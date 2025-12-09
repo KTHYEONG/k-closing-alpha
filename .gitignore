@@ -1,0 +1,17 @@
+# .gitignore
+
+# Google Cloud credentials
+*.json
+
+# env
+.env
+
+# 개인 정보
+kis_config.py
+
+# __pycache__
+__pycache__
+
+# data files
+*.xlsx
+*.csv
