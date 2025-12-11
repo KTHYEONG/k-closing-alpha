@@ -290,45 +290,65 @@ def load_and_preprocess_data(file_path):
     return df
 
 
-def explain_prediction(model, X_input):
-    """ExtraTrees의 feature_importances_ 기반으로 상위 변수 안내"""
-    if not hasattr(model, "feature_importances_"):
+def explain_prediction(model, X_input, explainer=None):
+    """SHAP을 사용하여 예측에 대한 기여도를 설명합니다."""
+    if explainer is None:
         return [], []
 
-    feature_names = (
-        list(model.feature_names_in_)
-        if hasattr(model, "feature_names_in_")
-        else list(X_input.columns)
-    )
-    feature_pairs = sorted(
-        zip(feature_names, model.feature_importances_), key=lambda x: x[1], reverse=True
-    )
-    pos_factors = [
-        f"{name}(imp:{importance:.3f})"
-        for name, importance in feature_pairs[:3]
-        if importance > 0
-    ]
-    return pos_factors, []
+    try:
+        # SHAP 값 계산
+        shap_values = explainer.shap_values(X_input)
+
+        # 피처 이름과 SHAP 값을 결합
+        feature_names = X_input.columns
+        feature_shap_values = list(zip(feature_names, shap_values[0]))
+
+        # 기여도에 따라 정렬
+        feature_shap_values.sort(key=lambda x: x[1], reverse=True)
+
+        # 긍정적/부정적 요인 상위 3개 추출
+        pos_factors = [
+            f"{name}({val:.2f})" for name, val in feature_shap_values[:3] if val > 0
+        ]
+        neg_factors = [
+            f"{name}({val:.2f})"
+            for name, val in reversed(feature_shap_values[-3:])
+            if val < 0
+        ]
+
+        return pos_factors, neg_factors
+    except Exception as e:
+        print(f"{Colors.YELLOW}[Warning] SHAP 값 계산 중 오류: {e}{Colors.RESET}")
+        return [], []
 
 
-def print_table(results_list, title):
+def print_table(results_list, title, minimal=False):
     """결과 리스트를 테이블 형태로 출력"""
     if not results_list:
         return
 
     results_list.sort(key=lambda x: x["Score"], reverse=True)
 
-    W_RANK, W_NAME, W_THEME = 6, 12, 10
-    W_SCENARIO, W_PROB, W_DECISION = 12, 8, 14
-
-    header = (
-        f"| {pad_str('Rank', W_RANK, 'center')} "
-        f"| {pad_str('Name', W_NAME, 'center')} "
-        f"| {pad_str('Theme', W_THEME, 'center')} "
-        f"| {pad_str('Scenario', W_SCENARIO, 'center')} "
-        f"| {pad_str('Prob', W_PROB, 'center')} "
-        f"| {pad_str('Decision', W_DECISION, 'center')} |"
-    )
+    if minimal:
+        W_RANK, W_NAME = 6, 12
+        W_PROB, W_DECISION = 8, 14
+        header = (
+            f"| {pad_str('Rank', W_RANK, 'center')} "
+            f"| {pad_str('Name', W_NAME, 'center')} "
+            f"| {pad_str('Score', W_PROB, 'center')} "
+            f"| {pad_str('Decision', W_DECISION, 'center')} |"
+        )
+    else:
+        W_RANK, W_NAME, W_THEME = 6, 12, 10
+        W_SCENARIO, W_PROB, W_DECISION = 12, 8, 14
+        header = (
+            f"| {pad_str('Rank', W_RANK, 'center')} "
+            f"| {pad_str('Name', W_NAME, 'center')} "
+            f"| {pad_str('Theme', W_THEME, 'center')} "
+            f"| {pad_str('Scenario', W_SCENARIO, 'center')} "
+            f"| {pad_str('Prob', W_PROB, 'center')} "
+            f"| {pad_str('Decision', W_DECISION, 'center')} |"
+        )
     divider = "-" * get_display_width(header)
 
     print(f"\n{Colors.BOLD}=== {title} ==={Colors.RESET}")
@@ -347,22 +367,31 @@ def print_table(results_list, title):
         name_display = res["Name"]
         if get_display_width(name_display) > W_NAME:
             name_display = name_display[:6] + ".."
-        theme_display = res["Theme"]
-        if get_display_width(theme_display) > W_THEME:
-            theme_display = theme_display[:6] + ".."
-        scenario_display = res["Scenario"]
-        if get_display_width(scenario_display) > W_SCENARIO:
-            scenario_display = scenario_display[:4] + ".."
         score_str = f"{res['Score']:.4f}"
 
-        row_str = (
-            f"| {pad_str(res['Rank'], W_RANK, 'center')} "
-            f"| {pad_str(name_display, W_NAME, 'left')} "
-            f"| {pad_str(theme_display, W_THEME, 'left')} "
-            f"| {pad_str(scenario_display, W_SCENARIO, 'left')} "
-            f"| {pad_str(score_str, W_PROB, 'center')} "
-            f"| {dec_color}{pad_str(res['Decision'], W_DECISION, 'center')}{Colors.RESET} |"
-        )
+        if minimal:
+            row_str = (
+                f"| {pad_str(res['Rank'], W_RANK, 'center')} "
+                f"| {pad_str(name_display, W_NAME, 'left')} "
+                f"| {pad_str(score_str, W_PROB, 'center')} "
+                f"| {dec_color}{pad_str(res['Decision'], W_DECISION, 'center')}{Colors.RESET} |"
+            )
+        else:
+            theme_display = res["Theme"]
+            if get_display_width(theme_display) > W_THEME:
+                theme_display = theme_display[:6] + ".."
+            scenario_display = res["Scenario"]
+            if get_display_width(scenario_display) > W_SCENARIO:
+                scenario_display = scenario_display[:4] + ".."
+
+            row_str = (
+                f"| {pad_str(res['Rank'], W_RANK, 'center')} "
+                f"| {pad_str(name_display, W_NAME, 'left')} "
+                f"| {pad_str(theme_display, W_THEME, 'left')} "
+                f"| {pad_str(scenario_display, W_SCENARIO, 'left')} "
+                f"| {pad_str(score_str, W_PROB, 'center')} "
+                f"| {dec_color}{pad_str(res['Decision'], W_DECISION, 'center')}{Colors.RESET} |"
+            )
         print(row_str)
     print(divider)
 
@@ -413,6 +442,16 @@ def main():
             print(f"{Colors.RED}모델 로드 오류: {e}{Colors.RESET}")
             sys.exit(1)
 
+    # SHAP Explainer 초기화 (모델이 로드된 후에)
+    explainer = None
+    # ExtraTrees, CatBoost 등 트리 기반 모델에 대해 TreeExplainer 초기화
+    if model and (
+        "extratrees" in str(type(model)).lower()
+        or "catboost" in str(type(model)).lower()
+    ):
+        import shap
+
+        explainer = shap.TreeExplainer(model)
     # 데이터 로드
     df_condition = load_and_preprocess_data(CONDITION_EXCEL_PATH)
     theme_map = load_theme_from_gsheet(
@@ -495,7 +534,9 @@ def main():
             if model:
                 try:
                     score = float(model.predict(X_input)[0])
-                    pos_factors, neg_factors = explain_prediction(model, X_input)
+                    pos_factors, neg_factors = explain_prediction(
+                        model, X_input, explainer
+                    )
                 except Exception as e:
                     print(
                         f"{Colors.RED}Predict Error ({stock_name}): {e}{Colors.RESET}"
@@ -538,16 +579,10 @@ def main():
     sangdda_results = [r for r in final_ordered_results if "상따" in r["Scenario"]]
 
     print_table(normal_results, "일반 분석 결과")
-    print_table(sangdda_results, "상따(29.9%) 시나리오 결과")
+    print_table(sangdda_results, "상따(29.9%) 시나리오 결과", minimal=True)
 
     print_explanations(normal_results, "일반 분석 결과")
-    print_explanations(sangdda_results, "상따(29.9%) 시나리오 결과")
-
-    # 마무리 정보
-    if final_ordered_results:
-        print(
-            f"\n* KOSPI: {final_ordered_results[0]['KOSPI_Rate']}%, KOSDAQ: {final_ordered_results[0]['KOSDAQ_Rate']}%"
-        )
+    # print_explanations(sangdda_results, "상따(29.9%) 시나리오 결과")
 
 
 if __name__ == "__main__":
