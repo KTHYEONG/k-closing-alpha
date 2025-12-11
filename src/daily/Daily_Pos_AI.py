@@ -581,14 +581,8 @@ def main():
     print_table(normal_results, "일반 분석 결과")
     print_table(sangdda_results, "상따(29.9%) 시나리오 결과", minimal=True)
 
-    # print_explanations(normal_results, "일반 분석 결과")
+    print_explanations(normal_results, "일반 분석 결과")
     # print_explanations(sangdda_results, "상따(29.9%) 시나리오 결과")
-
-    # 마무리 정보
-    # if final_ordered_results:
-    #    print(
-    #        f"\n* KOSPI: {final_ordered_results[0]['KOSPI_Rate']}%, KOSDAQ: {final_ordered_results[0]['KOSDAQ_Rate']}%"
-    #    )
 
 
 if __name__ == "__main__":
