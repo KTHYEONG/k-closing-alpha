@@ -8,6 +8,7 @@
 
 # 개인 정보
 kis_config.py
+kis_common.py
 
 # __pycache__
 __pycache__
