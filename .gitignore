@@ -15,3 +15,6 @@ __pycache__
 # data files
 *.xlsx
 *.csv
+
+# db
+*.db
