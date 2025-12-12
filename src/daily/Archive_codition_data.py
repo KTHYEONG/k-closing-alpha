@@ -20,17 +20,6 @@ def upsert_history(df: pd.DataFrame, db_path: str) -> None:
         df.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
 
         if STOCK_CODE_COL in df.columns:
-            # 동일 날짜/종목코드는 최신(rowid)만 유지
-            conn.execute(
-                f"""
-                DELETE FROM {TABLE_NAME}
-                WHERE rowid NOT IN (
-                    SELECT MAX(rowid)
-                    FROM {TABLE_NAME}
-                    GROUP BY "{SNAP_DATE_COL}", "{STOCK_CODE_COL}"
-                )
-                """
-            )
             conn.execute(
                 f"""
                 CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_date_code
