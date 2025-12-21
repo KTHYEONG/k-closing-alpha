@@ -28,14 +28,11 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 sys.path.append(project_root)
 
-from src.data.gsheet_loader import load_and_combine_sheets
+from src.data.db_loader import load_trade_log_from_db
 from src.processing.preprocessor import preprocess_data
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-GOOGLE_SHEET_NAME = "Stock"
-WORKSHEET_NAMES = ["Trade", "Trade2"]
 
 GROWTH_THRESHOLD = 5000
 EXPANDED_THRESHOLD = 10000
@@ -47,8 +44,8 @@ HOLDOUT_RATIOS = {
 }
 MIN_HOLDOUT = 200
 
-print("\n[Step 1/5] Loading data from Google Sheets...")
-df_raw = load_and_combine_sheets(GOOGLE_SHEET_NAME, WORKSHEET_NAMES)
+print("\n[Step 1/5] Loading data from local DB...")
+df_raw = load_trade_log_from_db()
 
 X_cat, y, cat_features, df_processed = preprocess_data(df_raw.copy())
 
@@ -60,6 +57,12 @@ else:
 X_cat = X_cat.loc[order_idx].reset_index(drop=True)
 y = y.loc[order_idx].reset_index(drop=True)
 df_processed = df_processed.loc[order_idx].reset_index(drop=True)
+
+# 숫자열 확인
+numeric_cols = X_cat.columns.difference(cat_features)
+X_cat[numeric_cols] = (
+    X_cat[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+)
 
 X_encoded = X_cat.copy()
 label_encoders = {}
