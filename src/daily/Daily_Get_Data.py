@@ -14,6 +14,8 @@ import configs.kis_config as kis_config
 import asyncio
 import aiohttp
 import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 
 from openpyxl import load_workbook
@@ -47,6 +49,20 @@ if not HTS_ID or "여기에" in HTS_ID:
 
 
 # ---------------------------------------------------------
+# 0. 세션 및 재시도 설정 (연결 안정성 확보)
+# ---------------------------------------------------------
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,  # 최대 3번 재시도
+    backoff_factor=1,  # 재시도 간격 지수적 증가
+    status_forcelist=[429, 500, 502, 503, 504],  # 재시도할 HTTP 상태 코드
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+
+# ---------------------------------------------------------
 # 1. 접근 토큰 관리
 # ---------------------------------------------------------
 def get_access_token():
@@ -72,7 +88,7 @@ def get_access_token():
         "appsecret": APP_SECRET,
     }
 
-    res = requests.post(
+    res = session.post(
         f"{URL_BASE}/oauth2/tokenP", headers=headers, data=json.dumps(body)
     )
     data = res.json()
@@ -126,7 +142,7 @@ def get_program_net_buy(code):
     }
 
     try:
-        res = requests.get(url, headers=headers, params=params)
+        res = session.get(url, headers=headers, params=params)
 
         if res.status_code != 200:
             print(f" ⚠️ [API 호출 오류] ({code}) 상태코드: {res.status_code}")
@@ -147,7 +163,7 @@ def get_program_net_buy(code):
         print(f" ⚠️ 프로그램 매매 조회 실패 ({code}): {e}")
         return 0.0
     finally:
-        time.sleep(0.06)  # API 요청 제한 준수를 위한 지연
+        time.sleep(0.2)  # TPS 제한을 고려하여 지연 시간 상향 (4개 동시 호출 대비)
 
 
 # ---------------------------------------------------------
@@ -177,7 +193,7 @@ def get_market_index_rate(market_code):
     }
 
     try:
-        res = requests.get(
+        res = session.get(
             f"{URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice",
             headers=headers,
             params=params,
@@ -208,7 +224,7 @@ def get_market_index_rate(market_code):
 
     except Exception as e:
         print(f" ⚠️ 지수 조회 실패 ({market_code}): {e}")
-        time.sleep(0.06)  # API 요청 제한 준수를 위한 지연
+        time.sleep(0.2)
 
     return 0.0
 
@@ -228,7 +244,7 @@ def get_investor_trend_estimate(code):
     params = {"MKSC_SHRN_ISCD": code}
 
     try:
-        res = requests.get(
+        res = session.get(
             f"{URL_BASE}/uapi/domestic-stock/v1/quotations/investor-trend-estimate",
             headers=headers,
             params=params,
@@ -250,7 +266,7 @@ def get_investor_trend_estimate(code):
         print(f" ⚠️ 수급 추정 조회 실패 ({code}): {e}")
         return 0, 0
     finally:
-        time.sleep(0.06)  # API 요청 제한 준수를 위한 지연
+        time.sleep(0.2)
 
 
 # ---------------------------------------------------------
@@ -271,7 +287,7 @@ def get_stock_detail(code):
     }
 
     try:
-        res = requests.get(
+        res = session.get(
             f"{URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-price",
             headers=headers,
             params=params,
@@ -281,7 +297,7 @@ def get_stock_detail(code):
             return data["output"]
     except Exception as e:
         print(f"   ⚠️ 상세 조회 실패 ({code}): {e}")
-        time.sleep(0.06)  # API 요청 제한 준수를 위한 지연
+        time.sleep(0.2)
 
     return None
 
@@ -299,7 +315,7 @@ def get_condition_list():
         "custtype": "P",
     }
     params = {"user_id": HTS_ID}
-    res = requests.get(
+    res = session.get(
         f"{URL_BASE}/uapi/domestic-stock/v1/quotations/psearch-title",
         headers=headers,
         params=params,
@@ -356,7 +372,7 @@ def get_trade_strength(code):
     params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
 
     try:
-        res = requests.get(url, headers=headers, params=params)
+        res = session.get(url, headers=headers, params=params)
         data = res.json()
 
         if data["rt_cd"] == "0" and data.get("output"):
@@ -376,7 +392,7 @@ def get_trade_strength(code):
         print(f" ⚠️ 체결강도 조회 실패 ({code}): {e}")
         return 0.0
     finally:
-        time.sleep(0.06)  # API 요청 제한 준수를 위한 지연
+        time.sleep(0.2)
 
 
 # ---------------------------------------------------------
@@ -391,7 +407,7 @@ headers = {
     "custtype": "P",
 }
 params = {"user_id": HTS_ID, "seq": target_cond["seq"]}
-res = requests.get(
+res = session.get(
     f"{URL_BASE}/uapi/domestic-stock/v1/quotations/psearch-result",
     headers=headers,
     params=params,
