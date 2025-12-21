@@ -17,6 +17,20 @@ FETCH_TARGET_DATE = None  # "2025-12-09"
 def upsert_history(df: pd.DataFrame, db_path: str) -> None:
     """Append snapshot rows to SQLite and deduplicate by 날짜/종목코드."""
     with sqlite3.connect(db_path) as conn:
+        # 신규 컬럼(예: 차트통과) 대응: 테이블이 이미 존재할 경우 누락된 컬럼을 추가
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT name FROM sqlite_master WHERE type='table' AND name='{TABLE_NAME}'"
+        )
+        if cursor.fetchone():
+            existing_cols = [
+                row[1] for row in cursor.execute(f"PRAGMA table_info({TABLE_NAME})")
+            ]
+            for col in df.columns:
+                if col not in existing_cols:
+                    # 특수문자가 포함된 컬럼명을 위해 쌍따옴표로 감싸서 ALTER TABLE 실행
+                    conn.execute(f'ALTER TABLE {TABLE_NAME} ADD COLUMN "{col}"')
+
         df.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
 
         if STOCK_CODE_COL in df.columns:
