@@ -16,6 +16,7 @@ RENAME_MAP = {
     "(기관_순매수)": "기관_순매수",
     "(외국인_순매수)": "외국인_순매수",
     "(테마/섹터)": "테마_섹터",
+    "(차트통과)": "차트통과",
     "(차트분석)": "차트분석",
     "(매수 가격)": "매수가격",
     "(매도 가격)": "매도가격",
@@ -43,6 +44,16 @@ def preprocess_data(df, task="classification", target_col=None):
 
     df.rename(columns=RENAME_MAP, inplace=True)
     df.replace("", np.nan, inplace=True)
+
+    # (차트분석)과 (차트통과) 결합 로직 추가
+    if "차트분석" in df.columns and "차트통과" in df.columns:
+        # 결측치 처리 후 결합 (예: '신고가_0', '상따_1')
+        df["차트분석"] = (
+            df["차트분석"].fillna("Unknown").astype(str)
+            + "_"
+            + df["차트통과"].fillna("N").astype(str)
+        )
+        df.drop(columns=["차트통과"], inplace=True)
 
     task = task.lower()
     if task not in {"classification", "regression"}:
