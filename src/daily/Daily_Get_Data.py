@@ -162,8 +162,6 @@ def get_program_net_buy(code):
     except Exception as e:
         print(f" ⚠️ 프로그램 매매 조회 실패 ({code}): {e}")
         return 0.0
-    finally:
-        time.sleep(0.2)  # TPS 제한을 고려하여 지연 시간 상향 (4개 동시 호출 대비)
 
 
 # ---------------------------------------------------------
@@ -224,7 +222,6 @@ def get_market_index_rate(market_code):
 
     except Exception as e:
         print(f" ⚠️ 지수 조회 실패 ({market_code}): {e}")
-        time.sleep(0.2)
 
     return 0.0
 
@@ -265,8 +262,6 @@ def get_investor_trend_estimate(code):
     except Exception as e:
         print(f" ⚠️ 수급 추정 조회 실패 ({code}): {e}")
         return 0, 0
-    finally:
-        time.sleep(0.2)
 
 
 # ---------------------------------------------------------
@@ -297,7 +292,6 @@ def get_stock_detail(code):
             return data["output"]
     except Exception as e:
         print(f"   ⚠️ 상세 조회 실패 ({code}): {e}")
-        time.sleep(0.2)
 
     return None
 
@@ -391,8 +385,6 @@ def get_trade_strength(code):
     except Exception as e:
         print(f" ⚠️ 체결강도 조회 실패 ({code}): {e}")
         return 0.0
-    finally:
-        time.sleep(0.2)
 
 
 # ---------------------------------------------------------
@@ -425,25 +417,17 @@ print(f"✅ 검색 결과: 총 {len(stock_list)} 종목 포착!")
 # ---------------------------------------------------------
 # 5. 상세 정보 조회 및 데이터 매핑
 # ---------------------------------------------------------
-async def fetch_all_stock_data(stock_list):
-    results = []
-    for i, stock in enumerate(stock_list):
+async def fetch_single_stock(i, stock, total, sem):
+    """개별 종목 데이터를 수집하는 비동기 태스크"""
+    async with sem:
         code = stock["code"]
         name = stock["name"]
 
         try:
             price = int(float(stock.get("price", 0)))
             rate = float(stock.get("chgrate", 0))
-        except Exception as e:
-            price = 0
-            rate = 0.0
-
-        trade_amt_eok = 0
-        mkt_cap_eok = 0
-        market_name = ""
-
-        # 체결강도 기본값
-        vol_power = 0.0
+        except:
+            price, rate = 0, 0.0
 
         # 여러 API를 동시에 호출 (비동기)
         detail, vol_power, (frgn_qty, orgn_qty), program_amt_won = await asyncio.gather(
@@ -453,82 +437,68 @@ async def fetch_all_stock_data(stock_list):
             asyncio.to_thread(get_program_net_buy, code),
         )
 
+        market_name, mkt_cap_eok, trade_amt_eok = "", 0, 0
         if detail:
             try:
-                price_str = str(detail.get("stck_prpr", price))
-                price = int(float(price_str.replace(",", "")))
+                price = int(float(str(detail.get("stck_prpr", price)).replace(",", "")))
+                rate = float(str(detail.get("prdy_ctrt", rate)).replace(",", ""))
+                shares = float(str(detail.get("lstn_stcn", "0")).replace(",", ""))
 
-                rate_str = str(detail.get("prdy_ctrt", rate))
-                rate = float(rate_str.replace(",", ""))
-
-                shares_str = str(detail.get("lstn_stcn", "0"))
-                shares_outstanding = float(shares_str.replace(",", ""))
-
-                # 시장구분 표준화
-                raw_market = str(detail.get("rprs_mrkt_kor_name", "")).upper().strip()
-                if any(
-                    keyword in raw_market for keyword in ["KOSPI", "유가", "코스피"]
-                ):
-                    market_name = "KOSPI"
-                elif any(
-                    keyword in raw_market for keyword in ["KOSDAQ", "KSQ", "코스닥"]
-                ):
-                    market_name = "KOSDAQ"
-                else:
-                    market_name = raw_market
-
-                # 시가총액, 거래대금
-                raw_mkt_cap_str = (
-                    str(detail.get("hts_avls", "")).replace(",", "").strip()
+                raw_market = str(detail.get("rprs_mrkt_kor_name", "")).upper()
+                market_name = (
+                    "KOSPI"
+                    if "KOSPI" in raw_market or "유가" in raw_market
+                    else "KOSDAQ" if "KOSDAQ" in raw_market else raw_market
                 )
-                if raw_mkt_cap_str not in ("", "0", "0.0"):
-                    raw_mkt_cap = float(raw_mkt_cap_str) * 100_000_000
-                else:
-                    raw_mkt_cap = (
-                        shares_outstanding * price
-                        if (shares_outstanding > 0 and price > 0)
-                        else 0
-                    )
 
-                raw_trade_amt_str = str(detail.get("acml_tr_pbmn", "0"))
-                raw_trade_amt = float(raw_trade_amt_str.replace(",", ""))
+                raw_mkt_cap = (
+                    float(str(detail.get("hts_avls", "0")).replace(",", ""))
+                    * 100_000_000
+                )
+                if raw_mkt_cap == 0:
+                    raw_mkt_cap = shares * price
 
                 mkt_cap_eok = round(raw_mkt_cap / 100_000_000, 2)
-                trade_amt_eok = round(raw_trade_amt / 100_000_000, 2)
+                trade_amt_eok = round(
+                    float(str(detail.get("acml_tr_pbmn", "0")).replace(",", ""))
+                    / 100_000_000,
+                    2,
+                )
+            except:
+                pass
 
-            except Exception as e:
-                print(f"   ⚠️ 데이터 변환 오류 ({name}): {e}")
-
-        # 실시간 외인/기관 추정
-        frgn_net_amt = frgn_qty * price
-        orgn_net_amt = orgn_qty * price
-        frgn_net_eok = round(frgn_net_amt / 100_000_000, 2)
-        orgn_net_eok = round(orgn_net_amt / 100_000_000, 2)
-
-        # 프로그램 순매수 조회
+        frgn_net_eok = round((frgn_qty * price) / 100_000_000, 2)
+        orgn_net_eok = round((orgn_qty * price) / 100_000_000, 2)
         program_net_eok = round(program_amt_won / 100_000_000, 2)
 
-        print(
-            f"[{i+1}/{len(stock_list)}] {name}({market_name}) | 등락:{rate}% | 체결강도:{vol_power}% | "
-            f"외인:{frgn_net_eok}억 | 기관:{orgn_net_eok}억 | 프로그램:{program_net_eok}억"
-        )
+        print(f"\r 🔍 데이터 수집 중... ({i+1}/{total})", end="", flush=True)
 
-        results.append(
-            {
-                "종목명": name,
-                "종목코드": code,
-                "시장구분": market_name,
-                "시가총액(억)": mkt_cap_eok,
-                "거래대금(억)": trade_amt_eok,
-                "체결강도": vol_power,
-                "등락률": rate,
-                "순위": 0,
-                "기관_순매수(억)": orgn_net_eok,
-                "외국인_순매수(억)": frgn_net_eok,
-                "프로그램_순매수(억)": program_net_eok,
-                "(차트통과)": 1,
-            }
-        )
+        return {
+            "종목명": name,
+            "종목코드": code,
+            "시장구분": market_name,
+            "시가총액(억)": mkt_cap_eok,
+            "거래대금(억)": trade_amt_eok,
+            "체결강도": vol_power,
+            "등락률": rate,
+            "순위": 0,
+            "기관_순매수(억)": orgn_net_eok,
+            "외국인_순매수(억)": frgn_net_eok,
+            "프로그램_순매수(억)": program_net_eok,
+            "(차트통과)": 1,
+        }
+
+
+async def fetch_all_stock_data(stock_list):
+    # 실전 계좌 TPS 20 제한을 고려하여 동시 실행 종목 수를 5개로 제한
+    # (5개 종목 * 종목당 4개 API = 20 TPS)
+    sem = asyncio.Semaphore(5)
+    total = len(stock_list)
+    tasks = [
+        fetch_single_stock(i, stock, total, sem) for i, stock in enumerate(stock_list)
+    ]
+    results = await asyncio.gather(*tasks)
+
     print("\n✅ 데이터 수집 완료")
     return results
 
@@ -654,6 +624,13 @@ if results:
     except Exception as e:
         print(f"⚠️ 엑셀 서식 적용 실패: {e}")
 
-    print(f"\n📂 엑셀 저장 완료!")
+    print(f"\n📋 [검색 결과 요약 - 총 {total_count}종목]")
+    for _, row in df.head(total_count).iterrows():
+        pass_status = "통과" if row["(차트통과)"] == 1 else "제외"
+        print(
+            f"   {int(row['순위']):2d}. {row['종목명']:<10} | {row['등락률']:>6.2f}% | {row['거래대금(억)']:>7.1f}억 | {pass_status}"
+        )
+
+    print(f"\n📂 엑셀 저장 완료: {save_path}")
 else:
     print("⚠ 검색된 종목이 없습니다.")
