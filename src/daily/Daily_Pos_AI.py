@@ -195,6 +195,7 @@ def load_and_preprocess_data(file_path):
         "KOSDAQ등락률": "kosdaq",
         "전체종목수": "총_종목수",
         "평균거래대금(억)": "평균거래대금_억",
+        "(차트통과)": "차트통과",
     }
     df.rename(columns=rename_map, inplace=True)
 
@@ -407,6 +408,10 @@ def main():
         code_input = matched_row.iloc[0]["종목코드"]
         stock_name = matched_row.iloc[0]["종목명"]
         theme = theme_map.get(code_input, "테마 없음")
+
+        # 엑셀에서 (차트통과) 값을 가져옴 (기본값 1)
+        chart_pass = int(matched_row.iloc[0].get("차트통과", 1))
+
         if not theme or theme == "테마 없음":
             print(f"{Colors.YELLOW}{stock_name} 테마없음{Colors.RESET}")
             continue
@@ -429,7 +434,10 @@ def main():
             }
 
             X_input["테마_섹터"] = theme
-            X_input["차트분석"] = str(scenario)
+
+            # 시나리오명과 차트통과 여부를 결합 (예: '신고가_0' 또는 '신고가_1')
+            combined_scenario = f"{scenario}_{chart_pass}"
+            X_input["차트분석"] = combined_scenario
             X_input["day_name"] = day_name_map[today.weekday()]
             X_input["day_of_month"] = float(today.day)
             X_input["month"] = float(today.month)
@@ -491,7 +499,7 @@ def main():
                     "Rank": X_input["선정순위"].values[0],
                     "Name": stock_name,
                     "Theme": theme,
-                    "Scenario": str(scenario),
+                    "Scenario": combined_scenario,
                     "Score": score,
                     "Decision": decision,
                     "KOSPI_Rate": X_input["kospi"].values[0],
