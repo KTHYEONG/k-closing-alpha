@@ -36,7 +36,7 @@ def load_theme_from_db():
     """
     conn = get_db_connection()
     try:
-        query = "SELECT 종목코드, 테마 FROM table_theme"
+        query = 'SELECT "종목코드", "테마" FROM table_theme'
         df = pd.read_sql(query, conn)
 
         # 종목코드 6자리 포맷팅 (혹시 모를 에러 방지)
