@@ -510,6 +510,7 @@ async def fetch_all_stock_data(stock_list):
                 "기관_순매수(억)": orgn_net_eok,
                 "외국인_순매수(억)": frgn_net_eok,
                 "프로그램_순매수(억)": program_net_eok,
+                "(차트통과)": 1,
             }
         )
     return results
@@ -532,6 +533,46 @@ if results:
     df = df.sort_values(by="거래대금(억)", ascending=False)
     df["순위"] = range(1, len(df) + 1)
 
+    # --- [개선] 별도 캐시 파일을 이용한 (차트통과) 데이터 영구 보존 로직 ---
+    cache_path = os.path.join(data_dir, "chart_pass_cache.json")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    daily_memory = {}
+
+    # 1. 기존 캐시 로드 (오늘 날짜인 경우만)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+                if cache_data.get("date") == today_str:
+                    daily_memory = cache_data.get("data", {})
+        except Exception:
+            pass
+
+    # 2. 현재 엑셀 파일에서 사용자가 수정한 최신 값 반영 (캐시 업데이트)
+    if os.path.exists(save_path):
+        try:
+            file_mtime = datetime.fromtimestamp(os.path.getmtime(save_path)).date()
+            if file_mtime == datetime.now().date():
+                old_df = pd.read_excel(save_path, engine="openpyxl")
+                if "종목코드" in old_df.columns and "(차트통과)" in old_df.columns:
+                    old_df["종목코드"] = old_df["종목코드"].astype(str).str.zfill(6)
+                    # 엑셀에 있는 현재 값들을 캐시에 병합 (사용자 수정 반영)
+                    current_excel_vals = dict(zip(old_df["종목코드"], old_df["(차트통과)"]))
+                    daily_memory.update(current_excel_vals)
+        except Exception as e:
+            print(f"    ⚠️ 캐시 업데이트 중 오류: {e}")
+
+    # 3. 새로운 결과에 캐시 적용 (종목이 잠시 사라졌어도 daily_memory에 남아있음)
+    df["(차트통과)"] = df["종목코드"].map(daily_memory).fillna(1).astype(int)
+    print(f"    ℹ️ (차트통과) 데이터 복원 완료 (기억된 종목 수: {len(daily_memory)}개)")
+
+    # 4. 업데이트된 캐시 저장
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump({"date": today_str, "data": daily_memory}, f, indent=2)
+    except Exception:
+        pass
+
     total_count = len(df)
     avg_trade_amt = round(df["거래대금(억)"].mean(), 2)
 
@@ -541,6 +582,7 @@ if results:
     df["KOSDAQ등락률"] = kosdaq_rate
 
     cols_order = [
+        "(차트통과)",
         "종목명",
         "종목코드",
         "시가총액(억)",
