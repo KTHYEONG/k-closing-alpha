@@ -189,7 +189,7 @@ deployment_model = ExtraTreesRegressor(**best_params)
 deployment_model.fit(X, y)
 print(" -> Deployment model trained on full dataset.", flush=True)
 
-model_path = os.path.join(models_dir, "best_stock_rg.cbm")
+model_path = os.path.join(models_dir, "best_stock_rg.joblib")
 dump(deployment_model, model_path)
 enc_path = os.path.join(models_dir, "best_stock_rg_label_encoders.json")
 encoder_payload = {
