@@ -102,7 +102,7 @@ def apply_label_encodings(df, encoder_map):
 CONDITION_EXCEL_PATH = os.path.join(DATA_DIR, "condition_종가매매.xlsx")
 
 # 2. AI 모델 파일 (models 폴더)
-MODEL_PATH = os.path.join(MODELS_DIR, "best_stock_rg.cbm")
+MODEL_PATH = os.path.join(MODELS_DIR, "best_stock_rg.joblib")
 
 # .env 파일에서 환경변수 로드
 env_file_path = os.path.join(PROJECT_ROOT, ".env")
@@ -220,38 +220,6 @@ def load_and_preprocess_data(file_path):
     return df
 
 
-def explain_prediction(model, X_input, explainer=None):
-    """SHAP을 사용하여 예측에 대한 기여도를 설명합니다."""
-    if explainer is None:
-        return [], []
-
-    try:
-        # SHAP 값 계산
-        shap_values = explainer.shap_values(X_input)
-
-        # 피처 이름과 SHAP 값을 결합
-        feature_names = X_input.columns
-        feature_shap_values = list(zip(feature_names, shap_values[0]))
-
-        # 기여도에 따라 정렬
-        feature_shap_values.sort(key=lambda x: x[1], reverse=True)
-
-        # 긍정적/부정적 요인 상위 3개 추출
-        pos_factors = [
-            f"{name}({val:.2f})" for name, val in feature_shap_values[:3] if val > 0
-        ]
-        neg_factors = [
-            f"{name}({val:.2f})"
-            for name, val in reversed(feature_shap_values[-3:])
-            if val < 0
-        ]
-
-        return pos_factors, neg_factors
-    except Exception as e:
-        print(f"{Colors.YELLOW}[Warning] SHAP 값 계산 중 오류: {e}{Colors.RESET}")
-        return [], []
-
-
 def print_table(results_list, title, minimal=False):
     """결과 리스트를 테이블 형태로 출력"""
     if not results_list:
@@ -326,55 +294,21 @@ def print_table(results_list, title, minimal=False):
     print(divider)
 
 
-def print_explanations(results_list, title):
-    """각 종목별 점수에 영향을 준 주요 요인을 설명"""
-    if not results_list:
-        return
-
-    print(f"\n{Colors.BOLD}--- {title}: Feature Contributions ---{Colors.RESET}")
-    for res in sorted(results_list, key=lambda x: x["Score"], reverse=True):
-        name = res["Name"]
-        scenario = res["Scenario"]
-        score = res["Score"]
-        pos_factors = res.get("Pos_Factors", [])
-        neg_factors = res.get("Neg_Factors", [])
-
-        print(
-            f"{Colors.CYAN}{name} ({scenario}){Colors.RESET} " f"- Score: {score:.4f}"
-        )
-        if pos_factors:
-            print(
-                f"  {Colors.GREEN}+ 영향 요인:{Colors.RESET} {', '.join(pos_factors)}"
-            )
-        if neg_factors:
-            print(f"  {Colors.RED}- 부담 요인:{Colors.RESET} {', '.join(neg_factors)}")
-        if not pos_factors and not neg_factors:
-            print("  (설명 정보를 불러오지 못했습니다.)")
-
-
 # =========================================================
 # 2. 메인 실행 함수
 # =========================================================
 
 
 def main():
-    # 모델 로드
+    # 1. 모델 및 Explainer 로드 (기존과 동일)
     if not os.path.exists(MODEL_PATH):
-        print(
-            f"{Colors.YELLOW}[Warning] 모델 파일({MODEL_PATH})이 없습니다.{Colors.RESET}"
-        )
+        print(f"{Colors.YELLOW}[Warning] 모델 파일이 없습니다.{Colors.RESET}")
         model = None
     else:
-        print(f"{Colors.GREEN}모델 로드 중... ({MODEL_PATH}){Colors.RESET}")
-        try:
-            model = load(MODEL_PATH)
-        except Exception as e:
-            print(f"{Colors.RED}모델 로드 오류: {e}{Colors.RESET}")
-            sys.exit(1)
+        print(f"{Colors.GREEN}모델 로드 중...{Colors.RESET}")
+        model = load(MODEL_PATH)
 
-    # SHAP Explainer 초기화 (모델이 로드된 후에)
     explainer = None
-    # ExtraTrees, CatBoost 등 트리 기반 모델에 대해 TreeExplainer 초기화
     if model and (
         "extratrees" in str(type(model)).lower()
         or "catboost" in str(type(model)).lower()
@@ -382,143 +316,102 @@ def main():
         import shap
 
         explainer = shap.TreeExplainer(model)
-    # 데이터 로드
+
+    # 2. 데이터 로드 및 테마 일괄 매핑
     df_condition = load_and_preprocess_data(CONDITION_EXCEL_PATH)
-    print(f"{Colors.CYAN}로컬 DB에서 테마 정보 로드 중...{Colors.RESET}")
     theme_map = load_theme_from_db()
 
-    # condition_*.xlsx 파일에 있는 모든 종목에 대해 분석 수행
-    print(
-        f"\n분석 대상: {Colors.BOLD}condition 파일 내 모든 종목 ({len(df_condition)}개){Colors.RESET}"
+    # 루프 밖에서 테마 정보를 일괄적으로 입힙니다.
+    df_condition["테마_섹터"] = (
+        df_condition["종목코드"].map(theme_map).fillna("테마 없음")
     )
-    print(f"적용 시나리오: {Colors.BOLD}{DEFAULT_SCENARIOS}{Colors.RESET}")
+    df_condition = df_condition[df_condition["테마_섹터"] != "테마 없음"].copy()
 
-    final_ordered_results = []
+    if df_condition.empty:
+        print(f"{Colors.RED}분석 대상 종목이 없습니다.{Colors.RESET}")
+        return
 
-    # 모델이 학습할 때 사용한 Feature 순서를 가져옴.
-    if model and hasattr(model, "feature_names_in_"):
-        train_feature_names = list(model.feature_names_in_)
+    # 3. [핵심] 모든 시나리오를 데이터프레임으로 확장 (Cross Join)
+    # 종목 10개 * 시나리오 7개 = 70개 행을 한 번에 만듭니다.
+    scenario_df = pd.DataFrame({"Scenario_Base": DEFAULT_SCENARIOS})
+    df_all = (
+        df_condition.assign(key=1)
+        .merge(scenario_df.assign(key=1), on="key")
+        .drop("key", axis=1)
+    )
+
+    # 4. 벡터화된 피처 엔지니어링 (루프 없음)
+    today = datetime.datetime.now()
+    day_name_map = {
+        0: "월요일",
+        1: "화요일",
+        2: "수요일",
+        3: "목요일",
+        4: "금요일",
+        5: "토요일",
+        6: "일요일",
+    }
+
+    df_all["day_name"] = day_name_map[today.weekday()]
+    df_all["day_of_month"] = float(today.day)
+    df_all["month"] = float(today.month)
+    df_all["차트분석"] = (
+        df_all["Scenario_Base"]
+        + "_"
+        + df_all["차트통과"].fillna(1).astype(int).astype(str)
+    )
+
+    # '상따' 시나리오 일괄 적용
+    df_all.loc[df_all["Scenario_Base"].str.contains("상따"), "등락률"] = 29.9
+    if "real_trade" not in df_all.columns:
+        df_all["real_trade"] = 0.0
+
+    # 5. 모델 입력 준비 및 배치 추론
+    # 인코딩도 일괄 처리
+    X_processed = apply_label_encodings(df_all.copy(), LABEL_ENCODER_MAP)
+
+    train_feature_names = (
+        list(model.feature_names_in_)
+        if model and hasattr(model, "feature_names_in_")
+        else []
+    )
+
+    if model and train_feature_names:
+        X_final = X_processed[train_feature_names]
+        # 단 한 번의 호출로 모든 종목/시나리오 예측
+        df_all["Score"] = model.predict(X_final)
     else:
-        train_feature_names = None
+        df_all["Score"] = 0.5
 
-    for index, matched_row_series in df_condition.iterrows():
-        # Series를 DataFrame으로 변환
-        matched_row = matched_row_series.to_frame().T
+    # 6. 의사결정 로직 일괄 적용
+    df_all["Decision"] = pd.cut(
+        df_all["Score"],
+        bins=[-np.inf, 1.2, 1.6, 1.9, np.inf],
+        labels=["Reduce", "Neutral", "Expand", "Max_Expand"],
+    ).astype(str)
 
-        code_input = matched_row.iloc[0]["종목코드"]
-        stock_name = matched_row.iloc[0]["종목명"]
-        theme = theme_map.get(code_input, "테마 없음")
+    # 7. 결과 리스트 생성
+    final_results = []
+    for _, row in df_all.iterrows():
+        res = {
+            "Rank": row["선정순위"],
+            "Name": row["종목명"],
+            "Theme": row["테마_섹터"],
+            "Scenario": row["차트분석"],
+            "Score": row["Score"],
+            "Decision": row["Decision"],
+            "kospi": row.get("kospi", 0),
+            "kosdaq": row.get("kosdaq", 0),
+            "Applied_Rate": row["등락률"],
+        }
+        final_results.append(res)
 
-        # 엑셀에서 (차트통과) 값을 가져옴 (기본값 1)
-        chart_pass = int(matched_row.iloc[0].get("차트통과", 1))
-
-        if not theme or theme == "테마 없음":
-            print(f"{Colors.YELLOW}{stock_name} 테마없음{Colors.RESET}")
-            continue
-
-        # 모든 종목에 대해 DEFAULT_SCENARIOS를 적용
-        for scenario in DEFAULT_SCENARIOS:
-            # 1. DataFrame을 복사하여 시나리오별 입력 데이터 생성
-            X_input = matched_row.copy()
-
-            # 2. 예측 시점에 생성되는 Feature들을 DataFrame에 직접 추가
-            today = datetime.datetime.now()
-            day_name_map = {
-                0: "월요일",
-                1: "화요일",
-                2: "수요일",
-                3: "목요일",
-                4: "금요일",
-                5: "토요일",
-                6: "일요일",
-            }
-
-            X_input["테마_섹터"] = theme
-
-            # 시나리오명과 차트통과 여부를 결합 (예: '신고가_0' 또는 '신고가_1')
-            combined_scenario = f"{scenario}_{chart_pass}"
-            X_input["차트분석"] = combined_scenario
-            X_input["day_name"] = day_name_map[today.weekday()]
-            X_input["day_of_month"] = float(today.day)
-            X_input["month"] = float(today.month)
-
-            # '상따' 시나리오일 경우 등락률을 29.9로 강제 조정
-            if "상따" in str(scenario):
-                X_input["등락률"] = 29.9
-
-            # 학습 시 사용되지 않은 컬럼 제거
-            X_input.drop(columns=["종목명"], inplace=True, errors="ignore")
-
-            # 모델에 없는 'real_trade' 같은 컬럼이 있다면 기본값으로 추가
-            if "real_trade" not in X_input.columns:
-                X_input["real_trade"] = 0.0
-
-            # 범주형 컬럼에 저장된 인코더 적용
-            X_input = apply_label_encodings(X_input, LABEL_ENCODER_MAP)
-
-            # 3. 모델이 원하는 컬럼 순서대로 강제 재정렬 (Reindexing)
-            if model and train_feature_names:
-                try:
-                    # 학습시 사용한 컬럼들로만 구성하고 순서를 맞춤
-                    X_input = X_input[train_feature_names]
-                except KeyError as e:
-                    print(
-                        f"{Colors.RED}[Critical] 학습 데이터와 예측 데이터의 컬럼이 다릅니다. 누락된 컬럼: {e}{Colors.RESET}"
-                    )
-                    continue
-
-            if model:
-                try:
-                    score = float(model.predict(X_input)[0])
-                    pos_factors, neg_factors = explain_prediction(
-                        model, X_input, explainer
-                    )
-                except Exception as e:
-                    print(
-                        f"{Colors.RED}Predict Error ({stock_name}): {e}{Colors.RESET}"
-                    )
-                    continue
-            else:
-                score = 0.5
-                pos_factors, neg_factors = [], []
-
-            # Decision Logic (비중 조절 로직)
-            if score >= 1.9:
-                decision = "Max_Expand"
-            elif score >= 1.6:
-                decision = "Expand"
-            elif score >= 1.2:
-                decision = "Neutral"
-            else:
-                decision = "Reduce"
-
-            applied_rate = X_input["등락률"].values[0]
-
-            final_ordered_results.append(
-                {
-                    "Rank": X_input["선정순위"].values[0],
-                    "Name": stock_name,
-                    "Theme": theme,
-                    "Scenario": combined_scenario,
-                    "Score": score,
-                    "Decision": decision,
-                    "KOSPI_Rate": X_input["kospi"].values[0],
-                    "KOSDAQ_Rate": X_input["kosdaq"].values[0],
-                    "Applied_Rate": applied_rate,
-                    "Pos_Factors": pos_factors,
-                    "Neg_Factors": neg_factors,
-                }
-            )
-
-    # 결과 출력
-    normal_results = [r for r in final_ordered_results if "상따" not in r["Scenario"]]
-    sangdda_results = [r for r in final_ordered_results if "상따" in r["Scenario"]]
+    # 8. 결과 출력
+    normal_results = [r for r in final_results if "상따" not in r["Scenario"]]
+    sangdda_results = [r for r in final_results if "상따" in r["Scenario"]]
 
     print_table(normal_results, "일반 분석 결과")
     print_table(sangdda_results, "상따(29.9%) 시나리오 결과", minimal=True)
-
-    print_explanations(normal_results, "일반 분석 결과")
-    # print_explanations(sangdda_results, "상따(29.9%) 시나리오 결과")
 
 
 if __name__ == "__main__":
