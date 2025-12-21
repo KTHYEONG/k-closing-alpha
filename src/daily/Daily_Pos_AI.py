@@ -13,9 +13,8 @@ import unicodedata
 
 from joblib import load
 
-# 구글 시트 연동을 위한 라이브러리
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+# DB 로더 임포트
+from src.data.db_loader import load_theme_from_db
 
 # .env 파일에서 환경변수를 불러오기 위한 라이브러리
 from dotenv import load_dotenv
@@ -109,22 +108,6 @@ MODEL_PATH = os.path.join(MODELS_DIR, "best_stock_rg.cbm")
 env_file_path = os.path.join(PROJECT_ROOT, ".env")
 load_dotenv(env_file_path)
 
-# 3. 구글 시트 인증 키 파일 (환경변수 사용)
-google_key_env = os.getenv("GSPREAD_KEY_PATH")
-if not google_key_env:
-    print(
-        f"{Colors.RED}[Error] 'GSPREAD_KEY_PATH' 환경변수를 찾을 수 없습니다. (.env: {env_file_path}){Colors.RESET}"
-    )
-    sys.exit(1)
-
-if not os.path.isabs(google_key_env):
-    # 상대 경로를 입력한 경우 프로젝트 루트 기준으로 보정
-    google_key_env = os.path.join(PROJECT_ROOT, google_key_env)
-
-GOOGLE_KEY_PATH = os.path.normpath(google_key_env)
-GOOGLE_SHEET_NAME = "Stock"
-WORKSHEET_NAME = "코드_테마_DB"
-
 ### 모든 종목에 대해 분석할 기본 시나리오 리스트 ###
 DEFAULT_SCENARIOS = [
     "신고가",
@@ -181,60 +164,6 @@ def pad_str(s, width, align="left"):
 # =========================================================
 # 1. 데이터 로드 및 전처리
 # =========================================================
-
-
-def load_theme_from_gsheet(key_path, sheet_name, worksheet_name):
-    """
-    [NEW] 구글 시트에서 실시간으로 데이터를 가져와 {종목코드: 테마} 딕셔너리 반환
-    """
-    if not os.path.exists(key_path):
-        print(f"{Colors.RED}[Error] 인증 키 파일({key_path})이 없습니다.{Colors.RESET}")
-        return {}
-
-    print(
-        f"{Colors.CYAN}구글 시트 연결 중... ({sheet_name} > {worksheet_name}){Colors.RESET}"
-    )
-
-    try:
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(key_path, scope)
-        client = gspread.authorize(creds)
-        sh = client.open(sheet_name)
-        ws = sh.worksheet(worksheet_name)
-        records = ws.get_all_records()
-        df = pd.DataFrame(records)
-
-        if df.empty:
-            print(f"{Colors.YELLOW}[Warning] 시트가 비어있습니다.{Colors.RESET}")
-            return {}
-
-        code_col = None
-        theme_col = None
-        for col in df.columns:
-            if "코드" in str(col):
-                code_col = col
-            if "테마" in str(col) or "섹터" in str(col):
-                theme_col = col
-
-        if not code_col or not theme_col:
-            print(
-                f"{Colors.RED}시트에서 '종목코드' 또는 '테마' 컬럼을 찾을 수 없습니다.{Colors.RESET}"
-            )
-            return {}
-
-        df[code_col] = df[code_col].apply(
-            lambda x: str(x).strip().split(".")[0].zfill(6)
-        )
-        theme_map = dict(zip(df[code_col], df[theme_col]))
-        print(f"✅ 구글 시트 데이터 로드 완료: 총 {len(theme_map)}개 매핑")
-        return theme_map
-
-    except Exception as e:
-        print(f"{Colors.RED}[Error] 구글 시트 연동 실패: {e}{Colors.RESET}")
-        return {}
 
 
 def load_and_preprocess_data(file_path):
@@ -454,9 +383,8 @@ def main():
         explainer = shap.TreeExplainer(model)
     # 데이터 로드
     df_condition = load_and_preprocess_data(CONDITION_EXCEL_PATH)
-    theme_map = load_theme_from_gsheet(
-        GOOGLE_KEY_PATH, GOOGLE_SHEET_NAME, WORKSHEET_NAME
-    )
+    print(f"{Colors.CYAN}로컬 DB에서 테마 정보 로드 중...{Colors.RESET}")
+    theme_map = load_theme_from_db()
 
     # condition_*.xlsx 파일에 있는 모든 종목에 대해 분석 수행
     print(
