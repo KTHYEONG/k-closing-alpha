@@ -65,8 +65,8 @@ session.mount("http://", adapter)
 # ---------------------------------------------------------
 # 1. 접근 토큰 관리
 # ---------------------------------------------------------
-def get_access_token():
-    if os.path.exists(TOKEN_FILE):
+def get_access_token(force_refresh=False):
+    if not force_refresh and os.path.exists(TOKEN_FILE):
         try:
             with open(TOKEN_FILE, "r", encoding="utf-8") as f:
                 saved_data = json.load(f)
@@ -77,8 +77,8 @@ def get_access_token():
                 if datetime.now() < expired_at - timedelta(minutes=10):
                     print(f"✅ 기존 토큰 재사용 (만료: {expired_at})")
                     return saved_data["access_token"]
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠️ 토큰 캐시 읽기 실패: {e}")
 
     print("🚀 새 토큰 발급 요청 중...")
     headers = {"content-type": "application/json"}
@@ -103,15 +103,18 @@ def get_access_token():
         "%Y-%m-%d %H:%M:%S"
     )
 
-    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "access_token": new_token,
-                "expired_at": expired_at_str,
-                "app_key": APP_KEY,
-            },
-            f,
-        )
+    try:
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "access_token": new_token,
+                    "expired_at": expired_at_str,
+                    "app_key": APP_KEY,
+                },
+                f,
+            )
+    except Exception as e:
+        print(f"⚠️ 토큰 캐시 저장 실패: {e}")
 
     return new_token
 
