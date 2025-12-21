@@ -225,11 +225,12 @@ def print_table(results_list, title, minimal=False):
     if not results_list:
         return
 
-    results_list.sort(key=lambda x: x["Score"], reverse=True)
+    # Rank 오름차순, 동일 Rank 내에서는 Score 내림차순 정렬
+    results_list.sort(key=lambda x: (x["Rank"], -x["Score"]))
 
     if minimal:
-        W_RANK, W_NAME = 6, 12
-        W_PROB, W_DECISION = 8, 14
+        W_RANK, W_NAME = 6, 16
+        W_PROB, W_DECISION = 8, 12
         header = (
             f"| {pad_str('Rank', W_RANK, 'center')} "
             f"| {pad_str('Name', W_NAME, 'center')} "
@@ -237,12 +238,12 @@ def print_table(results_list, title, minimal=False):
             f"| {pad_str('Decision', W_DECISION, 'center')} |"
         )
     else:
-        W_RANK, W_NAME, W_THEME = 6, 12, 10
-        W_SCENARIO, W_PROB, W_DECISION = 12, 8, 14
+        W_RANK, W_NAME, W_RATE = 6, 16, 8
+        W_SCENARIO, W_PROB, W_DECISION = 18, 8, 12
         header = (
             f"| {pad_str('Rank', W_RANK, 'center')} "
             f"| {pad_str('Name', W_NAME, 'center')} "
-            f"| {pad_str('Theme', W_THEME, 'center')} "
+            f"| {pad_str('Rate', W_RATE, 'center')} "
             f"| {pad_str('Scenario', W_SCENARIO, 'center')} "
             f"| {pad_str('Prob', W_PROB, 'center')} "
             f"| {pad_str('Decision', W_DECISION, 'center')} |"
@@ -263,8 +264,11 @@ def print_table(results_list, title, minimal=False):
         previous_stock_name = res["Name"]
 
         name_display = res["Name"]
+        # 이름이 설정된 너비보다 길 경우에만 최소한의 말줄임 적용
         if get_display_width(name_display) > W_NAME:
-            name_display = name_display[:6] + ".."
+            while get_display_width(name_display + "..") > W_NAME:
+                name_display = name_display[:-1]
+            name_display += ".."
         score_str = f"{res['Score']:.4f}"
 
         if minimal:
@@ -275,17 +279,18 @@ def print_table(results_list, title, minimal=False):
                 f"| {dec_color}{pad_str(res['Decision'], W_DECISION, 'center')}{Colors.RESET} |"
             )
         else:
-            theme_display = res["Theme"]
-            if get_display_width(theme_display) > W_THEME:
-                theme_display = theme_display[:6] + ".."
+            rate_display = f"{res['Applied_Rate']}%"
             scenario_display = res["Scenario"]
+            # 시나리오(차트분석)가 길 경우 마지막 숫자가 보이도록 너비 내에서 최대한 출력
             if get_display_width(scenario_display) > W_SCENARIO:
-                scenario_display = scenario_display[:4] + ".."
+                while get_display_width(scenario_display + "..") > W_SCENARIO:
+                    scenario_display = scenario_display[:-1]
+                scenario_display += ".."
 
             row_str = (
                 f"| {pad_str(res['Rank'], W_RANK, 'center')} "
                 f"| {pad_str(name_display, W_NAME, 'left')} "
-                f"| {pad_str(theme_display, W_THEME, 'left')} "
+                f"| {pad_str(rate_display, W_RATE, 'center')} "
                 f"| {pad_str(scenario_display, W_SCENARIO, 'left')} "
                 f"| {pad_str(score_str, W_PROB, 'center')} "
                 f"| {dec_color}{pad_str(res['Decision'], W_DECISION, 'center')}{Colors.RESET} |"
@@ -307,15 +312,6 @@ def main():
     else:
         print(f"{Colors.GREEN}모델 로드 중...{Colors.RESET}")
         model = load(MODEL_PATH)
-
-    explainer = None
-    if model and (
-        "extratrees" in str(type(model)).lower()
-        or "catboost" in str(type(model)).lower()
-    ):
-        import shap
-
-        explainer = shap.TreeExplainer(model)
 
     # 2. 데이터 로드 및 테마 일괄 매핑
     df_condition = load_and_preprocess_data(CONDITION_EXCEL_PATH)
