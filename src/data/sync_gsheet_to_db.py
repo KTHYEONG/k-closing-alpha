@@ -145,6 +145,10 @@ def sync_gsheet_to_sqlite():
                         .str[0]
                         .str.zfill(6)
                     )
+                
+                # 컬럼명 통일: "테마/섹터"를 "테마"로 변경하여 DB 저장 (특수문자 방지)
+                if "테마/섹터" in df_theme.columns:
+                    df_theme = df_theme.rename(columns={"테마/섹터": "테마"})
 
                 df_theme.to_sql("table_theme", conn, if_exists="replace", index=False)
                 print(f"    ✅ table_theme 저장 완료: {len(df_theme)}행")
