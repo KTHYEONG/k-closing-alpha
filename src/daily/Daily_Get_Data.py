@@ -513,6 +513,7 @@ async def fetch_all_stock_data(stock_list):
                 "(차트통과)": 1,
             }
         )
+    print("\n✅ 데이터 수집 완료")
     return results
 
 
@@ -548,7 +549,23 @@ if results:
         except Exception:
             pass
 
-    # 2. 현재 엑셀 파일에서 사용자가 수정한 최신 값 반영 (캐시 업데이트)
+    # 2. [수정] 신규/제외 종목 감지 (엑셀 복원 전 수행하여 정확한 변경사항 포착)
+    current_codes = set(df["종목코드"].unique())
+    cached_codes = set(daily_memory.keys())
+
+    # 2-1. 신규 종목 포착 (현재 결과에는 있으나 캐시에는 없는 것)
+    new_codes = current_codes - cached_codes
+    if new_codes:
+        new_stocks = df[df["종목코드"].isin(new_codes)]
+        print(f"\n✨ [신규 종목 포착] {len(new_stocks)}개 종목이 새로 발견되었습니다:")
+        for _, row in new_stocks.iterrows():
+            print(f"   - {row['종목명']} ({row['종목코드']})")
+
+        # 신규 종목들을 메모리에 추가 (기본값 1)
+        for code in new_codes:
+            daily_memory[code] = 1
+
+    # 3. 기존 엑셀 파일에서 사용자가 수정한 최신 값 반영 (수동 수정사항 유지)
     if os.path.exists(save_path):
         try:
             file_mtime = datetime.fromtimestamp(os.path.getmtime(save_path)).date()
@@ -556,15 +573,14 @@ if results:
                 old_df = pd.read_excel(save_path, engine="openpyxl")
                 if "종목코드" in old_df.columns and "(차트통과)" in old_df.columns:
                     old_df["종목코드"] = old_df["종목코드"].astype(str).str.zfill(6)
-                    # 엑셀에 있는 현재 값들을 캐시에 병합 (사용자 수정 반영)
-                    current_excel_vals = dict(zip(old_df["종목코드"], old_df["(차트통과)"]))
+                    current_excel_vals = dict(
+                        zip(old_df["종목코드"], old_df["(차트통과)"])
+                    )
                     daily_memory.update(current_excel_vals)
         except Exception as e:
             print(f"    ⚠️ 캐시 업데이트 중 오류: {e}")
 
-    # 3. 새로운 결과에 캐시 적용 (종목이 잠시 사라졌어도 daily_memory에 남아있음)
     df["(차트통과)"] = df["종목코드"].map(daily_memory).fillna(1).astype(int)
-    print(f"    ℹ️ (차트통과) 데이터 복원 완료 (기억된 종목 수: {len(daily_memory)}개)")
 
     # 4. 업데이트된 캐시 저장
     try:
@@ -618,11 +634,10 @@ if results:
                 cell.alignment = center_align
 
         wb.save(save_path)
-        print("✅ 엑셀 서식 적용 완료 (중앙 정렬)")
 
     except Exception as e:
         print(f"⚠️ 엑셀 서식 적용 실패: {e}")
 
-    print(f"\n📂 엑셀 최종 저장 완료: {save_path}")
+    print(f"\n📂 엑셀 저장 완료!")
 else:
     print("⚠ 검색된 종목이 없습니다.")
