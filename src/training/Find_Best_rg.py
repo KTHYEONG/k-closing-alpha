@@ -22,14 +22,11 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 sys.path.append(project_root)
 
-from src.data.gsheet_loader import load_and_combine_sheets
+from src.data.db_loader import load_trade_log_from_db
 from src.processing.preprocessor import preprocess_data
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.INFO)
-
-GOOGLE_SHEET_NAME = "Stock"
-WORKSHEET_NAMES = ["Trade", "Trade2"]
 
 # ==========================================
 # [최적화 설정] CPU 코어 할당 전략
@@ -40,10 +37,10 @@ N_JOBS_MODEL = 1  # 각 모델은 단일 스레드만 사용 (오버헤드 방�
 
 def load_regression_data():
     """Load & preprocess data for regression using shared preprocessor."""
-    print("\n[Step 1/5] Loading data from Google Sheets...", flush=True)
+    print("\n[Step 1/5] Loading data from local DB...", flush=True)
     start_time = time.time()
 
-    df_raw = load_and_combine_sheets(GOOGLE_SHEET_NAME, WORKSHEET_NAMES)
+    df_raw = load_trade_log_from_db()
 
     elapsed = time.time() - start_time
     print(f" -> Data loaded successfully in {elapsed:.2f} seconds.", flush=True)
@@ -56,6 +53,12 @@ def load_regression_data():
     order_idx = df_processed.index
     X_cat = X_cat.loc[order_idx]
     y = y.loc[order_idx]
+
+    # 숫자열 확인
+    numeric_cols = X_cat.columns.difference(cat_features)
+    X_cat[numeric_cols] = (
+        X_cat[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    )
 
     # 범주형 라벨 인코딩 버전 (LightGBM/XGBoost 등 숫자형 입력용)
     X_encoded = X_cat.copy()

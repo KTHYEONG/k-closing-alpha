@@ -24,7 +24,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 sys.path.append(project_root)
 
-from src.data.gsheet_loader import load_and_combine_sheets
+from src.data.db_loader import load_trade_log_from_db
 from src.processing.preprocessor import preprocess_data
 
 try:
@@ -38,8 +38,6 @@ except ImportError:
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-GOOGLE_SHEET_NAME = "Stock"
-WORKSHEET_NAMES = ["Trade", "Trade2"]
 TRAIN_RATIO = 0.8
 N_TRIALS = 60
 BASE_SPLITS = 5
@@ -47,8 +45,9 @@ BASE_SPLITS = 5
 GROWTH_THRESHOLD = 5000
 EXPANDED_THRESHOLD = 10000
 
-print("\n[ExtraTrees tuner] Loading data from Google Sheets...")
-df_raw = load_and_combine_sheets(GOOGLE_SHEET_NAME, WORKSHEET_NAMES)
+print("\n[ExtraTrees tuner] Loading data from local DB...")
+df_raw = load_trade_log_from_db()
+
 print(f" -> Downloaded {len(df_raw):,} rows from sheets.", flush=True)
 
 X_raw, y, cat_features, df_processed = preprocess_data(df_raw, task="regression")
@@ -61,6 +60,12 @@ else:
 
 X_raw = X_raw.loc[order_idx].reset_index(drop=True)
 y = y.loc[order_idx].reset_index(drop=True)
+
+# 숫자열 확인
+numeric_cols = X_raw.columns.difference(cat_features)
+X_raw[numeric_cols] = (
+    X_raw[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+)
 
 X = X_raw.copy()
 label_encoders = {}

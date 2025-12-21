@@ -22,14 +22,12 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 sys.path.append(project_root)
 
-from src.data.gsheet_loader import load_and_combine_sheets
+from src.data.db_loader import load_trade_log_from_db
 from src.processing.preprocessor import preprocess_data
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-GOOGLE_SHEET_NAME = "Stock"
-WORKSHEET_NAMES = ["Trade", "Trade2"]
 TRAIN_RATIO = 0.8
 USE_GPU = False
 N_TRIALS = 60
@@ -38,8 +36,8 @@ BASE_SPLITS = 4
 GROWTH_THRESHOLD = 5000
 EXPANDED_THRESHOLD = 10000
 
-print("\n[CatBoost tuner] Loading data from Google Sheets...")
-df_raw = load_and_combine_sheets(GOOGLE_SHEET_NAME, WORKSHEET_NAMES)
+print("\n[CatBoost tuner] Loading data from local DB...")
+df_raw = load_trade_log_from_db()
 
 X, y, cat_features, df_processed = preprocess_data(df_raw)
 
@@ -51,6 +49,10 @@ else:
 X = X.loc[order_idx].reset_index(drop=True)
 y = y.loc[order_idx].reset_index(drop=True)
 df_processed = df_processed.loc[order_idx].reset_index(drop=True)
+
+# 숫자열 확인
+numeric_cols = X.columns.difference(cat_features)
+X[numeric_cols] = X[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
 
 dataset_size = len(y)
 if dataset_size < GROWTH_THRESHOLD:
