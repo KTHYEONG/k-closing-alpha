@@ -101,6 +101,17 @@ async def fetch_single_stock(i, stock, total, sem, client, session):
             client.get_program_net_buy(session, code),
         )
 
+        # 실패한 API 체크
+        failed_apis = []
+        if res_detail.get("rt_cd") != "0":
+            failed_apis.append("현재가")
+        if res_strength.get("rt_cd") != "0":
+            failed_apis.append("체결강도")
+        if res_investor.get("rt_cd") != "0":
+            failed_apis.append("투자자추정")
+        if res_program.get("rt_cd") != "0":
+            failed_apis.append("프로그램")
+
         # 데이터 파싱
         detail = res_detail.get("output") if res_detail.get("rt_cd") == "0" else None
 
@@ -120,12 +131,6 @@ async def fetch_single_stock(i, stock, total, sem, client, session):
             program_amt_won = safe_float(
                 res_program["output"][0].get("whol_smtn_ntby_tr_pbmn", 0)
             )
-
-        if res_detail.get("rt_cd") != "0":
-            print(
-                f"\n {Colors.RED}⚠️ [{code}] 상세정보 로드 실패: {res_detail.get('msg1')}{Colors.RESET}"
-            )
-
         market_name, mkt_cap_eok, trade_amt_eok = "", 0, 0
         if detail:
             try:
@@ -174,7 +179,7 @@ async def fetch_single_stock(i, stock, total, sem, client, session):
             "외국인_순매수(억)": frgn_net_eok,
             "프로그램_순매수(억)": program_net_eok,
             "(차트통과)": 1,
-        }
+        }, failed_apis
 
 
 async def fetch_all_stock_data(stock_list, client, session):
@@ -185,10 +190,17 @@ async def fetch_all_stock_data(stock_list, client, session):
         fetch_single_stock(i, stock, total, sem, client, session)
         for i, stock in enumerate(stock_list)
     ]
-    results = await asyncio.gather(*tasks)
+    all_res = await asyncio.gather(*tasks)
+
+    results = [r for r, f in all_res]
+    failed_info = [
+        (stock_list[i]["name"], stock_list[i]["code"], f)
+        for i, (r, f) in enumerate(all_res)
+        if f
+    ]
 
     print(f"\n{Colors.GREEN}✅ 데이터 수집 완료{Colors.RESET}")
-    return results
+    return results, failed_info
 
 
 async def main():
@@ -242,8 +254,7 @@ async def main():
         )
 
         # 5. 상세 데이터 수집
-        results = await fetch_all_stock_data(stock_list, client, session)
-
+        results, failed_info = await fetch_all_stock_data(stock_list, client, session)
         if results:
             # 데이터 저장 및 후처리 로직 (기존과 동일)
             clean_name = (
@@ -279,6 +290,9 @@ async def main():
                     f"\n{Colors.MAGENTA}✨ [신규 종목 포착] {len(new_codes)}개 종목이 새로 발견되었습니다.{Colors.RESET}"
                 )
                 for code in new_codes:
+                    # 종목코드에 해당하는 종목명을 찾아 함께 출력
+                    name = df[df["종목코드"] == code]["종목명"].iloc[0]
+                    print(f"   👉 {name} ({code})")
                     daily_memory[code] = 1
 
             # 기존 엑셀 수정사항 반영
@@ -347,18 +361,16 @@ async def main():
             except:
                 pass
 
-            print(
-                f"\n{Colors.BOLD}📋 [검색 결과 요약 - 총 {total_count}종목]{Colors.RESET}"
-            )
-            for _, row in df.iterrows():
-                pass_status = (
-                    f"{Colors.GREEN}통과{Colors.RESET}"
-                    if row["(차트통과)"] == 1
-                    else f"{Colors.GRAY}제외{Colors.RESET}"
-                )
-                print(
-                    f"   {int(row['순위']):2d}. {row['종목명']:<10} | {row['등락률']:>6.2f}% | {row['거래대금(억)']:>7.1f}억 | {pass_status}"
-                )
+            # 수집 결과 요약 출력
+            success_count = len(results) - len(failed_info)
+            print(f"\n{Colors.BOLD}� [데이터 수집 요약]{Colors.RESET}")
+            print(f"   ✅ 성공: {Colors.GREEN}{success_count}{Colors.RESET} 종목")
+            if failed_info:
+                print(f"   ❌ 실패: {Colors.RED}{len(failed_info)}{Colors.RESET} 종목")
+                for name, code, apis in failed_info:
+                    print(
+                        f"      - {name} ({code}) [실패항목: {Colors.YELLOW}{', '.join(apis)}{Colors.RESET}]"
+                    )
 
             print(f"\n{Colors.GREEN}📂 엑셀 저장 완료: {save_path}{Colors.RESET}")
         else:
