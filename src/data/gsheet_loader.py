@@ -5,8 +5,9 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+from src import settings
+
+load_dotenv(settings.BASE_DIR / ".env")
 
 
 def load_data_from_gsheet(key_path, sheet_name, worksheet_name):
@@ -37,7 +38,7 @@ def load_and_combine_sheets(*args):
     """여러 워크시트에서 데이터를 로드하고 하나로 합치는 함수"""
     if len(args) == 2:
         sheet_name, worksheet_names = args
-        key_path = os.getenv("GSPREAD_KEY_PATH")
+        key_path = str(settings.GOOGLE_KEY_PATH)
     elif len(args) == 3:
         key_path, sheet_name, worksheet_names = args
     else:

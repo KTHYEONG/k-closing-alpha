@@ -5,7 +5,9 @@ from datetime import datetime
 
 import pandas as pd
 
-TARGET_CONDITION_NAME = "종가매매"
+from src import settings
+
+TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
 TABLE_NAME = "condition_history"
 SNAP_DATE_COL = "스냅샷_날짜"
 STOCK_CODE_COL = "종목코드"
@@ -137,17 +139,13 @@ def fetch_date_rows(date_str: str, history_db: str) -> pd.DataFrame:
 
 
 def main():
-    project_root = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    )
-    data_dir = os.path.join(project_root, "data")
-    history_dir = os.path.join(data_dir, "history")
-    os.makedirs(history_dir, exist_ok=True)
+    history_dir = settings.HISTORY_DIR
+    history_dir.mkdir(parents=True, exist_ok=True)
 
     clean_name = TARGET_CONDITION_NAME.replace("/", "_").replace("\\", "_")
-    latest_path = os.path.join(data_dir, f"condition_{clean_name}.xlsx")
-    history_csv = os.path.join(history_dir, f"condition_history_{clean_name}.csv")
-    history_db = os.path.join(history_dir, f"condition_history_{clean_name}.db")
+    latest_path = str(settings.DATA_DIR / f"condition_{clean_name}.xlsx")
+    history_csv = str(settings.HISTORY_CSV_PATH)
+    history_db = str(settings.HISTORY_DB_PATH)
 
     import_csv_history_if_needed(history_csv, history_db)
 

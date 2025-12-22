@@ -9,34 +9,16 @@ from dotenv import load_dotenv
 from gspread.utils import rowcol_to_a1
 from oauth2client.service_account import ServiceAccountCredentials
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+from etc.program_data import get_program_history
+from src import settings
 
-for path in [PROJECT_ROOT, CURRENT_DIR]:
-    if path not in sys.path:
-        sys.path.append(path)
+GOOGLE_KEY_PATH = str(settings.GOOGLE_KEY_PATH)
+GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
+WORKSHEET_NAME = settings.TRADE2_WORKSHEET_NAME
 
-from program_data import get_program_history
-
-ENV_FILE_PATH = os.path.join(PROJECT_ROOT, ".env")
-load_dotenv(ENV_FILE_PATH)
-
-google_key_env = os.getenv("GSPREAD_KEY_PATH")
-if not google_key_env:
-    raise EnvironmentError(
-        f"'GSPREAD_KEY_PATH' 환경변수가 없습니다 (.env: {ENV_FILE_PATH})"
-    )
-
-if not os.path.isabs(google_key_env):
-    google_key_env = os.path.join(PROJECT_ROOT, google_key_env)
-
-GOOGLE_KEY_PATH = os.path.normpath(google_key_env)
-GOOGLE_SHEET_NAME = "Stock"
-WORKSHEET_NAME = "Trade2"
-
-DATE_COL = "(매수날짜)"
-CODE_COL = "(종목코드)"
-PROGRAM_COL = "(프로그램_순매수)"
+DATE_COL = settings.GOTTEN_COLS["DATE"]
+CODE_COL = settings.GOTTEN_COLS["CODE"]
+PROGRAM_COL = settings.GOTTEN_COLS["PROGRAM"]
 
 
 def _load_sheet_dataframe():

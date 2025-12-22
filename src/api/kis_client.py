@@ -5,23 +5,25 @@ import os
 from datetime import datetime, timedelta
 
 
+from src import settings
+
 class KisApiClient:
     def __init__(
         self,
-        app_key,
-        app_secret,
-        account_id,
-        hts_id,
-        base_url="https://openapi.koreainvestment.com:9443",
-        token_file="kis_token_cache.json",
+        app_key=None,
+        app_secret=None,
+        account_id=None,
+        hts_id=None,
+        base_url=None,
+        token_file=None,
     ):
-        self.app_key = app_key
-        self.app_secret = app_secret
-        self.account_id = account_id
-        self.hts_id = hts_id
-        self.base_url = base_url
+        self.app_key = app_key or settings.KIS_API_CONFIG.get("app_key")
+        self.app_secret = app_secret or settings.KIS_API_CONFIG.get("app_secret")
+        self.account_id = account_id or settings.KIS_API_CONFIG.get("account_id")
+        self.hts_id = hts_id or settings.KIS_API_CONFIG.get("hts_id")
+        self.base_url = base_url or settings.KIS_BASE_URL
         self.token = None
-        self.token_file = token_file
+        self.token_file = str(token_file or settings.TOKEN_FILE)
 
     async def ensure_token(self, session: aiohttp.ClientSession):
         """토큰 유효성을 확인하고 필요시 갱신합니다."""
