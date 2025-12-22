@@ -9,23 +9,16 @@ from gspread.utils import rowcol_to_a1
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-ENV_FILE_PATH = os.path.join(PROJECT_ROOT, ".env")
-load_dotenv(ENV_FILE_PATH)
+from src import settings
 
-google_key_env = os.getenv("GSPREAD_KEY_PATH")
-if not google_key_env:
-    raise EnvironmentError(
-        f"'GSPREAD_KEY_PATH' environment variable is missing (.env: {ENV_FILE_PATH})"
-    )
+GOOGLE_KEY_PATH = str(settings.GOOGLE_KEY_PATH)
+GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
+WORKSHEET_NAME = settings.TRADE2_WORKSHEET_NAME
 
-if not os.path.isabs(google_key_env):
-    google_key_env = os.path.join(PROJECT_ROOT, google_key_env)
-
-# ===== 설정 =====
-GOOGLE_KEY_PATH = os.path.normpath(google_key_env)
-GOOGLE_SHEET_NAME = "Stock"  # 구글 스프레드시트 파일 이름
-WORKSHEET_NAME = "Trade2"  # 사용할 워크시트 이름
+INST_COL = settings.GOTTEN_COLS["INST"]
+FRGN_COL = settings.GOTTEN_COLS["FOREIGN"]
+DATE_COL = settings.GOTTEN_COLS["DATE"]
+CODE_COL = settings.GOTTEN_COLS["CODE"]
 
 
 def _load_sheet_dataframe():
@@ -95,7 +88,7 @@ def fill_missing_stock_data():
     df.replace("", pd.NA, inplace=True)
 
     # 필수 컬럼 존재 여부 확인
-    required_cols = ["(기관_순매수)", "(외국인_순매수)", "(종목코드)", "(매수날짜)"]
+    required_cols = [INST_COL, FRGN_COL, CODE_COL, DATE_COL]
     for col in required_cols:
         if col not in df.columns:
             raise KeyError(f"시트에 '{col}' 열이 없습니다.")
@@ -103,23 +96,23 @@ def fill_missing_stock_data():
     # 2. 업데이트할 대상 행 식별
     # (기관_순매수) 또는 (외국인_순매수)가 비어있는(NaN) 행 중, 종목코드가 유효한 행
     # 주의: 순매수가 0인 경우는 정상 값으로 간주.
-    target_mask = (df["(기관_순매수)"].isna() | df["(외국인_순매수)"].isna()) & df[
-        "(종목코드)"
+    target_mask = (df[INST_COL].isna() | df[FRGN_COL].isna()) & df[
+        CODE_COL
     ].notna()
 
     target_indices = df[target_mask].index
     total_count = len(target_indices)
     print(f"업데이트 대상 행 개수: {total_count}개")
 
-    inst_col_idx = _get_column_index(ws, "(기관_순매수)")
-    frgn_col_idx = _get_column_index(ws, "(외국인_순매수)")
+    inst_col_idx = _get_column_index(ws, INST_COL)
+    frgn_col_idx = _get_column_index(ws, FRGN_COL)
     updates = []
 
     for idx, i in enumerate(target_indices):
         try:
             # 날짜와 종목코드 추출
-            date_value = df.loc[i, "(매수날짜)"]
-            code_value = df.loc[i, "(종목코드)"]
+            date_value = df.loc[i, DATE_COL]
+            code_value = df.loc[i, CODE_COL]
 
             # 날짜 포맷 (여러 형식을 안전하게 처리)
             date = pd.to_datetime(date_value).strftime("%Y%m%d")
@@ -167,8 +160,8 @@ def fill_missing_stock_data():
                 else:
                     inst_net = df_net[valid_inst_cols].sum(axis=1).iloc[0]
 
-                df.at[i, "(기관_순매수)"] = inst_net
-                df.at[i, "(외국인_순매수)"] = foreign_net
+                df.at[i, INST_COL] = inst_net
+                df.at[i, FRGN_COL] = foreign_net
                 updates.append((i + 2, inst_col_idx, inst_net))
                 updates.append((i + 2, frgn_col_idx, foreign_net))
 

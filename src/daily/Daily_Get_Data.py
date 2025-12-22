@@ -8,7 +8,6 @@ sys.path.append(
 
 import json
 import pandas as pd
-import configs.kis_config as kis_config
 
 import asyncio
 import aiohttp
@@ -22,23 +21,18 @@ from openpyxl.styles import Alignment
 from src.api.kis_client import KisApiClient
 from src.utils.display import Colors
 
+from src import settings
+
 # =========================================================
 # [설정] API 접속 정보
 # =========================================================
-APP_KEY = kis_config.real_investment["app_key"]
-APP_SECRET = kis_config.real_investment["app_secret"]
-ACCOUNT_ID = kis_config.real_investment.get("account_id", "")
+APP_KEY = settings.KIS_API_CONFIG["app_key"]
+APP_SECRET = settings.KIS_API_CONFIG["app_secret"]
+ACCOUNT_ID = settings.KIS_API_CONFIG.get("account_id", "")
+HTS_ID = settings.KIS_API_CONFIG.get("hts_id")
 
-# HTS ID를 config 파일에서 불러옴
-HTS_ID = kis_config.real_investment.get("hts_id")
-TARGET_CONDITION_NAME = "종가매매"
-
-# 토큰 캐시 파일을 configs 폴더에 저장
-project_root = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
-configs_dir = os.path.join(project_root, "configs")
-TOKEN_FILE = os.path.join(configs_dir, "kis_token_cache.json")
+TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
+TOKEN_FILE = str(settings.TOKEN_FILE)
 
 print(f"[{datetime.now()}] 조건검색 (엑셀 중앙정렬 기능 추가) 시작...")
 
@@ -89,7 +83,7 @@ async def fetch_single_stock(i, stock, total, sem, client, session):
     """개별 종목 데이터를 수집하는 비동기 태스크"""
     async with sem:
         # 요청 간의 미세한 간격을 두어 TPS 분산 (Staggering)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(settings.API_SLEEP_INTERVAL)
         code = stock["code"]
         name = stock["name"]
 
@@ -184,8 +178,8 @@ async def fetch_single_stock(i, stock, total, sem, client, session):
 
 
 async def fetch_all_stock_data(stock_list, client, session):
-    # 2개 종목 * 종목당 4개 API = 8 TPS (매우 안정적인 수치)
-    sem = asyncio.Semaphore(2)
+    # API 요청 제한 설정
+    sem = asyncio.Semaphore(settings.API_SEMAPHORE_LIMIT)
     total = len(stock_list)
     tasks = [
         fetch_single_stock(i, stock, total, sem, client, session)
@@ -252,20 +246,17 @@ async def main():
 
         if results:
             # 데이터 저장 및 후처리 로직 (기존과 동일)
-            data_dir = os.path.join(project_root, "data")
-            os.makedirs(data_dir, exist_ok=True)
-
             clean_name = (
                 target_cond["condition_nm"].replace("/", "_").replace("\\", "_")
             )
-            save_path = os.path.join(data_dir, f"condition_{clean_name}.xlsx")
+            save_path = str(settings.DATA_DIR / f"condition_{clean_name}.xlsx")
 
             df = pd.DataFrame(results)
             df = df.sort_values(by="거래대금(억)", ascending=False)
             df["순위"] = range(1, len(df) + 1)
 
             # 캐시 로직
-            cache_path = os.path.join(data_dir, "chart_pass_cache.json")
+            cache_path = str(settings.CHART_PASS_CACHE_FILE)
             today_str = datetime.now().strftime("%Y-%m-%d")
             daily_memory = {}
 

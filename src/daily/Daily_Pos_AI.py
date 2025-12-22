@@ -20,13 +20,13 @@ from src.utils.display import Colors, print_table, apply_label_encodings
 from dotenv import load_dotenv
 
 
-PROJECT_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-CONFIGS_DIR = os.path.join(PROJECT_ROOT, "configs")
-MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
-LABEL_ENCODER_PATH = os.path.join(MODELS_DIR, "best_stock_rg_label_encoders.json")
+from src import settings
+
+LABEL_ENCODER_PATH = str(settings.LABEL_ENCODER_PATH)
+CONDITION_EXCEL_PATH = str(settings.CONDITION_EXCEL_PATH)
+MODEL_PATH = str(settings.MODEL_PATH)
+DEFAULT_SCENARIOS = settings.DEFAULT_SCENARIOS
+DAY_NAME_MAP = settings.DAY_NAME_MAP
 
 
 def load_label_encoder_map(path):
@@ -62,26 +62,13 @@ def load_label_encoder_map(path):
 LABEL_ENCODER_MAP = load_label_encoder_map(LABEL_ENCODER_PATH)
 
 
-# 1. 분석할 조건검색 결과 파일 (data 폴더)
-CONDITION_EXCEL_PATH = os.path.join(DATA_DIR, "condition_종가매매.xlsx")
+# 분석할 조건검색 결과 파일 및 모델 파일은 위에서 설정됨
 
-# 2. AI 모델 파일 (models 폴더)
-MODEL_PATH = os.path.join(MODELS_DIR, "best_stock_rg.joblib")
 
 # .env 파일에서 환경변수 로드
-env_file_path = os.path.join(PROJECT_ROOT, ".env")
+env_file_path = os.path.join(settings.BASE_DIR, ".env")
 load_dotenv(env_file_path)
 
-### 모든 종목에 대해 분석할 기본 시나리오 리스트 ###
-DEFAULT_SCENARIOS = [
-    "신고가",
-    "상따",
-    "신고가 근접",
-    "거래량 폭증",
-    "상한가 다음날",
-    "120 돌파",
-    "상승형 음봉",
-]
 
 
 def load_and_preprocess_data(file_path):
@@ -176,18 +163,9 @@ def main():
     )
 
     # 4. 벡터화된 피처 엔지니어링 (루프 없음)
+    import datetime
     today = datetime.datetime.now()
-    day_name_map = {
-        0: "월요일",
-        1: "화요일",
-        2: "수요일",
-        3: "목요일",
-        4: "금요일",
-        5: "토요일",
-        6: "일요일",
-    }
-
-    df_all["day_name"] = day_name_map[today.weekday()]
+    df_all["day_name"] = DAY_NAME_MAP[today.weekday()]
     df_all["day_of_month"] = float(today.day)
     df_all["month"] = float(today.month)
     df_all["차트분석"] = (

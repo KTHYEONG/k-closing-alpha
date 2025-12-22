@@ -2,11 +2,9 @@ import sqlite3
 import pandas as pd
 import os
 import sys
+from src import settings
 
-# 프로젝트 루트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
-DB_PATH = os.path.join(project_root, "data", "stock.db")
+DB_PATH = str(settings.STOCK_DB_PATH)
 
 
 def get_db_connection():
