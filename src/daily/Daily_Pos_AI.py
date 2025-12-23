@@ -12,8 +12,9 @@ import datetime
 
 from joblib import load
 
-# DB 로더 임포트
+# DB 및 시트 관련 임포트
 from src.data.db_loader import load_theme_from_db
+from src.data.sync_gsheet_to_db import sync_theme_only
 from src.utils.display import Colors, print_table, apply_label_encodings
 
 # .env 파일에서 환경변수를 불러오기 위한 라이브러리
@@ -27,6 +28,8 @@ CONDITION_EXCEL_PATH = str(settings.CONDITION_EXCEL_PATH)
 MODEL_PATH = str(settings.MODEL_PATH)
 DEFAULT_SCENARIOS = settings.DEFAULT_SCENARIOS
 DAY_NAME_MAP = settings.DAY_NAME_MAP
+GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
+THEME_WORKSHEET_NAME = settings.THEME_WORKSHEET_NAME
 
 
 def load_label_encoder_map(path):
@@ -139,19 +142,29 @@ def main():
         print(f"{Colors.GREEN}모델 로드 중...{Colors.RESET}")
         model = load(MODEL_PATH)
 
-    # 2. 데이터 로드 및 테마 일괄 매핑
+    # 2. 데이터 로드 및 테마 매핑
     df_condition = load_and_preprocess_data(CONDITION_EXCEL_PATH)
     theme_map = load_theme_from_db()
 
-    # 루프 밖에서 테마 정보를 일괄적으로 입힙니다.
+    # [Smart Sync] 현재 분석 종목 중 테마가 없는 종목이 있는지 확인
+    missing_themes = df_condition[~df_condition["종목코드"].map(theme_map).isin(theme_map.values())]
+    
+    if not missing_themes.empty:
+        print(f"{Colors.CYAN}신규 또는 미분류 종목 발견! 구글 시트에서 테마 정보를 동기화합니다...{Colors.RESET}")
+        sync_theme_only()
+        # 동기화 후 다시 로드
+        theme_map = load_theme_from_db()
+
+    # 최종 테마 정보를 데이터프레임에 입힙니다.
     df_condition["테마_섹터"] = (
         df_condition["종목코드"].map(theme_map).fillna("테마 없음")
     )
 
     # 테마가 없는 종목 알림 출력
-    no_theme_stocks = df_condition[df_condition["테마_섹터"] == "테마 없음"]["종목명"].tolist()
-    if no_theme_stocks:
-        print(f"{Colors.YELLOW}[알림] 테마 미매칭으로 분석 제외: {', '.join(no_theme_stocks)}{Colors.RESET}")
+    df_no_theme = df_condition[df_condition["테마_섹터"] == "테마 없음"]
+    if not df_no_theme.empty:
+        no_theme_names = df_no_theme["종목명"].tolist()
+        print(f"{Colors.YELLOW}[알림] 테마 미매칭으로 분석 제외: {', '.join(no_theme_names)}{Colors.RESET}")
 
     # 테마가 있는 종목만 분석 대상으로 유지
     df_condition = df_condition[df_condition["테마_섹터"] != "테마 없음"].copy()
