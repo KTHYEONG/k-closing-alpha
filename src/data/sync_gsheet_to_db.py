@@ -4,6 +4,7 @@ import sqlite3
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
+from src import settings
 
 # 1. 프로젝트 루트 경로 설정
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,10 +24,10 @@ load_dotenv(os.path.join(project_root, ".env"))
 # ==========================================
 # [설정] 구글 시트 및 DB 정보
 # ==========================================
-DB_PATH = os.path.join(project_root, "data", "stock.db")
-GOOGLE_SHEET_NAME = "Stock"
-TRADE_WORKSHEETS = ["Trade", "Trade2"]
-THEME_WORKSHEET = "코드_테마_DB"
+DB_PATH = str(settings.STOCK_DB_PATH)
+GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
+TRADE_WORKSHEETS = settings.TRADE_WORKSHEETS
+THEME_WORKSHEET = settings.THEME_WORKSHEET_NAME
 
 
 def filter_valid_rows(df, required_keywords=None):
@@ -68,72 +69,60 @@ def filter_valid_rows(df, required_keywords=None):
     return df_valid
 
 
-def sync_gsheet_to_sqlite():
-    print(f"🚀 구글 시트 데이터 동기화 시작 (매수날짜 1열 고정)...")
+def sync_trade_log(conn):
+    """매매일지 (Trade + Trade2) 동기화"""
+    print(f" -> [1/2] 매매일지({TRADE_WORKSHEETS}) 로드 중...")
+    df_trade = load_and_combine_sheets(GOOGLE_SHEET_NAME, TRADE_WORKSHEETS)
 
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    print(f" -> DB 연결 성공: {DB_PATH}")
+    if df_trade is not None and not df_trade.empty:
+        df_trade = filter_valid_rows(df_trade)
 
-    try:
-        # ==================================================
-        # 1. 매매일지 (Trade + Trade2) 동기화
-        # ==================================================
-        print(f" -> [1/2] 매매일지({TRADE_WORKSHEETS}) 로드 중...")
+        if not df_trade.empty:
+            if "매수날짜" in df_trade.columns:
+                df_trade["매수날짜"] = pd.to_datetime(
+                    df_trade["매수날짜"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+            elif "(매수날짜)" in df_trade.columns:
+                df_trade["매수날짜"] = pd.to_datetime(
+                    df_trade["(매수날짜)"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+                df_trade = df_trade.drop(columns=["(매수날짜)"])
 
-        df_trade = load_and_combine_sheets(GOOGLE_SHEET_NAME, TRADE_WORKSHEETS)
+            if "종목코드" in df_trade.columns:
+                df_trade["종목코드"] = df_trade["종목코드"].astype(str).str.zfill(6)
 
-        if df_trade is not None and not df_trade.empty:
-            df_trade = filter_valid_rows(df_trade)
+            if "매수날짜" in df_trade.columns:
+                cols = df_trade.columns.tolist()
+                cols.remove("매수날짜")
+                cols.insert(0, "매수날짜")
+                df_trade = df_trade[cols]
 
-            if not df_trade.empty:
-                # 1) 날짜 포맷팅 및 컬럼명 통일
-                if "매수날짜" in df_trade.columns:
-                    df_trade["매수날짜"] = pd.to_datetime(
-                        df_trade["매수날짜"], errors="coerce"
-                    ).dt.strftime("%Y-%m-%d")
-                elif "(매수날짜)" in df_trade.columns:
-                    df_trade["매수날짜"] = pd.to_datetime(
-                        df_trade["(매수날짜)"], errors="coerce"
-                    ).dt.strftime("%Y-%m-%d")
-                    df_trade = df_trade.drop(columns=["(매수날짜)"])
-
-                # 2) 종목코드 6자리 맞추기
-                if "종목코드" in df_trade.columns:
-                    df_trade["종목코드"] = df_trade["종목코드"].astype(str).str.zfill(6)
-
-                # 컬럼 재정렬: '매수날짜'를 무조건 맨 앞으로 이동
-                if "매수날짜" in df_trade.columns:
-                    cols = df_trade.columns.tolist()
-                    cols.remove("매수날짜")
-                    cols.insert(0, "매수날짜")  # 0번 인덱스(맨 앞)에 삽입
-                    df_trade = df_trade[cols]
-
-                # DB 저장
-                df_trade.to_sql(
-                    "table_trade_log", conn, if_exists="replace", index=False
-                )
-                print(
-                    f"    ✅ table_trade_log 저장 완료: {len(df_trade)}행 (매수날짜 1열 정렬됨)"
-                )
-            else:
-                print("    ⚠️ 유효한 데이터가 없습니다 (모든 행에 종목코드가 없음).")
+            df_trade.to_sql("table_trade_log", conn, if_exists="replace", index=False)
+            print(f"    ✅ table_trade_log 저장 완료: {len(df_trade)}행")
         else:
-            print("    ⚠️ 매매일지 데이터를 가져오지 못했습니다.")
+            print("    ⚠️ 유효한 데이터가 없습니다.")
+    else:
+        print("    ⚠️ 매매일지 데이터를 가져오지 못했습니다.")
 
-        # ==================================================
-        # 2. 테마 정보 (코드_테마_DB) 동기화
-        # ==================================================
-        print(f" -> [2/2] 테마정보({THEME_WORKSHEET}) 로드 중...")
 
-        key_path = os.getenv("GSPREAD_KEY_PATH")
-        if key_path and not os.path.isabs(key_path):
-            key_path = os.path.join(project_root, key_path)
+def sync_theme_only(conn=None):
+    """테마 정보 (코드_테마_DB)만 동기화"""
+    should_close = False
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+        should_close = True
 
-        df_theme = load_data_from_gsheet(key_path, GOOGLE_SHEET_NAME, THEME_WORKSHEET)
+    print(f" -> 테마정보({THEME_WORKSHEET}) 동기화 중...")
+    try:
+        key_path = str(settings.GOOGLE_KEY_PATH)
+        # 1. 전체 데이터 로드 (API 호출 최소화)
+        all_values = load_data_from_gsheet(key_path, GOOGLE_SHEET_NAME, THEME_WORKSHEET)
+        # load_data_from_gsheet가 내부적으로 df를 반환하므로, 
+        # API 레벨에서의 최적화는 gsheet_loader의 append_stocks_to_gsheet와 유사하게 
+        # 직접 gspread를 호출하는 것이 좋지만, 기존 구조를 유지하며 효율적으로 처리합니다.
 
-        if df_theme is not None and not df_theme.empty:
-            df_theme = filter_valid_rows(df_theme)
+        if all_values is not None and not all_values.empty:
+            df_theme = filter_valid_rows(all_values)
 
             if not df_theme.empty:
                 if "종목코드" in df_theme.columns:
@@ -146,7 +135,6 @@ def sync_gsheet_to_sqlite():
                         .str.zfill(6)
                     )
                 
-                # 컬럼명 통일: "테마/섹터"를 "테마"로 변경하여 DB 저장 (특수문자 방지)
                 if "테마/섹터" in df_theme.columns:
                     df_theme = df_theme.rename(columns={"테마/섹터": "테마"})
 
@@ -156,7 +144,18 @@ def sync_gsheet_to_sqlite():
                 print("    ⚠️ 유효한 테마 데이터가 없습니다.")
         else:
             print("    ⚠️ 테마 데이터를 가져오지 못했습니다.")
+    finally:
+        if should_close:
+            conn.close()
 
+
+def sync_gsheet_to_sqlite():
+    print(f"🚀 구글 시트 데이터 전체 동기화 시작...")
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        sync_trade_log(conn)
+        sync_theme_only(conn)
     except Exception as e:
         print(f"❌ 동기화 중 오류 발생: {e}")
     finally:
