@@ -1,9 +1,13 @@
-# -*- coding: utf-8 -*-
 import os
 import sqlite3
 from datetime import datetime
-
 import pandas as pd
+import sys
+
+# 프로젝트 루트 디렉토리를 sys.path에 추가
+sys.path.append(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 from src import settings
 
