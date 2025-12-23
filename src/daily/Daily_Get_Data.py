@@ -20,6 +20,8 @@ from openpyxl.styles import Alignment
 # 커스텀 모듈 임포트
 from src.api.kis_client import KisApiClient
 from src.utils.display import Colors
+from src.data.db_loader import load_theme_from_db
+from src.data.gsheet_loader import append_stocks_to_gsheet
 
 from src import settings
 
@@ -363,6 +365,22 @@ async def main():
 
             # 수집 결과 요약 출력
             success_count = len(results) - len(failed_info)
+
+            # 테마 미매칭 종목 확인 및 구글 시트 자동 등록
+            theme_map = load_theme_from_db()
+            df["테마"] = df["종목코드"].map(theme_map)
+            no_theme_df = df[df["테마"].isna() | (df["테마"] == "")]
+            
+            if not no_theme_df.empty:
+                no_theme_list = no_theme_df[["종목코드", "종목명"]].to_dict("records")
+                print(f"\n{Colors.BOLD}⚠️ [테마 미매칭] {Colors.YELLOW}{len(no_theme_list)}{Colors.RESET} 종목 발견")
+                print(f"   👉 대상 종목: {', '.join([s['종목명'] for s in no_theme_list])}")
+                print(f"   [진행] 미매칭 종목을 구글 시트에 등록 중...")
+                
+                key_path = str(settings.GOOGLE_KEY_PATH)
+                GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
+                THEME_WORKSHEET_NAME = settings.THEME_WORKSHEET_NAME
+                append_stocks_to_gsheet(key_path, GOOGLE_SHEET_NAME, THEME_WORKSHEET_NAME, no_theme_list)
             print(f"\n{Colors.BOLD}� [데이터 수집 요약]{Colors.RESET}")
             print(f"   ✅ 성공: {Colors.GREEN}{success_count}{Colors.RESET} 종목")
             if failed_info:
