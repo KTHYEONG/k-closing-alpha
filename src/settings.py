@@ -67,7 +67,8 @@ else:
     GOOGLE_KEY_PATH = Path(GSPREAD_KEY_PATH_ENV)
 
 GOOGLE_SHEET_NAME = "Stock"
-TRADE2_WORKSHEET_NAME = "Trade2"
+TRADE_WORKSHEETS = ["Trade", "Trade2"]
+THEME_WORKSHEET_NAME = "코드_테마_DB"
 
 # Google Sheets 컬럼명 설정
 GOTTEN_COLS = {
@@ -85,6 +86,7 @@ LABEL_ENCODER_PATH = MODELS_DIR / "best_stock_rg_label_encoders.json"
 MODEL_PATH = MODELS_DIR / "best_stock_rg.joblib"
 CONDITION_EXCEL_PATH = DATA_DIR / f"condition_{TARGET_CONDITION_NAME}.xlsx"
 
+# AI 분석 기본 시나리오 (시트에서 새로운 유형 기록시 추가 필요)
 DEFAULT_SCENARIOS = [
     "신고가",
     "상따",
