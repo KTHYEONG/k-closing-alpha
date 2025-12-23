@@ -147,6 +147,13 @@ def main():
     df_condition["테마_섹터"] = (
         df_condition["종목코드"].map(theme_map).fillna("테마 없음")
     )
+
+    # 테마가 없는 종목 알림 출력
+    no_theme_stocks = df_condition[df_condition["테마_섹터"] == "테마 없음"]["종목명"].tolist()
+    if no_theme_stocks:
+        print(f"{Colors.YELLOW}[알림] 테마 미매칭으로 분석 제외: {', '.join(no_theme_stocks)}{Colors.RESET}")
+
+    # 테마가 있는 종목만 분석 대상으로 유지
     df_condition = df_condition[df_condition["테마_섹터"] != "테마 없음"].copy()
 
     if df_condition.empty:
