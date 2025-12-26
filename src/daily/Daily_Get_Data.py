@@ -329,6 +329,17 @@ async def main():
             df["평균거래대금(억)"] = round(df["거래대금(억)"].mean(), 2)
             df["KOSPI등락률"] = kospi_rate
             df["KOSDAQ등락률"] = kosdaq_rate
+            
+            # [New] V-KOSPI 계산 및 추가
+            print(f"\n{Colors.CYAN}📊 V-KOSPI 계산 중...{Colors.RESET}")
+            try:
+                from src.api.kis_client import fetch_kospi200_and_calculate_vkospi
+                vkospi_value, vkospi_change = await fetch_kospi200_and_calculate_vkospi()
+                df["(v-kospi)"] = round(vkospi_value, 2)
+                print(f"   ✅ V-KOSPI: {vkospi_value:.2f} (Change: {vkospi_change:+.2%})")
+            except Exception as e:
+                print(f"   {Colors.YELLOW}⚠️ V-KOSPI 계산 실패: {e}{Colors.RESET}")
+                df["(v-kospi)"] = 0.0
 
             # 컬럼 정렬 및 저장
             cols_order = [
@@ -348,6 +359,7 @@ async def main():
                 "평균거래대금(억)",
                 "KOSPI등락률",
                 "KOSDAQ등락률",
+                "(v-kospi)",  # 마지막 열에 추가 (구글 시트 형식)
             ]
             df[cols_order].to_excel(save_path, index=False)
 
