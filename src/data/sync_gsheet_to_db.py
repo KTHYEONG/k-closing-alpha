@@ -4,14 +4,16 @@ import sqlite3
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-from src import settings
 
-# 1. 프로젝트 루트 경로 설정
+# 1. 프로젝트 루트 경로 설정 (import 전에 먼저 실행)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
-sys.path.append(project_root)
+sys.path.insert(0, project_root)
 
-# 2. gsheet_loader 모듈 임포트
+# 2. 이제 src 모듈을 import 가능
+from src import settings
+
+# 3. gsheet_loader 모듈 임포트
 try:
     from src.data.gsheet_loader import load_and_combine_sheets, load_data_from_gsheet
 except ImportError:
