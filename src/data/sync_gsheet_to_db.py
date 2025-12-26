@@ -92,6 +92,11 @@ def sync_trade_log(conn):
 
             if "종목코드" in df_trade.columns:
                 df_trade["종목코드"] = df_trade["종목코드"].astype(str).str.zfill(6)
+            
+            # v-kospi 컬럼명 정리 (preprocessor.py와 일관성 유지)
+            if "(v-kospi)" in df_trade.columns:
+                df_trade = df_trade.rename(columns={"(v-kospi)": "v_kospi"})
+                print(f"    📊 v-kospi 컬럼 포함됨")
 
             if "매수날짜" in df_trade.columns:
                 cols = df_trade.columns.tolist()
