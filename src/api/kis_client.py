@@ -118,7 +118,7 @@ class KisApiClient:
         )
 
     async def get_market_index_rate(self, session, market_code):
-        """시장 지수 등락률 조회 (FHKUP03500100)"""
+        """시장 지수 등락률 조회 (FHKUP03500100) - 최근 5일"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice"
         now = datetime.now()
         str_today = now.strftime("%Y%m%d")
@@ -129,6 +129,29 @@ class KisApiClient:
             "fid_input_date_1": str_past,
             "fid_input_date_2": str_today,
             "fid_period_div_code": "D",
+            "fid_org_adj_prc": "0",
+        }
+        return await self._handle_request(
+            session.get, url, headers=self._get_headers("FHKUP03500100"), params=params
+        )
+
+    async def get_market_index_history(
+        self, session, market_code, start_date, end_date, period_code="D"
+    ):
+        """
+        시장 지수/업종 기간별 시세 조회 (FHKUP03500100) - 기간 지정 가능
+        market_code: 업종/지수 코드 (KOSPI: 0001, KOSDAQ: 1001, V-KOSPI: 200 등)
+        start_date: YYYYMMDD
+        end_date: YYYYMMDD
+        period_code: D(일), W(주), M(월), Y(년)
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice"
+        params = {
+            "fid_cond_mrkt_div_code": "U",
+            "fid_input_iscd": market_code,
+            "fid_input_date_1": start_date,
+            "fid_input_date_2": end_date,
+            "fid_period_div_code": period_code,
             "fid_org_adj_prc": "0",
         }
         return await self._handle_request(
@@ -168,3 +191,74 @@ class KisApiClient:
         return await self._handle_request(
             session.get, url, headers=self._get_headers("HHKST03900400"), params=params
         )
+
+
+async def fetch_kospi200_and_calculate_vkospi():
+    """
+    KOSPI 200 최근 데이터를 가져와 역사적 변동성(HV)을 계산합니다.
+    
+    Returns:
+        tuple: (v_kospi, v_kospi_change)
+            - v_kospi: 오늘의 역사적 변동성 (%)
+            - v_kospi_change: 전일 대비 변화율
+    """
+    import pandas as pd
+    import numpy as np
+    from datetime import datetime, timedelta
+    import aiohttp
+    
+    client = KisApiClient()
+    kospi200_code = "1028"  # KOSPI 200
+    
+    # 최근 30일 데이터 (영업일 기준 약 21일)
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+    
+    async with aiohttp.ClientSession() as session:
+        await client.ensure_token(session)
+        
+        resp = await client.get_market_index_history(
+            session, kospi200_code, start_date, end_date
+        )
+        
+        if resp.get('rt_cd') == '0':
+            items = resp.get('output2', [])
+            
+            if len(items) >= 2:
+                # 데이터 정리 및 정렬
+                records = []
+                for item in items:
+                    date = item.get('stck_bsop_date')
+                    close = float(item.get('bstp_nmix_prpr') or 0)
+                    if date and close > 0:
+                        records.append({'date': date, 'close': close})
+                
+                df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
+                
+                if len(df) >= 2:
+                    # 로그 수익률 계산
+                    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+                    
+                    # 최근 20일 표준편차 (마지막 행 기준)
+                    if len(df) >= 21:
+                        recent_returns = df['log_ret'].iloc[-20:]
+                    else:
+                        recent_returns = df['log_ret'].dropna()
+                    
+                    std = recent_returns.std()
+                    
+                    # 연율화 HV
+                    vkospi_today = std * np.sqrt(252) * 100
+                    
+                    # 어제 HV 계산 (전일 대비 변화율용)
+                    if len(df) >= 22:
+                        prev_returns = df['log_ret'].iloc[-21:-1]
+                        prev_std = prev_returns.std()
+                        vkospi_yesterday = prev_std * np.sqrt(252) * 100
+                        vkospi_change = (vkospi_today - vkospi_yesterday) / vkospi_yesterday if vkospi_yesterday != 0 else 0
+                    else:
+                        vkospi_change = 0
+                    
+                    return vkospi_today, vkospi_change
+        
+        return 0.0, 0.0
