@@ -82,8 +82,8 @@ GOTTEN_COLS = {
 # =========================================================
 # [AI 분석 설정 (Daily_Pos_AI)]
 # =========================================================
-LABEL_ENCODER_PATH = MODELS_DIR / "best_stock_rg_label_encoders.json"
-MODEL_PATH = MODELS_DIR / "best_stock_rg.joblib"
+LABEL_ENCODER_PATH = MODELS_DIR / "best_stock_rg_cat_encoders.json"
+MODEL_PATH = MODELS_DIR / "best_stock_rg_cat.joblib"
 CONDITION_EXCEL_PATH = DATA_DIR / f"condition_{TARGET_CONDITION_NAME}.xlsx"
 
 # AI 분석 기본 시나리오 (시트에서 새로운 유형 기록시 추가 필요)
