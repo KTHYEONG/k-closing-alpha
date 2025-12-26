@@ -245,6 +245,28 @@ def main():
         print(f"{Colors.RED}분석 대상 종목이 없습니다.{Colors.RESET}")
         return
 
+    # [New] 실시간 V-KOSPI 계산 (KOSPI 200 데이터 기반)
+    current_vkospi = 0.0
+    current_vkospi_change = 0.0
+    
+    try:
+        import asyncio
+        from src.api.kis_client import fetch_kospi200_and_calculate_vkospi
+        
+        print(f"{Colors.CYAN}실시간 V-KOSPI 계산을 위해 KOSPI 200 데이터를 가져옵니다...{Colors.RESET}")
+        
+        # 비동기 함수 실행
+        current_vkospi, current_vkospi_change = asyncio.run(fetch_kospi200_and_calculate_vkospi())
+        
+        if current_vkospi > 0:
+            print(f"  > 계산된 V-KOSPI (오늘): {current_vkospi:.2f} (Change: {current_vkospi_change:.2%})")
+        else:
+            print(f"  > V-KOSPI 계산 실패. 기본값(0) 사용")
+            
+    except Exception as e:
+        print(f"{Colors.YELLOW}[Warning] V-KOSPI 계산 중 오류 발생: {e}{Colors.RESET}")
+        print("  > v_kospi 관련 피처는 0으로 처리됩니다.")
+
     # 3. [핵심] 모든 시나리오를 데이터프레임으로 확장 (Cross Join)
     # 종목 10개 * 시나리오 7개 = 70개 행을 한 번에 만듭니다.
     scenario_df = pd.DataFrame({"Scenario_Base": DEFAULT_SCENARIOS})
@@ -253,6 +275,10 @@ def main():
         .merge(scenario_df.assign(key=1), on="key")
         .drop("key", axis=1)
     )
+    
+    # [New] v-kospi 피처 주입
+    df_all["v_kospi"] = current_vkospi
+    df_all["v_kospi_change"] = current_vkospi_change
 
     # 4. [Feature Engineering Upgrade] 고도화된 전처리 적용
     # preprocessor.py 와 동일한 로직을 적용하여 모델 입력 정합성 확보
@@ -410,26 +436,26 @@ def main():
         # ============================================================
         # 각 종목의 점수가 왜 높게/낮게 나왔는지 상위 3개 피처를 분석합니다.
         # 주의: 종목 수가 많으면 시간이 오래 걸릴 수 있습니다.
-        explain_predictions_with_shap(
-            model=model,
-            X_final=X_final,
-            stock_names=df_all["종목명"].tolist(),
-            top_n=3
-        )
+        # explain_predictions_with_shap(
+        #     model=model,
+        #     X_final=X_final,
+        #     stock_names=df_all["종목명"].tolist(),
+        #     top_n=3
+        # )
         # ============================================================
 
     else:
         df_all["Score"] = 0.5
 
     # 6. 의사결정 로직 일괄 적용
-    # [Optimized Thresholds] 타겟 클리핑 후 재학습된 모델 기준
-    # - 이전 (클리핑 전): [-inf, 0.2, 0.4, 0.8, inf]
-    # - AI 추천 (클리핑 후): [-inf, 0.36, 0.46, 0.54, inf]
-    # - 적용 (안전마진): [-inf, 0.4, 0.5, 0.6, inf]
-    # → 모델이 극단값 학습을 피하고 안정적 수익 패턴에 집중하도록 개선됨
+    # [Optimized Thresholds] AI 추천 최적 임계값 적용 (2025-12-26)
+    # Reduce     (~ -0.23) -> Avg Return: 0.08%
+    # Neutral    (-0.23 ~ 0.07) -> Avg Return: 1.01%
+    # Expand     (0.07 ~ 0.41) -> Avg Return: 0.44%
+    # Max_Expand (0.41 ~) -> Avg Return: 1.44% (Win Rate: 62%)
     df_all["Decision"] = pd.cut(
         df_all["Score"],
-        bins=[-np.inf, 0.35, 0.45, 0.55, np.inf],
+        bins=[-np.inf, -0.23, 0.07, 0.41, np.inf],
         labels=["Reduce", "Neutral", "Expand", "Max_Expand"],
     ).astype(str)
 
