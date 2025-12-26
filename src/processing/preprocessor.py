@@ -31,6 +31,7 @@ RENAME_MAP = {
     "(중요 손실 지표)": "중요_손실_지표",
     "(프로그램_순매수)": "프로그램_순매수",
     "(체결강도)": "체결강도",
+    "(v-kospi)": "v_kospi",
 }
 
 
@@ -161,7 +162,7 @@ def preprocess_data(df, task="classification", target_col=None):
         return df
 
     def _convert_remaining_numeric(df):
-        cols = ["등락률", "kospi", "kosdaq", "day_of_month", "month", "체결강도"]
+        cols = ["등락률", "kospi", "kosdaq", "day_of_month", "month", "체결강도", "v_kospi"]
         for col in [c for c in cols if c in df.columns]:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         return df
@@ -171,6 +172,34 @@ def preprocess_data(df, task="classification", target_col=None):
     df = _apply_custom_ratios(df)
     df = _convert_remaining_numeric(df)
 
+    def _apply_vkospi_advanced(df):
+        if "v_kospi" not in df.columns:
+            return df
+            
+        # 1. 값이 0인 경우(결측) NaN 처리 후 날짜별 대표값(평균) 추출
+        # 종목 데이터이므로 같은 날짜면 v_kospi 값은 동일해야 함
+        # _convert_remaining_numeric에서 이미 0으로 채워졌을 수 있음
+        temp_df = df[[DATE_COL, "v_kospi"]].copy()
+        temp_df["v_kospi"] = temp_df["v_kospi"].replace(0, np.nan)
+        
+        daily_ref = temp_df.groupby(DATE_COL)["v_kospi"].mean()
+        
+        # 2. 결측치 보간 (Forward Fill -> Backward Fill)
+        # 과거 데이터가 비어있으면 앞의 데이터로, 앞이 없으면 뒤에서 가져옴
+        daily_ref = daily_ref.fillna(method='ffill').fillna(method='bfill')
+        
+        # 3. 변화율(Change) 피처 생성
+        daily_change = daily_ref.pct_change().fillna(0)
+        
+        # 4. 원본 DF에 적용 (Map)
+        # v_kospi 자체도 보간된 값으로 업데이트 (안정성 확보)
+        df["v_kospi"] = df[DATE_COL].map(daily_ref).fillna(0)
+        df["v_kospi_change"] = df[DATE_COL].map(daily_change).fillna(0)
+        
+        return df
+
+    df = _apply_vkospi_advanced(df)
+
     # -------------------------------------------------------------------------
     # 타겟 및 특징 선택
     # -------------------------------------------------------------------------
@@ -178,7 +207,12 @@ def preprocess_data(df, task="classification", target_col=None):
     label_col = target_col if target_col else (TARGET_CLASSIFICATION if task == "classification" else TARGET_REGRESSION)
     df.dropna(subset=[label_col], inplace=True)
 
-    exclude_cols = {DATE_COL, TARGET_CLASSIFICATION, TARGET_REGRESSION, "종목코드", "매수가격", "매도가격", "수익_구간", "중요_손실_지표", label_col}
+    exclude_cols = {
+        DATE_COL, TARGET_CLASSIFICATION, TARGET_REGRESSION, 
+        "종목코드", "매수가격", "매도가격", "수익_구간", "중요_손실_지표", label_col,
+        # [사용자 요청] 영향력이 미미하거나 메타데이터인 피처 제외
+        "real_trade", "체결강도", "방어_강도", "kosdaq", "kospi", "is_trading_month_end"
+    }
     feature_cols = [col for col in df.columns if col not in exclude_cols]
 
     cat_features_candidates = ["테마_섹터", "차트분석", "시장구분", "weekday"] # weekday로 교체
