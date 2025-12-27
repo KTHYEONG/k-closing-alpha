@@ -330,16 +330,25 @@ async def main():
             df["KOSPI등락률"] = kospi_rate
             df["KOSDAQ등락률"] = kosdaq_rate
             
-            # [New] V-KOSPI 계산 및 추가
-            print(f"\n{Colors.CYAN}📊 V-KOSPI 계산 중...{Colors.RESET}")
+            # [New] V-KOSPI & V-KOSDAQ 계산 및 추가
+            print(f"\n{Colors.CYAN}📊 변동성 지표(Volatility) 계산 중...{Colors.RESET}")
             try:
-                from src.api.kis_client import fetch_kospi200_and_calculate_vkospi
-                vkospi_value, vkospi_change = await fetch_kospi200_and_calculate_vkospi()
-                df["(v-kospi)"] = round(vkospi_value, 2)
-                print(f"   ✅ V-KOSPI: {vkospi_value:.2f} (Change: {vkospi_change:+.2%})")
+                from src.api.kis_client import fetch_index_and_calculate_volatility
+                
+                # V-KOSPI (KOSPI 200: 1028)
+                vkospi_val, vkospi_chg = await fetch_index_and_calculate_volatility("1028")
+                df["(v-kospi)"] = round(vkospi_val, 2)
+                print(f"   ✅ V-KOSPI: {vkospi_val:.2f} (Change: {vkospi_chg:+.2%})")
+                
+                # V-KOSDAQ (KOSDAQ 150: 2203)
+                vkosdaq_val, vkosdaq_chg = await fetch_index_and_calculate_volatility("2203")
+                df["(v-kosdaq)"] = round(vkosdaq_val, 2)
+                print(f"   ✅ V-KOSDAQ: {vkosdaq_val:.2f} (Change: {vkosdaq_chg:+.2%})")
+                
             except Exception as e:
-                print(f"   {Colors.YELLOW}⚠️ V-KOSPI 계산 실패: {e}{Colors.RESET}")
+                print(f"   {Colors.YELLOW}⚠️ 변동성 지표 계산 실패: {e}{Colors.RESET}")
                 df["(v-kospi)"] = 0.0
+                df["(v-kosdaq)"] = 0.0
 
             # 컬럼 정렬 및 저장
             cols_order = [
@@ -359,7 +368,8 @@ async def main():
                 "평균거래대금(억)",
                 "KOSPI등락률",
                 "KOSDAQ등락률",
-                "(v-kospi)",  # 마지막 열에 추가 (구글 시트 형식)
+                "(v-kospi)",
+                "(v-kosdaq)",
             ]
             df[cols_order].to_excel(save_path, index=False)
 

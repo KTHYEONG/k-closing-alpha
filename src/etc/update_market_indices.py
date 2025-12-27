@@ -102,7 +102,7 @@ def normalize_date(date_str):
 
 
 def calculate_historical_volatility(data_list):
-    """KOSPI 200 데이터를 받아 역사적 변동성을 계산합니다."""
+    """지수 데이터를 받아 역사적 변동성을 계산합니다."""
     # 데이터 정리
     records = []
     for item in data_list:
@@ -137,8 +137,8 @@ def calculate_historical_volatility(data_list):
     return df, hv_map
 
 
-def update_gsheet_with_calculated_data(key_path, sheet_name, worksheet_names, kospi200_map, hv_map):
-    """구글 시트의 (v-kospi) 컬럼에 계산된 역사적 변동성을 업데이트합니다."""
+def update_gsheet_with_calculated_data(key_path, sheet_name, worksheet_names, kospi200_map, hv_map, vkosdaq_map=None):
+    """구글 시트의 (v-kospi), (v-kosdaq) 컬럼에 계산된 역사적 변동성을 업데이트합니다."""
     
     try:
         scope = [
@@ -167,11 +167,14 @@ def update_gsheet_with_calculated_data(key_path, sheet_name, worksheet_names, ko
                 continue
 
             # (v-kospi) 컬럼 찾기
-            try:
+            vkospi_col_idx = -1
+            if "(v-kospi)" in headers:
                 vkospi_col_idx = headers.index("(v-kospi)")
-            except ValueError:
-                print(f"  [Error] '(v-kospi)' 컬럼을 찾을 수 없습니다.")
-                continue
+            
+            # (v-kosdaq) 컬럼 찾기
+            vkosdaq_col_idx = -1
+            if "(v-kosdaq)" in headers:
+                vkosdaq_col_idx = headers.index("(v-kosdaq)")
             
             updates = []
             
@@ -185,24 +188,24 @@ def update_gsheet_with_calculated_data(key_path, sheet_name, worksheet_names, ko
                 if date_value:
                     normalized_date = normalize_date(date_value)
                     if normalized_date:
-                        # V-KOSPI(HV) 값 채우기
-                        hv_val = hv_map.get(normalized_date, "")
-                        if hv_val:
-                            updates.append({
-                                'range': f'{chr(65 + vkospi_col_idx)}{row_idx}',
-                                'values': [[str(hv_val)]]
-                            })
-                        elif vkospi_col_idx < len(row) and row[vkospi_col_idx]:
-                             try:
-                                 # 기존에 잘못된 큰 값(100 이상)이 있다면 삭제
-                                 if float(row[vkospi_col_idx]) > 100:
-                                    updates.append({
-                                        'range': f'{chr(65 + vkospi_col_idx)}{row_idx}',
-                                        'values': [[""]]
-                                    })
-                             except:
-                                 pass
-            
+                        # 1. V-KOSPI 업데이트
+                        if vkospi_col_idx != -1:
+                            hv_val = hv_map.get(normalized_date, "")
+                            if hv_val:
+                                updates.append({
+                                    'range': f'{chr(65 + vkospi_col_idx)}{row_idx}',
+                                    'values': [[str(hv_val)]]
+                                })
+                        
+                        # 2. V-KOSDAQ 업데이트
+                        if vkosdaq_col_idx != -1 and vkosdaq_map:
+                            hv_val_k = vkosdaq_map.get(normalized_date, "")
+                            if hv_val_k:
+                                updates.append({
+                                    'range': f'{chr(65 + vkosdaq_col_idx)}{row_idx}',
+                                    'values': [[str(hv_val_k)]]
+                                })
+
             if updates:
                 ws.batch_update(updates)
                 print(f"  [INFO] {ws_name}에 {len(updates)}개 셀을 업데이트했습니다.")
@@ -216,35 +219,33 @@ def update_gsheet_with_calculated_data(key_path, sheet_name, worksheet_names, ko
 async def main():
     client = KisApiClient()
     
-    # KOSPI 200 코드 (한국투자증권 API에서는 1028)
-    kospi200_code = "1028"  # KOSPI 200 지수
+    # KOSPI 200 코드 (1028) & KOSDAQ 150 코드 (2203 예상)
+    kospi200_code = "1028"
+    kosdaq150_code = "2203"
     
-    # 데이터 수집 기간 (2016년부터 현재까지)
-    # 변동성 계산(전일 대비)을 위해 시작일보다 조금 더 과거 데이터가 필요할 수 있음
+    # 데이터 수집 기간
     start_date = "20151201" 
     end_date = datetime.now().strftime("%Y%m%d")
     
     async with aiohttp.ClientSession() as session:
         await client.ensure_token(session)
         
-        # KOSPI 200 데이터 가져오기
-        print(f"\n[INFO] KOSPI 200 (코드: {kospi200_code}) 데이터 수집 시작...")
+        # 1. KOSPI 200 처리
+        print(f"\n[INFO] KOSPI 200 (코드: {kospi200_code}) 데이터 수집...")
         kospi200_data = await fetch_index_for_date_range(
             client, session, kospi200_code, "KOSPI 200", start_date, end_date
         )
+        _, hv_map_kospi = calculate_historical_volatility(kospi200_data) if kospi200_data else (None, {})
+        kospi200_map = build_date_index_map(kospi200_data) if kospi200_data else {}
         
-        if not kospi200_data:
-            print("\n[경고] 데이터를 가져오지 못했습니다.")
-            return
-
-        # 데이터 프레임 변환 및 변동성 계산
-        print("\n[INFO] 역사적 변동성(Historical Volatility) 계산 중...")
-        df, hv_map = calculate_historical_volatility(kospi200_data)
+        # 2. KOSDAQ 150 처리
+        print(f"\n[INFO] KOSDAQ 150 (코드: {kosdaq150_code}) 데이터 수집...")
+        kosdaq150_data = await fetch_index_for_date_range(
+            client, session, kosdaq150_code, "KOSDAQ 150", start_date, end_date
+        )
+        _, hv_map_kosdaq = calculate_historical_volatility(kosdaq150_data) if kosdaq150_data else (None, {})
         
-        # 날짜별 KOSPI 200 맵
-        kospi200_map = build_date_index_map(kospi200_data)
-        
-        print(f"[INFO] 계산된 변동성 데이터: {len(hv_map)}일")
+        print(f"\n[INFO] 변동성 계산 완료: V-KOSPI {len(hv_map_kospi)}개, V-KOSDAQ {len(hv_map_kosdaq)}개")
         
         # 구글 시트 업데이트
         update_gsheet_with_calculated_data(
@@ -252,12 +253,16 @@ async def main():
             settings.GOOGLE_SHEET_NAME,
             settings.TRADE_WORKSHEETS,
             kospi200_map,
-            hv_map
+            hv_map_kospi,
+            vkosdaq_map=hv_map_kosdaq
         )
         
         print("\n[완료] 데이터 업데이트 완료!")
-        print("       - (v-kospi): KOSPI 200 기반 20일 역사적 변동성(HV)")
+        print("       - (v-kospi): KOSPI 200 기반 HV")
+        print("       - (v-kosdaq): KOSDAQ 150 기반 HV")
 
 
 if __name__ == "__main__":
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())

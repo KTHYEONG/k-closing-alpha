@@ -77,7 +77,8 @@ GOTTEN_COLS = {
     "PROGRAM": "(프로그램_순매수)",
     "INST": "(기관_순매수)",
     "FOREIGN": "(외국인_순매수)",
-    "V_KOSPI": "(v-kospi)"
+    "V_KOSPI": "(v-kospi)",
+    "V_KOSDAQ": "(v-kosdaq)"
 }
 
 # =========================================================

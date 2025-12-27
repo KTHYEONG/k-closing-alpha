@@ -193,14 +193,13 @@ class KisApiClient:
         )
 
 
-async def fetch_kospi200_and_calculate_vkospi():
+async def fetch_index_and_calculate_volatility(index_code="1028"):
     """
-    KOSPI 200 최근 데이터를 가져와 역사적 변동성(HV)을 계산합니다.
+    지수 코드를 받아 최근 데이터를 가져와 역사적 변동성(HV)을 계산합니다.
+    기본값 1028은 KOSPI 200입니다. KOSDAQ 150은 2203(예상)입니다.
     
     Returns:
-        tuple: (v_kospi, v_kospi_change)
-            - v_kospi: 오늘의 역사적 변동성 (%)
-            - v_kospi_change: 전일 대비 변화율
+        tuple: (hv_today, hv_change)
     """
     import pandas as pd
     import numpy as np
@@ -208,17 +207,16 @@ async def fetch_kospi200_and_calculate_vkospi():
     import aiohttp
     
     client = KisApiClient()
-    kospi200_code = "1028"  # KOSPI 200
     
     # 최근 30일 데이터 (영업일 기준 약 21일)
     end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=34)).strftime("%Y%m%d") # 여유있게 34일로 늘림
     
     async with aiohttp.ClientSession() as session:
         await client.ensure_token(session)
         
         resp = await client.get_market_index_history(
-            session, kospi200_code, start_date, end_date
+            session, index_code, start_date, end_date
         )
         
         if resp.get('rt_cd') == '0':
@@ -248,17 +246,21 @@ async def fetch_kospi200_and_calculate_vkospi():
                     std = recent_returns.std()
                     
                     # 연율화 HV
-                    vkospi_today = std * np.sqrt(252) * 100
+                    hv_today = std * np.sqrt(252) * 100
                     
                     # 어제 HV 계산 (전일 대비 변화율용)
                     if len(df) >= 22:
                         prev_returns = df['log_ret'].iloc[-21:-1]
                         prev_std = prev_returns.std()
-                        vkospi_yesterday = prev_std * np.sqrt(252) * 100
-                        vkospi_change = (vkospi_today - vkospi_yesterday) / vkospi_yesterday if vkospi_yesterday != 0 else 0
+                        hv_yesterday = prev_std * np.sqrt(252) * 100
+                        hv_change = (hv_today - hv_yesterday) / hv_yesterday if hv_yesterday != 0 else 0
                     else:
-                        vkospi_change = 0
+                        hv_change = 0
                     
-                    return vkospi_today, vkospi_change
+                    return hv_today, hv_change
         
         return 0.0, 0.0
+
+async def fetch_kospi200_and_calculate_vkospi():
+    """KOSPI 200(1028) 기반 V-KOSPI 계산 (Legacy Wrapper)"""
+    return await fetch_index_and_calculate_volatility("1028")

@@ -245,27 +245,27 @@ def main():
         print(f"{Colors.RED}분석 대상 종목이 없습니다.{Colors.RESET}")
         return
 
-    # [New] 실시간 V-KOSPI 계산 (KOSPI 200 데이터 기반)
-    current_vkospi = 0.0
-    current_vkospi_change = 0.0
+    # [New] 실시간 V-KOSPI & V-KOSDAQ 계산
+    current_vkospi, current_vkospi_change = 0.0, 0.0
+    current_vkosdaq, current_vkosdaq_change = 0.0, 0.0
     
     try:
         import asyncio
-        from src.api.kis_client import fetch_kospi200_and_calculate_vkospi
+        from src.api.kis_client import fetch_index_and_calculate_volatility
         
-        print(f"{Colors.CYAN}실시간 V-KOSPI 계산을 위해 KOSPI 200 데이터를 가져옵니다...{Colors.RESET}")
+        print(f"{Colors.CYAN}실시간 변동성(V-KOSPI/V-KOSDAQ) 데이터를 가져옵니다...{Colors.RESET}")
         
-        # 비동기 함수 실행
-        current_vkospi, current_vkospi_change = asyncio.run(fetch_kospi200_and_calculate_vkospi())
+        # 1. V-KOSPI (1028)
+        current_vkospi, current_vkospi_change = asyncio.run(fetch_index_and_calculate_volatility("1028"))
+        print(f"  > V-KOSPI : {current_vkospi:.2f} (Change: {current_vkospi_change:+.2%})")
         
-        if current_vkospi > 0:
-            print(f"  > 계산된 V-KOSPI (오늘): {current_vkospi:.2f} (Change: {current_vkospi_change:.2%})")
-        else:
-            print(f"  > V-KOSPI 계산 실패. 기본값(0) 사용")
+        # 2. V-KOSDAQ (2203)
+        current_vkosdaq, current_vkosdaq_change = asyncio.run(fetch_index_and_calculate_volatility("2203"))
+        print(f"  > V-KOSDAQ: {current_vkosdaq:.2f} (Change: {current_vkosdaq_change:+.2%})")
             
     except Exception as e:
-        print(f"{Colors.YELLOW}[Warning] V-KOSPI 계산 중 오류 발생: {e}{Colors.RESET}")
-        print("  > v_kospi 관련 피처는 0으로 처리됩니다.")
+        print(f"{Colors.YELLOW}[Warning] 변동성 계산 중 오류 발생: {e}{Colors.RESET}")
+        print("  > 변동성 관련 피처는 0으로 처리됩니다.")
 
     # 3. [핵심] 모든 시나리오를 데이터프레임으로 확장 (Cross Join)
     # 종목 10개 * 시나리오 7개 = 70개 행을 한 번에 만듭니다.
@@ -276,9 +276,11 @@ def main():
         .drop("key", axis=1)
     )
     
-    # [New] v-kospi 피처 주입
+    # [New] v-kospi & v-kosdaq 피처 주입
     df_all["v_kospi"] = current_vkospi
     df_all["v_kospi_change"] = current_vkospi_change
+    df_all["v_kosdaq"] = current_vkosdaq
+    df_all["v_kosdaq_change"] = current_vkosdaq_change
 
     # 4. [Feature Engineering Upgrade] 고도화된 전처리 적용
     # preprocessor.py 와 동일한 로직을 적용하여 모델 입력 정합성 확보
@@ -448,14 +450,14 @@ def main():
         df_all["Score"] = 0.5
 
     # 6. 의사결정 로직 일괄 적용
-    # [Optimized Thresholds] AI 추천 최적 임계값 적용 (2025-12-26)
-    # Reduce     (~ -0.23) -> Avg Return: 0.08%
-    # Neutral    (-0.23 ~ 0.07) -> Avg Return: 1.01%
-    # Expand     (0.07 ~ 0.41) -> Avg Return: 0.44%
-    # Max_Expand (0.41 ~) -> Avg Return: 1.44% (Win Rate: 62%)
+    # [Optimized Thresholds] AI 추천 및 실전 보정 임계값 적용 (2025-12-27)
+    # Reduce     (~ 0.17) -> 매수 금지 (평균 수익 낮음)
+    # Neutral    (0.17 ~ 0.50) -> 관망 (승률 반반 수준)
+    # Expand     (0.50 ~ 0.78) -> 분할 매수 (상승 잠재력 확보)
+    # Max_Expand (0.78 ~) -> 주력 매수 (평균 수익 1.64%, 승률 65% 이상 구간)
     df_all["Decision"] = pd.cut(
         df_all["Score"],
-        bins=[-np.inf, -0.23, 0.07, 0.41, np.inf],
+        bins=[-np.inf, 0.17, 0.50, 0.78, np.inf],
         labels=["Reduce", "Neutral", "Expand", "Max_Expand"],
     ).astype(str)
 
