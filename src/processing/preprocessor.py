@@ -32,6 +32,7 @@ RENAME_MAP = {
     "(프로그램_순매수)": "프로그램_순매수",
     "(체결강도)": "체결강도",
     "(v-kospi)": "v_kospi",
+    "(v-kosdaq)": "v_kosdaq",
 }
 
 
@@ -162,7 +163,7 @@ def preprocess_data(df, task="classification", target_col=None):
         return df
 
     def _convert_remaining_numeric(df):
-        cols = ["등락률", "kospi", "kosdaq", "day_of_month", "month", "체결강도", "v_kospi"]
+        cols = ["등락률", "kospi", "kosdaq", "day_of_month", "month", "체결강도", "v_kospi", "v_kosdaq"]
         for col in [c for c in cols if c in df.columns]:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         return df
@@ -199,6 +200,24 @@ def preprocess_data(df, task="classification", target_col=None):
         return df
 
     df = _apply_vkospi_advanced(df)
+
+    def _apply_vkosdaq_advanced(df):
+        """V-KOSDAQ 결측치 처리 및 변화율 피처 생성"""
+        if "v_kosdaq" not in df.columns:
+            return df
+            
+        # 0을 NaN으로 변환 후 보간
+        df["v_kosdaq"] = df["v_kosdaq"].replace(0, np.nan)
+        df["v_kosdaq"] = df["v_kosdaq"].fillna(method='ffill').fillna(method='bfill')
+        df["v_kosdaq"] = df["v_kosdaq"].fillna(0)
+
+        # 변화율 피처 생성
+        df["v_kosdaq_change"] = df["v_kosdaq"].pct_change().fillna(0)
+        df["v_kosdaq_change"] = df["v_kosdaq_change"].replace([np.inf, -np.inf], 0)
+        
+        return df
+
+    df = _apply_vkosdaq_advanced(df)
 
     # -------------------------------------------------------------------------
     # 타겟 및 특징 선택
