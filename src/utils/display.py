@@ -81,7 +81,7 @@ def print_table(results_list, title, minimal=False):
             f"| {pad_str('Name', W_NAME, 'center')} "
             f"| {pad_str('Rate', W_RATE, 'center')} "
             f"| {pad_str('Scenario', W_SCENARIO, 'center')} "
-            f"| {pad_str('Prob', W_PROB, 'center')} "
+            f"| {pad_str('Score', W_PROB, 'center')} "
             f"| {pad_str('Decision', W_DECISION, 'center')} |"
         )
     divider = "-" * get_display_width(header)
