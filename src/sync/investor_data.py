@@ -199,3 +199,133 @@ def get_investor_trade_daily(
     out["foreign_netbuy"] = pd.to_numeric(out["foreign_netbuy"], errors="coerce")
     out["inst_netbuy"] = pd.to_numeric(out["inst_netbuy"], errors="coerce")
     return out.reset_index(drop=True)
+
+
+# ==============================================================================
+# 비동기 버전 (Async Version)
+# ==============================================================================
+import asyncio
+import aiohttp
+from src.api.kis_client import KisApiClient
+
+
+async def _request_investor_daily_async(
+    session: aiohttp.ClientSession,
+    code: str,
+    trade_date: str,
+    client: KisApiClient,
+) -> dict:
+    """비동기 KIS API 호출 헬퍼"""
+    url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": str(code).strip().zfill(6),
+        "FID_INPUT_DATE_1": str(trade_date).strip(),
+        "FID_ORG_ADJ_PRC": "",
+        "FID_ETC_CLS_CODE": "",
+    }
+    # KisApiClient의 공통 요청 핸들러 사용
+    return await client._handle_request(
+        session.get, url, headers=client._get_headers("FHPTJ04160001"), params=params
+    )
+
+
+async def get_investor_trade_daily_async(
+    session: aiohttp.ClientSession,
+    client: KisApiClient,
+    code: str,
+    start_date: str,
+    end_date: str,
+    *,
+    target_dates: list[str] | None = None,
+    max_calls: int = 120,
+) -> pd.DataFrame:
+    """비동기 버전: KIS API를 통해 종목별 투자자 일별 거래 정보를 가져옵니다."""
+    code = str(code).strip().zfill(6)
+    s_dt = pd.to_datetime(str(start_date).strip(), format="%Y%m%d", errors="coerce")
+    e_dt = pd.to_datetime(str(end_date).strip(), format="%Y%m%d", errors="coerce")
+    if pd.isna(s_dt) or pd.isna(e_dt):
+        return pd.DataFrame()
+    if s_dt > e_dt:
+        s_dt, e_dt = e_dt, s_dt
+    start = s_dt.strftime("%Y%m%d")
+    end = e_dt.strftime("%Y%m%d")
+
+    wanted = {d for d in (target_dates or []) if start <= d <= end}
+
+    all_rows: list[dict] = []
+    seen_days = set()
+    cursor = end
+    no_progress = 0
+
+    for _ in range(max(1, int(max_calls))):
+        if cursor < start:
+            break
+        try:
+            body = await _request_investor_daily_async(session, code, cursor, client)
+        except Exception:
+            cursor = _prev_day_ymd(cursor, 1)
+            continue
+
+        if body.get("rt_cd") != "0":
+            cursor = _prev_day_ymd(cursor, 1)
+            continue
+
+        rows = _collect_rows(body)
+        row_days = {str(item.get("stck_bsop_date") or "").strip() for item in rows if isinstance(item, dict)}
+        row_days = {d for d in row_days if len(d) == 8 and d.isdigit()}
+        
+        if rows:
+            all_rows.extend(rows)
+            seen_days.update({d for d in row_days if start <= d <= end})
+
+        if wanted and wanted.issubset(seen_days):
+            break
+
+        if row_days:
+            min_day = min(row_days)
+            next_cursor = _prev_day_ymd(min_day, 1)
+        else:
+            # 데이터가 없는 경우, 탐색 범위를 크게 점프
+            next_cursor = _prev_day_ymd(cursor, 30)
+
+        if next_cursor >= cursor:
+            no_progress += 1
+            next_cursor = _prev_day_ymd(cursor, 30) # 무한 루프 방지
+        else:
+            no_progress = 0
+        cursor = next_cursor
+
+        if no_progress >= 3:
+            break
+        
+        # 비동기 환경에서는 짧은 sleep이 이벤트 루프에 제어권을 넘겨줌
+        await asyncio.sleep(0.01)
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    out_rows = []
+    for item in all_rows:
+        d = str(item.get("stck_bsop_date") or "").strip()
+        if not (start <= d <= end):
+            continue
+
+        foreign = _clean_num(item.get("frgn_ntby_tr_pbmn")) or _clean_num(item.get("frgn_ntby_qty"))
+        inst = _clean_num(item.get("orgn_ntby_tr_pbmn")) or _clean_num(item.get("orgn_ntby_qty"))
+
+        out_rows.append({
+            "date": pd.to_datetime(d, format="%Y%m%d", errors="coerce"),
+            "foreign_netbuy": foreign,
+            "inst_netbuy": inst,
+        })
+
+    if not out_rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(out_rows).dropna(subset=["date"]).sort_values("date")
+    out = out.drop_duplicates(subset=["date"], keep="last")
+    out["foreign_netbuy"] = pd.to_numeric(out["foreign_netbuy"], errors="coerce")
+    out["inst_netbuy"] = pd.to_numeric(out["inst_netbuy"], errors="coerce")
+    return out.reset_index(drop=True)
+

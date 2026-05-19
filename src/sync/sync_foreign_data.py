@@ -1,17 +1,22 @@
+import asyncio
 import os
 import time
 from typing import Any
 
+import aiohttp
 import pandas as pd
 from gspread.utils import rowcol_to_a1
+from tqdm.asyncio import tqdm
 
 from src import settings
+from src.api.kis_client import KisApiClient
 from src.data.gsheet_loader import GSheetClientManager, retry_on_quota_limit
 
 try:
-    from src.sync.investor_data import get_investor_trade_daily
+    # 비동기 함수 임포트
+    from src.sync.investor_data import get_investor_trade_daily_async
 except ImportError:
-    from sync.investor_data import get_investor_trade_daily  # type: ignore[no-redef]
+    from sync.investor_data import get_investor_trade_daily_async  # type: ignore[no-redef]
 
 
 GOOGLE_KEY_PATH = str(settings.GOOGLE_KEY_PATH)
@@ -30,6 +35,7 @@ def _load_sheet_dataframe() -> tuple[pd.DataFrame, Any]:
         raise FileNotFoundError(f"인증 키 파일이 없습니다: {GOOGLE_KEY_PATH}")
 
     manager = GSheetClientManager(GOOGLE_KEY_PATH)
+    print("Google Sheets(Trade2)에서 메타데이터 로드 중...")
     records = manager.get_all_records(GOOGLE_SHEET_NAME, WORKSHEET_NAME)
 
     sh = manager.get_spreadsheet(GOOGLE_SHEET_NAME)
@@ -42,11 +48,6 @@ def _load_sheet_dataframe() -> tuple[pd.DataFrame, Any]:
     return df, ws
 
 
-def _save_sheet_dataframe(ws: Any, df: pd.DataFrame) -> None:
-    """(Deprecated) 전체 시트 덮어쓰기는 수식 손실 위험이 있어 사용하지 않음."""
-    raise NotImplementedError("전체 시트 업데이트는 수식 보존을 위해 비활성화되었습니다.")
-
-
 def _get_column_index(ws: Any, column_name: str) -> int:
     """헤더 행에서 열 번호(1-based) 확인"""
     headers: list[str] = ws.row_values(1)
@@ -57,17 +58,13 @@ def _get_column_index(ws: Any, column_name: str) -> int:
 
 @retry_on_quota_limit()
 def _batch_update_cells(ws: Any, updates: list[tuple[int, int, Any]]) -> None:
-    """
-    지정된 셀만 부분 업데이트해 기존 수식을 보존.
-    updates: List[Tuple[row_idx, col_idx, value]]
-    """
+    """지정된 셀만 부분 업데이트. updates: List[Tuple[row_idx, col_idx, value]]"""
     if not updates:
         return
 
     data = []
     for row_idx, col_idx, value in updates:
         rng = rowcol_to_a1(row_idx, col_idx)
-        # gspread/requests json 직렬화 호환을 위해 numpy 타입 -> 파이썬 기본형 변환
         if pd.isna(value):
             val = ""
         elif hasattr(value, "item"):
@@ -79,140 +76,157 @@ def _batch_update_cells(ws: Any, updates: list[tuple[int, int, Any]]) -> None:
     ws.batch_update(data)
 
 
-def fill_missing_stock_data() -> None:
+async def main() -> None:
     # 1. 시트에서 데이터 로드
-    print("Google Sheets(Trade2)에서 데이터를 불러오는 중...")
     df, ws = _load_sheet_dataframe()
 
     # 빈 문자열을 NaN으로 변환해 결측 탐지
     df.replace("", pd.NA, inplace=True)
-
-    # 필수 컬럼 존재 여부 확인
     required_cols = [INST_COL, FRGN_COL, CODE_COL, DATE_COL]
     for col in required_cols:
         if col not in df.columns:
             raise KeyError(f"시트에 '{col}' 열이 없습니다.")
 
     # 2. 업데이트할 대상 행 식별
-    # (기관_순매수) 또는 (외국인_순매수)가 비어있는(NaN) 행 중, 종목코드가 유효한 행
-    target_mask = (df[INST_COL].isna() | df[FRGN_COL].isna()) & df[
-        CODE_COL
-    ].notna()
-
+    target_mask = (df[INST_COL].isna() | df[FRGN_COL].isna()) & df[CODE_COL].notna()
     target_indices = df[target_mask].index
-    total_count = len(target_indices)
-    print(f"업데이트 대상 행 개수: {total_count}개")
-
-    if total_count == 0:
+    if not target_indices.any():
         print("업데이트할 결측 데이터가 없습니다.")
         return
 
-    # 대상 데이터 프레임 복사 및 가공 (인덱스 보존)
+    print(f"업데이트 대상 행 개수: {len(target_indices)}개")
+
     target_df = df[target_mask].copy()
     target_df["standardized_code"] = target_df[CODE_COL].apply(
         lambda x: str(x).split(".")[0].zfill(6)
     )
     target_df["parsed_date"] = pd.to_datetime(target_df[DATE_COL])
 
-    # 종목별 그룹화 진행
     grouped = target_df.groupby("standardized_code")
-    total_groups = len(grouped)
-    print(f"업데이트 대상 종목 수: {total_groups}개")
+    print(f"업데이트 대상 종목 수: {len(grouped)}개")
 
     inst_col_idx = _get_column_index(ws, INST_COL)
     frgn_col_idx = _get_column_index(ws, FRGN_COL)
-    updates = []
-    processed_rows = 0
+    
+    # 3. KIS API 데이터 병렬 수집
+    client = KisApiClient()
+    async with client.create_session() as session:
+        await client.ensure_token(session)
+        
+        async def sem_task(code, min_date_str, max_date_str, target_dates_list):
+            async with client.semaphore:
+                try:
+                    res = await get_investor_trade_daily_async(
+                        session=session,
+                        client=client,
+                        code=code,
+                        start_date=min_date_str,
+                        end_date=max_date_str,
+                        target_dates=target_dates_list,
+                    )
+                    # 각 API 호출 후 미세한 지연을 두어 TPS(20)를 절대 넘지 않도록 함
+                    await asyncio.sleep(0.05)
+                    return res
+                except Exception as e:
+                    print(f"\n[Error] {code} 조회 중 예외 발생: {e}")
+                    return None
 
-    for g_idx, (code, group) in enumerate(grouped):
-        try:
+        # 모든 종목에 대한 코루틴 생성
+        all_coros = []
+        for code, group in grouped:
             dates_in_group = group["parsed_date"].dropna()
             if dates_in_group.empty:
                 continue
-
-            # 날짜 범위 산출
-            min_date_dt = dates_in_group.min()
-            max_date_dt = dates_in_group.max()
-            min_date_str = min_date_dt.strftime("%Y%m%d")
-            max_date_str = max_date_dt.strftime("%Y%m%d")
+            min_date_str = dates_in_group.min().strftime("%Y%m%d")
+            max_date_str = dates_in_group.max().strftime("%Y%m%d")
             target_dates_list = [d.strftime("%Y%m%d") for d in dates_in_group]
+            all_coros.append(sem_task(code, min_date_str, max_date_str, target_dates_list))
 
-            print(
-                f"[{g_idx+1}/{total_groups}] 종목 {code} 조회 중... "
-                f"기간: {min_date_str} ~ {max_date_str} (누락 날짜: {len(target_dates_list)}개)"
-            )
+        print(f"\nKIS API에서 수급 데이터 조회 중 (총 {len(all_coros)}개 종목, 청크 단위 병렬 처리)...")
+        
+        # 10개씩 청크로 나누어 처리하여 DNS 부하 및 TPS 관리
+        CHUNK_SIZE = 10
+        results = []
+        
+        with tqdm(total=len(all_coros), desc="수급 데이터 조회") as pbar:
+            for i in range(0, len(all_coros), CHUNK_SIZE):
+                chunk = all_coros[i : i + CHUNK_SIZE]
+                chunk_results = await asyncio.gather(*chunk)
+                results.extend(chunk_results)
+                pbar.update(len(chunk))
+                # 청크 사이의 명시적 휴식 (TPS 20 제한 준수)
+                await asyncio.sleep(0.1) 
 
-            # KIS OpenAPI를 이용한 수급 데이터 일괄 조회
-            df_net = pd.DataFrame()
-            try:
-                df_net = get_investor_trade_daily(
-                    code=code,
-                    start_date=min_date_str,
-                    end_date=max_date_str,
-                    target_dates=target_dates_list,
-                )
-            except Exception as e:
-                print(f"[warn] KIS 수급 조회 실패 for {code}: {e}")
-
-            if df_net is not None and not df_net.empty:
-                # 빠른 맵핑을 위해 dict 구조로 가공 (key: YYYYMMDD -> val: (inst_net, foreign_net))
-                net_dict = {}
-                for _, net_row in df_net.iterrows():
-                    d_str = net_row["date"].strftime("%Y%m%d")
-                    net_dict[d_str] = (
-                        net_row.get("inst_netbuy", 0.0),
-                        net_row.get("foreign_netbuy", 0.0),
-                    )
-
-                # 데이터 채우기
-                for i, row in group.iterrows():
-                    d_val = row["parsed_date"]
-                    d_str = d_val.strftime("%Y%m%d")
-
-                    if d_str in net_dict:
-                        inst_net, foreign_net = net_dict[d_str]
-
-                        if pd.isna(foreign_net):
-                            foreign_net = 0.0
-                        if pd.isna(inst_net):
-                            inst_net = 0.0
-
-                        df.at[i, INST_COL] = inst_net
-                        df.at[i, FRGN_COL] = foreign_net
-
-                        # gspread row index는 1-based이며 헤더 행 때문에 i + 2
-                        updates.append((i + 2, inst_col_idx, inst_net))
-                        updates.append((i + 2, frgn_col_idx, foreign_net))
-                        processed_rows += 1
-
-                print(
-                    f"-> 종목 {code} 매핑 완료: {len(group)}개 행 중 "
-                    f"{len([d for d in target_dates_list if d in net_dict])}개 반영 성공"
-                )
-            else:
-                print(f"-> 종목 {code} 데이터 수집 실패 또는 데이터 없음")
-
-            # KIS API 과부하 방지 및 안정성 보장
-            time.sleep(0.2)
-
-            # 100개 행(200개 셀)마다 구글 시트 실시간 저장 (중단/API 제한 대비)
-            if len(updates) >= 200:
-                _batch_update_cells(ws, updates)
-                updates.clear()
-                print(
-                    f"--> [Checkpoint] {processed_rows}/{total_count} "
-                    "Google Sheets 실시간 저장 완료."
-                )
-
-        except Exception as e:
-            print(f"Error processing stock {code}: {e}")
+        # 결과 처리 및 업데이트 목록 생성
+        print("\n조회된 데이터 처리 및 업데이트 목록 생성 중...")
+        updates = []
+    processed_rows = 0
+    
+    # 각 종목 그룹에 대해 결과 매핑
+    for (code, group), df_net in zip(grouped, results):
+        if df_net is None or df_net.empty:
+            # print(f"-> 종목 {code} 데이터 수집 실패 또는 데이터 없음")
             continue
 
-    # 남은 잔여 업데이트 반영
-    if updates:
-        _batch_update_cells(ws, updates)
+        net_dict = {
+            net_row["date"].strftime("%Y%m%d"): (
+                net_row.get("inst_netbuy", 0.0),
+                net_row.get("foreign_netbuy", 0.0),
+            )
+            for _, net_row in df_net.iterrows()
+        }
 
-    print("\n모든 작업이 완료되었습니다. Google Sheets(Trade2)에 값만 업데이트했습니다.")
+        # 데이터 채우기
+        for i, row in group.iterrows():
+            d_str = row["parsed_date"].strftime("%Y%m%d")
+            if d_str in net_dict:
+                inst_net, foreign_net = net_dict[d_str]
+
+                inst_net = 0.0 if pd.isna(inst_net) else inst_net
+                foreign_net = 0.0 if pd.isna(foreign_net) else foreign_net
+
+                # gspread row index는 1-based이며 헤더 행 때문에 i + 2
+                updates.append((i + 2, inst_col_idx, inst_net))
+                updates.append((i + 2, frgn_col_idx, foreign_net))
+                processed_rows += 1
+    
+    print(f"총 {processed_rows}개 행({len(updates)}개 셀)에 대한 업데이트 준비 완료.")
+
+    # 5. Google Sheets 일괄 업데이트 (대용량 배치)
+    if not updates:
+        print("실제로 업데이트할 내용이 없습니다.")
+        return
+        
+    BATCH_SIZE = 5000  # 한 번에 업데이트할 셀의 개수 (2,500개 행에 해당)
+    print(f"\nGoogle Sheets에 데이터 일괄 업데이트 시작 (배치 크기: {BATCH_SIZE} 셀)...")
+    
+    for i in range(0, len(updates), BATCH_SIZE):
+        chunk = updates[i : i + BATCH_SIZE]
+        try:
+            _batch_update_cells(ws, chunk)
+            print(f"  - {i + len(chunk)}/{len(updates)}개 셀 업데이트 완료.")
+            
+            # 마지막 청크가 아니면, API Quota를 준수하기 위해 1초 대기
+            if i + BATCH_SIZE < len(updates):
+                time.sleep(1)
+
+        except Exception as e:
+            print(f"!! Google Sheets 업데이트 중 오류 발생 (청크 {i}~{i+BATCH_SIZE}): {e}")
+            print("  - 해당 청크는 건너뛰고 다음 작업을 계속합니다.")
+            continue
+
+    print("\n모든 작업이 완료되었습니다.")
+
+
+def fill_missing_stock_data() -> None:
+    """비동기 main 함수를 실행하는 동기 래퍼"""
+    import sys
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"오류 발생: {e}")
 
 
 if __name__ == "__main__":

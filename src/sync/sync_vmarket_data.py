@@ -245,7 +245,7 @@ async def main() -> None:
     start_date = "20151201"
     end_date = datetime.now().strftime("%Y%m%d")
 
-    async with aiohttp.ClientSession() as session:
+    async with client.create_session() as session:
         await client.ensure_token(session)
 
         # 1. KOSPI 200 처리
