@@ -13,6 +13,7 @@ sys.path.append(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
+from gspread.utils import rowcol_to_a1
 from src import settings
 from src.api.kis_client import KisApiClient
 from src.data.gsheet_loader import GSheetClientManager, retry_on_quota_limit
@@ -208,7 +209,7 @@ def update_gsheet_with_calculated_data(
                             if hv_val:
                                 updates.append(
                                     {
-                                        "range": f"{chr(65 + vkospi_col_idx)}{row_idx}",
+                                        "range": rowcol_to_a1(row_idx, vkospi_col_idx + 1),
                                         "values": [[str(hv_val)]],
                                     }
                                 )
@@ -219,7 +220,7 @@ def update_gsheet_with_calculated_data(
                             if hv_val_k:
                                 updates.append(
                                     {
-                                        "range": f"{chr(65 + vkosdaq_col_idx)}{row_idx}",
+                                        "range": rowcol_to_a1(row_idx, vkosdaq_col_idx + 1),
                                         "values": [[str(hv_val_k)]],
                                     }
                                 )
