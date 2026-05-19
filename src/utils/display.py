@@ -1,4 +1,5 @@
 import unicodedata
+
 import pandas as pd
 
 
@@ -16,7 +17,7 @@ class Colors:
 
 
 def get_decision_color(decision):
-    """decision 값에 따라 색상 코드를 반환"""
+    """Decision 값에 따라 색상 코드를 반환"""
     d = decision.lower()
     if "max" in d:
         return Colors.RED + Colors.BOLD

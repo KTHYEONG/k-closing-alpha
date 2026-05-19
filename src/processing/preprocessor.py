@@ -1,5 +1,5 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 # 컬럼 이름 상수로 관리
 DATE_COL = "매수날짜"
@@ -33,19 +33,110 @@ RENAME_MAP = {
     "(체결강도)": "체결강도",
     "(v-kospi)": "v_kospi",
     "(v-kosdaq)": "v_kosdaq",
+    # OHLC 데이터 추가
+    "(시가)": "시가",
+    "(고가)": "고가",
+    "(저가)": "저가",
+    "(종가)": "종가",
+    "(전일종가)": "전일종가",
+    "(ema5)": "ema5",
+    "(ema10)": "ema10",
+    "(ema20)": "ema20",
+    "(거래량)": "거래량",
 }
 
 
-def preprocess_data(df, task="classification", target_col=None):
+
+# [Phase 1.5] 기술적 지표 추가 함수 (기존 EMA 컬럼 활용)
+def _add_technical_features(df):
+    """[Phase 1.5] 기술적 지표 10종 추가
+    스프레드시트에 이미 계산된 EMA(5, 10, 20)를 활용하여 파생 지표 생성
     """
-    주식 데이터프레임을 받아 전처리하고, 특성(X), 타겟(y), 범주형 특성 리스트, 전처리된 df를 반환합니다.
+    # 그룹핑 (종목코드 기준) - shift 연산 등에 필요
+    g = df.groupby("종목코드")
+    close = df["종가"]
+    volume = df["거래대금"]
+    
+    # 이미 RENAME_MAP을 통해 ema5, ema10, ema20 컬럼이 존재함
+    if "ema5" not in df.columns or "ema20" not in df.columns:
+        print("   ⚠️ EMA 컬럼이 없습니다. 수동 계산을 시도합니다.")
+        ema5 = g["종가"].transform(lambda x: x.ewm(span=5, adjust=False).mean())
+        ema20 = g["종가"].transform(lambda x: x.ewm(span=20, adjust=False).mean())
+    else:
+        ema5 = df["ema5"]
+        ema20 = df["ema20"]
+    
+    # 1. 이격도 (Disparity)
+    df["disparity_5"] = close / ema5
+    
+    # 2. 모멘텀 (Momentum 3D)
+    df["momentum_3d"] = close / g["종가"].shift(3) - 1
+    
+    # 3. 변동성 (Volatility 5D)
+    df["volatility_5d"] = g["등락률"].transform(lambda x: x.rolling(5).std())
+    
+    # 4. 거래량 비율 (Volume Ratio)
+    vol_avg5 = g["거래대금"].transform(lambda x: x.rolling(5).mean())
+    df["volume_ratio"] = volume / vol_avg5.replace(0, np.nan)
+    
+    # New Momentum
+    df["momentum_5d"] = close / g["종가"].shift(5) - 1
+    
+    # 5. EMA 정배열 점수
+    df["trend_score"] = (ema5 > ema20).astype(int)
+    
+    # 6. EMA 이탈도 (Oscillator)
+    df["ema_oscillator"] = (ema5 - ema20) / ema20
+    
+    # 7. 중기 위치 (Position)
+    df["position_20d"] = (close - ema20) / ema20
+    
+    # 8. 중기 방향 (Direction)
+    df["directional_20d"] = close / g["종가"].shift(20) - 1
+    
+    # 9. MACD Fast
+    df["macd_fast"] = ema5 - ema20
+    
+    # 10. RSI 14 (Simple)
+    delta = g["종가"].diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    avg_gain = up.transform(lambda x: x.rolling(14).mean())
+    avg_loss = down.transform(lambda x: x.rolling(14).mean())
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi_14"] = 100 - (100 / (1 + rs))
+    
+    # 결측치 처리 (inf 등 발산 방지)
+    df.replace([np.inf, -np.inf], 0, inplace=True)
+    df.fillna(0, inplace=True)
+    
+    return df
+
+
+def preprocess_data(df, task="classification", target_col=None, feature_flags=None, exclude_features=None):
+    """주식 데이터프레임을 받아 전처리하고, 특성(X), 타겟(y), 범주형 특성 리스트, 전처리된 df를 반환합니다.
     """
     print("⚙️ 데이터 전처리 및 영업일 기준 고도화 중...")
+    
+    # Feature flags 기본값 설정
+    if feature_flags is None:
+        feature_flags = {
+            "turnover": False,
+            "upper_shadow": False,
+            "body_length": False,
+            "gap_ratio": False
+        }
+    
+    if exclude_features is None:
+        exclude_features = ["시장구분", "선정순위"]
+    
+    active_features = [k for k, v in feature_flags.items() if v]
+    if active_features:
+        print(f"   🔧 추가 피처 활성화: {', '.join(active_features)}")
 
     df.rename(columns=RENAME_MAP, inplace=True)
     df.replace("", np.nan, inplace=True)
 
-    # (차트분석)과 (차트통과) 결합 로직
     if "차트분석" in df.columns and "차트통과" in df.columns:
         df["차트분석"] = (
             df["차트분석"].fillna("Unknown").astype(str)
@@ -54,15 +145,34 @@ def preprocess_data(df, task="classification", target_col=None):
         )
         df.drop(columns=["차트통과"], inplace=True)
 
-    # -------------------------------------------------------------------------
-    # [최우선 작업] 날짜 변환 및 정렬
-    # -------------------------------------------------------------------------
     if DATE_COL not in df.columns:
         raise ValueError(f"Error: 필수 컬럼({DATE_COL})이 데이터에 없습니다.")
     
     df[DATE_COL] = pd.to_datetime(df[DATE_COL])
-    # 날짜순 정렬 (shift 연산 및 시계열 데이터 무결성 보장)
+    # 날짜순 정렬
     df = df.sort_values(DATE_COL).reset_index(drop=True)
+    
+    # [중요] EMA 값이 하나라도 비어있는(NaN) 행 제거
+    ema_cols = ["ema5", "ema10", "ema20"]
+    existing_ema_cols = [c for c in ema_cols if c in df.columns]
+    
+    # 1. 핵심 수치 컬럼 일괄 형변환 (OHLCV + EMA 등)
+    target_numeric_cols = ["시가", "고가", "저가", "종가", "거래대금", "거래량", "전일종가", "ema5", "ema10", "ema20"]
+    for col in target_numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    if existing_ema_cols:
+         # 2. NaN 제거 (변환 실패 + 원래 결측치)
+        before_len = len(df)
+        df = df.dropna(subset=existing_ema_cols).copy()
+        removed_len = before_len - len(df)
+        if removed_len > 0:
+            print(f"   ⚠️ EMA 결측치 발견: {removed_len}개 행 제거 완료")
+    
+    # [Phase 1.5] 기술적 지표 추가 호출
+    df = _add_technical_features(df)
+
 
     # -------------------------------------------------------------------------
     # [날짜 피처 고도화] 영업일 및 리스크 기반
@@ -103,8 +213,10 @@ def preprocess_data(df, task="classification", target_col=None):
 
     # 나머지 수치형 전처리 로직 (기존 구현 함수들 호출)
     # -------------------------------------------------------------------------
-    def _apply_log_scaling(df):
+    def _apply_log_scaling(df, exclude_list):
+        # [V1 Feature Set] exclude_features에 포함된 피처는 로그 변환 제외
         cols = ["시가총액", "거래대금", "평균_거래대금", "총_종목수", "선정순위"]
+        cols = [c for c in cols if c not in exclude_list]  # 제외 피처 필터링
         for col in [c for c in cols if c in df.columns]:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
             df[col] = np.log1p(df[col].clip(lower=0))
@@ -117,7 +229,7 @@ def preprocess_data(df, task="classification", target_col=None):
             df[col] = np.sign(df[col]) * np.log1p(np.abs(df[col]))
         return df
 
-    def _apply_custom_ratios(df):
+    def _apply_custom_ratios(df, exclude_list):
         calc_cols = ["등락률", "kospi", "kosdaq"]
         for col in [c for c in calc_cols if c in df.columns]:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
@@ -126,13 +238,16 @@ def preprocess_data(df, task="classification", target_col=None):
             df["체결강도"] = pd.to_numeric(df["체결강도"], errors="coerce").fillna(100)
             df["체결강도"] = np.log(df["체결강도"].clip(lower=1) / 100.0)
         
-        if "선정순위" in df.columns and "총_종목수" in df.columns:
-            rank_raw = np.expm1(df["선정순위"]) 
-            total_raw = np.expm1(df["총_종목수"])
-            df["선정순위_상대"] = rank_raw / total_raw.clip(lower=1)
+        # [V1 Feature Set] 선정순위가 exclude_list에 없을 때만 선정순위_상대 생성
+        if "선정순위" not in exclude_list:
+            if "선정순위" in df.columns and "총_종목수" in df.columns:
+                rank_raw = np.expm1(df["선정순위"]) 
+                total_raw = np.expm1(df["총_종목수"])
+                df["선정순위_상대"] = rank_raw / total_raw.clip(lower=1)
 
+        # [V1 Feature Set] 시장구분이 exclude_list에 없을 때만 사용
         if "등락률" in df.columns:
-            if "시장구분" in df.columns:
+            if "시장구분" not in exclude_list and "시장구분" in df.columns:
                 market_ref = np.where(df["시장구분"].str.contains("KOSDAQ", na=False, case=False), 
                                       df["kosdaq"], df["kospi"])
             else:
@@ -144,6 +259,8 @@ def preprocess_data(df, task="classification", target_col=None):
             raw_trade = np.expm1(df["거래대금"])
             raw_avg_trade = np.expm1(df["평균_거래대금"])
             df["상대_거래대금"] = np.log((raw_trade + 1) / (raw_avg_trade + 1).clip(lower=1))
+        
+
 
         # 5. 수급 질적 분석 (중복 제거 및 주도성 분류)
         buy_cols = ["기관_순매수", "외국인_순매수", "프로그램_순매수"]
@@ -167,11 +284,61 @@ def preprocess_data(df, task="classification", target_col=None):
         for col in [c for c in cols if c in df.columns]:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         return df
+    
+    # -------------------------------------------------------------------------
+    # [동적 피처 생성] Feature Flags에 따라 선택적으로 피처 추가
+    # -------------------------------------------------------------------------
+    def _apply_optional_features(df, flags):
+        """Feature flags에 따라 선택적 피처를 생성합니다."""
+        # 1. 회전율 (거래대금 / 시가총액)
+        if flags.get("turnover", False):
+            if "거래대금" in df.columns and "시가총액" in df.columns:
+                raw_trade = np.expm1(df["거래대금"])
+                raw_mcap = np.expm1(df["시가총액"])
+                turnover = (raw_trade / raw_mcap.clip(lower=1)) * 100
+                df["회전율_log"] = np.log1p(turnover)
+        
+        # 2. 윗꼬리 비율 (OHLC 필요)
+        if flags.get("upper_shadow", False):
+            required_cols = ["시가", "고가", "저가", "종가"]
+            if all(col in df.columns for col in required_cols):
+                # 윗꼬리 = (고가 - max(시가, 종가)) / (고가 - 저가)
+                body_top = np.maximum(df["시가"], df["종가"])
+                candle_range = (df["고가"] - df["저가"]).clip(lower=1e-6)
+                upper_shadow = (df["고가"] - body_top) / candle_range
+                df["윗꼬리_비율"] = upper_shadow.clip(0, 1)
+            else:
+                print(f"   ⚠️ 윗꼬리 비율: OHLC 데이터 부족 (필요: {required_cols})")
+        
+        # 3. 몸통 길이 (OHLC 필요)
+        if flags.get("body_length", False):
+            required_cols = ["시가", "고가", "저가", "종가"]
+            if all(col in df.columns for col in required_cols):
+                # 몸통 길이 = |종가 - 시가| / (고가 - 저가)
+                body_length = np.abs(df["종가"] - df["시가"])
+                candle_range = (df["고가"] - df["저가"]).clip(lower=1e-6)
+                df["몸통_길이_비율"] = (body_length / candle_range).clip(0, 1)
+            else:
+                print(f"   ⚠️ 몸통 길이: OHLC 데이터 부족 (필요: {required_cols})")
+        
+        # 4. 시가 갭 비율 (전일 종가 필요)
+        if flags.get("gap_ratio", False):
+            if "시가" in df.columns and "전일종가" in df.columns:
+                # DB에 이미 전일종가 데이터가 있으므로 직접 사용
+                # 갭 비율 = (시가 - 전일종가) / 전일종가
+                gap_ratio = (df["시가"] - df["전일종가"]) / df["전일종가"].clip(lower=1e-6)
+                df["시가갭_비율"] = gap_ratio.fillna(0).clip(-0.3, 0.3)  # ±30% 제한
+            else:
+                print("   ⚠️ 시가 갭 비율: 시가/전일종가 데이터 부족")
+        
+        return df
 
-    df = _apply_log_scaling(df)
+    # exclude_features를 함수에 전달
+    df = _apply_log_scaling(df, exclude_features)
     df = _apply_signed_log_scaling(df)
-    df = _apply_custom_ratios(df)
+    df = _apply_custom_ratios(df, exclude_features)
     df = _convert_remaining_numeric(df)
+    df = _apply_optional_features(df, feature_flags)
 
     def _apply_vkospi_advanced(df):
         if "v_kospi" not in df.columns:
@@ -230,9 +397,21 @@ def preprocess_data(df, task="classification", target_col=None):
         DATE_COL, TARGET_CLASSIFICATION, TARGET_REGRESSION, 
         "종목코드", "매수가격", "매도가격", "수익_구간", "중요_손실_지표", label_col,
         # [사용자 요청] 영향력이 미미하거나 메타데이터인 피처 제외
-        "real_trade", "체결강도", "방어_강도", "kosdaq", "kospi", "is_trading_month_end"
+        "real_trade", "체결강도", "방어_강도", "kosdaq", "kospi", "is_trading_month_end",
+        # [Data Leakage 방지] 매수 시점에 알 수 없는 당일 가격 정보 제외
+        "시가", "고가", "저가", "종가", "전일종가",
+        # [원시값 제외] 종목 간 비교 불가능한 절대값 제외 (파생 지표만 사용)
+        "ema5", "ema10", "ema20", "거래량"
     }
     feature_cols = [col for col in df.columns if col not in exclude_cols]
+    
+    # exclude_features 처리 (Feature Importance 기반 제거)
+    if exclude_features is None:
+        exclude_features = []
+    
+    if exclude_features:
+        print(f"   🗑️ 제외 피처 ({len(exclude_features)}개): {', '.join(exclude_features)}")
+        feature_cols = [col for col in feature_cols if col not in exclude_features]
 
     cat_features_candidates = ["테마_섹터", "차트분석", "시장구분", "weekday"] # weekday로 교체
     cat_features = [col for col in cat_features_candidates if col in feature_cols]
@@ -272,10 +451,10 @@ def preprocess_data(df, task="classification", target_col=None):
         n_clipped_upper = (original_y > TARGET_UPPER_BOUND).sum()
         
         if n_clipped_lower > 0 or n_clipped_upper > 0:
-            print(f"📊 [Target Clipping] 극단값 제한 적용:")
+            print("📊 [Target Clipping] 극단값 제한 적용:")
             print(f"   - 하한 초과 ({TARGET_LOWER_BOUND}% 미만): {n_clipped_lower}건")
             print(f"   - 상한 초과 ({TARGET_UPPER_BOUND}% 초과): {n_clipped_upper}건")
-            print(f"   → 모델이 '안정적 수익 패턴'에 집중하도록 유도합니다.")
+            print("   → 모델이 '안정적 수익 패턴'에 집중하도록 유도합니다.")
     
     if task == "classification": 
         y = y.astype(int)
