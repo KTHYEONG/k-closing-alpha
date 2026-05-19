@@ -20,5 +20,21 @@ __pycache__
 # db
 *.db
 
+# catboost
+catboost_info/
+
 # model
 *.cbm
+
+# uv.lock
+uv.lock
+
+# KIS token cache
+kis_token_cache.json
+
+# Agent & Claude tools
+.agent/
+.claude/
+
+# Temporary trading API files
+.tmp_open_trading_api/
