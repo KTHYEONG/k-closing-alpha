@@ -27,8 +27,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.pipeline.config import DEFAULT_CONFIG
-from src.pipeline.data import load_or_build_snapshot
+try:
+    from src.pipeline.config import DEFAULT_CONFIG
+    from src.pipeline.data import load_or_build_snapshot
+except ImportError:
+    # Fallback for when pipeline module is missing
+    DEFAULT_CONFIG = None
+    def load_or_build_snapshot(*args, **kwargs):
+        return pd.DataFrame()
 
 
 KRW_100M = 100_000_000.0
@@ -526,12 +532,9 @@ def _normalize_symbol_history(
     low_col = _find_col(out, ["저가", "Low", "low"]) or (cols[2] if len(cols) > 2 else None)
     close_col = _find_col(out, ["종가", "Close", "close"]) or (cols[3] if len(cols) > 3 else None)
     vol_col = _find_col(out, ["거래량", "Volume", "volume"]) or (cols[4] if len(cols) > 4 else None)
-    value_col = _find_col(out, ["거래대금", "거래금액", "Value", "TradingValue"])
-    change_col = _find_col(out, ["등락률", "Change", "change"]) or (cols[5] if len(cols) > 5 else None)
-
-    if not all([open_col, high_col, low_col, close_col]):
-        return pd.DataFrame()
-
+    value_col = _find_col(out, ["거래대금", "거래금액", "Value", "TradingValue", "acml_tr_pbmn", "trade_value_krw"])
+    change_col = _find_col(out, ["등락률", "Change", "change", "prdy_ctrt", "daily_change_pct"])
+    
     norm = pd.DataFrame(
         {
             "date": out["date"],
@@ -551,13 +554,22 @@ def _normalize_symbol_history(
     cap_value_col = None
     if market_cap_df is not None and not market_cap_df.empty:
         cap = market_cap_df.copy()
-        cap.index = pd.to_datetime(cap.index, errors="coerce")
-        cap = cap[~cap.index.isna()].copy().sort_index()
-        cap["date"] = cap.index
+        # If 'date' is in columns, use it; otherwise use index
+        if "date" not in cap.columns:
+            cap.index = pd.to_datetime(cap.index, errors="coerce")
+            cap = cap[~cap.index.isna()].copy().sort_index()
+            cap["date"] = cap.index
+        else:
+            cap["date"] = pd.to_datetime(cap["date"], errors="coerce")
+            cap = cap[~cap["date"].isna()].copy().sort_values("date")
+        
         cap_col = _find_col(cap, ["시가총액", "MarketCap", "market_cap"])
         cap_value_col = _find_col(cap, ["거래대금", "거래금액", "Value", "TradingValue"])
 
         if cap_col is not None:
+            # Drop index name to avoid ambiguity during merge if it matches column name
+            if cap.index.name == "date":
+                cap.index.name = None
             cap_part = cap[["date", cap_col]].rename(columns={cap_col: "market_cap_krw"})
             norm = norm.merge(cap_part, on="date", how="left")
         else:
@@ -602,6 +614,113 @@ def _normalize_symbol_history(
     return norm
 
 
+def _fetch_kis_daily_ohlcv(
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    fetch_cfg: FetchConfig,
+) -> pd.DataFrame:
+    """Fetch OHLCV and volume/value from KIS as a fallback using synchronous requests."""
+    try:
+        import requests
+    except ImportError:
+        return pd.DataFrame()
+
+    candidates = ["src.sync.kis_common", "src.etc.kis_common", "etc.kis_common", "kis_common"]
+    kis_mod = None
+    for mod_name in candidates:
+        try:
+            mod = importlib.import_module(mod_name)
+            if all(hasattr(mod, k) for k in ["APP_KEY", "APP_SECRET", "URL_BASE", "get_access_token"]):
+                kis_mod = mod
+                break
+        except Exception:
+            continue
+
+    if kis_mod is None:
+        return pd.DataFrame()
+
+    try:
+        token = kis_mod.get_access_token()
+    except Exception as exc:
+        print(f"[warn] KIS token fetch failed for {symbol} fallback: {exc}")
+        return pd.DataFrame()
+
+    url = f"{kis_mod.URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}",
+        "appkey": kis_mod.APP_KEY,
+        "appsecret": kis_mod.APP_SECRET,
+        "tr_id": "FHKST03010100",
+        "custtype": "P",
+    }
+    params = {
+        "fid_cond_mrkt_div_code": "J", # Default to KOSPI, fallback handled by API if wrong
+        "fid_input_iscd": symbol,
+        "fid_input_date_1": _to_ymd(start),
+        "fid_input_date_2": _to_ymd(end),
+        "fid_period_div_code": "D",
+        "fid_org_adj_prc": "0",
+    }
+
+    kis_sleep_sec = _effective_kis_sleep_sec(fetch_cfg)
+    last_err = None
+    
+    for attempt in range(fetch_cfg.retries):
+        try:
+            with _kis_slot(fetch_cfg):
+                resp = requests.get(url, headers=headers, params=params, timeout=15)
+                time.sleep(kis_sleep_sec)
+            
+            if resp.status_code != 200:
+                last_err = f"HTTP {resp.status_code}"
+                continue
+            
+            data = resp.json()
+            if data.get("rt_cd") != "0":
+                # Handle market div code mismatch if possible
+                if data.get("msg_cd") == "EGW00123" and params["fid_cond_mrkt_div_code"] == "J":
+                    params["fid_cond_mrkt_div_code"] = "W" # Try KOSDAQ
+                    continue
+                return pd.DataFrame()
+            
+            output2 = data.get("output2", [])
+            if not output2:
+                return pd.DataFrame()
+            
+            out1 = data.get("output1", {})
+            # Listed share count to estimate historical market cap
+            lstn_stcn = float(out1.get("lstn_stcn", 0)) if out1.get("lstn_stcn") else 0
+            
+            rows = []
+            for item in output2:
+                d_str = item.get("stck_bsop_date")
+                if not d_str: continue
+                close_val = float(item.get("stck_clpr", 0))
+                rows.append({
+                    "date": pd.to_datetime(d_str, format="%Y%m%d"),
+                    "open": float(item.get("stck_oprc", 0)),
+                    "high": float(item.get("stck_hgpr", 0)),
+                    "low": float(item.get("stck_lwpr", 0)),
+                    "close": close_val,
+                    "volume": float(item.get("acml_vol", 0)),
+                    "trade_value_krw": float(item.get("acml_tr_pbmn", 0)),
+                    "daily_change_pct": float(item.get("prdy_ctrt", 0)) / 100.0,
+                    "market_cap_krw": close_val * lstn_stcn if lstn_stcn > 0 else np.nan
+                })
+            
+            df = pd.DataFrame(rows)
+            return df
+            
+        except Exception as e:
+            last_err = e
+            time.sleep(fetch_cfg.retry_sleep_sec * (attempt + 1))
+            
+    if last_err:
+        print(f"[warn] KIS ohlcv fallback failed for {symbol}: {last_err}")
+    return pd.DataFrame()
+
 def _fetch_one_symbol(
     symbol: str,
     start: pd.Timestamp,
@@ -611,8 +730,42 @@ def _fetch_one_symbol(
 ) -> pd.DataFrame:
     start_s = _to_ymd(start)
     end_s = _to_ymd(end)
+    
     ohlcv = _safe_get_market_ohlcv_by_date(start_s, end_s, symbol, fetch_cfg)
     cap = _safe_get_market_cap_by_date(start_s, end_s, symbol, fetch_cfg)
+    
+    # Check if we need KIS fallback for missing columns or empty data
+    needs_kis = False
+    if ohlcv is None or ohlcv.empty:
+        needs_kis = True
+    else:
+        # Check if trading value is missing (it's essential for this backfill)
+        has_val = _find_col(ohlcv, ["거래대금", "거래금액", "Value", "TradingValue"])
+        if not has_val:
+            needs_kis = True
+    
+    if cap is None or cap.empty:
+        needs_kis = True
+        
+    if needs_kis:
+        kis_df = _fetch_kis_daily_ohlcv(symbol, start, end, fetch_cfg)
+
+        if not kis_df.empty:
+            kis_indexed = kis_df.set_index("date")
+            if ohlcv is None or ohlcv.empty:
+                ohlcv = kis_indexed
+            else:
+                # Merge KIS columns into ohlcv if missing
+                for col in ["trade_value_krw", "market_cap_krw", "daily_change_pct"]:
+                    if col in kis_df.columns:
+                        if col not in ohlcv.columns:
+                            ohlcv[col] = kis_indexed[col]
+                        else:
+                            ohlcv[col] = ohlcv[col].fillna(kis_indexed[col])
+
+            if cap is None or cap.empty:
+                cap = kis_df[["date", "market_cap_krw"]].rename(columns={"market_cap_krw": "시가총액"}).set_index("date")
+
     norm = _normalize_symbol_history(ohlcv, cap, symbol, market_hint)
     if norm.empty:
         return norm
@@ -745,6 +898,7 @@ def _fetch_vkospi_proxy(
             return pd.DataFrame(columns=["date", "close"])
 
         candidates = [
+            "src.sync.kis_common",
             "src.etc.kis_common",
             "etc.kis_common",
             "kis_common",
