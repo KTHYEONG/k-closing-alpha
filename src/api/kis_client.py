@@ -26,6 +26,20 @@ class KisApiClient:
         self.token = None
         self.token_file = str(token_file or settings.TOKEN_FILE)
         self._market_div_cache = {}
+        # 동시성 제어를 위한 세마포어 (더 보수적으로 10으로 조정)
+        self.semaphore = asyncio.Semaphore(10)
+
+    def create_session(self) -> aiohttp.ClientSession:
+        """최적화된 커넥터를 가진 세션을 생성합니다."""
+        from aiohttp.resolver import ThreadedResolver
+        resolver = ThreadedResolver()
+        connector = aiohttp.TCPConnector(
+            limit=50,            # 동시 연결 수 제한
+            ttl_dns_cache=300,  # DNS 캐시 유지 시간
+            use_dns_cache=True,  # DNS 캐시 사용
+            resolver=resolver   # DNS 해석기 추가
+        )
+        return aiohttp.ClientSession(connector=connector)
 
     @staticmethod
     def _normalize_market_div_code(market_div_code):
