@@ -102,25 +102,41 @@ def load_and_preprocess_data(file_path):
         print(f"{Colors.RED}엑셀 파일 로드 실패: {e}{Colors.RESET}")
         sys.exit(1)
 
-    if "종목코드" in df.columns:
-        df["종목코드"] = df["종목코드"].apply(lambda x: str(x).zfill(6))
-
+    # [Fix] 최신 엑셀 컬럼명 형식(괄호 포함) 대응을 위한 rename_map 업데이트
     rename_map = {
-        # preprocessor.py의 rename_map과 유사하게 구성
+        "(시가총액, 억)": "시가총액",
         "시가총액(억)": "시가총액",
+        "(거래대금, 억)": "거래대금",
         "거래대금(억)": "거래대금",
+        "(등락률)": "등락률",
         "등락률": "등락률",
+        "(선정 순위)": "선정순위",
         "순위": "선정순위",
+        "(기관_순매수)": "기관_순매수",
         "기관_순매수(억)": "기관_순매수",
+        "(외국인_순매수)": "외국인_순매수",
         "외국인_순매수(억)": "외국인_순매수",
+        "(프로그램_순매수)": "프로그램_순매수",
         "프로그램_순매수(억)": "프로그램_순매수",
+        "(kospi, %)": "kospi",
         "KOSPI등락률": "kospi",
+        "(kosdaq, %)": "kosdaq",
         "KOSDAQ등락률": "kosdaq",
+        "(총 종목 수)": "총_종목수",
         "전체종목수": "총_종목수",
-        "평균거래대금(억)": "평균거래대금_억",
+        "(평균 거래대금)": "평균_거래대금",
+        "평균거래대금(억)": "평균_거래대금",
         "(차트통과)": "차트통과",
+        "(종목코드)": "종목코드",
+        "(종가)": "종가",
+        "(체결강도)": "체결강도",
+        "(시장구분)": "시장구분",
     }
     df.rename(columns=rename_map, inplace=True)
+
+    # 종목코드 포맷팅 (6자리 zero-fill)
+    if "종목코드" in df.columns:
+        df["종목코드"] = df["종목코드"].apply(lambda x: str(x).zfill(6))
 
     # 단위 변환 (억 -> 원)
     for col in [
@@ -128,16 +144,12 @@ def load_and_preprocess_data(file_path):
         "외국인_순매수",
         "프로그램_순매수",
         "거래대금",
-        "평균거래대금_억",
+        "평균_거래대금",
     ]:
         if col in df.columns:
             df[col] = df[col].apply(
                 lambda x: float(x) * 100_000_000 if pd.notna(x) else 0
             )
-
-    # preprocessor.py의 로직을 따라 '평균_거래대금'으로 컬럼명 최종 변경
-    if "평균거래대금_억" in df.columns:
-        df.rename(columns={"평균거래대금_억": "평균_거래대금"}, inplace=True)
 
     # [New] 상장일수 부족 종목 제외 로직 (EMA 20 계산 불가능한 경우)
     if "(상장일수)" in df.columns:
@@ -625,8 +637,7 @@ def main():
                     return scenarios
 
                 df_sma_below_df["Scenario_List"] = df_sma_below_df.apply(
-                    get_sma_below_scenarios, axis=1
-                )
+                    get_sma_below_scenarios, axis=1)
                 df_sma_below_exploded = df_sma_below_df.explode("Scenario_List")
                 df_sma_below_exploded["Scenario_Base"] = df_sma_below_exploded[
                     "Scenario_List"
@@ -647,8 +658,7 @@ def main():
                     return scenarios
 
                 df_candle_only_df["Scenario_List"] = df_candle_only_df.apply(
-                    get_candle_only_scenarios, axis=1
-                )
+                    get_candle_only_scenarios, axis=1)
                 df_candle_only_exploded = df_candle_only_df.explode("Scenario_List")
                 df_candle_only_exploded["Scenario_Base"] = df_candle_only_exploded[
                     "Scenario_List"
