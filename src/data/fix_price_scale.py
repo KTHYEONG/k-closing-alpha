@@ -112,10 +112,16 @@ def _connect_gsheet() -> gspread.Client:
 def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_symbols: dict[tuple[str, pd.Timestamp], dict[str, float]]) -> None:
     """구글 스프레드시트에 기입된 가격 스케일 오류 값을 일괄 업데이트합니다.
 
+    매수 가격과 매도 가격을 세트(Set)로 판단하여 동일한 대표 스케일을 일괄 적용함으로써
+    자연스러운 주가 변동 거래의 매도 가격이 개별 보정 마스크로 인해 왜곡되는 현상을 차단합니다.
+
     Args:
         sh: gspread 스프레드시트 객체
         sheet_name: 워크시트 이름 (예: Trade, Trade2)
         mismatched_symbols: 탐지된 {(종목코드, 매수날짜): {컬럼명: 스케일비율}} 매핑
+
+    Time Complexity: O(R * C) - R은 스프레드시트의 행 수, C는 가격 컬럼 개수.
+    Space Complexity: O(U) - U는 구글 시트에 업데이트할 셀 개수.
 
     """
     ws = sh.worksheet(sheet_name)
@@ -140,13 +146,16 @@ def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_sy
     s_idx: int = symbol_idx
     d_idx: int = date_idx
 
-    # 업데이트 대상 가격 컬럼들의 인덱스 매핑
-    target_price_keys = ["open", "high", "low", "close", "prev_close", "buy_price", "sell_price"]
+    # 업데이트 대상 가격 컬럼들의 인덱스 매핑 (시장 데이터 ohlcv인 open/high/low/close/prev_close는 철저히 배제하고 수동 입력인 buy_price, sell_price만 정밀 타겟팅)
+    target_price_keys = ["buy_price", "sell_price"]
     target_col_idxs: dict[str, int] = {}
     for k in target_price_keys:
         val = cols.get(k)
         if val is not None:
             target_col_idxs[k] = val
+
+    # 참조용 종가 컬럼 인덱스 (대표 스케일 판단의 기준으로만 읽기 위해 로드)
+    close_idx = cols.get("close")
 
     cells_to_update: list[gspread.Cell] = []
     updated_rows_count = 0
@@ -170,11 +179,9 @@ def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_sy
         if key not in mismatched_symbols:
             continue
 
-        column_scales = mismatched_symbols[key]
         row_updated = False
 
         # 해당 행의 '종가' 컬럼 값을 파싱하여 실시간 오폭 방지용 기준 종가로 사용
-        close_idx = target_col_idxs.get("close")
         ref_price = 0.0
         if close_idx is not None and close_idx < len(row):
             try:
@@ -182,16 +189,59 @@ def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_sy
             except ValueError:
                 pass
 
+        # 1. 행별 대표 스케일 팩터 산출 (매수가격/매도가격 기반 세트 동기화)
+        from src.processing.scale_corrector import find_closest_valid_scale
+        representative_scale = 1.0
+
+        buy_idx = target_col_idxs.get("buy_price")
+        sell_idx = target_col_idxs.get("sell_price")
+
+        buy_val = 0.0
+        if ref_price > 0 and buy_idx is not None and buy_idx < len(row):
+            try:
+                buy_val = float(str(row[buy_idx]).strip().replace(",", ""))
+            except ValueError:
+                pass
+
+        sell_val = 0.0
+        if ref_price > 0 and sell_idx is not None and sell_idx < len(row):
+            try:
+                sell_val = float(str(row[sell_idx]).strip().replace(",", ""))
+            except ValueError:
+                pass
+
+        # 매수가격 기준 진단 (최우선순위 지배 기준)
+        if buy_val > 0:
+            scale_buy = find_closest_valid_scale(ref_price / buy_val)
+            if scale_buy != 1.0:
+                representative_scale = scale_buy
+            else:
+                # 매수가격이 정상이면 매도가격도 정상으로 신뢰
+                pass
+
+        # 매수가격이 없는 특수 상황에만 매도가격 기준 진단
+        elif sell_val > 0:
+            scale_sell = find_closest_valid_scale(ref_price / sell_val)
+            if scale_sell != 1.0:
+                representative_scale = scale_sell
+
+        # 진단 불가 시 딕셔너리에 등록된 기본값 차용
+        if representative_scale == 1.0:
+            valid_factors = [f for f in mismatched_symbols[key].values() if f != 1.0]
+            if valid_factors:
+                representative_scale = valid_factors[0]
+            else:
+                representative_scale = mismatched_symbols[key].get("종가", 1.0)
+
+        if representative_scale == 1.0:
+            continue
+
+        # 2. 동기식 대표 스케일 적용 (마스킹 제거하여 일괄 곱 연산 수행)
         for key_name, col_idx in target_col_idxs.items():
             if col_idx >= len(row):
                 continue
 
             ko_col_name = {
-                "open": "시가",
-                "high": "고가",
-                "low": "저가",
-                "close": "종가",
-                "prev_close": "전일종가",
                 "buy_price": "매수가격",
                 "sell_price": "매도가격"
             }.get(key_name)
@@ -208,32 +258,16 @@ def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_sy
                 if num_val == 0:
                     continue
 
-                # 실시간 스케일 팩터 검증
-                from src.processing.scale_corrector import find_closest_valid_scale
+                corrected_val = round(num_val * representative_scale)
                 
-                scale_factor = 1.0
-                if ref_price > 0 and key_name in ["buy_price", "sell_price"]:
-                    ratio = ref_price / num_val
-                    scale_factor = find_closest_valid_scale(ratio)
-                else:
-                    if ko_col_name in column_scales:
-                        scale_factor = column_scales[ko_col_name]
-                    elif key_name == "prev_close" and "종가" in column_scales:
-                        scale_factor = column_scales["종가"]
-                    else:
-                        continue
-
-                # 보정할 필요가 없는 정상적인 값(1.0)이면 건너뜀
-                if scale_factor == 1.0:
+                # 안전 가드레일: 보정된 가격이 100원 미만으로 내려가는 극단적 하향은 오탐으로 스킵
+                if corrected_val < 100:
+                    print(f"   ⚠️ [구글시트 보정 스킵] 행 {row_idx} ({symbol}) {ko_col_name} 보정가({corrected_val})가 100원 미만으로 스킵합니다.")
                     continue
-
-                corrected_val = round(num_val * scale_factor, 2)
-                if key_name in ["open", "high", "low", "close", "prev_close", "buy_price", "sell_price"]:
-                    corrected_val = round(corrected_val)
 
                 cells_to_update.append(gspread.Cell(row=row_idx, col=col_idx + 1, value=str(corrected_val)))
                 row_updated = True
-                print(f"   👉 [구글시트 개별 매칭] 행 {row_idx} ({symbol}) {ko_col_name}: {num_val} -> {corrected_val} (스케일: {scale_factor})")
+                print(f"   👉 [구글시트 세트보정] 행 {row_idx} ({symbol}) {ko_col_name}: {num_val} -> {corrected_val} (스케일: {representative_scale})")
             except ValueError:
                 continue
 
@@ -325,11 +359,24 @@ def main() -> None:
     # 보정 가격 적용
     print("⚙️ 데이터베이스 내 가격 데이터 스케일 보정 적용 중...")
     df_corrected = apply_scale_correction(df, mismatched)
-    
+
+    # 가격 보정 후 DB 내의 하드코딩된 '수익률' 컬럼도 실계산 공식으로 재계산 (정합성 완벽 수복)
+    if "매수가격" in df_corrected.columns and "매도가격" in df_corrected.columns and "수익률" in df_corrected.columns:
+        # Arrow String 형변환 에러 방지를 위해 수익률 컬럼을 수치형(float)으로 사전 형변환
+        df_corrected["수익률"] = pd.to_numeric(df_corrected["수익률"], errors="coerce").fillna(0.0)
+        
+        mask_valid_buy = df_corrected["매수가격"] > 0
+        df_corrected.loc[mask_valid_buy, "수익률"] = (
+            (df_corrected.loc[mask_valid_buy, "매도가격"] - df_corrected.loc[mask_valid_buy, "매수가격"]) 
+            / df_corrected.loc[mask_valid_buy, "매수가격"] * 100.0
+        )
+        df_corrected.loc[~mask_valid_buy, "수익률"] = 0.0
+        print("📈 DB 내 '수익률' 컬럼을 보정된 가격 기준으로 실시간 재계산 및 정합성 수복 완료!")
+
     # 컬럼 이름 원복 전에 안전하게 날짜 컬럼 포맷팅 수행
     if "매수날짜" in df_corrected.columns:
         df_corrected["매수날짜"] = pd.to_datetime(df_corrected["매수날짜"]).dt.strftime("%Y-%m-%d")
-    
+
     # DB 업데이트를 위한 컬럼명 원복
     INVERSE_RENAME_MAP = {v: k for k, v in RENAME_MAP.items()}
     df_db_ready = df_corrected.rename(columns=INVERSE_RENAME_MAP)
