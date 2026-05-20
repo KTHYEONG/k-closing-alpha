@@ -92,8 +92,7 @@ async def fetch_single_stock(
     upper_limit_next_day_stock_codes=None,
     upper_limit_stock_codes=None,
 ):
-    """단일 종목의 상세 데이터를 수집합니다.
-    """
+    """단일 종목의 상세 데이터를 수집합니다."""
     if overheated_stock_codes is None:
         overheated_stock_codes = set()
     if new_high_stock_codes is None:
@@ -348,8 +347,7 @@ async def fetch_all_stock_data(
     upper_limit_next_day_stock_codes=None,
     upper_limit_stock_codes=None,
 ):
-    """모든 종목의 상세 데이터를 수집합니다.
-    """
+    """모든 종목의 상세 데이터를 수집합니다."""
     if overheated_stock_codes is None:
         overheated_stock_codes = set()
     if new_high_stock_codes is None:
@@ -916,9 +914,9 @@ async def main():
                 "KOSPI등락률": "(kospi, %)",
                 "KOSDAQ등락률": "(kosdaq, %)",
             }
-            
+
             df_excel = df.rename(columns=rename_map)
-            
+
             cols_order = [
                 "(차트통과)",
                 "(시나리오)",
