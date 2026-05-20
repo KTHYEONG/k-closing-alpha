@@ -5,6 +5,14 @@ import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 
+# Windows 터미널 한글 인코딩 에러 방지 (이모지 및 UTF-8 강제 출력)
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+
 # 1. 프로젝트 루트 경로 설정 (import 전에 먼저 실행)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
