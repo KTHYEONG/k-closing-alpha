@@ -109,13 +109,13 @@ def _connect_gsheet() -> gspread.Client:
     return client
 
 
-def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_symbols: dict[tuple[str, pd.Timestamp], float]) -> None:
+def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_symbols: dict[tuple[str, pd.Timestamp], dict[str, float]]) -> None:
     """구글 스프레드시트에 기입된 가격 스케일 오류 값을 일괄 업데이트합니다.
 
     Args:
         sh: gspread 스프레드시트 객체
         sheet_name: 워크시트 이름 (예: Trade, Trade2)
-        mismatched_symbols: 탐지된 {(종목코드, 매수날짜): 스케일비율} 매핑
+        mismatched_symbols: 탐지된 {(종목코드, 매수날짜): {컬럼명: 스케일비율}} 매핑
 
     """
     ws = sh.worksheet(sheet_name)
@@ -170,11 +170,33 @@ def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_sy
         if key not in mismatched_symbols:
             continue
 
-        scale_factor = mismatched_symbols[key]
+        column_scales = mismatched_symbols[key]
         row_updated = False
+
+        # 해당 행의 '종가' 컬럼 값을 파싱하여 실시간 오폭 방지용 기준 종가로 사용
+        close_idx = target_col_idxs.get("close")
+        ref_price = 0.0
+        if close_idx is not None and close_idx < len(row):
+            try:
+                ref_price = float(str(row[close_idx]).strip().replace(",", ""))
+            except ValueError:
+                pass
 
         for key_name, col_idx in target_col_idxs.items():
             if col_idx >= len(row):
+                continue
+
+            ko_col_name = {
+                "open": "시가",
+                "high": "고가",
+                "low": "저가",
+                "close": "종가",
+                "prev_close": "전일종가",
+                "buy_price": "매수가격",
+                "sell_price": "매도가격"
+            }.get(key_name)
+
+            if ko_col_name is None:
                 continue
 
             raw_val = str(row[col_idx]).strip()
@@ -182,9 +204,27 @@ def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_sy
                 continue
 
             try:
-                # 숫자 파싱 후 스케일 비율 곱해주기
                 num_val = float(raw_val.replace(",", ""))
                 if num_val == 0:
+                    continue
+
+                # 실시간 스케일 팩터 검증
+                from src.processing.scale_corrector import find_closest_valid_scale
+                
+                scale_factor = 1.0
+                if ref_price > 0 and key_name in ["buy_price", "sell_price"]:
+                    ratio = ref_price / num_val
+                    scale_factor = find_closest_valid_scale(ratio)
+                else:
+                    if ko_col_name in column_scales:
+                        scale_factor = column_scales[ko_col_name]
+                    elif key_name == "prev_close" and "종가" in column_scales:
+                        scale_factor = column_scales["종가"]
+                    else:
+                        continue
+
+                # 보정할 필요가 없는 정상적인 값(1.0)이면 건너뜀
+                if scale_factor == 1.0:
                     continue
 
                 corrected_val = round(num_val * scale_factor, 2)
@@ -193,6 +233,7 @@ def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_sy
 
                 cells_to_update.append(gspread.Cell(row=row_idx, col=col_idx + 1, value=str(corrected_val)))
                 row_updated = True
+                print(f"   👉 [구글시트 개별 매칭] 행 {row_idx} ({symbol}) {ko_col_name}: {num_val} -> {corrected_val} (스케일: {scale_factor})")
             except ValueError:
                 continue
 
@@ -255,14 +296,13 @@ def main() -> None:
     if "매수날짜" in df.columns:
         df["매수날짜"] = pd.to_datetime(df["매수날짜"])
 
-    print("📈 pykrx API와 스프레드시트 가격 비교 분석 시작...")
-    # 스케일 불일치 종목 탐지
+    print("📈 로컬 종가 대비 매매 가격 스케일 비교 분석 시작...")
+    # 스케일 불일치 종목 탐지 (API 연동 없이 로컬 종가 대조로 단독 진단)
     mismatched = detect_price_scale_mismatch(
         df,
-        pykrx_price_provider,
+        api_price_provider=None,
         threshold_lower=args.threshold_lower,
-        threshold_upper=args.threshold_upper,
-        max_workers=2
+        threshold_upper=args.threshold_upper
     )
 
     if not mismatched:
@@ -272,8 +312,9 @@ def main() -> None:
 
     print(f"\n⚠️ 스케일 불일치 데이터 {len(mismatched)}건 탐지됨:")
     mismatched_details = []
-    for (symbol, date), ratio in mismatched.items():
-        mismatched_details.append(f"{symbol}({date.strftime('%Y-%m-%d')}, 비율:{ratio:.2f})")
+    for (symbol, date), column_scales in mismatched.items():
+        scales_str = ",".join([f"{col}:{factor:.2f}" for col, factor in column_scales.items()])
+        mismatched_details.append(f"{symbol}({date.strftime('%Y-%m-%d')}, 보정:[{scales_str}])")
     print("  -> " + ", ".join(mismatched_details) + "\n")
 
     if not args.apply:
@@ -285,10 +326,13 @@ def main() -> None:
     print("⚙️ 데이터베이스 내 가격 데이터 스케일 보정 적용 중...")
     df_corrected = apply_scale_correction(df, mismatched)
     
+    # 컬럼 이름 원복 전에 안전하게 날짜 컬럼 포맷팅 수행
+    if "매수날짜" in df_corrected.columns:
+        df_corrected["매수날짜"] = pd.to_datetime(df_corrected["매수날짜"]).dt.strftime("%Y-%m-%d")
+    
     # DB 업데이트를 위한 컬럼명 원복
     INVERSE_RENAME_MAP = {v: k for k, v in RENAME_MAP.items()}
     df_db_ready = df_corrected.rename(columns=INVERSE_RENAME_MAP)
-    df_db_ready["매수날짜"] = df_db_ready["매수날짜"].dt.strftime("%Y-%m-%d")
 
     # DB에 보정 결과 저장
     df_db_ready.to_sql("table_trade_log", conn, if_exists="replace", index=False)
