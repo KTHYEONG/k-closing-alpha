@@ -2,66 +2,84 @@
 trigger: glob
 ---
 
----
 trigger:
-  # 1. Path-based automatic activation (Glob)
-  - "src/**/signals/**/*.py"
-  - "src/**/sizing/**/*.py"
-  - "src/**/regimes/**/*.py"
-  - "src/**/opt_*_utils/**/*.py"
-  - "src/core/indicators/**/*.py"
-  - "src/core/optimization/**/*.py"
-  - "src/execution/opt_main_*.py"
-  - "src/execution/trader_*.py"
-  
-  # 2. Filename-based additional activation (Regex)
-  - on_file_path_regex: "src/.*(engine|portfolio|metrics|data_collector|backtest).*"
-  
-  # 3. Manual keyword activation
-  - on_label: ["quant"]
+
+- "src/daily/\*_/_.py"
+- "src/processing/\*_/_.py"
+- "src/data/\*_/_.py"
+- "src/sync/\*_/_.py"
+- "src/api/\*_/_.py"
+- on*file_path_regex: "src/.*(AI|preprocessor|loader|sync|client|data|scale).\_"
+- on_label: ["quant"]
+
 ---
 
-# Quant & Financial Engineering Directives (Subagent Mode)
+# Quant & Financial Engineering Directives (Equity Focused)
 
-These rules inherit the general rules from `.agents/AGENTS.md` and are applied with priority as the "Quant Subagent" when tasks such as quantitative modeling, backtesting, and indicator calculation are detected.
+Priority: 1.Correctness > 2.No Look-Ahead & Bias Control > 3.Numerical Stability > 4.Reproducibility > 5.Market Realism (Taxes/Friction) > 6.Efficiency
 
-## 1. Context & Persona (Quant Subagent Role)
-- **Role:** You are a top-tier Quantitative Developer and Financial Engineer.
-- **Knowledge Base:** Provide optimal architecture and feedback based on financial engineering, statistics, linear algebra, and time-series analysis.
-- **Core Philosophy:** Never write code without mathematical rigor, and block computational bottlenecks at the source during the design phase.
-- **Task Scoping:** 
-    - **Partial Task:** Focus on core operations (Vectorization) when calculating simple indicators or writing unit functions.
-    - **Full Pipeline:** Strictly follow all verification procedures below when requesting strategy design and system construction.
+## 1. Hard Stop (Fail-Fast)
 
-## 2. Harness Engineering (High-Performance Computing & Real-time Integrity)
-- **Zero-Loop Policy:** Strictly prohibit the use of pure Python `for` or `while` loops when processing price data or time-series arrays.
-- **Vectorization First:** Utilize `numpy` vectorization and broadcasting for all primary operations.
-- **JIT Compilation (Numba):** 
-    - Must apply `@njit(nopython=True, cache=True, fastmath=True)` for logic where vectorization is impossible (Recursive, Path-dependent).
-    - If using types not supported by Numba (String, Dict, etc.), explicitly state the reason for minimizing the bottleneck in comments.
-- **Memory Management:** Default to pre-allocation via `np.zeros()`, etc. Design streaming structures using `polars` 'Lazy Evaluation', `pandas` `chunksize`, or `Generators` for large-scale data processing.
-- **Real-time Handling:** Use fixed-size `Ring Buffers` (deque or numpy array) instead of variable-length lists when processing real-time streams like WebSockets to minimize latency.
-- **Determinism:** Prioritize random seed fixation for all random number generation and ML model training.
+If critical parameters for 'Correctness', 'Time-Series Safety', or 'Equity-Specific Biases' are missing: DO NOT generate code. Output "Task Classification" and explicitly list missing params under "Needs confirmation". Ask for clarification.
 
-## 3. Prompt Engineering (Tiered Verification)
+## 2. Core Constraints
 
-### [Tier 1: Essential (Required for all Quant tasks)]
-- **Math-First Design:** Clearly present mathematical formulas and statistical assumptions before writing code.
-- **Numerical Stability:** Include logic in calculation formulas to prevent division by zero and NaN/Inf propagation.
-- **Schema Strictness:** Perform explicit validation (Assertion) of column types and dimension sizes before data input.
+- **Data Integrity & Schema:** Validate shape, dtype, and strict chronological order. Explicitly perform assertion of column types and dimension sizes before data input.
+- **Corporate Actions:** Explicitly handle Adjusted vs. Unadjusted price series (Stock splits, dividends, mergers). Never mix them silently.
+- **Time-Series (No Leakage):** Strict chronological alignment. Default backtest: Signal generated at $t$ (using data up to $t$ close) executes at $t+1$ (Open or Close).
+- **Math & Numerical Stability:** Block division by zero and prevent uncontrolled NaN/Inf propagation. Justify `epsilon` choices or handling mechanisms (e.g., IQR Scaling, Rank transformation) for fat-tailed asset returns.
+- **Trading Realism:** Parameterize equity-specific friction: broker commissions, Stock Transaction Tax (STT), exchange fees, slippage, and borrow costs for short-selling.
+- **Reproducibility:** Fix random seeds for all data splits, random sampling, and ML model training. No hidden global states.
 
-### [Tier 2: Advanced (Required for strategy and modeling tasks)]
-- **Bias Prevention:** Specify countermeasures against Look-ahead bias and Survivorship bias.
-- **Trading Friction:** Conservatively reflect slippage, commissions, latency, funding fees, etc.
-- **Time-Series Validation:** Prohibit random cross-validation (Random K-Fold) and suggest Walk-forward or Purged/Embargoed CV.
-- **Stylized Facts Awareness:** Review robust alternatives (IQR Scaling, Rank transformation, etc.) considering financial time-series characteristics (Fat-tails, Volatility Clustering).
-- **Labeling Rigor:** Consider path-dependent targeting such as the Triple-Barrier Method instead of simple return labeling.
-- **Feature Engineering:** Control multicollinearity (PCA, Spearman correlation coefficient) when inputting multiple indicators, and apply cross-sectional normalization (Cross-Sectional Z-score) for multi-asset analysis.
+## 3. Performance & Code Quality
 
-## 4. Subagent Workflow (Quant-specific execution steps)
-1. `<quant_plan>`: (Max 5 lines) Mathematical formula proof, statistical assumptions, and integration structure design.
-2. `<quant_compute>`: (Max 3 lines) Reason for selecting the computation engine (Numpy/Numba) and analysis of time/space complexity.
-3. `<quant_risk>`: (Max 4 lines) Time-series specific risks (Look-ahead, Concept Drift) and numerical stability verification plan.
-4. **Write Code:** Write high-performance logic (Complexity comments required).
-5. `<verify_quant>`: (Max 5 lines) Final report on blocking NaN propagation, simulation results, or numerical stability.
-```
+- **Zero-Loop Policy:** Strictly prohibit pure Python `for` or `while` loops **ONLY when performing mathematical/statistical operations on price time-series or multi-asset matrices.** (Allowed for API payload parsing, I/O operations, and network synchronization).
+- **Vectorization First:** Utilize `NumPy`, `Pandas`, or `Polars` vectorization and broadcasting for all primary calculations.
+- **Numba (JIT Compilation):**
+    - Apply `@njit(nopython=True, cache=True)` ONLY for recursive, path-dependent logic, or proven bottlenecks.
+    - NEVER pass DataFrames/Series to Numba; explicitly extract arrays via `.to_numpy()`.
+    - `fastmath=True` requires explicit justification in comments.
+- **Memory & Latency Management:** Default to pre-allocation via `np.zeros()`. Use `Polars` Lazy Evaluation, `Pandas` `chunksize`, or Generators for large-scale tick/order book data.
+- **Streaming Feeds:** Use fixed-size `Ring Buffers` (`collections.deque` or fixed numpy arrays) instead of variable-length lists when processing real-time exchange feeds to minimize allocation latency.
+- **Quality:** Enforce explicit type hints/signatures and clear validation steps. Separate mathematical indicators from execution logic.
+
+## 4. Anti-Patterns (Do NOT use unless explicitly justified)
+
+- **Time-Series CV:** Random K-Fold cross-validation (Use Walk-forward or Purged/Embargoed CV instead).
+- **Machine Learning Overkill:** Purged/Embargoed CV or Combinatorial Purged CV (CPCV) unless overlapping labels are explicitly present.
+- **Advanced Labeling:** Triple-Barrier Method unless building path-dependent intraday execution/stop-loss models.
+- **Dimensionality Reduction:** PCA or cross-sectional Z-score normalization unless managing large feature sets or broad multi-asset universes.
+- **Mathematical Derivations:** Writing extensive mathematical proofs or architecture-level documentation for simple, isolated indicator tasks.
+
+## 5. Context-Specific Checks (Apply only if relevant)
+
+- **Backtest:** Is the signal properly shifted to prevent look-ahead? Are transaction taxes applied on the sell side? Are long/short constraints and bounded exposures enforced?
+- **ML Modeling:** Ensure train/test splits maintain strict temporal order. Feature scalers must fit ONLY on the training data to prevent data leakage.
+- **Equity (Stock Market Dynamics):**
+    - **Market Hours:** Account for specific market hours, exchange holidays, and overnight gap risks (Close-to-Open jumps).
+    - **Survivorship Bias:** Historical universe construction must include delisted/merged tickers to avoid upward performance bias.
+    - **Liquidity & Impact:** Check for volume constraints; simulate market impact using ADV (Average Daily Volume) metrics for large sizing.
+    - **Short Constraints:** Validate borrow availability and locate fees before executing short signals.
+
+## 6. Output Modes & Templates
+
+Determine task scope and output STRICTLY using the matching template.
+
+[Mode: Micro] (Indicators, Utils, Snippets)
+Task: [Type]
+Assumptions: [Minimal Math/Statistical assumptions]
+Code: [High-performance vectorized implementation with complexity comments]
+Checks: [Edge cases, NaN/Inf handling]
+
+[Mode: Standard] (Backtests, Signals, Features)
+Task: [Type]
+Data Shape & Alignment: [Define explicit input/output shapes (e.g., Dataframe of Date x Tickers) and boundary alignments before coding]
+Code: [Clean, production-grade implementation]
+Verification: [Main stability checks, execution shift validation]
+
+[Mode: Full] (ML, Portfolio, Execution)
+Task: [Type, Asset Universe, Objective]
+Pipeline Logic Plan: [Describe how corporate actions, missing data, and time-order constraints are preserved in the pipeline steps]
+Method Choice: [Method, Stylized Facts awareness & Justification]
+Code: [Production-grade scalable logic with Numba/Vectorization optimization]
+Verification: [Leakage checklist, Survivorship bias control, Transaction tax/friction realism, Performance benchmarks]
