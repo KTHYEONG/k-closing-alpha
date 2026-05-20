@@ -74,6 +74,8 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     ],
     "v_kospi": ["(v-kospi)", "v-kospi", "v_kospi"],
     "v_kosdaq": ["(v-kosdaq)", "v-kosdaq", "v_kosdaq"],
+    "buy_price": ["(매수 가격)", "매수 가격", "(매수가격)", "매수가격", "buy_price"],
+    "sell_price": ["(매도 가격)", "매도 가격", "(매도가격)", "매도가격", "sell_price"],
 }
 
 

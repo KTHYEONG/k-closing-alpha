@@ -12,17 +12,16 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
 
 # Windows 터미널 한글 인코딩 에러 방지 (이모지 및 UTF-8 강제 출력)
 try:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
+except Exception:  # noqa: S110
     pass
 
 
-import numpy as np
+import gspread
 import pandas as pd
 
 # 프로젝트 루트 경로 추가
@@ -31,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src import settings
-from src.processing.scale_corrector import detect_price_scale_mismatch, apply_scale_correction
+from src.processing.scale_corrector import apply_scale_correction, detect_price_scale_mismatch
 
 try:
     from pykrx import stock
@@ -40,7 +39,7 @@ except ImportError:
 
 
 def pykrx_price_provider(symbol: str, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
-    """pykrx를 이용하여 해당 종목의 실 거래 종가를 조회합니다.
+    """pykrx를 이용하여 해당 종목의 실 거래 종가를 조회합니다. (Rate Limit 우회 및 안정적 재시도 탑재)
 
     Args:
         symbol: 종목코드 (6자리)
@@ -49,6 +48,7 @@ def pykrx_price_provider(symbol: str, start_date: pd.Timestamp, end_date: pd.Tim
 
     Returns:
         pd.DataFrame: date, close 컬럼이 포함된 데이터프레임
+
     """
     if stock is None:
         raise RuntimeError("pykrx 패키지가 설치되어 있지 않습니다.")
@@ -57,8 +57,23 @@ def pykrx_price_provider(symbol: str, start_date: pd.Timestamp, end_date: pd.Tim
     buffer_start = (start_date - pd.Timedelta(days=5)).strftime("%Y%m%d")
     buffer_end = (end_date + pd.Timedelta(days=5)).strftime("%Y%m%d")
 
-    # API 호출
-    df = stock.get_market_ohlcv_by_date(buffer_start, buffer_end, symbol)
+    # KRX 서버 차단 예방을 위한 호출 딜레이 추가
+    import time
+    time.sleep(0.3)
+
+    # 3회 재시도 루프 (Exponential Backoff)
+    max_retries = 3
+    df = None
+    for attempt in range(max_retries):
+        try:
+            df = stock.get_market_ohlcv_by_date(buffer_start, buffer_end, symbol)
+            if df is not None and not df.empty:
+                break
+        except Exception:
+            if attempt == max_retries - 1:
+                return pd.DataFrame()
+            time.sleep(1.0 * (attempt + 1))
+
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -81,8 +96,7 @@ def pykrx_price_provider(symbol: str, start_date: pd.Timestamp, end_date: pd.Tim
     return df[["date", "close"]].reset_index(drop=True)
 
 
-def _connect_gsheet():
-    import gspread
+def _connect_gsheet() -> gspread.Client:
     from oauth2client.service_account import ServiceAccountCredentials
 
     key_path = str(settings.GOOGLE_KEY_PATH)
@@ -91,19 +105,19 @@ def _connect_gsheet():
         "https://www.googleapis.com/auth/drive",
     ]
     creds = ServiceAccountCredentials.from_json_keyfile_name(key_path, scope)
-    return gspread.authorize(creds)
+    client: gspread.Client = gspread.authorize(creds)
+    return client
 
 
-def update_gsheet_scales(sh, sheet_name: str, mismatched_symbols: Dict[str, float]) -> None:
+def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_symbols: dict[tuple[str, pd.Timestamp], float]) -> None:
     """구글 스프레드시트에 기입된 가격 스케일 오류 값을 일괄 업데이트합니다.
 
     Args:
         sh: gspread 스프레드시트 객체
         sheet_name: 워크시트 이름 (예: Trade, Trade2)
-        mismatched_symbols: 탐지된 {종목코드: 스케일비율} 매핑
-    """
-    import gspread
+        mismatched_symbols: 탐지된 {(종목코드, 매수날짜): 스케일비율} 매핑
 
+    """
     ws = sh.worksheet(sheet_name)
     all_values = ws.get_all_values()
     if not all_values:
@@ -122,26 +136,44 @@ def update_gsheet_scales(sh, sheet_name: str, mismatched_symbols: Dict[str, floa
         print(f"   ⚠️ {sheet_name} 시트에서 필수 컬럼(종목코드/날짜)을 찾지 못했습니다.")
         return
 
-    # 업데이트 대상 가격 컬럼들의 인덱스 매핑
-    target_price_keys = ["open", "high", "low", "close", "prev_close", "ema5", "ema10", "ema20"]
-    target_col_idxs = {k: cols[k] for k in target_price_keys if cols.get(k) is not None}
+    # 명시적 타입 좁히기
+    s_idx: int = symbol_idx
+    d_idx: int = date_idx
 
-    cells_to_update: List[gspread.Cell] = []
+    # 업데이트 대상 가격 컬럼들의 인덱스 매핑
+    target_price_keys = ["open", "high", "low", "close", "prev_close", "buy_price", "sell_price"]
+    target_col_idxs: dict[str, int] = {}
+    for k in target_price_keys:
+        val = cols.get(k)
+        if val is not None:
+            target_col_idxs[k] = val
+
+    cells_to_update: list[gspread.Cell] = []
     updated_rows_count = 0
 
     # 검사 중 로그 제거 (간소화)
     for row_idx, row in enumerate(all_values[1:], start=2):
-        if symbol_idx >= len(row):
+        if s_idx >= len(row) or d_idx >= len(row):
             continue
 
-        symbol = str(row[symbol_idx]).strip().zfill(6)
-        if symbol not in mismatched_symbols:
+        symbol = str(row[s_idx]).strip().zfill(6)
+        raw_date = str(row[d_idx]).strip()
+        if not raw_date:
             continue
 
-        scale_factor = mismatched_symbols[symbol]
+        try:
+            normalized_date = pd.to_datetime(raw_date).normalize()
+        except (ValueError, TypeError):
+            continue
+
+        key = (symbol, normalized_date)
+        if key not in mismatched_symbols:
+            continue
+
+        scale_factor = mismatched_symbols[key]
         row_updated = False
 
-        for key, col_idx in target_col_idxs.items():
+        for key_name, col_idx in target_col_idxs.items():
             if col_idx >= len(row):
                 continue
 
@@ -156,11 +188,10 @@ def update_gsheet_scales(sh, sheet_name: str, mismatched_symbols: Dict[str, floa
                     continue
 
                 corrected_val = round(num_val * scale_factor, 2)
-                # 정수인 경우 정수형으로 변환 (OHLC는 대개 정수)
-                if key in ["open", "high", "low", "close", "prev_close"]:
-                    corrected_val = int(round(corrected_val))
+                if key_name in ["open", "high", "low", "close", "prev_close", "buy_price", "sell_price"]:
+                    corrected_val = round(corrected_val)
 
-                cells_to_update.append(gspread.Cell(row=row_idx, col=col_idx + 1, value=corrected_val))
+                cells_to_update.append(gspread.Cell(row=row_idx, col=col_idx + 1, value=str(corrected_val)))
                 row_updated = True
             except ValueError:
                 continue
@@ -177,7 +208,7 @@ def update_gsheet_scales(sh, sheet_name: str, mismatched_symbols: Dict[str, floa
     # API 한도 제한 회피를 위한 배치 업데이트 (1000개 단위)
     batch_size = 1000
     for i in range(0, len(cells_to_update), batch_size):
-        ws.update_cells(cells_to_update[i : i + batch_size], value_input_option="RAW")
+        ws.update_cells(cells_to_update[i : i + batch_size], value_input_option="RAW")  # type: ignore[arg-type]
         time.sleep(1.0) # Rate limit 방지
 
     print(f"   ✅ {sheet_name} 완료!")
@@ -187,8 +218,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="수동 기입 가격과 API 가격 간의 스케일 불일치 탐지 및 수정 도구")
     parser.add_argument("--db-check", action="store_true", help="로컬 SQLite 데이터베이스만 검사")
     parser.add_argument("--apply", action="store_true", help="실제 보정된 값을 구글 시트와 로컬 DB에 적용")
-    parser.add_argument("--threshold-lower", type=float, default=0.9, help="스케일 오류 탐지 하한선 (default: 0.9)")
-    parser.add_argument("--threshold-upper", type=float, default=1.1, help="스케일 오류 탐지 상한선 (default: 1.1)")
+    parser.add_argument("--threshold-lower", type=float, default=0.65, help="스케일 오류 탐지 하한선 (default: 0.65)")
+    parser.add_argument("--threshold-upper", type=float, default=1.50, help="스케일 오류 탐지 상한선 (default: 1.50)")
     args = parser.parse_args()
 
     db_path = str(settings.STOCK_DB_PATH)
@@ -230,7 +261,8 @@ def main() -> None:
         df,
         pykrx_price_provider,
         threshold_lower=args.threshold_lower,
-        threshold_upper=args.threshold_upper
+        threshold_upper=args.threshold_upper,
+        max_workers=2
     )
 
     if not mismatched:
@@ -238,19 +270,10 @@ def main() -> None:
         conn.close()
         sys.exit(0)
 
-    print(f"\n⚠️ 스케일 불일치 종목 {len(mismatched)}개 탐지됨:")
+    print(f"\n⚠️ 스케일 불일치 데이터 {len(mismatched)}건 탐지됨:")
     mismatched_details = []
-    for symbol, ratio in mismatched.items():
-        symbol_df = df[df["종목코드"] == symbol]
-        if not symbol_df.empty:
-            start_date = symbol_df["매수날짜"].min()
-            end_date = symbol_df["매수날짜"].max()
-            start_str = start_date.strftime("%Y-%m-%d")
-            end_str = end_date.strftime("%Y-%m-%d")
-            date_str = start_str if start_str == end_str else f"{start_str}~{end_str}"
-            mismatched_details.append(f"{symbol}({date_str}, 비율:{ratio:.2f})")
-        else:
-            mismatched_details.append(f"{symbol}(비율:{ratio:.2f})")
+    for (symbol, date), ratio in mismatched.items():
+        mismatched_details.append(f"{symbol}({date.strftime('%Y-%m-%d')}, 비율:{ratio:.2f})")
     print("  -> " + ", ".join(mismatched_details) + "\n")
 
     if not args.apply:
