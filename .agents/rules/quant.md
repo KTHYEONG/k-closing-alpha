@@ -1,8 +1,8 @@
 ---
 trigger:
   - on_label: ["quant"]
-  - on_file_path_regex: "src/.*(engine|portfolio|optimization|alpha|pipeline|validation|sizing|signals|universe|loader|metrics).*"
-  - on_file_path_glob: ["src/**/signals/**/*.py", "src/**/optimization/**/*.py", "src/**/validation/**/*.py"]
+  - on_file_path_regex: "src/.*(daily|backfill|processing|data|sync|api).*"
+  - on_file_path_glob: ["src/**/daily/**/*.py", "src/**/backfill/**/*.py", "src/**/processing/**/*.py"]
 priority: 10
 ---
 
