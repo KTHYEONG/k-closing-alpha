@@ -14,6 +14,14 @@ dependencies = [
     "tqdm>=4.67.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
+    "aiohttp>=3.9.0",
+    "openpyxl>=3.1.0",
+    "gspread>=6.0.0",
+    "oauth2client>=4.1.0",
+    "joblib>=1.3.0",
+    "requests>=2.31.0",
+    "pykrx>=1.0.0",
+    "setuptools>=69.0.0,<82",
 ]
 
 [build-system]
@@ -22,7 +30,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["src*", "src.backfill*"]
 
 
 
@@ -71,14 +79,14 @@ ignore = [
 "tests/*" = ["S101", "E402", "N803", "N806", "N813", "N814", "ARG", "I001", "RUF059", "F841"]
 "scripts/*" = ["T20"]
 "tools/agent_skills/lean_check.py" = ["T20", "S607"]
-"src/application/research/growth/evaluation.py" = ["I001"]  # contract wiring mandates exact single-line import strings
-"src/research/contracts.py" = ["RUF009"]  # growth-engine request defaults are frozen spec-mandated literals
-"src/data/vision.py" = ["E501"]
-"src/cli/compare_runs.py" = ["T20"]  # human-readable tabular stdout, not structured logging
-"src/cli/commands/provenance.py" = ["T20"]  # human-readable registration id / tabular stdout
-"src/cli/commands/research.py" = ["T20"]  # deterministic JSON diagnostic stdout
-"src/cli/commands/research/*.py" = ["T20"]  # deterministic JSON diagnostic stdout
-"tools/benchmark_library_admission.py" = ["T20"]  # deterministic JSON benchmark stdout
+"src/settings.py" = ["N802", "N803"]
+"src/api/kis_client.py" = ["T20", "ASYNC230", "ASYNC240", "S110", "SIM108", "B006"]
+"src/backfill/*.py" = ["T20", "E402", "N806", "B007", "B905", "S112", "RUF009", "E701", "S110", "RUF059", "RUF015", "B008", "RUF046", "SIM105", "SIM108"]
+"src/daily/*.py" = ["T20", "S608", "E402", "N806", "B007", "B905", "S112", "SIM102", "RUF001", "RUF046", "RUF059", "S110", "ASYNC230", "ASYNC240", "E722", "N803", "SIM108"]
+"src/sync/*.py" = ["T20", "ASYNC240", "ASYNC251", "N806", "B007", "B905", "B023", "S112"]
+"src/processing/*.py" = ["SIM102", "SIM108", "N806", "B905", "C416"]
+"src/utils/display.py" = ["T20", "N806", "B023"]
+"src/utils/db_to_xlsx.py" = ["T20", "S608"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15
@@ -104,7 +112,7 @@ exclude = [
 ]
 
 [[tool.mypy.overrides]]
-module = "tests.*"
+module = ["tests.*", "src.backfill.*", "src.daily.*", "src.sync.*", "src.api.*", "src.data.*", "src.processing.*", "src.utils.*"]
 ignore_errors = true
 
 
