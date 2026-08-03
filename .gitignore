@@ -1,9 +1,6 @@
 # .gitignore
 
-# Google Cloud credentials
-*.json
-
-# env / Environments
+# 환경변수 & 가상환경
 .env
 .venv
 env/
@@ -12,11 +9,16 @@ ENV/
 env.bak/
 venv.bak/
 
-# 개인 정보
+# 개인정보 & 민감한 인증 정보 (키 파일, 토큰 캐시)
 kis_config.py
 kis_common.py
+configs/kis_config.py
+*key*.json
+*credential*.json
+*token*.json
+kis_token_cache.json
 
-# __pycache__
+# __pycache__ & 파이썬 바이트코드
 __pycache__/
 *.py[cod]
 *$py.class
@@ -39,15 +41,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
+# Unit test / coverage / cache reports
 htmlcov/
 .tox/
 .nosig/
@@ -60,107 +54,28 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 cover/
-
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# pipenv
-# Pipfile.lock
-
-# poetry
-# poetry.lock
-
-# pdm
-.pdm-python-build-info
-.pdm-plugins
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
+# IDE / Editor settings
 .idea/
-
-# VS Code
 .vscode/
 
-# data files
+# Data & DB & Model Artifacts
 *.xlsx
 *.csv
-
-# db
 *.db
-
-# catboost
+*.sqlite3
 catboost_info/
-
-# model
 *.cbm
-
-# uv.lock
-uv.lock
-
-# KIS token cache
-kis_token_cache.json
+*.joblib
+/data/
+artifacts/models/
+configs/chart_pass_cache.json
 
 # Temporary trading API files
 .tmp_open_trading_api/
