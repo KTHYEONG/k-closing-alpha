@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.data.backfill_trade_sheets import SheetBackfillConfig, run_sheet_backfill
+from src.backfill.backfill_sheet import SheetBackfillConfig, run_sheet_backfill
 
 
 def main() -> None:

@@ -1,22 +1,15 @@
 import asyncio
 import os
 import time
-from typing import Any
 
-import aiohttp
 import pandas as pd
-from gspread.utils import rowcol_to_a1
 from tqdm.asyncio import tqdm
 
 from src import settings
 from src.api.kis_client import KisApiClient
-from src.data.gsheet_loader import GSheetClientManager, retry_on_quota_limit
-
-try:
-    from src.sync.program_data import get_program_history_async
-except ImportError:
-    from sync.program_data import get_program_history_async  # type: ignore[no-redef]
-
+from src.data.gsheet_loader import GSheetClientManager
+from src.sync.fetcher_program import get_program_history_async
+from src.sync.sheet_helpers import batch_update_cells, get_column_index, load_sheet_dataframe
 
 GOOGLE_KEY_PATH = str(settings.GOOGLE_KEY_PATH)
 GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
@@ -24,36 +17,6 @@ GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
 DATE_COL = settings.GOTTEN_COLS["DATE"]
 CODE_COL = settings.GOTTEN_COLS["CODE"]
 PROGRAM_COL = settings.GOTTEN_COLS["PROGRAM"]
-
-
-def _load_sheet_dataframe(manager: GSheetClientManager, worksheet_name: str) -> tuple[pd.DataFrame, Any]:
-    print(f"Google Sheets({worksheet_name})에서 데이터 불러오는 중...")
-    records = manager.get_all_records(GOOGLE_SHEET_NAME, worksheet_name)
-    sh = manager.get_spreadsheet(GOOGLE_SHEET_NAME)
-    ws = sh.worksheet(worksheet_name)
-    df = pd.DataFrame(records)
-    return df, ws
-
-
-def _get_column_index(ws: Any, column_name: str) -> int:
-    headers: list[str] = ws.row_values(1)
-    if column_name not in headers:
-        raise KeyError(f"시트에 '{column_name}' 열이 없습니다.")
-    return headers.index(column_name) + 1
-
-
-@retry_on_quota_limit()
-def _batch_update_cells(ws: Any, updates: list[tuple[int, int, Any]]) -> None:
-    if not updates:
-        return
-    data = [
-        {
-            "range": rowcol_to_a1(row_idx, col_idx),
-            "values": [[value.item() if hasattr(value, "item") else ("" if pd.isna(value) else value)]],
-        }
-        for row_idx, col_idx, value in updates
-    ]
-    ws.batch_update(data)
 
 
 async def main() -> None:
@@ -70,7 +33,7 @@ async def main() -> None:
         for worksheet_name in settings.TRADE_WORKSHEETS:
             print(f"\n>>> 시트 '{worksheet_name}' 처리 시작")
             try:
-                df, ws = _load_sheet_dataframe(manager, worksheet_name)
+                df, ws = load_sheet_dataframe(manager, worksheet_name)
                 if df.empty:
                     print(f"시트 '{worksheet_name}'가 비어 있어 건너뜁니다.")
                     continue
@@ -98,7 +61,7 @@ async def main() -> None:
                 grouped = target_df.groupby("standardized_code")
                 print(f"업데이트 대상 종목 수: {len(grouped)}개")
 
-                program_col_idx = _get_column_index(ws, PROGRAM_COL)
+                program_col_idx = get_column_index(ws, PROGRAM_COL)
                 
                 # KIS API 데이터 병렬 수집
                 async def sem_task(code, min_date_str, max_date_str, target_dates_list):
@@ -164,7 +127,7 @@ async def main() -> None:
                     for i in range(0, len(updates), BATCH_SIZE):
                         chunk = updates[i : i + BATCH_SIZE]
                         try:
-                            _batch_update_cells(ws, chunk)
+                            batch_update_cells(ws, chunk)
                             print(f"  - {i + len(chunk)}/{len(updates)}개 셀 업데이트 완료.")
                             if i + BATCH_SIZE < len(updates):
                                 time.sleep(1)

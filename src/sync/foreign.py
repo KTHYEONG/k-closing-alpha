@@ -1,23 +1,15 @@
 import asyncio
 import os
 import time
-from typing import Any
 
-import aiohttp
 import pandas as pd
-from gspread.utils import rowcol_to_a1
 from tqdm.asyncio import tqdm
 
 from src import settings
 from src.api.kis_client import KisApiClient
-from src.data.gsheet_loader import GSheetClientManager, retry_on_quota_limit
-
-try:
-    # 비동기 함수 임포트
-    from src.sync.investor_data import get_investor_trade_daily_async
-except ImportError:
-    from sync.investor_data import get_investor_trade_daily_async  # type: ignore[no-redef]
-
+from src.data.gsheet_loader import GSheetClientManager
+from src.sync.fetcher_investor import get_investor_trade_daily_async
+from src.sync.sheet_helpers import batch_update_cells, get_column_index, load_sheet_dataframe
 
 GOOGLE_KEY_PATH = str(settings.GOOGLE_KEY_PATH)
 GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
@@ -26,46 +18,6 @@ INST_COL = settings.GOTTEN_COLS["INST"]
 FRGN_COL = settings.GOTTEN_COLS["FOREIGN"]
 DATE_COL = settings.GOTTEN_COLS["DATE"]
 CODE_COL = settings.GOTTEN_COLS["CODE"]
-
-
-def _load_sheet_dataframe(manager: GSheetClientManager, worksheet_name: str) -> tuple[pd.DataFrame, Any]:
-    """특정 시트를 DataFrame으로 로드"""
-    print(f"Google Sheets({worksheet_name})에서 메타데이터 로드 중...")
-    records = manager.get_all_records(GOOGLE_SHEET_NAME, worksheet_name)
-
-    sh = manager.get_spreadsheet(GOOGLE_SHEET_NAME)
-    ws = sh.worksheet(worksheet_name)
-
-    df = pd.DataFrame(records)
-    return df, ws
-
-
-def _get_column_index(ws: Any, column_name: str) -> int:
-    """헤더 행에서 열 번호(1-based) 확인"""
-    headers: list[str] = ws.row_values(1)
-    if column_name not in headers:
-        raise KeyError(f"시트에 '{column_name}' 열이 없습니다.")
-    return headers.index(column_name) + 1
-
-
-@retry_on_quota_limit()
-def _batch_update_cells(ws: Any, updates: list[tuple[int, int, Any]]) -> None:
-    """지정된 셀만 부분 업데이트. updates: List[Tuple[row_idx, col_idx, value]]"""
-    if not updates:
-        return
-
-    data = []
-    for row_idx, col_idx, value in updates:
-        rng = rowcol_to_a1(row_idx, col_idx)
-        if pd.isna(value):
-            val = ""
-        elif hasattr(value, "item"):
-            val = value.item()
-        else:
-            val = value
-        data.append({"range": rng, "values": [[val]]})
-
-    ws.batch_update(data)
 
 
 async def main() -> None:
@@ -82,7 +34,7 @@ async def main() -> None:
             print(f"\n>>> 시트 '{worksheet_name}' 처리 시작")
             try:
                 # 1. 시트에서 데이터 로드
-                df, ws = _load_sheet_dataframe(manager, worksheet_name)
+                df, ws = load_sheet_dataframe(manager, worksheet_name)
                 if df.empty:
                     print(f"시트 '{worksheet_name}'가 비어 있어 건너뜁니다.")
                     continue
@@ -98,7 +50,7 @@ async def main() -> None:
                 # 2. 업데이트할 대상 행 식별
                 target_mask = (df[INST_COL].isna() | df[FRGN_COL].isna()) & df[CODE_COL].notna() & df[DATE_COL].notna()
                 target_indices = df[target_mask].index
-                if not target_indices.any():
+                if len(target_indices) == 0:
                     print(f"시트 '{worksheet_name}'에 업데이트할 결측 데이터가 없습니다.")
                     continue
 
@@ -113,8 +65,8 @@ async def main() -> None:
                 grouped = target_df.groupby("standardized_code")
                 print(f"업데이트 대상 종목 수: {len(grouped)}개")
 
-                inst_col_idx = _get_column_index(ws, INST_COL)
-                frgn_col_idx = _get_column_index(ws, FRGN_COL)
+                inst_col_idx = get_column_index(ws, INST_COL)
+                frgn_col_idx = get_column_index(ws, FRGN_COL)
                 
                 # 3. KIS API 데이터 병렬 수집
                 async def sem_task(code, min_date_str, max_date_str, target_dates_list):
@@ -204,7 +156,7 @@ async def main() -> None:
                     for i in range(0, len(updates), BATCH_SIZE):
                         chunk = updates[i : i + BATCH_SIZE]
                         try:
-                            _batch_update_cells(ws, chunk)
+                            batch_update_cells(ws, chunk)
                             print(f"  - {i + len(chunk)}/{len(updates)}개 셀 업데이트 완료.")
                             if i + BATCH_SIZE < len(updates):
                                 time.sleep(1)

@@ -1,5 +1,9 @@
+import logging
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # 컬럼 이름 상수로 관리
 DATE_COL = "매수날짜"
@@ -59,7 +63,7 @@ def _add_technical_features(df):
     
     # 이미 RENAME_MAP을 통해 ema5, ema10, ema20 컬럼이 존재함
     if "ema5" not in df.columns or "ema20" not in df.columns:
-        print("   ⚠️ EMA 컬럼이 없습니다. 수동 계산을 시도합니다.")
+        logger.info("   ⚠️ EMA 컬럼이 없습니다. 수동 계산을 시도합니다.")
         ema5 = g["종가"].transform(lambda x: x.ewm(span=5, adjust=False).mean())
         ema20 = g["종가"].transform(lambda x: x.ewm(span=20, adjust=False).mean())
     else:
@@ -116,7 +120,7 @@ def _add_technical_features(df):
 def preprocess_data(df, task="classification", target_col=None, feature_flags=None, exclude_features=None):
     """주식 데이터프레임을 받아 전처리하고, 특성(X), 타겟(y), 범주형 특성 리스트, 전처리된 df를 반환합니다.
     """
-    print("⚙️ 데이터 전처리 및 영업일 기준 고도화 중...")
+    logger.info("⚙️ 데이터 전처리 및 영업일 기준 고도화 중...")
     
     # Feature flags 기본값 설정
     if feature_flags is None:
@@ -132,7 +136,7 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
     
     active_features = [k for k, v in feature_flags.items() if v]
     if active_features:
-        print(f"   🔧 추가 피처 활성화: {', '.join(active_features)}")
+        logger.info(f"   🔧 추가 피처 활성화: {', '.join(active_features)}")
 
     df.rename(columns=RENAME_MAP, inplace=True)
     df.replace("", np.nan, inplace=True)
@@ -168,7 +172,7 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
         df = df.dropna(subset=existing_ema_cols).copy()
         removed_len = before_len - len(df)
         if removed_len > 0:
-            print(f"   ⚠️ EMA 결측치 발견: {removed_len}개 행 제거 완료")
+            logger.info(f"   ⚠️ EMA 결측치 발견: {removed_len}개 행 제거 완료")
     
     # [Phase 1.5] 기술적 지표 추가 호출
     df = _add_technical_features(df)
@@ -308,7 +312,7 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
                 upper_shadow = (df["고가"] - body_top) / candle_range
                 df["윗꼬리_비율"] = upper_shadow.clip(0, 1)
             else:
-                print(f"   ⚠️ 윗꼬리 비율: OHLC 데이터 부족 (필요: {required_cols})")
+                logger.info(f"   ⚠️ 윗꼬리 비율: OHLC 데이터 부족 (필요: {required_cols})")
         
         # 3. 몸통 길이 (OHLC 필요)
         if flags.get("body_length", False):
@@ -319,7 +323,7 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
                 candle_range = (df["고가"] - df["저가"]).clip(lower=1e-6)
                 df["몸통_길이_비율"] = (body_length / candle_range).clip(0, 1)
             else:
-                print(f"   ⚠️ 몸통 길이: OHLC 데이터 부족 (필요: {required_cols})")
+                logger.info(f"   ⚠️ 몸통 길이: OHLC 데이터 부족 (필요: {required_cols})")
         
         # 4. 시가 갭 비율 (전일 종가 필요)
         if flags.get("gap_ratio", False):
@@ -329,7 +333,7 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
                 gap_ratio = (df["시가"] - df["전일종가"]) / df["전일종가"].clip(lower=1e-6)
                 df["시가갭_비율"] = gap_ratio.fillna(0).clip(-0.3, 0.3)  # ±30% 제한
             else:
-                print("   ⚠️ 시가 갭 비율: 시가/전일종가 데이터 부족")
+                logger.info("   ⚠️ 시가 갭 비율: 시가/전일종가 데이터 부족")
         
         return df
 
@@ -354,7 +358,7 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
         
         # 2. 결측치 보간 (Forward Fill -> Backward Fill)
         # 과거 데이터가 비어있으면 앞의 데이터로, 앞이 없으면 뒤에서 가져옴
-        daily_ref = daily_ref.fillna(method='ffill').fillna(method='bfill')
+        daily_ref = daily_ref.ffill().bfill()
         
         # 3. 변화율(Change) 피처 생성
         daily_change = daily_ref.pct_change().fillna(0)
@@ -375,7 +379,7 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
             
         # 0을 NaN으로 변환 후 보간
         df["v_kosdaq"] = df["v_kosdaq"].replace(0, np.nan)
-        df["v_kosdaq"] = df["v_kosdaq"].fillna(method='ffill').fillna(method='bfill')
+        df["v_kosdaq"] = df["v_kosdaq"].ffill().bfill()
         df["v_kosdaq"] = df["v_kosdaq"].fillna(0)
 
         # 변화율 피처 생성
@@ -410,7 +414,7 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
         exclude_features = []
     
     if exclude_features:
-        print(f"   🗑️ 제외 피처 ({len(exclude_features)}개): {', '.join(exclude_features)}")
+        logger.info(f"   🗑️ 제외 피처 ({len(exclude_features)}개): {', '.join(exclude_features)}")
         feature_cols = [col for col in feature_cols if col not in exclude_features]
 
     cat_features_candidates = ["테마_섹터", "차트분석", "시장구분", "weekday"] # weekday로 교체
@@ -429,7 +433,7 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
     valid_idx = y.notna()
     if not valid_idx.all():
         n_invalid = (~valid_idx).sum()
-        print(f"⚠️ [Warning] 타겟 변환 실패로 {n_invalid}건 제거됨")
+        logger.info(f"⚠️ [Warning] 타겟 변환 실패로 {n_invalid}건 제거됨")
         X = X[valid_idx]
         y = y[valid_idx]
         df = df[valid_idx]
@@ -451,10 +455,10 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
         n_clipped_upper = (original_y > TARGET_UPPER_BOUND).sum()
         
         if n_clipped_lower > 0 or n_clipped_upper > 0:
-            print("📊 [Target Clipping] 극단값 제한 적용:")
-            print(f"   - 하한 초과 ({TARGET_LOWER_BOUND}% 미만): {n_clipped_lower}건")
-            print(f"   - 상한 초과 ({TARGET_UPPER_BOUND}% 초과): {n_clipped_upper}건")
-            print("   → 모델이 '안정적 수익 패턴'에 집중하도록 유도합니다.")
+            logger.info("📊 [Target Clipping] 극단값 제한 적용:")
+            logger.info(f"   - 하한 초과 ({TARGET_LOWER_BOUND}% 미만): {n_clipped_lower}건")
+            logger.info(f"   - 상한 초과 ({TARGET_UPPER_BOUND}% 초과): {n_clipped_upper}건")
+            logger.info("   → 모델이 '안정적 수익 패턴'에 집중하도록 유도합니다.")
     
     if task == "classification": 
         y = y.astype(int)
@@ -462,6 +466,6 @@ def preprocess_data(df, task="classification", target_col=None, feature_flags=No
     for col in cat_features:
         X[col] = X[col].fillna("Unknown").astype(str)
 
-    print(f"✅ 전처리 완료! (총 {len(X)}개 샘플, {len(feature_cols)}개 특성, task={task})")
+    logger.info(f"✅ 전처리 완료! (총 {len(X)}개 샘플, {len(feature_cols)}개 특성, task={task})")
     return X, y, cat_features, df
 

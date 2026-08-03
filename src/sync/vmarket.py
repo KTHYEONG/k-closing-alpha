@@ -1,5 +1,4 @@
 import asyncio
-import os
 import sys
 from datetime import datetime, timedelta
 from typing import Any
@@ -7,16 +6,12 @@ from typing import Any
 import aiohttp
 import numpy as np
 import pandas as pd
-
-# 프로젝트 루트 디렉토리를 sys.path에 추가
-sys.path.append(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
-
 from gspread.utils import rowcol_to_a1
+
 from src import settings
 from src.api.kis_client import KisApiClient
-from src.data.gsheet_loader import GSheetClientManager, retry_on_quota_limit
+from src.data.gsheet_loader import GSheetClientManager
+from src.sync.sheet_helpers import batch_update_cells
 
 
 async def fetch_index_for_date_range(
@@ -147,12 +142,6 @@ def calculate_historical_volatility(
     return df, hv_map
 
 
-@retry_on_quota_limit()
-def _batch_update_cells(ws: Any, updates: list[dict[str, Any]]) -> None:
-    """지수 백오프 재시도가 적용된 구글 시트 배치 업데이트 실행"""
-    ws.batch_update(updates)
-
-
 def update_gsheet_with_calculated_data(
     key_path: str,
     sheet_name: str,
@@ -226,7 +215,7 @@ def update_gsheet_with_calculated_data(
                                 )
 
             if updates:
-                _batch_update_cells(ws, updates)
+                batch_update_cells(ws, updates)
                 print(f"  [INFO] {ws_name}에 {len(updates)}개 셀을 업데이트했습니다.")
             else:
                 print(f"  [INFO] {ws_name}에 변경사항이 없습니다.")

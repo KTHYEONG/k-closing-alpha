@@ -7,34 +7,60 @@ from __future__ import annotations
 
 import argparse
 import importlib
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
+
 try:
     from pykrx import stock
 except ImportError:  # pragma: no cover - dependency availability differs by env
     stock = None
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-try:
-    from src.pipeline.config import DEFAULT_CONFIG
-    from src.pipeline.data import load_or_build_snapshot
-except ImportError:
-    # Fallback for when pipeline module is missing
-    DEFAULT_CONFIG = None
-    def load_or_build_snapshot(*args, **kwargs):
-        return pd.DataFrame()
+
+class PipelineConfig:
+    """레거시 `src.pipeline.config.PipelineConfig`의 하위 호환 최소 설정."""
+
+    def __init__(self, snapshot_path: Path | None = None) -> None:
+        self.snapshot_path: Path | None = snapshot_path
+
+
+DEFAULT_CONFIG = PipelineConfig()
+
+
+def load_or_build_snapshot(*args, **kwargs) -> pd.DataFrame:
+    """종목 후보 우주(symbol/market) 스냅샷을 로컬 DB에서 로드합니다.
+
+    레거시 `src.pipeline.data.load_or_build_snapshot`을 대체하며,
+    `table_trade_log`에서 symbol/market 컬럼을 구성합니다.
+    """
+    from src.data.db_loader import load_trade_log_from_db
+
+    try:
+        raw = load_trade_log_from_db()
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["symbol", "market"])
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["symbol", "market"])
+
+    rename = {}
+    for col in raw.columns:
+        if "종목코드" in str(col):
+            rename[col] = "symbol"
+        elif "시장구분" in str(col) or "시장" in str(col):
+            rename[col] = "market"
+    if "symbol" not in rename.values():
+        return pd.DataFrame(columns=["symbol", "market"])
+    out = raw.rename(columns=rename)
+    if "market" not in out.columns:
+        out["market"] = np.nan
+    return out[["symbol", "market"]]
 
 
 KRW_100M = 100_000_000.0
@@ -61,7 +87,7 @@ _PROGRAM_HISTORY_FN = None
 _PROGRAM_HISTORY_RESOLVED = False
 _INVESTOR_HISTORY_FN = None
 _INVESTOR_HISTORY_RESOLVED = False
-_KIS_SEMAPHORE: Optional[threading.Semaphore] = None
+_KIS_SEMAPHORE: threading.Semaphore | None = None
 _KIS_SEMAPHORE_SIZE = 0
 
 
@@ -73,7 +99,7 @@ def _effective_kis_sleep_sec(fetch_cfg: FetchConfig) -> float:
 def _ensure_kis_semaphore(fetch_cfg: FetchConfig) -> threading.Semaphore:
     global _KIS_SEMAPHORE, _KIS_SEMAPHORE_SIZE
     size = max(1, int(fetch_cfg.kis_max_parallel_calls))
-    if _KIS_SEMAPHORE is None or _KIS_SEMAPHORE_SIZE != size:
+    if _KIS_SEMAPHORE is None or size != _KIS_SEMAPHORE_SIZE:
         _KIS_SEMAPHORE = threading.Semaphore(size)
         _KIS_SEMAPHORE_SIZE = size
     return _KIS_SEMAPHORE
@@ -89,7 +115,7 @@ def _kis_slot(fetch_cfg: FetchConfig):
         sem.release()
 
 
-def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     cols = set(map(str, df.columns))
     for c in candidates:
         if c in cols:
@@ -97,7 +123,7 @@ def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
-def _sum_present_cols(df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
+def _sum_present_cols(df: pd.DataFrame, candidates: list[str]) -> pd.Series | None:
     cols = [c for c in candidates if c in df.columns]
     if not cols:
         return None
@@ -153,10 +179,10 @@ def _load_candidate_universe() -> pd.DataFrame:
 def _build_symbol_windows(
     universe: pd.DataFrame,
     fetch_cfg: FetchConfig,
-    symbol_limit: Optional[int] = None,
-    include_symbols: Optional[Set[str]] = None,
-    existing_last_dates: Optional[Dict[str, pd.Timestamp]] = None,
-) -> List[Tuple[str, pd.Timestamp, pd.Timestamp, str]]:
+    symbol_limit: int | None = None,
+    include_symbols: set[str] | None = None,
+    existing_last_dates: dict[str, pd.Timestamp] | None = None,
+) -> list[tuple[str, pd.Timestamp, pd.Timestamp, str]]:
     by_symbol = universe[["symbol"]].dropna().drop_duplicates().sort_values("symbol")
     market_hint = (
         universe[["symbol", "market"]]
@@ -174,7 +200,7 @@ def _build_symbol_windows(
     else:
         wanted = set()
 
-    rows: List[Tuple[str, pd.Timestamp, pd.Timestamp, str]] = []
+    rows: list[tuple[str, pd.Timestamp, pd.Timestamp, str]] = []
     start_fixed = pd.Timestamp(fetch_cfg.fixed_start_date)
     end_fixed = min(pd.Timestamp(fetch_cfg.fixed_end_date), pd.Timestamp.today().normalize())
     if start_fixed > end_fixed:
@@ -219,7 +245,7 @@ def _safe_get_market_ohlcv_by_date(
     symbol: str,
     fetch_cfg: FetchConfig,
 ) -> pd.DataFrame:
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     for attempt in range(fetch_cfg.retries):
         try:
             time.sleep(fetch_cfg.request_sleep_sec)
@@ -236,7 +262,7 @@ def _safe_get_market_cap_by_date(
     symbol: str,
     fetch_cfg: FetchConfig,
 ) -> pd.DataFrame:
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     for attempt in range(fetch_cfg.retries):
         try:
             time.sleep(fetch_cfg.request_sleep_sec)
@@ -256,7 +282,7 @@ def _safe_get_trading_value_by_date(
     fetch_cfg: FetchConfig,
 ) -> pd.DataFrame:
     def _request(on: str, detail: bool) -> pd.DataFrame:
-        last_err: Optional[Exception] = None
+        last_err: Exception | None = None
         for attempt in range(fetch_cfg.retries):
             try:
                 time.sleep(fetch_cfg.request_sleep_sec)
@@ -307,8 +333,7 @@ def _resolve_program_history_func():
         return _PROGRAM_HISTORY_FN
     _PROGRAM_HISTORY_RESOLVED = True
     candidates = [
-        "src.etc.program_data",
-        "etc.program_data",
+        "src.sync.fetcher_program",
     ]
     for mod_name in candidates:
         try:
@@ -328,8 +353,7 @@ def _resolve_investor_history_func():
         return _INVESTOR_HISTORY_FN
     _INVESTOR_HISTORY_RESOLVED = True
     candidates = [
-        "src.etc.investor_data",
-        "etc.investor_data",
+        "src.sync.fetcher_investor",
     ]
     for mod_name in candidates:
         try:
@@ -348,7 +372,7 @@ def _fetch_program_history_by_date(
     start: pd.Timestamp,
     end: pd.Timestamp,
     fetch_cfg: FetchConfig,
-    target_dates: Optional[List[str]] = None,
+    target_dates: list[str] | None = None,
 ) -> pd.DataFrame:
     fn = _resolve_program_history_func()
     if fn is None:
@@ -394,7 +418,7 @@ def _fetch_investor_history_by_date(
     start: pd.Timestamp,
     end: pd.Timestamp,
     fetch_cfg: FetchConfig,
-    target_dates: Optional[List[str]] = None,
+    target_dates: list[str] | None = None,
 ) -> pd.DataFrame:
     fn = _resolve_investor_history_func()
     if fn is not None:
@@ -445,7 +469,7 @@ def _normalize_investor_flow(flow_df: pd.DataFrame) -> pd.DataFrame:
     out = out[~out.index.isna()].copy()
     out["date"] = out.index
 
-    def _pick_by_keywords(keywords: List[str], exclude: Optional[Set[str]] = None) -> Optional[str]:
+    def _pick_by_keywords(keywords: list[str], exclude: set[str] | None = None) -> str | None:
         exclude = exclude or set()
         for c in out.columns:
             name = str(c).strip().lower()
@@ -614,6 +638,31 @@ def _normalize_symbol_history(
     return norm
 
 
+def _kis_sync_client():
+    """KisApiClient 인스턴스를 생성하고 토큰을 동기적으로 확보합니다.
+
+    레거시 `kis_common` 모듈 의존성을 대체합니다.
+    """
+    import asyncio
+
+    from src.api.kis_client import KisApiClient
+
+    client = KisApiClient()
+
+    async def _ensure() -> None:
+        async with client.create_session() as session:
+            await client.ensure_token(session)
+
+    try:
+        asyncio.run(_ensure())
+    except Exception as exc:
+        print(f"[warn] KIS token fetch failed: {exc}")
+        return None
+    if not client.token:
+        return None
+    return client
+
+
 def _fetch_kis_daily_ohlcv(
     symbol: str,
     start: pd.Timestamp,
@@ -626,35 +675,12 @@ def _fetch_kis_daily_ohlcv(
     except ImportError:
         return pd.DataFrame()
 
-    candidates = ["src.sync.kis_common", "src.etc.kis_common", "etc.kis_common", "kis_common"]
-    kis_mod = None
-    for mod_name in candidates:
-        try:
-            mod = importlib.import_module(mod_name)
-            if all(hasattr(mod, k) for k in ["APP_KEY", "APP_SECRET", "URL_BASE", "get_access_token"]):
-                kis_mod = mod
-                break
-        except Exception:
-            continue
-
-    if kis_mod is None:
+    client = _kis_sync_client()
+    if client is None:
         return pd.DataFrame()
 
-    try:
-        token = kis_mod.get_access_token()
-    except Exception as exc:
-        print(f"[warn] KIS token fetch failed for {symbol} fallback: {exc}")
-        return pd.DataFrame()
-
-    url = f"{kis_mod.URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
-    headers = {
-        "content-type": "application/json",
-        "authorization": f"Bearer {token}",
-        "appkey": kis_mod.APP_KEY,
-        "appsecret": kis_mod.APP_SECRET,
-        "tr_id": "FHKST03010100",
-        "custtype": "P",
-    }
+    url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    headers = client._get_headers("FHKST03010100")
     params = {
         "fid_cond_mrkt_div_code": "J", # Default to KOSPI, fallback handled by API if wrong
         "fid_input_iscd": symbol,
@@ -721,7 +747,7 @@ def _fetch_kis_daily_ohlcv(
         print(f"[warn] KIS ohlcv fallback failed for {symbol}: {last_err}")
     return pd.DataFrame()
 
-def _fetch_one_symbol(
+def fetch_one_symbol(
     symbol: str,
     start: pd.Timestamp,
     end: pd.Timestamp,
@@ -805,7 +831,7 @@ def _fetch_index_returns(
     out_col: str,
     fetch_cfg: FetchConfig,
 ) -> pd.DataFrame:
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     for attempt in range(fetch_cfg.retries):
         try:
             time.sleep(fetch_cfg.request_sleep_sec)
@@ -867,7 +893,7 @@ def _fetch_vkospi_proxy(
     index_code: str = "1028",
 ) -> pd.DataFrame:
     def _fetch_pykrx_close(code: str) -> pd.DataFrame:
-        last_err: Optional[Exception] = None
+        last_err: Exception | None = None
         for attempt in range(fetch_cfg.retries):
             try:
                 time.sleep(fetch_cfg.request_sleep_sec)
@@ -897,44 +923,14 @@ def _fetch_vkospi_proxy(
         except Exception:
             return pd.DataFrame(columns=["date", "close"])
 
-        candidates = [
-            "src.sync.kis_common",
-            "src.etc.kis_common",
-            "etc.kis_common",
-            "kis_common",
-        ]
-        kis_mod = None
-        for mod_name in candidates:
-            try:
-                mod = importlib.import_module(mod_name)
-                if all(
-                    hasattr(mod, k)
-                    for k in ["APP_KEY", "APP_SECRET", "URL_BASE", "get_access_token"]
-                ):
-                    kis_mod = mod
-                    break
-            except Exception:
-                continue
-        if kis_mod is None:
+        client = _kis_sync_client()
+        if client is None:
             return pd.DataFrame(columns=["date", "close"])
 
-        try:
-            token = kis_mod.get_access_token()
-        except Exception as exc:
-            print(f"[warn] KIS token fetch failed for v_kospi proxy: {exc}")
-            return pd.DataFrame(columns=["date", "close"])
+        url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice"
+        headers = client._get_headers("FHKUP03500100")
 
-        url = f"{kis_mod.URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice"
-        headers = {
-            "content-type": "application/json",
-            "authorization": f"Bearer {token}",
-            "appkey": kis_mod.APP_KEY,
-            "appsecret": kis_mod.APP_SECRET,
-            "tr_id": "FHKUP03500100",
-            "custtype": "P",
-        }
-
-        rows: List[Dict[str, object]] = []
+        rows: list[dict[str, object]] = []
         cur_start = pd.Timestamp(start).normalize()
         end_ts = pd.Timestamp(end).normalize()
         chunk_days = 60
@@ -1028,7 +1024,7 @@ def _to_parquet(df: pd.DataFrame, parquet_path: Path) -> None:
         df.to_parquet(parquet_path, index=False)
 
 
-def _load_existing_symbol_last_dates(parquet_path: Path) -> Dict[str, pd.Timestamp]:
+def _load_existing_symbol_last_dates(parquet_path: Path) -> dict[str, pd.Timestamp]:
     if parquet_path is None or not parquet_path.exists():
         return {}
     try:
@@ -1057,8 +1053,8 @@ def run_backfill(
     kis_rest_limit_per_sec: float,
     kis_rest_safety_ratio: float,
     kis_max_parallel_calls: int,
-    symbol_limit: Optional[int],
-    include_symbols: Optional[Set[str]],
+    symbol_limit: int | None,
+    include_symbols: set[str] | None,
     parquet_out: Path,
 ) -> pd.DataFrame:
     if stock is None:
@@ -1106,11 +1102,11 @@ def run_backfill(
         f"kis_sleep={_effective_kis_sleep_sec(fetch_cfg):.3f}s "
         f"existing_symbols={len(existing_last_dates)}"
     )
-    chunks: List[pd.DataFrame] = []
+    chunks: list[pd.DataFrame] = []
     done = 0
     with ThreadPoolExecutor(max_workers=fetch_cfg.max_workers) as ex:
         futures = {
-            ex.submit(_fetch_one_symbol, sym, s, e, mkt, fetch_cfg): (sym, s, e)
+            ex.submit(fetch_one_symbol, sym, s, e, mkt, fetch_cfg): (sym, s, e)
             for sym, s, e, mkt in windows
         }
         for fut in as_completed(futures):
@@ -1149,9 +1145,9 @@ def run_backfill(
 def preview_windows(
     *,
     lookback_trading_days: int,
-    symbol_limit: Optional[int],
-    include_symbols: Optional[Set[str]],
-    parquet_out: Optional[Path] = None,
+    symbol_limit: int | None,
+    include_symbols: set[str] | None,
+    parquet_out: Path | None = None,
 ) -> pd.DataFrame:
     fetch_cfg = FetchConfig(
         lookback_trading_days=max(1, int(lookback_trading_days)),

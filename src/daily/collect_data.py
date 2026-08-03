@@ -1,13 +1,7 @@
-import os
-import sys
-
-# 프로젝트 루트 디렉토리를 sys.path에 추가
-sys.path.append(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
-
 import asyncio
 import json
+import logging
+import os
 from datetime import datetime
 
 import aiohttp
@@ -23,6 +17,8 @@ from src.data.db_loader import load_theme_from_db
 from src.data.gsheet_loader import append_stocks_to_gsheet
 from src.utils.display import Colors
 
+logger = logging.getLogger(__name__)
+
 # =========================================================
 # [설정] API 접속 정보
 # =========================================================
@@ -34,13 +30,14 @@ HTS_ID = settings.KIS_API_CONFIG.get("hts_id")
 TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
 TOKEN_FILE = str(settings.TOKEN_FILE)
 
-print(f"[{datetime.now()}] 조건검색 (엑셀 중앙정렬 기능 추가) 시작...")
+logger.info("조건검색 (엑셀 중앙정렬 기능 추가) 시작...")
 
-if not HTS_ID or "여기에" in HTS_ID:
-    print(
-        "❌ 오류: configs/kis_config.py 파일의 'hts_id'에 본인의 HTS ID를 입력해주세요!"
-    )
-    exit()
+
+def _validate_hts_id() -> None:
+    if not HTS_ID or "여기에" in HTS_ID:
+        raise RuntimeError(
+            "configs/kis_config.py 파일의 'hts_id'에 본인의 HTS ID를 입력해주세요!"
+        )
 
 
 def safe_float(value, default=0.0):
@@ -168,7 +165,7 @@ async def fetch_single_stock(
                 # [New] 단기과열 종목 확인 (HTS 조건검색 기준)
                 is_overheated = code in overheated_stock_codes
                 if is_overheated:
-                    print(f"\n  🔥 {name}: 단기과열 종목 (HTS) → 차트통과=0 설정 예정")
+                    logger.info(f"\n  🔥 {name}: 단기과열 종목 (HTS) → 차트통과=0 설정 예정")
 
                 # 전일 종가 계산
                 if rate != 0:
@@ -192,7 +189,7 @@ async def fetch_single_stock(
                     safe_float(detail.get("acml_tr_pbmn")) / 100_000_000, 2
                 )
             except Exception as e:
-                print(f"\n {Colors.RED}⚠️ [{name}] 파싱 에러: {e}{Colors.RESET}")
+                logger.info(f"\n {Colors.RED}⚠️ [{name}] 파싱 에러: {e}{Colors.RESET}")
 
         frgn_net_eok = round((frgn_qty * price) / 100_000_000, 2)
         orgn_net_eok = round((orgn_qty * price) / 100_000_000, 2)
@@ -305,10 +302,10 @@ async def fetch_single_stock(
             ):
                 chart_pass = 0
 
-        print(
-            f"\r {Colors.YELLOW}🔍 데이터 수집 중... ({i+1}/{total}){Colors.RESET}",
-            end="",
-            flush=True,
+        logger.info(
+            "데이터 수집 중... (%d/%d)",
+            i + 1,
+            total,
         )
 
         return {
@@ -386,12 +383,14 @@ async def fetch_all_stock_data(
         if f
     ]
 
-    print(f"\n{Colors.GREEN}✅ 데이터 수집 완료{Colors.RESET}")
+    logger.info(f"\n{Colors.GREEN}✅ 데이터 수집 완료{Colors.RESET}")
     return results, failed_info
 
 
 async def main():
     from aiohttp.resolver import ThreadedResolver
+
+    _validate_hts_id()
 
     # aiohttp 세션 설정 강화 (네트워크 안정성 향상 + DNS 해결)
     timeout = aiohttp.ClientTimeout(
@@ -423,7 +422,7 @@ async def main():
         # 3. 조건 목록 및 대상 조건 찾기
         res_cond_list = await client.get_condition_list(session)
         if res_cond_list.get("rt_cd") != "0":
-            print(
+            logger.info(
                 f"{Colors.RED}조건식 목록 조회 실패: "
                 f"rt_cd={res_cond_list.get('rt_cd')}, "
                 f"msg={res_cond_list.get('msg1', 'N/A')}{Colors.RESET}"
@@ -432,7 +431,7 @@ async def main():
         my_conditions = res_cond_list.get("output2", [])
 
         if not my_conditions:
-            print(
+            logger.info(
                 f"{Colors.YELLOW}⚠ 저장된 조건이 없습니다. "
                 f"(HTS ID: {HTS_ID}, output2 비어 있음){Colors.RESET}"
             )
@@ -442,23 +441,23 @@ async def main():
             None,
         )
         if not target_cond:
-            print(
+            logger.info(
                 f"{Colors.RED}❌ '{TARGET_CONDITION_NAME}' 조건을 찾을 수 없습니다.{Colors.RESET}"
             )
             return
 
-        print(
+        logger.info(
             f"\n>> {Colors.BOLD}[{target_cond['condition_nm']}]{Colors.RESET} 검색 시작..."
         )
 
         # 4. 조건검색 결과 조회 (종가매매)
         res_cond_res = await client.get_condition_result(session, target_cond["seq"])
         if res_cond_res.get("rt_cd") != "0":
-            print(f"{Colors.RED}❌ 검색 실패: {res_cond_res.get('msg1')}{Colors.RESET}")
+            logger.info(f"{Colors.RED}❌ 검색 실패: {res_cond_res.get('msg1')}{Colors.RESET}")
             return
 
         stock_list = res_cond_res.get("output2", [])
-        print(
+        logger.info(
             f"{Colors.GREEN}✅ 검색 결과: 총 {len(stock_list)} 종목 포착!{Colors.RESET}"
         )
 
@@ -476,7 +475,7 @@ async def main():
         )
 
         if overheated_cond:
-            print(
+            logger.info(
                 f"\n>> {Colors.YELLOW}[{overheated_cond['condition_nm']}]{Colors.RESET} 검색 중..."
             )
             res_overheated = await client.get_condition_result(
@@ -488,7 +487,7 @@ async def main():
                 overheated_stock_codes = {
                     stock.get("code") for stock in overheated_list
                 }
-                print(
+                logger.info(
                     f"{Colors.YELLOW}🔥 단기과열 종목: {len(overheated_stock_codes)}개 포착{Colors.RESET}"
                 )
 
@@ -496,26 +495,26 @@ async def main():
                 main_stock_codes = {stock.get("code") for stock in stock_list}
                 overlap = main_stock_codes & overheated_stock_codes
                 if overlap:
-                    print(
+                    logger.info(
                         f"{Colors.YELLOW}   → 종가매매와 중복: {len(overlap)}개 종목{Colors.RESET}"
                     )
             else:
-                print(
+                logger.info(
                     f"{Colors.YELLOW}⚠️  단기과열 조건검색 실패 (무시하고 진행){Colors.RESET}"
                 )
         else:
-            print(
+            logger.info(
                 f"\n{Colors.YELLOW}⚠️  '{settings.OVERHEATED_CONDITION_NAME}' 조건을 찾을 수 없습니다.{Colors.RESET}"
             )
-            print(
+            logger.info(
                 f"   → HTS에서 '{settings.OVERHEATED_CONDITION_NAME}' 조건을 생성해주세요."
             )
-            print("   → 단기과열 필터링이 비활성화됩니다.")
+            logger.info("   → 단기과열 필터링이 비활성화됩니다.")
 
         # 4-2. [NEW] 신고가 조건검색 결과 조회
         new_high_stock_codes = set()
         new_high_cond_name = settings.NEW_HIGH_CONDITION_NAME
-        print(
+        logger.info(
             f"\n{Colors.CYAN}[디버그] '{new_high_cond_name}' 조건검색 조회 중...{Colors.RESET}"
         )
         # [FIX] 정확한 일치로 변경 ("신고가" in "신고가 근접" 방지)
@@ -524,20 +523,20 @@ async def main():
         )
 
         if new_high_cond:
-            print(
+            logger.info(
                 f"  ✓ 조건 발견: {new_high_cond['condition_nm']} (seq: {new_high_cond['seq']})"
             )
             res_new_high = await client.get_condition_result(
                 session, new_high_cond["seq"]
             )
-            print(
+            logger.info(
                 f"  API 응답: rt_cd={res_new_high.get('rt_cd')}, msg={res_new_high.get('msg1', 'N/A')}"
             )
 
             if res_new_high.get("rt_cd") == "0":
                 new_high_list = res_new_high.get("output2", [])
                 new_high_stock_codes = {stock.get("code") for stock in new_high_list}
-                print(
+                logger.info(
                     f"{Colors.GREEN}🚀 [신고가]: {len(new_high_stock_codes)}개 종목 포착{Colors.RESET}"
                 )
                 if new_high_stock_codes:
@@ -545,24 +544,24 @@ async def main():
                         f"{s.get('name', 'N/A')}({s.get('code', 'N/A')})"
                         for s in new_high_list[:3]
                     ]
-                    print(f"  샘플: {', '.join(sample_names)}")
+                    logger.info(f"  샘플: {', '.join(sample_names)}")
             else:
-                print(
+                logger.info(
                     f"{Colors.YELLOW}⚠️  [신고가] API 호출 실패 (rt_cd={res_new_high.get('rt_cd')}){Colors.RESET}"
                 )
         else:
-            print(
+            logger.info(
                 f"{Colors.YELLOW}⚠️  '{new_high_cond_name}' 조건을 찾을 수 없습니다.{Colors.RESET}"
             )
-            print("   → HTS에 등록된 조건검색 목록 확인 필요")
-            print(
+            logger.info("   → HTS에 등록된 조건검색 목록 확인 필요")
+            logger.info(
                 f"   → 등록된 조건 ({len(my_conditions)}개): {[c['condition_nm'] for c in my_conditions[:5]]}"
             )
 
         # 4-3. [NEW] 신고가 근접 조건검색 결과 조회
         near_new_high_stock_codes = set()
         near_new_high_cond_name = settings.NEAR_NEW_HIGH_CONDITION_NAME
-        print(
+        logger.info(
             f"\n{Colors.CYAN}[디버그] '{near_new_high_cond_name}' 조건검색 조회 중...{Colors.RESET}"
         )
         # [FIX] 정확한 일치로 변경
@@ -572,13 +571,13 @@ async def main():
         )
 
         if near_new_high_cond:
-            print(
+            logger.info(
                 f"  ✓ 조건 발견: {near_new_high_cond['condition_nm']} (seq: {near_new_high_cond['seq']})"
             )
             res_near_new_high = await client.get_condition_result(
                 session, near_new_high_cond["seq"]
             )
-            print(
+            logger.info(
                 f"  API 응답: rt_cd={res_near_new_high.get('rt_cd')}, msg={res_near_new_high.get('msg1', 'N/A')}"
             )
 
@@ -587,7 +586,7 @@ async def main():
                 near_new_high_stock_codes = {
                     stock.get("code") for stock in near_new_high_list
                 }
-                print(
+                logger.info(
                     f"{Colors.YELLOW}📈 [신고가 근접]: {len(near_new_high_stock_codes)}개 종목 포착{Colors.RESET}"
                 )
                 if near_new_high_stock_codes:
@@ -595,16 +594,16 @@ async def main():
                         f"{s.get('name', 'N/A')}({s.get('code', 'N/A')})"
                         for s in near_new_high_list[:3]
                     ]
-                    print(f"  샘플: {', '.join(sample_names)}")
+                    logger.info(f"  샘플: {', '.join(sample_names)}")
             else:
-                print(
+                logger.info(
                     f"{Colors.YELLOW}⚠️  [신고가 근접] API 호출 실패 (rt_cd={res_near_new_high.get('rt_cd')}){Colors.RESET}"
                 )
         else:
-            print(
+            logger.info(
                 f"{Colors.YELLOW}⚠️  '{near_new_high_cond_name}' 조건을 찾을 수 없습니다.{Colors.RESET}"
             )
-            print("   → HTS에 등록된 조건검색 목록 확인 필요")
+            logger.info("   → HTS에 등록된 조건검색 목록 확인 필요")
 
         # 4-4. [NEW] 상한가 다음날 조건검색 결과 조회
         upper_limit_next_day_stock_codes = set()
@@ -623,7 +622,7 @@ async def main():
                 upper_limit_next_day_stock_codes = {
                     stock.get("code") for stock in upper_limit_list
                 }
-                print(
+                logger.info(
                     f"{Colors.MAGENTA}⬆️ [상한가 다음날]: {len(upper_limit_next_day_stock_codes)}개 종목 포착{Colors.RESET}"
                 )
 
@@ -643,7 +642,7 @@ async def main():
                 upper_limit_stock_codes = {
                     stock.get("code") for stock in upper_limit_only_list
                 }
-                print(
+                logger.info(
                     f"{Colors.RED}🔺 [상한가]: {len(upper_limit_stock_codes)}개 종목 포착 (일반분석 제외){Colors.RESET}"
                 )
 
@@ -689,13 +688,13 @@ async def main():
             new_codes = current_codes - cached_codes
 
             if new_codes:
-                print(
+                logger.info(
                     f"\n{Colors.MAGENTA}✨ [신규 종목 포착] {len(new_codes)}개 종목이 새로 발견되었습니다.{Colors.RESET}"
                 )
                 for code in new_codes:
                     # 종목코드에 해당하는 종목명을 찾아 함께 출력
                     name = df[df["종목코드"] == code]["종목명"].iloc[0]
-                    print(f"   👉 {name} ({code})")
+                    logger.info(f"   👉 {name} ({code})")
                     daily_memory[code] = 1
 
             # 기존 엑셀 수정사항 반영
@@ -783,22 +782,22 @@ async def main():
             total_filtered = len(df[df["(차트통과)"] == 0])
             candle_filtered_count = total_filtered - sma_filtered_count
 
-            print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
-            print(f"{Colors.CYAN}[차트 필터링 결과]{Colors.RESET}")
+            logger.info(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+            logger.info(f"{Colors.CYAN}[차트 필터링 결과]{Colors.RESET}")
 
             # 단기과열 필터링 종목 (이미 앞에서 출력되었지만 요약)
             if overheated_stock_codes:
                 overheated_in_list = df[df["종목코드"].isin(overheated_stock_codes)]
                 if not overheated_in_list.empty:
-                    print(
+                    logger.info(
                         f"\n  🔥 {Colors.YELLOW}단기과열: {len(overheated_in_list)}개{Colors.RESET}"
                     )
                     for _, row in overheated_in_list.iterrows():
-                        print(f"     - {row['종목명']} ({row['종목코드']})")
+                        logger.info(f"     - {row['종목명']} ({row['종목코드']})")
 
             # SMA 120 필터링 종목 (신규종목 포함)
             if sma_filtered_count > 0:
-                print(
+                logger.info(
                     f"\n  📉 {Colors.RED}SMA 120 필터: {sma_filtered_count}개{Colors.RESET}"
                 )
                 # 실제로는 단기과열이 아니면서 차트통과=0인 종목 중 캔들 몸통은 괜찮은 것들
@@ -808,13 +807,13 @@ async def main():
                     & (df["캔들몸통비율"] >= 0.5)
                 ]
                 for _, row in sma_filtered.head(10).iterrows():  # 최대 10개만 표시
-                    print(f"     - {row['종목명']} ({row['종목코드']})")
+                    logger.info(f"     - {row['종목명']} ({row['종목코드']})")
                 if len(sma_filtered) > 10:
-                    print(f"     ... 외 {len(sma_filtered) - 10}개")
+                    logger.info(f"     ... 외 {len(sma_filtered) - 10}개")
 
             # 캔들 몸통 필터링 종목 (갭 상승 예외 제외)
             if candle_filtered_count > 0:
-                print(
+                logger.info(
                     f"\n  📊 {Colors.YELLOW}캔들 몸통 필터: {candle_filtered_count}개{Colors.RESET}"
                 )
                 candle_filtered = df[
@@ -826,11 +825,11 @@ async def main():
                     )  # 갭 상승 작은 것만
                 ]
                 for _, row in candle_filtered.head(10).iterrows():
-                    print(
+                    logger.info(
                         f"     - {row['종목명']} (몸통: {row['캔들몸통비율']:.1%}, 갭: {row['시가갭비율']:+.1%})"
                     )
                 if len(candle_filtered) > 10:
-                    print(f"     ... 외 {len(candle_filtered) - 10}개")
+                    logger.info(f"     ... 외 {len(candle_filtered) - 10}개")
 
             # [New] 갭 상승 예외로 통과한 종목 (캔들 몸통은 약하지만 갭 상승이 큼)
             gap_exception = df[
@@ -839,26 +838,26 @@ async def main():
                 & (df["시가갭비율"] >= settings.GAP_UP_THRESHOLD)
             ]
             if not gap_exception.empty:
-                print(
+                logger.info(
                     f"\n  🚀 {Colors.GREEN}갭 상승 예외 통과: {len(gap_exception)}개{Colors.RESET}"
                 )
-                print(
+                logger.info(
                     f"     (캔들 몸통 < {settings.CANDLE_BODY_RATIO_THRESHOLD:.0%} 이지만 갭 상승 >= {settings.GAP_UP_THRESHOLD:.0%})"
                 )
                 for _, row in gap_exception.head(10).iterrows():
-                    print(
+                    logger.info(
                         f"     - {row['종목명']} (몸통: {row['캔들몸통비율']:.1%}, 갭: {row['시가갭비율']:+.1%})"
                     )
                 if len(gap_exception) > 10:
-                    print(f"     ... 외 {len(gap_exception) - 10}개")
+                    logger.info(f"     ... 외 {len(gap_exception) - 10}개")
 
             # 요약
-            print(f"\n  {Colors.BOLD}[요약]{Colors.RESET}")
-            print(f"  총 필터: {Colors.RED}{total_filtered}{Colors.RESET}개 종목")
-            print(
+            logger.info(f"\n  {Colors.BOLD}[요약]{Colors.RESET}")
+            logger.info(f"  총 필터: {Colors.RED}{total_filtered}{Colors.RESET}개 종목")
+            logger.info(
                 f"  통과: {Colors.GREEN}{len(df) - total_filtered}{Colors.RESET}개 종목"
             )
-            print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
+            logger.info(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
 
             # 캔들몸통비율 컬럼은 임시 분석용이므로 최종 저장 시 제외
 
@@ -969,13 +968,13 @@ async def main():
 
             if not no_theme_df.empty:
                 no_theme_list = no_theme_df[["종목코드", "종목명"]].to_dict("records")
-                print(
+                logger.info(
                     f"\n{Colors.BOLD}⚠️ [테마 미매칭] {Colors.YELLOW}{len(no_theme_list)}{Colors.RESET} 종목 발견"
                 )
-                print(
+                logger.info(
                     f"   👉 대상 종목: {', '.join([s['종목명'] for s in no_theme_list])}"
                 )
-                print("   [진행] 미매칭 종목을 구글 시트에 등록 중...")
+                logger.info("   [진행] 미매칭 종목을 구글 시트에 등록 중...")
 
                 key_path = str(settings.GOOGLE_KEY_PATH)
                 GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
@@ -983,18 +982,18 @@ async def main():
                 append_stocks_to_gsheet(
                     key_path, GOOGLE_SHEET_NAME, THEME_WORKSHEET_NAME, no_theme_list
                 )
-            print(f"\n{Colors.BOLD}� [데이터 수집 요약]{Colors.RESET}")
-            print(f"   ✅ 성공: {Colors.GREEN}{success_count}{Colors.RESET} 종목")
+            logger.info(f"\n{Colors.BOLD}� [데이터 수집 요약]{Colors.RESET}")
+            logger.info(f"   ✅ 성공: {Colors.GREEN}{success_count}{Colors.RESET} 종목")
             if failed_info:
-                print(f"   ❌ 실패: {Colors.RED}{len(failed_info)}{Colors.RESET} 종목")
+                logger.info(f"   ❌ 실패: {Colors.RED}{len(failed_info)}{Colors.RESET} 종목")
                 for name, code, apis in failed_info:
-                    print(
+                    logger.info(
                         f"      - {name} ({code}) [실패항목: {Colors.YELLOW}{', '.join(apis)}{Colors.RESET}]"
                     )
 
-            print(f"\n{Colors.GREEN}📂 엑셀 저장 완료: {save_path}{Colors.RESET}")
+            logger.info(f"\n{Colors.GREEN}📂 엑셀 저장 완료: {save_path}{Colors.RESET}")
         else:
-            print(f"{Colors.YELLOW}⚠ 검색된 종목이 없습니다.{Colors.RESET}")
+            logger.info(f"{Colors.YELLOW}⚠ 검색된 종목이 없습니다.{Colors.RESET}")
 
 
 if __name__ == "__main__":

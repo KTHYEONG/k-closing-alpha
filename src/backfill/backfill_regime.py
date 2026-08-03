@@ -8,21 +8,14 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from src.pipeline.config import DEFAULT_CONFIG, PipelineConfig
-from src.pipeline.data import load_or_build_snapshot
+from src import settings
 
 try:
     from pykrx import stock as krx_stock
@@ -31,16 +24,46 @@ except ImportError:  # pragma: no cover - dependency availability differs by env
 
 
 @dataclass(frozen=True)
+class PipelineConfig:
+    """기존 `src.pipeline.config.PipelineConfig`의 하위 호환 대체물.
+
+    레거시 `src.pipeline` 모듈이 존재하지 않으므로, 백필 실행에 필요한
+    최소 설정(market_factors_path)만 로컬에서 제공합니다.
+    """
+
+    market_factors_path: Path = settings.DATA_DIR / "history" / "market_factors_daily.parquet"
+
+
+DEFAULT_CONFIG = PipelineConfig()
+
+
+def load_or_build_snapshot(*, config: PipelineConfig = DEFAULT_CONFIG, rebuild: bool = False, sync_gsheet: bool = False) -> pd.DataFrame:
+    """백필 실행에 필요한 date-level 스냅샷을 반환합니다.
+
+    레거시 `src.pipeline.data.load_or_build_snapshot`을 대체하며, 로컬
+    시장 요인 parquet 캐시에서 `date` 컬럼을 읽습니다. 캐시가 없으면
+    빈 DataFrame을 반환합니다.
+    """
+    path = Path(config.market_factors_path)
+    if not path.exists():
+        return pd.DataFrame(columns=["date"])
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return pd.DataFrame(columns=["date"])
+
+
+@dataclass(frozen=True)
 class MarketFactorFetchConfig:
     retries: int = 3
     retry_sleep_sec: float = 1.0
     timeout_sec: int = 20
     krx_request_sleep_sec: float = 0.03
-    krx_openapi_base_urls: Tuple[str, ...] = (
+    krx_openapi_base_urls: tuple[str, ...] = (
         "https://data-dbg.krx.co.kr",
         "http://data-dbg.krx.co.kr",
     )
-    krx_openapi_endpoints: Tuple[str, ...] = (
+    krx_openapi_endpoints: tuple[str, ...] = (
         "/svc/apis/sto/stk_bydd_trd",
         "/svc/apis/sto/ksq_bydd_trd",
     )
@@ -51,7 +74,7 @@ def _get_env_value(key: str, default: str = "") -> str:
     if raw is not None and str(raw).strip():
         return str(raw).strip().strip('"').strip("'")
 
-    env_path = PROJECT_ROOT / ".env"
+    env_path = settings.BASE_DIR / ".env"
     if not env_path.exists():
         return default
     try:
@@ -67,14 +90,14 @@ def _get_env_value(key: str, default: str = "") -> str:
     return default
 
 
-def _get_env_csv(key: str) -> List[str]:
+def _get_env_csv(key: str) -> list[str]:
     txt = _get_env_value(key, "")
     if not txt:
         return []
     return [x.strip() for x in txt.split(",") if x.strip()]
 
 
-def _parse_date_arg(value: Optional[str]) -> Optional[pd.Timestamp]:
+def _parse_date_arg(value: str | None) -> pd.Timestamp | None:
     if value is None or not str(value).strip():
         return None
     txt = str(value).strip()
@@ -84,11 +107,11 @@ def _parse_date_arg(value: Optional[str]) -> Optional[pd.Timestamp]:
 
 
 def _resolve_range(
-    start: Optional[str],
-    end: Optional[str],
+    start: str | None,
+    end: str | None,
     use_snapshot_range: bool,
     config: PipelineConfig = DEFAULT_CONFIG,
-) -> Tuple[pd.Timestamp, pd.Timestamp]:
+) -> tuple[pd.Timestamp, pd.Timestamp]:
     start_ts = _parse_date_arg(start)
     end_ts = _parse_date_arg(end)
 
@@ -127,7 +150,7 @@ def _download_vix_yfinance(
         ) from exc
 
     end_exclusive = end + pd.Timedelta(days=1)
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     for attempt in range(max(1, int(cfg.retries))):
         try:
             data = yf.download(
@@ -170,7 +193,7 @@ def _normalize_col_name(name: str) -> str:
     return "".join(ch for ch in str(name).strip().lower() if ch.isalnum())
 
 
-def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     cols = list(map(str, df.columns))
     col_map = {_normalize_col_name(c): c for c in cols}
     for c in candidates:
@@ -182,7 +205,7 @@ def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
-def _pick_change_col(df: pd.DataFrame) -> Optional[str]:
+def _pick_change_col(df: pd.DataFrame) -> str | None:
     exact = _find_col(
         df,
         [
@@ -256,7 +279,7 @@ def _extract_price_change_series(df: pd.DataFrame) -> pd.Series:
     return pd.Series(dtype=float)
 
 
-def _extract_outblock_rows(payload: object) -> List[Dict[str, object]]:
+def _extract_outblock_rows(payload: object) -> list[dict[str, object]]:
     if not isinstance(payload, dict):
         return []
 
@@ -278,14 +301,14 @@ def _safe_get_krx_openapi_day(
     endpoint: str,
     auth_key: str,
     cfg: MarketFactorFetchConfig,
-    base_urls: List[str],
-) -> Tuple[pd.DataFrame, bool]:
+    base_urls: list[str],
+) -> tuple[pd.DataFrame, bool]:
     try:
         import requests
     except Exception as exc:
         raise RuntimeError("requests is required for KRX OpenAPI calls.") from exc
 
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     unauthorized = False
     for base_url in [b.rstrip("/") for b in base_urls if str(b).strip()]:
         url = f"{base_url}{endpoint}"
@@ -327,7 +350,7 @@ def _fetch_krx_breadth_openapi(
     cfg: MarketFactorFetchConfig,
     auth_key: str,
 ) -> pd.DataFrame:
-    rows: List[Dict[str, object]] = []
+    rows: list[dict[str, object]] = []
     dates = pd.date_range(start=start, end=end, freq="B")
     env_base_urls = _get_env_csv("KRX_OPENAPI_BASE_URLS")
     env_single_base = _get_env_value("KRX_OPENAPI_BASE_URL", "")
@@ -337,12 +360,12 @@ def _fetch_krx_breadth_openapi(
 
     env_endpoints = _get_env_csv("KRX_OPENAPI_ENDPOINTS")
     endpoints = env_endpoints or [e for e in cfg.krx_openapi_endpoints if str(e).strip()]
-    disabled_endpoints: Set[str] = set()
+    disabled_endpoints: set[str] = set()
 
     for dt in dates:
         date_ymd = dt.strftime("%Y%m%d")
-        parts: List[pd.DataFrame] = []
-        called_endpoints: List[str] = []
+        parts: list[pd.DataFrame] = []
+        called_endpoints: list[str] = []
         for endpoint in endpoints:
             if endpoint in disabled_endpoints:
                 continue
@@ -396,7 +419,7 @@ def _fetch_krx_breadth_openapi(
 def _safe_get_krx_day(date_ymd: str, cfg: MarketFactorFetchConfig) -> pd.DataFrame:
     if krx_stock is None:
         return pd.DataFrame()
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     for attempt in range(max(1, int(cfg.retries))):
         try:
             time.sleep(max(0.0, float(cfg.krx_request_sleep_sec)))
@@ -412,9 +435,9 @@ def _safe_get_krx_change_day(date_ymd: str, cfg: MarketFactorFetchConfig) -> pd.
     if krx_stock is None:
         return pd.DataFrame()
     markets = ["ALL", "KOSPI", "KOSDAQ", "KONEX"]
-    frames: List[pd.DataFrame] = []
+    frames: list[pd.DataFrame] = []
     for market in markets:
-        last_err: Optional[Exception] = None
+        last_err: Exception | None = None
         for attempt in range(max(1, int(cfg.retries))):
             try:
                 time.sleep(max(0.0, float(cfg.krx_request_sleep_sec)))
@@ -458,7 +481,7 @@ def _fetch_krx_breadth(
         print("[warn] pykrx is not installed; KRX breadth collection skipped.")
         return pd.DataFrame(columns=["date", "adv_count", "dec_count", "adv_ratio", "source_breadth"])
 
-    rows: List[Dict[str, object]] = []
+    rows: list[dict[str, object]] = []
     dates = pd.date_range(start=start, end=end, freq="B")
     for dt in dates:
         date_ymd = dt.strftime("%Y%m%d")
@@ -587,10 +610,10 @@ def _normalize_output_path(path: Path) -> Path:
 
 def run_backfill_market_regime_factors(
     *,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
+    start: str | None = None,
+    end: str | None = None,
     use_snapshot_range: bool = True,
-    out_path: Optional[Path] = None,
+    out_path: Path | None = None,
     collect_vix: bool = True,
     collect_krx_breadth: bool = True,
     config: PipelineConfig = DEFAULT_CONFIG,
@@ -632,10 +655,10 @@ def run_backfill_market_regime_factors(
 
 def run_backfill_market_factors(
     *,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
+    start: str | None = None,
+    end: str | None = None,
     use_snapshot_range: bool = True,
-    out_path: Optional[Path] = None,
+    out_path: Path | None = None,
     config: PipelineConfig = DEFAULT_CONFIG,
     fetch_cfg: MarketFactorFetchConfig = MarketFactorFetchConfig(),
 ) -> pd.DataFrame:

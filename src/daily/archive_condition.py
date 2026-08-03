@@ -1,16 +1,13 @@
+import logging
 import os
 import sqlite3
-import sys
 from datetime import datetime
 
 import pandas as pd
 
-# 프로젝트 루트 디렉토리를 sys.path에 추가
-sys.path.append(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
-
 from src import settings
+
+logger = logging.getLogger(__name__)
 
 TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
 TABLE_NAME = "condition_history"
@@ -27,7 +24,8 @@ def upsert_history(df: pd.DataFrame, db_path: str) -> None:
         # 신규 컬럼(예: 차트통과) 대응: 테이블이 이미 존재할 경우 누락된 컬럼을 추가
         cursor = conn.cursor()
         cursor.execute(
-            f"SELECT name FROM sqlite_master WHERE type='table' AND name='{TABLE_NAME}'"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (TABLE_NAME,),
         )
         if cursor.fetchone():
             existing_cols = [
@@ -71,7 +69,7 @@ def import_csv_history_if_needed(history_csv: str, history_db: str) -> None:
             .unique()
         )
     except ValueError:
-        print(
+        logger.info(
             f"[warn] CSV에 '{SNAP_DATE_COL}' 컬럼이 없어 import를 건너뜁니다: {history_csv}"
         )
         return
@@ -97,7 +95,7 @@ def import_csv_history_if_needed(history_csv: str, history_db: str) -> None:
 
     missing_dates = csv_dates - db_dates
     if not table_exists and not csv_dates:
-        print(
+        logger.info(
             f"[warn] CSV에 '{SNAP_DATE_COL}' 데이터가 비어 import를 건너뜁니다: {history_csv}"
         )
         return
@@ -106,7 +104,7 @@ def import_csv_history_if_needed(history_csv: str, history_db: str) -> None:
 
     df_csv = pd.read_csv(history_csv)
     if SNAP_DATE_COL not in df_csv.columns:
-        print(
+        logger.info(
             f"[warn] CSV에 '{SNAP_DATE_COL}' 컬럼이 없어 import를 건너뜁니다: {history_csv}"
         )
         return
@@ -116,7 +114,7 @@ def import_csv_history_if_needed(history_csv: str, history_db: str) -> None:
         df_csv = df_csv.drop(columns=["스냅샷_시간"])
 
     upsert_history(df_csv, history_db)
-    print(f"[done] 기존 CSV 히스토리를 SQLite로 마이그레이션: {history_db}")
+    logger.info(f"[done] 기존 CSV 히스토리를 SQLite로 마이그레이션: {history_db}")
 
 
 def fetch_date_rows(date_str: str, history_db: str) -> pd.DataFrame:
@@ -157,17 +155,17 @@ def main():
     if FETCH_TARGET_DATE:
         df = fetch_date_rows(FETCH_TARGET_DATE, history_db)
         if df.empty:
-            print(f"[info] 조회된 데이터가 없습니다: {FETCH_TARGET_DATE}")
+            logger.info(f"[info] 조회된 데이터가 없습니다: {FETCH_TARGET_DATE}")
         else:
             target_file = os.path.join(
                 history_dir, f"condition_{clean_name}_{FETCH_TARGET_DATE}.xlsx"
             )
             df.to_excel(target_file, index=False)
-            print(f"[done] 조회 결과를 저장했습니다: {target_file}")
+            logger.info(f"[done] 조회 결과를 저장했습니다: {target_file}")
         return
 
     if not os.path.exists(latest_path):
-        print(f"[skip] 최신 파일이 없습니다: {latest_path}")
+        logger.info(f"[skip] 최신 파일이 없습니다: {latest_path}")
         return
 
     # 전날 결과 불러오기
@@ -178,7 +176,7 @@ def main():
     df.insert(0, SNAP_DATE_COL, snap_dt.strftime("%Y-%m-%d"))
 
     upsert_history(df, history_db)
-    print(f"[done] SQLite 누적 저장: {history_db}")
+    logger.info(f"[done] SQLite 누적 저장: {history_db}")
 
 
 if __name__ == "__main__":
