@@ -36,7 +36,7 @@ logger.info("조건검색 (엑셀 중앙정렬 기능 추가) 시작...")
 def _validate_hts_id() -> None:
     if not HTS_ID or "여기에" in HTS_ID:
         raise RuntimeError(
-            "configs/kis_config.py 파일의 'hts_id'에 본인의 HTS ID를 입력해주세요!"
+            ".env 파일의 'KIS_HTS_ID'에 본인의 HTS ID를 입력해주세요!"
         )
 
 
