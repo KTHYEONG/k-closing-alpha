@@ -138,8 +138,8 @@ class Settings(BaseSettings):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def GOOGLE_KEY_PATH(self) -> Path:
-        """GSPREAD_KEY_PATH 환경변수를 절대 경로로 변환."""
-        raw = self.GSPREAD_KEY_PATH_ENV.strip()
+        """GSPREAD_KEY_PATH 환경변수를 절대 경로로 변환 (Windows 역슬래시 보정)."""
+        raw = self.GSPREAD_KEY_PATH_ENV.strip().replace("\\", "/")
         if not raw:
             return Path("")
         key_path = Path(raw)
