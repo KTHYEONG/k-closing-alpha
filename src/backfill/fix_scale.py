@@ -11,7 +11,6 @@ import os
 import sqlite3
 import sys
 import time
-from pathlib import Path
 
 # Windows 터미널 한글 인코딩 에러 방지 (이모지 및 UTF-8 강제 출력)
 try:
@@ -23,11 +22,6 @@ except Exception:  # noqa: S110
 
 import gspread
 import pandas as pd
-
-# 프로젝트 루트 경로 추가
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src import settings
 from src.processing.scale_corrector import apply_scale_correction, detect_price_scale_mismatch
@@ -132,7 +126,7 @@ def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_sy
     headers = all_values[0]
 
     # 컬럼 인덱스 찾기
-    from src.data.backfill_trade_sheets import _resolve_columns
+    from src.backfill.backfill_sheet import _resolve_columns
     cols = _resolve_columns(headers, sheet_name=sheet_name)
 
     symbol_idx = cols.get("symbol")

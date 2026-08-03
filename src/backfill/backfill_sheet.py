@@ -7,26 +7,20 @@
 from __future__ import annotations
 
 import argparse
-import sys
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from src import settings
-from src.data.backfill_symbol_price_history import FetchConfig, _fetch_one_symbol
+from src.backfill.backfill_price import FetchConfig, fetch_one_symbol
 
 
 @dataclass(frozen=True)
 class SheetBackfillConfig:
-    sheets: Tuple[str, ...] = ("Trade", "Trade2")
+    sheets: tuple[str, ...] = ("Trade", "Trade2")
     lookback_for_ema_days: int = 260
     workers: int = 4
     batch_size: int = 2000
@@ -36,7 +30,7 @@ class SheetBackfillConfig:
     fill_index_vol: bool = True
 
 
-COLUMN_ALIASES: Dict[str, List[str]] = {
+COLUMN_ALIASES: dict[str, list[str]] = {
     "date": ["(매수날짜)", "매수날짜", "date"],
     "symbol": ["(종목코드)", "종목코드", "symbol"],
     "open": ["(시가)", "시가", "open"],
@@ -92,7 +86,7 @@ def _connect_gsheet():
     return gspread.authorize(creds)
 
 
-def _find_header_index(headers: Sequence[str], aliases: Sequence[str]) -> Optional[int]:
+def _find_header_index(headers: Sequence[str], aliases: Sequence[str]) -> int | None:
     normalized = {str(h).strip(): i for i, h in enumerate(headers)}
     for a in aliases:
         if a in normalized:
@@ -100,8 +94,8 @@ def _find_header_index(headers: Sequence[str], aliases: Sequence[str]) -> Option
     return None
 
 
-def _resolve_columns(headers: Sequence[str], sheet_name: str = "") -> Dict[str, Optional[int]]:
-    out: Dict[str, Optional[int]] = {}
+def _resolve_columns(headers: Sequence[str], sheet_name: str = "") -> dict[str, int | None]:
+    out: dict[str, int | None] = {}
     for key, aliases in COLUMN_ALIASES.items():
         out[key] = _find_header_index(headers, aliases)
     
@@ -118,7 +112,7 @@ def _resolve_columns(headers: Sequence[str], sheet_name: str = "") -> Dict[str, 
     return out
 
 
-def _parse_date_ymd(value: str) -> Optional[str]:
+def _parse_date_ymd(value: str) -> str | None:
     s = str(value).strip().replace("-", "").replace("/", "").replace(".", "")
     if len(s) != 8 or not s.isdigit():
         return None
@@ -130,14 +124,14 @@ def _parse_date_ymd(value: str) -> Optional[str]:
 
 def _needs_fill(
     row: Sequence[str],
-    cols: Dict[str, Optional[int]],
+    cols: dict[str, int | None],
     *,
     fill_price: bool,
     fill_ema_volume: bool,
     fill_flow: bool,
     fill_index_vol: bool,
 ) -> bool:
-    check_keys: List[str] = []
+    check_keys: list[str] = []
     if fill_price:
         check_keys += [
             "open",
@@ -176,14 +170,14 @@ def _needs_fill(
     return False
 
 
-def _to_int_or_none(v: object) -> Optional[int]:
+def _to_int_or_none(v: object) -> int | None:
     num = pd.to_numeric(v, errors="coerce")
     if pd.isna(num):
         return None
     return int(round(float(num)))
 
 
-def _to_float_or_none(v: object, ndigits: int = 2) -> Optional[float]:
+def _to_float_or_none(v: object, ndigits: int = 2) -> float | None:
     num = pd.to_numeric(v, errors="coerce")
     if pd.isna(num):
         return None
@@ -200,7 +194,7 @@ def _compute_emas(hist: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fetch_index_vol_by_dates(
-    target_dates: List[str],
+    target_dates: list[str],
     fetch_cfg: FetchConfig,
     lookback_days: int = 120,
 ) -> pd.DataFrame:
@@ -220,7 +214,7 @@ def _fetch_index_vol_by_dates(
     end = e.strftime("%Y%m%d")
 
     def _fetch_close(index_code: str) -> pd.DataFrame:
-        last_err: Optional[Exception] = None
+        last_err: Exception | None = None
         for attempt in range(max(1, int(fetch_cfg.retries))):
             try:
                 idx = krx_stock.get_index_ohlcv_by_date(start, end, index_code)
@@ -284,7 +278,7 @@ def _fetch_index_vol_by_dates(
 
 def _fetch_symbol_history_for_dates(
     symbol: str,
-    target_dates: List[str],
+    target_dates: list[str],
     market_hint: str,
     fetch_cfg: FetchConfig,
     ema_lookback_days: int,
@@ -296,7 +290,7 @@ def _fetch_symbol_history_for_dates(
     if pd.isna(s) or pd.isna(e):
         return pd.DataFrame()
     start = s - pd.Timedelta(days=max(60, int(ema_lookback_days)))
-    hist = _fetch_one_symbol(symbol, start, e, market_hint, fetch_cfg)
+    hist = fetch_one_symbol(symbol, start, e, market_hint, fetch_cfg)
     if hist is None or hist.empty:
         return pd.DataFrame()
     hist = _compute_emas(hist)
@@ -307,12 +301,12 @@ def _fetch_symbol_history_for_dates(
 def _build_cells_for_sheet(
     *,
     ws,
-    all_values: List[List[str]],
-    cols: Dict[str, Optional[int]],
+    all_values: list[list[str]],
+    cols: dict[str, int | None],
     cfg: SheetBackfillConfig,
-) -> Tuple[List[object], int]:
+) -> tuple[list[object], int]:
     import gspread
-    tasks: List[Tuple[int, str, str]] = []
+    tasks: list[tuple[int, str, str]] = []
     for row_idx, row in enumerate(all_values[1:], start=2):
         date_col = cols.get("date")
         symbol_col = cols.get("symbol")
@@ -340,14 +334,14 @@ def _build_cells_for_sheet(
     if not tasks:
         return [], 0
 
-    by_symbol: Dict[str, List[str]] = {}
+    by_symbol: dict[str, list[str]] = {}
     for _, ymd, symbol in tasks:
         by_symbol.setdefault(symbol, []).append(ymd)
 
     fetch_cfg = FetchConfig(
         max_workers=max(1, int(cfg.workers)),
     )
-    symbol_hist_map: Dict[str, pd.DataFrame] = {}
+    symbol_hist_map: dict[str, pd.DataFrame] = {}
     symbol_items = [
         (symbol, sorted(set(dates)))
         for symbol, dates in by_symbol.items()
@@ -372,7 +366,7 @@ def _build_cells_for_sheet(
                 print(f"[warn] sheet symbol history fetch failed symbol={symbol}: {exc}")
                 symbol_hist_map[symbol] = pd.DataFrame()
 
-    vindex_by_date: Dict[str, Dict[str, object]] = {}
+    vindex_by_date: dict[str, dict[str, object]] = {}
     if cfg.fill_index_vol:
         target_dates = sorted({ymd for _, ymd, _ in tasks})
         vindex = _fetch_index_vol_by_dates(
@@ -387,7 +381,7 @@ def _build_cells_for_sheet(
                     "v_kosdaq": getattr(rec, "v_kosdaq", np.nan),
                 }
 
-    cells: List[object] = []
+    cells: list[object] = []
     filled_rows = 0
     for row_idx, ymd, symbol in tasks:
         hist = symbol_hist_map.get(symbol)
@@ -398,7 +392,7 @@ def _build_cells_for_sheet(
             continue
         r = rec.iloc[-1]
 
-        values: Dict[str, object] = {}
+        values: dict[str, object] = {}
         if cfg.fill_price:
             values["open"] = _to_int_or_none(r.get("open"))
             values["high"] = _to_int_or_none(r.get("high"))

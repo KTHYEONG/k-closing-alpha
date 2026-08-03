@@ -58,16 +58,19 @@ def load_condition_data_from_db(date=None, limit=None):
     """
     conn = get_db_connection()
     try:
+        params = []
         if date:
-            query = f"SELECT * FROM table_condition WHERE 스냅샷_날짜 LIKE '{date}%'"
+            query = "SELECT * FROM table_condition WHERE 스냅샷_날짜 LIKE ?"
+            params.append(f"{date}%")
         else:
             # 날짜 지정 없으면 전체 로드 (혹은 최근 데이터)
             query = "SELECT * FROM table_condition"
 
         if limit:
-            query += f" ORDER BY 스냅샷_날짜 DESC LIMIT {limit}"
+            query += " ORDER BY 스냅샷_날짜 DESC LIMIT ?"
+            params.append(limit)
 
-        df = pd.read_sql(query, conn)
+        df = pd.read_sql(query, conn, params=params)
         return df
     finally:
         conn.close()

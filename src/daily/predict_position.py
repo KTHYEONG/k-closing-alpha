@@ -1,23 +1,18 @@
+import datetime
 import json
+import logging
 import os
 import sys
 
 import numpy as np
 import pandas as pd
-
-sys.path.append(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
-
-import datetime
-
-# .env 파일에서 환경변수를 불러오기 위한 라이브러리
-from dotenv import load_dotenv
 from joblib import load
+
+logger = logging.getLogger(__name__)
 
 # DB 및 시트 관련 임포트
 from src.data.db_loader import load_theme_from_db
-from src.data.sync_gsheet_to_db import sync_theme_only
+from src.data.sync_sheet_db import sync_theme_only
 from src.utils.display import Colors, print_table
 
 # SHAP (모델 해석용) - 필요 시 설치: pip install shap
@@ -51,7 +46,7 @@ THEME_WORKSHEET_NAME = settings.THEME_WORKSHEET_NAME
 def load_label_encoder_map(path):
     """Load saved label encoder classes and build mapping."""
     if not os.path.exists(path):
-        print(
+        logger.info(
             f"{Colors.YELLOW}[Warning] Label encoder file not found: {path}. "
             "Categorical encoding may fail during inference."
             f"{Colors.RESET}"
@@ -62,7 +57,7 @@ def load_label_encoder_map(path):
         with open(path, encoding="utf-8") as f:
             raw_data = json.load(f)
     except Exception as exc:
-        print(
+        logger.info(
             f"{Colors.RED}[Error] Failed to read label encoder file: {exc}{Colors.RESET}"
         )
         return {}
@@ -72,7 +67,7 @@ def load_label_encoder_map(path):
         mapping = {str(cls): idx for idx, cls in enumerate(classes)}
         unknown_idx = mapping.get("Unknown", len(mapping))
         encoder_map[col] = {"mapping": mapping, "unknown": unknown_idx}
-    print(
+    logger.info(
         f"{Colors.CYAN}Loaded label encoders for columns: {list(encoder_map.keys())}{Colors.RESET}"
     )
     return encoder_map
@@ -84,22 +79,17 @@ LABEL_ENCODER_MAP = load_label_encoder_map(LABEL_ENCODER_PATH)
 # 분석할 조건검색 결과 파일 및 모델 파일은 위에서 설정됨
 
 
-# .env 파일에서 환경변수 로드
-env_file_path = os.path.join(settings.BASE_DIR, ".env")
-load_dotenv(env_file_path)
-
-
 def load_and_preprocess_data(file_path):
     if not os.path.exists(file_path):
-        print(f"{Colors.RED}Error: {file_path} 파일을 찾을 수 없습니다.{Colors.RESET}")
+        logger.info(f"{Colors.RED}Error: {file_path} 파일을 찾을 수 없습니다.{Colors.RESET}")
         sys.exit(1)
 
-    print(f"{Colors.CYAN}조건검색 데이터 로드 중... ({file_path}){Colors.RESET}")
+    logger.info(f"{Colors.CYAN}조건검색 데이터 로드 중... ({file_path}){Colors.RESET}")
 
     try:
         df = pd.read_excel(file_path, engine="openpyxl")
     except Exception as e:
-        print(f"{Colors.RED}엑셀 파일 로드 실패: {e}{Colors.RESET}")
+        logger.info(f"{Colors.RED}엑셀 파일 로드 실패: {e}{Colors.RESET}")
         sys.exit(1)
 
     # [Fix] 최신 엑셀 컬럼명 형식(괄호 포함) 대응을 위한 rename_map 업데이트
@@ -158,12 +148,12 @@ def load_and_preprocess_data(file_path):
         df = df[df["(상장일수)"] >= settings.EMA_PERIOD].copy()
         filtered_count = original_count - len(df)
         if filtered_count > 0:
-            print(
+            logger.info(
                 f"{Colors.YELLOW}⚠️ 상장일수 부족 ({settings.EMA_PERIOD}일 미만): {filtered_count}개 종목 제외{Colors.RESET}"
             )
 
     # "상따" 시나리오 종목도 함께 로드 (나중에 필터링)
-    print(
+    logger.info(
         f"{Colors.GREEN}✅ 데이터 로드 완료: 분석 대상 {len(df)}개 종목{Colors.RESET}"
     )
     return df
@@ -180,12 +170,12 @@ def explain_predictions_with_shap(model, X_final, stock_names, top_n=3):
 
     """
     if not HAS_SHAP:
-        print(
+        logger.info(
             f"{Colors.YELLOW}[SHAP] shap 라이브러리가 설치되지 않았습니다. 'pip install shap'로 설치하세요.{Colors.RESET}"
         )
         return
 
-    print(f"\n{Colors.CYAN}[SHAP Analysis] 예측 근거 분석 중...{Colors.RESET}")
+    logger.info(f"\n{Colors.CYAN}[SHAP Analysis] 예측 근거 분석 중...{Colors.RESET}")
 
     try:
         # TreeExplainer 생성 (CatBoost, RandomForest 등 트리 기반 모델용)
@@ -195,9 +185,9 @@ def explain_predictions_with_shap(model, X_final, stock_names, top_n=3):
         shap_values = explainer.shap_values(X_final)
 
         # 각 종목별로 상위 기여 피처 출력
-        print(f"\n{'='*80}")
-        print(f"{Colors.GREEN}📊 주요 예측 근거 (Top {top_n} Features){Colors.RESET}")
-        print(f"{'='*80}")
+        logger.info(f"\n{'='*80}")
+        logger.info(f"{Colors.GREEN}📊 주요 예측 근거 (Top {top_n} Features){Colors.RESET}")
+        logger.info(f"{'='*80}")
 
         printed_stocks = set()
 
@@ -212,7 +202,7 @@ def explain_predictions_with_shap(model, X_final, stock_names, top_n=3):
             abs_shap = np.abs(shap_row)
             top_indices = np.argsort(abs_shap)[-top_n:][::-1]
 
-            print(f"\n[{stock_name}]")
+            logger.info(f"\n[{stock_name}]")
             for rank, feat_idx in enumerate(top_indices, 1):
                 feat_name = X_final.columns[feat_idx]
                 feat_value = X_final.iloc[idx, feat_idx]
@@ -228,14 +218,14 @@ def explain_predictions_with_shap(model, X_final, stock_names, top_n=3):
                     except:
                         value_str = f"{feat_value!s:20s}"
 
-                print(
+                logger.info(
                     f"  {rank}. {feat_name:20s} = {value_str}  {direction} {abs(shap_impact):+.4f}"
                 )
 
-        print(f"\n{'='*80}\n")
+        logger.info(f"\n{'='*80}\n")
 
     except Exception as e:
-        print(f"{Colors.RED}[SHAP Error] {e}{Colors.RESET}")
+        logger.info(f"{Colors.RED}[SHAP Error] {e}{Colors.RESET}")
 
 
 # =========================================================
@@ -294,7 +284,7 @@ def get_decision_batch(scores: pd.Series) -> pd.Series:
     ):
 
         # 로깅 (필요 시 주석 해제)
-        # print(f"  > [Static Logic] Samples={n_samples}, Std={score_std:.4f}, Range={score_range:.4f}")
+        # logger.info(f"  > [Static Logic] Samples={n_samples}, Std={score_std:.4f}, Range={score_range:.4f}")
         return scores.apply(apply_static_logic)
 
     # 3. GMM Clustering
@@ -383,7 +373,7 @@ def get_decision_batch(scores: pd.Series) -> pd.Series:
         return pd.Series(final_decisions, index=scores.index)
 
     except Exception as e:
-        print(
+        logger.info(
             f"{Colors.YELLOW}[Warning] GMM Error: {e} -> Fallback to Static{Colors.RESET}"
         )
         return scores.apply(apply_static_logic)
@@ -392,10 +382,10 @@ def get_decision_batch(scores: pd.Series) -> pd.Series:
 def main():
     # 1. 모델 및 Explainer 로드 (기존과 동일)
     if not os.path.exists(MODEL_PATH):
-        print(f"{Colors.YELLOW}[Warning] 모델 파일이 없습니다.{Colors.RESET}")
+        logger.info(f"{Colors.YELLOW}[Warning] 모델 파일이 없습니다.{Colors.RESET}")
         model = None
     else:
-        print(f"{Colors.GREEN}모델 로드 중...{Colors.RESET}")
+        logger.info(f"{Colors.GREEN}모델 로드 중...{Colors.RESET}")
         model = load(MODEL_PATH)
 
     # 2. 데이터 로드 및 테마 매핑
@@ -408,7 +398,7 @@ def main():
     ]
 
     if not missing_themes.empty:
-        print(
+        logger.info(
             f"{Colors.CYAN}신규 또는 미분류 종목 발견! 구글 시트에서 테마 정보를 동기화합니다...{Colors.RESET}"
         )
         sync_theme_only()
@@ -424,7 +414,7 @@ def main():
     df_no_theme = df_condition[df_condition["테마_섹터"] == "테마 없음"]
     if not df_no_theme.empty:
         no_theme_names = df_no_theme["종목명"].tolist()
-        print(
+        logger.info(
             f"{Colors.YELLOW}[알림] 테마 미매칭으로 분석 제외: {', '.join(no_theme_names)}{Colors.RESET}"
         )
 
@@ -432,7 +422,7 @@ def main():
     df_condition = df_condition[df_condition["테마_섹터"] != "테마 없음"].copy()
 
     if df_condition.empty:
-        print(f"{Colors.RED}분석 대상 종목이 없습니다.{Colors.RESET}")
+        logger.info(f"{Colors.RED}분석 대상 종목이 없습니다.{Colors.RESET}")
         return
 
     # 차트통과 데이터는 이미 Daily_Get_Data.py에서 SMA 120 기준으로 설정됨
@@ -446,7 +436,7 @@ def main():
 
         from src.api.kis_client import fetch_index_and_calculate_volatility
 
-        print(
+        logger.info(
             f"{Colors.CYAN}실시간 변동성(V-KOSPI/V-KOSDAQ) 데이터를 가져옵니다...{Colors.RESET}"
         )
 
@@ -454,7 +444,7 @@ def main():
         current_vkospi, current_vkospi_change = asyncio.run(
             fetch_index_and_calculate_volatility("1028")
         )
-        print(
+        logger.info(
             f"  > V-KOSPI : {current_vkospi:.2f} (Change: {current_vkospi_change:+.2%})"
         )
 
@@ -462,13 +452,13 @@ def main():
         current_vkosdaq, current_vkosdaq_change = asyncio.run(
             fetch_index_and_calculate_volatility("2203")
         )
-        print(
+        logger.info(
             f"  > V-KOSDAQ: {current_vkosdaq:.2f} (Change: {current_vkosdaq_change:+.2%})"
         )
 
     except Exception as e:
-        print(f"{Colors.YELLOW}[Warning] 변동성 계산 중 오류 발생: {e}{Colors.RESET}")
-        print("  > 변동성 관련 피처는 0으로 처리됩니다.")
+        logger.info(f"{Colors.YELLOW}[Warning] 변동성 계산 중 오류 발생: {e}{Colors.RESET}")
+        logger.info("  > 변동성 관련 피처는 0으로 처리됩니다.")
 
     # 3. [핵심] 시나리오 확장 - 차트통과=0인 종목은 SMA 120 실시간 계산
     # 차트통과=1: 모든 시나리오
@@ -511,7 +501,7 @@ def main():
 
         # 분석 대상에 추가
         df_all_parts.append(df_passed_exploded.drop(columns=["Scenario_List"]))
-        print(
+        logger.info(
             f"{Colors.CYAN}📌 분석 대상 종목(차트통과): {len(df_passed)}개 (시나리오 확장 포함 총 {len(df_passed_exploded)}건){Colors.RESET}"
         )
 
@@ -532,7 +522,7 @@ def main():
         if not df_filtered_sangdda.empty:
             df_filtered_sangdda["Scenario_Base"] = "상따"
             df_all_parts.append(df_filtered_sangdda)
-            print(
+            logger.info(
                 f"{Colors.MAGENTA}📌 차트통과=0 but 상따 지정: {len(df_filtered_sangdda)}개 (상따 전용){Colors.RESET}"
             )
 
@@ -576,13 +566,13 @@ def main():
             df_all_parts.append(
                 df_filtered_with_scenario_exploded.drop(columns=["Scenario_List"])
             )
-            print(
+            logger.info(
                 f"{Colors.MAGENTA}📌 차트통과=0 but 시나리오 지정: {len(df_filtered_with_scenario)}개 (지정+상따){Colors.RESET}"
             )
 
         # [Step 4] 시나리오 미지정 차트통과=0 종목: SMA 120 기준으로 분류
         if not df_filtered_without_scenario.empty:
-            print(
+            logger.info(
                 f"\n{Colors.CYAN}[차트통과=0 & 시나리오 미지정 종목 SMA 120 분석 중...]{Colors.RESET}"
             )
 
@@ -604,17 +594,17 @@ def main():
                     if success and sma_120 > 0:
                         if current_price < sma_120:
                             df_sma_below.append(row)
-                            print(
+                            logger.info(
                                 f"  📉 {stock_name}: 현재가 {current_price:,}원 < SMA120 {sma_120:,.0f}원 → 120돌파 시나리오만"
                             )
                         else:
                             df_candle_only.append(row)
-                            print(
+                            logger.info(
                                 f"  📊 {stock_name}: 현재가 {current_price:,}원 >= SMA120 {sma_120:,.0f}원 → 거래량 폭증"
                             )
                     else:
                         df_candle_only.append(row)
-                        print(f"  ⚠️  {stock_name}: SMA 계산 실패 → 거래량 폭증")
+                        logger.info(f"  ⚠️  {stock_name}: SMA 계산 실패 → 거래량 폭증")
 
             asyncio.run(check_sma_for_filtered_stocks())
 
@@ -671,12 +661,12 @@ def main():
     if df_all_parts:
         df_all = pd.concat(df_all_parts, ignore_index=True)
     else:
-        print(f"{Colors.RED}분석할 데이터가 없습니다.{Colors.RESET}")
+        logger.info(f"{Colors.RED}분석할 데이터가 없습니다.{Colors.RESET}")
         return
 
     # 결과 요약
-    print(f"\n{Colors.CYAN}[시나리오 적용 완료]{Colors.RESET}")
-    print(f"  ✅ 차트통과: {len(df_passed)}개 × {len(DEFAULT_SCENARIOS)}개 시나리오")
+    logger.info(f"\n{Colors.CYAN}[시나리오 적용 완료]{Colors.RESET}")
+    logger.info(f"  ✅ 차트통과: {len(df_passed)}개 × {len(DEFAULT_SCENARIOS)}개 시나리오")
 
     # [Fix] 변수가 조건문 내부에서만 정의되므로 안전하게 참조
     if df_filtered is not None and not df_filtered.empty:
@@ -689,11 +679,11 @@ def main():
             if "df_candle_only" in locals() and df_candle_only
             else 0
         )
-        print(f"  📉 SMA 120 미만: {sma_below_count}개 × 120돌파 시나리오만")
-        print(
+        logger.info(f"  📉 SMA 120 미만: {sma_below_count}개 × 120돌파 시나리오만")
+        logger.info(
             f"  📊 캔들 필터만: {candle_only_count}개 × {len(DEFAULT_SCENARIOS)}개 시나리오"
         )
-    print()
+    logger.info()
 
     # [New] v-kospi & v-kosdaq 피처 주입
     df_all["v_kospi"] = current_vkospi
@@ -875,7 +865,7 @@ def main():
         # V1 제외 피처가 train_feature_names에 없는지 확인 (디버깅용)
         excluded_in_model = [f for f in V1_EXCLUDE_FEATURES if f in train_feature_names]
         if excluded_in_model:
-            print(
+            logger.info(
                 f"{Colors.YELLOW}[Warning] 학습 모델에 제외되어야 할 피처가 포함됨: {excluded_in_model}{Colors.RESET}"
             )
 
@@ -885,10 +875,10 @@ def main():
         df_all["Score"] = model.predict(X_final)
 
         # [Debug] 피처 정합성 확인 로그
-        print(
+        logger.info(
             f"{Colors.GREEN}✅ 모델 입력 피처 수: {len(train_feature_names)}{Colors.RESET}"
         )
-        print(f"   👉 V1 제외 피처: {V1_EXCLUDE_FEATURES}")
+        logger.info(f"   👉 V1 제외 피처: {V1_EXCLUDE_FEATURES}")
 
         # ============================================================
         # [SHAP 분석] 예측 근거 확인 (필요 시 아래 주석 해제)
@@ -909,7 +899,7 @@ def main():
     # 6. 의사결정 로직 일괄 적용 (GMM Dynamic + Safety Floor)
     # [Optimized Thresholds] AI 추천 및 실전 보정 임계값 적용 (2025-12-27 업데이트)
     # GMM을 통해 그날의 시장 난이도에 맞게 상대평가하되, 절대 하한선(Safety)을 지킴
-    print(f"{Colors.CYAN}의사결정 등급 산정 중 (GMM Dynamic Logic)...{Colors.RESET}")
+    logger.info(f"{Colors.CYAN}의사결정 등급 산정 중 (GMM Dynamic Logic)...{Colors.RESET}")
     df_all["Decision"] = get_decision_batch(df_all["Score"])
 
     # 7. 결과 리스트 생성

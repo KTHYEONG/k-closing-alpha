@@ -1,18 +1,17 @@
+import logging
 import os
-import sys
 import time
 from collections.abc import Callable
 from typing import Any, Optional, TypeVar, cast
 
 import gspread
 import pandas as pd
-from dotenv import load_dotenv
 from gspread.exceptions import APIError
 from oauth2client.service_account import ServiceAccountCredentials
 
 from src import settings
 
-load_dotenv(settings.BASE_DIR / ".env")
+logger = logging.getLogger(__name__)
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -33,8 +32,11 @@ def retry_on_quota_limit(max_retries: int = 3, base_delay: float = 2.0) -> Calla
                         and retries < max_retries
                     ):
                         wait_time = base_delay * (2**retries)
-                        print(
-                            f"    [Warning] API Quota 초과(429). {wait_time}초 대기 후 재시도... ({retries+1}/{max_retries})"
+                        logger.warning(
+                            "API Quota 초과(429). %.1f초 대기 후 재시도... (%d/%d)",
+                            wait_time,
+                            retries + 1,
+                            max_retries,
                         )
                         time.sleep(wait_time)
                         retries += 1
@@ -104,17 +106,17 @@ def load_data_from_gsheet(
 ) -> pd.DataFrame | None:
     """구글 시트에서 데이터를 DataFrame으로 로드하는 함수"""
     if not os.path.exists(key_path):
-        print(f"Error: 인증 키 파일({key_path})이 없습니다.")
-        sys.exit(1)
+        logger.error("인증 키 파일(%s)이 없습니다.", key_path)
+        return None
     try:
         manager = GSheetClientManager(key_path)
         records = manager.get_all_records(sheet_name, worksheet_name)
         df = pd.DataFrame(records)
         if df.empty:
-            print(f"Warning: '{worksheet_name}' 시트에서 가져온 데이터가 없습니다.")
+            logger.warning("'%s' 시트에서 가져온 데이터가 없습니다.", worksheet_name)
         return df
     except Exception as e:
-        print(f"'{worksheet_name}' 시트 로드 실패: {e}")
+        logger.error("'%s' 시트 로드 실패: %s", worksheet_name, e)
         return None
 
 
@@ -132,10 +134,9 @@ def load_and_combine_sheets(*args: Any) -> pd.DataFrame:
             "(key_path, sheet_name, worksheet_names)"
         )
 
-    print("[INFO] 구글 시트에서 데이터 로드 중...")
+    logger.info("구글 시트에서 데이터 로드 중...")
     if not key_path:
-        print("Error: 구글 시트 인증 키 경로가 설정되지 않았습니다.")
-        sys.exit(1)
+        raise RuntimeError("구글 시트 인증 키 경로가 설정되지 않았습니다.")
     df_list = []
     for ws_name in worksheet_names:
         df_sheet = load_data_from_gsheet(key_path, sheet_name, ws_name)
@@ -143,8 +144,7 @@ def load_and_combine_sheets(*args: Any) -> pd.DataFrame:
             df_list.append(df_sheet)
 
     if not df_list:
-        print("Error: 모든 시트에서 데이터를 가져오지 못했습니다.")
-        sys.exit(1)
+        raise RuntimeError("모든 시트에서 데이터를 가져오지 못했습니다.")
 
     return pd.concat(df_list, ignore_index=True)
 
@@ -164,14 +164,14 @@ def append_stocks_to_gsheet(
         all_values, ws = manager.get_all_values(sheet_name, worksheet_name)
 
         if not all_values:
-            print("[Warning] 시트가 비어있습니다. 헤더가 필요합니다.")
+            logger.warning("시트가 비어있습니다. 헤더가 필요합니다.")
             return
 
         headers = all_values[0]
         try:
             code_col_idx = headers.index("종목코드")
         except ValueError:
-            print("[Error] '종목코드' column을 찾을 수 없습니다.")
+            logger.error("'종목코드' column을 찾을 수 없습니다.")
             return
 
         existing_codes = {
@@ -194,9 +194,9 @@ def append_stocks_to_gsheet(
 
         if new_rows:
             manager.append_rows(ws, new_rows)
-            print(f"[INFO] 구글 시트에 {len(new_rows)}개 종목이 새로 추가되었습니다.")
+            logger.info("구글 시트에 %d개 종목이 새로 추가되었습니다.", len(new_rows))
         else:
-            print("[INFO] 추가할 새로운 종목이 없습니다 (이미 시트에 존재).")
+            logger.info("추가할 새로운 종목이 없습니다 (이미 시트에 존재).")
 
     except Exception as e:
-        print(f"[Error] 구글 시트 업데이트 실패: {e}")
+        logger.error("구글 시트 업데이트 실패: %s", e)

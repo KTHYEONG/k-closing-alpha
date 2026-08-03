@@ -12,12 +12,12 @@ import time
 from typing import Any
 
 import pandas as pd
-from gspread.utils import rowcol_to_a1
 from tqdm.asyncio import tqdm
 
 from src import settings
 from src.api.kis_client import KisApiClient
-from src.data.gsheet_loader import GSheetClientManager, retry_on_quota_limit
+from src.data.gsheet_loader import GSheetClientManager
+from src.sync.sheet_helpers import batch_update_cells
 
 try:
     from pykrx import stock
@@ -47,20 +47,6 @@ def _find_volume_col(df: pd.DataFrame) -> str | None:
         if "거래량" in str(col) or "volume" in str(col).lower():
             return str(col)
     return None
-
-
-@retry_on_quota_limit()
-def _batch_update_cells(ws: Any, updates: list[tuple[int, int, Any]]) -> None:
-    if not updates:
-        return
-    data = [
-        {
-            "range": rowcol_to_a1(row_idx, col_idx),
-            "values": [[value.item() if hasattr(value, "item") else ("" if pd.isna(value) else value)]],
-        }
-        for row_idx, col_idx, value in updates
-    ]
-    ws.batch_update(data)
 
 
 async def fetch_volume_data_for_stock(code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -212,7 +198,7 @@ async def main() -> None:
         for i in range(0, len(updates), BATCH_SIZE):
             chunk = updates[i : i + BATCH_SIZE]
             try:
-                _batch_update_cells(ws, chunk)
+                batch_update_cells(ws, chunk)
                 logger.info(f"  - {i + len(chunk)}/{len(updates)}개 셀 업데이트 완료.")
                 if i + BATCH_SIZE < len(updates):
                     time.sleep(1)
