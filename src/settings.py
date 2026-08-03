@@ -45,6 +45,7 @@ class Settings(BaseSettings):
 
     # Google Sheets
     GSPREAD_KEY_PATH_ENV: str = Field(default="", validation_alias="GSPREAD_KEY_PATH")
+    GSPREAD_SA_JSON: str = Field(default="")
     GOOGLE_SHEET_NAME: str = "Stock"
     TRADE_WORKSHEETS: list[str] = ["Trade", "Trade2"]
     THEME_WORKSHEET_NAME: str = "코드_테마_DB"
@@ -234,6 +235,7 @@ KIS_HTS_ID = settings.KIS_HTS_ID
 KIS_BASE_URL = settings.KIS_BASE_URL
 KIS_API_CONFIG = settings.KIS_API_CONFIG
 GSPREAD_KEY_PATH_ENV = settings.GSPREAD_KEY_PATH_ENV
+GSPREAD_SA_JSON = settings.GSPREAD_SA_JSON
 GOOGLE_KEY_PATH = settings.GOOGLE_KEY_PATH
 GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
 TRADE_WORKSHEETS = settings.TRADE_WORKSHEETS

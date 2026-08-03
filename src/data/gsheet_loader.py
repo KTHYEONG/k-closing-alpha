@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -46,7 +47,6 @@ def retry_on_quota_limit(max_retries: int = 3, base_delay: float = 2.0) -> Calla
         return cast(F, wrapper)
     return decorator
 
-
 class GSheetClientManager:
     """인증 정보와 Spreadsheet 객체를 캐싱하여 불필요한 API 호출을 제거합니다."""
 
@@ -57,13 +57,13 @@ class GSheetClientManager:
     client: gspread.Client
     spreadsheets_cache: dict[str, gspread.Spreadsheet]
 
-    def __new__(cls, key_path: str) -> "GSheetClientManager":
+    def __new__(cls, key_path: str = "") -> "GSheetClientManager":
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self, key_path: str) -> None:
+    def __init__(self, key_path: str = "") -> None:
         if self._initialized:
             return
 
@@ -71,7 +71,13 @@ class GSheetClientManager:
             "https://spreadsheets.google.com/feeds",
             "https://www.googleapis.com/auth/drive",
         ]
-        self.creds = ServiceAccountCredentials.from_json_keyfile_name(key_path, self.scope)
+        sa_json = settings.GSPREAD_SA_JSON.strip()
+        if sa_json:
+            info = json.loads(sa_json)
+            self.creds = ServiceAccountCredentials.from_json_keyfile_dict(info, self.scope)
+        else:
+            self.creds = ServiceAccountCredentials.from_json_keyfile_name(key_path, self.scope)
+
         self.client = gspread.authorize(self.creds)
         self.spreadsheets_cache = {}  # 시트 이름별 캐싱
         self._initialized = True
