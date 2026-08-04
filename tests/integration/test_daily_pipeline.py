@@ -335,3 +335,104 @@ def test_import_csv_history_if_needed_migrates_legacy_csv(tmp_path: Path) -> Non
 
     rows = archive.fetch_date_rows("2026-08-01", str(db_path))
     assert rows["종목코드"].astype(str).str.zfill(6).tolist() == ["000002"]
+
+
+# ---------------------------------------------------------
+# collect.main() → upsert_archive_snapshot wiring
+# ---------------------------------------------------------
+class _FakeKisClient:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    async def ensure_token(self, session: object) -> None:
+        return None
+
+    async def get_market_index_rate(self, session: object, code: str) -> dict:
+        return {"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "1.00"}}
+
+    async def get_condition_list(self, session: object) -> dict:
+        return {
+            "rt_cd": "0",
+            "output2": [
+                {"condition_nm": collect.settings.TARGET_CONDITION_NAME, "seq": 1}
+            ],
+        }
+
+    async def get_condition_result(self, session: object, seq: int) -> dict:
+        return {
+            "rt_cd": "0",
+            "output2": [
+                {"code": "005930", "name": "삼성전자", "price": "1000", "chgrate": "1.00"}
+            ],
+        }
+
+
+class _FakeSession:
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+async def _fake_fetch_all_stock_data(*args, **kwargs) -> tuple[list[dict], list]:
+    return (
+        [
+            {
+                "종목명": "삼성전자",
+                "종목코드": "005930",
+                "시가": 1000,
+                "고가": 1100,
+                "저가": 900,
+                "종가": 1050,
+                "전일종가": 1000,
+                "시장구분": "KOSPI",
+                "시가총액": 5000.0,
+                "거래대금": 120.0,
+                "체결강도": 120.0,
+                "등락률": 5.0,
+                "선정순위": 1,
+                "기관_순매수": 1.0,
+                "외국인_순매수": 2.0,
+                "프로그램_순매수": 0.5,
+                "시나리오": "거래량 폭증",
+                "거래량": 100000,
+            }
+        ],
+        [],
+    )
+
+
+def test_collect_main_archives_snapshot_to_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """collect.main() 은 수집 후 upsert_archive_snapshot 으로 archive.db/parquet 에 누적 저장한다."""
+    history_dir = tmp_path / "history"
+    monkeypatch.setattr(collect.settings, "HISTORY_DIR", history_dir)
+    monkeypatch.setattr(
+        collect.settings, "HISTORY_PARQUET_PATH", history_dir / "archive.parquet"
+    )
+    monkeypatch.setattr(
+        collect.settings, "HISTORY_DB_PATH", history_dir / "archive.db"
+    )
+    monkeypatch.setattr(
+        collect.settings,
+        "CONDITION_CSV_PATH",
+        tmp_path / "daily" / "daily_stocks.csv",
+    )
+
+    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all_stock_data)
+    monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
+    monkeypatch.setattr(collect, "load_theme_from_db", lambda: {})
+    monkeypatch.setattr(collect, "append_stocks_to_gsheet", lambda *a, **k: None)
+
+    asyncio.run(collect.main())
+
+    assert (history_dir / "archive.db").exists()
+    assert (history_dir / "archive.parquet").exists()
+    df = pd.read_parquet(history_dir / "archive.parquet")
+    assert "스냅샷_날짜" in df.columns
+    assert len(df) >= 1
+    assert df["종목코드"].astype(str).str.zfill(6).tolist() == ["005930"]
