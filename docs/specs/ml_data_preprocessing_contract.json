@@ -1,0 +1,37 @@
+{
+  "target_file": "/home/kth/k-closing-alpha/src/processing/preprocessor_v2.py",
+  "symbol": "build_ml_dataset",
+  "signature": "def build_ml_dataset(trade_log_df: pd.DataFrame, theme_df: pd.DataFrame | None = None) -> tuple[pd.DataFrame, dict[str, pd.Series], list[str], pd.DataFrame]",
+  "python_assertion": "import pandas as pd; sample_df = pd.DataFrame({\"매수날짜\": [\"2024-01-02\"] * 2, \"종목코드\": [\"005930\", \"000660\"], \"(시가)\": [10000, 20000], \"(종가)\": [10500, 21000], \"(전일종가)\": [9900, 19800], \"(등락률)\": [1.0, 2.0], \"(선정 순위)\": [1.0, 2.0], \"(거래대금, 억)\": [100.0, 50.0], \"(기관_순매수)\": [10.0, -10.0], \"(외국인_순매수)\": [20.0, 5.0], \"(프로그램_순매수)\": [5.0, 0.0], \"(시장구분)\": [\"KOSPI\", \"KOSDAQ\"], \"(총 종목 수)\": [2.0, 2.0], \"(kospi, %)\": [0.5, 0.5], \"(kosdaq, %)\": [0.3, 0.3], \"(매수 가격)\": [10300.0, 20500.0], \"(수익률, %)\": [\"2.1\", \"1.5\"]}); assert len(build_ml_dataset(sample_df)[0]) > 0",
+  "requirements": [
+    "Raw column names with parentheses and Korean units must be mapped to clean snake_case identifiers.",
+    "Must generate 3 target types: target_return (float clipped), target_rank (int 0~4 per daily group), target_good / target_bad (int 0/1 binary).",
+    "Must apply log scaling for skewed amounts (trade_value_100m, market_cap_100m) and signed log for net buy metrics.",
+    "Must calculate cross-sectional daily percentile ranks for key features (trade_value_pct_rank, inst_net_buy_pct_rank, change_rate_pct_rank).",
+    "Must calculate buy_price_change_rate using actual 15:19-20 execution price (buy_price) instead of API 15:30 close price.",
+    "Must exclude future leakage columns (buy_price, sell_price, raw net_return, targets, etc.) from the feature matrix X."
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "clean_column_mapping",
+      "target_test_file": "/home/kth/k-closing-alpha/tests/test_preprocessor_v2.py",
+      "expected_behavior": "Columns with parentheses like '(시가총액, 억)' are properly transformed into clean names like 'market_cap_100m'."
+    },
+    {
+      "scenario_id": "multi_target_generation",
+      "target_test_file": "/home/kth/k-closing-alpha/tests/test_preprocessor_v2.py",
+      "expected_behavior": "Returns valid target_rank (0~4), target_return, target_good (0/1), and target_bad (0/1) without NaNs."
+    },
+    {
+      "scenario_id": "no_data_leakage_in_features",
+      "target_test_file": "/home/kth/k-closing-alpha/tests/test_preprocessor_v2.py",
+      "expected_behavior": "Feature matrix X does not contain buy_price, sell_price, net_return, or target columns."
+    }
+  ],
+  "wiring": {
+    "caller_file": "/home/kth/k-closing-alpha/src/daily/predict_position.py",
+    "anchor": "from src.processing.preprocessor import preprocess_data",
+    "import_symbol": "from src.processing.preprocessor_v2 import build_ml_dataset",
+    "invocation_expression": "X, targets, cat_features, processed_df = build_ml_dataset(trade_log_df)"
+  }
+}
