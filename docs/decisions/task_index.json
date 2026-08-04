@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "OHLCV_PREFETCH_SMA120",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_OHLCV_PREFETCH_SMA120",
+      "domain": "daily",
+      "title": "OHLCV 사전 병렬 선조회로 SMA120 수집 속도 최적화",
+      "why": "120일 이동평균선 조회 API 순차 중복 호출로 수집 시간이 13.7초에서 19.6초로 폭증",
+      "resolution": "prefetch_ohlcv_for_sma120 추가 및 calculate_all_moving_averages/fetch_all_stock_data 병렬 prefetch 적용",
+      "impact": "OHLCV 추가 호출 102회 -> 51회 50% 감축 및 TPS 제한 한계 내 병렬 처리 안정화"
+    },
+    {
       "task_id": "COLLECT_PERF_V2",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_COLLECT_PERF_V2",

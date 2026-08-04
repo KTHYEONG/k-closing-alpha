@@ -1,5 +1,7 @@
 {
-  "src/api/kis_client.py": {},
+  "src/api/kis_client.py": {
+    "testing": "tests/unit/api/test_kis_client.py"
+  },
   "src/backfill/backfill_price.py": {},
   "src/backfill/backfill_regime.py": {},
   "src/backfill/backfill_sheet.py": {},
