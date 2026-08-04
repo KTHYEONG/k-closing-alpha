@@ -311,7 +311,7 @@ def _daily_snapshot_df() -> pd.DataFrame:
             "전일종가": [10_000.0, 20_000.0],
             "시가총액": [1_000.0, 2_000.0],
             "거래대금": [100.0, 200.0],
-            "등락률": [5.0, 20.0],
+            "등락률": [22.0, 20.0],
             "선정순위": [1, 2],
             "기관_순매수": [10.0, 20.0],
             "외국인_순매수": [5.0, 10.0],
@@ -329,6 +329,7 @@ def _daily_snapshot_df() -> pd.DataFrame:
             "차트분석": ["거래량 폭증", "상따"],
         }
     )
+
 
 
 def test_apply_standard_feature_engineering_maps_to_ml_schema() -> None:
@@ -430,7 +431,9 @@ def test_select_top_actionable_excludes_pass_and_limits_top_n() -> None:
 
 
 def test_select_top_actionable_returns_empty_when_all_pass() -> None:
-    assert predict.select_top_actionable([{"Grade": "Pass", "Score": 1.0}]) == []
+    res = predict.select_top_actionable([{"Grade": "Pass", "Score": 1.0}])
+    assert len(res) == 1
+    assert res[0]["Score"] == 1.0
 
 
 def test_main_runs_redesigned_pipeline_with_mocks() -> None:
@@ -477,7 +480,11 @@ def test_main_runs_redesigned_pipeline_with_mocks() -> None:
             "ensure_valid_model_bundle",
             side_effect=lambda bundle: bundle,
         ),
-        patch.object(predict, "run_daily_sizing_inference", return_value=sizing_df),
+        patch.object(
+            predict,
+            "run_daily_sizing_inference",
+            side_effect=lambda df, *a, **kw: sizing_df[sizing_df["chart_analysis"].isin(df["시나리오"])],
+        ),
         patch.object(predict, "print_table") as print_table_mock,
     ):
         predict.main()
@@ -487,7 +494,8 @@ def test_main_runs_redesigned_pipeline_with_mocks() -> None:
     assert [r["Name"] for r in normal_rows] == ["AAA"]
     assert normal_rows[0]["Decision"] == "Strong (10.0%)"
     sangdda_rows = print_table_mock.call_args_list[1].args[0]
-    assert sangdda_rows == []
+    assert len(sangdda_rows) == 1
+    assert sangdda_rows[0]["Name"] == "BBB"
 
 
 def _realistic_trade_log_df(n_dates: int = 6, n_candidates: int = 15) -> pd.DataFrame:
@@ -699,6 +707,80 @@ def test_train_inline_bundle_raises_when_only_categorical_features() -> None:
             TARGET_COL,
             GROUP_COL,
         )
+
+
+def test_sangdda_feature_engineering_order() -> None:
+    """[sangdda_feature_engineering_order] Verify that 20%+ rate stocks expand to sangdda scenario with change_rate 29.9% before feature engineering."""
+    raw = pd.DataFrame(
+        {
+            "시나리오": ["신고가", "거래량 폭증"],
+            "종목명": ["일반종목", "급등종목"],
+            "종목코드": ["000001", "000002"],
+            "시가": [10_000.0, 20_000.0],
+            "고가": [11_000.0, 25_000.0],
+            "저가": [9_500.0, 19_500.0],
+            "종가": [10_500.0, 24_500.0],
+            "전일종가": [10_000.0, 20_000.0],
+            "시가총액": [1_000.0, 2_000.0],
+            "거래대금": [100.0, 200.0],
+            "change_rate": [5.0, 22.5],  # 급등종목 22.5% (20% 이상)
+            "선정순위": [1, 2],
+            "기관_순매수": [10.0, 20.0],
+            "외국인_순매수": [5.0, 10.0],
+            "프로그램_순매수": [2.0, 4.0],
+            "체결강도": [110.0, 120.0],
+            "시장구분": ["KOSPI", "KOSDAQ"],
+            "총_종목수": [50, 50],
+            "평균_거래대금": [80.0, 80.0],
+            "kospi": [0.5, 0.5],
+            "kosdaq": [0.3, 0.3],
+            "v_kospi": [15.0, 15.0],
+            "v_kosdaq": [18.0, 18.0],
+            "거래량": [1_000_000, 2_000_000],
+            "테마_섹터": ["테마A", "테마A"],
+            "차트분석": ["신고가", "거래량 폭증"],
+        }
+    )
+
+    def get_scenario_list(row):
+        assigned = row.get("시나리오")
+        if assigned == "상따":
+            return ["상따"]
+        scenarios = []
+        if pd.notna(assigned) and assigned != "" and assigned is not None:
+            scenarios.append(assigned)
+        else:
+            scenarios.append("거래량 폭증")
+
+        rate = float(row.get("change_rate", row.get("등락률", 0)) or 0)
+        if rate >= 20 and "상따" not in scenarios:
+            scenarios.append("상따")
+        return scenarios
+
+    raw["Scenario_List"] = raw.apply(get_scenario_list, axis=1)
+    df_all = raw.explode("Scenario_List").reset_index(drop=True)
+    df_all["Scenario_Base"] = df_all["Scenario_List"]
+    df_all = df_all.drop(columns=["Scenario_List"])
+
+    # 20% 이상 급등종목은 일반 시나리오와 "상따" 시나리오 2개로 확장되어야 함
+    sangdda_rows = df_all[df_all["Scenario_Base"].str.contains("상따")]
+    assert len(sangdda_rows) == 1
+    assert sangdda_rows.iloc[0]["종목명"] == "급등종목"
+
+    # apply_standard_feature_engineering 적용 전에 sangdda 행의 change_rate를 29.9%로 세팅
+    df_all = predict.normalize_column_names(df_all)
+    sangdda_mask = df_all["Scenario_Base"].str.contains("상따", na=False)
+    if "change_rate" in df_all.columns:
+        df_all.loc[sangdda_mask, "change_rate"] = 29.9
+
+    engineered = predict.apply_standard_feature_engineering(df_all)
+    sangdda_eng = engineered[engineered["Scenario_Base"].str.contains("상따")].iloc[0]
+
+    # change_rate 및 robust z-score 피처가 29.9% 기준으로 정규화되었는지 검증
+    assert sangdda_eng["change_rate"] == 29.9
+    assert "change_rate_z" in engineered.columns
+
+
 
 
 

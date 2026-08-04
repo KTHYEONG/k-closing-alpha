@@ -472,7 +472,7 @@ async def fetch_index_and_calculate_volatility(index_code="1028", session=None):
                     
                     # 연율화 HV
                     hv_today = std * np.sqrt(252) * 100
-                    
+
                     # 어제 HV 계산 (전일 대비 변화율용)
                     if len(df) >= 22:
                         prev_returns = df['log_ret'].iloc[-21:-1]
@@ -481,9 +481,9 @@ async def fetch_index_and_calculate_volatility(index_code="1028", session=None):
                         hv_change = (hv_today - hv_yesterday) / hv_yesterday if hv_yesterday != 0 else 0
                     else:
                         hv_change = 0
-                    
+
                     return hv_today, hv_change
-        
+
         return 0.0, 0.0
 
     finally:
