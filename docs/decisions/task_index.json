@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "POSITION_SIZING_COST_FIX",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_POSITION_SIZING_COST_FIX",
+      "domain": "quant",
+      "title": "Korean Stock Fee/Tax Integration & Position Sizing Calibration",
+      "why": "Tax (0.15%), KIS fee (0.028%), and slippage were uncredited, and negative utility scores led to faulty sizing grade allocations.",
+      "resolution": "Deducted 0.20% round-trip cost, fixed assign_sizing_grades thresholds, normalized probability scales, and scaled sizing allocation with utility score magnitude.",
+      "impact": "Eliminated false positive position sizing on sub-zero net return trades and established realistic risk-weighted position allocation."
+    },
+    {
       "task_id": "SIZING_SAFETY_MARGIN_REFACTORING",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_SIZING_SAFETY_MARGIN_REFACTORING",
