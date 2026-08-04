@@ -6,6 +6,7 @@ from datetime import datetime
 import pandas as pd
 
 from src import settings
+from src.processing.schema import ARCHIVE_COLUMN_ORDER
 
 logger = logging.getLogger(__name__)
 
@@ -15,36 +16,6 @@ STOCK_CODE_COL = "종목코드"
 RANK_COL = "순위"
 # 조회하고 싶을 때 YYYY-MM-DD 형식으로 지정.
 FETCH_TARGET_DATE = None  # "2025-12-09"
-
-# 구글 스프레드시트(매매일지) 26개 열과 1:1 대응하는 표준 아카이브 컬럼 순서
-ARCHIVE_COLUMN_ORDER = [
-    "스냅샷_날짜",
-    "종목코드",
-    "종목명",
-    "시가",
-    "고가",
-    "저가",
-    "종가",
-    "전일종가",
-    "시가총액",
-    "거래대금",
-    "등락률",
-    "선정순위",
-    "기관_순매수",
-    "외국인_순매수",
-    "프로그램_순매수",
-    "체결강도",
-    "시장구분",
-    "총_종목수",
-    "평균_거래대금",
-    "kospi",
-    "kosdaq",
-    "v_kospi",
-    "v_kosdaq",
-    "거래량",
-    "테마_섹터",
-    "시나리오",
-]
 
 
 def upsert_history(df: pd.DataFrame, db_path: str) -> None:

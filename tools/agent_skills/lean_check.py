@@ -625,7 +625,7 @@ def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
 def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
     diagnostics: list[JsonDiag] = []
     try:
-        with open(spec_path) as f:
+        with open(spec_path, encoding="utf-8") as f:
             contract = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError) as e:
         return (1, [{"file": spec_path, "line": 0, "error": f"Spec file error: {e}", "fix_hint": ""}])
@@ -651,7 +651,7 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
             d = {"file": fh, "line": 0, "error": msg, "fix_hint": "Add 'assertions' or 'python_assertion' in contract.json"}
             diagnostics.append(d)
 
-        with open(fh) as sf:
+        with open(fh, encoding="utf-8") as sf:
             sf_content = sf.read()
             if kind == "field":
                 field_name = name.split(".")[-1] if "." in name else name
@@ -727,7 +727,7 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
             re.MULTILINE,
         )
         if target_test_file and os.path.exists(target_test_file):
-            with open(target_test_file) as tf:
+            with open(target_test_file, encoding="utf-8") as tf:
                 content = tf.read()
             found = bool(ref_pattern.search(content)) or bool(test_def_pattern.search(content))
         if not found:
@@ -735,7 +735,7 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
                 for fn in fnames:
                     if not fn.endswith(".py"):
                         continue
-                    with open(os.path.join(root, fn)) as tf:
+                    with open(os.path.join(root, fn), encoding="utf-8") as tf:
                         content = tf.read()
                         if bool(ref_pattern.search(content)) or test_def_pattern.search(content):
                             found = True
@@ -776,7 +776,7 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
             d = {"file": wf, "line": 0, "error": f"Spec wiring target file not found: {wf}", "fix_hint": f"Create {wf}"}
             diagnostics.append(d)
             continue
-        with open(wf) as f:
+        with open(wf, encoding="utf-8") as f:
             wf_content = f.read()
             normalized_wf_content = re.sub(r"\s+", " ", wf_content)
             

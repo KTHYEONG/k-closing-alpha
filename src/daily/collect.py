@@ -12,6 +12,7 @@ from src import settings
 from src.api.kis_client import KisApiClient, prefetch_ohlcv_for_sma120
 from src.data.db_loader import load_theme_from_db
 from src.data.gsheet_loader import append_stocks_to_gsheet
+from src.processing.schema import STANDARD_COLUMN_ORDER
 from src.utils.display import Colors
 
 logger = logging.getLogger(__name__)
@@ -26,36 +27,6 @@ HTS_ID = settings.KIS_API_CONFIG.get("hts_id")
 
 TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
 TOKEN_FILE = str(settings.TOKEN_FILE)
-
-# =========================================================
-# [표준 열 순서] 스프레드시트 복사/붙여넣기 호환을 위한 고정 컬럼 순서
-# =========================================================
-STANDARD_COLUMN_ORDER = [
-    "시나리오",
-    "종목명",
-    "종목코드",
-    "시가",
-    "고가",
-    "저가",
-    "종가",
-    "전일종가",
-    "시가총액",
-    "거래대금",
-    "등락률",
-    "선정순위",
-    "기관_순매수",
-    "외국인_순매수",
-    "프로그램_순매수",
-    "체결강도",
-    "시장구분",
-    "총_종목수",
-    "평균_거래대금",
-    "kospi",
-    "kosdaq",
-    "v_kospi",
-    "v_kosdaq",
-    "거래량",
-]
 
 logger.debug("조건검색 (표준 CSV 저장) 시작...")
 

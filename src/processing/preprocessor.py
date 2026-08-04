@@ -4,8 +4,8 @@
 `trade_log.parquet` / `theme.parquet` 원본 컬럼명을 표준 식별자로 정규화하고,
 랭킹/회귀/분류 multi-task 학습용 타깃 3종과 횡단면 상대 피처를 생성합니다.
 
-v1 전처리기의 구형 컬럼/매핑 상수(`RENAME_MAP`, `DATE_COL`)는
-`src.processing.legacy_mapping`에서 re-export하여 하위 호환성을 보장합니다.
+컬럼명 정규화 매핑은 `src.processing.schema.RAW_TO_STANDARD_MAP`를
+단일 원천으로 사용합니다.
 """
 
 from __future__ import annotations
@@ -14,39 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.ml.sizing_engine import ROUND_TRIP_COST_RATIO
-from src.processing.legacy_mapping import DATE_COL, RENAME_MAP  # noqa: F401  (하위 호환성 re-export)
-
-# 원본 컬럼명 -> 정규화 컬럼명 1:1 매핑 (스프레드시트 특수문자/단위 제거)
-COLUMN_MAP: dict[str, str] = {
-    "매수날짜": "trade_date",
-    "종목코드": "stock_code",
-    "(시가)": "open_price",
-    "(고가)": "high_price",
-    "(저가)": "low_price",
-    "(종가)": "close_price",
-    "(전일종가)": "prev_close_price",
-    "(시가총액, 억)": "market_cap_100m",
-    "(거래대금, 억)": "trade_value_100m",
-    "(등락률)": "change_rate",
-    "(선정 순위)": "selection_rank",
-    "(기관_순매수)": "inst_net_buy",
-    "(외국인_순매수)": "foreign_net_buy",
-    "(프로그램_순매수)": "prog_net_buy",
-    "(체결강도)": "volume_power",
-    "(시장구분)": "market_type",
-    "(총 종목 수)": "total_candidate_count",
-    "(평균 거래대금)": "avg_trade_value",
-    "(kospi, %)": "kospi_change",
-    "(kosdaq, %)": "kosdaq_change",
-    "v_kospi": "v_kospi",
-    "v_kosdaq": "v_kosdaq",
-    "(거래량)": "volume",
-    "(테마/섹터)": "theme_sector",
-    "(차트분석)": "chart_analysis",
-    "(매수 가격)": "buy_price",
-    "(매도 가격)": "sell_price",
-    "(수익률, %)": "net_return",
-}
+from src.processing.schema import RAW_TO_STANDARD_MAP
 
 _NUMERIC_COLUMNS: tuple[str, ...] = (
     "open_price",
@@ -145,7 +113,7 @@ _TARGET_NAMES: tuple[str, ...] = ("target_return", "target_rank", "target_good",
 
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     """원본 컬럼명을 표준 snake_case 식별자로 1:1 매핑 정규화하고 문자열 수치 피처를 정제합니다."""
-    df = df.rename(columns=COLUMN_MAP)
+    df = df.rename(columns=RAW_TO_STANDARD_MAP)
 
     if "trade_date" in df.columns:
         df["trade_date"] = pd.to_datetime(df["trade_date"])

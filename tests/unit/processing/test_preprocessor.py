@@ -365,14 +365,3 @@ def test_s8_pct_rank_missing_col() -> None:
     assert "foreign_density_z" not in out.columns
     assert "major_density_z" in out.columns
     assert out["major_density_z"].notna().all()
-
-
-def test_rename_map_compatibility() -> None:
-    """SCENARIO_RENAME_MAP_COMPATIBILITY: RENAME_MAP이 메인 preprocessor와 legacy_mapping 양쪽에서 동일하게 import됩니다."""
-    from src.processing.legacy_mapping import RENAME_MAP as LEGACY_RENAME_MAP
-
-    from src.processing.preprocessor import RENAME_MAP as PREPROCESSOR_RENAME_MAP
-
-    assert PREPROCESSOR_RENAME_MAP == LEGACY_RENAME_MAP
-    assert LEGACY_RENAME_MAP["(매수날짜)"] == "매수날짜"
-    assert PREPROCESSOR_RENAME_MAP["(수익률, %)"] == "수익률"

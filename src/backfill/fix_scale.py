@@ -133,7 +133,7 @@ def update_gsheet_scales(sh: gspread.Spreadsheet, sheet_name: str, mismatched_sy
     date_idx = cols.get("date")
 
     if symbol_idx is None or date_idx is None:
-        print(f"   ⚠️ {sheet_name} 시트에서 필수 컬럼(종목코드/날짜)을 찾지 못했습니다.")
+        logger.warning(f"{sheet_name} 시트에서 필수 컬럼(종목코드/날짜)을 찾지 못했습니다.")
         return
 
     # 명시적 타입 좁히기
@@ -313,8 +313,9 @@ def main() -> None:
         sys.exit(1)
 
     # 컬럼 이름 전처리 매핑 적용
-    from src.processing.preprocessor import RENAME_MAP
-    df = df.rename(columns=RENAME_MAP)
+    # (구글 시트 괄호 헤더를 표준 영문으로 정규화 후 한글 표준 컬럼으로 변환)
+    from src.processing.schema import RAW_TO_STANDARD_MAP, STANDARD_TO_KOREAN_MAP
+    df = df.rename(columns=RAW_TO_STANDARD_MAP).rename(columns=STANDARD_TO_KOREAN_MAP)
     
     # 종목코드 표준화
     if "종목코드" in df.columns:
@@ -371,8 +372,9 @@ def main() -> None:
     if "매수날짜" in df_corrected.columns:
         df_corrected["매수날짜"] = pd.to_datetime(df_corrected["매수날짜"]).dt.strftime("%Y-%m-%d")
 
-    # DB 업데이트를 위한 컬럼명 원복
-    INVERSE_RENAME_MAP = {v: k for k, v in RENAME_MAP.items()}
+    # DB 업데이트를 위한 컬럼명 원복 (괄호 레거시 헤더 복원)
+    from src.processing.schema import LEGACY_RAW_TO_KOREAN_MAP
+    INVERSE_RENAME_MAP = {v: k for k, v in LEGACY_RAW_TO_KOREAN_MAP.items()}
     df_db_ready = df_corrected.rename(columns=INVERSE_RENAME_MAP)
 
     # DB에 보정 결과 저장
