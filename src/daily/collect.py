@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from pathlib import Path
 
 import aiohttp
@@ -612,4 +613,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     asyncio.run(main())
