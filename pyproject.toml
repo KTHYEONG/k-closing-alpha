@@ -22,6 +22,8 @@ dependencies = [
     "requests>=2.31.0",
     "pykrx>=1.0.0",
     "setuptools>=69.0.0,<82",
+    "scikit-learn>=1.5.0",
+    "lightgbm>=4.3.0",
 ]
 
 [build-system]
