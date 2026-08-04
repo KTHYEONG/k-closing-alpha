@@ -270,10 +270,12 @@ def build_result_rows(sizing_df: pd.DataFrame) -> list[dict[str, Any]]:
 def select_top_actionable(
     results: list[dict[str, Any]], top_n: int = _DEFAULT_TOP_N
 ) -> list[dict[str, Any]]:
-    """Pass 등급을 제외한 액션 가능 후보 중 Utility Score 기준 상위 ``top_n`` 을 선별합니다."""
+    """Pass 등급을 제외한 액션 가능 후보 중 Utility Score 기준 상위 ``top_n`` 을 선별하며,
+    액션 가능 종목이 없으면 상위 ``top_n`` 종목을 관찰용 표로 반환합니다.
+    """
     actionable = [r for r in results if r["Grade"] != "Pass"]
-    if not actionable:
-        return []
+    if not actionable and results:
+        return sorted(results, key=lambda r: r["Score"], reverse=True)[:top_n]
     return sorted(actionable, key=lambda r: r["Score"], reverse=True)[:top_n]
 
 
@@ -465,9 +467,9 @@ def main():
             scenarios.append("거래량 폭증")  # 기본값
 
         # [규칙 3] 등락률 20% 이상이면 "상따" 시나리오 추가 (일반 + 상따 함께 분석)
-        if row.get("등락률", 0) >= 20:
-            if "상따" not in scenarios:
-                scenarios.append("상따")
+        rate = float(row.get("change_rate", row.get("등락률", 0)) or 0)
+        if rate >= 20 and "상따" not in scenarios:
+            scenarios.append("상따")
 
         return scenarios
 
@@ -489,13 +491,15 @@ def main():
     df_all["v_kosdaq_change"] = current_vkosdaq_change
 
     # 4. [Feature Engineering] 표준 ML 피처 정합성 확보
-    # schema 의 normalize_column_names / engineer_features 를 적용하여
-    # 학습 파이프라인(models_bundle["feature_cols"])과 1:1 동일한 스키마를 생성합니다.
     df_all["차트분석"] = df_all["Scenario_Base"].astype(str)
-    df_all = apply_standard_feature_engineering(df_all)
+    # 먼저 컬럼명을 정규화하여 '등락률' 등을 'change_rate'로 통합한 후 '상따' 29.9%를 적용
+    df_all = normalize_column_names(df_all)
 
-    # '상따' 시나리오 일괄 적용 (기존 로직 유지)
-    df_all.loc[df_all["Scenario_Base"].str.contains("상따"), "change_rate"] = 29.9
+    sangdda_mask = df_all["Scenario_Base"].str.contains("상따", na=False)
+    if "change_rate" in df_all.columns:
+        df_all.loc[sangdda_mask, "change_rate"] = 29.9
+
+    df_all = apply_standard_feature_engineering(df_all)
 
     # 5. Fast Inference & Dynamic Sizing (저장된 모델 아티팩트 로드)
     # 레거시 GMM/Static 판단 로직은 제거되고, artifacts/models/ 의 모델 번들을
@@ -517,18 +521,31 @@ def main():
     models_bundle = ensure_valid_model_bundle(models_bundle)
 
     start = time.perf_counter()
-    sizing_df = run_daily_sizing_inference(df_all, models_bundle)
+    df_normal = df_all[~df_all["시나리오"].str.contains("상따", na=False)].copy()
+    df_sangdda = df_all[df_all["시나리오"].str.contains("상따", na=False)].copy()
+
+    normal_sizing = run_daily_sizing_inference(df_normal, models_bundle)
+    sangdda_sizing = (
+        run_daily_sizing_inference(df_sangdda, models_bundle)
+        if not df_sangdda.empty
+        else pd.DataFrame()
+    )
+    sizing_df = (
+        pd.concat([normal_sizing, sangdda_sizing], ignore_index=True)
+        if not sangdda_sizing.empty
+        else normal_sizing
+    )
+
     elapsed_ms = (time.perf_counter() - start) * 1000
     logger.info(
         f"{Colors.GREEN}추론 완료: {len(sizing_df)}건 ({elapsed_ms:.0f}ms){Colors.RESET}"
     )
 
-    # 6. 결과 리스트 생성 (utility_score / grade / allocation)
-    final_results = build_result_rows(sizing_df)
-
-    # 7. 결과 출력 (Top N 액션 가능 후보만 표시)
-    normal_results = [r for r in final_results if "상따" not in r["Scenario"]]
-    sangdda_results = [r for r in final_results if "상따" in r["Scenario"]]
+    # 6. 결과 리스트 생성 및 출력 (Top N 액션 가능 후보만 표시)
+    normal_results = build_result_rows(normal_sizing)
+    sangdda_results = (
+        build_result_rows(sangdda_sizing) if not df_sangdda.empty else []
+    )
 
     print_table(
         select_top_actionable(normal_results), "일반 분석 결과 (Dynamic Sizing)"

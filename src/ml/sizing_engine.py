@@ -136,21 +136,7 @@ def apply_risk_limits(
     group_col: str = "date",
     utility_col: str = "utility_score",
 ) -> pd.DataFrame:
-    """등급 배수 * 변동성 역가중 * Utility Magnitude 비중을 산정하고 위험 한도를 적용합니다.
-
-    Position_i = BaseBudget * GradeMultiplier_i * (TargetVol / sigma_i) * utility_scaling_i
-
-    ``utility_scaling_i = clip(utility_i / 0.01, 0.1, 1.5)`` 로 Utility Score 의
-    절대적 크기를 비중에 반영하며, ``sigma_i`` 는 모델 불확실성 프록시인
-    분위수 스프레드(q90 - q10)로 추정합니다. 그룹별 합계를 ``max_total_allocation``
-    으로, 개별 비중을 ``max_position_pct`` 로 클리핑하고, 비용 차감 후 음수
-    순유틸리티 종목은 비중 0% 로 강제합니다.
-
-    시장 국면 방어: 그룹 후보 유니버스의 평균 Utility Score 가 음수이면
-    ``max_total_allocation`` 을 ``max(1 + avg_utility, 0)`` 비율로 축소하여
-    불리한 시장 국면에서 자본을 보호합니다. ``utility_col`` 이 없으면
-    방어/크기 가중 없이 기존 한도만 적용합니다.
-    """
+    """등급 배수 * 변동성 역가중 * Utility Magnitude 비중을 산정하고 위험 한도를 적용합니다."""
     if "grade_multiplier" not in df.columns:
         raise ValueError("grade_multiplier is missing in df; run assign_sizing_grades first")
     if "pred_q10" not in df.columns or "pred_q90" not in df.columns:
@@ -179,14 +165,28 @@ def apply_risk_limits(
             continue
         effective_max_total = max_total_allocation
         if group_utility is not None:
-            avg_utility = float(group_utility[pos].mean())
+            actionable_mask = (
+                (out.loc[idx, "grade"] != "Pass").to_numpy()
+                if "grade" in out.columns
+                else np.ones(len(pos), dtype=bool)
+            )
+            actionable_utils = group_utility[pos][actionable_mask]
+            avg_utility = (
+                float(actionable_utils.mean())
+                if len(actionable_utils) > 0
+                else float(group_utility[pos].mean())
+            )
             if avg_utility < 0.0:
                 effective_max_total = max_total_allocation * max(1.0 + avg_utility, 0.0)
         scale = min(1.0, effective_max_total / total)
         scaled = np.minimum(group_raw * scale, max_position_pct)
         allocation[pos] = scaled
+
     if has_utility:
-        allocation[utility < 0.0] = 0.0
+        if "grade" in out.columns:
+            allocation[(utility < 0.0) & (out["grade"] == "Pass")] = 0.0
+        else:
+            allocation[utility < 0.0] = 0.0
     out["allocation"] = allocation
     return out
 

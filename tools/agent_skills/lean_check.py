@@ -214,12 +214,14 @@ def _parse_coverage_table(stdout: str) -> dict[str, tuple[int | None, str]]:
 def _coverage_entry(
     table: dict[str, tuple[int | None, str]], file_path: str
 ) -> tuple[int | None, str] | None:
-    mkey = file_path.replace(".py", "")
+    norm_path = file_path.replace("\\", "/")
+    mkey = norm_path.replace(".py", "")
     module_key = mkey.replace("/", ".")
-    for key in (file_path, mkey, module_key):
+    for key in (norm_path, file_path, mkey, module_key, norm_path.replace("/", "\\")):
         if key in table:
             return table[key]
     return None
+
 
 
 def _coverage_lookup(
@@ -258,11 +260,13 @@ def _get_changed_lines(file_path: str) -> set[int]:
     try:
         res = subprocess.run(  # noqa: S603
             ["git", "diff", "--unified=0", "HEAD", "--", file_path],  # noqa: S607
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
     except Exception:
         return set()
     changed: set[int] = set()
+    if not res or not res.stdout:
+        return changed
     for line in res.stdout.splitlines():
         if line.startswith("@@"):
             m = re.search(r"\+(\d+)(?:,(\d+))?", line)
@@ -272,6 +276,7 @@ def _get_changed_lines(file_path: str) -> set[int]:
                 for i in range(start, start + count):
                     changed.add(i)
     return changed
+
 
 
 def _is_new_file(file_path: str) -> bool:
@@ -408,7 +413,8 @@ def _coerce_list_args(inp: dict[str, Any]) -> dict[str, Any]:
 
 
 def _file_to_module(file_hint: str) -> str:
-    return file_hint[:-3].replace("/", ".") if file_hint.endswith(".py") else file_hint.replace("/", ".")
+    path = file_hint[:-3] if file_hint.endswith(".py") else file_hint
+    return path.replace("/", ".").replace("\\", ".")
 
 
 def _repo_relative(path: str) -> str:
