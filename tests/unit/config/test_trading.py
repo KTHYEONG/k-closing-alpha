@@ -27,7 +27,7 @@ def test_trading_condition_name_drives_aggregate_paths(tmp_path) -> None:
         TARGET_CONDITION_NAME="상따",
         _env_file=None,
     )
-    assert tmp_path / "data" / "condition_상따.csv" == settings.CONDITION_CSV_PATH
+    assert tmp_path / "data" / "daily" / "daily_stocks.csv" == settings.CONDITION_CSV_PATH
     assert tmp_path / "data" / "condition_상따.xlsx" == settings.CONDITION_EXCEL_PATH
     assert tmp_path / "data" / "history" == settings.HISTORY_DIR
     assert settings.HISTORY_DB_PATH == settings.HISTORY_DIR / "condition_history_상따.db"

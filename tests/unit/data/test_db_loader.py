@@ -55,7 +55,7 @@ def patch_db_path(tmp_path, monkeypatch):
     # Parquet 우선 로드를 건너뛰도록 임시 경로로 분리
     monkeypatch.setattr(data_loader.settings, "TRADE_LOG_PARQUET_PATH", tmp_path / "trade.parquet")
     monkeypatch.setattr(data_loader.settings, "THEME_PARQUET_PATH", tmp_path / "theme.parquet")
-    monkeypatch.setattr(data_loader.settings, "CONDITION_PARQUET_PATH", tmp_path / "condition.parquet")
+    monkeypatch.setattr(data_loader.settings, "HISTORY_PARQUET_PATH", tmp_path / "condition.parquet")
     return db_path
 
 

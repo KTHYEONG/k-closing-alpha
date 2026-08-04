@@ -21,32 +21,31 @@ from src.daily.collect import STANDARD_COLUMN_ORDER, save_collected_condition_da
 def _standard_columns_df() -> pd.DataFrame:
     """표준 열 이름(순서는 뒤섞임) + 비표준 여분 열을 포함한 샘플 DataFrame."""
     row = {
-        "(차트통과)": [1, 1],
-        "(시나리오)": ["신고가", "거래량 폭증"],
-        "(상장일수)": [300, 500],
+        "시나리오": ["신고가", "거래량 폭증"],
+        "상장일수": [300, 500],
         "종목명": ["AAA", "BBB"],
-        "(종목코드)": [1, 2],
-        "(시가)": [10000, 20000],
-        "(고가)": [11000, 21000],
-        "(저가)": [9000, 19000],
-        "(종가)": [10500, 20500],
-        "(전일종가)": [10000, 20000],
-        "(시가총액, 억)": [5000.0, 8000.0],
-        "(거래대금, 억)": [120.0, 250.0],
-        "(등락률)": [5.0, 2.5],
-        "(선정 순위)": [1, 2],
-        "(기관_순매수)": [10.0, 20.0],
-        "(외국인_순매수)": [30.0, 40.0],
-        "(프로그램_순매수)": [5.0, 6.0],
-        "(체결강도)": [120.0, 110.0],
-        "(시장구분)": ["KOSPI", "KOSDAQ"],
-        "(총 종목 수)": [2, 2],
-        "(평균 거래대금)": [185.0, 185.0],
-        "(kospi, %)": [0.5, 0.5],
-        "(kosdaq, %)": [0.3, 0.3],
-        "(v-kospi)": [12.5, 12.5],
-        "(v-kosdaq)": [15.2, 15.2],
-        "(거래량)": [100000, 200000],
+        "종목코드": [1, 2],
+        "시가": [10000, 20000],
+        "고가": [11000, 21000],
+        "저가": [9000, 19000],
+        "종가": [10500, 20500],
+        "전일종가": [10000, 20000],
+        "시가총액": [5000.0, 8000.0],
+        "거래대금": [120.0, 250.0],
+        "등락률": [5.0, 2.5],
+        "선정순위": [1, 2],
+        "기관_순매수": [10.0, 20.0],
+        "외국인_순매수": [30.0, 40.0],
+        "프로그램_순매수": [5.0, 6.0],
+        "체결강도": [120.0, 110.0],
+        "시장구분": ["KOSPI", "KOSDAQ"],
+        "총_종목수": [2, 2],
+        "평균_거래대금": [185.0, 185.0],
+        "kospi": [0.5, 0.5],
+        "kosdaq": [0.3, 0.3],
+        "v_kospi": [12.5, 12.5],
+        "v_kosdaq": [15.2, 15.2],
+        "거래량": [100000, 200000],
         "extra_col": ["x", "y"],
     }
     return pd.DataFrame(row)
@@ -74,8 +73,8 @@ def test_csv_export_order_verification(tmp_path: Path) -> None:
 
     # 파일에 저장된 종목코드는 6자리 zero-fill 문자열
     raw_df = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=str)
-    assert raw_df["(종목코드)"].tolist() == ["000001", "000002"]
-    assert (raw_df["(종목코드)"].str.len() == 6).all()
+    assert raw_df["종목코드"].tolist() == ["000001", "000002"]
+    assert (raw_df["종목코드"].str.len() == 6).all()
 
 
 def test_save_collected_condition_data_creates_sibling_parquet(tmp_path: Path) -> None:
@@ -87,7 +86,7 @@ def test_save_collected_condition_data_creates_sibling_parquet(tmp_path: Path) -
     assert parquet_path.exists()
     df = pd.read_parquet(parquet_path)
     assert df.columns.tolist() == list(STANDARD_COLUMN_ORDER)
-    assert df["(종목코드)"].astype(str).str.zfill(6).tolist() == ["000001", "000002"]
+    assert df["종목코드"].astype(str).str.zfill(6).tolist() == ["000001", "000002"]
 
 
 def test_save_collected_condition_data_returns_path(tmp_path: Path) -> None:
@@ -202,16 +201,14 @@ def test_fetch_single_stock_sangdda_scenario() -> None:
         _run_fetch_single_stock(_fake_client(), upper_limit_stock_codes={"005930"})
     )
     assert failed == []
-    assert result["(시나리오)"] == "상따"
-    assert result["(차트통과)"] == 1
+    assert result["시나리오"] == "상따"
     assert result["종목코드"] == "005930"
 
 
 def test_fetch_single_stock_default_scenario_volume_surge() -> None:
     result, failed = asyncio.run(_run_fetch_single_stock(_fake_client()))
     assert failed == []
-    assert result["(시나리오)"] == "거래량 폭증"
-    assert result["(차트통과)"] == 1
+    assert result["시나리오"] == "거래량 폭증"
 
 
 def test_fetch_all_stock_data_aggregates_and_reports_failures() -> None:

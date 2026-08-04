@@ -1,8 +1,5 @@
 import asyncio
-import json
 import logging
-import os
-from datetime import datetime
 from pathlib import Path
 
 import aiohttp
@@ -33,32 +30,30 @@ TOKEN_FILE = str(settings.TOKEN_FILE)
 # [표준 열 순서] 스프레드시트 복사/붙여넣기 호환을 위한 고정 컬럼 순서
 # =========================================================
 STANDARD_COLUMN_ORDER = [
-    "(차트통과)",
-    "(시나리오)",
-    "(상장일수)",
+    "시나리오",
     "종목명",
-    "(종목코드)",
-    "(시가)",
-    "(고가)",
-    "(저가)",
-    "(종가)",
-    "(전일종가)",
-    "(시가총액, 억)",
-    "(거래대금, 억)",
-    "(등락률)",
-    "(선정 순위)",
-    "(기관_순매수)",
-    "(외국인_순매수)",
-    "(프로그램_순매수)",
-    "(체결강도)",
-    "(시장구분)",
-    "(총 종목 수)",
-    "(평균 거래대금)",
-    "(kospi, %)",
-    "(kosdaq, %)",
-    "(v-kospi)",
-    "(v-kosdaq)",
-    "(거래량)",
+    "종목코드",
+    "시가",
+    "고가",
+    "저가",
+    "종가",
+    "전일종가",
+    "시가총액",
+    "거래대금",
+    "등락률",
+    "선정순위",
+    "기관_순매수",
+    "외국인_순매수",
+    "프로그램_순매수",
+    "체결강도",
+    "시장구분",
+    "총_종목수",
+    "평균_거래대금",
+    "kospi",
+    "kosdaq",
+    "v_kospi",
+    "v_kosdaq",
+    "거래량",
 ]
 
 logger.info("조건검색 (표준 CSV 저장) 시작...")
@@ -120,8 +115,8 @@ def save_collected_condition_data(
     """
     out = df.copy()
     out = out.reindex(columns=STANDARD_COLUMN_ORDER)
-    if "(종목코드)" in out.columns:
-        out["(종목코드)"] = out["(종목코드)"].astype(str).str.zfill(6)
+    if "종목코드" in out.columns:
+        out["종목코드"] = out["종목코드"].astype(str).str.zfill(6)
 
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,11 +225,6 @@ async def fetch_single_stock(
 
                 rate = safe_float(detail.get("prdy_ctrt"), rate)
 
-                # [New] 단기과열 종목 확인 (HTS 조건검색 기준)
-                is_overheated = code in overheated_stock_codes
-                if is_overheated:
-                    logger.info(f"\n  🔥 {name}: 단기과열 종목 (HTS) → 차트통과=0 설정 예정")
-
                 # 전일 종가 계산
                 if rate != 0:
                     prev_close_price = int(close_price / (1 + rate / 100))
@@ -263,42 +253,20 @@ async def fetch_single_stock(
         orgn_net_eok = round((orgn_qty * price) / 100_000_000, 2)
         program_net_eok = round(program_amt_won / 100_000_000, 2)
 
-        ema_multi_res = {}
-        chart_pass = 1
         scenario = ""
         data_count = 0
         sma_value, sma_success = 0, False
-        sma60_value, sma60_success = 0, False
 
-        # EMA & SMA 계산 (중복 API 호출 방지 통합 버전)
+        # EMA & SMA 계산 (상장일수 및 120 돌파 시나리오 판별용)
         try:
             from src.api.kis_client import calculate_all_moving_averages
 
-            (
-                ema_multi_res,
-                (ema20_val, ema_success, data_count),
-                (sma60_val, sma60_ok),
-                (sma120_val, sma120_ok),
-            ) = await calculate_all_moving_averages(code, session=session)
-
+            (_, (_, _, data_count), _, (sma120_val, sma120_ok)) = (
+                await calculate_all_moving_averages(code, session=session)
+            )
             sma_value, sma_success = float(sma120_val), sma120_ok
-            sma60_value, sma60_success = float(sma60_val), sma60_ok
-
         except Exception:
             pass
-
-        # === 7가지 필터링 및 시나리오 분류 (우선순위 역순 적용) ===
-        ema5 = ema_multi_res.get(5, 0)
-        ema10 = ema_multi_res.get(10, 0)
-        ema20 = ema_multi_res.get(20, 0)
-
-        # 1. 단기과열 필터링
-        if code in overheated_stock_codes:
-            chart_pass = 0
-
-        # 2. 상장일수 부족 필터링
-        if data_count < settings.EMA_PERIOD:
-            chart_pass = 0
 
         # === 시나리오 할당 (우선순위: 높음 → 낮음) ===
         # 우선순위: 상따 > 상한가 다음날 > 상승형 음봉 > 신고가 > 신고가 근접 > 120 돌파 > 거래량 폭증(기본)
@@ -306,69 +274,26 @@ async def fetch_single_stock(
         # 1. [최우선] 상따 (상한가 조건검색)
         if code in upper_limit_stock_codes:
             scenario = "상따"
-            # 상한가는 차트 필터링 없이 통과
 
         # 2. 상한가 다음날
         elif code in upper_limit_next_day_stock_codes:
             scenario = "상한가 다음날"
-            # SMA 120 아래면 차트 필터링
-            if sma_success and sma_value > 0 and close_price < sma_value:
-                chart_pass = 0
 
         # 3. 상승형 음봉 (종가 < 시가 이지만 등락률 > 0)
         elif rate > 0 and close_price < open_price:
             scenario = "상승형 음봉"
-            # 이평선 아래면 차트 필터링
-            if (
-                (ema5 > 0 and close_price < ema5)
-                or (ema10 > 0 and close_price < ema10)
-                or (ema20 > 0 and close_price < ema20)
-                or (sma60_success and close_price < sma60_value)
-                or (sma_success and close_price < sma_value)
-            ):
-                chart_pass = 0
 
         # 4. 신고가
         elif code in new_high_stock_codes:
             scenario = "신고가"
-            # 이평선 아래면 차트 필터링
-            if (
-                (ema5 > 0 and close_price < ema5)
-                or (ema10 > 0 and close_price < ema10)
-                or (ema20 > 0 and close_price < ema20)
-                or (sma60_success and close_price < sma60_value)
-                or (sma_success and close_price < sma_value)
-            ):
-                chart_pass = 0
 
         # 5. 신고가 근접
         elif code in near_new_high_stock_codes:
             scenario = "신고가 근접"
-            # 이평선 아래면 차트 필터링
-            if (
-                (ema5 > 0 and close_price < ema5)
-                or (ema10 > 0 and close_price < ema10)
-                or (ema20 > 0 and close_price < ema20)
-                or (sma60_success and close_price < sma60_value)
-                or (sma_success and close_price < sma_value)
-            ):
-                chart_pass = 0
 
         # 6. 120 돌파
-        elif (
-            sma_success
-            and sma_value > 0
-            and prev_close_price < sma_value <= close_price
-        ):
+        elif sma_success and sma_value > 0 and prev_close_price < sma_value <= close_price:
             scenario = "120 돌파"
-            # 단기 이평선 아래면 차트 필터링
-            if (
-                (ema5 > 0 and close_price < ema5)
-                or (ema10 > 0 and close_price < ema10)
-                or (ema20 > 0 and close_price < ema20)
-                or (sma60_success and close_price < sma60_value)
-            ):
-                chart_pass = 0
 
         # 7. 기본값: 거래량 폭증 (상기 조건 미충족)
         else:
@@ -389,20 +314,16 @@ async def fetch_single_stock(
             "종가": close_price,
             "전일종가": prev_close_price,
             "시장구분": market_name,
-            "시가총액(억)": mkt_cap_eok,
-            "거래대금(억)": trade_amt_eok,
+            "시가총액": mkt_cap_eok,
+            "거래대금": trade_amt_eok,
             "체결강도": vol_power,
             "등락률": rate,
-            "순위": 0,
-            "기관_순매수(억)": orgn_net_eok,
-            "외국인_순매수(억)": frgn_net_eok,
-            "프로그램_순매수(억)": program_net_eok,
-            "(차트통과)": chart_pass,
-            "(시나리오)": scenario,
-            "(상장일수)": data_count,
-            "(거래량)": vol_acml,
-            "(sma60)": round(sma60_value, 2) if sma60_success else 0,
-            "(sma120)": round(sma_value, 2) if sma_success else 0,
+            "선정순위": 0,
+            "기관_순매수": orgn_net_eok,
+            "외국인_순매수": frgn_net_eok,
+            "프로그램_순매수": program_net_eok,
+            "시나리오": scenario,
+            "거래량": vol_acml,
         }, failed_apis
 
 
@@ -734,68 +655,15 @@ async def main():
             save_path = str(settings.CONDITION_CSV_PATH)
 
             df = pd.DataFrame(results)
-            df = df.sort_values(by="거래대금(억)", ascending=False)
-            df["순위"] = range(1, len(df) + 1)
-
-            # 캐시 로직
-            cache_path = str(settings.CHART_PASS_CACHE_FILE)
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            daily_memory = {}
-
-            if os.path.exists(cache_path):
-                try:
-                    with open(cache_path, encoding="utf-8") as f:
-                        cache_data = json.load(f)
-                        if cache_data.get("date") == today_str:
-                            daily_memory = cache_data.get("data", {})
-                except:
-                    pass
-
-            # 신규 종목 감지 및 캐시 업데이트
-            current_codes = set(df["종목코드"].unique())
-            cached_codes = set(daily_memory.keys())
-            new_codes = current_codes - cached_codes
-
-            if new_codes:
-                logger.info(
-                    f"\n{Colors.MAGENTA}✨ [신규 종목 포착] {len(new_codes)}개 종목이 새로 발견되었습니다.{Colors.RESET}"
-                )
-                for code in new_codes:
-                    # 종목코드에 해당하는 종목명을 찾아 함께 출력
-                    name = df[df["종목코드"] == code]["종목명"].iloc[0]
-                    logger.info(f"   👉 {name} ({code})")
-                    daily_memory[code] = 1
-
-            # 기존 저장본 수정사항 반영 (당일 재수집 시 차트통과 유지)
-            if os.path.exists(save_path):
-                try:
-                    if (
-                        datetime.fromtimestamp(os.path.getmtime(save_path)).date()
-                        == datetime.now().date()
-                    ):
-                        old_df = pd.read_csv(save_path, encoding="utf-8-sig")
-                        if (
-                            "종목코드" in old_df.columns
-                            and "(차트통과)" in old_df.columns
-                        ):
-                            old_df["종목코드"] = (
-                                old_df["종목코드"].astype(str).str.zfill(6)
-                            )
-                            daily_memory.update(
-                                dict(zip(old_df["종목코드"], old_df["(차트통과)"]))
-                            )
-                except:
-                    pass
-
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump({"date": today_str, "data": daily_memory}, f, indent=2)
+            df = df.sort_values(by="거래대금", ascending=False)
+            df["선정순위"] = range(1, len(df) + 1)
 
             # 추가 지표 계산
             total_count = len(df)
-            df["전체종목수"] = total_count
-            df["평균거래대금(억)"] = round(df["거래대금(억)"].mean(), 2)
-            df["KOSPI등락률"] = kospi_rate
-            df["KOSDAQ등락률"] = kosdaq_rate
+            df["총_종목수"] = total_count
+            df["평균_거래대금"] = round(df["거래대금"].mean(), 2)
+            df["kospi"] = kospi_rate
+            df["kosdaq"] = kosdaq_rate
 
             # [New] V-KOSPI & V-KOSDAQ 계산 및 추가
             try:
@@ -805,45 +673,20 @@ async def main():
                 vkospi_val, vkospi_chg = await fetch_index_and_calculate_volatility(
                     "1028", session=session
                 )
-                df["(v-kospi)"] = round(vkospi_val, 2)
+                df["v_kospi"] = round(vkospi_val, 2)
 
                 # V-KOSDAQ (KOSDAQ 150: 2203)
                 vkosdaq_val, vkosdaq_chg = await fetch_index_and_calculate_volatility(
                     "2203", session=session
                 )
-                df["(v-kosdaq)"] = round(vkosdaq_val, 2)
+                df["v_kosdaq"] = round(vkosdaq_val, 2)
 
             except Exception:
-                df["(v-kospi)"] = 0.0
-                df["(v-kosdaq)"] = 0.0
-
-            # 컬럼명 리네임 및 순서 재배치를 적용할 임시 데이터프레임 생성
-            rename_map = {
-                "종목코드": "(종목코드)",
-                "시가": "(시가)",
-                "고가": "(고가)",
-                "저가": "(저가)",
-                "종가": "(종가)",
-                "전일종가": "(전일종가)",
-                "시가총액(억)": "(시가총액, 억)",
-                "거래대금(억)": "(거래대금, 억)",
-                "등락률": "(등락률)",
-                "순위": "(선정 순위)",
-                "기관_순매수(억)": "(기관_순매수)",
-                "외국인_순매수(억)": "(외국인_순매수)",
-                "프로그램_순매수(억)": "(프로그램_순매수)",
-                "체결강도": "(체결강도)",
-                "시장구분": "(시장구분)",
-                "전체종목수": "(총 종목 수)",
-                "평균거래대금(억)": "(평균 거래대금)",
-                "KOSPI등락률": "(kospi, %)",
-                "KOSDAQ등락률": "(kosdaq, %)",
-            }
-
-            df_excel = df.rename(columns=rename_map)
+                df["v_kospi"] = 0.0
+                df["v_kosdaq"] = 0.0
 
             # 표준 열 순서로 utf-8-sig CSV (+ Parquet) 저장
-            save_collected_condition_data(df_excel, save_path)
+            save_collected_condition_data(df, save_path)
 
             # 수집 결과 요약 출력
             success_count = len(results) - len(failed_info)
