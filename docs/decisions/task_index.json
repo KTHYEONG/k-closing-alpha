@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK-PREPROCESSOR-DATA-RECOVERY",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_TASK-PREPROCESSOR-DATA-RECOVERY",
+      "domain": "processing",
+      "title": "Preprocessor Data Recovery & 33k Full Dataset Restoration",
+      "why": "Fix string percent symbol cleaning in clean_column_names to prevent 92% net_return row loss",
+      "resolution": "Implemented percent/comma string cleaning in src/processing/preprocessor.py clean_column_names",
+      "impact": "Restored all 33,934 rows (100%) for ML training"
+    },
+    {
       "task_id": "TASK-MODEL-PIPELINE",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_TASK-MODEL-PIPELINE",
