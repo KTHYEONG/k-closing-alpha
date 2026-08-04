@@ -222,7 +222,7 @@ def run_daily_sizing_inference(
         work[group_col] = str(datetime.date.today())
 
     return predict_daily_position_sizing(
-        work[[*feature_cols, group_col]],
+        work,
         feature_cols,
         group_col=group_col,
         models_bundle=models_bundle,
@@ -335,7 +335,7 @@ def main():
     )
     logger.info(f"\n{Colors.CYAN}[시나리오 적용 완료]{Colors.RESET}")
     logger.info(f"  ✅ 분석 대상: {len(df_all)}개 × 시나리오 확장")
-    logger.info()
+    logger.info("")
 
     # [New] v-kospi & v-kosdaq 피처 주입
     df_all["v_kospi"] = current_vkospi
@@ -507,8 +507,10 @@ def main():
             "Theme": row["테마_섹터"],
             "Scenario": row["차트분석"],
             "RankScore": round(float(row.get("rank_score", 0.0)), 4),
+            "Score": round(float(row["utility_score"]), 4),
             "Utility": round(float(row["utility_score"]), 4),
             "Grade": row["grade"],
+            "Decision": f"{row['grade']} ({round(float(row['allocation']) * 100.0, 1)}%)",
             "Alloc%": round(float(row["allocation"]) * 100.0, 2),
             "kospi": row.get("kospi", 0),
             "kosdaq": row.get("kosdaq", 0),
@@ -525,4 +527,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     main()
