@@ -54,6 +54,13 @@ def upsert_history(df: pd.DataFrame, db_path: str) -> None:
         )
         conn.commit()
 
+    # Parquet 아카이브 저장
+    try:
+        from src.data.parquet_loader import upsert_condition_parquet
+        upsert_condition_parquet(df)
+    except Exception as e:
+        logger.error("Parquet 조건검색 아카이브 저장 오류: %s", e)
+
 
 # 기존에 저장해두던 데이터 DB로 마이그레이션
 def import_csv_history_if_needed(history_csv: str, history_db: str) -> None:

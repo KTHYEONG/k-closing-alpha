@@ -1,8 +1,9 @@
 import logging
 import os
 import sqlite3
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 
 from src import settings
 from src.data.gsheet_loader import load_and_combine_sheets, load_data_from_gsheet
@@ -93,6 +94,13 @@ def sync_trade_log(conn):
 
             df_trade.to_sql("table_trade_log", conn, if_exists="replace", index=False)
             logger.info("table_trade_log 저장 완료: %d행", len(df_trade))
+            
+            # Parquet 백업/학습용 저장
+            try:
+                from src.data.parquet_loader import save_trade_log_to_parquet
+                save_trade_log_to_parquet(df_trade)
+            except Exception as e:
+                logger.error("Parquet 저장 중 오류 발생: %s", e)
         else:
             logger.warning("유효한 데이터가 없습니다.")
     else:
@@ -134,6 +142,13 @@ def sync_theme_only(conn=None):
 
                 df_theme.to_sql("table_theme", conn, if_exists="replace", index=False)
                 logger.info("table_theme 저장 완료: %d행", len(df_theme))
+
+                # Parquet 백업/학습용 저장
+                try:
+                    from src.data.parquet_loader import save_theme_to_parquet
+                    save_theme_to_parquet(df_theme)
+                except Exception as e:
+                    logger.error("Parquet 테마 저장 중 오류 발생: %s", e)
             else:
                 logger.warning("유효한 테마 데이터가 없습니다.")
         else:
@@ -143,8 +158,9 @@ def sync_theme_only(conn=None):
             conn.close()
 
 
-def sync_gsheet_to_sqlite():
-    logger.info("구글 시트 데이터 전체 동기화 시작...")
+def sync_gsheet_data():
+    """구글 시트 데이터 전체 동기화 (Parquet & SQLite 저장)."""
+    logger.info("구글 시트 데이터 전체 동기화 시작 (Parquet & SQLite)...")
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -157,5 +173,9 @@ def sync_gsheet_to_sqlite():
         logger.info("동기화 종료")
 
 
+# 레거시 명칭 호환성 alias
+sync_gsheet_to_sqlite = sync_gsheet_data
+
+
 if __name__ == "__main__":
-    sync_gsheet_to_sqlite()
+    sync_gsheet_data()
