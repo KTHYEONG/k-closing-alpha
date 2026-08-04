@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ML_FEATURE_ENG_V2",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ML_FEATURE_ENG_V2",
+      "domain": "processing",
+      "title": "ML Feature Engineering & Preprocessing Pipeline v2",
+      "why": "plan.md 요구사항 대비 전처리 버그(단위 불일치, Data Leakage 등) 수정 및 횡단면 Z-Score/피처 확장",
+      "resolution": "preprocessor_v2.py 버그 7건 수정, Phase 1 피처 19종 확장, 테스트 케이스 보강",
+      "impact": "학습 피처 정확성 확보 및 Data Leakage 차단으로 모델 성과 및 랭킹 정합성 향상"
+    },
+    {
       "task_id": "TASK_ML_DATA_PREPROCESS_V2",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_ML_DATA_PREPROCESS_V2",
