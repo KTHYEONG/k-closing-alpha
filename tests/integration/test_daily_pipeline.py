@@ -14,8 +14,8 @@ from unittest.mock import AsyncMock, patch
 import pandas as pd
 import pytest
 
-from src.daily import collect_data
-from src.daily.collect_data import STANDARD_COLUMN_ORDER, save_collected_condition_data
+from src.daily import collect
+from src.daily.collect import STANDARD_COLUMN_ORDER, save_collected_condition_data
 
 
 def _standard_columns_df() -> pd.DataFrame:
@@ -100,29 +100,29 @@ def test_save_collected_condition_data_returns_path(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------
-# collect_data 헬퍼 함수
+# collect 헬퍼 함수
 # ---------------------------------------------------------
 def test_safe_float_converts_values() -> None:
-    assert collect_data.safe_float(None) == 0.0
-    assert collect_data.safe_float("1,234.5") == 1234.5
-    assert collect_data.safe_float("abc") == 0.0
-    assert collect_data.safe_float(7) == 7.0
+    assert collect.safe_float(None) == 0.0
+    assert collect.safe_float("1,234.5") == 1234.5
+    assert collect.safe_float("abc") == 0.0
+    assert collect.safe_float(7) == 7.0
 
 
 def test_parse_market_index_rate_returns_zero_on_missing() -> None:
-    assert collect_data.parse_market_index_rate(None) == 0.0
-    assert collect_data.parse_market_index_rate({"rt_cd": "1"}) == 0.0
-    assert collect_data.parse_market_index_rate({"rt_cd": "0", "output1": None}) == 0.0
+    assert collect.parse_market_index_rate(None) == 0.0
+    assert collect.parse_market_index_rate({"rt_cd": "1"}) == 0.0
+    assert collect.parse_market_index_rate({"rt_cd": "0", "output1": None}) == 0.0
 
 
 def test_parse_market_index_rate_uses_rate_and_fallback() -> None:
     assert (
-        collect_data.parse_market_index_rate(
+        collect.parse_market_index_rate(
             {"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "1.25"}}
         )
         == 1.25
     )
-    fallback = collect_data.parse_market_index_rate(
+    fallback = collect.parse_market_index_rate(
         {"rt_cd": "0", "output1": {"bstp_nmix_prpr": "100", "bstp_nmix_prdy_vrss": "2"}}
     )
     assert fallback == pytest.approx(2.04)
@@ -130,12 +130,12 @@ def test_parse_market_index_rate_uses_rate_and_fallback() -> None:
 
 def test_validate_hts_id_raises_on_placeholder() -> None:
     with (
-        patch.object(collect_data, "HTS_ID", "여기에 HTS ID를 입력"),
+        patch.object(collect, "HTS_ID", "여기에 HTS ID를 입력"),
         pytest.raises(RuntimeError),
     ):
-        collect_data._validate_hts_id()
-    with patch.object(collect_data, "HTS_ID", "real-hts"):
-        collect_data._validate_hts_id()  # should not raise
+        collect._validate_hts_id()
+    with patch.object(collect, "HTS_ID", "real-hts"):
+        collect._validate_hts_id()  # should not raise
 
 
 # ---------------------------------------------------------
@@ -192,7 +192,7 @@ async def _run_fetch_single_stock(client, **scenario_sets) -> tuple[dict, list[s
             )
         ),
     ):
-        return await collect_data.fetch_single_stock(
+        return await collect.fetch_single_stock(
             0, stock, 1, sem, client, None, **scenario_sets
         )
 
@@ -218,9 +218,9 @@ def test_fetch_all_stock_data_aggregates_and_reports_failures() -> None:
     async def _fake_single_stock(*args, **kwargs) -> tuple[dict, list[str]]:
         return ({"종목명": "AAA", "종목코드": "005930"}, ["체결강도"])
 
-    with patch.object(collect_data, "fetch_single_stock", side_effect=_fake_single_stock):
+    with patch.object(collect, "fetch_single_stock", side_effect=_fake_single_stock):
         results, failed = asyncio.run(
-            collect_data.fetch_all_stock_data(
+            collect.fetch_all_stock_data(
                 [{"code": "005930", "name": "AAA"}],
                 None,
                 None,
@@ -237,11 +237,11 @@ def test_fetch_all_stock_data_aggregates_and_reports_failures() -> None:
 
 
 # ---------------------------------------------------------
-# archive_condition CSV 우선 인식
+# archive CSV 우선 인식
 # ---------------------------------------------------------
 def test_archive_condition_prefers_csv_over_xlsx(tmp_path: Path) -> None:
     """아카이브가 condition_*.csv 를 우선 인식하고 스냅샷 날짜를 삽입한다."""
-    import src.daily.archive_condition as archive_condition
+    import src.daily.archive as archive
 
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True)
@@ -252,19 +252,19 @@ def test_archive_condition_prefers_csv_over_xlsx(tmp_path: Path) -> None:
     )
 
     with (
-        patch.object(archive_condition.settings, "DATA_DIR", data_dir),
-        patch.object(archive_condition.settings, "HISTORY_DIR", tmp_path / "history"),
+        patch.object(archive.settings, "DATA_DIR", data_dir),
+        patch.object(archive.settings, "HISTORY_DIR", tmp_path / "history"),
         patch.object(
-            archive_condition.settings, "HISTORY_DB_PATH", tmp_path / "history.db"
+            archive.settings, "HISTORY_DB_PATH", tmp_path / "history.db"
         ),
         patch.object(
-            archive_condition.settings, "HISTORY_CSV_PATH", tmp_path / "history.csv"
+            archive.settings, "HISTORY_CSV_PATH", tmp_path / "history.csv"
         ),
-        patch.object(archive_condition.settings, "CONDITION_CSV_PATH", csv_file),
-        patch.object(archive_condition, "import_csv_history_if_needed"),
-        patch.object(archive_condition, "upsert_history") as upsert_mock,
+        patch.object(archive.settings, "CONDITION_CSV_PATH", csv_file),
+        patch.object(archive, "import_csv_history_if_needed"),
+        patch.object(archive, "upsert_history") as upsert_mock,
     ):
-        archive_condition.main()
+        archive.main()
 
     upsert_mock.assert_called_once()
     df = upsert_mock.call_args.args[0]
@@ -274,55 +274,55 @@ def test_archive_condition_prefers_csv_over_xlsx(tmp_path: Path) -> None:
 
 
 def test_archive_condition_skips_when_csv_and_xlsx_missing(tmp_path: Path) -> None:
-    import src.daily.archive_condition as archive_condition
+    import src.daily.archive as archive
 
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True)
 
     with (
-        patch.object(archive_condition.settings, "DATA_DIR", data_dir),
-        patch.object(archive_condition.settings, "HISTORY_DIR", tmp_path / "history"),
+        patch.object(archive.settings, "DATA_DIR", data_dir),
+        patch.object(archive.settings, "HISTORY_DIR", tmp_path / "history"),
         patch.object(
-            archive_condition.settings, "HISTORY_DB_PATH", tmp_path / "history.db"
+            archive.settings, "HISTORY_DB_PATH", tmp_path / "history.db"
         ),
         patch.object(
-            archive_condition.settings, "HISTORY_CSV_PATH", tmp_path / "history.csv"
+            archive.settings, "HISTORY_CSV_PATH", tmp_path / "history.csv"
         ),
         patch.object(
-            archive_condition.settings, "CONDITION_CSV_PATH", data_dir / "condition_종가매매.csv"
+            archive.settings, "CONDITION_CSV_PATH", data_dir / "condition_종가매매.csv"
         ),
-        patch.object(archive_condition, "import_csv_history_if_needed"),
-        patch.object(archive_condition, "upsert_history") as upsert_mock,
+        patch.object(archive, "import_csv_history_if_needed"),
+        patch.object(archive, "upsert_history") as upsert_mock,
     ):
-        archive_condition.main()
+        archive.main()
 
     upsert_mock.assert_not_called()
 
 
 def test_upsert_history_stores_and_dedups(tmp_path: Path) -> None:
-    import src.daily.archive_condition as archive_condition
+    import src.daily.archive as archive
 
     db_path = tmp_path / "history.db"
     df = pd.DataFrame(
         {"스냅샷_날짜": ["2026-08-04"], "(종목코드)": ["000001"], "종목명": ["AAA"]}
     )
     with patch("src.data.parquet_loader.upsert_condition_parquet"):
-        archive_condition.upsert_history(df, str(db_path))
+        archive.upsert_history(df, str(db_path))
 
-    rows = archive_condition.fetch_date_rows("2026-08-04", str(db_path))
+    rows = archive.fetch_date_rows("2026-08-04", str(db_path))
     assert len(rows) == 1
     assert rows["(종목코드)"].tolist() == ["000001"]
 
 
 def test_fetch_date_rows_raises_on_missing_db(tmp_path: Path) -> None:
-    import src.daily.archive_condition as archive_condition
+    import src.daily.archive as archive
 
     with pytest.raises(FileNotFoundError):
-        archive_condition.fetch_date_rows("2026-08-04", str(tmp_path / "nope.db"))
+        archive.fetch_date_rows("2026-08-04", str(tmp_path / "nope.db"))
 
 
 def test_import_csv_history_if_needed_migrates_legacy_csv(tmp_path: Path) -> None:
-    import src.daily.archive_condition as archive_condition
+    import src.daily.archive as archive
 
     history_csv = tmp_path / "history.csv"
     history_csv.write_text(
@@ -332,9 +332,9 @@ def test_import_csv_history_if_needed_migrates_legacy_csv(tmp_path: Path) -> Non
     db_path = tmp_path / "history.db"
 
     with patch("src.data.parquet_loader.upsert_condition_parquet"):
-        archive_condition.import_csv_history_if_needed(str(history_csv), str(db_path))
+        archive.import_csv_history_if_needed(str(history_csv), str(db_path))
         # 두 번째 호출은 누락 날짜가 없으므로 무시
-        archive_condition.import_csv_history_if_needed(str(history_csv), str(db_path))
+        archive.import_csv_history_if_needed(str(history_csv), str(db_path))
 
-    rows = archive_condition.fetch_date_rows("2026-08-01", str(db_path))
+    rows = archive.fetch_date_rows("2026-08-01", str(db_path))
     assert rows["종목코드"].astype(str).str.zfill(6).tolist() == ["000002"]
