@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "SIZING_SAFETY_MARGIN_REFACTORING",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_SIZING_SAFETY_MARGIN_REFACTORING",
+      "domain": "ml",
+      "title": "Sizing Grade Safety Margin Threshold & Hybrid Criteria Refactoring",
+      "why": "Prevent assigning Strong grades to marginal Break-Even utility scores (+0.001) that fail to cover trading costs and slippage.",
+      "resolution": "Configured minimum safety margin thresholds for Strong (>= +0.30%) and Good (>= +0.10%) grades in assign_sizing_grades.",
+      "impact": "Eliminated score scale illusions, suppressed risky leverage under marginal expectancy, and enhanced capital preservation."
+    },
+    {
       "task_id": "MODEL_UTILITY_SCORE_FIX",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_MODEL_UTILITY_SCORE_FIX",
