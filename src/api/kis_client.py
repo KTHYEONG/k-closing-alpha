@@ -743,13 +743,56 @@ async def calculate_multiple_emas(stock_code, periods=[5, 10, 20], lookback_days
             await session.close()
 
 
+async def prefetch_ohlcv_for_sma120(
+    codes: list[str],
+    session: aiohttp.ClientSession,
+    client: KisApiClient,
+) -> dict[str, list[dict[str, str]]]:
+    """SMA120 계산용 OHLCV 이력을 사전 일괄 병렬 선조회한다.
+
+    최근 200역일 범위를 단일 청크로 종목당 1회 호출하여 150건 이상의 데이터를
+    확보한다. 실패한 종목은 반환 dict에서 key로 제외되며 예외를 전파하지 않는다.
+    """
+    from datetime import datetime, timedelta
+
+    if not codes:
+        return {}
+
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
+
+    async def _fetch(code: str) -> tuple[str, list[dict[str, str]]] | None:
+        try:
+            await client.rate_limiter.acquire()
+            resp = await client.get_stock_ohlcv_history(
+                session, code, start_date, end_date
+            )
+            if resp.get("rt_cd") != "0":
+                return None
+            records = [
+                {"date": item.get("stck_bsop_date", ""), "close": item.get("stck_clpr", "")}
+                for item in resp.get("output2", [])
+            ]
+            records = [r for r in records if r["date"] and r["close"]]
+            return (code, records) if records else None
+        except Exception as e:
+            logger.warning("[OHLCV Prefetch] %s: %s: %s", code, type(e).__name__, e)
+            return None
+
+    results = await asyncio.gather(*[_fetch(code) for code in codes])
+    pairs = [item for item in results if item is not None]
+    return dict(pairs)
+
+
 async def calculate_all_moving_averages(
     stock_code: str,
     session: aiohttp.ClientSession | None = None,
     client: KisApiClient | None = None,
+    prefetched_records: list[dict[str, str]] | None = None,
 ) -> tuple:
     """한 종목의 여러 이동평균(EMA 5/10/20, SMA 60/120)을 최소한의 API 호출로 통합 계산함.
     TPS 부하를 줄이기 위해 중복되는 OHLCV 데이터를 한 번에 가져와서 메모리에서 계산함.
+    ``prefetched_records``가 주어지면 API 호출 없이 전달된 이력 레코드로만 계산한다.
     """
     import asyncio
     from datetime import datetime, timedelta
@@ -759,7 +802,19 @@ async def calculate_all_moving_averages(
     all_records = []
     local_session = False
 
-    if session is None:
+    if prefetched_records is not None:
+        for r in prefetched_records:
+            date = r.get("date")
+            close = r.get("close")
+            if not date:
+                continue
+            try:
+                close_val = float(close)
+            except (TypeError, ValueError):
+                continue
+            if close_val > 0:
+                all_records.append({"date": date, "close": close_val})
+    elif session is None:
         import aiohttp
         from aiohttp.resolver import ThreadedResolver
         connector = aiohttp.TCPConnector(resolver=ThreadedResolver())
@@ -767,36 +822,37 @@ async def calculate_all_moving_averages(
         local_session = True
 
     try:
-        if client is None:
-            client = KisApiClient()
-            await client.ensure_token(session)
+        if prefetched_records is None:
+            if client is None:
+                client = KisApiClient()
+                await client.ensure_token(session)
 
-        # SMA 120까지 계산하기 위해 충분한 데이터 확보
-        for chunk in range(2):
-            end_dt = datetime.now() - timedelta(days=100 * chunk)
-            start_dt = end_dt - timedelta(days=120)
-            end_date = end_dt.strftime("%Y%m%d")
-            start_date = start_dt.strftime("%Y%m%d")
+            # SMA 120까지 계산하기 위해 충분한 데이터 확보
+            for chunk in range(2):
+                end_dt = datetime.now() - timedelta(days=100 * chunk)
+                start_dt = end_dt - timedelta(days=120)
+                end_date = end_dt.strftime("%Y%m%d")
+                start_date = start_dt.strftime("%Y%m%d")
 
-            resp = await client.get_stock_ohlcv_history(session, stock_code, start_date, end_date)
+                resp = await client.get_stock_ohlcv_history(session, stock_code, start_date, end_date)
 
-            if resp.get("rt_cd") != "0":
-                if chunk == 0:
-                    return {}, (0.0, False, 0), (0.0, False), (0.0, False)
-                break
+                if resp.get("rt_cd") != "0":
+                    if chunk == 0:
+                        return {}, (0.0, False, 0), (0.0, False), (0.0, False)
+                    break
 
-            items = resp.get("output2", [])
-            for item in items:
-                date = item.get("stck_bsop_date")
-                close = float(item.get("stck_clpr") or 0)
-                if date and close > 0:
-                    all_records.append({"date": date, "close": close})
+                items = resp.get("output2", [])
+                for item in items:
+                    date = item.get("stck_bsop_date")
+                    close = float(item.get("stck_clpr") or 0)
+                    if date and close > 0:
+                        all_records.append({"date": date, "close": close})
 
-            if len(all_records) >= 150:
-                break
+                if len(all_records) >= 150:
+                    break
 
-            if chunk < 1:
-                await asyncio.sleep(0.05)
+                if chunk < 1:
+                    await asyncio.sleep(0.05)
 
         if not all_records:
             return {}, (0.0, False, 0), (0.0, False), (0.0, False)

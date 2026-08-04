@@ -8,7 +8,7 @@ import pandas as pd
 from src import settings
 
 # 커스텀 모듈 임포트
-from src.api.kis_client import KisApiClient
+from src.api.kis_client import KisApiClient, prefetch_ohlcv_for_sma120
 from src.data.db_loader import load_theme_from_db
 from src.data.gsheet_loader import append_stocks_to_gsheet
 from src.utils.display import Colors
@@ -151,6 +151,7 @@ async def fetch_single_stock(
     near_new_high_stock_codes=None,
     upper_limit_next_day_stock_codes=None,
     upper_limit_stock_codes=None,
+    ohlcv_cache=None,
 ):
     """단일 종목의 상세 데이터를 수집합니다."""
     if overheated_stock_codes is None:
@@ -272,8 +273,12 @@ async def fetch_single_stock(
             try:
                 from src.api.kis_client import calculate_all_moving_averages
 
+                prefetched = (ohlcv_cache or {}).get(code)
                 (_, (_, _, data_count), _, (sma120_val, sma120_ok)) = (
-                    await calculate_all_moving_averages(code, session=session, client=client)
+                    await calculate_all_moving_averages(
+                        code, session=session, client=client,
+                        prefetched_records=prefetched,
+                    )
                 )
                 sma_value, sma_success = float(sma120_val), sma120_ok
                 if sma_success and sma_value > 0 and prev_close_price < sma_value <= close_price:
@@ -330,6 +335,24 @@ async def fetch_all_stock_data(
     if upper_limit_stock_codes is None:
         upper_limit_stock_codes = set()
 
+    # Phase A: 1차 시나리오 확정 가능 종목 분류 (SMA120 조회 불필요)
+    primary_matched_codes = (
+        upper_limit_stock_codes
+        | upper_limit_next_day_stock_codes
+        | new_high_stock_codes
+        | near_new_high_stock_codes
+    )
+    sma_needed_codes = [
+        stock["code"] for stock in stock_list
+        if stock["code"] not in primary_matched_codes
+    ]
+
+    # Phase B: SMA120 필요 종목 OHLCV 사전 병렬 선조회
+    if sma_needed_codes and client is not None and session is not None:
+        ohlcv_cache = await prefetch_ohlcv_for_sma120(sma_needed_codes, session=session, client=client)
+    else:
+        ohlcv_cache = {}
+
     sem = asyncio.Semaphore(settings.API_SEMAPHORE_LIMIT)
     total = len(stock_list)
     completed_count = 0
@@ -348,6 +371,7 @@ async def fetch_all_stock_data(
             near_new_high_stock_codes,
             upper_limit_next_day_stock_codes,
             upper_limit_stock_codes,
+            ohlcv_cache,
         )
         completed_count += 1
         pct = (completed_count / total) * 100 if total > 0 else 100.0
