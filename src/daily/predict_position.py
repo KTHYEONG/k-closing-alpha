@@ -13,8 +13,11 @@ logger = logging.getLogger(__name__)
 # DB 및 시트 관련 임포트
 from src.data.db_loader import load_theme_from_db
 from src.data.sync_sheet_db import sync_theme_only
+from src.ml.model_pipeline import run_model_pipeline  # noqa: F401  (Purged Walk-Forward CV 학습 파이프라인 진입점)
 from src.processing.preprocessor import build_ml_dataset  # noqa: F401  (파퀘 기반 학습 파이프라인 진입점)
 from src.utils.display import Colors, print_table
+
+# run_model_pipeline(df, feature_cols, target_col, group_col)
 
 # SHAP (모델 해석용) - 필요 시 설치: pip install shap
 try:
