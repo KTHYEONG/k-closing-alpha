@@ -68,7 +68,7 @@ class PathSettings(BaseSettings):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def HISTORY_PARQUET_PATH(self) -> Path:
-        return self.PARQUET_DIR / "condition_history.parquet"
+        return self.HISTORY_DIR / "archive.parquet"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
