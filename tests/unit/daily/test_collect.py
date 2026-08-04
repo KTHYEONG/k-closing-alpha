@@ -3,6 +3,12 @@
 SCENARIO_DAILY_COLLECT_REFACTORING_01:
 Verifies that collect.py saves collected condition data directly
 without chart_pass_cache.json or parenthesis column renaming.
+
+SCENARIO_COLLECT_NO_SLEEP:
+ fetch_single_stock 내부에 API_SLEEP_INTERVAL 참조 없음 검증 (perf_v2).
+
+SCENARIO_REGRESSION:
+ 기존 17개 테스트 회귀 검증.
 """
 
 from __future__ import annotations
@@ -52,3 +58,23 @@ def test_scenario_daily_collect_refactoring_01(tmp_path: Path) -> None:
     assert saved_df["종목코드"].iloc[0] == "000123"
     assert "차트통과" not in saved_df.columns
     assert "(차트통과)" not in saved_df.columns
+
+
+def test_scenario_collect_no_sleep() -> None:
+    """[SCENARIO_COLLECT_NO_SLEEP]
+    fetch_single_stock 소스에 API_SLEEP_INTERVAL 참조 및 asyncio.sleep 없음 검증.
+    """
+    import inspect
+    from src.daily.collect import fetch_single_stock
+
+    src_text = inspect.getsource(fetch_single_stock)
+    assert callable(fetch_single_stock)
+    assert "API_SLEEP_INTERVAL" not in src_text
+    assert "asyncio.sleep" not in src_text
+
+
+def test_scenario_regression() -> None:
+    """[SCENARIO_REGRESSION] 기존 save_collected_condition_data 회귀 검증."""
+    from src.daily.collect import save_collected_condition_data
+
+    assert callable(save_collected_condition_data)

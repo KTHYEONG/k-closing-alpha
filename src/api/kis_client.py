@@ -23,16 +23,16 @@ class AsyncRateLimiter:
     async def acquire(self) -> None:
         """Rate limit 초과 시 대기 후 권한 획득."""
         import time
-        async with self._lock:
-            now = time.monotonic()
-            self._timestamps = [t for t in self._timestamps if now - t < self.time_period]
-            if len(self._timestamps) >= self.max_rate:
-                sleep_time = self.time_period - (now - self._timestamps[0])
-                if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
+        while True:
+            async with self._lock:
                 now = time.monotonic()
                 self._timestamps = [t for t in self._timestamps if now - t < self.time_period]
-            self._timestamps.append(now)
+                if len(self._timestamps) < self.max_rate:
+                    self._timestamps.append(now)
+                    return
+                sleep_time = self._timestamps[0] + self.time_period - now
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
 
 
 class KisApiClient:
@@ -743,7 +743,11 @@ async def calculate_multiple_emas(stock_code, periods=[5, 10, 20], lookback_days
             await session.close()
 
 
-async def calculate_all_moving_averages(stock_code, session=None):
+async def calculate_all_moving_averages(
+    stock_code: str,
+    session: aiohttp.ClientSession | None = None,
+    client: KisApiClient | None = None,
+) -> tuple:
     """한 종목의 여러 이동평균(EMA 5/10/20, SMA 60/120)을 최소한의 API 호출로 통합 계산함.
     TPS 부하를 줄이기 위해 중복되는 OHLCV 데이터를 한 번에 가져와서 메모리에서 계산함.
     """
@@ -752,7 +756,6 @@ async def calculate_all_moving_averages(stock_code, session=None):
 
     import pandas as pd
 
-    client = KisApiClient()
     all_records = []
     local_session = False
 
@@ -764,7 +767,9 @@ async def calculate_all_moving_averages(stock_code, session=None):
         local_session = True
 
     try:
-        await client.ensure_token(session)
+        if client is None:
+            client = KisApiClient()
+            await client.ensure_token(session)
 
         # SMA 120까지 계산하기 위해 충분한 데이터 확보
         for chunk in range(2):
