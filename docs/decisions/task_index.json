@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "ARCHIVE_REDESIGN_V2",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ARCHIVE_REDESIGN_V2",
+      "domain": "daily",
+      "title": "Archive Column Consolidation and Theme Integration",
+      "why": "Eliminate duplicate chart_analysis column, integrate theme mapping via theme.parquet, remove legacy _Y suffix, and align 26 columns 1:1 with spreadsheet",
+      "resolution": "Updated src/daily/archive.py and predict.py to use official load_theme loader, consolidated scenario to single column 26, and updated docs/specs",
+      "impact": "Cleaned legacy artifacts, guaranteed 100% spreadsheet compatibility with exact 26 columns, and resolved all null values"
+    },
+    {
+      "task_id": "ARCHIVE_REDESIGN",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ARCHIVE_REDESIGN",
+      "domain": "daily",
+      "title": "Daily Candidate Archive Redesign and Spreadsheet Alignment",
+      "why": "Refactor legacy sqlite archive to 27 standard columns matching Google Spreadsheet layout, with dual persistence (Parquet+SQLite) and TSV export",
+      "resolution": "Redesigned src/daily/archive.py, simplified paths to data/history/archive.parquet and archive.db, aligned 27 columns 1:1 with spreadsheet, added TSV export CLI",
+      "impact": "Improved archive durability, guaranteed spreadsheet copy-paste compatibility, and simplified history file management"
+    },
+    {
       "task_id": "daily_data_refactoring",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_daily_data_refactoring",

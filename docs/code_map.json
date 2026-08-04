@@ -63,5 +63,8 @@
   },
   "src/daily/collect.py": {
     "testing": "tests/unit/daily/test_collect.py"
+  },
+  "src/daily/archive.py": {
+    "testing": "tests/unit/daily/test_archive.py"
   }
 }
