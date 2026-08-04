@@ -20,10 +20,10 @@
   },
   "src/data/sync_sheet_db.py": {},
   "src/processing/preprocessor.py": {
-    "testing": "tests/unit/test_preprocessor.py"
+    "testing": "tests/test_preprocessor.py"
   },
-  "src/processing/preprocessor_v2.py": {
-    "testing": "tests/test_preprocessor_v2.py"
+  "src/processing/legacy_mapping.py": {
+    "testing": "tests/test_preprocessor.py"
   },
   "src/processing/scale_corrector.py": {
     "testing": "tests/unit/test_scale_corrector.py"

@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "PREPROCESSOR_MAIN_CONSOLIDATION",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_PREPROCESSOR_MAIN_CONSOLIDATION",
+      "domain": "processing",
+      "title": "Preprocessor Module Refactoring & Consolidation (v2 -> Main)",
+      "why": "v2 전처리기를 프로젝트 메인 preprocessor.py로 통합하고 기존 legacy v1 코드를 legacy/로 분리 이관",
+      "resolution": "preprocessor_v2.py를 src/processing/preprocessor.py로 승격하고 legacy 전처리기를 legacy/preprocessor.py로 이동, RENAME_MAP을 legacy_mapping.py로 추출 및 re-export",
+      "impact": "메인 전처리 파이프라인 단일화 및 코드베이스 깔끔화, 구형 데이터 호환성 보장"
+    },
+    {
       "task_id": "ML_FEATURE_ENG_V2",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_ML_FEATURE_ENG_V2",
