@@ -75,5 +75,8 @@
   "src/utils/export_archive.py": {},
   "src/backfill/backfill_condition_history.py": {
     "testing": "tests/unit/backfill/test_backfill_condition_history.py"
+  },
+  "src/processing/schema.py": {
+    "testing": "tests/unit/processing/test_schema.py"
   }
 }

@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_SPREADSHEET_REFACTOR",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_SPREADSHEET_REFACTOR",
+      "domain": "processing",
+      "title": "스프레드시트 열 참조 및 컬럼 정규화 리팩토링",
+      "why": "legacy_mapping.py 및 하드코딩 컬럼 리터럴 산재 문제 해결",
+      "resolution": "src/processing/schema.py 중앙 스키마 모듈 도입, legacy_mapping.py 제거, daily/ 및 preprocessor 연동 정제",
+      "impact": "표준 영문 컬럼 단일 원천 관리 및 파이프라인 결합도 해소"
+    },
+    {
       "task_id": "TASK_20260804_CONDITION_HISTORY_BACKFILL",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_20260804_CONDITION_HISTORY_BACKFILL",

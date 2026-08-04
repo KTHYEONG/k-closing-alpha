@@ -29,6 +29,7 @@ from src.processing.preprocessor import (  # noqa: F401  (파퀘 기반 학습 �
     clean_column_names,
     engineer_features,
 )
+from src.processing.schema import normalize_column_names
 from src.utils.display import Colors, print_table
 
 # run_model_pipeline(df, feature_cols, target_col, group_col)
@@ -217,46 +218,18 @@ def explain_predictions_with_shap(model, X_final, stock_names, top_n=3):
 # 출력 테이블 기본 상위 후보 수 (Top N)
 _DEFAULT_TOP_N = 15
 
-# 일일 CSV(비괄호 스프레드시트 헤더) -> 표준 스프레드시트 헤더 정규화 매핑.
-# ``clean_column_names`` 이 단일 권위 매핑이 되도록, 일일 CSV 의 컬럼명을
-# preprocessor 의 COLUMN_MAP 키(괄호/단위 표기) 형태로 먼저 정규화합니다.
-_DAILY_TO_SPREADSHEET_HEADER: dict[str, str] = {
-    "시가": "(시가)",
-    "고가": "(고가)",
-    "저가": "(저가)",
-    "종가": "(종가)",
-    "전일종가": "(전일종가)",
-    "시가총액": "(시가총액, 억)",
-    "거래대금": "(거래대금, 억)",
-    "등락률": "(등락률)",
-    "선정순위": "(선정 순위)",
-    "기관_순매수": "(기관_순매수)",
-    "외국인_순매수": "(외국인_순매수)",
-    "프로그램_순매수": "(프로그램_순매수)",
-    "체결강도": "(체결강도)",
-    "시장구분": "(시장구분)",
-    "총_종목수": "(총 종목 수)",
-    "평균_거래대금": "(평균 거래대금)",
-    "kospi": "(kospi, %)",
-    "kosdaq": "(kosdaq, %)",
-    "거래량": "(거래량)",
-    "테마_섹터": "(테마/섹터)",
-    "차트분석": "(차트분석)",
-}
-
 
 def apply_standard_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     """당일 스냅샷을 학습 파이프라인과 1:1 동일한 표준 ML 피처 스키마로 정규화합니다.
 
-    일일 CSV 의 컬럼명을 표준 스프레드시트 헤더로 정규화한 뒤
-    ``clean_column_names`` / ``engineer_features`` / ``_apply_robust_z`` 를
+    ``normalize_column_names`` 단일 정규화로 일일 CSV 의 한글/괄호 헤더를 표준
+    영문 컬럼으로 변환한 뒤 ``engineer_features`` / ``_apply_robust_z`` 를
     적용합니다. 당일 스냅샷에는 존재하지 않는 ``trade_date``(오늘)와
     ``buy_price``(전일종가 기준 중립값)를 보강하고, 표시용 메타데이터
     (``종목명`` 등)는 보존합니다.
     """
     work = df.copy()
-    work = work.rename(columns=_DAILY_TO_SPREADSHEET_HEADER)
-    work = clean_column_names(work)
+    work = normalize_column_names(work)
     if "trade_date" not in work.columns:
         work["trade_date"] = pd.Timestamp.today().normalize()
     if "buy_price" not in work.columns:
@@ -516,7 +489,7 @@ def main():
     df_all["v_kosdaq_change"] = current_vkosdaq_change
 
     # 4. [Feature Engineering] 표준 ML 피처 정합성 확보
-    # preprocessor.py 의 clean_column_names / engineer_features 를 적용하여
+    # schema 의 normalize_column_names / engineer_features 를 적용하여
     # 학습 파이프라인(models_bundle["feature_cols"])과 1:1 동일한 스키마를 생성합니다.
     df_all["차트분석"] = df_all["Scenario_Base"].astype(str)
     df_all = apply_standard_feature_engineering(df_all)
