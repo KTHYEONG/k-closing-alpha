@@ -128,6 +128,26 @@ class Settings(BaseSettings):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def PARQUET_DIR(self) -> Path:
+        return self.DATA_DIR / "parquet"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def TRADE_LOG_PARQUET_PATH(self) -> Path:
+        return self.PARQUET_DIR / "trade_log.parquet"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def THEME_PARQUET_PATH(self) -> Path:
+        return self.PARQUET_DIR / "theme.parquet"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def CONDITION_PARQUET_PATH(self) -> Path:
+        return self.PARQUET_DIR / "condition_history.parquet"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def TOKEN_FILE(self) -> Path:
         return self.CONFIGS_DIR / "kis_token_cache.json"
 
@@ -260,6 +280,10 @@ EMA_LOOKBACK_DAYS = settings.EMA_LOOKBACK_DAYS
 DEFAULT_SCENARIOS = settings.DEFAULT_SCENARIOS
 DAY_NAME_MAP = settings.DAY_NAME_MAP
 STOCK_DB_PATH = settings.STOCK_DB_PATH
+PARQUET_DIR = settings.PARQUET_DIR
+TRADE_LOG_PARQUET_PATH = settings.TRADE_LOG_PARQUET_PATH
+THEME_PARQUET_PATH = settings.THEME_PARQUET_PATH
+CONDITION_PARQUET_PATH = settings.CONDITION_PARQUET_PATH
 TOKEN_FILE = settings.TOKEN_FILE
 CHART_PASS_CACHE_FILE = settings.CHART_PASS_CACHE_FILE
 HISTORY_DIR = settings.HISTORY_DIR
