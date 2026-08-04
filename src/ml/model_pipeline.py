@@ -17,6 +17,7 @@ from lightgbm import LGBMRanker, LGBMRegressor
 from scipy.stats import spearmanr
 from sklearn.linear_model import Ridge
 
+from src.ml.backtest_evaluator import run_backtest_evaluation
 from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
 
 logger = logging.getLogger(__name__)
@@ -181,4 +182,5 @@ def run_model_pipeline(
         "oof_df": oof_df,
         "metrics": metrics,
         "trained_models": trained_models,
+        "backtest_eval": run_backtest_evaluation(oof_df, target_col, group_col),
     }
