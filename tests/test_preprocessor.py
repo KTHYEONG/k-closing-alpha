@@ -1,6 +1,7 @@
-"""preprocessor_v2 ML 데이터 전처리 파이프라인 검증 테스트.
+"""메인 preprocessor ML 데이터 전처리 파이프라인 검증 테스트.
 
-`docs/specs/ml_data_preprocessing_contract.json`의 시나리오 기반 검증입니다.
+`docs/specs/ml_data_preprocessing_contract.json`의 시나리오와
+`docs/specs/preprocessor_refactor_contract.json`의 시나리오 기반 검증입니다.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.processing.preprocessor_v2 import (
+from src.processing.preprocessor import (
     _ROBUST_Z_COLUMNS,
     _apply_robust_z,
     build_ml_dataset,
@@ -140,7 +141,7 @@ def test_categorical_features_reported() -> None:
 
 
 def test_build_ml_dataset_nonempty() -> None:
-    """python_assertion: build_ml_dataset(sample_df)[0] 길이가 0보다 커야 합니다."""
+    """SCENARIO_PREPROCESS_ML_DATASET: build_ml_dataset이 X/y/cat_features 및 multi-target 컬럼을 반환합니다."""
     X, targets, cat_features, processed = build_ml_dataset(_build_raw_df())
     assert len(X) > 0
     assert len(targets) == 4
@@ -319,3 +320,14 @@ def test_s8_pct_rank_missing_col() -> None:
     assert "foreign_density_z" not in out.columns
     assert "major_density_z" in out.columns
     assert out["major_density_z"].notna().all()
+
+
+def test_rename_map_compatibility() -> None:
+    """SCENARIO_RENAME_MAP_COMPATIBILITY: RENAME_MAP이 메인 preprocessor와 legacy_mapping 양쪽에서 동일하게 import됩니다."""
+    from src.processing.legacy_mapping import RENAME_MAP as LEGACY_RENAME_MAP
+
+    from src.processing.preprocessor import RENAME_MAP as PREPROCESSOR_RENAME_MAP
+
+    assert PREPROCESSOR_RENAME_MAP == LEGACY_RENAME_MAP
+    assert LEGACY_RENAME_MAP["(매수날짜)"] == "매수날짜"
+    assert PREPROCESSOR_RENAME_MAP["(수익률, %)"] == "수익률"
