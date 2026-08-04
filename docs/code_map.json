@@ -7,7 +7,9 @@
   "src/backfill/run_sheet_backfill.py": {},
   "src/daily/archive_condition.py": {},
   "src/daily/collect_data.py": {},
-  "src/daily/predict_position.py": {},
+  "src/daily/predict_position.py": {
+    "testing": "tests/unit/daily/test_predict_position.py"
+  },
   "src/data/data_loader.py": {},
   "src/data/db_loader.py": {
     "testing": "tests/unit/test_db_loader.py"

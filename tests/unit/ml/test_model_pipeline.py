@@ -5,11 +5,14 @@ SCENARIO_MODEL_PIPELINE_TRAIN_EVAL
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.ml.model_pipeline import run_model_pipeline
+from src.ml.model_pipeline import run_model_pipeline, run_sizing_pipeline
+from src.ml.sizing_engine import load_model_artifacts
 
 FEATURE_COLS = ["feature_a", "feature_b"]
 TARGET_COL = "net_return"
@@ -136,3 +139,25 @@ def test_run_model_pipeline_rejects_missing_columns() -> None:
             target_col=TARGET_COL,
             group_col=GROUP_COL,
         )
+
+
+def test_run_sizing_pipeline_exports_model_bundle(tmp_path) -> None:
+    """훈련 모드(export_dir)에서 모델 번들을 저장하고 artifact_path 를 반환한다."""
+    df = _make_dataset(n_groups=8, rows_per_group=6)
+    result = run_sizing_pipeline(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+        export_dir=str(tmp_path),
+    )
+    assert {"quantile_df", "sizing_df", "artifact_path"}.issubset(result.keys())
+    assert {"utility_score", "grade", "grade_multiplier", "allocation"}.issubset(
+        result["sizing_df"].columns
+    )
+    assert tmp_path.joinpath("sizing_pipeline_bundle.joblib").is_file()
+    assert os.path.exists(result["artifact_path"])
+    loaded = load_model_artifacts(str(tmp_path))
+    assert set(loaded["feature_cols"]) == set(FEATURE_COLS)

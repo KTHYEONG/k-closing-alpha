@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "daily_pipeline_integration",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_daily_pipeline_integration",
+      "domain": "daily",
+      "title": "Daily Prediction & Dynamic Sizing Pipeline Integration",
+      "why": "Integrate trained ML ranker, quantile risk model and utility sizing engine into daily operational pipeline with model persistence and legacy cleanup",
+      "resolution": "Refactored src/daily/predict_position.py, added save/load_model_artifacts & predict_daily_position_sizing in src/ml/sizing_engine.py, cleaned legacy GMM/static logic",
+      "impact": "Fast 1-second inference from artifacts/models/ and automated risk-managed portfolio sizing for 15:20 daily snapshot"
+    },
+    {
       "task_id": "quantile_sizing",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_quantile_sizing",

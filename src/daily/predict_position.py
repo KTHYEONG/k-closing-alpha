@@ -3,10 +3,10 @@ import json
 import logging
 import os
 import sys
+from typing import Any
 
 import numpy as np
 import pandas as pd
-from joblib import load
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 from src.data.db_loader import load_theme_from_db
 from src.data.sync_sheet_db import sync_theme_only
 from src.ml.model_pipeline import run_model_pipeline  # noqa: F401  (Purged Walk-Forward CV 학습 파이프라인 진입점)
+from src.ml.sizing_engine import load_model_artifacts, predict_daily_position_sizing
 from src.processing.preprocessor import build_ml_dataset  # noqa: F401  (파퀘 기반 학습 파이프라인 진입점)
 from src.utils.display import Colors, print_table
 
@@ -27,20 +28,11 @@ try:
 except ImportError:
     HAS_SHAP = False
 
-# GMM (동적 의사결정용)
-try:
-    from sklearn.mixture import GaussianMixture
-
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
-
 
 from src import settings
 
 LABEL_ENCODER_PATH = str(settings.LABEL_ENCODER_PATH)
 CONDITION_EXCEL_PATH = str(settings.CONDITION_EXCEL_PATH)
-MODEL_PATH = str(settings.MODEL_PATH)
 DEFAULT_SCENARIOS = settings.DEFAULT_SCENARIOS
 DAY_NAME_MAP = settings.DAY_NAME_MAP
 GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
@@ -237,162 +229,40 @@ def explain_predictions_with_shap(model, X_final, stock_names, top_n=3):
 # =========================================================
 
 
-# =========================================================
-# 2. 동적 의사결정 로직 (GMM & Safety Floor)
-# =========================================================
+def run_daily_sizing_inference(
+    df: pd.DataFrame,
+    models_bundle: dict[str, Any],
+    feature_cols: list[str] | None = None,
+    group_col: str = "date",
+) -> pd.DataFrame:
+    """저장된 모델 아티팩트로 당일 스냅샷에 Fast Inference + Dynamic Sizing 을 수행합니다.
 
-# GMM 적용을 위한 최소/최적화 파라미터 (추후 Find_Opt_Threshold 등으로 최적화 가능)
-MIN_SAMPLES_FOR_GMM = 10  # 최소 샘플 수
-MIN_STD_FOR_GMM = 0.05  # 최소 표준편차 (변별력 기준 1)
-MIN_RANGE_FOR_GMM = 0.10  # 최소 점수 범위 (변별력 기준 2)
-
-# Safety Floor (AI 최적화 임계값 - Find_Opt_Threshold.py 결과)
-# 최적 Bins: [-inf, 0.5868, 0.8717, 1.0726, inf]
-SAFETY_MAX_FLOOR = 1.07  # Max_Expand가 되기 위한 그룹 평균 최소값 (AI 추천)
-SAFETY_EXPAND_FLOOR = 0.87  # Expand가 되기 위한 그룹 평균 최소값 (AI 추천)
-ABSOLUTE_MIN_SCORE = 0.59  # 이 점수 미만은 무조건 Reduce (AI 추천)
-
-
-def get_decision_batch(scores: pd.Series) -> pd.Series:
-    """GMM을 사용하여 동적으로 등급을 부여하되, 데이터가 부족하거나 변별력이 없으면
-    기존의 고정 임계값 방식을 사용합니다. 또한 Safety Floor를 적용하여 리스크를 관리합니다.
+    모델 학습 시 사용된 ``feature_cols`` 를 기준으로 누락 컬럼을 0 으로 채우고,
+    ``group_col`` 이 없으면 오늘 날짜로 단일 그룹을 구성하여
+    ``predict_daily_position_sizing`` 을 호출합니다.
     """
+    if feature_cols is None:
+        feature_cols = list(models_bundle.get("feature_cols", []))
+    if not feature_cols:
+        raise ValueError("feature_cols is empty; models_bundle must declare feature_cols")
 
-    # 1. 고정 임계값 로직 (Fallback & Basic)
-    def apply_static_logic(s):
-        # AI 최적화 임계값 (Find_Opt_Threshold.py 결과)
-        # Reduce (~0.59), Neutral (0.59~0.87), Expand (0.87~1.07), Max (1.07~)
-        if s < 0.59:
-            return "Reduce"
-        elif s < 0.87:
-            return "Neutral"
-        elif s < 1.07:
-            return "Expand"
-        else:
-            return "Max_Expand"
+    work = df.copy()
+    for col in feature_cols:
+        if col not in work.columns:
+            work[col] = 0.0
+    if group_col not in work.columns:
+        work[group_col] = str(datetime.date.today())
 
-    # GMM 사용 불가 조건 체크
-    if not HAS_SKLEARN:
-        return scores.apply(apply_static_logic)
-
-    n_samples = len(scores)
-    score_std = scores.std()
-    score_range = scores.max() - scores.min()
-
-    # 2. GMM 적용 여부 판단
-    # 샘플이 너무 적거나, 점수가 다들 비슷비슷하면(표준편차/범위 미달) 굳이 억지로 나누지 않음
-    if (
-        n_samples < MIN_SAMPLES_FOR_GMM
-        or score_std < MIN_STD_FOR_GMM
-        or score_range < MIN_RANGE_FOR_GMM
-    ):
-
-        # 로깅 (필요 시 주석 해제)
-        # logger.info(f"  > [Static Logic] Samples={n_samples}, Std={score_std:.4f}, Range={score_range:.4f}")
-        return scores.apply(apply_static_logic)
-
-    # 3. GMM Clustering
-    try:
-        # 데이터 shape 변환 (N, 1)
-        X = scores.values.reshape(-1, 1)
-
-        # 컴포넌트 수는 최대 4개, 샘플 수보다 작아야 함
-        n_components = min(4, n_samples)
-
-        gmm = GaussianMixture(n_components=n_components, random_state=42)
-        gmm.fit(X)
-        labels = gmm.predict(X)
-
-        # 4. 클러스터 의미 매핑 (Labels 0,1,2,3 -> Reduce, Neutral, Expand, Max_Expand)
-        # 각 클러스터의 평균 점수를 구해서 오름차순 정렬
-        cluster_means = []
-        for i in range(n_components):
-            mean_score = X[labels == i].mean()
-            cluster_means.append((mean_score, i))
-
-        # 평균 점수가 낮은 순서대로 정렬
-        cluster_means.sort(key=lambda x: x[0])
-
-        # 순위 매핑 (Rank 0 = Lowest Score Group)
-        rank_map = {
-            original_label: rank
-            for rank, (_, original_label) in enumerate(cluster_means)
-        }
-
-        # 가능한 등급 리스트 (4단계)
-        decision_levels = ["Reduce", "Neutral", "Expand", "Max_Expand"]
-
-        final_decisions = []
-        for i, score in enumerate(scores):
-            # 개별 절대 과락 체크 (Safety Floor 1)
-            if score < ABSOLUTE_MIN_SCORE:
-                final_decisions.append("Reduce")
-                continue
-
-            cluster_label = labels[i]
-            rank = rank_map[
-                cluster_label
-            ]  # 0, 1, 2, 3 중 하나 (또는 n_components-1 까지)
-
-            # 컴포넌트 개수가 4개 미만일 경우 처리를 위해 매핑 조정
-            # 예: 2개 그룹이면 -> 0(Reduce), 1(Neutral/Expand?) -> 단순 매핑보다 그룹 평균 기반 매핑이 나음
-            # 여기서는 간단히 4등분 논리를 적용하되, 그룹 평균 점수를 Safety Floor로 재검증
-
-            # 현재 그룹의 평균 점수
-            group_mean = cluster_means[rank][0]
-
-            # 기본 등급 할당 (그룹 순위에 따라 최대치 부여)
-            # n_components가 4이면: 0->Red, 1->Neu, 2->Exp, 3->Max
-            # n_components가 3이면: 0->Red, 1->Neu, 2->Exp (Max 없음)
-
-            # 인덱스 스케일링: (rank / (n_components-1)) * 3 -> 0~3 사이 실수
-            if n_components > 1:
-                scaled_rank = int(round((rank / (n_components - 1)) * 3))
-            else:
-                scaled_rank = 0  # 그룹이 1개면 다 Reduce? -> 아니면 평균 점수 따라감
-
-            base_decision = decision_levels[scaled_rank]
-
-            # 5. Safety Floor 적용 (강등 로직 - Group Mean 기준)
-            # Max_Expand가 되려면 그룹 평균이 SAFETY_MAX_FLOOR(0.6) 이상이어야 함
-            if base_decision == "Max_Expand" and group_mean < SAFETY_MAX_FLOOR:
-                base_decision = "Expand"  # 1단계 강등
-
-            # Expand가 되려면 그룹 평균이 SAFETY_EXPAND_FLOOR(0.4) 이상이어야 함
-            if base_decision == "Expand" and group_mean < SAFETY_EXPAND_FLOOR:
-                base_decision = "Neutral"  # 1단계 강등
-
-            # 6. Safety Pass (승격 로직 - Individual Score 기준)
-            # 상대평가(GMM)로 인해 억울하게 강등된 고득점 종목 구제
-            if score >= 1.07:  # AI 추천: Max_Expand 임계값
-                base_decision = "Max_Expand"
-            elif score >= 0.87 and base_decision in [
-                "Reduce",
-                "Neutral",
-            ]:  # AI 추천: Expand 임계값
-                base_decision = "Expand"
-
-            final_decisions.append(base_decision)
-
-        return pd.Series(final_decisions, index=scores.index)
-
-    except Exception as e:
-        logger.info(
-            f"{Colors.YELLOW}[Warning] GMM Error: {e} -> Fallback to Static{Colors.RESET}"
-        )
-        return scores.apply(apply_static_logic)
+    return predict_daily_position_sizing(
+        work[[*feature_cols, group_col]],
+        feature_cols,
+        group_col=group_col,
+        models_bundle=models_bundle,
+    )
 
 
 def main():
-    # 1. 모델 및 Explainer 로드 (기존과 동일)
-    if not os.path.exists(MODEL_PATH):
-        logger.info(f"{Colors.YELLOW}[Warning] 모델 파일이 없습니다.{Colors.RESET}")
-        model = None
-    else:
-        logger.info(f"{Colors.GREEN}모델 로드 중...{Colors.RESET}")
-        model = load(MODEL_PATH)
-
-    # 2. 데이터 로드 및 테마 매핑
+    # 1. 데이터 로드 및 테마 매핑
     df_condition = load_and_preprocess_data(CONDITION_EXCEL_PATH)
     theme_map = load_theme_from_db()
 
@@ -835,98 +705,49 @@ def main():
     if "real_trade" not in df_all.columns:
         df_all["real_trade"] = 0.0
 
-    # 5. 모델 입력 준비 및 배치 추론
-    # [CatBoost 전용] 범주형 변수는 문자열로 변환 (학습 시와 동일)
-    X_processed = df_all.copy()
-
-    # LABEL_ENCODER_MAP에 정의된 범주형 컬럼들을 문자열로 변환
-    cat_cols_from_encoder = list(LABEL_ENCODER_MAP.keys()) if LABEL_ENCODER_MAP else []
-    for col in cat_cols_from_encoder:
-        if col in X_processed.columns:
-            X_processed[col] = X_processed[col].astype(str)
-
-    # [Feature Names Check] 모델 학습 시 사용된 피처 이름 확보
-    train_feature_names = []
-    if model:
-        if hasattr(model, "feature_names_in_"):
-            train_feature_names = list(model.feature_names_in_)
-        elif hasattr(model, "feature_names_"):
-            train_feature_names = list(model.feature_names_)
-
-    if model and train_feature_names:
-        # [V1 Feature Set] 제외 피처 확인 및 제거 (V1_Drop_Rank: 시장구분, 선정순위 제외)
-        V1_EXCLUDE_FEATURES = ["시장구분", "선정순위"]
-
-        # 누락된 컬럼 채우기 (범주형/숫자형 구분)
-        for col in train_feature_names:
-            if col not in X_processed.columns:
-                # 범주형이면 "0" (문자열), 숫자형이면 0.0 (실수)
-                if col in cat_cols_from_encoder:
-                    X_processed[col] = "0"
-                else:
-                    X_processed[col] = 0.0
-
-        # V1 제외 피처가 train_feature_names에 없는지 확인 (디버깅용)
-        excluded_in_model = [f for f in V1_EXCLUDE_FEATURES if f in train_feature_names]
-        if excluded_in_model:
-            logger.info(
-                f"{Colors.YELLOW}[Warning] 학습 모델에 제외되어야 할 피처가 포함됨: {excluded_in_model}{Colors.RESET}"
-            )
-
-        X_final = X_processed[train_feature_names]
-
-        # 단 한 번의 호출로 모든 종목/시나리오 예측
-        df_all["Score"] = model.predict(X_final)
-
-        # [Debug] 피처 정합성 확인 로그
+    # 5. Fast Inference & Dynamic Sizing (저장된 모델 아티팩트 로드)
+    # 레거시 GMM/Static 판단 로직은 제거되고, artifacts/models/ 의 모델 번들을
+    # 로드하여 Utility Score 기반 Sizing Grade(Strong/Good/Weak/Pass) 및 배분을 산출합니다.
+    try:
+        models_bundle = load_model_artifacts()
+    except FileNotFoundError as exc:
         logger.info(
-            f"{Colors.GREEN}✅ 모델 입력 피처 수: {len(train_feature_names)}{Colors.RESET}"
+            f"{Colors.YELLOW}[Warning] 모델 아티팩트가 없어 예측을 건너뜁니다: {exc}{Colors.RESET}"
         )
-        logger.info(f"   👉 V1 제외 피처: {V1_EXCLUDE_FEATURES}")
+        logger.info(
+            f"{Colors.CYAN}[Guide] 먼저 run_sizing_pipeline(export_dir=...) 로 학습 후 "
+            "save_model_artifacts() 를 실행해 artifacts/models/ 에 저장하세요.{Colors.RESET}"
+        )
+        return
 
-        # ============================================================
-        # [SHAP 분석] 예측 근거 확인 (필요 시 아래 주석 해제)
-        # ============================================================
-        # 각 종목의 점수가 왜 높게/낮게 나왔는지 상위 3개 피처를 분석합니다.
-        # 주의: 종목 수가 많으면 시간이 오래 걸릴 수 있습니다.
-        # explain_predictions_with_shap(
-        #     model=model,
-        #     X_final=X_final,
-        #     stock_names=df_all["종목명"].tolist(),
-        #     top_n=3
-        # )
-        # ============================================================
+    logger.info(
+        f"{Colors.GREEN}모델 아티팩트 로드 완료. Fast Inference + Dynamic Sizing 실행 중...{Colors.RESET}"
+    )
+    sizing_df = run_daily_sizing_inference(df_all, models_bundle)
 
-    else:
-        df_all["Score"] = 0.5
-
-    # 6. 의사결정 로직 일괄 적용 (GMM Dynamic + Safety Floor)
-    # [Optimized Thresholds] AI 추천 및 실전 보정 임계값 적용 (2025-12-27 업데이트)
-    # GMM을 통해 그날의 시장 난이도에 맞게 상대평가하되, 절대 하한선(Safety)을 지킴
-    logger.info(f"{Colors.CYAN}의사결정 등급 산정 중 (GMM Dynamic Logic)...{Colors.RESET}")
-    df_all["Decision"] = get_decision_batch(df_all["Score"])
-
-    # 7. 결과 리스트 생성
+    # 6. 결과 리스트 생성 (utility_score / grade / allocation)
     final_results = []
-    for _, row in df_all.iterrows():
+    for _, row in sizing_df.iterrows():
         res = {
-            "Rank": int(row.get("선정순위_원본", row["선정순위"])),
+            "Rank": int(row.get("선정순위_원본", row.get("선정순위", 0))),
             "Name": row["종목명"],
             "Theme": row["테마_섹터"],
             "Scenario": row["차트분석"],
-            "Score": row["Score"],
-            "Decision": row["Decision"],
+            "RankScore": round(float(row.get("rank_score", 0.0)), 4),
+            "Utility": round(float(row["utility_score"]), 4),
+            "Grade": row["grade"],
+            "Alloc%": round(float(row["allocation"]) * 100.0, 2),
             "kospi": row.get("kospi", 0),
             "kosdaq": row.get("kosdaq", 0),
             "Applied_Rate": row["등락률"],
         }
         final_results.append(res)
 
-    # 8. 결과 출력
+    # 7. 결과 출력
     normal_results = [r for r in final_results if "상따" not in r["Scenario"]]
     sangdda_results = [r for r in final_results if "상따" in r["Scenario"]]
 
-    print_table(normal_results, "일반 분석 결과")
+    print_table(normal_results, "일반 분석 결과 (Dynamic Sizing)")
     print_table(sangdda_results, "상따(29.9%) 시나리오 결과", minimal=True)
 
 

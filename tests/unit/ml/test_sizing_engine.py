@@ -2,17 +2,34 @@
 
 SCENARIO: utility_score_calculation
 SCENARIO: sizing_grade_assignment
+SCENARIO: daily_position_sizing_inference
+SCENARIO: save_and_load_artifacts
+SCENARIO: load_model_artifacts_missing
 """
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
+from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
+from sklearn.calibration import CalibratedClassifierCV
 
-from src.ml.sizing_engine import apply_risk_limits, assign_sizing_grades, calculate_utility_score
+from src.ml.sizing_engine import (
+    apply_risk_limits,
+    assign_sizing_grades,
+    calculate_utility_score,
+    load_model_artifacts,
+    predict_daily_position_sizing,
+    save_model_artifacts,
+)
 
 GROUP_COL = "date"
+
+FEATURE_COLS = ["f1", "f2"]
+TARGET_COL = "target_net_return"
 
 
 def _make_utility_df(n_rows: int = 12, seed: int = 3) -> pd.DataFrame:
@@ -204,3 +221,172 @@ def test_apply_risk_limits_raises_on_missing_columns() -> None:
     graded = assign_sizing_grades(_with_utility(df, [float(i) for i in range(len(df))]))
     with pytest.raises(ValueError, match="pred_q"):
         apply_risk_limits(graded.drop(columns=["pred_q10"]))
+
+
+def _make_feature_df(n_rows: int = 30, n_dates: int = 3, seed: int = 11) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    dates = [f"2024-01-{d:02d}" for d in range(1, n_dates + 1)]
+    rows_per_date = n_rows // n_dates
+    f1 = rng.normal(size=n_rows)
+    f2 = rng.normal(size=n_rows)
+    target = 0.02 * f1 + 0.01 * f2 + rng.normal(loc=0.0, scale=0.008, size=n_rows)
+    return pd.DataFrame(
+        {
+            "date": [d for d in dates for _ in range(rows_per_date)],
+            "f1": f1,
+            "f2": f2,
+            TARGET_COL: target,
+        }
+    )
+
+
+def _build_bundle(
+    df: pd.DataFrame,
+    feature_cols: list[str] = FEATURE_COLS,
+    target_col: str = TARGET_COL,
+    group_col: str = GROUP_COL,
+) -> dict[str, object]:
+    train = df.sort_values(group_col)
+    y = train[target_col].to_numpy(dtype=np.float64)
+
+    relevance = train[target_col].groupby(train[group_col], sort=False).rank(pct=True).to_numpy()
+    relevance = (relevance * 4.0).round().astype(int)
+    group_counts = train[group_col].value_counts(sort=False).to_numpy(dtype=np.int64)
+    ranker = LGBMRanker(objective="lambdarank", random_state=42, verbosity=-1)
+    ranker.fit(train[feature_cols], relevance, group=group_counts)
+
+    quantile_models: dict[str, object] = {}
+    for col, alpha in (("pred_q10", 0.1), ("pred_q50", 0.5), ("pred_q90", 0.9)):
+        model = LGBMRegressor(objective="quantile", alpha=alpha, random_state=42, verbosity=-1)
+        model.fit(train[feature_cols], y)
+        quantile_models[col] = model
+
+    calibrators: dict[str, object] = {}
+    for name, cond in (
+        ("p_good", train[target_col] >= 0.01),
+        ("p_bad", train[target_col] <= -0.015),
+    ):
+        y_bin = cond.to_numpy().astype(bool)
+        if np.unique(y_bin).size < 2 or np.min(np.bincount(y_bin)) < 3:
+            calibrators[name] = float(np.mean(y_bin))
+            continue
+        base = LGBMClassifier(objective="binary", random_state=42, verbosity=-1)
+        calibrator = CalibratedClassifierCV(estimator=base, method="sigmoid", cv=3)
+        calibrator.fit(train[feature_cols], y_bin)
+        calibrators[name] = calibrator
+
+    return {
+        "feature_cols": list(feature_cols),
+        "target_col": target_col,
+        "group_col": group_col,
+        "rank_model": ranker,
+        "quantile_models": quantile_models,
+        "calibrators": calibrators,
+    }
+
+
+def test_predict_daily_position_sizing_returns_sizing_columns() -> None:
+    """(SCENARIO: daily_position_sizing_inference)
+    인라인 모델로 당일 스냅샷 추론 시 utility_score / grade / grade_multiplier /
+    allocation 및 rank_score / 분위수 / 확률 컬럼을 반환한다.
+    """
+    result = predict_daily_position_sizing(_make_feature_df(), FEATURE_COLS)
+    assert {"utility_score", "grade", "grade_multiplier", "allocation"}.issubset(result.columns)
+    assert {
+        "rank_score",
+        "pred_q10",
+        "pred_q50",
+        "pred_q90",
+        "p_good",
+        "p_bad",
+    }.issubset(result.columns)
+    assert result["grade"].isin(["Strong", "Good", "Weak", "Pass"]).all()
+    assert result["grade_multiplier"].isin([0.0, 0.5, 1.0, 1.5]).all()
+    assert result["allocation"].ge(0.0).all()
+    assert len(result) == len(_make_feature_df())
+
+
+def test_predict_daily_position_sizing_pass_grade_yields_zero_allocation() -> None:
+    """Pass 등급은 0.0 배분 비중을 가진다."""
+    df = _make_feature_df(n_rows=40, n_dates=4)
+    result = predict_daily_position_sizing(df, FEATURE_COLS)
+    pass_mask = result["grade"].eq("Pass")
+    assert pass_mask.any()
+    np.testing.assert_allclose(result.loc[pass_mask, "allocation"].to_numpy(), 0.0)
+    assert result.loc[pass_mask, "grade_multiplier"].eq(0.0).all()
+
+
+def test_predict_daily_position_sizing_supports_single_day() -> None:
+    df = _make_feature_df(n_rows=12, n_dates=1)
+    result = predict_daily_position_sizing(df, FEATURE_COLS)
+    assert {"utility_score", "grade", "allocation"}.issubset(result.columns)
+    assert len(result) == len(df)
+
+
+def test_predict_daily_position_sizing_is_deterministic_inline() -> None:
+    df = _make_feature_df()
+    first = predict_daily_position_sizing(df, FEATURE_COLS)
+    second = predict_daily_position_sizing(df, FEATURE_COLS)
+    pd.testing.assert_series_equal(first["utility_score"], second["utility_score"])
+    pd.testing.assert_series_equal(first["grade"], second["grade"])
+    np.testing.assert_allclose(first["allocation"].to_numpy(), second["allocation"].to_numpy())
+
+
+def test_predict_daily_position_sizing_with_preloaded_bundle() -> None:
+    """저장/로드된 모델 번들로 추론 시 저장 직전 번들과 동일한 결과를 반환한다."""
+    df = _make_feature_df()
+    bundle = _build_bundle(df)
+    result = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bundle)
+    assert {"utility_score", "grade", "allocation"}.issubset(result.columns)
+    assert result["grade"].isin(["Strong", "Good", "Weak", "Pass"]).all()
+
+
+def test_predict_daily_position_sizing_requires_group_col_and_features() -> None:
+    with pytest.raises(ValueError, match="missing feature columns"):
+        predict_daily_position_sizing(_make_feature_df(), ["f3"])
+    with pytest.raises(ValueError, match="group_col"):
+        predict_daily_position_sizing(_make_feature_df().drop(columns=[GROUP_COL]), FEATURE_COLS)
+
+
+def test_predict_daily_position_sizing_requires_target_for_inline_models() -> None:
+    df = _make_feature_df().drop(columns=[TARGET_COL])
+    with pytest.raises(ValueError, match="required to train inline models"):
+        predict_daily_position_sizing(df, FEATURE_COLS)
+
+
+def test_predict_daily_position_sizing_handles_single_class_calibrator() -> None:
+    """이진 라벨이 단일 클래스로 수렴해도 prior 상수 폴백으로 추론이 완료된다."""
+    df = _make_feature_df()
+    df[TARGET_COL] = df[TARGET_COL].abs() + 0.01  # 전부 양수 → p_bad 단일 클래스
+    result = predict_daily_position_sizing(df, FEATURE_COLS)
+    assert {"utility_score", "grade", "allocation"}.issubset(result.columns)
+    assert result["p_bad"].eq(result["p_bad"].iloc[0]).all()
+
+
+def test_save_load_artifacts_roundtrip(tmp_path) -> None:
+    """(SCENARIO: save_and_load_artifacts) 저장된 번들을 로드하면 내용이 정확히 일치한다."""
+    artifacts = {"dummy": 123, "nested": {"a": [1, 2], "b": "x"}}
+    saved_path = save_model_artifacts(artifacts, str(tmp_path))
+    assert os.path.exists(saved_path)
+    assert os.path.isabs(saved_path)
+    assert save_model_artifacts(artifacts, str(tmp_path)) == saved_path
+    reloaded = load_model_artifacts(str(tmp_path))
+    assert reloaded == artifacts
+
+
+def test_save_model_artifacts_creates_directory(tmp_path) -> None:
+    target = tmp_path / "nested" / "models"
+    saved_path = save_model_artifacts({"dummy": 1}, str(target))
+    assert target.is_dir()
+    assert os.path.exists(saved_path)
+
+
+def test_load_model_artifacts_missing_directory_raises(tmp_path) -> None:
+    """(SCENARIO: load_model_artifacts_missing) 존재하지 않는 디렉터리/번들에 대해
+    FileNotFoundError 를 발생시킨다."""
+    with pytest.raises(FileNotFoundError):
+        load_model_artifacts(str(tmp_path / "no_such_dir"))
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    with pytest.raises(FileNotFoundError):
+        load_model_artifacts(str(empty_dir))
