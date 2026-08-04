@@ -143,7 +143,7 @@ _TARGET_NAMES: tuple[str, ...] = ("target_return", "target_rank", "target_good",
 
 
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """원본 컬럼명을 표준 snake_case 식별자로 1:1 매핑 정규화합니다."""
+    """원본 컬럼명을 표준 snake_case 식별자로 1:1 매핑 정규화하고 문자열 수치 피처를 정제합니다."""
     df = df.rename(columns=COLUMN_MAP)
 
     if "trade_date" in df.columns:
@@ -154,6 +154,14 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
         )
     for col in _NUMERIC_COLUMNS:
         if col in df.columns:
+            if df[col].dtype == object or isinstance(df[col].dtype, pd.StringDtype):
+                df[col] = (
+                    df[col]
+                    .astype(str)
+                    .str.replace("%", "", regex=False)
+                    .str.replace(",", "", regex=False)
+                    .str.strip()
+                )
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
