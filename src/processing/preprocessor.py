@@ -13,6 +13,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.ml.sizing_engine import ROUND_TRIP_COST_RATIO
 from src.processing.legacy_mapping import DATE_COL, RENAME_MAP  # noqa: F401  (하위 호환성 re-export)
 
 # 원본 컬럼명 -> 정규화 컬럼명 1:1 매핑 (스프레드시트 특수문자/단위 제거)
@@ -253,9 +254,15 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def create_multi_targets(df: pd.DataFrame) -> pd.DataFrame:
-    """회귀/랭킹/분류 3종 타깃 변수를 생성합니다."""
+    """회귀/랭킹/분류 3종 타깃 변수를 생성합니다.
+
+    ``net_return``(gross)에서 왕복 거래 비용(``ROUND_TRIP_COST_RATIO``, 0.20%)을
+    차감한 순수익(net-of-cost) 기준으로 회귀/분류 타깃을 인코딩합니다.
+    ``target_rank`` 는 그룹 내 상대순위로 상수 이동에 불변하므로 그대로 둡니다.
+    """
     df = df.copy()
-    df["target_return"] = df["net_return"].clip(-10.0, 10.0)
+    net_of_cost = df["net_return"] - ROUND_TRIP_COST_RATIO * 100.0
+    df["target_return"] = net_of_cost.clip(-10.0, 10.0)
 
     def assign_daily_rank(group_df: pd.DataFrame) -> pd.Series:
         n = len(group_df)
@@ -275,8 +282,8 @@ def create_multi_targets(df: pd.DataFrame) -> pd.DataFrame:
     for _, group_df in df.groupby("trade_date", sort=False):
         rank_map.update(assign_daily_rank(group_df).to_dict())
     df["target_rank"] = pd.Series(rank_map, dtype="int64").reindex(df.index)
-    df["target_good"] = (df["net_return"] >= 1.0).astype(int)
-    df["target_bad"] = (df["net_return"] <= -2.0).astype(int)
+    df["target_good"] = (net_of_cost >= 1.0).astype(int)
+    df["target_bad"] = (net_of_cost <= -2.0).astype(int)
     return df
 
 def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:

@@ -18,6 +18,9 @@ from sklearn.calibration import CalibratedClassifierCV
 
 _PREDICTION_COLS = ("pred_q10", "pred_q50", "pred_q90", "p_good", "p_bad")
 
+# 왕복 거래 비용 (매수/매도 수수료 0.028% + 매도 거래세 0.15% + 슬리피지 0.022% ≈ 0.20%).
+ROUND_TRIP_COST_RATIO: float = 0.0020
+
 _BUNDLE_FILENAME = "sizing_pipeline_bundle.joblib"
 _QUANTILE_COLS = ("pred_q10", "pred_q50", "pred_q90")
 _QUANTILE_ALPHAS = (0.10, 0.50, 0.90)
@@ -48,16 +51,18 @@ def calculate_utility_score(
     df: pd.DataFrame,
     lambda_risk: float = 0.5,
     gamma_uncertainty: float = 0.1,
-    w_good: float = 0.5,
-    w_bad: float = 0.5,
+    w_good: float = 0.01,
+    w_bad: float = 0.01,
+    round_trip_cost: float = ROUND_TRIP_COST_RATIO,
 ) -> pd.Series:
     """하방위험/불확실성 패널티가 적용된 종합 Utility Score 를 산출합니다.
 
-    U_i = q50_i - lambda·max(0, -q10_i) - gamma·(q90_i - q10_i)
+    U_i = (q50_i - cost) - lambda·max(0, -(q10_i - cost)) - gamma·(q90_i - q10_i)
           + w_good·p_good_i - w_bad·p_bad_i
 
-    기본 위험 패널티(``lambda_risk=0.5``, ``gamma_uncertainty=0.1``)는
-    Utility Score 를 현실적인 위험조정수익률(% 단위) 스케일에 유지합니다.
+    ``round_trip_cost``(기본 0.20%)를 기대수익 q50 과 하방위험 기준 q10 에서
+    공제해 순유틸리티(net-of-cost) 기준으로 산출하며, 확률 가중치
+    (``w_good``/``w_bad``)는 수익률 스케일과 정렬된 소량 가산치입니다.
     """
     missing = [col for col in _PREDICTION_COLS if col not in df.columns]
     if missing:
@@ -67,9 +72,11 @@ def calculate_utility_score(
     q90 = df["pred_q90"].to_numpy(dtype=np.float64)
     p_good = df["p_good"].to_numpy(dtype=np.float64)
     p_bad = df["p_bad"].to_numpy(dtype=np.float64)
-    downside = lambda_risk * np.maximum(0.0, -q10)
+    net_q50 = q50 - round_trip_cost
+    net_q10 = q10 - round_trip_cost
+    downside = lambda_risk * np.maximum(0.0, -net_q10)
     uncertainty = gamma_uncertainty * (q90 - q10)
-    utility = q50 - downside - uncertainty + w_good * p_good - w_bad * p_bad
+    utility = net_q50 - downside - uncertainty + w_good * p_good - w_bad * p_bad
     return pd.Series(utility, index=df.index, name="utility_score")
 
 
@@ -77,18 +84,21 @@ def assign_sizing_grades(
     df: pd.DataFrame,
     utility_col: str = "utility_score",
     group_col: str = "date",
-    min_good_utility: float = 0.0,
-    min_weak_utility: float = -2.0,
+    min_good_utility: float = 0.0030,
+    min_weak_utility: float = 0.0010,
+    round_trip_cost: float = ROUND_TRIP_COST_RATIO,
 ) -> pd.DataFrame:
     """그룹(날짜) 내 Utility Score 백분위 + 절대 임계값 혼합(Hybrid) 등급 부여.
 
-    상대백분위(pct)와 절대 Utility Score, 기대수익(q50) 을 동시에 만족해야
-    해당 등급을 부여합니다 (Relative Evaluation Trap 방지):
+    상대백분위(pct)와 절대 Utility Score, 순 기대수익(net_q50) 을 동시에 만족해야
+    해당 등급을 부여합니다 (Relative Evaluation Trap 방지). ``net_q50 =
+    pred_q50 - round_trip_cost`` 로 거래 비용 차감 후에도 순 기대수익이 양수인
+    종목만 거래 후보로 승인합니다.
 
-    - Strong: ``pct >= 0.90`` AND ``utility >= min_good_utility`` AND ``q50 > 0``
-    - Good:   ``pct >= 0.75`` AND ``utility >= min_weak_utility`` AND ``q50 > 0``
-    - Weak:   ``pct >= 0.50`` AND ``utility >= 0.0`` AND ``q50 > 0``
-    - Pass:   절대 임계값 미달 또는 ``pct < 0.50`` 인 후보 (배수 0.0)
+    - Strong: ``pct >= 0.90`` AND ``utility >= min_good_utility`` AND ``net_q50 > 0``
+    - Good:   ``pct >= 0.75`` AND ``utility >= min_weak_utility`` AND ``net_q50 > 0``
+    - Weak:   ``pct >= 0.50`` AND ``utility >= min_weak_utility`` AND ``net_q50 > 0``
+    - Pass:   절대 임계값 미달 또는 ``net_q50 <= 0`` 또는 ``pct < 0.50`` (배수 0.0)
     """
     if utility_col not in df.columns:
         raise ValueError(f"utility_col {utility_col!r} is missing in df")
@@ -103,12 +113,14 @@ def assign_sizing_grades(
         pct = out.loc[idx, utility_col].rank(pct=True, method="average").to_numpy()
         strong = (pct >= _STRONG_PCT) & (u >= min_good_utility)
         good = (pct >= _GOOD_PCT) & (u >= min_weak_utility)
-        weak = (pct >= _WEAK_PCT) & (u >= 0.0)
+        weak = (pct >= _WEAK_PCT) & (u >= min_weak_utility)
         if has_q50:
-            positive = out.loc[idx, "pred_q50"].to_numpy(dtype=np.float64) > 0.0
-            strong = strong & positive
-            good = good & positive
-            weak = weak & positive
+            net_positive = (
+                out.loc[idx, "pred_q50"].to_numpy(dtype=np.float64) - round_trip_cost > 0.0
+            )
+            strong = strong & net_positive
+            good = good & net_positive
+            weak = weak & net_positive
         grades.extend(np.select([strong, good, weak], ["Strong", "Good", "Weak"], default="Pass").tolist())
     out["grade"] = grades
     out["grade_multiplier"] = out["grade"].map(_GRADE_MULTIPLIERS).to_numpy(dtype=np.float64)
@@ -124,18 +136,20 @@ def apply_risk_limits(
     group_col: str = "date",
     utility_col: str = "utility_score",
 ) -> pd.DataFrame:
-    """등급 배수 * 변동성 역가중 비중을 산정하고 위험 한도를 적용합니다.
+    """등급 배수 * 변동성 역가중 * Utility Magnitude 비중을 산정하고 위험 한도를 적용합니다.
 
-    Position_i = BaseBudget * GradeMultiplier_i * (TargetVol / sigma_i)
+    Position_i = BaseBudget * GradeMultiplier_i * (TargetVol / sigma_i) * utility_scaling_i
 
-    ``sigma_i`` 는 모델 불확실성 프록시인 분위수 스프레드(q90 - q10)로 추정하며,
-    그룹별 합계를 ``max_total_allocation`` 으로, 개별 비중을
-    ``max_position_pct`` 로 클리핑합니다.
+    ``utility_scaling_i = clip(utility_i / 0.01, 0.1, 1.5)`` 로 Utility Score 의
+    절대적 크기를 비중에 반영하며, ``sigma_i`` 는 모델 불확실성 프록시인
+    분위수 스프레드(q90 - q10)로 추정합니다. 그룹별 합계를 ``max_total_allocation``
+    으로, 개별 비중을 ``max_position_pct`` 로 클리핑하고, 비용 차감 후 음수
+    순유틸리티 종목은 비중 0% 로 강제합니다.
 
     시장 국면 방어: 그룹 후보 유니버스의 평균 Utility Score 가 음수이면
     ``max_total_allocation`` 을 ``max(1 + avg_utility, 0)`` 비율로 축소하여
     불리한 시장 국면에서 자본을 보호합니다. ``utility_col`` 이 없으면
-    방어 로직 없이 기존 한도만 적용합니다.
+    방어/크기 가중 없이 기존 한도만 적용합니다.
     """
     if "grade_multiplier" not in df.columns:
         raise ValueError("grade_multiplier is missing in df; run assign_sizing_grades first")
@@ -145,11 +159,18 @@ def apply_risk_limits(
     out = df.copy()
     sigma = np.maximum((out["pred_q90"] - out["pred_q10"]).to_numpy(dtype=np.float64), 1e-8)
     multiplier = out["grade_multiplier"].to_numpy(dtype=np.float64)
-    raw = base_budget * multiplier * (target_vol / sigma)
-    allocation = np.zeros_like(raw)
-    group_utility = (
-        out[utility_col].to_numpy(dtype=np.float64) if utility_col in out.columns else None
+    has_utility = utility_col in out.columns
+    utility = (
+        out[utility_col].to_numpy(dtype=np.float64)
+        if has_utility
+        else np.zeros(len(out), dtype=np.float64)
     )
+    utility_scaling = (
+        np.clip(utility / 0.01, 0.1, 1.5) if has_utility else np.ones(len(out), dtype=np.float64)
+    )
+    raw = base_budget * multiplier * (target_vol / sigma) * utility_scaling
+    allocation = np.zeros_like(raw)
+    group_utility = utility if has_utility else None
     for idx in out.groupby(group_col, sort=False).groups.values():
         pos = out.index.get_indexer(idx)
         group_raw = raw[pos]
@@ -164,6 +185,8 @@ def apply_risk_limits(
         scale = min(1.0, effective_max_total / total)
         scaled = np.minimum(group_raw * scale, max_position_pct)
         allocation[pos] = scaled
+    if has_utility:
+        allocation[utility < 0.0] = 0.0
     out["allocation"] = allocation
     return out
 
