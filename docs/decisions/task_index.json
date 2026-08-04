@@ -1,0 +1,14 @@
+{
+  "tasks": [
+    {
+      "task_id": "TASK_ML_DATA_PREPROCESS_V2",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ML_DATA_PREPROCESS_V2",
+      "domain": "ml_data",
+      "title": "Parquet 기반 ML 데이터 전처리 및 피처/다중타깃 엔진 v2 구축",
+      "why": "스프레드시트 괄호/단위 열 이름 혼선 제거, 15:19~20 매수가격 기준 정합성 보장, docs/plan.md 명세에 맞춘 랭킹/회귀/확률 다중 타깃 및 횡단면 백분위 피처 구축",
+      "resolution": "preprocessor_v2.py 모듈 작성, 매수체결가 등락률(buy_price_change_rate) 및 상대 지표 포함, 5단계 ranking/clipped return/binary target 생성 구현 및 테스트 통과",
+      "impact": "데이터 누수 완전 차단, 괄호 열 이름 정규화, LightGBM/CatBoost 다중 타깃 지원 전처리 파이프라인 정립"
+    }
+  ]
+}
