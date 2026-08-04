@@ -81,7 +81,7 @@ def test_load_and_preprocess_data_exits_on_missing_file() -> None:
 def test_load_and_preprocess_data_exits_on_read_error() -> None:
     with (
         patch.object(predict_position.os.path, "exists", return_value=True),
-        patch.object(predict_position.pd, "read_excel", side_effect=OSError("boom")),
+        patch.object(predict_position.pd, "read_csv", side_effect=OSError("boom")),
         patch.object(predict_position.sys, "exit", side_effect=SystemExit),
         pytest.raises(SystemExit),
     ):
@@ -100,7 +100,7 @@ def test_load_and_preprocess_data_normalizes_columns() -> None:
     )
     with (
         patch.object(predict_position.os.path, "exists", return_value=True),
-        patch.object(predict_position.pd, "read_excel", return_value=raw),
+        patch.object(predict_position.pd, "read_csv", return_value=raw),
     ):
         result = predict_position.load_and_preprocess_data("fake.xlsx")
     assert result["종목코드"].tolist() == ["000123", "000456"]
@@ -115,7 +115,7 @@ def test_load_and_preprocess_data_without_listing_days() -> None:
     )
     with (
         patch.object(predict_position.os.path, "exists", return_value=True),
-        patch.object(predict_position.pd, "read_excel", return_value=raw),
+        patch.object(predict_position.pd, "read_csv", return_value=raw),
     ):
         result = predict_position.load_and_preprocess_data("fake.xlsx")
     assert len(result) == 1
@@ -126,7 +126,7 @@ def test_load_and_preprocess_data_filters_insufficient_listing_days() -> None:
     raw = pd.DataFrame({"종목코드": ["000001"], "(상장일수)": ["1"]})
     with (
         patch.object(predict_position.os.path, "exists", return_value=True),
-        patch.object(predict_position.pd, "read_excel", return_value=raw),
+        patch.object(predict_position.pd, "read_csv", return_value=raw),
     ):
         result = predict_position.load_and_preprocess_data("fake.xlsx")
     assert result.empty

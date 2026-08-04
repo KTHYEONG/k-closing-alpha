@@ -193,6 +193,11 @@ class Settings(BaseSettings):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def CONDITION_CSV_PATH(self) -> Path:
+        return self.DATA_DIR / f"condition_{self.TARGET_CONDITION_NAME}.csv"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def CONDITION_EXCEL_PATH(self) -> Path:
         return self.DATA_DIR / f"condition_{self.TARGET_CONDITION_NAME}.xlsx"
 
@@ -291,6 +296,7 @@ HISTORY_DB_PATH = settings.HISTORY_DB_PATH
 HISTORY_CSV_PATH = settings.HISTORY_CSV_PATH
 LABEL_ENCODER_PATH = settings.LABEL_ENCODER_PATH
 MODEL_PATH = settings.MODEL_PATH
+CONDITION_CSV_PATH = settings.CONDITION_CSV_PATH
 CONDITION_EXCEL_PATH = settings.CONDITION_EXCEL_PATH
 
 # 스펙 하위 호환 별칭 (소문자)

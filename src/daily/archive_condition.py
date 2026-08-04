@@ -153,7 +153,10 @@ def main():
     history_dir.mkdir(parents=True, exist_ok=True)
 
     clean_name = TARGET_CONDITION_NAME.replace("/", "_").replace("\\", "_")
-    latest_path = str(settings.DATA_DIR / f"condition_{clean_name}.xlsx")
+    # 표준 CSV(utf-8-sig) 경로 우선 인식, 레거시 xlsx 폴백
+    csv_latest = str(settings.CONDITION_CSV_PATH)
+    xlsx_latest = str(settings.DATA_DIR / f"condition_{clean_name}.xlsx")
+    latest_path = csv_latest if os.path.exists(csv_latest) else xlsx_latest
     history_csv = str(settings.HISTORY_CSV_PATH)
     history_db = str(settings.HISTORY_DB_PATH)
 
@@ -176,7 +179,10 @@ def main():
         return
 
     # 전날 결과 불러오기
-    df = pd.read_excel(latest_path)
+    if latest_path.endswith(".csv"):
+        df = pd.read_csv(latest_path, encoding="utf-8-sig")
+    else:
+        df = pd.read_excel(latest_path)
 
     # 파일 수정 시각을 스냅샷 시각으로 사용 (없으면 현재 시각)
     snap_dt = datetime.fromtimestamp(os.path.getmtime(latest_path))

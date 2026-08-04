@@ -24,6 +24,7 @@ def test_models_dir_under_artifacts() -> None:
 def test_derived_paths_based_on_base_dir(tmp_path: Path) -> None:
     settings = Settings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data")
     assert tmp_path / "data" / "stock.db" == settings.STOCK_DB_PATH
+    assert tmp_path / "data" / "condition_종가매매.csv" == settings.CONDITION_CSV_PATH
     assert tmp_path / "data" / "condition_종가매매.xlsx" == settings.CONDITION_EXCEL_PATH
     assert settings.MODEL_PATH == settings.MODELS_DIR / "best_stock_rg_cat.joblib"
 
