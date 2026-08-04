@@ -35,6 +35,14 @@ _GRADE_MULTIPLIERS: dict[str, float] = {
     "Pass": 0.0,
 }
 
+# LightGBM Booster 는 문자열/범주형 object 컬럼을 입력으로 허용하지 않으므로
+# 학습 피처에서 완전히 제외합니다 (preprocessor._CATEGORICAL_COLUMNS 와 동일).
+_CATEGORICAL_FEATURE_COLS: tuple[str, ...] = (
+    "market_type",
+    "theme_sector",
+    "chart_analysis",
+)
+
 
 def calculate_utility_score(
     df: pd.DataFrame,
@@ -185,7 +193,14 @@ def _train_inline_bundle(
     LGBMRanker(랭킹) + Quantile Regressor(q10/q50/q90) + Calibrated Classifier
     (p_good/p_bad) 5종 모델을 포함하며, ``predict_daily_position_sizing`` 의
     인라인 추론(``models_bundle=None``)과 학습 모드 저장에 사용됩니다.
+
+    문자열/범주형 컬럼(``market_type``, ``theme_sector``, ``chart_analysis``)은
+    Booster 구성 시 ValueError 를 유발하므로 ``feature_cols`` 에서 제외됩니다.
     """
+    feature_cols = [col for col in feature_cols if col not in _CATEGORICAL_FEATURE_COLS]
+    if not feature_cols:
+        raise ValueError("feature_cols is empty after excluding categorical columns")
+
     train = df.sort_values(group_col)
     y = train[target_col].to_numpy(dtype=np.float64)
 
