@@ -1,11 +1,38 @@
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 
 import aiohttp
 
 from src import settings
+
+logger = logging.getLogger(__name__)
+
+
+class AsyncRateLimiter:
+    """한국투자증권 REST API 요청용 비동기 레이트 리미터 (슬라이딩 윈도우)."""
+
+    def __init__(self, max_rate: float = 18.0, time_period: float = 1.0):
+        self.max_rate = max_rate
+        self.time_period = time_period
+        self._timestamps: list[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        """Rate limit 초과 시 대기 후 권한 획득."""
+        import time
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._timestamps = [t for t in self._timestamps if now - t < self.time_period]
+                if len(self._timestamps) < self.max_rate:
+                    self._timestamps.append(now)
+                    return
+                sleep_time = self._timestamps[0] + self.time_period - now
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
 
 
 class KisApiClient:
@@ -26,8 +53,9 @@ class KisApiClient:
         self.token = None
         self.token_file = str(token_file or settings.TOKEN_FILE)
         self._market_div_cache = {}
-        # 동시성 제어를 위한 세마포어 (더 보수적으로 10으로 조정)
+        # 동시성 및 레이트 리밋 제어를 위한 세마포어와 AsyncRateLimiter
         self.semaphore = asyncio.Semaphore(10)
+        self.rate_limiter = AsyncRateLimiter(max_rate=18.0, time_period=1.0)
 
     def create_session(self) -> aiohttp.ClientSession:
         """최적화된 커넥터를 가진 세션을 생성합니다."""
@@ -176,6 +204,7 @@ class KisApiClient:
         """재시도 로직을 포함한 공통 요청 처리 (네트워크 에러 처리 강화)"""
         import aiohttp
         
+        await self.rate_limiter.acquire()
         for attempt in range(5):
             try:
                 async with session_method(url, **kwargs) as resp:
@@ -193,7 +222,12 @@ class KisApiClient:
                 # 네트워크 연결 에러 시 지수 백오프로 재시도
                 if attempt < 4:  # 마지막 시도가 아니면
                     wait_time = 0.5 * (2 ** attempt)  # 0.5초, 1초, 2초, 4초
-                    print(f"\n⚠️  네트워크 에러 ({type(e).__name__}), {wait_time:.1f}초 후 재시도... ({attempt+1}/5)")
+                    logger.warning(
+                        "네트워크 에러 (%s), %.1f초 후 재시도... (%d/5)",
+                        type(e).__name__,
+                        wait_time,
+                        attempt + 1,
+                    )
                     await asyncio.sleep(wait_time)
                     continue
                 else:
@@ -438,7 +472,7 @@ async def fetch_index_and_calculate_volatility(index_code="1028", session=None):
                     
                     # 연율화 HV
                     hv_today = std * np.sqrt(252) * 100
-                    
+
                     # 어제 HV 계산 (전일 대비 변화율용)
                     if len(df) >= 22:
                         prev_returns = df['log_ret'].iloc[-21:-1]
@@ -447,9 +481,9 @@ async def fetch_index_and_calculate_volatility(index_code="1028", session=None):
                         hv_change = (hv_today - hv_yesterday) / hv_yesterday if hv_yesterday != 0 else 0
                     else:
                         hv_change = 0
-                    
+
                     return hv_today, hv_change
-        
+
         return 0.0, 0.0
 
     finally:
@@ -500,10 +534,14 @@ async def calculate_stock_sma(stock_code, sma_period=120, lookback_days=200, ses
             if resp.get('rt_cd') != '0':
                 if chunk == 0:
                     # 첫 번째 호출 실패면 전체 실패
-                    print(
-                        f"\n[SMA Debug] {stock_code} 일봉 조회 실패: "
-                        f"rt_cd={resp.get('rt_cd')}, msg={resp.get('msg1', 'N/A')}, "
-                        f"range={start_date}~{end_date}, chunk={chunk}"
+                    logger.warning(
+                        "[SMA Debug] %s 일봉 조회 실패: rt_cd=%s, msg=%s, range=%s~%s, chunk=%s",
+                        stock_code,
+                        resp.get('rt_cd'),
+                        resp.get('msg1', 'N/A'),
+                        start_date,
+                        end_date,
+                        chunk,
                     )
                     return 0.0, False
                 else:
@@ -545,7 +583,9 @@ async def calculate_stock_sma(stock_code, sma_period=120, lookback_days=200, ses
         return float(sma_value), True
             
     except Exception as e:
-        print(f"\n[SMA Debug] {stock_code} SMA 계산 예외: {type(e).__name__}: {e}")
+        logger.warning(
+            "[SMA Debug] %s SMA 계산 예외: %s: %s", stock_code, type(e).__name__, e
+        )
         return 0.0, False
     finally:
         if local_session:
@@ -581,19 +621,25 @@ async def calculate_stock_ema(stock_code, ema_period=20, lookback_days=60, sessi
         )
         
         if resp.get('rt_cd') != '0':
-            print(
-                f"\n[EMA Debug] {stock_code} 일봉 조회 실패: "
-                f"rt_cd={resp.get('rt_cd')}, msg={resp.get('msg1', 'N/A')}, "
-                f"range={start_date}~{end_date}"
+            logger.warning(
+                "[EMA Debug] %s 일봉 조회 실패: rt_cd=%s, msg=%s, range=%s~%s",
+                stock_code,
+                resp.get('rt_cd'),
+                resp.get('msg1', 'N/A'),
+                start_date,
+                end_date,
             )
             return 0.0, False, 0
         
         items = resp.get('output2', [])
         if not items:
-            print(
-                f"\n[EMA Debug] {stock_code} 일봉 응답이 비어 있음: "
-                f"rt_cd={resp.get('rt_cd')}, msg={resp.get('msg1', 'N/A')}, "
-                f"range={start_date}~{end_date}"
+            logger.warning(
+                "[EMA Debug] %s 일봉 응답이 비어 있음: rt_cd=%s, msg=%s, range=%s~%s",
+                stock_code,
+                resp.get('rt_cd'),
+                resp.get('msg1', 'N/A'),
+                start_date,
+                end_date,
             )
         
         # 데이터 파싱
@@ -622,7 +668,9 @@ async def calculate_stock_ema(stock_code, ema_period=20, lookback_days=60, sessi
         return float(ema_value), True, len(df)
             
     except Exception as e:
-        print(f"\n[EMA Debug] {stock_code} EMA 계산 예외: {type(e).__name__}: {e}")
+        logger.warning(
+            "[EMA Debug] %s EMA 계산 예외: %s: %s", stock_code, type(e).__name__, e
+        )
         return 0.0, False, 0
     finally:
         if local_session:
@@ -695,20 +743,78 @@ async def calculate_multiple_emas(stock_code, periods=[5, 10, 20], lookback_days
             await session.close()
 
 
-async def calculate_all_moving_averages(stock_code, session=None):
+async def prefetch_ohlcv_for_sma120(
+    codes: list[str],
+    session: aiohttp.ClientSession,
+    client: KisApiClient,
+) -> dict[str, list[dict[str, str]]]:
+    """SMA120 계산용 OHLCV 이력을 사전 일괄 병렬 선조회한다.
+
+    최근 200역일 범위를 단일 청크로 종목당 1회 호출하여 150건 이상의 데이터를
+    확보한다. 실패한 종목은 반환 dict에서 key로 제외되며 예외를 전파하지 않는다.
+    """
+    from datetime import datetime, timedelta
+
+    if not codes:
+        return {}
+
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
+
+    async def _fetch(code: str) -> tuple[str, list[dict[str, str]]] | None:
+        try:
+            await client.rate_limiter.acquire()
+            resp = await client.get_stock_ohlcv_history(
+                session, code, start_date, end_date
+            )
+            if resp.get("rt_cd") != "0":
+                return None
+            records = [
+                {"date": item.get("stck_bsop_date", ""), "close": item.get("stck_clpr", "")}
+                for item in resp.get("output2", [])
+            ]
+            records = [r for r in records if r["date"] and r["close"]]
+            return (code, records) if records else None
+        except Exception as e:
+            logger.warning("[OHLCV Prefetch] %s: %s: %s", code, type(e).__name__, e)
+            return None
+
+    results = await asyncio.gather(*[_fetch(code) for code in codes])
+    pairs = [item for item in results if item is not None]
+    return dict(pairs)
+
+
+async def calculate_all_moving_averages(
+    stock_code: str,
+    session: aiohttp.ClientSession | None = None,
+    client: KisApiClient | None = None,
+    prefetched_records: list[dict[str, str]] | None = None,
+) -> tuple:
     """한 종목의 여러 이동평균(EMA 5/10/20, SMA 60/120)을 최소한의 API 호출로 통합 계산함.
     TPS 부하를 줄이기 위해 중복되는 OHLCV 데이터를 한 번에 가져와서 메모리에서 계산함.
+    ``prefetched_records``가 주어지면 API 호출 없이 전달된 이력 레코드로만 계산한다.
     """
     import asyncio
     from datetime import datetime, timedelta
 
     import pandas as pd
 
-    client = KisApiClient()
     all_records = []
     local_session = False
 
-    if session is None:
+    if prefetched_records is not None:
+        for r in prefetched_records:
+            date = r.get("date")
+            close = r.get("close")
+            if not date:
+                continue
+            try:
+                close_val = float(close)
+            except (TypeError, ValueError):
+                continue
+            if close_val > 0:
+                all_records.append({"date": date, "close": close_val})
+    elif session is None:
         import aiohttp
         from aiohttp.resolver import ThreadedResolver
         connector = aiohttp.TCPConnector(resolver=ThreadedResolver())
@@ -716,34 +822,37 @@ async def calculate_all_moving_averages(stock_code, session=None):
         local_session = True
 
     try:
-        await client.ensure_token(session)
+        if prefetched_records is None:
+            if client is None:
+                client = KisApiClient()
+                await client.ensure_token(session)
 
-        # SMA 120까지 계산하기 위해 충분한 데이터 확보
-        for chunk in range(2):
-            end_dt = datetime.now() - timedelta(days=100 * chunk)
-            start_dt = end_dt - timedelta(days=120)
-            end_date = end_dt.strftime("%Y%m%d")
-            start_date = start_dt.strftime("%Y%m%d")
+            # SMA 120까지 계산하기 위해 충분한 데이터 확보
+            for chunk in range(2):
+                end_dt = datetime.now() - timedelta(days=100 * chunk)
+                start_dt = end_dt - timedelta(days=120)
+                end_date = end_dt.strftime("%Y%m%d")
+                start_date = start_dt.strftime("%Y%m%d")
 
-            resp = await client.get_stock_ohlcv_history(session, stock_code, start_date, end_date)
+                resp = await client.get_stock_ohlcv_history(session, stock_code, start_date, end_date)
 
-            if resp.get("rt_cd") != "0":
-                if chunk == 0:
-                    return {}, (0.0, False, 0), (0.0, False), (0.0, False)
-                break
+                if resp.get("rt_cd") != "0":
+                    if chunk == 0:
+                        return {}, (0.0, False, 0), (0.0, False), (0.0, False)
+                    break
 
-            items = resp.get("output2", [])
-            for item in items:
-                date = item.get("stck_bsop_date")
-                close = float(item.get("stck_clpr") or 0)
-                if date and close > 0:
-                    all_records.append({"date": date, "close": close})
+                items = resp.get("output2", [])
+                for item in items:
+                    date = item.get("stck_bsop_date")
+                    close = float(item.get("stck_clpr") or 0)
+                    if date and close > 0:
+                        all_records.append({"date": date, "close": close})
 
-            if len(all_records) >= 150:
-                break
+                if len(all_records) >= 150:
+                    break
 
-            if chunk < 1:
-                await asyncio.sleep(0.05)
+                if chunk < 1:
+                    await asyncio.sleep(0.05)
 
         if not all_records:
             return {}, (0.0, False, 0), (0.0, False), (0.0, False)
@@ -771,7 +880,9 @@ async def calculate_all_moving_averages(stock_code, session=None):
         return ema_res, (ema20_val, ema_success, data_count), (sma60_val, sma60_ok), (sma120_val, sma120_ok)
 
     except Exception as e:
-        print(f"\n[MA Calc Error] {stock_code}: {e}")
+        logger.warning(
+            "[MA Calc Error] %s: %s: %s", stock_code, type(e).__name__, e
+        )
         return {}, (0.0, False, 0), (0.0, False), (0.0, False)
     finally:
         if local_session:
