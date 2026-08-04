@@ -46,8 +46,8 @@ _CATEGORICAL_FEATURE_COLS: tuple[str, ...] = (
 
 def calculate_utility_score(
     df: pd.DataFrame,
-    lambda_risk: float = 1.5,
-    gamma_uncertainty: float = 0.2,
+    lambda_risk: float = 0.5,
+    gamma_uncertainty: float = 0.1,
     w_good: float = 0.5,
     w_bad: float = 0.5,
 ) -> pd.Series:
@@ -55,6 +55,9 @@ def calculate_utility_score(
 
     U_i = q50_i - lambda·max(0, -q10_i) - gamma·(q90_i - q10_i)
           + w_good·p_good_i - w_bad·p_bad_i
+
+    기본 위험 패널티(``lambda_risk=0.5``, ``gamma_uncertainty=0.1``)는
+    Utility Score 를 현실적인 위험조정수익률(% 단위) 스케일에 유지합니다.
     """
     missing = [col for col in _PREDICTION_COLS if col not in df.columns]
     if missing:
@@ -74,13 +77,18 @@ def assign_sizing_grades(
     df: pd.DataFrame,
     utility_col: str = "utility_score",
     group_col: str = "date",
+    min_good_utility: float = 0.0,
+    min_weak_utility: float = -2.0,
 ) -> pd.DataFrame:
-    """그룹(날짜) 내 Utility Score 백분위 기준 등급 및 배수를 부여합니다.
+    """그룹(날짜) 내 Utility Score 백분위 + 절대 임계값 혼합(Hybrid) 등급 부여.
 
-    - Strong: 상위 10% (배수 1.5)
-    - Good:   상위 25% (배수 1.0)
-    - Weak:   상위 50% 이면서 기대수익(q50) 양수 (배수 0.5)
-    - Pass:   기타 (배수 0.0)
+    상대백분위(pct)와 절대 Utility Score, 기대수익(q50) 을 동시에 만족해야
+    해당 등급을 부여합니다 (Relative Evaluation Trap 방지):
+
+    - Strong: ``pct >= 0.90`` AND ``utility >= min_good_utility`` AND ``q50 > 0``
+    - Good:   ``pct >= 0.75`` AND ``utility >= min_weak_utility`` AND ``q50 > 0``
+    - Weak:   ``pct >= 0.50`` AND ``utility >= 0.0`` AND ``q50 > 0``
+    - Pass:   절대 임계값 미달 또는 ``pct < 0.50`` 인 후보 (배수 0.0)
     """
     if utility_col not in df.columns:
         raise ValueError(f"utility_col {utility_col!r} is missing in df")
@@ -91,12 +99,16 @@ def assign_sizing_grades(
     has_q50 = "pred_q50" in out.columns
     grades: list[str] = []
     for idx in out.groupby(group_col, sort=False).groups.values():
+        u = out.loc[idx, utility_col].to_numpy(dtype=np.float64)
         pct = out.loc[idx, utility_col].rank(pct=True, method="average").to_numpy()
-        weak = pct >= _WEAK_PCT
+        strong = (pct >= _STRONG_PCT) & (u >= min_good_utility)
+        good = (pct >= _GOOD_PCT) & (u >= min_weak_utility)
+        weak = (pct >= _WEAK_PCT) & (u >= 0.0)
         if has_q50:
-            weak = weak & (out.loc[idx, "pred_q50"].to_numpy(dtype=np.float64) > 0.0)
-        strong = pct >= _STRONG_PCT
-        good = pct >= _GOOD_PCT
+            positive = out.loc[idx, "pred_q50"].to_numpy(dtype=np.float64) > 0.0
+            strong = strong & positive
+            good = good & positive
+            weak = weak & positive
         grades.extend(np.select([strong, good, weak], ["Strong", "Good", "Weak"], default="Pass").tolist())
     out["grade"] = grades
     out["grade_multiplier"] = out["grade"].map(_GRADE_MULTIPLIERS).to_numpy(dtype=np.float64)
@@ -110,6 +122,7 @@ def apply_risk_limits(
     max_position_pct: float = 0.25,
     max_total_allocation: float = 1.0,
     group_col: str = "date",
+    utility_col: str = "utility_score",
 ) -> pd.DataFrame:
     """등급 배수 * 변동성 역가중 비중을 산정하고 위험 한도를 적용합니다.
 
@@ -118,6 +131,11 @@ def apply_risk_limits(
     ``sigma_i`` 는 모델 불확실성 프록시인 분위수 스프레드(q90 - q10)로 추정하며,
     그룹별 합계를 ``max_total_allocation`` 으로, 개별 비중을
     ``max_position_pct`` 로 클리핑합니다.
+
+    시장 국면 방어: 그룹 후보 유니버스의 평균 Utility Score 가 음수이면
+    ``max_total_allocation`` 을 ``max(1 + avg_utility, 0)`` 비율로 축소하여
+    불리한 시장 국면에서 자본을 보호합니다. ``utility_col`` 이 없으면
+    방어 로직 없이 기존 한도만 적용합니다.
     """
     if "grade_multiplier" not in df.columns:
         raise ValueError("grade_multiplier is missing in df; run assign_sizing_grades first")
@@ -129,13 +147,21 @@ def apply_risk_limits(
     multiplier = out["grade_multiplier"].to_numpy(dtype=np.float64)
     raw = base_budget * multiplier * (target_vol / sigma)
     allocation = np.zeros_like(raw)
+    group_utility = (
+        out[utility_col].to_numpy(dtype=np.float64) if utility_col in out.columns else None
+    )
     for idx in out.groupby(group_col, sort=False).groups.values():
         pos = out.index.get_indexer(idx)
         group_raw = raw[pos]
         total = float(group_raw.sum())
         if total <= 0.0:
             continue
-        scale = min(1.0, max_total_allocation / total)
+        effective_max_total = max_total_allocation
+        if group_utility is not None:
+            avg_utility = float(group_utility[pos].mean())
+            if avg_utility < 0.0:
+                effective_max_total = max_total_allocation * max(1.0 + avg_utility, 0.0)
+        scale = min(1.0, effective_max_total / total)
         scaled = np.minimum(group_raw * scale, max_position_pct)
         allocation[pos] = scaled
     out["allocation"] = allocation

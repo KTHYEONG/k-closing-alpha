@@ -214,6 +214,28 @@ def test_apply_risk_limits_scales_down_when_total_exceeds_budget() -> None:
     assert result["allocation"].sum() <= 0.6 + 1e-9
 
 
+def test_apply_risk_limits_defensive_cap_on_negative_avg_utility() -> None:
+    """(시장 국면 방어) 후보 유니버스 평균 utility 가 음수이면
+    max_total_allocation 을 max(1 + avg_utility, 0) 비율로 축소한다."""
+    df = assign_sizing_grades(
+        _with_utility(_make_utility_df(), [-0.02 * (i + 1) for i in range(12)])
+    )
+    df["grade_multiplier"] = 1.5
+    result = apply_risk_limits(df, max_position_pct=1.0, max_total_allocation=1.0)
+    avg_utility = float(df["utility_score"].mean())
+    assert avg_utility < 0.0
+    expected_cap = max(1.0 + avg_utility, 0.0)
+    np.testing.assert_allclose(result["allocation"].sum(), expected_cap, atol=1e-6)
+
+
+def test_apply_risk_limits_no_defensive_cap_on_positive_avg_utility() -> None:
+    """평균 utility 가 양수이면 방어 축소 없이 max_total_allocation 이 적용된다."""
+    df = assign_sizing_grades(_with_utility(_make_utility_df(), [float(i) for i in range(12)]))
+    df["grade_multiplier"] = 1.5
+    result = apply_risk_limits(df, max_position_pct=1.0, max_total_allocation=1.0)
+    np.testing.assert_allclose(result["allocation"].sum(), 1.0, atol=1e-6)
+
+
 def test_apply_risk_limits_raises_on_missing_columns() -> None:
     df = _make_utility_df()
     with pytest.raises(ValueError, match="grade_multiplier"):
@@ -390,3 +412,12 @@ def test_load_model_artifacts_missing_directory_raises(tmp_path) -> None:
     empty_dir.mkdir()
     with pytest.raises(FileNotFoundError):
         load_model_artifacts(str(empty_dir))
+
+
+def test_scenario_sizing_grade_hybrid_01() -> None:
+    """[SCENARIO_SIZING_GRADE_HYBRID_01] Verifies hybrid grading demotes Strong/Good grades to Pass when utility score falls below absolute threshold."""
+    df = _with_utility(_make_utility_df(n_rows=10), [-10.0] * 10)
+    df["pred_q50"] = [0.02] * 10
+    result = assign_sizing_grades(df, min_good_utility=0.0, min_weak_utility=-2.0)
+    assert (result["grade"] == "Pass").all()
+
