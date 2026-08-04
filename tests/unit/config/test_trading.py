@@ -10,7 +10,7 @@ def test_trading_settings_defaults() -> None:
     settings = TradingSettings(_env_file=None)
     assert settings.TARGET_CONDITION_NAME == "종가매매"
     assert settings.OVERHEATED_CONDITION_NAME == "단기과열"
-    assert settings.API_SEMAPHORE_LIMIT == 4
+    assert settings.API_SEMAPHORE_LIMIT == 8
     assert settings.API_SLEEP_INTERVAL == 0.2
     assert settings.EMA_PERIOD == 20
     assert settings.SMA_PERIOD == 120
