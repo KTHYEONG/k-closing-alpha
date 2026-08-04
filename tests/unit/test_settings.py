@@ -55,3 +55,21 @@ def settings_module_base_dir() -> Path:
     from src import settings
 
     return settings.BASE_DIR
+
+
+def test_config_modularity_and_compatibility() -> None:
+    """CONFIG_MODULARITY_AND_COMPATIBILITY: Settings 싱글톤 및 도메인 config 모듈이 순환 임포트나 누락 속성 없이 로드된다."""
+    from src import settings
+    from src.config.base import PathSettings
+    from src.config.gsheet import GSheetSettings
+    from src.config.kis import KisSettings
+    from src.config.trading import TradingSettings
+
+    assert hasattr(settings, "CONDITION_CSV_PATH")
+    assert isinstance(settings.settings, Settings)
+    assert isinstance(PathSettings, type)
+    assert isinstance(KisSettings, type)
+    assert isinstance(GSheetSettings, type)
+    assert isinstance(TradingSettings, type)
+    assert settings.settings.STOCK_DB_PATH == settings.STOCK_DB_PATH
+    assert settings.settings.KIS_API_CONFIG["app_key"] == settings.KIS_API_CONFIG["app_key"]
