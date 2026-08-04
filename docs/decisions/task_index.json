@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK-MODEL-PIPELINE",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_TASK-MODEL-PIPELINE",
+      "domain": "ml",
+      "title": "ML Model Selection & Purged Walk-Forward Pipeline",
+      "why": "Establish zero-leakage Purged Group Walk-Forward CV and model evaluation",
+      "resolution": "Implemented src/ml/purged_cv.py, src/ml/model_pipeline.py and unit tests",
+      "impact": "Enables cross-validation, LightGBM ranking and backtest metric evaluation"
+    },
+    {
       "task_id": "PREPROCESSOR_MAIN_CONSOLIDATION",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_PREPROCESSOR_MAIN_CONSOLIDATION",

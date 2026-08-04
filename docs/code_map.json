@@ -46,5 +46,8 @@
   "src/utils/db_to_xlsx.py": {},
   "src/utils/display.py": {
     "testing": "tests/unit/test_display.py"
+  },
+  "src/ml/model_pipeline.py": {
+    "testing": "tests/unit/ml/test_model_pipeline.py"
   }
 }

@@ -1,0 +1,32 @@
+{
+  "feature": "model_pipeline",
+  "domain": "ml",
+  "target_file": "/home/kth/k-closing-alpha/src/ml/model_pipeline.py",
+  "symbol": "run_model_pipeline",
+  "signature": "def run_model_pipeline(df: pd.DataFrame, feature_cols: list[str], target_col: str, group_col: str, n_splits: int = 5, purge_gap: int = 1, model_type: str = 'lgb_ranker') -> dict[str, Any]",
+  "python_assertion": "assert callable(run_model_pipeline) and run_model_pipeline.__annotations__['return'] == 'dict[str, Any]'",
+  "requirements": [
+    "Strict zero-leakage Purged Group Walk-Forward CV validation",
+    "Support baseline model (Ridge) and primary model (LGBMRanker / LGBMRegressor)",
+    "Output OOF predictions with NDCG@1, NDCG@3, Rank IC and Top-k Net Return",
+    "Type annotations strict compliance with no raw print statements"
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "SCENARIO_PURGED_CV_SPLIT",
+      "target_test_file": "/home/kth/k-closing-alpha/tests/unit/ml/test_purged_cv.py",
+      "expected_behavior": "PurgedGroupTimeSeriesSplit correctly yields train/val indices without overlapping groups or purge leakage"
+    },
+    {
+      "scenario_id": "SCENARIO_MODEL_PIPELINE_TRAIN_EVAL",
+      "target_test_file": "/home/kth/k-closing-alpha/tests/unit/ml/test_model_pipeline.py",
+      "expected_behavior": "run_model_pipeline trains model over purged CV folds, produces OOF predictions and returns evaluated metrics dictionary"
+    }
+  ],
+  "wiring": {
+    "file": "/home/kth/k-closing-alpha/src/daily/predict_position.py",
+    "anchor": "from src.processing.preprocessor import build_ml_dataset",
+    "import_symbol": "from src.ml.model_pipeline import run_model_pipeline",
+    "invocation_expression": "# run_model_pipeline(df, feature_cols, target_col, group_col)"
+  }
+}
