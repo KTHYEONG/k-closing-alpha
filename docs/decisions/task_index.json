@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_EXPORT_SPREADSHEET",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_EXPORT_SPREADSHEET",
+      "domain": "utils",
+      "title": "Archive → Spreadsheet Export Utility 개편 및 export_archive.py 전면 재작성",
+      "why": "기존 db_to_xlsx.py는 구 condition_history 스키마에 종속된 dead code였으며, 스프레드시트 복사-붙여넣기에 최적화된 data/exports/ 경로 저장 유틸리티가 필요함",
+      "resolution": "db_to_xlsx.py 삭제 후 export_archive.py 생성(TSV/CSV 출력, ARCHIVE_COLUMN_ORDER 26컬럼, data/exports/ 저장), CONDITION_EXCEL_PATH 레거시 정리",
+      "impact": "스프레드시트 복사-붙여넣기 편의성 향상 및 과거 xlsx 레거시 코드 완전 정리"
+    },
+    {
       "task_id": "OHLCV_PREFETCH_SMA120",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_OHLCV_PREFETCH_SMA120",
