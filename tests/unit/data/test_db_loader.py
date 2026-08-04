@@ -1,17 +1,21 @@
-"""SQLite DB 로더 단위 테스트."""
+"""SQLite DB 로더 단위 테스트.
+
+`src.data.db_loader` 는 `src.data.data_loader` 로 전달하는 레거시 어댑터이므로,
+SQLite 경로/연결은 `data_loader` 의 `DB_PATH`/`_get_db_connection` 을 기준으로 검증합니다.
+"""
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
-from src.data import db_loader
+from src.data import data_loader, db_loader
 
 
 @pytest.fixture
 def patch_db_path(tmp_path, monkeypatch):
-    """db_loader.DB_PATH를 임시 DB로 교체합니다."""
-    import sqlite3
-
+    """data_loader 의 SQLite 경로를 임시 DB 로 교체합니다."""
     db_path = tmp_path / "stock.db"
     conn = sqlite3.connect(db_path)
     try:
@@ -46,7 +50,12 @@ def patch_db_path(tmp_path, monkeypatch):
         conn.commit()
     finally:
         conn.close()
-    monkeypatch.setattr(db_loader, "DB_PATH", str(db_path))
+    monkeypatch.setattr(data_loader.settings, "STOCK_DB_PATH", db_path)
+    monkeypatch.setattr(data_loader, "DB_PATH", str(db_path))
+    # Parquet 우선 로드를 건너뛰도록 임시 경로로 분리
+    monkeypatch.setattr(data_loader.settings, "TRADE_LOG_PARQUET_PATH", tmp_path / "trade.parquet")
+    monkeypatch.setattr(data_loader.settings, "THEME_PARQUET_PATH", tmp_path / "theme.parquet")
+    monkeypatch.setattr(data_loader.settings, "CONDITION_PARQUET_PATH", tmp_path / "condition.parquet")
     return db_path
 
 
@@ -61,14 +70,12 @@ def test_load_theme_from_db(patch_db_path) -> None:
     assert theme_map == {"005930": "반도체", "000660": "AI"}
 
 
-def test_get_db_connection_missing_file(tmp_path) -> None:
-    missing = str(tmp_path / "nope.db")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(db_loader, "DB_PATH", missing)
+def test_get_db_connection_missing_file(tmp_path, monkeypatch) -> None:
+    missing = tmp_path / "nope.db"
+    monkeypatch.setattr(data_loader.settings, "STOCK_DB_PATH", missing)
+    monkeypatch.setattr(data_loader, "DB_PATH", str(missing))
     with pytest.raises(FileNotFoundError):
-        db_loader.get_db_connection()
-    monkeypatch.undo()
+        data_loader._get_db_connection()
 
 
 def test_load_condition_data_from_db_with_date(patch_db_path) -> None:
