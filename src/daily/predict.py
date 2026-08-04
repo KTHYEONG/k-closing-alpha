@@ -2,7 +2,9 @@ import datetime
 import json
 import logging
 import os
+import re
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -14,8 +16,19 @@ logger = logging.getLogger(__name__)
 from src.data.db_loader import load_theme_from_db
 from src.data.sync_sheet_db import sync_theme_only
 from src.ml.model_pipeline import run_model_pipeline  # noqa: F401  (Purged Walk-Forward CV 학습 파이프라인 진입점)
-from src.ml.sizing_engine import load_model_artifacts, predict_daily_position_sizing
-from src.processing.preprocessor import build_ml_dataset  # noqa: F401  (파퀘 기반 학습 파이프라인 진입점)
+from src.ml.sizing_engine import (
+    _train_inline_bundle,
+    load_model_artifacts,
+    predict_daily_position_sizing,
+    save_model_artifacts,
+)
+from src.processing.preprocessor import (  # noqa: F401  (파퀘 기반 학습 파이프라인 진입점)
+    _ROBUST_Z_COLUMNS,
+    _apply_robust_z,
+    build_ml_dataset,
+    clean_column_names,
+    engineer_features,
+)
 from src.utils.display import Colors, print_table
 
 # run_model_pipeline(df, feature_cols, target_col, group_col)
@@ -193,8 +206,102 @@ def explain_predictions_with_shap(model, X_final, stock_names, top_n=3):
 
 
 # =========================================================
-# 2. 메인 실행 함수
+# 3. 메인 실행 함수 (Fast Inference + Dynamic Sizing)
 # =========================================================
+
+
+# =========================================================
+# 2. 표준 ML 피처 스키마 정합성 + 출력 포맷 헬퍼
+# =========================================================
+
+# 출력 테이블 기본 상위 후보 수 (Top N)
+_DEFAULT_TOP_N = 15
+
+# 일일 CSV(비괄호 스프레드시트 헤더) -> 표준 스프레드시트 헤더 정규화 매핑.
+# ``clean_column_names`` 이 단일 권위 매핑이 되도록, 일일 CSV 의 컬럼명을
+# preprocessor 의 COLUMN_MAP 키(괄호/단위 표기) 형태로 먼저 정규화합니다.
+_DAILY_TO_SPREADSHEET_HEADER: dict[str, str] = {
+    "시가": "(시가)",
+    "고가": "(고가)",
+    "저가": "(저가)",
+    "종가": "(종가)",
+    "전일종가": "(전일종가)",
+    "시가총액": "(시가총액, 억)",
+    "거래대금": "(거래대금, 억)",
+    "등락률": "(등락률)",
+    "선정순위": "(선정 순위)",
+    "기관_순매수": "(기관_순매수)",
+    "외국인_순매수": "(외국인_순매수)",
+    "프로그램_순매수": "(프로그램_순매수)",
+    "체결강도": "(체결강도)",
+    "시장구분": "(시장구분)",
+    "총_종목수": "(총 종목 수)",
+    "평균_거래대금": "(평균 거래대금)",
+    "kospi": "(kospi, %)",
+    "kosdaq": "(kosdaq, %)",
+    "거래량": "(거래량)",
+    "테마_섹터": "(테마/섹터)",
+    "차트분석": "(차트분석)",
+}
+
+
+def apply_standard_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
+    """당일 스냅샷을 학습 파이프라인과 1:1 동일한 표준 ML 피처 스키마로 정규화합니다.
+
+    일일 CSV 의 컬럼명을 표준 스프레드시트 헤더로 정규화한 뒤
+    ``clean_column_names`` / ``engineer_features`` / ``_apply_robust_z`` 를
+    적용합니다. 당일 스냅샷에는 존재하지 않는 ``trade_date``(오늘)와
+    ``buy_price``(전일종가 기준 중립값)를 보강하고, 표시용 메타데이터
+    (``종목명`` 등)는 보존합니다.
+    """
+    work = df.copy()
+    work = work.rename(columns=_DAILY_TO_SPREADSHEET_HEADER)
+    work = clean_column_names(work)
+    if "trade_date" not in work.columns:
+        work["trade_date"] = pd.Timestamp.today().normalize()
+    if "buy_price" not in work.columns:
+        work["buy_price"] = work["prev_close_price"]
+    work = engineer_features(work)
+    # 학습 파이프라인(build_ml_dataset)과 1:1 동일한 횡단면 Robust Z-Score
+    # 피처(change_rate_z, major_density_z 등)를 생성합니다.
+    return _apply_robust_z(work, _ROBUST_Z_COLUMNS)
+
+
+def build_result_rows(sizing_df: pd.DataFrame) -> list[dict[str, Any]]:
+    """``sizing_df`` 를 출력용 결과 리스트(display 스키마)로 변환합니다.
+
+    표준 컬럼(``selection_rank``, ``theme_sector``, ``chart_analysis``,
+    ``change_rate``)을 우선 사용하고, 레거시 한글 컬럼명을 폴백으로 지원합니다.
+    """
+    final_results: list[dict[str, Any]] = []
+    for _, row in sizing_df.iterrows():
+        res = {
+            "Rank": int(row.get("selection_rank", row.get("선정순위", 0)) or 0),
+            "Name": row.get("종목명", ""),
+            "Theme": row.get("theme_sector", row.get("테마_섹터", "")),
+            "Scenario": row.get("chart_analysis", row.get("차트분석", "")),
+            "RankScore": round(float(row.get("rank_score", 0.0)), 4),
+            "Score": round(float(row["utility_score"]), 4),
+            "Utility": round(float(row["utility_score"]), 4),
+            "Grade": row["grade"],
+            "Decision": f"{row['grade']} ({round(float(row['allocation']) * 100.0, 1)}%)",
+            "Alloc%": round(float(row["allocation"]) * 100.0, 2),
+            "kospi": row.get("kospi", 0),
+            "kosdaq": row.get("kosdaq", 0),
+            "Applied_Rate": row.get("change_rate", row.get("등락률", 0)),
+        }
+        final_results.append(res)
+    return final_results
+
+
+def select_top_actionable(
+    results: list[dict[str, Any]], top_n: int = _DEFAULT_TOP_N
+) -> list[dict[str, Any]]:
+    """Pass 등급을 제외한 액션 가능 후보 중 Utility Score 기준 상위 ``top_n`` 을 선별합니다."""
+    actionable = [r for r in results if r["Grade"] != "Pass"]
+    if not actionable:
+        return []
+    return sorted(actionable, key=lambda r: r["Score"], reverse=True)[:top_n]
 
 
 def run_daily_sizing_inference(
@@ -227,6 +334,74 @@ def run_daily_sizing_inference(
         group_col=group_col,
         models_bundle=models_bundle,
     )
+
+
+# 모델 번들 검증 상수: 단위 테스트 픽스처가 생성하는 더미 피처 패턴 및
+# 실데이터 학습 번들이 반드시 포함해야 하는 모델 키 목록.
+_DUMMY_FEATURE_PATTERN = re.compile(r"^f\d+$")
+_MODEL_BUNDLE_KEYS = ("rank_model", "quantile_models", "calibrators")
+
+
+def _is_dummy_feature_cols(feature_cols: list[str]) -> bool:
+    """더미 테스트 피처(예: ['f1', 'f2', 'f3']) 여부를 결정적으로 판별합니다."""
+    return any(_DUMMY_FEATURE_PATTERN.match(col) for col in feature_cols)
+
+
+def _is_valid_real_bundle(models_bundle: dict[str, Any]) -> bool:
+    """저장된 번들이 실데이터 학습 산출물인지 검증합니다.
+
+    실데이터 번들은 비어있지 않은 수치 피처 목록과 rank/quantile/calibrator
+    모델 키를 모두 포함해야 합니다. 더미 피처만으로 구성된 번들은 무효로
+    간주합니다.
+    """
+    feature_cols = list(models_bundle.get("feature_cols", []))
+    if not feature_cols or _is_dummy_feature_cols(feature_cols):
+        return False
+    return all(key in models_bundle for key in _MODEL_BUNDLE_KEYS)
+
+
+def train_and_save_real_model_bundle(
+    export_dir: str = "artifacts/models",
+    trade_log_path: str | os.PathLike[str] | None = None,
+    theme_path: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """``trade_log.parquet`` 실데이터로 표준 ML 번들을 학습·저장한 뒤 반환합니다.
+
+    ``build_ml_dataset`` 산출 feature_cols 에서 범주형 문자열 컬럼
+    (``market_type``, ``theme_sector``, ``chart_analysis``)을 제외한 수치
+    피처만 LightGBM 학습에 사용해 Booster 구성 오류를 방지합니다.
+    """
+    trade_log_path = str(trade_log_path or settings.TRADE_LOG_PARQUET_PATH)
+    theme_path = str(theme_path or settings.THEME_PARQUET_PATH)
+    trade_log_df = pd.read_parquet(trade_log_path)
+    theme_df = pd.read_parquet(theme_path) if os.path.exists(theme_path) else None
+    X, targets, cat_features, processed = build_ml_dataset(trade_log_df, theme_df)
+    feature_cols = [col for col in X.columns if col not in cat_features]
+    target_col = "target_return"
+    group_col = "trade_date"
+    bundle = _train_inline_bundle(
+        processed[[*feature_cols, target_col, group_col]],
+        feature_cols,
+        target_col,
+        group_col,
+    )
+    save_model_artifacts(bundle, export_dir)
+    logger.info(
+        f"{Colors.GREEN}실데이터 모델 번들 재학습·저장 완료: "
+        f"feature_cols={len(feature_cols)}개 (export_dir={export_dir}){Colors.RESET}"
+    )
+    return bundle
+
+
+def ensure_valid_model_bundle(models_bundle: dict[str, Any]) -> dict[str, Any]:
+    """더미/무효 모델 번들을 감지하면 실데이터로 재학습한 번들로 대체합니다."""
+    if _is_valid_real_bundle(models_bundle):
+        return models_bundle
+    logger.info(
+        f"{Colors.YELLOW}[Warning] 모델 번들이 더미 테스트 피처이거나 무효합니다. "
+        f"trade_log.parquet 로 실데이터 재학습을 시작합니다.{Colors.RESET}"
+    )
+    return train_and_save_real_model_bundle()
 
 
 def main():
@@ -330,12 +505,9 @@ def main():
 
     # 결과 요약
     logger.info(
-        f"{Colors.CYAN}📌 분석 대상 종목: {len(df_condition)}개 "
-        f"(시나리오 확장 포함 총 {len(df_all)}건){Colors.RESET}"
+        f"{Colors.CYAN}분석 대상: {len(df_condition)}개 종목 "
+        f"(시나리오 확장 포함 {len(df_all)}건){Colors.RESET}"
     )
-    logger.info(f"\n{Colors.CYAN}[시나리오 적용 완료]{Colors.RESET}")
-    logger.info(f"  ✅ 분석 대상: {len(df_all)}개 × 시나리오 확장")
-    logger.info("")
 
     # [New] v-kospi & v-kosdaq 피처 주입
     df_all["v_kospi"] = current_vkospi
@@ -343,140 +515,14 @@ def main():
     df_all["v_kosdaq"] = current_vkosdaq
     df_all["v_kosdaq_change"] = current_vkosdaq_change
 
-    # 4. [Feature Engineering Upgrade] 고도화된 전처리 적용
-    # preprocessor.py 와 동일한 로직을 적용하여 모델 입력 정합성 확보
-
-    # (1) 날짜 관련 피처 생성
-
-    today = datetime.datetime.now()
-    # 단일 날짜(오늘)이므로 list로 만들어서 Series 생성 후 처리
-    # 실제로는 historical 데이터가 아니므로 diff/shift 기능은 제한적이지만, 최대한 포맷 유지
-    # 영업일 로직은 단일 날짜에서는 '평일' 기준으로 가정
-
-    # 1. 주기성 인코딩
-    # 여기서는 dt 접근자 대신 단일 값 계산으로 처리
-    days_in_month_map = {
-        1: 31,
-        2: 28,
-        3: 31,
-        4: 30,
-        5: 31,
-        6: 30,
-        7: 31,
-        8: 31,
-        9: 30,
-        10: 31,
-        11: 30,
-        12: 31,
-    }
-    # 윤년 간단 처리
-    if today.year % 4 == 0 and (today.year % 100 != 0 or today.year % 400 == 0):
-        days_in_month_map[2] = 29
-
-    days_in_month = days_in_month_map.get(today.month, 30)
-
-    # [Fix] 누락된 단순 날짜 피처 추가
-    df_all["month"] = float(today.month)
-    df_all["day_of_month"] = float(today.day)
-
-    df_all["month_sin"] = np.sin(2 * np.pi * today.month / 12)
-    df_all["month_cos"] = np.cos(2 * np.pi * today.month / 12)
-    df_all["day_sin"] = np.sin(2 * np.pi * today.day / days_in_month)
-    df_all["day_cos"] = np.cos(2 * np.pi * today.day / days_in_month)
-
-    # 2. 영업일 관련 (단일 시점이라 shift 불가 -> 보수적 기본값 적용)
-    # 금요일(4)이면 다음 거래일까지 3일(토,일,월), 그 외는 1일로 가정
-    if today.weekday() == 4:  # 금요일
-        df_all["date_diff"] = 3
-    else:
-        df_all["date_diff"] = 1
-
-    # 월말 여부 (오늘이 마지막 날인지 체크)
-    is_month_end = 1 if today.day == days_in_month else 0
-    # 주말이 껴서 마지막 영업일인 경우까지 계산하긴 복잡하므로 달력 기준 근사치 사용
-    df_all["is_trading_month_end"] = is_month_end
-
-    # 3. 요일 (Categorical)
-    df_all["weekday"] = today.weekday()
-
-    # (2) 로그 스케일링 (자릿수 압축)
-    # [V1 Feature Set] 선정순위 원본값 백업 (결과 출력용) - 모델 입력에서는 제외
-    if "선정순위" in df_all.columns:
-        df_all["선정순위_원본"] = (
-            pd.to_numeric(df_all["선정순위"], errors="coerce").fillna(0).astype(int)
-        )
-
-    # [V1 Feature Set] 로그 스케일링 (선정순위 포함)
-    log_cols = ["시가총액", "거래대금", "평균_거래대금", "총_종목수", "선정순위"]
-    for col in log_cols:
-        if col in df_all.columns:
-            df_all[col] = pd.to_numeric(df_all[col], errors="coerce").fillna(0)
-            df_all[col] = np.log1p(df_all[col].clip(lower=0))
-
-    # (3) Signed Log (수급 데이터)
-    # preprocessor.py에서는 _apply_signed_log_scaling
-    signed_cols = ["기관_순매수", "외국인_순매수", "프로그램_순매수"]
-    for col in signed_cols:
-        if col in df_all.columns:
-            df_all[col] = pd.to_numeric(df_all[col], errors="coerce").fillna(0)
-            df_all[col] = np.sign(df_all[col]) * np.log1p(np.abs(df_all[col]))
-
-    # (4) 도메인 특화 비율 (Custom Ratios)
-    # 4-1. 체결강도 (100 기준 로그)
-    if "체결강도" in df_all.columns:
-        df_all["체결강도"] = pd.to_numeric(df_all["체결강도"], errors="coerce").fillna(
-            100
-        )
-        df_all["체결강도"] = np.log(df_all["체결강도"].clip(lower=1) / 100.0)
-
-    # 4-2. [V1 Feature Set] 선정순위_상대 생성 (학습 모델과 동일)
-    if "선정순위" in df_all.columns and "총_종목수" in df_all.columns:
-        rank_raw = np.expm1(df_all["선정순위"])
-        total_raw = np.expm1(df_all["총_종목수"])
-        df_all["선정순위_상대"] = rank_raw / total_raw.clip(lower=1)
-
-    # 4-3. [V1 Feature Set] 상대 등락률 & 방어 강도 (시장구분 미사용)
-    # 시장구분 피처를 사용하지 않으므로 KOSPI를 기본 참조로 사용
-    if "등락률" in df_all.columns:
-        market_ref = df_all["kospi"]
-        df_all["상대_등락률"] = df_all["등락률"] - market_ref
-        df_all["방어_강도"] = np.where(market_ref < 0, df_all["상대_등락률"], 0)
-
-    # 4-4. 상대 거래대금 (당일/평균)
-    if "거래대금" in df_all.columns and "평균_거래대금" in df_all.columns:
-        raw_trade = np.expm1(df_all["거래대금"])
-        raw_avg_trade = np.expm1(df_all["평균_거래대금"])
-        df_all["상대_거래대금"] = np.log(
-            (raw_trade + 1) / (raw_avg_trade + 1).clip(lower=1)
-        )
-
-    # 4-5. 수급 질적 분석 (메이저 밀도, 프로그램 주도성)
-    buy_cols = ["기관_순매수", "외국인_순매수", "프로그램_순매수"]
-    if all(c in df_all.columns for c in buy_cols) and "거래대금" in df_all.columns:
-        # 이미 Signed Log 변환되었으므로 복원
-        raw_inst = np.sign(df_all["기관_순매수"]) * np.expm1(
-            np.abs(df_all["기관_순매수"])
-        )
-        raw_fore = np.sign(df_all["외국인_순매수"]) * np.expm1(
-            np.abs(df_all["외국인_순매수"])
-        )
-        raw_prog = np.sign(df_all["프로그램_순매수"]) * np.expm1(
-            np.abs(df_all["프로그램_순매수"])
-        )
-        raw_trade_for_ratio = np.expm1(df_all["거래대금"]).clip(lower=1)
-
-        # 메이저 밀도 (기관+외국인)
-        df_all["메이저_밀도"] = (raw_inst + raw_fore) / raw_trade_for_ratio
-        # 프로그램 주도성
-        df_all["프로그램_주도성"] = raw_prog / raw_trade_for_ratio
-
-    # 4-6. 차트분석 피처 생성
+    # 4. [Feature Engineering] 표준 ML 피처 정합성 확보
+    # preprocessor.py 의 clean_column_names / engineer_features 를 적용하여
+    # 학습 파이프라인(models_bundle["feature_cols"])과 1:1 동일한 스키마를 생성합니다.
     df_all["차트분석"] = df_all["Scenario_Base"].astype(str)
+    df_all = apply_standard_feature_engineering(df_all)
 
     # '상따' 시나리오 일괄 적용 (기존 로직 유지)
-    df_all.loc[df_all["Scenario_Base"].str.contains("상따"), "등락률"] = 29.9
-    if "real_trade" not in df_all.columns:
-        df_all["real_trade"] = 0.0
+    df_all.loc[df_all["Scenario_Base"].str.contains("상따"), "change_rate"] = 29.9
 
     # 5. Fast Inference & Dynamic Sizing (저장된 모델 아티팩트 로드)
     # 레거시 GMM/Static 판단 로직은 제거되고, artifacts/models/ 의 모델 번들을
@@ -493,37 +539,30 @@ def main():
         )
         return
 
-    logger.info(
-        f"{Colors.GREEN}모델 아티팩트 로드 완료. Fast Inference + Dynamic Sizing 실행 중...{Colors.RESET}"
-    )
+    # 모델 번들 검증: 더미 테스트 피처('f1'/'f2'/'f3') 또는 무효 번들이면
+    # trade_log.parquet 실데이터로 자동 재학습합니다.
+    models_bundle = ensure_valid_model_bundle(models_bundle)
+
+    start = time.perf_counter()
     sizing_df = run_daily_sizing_inference(df_all, models_bundle)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    logger.info(
+        f"{Colors.GREEN}추론 완료: {len(sizing_df)}건 ({elapsed_ms:.0f}ms){Colors.RESET}"
+    )
 
     # 6. 결과 리스트 생성 (utility_score / grade / allocation)
-    final_results = []
-    for _, row in sizing_df.iterrows():
-        res = {
-            "Rank": int(row.get("선정순위_원본", row.get("선정순위", 0))),
-            "Name": row["종목명"],
-            "Theme": row["테마_섹터"],
-            "Scenario": row["차트분석"],
-            "RankScore": round(float(row.get("rank_score", 0.0)), 4),
-            "Score": round(float(row["utility_score"]), 4),
-            "Utility": round(float(row["utility_score"]), 4),
-            "Grade": row["grade"],
-            "Decision": f"{row['grade']} ({round(float(row['allocation']) * 100.0, 1)}%)",
-            "Alloc%": round(float(row["allocation"]) * 100.0, 2),
-            "kospi": row.get("kospi", 0),
-            "kosdaq": row.get("kosdaq", 0),
-            "Applied_Rate": row["등락률"],
-        }
-        final_results.append(res)
+    final_results = build_result_rows(sizing_df)
 
-    # 7. 결과 출력
+    # 7. 결과 출력 (Top N 액션 가능 후보만 표시)
     normal_results = [r for r in final_results if "상따" not in r["Scenario"]]
     sangdda_results = [r for r in final_results if "상따" in r["Scenario"]]
 
-    print_table(normal_results, "일반 분석 결과 (Dynamic Sizing)")
-    print_table(sangdda_results, "상따(29.9%) 시나리오 결과", minimal=True)
+    print_table(
+        select_top_actionable(normal_results), "일반 분석 결과 (Dynamic Sizing)"
+    )
+    print_table(
+        select_top_actionable(sangdda_results), "상따(29.9%) 시나리오 결과", minimal=True
+    )
 
 
 if __name__ == "__main__":
