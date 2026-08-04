@@ -17,7 +17,7 @@ def test_default_paths_point_to_project_root() -> None:
 def test_models_dir_under_artifacts() -> None:
     """모델 아티팩트는 artifacts/models/ 로 이관되어야 합니다."""
     settings = Settings()
-    assert str(settings.MODELS_DIR).endswith("artifacts/models")
+    assert str(settings.MODELS_DIR).replace("\\", "/").endswith("artifacts/models")
     assert settings.models_dir == settings.MODELS_DIR
 
 

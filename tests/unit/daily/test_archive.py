@@ -61,7 +61,7 @@ def _candidate_row(code: str, name: str, rank: int, date: str = "2026-08-04") ->
 
 
 def test_scenario_archive_upsert_01(tmp_archive: Path) -> None:
-    """SCENARIO_ARCHIVE_UPSERT_01: Upsert candidates DataFrame into parquet and db without duplication."""
+    """SCENARIO_ARCHIVE_UPSERT_01: Upsert candidates DataFrame into parquet and db replacing previous snapshot for same date."""
     df = pd.DataFrame(
         [
             _candidate_row("005930", "삼성전자", 1),
@@ -71,16 +71,16 @@ def test_scenario_archive_upsert_01(tmp_archive: Path) -> None:
     assert archive.upsert_archive_snapshot(df, snapshot_date="2026-08-04") == 2
 
     dup = pd.DataFrame([_candidate_row("005930", "삼성전자", 1)])
-    assert archive.upsert_archive_snapshot(dup, snapshot_date="2026-08-04") == 2
+    assert archive.upsert_archive_snapshot(dup, snapshot_date="2026-08-04") == 1
 
     parquet_df = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
-    assert len(parquet_df) == 2
-    assert set(parquet_df["종목코드"].astype(str).str.zfill(6)) == {"000660", "005930"}
+    assert len(parquet_df) == 1
+    assert set(parquet_df["종목코드"].astype(str).str.zfill(6)) == {"005930"}
 
     with sqlite3.connect(archive.settings.HISTORY_DB_PATH) as conn:
         db_df = pd.read_sql("SELECT * FROM condition_history", conn)
-    assert len(db_df) == 2
-    assert set(db_df["종목코드"].astype(str).str.zfill(6)) == {"000660", "005930"}
+    assert len(db_df) == 1
+    assert set(db_df["종목코드"].astype(str).str.zfill(6)) == {"005930"}
 
 
 def test_python_assertion_archive_upsert(tmp_archive: Path) -> None:
@@ -104,9 +104,9 @@ def test_scenario_archive_fetch_02(tmp_archive: Path) -> None:
         snapshot_date="2026-08-04",
     )
 
-    latest = archive.fetch_archive_snapshot()
-    assert latest["스냅샷_날짜"].tolist() == ["2026-08-04"]
-    assert latest.columns.tolist() == archive.ARCHIVE_COLUMN_ORDER
+    latest_month = archive.fetch_archive_snapshot()
+    assert latest_month["스냅샷_날짜"].tolist() == ["2026-08-03", "2026-08-04"]
+    assert latest_month.columns.tolist() == archive.ARCHIVE_COLUMN_ORDER
 
     specified = archive.fetch_archive_snapshot("2026-08-03")
     assert specified["스냅샷_날짜"].tolist() == ["2026-08-03"]
