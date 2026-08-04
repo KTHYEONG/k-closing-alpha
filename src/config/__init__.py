@@ -49,12 +49,12 @@ class Settings(PathSettings, KisSettings, GSheetSettings, TradingSettings):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def HISTORY_DB_PATH(self) -> Path:
-        return self.HISTORY_DIR / f"condition_history_{self.TARGET_CONDITION_NAME}.db"
+        return self.HISTORY_DIR / "archive.db"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def HISTORY_CSV_PATH(self) -> Path:
-        return self.HISTORY_DIR / f"condition_history_{self.TARGET_CONDITION_NAME}.csv"
+        return self.HISTORY_DIR / "archive.csv"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
