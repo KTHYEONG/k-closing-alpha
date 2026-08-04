@@ -165,8 +165,6 @@ async def fetch_single_stock(
         upper_limit_stock_codes = set()
 
     async with sem:
-        # 요청 간의 미세한 간격을 두어 TPS 분산 (Staggering)
-        await asyncio.sleep(settings.API_SLEEP_INTERVAL)
         code = stock["code"]
         name = stock["name"]
 
@@ -275,7 +273,7 @@ async def fetch_single_stock(
                 from src.api.kis_client import calculate_all_moving_averages
 
                 (_, (_, _, data_count), _, (sma120_val, sma120_ok)) = (
-                    await calculate_all_moving_averages(code, session=session)
+                    await calculate_all_moving_averages(code, session=session, client=client)
                 )
                 sma_value, sma_success = float(sma120_val), sma120_ok
                 if sma_success and sma_value > 0 and prev_close_price < sma_value <= close_price:
@@ -404,9 +402,11 @@ async def main():
         )
         await client.ensure_token(session)
 
-        # 2. 시장 지수 조회
-        res_kospi = await client.get_market_index_rate(session, "0001")
-        res_kosdaq = await client.get_market_index_rate(session, "1001")
+        # 2. 시장 지수 조회 (병렬 gather)
+        res_kospi, res_kosdaq = await asyncio.gather(
+            client.get_market_index_rate(session, "0001"),
+            client.get_market_index_rate(session, "1001"),
+        )
 
         kospi_rate = parse_market_index_rate(res_kospi)
         kosdaq_rate = parse_market_index_rate(res_kosdaq)
@@ -446,56 +446,44 @@ async def main():
 
         stock_list = res_cond_res.get("output2", [])
 
-        # 4-1. 단기과열 조건검색 결과 조회
-        overheated_stock_codes = set()
-        overheated_cond = next(
-            (c for c in my_conditions if c["condition_nm"] == settings.OVERHEATED_CONDITION_NAME),
-            None,
-        )
-        if overheated_cond:
-            res_overheated = await client.get_condition_result(session, overheated_cond["seq"])
-            if res_overheated.get("rt_cd") == "0":
-                overheated_stock_codes = {stock.get("code") for stock in res_overheated.get("output2", [])}
+        # 4-1~4-5. 조건검색 결과 병렬 조회 (Phase 0 최적화)
+        condition_candidates = [
+            (settings.OVERHEATED_CONDITION_NAME, "overheated"),
+            (settings.NEW_HIGH_CONDITION_NAME, "new_high"),
+            (settings.NEAR_NEW_HIGH_CONDITION_NAME, "near_new_high"),
+            (settings.UPPER_LIMIT_NEXT_DAY_CONDITION_NAME, "upper_limit_next"),
+            (settings.UPPER_LIMIT_CONDITION_NAME, "upper_limit"),
+        ]
+        cond_seq_map = {}
+        for cond_name, key in condition_candidates:
+            matched = next(
+                (c for c in my_conditions if c["condition_nm"] == cond_name),
+                None,
+            )
+            if matched:
+                cond_seq_map[key] = matched["seq"]
 
-        # 4-2. 신고가 조건검색 결과 조회
-        new_high_stock_codes = set()
-        new_high_cond = next(
-            (c for c in my_conditions if c["condition_nm"] == settings.NEW_HIGH_CONDITION_NAME), None
-        )
-        if new_high_cond:
-            res_new_high = await client.get_condition_result(session, new_high_cond["seq"])
-            if res_new_high.get("rt_cd") == "0":
-                new_high_stock_codes = {stock.get("code") for stock in res_new_high.get("output2", [])}
+        async def _fetch_condition_codes(seq):
+            if seq is None:
+                return set()
+            res = await client.get_condition_result(session, seq)
+            if res.get("rt_cd") != "0":
+                return set()
+            return {stock.get("code") for stock in res.get("output2", [])}
 
-        # 4-3. 신고가 근접 조건검색 결과 조회
-        near_new_high_stock_codes = set()
-        near_new_high_cond = next(
-            (c for c in my_conditions if c["condition_nm"] == settings.NEAR_NEW_HIGH_CONDITION_NAME), None
+        (
+            overheated_stock_codes,
+            new_high_stock_codes,
+            near_new_high_stock_codes,
+            upper_limit_next_day_stock_codes,
+            upper_limit_stock_codes,
+        ) = await asyncio.gather(
+            _fetch_condition_codes(cond_seq_map.get("overheated")),
+            _fetch_condition_codes(cond_seq_map.get("new_high")),
+            _fetch_condition_codes(cond_seq_map.get("near_new_high")),
+            _fetch_condition_codes(cond_seq_map.get("upper_limit_next")),
+            _fetch_condition_codes(cond_seq_map.get("upper_limit")),
         )
-        if near_new_high_cond:
-            res_near_new_high = await client.get_condition_result(session, near_new_high_cond["seq"])
-            if res_near_new_high.get("rt_cd") == "0":
-                near_new_high_stock_codes = {stock.get("code") for stock in res_near_new_high.get("output2", [])}
-
-        # 4-4. 상한가 다음날 조건검색 결과 조회
-        upper_limit_next_day_stock_codes = set()
-        upper_limit_next_cond = next(
-            (c for c in my_conditions if c["condition_nm"] == settings.UPPER_LIMIT_NEXT_DAY_CONDITION_NAME), None
-        )
-        if upper_limit_next_cond:
-            res_upper_next = await client.get_condition_result(session, upper_limit_next_cond["seq"])
-            if res_upper_next.get("rt_cd") == "0":
-                upper_limit_next_day_stock_codes = {stock.get("code") for stock in res_upper_next.get("output2", [])}
-
-        # 4-5. 상한가 조건검색 결과 조회
-        upper_limit_stock_codes = set()
-        upper_limit_cond = next(
-            (c for c in my_conditions if c["condition_nm"] == settings.UPPER_LIMIT_CONDITION_NAME), None
-        )
-        if upper_limit_cond:
-            res_upper_only = await client.get_condition_result(session, upper_limit_cond["seq"])
-            if res_upper_only.get("rt_cd") == "0":
-                upper_limit_stock_codes = {stock.get("code") for stock in res_upper_only.get("output2", [])}
 
         # 조건검색 결과 통합 카드 리포트 출력
         logger.info(
@@ -546,16 +534,12 @@ async def main():
             try:
                 from src.api.kis_client import fetch_index_and_calculate_volatility
 
-                # V-KOSPI (KOSPI 200: 1028)
-                vkospi_val, vkospi_chg = await fetch_index_and_calculate_volatility(
-                    "1028", session=session
+                # V-KOSPI (KOSPI 200: 1028) & V-KOSDAQ (KOSDAQ 150: 2203) 병렬 조회
+                (vkospi_val, vkospi_chg), (vkosdaq_val, vkosdaq_chg) = await asyncio.gather(
+                    fetch_index_and_calculate_volatility("1028", session=session),
+                    fetch_index_and_calculate_volatility("2203", session=session),
                 )
                 df["v_kospi"] = round(vkospi_val, 2)
-
-                # V-KOSDAQ (KOSDAQ 150: 2203)
-                vkosdaq_val, vkosdaq_chg = await fetch_index_and_calculate_volatility(
-                    "2203", session=session
-                )
                 df["v_kosdaq"] = round(vkosdaq_val, 2)
 
             except Exception:

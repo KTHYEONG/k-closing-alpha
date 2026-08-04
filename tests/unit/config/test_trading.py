@@ -11,7 +11,7 @@ def test_trading_settings_defaults() -> None:
     assert settings.TARGET_CONDITION_NAME == "종가매매"
     assert settings.OVERHEATED_CONDITION_NAME == "단기과열"
     assert settings.API_SEMAPHORE_LIMIT == 8
-    assert settings.API_SLEEP_INTERVAL == 0.2
+    assert not hasattr(settings, "API_SLEEP_INTERVAL")
     assert settings.EMA_PERIOD == 20
     assert settings.SMA_PERIOD == 120
     assert settings.CANDLE_BODY_RATIO_THRESHOLD == 0.5

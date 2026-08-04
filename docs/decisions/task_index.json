@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "COLLECT_PERF_V2",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_COLLECT_PERF_V2",
+      "domain": "daily",
+      "title": "KIS API Data Collection Speed Optimization Phase 2",
+      "why": "Further optimize collection speed under KIS 18 TPS limit by resolving AsyncRateLimiter lock-while-sleeping bug and parallelizing pre-collect condition/index API calls",
+      "resolution": "Removed API_SLEEP_INTERVAL delay, fixed AsyncRateLimiter acquire lock pattern, parallelized condition/index API calls with asyncio.gather, and passed client parameter to calculate_all_moving_averages",
+      "impact": "Eliminated redundant sleep delays and lock contention, achieving max rate limiter throughput while preserving 18 TPS safety limit"
+    },
+    {
       "task_id": "TASK_20260804_DATA_COLLECTION_OPT",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_20260804_DATA_COLLECTION_OPT",

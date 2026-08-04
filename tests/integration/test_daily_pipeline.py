@@ -351,14 +351,23 @@ class _FakeKisClient:
         return {"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "1.00"}}
 
     async def get_condition_list(self, session: object) -> dict:
+        cond_names = [
+            collect.settings.TARGET_CONDITION_NAME,
+            collect.settings.OVERHEATED_CONDITION_NAME,
+            collect.settings.NEW_HIGH_CONDITION_NAME,
+            collect.settings.NEAR_NEW_HIGH_CONDITION_NAME,
+        ]
         return {
             "rt_cd": "0",
             "output2": [
-                {"condition_nm": collect.settings.TARGET_CONDITION_NAME, "seq": 1}
+                {"condition_nm": name, "seq": idx + 1}
+                for idx, name in enumerate(cond_names)
             ],
         }
 
     async def get_condition_result(self, session: object, seq: int) -> dict:
+        if seq == 4:  # 신고가 근접 조건: 실패 응답 경로 검증
+            return {"rt_cd": "9", "msg1": "조회 실패"}
         return {
             "rt_cd": "0",
             "output2": [
