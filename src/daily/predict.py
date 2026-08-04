@@ -470,9 +470,8 @@ def main():
         # 프로그램 주도성
         df_all["프로그램_주도성"] = raw_prog / raw_trade_for_ratio
 
-    # 4-6. 차트분석 피처 생성 (학습 시 사용된 핵심 피처)
-    # 차트통과 필터링이 제거되어 전 종목이 통과(Y) 처리됨: Scenario_Base + "_Y"
-    df_all["차트분석"] = df_all["Scenario_Base"].astype(str) + "_Y"
+    # 4-6. 차트분석 피처 생성
+    df_all["차트분석"] = df_all["Scenario_Base"].astype(str)
 
     # '상따' 시나리오 일괄 적용 (기존 로직 유지)
     df_all.loc[df_all["Scenario_Base"].str.contains("상따"), "등락률"] = 29.9

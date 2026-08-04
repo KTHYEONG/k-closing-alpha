@@ -9,6 +9,7 @@ from src import settings
 
 # 커스텀 모듈 임포트
 from src.api.kis_client import KisApiClient
+from src.daily.archive import upsert_archive_snapshot
 from src.data.db_loader import load_theme_from_db
 from src.data.gsheet_loader import append_stocks_to_gsheet
 from src.utils.display import Colors
@@ -687,6 +688,9 @@ async def main():
 
             # 표준 열 순서로 utf-8-sig CSV (+ Parquet) 저장
             save_collected_condition_data(df, save_path)
+
+            # 신규 아카이브 (data/history/archive.parquet + archive.db) 누적 저장
+            upsert_archive_snapshot(df)
 
             # 수집 결과 요약 출력
             success_count = len(results) - len(failed_info)
