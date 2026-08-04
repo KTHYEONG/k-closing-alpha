@@ -84,7 +84,7 @@ def load_condition_data(date: str | None = None, limit: int | None = None) -> pd
     Returns:
         pd.DataFrame: Condition history DataFrame.
     """
-    if settings.CONDITION_PARQUET_PATH.exists():
+    if settings.HISTORY_PARQUET_PATH.exists():
         df_pq = load_condition_data_from_parquet(date=date, limit=limit)
         if not df_pq.empty:
             return df_pq

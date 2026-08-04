@@ -88,38 +88,6 @@ def load_and_preprocess_data(file_path):
         logger.info(f"{Colors.RED}CSV 파일 로드 실패: {e}{Colors.RESET}")
         sys.exit(1)
 
-    # [Fix] 최신 엑셀 컬럼명 형식(괄호 포함) 대응을 위한 rename_map 업데이트
-    rename_map = {
-        "(시가총액, 억)": "시가총액",
-        "시가총액(억)": "시가총액",
-        "(거래대금, 억)": "거래대금",
-        "거래대금(억)": "거래대금",
-        "(등락률)": "등락률",
-        "등락률": "등락률",
-        "(선정 순위)": "선정순위",
-        "순위": "선정순위",
-        "(기관_순매수)": "기관_순매수",
-        "기관_순매수(억)": "기관_순매수",
-        "(외국인_순매수)": "외국인_순매수",
-        "외국인_순매수(억)": "외국인_순매수",
-        "(프로그램_순매수)": "프로그램_순매수",
-        "프로그램_순매수(억)": "프로그램_순매수",
-        "(kospi, %)": "kospi",
-        "KOSPI등락률": "kospi",
-        "(kosdaq, %)": "kosdaq",
-        "KOSDAQ등락률": "kosdaq",
-        "(총 종목 수)": "총_종목수",
-        "전체종목수": "총_종목수",
-        "(평균 거래대금)": "평균_거래대금",
-        "평균거래대금(억)": "평균_거래대금",
-        "(차트통과)": "차트통과",
-        "(종목코드)": "종목코드",
-        "(종가)": "종가",
-        "(체결강도)": "체결강도",
-        "(시장구분)": "시장구분",
-    }
-    df.rename(columns=rename_map, inplace=True)
-
     # 종목코드 포맷팅 (6자리 zero-fill)
     if "종목코드" in df.columns:
         df["종목코드"] = df["종목코드"].apply(lambda x: str(x).zfill(6))
@@ -138,10 +106,10 @@ def load_and_preprocess_data(file_path):
             )
 
     # [New] 상장일수 부족 종목 제외 로직 (EMA 20 계산 불가능한 경우)
-    if "(상장일수)" in df.columns:
+    if "상장일수" in df.columns:
         original_count = len(df)
-        df["(상장일수)"] = pd.to_numeric(df["(상장일수)"], errors="coerce").fillna(0)
-        df = df[df["(상장일수)"] >= settings.EMA_PERIOD].copy()
+        df["상장일수"] = pd.to_numeric(df["상장일수"], errors="coerce").fillna(0)
+        df = df[df["상장일수"] >= settings.EMA_PERIOD].copy()
         filtered_count = original_count - len(df)
         if filtered_count > 0:
             logger.info(
@@ -299,8 +267,6 @@ def main():
         logger.info(f"{Colors.RED}분석 대상 종목이 없습니다.{Colors.RESET}")
         return
 
-    # 차트통과 데이터는 이미 Daily_Get_Data.py에서 SMA 120 기준으로 설정됨
-
     # [New] 실시간 V-KOSPI & V-KOSDAQ 계산
     current_vkospi, current_vkospi_change = 0.0, 0.0
     current_vkosdaq, current_vkosdaq_change = 0.0, 0.0
@@ -334,148 +300,41 @@ def main():
         logger.info(f"{Colors.YELLOW}[Warning] 변동성 계산 중 오류 발생: {e}{Colors.RESET}")
         logger.info("  > 변동성 관련 피처는 0으로 처리됩니다.")
 
-    # 3. [핵심] 시나리오 확장 - 수집 단계에서 저장된 (시나리오)를 그대로 사용
-    # 차트통과=1: 저장된 시나리오 유지
-    # 차트통과=0: 저장된 시나리오 유지 (미지정은 "거래량 폭증" 기본)
+    # 3. [핵심] 시나리오 확장 - 수집 단계에서 저장된 표준 시나리오를 그대로 사용
+    def get_scenario_list(row):
+        assigned = row.get("시나리오")
 
-    df_passed = df_condition[df_condition["차트통과"] == 1].copy()  # 통과한 종목
-    df_filtered = df_condition[df_condition["차트통과"] == 0].copy()  # 필터된 종목
+        # [규칙 1] "상따"로 지정된 경우 -> 일반분석 제외하고 "상따"만 적용
+        if assigned == "상따":
+            return ["상따"]
 
-    df_all_parts = []
+        scenarios = []
 
-    # 3-1. 차트통과한 종목: 시나리오 리스트 생성
-    if not df_passed.empty:
-
-        def get_scenario_list(row):
-            assigned = row.get("(시나리오)")
-
-            # [규칙 1] 엑셀에서 "상따"로 지정된 경우 -> 일반분석 제외하고 "상따"만 적용
-            if assigned == "상따":
-                return ["상따"]
-
-            scenarios = []
-
-            # [규칙 2] 그 외 일반적인 경우
-            if pd.notna(assigned) and assigned != "" and assigned is not None:
-                scenarios.append(assigned)
-            else:
-                scenarios.append("거래량 폭증")  # 기본값
-
-            # [규칙 3] 등락률 20% 이상이면 "상따" 시나리오 추가 (일반 + 상따 함께 분석)
-            if row.get("등락률", 0) >= 20:
-                if "상따" not in scenarios:
-                    scenarios.append("상따")
-
-            return scenarios
-
-        df_passed["Scenario_List"] = df_passed.apply(get_scenario_list, axis=1)
-        df_passed_exploded = df_passed.explode("Scenario_List")
-        df_passed_exploded["Scenario_Base"] = df_passed_exploded["Scenario_List"]
-
-        # 분석 대상에 추가
-        df_all_parts.append(df_passed_exploded.drop(columns=["Scenario_List"]))
-        logger.info(
-            f"{Colors.CYAN}📌 분석 대상 종목(차트통과): {len(df_passed)}개 (시나리오 확장 포함 총 {len(df_passed_exploded)}건){Colors.RESET}"
-        )
-
-    # 3-2. 차트통과=0인 종목: (시나리오) 우선 확인 후 SMA 120 분석
-    if not df_filtered.empty:
-        # [Step 1] "상따" 시나리오 지정 종목 우선 분리 및 처리
-        df_filtered_sangdda = pd.DataFrame()
-        if "(시나리오)" in df_filtered.columns:
-            df_filtered_sangdda = df_filtered[
-                df_filtered["(시나리오)"] == "상따"
-            ].copy()
-            # 상따 제외한 나머지
-            df_remaining = df_filtered[df_filtered["(시나리오)"] != "상따"].copy()
+        # [규칙 2] 그 외 일반적인 경우
+        if pd.notna(assigned) and assigned != "" and assigned is not None:
+            scenarios.append(assigned)
         else:
-            df_remaining = df_filtered.copy()
+            scenarios.append("거래량 폭증")  # 기본값
 
-        # 상따 지정 종목 -> 바로 추가 (일반 분석 제외)
-        if not df_filtered_sangdda.empty:
-            df_filtered_sangdda["Scenario_Base"] = "상따"
-            df_all_parts.append(df_filtered_sangdda)
-            logger.info(
-                f"{Colors.MAGENTA}📌 차트통과=0 but 상따 지정: {len(df_filtered_sangdda)}개 (상따 전용){Colors.RESET}"
-            )
+        # [규칙 3] 등락률 20% 이상이면 "상따" 시나리오 추가 (일반 + 상따 함께 분석)
+        if row.get("등락률", 0) >= 20:
+            if "상따" not in scenarios:
+                scenarios.append("상따")
 
-        # [Step 2] 나머지 종목 중 시나리오 지정 vs 미지정 분리
-        df_filtered_with_scenario = (
-            df_remaining[
-                df_remaining["(시나리오)"].notna() & (df_remaining["(시나리오)"] != "")
-            ].copy()
-            if "(시나리오)" in df_remaining.columns
-            else pd.DataFrame()
-        )
+        return scenarios
 
-        df_filtered_without_scenario = (
-            df_remaining[
-                df_remaining["(시나리오)"].isna() | (df_remaining["(시나리오)"] == "")
-            ].copy()
-            if "(시나리오)" in df_remaining.columns
-            else df_remaining.copy()
-        )
-
-        # [Step 3] 시나리오 지정 종목 (상따 제외) 처리
-        if not df_filtered_with_scenario.empty:
-
-            def get_scenario_list_filtered(row):
-                scenarios = [row["(시나리오)"]]
-                # 등락률 20% 이상이면 상따 시나리오 추가
-                if row.get("등락률", 0) >= 20:
-                    if "상따" not in scenarios:
-                        scenarios.append("상따")
-                return scenarios
-
-            df_filtered_with_scenario["Scenario_List"] = (
-                df_filtered_with_scenario.apply(get_scenario_list_filtered, axis=1)
-            )
-            df_filtered_with_scenario_exploded = df_filtered_with_scenario.explode(
-                "Scenario_List"
-            )
-            df_filtered_with_scenario_exploded["Scenario_Base"] = (
-                df_filtered_with_scenario_exploded["Scenario_List"]
-            )
-            df_all_parts.append(
-                df_filtered_with_scenario_exploded.drop(columns=["Scenario_List"])
-            )
-            logger.info(
-                f"{Colors.MAGENTA}📌 차트통과=0 but 시나리오 지정: {len(df_filtered_with_scenario)}개 (지정+상따){Colors.RESET}"
-            )
-
-        # [Step 4] 시나리오 미지정 차트통과=0 종목: 기본 시나리오 적용
-        # (수집 단계에서 시나리오가 정형화되므로 중복 SMA 120 재계산 없이 "거래량 폭증" 기본값 사용)
-        if not df_filtered_without_scenario.empty:
-
-            def get_default_scenarios(row):
-                scenarios = ["거래량 폭증"]
-                if row.get("등락률", 0) >= 20:
-                    if "상따" not in scenarios:
-                        scenarios.append("상따")
-                return scenarios
-
-            df_filtered_without_scenario["Scenario_List"] = (
-                df_filtered_without_scenario.apply(get_default_scenarios, axis=1)
-            )
-            df_default_exploded = df_filtered_without_scenario.explode("Scenario_List")
-            df_default_exploded["Scenario_Base"] = df_default_exploded["Scenario_List"]
-            df_all_parts.append(df_default_exploded.drop(columns=["Scenario_List"]))
-            logger.info(
-                f"{Colors.MAGENTA}📌 차트통과=0 but 시나리오 미지정: {len(df_filtered_without_scenario)}개 → 거래량 폭증 기본 적용{Colors.RESET}"
-            )
-
-    # 3-3. 모든 부분 결합
-    if df_all_parts:
-        df_all = pd.concat(df_all_parts, ignore_index=True)
-    else:
-        logger.info(f"{Colors.RED}분석할 데이터가 없습니다.{Colors.RESET}")
-        return
+    df_condition["Scenario_List"] = df_condition.apply(get_scenario_list, axis=1)
+    df_all = df_condition.explode("Scenario_List").reset_index(drop=True)
+    df_all["Scenario_Base"] = df_all["Scenario_List"]
+    df_all = df_all.drop(columns=["Scenario_List"])
 
     # 결과 요약
+    logger.info(
+        f"{Colors.CYAN}📌 분석 대상 종목: {len(df_condition)}개 "
+        f"(시나리오 확장 포함 총 {len(df_all)}건){Colors.RESET}"
+    )
     logger.info(f"\n{Colors.CYAN}[시나리오 적용 완료]{Colors.RESET}")
-    logger.info(f"  ✅ 차트통과: {len(df_passed)}개 × 시나리오 확장")
-    if df_filtered is not None and not df_filtered.empty:
-        logger.info(f"  📊 차트통과=0: {len(df_filtered)}개 × 저장 시나리오 유지")
+    logger.info(f"  ✅ 분석 대상: {len(df_all)}개 × 시나리오 확장")
     logger.info()
 
     # [New] v-kospi & v-kosdaq 피처 주입
@@ -612,12 +471,8 @@ def main():
         df_all["프로그램_주도성"] = raw_prog / raw_trade_for_ratio
 
     # 4-6. 차트분석 피처 생성 (학습 시 사용된 핵심 피처)
-    # Scenario_Base(시나리오명)와 차트통과(Y/N)를 결합
-    df_all["차트분석"] = (
-        df_all["Scenario_Base"].astype(str)
-        + "_"
-        + df_all["차트통과"].fillna("N").astype(str)
-    )
+    # 차트통과 필터링이 제거되어 전 종목이 통과(Y) 처리됨: Scenario_Base + "_Y"
+    df_all["차트분석"] = df_all["Scenario_Base"].astype(str) + "_Y"
 
     # '상따' 시나리오 일괄 적용 (기존 로직 유지)
     df_all.loc[df_all["Scenario_Base"].str.contains("상따"), "등락률"] = 29.9

@@ -167,7 +167,7 @@ def upsert_condition_parquet(df: pd.DataFrame) -> None:
     if df is None or df.empty:
         return
 
-    parquet_path = settings.CONDITION_PARQUET_PATH
+    parquet_path = settings.HISTORY_PARQUET_PATH
     if parquet_path.exists():
         df_existing = pd.read_parquet(parquet_path)
         df_combined = pd.concat([df_existing, df], ignore_index=True)
@@ -195,7 +195,7 @@ def load_condition_data_from_parquet(date: str | None = None, limit: int | None 
     Returns:
         pd.DataFrame: Condition history DataFrame.
     """
-    parquet_path = settings.CONDITION_PARQUET_PATH
+    parquet_path = settings.HISTORY_PARQUET_PATH
     if not parquet_path.exists():
         logger.info("Condition history parquet file not found at %s.", parquet_path)
         return pd.DataFrame()

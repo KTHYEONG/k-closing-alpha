@@ -21,9 +21,10 @@ def test_path_settings_derived_paths(tmp_path: Path) -> None:
     assert tmp_path / "data" / "parquet" == settings.PARQUET_DIR
     assert settings.TRADE_LOG_PARQUET_PATH == settings.PARQUET_DIR / "trade_log.parquet"
     assert settings.THEME_PARQUET_PATH == settings.PARQUET_DIR / "theme.parquet"
-    assert settings.CONDITION_PARQUET_PATH == settings.PARQUET_DIR / "condition_history.parquet"
+    assert tmp_path / "data" / "daily" == settings.DAILY_DIR
+    assert settings.CONDITION_PARQUET_PATH == settings.DAILY_DIR / "daily_stocks.parquet"
+    assert settings.HISTORY_PARQUET_PATH == settings.PARQUET_DIR / "condition_history.parquet"
     assert settings.TOKEN_FILE == settings.CONFIGS_DIR / "kis_token_cache.json"
-    assert tmp_path / "data" / "chart_pass_cache.json" == settings.CHART_PASS_CACHE_FILE
     assert tmp_path / "data" / "history" == settings.HISTORY_DIR
     assert settings.LABEL_ENCODER_PATH == settings.MODELS_DIR / "best_stock_rg_cat_encoders.json"
     assert settings.MODEL_PATH == settings.MODELS_DIR / "best_stock_rg_cat.joblib"

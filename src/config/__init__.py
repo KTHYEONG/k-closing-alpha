@@ -59,7 +59,7 @@ class Settings(PathSettings, KisSettings, GSheetSettings, TradingSettings):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def CONDITION_CSV_PATH(self) -> Path:
-        return self.DATA_DIR / f"condition_{self.TARGET_CONDITION_NAME}.csv"
+        return self.DAILY_DIR / "daily_stocks.csv"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -116,7 +116,8 @@ TRADE_LOG_PARQUET_PATH = settings.TRADE_LOG_PARQUET_PATH
 THEME_PARQUET_PATH = settings.THEME_PARQUET_PATH
 CONDITION_PARQUET_PATH = settings.CONDITION_PARQUET_PATH
 TOKEN_FILE = settings.TOKEN_FILE
-CHART_PASS_CACHE_FILE = settings.CHART_PASS_CACHE_FILE
+DAILY_DIR = settings.DAILY_DIR
+HISTORY_PARQUET_PATH = settings.HISTORY_PARQUET_PATH
 HISTORY_DIR = settings.HISTORY_DIR
 HISTORY_DB_PATH = settings.HISTORY_DB_PATH
 HISTORY_CSV_PATH = settings.HISTORY_CSV_PATH
@@ -141,11 +142,11 @@ __all__ = [
     "API_SLEEP_INTERVAL",
     "BASE_DIR",
     "CANDLE_BODY_RATIO_THRESHOLD",
-    "CHART_PASS_CACHE_FILE",
     "CONDITION_CSV_PATH",
     "CONDITION_EXCEL_PATH",
     "CONDITION_PARQUET_PATH",
     "CONFIGS_DIR",
+    "DAILY_DIR",
     "DATA_DIR",
     "DAY_NAME_MAP",
     "DEFAULT_SCENARIOS",
@@ -160,6 +161,7 @@ __all__ = [
     "HISTORY_CSV_PATH",
     "HISTORY_DB_PATH",
     "HISTORY_DIR",
+    "HISTORY_PARQUET_PATH",
     "KIS_ACCOUNT_ID",
     "KIS_API_CONFIG",
     "KIS_APP_KEY",

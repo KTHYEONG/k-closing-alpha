@@ -57,18 +57,23 @@ class PathSettings(BaseSettings):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def DAILY_DIR(self) -> Path:
+        return self.DATA_DIR / "daily"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def CONDITION_PARQUET_PATH(self) -> Path:
+        return self.DAILY_DIR / "daily_stocks.parquet"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def HISTORY_PARQUET_PATH(self) -> Path:
         return self.PARQUET_DIR / "condition_history.parquet"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def TOKEN_FILE(self) -> Path:
         return self.CONFIGS_DIR / "kis_token_cache.json"
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def CHART_PASS_CACHE_FILE(self) -> Path:
-        return self.DATA_DIR / "chart_pass_cache.json"
 
     @computed_field  # type: ignore[prop-decorator]
     @property

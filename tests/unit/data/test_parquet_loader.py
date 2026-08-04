@@ -20,7 +20,7 @@ def tmp_parquet_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "PARQUET_DIR", p_dir)
     monkeypatch.setattr(settings, "TRADE_LOG_PARQUET_PATH", p_dir / "trade_log.parquet")
     monkeypatch.setattr(settings, "THEME_PARQUET_PATH", p_dir / "theme.parquet")
-    monkeypatch.setattr(settings, "CONDITION_PARQUET_PATH", p_dir / "condition_history.parquet")
+    monkeypatch.setattr(settings, "HISTORY_PARQUET_PATH", p_dir / "condition_history.parquet")
     return p_dir
 
 

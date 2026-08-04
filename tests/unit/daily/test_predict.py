@@ -91,10 +91,10 @@ def test_load_and_preprocess_data_exits_on_read_error() -> None:
 def test_load_and_preprocess_data_normalizes_columns() -> None:
     raw = pd.DataFrame(
         {
-            "(종목코드)": ["123", 456],
-            "(시가총액, 억)": [10.0, 20.0],
-            "기관_순매수(억)": [1.0, 2.0],
-            "(상장일수)": ["300", "500"],
+            "종목코드": ["123", 456],
+            "시가총액": [10.0, 20.0],
+            "기관_순매수": [1.0, 2.0],
+            "상장일수": ["300", "500"],
             "기타": ["x", "y"],
         }
     )
@@ -106,12 +106,12 @@ def test_load_and_preprocess_data_normalizes_columns() -> None:
     assert result["종목코드"].tolist() == ["000123", "000456"]
     assert result["기관_순매수"].tolist() == [100_000_000, 200_000_000]
     assert result["시가총액"].tolist() == [10.0, 20.0]
-    assert (result["(상장일수)"] >= predict.settings.EMA_PERIOD).all()
+    assert (result["상장일수"] >= predict.settings.EMA_PERIOD).all()
 
 
 def test_load_and_preprocess_data_without_listing_days() -> None:
     raw = pd.DataFrame(
-        {"종목코드": ["000123"], "거래대금(억)": [3.0], "등락률": [1.0]}
+        {"종목코드": ["000123"], "거래대금": [3.0], "등락률": [1.0]}
     )
     with (
         patch.object(predict.os.path, "exists", return_value=True),
@@ -123,7 +123,7 @@ def test_load_and_preprocess_data_without_listing_days() -> None:
 
 
 def test_load_and_preprocess_data_filters_insufficient_listing_days() -> None:
-    raw = pd.DataFrame({"종목코드": ["000001"], "(상장일수)": ["1"]})
+    raw = pd.DataFrame({"종목코드": ["000001"], "상장일수": ["1"]})
     with (
         patch.object(predict.os.path, "exists", return_value=True),
         patch.object(predict.pd, "read_csv", return_value=raw),
@@ -256,3 +256,28 @@ def test_run_daily_sizing_inference_fills_missing_features() -> None:
 def test_run_daily_sizing_inference_raises_without_feature_cols() -> None:
     with pytest.raises(ValueError, match="feature_cols is empty"):
         predict.run_daily_sizing_inference(_snapshot_df(), {"dummy": 1})
+
+
+def test_scenario_daily_predict_refactoring_02(tmp_path) -> None:
+    """[SCENARIO_DAILY_PREDICT_REFACTORING_02] Verify clean loading of standard CSV without chart_pass filtering."""
+    csv_file = tmp_path / "daily_stocks.csv"
+    raw = pd.DataFrame(
+        {
+            "종목코드": ["123", "456"],
+            "시가총액": [10.0, 20.0],
+            "기관_순매수": [1.0, 2.0],
+            "상장일수": [300, 500],
+            "거래대금": [5.0, 10.0],
+            "평균_거래대금": [2.0, 4.0],
+        }
+    )
+    raw.to_csv(csv_file, index=False)
+    with (
+        patch.object(predict.os.path, "exists", return_value=True),
+        patch.object(predict.pd, "read_csv", return_value=raw),
+    ):
+        result = predict.load_and_preprocess_data(str(csv_file))
+    assert result["종목코드"].tolist() == ["000123", "000456"]
+    assert result["기관_순매수"].tolist() == [100_000_000, 200_000_000]
+    assert "차트통과" not in result.columns
+
