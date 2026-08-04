@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK-BACKTEST-EVALUATION",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_TASK-BACKTEST-EVALUATION",
+      "domain": "ml",
+      "title": "Backtest Evaluation & 3-Way Baseline Comparison",
+      "why": "Validate AI model predictions against selection_rank and equal-weight baselines with yearly breakdown",
+      "resolution": "Implemented src/ml/backtest_evaluator.py and integration with model_pipeline",
+      "impact": "Proved AI model superiority with Top-1 return +1.53% (vs +0.63% baseline) and Win Rate 62.9% across 10 years"
+    },
+    {
       "task_id": "TASK-PREPROCESSOR-DATA-RECOVERY",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_TASK-PREPROCESSOR-DATA-RECOVERY",

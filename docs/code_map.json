@@ -49,5 +49,8 @@
   },
   "src/ml/model_pipeline.py": {
     "testing": "tests/unit/ml/test_model_pipeline.py"
+  },
+  "src/ml/backtest_evaluator.py": {
+    "testing": "tests/unit/ml/test_backtest_evaluator.py"
   }
 }
