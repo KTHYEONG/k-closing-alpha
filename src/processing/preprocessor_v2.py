@@ -86,14 +86,32 @@ _PCT_RANK_COLUMNS: dict[str, str] = {
     "inst_net_buy": "inst_net_buy_pct_rank",
     "foreign_net_buy": "foreign_net_buy_pct_rank",
     "change_rate": "change_rate_pct_rank",
+    "major_density": "major_density_pct_rank",
+    "prog_dominance": "prog_dominance_pct_rank",
+    "gap_ratio": "gap_ratio_pct_rank",
+    "turnover": "turnover_pct_rank",
 }
+
+# Robust Z-Score ((x - median) / MAD) 횡단면 표준화 대상
+_ROBUST_Z_COLUMNS: tuple[str, ...] = (
+    "change_rate",
+    "buy_price_change_rate",
+    "gap_ratio",
+    "major_density",
+    "prog_dominance",
+    "turnover",
+    "inst_density",
+    "foreign_density",
+)
 
 _CATEGORICAL_COLUMNS: tuple[str, ...] = ("market_type", "theme_sector", "chart_analysis")
 
 # 학습 피처 집합(X)에서 완전 격리하는 메타데이터/미래 정보 컬럼
 _EXCLUDED_FROM_X: set[str] = {
+    # 메타/식별자
     "trade_date",
     "stock_code",
+    # 미래 정보 (매수 시점 미확정 가격)
     "open_price",
     "high_price",
     "low_price",
@@ -101,6 +119,14 @@ _EXCLUDED_FROM_X: set[str] = {
     "prev_close_price",
     "buy_price",
     "sell_price",
+    # Data Leakage 방지
+    "intraday_return",
+    # 원본 금액/거래량 컬럼 (log_ 접두사 파생 컬럼만 학습 피처로 사용)
+    "market_cap_100m",
+    "trade_value_100m",
+    "volume",
+    "avg_trade_value",
+    # 타깃 변수
     "net_return",
     "target_return",
     "target_rank",
@@ -128,20 +154,48 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """로그 스케일링, 상대 비율, 횡단면 백분위 피처를 생성합니다."""
+    """로그 스케일링, 상대 비율, 횡단면 백분위/robust-z 피처를 생성합니다."""
     df = df.copy()
 
     prev_close = df["prev_close_price"].replace(0, np.nan)
-    df["buy_price_change_rate"] = (df["buy_price"] - df["prev_close_price"]) / prev_close
-    df["gap_ratio"] = (df["open_price"] - df["prev_close_price"]) / prev_close
+    # BUG-1: buy_price_change_rate/gap_ratio를 % 단위로 통일 (kospi/kosdaq_change와 동일 스케일)
+    df["buy_price_change_rate"] = (df["buy_price"] - df["prev_close_price"]) / prev_close * 100
+    df["gap_ratio"] = (df["open_price"] - df["prev_close_price"]) / prev_close * 100
     df["intraday_return"] = (df["close_price"] - df["open_price"]) / df["open_price"].replace(
         0, np.nan
     )
 
+    # FEAT-1: 캔들/가격 파생 피처
+    candle_range = (df["high_price"] - df["low_price"]).clip(lower=1)
+    df["intraday_range"] = (df["high_price"] - df["low_price"]) / prev_close * 100
+    df["close_position"] = (df["close_price"] - df["low_price"]) / candle_range
+    body_top = np.maximum(df["open_price"], df["close_price"])
+    df["upper_shadow_ratio"] = (df["high_price"] - body_top) / candle_range
+    df["body_ratio"] = np.abs(df["close_price"] - df["open_price"]) / candle_range
+    df["turnover"] = df["trade_value_100m"] / df["market_cap_100m"].clip(lower=0.01)
+
     trade_value = df["trade_value_100m"].replace(0, np.nan)
-    df["major_density"] = (df["inst_net_buy"] + df["foreign_net_buy"]) / trade_value
-    df["prog_dominance"] = df["prog_net_buy"] / trade_value
-    df["rank_ratio"] = df["selection_rank"] / df["total_candidate_count"].clip(lower=1)
+    # BUG-5: 수급 NaN 안전 합산 (fillna(0)) + FEAT-2: 개별 수급 밀도
+    if "inst_net_buy" in df.columns:
+        df["inst_density"] = df["inst_net_buy"].fillna(0) / trade_value
+    if "foreign_net_buy" in df.columns:
+        df["foreign_density"] = df["foreign_net_buy"].fillna(0) / trade_value
+    inst_part = (
+        df["inst_net_buy"].fillna(0)
+        if "inst_net_buy" in df.columns
+        else pd.Series(0.0, index=df.index)
+    )
+    foreign_part = (
+        df["foreign_net_buy"].fillna(0)
+        if "foreign_net_buy" in df.columns
+        else pd.Series(0.0, index=df.index)
+    )
+    df["major_density"] = (inst_part + foreign_part) / trade_value
+    if "prog_net_buy" in df.columns:
+        df["prog_dominance"] = df["prog_net_buy"] / trade_value
+
+    # BUG-6: total_candidate_count NaN → fillna(1)
+    df["rank_ratio"] = df["selection_rank"] / df["total_candidate_count"].fillna(1).clip(lower=1)
 
     market_ref = np.where(
         df["market_type"].astype(str).str.upper().str.contains("KOSDAQ", na=False),
@@ -150,16 +204,36 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["relative_change_rate"] = df["buy_price_change_rate"] - market_ref
 
+    # FEAT-3: KOSPI/KOSDAQ 독립 상대강도 + 섹터 내 상대강도
+    df["relative_change_kospi"] = df["change_rate"] - df["kospi_change"]
+    df["relative_change_kosdaq"] = df["change_rate"] - df["kosdaq_change"]
+    if "theme_sector" in df.columns:
+        sector_mean = df.groupby(["trade_date", "theme_sector"])["change_rate"].transform("mean")
+        df["sector_relative_change"] = df["change_rate"] - sector_mean
+
+    # FEAT-4: V-KOSPI/V-KOSDAQ 0값을 NaN 처리 후 날짜별 대표값 보간 + 변화율
+    for vix_col in ("v_kospi", "v_kosdaq"):
+        if vix_col not in df.columns:
+            continue
+        df[vix_col] = df[vix_col].replace(0, np.nan)
+        daily_ref = df.groupby("trade_date")[vix_col].first().ffill().bfill()
+        df[vix_col] = df["trade_date"].map(daily_ref)
+        daily_change = daily_ref.pct_change().fillna(0)
+        df[f"{vix_col}_change"] = df["trade_date"].map(daily_change).fillna(0)
+
+    # BUG-7: log 변환 시 원본 컬럼 유지 + log_ 접두사 파생 컬럼 생성
     for col in _LOG_AMOUNT_COLUMNS:
         if col in df.columns:
-            df[col] = np.log1p(df[col].clip(lower=0))
+            df[f"log_{col}"] = np.log1p(df[col].clip(lower=0))
 
     for col in _SIGNED_LOG_COLUMNS:
         if col in df.columns:
             df[col] = np.sign(df[col]) * np.log1p(np.abs(df[col]))
 
+    # BUG-4: pct-rank 대상 컬럼 존재 검사 후 생성
     for src_col, dst_col in _PCT_RANK_COLUMNS.items():
-        df[dst_col] = df.groupby("trade_date")[src_col].rank(pct=True)
+        if src_col in df.columns:
+            df[dst_col] = df.groupby("trade_date")[src_col].rank(pct=True)
 
     df = df.replace([np.inf, -np.inf], np.nan)
     return df
@@ -171,9 +245,12 @@ def create_multi_targets(df: pd.DataFrame) -> pd.DataFrame:
     df["target_return"] = df["net_return"].clip(-10.0, 10.0)
 
     def assign_daily_rank(group_df: pd.DataFrame) -> pd.Series:
-        if len(group_df) < 5:
-            ranks = group_df["net_return"].rank(method="min", ascending=True)
-            return ((ranks - 1) / len(group_df) * 5).astype(int).clip(0, 4)
+        n = len(group_df)
+        if n < 5:
+            ranks = group_df["net_return"].rank(method="first", ascending=True)
+            if n == 1:
+                return pd.Series(2, index=group_df.index)  # 단일 종목: 중립 등급
+            return ((ranks - 1) / (n - 1) * 4).round().astype(int).clip(0, 4)
         return pd.qcut(
             group_df["net_return"].rank(method="first"), q=5, labels=[0, 1, 2, 3, 4]
         ).astype(int)
@@ -187,6 +264,21 @@ def create_multi_targets(df: pd.DataFrame) -> pd.DataFrame:
     df["target_rank"] = pd.Series(rank_map, dtype="int64").reindex(df.index)
     df["target_good"] = (df["net_return"] >= 1.0).astype(int)
     df["target_bad"] = (df["net_return"] <= -2.0).astype(int)
+    return df
+
+def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
+    """횡단면 Robust Z-Score((x - median) / MAD)를 생성하고 [-5, 5]로 클리핑합니다.
+
+    MAD가 0인 그룹은 0-나눗셈 방지를 위해 NaN으로 처리합니다.
+    """
+    for col in columns:
+        if col not in df.columns:
+            continue
+        grouped = df.groupby("trade_date")[col]
+        median = grouped.transform("median")
+        mad = grouped.transform(lambda x: (x - x.median()).abs().median())
+        mad = mad.replace(0, np.nan)
+        df[f"{col}_z"] = ((df[col] - median) / mad).clip(-5, 5)
     return df
 
 
@@ -215,6 +307,7 @@ def build_ml_dataset(
 
     df = df.dropna(subset=["net_return"]).copy()
     df = engineer_features(df)
+    df = _apply_robust_z(df, _ROBUST_Z_COLUMNS)
     df = create_multi_targets(df)
 
     for col in _CATEGORICAL_COLUMNS:
