@@ -19,6 +19,8 @@ from sklearn.linear_model import Ridge
 
 from src.ml.backtest_evaluator import run_backtest_evaluation
 from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
+from src.ml.quantile_model import fit_predict_quantile_and_classifier
+from src.ml.sizing_engine import apply_risk_limits, assign_sizing_grades, calculate_utility_score
 
 logger = logging.getLogger(__name__)
 
@@ -184,3 +186,47 @@ def run_model_pipeline(
         "trained_models": trained_models,
         "backtest_eval": run_backtest_evaluation(oof_df, target_col, group_col),
     }
+
+
+def run_sizing_pipeline(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    group_col: str,
+    n_splits: int = 5,
+    purge_gap: int = 1,
+    base_budget: float = 1.0,
+    target_vol: float = 0.15,
+    max_position_pct: float = 0.25,
+    max_total_allocation: float = 1.0,
+) -> dict[str, Any]:
+    """Quantile 위험 예측 + Utility Dynamic Sizing 통합 파이프라인.
+
+    Quantile Regressor(q10/q50/q90)와 Calibrated Classifier(p_good/p_bad)로
+    OOF 위험 프로필을 예측하고, Utility Score -> 등급(Strong/Good/Weak/Pass) ->
+    변동성 역가중 비중 및 위험 한도를 적용한 최종 배분을 산출합니다.
+
+    Returns:
+        dict containing 'quantile_df' (OOF 분위수/확률 예측) and
+        'sizing_df' (utility_score, grade, grade_multiplier, allocation 포함).
+    """
+    quantile_df = fit_predict_quantile_and_classifier(
+        df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=n_splits,
+        purge_gap=purge_gap,
+    )
+    sizing_df = quantile_df.copy()
+    sizing_df["utility_score"] = calculate_utility_score(sizing_df)
+    sizing_df = assign_sizing_grades(sizing_df, group_col=group_col)
+    sizing_df = apply_risk_limits(
+        sizing_df,
+        base_budget=base_budget,
+        target_vol=target_vol,
+        max_position_pct=max_position_pct,
+        max_total_allocation=max_total_allocation,
+        group_col=group_col,
+    )
+    return {"quantile_df": quantile_df, "sizing_df": sizing_df}
