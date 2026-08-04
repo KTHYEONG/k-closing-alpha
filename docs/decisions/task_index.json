@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260804_DATA_COLLECTION_OPT",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_20260804_DATA_COLLECTION_OPT",
+      "domain": "daily",
+      "title": "KIS API Data Collection Speed & Rate Limit Optimization & Logging Cleanup",
+      "why": "Improve real-time data collection throughput while strictly enforcing KIS REST API 18 TPS limit and removing automatic archiving and redundant logs.",
+      "resolution": "Implemented AsyncRateLimiter, lazy evaluation for SMA120 calculations, single-line dynamic progress bar logging, and removed automatic archive snapshot upsert in collect.py.",
+      "impact": "Significantly reduced daily collection time, 100% prevented EGW00201 rate limit errors, simplified logging output, and isolated archive functionality for manual user execution."
+    },
+    {
       "task_id": "POSITION_SIZING_COST_FIX",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_POSITION_SIZING_COST_FIX",
