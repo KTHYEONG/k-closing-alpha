@@ -93,7 +93,6 @@ ignore = [
 "src/sync/*.py" = ["T20", "ASYNC240", "ASYNC251", "N806", "B007", "B905", "B023", "S112"]
 "src/processing/*.py" = ["SIM102", "SIM108", "N806", "B905", "C416"]
 "src/utils/display.py" = ["T20", "N806", "B023"]
-"src/utils/db_to_xlsx.py" = ["T20", "S608"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15

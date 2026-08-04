@@ -61,11 +61,6 @@ class Settings(PathSettings, KisSettings, GSheetSettings, TradingSettings):
     def CONDITION_CSV_PATH(self) -> Path:
         return self.DAILY_DIR / "daily_stocks.csv"
 
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def CONDITION_EXCEL_PATH(self) -> Path:
-        return self.DATA_DIR / f"condition_{self.TARGET_CONDITION_NAME}.xlsx"
-
 
 settings = Settings()
 
@@ -123,7 +118,6 @@ HISTORY_CSV_PATH = settings.HISTORY_CSV_PATH
 LABEL_ENCODER_PATH = settings.LABEL_ENCODER_PATH
 MODEL_PATH = settings.MODEL_PATH
 CONDITION_CSV_PATH = settings.CONDITION_CSV_PATH
-CONDITION_EXCEL_PATH = settings.CONDITION_EXCEL_PATH
 
 # 스펙 하위 호환 별칭 (소문자)
 base_dir = settings.base_dir
@@ -141,7 +135,6 @@ __all__ = [
     "BASE_DIR",
     "CANDLE_BODY_RATIO_THRESHOLD",
     "CONDITION_CSV_PATH",
-    "CONDITION_EXCEL_PATH",
     "CONDITION_PARQUET_PATH",
     "CONFIGS_DIR",
     "DAILY_DIR",

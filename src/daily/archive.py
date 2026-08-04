@@ -9,7 +9,6 @@ from src import settings
 
 logger = logging.getLogger(__name__)
 
-TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
 TABLE_NAME = "condition_history"
 SNAP_DATE_COL = "스냅샷_날짜"
 STOCK_CODE_COL = "종목코드"
@@ -367,11 +366,8 @@ def main():
     history_dir = settings.HISTORY_DIR
     history_dir.mkdir(parents=True, exist_ok=True)
 
-    clean_name = TARGET_CONDITION_NAME.replace("/", "_").replace("\\", "_")
-    # 표준 CSV(utf-8-sig) 경로 우선 인식, 레거시 xlsx 폴백
+    # 표준 CSV(utf-8-sig) 경로 우선 인식
     csv_latest = str(settings.CONDITION_CSV_PATH)
-    xlsx_latest = str(settings.DATA_DIR / f"condition_{clean_name}.xlsx")
-    latest_path = csv_latest if os.path.exists(csv_latest) else xlsx_latest
     history_csv = str(settings.HISTORY_CSV_PATH)
     history_db = str(settings.HISTORY_DB_PATH)
 
@@ -382,25 +378,20 @@ def main():
         if df.empty:
             logger.info(f"[info] 조회된 데이터가 없습니다: {FETCH_TARGET_DATE}")
         else:
-            target_file = os.path.join(
-                history_dir, f"condition_{clean_name}_{FETCH_TARGET_DATE}.xlsx"
-            )
-            df.to_excel(target_file, index=False)
+            target_file = os.path.join(history_dir, f"archive_{FETCH_TARGET_DATE}.tsv")
+            df.to_csv(target_file, sep="\t", index=False)
             logger.info(f"[done] 조회 결과를 저장했습니다: {target_file}")
         return
 
-    if not os.path.exists(latest_path):
-        logger.info(f"[skip] 최신 파일이 없습니다: {latest_path}")
+    if not os.path.exists(csv_latest):
+        logger.info(f"[skip] 최신 파일이 없습니다: {csv_latest}")
         return
 
     # 전날 결과 불러오기
-    if latest_path.endswith(".csv"):
-        df = pd.read_csv(latest_path, encoding="utf-8-sig")
-    else:
-        df = pd.read_excel(latest_path)
+    df = pd.read_csv(csv_latest, encoding="utf-8-sig")
 
     # 파일 수정 시각을 스냅샷 시각으로 사용 (없으면 현재 시각)
-    snap_dt = datetime.fromtimestamp(os.path.getmtime(latest_path))
+    snap_dt = datetime.fromtimestamp(os.path.getmtime(csv_latest))
     df.insert(0, SNAP_DATE_COL, snap_dt.strftime("%Y-%m-%d"))
 
     upsert_history(df, history_db)

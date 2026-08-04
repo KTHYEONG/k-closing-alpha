@@ -25,8 +25,13 @@ def test_derived_paths_based_on_base_dir(tmp_path: Path) -> None:
     settings = Settings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data")
     assert tmp_path / "data" / "stock.db" == settings.STOCK_DB_PATH
     assert tmp_path / "data" / "daily" / "daily_stocks.csv" == settings.CONDITION_CSV_PATH
-    assert tmp_path / "data" / "condition_종가매매.xlsx" == settings.CONDITION_EXCEL_PATH
     assert settings.MODEL_PATH == settings.MODELS_DIR / "best_stock_rg_cat.joblib"
+
+
+def test_condition_excel_path_removed(tmp_path: Path) -> None:
+    """CONDITION_EXCEL_PATH 레거시 필드는 제거되었습니다."""
+    settings = Settings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data", _env_file=None)
+    assert not hasattr(settings, "CONDITION_EXCEL_PATH")
 
 
 def test_kis_config_from_env(tmp_path: Path, monkeypatch) -> None:

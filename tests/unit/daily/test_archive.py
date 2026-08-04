@@ -195,3 +195,21 @@ def test_upsert_adds_missing_columns_to_existing_table(tmp_archive: Path) -> Non
     df = archive.fetch_archive_snapshot("2026-08-04")
     assert len(df) == 1
     assert df["종목코드"].tolist() == ["005930"]
+
+
+def test_main_fetch_target_date_saves_tsv(
+    tmp_archive: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """main() FETCH_TARGET_DATE 분기는 조회 결과를 archive_{date}.tsv로 저장합니다."""
+    archive.upsert_archive_snapshot(
+        pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
+        snapshot_date="2026-08-04",
+    )
+    monkeypatch.setattr(archive, "FETCH_TARGET_DATE", "2026-08-04")
+
+    archive.main()
+
+    target_file = tmp_archive / "archive_2026-08-04.tsv"
+    assert target_file.exists()
+    df = pd.read_csv(target_file, sep="\t")
+    assert "2026-08-04" in df["스냅샷_날짜"].astype(str).values
