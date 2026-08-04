@@ -57,5 +57,8 @@
   },
   "src/ml/sizing_engine.py": {
     "testing": "tests/unit/ml/test_sizing_engine.py"
+  },
+  "src/config/base.py": {
+    "testing": "tests/unit/config/test_base.py"
   }
 }

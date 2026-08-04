@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260804_architecture_refactoring",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ADR_20260804_architecture_refactoring",
+      "domain": "architecture",
+      "title": "Architecture & Directory Refactoring",
+      "why": "Centralized monolithic settings and legacy script names caused high token waste and maintenance overhead",
+      "resolution": "Modularized settings into src/config/ domain modules, streamlined src/daily/ scripts to collect/predict/archive, and symmetrically aligned tests/ directory",
+      "impact": "Enhanced code maintainability, scalability, and AI-agent token efficiency with symmetrical test discovery"
+    },
+    {
       "task_id": "ADR_20260804_daily_pipeline_refactor",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_ADR_20260804_daily_pipeline_refactor",
