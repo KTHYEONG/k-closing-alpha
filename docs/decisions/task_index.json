@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "quantile_sizing",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_quantile_sizing",
+      "domain": "ml",
+      "title": "Quantile Risk Model & Dynamic Sizing Engine Implementation",
+      "why": "Implement Quantile Risk Model",
+      "resolution": "Created quantile_model.py and sizing_engine.py",
+      "impact": "Portfolio risk management"
+    },
+    {
       "task_id": "TASK-BACKTEST-EVALUATION",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_TASK-BACKTEST-EVALUATION",

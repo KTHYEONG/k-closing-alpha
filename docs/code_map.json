@@ -52,5 +52,8 @@
   },
   "src/ml/backtest_evaluator.py": {
     "testing": "tests/unit/ml/test_backtest_evaluator.py"
+  },
+  "src/ml/sizing_engine.py": {
+    "testing": "tests/unit/ml/test_sizing_engine.py"
   }
 }
