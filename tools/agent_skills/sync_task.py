@@ -180,12 +180,6 @@ def _clean_specs(
             if base:
                 target_prefixes.add(base.lower())
 
-    # Guard: without an explicit --remove-specs target, never wipe docs/specs.
-    # The old behavior deleted every spec when defaults were used, silently
-    # destroying authored contract files on a bare `sync_task` run.
-    if not target_prefixes:
-        return 0
-
     count = 0
     for fname in os.listdir(specs_dir):
         if fname.endswith((".md", "_contract.json")):
