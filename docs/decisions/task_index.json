@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "daily_data_refactoring",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_daily_data_refactoring",
+      "domain": "daily",
+      "title": "Daily Data Storage, Column Standardization & Logic Cleanup",
+      "why": "Cleanup redundant chart_pass cache and parenthesis column renaming, and adjust daily stock data storage location to data/daily/",
+      "resolution": "Removed chart_pass_cache.json and (차트통과) logic, relocated files to data/daily/daily_stocks.csv and parquet, and standardized columns across collect.py and predict.py without duplicate rename_map.",
+      "impact": "Clean daily data storage structure, improved maintainability and AI workflow efficiency, zero redundant column renaming."
+    },
+    {
       "task_id": "ADR_20260804_architecture_refactoring",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_ADR_20260804_architecture_refactoring",

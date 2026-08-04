@@ -60,5 +60,8 @@
   },
   "src/config/base.py": {
     "testing": "tests/unit/config/test_base.py"
+  },
+  "src/daily/collect.py": {
+    "testing": "tests/unit/daily/test_collect.py"
   }
 }
