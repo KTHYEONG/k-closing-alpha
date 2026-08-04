@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260804_CONDITION_HISTORY_BACKFILL",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_20260804_CONDITION_HISTORY_BACKFILL",
+      "domain": "quant",
+      "title": "condition_history Data Cleaning and Backfill Pipeline",
+      "why": "condition_history_종가매매.xlsx contained 307 pre-20251229 obsolete rows, missing fields post-20260520, and missing volume for 281 rows.",
+      "resolution": "Filtered out pre-20251229 rows, built ConditionHistoryBackfiller to restore missing OHLCV/volume/market cap/index returns via KIS API, removed unused EMA columns, and excluded historical volume power.",
+      "impact": "Generated clean data/history/condition_history_cleaned.csv and parquet repositories with 100% volume and code coverage."
+    },
+    {
       "task_id": "TASK_EXPORT_SPREADSHEET",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_EXPORT_SPREADSHEET",

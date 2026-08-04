@@ -72,5 +72,8 @@
   "src/daily/predict.py": {
     "testing": "tests/unit/daily/test_predict.py"
   },
-  "src/utils/export_archive.py": {}
+  "src/utils/export_archive.py": {},
+  "src/backfill/backfill_condition_history.py": {
+    "testing": "tests/unit/backfill/test_backfill_condition_history.py"
+  }
 }
