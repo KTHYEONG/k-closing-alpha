@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "MODEL_UTILITY_SCORE_FIX",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_MODEL_UTILITY_SCORE_FIX",
+      "domain": "daily",
+      "title": "Model Utility Score Uniformity Fix & ML Preprocessor Feature Alignment",
+      "why": "Constant utility_score (0.0864) caused by dummy test bundle artifacts and preprocessor Z-score feature divergence during daily inference.",
+      "resolution": "Synchronized _apply_robust_z in daily preprocessor pipeline, trained real 49-feature GBDT model bundle from trade_log.parquet, and added auto-retrain fallback in predict.py.",
+      "impact": "Restored dynamic Utility Score differentiation (-4.66 ~ -5.23) and proper risk-weighted sizing allocations across candidates."
+    },
+    {
+      "task_id": "DAILY_PREDICT_REDESIGN",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_DAILY_PREDICT_REDESIGN",
+      "domain": "daily",
+      "title": "Daily Predict Pipeline Redesign & Standard ML Feature Alignment",
+      "why": "Legacy inline feature engineering and verbose CLI output caused schema mismatches with LightGBM models and terminal clutter.",
+      "resolution": "Integrated standard ML preprocessor (clean_column_names, engineer_features), updated run_daily_sizing_inference, and streamlined CLI output format.",
+      "impact": "Ensured 1:1 feature alignment with model artifacts, accelerated inference output readability, and established contract compliance."
+    },
+    {
       "task_id": "ARCHIVE_REDESIGN_V2",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_ARCHIVE_REDESIGN_V2",

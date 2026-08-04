@@ -66,5 +66,8 @@
   },
   "src/daily/archive.py": {
     "testing": "tests/unit/daily/test_archive.py"
+  },
+  "src/daily/predict.py": {
+    "testing": "tests/unit/daily/test_predict.py"
   }
 }
