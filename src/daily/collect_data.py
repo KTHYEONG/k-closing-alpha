@@ -3,11 +3,10 @@ import json
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 
 import aiohttp
 import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment
 
 from src import settings
 
@@ -30,7 +29,39 @@ HTS_ID = settings.KIS_API_CONFIG.get("hts_id")
 TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
 TOKEN_FILE = str(settings.TOKEN_FILE)
 
-logger.info("조건검색 (엑셀 중앙정렬 기능 추가) 시작...")
+# =========================================================
+# [표준 열 순서] 스프레드시트 복사/붙여넣기 호환을 위한 고정 컬럼 순서
+# =========================================================
+STANDARD_COLUMN_ORDER = [
+    "(차트통과)",
+    "(시나리오)",
+    "(상장일수)",
+    "종목명",
+    "(종목코드)",
+    "(시가)",
+    "(고가)",
+    "(저가)",
+    "(종가)",
+    "(전일종가)",
+    "(시가총액, 억)",
+    "(거래대금, 억)",
+    "(등락률)",
+    "(선정 순위)",
+    "(기관_순매수)",
+    "(외국인_순매수)",
+    "(프로그램_순매수)",
+    "(체결강도)",
+    "(시장구분)",
+    "(총 종목 수)",
+    "(평균 거래대금)",
+    "(kospi, %)",
+    "(kosdaq, %)",
+    "(v-kospi)",
+    "(v-kosdaq)",
+    "(거래량)",
+]
+
+logger.info("조건검색 (표준 CSV 저장) 시작...")
 
 
 def _validate_hts_id() -> None:
@@ -71,6 +102,43 @@ def parse_market_index_rate(data):
     except Exception:
         pass
     return 0.0
+
+
+# ---------------------------------------------------------
+# 표준 CSV 저장 (utf-8-sig) & Parquet
+# ---------------------------------------------------------
+def save_collected_condition_data(
+    df: pd.DataFrame,
+    csv_path: Path | str,
+    excel_path: Path | str | None = None,
+) -> Path:
+    """조건검색 DataFrame 을 표준 열 순서로 저장한다.
+
+    - utf-8-sig 인코딩 CSV 로 저장하여 Excel / Google Sheets 에서 한글 깨짐 없이 열림.
+    - ``STANDARD_COLUMN_ORDER`` 순서를 엄격히 유지하고, 종목코드는 6자리 zero-fill 문자열로 저장.
+    - ``excel_path`` 가 주어지면 레거시 호환용 xlsx 도 함께 기록한다 (셀 포맷팅 없음).
+    """
+    out = df.copy()
+    out = out.reindex(columns=STANDARD_COLUMN_ORDER)
+    if "(종목코드)" in out.columns:
+        out["(종목코드)"] = out["(종목코드)"].astype(str).str.zfill(6)
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    parquet_path = csv_path.with_suffix(".parquet")
+    try:
+        out.to_parquet(parquet_path, index=False)
+        logger.info("Parquet 저장 완료: %s", parquet_path)
+    except Exception:
+        logger.exception("Parquet 저장 실패 (CSV 는 정상 저장됨): %s", parquet_path)
+
+    if excel_path is not None:
+        out.to_excel(Path(excel_path), index=False)
+
+    logger.info("표준 CSV 저장 완료: %s (%d행)", csv_path, len(out))
+    return csv_path
 
 
 # ---------------------------------------------------------
@@ -233,9 +301,9 @@ async def fetch_single_stock(
             chart_pass = 0
 
         # === 시나리오 할당 (우선순위: 높음 → 낮음) ===
-        # 우선순위: 상따(상한가) > 상한가 다음날 > 상승형 음봉 > 120 돌파 > 신고가 근접 > 신고가
+        # 우선순위: 상따 > 상한가 다음날 > 상승형 음봉 > 신고가 > 신고가 근접 > 120 돌파 > 거래량 폭증(기본)
 
-        # 1. [최최우선] 상따 (상한가 조건검색)
+        # 1. [최우선] 상따 (상한가 조건검색)
         if code in upper_limit_stock_codes:
             scenario = "상따"
             # 상한가는 차트 필터링 없이 통과
@@ -260,7 +328,33 @@ async def fetch_single_stock(
             ):
                 chart_pass = 0
 
-        # 4. 120 돌파
+        # 4. 신고가
+        elif code in new_high_stock_codes:
+            scenario = "신고가"
+            # 이평선 아래면 차트 필터링
+            if (
+                (ema5 > 0 and close_price < ema5)
+                or (ema10 > 0 and close_price < ema10)
+                or (ema20 > 0 and close_price < ema20)
+                or (sma60_success and close_price < sma60_value)
+                or (sma_success and close_price < sma_value)
+            ):
+                chart_pass = 0
+
+        # 5. 신고가 근접
+        elif code in near_new_high_stock_codes:
+            scenario = "신고가 근접"
+            # 이평선 아래면 차트 필터링
+            if (
+                (ema5 > 0 and close_price < ema5)
+                or (ema10 > 0 and close_price < ema10)
+                or (ema20 > 0 and close_price < ema20)
+                or (sma60_success and close_price < sma60_value)
+                or (sma_success and close_price < sma_value)
+            ):
+                chart_pass = 0
+
+        # 6. 120 돌파
         elif (
             sma_success
             and sma_value > 0
@@ -276,31 +370,9 @@ async def fetch_single_stock(
             ):
                 chart_pass = 0
 
-        # 5. 신고가 근접 (우선순위 상승)
-        elif code in near_new_high_stock_codes:
-            scenario = "신고가 근접"
-            # 이평선 아래면 차트 필터링
-            if (
-                (ema5 > 0 and close_price < ema5)
-                or (ema10 > 0 and close_price < ema10)
-                or (ema20 > 0 and close_price < ema20)
-                or (sma60_success and close_price < sma60_value)
-                or (sma_success and close_price < sma_value)
-            ):
-                chart_pass = 0
-
-        # 6. 신고가
-        elif code in new_high_stock_codes:
-            scenario = "신고가"
-            # 이평선 아래면 차트 필터링
-            if (
-                (ema5 > 0 and close_price < ema5)
-                or (ema10 > 0 and close_price < ema10)
-                or (ema20 > 0 and close_price < ema20)
-                or (sma60_success and close_price < sma60_value)
-                or (sma_success and close_price < sma_value)
-            ):
-                chart_pass = 0
+        # 7. 기본값: 거래량 폭증 (상기 조건 미충족)
+        else:
+            scenario = "거래량 폭증"
 
         logger.info(
             "데이터 수집 중... (%d/%d)",
@@ -658,11 +730,8 @@ async def main():
             upper_limit_stock_codes,
         )
         if results:
-            # 데이터 저장 및 후처리 로직 (기존과 동일)
-            clean_name = (
-                target_cond["condition_nm"].replace("/", "_").replace("\\", "_")
-            )
-            save_path = str(settings.DATA_DIR / f"condition_{clean_name}.xlsx")
+            # 데이터 저장 및 후처리 로직 (표준 CSV 저장)
+            save_path = str(settings.CONDITION_CSV_PATH)
 
             df = pd.DataFrame(results)
             df = df.sort_values(by="거래대금(억)", ascending=False)
@@ -697,14 +766,14 @@ async def main():
                     logger.info(f"   👉 {name} ({code})")
                     daily_memory[code] = 1
 
-            # 기존 엑셀 수정사항 반영
+            # 기존 저장본 수정사항 반영 (당일 재수집 시 차트통과 유지)
             if os.path.exists(save_path):
                 try:
                     if (
                         datetime.fromtimestamp(os.path.getmtime(save_path)).date()
                         == datetime.now().date()
                     ):
-                        old_df = pd.read_excel(save_path, engine="openpyxl")
+                        old_df = pd.read_csv(save_path, encoding="utf-8-sig")
                         if (
                             "종목코드" in old_df.columns
                             and "(차트통과)" in old_df.columns
@@ -717,149 +786,6 @@ async def main():
                             )
                 except:
                     pass
-
-            # 캔들 몸통 비율 계산 및 필터링
-            def calculate_candle_body_ratio(row):
-                """캔들의 몸통 비율을 계산 (몸통 크기 / 전체 크기)"""
-                open_price = row["시가"]
-                high_price = row["고가"]
-                low_price = row["저가"]
-                close_price = row["종가"]
-
-                # 가격 데이터가 유효한지 확인
-                if high_price == 0 or low_price == 0 or high_price == low_price:
-                    return 0.0
-
-                body_size = abs(close_price - open_price)  # 몸통 크기
-                total_size = high_price - low_price  # 전체 크기 (고가 - 저가)
-
-                if total_size == 0:
-                    return 0.0
-
-                return body_size / total_size
-
-            # 각 종목의 캔들 몸통 비율 계산
-            df["캔들몸통비율"] = df.apply(calculate_candle_body_ratio, axis=1)
-
-            # [New] 시가 갭 상승 비율 계산
-            def calculate_gap_ratio(row):
-                """시가 갭 비율 계산 (시가 - 전일종가) / 전일종가"""
-                prev_close = row["전일종가"]
-                open_price = row["시가"]
-
-                if prev_close == 0:
-                    return 0.0
-
-                return (open_price - prev_close) / prev_close
-
-            df["시가갭비율"] = df.apply(calculate_gap_ratio, axis=1)
-
-            # [수정] 차트통과 값은 이미 fetch_single_stock에서 SMA/EMA/단기과열 기준으로 설정됨
-            # 추가로 캔들 몸통 비율 필터링 적용 (단, 시가 갭 상승이 높으면 예외)
-
-            # SMA/EMA/단기과열로 이미 필터된 종목 확인
-            sma_filtered_count = len(df[df["(차트통과)"] == 0])
-
-            # 캔들 몸통이 약하지만 시가 갭 상승이 큰 경우 예외 처리
-            # 조건: 캔들몸통비율 < 50% AND 시가갭비율 < 5%인 경우만 필터링
-            weak_candle_mask = (
-                df["캔들몸통비율"] < settings.CANDLE_BODY_RATIO_THRESHOLD
-            ) & (
-                df["시가갭비율"] < settings.GAP_UP_THRESHOLD
-            )  # 갭 상승이 작을 때만 필터
-
-            # [수정] 상한가 다음날 시나리오는 SMA 120 위라면 몸통 비율 예외 적용
-            if "(시나리오)" in df.columns and "(sma120)" in df.columns:
-                upper_limit_exception = (df["(시나리오)"] == "상한가 다음날") & (
-                    df["종가"] >= df["(sma120)"]
-                )
-                weak_candle_mask = weak_candle_mask & (~upper_limit_exception)
-
-            # 차트통과가 1인 종목 중에서 약한 캔들 필터링
-            df.loc[weak_candle_mask & (df["(차트통과)"] == 1), "(차트통과)"] = 0
-
-            # 최종 필터링 결과 출력
-            total_filtered = len(df[df["(차트통과)"] == 0])
-            candle_filtered_count = total_filtered - sma_filtered_count
-
-            logger.info(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
-            logger.info(f"{Colors.CYAN}[차트 필터링 결과]{Colors.RESET}")
-
-            # 단기과열 필터링 종목 (이미 앞에서 출력되었지만 요약)
-            if overheated_stock_codes:
-                overheated_in_list = df[df["종목코드"].isin(overheated_stock_codes)]
-                if not overheated_in_list.empty:
-                    logger.info(
-                        f"\n  🔥 {Colors.YELLOW}단기과열: {len(overheated_in_list)}개{Colors.RESET}"
-                    )
-                    for _, row in overheated_in_list.iterrows():
-                        logger.info(f"     - {row['종목명']} ({row['종목코드']})")
-
-            # SMA 120 필터링 종목 (신규종목 포함)
-            if sma_filtered_count > 0:
-                logger.info(
-                    f"\n  📉 {Colors.RED}SMA 120 필터: {sma_filtered_count}개{Colors.RESET}"
-                )
-                # 실제로는 단기과열이 아니면서 차트통과=0인 종목 중 캔들 몸통은 괜찮은 것들
-                sma_filtered = df[
-                    (df["(차트통과)"] == 0)
-                    & (~df["종목코드"].isin(overheated_stock_codes))
-                    & (df["캔들몸통비율"] >= 0.5)
-                ]
-                for _, row in sma_filtered.head(10).iterrows():  # 최대 10개만 표시
-                    logger.info(f"     - {row['종목명']} ({row['종목코드']})")
-                if len(sma_filtered) > 10:
-                    logger.info(f"     ... 외 {len(sma_filtered) - 10}개")
-
-            # 캔들 몸통 필터링 종목 (갭 상승 예외 제외)
-            if candle_filtered_count > 0:
-                logger.info(
-                    f"\n  📊 {Colors.YELLOW}캔들 몸통 필터: {candle_filtered_count}개{Colors.RESET}"
-                )
-                candle_filtered = df[
-                    (df["(차트통과)"] == 0)
-                    & (~df["종목코드"].isin(overheated_stock_codes))
-                    & (df["캔들몸통비율"] < settings.CANDLE_BODY_RATIO_THRESHOLD)
-                    & (
-                        df["시가갭비율"] < settings.GAP_UP_THRESHOLD
-                    )  # 갭 상승 작은 것만
-                ]
-                for _, row in candle_filtered.head(10).iterrows():
-                    logger.info(
-                        f"     - {row['종목명']} (몸통: {row['캔들몸통비율']:.1%}, 갭: {row['시가갭비율']:+.1%})"
-                    )
-                if len(candle_filtered) > 10:
-                    logger.info(f"     ... 외 {len(candle_filtered) - 10}개")
-
-            # [New] 갭 상승 예외로 통과한 종목 (캔들 몸통은 약하지만 갭 상승이 큼)
-            gap_exception = df[
-                (df["(차트통과)"] == 1)
-                & (df["캔들몸통비율"] < settings.CANDLE_BODY_RATIO_THRESHOLD)
-                & (df["시가갭비율"] >= settings.GAP_UP_THRESHOLD)
-            ]
-            if not gap_exception.empty:
-                logger.info(
-                    f"\n  🚀 {Colors.GREEN}갭 상승 예외 통과: {len(gap_exception)}개{Colors.RESET}"
-                )
-                logger.info(
-                    f"     (캔들 몸통 < {settings.CANDLE_BODY_RATIO_THRESHOLD:.0%} 이지만 갭 상승 >= {settings.GAP_UP_THRESHOLD:.0%})"
-                )
-                for _, row in gap_exception.head(10).iterrows():
-                    logger.info(
-                        f"     - {row['종목명']} (몸통: {row['캔들몸통비율']:.1%}, 갭: {row['시가갭비율']:+.1%})"
-                    )
-                if len(gap_exception) > 10:
-                    logger.info(f"     ... 외 {len(gap_exception) - 10}개")
-
-            # 요약
-            logger.info(f"\n  {Colors.BOLD}[요약]{Colors.RESET}")
-            logger.info(f"  총 필터: {Colors.RED}{total_filtered}{Colors.RESET}개 종목")
-            logger.info(
-                f"  통과: {Colors.GREEN}{len(df) - total_filtered}{Colors.RESET}개 종목"
-            )
-            logger.info(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
-
-            # 캔들몸통비율 컬럼은 임시 분석용이므로 최종 저장 시 제외
 
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump({"date": today_str, "data": daily_memory}, f, indent=2)
@@ -916,47 +842,8 @@ async def main():
 
             df_excel = df.rename(columns=rename_map)
 
-            cols_order = [
-                "(차트통과)",
-                "(시나리오)",
-                "(상장일수)",
-                "종목명",
-                "(종목코드)",
-                "(시가)",
-                "(고가)",
-                "(저가)",
-                "(종가)",
-                "(전일종가)",
-                "(시가총액, 억)",
-                "(거래대금, 억)",
-                "(등락률)",
-                "(선정 순위)",
-                "(기관_순매수)",
-                "(외국인_순매수)",
-                "(프로그램_순매수)",
-                "(체결강도)",
-                "(시장구분)",
-                "(총 종목 수)",
-                "(평균 거래대금)",
-                "(kospi, %)",
-                "(kosdaq, %)",
-                "(v-kospi)",
-                "(v-kosdaq)",
-                "(거래량)",
-            ]
-            df_excel[cols_order].to_excel(save_path, index=False)
-
-            # 엑셀 서식 적용
-            try:
-                wb = load_workbook(save_path)
-                ws = wb.active
-                center_align = Alignment(horizontal="center", vertical="center")
-                for row in ws.iter_rows():
-                    for cell in row:
-                        cell.alignment = center_align
-                wb.save(save_path)
-            except:
-                pass
+            # 표준 열 순서로 utf-8-sig CSV (+ Parquet) 저장
+            save_collected_condition_data(df_excel, save_path)
 
             # 수집 결과 요약 출력
             success_count = len(results) - len(failed_info)
@@ -991,7 +878,7 @@ async def main():
                         f"      - {name} ({code}) [실패항목: {Colors.YELLOW}{', '.join(apis)}{Colors.RESET}]"
                     )
 
-            logger.info(f"\n{Colors.GREEN}📂 엑셀 저장 완료: {save_path}{Colors.RESET}")
+            logger.info(f"\n{Colors.GREEN}📂 표준 CSV 저장 완료: {save_path}{Colors.RESET}")
         else:
             logger.info(f"{Colors.YELLOW}⚠ 검색된 종목이 없습니다.{Colors.RESET}")
 

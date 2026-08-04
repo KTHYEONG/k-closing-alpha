@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260804_daily_pipeline_refactor",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ADR_20260804_daily_pipeline_refactor",
+      "domain": "daily",
+      "title": "Daily Data Pipeline Refactoring & CSV Storage Standardization",
+      "why": "Legacy heuristic judgment logic in collect_data & predict_position and inefficient excel openpyxl serialization",
+      "resolution": "Refactored collect_data & predict_position with single-pass scenario priority logic, standardized UTF-8-sig CSV export with fixed 26-column order",
+      "impact": "Improved prediction speed, eliminated duplicate API calls, guaranteed seamless spreadsheet copy-paste workflow"
+    },
+    {
       "task_id": "daily_pipeline_integration",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_daily_pipeline_integration",

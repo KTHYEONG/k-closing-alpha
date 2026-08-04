@@ -32,7 +32,7 @@ except ImportError:
 from src import settings
 
 LABEL_ENCODER_PATH = str(settings.LABEL_ENCODER_PATH)
-CONDITION_EXCEL_PATH = str(settings.CONDITION_EXCEL_PATH)
+CONDITION_CSV_PATH = str(settings.CONDITION_CSV_PATH)
 DEFAULT_SCENARIOS = settings.DEFAULT_SCENARIOS
 DAY_NAME_MAP = settings.DAY_NAME_MAP
 GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
@@ -83,9 +83,9 @@ def load_and_preprocess_data(file_path):
     logger.info(f"{Colors.CYAN}조건검색 데이터 로드 중... ({file_path}){Colors.RESET}")
 
     try:
-        df = pd.read_excel(file_path, engine="openpyxl")
+        df = pd.read_csv(file_path)
     except Exception as e:
-        logger.info(f"{Colors.RED}엑셀 파일 로드 실패: {e}{Colors.RESET}")
+        logger.info(f"{Colors.RED}CSV 파일 로드 실패: {e}{Colors.RESET}")
         sys.exit(1)
 
     # [Fix] 최신 엑셀 컬럼명 형식(괄호 포함) 대응을 위한 rename_map 업데이트
@@ -263,7 +263,7 @@ def run_daily_sizing_inference(
 
 def main():
     # 1. 데이터 로드 및 테마 매핑
-    df_condition = load_and_preprocess_data(CONDITION_EXCEL_PATH)
+    df_condition = load_and_preprocess_data(settings.CONDITION_CSV_PATH)
     theme_map = load_theme_from_db()
 
     # [Smart Sync] 현재 분석 종목 중 테마가 없는 종목이 있는지 확인
@@ -334,10 +334,9 @@ def main():
         logger.info(f"{Colors.YELLOW}[Warning] 변동성 계산 중 오류 발생: {e}{Colors.RESET}")
         logger.info("  > 변동성 관련 피처는 0으로 처리됩니다.")
 
-    # 3. [핵심] 시나리오 확장 - 차트통과=0인 종목은 SMA 120 실시간 계산
-    # 차트통과=1: 모든 시나리오
-    # 차트통과=0 & SMA 120 미만: "120 돌파" 시나리오만
-    # 차트통과=0 & SMA 120 이상 (캔들 필터만): 모든 시나리오
+    # 3. [핵심] 시나리오 확장 - 수집 단계에서 저장된 (시나리오)를 그대로 사용
+    # 차트통과=1: 저장된 시나리오 유지
+    # 차트통과=0: 저장된 시나리오 유지 (미지정은 "거래량 폭증" 기본)
 
     df_passed = df_condition[df_condition["차트통과"] == 1].copy()  # 통과한 종목
     df_filtered = df_condition[df_condition["차트통과"] == 0].copy()  # 필터된 종목
@@ -444,92 +443,26 @@ def main():
                 f"{Colors.MAGENTA}📌 차트통과=0 but 시나리오 지정: {len(df_filtered_with_scenario)}개 (지정+상따){Colors.RESET}"
             )
 
-        # [Step 4] 시나리오 미지정 차트통과=0 종목: SMA 120 기준으로 분류
+        # [Step 4] 시나리오 미지정 차트통과=0 종목: 기본 시나리오 적용
+        # (수집 단계에서 시나리오가 정형화되므로 중복 SMA 120 재계산 없이 "거래량 폭증" 기본값 사용)
         if not df_filtered_without_scenario.empty:
-            logger.info(
-                f"\n{Colors.CYAN}[차트통과=0 & 시나리오 미지정 종목 SMA 120 분석 중...]{Colors.RESET}"
+
+            def get_default_scenarios(row):
+                scenarios = ["거래량 폭증"]
+                if row.get("등락률", 0) >= 20:
+                    if "상따" not in scenarios:
+                        scenarios.append("상따")
+                return scenarios
+
+            df_filtered_without_scenario["Scenario_List"] = (
+                df_filtered_without_scenario.apply(get_default_scenarios, axis=1)
             )
-
-            import asyncio
-
-            from src.api.kis_client import calculate_stock_sma
-
-            df_sma_below = []  # SMA 120 미만
-            df_candle_only = []  # 캔들 필터만 (SMA 120 이상)
-
-            async def check_sma_for_filtered_stocks():
-                for idx, row in df_filtered_without_scenario.iterrows():
-                    ticker = str(row["종목코드"]).zfill(6)
-                    stock_name = row["종목명"]
-                    current_price = row.get("종가", row.get("현재가", 0))
-
-                    sma_120, success = await calculate_stock_sma(ticker, sma_period=120)
-
-                    if success and sma_120 > 0:
-                        if current_price < sma_120:
-                            df_sma_below.append(row)
-                            logger.info(
-                                f"  📉 {stock_name}: 현재가 {current_price:,}원 < SMA120 {sma_120:,.0f}원 → 120돌파 시나리오만"
-                            )
-                        else:
-                            df_candle_only.append(row)
-                            logger.info(
-                                f"  📊 {stock_name}: 현재가 {current_price:,}원 >= SMA120 {sma_120:,.0f}원 → 거래량 폭증"
-                            )
-                    else:
-                        df_candle_only.append(row)
-                        logger.info(f"  ⚠️  {stock_name}: SMA 계산 실패 → 거래량 폭증")
-
-            asyncio.run(check_sma_for_filtered_stocks())
-
-            # 3-2-B-1. SMA 120 미만 종목: "120 돌파" + "상따" 시나리오
-            if df_sma_below:
-                df_sma_below_df = pd.DataFrame(df_sma_below)
-
-                def get_sma_below_scenarios(row):
-                    # 120 돌파 관련 시나리오 자동 선택
-                    breakthrough_scenarios = [
-                        s for s in DEFAULT_SCENARIOS if "120" in s or "돌파" in s
-                    ]
-                    if not breakthrough_scenarios:
-                        breakthrough_scenarios = [DEFAULT_SCENARIOS[0]]
-
-                    scenarios = breakthrough_scenarios[:]
-                    if row.get("등락률", 0) >= 20:
-                        if "상따" not in scenarios:
-                            scenarios.append("상따")
-                    return scenarios
-
-                df_sma_below_df["Scenario_List"] = df_sma_below_df.apply(
-                    get_sma_below_scenarios, axis=1)
-                df_sma_below_exploded = df_sma_below_df.explode("Scenario_List")
-                df_sma_below_exploded["Scenario_Base"] = df_sma_below_exploded[
-                    "Scenario_List"
-                ]
-                df_all_parts.append(
-                    df_sma_below_exploded.drop(columns=["Scenario_List"])
-                )
-
-            # 3-2-B-2. 캔들 필터만 종목: "거래량 폭증" + "상따" 시나리오
-            if df_candle_only:
-                df_candle_only_df = pd.DataFrame(df_candle_only)
-
-                def get_candle_only_scenarios(row):
-                    scenarios = ["거래량 폭증"]
-                    if row.get("등락률", 0) >= 20:
-                        if "상따" not in scenarios:
-                            scenarios.append("상따")
-                    return scenarios
-
-                df_candle_only_df["Scenario_List"] = df_candle_only_df.apply(
-                    get_candle_only_scenarios, axis=1)
-                df_candle_only_exploded = df_candle_only_df.explode("Scenario_List")
-                df_candle_only_exploded["Scenario_Base"] = df_candle_only_exploded[
-                    "Scenario_List"
-                ]
-                df_all_parts.append(
-                    df_candle_only_exploded.drop(columns=["Scenario_List"])
-                )
+            df_default_exploded = df_filtered_without_scenario.explode("Scenario_List")
+            df_default_exploded["Scenario_Base"] = df_default_exploded["Scenario_List"]
+            df_all_parts.append(df_default_exploded.drop(columns=["Scenario_List"]))
+            logger.info(
+                f"{Colors.MAGENTA}📌 차트통과=0 but 시나리오 미지정: {len(df_filtered_without_scenario)}개 → 거래량 폭증 기본 적용{Colors.RESET}"
+            )
 
     # 3-3. 모든 부분 결합
     if df_all_parts:
@@ -540,23 +473,9 @@ def main():
 
     # 결과 요약
     logger.info(f"\n{Colors.CYAN}[시나리오 적용 완료]{Colors.RESET}")
-    logger.info(f"  ✅ 차트통과: {len(df_passed)}개 × {len(DEFAULT_SCENARIOS)}개 시나리오")
-
-    # [Fix] 변수가 조건문 내부에서만 정의되므로 안전하게 참조
+    logger.info(f"  ✅ 차트통과: {len(df_passed)}개 × 시나리오 확장")
     if df_filtered is not None and not df_filtered.empty:
-        # df_sma_below와 df_candle_only는 리스트로 정의되었으므로 존재 여부 확인 후 len() 호출
-        sma_below_count = (
-            len(df_sma_below) if "df_sma_below" in locals() and df_sma_below else 0
-        )
-        candle_only_count = (
-            len(df_candle_only)
-            if "df_candle_only" in locals() and df_candle_only
-            else 0
-        )
-        logger.info(f"  📉 SMA 120 미만: {sma_below_count}개 × 120돌파 시나리오만")
-        logger.info(
-            f"  📊 캔들 필터만: {candle_only_count}개 × {len(DEFAULT_SCENARIOS)}개 시나리오"
-        )
+        logger.info(f"  📊 차트통과=0: {len(df_filtered)}개 × 저장 시나리오 유지")
     logger.info()
 
     # [New] v-kospi & v-kosdaq 피처 주입
