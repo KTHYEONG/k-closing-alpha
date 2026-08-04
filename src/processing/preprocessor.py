@@ -1,467 +1,309 @@
+"""ML 데이터 전처리 및 피처 엔지니어링 파이프라인 (Parquet 기반).
+
+`docs/specs/ml_data_preprocessing.md` 명세를 구현합니다.
+`trade_log.parquet` / `theme.parquet` 원본 컬럼명을 표준 식별자로 정규화하고,
+랭킹/회귀/분류 multi-task 학습용 타깃 3종과 횡단면 상대 피처를 생성합니다.
+
+컬럼명 정규화 매핑은 `src.processing.schema.RAW_TO_STANDARD_MAP`를
+단일 원천으로 사용합니다.
+"""
+
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 
-# 컬럼 이름 상수로 관리
-DATE_COL = "매수날짜"
-TARGET_CLASSIFICATION = "Win"
-TARGET_REGRESSION = "수익률"
+from src.ml.sizing_engine import ROUND_TRIP_COST_RATIO
+from src.processing.schema import RAW_TO_STANDARD_MAP
 
-RENAME_MAP = {
-    "(매수날짜)": DATE_COL,
-    "(종목코드)": "종목코드",
-    "(시가총액, 억)": "시가총액",
-    "(거래대금, 억)": "거래대금",
-    "(등락률)": "등락률",
-    "(선정 순위)": "선정순위",
-    "(기관_순매수)": "기관_순매수",
-    "(외국인_순매수)": "외국인_순매수",
-    "(테마/섹터)": "테마_섹터",
-    "(차트통과)": "차트통과",
-    "(차트분석)": "차트분석",
-    "(매수 가격)": "매수가격",
-    "(매도 가격)": "매도가격",
-    "(총 종목 수)": "총_종목수",
-    "(평균 거래대금)": "평균_거래대금",
-    "(수익률, %)": TARGET_REGRESSION,
-    "(Win)": TARGET_CLASSIFICATION,
-    "(kospi, %)": "kospi",
-    "(kosdaq, %)": "kosdaq",
-    "(시장구분)": "시장구분",
-    "(수익 구간)": "수익_구간",
-    "(중요 손실 지표)": "중요_손실_지표",
-    "(프로그램_순매수)": "프로그램_순매수",
-    "(체결강도)": "체결강도",
-    "(v-kospi)": "v_kospi",
-    "(v-kosdaq)": "v_kosdaq",
-    # OHLC 데이터 추가
-    "(시가)": "시가",
-    "(고가)": "고가",
-    "(저가)": "저가",
-    "(종가)": "종가",
-    "(전일종가)": "전일종가",
-    "(ema5)": "ema5",
-    "(ema10)": "ema10",
-    "(ema20)": "ema20",
-    "(거래량)": "거래량",
+_NUMERIC_COLUMNS: tuple[str, ...] = (
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "prev_close_price",
+    "market_cap_100m",
+    "trade_value_100m",
+    "change_rate",
+    "selection_rank",
+    "inst_net_buy",
+    "foreign_net_buy",
+    "prog_net_buy",
+    "volume_power",
+    "total_candidate_count",
+    "avg_trade_value",
+    "kospi_change",
+    "kosdaq_change",
+    "v_kospi",
+    "v_kosdaq",
+    "volume",
+    "buy_price",
+    "sell_price",
+    "net_return",
+)
+
+_LOG_AMOUNT_COLUMNS: tuple[str, ...] = (
+    "market_cap_100m",
+    "trade_value_100m",
+    "volume",
+    "avg_trade_value",
+)
+
+_SIGNED_LOG_COLUMNS: tuple[str, ...] = (
+    "inst_net_buy",
+    "foreign_net_buy",
+    "prog_net_buy",
+)
+
+_PCT_RANK_COLUMNS: dict[str, str] = {
+    "trade_value_100m": "trade_value_pct_rank",
+    "inst_net_buy": "inst_net_buy_pct_rank",
+    "foreign_net_buy": "foreign_net_buy_pct_rank",
+    "change_rate": "change_rate_pct_rank",
+    "major_density": "major_density_pct_rank",
+    "prog_dominance": "prog_dominance_pct_rank",
+    "gap_ratio": "gap_ratio_pct_rank",
+    "turnover": "turnover_pct_rank",
 }
 
+# Robust Z-Score ((x - median) / MAD) 횡단면 표준화 대상
+_ROBUST_Z_COLUMNS: tuple[str, ...] = (
+    "change_rate",
+    "buy_price_change_rate",
+    "gap_ratio",
+    "major_density",
+    "prog_dominance",
+    "turnover",
+    "inst_density",
+    "foreign_density",
+)
+
+_CATEGORICAL_COLUMNS: tuple[str, ...] = ("market_type", "theme_sector", "chart_analysis")
+
+# 학습 피처 집합(X)에서 완전 격리하는 메타데이터/미래 정보 컬럼
+_EXCLUDED_FROM_X: set[str] = {
+    # 메타/식별자
+    "trade_date",
+    "stock_code",
+    # 미래 정보 (매수 시점 미확정 가격)
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "prev_close_price",
+    "buy_price",
+    "sell_price",
+    # Data Leakage 방지
+    "intraday_return",
+    # 원본 금액/거래량 컬럼 (log_ 접두사 파생 컬럼만 학습 피처로 사용)
+    "market_cap_100m",
+    "trade_value_100m",
+    "volume",
+    "avg_trade_value",
+    # 타깃 변수
+    "net_return",
+    "target_return",
+    "target_rank",
+    "target_good",
+    "target_bad",
+}
+
+_TARGET_NAMES: tuple[str, ...] = ("target_return", "target_rank", "target_good", "target_bad")
 
 
-# [Phase 1.5] 기술적 지표 추가 함수 (기존 EMA 컬럼 활용)
-def _add_technical_features(df):
-    """[Phase 1.5] 기술적 지표 10종 추가
-    스프레드시트에 이미 계산된 EMA(5, 10, 20)를 활용하여 파생 지표 생성
-    """
-    # 그룹핑 (종목코드 기준) - shift 연산 등에 필요
-    g = df.groupby("종목코드")
-    close = df["종가"]
-    volume = df["거래대금"]
-    
-    # 이미 RENAME_MAP을 통해 ema5, ema10, ema20 컬럼이 존재함
-    if "ema5" not in df.columns or "ema20" not in df.columns:
-        print("   ⚠️ EMA 컬럼이 없습니다. 수동 계산을 시도합니다.")
-        ema5 = g["종가"].transform(lambda x: x.ewm(span=5, adjust=False).mean())
-        ema20 = g["종가"].transform(lambda x: x.ewm(span=20, adjust=False).mean())
-    else:
-        ema5 = df["ema5"]
-        ema20 = df["ema20"]
-    
-    # 1. 이격도 (Disparity)
-    df["disparity_5"] = close / ema5
-    
-    # 2. 모멘텀 (Momentum 3D)
-    df["momentum_3d"] = close / g["종가"].shift(3) - 1
-    
-    # 3. 변동성 (Volatility 5D)
-    df["volatility_5d"] = g["등락률"].transform(lambda x: x.rolling(5).std())
-    
-    # 4. 거래량 비율 (Volume Ratio)
-    vol_avg5 = g["거래대금"].transform(lambda x: x.rolling(5).mean())
-    df["volume_ratio"] = volume / vol_avg5.replace(0, np.nan)
-    
-    # New Momentum
-    df["momentum_5d"] = close / g["종가"].shift(5) - 1
-    
-    # 5. EMA 정배열 점수
-    df["trend_score"] = (ema5 > ema20).astype(int)
-    
-    # 6. EMA 이탈도 (Oscillator)
-    df["ema_oscillator"] = (ema5 - ema20) / ema20
-    
-    # 7. 중기 위치 (Position)
-    df["position_20d"] = (close - ema20) / ema20
-    
-    # 8. 중기 방향 (Direction)
-    df["directional_20d"] = close / g["종가"].shift(20) - 1
-    
-    # 9. MACD Fast
-    df["macd_fast"] = ema5 - ema20
-    
-    # 10. RSI 14 (Simple)
-    delta = g["종가"].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    avg_gain = up.transform(lambda x: x.rolling(14).mean())
-    avg_loss = down.transform(lambda x: x.rolling(14).mean())
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi_14"] = 100 - (100 / (1 + rs))
-    
-    # 결측치 처리 (inf 등 발산 방지)
-    df.replace([np.inf, -np.inf], 0, inplace=True)
-    df.fillna(0, inplace=True)
-    
+def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """원본 컬럼명을 표준 snake_case 식별자로 1:1 매핑 정규화하고 문자열 수치 피처를 정제합니다."""
+    df = df.rename(columns=RAW_TO_STANDARD_MAP)
+
+    if "trade_date" in df.columns:
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+    if "stock_code" in df.columns:
+        df["stock_code"] = (
+            df["stock_code"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+        )
+    for col in _NUMERIC_COLUMNS:
+        if col in df.columns:
+            if df[col].dtype == object or isinstance(df[col].dtype, pd.StringDtype):
+                df[col] = (
+                    df[col]
+                    .astype(str)
+                    .str.replace("%", "", regex=False)
+                    .str.replace(",", "", regex=False)
+                    .str.strip()
+                )
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 
-def preprocess_data(df, task="classification", target_col=None, feature_flags=None, exclude_features=None):
-    """주식 데이터프레임을 받아 전처리하고, 특성(X), 타겟(y), 범주형 특성 리스트, 전처리된 df를 반환합니다.
-    """
-    print("⚙️ 데이터 전처리 및 영업일 기준 고도화 중...")
-    
-    # Feature flags 기본값 설정
-    if feature_flags is None:
-        feature_flags = {
-            "turnover": False,
-            "upper_shadow": False,
-            "body_length": False,
-            "gap_ratio": False
-        }
-    
-    if exclude_features is None:
-        exclude_features = ["시장구분", "선정순위"]
-    
-    active_features = [k for k, v in feature_flags.items() if v]
-    if active_features:
-        print(f"   🔧 추가 피처 활성화: {', '.join(active_features)}")
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """로그 스케일링, 상대 비율, 횡단면 백분위/robust-z 피처를 생성합니다."""
+    df = df.copy()
 
-    df.rename(columns=RENAME_MAP, inplace=True)
-    df.replace("", np.nan, inplace=True)
+    prev_close = df["prev_close_price"].replace(0, np.nan)
+    # BUG-1: buy_price_change_rate/gap_ratio를 % 단위로 통일 (kospi/kosdaq_change와 동일 스케일)
+    df["buy_price_change_rate"] = (df["buy_price"] - df["prev_close_price"]) / prev_close * 100
+    df["gap_ratio"] = (df["open_price"] - df["prev_close_price"]) / prev_close * 100
+    df["intraday_return"] = (df["close_price"] - df["open_price"]) / df["open_price"].replace(
+        0, np.nan
+    )
 
-    if "차트분석" in df.columns and "차트통과" in df.columns:
-        df["차트분석"] = (
-            df["차트분석"].fillna("Unknown").astype(str)
-            + "_"
-            + df["차트통과"].fillna("N").astype(str)
-        )
-        df.drop(columns=["차트통과"], inplace=True)
+    # FEAT-1: 캔들/가격 파생 피처
+    candle_range = (df["high_price"] - df["low_price"]).clip(lower=1)
+    df["intraday_range"] = (df["high_price"] - df["low_price"]) / prev_close * 100
+    df["close_position"] = (df["close_price"] - df["low_price"]) / candle_range
+    body_top = np.maximum(df["open_price"], df["close_price"])
+    df["upper_shadow_ratio"] = (df["high_price"] - body_top) / candle_range
+    df["body_ratio"] = np.abs(df["close_price"] - df["open_price"]) / candle_range
+    df["turnover"] = df["trade_value_100m"] / df["market_cap_100m"].clip(lower=0.01)
 
-    if DATE_COL not in df.columns:
-        raise ValueError(f"Error: 필수 컬럼({DATE_COL})이 데이터에 없습니다.")
-    
-    df[DATE_COL] = pd.to_datetime(df[DATE_COL])
-    # 날짜순 정렬
-    df = df.sort_values(DATE_COL).reset_index(drop=True)
-    
-    # [중요] EMA 값이 하나라도 비어있는(NaN) 행 제거
-    ema_cols = ["ema5", "ema10", "ema20"]
-    existing_ema_cols = [c for c in ema_cols if c in df.columns]
-    
-    # 1. 핵심 수치 컬럼 일괄 형변환 (OHLCV + EMA 등)
-    target_numeric_cols = ["시가", "고가", "저가", "종가", "거래대금", "거래량", "전일종가", "ema5", "ema10", "ema20"]
-    for col in target_numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+    trade_value = df["trade_value_100m"].replace(0, np.nan)
+    # BUG-5: 수급 NaN 안전 합산 (fillna(0)) + FEAT-2: 개별 수급 밀도
+    if "inst_net_buy" in df.columns:
+        df["inst_density"] = df["inst_net_buy"].fillna(0) / trade_value
+    if "foreign_net_buy" in df.columns:
+        df["foreign_density"] = df["foreign_net_buy"].fillna(0) / trade_value
+    inst_part = (
+        df["inst_net_buy"].fillna(0)
+        if "inst_net_buy" in df.columns
+        else pd.Series(0.0, index=df.index)
+    )
+    foreign_part = (
+        df["foreign_net_buy"].fillna(0)
+        if "foreign_net_buy" in df.columns
+        else pd.Series(0.0, index=df.index)
+    )
+    df["major_density"] = (inst_part + foreign_part) / trade_value
+    if "prog_net_buy" in df.columns:
+        df["prog_dominance"] = df["prog_net_buy"] / trade_value
 
-    if existing_ema_cols:
-         # 2. NaN 제거 (변환 실패 + 원래 결측치)
-        before_len = len(df)
-        df = df.dropna(subset=existing_ema_cols).copy()
-        removed_len = before_len - len(df)
-        if removed_len > 0:
-            print(f"   ⚠️ EMA 결측치 발견: {removed_len}개 행 제거 완료")
-    
-    # [Phase 1.5] 기술적 지표 추가 호출
-    df = _add_technical_features(df)
+    # BUG-6: total_candidate_count NaN → fillna(1)
+    df["rank_ratio"] = df["selection_rank"] / df["total_candidate_count"].fillna(1).clip(lower=1)
 
+    market_ref = np.where(
+        df["market_type"].astype(str).str.upper().str.contains("KOSDAQ", na=False),
+        df["kosdaq_change"],
+        df["kospi_change"],
+    )
+    df["relative_change_rate"] = df["buy_price_change_rate"] - market_ref
 
-    # -------------------------------------------------------------------------
-    # [날짜 피처 고도화] 영업일 및 리스크 기반
-    # -------------------------------------------------------------------------
-    def _apply_advanced_date_features(df):
-        df = df.copy()
-        dt_series = df[DATE_COL]
-        
-        # 1. 주기성 인코딩 (Month, Day) - 실제 월 일수(days_in_month) 반영
-        df["month_sin"] = np.sin(2 * np.pi * dt_series.dt.month / 12)
-        df["month_cos"] = np.cos(2 * np.pi * dt_series.dt.month / 12)
-        df["day_sin"] = np.sin(2 * np.pi * dt_series.dt.day / dt_series.dt.days_in_month)
-        df["day_cos"] = np.cos(2 * np.pi * dt_series.dt.day / dt_series.dt.days_in_month)
+    # FEAT-3: KOSPI/KOSDAQ 독립 상대강도 + 섹터 내 상대강도
+    df["relative_change_kospi"] = df["change_rate"] - df["kospi_change"]
+    df["relative_change_kosdaq"] = df["change_rate"] - df["kosdaq_change"]
+    if "theme_sector" in df.columns:
+        sector_mean = df.groupby(["trade_date", "theme_sector"])["change_rate"].transform("mean")
+        df["sector_relative_change"] = df["change_rate"] - sector_mean
 
-        # 2. 영업일 기준 특징 (unique_dates를 사용하여 종목 중복 영향 배제)
-        unique_dates = pd.Series(sorted(dt_series.unique()))
-        
-        # 2-1. 오버나이트 리스크 (다음 거래일까지의 날짜 차이)
-        date_risk_map = {
-            date: diff for date, diff in zip(unique_dates, unique_dates.diff().dt.days.shift(-1).fillna(1))
-        }
-        df["date_diff"] = dt_series.map(date_risk_map)
-
-        # 2-2. 실제 영업일 월말 (다음 데이터에서 월이 바뀌는지 체크)
-        is_month_end_map = {
-            date: int(month != next_month) for date, month, next_month in zip(
-                unique_dates, unique_dates.dt.month, unique_dates.dt.month.shift(-1).fillna(unique_dates.dt.month.iloc[-1])
-            )
-        }
-        df["is_trading_month_end"] = dt_series.map(is_month_end_map)
-
-        # 3. 요일 (Categorical)
-        df["weekday"] = dt_series.dt.dayofweek
-        
-        return df
-
-    df = _apply_advanced_date_features(df)
-
-    # 나머지 수치형 전처리 로직 (기존 구현 함수들 호출)
-    # -------------------------------------------------------------------------
-    def _apply_log_scaling(df, exclude_list):
-        # [V1 Feature Set] exclude_features에 포함된 피처는 로그 변환 제외
-        cols = ["시가총액", "거래대금", "평균_거래대금", "총_종목수", "선정순위"]
-        cols = [c for c in cols if c not in exclude_list]  # 제외 피처 필터링
-        for col in [c for c in cols if c in df.columns]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-            df[col] = np.log1p(df[col].clip(lower=0))
-        return df
-
-    def _apply_signed_log_scaling(df):
-        cols = ["기관_순매수", "외국인_순매수", "프로그램_순매수"]
-        for col in [c for c in cols if c in df.columns]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-            df[col] = np.sign(df[col]) * np.log1p(np.abs(df[col]))
-        return df
-
-    def _apply_custom_ratios(df, exclude_list):
-        calc_cols = ["등락률", "kospi", "kosdaq"]
-        for col in [c for c in calc_cols if c in df.columns]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-        if "체결강도" in df.columns:
-            df["체결강도"] = pd.to_numeric(df["체결강도"], errors="coerce").fillna(100)
-            df["체결강도"] = np.log(df["체결강도"].clip(lower=1) / 100.0)
-        
-        # [V1 Feature Set] 선정순위가 exclude_list에 없을 때만 선정순위_상대 생성
-        if "선정순위" not in exclude_list:
-            if "선정순위" in df.columns and "총_종목수" in df.columns:
-                rank_raw = np.expm1(df["선정순위"]) 
-                total_raw = np.expm1(df["총_종목수"])
-                df["선정순위_상대"] = rank_raw / total_raw.clip(lower=1)
-
-        # [V1 Feature Set] 시장구분이 exclude_list에 없을 때만 사용
-        if "등락률" in df.columns:
-            if "시장구분" not in exclude_list and "시장구분" in df.columns:
-                market_ref = np.where(df["시장구분"].str.contains("KOSDAQ", na=False, case=False), 
-                                      df["kosdaq"], df["kospi"])
-            else:
-                market_ref = df["kospi"]
-            df["상대_등락률"] = df["등락률"] - market_ref
-            df["방어_강도"] = np.where(market_ref < 0, df["상대_등락률"], 0)
-
-        if "거래대금" in df.columns and "평균_거래대금" in df.columns:
-            raw_trade = np.expm1(df["거래대금"])
-            raw_avg_trade = np.expm1(df["평균_거래대금"])
-            df["상대_거래대금"] = np.log((raw_trade + 1) / (raw_avg_trade + 1).clip(lower=1))
-        
-
-
-        # 5. 수급 질적 분석 (중복 제거 및 주도성 분류)
-        buy_cols = ["기관_순매수", "외국인_순매수", "프로그램_순매수"]
-        if all(c in df.columns for c in buy_cols) and "거래대금" in df.columns:
-            # Signed Log 복원
-            raw_inst = np.sign(df["기관_순매수"]) * np.expm1(np.abs(df["기관_순매수"]))
-            raw_fore = np.sign(df["외국인_순매수"]) * np.expm1(np.abs(df["외국인_순매수"]))
-            raw_prog = np.sign(df["프로그램_순매수"]) * np.expm1(np.abs(df["프로그램_순매수"]))
-            raw_trade = np.expm1(df["거래대금"]).clip(lower=1)
-            
-            # 5-1. 메이저 밀도 (순수 주체 합산: 기관 + 외국인)
-            df["메이저_밀도"] = (raw_inst + raw_fore) / raw_trade
-            
-            # 5-2. 프로그램 주도성 (매매 방식의 기계적 강도)
-            df["프로그램_주도성"] = raw_prog / raw_trade
-            
-        return df
-
-    def _convert_remaining_numeric(df):
-        cols = ["등락률", "kospi", "kosdaq", "day_of_month", "month", "체결강도", "v_kospi", "v_kosdaq"]
-        for col in [c for c in cols if c in df.columns]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-        return df
-    
-    # -------------------------------------------------------------------------
-    # [동적 피처 생성] Feature Flags에 따라 선택적으로 피처 추가
-    # -------------------------------------------------------------------------
-    def _apply_optional_features(df, flags):
-        """Feature flags에 따라 선택적 피처를 생성합니다."""
-        # 1. 회전율 (거래대금 / 시가총액)
-        if flags.get("turnover", False):
-            if "거래대금" in df.columns and "시가총액" in df.columns:
-                raw_trade = np.expm1(df["거래대금"])
-                raw_mcap = np.expm1(df["시가총액"])
-                turnover = (raw_trade / raw_mcap.clip(lower=1)) * 100
-                df["회전율_log"] = np.log1p(turnover)
-        
-        # 2. 윗꼬리 비율 (OHLC 필요)
-        if flags.get("upper_shadow", False):
-            required_cols = ["시가", "고가", "저가", "종가"]
-            if all(col in df.columns for col in required_cols):
-                # 윗꼬리 = (고가 - max(시가, 종가)) / (고가 - 저가)
-                body_top = np.maximum(df["시가"], df["종가"])
-                candle_range = (df["고가"] - df["저가"]).clip(lower=1e-6)
-                upper_shadow = (df["고가"] - body_top) / candle_range
-                df["윗꼬리_비율"] = upper_shadow.clip(0, 1)
-            else:
-                print(f"   ⚠️ 윗꼬리 비율: OHLC 데이터 부족 (필요: {required_cols})")
-        
-        # 3. 몸통 길이 (OHLC 필요)
-        if flags.get("body_length", False):
-            required_cols = ["시가", "고가", "저가", "종가"]
-            if all(col in df.columns for col in required_cols):
-                # 몸통 길이 = |종가 - 시가| / (고가 - 저가)
-                body_length = np.abs(df["종가"] - df["시가"])
-                candle_range = (df["고가"] - df["저가"]).clip(lower=1e-6)
-                df["몸통_길이_비율"] = (body_length / candle_range).clip(0, 1)
-            else:
-                print(f"   ⚠️ 몸통 길이: OHLC 데이터 부족 (필요: {required_cols})")
-        
-        # 4. 시가 갭 비율 (전일 종가 필요)
-        if flags.get("gap_ratio", False):
-            if "시가" in df.columns and "전일종가" in df.columns:
-                # DB에 이미 전일종가 데이터가 있으므로 직접 사용
-                # 갭 비율 = (시가 - 전일종가) / 전일종가
-                gap_ratio = (df["시가"] - df["전일종가"]) / df["전일종가"].clip(lower=1e-6)
-                df["시가갭_비율"] = gap_ratio.fillna(0).clip(-0.3, 0.3)  # ±30% 제한
-            else:
-                print("   ⚠️ 시가 갭 비율: 시가/전일종가 데이터 부족")
-        
-        return df
-
-    # exclude_features를 함수에 전달
-    df = _apply_log_scaling(df, exclude_features)
-    df = _apply_signed_log_scaling(df)
-    df = _apply_custom_ratios(df, exclude_features)
-    df = _convert_remaining_numeric(df)
-    df = _apply_optional_features(df, feature_flags)
-
-    def _apply_vkospi_advanced(df):
-        if "v_kospi" not in df.columns:
-            return df
-            
-        # 1. 값이 0인 경우(결측) NaN 처리 후 날짜별 대표값(평균) 추출
-        # 종목 데이터이므로 같은 날짜면 v_kospi 값은 동일해야 함
-        # _convert_remaining_numeric에서 이미 0으로 채워졌을 수 있음
-        temp_df = df[[DATE_COL, "v_kospi"]].copy()
-        temp_df["v_kospi"] = temp_df["v_kospi"].replace(0, np.nan)
-        
-        daily_ref = temp_df.groupby(DATE_COL)["v_kospi"].mean()
-        
-        # 2. 결측치 보간 (Forward Fill -> Backward Fill)
-        # 과거 데이터가 비어있으면 앞의 데이터로, 앞이 없으면 뒤에서 가져옴
-        daily_ref = daily_ref.fillna(method='ffill').fillna(method='bfill')
-        
-        # 3. 변화율(Change) 피처 생성
+    # FEAT-4: V-KOSPI/V-KOSDAQ 0값을 NaN 처리 후 날짜별 대표값 보간 + 변화율
+    for vix_col in ("v_kospi", "v_kosdaq"):
+        if vix_col not in df.columns:
+            continue
+        df[vix_col] = df[vix_col].replace(0, np.nan)
+        daily_ref = df.groupby("trade_date")[vix_col].first().ffill().bfill()
+        df[vix_col] = df["trade_date"].map(daily_ref)
         daily_change = daily_ref.pct_change().fillna(0)
-        
-        # 4. 원본 DF에 적용 (Map)
-        # v_kospi 자체도 보간된 값으로 업데이트 (안정성 확보)
-        df["v_kospi"] = df[DATE_COL].map(daily_ref).fillna(0)
-        df["v_kospi_change"] = df[DATE_COL].map(daily_change).fillna(0)
-        
-        return df
+        df[f"{vix_col}_change"] = df["trade_date"].map(daily_change).fillna(0)
 
-    df = _apply_vkospi_advanced(df)
+    # BUG-7: log 변환 시 원본 컬럼 유지 + log_ 접두사 파생 컬럼 생성
+    for col in _LOG_AMOUNT_COLUMNS:
+        if col in df.columns:
+            df[f"log_{col}"] = np.log1p(df[col].clip(lower=0))
 
-    def _apply_vkosdaq_advanced(df):
-        """V-KOSDAQ 결측치 처리 및 변화율 피처 생성"""
-        if "v_kosdaq" not in df.columns:
-            return df
-            
-        # 0을 NaN으로 변환 후 보간
-        df["v_kosdaq"] = df["v_kosdaq"].replace(0, np.nan)
-        df["v_kosdaq"] = df["v_kosdaq"].fillna(method='ffill').fillna(method='bfill')
-        df["v_kosdaq"] = df["v_kosdaq"].fillna(0)
+    for col in _SIGNED_LOG_COLUMNS:
+        if col in df.columns:
+            df[col] = np.sign(df[col]) * np.log1p(np.abs(df[col]))
 
-        # 변화율 피처 생성
-        df["v_kosdaq_change"] = df["v_kosdaq"].pct_change().fillna(0)
-        df["v_kosdaq_change"] = df["v_kosdaq_change"].replace([np.inf, -np.inf], 0)
-        
-        return df
+    # BUG-4: pct-rank 대상 컬럼 존재 검사 후 생성
+    for src_col, dst_col in _PCT_RANK_COLUMNS.items():
+        if src_col in df.columns:
+            df[dst_col] = df.groupby("trade_date")[src_col].rank(pct=True)
 
-    df = _apply_vkosdaq_advanced(df)
+    df = df.replace([np.inf, -np.inf], np.nan)
+    return df
 
-    # -------------------------------------------------------------------------
-    # 타겟 및 특징 선택
-    # -------------------------------------------------------------------------
-    task = task.lower()
-    label_col = target_col if target_col else (TARGET_CLASSIFICATION if task == "classification" else TARGET_REGRESSION)
-    df.dropna(subset=[label_col], inplace=True)
 
-    exclude_cols = {
-        DATE_COL, TARGET_CLASSIFICATION, TARGET_REGRESSION, 
-        "종목코드", "매수가격", "매도가격", "수익_구간", "중요_손실_지표", label_col,
-        # [사용자 요청] 영향력이 미미하거나 메타데이터인 피처 제외
-        "real_trade", "체결강도", "방어_강도", "kosdaq", "kospi", "is_trading_month_end",
-        # [Data Leakage 방지] 매수 시점에 알 수 없는 당일 가격 정보 제외
-        "시가", "고가", "저가", "종가", "전일종가",
-        # [원시값 제외] 종목 간 비교 불가능한 절대값 제외 (파생 지표만 사용)
-        "ema5", "ema10", "ema20", "거래량"
-    }
-    feature_cols = [col for col in df.columns if col not in exclude_cols]
-    
-    # exclude_features 처리 (Feature Importance 기반 제거)
-    if exclude_features is None:
-        exclude_features = []
-    
-    if exclude_features:
-        print(f"   🗑️ 제외 피처 ({len(exclude_features)}개): {', '.join(exclude_features)}")
-        feature_cols = [col for col in feature_cols if col not in exclude_features]
+def create_multi_targets(df: pd.DataFrame) -> pd.DataFrame:
+    """회귀/랭킹/분류 3종 타깃 변수를 생성합니다.
 
-    cat_features_candidates = ["테마_섹터", "차트분석", "시장구분", "weekday"] # weekday로 교체
-    cat_features = [col for col in cat_features_candidates if col in feature_cols]
+    ``net_return``(gross)에서 왕복 거래 비용(``ROUND_TRIP_COST_RATIO``, 0.20%)을
+    차감한 순수익(net-of-cost) 기준으로 회귀/분류 타깃을 인코딩합니다.
+    ``target_rank`` 는 그룹 내 상대순위로 상수 이동에 불변하므로 그대로 둡니다.
+    """
+    df = df.copy()
+    net_of_cost = df["net_return"] - ROUND_TRIP_COST_RATIO * 100.0
+    df["target_return"] = net_of_cost.clip(-10.0, 10.0)
 
+    def assign_daily_rank(group_df: pd.DataFrame) -> pd.Series:
+        n = len(group_df)
+        if n < 5:
+            ranks = group_df["net_return"].rank(method="first", ascending=True)
+            if n == 1:
+                return pd.Series(2, index=group_df.index)  # 단일 종목: 중립 등급
+            return ((ranks - 1) / (n - 1) * 4).round().astype(int).clip(0, 4)
+        return pd.qcut(
+            group_df["net_return"].rank(method="first"), q=5, labels=[0, 1, 2, 3, 4]
+        ).astype(int)
+
+    # pandas 2.x의 groupby.apply는 그룹이 단일 날짜뿐일 때 Series가 아닌
+    # DataFrame을 반환해 target_rank 할당이 깨집니다. 그룹별 명시 매핑으로
+    # 그룹 수와 무관하게 결정적으로 결과를 보장합니다.
+    rank_map: dict[int, int] = {}
+    for _, group_df in df.groupby("trade_date", sort=False):
+        rank_map.update(assign_daily_rank(group_df).to_dict())
+    df["target_rank"] = pd.Series(rank_map, dtype="int64").reindex(df.index)
+    df["target_good"] = (net_of_cost >= 1.0).astype(int)
+    df["target_bad"] = (net_of_cost <= -2.0).astype(int)
+    return df
+
+def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
+    """횡단면 Robust Z-Score((x - median) / MAD)를 생성하고 [-5, 5]로 클리핑합니다.
+
+    MAD가 0인 그룹은 0-나눗셈 방지를 위해 NaN으로 처리합니다.
+    """
+    for col in columns:
+        if col not in df.columns:
+            continue
+        grouped = df.groupby("trade_date")[col]
+        median = grouped.transform("median")
+        mad = grouped.transform(lambda x: (x - x.median()).abs().median())
+        mad = mad.replace(0, np.nan)
+        df[f"{col}_z"] = ((df[col] - median) / mad).clip(-5, 5)
+    return df
+
+
+def build_ml_dataset(
+    trade_log_df: pd.DataFrame, theme_df: pd.DataFrame | None = None
+) -> tuple[pd.DataFrame, dict[str, pd.Series], list[str], pd.DataFrame]:
+    """매매일지 원본 데이터를 정제하여 (X, targets, cat_features, processed_df)를 반환합니다."""
+    df = clean_column_names(trade_log_df.copy())
+
+    if theme_df is not None and not theme_df.empty:
+        if {"종목코드", "테마"}.issubset(theme_df.columns):
+            theme_map = theme_df.set_index("종목코드")["테마"]
+            if "theme_sector" in df.columns:
+                df["theme_sector"] = df["theme_sector"].fillna(df["stock_code"].map(theme_map))
+            else:
+                df["theme_sector"] = df["stock_code"].map(theme_map)
+        if {"종목코드", "시장구분"}.issubset(theme_df.columns):
+            market_map = theme_df.set_index("종목코드")["시장구분"]
+            if "market_type" in df.columns:
+                df["market_type"] = df["market_type"].fillna(df["stock_code"].map(market_map))
+            else:
+                df["market_type"] = df["stock_code"].map(market_map)
+
+    if "trade_date" not in df.columns or "net_return" not in df.columns:
+        raise ValueError("필수 컬럼(trade_date, net_return)이 데이터에 없습니다.")
+
+    df = df.dropna(subset=["net_return"]).copy()
+    df = engineer_features(df)
+    df = _apply_robust_z(df, _ROBUST_Z_COLUMNS)
+    df = create_multi_targets(df)
+
+    for col in _CATEGORICAL_COLUMNS:
+        if col in df.columns:
+            df[col] = df[col].fillna("Unknown").astype(str)
+
+    cat_features = [col for col in _CATEGORICAL_COLUMNS if col in df.columns]
+    targets = {name: df[name] for name in _TARGET_NAMES}
+    feature_cols = [col for col in df.columns if col not in _EXCLUDED_FROM_X]
     X = df[feature_cols].copy()
-    y = df[label_col]
-    
-    # -------------------------------------------------------------------------
-    # [Data Type Conversion] 타겟을 숫자형으로 변환
-    # -------------------------------------------------------------------------
-    # DB에서 불러온 데이터가 문자열일 수 있으므로 명시적으로 숫자형 변환
-    y = pd.to_numeric(y, errors='coerce')
-    
-    # NaN 제거 (변환 실패한 행)
-    valid_idx = y.notna()
-    if not valid_idx.all():
-        n_invalid = (~valid_idx).sum()
-        print(f"⚠️ [Warning] 타겟 변환 실패로 {n_invalid}건 제거됨")
-        X = X[valid_idx]
-        y = y[valid_idx]
-        df = df[valid_idx]
-    
-    # -------------------------------------------------------------------------
-    # [Target Clipping] 극단적인 수익률 제한 (Regression 전용)
-    # -------------------------------------------------------------------------
-    # 모델이 "30% 대박"을 쫓다가 함정에 빠지는 것을 방지하기 위해,
-    # 학습 타겟의 상한/하한을 설정하여 "안정적인 수익 패턴"을 학습하도록 유도합니다.
-    if task == "regression":
-        TARGET_LOWER_BOUND = -10.0  # 하한: -10% (큰 손실은 -10%로 간주)
-        TARGET_UPPER_BOUND = 10.0   # 상한: +10% (큰 수익은 +10%로 간주)
-        
-        original_y = y.copy()
-        y = y.clip(lower=TARGET_LOWER_BOUND, upper=TARGET_UPPER_BOUND)
-        
-        # 클리핑 통계 출력
-        n_clipped_lower = (original_y < TARGET_LOWER_BOUND).sum()
-        n_clipped_upper = (original_y > TARGET_UPPER_BOUND).sum()
-        
-        if n_clipped_lower > 0 or n_clipped_upper > 0:
-            print("📊 [Target Clipping] 극단값 제한 적용:")
-            print(f"   - 하한 초과 ({TARGET_LOWER_BOUND}% 미만): {n_clipped_lower}건")
-            print(f"   - 상한 초과 ({TARGET_UPPER_BOUND}% 초과): {n_clipped_upper}건")
-            print("   → 모델이 '안정적 수익 패턴'에 집중하도록 유도합니다.")
-    
-    if task == "classification": 
-        y = y.astype(int)
-
-    for col in cat_features:
-        X[col] = X[col].fillna("Unknown").astype(str)
-
-    print(f"✅ 전처리 완료! (총 {len(X)}개 샘플, {len(feature_cols)}개 특성, task={task})")
-    return X, y, cat_features, df
-
+    return X, targets, cat_features, df
