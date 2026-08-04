@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src.processing.preprocessor import (
+from legacy.preprocessor import (
     RENAME_MAP,
     _add_technical_features,
     preprocess_data,
