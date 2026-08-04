@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.processing.preprocessor_v2 import (
+    _ROBUST_Z_COLUMNS,
+    _apply_robust_z,
     build_ml_dataset,
     clean_column_names,
     create_multi_targets,
@@ -16,13 +19,17 @@ from src.processing.preprocessor_v2 import (
 )
 
 
-def _build_raw_df() -> pd.DataFrame:
-    """괄호/단위 특수문자가 포함된 스프레드시트 헤더 형태의 원본 DataFrame을 생성합니다."""
+def _build_raw_df(n_per_date: list[int] | None = None) -> pd.DataFrame:
+    """괄호/단위 특수문자가 포함된 스프레드시트 헤더 형태의 원본 DataFrame을 생성합니다.
+
+    ``n_per_date``로 거래일별 종목 수를 조정해 그룹 크기 엣지케이스 검증을 지원합니다.
+    """
     rng = np.random.default_rng(42)
-    dates = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"])
+    if n_per_date is None:
+        n_per_date = [8, 8, 3]
+    dates = pd.to_datetime([f"2024-01-0{i + 2}" for i in range(len(n_per_date))])
     rows: list[dict[str, object]] = []
-    for date in dates:
-        n_stocks = 3 if date.day == 4 else 8
+    for date, n_stocks in zip(dates, n_per_date, strict=True):
         for i in range(n_stocks):
             code = f"{i:06d}"
             base = 10_000 + i * 1_000
@@ -183,3 +190,132 @@ def test_target_rank_single_date_group() -> None:
     assert targets["target_rank"].notna().all()
     assert targets["target_rank"].between(0, 4).all()
     assert len(targets["target_rank"]) == len(processed)
+
+def test_s1_unit_consistency() -> None:
+    """S1_unit_consistency: buy_price_change_rate와 kospi_change의 단위가 %로 통일되어 차감이 유효합니다.
+
+    매수가 70000, 전일종가 65000 → buy_price_change_rate=7.69%, kospi_change=0.3%
+    → relative_change_rate ≈ 7.39%. 단위 불일치 시 ~700% 수준으로 왜곡됩니다.
+    """
+    df = _build_raw_df(n_per_date=[1])
+    df["(매수 가격)"] = 70_000.0
+    df["(전일종가)"] = 65_000.0
+    df["(시가)"] = 65_000.0
+    df["(kospi, %)"] = 0.3
+    df["(시장구분)"] = "KOSPI"
+    engineered = engineer_features(clean_column_names(df))
+    row = engineered.iloc[0]
+    assert row["buy_price_change_rate"] == pytest.approx(5000 / 65_000 * 100, rel=1e-6)
+    assert row["gap_ratio"] == pytest.approx(0.0, abs=1e-9)
+    assert row["relative_change_rate"] == pytest.approx(
+        5000 / 65_000 * 100 - 0.3, rel=1e-6
+    )
+
+
+def test_s2_no_leakage() -> None:
+    """S2_no_leakage: build_ml_dataset() 반환 X에 당일 OHLC/intraday_return 등 미래 정보 미포함."""
+    X, targets, cat_features, processed = build_ml_dataset(_build_raw_df())
+    leak_cols = {
+        "intraday_return",
+        "open_price",
+        "high_price",
+        "low_price",
+        "close_price",
+        "prev_close_price",
+        "buy_price",
+        "sell_price",
+        "market_cap_100m",
+        "trade_value_100m",
+        "net_return",
+        "trade_date",
+        "stock_code",
+    }
+    assert not leak_cols.intersection(X.columns)
+
+
+def test_s3_rank_edge_cases() -> None:
+    """S3_rank_edge_cases: 거래일별 종목 수 1/2/3/4개일 때 target_rank가 0~4 범위에서 max=4 생성."""
+    df = _build_raw_df(n_per_date=[1, 2, 3, 4])
+    _, _, _, processed = build_ml_dataset(df)
+    rank = processed["target_rank"]
+    assert rank.between(0, 4).all()
+    assert rank.max() == 4
+    groups: dict[int, set[int]] = {}
+    for date, size in zip(sorted(processed["trade_date"].unique()), [1, 2, 3, 4], strict=True):
+        groups[size] = set(processed.loc[processed["trade_date"] == date, "target_rank"])
+    assert groups[1] == {2}
+    assert groups[2] == {0, 4}
+    assert groups[3] == {0, 2, 4}
+    assert groups[4] == {0, 1, 3, 4}
+
+
+def test_s4_nan_safety() -> None:
+    """S4_nan_safety: inst_net_buy / total_candidate_count NaN 시 major_density, rank_ratio 유효."""
+    df = _build_raw_df(n_per_date=[3])
+    df["(기관_순매수)"] = np.nan
+    df["(총 종목 수)"] = np.nan
+    engineered = engineer_features(clean_column_names(df))
+    assert engineered["major_density"].notna().all()
+    assert engineered["inst_density"].notna().all()
+    assert engineered["foreign_density"].notna().all()
+    assert engineered["rank_ratio"].notna().all()
+    assert (engineered["rank_ratio"] > 0).all()
+
+
+def test_s5_robust_z_bounds() -> None:
+    """S5_robust_z_bounds: Robust Z-Score가 [-5, 5] 범위 내이고 MAD=0 그룹은 NaN으로 안전 처리."""
+    df = _build_raw_df(n_per_date=[3, 3])
+    date1 = df["매수날짜"].iloc[0]
+    df.loc[df["매수날짜"] == date1, "(등락률)"] = 1.0
+    engineered = engineer_features(clean_column_names(df))
+    out = _apply_robust_z(engineered, _ROBUST_Z_COLUMNS)
+    for col in _ROBUST_Z_COLUMNS:
+        z_col = f"{col}_z"
+        assert z_col in out.columns
+        vals = out[z_col].dropna()
+        assert vals.between(-5, 5).all()
+    assert not np.isinf(out["change_rate_z"]).any()
+    assert out["change_rate_z"].notna().sum() > 0
+
+
+def test_s6_log_original_preserved() -> None:
+    """S6_log_original_preserved: log 변환 후 원본 금액 컬럼(market_cap_100m) 유지 + log_ 접두사 컬럼 생성."""
+    cleaned = clean_column_names(_build_raw_df())
+    original_cap = cleaned["market_cap_100m"].copy()
+    engineered = engineer_features(cleaned)
+    assert "log_market_cap_100m" in engineered.columns
+    assert "log_trade_value_100m" in engineered.columns
+    pd.testing.assert_series_equal(engineered["market_cap_100m"], original_cap)
+    assert engineered["log_market_cap_100m"].notna().all()
+
+
+def test_s7_vkospi_zero() -> None:
+    """S7_vkospi_zero: v_kospi=0 입력 시 NaN 변환 후 ffill/bfill 보간, v_kospi_change 정상 생성."""
+    df = _build_raw_df(n_per_date=[2, 2, 2])
+    date1 = df["매수날짜"].iloc[0]
+    date3 = df["매수날짜"].iloc[-1]
+    df.loc[df["매수날짜"] == date1, "v_kospi"] = 0
+    df.loc[df["매수날짜"] == date3, "v_kospi"] = 20.0
+    engineered = engineer_features(clean_column_names(df))
+    assert engineered["v_kospi"].notna().all()
+    assert (engineered["v_kospi"] > 0).all()
+    assert "v_kospi_change" in engineered.columns
+    assert engineered["v_kospi_change"].notna().all()
+    assert not np.isinf(engineered["v_kospi_change"]).any()
+
+
+def test_s8_pct_rank_missing_col() -> None:
+    """S8_pct_rank_missing_col: _PCT_RANK_COLUMNS 대상 컬럼 부재 시 KeyError 미발생, 해당 rank 컬럼만 스킵."""
+    df = _build_raw_df(n_per_date=[3])
+    cleaned = clean_column_names(df)
+    cleaned = cleaned.drop(columns=["foreign_net_buy", "v_kosdaq"])
+    engineered = engineer_features(cleaned)
+    assert "foreign_net_buy_pct_rank" not in engineered.columns
+    assert "inst_net_buy_pct_rank" in engineered.columns
+    assert "major_density" in engineered.columns
+    assert engineered["major_density"].notna().all()
+    assert "v_kosdaq_change" not in engineered.columns
+    out = _apply_robust_z(engineered, _ROBUST_Z_COLUMNS)
+    assert "foreign_density_z" not in out.columns
+    assert "major_density_z" in out.columns
+    assert out["major_density_z"].notna().all()
