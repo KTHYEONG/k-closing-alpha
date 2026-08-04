@@ -259,7 +259,7 @@ def test_archive_condition_prefers_csv_over_xlsx(tmp_path: Path) -> None:
         ),
         patch.object(archive.settings, "CONDITION_CSV_PATH", csv_file),
         patch.object(archive, "import_csv_history_if_needed"),
-        patch.object(archive, "upsert_history") as upsert_mock,
+        patch.object(archive, "upsert_archive_snapshot") as upsert_mock,
     ):
         archive.main()
 

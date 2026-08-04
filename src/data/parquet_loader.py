@@ -156,7 +156,7 @@ def load_theme_from_parquet() -> dict[str, str]:
 
 
 def upsert_condition_parquet(df: pd.DataFrame) -> None:
-    """Append condition snapshot rows to parquet and deduplicate by 스냅샷_날짜 and 종목코드.
+    """Overwrite condition snapshot rows in parquet for the target dates.
 
     Time Complexity: O(N + M) where N is existing rows and M is new rows.
     Space Complexity: O(N + M) in memory merge.
@@ -170,13 +170,15 @@ def upsert_condition_parquet(df: pd.DataFrame) -> None:
     parquet_path = settings.HISTORY_PARQUET_PATH
     if parquet_path.exists():
         df_existing = pd.read_parquet(parquet_path)
+        if "스냅샷_날짜" in df.columns and "스냅샷_날짜" in df_existing.columns:
+            target_dates = set(df["스냅샷_날짜"].dropna().astype(str).unique())
+            df_existing = df_existing[~df_existing["스냅샷_날짜"].astype(str).isin(target_dates)]
         df_combined = pd.concat([df_existing, df], ignore_index=True)
     else:
         df_combined = df.copy()
 
-    # Deduplicate if key columns exist
+    # Deduplicate if key columns exist within new dataframe
     dedup_cols = [col for col in ["스냅샷_날짜", "종목코드"] if col in df_combined.columns]
-
     if dedup_cols:
         df_combined = df_combined.drop_duplicates(subset=dedup_cols, keep="last")
 

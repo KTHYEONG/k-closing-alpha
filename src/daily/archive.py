@@ -224,7 +224,7 @@ def _standardize_archive_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _upsert_sqlite_archive(df: pd.DataFrame, db_path: str) -> int:
-    """Upsert snapshot rows into the SQLite archive, deduplicating by (date, code)."""
+    """Overwrite snapshot rows in the SQLite archive for the given dates."""
     with sqlite3.connect(db_path) as conn:
         df.head(0).to_sql(TABLE_NAME, conn, if_exists="append", index=False)
         existing_cols = [
@@ -236,20 +236,11 @@ def _upsert_sqlite_archive(df: pd.DataFrame, db_path: str) -> int:
 
         total = 0
         for snap_date, group in df.groupby(SNAP_DATE_COL, dropna=False):
-            existing = pd.read_sql(
-                f'SELECT * FROM "{TABLE_NAME}" WHERE "{SNAP_DATE_COL}" = ?',
-                conn,
-                params=[snap_date],
-            )
-            merged = pd.concat([existing, group], ignore_index=True)
-            merged = merged.drop_duplicates(
-                subset=[SNAP_DATE_COL, STOCK_CODE_COL], keep="last"
-            )
             conn.execute(
                 f'DELETE FROM "{TABLE_NAME}" WHERE "{SNAP_DATE_COL}" = ?', [snap_date]
             )
-            merged.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
-            total += len(merged)
+            group.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
+            total += len(group)
         conn.commit()
     return total
 
@@ -305,17 +296,23 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
     return row_count
 
 
-def fetch_archive_snapshot(snapshot_date: str | None = None) -> pd.DataFrame:
-    """Read candidate snapshot from archive in the standard 27-column order.
+def fetch_archive_snapshot(
+    snapshot_date: str | None = None,
+    month: str | None = None,
+    all_rows: bool = False,
+) -> pd.DataFrame:
+    """Read candidate snapshot from archive in standard 27-column order.
 
-    The Parquet archive is the primary store; the SQLite archive is used as a
-    fallback when Parquet is absent. With no snapshot_date the latest date is returned.
+    If all_rows is True, returns all historical data. Otherwise filters by snapshot_date,
+    month (YYYY-MM), or defaults to the latest available month.
 
     Args:
-        snapshot_date: Target date (YYYY-MM-DD) or None for the latest snapshot.
+        snapshot_date: Target date (YYYY-MM-DD) or None.
+        month: Target month (YYYY-MM) or None.
+        all_rows: If True, return all rows without filtering by date/month.
 
     Returns:
-        DataFrame reordered to ARCHIVE_COLUMN_ORDER.
+        DataFrame reordered to ARCHIVE_COLUMN_ORDER, sorted by date and rank.
     """
     if settings.HISTORY_PARQUET_PATH.exists():
         df = pd.read_parquet(settings.HISTORY_PARQUET_PATH)
@@ -324,34 +321,55 @@ def fetch_archive_snapshot(snapshot_date: str | None = None) -> pd.DataFrame:
     if df.empty or SNAP_DATE_COL not in df.columns:
         return pd.DataFrame(columns=ARCHIVE_COLUMN_ORDER)
 
-    if snapshot_date is None:
-        snapshot_date = str(df[SNAP_DATE_COL].astype(str).max())
-    df = df[df[SNAP_DATE_COL].astype(str) == snapshot_date]
+    df_dates = df[SNAP_DATE_COL].astype(str)
+
+    if not all_rows:
+        if snapshot_date is not None:
+            df = df[df_dates == snapshot_date]
+        elif month is not None:
+            df = df[df_dates.str.startswith(month)]
+        else:
+            latest_date = str(df_dates.max())
+            latest_month = latest_date[:7]  # YYYY-MM
+            df = df[df_dates.str.startswith(latest_month)]
+
     df = _standardize_archive_df(df)
-    return df.sort_values("선정순위", na_position="last", kind="stable")
+    return df.sort_values(
+        [SNAP_DATE_COL, "선정순위"],
+        ascending=[True, True],
+        na_position="last",
+        kind="stable",
+    )
 
 
 def export_archive_for_spreadsheet(
     df_or_date: pd.DataFrame | str | None = None,
     sep: str = "\t",
     include_header: bool = True,
+    month: str | None = None,
 ) -> str:
-    """Render an archive snapshot as a TSV string ready for spreadsheet copy-paste.
+    """Render archive snapshot rows as a TSV string ready for spreadsheet copy-paste.
+
+    By default, renders all rows for the latest month (or specified month/date).
 
     Args:
-        df_or_date: Candidate DataFrame, snapshot date (YYYY-MM-DD), or None for latest.
+        df_or_date: Candidate DataFrame, snapshot date (YYYY-MM-DD), or None for month group.
         sep: Column separator (tab by default).
-        include_header: Whether to include the standard 27-column header row.
+        include_header: Whether to include standard header row.
+        month: Target month (YYYY-MM) when df_or_date is None.
 
     Returns:
-        TSV string whose columns match the spreadsheet trade-log layout 1:1.
+        TSV string whose columns match standard 26-column layout.
     """
     if isinstance(df_or_date, pd.DataFrame):
         df = _standardize_archive_df(df_or_date)
     elif isinstance(df_or_date, str):
-        df = fetch_archive_snapshot(df_or_date)
+        if len(df_or_date) == 7:  # YYYY-MM format
+            df = fetch_archive_snapshot(month=df_or_date)
+        else:
+            df = fetch_archive_snapshot(snapshot_date=df_or_date)
     else:
-        df = fetch_archive_snapshot()
+        df = fetch_archive_snapshot(month=month)
 
     if df.empty:
         if include_header:
@@ -363,6 +381,10 @@ def export_archive_for_spreadsheet(
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+    )
     history_dir = settings.HISTORY_DIR
     history_dir.mkdir(parents=True, exist_ok=True)
 
@@ -384,18 +406,21 @@ def main():
         return
 
     if not os.path.exists(csv_latest):
-        logger.info(f"[skip] 최신 파일이 없습니다: {csv_latest}")
+        logger.warning(f"[skip] 아카이브할 최신 조건검색 CSV 파일이 없습니다: {csv_latest}")
         return
 
-    # 전날 결과 불러오기
+    # 최신 결과 불러오기
     df = pd.read_csv(csv_latest, encoding="utf-8-sig")
 
     # 파일 수정 시각을 스냅샷 시각으로 사용 (없으면 현재 시각)
     snap_dt = datetime.fromtimestamp(os.path.getmtime(csv_latest))
-    df.insert(0, SNAP_DATE_COL, snap_dt.strftime("%Y-%m-%d"))
+    snapshot_date = snap_dt.strftime("%Y-%m-%d")
+    df.insert(0, SNAP_DATE_COL, snapshot_date)
 
-    upsert_history(df, history_db)
-    logger.info(f"[done] SQLite 누적 저장: {history_db}")
+    stored_rows = upsert_archive_snapshot(df, snapshot_date=snapshot_date)
+    logger.info(
+        f"[SUCCESS] 조건검색 아카이브 완료 (날짜: {snapshot_date}, 저장 종목 수: {stored_rows}건)"
+    )
 
 
 if __name__ == "__main__":
