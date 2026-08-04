@@ -1,0 +1,68 @@
+"""Purged Group Time-Series Walk-Forward Cross-Validation Splitter.
+
+동일 ``date`` group 의 모든 후보 종목은 항상 같은 fold 에 속하며,
+Train 과 Validation 경계에 위치한 샘플은 보유기간(``purge_gap``) 만큼
+Train 에서 제외되어 미래 데이터 누수(Data Leakage)를 차단합니다.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Generator
+
+import numpy as np
+import pandas as pd
+
+
+class PurgedGroupTimeSeriesSplit:
+    """Group(날짜) 단위 Purged Time-Series Walk-Forward Splitter.
+
+    Parameters
+    ----------
+    n_splits : int
+        생성할 fold 수.
+    purge_gap : int
+        Validation 시작 직전까지 Train 에서 제외할 group 수 (보유기간 만큼의 purge).
+    """
+
+    def __init__(self, n_splits: int = 5, purge_gap: int = 1) -> None:
+        if n_splits < 1:
+            raise ValueError(f"n_splits must be >= 1, got {n_splits}")
+        if purge_gap < 0:
+            raise ValueError(f"purge_gap must be >= 0, got {purge_gap}")
+        self.n_splits = n_splits
+        self.purge_gap = purge_gap
+
+    def split(
+        self,
+        X: pd.DataFrame,  # noqa: N803  (spec 계약 시그니처 대문자 X 유지)
+        y: pd.Series | None = None,
+        groups: pd.Series | None = None,
+    ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Walk-Forward 로 train/validation index 쌍을 순차 생성합니다.
+
+        각 fold 의 train 은 Validation 시작 시점보다 ``purge_gap`` 만큼 앞선
+        group 까지로 제한되어, Validation 구간의 라벨이 Train 학습에
+        노출되는 것을 방지합니다.
+        """
+        if groups is None:
+            raise ValueError("groups must be provided for PurgedGroupTimeSeriesSplit")
+        group_values = pd.Series(groups).to_numpy()
+        unique_groups = np.unique(group_values)
+        n_groups = len(unique_groups)
+        if n_groups < self.n_splits + 1:
+            raise ValueError(
+                f"n_splits={self.n_splits} requires at least {self.n_splits + 1} "
+                f"unique groups, got {n_groups}"
+            )
+        group_positions = pd.Series(group_values).map(
+            {group: i for i, group in enumerate(unique_groups)}
+        ).to_numpy(dtype=np.int64)
+
+        test_size = n_groups // (self.n_splits + 1)
+        test_starts = range(n_groups - self.n_splits * test_size, n_groups, test_size)
+        for test_start in test_starts:
+            test_end = test_start + test_size
+            train_end = test_start - self.purge_gap
+            train_mask = group_positions < train_end
+            test_mask = (group_positions >= test_start) & (group_positions < test_end)
+            yield np.flatnonzero(train_mask), np.flatnonzero(test_mask)

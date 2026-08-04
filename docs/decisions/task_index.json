@@ -1,0 +1,244 @@
+{
+  "tasks": [
+    {
+      "task_id": "sangdda_scenario_prediction",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_sangdda_scenario_prediction",
+      "domain": "quant",
+      "title": "상따(29.9%) 시나리오 예측 확장 및 Dynamic Sizing 통합",
+      "why": "20% 이상 급등 종목에 대한 상따 시나리오 예측 필요성 및 추론 파이프라인 정합성 보장",
+      "resolution": "predict.py 내 20% 이상 종목 상따 시나리오 확장, pre-feature-engineering 29.9% 세팅, sizing_engine 추론 독립성 보장",
+      "impact": "일반 분석 결과와 상따 시나리오 예측 결과가 모두 원본 Score/Decision 수치로 정합되게 시각화됨"
+    },
+    {
+      "task_id": "TASK_SPREADSHEET_REFACTOR",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_SPREADSHEET_REFACTOR",
+      "domain": "processing",
+      "title": "스프레드시트 열 참조 및 컬럼 정규화 리팩토링",
+      "why": "legacy_mapping.py 및 하드코딩 컬럼 리터럴 산재 문제 해결",
+      "resolution": "src/processing/schema.py 중앙 스키마 모듈 도입, legacy_mapping.py 제거, daily/ 및 preprocessor 연동 정제",
+      "impact": "표준 영문 컬럼 단일 원천 관리 및 파이프라인 결합도 해소"
+    },
+    {
+      "task_id": "TASK_20260804_CONDITION_HISTORY_BACKFILL",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_20260804_CONDITION_HISTORY_BACKFILL",
+      "domain": "quant",
+      "title": "condition_history Data Cleaning and Backfill Pipeline",
+      "why": "condition_history_종가매매.xlsx contained 307 pre-20251229 obsolete rows, missing fields post-20260520, and missing volume for 281 rows.",
+      "resolution": "Filtered out pre-20251229 rows, built ConditionHistoryBackfiller to restore missing OHLCV/volume/market cap/index returns via KIS API, removed unused EMA columns, and excluded historical volume power.",
+      "impact": "Generated clean data/history/condition_history_cleaned.csv and parquet repositories with 100% volume and code coverage."
+    },
+    {
+      "task_id": "TASK_EXPORT_SPREADSHEET",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_EXPORT_SPREADSHEET",
+      "domain": "utils",
+      "title": "Archive → Spreadsheet Export Utility 개편 및 export_archive.py 전면 재작성",
+      "why": "기존 db_to_xlsx.py는 구 condition_history 스키마에 종속된 dead code였으며, 스프레드시트 복사-붙여넣기에 최적화된 data/exports/ 경로 저장 유틸리티가 필요함",
+      "resolution": "db_to_xlsx.py 삭제 후 export_archive.py 생성(TSV/CSV 출력, ARCHIVE_COLUMN_ORDER 26컬럼, data/exports/ 저장), CONDITION_EXCEL_PATH 레거시 정리",
+      "impact": "스프레드시트 복사-붙여넣기 편의성 향상 및 과거 xlsx 레거시 코드 완전 정리"
+    },
+    {
+      "task_id": "OHLCV_PREFETCH_SMA120",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_OHLCV_PREFETCH_SMA120",
+      "domain": "daily",
+      "title": "OHLCV 사전 병렬 선조회로 SMA120 수집 속도 최적화",
+      "why": "120일 이동평균선 조회 API 순차 중복 호출로 수집 시간이 13.7초에서 19.6초로 폭증",
+      "resolution": "prefetch_ohlcv_for_sma120 추가 및 calculate_all_moving_averages/fetch_all_stock_data 병렬 prefetch 적용",
+      "impact": "OHLCV 추가 호출 102회 -> 51회 50% 감축 및 TPS 제한 한계 내 병렬 처리 안정화"
+    },
+    {
+      "task_id": "COLLECT_PERF_V2",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_COLLECT_PERF_V2",
+      "domain": "daily",
+      "title": "KIS API Data Collection Speed Optimization Phase 2",
+      "why": "Further optimize collection speed under KIS 18 TPS limit by resolving AsyncRateLimiter lock-while-sleeping bug and parallelizing pre-collect condition/index API calls",
+      "resolution": "Removed API_SLEEP_INTERVAL delay, fixed AsyncRateLimiter acquire lock pattern, parallelized condition/index API calls with asyncio.gather, and passed client parameter to calculate_all_moving_averages",
+      "impact": "Eliminated redundant sleep delays and lock contention, achieving max rate limiter throughput while preserving 18 TPS safety limit"
+    },
+    {
+      "task_id": "TASK_20260804_DATA_COLLECTION_OPT",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_20260804_DATA_COLLECTION_OPT",
+      "domain": "daily",
+      "title": "KIS API Data Collection Speed & Rate Limit Optimization & Logging Cleanup",
+      "why": "Improve real-time data collection throughput while strictly enforcing KIS REST API 18 TPS limit and removing automatic archiving and redundant logs.",
+      "resolution": "Implemented AsyncRateLimiter, lazy evaluation for SMA120 calculations, single-line dynamic progress bar logging, and removed automatic archive snapshot upsert in collect.py.",
+      "impact": "Significantly reduced daily collection time, 100% prevented EGW00201 rate limit errors, simplified logging output, and isolated archive functionality for manual user execution."
+    },
+    {
+      "task_id": "POSITION_SIZING_COST_FIX",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_POSITION_SIZING_COST_FIX",
+      "domain": "quant",
+      "title": "Korean Stock Fee/Tax Integration & Position Sizing Calibration",
+      "why": "Tax (0.15%), KIS fee (0.028%), and slippage were uncredited, and negative utility scores led to faulty sizing grade allocations.",
+      "resolution": "Deducted 0.20% round-trip cost, fixed assign_sizing_grades thresholds, normalized probability scales, and scaled sizing allocation with utility score magnitude.",
+      "impact": "Eliminated false positive position sizing on sub-zero net return trades and established realistic risk-weighted position allocation."
+    },
+    {
+      "task_id": "SIZING_SAFETY_MARGIN_REFACTORING",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_SIZING_SAFETY_MARGIN_REFACTORING",
+      "domain": "ml",
+      "title": "Sizing Grade Safety Margin Threshold & Hybrid Criteria Refactoring",
+      "why": "Prevent assigning Strong grades to marginal Break-Even utility scores (+0.001) that fail to cover trading costs and slippage.",
+      "resolution": "Configured minimum safety margin thresholds for Strong (>= +0.30%) and Good (>= +0.10%) grades in assign_sizing_grades.",
+      "impact": "Eliminated score scale illusions, suppressed risky leverage under marginal expectancy, and enhanced capital preservation."
+    },
+    {
+      "task_id": "MODEL_UTILITY_SCORE_FIX",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_MODEL_UTILITY_SCORE_FIX",
+      "domain": "daily",
+      "title": "Model Utility Score Uniformity Fix & ML Preprocessor Feature Alignment",
+      "why": "Constant utility_score (0.0864) caused by dummy test bundle artifacts and preprocessor Z-score feature divergence during daily inference.",
+      "resolution": "Synchronized _apply_robust_z in daily preprocessor pipeline, trained real 49-feature GBDT model bundle from trade_log.parquet, and added auto-retrain fallback in predict.py.",
+      "impact": "Restored dynamic Utility Score differentiation (-4.66 ~ -5.23) and proper risk-weighted sizing allocations across candidates."
+    },
+    {
+      "task_id": "DAILY_PREDICT_REDESIGN",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_DAILY_PREDICT_REDESIGN",
+      "domain": "daily",
+      "title": "Daily Predict Pipeline Redesign & Standard ML Feature Alignment",
+      "why": "Legacy inline feature engineering and verbose CLI output caused schema mismatches with LightGBM models and terminal clutter.",
+      "resolution": "Integrated standard ML preprocessor (clean_column_names, engineer_features), updated run_daily_sizing_inference, and streamlined CLI output format.",
+      "impact": "Ensured 1:1 feature alignment with model artifacts, accelerated inference output readability, and established contract compliance."
+    },
+    {
+      "task_id": "ARCHIVE_REDESIGN_V2",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ARCHIVE_REDESIGN_V2",
+      "domain": "daily",
+      "title": "Archive Column Consolidation and Theme Integration",
+      "why": "Eliminate duplicate chart_analysis column, integrate theme mapping via theme.parquet, remove legacy _Y suffix, and align 26 columns 1:1 with spreadsheet",
+      "resolution": "Updated src/daily/archive.py and predict.py to use official load_theme loader, consolidated scenario to single column 26, and updated docs/specs",
+      "impact": "Cleaned legacy artifacts, guaranteed 100% spreadsheet compatibility with exact 26 columns, and resolved all null values"
+    },
+    {
+      "task_id": "ARCHIVE_REDESIGN",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ARCHIVE_REDESIGN",
+      "domain": "daily",
+      "title": "Daily Candidate Archive Redesign and Spreadsheet Alignment",
+      "why": "Refactor legacy sqlite archive to 27 standard columns matching Google Spreadsheet layout, with dual persistence (Parquet+SQLite) and TSV export",
+      "resolution": "Redesigned src/daily/archive.py, simplified paths to data/history/archive.parquet and archive.db, aligned 27 columns 1:1 with spreadsheet, added TSV export CLI",
+      "impact": "Improved archive durability, guaranteed spreadsheet copy-paste compatibility, and simplified history file management"
+    },
+    {
+      "task_id": "daily_data_refactoring",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_daily_data_refactoring",
+      "domain": "daily",
+      "title": "Daily Data Storage, Column Standardization & Logic Cleanup",
+      "why": "Cleanup redundant chart_pass cache and parenthesis column renaming, and adjust daily stock data storage location to data/daily/",
+      "resolution": "Removed chart_pass_cache.json and (차트통과) logic, relocated files to data/daily/daily_stocks.csv and parquet, and standardized columns across collect.py and predict.py without duplicate rename_map.",
+      "impact": "Clean daily data storage structure, improved maintainability and AI workflow efficiency, zero redundant column renaming."
+    },
+    {
+      "task_id": "ADR_20260804_architecture_refactoring",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ADR_20260804_architecture_refactoring",
+      "domain": "architecture",
+      "title": "Architecture & Directory Refactoring",
+      "why": "Centralized monolithic settings and legacy script names caused high token waste and maintenance overhead",
+      "resolution": "Modularized settings into src/config/ domain modules, streamlined src/daily/ scripts to collect/predict/archive, and symmetrically aligned tests/ directory",
+      "impact": "Enhanced code maintainability, scalability, and AI-agent token efficiency with symmetrical test discovery"
+    },
+    {
+      "task_id": "ADR_20260804_daily_pipeline_refactor",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ADR_20260804_daily_pipeline_refactor",
+      "domain": "daily",
+      "title": "Daily Data Pipeline Refactoring & CSV Storage Standardization",
+      "why": "Legacy heuristic judgment logic in collect_data & predict_position and inefficient excel openpyxl serialization",
+      "resolution": "Refactored collect_data & predict_position with single-pass scenario priority logic, standardized UTF-8-sig CSV export with fixed 26-column order",
+      "impact": "Improved prediction speed, eliminated duplicate API calls, guaranteed seamless spreadsheet copy-paste workflow"
+    },
+    {
+      "task_id": "daily_pipeline_integration",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_daily_pipeline_integration",
+      "domain": "daily",
+      "title": "Daily Prediction & Dynamic Sizing Pipeline Integration",
+      "why": "Integrate trained ML ranker, quantile risk model and utility sizing engine into daily operational pipeline with model persistence and legacy cleanup",
+      "resolution": "Refactored src/daily/predict_position.py, added save/load_model_artifacts & predict_daily_position_sizing in src/ml/sizing_engine.py, cleaned legacy GMM/static logic",
+      "impact": "Fast 1-second inference from artifacts/models/ and automated risk-managed portfolio sizing for 15:20 daily snapshot"
+    },
+    {
+      "task_id": "quantile_sizing",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_quantile_sizing",
+      "domain": "ml",
+      "title": "Quantile Risk Model & Dynamic Sizing Engine Implementation",
+      "why": "Implement Quantile Risk Model",
+      "resolution": "Created quantile_model.py and sizing_engine.py",
+      "impact": "Portfolio risk management"
+    },
+    {
+      "task_id": "TASK-BACKTEST-EVALUATION",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_TASK-BACKTEST-EVALUATION",
+      "domain": "ml",
+      "title": "Backtest Evaluation & 3-Way Baseline Comparison",
+      "why": "Validate AI model predictions against selection_rank and equal-weight baselines with yearly breakdown",
+      "resolution": "Implemented src/ml/backtest_evaluator.py and integration with model_pipeline",
+      "impact": "Proved AI model superiority with Top-1 return +1.53% (vs +0.63% baseline) and Win Rate 62.9% across 10 years"
+    },
+    {
+      "task_id": "TASK-PREPROCESSOR-DATA-RECOVERY",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_TASK-PREPROCESSOR-DATA-RECOVERY",
+      "domain": "processing",
+      "title": "Preprocessor Data Recovery & 33k Full Dataset Restoration",
+      "why": "Fix string percent symbol cleaning in clean_column_names to prevent 92% net_return row loss",
+      "resolution": "Implemented percent/comma string cleaning in src/processing/preprocessor.py clean_column_names",
+      "impact": "Restored all 33,934 rows (100%) for ML training"
+    },
+    {
+      "task_id": "TASK-MODEL-PIPELINE",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_TASK-MODEL-PIPELINE",
+      "domain": "ml",
+      "title": "ML Model Selection & Purged Walk-Forward Pipeline",
+      "why": "Establish zero-leakage Purged Group Walk-Forward CV and model evaluation",
+      "resolution": "Implemented src/ml/purged_cv.py, src/ml/model_pipeline.py and unit tests",
+      "impact": "Enables cross-validation, LightGBM ranking and backtest metric evaluation"
+    },
+    {
+      "task_id": "PREPROCESSOR_MAIN_CONSOLIDATION",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_PREPROCESSOR_MAIN_CONSOLIDATION",
+      "domain": "processing",
+      "title": "Preprocessor Module Refactoring & Consolidation (v2 -> Main)",
+      "why": "v2 전처리기를 프로젝트 메인 preprocessor.py로 통합하고 기존 legacy v1 코드를 legacy/로 분리 이관",
+      "resolution": "preprocessor_v2.py를 src/processing/preprocessor.py로 승격하고 legacy 전처리기를 legacy/preprocessor.py로 이동, RENAME_MAP을 legacy_mapping.py로 추출 및 re-export",
+      "impact": "메인 전처리 파이프라인 단일화 및 코드베이스 깔끔화, 구형 데이터 호환성 보장"
+    },
+    {
+      "task_id": "ML_FEATURE_ENG_V2",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ML_FEATURE_ENG_V2",
+      "domain": "processing",
+      "title": "ML Feature Engineering & Preprocessing Pipeline v2",
+      "why": "plan.md 요구사항 대비 전처리 버그(단위 불일치, Data Leakage 등) 수정 및 횡단면 Z-Score/피처 확장",
+      "resolution": "preprocessor_v2.py 버그 7건 수정, Phase 1 피처 19종 확장, 테스트 케이스 보강",
+      "impact": "학습 피처 정확성 확보 및 Data Leakage 차단으로 모델 성과 및 랭킹 정합성 향상"
+    },
+    {
+      "task_id": "TASK_ML_DATA_PREPROCESS_V2",
+      "date": "2026-08-04",
+      "adr_id": "ADR_20260804_ML_DATA_PREPROCESS_V2",
+      "domain": "ml_data",
+      "title": "Parquet 기반 ML 데이터 전처리 및 피처/다중타깃 엔진 v2 구축",
+      "why": "스프레드시트 괄호/단위 열 이름 혼선 제거, 15:19~20 매수가격 기준 정합성 보장, docs/plan.md 명세에 맞춘 랭킹/회귀/확률 다중 타깃 및 횡단면 백분위 피처 구축",
+      "resolution": "preprocessor_v2.py 모듈 작성, 매수체결가 등락률(buy_price_change_rate) 및 상대 지표 포함, 5단계 ranking/clipped return/binary target 생성 구현 및 테스트 통과",
+      "impact": "데이터 누수 완전 차단, 괄호 열 이름 정규화, LightGBM/CatBoost 다중 타깃 지원 전처리 파이프라인 정립"
+    }
+  ]
+}
