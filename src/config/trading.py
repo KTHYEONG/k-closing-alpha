@@ -33,7 +33,7 @@ class TradingSettings(BaseSettings):
     UPPER_LIMIT_CONDITION_NAME: str = "상한가"
 
     # API 요청 제한 및 지연 시간
-    API_SEMAPHORE_LIMIT: int = 4
+    API_SEMAPHORE_LIMIT: int = 8
     API_SLEEP_INTERVAL: float = 0.2
 
     # 차트 필터링 설정

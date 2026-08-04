@@ -1,11 +1,38 @@
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 
 import aiohttp
 
 from src import settings
+
+logger = logging.getLogger(__name__)
+
+
+class AsyncRateLimiter:
+    """한국투자증권 REST API 요청용 비동기 레이트 리미터 (슬라이딩 윈도우)."""
+
+    def __init__(self, max_rate: float = 18.0, time_period: float = 1.0):
+        self.max_rate = max_rate
+        self.time_period = time_period
+        self._timestamps: list[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        """Rate limit 초과 시 대기 후 권한 획득."""
+        import time
+        async with self._lock:
+            now = time.monotonic()
+            self._timestamps = [t for t in self._timestamps if now - t < self.time_period]
+            if len(self._timestamps) >= self.max_rate:
+                sleep_time = self.time_period - (now - self._timestamps[0])
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                now = time.monotonic()
+                self._timestamps = [t for t in self._timestamps if now - t < self.time_period]
+            self._timestamps.append(now)
 
 
 class KisApiClient:
@@ -26,8 +53,9 @@ class KisApiClient:
         self.token = None
         self.token_file = str(token_file or settings.TOKEN_FILE)
         self._market_div_cache = {}
-        # 동시성 제어를 위한 세마포어 (더 보수적으로 10으로 조정)
+        # 동시성 및 레이트 리밋 제어를 위한 세마포어와 AsyncRateLimiter
         self.semaphore = asyncio.Semaphore(10)
+        self.rate_limiter = AsyncRateLimiter(max_rate=18.0, time_period=1.0)
 
     def create_session(self) -> aiohttp.ClientSession:
         """최적화된 커넥터를 가진 세션을 생성합니다."""
@@ -176,6 +204,7 @@ class KisApiClient:
         """재시도 로직을 포함한 공통 요청 처리 (네트워크 에러 처리 강화)"""
         import aiohttp
         
+        await self.rate_limiter.acquire()
         for attempt in range(5):
             try:
                 async with session_method(url, **kwargs) as resp:
@@ -193,7 +222,12 @@ class KisApiClient:
                 # 네트워크 연결 에러 시 지수 백오프로 재시도
                 if attempt < 4:  # 마지막 시도가 아니면
                     wait_time = 0.5 * (2 ** attempt)  # 0.5초, 1초, 2초, 4초
-                    print(f"\n⚠️  네트워크 에러 ({type(e).__name__}), {wait_time:.1f}초 후 재시도... ({attempt+1}/5)")
+                    logger.warning(
+                        "네트워크 에러 (%s), %.1f초 후 재시도... (%d/5)",
+                        type(e).__name__,
+                        wait_time,
+                        attempt + 1,
+                    )
                     await asyncio.sleep(wait_time)
                     continue
                 else:
@@ -500,10 +534,14 @@ async def calculate_stock_sma(stock_code, sma_period=120, lookback_days=200, ses
             if resp.get('rt_cd') != '0':
                 if chunk == 0:
                     # 첫 번째 호출 실패면 전체 실패
-                    print(
-                        f"\n[SMA Debug] {stock_code} 일봉 조회 실패: "
-                        f"rt_cd={resp.get('rt_cd')}, msg={resp.get('msg1', 'N/A')}, "
-                        f"range={start_date}~{end_date}, chunk={chunk}"
+                    logger.warning(
+                        "[SMA Debug] %s 일봉 조회 실패: rt_cd=%s, msg=%s, range=%s~%s, chunk=%s",
+                        stock_code,
+                        resp.get('rt_cd'),
+                        resp.get('msg1', 'N/A'),
+                        start_date,
+                        end_date,
+                        chunk,
                     )
                     return 0.0, False
                 else:
@@ -545,7 +583,9 @@ async def calculate_stock_sma(stock_code, sma_period=120, lookback_days=200, ses
         return float(sma_value), True
             
     except Exception as e:
-        print(f"\n[SMA Debug] {stock_code} SMA 계산 예외: {type(e).__name__}: {e}")
+        logger.warning(
+            "[SMA Debug] %s SMA 계산 예외: %s: %s", stock_code, type(e).__name__, e
+        )
         return 0.0, False
     finally:
         if local_session:
@@ -581,19 +621,25 @@ async def calculate_stock_ema(stock_code, ema_period=20, lookback_days=60, sessi
         )
         
         if resp.get('rt_cd') != '0':
-            print(
-                f"\n[EMA Debug] {stock_code} 일봉 조회 실패: "
-                f"rt_cd={resp.get('rt_cd')}, msg={resp.get('msg1', 'N/A')}, "
-                f"range={start_date}~{end_date}"
+            logger.warning(
+                "[EMA Debug] %s 일봉 조회 실패: rt_cd=%s, msg=%s, range=%s~%s",
+                stock_code,
+                resp.get('rt_cd'),
+                resp.get('msg1', 'N/A'),
+                start_date,
+                end_date,
             )
             return 0.0, False, 0
         
         items = resp.get('output2', [])
         if not items:
-            print(
-                f"\n[EMA Debug] {stock_code} 일봉 응답이 비어 있음: "
-                f"rt_cd={resp.get('rt_cd')}, msg={resp.get('msg1', 'N/A')}, "
-                f"range={start_date}~{end_date}"
+            logger.warning(
+                "[EMA Debug] %s 일봉 응답이 비어 있음: rt_cd=%s, msg=%s, range=%s~%s",
+                stock_code,
+                resp.get('rt_cd'),
+                resp.get('msg1', 'N/A'),
+                start_date,
+                end_date,
             )
         
         # 데이터 파싱
@@ -622,7 +668,9 @@ async def calculate_stock_ema(stock_code, ema_period=20, lookback_days=60, sessi
         return float(ema_value), True, len(df)
             
     except Exception as e:
-        print(f"\n[EMA Debug] {stock_code} EMA 계산 예외: {type(e).__name__}: {e}")
+        logger.warning(
+            "[EMA Debug] %s EMA 계산 예외: %s: %s", stock_code, type(e).__name__, e
+        )
         return 0.0, False, 0
     finally:
         if local_session:
@@ -771,7 +819,9 @@ async def calculate_all_moving_averages(stock_code, session=None):
         return ema_res, (ema20_val, ema_success, data_count), (sma60_val, sma60_ok), (sma120_val, sma120_ok)
 
     except Exception as e:
-        print(f"\n[MA Calc Error] {stock_code}: {e}")
+        logger.warning(
+            "[MA Calc Error] %s: %s: %s", stock_code, type(e).__name__, e
+        )
         return {}, (0.0, False, 0), (0.0, False), (0.0, False)
     finally:
         if local_session:

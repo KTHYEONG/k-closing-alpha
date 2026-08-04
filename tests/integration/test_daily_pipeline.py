@@ -403,11 +403,12 @@ async def _fake_fetch_all_stock_data(*args, **kwargs) -> tuple[list[dict], list]
     )
 
 
-def test_collect_main_archives_snapshot_to_history(
+def test_collect_main_saves_csv_without_auto_archive(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """collect.main() 은 수집 후 upsert_archive_snapshot 으로 archive.db/parquet 에 누적 저장한다."""
+    """collect.main() 은 자동 아카이브 없이 지정된 CSV/Parquet 에 수집 데이터를 저장한다."""
     history_dir = tmp_path / "history"
+    csv_path = tmp_path / "daily" / "daily_stocks.csv"
     monkeypatch.setattr(collect.settings, "HISTORY_DIR", history_dir)
     monkeypatch.setattr(
         collect.settings, "HISTORY_PARQUET_PATH", history_dir / "archive.parquet"
@@ -415,11 +416,7 @@ def test_collect_main_archives_snapshot_to_history(
     monkeypatch.setattr(
         collect.settings, "HISTORY_DB_PATH", history_dir / "archive.db"
     )
-    monkeypatch.setattr(
-        collect.settings,
-        "CONDITION_CSV_PATH",
-        tmp_path / "daily" / "daily_stocks.csv",
-    )
+    monkeypatch.setattr(collect.settings, "CONDITION_CSV_PATH", csv_path)
 
     monkeypatch.setattr(collect, "HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
@@ -430,9 +427,6 @@ def test_collect_main_archives_snapshot_to_history(
 
     asyncio.run(collect.main())
 
-    assert (history_dir / "archive.db").exists()
-    assert (history_dir / "archive.parquet").exists()
-    df = pd.read_parquet(history_dir / "archive.parquet")
-    assert "스냅샷_날짜" in df.columns
-    assert len(df) >= 1
-    assert df["종목코드"].astype(str).str.zfill(6).tolist() == ["005930"]
+    assert csv_path.exists()
+    assert not (history_dir / "archive.db").exists()
+    assert not (history_dir / "archive.parquet").exists()

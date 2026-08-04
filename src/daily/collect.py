@@ -9,7 +9,6 @@ from src import settings
 
 # 커스텀 모듈 임포트
 from src.api.kis_client import KisApiClient
-from src.daily.archive import upsert_archive_snapshot
 from src.data.db_loader import load_theme_from_db
 from src.data.gsheet_loader import append_stocks_to_gsheet
 from src.utils.display import Colors
@@ -57,7 +56,7 @@ STANDARD_COLUMN_ORDER = [
     "거래량",
 ]
 
-logger.info("조건검색 (표준 CSV 저장) 시작...")
+logger.debug("조건검색 (표준 CSV 저장) 시작...")
 
 
 def _validate_hts_id() -> None:
@@ -126,14 +125,14 @@ def save_collected_condition_data(
     parquet_path = csv_path.with_suffix(".parquet")
     try:
         out.to_parquet(parquet_path, index=False)
-        logger.info("Parquet 저장 완료: %s", parquet_path)
+        logger.debug("Parquet 저장 완료: %s", parquet_path)
     except Exception:
         logger.exception("Parquet 저장 실패 (CSV 는 정상 저장됨): %s", parquet_path)
 
     if excel_path is not None:
         out.to_excel(Path(excel_path), index=False)
 
-    logger.info("표준 CSV 저장 완료: %s (%d행)", csv_path, len(out))
+    logger.debug("표준 CSV 저장 완료: %s (%d행)", csv_path, len(out))
     return csv_path
 
 
@@ -258,53 +257,34 @@ async def fetch_single_stock(
         data_count = 0
         sma_value, sma_success = 0, False
 
-        # EMA & SMA 계산 (상장일수 및 120 돌파 시나리오 판별용)
-        try:
-            from src.api.kis_client import calculate_all_moving_averages
-
-            (_, (_, _, data_count), _, (sma120_val, sma120_ok)) = (
-                await calculate_all_moving_averages(code, session=session)
-            )
-            sma_value, sma_success = float(sma120_val), sma120_ok
-        except Exception:
-            pass
-
-        # === 시나리오 할당 (우선순위: 높음 → 낮음) ===
-        # 우선순위: 상따 > 상한가 다음날 > 상승형 음봉 > 신고가 > 신고가 근접 > 120 돌파 > 거래량 폭증(기본)
-
-        # 1. [최우선] 상따 (상한가 조건검색)
+        # 1차 시나리오 우선판단 (상따, 상한가 다음날, 상승형 음봉, 신고가, 신고가 근접)
         if code in upper_limit_stock_codes:
             scenario = "상따"
-
-        # 2. 상한가 다음날
         elif code in upper_limit_next_day_stock_codes:
             scenario = "상한가 다음날"
-
-        # 3. 상승형 음봉 (종가 < 시가 이지만 등락률 > 0)
         elif rate > 0 and close_price < open_price:
             scenario = "상승형 음봉"
-
-        # 4. 신고가
         elif code in new_high_stock_codes:
             scenario = "신고가"
-
-        # 5. 신고가 근접
         elif code in near_new_high_stock_codes:
             scenario = "신고가 근접"
 
-        # 6. 120 돌파
-        elif sma_success and sma_value > 0 and prev_close_price < sma_value <= close_price:
-            scenario = "120 돌파"
+        # 1차 시나리오 미확정 시 120일 이동평균 계산 진행
+        if not scenario:
+            try:
+                from src.api.kis_client import calculate_all_moving_averages
 
-        # 7. 기본값: 거래량 폭증 (상기 조건 미충족)
-        else:
+                (_, (_, _, data_count), _, (sma120_val, sma120_ok)) = (
+                    await calculate_all_moving_averages(code, session=session)
+                )
+                sma_value, sma_success = float(sma120_val), sma120_ok
+                if sma_success and sma_value > 0 and prev_close_price < sma_value <= close_price:
+                    scenario = "120 돌파"
+            except Exception:
+                pass
+
+        if not scenario:
             scenario = "거래량 폭증"
-
-        logger.info(
-            "데이터 수집 중... (%d/%d)",
-            i + 1,
-            total,
-        )
 
         return {
             "종목명": name,
@@ -339,6 +319,8 @@ async def fetch_all_stock_data(
     upper_limit_stock_codes=None,
 ):
     """모든 종목의 상세 데이터를 수집합니다."""
+    import sys
+
     if overheated_stock_codes is None:
         overheated_stock_codes = set()
     if new_high_stock_codes is None:
@@ -352,8 +334,11 @@ async def fetch_all_stock_data(
 
     sem = asyncio.Semaphore(settings.API_SEMAPHORE_LIMIT)
     total = len(stock_list)
-    tasks = [
-        fetch_single_stock(
+    completed_count = 0
+
+    async def _track_task(i, stock):
+        nonlocal completed_count
+        res = await fetch_single_stock(
             i,
             stock,
             total,
@@ -366,9 +351,22 @@ async def fetch_all_stock_data(
             upper_limit_next_day_stock_codes,
             upper_limit_stock_codes,
         )
-        for i, stock in enumerate(stock_list)
-    ]
+        completed_count += 1
+        pct = (completed_count / total) * 100 if total > 0 else 100.0
+        bar_len = 25
+        filled = int(bar_len * completed_count // total) if total > 0 else bar_len
+        bar = "█" * filled + "░" * (bar_len - filled)
+        sys.stdout.write(
+            f"\r⏳ [수집 진행] [{bar}] {pct:5.1f}% ({completed_count}/{total})"
+        )
+        sys.stdout.flush()
+        return res
+
+    tasks = [_track_task(i, stock) for i, stock in enumerate(stock_list)]
     all_res = await asyncio.gather(*tasks)
+    if total > 0:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
     results = [r for r, f in all_res]
     failed_info = [
@@ -377,7 +375,7 @@ async def fetch_all_stock_data(
         if f
     ]
 
-    logger.info(f"\n{Colors.GREEN}✅ 데이터 수집 완료{Colors.RESET}")
+    logger.info(f"{Colors.GREEN}✅ 데이터 수집 완료{Colors.RESET}")
     return results, failed_info
 
 
@@ -440,205 +438,83 @@ async def main():
             )
             return
 
-        logger.info(
-            f"\n>> {Colors.BOLD}[{target_cond['condition_nm']}]{Colors.RESET} 검색 시작..."
-        )
-
         # 4. 조건검색 결과 조회 (종가매매)
         res_cond_res = await client.get_condition_result(session, target_cond["seq"])
         if res_cond_res.get("rt_cd") != "0":
-            logger.info(f"{Colors.RED}❌ 검색 실패: {res_cond_res.get('msg1')}{Colors.RESET}")
+            logger.error(f"{Colors.RED}❌ 검색 실패: {res_cond_res.get('msg1')}{Colors.RESET}")
             return
 
         stock_list = res_cond_res.get("output2", [])
-        logger.info(
-            f"{Colors.GREEN}✅ 검색 결과: 총 {len(stock_list)} 종목 포착!{Colors.RESET}"
-        )
 
-        # 4-1. [New] 단기과열 조건검색 결과 조회 (예고 + 본지정)
-        overheated_stock_codes = set()  # 단기과열 종목 코드 Set
-
-        # [FIX] 정확한 일치로 변경
+        # 4-1. 단기과열 조건검색 결과 조회
+        overheated_stock_codes = set()
         overheated_cond = next(
-            (
-                c
-                for c in my_conditions
-                if c["condition_nm"] == settings.OVERHEATED_CONDITION_NAME
-            ),
+            (c for c in my_conditions if c["condition_nm"] == settings.OVERHEATED_CONDITION_NAME),
             None,
         )
-
         if overheated_cond:
-            logger.info(
-                f"\n>> {Colors.YELLOW}[{overheated_cond['condition_nm']}]{Colors.RESET} 검색 중..."
-            )
-            res_overheated = await client.get_condition_result(
-                session, overheated_cond["seq"]
-            )
-
+            res_overheated = await client.get_condition_result(session, overheated_cond["seq"])
             if res_overheated.get("rt_cd") == "0":
-                overheated_list = res_overheated.get("output2", [])
-                overheated_stock_codes = {
-                    stock.get("code") for stock in overheated_list
-                }
-                logger.info(
-                    f"{Colors.YELLOW}🔥 단기과열 종목: {len(overheated_stock_codes)}개 포착{Colors.RESET}"
-                )
+                overheated_stock_codes = {stock.get("code") for stock in res_overheated.get("output2", [])}
 
-                # 교집합 확인 (종가매매 종목 중 단기과열 종목)
-                main_stock_codes = {stock.get("code") for stock in stock_list}
-                overlap = main_stock_codes & overheated_stock_codes
-                if overlap:
-                    logger.info(
-                        f"{Colors.YELLOW}   → 종가매매와 중복: {len(overlap)}개 종목{Colors.RESET}"
-                    )
-            else:
-                logger.info(
-                    f"{Colors.YELLOW}⚠️  단기과열 조건검색 실패 (무시하고 진행){Colors.RESET}"
-                )
-        else:
-            logger.info(
-                f"\n{Colors.YELLOW}⚠️  '{settings.OVERHEATED_CONDITION_NAME}' 조건을 찾을 수 없습니다.{Colors.RESET}"
-            )
-            logger.info(
-                f"   → HTS에서 '{settings.OVERHEATED_CONDITION_NAME}' 조건을 생성해주세요."
-            )
-            logger.info("   → 단기과열 필터링이 비활성화됩니다.")
-
-        # 4-2. [NEW] 신고가 조건검색 결과 조회
+        # 4-2. 신고가 조건검색 결과 조회
         new_high_stock_codes = set()
-        new_high_cond_name = settings.NEW_HIGH_CONDITION_NAME
-        logger.info(
-            f"\n{Colors.CYAN}[디버그] '{new_high_cond_name}' 조건검색 조회 중...{Colors.RESET}"
-        )
-        # [FIX] 정확한 일치로 변경 ("신고가" in "신고가 근접" 방지)
         new_high_cond = next(
-            (c for c in my_conditions if c["condition_nm"] == new_high_cond_name), None
+            (c for c in my_conditions if c["condition_nm"] == settings.NEW_HIGH_CONDITION_NAME), None
         )
-
         if new_high_cond:
-            logger.info(
-                f"  ✓ 조건 발견: {new_high_cond['condition_nm']} (seq: {new_high_cond['seq']})"
-            )
-            res_new_high = await client.get_condition_result(
-                session, new_high_cond["seq"]
-            )
-            logger.info(
-                f"  API 응답: rt_cd={res_new_high.get('rt_cd')}, msg={res_new_high.get('msg1', 'N/A')}"
-            )
-
+            res_new_high = await client.get_condition_result(session, new_high_cond["seq"])
             if res_new_high.get("rt_cd") == "0":
-                new_high_list = res_new_high.get("output2", [])
-                new_high_stock_codes = {stock.get("code") for stock in new_high_list}
-                logger.info(
-                    f"{Colors.GREEN}🚀 [신고가]: {len(new_high_stock_codes)}개 종목 포착{Colors.RESET}"
-                )
-                if new_high_stock_codes:
-                    sample_names = [
-                        f"{s.get('name', 'N/A')}({s.get('code', 'N/A')})"
-                        for s in new_high_list[:3]
-                    ]
-                    logger.info(f"  샘플: {', '.join(sample_names)}")
-            else:
-                logger.info(
-                    f"{Colors.YELLOW}⚠️  [신고가] API 호출 실패 (rt_cd={res_new_high.get('rt_cd')}){Colors.RESET}"
-                )
-        else:
-            logger.info(
-                f"{Colors.YELLOW}⚠️  '{new_high_cond_name}' 조건을 찾을 수 없습니다.{Colors.RESET}"
-            )
-            logger.info("   → HTS에 등록된 조건검색 목록 확인 필요")
-            logger.info(
-                f"   → 등록된 조건 ({len(my_conditions)}개): {[c['condition_nm'] for c in my_conditions[:5]]}"
-            )
+                new_high_stock_codes = {stock.get("code") for stock in res_new_high.get("output2", [])}
 
-        # 4-3. [NEW] 신고가 근접 조건검색 결과 조회
+        # 4-3. 신고가 근접 조건검색 결과 조회
         near_new_high_stock_codes = set()
-        near_new_high_cond_name = settings.NEAR_NEW_HIGH_CONDITION_NAME
-        logger.info(
-            f"\n{Colors.CYAN}[디버그] '{near_new_high_cond_name}' 조건검색 조회 중...{Colors.RESET}"
-        )
-        # [FIX] 정확한 일치로 변경
         near_new_high_cond = next(
-            (c for c in my_conditions if c["condition_nm"] == near_new_high_cond_name),
-            None,
+            (c for c in my_conditions if c["condition_nm"] == settings.NEAR_NEW_HIGH_CONDITION_NAME), None
         )
-
         if near_new_high_cond:
-            logger.info(
-                f"  ✓ 조건 발견: {near_new_high_cond['condition_nm']} (seq: {near_new_high_cond['seq']})"
-            )
-            res_near_new_high = await client.get_condition_result(
-                session, near_new_high_cond["seq"]
-            )
-            logger.info(
-                f"  API 응답: rt_cd={res_near_new_high.get('rt_cd')}, msg={res_near_new_high.get('msg1', 'N/A')}"
-            )
-
+            res_near_new_high = await client.get_condition_result(session, near_new_high_cond["seq"])
             if res_near_new_high.get("rt_cd") == "0":
-                near_new_high_list = res_near_new_high.get("output2", [])
-                near_new_high_stock_codes = {
-                    stock.get("code") for stock in near_new_high_list
-                }
-                logger.info(
-                    f"{Colors.YELLOW}📈 [신고가 근접]: {len(near_new_high_stock_codes)}개 종목 포착{Colors.RESET}"
-                )
-                if near_new_high_stock_codes:
-                    sample_names = [
-                        f"{s.get('name', 'N/A')}({s.get('code', 'N/A')})"
-                        for s in near_new_high_list[:3]
-                    ]
-                    logger.info(f"  샘플: {', '.join(sample_names)}")
-            else:
-                logger.info(
-                    f"{Colors.YELLOW}⚠️  [신고가 근접] API 호출 실패 (rt_cd={res_near_new_high.get('rt_cd')}){Colors.RESET}"
-                )
-        else:
-            logger.info(
-                f"{Colors.YELLOW}⚠️  '{near_new_high_cond_name}' 조건을 찾을 수 없습니다.{Colors.RESET}"
-            )
-            logger.info("   → HTS에 등록된 조건검색 목록 확인 필요")
+                near_new_high_stock_codes = {stock.get("code") for stock in res_near_new_high.get("output2", [])}
 
-        # 4-4. [NEW] 상한가 다음날 조건검색 결과 조회
+        # 4-4. 상한가 다음날 조건검색 결과 조회
         upper_limit_next_day_stock_codes = set()
-        upper_limit_cond_name = settings.UPPER_LIMIT_NEXT_DAY_CONDITION_NAME
-        # [FIX] 정확한 일치로 변경
-        upper_limit_cond = next(
-            (c for c in my_conditions if c["condition_nm"] == upper_limit_cond_name),
-            None,
+        upper_limit_next_cond = next(
+            (c for c in my_conditions if c["condition_nm"] == settings.UPPER_LIMIT_NEXT_DAY_CONDITION_NAME), None
         )
-        if upper_limit_cond:
-            res_upper_limit = await client.get_condition_result(
-                session, upper_limit_cond["seq"]
-            )
-            if res_upper_limit.get("rt_cd") == "0":
-                upper_limit_list = res_upper_limit.get("output2", [])
-                upper_limit_next_day_stock_codes = {
-                    stock.get("code") for stock in upper_limit_list
-                }
-                logger.info(
-                    f"{Colors.MAGENTA}⬆️ [상한가 다음날]: {len(upper_limit_next_day_stock_codes)}개 종목 포착{Colors.RESET}"
-                )
+        if upper_limit_next_cond:
+            res_upper_next = await client.get_condition_result(session, upper_limit_next_cond["seq"])
+            if res_upper_next.get("rt_cd") == "0":
+                upper_limit_next_day_stock_codes = {stock.get("code") for stock in res_upper_next.get("output2", [])}
 
-        # 4-5. [NEW] 상한가 조건검색 결과 조회
+        # 4-5. 상한가 조건검색 결과 조회
         upper_limit_stock_codes = set()
-        upper_limit_cond_name = settings.UPPER_LIMIT_CONDITION_NAME
         upper_limit_cond = next(
-            (c for c in my_conditions if c["condition_nm"] == upper_limit_cond_name),
-            None,
+            (c for c in my_conditions if c["condition_nm"] == settings.UPPER_LIMIT_CONDITION_NAME), None
         )
         if upper_limit_cond:
-            res_upper_limit_only = await client.get_condition_result(
-                session, upper_limit_cond["seq"]
-            )
-            if res_upper_limit_only.get("rt_cd") == "0":
-                upper_limit_only_list = res_upper_limit_only.get("output2", [])
-                upper_limit_stock_codes = {
-                    stock.get("code") for stock in upper_limit_only_list
-                }
-                logger.info(
-                    f"{Colors.RED}🔺 [상한가]: {len(upper_limit_stock_codes)}개 종목 포착 (일반분석 제외){Colors.RESET}"
-                )
+            res_upper_only = await client.get_condition_result(session, upper_limit_cond["seq"])
+            if res_upper_only.get("rt_cd") == "0":
+                upper_limit_stock_codes = {stock.get("code") for stock in res_upper_only.get("output2", [])}
+
+        # 조건검색 결과 통합 카드 리포트 출력
+        logger.info(
+            f"\n{Colors.BOLD}================================================================================{Colors.RESET}"
+        )
+        logger.info(
+            f"{Colors.BOLD}🚀 K-CLOSING ALPHA :: 실시간 종가매매 데이터 수집 ({len(stock_list)}종목 포착){Colors.RESET}"
+        )
+        logger.info(
+            f"{Colors.BOLD}================================================================================{Colors.RESET}"
+        )
+        logger.info(f"   • 🔺 상한가       : {len(upper_limit_stock_codes)}종목")
+        logger.info(f"   • ⬆️ 상한가 다음날 : {len(upper_limit_next_day_stock_codes)}종목")
+        logger.info(f"   • 🚀 신고가       : {len(new_high_stock_codes)}종목")
+        logger.info(f"   • 📈 신고가 근접  : {len(near_new_high_stock_codes)}종목")
+        logger.info(f"   • 🔥 단기과열     : {len(overheated_stock_codes)}종목")
+        logger.info(
+            f"{Colors.BOLD}================================================================================{Colors.RESET}\n"
+        )
 
         # 5. 상세 데이터 수집 (HTS 조건검색 결과 전달)
         results, failed_info = await fetch_all_stock_data(
@@ -688,9 +564,6 @@ async def main():
 
             # 표준 열 순서로 utf-8-sig CSV (+ Parquet) 저장
             save_collected_condition_data(df, save_path)
-
-            # 신규 아카이브 (data/history/archive.parquet + archive.db) 누적 저장
-            upsert_archive_snapshot(df)
 
             # 수집 결과 요약 출력
             success_count = len(results) - len(failed_info)
