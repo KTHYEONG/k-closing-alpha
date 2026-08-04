@@ -1,13 +1,14 @@
-"""Model Pipeline wiring 및 일일 의사결정 로직 단위 테스트.
+"""일일 예측 진입점 wiring 및 Fast Inference 단위 테스트.
 
 SCENARIO_MODEL_PIPELINE_TRAIN_EVAL 의 wiring 단계가 일일 예측 진입점에
-연결되었는지 확인하고, predict_position.py 의 순수 로직(레이블 인코더 로드,
-데이터 전처리, SHAP 설명, GMM 기반 동적 의사결정)을 검증합니다.
+연결되었는지 확인하고, 레거시 GMM/Static 의사결정 로직 제거 여부와
+저장된 모델 아티팩트 기반 Fast Inference(< 1초) 동작을 검증합니다.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,6 +17,30 @@ import pandas as pd
 import pytest
 
 import src.daily.predict_position as predict_position
+from src.ml.sizing_engine import _train_inline_bundle, save_model_artifacts
+
+FEATURE_COLS = ["f1", "f2"]
+TARGET_COL = "target_net_return"
+GROUP_COL = "date"
+
+
+def _snapshot_df(n_rows: int = 24, seed: int = 3) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    f1 = rng.normal(size=n_rows)
+    f2 = rng.normal(size=n_rows)
+    target = 0.02 * f1 + 0.01 * f2 + rng.normal(loc=0.0, scale=0.008, size=n_rows)
+    return pd.DataFrame(
+        {
+            "종목명": [f"종목{i}" for i in range(n_rows)],
+            "테마_섹터": ["테마A"] * n_rows,
+            "차트분석": ["거래량 폭증_Y"] * n_rows,
+            "선정순위": list(range(1, n_rows + 1)),
+            GROUP_COL: [f"2026-08-{d:02d}" for d in range(1, n_rows + 1)],
+            "f1": f1,
+            "f2": f2,
+            TARGET_COL: target,
+        }
+    )
 
 
 def test_run_model_pipeline_wired_into_daily_predict_position() -> None:
@@ -179,68 +204,55 @@ def test_main_returns_when_no_actionable_stocks() -> None:
         predict_position.main()
 
 
-def _wide_scores() -> pd.Series:
-    return pd.Series(
-        [0.20, 0.35, 0.50, 0.62, 0.72, 0.85, 0.95, 1.05, 1.12, 1.20, 1.30, 1.40]
+def test_legacy_gmm_logic_removed() -> None:
+    """레거시 GMM/Static 의사결정 및 하드코딩 Safety Floor 가 제거되었는지 확인한다."""
+    assert not hasattr(predict_position, "get_decision_batch")
+    assert not hasattr(predict_position, "GaussianMixture")
+    assert not hasattr(predict_position, "HAS_SKLEARN")
+    assert not hasattr(predict_position, "SAFETY_MAX_FLOOR")
+    assert not hasattr(predict_position, "SAFETY_EXPAND_FLOOR")
+    assert not hasattr(predict_position, "ABSOLUTE_MIN_SCORE")
+    assert not hasattr(predict_position, "MIN_SAMPLES_FOR_GMM")
+
+
+def test_run_daily_sizing_inference_from_saved_artifacts_within_1s(tmp_path) -> None:
+    """저장된 모델 아티팩트(artifacts/models)를 로드하여 Fast Inference 가 1초 이내 완료된다."""
+    snapshot = _snapshot_df()
+    bundle = _train_inline_bundle(snapshot, FEATURE_COLS, TARGET_COL, GROUP_COL)
+    save_model_artifacts(bundle, str(tmp_path))
+
+    start = time.perf_counter()
+    loaded = predict_position.load_model_artifacts(str(tmp_path))
+    result = predict_position.run_daily_sizing_inference(
+        snapshot, loaded, feature_cols=FEATURE_COLS, group_col=GROUP_COL
     )
+    elapsed = time.perf_counter() - start
 
-
-def test_get_decision_batch_uses_static_logic_without_sklearn() -> None:
-    scores = pd.Series([0.30, 0.70, 0.90, 1.10])
-    with patch.object(predict_position, "HAS_SKLEARN", False):
-        decisions = predict_position.get_decision_batch(scores)
-    assert decisions.tolist() == ["Reduce", "Neutral", "Expand", "Max_Expand"]
-
-
-def test_get_decision_batch_static_when_sample_too_small() -> None:
-    scores = pd.Series([0.3, 0.9, 1.1])
-    with patch.object(predict_position, "HAS_SKLEARN", True):
-        decisions = predict_position.get_decision_batch(scores)
-    assert decisions.tolist() == ["Reduce", "Expand", "Max_Expand"]
-
-
-def test_get_decision_batch_static_when_scores_have_low_discrimination() -> None:
-    scores = pd.Series([1.0] * 12)
-    with patch.object(predict_position, "HAS_SKLEARN", True):
-        decisions = predict_position.get_decision_batch(scores)
-    assert set(decisions.tolist()) == {"Expand"}
-
-
-def test_get_decision_batch_gmm_path_applies_safety_logic() -> None:
-    scores = _wide_scores()
-    with patch.object(predict_position, "HAS_SKLEARN", True):
-        decisions = predict_position.get_decision_batch(scores)
-    assert set(decisions.tolist()) <= {
-        "Reduce",
-        "Neutral",
-        "Expand",
-        "Max_Expand",
-    }
-    assert decisions[scores < predict_position.ABSOLUTE_MIN_SCORE].tolist() == [
-        "Reduce"
-    ] * int((scores < predict_position.ABSOLUTE_MIN_SCORE).sum())
-    assert decisions[scores >= 1.07].tolist() == ["Max_Expand"] * int(
-        (scores >= 1.07).sum()
+    assert {"utility_score", "grade", "grade_multiplier", "allocation"}.issubset(
+        result.columns
     )
+    assert result["grade"].isin(["Strong", "Good", "Weak", "Pass"]).all()
+    assert result["allocation"].ge(0.0).all()
+    assert elapsed < 1.0
 
 
-def test_get_decision_batch_falls_back_to_static_on_gmm_error() -> None:
-    scores = _wide_scores()
-    with (
-        patch.object(predict_position, "HAS_SKLEARN", True),
-        patch.object(
-            predict_position.GaussianMixture, "fit", side_effect=RuntimeError("gmm")
-        ),
-    ):
-        decisions = predict_position.get_decision_batch(scores)
-    assert decisions.tolist() == scores.apply(
-        lambda s: (
-            "Reduce"
-            if s < 0.59
-            else "Neutral"
-            if s < 0.87
-            else "Expand"
-            if s < 1.07
-            else "Max_Expand"
-        )
-    ).tolist()
+def test_run_daily_sizing_inference_adds_missing_group_col() -> None:
+    snapshot = _snapshot_df().drop(columns=[GROUP_COL])
+    bundle = _train_inline_bundle(_snapshot_df(), FEATURE_COLS, TARGET_COL, GROUP_COL)
+    result = predict_position.run_daily_sizing_inference(snapshot, bundle)
+    assert GROUP_COL in result.columns
+    assert len(result) == len(snapshot)
+    assert {"utility_score", "grade", "allocation"}.issubset(result.columns)
+
+
+def test_run_daily_sizing_inference_fills_missing_features() -> None:
+    snapshot = _snapshot_df().drop(columns=["f2"])
+    bundle = _train_inline_bundle(_snapshot_df(), FEATURE_COLS, TARGET_COL, GROUP_COL)
+    result = predict_position.run_daily_sizing_inference(snapshot, bundle)
+    assert {"utility_score", "grade", "allocation"}.issubset(result.columns)
+    assert len(result) == len(snapshot)
+
+
+def test_run_daily_sizing_inference_raises_without_feature_cols() -> None:
+    with pytest.raises(ValueError, match="feature_cols is empty"):
+        predict_position.run_daily_sizing_inference(_snapshot_df(), {"dummy": 1})

@@ -53,7 +53,7 @@ def _fit_predict_calibrated(
     상수 예측으로 반환합니다.
     """
     y_train = train[target_col].to_numpy().astype(bool)
-    if np.unique(y_train).size < 2:
+    if np.unique(y_train).size < 2 or int(np.min(np.bincount(y_train))) < 3:
         return np.full(len(val), float(np.mean(y_train)))
     base = LGBMClassifier(objective="binary", random_state=42, verbosity=-1)
     calibrator = CalibratedClassifierCV(estimator=base, method="sigmoid", cv=3)
