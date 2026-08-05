@@ -1,7 +1,13 @@
-"""OOF 백테스트 평가: Baseline 비교 및 연도별 안정성 감사.
+"""OOF 백테스트 평가: Baseline 비교 및 연도/국면별 안정성 감사.
 
-LGBMRanker OOF 예측을 2개 Baseline(selection_rank 휴리스틱, 동일가중 무작위)과
-비교하고, 연도별 Top-k 수익률 / 승률 / Profit Factor / Sharpe 를 분해합니다.
+`docs/specs/ml_strategy_improvement.md` P0/P1 요구사항:
+- ``selection_rank`` 는 필수 baseline 컬럼입니다. 누락 시 경고가 아니라
+  ValueError 로 fail-closed 합니다.
+- 동일 OOF 날짜 집합에서 selection-rank / equal-weight / regularized-linear
+  baseline 을 모두 평가합니다.
+- 모든 contender 에 대해 날짜가중·자본가중 수익률, 비용차감 수익률, 턴오버,
+  최대 드로다운, 연도/국면(시장구분)/시가총액 분해를 계산합니다.
+
 모든 성능 지표는 NumPy 벡터 연산만 사용합니다 (pd.apply 루프 금지).
 """
 
@@ -19,6 +25,15 @@ logger = logging.getLogger(__name__)
 _DAILY_ANNUALIZATION = float(np.sqrt(252.0))
 _MIN_YEAR_SAMPLES = 5
 _BASE_METRIC_KEYS = ("top_1_return", "win_rate", "profit_factor", "mean_win", "mean_loss", "sharpe")
+_EXTENDED_METRIC_KEYS = (
+    *_BASE_METRIC_KEYS,
+    "top_3_return",
+    "cost_adjusted_return",
+    "date_weighted_return",
+    "capital_weighted_return",
+    "turnover",
+    "max_drawdown",
+)
 _YEARLY_METRIC_KEYS = ("top1_return", "top3_return", "win_rate", "profit_factor", "sharpe")
 _YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})")
 
@@ -110,6 +125,104 @@ def _aggregate_metrics(daily_returns: np.ndarray) -> dict[str, float]:
     }
 
 
+def _max_drawdown(daily_returns: np.ndarray) -> float:
+    """일자별 수익률 시계열의 최대 드로다운(양수)을 반환합니다."""
+    returns = daily_returns[np.isfinite(daily_returns)]
+    if returns.size == 0:
+        return float("nan")
+    cumulative = np.cumprod(1.0 + returns)
+    peak = np.maximum.accumulate(cumulative)
+    drawdown = (cumulative - peak) / peak
+    return float(-drawdown.min())
+
+
+def _turnover(
+    oof: pd.DataFrame, group_col: str, score_col: str, ascending: bool, k: int
+) -> float:
+    """일자별 Top-k 선택 종목의 전일 대비 신규 편입 비율 평균을 반환합니다."""
+    sorted_df = oof.sort_values([group_col, score_col], ascending=[True, ascending], kind="mergesort")
+    prev: set[Any] | None = None
+    turns: list[float] = []
+    for _, group in sorted_df.groupby(group_col, sort=False):
+        top = group.index[:k]
+        if prev is not None:
+            keep = len(set(top) & prev)
+            turns.append(1.0 - keep / min(k, len(top)))
+        prev = set(top)
+    return float(np.mean(turns)) if turns else float("nan")
+
+
+def _capital_weighted_return(
+    oof: pd.DataFrame, group_col: str, target_col: str, score_col: str, ascending: bool
+) -> float:
+    """그룹 내 역순위 가중(상위 점수 종목에 더 큰 가중) 자본가중 일일 수익률 평균."""
+    sorted_df = oof.sort_values([group_col, score_col], ascending=[True, ascending], kind="mergesort")
+    daily: list[float] = []
+    for _, group in sorted_df.groupby(group_col, sort=False):
+        n = len(group)
+        if n == 0:
+            continue
+        weights = np.arange(n, 0, -1, dtype=np.float64)
+        weights = weights / weights.sum()
+        daily.append(float(np.dot(weights, group[target_col].to_numpy(dtype=np.float64))))
+    return float(np.mean(daily)) if daily else float("nan")
+
+
+def _stratified_breakdown(
+    oof: pd.DataFrame,
+    group_col: str,
+    target_col: str,
+    score_col: str,
+    ascending: bool,
+    strat_col: str,
+) -> dict[str, dict[str, float]]:
+    """일자별 Top-1 선택 종목의 국면(strat_col)별 지표 분해를 반환합니다."""
+    sorted_df = oof.sort_values([group_col, score_col], ascending=[True, ascending], kind="mergesort")
+    top1 = sorted_df.groupby(group_col, sort=False).head(1)
+    top1 = top1.dropna(subset=[strat_col])
+    breakdown: dict[str, dict[str, float]] = {}
+    for strat, group in top1.groupby(strat_col, sort=False):
+        breakdown[str(strat)] = _aggregate_metrics(
+            group[target_col].to_numpy(dtype=np.float64)
+        )
+    return breakdown
+
+
+def _extended_metrics(
+    oof: pd.DataFrame,
+    group_col: str,
+    target_col: str,
+    score_col: str,
+    ascending: bool,
+    k: int | None,
+) -> dict[str, Any]:
+    """단일 contender 에 대한 확장 성과 지표(비용/턴오버/드로다운/국면 분해)를 반환합니다.
+
+    ``k=None`` 은 동일가중(그룹 전체 평균) contender 로, 턴오버는 정의되지
+    않으므로 NaN 을 반환합니다.
+    """
+    daily, _ = _group_series(oof, group_col, target_col, score_col, ascending, k)
+    if k is None:
+        daily3 = daily
+        metrics = _aggregate_metrics(daily)
+        metrics["top_3_return"] = metrics["top_1_return"]
+        metrics["capital_weighted_return"] = metrics["top_1_return"]
+        metrics["turnover"] = float("nan")
+    else:
+        daily3, _ = _group_series(oof, group_col, target_col, score_col, ascending, 3)
+        metrics = _aggregate_metrics(daily)
+        metrics["top_3_return"] = float(np.mean(daily3)) if daily3.size else float("nan")
+        metrics["capital_weighted_return"] = _capital_weighted_return(
+            oof, group_col, target_col, score_col, ascending
+        )
+        metrics["turnover"] = _turnover(oof, group_col, score_col, ascending, k)
+    # target_col is decimal net return; transaction cost was deducted during target construction.
+    metrics["cost_adjusted_return"] = metrics["top_1_return"]
+    metrics["date_weighted_return"] = metrics["top_1_return"]
+    metrics["max_drawdown"] = _max_drawdown(daily)
+    return metrics
+
+
 def _yearly_breakdown(
     daily: np.ndarray,
     daily3: np.ndarray,
@@ -146,50 +259,67 @@ def run_backtest_evaluation(
     """OOF 예측 vs Baseline 비교 백테스트를 실행합니다.
 
     Args:
-        oof_df: 컬럼 `group_col`, `target_col`, `pred`, [선택] `selection_rank`.
-        target_col: 일자별 실현 순수익률 컬럼.
+        oof_df: 컬럼 `group_col`, `target_col`, `pred`, `selection_rank`,
+            [선택] `pred_linear` 를 포함해야 합니다.
+        target_col: 일자별 실현 순수익률(decimal net) 컬럼.
         group_col: 거래일 그룹 컬럼.
 
     Returns:
         dict with keys:
-          'model_metrics'    : 전체 기간 AI 모델 지표
-          'baseline_metrics' : 기존 선정순위 및 동일가중 Baseline 지표
+          'model_metrics'    : AI 모델 지표 (비용/턴오버/드로다운/국면 분해 포함)
+          'baseline_metrics' : selection_rank / equal_weight / [linear] Baseline 지표
           'yearly_breakdown' : 연도별 Top-1 Return, Win Rate, Profit Factor, Sharpe
     """
-    missing = [col for col in (group_col, target_col, "pred") if col not in oof_df.columns]
+    required = [group_col, target_col, "pred", "selection_rank"]
+    missing = [col for col in required if col not in oof_df.columns]
     if missing:
         raise ValueError(f"missing required columns in oof_df: {missing}")
 
-    work = oof_df[[group_col, target_col, "pred"]].copy()
-    if "selection_rank" in oof_df.columns:
-        work["selection_rank"] = oof_df["selection_rank"].to_numpy()
-    work = work.dropna(subset=[group_col, target_col, "pred"])
+    work = oof_df[required].copy()
+    if "pred_linear" in oof_df.columns:
+        work["pred_linear"] = oof_df["pred_linear"].to_numpy()
+    if "market_type" in oof_df.columns:
+        work["market_type"] = oof_df["market_type"].astype(str)
+    if "market_cap_100m" in oof_df.columns:
+        work["market_cap_100m"] = oof_df["market_cap_100m"].to_numpy(dtype=np.float64)
+        work["market_cap_tercile"] = pd.qcut(
+            work["market_cap_100m"], q=3, labels=["low", "mid", "high"], duplicates="drop"
+        ).astype(str)
+
+    work = work.dropna(subset=[group_col, target_col, "pred", "selection_rank"])
     if work.empty:
         raise ValueError("oof_df has no usable rows after NaN filtering")
 
+    model_metrics = _extended_metrics(work, group_col, target_col, "pred", False, 1)
     model_daily, model_daily3, model_years = _model_daily_series(work, group_col, target_col)
-    model_metrics = _aggregate_metrics(model_daily)
-    model_metrics["top_3_return"] = float(np.mean(model_daily3))
 
-    ew_daily, _ = _group_series(work, group_col, target_col, "pred", ascending=False, k=None)
-    ew_metrics = _aggregate_metrics(ew_daily)
-    ew_metrics["top_3_return"] = ew_metrics["top_1_return"]
+    ew_metrics = _extended_metrics(work, group_col, target_col, "pred", False, None)
 
     baseline_metrics: dict[str, Any] = {}
-    if "selection_rank" in work.columns:
-        sr_daily, sr_daily3 = _selection_rank_daily_series(work, group_col, target_col)
-        sr_metrics = _aggregate_metrics(sr_daily)
-        sr_metrics["top_3_return"] = float(np.mean(sr_daily3))
-        baseline_metrics["selection_rank"] = sr_metrics
-    else:
-        logger.warning("selection_rank column missing - skipping selection_rank baseline")
-        baseline_metrics["selection_rank"] = None
+    sr_metrics = _extended_metrics(work, group_col, target_col, "selection_rank", True, 1)
+    baseline_metrics["selection_rank"] = sr_metrics
     baseline_metrics["equal_weight"] = ew_metrics
+
+    if "pred_linear" in work.columns:
+        linear_metrics = _extended_metrics(work, group_col, target_col, "pred_linear", False, 1)
+        baseline_metrics["linear"] = linear_metrics
 
     return {
         "model_metrics": model_metrics,
         "baseline_metrics": baseline_metrics,
         "yearly_breakdown": _yearly_breakdown(model_daily, model_daily3, model_years),
+        "regime_breakdown": {
+            "market_type": _stratified_breakdown(
+                work, group_col, target_col, "pred", False, "market_type"
+            )
+            if "market_type" in work.columns
+            else {},
+            "market_cap": _stratified_breakdown(
+                work, group_col, target_col, "pred", False, "market_cap_tercile"
+            )
+            if "market_cap_tercile" in work.columns
+            else {},
+        },
     }
 
 
@@ -200,12 +330,3 @@ def _model_daily_series(
     daily, years = _group_series(work, group_col, target_col, "pred", ascending=False, k=1)
     daily3, _ = _group_series(work, group_col, target_col, "pred", ascending=False, k=3)
     return daily, daily3, years
-
-
-def _selection_rank_daily_series(
-    work: pd.DataFrame, group_col: str, target_col: str
-) -> tuple[np.ndarray, np.ndarray]:
-    """selection_rank 오름차순(낮을수록 우선) 정렬 기준 Top-1/Top-3 일별 수익률 시계열."""
-    daily, _ = _group_series(work, group_col, target_col, "selection_rank", ascending=True, k=1)
-    daily3, _ = _group_series(work, group_col, target_col, "selection_rank", ascending=True, k=3)
-    return daily, daily3

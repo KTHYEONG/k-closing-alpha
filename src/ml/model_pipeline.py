@@ -18,14 +18,22 @@ from scipy.stats import spearmanr
 from sklearn.linear_model import Ridge
 
 from src.ml.backtest_evaluator import run_backtest_evaluation
+from src.ml.feature_manifest import build_feature_manifest
 from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
 from src.ml.quantile_model import fit_predict_quantile_and_classifier
 from src.ml.sizing_engine import (
+    ROUND_TRIP_COST_RATIO,
     _train_inline_bundle,
     apply_risk_limits,
     assign_sizing_grades,
     calculate_utility_score,
     save_model_artifacts,
+)
+from src.processing.preprocessor import (
+    DECISION_TIMESTAMP_COL,
+    FEATURE_AVAILABLE_TIMESTAMP_COL,
+    LABEL_THRESHOLDS,
+    RETURN_UNIT,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,6 +135,51 @@ def _fit_predict(
     return model, model.predict(val[feature_cols])
 
 
+def _validate_feature_availability(df: pd.DataFrame, feature_cols: list[str]) -> None:
+    """선정 피처가 decision 시각보다 늦지 않게 이용 가능한지 검증합니다.
+
+    Raises:
+        ValueError: 타임스탬프 컬럼 누락, timezone-naive, 또는 임의의 행에서
+            ``feature_available_timestamp > decision_timestamp`` 인 경우
+            (위반 피처 컬럼명을 함께 보고).
+    """
+    for col in (FEATURE_AVAILABLE_TIMESTAMP_COL, DECISION_TIMESTAMP_COL):
+        if col not in df.columns:
+            raise ValueError(
+                f"timestamp column {col!r} is required for point-in-time integrity; "
+                f"record {col} in candidate history before training"
+            )
+        if getattr(df[col].dtype, "tz", None) is None:
+            raise ValueError(
+                f"timestamp column {col!r} must be timezone-aware (Asia/Seoul), got {df[col].dtype}"
+            )
+    available = df[FEATURE_AVAILABLE_TIMESTAMP_COL]
+    decision = df[DECISION_TIMESTAMP_COL]
+    violation = available > decision
+    if violation.any():
+        offending = [feature for feature in feature_cols if df.loc[violation, feature].notna().any()]
+        raise ValueError(
+            "features become available after decision_timestamp; non-causal rows "
+            f"({int(violation.sum())} rows) violate feature_available_timestamp <= "
+            f"decision_timestamp. Offending feature columns: {offending}"
+        )
+
+
+def _fit_predict_linear_baseline(
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+) -> np.ndarray:
+    """Regularized linear(Ridge) baseline 을 동일 fold 에서 학습·예측합니다."""
+    medians = train[feature_cols].median(numeric_only=True).reindex(feature_cols).fillna(0.0)
+    train_features = train[feature_cols].fillna(medians)
+    val_features = val[feature_cols].fillna(medians)
+    model = Ridge()
+    model.fit(train_features, train[target_col])
+    return np.asarray(model.predict(val_features), dtype=np.float64)
+
+
 def run_model_pipeline(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -138,8 +191,16 @@ def run_model_pipeline(
 ) -> dict[str, Any]:
     """Train ML model using Purged Group Walk-Forward CV and evaluate OOF results.
 
+    Point-in-time 요구사항(P0):
+    - ``feature_available_timestamp``/``decision_timestamp`` 가 timezone-aware 로
+      존재해야 하고 모든 행에서 ``feature_available <= decision`` 을 만족해야 합니다.
+    - OOF 프레임에 ``selection_rank`` 와 regularized linear baseline(``pred_linear``),
+      fold 출처를 보존합니다.
+
     Returns:
-        dict containing 'oof_predictions', 'oof_df', 'metrics', and 'trained_models'.
+        dict containing 'oof_predictions', 'oof_df', 'metrics', 'trained_models',
+        'backtest_eval', and bundle metadata (return_unit, round_trip_cost,
+        label_thresholds, feature_manifest, training_cutoff, policy_params).
     """
     if model_type not in _MODEL_TYPES:
         raise ValueError(f"model_type must be one of {list(_MODEL_TYPES)}, got {model_type!r}")
@@ -149,11 +210,14 @@ def run_model_pipeline(
     if not feature_cols:
         raise ValueError("feature_cols must not be empty")
 
+    _validate_feature_availability(df, feature_cols)
+
     work = df.sort_values(group_col).copy()
     splitter = PurgedGroupTimeSeriesSplit(n_splits=n_splits, purge_gap=purge_gap)
 
     oof_parts: list[pd.DataFrame] = []
     trained_models: list[Any] = []
+    training_cutoff: Any = None
 
     for fold, (train_idx, val_idx) in enumerate(
         splitter.split(work, y=work[target_col], groups=work[group_col])
@@ -162,15 +226,20 @@ def run_model_pipeline(
         val = work.iloc[val_idx]
         model, pred = _fit_predict(model_type, train, val, feature_cols, target_col, group_col)
         trained_models.append(model)
+        training_cutoff = train[group_col].max()
 
         fold_oof = pd.DataFrame(
             {
                 group_col: val[group_col].to_numpy(),
                 target_col: val[target_col].to_numpy(),
                 "pred": pred,
+                "pred_linear": _fit_predict_linear_baseline(train, val, feature_cols, target_col),
+                "fold": fold,
             },
             index=val.index,
         )
+        if "selection_rank" in work.columns:
+            fold_oof["selection_rank"] = val["selection_rank"].to_numpy()
         oof_parts.append(fold_oof)
         logger.info("fold=%d train=%d val=%d", fold, len(train_idx), len(val_idx))
 
@@ -191,6 +260,17 @@ def run_model_pipeline(
         "metrics": metrics,
         "trained_models": trained_models,
         "backtest_eval": run_backtest_evaluation(oof_df, target_col, group_col),
+        "return_unit": RETURN_UNIT,
+        "round_trip_cost": ROUND_TRIP_COST_RATIO,
+        "label_thresholds": dict(LABEL_THRESHOLDS),
+        "feature_manifest": build_feature_manifest(feature_cols),
+        "training_cutoff": str(training_cutoff),
+        "calibration_diagnostics": [],
+        "policy_params": {
+            "purge_gap": purge_gap,
+            "n_splits": n_splits,
+            "model_type": model_type,
+        },
     }
 
 
@@ -241,6 +321,12 @@ def run_sizing_pipeline(
     )
     result: dict[str, Any] = {"quantile_df": quantile_df, "sizing_df": sizing_df}
     if export_dir:
-        bundle = _train_inline_bundle(df, feature_cols, target_col, group_col)
+        bundle = _train_inline_bundle(
+            df,
+            feature_cols,
+            target_col,
+            group_col,
+            calibration_diagnostics=quantile_df.attrs.get("calibration_diagnostics", []),
+        )
         result["artifact_path"] = save_model_artifacts(bundle, export_dir)
     return result

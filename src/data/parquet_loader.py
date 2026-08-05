@@ -171,14 +171,33 @@ def upsert_condition_parquet(df: pd.DataFrame) -> None:
     if parquet_path.exists():
         df_existing = pd.read_parquet(parquet_path)
         if "스냅샷_날짜" in df.columns and "스냅샷_날짜" in df_existing.columns:
-            target_dates = set(df["스냅샷_날짜"].dropna().astype(str).unique())
-            df_existing = df_existing[~df_existing["스냅샷_날짜"].astype(str).isin(target_dates)]
+            has_identity = "snapshot_timestamp" in df.columns and "snapshot_timestamp" in df_existing.columns
+            if has_identity:
+                # 스냅샷 정체성(날짜, 시각) 단위로만 교체해 intraday 캡처를 보존합니다.
+                existing_key = (
+                    df_existing["스냅샷_날짜"].astype(str)
+                    + "|"
+                    + df_existing["snapshot_timestamp"].astype(str)
+                )
+                new_keys = set(
+                    df["스냅샷_날짜"].astype(str)
+                    + "|"
+                    + df["snapshot_timestamp"].astype(str)
+                )
+                df_existing = df_existing[~existing_key.isin(new_keys)]
+            else:
+                target_dates = set(df["스냅샷_날짜"].dropna().astype(str).unique())
+                df_existing = df_existing[~df_existing["스냅샷_날짜"].astype(str).isin(target_dates)]
         df_combined = pd.concat([df_existing, df], ignore_index=True)
     else:
         df_combined = df.copy()
 
-    # Deduplicate if key columns exist within new dataframe
-    dedup_cols = [col for col in ["스냅샷_날짜", "종목코드"] if col in df_combined.columns]
+    # 스냅샷 정체성이 있으면 (날짜, 시각, 종목), 없으면 (날짜, 종목) 기준 중복 제거
+    if "snapshot_timestamp" in df_combined.columns:
+        dedup_cols = ["스냅샷_날짜", "snapshot_timestamp", "종목코드"]
+    else:
+        dedup_cols = ["스냅샷_날짜", "종목코드"]
+    dedup_cols = [col for col in dedup_cols if col in df_combined.columns]
     if dedup_cols:
         df_combined = df_combined.drop_duplicates(subset=dedup_cols, keep="last")
 

@@ -133,7 +133,7 @@ def test_multi_target_generation() -> None:
     assert len(X) == len(processed)
     assert targets["target_rank"].between(0, 4).all()
     assert targets["target_rank"].dtype.kind == "i"
-    assert targets["target_return"].between(-10.0, 10.0).all()
+    assert targets["target_return"].between(-0.10, 0.10).all()
     assert set(targets["target_good"].unique()).issubset({0, 1})
     assert set(targets["target_bad"].unique()).issubset({0, 1})
     for series in targets.values():
@@ -142,13 +142,96 @@ def test_multi_target_generation() -> None:
 
 
 def test_target_return_clipped() -> None:
-    """target_return이 ±10%로 클리핑되는지 검증합니다."""
+    """target_return이 decimal net 단위로 ±10% 소수 클리핑되고, 라벨이 동일 단위 임계값에서 파생됩니다.
+
+    SCENARIO: test_target_return_clipped — Targets and classifier labels share
+    decimal-net units and one cost deduction.
+    """
     df = _build_raw_df()
     df.loc[df.index[0], "(수익률, %)"] = "25.0"
     df.loc[df.index[1], "(수익률, %)"] = "-15.0"
     _, targets, _, _ = build_ml_dataset(df)
-    assert targets["target_return"].max() <= 10.0
-    assert targets["target_return"].min() >= -10.0
+    assert targets["target_return"].max() <= 0.10
+    assert targets["target_return"].min() >= -0.10
+
+
+def test_target_return_decimal_net_single_cost_deduction() -> None:
+    """원본 퍼센트 수익률이 정확히 1회 decimal 변환되고 비용이 정확히 1회 차감됩니다.
+
+    - 1.0% gross -> decimal net = 0.01 - 0.002 = 0.008 (percentage-point 혼용 금지)
+    - 2.0% gross -> 0.018 >= +1% 임계값 -> target_good = 1
+    - -3.0% gross -> -0.032 <= -2% 임계값 -> target_bad = 1
+    """
+    from src.ml.sizing_engine import ROUND_TRIP_COST_RATIO
+
+    df = _build_raw_df(n_per_date=[1])
+    df["(수익률, %)"] = "1.0"
+    _, targets, _, _ = build_ml_dataset(df)
+    assert targets["target_return"].iloc[0] == pytest.approx(0.01 - ROUND_TRIP_COST_RATIO)
+
+    df = _build_raw_df(n_per_date=[1])
+    df["(수익률, %)"] = "2.0"
+    _, targets, _, _ = build_ml_dataset(df)
+    assert targets["target_good"].iloc[0] == 1
+    assert targets["target_return"].iloc[0] == pytest.approx(0.02 - ROUND_TRIP_COST_RATIO)
+
+    df = _build_raw_df(n_per_date=[1])
+    df["(수익률, %)"] = "-3.0"
+    _, targets, _, _ = build_ml_dataset(df)
+    assert targets["target_bad"].iloc[0] == 1
+
+
+def test_build_ml_dataset_attaches_feature_manifest() -> None:
+    """훈련 입력에 결정적 피처 매니페스트가 부착됩니다."""
+    X, targets, cat_features, processed = build_ml_dataset(_build_raw_df())
+    manifest = processed.attrs["feature_manifest"]
+    assert set(manifest.columns) == {
+        "feature_name",
+        "source_column",
+        "availability_rule",
+        "unit",
+        "panel_scope",
+    }
+    assert set(manifest["feature_name"]) == set(X.columns)
+    assert manifest["availability_rule"].isin(
+        ["at_decision_time", "needs_snapshot_proof"]
+    ).all()
+
+
+def test_production_feature_set_excludes_candle_price_derived_features() -> None:
+    """P0: close/high/low/실현 매수가 파생 피처는 생성되지만 프로덕션 피처 집합(X)에서 제외됩니다."""
+    X, targets, cat_features, processed = build_ml_dataset(_build_raw_df())
+    candle_derived = {
+        "close_position",
+        "body_ratio",
+        "upper_shadow_ratio",
+        "intraday_range",
+        "buy_price_change_rate",
+        "gap_ratio",
+        "relative_change_rate",
+    }
+    assert candle_derived.issubset(set(processed.columns))
+    assert not candle_derived.intersection(X.columns)
+    # 캔들/실현 매수가 파생 피처의 robust-z 변환도 X 에서 제외됩니다.
+    for z_col in ("buy_price_change_rate_z", "gap_ratio_z"):
+        assert z_col in processed.columns
+        assert z_col not in X.columns
+
+
+def test_build_ml_dataset_rejects_non_causal_rows() -> None:
+    """피처 이용 가능 시각이 decision 시각보다 늦은 행은 X 구성 전에 제외됩니다."""
+    df = _build_raw_df(n_per_date=[3, 3, 3])
+    cleaned = clean_column_names(df)
+    cleaned["decision_timestamp"] = pd.Timestamp("2024-01-02 15:30:00", tz="Asia/Seoul")
+    cleaned["feature_available_timestamp"] = pd.Timestamp(
+        "2024-01-02 15:30:00", tz="Asia/Seoul"
+    )
+    cleaned.loc[cleaned.index[0], "feature_available_timestamp"] = pd.Timestamp(
+        "2024-01-02 15:45:00", tz="Asia/Seoul"
+    )
+    X, targets, cat_features, processed = build_ml_dataset(cleaned)
+    assert len(processed) == len(cleaned) - 1
+    assert len(X) == len(processed)
 
 
 def test_engineer_features_created() -> None:

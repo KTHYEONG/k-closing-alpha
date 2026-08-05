@@ -17,6 +17,21 @@ RANK_COL = "순위"
 # 조회하고 싶을 때 YYYY-MM-DD 형식으로 지정.
 FETCH_TARGET_DATE = None  # "2025-12-09"
 
+# point-in-time 무결성 타임스탬프 (Asia/Seoul timezone-aware)
+SNAPSHOT_TIMESTAMP_COL = "snapshot_timestamp"
+FEATURE_AVAILABLE_TIMESTAMP_COL = "feature_available_timestamp"
+DECISION_TIMESTAMP_COL = "decision_timestamp"
+EXECUTION_TIMESTAMP_COL = "execution_timestamp"
+TIMESTAMP_COLS = (
+    SNAPSHOT_TIMESTAMP_COL,
+    FEATURE_AVAILABLE_TIMESTAMP_COL,
+    DECISION_TIMESTAMP_COL,
+    EXECUTION_TIMESTAMP_COL,
+)
+KST = "Asia/Seoul"
+
+# 조회(읽기) 시 타임스탬프 컬럼이 26개 표준 컬럼 뒤에 붙은 전체 순서
+ARCHIVE_READ_COLUMN_ORDER = [*ARCHIVE_COLUMN_ORDER, *TIMESTAMP_COLS]
 
 def upsert_history(df: pd.DataFrame, db_path: str) -> None:
     """Append snapshot rows to SQLite and deduplicate by 날짜/종목코드."""
@@ -149,10 +164,14 @@ def fetch_date_rows(date_str: str, history_db: str) -> pd.DataFrame:
 
 
 def _standardize_archive_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Reorder candidates to ARCHIVE_COLUMN_ORDER with zero-filled stock codes and standardized theme/chart values."""
+    """Reorder candidates to ARCHIVE_COLUMN_ORDER with zero-filled stock codes and standardized theme/chart values.
+
+    Timezone-aware timestamp columns(``snapshot_timestamp`` 등)은 26개 표준 컬럼
+    뒤에 보존되어 스냅샷 시각이 유실되지 않습니다.
+    """
     out = df.copy()
     if out.empty:
-        return pd.DataFrame(columns=ARCHIVE_COLUMN_ORDER)
+        return pd.DataFrame(columns=ARCHIVE_READ_COLUMN_ORDER)
 
     if STOCK_CODE_COL in out.columns:
         out[STOCK_CODE_COL] = out[STOCK_CODE_COL].astype(str).str.zfill(6)
@@ -191,11 +210,37 @@ def _standardize_archive_df(df: pd.DataFrame) -> pd.DataFrame:
     if "차트분석" in out.columns:
         out = out.drop(columns=["차트분석"])
 
-    return out.reindex(columns=ARCHIVE_COLUMN_ORDER)
+    # reindex 는 타임스탬프 컬럼을 버리므로 보존 후 재부착
+    timestamp_series = {col: out[col] for col in TIMESTAMP_COLS if col in out.columns}
+    out = out.reindex(columns=ARCHIVE_COLUMN_ORDER)
+    for col, series in timestamp_series.items():
+        out[col] = series.reindex(out.index)
+    for col in TIMESTAMP_COLS:
+        if col not in out.columns:
+            out[col] = pd.NaT
+    return out[ARCHIVE_READ_COLUMN_ORDER]
+
+
+def _kst_timestamp(snapshot_date: str) -> pd.Timestamp:
+    """스냅샷 날짜에서 Asia/Seoul timezone-aware 타임스탬프를 결정적으로 생성합니다.
+
+    스냅샷 시각이 기록되지 않은 과거 데이터는 장 마감 15:30 KST 관례로 간주합니다.
+    """
+    return pd.Timestamp(snapshot_date, tz=KST) + pd.Timedelta(hours=15, minutes=30)
+
+
+def _ensure_tz(series: pd.Series, fallback: pd.Series) -> pd.Series:
+    """타임스탬프 컬럼을 Asia/Seoul timezone-aware 로 강제하고 결측치를 보정합니다."""
+    parsed = pd.to_datetime(series, errors="coerce")
+    if parsed.dt.tz is None:
+        parsed = parsed.dt.tz_localize(KST)
+    else:
+        parsed = parsed.dt.tz_convert(KST)
+    return parsed.fillna(fallback)
 
 
 def _upsert_sqlite_archive(df: pd.DataFrame, db_path: str) -> int:
-    """Overwrite snapshot rows in the SQLite archive for the given dates."""
+    """Overwrite snapshot rows in the SQLite archive for the given snapshot identities."""
     with sqlite3.connect(db_path) as conn:
         df.head(0).to_sql(TABLE_NAME, conn, if_exists="append", index=False)
         existing_cols = [
@@ -205,11 +250,29 @@ def _upsert_sqlite_archive(df: pd.DataFrame, db_path: str) -> int:
             if col not in existing_cols:
                 conn.execute(f'ALTER TABLE {TABLE_NAME} ADD COLUMN "{col}"')
 
+        has_timestamp = SNAPSHOT_TIMESTAMP_COL in existing_cols
         total = 0
-        for snap_date, group in df.groupby(SNAP_DATE_COL, dropna=False):
-            conn.execute(
-                f'DELETE FROM "{TABLE_NAME}" WHERE "{SNAP_DATE_COL}" = ?', [snap_date]
-            )
+        group_cols = [SNAP_DATE_COL, SNAPSHOT_TIMESTAMP_COL] if has_timestamp else [SNAP_DATE_COL]
+        for keys, group in df.groupby(group_cols, dropna=False):
+            snap_date = keys[0] if isinstance(keys, tuple) else keys
+            if has_timestamp:
+                snap_ts = keys[1] if isinstance(keys, tuple) else None
+                if pd.isna(snap_ts):
+                    conn.execute(
+                        f'DELETE FROM "{TABLE_NAME}" WHERE "{SNAP_DATE_COL}" = ? AND '
+                        f'"{SNAPSHOT_TIMESTAMP_COL}" IS NULL',
+                        [snap_date],
+                    )
+                else:
+                    conn.execute(
+                        f'DELETE FROM "{TABLE_NAME}" WHERE "{SNAP_DATE_COL}" = ? AND '
+                        f'"{SNAPSHOT_TIMESTAMP_COL}" = ?',
+                        [snap_date, str(snap_ts)],
+                    )
+            else:
+                conn.execute(
+                    f'DELETE FROM "{TABLE_NAME}" WHERE "{SNAP_DATE_COL}" = ?', [snap_date]
+                )
             group.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
             total += len(group)
         conn.commit()
@@ -232,8 +295,12 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
     """Upsert candidate snapshot into both Parquet and SQLite archives.
 
     The snapshot date is taken from the argument or, when absent, filled with
-    today's date. Rows are deduplicated by (스냅샷_날짜, 종목코드) with keep-last
-    semantics and stored in the standard 27-column layout in both stores.
+    today's date. Timezone-aware ``snapshot_timestamp``/``feature_available_timestamp``
+    (Asia/Seoul) are preserved per row; when a snapshot time is not recorded, the
+    deterministic 15:30 KST close convention is used. Rows are deduplicated by the
+    full snapshot identity (snapshot_timestamp, stock_code) when multiple intraday
+    captures exist, falling back to (스냅샷_날짜, 종목코드) otherwise. Stored in the
+    standard 26-column layout plus timestamp columns in both stores.
 
     Args:
         df: Candidate snapshot DataFrame.
@@ -250,8 +317,31 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
     else:
         out[SNAP_DATE_COL] = out[SNAP_DATE_COL].fillna(datetime.now().strftime("%Y-%m-%d"))
 
+    # 스냅샷 시각 보존: 미지정 시 날짜 기준 결정적 15:30 KST 관례 적용
+    if SNAPSHOT_TIMESTAMP_COL not in out.columns:
+        out[SNAPSHOT_TIMESTAMP_COL] = out[SNAP_DATE_COL].map(
+            lambda d: _kst_timestamp(str(d))
+        )
+    else:
+        out[SNAPSHOT_TIMESTAMP_COL] = _ensure_tz(
+            out[SNAPSHOT_TIMESTAMP_COL], out[SNAP_DATE_COL].map(_kst_timestamp)
+        )
+    for col in (
+        FEATURE_AVAILABLE_TIMESTAMP_COL,
+        DECISION_TIMESTAMP_COL,
+        EXECUTION_TIMESTAMP_COL,
+    ):
+        if col not in out.columns:
+            out[col] = out[SNAPSHOT_TIMESTAMP_COL]
+        else:
+            out[col] = _ensure_tz(out[col], out[SNAPSHOT_TIMESTAMP_COL])
+
     out = _standardize_archive_df(out)
-    out = out.drop_duplicates(subset=[SNAP_DATE_COL, STOCK_CODE_COL], keep="last")
+    has_intraday = out[SNAPSHOT_TIMESTAMP_COL].nunique() > 1
+    if has_intraday:
+        out = out.drop_duplicates(subset=[SNAPSHOT_TIMESTAMP_COL, STOCK_CODE_COL], keep="last")
+    else:
+        out = out.drop_duplicates(subset=[SNAP_DATE_COL, STOCK_CODE_COL], keep="last")
 
     settings.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     row_count = _upsert_sqlite_archive(out, str(settings.HISTORY_DB_PATH))
@@ -290,7 +380,7 @@ def fetch_archive_snapshot(
     else:
         df = _read_sqlite_archive()
     if df.empty or SNAP_DATE_COL not in df.columns:
-        return pd.DataFrame(columns=ARCHIVE_COLUMN_ORDER)
+        return pd.DataFrame(columns=ARCHIVE_READ_COLUMN_ORDER)
 
     df_dates = df[SNAP_DATE_COL].astype(str)
 

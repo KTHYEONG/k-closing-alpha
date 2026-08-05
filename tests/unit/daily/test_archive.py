@@ -106,11 +106,11 @@ def test_scenario_archive_fetch_02(tmp_archive: Path) -> None:
 
     latest_month = archive.fetch_archive_snapshot()
     assert latest_month["스냅샷_날짜"].tolist() == ["2026-08-03", "2026-08-04"]
-    assert latest_month.columns.tolist() == archive.ARCHIVE_COLUMN_ORDER
+    assert latest_month.columns.tolist() == archive.ARCHIVE_READ_COLUMN_ORDER
 
     specified = archive.fetch_archive_snapshot("2026-08-03")
     assert specified["스냅샷_날짜"].tolist() == ["2026-08-03"]
-    assert specified.columns.tolist() == archive.ARCHIVE_COLUMN_ORDER
+    assert specified.columns.tolist() == archive.ARCHIVE_READ_COLUMN_ORDER
     assert len(archive.ARCHIVE_COLUMN_ORDER) == 26
 
 
@@ -148,6 +148,45 @@ def test_upsert_keeps_existing_snapshot_date(tmp_archive: Path) -> None:
     assert loaded["스냅샷_날짜"].tolist() == ["2026-07-01"]
 
 
+def test_upsert_preserves_timezone_aware_timestamps(tmp_archive: Path) -> None:
+    """스냅샷 시각이 유실되지 않고 Asia/Seoul timezone-aware 로 보존됩니다."""
+    archive.upsert_archive_snapshot(
+        pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
+        snapshot_date="2026-08-04",
+    )
+    loaded = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    ts = pd.to_datetime(loaded["snapshot_timestamp"])
+    assert ts.notna().all()
+    assert ts.dt.tz is not None
+    # 시각 미기록 데이터는 결정적 15:30 KST 관례를 사용합니다.
+    assert ts.dt.hour.iloc[0] == 15
+    assert ts.dt.minute.iloc[0] == 30
+
+
+def test_upsert_dedups_by_snapshot_identity_when_intraday(tmp_archive: Path) -> None:
+    """동일 날짜/종목이어도 intraday 캡처 시각이 다르면 스냅샷 정체성으로 보존됩니다."""
+    row = _candidate_row("005930", "삼성전자", 1)
+    morning = dict(row, snapshot_timestamp=pd.Timestamp("2026-08-04 09:00:00", tz="Asia/Seoul"))
+    afternoon = dict(row, snapshot_timestamp=pd.Timestamp("2026-08-04 14:00:00", tz="Asia/Seoul"))
+    archive.upsert_archive_snapshot(pd.DataFrame([morning]), snapshot_date="2026-08-04")
+    archive.upsert_archive_snapshot(pd.DataFrame([afternoon]), snapshot_date="2026-08-04")
+    loaded = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    assert len(loaded) == 2
+    assert loaded["snapshot_timestamp"].nunique() == 2
+
+    # 동일 스냅샷 정체성으로 재 upsert 시 해당 행만 교체되어 2건이 유지됩니다.
+    updated = dict(morning, 종목명="삼성전자개편")
+    archive.upsert_archive_snapshot(pd.DataFrame([updated]), snapshot_date="2026-08-04")
+    loaded = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    assert len(loaded) == 2
+    morning_ts = pd.Timestamp("2026-08-04 09:00:00", tz="Asia/Seoul")
+    assert (
+        loaded.loc[pd.to_datetime(loaded["snapshot_timestamp"]) == morning_ts, "종목명"]
+        .iloc[0]
+        == "삼성전자개편"
+    )
+
+
 def test_fetch_falls_back_to_sqlite_when_parquet_missing(tmp_archive: Path) -> None:
     archive.upsert_archive_snapshot(
         pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
@@ -162,7 +201,7 @@ def test_fetch_falls_back_to_sqlite_when_parquet_missing(tmp_archive: Path) -> N
 def test_fetch_empty_archive_returns_standard_columns(tmp_archive: Path) -> None:
     df = archive.fetch_archive_snapshot()
     assert df.empty
-    assert df.columns.tolist() == archive.ARCHIVE_COLUMN_ORDER
+    assert df.columns.tolist() == archive.ARCHIVE_READ_COLUMN_ORDER
 
 
 def test_export_empty_df_returns_header() -> None:
@@ -213,3 +252,64 @@ def test_main_fetch_target_date_saves_tsv(
     assert target_file.exists()
     df = pd.read_csv(target_file, sep="\t")
     assert "2026-08-04" in df["스냅샷_날짜"].astype(str).values
+
+
+def test_upsert_localizes_naive_snapshot_timestamp(tmp_archive: Path) -> None:
+    """Naive(시간대 미지정) 스냅샷 시각은 Asia/Seoul 로 로컬라이즈됩니다."""
+    row = _candidate_row("005930", "삼성전자", 1)
+    row["snapshot_timestamp"] = "2026-08-04 09:00:00"
+    archive.upsert_archive_snapshot(pd.DataFrame([row]), snapshot_date="2026-08-04")
+    loaded = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    ts = pd.to_datetime(loaded["snapshot_timestamp"])
+    assert ts.dt.tz is not None
+    assert ts.dt.hour.iloc[0] == 9
+
+
+def test_upsert_preserves_supplied_decision_timestamp(tmp_archive: Path) -> None:
+    """호출자가 decision/feature_available 타임스탬프를 지정하면 보존됩니다."""
+    row = _candidate_row("005930", "삼성전자", 1)
+    row["feature_available_timestamp"] = pd.Timestamp("2026-08-04 08:00:00", tz="Asia/Seoul")
+    row["decision_timestamp"] = pd.Timestamp("2026-08-04 15:30:00", tz="Asia/Seoul")
+    archive.upsert_archive_snapshot(pd.DataFrame([row]), snapshot_date="2026-08-04")
+    loaded = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    feature_ts = pd.to_datetime(loaded["feature_available_timestamp"])
+    decision_ts = pd.to_datetime(loaded["decision_timestamp"])
+    assert feature_ts.dt.hour.iloc[0] == 8
+    assert decision_ts.dt.hour.iloc[0] == 15
+
+
+def test_upsert_dedups_multiple_intraday_captures_in_one_batch(tmp_archive: Path) -> None:
+    """단일 배치에 동일 날짜/종목의 서로 다른 intraday 시각이 있으면 스냅샷 정체성으로 중복 제거합니다."""
+    row = _candidate_row("005930", "삼성전자", 1)
+    morning = dict(row, snapshot_timestamp=pd.Timestamp("2026-08-04 09:00:00", tz="Asia/Seoul"))
+    noon = dict(row, snapshot_timestamp=pd.Timestamp("2026-08-04 12:00:00", tz="Asia/Seoul"))
+    dup = dict(row, snapshot_timestamp=pd.Timestamp("2026-08-04 09:00:00", tz="Asia/Seoul"))
+    archive.upsert_archive_snapshot(
+        pd.DataFrame([morning, noon, dup]), snapshot_date="2026-08-04"
+    )
+    loaded = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    assert len(loaded) == 2
+    assert loaded["snapshot_timestamp"].nunique() == 2
+
+
+def test_upsert_handles_null_snapshot_timestamp(tmp_archive: Path) -> None:
+    """snapshot_timestamp 가 NaT 인 행은 IS NULL 정체성으로 교체되며 오류 없이 저장됩니다."""
+    row = _candidate_row("005930", "삼성전자", 1)
+    row["snapshot_timestamp"] = pd.NaT
+    archive.upsert_archive_snapshot(pd.DataFrame([row]), snapshot_date="2026-08-04")
+    loaded = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    assert len(loaded) == 1
+
+
+def test_upsert_sqlite_null_timestamp_identity_replacement(tmp_archive: Path) -> None:
+    """NULL snapshot_timestamp 행은 IS NULL 정체성으로 재배치(중복 없이 교체)됩니다."""
+    import sqlite3
+
+    db_path = str(archive.settings.HISTORY_DB_PATH)
+    row = _candidate_row("005930", "삼성전자", 1)
+    with_null = pd.DataFrame([dict(row, snapshot_timestamp=pd.NaT)])
+    archive._upsert_sqlite_archive(with_null, db_path)
+    archive._upsert_sqlite_archive(with_null, db_path)
+    with sqlite3.connect(db_path) as conn:
+        db_df = pd.read_sql("SELECT * FROM condition_history", conn)
+    assert len(db_df) == 1

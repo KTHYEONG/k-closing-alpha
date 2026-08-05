@@ -5,7 +5,9 @@ from __future__ import annotations
 from src.config.kis import KisSettings
 
 
-def test_kis_settings_defaults() -> None:
+def test_kis_settings_defaults(monkeypatch) -> None:
+    for name in ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_ID", "KIS_HTS_ID"):
+        monkeypatch.delenv(name, raising=False)
     settings = KisSettings(_env_file=None)
     assert settings.KIS_APP_KEY == ""
     assert settings.KIS_APP_SECRET == ""

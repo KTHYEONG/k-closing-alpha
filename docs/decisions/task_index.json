@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_STRATEGY_IMPROVEMENT",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_STRATEGY_IMPROVEMENT",
+      "domain": "ml",
+      "title": "Point-in-Time ML Strategy Re-evaluation",
+      "why": "Re-evaluate the ML strategy through 2025 after correcting return units, baseline attribution, calibration, and timestamp-contract risks.",
+      "resolution": "Implemented decimal-net targets, causal feature manifest checks, chronological calibration diagnostics, retained selection-rank and Ridge baselines, fixed real-data NaN handling for Ridge, and reran OOF comparison through 2025; documented the result and deferred production promotion pending real capture timestamps.",
+      "impact": "2017-2025 OOF Regressor achieved +1.074% Top-1 net return and Sharpe 4.27 versus +0.479% and 2.10 for selection rank, but synthetic timestamps, 38.84% maximum drawdown, and 100% Top-1 turnover keep the research score at 60/100."
+    },
+    {
       "task_id": "sangdda_scenario_prediction",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_sangdda_scenario_prediction",
