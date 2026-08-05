@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_CLOSE_MORNING_RERANKER_V1",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_CLOSE_MORNING_RERANKER_V1",
+      "domain": "ml",
+      "title": "Sync close-to-morning risk reranker implementation and results",
+      "why": "The reranker implementation has been validated on the full real-data pipeline and its metrics, serving contract, and policy mapping must be registered.",
+      "resolution": "Recorded the 5-fold OOF reranker comparison and bundle contract in docs/results/ml-v6.md; registered the task and refreshed the code map; cleaned completed temporary specs and scratch artifacts.",
+      "impact": "The current close-to-morning candidate is reproducibly documented with decision_score semantics, 1-stock-per-day behavior, and explicit research-only promotion gates."
+    },
+    {
       "task_id": "TASK_ML_CLOSE_MORNING_V5",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_ML_CLOSE_MORNING_V5",

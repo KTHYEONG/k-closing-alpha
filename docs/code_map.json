@@ -57,7 +57,7 @@
   },
   "src/ml/model_pipeline.py": {
     "testing": "tests/unit/ml/test_model_pipeline.py",
-    "architecture": "docs/results/ml-v5.md"
+    "architecture": "docs/results/ml-v6.md"
   },
   "src/ml/backtest_evaluator.py": {
     "testing": "tests/unit/ml/test_backtest_evaluator.py"
