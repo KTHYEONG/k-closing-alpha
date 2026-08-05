@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_V2_SCENARIO_ACTION_PANEL",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_V2_SCENARIO_ACTION_PANEL",
+      "domain": "general",
+      "title": "ML v2 scenario action panel rerun",
+      "why": "동일 날짜·종목의 상따 및 다른 시나리오 중복을 임의 병합하지 않고, 최신 시나리오 행동 패널 구현의 ML 성능과 정책 결과를 2025년까지 재평가해야 했다.",
+      "resolution": "scenario_action 패널로 snapshot49 LightGBM Regressor를 5-fold purge1 OOF 재실행하고, 충돌 동일 행동키는 reject, 다중 시나리오는 exclude_multi_scenario로 보수적 종목 패널을 구성했다. 최신 결과를 docs/results/ml-v2.md에 기록했다.",
+      "impact": "2017–2025 OOF Top-1 +1.457%, Sharpe 5.67, MDD 40.72%를 확인했으며 날짜·종목 유일 정책에서도 +1.449%가 유지됐다. 2026년은 제외했고 실제 캡처 시각·독립 OOS·체결비용이 없어 실전 승격은 보류한다."
+    },
+    {
+      "task_id": "TASK_ML_INTERNAL_PANEL_ENHANCEMENT",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_INTERNAL_PANEL_ENHANCEMENT",
+      "domain": "ml",
+      "title": "Internal candidate-panel ML enhancement",
+      "why": "시간/provenance 검증을 과도하게 적용해 15:20 스프레드시트 스냅샷 피처를 제외했고, 실제 후보 패널의 시나리오·보유 정책을 분리할 필요가 있었다.",
+      "resolution": "base40/snapshot49/interaction53 feature-set을 추가하고 snapshot49 LGBMRegressor를 champion 경로로 연결했으며, return_model·종목코드 기반 policy simulator·내부 OOF 비교를 추가했다. 2017–2025 재학습에서 snapshot49가 base40보다 Top-1과 Sharpe를 개선했지만, 날짜-종목 중복으로 실제 보유 정책은 보류했다.",
+      "impact": "내부 후보 패널만으로 모델 선별력을 비교할 수 있고 2026을 평가에서 제외한다. 실제 운용 전 216개 날짜-종목 중복의 시나리오 결합 규칙이 필요하다."
+    },
+    {
       "task_id": "TASK_ML_STRATEGY_IMPROVEMENT",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_ML_STRATEGY_IMPROVEMENT",
