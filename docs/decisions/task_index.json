@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_RECENCY_ADAPTIVE_ENSEMBLE",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_RECENCY_ADAPTIVE_ENSEMBLE",
+      "domain": "ml",
+      "title": "ML recency-adaptive dual-horizon ensemble",
+      "why": "The p_bad reranker v2 lowered scheduled return without reducing MDD, indicating that post-prediction risk penalties were not fixing the expanding-history return model's regime sensitivity.",
+      "resolution": "Implemented fold-local exponential recency weighting for 252/504 trade-date half-lives, a percentile-ranked expanding/recent return ensemble, nested inner/outer purged selection, and opt-in research bundle serving. ML v8 through 2025-12-30 passed the nested OOF gate: scheduled mean 1.5316% to 1.5933%, PF 2.74 to 2.87, Sharpe 6.04 to 6.31, and MDD 33.94% to 25.87%.",
+      "impact": "Registers the strongest structural ML candidate to date while keeping production promotion blocked on capture-time provenance, execution slippage, and untouched paper/live OOS validation. The v1 default remains unchanged until those gates pass."
+    },
+    {
       "task_id": "TASK_ML_RISK_AWARE_RERANKER_V2",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_ML_RISK_AWARE_RERANKER_V2",

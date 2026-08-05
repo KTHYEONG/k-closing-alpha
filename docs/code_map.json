@@ -67,7 +67,8 @@
     "architecture": "docs/results/ml-v7.md"
   },
   "src/ml/sizing_engine.py": {
-    "testing": "tests/unit/ml/test_sizing_engine.py"
+    "testing": "tests/unit/ml/test_sizing_engine.py",
+    "architecture": "docs/results/ml-v8.md"
   },
   "src/config/base.py": {
     "testing": "tests/unit/config/test_base.py"
