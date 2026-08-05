@@ -95,5 +95,8 @@
   },
   "src/ml/single_stock_policy.py": {
     "testing": "tests/unit/ml/test_single_stock_policy.py"
+  },
+  "src/ml/training/pipelines.py": {
+    "testing": "tests/unit/ml/test_model_pipeline.py"
   }
 }
