@@ -778,3 +778,153 @@ def test_predict_daily_position_sizing_legacy_bundle_has_no_decision_score() -> 
     assert "decision_score" not in result.columns
     assert {"rank_score", "p_good"}.issubset(result.columns)
 
+def _build_research_bundle(
+    df: pd.DataFrame,
+    alpha: float = 0.5,
+    half_life: int = 252,
+    probability_weight: float = 0.5,
+) -> dict[str, object]:
+    """recency-adaptive 앙상블 연구 번들 (두 return 모델 + recency 설정) 을 구성합니다."""
+    from src.ml.model_pipeline import calculate_recency_sample_weight
+
+    weights = calculate_recency_sample_weight(df[GROUP_COL], half_life)
+    recent_model = LGBMRegressor(objective="huber", random_state=42, verbosity=-1)
+    recent_model.fit(df[FEATURE_COLS], df[TARGET_COL], sample_weight=weights)
+    config: dict[str, object] = {
+        "version": "close-morning-recency-ensemble-research",
+        "half_life_groups": half_life,
+        "recent_weight": alpha,
+        "probability_weight": probability_weight,
+        "score_col": "decision_score",
+    }
+    return _train_inline_bundle(
+        df,
+        FEATURE_COLS,
+        TARGET_COL,
+        GROUP_COL,
+        recent_return_model=recent_model,
+        recency_ensemble_config=config,
+    )
+
+
+def test_predict_daily_position_sizing_research_bundle_blends_rank_scores() -> None:
+    """연구 번들은 동일 날짜 백분위 blend 를 rank_score 로 재현하고, v1 reranker
+    decision_score 는 blend 백분위 + p_good 백분위 로 재현합니다."""
+    df = _make_feature_df(n_rows=45, n_dates=3)
+    alpha, probability_weight = 0.5, 0.5
+    bundle = _build_research_bundle(df, alpha=alpha, probability_weight=probability_weight)
+    result = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bundle)
+
+    expanding = bundle["return_model"].predict(df[FEATURE_COLS])
+    recent = bundle["recent_return_model"].predict(df[FEATURE_COLS])
+    exp_pct = (
+        pd.Series(expanding, index=df.index).groupby(df[GROUP_COL]).rank(pct=True, method="average")
+    )
+    rec_pct = (
+        pd.Series(recent, index=df.index).groupby(df[GROUP_COL]).rank(pct=True, method="average")
+    )
+    blend = (1 - alpha) * exp_pct + alpha * rec_pct
+    np.testing.assert_allclose(result["rank_score"].to_numpy(), blend.to_numpy(), atol=1e-12)
+    np.testing.assert_allclose(result["pred_expanding"].to_numpy(), expanding, atol=1e-12)
+    np.testing.assert_allclose(result["pred_recent"].to_numpy(), recent, atol=1e-12)
+
+    expected_decision = (
+        blend.groupby(df[GROUP_COL]).rank(pct=True, method="average")
+        + probability_weight
+        * result.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+    )
+    np.testing.assert_allclose(
+        result["decision_score"].to_numpy(), expected_decision.to_numpy(), atol=1e-12
+    )
+    assert "allocation" in result.columns
+
+
+def test_predict_daily_position_sizing_research_bundle_alpha_endpoints() -> None:
+    """alpha=0 은 expanding pct rank 로 v1 decision 을 정확히 재현하고, alpha=1 은
+    recent pct rank 를 그대로 사용합니다."""
+    df = _make_feature_df()
+    bundle0 = _build_research_bundle(df, alpha=0.0)
+    result0 = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bundle0)
+    expanding = bundle0["return_model"].predict(df[FEATURE_COLS])
+    exp_pct = (
+        pd.Series(expanding, index=df.index).groupby(df[GROUP_COL]).rank(pct=True, method="average")
+    )
+    np.testing.assert_allclose(result0["rank_score"].to_numpy(), exp_pct.to_numpy(), atol=1e-12)
+
+    # alpha=0 연구 번들은 기존 v1 reranker decision_score 와 동일합니다
+    # (pct_rank(pct_rank(x)) = pct_rank(x) 항등에 의해).
+    v1_bundle = dict(_train_inline_bundle(df, FEATURE_COLS, TARGET_COL, GROUP_COL))
+    v1_bundle["decision_score_config"] = dict(_CLOSE_MORNING_RERANKER_CONFIG)
+    v1 = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=v1_bundle)
+    np.testing.assert_allclose(
+        result0["decision_score"].to_numpy(), v1["decision_score"].to_numpy(), atol=1e-12
+    )
+
+    bundle1 = _build_research_bundle(df, alpha=1.0)
+    result1 = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bundle1)
+    recent = bundle1["recent_return_model"].predict(df[FEATURE_COLS])
+    rec_pct = (
+        pd.Series(recent, index=df.index).groupby(df[GROUP_COL]).rank(pct=True, method="average")
+    )
+    np.testing.assert_allclose(result1["rank_score"].to_numpy(), rec_pct.to_numpy(), atol=1e-12)
+
+
+def test_train_inline_bundle_research_bundle_requires_matching_models_and_config() -> None:
+    """연구 번들은 recent_return_model 과 recency_ensemble_config 를 항상 함께 요구하며
+    미지원 half-life/범위 밖 recent_weight 는 fail-closed 로 거부합니다."""
+    df = _make_feature_df()
+    with pytest.raises(ValueError, match="requires both recent_return_model and recency_ensemble_config"):
+        _train_inline_bundle(
+            df, FEATURE_COLS, TARGET_COL, GROUP_COL, recent_return_model=LGBMRegressor()
+        )
+    with pytest.raises(ValueError, match="requires both recent_return_model and recency_ensemble_config"):
+        _train_inline_bundle(
+            df, FEATURE_COLS, TARGET_COL, GROUP_COL, recency_ensemble_config={"version": "x"}
+        )
+    with pytest.raises(ValueError, match="half_life_groups must be 252 or 504"):
+        _train_inline_bundle(
+            df,
+            FEATURE_COLS,
+            TARGET_COL,
+            GROUP_COL,
+            recent_return_model=LGBMRegressor(),
+            recency_ensemble_config={"half_life_groups": 100, "recent_weight": 0.5},
+        )
+    with pytest.raises(ValueError, match="recent_weight must be within"):
+        _train_inline_bundle(
+            df,
+            FEATURE_COLS,
+            TARGET_COL,
+            GROUP_COL,
+            recent_return_model=LGBMRegressor(),
+            recency_ensemble_config={"half_life_groups": 252, "recent_weight": 1.5},
+        )
+
+
+def test_predict_daily_position_sizing_research_bundle_missing_recent_model_raises() -> None:
+    """recency 설정이 있는데 최근 모델이 누락된 연구 번들은 ValueError 로 거부합니다."""
+    df = _make_feature_df()
+    bundle = _build_research_bundle(df)
+    del bundle["recent_return_model"]
+    with pytest.raises(ValueError, match="requires both return_model and recent_return_model"):
+        predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bundle)
+
+def test_predict_daily_position_sizing_research_bundle_rejects_invalid_config() -> None:
+    """_predict_from_bundle 은 연구 번들의 잘못된 recency 설정을 fail-closed 로 거부합니다."""
+    df = _make_feature_df()
+
+    bad_half_life = _build_research_bundle(df)
+    bad_half_life["recency_ensemble_config"]["half_life_groups"] = 100
+    with pytest.raises(ValueError, match="half_life_groups must be 252 or 504"):
+        predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bad_half_life)
+
+    bad_weight = _build_research_bundle(df)
+    bad_weight["recency_ensemble_config"]["recent_weight"] = 1.5
+    with pytest.raises(ValueError, match="recent_weight must be within"):
+        predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bad_weight)
+
+    no_group_col = _build_research_bundle(df)
+    del no_group_col["group_col"]
+    with pytest.raises(ValueError, match="requires a group_col present in df"):
+        predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=no_group_col)
+
