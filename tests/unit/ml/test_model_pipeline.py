@@ -16,7 +16,10 @@ from src.ml.model_pipeline import (
     _align_close_morning_oof,
     _calibrate_close_morning_decision_oof,
     _calibrate_oof_policy,
+    _close_morning_yearly_breakdown,
+    _select_bad_probability_weight,
     evaluate_close_morning_quality,
+    run_close_morning_reranker_v2_experiment,
     run_model_pipeline,
     run_sizing_pipeline,
 )
@@ -235,6 +238,7 @@ def _aligned_risk_oof(extra_row: bool = True) -> pd.DataFrame:
         GROUP_COL: ["2024-03-01", "2024-03-01"],
         TARGET_COL: [0.01, 0.02],
         "p_good": [0.6, 0.4],
+        "p_bad": [0.3, 0.1],
         "stock_code": ["000001", "000002"],
         "chart_analysis": ["상따", "신고가"],
     }
@@ -242,6 +246,7 @@ def _aligned_risk_oof(extra_row: bool = True) -> pd.DataFrame:
         rows[GROUP_COL].append("2024-03-02")
         rows[TARGET_COL].append(0.03)
         rows["p_good"].append(0.7)
+        rows["p_bad"].append(0.2)
         rows["stock_code"].append("000003")
         rows["chart_analysis"].append("거래량 폭증")
     return pd.DataFrame(rows, index=index)
@@ -325,14 +330,28 @@ def test_align_close_morning_oof_skips_checks_when_columns_absent() -> None:
         {
             GROUP_COL: ["2024-03-01", "2024-03-01"],
             "p_good": [0.6, 0.4],
+            "p_bad": [0.3, 0.1],
         },
         index=[5, 7],
     )
     aligned = _align_close_morning_oof(
         _aligned_return_oof(), risk, target_col=TARGET_COL, group_col=GROUP_COL
     )
-    assert {"pred", "p_good", "stock_code", "chart_analysis"} <= set(aligned.columns)
+    assert {"pred", "p_good", "p_bad", "stock_code", "chart_analysis"} <= set(
+        aligned.columns
+    )
     assert aligned["p_good"].notna().all()
+    assert aligned["p_bad"].notna().all()
+
+
+def test_align_close_morning_oof_rejects_missing_p_bad() -> None:
+    """정렬 결과에 누락 p_bad 가 있으면 대체하지 않고 거부합니다."""
+    risk = _aligned_risk_oof()
+    risk.loc[7, "p_bad"] = float("nan")
+    with pytest.raises(ValueError, match="p_bad predictions are missing"):
+        _align_close_morning_oof(
+            _aligned_return_oof(), risk, target_col=TARGET_COL, group_col=GROUP_COL
+        )
 
 
 def test_calibrate_close_morning_decision_oof_uses_decision_score_end_to_end() -> None:
@@ -776,3 +795,216 @@ def test_evaluate_close_morning_quality_missing_policy_rejects() -> None:
         pytest.raises(ValueError, match="non-finite"),
     ):
         evaluate_close_morning_quality(raw, n_splits=2, purge_gap=1)
+
+def _make_reranker_v2_dataset(seed: int = 7, n_groups: int = 52) -> pd.DataFrame:
+    """p_bad 패널티가 MDD 만 낮출 수 있는 합성 순서형 패널을 만듭니다.
+
+    ``feature_b > 0.7`` 인 'lottery' 종목은 안전 종목과 동일한 기대수익을
+    가지면서 큰 꼬리손실을 가져, 손실 확률(p_bad) 패널티가 평균을 낮추지 않고
+    최대 드로다운을 줄이는 구조입니다. ``selection_rank`` 를 포함해
+    ``run_model_pipeline`` 의 백테스트 계약을 충족합니다.
+    """
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2024-01-01", periods=n_groups, freq="D")
+    rows: list[dict[str, object]] = []
+    for g, date in enumerate(dates):
+        rows.extend(
+            {"trade_date": date, "stock_code": f"{g * 6 + i + 1:06d}"}
+            for i in range(6)
+        )
+    df = pd.DataFrame(rows)
+    df["feature_a"] = rng.uniform(0, 1, len(df))
+    df["feature_b"] = rng.uniform(0, 1, len(df))
+    df["chart_analysis"] = ["신고가"] * len(df)
+    df["market_type"] = "KOSPI"
+    df["selection_rank"] = df.groupby(GROUP_COL, sort=False).cumcount() + 1
+    mu = 0.006 + 0.012 * df["feature_a"]
+    lottery = df["feature_b"] > 0.7
+    up = rng.random(len(df)) < 0.6
+    lottery_target = np.where(up, mu + 0.04, mu - 0.06)
+    target = np.where(lottery, lottery_target, mu) + rng.normal(0, 0.004, len(df))
+    df[TARGET_COL] = np.clip(target, -0.25, 0.25)
+    return df
+
+
+def test_select_bad_probability_weight_rules() -> None:
+    """v2 패널티 선택은 보수적 규칙을 준수합니다: 평균 보존 + MDD 엄격 감소만
+    유효하며, 최저 MDD → 높은 평균 → 낮은 가중치 순으로 타이브레이크합니다."""
+    base = {"scheduled_mean_return": 0.01, "entry_sequence_drawdown": 0.30}
+    # MDD 가 동일하면 비영 후보는 미유효 (엄격 감소 요구).
+    stats = {
+        0.0: dict(base),
+        0.5: {"scheduled_mean_return": 0.012, "entry_sequence_drawdown": 0.30},
+    }
+    assert _select_bad_probability_weight(stats) == 0.0
+    # 평균이 v1 미만이면 미유효.
+    stats = {
+        0.0: dict(base),
+        0.5: {"scheduled_mean_return": 0.009, "entry_sequence_drawdown": 0.10},
+    }
+    assert _select_bad_probability_weight(stats) == 0.0
+    # 평균 보존 + MDD 엄격 감소면 선택됩니다.
+    stats = {
+        0.0: dict(base),
+        0.5: {"scheduled_mean_return": 0.012, "entry_sequence_drawdown": 0.20},
+    }
+    assert _select_bad_probability_weight(stats) == 0.5
+    # 최저 MDD 가 우선입니다.
+    stats = {
+        0.0: dict(base),
+        0.5: {"scheduled_mean_return": 0.011, "entry_sequence_drawdown": 0.15},
+        1.0: {"scheduled_mean_return": 0.013, "entry_sequence_drawdown": 0.10},
+    }
+    assert _select_bad_probability_weight(stats) == 1.0
+    # MDD/평균 동점이면 낮은 가중치가 우선입니다.
+    stats = {
+        0.0: dict(base),
+        0.5: {"scheduled_mean_return": 0.013, "entry_sequence_drawdown": 0.10},
+        1.0: {"scheduled_mean_return": 0.013, "entry_sequence_drawdown": 0.10},
+    }
+    assert _select_bad_probability_weight(stats) == 0.5
+    # NaN 지표는 미충족으로 간주되어 v1 로 fail-closed 합니다.
+    stats = {
+        0.0: dict(base),
+        0.5: {"scheduled_mean_return": float("nan"), "entry_sequence_drawdown": 0.05},
+    }
+    assert _select_bad_probability_weight(stats) == 0.0
+
+
+def test_close_morning_reranker_v2_nested_selection_is_causal() -> None:
+    """(SCENARIO: test_calibrate_close_morning_decision_oof_uses_decision_score_end_to_end)
+
+    v2 중첩 선택은 각 fold 의 외부 validation 스코어 설정을 그 fold 의 이전
+    내부 OOF 역사에서만 고르고, 외부(미래) 수익률은 절대 읽지 않습니다.
+
+    나중 날짜(외부 validation)의 실현 수익률이 선택된 설정을 바꿀 만큼 극단적
+    (전량 -19%)으로 바뀌어도 폴드별 ``chosen_weight`` 는 그대로여야 합니다.
+    해당 변경은 그 폴드의 외부 평가 지표에는 반영되어야 하므로, 선택이 외부
+    validation 레이블을 읽지 않는다는 인과 경계를 증명합니다.
+    """
+    df = _make_reranker_v2_dataset(seed=7)
+    # 마지막 outer fold 의 validation 날짜(어떤 fold 의 train 에도 없는 순수 미래
+    # 구간)만 변경해 인과 경계를 검증합니다. test_size = n_groups // (n_splits + 1).
+    future_dates = sorted(df[GROUP_COL].unique())[-(len(df[GROUP_COL].unique()) // 5) :]
+    mutated = df.copy()
+    mutated.loc[mutated[GROUP_COL].isin(future_dates), TARGET_COL] = -0.19
+
+    base = run_close_morning_reranker_v2_experiment(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=4,
+        min_history_dates=2,
+    )
+    altered = run_close_morning_reranker_v2_experiment(
+        mutated,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=4,
+        min_history_dates=2,
+    )
+
+    assert base["contract"]["version"] == "close-morning-reranker-v2-research"
+    assert base["contract"]["candidate_weights"] == [0.0, 0.5, 1.0]
+    assert len(base["folds"]) == 4
+    assert base["chosen_weights"] == altered["chosen_weights"]
+    # 적어도 하나의 폴드가 비영(非零) 패널티를 선택해야 테스트가 의미를 가집니다.
+    assert any(weight > 0.0 for weight in base["chosen_weights"])
+    for fold in base["folds"]:
+        assert fold["chosen_weight"] in (0.0, 0.5, 1.0)
+        assert set(fold["inner"]["candidate_stats"]) == {0.0, 0.5, 1.0}
+        assert {"scheduled_mean_return", "entry_sequence_drawdown"} <= set(
+            fold["inner"]["candidate_stats"][0.0]
+        )
+        assert "scheduled_mean_return" in fold["v1"]["metrics"]
+        assert "entry_sequence_drawdown" in fold["v2"]["metrics"]
+    assert set(base["aggregate"]) == {"v1", "v2"}
+    assert (
+        base["aggregate"]["v1"]["n_scheduled_dates"]
+        == base["aggregate"]["v2"]["n_scheduled_dates"]
+    )
+    # 미래 수익률 변경은 해당 폴드의 외부 평가 지표에 반영됩니다 (관측 경계 존재).
+    last = len(base["folds"]) - 1
+    assert base["folds"][last]["v2"]["metrics"]["scheduled_mean_return"] != pytest.approx(
+        altered["folds"][last]["v2"]["metrics"]["scheduled_mean_return"]
+    )
+
+def test_close_morning_reranker_v2_rejects_invalid_inputs() -> None:
+    """v2 실험은 식별 컬럼 누락, 비정상 가중치/워밍업/purge 를 fail-closed 로 거부합니다."""
+    df = _make_reranker_v2_dataset(seed=7, n_groups=16)
+    with pytest.raises(ValueError, match="requires stock_code and chart_analysis"):
+        run_close_morning_reranker_v2_experiment(
+            df.drop(columns=["chart_analysis"]),
+            feature_cols=["feature_a", "feature_b"],
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+        )
+    with pytest.raises(ValueError, match="probability_weight must be in \\(0, 1\\]"):
+        run_close_morning_reranker_v2_experiment(
+            df,
+            feature_cols=["feature_a", "feature_b"],
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            probability_weight=0.0,
+        )
+    with pytest.raises(ValueError, match="min_history_dates must be >= 1"):
+        run_close_morning_reranker_v2_experiment(
+            df,
+            feature_cols=["feature_a", "feature_b"],
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            min_history_dates=0,
+        )
+    with pytest.raises(ValueError, match="purge_gap must be >= 0"):
+        run_close_morning_reranker_v2_experiment(
+            df,
+            feature_cols=["feature_a", "feature_b"],
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            purge_gap=-1,
+        )
+
+
+def test_close_morning_reranker_v2_fails_closed_on_insufficient_inner_history() -> None:
+    """내부 partition 이 중첩 walk-forward 를 지원할 만큼 충분하지 않으면 v1 로
+    fail-closed 합니다 (w_bad=0 선택, 진단 사유 기록)."""
+    df = _make_reranker_v2_dataset(seed=7, n_groups=8)
+    report = run_close_morning_reranker_v2_experiment(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=5,
+        min_history_dates=2,
+    )
+    assert report["folds"][0]["chosen_weight"] == 0.0
+    assert (
+        report["folds"][0]["inner"]["fail_closed_reason"] == "insufficient_inner_history"
+    )
+    assert report["folds"][0]["inner"]["candidate_stats"] == {}
+    assert len(report["folds"]) == 5
+
+def test_close_morning_yearly_breakdown_handles_small_and_invalid_years() -> None:
+    """연도별 분해는 표본 <5년 연도를 null 처리하고 비파싱 연도를 건너뜁니다."""
+    dates = np.array(
+        [
+            "2024-01-01",
+            "2024-01-02",
+            "2024-01-03",
+            "2024-01-04",
+            "2024-01-05",
+            "2024-01-06",
+            "2025-01-01",
+            "garbage-date",
+        ],
+        dtype=object,
+    )
+    scheduled = np.array([0.01, 0.01, 0.01, 0.01, 0.01, 0.01, -0.01, 0.02])
+    out = _close_morning_yearly_breakdown(dates, scheduled)
+    assert out[2024] is not None
+    assert out[2024]["scheduled_mean_return"] == pytest.approx(0.01)
+    assert out[2025] is None
+    # 비파싱 연도는 건너뜁니다 (NaN 연도 키 미생성).
+    assert all(np.isfinite(year) for year in out)
