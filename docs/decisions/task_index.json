@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "src_tests_refactoring",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_src_tests_refactoring",
+      "domain": "architecture",
+      "title": "Source and Test Architecture Refactoring",
+      "why": "Large mixed-responsibility modules and uneven test topology increased maintenance and AI context cost.",
+      "resolution": "Split KIS, daily prediction, ML training, and backfill responsibilities into canonical submodules while preserving legacy facade imports; reorganized tests by bounded context and behavior level.",
+      "impact": "Preserves daily entry points and public contracts, improves discoverability, and keeps regression coverage across 449 tests."
+    },
+    {
       "task_id": "TASK_ML_RECENCY_ADAPTIVE_ENSEMBLE",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_ML_RECENCY_ADAPTIVE_ENSEMBLE",
