@@ -24,6 +24,20 @@ FEATURE_COLS = ["f1", "f2"]
 TARGET_COL = "target_net_return"
 GROUP_COL = "date"
 
+_PRODUCTION_CALENDAR_FLOW_NINE: frozenset[str] = frozenset(
+    {
+        "weekday_is_monday",
+        "weekday_is_tuesday",
+        "weekday_is_wednesday",
+        "weekday_is_thursday",
+        "weekday_is_friday",
+        "flow_consensus",
+        "flow_alignment_direction",
+        "flow_turnover",
+        "friday_selection_rank_pct",
+    }
+)
+
 
 def _snapshot_df(n_rows: int = 24, seed: int = 3) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
@@ -866,18 +880,18 @@ def test_candidate_export_dir_versions_candidate_and_keeps_active_root() -> None
     """후보 피처셋은 cutoff 로 버전화된 하위 경로, 그 외 feature_set 은 루트 경로를 반환합니다."""
     bundle = {"training_cutoff": "2026-06-05 00:00:00"}
     candidate = predict._candidate_export_dir(
-        "artifacts/models", "production_calendar_flow", bundle
+        "artifacts/models", "close_morning61", bundle
     )
     assert candidate == os.path.join(
-        "artifacts/models", "production_calendar_flow_2026-06-05"
+        "artifacts/models", "close_morning61_2026-06-05"
     )
     active = predict._candidate_export_dir("artifacts/models", "snapshot49", bundle)
     assert active == "artifacts/models"
 
 
 def test_train_and_save_real_model_bundle_trains_numeric_features(tmp_path) -> None:
-    """후보 번들은 scenario_action + production_calendar_flow 를 사용하고 활성 아티팩트를 덮어쓰지 않습니다."""
-    raw = _realistic_trade_log_df()
+    """후보 번들은 scenario_action + close_morning61 을 사용하고 정책을 영속화합니다."""
+    raw = _realistic_trade_log_df(n_dates=8)
     trade_log_path = tmp_path / "trade_log.parquet"
     raw.to_parquet(trade_log_path)
     export_dir = tmp_path / "models"
@@ -894,34 +908,65 @@ def test_train_and_save_real_model_bundle_trains_numeric_features(tmp_path) -> N
     assert bundle["feature_cols"]
     assert "quantile_models" in bundle
     assert "return_model" in bundle
-    # 후보 메타데이터가 번들에 영속화됩니다.
-    assert bundle["feature_set"] == "production_calendar_flow"
+    # champion 메타데이터가 번들에 영속화됩니다.
+    assert bundle["feature_set"] == "close_morning61"
     assert bundle["panel_mode"] == "scenario_action"
-    # 9개 캘린더/수급 후보 피처가 수치 피처에 포함되고 캔들/실현 매수가 파생은 없습니다.
-    nine = {
-        "weekday_is_monday",
-        "weekday_is_tuesday",
-        "weekday_is_wednesday",
-        "weekday_is_thursday",
-        "weekday_is_friday",
-        "flow_consensus",
-        "flow_alignment_direction",
-        "flow_turnover",
-        "friday_selection_rank_pct",
-    }
-    assert nine.issubset(bundle["feature_cols"])
-    assert not {"close_position", "buy_price_change_rate", "gap_ratio"}.intersection(
+    # close_morning61: snapshot49 전체 + relative_flow_strength 1개, 거부 상호작용 제외.
+    assert "relative_flow_strength" in bundle["feature_cols"]
+    assert not {"range_efficiency", "flow_turnover"}.intersection(
         bundle["feature_cols"]
     )
-    # feature_manifest 가 영속화되고 후보 피처는 모두 at_decision_time 입니다.
+    assert not _PRODUCTION_CALENDAR_FLOW_NINE.intersection(bundle["feature_cols"])
+    # 정책이 번들에 직렬화되어 pred→rank_score 매핑이 기록됩니다.
+    assert isinstance(bundle["single_stock_policy"], dict)
+    assert bundle["policy_metadata"]["oof_score_col"] == "pred"
+    assert bundle["policy_metadata"]["daily_score_col"] == "rank_score"
+    assert bundle["oof_score_col"] == "pred"
+    assert bundle["daily_score_col"] == "rank_score"
+    # feature_manifest 가 영속화되고 모든 피처가 at_decision_time 입니다.
     manifest = bundle["feature_manifest"]
     assert set(manifest["feature_name"]) == set(bundle["feature_cols"])
     rules = dict(zip(manifest["feature_name"], manifest["availability_rule"], strict=True))
-    assert all(rules[name] == "at_decision_time" for name in nine)
+    assert all(rules[name] == "at_decision_time" for name in bundle["feature_cols"])
     # 후보는 훈련 cutoff 로 버전화된 하위 디렉터리에 저장되어 활성 아티팩트를 덮어쓰지 않습니다.
-    candidate_dir = export_dir / f"production_calendar_flow_{bundle['training_cutoff'][:10]}"
+    candidate_dir = export_dir / f"close_morning61_{bundle['training_cutoff'][:10]}"
     assert (candidate_dir / "sizing_pipeline_bundle.joblib").exists()
     assert not (export_dir / "sizing_pipeline_bundle.joblib").exists()
+
+
+def test_scenario_daily_predict_redesign_01_fresh_candidate_bundle_emits_policy_decision(
+    tmp_path,
+) -> None:
+    """[SCENARIO_DAILY_PREDICT_REDESIGN_01] A freshly trained close_morning61
+    candidate bundle contains a serialized policy and daily inference emits one
+    policy-backed BUY/ABSTAIN decision rather than missing_validated_policy."""
+    raw = _realistic_trade_log_df(n_dates=8)
+    trade_log_path = tmp_path / "trade_log.parquet"
+    raw.to_parquet(trade_log_path)
+    export_dir = tmp_path / "models"
+
+    bundle = predict.train_and_save_real_model_bundle(
+        export_dir=str(export_dir),
+        trade_log_path=trade_log_path,
+        theme_path=str(tmp_path / "missing_theme.parquet"),
+    )
+    loaded = predict.load_model_artifacts(
+        str(export_dir / f"close_morning61_{bundle['training_cutoff'][:10]}")
+    )
+    policy = predict._load_single_stock_policy(loaded)
+    assert policy is not None
+    assert policy.policy_id == "always_buy_top1"
+
+    snapshot = predict.apply_standard_feature_engineering(
+        _daily_snapshot_from_processed(
+            predict.build_ml_dataset(raw, None, feature_set="close_morning61")[3]
+        )
+    )
+    scored = predict.run_daily_sizing_inference(snapshot, loaded, group_col="date")
+    decision = predict.select_single_daily_trade(scored, policy, group_col="date")
+    assert len(decision) == 1
+    assert decision.iloc[0]["decision_reason"] != "missing_validated_policy"
+    assert decision.iloc[0]["decision"] in {"BUY", "ABSTAIN"}
 
 
 def test_train_inline_bundle_excludes_categorical_features() -> None:
