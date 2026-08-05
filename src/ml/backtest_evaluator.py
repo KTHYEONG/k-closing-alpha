@@ -322,6 +322,191 @@ def run_backtest_evaluation(
         },
     }
 
+def _turnover_by_stock_code(
+    oof: pd.DataFrame,
+    group_col: str,
+    stock_col: str,
+    score_col: str,
+    top_k: int,
+) -> float:
+    """일자별 top-k 선택 종목코드의 전일 대비 신규 편입 비율 평균을 반환합니다.
+
+    DataFrame index 가 아닌 ``stock_col`` 값으로 보유 종목을 추적하므로,
+    날짜가 달라져도 동일 종목 코드는 turnover 에서 유지됩니다.
+    """
+    sorted_df = oof.sort_values([group_col, score_col], ascending=[True, False], kind="mergesort")
+    prev: set[Any] | None = None
+    turns: list[float] = []
+    for _, group in sorted_df.groupby(group_col, sort=False):
+        top = set(group[stock_col].iloc[:top_k])
+        if prev is not None:
+            keep = len(top & prev)
+            turns.append(1.0 - keep / min(top_k, len(top)))
+        prev = top
+    return float(np.mean(turns)) if turns else float("nan")
+
+
+def simulate_top_k_policy(
+    oof_df: pd.DataFrame,
+    target_col: str,
+    group_col: str,
+    stock_col: str = "stock_code",
+    score_col: str = "pred",
+    top_k: int = 1,
+) -> dict[str, Any]:
+    """일자별 top-k 종목코드 기반 동일가중 선택 정책 시뮬레이션.
+
+    OOF 의 ``stock_col``, 예측 점수, 실제 decimal-net target 으로 날짜별
+    top-k(동일가중)를 선택하고 일별 수익률·누적 NAV·Sharpe·MDD·win rate·
+    profit factor·연도별 결과를 반환합니다.
+
+    - turnover 는 선택된 종목코드 집합(``stock_col``)으로 계산합니다.
+    - ``target_col`` 은 decimal net return 이므로 비용을 재차감하지 않습니다.
+    - 중복 종목코드/결측 코드/``top_k < 1``/비유한 선택 수익률은 ``ValueError`` 입니다.
+
+    Args:
+        oof_df: ``group_col``, ``target_col``, ``stock_col``, ``score_col`` 를 포함한 OOF.
+        target_col: 일자별 실현 순수익률(decimal net) 컬럼.
+        group_col: 거래일 그룹 컬럼.
+        stock_col: 종목 식별자 컬럼 (turnover 추적용).
+        score_col: 예측 점수 컬럼.
+        top_k: 일자별 선택할 최대 종목 수.
+    """
+    if top_k < 1:
+        raise ValueError(f"top_k must be >= 1, got {top_k}")
+    required = [group_col, target_col, stock_col, score_col]
+    missing = [col for col in required if col not in oof_df.columns]
+    if missing:
+        raise ValueError(f"missing required columns in oof_df: {missing}")
+
+    work = oof_df[required].copy()
+    work = work.dropna(subset=[group_col, target_col, score_col])
+    if work[stock_col].isna().any():
+        raise ValueError(f"stock_col {stock_col!r} contains missing values in oof_df")
+    duplicates = work.duplicated(subset=[group_col, stock_col], keep=False)
+    if duplicates.any():
+        raise ValueError(
+            f"duplicate {stock_col} values within a {group_col} group are not allowed"
+        )
+    if work.empty:
+        raise ValueError("oof_df has no usable rows after NaN filtering")
+
+    daily, years = _group_series(work, group_col, target_col, score_col, ascending=False, k=top_k)
+    if not np.isfinite(daily).all():
+        raise ValueError("non-finite selected returns in top_k policy")
+
+    nav = np.cumprod(1.0 + daily)
+    metrics = _aggregate_metrics(daily)
+    metrics["max_drawdown"] = _max_drawdown(daily)
+    return {
+        "daily_returns": daily,
+        "nav": nav,
+        "turnover": _turnover_by_stock_code(work, group_col, stock_col, score_col, top_k),
+        "top_k": top_k,
+        "metrics": metrics,
+        "yearly_breakdown": _yearly_breakdown(daily, daily, years),
+    }
+
+_ACTION_RESOLUTION_MODES: tuple[str, ...] = (
+    "exclude_multi_scenario",
+    "score_best_action",
+    "require_final_action",
+)
+
+
+def resolve_stock_actions(
+    oof_df: pd.DataFrame,
+    group_col: str,
+    stock_col: str = "stock_code",
+    scenario_col: str = "chart_analysis",
+    score_col: str = "pred",
+    mode: str = "exclude_multi_scenario",
+    executable_col: str = "is_executable_action",
+) -> pd.DataFrame:
+    """OOF 행동 패널을 유일한 ``(group, stock)`` 종목 패널로 해소합니다.
+
+    시나리오 행동 패널에서 날짜-종목당 실행 가능한 행동 하나를 선택해
+    ``simulate_top_k_policy`` 가 중복을 거부하지 않도록 만듭니다. 실현 수익률
+    (``target_col``)이나 원천 행 순서로 행동을 선택하지 않습니다.
+
+    모드:
+    - ``exclude_multi_scenario``: 날짜-종목에 행동이 둘 이상이면 해당 종목을
+      포트폴리오 평가에서 제외합니다.
+    - ``score_best_action``: 행동별 예측 점수(``score_col``)가 가장 높은 하나를
+      선택하며, 동점은 ``scenario_col`` 오름차순으로 결정합니다.
+    - ``require_final_action``: ``executable_col`` 이 True 인 행동이 정확히 하나인
+      날짜-종목만 선택하며, 없거나 둘 이상이면 ``ValueError`` 입니다.
+
+    Args:
+        oof_df: ``group_col``/``stock_col``/``scenario_col``/``score_col`` 를 포함한 OOF.
+        group_col: 거래일 그룹 컬럼.
+        stock_col: 종목 식별자 컬럼.
+        scenario_col: 시나리오(차트분석) 컬럼.
+        score_col: 행동 선택에 사용할 예측 점수 컬럼.
+        mode: 해소 모드.
+        executable_col: ``require_final_action`` 모드에서 실행 행동을 식별하는 boolean 컬럼.
+
+    Returns:
+        날짜-종목 key 가 유일한 해소된 DataFrame.
+
+    Raises:
+        ValueError: 미지원 모드, key 컬럼 누락/null, 또는 ``require_final_action``
+            에서 날짜-종목별 실행 행동이 0개/2개 이상인 경우. 해소 결과는 각 모드가
+            구조적으로 유일한 ``(group, stock)`` key 를 보장합니다.
+    """
+    if mode not in _ACTION_RESOLUTION_MODES:
+        raise ValueError(f"mode must be one of {list(_ACTION_RESOLUTION_MODES)}, got {mode!r}")
+    required = [group_col, stock_col, scenario_col, score_col]
+    missing = [col for col in required if col not in oof_df.columns]
+    if missing:
+        raise ValueError(f"missing required columns in oof_df for action resolution: {missing}")
+    null_cols = [col for col in required if oof_df[col].isna().any()]
+    if null_cols:
+        raise ValueError(f"required columns contain nulls: {null_cols}")
+
+    work = oof_df.reset_index(drop=True).copy()
+    group_keys = [group_col, stock_col]
+
+    if mode == "exclude_multi_scenario":
+        counts = work.groupby(group_keys, sort=False)[scenario_col].transform("size")
+        resolved = work.loc[counts == 1]
+    elif mode == "score_best_action":
+        resolved = (
+            work.sort_values(
+                [*group_keys, score_col, scenario_col],
+                ascending=[True, True, False, True],
+                kind="mergesort",
+            )
+            .groupby(group_keys, sort=False)
+            .head(1)
+        )
+    else:  # require_final_action
+        if executable_col not in work.columns:
+            raise ValueError(
+                f"executable_col {executable_col!r} is required for require_final_action mode"
+            )
+        executable = work[executable_col].fillna(False).astype(bool)
+        group_sizes = work.groupby(group_keys, sort=False).size()
+        executable_counts = (
+            work.assign(_executable=executable)
+            .groupby(group_keys, sort=False)["_executable"]
+            .sum()
+            .reindex(group_sizes.index, fill_value=0)
+        )
+        invalid = executable_counts[executable_counts != 1]
+        if not invalid.empty:
+            raise ValueError(
+                "require_final_action expects exactly one executable action per "
+                f"{group_col}-{stock_col} group; got {len(invalid)} invalid groups"
+            )
+        resolved = work.loc[executable]
+
+    # 각 해소 모드는 (group, stock) key 에 대해 하나의 행만 반환하므로 결과는
+    # 구조적으로 유일합니다 (exclude: count==1 만 유지, score_best: 그룹당 head(1),
+    # require_final: 실행 행동 정확히 1개 검증). 해소되지 않은 중복은
+    # simulate_top_k_policy 가 fail-closed 로 거부합니다.
+    return resolved.reset_index(drop=True)
+
 
 def _model_daily_series(
     work: pd.DataFrame, group_col: str, target_col: str
