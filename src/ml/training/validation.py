@@ -5,7 +5,24 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-_MODEL_TYPES = ("ridge", "lgb_ranker", "lgb_regressor")
+_MODEL_TYPES = (
+    "ridge",
+    "lgb_ranker",
+    "lgb_regressor",
+    "xgb_regressor",
+    "catboost_regressor",
+    "random_forest_regressor",
+)
+
+# algorithm-family ensemble 실험(ml_ensemble_improvement)에 참여하는 결정적
+# numeric-only return 추정기 family 목록입니다. 모든 family 는 동일한 수치형
+# close_morning61 피처 컬럼을 사용합니다 (범주형 피처 미사용).
+_ALGORITHM_FAMILIES: tuple[str, ...] = (
+    "lgb_regressor",
+    "xgb_regressor",
+    "catboost_regressor",
+    "random_forest_regressor",
+)
 
 
 def calculate_recency_sample_weight(

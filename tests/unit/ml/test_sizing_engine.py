@@ -928,3 +928,251 @@ def test_predict_daily_position_sizing_research_bundle_rejects_invalid_config() 
     with pytest.raises(ValueError, match="requires a group_col present in df"):
         predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=no_group_col)
 
+
+def _algorithm_bundle_models(df: pd.DataFrame, weights: dict[str, float]) -> dict[str, object]:
+    """full-history deterministic return 모델 매핑을 구성합니다 (algorithm 연구 번들용)."""
+    from src.ml.training.fitting import fit_full_history_algorithm_return_model
+
+    return {
+        model_type: fit_full_history_algorithm_return_model(
+            model_type, df, FEATURE_COLS, TARGET_COL
+        )
+        for model_type in weights
+    }
+
+
+def _build_algorithm_bundle(
+    df: pd.DataFrame,
+    weights: dict[str, float],
+    probability_weight: float = 0.5,
+) -> dict[str, object]:
+    """algorithm-family 앙상블 연구 번들 (full-history return 모델 + 설정) 을 구성합니다."""
+    config: dict[str, object] = {
+        "version": "close-morning-algorithm-ensemble-research",
+        "weights": dict(weights),
+        "probability_weight": probability_weight,
+        "score_col": "decision_score",
+    }
+    return _train_inline_bundle(
+        df,
+        FEATURE_COLS,
+        TARGET_COL,
+        GROUP_COL,
+        algorithm_ensemble_models=_algorithm_bundle_models(df, weights),
+        algorithm_ensemble_config=config,
+    )
+
+
+def _expected_rank_blend(
+    df: pd.DataFrame,
+    models: dict[str, object],
+    weights: dict[str, float],
+) -> pd.Series:
+    """serving blend 와 동일한 그룹 내 백분위 convex blend 를 재계산합니다."""
+    blend: pd.Series | None = None
+    for model_type, weight in weights.items():
+        pred = pd.Series(models[model_type].predict(df[FEATURE_COLS]), index=df.index)
+        pct = pred.groupby(df[GROUP_COL]).rank(pct=True, method="average")
+        term = weight * pct
+        blend = term if blend is None else blend.add(term)
+    assert blend is not None
+    return blend
+
+
+def test_predict_daily_position_sizing_algorithm_bundle_blends_rank_scores() -> None:
+    """(SCENARIO_ALGORITHM_ENSEMBLE_04) algorithm-family 연구 번들은 동일 날짜
+    백분위 blend 를 rank_score 로 재현하고, v1 reranker decision_score 는 blend
+    백분위 + p_good 백분위 로 재현합니다."""
+    df = _make_feature_df(n_rows=45, n_dates=3)
+    weights = {"lgb_regressor": 0.5, "xgb_regressor": 0.5}
+    bundle = _build_algorithm_bundle(df, weights)
+    result = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bundle)
+
+    blend = _expected_rank_blend(df, bundle["algorithm_ensemble_models"], weights)
+    np.testing.assert_allclose(result["rank_score"].to_numpy(), blend.to_numpy(), atol=1e-12)
+    for model_type in weights:
+        expected_pred = bundle["algorithm_ensemble_models"][model_type].predict(df[FEATURE_COLS])
+        np.testing.assert_allclose(
+            result[f"pred_{model_type}"].to_numpy(), expected_pred, atol=1e-12
+        )
+
+    expected_decision = (
+        blend.groupby(df[GROUP_COL]).rank(pct=True, method="average")
+        + 0.5 * result.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+    )
+    np.testing.assert_allclose(
+        result["decision_score"].to_numpy(), expected_decision.to_numpy(), atol=1e-12
+    )
+    assert "allocation" in result.columns
+
+
+def test_predict_daily_position_sizing_algorithm_bundle_all_four_equal() -> None:
+    """all_four_equal(4개 전문가 동일 가중) 레시피가 serving 에서 재현됩니다."""
+    df = _make_feature_df(n_rows=60, n_dates=4)
+    weights = {
+        "lgb_regressor": 0.25,
+        "xgb_regressor": 0.25,
+        "catboost_regressor": 0.25,
+        "random_forest_regressor": 0.25,
+    }
+    bundle = _build_algorithm_bundle(df, weights)
+    result = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bundle)
+    blend = _expected_rank_blend(df, bundle["algorithm_ensemble_models"], weights)
+    np.testing.assert_allclose(result["rank_score"].to_numpy(), blend.to_numpy(), atol=1e-12)
+    assert "decision_score" in result.columns
+
+
+def test_convex_rank_blend_rejects_empty_weights() -> None:
+    """(defensive) 빈 앙상블 가중치는 fail-closed 로 거부합니다."""
+    from src.ml.sizing_engine import _convex_rank_blend
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        _convex_rank_blend({}, pd.Series([GROUP_COL]), {})
+
+
+def test_train_inline_bundle_algorithm_bundle_requires_matching_models_and_config() -> None:
+    """algorithm 연구 번들은 모델과 설정을 항상 함께 요구하며 비-convex weights,
+    미지원/불일치 model key 는 fail-closed 로 거부합니다."""
+    df = _make_feature_df()
+    models2 = _algorithm_bundle_models(df, {"lgb_regressor": 0.5, "xgb_regressor": 0.5})
+    config = {
+        "version": "close-morning-algorithm-ensemble-research",
+        "weights": {"lgb_regressor": 0.5, "xgb_regressor": 0.5},
+    }
+    with pytest.raises(ValueError, match="requires both algorithm_ensemble_models and"):
+        _train_inline_bundle(
+            df, FEATURE_COLS, TARGET_COL, GROUP_COL, algorithm_ensemble_config=config
+        )
+    with pytest.raises(ValueError, match="requires both algorithm_ensemble_models and"):
+        _train_inline_bundle(
+            df, FEATURE_COLS, TARGET_COL, GROUP_COL, algorithm_ensemble_models=models2
+        )
+    # 비-convex weights.
+    bad = dict(config)
+    bad["weights"] = {"lgb_regressor": 0.5, "xgb_regressor": 0.4}
+    with pytest.raises(ValueError, match="must sum to 1"):
+        _train_inline_bundle(
+            df,
+            FEATURE_COLS,
+            TARGET_COL,
+            GROUP_COL,
+            algorithm_ensemble_models=models2,
+            algorithm_ensemble_config=bad,
+        )
+    # 빈 weights.
+    bad = dict(config)
+    bad["weights"] = {}
+    with pytest.raises(ValueError, match="must be a non-empty mapping"):
+        _train_inline_bundle(
+            df,
+            FEATURE_COLS,
+            TARGET_COL,
+            GROUP_COL,
+            algorithm_ensemble_models=models2,
+            algorithm_ensemble_config=bad,
+        )
+    # 빈 모델 매핑.
+    with pytest.raises(ValueError, match="requires a non-empty algorithm_ensemble_models"):
+        _train_inline_bundle(
+            df,
+            FEATURE_COLS,
+            TARGET_COL,
+            GROUP_COL,
+            algorithm_ensemble_models={},
+            algorithm_ensemble_config=config,
+        )
+    # [0, 1] 범위 밖 가중치.
+    bad = dict(config)
+    bad["weights"] = {"lgb_regressor": 0.5, "xgb_regressor": 1.5}
+    with pytest.raises(ValueError, match="must be within \\[0, 1\\]"):
+        _train_inline_bundle(
+            df,
+            FEATURE_COLS,
+            TARGET_COL,
+            GROUP_COL,
+            algorithm_ensemble_models=models2,
+            algorithm_ensemble_config=bad,
+        )
+    # 미지원 model key.
+    bad = dict(config)
+    bad["weights"] = {"svm": 1.0}
+    with pytest.raises(ValueError, match="weights key must be one of"):
+        _train_inline_bundle(
+            df,
+            FEATURE_COLS,
+            TARGET_COL,
+            GROUP_COL,
+            algorithm_ensemble_models={"svm": object()},
+            algorithm_ensemble_config=bad,
+        )
+    # model key 불일치.
+    with pytest.raises(ValueError, match="keys must exactly match"):
+        _train_inline_bundle(
+            df,
+            FEATURE_COLS,
+            TARGET_COL,
+            GROUP_COL,
+            algorithm_ensemble_models={"lgb_regressor": models2["lgb_regressor"]},
+            algorithm_ensemble_config=config,
+        )
+    # recency 와 algorithm 동시 설정 거부.
+    recency_config = {"version": "r", "half_life_groups": 252, "recent_weight": 0.5}
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _train_inline_bundle(
+            df,
+            FEATURE_COLS,
+            TARGET_COL,
+            GROUP_COL,
+            recent_return_model=LGBMRegressor(),
+            recency_ensemble_config=recency_config,
+            algorithm_ensemble_models=models2,
+            algorithm_ensemble_config=config,
+        )
+
+
+def test_predict_daily_position_sizing_algorithm_bundle_fail_closed() -> None:
+    """algorithm 설정 번들의 잘못된 설정/모델 누락/동시 recency 설정은 serving 시
+    ValueError 로 fail-closed 됩니다."""
+    import copy
+
+    df = _make_feature_df()
+    weights = {"lgb_regressor": 0.5, "xgb_regressor": 0.5}
+    bundle = _build_algorithm_bundle(df, weights)
+
+    # 동시 recency 설정은 serving 시 거부됩니다.
+    both = copy.deepcopy(bundle)
+    both["recency_ensemble_config"] = {
+        "version": "r",
+        "half_life_groups": 252,
+        "recent_weight": 0.5,
+    }
+    with pytest.raises(ValueError, match="cannot be combined"):
+        predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=both)
+
+    # 모델 누락.
+    missing = copy.deepcopy(bundle)
+    del missing["algorithm_ensemble_models"]
+    with pytest.raises(ValueError, match="requires a non-empty algorithm_ensemble_models"):
+        predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=missing)
+
+    # 비-convex weights.
+    bad = copy.deepcopy(bundle)
+    bad["algorithm_ensemble_config"]["weights"] = {
+        "lgb_regressor": 0.5,
+        "xgb_regressor": 0.4,
+    }
+    with pytest.raises(ValueError, match="must sum to 1"):
+        predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bad)
+
+    # model key 불일치.
+    mismatch = copy.deepcopy(bundle)
+    del mismatch["algorithm_ensemble_models"]["xgb_regressor"]
+    with pytest.raises(ValueError, match="keys must exactly match"):
+        predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=mismatch)
+
+    # group_col 부재.
+    no_group = copy.deepcopy(bundle)
+    del no_group["group_col"]
+    with pytest.raises(ValueError, match="requires a group_col present in df"):
+        predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=no_group)
+

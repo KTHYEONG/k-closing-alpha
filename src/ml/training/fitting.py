@@ -7,13 +7,16 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from catboost import CatBoostRegressor
 from lightgbm import LGBMRanker, LGBMRegressor
 from scipy.stats import spearmanr
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from xgboost import XGBRegressor
 
-from src.ml.training.validation import calculate_recency_sample_weight
+from src.ml.training.validation import _ALGORITHM_FAMILIES, calculate_recency_sample_weight
 
 
 def _group_relevance(target: pd.Series, groups: pd.Series) -> pd.Series:
@@ -82,6 +85,37 @@ def _compute_top_k_return(oof: pd.DataFrame, group_col: str, target_col: str, k:
     return _group_metric(oof, group_col, per_group)
 
 
+def _build_algorithm_return_estimator(
+    model_type: str, params: dict[str, Any] | None = None
+) -> Any:
+    """deterministic numeric-only algorithm-family return estimator 를 생성합니다.
+
+    ml_ensemble_improvement 실험의 도전자 XGBoost/CatBoost/RandomForest 는 각각
+    pseudo-Huber / Huber / bagged-tree 회귀로 생성되며, ``random_state``/``random_seed``
+    는 42, 워커는 단일(``n_jobs``/``thread_count``=1)로 고정해 fold 학습과
+    full-history 학습이 동일한 결정적 설정을 공유합니다. CatBoost 는 파일 출력을
+    비활성화(``allow_writing_files=False``)해 추론 환경을 오염시키지 않습니다.
+    미지원 model_type 은 ``ValueError`` 로 fail-closed 합니다.
+    """
+    extra = dict(params or {})
+    if model_type == "xgb_regressor":
+        return XGBRegressor(
+            objective="reg:pseudohubererror", random_state=42, n_jobs=1, verbosity=0, **extra
+        )
+    if model_type == "catboost_regressor":
+        return CatBoostRegressor(
+            loss_function="Huber:delta=1.0",
+            random_seed=42,
+            thread_count=1,
+            allow_writing_files=False,
+            verbose=False,
+            **extra,
+        )
+    if model_type == "random_forest_regressor":
+        return RandomForestRegressor(random_state=42, n_jobs=1, **extra)
+    raise ValueError(f"unsupported algorithm-family model_type: {model_type!r}")
+
+
 def _fit_predict(
     model_type: str,
     train: pd.DataFrame,
@@ -112,6 +146,11 @@ def _fit_predict(
 
     if model_type == "lgb_regressor":
         model = LGBMRegressor(objective="huber", random_state=42, **params)
+        model.fit(train[feature_cols], train[target_col], sample_weight=sample_weight)
+        return model, model.predict(val[feature_cols])
+
+    if model_type in _ALGORITHM_FAMILIES:
+        model = _build_algorithm_return_estimator(model_type, params)
         model.fit(train[feature_cols], train[target_col], sample_weight=sample_weight)
         return model, model.predict(val[feature_cols])
 
@@ -216,3 +255,24 @@ def recency_sample_weight_for_fold(
     if recency_half_life_groups is None:
         return None
     return calculate_recency_sample_weight(train[group_col], recency_half_life_groups)
+
+
+def fit_full_history_algorithm_return_model(
+    model_type: str,
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+) -> Any:
+    """전체 history 로 학습한 deterministic return-estimator 를 반환합니다.
+
+    ml_ensemble_improvement 연구 번들용 full-history 추정기입니다. fold 학습과
+    동일한 결정적 설정(``_build_algorithm_return_estimator``)을 사용해 OOF 실험과
+    운영 추정기가 일치하며, ``model_type`` 은 algorithm-family 목록의 하나여야
+    합니다.
+    """
+    if model_type == "lgb_regressor":
+        model = LGBMRegressor(objective="huber", random_state=42, verbosity=-1)
+    else:
+        model = _build_algorithm_return_estimator(model_type)
+    model.fit(df[feature_cols], df[target_col])
+    return model
