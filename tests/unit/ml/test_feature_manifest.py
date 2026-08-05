@@ -45,6 +45,33 @@ def test_build_feature_manifest_units() -> None:
     assert units["v_kospi"] == "index_level"
 
 
+def test_build_feature_manifest_production_calendar_flow_units() -> None:
+    """production_calendar_flow 후보는 결정적으로 at_decision_time 이며 단위가 고정됩니다."""
+    features = [
+        "weekday_is_monday",
+        "weekday_is_tuesday",
+        "weekday_is_wednesday",
+        "weekday_is_thursday",
+        "weekday_is_friday",
+        "flow_consensus",
+        "flow_alignment_direction",
+        "flow_turnover",
+        "friday_selection_rank_pct",
+    ]
+    manifest = build_feature_manifest(features)
+    units = dict(zip(manifest["feature_name"], manifest["unit"], strict=True))
+    rules = dict(zip(manifest["feature_name"], manifest["availability_rule"], strict=True))
+    for name in features:
+        assert rules[name] == "at_decision_time"
+    assert units["weekday_is_monday"] == "binary_indicator"
+    assert units["weekday_is_friday"] == "binary_indicator"
+    assert units["flow_consensus"] == "signed_count"
+    assert units["flow_alignment_direction"] == "decimal_ratio"
+    assert units["flow_turnover"] == "decimal_ratio"
+    assert units["friday_selection_rank_pct"] == "decimal_ratio"
+    assert (manifest["panel_scope"] == "candidate_panel").all()
+
+
 def test_build_feature_manifest_empty_input() -> None:
     manifest = build_feature_manifest([])
     assert manifest.empty
