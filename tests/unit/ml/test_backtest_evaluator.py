@@ -15,7 +15,20 @@ from src.ml.backtest_evaluator import run_backtest_evaluation
 GROUP_COL = "trade_date"
 TARGET_COL = "net_return"
 
-METRIC_KEYS = ("top_1_return", "top_3_return", "win_rate", "profit_factor", "mean_win", "mean_loss", "sharpe")
+METRIC_KEYS = (
+    "top_1_return",
+    "top_3_return",
+    "win_rate",
+    "profit_factor",
+    "mean_win",
+    "mean_loss",
+    "sharpe",
+    "cost_adjusted_return",
+    "date_weighted_return",
+    "capital_weighted_return",
+    "turnover",
+    "max_drawdown",
+)
 
 
 def _make_oof(
@@ -47,6 +60,7 @@ def test_run_backtest_evaluation_returns_contract_shape() -> None:
     assert "model_metrics" in result
     assert "baseline_metrics" in result
     assert "yearly_breakdown" in result
+    assert "regime_breakdown" in result
 
     model = result["model_metrics"]
     assert set(model) == set(METRIC_KEYS)
@@ -56,15 +70,11 @@ def test_run_backtest_evaluation_returns_contract_shape() -> None:
     assert set(result["baseline_metrics"]["equal_weight"]) == set(METRIC_KEYS)
 
 
-def test_run_backtest_evaluation_skips_selection_rank_when_column_missing(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_run_backtest_evaluation_fails_closed_when_selection_rank_missing() -> None:
+    """selection_rank baseline 은 필수입니다. 누락 시 조용히 생략하지 않고 ValueError 로 실패합니다."""
     oof = _make_oof(include_selection_rank=False)
-    result = run_backtest_evaluation(oof, TARGET_COL, GROUP_COL)
-
-    assert result["baseline_metrics"]["selection_rank"] is None
-    assert set(result["baseline_metrics"]["equal_weight"]) == set(METRIC_KEYS)
-    assert "selection_rank" in caplog.text
+    with pytest.raises(ValueError, match="selection_rank"):
+        run_backtest_evaluation(oof, TARGET_COL, GROUP_COL)
 
 
 def test_run_backtest_evaluation_yearly_breakdown() -> None:

@@ -50,27 +50,25 @@ def _make_utility_df(n_rows: int = 12, seed: int = 3) -> pd.DataFrame:
 
 
 def test_utility_score_calculation_matches_formula() -> None:
-    """U_i = (q50 - cost) - lambda*max(0, -(q10 - cost)) - gamma*(q90 - q10)
-          + w_good*p_good - w_bad*p_bad
+    """U_i = q50 - lambda*max(0, -q10) - gamma*(q90 - q10) + w_good*p_good - w_bad*p_bad
 
+    decimal net 예측은 이미 비용 차감 완료이므로 유틸리티가 비용을 재차감하지 않습니다.
     (SCENARIO: utility_score_calculation)
     """
     df = _make_utility_df()
     lambda_risk, gamma_uncertainty, w_good, w_bad = 1.5, 0.2, 0.5, 0.5
-    round_trip_cost = 0.0020
     series = calculate_utility_score(
         df,
         lambda_risk=lambda_risk,
         gamma_uncertainty=gamma_uncertainty,
         w_good=w_good,
         w_bad=w_bad,
-        round_trip_cost=round_trip_cost,
     )
     assert isinstance(series, pd.Series)
     assert series.name == "utility_score"
     expected = (
-        (df["pred_q50"] - round_trip_cost)
-        - lambda_risk * np.maximum(0.0, -(df["pred_q10"] - round_trip_cost))
+        df["pred_q50"]
+        - lambda_risk * np.maximum(0.0, -df["pred_q10"])
         - gamma_uncertainty * (df["pred_q90"] - df["pred_q10"])
         + w_good * df["p_good"]
         - w_bad * df["p_bad"]
@@ -78,9 +76,10 @@ def test_utility_score_calculation_matches_formula() -> None:
     np.testing.assert_allclose(series.to_numpy(), expected.to_numpy())
 
 
-def test_utility_score_deducts_round_trip_cost() -> None:
-    """(SCENARIO: utility_score_calculation) 기본 round_trip_cost=0.0020 이
-    기대수익 q50 에서 차감되어 순유틸리티가 q50 보다 낮고, 비용 없음보다 작다."""
+def test_utility_score_consumes_net_predictions_without_second_cost_deduction() -> None:
+    """(SCENARIO: utility_score_calculation) decimal net 예측에 대해 round_trip_cost
+    인자는 결과를 변경하지 않습니다 — 타깃 구성 시점에 정확히 1회 차감된 비용이
+    유틸리티에서 다시 차감되지 않아야 합니다."""
     df = pd.DataFrame(
         {
             "pred_q10": [0.0],
@@ -90,10 +89,17 @@ def test_utility_score_deducts_round_trip_cost() -> None:
             "p_bad": [0.5],
         }
     )
-    assert float(calculate_utility_score(df).iloc[0]) < 0.005
     no_cost = float(calculate_utility_score(df, round_trip_cost=0.0).iloc[0])
     with_cost = float(calculate_utility_score(df).iloc[0])
-    assert with_cost < no_cost
+    assert with_cost == pytest.approx(no_cost)
+    # 유틸리티는 예측 q50 자체를 그대로 기대수익으로 소비합니다 (비용 재차감 없음).
+    assert with_cost == pytest.approx(
+        float(df["pred_q50"].iloc[0])
+        - 0.5 * np.maximum(0.0, -df["pred_q10"].iloc[0])
+        - 0.1 * (df["pred_q90"].iloc[0] - df["pred_q10"].iloc[0])
+        + 0.01 * df["p_good"].iloc[0]
+        - 0.01 * df["p_bad"].iloc[0]
+    )
 
 
 def test_utility_score_penalizes_downside_and_uncertainty() -> None:
@@ -167,15 +173,15 @@ def test_assign_sizing_grades_assigns_bands_correctly() -> None:
 
 
 def test_assign_sizing_grades_passes_negative_net_utility_and_nonpositive_return() -> None:
-    """(SCENARIO: sizing_grade_assignment) 음수 순유틸리티 또는 비용 차감 후
-    기대수익(net_q50)이 0 이하인 항목은 상위 백분위여도 Pass 등급을 받는다."""
+    """(SCENARIO: sizing_grade_assignment) 음수 순유틸리티 또는 기대수익
+    (net_q50, 비용 차감 완료)이 0 이하인 항목은 상위 백분위여도 Pass 등급을 받는다."""
     negative_util = _with_utility(_make_utility_df(n_rows=10), [-0.01] * 10)
     negative_util["pred_q50"] = 0.05
     result = assign_sizing_grades(negative_util, utility_col="utility_score", group_col=GROUP_COL)
     assert (result["grade"] == "Pass").all()
 
     zero_net = _with_utility(_make_utility_df(n_rows=10), [float(i) for i in range(10)])
-    zero_net["pred_q50"] = 0.0020
+    zero_net["pred_q50"] = 0.0
     result2 = assign_sizing_grades(zero_net, utility_col="utility_score", group_col=GROUP_COL)
     assert (result2["grade"] == "Pass").all()
 
@@ -286,9 +292,28 @@ def test_apply_risk_limits_raises_on_missing_columns() -> None:
     df = _make_utility_df()
     with pytest.raises(ValueError, match="grade_multiplier"):
         apply_risk_limits(df)
-    graded = assign_sizing_grades(_with_utility(df, [float(i) for i in range(len(df))]))
-    with pytest.raises(ValueError, match="pred_q"):
-        apply_risk_limits(graded.drop(columns=["pred_q10"]))
+    # 분위수 스프레드(q90-q10)를 실현 변동성으로 사용하지 않으므로
+    # pred_q10/pred_q90 없이도 변동성 타게팅이 동작합니다.
+    df["grade_multiplier"] = 1.0
+    result = apply_risk_limits(df)
+    assert "allocation" in result.columns
+
+
+def test_apply_risk_limits_uses_separate_realized_vol_column() -> None:
+    """변동성 타게팅은 q90-q10 이 아니라 별도 실현 변동성(realized_vol) 컬럼을 사용합니다.
+
+    realized_vol 이 제공되면 동일 utility/등급에서 높은 변동성 종목이 낮은 비중을 받습니다.
+    """
+    df = _with_utility(_make_utility_df(n_rows=2), [0.01, 0.01])
+    df["grade_multiplier"] = 1.0
+    df["realized_vol"] = [0.01, 0.10]
+    result = apply_risk_limits(
+        df, target_vol=0.15, max_position_pct=1.0, max_total_allocation=1.0
+    )
+    alloc = result["allocation"].to_numpy()
+    assert alloc[0] > alloc[1]
+    # 실현 변동성 비(10배)가 비중 비(1/10)로 반영됩니다.
+    assert alloc[0] == pytest.approx(alloc[1] * 10, rel=1e-6)
 
 
 def _make_feature_df(n_rows: int = 30, n_dates: int = 3, seed: int = 11) -> pd.DataFrame:

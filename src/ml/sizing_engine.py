@@ -16,6 +16,8 @@ from joblib import dump, load
 from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
 from sklearn.calibration import CalibratedClassifierCV
 
+from src.ml.feature_manifest import build_feature_manifest
+
 _PREDICTION_COLS = ("pred_q10", "pred_q50", "pred_q90", "p_good", "p_bad")
 
 # 왕복 거래 비용 (매수/매도 수수료 0.028% + 매도 거래세 0.15% + 슬리피지 0.022% ≈ 0.20%).
@@ -24,12 +26,18 @@ ROUND_TRIP_COST_RATIO: float = 0.0020
 _BUNDLE_FILENAME = "sizing_pipeline_bundle.joblib"
 _QUANTILE_COLS = ("pred_q10", "pred_q50", "pred_q90")
 _QUANTILE_ALPHAS = (0.10, 0.50, 0.90)
+# Decimal net 기준 이벤트 임계값 (preprocessor.LABEL_THRESHOLDS 와 동일)
 _GOOD_THRESHOLD = 0.01
-_BAD_THRESHOLD = -0.015
+_BAD_THRESHOLD = -0.02
 
 _STRONG_PCT = 0.90
 _GOOD_PCT = 0.75
 _WEAK_PCT = 0.50
+
+# 변동성 타게팅용 별도 실현 변동성 기본값 (q90-q10 은 불확실성 지표일 뿐
+# 실현 변동성이 아니므로 시그마 추정에 사용하지 않습니다).
+_DEFAULT_REALIZED_VOL = 0.02
+_REALIZED_VOL_COL = "realized_vol"
 
 _GRADE_MULTIPLIERS: dict[str, float] = {
     "Strong": 1.5,
@@ -57,12 +65,13 @@ def calculate_utility_score(
 ) -> pd.Series:
     """하방위험/불확실성 패널티가 적용된 종합 Utility Score 를 산출합니다.
 
-    U_i = (q50_i - cost) - lambda·max(0, -(q10_i - cost)) - gamma·(q90_i - q10_i)
+    U_i = q50_i - lambda·max(0, -q10_i) - gamma·(q90_i - q10_i)
           + w_good·p_good_i - w_bad·p_bad_i
 
-    ``round_trip_cost``(기본 0.20%)를 기대수익 q50 과 하방위험 기준 q10 에서
-    공제해 순유틸리티(net-of-cost) 기준으로 산출하며, 확률 가중치
-    (``w_good``/``w_bad``)는 수익률 스케일과 정렬된 소량 가산치입니다.
+    입력 분위수/확률 예측은 이미 decimal net return 단위(비용 차감 완료)이므로
+    여기서 거래 비용을 다시 차감하지 않습니다 (``round_trip_cost`` 는 타깃 구성
+    시점에 정확히 1회 반영된 비용으로, 이 함수는 예측이 net 기준임을 명시합니다).
+    ``q90 - q10`` 은 불확실성 스프레드이며 실현 변동성이 아닙니다.
     """
     missing = [col for col in _PREDICTION_COLS if col not in df.columns]
     if missing:
@@ -72,11 +81,9 @@ def calculate_utility_score(
     q90 = df["pred_q90"].to_numpy(dtype=np.float64)
     p_good = df["p_good"].to_numpy(dtype=np.float64)
     p_bad = df["p_bad"].to_numpy(dtype=np.float64)
-    net_q50 = q50 - round_trip_cost
-    net_q10 = q10 - round_trip_cost
-    downside = lambda_risk * np.maximum(0.0, -net_q10)
+    downside = lambda_risk * np.maximum(0.0, -q10)
     uncertainty = gamma_uncertainty * (q90 - q10)
-    utility = net_q50 - downside - uncertainty + w_good * p_good - w_bad * p_bad
+    utility = q50 - downside - uncertainty + w_good * p_good - w_bad * p_bad
     return pd.Series(utility, index=df.index, name="utility_score")
 
 
@@ -91,9 +98,9 @@ def assign_sizing_grades(
     """그룹(날짜) 내 Utility Score 백분위 + 절대 임계값 혼합(Hybrid) 등급 부여.
 
     상대백분위(pct)와 절대 Utility Score, 순 기대수익(net_q50) 을 동시에 만족해야
-    해당 등급을 부여합니다 (Relative Evaluation Trap 방지). ``net_q50 =
-    pred_q50 - round_trip_cost`` 로 거래 비용 차감 후에도 순 기대수익이 양수인
-    종목만 거래 후보로 승인합니다.
+    해당 등급을 부여합니다 (Relative Evaluation Trap 방지). 예측 ``pred_q50`` 은
+    이미 decimal net return(비용 차감 완료)이므로 여기서 비용을 추가 차감하지 않고
+    ``pred_q50 > 0`` 인 종목만 거래 후보로 승인합니다.
 
     - Strong: ``pct >= 0.90`` AND ``utility >= min_good_utility`` AND ``net_q50 > 0``
     - Good:   ``pct >= 0.75`` AND ``utility >= min_weak_utility`` AND ``net_q50 > 0``
@@ -115,9 +122,7 @@ def assign_sizing_grades(
         good = (pct >= _GOOD_PCT) & (u >= min_weak_utility)
         weak = (pct >= _WEAK_PCT) & (u >= min_weak_utility)
         if has_q50:
-            net_positive = (
-                out.loc[idx, "pred_q50"].to_numpy(dtype=np.float64) - round_trip_cost > 0.0
-            )
+            net_positive = out.loc[idx, "pred_q50"].to_numpy(dtype=np.float64) > 0.0
             strong = strong & net_positive
             good = good & net_positive
             weak = weak & net_positive
@@ -136,14 +141,32 @@ def apply_risk_limits(
     group_col: str = "date",
     utility_col: str = "utility_score",
 ) -> pd.DataFrame:
-    """등급 배수 * 변동성 역가중 * Utility Magnitude 비중을 산정하고 위험 한도를 적용합니다."""
+    """등급 배수 * 변동성 역가중 * Utility Magnitude 비중을 산정하고 위험 한도를 적용합니다.
+
+    Position_i = BaseBudget * GradeMultiplier_i * (TargetVol / sigma_i) * utility_scaling_i
+
+    ``utility_scaling_i = clip(utility_i / 0.01, 0.1, 1.5)`` 로 Utility Score 의
+    절대적 크기를 비중에 반영하며, ``sigma_i`` 는 별도 실현 변동성(``realized_vol``
+    컬럼 또는 기본값)입니다. 분위수 스프레드(q90-q10) 는 불확실성 지표이므로
+    실현 변동성으로 사용하지 않습니다. 그룹별 합계를 ``max_total_allocation``
+    으로, 개별 비중을 ``max_position_pct`` 로 클리핑하고, 음수 순유틸리티
+    종목은 비중 0% 로 강제합니다.
+
+    시장 국면 방어: 그룹 후보 유니버스의 평균 Utility Score 가 음수이면
+    ``max_total_allocation`` 을 ``max(1 + avg_utility, 0)`` 비율로 축소하여
+    불리한 시장 국면에서 자본을 보호합니다. ``utility_col`` 이 없으면
+    방어/크기 가중 없이 기존 한도만 적용합니다.
+    """
     if "grade_multiplier" not in df.columns:
         raise ValueError("grade_multiplier is missing in df; run assign_sizing_grades first")
-    if "pred_q10" not in df.columns or "pred_q90" not in df.columns:
-        raise ValueError("missing required prediction columns in df: pred_q10/pred_q90")
 
     out = df.copy()
-    sigma = np.maximum((out["pred_q90"] - out["pred_q10"]).to_numpy(dtype=np.float64), 1e-8)
+    # 변동성 타게팅: 실현 변동성(별도 예측/지연 컬럼) 또는 기본값을 사용합니다.
+    # 분위수 스프레드(q90-q10)는 불확실성 지표이므로 실현 변동성으로 사용하지 않습니다.
+    if _REALIZED_VOL_COL in out.columns:
+        sigma = np.maximum(out[_REALIZED_VOL_COL].to_numpy(dtype=np.float64), 1e-8)
+    else:
+        sigma = np.full(len(out), _DEFAULT_REALIZED_VOL)
     multiplier = out["grade_multiplier"].to_numpy(dtype=np.float64)
     has_utility = utility_col in out.columns
     utility = (
@@ -236,12 +259,17 @@ def _train_inline_bundle(
     feature_cols: list[str],
     target_col: str,
     group_col: str,
+    calibration_diagnostics: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """타깃이 포함된 데이터로 즉시 학습 가능한 기본 모델 번들을 구성합니다.
 
     LGBMRanker(랭킹) + Quantile Regressor(q10/q50/q90) + Calibrated Classifier
     (p_good/p_bad) 5종 모델을 포함하며, ``predict_daily_position_sizing`` 의
     인라인 추론(``models_bundle=None``)과 학습 모드 저장에 사용됩니다.
+
+    번들에는 P0 계약(``ml_strategy_improvement``)이 요구하는 반환 단위, 비용,
+    라벨 임계값, decision-time 피처 매니페스트, training cutoff, 보정 진단,
+    정책 파라미터를 영속화합니다.
 
     문자열/범주형 컬럼(``market_type``, ``theme_sector``, ``chart_analysis``)은
     Booster 구성 시 ValueError 를 유발하므로 ``feature_cols`` 에서 제외됩니다.
@@ -274,10 +302,27 @@ def _train_inline_bundle(
         ),
     }
 
+    manifest = build_feature_manifest(list(feature_cols))
+    training_cutoff = str(train[group_col].max())
+    policy_params: dict[str, Any] = {
+        "grade_multipliers": dict(_GRADE_MULTIPLIERS),
+        "grade_percentiles": {"strong": _STRONG_PCT, "good": _GOOD_PCT, "weak": _WEAK_PCT},
+        "utility_weights": {"lambda_risk": 0.5, "gamma_uncertainty": 0.1, "w_good": 0.01, "w_bad": 0.01},
+        "round_trip_cost": ROUND_TRIP_COST_RATIO,
+        "realized_vol_default": _DEFAULT_REALIZED_VOL,
+    }
+
     return {
         "feature_cols": list(feature_cols),
         "target_col": target_col,
         "group_col": group_col,
+        "return_unit": "decimal_net",
+        "round_trip_cost": ROUND_TRIP_COST_RATIO,
+        "label_thresholds": {"target_good": _GOOD_THRESHOLD, "target_bad": _BAD_THRESHOLD},
+        "feature_manifest": manifest,
+        "training_cutoff": training_cutoff,
+        "calibration_diagnostics": list(calibration_diagnostics or []),
+        "policy_params": policy_params,
         "rank_model": ranker,
         "quantile_models": quantile_models,
         "calibrators": calibrators,
