@@ -39,11 +39,14 @@ FEATURE_AVAILABLE_TIMESTAMP_COL = "feature_available_timestamp"
 # 허용되는 내부 피처셋: base40 → snapshot49 → interaction53 순으로만 승격합니다.
 # production_calendar_flow 는 승격 체인에 속하지 않는 별도의 연구 후보 피처셋으로,
 # 명시적으로 요청할 때만 활성화됩니다.
+# close_morning61 은 검증된 champion 피처셋으로, snapshot49 + relative_flow_strength
+# 정확히 1개를 추가합니다 (range_efficiency/flow_turnover/캘린더 흐름 제외).
 _ALLOWED_FEATURE_SETS: tuple[str, ...] = (
     "base40",
     "snapshot49",
     "interaction53",
     "production_calendar_flow",
+    "close_morning61",
 )
 
 # 허용되는 패널 모드:
@@ -73,6 +76,11 @@ _INTERACTION53_FEATURES: tuple[str, ...] = (
     "flow_turnover",
     "relative_flow_strength",
 )
+
+# close_morning61: snapshot49 에 정확히 1개 추가하는 검증된 champion 피처셋.
+# relative_flow_strength 는 같은 날짜 내 대형 투자자 수급 밀도와 가격 변화의
+# 백분위 순위 곱(같은 날짜만 사용, 벡터 연산)으로 [0, 1] 에 유한하게 묶입니다.
+_CLOSE_MORNING61_FEATURES: tuple[str, ...] = ("relative_flow_strength",)
 
 # production_calendar_flow: 캘린더/수급 흐름 연구 후보 피처 9종.
 # 15:20 KST 고정 스냅샷이 생성한 값만 사용하며, 캔들/실현 매수가 파생 피처는 없습니다.
@@ -432,6 +440,23 @@ def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
     return df
 
 
+def _validate_close_morning61_feature(df: pd.DataFrame) -> None:
+    """champion 피처 ``relative_flow_strength`` 의 무결성을 fail-closed 로 검증합니다.
+
+    필수 원천 입력이 없어 피처가 생성되지 않았거나, 모든 값이 유한한 [0, 1]
+    범위를 벗어나면 ``ValueError`` 를 발생시킵니다 (미래 값으로 채우지 않습니다).
+    """
+    if "relative_flow_strength" not in df.columns:
+        raise ValueError(
+            "close_morning61 requires source inputs (change_rate and major "
+            "investor flow) to compute relative_flow_strength; missing required "
+            "source inputs"
+        )
+    rfs = df["relative_flow_strength"].to_numpy(dtype=np.float64)
+    if not np.isfinite(rfs).all() or not np.logical_and(rfs >= 0.0, rfs <= 1.0).all():
+        raise ValueError("relative_flow_strength must be finite within [0, 1]")
+
+
 def build_ml_dataset(
     trade_log_df: pd.DataFrame,
     theme_df: pd.DataFrame | None = None,
@@ -441,10 +466,12 @@ def build_ml_dataset(
     """매매일지 원본 데이터를 정제하여 (X, targets, cat_features, processed_df)를 반환합니다.
 
     ``feature_set`` 은 ``base40`` / ``snapshot49`` / ``interaction53`` /
-    ``production_calendar_flow`` 만 허용하며, 기본값 ``base40`` 은 기존
-    conservative 피처집합과 호환됩니다. ``production_calendar_flow`` 는 명시적으로
-    요청할 때만 9개 캘린더/수급 후보 피처를 X 에 포함하는 연구 후보 피처셋입니다.
-    시간 컬럼은 검증·합성·검사하지 않습니다 (고정된 업무 원천 규칙).
+    ``production_calendar_flow`` / ``close_morning61`` 만 허용하며, 기본값
+    ``base40`` 은 기존 conservative 피처집합과 호환됩니다. ``production_calendar_flow``
+    는 명시적으로 요청할 때만 9개 캘린더/수급 후보 피처를 X 에 포함하는 연구 후보
+    피처셋이고, ``close_morning61`` 은 검증된 champion 으로 snapshot49 전체와
+    ``relative_flow_strength`` 정확히 1개만 X 에 포함합니다. 시간 컬럼은
+    검증·합성·검사하지 않습니다 (고정된 15:20 KST 공통 소스 스냅샷 계약).
 
     ``panel_mode`` 는 ``raw_rows``(기본, 원천 행 유지) 또는 ``scenario_action``
     만 허용합니다. ``scenario_action`` 은 clean → 행동 패널 정규화 → 피처/타깃
@@ -479,6 +506,12 @@ def build_ml_dataset(
     if "trade_date" not in df.columns or "net_return" not in df.columns:
         raise ValueError("필수 컬럼(trade_date, net_return)이 데이터에 없습니다.")
 
+    if feature_set == "close_morning61" and "change_rate" not in df.columns:
+        raise ValueError(
+            "close_morning61 requires the price-change source (change_rate) to "
+            "compute relative_flow_strength; missing required source inputs"
+        )
+
     if panel_mode == "scenario_action":
         df, scenario_rejects = build_scenario_action_panel(df)
         df.attrs["scenario_action_rejects"] = scenario_rejects
@@ -502,6 +535,12 @@ def build_ml_dataset(
     if feature_set == "production_calendar_flow":
         feature_cols.extend(
             col for col in _PRODUCTION_CALENDAR_FLOW_FEATURES if col in df.columns
+        )
+    if feature_set == "close_morning61":
+        feature_cols.extend(col for col in _SNAPSHOT49_FEATURES if col in df.columns)
+        _validate_close_morning61_feature(df)
+        feature_cols.extend(
+            col for col in _CLOSE_MORNING61_FEATURES if col in df.columns
         )
     if panel_mode == "scenario_action":
         # chart_analysis 원문은 감사용 메타데이터이며, LightGBM 입력에는 고정

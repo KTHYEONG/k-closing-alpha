@@ -19,7 +19,7 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from src.ml.backtest_evaluator import run_backtest_evaluation
+from src.ml.backtest_evaluator import _max_drawdown, run_backtest_evaluation
 from src.ml.feature_manifest import build_feature_manifest
 from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
 from src.ml.quantile_model import fit_predict_quantile_and_classifier
@@ -38,11 +38,84 @@ from src.ml.sizing_engine import (
     calculate_utility_score,
     save_model_artifacts,
 )
-from src.processing.preprocessor import LABEL_THRESHOLDS, RETURN_UNIT
+from src.processing.preprocessor import (
+    LABEL_THRESHOLDS,
+    RETURN_UNIT,
+    build_ml_dataset,
+)
 
 logger = logging.getLogger(__name__)
 
 _MODEL_TYPES = ("ridge", "lgb_ranker", "lgb_regressor")
+
+# 번들에 영속화할 compact OOF 정책 지표 (close-to-morning 전략 지표).
+_POLICY_METRIC_KEYS: tuple[str, ...] = (
+    "n_scheduled_dates",
+    "n_buy",
+    "n_abstain",
+    "buy_rate",
+    "scheduled_mean_return",
+    "scheduled_win_rate",
+    "profit_factor",
+    "scheduled_sharpe",
+    "active_trade_mean_return",
+    "active_trade_win_rate",
+    "entry_sequence_drawdown",
+)
+
+
+def _policy_metadata(
+    policy: SingleStockPolicy | None,
+    evaluation: SingleStockPolicyEvaluation | None,
+) -> dict[str, Any] | None:
+    """OOF 정책 보정 결과를 번들용 메타데이터로 요약합니다.
+
+    OOF 정책 보정은 ``pred`` 스코어, 최종 일일 선택은 ``rank_score`` 를
+    사용하며 그 매핑(oof_score_col/daily_score_col)을 명시적으로 기록합니다.
+    """
+    if policy is None or evaluation is None:
+        return None
+    return {
+        "oof_score_col": "pred",
+        "daily_score_col": "rank_score",
+        "calibration_cutoff": str(policy.calibration_cutoff),
+        "policy_version": policy.version,
+        "policy_id": policy.policy_id,
+        "candidate": policy.candidate,
+        "policy_metrics": {
+            key: evaluation.metrics[key]
+            for key in _POLICY_METRIC_KEYS
+            if key in evaluation.metrics
+        },
+    }
+
+
+def _calibrate_oof_policy(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    group_col: str,
+    n_splits: int,
+    purge_gap: int,
+) -> tuple[SingleStockPolicy | None, dict[str, Any] | None]:
+    """시나리오 행동 패널에서 purged OOF 정책을 보정하고 번들용 메타데이터를 반환합니다.
+
+    ``stock_code`` / ``chart_analysis`` 식별 컬럼이 없으면 정책을 산출할 수
+    없으므로 ``(None, None)`` 을 반환합니다 — 호출부는 이를 명시적
+    ``ABSTAIN(missing_validated_policy)`` 로 이어갑니다 (Top-N 폴백 금지).
+    """
+    if not {"stock_code", "chart_analysis"} <= set(df.columns):
+        return None, None
+    result = run_model_pipeline(
+        df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=n_splits,
+        purge_gap=purge_gap,
+        model_type="lgb_regressor",
+    )
+    return result["single_stock_policy"], result["policy_metadata"]
 
 
 def _group_relevance(target: pd.Series, groups: pd.Series) -> pd.Series:
@@ -265,6 +338,8 @@ def run_model_pipeline(
         )
         single_stock_policy = single_stock_evaluation.selected_policy
 
+    policy_metadata = _policy_metadata(single_stock_policy, single_stock_evaluation)
+
     return {
         "oof_predictions": oof_df,
         "oof_df": oof_df,
@@ -279,6 +354,7 @@ def run_model_pipeline(
         "calibration_diagnostics": [],
         "single_stock_policy": single_stock_policy,
         "single_stock_evaluation": single_stock_evaluation,
+        "policy_metadata": policy_metadata,
         "policy_params": {
             "purge_gap": purge_gap,
             "n_splits": n_splits,
@@ -341,5 +417,151 @@ def run_sizing_pipeline(
             group_col,
             calibration_diagnostics=quantile_df.attrs.get("calibration_diagnostics", []),
         )
+        policy, policy_metadata = _calibrate_oof_policy(
+            df, feature_cols, target_col, group_col, n_splits, purge_gap
+        )
+        bundle["single_stock_policy"] = policy.model_dump() if policy is not None else None
+        bundle["policy_metadata"] = policy_metadata
+        bundle["oof_score_col"] = "pred"
+        bundle["daily_score_col"] = "rank_score"
         result["artifact_path"] = save_model_artifacts(bundle, export_dir)
     return result
+
+
+# close-to-morning 품질 보고에서 항상 유한해야 하는 핵심 지표.
+_FINITE_QUALITY_METRICS: tuple[str, ...] = (
+    "top1_net_mean",
+    "win_rate",
+    "sharpe",
+    "active_trade_win_rate",
+    "close_to_morning_mdd",
+)
+
+
+def _validate_quality_metrics(feature_set: str, metrics: dict[str, Any]) -> None:
+    """보고 지표의 비유한 값은 fail-closed 로 거부합니다."""
+    for key in _FINITE_QUALITY_METRICS:
+        value = metrics[key]
+        if isinstance(value, float) and not np.isfinite(value):
+            raise ValueError(
+                f"non-finite close-to-morning metric {key}={value} for feature_set={feature_set}"
+            )
+
+
+def _quality_score(metrics: dict[str, Any]) -> dict[str, Any]:
+    """투명한 100점 품질 스코어 (구성 요소 공식 문서화).
+
+    - selection_edge: 30 * NDCG@1 / 0.55 (검증 champion 0.5032 → 약 27)
+    - net_economics:  20 * max(top1_net_mean, 0) / 0.015 (champion 1.54% → 약 20)
+    - risk_and_stability: 20 * (1 - close_to_morning_mdd) (champion 29.34% → 약 14)
+    - validation_independence: 8 (purged walk-forward OOF 확보, 피처 선택이
+      전체 이력 재사용 → post-freeze 기간 필요)
+    - daily_deployment_integrity: 정책 영속 시 4, 정책 부재 시 0
+    """
+    selection = min(30.0, 30.0 * metrics["oof_ndcg_1"] / 0.55)
+    net = min(20.0, 20.0 * max(metrics["top1_net_mean"], 0.0) / 0.015)
+    risk = 20.0 * max(0.0, 1.0 - metrics["close_to_morning_mdd"])
+    components = {
+        "selection_edge": round(selection, 1),
+        "net_economics": round(net, 1),
+        "risk_and_stability": round(risk, 1),
+        "validation_independence": 8.0,
+        "daily_deployment_integrity": 4.0 if metrics.get("policy_candidate") else 0.0,
+    }
+    return {
+        "components": components,
+        "total": round(sum(components.values())),
+    }
+
+
+def evaluate_close_morning_quality(
+    trade_log_df: pd.DataFrame,
+    theme_df: pd.DataFrame | None = None,
+    feature_sets: tuple[str, ...] = ("base40", "snapshot49", "close_morning61"),
+    panel_mode: str = "scenario_action",
+    n_splits: int = 5,
+    purge_gap: int = 1,
+) -> dict[str, Any]:
+    """feature_set 별 close-to-morning 품질을 동일 OOF 날짜에서 비교 보고합니다.
+
+    모든 피처셋은 같은 원천(``trade_log_df``)과 같은 purged walk-forward 분할을
+    사용하므로 OOF 날짜 집합이 동일합니다. 보고 지표는 decimal-net 단위의
+    close-to-morning 수익/승률/PF/Sharpe/복리 MDD, BUY/ABSTAIN 사유 분포,
+    active-trade·scheduled-date 수익, 그리고 100점 투명 스코어입니다. MDD 는
+    close-to-morning 전략 지표로 명명합니다 (entry-sequence 프록시 아님).
+
+    비유한(정의되지 않은) 핵심 지표는 ``ValueError`` 로 거부합니다.
+    """
+    report: dict[str, dict[str, Any]] = {}
+    for feature_set in feature_sets:
+        panel_x, _targets, cat_features, processed = build_ml_dataset(
+            trade_log_df, theme_df, feature_set=feature_set, panel_mode=panel_mode
+        )
+        feature_cols = [col for col in panel_x.columns if col not in cat_features]
+        target_col, group_col = "target_return", "trade_date"
+        result = run_model_pipeline(
+            processed,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=n_splits,
+            purge_gap=purge_gap,
+            model_type="lgb_regressor",
+        )
+        metrics = result["metrics"]
+        evaluation = result["single_stock_evaluation"]
+        entry: dict[str, Any] = {
+            "feature_set": feature_set,
+            "n_features": len(feature_cols),
+            "n_oof_dates": int(result["oof_df"][group_col].nunique()),
+            "oof_ndcg_1": float(metrics["ndcg_1"]),
+            "oof_rank_ic": float(metrics["rank_ic"]),
+        }
+        if evaluation is not None:
+            em = evaluation.metrics
+            entry.update(
+                {
+                    "top1_net_mean": float(em["scheduled_mean_return"]),
+                    "scheduled_mean_return": float(em["scheduled_mean_return"]),
+                    "active_trade_mean_return": float(em["active_trade_mean_return"]),
+                    "active_trade_win_rate": float(em["active_trade_win_rate"]),
+                    "win_rate": float(em["scheduled_win_rate"]),
+                    "profit_factor": float(em["profit_factor"]),
+                    "sharpe": float(em["scheduled_sharpe"]),
+                    "close_to_morning_mdd": _max_drawdown(evaluation.scheduled_returns),
+                    "n_buy": int(em["n_buy"]),
+                    "n_abstain": int(em["n_abstain"]),
+                    "reason_counts": dict(em["reason_counts"]),
+                    "policy_candidate": evaluation.selected_policy.candidate,
+                }
+            )
+        else:
+            entry.update(
+                {
+                    "top1_net_mean": float("nan"),
+                    "scheduled_mean_return": float("nan"),
+                    "active_trade_mean_return": float("nan"),
+                    "active_trade_win_rate": float("nan"),
+                    "win_rate": float("nan"),
+                    "profit_factor": float("nan"),
+                    "sharpe": float("nan"),
+                    "close_to_morning_mdd": float("nan"),
+                    "n_buy": 0,
+                    "n_abstain": int(result["oof_df"][group_col].nunique()),
+                    "reason_counts": {
+                        "missing_validated_policy": int(result["oof_df"][group_col].nunique())
+                    },
+                    "policy_candidate": None,
+                }
+            )
+        report[feature_set] = entry
+        _validate_quality_metrics(feature_set, entry)
+
+    return {
+        "feature_sets": list(feature_sets),
+        "panel_mode": panel_mode,
+        "report": report,
+        "quality_score": {
+            feature_set: _quality_score(report[feature_set]) for feature_set in feature_sets
+        },
+    }
