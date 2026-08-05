@@ -971,8 +971,9 @@ def test_ensure_valid_model_bundle_returns_real_bundle_unchanged() -> None:
         "quantile_models": "q",
         "calibrators": "c",
     }
-    with patch.object(
-        predict, "train_and_save_real_model_bundle", return_value=real
+    with patch(
+        "src.daily.model_bundle_service.train_and_save_real_model_bundle",
+        return_value=real,
     ) as retrain_mock:
         out = predict.ensure_valid_model_bundle(real)
     assert out is real
@@ -988,8 +989,9 @@ def test_ensure_valid_model_bundle_retrains_on_dummy_features() -> None:
         "quantile_models": 2,
         "calibrators": 3,
     }
-    with patch.object(
-        predict, "train_and_save_real_model_bundle", return_value=real
+    with patch(
+        "src.daily.model_bundle_service.train_and_save_real_model_bundle",
+        return_value=real,
     ) as retrain_mock:
         out = predict.ensure_valid_model_bundle(dummy)
     assert out is real
@@ -1005,8 +1007,9 @@ def test_ensure_valid_model_bundle_retrains_on_invalid_bundle() -> None:
         "quantile_models": 2,
         "calibrators": 3,
     }
-    with patch.object(
-        predict, "train_and_save_real_model_bundle", return_value=real
+    with patch(
+        "src.daily.model_bundle_service.train_and_save_real_model_bundle",
+        return_value=real,
     ) as retrain_mock:
         out = predict.ensure_valid_model_bundle(invalid)
     assert out is real
