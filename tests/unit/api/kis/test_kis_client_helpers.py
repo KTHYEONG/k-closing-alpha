@@ -1,7 +1,7 @@
 """Unit tests for KisApiClient OHLCV/volatility helper functions.
 
 Covers success and error paths of the moving-average and volatility helpers
-whose diagnostic logging was migrated from print() to logger.
+whose diagnostic logging was migrated from console output to logger.
 """
 
 from __future__ import annotations
