@@ -1,0 +1,95 @@
+{
+  "feature": "ml_ensemble_improvement",
+  "domain": "quant",
+  "target_file": "C:/KTHYEONG_github/k-closing-alpha/src/ml/training/experiments.py",
+  "symbol": "run_close_morning_algorithm_ensemble_experiment",
+  "signature": "def run_close_morning_algorithm_ensemble_experiment(df: pd.DataFrame, feature_cols: list[str], target_col: str, group_col: str, n_splits: int = 5, purge_gap: int = 1, probability_weight: float = 0.5, min_history_dates: int = _DEFAULT_MIN_HISTORY_DATES, build_research_bundle: bool = False) -> dict[str, Any]",
+  "python_assertion": "assert callable(run_close_morning_algorithm_ensemble_experiment)",
+  "requirements": [
+    "Use the existing PurgedGroupTimeSeriesSplit for every inner and outer split; train dates must precede validation dates and purge_gap must be retained unchanged.",
+    "Use the fixed base estimators lgb_regressor, xgb_regressor, catboost_regressor, and random_forest_regressor on the same numeric close_morning61 feature columns. Do not introduce categorical features in this experiment.",
+    "Convert each base prediction to a percentile rank within group_col before blending; never average raw prediction values from different estimator families.",
+    "Evaluate only the fixed recipes lgb_only, lgb_xgb_equal, lgb_catboost_equal, lgb_random_forest_equal, lgb_xgb_catboost_equal, and all_four_equal. Do not tune continuous ensemble weights.",
+    "For each outer fold, choose a recipe solely from that fold's inner OOF. A non-baseline recipe is eligible only when finite scheduled_mean_return is at least the lgb_only baseline and finite entry_sequence_drawdown is strictly lower; otherwise choose lgb_only.",
+    "Promotion is research-only and requires a non-baseline aggregate recipe, strictly higher finite scheduled mean than lgb_only, strictly lower finite compounded MDD, positive scheduled net mean, and profit factor above one. Failure returns promoted=False and no research bundle.",
+    "Raise ValueError for missing stock_code or chart_analysis, invalid probability_weight or min_history_dates, negative purge_gap, missing/non-finite base OOF predictions, mismatched OOF indices, invalid ensemble configuration, or simultaneous recency_ensemble_config and algorithm_ensemble_config.",
+    "Set random_state/random_seed=42, n_jobs/thread_count=1, CatBoost allow_writing_files=False, and use no row-wise DataFrame apply in scoring. The outer OOF and serving blend must be vectorized groupby rank operations.",
+    "Add xgboost and catboost as direct pyproject runtime dependencies because persisted research bundles must be loadable in a clean inference environment. RandomForestRegressor remains supplied by scikit-learn.",
+    "Do not change train_and_save_real_model_bundle defaults or replace the active production artifact. Only an explicit build_research_bundle=True call may return the versioned research bundle."
+  ],
+  "implementation_files": [
+    {
+      "target_file": "C:/KTHYEONG_github/k-closing-alpha/pyproject.toml",
+      "change": "Add xgboost>=2.1.0 and catboost>=1.2.0 to project.dependencies."
+    },
+    {
+      "target_file": "C:/KTHYEONG_github/k-closing-alpha/src/ml/training/validation.py",
+      "change": "Extend _MODEL_TYPES with xgb_regressor, catboost_regressor, and random_forest_regressor while keeping recency_half_life_groups valid only for lgb_regressor."
+    },
+    {
+      "target_file": "C:/KTHYEONG_github/k-closing-alpha/src/ml/training/fitting.py",
+      "change": "Add deterministic numeric-only fold estimators and a full-history return-estimator helper for the three challengers; each accepts sample_weight where its library supports it."
+    },
+    {
+      "target_file": "C:/KTHYEONG_github/k-closing-alpha/src/ml/training/experiments.py",
+      "change": "Implement nested algorithm-family OOF evaluation, deterministic fixed-recipe selection, promotion gate, report payload, and opt-in full-history research-bundle construction."
+    },
+    {
+      "target_file": "C:/KTHYEONG_github/k-closing-alpha/src/ml/sizing_engine.py",
+      "change": "Persist and serve algorithm_ensemble_models plus algorithm_ensemble_config, validating exact model keys and convex weights before groupwise percentile-rank blending."
+    },
+    {
+      "target_file": "C:/KTHYEONG_github/k-closing-alpha/src/ml/model_pipeline.py",
+      "change": "Re-export run_close_morning_algorithm_ensemble_experiment from the public ML facade."
+    },
+    {
+      "target_file": "C:/KTHYEONG_github/k-closing-alpha/tests/unit/ml/test_model_pipeline.py",
+      "change": "Add nested-causality, baseline fallback, deterministic-tie, and promotion-gate tests."
+    },
+    {
+      "target_file": "C:/KTHYEONG_github/k-closing-alpha/tests/unit/ml/test_sizing_engine.py",
+      "change": "Add algorithm bundle serving, malformed-config fail-closed, and mutual-exclusion-with-recency tests."
+    }
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "SCENARIO_ALGORITHM_ENSEMBLE_01",
+      "target_test_file": "C:/KTHYEONG_github/k-closing-alpha/tests/unit/ml/test_model_pipeline.py",
+      "expected_behavior": "Each outer fold records an inner-only selected recipe; altering an outer validation target cannot change that fold's chosen_recipe."
+    },
+    {
+      "scenario_id": "SCENARIO_ALGORITHM_ENSEMBLE_02",
+      "target_test_file": "C:/KTHYEONG_github/k-closing-alpha/tests/unit/ml/test_model_pipeline.py",
+      "expected_behavior": "When no fixed multi-model recipe meets inner mean-and-MDD eligibility, the fold selects lgb_only and the candidate outer return series equals the baseline series."
+    },
+    {
+      "scenario_id": "SCENARIO_ALGORITHM_ENSEMBLE_03",
+      "target_test_file": "C:/KTHYEONG_github/k-closing-alpha/tests/unit/ml/test_model_pipeline.py",
+      "expected_behavior": "A tied eligible recipe selection is deterministic: lower MDD, higher mean, fewer non-LightGBM experts, then lexical recipe id."
+    },
+    {
+      "scenario_id": "SCENARIO_ALGORITHM_ENSEMBLE_04",
+      "target_test_file": "C:/KTHYEONG_github/k-closing-alpha/tests/unit/ml/test_sizing_engine.py",
+      "expected_behavior": "A valid opt-in algorithm bundle produces rank_score from the configured convex blend of per-date percentile ranks; invalid weights, missing models, or a simultaneous recency config raise ValueError."
+    },
+    {
+      "scenario_id": "SCENARIO_ALGORITHM_ENSEMBLE_05",
+      "target_test_file": "C:/KTHYEONG_github/k-closing-alpha/tests/unit/ml/test_model_pipeline.py",
+      "expected_behavior": "build_research_bundle returns None unless the aggregate non-baseline candidate passes every promotion predicate; it never changes production defaults."
+    }
+  ],
+  "wiring": [
+    {
+      "caller_file": "C:/KTHYEONG_github/k-closing-alpha/src/ml/model_pipeline.py",
+      "anchor": "from src.ml.training.experiments import",
+      "import_symbol": "run_close_morning_recency_ensemble_experiment",
+      "invocation_expression": "run_close_morning_algorithm_ensemble_experiment"
+    },
+    {
+      "caller_file": "C:/KTHYEONG_github/k-closing-alpha/src/ml/sizing_engine.py",
+      "anchor": "def _predict_from_bundle(",
+      "import_symbol": "recency_ensemble_config",
+      "invocation_expression": "algorithm_ensemble_config"
+    }
+  ]
+}
