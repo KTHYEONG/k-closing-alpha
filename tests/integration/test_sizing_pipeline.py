@@ -30,6 +30,11 @@ def _make_dataset(n_groups: int = 15, rows_per_group: int = 8, seed: int = 19) -
     df["feature_a"] = rng.normal(size=len(df))
     df["feature_b"] = rng.normal(size=len(df))
     df["net_return"] = 0.02 * df["feature_a"] + rng.normal(scale=0.009, size=len(df))
+    df["selection_rank"] = df.groupby(GROUP_COL, sort=False).cumcount() + 1
+    df["decision_timestamp"] = df[GROUP_COL].map(
+        lambda d: pd.Timestamp(d, tz="Asia/Seoul").replace(hour=15, minute=30)
+    )
+    df["feature_available_timestamp"] = df["decision_timestamp"]
     return df
 
 
@@ -102,16 +107,20 @@ def test_ranker_and_sizing_pipelines_run_on_same_data() -> None:
 
 
 def test_sizing_pipeline_high_quality_signal_dominates_sizing() -> None:
-    """신호가 강하면(고 q50·p_good) Strong/Good 등급이 Pass 보다 높은 비중을 가져야 한다."""
+    """신호가 강하면(고 q50·p_good) Strong/Good 등급이 Pass 보다 높은 비중을 가져야 한다.
+
+    순차 fit/보정 구간 분할(chronological calibration) 후에도 fit 구간에서
+    신호가 분리될 수 있도록 충분한 날짜 수와 강한 신호를 사용합니다.
+    """
     rng = np.random.default_rng(7)
-    dates = pd.to_datetime([f"2024-04-{d:02d}" for d in range(1, 13)])
+    dates = pd.to_datetime([f"2024-04-{d:02d}" for d in range(1, 25)])
     rows: list[dict[str, object]] = []
     for date in dates:
-        rows.extend({"trade_date": date} for _ in range(10))
+        rows.extend({"trade_date": date} for _ in range(12))
     df = pd.DataFrame(rows)
     df["feature_a"] = rng.normal(size=len(df))
     df["feature_b"] = rng.normal(size=len(df))
-    df["net_return"] = 0.03 * df["feature_a"] + rng.normal(scale=0.006, size=len(df))
+    df["net_return"] = 0.04 * df["feature_a"] + rng.normal(scale=0.005, size=len(df))
 
     sizing_df = run_sizing_pipeline(
         df,

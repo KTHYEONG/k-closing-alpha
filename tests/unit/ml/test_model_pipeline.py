@@ -20,7 +20,11 @@ GROUP_COL = "trade_date"
 
 
 def _make_dataset(
-    n_groups: int = 12, rows_per_group: int = 6, seed: int = 7
+    n_groups: int = 12,
+    rows_per_group: int = 6,
+    seed: int = 7,
+    include_timestamps: bool = True,
+    violate_causality: bool = False,
 ) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     dates = pd.to_datetime([f"2024-03-{d:02d}" for d in range(1, n_groups + 1)])
@@ -30,7 +34,17 @@ def _make_dataset(
     df = pd.DataFrame(rows)
     df["feature_a"] = rng.normal(size=len(df))
     df["feature_b"] = rng.normal(size=len(df))
-    df["net_return"] = 2.0 * df["feature_a"] + rng.normal(scale=0.3, size=len(df))
+    df["net_return"] = 0.01 * df["feature_a"] + rng.normal(scale=0.004, size=len(df))
+    df["selection_rank"] = df.groupby(GROUP_COL, sort=False).cumcount() + 1
+    if include_timestamps:
+        df["decision_timestamp"] = df[GROUP_COL].map(
+            lambda d: pd.Timestamp(d, tz="Asia/Seoul").replace(hour=15, minute=30)
+        )
+        df["feature_available_timestamp"] = df["decision_timestamp"]
+        if violate_causality:
+            df.loc[df.index[0], "feature_available_timestamp"] = pd.Timestamp(
+                "2024-03-02 09:00:00", tz="Asia/Seoul"
+            )
     return df
 
 
@@ -38,6 +52,7 @@ def _make_dataset(
     "model_type", ["lgb_ranker", "lgb_regressor", "ridge"]
 )
 def test_run_model_pipeline_returns_contract_shapes(model_type: str) -> None:
+    """OOF 출력이 baseline 컬럼과 fold 출처를 보존해 동일 날짜 비교를 지원합니다."""
     df = _make_dataset()
     result = run_model_pipeline(
         df,
@@ -56,10 +71,52 @@ def test_run_model_pipeline_returns_contract_shapes(model_type: str) -> None:
     assert 0 < len(oof) <= len(df)
     assert oof.index.is_unique
     assert set(oof.index) <= set(df.index)
-    assert {"pred", "relevance", GROUP_COL, TARGET_COL} <= set(oof.columns)
+    assert {"pred", "relevance", "selection_rank", "pred_linear", "fold", GROUP_COL, TARGET_COL} <= set(
+        oof.columns
+    )
 
     assert result["oof_df"] is oof
     assert len(result["trained_models"]) == 3
+    assert result["return_unit"] == "decimal_net"
+    assert "feature_manifest" in result
+    assert "training_cutoff" in result
+    assert result["policy_params"]["purge_gap"] == 1
+    assert result["backtest_eval"]["baseline_metrics"]["selection_rank"] is not None
+    assert "linear" in result["backtest_eval"]["baseline_metrics"]
+
+
+def test_run_model_pipeline_rejects_missing_timestamps() -> None:
+    df = _make_dataset(include_timestamps=False)
+    with pytest.raises(ValueError, match="timestamp column"):
+        run_model_pipeline(
+            df,
+            feature_cols=FEATURE_COLS,
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+        )
+
+
+def test_run_model_pipeline_rejects_naive_timestamps() -> None:
+    df = _make_dataset()
+    df["decision_timestamp"] = df["decision_timestamp"].dt.tz_localize(None)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        run_model_pipeline(
+            df,
+            feature_cols=FEATURE_COLS,
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+        )
+
+
+def test_run_model_pipeline_rejects_non_causal_rows() -> None:
+    df = _make_dataset(violate_causality=True)
+    with pytest.raises(ValueError, match="non-causal"):
+        run_model_pipeline(
+            df,
+            feature_cols=FEATURE_COLS,
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+        )
 
 
 @pytest.mark.parametrize(
@@ -161,3 +218,10 @@ def test_run_sizing_pipeline_exports_model_bundle(tmp_path) -> None:
     assert os.path.exists(result["artifact_path"])
     loaded = load_model_artifacts(str(tmp_path))
     assert set(loaded["feature_cols"]) == set(FEATURE_COLS)
+    assert loaded["return_unit"] == "decimal_net"
+    assert loaded["round_trip_cost"] == 0.002
+    assert loaded["label_thresholds"] == {"target_good": 0.01, "target_bad": -0.02}
+    assert "feature_manifest" in loaded
+    assert "training_cutoff" in loaded
+    assert "calibration_diagnostics" in loaded
+    assert "policy_params" in loaded
