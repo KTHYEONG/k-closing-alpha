@@ -952,7 +952,9 @@ def main() -> None:
 
     # 4. Mypy
     if not args.skip_mypy:
-        mypy_res = run_cmd(["uv", "run", "mypy", *py_files, "--ignore-missing-imports"])
+        # Windows uv shims can fail to canonicalize the generated mypy script;
+        # invoke the active interpreter to keep the same environment.
+        mypy_res = run_cmd([sys.executable, "-m", "mypy", *py_files, "--ignore-missing-imports"])
         if mypy_res.returncode != 0:
             out = (mypy_res.stdout or mypy_res.stderr).strip()
             # Slice error output to max 10 lines for token efficiency
@@ -975,7 +977,7 @@ def main() -> None:
     cov_args = ["--cov=src"]
 
     deselect_args = [f"--deselect={node}" for node in args.deselect]
-    core_cmd = ["uv", "run", "pytest", *cov_args, *test_files, *deselect_args, "-q", "--tb=line", "--cov-report=term-missing"]
+    core_cmd = [sys.executable, "-m", "pytest", *cov_args, *test_files, *deselect_args, "-q", "--tb=line", "--cov-report=term-missing"]
     # The growth evaluator's sealed integration fixtures exercise real rolling
     # windows and reliability gates.  Package-wide coverage tracing can exceed
     # the former three-minute limit even when the test command itself passes.
