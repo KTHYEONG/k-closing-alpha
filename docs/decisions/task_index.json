@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_RISK_AWARE_RERANKER_V2",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_RISK_AWARE_RERANKER_V2",
+      "domain": "ml",
+      "title": "ML risk-aware reranker v2 nested OOF evaluation",
+      "why": "The v1 reranker improved return and Sharpe but left close-to-morning MDD unchanged; an existing calibrated p_bad estimate required a causal downside-risk experiment.",
+      "resolution": "Implemented p_bad-aware decision scoring with a bounded {0, 0.5, 1.0} penalty grid, nested purged outer/inner walk-forward selection through 2025-12-30, and recorded the real-data v7 result. The penalty was rejected because outer OOF scheduled mean fell from 1.5316% to 1.4726% while MDD stayed 33.94%; v1 remains active and no production bundle was changed.",
+      "impact": "Registers the rejected v2 ablation and preserves v1 as the production research candidate; future promotion still requires lower MDD without lower scheduled mean plus untouched paper/live validation under the 0.20% cost contract."
+    },
+    {
       "task_id": "TASK_ML_CLOSE_MORNING_RERANKER_V1",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_ML_CLOSE_MORNING_RERANKER_V1",

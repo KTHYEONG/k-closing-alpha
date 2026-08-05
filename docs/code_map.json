@@ -60,7 +60,11 @@
     "architecture": "docs/results/ml-v6.md"
   },
   "src/ml/backtest_evaluator.py": {
-    "testing": "tests/unit/ml/test_backtest_evaluator.py"
+    "testing": [
+      "tests/unit/ml/test_backtest_evaluator.py",
+      "tests/unit/ml/test_sizing_engine.py"
+    ],
+    "architecture": "docs/results/ml-v7.md"
   },
   "src/ml/sizing_engine.py": {
     "testing": "tests/unit/ml/test_sizing_engine.py"
