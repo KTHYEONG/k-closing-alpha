@@ -24,7 +24,11 @@
   },
   "src/data/sync_sheet_db.py": {},
   "src/processing/preprocessor.py": {
-    "testing": "tests/test_preprocessor.py"
+    "testing": [
+      "tests/test_preprocessor.py",
+      "tests/unit/processing/test_preprocessor.py"
+    ],
+    "architecture": "docs/results/ml-v3.md"
   },
   "src/processing/legacy_mapping.py": {
     "testing": "tests/test_preprocessor.py"
@@ -52,13 +56,19 @@
     "testing": "tests/unit/test_display.py"
   },
   "src/ml/model_pipeline.py": {
-    "testing": "tests/unit/ml/test_model_pipeline.py"
+    "testing": "tests/unit/ml/test_model_pipeline.py",
+    "architecture": "docs/results/ml-v6.md"
   },
   "src/ml/backtest_evaluator.py": {
-    "testing": "tests/unit/ml/test_backtest_evaluator.py"
+    "testing": [
+      "tests/unit/ml/test_backtest_evaluator.py",
+      "tests/unit/ml/test_sizing_engine.py"
+    ],
+    "architecture": "docs/results/ml-v7.md"
   },
   "src/ml/sizing_engine.py": {
-    "testing": "tests/unit/ml/test_sizing_engine.py"
+    "testing": "tests/unit/ml/test_sizing_engine.py",
+    "architecture": "docs/results/ml-v8.md"
   },
   "src/config/base.py": {
     "testing": "tests/unit/config/test_base.py"
@@ -78,5 +88,12 @@
   },
   "src/processing/schema.py": {
     "testing": "tests/unit/processing/test_schema.py"
+  },
+  "src/ml/scenario_action_panel.py": {
+    "architecture": "docs/results/ml-v2.md",
+    "testing": "tests/unit/ml/test_scenario_action_panel.py"
+  },
+  "src/ml/single_stock_policy.py": {
+    "testing": "tests/unit/ml/test_single_stock_policy.py"
   }
 }
