@@ -87,5 +87,8 @@
   "src/ml/scenario_action_panel.py": {
     "architecture": "docs/results/ml-v2.md",
     "testing": "tests/unit/ml/test_scenario_action_panel.py"
+  },
+  "src/ml/single_stock_policy.py": {
+    "testing": "tests/unit/ml/test_single_stock_policy.py"
   }
 }
