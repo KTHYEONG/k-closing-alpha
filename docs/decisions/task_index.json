@@ -1,6 +1,96 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_RECENCY_ADAPTIVE_ENSEMBLE",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_RECENCY_ADAPTIVE_ENSEMBLE",
+      "domain": "ml",
+      "title": "ML recency-adaptive dual-horizon ensemble",
+      "why": "The p_bad reranker v2 lowered scheduled return without reducing MDD, indicating that post-prediction risk penalties were not fixing the expanding-history return model's regime sensitivity.",
+      "resolution": "Implemented fold-local exponential recency weighting for 252/504 trade-date half-lives, a percentile-ranked expanding/recent return ensemble, nested inner/outer purged selection, and opt-in research bundle serving. ML v8 through 2025-12-30 passed the nested OOF gate: scheduled mean 1.5316% to 1.5933%, PF 2.74 to 2.87, Sharpe 6.04 to 6.31, and MDD 33.94% to 25.87%.",
+      "impact": "Registers the strongest structural ML candidate to date while keeping production promotion blocked on capture-time provenance, execution slippage, and untouched paper/live OOS validation. The v1 default remains unchanged until those gates pass."
+    },
+    {
+      "task_id": "TASK_ML_RISK_AWARE_RERANKER_V2",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_RISK_AWARE_RERANKER_V2",
+      "domain": "ml",
+      "title": "ML risk-aware reranker v2 nested OOF evaluation",
+      "why": "The v1 reranker improved return and Sharpe but left close-to-morning MDD unchanged; an existing calibrated p_bad estimate required a causal downside-risk experiment.",
+      "resolution": "Implemented p_bad-aware decision scoring with a bounded {0, 0.5, 1.0} penalty grid, nested purged outer/inner walk-forward selection through 2025-12-30, and recorded the real-data v7 result. The penalty was rejected because outer OOF scheduled mean fell from 1.5316% to 1.4726% while MDD stayed 33.94%; v1 remains active and no production bundle was changed.",
+      "impact": "Registers the rejected v2 ablation and preserves v1 as the production research candidate; future promotion still requires lower MDD without lower scheduled mean plus untouched paper/live validation under the 0.20% cost contract."
+    },
+    {
+      "task_id": "TASK_ML_CLOSE_MORNING_RERANKER_V1",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_CLOSE_MORNING_RERANKER_V1",
+      "domain": "ml",
+      "title": "Sync close-to-morning risk reranker implementation and results",
+      "why": "The reranker implementation has been validated on the full real-data pipeline and its metrics, serving contract, and policy mapping must be registered.",
+      "resolution": "Recorded the 5-fold OOF reranker comparison and bundle contract in docs/results/ml-v6.md; registered the task and refreshed the code map; cleaned completed temporary specs and scratch artifacts.",
+      "impact": "The current close-to-morning candidate is reproducibly documented with decision_score semantics, 1-stock-per-day behavior, and explicit research-only promotion gates."
+    },
+    {
+      "task_id": "TASK_ML_CLOSE_MORNING_V5",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_CLOSE_MORNING_V5",
+      "domain": "ml",
+      "title": "Record latest close-to-morning ML pipeline results",
+      "why": "The latest full real-data pipeline execution must be reproducible and documented after the close-to-morning policy implementation.",
+      "resolution": "Recorded the base40, snapshot49, and close_morning61 OOF comparison, single-stock policy counts, close-to-morning risk metrics, quality score, and persisted bundle fields in docs/results/ml-v5.md.",
+      "impact": "Provides the current evidence for production-readiness decisions while retaining the explicit research-only promotion gate."
+    },
+    {
+      "task_id": "TASK_ML_SINGLE_STOCK_ABSTENTION",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_SINGLE_STOCK_ABSTENTION",
+      "domain": "ml",
+      "title": "Single-stock daily BUY/ABSTAIN policy",
+      "why": "The ML strategy targets one new stock per day, but the prior sizing/display path exposed multiple candidates and did not make abstention causal.",
+      "resolution": "Added causal OOF single-stock policy calibration, deterministic scenario-action resolution, exactly-one BUY or explicit ABSTAIN decisions, and entry-sequence-only evaluation until an exit ledger exists. The OOF comparison selected always_buy_top1; margin abstention candidates were retained for diagnostics because they reduced scheduled-date return.",
+      "impact": "Daily inference now has a single-stock decision contract; model reports distinguish active-trade returns from scheduled-date returns and do not claim portfolio MDD without exit data."
+    },
+    {
+      "task_id": "TASK_ML_V3_CALENDAR_FLOW_FEATURES",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_V3_CALENDAR_FLOW_FEATURES",
+      "domain": "ml",
+      "title": "ML v3 calendar and flow feature evaluation",
+      "why": "The implemented weekday and order-flow feature candidate required a reproducible OOF comparison against base40 before promotion.",
+      "resolution": "Ran identical 5-fold purge-1 scenario_action LightGBM Huber evaluations through 2025-12-30, recorded detailed metrics in docs/results/ml-v3.md, and retained production_calendar_flow as an explicit research candidate because primary returns and Sharpe did not improve.",
+      "impact": "production_calendar_flow achieved 1.1097% Top-1 net return, 4.369 Sharpe, and 40.46% MDD versus base40 at 1.1393%, 4.473, and 40.23%; it is not promoted. Task and code-map registries are synchronized."
+    },
+    {
+      "task_id": "TASK_ML_V2_SCENARIO_ACTION_PANEL",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_V2_SCENARIO_ACTION_PANEL",
+      "domain": "general",
+      "title": "ML v2 scenario action panel rerun",
+      "why": "동일 날짜·종목의 상따 및 다른 시나리오 중복을 임의 병합하지 않고, 최신 시나리오 행동 패널 구현의 ML 성능과 정책 결과를 2025년까지 재평가해야 했다.",
+      "resolution": "scenario_action 패널로 snapshot49 LightGBM Regressor를 5-fold purge1 OOF 재실행하고, 충돌 동일 행동키는 reject, 다중 시나리오는 exclude_multi_scenario로 보수적 종목 패널을 구성했다. 최신 결과를 docs/results/ml-v2.md에 기록했다.",
+      "impact": "2017–2025 OOF Top-1 +1.457%, Sharpe 5.67, MDD 40.72%를 확인했으며 날짜·종목 유일 정책에서도 +1.449%가 유지됐다. 2026년은 제외했고 실제 캡처 시각·독립 OOS·체결비용이 없어 실전 승격은 보류한다."
+    },
+    {
+      "task_id": "TASK_ML_INTERNAL_PANEL_ENHANCEMENT",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_INTERNAL_PANEL_ENHANCEMENT",
+      "domain": "ml",
+      "title": "Internal candidate-panel ML enhancement",
+      "why": "시간/provenance 검증을 과도하게 적용해 15:20 스프레드시트 스냅샷 피처를 제외했고, 실제 후보 패널의 시나리오·보유 정책을 분리할 필요가 있었다.",
+      "resolution": "base40/snapshot49/interaction53 feature-set을 추가하고 snapshot49 LGBMRegressor를 champion 경로로 연결했으며, return_model·종목코드 기반 policy simulator·내부 OOF 비교를 추가했다. 2017–2025 재학습에서 snapshot49가 base40보다 Top-1과 Sharpe를 개선했지만, 날짜-종목 중복으로 실제 보유 정책은 보류했다.",
+      "impact": "내부 후보 패널만으로 모델 선별력을 비교할 수 있고 2026을 평가에서 제외한다. 실제 운용 전 216개 날짜-종목 중복의 시나리오 결합 규칙이 필요하다."
+    },
+    {
+      "task_id": "TASK_ML_STRATEGY_IMPROVEMENT",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_STRATEGY_IMPROVEMENT",
+      "domain": "ml",
+      "title": "Point-in-Time ML Strategy Re-evaluation",
+      "why": "Re-evaluate the ML strategy through 2025 after correcting return units, baseline attribution, calibration, and timestamp-contract risks.",
+      "resolution": "Implemented decimal-net targets, causal feature manifest checks, chronological calibration diagnostics, retained selection-rank and Ridge baselines, fixed real-data NaN handling for Ridge, and reran OOF comparison through 2025; documented the result and deferred production promotion pending real capture timestamps.",
+      "impact": "2017-2025 OOF Regressor achieved +1.074% Top-1 net return and Sharpe 4.27 versus +0.479% and 2.10 for selection rank, but synthetic timestamps, 38.84% maximum drawdown, and 100% Top-1 turnover keep the research score at 60/100."
+    },
+    {
       "task_id": "sangdda_scenario_prediction",
       "date": "2026-08-04",
       "adr_id": "ADR_20260804_sangdda_scenario_prediction",

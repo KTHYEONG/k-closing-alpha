@@ -69,9 +69,18 @@ def _fail_exit(phase: str, msg: str, diag: JsonDiag) -> None:
     sys.exit(1)
 
 
+def _is_test_file(path: str) -> bool:
+    """A file is a test file if it lives under tests/ or its basename starts with test_.
+
+    Substring matching (``"test_" in path``) would misclassify source files such as
+    ``src/ml/backtest_evaluator.py`` whose name contains ``test_`` mid-word.
+    """
+    return path.startswith("tests/") or path.rsplit("/", 1)[-1].startswith("test_")
+
+
 def _find_test_files(py_files: list[str]) -> list[str]:
-    test_files = [f for f in py_files if f.startswith("tests/") or "test_" in f]
-    source_files = [f for f in py_files if not (f.startswith("tests/") or "test_" in f)]
+    test_files = [f for f in py_files if _is_test_file(f)]
+    source_files = [f for f in py_files if not _is_test_file(f)]
     repository_files = _repository_test_files()
     for sf in source_files:
         if sf.startswith("src/") and not sf.endswith("__init__.py"):
@@ -171,7 +180,7 @@ def _source_has_matching_test(source_file: str, test_files: list[str]) -> bool:
 def _get_source_files(py_files: list[str]) -> list[str]:
     return [
         f for f in py_files
-        if not (f.startswith("tests/") or f.startswith("scripts/") or "test_" in f)
+        if not _is_test_file(f)
     ]
 
 
