@@ -59,8 +59,8 @@ def calculate_utility_score(
     df: pd.DataFrame,
     lambda_risk: float = 0.5,
     gamma_uncertainty: float = 0.1,
-    w_good: float = 0.01,
-    w_bad: float = 0.01,
+    w_good: float = 0.0,
+    w_bad: float = 0.0,
     round_trip_cost: float = ROUND_TRIP_COST_RATIO,
 ) -> pd.Series:
     """하방위험/불확실성 패널티가 적용된 종합 Utility Score 를 산출합니다.
@@ -287,6 +287,11 @@ def _train_inline_bundle(
     ranker = LGBMRanker(objective="lambdarank", random_state=42, verbosity=-1)
     ranker.fit(train[feature_cols], relevance, group=group_counts)
 
+    # 회귀 champion: expected-return LGBMRegressor(Huber). 당일 rank_score 는
+    # 이 기대수익 예측으로 생성되어 OOF champion 과 운영 점수가 일치합니다.
+    return_model = LGBMRegressor(objective="huber", random_state=42, verbosity=-1)
+    return_model.fit(train[feature_cols], y)
+
     quantile_models: dict[str, Any] = {}
     for col, alpha in zip(_QUANTILE_COLS, _QUANTILE_ALPHAS, strict=True):
         model = LGBMRegressor(objective="quantile", alpha=alpha, random_state=42, verbosity=-1)
@@ -307,7 +312,7 @@ def _train_inline_bundle(
     policy_params: dict[str, Any] = {
         "grade_multipliers": dict(_GRADE_MULTIPLIERS),
         "grade_percentiles": {"strong": _STRONG_PCT, "good": _GOOD_PCT, "weak": _WEAK_PCT},
-        "utility_weights": {"lambda_risk": 0.5, "gamma_uncertainty": 0.1, "w_good": 0.01, "w_bad": 0.01},
+        "utility_weights": {"lambda_risk": 0.5, "gamma_uncertainty": 0.1, "w_good": 0.0, "w_bad": 0.0},
         "round_trip_cost": ROUND_TRIP_COST_RATIO,
         "realized_vol_default": _DEFAULT_REALIZED_VOL,
     }
@@ -324,6 +329,7 @@ def _train_inline_bundle(
         "calibration_diagnostics": list(calibration_diagnostics or []),
         "policy_params": policy_params,
         "rank_model": ranker,
+        "return_model": return_model,
         "quantile_models": quantile_models,
         "calibrators": calibrators,
     }
@@ -338,9 +344,15 @@ def _predict_from_bundle(
     features = df[feature_cols]
     out = df.copy()
 
-    rank_model = models_bundle.get("rank_model")
-    if rank_model is not None:
-        out["rank_score"] = rank_model.predict(features)
+    # rank_score 는 회귀 champion(return_model) 의 기대수익 예측으로 생성하며,
+    # return_model 이 없는 기존 번들은 rank_model 로 폴백합니다.
+    return_model = models_bundle.get("return_model")
+    if return_model is not None:
+        out["rank_score"] = return_model.predict(features)
+    else:
+        rank_model = models_bundle.get("rank_model")
+        if rank_model is not None:
+            out["rank_score"] = rank_model.predict(features)
 
     quantile_models = models_bundle["quantile_models"]
     for col in _QUANTILE_COLS:

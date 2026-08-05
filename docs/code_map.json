@@ -24,7 +24,11 @@
   },
   "src/data/sync_sheet_db.py": {},
   "src/processing/preprocessor.py": {
-    "testing": "tests/test_preprocessor.py"
+    "testing": [
+      "tests/test_preprocessor.py",
+      "tests/unit/processing/test_preprocessor.py"
+    ],
+    "architecture": "docs/results/ml-internal-rerun-2026-08-05.md"
   },
   "src/processing/legacy_mapping.py": {
     "testing": "tests/test_preprocessor.py"
@@ -79,5 +83,9 @@
   },
   "src/processing/schema.py": {
     "testing": "tests/unit/processing/test_schema.py"
+  },
+  "src/ml/scenario_action_panel.py": {
+    "architecture": "docs/results/ml-v2.md",
+    "testing": "tests/unit/ml/test_scenario_action_panel.py"
   }
 }

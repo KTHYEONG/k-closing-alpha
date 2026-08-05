@@ -660,7 +660,7 @@ def test_ensure_valid_model_bundle_retrains_on_invalid_bundle() -> None:
 
 
 def test_train_and_save_real_model_bundle_trains_numeric_features(tmp_path) -> None:
-    """trade_log.parquet 실데이터로 학습한 번들은 범주형 컬럼을 제외한 수치 피처를 선언합니다."""
+    """trade_log.parquet 실데이터로 학습한 snapshot49 번들은 수치 피처와 return_model 을 포함합니다."""
     raw = _realistic_trade_log_df()
     trade_log_path = tmp_path / "trade_log.parquet"
     raw.to_parquet(trade_log_path)
@@ -677,6 +677,20 @@ def test_train_and_save_real_model_bundle_trains_numeric_features(tmp_path) -> N
     )
     assert bundle["feature_cols"]
     assert "quantile_models" in bundle
+    # P0: snapshot49 9개 피처가 승격되어 수치 피처에 포함되고 회귀 champion 이 저장됩니다.
+    promoted = {
+        "close_position",
+        "body_ratio",
+        "upper_shadow_ratio",
+        "intraday_range",
+        "buy_price_change_rate",
+        "gap_ratio",
+        "relative_change_rate",
+        "buy_price_change_rate_z",
+        "gap_ratio_z",
+    }
+    assert promoted.issubset(bundle["feature_cols"])
+    assert "return_model" in bundle
     assert (export_dir / "sizing_pipeline_bundle.joblib").exists()
 
 
