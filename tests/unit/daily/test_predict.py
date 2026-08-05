@@ -8,6 +8,7 @@ SCENARIO_MODEL_PIPELINE_TRAIN_EVAL 의 wiring 단계가 일일 예측 진입점�
 from __future__ import annotations
 
 import json
+import os
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -385,6 +386,87 @@ def test_apply_standard_feature_engineering_preserves_display_metadata() -> None
     assert out["selection_rank"].tolist() == [1, 2]
 
 
+def _daily_snapshot_from_raw(
+    raw: pd.DataFrame, trade_date: pd.Timestamp
+) -> pd.DataFrame:
+    """원본 매매일지의 특정 거래일 행을 당일 일일 CSV 스프레드시트 포맷으로 변환합니다."""
+    last = raw[raw["매수날짜"] == trade_date].copy()
+    return pd.DataFrame(
+        {
+            "시나리오": last["(차트분석)"].astype(str),
+            "종목명": [f"종목{i}" for i in range(len(last))],
+            "종목코드": last["종목코드"].astype(str).str.zfill(6),
+            "시가": last["(시가)"],
+            "고가": last["(고가)"],
+            "저가": last["(저가)"],
+            "종가": last["(종가)"],
+            "전일종가": last["(전일종가)"],
+            "시가총액": last["(시가총액, 억)"],
+            "거래대금": last["(거래대금, 억)"],
+            "등락률": last["(등락률)"],
+            "선정순위": last["(선정 순위)"],
+            "기관_순매수": last["(기관_순매수)"],
+            "외국인_순매수": last["(외국인_순매수)"],
+            "프로그램_순매수": last["(프로그램_순매수)"],
+            "체결강도": last["(체결강도)"],
+            "시장구분": last["(시장구분)"],
+            "총_종목수": last["(총 종목 수)"],
+            "평균_거래대금": last["(평균 거래대금)"],
+            "kospi": last["(kospi, %)"],
+            "kosdaq": last["(kosdaq, %)"],
+            "v_kospi": last["v_kospi"],
+            "v_kosdaq": last["v_kosdaq"],
+            "거래량": last["(거래량)"],
+            "테마_섹터": last["(테마/섹터)"],
+            "차트분석": last["(차트분석)"],
+            "매수날짜": trade_date,
+        }
+    )
+
+
+def test_apply_standard_feature_engineering_maps_production_calendar_flow() -> None:
+    """당일 추론이 학습과 동일한 명시적 스냅샷 날짜에서 후보 피처를 생성합니다.
+
+    호스트 클럭에 의존하지 않도록 ``trade_date`` 를 명시적으로 공급하며,
+    학습 ``processed`` 의 마지막 거래일(Friday) 후보 피처와 정확히 일치합니다.
+    """
+    raw = _realistic_trade_log_df(n_dates=6, n_candidates=15)
+    _, _, _, processed = predict.build_ml_dataset(
+        raw, None, feature_set="production_calendar_flow", panel_mode="scenario_action"
+    )
+    last_date = processed["trade_date"].max()
+    assert last_date.day_name() == "Friday"
+
+    snapshot = _daily_snapshot_from_raw(raw, last_date)
+    out = predict.apply_standard_feature_engineering(snapshot)
+
+    nine = [
+        "weekday_is_monday",
+        "weekday_is_tuesday",
+        "weekday_is_wednesday",
+        "weekday_is_thursday",
+        "weekday_is_friday",
+        "flow_consensus",
+        "flow_alignment_direction",
+        "flow_turnover",
+        "friday_selection_rank_pct",
+    ]
+    assert set(nine).issubset(out.columns)
+    train_rows = processed.loc[processed["trade_date"] == last_date, nine]
+    pd.testing.assert_frame_equal(
+        out.loc[:, nine].reset_index(drop=True),
+        train_rows.reset_index(drop=True),
+    )
+    # 금요일이므로 weekday_is_friday=1, 금요일 랭킹 상호작용은 1 - rank_ratio 입니다.
+    assert (out["weekday_is_friday"] == 1.0).all()
+    assert (out["weekday_is_monday"] == 0.0).all()
+    expected = (1 - out["rank_ratio"]).round(12).reset_index(drop=True).rename(
+        "friday_selection_rank_pct"
+    )
+    actual = out["friday_selection_rank_pct"].round(12).reset_index(drop=True)
+    pd.testing.assert_series_equal(actual, expected)
+
+
 def test_build_result_rows_uses_standard_columns() -> None:
     sizing_df = pd.DataFrame(
         {
@@ -659,8 +741,21 @@ def test_ensure_valid_model_bundle_retrains_on_invalid_bundle() -> None:
     retrain_mock.assert_called_once_with()
 
 
+def test_candidate_export_dir_versions_candidate_and_keeps_active_root() -> None:
+    """후보 피처셋은 cutoff 로 버전화된 하위 경로, 그 외 feature_set 은 루트 경로를 반환합니다."""
+    bundle = {"training_cutoff": "2026-06-05 00:00:00"}
+    candidate = predict._candidate_export_dir(
+        "artifacts/models", "production_calendar_flow", bundle
+    )
+    assert candidate == os.path.join(
+        "artifacts/models", "production_calendar_flow_2026-06-05"
+    )
+    active = predict._candidate_export_dir("artifacts/models", "snapshot49", bundle)
+    assert active == "artifacts/models"
+
+
 def test_train_and_save_real_model_bundle_trains_numeric_features(tmp_path) -> None:
-    """trade_log.parquet 실데이터로 학습한 snapshot49 번들은 수치 피처와 return_model 을 포함합니다."""
+    """후보 번들은 scenario_action + production_calendar_flow 를 사용하고 활성 아티팩트를 덮어쓰지 않습니다."""
     raw = _realistic_trade_log_df()
     trade_log_path = tmp_path / "trade_log.parquet"
     raw.to_parquet(trade_log_path)
@@ -677,21 +772,35 @@ def test_train_and_save_real_model_bundle_trains_numeric_features(tmp_path) -> N
     )
     assert bundle["feature_cols"]
     assert "quantile_models" in bundle
-    # P0: snapshot49 9개 피처가 승격되어 수치 피처에 포함되고 회귀 champion 이 저장됩니다.
-    promoted = {
-        "close_position",
-        "body_ratio",
-        "upper_shadow_ratio",
-        "intraday_range",
-        "buy_price_change_rate",
-        "gap_ratio",
-        "relative_change_rate",
-        "buy_price_change_rate_z",
-        "gap_ratio_z",
-    }
-    assert promoted.issubset(bundle["feature_cols"])
     assert "return_model" in bundle
-    assert (export_dir / "sizing_pipeline_bundle.joblib").exists()
+    # 후보 메타데이터가 번들에 영속화됩니다.
+    assert bundle["feature_set"] == "production_calendar_flow"
+    assert bundle["panel_mode"] == "scenario_action"
+    # 9개 캘린더/수급 후보 피처가 수치 피처에 포함되고 캔들/실현 매수가 파생은 없습니다.
+    nine = {
+        "weekday_is_monday",
+        "weekday_is_tuesday",
+        "weekday_is_wednesday",
+        "weekday_is_thursday",
+        "weekday_is_friday",
+        "flow_consensus",
+        "flow_alignment_direction",
+        "flow_turnover",
+        "friday_selection_rank_pct",
+    }
+    assert nine.issubset(bundle["feature_cols"])
+    assert not {"close_position", "buy_price_change_rate", "gap_ratio"}.intersection(
+        bundle["feature_cols"]
+    )
+    # feature_manifest 가 영속화되고 후보 피처는 모두 at_decision_time 입니다.
+    manifest = bundle["feature_manifest"]
+    assert set(manifest["feature_name"]) == set(bundle["feature_cols"])
+    rules = dict(zip(manifest["feature_name"], manifest["availability_rule"], strict=True))
+    assert all(rules[name] == "at_decision_time" for name in nine)
+    # 후보는 훈련 cutoff 로 버전화된 하위 디렉터리에 저장되어 활성 아티팩트를 덮어쓰지 않습니다.
+    candidate_dir = export_dir / f"production_calendar_flow_{bundle['training_cutoff'][:10]}"
+    assert (candidate_dir / "sizing_pipeline_bundle.joblib").exists()
+    assert not (export_dir / "sizing_pipeline_bundle.joblib").exists()
 
 
 def test_train_inline_bundle_excludes_categorical_features() -> None:

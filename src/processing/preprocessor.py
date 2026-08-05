@@ -37,7 +37,14 @@ DECISION_TIMESTAMP_COL = "decision_timestamp"
 FEATURE_AVAILABLE_TIMESTAMP_COL = "feature_available_timestamp"
 
 # 허용되는 내부 피처셋: base40 → snapshot49 → interaction53 순으로만 승격합니다.
-_ALLOWED_FEATURE_SETS: tuple[str, ...] = ("base40", "snapshot49", "interaction53")
+# production_calendar_flow 는 승격 체인에 속하지 않는 별도의 연구 후보 피처셋으로,
+# 명시적으로 요청할 때만 활성화됩니다.
+_ALLOWED_FEATURE_SETS: tuple[str, ...] = (
+    "base40",
+    "snapshot49",
+    "interaction53",
+    "production_calendar_flow",
+)
 
 # 허용되는 패널 모드:
 # - raw_rows: 원천 행을 그대로 유지 (기존 동작, 하위 호환).
@@ -65,6 +72,31 @@ _INTERACTION53_FEATURES: tuple[str, ...] = (
     "range_efficiency",
     "flow_turnover",
     "relative_flow_strength",
+)
+
+# production_calendar_flow: 캘린더/수급 흐름 연구 후보 피처 9종.
+# 15:20 KST 고정 스냅샷이 생성한 값만 사용하며, 캔들/실현 매수가 파생 피처는 없습니다.
+_WEEKDAY_INDICATOR_FEATURES: tuple[str, ...] = (
+    "weekday_is_monday",
+    "weekday_is_tuesday",
+    "weekday_is_wednesday",
+    "weekday_is_thursday",
+    "weekday_is_friday",
+)
+
+# flow_consensus / flow_alignment_direction 의 원천이 되는 단일 소스 밀도 컬럼.
+_PRODUCTION_FLOW_SOURCE_COLUMNS: tuple[str, ...] = (
+    "inst_density",
+    "foreign_density",
+    "prog_dominance",
+)
+
+_PRODUCTION_CALENDAR_FLOW_FEATURES: tuple[str, ...] = (
+    *_WEEKDAY_INDICATOR_FEATURES,
+    "flow_consensus",
+    "flow_alignment_direction",
+    "flow_turnover",
+    "friday_selection_rank_pct",
 )
 
 
@@ -167,6 +199,16 @@ _EXCLUDED_FROM_X: set[str] = {
     "range_efficiency",
     "flow_turnover",
     "relative_flow_strength",
+    # production_calendar_flow 연구 후보 피처는 명시적 feature_set 에서만 X 에
+    # 포함되고 base40/snapshot49/interaction53 X 에서는 제외됩니다.
+    "weekday_is_monday",
+    "weekday_is_tuesday",
+    "weekday_is_wednesday",
+    "weekday_is_thursday",
+    "weekday_is_friday",
+    "flow_consensus",
+    "flow_alignment_direction",
+    "friday_selection_rank_pct",
     # 원본 금액/거래량 컬럼 (log_ 접두사 파생 컬럼만 학습 피처로 사용)
     "market_cap_100m",
     "trade_value_100m",
@@ -304,6 +346,33 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
             df["major_density_pct_rank"] * df["change_rate_pct_rank"]
         ).clip(0, 1)
 
+    # production_calendar_flow: 캘린더/수급 흐름 연구 후보 피처.
+    # 모두 스냅샷 결정 시점 값의 벡터 연산이며, 행 단위 apply / 미래 행 보간은
+    # 허용되지 않습니다. 이용 불가능한 수급은 0 으로 간주해 시그널을 만들지 않습니다.
+    trade_date = pd.to_datetime(df["trade_date"])
+    weekday_index = trade_date.dt.dayofweek
+    for offset, name in enumerate(_WEEKDAY_INDICATOR_FEATURES):
+        df[name] = (weekday_index == offset).astype("float64")
+
+    flow_matrix = np.column_stack(
+        [
+            df[name].fillna(0).to_numpy()
+            if name in df.columns
+            else np.zeros(len(df))
+            for name in _PRODUCTION_FLOW_SOURCE_COLUMNS
+        ]
+    )
+    df["flow_consensus"] = np.sign(flow_matrix).sum(axis=1).astype("float64")
+    abs_flow = np.abs(flow_matrix).sum(axis=1)
+    # 분모(절대 흐름 합)가 0 인 행은 방향 정렬 0.0 으로 처리합니다.
+    df["flow_alignment_direction"] = np.divide(
+        flow_matrix.sum(axis=1),
+        abs_flow,
+        out=np.zeros(len(df)),
+        where=abs_flow != 0,
+    )
+    df["friday_selection_rank_pct"] = df["weekday_is_friday"] * (1 - df["rank_ratio"])
+
     df = df.replace([np.inf, -np.inf], np.nan)
     return df
 
@@ -371,9 +440,11 @@ def build_ml_dataset(
 ) -> tuple[pd.DataFrame, dict[str, pd.Series], list[str], pd.DataFrame]:
     """매매일지 원본 데이터를 정제하여 (X, targets, cat_features, processed_df)를 반환합니다.
 
-    ``feature_set`` 은 ``base40`` / ``snapshot49`` / ``interaction53`` 만 허용하며,
-    기본값 ``base40`` 은 기존 conservative 피처집합과 호환됩니다. 시간 컬럼은
-    검증·합성·검사하지 않습니다 (고정된 업무 원천 규칙).
+    ``feature_set`` 은 ``base40`` / ``snapshot49`` / ``interaction53`` /
+    ``production_calendar_flow`` 만 허용하며, 기본값 ``base40`` 은 기존
+    conservative 피처집합과 호환됩니다. ``production_calendar_flow`` 는 명시적으로
+    요청할 때만 9개 캘린더/수급 후보 피처를 X 에 포함하는 연구 후보 피처셋입니다.
+    시간 컬럼은 검증·합성·검사하지 않습니다 (고정된 업무 원천 규칙).
 
     ``panel_mode`` 는 ``raw_rows``(기본, 원천 행 유지) 또는 ``scenario_action``
     만 허용합니다. ``scenario_action`` 은 clean → 행동 패널 정규화 → 피처/타깃
@@ -428,6 +499,10 @@ def build_ml_dataset(
         feature_cols.extend(col for col in _SNAPSHOT49_FEATURES if col in df.columns)
     if feature_set == "interaction53":
         feature_cols.extend(col for col in _INTERACTION53_FEATURES if col in df.columns)
+    if feature_set == "production_calendar_flow":
+        feature_cols.extend(
+            col for col in _PRODUCTION_CALENDAR_FLOW_FEATURES if col in df.columns
+        )
     if panel_mode == "scenario_action":
         # chart_analysis 원문은 감사용 메타데이터이며, LightGBM 입력에는 고정
         # one-hot 수치 피처(SCENARIO_ONE_HOT_FEATURES)를 사용합니다.

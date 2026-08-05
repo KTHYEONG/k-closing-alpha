@@ -67,9 +67,27 @@ _LOG_AMOUNT_FEATURES: frozenset[str] = frozenset(
 
 _INDEX_LEVEL_FEATURES: frozenset[str] = frozenset({"v_kospi", "v_kosdaq"})
 
+# production_calendar_flow 후보: 요일 one-hot 지표.
+_BINARY_INDICATOR_FEATURES: frozenset[str] = frozenset(
+    {
+        "weekday_is_monday",
+        "weekday_is_tuesday",
+        "weekday_is_wednesday",
+        "weekday_is_thursday",
+        "weekday_is_friday",
+    }
+)
+
+# production_calendar_flow 후보: 부호 합산 개수.
+_SIGNED_COUNT_FEATURES: frozenset[str] = frozenset({"flow_consensus"})
+
 
 def _feature_unit(feature: str) -> str:
     """피처 이름으로부터 결정적 단위 라벨을 반환합니다."""
+    if feature in _BINARY_INDICATOR_FEATURES:
+        return "binary_indicator"
+    if feature in _SIGNED_COUNT_FEATURES:
+        return "signed_count"
     if feature.endswith("_z"):
         return "robust_z"
     if feature.endswith("_pct_rank"):

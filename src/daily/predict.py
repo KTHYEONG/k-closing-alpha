@@ -316,6 +316,25 @@ def run_daily_sizing_inference(
 _DUMMY_FEATURE_PATTERN = re.compile(r"^f\d+$")
 _MODEL_BUNDLE_KEYS = ("rank_model", "quantile_models", "calibrators")
 
+# research 후보 피처셋: 활성 아티팩트와 분리된 버전화 하위 디렉터리에 저장합니다.
+_CANDIDATE_FEATURE_SET = "production_calendar_flow"
+
+
+def _candidate_export_dir(
+    export_dir: str, feature_set: str, bundle: dict[str, Any]
+) -> str:
+    """후보 피처셋 번들은 버전화된 하위 디렉터리에 저장할 경로를 반환합니다.
+
+    활성 아티팩트는 ``export_dir`` 루트의 ``sizing_pipeline_bundle.joblib`` 이므로,
+    후보(``production_calendar_flow``)는 훈련 데이터 cutoff 날짜(YYYY-MM-DD)로
+    버전화된 별도 디렉터리에 기록해 활성 아티팩트를 덮어쓰지 않습니다.
+    다른 feature_set(활성 아티팩트 재학습)은 기존대로 루트 경로를 반환합니다.
+    """
+    if feature_set != _CANDIDATE_FEATURE_SET:
+        return export_dir
+    version = str(bundle.get("training_cutoff", ""))[:10] or "candidate"
+    return os.path.join(export_dir, f"{_CANDIDATE_FEATURE_SET}_{version}")
+
 
 def _is_dummy_feature_cols(feature_cols: list[str]) -> bool:
     """더미 테스트 피처(예: ['f1', 'f2', 'f3']) 여부를 결정적으로 판별합니다."""
@@ -339,8 +358,17 @@ def train_and_save_real_model_bundle(
     export_dir: str = "artifacts/models",
     trade_log_path: str | os.PathLike[str] | None = None,
     theme_path: str | os.PathLike[str] | None = None,
+    feature_set: str = "production_calendar_flow",
+    panel_mode: str = "scenario_action",
 ) -> dict[str, Any]:
     """``trade_log.parquet`` 실데이터로 표준 ML 번들을 학습·저장한 뒤 반환합니다.
+
+    기본값은 평가된 연구 후보 패널과 동일한 ``production_calendar_flow`` 피처셋
+    + ``scenario_action`` 패널 모드입니다. 후보 번들은 활성 아티팩트를 덮어쓰지
+    않도록 훈련 cutoff 로 버전화된 하위 디렉터리에 저장되고, ``feature_set`` /
+    ``panel_mode`` / ``feature_manifest`` 메타데이터를 영속화합니다. 승격
+    게이트(독립 holdout + paper-trading) 통과 전까지 활성 아티팩트를 대체하지
+    않습니다.
 
     ``build_ml_dataset`` 산출 feature_cols 에서 범주형 문자열 컬럼
     (``market_type``, ``theme_sector``, ``chart_analysis``)을 제외한 수치
@@ -351,7 +379,7 @@ def train_and_save_real_model_bundle(
     trade_log_df = pd.read_parquet(trade_log_path)
     theme_df = pd.read_parquet(theme_path) if os.path.exists(theme_path) else None
     X, targets, cat_features, processed = build_ml_dataset(
-        trade_log_df, theme_df, feature_set='snapshot49'
+        trade_log_df, theme_df, feature_set=feature_set, panel_mode=panel_mode
     )
     feature_cols = [col for col in X.columns if col not in cat_features]
     target_col = "target_return"
@@ -362,10 +390,14 @@ def train_and_save_real_model_bundle(
         target_col,
         group_col,
     )
-    save_model_artifacts(bundle, export_dir)
+    bundle["feature_set"] = feature_set
+    bundle["panel_mode"] = panel_mode
+    save_dir = _candidate_export_dir(export_dir, feature_set, bundle)
+    save_model_artifacts(bundle, save_dir)
     logger.info(
         f"{Colors.GREEN}실데이터 모델 번들 재학습·저장 완료: "
-        f"feature_cols={len(feature_cols)}개 (export_dir={export_dir}){Colors.RESET}"
+        f"feature_set={feature_set} panel_mode={panel_mode} "
+        f"feature_cols={len(feature_cols)}개 (save_dir={save_dir}){Colors.RESET}"
     )
     return bundle
 
