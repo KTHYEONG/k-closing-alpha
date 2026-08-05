@@ -28,8 +28,9 @@ def test_build_feature_manifest_classifies_availability_rule() -> None:
         ["close_position", "buy_price_change_rate", "change_rate", "major_density"]
     )
     rules = dict(zip(manifest["feature_name"], manifest["availability_rule"], strict=True))
-    assert rules["close_position"] == "needs_snapshot_proof"
-    assert rules["buy_price_change_rate"] == "needs_snapshot_proof"
+    # 공통 15:20 KST 소스 스냅샷이 수용 계약이므로 모든 피처가 at_decision_time 입니다.
+    assert rules["close_position"] == "at_decision_time"
+    assert rules["buy_price_change_rate"] == "at_decision_time"
     assert rules["change_rate"] == "at_decision_time"
     assert rules["major_density"] == "at_decision_time"
 

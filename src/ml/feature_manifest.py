@@ -1,16 +1,15 @@
 """Decision-time feature manifest: source, availability rule, unit, panel scope.
 
-`docs/specs/ml_strategy_improvement.md` P0 요구사항: 선정된 모든 피처는 decision
-timestamp 보다 늦지 않게 이용 가능해야 하고, 피처 단위와 이용 가능성 규칙이 모델
-번들에 영속화되어야 합니다. 매니페스트는 피처 이름으로부터만 결정적으로 유도되며
-데이터 의존성이 없습니다.
+`docs/specs/ml_close_to_morning_quality.md` 계약: 모든 피처는 15:20 KST 공통
+소스 스냅샷의 availability 메타데이터로 기록됩니다. 피처 단위와 이용 가능성
+규칙이 모델 번들에 영속화되며, 피처 이름으로부터만 결정적으로 유도됩니다
+(데이터 의존성 없음). 행 단위 타임스탬프 검증/타임스탬프 파생 규칙은 사용하지
+않습니다 — 고정된 업무 원천 규칙입니다.
 
 Availability rule:
-    ``at_decision_time``  -> decision 시점에 이용 가능한 피처 (횡단면 순위, 수급
-                             밀도, 시장 컨텍스트 등).
-    ``needs_snapshot_proof`` -> close/high/low 또는 실현 매수 가격 파생 피처. 스냅샷이
-                             주문 전에 캡처됨이 증명될 때까지 프로덕션 피처 집합에서
-                             제외 대상입니다.
+    ``at_decision_time``  -> 수용된 공통 15:20 KST 소스 스냅샷에서 decision 시점에
+                             이용 가능한 피처 (횡단면 순위, 수급 밀도, 시장 컨텍스트,
+                             캔들/실현 매수가 파생 피처 포함).
 """
 
 from __future__ import annotations
@@ -23,27 +22,6 @@ FEATURE_MANIFEST_COLUMNS: tuple[str, ...] = (
     "availability_rule",
     "unit",
     "panel_scope",
-)
-
-# close/high/low/실현 매수가 파생 피처: 주문 시점 이용 가능성이 아직 증명되지 않음.
-_CANDLE_PRICE_DERIVED: frozenset[str] = frozenset(
-    {
-        "close_position",
-        "body_ratio",
-        "upper_shadow_ratio",
-        "intraday_range",
-        "intraday_return",
-        "buy_price_change_rate",
-        "gap_ratio",
-        "relative_change_rate",
-        "open_price",
-        "high_price",
-        "low_price",
-        "close_price",
-        "prev_close_price",
-        "buy_price",
-        "sell_price",
-    }
 )
 
 _PERCENT_FEATURES: frozenset[str] = frozenset(
@@ -114,16 +92,14 @@ def build_feature_manifest(feature_cols: list[str]) -> pd.DataFrame:
     """
     if isinstance(feature_cols, str):
         raise TypeError("feature_cols must be a list of feature names, not a string")
-    rows: list[dict[str, str]] = []
-    for feature in feature_cols:
-        rule = "needs_snapshot_proof" if feature in _CANDLE_PRICE_DERIVED else "at_decision_time"
-        rows.append(
-            {
-                "feature_name": feature,
-                "source_column": feature,
-                "availability_rule": rule,
-                "unit": _feature_unit(feature),
-                "panel_scope": "candidate_panel",
-            }
-        )
+    rows = [
+        {
+            "feature_name": feature,
+            "source_column": feature,
+            "availability_rule": "at_decision_time",
+            "unit": _feature_unit(feature),
+            "panel_scope": "candidate_panel",
+        }
+        for feature in feature_cols
+    ]
     return pd.DataFrame(rows, columns=list(FEATURE_MANIFEST_COLUMNS))

@@ -14,6 +14,7 @@ import pytest
 from src.processing.preprocessor import (
     _ROBUST_Z_COLUMNS,
     _apply_robust_z,
+    _validate_close_morning61_feature,
     build_ml_dataset,
     clean_column_names,
     create_multi_targets,
@@ -193,9 +194,7 @@ def test_build_ml_dataset_attaches_feature_manifest() -> None:
         "panel_scope",
     }
     assert set(manifest["feature_name"]) == set(X.columns)
-    assert manifest["availability_rule"].isin(
-        ["at_decision_time", "needs_snapshot_proof"]
-    ).all()
+    assert (manifest["availability_rule"] == "at_decision_time").all()
 
 
 def test_production_feature_set_excludes_candle_price_derived_features() -> None:
@@ -301,6 +300,65 @@ def test_production_calendar_flow_feature_set_adds_nine_features() -> None:
         "relative_change_rate",
     }
     assert not candle_derived.intersection(X_pcf.columns)
+
+
+def test_close_morning61_feature_set_is_snapshot49_plus_relative_flow_strength() -> None:
+    """close_morning61 은 snapshot49 전체 + relative_flow_strength 정확히 1개입니다.
+
+    rejected 상호작용(range_efficiency/flow_turnover), 캘린더 흐름, 타깃, 매도가,
+    행 단위 타임스탬프는 X 에 포함되지 않습니다.
+    """
+    X_snap, _, _, _ = build_ml_dataset(_build_raw_df(), feature_set="snapshot49")
+    X_cm, _, _, processed = build_ml_dataset(_build_raw_df(), feature_set="close_morning61")
+    assert processed.attrs["feature_set"] == "close_morning61"
+    assert X_cm.attrs["feature_set"] == "close_morning61"
+    assert set(X_cm.columns) == set(X_snap.columns) | {"relative_flow_strength"}
+    assert "relative_flow_strength" in X_cm.columns
+    assert not {"range_efficiency", "flow_turnover"}.intersection(X_cm.columns)
+    assert not _PRODUCTION_CALENDAR_FLOW_NINE.intersection(X_cm.columns)
+    assert not {"sell_price", "net_return"}.intersection(X_cm.columns)
+    assert not {"decision_timestamp", "feature_available_timestamp"}.intersection(
+        X_cm.columns
+    )
+    assert X_cm["relative_flow_strength"].between(0.0, 1.0).all()
+
+
+def test_relative_flow_strength_deterministic_and_bounded() -> None:
+    """relative_flow_strength 는 결정적이며 [0, 1] 로 유한하게 묶입니다."""
+    _, _, _, first = build_ml_dataset(_build_raw_df(), feature_set="close_morning61")
+    _, _, _, second = build_ml_dataset(_build_raw_df(), feature_set="close_morning61")
+    pd.testing.assert_series_equal(
+        first["relative_flow_strength"], second["relative_flow_strength"]
+    )
+    rfs = first["relative_flow_strength"]
+    assert rfs.notna().all()
+    assert rfs.between(0.0, 1.0).all()
+
+
+def test_close_morning61_fails_closed_on_missing_required_source() -> None:
+    """champion 피처셋의 필수 원천(등락률)이 없으면 ValueError 로 fail-closed 합니다."""
+    df = _build_raw_df().drop(columns=["(등락률)"])
+    with pytest.raises(ValueError, match="relative_flow_strength"):
+        build_ml_dataset(df, feature_set="close_morning61")
+
+
+def test_validate_close_morning61_feature_fails_closed() -> None:
+    """유효성 검증 헬퍼는 피처 부재와 비유한/범위 밖 값을 각각 ValueError 로 거부합니다."""
+    with pytest.raises(ValueError, match="relative_flow_strength"):
+        _validate_close_morning61_feature(
+            pd.DataFrame({"change_rate": [1.0]})
+        )
+    out_of_bounds = pd.DataFrame({"relative_flow_strength": [1.5]})
+    with pytest.raises(ValueError, match="finite within \\[0, 1\\]"):
+        _validate_close_morning61_feature(out_of_bounds)
+    non_finite = pd.DataFrame({"relative_flow_strength": [np.inf]})
+    with pytest.raises(ValueError, match="finite within \\[0, 1\\]"):
+        _validate_close_morning61_feature(non_finite)
+
+
+def test_validate_close_morning61_feature_accepts_bounded_feature() -> None:
+    """유한하고 [0, 1] 범위의 피처는 통과합니다."""
+    _validate_close_morning61_feature(pd.DataFrame({"relative_flow_strength": [0.0, 0.5, 1.0]}))
 
 
 def test_build_ml_dataset_rejects_unknown_feature_set() -> None:

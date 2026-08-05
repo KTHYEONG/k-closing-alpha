@@ -6,12 +6,17 @@ SCENARIO_MODEL_PIPELINE_TRAIN_EVAL
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.ml.model_pipeline import run_model_pipeline, run_sizing_pipeline
+from src.ml.model_pipeline import (
+    evaluate_close_morning_quality,
+    run_model_pipeline,
+    run_sizing_pipeline,
+)
 from src.ml.sizing_engine import load_model_artifacts
 
 FEATURE_COLS = ["feature_a", "feature_b"]
@@ -180,6 +185,33 @@ def test_run_model_pipeline_calibrates_single_stock_policy_on_scenario_panel() -
     assert evaluation is not None
     assert len(evaluation.decisions) == len(result["oof_predictions"][GROUP_COL].unique())
 
+    # 번들 준비 메타데이터: pred→rank_score 매핑과 보정 cutoff 를 명시 기록합니다.
+    metadata = result["policy_metadata"]
+    assert metadata is not None
+    assert metadata["oof_score_col"] == "pred"
+    assert metadata["daily_score_col"] == "rank_score"
+    assert metadata["calibration_cutoff"] == str(policy.calibration_cutoff)
+    assert metadata["policy_version"] == policy.version
+    assert metadata["policy_id"] == policy.policy_id
+    assert metadata["candidate"] == policy.candidate
+    assert "scheduled_mean_return" in metadata["policy_metrics"]
+
+
+def test_run_model_pipeline_policy_metadata_none_without_identity_columns() -> None:
+    """stock_code/chart_analysis 가 없으면 정책 메타데이터는 None (명시 ABSTAIN)."""
+    df = _make_dataset()
+    result = run_model_pipeline(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+        model_type="lgb_regressor",
+    )
+    assert result["single_stock_policy"] is None
+    assert result["policy_metadata"] is None
+
 
 def test_run_model_pipeline_passes_model_params_to_requested_model() -> None:
     """model_params 는 요청된 모델에만 전달되고 random_state=42 가 유지됩니다."""
@@ -330,3 +362,156 @@ def test_run_sizing_pipeline_exports_model_bundle(tmp_path) -> None:
     assert "training_cutoff" in loaded
     assert "calibration_diagnostics" in loaded
     assert "policy_params" in loaded
+
+
+def test_run_sizing_pipeline_export_persists_single_stock_policy(tmp_path) -> None:
+    """export_dir 훈련 모드는 시나리오 패널이 있으면 정책을 번들에 영속화합니다."""
+    df = _make_dataset(n_groups=8, rows_per_group=6, seed=3)
+    df["stock_code"] = [f"{i % 6 + 1:06d}" for i in range(len(df))]
+    df["chart_analysis"] = ["거래량 폭증"] * len(df)
+    result = run_sizing_pipeline(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+        export_dir=str(tmp_path),
+    )
+    loaded = load_model_artifacts(str(tmp_path))
+    assert loaded["single_stock_policy"] is not None
+    assert loaded["policy_metadata"]["oof_score_col"] == "pred"
+    assert loaded["policy_metadata"]["daily_score_col"] == "rank_score"
+    assert loaded["oof_score_col"] == "pred"
+    assert loaded["daily_score_col"] == "rank_score"
+
+
+def _report_raw_df(n_dates: int = 4, n_candidates: int = 8, seed: int = 5) -> pd.DataFrame:
+    """close-morning 품질 보고 테스트용 원본 매매일지(스프레드시트 헤더)."""
+    rng = np.random.default_rng(seed)
+    rows: list[dict[str, object]] = []
+    for d_idx in range(n_dates):
+        date = pd.Timestamp(f"2024-0{1 + d_idx}-{5 + d_idx:02d}")
+        for c in range(n_candidates):
+            prev = 10_000.0 + rng.normal(0, 500)
+            open_p = prev * (1 + rng.normal(0, 0.01))
+            close = prev * (1 + rng.normal(0, 0.02))
+            rows.append(
+                {
+                    "매수날짜": date,
+                    "종목코드": f"{c + 1:06d}",
+                    "(시가)": open_p,
+                    "(고가)": max(open_p, close) * (1 + abs(rng.normal(0, 0.01))),
+                    "(저가)": min(open_p, close) * (1 - abs(rng.normal(0, 0.01))),
+                    "(종가)": close,
+                    "(전일종가)": prev,
+                    "(시가총액, 억)": rng.uniform(300, 3_000),
+                    "(거래대금, 억)": rng.uniform(50, 800),
+                    "(등락률)": rng.normal(2, 8),
+                    "(선정 순위)": float(c + 1),
+                    "(기관_순매수)": rng.normal(0, 1e8),
+                    "(외국인_순매수)": rng.normal(0, 1e8),
+                    "(프로그램_순매수)": rng.normal(0, 5e7),
+                    "(체결강도)": rng.uniform(80, 200),
+                    "(시장구분)": "KOSPI" if c % 2 == 0 else "KOSDAQ",
+                    "(총 종목 수)": float(n_candidates),
+                    "(평균 거래대금)": rng.uniform(50, 800),
+                    "(kospi, %)": rng.normal(0, 1),
+                    "(kosdaq, %)": rng.normal(0, 1),
+                    "v_kospi": rng.uniform(12, 25),
+                    "v_kosdaq": rng.uniform(12, 25),
+                    "(거래량)": rng.uniform(1e5, 5e6),
+                    "(테마/섹터)": rng.choice(["테마A", "테마B", "테마C"]),
+                    "(차트분석)": rng.choice(["거래량 폭증", "신고가 근접", "상한가 다음날"]),
+                    "(매수 가격)": prev * 1.01,
+                    "(매도 가격)": prev * 1.03,
+                    "(수익률, %)": rng.normal(1.0, 4.0),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _fake_quality_pipeline_result(scheduled_mean: float) -> dict[str, Any]:
+    """evaluate_close_morning_quality 단위 테스트용 run_model_pipeline 페이크 결과."""
+    from types import SimpleNamespace
+
+    evaluation = SimpleNamespace(
+        metrics={
+            "scheduled_mean_return": scheduled_mean,
+            "scheduled_win_rate": 0.5,
+            "profit_factor": 2.0,
+            "scheduled_sharpe": 3.0,
+            "active_trade_mean_return": scheduled_mean,
+            "active_trade_win_rate": 0.5,
+            "n_buy": 100,
+            "n_abstain": 20,
+            "reason_counts": {"top1_buy": 100, "insufficient_policy_history": 20},
+        },
+        scheduled_returns=np.array([0.01, -0.005, 0.02, 0.0, 0.01]),
+        selected_policy=SimpleNamespace(candidate="always_buy_top1"),
+    )
+    return {
+        "metrics": {"ndcg_1": 0.5, "rank_ic": 0.1},
+        "oof_df": pd.DataFrame({"trade_date": [pd.Timestamp("2024-01-05")] * 5}),
+        "single_stock_evaluation": evaluation,
+    }
+
+
+def test_evaluate_close_morning_quality_reports_close_to_morning_metrics() -> None:
+    """보고서가 동일 OOF 날짜에서 피처셋 비교와 100점 스코어를 반환합니다.
+
+    MDD 는 close-to-morning 전략 지표로 명명되며 entry-sequence 프록시가
+    아닙니다. 모든 지표는 decimal-net 단위입니다.
+    """
+    from unittest.mock import patch
+
+    raw = _report_raw_df()
+    fake = _fake_quality_pipeline_result(scheduled_mean=0.015)
+    with patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake):
+        report = evaluate_close_morning_quality(raw, n_splits=2, purge_gap=1)
+
+    assert set(report["feature_sets"]) == {"base40", "snapshot49", "close_morning61"}
+    entry = report["report"]["close_morning61"]
+    assert "close_to_morning_mdd" in entry
+    assert "entry_sequence_drawdown" not in entry
+    assert entry["top1_net_mean"] == pytest.approx(0.015)
+    assert entry["scheduled_mean_return"] == pytest.approx(0.015)
+    assert entry["reason_counts"]["top1_buy"] == 100
+    assert 0 <= entry["n_buy"] <= entry["n_buy"] + entry["n_abstain"]
+
+    score = report["quality_score"]["close_morning61"]
+    assert 0 <= score["total"] <= 100
+    assert set(score["components"]) == {
+        "selection_edge",
+        "net_economics",
+        "risk_and_stability",
+        "validation_independence",
+        "daily_deployment_integrity",
+    }
+
+
+def test_evaluate_close_morning_quality_rejects_non_finite_metrics() -> None:
+    """비유한 지표(예: scheduled_mean_return=NaN)는 ValueError 로 fail-closed 합니다."""
+    from unittest.mock import patch
+
+    raw = _report_raw_df()
+    fake = _fake_quality_pipeline_result(scheduled_mean=float("nan"))
+    with (
+        patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake),
+        pytest.raises(ValueError, match="non-finite"),
+    ):
+        evaluate_close_morning_quality(raw, n_splits=2, purge_gap=1)
+
+
+def test_evaluate_close_morning_quality_missing_policy_rejects() -> None:
+    """정책 미보정 상태(식별 컬럼 부재)는 ABSTAIN 메타데이터와 함께 거부됩니다."""
+    from unittest.mock import patch
+
+    raw = _report_raw_df()
+    fake = _fake_quality_pipeline_result(scheduled_mean=0.015)
+    fake["single_stock_evaluation"] = None
+    with (
+        patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake),
+        pytest.raises(ValueError, match="non-finite"),
+    ):
+        evaluate_close_morning_quality(raw, n_splits=2, purge_gap=1)
