@@ -13,6 +13,9 @@ import pandas as pd
 import pytest
 
 from src.ml.model_pipeline import (
+    _align_close_morning_oof,
+    _calibrate_close_morning_decision_oof,
+    _calibrate_oof_policy,
     evaluate_close_morning_quality,
     run_model_pipeline,
     run_sizing_pipeline,
@@ -211,6 +214,186 @@ def test_run_model_pipeline_policy_metadata_none_without_identity_columns() -> N
     )
     assert result["single_stock_policy"] is None
     assert result["policy_metadata"] is None
+
+
+def _aligned_return_oof() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            GROUP_COL: ["2024-03-01", "2024-03-01"],
+            TARGET_COL: [0.01, 0.02],
+            "pred": [0.005, 0.01],
+            "stock_code": ["000001", "000002"],
+            "chart_analysis": ["상따", "신고가"],
+        },
+        index=[5, 7],
+    )
+
+
+def _aligned_risk_oof(extra_row: bool = True) -> pd.DataFrame:
+    index = [5, 7] if not extra_row else [5, 7, 9]
+    rows = {
+        GROUP_COL: ["2024-03-01", "2024-03-01"],
+        TARGET_COL: [0.01, 0.02],
+        "p_good": [0.6, 0.4],
+        "stock_code": ["000001", "000002"],
+        "chart_analysis": ["상따", "신고가"],
+    }
+    if extra_row:
+        rows[GROUP_COL].append("2024-03-02")
+        rows[TARGET_COL].append(0.03)
+        rows["p_good"].append(0.7)
+        rows["stock_code"].append("000003")
+        rows["chart_analysis"].append("거래량 폭증")
+    return pd.DataFrame(rows, index=index)
+
+
+def test_align_close_morning_oof_aligns_on_original_index() -> None:
+    """return OOF 와 risk OOF 는 날짜가 아닌 원본 행 인덱스로 정렬됩니다."""
+    aligned = _align_close_morning_oof(
+        _aligned_return_oof(), _aligned_risk_oof(), target_col=TARGET_COL, group_col=GROUP_COL
+    )
+    assert aligned.index.tolist() == [5, 7]
+    assert {"pred", "p_good", GROUP_COL, TARGET_COL, "stock_code", "chart_analysis"} <= set(
+        aligned.columns
+    )
+    np.testing.assert_allclose(aligned["pred"].to_numpy(), [0.005, 0.01])
+    np.testing.assert_allclose(aligned["p_good"].to_numpy(), [0.6, 0.4])
+
+
+def test_align_close_morning_oof_rejects_missing_index() -> None:
+    """return 예측 인덱스가 risk OOF 에 없으면 fail-closed 합니다 (누락 대체 금지)."""
+    risk = _aligned_risk_oof(extra_row=False).drop(index=[7])
+    with pytest.raises(ValueError, match="missing from quantile/classifier OOF"):
+        _align_close_morning_oof(
+            _aligned_return_oof(), risk, target_col=TARGET_COL, group_col=GROUP_COL
+        )
+
+
+def test_align_close_morning_oof_rejects_group_mismatch() -> None:
+    """같은 인덱스에서 trade_date 가 어긋나면 날짜 단독 병합을 금지합니다."""
+    risk = _aligned_risk_oof()
+    risk.loc[5, GROUP_COL] = "2024-03-02"
+    with pytest.raises(ValueError, match="trade_date mismatch"):
+        _align_close_morning_oof(
+            _aligned_return_oof(), risk, target_col=TARGET_COL, group_col=GROUP_COL
+        )
+
+
+def test_align_close_morning_oof_rejects_target_return_mismatch() -> None:
+    """같은 인덱스에서 타깃 수익률이 어긋나면 fail-closed 합니다."""
+    risk = _aligned_risk_oof()
+    risk.loc[7, TARGET_COL] = 0.99
+    with pytest.raises(ValueError, match="net_return mismatch"):
+        _align_close_morning_oof(
+            _aligned_return_oof(), risk, target_col=TARGET_COL, group_col=GROUP_COL
+        )
+
+
+def test_align_close_morning_oof_rejects_stock_code_mismatch() -> None:
+    """같은 인덱스에서 stock_code 가 어긋나면 fail-closed 합니다."""
+    risk = _aligned_risk_oof()
+    risk.loc[7, "stock_code"] = "000099"
+    with pytest.raises(ValueError, match="stock_code mismatch"):
+        _align_close_morning_oof(
+            _aligned_return_oof(), risk, target_col=TARGET_COL, group_col=GROUP_COL
+        )
+
+
+def test_align_close_morning_oof_rejects_chart_analysis_mismatch() -> None:
+    """같은 인덱스에서 chart_analysis 가 어긋나면 fail-closed 합니다."""
+    risk = _aligned_risk_oof()
+    risk.loc[5, "chart_analysis"] = "상한가 다음날"
+    with pytest.raises(ValueError, match="chart_analysis mismatch"):
+        _align_close_morning_oof(
+            _aligned_return_oof(), risk, target_col=TARGET_COL, group_col=GROUP_COL
+        )
+
+
+def test_align_close_morning_oof_rejects_missing_p_good() -> None:
+    """정렬 결과에 누락 p_good 가 있으면 대체하지 않고 거부합니다."""
+    risk = _aligned_risk_oof()
+    risk.loc[7, "p_good"] = float("nan")
+    with pytest.raises(ValueError, match="p_good predictions are missing"):
+        _align_close_morning_oof(
+            _aligned_return_oof(), risk, target_col=TARGET_COL, group_col=GROUP_COL
+        )
+
+
+def test_align_close_morning_oof_skips_checks_when_columns_absent() -> None:
+    """risk OOF 에 타깃/식별 컬럼이 없으면 해당 정렬 검증을 건너뜁니다 (p_good 필수만)."""
+    risk = pd.DataFrame(
+        {
+            GROUP_COL: ["2024-03-01", "2024-03-01"],
+            "p_good": [0.6, 0.4],
+        },
+        index=[5, 7],
+    )
+    aligned = _align_close_morning_oof(
+        _aligned_return_oof(), risk, target_col=TARGET_COL, group_col=GROUP_COL
+    )
+    assert {"pred", "p_good", "stock_code", "chart_analysis"} <= set(aligned.columns)
+    assert aligned["p_good"].notna().all()
+
+
+def test_calibrate_close_morning_decision_oof_uses_decision_score_end_to_end() -> None:
+    """reranker OOF 보정은 decision_score 를 스코어로 사용하고 정책/메타데이터에
+    decision_score 매핑을 기록합니다."""
+    df = _make_dataset(n_groups=10, rows_per_group=5, seed=13)
+    df["stock_code"] = [f"{i % 5 + 1:06d}" for i in range(len(df))]
+    df["chart_analysis"] = ["거래량 폭증", "신고가", "상따", "120 돌파", "신고가 근접"] * (
+        len(df) // 5
+    )
+    df["market_type"] = ["KOSPI" if i % 2 == 0 else "KOSDAQ" for i in range(len(df))]
+    policy, evaluation, metadata = _calibrate_close_morning_decision_oof(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+    )
+    assert policy is not None
+    assert policy.score_col == "decision_score"
+    assert evaluation is not None
+    assert metadata is not None
+    assert metadata["oof_score_col"] == "decision_score"
+    assert metadata["daily_score_col"] == "decision_score"
+    assert metadata["candidate"] == policy.candidate
+
+
+def test_calibrate_close_morning_decision_oof_returns_none_without_identity() -> None:
+    """식별 컬럼(stock_code/chart_analysis)이 없으면 (None, None, None) 을 반환합니다."""
+    df = _make_dataset()
+    policy, evaluation, metadata = _calibrate_close_morning_decision_oof(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+    )
+    assert (policy, evaluation, metadata) == (None, None, None)
+
+
+def test_calibrate_oof_policy_reranker_returns_decision_score_metadata() -> None:
+    """_calibrate_oof_policy(reranker=True) 는 decision_score 매핑을 반환합니다."""
+    df = _make_dataset(n_groups=10, rows_per_group=5, seed=13)
+    df["stock_code"] = [f"{i % 5 + 1:06d}" for i in range(len(df))]
+    df["chart_analysis"] = ["거래량 폭증"] * len(df)
+    policy, metadata = _calibrate_oof_policy(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+        reranker=True,
+    )
+    assert policy is not None
+    assert policy.score_col == "decision_score"
+    assert metadata is not None
+    assert metadata["oof_score_col"] == "decision_score"
+    assert metadata["daily_score_col"] == "decision_score"
 
 
 def test_run_model_pipeline_passes_model_params_to_requested_model() -> None:
@@ -457,6 +640,36 @@ def _fake_quality_pipeline_result(scheduled_mean: float) -> dict[str, Any]:
     }
 
 
+def _fake_decision_policy_result(
+    scheduled_mean: float,
+) -> tuple[Any, Any, dict[str, Any]]:
+    """evaluate_close_morning_quality 단위 테스트용 reranker OOF 보정 페이크 결과."""
+    from types import SimpleNamespace
+
+    evaluation = SimpleNamespace(
+        metrics={
+            "scheduled_mean_return": scheduled_mean,
+            "scheduled_win_rate": 0.6,
+            "profit_factor": 2.5,
+            "scheduled_sharpe": 4.0,
+            "active_trade_mean_return": scheduled_mean,
+            "active_trade_win_rate": 0.6,
+            "n_buy": 90,
+            "n_abstain": 30,
+            "reason_counts": {"top1_buy": 90, "insufficient_policy_history": 30},
+        },
+        scheduled_returns=np.array([0.02, -0.01, 0.015, 0.0, 0.01]),
+        selected_policy=SimpleNamespace(candidate="always_buy_top1"),
+    )
+    policy = SimpleNamespace(candidate="always_buy_top1", score_col="decision_score")
+    metadata = {
+        "oof_score_col": "decision_score",
+        "daily_score_col": "decision_score",
+        "candidate": "always_buy_top1",
+    }
+    return policy, evaluation, metadata
+
+
 def test_evaluate_close_morning_quality_reports_close_to_morning_metrics() -> None:
     """보고서가 동일 OOF 날짜에서 피처셋 비교와 100점 스코어를 반환합니다.
 
@@ -467,7 +680,14 @@ def test_evaluate_close_morning_quality_reports_close_to_morning_metrics() -> No
 
     raw = _report_raw_df()
     fake = _fake_quality_pipeline_result(scheduled_mean=0.015)
-    with patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake):
+    decision = _fake_decision_policy_result(scheduled_mean=0.015)
+    with (
+        patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake),
+        patch(
+            "src.ml.model_pipeline._calibrate_close_morning_decision_oof",
+            return_value=decision,
+        ),
+    ):
         report = evaluate_close_morning_quality(raw, n_splits=2, purge_gap=1)
 
     assert set(report["feature_sets"]) == {"base40", "snapshot49", "close_morning61"}
@@ -476,7 +696,7 @@ def test_evaluate_close_morning_quality_reports_close_to_morning_metrics() -> No
     assert "entry_sequence_drawdown" not in entry
     assert entry["top1_net_mean"] == pytest.approx(0.015)
     assert entry["scheduled_mean_return"] == pytest.approx(0.015)
-    assert entry["reason_counts"]["top1_buy"] == 100
+    assert entry["reason_counts"]["top1_buy"] == 90
     assert 0 <= entry["n_buy"] <= entry["n_buy"] + entry["n_abstain"]
 
     score = report["quality_score"]["close_morning61"]
@@ -490,14 +710,51 @@ def test_evaluate_close_morning_quality_reports_close_to_morning_metrics() -> No
     }
 
 
+def test_evaluate_close_morning_quality_exposes_legacy_and_reranker_metrics() -> None:
+    """champion 피처셋은 레거시 rank-only 와 decision-score reranker 정책 지표를
+    명확한 이름으로 함께 노출하고, 후보 지표는 decision-score 정책입니다."""
+    from unittest.mock import patch
+
+    raw = _report_raw_df()
+    fake = _fake_quality_pipeline_result(scheduled_mean=0.011)
+    decision = _fake_decision_policy_result(scheduled_mean=0.019)
+    with (
+        patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake),
+        patch(
+            "src.ml.model_pipeline._calibrate_close_morning_decision_oof",
+            return_value=decision,
+        ),
+    ):
+        report = evaluate_close_morning_quality(raw, n_splits=2, purge_gap=1)
+
+    entry = report["report"]["close_morning61"]
+    # 후보 지표 = decision-score reranker 정책
+    assert entry["top1_net_mean"] == pytest.approx(0.019)
+    assert entry["policy_candidate"] == "always_buy_top1"
+    assert entry["reason_counts"]["top1_buy"] == 90
+    # 레거시 rank-only 지표는 legacy_ 접두어로 함께 노출됩니다.
+    assert entry["legacy_top1_net_mean"] == pytest.approx(0.011)
+    assert entry["legacy_sharpe"] == pytest.approx(3.0)
+    assert entry["legacy_policy_candidate"] == "always_buy_top1"
+    # 그 외 피처셋은 레거시 지표를 후보로 사용하고 legacy_ 접두어도 노출합니다.
+    legacy_entry = report["report"]["snapshot49"]
+    assert legacy_entry["top1_net_mean"] == pytest.approx(0.011)
+    assert legacy_entry["legacy_top1_net_mean"] == pytest.approx(0.011)
+
+
 def test_evaluate_close_morning_quality_rejects_non_finite_metrics() -> None:
     """비유한 지표(예: scheduled_mean_return=NaN)는 ValueError 로 fail-closed 합니다."""
     from unittest.mock import patch
 
     raw = _report_raw_df()
     fake = _fake_quality_pipeline_result(scheduled_mean=float("nan"))
+    decision = _fake_decision_policy_result(scheduled_mean=float("nan"))
     with (
         patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake),
+        patch(
+            "src.ml.model_pipeline._calibrate_close_morning_decision_oof",
+            return_value=decision,
+        ),
         pytest.raises(ValueError, match="non-finite"),
     ):
         evaluate_close_morning_quality(raw, n_splits=2, purge_gap=1)
@@ -512,6 +769,10 @@ def test_evaluate_close_morning_quality_missing_policy_rejects() -> None:
     fake["single_stock_evaluation"] = None
     with (
         patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake),
+        patch(
+            "src.ml.model_pipeline._calibrate_close_morning_decision_oof",
+            return_value=(None, None, None),
+        ),
         pytest.raises(ValueError, match="non-finite"),
     ):
         evaluate_close_morning_quality(raw, n_splits=2, purge_gap=1)

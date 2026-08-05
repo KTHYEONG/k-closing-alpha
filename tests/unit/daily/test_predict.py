@@ -387,7 +387,8 @@ def test_apply_standard_feature_engineering_maps_to_ml_schema() -> None:
     ]
     assert set(expected_cols).issubset(out.columns)
     assert np.issubdtype(out["trade_date"].dtype, np.datetime64)
-    assert out["buy_price_change_rate"].round(6).eq(0).all()
+    # buy_price 가 없으면 당일 종가로 대체되어 파생 매수가 피처가 0 으로 왜곡되지 않습니다.
+    np.testing.assert_allclose(out["buy_price"].to_numpy(), out["close_price"].to_numpy())
     assert out["major_density"].notna().all()
     assert out["prog_dominance"].notna().all()
 
@@ -399,6 +400,142 @@ def test_apply_standard_feature_engineering_preserves_display_metadata() -> None
     assert out["theme_sector"].tolist() == ["테마A", "테마A"]
     assert out["chart_analysis"].tolist() == ["거래량 폭증", "상따"]
     assert out["selection_rank"].tolist() == [1, 2]
+
+
+def test_apply_standard_feature_engineering_buy_price_falls_back_to_close_price() -> None:
+    """buy_price 가 없으면 유한 양수 close_price 로 대체되며, 명시
+    buy_price=close_price 와 동일한 파생 매수가 피처를 산출합니다."""
+    snapshot = _daily_snapshot_df()
+    implicit = predict.apply_standard_feature_engineering(snapshot)
+
+    explicit = snapshot.copy()
+    explicit["(매수 가격)"] = explicit["종가"]
+    explicit_out = predict.apply_standard_feature_engineering(explicit)
+
+    np.testing.assert_allclose(
+        implicit["buy_price"].to_numpy(), implicit["close_price"].to_numpy()
+    )
+    np.testing.assert_allclose(
+        implicit["buy_price"].to_numpy(), explicit_out["buy_price"].to_numpy()
+    )
+    pd.testing.assert_series_equal(
+        implicit["buy_price_change_rate"], explicit_out["buy_price_change_rate"]
+    )
+    # buy_price = close_price 이므로 매수가 변화율은 (종가-전일종가)/전일종가 x 100 입니다.
+    expected = (
+        (implicit["close_price"] - implicit["prev_close_price"])
+        / implicit["prev_close_price"]
+        * 100
+    )
+    np.testing.assert_allclose(
+        implicit["buy_price_change_rate"].to_numpy(), expected.to_numpy()
+    )
+
+
+def test_apply_standard_feature_engineering_keeps_explicit_buy_price() -> None:
+    """명시적으로 공급된 buy_price 는 변경되지 않습니다."""
+    snapshot = _daily_snapshot_df()
+    snapshot["(매수 가격)"] = [9_999.0, 19_999.0]
+    out = predict.apply_standard_feature_engineering(snapshot)
+    np.testing.assert_allclose(out["buy_price"].to_numpy(), [9_999.0, 19_999.0])
+    assert out["buy_price_change_rate"].round(6).ne(0).all()
+
+
+def test_apply_standard_feature_engineering_requires_close_price_without_buy_price() -> None:
+    """buy_price 가 없는데 close_price 도 없으면 ValueError 로 fail-closed 합니다."""
+    snapshot = _daily_snapshot_df().drop(columns=["종가"])
+    with pytest.raises(ValueError, match="close_price is missing"):
+        predict.apply_standard_feature_engineering(snapshot)
+
+
+def test_apply_standard_feature_engineering_rejects_non_finite_close_price() -> None:
+    """buy_price 가 없는데 close_price 가 비유한 값이면 ValueError 로 거부합니다."""
+    snapshot = _daily_snapshot_df()
+    snapshot.loc[0, "종가"] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        predict.apply_standard_feature_engineering(snapshot)
+
+
+def test_apply_standard_feature_engineering_rejects_non_positive_close_price() -> None:
+    """buy_price 가 없는데 close_price 가 0 이하이면 ValueError 로 거부합니다."""
+    snapshot = _daily_snapshot_df()
+    snapshot.loc[0, "종가"] = 0.0
+    with pytest.raises(ValueError, match="non-positive"):
+        predict.apply_standard_feature_engineering(snapshot)
+
+
+def test_run_daily_sizing_inference_appends_decision_score_only_for_reranker() -> None:
+    """reranker v1 설정 번들만 decision_score 를 생성하고 레거시 번들은 기존 출력을 유지합니다."""
+    snapshot = _snapshot_df()
+    legacy = _train_inline_bundle(snapshot, FEATURE_COLS, TARGET_COL, GROUP_COL)
+    legacy_out = predict.run_daily_sizing_inference(
+        snapshot, legacy, feature_cols=FEATURE_COLS, group_col=GROUP_COL
+    )
+    assert "decision_score" not in legacy_out.columns
+
+    reranker = dict(legacy)
+    reranker["decision_score_config"] = {
+        "version": "close-morning-reranker-v1",
+        "rank_weight": 1.0,
+        "p_good_weight": 0.5,
+        "score_col": "decision_score",
+    }
+    reranker_out = predict.run_daily_sizing_inference(
+        snapshot, reranker, feature_cols=FEATURE_COLS, group_col=GROUP_COL
+    )
+    assert "decision_score" in reranker_out.columns
+    expected = (
+        reranker_out.groupby(GROUP_COL)["rank_score"].rank(pct=True, method="average")
+        + 0.5 * reranker_out.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+    )
+    pd.testing.assert_series_equal(
+        reranker_out["decision_score"], expected.rename("decision_score")
+    )
+
+
+def test_decision_score_selection_can_differ_from_raw_rank_score() -> None:
+    """reranker 정책은 p_good 순위를 반영해 raw rank_score 선택과 다른 종목을 고를 수 있고,
+    레거시 정책은 rank_score 로 선택합니다."""
+    from src.ml.single_stock_policy import always_buy_policy, select_single_daily_trade
+    from src.ml.sizing_engine import add_close_morning_decision_score
+
+    scored = add_close_morning_decision_score(
+        pd.DataFrame(
+            {
+                "date": ["2026-08-04"] * 10,
+                "stock_code": [f"{i:06d}" for i in range(1, 11)],
+                "chart_analysis": ["거래량 폭증"] * 10,
+                "rank_score": [10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+                "p_good": [0.1, 0.2, 0.95, 0.15, 0.05, 0.3, 0.25, 0.35, 0.4, 0.0],
+            }
+        ),
+        group_col="date",
+    )
+    # raw rank_score 1위는 000001 이지만 decision_score 1위는 p_good 가 높은 000003 입니다.
+    assert float(scored.loc[scored["stock_code"] == "000001", "rank_score"].iloc[0]) == 10.0
+    assert (
+        scored.loc[scored["stock_code"] == "000003", "decision_score"].iloc[0]
+        == scored["decision_score"].max()
+    )
+
+    reranker_policy = always_buy_policy("2026-08-04", score_col="decision_score")
+    decision = select_single_daily_trade(
+        scored,
+        reranker_policy,
+        group_col="date",
+        score_col=reranker_policy.score_col,
+    )
+    assert decision.iloc[0]["decision"] == "BUY"
+    assert decision.iloc[0]["stock_code"] == "000003"
+
+    legacy_policy = always_buy_policy("2026-08-04")
+    legacy_decision = select_single_daily_trade(
+        scored,
+        legacy_policy,
+        group_col="date",
+        score_col=legacy_policy.score_col,
+    )
+    assert legacy_decision.iloc[0]["stock_code"] == "000001"
 
 
 def _daily_snapshot_from_raw(
@@ -917,12 +1054,15 @@ def test_train_and_save_real_model_bundle_trains_numeric_features(tmp_path) -> N
         bundle["feature_cols"]
     )
     assert not _PRODUCTION_CALENDAR_FLOW_NINE.intersection(bundle["feature_cols"])
-    # 정책이 번들에 직렬화되어 pred→rank_score 매핑이 기록됩니다.
+    # champion reranker 번들은 decision_score 매핑과 불변 설정을 영속화합니다.
     assert isinstance(bundle["single_stock_policy"], dict)
-    assert bundle["policy_metadata"]["oof_score_col"] == "pred"
-    assert bundle["policy_metadata"]["daily_score_col"] == "rank_score"
-    assert bundle["oof_score_col"] == "pred"
-    assert bundle["daily_score_col"] == "rank_score"
+    assert bundle["single_stock_policy"]["score_col"] == "decision_score"
+    assert bundle["policy_metadata"]["oof_score_col"] == "decision_score"
+    assert bundle["policy_metadata"]["daily_score_col"] == "decision_score"
+    assert bundle["oof_score_col"] == "decision_score"
+    assert bundle["daily_score_col"] == "decision_score"
+    assert bundle["decision_score_config"]["version"] == "close-morning-reranker-v1"
+    assert bundle["decision_score_config"]["p_good_weight"] == 0.5
     # feature_manifest 가 영속화되고 모든 피처가 at_decision_time 입니다.
     manifest = bundle["feature_manifest"]
     assert set(manifest["feature_name"]) == set(bundle["feature_cols"])
@@ -932,6 +1072,31 @@ def test_train_and_save_real_model_bundle_trains_numeric_features(tmp_path) -> N
     candidate_dir = export_dir / f"close_morning61_{bundle['training_cutoff'][:10]}"
     assert (candidate_dir / "sizing_pipeline_bundle.joblib").exists()
     assert not (export_dir / "sizing_pipeline_bundle.joblib").exists()
+
+
+def test_train_and_save_real_model_bundle_legacy_feature_set_keeps_rank_score(
+    tmp_path,
+) -> None:
+    """close_morning61 외 피처셋 번들은 기존 pred/rank_score 매핑을 유지하고
+    decision_score_config 를 영속화하지 않습니다."""
+    raw = _realistic_trade_log_df(n_dates=8)
+    trade_log_path = tmp_path / "trade_log.parquet"
+    raw.to_parquet(trade_log_path)
+    export_dir = tmp_path / "models"
+
+    bundle = predict.train_and_save_real_model_bundle(
+        export_dir=str(export_dir),
+        trade_log_path=trade_log_path,
+        theme_path=str(tmp_path / "missing_theme.parquet"),
+        feature_set="snapshot49",
+    )
+
+    assert bundle["feature_set"] == "snapshot49"
+    assert "decision_score_config" not in bundle
+    assert bundle["oof_score_col"] == "pred"
+    assert bundle["daily_score_col"] == "rank_score"
+    assert bundle["policy_metadata"]["oof_score_col"] == "pred"
+    assert bundle["policy_metadata"]["daily_score_col"] == "rank_score"
 
 
 def test_scenario_daily_predict_redesign_01_fresh_candidate_bundle_emits_policy_decision(
@@ -956,6 +1121,7 @@ def test_scenario_daily_predict_redesign_01_fresh_candidate_bundle_emits_policy_
     policy = predict._load_single_stock_policy(loaded)
     assert policy is not None
     assert policy.policy_id == "always_buy_top1"
+    assert policy.score_col == "decision_score"
 
     snapshot = predict.apply_standard_feature_engineering(
         _daily_snapshot_from_processed(
@@ -963,7 +1129,10 @@ def test_scenario_daily_predict_redesign_01_fresh_candidate_bundle_emits_policy_
         )
     )
     scored = predict.run_daily_sizing_inference(snapshot, loaded, group_col="date")
-    decision = predict.select_single_daily_trade(scored, policy, group_col="date")
+    assert "decision_score" in scored.columns
+    decision = predict.select_single_daily_trade(
+        scored, policy, group_col="date", score_col=policy.score_col
+    )
     assert len(decision) == 1
     assert decision.iloc[0]["decision_reason"] != "missing_validated_policy"
     assert decision.iloc[0]["decision"] in {"BUY", "ABSTAIN"}

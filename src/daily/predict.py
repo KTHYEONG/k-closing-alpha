@@ -26,6 +26,7 @@ from src.ml.single_stock_policy import (
     select_single_daily_trade,
 )
 from src.ml.sizing_engine import (
+    _CLOSE_MORNING_RERANKER_CONFIG,
     _train_inline_bundle,
     load_model_artifacts,
     predict_daily_position_sizing,
@@ -233,16 +234,30 @@ def apply_standard_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
 
     ``normalize_column_names`` 단일 정규화로 일일 CSV 의 한글/괄호 헤더를 표준
     영문 컬럼으로 변환한 뒤 ``engineer_features`` / ``_apply_robust_z`` 를
-    적용합니다. 당일 스냅샷에는 존재하지 않는 ``trade_date``(오늘)와
-    ``buy_price``(전일종가 기준 중립값)를 보강하고, 표시용 메타데이터
-    (``종목명`` 등)는 보존합니다.
+    적용합니다. 당일 스냅샷에는 존재하지 않는 ``trade_date``(오늘)를 보강합니다.
+    ``buy_price`` 가 없으면 이전 종가 중립값 대신 유한 양수 ``close_price`` 로
+    대체합니다(학습 대비 서빙 피처 정합성). 명시적으로 공급된 ``buy_price`` 는
+    변경하지 않습니다. 표시용 메타데이터(``종목명`` 등)는 보존합니다.
     """
     work = df.copy()
     work = normalize_column_names(work)
     if "trade_date" not in work.columns:
         work["trade_date"] = pd.Timestamp.today().normalize()
     if "buy_price" not in work.columns:
-        work["buy_price"] = work["prev_close_price"]
+        if "close_price" not in work.columns:
+            raise ValueError(
+                "buy_price is absent and close_price is missing; cannot derive buy_price"
+            )
+        close_price = pd.to_numeric(work["close_price"], errors="coerce")
+        if close_price.isna().any() or not np.isfinite(close_price.to_numpy(dtype=np.float64)).all():
+            raise ValueError(
+                "buy_price is absent and close_price is non-finite; cannot derive buy_price"
+            )
+        if (close_price <= 0.0).any():
+            raise ValueError(
+                "buy_price is absent and close_price is non-positive; cannot derive buy_price"
+            )
+        work["buy_price"] = close_price
     work = engineer_features(work)
     # 학습 파이프라인(build_ml_dataset)과 1:1 동일한 횡단면 Robust Z-Score
     # 피처(change_rate_z, major_density_z 등)를 생성합니다.
@@ -401,9 +416,13 @@ def train_and_save_real_model_bundle(
     2. ``run_model_pipeline`` 으로 동일 수치 피처 + 행동 메타데이터로 purged OOF
        예측과 ``SingleStockPolicy`` 를 생성합니다.
     3. ``_train_inline_bundle`` 로 전체 이력 최종 추론 모델을 학습합니다.
-    4. ``single_stock_policy.model_dump()`` 와 함께 ``oof_score_col="pred"``,
-       ``daily_score_col="rank_score"``, 보정 cutoff, 정책 버전, 피처셋 이름,
-       compact OOF 정책 지표를 번들에 영속화합니다.
+    4. ``single_stock_policy.model_dump()`` 와 함께 보정 cutoff, 정책 버전,
+       피처셋 이름, compact OOF 정책 지표를 번들에 영속화합니다.
+       ``close_morning61 + scenario_action`` 은 reranker 결정 스코어
+       (``decision_score``) OOF 정책을 사용하며 ``oof_score_col`` 와
+       ``daily_score_col`` 모두 ``"decision_score"`` 로 기록하고
+       ``decision_score_config`` 를 영속화합니다. 그 외 번들은 기존
+       ``pred``/``rank_score`` 매핑을 유지합니다.
     5. 버전화된 후보 아티팩트만 저장하며 활성 아티팩트를 자동으로 대체하지
        않습니다. 정책 상태가 없으면 ``ABSTAIN(missing_validated_policy)`` 로
        명시 처리되고 Top-N 폴백은 없습니다.
@@ -422,6 +441,7 @@ def train_and_save_real_model_bundle(
     feature_cols = [col for col in X.columns if col not in cat_features]
     target_col = "target_return"
     group_col = "trade_date"
+    reranker = feature_set == "close_morning61" and panel_mode == "scenario_action"
     policy, policy_metadata = _calibrate_oof_policy(
         processed,
         feature_cols,
@@ -429,6 +449,7 @@ def train_and_save_real_model_bundle(
         group_col,
         n_splits=5,
         purge_gap=1,
+        reranker=reranker,
     )
     bundle = _train_inline_bundle(
         processed[[*feature_cols, target_col, group_col]],
@@ -440,8 +461,13 @@ def train_and_save_real_model_bundle(
     bundle["panel_mode"] = panel_mode
     bundle["single_stock_policy"] = policy.model_dump() if policy is not None else None
     bundle["policy_metadata"] = policy_metadata
-    bundle["oof_score_col"] = "pred"
-    bundle["daily_score_col"] = "rank_score"
+    if reranker:
+        bundle["decision_score_config"] = dict(_CLOSE_MORNING_RERANKER_CONFIG)
+        bundle["oof_score_col"] = "decision_score"
+        bundle["daily_score_col"] = "decision_score"
+    else:
+        bundle["oof_score_col"] = "pred"
+        bundle["daily_score_col"] = "rank_score"
     save_dir = _candidate_export_dir(export_dir, feature_set, bundle)
     save_model_artifacts(bundle, save_dir)
     logger.info(
@@ -656,7 +682,7 @@ def main():
         )
     else:
         single_decision = select_single_daily_trade(
-            scored_all, policy, group_col="date"
+            scored_all, policy, group_col="date", score_col=policy.score_col
         )
     print_table(single_decision, "실행 결정 (Single-Stock: BUY/ABSTAIN)", minimal=True)
 
