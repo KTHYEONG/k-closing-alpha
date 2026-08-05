@@ -10,11 +10,31 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
+from src.ml.feature_manifest import build_feature_manifest
 from src.ml.sizing_engine import ROUND_TRIP_COST_RATIO
 from src.processing.schema import RAW_TO_STANDARD_MAP
+
+logger = logging.getLogger(__name__)
+
+# 수익률 단위: 단일 권위 단위는 decimal net return (순수익률, 소수).
+# 원본 퍼센트 수익률(net_return)은 정확히 1회 decimal 변환 후 왕복 비용을
+# 정확히 1회 차감합니다. 분위수/분류/유틸리티/임계값/배분이 같은 단위를 소비합니다.
+RETURN_UNIT = "decimal_net"
+
+# Decimal net 기준 이벤트 임계값 (target_good: +1%, target_bad: -2%).
+LABEL_THRESHOLDS: dict[str, float] = {"target_good": 0.01, "target_bad": -0.02}
+RETURN_CLIP_LOWER = -0.10
+RETURN_CLIP_UPPER = 0.10
+
+# point-in-time 무결성 타임스탬프 컬럼명 (Asia/Seoul timezone-aware)
+DECISION_TIMESTAMP_COL = "decision_timestamp"
+FEATURE_AVAILABLE_TIMESTAMP_COL = "feature_available_timestamp"
+
 
 _NUMERIC_COLUMNS: tuple[str, ...] = (
     "open_price",
@@ -95,6 +115,20 @@ _EXCLUDED_FROM_X: set[str] = {
     "sell_price",
     # Data Leakage 방지
     "intraday_return",
+    # P0(ml_strategy_improvement): close/high/low/실현 매수가 파생 캔들 피처는
+    # 스냅샷이 주문 전 캡처됨이 증명될 때까지 프로덕션 피처 집합에서 제외합니다.
+    # (feature_manifest 에서 needs_snapshot_proof 로 분류됨)
+    "close_position",
+    "body_ratio",
+    "upper_shadow_ratio",
+    "intraday_range",
+    "buy_price_change_rate",
+    "gap_ratio",
+    "relative_change_rate",
+    # 캔들/실현 매수가 파생 피처의 robust-z 변환도 동일한 미래 정보를 포함하므로 제외
+    "buy_price_change_rate_z",
+    "gap_ratio_z",
+    "relative_change_rate_z",
     # 원본 금액/거래량 컬럼 (log_ 접두사 파생 컬럼만 학습 피처로 사용)
     "market_cap_100m",
     "trade_value_100m",
@@ -222,15 +256,19 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def create_multi_targets(df: pd.DataFrame) -> pd.DataFrame:
-    """회귀/랭킹/분류 3종 타깃 변수를 생성합니다.
+    """회귀/랭킹/분류 3종 타깃 변수를 decimal net 기준으로 생성합니다.
 
-    ``net_return``(gross)에서 왕복 거래 비용(``ROUND_TRIP_COST_RATIO``, 0.20%)을
-    차감한 순수익(net-of-cost) 기준으로 회귀/분류 타깃을 인코딩합니다.
-    ``target_rank`` 는 그룹 내 상대순위로 상수 이동에 불변하므로 그대로 둡니다.
+    원본 퍼센트 수익률(``net_return``)을 정확히 1회 decimal 로 변환
+    (``/ 100``)하고 왕복 거래 비용(``ROUND_TRIP_COST_RATIO``, 0.20%)을 정확히
+    1회 차감한 decimal net return 으로 회귀/분류 타깃을 인코딩합니다.
+    ``target_good``/``target_bad`` 는 ``LABEL_THRESHOLDS`` 의 decimal net
+    임계값(+1%/-2%)에서 파생됩니다. ``target_rank`` 는 그룹 내 상대순위로
+    상수 이동에 불변하므로 그대로 둡니다.
     """
     df = df.copy()
-    net_of_cost = df["net_return"] - ROUND_TRIP_COST_RATIO * 100.0
-    df["target_return"] = net_of_cost.clip(-10.0, 10.0)
+    gross_decimal = df["net_return"] / 100.0
+    net_of_cost = gross_decimal - ROUND_TRIP_COST_RATIO
+    df["target_return"] = net_of_cost.clip(RETURN_CLIP_LOWER, RETURN_CLIP_UPPER)
 
     def assign_daily_rank(group_df: pd.DataFrame) -> pd.Series:
         n = len(group_df)
@@ -250,8 +288,10 @@ def create_multi_targets(df: pd.DataFrame) -> pd.DataFrame:
     for _, group_df in df.groupby("trade_date", sort=False):
         rank_map.update(assign_daily_rank(group_df).to_dict())
     df["target_rank"] = pd.Series(rank_map, dtype="int64").reindex(df.index)
-    df["target_good"] = (net_of_cost >= 1.0).astype(int)
-    df["target_bad"] = (net_of_cost <= -2.0).astype(int)
+    df["target_good"] = (net_of_cost >= LABEL_THRESHOLDS["target_good"]).astype(int)
+    df["target_bad"] = (net_of_cost <= LABEL_THRESHOLDS["target_bad"]).astype(int)
+    df.attrs["return_unit"] = RETURN_UNIT
+    df.attrs["label_thresholds"] = dict(LABEL_THRESHOLDS)
     return df
 
 def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
@@ -268,6 +308,24 @@ def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
         mad = mad.replace(0, np.nan)
         df[f"{col}_z"] = ((df[col] - median) / mad).clip(-5, 5)
     return df
+
+
+def _reject_non_causal_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """피처 이용 가능 시각이 decision 시각보다 늦은 행을 학습에서 제외합니다.
+
+    타임스탬프 컬럼이 둘 다 존재할 때만 적용됩니다 (없으면 원본 그대로 반환).
+    decision 시각보다 늦게 이용 가능해진 피처 행은 미래 정보 누출 후보이므로
+    X 를 구성하기 전에 버립니다.
+    """
+    if not {DECISION_TIMESTAMP_COL, FEATURE_AVAILABLE_TIMESTAMP_COL} <= set(df.columns):
+        return df
+    available = pd.to_datetime(df[FEATURE_AVAILABLE_TIMESTAMP_COL], utc=True)
+    decision = pd.to_datetime(df[DECISION_TIMESTAMP_COL], utc=True)
+    causal_mask = available <= decision
+    rejected = int((~causal_mask).sum())
+    if rejected:
+        logger.info("rejected %d non-causal rows (feature_available > decision)", rejected)
+    return df.loc[causal_mask].copy()
 
 
 def build_ml_dataset(
@@ -294,6 +352,7 @@ def build_ml_dataset(
         raise ValueError("필수 컬럼(trade_date, net_return)이 데이터에 없습니다.")
 
     df = df.dropna(subset=["net_return"]).copy()
+    df = _reject_non_causal_rows(df)
     df = engineer_features(df)
     df = _apply_robust_z(df, _ROBUST_Z_COLUMNS)
     df = create_multi_targets(df)
@@ -306,4 +365,7 @@ def build_ml_dataset(
     targets = {name: df[name] for name in _TARGET_NAMES}
     feature_cols = [col for col in df.columns if col not in _EXCLUDED_FROM_X]
     X = df[feature_cols].copy()
+    manifest = build_feature_manifest(feature_cols)
+    df.attrs["feature_manifest"] = manifest
+    X.attrs["feature_manifest"] = manifest
     return X, targets, cat_features, df
