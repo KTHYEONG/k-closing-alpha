@@ -19,7 +19,13 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from src.ml.backtest_evaluator import _max_drawdown, run_backtest_evaluation
+from src.ml.backtest_evaluator import (
+    _MIN_YEAR_SAMPLES,
+    _aggregate_metrics,
+    _extract_year,
+    _max_drawdown,
+    run_backtest_evaluation,
+)
 from src.ml.feature_manifest import build_feature_manifest
 from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
 from src.ml.quantile_model import fit_predict_quantile_and_classifier
@@ -27,6 +33,7 @@ from src.ml.single_stock_policy import (
     _DEFAULT_MIN_HISTORY_DATES,
     SingleStockPolicy,
     SingleStockPolicyEvaluation,
+    always_buy_policy,
     default_policy_candidates,
     evaluate_single_stock_policy_oof,
 )
@@ -102,8 +109,8 @@ def _align_close_morning_oof(
 ) -> pd.DataFrame:
     """return OOF 와 quantile/classifier OOF 를 원본 행 인덱스로 정렬합니다.
 
-    날짜 단독 병합은 금지합니다. return 예측 행이 risk OOF 에 없거나 p_good
-    예측이 누락되거나 group/target/stock/scenario 식별 키가 원본 인덱스에서
+    날짜 단독 병합은 금지합니다. return 예측 행이 risk OOF 에 없거나 p_good /
+    p_bad 예측이 누락되거나 group/target/stock/scenario 식별 키가 원본 인덱스에서
     어긋나면 ``ValueError`` 로 fail-closed 합니다 (누락 OOF 예측은 대체하지 않음).
     """
     missing = return_oof.index.difference(risk_oof.index)
@@ -113,12 +120,13 @@ def _align_close_morning_oof(
             f"quantile/classifier OOF ({len(missing)} rows); missing OOF predictions "
             "are never substituted"
         )
-    aligned = return_oof.join(risk_oof[["p_good"]], how="left")
-    if aligned["p_good"].isna().any():
-        raise ValueError(
-            "close-morning OOF alignment: p_good predictions are missing for aligned "
-            "return rows"
-        )
+    aligned = return_oof.join(risk_oof[["p_good", "p_bad"]], how="left")
+    for col in ("p_good", "p_bad"):
+        if aligned[col].isna().any():
+            raise ValueError(
+                "close-morning OOF alignment: "
+                f"{col} predictions are missing for aligned return rows"
+            )
     for col in (group_col, target_col):
         if col not in risk_oof.columns:
             continue
@@ -200,6 +208,386 @@ def _calibrate_close_morning_decision_oof(
         policy, evaluation, oof_score_col="decision_score", daily_score_col="decision_score"
     )
     return policy, evaluation, metadata
+
+def _select_bad_probability_weight(
+    candidate_stats: dict[float, dict[str, float]],
+) -> float:
+    """v2 하방위험 패널티 가중치를 보수적 규칙으로 선택합니다.
+
+    ``candidate_stats`` 는 ``w_bad -> {scheduled_mean_return, entry_sequence_drawdown}``
+    매핑입니다. ``w_bad=0``(v1) 은 항상 유효하며, 비영(非零) 후보는 내부 OOF
+    scheduled mean 이 v1 이상이고 compounded close-to-morning MDD 가 엄격히
+    낮을 때만 유효합니다. 유효 후보 중 최저 MDD → 높은 scheduled mean → 낮은
+    ``w_bad`` 순으로 선택하며 조건을 충족하지 못하면 v1(``0.0``) 으로
+    fail-closed 합니다. NaN 지표는 미충족으로 간주해 절대 v1 을 대체하지
+    않습니다.
+    """
+    baseline = candidate_stats[0.0]
+    base_mean = float(baseline["scheduled_mean_return"])
+    base_mdd = float(baseline["entry_sequence_drawdown"])
+
+    eligible: list[float] = [0.0]
+    for weight, stats in sorted(candidate_stats.items()):
+        if weight == 0.0:
+            continue
+        mean = float(stats["scheduled_mean_return"])
+        mdd = float(stats["entry_sequence_drawdown"])
+        mean_ge = np.isfinite(mean) and np.isfinite(base_mean) and mean >= base_mean
+        mdd_lt = np.isfinite(mdd) and np.isfinite(base_mdd) and mdd < base_mdd
+        if mean_ge and mdd_lt:
+            eligible.append(weight)
+
+    def _sort_key(weight: float) -> tuple[float, float, float]:
+        stats = candidate_stats[weight]
+        mdd = float(stats["entry_sequence_drawdown"])
+        mean = float(stats["scheduled_mean_return"])
+        return (
+            mdd if np.isfinite(mdd) else np.inf,
+            -mean if np.isfinite(mean) else -np.inf,
+            weight,
+        )
+
+    return min(eligible, key=_sort_key)
+
+
+def _evaluate_close_morning_top1(
+    panel: pd.DataFrame,
+    target_col: str,
+    group_col: str,
+    *,
+    probability_weight: float,
+    bad_probability_weight: float,
+    min_history_dates: int,
+    p_bad_col: str = "p_bad",
+) -> dict[str, Any]:
+    """``always_buy_top1`` 정책으로 ``panel`` 을 정확히 1회 평가합니다 (연구 전용)."""
+    scored = add_close_morning_decision_score(
+        panel,
+        group_col=group_col,
+        p_bad_col=p_bad_col,
+        probability_weight=probability_weight,
+        bad_probability_weight=bad_probability_weight,
+    )
+    cutoff = str(scored[group_col].max())
+    evaluation = evaluate_single_stock_policy_oof(
+        scored,
+        target_col=target_col,
+        group_col=group_col,
+        stock_col="stock_code",
+        policy_candidates=(always_buy_policy(cutoff, score_col="decision_score"),),
+        min_history_dates=min_history_dates,
+        scenario_col="chart_analysis",
+        score_col="decision_score",
+    )
+    return {
+        "metrics": dict(evaluation.metrics),
+        "scheduled_returns": np.asarray(evaluation.scheduled_returns, dtype=np.float64),
+        "dates": evaluation.decisions[group_col].to_numpy(),
+    }
+
+
+def _inner_close_morning_candidate_evaluator(
+    inner_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    group_col: str,
+    *,
+    n_splits: int,
+    purge_gap: int,
+    probability_weight: float,
+    min_history_dates: int,
+    p_bad_col: str = "p_bad",
+) -> dict[str, Any]:
+    """외부 fold 의 train 분할만 사용하는 내부 purged walk-forward 후보 평가입니다.
+
+    outer-train 날짜 전용 OOF(return ``pred`` + ``p_good``/``p_bad``)를 중첩
+    walk-forward 로 산출하고, ``w_bad in {0, w_good, 2*w_good}`` 후보를
+    ``always_buy_top1`` 로 평가한 뒤 ``_select_bad_probability_weight`` 의 보수적
+    규칙으로 최적 ``w_bad`` 를 결정합니다. 선택은 전적으로 이 partition 의 OOF
+    레이블만 사용하며 외부 validation 레이블을 절대 읽지 않습니다. partition 이
+    중첩 walk-forward 를 지원할 만큼 충분하지 않으면 ``0.0`` 으로 fail-closed
+    합니다.
+    """
+    inner_groups = int(inner_df[group_col].nunique())
+    if inner_groups < 3:
+        return {
+            "chosen_weight": 0.0,
+            "candidate_stats": {},
+            "inner_n_groups": inner_groups,
+            "inner_n_splits": 0,
+            "inner_cutoff": None,
+            "fail_closed_reason": "insufficient_inner_history",
+        }
+    inner_splits = max(1, min(n_splits, inner_groups - 2))
+
+    result = run_model_pipeline(
+        inner_df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=inner_splits,
+        purge_gap=purge_gap,
+        model_type="lgb_regressor",
+    )
+    risk_oof = fit_predict_quantile_and_classifier(
+        inner_df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=inner_splits,
+        purge_gap=purge_gap,
+    )
+    aligned = _align_close_morning_oof(
+        result["oof_predictions"], risk_oof, target_col=target_col, group_col=group_col
+    )
+    aligned["rank_score"] = aligned["pred"]
+    cutoff = str(aligned[group_col].max())
+
+    candidate_stats: dict[float, dict[str, float]] = {}
+    for weight in (0.0, probability_weight, 2.0 * probability_weight):
+        evaluation = _evaluate_close_morning_top1(
+            aligned,
+            target_col,
+            group_col,
+            probability_weight=probability_weight,
+            bad_probability_weight=weight,
+            min_history_dates=min_history_dates,
+            p_bad_col=p_bad_col,
+        )
+        metrics = evaluation["metrics"]
+        candidate_stats[float(weight)] = {
+            "scheduled_mean_return": float(metrics["scheduled_mean_return"]),
+            "entry_sequence_drawdown": float(metrics["entry_sequence_drawdown"]),
+            "scheduled_sharpe": float(metrics["scheduled_sharpe"]),
+            "profit_factor": float(metrics["profit_factor"]),
+            "buy_rate": float(metrics["buy_rate"]),
+        }
+
+    return {
+        "chosen_weight": float(_select_bad_probability_weight(candidate_stats)),
+        "candidate_stats": candidate_stats,
+        "inner_n_groups": inner_groups,
+        "inner_n_splits": inner_splits,
+        "inner_cutoff": cutoff,
+        "fail_closed_reason": None,
+    }
+
+
+def _aggregate_close_morning_metrics(
+    scheduled: np.ndarray, n_buy: int
+) -> dict[str, float]:
+    """폴드 전체의 scheduled return 시계열로 실험 수준 지표를 집계합니다."""
+    agg = _aggregate_metrics(scheduled)
+    return {
+        "n_scheduled_dates": int(scheduled.size),
+        "n_buy": n_buy,
+        "scheduled_mean_return": float(agg["top_1_return"]),
+        "scheduled_win_rate": float(agg["win_rate"]),
+        "profit_factor": float(agg["profit_factor"]),
+        "scheduled_sharpe": float(agg["sharpe"]),
+        "entry_sequence_drawdown": float(_max_drawdown(scheduled)),
+    }
+
+
+def _close_morning_yearly_breakdown(
+    dates: np.ndarray, scheduled: np.ndarray
+) -> dict[int, dict[str, float] | None]:
+    """scheduled return 시계열의 연도별 분해를 반환합니다 (표본 <5년 미만 null)."""
+    years = _extract_year(pd.Series(dates))
+    breakdown: dict[int, dict[str, float] | None] = {}
+    for year in np.unique(years):
+        if not np.isfinite(year):
+            continue
+        mask = years == year
+        if mask.sum() < _MIN_YEAR_SAMPLES:
+            breakdown[int(year)] = None
+            continue
+        agg = _aggregate_metrics(scheduled[mask])
+        breakdown[int(year)] = {
+            "scheduled_mean_return": float(agg["top_1_return"]),
+            "scheduled_win_rate": float(agg["win_rate"]),
+            "profit_factor": float(agg["profit_factor"]),
+            "scheduled_sharpe": float(agg["sharpe"]),
+        }
+    return breakdown
+
+
+def run_close_morning_reranker_v2_experiment(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    group_col: str,
+    n_splits: int = 5,
+    purge_gap: int = 1,
+    probability_weight: float = 0.5,
+    min_history_dates: int = _DEFAULT_MIN_HISTORY_DATES,
+    p_bad_col: str = "p_bad",
+) -> dict[str, Any]:
+    """close-morning reranker v2 중첩 선택 실험을 실행합니다 (연구 전용).
+
+    외부 5-fold ``PurgedGroupTimeSeriesSplit``(purge_gap=1) 로 각 fold 의 외부
+    validation 날짜를 1회 평가합니다. 폴드별 선택은 해당 fold 의 외부 train
+    partition 만 사용하는 내부 purged walk-forward OOF 에서 ``w_bad`` 를 고르고,
+    그 설정을 외부 validation 날짜에 1회 적용합니다. 외부 validation 레이블은
+    설정 선택에 절대 사용하지 않습니다. ``save_model_artifacts`` 를 호출하지
+    않고 프로덕션 번들이나 reranker 기본값을 변경하지 않습니다.
+
+    Args:
+        df: ``stock_code``/``chart_analysis`` 식별 컬럼을 포함한 OOF 패널 입력.
+        feature_cols: 학습 피처 컬럼.
+        target_col: 일자별 실현 순수익률(decimal net) 컬럼.
+        group_col: 거래일 그룹 컬럼.
+        n_splits: 외부 walk-forward fold 수.
+        purge_gap: 보유기간 만큼의 purge group 수.
+        probability_weight: ``w_good`` (v1 p_good 가중치, 기본 0.5).
+        min_history_dates: ``always_buy_top1`` 의 기존 워밍업 의미.
+        p_bad_col: v2 손실 확률 컬럼.
+
+    Returns:
+        dict: ``contract``(버전/후보 그리드/폴드 파라미터), ``folds``(폴드별
+        선택 가중치·내부 후보 지표·v1/v2 외부 평가), ``chosen_weights``,
+        ``aggregate``(폴드 연결 시계열의 v1/v2 실험 수준 지표) 포함.
+    """
+    if not {"stock_code", "chart_analysis"} <= set(df.columns):
+        raise ValueError(
+            "close-morning reranker v2 requires stock_code and chart_analysis columns"
+        )
+    if not 0.0 < probability_weight <= 1.0:
+        raise ValueError(f"probability_weight must be in (0, 1], got {probability_weight}")
+    if min_history_dates < 1:
+        raise ValueError(f"min_history_dates must be >= 1, got {min_history_dates}")
+    if purge_gap < 0:
+        raise ValueError(f"purge_gap must be >= 0, got {purge_gap}")
+
+    work = df.sort_values(group_col).copy()
+    result = run_model_pipeline(
+        work,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=n_splits,
+        purge_gap=purge_gap,
+        model_type="lgb_regressor",
+    )
+    risk_oof = fit_predict_quantile_and_classifier(
+        work,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=n_splits,
+        purge_gap=purge_gap,
+    )
+    outer_aligned = _align_close_morning_oof(
+        result["oof_predictions"], risk_oof, target_col=target_col, group_col=group_col
+    )
+    outer_aligned["rank_score"] = outer_aligned["pred"]
+
+    splitter = PurgedGroupTimeSeriesSplit(n_splits=n_splits, purge_gap=purge_gap)
+    full_date_positions = {
+        date: i for i, date in enumerate(sorted(work[group_col].unique()))
+    }
+    folds: list[dict[str, Any]] = []
+    v1_series: list[np.ndarray] = []
+    v2_series: list[np.ndarray] = []
+    v1_dates: list[np.ndarray] = []
+    v2_dates: list[np.ndarray] = []
+
+    for fold, (train_idx, val_idx) in enumerate(
+        splitter.split(work, y=work[target_col], groups=work[group_col])
+    ):
+        train_groups = set(work.iloc[train_idx][group_col].unique())
+        val_groups = set(work.iloc[val_idx][group_col].unique())
+        inner_df = work[work[group_col].isin(train_groups)]
+        inner = _inner_close_morning_candidate_evaluator(
+            inner_df,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=n_splits,
+            purge_gap=purge_gap,
+            probability_weight=probability_weight,
+            min_history_dates=min_history_dates,
+            p_bad_col=p_bad_col,
+        )
+        chosen = float(inner["chosen_weight"])
+
+        # 워밍업은 전체 타임라인 기준 첫 ``min_history_dates`` 날짜에만 적용됩니다.
+        # 외부 validation 패널은 후행 날짜 구간이므로, 패널 내 워밍업 수는 패널
+        # 시작일의 전체 위치가 워밍업 창을 벗어나면 0 이 됩니다.
+        outer_val = outer_aligned[outer_aligned[group_col].isin(val_groups)]
+        panel_start = full_date_positions[outer_val[group_col].min()]
+        panel_dates = int(outer_val[group_col].nunique())
+        effective_min_history_dates = max(
+            1, min(panel_dates, min_history_dates - panel_start)
+        )
+        v1 = _evaluate_close_morning_top1(
+            outer_val,
+            target_col,
+            group_col,
+            probability_weight=probability_weight,
+            bad_probability_weight=0.0,
+            min_history_dates=effective_min_history_dates,
+            p_bad_col=p_bad_col,
+        )
+        v2 = _evaluate_close_morning_top1(
+            outer_val,
+            target_col,
+            group_col,
+            probability_weight=probability_weight,
+            bad_probability_weight=chosen,
+            min_history_dates=effective_min_history_dates,
+            p_bad_col=p_bad_col,
+        )
+        folds.append(
+            {
+                "fold": fold,
+                "chosen_weight": chosen,
+                "inner": inner,
+                "v1": {
+                    "metrics": v1["metrics"],
+                    "n_buy": int(v1["metrics"]["n_buy"]),
+                },
+                "v2": {
+                    "metrics": v2["metrics"],
+                    "n_buy": int(v2["metrics"]["n_buy"]),
+                },
+            }
+        )
+        v1_series.append(v1["scheduled_returns"])
+        v2_series.append(v2["scheduled_returns"])
+        v1_dates.append(v1["dates"])
+        v2_dates.append(v2["dates"])
+
+    v1_cat = np.concatenate(v1_series)
+    v2_cat = np.concatenate(v2_series)
+    v1_dates_cat = np.concatenate(v1_dates)
+    v2_dates_cat = np.concatenate(v2_dates)
+    return {
+        "contract": {
+            "version": "close-morning-reranker-v2-research",
+            "policy_candidate": "always_buy_top1",
+            "candidate_weights": [0.0, probability_weight, 2.0 * probability_weight],
+            "probability_weight": probability_weight,
+            "n_splits": n_splits,
+            "purge_gap": purge_gap,
+            "min_history_dates": min_history_dates,
+            "evaluation_cutoff": str(work[group_col].max()),
+        },
+        "folds": folds,
+        "chosen_weights": [float(fold["chosen_weight"]) for fold in folds],
+        "aggregate": {
+            "v1": _aggregate_close_morning_metrics(
+                v1_cat, int(sum(fold["v1"]["n_buy"] for fold in folds))
+            ),
+            "v2": _aggregate_close_morning_metrics(
+                v2_cat, int(sum(fold["v2"]["n_buy"] for fold in folds))
+            ),
+        },
+        "yearly_breakdown": {
+            "v1": _close_morning_yearly_breakdown(v1_dates_cat, v1_cat),
+            "v2": _close_morning_yearly_breakdown(v2_dates_cat, v2_cat),
+        },
+    }
 
 
 def _calibrate_oof_policy(

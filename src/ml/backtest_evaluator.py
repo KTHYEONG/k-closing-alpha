@@ -41,7 +41,11 @@ _YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})")
 def _extract_year(groups: pd.Series) -> np.ndarray:
     """그룹 컬럼(거래일) 값에서 연도 배열(float64)을 추출합니다."""
     parsed = pd.to_datetime(groups, errors="coerce", format="mixed")
-    years: np.ndarray = np.asarray(parsed.dt.year.to_numpy(dtype=np.float64), dtype=np.float64)
+    # nullable Int64 시계열의 to_numpy 는 읽기전용 뷰를 반환할 수 있어 쓰기가 가능한
+    # 복사본을 강제합니다 (연도 파싱 실패 폴백 경로에서 원소를 덮어씁니다).
+    years: np.ndarray = np.asarray(
+        parsed.dt.year.to_numpy(dtype=np.float64), dtype=np.float64
+    ).copy()
     missing = ~np.isfinite(years)
     if missing.any():
         raw = groups.astype(str).to_numpy()

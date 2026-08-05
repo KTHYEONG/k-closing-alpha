@@ -643,6 +643,93 @@ def test_add_close_morning_decision_score_never_reads_target_column() -> None:
     pd.testing.assert_series_equal(out["decision_score"], expected.rename("decision_score"))
 
 
+def test_add_close_morning_decision_score_v2_subtracts_p_bad_percentile() -> None:
+    """(SCENARIO: close_morning_decision_score) v2 는 p_bad 백분위를 차감합니다.
+
+    ``decision_score = rank_pct + probability_weight * p_good_pct
+    - bad_probability_weight * p_bad_pct``
+    """
+    df = pd.DataFrame(
+        {
+            GROUP_COL: ["2024-01-01"] * 3 + ["2024-01-02"] * 3,
+            "rank_score": [0.3, 0.1, 0.2, 0.5, 0.4, 0.6],
+            "p_good": [0.1, 0.9, 0.5, 0.8, 0.2, 0.4],
+            "p_bad": [0.9, 0.1, 0.5, 0.2, 0.8, 0.4],
+        }
+    )
+    out = add_close_morning_decision_score(
+        df, probability_weight=0.5, bad_probability_weight=0.5
+    )
+    expected = (
+        df.groupby(GROUP_COL)["rank_score"].rank(pct=True, method="average")
+        + 0.5 * df.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+        - 0.5 * df.groupby(GROUP_COL)["p_bad"].rank(pct=True, method="average")
+    )
+    pd.testing.assert_series_equal(out["decision_score"], expected.rename("decision_score"))
+    # p_bad 가 높은(0.9) 종목은 v1 점수 대비 패널티로 점수가 낮아집니다.
+    v1 = add_close_morning_decision_score(df)
+    assert float(out["decision_score"].iloc[0]) < float(v1["decision_score"].iloc[0])
+
+
+def test_add_close_morning_decision_score_v2_requires_p_bad_when_weight_nonzero() -> None:
+    """bad_probability_weight=0(기본)이면 p_bad 컬럼이 없어도 동작하고, 비영이면
+    누락 p_bad 를 fail-closed 로 거부합니다."""
+    df = pd.DataFrame(
+        {GROUP_COL: ["2024-01-01"] * 2, "rank_score": [0.5, 0.7], "p_good": [0.4, 0.6]}
+    )
+    assert "decision_score" in add_close_morning_decision_score(df).columns
+    with pytest.raises(ValueError, match="missing required columns"):
+        add_close_morning_decision_score(df, bad_probability_weight=0.5)
+
+
+def test_add_close_morning_decision_score_v2_rejects_non_finite_p_bad() -> None:
+    df = pd.DataFrame(
+        {
+            GROUP_COL: ["2024-01-01"] * 2,
+            "rank_score": [0.5, 0.7],
+            "p_good": [0.4, 0.6],
+            "p_bad": [0.3, np.nan],
+        }
+    )
+    with pytest.raises(ValueError, match="p_bad must be finite"):
+        add_close_morning_decision_score(df, bad_probability_weight=0.5)
+
+
+def test_add_close_morning_decision_score_v2_rejects_out_of_range_bad_weight() -> None:
+    df = pd.DataFrame(
+        {
+            GROUP_COL: ["2024-01-01"] * 2,
+            "rank_score": [0.5, 0.7],
+            "p_good": [0.4, 0.6],
+            "p_bad": [0.3, 0.2],
+        }
+    )
+    with pytest.raises(ValueError, match="bad_probability_weight must be within \\[0, 1\\]"):
+        add_close_morning_decision_score(df, bad_probability_weight=1.5)
+
+
+def test_add_close_morning_decision_score_v2_never_reads_target_column() -> None:
+    """v2 결정 스코어도 타깃/수익률 컬럼을 절대 읽지 않습니다."""
+    df = pd.DataFrame(
+        {
+            GROUP_COL: ["2024-01-01"] * 2,
+            "rank_score": [0.5, 0.7],
+            "p_good": [0.4, 0.6],
+            "p_bad": [0.9, 0.1],
+            "target_net_return": [0.05, -0.05],
+        }
+    )
+    out = add_close_morning_decision_score(
+        df, probability_weight=0.5, bad_probability_weight=0.5
+    )
+    expected = (
+        df.groupby(GROUP_COL)["rank_score"].rank(pct=True, method="average")
+        + 0.5 * df.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+        - 0.5 * df.groupby(GROUP_COL)["p_bad"].rank(pct=True, method="average")
+    )
+    pd.testing.assert_series_equal(out["decision_score"], expected.rename("decision_score"))
+
+
 def test_predict_daily_position_sizing_appends_decision_score_for_reranker_bundle() -> None:
     """reranker v1 설정 번들은 rank_score/p_good 예측 직후 decision_score 를 추가합니다."""
     df = _make_feature_df()
@@ -653,6 +740,30 @@ def test_predict_daily_position_sizing_appends_decision_score_for_reranker_bundl
     expected = (
         result.groupby(GROUP_COL)["rank_score"].rank(pct=True, method="average")
         + 0.5 * result.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+    )
+    pd.testing.assert_series_equal(
+        result["decision_score"], expected.rename("decision_score")
+    )
+
+
+def test_predict_daily_position_sizing_appends_decision_score_for_reranker_v2_research_bundle() -> None:
+    """reranker v2 연구 번들은 p_bad 하방위험 패널티를 명시적으로 선언할 때만
+    decision_score 에 반영하고, 기본 프로덕션 번들은 변경하지 않습니다."""
+    df = _make_feature_df()
+    bundle = dict(_build_bundle(df))
+    bundle["decision_score_config"] = {
+        "version": "close-morning-reranker-v2-research",
+        "rank_weight": 1.0,
+        "p_good_weight": 0.5,
+        "bad_probability_weight": 0.5,
+        "score_col": "decision_score",
+    }
+    result = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bundle)
+    assert "decision_score" in result.columns
+    expected = (
+        result.groupby(GROUP_COL)["rank_score"].rank(pct=True, method="average")
+        + 0.5 * result.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+        - 0.5 * result.groupby(GROUP_COL)["p_bad"].rank(pct=True, method="average")
     )
     pd.testing.assert_series_equal(
         result["decision_score"], expected.rename("decision_score")
