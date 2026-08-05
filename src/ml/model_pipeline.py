@@ -33,6 +33,7 @@ from src.ml.single_stock_policy import (
 from src.ml.sizing_engine import (
     ROUND_TRIP_COST_RATIO,
     _train_inline_bundle,
+    add_close_morning_decision_score,
     apply_risk_limits,
     assign_sizing_grades,
     calculate_utility_score,
@@ -67,17 +68,20 @@ _POLICY_METRIC_KEYS: tuple[str, ...] = (
 def _policy_metadata(
     policy: SingleStockPolicy | None,
     evaluation: SingleStockPolicyEvaluation | None,
+    *,
+    oof_score_col: str = "pred",
+    daily_score_col: str = "rank_score",
 ) -> dict[str, Any] | None:
     """OOF 정책 보정 결과를 번들용 메타데이터로 요약합니다.
 
-    OOF 정책 보정은 ``pred`` 스코어, 최종 일일 선택은 ``rank_score`` 를
-    사용하며 그 매핑(oof_score_col/daily_score_col)을 명시적으로 기록합니다.
+    기본 매핑은 OOF ``pred`` → 일일 ``rank_score`` 이며, close-morning
+    reranker 는 ``decision_score`` → ``decision_score`` 를 명시적으로 기록합니다.
     """
     if policy is None or evaluation is None:
         return None
     return {
-        "oof_score_col": "pred",
-        "daily_score_col": "rank_score",
+        "oof_score_col": oof_score_col,
+        "daily_score_col": daily_score_col,
         "calibration_cutoff": str(policy.calibration_cutoff),
         "policy_version": policy.version,
         "policy_id": policy.policy_id,
@@ -90,6 +94,114 @@ def _policy_metadata(
     }
 
 
+def _align_close_morning_oof(
+    return_oof: pd.DataFrame,
+    risk_oof: pd.DataFrame,
+    target_col: str,
+    group_col: str,
+) -> pd.DataFrame:
+    """return OOF 와 quantile/classifier OOF 를 원본 행 인덱스로 정렬합니다.
+
+    날짜 단독 병합은 금지합니다. return 예측 행이 risk OOF 에 없거나 p_good
+    예측이 누락되거나 group/target/stock/scenario 식별 키가 원본 인덱스에서
+    어긋나면 ``ValueError`` 로 fail-closed 합니다 (누락 OOF 예측은 대체하지 않음).
+    """
+    missing = return_oof.index.difference(risk_oof.index)
+    if len(missing):
+        raise ValueError(
+            "close-morning OOF alignment: return-prediction rows are missing from "
+            f"quantile/classifier OOF ({len(missing)} rows); missing OOF predictions "
+            "are never substituted"
+        )
+    aligned = return_oof.join(risk_oof[["p_good"]], how="left")
+    if aligned["p_good"].isna().any():
+        raise ValueError(
+            "close-morning OOF alignment: p_good predictions are missing for aligned "
+            "return rows"
+        )
+    for col in (group_col, target_col):
+        if col not in risk_oof.columns:
+            continue
+        if not aligned[col].equals(risk_oof.loc[aligned.index, col]):
+            raise ValueError(
+                f"close-morning OOF alignment: {col} mismatch between return and risk "
+                "OOF on original index"
+            )
+    for col in ("stock_code", "chart_analysis"):
+        if col not in risk_oof.columns:
+            continue
+        if not aligned[col].equals(risk_oof.loc[aligned.index, col]):
+            raise ValueError(
+                f"close-morning OOF alignment: {col} mismatch between return and risk "
+                "OOF on original index"
+            )
+    return aligned
+
+
+def _calibrate_close_morning_decision_oof(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    group_col: str,
+    n_splits: int,
+    purge_gap: int,
+) -> tuple[
+    SingleStockPolicy | None,
+    SingleStockPolicyEvaluation | None,
+    dict[str, Any] | None,
+]:
+    """close-morning reranker OOF 정책 보정 (rank_score + p_good 순위 결합).
+
+    1. 회귀 champion(Huber) OOF ``pred`` 를 기존 purged walk-forward 파이프라인으로 산출하고,
+    2. 동일 피처/타깃/그룹/폴드/퍼지 갭으로 시계열 ``p_good`` OOF 를 산출한 뒤
+    3. 두 OOF 를 원본 행 인덱스로 정렬해 ``rank_score`` / ``decision_score`` 를 구성하고
+    4. ``evaluate_single_stock_policy_oof(..., score_col="decision_score")`` 로 보정합니다.
+
+    정책/메타데이터에는 ``oof_score_col=daily_score_col="decision_score"`` 를
+    기록합니다. 식별 컬럼이 없으면 ``(None, None, None)`` 을 반환합니다.
+    """
+    if not {"stock_code", "chart_analysis"} <= set(df.columns):
+        return None, None, None
+    result = run_model_pipeline(
+        df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=n_splits,
+        purge_gap=purge_gap,
+        model_type="lgb_regressor",
+    )
+    risk_oof = fit_predict_quantile_and_classifier(
+        df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=n_splits,
+        purge_gap=purge_gap,
+    )
+    aligned = _align_close_morning_oof(
+        result["oof_predictions"], risk_oof, target_col=target_col, group_col=group_col
+    )
+    aligned["rank_score"] = aligned["pred"]
+    aligned = add_close_morning_decision_score(aligned, group_col=group_col)
+    cutoff = str(aligned[group_col].max())
+    evaluation = evaluate_single_stock_policy_oof(
+        aligned,
+        target_col=target_col,
+        group_col=group_col,
+        stock_col="stock_code",
+        policy_candidates=default_policy_candidates(cutoff, score_col="decision_score"),
+        min_history_dates=_DEFAULT_MIN_HISTORY_DATES,
+        scenario_col="chart_analysis",
+        score_col="decision_score",
+    )
+    policy = evaluation.selected_policy
+    metadata = _policy_metadata(
+        policy, evaluation, oof_score_col="decision_score", daily_score_col="decision_score"
+    )
+    return policy, evaluation, metadata
+
+
 def _calibrate_oof_policy(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -97,15 +209,29 @@ def _calibrate_oof_policy(
     group_col: str,
     n_splits: int,
     purge_gap: int,
+    *,
+    reranker: bool = False,
 ) -> tuple[SingleStockPolicy | None, dict[str, Any] | None]:
     """시나리오 행동 패널에서 purged OOF 정책을 보정하고 번들용 메타데이터를 반환합니다.
 
-    ``stock_code`` / ``chart_analysis`` 식별 컬럼이 없으면 정책을 산출할 수
-    없으므로 ``(None, None)`` 을 반환합니다 — 호출부는 이를 명시적
+    ``reranker=True`` 이면 close-morning 결정 스코어(rank_score + p_good 순위)
+    OOF 보정을 사용하고, 그 외에는 기존 ``pred``/``rank_score`` 매핑을
+    유지합니다. ``stock_code`` / ``chart_analysis`` 식별 컬럼이 없으면 정책을
+    산출할 수 없으므로 ``(None, None)`` 을 반환합니다 — 호출부는 이를 명시적
     ``ABSTAIN(missing_validated_policy)`` 로 이어갑니다 (Top-N 폴백 금지).
     """
     if not {"stock_code", "chart_analysis"} <= set(df.columns):
         return None, None
+    if reranker:
+        policy, _evaluation, metadata = _calibrate_close_morning_decision_oof(
+            df,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=n_splits,
+            purge_gap=purge_gap,
+        )
+        return policy, metadata
     result = run_model_pipeline(
         df,
         feature_cols=feature_cols,
@@ -437,6 +563,57 @@ _FINITE_QUALITY_METRICS: tuple[str, ...] = (
     "close_to_morning_mdd",
 )
 
+# reranker 후보 정책(decision_score)이 적용되는 champion 피처셋.
+_RERANKER_FEATURE_SET = "close_morning61"
+
+
+def _policy_entry(
+    evaluation: SingleStockPolicyEvaluation | None,
+    n_oof_dates: int,
+    *,
+    prefix: str,
+) -> dict[str, Any]:
+    """OOF 정책 평가를 품질 보고 엔트리 지표 dict 로 변환합니다.
+
+    ``prefix`` 로 지표 이름을 명확히 구분해 레거시 rank-only 와 reranker
+    decision-score 정책을 같은 피처셋 엔트리에 함께 노출할 수 있습니다.
+    정책이 없으면 관망(ABSTAIN) 지표를 NaN/0 으로 기록합니다.
+    """
+    if evaluation is None:
+        return {
+            f"{prefix}top1_net_mean": float("nan"),
+            f"{prefix}scheduled_mean_return": float("nan"),
+            f"{prefix}active_trade_mean_return": float("nan"),
+            f"{prefix}active_trade_win_rate": float("nan"),
+            f"{prefix}win_rate": float("nan"),
+            f"{prefix}profit_factor": float("nan"),
+            f"{prefix}sharpe": float("nan"),
+            f"{prefix}close_to_morning_mdd": float("nan"),
+            f"{prefix}n_buy": 0,
+            f"{prefix}n_abstain": int(n_oof_dates),
+            f"{prefix}reason_counts": {"missing_validated_policy": int(n_oof_dates)},
+            f"{prefix}policy_candidate": None,
+        }
+    em = evaluation.metrics
+    return {
+        f"{prefix}top1_net_mean": float(em["scheduled_mean_return"]),
+        f"{prefix}scheduled_mean_return": float(em["scheduled_mean_return"]),
+        f"{prefix}active_trade_mean_return": float(em["active_trade_mean_return"]),
+        f"{prefix}active_trade_win_rate": float(em["active_trade_win_rate"]),
+        f"{prefix}win_rate": float(em["scheduled_win_rate"]),
+        f"{prefix}profit_factor": float(em["profit_factor"]),
+        f"{prefix}sharpe": float(em["scheduled_sharpe"]),
+        f"{prefix}close_to_morning_mdd": _max_drawdown(evaluation.scheduled_returns),
+        f"{prefix}n_buy": int(em["n_buy"]),
+        f"{prefix}n_abstain": int(em["n_abstain"]),
+        f"{prefix}reason_counts": dict(em["reason_counts"]),
+        f"{prefix}policy_candidate": (
+            evaluation.selected_policy.candidate
+            if evaluation.selected_policy is not None
+            else None
+        ),
+    }
+
 
 def _validate_quality_metrics(feature_set: str, metrics: dict[str, Any]) -> None:
     """보고 지표의 비유한 값은 fail-closed 로 거부합니다."""
@@ -510,50 +687,30 @@ def evaluate_close_morning_quality(
         )
         metrics = result["metrics"]
         evaluation = result["single_stock_evaluation"]
+        n_oof_dates = int(result["oof_df"][group_col].nunique())
         entry: dict[str, Any] = {
             "feature_set": feature_set,
             "n_features": len(feature_cols),
-            "n_oof_dates": int(result["oof_df"][group_col].nunique()),
+            "n_oof_dates": n_oof_dates,
             "oof_ndcg_1": float(metrics["ndcg_1"]),
             "oof_rank_ic": float(metrics["rank_ic"]),
         }
-        if evaluation is not None:
-            em = evaluation.metrics
-            entry.update(
-                {
-                    "top1_net_mean": float(em["scheduled_mean_return"]),
-                    "scheduled_mean_return": float(em["scheduled_mean_return"]),
-                    "active_trade_mean_return": float(em["active_trade_mean_return"]),
-                    "active_trade_win_rate": float(em["active_trade_win_rate"]),
-                    "win_rate": float(em["scheduled_win_rate"]),
-                    "profit_factor": float(em["profit_factor"]),
-                    "sharpe": float(em["scheduled_sharpe"]),
-                    "close_to_morning_mdd": _max_drawdown(evaluation.scheduled_returns),
-                    "n_buy": int(em["n_buy"]),
-                    "n_abstain": int(em["n_abstain"]),
-                    "reason_counts": dict(em["reason_counts"]),
-                    "policy_candidate": evaluation.selected_policy.candidate,
-                }
+        # 레거시 rank-only 정책 지표는 항상 전방호환 이름으로 노출합니다.
+        entry.update(_policy_entry(evaluation, n_oof_dates, prefix="legacy_"))
+        # champion 피처셋의 후보(candidate) 지표는 decision-score reranker 정책으로
+        # 대체하며, 정렬 검증을 통과한 경우에만 사용합니다(실패 시 fail-closed NaN).
+        if feature_set == _RERANKER_FEATURE_SET:
+            _policy, decision_evaluation, _metadata = _calibrate_close_morning_decision_oof(
+                processed,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                group_col=group_col,
+                n_splits=n_splits,
+                purge_gap=purge_gap,
             )
+            entry.update(_policy_entry(decision_evaluation, n_oof_dates, prefix=""))
         else:
-            entry.update(
-                {
-                    "top1_net_mean": float("nan"),
-                    "scheduled_mean_return": float("nan"),
-                    "active_trade_mean_return": float("nan"),
-                    "active_trade_win_rate": float("nan"),
-                    "win_rate": float("nan"),
-                    "profit_factor": float("nan"),
-                    "sharpe": float("nan"),
-                    "close_to_morning_mdd": float("nan"),
-                    "n_buy": 0,
-                    "n_abstain": int(result["oof_df"][group_col].nunique()),
-                    "reason_counts": {
-                        "missing_validated_policy": int(result["oof_df"][group_col].nunique())
-                    },
-                    "policy_candidate": None,
-                }
-            )
+            entry.update(_policy_entry(evaluation, n_oof_dates, prefix=""))
         report[feature_set] = entry
         _validate_quality_metrics(feature_set, entry)
 
