@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from src.ml.feature_manifest import build_feature_manifest
+from src.ml.scenario_action_panel import build_scenario_action_panel
 from src.ml.sizing_engine import ROUND_TRIP_COST_RATIO
 from src.processing.schema import RAW_TO_STANDARD_MAP
 
@@ -31,9 +32,40 @@ LABEL_THRESHOLDS: dict[str, float] = {"target_good": 0.01, "target_bad": -0.02}
 RETURN_CLIP_LOWER = -0.10
 RETURN_CLIP_UPPER = 0.10
 
-# point-in-time 무결성 타임스탬프 컬럼명 (Asia/Seoul timezone-aware)
+# point-in-time 무결성 타임스탬프 컬럼명 (아카이브 등 외부 모듈에서 소비)
 DECISION_TIMESTAMP_COL = "decision_timestamp"
 FEATURE_AVAILABLE_TIMESTAMP_COL = "feature_available_timestamp"
+
+# 허용되는 내부 피처셋: base40 → snapshot49 → interaction53 순으로만 승격합니다.
+_ALLOWED_FEATURE_SETS: tuple[str, ...] = ("base40", "snapshot49", "interaction53")
+
+# 허용되는 패널 모드:
+# - raw_rows: 원천 행을 그대로 유지 (기존 동작, 하위 호환).
+# - scenario_action: 원천 행을 시나리오 행동 패널로 정규화 (같은 날짜-종목의
+#   서로 다른 시나리오 행동을 보존하고 충돌 중복은 reject).
+_ALLOWED_PANEL_MODES: tuple[str, ...] = ("raw_rows", "scenario_action")
+
+# snapshot49: 기존 conservative 피처에 승격하는 내부 파생 피처 9종.
+# P0(ml_internal_panel_enhancement) 내부 재현 근거에서 OOF 성과가 확인됨.
+_SNAPSHOT49_FEATURES: tuple[str, ...] = (
+    "close_position",
+    "body_ratio",
+    "upper_shadow_ratio",
+    "intraday_range",
+    "buy_price_change_rate",
+    "gap_ratio",
+    "relative_change_rate",
+    "buy_price_change_rate_z",
+    "gap_ratio_z",
+)
+
+# interaction53: snapshot49 에 추가하는 상호작용 피처 4종 (기존 값의 벡터 연산).
+_INTERACTION53_FEATURES: tuple[str, ...] = (
+    "candle_strength",
+    "range_efficiency",
+    "flow_turnover",
+    "relative_flow_strength",
+)
 
 
 _NUMERIC_COLUMNS: tuple[str, ...] = (
@@ -129,6 +161,12 @@ _EXCLUDED_FROM_X: set[str] = {
     "buy_price_change_rate_z",
     "gap_ratio_z",
     "relative_change_rate_z",
+    # P1(ml_internal_panel_enhancement): interaction53 전용 상호작용 피처는
+    # base40 보수적 피처집합에서 제외하고 interaction53 에서만 승격합니다.
+    "candle_strength",
+    "range_efficiency",
+    "flow_turnover",
+    "relative_flow_strength",
     # 원본 금액/거래량 컬럼 (log_ 접두사 파생 컬럼만 학습 피처로 사용)
     "market_cap_100m",
     "trade_value_100m",
@@ -251,6 +289,21 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         if src_col in df.columns:
             df[dst_col] = df.groupby("trade_date")[src_col].rank(pct=True)
 
+    # P1(ml_internal_panel_enhancement): interaction53 상호작용 피처.
+    # 모두 기존 값의 벡터 연산이며, 분모 0 은 NaN 으로 안전 처리 후
+    # [-5, 5] 또는 논리적 범위로 클리핑합니다. base40 X 에서는 제외됩니다.
+    df["candle_strength"] = (
+        (2 * df["close_position"] - 1) * df["body_ratio"] * df["intraday_range"]
+    ).clip(-5, 5)
+    df["range_efficiency"] = (
+        df["intraday_return"].abs() / np.maximum(df["intraday_range"] / 100, 1e-6)
+    ).clip(0, 5)
+    df["flow_turnover"] = (df["major_density"] * df["turnover"]).clip(0, 5)
+    if "major_density_pct_rank" in df.columns and "change_rate_pct_rank" in df.columns:
+        df["relative_flow_strength"] = (
+            df["major_density_pct_rank"] * df["change_rate_pct_rank"]
+        ).clip(0, 1)
+
     df = df.replace([np.inf, -np.inf], np.nan)
     return df
 
@@ -310,28 +363,32 @@ def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
     return df
 
 
-def _reject_non_causal_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """피처 이용 가능 시각이 decision 시각보다 늦은 행을 학습에서 제외합니다.
-
-    타임스탬프 컬럼이 둘 다 존재할 때만 적용됩니다 (없으면 원본 그대로 반환).
-    decision 시각보다 늦게 이용 가능해진 피처 행은 미래 정보 누출 후보이므로
-    X 를 구성하기 전에 버립니다.
-    """
-    if not {DECISION_TIMESTAMP_COL, FEATURE_AVAILABLE_TIMESTAMP_COL} <= set(df.columns):
-        return df
-    available = pd.to_datetime(df[FEATURE_AVAILABLE_TIMESTAMP_COL], utc=True)
-    decision = pd.to_datetime(df[DECISION_TIMESTAMP_COL], utc=True)
-    causal_mask = available <= decision
-    rejected = int((~causal_mask).sum())
-    if rejected:
-        logger.info("rejected %d non-causal rows (feature_available > decision)", rejected)
-    return df.loc[causal_mask].copy()
-
-
 def build_ml_dataset(
-    trade_log_df: pd.DataFrame, theme_df: pd.DataFrame | None = None
+    trade_log_df: pd.DataFrame,
+    theme_df: pd.DataFrame | None = None,
+    feature_set: str = "base40",
+    panel_mode: str = "raw_rows",
 ) -> tuple[pd.DataFrame, dict[str, pd.Series], list[str], pd.DataFrame]:
-    """매매일지 원본 데이터를 정제하여 (X, targets, cat_features, processed_df)를 반환합니다."""
+    """매매일지 원본 데이터를 정제하여 (X, targets, cat_features, processed_df)를 반환합니다.
+
+    ``feature_set`` 은 ``base40`` / ``snapshot49`` / ``interaction53`` 만 허용하며,
+    기본값 ``base40`` 은 기존 conservative 피처집합과 호환됩니다. 시간 컬럼은
+    검증·합성·검사하지 않습니다 (고정된 업무 원천 규칙).
+
+    ``panel_mode`` 는 ``raw_rows``(기본, 원천 행 유지) 또는 ``scenario_action``
+    만 허용합니다. ``scenario_action`` 은 clean → 행동 패널 정규화 → 피처/타깃
+    생성 순서로 동작하며, 같은 날짜-종목의 서로 다른 시나리오 행동을 모두
+    보존합니다. 충돌 중복은 학습에서 제외되고
+    ``processed.attrs['scenario_action_rejects']`` 로 노출됩니다.
+    """
+    if feature_set not in _ALLOWED_FEATURE_SETS:
+        raise ValueError(
+            f"feature_set must be one of {list(_ALLOWED_FEATURE_SETS)}, got {feature_set!r}"
+        )
+    if panel_mode not in _ALLOWED_PANEL_MODES:
+        raise ValueError(
+            f"panel_mode must be one of {list(_ALLOWED_PANEL_MODES)}, got {panel_mode!r}"
+        )
     df = clean_column_names(trade_log_df.copy())
 
     if theme_df is not None and not theme_df.empty:
@@ -351,8 +408,11 @@ def build_ml_dataset(
     if "trade_date" not in df.columns or "net_return" not in df.columns:
         raise ValueError("필수 컬럼(trade_date, net_return)이 데이터에 없습니다.")
 
+    if panel_mode == "scenario_action":
+        df, scenario_rejects = build_scenario_action_panel(df)
+        df.attrs["scenario_action_rejects"] = scenario_rejects
+
     df = df.dropna(subset=["net_return"]).copy()
-    df = _reject_non_causal_rows(df)
     df = engineer_features(df)
     df = _apply_robust_z(df, _ROBUST_Z_COLUMNS)
     df = create_multi_targets(df)
@@ -364,8 +424,22 @@ def build_ml_dataset(
     cat_features = [col for col in _CATEGORICAL_COLUMNS if col in df.columns]
     targets = {name: df[name] for name in _TARGET_NAMES}
     feature_cols = [col for col in df.columns if col not in _EXCLUDED_FROM_X]
+    if feature_set in ("snapshot49", "interaction53"):
+        feature_cols.extend(col for col in _SNAPSHOT49_FEATURES if col in df.columns)
+    if feature_set == "interaction53":
+        feature_cols.extend(col for col in _INTERACTION53_FEATURES if col in df.columns)
+    if panel_mode == "scenario_action":
+        # chart_analysis 원문은 감사용 메타데이터이며, LightGBM 입력에는 고정
+        # one-hot 수치 피처(SCENARIO_ONE_HOT_FEATURES)를 사용합니다.
+        feature_cols = [col for col in feature_cols if col != "chart_analysis"]
+        cat_features = [col for col in cat_features if col != "chart_analysis"]
+    feature_cols = list(dict.fromkeys(feature_cols))
     X = df[feature_cols].copy()
     manifest = build_feature_manifest(feature_cols)
     df.attrs["feature_manifest"] = manifest
+    df.attrs["feature_set"] = feature_set
+    df.attrs["panel_mode"] = panel_mode
     X.attrs["feature_manifest"] = manifest
+    X.attrs["feature_set"] = feature_set
+    X.attrs["panel_mode"] = panel_mode
     return X, targets, cat_features, df

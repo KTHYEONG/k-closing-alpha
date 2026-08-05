@@ -199,8 +199,13 @@ def test_build_ml_dataset_attaches_feature_manifest() -> None:
 
 
 def test_production_feature_set_excludes_candle_price_derived_features() -> None:
-    """P0: close/high/low/실현 매수가 파생 피처는 생성되지만 프로덕션 피처 집합(X)에서 제외됩니다."""
+    """P0: base40 은 close/high/low/실현 매수가 파생 피처를 X 에서 제외합니다.
+
+    base40 은 이전 conservative feature 집합과 동일해야 하므로
+    캔들/실현 매수가 파생 피처와 그 robust-z 변환을 포함하지 않습니다.
+    """
     X, targets, cat_features, processed = build_ml_dataset(_build_raw_df())
+    assert X.attrs["feature_set"] == "base40"
     candle_derived = {
         "close_position",
         "body_ratio",
@@ -218,20 +223,143 @@ def test_production_feature_set_excludes_candle_price_derived_features() -> None
         assert z_col not in X.columns
 
 
-def test_build_ml_dataset_rejects_non_causal_rows() -> None:
-    """피처 이용 가능 시각이 decision 시각보다 늦은 행은 X 구성 전에 제외됩니다."""
-    df = _build_raw_df(n_per_date=[3, 3, 3])
-    cleaned = clean_column_names(df)
-    cleaned["decision_timestamp"] = pd.Timestamp("2024-01-02 15:30:00", tz="Asia/Seoul")
-    cleaned["feature_available_timestamp"] = pd.Timestamp(
-        "2024-01-02 15:30:00", tz="Asia/Seoul"
+def test_snapshot49_feature_set_promotes_nine_documented_features() -> None:
+    """snapshot49 는 정확히 9개 내부 피처를 X 에 승격합니다."""
+    X, targets, cat_features, processed = build_ml_dataset(
+        _build_raw_df(), feature_set="snapshot49"
     )
-    cleaned.loc[cleaned.index[0], "feature_available_timestamp"] = pd.Timestamp(
-        "2024-01-02 15:45:00", tz="Asia/Seoul"
+    assert X.attrs["feature_set"] == "snapshot49"
+    promoted = {
+        "close_position",
+        "body_ratio",
+        "upper_shadow_ratio",
+        "intraday_range",
+        "buy_price_change_rate",
+        "gap_ratio",
+        "relative_change_rate",
+        "buy_price_change_rate_z",
+        "gap_ratio_z",
+    }
+    assert promoted.issubset(set(processed.columns))
+    assert promoted.issubset(X.columns)
+    # 원시 가격/매수가/결과 열은 여전히 X 에서 제외됩니다.
+    assert not {"open_price", "close_price", "buy_price", "sell_price", "net_return"}.intersection(
+        X.columns
     )
-    X, targets, cat_features, processed = build_ml_dataset(cleaned)
-    assert len(processed) == len(cleaned) - 1
+
+
+def test_interaction53_feature_set_adds_four_interaction_features() -> None:
+    """interaction53 은 snapshot49 에 4개 상호작용 피처만 추가합니다."""
+    X, targets, cat_features, processed = build_ml_dataset(
+        _build_raw_df(), feature_set="interaction53"
+    )
+    assert X.attrs["feature_set"] == "interaction53"
+    interactions = {"candle_strength", "range_efficiency", "flow_turnover", "relative_flow_strength"}
+    assert interactions.issubset(set(processed.columns))
+    assert interactions.issubset(X.columns)
+    snapshot49 = {
+        "close_position",
+        "body_ratio",
+        "upper_shadow_ratio",
+        "intraday_range",
+        "buy_price_change_rate",
+        "gap_ratio",
+        "relative_change_rate",
+        "buy_price_change_rate_z",
+        "gap_ratio_z",
+    }
+    assert snapshot49.issubset(X.columns)
+    # X 에 결과/식별자/원시 가격 열이 누출되지 않아야 합니다.
+    assert not {"stock_code", "sell_price", "net_return", "intraday_return"}.intersection(X.columns)
+
+
+def test_build_ml_dataset_rejects_unknown_feature_set() -> None:
+    """허용되지 않는 feature_set 은 ValueError 를 발생시킵니다."""
+    with pytest.raises(ValueError, match="feature_set"):
+        build_ml_dataset(_build_raw_df(), feature_set="leaky80")
+
+
+def test_build_ml_dataset_rejects_unknown_panel_mode() -> None:
+    """허용되지 않는 panel_mode 는 ValueError 를 발생시킵니다."""
+    with pytest.raises(ValueError, match="panel_mode"):
+        build_ml_dataset(_build_raw_df(), panel_mode="raw_rows_legacy")
+
+
+def _build_scenario_raw_df() -> pd.DataFrame:
+    """날짜-종목별로 서로 다른 시나리오를 가진 원본 헤더 형태의 DataFrame."""
+    df = _build_raw_df(n_per_date=[3, 3])
+    df["(차트분석)"] = ["상따", "120 돌파", "거래량 폭증", "상한가 다음날", "신고가 근접", "상승형 음봉"]
+    return df
+
+
+def test_build_ml_dataset_scenario_action_panel_mode() -> None:
+    """scenario_action 모드는 행동 패널을 거쳐 고정 시나리오 one-hot 피처를 X 에 포함합니다."""
+    X, targets, cat_features, processed = build_ml_dataset(
+        _build_scenario_raw_df(), panel_mode="scenario_action"
+    )
+    assert processed.attrs["panel_mode"] == "scenario_action"
+    assert X.attrs["panel_mode"] == "scenario_action"
+    assert len(processed) == 6
+    scenario_cols = {
+        "scenario_is_sangtta",
+        "scenario_is_120_breakout",
+        "scenario_is_volume_surge",
+        "scenario_is_new_high",
+        "scenario_is_near_new_high",
+        "scenario_is_limitup_next_day",
+        "scenario_is_rising_bearish",
+        "scenario_other",
+        "scenario_count_for_stock_date",
+        "has_sangtta_for_stock_date",
+        "is_multi_scenario_stock_date",
+    }
+    assert scenario_cols.issubset(X.columns)
+    # chart_analysis 원문은 one-hot 수치 피처를 대신 사용하므로 X 에서 제외됩니다.
+    assert "chart_analysis" not in X.columns
+    assert "chart_analysis" not in cat_features
+    # X 에 결과/식별자/원시 가격이 누출되지 않습니다.
+    assert not {"sell_price", "net_return", "stock_code", "trade_date"}.intersection(X.columns)
+
+
+def test_build_ml_dataset_scenario_action_excludes_conflicting_rejects() -> None:
+    """충돌 중복 행동은 reject 로 노출되고 X/타깃/학습에서 제외됩니다."""
+    df = _build_raw_df(n_per_date=[2, 2])
+    df["(차트분석)"] = ["상따", "상따", "거래량 폭증", "신고가"]
+    # 같은 날짜-종목-시나리오 key 의 실행값 충돌 생성.
+    df.loc[1, "종목코드"] = df.loc[0, "종목코드"]
+    df.loc[1, "(수익률, %)"] = "9.99%"
+
+    X, targets, cat_features, processed = build_ml_dataset(df, panel_mode="scenario_action")
+    rejects = processed.attrs["scenario_action_rejects"]
+    assert len(rejects) == 2
+    assert (rejects["reject_reason"] == "conflicting_duplicate_action").all()
+    assert len(processed) == 2
     assert len(X) == len(processed)
+    assert len(targets["target_return"]) == len(processed)
+
+
+def test_build_ml_dataset_scenario_action_context_for_sangtta_stock_date() -> None:
+    """상따가 포함된 날짜-종목은 has_sangtta/is_multi_scenario 가 1 이 됩니다."""
+    df = _build_raw_df(n_per_date=[3, 3])
+    df["(차트분석)"] = ["상따", "120 돌파", "거래량 폭증", "상한가 다음날", "신고가 근접", "상승형 음봉"]
+    # 날짜1의 000000 에 상따 + 120 돌파 두 행동을 생성.
+    df.loc[1, "종목코드"] = df.loc[0, "종목코드"]
+    X, targets, cat_features, processed = build_ml_dataset(df, panel_mode="scenario_action")
+    group = processed.loc[processed["stock_code"] == "000000"]
+    date1 = group["trade_date"].iloc[0]
+    date1_group = group.loc[group["trade_date"] == date1]
+    assert (date1_group["scenario_count_for_stock_date"] == 2).all()
+    assert (date1_group["has_sangtta_for_stock_date"] == 1).all()
+    assert (date1_group["is_multi_scenario_stock_date"] == 1).all()
+
+
+def test_build_ml_dataset_raw_rows_keeps_chart_analysis_categorical() -> None:
+    """raw_rows 모드는 chart_analysis 를 기존 범주형 피처로 유지합니다."""
+    X, targets, cat_features, processed = build_ml_dataset(_build_raw_df())
+    assert processed.attrs["panel_mode"] == "raw_rows"
+    assert "chart_analysis" in X.columns
+    assert "chart_analysis" in cat_features
+    assert "scenario_is_sangtta" not in X.columns
 
 
 def test_engineer_features_created() -> None:

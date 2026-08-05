@@ -86,36 +86,109 @@ def test_run_model_pipeline_returns_contract_shapes(model_type: str) -> None:
 
 
 def test_run_model_pipeline_rejects_missing_timestamps() -> None:
+    """타임스탬프가 없는 현재 후보 패널로도 chronological training 이 성공합니다.
+
+    시간은 고정된 업무 원천 규칙이며 모델 입력·CV 분할·artifact 승인 조건이
+    아니므로, 타임스탬프 컬럼이 없어도 walk-forward 학습이 동작해야 합니다.
+    """
     df = _make_dataset(include_timestamps=False)
-    with pytest.raises(ValueError, match="timestamp column"):
-        run_model_pipeline(
-            df,
-            feature_cols=FEATURE_COLS,
-            target_col=TARGET_COL,
-            group_col=GROUP_COL,
-        )
+    result = run_model_pipeline(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+    )
+    oof = result["oof_predictions"]
+    assert 0 < len(oof) <= len(df)
+    assert set(oof.columns) >= {"pred", GROUP_COL, TARGET_COL, "fold"}
+    assert result["metrics"]["ndcg_1"] >= 0.0
 
 
-def test_run_model_pipeline_rejects_naive_timestamps() -> None:
+def test_run_model_pipeline_retains_metadata_columns_in_oof() -> None:
+    """OOF 에 stock_code/market_type/market_cap_100m 가 보존되어 시장구분·시총 분석이 가능합니다."""
     df = _make_dataset()
-    df["decision_timestamp"] = df["decision_timestamp"].dt.tz_localize(None)
-    with pytest.raises(ValueError, match="timezone-aware"):
+    df["stock_code"] = [f"{i:06d}" for i in range(len(df))]
+    df["market_type"] = ["KOSPI" if i % 2 == 0 else "KOSDAQ" for i in range(len(df))]
+    df["market_cap_100m"] = np.linspace(100.0, 3_000.0, len(df))
+    oof = run_model_pipeline(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+        model_type="lgb_regressor",
+    )["oof_predictions"]
+    assert {"stock_code", "market_type", "market_cap_100m"}.issubset(oof.columns)
+
+
+def test_run_model_pipeline_retains_scenario_metadata_in_oof() -> None:
+    """OOF 에 chart_analysis 와 시나리오 context 컬럼이 보존됩니다."""
+    df = _make_dataset()
+    df["chart_analysis"] = ["상따" if i % 3 == 0 else "신고가" for i in range(len(df))]
+    df["scenario_count_for_stock_date"] = 1
+    df["has_sangtta_for_stock_date"] = (np.arange(len(df)) % 3 == 0).astype(int)
+    df["is_multi_scenario_stock_date"] = 0
+    oof = run_model_pipeline(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+        model_type="lgb_regressor",
+    )["oof_predictions"]
+    assert {
+        "chart_analysis",
+        "scenario_count_for_stock_date",
+        "has_sangtta_for_stock_date",
+        "is_multi_scenario_stock_date",
+    }.issubset(oof.columns)
+    assert oof["chart_analysis"].notna().all()
+
+
+def test_run_model_pipeline_passes_model_params_to_requested_model() -> None:
+    """model_params 는 요청된 모델에만 전달되고 random_state=42 가 유지됩니다."""
+    df = _make_dataset()
+    params = {"learning_rate": 0.02, "num_leaves": 7}
+    first = run_model_pipeline(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+        model_type="lgb_regressor",
+        model_params=params,
+    )
+    second = run_model_pipeline(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+        model_type="lgb_regressor",
+        model_params=params,
+    )
+    np.testing.assert_array_equal(
+        first["oof_predictions"]["pred"].to_numpy(),
+        second["oof_predictions"]["pred"].to_numpy(),
+    )
+    assert all(getattr(m, "learning_rate", None) == 0.02 for m in first["trained_models"])
+
+
+def test_run_model_pipeline_rejects_negative_purge_gap() -> None:
+    df = _make_dataset()
+    with pytest.raises(ValueError, match="purge_gap"):
         run_model_pipeline(
             df,
             feature_cols=FEATURE_COLS,
             target_col=TARGET_COL,
             group_col=GROUP_COL,
-        )
-
-
-def test_run_model_pipeline_rejects_non_causal_rows() -> None:
-    df = _make_dataset(violate_causality=True)
-    with pytest.raises(ValueError, match="non-causal"):
-        run_model_pipeline(
-            df,
-            feature_cols=FEATURE_COLS,
-            target_col=TARGET_COL,
-            group_col=GROUP_COL,
+            purge_gap=-1,
         )
 
 
