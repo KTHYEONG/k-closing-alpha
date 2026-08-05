@@ -15,7 +15,10 @@ logger = logging.getLogger(__name__)
 # DB 및 시트 관련 임포트
 from src.data.db_loader import load_theme_from_db
 from src.data.sync_sheet_db import sync_theme_only
-from src.ml.model_pipeline import run_model_pipeline  # noqa: F401  (Purged Walk-Forward CV 학습 파이프라인 진입점)
+from src.ml.model_pipeline import (  # noqa: F401  (Purged Walk-Forward CV 학습 파이프라인 진입점)
+    _calibrate_oof_policy,
+    run_model_pipeline,
+)
 from src.ml.single_stock_policy import (
     REASON_MISSING_POLICY,
     SingleStockPolicy,
@@ -343,7 +346,9 @@ _DUMMY_FEATURE_PATTERN = re.compile(r"^f\d+$")
 _MODEL_BUNDLE_KEYS = ("rank_model", "quantile_models", "calibrators")
 
 # research 후보 피처셋: 활성 아티팩트와 분리된 버전화 하위 디렉터리에 저장합니다.
-_CANDIDATE_FEATURE_SET = "production_calendar_flow"
+# 검증된 champion close_morning61 이 기본 후보이며, 승격 전까지 활성 아티팩트를
+# 덮어쓰지 않도록 cutoff 로 버전화된 후보 경로를 사용합니다.
+_CANDIDATE_FEATURE_SET = "close_morning61"
 
 
 def _candidate_export_dir(
@@ -352,9 +357,9 @@ def _candidate_export_dir(
     """후보 피처셋 번들은 버전화된 하위 디렉터리에 저장할 경로를 반환합니다.
 
     활성 아티팩트는 ``export_dir`` 루트의 ``sizing_pipeline_bundle.joblib`` 이므로,
-    후보(``production_calendar_flow``)는 훈련 데이터 cutoff 날짜(YYYY-MM-DD)로
-    버전화된 별도 디렉터리에 기록해 활성 아티팩트를 덮어쓰지 않습니다.
-    다른 feature_set(활성 아티팩트 재학습)은 기존대로 루트 경로를 반환합니다.
+    후보(``close_morning61``)는 훈련 데이터 cutoff 날짜(YYYY-MM-DD)로 버전화된
+    별도 디렉터리에 기록해 활성 아티팩트를 덮어쓰지 않습니다. 다른
+    feature_set(활성 아티팩트 재학습)은 기존대로 루트 경로를 반환합니다.
     """
     if feature_set != _CANDIDATE_FEATURE_SET:
         return export_dir
@@ -384,17 +389,24 @@ def train_and_save_real_model_bundle(
     export_dir: str = "artifacts/models",
     trade_log_path: str | os.PathLike[str] | None = None,
     theme_path: str | os.PathLike[str] | None = None,
-    feature_set: str = "production_calendar_flow",
+    feature_set: str = "close_morning61",
     panel_mode: str = "scenario_action",
 ) -> dict[str, Any]:
     """``trade_log.parquet`` 실데이터로 표준 ML 번들을 학습·저장한 뒤 반환합니다.
 
-    기본값은 평가된 연구 후보 패널과 동일한 ``production_calendar_flow`` 피처셋
-    + ``scenario_action`` 패널 모드입니다. 후보 번들은 활성 아티팩트를 덮어쓰지
-    않도록 훈련 cutoff 로 버전화된 하위 디렉터리에 저장되고, ``feature_set`` /
-    ``panel_mode`` / ``feature_manifest`` 메타데이터를 영속화합니다. 승격
-    게이트(독립 holdout + paper-trading) 통과 전까지 활성 아티팩트를 대체하지
-    않습니다.
+    기본값은 검증된 champion ``close_morning61`` 피처셋 + ``scenario_action``
+    패널 모드입니다. 훈련 절차:
+
+    1. ``build_ml_dataset`` 로 ``close_morning61`` 시나리오 행동 패널을 구성합니다.
+    2. ``run_model_pipeline`` 으로 동일 수치 피처 + 행동 메타데이터로 purged OOF
+       예측과 ``SingleStockPolicy`` 를 생성합니다.
+    3. ``_train_inline_bundle`` 로 전체 이력 최종 추론 모델을 학습합니다.
+    4. ``single_stock_policy.model_dump()`` 와 함께 ``oof_score_col="pred"``,
+       ``daily_score_col="rank_score"``, 보정 cutoff, 정책 버전, 피처셋 이름,
+       compact OOF 정책 지표를 번들에 영속화합니다.
+    5. 버전화된 후보 아티팩트만 저장하며 활성 아티팩트를 자동으로 대체하지
+       않습니다. 정책 상태가 없으면 ``ABSTAIN(missing_validated_policy)`` 로
+       명시 처리되고 Top-N 폴백은 없습니다.
 
     ``build_ml_dataset`` 산출 feature_cols 에서 범주형 문자열 컬럼
     (``market_type``, ``theme_sector``, ``chart_analysis``)을 제외한 수치
@@ -410,6 +422,14 @@ def train_and_save_real_model_bundle(
     feature_cols = [col for col in X.columns if col not in cat_features]
     target_col = "target_return"
     group_col = "trade_date"
+    policy, policy_metadata = _calibrate_oof_policy(
+        processed,
+        feature_cols,
+        target_col,
+        group_col,
+        n_splits=5,
+        purge_gap=1,
+    )
     bundle = _train_inline_bundle(
         processed[[*feature_cols, target_col, group_col]],
         feature_cols,
@@ -418,12 +438,18 @@ def train_and_save_real_model_bundle(
     )
     bundle["feature_set"] = feature_set
     bundle["panel_mode"] = panel_mode
+    bundle["single_stock_policy"] = policy.model_dump() if policy is not None else None
+    bundle["policy_metadata"] = policy_metadata
+    bundle["oof_score_col"] = "pred"
+    bundle["daily_score_col"] = "rank_score"
     save_dir = _candidate_export_dir(export_dir, feature_set, bundle)
     save_model_artifacts(bundle, save_dir)
     logger.info(
         f"{Colors.GREEN}실데이터 모델 번들 재학습·저장 완료: "
         f"feature_set={feature_set} panel_mode={panel_mode} "
-        f"feature_cols={len(feature_cols)}개 (save_dir={save_dir}){Colors.RESET}"
+        f"feature_cols={len(feature_cols)}개 "
+        f"policy={'serialized' if policy is not None else 'absent(ABSTAIN)'} "
+        f"(save_dir={save_dir}){Colors.RESET}"
     )
     return bundle
 
