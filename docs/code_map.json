@@ -28,7 +28,7 @@
       "tests/test_preprocessor.py",
       "tests/unit/processing/test_preprocessor.py"
     ],
-    "architecture": "docs/results/ml-internal-rerun-2026-08-05.md"
+    "architecture": "docs/results/ml-v3.md"
   },
   "src/processing/legacy_mapping.py": {
     "testing": "tests/test_preprocessor.py"
