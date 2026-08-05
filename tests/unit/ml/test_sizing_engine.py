@@ -18,7 +18,9 @@ from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
 from sklearn.calibration import CalibratedClassifierCV
 
 from src.ml.sizing_engine import (
+    _CLOSE_MORNING_RERANKER_CONFIG,
     _train_inline_bundle,
+    add_close_morning_decision_score,
     apply_risk_limits,
     assign_sizing_grades,
     calculate_utility_score,
@@ -541,4 +543,127 @@ def test_predict_from_bundle_falls_back_to_rank_model_without_return_model() -> 
     result = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=legacy)
     expected = legacy["rank_model"].predict(df[FEATURE_COLS])
     np.testing.assert_allclose(result["rank_score"].to_numpy(), expected, atol=1e-12)
+
+
+def test_add_close_morning_decision_score_formula_is_groupwise() -> None:
+    """(SCENARIO: close_morning_decision_score) decision_score 는 그룹(날짜) 내
+    rank_score 백분위 + 0.5 x p_good 백분위로 산출됩니다."""
+    df = pd.DataFrame(
+        {
+            GROUP_COL: ["2024-01-01"] * 3 + ["2024-01-02"] * 3,
+            "rank_score": [0.3, 0.1, 0.2, 0.5, 0.4, 0.6],
+            "p_good": [0.1, 0.9, 0.5, 0.8, 0.2, 0.4],
+        }
+    )
+    out = add_close_morning_decision_score(df)
+    expected = (
+        df.groupby(GROUP_COL)["rank_score"].rank(pct=True, method="average")
+        + 0.5 * df.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+    )
+    assert out["decision_score"].name == "decision_score"
+    pd.testing.assert_series_equal(out["decision_score"], expected.rename("decision_score"))
+    assert out.columns.tolist() == [GROUP_COL, "rank_score", "p_good", "decision_score"]
+
+
+def test_add_close_morning_decision_score_resolves_ties_with_average() -> None:
+    """동점 rank_score 는 method='average' 백분위 순위로 해소됩니다."""
+    df = pd.DataFrame(
+        {
+            GROUP_COL: ["2024-01-01"] * 3,
+            "rank_score": [0.5, 0.5, 0.2],
+            "p_good": [0.4, 0.6, 0.8],
+        }
+    )
+    out = add_close_morning_decision_score(df)
+    expected = (
+        df.groupby(GROUP_COL)["rank_score"].rank(pct=True, method="average")
+        + 0.5 * df.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+    )
+    pd.testing.assert_series_equal(out["decision_score"], expected.rename("decision_score"))
+    # 동점 0.5 두 건은 평균 순위 2.5 → pct 2.5/3, 최저값 0.2 는 1/3 입니다.
+    assert float(out["decision_score"].iloc[0]) == pytest.approx(
+        2.5 / 3 + 0.5 * (1 / 3)
+    )
+    assert float(out["decision_score"].iloc[1]) == pytest.approx(
+        2.5 / 3 + 0.5 * (2 / 3)
+    )
+
+
+def test_add_close_morning_decision_score_handles_single_row_group() -> None:
+    """한 행으로만 구성된 그룹은 백분위 순위 1.0 을 유지합니다."""
+    df = pd.DataFrame(
+        {
+            GROUP_COL: ["2024-01-01", "2024-01-02"],
+            "rank_score": [0.5, 0.9],
+            "p_good": [0.2, 0.3],
+        }
+    )
+    out = add_close_morning_decision_score(df)
+    assert float(out["decision_score"].iloc[0]) == pytest.approx(1.0 + 0.5 * 1.0)
+    assert float(out["decision_score"].iloc[1]) == pytest.approx(1.0 + 0.5 * 1.0)
+
+
+def test_add_close_morning_decision_score_rejects_missing_columns() -> None:
+    df = pd.DataFrame({GROUP_COL: ["2024-01-01"], "rank_score": [0.5], "p_good": [0.5]})
+    with pytest.raises(ValueError, match="missing required columns"):
+        add_close_morning_decision_score(df.drop(columns=["p_good"]))
+    with pytest.raises(ValueError, match="missing required columns"):
+        add_close_morning_decision_score(df.drop(columns=[GROUP_COL]))
+
+
+def test_add_close_morning_decision_score_rejects_non_finite_scores() -> None:
+    df = pd.DataFrame(
+        {GROUP_COL: ["2024-01-01"] * 2, "rank_score": [0.5, np.nan], "p_good": [0.5, 0.5]}
+    )
+    with pytest.raises(ValueError, match="must be finite"):
+        add_close_morning_decision_score(df)
+
+
+def test_add_close_morning_decision_score_rejects_out_of_range_weight() -> None:
+    df = pd.DataFrame({GROUP_COL: ["2024-01-01"], "rank_score": [0.5], "p_good": [0.5]})
+    with pytest.raises(ValueError, match="within \\[0, 1\\]"):
+        add_close_morning_decision_score(df, probability_weight=1.5)
+
+
+def test_add_close_morning_decision_score_never_reads_target_column() -> None:
+    """결정 스코어는 rank_score/p_good/그룹 컬럼만 소비하고 수익률/미래 정보는 읽지 않습니다."""
+    df = pd.DataFrame(
+        {
+            GROUP_COL: ["2024-01-01"] * 2,
+            "rank_score": [0.5, 0.7],
+            "p_good": [0.4, 0.6],
+            "target_net_return": [0.05, 0.01],
+        }
+    )
+    out = add_close_morning_decision_score(df)
+    expected = (
+        df.groupby(GROUP_COL)["rank_score"].rank(pct=True, method="average")
+        + 0.5 * df.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+    )
+    pd.testing.assert_series_equal(out["decision_score"], expected.rename("decision_score"))
+
+
+def test_predict_daily_position_sizing_appends_decision_score_for_reranker_bundle() -> None:
+    """reranker v1 설정 번들은 rank_score/p_good 예측 직후 decision_score 를 추가합니다."""
+    df = _make_feature_df()
+    bundle = dict(_build_bundle(df))
+    bundle["decision_score_config"] = dict(_CLOSE_MORNING_RERANKER_CONFIG)
+    result = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bundle)
+    assert "decision_score" in result.columns
+    expected = (
+        result.groupby(GROUP_COL)["rank_score"].rank(pct=True, method="average")
+        + 0.5 * result.groupby(GROUP_COL)["p_good"].rank(pct=True, method="average")
+    )
+    pd.testing.assert_series_equal(
+        result["decision_score"], expected.rename("decision_score")
+    )
+
+
+def test_predict_daily_position_sizing_legacy_bundle_has_no_decision_score() -> None:
+    """decision_score_config 가 없는 레거시 번들은 기존 출력을 유지합니다."""
+    df = _make_feature_df()
+    bundle = _build_bundle(df)
+    result = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=bundle)
+    assert "decision_score" not in result.columns
+    assert {"rank_score", "p_good"}.issubset(result.columns)
 

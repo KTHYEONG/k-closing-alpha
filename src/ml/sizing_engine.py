@@ -54,6 +54,14 @@ _CATEGORICAL_FEATURE_COLS: tuple[str, ...] = (
     "chart_analysis",
 )
 
+# close-morning reranker v1 불변 설정 (후보 번들에 영속화되며 추론 시점에만 소비).
+_CLOSE_MORNING_RERANKER_CONFIG: dict[str, Any] = {
+    "version": "close-morning-reranker-v1",
+    "rank_weight": 1.0,
+    "p_good_weight": 0.5,
+    "score_col": "decision_score",
+}
+
 
 def calculate_utility_score(
     df: pd.DataFrame,
@@ -376,6 +384,40 @@ def _predict_from_bundle(
     return out
 
 
+def add_close_morning_decision_score(
+    df: pd.DataFrame,
+    group_col: str = "date",
+    rank_score_col: str = "rank_score",
+    p_good_col: str = "p_good",
+    output_col: str = "decision_score",
+    probability_weight: float = 0.5,
+) -> pd.DataFrame:
+    """close-morning reranker 결정 스코어를 그룹(날짜) 내 횡단면 백분위 순위로 산출합니다.
+
+    ``decision_score = rank(rank_score, pct=True) + probability_weight * rank(p_good, pct=True)``
+    벡터화된 ``groupby().rank`` 를 사용하며 row-wise apply 를 피하고 타깃/수익률
+    컬럼을 절대 읽지 않습니다(미래 정보 금지). 누락 그룹/스코어 컬럼, 비유한
+    스코어, 또는 ``[0, 1]`` 을 벗어난 ``probability_weight`` 는 ``ValueError`` 로
+    fail-closed 합니다.
+    """
+    missing = [col for col in (group_col, rank_score_col, p_good_col) if col not in df.columns]
+    if missing:
+        raise ValueError(f"missing required columns for close-morning decision score: {missing}")
+    if not 0.0 <= probability_weight <= 1.0:
+        raise ValueError(f"probability_weight must be within [0, 1], got {probability_weight}")
+    rank_score = df[rank_score_col].to_numpy(dtype=np.float64)
+    p_good = df[p_good_col].to_numpy(dtype=np.float64)
+    if not np.isfinite(rank_score).all() or not np.isfinite(p_good).all():
+        raise ValueError(
+            "rank_score and p_good must be finite for close-morning decision score"
+        )
+    out = df.copy()
+    rank_pct = df.groupby(group_col)[rank_score_col].rank(pct=True, method="average")
+    p_good_pct = df.groupby(group_col)[p_good_col].rank(pct=True, method="average")
+    out[output_col] = rank_pct + probability_weight * p_good_pct
+    return out
+
+
 def predict_daily_position_sizing(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -389,6 +431,10 @@ def predict_daily_position_sizing(
     ``target_col`` 을 사용해 인라인 모델을 학습합니다. rank_score, 분위수 예측
     (pred_q10/pred_q50/pred_q90), 보정 확률(p_good/p_bad)을 산출한 뒤
     Utility Score -> 등급(Strong/Good/Weak/Pass) -> 배분(allocation)을 계산합니다.
+
+    번들이 ``decision_score_config.version=close-morning-reranker-v1`` 를 선언하면
+    rank_score/p_good 예측 직후 ``decision_score`` 를 추가해 일별 선택이 결합
+    스코어를 사용하도록 합니다. 레거시 번들은 기존 출력과 선택 의미를 유지합니다.
 
     단일 날짜 또는 복수 날짜 데이터프레임을 모두 지원하며, Pass 등급은
     0.0 배분 비중을 가집니다.
@@ -407,6 +453,17 @@ def predict_daily_position_sizing(
         models_bundle = _train_inline_bundle(df, feature_cols, target_col, group_col)
 
     out = _predict_from_bundle(df, feature_cols, models_bundle)
+    decision_score_config = models_bundle.get("decision_score_config")
+    if (
+        decision_score_config is not None
+        and decision_score_config.get("version") == _CLOSE_MORNING_RERANKER_CONFIG["version"]
+    ):
+        p_good_weight = decision_score_config.get(
+            "p_good_weight", _CLOSE_MORNING_RERANKER_CONFIG["p_good_weight"]
+        )
+        out = add_close_morning_decision_score(
+            out, group_col=group_col, probability_weight=p_good_weight
+        )
     out["utility_score"] = calculate_utility_score(out)
     out = assign_sizing_grades(out, group_col=group_col)
     out = apply_risk_limits(out, group_col=group_col)
