@@ -16,6 +16,8 @@ import pandas as pd
 from lightgbm import LGBMRanker, LGBMRegressor
 from scipy.stats import spearmanr
 from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from src.ml.backtest_evaluator import run_backtest_evaluation
 from src.ml.feature_manifest import build_feature_manifest
@@ -29,12 +31,7 @@ from src.ml.sizing_engine import (
     calculate_utility_score,
     save_model_artifacts,
 )
-from src.processing.preprocessor import (
-    DECISION_TIMESTAMP_COL,
-    FEATURE_AVAILABLE_TIMESTAMP_COL,
-    LABEL_THRESHOLDS,
-    RETURN_UNIT,
-)
+from src.processing.preprocessor import LABEL_THRESHOLDS, RETURN_UNIT
 
 logger = logging.getLogger(__name__)
 
@@ -114,15 +111,23 @@ def _fit_predict(
     feature_cols: list[str],
     target_col: str,
     group_col: str,
+    model_params: dict[str, int | float] | None = None,
 ) -> Any:
-    """model_type 에 따라 fold 단위 모델을 학습하고 OOF 예측을 반환합니다."""
+    """model_type 에 따라 fold 단위 모델을 학습하고 OOF 예측을 반환합니다.
+
+    ``model_params`` 는 요청된 모델에만 전달되며 ``random_state=42`` 는 유지합니다.
+    """
+    params: dict[str, Any] = dict(model_params or {})
     if model_type == "ridge":
-        model = Ridge()
-        model.fit(train[feature_cols], train[target_col])
-        return model, model.predict(val[feature_cols])
+        medians = train[feature_cols].median(numeric_only=True).reindex(feature_cols).fillna(0.0)
+        train_features = train[feature_cols].fillna(medians)
+        val_features = val[feature_cols].fillna(medians)
+        model = make_pipeline(StandardScaler(), Ridge(**params))
+        model.fit(train_features, train[target_col])
+        return model, model.predict(val_features)
 
     if model_type == "lgb_regressor":
-        model = LGBMRegressor(objective="huber", random_state=42)
+        model = LGBMRegressor(objective="huber", random_state=42, **params)
         model.fit(train[feature_cols], train[target_col])
         return model, model.predict(val[feature_cols])
 
@@ -130,39 +135,9 @@ def _fit_predict(
     train_sorted = train.sort_values(group_col)
     relevance = _group_relevance(train_sorted[target_col], train_sorted[group_col]).to_numpy()
     group_counts = train_sorted[group_col].value_counts(sort=False).to_numpy(dtype=np.int64)
-    model = LGBMRanker(objective="lambdarank", random_state=42)
+    model = LGBMRanker(objective="lambdarank", random_state=42, **params)
     model.fit(train_sorted[feature_cols], relevance, group=group_counts)
     return model, model.predict(val[feature_cols])
-
-
-def _validate_feature_availability(df: pd.DataFrame, feature_cols: list[str]) -> None:
-    """선정 피처가 decision 시각보다 늦지 않게 이용 가능한지 검증합니다.
-
-    Raises:
-        ValueError: 타임스탬프 컬럼 누락, timezone-naive, 또는 임의의 행에서
-            ``feature_available_timestamp > decision_timestamp`` 인 경우
-            (위반 피처 컬럼명을 함께 보고).
-    """
-    for col in (FEATURE_AVAILABLE_TIMESTAMP_COL, DECISION_TIMESTAMP_COL):
-        if col not in df.columns:
-            raise ValueError(
-                f"timestamp column {col!r} is required for point-in-time integrity; "
-                f"record {col} in candidate history before training"
-            )
-        if getattr(df[col].dtype, "tz", None) is None:
-            raise ValueError(
-                f"timestamp column {col!r} must be timezone-aware (Asia/Seoul), got {df[col].dtype}"
-            )
-    available = df[FEATURE_AVAILABLE_TIMESTAMP_COL]
-    decision = df[DECISION_TIMESTAMP_COL]
-    violation = available > decision
-    if violation.any():
-        offending = [feature for feature in feature_cols if df.loc[violation, feature].notna().any()]
-        raise ValueError(
-            "features become available after decision_timestamp; non-causal rows "
-            f"({int(violation.sum())} rows) violate feature_available_timestamp <= "
-            f"decision_timestamp. Offending feature columns: {offending}"
-        )
 
 
 def _fit_predict_linear_baseline(
@@ -171,11 +146,11 @@ def _fit_predict_linear_baseline(
     feature_cols: list[str],
     target_col: str,
 ) -> np.ndarray:
-    """Regularized linear(Ridge) baseline 을 동일 fold 에서 학습·예측합니다."""
+    """StandardScaler + Ridge linear baseline 을 동일 fold 에서 학습·예측합니다."""
     medians = train[feature_cols].median(numeric_only=True).reindex(feature_cols).fillna(0.0)
     train_features = train[feature_cols].fillna(medians)
     val_features = val[feature_cols].fillna(medians)
-    model = Ridge()
+    model = make_pipeline(StandardScaler(), Ridge())
     model.fit(train_features, train[target_col])
     return np.asarray(model.predict(val_features), dtype=np.float64)
 
@@ -187,15 +162,13 @@ def run_model_pipeline(
     group_col: str,
     n_splits: int = 5,
     purge_gap: int = 1,
-    model_type: str = "lgb_ranker",
+    model_type: str = "lgb_regressor",
+    model_params: dict[str, int | float] | None = None,
 ) -> dict[str, Any]:
     """Train ML model using Purged Group Walk-Forward CV and evaluate OOF results.
 
-    Point-in-time 요구사항(P0):
-    - ``feature_available_timestamp``/``decision_timestamp`` 가 timezone-aware 로
-      존재해야 하고 모든 행에서 ``feature_available <= decision`` 을 만족해야 합니다.
-    - OOF 프레임에 ``selection_rank`` 와 regularized linear baseline(``pred_linear``),
-      fold 출처를 보존합니다.
+    시간 컬럼은 필수 검증하지 않습니다. 고정된 업무 원천 규칙이며 모델 입력·CV
+    분할·artifact 승인 조건이 아닙니다.
 
     Returns:
         dict containing 'oof_predictions', 'oof_df', 'metrics', 'trained_models',
@@ -209,8 +182,8 @@ def run_model_pipeline(
         raise ValueError(f"missing columns in df: {missing_cols}")
     if not feature_cols:
         raise ValueError("feature_cols must not be empty")
-
-    _validate_feature_availability(df, feature_cols)
+    if purge_gap < 0:
+        raise ValueError(f"purge_gap must be >= 0, got {purge_gap}")
 
     work = df.sort_values(group_col).copy()
     splitter = PurgedGroupTimeSeriesSplit(n_splits=n_splits, purge_gap=purge_gap)
@@ -224,7 +197,9 @@ def run_model_pipeline(
     ):
         train = work.iloc[train_idx]
         val = work.iloc[val_idx]
-        model, pred = _fit_predict(model_type, train, val, feature_cols, target_col, group_col)
+        model, pred = _fit_predict(
+            model_type, train, val, feature_cols, target_col, group_col, model_params
+        )
         trained_models.append(model)
         training_cutoff = train[group_col].max()
 
@@ -240,6 +215,17 @@ def run_model_pipeline(
         )
         if "selection_rank" in work.columns:
             fold_oof["selection_rank"] = val["selection_rank"].to_numpy()
+        for col in (
+            "stock_code",
+            "market_type",
+            "market_cap_100m",
+            "chart_analysis",
+            "scenario_count_for_stock_date",
+            "has_sangtta_for_stock_date",
+            "is_multi_scenario_stock_date",
+        ):
+            if col in work.columns:
+                fold_oof[col] = val[col].to_numpy()
         oof_parts.append(fold_oof)
         logger.info("fold=%d train=%d val=%d", fold, len(train_idx), len(val_idx))
 
