@@ -10,11 +10,103 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
+from src.ml.feature_manifest import build_feature_manifest
+from src.ml.scenario_action_panel import build_scenario_action_panel
 from src.ml.sizing_engine import ROUND_TRIP_COST_RATIO
 from src.processing.schema import RAW_TO_STANDARD_MAP
+
+logger = logging.getLogger(__name__)
+
+# 수익률 단위: 단일 권위 단위는 decimal net return (순수익률, 소수).
+# 원본 퍼센트 수익률(net_return)은 정확히 1회 decimal 변환 후 왕복 비용을
+# 정확히 1회 차감합니다. 분위수/분류/유틸리티/임계값/배분이 같은 단위를 소비합니다.
+RETURN_UNIT = "decimal_net"
+
+# Decimal net 기준 이벤트 임계값 (target_good: +1%, target_bad: -2%).
+LABEL_THRESHOLDS: dict[str, float] = {"target_good": 0.01, "target_bad": -0.02}
+RETURN_CLIP_LOWER = -0.10
+RETURN_CLIP_UPPER = 0.10
+
+# point-in-time 무결성 타임스탬프 컬럼명 (아카이브 등 외부 모듈에서 소비)
+DECISION_TIMESTAMP_COL = "decision_timestamp"
+FEATURE_AVAILABLE_TIMESTAMP_COL = "feature_available_timestamp"
+
+# 허용되는 내부 피처셋: base40 → snapshot49 → interaction53 순으로만 승격합니다.
+# production_calendar_flow 는 승격 체인에 속하지 않는 별도의 연구 후보 피처셋으로,
+# 명시적으로 요청할 때만 활성화됩니다.
+# close_morning61 은 검증된 champion 피처셋으로, snapshot49 + relative_flow_strength
+# 정확히 1개를 추가합니다 (range_efficiency/flow_turnover/캘린더 흐름 제외).
+_ALLOWED_FEATURE_SETS: tuple[str, ...] = (
+    "base40",
+    "snapshot49",
+    "interaction53",
+    "production_calendar_flow",
+    "close_morning61",
+)
+
+# 허용되는 패널 모드:
+# - raw_rows: 원천 행을 그대로 유지 (기존 동작, 하위 호환).
+# - scenario_action: 원천 행을 시나리오 행동 패널로 정규화 (같은 날짜-종목의
+#   서로 다른 시나리오 행동을 보존하고 충돌 중복은 reject).
+_ALLOWED_PANEL_MODES: tuple[str, ...] = ("raw_rows", "scenario_action")
+
+# snapshot49: 기존 conservative 피처에 승격하는 내부 파생 피처 9종.
+# P0(ml_internal_panel_enhancement) 내부 재현 근거에서 OOF 성과가 확인됨.
+_SNAPSHOT49_FEATURES: tuple[str, ...] = (
+    "close_position",
+    "body_ratio",
+    "upper_shadow_ratio",
+    "intraday_range",
+    "buy_price_change_rate",
+    "gap_ratio",
+    "relative_change_rate",
+    "buy_price_change_rate_z",
+    "gap_ratio_z",
+)
+
+# interaction53: snapshot49 에 추가하는 상호작용 피처 4종 (기존 값의 벡터 연산).
+_INTERACTION53_FEATURES: tuple[str, ...] = (
+    "candle_strength",
+    "range_efficiency",
+    "flow_turnover",
+    "relative_flow_strength",
+)
+
+# close_morning61: snapshot49 에 정확히 1개 추가하는 검증된 champion 피처셋.
+# relative_flow_strength 는 같은 날짜 내 대형 투자자 수급 밀도와 가격 변화의
+# 백분위 순위 곱(같은 날짜만 사용, 벡터 연산)으로 [0, 1] 에 유한하게 묶입니다.
+_CLOSE_MORNING61_FEATURES: tuple[str, ...] = ("relative_flow_strength",)
+
+# production_calendar_flow: 캘린더/수급 흐름 연구 후보 피처 9종.
+# 15:20 KST 고정 스냅샷이 생성한 값만 사용하며, 캔들/실현 매수가 파생 피처는 없습니다.
+_WEEKDAY_INDICATOR_FEATURES: tuple[str, ...] = (
+    "weekday_is_monday",
+    "weekday_is_tuesday",
+    "weekday_is_wednesday",
+    "weekday_is_thursday",
+    "weekday_is_friday",
+)
+
+# flow_consensus / flow_alignment_direction 의 원천이 되는 단일 소스 밀도 컬럼.
+_PRODUCTION_FLOW_SOURCE_COLUMNS: tuple[str, ...] = (
+    "inst_density",
+    "foreign_density",
+    "prog_dominance",
+)
+
+_PRODUCTION_CALENDAR_FLOW_FEATURES: tuple[str, ...] = (
+    *_WEEKDAY_INDICATOR_FEATURES,
+    "flow_consensus",
+    "flow_alignment_direction",
+    "flow_turnover",
+    "friday_selection_rank_pct",
+)
+
 
 _NUMERIC_COLUMNS: tuple[str, ...] = (
     "open_price",
@@ -95,6 +187,36 @@ _EXCLUDED_FROM_X: set[str] = {
     "sell_price",
     # Data Leakage 방지
     "intraday_return",
+    # P0(ml_strategy_improvement): close/high/low/실현 매수가 파생 캔들 피처는
+    # 스냅샷이 주문 전 캡처됨이 증명될 때까지 프로덕션 피처 집합에서 제외합니다.
+    # (feature_manifest 에서 needs_snapshot_proof 로 분류됨)
+    "close_position",
+    "body_ratio",
+    "upper_shadow_ratio",
+    "intraday_range",
+    "buy_price_change_rate",
+    "gap_ratio",
+    "relative_change_rate",
+    # 캔들/실현 매수가 파생 피처의 robust-z 변환도 동일한 미래 정보를 포함하므로 제외
+    "buy_price_change_rate_z",
+    "gap_ratio_z",
+    "relative_change_rate_z",
+    # P1(ml_internal_panel_enhancement): interaction53 전용 상호작용 피처는
+    # base40 보수적 피처집합에서 제외하고 interaction53 에서만 승격합니다.
+    "candle_strength",
+    "range_efficiency",
+    "flow_turnover",
+    "relative_flow_strength",
+    # production_calendar_flow 연구 후보 피처는 명시적 feature_set 에서만 X 에
+    # 포함되고 base40/snapshot49/interaction53 X 에서는 제외됩니다.
+    "weekday_is_monday",
+    "weekday_is_tuesday",
+    "weekday_is_wednesday",
+    "weekday_is_thursday",
+    "weekday_is_friday",
+    "flow_consensus",
+    "flow_alignment_direction",
+    "friday_selection_rank_pct",
     # 원본 금액/거래량 컬럼 (log_ 접두사 파생 컬럼만 학습 피처로 사용)
     "market_cap_100m",
     "trade_value_100m",
@@ -217,20 +339,66 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         if src_col in df.columns:
             df[dst_col] = df.groupby("trade_date")[src_col].rank(pct=True)
 
+    # P1(ml_internal_panel_enhancement): interaction53 상호작용 피처.
+    # 모두 기존 값의 벡터 연산이며, 분모 0 은 NaN 으로 안전 처리 후
+    # [-5, 5] 또는 논리적 범위로 클리핑합니다. base40 X 에서는 제외됩니다.
+    df["candle_strength"] = (
+        (2 * df["close_position"] - 1) * df["body_ratio"] * df["intraday_range"]
+    ).clip(-5, 5)
+    df["range_efficiency"] = (
+        df["intraday_return"].abs() / np.maximum(df["intraday_range"] / 100, 1e-6)
+    ).clip(0, 5)
+    df["flow_turnover"] = (df["major_density"] * df["turnover"]).clip(0, 5)
+    if "major_density_pct_rank" in df.columns and "change_rate_pct_rank" in df.columns:
+        df["relative_flow_strength"] = (
+            df["major_density_pct_rank"] * df["change_rate_pct_rank"]
+        ).clip(0, 1)
+
+    # production_calendar_flow: 캘린더/수급 흐름 연구 후보 피처.
+    # 모두 스냅샷 결정 시점 값의 벡터 연산이며, 행 단위 apply / 미래 행 보간은
+    # 허용되지 않습니다. 이용 불가능한 수급은 0 으로 간주해 시그널을 만들지 않습니다.
+    trade_date = pd.to_datetime(df["trade_date"])
+    weekday_index = trade_date.dt.dayofweek
+    for offset, name in enumerate(_WEEKDAY_INDICATOR_FEATURES):
+        df[name] = (weekday_index == offset).astype("float64")
+
+    flow_matrix = np.column_stack(
+        [
+            df[name].fillna(0).to_numpy()
+            if name in df.columns
+            else np.zeros(len(df))
+            for name in _PRODUCTION_FLOW_SOURCE_COLUMNS
+        ]
+    )
+    df["flow_consensus"] = np.sign(flow_matrix).sum(axis=1).astype("float64")
+    abs_flow = np.abs(flow_matrix).sum(axis=1)
+    # 분모(절대 흐름 합)가 0 인 행은 방향 정렬 0.0 으로 처리합니다.
+    df["flow_alignment_direction"] = np.divide(
+        flow_matrix.sum(axis=1),
+        abs_flow,
+        out=np.zeros(len(df)),
+        where=abs_flow != 0,
+    )
+    df["friday_selection_rank_pct"] = df["weekday_is_friday"] * (1 - df["rank_ratio"])
+
     df = df.replace([np.inf, -np.inf], np.nan)
     return df
 
 
 def create_multi_targets(df: pd.DataFrame) -> pd.DataFrame:
-    """회귀/랭킹/분류 3종 타깃 변수를 생성합니다.
+    """회귀/랭킹/분류 3종 타깃 변수를 decimal net 기준으로 생성합니다.
 
-    ``net_return``(gross)에서 왕복 거래 비용(``ROUND_TRIP_COST_RATIO``, 0.20%)을
-    차감한 순수익(net-of-cost) 기준으로 회귀/분류 타깃을 인코딩합니다.
-    ``target_rank`` 는 그룹 내 상대순위로 상수 이동에 불변하므로 그대로 둡니다.
+    원본 퍼센트 수익률(``net_return``)을 정확히 1회 decimal 로 변환
+    (``/ 100``)하고 왕복 거래 비용(``ROUND_TRIP_COST_RATIO``, 0.20%)을 정확히
+    1회 차감한 decimal net return 으로 회귀/분류 타깃을 인코딩합니다.
+    ``target_good``/``target_bad`` 는 ``LABEL_THRESHOLDS`` 의 decimal net
+    임계값(+1%/-2%)에서 파생됩니다. ``target_rank`` 는 그룹 내 상대순위로
+    상수 이동에 불변하므로 그대로 둡니다.
     """
     df = df.copy()
-    net_of_cost = df["net_return"] - ROUND_TRIP_COST_RATIO * 100.0
-    df["target_return"] = net_of_cost.clip(-10.0, 10.0)
+    gross_decimal = df["net_return"] / 100.0
+    net_of_cost = gross_decimal - ROUND_TRIP_COST_RATIO
+    df["target_return"] = net_of_cost.clip(RETURN_CLIP_LOWER, RETURN_CLIP_UPPER)
 
     def assign_daily_rank(group_df: pd.DataFrame) -> pd.Series:
         n = len(group_df)
@@ -250,8 +418,10 @@ def create_multi_targets(df: pd.DataFrame) -> pd.DataFrame:
     for _, group_df in df.groupby("trade_date", sort=False):
         rank_map.update(assign_daily_rank(group_df).to_dict())
     df["target_rank"] = pd.Series(rank_map, dtype="int64").reindex(df.index)
-    df["target_good"] = (net_of_cost >= 1.0).astype(int)
-    df["target_bad"] = (net_of_cost <= -2.0).astype(int)
+    df["target_good"] = (net_of_cost >= LABEL_THRESHOLDS["target_good"]).astype(int)
+    df["target_bad"] = (net_of_cost <= LABEL_THRESHOLDS["target_bad"]).astype(int)
+    df.attrs["return_unit"] = RETURN_UNIT
+    df.attrs["label_thresholds"] = dict(LABEL_THRESHOLDS)
     return df
 
 def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
@@ -270,10 +440,53 @@ def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
     return df
 
 
+def _validate_close_morning61_feature(df: pd.DataFrame) -> None:
+    """champion 피처 ``relative_flow_strength`` 의 무결성을 fail-closed 로 검증합니다.
+
+    필수 원천 입력이 없어 피처가 생성되지 않았거나, 모든 값이 유한한 [0, 1]
+    범위를 벗어나면 ``ValueError`` 를 발생시킵니다 (미래 값으로 채우지 않습니다).
+    """
+    if "relative_flow_strength" not in df.columns:
+        raise ValueError(
+            "close_morning61 requires source inputs (change_rate and major "
+            "investor flow) to compute relative_flow_strength; missing required "
+            "source inputs"
+        )
+    rfs = df["relative_flow_strength"].to_numpy(dtype=np.float64)
+    if not np.isfinite(rfs).all() or not np.logical_and(rfs >= 0.0, rfs <= 1.0).all():
+        raise ValueError("relative_flow_strength must be finite within [0, 1]")
+
+
 def build_ml_dataset(
-    trade_log_df: pd.DataFrame, theme_df: pd.DataFrame | None = None
+    trade_log_df: pd.DataFrame,
+    theme_df: pd.DataFrame | None = None,
+    feature_set: str = "base40",
+    panel_mode: str = "raw_rows",
 ) -> tuple[pd.DataFrame, dict[str, pd.Series], list[str], pd.DataFrame]:
-    """매매일지 원본 데이터를 정제하여 (X, targets, cat_features, processed_df)를 반환합니다."""
+    """매매일지 원본 데이터를 정제하여 (X, targets, cat_features, processed_df)를 반환합니다.
+
+    ``feature_set`` 은 ``base40`` / ``snapshot49`` / ``interaction53`` /
+    ``production_calendar_flow`` / ``close_morning61`` 만 허용하며, 기본값
+    ``base40`` 은 기존 conservative 피처집합과 호환됩니다. ``production_calendar_flow``
+    는 명시적으로 요청할 때만 9개 캘린더/수급 후보 피처를 X 에 포함하는 연구 후보
+    피처셋이고, ``close_morning61`` 은 검증된 champion 으로 snapshot49 전체와
+    ``relative_flow_strength`` 정확히 1개만 X 에 포함합니다. 시간 컬럼은
+    검증·합성·검사하지 않습니다 (고정된 15:20 KST 공통 소스 스냅샷 계약).
+
+    ``panel_mode`` 는 ``raw_rows``(기본, 원천 행 유지) 또는 ``scenario_action``
+    만 허용합니다. ``scenario_action`` 은 clean → 행동 패널 정규화 → 피처/타깃
+    생성 순서로 동작하며, 같은 날짜-종목의 서로 다른 시나리오 행동을 모두
+    보존합니다. 충돌 중복은 학습에서 제외되고
+    ``processed.attrs['scenario_action_rejects']`` 로 노출됩니다.
+    """
+    if feature_set not in _ALLOWED_FEATURE_SETS:
+        raise ValueError(
+            f"feature_set must be one of {list(_ALLOWED_FEATURE_SETS)}, got {feature_set!r}"
+        )
+    if panel_mode not in _ALLOWED_PANEL_MODES:
+        raise ValueError(
+            f"panel_mode must be one of {list(_ALLOWED_PANEL_MODES)}, got {panel_mode!r}"
+        )
     df = clean_column_names(trade_log_df.copy())
 
     if theme_df is not None and not theme_df.empty:
@@ -293,6 +506,16 @@ def build_ml_dataset(
     if "trade_date" not in df.columns or "net_return" not in df.columns:
         raise ValueError("필수 컬럼(trade_date, net_return)이 데이터에 없습니다.")
 
+    if feature_set == "close_morning61" and "change_rate" not in df.columns:
+        raise ValueError(
+            "close_morning61 requires the price-change source (change_rate) to "
+            "compute relative_flow_strength; missing required source inputs"
+        )
+
+    if panel_mode == "scenario_action":
+        df, scenario_rejects = build_scenario_action_panel(df)
+        df.attrs["scenario_action_rejects"] = scenario_rejects
+
     df = df.dropna(subset=["net_return"]).copy()
     df = engineer_features(df)
     df = _apply_robust_z(df, _ROBUST_Z_COLUMNS)
@@ -305,5 +528,32 @@ def build_ml_dataset(
     cat_features = [col for col in _CATEGORICAL_COLUMNS if col in df.columns]
     targets = {name: df[name] for name in _TARGET_NAMES}
     feature_cols = [col for col in df.columns if col not in _EXCLUDED_FROM_X]
+    if feature_set in ("snapshot49", "interaction53"):
+        feature_cols.extend(col for col in _SNAPSHOT49_FEATURES if col in df.columns)
+    if feature_set == "interaction53":
+        feature_cols.extend(col for col in _INTERACTION53_FEATURES if col in df.columns)
+    if feature_set == "production_calendar_flow":
+        feature_cols.extend(
+            col for col in _PRODUCTION_CALENDAR_FLOW_FEATURES if col in df.columns
+        )
+    if feature_set == "close_morning61":
+        feature_cols.extend(col for col in _SNAPSHOT49_FEATURES if col in df.columns)
+        _validate_close_morning61_feature(df)
+        feature_cols.extend(
+            col for col in _CLOSE_MORNING61_FEATURES if col in df.columns
+        )
+    if panel_mode == "scenario_action":
+        # chart_analysis 원문은 감사용 메타데이터이며, LightGBM 입력에는 고정
+        # one-hot 수치 피처(SCENARIO_ONE_HOT_FEATURES)를 사용합니다.
+        feature_cols = [col for col in feature_cols if col != "chart_analysis"]
+        cat_features = [col for col in cat_features if col != "chart_analysis"]
+    feature_cols = list(dict.fromkeys(feature_cols))
     X = df[feature_cols].copy()
+    manifest = build_feature_manifest(feature_cols)
+    df.attrs["feature_manifest"] = manifest
+    df.attrs["feature_set"] = feature_set
+    df.attrs["panel_mode"] = panel_mode
+    X.attrs["feature_manifest"] = manifest
+    X.attrs["feature_set"] = feature_set
+    X.attrs["panel_mode"] = panel_mode
     return X, targets, cat_features, df
