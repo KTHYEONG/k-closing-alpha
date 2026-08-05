@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_CLOSE_MORNING_V5",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_CLOSE_MORNING_V5",
+      "domain": "ml",
+      "title": "Record latest close-to-morning ML pipeline results",
+      "why": "The latest full real-data pipeline execution must be reproducible and documented after the close-to-morning policy implementation.",
+      "resolution": "Recorded the base40, snapshot49, and close_morning61 OOF comparison, single-stock policy counts, close-to-morning risk metrics, quality score, and persisted bundle fields in docs/results/ml-v5.md.",
+      "impact": "Provides the current evidence for production-readiness decisions while retaining the explicit research-only promotion gate."
+    },
+    {
       "task_id": "TASK_ML_SINGLE_STOCK_ABSTENTION",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_ML_SINGLE_STOCK_ABSTENTION",
