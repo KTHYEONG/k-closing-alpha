@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_V3_CALENDAR_FLOW_FEATURES",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_V3_CALENDAR_FLOW_FEATURES",
+      "domain": "ml",
+      "title": "ML v3 calendar and flow feature evaluation",
+      "why": "The implemented weekday and order-flow feature candidate required a reproducible OOF comparison against base40 before promotion.",
+      "resolution": "Ran identical 5-fold purge-1 scenario_action LightGBM Huber evaluations through 2025-12-30, recorded detailed metrics in docs/results/ml-v3.md, and retained production_calendar_flow as an explicit research candidate because primary returns and Sharpe did not improve.",
+      "impact": "production_calendar_flow achieved 1.1097% Top-1 net return, 4.369 Sharpe, and 40.46% MDD versus base40 at 1.1393%, 4.473, and 40.23%; it is not promoted. Task and code-map registries are synchronized."
+    },
+    {
       "task_id": "TASK_ML_V2_SCENARIO_ACTION_PANEL",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_ML_V2_SCENARIO_ACTION_PANEL",
