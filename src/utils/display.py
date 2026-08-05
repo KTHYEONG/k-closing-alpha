@@ -18,7 +18,15 @@ class Colors:
 
 def get_decision_color(decision):
     """Decision 값에 따라 색상 코드를 반환"""
-    d = decision.lower()
+    d = str(decision).lower()
+    if "strong" in d or "buy" in d:
+        return Colors.RED + Colors.BOLD
+    if "good" in d:
+        return Colors.GREEN + Colors.BOLD
+    if "weak" in d:
+        return Colors.YELLOW
+    if "pass" in d or "abstain" in d:
+        return Colors.GRAY
     if "max" in d:
         return Colors.RED + Colors.BOLD
     if "expand" in d:
@@ -58,7 +66,25 @@ def pad_str(s, width, align="left"):
 
 
 def print_table(results_list, title, minimal=False):
-    """결과 리스트를 테이블 형태로 출력"""
+    """결과 리스트 또는 DataFrame을 테이블 형태로 출력"""
+    if results_list is None:
+        return
+
+    if isinstance(results_list, pd.DataFrame):
+        if results_list.empty:
+            return
+        # single_stock_policy decision DataFrame 이 들어온 경우
+        print(f"\n{Colors.BOLD}=== {title} ==={Colors.RESET}")
+        for idx, row in results_list.iterrows():
+            decision = row.get("decision", "ABSTAIN")
+            reason = row.get("decision_reason", "")
+            stock = row.get("stock_code") or "None"
+            score = row.get("rank_score")
+            score_str = f"{score:.4f}" if score is not None and pd.notna(score) else "N/A"
+            color = get_decision_color(decision)
+            print(f"  > Decision: {color}{decision}{Colors.RESET} | Reason: {reason} | Stock: {stock} | Score: {score_str}")
+        return
+
     if not results_list:
         return
 
