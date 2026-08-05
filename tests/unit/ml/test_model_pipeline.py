@@ -706,9 +706,9 @@ def test_evaluate_close_morning_quality_reports_close_to_morning_metrics() -> No
     fake = _fake_quality_pipeline_result(scheduled_mean=0.015)
     decision = _fake_decision_policy_result(scheduled_mean=0.015)
     with (
-        patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake),
+        patch("src.ml.training.pipelines.run_model_pipeline", return_value=fake),
         patch(
-            "src.ml.model_pipeline._calibrate_close_morning_decision_oof",
+            "src.ml.training.pipelines._calibrate_close_morning_decision_oof",
             return_value=decision,
         ),
     ):
@@ -743,9 +743,9 @@ def test_evaluate_close_morning_quality_exposes_legacy_and_reranker_metrics() ->
     fake = _fake_quality_pipeline_result(scheduled_mean=0.011)
     decision = _fake_decision_policy_result(scheduled_mean=0.019)
     with (
-        patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake),
+        patch("src.ml.training.pipelines.run_model_pipeline", return_value=fake),
         patch(
-            "src.ml.model_pipeline._calibrate_close_morning_decision_oof",
+            "src.ml.training.pipelines._calibrate_close_morning_decision_oof",
             return_value=decision,
         ),
     ):
@@ -774,9 +774,9 @@ def test_evaluate_close_morning_quality_rejects_non_finite_metrics() -> None:
     fake = _fake_quality_pipeline_result(scheduled_mean=float("nan"))
     decision = _fake_decision_policy_result(scheduled_mean=float("nan"))
     with (
-        patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake),
+        patch("src.ml.training.pipelines.run_model_pipeline", return_value=fake),
         patch(
-            "src.ml.model_pipeline._calibrate_close_morning_decision_oof",
+            "src.ml.training.pipelines._calibrate_close_morning_decision_oof",
             return_value=decision,
         ),
         pytest.raises(ValueError, match="non-finite"),
@@ -792,9 +792,9 @@ def test_evaluate_close_morning_quality_missing_policy_rejects() -> None:
     fake = _fake_quality_pipeline_result(scheduled_mean=0.015)
     fake["single_stock_evaluation"] = None
     with (
-        patch("src.ml.model_pipeline.run_model_pipeline", return_value=fake),
+        patch("src.ml.training.pipelines.run_model_pipeline", return_value=fake),
         patch(
-            "src.ml.model_pipeline._calibrate_close_morning_decision_oof",
+            "src.ml.training.pipelines._calibrate_close_morning_decision_oof",
             return_value=(None, None, None),
         ),
         pytest.raises(ValueError, match="non-finite"),
