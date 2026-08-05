@@ -17,8 +17,13 @@ from src.ml.model_pipeline import (
     _calibrate_close_morning_decision_oof,
     _calibrate_oof_policy,
     _close_morning_yearly_breakdown,
+    _dominant_recency_config,
+    _fit_predict,
     _select_bad_probability_weight,
+    _select_recency_ensemble_config,
+    calculate_recency_sample_weight,
     evaluate_close_morning_quality,
+    run_close_morning_recency_ensemble_experiment,
     run_close_morning_reranker_v2_experiment,
     run_model_pipeline,
     run_sizing_pipeline,
@@ -985,6 +990,384 @@ def test_close_morning_reranker_v2_fails_closed_on_insufficient_inner_history() 
     )
     assert report["folds"][0]["inner"]["candidate_stats"] == {}
     assert len(report["folds"]) == 5
+
+def _make_recency_dataset(seed: int = 7, n_groups: int = 220, rows_per_group: int = 3) -> pd.DataFrame:
+    """구간 전환(regime shift) 합성 패널: 전반 고노이즈 구간 / 후반 신호 구간.
+
+    half-life recent 전문가가 초기 고노이즈 구간을 하향 가중해 MDD 를 줄이므로
+    recency 앙상블 후보가 baseline(expanding) 을 개선할 수 있는 구조입니다.
+    ``selection_rank`` 를 포함해 ``run_model_pipeline`` 의 백테스트 계약을
+    충족합니다.
+    """
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2020-01-01", periods=n_groups, freq="D")
+    rows: list[dict[str, object]] = []
+    for g, date in enumerate(dates):
+        rows.extend(
+            {"trade_date": date, "stock_code": f"{g * rows_per_group + i + 1:06d}"}
+            for i in range(rows_per_group)
+        )
+    df = pd.DataFrame(rows)
+    n = len(df)
+    df["feature_a"] = rng.uniform(-1, 1, n)
+    df["feature_b"] = rng.uniform(-1, 1, n)
+    df["chart_analysis"] = "신고가"
+    df["market_type"] = "KOSPI"
+    df["selection_rank"] = df.groupby(GROUP_COL, sort=False).cumcount() + 1
+    positions = df.groupby(GROUP_COL).ngroup().to_numpy()
+    frac = positions / n_groups
+    signal = np.where(frac >= 0.5, 0.05 * df["feature_a"].to_numpy(), 0.0)
+    noise = np.where(frac >= 0.5, 0.004, 0.03)
+    df[TARGET_COL] = np.clip(signal + rng.normal(0, noise), -0.2, 0.2)
+    return df
+
+
+def test_calculate_recency_sample_weight_decay_formula_and_mean_one() -> None:
+    """decay 공식과 mean-one 정규화, None(expanding) 동작을 검증합니다.
+
+    ``w(age) = exp(-ln(2) * age / half_life)`` 를 정확히 반영하고 정규화 평균이
+    1 이며 최신 그룹이 가장 높은 가중치를 받아야 합니다.
+    """
+    groups = pd.Series(pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]))
+    weights = calculate_recency_sample_weight(groups, 252)
+    assert weights.mean() == pytest.approx(1.0)
+    ages = np.array([2.0, 1.0, 0.0])
+    expected = np.exp(-np.log(2.0) * ages / 252.0)
+    np.testing.assert_allclose(weights, expected / expected.mean())
+    assert weights[-1] > weights[0]
+
+    # None 은 기존 expanding 동작(전부 1) 을 반환합니다.
+    np.testing.assert_array_equal(calculate_recency_sample_weight(groups, None), np.ones(3))
+    # 504 half-life 는 같은 정규화 계약을 유지합니다.
+    weights_504 = calculate_recency_sample_weight(groups, 504)
+    assert weights_504.mean() == pytest.approx(1.0)
+    assert weights_504[-1] > weights_504[0]
+
+
+def test_calculate_recency_sample_weight_rejects_invalid_inputs() -> None:
+    """미지원 half-life, 빈 그룹, 파싱 불가 그룹은 fail-closed 로 거부합니다."""
+    groups = pd.Series(pd.to_datetime(["2024-01-01", "2024-01-02"]))
+    with pytest.raises(ValueError, match="one of None, 252, 504"):
+        calculate_recency_sample_weight(groups, 100)
+    with pytest.raises(ValueError, match="non-empty"):
+        calculate_recency_sample_weight(pd.Series([], dtype="datetime64[ns]"), 252)
+    with pytest.raises(ValueError, match="parseable"):
+        calculate_recency_sample_weight(pd.Series(["2024-01-01", "not-a-date"]), 252)
+    with pytest.raises(ValueError, match="parseable"):
+        calculate_recency_sample_weight(pd.Series([pd.Timestamp("2024-01-01"), None]), 252)
+
+
+def test_run_model_pipeline_recency_weights_are_fold_local() -> None:
+    """recency 가중치는 fold 의 train 거래일에서만 계산됩니다.
+
+    마지막 외부 validation 날짜의 실현 수익률을 극단(-19%)으로 바꿔도 훈련
+    가중치가 바뀌지 않아 OOF 예측이 (LightGBM 스레드 감축 1-ULP 노이즈 이내로)
+    동일해야 합니다 — 검증 라벨이 학습에 노출되지 않는다는 인과 경계를 증명합니다.
+    """
+    df = _make_recency_dataset(seed=7)
+    n_groups = df[GROUP_COL].nunique()
+    future_dates = sorted(df[GROUP_COL].unique())[-(n_groups // 3) :]
+    mutated = df.copy()
+    mutated.loc[mutated[GROUP_COL].isin(future_dates), TARGET_COL] = -0.19
+
+    def _preds(data: pd.DataFrame) -> np.ndarray:
+        return run_model_pipeline(
+            data,
+            feature_cols=["feature_a", "feature_b"],
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            n_splits=2,
+            model_type="lgb_regressor",
+            recency_half_life_groups=252,
+        )["oof_predictions"]["pred"].to_numpy()
+
+    np.testing.assert_allclose(_preds(df), _preds(mutated), atol=1e-9)
+
+
+def test_run_model_pipeline_recency_weights_change_predictions() -> None:
+    """half-life recent Huber 가 expanding 과 다른 OOF 예측을 산출합니다."""
+    df = _make_recency_dataset(seed=7)
+    expanding = run_model_pipeline(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=2,
+        model_type="lgb_regressor",
+    )["oof_predictions"]["pred"].to_numpy()
+    recent = run_model_pipeline(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=2,
+        model_type="lgb_regressor",
+        recency_half_life_groups=252,
+    )["oof_predictions"]["pred"].to_numpy()
+    assert not np.allclose(expanding, recent)
+
+
+def test_run_model_pipeline_rejects_invalid_recency_configuration() -> None:
+    """Ridge/LGBMRanker 는 recency 가중치를 거부하고 미지원 half-life 는 오류입니다."""
+    df = _make_dataset(n_groups=12)
+    with pytest.raises(ValueError, match="only supported for lgb_regressor"):
+        run_model_pipeline(
+            df,
+            feature_cols=FEATURE_COLS,
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            model_type="ridge",
+            recency_half_life_groups=252,
+        )
+    with pytest.raises(ValueError, match="only supported for lgb_regressor"):
+        run_model_pipeline(
+            df,
+            feature_cols=FEATURE_COLS,
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            model_type="lgb_ranker",
+            recency_half_life_groups=504,
+        )
+    with pytest.raises(ValueError, match="one of None, 252, 504"):
+        run_model_pipeline(
+            df,
+            feature_cols=FEATURE_COLS,
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            recency_half_life_groups=100,
+        )
+
+
+def test_select_recency_ensemble_config_deterministic_ties() -> None:
+    """recency 후보 선택은 보수적 규칙을 준수합니다: 평균 보존 + MDD 엄격 감소만
+    유효하며, 낮은 MDD → 높은 mean → 낮은 recent_weight → 긴 half_life 순으로
+    타이브레이크합니다. NaN 지표는 미충족으로 간주되어 v1 로 fail-closed 합니다."""
+    base = {"scheduled_mean_return": 0.01, "entry_sequence_drawdown": 0.30}
+    # MDD 가 동일하면 비영 후보는 미유효 (엄격 감소 요구).
+    stats = {
+        (None, 0.0): dict(base),
+        (252, 0.5): {"scheduled_mean_return": 0.012, "entry_sequence_drawdown": 0.30},
+    }
+    assert _select_recency_ensemble_config(stats) == (None, 0.0)
+    # 평균이 v1 미만이면 미유효.
+    stats = {
+        (None, 0.0): dict(base),
+        (252, 0.5): {"scheduled_mean_return": 0.009, "entry_sequence_drawdown": 0.10},
+    }
+    assert _select_recency_ensemble_config(stats) == (None, 0.0)
+    # 평균 보존 + MDD 엄격 감소면 선택됩니다.
+    stats = {
+        (None, 0.0): dict(base),
+        (504, 0.5): {"scheduled_mean_return": 0.012, "entry_sequence_drawdown": 0.20},
+    }
+    assert _select_recency_ensemble_config(stats) == (504, 0.5)
+    # 최저 MDD 가 우선입니다.
+    stats = {
+        (None, 0.0): dict(base),
+        (252, 0.5): {"scheduled_mean_return": 0.011, "entry_sequence_drawdown": 0.15},
+        (504, 1.0): {"scheduled_mean_return": 0.013, "entry_sequence_drawdown": 0.10},
+    }
+    assert _select_recency_ensemble_config(stats) == (504, 1.0)
+    # MDD/mean 동점이면 낮은 recent_weight 가 우선, 같은 alpha 는 긴 half-life.
+    stats = {
+        (None, 0.0): dict(base),
+        (252, 0.75): {"scheduled_mean_return": 0.013, "entry_sequence_drawdown": 0.10},
+        (504, 0.75): {"scheduled_mean_return": 0.013, "entry_sequence_drawdown": 0.10},
+        (504, 0.25): {"scheduled_mean_return": 0.013, "entry_sequence_drawdown": 0.10},
+    }
+    assert _select_recency_ensemble_config(stats) == (504, 0.25)
+    # NaN 지표는 미충족으로 간주되어 v1 로 fail-closed 합니다.
+    stats = {
+        (None, 0.0): dict(base),
+        (252, 0.5): {"scheduled_mean_return": float("nan"), "entry_sequence_drawdown": 0.05},
+    }
+    assert _select_recency_ensemble_config(stats) == (None, 0.0)
+
+
+def test_close_morning_recency_ensemble_nested_selection_is_causal() -> None:
+    """recency 앙상블 중첩 선택은 외부 validation 레이블을 읽지 않습니다.
+
+    나중 날짜(마지막 외부 validation fold)의 실현 수익률이 -19% 로 바뀌어도
+    폴드별 ``chosen_config`` 는 그대로여야 합니다. 해당 변경은 그 폴드의 외부
+    평가 지표에는 반영되어야 하므로, 선택이 외부 validation 레이블을 읽지
+    않는다는 인과 경계를 증명합니다.
+    """
+    df = _make_recency_dataset(seed=7)
+    n_groups = df[GROUP_COL].nunique()
+    future_dates = sorted(df[GROUP_COL].unique())[-(n_groups // 3) :]
+    mutated = df.copy()
+    mutated.loc[mutated[GROUP_COL].isin(future_dates), TARGET_COL] = -0.19
+
+    base = run_close_morning_recency_ensemble_experiment(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=2,
+        min_history_dates=2,
+    )
+    altered = run_close_morning_recency_ensemble_experiment(
+        mutated,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=2,
+        min_history_dates=2,
+    )
+
+    assert base["contract"]["version"] == "close-morning-recency-ensemble-research"
+    assert base["contract"]["half_lives"] == [252, 504]
+    assert base["contract"]["alphas"] == [0.0, 0.25, 0.5, 0.75, 1.0]
+    assert len(base["folds"]) == 2
+    assert base["chosen_configs"] == altered["chosen_configs"]
+    # 적어도 하나의 폴드가 비-baseline 구성을 선택해야 테스트가 의미를 가집니다.
+    assert any(config["half_life"] is not None for config in base["chosen_configs"])
+    for fold in base["folds"]:
+        assert fold["chosen_config"]["half_life"] in (None, 252, 504)
+        assert fold["chosen_config"]["recent_weight"] in (0.0, 0.25, 0.5, 0.75, 1.0)
+        assert (None, 0.0) in fold["inner"]["candidate_stats"]
+        assert {"scheduled_mean_return", "entry_sequence_drawdown"} <= set(
+            fold["inner"]["candidate_stats"][(None, 0.0)]
+        )
+        assert "scheduled_mean_return" in fold["baseline"]["metrics"]
+        assert "entry_sequence_drawdown" in fold["candidate"]["metrics"]
+    assert set(base["aggregate"]) == {"baseline", "candidate"}
+    assert (
+        base["aggregate"]["baseline"]["n_scheduled_dates"]
+        == base["aggregate"]["candidate"]["n_scheduled_dates"]
+    )
+    # 미래 수익률 변경은 해당 폴드의 외부 평가 지표에 반영됩니다 (관측 경계 존재).
+    last = len(base["folds"]) - 1
+    assert base["folds"][last]["candidate"]["metrics"]["scheduled_mean_return"] != pytest.approx(
+        altered["folds"][last]["candidate"]["metrics"]["scheduled_mean_return"]
+    )
+    assert base["research_bundle"] is None
+
+
+def test_close_morning_recency_ensemble_rejects_invalid_inputs() -> None:
+    """recency 실험은 식별 컬럼 누락, 비정상 가중치/워밍업/purge, 미지원 후보
+    half-life/alpha 를 fail-closed 로 거부합니다."""
+    df = _make_recency_dataset(seed=7, n_groups=20)
+    kwargs = {
+        "feature_cols": ["feature_a", "feature_b"],
+        "target_col": TARGET_COL,
+        "group_col": GROUP_COL,
+    }
+    with pytest.raises(ValueError, match="requires stock_code and chart_analysis"):
+        run_close_morning_recency_ensemble_experiment(
+            df.drop(columns=["chart_analysis"]), **kwargs
+        )
+    with pytest.raises(ValueError, match="probability_weight must be in \\(0, 1\\]"):
+        run_close_morning_recency_ensemble_experiment(df, **kwargs, probability_weight=0.0)
+    with pytest.raises(ValueError, match="min_history_dates must be >= 1"):
+        run_close_morning_recency_ensemble_experiment(df, **kwargs, min_history_dates=0)
+    with pytest.raises(ValueError, match="purge_gap must be >= 0"):
+        run_close_morning_recency_ensemble_experiment(df, **kwargs, purge_gap=-1)
+    with pytest.raises(ValueError, match="half_lives must be a non-empty subset"):
+        run_close_morning_recency_ensemble_experiment(df, **kwargs, half_lives=(100,))
+    with pytest.raises(ValueError, match="alphas must be a non-empty subset"):
+        run_close_morning_recency_ensemble_experiment(df, **kwargs, alphas=(0.5,))
+    with pytest.raises(ValueError, match="alphas must be a non-empty subset"):
+        run_close_morning_recency_ensemble_experiment(df, **kwargs, alphas=(-0.5, 1.5))
+
+
+def test_close_morning_recency_ensemble_fails_closed_on_insufficient_inner_history() -> None:
+    """내부 partition 이 중첩 walk-forward 를 지원할 만큼 충분하지 않으면 baseline
+    으로 fail-closed 합니다 (진단 사유 기록)."""
+    df = _make_recency_dataset(seed=7, n_groups=8)
+    report = run_close_morning_recency_ensemble_experiment(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=5,
+        min_history_dates=2,
+    )
+    assert report["folds"][0]["chosen_config"] == {"half_life": None, "recent_weight": 0.0}
+    assert (
+        report["folds"][0]["inner"]["fail_closed_reason"] == "insufficient_inner_history"
+    )
+    assert report["folds"][0]["inner"]["candidate_stats"] == {}
+    assert len(report["folds"]) == 5
+
+
+def test_close_morning_recency_ensemble_builds_research_bundle_when_promoted() -> None:
+    """승격 게이트 통과 + 명시 요청 시에만 두 return 모델과 recency 설정을 포함한
+    연구 번들이 영속화됩니다 (자동 저장 금지, 프로덕션 기본값 불변)."""
+    df = _make_recency_dataset(seed=13)
+    report = run_close_morning_recency_ensemble_experiment(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=2,
+        min_history_dates=2,
+        build_research_bundle=True,
+    )
+    assert report["promotion"]["promoted"] is True
+    bundle = report["research_bundle"]
+    assert bundle is not None
+    assert "return_model" in bundle
+    assert "recent_return_model" in bundle
+    config = bundle["recency_ensemble_config"]
+    assert config["version"] == "close-morning-recency-ensemble-research"
+    assert config["half_life_groups"] in (252, 504)
+    assert config["recent_weight"] in (0.25, 0.5, 0.75, 1.0)
+    assert bundle["decision_score_config"]["version"] == "close-morning-reranker-v1"
+
+
+def test_calculate_recency_sample_weight_rejects_non_finite_mean(monkeypatch) -> None:
+    """정규화 분모가 비유한 경우 방어적 fail-closed 로 거부합니다.
+
+    exp 감쇠는 수학적으로 유한하기 때문에 비유한 분모는 정상 입력으로 도달할 수
+    없어, np.exp 를 몽키패치해 방어 가드가 실제로 발화하는지 검증합니다.
+    """
+    import numpy as np
+
+    groups = pd.Series(pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]))
+    monkeypatch.setattr(np, "exp", lambda x: np.full(np.asarray(x).size, np.inf))
+    with pytest.raises(ValueError, match="not finite"):
+        calculate_recency_sample_weight(groups, 252)
+
+
+def test_fit_predict_rejects_recency_weighting_for_ridge_and_ranker() -> None:
+    """_fit_predict 는 Ridge/LGBMRanker 에 비영 recency 가중치를 방어적으로 거부합니다
+    (run_model_pipeline 의 사전 검증과 독립적인 이중 방어)."""
+    df = _make_dataset(n_groups=10, rows_per_group=6)
+    train = df.sort_values(GROUP_COL).iloc[:30]
+    val = df.sort_values(GROUP_COL).iloc[30:]
+    sample_weight = np.ones(len(train), dtype=np.float64)
+    with pytest.raises(ValueError, match="recency sample weighting is not supported for ridge"):
+        _fit_predict(
+            "ridge", train, val, FEATURE_COLS, TARGET_COL, GROUP_COL, sample_weight=sample_weight
+        )
+    with pytest.raises(
+        ValueError, match="recency sample weighting is not supported for lgb_ranker"
+    ):
+        _fit_predict(
+            "lgb_ranker", train, val, FEATURE_COLS, TARGET_COL, GROUP_COL, sample_weight=sample_weight
+        )
+
+
+def test_dominant_recency_config_deterministic_ties() -> None:
+    """연구 번들용 최빈 구성은 높은 빈도 → 낮은 recent_weight → 긴 half_life →
+    baseline(None) 우선 순서로 결정적 선택됩니다."""
+    # 최빈 구성이 우선합니다.
+    configs = [(252, 0.5), (252, 0.5), (504, 0.75), (504, 0.5)]
+    assert _dominant_recency_config(configs) == (252, 0.5)
+    # 동률이면 낮은 recent_weight 가 우선합니다.
+    configs = [(252, 0.75), (504, 0.5)]
+    assert _dominant_recency_config(configs) == (504, 0.5)
+    # 같은 alpha/빈도이면 긴 half_life 가 우선합니다.
+    configs = [(252, 0.5), (504, 0.5)]
+    assert _dominant_recency_config(configs) == (504, 0.5)
+    # baseline(None) 은 같은 alpha 대비 우선합니다 (recent_weight=0).
+    configs = [(None, 0.0), (252, 0.5), (None, 0.0)]
+    assert _dominant_recency_config(configs) == (None, 0.0)
+    # None half-life 와 같은 alpha 후보는 baseline 이 이깁니다.
+    configs = [(None, 0.0), (252, 0.0)]
+    assert _dominant_recency_config(configs) == (None, 0.0)
+
 
 def test_close_morning_yearly_breakdown_handles_small_and_invalid_years() -> None:
     """연도별 분해는 표본 <5년 연도를 null 처리하고 비파싱 연도를 건너뜁니다."""
