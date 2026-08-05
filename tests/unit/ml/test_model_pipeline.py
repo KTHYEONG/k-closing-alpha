@@ -149,6 +149,38 @@ def test_run_model_pipeline_retains_scenario_metadata_in_oof() -> None:
     assert oof["chart_analysis"].notna().all()
 
 
+def test_run_model_pipeline_calibrates_single_stock_policy_on_scenario_panel() -> None:
+    """ranker OOF 생성 직후 단일 종목 정책이 인과적으로 보정·영속화됩니다."""
+    from src.ml.single_stock_policy import SingleStockPolicy
+
+    df = _make_dataset(n_groups=10, rows_per_group=5, seed=13)
+    df["stock_code"] = [f"{i % 5 + 1:06d}" for i in range(len(df))]
+    df["chart_analysis"] = ["거래량 폭증", "신고가", "상따", "120 돌파", "신고가 근접"] * (
+        len(df) // 5
+    )
+    df["market_type"] = ["KOSPI" if i % 2 == 0 else "KOSDAQ" for i in range(len(df))]
+    result = run_model_pipeline(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+        model_type="lgb_regressor",
+    )
+    policy = result["single_stock_policy"]
+    assert policy is not None
+    assert isinstance(policy, SingleStockPolicy)
+    assert policy.candidate in {
+        "always_buy_top1",
+        "margin_quantile.0.70",
+        "margin_quantile.0.90",
+    }
+    evaluation = result["single_stock_evaluation"]
+    assert evaluation is not None
+    assert len(evaluation.decisions) == len(result["oof_predictions"][GROUP_COL].unique())
+
+
 def test_run_model_pipeline_passes_model_params_to_requested_model() -> None:
     """model_params 는 요청된 모델에만 전달되고 random_state=42 가 유지됩니다."""
     df = _make_dataset()

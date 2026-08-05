@@ -16,6 +16,12 @@ logger = logging.getLogger(__name__)
 from src.data.db_loader import load_theme_from_db
 from src.data.sync_sheet_db import sync_theme_only
 from src.ml.model_pipeline import run_model_pipeline  # noqa: F401  (Purged Walk-Forward CV 학습 파이프라인 진입점)
+from src.ml.single_stock_policy import (
+    REASON_MISSING_POLICY,
+    SingleStockPolicy,
+    abstain_decision,
+    select_single_daily_trade,
+)
 from src.ml.sizing_engine import (
     _train_inline_bundle,
     load_model_artifacts,
@@ -311,6 +317,26 @@ def run_daily_sizing_inference(
     )
 
 
+def _load_single_stock_policy(models_bundle: dict[str, Any]) -> SingleStockPolicy | None:
+    """모델 번들에 영속화된 ``SingleStockPolicy`` 상태를 반환합니다.
+
+    유효한 정책 상태가 없으면 ``None`` 을 반환하며, 호출부가 조용한 Top-N 폴백
+    대신 명시적 ``ABSTAIN``(``missing_validated_policy``)을 산출하게 합니다.
+    """
+    raw = models_bundle.get("single_stock_policy")
+    if raw is None:
+        return None
+    if isinstance(raw, SingleStockPolicy):
+        return raw
+    if isinstance(raw, dict):
+        return SingleStockPolicy(**raw)
+    logger.info(
+        f"{Colors.YELLOW}[Warning] 인식할 수 없는 single_stock_policy 상태입니다. "
+        f"ABSTAIN(missing_validated_policy) 으로 결정합니다.{Colors.RESET}"
+    )
+    return None
+
+
 # 모델 번들 검증 상수: 단위 테스트 픽스처가 생성하는 더미 피처 패턴 및
 # 실데이터 학습 번들이 반드시 포함해야 하는 모델 키 목록.
 _DUMMY_FEATURE_PATTERN = re.compile(r"^f\d+$")
@@ -587,6 +613,26 @@ def main():
     print_table(
         select_top_actionable(sangdda_results), "상따(29.9%) 시나리오 결과", minimal=True
     )
+
+    # 7. 단일 실행 결정: normal + sangdda 스코어링 테이블을 병합해 정확히 한 번만
+    # 소비하고 BUY(종목 1개) 또는 ABSTAIN 1건만 산출합니다. 정책 상태가 없으면
+    # 조용한 Top-N 폴백 대신 명시적 ABSTAIN(missing_validated_policy) 입니다.
+    scored_all = (
+        pd.concat([normal_sizing, sangdda_sizing], ignore_index=True)
+        if not sangdda_sizing.empty
+        else normal_sizing
+    )
+    policy = _load_single_stock_policy(models_bundle)
+    if policy is None:
+        single_decision = abstain_decision(
+            REASON_MISSING_POLICY,
+            group_value=str(datetime.date.today()),
+        )
+    else:
+        single_decision = select_single_daily_trade(
+            scored_all, policy, group_col="date"
+        )
+    print_table(single_decision, "실행 결정 (Single-Stock: BUY/ABSTAIN)", minimal=True)
 
 
 if __name__ == "__main__":
