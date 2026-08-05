@@ -62,6 +62,17 @@ _CLOSE_MORNING_RERANKER_CONFIG: dict[str, Any] = {
     "score_col": "decision_score",
 }
 
+# close-morning reranker v2 연구 설정: ``p_bad`` 하방위험 패널티를 명시적으로
+# 선언하는 연구 번들에서만 소비됩니다. 프로덕션 기본값이나 v1 번들은 변경하지
+# 않습니다 (+1% good / -2% bad 라벨 비대칭 계약의 제한적 그리드).
+_CLOSE_MORNING_RERANKER_V2_RESEARCH_CONFIG: dict[str, Any] = {
+    "version": "close-morning-reranker-v2-research",
+    "rank_weight": 1.0,
+    "p_good_weight": 0.5,
+    "bad_probability_weight": 0.5,
+    "score_col": "decision_score",
+}
+
 
 def calculate_utility_score(
     df: pd.DataFrame,
@@ -389,32 +400,55 @@ def add_close_morning_decision_score(
     group_col: str = "date",
     rank_score_col: str = "rank_score",
     p_good_col: str = "p_good",
+    p_bad_col: str = "p_bad",
     output_col: str = "decision_score",
     probability_weight: float = 0.5,
+    bad_probability_weight: float = 0.0,
 ) -> pd.DataFrame:
     """close-morning reranker 결정 스코어를 그룹(날짜) 내 횡단면 백분위 순위로 산출합니다.
 
-    ``decision_score = rank(rank_score, pct=True) + probability_weight * rank(p_good, pct=True)``
-    벡터화된 ``groupby().rank`` 를 사용하며 row-wise apply 를 피하고 타깃/수익률
-    컬럼을 절대 읽지 않습니다(미래 정보 금지). 누락 그룹/스코어 컬럼, 비유한
-    스코어, 또는 ``[0, 1]`` 을 벗어난 ``probability_weight`` 는 ``ValueError`` 로
-    fail-closed 합니다.
+    ``decision_score = rank(rank_score, pct=True) + probability_weight * rank(p_good, pct=True)
+    - bad_probability_weight * rank(p_bad, pct=True)``
+
+    ``bad_probability_weight=0.0``(기본)이면 v1 스코어와 완전히 동일하며 ``p_bad``
+    컬럼을 읽지 않습니다. v2 는 동일한 +1%/-2% 라벨 계약의 비대칭 손실 심각도를
+    반영해 하방위험 패널티를 추가하는 리스크 통제 실험입니다. 벡터화된
+    ``groupby().rank`` 를 사용하며 row-wise apply 를 피하고 타깃/수익률 컬럼을
+    절대 읽지 않습니다(미래 정보 금지). 누락 그룹/스코어 컬럼, 비유한 스코어,
+    또는 ``[0, 1]`` 을 벗어난 가중치는 ``ValueError`` 로 fail-closed 합니다.
     """
     missing = [col for col in (group_col, rank_score_col, p_good_col) if col not in df.columns]
     if missing:
         raise ValueError(f"missing required columns for close-morning decision score: {missing}")
     if not 0.0 <= probability_weight <= 1.0:
         raise ValueError(f"probability_weight must be within [0, 1], got {probability_weight}")
+    if not 0.0 <= bad_probability_weight <= 1.0:
+        raise ValueError(
+            f"bad_probability_weight must be within [0, 1], got {bad_probability_weight}"
+        )
     rank_score = df[rank_score_col].to_numpy(dtype=np.float64)
     p_good = df[p_good_col].to_numpy(dtype=np.float64)
     if not np.isfinite(rank_score).all() or not np.isfinite(p_good).all():
         raise ValueError(
             "rank_score and p_good must be finite for close-morning decision score"
         )
-    out = df.copy()
     rank_pct = df.groupby(group_col)[rank_score_col].rank(pct=True, method="average")
     p_good_pct = df.groupby(group_col)[p_good_col].rank(pct=True, method="average")
-    out[output_col] = rank_pct + probability_weight * p_good_pct
+    score = rank_pct + probability_weight * p_good_pct
+    if bad_probability_weight != 0.0:
+        if p_bad_col not in df.columns:
+            raise ValueError(
+                f"missing required columns for close-morning decision score: ['{p_bad_col}']"
+            )
+        p_bad = df[p_bad_col].to_numpy(dtype=np.float64)
+        if not np.isfinite(p_bad).all():
+            raise ValueError(
+                "p_bad must be finite for close-morning decision score"
+            )
+        p_bad_pct = df.groupby(group_col)[p_bad_col].rank(pct=True, method="average")
+        score = score - bad_probability_weight * p_bad_pct
+    out = df.copy()
+    out[output_col] = score
     return out
 
 
@@ -434,7 +468,9 @@ def predict_daily_position_sizing(
 
     번들이 ``decision_score_config.version=close-morning-reranker-v1`` 를 선언하면
     rank_score/p_good 예측 직후 ``decision_score`` 를 추가해 일별 선택이 결합
-    스코어를 사용하도록 합니다. 레거시 번들은 기존 출력과 선택 의미를 유지합니다.
+    스코어를 사용하도록 합니다. ``close-morning-reranker-v2-research`` 번들은
+    추가로 ``bad_probability_weight`` 만큼 ``p_bad`` 백분위를 차감합니다. 레거시
+    번들은 기존 출력과 선택 의미를 유지합니다.
 
     단일 날짜 또는 복수 날짜 데이터프레임을 모두 지원하며, Pass 등급은
     0.0 배분 비중을 가집니다.
@@ -463,6 +499,24 @@ def predict_daily_position_sizing(
         )
         out = add_close_morning_decision_score(
             out, group_col=group_col, probability_weight=p_good_weight
+        )
+    elif (
+        decision_score_config is not None
+        and decision_score_config.get("version")
+        == _CLOSE_MORNING_RERANKER_V2_RESEARCH_CONFIG["version"]
+    ):
+        p_good_weight = decision_score_config.get(
+            "p_good_weight", _CLOSE_MORNING_RERANKER_CONFIG["p_good_weight"]
+        )
+        bad_probability_weight = decision_score_config.get(
+            "bad_probability_weight",
+            _CLOSE_MORNING_RERANKER_V2_RESEARCH_CONFIG["bad_probability_weight"],
+        )
+        out = add_close_morning_decision_score(
+            out,
+            group_col=group_col,
+            probability_weight=p_good_weight,
+            bad_probability_weight=bad_probability_weight,
         )
     out["utility_score"] = calculate_utility_score(out)
     out = assign_sizing_grades(out, group_col=group_col)
