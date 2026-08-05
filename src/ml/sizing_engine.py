@@ -279,6 +279,8 @@ def _train_inline_bundle(
     target_col: str,
     group_col: str,
     calibration_diagnostics: list[dict[str, Any]] | None = None,
+    recent_return_model: Any | None = None,
+    recency_ensemble_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """타깃이 포함된 데이터로 즉시 학습 가능한 기본 모델 번들을 구성합니다.
 
@@ -292,7 +294,31 @@ def _train_inline_bundle(
 
     문자열/범주형 컬럼(``market_type``, ``theme_sector``, ``chart_analysis``)은
     Booster 구성 시 ValueError 를 유발하므로 ``feature_cols`` 에서 제외됩니다.
+
+    opt-in 연구 번들: ``recent_return_model``(half-life recent Huber)과
+    ``recency_ensemble_config`` 를 함께 주면 두 return 모델을 영속화하고,
+    decision-time 그룹 단위 rank blend 를 재현하도록 ``decision_score_config``
+    (v1 reranker) 를 함께 기록합니다. 두 인자는 항상 함께 주어야 하며,
+    ``recency_ensemble_config`` 의 ``half_life_groups``(252/504)와
+    ``recent_weight``([0, 1]) 를 검증합니다.
     """
+    if recency_ensemble_config is not None and recent_return_model is None:
+        raise ValueError(
+            "recency research bundle requires both recent_return_model and "
+            "recency_ensemble_config"
+        )
+    if recency_ensemble_config is not None:
+        half_life = recency_ensemble_config.get("half_life_groups")
+        recent_weight = recency_ensemble_config.get("recent_weight")
+        if half_life not in (252, 504):
+            raise ValueError(
+                f"recency_ensemble_config.half_life_groups must be 252 or 504, got {half_life!r}"
+            )
+        if not isinstance(recent_weight, (int, float)) or not 0.0 <= recent_weight <= 1.0:
+            raise ValueError(
+                f"recency_ensemble_config.recent_weight must be within [0, 1], "
+                f"got {recent_weight!r}"
+            )
     feature_cols = [col for col in feature_cols if col not in _CATEGORICAL_FEATURE_COLS]
     if not feature_cols:
         raise ValueError("feature_cols is empty after excluding categorical columns")
@@ -336,7 +362,7 @@ def _train_inline_bundle(
         "realized_vol_default": _DEFAULT_REALIZED_VOL,
     }
 
-    return {
+    bundle: dict[str, Any] = {
         "feature_cols": list(feature_cols),
         "target_col": target_col,
         "group_col": group_col,
@@ -352,6 +378,23 @@ def _train_inline_bundle(
         "quantile_models": quantile_models,
         "calibrators": calibrators,
     }
+    if recent_return_model is not None:
+        if recency_ensemble_config is None:
+            raise ValueError(
+                "recency research bundle requires both recent_return_model and "
+                "recency_ensemble_config"
+            )
+        bundle["recent_return_model"] = recent_return_model
+        bundle["recency_ensemble_config"] = dict(recency_ensemble_config)
+        bundle["decision_score_config"] = {
+            "version": "close-morning-reranker-v1",
+            "rank_weight": 1.0,
+            "p_good_weight": float(
+                recency_ensemble_config.get("probability_weight", 0.5)
+            ),
+            "score_col": "decision_score",
+        }
+    return bundle
 
 
 def _predict_from_bundle(
@@ -366,7 +409,38 @@ def _predict_from_bundle(
     # rank_score 는 회귀 champion(return_model) 의 기대수익 예측으로 생성하며,
     # return_model 이 없는 기존 번들은 rank_model 로 폴백합니다.
     return_model = models_bundle.get("return_model")
-    if return_model is not None:
+    recency_config = models_bundle.get("recency_ensemble_config")
+    if recency_config is not None:
+        recent_return_model = models_bundle.get("recent_return_model")
+        if return_model is None or recent_return_model is None:
+            raise ValueError(
+                "recency ensemble research bundle requires both return_model and "
+                "recent_return_model"
+            )
+        half_life = recency_config.get("half_life_groups")
+        recent_weight = recency_config.get("recent_weight")
+        if half_life not in (252, 504):
+            raise ValueError(
+                f"recency_ensemble_config.half_life_groups must be 252 or 504, got {half_life!r}"
+            )
+        if not isinstance(recent_weight, (int, float)) or not 0.0 <= recent_weight <= 1.0:
+            raise ValueError(
+                f"recency_ensemble_config.recent_weight must be within [0, 1], "
+                f"got {recent_weight!r}"
+            )
+        bundle_group_col = models_bundle.get("group_col")
+        if bundle_group_col is None or bundle_group_col not in out.columns:
+            raise ValueError(
+                "recency ensemble research bundle requires a group_col present in df"
+            )
+        expanding_pred = pd.Series(return_model.predict(features), index=df.index)
+        recent_pred = pd.Series(recent_return_model.predict(features), index=df.index)
+        expanding_pct = expanding_pred.groupby(out[bundle_group_col]).rank(pct=True, method="average")
+        recent_pct = recent_pred.groupby(out[bundle_group_col]).rank(pct=True, method="average")
+        out["rank_score"] = (1.0 - recent_weight) * expanding_pct + recent_weight * recent_pct
+        out["pred_expanding"] = expanding_pred
+        out["pred_recent"] = recent_pred
+    elif return_model is not None:
         out["rank_score"] = return_model.predict(features)
     else:
         rank_model = models_bundle.get("rank_model")
