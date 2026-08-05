@@ -13,6 +13,7 @@ from src.ml.training.experiments import (
     _inner_close_morning_candidate_evaluator,
     _inner_recency_ensemble_candidate_evaluator,
     _recency_ensemble_rank,
+    run_close_morning_algorithm_ensemble_experiment,
     run_close_morning_recency_ensemble_experiment,
     run_close_morning_reranker_v2_experiment,
 )
@@ -82,6 +83,7 @@ __all__ = [
     "_validate_quality_metrics",
     "calculate_recency_sample_weight",
     "evaluate_close_morning_quality",
+    "run_close_morning_algorithm_ensemble_experiment",
     "run_close_morning_recency_ensemble_experiment",
     "run_close_morning_reranker_v2_experiment",
     "run_model_pipeline",
