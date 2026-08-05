@@ -273,6 +273,36 @@ def test_interaction53_feature_set_adds_four_interaction_features() -> None:
     assert not {"stock_code", "sell_price", "net_return", "intraday_return"}.intersection(X.columns)
 
 
+def test_production_calendar_flow_feature_set_adds_nine_features() -> None:
+    """production_calendar_flow 는 base40 에 정확히 9개 캘린더/수급 후보를 추가합니다."""
+    X_base, _, _, _ = build_ml_dataset(
+        _build_scenario_raw_df(), panel_mode="scenario_action"
+    )
+    X_pcf, _, _, processed = build_ml_dataset(
+        _build_scenario_raw_df(),
+        feature_set="production_calendar_flow",
+        panel_mode="scenario_action",
+    )
+    assert processed.attrs["feature_set"] == "production_calendar_flow"
+    assert X_pcf.attrs["feature_set"] == "production_calendar_flow"
+    assert _PRODUCTION_CALENDAR_FLOW_NINE.issubset(set(processed.columns))
+    assert _PRODUCTION_CALENDAR_FLOW_NINE.issubset(X_pcf.columns)
+    # base40 X 에는 후보 피처가 하나도 없고, 차이는 정확히 9종입니다.
+    assert not _PRODUCTION_CALENDAR_FLOW_NINE.intersection(X_base.columns)
+    assert set(X_pcf.columns) - set(X_base.columns) == _PRODUCTION_CALENDAR_FLOW_NINE
+    # 캔들/실현 매수가 파생 피처는 여전히 X 에서 제외됩니다.
+    candle_derived = {
+        "close_position",
+        "body_ratio",
+        "upper_shadow_ratio",
+        "intraday_range",
+        "buy_price_change_rate",
+        "gap_ratio",
+        "relative_change_rate",
+    }
+    assert not candle_derived.intersection(X_pcf.columns)
+
+
 def test_build_ml_dataset_rejects_unknown_feature_set() -> None:
     """허용되지 않는 feature_set 은 ValueError 를 발생시킵니다."""
     with pytest.raises(ValueError, match="feature_set"):
@@ -380,6 +410,89 @@ def test_engineer_features_created() -> None:
         "change_rate_pct_rank",
     }
     assert expected.issubset(set(engineered.columns))
+    # production_calendar_flow 연구 후보 9종이 engineer_features 에서 생성됩니다.
+    candidate = {
+        "weekday_is_monday",
+        "weekday_is_tuesday",
+        "weekday_is_wednesday",
+        "weekday_is_thursday",
+        "weekday_is_friday",
+        "flow_consensus",
+        "flow_alignment_direction",
+        "flow_turnover",
+        "friday_selection_rank_pct",
+    }
+    assert candidate.issubset(set(engineered.columns))
+
+
+_PRODUCTION_CALENDAR_FLOW_NINE: set[str] = {
+    "weekday_is_monday",
+    "weekday_is_tuesday",
+    "weekday_is_wednesday",
+    "weekday_is_thursday",
+    "weekday_is_friday",
+    "flow_consensus",
+    "flow_alignment_direction",
+    "flow_turnover",
+    "friday_selection_rank_pct",
+}
+
+
+def test_production_calendar_flow_weekday_one_hot_and_friday_rank() -> None:
+    """요일 one-hot 은 정확히 하나만 1 이고, 금요일 랭킹 상호작용은 금요일만 0 이 아닙니다."""
+    df = _build_raw_df(n_per_date=[2, 2])
+    monday = pd.Timestamp("2024-01-08")
+    friday = pd.Timestamp("2024-01-12")
+    df["매수날짜"] = [monday, monday, friday, friday]
+    engineered = engineer_features(clean_column_names(df))
+
+    weekday_cols = [
+        "weekday_is_monday",
+        "weekday_is_tuesday",
+        "weekday_is_wednesday",
+        "weekday_is_thursday",
+        "weekday_is_friday",
+    ]
+    assert (engineered[weekday_cols].sum(axis=1) == 1).all()
+    assert engineered[weekday_cols].isin([0.0, 1.0]).all().all()
+    assert engineered[weekday_cols].dtypes.eq("float64").all()
+
+    monday_mask = engineered["trade_date"] == monday
+    friday_mask = engineered["trade_date"] == friday
+    assert (engineered.loc[monday_mask, "weekday_is_monday"] == 1.0).all()
+    assert (engineered.loc[monday_mask, "weekday_is_friday"] == 0.0).all()
+    assert (engineered.loc[friday_mask, "weekday_is_friday"] == 1.0).all()
+
+    # 금요일 랭킹 상호작용: 금요일은 1 - rank_ratio, 그 외 요일은 정확히 0.
+    assert (engineered.loc[monday_mask, "friday_selection_rank_pct"] == 0.0).all()
+    expected_friday = (1 - engineered.loc[friday_mask, "rank_ratio"]).round(12)
+    actual_friday = engineered.loc[friday_mask, "friday_selection_rank_pct"].round(12)
+    assert (actual_friday == expected_friday).all()
+    # 금요일인데 rank_ratio < 1 인 행은 0 이 아닙니다 (정확히 그 요일에만 시그널).
+    assert (actual_friday < 1.0).all()
+    assert (engineered.loc[friday_mask, "rank_ratio"] < 1).any()
+    assert (actual_friday[engineered.loc[friday_mask, "rank_ratio"] < 1] > 0).all()
+
+
+def test_production_calendar_flow_zero_flow_and_alignment_formulas() -> None:
+    """전 수급이 0/결측이면 consensus 0, 정렬 0 이고, 일치 방향은 ±1 입니다."""
+    df = _build_raw_df(n_per_date=[3])
+    df["(기관_순매수)"] = 0.0
+    df["(외국인_순매수)"] = 0.0
+    df["(프로그램_순매수)"] = 0.0
+    engineered = engineer_features(clean_column_names(df))
+    assert (engineered["flow_consensus"] == 0).all()
+    assert (engineered["flow_alignment_direction"] == 0.0).all()
+
+    aligned = _build_raw_df(n_per_date=[3])
+    aligned["(기관_순매수)"] = 100.0
+    aligned["(외국인_순매수)"] = 50.0
+    aligned["(프로그램_순매수)"] = 25.0
+    engineered = engineer_features(clean_column_names(aligned))
+    assert (engineered["flow_consensus"] == 3).all()
+    assert (engineered["flow_alignment_direction"] == 1.0).all()
+    assert engineered["flow_alignment_direction"].between(-1.0, 1.0).all()
+    assert engineered["flow_consensus"].between(-3, 3).all()
 
 
 def test_no_data_leakage_in_features() -> None:
