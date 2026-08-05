@@ -23,6 +23,13 @@ from src.ml.backtest_evaluator import run_backtest_evaluation
 from src.ml.feature_manifest import build_feature_manifest
 from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
 from src.ml.quantile_model import fit_predict_quantile_and_classifier
+from src.ml.single_stock_policy import (
+    _DEFAULT_MIN_HISTORY_DATES,
+    SingleStockPolicy,
+    SingleStockPolicyEvaluation,
+    default_policy_candidates,
+    evaluate_single_stock_policy_oof,
+)
 from src.ml.sizing_engine import (
     ROUND_TRIP_COST_RATIO,
     _train_inline_bundle,
@@ -240,6 +247,24 @@ def run_model_pipeline(
         "top_3_return": _compute_top_k_return(oof_df, group_col, target_col, k=3),
     }
 
+    # 단일 종목 정책 OOF 보정: ranker OOF 생성 직후, 후보 번들 승격 이전에
+    # 저장된 rank_score/OOF pred 만으로 정책 상태를 인과적으로 확정합니다.
+    single_stock_policy: SingleStockPolicy | None = None
+    single_stock_evaluation: SingleStockPolicyEvaluation | None = None
+    if {"stock_code", "chart_analysis"} <= set(oof_df.columns):
+        cutoff = str(oof_df[group_col].max())
+        single_stock_evaluation = evaluate_single_stock_policy_oof(
+            oof_df,
+            target_col=target_col,
+            group_col=group_col,
+            stock_col="stock_code",
+            policy_candidates=default_policy_candidates(cutoff, score_col="pred"),
+            min_history_dates=_DEFAULT_MIN_HISTORY_DATES,
+            scenario_col="chart_analysis",
+            score_col="pred",
+        )
+        single_stock_policy = single_stock_evaluation.selected_policy
+
     return {
         "oof_predictions": oof_df,
         "oof_df": oof_df,
@@ -252,6 +277,8 @@ def run_model_pipeline(
         "feature_manifest": build_feature_manifest(feature_cols),
         "training_cutoff": str(training_cutoff),
         "calibration_diagnostics": [],
+        "single_stock_policy": single_stock_policy,
+        "single_stock_evaluation": single_stock_evaluation,
         "policy_params": {
             "purge_gap": purge_gap,
             "n_splits": n_splits,
