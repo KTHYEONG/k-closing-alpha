@@ -18,6 +18,7 @@ from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
 from sklearn.calibration import CalibratedClassifierCV
 
 from src.ml.sizing_engine import (
+    _train_inline_bundle,
     apply_risk_limits,
     assign_sizing_grades,
     calculate_utility_score,
@@ -93,12 +94,13 @@ def test_utility_score_consumes_net_predictions_without_second_cost_deduction() 
     with_cost = float(calculate_utility_score(df).iloc[0])
     assert with_cost == pytest.approx(no_cost)
     # 유틸리티는 예측 q50 자체를 그대로 기대수익으로 소비합니다 (비용 재차감 없음).
+    # p_good/p_bad 유틸리티 가중치는 보정 증거가 없으면 기본 0 입니다.
     assert with_cost == pytest.approx(
         float(df["pred_q50"].iloc[0])
         - 0.5 * np.maximum(0.0, -df["pred_q10"].iloc[0])
         - 0.1 * (df["pred_q90"].iloc[0] - df["pred_q10"].iloc[0])
-        + 0.01 * df["p_good"].iloc[0]
-        - 0.01 * df["p_bad"].iloc[0]
+        + 0.0 * df["p_good"].iloc[0]
+        - 0.0 * df["p_bad"].iloc[0]
     )
 
 
@@ -491,4 +493,52 @@ def test_scenario_sizing_grade_hybrid_01() -> None:
     df["pred_q50"] = [0.02] * 10
     result = assign_sizing_grades(df, min_good_utility=0.0, min_weak_utility=-2.0)
     assert (result["grade"] == "Pass").all()
+
+
+def test_utility_score_defaults_zero_p_good_p_bad_weights() -> None:
+    """p_good/p_bad 유틸리티 가중치는 보정 승격이 없으면 기본 0 입니다."""
+    df = pd.DataFrame(
+        {
+            "pred_q10": [-0.01],
+            "pred_q50": [0.01],
+            "pred_q90": [0.03],
+            "p_good": [1.0],
+            "p_bad": [1.0],
+        }
+    )
+    score = float(calculate_utility_score(df).iloc[0])
+    expected = 0.01 - 0.5 * max(0.0, 0.01) - 0.1 * (0.03 - (-0.01))
+    assert score == pytest.approx(expected)
+
+
+def test_train_inline_bundle_contains_return_model_and_zero_utility_weights() -> None:
+    """_train_inline_bundle 은 회귀 champion(return_model)을 영속화하고
+    p_good/p_bad 유틸리티 가중치는 기본 0 으로 기록합니다."""
+    df = _make_feature_df()
+    bundle = _train_inline_bundle(df, FEATURE_COLS, TARGET_COL, GROUP_COL)
+    assert isinstance(bundle["return_model"], LGBMRegressor)
+    assert isinstance(bundle["rank_model"], LGBMRanker)
+    weights = bundle["policy_params"]["utility_weights"]
+    assert weights["w_good"] == 0.0
+    assert weights["w_bad"] == 0.0
+
+
+def test_predict_daily_position_sizing_rank_score_comes_from_return_model() -> None:
+    """당일 rank_score 는 저장된 return_model 의 기대수익 예측으로 생성됩니다."""
+    df = _make_feature_df()
+    result = predict_daily_position_sizing(df, FEATURE_COLS)
+    assert "rank_score" in result.columns
+    bundle = _train_inline_bundle(df, FEATURE_COLS, TARGET_COL, GROUP_COL)
+    expected = bundle["return_model"].predict(df[FEATURE_COLS])
+    np.testing.assert_allclose(result["rank_score"].to_numpy(), expected, atol=1e-12)
+
+
+def test_predict_from_bundle_falls_back_to_rank_model_without_return_model() -> None:
+    """return_model 이 없는 기존 번들은 rank_model 로 rank_score 를 보존합니다."""
+    df = _make_feature_df()
+    legacy = _build_bundle(df)
+    assert "return_model" not in legacy
+    result = predict_daily_position_sizing(df, FEATURE_COLS, models_bundle=legacy)
+    expected = legacy["rank_model"].predict(df[FEATURE_COLS])
+    np.testing.assert_allclose(result["rank_score"].to_numpy(), expected, atol=1e-12)
 
