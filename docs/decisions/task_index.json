@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_SINGLE_STOCK_ABSTENTION",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_ML_SINGLE_STOCK_ABSTENTION",
+      "domain": "ml",
+      "title": "Single-stock daily BUY/ABSTAIN policy",
+      "why": "The ML strategy targets one new stock per day, but the prior sizing/display path exposed multiple candidates and did not make abstention causal.",
+      "resolution": "Added causal OOF single-stock policy calibration, deterministic scenario-action resolution, exactly-one BUY or explicit ABSTAIN decisions, and entry-sequence-only evaluation until an exit ledger exists. The OOF comparison selected always_buy_top1; margin abstention candidates were retained for diagnostics because they reduced scheduled-date return.",
+      "impact": "Daily inference now has a single-stock decision contract; model reports distinguish active-trade returns from scheduled-date returns and do not claim portfolio MDD without exit data."
+    },
+    {
       "task_id": "TASK_ML_V3_CALENDAR_FLOW_FEATURES",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_ML_V3_CALENDAR_FLOW_FEATURES",
