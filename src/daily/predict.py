@@ -350,7 +350,9 @@ def train_and_save_real_model_bundle(
     theme_path = str(theme_path or settings.THEME_PARQUET_PATH)
     trade_log_df = pd.read_parquet(trade_log_path)
     theme_df = pd.read_parquet(theme_path) if os.path.exists(theme_path) else None
-    X, targets, cat_features, processed = build_ml_dataset(trade_log_df, theme_df)
+    X, targets, cat_features, processed = build_ml_dataset(
+        trade_log_df, theme_df, feature_set='snapshot49'
+    )
     feature_cols = [col for col in X.columns if col not in cat_features]
     target_col = "target_return"
     group_col = "trade_date"
