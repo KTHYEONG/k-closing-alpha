@@ -72,6 +72,47 @@ _POLICY_METRIC_KEYS: tuple[str, ...] = (
 )
 
 
+def calculate_recency_sample_weight(
+    groups: pd.Series, half_life_groups: int | None
+) -> np.ndarray:
+    """최근 데이터에 지수 감쇠 가중치를 부여한 row 단위 sample weight 를 반환합니다.
+
+    ``groups`` 의 유일 거래일을 시간순으로 정렬해 최신 그룹 age=0, 과거로 갈수록
+    age 가 커집니다. 각 그룹 가중치는 ``exp(-ln(2) * age / half_life_groups)`` 이며
+    평균이 정확히 1 이 되도록 정규화해 가중 Huber 학습 시 순수익 타깃의 레이블
+    크기가 변하지 않도록 합니다. ``None`` 이면 전부 1 (기존 expanding 동작) 을
+    반환합니다.
+
+    ``half_life_groups`` 는 252(1 policy-history 년) 또는 504(2년) 만 허용하며,
+    그 외 값·비어 있는 그룹·시간순 파싱 불가 그룹·비유한 출력은 ``ValueError`` 로
+    fail-closed 합니다.
+    """
+    if half_life_groups is None:
+        return np.ones(len(groups), dtype=np.float64)
+    if half_life_groups not in (252, 504):
+        raise ValueError(
+            f"recency_half_life_groups must be one of None, 252, 504, got {half_life_groups!r}"
+        )
+    if len(groups) == 0:
+        raise ValueError("recency sample weight requires non-empty trade-date groups")
+    unique_groups = pd.unique(groups)
+    parsed = pd.to_datetime(pd.Series(unique_groups), errors="coerce")
+    if parsed.isna().any():
+        raise ValueError(
+            "recency sample weight requires parseable chronological trade-date groups"
+        )
+    order = np.argsort(parsed.to_numpy(), kind="stable")
+    sorted_unique = unique_groups[order]
+    ages = np.arange(len(sorted_unique), dtype=np.float64)[::-1]
+    decay = np.exp(-np.log(2.0) * ages / float(half_life_groups))
+    mean_decay = float(decay.mean())
+    if not np.isfinite(mean_decay) or mean_decay <= 0.0:
+        raise ValueError("recency sample weights are not finite")
+    weights = decay / mean_decay
+    weight_by_group = dict(zip(sorted_unique, weights.tolist(), strict=True))
+    return np.asarray([weight_by_group[g] for g in groups], dtype=np.float64)
+
+
 def _policy_metadata(
     policy: SingleStockPolicy | None,
     evaluation: SingleStockPolicyEvaluation | None,
@@ -590,6 +631,517 @@ def run_close_morning_reranker_v2_experiment(
     }
 
 
+def _recency_ensemble_rank(
+    pred_expanding: pd.Series,
+    pred_recent: pd.Series,
+    group: pd.Series,
+    recent_weight: float,
+) -> pd.Series:
+    """동일 거래일 내 백분위 순위를 convex blend 해 앙상블 순위를 산출합니다.
+
+    ``(1 - recent_weight) * pct_rank(pred_expanding)
+    + recent_weight * pct_rank(pred_recent)`` 로 두 전문가의 예측 스케일 차이를
+    제거합니다. 그룹 단위 ``groupby().rank`` 벡터화를 사용하며 타깃/수익률
+    컬럼은 절대 읽지 않습니다 (미래 정보 금지).
+    """
+    expanding_pct = pred_expanding.groupby(group).rank(pct=True, method="average")
+    recent_pct = pred_recent.groupby(group).rank(pct=True, method="average")
+    return (1.0 - recent_weight) * expanding_pct + recent_weight * recent_pct
+
+
+def _select_recency_ensemble_config(
+    candidate_stats: dict[tuple[int | None, float], dict[str, float]],
+) -> tuple[int | None, float]:
+    """내부 OOF 후보에서 보수적 규칙으로 ``(half_life, recent_weight)`` 를 선택합니다.
+
+    baseline(alpha=0, v1) 은 항상 유효하며, 비영 후보는 내부 OOF scheduled mean
+    이 v1 이상이고 compounded MDD 가 엄격히 낮을 때만 유효합니다. 유효 후보 중
+    낮은 MDD → 높은 mean → 낮은 recent_weight → 긴 half_life 순으로 선택하고
+    조건을 충족하지 못하면 ``(None, 0.0)`` v1 로 fail-closed 합니다. NaN 지표는
+    미충족으로 간주해 절대 v1 을 대체하지 않습니다.
+    """
+    baseline_key: tuple[int | None, float] = (None, 0.0)
+    baseline = candidate_stats[baseline_key]
+    base_mean = float(baseline["scheduled_mean_return"])
+    base_mdd = float(baseline["entry_sequence_drawdown"])
+
+    eligible: list[tuple[int | None, float]] = [baseline_key]
+    for config, stats in candidate_stats.items():
+        if config == baseline_key:
+            continue
+        mean = float(stats["scheduled_mean_return"])
+        mdd = float(stats["entry_sequence_drawdown"])
+        mean_ge = np.isfinite(mean) and np.isfinite(base_mean) and mean >= base_mean
+        mdd_lt = np.isfinite(mdd) and np.isfinite(base_mdd) and mdd < base_mdd
+        if mean_ge and mdd_lt:
+            eligible.append(config)
+
+    def _sort_key(config: tuple[int | None, float]) -> tuple[float, float, float, float]:
+        stats = candidate_stats[config]
+        mdd = float(stats["entry_sequence_drawdown"])
+        mean = float(stats["scheduled_mean_return"])
+        half_life, recent_weight = config
+        return (
+            mdd if np.isfinite(mdd) else np.inf,
+            -mean if np.isfinite(mean) else -np.inf,
+            recent_weight,
+            -float(half_life) if half_life is not None else float("-inf"),
+        )
+
+    return min(eligible, key=_sort_key)
+
+
+def _dominant_recency_config(
+    configs: list[tuple[int | None, float]],
+) -> tuple[int | None, float]:
+    """폴드 선택 구성 중 최빈값을 결정적 순서로 반환합니다 (연구 번들용).
+
+    동률이면 낮은 recent_weight → 긴 half_life 순으로 우선합니다. ``(None, 0.0)``
+    baseline 은 recent_weight=0 으로 가장 먼저 우선해, 폴드들이 baseline 으로
+    fail-closed 했을 때 번들이 baseline 구성을 유지합니다.
+    """
+    counts: dict[tuple[int | None, float], int] = {}
+    for config in configs:
+        counts[config] = counts.get(config, 0) + 1
+
+    def _precedes(a: tuple[int | None, float], b: tuple[int | None, float]) -> bool:
+        a_half_life, a_alpha = a
+        b_half_life, b_alpha = b
+        if a_alpha != b_alpha:
+            return a_alpha < b_alpha
+        if a_half_life is None or b_half_life is None:
+            return a_half_life is None
+        return a_half_life > b_half_life
+
+    best = configs[0]
+    for config, count in counts.items():
+        if count > counts[best] or (count == counts[best] and _precedes(config, best)):
+            best = config
+    return best
+
+
+def _inner_recency_ensemble_candidate_evaluator(
+    inner_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    group_col: str,
+    *,
+    n_splits: int,
+    purge_gap: int,
+    probability_weight: float,
+    min_history_dates: int,
+    half_lives: tuple[int, ...],
+    alphas: tuple[float, ...],
+) -> dict[str, Any]:
+    """외부 fold 의 train 분할만 사용하는 내부 purged walk-forward 후보 평가입니다.
+
+    outer-train 날짜 전용 OOF(expanding + 252/504 half-life recent + p_good)를
+    중첩 walk-forward 로 산출하고, ``(half_life, recent_weight)`` 고정 후보를
+    ``always_buy_top1`` 로 평가한 뒤 ``_select_recency_ensemble_config`` 의 보수적
+    규칙으로 최적 구성을 결정합니다. 선택은 전적으로 이 partition 의 OOF 레이블만
+    사용하며 외부 validation 레이블을 절대 읽지 않습니다. partition 이 중첩
+    walk-forward 를 지원할 만큼 충분하지 않으면 baseline 으로 fail-closed 합니다.
+    """
+    inner_groups = int(inner_df[group_col].nunique())
+    if inner_groups < 3:
+        return {
+            "chosen_config": (None, 0.0),
+            "candidate_stats": {},
+            "inner_n_groups": inner_groups,
+            "inner_n_splits": 0,
+            "inner_cutoff": None,
+            "fail_closed_reason": "insufficient_inner_history",
+        }
+    inner_splits = max(1, min(n_splits, inner_groups - 2))
+
+    expanding = run_model_pipeline(
+        inner_df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=inner_splits,
+        purge_gap=purge_gap,
+        model_type="lgb_regressor",
+    )
+    recent_by_h: dict[int, dict[str, Any]] = {
+        half_life: run_model_pipeline(
+            inner_df,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=inner_splits,
+            purge_gap=purge_gap,
+            model_type="lgb_regressor",
+            recency_half_life_groups=half_life,
+        )
+        for half_life in half_lives
+    }
+    risk_oof = fit_predict_quantile_and_classifier(
+        inner_df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=inner_splits,
+        purge_gap=purge_gap,
+    )
+    aligned_exp = _align_close_morning_oof(
+        expanding["oof_predictions"], risk_oof, target_col=target_col, group_col=group_col
+    )
+    aligned_recent = {
+        half_life: _align_close_morning_oof(
+            recent_by_h[half_life]["oof_predictions"],
+            risk_oof,
+            target_col=target_col,
+            group_col=group_col,
+        )
+        for half_life in half_lives
+    }
+
+    def _evaluate(rank_score: pd.Series) -> dict[str, float]:
+        panel = aligned_exp.copy()
+        panel["rank_score"] = rank_score
+        evaluation = _evaluate_close_morning_top1(
+            panel,
+            target_col,
+            group_col,
+            probability_weight=probability_weight,
+            bad_probability_weight=0.0,
+            min_history_dates=min_history_dates,
+        )
+        metrics = evaluation["metrics"]
+        return {
+            "scheduled_mean_return": float(metrics["scheduled_mean_return"]),
+            "entry_sequence_drawdown": float(metrics["entry_sequence_drawdown"]),
+            "scheduled_sharpe": float(metrics["scheduled_sharpe"]),
+            "profit_factor": float(metrics["profit_factor"]),
+            "buy_rate": float(metrics["buy_rate"]),
+        }
+
+    candidate_stats: dict[tuple[int | None, float], dict[str, float]] = {}
+    baseline_rank = _recency_ensemble_rank(
+        aligned_exp["pred"], aligned_exp["pred"], aligned_exp[group_col], 0.0
+    )
+    candidate_stats[(None, 0.0)] = _evaluate(baseline_rank)
+    for half_life in half_lives:
+        for recent_weight in alphas:
+            if recent_weight == 0.0:
+                continue
+            rank_score = _recency_ensemble_rank(
+                aligned_exp["pred"],
+                aligned_recent[half_life]["pred"],
+                aligned_exp[group_col],
+                recent_weight,
+            )
+            candidate_stats[(half_life, recent_weight)] = _evaluate(rank_score)
+
+    return {
+        "chosen_config": _select_recency_ensemble_config(candidate_stats),
+        "candidate_stats": candidate_stats,
+        "inner_n_groups": inner_groups,
+        "inner_n_splits": inner_splits,
+        "inner_cutoff": str(aligned_exp[group_col].max()),
+        "fail_closed_reason": None,
+    }
+
+
+def run_close_morning_recency_ensemble_experiment(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    group_col: str,
+    n_splits: int = 5,
+    purge_gap: int = 1,
+    probability_weight: float = 0.5,
+    min_history_dates: int = _DEFAULT_MIN_HISTORY_DATES,
+    p_bad_col: str = "p_bad",
+    half_lives: tuple[int, ...] = (252, 504),
+    alphas: tuple[float, ...] = (0.0, 0.25, 0.50, 0.75, 1.0),
+    build_research_bundle: bool = False,
+) -> dict[str, Any]:
+    """close-morning recency-adaptive dual-horizon ensemble 중첩 선택 실험 (연구 전용).
+
+    외부 ``PurgedGroupTimeSeriesSplit(n_splits, purge_gap)`` 로 각 fold 의 외부
+    validation 날짜를 1회 평가합니다. 폴드별 ``(half_life, recent_weight)`` 구성은
+    해당 fold 의 외부 train partition 만 사용하는 내부 purged walk-forward OOF
+    에서 고르고, 그 설정을 외부 validation 날짜에 1회 적용합니다. 외부 validation
+    레이블은 설정 선택에 절대 사용하지 않습니다. ``save_model_artifacts`` 를
+    호출하지 않고 프로덕션 번들이나 기본값을 변경하지 않습니다.
+
+    ``alpha=0`` 은 v1 expanding baseline 으로 중복 제거되며, ``p_good`` 백분위
+    기여와 ``always_buy_top1`` 정책을 유지합니다. ``build_research_bundle=True``
+    일 때에만, 승격 게이트(후보가 v1 대비 scheduled mean 우위 + MDD 엄격 감소 +
+    평균 양수 + PF>1)를 통과하면 두 return 모델과 ``recency_ensemble_config`` 를
+    포함한 연구 번들을 결과에 영속화합니다.
+
+    Args:
+        df: ``stock_code``/``chart_analysis`` 식별 컬럼을 포함한 OOF 패널 입력.
+        feature_cols: 학습 피처 컬럼.
+        target_col: 일자별 실현 순수익률(decimal net) 컬럼.
+        group_col: 거래일 그룹 컬럼.
+        n_splits: 외부 walk-forward fold 수.
+        purge_gap: 보유기간 만큼의 purge group 수.
+        probability_weight: ``w_good`` (v1 p_good 가중치, 기본 0.5).
+        min_history_dates: ``always_buy_top1`` 의 기존 워밍업 의미.
+        p_bad_col: v2 손실 확률 컬럼 (본 실험에서 비영 penalty 미사용).
+        half_lives: 최근 전문가 half-life 후보 (252 또는 504).
+        alphas: 최근 전문가 가중치 후보 (0.0 baseline 포함).
+        build_research_bundle: 승격 게이트 통과 시 연구 번들 영속화 여부.
+
+    Returns:
+        dict: ``contract``, ``folds``(폴드별 선택 구성·내부 후보 지표·baseline/
+        candidate 외부 평가), ``chosen_configs``, ``aggregate``(폴드 연결 시계열의
+        baseline/candidate 지표), ``yearly_breakdown``, ``promotion``(승격 심사),
+        ``research_bundle``(선택 시).
+    """
+    if not {"stock_code", "chart_analysis"} <= set(df.columns):
+        raise ValueError(
+            "close-morning recency ensemble requires stock_code and chart_analysis columns"
+        )
+    if not 0.0 < probability_weight <= 1.0:
+        raise ValueError(f"probability_weight must be in (0, 1], got {probability_weight}")
+    if min_history_dates < 1:
+        raise ValueError(f"min_history_dates must be >= 1, got {min_history_dates}")
+    if purge_gap < 0:
+        raise ValueError(f"purge_gap must be >= 0, got {purge_gap}")
+    if not half_lives or not all(h in (252, 504) for h in half_lives):
+        raise ValueError(
+            f"half_lives must be a non-empty subset of (252, 504), got {half_lives!r}"
+        )
+    if not alphas or 0.0 not in alphas or not all(0.0 <= a <= 1.0 for a in alphas):
+        raise ValueError(
+            f"alphas must be a non-empty subset of [0, 1] containing 0.0, got {alphas!r}"
+        )
+
+    work = df.sort_values(group_col).copy()
+    expanding = run_model_pipeline(
+        work,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=n_splits,
+        purge_gap=purge_gap,
+        model_type="lgb_regressor",
+    )
+    recent_by_h: dict[int, dict[str, Any]] = {
+        half_life: run_model_pipeline(
+            work,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=n_splits,
+            purge_gap=purge_gap,
+            model_type="lgb_regressor",
+            recency_half_life_groups=half_life,
+        )
+        for half_life in half_lives
+    }
+    risk_oof = fit_predict_quantile_and_classifier(
+        work,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=n_splits,
+        purge_gap=purge_gap,
+    )
+    aligned_exp = _align_close_morning_oof(
+        expanding["oof_predictions"], risk_oof, target_col=target_col, group_col=group_col
+    )
+    aligned_recent = {
+        half_life: _align_close_morning_oof(
+            recent_by_h[half_life]["oof_predictions"],
+            risk_oof,
+            target_col=target_col,
+            group_col=group_col,
+        )
+        for half_life in half_lives
+    }
+
+    splitter = PurgedGroupTimeSeriesSplit(n_splits=n_splits, purge_gap=purge_gap)
+    full_date_positions = {
+        date: i for i, date in enumerate(sorted(work[group_col].unique()))
+    }
+    folds: list[dict[str, Any]] = []
+    chosen_config_tuples: list[tuple[int | None, float]] = []
+    baseline_series: list[np.ndarray] = []
+    candidate_series: list[np.ndarray] = []
+    baseline_dates: list[np.ndarray] = []
+    candidate_dates: list[np.ndarray] = []
+
+    for fold, (train_idx, val_idx) in enumerate(
+        splitter.split(work, y=work[target_col], groups=work[group_col])
+    ):
+        train_groups = set(work.iloc[train_idx][group_col].unique())
+        val_groups = set(work.iloc[val_idx][group_col].unique())
+        inner_df = work[work[group_col].isin(train_groups)]
+        inner = _inner_recency_ensemble_candidate_evaluator(
+            inner_df,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=n_splits,
+            purge_gap=purge_gap,
+            probability_weight=probability_weight,
+            min_history_dates=min_history_dates,
+            half_lives=half_lives,
+            alphas=alphas,
+        )
+        chosen_half_life, chosen_alpha = inner["chosen_config"]
+
+        outer_val = aligned_exp[aligned_exp[group_col].isin(val_groups)]
+        panel_start = full_date_positions[outer_val[group_col].min()]
+        panel_dates = int(outer_val[group_col].nunique())
+        effective_min_history_dates = max(
+            1, min(panel_dates, min_history_dates - panel_start)
+        )
+
+        baseline_rank = _recency_ensemble_rank(
+            outer_val["pred"], outer_val["pred"], outer_val[group_col], 0.0
+        )
+        baseline_panel = outer_val.copy()
+        baseline_panel["rank_score"] = baseline_rank
+        baseline_eval = _evaluate_close_morning_top1(
+            baseline_panel,
+            target_col,
+            group_col,
+            probability_weight=probability_weight,
+            bad_probability_weight=0.0,
+            min_history_dates=effective_min_history_dates,
+            p_bad_col=p_bad_col,
+        )
+
+        if chosen_half_life is None or chosen_alpha == 0.0:
+            candidate_eval = baseline_eval
+        else:
+            recent_outer_val = aligned_recent[chosen_half_life][
+                aligned_recent[chosen_half_life][group_col].isin(val_groups)
+            ]
+            candidate_rank = _recency_ensemble_rank(
+                outer_val["pred"],
+                recent_outer_val["pred"],
+                outer_val[group_col],
+                chosen_alpha,
+            )
+            candidate_panel = outer_val.copy()
+            candidate_panel["rank_score"] = candidate_rank
+            candidate_eval = _evaluate_close_morning_top1(
+                candidate_panel,
+                target_col,
+                group_col,
+                probability_weight=probability_weight,
+                bad_probability_weight=0.0,
+                min_history_dates=effective_min_history_dates,
+                p_bad_col=p_bad_col,
+            )
+
+        folds.append(
+            {
+                "fold": fold,
+                "chosen_config": {
+                    "half_life": chosen_half_life,
+                    "recent_weight": chosen_alpha,
+                },
+                "inner": inner,
+                "baseline": {
+                    "metrics": dict(baseline_eval["metrics"]),
+                    "n_buy": int(baseline_eval["metrics"]["n_buy"]),
+                },
+                "candidate": {
+                    "metrics": dict(candidate_eval["metrics"]),
+                    "n_buy": int(candidate_eval["metrics"]["n_buy"]),
+                },
+            }
+        )
+        chosen_config_tuples.append((chosen_half_life, chosen_alpha))
+        baseline_series.append(baseline_eval["scheduled_returns"])
+        candidate_series.append(candidate_eval["scheduled_returns"])
+        baseline_dates.append(baseline_eval["dates"])
+        candidate_dates.append(candidate_eval["dates"])
+
+    baseline_cat = np.concatenate(baseline_series)
+    candidate_cat = np.concatenate(candidate_series)
+    baseline_dates_cat = np.concatenate(baseline_dates)
+    candidate_dates_cat = np.concatenate(candidate_dates)
+
+    baseline_agg = _aggregate_close_morning_metrics(
+        baseline_cat, int(sum(fold["baseline"]["n_buy"] for fold in folds))
+    )
+    candidate_agg = _aggregate_close_morning_metrics(
+        candidate_cat, int(sum(fold["candidate"]["n_buy"] for fold in folds))
+    )
+
+    base_mean = float(baseline_agg["scheduled_mean_return"])
+    cand_mean = float(candidate_agg["scheduled_mean_return"])
+    base_mdd = float(baseline_agg["entry_sequence_drawdown"])
+    cand_mdd = float(candidate_agg["entry_sequence_drawdown"])
+    cand_pf = float(candidate_agg["profit_factor"])
+    beats_mean = np.isfinite(cand_mean) and np.isfinite(base_mean) and cand_mean > base_mean
+    lower_mdd = np.isfinite(cand_mdd) and np.isfinite(base_mdd) and cand_mdd < base_mdd
+    positive_mean = np.isfinite(cand_mean) and cand_mean > 0.0
+    pf_above_one = np.isfinite(cand_pf) and cand_pf > 1.0
+    promotion = {
+        "promoted": bool(beats_mean and lower_mdd and positive_mean and pf_above_one),
+        "candidate_beats_baseline_mean": bool(beats_mean),
+        "candidate_lower_compounded_mdd": bool(lower_mdd),
+        "positive_scheduled_net_mean": bool(positive_mean),
+        "profit_factor_above_one": bool(pf_above_one),
+    }
+
+    research_bundle: dict[str, Any] | None = None
+    if build_research_bundle and promotion["promoted"]:
+        dominant_half_life, dominant_alpha = _dominant_recency_config(chosen_config_tuples)
+        bundle_half_life = (
+            dominant_half_life if dominant_half_life is not None else half_lives[0]
+        )
+        recent_weights = calculate_recency_sample_weight(work[group_col], bundle_half_life)
+        recent_return_model = LGBMRegressor(objective="huber", random_state=42)
+        recent_return_model.fit(work[feature_cols], work[target_col], sample_weight=recent_weights)
+        recency_ensemble_config = {
+            "version": "close-morning-recency-ensemble-research",
+            "half_life_groups": bundle_half_life,
+            "recent_weight": dominant_alpha,
+            "probability_weight": probability_weight,
+            "score_col": "decision_score",
+        }
+        research_bundle = _train_inline_bundle(
+            work,
+            feature_cols,
+            target_col,
+            group_col,
+            calibration_diagnostics=risk_oof.attrs.get("calibration_diagnostics", []),
+            recent_return_model=recent_return_model,
+            recency_ensemble_config=recency_ensemble_config,
+        )
+
+    return {
+        "contract": {
+            "version": "close-morning-recency-ensemble-research",
+            "policy_candidate": "always_buy_top1",
+            "half_lives": list(half_lives),
+            "alphas": list(alphas),
+            "probability_weight": probability_weight,
+            "n_splits": n_splits,
+            "purge_gap": purge_gap,
+            "min_history_dates": min_history_dates,
+            "evaluation_cutoff": str(work[group_col].max()),
+        },
+        "folds": folds,
+        "chosen_configs": [
+            {"half_life": half_life, "recent_weight": recent_weight}
+            for half_life, recent_weight in chosen_config_tuples
+        ],
+        "aggregate": {
+            "baseline": baseline_agg,
+            "candidate": candidate_agg,
+        },
+        "yearly_breakdown": {
+            "baseline": _close_morning_yearly_breakdown(baseline_dates_cat, baseline_cat),
+            "candidate": _close_morning_yearly_breakdown(candidate_dates_cat, candidate_cat),
+        },
+        "promotion": promotion,
+        "research_bundle": research_bundle,
+    }
+
+
 def _calibrate_oof_policy(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -706,13 +1258,19 @@ def _fit_predict(
     target_col: str,
     group_col: str,
     model_params: dict[str, int | float] | None = None,
+    sample_weight: np.ndarray | None = None,
 ) -> Any:
     """model_type 에 따라 fold 단위 모델을 학습하고 OOF 예측을 반환합니다.
 
     ``model_params`` 는 요청된 모델에만 전달되며 ``random_state=42`` 는 유지합니다.
+    ``sample_weight`` 는 회귀 champion(Huber) 경로에서만 지원되며, 검증 라벨은
+    가중치 계산에 절대 사용되지 않습니다. Ridge/LGBMRanker 는 비검증된 동작을
+    방지하기 위해 비영(非零) recency 가중치를 ``ValueError`` 로 거부합니다.
     """
     params: dict[str, Any] = dict(model_params or {})
     if model_type == "ridge":
+        if sample_weight is not None:
+            raise ValueError("recency sample weighting is not supported for ridge")
         medians = train[feature_cols].median(numeric_only=True).reindex(feature_cols).fillna(0.0)
         train_features = train[feature_cols].fillna(medians)
         val_features = val[feature_cols].fillna(medians)
@@ -722,9 +1280,11 @@ def _fit_predict(
 
     if model_type == "lgb_regressor":
         model = LGBMRegressor(objective="huber", random_state=42, **params)
-        model.fit(train[feature_cols], train[target_col])
+        model.fit(train[feature_cols], train[target_col], sample_weight=sample_weight)
         return model, model.predict(val[feature_cols])
 
+    if sample_weight is not None:
+        raise ValueError("recency sample weighting is not supported for lgb_ranker")
     # lgb_ranker: 동일 query(date) 샘플이 연속되도록 정렬 후 group counts 전달
     train_sorted = train.sort_values(group_col)
     relevance = _group_relevance(train_sorted[target_col], train_sorted[group_col]).to_numpy()
@@ -758,11 +1318,18 @@ def run_model_pipeline(
     purge_gap: int = 1,
     model_type: str = "lgb_regressor",
     model_params: dict[str, int | float] | None = None,
+    recency_half_life_groups: int | None = None,
 ) -> dict[str, Any]:
     """Train ML model using Purged Group Walk-Forward CV and evaluate OOF results.
 
     시간 컬럼은 필수 검증하지 않습니다. 고정된 업무 원천 규칙이며 모델 입력·CV
     분할·artifact 승인 조건이 아닙니다.
+
+    ``recency_half_life_groups`` 가 주어지면 회귀 champion(Huber) 학습 시 각 fold
+    의 train 거래일 그룹에서만 계산한 recency sample weight 를 전달합니다.
+    검증 행·타깃·미래 날짜는 가중치 계산에 절대 사용되지 않습니다. 지원 값은
+    ``None``(기존 expanding 동작), 252, 504 뿐이며, Ridge/LGBMRanker 는 비검증
+    동작을 방지하기 위해 비영 recency 가중치를 거부합니다.
 
     Returns:
         dict containing 'oof_predictions', 'oof_df', 'metrics', 'trained_models',
@@ -771,6 +1338,17 @@ def run_model_pipeline(
     """
     if model_type not in _MODEL_TYPES:
         raise ValueError(f"model_type must be one of {list(_MODEL_TYPES)}, got {model_type!r}")
+    if recency_half_life_groups is not None:
+        if model_type != "lgb_regressor":
+            raise ValueError(
+                "recency_half_life_groups is only supported for lgb_regressor, "
+                f"got model_type={model_type!r}"
+            )
+        if recency_half_life_groups not in (252, 504):
+            raise ValueError(
+                "recency_half_life_groups must be one of None, 252, 504, "
+                f"got {recency_half_life_groups!r}"
+            )
     missing_cols = [col for col in [*feature_cols, target_col, group_col] if col not in df.columns]
     if missing_cols:
         raise ValueError(f"missing columns in df: {missing_cols}")
@@ -791,8 +1369,20 @@ def run_model_pipeline(
     ):
         train = work.iloc[train_idx]
         val = work.iloc[val_idx]
+        sample_weight = (
+            calculate_recency_sample_weight(train[group_col], recency_half_life_groups)
+            if recency_half_life_groups is not None
+            else None
+        )
         model, pred = _fit_predict(
-            model_type, train, val, feature_cols, target_col, group_col, model_params
+            model_type,
+            train,
+            val,
+            feature_cols,
+            target_col,
+            group_col,
+            model_params,
+            sample_weight,
         )
         trained_models.append(model)
         training_cutoff = train[group_col].max()
