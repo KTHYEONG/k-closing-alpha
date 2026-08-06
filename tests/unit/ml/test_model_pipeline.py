@@ -1598,6 +1598,7 @@ def test_close_morning_algorithm_ensemble_nested_selection_is_causal() -> None:
         group_col=GROUP_COL,
         n_splits=n_splits,
         min_history_dates=2,
+        selection_mode="nested_retrain",
     )
     altered = run_close_morning_algorithm_ensemble_experiment(
         mutated,
@@ -1606,12 +1607,14 @@ def test_close_morning_algorithm_ensemble_nested_selection_is_causal() -> None:
         group_col=GROUP_COL,
         n_splits=n_splits,
         min_history_dates=2,
+        selection_mode="nested_retrain",
     )
 
     assert base["contract"]["version"] == "close-morning-algorithm-ensemble-research"
     assert base["contract"]["recipes"] == list(_ALGORITHM_RECIPE_IDS)
     assert len(base["folds"]) == n_splits
     assert base["chosen_recipes"] == altered["chosen_recipes"]
+    assert base["selection_mode"] == "nested_retrain"
     # 적어도 하나의 폴드가 비-baseline 레시피를 선택해야 테스트가 의미를 가집니다.
     assert any(recipe != "lgb_only" for recipe in base["chosen_recipes"])
     for fold in base["folds"]:
@@ -1641,8 +1644,10 @@ def test_close_morning_algorithm_ensemble_falls_back_to_baseline() -> None:
         n_splits=5,
         min_history_dates=2,
         build_research_bundle=True,
+        selection_mode="nested_retrain",
     )
     assert len(report["folds"]) == 5
+    assert report["selection_mode"] == "nested_retrain"
     assert all(recipe == "lgb_only" for recipe in report["chosen_recipes"])
     assert (
         report["folds"][0]["inner"]["fail_closed_reason"] == "insufficient_inner_history"
@@ -1676,8 +1681,10 @@ def test_close_morning_algorithm_ensemble_builds_research_bundle_when_promoted(
         n_splits=2,
         min_history_dates=2,
         build_research_bundle=True,
+        selection_mode="nested_retrain",
     )
     assert report["promotion"]["promoted"] is True
+    assert report["selection_mode"] == "nested_retrain"
     bundle = report["research_bundle"]
     assert bundle is not None
     weights = bundle["algorithm_ensemble_config"]["weights"]
@@ -1727,3 +1734,173 @@ def test_close_morning_algorithm_ensemble_rejects_invalid_inputs() -> None:
         run_close_morning_algorithm_ensemble_experiment(df, **kwargs, min_history_dates=0)
     with pytest.raises(ValueError, match="purge_gap must be >= 0"):
         run_close_morning_algorithm_ensemble_experiment(df, **kwargs, purge_gap=-1)
+
+
+def test_close_morning_algorithm_ensemble_rejects_invalid_selection_mode() -> None:
+    """미지원 selection_mode 는 fail-closed 로 거부합니다."""
+    df = _make_algorithm_dataset(seed=7, n_groups=16)
+    with pytest.raises(ValueError, match="selection_mode must be one of"):
+        run_close_morning_algorithm_ensemble_experiment(
+            df,
+            feature_cols=["feature_a", "feature_b"],
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            selection_mode="unknown_mode",
+        )
+
+
+def test_close_morning_algorithm_ensemble_prequential_selection_is_causal() -> None:
+    """(SCENARIO_ENSEMBLE_PERF_01) prequential 선택은 fold f 보다 낮은 source fold
+    만 사용하며, fold f 이후의 레이블 변경이 선택을 바꿀 수 없습니다.
+
+    마지막 외부 fold validation 날짜의 실현 수익률이 -19% 로 바뀌어도 폴드별
+    ``chosen_recipe`` 는 그대로여야 하고, ``selection_source_folds[f]`` 는 항상
+    ``[0..f-1]`` 만 포함해야 합니다. 해당 변경은 그 폴드의 외부 평가 지표에는
+    반영되어야 하므로, 선택이 미래 OOF 레이블을 읽지 않는다는 인과 경계를
+    증명합니다.
+    """
+    df = _make_algorithm_dataset(seed=8, n_groups=64)
+    n_splits = 4
+    test_size = df[GROUP_COL].nunique() // (n_splits + 1)
+    future_dates = sorted(df[GROUP_COL].unique())[-test_size:]
+    mutated = df.copy()
+    mutated.loc[mutated[GROUP_COL].isin(future_dates), TARGET_COL] = -0.19
+
+    base = run_close_morning_algorithm_ensemble_experiment(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=n_splits,
+        min_history_dates=2,
+        selection_mode="prequential_outer_oof",
+        max_workers=2,
+    )
+    altered = run_close_morning_algorithm_ensemble_experiment(
+        mutated,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=n_splits,
+        min_history_dates=2,
+        selection_mode="prequential_outer_oof",
+        max_workers=2,
+    )
+
+    assert base["selection_mode"] == "prequential_outer_oof"
+    assert len(base["folds"]) == n_splits
+    assert base["chosen_recipes"] == altered["chosen_recipes"]
+    # fold f 선택은 fold f 보다 낮은 source fold 만 기록합니다.
+    for fold, source_folds in enumerate(base["selection_source_folds"]):
+        assert source_folds == list(range(fold))
+        assert base["folds"][fold]["selection"]["source_folds"] == list(range(fold))
+    # 적어도 하나의 폴드가 비-baseline 레시피를 선택해야 테스트가 의미를 가집니다.
+    assert any(recipe != "lgb_only" for recipe in base["chosen_recipes"])
+    for fold in base["folds"]:
+        assert fold["chosen_recipe"] in _ALGORITHM_RECIPE_IDS
+        assert "scheduled_mean_return" in fold["baseline"]["metrics"]
+        assert "entry_sequence_drawdown" in fold["candidate"]["metrics"]
+    assert set(base["aggregate"]) == {"baseline", "candidate"}
+    # 미래 수익률 변경은 해당 폴드의 외부 평가 지표에 반영됩니다 (관측 경계 존재).
+    last = len(base["folds"]) - 1
+    assert base["folds"][last]["candidate"]["metrics"]["scheduled_mean_return"] != pytest.approx(
+        altered["folds"][last]["candidate"]["metrics"]["scheduled_mean_return"]
+    )
+    assert base["research_bundle"] is None
+
+
+def test_close_morning_algorithm_ensemble_prequential_fails_closed_on_insufficient_history(
+    monkeypatch,
+) -> None:
+    """(SCENARIO_ENSEMBLE_PERF_02) 사전 OOF history 가 부족하면 내부 재학습 없이
+    ``lgb_only`` 로 fail-closed 합니다.
+
+    ``min_history_dates`` 보다 적은 이전 OOF 거래일을 가진 폴드(첫 fold 포함)는
+    ``insufficient_prequential_history`` 사유로 fail-closed 하며, 내부 전문가/risk
+    모델을 재학습하지 않습니다 (중첩 평가자 호출 0 회, risk OOF 1 회).
+    """
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "src.ml.training.experiments._inner_algorithm_candidate_evaluator",
+        lambda *args, **kwargs: calls.append(1),
+    )
+    df = _make_algorithm_dataset(seed=7, n_groups=8)
+    report = run_close_morning_algorithm_ensemble_experiment(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=5,
+        min_history_dates=100,
+        selection_mode="prequential_outer_oof",
+        max_workers=2,
+    )
+    assert len(report["folds"]) == 5
+    assert report["selection_mode"] == "prequential_outer_oof"
+    assert all(recipe == "lgb_only" for recipe in report["chosen_recipes"])
+    for fold in report["folds"]:
+        assert fold["chosen_recipe"] == "lgb_only"
+        assert (
+            fold["selection"]["fail_closed_reason"] == "insufficient_prequential_history"
+        )
+        assert fold["selection"]["source_folds"] == list(range(fold["fold"]))
+        assert fold["baseline"]["metrics"] == fold["candidate"]["metrics"]
+    assert report["model_fit_counts"] == {
+        "return_expert_fold_fits": 20,
+        "risk_oof_invocations": 1,
+        "inner_algorithm_evaluator_invocations": 0,
+    }
+    assert calls == []
+
+
+def test_close_morning_algorithm_ensemble_fit_count_reduction() -> None:
+    """(SCENARIO_ENSEMBLE_PERF_03) n_splits=5 에서 prequential 은 return 전문가
+    fold fit 20 회·risk OOF 1 회로 줄이고, nested_retrain 은 기존의 더 큰 fit 수를
+    보고합니다."""
+    df = _make_algorithm_dataset(seed=7, n_groups=64)
+    kwargs = {
+        "feature_cols": ["feature_a", "feature_b"],
+        "target_col": TARGET_COL,
+        "group_col": GROUP_COL,
+        "n_splits": 5,
+        "min_history_dates": 2,
+    }
+    preq = run_close_morning_algorithm_ensemble_experiment(
+        df, selection_mode="prequential_outer_oof", max_workers=2, **kwargs
+    )
+    nested = run_close_morning_algorithm_ensemble_experiment(
+        df, selection_mode="nested_retrain", **kwargs
+    )
+    assert preq["model_fit_counts"] == {
+        "return_expert_fold_fits": 20,
+        "risk_oof_invocations": 1,
+        "inner_algorithm_evaluator_invocations": 0,
+    }
+    assert nested["model_fit_counts"]["return_expert_fold_fits"] > 20
+    assert nested["model_fit_counts"]["risk_oof_invocations"] > 1
+    assert nested["model_fit_counts"]["inner_algorithm_evaluator_invocations"] == 5
+    # nested 의 fit 수는 보고된 내부 분할 수와 일치합니다.
+    expected_nested_fits = 20 + sum(
+        4 * int(fold["inner"]["inner_n_splits"]) for fold in nested["folds"]
+    )
+    assert nested["model_fit_counts"]["return_expert_fold_fits"] == expected_nested_fits
+
+
+def test_close_morning_algorithm_ensemble_prequential_deterministic_selection() -> None:
+    """prequential 선택은 동일 입력에서 결정적으로 반복됩니다 (mode-specific)."""
+    df = _make_algorithm_dataset(seed=8, n_groups=64)
+    kwargs = {
+        "feature_cols": ["feature_a", "feature_b"],
+        "target_col": TARGET_COL,
+        "group_col": GROUP_COL,
+        "n_splits": 4,
+        "min_history_dates": 2,
+        "selection_mode": "prequential_outer_oof",
+        "max_workers": 2,
+    }
+    first = run_close_morning_algorithm_ensemble_experiment(df, **kwargs)
+    second = run_close_morning_algorithm_ensemble_experiment(df, **kwargs)
+    assert first["chosen_recipes"] == second["chosen_recipes"]
+    assert first["selection_source_folds"] == second["selection_source_folds"]
+    assert first["model_fit_counts"] == second["model_fit_counts"]
+    assert first["timing"]["n_workers"] == 2
