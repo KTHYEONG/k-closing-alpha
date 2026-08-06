@@ -54,7 +54,7 @@ Provide a clear, concise summary with emojis. Example:
 ### 📐 [SPEC] <Task Title>
 
 - **Goal**: <Core objective>
-- **Diagnosis**: <Root cause summary>
+- **Diagnosis**: `[Component]` -> `[Failure Cause]`
 - **Artifacts**:
   - 📄 Specification: [`<feature>.md`](file:///docs/specs/<feature>.md)
   - ⚙️ Contract: [`<feature>_contract.json`](file:///docs/specs/<feature>_contract.json)
