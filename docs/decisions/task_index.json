@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_ALGORITHM_ENSEMBLE_PERFORMANCE",
+      "date": "2026-08-06",
+      "adr_id": "ADR_20260806_ML_ALGORITHM_ENSEMBLE_PERFORMANCE",
+      "domain": "ml",
+      "title": "ML algorithm-family ensemble prequential runtime optimization",
+      "why": "The full nested four-expert ensemble exceeded the execution budget because inner retraining repeated 120 return-expert fold fits and 25 inner risk OOF runs.",
+      "resolution": "Recorded the real-data prequential_outer_oof run through 2025-12-30 in docs/results/ml-v9.md: 33,678 panel rows, 20 return fits, zero inner refits, three bounded workers, 221.182 seconds, candidate mean 1.5378% versus 1.5316%, PF 2.751 versus 2.740, Sharpe 6.090 versus 6.044, and MDD 29.66% versus 33.94%.",
+      "impact": "The causal research candidate passes the strict research promotion gate while reducing repeated fitting; production remains unchanged pending capture-time provenance, slippage, and untouched paper/live OOS validation."
+    },
+    {
       "task_id": "src_tests_refactoring",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_src_tests_refactoring",
