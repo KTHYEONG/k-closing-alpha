@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_FEATURE_ENGINEERING_EVOLUTION",
+      "date": "2026-08-06",
+      "adr_id": "ADR_20260806_ML_FEATURE_ENGINEERING_EVOLUTION",
+      "domain": "ml",
+      "title": "Causal ML feature catalog and fold-local selection",
+      "why": "The fixed 61-feature pipeline needed a causal expanded candidate catalog and train-window-local importance selection without changing the production candidate.",
+      "resolution": "Implemented causal_expanded_v1 with operational 15:18 sheet features, strict prior-date external history joins, 600-1000 candidate generation, deterministic fold-local LightGBM gain selection, selection-aware bundle/serving metadata, and regression coverage.",
+      "impact": "Adds a research-only feature-engineering path that retains 300-500 selected features, fails closed when historical data is absent, preserves legacy behavior, and prevents outer-validation leakage."
+    },
+    {
+      "task_id": "TASK_ML_FEATURE_ENGINEERING_AVAILABILITY_CONTRACT",
+      "date": "2026-08-06",
+      "adr_id": "ADR_20260806_ML_FEATURE_ENGINEERING_AVAILABILITY_CONTRACT",
+      "domain": "ml",
+      "title": "ML feature availability contract aligned to 15:18 operational sheet capture",
+      "why": "The feature-engineering specification treated same-date OHLC too conservatively despite the operational sheet being captured together around 15:18 before the 15:19-20 entry decision.",
+      "resolution": "Updated the research specification and contract to accept same-date operational-sheet fields without a separate snapshot/timestamp system, while excluding only same-date external EOD/backfill history and execution-derived sell values.",
+      "impact": "Preserves valid intraday signal inputs, keeps future-label leakage barred, and narrows provenance controls to external history joins."
+    },
+    {
       "task_id": "TASK_ML_ALGORITHM_ENSEMBLE_PERFORMANCE",
       "date": "2026-08-06",
       "adr_id": "ADR_20260806_ML_ALGORITHM_ENSEMBLE_PERFORMANCE",
