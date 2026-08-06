@@ -482,6 +482,7 @@ def _fetch_vkospi_proxy(
     fetch_cfg: FetchConfig,
     *,
     index_code: str = "1028",
+    output_col: str = "v_kospi",
 ) -> pd.DataFrame:
     from src.backfill.price.factors import compute_vkospi_proxy
 
@@ -510,14 +511,14 @@ def _fetch_vkospi_proxy(
         logger.warning("[DATA] stage=vkospi symbol=%s status=FAIL error=%s", code, last_err)
         return pd.DataFrame(columns=["date", "close"])
 
+    # KOSPI/KOSDAQ close history is sufficient for the historical-volatility
+    # proxy and avoids pykrx index-name lookup failures (e.g. ticker 1028).
     close_df = _fetch_pykrx_close(str(index_code))
-    if close_df.empty and str(index_code) != "1001":
-        close_df = _fetch_pykrx_close("1001")
     if close_df.empty:
         close_df = _fetch_kis_index_close(start, end, str(index_code), fetch_cfg)
     if close_df.empty and str(index_code) != "1001":
         close_df = _fetch_kis_index_close(start, end, "1001", fetch_cfg)
     if close_df.empty:
         logger.warning("[DATA] stage=vkospi symbol=%s status=FAIL", index_code)
-        return pd.DataFrame(columns=["date", "v_kospi"])
-    return compute_vkospi_proxy(close_df, window=20, min_periods=20)
+        return pd.DataFrame(columns=["date", output_col])
+    return compute_vkospi_proxy(close_df, window=20, min_periods=20, output_col=output_col)
