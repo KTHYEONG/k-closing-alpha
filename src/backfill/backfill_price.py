@@ -69,6 +69,9 @@ def _parse_args() -> argparse.Namespace:
         description="Backfill per-symbol historical bars for rolling-feature support."
     )
     parser.add_argument("--lookback-days", type=int, default=40, help="target trading-day lookback")
+    parser.add_argument("--start-date", type=str, default="", help="full-history start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, default="", help="full-history end date (YYYY-MM-DD)")
+    parser.add_argument("--skip-flows", action="store_true", help="skip investor/program flow APIs")
     parser.add_argument("--workers", type=int, default=4, help="parallel workers")
     parser.add_argument(
         "--kis-rest-rps",
@@ -87,6 +90,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Maximum parallel KIS sections in this process.",
+    )
+    parser.add_argument(
+        "--pykrx-rps",
+        type=float,
+        default=8.0,
+        help="Process-wide pykrx request limit (requests/sec).",
     )
     parser.add_argument("--limit-symbols", type=int, default=None, help="debug symbol cap")
     parser.add_argument("--symbols", type=str, default="", help="comma separated symbol list, e.g. 005930,000660")
@@ -139,6 +148,10 @@ def main() -> None:
         kis_rest_limit_per_sec=args.kis_rest_rps,
         kis_rest_safety_ratio=args.kis_safety_ratio,
         kis_max_parallel_calls=args.kis_max_parallel,
+        pykrx_requests_per_sec=args.pykrx_rps,
+        start_date=args.start_date or None,
+        end_date=args.end_date or None,
+        include_flows=not args.skip_flows,
         symbol_limit=args.limit_symbols,
         include_symbols=include_symbols,
         parquet_out=parquet_out,

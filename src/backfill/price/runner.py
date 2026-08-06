@@ -90,20 +90,12 @@ def fetch_one_symbol(
         if "date" in norm.columns
         else None
     )
-    flow_norm = _fetch_investor_history_by_date(
-        symbol,
-        start,
-        end,
-        fetch_cfg,
-        target_dates=target_dates,
-    )
-    prog_norm = _fetch_program_history_by_date(
-        symbol,
-        start,
-        end,
-        fetch_cfg,
-        target_dates=target_dates,
-    )
+    if fetch_cfg.include_flows:
+        flow_norm = _fetch_investor_history_by_date(symbol, start, end, fetch_cfg, target_dates=target_dates)
+        prog_norm = _fetch_program_history_by_date(symbol, start, end, fetch_cfg, target_dates=target_dates)
+    else:
+        flow_norm = pd.DataFrame(columns=["date", "foreign_netbuy", "inst_netbuy"])
+        prog_norm = pd.DataFrame(columns=["date", "program_netbuy"])
 
     out = norm.merge(flow_norm, on="date", how="left")
     out = out.merge(prog_norm, on="date", how="left")
@@ -157,6 +149,10 @@ def run_backfill(
     kis_rest_limit_per_sec: float,
     kis_rest_safety_ratio: float,
     kis_max_parallel_calls: int,
+    pykrx_requests_per_sec: float = 8.0,
+    start_date: pd.Timestamp | None = None,
+    end_date: pd.Timestamp | None = None,
+    include_flows: bool = True,
     symbol_limit: int | None,
     include_symbols: set[str] | None,
     parquet_out: Path,
@@ -171,6 +167,11 @@ def run_backfill(
         kis_rest_limit_per_sec=max(1.0, float(kis_rest_limit_per_sec)),
         kis_rest_safety_ratio=min(1.0, max(0.1, float(kis_rest_safety_ratio))),
         kis_max_parallel_calls=max(1, int(kis_max_parallel_calls)),
+        pykrx_requests_per_sec=max(0.1, float(pykrx_requests_per_sec)),
+        fixed_start_date=pd.Timestamp(start_date) if start_date is not None else pd.Timestamp("2016-01-01"),
+        fixed_end_date=pd.Timestamp(end_date) if end_date is not None else pd.Timestamp("2025-12-31"),
+        include_flows=bool(include_flows),
+        force_full_history=start_date is not None,
     )
     universe = _load_candidate_universe()
     if universe.empty:
@@ -198,12 +199,13 @@ def run_backfill(
         return pd.DataFrame()
 
     logger.info(
-        "[DATA] stage=backfill symbols=%d workers=%d kis_limit=%.2f safety=%.2f kis_parallel=%d kis_sleep=%.3f existing_symbols=%d",
-        len(windows), fetch_cfg.max_workers, fetch_cfg.kis_rest_limit_per_sec,
+        "[DATA] stage=backfill symbols=%d workers=%d pykrx_rps=%.2f kis_limit=%.2f safety=%.2f kis_parallel=%d kis_sleep=%.3f existing_symbols=%d",
+        len(windows), fetch_cfg.max_workers, fetch_cfg.pykrx_requests_per_sec, fetch_cfg.kis_rest_limit_per_sec,
         fetch_cfg.kis_rest_safety_ratio, fetch_cfg.kis_max_parallel_calls,
         _effective_kis_sleep_sec(fetch_cfg), len(existing_last_dates),
     )
     chunks: list[pd.DataFrame] = []
+    checkpoint_chunks: list[pd.DataFrame] = []
     done = 0
     with ThreadPoolExecutor(max_workers=fetch_cfg.max_workers) as ex:
         futures = {
@@ -217,6 +219,11 @@ def run_backfill(
                 df = fut.result()
                 if df is not None and not df.empty:
                     chunks.append(df)
+                    checkpoint_chunks.append(df)
+                    if done % 100 == 0:
+                        _to_parquet(pd.concat(checkpoint_chunks, ignore_index=True), parquet_out)
+                        checkpoint_chunks.clear()
+                        logger.info("[DATA] stage=backfill checkpoint=%d/%d path=%s", done, len(windows), parquet_out)
                 logger.info("[DATA] stage=backfill symbol=%s progress=%d/%d rows=%d", sym, done, len(windows), 0 if df is None else len(df))
             except Exception as exc:
                 logger.warning("[DATA] stage=backfill symbol=%s progress=%d/%d status=FAIL error=%s", sym, done, len(windows), exc)

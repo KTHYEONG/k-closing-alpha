@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,8 @@ class MarketFactorFetchConfig:
     retry_sleep_sec: float = 1.0
     timeout_sec: int = 20
     krx_request_sleep_sec: float = 0.03
+    krx_requests_per_sec: float = 4.0
+    krx_daily_request_budget: int = 8000
     krx_openapi_base_urls: tuple[str, ...] = (
         "https://data-dbg.krx.co.kr",
         "http://data-dbg.krx.co.kr",
@@ -69,6 +72,29 @@ class MarketFactorFetchConfig:
     )
 
 
+_KRX_RATE_LOCK = threading.Lock()
+_KRX_NEXT_REQUEST = 0.0
+_KRX_REQUEST_DAY = ""
+_KRX_REQUEST_COUNT = 0
+
+
+def _acquire_krx_request_slot(cfg: MarketFactorFetchConfig) -> None:
+    """전 프로세스 KRX 호출률과 일일 예산을 제한합니다."""
+    global _KRX_NEXT_REQUEST, _KRX_REQUEST_DAY, _KRX_REQUEST_COUNT
+    interval = 1.0 / max(0.1, float(cfg.krx_requests_per_sec))
+    today = pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d")
+    with _KRX_RATE_LOCK:
+        if today != _KRX_REQUEST_DAY:
+            _KRX_REQUEST_DAY = today
+            _KRX_REQUEST_COUNT = 0
+        if max(1, int(cfg.krx_daily_request_budget)) <= _KRX_REQUEST_COUNT:
+            raise RuntimeError("KRX daily request budget reached; resume on the next day.")
+        now = time.monotonic()
+        wait = max(0.0, _KRX_NEXT_REQUEST - now)
+        _KRX_NEXT_REQUEST = max(now, _KRX_NEXT_REQUEST) + interval
+        _KRX_REQUEST_COUNT += 1
+    if wait > 0:
+        time.sleep(wait)
 def _get_env_value(key: str, default: str = "") -> str:
     raw = os.getenv(key)
     if raw is not None and str(raw).strip():
@@ -314,7 +340,7 @@ def _safe_get_krx_openapi_day(
         url = f"{base_url}{endpoint}"
         for attempt in range(max(1, int(cfg.retries))):
             try:
-                time.sleep(max(0.0, float(cfg.krx_request_sleep_sec)))
+                _acquire_krx_request_slot(cfg)
                 resp = requests.get(
                     url,
                     params={"basDd": date_ymd},
