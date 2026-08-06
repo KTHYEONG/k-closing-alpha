@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import time
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -28,6 +29,7 @@ from src.ml.sizing_engine import (
     _train_inline_bundle,
     add_close_morning_decision_score,
 )
+from src.ml.training.ensemble_execution import run_algorithm_expert_oof_parallel
 from src.ml.training.fitting import (
     _align_close_morning_oof,
     fit_full_history_algorithm_return_model,
@@ -1082,62 +1084,27 @@ def _dominant_algorithm_recipe(chosen_recipes: list[str]) -> str:
     return min(counts, key=_sort_key)
 
 
-def run_close_morning_algorithm_ensemble_experiment(
-    df: pd.DataFrame,
+def _run_nested_retrain_algorithm_experiment(
+    work: pd.DataFrame,
     feature_cols: list[str],
     target_col: str,
     group_col: str,
-    n_splits: int = 5,
-    purge_gap: int = 1,
-    probability_weight: float = 0.5,
-    min_history_dates: int = _DEFAULT_MIN_HISTORY_DATES,
-    build_research_bundle: bool = False,
+    *,
+    n_splits: int,
+    purge_gap: int,
+    probability_weight: float,
+    min_history_dates: int,
 ) -> dict[str, Any]:
-    """close-morning algorithm-family ensemble 중첩 선택 실험을 실행합니다 (연구 전용).
+    """기존 중첩 재학습(nested_retrain) 선택 모드의 참조 구현입니다 (연구 전용).
 
-    외부 ``PurgedGroupTimeSeriesSplit(n_splits, purge_gap)`` 로 각 fold 의 외부
-    validation 날짜를 1회 평가합니다. 폴드별 고정 레시피는 해당 fold 의 외부 train
-    partition 만 사용하는 내부 purged walk-forward OOF 에서 고르고, 그 설정을 외부
-    validation 날짜에 1회 적용합니다. 외부 validation 레이블은 설정 선택에 절대
-    사용하지 않습니다. 모든 전문가는 동일한 수치형 ``close_morning61`` 피처 컬럼을
-    사용하며 범주형 피처는 도입하지 않습니다.
-
-    ``lgb_only`` 는 항상 유효하며, 도전자 레시피는 내부 OOF scheduled mean 이
-    baseline 이상이고 compounded MDD 가 엄격히 낮을 때만 선택됩니다. ``build_
-    research_bundle=True`` 일 때에만, 승격 게이트(비-baseline 승자 + mean 우위 +
-    MDD 엄격 감소 + 평균 양수 + PF>1)를 통과하면 선택된 레시피의 full-history
-    return 모델과 ``algorithm_ensemble_config`` 를 포함한 연구 번들을 결과에
-    영속화합니다. 프로덕션 번들/기본값은 절대 변경하지 않습니다.
-
-    Args:
-        df: ``stock_code``/``chart_analysis`` 식별 컬럼을 포함한 OOF 패널 입력.
-        feature_cols: 학습 피처 컬럼 (수치형 close_morning61).
-        target_col: 일자별 실현 순수익률(decimal net) 컬럼.
-        group_col: 거래일 그룹 컬럼.
-        n_splits: 외부 walk-forward fold 수.
-        purge_gap: 보유기간 만큼의 purge group 수.
-        probability_weight: ``w_good`` (p_good 가중치, 기본 0.5).
-        min_history_dates: ``always_buy_top1`` 의 기존 워밍업 의미.
-        build_research_bundle: 승격 게이트 통과 시 연구 번들 영속화 여부.
-
-    Returns:
-        dict: ``contract``, ``folds``(폴드별 선택 레시피·내부 후보 지표·baseline/
-        candidate 외부 평가), ``chosen_recipes``, ``aggregate``(폴드 연결 시계열의
-        baseline/candidate 지표), ``yearly_breakdown``, ``standalone_experts``,
-        ``recipe_metrics``, ``promotion``(승격 심사), ``research_bundle``(선택 시).
+    각 외부 fold 의 외부 validation 날짜를 1회 평가하며, 폴드별 고정 레시피는
+    해당 fold 의 외부 train partition 만 사용하는 내부 purged walk-forward OOF
+    에서 고르고 그 설정을 외부 validation 날짜에 1회 적용합니다. 외부 validation
+    레이블은 설정 선택에 절대 사용되지 않습니다. 성능 비교의 parity/참조 모드로
+    동작하며 프로덕션 번들/기본값을 변경하지 않습니다.
     """
-    if not {"stock_code", "chart_analysis"} <= set(df.columns):
-        raise ValueError(
-            "close-morning algorithm ensemble requires stock_code and chart_analysis columns"
-        )
-    if not 0.0 < probability_weight <= 1.0:
-        raise ValueError(f"probability_weight must be in (0, 1], got {probability_weight}")
-    if min_history_dates < 1:
-        raise ValueError(f"min_history_dates must be >= 1, got {min_history_dates}")
-    if purge_gap < 0:
-        raise ValueError(f"purge_gap must be >= 0, got {purge_gap}")
-
-    work = df.sort_values(group_col).copy()
+    overall_started = time.perf_counter()
+    expert_started = time.perf_counter()
     expert_returns = {
         model_type: run_model_pipeline(
             work,
@@ -1150,6 +1117,8 @@ def run_close_morning_algorithm_ensemble_experiment(
         )
         for model_type in _ALGORITHM_FAMILIES
     }
+    expert_wall = time.perf_counter() - expert_started
+    risk_started = time.perf_counter()
     risk_oof = fit_predict_quantile_and_classifier(
         work,
         feature_cols=feature_cols,
@@ -1158,6 +1127,7 @@ def run_close_morning_algorithm_ensemble_experiment(
         n_splits=n_splits,
         purge_gap=purge_gap,
     )
+    risk_wall = time.perf_counter() - risk_started
     aligned = {
         model_type: _align_close_morning_oof(
             expert_returns[model_type]["oof_predictions"],
@@ -1180,11 +1150,13 @@ def run_close_morning_algorithm_ensemble_experiment(
     }
     folds: list[dict[str, Any]] = []
     chosen_recipes: list[str] = []
+    selection_source_folds: list[list[int]] = []
     baseline_series: list[np.ndarray] = []
     candidate_series: list[np.ndarray] = []
     baseline_dates: list[np.ndarray] = []
     candidate_dates: list[np.ndarray] = []
 
+    selection_started = time.perf_counter()
     for fold, (train_idx, val_idx) in enumerate(
         splitter.split(work, y=work[target_col], groups=work[group_col])
     ):
@@ -1255,6 +1227,12 @@ def run_close_morning_algorithm_ensemble_experiment(
                 "fold": fold,
                 "chosen_recipe": chosen,
                 "inner": inner,
+                "selection": {
+                    "source_folds": list(range(int(inner["inner_n_splits"]))),
+                    "source_cutoff": inner["inner_cutoff"],
+                    "prior_n_groups": inner["inner_n_groups"],
+                    "fail_closed_reason": inner["fail_closed_reason"],
+                },
                 "baseline": {
                     "metrics": dict(baseline_eval["metrics"]),
                     "n_buy": int(baseline_eval["metrics"]["n_buy"]),
@@ -1266,10 +1244,346 @@ def run_close_morning_algorithm_ensemble_experiment(
             }
         )
         chosen_recipes.append(chosen)
+        selection_source_folds.append(list(range(int(inner["inner_n_splits"]))))
         baseline_series.append(baseline_eval["scheduled_returns"])
         candidate_series.append(candidate_eval["scheduled_returns"])
         baseline_dates.append(baseline_eval["dates"])
         candidate_dates.append(candidate_eval["dates"])
+    selection_wall = time.perf_counter() - selection_started
+
+    inner_fit_folds = int(
+        sum(len(_ALGORITHM_FAMILIES) * int(fold["inner"]["inner_n_splits"]) for fold in folds)
+    )
+    return {
+        "folds": folds,
+        "chosen_recipes": chosen_recipes,
+        "selection_source_folds": selection_source_folds,
+        "baseline_series": baseline_series,
+        "candidate_series": candidate_series,
+        "baseline_dates": baseline_dates,
+        "candidate_dates": candidate_dates,
+        "aligned": aligned,
+        "expert_pct": expert_pct,
+        "risk_oof": risk_oof,
+        "timing": {
+            "expert_oof_seconds": float(expert_wall),
+            "risk_oof_seconds": float(risk_wall),
+            "selection_seconds": float(selection_wall),
+            "total_seconds": float(time.perf_counter() - overall_started),
+            "n_workers": 1,
+        },
+        "model_fit_counts": {
+            "return_expert_fold_fits": int(n_splits * len(_ALGORITHM_FAMILIES)) + inner_fit_folds,
+            "risk_oof_invocations": int(1 + len(folds)),
+            "inner_algorithm_evaluator_invocations": len(folds),
+        },
+    }
+
+
+def _run_prequential_algorithm_experiment(
+    work: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    group_col: str,
+    *,
+    n_splits: int,
+    purge_gap: int,
+    probability_weight: float,
+    min_history_dates: int,
+    max_workers: int | None,
+) -> dict[str, Any]:
+    """prequential_outer_oof 선택 모드: 중첩 재학습 없이 사전 순차 OOF 로 선택합니다.
+
+    네 return 전문가와 risk OOF 를 외부 splitter 에 대해 각각 정확히 1회 생성하고,
+    외부 fold ``f`` 의 레시피 선택은 ``fold < f`` 인 기존 외부 OOF 행만 사용해
+    고정 레시피를 평가합니다. 이 행들은 자신의 validation 날짜보다 이전에 학습된
+    모델이 예측한 것이므로 fold ``f`` 의 외부 train 역사 안에서 이용 가능합니다.
+    ``fold < f`` 인 OOF 행이 ``min_history_dates`` 거래일을 채우지 못하면
+    ``lgb_only`` 로 fail-closed 합니다 (사유 ``insufficient_prequential_history``).
+    중첩 재학습은 수행하지 않으므로, 외부 fold 수가 5 면 return 전문가 fit 은
+    20 회, risk OOF 는 1 회뿐입니다.
+    """
+    overall_started = time.perf_counter()
+    expert_returns, expert_telemetry = run_algorithm_expert_oof_parallel(
+        work,
+        feature_cols,
+        target_col,
+        group_col,
+        n_splits,
+        purge_gap,
+        max_workers,
+    )
+    risk_started = time.perf_counter()
+    risk_oof = fit_predict_quantile_and_classifier(
+        work,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        group_col=group_col,
+        n_splits=n_splits,
+        purge_gap=purge_gap,
+    )
+    risk_wall = time.perf_counter() - risk_started
+    aligned = {
+        model_type: _align_close_morning_oof(
+            expert_returns[model_type]["oof_predictions"],
+            risk_oof,
+            target_col=target_col,
+            group_col=group_col,
+        )
+        for model_type in _ALGORITHM_FAMILIES
+    }
+    expert_pct = {
+        model_type: aligned[model_type]["pred"].groupby(aligned[model_type][group_col]).rank(
+            pct=True, method="average"
+        )
+        for model_type in _ALGORITHM_FAMILIES
+    }
+    base = aligned["lgb_regressor"]
+    full_date_positions = {
+        date: i for i, date in enumerate(sorted(work[group_col].unique()))
+    }
+
+    folds: list[dict[str, Any]] = []
+    chosen_recipes: list[str] = []
+    selection_source_folds: list[list[int]] = []
+    baseline_series: list[np.ndarray] = []
+    candidate_series: list[np.ndarray] = []
+    baseline_dates: list[np.ndarray] = []
+    candidate_dates: list[np.ndarray] = []
+
+    selection_started = time.perf_counter()
+    for fold in range(n_splits):
+        prior = base[base["fold"] < fold]
+        prior_groups = int(prior[group_col].nunique())
+        source_folds = list(range(fold))
+        if prior_groups < min_history_dates:
+            chosen = "lgb_only"
+            candidate_stats: dict[str, dict[str, float]] = {}
+            fail_closed_reason: str | None = "insufficient_prequential_history"
+        else:
+            prior_pct = {
+                model_type: expert_pct[model_type].loc[prior.index]
+                for model_type in _ALGORITHM_FAMILIES
+            }
+            candidate_stats = {
+                recipe: _evaluate_algorithm_rank(
+                    prior,
+                    _algorithm_ensemble_rank(prior_pct, _ALGORITHM_RECIPES[recipe]),
+                    target_col,
+                    group_col,
+                    probability_weight=probability_weight,
+                    min_history_dates=min_history_dates,
+                )
+                for recipe in _ALGORITHM_RECIPES
+            }
+            chosen = _select_algorithm_recipe(candidate_stats)
+            fail_closed_reason = None
+
+        outer_val = base[base["fold"] == fold]
+        panel_start = full_date_positions[outer_val[group_col].min()]
+        panel_dates = int(outer_val[group_col].nunique())
+        effective_min_history_dates = max(
+            1, min(panel_dates, min_history_dates - panel_start)
+        )
+        outer_pct = {
+            model_type: expert_pct[model_type].loc[outer_val.index]
+            for model_type in _ALGORITHM_FAMILIES
+        }
+
+        baseline_panel = outer_val.copy()
+        baseline_panel["rank_score"] = _algorithm_ensemble_rank(
+            outer_pct, _ALGORITHM_RECIPES["lgb_only"]
+        )
+        baseline_eval = _evaluate_close_morning_top1(
+            baseline_panel,
+            target_col,
+            group_col,
+            probability_weight=probability_weight,
+            bad_probability_weight=0.0,
+            min_history_dates=effective_min_history_dates,
+            p_bad_col="p_bad",
+        )
+
+        if chosen == "lgb_only":
+            candidate_eval = baseline_eval
+        else:
+            candidate_panel = outer_val.copy()
+            candidate_panel["rank_score"] = _algorithm_ensemble_rank(
+                outer_pct, _ALGORITHM_RECIPES[chosen]
+            )
+            candidate_eval = _evaluate_close_morning_top1(
+                candidate_panel,
+                target_col,
+                group_col,
+                probability_weight=probability_weight,
+                bad_probability_weight=0.0,
+                min_history_dates=effective_min_history_dates,
+                p_bad_col="p_bad",
+            )
+
+        folds.append(
+            {
+                "fold": fold,
+                "chosen_recipe": chosen,
+                "selection": {
+                    "source_folds": source_folds,
+                    "source_cutoff": str(prior[group_col].max()) if len(prior) else None,
+                    "prior_n_groups": prior_groups,
+                    "fail_closed_reason": fail_closed_reason,
+                },
+                "candidate_stats": candidate_stats,
+                "baseline": {
+                    "metrics": dict(baseline_eval["metrics"]),
+                    "n_buy": int(baseline_eval["metrics"]["n_buy"]),
+                },
+                "candidate": {
+                    "metrics": dict(candidate_eval["metrics"]),
+                    "n_buy": int(candidate_eval["metrics"]["n_buy"]),
+                },
+            }
+        )
+        chosen_recipes.append(chosen)
+        selection_source_folds.append(source_folds)
+        baseline_series.append(baseline_eval["scheduled_returns"])
+        candidate_series.append(candidate_eval["scheduled_returns"])
+        baseline_dates.append(baseline_eval["dates"])
+        candidate_dates.append(candidate_eval["dates"])
+    selection_wall = time.perf_counter() - selection_started
+
+    return {
+        "folds": folds,
+        "chosen_recipes": chosen_recipes,
+        "selection_source_folds": selection_source_folds,
+        "baseline_series": baseline_series,
+        "candidate_series": candidate_series,
+        "baseline_dates": baseline_dates,
+        "candidate_dates": candidate_dates,
+        "aligned": aligned,
+        "expert_pct": expert_pct,
+        "risk_oof": risk_oof,
+        "timing": {
+            "expert_oof_seconds": float(expert_telemetry["expert_wall_seconds"]),
+            "risk_oof_seconds": float(risk_wall),
+            "selection_seconds": float(selection_wall),
+            "total_seconds": float(time.perf_counter() - overall_started),
+            "n_workers": int(expert_telemetry["n_workers"]),
+        },
+        "model_fit_counts": {
+            "return_expert_fold_fits": int(n_splits * len(_ALGORITHM_FAMILIES)),
+            "risk_oof_invocations": 1,
+            "inner_algorithm_evaluator_invocations": 0,
+        },
+    }
+
+
+def run_close_morning_algorithm_ensemble_experiment(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    group_col: str,
+    n_splits: int = 5,
+    purge_gap: int = 1,
+    probability_weight: float = 0.5,
+    min_history_dates: int = _DEFAULT_MIN_HISTORY_DATES,
+    build_research_bundle: bool = False,
+    selection_mode: Literal["prequential_outer_oof", "nested_retrain"] = "prequential_outer_oof",
+    max_workers: int | None = None,
+) -> dict[str, Any]:
+    """close-morning algorithm-family ensemble 실험을 실행합니다 (연구 전용).
+
+    두 선택 모드를 지원합니다:
+    - ``prequential_outer_oof`` (기본): 네 return 전문가와 risk OOF 를 외부
+      splitter 에 대해 각각 1회 생성하고, 외부 fold ``f`` 의 레시피 선택을
+      ``fold < f`` 인 기존 외부 OOF 행만 사용해 수행합니다. 사전 순차 OOF
+      거래일이 ``min_history_dates`` 를 채우지 못하면 ``lgb_only`` 로
+      fail-closed 하며 중첩 재학습은 전혀 수행하지 않습니다.
+    - ``nested_retrain``: 기존 중첩 재학습 동작을 참조(parity) 모드로 유지합니다.
+
+    두 모드의 선택 근거가 의도적으로 다르므로 수치가 동일하지 않을 수 있으며,
+    벤치마크·보고 시 반드시 ``selection_mode`` 로 구분해 보고해야 합니다. 어느
+    모드에서도 외부 validation 레이블은 설정 선택에 사용되지 않습니다. 모든
+    전문가는 동일한 수치형 ``close_morning61`` 피처 컬럼을 사용하며 범주형
+    피처는 도입하지 않습니다.
+
+    ``lgb_only`` 는 항상 유효하며, 도전자 레시피는 선택 근거(scheduled mean 이
+    baseline 이상 + compounded MDD 엄격 감소)를 만족할 때만 선택됩니다.
+    ``build_research_bundle=True`` 일 때에만, 승격 게이트(비-baseline 승자 +
+    mean 우위 + MDD 엄격 감소 + 평균 양수 + PF>1)를 통과하면 선택된 레시피의
+    full-history return 모델과 ``algorithm_ensemble_config`` 를 포함한 연구
+    번들을 결과에 영속화합니다. 프로덕션 번들/기본값은 절대 변경하지 않습니다.
+
+    Args:
+        df: ``stock_code``/``chart_analysis`` 식별 컬럼을 포함한 OOF 패널 입력.
+        feature_cols: 학습 피처 컬럼 (수치형 close_morning61).
+        target_col: 일자별 실현 순수익률(decimal net) 컬럼.
+        group_col: 거래일 그룹 컬럼.
+        n_splits: 외부 walk-forward fold 수.
+        purge_gap: 보유기간 만큼의 purge group 수.
+        probability_weight: ``w_good`` (p_good 가중치, 기본 0.5).
+        min_history_dates: ``always_buy_top1`` 의 기존 워밍업 의미이자, prequential
+            선택에 필요한 최소 사전 OOF 거래일 수.
+        build_research_bundle: 승격 게이트 통과 시 연구 번들 영속화 여부.
+        selection_mode: ``prequential_outer_oof`` 또는 ``nested_retrain``.
+        max_workers: 전문가 병렬 실행 워커 수 상한 (None 이면 psutil 로 측정한
+            CPU/가용 메모리 용량과 전문가 수로 결정).
+
+    Returns:
+        dict: ``contract``, ``folds``(폴드별 선택 레시피·선택 근거·baseline/
+        candidate 외부 평가), ``chosen_recipes``, ``aggregate``, ``yearly_breakdown``,
+        ``standalone_experts``, ``recipe_metrics``, ``promotion``, ``selection_mode``,
+        ``selection_source_folds``, ``timing``, ``model_fit_counts``,
+        ``research_bundle``(선택 시).
+    """
+    if selection_mode not in ("prequential_outer_oof", "nested_retrain"):
+        raise ValueError(
+            "selection_mode must be one of 'prequential_outer_oof', 'nested_retrain', "
+            f"got {selection_mode!r}"
+        )
+    if not {"stock_code", "chart_analysis"} <= set(df.columns):
+        raise ValueError(
+            "close-morning algorithm ensemble requires stock_code and chart_analysis columns"
+        )
+    if not 0.0 < probability_weight <= 1.0:
+        raise ValueError(f"probability_weight must be in (0, 1], got {probability_weight}")
+    if min_history_dates < 1:
+        raise ValueError(f"min_history_dates must be >= 1, got {min_history_dates}")
+    if purge_gap < 0:
+        raise ValueError(f"purge_gap must be >= 0, got {purge_gap}")
+
+    work = df.sort_values(group_col).copy()
+    if selection_mode == "nested_retrain":
+        payload = _run_nested_retrain_algorithm_experiment(
+            work,
+            feature_cols,
+            target_col,
+            group_col,
+            n_splits=n_splits,
+            purge_gap=purge_gap,
+            probability_weight=probability_weight,
+            min_history_dates=min_history_dates,
+        )
+    else:
+        payload = _run_prequential_algorithm_experiment(
+            work,
+            feature_cols,
+            target_col,
+            group_col,
+            n_splits=n_splits,
+            purge_gap=purge_gap,
+            probability_weight=probability_weight,
+            min_history_dates=min_history_dates,
+            max_workers=max_workers,
+        )
+
+    folds: list[dict[str, Any]] = payload["folds"]
+    chosen_recipes: list[str] = payload["chosen_recipes"]
+    baseline_series: list[np.ndarray] = payload["baseline_series"]
+    candidate_series: list[np.ndarray] = payload["candidate_series"]
+    baseline_dates: list[np.ndarray] = payload["baseline_dates"]
+    candidate_dates: list[np.ndarray] = payload["candidate_dates"]
+    aligned: dict[str, pd.DataFrame] = payload["aligned"]
+    expert_pct: dict[str, pd.Series] = payload["expert_pct"]
+    risk_oof: pd.DataFrame = payload["risk_oof"]
 
     baseline_cat = np.concatenate(baseline_series)
     candidate_cat = np.concatenate(candidate_series)
@@ -1285,7 +1599,7 @@ def run_close_morning_algorithm_ensemble_experiment(
     promotion = _algorithm_promotion_gate(baseline_agg, candidate_agg, chosen_recipes)
 
     # standalone-expert / recipe 지표는 전체 외부 OOF 를 1회 평가한 기술 지표입니다
-    # (선택은 내부 OOF 만 사용하므로 이 지표는 선택에 영향이 없습니다).
+    # (선택 근거는 prequential/중첩 OOF 이므로 이 지표는 선택에 영향이 없습니다).
     standalone_experts: dict[str, dict[str, float]] = {
         model_type: _evaluate_algorithm_rank(
             aligned[model_type],
@@ -1360,5 +1674,9 @@ def run_close_morning_algorithm_ensemble_experiment(
         "standalone_experts": standalone_experts,
         "recipe_metrics": recipe_metrics,
         "promotion": promotion,
+        "selection_mode": selection_mode,
+        "selection_source_folds": payload["selection_source_folds"],
+        "timing": payload["timing"],
+        "model_fit_counts": payload["model_fit_counts"],
         "research_bundle": research_bundle,
     }
