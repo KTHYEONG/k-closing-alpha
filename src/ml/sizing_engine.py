@@ -17,6 +17,12 @@ from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
 from sklearn.calibration import CalibratedClassifierCV
 
 from src.ml.feature_manifest import build_feature_manifest
+from src.ml.feature_selection import (
+    FEATURE_SELECTION_VERSION,
+    FeatureSelectionConfig,
+    FoldLocalFeatureSelector,
+    serialize_selection_result,
+)
 
 _PREDICTION_COLS = ("pred_q10", "pred_q50", "pred_q90", "p_good", "p_bad")
 
@@ -354,6 +360,9 @@ def _train_inline_bundle(
     recency_ensemble_config: dict[str, Any] | None = None,
     algorithm_ensemble_models: dict[str, Any] | None = None,
     algorithm_ensemble_config: dict[str, Any] | None = None,
+    *,
+    feature_selection_config: FeatureSelectionConfig | None = None,
+    catalog_metadata: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """타깃이 포함된 데이터로 즉시 학습 가능한 기본 모델 번들을 구성합니다.
 
@@ -416,6 +425,15 @@ def _train_inline_bundle(
     if not feature_cols:
         raise ValueError("feature_cols is empty after excluding categorical columns")
 
+    selection_payload: dict[str, Any] = {}
+    selection_config: FeatureSelectionConfig | None = None
+    if feature_selection_config is not None:
+        selector = FoldLocalFeatureSelector(feature_selection_config)
+        selection_result = selector.select(df, list(feature_cols), target_col, group_col)
+        feature_cols = selection_result.selected_feature_cols
+        selection_payload = serialize_selection_result(selection_result)
+        selection_config = feature_selection_config
+
     train = df.sort_values(group_col)
     y = train[target_col].to_numpy(dtype=np.float64)
 
@@ -445,7 +463,7 @@ def _train_inline_bundle(
         ),
     }
 
-    manifest = build_feature_manifest(list(feature_cols))
+    manifest = build_feature_manifest(list(feature_cols), catalog_metadata=catalog_metadata)
     training_cutoff = str(train[group_col].max())
     policy_params: dict[str, Any] = {
         "grade_multipliers": dict(_GRADE_MULTIPLIERS),
@@ -471,6 +489,27 @@ def _train_inline_bundle(
         "quantile_models": quantile_models,
         "calibrators": calibrators,
     }
+    if df.attrs.get("catalog_version"):
+        bundle["catalog_version"] = str(df.attrs["catalog_version"])
+    if df.attrs.get("catalog_hash"):
+        bundle["catalog_hash"] = str(df.attrs["catalog_hash"])
+    if selection_config is not None:
+        bundle["feature_selection_version"] = FEATURE_SELECTION_VERSION
+        bundle["feature_selection_config"] = {
+            "n_inner_splits": selection_config.n_inner_splits,
+            "purge_gap": selection_config.purge_gap,
+            "retain_count": selection_config.retain_count,
+            "min_retain": selection_config.min_retain,
+            "max_retain": selection_config.max_retain,
+            "min_candidates": selection_config.min_candidates,
+            "max_candidates": selection_config.max_candidates,
+            "random_state": selection_config.random_state,
+        }
+        bundle["selected_feature_cols"] = list(selection_payload["selected_feature_cols"])
+        bundle["candidate_count"] = int(selection_payload["candidate_count"])
+        bundle["eligible_count"] = int(selection_payload["eligible_count"])
+        bundle["retained_count"] = int(selection_payload["retained_count"])
+        bundle["feature_support_summary"] = selection_payload["support_summary"]
     if recent_return_model is not None:
         if recency_ensemble_config is None:
             raise ValueError(

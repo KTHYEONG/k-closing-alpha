@@ -1245,3 +1245,31 @@ def test_sangdda_feature_engineering_order() -> None:
 
 
 
+
+
+def test_train_and_save_real_model_bundle_accepts_research_params(tmp_path) -> None:
+    """새 연구 파라미터(price_history_path/feature_selection_config)가 기본 경로를 유지합니다."""
+    raw = _realistic_trade_log_df(n_dates=8)
+    trade_log_path = tmp_path / "trade_log.parquet"
+    raw.to_parquet(trade_log_path)
+    export_dir = tmp_path / "models"
+    bundle = predict.train_and_save_real_model_bundle(
+        export_dir=str(export_dir),
+        trade_log_path=trade_log_path,
+        theme_path=str(tmp_path / "missing_theme.parquet"),
+        price_history_path=str(tmp_path / "missing_history.parquet"),
+        feature_selection_config=None,
+    )
+    assert bundle["feature_set"] == "close_morning61"
+    assert bundle["feature_cols"]
+
+
+def test_candidate_export_dir_versions_causal_research_candidate() -> None:
+    """causal_expanded_v1 연구 후보도 cutoff 로 버전화된 하위 디렉터리에 저장됩니다."""
+    bundle = {"training_cutoff": "2026-06-05 00:00:00"}
+    candidate = predict._candidate_export_dir(
+        "artifacts/models", "causal_expanded_v1", bundle
+    )
+    assert candidate == os.path.join(
+        "artifacts/models", "causal_expanded_v1_2026-06-05"
+    )

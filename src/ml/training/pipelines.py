@@ -13,6 +13,11 @@ from src.ml.backtest_evaluator import (
     run_backtest_evaluation,
 )
 from src.ml.feature_manifest import build_feature_manifest
+from src.ml.feature_selection import (
+    FEATURE_SELECTION_VERSION,
+    FeatureSelectionConfig,
+    FoldLocalFeatureSelector,
+)
 from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
 from src.ml.quantile_model import fit_predict_quantile_and_classifier
 from src.ml.single_stock_policy import (
@@ -64,6 +69,7 @@ def run_model_pipeline(
     model_type: str = "lgb_regressor",
     model_params: dict[str, int | float] | None = None,
     recency_half_life_groups: int | None = None,
+    feature_selection_config: FeatureSelectionConfig | None = None,
 ) -> dict[str, Any]:
     """Train ML model using Purged Group Walk-Forward CV and evaluate OOF results.
 
@@ -90,19 +96,45 @@ def run_model_pipeline(
         purge_gap,
         recency_half_life_groups,
     )
+    if feature_selection_config is not None and not isinstance(
+        feature_selection_config, FeatureSelectionConfig
+    ):
+        raise ValueError(
+            "feature_selection_config must be a FeatureSelectionConfig or None, "
+            f"got {type(feature_selection_config).__name__}"
+        )
 
     work = df.sort_values(group_col).copy()
+    work.attrs = dict(df.attrs)
+    selector = (
+        FoldLocalFeatureSelector(feature_selection_config)
+        if feature_selection_config is not None
+        else None
+    )
     splitter = PurgedGroupTimeSeriesSplit(n_splits=n_splits, purge_gap=purge_gap)
 
     oof_parts: list[pd.DataFrame] = []
     trained_models: list[Any] = []
     training_cutoff: Any = None
+    selected_features_by_fold: dict[str, dict[str, Any]] = {}
 
     for fold, (train_idx, val_idx) in enumerate(
         splitter.split(work, y=work[target_col], groups=work[group_col])
     ):
         train = work.iloc[train_idx]
         val = work.iloc[val_idx]
+        if selector is not None:
+            selection_result = selector.select(train, feature_cols, target_col, group_col)
+            fold_feature_cols = selection_result.selected_feature_cols
+            selected_features_by_fold[str(fold)] = {
+                "selected_feature_cols": list(fold_feature_cols),
+                "candidate_count": len(selection_result.candidate_feature_cols),
+                "eligible_count": len(selection_result.eligible_feature_cols),
+                "n_inner_folds": selection_result.n_inner_folds,
+                "support_summary": selection_result.support_summary,
+            }
+        else:
+            fold_feature_cols = feature_cols
         sample_weight = recency_sample_weight_for_fold(
             train, group_col, recency_half_life_groups
         )
@@ -110,7 +142,7 @@ def run_model_pipeline(
             model_type,
             train,
             val,
-            feature_cols,
+            fold_feature_cols,
             target_col,
             group_col,
             model_params,
@@ -124,7 +156,9 @@ def run_model_pipeline(
                 group_col: val[group_col].to_numpy(),
                 target_col: val[target_col].to_numpy(),
                 "pred": pred,
-                "pred_linear": _fit_predict_linear_baseline(train, val, feature_cols, target_col),
+                "pred_linear": _fit_predict_linear_baseline(
+                    train, val, fold_feature_cols, target_col
+                ),
                 "fold": fold,
             },
             index=val.index,
@@ -176,7 +210,7 @@ def run_model_pipeline(
 
     policy_metadata = _policy_metadata(single_stock_policy, single_stock_evaluation)
 
-    return {
+    result: dict[str, Any] = {
         "oof_predictions": oof_df,
         "oof_df": oof_df,
         "metrics": metrics,
@@ -197,6 +231,10 @@ def run_model_pipeline(
             "model_type": model_type,
         },
     }
+    if selector is not None:
+        result["feature_selection_version"] = FEATURE_SELECTION_VERSION
+        result["selected_features_by_fold"] = selected_features_by_fold
+    return result
 
 
 def run_sizing_pipeline(
