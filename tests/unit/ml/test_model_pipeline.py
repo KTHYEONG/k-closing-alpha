@@ -6,6 +6,7 @@ SCENARIO_MODEL_PIPELINE_TRAIN_EVAL
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -30,6 +31,7 @@ from src.ml.model_pipeline import (
     run_sizing_pipeline,
 )
 from src.ml.sizing_engine import load_model_artifacts
+from src.ml.training import ensemble_execution
 from src.ml.training.experiments import (
     _algorithm_promotion_gate,
     _dominant_algorithm_recipe,
@@ -1886,8 +1888,15 @@ def test_close_morning_algorithm_ensemble_fit_count_reduction() -> None:
     assert nested["model_fit_counts"]["return_expert_fold_fits"] == expected_nested_fits
 
 
-def test_close_morning_algorithm_ensemble_prequential_deterministic_selection() -> None:
+def test_close_morning_algorithm_ensemble_prequential_deterministic_selection(monkeypatch) -> None:
     """prequential 선택은 동일 입력에서 결정적으로 반복됩니다 (mode-specific)."""
+    monkeypatch.setattr(
+        ensemble_execution.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(
+            available=2 * ensemble_execution._EXPERT_MEMORY_BUDGET_BYTES
+        ),
+    )
     df = _make_algorithm_dataset(seed=8, n_groups=64)
     kwargs = {
         "feature_cols": ["feature_a", "feature_b"],
