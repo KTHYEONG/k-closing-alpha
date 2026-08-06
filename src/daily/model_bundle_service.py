@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from src import settings
+from src.ml.feature_selection import FeatureSelectionConfig
 from src.ml.model_pipeline import _calibrate_oof_policy
 from src.ml.single_stock_policy import SingleStockPolicy
 from src.ml.sizing_engine import (
@@ -52,6 +53,9 @@ _MODEL_BUNDLE_KEYS = ("rank_model", "quantile_models", "calibrators")
 # 검증된 champion close_morning61 이 기본 후보이며, 승격 전까지 활성 아티팩트를
 # 덮어쓰지 않도록 cutoff 로 버전화된 후보 경로를 사용합니다.
 _CANDIDATE_FEATURE_SET = "close_morning61"
+_RESEARCH_CANDIDATE_FEATURE_SETS: frozenset[str] = frozenset(
+    {"close_morning61", "causal_expanded_v1"}
+)
 
 
 def _candidate_export_dir(
@@ -60,14 +64,15 @@ def _candidate_export_dir(
     """후보 피처셋 번들은 버전화된 하위 디렉터리에 저장할 경로를 반환합니다.
 
     활성 아티팩트는 ``export_dir`` 루트의 ``sizing_pipeline_bundle.joblib`` 이므로,
-    후보(``close_morning61``)는 훈련 데이터 cutoff 날짜(YYYY-MM-DD)로 버전화된
-    별도 디렉터리에 기록해 활성 아티팩트를 덮어쓰지 않습니다. 다른
-    feature_set(활성 아티팩트 재학습)은 기존대로 루트 경로를 반환합니다.
+    후보(``close_morning61``, ``causal_expanded_v1``)는 훈련 데이터 cutoff 날짜
+    (YYYY-MM-DD)로 버전화된 별도 디렉터리에 기록해 활성 아티팩트를 덮어쓰지
+    않습니다. 다른 feature_set(활성 아티팩트 재학습)은 기존대로 루트 경로를
+    반환합니다.
     """
-    if feature_set != _CANDIDATE_FEATURE_SET:
+    if feature_set not in _RESEARCH_CANDIDATE_FEATURE_SETS:
         return export_dir
     version = str(bundle.get("training_cutoff", ""))[:10] or "candidate"
-    return os.path.join(export_dir, f"{_CANDIDATE_FEATURE_SET}_{version}")
+    return os.path.join(export_dir, f"{feature_set}_{version}")
 
 
 def _is_dummy_feature_cols(feature_cols: list[str]) -> bool:
@@ -94,6 +99,8 @@ def train_and_save_real_model_bundle(
     theme_path: str | os.PathLike[str] | None = None,
     feature_set: str = "close_morning61",
     panel_mode: str = "scenario_action",
+    price_history_path: str | os.PathLike[str] | None = None,
+    feature_selection_config: FeatureSelectionConfig | None = None,
 ) -> dict[str, Any]:
     """``trade_log.parquet`` 실데이터로 표준 ML 번들을 학습·저장한 뒤 반환합니다.
 
@@ -123,8 +130,18 @@ def train_and_save_real_model_bundle(
     theme_path = str(theme_path or settings.THEME_PARQUET_PATH)
     trade_log_df = pd.read_parquet(trade_log_path)
     theme_df = pd.read_parquet(theme_path) if os.path.exists(theme_path) else None
+    price_history_df = None
+    if price_history_path is not None:
+        price_history_path = str(price_history_path)
+        price_history_df = (
+            pd.read_parquet(price_history_path) if os.path.exists(price_history_path) else None
+        )
     X, targets, cat_features, processed = build_ml_dataset(
-        trade_log_df, theme_df, feature_set=feature_set, panel_mode=panel_mode
+        trade_log_df,
+        theme_df,
+        feature_set=feature_set,
+        panel_mode=panel_mode,
+        price_history_df=price_history_df,
     )
     feature_cols = [col for col in X.columns if col not in cat_features]
     target_col = "target_return"
@@ -138,12 +155,17 @@ def train_and_save_real_model_bundle(
         n_splits=5,
         purge_gap=1,
         reranker=reranker,
+        feature_selection_config=feature_selection_config,
     )
     bundle = _train_inline_bundle(
         processed[[*feature_cols, target_col, group_col]],
         feature_cols,
         target_col,
         group_col,
+        feature_selection_config=feature_selection_config,
+        catalog_metadata=(
+            processed.attrs.get("feature_manifest") if feature_set == "causal_expanded_v1" else None
+        ),
     )
     bundle["feature_set"] = feature_set
     bundle["panel_mode"] = panel_mode
