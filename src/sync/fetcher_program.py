@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import aiohttp
@@ -30,6 +31,7 @@ async def get_program_history_async(
     *,
     target_dates: list[str] | None = None,
     max_calls: int = 120,
+    request_slot: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, float]:
     """비동기 버전: 종목별 프로그램 매매 추이(일별)를 조회합니다."""
     url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
@@ -62,6 +64,8 @@ async def get_program_history_async(
         }
 
         try:
+            if request_slot is not None:
+                await request_slot()
             data = await client._handle_request(
                 session.get, url, headers=client._get_headers("FHPPG04650201"), params=params
             )
