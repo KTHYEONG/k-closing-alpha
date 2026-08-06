@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import importlib
+import sys
 from types import SimpleNamespace
 
 import pandas as pd
@@ -87,6 +88,7 @@ def test_backfill_price_facade_dry_run_logging(monkeypatch: pytest.MonkeyPatch, 
         kis_rest_rps=20.0,
         kis_safety_ratio=0.6,
         kis_max_parallel=1,
+        flows_only=False,
     )
     monkeypatch.setattr(mod, "_parse_args", lambda: args)
     monkeypatch.setattr(mod, "preview_windows", lambda **_: pd.DataFrame())
@@ -94,6 +96,21 @@ def test_backfill_price_facade_dry_run_logging(monkeypatch: pytest.MonkeyPatch, 
 
     monkeypatch.setattr(mod, "preview_windows", lambda **_: pd.DataFrame({"symbol": ["005930"]}))
     mod.main()
+
+
+def test_backfill_price_facade_flows_only(monkeypatch) -> None:
+    mod = importlib.import_module("src.backfill.backfill_price")
+    called = []
+    monkeypatch.setattr(mod, "_parse_args", lambda: SimpleNamespace(flows_only=True))
+    monkeypatch.setattr(mod, "flow_backfill_main", lambda: called.append(True))
+    mod.main()
+    assert called == [True]
+
+
+def test_backfill_price_parse_exposes_flows_only(monkeypatch) -> None:
+    mod = importlib.import_module("src.backfill.backfill_price")
+    monkeypatch.setattr(sys, "argv", ["backfill_price", "--flows-only"])
+    assert mod._parse_args().flows_only is True
 
 
 def test_daily_predict_facade_exposes_public_symbols() -> None:
