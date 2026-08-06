@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,10 +39,15 @@ class FetchConfig:
     kis_rest_limit_per_sec: float = 20.0
     kis_rest_safety_ratio: float = 0.6
     kis_max_parallel_calls: int = 1
+    pykrx_requests_per_sec: float = 8.0
+    include_flows: bool = True
+    force_full_history: bool = False
 
 
 _KIS_SEMAPHORE: threading.Semaphore | None = None
 _KIS_SEMAPHORE_SIZE = 0
+_PYKRX_LOCK = threading.Lock()
+_PYKRX_NEXT_REQUEST = 0.0
 
 
 def _effective_kis_sleep_sec(fetch_cfg: FetchConfig) -> float:
@@ -66,3 +72,15 @@ def _kis_slot(fetch_cfg: FetchConfig):
         yield
     finally:
         sem.release()
+
+
+def _wait_for_pykrx_slot(fetch_cfg: FetchConfig) -> None:
+    """프로세스 전체에서 pykrx 호출률을 제한합니다."""
+    global _PYKRX_NEXT_REQUEST
+    interval = 1.0 / max(0.1, float(fetch_cfg.pykrx_requests_per_sec))
+    with _PYKRX_LOCK:
+        now = time.monotonic()
+        wait = max(0.0, _PYKRX_NEXT_REQUEST - now)
+        _PYKRX_NEXT_REQUEST = max(now, _PYKRX_NEXT_REQUEST) + interval
+    if wait > 0:
+        time.sleep(wait)
