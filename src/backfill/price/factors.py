@@ -14,13 +14,14 @@ def compute_vkospi_proxy(
     *,
     window: int = 20,
     min_periods: int = 20,
+    output_col: str = "v_kospi",
 ) -> pd.DataFrame:
     """Build V-KOSPI proxy (historical volatility) from index close prices."""
     if index_close_df is None or index_close_df.empty:
-        return pd.DataFrame(columns=["date", "v_kospi"])
+        return pd.DataFrame(columns=["date", output_col])
 
     if "date" not in index_close_df.columns or "close" not in index_close_df.columns:
-        return pd.DataFrame(columns=["date", "v_kospi"])
+        return pd.DataFrame(columns=["date", output_col])
 
     out = index_close_df.copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
@@ -28,7 +29,7 @@ def compute_vkospi_proxy(
     out = out.dropna(subset=["date", "close"]).sort_values("date")
     out = out.drop_duplicates(subset=["date"], keep="last")
     if out.empty:
-        return pd.DataFrame(columns=["date", "v_kospi"])
+        return pd.DataFrame(columns=["date", output_col])
 
     close_ratio = pd.to_numeric(out["close"] / out["close"].shift(1), errors="coerce")
     log_ret = np.where(close_ratio > 0, np.log(close_ratio), np.nan)
@@ -36,8 +37,8 @@ def compute_vkospi_proxy(
         window=int(window),
         min_periods=int(min_periods),
     ).std(ddof=0)
-    out["v_kospi"] = roll_std * np.sqrt(252.0) * 100.0
-    return out[["date", "v_kospi"]]
+    out[output_col] = roll_std * np.sqrt(252.0) * 100.0
+    return out[["date", output_col]]
 
 
 def _merge_index_returns(
@@ -52,9 +53,13 @@ def _merge_index_returns(
 
     kospi = _fetch_index_returns(start, end, code="1001", out_col="kospi_pct", fetch_cfg=fetch_cfg)
     kosdaq = _fetch_index_returns(start, end, code="2001", out_col="kosdaq_pct", fetch_cfg=fetch_cfg)
-    vkospi = _fetch_vkospi_proxy(start, end, fetch_cfg=fetch_cfg, index_code="1028")
+    # Historical proxy volatility is calculated from KOSPI/KOSDAQ index closes;
+    # do not depend on pykrx's separate volatility-index ticker metadata.
+    vkospi = _fetch_vkospi_proxy(start, end, fetch_cfg=fetch_cfg, index_code="1001", output_col="v_kospi")
+    vkosdaq = _fetch_vkospi_proxy(start, end, fetch_cfg=fetch_cfg, index_code="2001", output_col="v_kosdaq")
 
     out = history.merge(kospi, on="date", how="left")
     out = out.merge(kosdaq, on="date", how="left")
     out = out.merge(vkospi, on="date", how="left")
+    out = out.merge(vkosdaq, on="date", how="left")
     return out
