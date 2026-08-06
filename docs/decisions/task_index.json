@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "kis_flow_backfill",
+      "date": "2026-08-06",
+      "adr_id": "ADR_20260806_kis_flow_backfill",
+      "domain": "backfill",
+      "title": "KIS flow-only historical backfill",
+      "why": "수급 3종 과거 데이터 수집 시 OHLCV 재조회와 장시간 단일 parquet 재작성으로 비효율이 발생함",
+      "resolution": "공용 KIS 세션·전역 rate limiter·flow-only checkpoint parquet·명시적 병합 경로를 추가하고 VKOSPI/VKOSDAQ을 지수 종가 기반으로 계산하도록 보완함",
+      "impact": "수급 과거 백필을 재시작 가능하고 호출 제한을 준수하는 구조로 분리; 원천 가격 parquet은 명시적 apply 전까지 보존"
+    },
+    {
       "task_id": "TASK_ML_FEATURE_ENGINEERING_EVOLUTION",
       "date": "2026-08-06",
       "adr_id": "ADR_20260806_ML_FEATURE_ENGINEERING_EVOLUTION",

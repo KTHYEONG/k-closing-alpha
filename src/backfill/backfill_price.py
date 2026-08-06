@@ -11,6 +11,7 @@ import argparse
 import logging
 from pathlib import Path
 
+from src.backfill.kis_flow_backfill import main as flow_backfill_main
 from src.backfill.price.config import (
     DEFAULT_CONFIG,
     KRW_100M,
@@ -72,6 +73,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", type=str, default="", help="full-history start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, default="", help="full-history end date (YYYY-MM-DD)")
     parser.add_argument("--skip-flows", action="store_true", help="skip investor/program flow APIs")
+    parser.add_argument("--flows-only", action="store_true", help="run the dedicated resumable KIS flow backfill")
     parser.add_argument("--workers", type=int, default=4, help="parallel workers")
     parser.add_argument(
         "--kis-rest-rps",
@@ -111,6 +113,9 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if getattr(args, "flows_only", False):
+        flow_backfill_main()
+        return
     parquet_out = Path(args.parquet_out) if str(args.parquet_out).strip() else None
     if parquet_out is None:
         raise ValueError("parquet output path is required.")
