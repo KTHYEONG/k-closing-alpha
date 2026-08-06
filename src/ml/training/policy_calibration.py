@@ -250,14 +250,17 @@ def _calibrate_oof_policy(
     purge_gap: int,
     *,
     reranker: bool = False,
+    feature_selection_config: Any = None,
 ) -> tuple[SingleStockPolicy | None, dict[str, Any] | None]:
     """시나리오 행동 패널에서 purged OOF 정책을 보정하고 번들용 메타데이터를 반환합니다.
 
     ``reranker=True`` 이면 close-morning 결정 스코어(rank_score + p_good 순위)
     OOF 보정을 사용하고, 그 외에는 기존 ``pred``/``rank_score`` 매핑을
-    유지합니다. ``stock_code`` / ``chart_analysis`` 식별 컬럼이 없으면 정책을
-    산출할 수 없으므로 ``(None, None)`` 을 반환합니다 — 호출부는 이를 명시적
-    ``ABSTAIN(missing_validated_policy)`` 로 이어갑니다 (Top-N 폴백 금지).
+    유지합니다. ``feature_selection_config`` 가 주어지면 fold-local 선택을
+    ``run_model_pipeline`` 에 전달합니다. ``stock_code`` / ``chart_analysis``
+    식별 컬럼이 없으면 정책을 산출할 수 없으므로 ``(None, None)`` 을 반환합니다 —
+    호출부는 이를 명시적 ``ABSTAIN(missing_validated_policy)`` 로 이어갑니다
+    (Top-N 폴백 금지).
     """
     if not {"stock_code", "chart_analysis"} <= set(df.columns):
         return None, None
@@ -281,5 +284,6 @@ def _calibrate_oof_policy(
         n_splits=n_splits,
         purge_gap=purge_gap,
         model_type="lgb_regressor",
+        feature_selection_config=feature_selection_config,
     )
     return result["single_stock_policy"], result["policy_metadata"]

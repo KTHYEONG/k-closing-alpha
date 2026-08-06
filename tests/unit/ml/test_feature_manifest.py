@@ -87,3 +87,60 @@ def test_build_feature_manifest_panel_scope_is_candidate() -> None:
 def test_build_feature_manifest_requires_list_input() -> None:
     with pytest.raises(TypeError, match="not a string"):
         build_feature_manifest("change_rate")  # type: ignore[arg-type]
+
+
+def _catalog_metadata() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "feature_name": "snap_turnover",
+                "family": "sheet_level",
+                "source_columns": ["trade_value_100m", "market_cap_100m"],
+                "lookback_groups": ["same_date"],
+                "availability_rule": "at_decision_time",
+                "unit": "decimal_ratio",
+                "panel_scope": "candidate_panel",
+            },
+            {
+                "feature_name": "hist_ret_5d",
+                "family": "lagged_state",
+                "source_columns": ["close"],
+                "lookback_groups": ["5d"],
+                "availability_rule": "prior_date_history_only",
+                "unit": "decimal_ratio",
+                "panel_scope": "stock_history",
+            },
+        ]
+    )
+
+
+def test_build_feature_manifest_with_catalog_metadata() -> None:
+    metadata = _catalog_metadata()
+    manifest = build_feature_manifest(["snap_turnover", "hist_ret_5d"], catalog_metadata=metadata)
+    assert {
+        "feature_name",
+        "source_column",
+        "availability_rule",
+        "unit",
+        "panel_scope",
+        "family",
+        "source_columns",
+        "lookback_groups",
+    }.issubset(set(manifest.columns))
+    assert manifest.loc[0, "family"] == "sheet_level"
+    assert manifest.loc[0, "availability_rule"] == "at_decision_time"
+    assert manifest.loc[1, "family"] == "lagged_state"
+    assert manifest.loc[1, "availability_rule"] == "prior_date_history_only"
+    assert manifest.loc[1, "lookback_groups"] == ["5d"]
+
+
+def test_build_feature_manifest_fails_closed_on_unknown_generated_column() -> None:
+    metadata = _catalog_metadata()
+    with pytest.raises(ValueError, match="unknown generated column"):
+        build_feature_manifest(["snap_turnover", "not_in_catalog"], catalog_metadata=metadata)
+
+
+def test_build_feature_manifest_rejects_incomplete_catalog_metadata() -> None:
+    metadata = _catalog_metadata().drop(columns=["family"])
+    with pytest.raises(ValueError, match="catalog_metadata"):
+        build_feature_manifest(["snap_turnover"], catalog_metadata=metadata)
