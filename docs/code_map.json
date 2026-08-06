@@ -98,5 +98,8 @@
   },
   "src/ml/training/pipelines.py": {
     "testing": "tests/unit/ml/test_model_pipeline.py"
+  },
+  "src/ml/training/ensemble_execution.py": {
+    "testing": "tests/unit/ml/test_ensemble_execution.py"
   }
 }
