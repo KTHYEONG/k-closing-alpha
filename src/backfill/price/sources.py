@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import importlib
 import logging
+import threading
 import time
 
 import numpy as np
 import pandas as pd
 
-from src.backfill.price.config import FetchConfig, _effective_kis_sleep_sec, _kis_slot
+from src.backfill.price.config import (
+    FetchConfig,
+    _effective_kis_sleep_sec,
+    _kis_slot,
+    _wait_for_pykrx_slot,
+)
 from src.backfill.price.normalize import (
     _find_col,
     _normalize_investor_flow,
@@ -29,6 +35,8 @@ _PROGRAM_HISTORY_FN = None
 _PROGRAM_HISTORY_RESOLVED = False
 _INVESTOR_HISTORY_FN = None
 _INVESTOR_HISTORY_RESOLVED = False
+_KIS_CLIENT = None
+_KIS_CLIENT_LOCK = threading.Lock()
 
 
 def _safe_get_market_ohlcv_by_date(
@@ -40,7 +48,7 @@ def _safe_get_market_ohlcv_by_date(
     last_err: Exception | None = None
     for attempt in range(fetch_cfg.retries):
         try:
-            time.sleep(fetch_cfg.request_sleep_sec)
+            _wait_for_pykrx_slot(fetch_cfg)
             return stock.get_market_ohlcv_by_date(from_date, to_date, symbol)
         except Exception as exc:  # pragma: no cover - network/runtime dependent
             last_err = exc
@@ -57,7 +65,7 @@ def _safe_get_market_cap_by_date(
     last_err: Exception | None = None
     for attempt in range(fetch_cfg.retries):
         try:
-            time.sleep(fetch_cfg.request_sleep_sec)
+            _wait_for_pykrx_slot(fetch_cfg)
             return stock.get_market_cap_by_date(from_date, to_date, symbol)
         except Exception as exc:  # pragma: no cover - network/runtime dependent
             last_err = exc
@@ -77,7 +85,7 @@ def _safe_get_trading_value_by_date(
         last_err: Exception | None = None
         for attempt in range(fetch_cfg.retries):
             try:
-                time.sleep(fetch_cfg.request_sleep_sec)
+                _wait_for_pykrx_slot(fetch_cfg)
                 return stock.get_market_trading_value_by_date(
                     from_date,
                     to_date,
@@ -258,20 +266,25 @@ def _kis_sync_client():
 
     from src.api.kis_client import KisApiClient
 
-    client = KisApiClient()
+    global _KIS_CLIENT
+    with _KIS_CLIENT_LOCK:
+        if _KIS_CLIENT is not None and _KIS_CLIENT.token:
+            return _KIS_CLIENT
+        client = KisApiClient()
 
-    async def _ensure() -> None:
-        async with client.create_session() as session:
-            await client.ensure_token(session)
+        async def _ensure() -> None:
+            async with client.create_session() as session:
+                await client.ensure_token(session)
 
-    try:
-        asyncio.run(_ensure())
-    except Exception as exc:
-        logger.warning("[DATA] stage=kis_token status=FAIL error=%s", exc)
-        return None
-    if not client.token:
-        return None
-    return client
+        try:
+            asyncio.run(_ensure())
+        except Exception as exc:
+            logger.warning("[DATA] stage=kis_token status=FAIL error=%s", exc)
+            return None
+        if not client.token:
+            return None
+        _KIS_CLIENT = client
+        return client
 
 
 def _fetch_kis_daily_ohlcv(
@@ -369,7 +382,7 @@ def _fetch_index_returns(
     last_err: Exception | None = None
     for attempt in range(fetch_cfg.retries):
         try:
-            time.sleep(fetch_cfg.request_sleep_sec)
+            _wait_for_pykrx_slot(fetch_cfg)
             idx = stock.get_index_ohlcv_by_date(_to_ymd(start), _to_ymd(end), code)
             if idx is None or idx.empty:
                 return pd.DataFrame(columns=["date", out_col])
@@ -385,8 +398,82 @@ def _fetch_index_returns(
         except Exception as exc:  # pragma: no cover - network/runtime dependent
             last_err = exc
             time.sleep(fetch_cfg.retry_sleep_sec * (attempt + 1))
+
+    # pykrx 지수 엔드포인트가 KRX 응답 변경으로 실패할 때 KIS를 사용한다.
+    close = _fetch_kis_index_close(start, end, code, fetch_cfg)
+    if not close.empty:
+        pct = close["close"].pct_change()
+        return pd.DataFrame({"date": close["date"], out_col: pct.to_numpy()})
+
     logger.warning("[DATA] stage=index symbol=%s status=FAIL error=%s", code, last_err)
     return pd.DataFrame(columns=["date", out_col])
+
+
+def _fetch_kis_index_close(
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    code: str,
+    fetch_cfg: FetchConfig,
+) -> pd.DataFrame:
+    """KIS 일별 지수 차트에서 종가를 가져옵니다."""
+    try:
+        import requests
+    except Exception:
+        return pd.DataFrame(columns=["date", "close"])
+
+    client = _kis_sync_client()
+    if client is None:
+        return pd.DataFrame(columns=["date", "close"])
+
+    url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice"
+    headers = client._get_headers("FHKUP03500100")
+    rows: list[dict[str, object]] = []
+    cur_start = pd.Timestamp(start).normalize()
+    end_ts = pd.Timestamp(end).normalize()
+    chunk_days = 60
+    kis_sleep_sec = _effective_kis_sleep_sec(fetch_cfg)
+    with _kis_slot(fetch_cfg):
+        while cur_start <= end_ts:
+            cur_end = min(cur_start + pd.Timedelta(days=chunk_days), end_ts)
+            params = {
+                "fid_cond_mrkt_div_code": "U",
+                "fid_input_iscd": str(code),
+                "fid_input_date_1": cur_start.strftime("%Y%m%d"),
+                "fid_input_date_2": cur_end.strftime("%Y%m%d"),
+                "fid_period_div_code": "D",
+                "fid_org_adj_prc": "0",
+            }
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data.get("output2") if isinstance(data, dict) else None
+                    if isinstance(items, list):
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            dt = pd.to_datetime(
+                                str(item.get("stck_bsop_date", "")).strip(),
+                                format="%Y%m%d",
+                                errors="coerce",
+                            )
+                            close = pd.to_numeric(item.get("bstp_nmix_prpr"), errors="coerce")
+                            if pd.notna(dt) and pd.notna(close):
+                                rows.append({"date": dt, "close": float(close)})
+            except Exception as exc:  # pragma: no cover - network/runtime dependent
+                logger.warning("[DATA] stage=kis_index code=%s status=FAIL error=%s", code, exc)
+            cur_start = cur_end + pd.Timedelta(days=1)
+            time.sleep(kis_sleep_sec)
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "close"])
+    return (
+        pd.DataFrame(rows)
+        .dropna(subset=["date", "close"])
+        .sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
+    )
 
 
 def _fetch_vkospi_proxy(
@@ -402,7 +489,7 @@ def _fetch_vkospi_proxy(
         last_err: Exception | None = None
         for attempt in range(fetch_cfg.retries):
             try:
-                time.sleep(fetch_cfg.request_sleep_sec)
+                _wait_for_pykrx_slot(fetch_cfg)
                 idx = stock.get_index_ohlcv_by_date(_to_ymd(start), _to_ymd(end), code)
                 if idx is None or idx.empty:
                     return pd.DataFrame(columns=["date", "close"])
@@ -423,72 +510,13 @@ def _fetch_vkospi_proxy(
         logger.warning("[DATA] stage=vkospi symbol=%s status=FAIL error=%s", code, last_err)
         return pd.DataFrame(columns=["date", "close"])
 
-    def _fetch_kis_close(code: str) -> pd.DataFrame:
-        try:
-            import requests
-        except Exception:
-            return pd.DataFrame(columns=["date", "close"])
-
-        client = _kis_sync_client()
-        if client is None:
-            return pd.DataFrame(columns=["date", "close"])
-
-        url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice"
-        headers = client._get_headers("FHKUP03500100")
-
-        rows: list[dict[str, object]] = []
-        cur_start = pd.Timestamp(start).normalize()
-        end_ts = pd.Timestamp(end).normalize()
-        chunk_days = 60
-        kis_sleep_sec = _effective_kis_sleep_sec(fetch_cfg)
-        with _kis_slot(fetch_cfg):
-            while cur_start <= end_ts:
-                cur_end = min(cur_start + pd.Timedelta(days=chunk_days), end_ts)
-                params = {
-                    "fid_cond_mrkt_div_code": "U",
-                    "fid_input_iscd": str(code),
-                    "fid_input_date_1": cur_start.strftime("%Y%m%d"),
-                    "fid_input_date_2": cur_end.strftime("%Y%m%d"),
-                    "fid_period_div_code": "D",
-                    "fid_org_adj_prc": "0",
-                }
-                try:
-                    resp = requests.get(url, headers=headers, params=params, timeout=15)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        items = data.get("output2") if isinstance(data, dict) else None
-                        if isinstance(items, list):
-                            for item in items:
-                                if not isinstance(item, dict):
-                                    continue
-                                d_raw = str(item.get("stck_bsop_date", "")).strip()
-                                c_raw = item.get("bstp_nmix_prpr")
-                                if not d_raw:
-                                    continue
-                                dt = pd.to_datetime(d_raw, format="%Y%m%d", errors="coerce")
-                                close = pd.to_numeric(c_raw, errors="coerce")
-                                if pd.notna(dt) and pd.notna(close):
-                                    rows.append({"date": dt, "close": float(close)})
-                except Exception:
-                    pass
-
-                cur_start = cur_end + pd.Timedelta(days=1)
-                time.sleep(kis_sleep_sec)
-
-        if not rows:
-            return pd.DataFrame(columns=["date", "close"])
-        out = pd.DataFrame(rows)
-        out = out.dropna(subset=["date", "close"]).sort_values("date")
-        out = out.drop_duplicates(subset=["date"], keep="last")
-        return out
-
     close_df = _fetch_pykrx_close(str(index_code))
     if close_df.empty and str(index_code) != "1001":
         close_df = _fetch_pykrx_close("1001")
     if close_df.empty:
-        close_df = _fetch_kis_close(str(index_code))
+        close_df = _fetch_kis_index_close(start, end, str(index_code), fetch_cfg)
     if close_df.empty and str(index_code) != "1001":
-        close_df = _fetch_kis_close("1001")
+        close_df = _fetch_kis_index_close(start, end, "1001", fetch_cfg)
     if close_df.empty:
         logger.warning("[DATA] stage=vkospi symbol=%s status=FAIL", index_code)
         return pd.DataFrame(columns=["date", "v_kospi"])

@@ -78,6 +78,12 @@ def _build_symbol_windows(
     rows: list[tuple[str, pd.Timestamp, pd.Timestamp, str]] = []
     start_fixed = pd.Timestamp(fetch_cfg.fixed_start_date)
     end_fixed = min(pd.Timestamp(fetch_cfg.fixed_end_date), pd.Timestamp.today().normalize())
+    # 신규 종목은 CLI의 lookback 범위만 요청한다. 기존 종목은 아래의
+    # 증분 갱신 경로에서 fixed_start_date와 마지막 저장일을 기준으로 처리한다.
+    recent_start = max(
+        start_fixed,
+        end_fixed - pd.offsets.BDay(max(1, int(fetch_cfg.lookback_trading_days))),
+    )
     if start_fixed > end_fixed:
         start_fixed, end_fixed = end_fixed, start_fixed
 
@@ -85,9 +91,11 @@ def _build_symbol_windows(
     overlap_days = max(20, int(fetch_cfg.calendar_buffer_days))
 
     def _resolve_start(symbol: str) -> pd.Timestamp:
+        if fetch_cfg.force_full_history:
+            return start_fixed
         last_dt = existing.get(str(symbol))
         if last_dt is None:
-            return start_fixed
+            return recent_start
         last_ts = pd.to_datetime(last_dt, errors="coerce")
         if pd.isna(last_ts):
             return start_fixed
