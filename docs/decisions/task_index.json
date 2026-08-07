@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_HISTORY_FEATURE_PIPELINE",
+      "date": "2026-08-07",
+      "adr_id": "ADR_20260807_ML_HISTORY_FEATURE_PIPELINE",
+      "domain": "ml",
+      "title": "Causal history feature streaming and research observability",
+      "why": "Prepare 720-feature causal history research under WSL memory limits and preserve diagnosable outcomes when long runs terminate.",
+      "resolution": "Added bounded Arrow Parquet scans, RSS budget checks, alphanumeric identifier-safe finite sanitization, a research-only CLI, atomic status snapshots, append-only stage events, and failure traceback persistence. Real history/control stages completed under 8 GiB; 5-fold candidate evaluation exceeded the 30-minute timeout and was not promoted.",
+      "impact": "Research pipeline is reproducible and memory-bounded for history construction, writes non-production artifacts only, and exposes failure checkpoints; GPU remains opt-in/CPU fallback in the current WSL environment."
+    },
+    {
       "task_id": "TASK_ML_RECENCY_ADAPTIVE_ENSEMBLE",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_ML_RECENCY_ADAPTIVE_ENSEMBLE",
