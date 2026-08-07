@@ -14,6 +14,8 @@ Availability rule:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import pandas as pd
 
 FEATURE_MANIFEST_COLUMNS: tuple[str, ...] = (
@@ -83,8 +85,16 @@ def _feature_unit(feature: str) -> str:
     return "decimal_ratio"
 
 
-def build_feature_manifest(feature_cols: list[str]) -> pd.DataFrame:
+def build_feature_manifest(
+    feature_cols: list[str],
+    catalogue: Mapping[str, Mapping[str, str]] | None = None,
+) -> pd.DataFrame:
     """학습/추론 피처 목록에 대한 결정적 매니페스트 DataFrame 을 생성합니다.
+
+    ``catalogue`` 가 주어지면 해당 피처명의 ``source_column`` / ``availability_rule``
+    / ``panel_scope`` 를 오버라이드합니다 (``src.ml.history_features`` 카탈로그
+    계약). 카탈로그에 없는 피처는 기존 ``at_decision_time`` 규칙을 유지하므로
+    기존 호출 동작은 변경되지 않습니다.
 
     Returns:
         컬럼: ``feature_name``, ``source_column``, ``availability_rule``,
@@ -92,14 +102,30 @@ def build_feature_manifest(feature_cols: list[str]) -> pd.DataFrame:
     """
     if isinstance(feature_cols, str):
         raise TypeError("feature_cols must be a list of feature names, not a string")
+    catalogue = catalogue or {}
     rows = [
         {
             "feature_name": feature,
-            "source_column": feature,
-            "availability_rule": "at_decision_time",
+            "source_column": _catalogue_get(catalogue, feature, "source_column", feature),
+            "availability_rule": _catalogue_get(
+                catalogue, feature, "availability_rule", "at_decision_time"
+            ),
             "unit": _feature_unit(feature),
-            "panel_scope": "candidate_panel",
+            "panel_scope": _catalogue_get(catalogue, feature, "panel_scope", "candidate_panel"),
         }
         for feature in feature_cols
     ]
     return pd.DataFrame(rows, columns=list(FEATURE_MANIFEST_COLUMNS))
+
+
+def _catalogue_get(
+    catalogue: Mapping[str, Mapping[str, str]],
+    feature: str,
+    key: str,
+    default: str,
+) -> str:
+    """카탈로그 오버라이드에서 값(기본값)을 결정적으로 반환합니다."""
+    meta = catalogue.get(feature)
+    if meta is None:
+        return default
+    return meta.get(key, default)
