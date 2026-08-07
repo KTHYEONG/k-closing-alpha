@@ -747,3 +747,98 @@ def test_s8_pct_rank_missing_col() -> None:
     assert "foreign_density_z" not in out.columns
     assert "major_density_z" in out.columns
     assert out["major_density_z"].notna().all()
+
+
+def _price_history_for(raw_df: pd.DataFrame, lookback_days: int = 60) -> pd.DataFrame:
+    """``_build_raw_df`` 종목/날짜를 커버하는 표준 가격 이력 스키마를 합성합니다."""
+    cleaned = clean_column_names(raw_df)
+    rng = np.random.default_rng(11)
+    symbols = sorted(cleaned["stock_code"].unique())
+    date_min = cleaned["trade_date"].min() - pd.Timedelta(days=lookback_days)
+    dates = pd.date_range(date_min, cleaned["trade_date"].max(), freq="D")
+    rows: list[dict[str, object]] = []
+    for symbol in symbols:
+        close = 50000.0
+        for date in dates:
+            close = close * (1 + rng.normal(0, 0.02))
+            open_ = close * (1 + rng.normal(0, 0.005))
+            high = max(open_, close) * (1 + abs(rng.normal(0, 0.004)))
+            low = min(open_, close) * (1 - abs(rng.normal(0, 0.004)))
+            volume = abs(rng.normal(1_000_000, 200_000))
+            rows.append(
+                {
+                    "date": date,
+                    "symbol": symbol,
+                    "open": open_,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "prev_close": close / (1 + rng.normal(0, 0.02)),
+                    "volume": volume,
+                    "trade_value_100m": volume * close / 100_000_000,
+                    "market_cap_100m": close * 1_000_000 / 100_000_000,
+                    "daily_change_pct": rng.normal(0.0, 2.0),
+                    "market": "KOSPI",
+                    "inst_net_buy": rng.normal(0, 1e8),
+                    "foreign_net_buy": rng.normal(0, 1e8),
+                    "prog_net_buy": rng.normal(0, 1e8),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_causal_expanded_v1_requires_price_history() -> None:
+    """SCENARIO_PREPROCESS_ML_DATASET: causal_expanded_v1 은 이력이 없으면 fail-closed."""
+    raw = _build_raw_df(n_per_date=[8, 8, 8])
+    with pytest.raises(ValueError, match="price_history_df"):
+        build_ml_dataset(raw, feature_set="causal_expanded_v1")
+
+
+def test_build_ml_dataset_causal_expanded_v1_returns_catalog() -> None:
+    """SCENARIO_PREPROCESS_ML_DATASET: causal_expanded_v1 은 카탈로그 행렬을 반환합니다.
+
+    기존 데이터셋 구성은 하위 호환 기준선으로 유지되고, causal_expanded_v1 은
+    opt-in 경로입니다.
+    """
+    raw = _build_raw_df(n_per_date=[8, 8, 8])
+    history = _price_history_for(raw)
+    X, targets, cat_features, processed = build_ml_dataset(
+        raw, feature_set="causal_expanded_v1", panel_mode="raw_rows", price_history_df=history
+    )
+    assert X.columns.is_unique
+    assert 600 <= X.shape[1] <= 1000
+    manifest = X.attrs["feature_manifest"]
+    assert {"family", "source_columns", "lookback_groups", "availability_rule"}.issubset(
+        set(manifest.columns)
+    )
+    assert set(manifest["feature_name"]) == set(X.columns)
+    assert X.attrs["catalog_version"] == "causal_expanded_v1"
+    assert X.attrs["catalog_hash"]
+    assert processed.attrs["catalog_hash"] == X.attrs["catalog_hash"]
+    assert "snap_log_market_cap_100m" in processed.columns
+    assert "target_return" in targets
+
+
+def test_build_ml_dataset_causal_expanded_v1_scenario_action_panel() -> None:
+    """causal_expanded_v1 은 scenario_action 패널 모드에서도 카탈로그 행렬을 생성합니다."""
+    raw = _build_raw_df(n_per_date=[8, 8, 8])
+    history = _price_history_for(raw)
+    X, targets, cat_features, processed = build_ml_dataset(
+        raw,
+        feature_set="causal_expanded_v1",
+        panel_mode="scenario_action",
+        price_history_df=history,
+    )
+    assert 600 <= X.shape[1] <= 1000
+    assert processed.attrs["panel_mode"] == "scenario_action"
+    assert "chart_analysis" not in X.columns
+
+
+def test_legacy_feature_sets_remain_unchanged_without_history() -> None:
+    """SCENARIO_PREPROCESS_ML_DATASET: 레거시 피처셋은 이력 없이 기존 동작을 유지합니다."""
+    raw = _build_raw_df(n_per_date=[8, 8, 8])
+    legacy = build_ml_dataset(raw, feature_set="close_morning61", panel_mode="raw_rows")
+    snapshot = build_ml_dataset(raw, feature_set="snapshot49", panel_mode="raw_rows")
+    assert set(legacy[0].columns) == set(snapshot[0].columns) | {"relative_flow_strength"}
+    assert "feature_manifest" in legacy[0].attrs
+    assert legacy[0].attrs["feature_manifest"].shape[1] == 5
