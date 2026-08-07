@@ -203,14 +203,16 @@ class KisApiClient:
                     # 토큰 만료/유효하지 않음 에러 자동 재발급 처리
                     msg_cd = data.get("msg_cd", "")
                     msg1 = data.get("msg1", "")
-                    if data.get("rt_cd") != "0" and (
-                        msg_cd in ("EGW00121", "EGW00123") or "token" in msg1.lower() or "토큰" in msg1
+                    if (
+                        data.get("rt_cd") != "0"
+                        and (msg_cd in ("EGW00121", "EGW00123") or "token" in msg1.lower() or "토큰" in msg1)
+                        and session
+                        and attempt < 2
                     ):
-                        if session and attempt < 2:
-                            logger.warning("유효하지 않은 토큰 감지 (%s). 토큰 강제 재발급 진행...", msg_cd or msg1)
-                            await self.ensure_token(session, force_refresh=True)
-                            await asyncio.sleep(0.2)
-                            continue
+                        logger.warning("유효하지 않은 토큰 감지 (%s). 토큰 강제 재발급 진행...", msg_cd or msg1)
+                        await self.ensure_token(session, force_refresh=True)
+                        await asyncio.sleep(0.2)
+                        continue
 
                     # KIS 특유의 TPS 초과 메시지 처리
                     if data.get("rt_cd") != "0" and "초당 거래건수" in msg1:
