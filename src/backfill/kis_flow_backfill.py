@@ -75,6 +75,28 @@ def plan_missing_flows(source: pd.DataFrame, checkpoint: pd.DataFrame | None = N
     }
 
 
+def _plan_missing_fields(source: pd.DataFrame, checkpoint: pd.DataFrame | None = None) -> dict[str, tuple[bool, bool]]:
+    """Return per-symbol requirements as ``(investor, program)`` flags."""
+    frame = source[["symbol", "date", *FLOW_COLUMNS]].copy()
+    frame["symbol"] = frame["symbol"].astype(str).str.zfill(6)
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    if checkpoint is not None and not checkpoint.empty:
+        cp = checkpoint[["symbol", "date", *FLOW_COLUMNS]].copy()
+        cp["symbol"] = cp["symbol"].astype(str).str.zfill(6)
+        cp["date"] = pd.to_datetime(cp["date"], errors="coerce")
+        cp = cp.groupby(["symbol", "date"], as_index=False)[list(FLOW_COLUMNS)].last()
+        frame = frame.merge(cp, on=["symbol", "date"], how="left", suffixes=("", "_checkpoint"))
+        for col in FLOW_COLUMNS:
+            frame[col] = frame[col].fillna(frame.pop(f"{col}_checkpoint"))
+    result: dict[str, tuple[bool, bool]] = {}
+    for symbol, group in frame.groupby("symbol", sort=True):
+        result[symbol] = (
+            bool(group[["foreign_netbuy", "inst_netbuy"]].isna().any().any()),
+            bool(group["program_netbuy"].isna().any()),
+        )
+    return result
+
+
 def _read_checkpoints(checkpoint_dir: Path) -> pd.DataFrame:
     paths = sorted(checkpoint_dir.glob("batch_*.parquet")) if checkpoint_dir.exists() else []
     if not paths:
@@ -88,18 +110,53 @@ async def _fetch_symbol(
     limiter: AsyncRateLimiter,
     symbol: str,
     dates: list[str],
+    need_investor: bool = True,
+    need_program: bool = True,
 ) -> pd.DataFrame:
-    investor = await get_investor_trade_daily_async(
-        session, client, symbol, min(dates), max(dates), target_dates=dates, request_slot=limiter.acquire
-    )
-    program = await get_program_history_async(
-        session, client, symbol, min(dates), max(dates), target_dates=dates, request_slot=limiter.acquire
-    )
+    requests = []
+    if need_investor:
+        requests.append(get_investor_trade_daily_async(
+            session, client, symbol, min(dates), max(dates), target_dates=dates, request_slot=limiter.acquire
+        ))
+    if need_program:
+        requests.append(get_program_history_async(
+            session, client, symbol, min(dates), max(dates), target_dates=dates, request_slot=limiter.acquire
+        ))
+    results = await asyncio.gather(*requests) if requests else []
+    investor = results[0] if need_investor else pd.DataFrame()
+    program = results[1 if need_investor else 0] if need_program else {}
     base = pd.DataFrame({"symbol": symbol, "date": pd.to_datetime(dates, format="%Y%m%d")})
     if investor.empty:
         investor = pd.DataFrame(columns=["date", "foreign_netbuy", "inst_netbuy"])
     prog = pd.DataFrame({"date": pd.to_datetime(list(program), format="%Y%m%d"), "program_netbuy": list(program.values())})
     return base.merge(investor, on="date", how="left").merge(prog, on="date", how="left")
+
+
+async def _fetch_symbol_guarded(
+    session: object,
+    client: KisApiClient,
+    limiter: AsyncRateLimiter,
+    semaphore: asyncio.Semaphore,
+    field_plan: dict[str, tuple[bool, bool]],
+    symbol: str,
+    dates: list[str],
+) -> pd.DataFrame:
+    async with semaphore:
+        need_investor, need_program = field_plan[symbol]
+        try:
+            return await _fetch_symbol(
+                session, client, limiter, symbol, dates, need_investor, need_program
+            )
+        except Exception as exc:
+            logger.exception(
+                "[DATA] stage=flow_backfill symbol=%s status=SYMBOL_FAIL error=%s",
+                symbol, type(exc).__name__,
+            )
+            return pd.DataFrame({
+                "symbol": symbol,
+                "date": pd.to_datetime(dates, format="%Y%m%d"),
+                **dict.fromkeys(FLOW_COLUMNS, pd.NA),
+            })
 
 
 async def run_kis_flow_backfill(
@@ -111,6 +168,7 @@ async def run_kis_flow_backfill(
     source = pd.read_parquet(parquet_path, columns=["symbol", "date", *FLOW_COLUMNS])
     checkpoint = _read_checkpoints(checkpoint_dir)
     plan = plan_missing_flows(source, checkpoint)
+    field_plan = _plan_missing_fields(source, checkpoint)
     if symbols is not None:
         requested = {str(symbol).zfill(6) for symbol in symbols}
         plan = {symbol: dates for symbol, dates in plan.items() if symbol in requested}
@@ -121,14 +179,15 @@ async def run_kis_flow_backfill(
     limiter = AsyncRateLimiter(config.requests_per_second)
     semaphore = asyncio.Semaphore(max(1, config.concurrency))
 
-    async def guarded(symbol: str, dates: list[str]) -> pd.DataFrame:
-        async with semaphore:
-            return await _fetch_symbol(session, client, limiter, symbol, dates)
-
     client = KisApiClient()
     async with client.create_session() as session:
         await client.ensure_token(session)
-        tasks = [asyncio.create_task(guarded(symbol, dates)) for symbol, dates in plan.items()]
+        tasks = [
+            asyncio.create_task(
+                _fetch_symbol_guarded(session, client, limiter, semaphore, field_plan, symbol, dates)
+            )
+            for symbol, dates in plan.items()
+        ]
         completed = 0
         pending_frames: list[pd.DataFrame] = []
         paths: list[Path] = []
@@ -172,8 +231,9 @@ def apply_flow_checkpoints(parquet_path: Path, checkpoint_dir: Path) -> int:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")  # pragma: no cover
     parser = argparse.ArgumentParser(description="KIS flow-only historical backfill")
-    parser.add_argument("--parquet", default="data/history/price_history_2016_2025.parquet")
+    parser.add_argument("--parquet", default="data/history/price_history.parquet")
     parser.add_argument("--checkpoint-dir", default="data/history/flow_backfill")
     parser.add_argument("--rps", type=float, default=10.0)
     parser.add_argument("--concurrency", type=int, default=4)
