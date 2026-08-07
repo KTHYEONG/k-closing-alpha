@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -8,6 +9,8 @@ import aiohttp
 import pandas as pd
 
 from src.api.kis_client import KisApiClient
+
+logger = logging.getLogger(__name__)
 
 
 def _clean_num(v: Any) -> float:
@@ -32,6 +35,7 @@ async def get_program_history_async(
     target_dates: list[str] | None = None,
     max_calls: int = 120,
     request_slot: Callable[[], Awaitable[None]] | None = None,
+    max_consecutive_failures: int = 3,
 ) -> dict[str, float]:
     """비동기 버전: 종목별 프로그램 매매 추이(일별)를 조회합니다."""
     url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
@@ -52,6 +56,7 @@ async def get_program_history_async(
     cursor = end
     seen_days = set()
     no_progress = 0
+    failures = 0
 
     for _ in range(max(1, int(max_calls))):
         if cursor < start:
@@ -69,7 +74,14 @@ async def get_program_history_async(
             data = await client._handle_request(
                 session.get, url, headers=client._get_headers("FHPPG04650201"), params=params
             )
-        except Exception:
+        except Exception as exc:
+            failures += 1
+            logger.warning(
+                "[DATA] stage=program_flow symbol=%s cursor=%s status=REQUEST_FAIL failures=%d error=%s",
+                code, cursor, failures, type(exc).__name__,
+            )
+            if failures >= max(1, int(max_consecutive_failures)):
+                break
             dt = pd.to_datetime(cursor, format="%Y%m%d", errors="coerce")
             if pd.isna(dt):
                 break
@@ -77,11 +89,20 @@ async def get_program_history_async(
             continue
 
         if data.get("rt_cd") != "0":
+            failures += 1
+            logger.warning(
+                "[DATA] stage=program_flow symbol=%s cursor=%s status=API_FAIL failures=%d msg=%s",
+                code, cursor, failures, data.get("msg1", ""),
+            )
+            if failures >= max(1, int(max_consecutive_failures)):
+                break
             dt = pd.to_datetime(cursor, format="%Y%m%d", errors="coerce")
             if pd.isna(dt):
                 break
             cursor = (dt - pd.Timedelta(days=1)).strftime("%Y%m%d")
             continue
+
+        failures = 0
 
         rows = data.get("output", [])
         row_days = set()
