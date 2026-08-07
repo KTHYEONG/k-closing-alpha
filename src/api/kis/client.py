@@ -38,17 +38,18 @@ class KisApiClient:
         self.semaphore = asyncio.Semaphore(10)
         self.rate_limiter = AsyncRateLimiter(max_rate=18.0, time_period=1.0)
 
-    def create_session(self) -> aiohttp.ClientSession:
-        """최적화된 커넥터를 가진 세션을 생성합니다."""
+    def create_session(self, *, timeout: aiohttp.ClientTimeout | None = None) -> aiohttp.ClientSession:
+        """최적화된 커넥터와 bounded request timeout을 가진 세션을 생성합니다."""
         from aiohttp.resolver import ThreadedResolver
         resolver = ThreadedResolver()
+        request_timeout = timeout or aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
         connector = aiohttp.TCPConnector(
             limit=50,            # 동시 연결 수 제한
             ttl_dns_cache=300,  # DNS 캐시 유지 시간
             use_dns_cache=True,  # DNS 캐시 사용
             resolver=resolver   # DNS 해석기 추가
         )
-        return aiohttp.ClientSession(connector=connector)
+        return aiohttp.ClientSession(timeout=request_timeout, connector=connector)
 
     @staticmethod
     def _normalize_market_div_code(market_div_code):
