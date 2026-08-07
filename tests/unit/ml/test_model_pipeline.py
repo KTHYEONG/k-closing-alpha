@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.ml.feature_selection import FeatureSelectionConfig
 from src.ml.model_pipeline import (
     _align_close_morning_oof,
     _calibrate_close_morning_decision_oof,
@@ -1391,3 +1392,91 @@ def test_close_morning_yearly_breakdown_handles_small_and_invalid_years() -> Non
     assert out[2025] is None
     # 비파싱 연도는 건너뜁니다 (NaN 연도 키 미생성).
     assert all(np.isfinite(year) for year in out)
+
+
+def test_fs08_no_selector_preserves_existing_behavior() -> None:
+    """feature_selection_config=None 이면 선택 진단 없이 기존 동작을 유지합니다."""
+    df = _make_dataset(n_groups=12, rows_per_group=6)
+    result = run_model_pipeline(
+        df,
+        feature_cols=FEATURE_COLS,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+    )
+    assert result["feature_selection_diagnostics"] is None
+    manifest = result["feature_manifest"]
+    assert (manifest["availability_rule"] == "at_decision_time").all()
+    assert result["policy_params"] == {
+        "purge_gap": 1,
+        "n_splits": 3,
+        "model_type": "lgb_regressor",
+    }
+
+
+def test_fs09_selector_wiring_reports_fold_local_selections() -> None:
+    """각 outer 모델은 자신의 train-fold 선택 목록만 받고 진단을 보고합니다."""
+    rng = np.random.default_rng(9)
+    n_groups, rows = 40, 8
+    dates = pd.to_datetime([f"2024-03-{1 + d % 28:02d}" for d in range(n_groups)])
+    df = pd.DataFrame({"trade_date": [d for d in dates for _ in range(rows)]})
+    signal = rng.normal(size=len(df))
+    candidate_cols = [f"f{i:03d}" for i in range(40)]
+    for j, col in enumerate(candidate_cols):
+        df[col] = rng.normal(size=len(df)) + 0.3 * signal * (j % 3)
+    df[TARGET_COL] = 0.02 * signal + rng.normal(scale=0.02, size=len(df))
+    df["selection_rank"] = df.groupby(GROUP_COL, sort=False).cumcount() + 1
+    cfg = FeatureSelectionConfig(min_retained=5, max_retained=20, hard_max_retained=40)
+    result = run_model_pipeline(
+        df,
+        feature_cols=candidate_cols,
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=3,
+        purge_gap=1,
+        feature_selection_config=cfg,
+    )
+    diag = result["feature_selection_diagnostics"]
+    assert diag is not None
+    assert diag["n_folds"] == 3
+    assert len(diag["fold_selections"]) == 3
+    assert 0.0 <= diag["median_pairwise_jaccard"] <= 1.0
+    assert diag["data_cutoff"] == str(df[GROUP_COL].max())
+    for fold, fold_payload in enumerate(diag["fold_selections"]):
+        selected = fold_payload["selected_features"]
+        assert 5 <= len(selected) <= 20
+        assert set(selected) <= set(candidate_cols)
+        # 각 fold 의 학습 모델은 정확히 해당 fold 의 선택 목록으로 학습됩니다.
+        model_features = result["trained_models"][fold].booster_.feature_name()
+        assert list(model_features) == selected
+    assert 5 <= len(diag["final_features"]) <= 40
+    assert len(result["feature_manifest"]) == len(diag["final_features"])
+
+
+def test_fs09_rejects_non_config_selector() -> None:
+    """FeatureSelectionConfig 가 아닌 selector 는 ValueError 로 거부합니다."""
+    df = _make_dataset(n_groups=12, rows_per_group=6)
+    with pytest.raises(ValueError, match="FeatureSelectionConfig"):
+        run_model_pipeline(
+            df,
+            feature_cols=FEATURE_COLS,
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            n_splits=3,
+            purge_gap=1,
+            feature_selection_config="not-a-config",  # type: ignore[arg-type]
+        )
+
+
+def test_finite_nan_handles_missing_and_inf_features() -> None:
+    """``_finite_nan`` 은 누락 컬럼을 무시하고 ``inf`` 를 ``NaN`` 으로 치환합니다."""
+    from src.ml.model_pipeline import _finite_nan
+
+    df = pd.DataFrame({"a": [1.0, np.inf, -np.inf, 4.0], "b": [1.0, 2.0, 3.0, np.nan]})
+    out = _finite_nan(df, ["a", "b", "missing_col"])
+    a = out["a"].to_numpy()
+    assert np.isfinite(a[[0, 3]]).all()
+    assert np.isnan(a[[1, 2]]).all()
+    assert out["b"].iloc[3] is np.nan or pd.isna(out["b"].iloc[3])
+    assert out["b"].iloc[0] == 1.0

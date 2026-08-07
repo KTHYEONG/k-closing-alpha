@@ -8,7 +8,7 @@ Return 지표를 산출합니다.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import numpy as np
@@ -27,6 +27,13 @@ from src.ml.backtest_evaluator import (
     run_backtest_evaluation,
 )
 from src.ml.feature_manifest import build_feature_manifest
+from src.ml.feature_selection import (
+    FEATURE_SELECTION_VERSION,
+    FeatureSelectionConfig,
+    FeatureSelectionResult,
+    median_pairwise_jaccard,
+    select_features,
+)
 from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
 from src.ml.quantile_model import fit_predict_quantile_and_classifier
 from src.ml.single_stock_policy import (
@@ -1250,6 +1257,18 @@ def _compute_top_k_return(oof: pd.DataFrame, group_col: str, target_col: str, k:
     return _group_metric(oof, group_col, per_group)
 
 
+def _finite_nan(frame: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    """피처의 모든 비유한 값을 ``NaN`` 으로 치환합니다 (모델 결측 값으로 허용)."""
+    out = frame.copy()
+    for col in feature_cols:
+        if col not in out.columns:
+            continue
+        arr = out[col].to_numpy(dtype=np.float64)
+        if np.isinf(arr).any():
+            out[col] = np.where(np.isfinite(arr), arr, np.nan)
+    return out
+
+
 def _fit_predict(
     model_type: str,
     train: pd.DataFrame,
@@ -1266,8 +1285,11 @@ def _fit_predict(
     ``sample_weight`` 는 회귀 champion(Huber) 경로에서만 지원되며, 검증 라벨은
     가중치 계산에 절대 사용되지 않습니다. Ridge/LGBMRanker 는 비검증된 동작을
     방지하기 위해 비영(非零) recency 가중치를 ``ValueError`` 로 거부합니다.
+    피처의 비유한 값은 모델 입력 전에 ``NaN`` 으로 치환됩니다.
     """
     params: dict[str, Any] = dict(model_params or {})
+    train = _finite_nan(train, feature_cols)
+    val = _finite_nan(val, feature_cols)
     if model_type == "ridge":
         if sample_weight is not None:
             raise ValueError("recency sample weighting is not supported for ridge")
@@ -1301,6 +1323,8 @@ def _fit_predict_linear_baseline(
     target_col: str,
 ) -> np.ndarray:
     """StandardScaler + Ridge linear baseline 을 동일 fold 에서 학습·예측합니다."""
+    train = _finite_nan(train, feature_cols)
+    val = _finite_nan(val, feature_cols)
     medians = train[feature_cols].median(numeric_only=True).reindex(feature_cols).fillna(0.0)
     train_features = train[feature_cols].fillna(medians)
     val_features = val[feature_cols].fillna(medians)
@@ -1319,6 +1343,7 @@ def run_model_pipeline(
     model_type: str = "lgb_regressor",
     model_params: dict[str, int | float] | None = None,
     recency_half_life_groups: int | None = None,
+    feature_selection_config: FeatureSelectionConfig | None = None,
 ) -> dict[str, Any]:
     """Train ML model using Purged Group Walk-Forward CV and evaluate OOF results.
 
@@ -1331,13 +1356,28 @@ def run_model_pipeline(
     ``None``(기존 expanding 동작), 252, 504 뿐이며, Ridge/LGBMRanker 는 비검증
     동작을 방지하기 위해 비영 recency 가중치를 거부합니다.
 
+    ``feature_selection_config`` 가 주어지면 각 outer fold 의 train 분할에서만
+    fold-local 선택을 수행하고 해당 fold 의 선택 목록으로만 모델을 학습·예측합니다.
+    validation/이후 날짜 라벨은 선택에 사용되지 않습니다. 선택 진단(fold 목록,
+    gain, 거부 사유, median pairwise Jaccard, 최종 선별 목록)은
+    ``feature_selection_diagnostics`` 로 반환되며, ``None`` 이면 기존 동작을
+    그대로 유지합니다.
+
     Returns:
         dict containing 'oof_predictions', 'oof_df', 'metrics', 'trained_models',
         'backtest_eval', and bundle metadata (return_unit, round_trip_cost,
-        label_thresholds, feature_manifest, training_cutoff, policy_params).
+        label_thresholds, feature_manifest, training_cutoff, policy_params),
+        and optionally 'feature_selection_diagnostics'.
     """
     if model_type not in _MODEL_TYPES:
         raise ValueError(f"model_type must be one of {list(_MODEL_TYPES)}, got {model_type!r}")
+    if feature_selection_config is not None and not isinstance(
+        feature_selection_config, FeatureSelectionConfig
+    ):
+        raise ValueError(
+            "feature_selection_config must be a FeatureSelectionConfig or None, "
+            f"got {type(feature_selection_config).__name__}"
+        )
     if recency_half_life_groups is not None:
         if model_type != "lgb_regressor":
             raise ValueError(
@@ -1363,12 +1403,21 @@ def run_model_pipeline(
     oof_parts: list[pd.DataFrame] = []
     trained_models: list[Any] = []
     training_cutoff: Any = None
+    fold_selections: list[FeatureSelectionResult] = []
+    fold_cutoffs: list[str] = []
 
     for fold, (train_idx, val_idx) in enumerate(
         splitter.split(work, y=work[target_col], groups=work[group_col])
     ):
         train = work.iloc[train_idx]
         val = work.iloc[val_idx]
+        if feature_selection_config is not None:
+            selection = select_features(train, feature_cols, target_col, feature_selection_config)
+            fold_feature_cols = list(selection.selected_features)
+            fold_selections.append(selection)
+            fold_cutoffs.append(str(train[group_col].max()))
+        else:
+            fold_feature_cols = feature_cols
         sample_weight = (
             calculate_recency_sample_weight(train[group_col], recency_half_life_groups)
             if recency_half_life_groups is not None
@@ -1378,7 +1427,7 @@ def run_model_pipeline(
             model_type,
             train,
             val,
-            feature_cols,
+            fold_feature_cols,
             target_col,
             group_col,
             model_params,
@@ -1392,7 +1441,9 @@ def run_model_pipeline(
                 group_col: val[group_col].to_numpy(),
                 target_col: val[target_col].to_numpy(),
                 "pred": pred,
-                "pred_linear": _fit_predict_linear_baseline(train, val, feature_cols, target_col),
+                "pred_linear": _fit_predict_linear_baseline(
+                    train, val, fold_feature_cols, target_col
+                ),
                 "fold": fold,
             },
             index=val.index,
@@ -1444,6 +1495,42 @@ def run_model_pipeline(
 
     policy_metadata = _policy_metadata(single_stock_policy, single_stock_evaluation)
 
+    feature_selection_diagnostics: dict[str, Any] | None = None
+    manifest_features: list[str] = feature_cols
+    manifest_catalogue: Mapping[str, Mapping[str, str]] | None = None
+    if feature_selection_config is not None:
+        final_selection = select_features(work, feature_cols, target_col, feature_selection_config)
+        jaccard = median_pairwise_jaccard([s.selected_features for s in fold_selections])
+        feature_selection_diagnostics = {
+            "version": FEATURE_SELECTION_VERSION,
+            "catalogue_version": feature_selection_config.catalogue_version,
+            "data_cutoff": str(work[group_col].max()),
+            "n_folds": len(fold_selections),
+            "fold_selections": [
+                {
+                    "fold": fold,
+                    "data_cutoff": fold_cutoffs[fold],
+                    "selected_features": list(selection.selected_features),
+                    "gains": list(selection.gains),
+                    "rejected": list(selection.rejected),
+                    "counts": dict(selection.counts),
+                    "metadata": dict(selection.metadata),
+                }
+                for fold, selection in enumerate(fold_selections)
+            ],
+            "median_pairwise_jaccard": jaccard,
+            "final_features": list(final_selection.selected_features),
+            "final_selection": {
+                "selected_features": list(final_selection.selected_features),
+                "gains": list(final_selection.gains),
+                "rejected": list(final_selection.rejected),
+                "counts": dict(final_selection.counts),
+                "metadata": dict(final_selection.metadata),
+            },
+        }
+        manifest_features = feature_selection_diagnostics["final_features"]
+        manifest_catalogue = feature_selection_config.catalogue
+
     return {
         "oof_predictions": oof_df,
         "oof_df": oof_df,
@@ -1453,12 +1540,13 @@ def run_model_pipeline(
         "return_unit": RETURN_UNIT,
         "round_trip_cost": ROUND_TRIP_COST_RATIO,
         "label_thresholds": dict(LABEL_THRESHOLDS),
-        "feature_manifest": build_feature_manifest(feature_cols),
+        "feature_manifest": build_feature_manifest(manifest_features, catalogue=manifest_catalogue),
         "training_cutoff": str(training_cutoff),
         "calibration_diagnostics": [],
         "single_stock_policy": single_stock_policy,
         "single_stock_evaluation": single_stock_evaluation,
         "policy_metadata": policy_metadata,
+        "feature_selection_diagnostics": feature_selection_diagnostics,
         "policy_params": {
             "purge_gap": purge_gap,
             "n_splits": n_splits,
