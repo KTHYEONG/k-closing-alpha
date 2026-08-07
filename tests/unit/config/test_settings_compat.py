@@ -9,7 +9,7 @@ from src.settings import Settings
 
 def test_default_paths_point_to_project_root() -> None:
     settings = Settings()
-    assert Path(__file__).resolve().parent.parent.parent == settings.BASE_DIR
+    assert Path(__file__).resolve().parents[3] == settings.BASE_DIR
     assert settings.MODELS_DIR == settings.BASE_DIR / "artifacts" / "models"
     assert settings.DATA_DIR == settings.BASE_DIR / "data"
 

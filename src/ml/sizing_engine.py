@@ -17,6 +17,12 @@ from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
 from sklearn.calibration import CalibratedClassifierCV
 
 from src.ml.feature_manifest import build_feature_manifest
+from src.ml.feature_selection import (
+    FEATURE_SELECTION_VERSION,
+    FeatureSelectionConfig,
+    FoldLocalFeatureSelector,
+    serialize_selection_result,
+)
 
 _PREDICTION_COLS = ("pred_q10", "pred_q50", "pred_q90", "p_good", "p_bad")
 
@@ -72,6 +78,77 @@ _CLOSE_MORNING_RERANKER_V2_RESEARCH_CONFIG: dict[str, Any] = {
     "bad_probability_weight": 0.5,
     "score_col": "decision_score",
 }
+
+# algorithm-family 앙상블 연구(ml_ensemble_improvement)에서 사용 가능한 return
+# 추정기 family 목록. ``algorithm_ensemble_config.weights`` 의 key 는 이 목록의
+# 하나여야 하며 ``algorithm_ensemble_models`` 의 key 와 정확히 일치해야 합니다.
+_ALGORITHM_MODEL_TYPES: tuple[str, ...] = (
+    "lgb_regressor",
+    "xgb_regressor",
+    "catboost_regressor",
+    "random_forest_regressor",
+)
+
+
+def _convex_rank_blend(
+    preds: dict[str, pd.Series],
+    group: pd.Series,
+    weights: dict[str, float],
+) -> pd.Series:
+    """각 모델 예측의 그룹 내 백분위 순위를 convex weighted mean 으로 blend 합니다.
+
+    서로 다른 estimator family 의 raw 예측값은 스케일/손실이 달라 직접 평균할 수
+    없으므로, 벡터화된 ``groupby().rank`` 로 백분위 순위로 변환한 뒤 가중 평균을
+    계산합니다 (row-wise apply 미사용).
+    """
+    blend: pd.Series | None = None
+    for model_type, weight in weights.items():
+        pct = preds[model_type].groupby(group).rank(pct=True, method="average")
+        term = weight * pct
+        blend = term if blend is None else blend.add(term)
+    if blend is None:
+        raise ValueError("ensemble weights must not be empty")
+    return blend
+
+
+def _validate_algorithm_ensemble_config(
+    algorithm_ensemble_models: Any,
+    algorithm_ensemble_config: Any,
+) -> dict[str, float]:
+    """연구 번들의 algorithm 앙상블 설정을 fail-closed 로 검증합니다.
+
+    ``weights`` 는 비어 있지 않은 convex 매핑(각 원소 [0, 1] 이고 합이 1)이어야
+    하고, model key 는 지원 family 중 하나여야 하며 ``algorithm_ensemble_models``
+    의 key 와 정확히 일치해야 합니다. 검증된 float weights dict 를 반환합니다.
+    """
+    weights = algorithm_ensemble_config.get("weights")
+    if not isinstance(weights, dict) or not weights:
+        raise ValueError("algorithm_ensemble_config.weights must be a non-empty mapping")
+    if not isinstance(algorithm_ensemble_models, dict) or not algorithm_ensemble_models:
+        raise ValueError(
+            "algorithm_ensemble_config requires a non-empty algorithm_ensemble_models"
+        )
+    if set(weights) != set(algorithm_ensemble_models):
+        raise ValueError(
+            "algorithm_ensemble_models keys must exactly match "
+            "algorithm_ensemble_config.weights keys"
+        )
+    total = 0.0
+    for model_type, weight in weights.items():
+        if model_type not in _ALGORITHM_MODEL_TYPES:
+            raise ValueError(
+                "algorithm_ensemble_config.weights key must be one of "
+                f"{list(_ALGORITHM_MODEL_TYPES)}, got {model_type!r}"
+            )
+        if not isinstance(weight, (int, float)) or not 0.0 <= weight <= 1.0:
+            raise ValueError(
+                f"algorithm_ensemble_config.weights[{model_type!r}] must be within [0, 1], "
+                f"got {weight!r}"
+            )
+        total += float(weight)
+    if not np.isclose(total, 1.0, atol=1e-9):
+        raise ValueError(f"algorithm_ensemble_config.weights must sum to 1, got {total}")
+    return {model_type: float(weight) for model_type, weight in weights.items()}
 
 
 def calculate_utility_score(
@@ -281,6 +358,11 @@ def _train_inline_bundle(
     calibration_diagnostics: list[dict[str, Any]] | None = None,
     recent_return_model: Any | None = None,
     recency_ensemble_config: dict[str, Any] | None = None,
+    algorithm_ensemble_models: dict[str, Any] | None = None,
+    algorithm_ensemble_config: dict[str, Any] | None = None,
+    *,
+    feature_selection_config: FeatureSelectionConfig | None = None,
+    catalog_metadata: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """타깃이 포함된 데이터로 즉시 학습 가능한 기본 모델 번들을 구성합니다.
 
@@ -295,13 +377,26 @@ def _train_inline_bundle(
     문자열/범주형 컬럼(``market_type``, ``theme_sector``, ``chart_analysis``)은
     Booster 구성 시 ValueError 를 유발하므로 ``feature_cols`` 에서 제외됩니다.
 
-    opt-in 연구 번들: ``recent_return_model``(half-life recent Huber)과
-    ``recency_ensemble_config`` 를 함께 주면 두 return 모델을 영속화하고,
-    decision-time 그룹 단위 rank blend 를 재현하도록 ``decision_score_config``
-    (v1 reranker) 를 함께 기록합니다. 두 인자는 항상 함께 주어야 하며,
-    ``recency_ensemble_config`` 의 ``half_life_groups``(252/504)와
-    ``recent_weight``([0, 1]) 를 검증합니다.
+    opt-in 연구 번들:
+    - recency: ``recent_return_model``(half-life recent Huber)과
+      ``recency_ensemble_config`` 를 함께 주면 두 return 모델을 영속화하고,
+      decision-time 그룹 단위 rank blend 를 재현하도록 ``decision_score_config``
+      (v1 reranker) 를 함께 기록합니다.
+    - algorithm: ``algorithm_ensemble_models``(결정적 numeric-only return 추정기
+      매핑)과 ``algorithm_ensemble_config``(convex ``weights``)를 함께 주면
+      추정기 매핑과 설정을 영속화하고 동일한 rank blend 를 재현합니다.
+      recency/algorithm 설정은 동시에 활성화할 수 없습니다 (서로 다른 앙상블
+      차원을 겹치지 않게 하기 위한 별도 실험 전제).
     """
+    if recency_ensemble_config is not None and algorithm_ensemble_config is not None:
+        raise ValueError(
+            "recency_ensemble_config and algorithm_ensemble_config cannot be combined"
+        )
+    if algorithm_ensemble_config is not None and algorithm_ensemble_models is None:
+        raise ValueError(
+            "algorithm research bundle requires both algorithm_ensemble_models and "
+            "algorithm_ensemble_config"
+        )
     if recency_ensemble_config is not None and recent_return_model is None:
         raise ValueError(
             "recency research bundle requires both recent_return_model and "
@@ -319,9 +414,25 @@ def _train_inline_bundle(
                 f"recency_ensemble_config.recent_weight must be within [0, 1], "
                 f"got {recent_weight!r}"
             )
+    if algorithm_ensemble_config is not None:
+        algorithm_ensemble_config = {
+            **algorithm_ensemble_config,
+            "weights": _validate_algorithm_ensemble_config(
+                algorithm_ensemble_models, algorithm_ensemble_config
+            ),
+        }
     feature_cols = [col for col in feature_cols if col not in _CATEGORICAL_FEATURE_COLS]
     if not feature_cols:
         raise ValueError("feature_cols is empty after excluding categorical columns")
+
+    selection_payload: dict[str, Any] = {}
+    selection_config: FeatureSelectionConfig | None = None
+    if feature_selection_config is not None:
+        selector = FoldLocalFeatureSelector(feature_selection_config)
+        selection_result = selector.select(df, list(feature_cols), target_col, group_col)
+        feature_cols = selection_result.selected_feature_cols
+        selection_payload = serialize_selection_result(selection_result)
+        selection_config = feature_selection_config
 
     train = df.sort_values(group_col)
     y = train[target_col].to_numpy(dtype=np.float64)
@@ -352,7 +463,7 @@ def _train_inline_bundle(
         ),
     }
 
-    manifest = build_feature_manifest(list(feature_cols))
+    manifest = build_feature_manifest(list(feature_cols), catalog_metadata=catalog_metadata)
     training_cutoff = str(train[group_col].max())
     policy_params: dict[str, Any] = {
         "grade_multipliers": dict(_GRADE_MULTIPLIERS),
@@ -378,6 +489,27 @@ def _train_inline_bundle(
         "quantile_models": quantile_models,
         "calibrators": calibrators,
     }
+    if df.attrs.get("catalog_version"):
+        bundle["catalog_version"] = str(df.attrs["catalog_version"])
+    if df.attrs.get("catalog_hash"):
+        bundle["catalog_hash"] = str(df.attrs["catalog_hash"])
+    if selection_config is not None:
+        bundle["feature_selection_version"] = FEATURE_SELECTION_VERSION
+        bundle["feature_selection_config"] = {
+            "n_inner_splits": selection_config.n_inner_splits,
+            "purge_gap": selection_config.purge_gap,
+            "retain_count": selection_config.retain_count,
+            "min_retain": selection_config.min_retain,
+            "max_retain": selection_config.max_retain,
+            "min_candidates": selection_config.min_candidates,
+            "max_candidates": selection_config.max_candidates,
+            "random_state": selection_config.random_state,
+        }
+        bundle["selected_feature_cols"] = list(selection_payload["selected_feature_cols"])
+        bundle["candidate_count"] = int(selection_payload["candidate_count"])
+        bundle["eligible_count"] = int(selection_payload["eligible_count"])
+        bundle["retained_count"] = int(selection_payload["retained_count"])
+        bundle["feature_support_summary"] = selection_payload["support_summary"]
     if recent_return_model is not None:
         if recency_ensemble_config is None:
             raise ValueError(
@@ -391,6 +523,22 @@ def _train_inline_bundle(
             "rank_weight": 1.0,
             "p_good_weight": float(
                 recency_ensemble_config.get("probability_weight", 0.5)
+            ),
+            "score_col": "decision_score",
+        }
+    if algorithm_ensemble_models is not None:
+        if algorithm_ensemble_config is None:
+            raise ValueError(
+                "algorithm research bundle requires both algorithm_ensemble_models and "
+                "algorithm_ensemble_config"
+            )
+        bundle["algorithm_ensemble_models"] = dict(algorithm_ensemble_models)
+        bundle["algorithm_ensemble_config"] = dict(algorithm_ensemble_config)
+        bundle["decision_score_config"] = {
+            "version": "close-morning-reranker-v1",
+            "rank_weight": 1.0,
+            "p_good_weight": float(
+                algorithm_ensemble_config.get("probability_weight", 0.5)
             ),
             "score_col": "decision_score",
         }
@@ -410,7 +558,31 @@ def _predict_from_bundle(
     # return_model 이 없는 기존 번들은 rank_model 로 폴백합니다.
     return_model = models_bundle.get("return_model")
     recency_config = models_bundle.get("recency_ensemble_config")
-    if recency_config is not None:
+    algorithm_config = models_bundle.get("algorithm_ensemble_config")
+    if algorithm_config is not None and recency_config is not None:
+        raise ValueError(
+            "recency_ensemble_config and algorithm_ensemble_config cannot be combined"
+        )
+    if algorithm_config is not None:
+        algorithm_models = models_bundle.get("algorithm_ensemble_models")
+        if algorithm_models is None:
+            raise ValueError(
+                "algorithm_ensemble_config requires a non-empty algorithm_ensemble_models"
+            )
+        weights = _validate_algorithm_ensemble_config(algorithm_models, algorithm_config)
+        bundle_group_col = models_bundle.get("group_col")
+        if bundle_group_col is None or bundle_group_col not in out.columns:
+            raise ValueError(
+                "algorithm ensemble research bundle requires a group_col present in df"
+            )
+        preds = {
+            model_type: pd.Series(algorithm_models[model_type].predict(features), index=df.index)
+            for model_type in weights
+        }
+        out["rank_score"] = _convex_rank_blend(preds, out[bundle_group_col], weights)
+        for model_type, pred_series in preds.items():
+            out[f"pred_{model_type}"] = pred_series
+    elif recency_config is not None:
         recent_return_model = models_bundle.get("recent_return_model")
         if return_model is None or recent_return_model is None:
             raise ValueError(
@@ -435,9 +607,11 @@ def _predict_from_bundle(
             )
         expanding_pred = pd.Series(return_model.predict(features), index=df.index)
         recent_pred = pd.Series(recent_return_model.predict(features), index=df.index)
-        expanding_pct = expanding_pred.groupby(out[bundle_group_col]).rank(pct=True, method="average")
-        recent_pct = recent_pred.groupby(out[bundle_group_col]).rank(pct=True, method="average")
-        out["rank_score"] = (1.0 - recent_weight) * expanding_pct + recent_weight * recent_pct
+        out["rank_score"] = _convex_rank_blend(
+            {"expanding": expanding_pred, "recent": recent_pred},
+            out[bundle_group_col],
+            {"expanding": 1.0 - recent_weight, "recent": recent_weight},
+        )
         out["pred_expanding"] = expanding_pred
         out["pred_recent"] = recent_pred
     elif return_model is not None:
