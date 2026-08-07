@@ -87,3 +87,21 @@ def test_build_feature_manifest_panel_scope_is_candidate() -> None:
 def test_build_feature_manifest_requires_list_input() -> None:
     with pytest.raises(TypeError, match="not a string"):
         build_feature_manifest("change_rate")  # type: ignore[arg-type]
+
+
+def test_build_feature_manifest_history_catalogue_overrides() -> None:
+    """카탈로그 피처는 prior_eod_available_at_decision_time 규칙과 패널 범위를 영속화합니다."""
+    from src.ml.history_features import catalogue_availability_overrides
+
+    manifest = build_feature_manifest(
+        ["change_rate", "ret_log_1", "rank_ret_0"],
+        catalogue=catalogue_availability_overrides(),
+    )
+    rows = manifest.set_index("feature_name")
+    assert rows.loc["ret_log_1", "availability_rule"] == "prior_eod_available_at_decision_time"
+    assert rows.loc["ret_log_1", "source_column"] == "close"
+    assert rows.loc["ret_log_1", "panel_scope"] == "history_temporal_panel"
+    assert rows.loc["rank_ret_0", "panel_scope"] == "decision_candidate_panel"
+    # 카탈로그에 없는 기존 trade-log 피처는 기존 규칙을 유지합니다.
+    assert rows.loc["change_rate", "availability_rule"] == "at_decision_time"
+    assert rows.loc["change_rate", "source_column"] == "change_rate"
