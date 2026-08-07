@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import aiohttp
 import pandas as pd
 
 from src.api.kis_client import KisApiClient
+
+logger = logging.getLogger(__name__)
 
 
 def _clean_num(v: Any) -> float | None:
@@ -44,6 +48,7 @@ async def _request_investor_daily_async(
     code: str,
     trade_date: str,
     client: KisApiClient,
+    request_slot: Callable[[], Awaitable[None]] | None = None,
 ) -> dict:
     """비동기 KIS API 호출 헬퍼"""
     url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
@@ -55,6 +60,8 @@ async def _request_investor_daily_async(
         "FID_ETC_CLS_CODE": "",
     }
     # KisApiClient의 공통 요청 핸들러 사용
+    if request_slot is not None:
+        await request_slot()
     return await client._handle_request(
         session.get, url, headers=client._get_headers("FHPTJ04160001"), params=params
     )
@@ -69,6 +76,8 @@ async def get_investor_trade_daily_async(
     *,
     target_dates: list[str] | None = None,
     max_calls: int = 120,
+    request_slot: Callable[[], Awaitable[None]] | None = None,
+    max_consecutive_failures: int = 3,
 ) -> pd.DataFrame:
     """비동기 버전: KIS API를 통해 종목별 투자자 일별 거래 정보를 가져옵니다."""
     code = str(code).strip().zfill(6)
@@ -87,19 +96,36 @@ async def get_investor_trade_daily_async(
     seen_days = set()
     cursor = end
     no_progress = 0
+    failures = 0
 
     for _ in range(max(1, int(max_calls))):
         if cursor < start:
             break
         try:
-            body = await _request_investor_daily_async(session, code, cursor, client)
-        except Exception:
+            body = await _request_investor_daily_async(session, code, cursor, client, request_slot)
+        except Exception as exc:
+            failures += 1
+            logger.warning(
+                "[DATA] stage=investor_flow symbol=%s cursor=%s status=REQUEST_FAIL failures=%d error=%s",
+                code, cursor, failures, type(exc).__name__,
+            )
+            if failures >= max(1, int(max_consecutive_failures)):
+                break
             cursor = _prev_day_ymd(cursor, 1)
             continue
 
         if body.get("rt_cd") != "0":
+            failures += 1
+            logger.warning(
+                "[DATA] stage=investor_flow symbol=%s cursor=%s status=API_FAIL failures=%d msg=%s",
+                code, cursor, failures, body.get("msg1", ""),
+            )
+            if failures >= max(1, int(max_consecutive_failures)):
+                break
             cursor = _prev_day_ymd(cursor, 1)
             continue
+
+        failures = 0
 
         rows = _collect_rows(body)
         row_days = {str(item.get("stck_bsop_date") or "").strip() for item in rows if isinstance(item, dict)}
@@ -141,8 +167,8 @@ async def get_investor_trade_daily_async(
         if not (start <= d <= end):
             continue
 
-        foreign = _clean_num(item.get("frgn_ntby_tr_pbmn")) or _clean_num(item.get("frgn_ntby_qty"))
-        inst = _clean_num(item.get("orgn_ntby_tr_pbmn")) or _clean_num(item.get("orgn_ntby_qty"))
+        foreign = _clean_num(item.get("frgn_ntby_tr_pbmn"))
+        inst = _clean_num(item.get("orgn_ntby_tr_pbmn"))
 
         out_rows.append(
             {

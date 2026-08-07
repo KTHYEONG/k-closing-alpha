@@ -1,99 +1,192 @@
 {
-  "src/api/kis_client.py": {
-    "testing": "tests/unit/api/test_kis_client.py"
+  "src/api/kis/client.py": {
+    "testing": "tests/unit/test_facade_imports.py"
   },
-  "src/backfill/backfill_price.py": {},
+  "src/api/kis/indicators.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/api/kis/rate_limit.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/api/kis_client.py": {
+    "testing": [
+      "tests/unit/api/kis/test_kis_client.py",
+      "tests/unit/api/kis/test_kis_client_helpers.py",
+      "tests/unit/api/kis/test_kis_rate_limiter.py",
+      "tests/unit/api/kis/test_ohlcv_prefetch.py"
+    ]
+  },
+  "src/backfill/backfill_condition_history.py": {
+    "testing": "tests/unit/backfill/test_backfill_condition_history.py"
+  },
+  "src/backfill/backfill_price.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
   "src/backfill/backfill_regime.py": {},
   "src/backfill/backfill_sheet.py": {},
-  "src/backfill/fix_scale.py": {},
-  "src/backfill/run_sheet_backfill.py": {},
-  "src/daily/archive_condition.py": {},
-  "src/daily/collect_data.py": {},
-  "src/daily/predict_position.py": {
-    "testing": "tests/unit/daily/test_predict_position.py"
+  "src/backfill/fix_scale.py": {
+    "testing": "tests/unit/backfill/test_fix_scale.py"
   },
-  "src/data/data_loader.py": {},
+  "src/backfill/price/config.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/backfill/price/factors.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/backfill/price/normalize.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/backfill/price/runner.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/backfill/price/sources.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/backfill/price/universe.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/backfill/run_sheet_backfill.py": {},
+  "src/config/base.py": {
+    "testing": "tests/unit/config/test_base.py"
+  },
+  "src/config/gsheet.py": {
+    "testing": "tests/unit/config/test_gsheet.py"
+  },
+  "src/config/kis.py": {
+    "testing": "tests/unit/config/test_kis.py"
+  },
+  "src/config/trading.py": {
+    "testing": "tests/unit/config/test_trading.py"
+  },
+  "src/daily/archive.py": {
+    "testing": "tests/unit/daily/test_archive.py"
+  },
+  "src/daily/collect.py": {
+    "testing": "tests/unit/daily/test_collect.py"
+  },
+  "src/daily/model_bundle_service.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/daily/predict.py": {
+    "testing": "tests/unit/daily/test_predict.py"
+  },
+  "src/daily/prediction_service.py": {
+    "testing": "tests/unit/daily/test_prediction_service.py"
+  },
+  "src/data/data_loader.py": {
+    "testing": "tests/unit/data/test_db_loader.py"
+  },
   "src/data/db_loader.py": {
-    "testing": "tests/unit/test_db_loader.py"
+    "testing": "tests/unit/data/test_db_loader.py"
   },
   "src/data/gsheet_loader.py": {
-    "testing": "tests/unit/test_gsheet_loader.py"
+    "testing": "tests/unit/data/test_gsheet_loader.py"
   },
   "src/data/parquet_loader.py": {
-    "testing": "tests/test_parquet_loader.py"
+    "testing": "tests/unit/data/test_parquet_loader.py"
   },
   "src/data/sync_sheet_db.py": {},
-  "src/processing/preprocessor.py": {
-    "testing": [
-      "tests/test_preprocessor.py",
-      "tests/unit/processing/test_preprocessor.py"
-    ],
-    "architecture": "docs/results/ml-v3.md"
+  "src/ml/backtest_evaluator.py": {
+    "testing": "tests/unit/ml/test_backtest_evaluator.py"
   },
-  "src/processing/legacy_mapping.py": {
-    "testing": "tests/test_preprocessor.py"
+  "src/ml/feature_manifest.py": {
+    "testing": "tests/unit/ml/test_feature_manifest.py"
+  },
+  "src/ml/feature_selection.py": {
+    "testing": "tests/unit/ml/test_feature_selection.py"
+  },
+  "src/ml/model_pipeline.py": {
+    "testing": "tests/unit/ml/test_model_pipeline.py"
+  },
+  "src/ml/model_registry.py": {
+    "testing": "tests/unit/ml/test_model_registry.py"
+  },
+  "src/ml/purged_cv.py": {
+    "testing": "tests/unit/ml/test_purged_cv.py"
+  },
+  "src/ml/quantile_model.py": {
+    "testing": "tests/unit/ml/test_quantile_model.py"
+  },
+  "src/ml/scenario_action_panel.py": {
+    "testing": "tests/unit/ml/test_scenario_action_panel.py"
+  },
+  "src/ml/single_stock_policy.py": {
+    "testing": "tests/unit/ml/test_single_stock_policy.py"
+  },
+  "src/ml/sizing_engine.py": {
+    "testing": "tests/unit/ml/test_sizing_engine.py"
+  },
+  "src/ml/training/ensemble_execution.py": {
+    "testing": [
+      "tests/unit/ml/test_ensemble_execution.py",
+      "tests/unit/ml/test_model_pipeline.py"
+    ]
+  },
+  "src/ml/training/experiments.py": {
+    "testing": [
+      "tests/unit/ml/test_model_pipeline.py",
+      "tests/unit/test_facade_imports.py"
+    ]
+  },
+  "src/ml/training/fitting.py": {
+    "testing": [
+      "tests/unit/ml/test_model_pipeline.py",
+      "tests/unit/ml/test_sizing_engine.py",
+      "tests/unit/test_facade_imports.py"
+    ]
+  },
+  "src/ml/training/pipelines.py": {
+    "testing": [
+      "tests/unit/ml/test_feature_selection.py",
+      "tests/unit/test_facade_imports.py"
+    ]
+  },
+  "src/ml/training/policy_calibration.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/ml/training/validation.py": {
+    "testing": [
+      "tests/unit/ml/test_ensemble_execution.py",
+      "tests/unit/test_facade_imports.py"
+    ]
+  },
+  "src/processing/feature_catalog.py": {
+    "testing": "tests/unit/processing/test_feature_catalog.py"
+  },
+  "src/processing/preprocessor.py": {
+    "testing": "tests/unit/processing/test_preprocessor.py"
   },
   "src/processing/scale_corrector.py": {
-    "testing": "tests/unit/test_scale_corrector.py"
+    "testing": "tests/unit/processing/test_scale_corrector.py"
+  },
+  "src/processing/schema.py": {
+    "testing": "tests/unit/processing/test_schema.py"
   },
   "src/settings.py": {
-    "testing": "tests/unit/test_settings.py"
+    "testing": [
+      "tests/unit/config/test_settings_compat.py",
+      "tests/unit/data/test_parquet_loader.py"
+    ]
   },
   "src/sync/fetcher_investor.py": {},
   "src/sync/fetcher_program.py": {},
   "src/sync/foreign.py": {
-    "testing": "tests/integration/test_sync_pipeline.py"
+    "testing": "tests/integration/sync/test_sync_pipeline.py"
   },
   "src/sync/program.py": {
-    "testing": "tests/integration/test_sync_pipeline.py"
+    "testing": "tests/integration/sync/test_sync_pipeline.py"
   },
   "src/sync/sheet_helpers.py": {},
   "src/sync/vmarket.py": {},
   "src/sync/volume.py": {},
   "src/tools/migrate_sqlite_to_parquet.py": {},
-  "src/utils/db_to_xlsx.py": {},
   "src/utils/display.py": {
-    "testing": "tests/unit/test_display.py"
+    "testing": "tests/unit/utils/test_display.py"
   },
-  "src/ml/model_pipeline.py": {
-    "testing": "tests/unit/ml/test_model_pipeline.py",
-    "architecture": "docs/results/ml-v6.md"
+  "src/utils/export_archive.py": {
+    "testing": "tests/unit/utils/test_export_spreadsheet.py"
   },
-  "src/ml/backtest_evaluator.py": {
-    "testing": [
-      "tests/unit/ml/test_backtest_evaluator.py",
-      "tests/unit/ml/test_sizing_engine.py"
-    ],
-    "architecture": "docs/results/ml-v7.md"
-  },
-  "src/ml/sizing_engine.py": {
-    "testing": "tests/unit/ml/test_sizing_engine.py",
-    "architecture": "docs/results/ml-v8.md"
-  },
-  "src/config/base.py": {
-    "testing": "tests/unit/config/test_base.py"
-  },
-  "src/daily/collect.py": {
-    "testing": "tests/unit/daily/test_collect.py"
-  },
-  "src/daily/archive.py": {
-    "testing": "tests/unit/daily/test_archive.py"
-  },
-  "src/daily/predict.py": {
-    "testing": "tests/unit/daily/test_predict.py"
-  },
-  "src/utils/export_archive.py": {},
-  "src/backfill/backfill_condition_history.py": {
-    "testing": "tests/unit/backfill/test_backfill_condition_history.py"
-  },
-  "src/processing/schema.py": {
-    "testing": "tests/unit/processing/test_schema.py"
-  },
-  "src/ml/scenario_action_panel.py": {
-    "architecture": "docs/results/ml-v2.md",
-    "testing": "tests/unit/ml/test_scenario_action_panel.py"
-  },
-  "src/ml/single_stock_policy.py": {
-    "testing": "tests/unit/ml/test_single_stock_policy.py"
+  "src/backfill/kis_flow_backfill.py": {
+    "testing": "tests/unit/backfill/test_kis_flow_backfill.py"
   }
 }

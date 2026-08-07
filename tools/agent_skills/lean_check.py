@@ -101,7 +101,7 @@ def _find_test_files(py_files: list[str]) -> list[str]:
 
 
 @functools.cache
-def _repository_test_files() -> list[str]:
+def _repository_test_files() -> tuple[str, ...]:
     """Return test modules in deterministic order for semantic source matching.
 
     Cached: the walk spans the whole ``tests/`` tree and is unchanged within a
@@ -115,11 +115,11 @@ def _repository_test_files() -> list[str]:
             for filename in sorted(files)
             if filename.startswith("test_") and filename.endswith(".py")
         )
-    return sorted(test_files)
+    return tuple(sorted(test_files))
 
 
 @functools.cache
-def _load_test_ast(test_file: str) -> ast.AST | None:
+def _load_test_ast(test_file: str) -> ast.Module | None:
     """Parse a test file exactly once; repeated (source, test) checks reuse the tree."""
     try:
         with open(test_file, encoding="utf-8") as handle:
@@ -153,6 +153,7 @@ def _imported_source_modules(test_file: str) -> frozenset[str]:
     return frozenset(modules)
 
 
+@functools.cache
 def _test_references_source(test_file: str, source_file: str) -> bool:
     """Match tests by imported source symbol when filenames are feature-oriented.
 
@@ -529,6 +530,27 @@ def _execute_assertions(
     return diags
 
 
+@functools.lru_cache(maxsize=1)
+def _get_src_files_contents() -> tuple[tuple[str, str], ...]:
+    """Cache all python files under src/ and their contents once per process.
+
+    Eliminates redundant disk I/O when checking for orphaned implementations.
+    """
+    results: list[tuple[str, str]] = []
+    if os.path.exists("src"):
+        for root, dirs, files in os.walk("src"):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            for fn_name in files:
+                if fn_name.endswith(".py"):
+                    fp = os.path.join(root, fn_name)
+                    try:
+                        with open(fp, encoding="utf-8", errors="ignore") as f:
+                            results.append((fp, f.read()))
+                    except OSError:
+                        continue
+    return tuple(results)
+
+
 def _check_orphaned_implementations(fh: str, kind: str, name: str) -> list[JsonDiag]:
     """A function/class that only appears in its own def line and in tests/
     is dead in production -- it compiles, may even be unit-tested, and does
@@ -548,21 +570,10 @@ def _check_orphaned_implementations(fh: str, kind: str, name: str) -> list[JsonD
     ref_pat = re.compile(rf"\b{re.escape(leaf)}\b")
     def_pat = re.compile(rf"^\s*(?:def|class)\s+{re.escape(leaf)}\b")
     found_caller = False
-    for root, dirs, files in os.walk("src"):
-        dirs[:] = [d for d in dirs if d != "__pycache__"]
-        for fn_name in files:
-            if not fn_name.endswith(".py"):
-                continue
-            fp = os.path.join(root, fn_name)
-            try:
-                with open(fp, encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        if ref_pat.search(line) and not def_pat.match(line):
-                            found_caller = True
-                            break
-            except OSError:
-                continue
-            if found_caller:
+    for _fp, content in _get_src_files_contents():
+        for line in content.splitlines():
+            if ref_pat.search(line) and not def_pat.match(line):
+                found_caller = True
                 break
         if found_caller:
             break
@@ -573,6 +584,23 @@ def _check_orphaned_implementations(fh: str, kind: str, name: str) -> list[JsonD
         "error": f"Spec: {kind} '{name}' has no callers in src/ outside its own definition (orphaned implementation)",
         "fix_hint": f"Wire {name} into its caller per the spec's wiring plan -- it currently does nothing in production",
     }]
+
+
+@functools.lru_cache(maxsize=1)
+def _get_tests_files_contents() -> tuple[tuple[str, str], ...]:
+    """Cache all test files and their contents once per process."""
+    results: list[tuple[str, str]] = []
+    if os.path.exists("tests"):
+        for root, _dirs, fnames in os.walk("tests"):
+            for fn in fnames:
+                if fn.endswith(".py"):
+                    fp = os.path.join(root, fn)
+                    try:
+                        with open(fp, encoding="utf-8", errors="ignore") as f:
+                            results.append((fp, f.read()))
+                    except OSError:
+                        continue
+    return tuple(results)
 
 
 def _execute_python_assertion(fh: str, name: str, assertion_code: str) -> list[JsonDiag]:
@@ -618,9 +646,12 @@ def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = list(contract.get("contracts", []))
     for change in contract.get("changes", []):
         symbol = change.get("symbol", "")
+        # An explicit ``kind`` (e.g. ``"field"`` for an uppercase module-level
+        # constant like a profile-id) overrides the case-based default, matching
+        # the ``contracts`` schema which already passes ``kind`` through.
         entries.append({
             "file_hint": _repo_relative(change.get("target_file", "")),
-            "kind": "class" if symbol and symbol[0].isupper() else "function",
+            "kind": change.get("kind") or ("class" if symbol and symbol[0].isupper() else "function"),
             "name": symbol,
             "assertions": [],
             "python_assertion": change.get("python_assertion", ""),
@@ -629,7 +660,7 @@ def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
         symbol = contract["symbol"]
         entries.append({
             "file_hint": _repo_relative(contract.get("target_file", "")),
-            "kind": "class" if symbol and symbol[0].isupper() else "function",
+            "kind": contract.get("kind") or ("class" if symbol and symbol[0].isupper() else "function"),
             "name": symbol,
             "assertions": [],
             "python_assertion": contract.get("python_assertion", ""),
@@ -746,16 +777,9 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
                 content = tf.read()
             found = bool(ref_pattern.search(content)) or bool(test_def_pattern.search(content))
         if not found:
-            for root, _dirs, fnames in os.walk("tests"):
-                for fn in fnames:
-                    if not fn.endswith(".py"):
-                        continue
-                    with open(os.path.join(root, fn), encoding="utf-8") as tf:
-                        content = tf.read()
-                        if bool(ref_pattern.search(content)) or test_def_pattern.search(content):
-                            found = True
-                            break
-                if found:
+            for _fp, content in _get_tests_files_contents():
+                if bool(ref_pattern.search(content)) or test_def_pattern.search(content):
+                    found = True
                     break
         if not found:
             fix_hint = f"Write a test referencing {test_name} in {target_test_file}" if target_test_file else f"Write {test_name}"
@@ -851,6 +875,14 @@ def main() -> None:
         "--deselect", nargs="*", default=[],
         help="Pytest node ids to deselect (use for pre-existing baseline failures "
              "confirmed via git-stash reproduction, never for failures introduced this session)",
+    )
+    parser.add_argument(
+        "--pytest-timeout",
+        type=int,
+        default=None,
+        help="Seconds to allow the pytest+coverage step (default: auto-scaled by "
+        "test-file count, floor 300s, cap 1200s). Explicitly raising this is the "
+        "right move for heavy orchestrator test files that exceed the default.",
     )
     args = parser.parse_args()
 
@@ -968,18 +1000,46 @@ def main() -> None:
         print(_emit_json("PASS", "all", [], None), file=sys.stderr)
         return
 
-    # Collect at package scope. Leaf-module coverage targets can import a
-    # package before pytest's conftest, which is unsafe for native dependencies
-    # such as NumPy. The report still contains every source file, so the
-    # per-file and changed-line checks below remain effective.
-    cov_args = ["--cov=src"]
+    # Measure coverage only on the changed source files, never the whole src
+    # tree: tracing every module roughly doubles pytest time for a single-file
+    # change while the per-file gate below only ever inspects changed files.
+    # (pytest-cov accumulates repeated --cov sources, so one flag per file is
+    # correct; report keys match `_coverage_entry`'s path spellings.)
+    cov_args = []
+    if source_files:
+        # Dotted module names, never ".py"-suffixed paths: coverage treats a
+        # value ending in ".py" as a literal module literally named "...backtest.py"
+        # (never imported), which silently reports 0%. Modules are importable via
+        # the project's pythonpath and coverage reports them under their real path.
+        cov_args = [
+            (
+                f"--cov={sf[:-3].replace('/', '.')}"
+                if sf.endswith(".py")
+                else f"--cov={sf}"
+            )
+            for sf in source_files
+        ]
+    report_args = ["--cov-report=term-missing"] if cov_args else []
 
     deselect_args = [f"--deselect={node}" for node in args.deselect]
-    core_cmd = ["uv", "run", "pytest", *cov_args, *test_files, *deselect_args, "-q", "--tb=line", "--cov-report=term-missing"]
+    core_cmd = [
+        "uv",
+        "run",
+        "pytest",
+        *cov_args,
+        "-m",
+        "not slow",
+        *test_files,
+        *deselect_args,
+        "-q",
+        "--tb=line",
+        *report_args,
+    ]
     # The growth evaluator's sealed integration fixtures exercise real rolling
     # windows and reliability gates.  Package-wide coverage tracing can exceed
     # the former three-minute limit even when the test command itself passes.
-    pt_res = run_cmd(core_cmd, timeout=300)
+    pytest_timeout = args.pytest_timeout or max(300, min(1200, 240 * len(test_files)))
+    pt_res = run_cmd(core_cmd, timeout=pytest_timeout)
 
     cov_val: int | None = None
     missing_infos: list[str] = []
@@ -1036,7 +1096,11 @@ def main() -> None:
                             "file": sf,
                             "line": 0,
                             "error": f"Coverage target violation (Modified File): changed lines {sorted(uncovered_changed)} are not covered by tests",
-                            "fix_hint": f"Add test cases targeting the modified lines in {sf}: {sorted(uncovered_changed)}",
+                            "fix_hint": (
+                                f"Add fast unit tests targeting the modified lines in {sf}: "
+                                f"{sorted(uncovered_changed)} (the audit runs `-m 'not slow'`; "
+                                f"slow integration tests are excluded by design)"
+                            ),
                         }
                         coverage_violations.append(d)
 
@@ -1058,9 +1122,18 @@ def main() -> None:
         print(_emit_json("PASS", "all", [], cov_val), file=sys.stderr)
     else:
         last_err = [
-            line for line in pt_res.stdout.splitlines() if any(x in line for x in ("FAIL", "Error", "AssertionError"))
+            line
+            for line in (pt_res.stdout or "").splitlines()
+            if any(x in line for x in ("FAIL", "Error", "AssertionError"))
         ]
-        cause = last_err[-1] if last_err else "Check pytest output."
+        # A subprocess timeout (returncode 124) puts its explanation on stderr,
+        # not stdout -- surface it so a killed run is never misreported as an
+        # assertion failure.
+        cause = (
+            last_err[-1]
+            if last_err
+            else (pt_res.stderr or "Check pytest output.").strip()
+        )
         d = {"file": "", "line": 0, "error": cause, "fix_hint": "Fix failing assertions in tests"}
         _fail_exit("pytest", f"FAIL | Pytest Failed: {cause}", d)
 
