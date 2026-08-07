@@ -47,14 +47,22 @@ Frontier reasoning model protocol for specification engineering and architecture
    - If spec-only validation fails due to invalid target file paths or non-existent caller anchors, fix `contract.json` before completing the `/spec` phase.
 
 
-## Output
+## Output & Chat Notification Directives
 
-Provide a clear, concise summary with emojis. Example:
+Keep the chat response extremely concise (max 4-5 bullet points total, under 80 tokens).
+NEVER dump detailed failure histories, nested function signatures, or multi-paragraph background analyses into the chat window. All deep rationale MUST reside strictly inside `docs/specs/<feature>.md`.
+
+### Format Rule:
+- **Goal**: 1-line core objective.
+- **Diagnosis**: 1-line root cause in `[Component] -> [Bottleneck]` format.
+- **Solution**: 1-line key architectural action.
+- **Artifacts**: Clickable markdown links to the spec and contract files.
 
 ### 📐 [SPEC] <Task Title>
 
-- **Goal**: <Core objective>
-- **Diagnosis**: `[Component]` -> `[Failure Cause]`
+- **Goal**: <Core objective in 1 line>
+- **Diagnosis**: `[Component]` -> `<Short bottleneck description in 1 line>`
+- **Solution**: `<Key architecture change>` (Success: `<1-line verification criteria>`)
 - **Artifacts**:
   - 📄 Specification: [`<feature>.md`](file:///docs/specs/<feature>.md)
   - ⚙️ Contract: [`<feature>_contract.json`](file:///docs/specs/<feature>_contract.json)
