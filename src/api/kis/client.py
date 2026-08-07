@@ -123,9 +123,9 @@ class KisApiClient:
         self._market_div_cache[code] = "J"
         return "J"
 
-    async def ensure_token(self, session: aiohttp.ClientSession):
+    async def ensure_token(self, session: aiohttp.ClientSession, force_refresh: bool = False):
         """토큰 유효성을 확인하고 필요시 갱신합니다."""
-        if os.path.exists(self.token_file):
+        if not force_refresh and os.path.exists(self.token_file):
             try:
                 with open(self.token_file, encoding="utf-8") as f:
                     saved_data = json.load(f)
@@ -182,20 +182,37 @@ class KisApiClient:
         }
 
     async def _handle_request(self, session_method, url, **kwargs):
-        """재시도 로직을 포함한 공통 요청 처리 (네트워크 에러 처리 강화)"""
+        """재시도 로직을 포함한 공통 요청 처리 (네트워크 및 토큰 재발급 에러 처리 강화)"""
         import aiohttp
         
+        session = getattr(session_method, "__self__", None)
         await self.rate_limiter.acquire()
         for attempt in range(5):
             try:
+                # 최신 토큰으로 headers의 authorization 동기화
+                if "headers" in kwargs and isinstance(kwargs["headers"], dict):
+                    kwargs["headers"]["authorization"] = f"Bearer {self.token}"
+
                 async with session_method(url, **kwargs) as resp:
                     if resp.status == 429:  # Too Many Requests
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
 
                     data = await resp.json()
+                    # 토큰 만료/유효하지 않음 에러 자동 재발급 처리
+                    msg_cd = data.get("msg_cd", "")
+                    msg1 = data.get("msg1", "")
+                    if data.get("rt_cd") != "0" and (
+                        msg_cd in ("EGW00121", "EGW00123") or "token" in msg1.lower() or "토큰" in msg1
+                    ):
+                        if session and attempt < 2:
+                            logger.warning("유효하지 않은 토큰 감지 (%s). 토큰 강제 재발급 진행...", msg_cd or msg1)
+                            await self.ensure_token(session, force_refresh=True)
+                            await asyncio.sleep(0.2)
+                            continue
+
                     # KIS 특유의 TPS 초과 메시지 처리
-                    if data.get("rt_cd") != "0" and "초당 거래건수" in data.get("msg1", ""):
+                    if data.get("rt_cd") != "0" and "초당 거래건수" in msg1:
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
                     return data
