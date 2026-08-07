@@ -1,6 +1,56 @@
 {
   "tasks": [
     {
+      "task_id": "kis_flow_backfill",
+      "date": "2026-08-06",
+      "adr_id": "ADR_20260806_kis_flow_backfill",
+      "domain": "backfill",
+      "title": "KIS flow-only historical backfill",
+      "why": "수급 3종 과거 데이터 수집 시 OHLCV 재조회와 장시간 단일 parquet 재작성으로 비효율이 발생함",
+      "resolution": "공용 KIS 세션·전역 rate limiter·flow-only checkpoint parquet·명시적 병합 경로를 추가하고 VKOSPI/VKOSDAQ을 지수 종가 기반으로 계산하도록 보완함",
+      "impact": "수급 과거 백필을 재시작 가능하고 호출 제한을 준수하는 구조로 분리; 원천 가격 parquet은 명시적 apply 전까지 보존"
+    },
+    {
+      "task_id": "TASK_ML_FEATURE_ENGINEERING_EVOLUTION",
+      "date": "2026-08-06",
+      "adr_id": "ADR_20260806_ML_FEATURE_ENGINEERING_EVOLUTION",
+      "domain": "ml",
+      "title": "Causal ML feature catalog and fold-local selection",
+      "why": "The fixed 61-feature pipeline needed a causal expanded candidate catalog and train-window-local importance selection without changing the production candidate.",
+      "resolution": "Implemented causal_expanded_v1 with operational 15:18 sheet features, strict prior-date external history joins, 600-1000 candidate generation, deterministic fold-local LightGBM gain selection, selection-aware bundle/serving metadata, and regression coverage.",
+      "impact": "Adds a research-only feature-engineering path that retains 300-500 selected features, fails closed when historical data is absent, preserves legacy behavior, and prevents outer-validation leakage."
+    },
+    {
+      "task_id": "TASK_ML_FEATURE_ENGINEERING_AVAILABILITY_CONTRACT",
+      "date": "2026-08-06",
+      "adr_id": "ADR_20260806_ML_FEATURE_ENGINEERING_AVAILABILITY_CONTRACT",
+      "domain": "ml",
+      "title": "ML feature availability contract aligned to 15:18 operational sheet capture",
+      "why": "The feature-engineering specification treated same-date OHLC too conservatively despite the operational sheet being captured together around 15:18 before the 15:19-20 entry decision.",
+      "resolution": "Updated the research specification and contract to accept same-date operational-sheet fields without a separate snapshot/timestamp system, while excluding only same-date external EOD/backfill history and execution-derived sell values.",
+      "impact": "Preserves valid intraday signal inputs, keeps future-label leakage barred, and narrows provenance controls to external history joins."
+    },
+    {
+      "task_id": "TASK_ML_ALGORITHM_ENSEMBLE_PERFORMANCE",
+      "date": "2026-08-06",
+      "adr_id": "ADR_20260806_ML_ALGORITHM_ENSEMBLE_PERFORMANCE",
+      "domain": "ml",
+      "title": "ML algorithm-family ensemble prequential runtime optimization",
+      "why": "The full nested four-expert ensemble exceeded the execution budget because inner retraining repeated 120 return-expert fold fits and 25 inner risk OOF runs.",
+      "resolution": "Recorded the real-data prequential_outer_oof run through 2025-12-30 in docs/results/ml-v9.md: 33,678 panel rows, 20 return fits, zero inner refits, three bounded workers, 221.182 seconds, candidate mean 1.5378% versus 1.5316%, PF 2.751 versus 2.740, Sharpe 6.090 versus 6.044, and MDD 29.66% versus 33.94%.",
+      "impact": "The causal research candidate passes the strict research promotion gate while reducing repeated fitting; production remains unchanged pending capture-time provenance, slippage, and untouched paper/live OOS validation."
+    },
+    {
+      "task_id": "src_tests_refactoring",
+      "date": "2026-08-05",
+      "adr_id": "ADR_20260805_src_tests_refactoring",
+      "domain": "architecture",
+      "title": "Source and Test Architecture Refactoring",
+      "why": "Large mixed-responsibility modules and uneven test topology increased maintenance and AI context cost.",
+      "resolution": "Split KIS, daily prediction, ML training, and backfill responsibilities into canonical submodules while preserving legacy facade imports; reorganized tests by bounded context and behavior level.",
+      "impact": "Preserves daily entry points and public contracts, improves discoverability, and keeps regression coverage across 449 tests."
+    },
+    {
       "task_id": "TASK_ML_RECENCY_ADAPTIVE_ENSEMBLE",
       "date": "2026-08-05",
       "adr_id": "ADR_20260805_ML_RECENCY_ADAPTIVE_ENSEMBLE",

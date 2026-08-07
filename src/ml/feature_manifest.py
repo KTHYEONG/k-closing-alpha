@@ -83,15 +83,64 @@ def _feature_unit(feature: str) -> str:
     return "decimal_ratio"
 
 
-def build_feature_manifest(feature_cols: list[str]) -> pd.DataFrame:
+def build_feature_manifest(
+    feature_cols: list[str],
+    catalog_metadata: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """학습/추론 피처 목록에 대한 결정적 매니페스트 DataFrame 을 생성합니다.
+
+    ``catalog_metadata`` 가 주어지면 카탈로그 선언(family/source_columns/
+    lookback_groups/availability_rule)을 기존 필드 위에 추가로 기록하고,
+    카탈로그에 선언되지 않은 생성 컬럼은 fail-closed 로 거부합니다.
 
     Returns:
         컬럼: ``feature_name``, ``source_column``, ``availability_rule``,
-        ``unit``, ``panel_scope`` (순서 고정).
+        ``unit``, ``panel_scope`` (순서 고정). ``catalog_metadata`` 가 주어지면
+        ``family``, ``source_columns``, ``lookback_groups`` 가 뒤에 추가됩니다.
     """
     if isinstance(feature_cols, str):
         raise TypeError("feature_cols must be a list of feature names, not a string")
+
+    if catalog_metadata is not None:
+        required = {
+            "feature_name",
+            "family",
+            "source_columns",
+            "lookback_groups",
+            "availability_rule",
+            "unit",
+            "panel_scope",
+        }
+        if not required.issubset(set(catalog_metadata.columns)):
+            raise ValueError(
+                "catalog_metadata must contain feature_name/family/source_columns/"
+                "lookback_groups/availability_rule/unit/panel_scope columns"
+            )
+        meta = catalog_metadata.set_index("feature_name")
+        rows: list[dict[str, object]] = []
+        for feature in feature_cols:
+            if feature not in meta.index:
+                raise ValueError(
+                    f"unknown generated column {feature!r} is not declared in the catalog metadata"
+                )
+            row = meta.loc[feature]
+            rows.append(
+                {
+                    "feature_name": feature,
+                    "source_column": feature,
+                    "availability_rule": row["availability_rule"],
+                    "unit": row["unit"],
+                    "panel_scope": row["panel_scope"],
+                    "family": row["family"],
+                    "source_columns": list(row["source_columns"]),
+                    "lookback_groups": list(row["lookback_groups"]),
+                }
+            )
+        return pd.DataFrame(
+            rows,
+            columns=[*FEATURE_MANIFEST_COLUMNS, "family", "source_columns", "lookback_groups"],
+        )
+
     rows = [
         {
             "feature_name": feature,

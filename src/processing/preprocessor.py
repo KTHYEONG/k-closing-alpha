@@ -18,6 +18,7 @@ import pandas as pd
 from src.ml.feature_manifest import build_feature_manifest
 from src.ml.scenario_action_panel import build_scenario_action_panel
 from src.ml.sizing_engine import ROUND_TRIP_COST_RATIO
+from src.processing.feature_catalog import build_causal_feature_matrix
 from src.processing.schema import RAW_TO_STANDARD_MAP
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ _ALLOWED_FEATURE_SETS: tuple[str, ...] = (
     "interaction53",
     "production_calendar_flow",
     "close_morning61",
+    "causal_expanded_v1",
 )
 
 # 허용되는 패널 모드:
@@ -462,16 +464,24 @@ def build_ml_dataset(
     theme_df: pd.DataFrame | None = None,
     feature_set: str = "base40",
     panel_mode: str = "raw_rows",
+    price_history_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, pd.Series], list[str], pd.DataFrame]:
     """매매일지 원본 데이터를 정제하여 (X, targets, cat_features, processed_df)를 반환합니다.
 
     ``feature_set`` 은 ``base40`` / ``snapshot49`` / ``interaction53`` /
-    ``production_calendar_flow`` / ``close_morning61`` 만 허용하며, 기본값
-    ``base40`` 은 기존 conservative 피처집합과 호환됩니다. ``production_calendar_flow``
-    는 명시적으로 요청할 때만 9개 캘린더/수급 후보 피처를 X 에 포함하는 연구 후보
-    피처셋이고, ``close_morning61`` 은 검증된 champion 으로 snapshot49 전체와
-    ``relative_flow_strength`` 정확히 1개만 X 에 포함합니다. 시간 컬럼은
-    검증·합성·검사하지 않습니다 (고정된 15:20 KST 공통 소스 스냅샷 계약).
+    ``production_calendar_flow`` / ``close_morning61`` / ``causal_expanded_v1``
+    만 허용하며, 기본값 ``base40`` 은 기존 conservative 피처집합과 호환됩니다.
+    ``production_calendar_flow`` 는 명시적으로 요청할 때만 9개 캘린더/수급 후보
+    피처를 X 에 포함하는 연구 후보 피처셋이고, ``close_morning61`` 은 검증된
+    champion 으로 snapshot49 전체와 ``relative_flow_strength`` 정확히 1개만 X 에
+    포함합니다. 시간 컬럼은 검증·합성·검사하지 않습니다 (고정된 15:20 KST 공통
+    소스 스냅샷 계약).
+
+    ``causal_expanded_v1`` 은 opt-in 인과 카탈로그 경로로, ``price_history_df``
+    가 반드시 필요합니다 (없으면 fail-closed). ``build_causal_feature_matrix`` 가
+    600--1000 후보 행렬과 메타데이터 매니페스트를 생성하고, X 는 해당 행렬,
+    processed 에는 후보 컬럼이 추가됩니다. 레거시 피처셋은 입력/동작이
+    변경되지 않습니다.
 
     ``panel_mode`` 는 ``raw_rows``(기본, 원천 행 유지) 또는 ``scenario_action``
     만 허용합니다. ``scenario_action`` 은 clean → 행동 패널 정규화 → 피처/타깃
@@ -527,6 +537,32 @@ def build_ml_dataset(
 
     cat_features = [col for col in _CATEGORICAL_COLUMNS if col in df.columns]
     targets = {name: df[name] for name in _TARGET_NAMES}
+
+    if feature_set == "causal_expanded_v1":
+        if price_history_df is None:
+            raise ValueError(
+                "causal_expanded_v1 requires price_history_df; the research feature set "
+                "fails closed when price history is missing"
+            )
+        matrix, catalog_manifest = build_causal_feature_matrix(
+            df, price_history_df, catalog_version="causal_expanded_v1"
+        )
+        feature_cols = list(matrix.columns)
+        X = matrix.copy()
+        manifest = build_feature_manifest(feature_cols, catalog_metadata=catalog_manifest)
+        df = df.join(matrix)
+        df.attrs["feature_manifest"] = manifest
+        df.attrs["feature_set"] = feature_set
+        df.attrs["panel_mode"] = panel_mode
+        df.attrs["catalog_version"] = matrix.attrs["catalog_version"]
+        df.attrs["catalog_hash"] = matrix.attrs["catalog_hash"]
+        X.attrs["feature_manifest"] = manifest
+        X.attrs["feature_set"] = feature_set
+        X.attrs["panel_mode"] = panel_mode
+        X.attrs["catalog_version"] = matrix.attrs["catalog_version"]
+        X.attrs["catalog_hash"] = matrix.attrs["catalog_hash"]
+        return X, targets, cat_features, df
+
     feature_cols = [col for col in df.columns if col not in _EXCLUDED_FROM_X]
     if feature_set in ("snapshot49", "interaction53"):
         feature_cols.extend(col for col in _SNAPSHOT49_FEATURES if col in df.columns)
