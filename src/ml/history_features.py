@@ -49,7 +49,7 @@ try:
 except Exception:  # pragma: no cover - optional telemetry dependency
     _HAS_PSUTIL = False
 
-HISTORICAL_CATALOGUE_VERSION = "causal_history_v1"
+HISTORICAL_CATALOGUE_VERSION = "causal_history_v2"
 
 # --- 카탈로그 lookback/그리드 상수 (버전화된 동결 값) -----------------------------------------
 
@@ -279,7 +279,15 @@ def _build_catalogue() -> tuple[dict[str, object], ...]:
     for window in _CUM_WINDOWS:
         add("return_trend_mean_reversion", f"cum_vol_norm_{window}", "daily_change_pct", "cum_vol_norm", window)
     for window in _MA_SLOPE_WINDOWS:
-        add("return_trend_mean_reversion", f"ma_slope_{window}", "close", "ma_slope", window)
+            # ``ma_slope`` compares two rolling windows separated by ``window``;
+            # its effective source history is therefore 2 * window observations.
+            add(
+                "return_trend_mean_reversion",
+                f"ma_slope_{window}",
+                "close",
+                "ma_slope",
+                2 * window,
+            )
     for fast, slow in _VOL_CHANGE_PAIRS:
         add("return_trend_mean_reversion", f"vol_change_{fast}_{slow}", "close", "volatility_change", f"{fast}_{slow}")
     for window in _TRIX_WINDOWS:
@@ -375,7 +383,13 @@ def _build_catalogue() -> tuple[dict[str, object], ...]:
         for lag in _FLOW_CHANGE_LAGS:
             add("investor_flow_dynamics", f"{short}_flow_change_{lag}", source, "difference", lag)
         for lag in _FLOW_CHANGE_LAGS:
-            add("investor_flow_dynamics", f"{short}_flow_change_ratio_{lag}", source, "change_ratio", lag)
+            add(
+                "investor_flow_dynamics",
+                f"{short}_flow_change_ratio_{lag}",
+                source,
+                "signed_log_change",
+                lag,
+            )
         for window in _FLOW_WINDOWS:
             add("investor_flow_dynamics", f"{short}_flow_roll_sum_{window}", source, "rolling_sum", window)
         for window in _FLOW_WINDOWS:
@@ -523,6 +537,52 @@ def _safe_divide(
     return pd.Series(out)
 
 
+def _safe_zscore(
+    numerator: pd.Series | np.ndarray,
+    denominator: pd.Series | np.ndarray,
+) -> pd.Series:
+    """표준화 산술.
+
+    유효한 관측에서 분산이 0이면 ``NaN`` 대신 중립값 0을 반환합니다. 이는
+    상수 구간을 데이터 결측으로 잘못 분류하지 않으면서, 유효 관측이 없는
+    rolling 구간의 ``NaN``은 그대로 보존합니다.
+    """
+    num = np.asarray(numerator, dtype=np.float64)
+    den = np.asarray(denominator, dtype=np.float64)
+    out = np.full(num.shape, np.nan, dtype=np.float64)
+    finite = np.isfinite(num) & np.isfinite(den)
+    zero_scale = finite & (den == 0)
+    out[zero_scale] = 0.0
+    np.divide(num, den, out=out, where=finite & (den != 0))
+    if isinstance(numerator, pd.Series):
+        return pd.Series(out, index=numerator.index)
+    return pd.Series(out)
+
+
+def _signed_log_change(
+    current: pd.Series,
+    previous: pd.Series,
+) -> pd.Series:
+    """부호를 보존한 log 변화량으로 0 분모의 흐름을 안정적으로 비교합니다."""
+    current_values = current.to_numpy(dtype=np.float64)
+    previous_values = previous.to_numpy(dtype=np.float64)
+    current_log = np.sign(current_values) * np.log1p(np.abs(current_values))
+    previous_log = np.sign(previous_values) * np.log1p(np.abs(previous_values))
+    return pd.Series(current_log - previous_log, index=current.index)
+
+
+def _aggregate_market_dates(frame: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """중복 종목 행을 순서 불변인 날짜별 시장값으로 축약합니다."""
+    value_columns = ["kospi_pct", "kosdaq_pct", "v_kospi", "v_kosdaq"]
+    values = frame[[date_col, *value_columns]].copy()
+    values[date_col] = pd.to_datetime(values[date_col])
+    return (
+        values.groupby(date_col, sort=True, as_index=False)[value_columns]
+        .median()
+        .reset_index(drop=True)
+    )
+
+
 def _sanitize_finite(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """``+/-inf`` 를 ``NaN`` 으로 치환하고 개수를 반환합니다.
 
@@ -668,7 +728,7 @@ def _build_temporal_features(
         for window in _ZSCORE_WINDOWS:
             ma = _rolling_series(close, labels, window, "mean")
             std = _rolling_series(close, labels, window, "std")
-            assign(f"close_zscore_{window}", _safe_divide(close - ma, std))
+            assign(f"close_zscore_{window}", _safe_zscore(close - ma, std))
         for window in _DRAWDOWN_WINDOWS:
             roll_max = _rolling_series(close, labels, window, "max")
             assign(f"drawdown_{window}", _safe_divide(close, roll_max) - 1.0)
@@ -692,7 +752,7 @@ def _build_temporal_features(
         for window in _EWMA_WINDOWS:
             ewma_mean = _ewm_series(close, labels, window)
             ewma_std = series_ewm_std(close, labels, window)
-            assign(f"ewma_zscore_{window}", _safe_divide(close - ewma_mean, ewma_std))
+            assign(f"ewma_zscore_{window}", _safe_zscore(close - ewma_mean, ewma_std))
         for window in _PCT_HIGH_WINDOWS:
             roll_max = _rolling_series(close, labels, window, "max")
             assign(f"pct_of_high_{window}", _safe_divide(close, roll_max) - 1.0)
@@ -819,11 +879,11 @@ def _build_temporal_features(
         for window in _LIQUIDITY_WINDOWS:
             mean_vol = _rolling_series(volume, labels, window, "mean")
             std_vol = _rolling_series(volume, labels, window, "std")
-            assign(f"volume_zscore_{window}", _safe_divide(volume - mean_vol, std_vol))
+            assign(f"volume_zscore_{window}", _safe_zscore(volume - mean_vol, std_vol))
         for window in _LIQUIDITY_WINDOWS:
             mean_to = _rolling_series(turnover, labels, window, "mean")
             std_to = _rolling_series(turnover, labels, window, "std")
-            assign(f"turnover_zscore_{window}", _safe_divide(turnover - mean_to, std_to))
+            assign(f"turnover_zscore_{window}", _safe_zscore(turnover - mean_to, std_to))
         for window in _LIQUIDITY_WINDOWS:
             assign(f"avg_dollar_volume_{window}", _rolling_series(value, labels, window, "mean"))
 
@@ -843,7 +903,7 @@ def _build_temporal_features(
             for lag in _FLOW_CHANGE_LAGS:
                 assign(
                     f"{short}_flow_change_ratio_{lag}",
-                    _safe_divide(flow_s, _shift_series(flow_s, labels, lag)) - 1.0,
+                    _signed_log_change(flow_s, _shift_series(flow_s, labels, lag)),
                 )
             for window in _FLOW_WINDOWS:
                 assign(f"{short}_flow_roll_sum_{window}", _rolling_series(flow_s, labels, window, "sum"))
@@ -852,7 +912,7 @@ def _build_temporal_features(
             for window in _FLOW_WINDOWS:
                 mean_f = _rolling_series(flow_s, labels, window, "mean")
                 std_f = _rolling_series(flow_s, labels, window, "std")
-                assign(f"{short}_flow_zscore_{window}", _safe_divide(flow_s - mean_f, std_f))
+                assign(f"{short}_flow_zscore_{window}", _safe_zscore(flow_s - mean_f, std_f))
             pos = (flow_s > 0.0).astype(np.float64)
             for window in _FLOW_STREAK_WINDOWS:
                 assign(f"{short}_flow_pos_streak_{window}", _rolling_series(pos, labels, window, "sum"))
@@ -879,7 +939,9 @@ def _build_market_context_frame(
     date_col = config.history_date_col
     ud = dates_df[[date_col, "kospi_pct", "kosdaq_pct", "v_kospi", "v_kosdaq"]].copy()
     ud[date_col] = pd.to_datetime(ud[date_col])
-    ud = ud.sort_values(date_col).drop_duplicates(subset=[date_col], keep="first").reset_index(drop=True)
+    # 각 지수 컬럼은 서로 다른 원천 행에서 들어올 수 있고, parquet의 행 순서도
+    # 입력 경로마다 다를 수 있다. 중앙값은 NaN을 무시하면서 행 순서에 불변이다.
+    ud = _aggregate_market_dates(ud, date_col)
     level_kospi = (1.0 + ud["kospi_pct"].fillna(0.0)).cumprod()
 
     out: dict[str, pd.Series] = {}
@@ -915,7 +977,8 @@ def _build_market_context_frame(
                 level_kospi, level_kospi.rolling(window, min_periods=window).mean()
             ) - 1.0
 
-    frame = pd.DataFrame(out, index=ud[date_col].astype("datetime64[ns]"))
+    frame = pd.DataFrame(out)
+    frame.index = ud[date_col].astype("datetime64[ns]").to_numpy()
     frame.index.name = "_market_date"
     return frame
 
@@ -1363,12 +1426,10 @@ def build_causal_history_feature_panel_from_parquet(
     ):
         market_batch = batch.to_pandas()
         market_batch[date_col] = pd.to_datetime(market_batch[date_col])
-        market_parts.append(market_batch.drop_duplicates(subset=[date_col], keep="first"))
+        market_parts.append(_aggregate_market_dates(market_batch, date_col))
     market_dates_df = (
         pd.concat(market_parts, ignore_index=True)
-        .drop_duplicates(subset=[date_col], keep="first")
-        .sort_values(date_col)
-        .reset_index(drop=True)
+        .pipe(_aggregate_market_dates, date_col)
     )
     del market_parts, parquet_file
 
@@ -1447,7 +1508,7 @@ def catalogue_availability_overrides() -> dict[str, dict[str, str]]:
 
 
 def catalogue_quality_metadata() -> dict[str, dict[str, str]]:
-    """causal_history_v1 품질 리포트용 피처별 메타데이터를 반환합니다.
+    """causal_history_v2 품질 리포트용 피처별 메타데이터를 반환합니다.
 
     ``family``, ``source_column``, ``transform``, ``lookback``,
     ``availability_rule``, ``panel_scope`` 를 포함하며, 카탈로그에 피처가 정확히
