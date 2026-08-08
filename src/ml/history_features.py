@@ -33,8 +33,10 @@ Streaming 설계 (두 단계):
 from __future__ import annotations
 
 import gc
+import os
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -182,6 +184,7 @@ class HistoryFeatureExecutionConfig(pydantic.BaseModel):
     parquet_columns: tuple[str, ...] = REQUIRED_HISTORY_COLUMNS
     enforce_memory_budget: bool = True
     parquet_batch_rows: int = 250_000
+    n_jobs: int = 4
 
     @pydantic.model_validator(mode="after")
     def _validate(self) -> HistoryFeatureExecutionConfig:
@@ -193,6 +196,8 @@ class HistoryFeatureExecutionConfig(pydantic.BaseModel):
             )
         if self.parquet_batch_rows < 1:
             raise ValueError(f"parquet_batch_rows must be >= 1, got {self.parquet_batch_rows}")
+        if self.n_jobs != -1 and self.n_jobs < 1:
+            raise ValueError(f"n_jobs must be -1 (all cores) or >= 1, got {self.n_jobs}")
         missing = [col for col in REQUIRED_HISTORY_COLUMNS if col not in set(self.parquet_columns)]
         if missing:
             raise ValueError(
@@ -1151,24 +1156,35 @@ def _build_panel_core(
 
     parts: list[pd.DataFrame] = []
     peak_rss = _rss_bytes()
-    for batch in batches:
+
+    def build_batch_part(batch: Sequence[str]) -> pd.DataFrame:
         hist_batch = read_batch(batch)
         temporal = _build_temporal_features(hist_batch, config)
         batch_keys = keys[keys[dsym].isin(batch)]
         matched = _merge_temporal_keys(batch_keys, hist_batch, temporal, config)
-        parts.append(matched)
-        peak_rss = max(peak_rss, _rss_bytes())
-        del temporal, hist_batch, matched
-        gc.collect()
-        if (
-            exec_cfg.enforce_memory_budget
-            and exec_cfg.memory_budget_bytes is not None
-            and peak_rss > exec_cfg.memory_budget_bytes
-        ):
-            raise ValueError(
-                f"peak RSS {peak_rss} exceeds memory_budget_bytes "
-                f"{exec_cfg.memory_budget_bytes}; streaming build failed closed"
-            )
+        del hist_batch, temporal
+        return matched
+
+    if exec_cfg.n_jobs != 1 and len(batches) > 1:
+        # 독립 배치를 병렬 계산 (결과 순서는 ``pool.map`` 이 입력 배치 순서를
+        # 유지하므로 concat/sort 이후 최종 판넬은 결정적입니다).
+        max_workers = exec_cfg.n_jobs if exec_cfg.n_jobs > 0 else (os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            parts = list(pool.map(build_batch_part, batches))
+    else:
+        for batch in batches:
+            parts.append(build_batch_part(batch))
+    gc.collect()
+    peak_rss = max(peak_rss, _rss_bytes())
+    if (
+        exec_cfg.enforce_memory_budget
+        and exec_cfg.memory_budget_bytes is not None
+        and peak_rss > exec_cfg.memory_budget_bytes
+    ):
+        raise ValueError(
+            f"peak RSS {peak_rss} exceeds memory_budget_bytes "
+            f"{exec_cfg.memory_budget_bytes}; streaming build failed closed"
+        )
 
     panel = pd.concat(parts, axis=0).sort_values([ddate, dsym]).reset_index(drop=True)
     del parts
