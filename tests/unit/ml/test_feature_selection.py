@@ -24,6 +24,7 @@ from src.ml.feature_selection import (
     permutation_null_stability,
     select_features,
 )
+from src.ml.history_feature_research import _resolve_research_selection_config
 from src.ml.model_pipeline import run_model_pipeline
 
 
@@ -57,6 +58,18 @@ def _small_config(min_retained: int = 5, max_retained: int = 20) -> FeatureSelec
         min_retained=min_retained,
         max_retained=max_retained,
         hard_max_retained=40,
+    )
+
+
+def _fwer_config() -> FeatureSelectionConfig:
+    return FeatureSelectionConfig(
+        selection_rule="permutation_fwer",
+        min_retained=1,
+        max_retained=20,
+        hard_max_retained=40,
+        null_alpha=0.05,
+        null_permutations=19,
+        min_significant_features=1,
     )
 
 
@@ -324,7 +337,7 @@ def test_mto02_fold_plan_invariant_to_outer_labels_and_reused() -> None:
         list(p.selected_features) for p in plans
     ]
     assert diagnostics["config_fingerprint"] == plans[0].config_fingerprint
-    assert diagnostics["final_train_only"] is True
+    assert diagnostics["final_selection_provenance"] == "full_training_selection"
     assert diagnostics["stability"]["n_permutations"] >= 1
 
 
@@ -479,3 +492,208 @@ def test_mto02_feq03_source_incomplete_and_capacity_limited() -> None:
         )
     with pytest.raises(ValueError, match="min_fold_selection_rate"):
         build_feature_quality_report([result], cols, catalogue, 0.0)
+
+def test_fs04_permutation_fwer_fold_plans_invariant_to_validation_and_later_labels() -> None:
+    """FS-04: permutation-FWER fold 계획은 validation/이후 라벨과 무관하게 불변입니다."""
+    df = _predictive_df(n_groups=40, rows_per_group=8)
+    cfg = _fwer_config()
+    cols = _candidate_cols(40)
+    plans = build_fold_feature_plans(
+        df, cols, "target_return", "trade_date", cfg, n_splits=3, purge_gap=1
+    )
+    assert all(p.selected_features for p in plans)
+    assert all(p.metadata["provenance"] == "fold_train_selection" for p in plans)
+
+    n_groups = df["trade_date"].nunique()
+    future_dates = sorted(df["trade_date"].unique())[-(n_groups // (3 + 1)):]
+    mutated = df.copy()
+    mutated.loc[mutated["trade_date"].isin(future_dates), "target_return"] += 0.5
+    plans_mutated = build_fold_feature_plans(
+        mutated, cols, "target_return", "trade_date", cfg, n_splits=3, purge_gap=1
+    )
+    assert [p.selected_features for p in plans] == [p.selected_features for p in plans_mutated]
+    assert [p.metadata["selection_threshold"] for p in plans] == [
+        p.metadata["selection_threshold"] for p in plans_mutated
+    ]
+    assert [p.metadata["null_max_gain_max"] for p in plans] == [
+        p.metadata["null_max_gain_max"] for p in plans_mutated
+    ]
+    assert [p.counts for p in plans] == [p.counts for p in plans_mutated]
+
+
+def test_fs05_permutation_fwer_threshold_rejection_and_no_cap_truncation() -> None:
+    """FS-05: 임계값 위 피처는 유지되고, 이하 피처는 not_significant_vs_null 로
+    거부되며, max_retained 는 결과를 조용히 잘라내지 않습니다."""
+    rng = np.random.default_rng(7)
+    n_groups, rows_per_group = 40, 8
+    n = n_groups * rows_per_group
+    dates = pd.to_datetime([f"2024-03-{1 + d % 28:02d}" for d in range(n_groups)])
+    df = pd.DataFrame({"trade_date": [d for d in dates for _ in range(rows_per_group)]})
+    signals = [rng.normal(0.0, 1.0, n) for _ in range(4)]
+    for j, signal in enumerate(signals):
+        df[f"f{j:03d}"] = signal
+    for j in range(4, 10):
+        df[f"f{j:03d}"] = rng.normal(0.0, 1.0, n)
+    df["target_return"] = 0.08 * sum(signals) + rng.normal(0.0, 0.01, n)
+
+    cfg = FeatureSelectionConfig(
+        selection_rule="permutation_fwer",
+        min_retained=1,
+        max_retained=2,
+        hard_max_retained=20,
+        null_alpha=0.05,
+        null_permutations=19,
+        min_significant_features=1,
+    )
+    result = select_features(df, [f"f{j:03d}" for j in range(10)], "target_return", cfg, group_col="trade_date")
+    threshold = result.metadata["selection_threshold"]
+    reasons = dict(result.rejected)
+    # 임계값을 엄격히 초과하는 피처만 유지됩니다.
+    assert all(gain > threshold for _name, gain in result.gains)
+    # 이하 피처는 명시적 screening-weak 거부 사유를 받습니다.
+    not_significant = {
+        feature for feature, reason in reasons.items() if reason == "not_significant_vs_null"
+    }
+    assert len(not_significant) == 6
+    # max_retained 는 유지 수를 잘라내지 않습니다.
+    assert result.counts["n_retained"] > cfg.max_retained
+    assert result.counts["n_retained"] == result.counts["n_post_correlation"]
+
+
+def test_fs05_permutation_fwer_rejects_zero_significant_features() -> None:
+    """FS-05: 유의 피처가 없으면 permutation_fwer 는 fail-closed 로 거부합니다."""
+    rng = np.random.default_rng(9)
+    n_groups, rows_per_group = 20, 6
+    n = n_groups * rows_per_group
+    dates = pd.to_datetime([f"2024-03-{1 + d % 28:02d}" for d in range(n_groups)])
+    df = pd.DataFrame({"trade_date": [d for d in dates for _ in range(rows_per_group)]})
+    for j in range(6):
+        df[f"f{j:03d}"] = rng.normal(0.0, 1.0, n)
+    df["target_return"] = 0.0
+    with pytest.raises(ValueError, match="retained feature count"):
+        select_features(df, _candidate_cols(6), "target_return", _fwer_config(), group_col="trade_date")
+
+
+def test_fs05_permutation_fwer_fails_closed_without_group_col() -> None:
+    """FS-05: permutation_fwer 는 group_col 없이 호출되면 fail-closed 로 거부합니다."""
+    df = _predictive_df(n_candidates=12, n_groups=30, rows_per_group=8)
+    with pytest.raises(ValueError, match="group_col"):
+        select_features(df, _candidate_cols(12), "target_return", _fwer_config())
+
+
+def test_hfs05_staggered_missingness_pairwise_spearman_prunes_not_false_positive() -> None:
+    """FS-05/HFS-05: 결측이 엇갈린(도약) 쌍이 공통 관측에서 0.98 을 넘으면
+    가지치기되고, 겹침이 부족한 쌍은 절대 거짓 양성으로 가지치기되지 않습니다."""
+    rng = np.random.default_rng(21)
+    n = 300
+    signal = rng.normal(0.0, 1.0, n)
+    df = pd.DataFrame({"target_return": signal + rng.normal(0.0, 0.05, n)})
+    df["f_signal"] = signal
+    dup = signal.copy()
+    dup_mask = rng.random(n) < 0.4
+    signal_mask = rng.random(n) < 0.4
+    dup[dup_mask & ~signal_mask] = np.nan
+    df["f_dup"] = dup
+    low_overlap = rng.normal(0.0, 1.0, n)
+    low_overlap[df["f_dup"].isna()] = np.nan
+    df["f_low_overlap"] = low_overlap
+
+    cfg = FeatureSelectionConfig(min_retained=1, max_retained=10, hard_max_retained=20)
+    result = select_features(
+        df, ["f_signal", "f_dup", "f_low_overlap"], "target_return", cfg
+    )
+    reasons = dict(result.rejected)
+    # 공통 관측에서 동일한 f_dup 은 상관 > 0.98 로 가지치기됩니다.
+    assert reasons["f_dup"] == "correlated_pair_pruned"
+    # 겹침이 부족한 피처는 correlated 로 거부되지 않습니다 (부족하면 상관 0).
+    assert reasons.get("f_low_overlap") != "correlated_pair_pruned"
+
+
+def test_mto02_permutation_fwer_diagnostics_expose_rule_threshold_null_and_provenance() -> None:
+    """MTO-02: 진단이 rule, 임계값, null 요약, 선택 카운트와 fold-local/full-training
+    선택 출처를 노출합니다."""
+    df = _predictive_df(n_groups=40, rows_per_group=8)
+    cfg = _fwer_config()
+    result = run_model_pipeline(
+        df,
+        _candidate_cols(40),
+        "target_return",
+        "trade_date",
+        n_splits=3,
+        purge_gap=1,
+        model_type="lgb_regressor",
+        feature_selection_config=cfg,
+    )
+    diagnostics = result["feature_selection_diagnostics"]
+    assert diagnostics["final_selection_provenance"] == "full_training_selection"
+    assert diagnostics["final_selection"]["metadata"]["provenance"] == "full_training_selection"
+    final_meta = diagnostics["final_selection"]["metadata"]
+    assert final_meta["selection_rule"] == "permutation_fwer"
+    assert final_meta["selection_threshold"] is not None
+    assert final_meta["null_alpha"] == 0.05
+    assert final_meta["null_permutations"] == 19
+    assert final_meta["null_max_gain_min"] is not None
+    assert final_meta["null_max_gain_median"] is not None
+    assert final_meta["null_max_gain_max"] is not None
+    assert (
+        final_meta["null_max_gain_min"]
+        <= final_meta["null_max_gain_median"]
+        <= final_meta["null_max_gain_max"]
+    )
+    for fold in diagnostics["fold_selections"]:
+        assert fold["metadata"]["provenance"] == "fold_train_selection"
+        assert fold["metadata"]["selection_rule"] == "permutation_fwer"
+        assert fold["metadata"]["selection_threshold"] is not None
+        assert fold["counts"]["n_pre_correlation"] >= fold["counts"]["n_post_correlation"]
+        assert fold["counts"]["n_post_correlation"] == fold["counts"]["n_retained"]
+
+
+def test_fs07_permutation_fwer_config_validation() -> None:
+    """FS-07: permutation_fwer 설정 범위 위반은 초기화 시 fail-closed 로 거부됩니다."""
+    with pytest.raises(ValueError, match="null_alpha"):
+        FeatureSelectionConfig(null_alpha=0.0)
+    with pytest.raises(ValueError, match="null_permutations"):
+        FeatureSelectionConfig(null_alpha=0.05, null_permutations=10)
+    with pytest.raises(ValueError, match="min_significant_features"):
+        FeatureSelectionConfig(min_significant_features=0)
+    with pytest.raises(ValueError, match="min_pairwise_observations"):
+        FeatureSelectionConfig(min_pairwise_observations=2)
+    with pytest.raises(ValueError, match="requires screening_device"):
+        FeatureSelectionConfig(selection_rule="permutation_fwer", screening_device="gpu")
+
+
+def test_fs10_research_default_selection_rule_is_permutation_fwer() -> None:
+    """FS-10: 리서치 설정을 생략하면 permutation_fwer 기본값, 명시 설정은 유지됩니다."""
+    default = _resolve_research_selection_config(None)
+    assert default.selection_rule == "permutation_fwer"
+    legacy = FeatureSelectionConfig(min_retained=5, max_retained=20, hard_max_retained=40)
+    assert _resolve_research_selection_config(legacy) is legacy
+    assert legacy.selection_rule == "fixed_cap"
+
+def test_mto02_not_significant_vs_null_maps_to_screening_weak_in_quality_report() -> None:
+    """MTO-02: not_significant_vs_null 거부는 capacity_limited 가 아닌 screening_weak
+    액션으로 품질 리포트에 매핑됩니다."""
+    rng = np.random.default_rng(7)
+    n_groups, rows_per_group = 40, 8
+    n = n_groups * rows_per_group
+    dates = pd.to_datetime([f"2024-03-{1 + d % 28:02d}" for d in range(n_groups)])
+    df = pd.DataFrame({"trade_date": [d for d in dates for _ in range(rows_per_group)]})
+    df["f_signal"] = rng.normal(0.0, 1.0, n)
+    for j in range(4, 10):
+        df[f"f{j:03d}"] = rng.normal(0.0, 1.0, n)
+    df["target_return"] = 0.08 * df["f_signal"] + rng.normal(0.0, 0.01, n)
+
+    cfg = _fwer_config()
+    cols = ["f_signal", *[f"f{j:03d}" for j in range(4, 10)]]
+    result = select_features(df, cols, "target_return", cfg, group_col="trade_date")
+    reasons = dict(result.rejected)
+    rejected_weak = {
+        feature for feature, reason in reasons.items() if reason == "not_significant_vs_null"
+    }
+    assert rejected_weak
+
+    report = build_feature_quality_report([result], cols, {}, cfg.min_fold_selection_rate)
+    actions = report["actions"]
+    for feature in rejected_weak:
+        assert "screening_weak" in actions[feature]
+        assert "capacity_limited" not in actions[feature]

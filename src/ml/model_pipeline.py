@@ -938,7 +938,7 @@ def run_close_morning_recency_ensemble_experiment(
         fold_feature_plans: 외부 fold 별 불변 피처 계획 (return 전문가 공유).
         risk_feature_cols: p_good/risk 입력 표면 (기본 ``feature_cols``).
         pred_linear: False 면 return 전문가의 Ridge baseline 을 생략 (candidate-speed).
-        final_feature_selection: 번들 매니페스트용 full-data ``final_train_only`` 선택.
+        final_feature_selection: 번들 매니페스트용 full-data ``full_training_selection`` 선택.
         fold_event_callback: 폴드 단위 프로파일/선택 진단을 append-only 로 방출.
         memory_budget_bytes: 초과 시 fail-closed.
         wall_time_budget_seconds: 초과 시 fail-closed.
@@ -1459,7 +1459,7 @@ def run_model_pipeline(
     ``fold_feature_plans`` 가 주어지면 내부 선택을 재계산하지 않고 fold 별 불변
     피처 계획을 그대로 사용합니다 (두 return 전문가가 같은 계획을 공유하기 위함).
     ``feature_selection_config`` 와 상호 배타적입니다. ``final_feature_selection``
-    로 OOF 평가 후 full-data ``final_train_only`` 선택을 재사용해 번들 매니페스트를
+    로 OOF 평가 후 full-data ``full_training_selection`` 선택을 재사용해 번들 매니페스트를
     확정하고, ``include_final_train_selection=False`` 면 final 선택을 건너뜁니다.
 
     ``pred_linear=False`` (candidate-speed) 는 비용이 큰 Ridge baseline 을 생략해
@@ -1553,7 +1553,14 @@ def run_model_pipeline(
             fold_cutoffs.append(plan.data_cutoff)
         elif feature_selection_config is not None:
             selection_started = time.perf_counter()
-            selection = select_features(train, feature_cols, target_col, feature_selection_config)
+            selection = select_features(
+                train,
+                feature_cols,
+                target_col,
+                feature_selection_config,
+                group_col=group_col,
+                provenance="fold_train_selection",
+            )
             fold_feature_cols = list(selection.selected_features)
             fold_selections.append(selection)
             fold_cutoffs.append(str(train[group_col].max()))
@@ -1694,14 +1701,20 @@ def run_model_pipeline(
     manifest_features: list[str] = feature_cols
     manifest_catalogue: Mapping[str, Mapping[str, str]] | None = None
     if feature_selection_config is not None:
-        final_selection = select_features(work, feature_cols, target_col, feature_selection_config)
+        final_selection = select_features(
+            work, feature_cols, target_col, feature_selection_config, group_col=group_col
+        )
         manifest_catalogue = feature_selection_config.catalogue
     elif fold_feature_plans is not None:
         if final_feature_selection is not None:
             final_selection = final_feature_selection
         elif include_final_train_selection:
             final_selection = select_features(
-                work, feature_cols, target_col, fold_feature_plans[0].config
+                work,
+                feature_cols,
+                target_col,
+                fold_feature_plans[0].config,
+                group_col=group_col,
             )
         else:
             final_selection = None
@@ -1745,7 +1758,7 @@ def run_model_pipeline(
             ],
             "median_pairwise_jaccard": jaccard,
             "stability": stability,
-            "final_train_only": True,
+            "final_selection_provenance": "full_training_selection",
             "final_features": (
                 list(final_selection.selected_features)
                 if final_selection is not None
