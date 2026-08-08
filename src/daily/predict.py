@@ -633,8 +633,8 @@ def main():
     models_bundle = ensure_valid_model_bundle(models_bundle)
 
     start = time.perf_counter()
-    df_normal = df_all[~df_all["시나리오"].str.contains("상따", na=False)].copy()
-    df_sangdda = df_all[df_all["시나리오"].str.contains("상따", na=False)].copy()
+    df_normal = df_all[~df_all["Scenario_Base"].str.contains("상따", na=False)].copy()
+    df_sangdda = df_all[df_all["Scenario_Base"].str.contains("상따", na=False)].copy()
 
     normal_sizing = run_daily_sizing_inference(df_normal, models_bundle)
     sangdda_sizing = (
