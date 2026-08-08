@@ -58,7 +58,7 @@ _KNOWN_REJECTION_REASONS: frozenset[str] = frozenset(
     }
 )
 
-FEATURE_QUALITY_VERSION = "feature_quality_v1"
+FEATURE_QUALITY_VERSION = "feature_quality_v2"
 _BASELINE_FAMILY = "baseline"
 _QUALITY_ACTION_NAMES = (
     "source_incomplete",
@@ -87,7 +87,9 @@ class FeatureSelectionConfig(pydantic.BaseModel):
     min_gain: float = 0.0
     catalogue_version: str = "unversioned"
     catalogue: Mapping[str, Mapping[str, str]] = {}
-    min_fold_selection_rate: float = 0.5
+    # A feature must be selected in every fold to be called stable. With two
+    # folds, a 0.5 threshold labels a one-fold feature as stable by definition.
+    min_fold_selection_rate: float = 1.0
     screening_device: Literal["cpu", "gpu", "auto"] = "cpu"
     n_jobs: int = -1
 
@@ -578,7 +580,7 @@ def build_feature_quality_report(
             로 분류합니다.
 
     Returns:
-        ``version``(feature_quality_v1), ``n_folds``, ``feature_records``,
+        ``version``(feature_quality_v2), ``n_folds``, ``feature_records``,
         ``family_records``, ``actions`` 로 구성된 결정적 리포트.
 
     Raises:
