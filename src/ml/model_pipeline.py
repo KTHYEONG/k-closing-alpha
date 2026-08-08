@@ -142,6 +142,55 @@ def calculate_recency_sample_weight(
     return np.asarray([weight_by_group[g] for g in groups], dtype=np.float64)
 
 
+def calculate_date_balanced_sample_weight(
+    groups: pd.Series, recency_half_life_groups: int | None = None
+) -> np.ndarray:
+    """각 거래일이 동일한 총 로스 질량을 기여하도록 행 단위 sample weight 를 반환합니다.
+
+    날짜 ``d`` 의 행 수 ``n_d`` 에 대해 각 행 가중치 ``1 / n_d`` 를 부여해 날짜별
+    총 질량이 동일해지도록 하고, 최종 평균이 정확히 1 이 되도록 정규화합니다.
+    ``recency_half_life_groups`` 가 주어지면 ``calculate_recency_sample_weight`` 의
+    causal half-life 감쇠를 먼저 곱한 뒤 동일한 mean-one 정규화를 적용합니다.
+    모든 연산은 벡터화된 NumPy/Pandas 변환만 사용합니다 (``pd.apply`` 금지).
+
+    ``recency_half_life_groups`` 는 None(날짜 균형만), 252, 504 만 허용하며,
+    빈 그룹·파싱 불가/널 그룹·비유한 가중치·0 총 질량은 ``ValueError`` 로
+    fail-closed 합니다. 검증/미래 날짜는 가중치 계산에 사용되지 않습니다.
+    """
+    if recency_half_life_groups is not None and recency_half_life_groups not in (252, 504):
+        raise ValueError(
+            f"recency_half_life_groups must be one of None, 252, 504, "
+            f"got {recency_half_life_groups!r}"
+        )
+    if len(groups) == 0:
+        raise ValueError("date-balanced sample weight requires non-empty trade-date groups")
+    parsed = pd.to_datetime(pd.Series(groups), errors="coerce")
+    if parsed.isna().any():
+        raise ValueError(
+            "date-balanced sample weight requires parseable trade-date groups"
+        )
+    group_id = pd.factorize(parsed, sort=True)[0]
+    counts = pd.Series(group_id).value_counts(sort=False).to_numpy(dtype=np.float64)
+    row_counts = counts[group_id]
+    weights: np.ndarray = np.asarray(1.0 / row_counts, dtype=np.float64)
+    if recency_half_life_groups is not None:
+        unique_group_ids = np.unique(group_id)
+        age_map = {
+            int(gid): float(len(unique_group_ids) - 1 - int(pos))
+            for pos, gid in enumerate(unique_group_ids)
+        }
+        ages = np.asarray([age_map[gid] for gid in group_id], dtype=np.float64)
+        decay = np.exp(-np.log(2.0) * ages / float(recency_half_life_groups))
+        weights = weights * decay
+    mean_weight = float(weights.mean())
+    if not np.isfinite(mean_weight) or mean_weight <= 0.0:
+        raise ValueError("date-balanced sample weights are not finite")
+    weights = weights / mean_weight
+    if not np.isfinite(weights).all() or float(weights.sum()) <= 0.0:
+        raise ValueError("date-balanced sample weights are not finite")
+    return weights
+
+
 def _policy_metadata(
     policy: SingleStockPolicy | None,
     evaluation: SingleStockPolicyEvaluation | None,
@@ -726,6 +775,72 @@ def _select_recency_ensemble_config(
     return min(eligible, key=_sort_key)
 
 
+def _select_recency_ensemble_config_with_mode(
+    candidate_stats_by_mode: dict[str, dict[tuple[int | None, float], dict[str, float]]],
+) -> tuple[str, tuple[int | None, float]]:
+    """모드별 내부 OOF 후보에서 ``(weighting_mode, (half_life, recent_weight))`` 를 선택합니다.
+
+    각 모드의 ``_select_recency_ensemble_config`` 최선 구성을 모드별로 산출한 뒤,
+    baseline(``current`` 모드의 ``(None, 0.0)``) 을 기준으로 보수적 규칙을
+    적용해 최종 모드를 결정합니다. ``date_balanced`` 모드는 baseline 대비 mean
+    보존 + MDD 엄격 감소를 충족할 때만 선택되며, 그렇지 않으면 ``current`` 로
+    fail-closed 합니다. 동률이면 낮은 MDD → 높은 mean → 낮은 recent_weight →
+    긴 half_life 순입니다. 선택은 내부 OOF 레이블만 사용합니다.
+    """
+    baseline_mode = "current"
+    if baseline_mode not in candidate_stats_by_mode:
+        baseline_mode = next(iter(candidate_stats_by_mode))
+    baseline_stats = candidate_stats_by_mode[baseline_mode]
+    baseline_key: tuple[int | None, float] = (None, 0.0)
+    base_mean = float(baseline_stats[baseline_key]["scheduled_mean_return"])
+    base_mdd = float(baseline_stats[baseline_key]["entry_sequence_drawdown"])
+
+    chosen_by_mode: dict[str, tuple[int | None, float]] = {
+        mode: _select_recency_ensemble_config(stats)
+        for mode, stats in candidate_stats_by_mode.items()
+    }
+    current_config = chosen_by_mode[baseline_mode]
+    current_stats = candidate_stats_by_mode[baseline_mode][current_config]
+
+    def _rank(
+        config: tuple[int | None, float], stats: dict[str, float]
+    ) -> tuple[float, float, float, float]:
+        mdd = float(stats["entry_sequence_drawdown"])
+        mean = float(stats["scheduled_mean_return"])
+        half_life, recent_weight = config
+        return (
+            mdd if np.isfinite(mdd) else np.inf,
+            -mean if np.isfinite(mean) else -np.inf,
+            recent_weight,
+            -float(half_life) if half_life is not None else float("-inf"),
+        )
+
+    best_mode = baseline_mode
+    best_config = current_config
+    best_stats = current_stats
+    for mode, config in chosen_by_mode.items():
+        if mode == baseline_mode:
+            continue
+        stats = candidate_stats_by_mode[mode][config]
+        mean = float(stats["scheduled_mean_return"])
+        mdd = float(stats["entry_sequence_drawdown"])
+        eligible = (
+            np.isfinite(mean)
+            and np.isfinite(mdd)
+            and np.isfinite(base_mean)
+            and np.isfinite(base_mdd)
+            and mean >= base_mean
+            and mdd < base_mdd
+        )
+        if not eligible:
+            continue
+        if _rank(config, stats) < _rank(best_config, best_stats):
+            best_mode = mode
+            best_config = config
+            best_stats = stats
+    return best_mode, best_config
+
+
 def _dominant_recency_config(
     configs: list[tuple[int | None, float]],
 ) -> tuple[int | None, float]:
@@ -769,13 +884,16 @@ def _inner_recency_ensemble_candidate_evaluator(
     alphas: tuple[float, ...],
     risk_feature_cols: list[str] | None = None,
     pred_linear: bool = True,
+    weighting_modes: tuple[str, ...] = ("current",),
 ) -> dict[str, Any]:
     """외부 fold 의 train 분할만 사용하는 내부 purged walk-forward 후보 평가입니다.
 
     outer-train 날짜 전용 OOF(expanding + 252/504 half-life recent + p_good)를
     중첩 walk-forward 로 산출하고, ``(half_life, recent_weight)`` 고정 후보를
     ``always_buy_top1`` 로 평가한 뒤 ``_select_recency_ensemble_config`` 의 보수적
-    규칙으로 최적 구성을 결정합니다. 선택은 전적으로 이 partition 의 OOF 레이블만
+    규칙으로 최적 구성을 결정합니다. ``weighting_modes`` 에 ``date_balanced`` 가
+    포함되면 각 모드에서 동일한 후보를 재평가하고 ``_select_recency_ensemble_config_with_mode``
+    기준으로 모드까지 함께 선택합니다. 선택은 전적으로 이 partition 의 OOF 레이블만
     사용하며 외부 validation 레이블을 절대 읽지 않습니다. partition 이 중첩
     walk-forward 를 지원할 만큼 충분하지 않으면 baseline 으로 fail-closed 합니다.
     ``risk_feature_cols`` 는 p_good/risk 입력 표면 (기본 ``feature_cols``).
@@ -784,7 +902,9 @@ def _inner_recency_ensemble_candidate_evaluator(
     if inner_groups < 3:
         return {
             "chosen_config": (None, 0.0),
+            "chosen_weighting_mode": "current",
             "candidate_stats": {},
+            "candidate_stats_by_mode": {},
             "inner_n_groups": inner_groups,
             "inner_n_splits": 0,
             "inner_cutoff": None,
@@ -792,31 +912,6 @@ def _inner_recency_ensemble_candidate_evaluator(
         }
     inner_splits = max(1, min(n_splits, inner_groups - 2))
     risk_cols = risk_feature_cols if risk_feature_cols is not None else feature_cols
-
-    expanding = run_model_pipeline(
-        inner_df,
-        feature_cols=feature_cols,
-        target_col=target_col,
-        group_col=group_col,
-        n_splits=inner_splits,
-        purge_gap=purge_gap,
-        model_type="lgb_regressor",
-        pred_linear=pred_linear,
-    )
-    recent_by_h: dict[int, dict[str, Any]] = {
-        half_life: run_model_pipeline(
-            inner_df,
-            feature_cols=feature_cols,
-            target_col=target_col,
-            group_col=group_col,
-            n_splits=inner_splits,
-            purge_gap=purge_gap,
-            model_type="lgb_regressor",
-            recency_half_life_groups=half_life,
-            pred_linear=pred_linear,
-        )
-        for half_life in half_lives
-    }
     risk_oof = fit_predict_quantile_and_classifier(
         inner_df,
         feature_cols=risk_cols,
@@ -825,62 +920,104 @@ def _inner_recency_ensemble_candidate_evaluator(
         n_splits=inner_splits,
         purge_gap=purge_gap,
     )
-    aligned_exp = _align_close_morning_oof(
-        expanding["oof_predictions"], risk_oof, target_col=target_col, group_col=group_col
-    )
-    aligned_recent = {
-        half_life: _align_close_morning_oof(
-            recent_by_h[half_life]["oof_predictions"],
+
+    def _mode_candidate_stats(
+        weighting_mode: str,
+    ) -> dict[tuple[int | None, float], dict[str, float]]:
+        expanding = run_model_pipeline(
+            inner_df,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=inner_splits,
+            purge_gap=purge_gap,
+            model_type="lgb_regressor",
+            pred_linear=pred_linear,
+            weighting_mode=weighting_mode,
+        )
+        recent_by_h: dict[int, dict[str, Any]] = {
+            half_life: run_model_pipeline(
+                inner_df,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                group_col=group_col,
+                n_splits=inner_splits,
+                purge_gap=purge_gap,
+                model_type="lgb_regressor",
+                recency_half_life_groups=half_life,
+                pred_linear=pred_linear,
+                weighting_mode=weighting_mode,
+            )
+            for half_life in half_lives
+        }
+        aligned_exp = _align_close_morning_oof(
+            expanding["oof_predictions"],
             risk_oof,
             target_col=target_col,
             group_col=group_col,
         )
-        for half_life in half_lives
-    }
-
-    def _evaluate(rank_score: pd.Series) -> dict[str, float]:
-        panel = aligned_exp.copy()
-        panel["rank_score"] = rank_score
-        evaluation = _evaluate_close_morning_top1(
-            panel,
-            target_col,
-            group_col,
-            probability_weight=probability_weight,
-            bad_probability_weight=0.0,
-            min_history_dates=min_history_dates,
-        )
-        metrics = evaluation["metrics"]
-        return {
-            "scheduled_mean_return": float(metrics["scheduled_mean_return"]),
-            "entry_sequence_drawdown": float(metrics["entry_sequence_drawdown"]),
-            "scheduled_sharpe": float(metrics["scheduled_sharpe"]),
-            "profit_factor": float(metrics["profit_factor"]),
-            "buy_rate": float(metrics["buy_rate"]),
+        aligned_recent = {
+            half_life: _align_close_morning_oof(
+                recent_by_h[half_life]["oof_predictions"],
+                risk_oof,
+                target_col=target_col,
+                group_col=group_col,
+            )
+            for half_life in half_lives
         }
 
-    candidate_stats: dict[tuple[int | None, float], dict[str, float]] = {}
-    baseline_rank = _recency_ensemble_rank(
-        aligned_exp["pred"], aligned_exp["pred"], aligned_exp[group_col], 0.0
-    )
-    candidate_stats[(None, 0.0)] = _evaluate(baseline_rank)
-    for half_life in half_lives:
-        for recent_weight in alphas:
-            if recent_weight == 0.0:
-                continue
-            rank_score = _recency_ensemble_rank(
-                aligned_exp["pred"],
-                aligned_recent[half_life]["pred"],
-                aligned_exp[group_col],
-                recent_weight,
+        def _evaluate(rank_score: pd.Series) -> dict[str, float]:
+            panel = aligned_exp.copy()
+            panel["rank_score"] = rank_score
+            evaluation = _evaluate_close_morning_top1(
+                panel,
+                target_col,
+                group_col,
+                probability_weight=probability_weight,
+                bad_probability_weight=0.0,
+                min_history_dates=min_history_dates,
             )
-            candidate_stats[(half_life, recent_weight)] = _evaluate(rank_score)
+            metrics = evaluation["metrics"]
+            return {
+                "scheduled_mean_return": float(metrics["scheduled_mean_return"]),
+                "entry_sequence_drawdown": float(metrics["entry_sequence_drawdown"]),
+                "scheduled_sharpe": float(metrics["scheduled_sharpe"]),
+                "profit_factor": float(metrics["profit_factor"]),
+                "buy_rate": float(metrics["buy_rate"]),
+            }
 
+        candidate_stats: dict[tuple[int | None, float], dict[str, float]] = {}
+        baseline_rank = _recency_ensemble_rank(
+            aligned_exp["pred"], aligned_exp["pred"], aligned_exp[group_col], 0.0
+        )
+        candidate_stats[(None, 0.0)] = _evaluate(baseline_rank)
+        for half_life in half_lives:
+            for recent_weight in alphas:
+                if recent_weight == 0.0:
+                    continue
+                rank_score = _recency_ensemble_rank(
+                    aligned_exp["pred"],
+                    aligned_recent[half_life]["pred"],
+                    aligned_exp[group_col],
+                    recent_weight,
+                )
+                candidate_stats[(half_life, recent_weight)] = _evaluate(rank_score)
+        return candidate_stats
+
+    candidate_stats_by_mode: dict[
+        str, dict[tuple[int | None, float], dict[str, float]]
+    ] = {mode: _mode_candidate_stats(mode) for mode in weighting_modes}
+    chosen_weighting_mode, chosen_config = _select_recency_ensemble_config_with_mode(
+        candidate_stats_by_mode
+    )
     return {
-        "chosen_config": _select_recency_ensemble_config(candidate_stats),
-        "candidate_stats": candidate_stats,
+        "chosen_config": chosen_config,
+        "chosen_weighting_mode": chosen_weighting_mode,
+        "candidate_stats": candidate_stats_by_mode["current"],
+        "candidate_stats_by_mode": candidate_stats_by_mode,
         "inner_n_groups": inner_groups,
         "inner_n_splits": inner_splits,
-        "inner_cutoff": str(aligned_exp[group_col].max()),
+        "inner_cutoff": str(inner_df[group_col].max()),
         "fail_closed_reason": None,
     }
 
@@ -899,6 +1036,7 @@ def run_close_morning_recency_ensemble_experiment(
     alphas: tuple[float, ...] = (0.0, 0.25, 0.50, 0.75, 1.0),
     build_research_bundle: bool = False,
     *,
+    weighting_modes: tuple[str, ...] = ("current",),
     fold_feature_plans: Sequence[FoldFeaturePlan] | None = None,
     risk_feature_cols: list[str] | None = None,
     pred_linear: bool = True,
@@ -915,6 +1053,11 @@ def run_close_morning_recency_ensemble_experiment(
     에서 고르고, 그 설정을 외부 validation 날짜에 1회 적용합니다. 외부 validation
     레이블은 설정 선택에 절대 사용하지 않습니다. ``save_model_artifacts`` 를
     호출하지 않고 프로덕션 번들이나 기본값을 변경하지 않습니다.
+
+    ``weighting_modes`` 는 ``current``(기존 uniform/recency-only) 와
+    ``date_balanced``(거래일별 균등 총 로스 질량) 중 내부 OOF 에서 모드까지 함께
+    선택할 후보 집합입니다. 기본 ``("current",)`` 는 기존 동작과 동일합니다.
+    선택된 모드의 외부 모델로 해당 fold 의 baseline/candidate 를 평가합니다.
 
     ``alpha=0`` 은 v1 expanding baseline 으로 중복 제거되며, ``p_good`` 백분위
     기여와 ``always_buy_top1`` 정책을 유지합니다. ``build_research_bundle=True``
@@ -935,6 +1078,7 @@ def run_close_morning_recency_ensemble_experiment(
         half_lives: 최근 전문가 half-life 후보 (252 또는 504).
         alphas: 최근 전문가 가중치 후보 (0.0 baseline 포함).
         build_research_bundle: 승격 게이트 통과 시 연구 번들 영속화 여부.
+        weighting_modes: 내부 OOF 에서 선택할 로스 가중치 모드 후보.
         fold_feature_plans: 외부 fold 별 불변 피처 계획 (return 전문가 공유).
         risk_feature_cols: p_good/risk 입력 표면 (기본 ``feature_cols``).
         pred_linear: False 면 return 전문가의 Ridge baseline 을 생략 (candidate-speed).
@@ -967,27 +1111,19 @@ def run_close_morning_recency_ensemble_experiment(
         raise ValueError(
             f"alphas must be a non-empty subset of [0, 1] containing 0.0, got {alphas!r}"
         )
+    allowed_weighting_modes = ("current", "date_balanced")
+    if not weighting_modes or not all(m in allowed_weighting_modes for m in weighting_modes):
+        raise ValueError(
+            f"weighting_modes must be a non-empty subset of {allowed_weighting_modes}, "
+            f"got {weighting_modes!r}"
+        )
     risk_cols = risk_feature_cols if risk_feature_cols is not None else feature_cols
 
     work = df.sort_values(group_col).copy()
-    expanding = run_model_pipeline(
-        work,
-        feature_cols=feature_cols,
-        target_col=target_col,
-        group_col=group_col,
-        n_splits=n_splits,
-        purge_gap=purge_gap,
-        model_type="lgb_regressor",
-        fold_feature_plans=fold_feature_plans,
-        final_feature_selection=final_feature_selection,
-        include_final_train_selection=False,
-        pred_linear=pred_linear,
-        memory_budget_bytes=memory_budget_bytes,
-        wall_time_budget_seconds=wall_time_budget_seconds,
-        fold_event_callback=fold_event_callback,
-    )
-    recent_by_h: dict[int, dict[str, Any]] = {
-        half_life: run_model_pipeline(
+    expanding_by_mode: dict[str, dict[str, Any]] = {}
+    recent_by_h_by_mode: dict[str, dict[int, dict[str, Any]]] = {}
+    for mode in weighting_modes:
+        expanding_by_mode[mode] = run_model_pipeline(
             work,
             feature_cols=feature_cols,
             target_col=target_col,
@@ -995,17 +1131,36 @@ def run_close_morning_recency_ensemble_experiment(
             n_splits=n_splits,
             purge_gap=purge_gap,
             model_type="lgb_regressor",
-            recency_half_life_groups=half_life,
             fold_feature_plans=fold_feature_plans,
             final_feature_selection=final_feature_selection,
             include_final_train_selection=False,
             pred_linear=pred_linear,
+            weighting_mode=mode,
             memory_budget_bytes=memory_budget_bytes,
             wall_time_budget_seconds=wall_time_budget_seconds,
             fold_event_callback=fold_event_callback,
         )
-        for half_life in half_lives
-    }
+        recent_by_h_by_mode[mode] = {
+            half_life: run_model_pipeline(
+                work,
+                feature_cols=feature_cols,
+                target_col=target_col,
+                group_col=group_col,
+                n_splits=n_splits,
+                purge_gap=purge_gap,
+                model_type="lgb_regressor",
+                recency_half_life_groups=half_life,
+                fold_feature_plans=fold_feature_plans,
+                final_feature_selection=final_feature_selection,
+                include_final_train_selection=False,
+                pred_linear=pred_linear,
+                weighting_mode=mode,
+                memory_budget_bytes=memory_budget_bytes,
+                wall_time_budget_seconds=wall_time_budget_seconds,
+                fold_event_callback=fold_event_callback,
+            )
+            for half_life in half_lives
+        }
     risk_oof = fit_predict_quantile_and_classifier(
         work,
         feature_cols=risk_cols,
@@ -1014,17 +1169,26 @@ def run_close_morning_recency_ensemble_experiment(
         n_splits=n_splits,
         purge_gap=purge_gap,
     )
-    aligned_exp = _align_close_morning_oof(
-        expanding["oof_predictions"], risk_oof, target_col=target_col, group_col=group_col
-    )
-    aligned_recent = {
-        half_life: _align_close_morning_oof(
-            recent_by_h[half_life]["oof_predictions"],
+    aligned_exp_by_mode = {
+        mode: _align_close_morning_oof(
+            expanding_by_mode[mode]["oof_predictions"],
             risk_oof,
             target_col=target_col,
             group_col=group_col,
         )
-        for half_life in half_lives
+        for mode in weighting_modes
+    }
+    aligned_recent_by_mode = {
+        mode: {
+            half_life: _align_close_morning_oof(
+                recent_by_h_by_mode[mode][half_life]["oof_predictions"],
+                risk_oof,
+                target_col=target_col,
+                group_col=group_col,
+            )
+            for half_life in half_lives
+        }
+        for mode in weighting_modes
     }
 
     splitter = PurgedGroupTimeSeriesSplit(n_splits=n_splits, purge_gap=purge_gap)
@@ -1033,6 +1197,7 @@ def run_close_morning_recency_ensemble_experiment(
     }
     folds: list[dict[str, Any]] = []
     chosen_config_tuples: list[tuple[int | None, float]] = []
+    chosen_weighting_modes: list[str] = []
     baseline_series: list[np.ndarray] = []
     candidate_series: list[np.ndarray] = []
     baseline_dates: list[np.ndarray] = []
@@ -1058,8 +1223,12 @@ def run_close_morning_recency_ensemble_experiment(
             alphas=alphas,
             risk_feature_cols=risk_cols,
             pred_linear=pred_linear,
+            weighting_modes=weighting_modes,
         )
         chosen_half_life, chosen_alpha = inner["chosen_config"]
+        chosen_weighting_mode = inner["chosen_weighting_mode"]
+        aligned_exp = aligned_exp_by_mode[chosen_weighting_mode]
+        aligned_recent = aligned_recent_by_mode[chosen_weighting_mode]
 
         outer_val = aligned_exp[aligned_exp[group_col].isin(val_groups)]
         panel_start = full_date_positions[outer_val[group_col].min()]
@@ -1113,6 +1282,7 @@ def run_close_morning_recency_ensemble_experiment(
                 "chosen_config": {
                     "half_life": chosen_half_life,
                     "recent_weight": chosen_alpha,
+                    "weighting_mode": chosen_weighting_mode,
                 },
                 "inner": inner,
                 "baseline": {
@@ -1126,6 +1296,7 @@ def run_close_morning_recency_ensemble_experiment(
             }
         )
         chosen_config_tuples.append((chosen_half_life, chosen_alpha))
+        chosen_weighting_modes.append(chosen_weighting_mode)
         baseline_series.append(baseline_eval["scheduled_returns"])
         candidate_series.append(candidate_eval["scheduled_returns"])
         baseline_dates.append(baseline_eval["dates"])
@@ -1139,6 +1310,7 @@ def run_close_morning_recency_ensemble_experiment(
                         "chosen_config": {
                             "half_life": chosen_half_life,
                             "recent_weight": chosen_alpha,
+                            "weighting_mode": chosen_weighting_mode,
                         },
                         "inner_n_groups": int(inner["inner_n_groups"]),
                         "inner_n_splits": int(inner["inner_n_splits"]),
@@ -1181,16 +1353,25 @@ def run_close_morning_recency_ensemble_experiment(
     research_bundle: dict[str, Any] | None = None
     if build_research_bundle and promotion["promoted"]:
         dominant_half_life, dominant_alpha = _dominant_recency_config(chosen_config_tuples)
+        dominant_weighting_mode = max(
+            set(chosen_weighting_modes), key=chosen_weighting_modes.count
+        )
         bundle_half_life = (
             dominant_half_life if dominant_half_life is not None else half_lives[0]
         )
-        recent_weights = calculate_recency_sample_weight(work[group_col], bundle_half_life)
+        if dominant_weighting_mode == "date_balanced":
+            recent_weights = calculate_date_balanced_sample_weight(
+                work[group_col], bundle_half_life
+            )
+        else:
+            recent_weights = calculate_recency_sample_weight(work[group_col], bundle_half_life)
         recent_return_model = LGBMRegressor(objective="huber", random_state=42)
         recent_return_model.fit(work[feature_cols], work[target_col], sample_weight=recent_weights)
         recency_ensemble_config = {
             "version": "close-morning-recency-ensemble-research",
             "half_life_groups": bundle_half_life,
             "recent_weight": dominant_alpha,
+            "weighting_mode": dominant_weighting_mode,
             "probability_weight": probability_weight,
             "score_col": "decision_score",
         }
@@ -1210,6 +1391,7 @@ def run_close_morning_recency_ensemble_experiment(
             "policy_candidate": "always_buy_top1",
             "half_lives": list(half_lives),
             "alphas": list(alphas),
+            "weighting_modes": list(weighting_modes),
             "probability_weight": probability_weight,
             "n_splits": n_splits,
             "purge_gap": purge_gap,
@@ -1218,8 +1400,8 @@ def run_close_morning_recency_ensemble_experiment(
         },
         "folds": folds,
         "chosen_configs": [
-            {"half_life": half_life, "recent_weight": recent_weight}
-            for half_life, recent_weight in chosen_config_tuples
+            {"half_life": half_life, "recent_weight": recent_weight, "weighting_mode": chosen_weighting_modes[fold]}
+            for fold, (half_life, recent_weight) in enumerate(chosen_config_tuples)
         ],
         "aggregate": {
             "baseline": baseline_agg,
@@ -1229,6 +1411,9 @@ def run_close_morning_recency_ensemble_experiment(
             "baseline": _close_morning_yearly_breakdown(baseline_dates_cat, baseline_cat),
             "candidate": _close_morning_yearly_breakdown(candidate_dates_cat, candidate_cat),
         },
+        "baseline_oof_dates": baseline_dates_cat,
+        "candidate_oof_dates": candidate_dates_cat,
+        "oof_dates": candidate_dates_cat,
         "promotion": promotion,
         "research_bundle": research_bundle,
     }
@@ -1430,6 +1615,7 @@ def run_model_pipeline(
     recency_half_life_groups: int | None = None,
     feature_selection_config: FeatureSelectionConfig | None = None,
     *,
+    weighting_mode: str = "current",
     fold_feature_plans: Sequence[FoldFeaturePlan] | None = None,
     final_feature_selection: FeatureSelectionResult | None = None,
     pred_linear: bool = True,
@@ -1448,6 +1634,12 @@ def run_model_pipeline(
     검증 행·타깃·미래 날짜는 가중치 계산에 절대 사용되지 않습니다. 지원 값은
     ``None``(기존 expanding 동작), 252, 504 뿐이며, Ridge/LGBMRanker 는 비검증
     동작을 방지하기 위해 비영 recency 가중치를 거부합니다.
+
+    ``weighting_mode`` 는 ``current``(기존 uniform/recency-only) 또는
+    ``date_balanced``(거래일별 균등 총 로스 질량) 를 지정하며 회귀 champion 학습
+    sample weight 계산에만 영향을 줍니다. ``date_balanced`` 는
+    ``calculate_date_balanced_sample_weight`` 로 fold train 그룹에서만 계산되고,
+    기본 ``current`` 는 기존 동작을 그대로 유지합니다 (배포 번들 기본값 미변경).
 
     ``feature_selection_config`` 가 주어지면 각 outer fold 의 train 분할에서만
     fold-local 선택을 수행하고 해당 fold 의 선택 목록으로만 모델을 학습·예측합니다.
@@ -1507,6 +1699,15 @@ def run_model_pipeline(
                 "recency_half_life_groups must be one of None, 252, 504, "
                 f"got {recency_half_life_groups!r}"
             )
+    if weighting_mode not in ("current", "date_balanced"):
+        raise ValueError(
+            f"weighting_mode must be one of current/date_balanced, got {weighting_mode!r}"
+        )
+    if weighting_mode == "date_balanced" and model_type != "lgb_regressor":
+        raise ValueError(
+            "weighting_mode=date_balanced is only supported for lgb_regressor, "
+            f"got model_type={model_type!r}"
+        )
     missing_cols = [col for col in [*feature_cols, target_col, group_col] if col not in df.columns]
     if missing_cols:
         raise ValueError(f"missing columns in df: {missing_cols}")
@@ -1574,11 +1775,16 @@ def run_model_pipeline(
             )
         else:
             fold_feature_cols = feature_cols
-        sample_weight = (
-            calculate_recency_sample_weight(train[group_col], recency_half_life_groups)
-            if recency_half_life_groups is not None
-            else None
-        )
+        if weighting_mode == "date_balanced":
+            sample_weight = calculate_date_balanced_sample_weight(
+                train[group_col], recency_half_life_groups
+            )
+        elif recency_half_life_groups is not None:
+            sample_weight = calculate_recency_sample_weight(
+                train[group_col], recency_half_life_groups
+            )
+        else:
+            sample_weight = None
         fit_started = time.perf_counter()
         model, pred = _fit_predict(
             model_type,

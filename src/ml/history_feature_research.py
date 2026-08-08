@@ -54,7 +54,6 @@ from src.ml.history_features import (
 from src.ml.model_pipeline import (
     run_close_morning_recency_ensemble_experiment,
 )
-from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
 from src.ml.sizing_engine import save_model_artifacts
 from src.processing.preprocessor import build_ml_dataset
 
@@ -66,6 +65,59 @@ _TEMPORAL_SCOPE = "history_temporal_panel"
 _RESEARCH_CACHE_VERSION = "history_feature_cache_v1"
 _AVAILABLE_MODES = ("confirmation", "discovery")
 ProgressCallback = Callable[[str, Mapping[str, Any]], None]
+
+
+def _normalize_oof_dates(dates: np.ndarray) -> tuple[bool, list[str]]:
+    """실제 scheduled-return 날짜 배열을 표준화합니다.
+
+    각 날짜를 파싱해 유일·오름차순 문자열 목록으로 정규화하고, 파싱 불가·중복·
+    빈 배열이면 ``(False, [])`` 를 반환합니다. 표준화는 재현 가능하도록 시간대가
+    보존된 ISO 문자열을 사용합니다.
+    """
+    if dates is None or len(dates) == 0:
+        return False, []
+    series = pd.Series(np.asarray(dates, dtype=object))
+    parsed = pd.to_datetime(series, errors="coerce")
+    if parsed.isna().any():
+        return False, []
+    if parsed.duplicated().any():
+        return False, []
+    normalized = sorted(d.isoformat() for d in parsed.drop_duplicates())
+    return True, normalized
+
+
+def validate_research_oof_alignment(
+    control_dates: np.ndarray, candidate_dates: np.ndarray
+) -> tuple[bool, list[str], list[str]]:
+    """컨트롤/후보 실험의 실제 OOF 날짜 배열 동일성을 검증합니다.
+
+    두 실험의 실제 scheduled-return 날짜 배열을 각각 표준화한 뒤 비교해, 누락·
+    추가·재배열·중복·파싱 불가가 하나라도 있으면 ``(False, [], [])`` 를 반환합니다.
+    표준화된 두 날짜 목록과 일치 여부는 리서치 번들 비교 페이로드에 그대로 보존됩니다.
+    """
+    control_ok, control_norm = _normalize_oof_dates(control_dates)
+    candidate_ok, candidate_norm = _normalize_oof_dates(candidate_dates)
+    if not control_ok or not candidate_ok:
+        return False, [], []
+    return control_norm == candidate_norm, control_norm, candidate_norm
+
+
+def _oof_date_mismatch_diagnostic(
+    control_norm: list[str], candidate_norm: list[str]
+) -> str:
+    """표준화 날짜 목록의 결정적 불일치 진단 문자열을 반환합니다."""
+    if control_norm == candidate_norm:
+        return "oof_dates_identical"
+    control_set = set(control_norm)
+    candidate_set = set(candidate_norm)
+    missing = sorted(control_set - candidate_set)
+    additional = sorted(candidate_set - control_set)
+    parts: list[str] = []
+    if missing:
+        parts.append(f"missing={missing[:5]}")
+    if additional:
+        parts.append(f"additional={additional[:5]}")
+    return "oof_date_mismatch(" + ", ".join(parts) + ")"
 
 
 def _resolve_research_selection_config(
@@ -332,9 +384,10 @@ def _promotion_gate(
     candidate: dict[str, Any],
     identical_oof_dates: bool,
     stability: dict[str, Any],
+    availability_promotable: bool = True,
 ) -> dict[str, Any]:
-    """확정 게이트: 동일 OOF 날짜 + 양수 scheduled mean + 대조군보다 엄격히 높은
-    mean + PF>1 + MDD 엄격 감소 + 안정성."""
+    """확정 게이트: 가용성 증명 + 동일 OOF 날짜 + 양수 scheduled mean + 대조군보다
+    엄격히 높은 mean + PF>1 + MDD 엄격 감소 + 안정성."""
     control_agg = control["aggregate"]["candidate"]
     candidate_agg = candidate["aggregate"]["candidate"]
     cand_mean = float(candidate_agg["scheduled_mean_return"])
@@ -354,6 +407,8 @@ def _promotion_gate(
     )
     stability_ok = bool(stability.get("gate_passed", False))
     rejected_reasons: list[str] = []
+    if not availability_promotable:
+        rejected_reasons.append("availability_manifest_non_promotable")
     if not identical_oof_dates:
         rejected_reasons.append("oof_dates_mismatch")
     if not positive_mean:
@@ -368,6 +423,7 @@ def _promotion_gate(
         rejected_reasons.append("stability_gate_failed")
     return {
         "promoted": not rejected_reasons,
+        "availability_manifest_promotable": bool(availability_promotable),
         "identical_oof_dates": bool(identical_oof_dates),
         "positive_scheduled_net_mean": bool(positive_mean),
         "candidate_beats_control_mean": bool(beats_control),
@@ -396,6 +452,9 @@ def run_history_feature_research_experiment(
     wall_time_budget_seconds: float | None = 1800.0,
     export_dir: str = "artifacts/models/research",
     progress_callback: ProgressCallback | None = None,
+    observation_time_col: str | None = None,
+    decision_time_col: str | None = None,
+    execution_time_col: str | None = None,
 ) -> dict[str, Any]:
     """close_morning61 v8 컨트롤 대비 causal-history 후보 리서치 실험을 실행합니다.
 
@@ -417,6 +476,10 @@ def run_history_feature_research_experiment(
         wall_time_budget_seconds: 전체 실행 wall-time 예산 (기본 30분).
         export_dir: 후보 번들 저장 root (버전/컷오프 하위 디렉터리로 분리).
         progress_callback: 진행 이벤트 콜백.
+        observation_time_col / decision_time_col / execution_time_col: 원산지
+            증명 타임스탬프 컬럼명. 모두 주어지면 결정 시점 가용성 증명이 강제되고
+            승격 게이트의 ``availability_manifest_promotable`` 로 반영됩니다.
+            주어지지 않으면 (레거시) discovery-only 승격 불가 상태로 기록됩니다.
 
     Returns:
         dict: ``contract``, ``build_metrics``, ``control``, ``candidate``,
@@ -432,6 +495,10 @@ def run_history_feature_research_experiment(
         theme_df,
         feature_set=feature_set,
         panel_mode=panel_mode,
+        observation_time_col=observation_time_col,
+        decision_time_col=decision_time_col,
+        execution_time_col=execution_time_col,
+        provenance_mode=mode,
     )
     base_feature_candidates = [col for col in _x.columns if col not in cat_features]
     base_feature_cols = []
@@ -591,31 +658,39 @@ def run_history_feature_research_experiment(
         {"metrics": dict(candidate["aggregate"]["candidate"])},
     )
 
-    splitter = PurgedGroupTimeSeriesSplit(n_splits=n_splits, purge_gap=purge_gap)
-    oof_dates = sorted(
-        {
-            date
-            for _, val_idx in splitter.split(
-                joined, y=joined[target_col], groups=joined[group_col]
-            )
-            for date in joined.iloc[val_idx][group_col].unique()
-        }
-    )
-    identical_oof_dates = True
     control_agg = dict(control["aggregate"]["candidate"])
     candidate_agg = dict(candidate["aggregate"]["candidate"])
+
+    identical_oof_dates, control_oof_dates, candidate_oof_dates = (
+        validate_research_oof_alignment(
+            control["baseline_oof_dates"], candidate["candidate_oof_dates"]
+        )
+    )
 
     stability = (
         diagnostics.get("stability", {})
         if diagnostics is not None
         else {"gate_passed": True, "reason": "no_feature_selection"}
     )
-    promotion = _promotion_gate(control, candidate, identical_oof_dates, stability)
+    availability_provenance = processed.attrs.get(
+        "availability_provenance", {"promotable": False, "mode": "discovery"}
+    )
+    availability_promotable = bool(availability_provenance.get("promotable", False))
+    promotion = _promotion_gate(
+        control,
+        candidate,
+        identical_oof_dates,
+        stability,
+        availability_promotable=availability_promotable,
+    )
 
     comparison = {
         "identical_oof_dates": identical_oof_dates,
-        "control_oof_dates": [str(d) for d in oof_dates],
-        "candidate_oof_dates": [str(d) for d in oof_dates],
+        "control_oof_dates": control_oof_dates,
+        "candidate_oof_dates": candidate_oof_dates,
+        "oof_date_mismatch": _oof_date_mismatch_diagnostic(
+            control_oof_dates, candidate_oof_dates
+        ),
         "control_metrics": control_agg,
         "candidate_metrics": candidate_agg,
         "control_policy": _ensemble_policy_summary(control),
@@ -658,6 +733,7 @@ def run_history_feature_research_experiment(
         "feature_selection_diagnostics": diagnostics,
         "quality_report": quality_report,
         "training_cutoff": str(joined[group_col].max()),
+        "availability_provenance": availability_provenance,
         "control_metrics": control_agg,
         "candidate_metrics": candidate_agg,
         "promotion": promotion,
@@ -713,5 +789,6 @@ def run_history_feature_research_experiment(
         },
         "comparison": comparison,
         "promotion": promotion,
+        "availability_provenance": availability_provenance,
         "candidate_bundle_path": saved_path,
     }

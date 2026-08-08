@@ -19,6 +19,7 @@ from src.processing.preprocessor import (
     clean_column_names,
     create_multi_targets,
     engineer_features,
+    validate_decision_time_availability,
 )
 
 
@@ -747,3 +748,124 @@ def test_s8_pct_rank_missing_col() -> None:
     assert "foreign_density_z" not in out.columns
     assert "major_density_z" in out.columns
     assert out["major_density_z"].notna().all()
+
+
+def _availability_frame(n_rows: int = 3) -> pd.DataFrame:
+    """결정 시점 가용성 검증용 타임스탬프 프레임 (KST aware)."""
+    tz = "Asia/Seoul"
+    base = pd.to_datetime(
+        [f"2024-01-0{i + 2} 15:00:00" for i in range(n_rows)]
+    ).tz_localize(tz)
+    return pd.DataFrame(
+        {
+            "observation_time": base + pd.Timedelta(minutes=10),
+            "decision_time": base + pd.Timedelta(minutes=20),
+            "execution_time": base + pd.Timedelta(minutes=30),
+            "value": [1.0, 2.0, 3.0],
+        }
+    )
+
+
+def _availability_manifest() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "feature_name": ["close_position", "relative_change_rate"],
+            "source_column": ["close_price", "close_price"],
+            "availability_rule": ["at_decision_time", "at_decision_time"],
+            "unit": ["ratio", "ratio"],
+            "panel_scope": ["candidate_panel", "candidate_panel"],
+        }
+    )
+
+
+def test_p0a_availability_passes_confirmation_and_index_preserved() -> None:
+    """P0-AVAILABILITY: 유효한 증명은 confirmation 에서 통과하고 인덱스가 보존됩니다."""
+    frame = _availability_frame()
+    manifest = _availability_manifest()
+    result = validate_decision_time_availability(
+        frame, manifest, "observation_time", "decision_time", "execution_time"
+    )
+    assert result.index.equals(frame.index)
+    provenance = result.attrs["availability_provenance"]
+    assert provenance["promotable"] is True
+    assert provenance["rejected_row_count"] == 0
+    assert provenance["input_hash"]
+    assert provenance["timestamp_timezone"] == "Asia/Seoul"
+    assert (
+        provenance["decision_time_rule"] == "observation_time <= decision_time <= execution_time"
+    )
+
+
+def test_p0a_observation_after_decision_raises_in_confirmation() -> None:
+    """P0-AVAILABILITY-01: 관측이 결정 시점보다 늦은 close 파생 피처는 confirmation 에서 ValueError."""
+    frame = _availability_frame()
+    frame.loc[frame.index[1], "observation_time"] = frame.loc[
+        frame.index[1], "decision_time"
+    ] + pd.Timedelta(minutes=1)
+    manifest = _availability_manifest()
+    with pytest.raises(ValueError, match="decision-time availability"):
+        validate_decision_time_availability(
+            frame, manifest, "observation_time", "decision_time", "execution_time"
+        )
+
+
+def test_p0a_timezone_naive_raises_in_confirmation() -> None:
+    """P0-AVAILABILITY-02: 타임존 naive 증명은 confirmation 에서 ValueError."""
+    frame = _availability_frame()
+    frame["decision_time"] = frame["decision_time"].dt.tz_localize(None)
+    manifest = _availability_manifest()
+    with pytest.raises(ValueError, match="timezone_naive"):
+        validate_decision_time_availability(
+            frame, manifest, "observation_time", "decision_time", "execution_time"
+        )
+
+
+def test_p0a_missing_provenance_raises_in_confirmation() -> None:
+    """P0-AVAILABILITY-02: 증명 컬럼 부재는 confirmation 에서 ValueError."""
+    frame = _availability_frame().drop(columns=["execution_time"])
+    manifest = _availability_manifest()
+    with pytest.raises(ValueError, match="missing_timestamp_columns"):
+        validate_decision_time_availability(
+            frame, manifest, "observation_time", "decision_time", "execution_time"
+        )
+
+
+def test_p0a_partial_provenance_raises_in_confirmation() -> None:
+    """P0-AVAILABILITY: 일부 타임스탬프만 지정한 confirmation 입력은 fail-closed 입니다."""
+    with pytest.raises(ValueError, match="requires observation_time_col"):
+        build_ml_dataset(
+            _build_raw_df(),
+            observation_time_col="observation_time",
+            decision_time_col="decision_time",
+            provenance_mode="confirmation",
+        )
+
+
+def test_p0a_discovery_records_non_promotable_without_raising() -> None:
+    """P0-AVAILABILITY-02: discovery 모드는 위반을 승격 불가 상태로 기록하고 예외를 던지지 않습니다."""
+    frame = _availability_frame()
+    frame.loc[frame.index[0], "observation_time"] = frame.loc[
+        frame.index[0], "decision_time"
+    ] + pd.Timedelta(minutes=5)
+    manifest = _availability_manifest()
+    result = validate_decision_time_availability(
+        frame,
+        manifest,
+        "observation_time",
+        "decision_time",
+        "execution_time",
+        mode="discovery",
+    )
+    provenance = result.attrs["availability_provenance"]
+    assert provenance["promotable"] is False
+    assert provenance["rejected_row_count"] == 1
+    assert provenance["mode"] == "discovery"
+
+
+def test_build_ml_dataset_legacy_records_discovery_non_promotable() -> None:
+    """P0-AVAILABILITY: 증명 컬럼 없는 레거시 build_ml_dataset 은 discovery 승격 불가 상태를 기록합니다."""
+    X, _targets, _cat, processed = build_ml_dataset(_build_raw_df())
+    provenance = processed.attrs["availability_provenance"]
+    assert provenance["promotable"] is False
+    assert provenance["mode"] == "discovery"
+    assert X.attrs["availability_provenance"]["promotable"] is False
