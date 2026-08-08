@@ -4,17 +4,35 @@
 구현합니다. 각 outer fold 의 train 분할에서만 계산하므로 validation/이후 날짜
 라벨은 선택에 절대 노출되지 않습니다.
 
-선택 흐름 (train 구간 전용, 결정적):
+``selection_rule`` 에 따라 두 가지 흐름이 있습니다 (train 구간 전용, 결정적):
+
+``fixed_cap`` (legacy, API 기본):
 1. 품질 거부: 전부 비유한(all-nonfinite) 컬럼, train 결측률 > 0.35, 영분산 컬럼을
    이유와 함께 거부합니다.
-2. 고정 시드·단일 스레드 LightGBM(Huber) 스크리닝 모델로 gain 중요도를 계산합니다.
+2. 결정적 CPU LightGBM(Huber) 스크리닝 모델로 gain 중요도를 계산합니다 (CPU fit 은
+   ``deterministic=True`` + ``force_col_wise=True`` 이므로 스레드 수와 무관하게
+   재현됩니다).
 3. ``gain <= min_gain`` 인 영-gain 컬럼을 ``zero_gain`` 으로 거부합니다.
-4. train 행만 사용한 절대 Spearman 상관이 0.98 을 넘는 쌍을 (gain desc, 이름 asc)
-   결정적 tie-break 으로 가지치기합니다 (``correlated_pair_pruned``).
+4. train 행만 사용한 exact pairwise-complete Spearman 상관이 ``correlation_threshold``
+   를 넘는 쌍을 (gain desc, 이름 asc) 결정적 tie-break 으로 가지치기합니다.
 5. 양의 gain 컬럼을 (gain desc, 이름 asc) 로 정렬해 최대 ``max_retained`` 개를
    유지하며, 초과분은 ``beyond_max_retained`` 로 거부합니다.
 6. 유지 수가 ``min_retained`` 미만(또는 ``hard_max_retained`` 초과)이면
    ``ValueError`` 로 fail-closed 하며, zero-importance 컬럼으로 패딩하지 않습니다.
+
+``permutation_fwer`` (신규 리서치 기본): 3 번 대신 아래의 null 임계값을 사용합니다.
+1. 품질 거부 -> 2. 실 target 으로 실제 gain 계산.
+3. ``null_permutations`` 회, 같은 ``group_col`` 값(거래일) 안에서만 target 을 섞어
+   동일 스크리닝을 재적합하고 각 순열의 최대 gain 을 수집합니다. 날짜-로컬 순열은
+   일별 target 분포를 보존하면서 피처-수익 연관만 끊으므로 결정 시점 간 정보 이동이
+   없습니다.
+4. 임계값 ``T`` = 순열 최대 gain 의 empirical ``(1 - null_alpha)`` 분위수. 실제
+   gain 이 ``T`` 를 엄격히 초과하는 컬럼만 유지하며, 이하 컬럼은
+   ``not_significant_vs_null`` 로 거부합니다 (FWER ``alpha`` 제어).
+5. 유지 목록에 exact pairwise-complete Spearman 가지치기를 적용합니다. ``max_retained``
+   / ``min_retained`` 는 적용하지 않으며, 유지 수가
+   ``[min_significant_features, hard_max_retained]`` 를 벗어나면 ``ValueError`` 로
+   fail-closed 합니다 (조용한 truncation 없음).
 
 Vectorized 전용이며 ``pd.apply`` 를 사용하지 않습니다. SHAP 은 선택기가 아니라
 옵션 사후 설명 전용입니다.
@@ -25,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -45,6 +64,7 @@ _REASON_ZERO_VARIANCE = "zero_variance"
 _REASON_ZERO_GAIN = "zero_gain"
 _REASON_CORRELATED = "correlated_pair_pruned"
 _REASON_BEYOND_CAP = "beyond_max_retained"
+_REASON_NOT_SIGNIFICANT = "not_significant_vs_null"
 
 _KNOWN_REJECTION_REASONS: frozenset[str] = frozenset(
     {
@@ -55,6 +75,7 @@ _KNOWN_REJECTION_REASONS: frozenset[str] = frozenset(
         _REASON_ZERO_GAIN,
         _REASON_CORRELATED,
         _REASON_BEYOND_CAP,
+        _REASON_NOT_SIGNIFICANT,
     }
 )
 
@@ -92,6 +113,11 @@ class FeatureSelectionConfig(pydantic.BaseModel):
     min_fold_selection_rate: float = 1.0
     screening_device: Literal["cpu", "gpu", "auto"] = "cpu"
     n_jobs: int = -1
+    selection_rule: Literal["fixed_cap", "permutation_fwer"] = "fixed_cap"
+    null_alpha: float = 0.05
+    null_permutations: int = 19
+    min_significant_features: int = 1
+    min_pairwise_observations: int = 3
 
     @pydantic.model_validator(mode="after")
     def _validate_ranges(self) -> FeatureSelectionConfig:
@@ -120,6 +146,26 @@ class FeatureSelectionConfig(pydantic.BaseModel):
             raise ValueError(
                 f"n_jobs must be -1 (all cores) or >= 1, got {self.n_jobs}"
             )
+        if not 0.0 < self.null_alpha < 1.0:
+            raise ValueError(f"null_alpha must be in (0, 1), got {self.null_alpha}")
+        min_null_permutations = math.ceil(1.0 / self.null_alpha) - 1
+        if self.null_permutations < min_null_permutations:
+            raise ValueError(
+                f"null_permutations must be >= ceil(1/null_alpha) - 1 = "
+                f"{min_null_permutations}, got {self.null_permutations}"
+            )
+        if self.min_significant_features < 1:
+            raise ValueError(
+                f"min_significant_features must be >= 1, got {self.min_significant_features}"
+            )
+        if self.min_pairwise_observations < 3:
+            raise ValueError(
+                f"min_pairwise_observations must be >= 3, got {self.min_pairwise_observations}"
+            )
+        if self.selection_rule == "permutation_fwer" and self.screening_device != "cpu":
+            raise ValueError(
+                "selection_rule='permutation_fwer' requires screening_device='cpu'"
+            )
         return self
 
 
@@ -129,7 +175,8 @@ class FeatureSelectionResult(pydantic.BaseModel):
     - ``selected_features``: 최종 유지 피처 (gain desc, 이름 asc) 순서.
     - ``gains``: 양의 gain 을 가진 후보의 (feature, gain) 쌍, (gain desc, 이름 asc).
     - ``rejected``: (feature, reason) 쌍 (품질/영-gain/상관/초과 사유 포함).
-    - ``counts``: n_candidates, n_rejected, n_positive_gain, n_retained 등.
+    - ``counts``: n_candidates, n_rejected, n_positive_gain, n_pre_correlation,
+      n_post_correlation, n_retained 등.
     - ``metadata``: data_cutoff, n_train_rows, n_groups, random_seed 등.
     """
 
@@ -165,7 +212,7 @@ class FoldFeaturePlan:
     같은 fold 의 expanding/recent return 전문가가 동일한 ``selected_features``
     를 공유해야 하므로, 선택 결과와 그 근거(거부 사유·gain·카운트·설정 지문·
     시드)를 불변 값으로 캡슐화합니다. ``config`` 는 OOF 평가 후 research 번들
-    용 full-data ``final_train_only`` 선택을 재현할 때만 사용됩니다.
+    용 full-data ``full_training_selection`` 을 재현할 때만 사용됩니다.
     """
 
     fold: int
@@ -205,7 +252,14 @@ def build_fold_feature_plans(
         splitter.split(work, y=work[target_col], groups=work[group_col])
     ):
         train = work.iloc[train_idx]
-        result = select_features(train, feature_cols, target_col, config)
+        result = select_features(
+            train,
+            feature_cols,
+            target_col,
+            config,
+            group_col=group_col,
+            provenance="fold_train_selection",
+        )
         plans.append(
             FoldFeaturePlan(
                 fold=fold,
@@ -341,24 +395,46 @@ def _prune_correlated(
     ordered_names: list[str],
     config: FeatureSelectionConfig,
 ) -> tuple[list[str], dict[str, str]]:
-    """train 행만 사용한 Spearman 상관 가지치기 (BLAS 행렬곱, 결정적 tie-break).
+    """train 행만 사용한 exact pairwise-complete Spearman 가지치기 (BLAS 행렬곱).
 
-    판다스 ``.corr(method="spearman")`` 의 단일 스레드 pairwise 계산 대신,
-    전 컬럼 동시 rank -> 평균 0/표준편차 1 표준화 -> ``Z^T Z / N`` BLAS 행렬곱으로
-    Spearman 행렬을 계산합니다 (결측값은 표준화 후 0으로 처리해 기여하지 않음).
-    유지/거부 판정은 결정적 greedy 스캔으로 NumPy 2D 인덱싱을 사용합니다.
+    각 컬럼을 유한 관측값으로 rank 하고, 쌍 ``(i, j)`` 의 상관은 두 컬럼이 모두
+    존재하는 행만 사용해 계산합니다. 쌍별 개수·랭크합·랭크제곱합·교차곱 5 개
+    행렬을 ``mask``/``rank`` 행렬의 행렬곱으로 한 번에 유도하므로 ``pd.apply`` 나
+    컬럼 순회가 없습니다. 공통 관측 수가 ``min_pairwise_observations`` 미만이거나
+    쌍 분산이 0 이면 상관은 0.0 으로 정의해 해당 쌍은 가지치기에서 생존합니다
+    (결측을 0 으로 채운 표준화 랭크로 전체 행 수로 나누는 기존 방식의 확장 오류
+    제거). 유지/거부 판정은 결정적 greedy 스캔((gain desc, 이름 asc) 순서)으로
+    절대 상관이 ``correlation_threshold`` 를 엄격히 초과할 때만 거부합니다.
     """
     if len(ordered_names) < 2:
         return ordered_names, {}
     ranked = train[ordered_names].rank(method="average")
-    mat = ranked.to_numpy(dtype=np.float64)
-    n_rows = mat.shape[0]
-    mu = np.nanmean(mat, axis=0)
-    sd = np.nanstd(mat, axis=0)
-    sd[sd == 0] = np.nan
-    z = np.where(np.isnan((mat - mu) / sd), 0.0, (mat - mu) / sd)
-    corr = (z.T @ z) / n_rows
+    r = ranked.to_numpy(dtype=np.float64)
+    present = np.isfinite(r)
+    mask = present.astype(np.float64)
+    r0 = np.where(present, r, 0.0)
+
+    pair_count = mask.T @ mask
+    rank_sum_i = r0.T @ mask
+    rank_sum_j = mask.T @ r0
+    rank_sq_i = (r0 * r0).T @ mask
+    rank_sq_j = mask.T @ (r0 * r0)
+    cross = r0.T @ r0
+
+    n = pair_count
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean_i = rank_sum_i / n
+        mean_j = rank_sum_j / n
+        var_i = rank_sq_i / n - mean_i * mean_i
+        var_j = rank_sq_j / n - mean_j * mean_j
+        cov = cross / n - mean_i * mean_j
+        denom = np.sqrt(var_i * var_j)
+        corr = np.where(denom > 0.0, cov / np.where(denom > 0.0, denom, np.nan), 0.0)
+    corr = np.where(np.isfinite(corr), corr, 0.0)
     corr = np.clip(corr, -1.0, 1.0)
+    corr[n < config.min_pairwise_observations] = 0.0
+    corr[var_i <= 0.0] = 0.0
+    corr[var_j <= 0.0] = 0.0
     np.fill_diagonal(corr, 1.0)
 
     kept_indices: list[int] = []
@@ -416,26 +492,93 @@ def _resolve_screening_device(device: str) -> tuple[str, str | None]:
     return _SCREENING_DEVICE_RESULTS[device]
 
 
+def _screen_gains(
+    x: pd.DataFrame, target: np.ndarray, config: FeatureSelectionConfig
+) -> np.ndarray:
+    """결정적 CPU Huber LightGBM 스크리닝을 적합하고 컬럼별 gain 을 반환합니다.
+
+    CPU 적합에는 ``deterministic=True`` + ``force_col_wise=True`` 를 적용해 스레드
+    수(config ``n_jobs``)와 무관하게 같은 결과가 재현되며, GPU 는 기존 설정을
+    유지합니다. ``x`` 의 컬럼 순서와 반환 배열이 1:1 대응합니다.
+    """
+    resolved_device, _ = _resolve_screening_device(config.screening_device)
+    kwargs: dict[str, Any] = {
+        "objective": "huber",
+        "random_state": config.random_seed,
+        "n_jobs": config.n_jobs,
+        "verbosity": -1,
+        "device": resolved_device,
+    }
+    if resolved_device == "cpu":
+        kwargs["deterministic"] = True
+        kwargs["force_col_wise"] = True
+    model = LGBMRegressor(**kwargs)
+    model.fit(x, target)
+    return np.asarray(
+        model.booster_.feature_importance(importance_type="gain"), dtype=np.float64
+    )
+
+
+def _permutation_null_maxima(
+    frame: pd.DataFrame,
+    feature_names: list[str],
+    target: np.ndarray,
+    config: FeatureSelectionConfig,
+    group_col: str,
+) -> np.ndarray:
+    """같은 ``group_col``(거래일) 안에서만 target 을 섞은 null 순열 최대 gain 분포.
+
+    각 순열은 ``config.random_seed`` 로 구동되는 단일 결정적 RNG 를 공유해 항상
+    같은 순열 시퀀스를 산출합니다. target 은 어떤 거래일에서도 다른 거래일로
+    이동하지 않으므로 일별 target 분포는 보존되고 피처-수익 연관만 끊어집니다.
+    반환 배열은 순열별 생존 피처 최대 gain 입니다.
+    """
+    x = frame[feature_names]
+    groups = frame.groupby(group_col, sort=True).indices
+    group_positions = [np.asarray(positions, dtype=np.intp) for positions in groups.values()]
+    rng = np.random.default_rng(config.random_seed)
+    maxima = np.empty(config.null_permutations, dtype=np.float64)
+    for i in range(config.null_permutations):
+        permuted = target.copy()
+        for positions in group_positions:
+            chunk = permuted[positions]
+            permuted[positions] = chunk[rng.permutation(chunk.size)]
+        maxima[i] = _screen_gains(x, permuted, config).max()
+    return maxima
+
 def select_features(
     train: pd.DataFrame,
     feature_cols: list[str],
     target_col: str,
     config: FeatureSelectionConfig,
+    *,
+    group_col: str | None = None,
+    provenance: Literal["fold_train_selection", "full_training_selection"] = "full_training_selection",
 ) -> FeatureSelectionResult:
     """``train`` 구간 데이터만 사용해 fold-local 피처 선택을 수행합니다.
+
+    ``selection_rule`` 이 ``fixed_cap`` 이면 기존 300--400--500 계약을, ``permutation_fwer``
+    이면 날짜-로컬 순열 null 임계값 계약을 따릅니다 (모듈 docstring 참조).
 
     Args:
         train: 선택에 사용할 train 분할 DataFrame (validation/이후 행 금지).
         feature_cols: 후보 피처 컬럼 (순서는 결과에 영향을 주지 않습니다).
         target_col: 학습 라벨 컬럼.
         config: 선택 설정.
+        group_col: ``permutation_fwer`` 에 필수인 거래일 그룹 컬럼. target 은 이
+            컬럼 값이 같은 행 안에서만 순열됩니다.
+        provenance: 결과 메타데이터에 기록할 선택 출처. fold train 전용이면
+            ``fold_train_selection``, full-data 최종이면 ``full_training_selection``.
 
     Returns:
         ``FeatureSelectionResult``.
 
     Raises:
-        ValueError: 후보가 없거나 유지 수가 ``[min_retained, hard_max_retained]``
-            범위를 벗어나면 발생합니다. zero-importance 패딩은 없습니다.
+        ValueError: 후보가 없거나, ``permutation_fwer`` 에서 ``group_col`` 누락/
+            유지 수가 ``[min_significant_features, hard_max_retained]`` 를 벗어나거나,
+            ``fixed_cap`` 에서 유지 수가 ``[min_retained, hard_max_retained]`` 를
+            벗어나면 발생합니다. zero-importance 컬럼으로 패딩하거나 조용히
+            truncation 하지 않습니다.
     """
     if target_col not in train.columns:
         raise ValueError(f"train must contain target_col {target_col!r}")
@@ -464,47 +607,79 @@ def select_features(
         )
 
     resolved_device, fallback_reason = _resolve_screening_device(config.screening_device)
-    model = LGBMRegressor(
-        objective="huber",
-        random_state=config.random_seed,
-        n_jobs=config.n_jobs,
-        verbosity=-1,
-        device=resolved_device,
-    )
-    model.fit(sanitized[survivors], sanitized[target_col])
-    raw_gains = np.asarray(
-        model.booster_.feature_importance(importance_type="gain"), dtype=np.float64
-    )
-    gain_by_name = dict(zip(survivors, raw_gains.tolist(), strict=True))
+    feature_matrix = sanitized[survivors]
 
-    positive = [
-        name for name in survivors if gain_by_name[name] > config.min_gain
-    ]
-    positive.sort(key=lambda name: (-gain_by_name[name], name))
-    for name in survivors:
-        if name not in set(positive):
-            rejected[name] = _REASON_ZERO_GAIN
+    if config.selection_rule == "fixed_cap":
+        raw_gains = _screen_gains(feature_matrix, target_arr, config)
+        gain_by_name = dict(zip(survivors, raw_gains.tolist(), strict=True))
 
-    pruned, pruned_rejected = _prune_correlated(sanitized, positive, config)
-    rejected.update(pruned_rejected)
+        positive = [name for name in survivors if gain_by_name[name] > config.min_gain]
+        positive.sort(key=lambda name: (-gain_by_name[name], name))
+        for name in survivors:
+            if name not in set(positive):
+                rejected[name] = _REASON_ZERO_GAIN
 
-    selected = pruned[: config.max_retained]
-    for name in pruned[config.max_retained :]:
-        rejected[name] = _REASON_BEYOND_CAP
+        pruned, pruned_rejected = _prune_correlated(sanitized, positive, config)
+        rejected.update(pruned_rejected)
 
-    n_retained = len(selected)
-    if not (config.min_retained <= n_retained <= config.hard_max_retained):
-        raise ValueError(
-            f"retained feature count {n_retained} is outside "
-            f"[{config.min_retained}, {config.hard_max_retained}]; "
-            "selection failed closed without padding from zero-gain columns"
+        selected = pruned[: config.max_retained]
+        for name in pruned[config.max_retained :]:
+            rejected[name] = _REASON_BEYOND_CAP
+
+        n_retained = len(selected)
+        if not (config.min_retained <= n_retained <= config.hard_max_retained):
+            raise ValueError(
+                f"retained feature count {n_retained} is outside "
+                f"[{config.min_retained}, {config.hard_max_retained}]; "
+                "selection failed closed without padding from zero-gain columns"
+            )
+        gains = tuple((name, float(gain_by_name[name])) for name in positive)
+        pre_prune = positive
+        threshold: float | None = None
+        null_maxima = np.empty(0, dtype=np.float64)
+    else:
+        if group_col is None:
+            raise ValueError(
+                "selection_rule='permutation_fwer' requires a non-None group_col"
+            )
+        if group_col not in sanitized.columns:
+            raise ValueError(f"train must contain group_col {group_col!r}")
+        real_gains = _screen_gains(feature_matrix, target_arr, config)
+        gain_by_name = dict(zip(survivors, real_gains.tolist(), strict=True))
+        null_maxima = _permutation_null_maxima(
+            sanitized, survivors, target_arr, config, group_col
         )
+        threshold = float(np.quantile(null_maxima, 1.0 - config.null_alpha))
 
-    gains = tuple((name, float(gain_by_name[name])) for name in positive)
+        significant = [name for name in survivors if gain_by_name[name] > threshold]
+        significant.sort(key=lambda name: (-gain_by_name[name], name))
+        for name in survivors:
+            if name not in set(significant):
+                rejected[name] = _REASON_NOT_SIGNIFICANT
+
+        pruned, pruned_rejected = _prune_correlated(sanitized, significant, config)
+        rejected.update(pruned_rejected)
+
+        selected = pruned
+        n_retained = len(selected)
+        if not (
+            config.min_significant_features <= n_retained <= config.hard_max_retained
+        ):
+            raise ValueError(
+                f"retained feature count {n_retained} is outside "
+                f"[{config.min_significant_features}, {config.hard_max_retained}] for "
+                "selection_rule='permutation_fwer'; selection failed closed without "
+                "padding or silent truncation"
+            )
+        gains = tuple((name, float(gain_by_name[name])) for name in significant)
+        pre_prune = significant
+
     counts = {
         "n_candidates": len(feature_cols),
         "n_survived_quality": len(survivors),
-        "n_positive_gain": len(positive),
+        "n_positive_gain": len(pre_prune),
+        "n_pre_correlation": len(pre_prune),
+        "n_post_correlation": len(pruned),
         "n_rejected": len(rejected),
         "n_retained": n_retained,
     }
@@ -516,6 +691,32 @@ def select_features(
         "resolved_screening_device": resolved_device,
         "gpu_fallback_reason": fallback_reason,
         "config_fingerprint": config_fingerprint(config),
+        "selection_rule": config.selection_rule,
+        "selection_threshold": threshold,
+        "null_alpha": (
+            config.null_alpha if config.selection_rule == "permutation_fwer" else None
+        ),
+        "null_permutations": (
+            config.null_permutations if config.selection_rule == "permutation_fwer" else 0
+        ),
+        "null_max_gain_min": (
+            float(null_maxima.min()) if null_maxima.size else None
+        ),
+        "null_max_gain_median": (
+            float(np.median(null_maxima)) if null_maxima.size else None
+        ),
+        "null_max_gain_max": (
+            float(null_maxima.max()) if null_maxima.size else None
+        ),
+        "permutation_seed": (
+            config.random_seed if config.selection_rule == "permutation_fwer" else None
+        ),
+        "provenance": provenance,
+        "n_survived_quality": len(survivors),
+        "n_pre_correlation": len(pre_prune),
+        "n_post_correlation": len(pruned),
+        "n_retained": n_retained,
+        "at_hard_max_retained": n_retained == config.hard_max_retained,
     }
     return FeatureSelectionResult(
         selected_features=tuple(selected),
@@ -656,6 +857,8 @@ def build_feature_quality_report(
             feature_actions.append("capacity_limited")
         if rej.get(_REASON_CORRELATED, 0):
             feature_actions.append("redundant")
+        if rej.get(_REASON_NOT_SIGNIFICANT, 0):
+            feature_actions.append("screening_weak")
         selection_count = selection_counts.get(feature, 0)
         selection_rate = selection_count / n_folds if n_folds else 0.0
         if selection_rate < min_fold_selection_rate:
