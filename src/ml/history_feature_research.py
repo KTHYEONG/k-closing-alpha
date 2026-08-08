@@ -68,6 +68,19 @@ _AVAILABLE_MODES = ("confirmation", "discovery")
 ProgressCallback = Callable[[str, Mapping[str, Any]], None]
 
 
+def _resolve_research_selection_config(
+    feature_selection_config: FeatureSelectionConfig | None,
+) -> FeatureSelectionConfig:
+    """리서치 후보 선택 설정을 결정합니다.
+
+    호출자가 설정을 생략하면 ``permutation_fwer`` 리서치 기본값을, 명시적으로
+    전달하면 그대로(레거시 ``fixed_cap`` 포함) 반환합니다.
+    """
+    if feature_selection_config is not None:
+        return feature_selection_config
+    return FeatureSelectionConfig(selection_rule="permutation_fwer")
+
+
 def _emit_progress(
     callback: ProgressCallback | None, stage: str, details: Mapping[str, Any]
 ) -> None:
@@ -298,7 +311,7 @@ def _build_selection_diagnostics(
         ],
         "median_pairwise_jaccard": jaccard,
         "stability": stability,
-        "final_train_only": True,
+        "final_selection_provenance": "full_training_selection",
         "final_features": final_features,
         "final_selection": (
             {
@@ -413,7 +426,7 @@ def run_history_feature_research_experiment(
         raise ValueError("either price_history or price_history_path must be provided")
     if mode not in _AVAILABLE_MODES:
         raise ValueError(f"mode must be one of {_AVAILABLE_MODES}, got {mode!r}")
-    config = feature_selection_config or FeatureSelectionConfig()
+    config = _resolve_research_selection_config(feature_selection_config)
     _x, _targets, cat_features, processed = build_ml_dataset(
         trade_log_df,
         theme_df,
@@ -542,7 +555,9 @@ def run_history_feature_research_experiment(
             n_splits=n_splits,
             purge_gap=purge_gap,
         )
-        final_selection = select_features(joined, candidate_feature_cols, target_col, config)
+        final_selection = select_features(
+            joined, candidate_feature_cols, target_col, config, group_col=group_col
+        )
         diagnostics = _build_selection_diagnostics(
             plans, final_selection, str(joined[group_col].max()), config, candidate_feature_cols
         )
