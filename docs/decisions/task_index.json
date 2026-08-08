@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_TRAINING_OPTIMIZATION",
+      "date": "2026-08-08",
+      "adr_id": "ADR_20260808_ML_TRAINING_OPTIMIZATION",
+      "domain": "ml",
+      "title": "ML training optimization and causal history benchmark",
+      "why": "Finalize synchronization after the cold-cache and warm-cache benchmark.",
+      "resolution": "Registered the causal cutoff, 25k Arrow batch benchmark, 267.89-second cold panel build, three warm cache reads, and the candidate-selection timeout; removed completed temporary ML training optimization specs.",
+      "impact": "ADR and code map are current, benchmark evidence is retained in docs/results, and no production model artifact was promoted."
+    },
+    {
       "task_id": "TASK_ML_HISTORY_FEATURE_PIPELINE",
       "date": "2026-08-07",
       "adr_id": "ADR_20260807_ML_HISTORY_FEATURE_PIPELINE",
