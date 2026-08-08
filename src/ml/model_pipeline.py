@@ -1139,6 +1139,7 @@ def run_close_morning_recency_ensemble_experiment(
             memory_budget_bytes=memory_budget_bytes,
             wall_time_budget_seconds=wall_time_budget_seconds,
             fold_event_callback=fold_event_callback,
+            retain_models=False,
         )
         recent_by_h_by_mode[mode] = {
             half_life: run_model_pipeline(
@@ -1158,6 +1159,7 @@ def run_close_morning_recency_ensemble_experiment(
                 memory_budget_bytes=memory_budget_bytes,
                 wall_time_budget_seconds=wall_time_budget_seconds,
                 fold_event_callback=fold_event_callback,
+                retain_models=False,
             )
             for half_life in half_lives
         }
@@ -1623,6 +1625,7 @@ def run_model_pipeline(
     memory_budget_bytes: int | None = None,
     wall_time_budget_seconds: float | None = None,
     fold_event_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    retain_models: bool = True,
 ) -> dict[str, Any]:
     """Train ML model using Purged Group Walk-Forward CV and evaluate OOF results.
 
@@ -1661,6 +1664,11 @@ def run_model_pipeline(
     ``memory_budget_bytes`` / ``wall_time_budget_seconds`` 가 주어지면 각 fold 이후
     초과 시 ``ValueError`` 로 fail-closed 합니다. ``fold_event_callback`` 은 fold
     단위 profile payload(시각·RSS·위상)를 append-only 로 방출합니다.
+
+    ``retain_models=False`` (연구 전용) 는 각 fold 의 필수 OOF 예측·정책 지표·
+    진단이 산출된 뒤 추정기를 즉시 폐기해 유지 객체를 줄입니다. OOF 예측·날짜·
+    지표·승격 입력은 바뀌지 않으며, 기본값은 ``True`` 로 추론 모델이 필요한
+    호출자의 기존 보유 계약을 그대로 유지합니다.
 
     Returns:
         dict containing 'oof_predictions', 'oof_df', 'metrics', 'trained_models',
@@ -1796,7 +1804,11 @@ def run_model_pipeline(
             model_params,
             sample_weight,
         )
-        trained_models.append(model)
+        if retain_models:
+            trained_models.append(model)
+        else:
+            # OOF pred 는 이미 계산됐으므로 연구 전용 폴드 추정기를 즉시 폐기합니다.
+            del model
         training_cutoff = train[group_col].max()
         phases.append(
             {

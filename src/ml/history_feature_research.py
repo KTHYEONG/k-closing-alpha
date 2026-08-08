@@ -25,9 +25,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import time
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional telemetry dependency
+    psutil = None
 
 import numpy as np
 import pandas as pd
@@ -145,6 +153,121 @@ def _emit_progress(
         logger.warning("history-feature progress observer failed at stage=%s", stage, exc_info=True)
 
 
+def _rss_bytes() -> int:
+    """현재 프로세스 RSS (psutil 미사용 시 0)."""
+    if psutil is None:
+        return 0
+    try:
+        return int(psutil.Process().memory_info().rss)
+    except Exception:  # pragma: no cover - telemetry best-effort
+        return 0
+
+
+class _Lifecycle:
+    """연구 실험 수명주기 이벤트를 단조 stage_id 로 방출합니다.
+
+    이벤트는 append-only 이며 ``status`` 는 ``started``/``completed``/``failed``
+    중 하나입니다. 실패는 진행 중 stage 에 대해 예외 진단을 포함한 ``failed``
+    이벤트를 남긴 뒤 예외를 다시 던집니다. observer 는 비권위적입니다.
+    """
+
+    def __init__(self, callback: ProgressCallback | None) -> None:
+        self._callback = callback
+        self._run_started = time.perf_counter()
+        self._stage_id = 0
+
+    def emit(
+        self,
+        stage: str,
+        status: str,
+        *,
+        elapsed_seconds: float | None = None,
+        fold: int | None = None,
+        **details: Any,
+    ) -> None:
+        self._stage_id += 1
+        payload: dict[str, Any] = {
+            "status": status,
+            "stage_id": self._stage_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "elapsed_seconds": (
+                round(elapsed_seconds, 4)
+                if elapsed_seconds is not None
+                else round(time.perf_counter() - self._run_started, 4)
+            ),
+            "current_rss_bytes": _rss_bytes(),
+            "peak_rss_bytes": _rss_bytes(),
+        }
+        if fold is not None:
+            payload["fold"] = int(fold)
+        payload.update(details)
+        _emit_progress(self._callback, stage, payload)
+
+    def stage(
+        self, stage: str, *, fold: int | None = None, **started_details: Any
+    ) -> _StageEvent:
+        """stage 시작/완료/실패 이벤트를 감싸는 context manager 를 반환합니다."""
+        return _StageEvent(self, stage, fold=fold, started_details=started_details)
+
+
+class _StageEvent:
+    """수명주기 stage 를 감싸 started → completed/failed 이벤트를 방출합니다."""
+
+    def __init__(
+        self,
+        lifecycle: _Lifecycle,
+        stage: str,
+        *,
+        fold: int | None = None,
+        started_details: Mapping[str, Any],
+    ) -> None:
+        self._lifecycle = lifecycle
+        self._stage = stage
+        self._fold = fold
+        self._started = time.perf_counter()
+        self._peak_rss = _rss_bytes()
+        self._completed = False
+        lifecycle.emit(stage, "started", fold=fold, **dict(started_details))
+
+    def __enter__(self) -> _StageEvent:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, _tb: Any) -> Literal[False]:
+        if exc is not None:
+            self.failed(exc)
+        else:
+            self.completed()
+        return False
+
+    def _finalize(self, **details: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "elapsed_seconds": time.perf_counter() - self._started,
+            "peak_rss_bytes": max(self._peak_rss, _rss_bytes()),
+        }
+        if self._fold is not None:
+            payload["fold"] = self._fold
+        payload.update(details)
+        return payload
+
+    def completed(self, **details: Any) -> None:
+        if self._completed:
+            return
+        self._completed = True
+        self._lifecycle.emit(self._stage, "completed", **self._finalize(**details))
+
+    def failed(self, exc: BaseException, **details: Any) -> None:
+        if self._completed:
+            return
+        self._completed = True
+        self._lifecycle.emit(
+            self._stage,
+            "failed",
+            exception_type=type(exc).__name__,
+            exception_message=str(exc),
+            **self._finalize(**details),
+        )
+
+
 def _ensemble_policy_summary(ensemble: dict[str, Any]) -> dict[str, Any]:
     """recency 앙상블 후보 집계를 정책 지표 요약으로 반환합니다."""
     aggregate = ensemble["aggregate"]["candidate"]
@@ -260,9 +383,19 @@ def _load_or_build_history_panel(
     execution_config: HistoryFeatureExecutionConfig | None,
     cache_dir: str | None,
     fingerprint: str,
+    batch_observer: ProgressCallback | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """지문이 일치하면 캐시 warm read, 아니면 재구성 후 저장합니다."""
-    cache_meta: dict[str, Any] = {"cache_state": "cold", "cache_fingerprint": fingerprint}
+    """지문이 일치하면 캐시 warm read, 아니면 재구성 후 원자적으로 저장합니다.
+
+    캐시는 panel parquet + metrics JSON 한 쌍으로만 warm 이며, 누락·지문 불일치·
+    읽기 실패는 항상 cold 재구성으로 이어지고 ``cache_reason`` 에 원인을 남깁니다.
+    저장은 임시 형제 파일에 먼저 쓰고 검증한 뒤 ``os.replace`` 로 원자 교체합니다.
+    """
+    cache_meta: dict[str, Any] = {
+        "cache_state": "cold",
+        "cache_fingerprint": fingerprint,
+        "cache_reason": "no_cache_dir",
+    }
     if cache_dir is not None:
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
@@ -272,14 +405,29 @@ def _load_or_build_history_panel(
             try:
                 panel = pd.read_parquet(parquet_path)
                 stored_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+                stored_cache = stored_metrics.get("cache_metrics", {})
+                if stored_cache.get("cache_fingerprint") != fingerprint:
+                    raise ValueError(
+                        f"stored fingerprint {stored_cache.get('cache_fingerprint')} "
+                        f"does not match {fingerprint}"
+                    )
                 panel.attrs["history_feature_build_metrics"] = stored_metrics["build_metrics"]
-                panel.attrs["history_feature_cache_metrics"] = stored_metrics["cache_metrics"]
-                cache_meta = dict(stored_metrics["cache_metrics"])
+                panel.attrs["history_feature_cache_metrics"] = stored_cache
+                cache_meta = dict(stored_cache)
                 cache_meta["cache_state"] = "warm"
+                cache_meta["cache_reason"] = "warm_fingerprint_match"
                 logger.info("history-feature cache warm read: %s", parquet_path.name)
                 return panel, cache_meta
             except Exception as exc:  # noqa: BLE001 - corrupt cache must rebuild
                 logger.warning("history-feature cache read failed, rebuilding: %s", exc)
+                cache_meta["cache_reason"] = f"cache_unreadable:{type(exc).__name__}"
+        else:
+            missing = [
+                path.name
+                for path in (parquet_path, metrics_path)
+                if not path.is_file()
+            ]
+            cache_meta["cache_reason"] = "incomplete_cache_pair:" + ",".join(missing)
 
     if price_history_path is not None:
         history_panel = build_causal_history_feature_panel_from_parquet(
@@ -287,6 +435,7 @@ def _load_or_build_history_panel(
             decision_keys,
             HistoricalFeatureConfig(),
             execution_config,
+            batch_observer=batch_observer,
         )
     else:
         history_panel = build_causal_history_feature_panel(
@@ -300,26 +449,58 @@ def _load_or_build_history_panel(
         "cache_state": "cold",
         "cache_fingerprint": fingerprint,
         "source_identity": _source_identity(price_history, price_history_path),
+        "cache_reason": cache_meta["cache_reason"],
     }
     if cache_dir is not None:
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
         parquet_path = cache_path / f"history_features_{fingerprint}.parquet"
         metrics_path = cache_path / f"history_features_{fingerprint}.metrics.json"
-        history_panel.to_parquet(parquet_path, index=False)
-        metrics_path.write_text(
-            json.dumps(
-                {
-                    "build_metrics": build_metrics,
-                    "cache_metrics": cache_metrics,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        logger.info("history-feature cache written: %s", parquet_path.name)
+        temp_parquet = Path(f"{parquet_path}.tmp")
+        temp_metrics = Path(f"{metrics_path}.tmp")
+        try:
+            history_panel.to_parquet(temp_parquet, index=False)
+            temp_metrics.write_text(
+                json.dumps(
+                    {
+                        "build_metrics": build_metrics,
+                        "cache_metrics": cache_metrics,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            _validate_cache_pair(temp_parquet, temp_metrics, fingerprint)
+            os.replace(temp_parquet, parquet_path)
+            os.replace(temp_metrics, metrics_path)
+        finally:
+            temp_parquet.unlink(missing_ok=True)
+            temp_metrics.unlink(missing_ok=True)
+        logger.info("history-feature cache written (atomic): %s", parquet_path.name)
     return history_panel, cache_metrics
+
+def _validate_cache_pair(
+    parquet_path: Path, metrics_path: Path, fingerprint: str
+) -> None:
+    """임시 캐시 쌍을 원자 교체 전에 검증합니다.
+
+    실패하면 예외를 던져 출판을 중단합니다. 검증은 고정 카탈로그 컬럼 계약과
+    저장된 지문 일치를 확인해, 손상된 쌍이 warm 캐시로 취급되는 것을 방지합니다.
+    """
+    panel = pd.read_parquet(parquet_path)
+    out_cols = [
+        "stock_code",
+        "trade_date",
+        *[str(entry["feature_name"]) for entry in HISTORICAL_CATALOGUE],
+    ]
+    if panel.columns.tolist() != out_cols:
+        raise ValueError("cache panel columns do not match the fixed catalogue")
+    stored_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    if stored_metrics.get("cache_metrics", {}).get("cache_fingerprint") != fingerprint:
+        raise ValueError("cache metrics fingerprint does not match")
+    if "build_metrics" not in stored_metrics:
+        raise ValueError("cache metrics missing build_metrics")
 
 
 def _build_selection_diagnostics(
@@ -489,6 +670,7 @@ def run_history_feature_research_experiment(
         raise ValueError("either price_history or price_history_path must be provided")
     if mode not in _AVAILABLE_MODES:
         raise ValueError(f"mode must be one of {_AVAILABLE_MODES}, got {mode!r}")
+    lifecycle = _Lifecycle(progress_callback)
     config = _resolve_research_selection_config(feature_selection_config)
     _x, _targets, cat_features, processed = build_ml_dataset(
         trade_log_df,
@@ -562,18 +744,33 @@ def run_history_feature_research_experiment(
         price_history_path,
         evaluation_cutoff,
     )
-    history_panel, cache_metrics = _load_or_build_history_panel(
-        price_history,
-        price_history_path,
-        decision_keys,
-        group_col,
-        execution_config,
-        cache_dir,
-        fingerprint,
-    )
+    with lifecycle.stage(
+        "history_panel_build",
+        source="parquet" if price_history_path is not None else "dataframe",
+        evaluation_cutoff=str(evaluation_cutoff),
+        fingerprint=fingerprint,
+    ) as panel_stage:
+        history_panel, cache_metrics = _load_or_build_history_panel(
+            price_history,
+            price_history_path,
+            decision_keys,
+            group_col,
+            execution_config,
+            cache_dir,
+            fingerprint,
+            batch_observer=progress_callback,
+        )
     build_metrics = dict(history_panel.attrs.get("history_feature_build_metrics", {}))
     build_metrics["cache_state"] = cache_metrics["cache_state"]
     build_metrics["cache_fingerprint"] = fingerprint
+    build_metrics["cache_reason"] = cache_metrics.get("cache_reason")
+    panel_stage.completed(
+        cache_state=cache_metrics["cache_state"],
+        cache_reason=cache_metrics.get("cache_reason"),
+        batch_count=build_metrics.get("batch_count"),
+        decision_key_rows=build_metrics.get("decision_key_rows"),
+        output_rows=build_metrics.get("output_rows"),
+    )
     _emit_progress(progress_callback, "history_panel_built", build_metrics)
 
     joined = processed.merge(history_panel, on=["stock_code", group_col], how="left")
@@ -589,19 +786,21 @@ def run_history_feature_research_experiment(
         execution_config.memory_budget_bytes if execution_config is not None else None
     )
 
-    control = run_close_morning_recency_ensemble_experiment(
-        joined,
-        feature_cols=base_feature_cols,
-        target_col=target_col,
-        group_col=group_col,
-        n_splits=n_splits,
-        purge_gap=purge_gap,
-        risk_feature_cols=base_feature_cols,
-        pred_linear=True,
-        memory_budget_bytes=memory_budget_bytes,
-        wall_time_budget_seconds=wall_time_budget_seconds,
-        fold_event_callback=_fold_event,
-    )
+    with lifecycle.stage("control", feature_cols=len(base_feature_cols)) as control_stage:
+        control = run_close_morning_recency_ensemble_experiment(
+            joined,
+            feature_cols=base_feature_cols,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=n_splits,
+            purge_gap=purge_gap,
+            risk_feature_cols=base_feature_cols,
+            pred_linear=True,
+            memory_budget_bytes=memory_budget_bytes,
+            wall_time_budget_seconds=wall_time_budget_seconds,
+            fold_event_callback=_fold_event,
+        )
+    control_stage.completed(n_folds=n_splits)
     _emit_progress(
         progress_callback,
         "control_complete",
@@ -613,18 +812,32 @@ def run_history_feature_research_experiment(
     final_selection: FeatureSelectionResult | None = None
     quality_report: dict[str, Any] | None = None
     if config is not None:
-        plans = build_fold_feature_plans(
-            joined,
-            candidate_feature_cols,
-            target_col,
-            group_col,
-            config,
-            n_splits=n_splits,
-            purge_gap=purge_gap,
-        )
-        final_selection = select_features(
-            joined, candidate_feature_cols, target_col, config, group_col=group_col
-        )
+        with lifecycle.stage(
+            "selection_plan", n_splits=n_splits, candidate_features=len(candidate_feature_cols)
+        ) as plan_stage:
+            plans = build_fold_feature_plans(
+                joined,
+                candidate_feature_cols,
+                target_col,
+                group_col,
+                config,
+                n_splits=n_splits,
+                purge_gap=purge_gap,
+            )
+        plan_stage.completed(fold_count=len(plans))
+        for _plan in plans:
+            lifecycle.emit(
+                "selection_plan",
+                "completed",
+                fold=_plan.fold,
+                selected_features=len(_plan.selected_features),
+                data_cutoff=_plan.data_cutoff,
+            )
+        with lifecycle.stage("final_selection") as final_stage:
+            final_selection = select_features(
+                joined, candidate_feature_cols, target_col, config, group_col=group_col
+            )
+        final_stage.completed(selected_features=len(final_selection.selected_features))
         diagnostics = _build_selection_diagnostics(
             plans, final_selection, str(joined[group_col].max()), config, candidate_feature_cols
         )
@@ -637,21 +850,23 @@ def run_history_feature_research_experiment(
         )
         diagnostics["quality_report"] = quality_report
 
-    candidate = run_close_morning_recency_ensemble_experiment(
-        joined,
-        feature_cols=candidate_feature_cols,
-        target_col=target_col,
-        group_col=group_col,
-        n_splits=n_splits,
-        purge_gap=purge_gap,
-        risk_feature_cols=base_feature_cols,
-        fold_feature_plans=plans,
-        final_feature_selection=final_selection,
-        pred_linear=mode == "discovery",
-        memory_budget_bytes=memory_budget_bytes,
-        wall_time_budget_seconds=wall_time_budget_seconds,
-        fold_event_callback=_fold_event,
-    )
+    with lifecycle.stage("candidate", feature_cols=len(candidate_feature_cols)) as candidate_stage:
+        candidate = run_close_morning_recency_ensemble_experiment(
+            joined,
+            feature_cols=candidate_feature_cols,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=n_splits,
+            purge_gap=purge_gap,
+            risk_feature_cols=base_feature_cols,
+            fold_feature_plans=plans,
+            final_feature_selection=final_selection,
+            pred_linear=mode == "discovery",
+            memory_budget_bytes=memory_budget_bytes,
+            wall_time_budget_seconds=wall_time_budget_seconds,
+            fold_event_callback=_fold_event,
+        )
+    candidate_stage.completed(n_folds=n_splits)
     _emit_progress(
         progress_callback,
         "candidate_complete",
@@ -740,7 +955,11 @@ def run_history_feature_research_experiment(
         "comparison": comparison,
     }
     save_dir = f"{export_dir}/{HISTORICAL_CATALOGUE_VERSION}/{bundle['training_cutoff'][:10]}"
-    saved_path = save_model_artifacts(bundle, save_dir)
+    with lifecycle.stage("export", save_dir=save_dir) as export_stage:
+        saved_path = save_model_artifacts(bundle, save_dir)
+    export_stage.completed(
+        candidate_bundle_path=saved_path, final_feature_count=len(final_features)
+    )
     _emit_progress(
         progress_callback,
         "artifact_saved",
