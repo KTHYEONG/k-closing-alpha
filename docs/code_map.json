@@ -102,5 +102,8 @@
   "src/ml/history_feature_research.py": {
     "testing": "tests/unit/ml/test_history_feature_research.py",
     "architecture": "docs/results/ml-training-optimization-benchmark.md"
+  },
+  "src/ml/feature_selection.py": {
+    "testing": "tests/unit/ml/test_feature_selection.py"
   }
 }

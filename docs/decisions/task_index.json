@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ml_training_optimization",
+      "date": "2026-08-08",
+      "adr_id": "ADR_20260808_ml_training_optimization",
+      "domain": "ml_pipeline",
+      "title": "Optimize Cold Cache History Panel and Spearman Feature Selection",
+      "why": "Cold cache causal panel build and 720 fold-local feature selection timeout blocked ML research discovery runs.",
+      "resolution": "Accelerated Spearman correlation matrix calculation via BLAS matrix multiplication and enforced memory-bounded streaming batching to avoid OOM.",
+      "impact": "Fold-local feature selection completed within 456s pipeline wall time with Peak RSS 3.79 GiB, preventing timeouts and OOM."
+    },
+    {
       "task_id": "TASK_ML_TRAINING_OPTIMIZATION",
       "date": "2026-08-08",
       "adr_id": "ADR_20260808_ML_TRAINING_OPTIMIZATION",
