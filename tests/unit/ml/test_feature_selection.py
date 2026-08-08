@@ -17,7 +17,9 @@ import pytest
 
 from src.ml.feature_selection import (
     FeatureSelectionConfig,
+    build_fold_feature_plans,
     median_pairwise_jaccard,
+    permutation_null_stability,
     select_features,
 )
 from src.ml.model_pipeline import run_model_pipeline
@@ -276,3 +278,83 @@ def test_hfs06_gpu_probe_failure_returns_cpu_reason(monkeypatch) -> None:
     resolved, reason = _probe_gpu_device()
     assert resolved == "cpu"
     assert "gpu_probe_failed" in reason
+
+
+def test_mto02_fold_plan_invariant_to_outer_labels_and_reused() -> None:
+    """MTO-02: 외부 validation/이후 라벨 변경이 fold plan 을 바꾸지 않고, plan 은
+    파이프라인에서 두 return 전문가가 재사용할 수 있도록 진단에 그대로 반영됩니다."""
+    df = _predictive_df(n_groups=40, rows_per_group=8)
+    cfg = _small_config()
+    plans = build_fold_feature_plans(
+        df, _candidate_cols(40), "target_return", "trade_date", cfg, n_splits=3, purge_gap=1
+    )
+    assert len(plans) == 3
+    assert all(p.selected_features for p in plans)
+    assert all(p.config_fingerprint == plans[0].config_fingerprint for p in plans)
+    assert all(p.seed == cfg.random_seed for p in plans)
+    assert all(p.data_cutoff for p in plans)
+
+    n_groups = df["trade_date"].nunique()
+    future_dates = sorted(df["trade_date"].unique())[-(n_groups // (3 + 1)):]
+    mutated = df.copy()
+    mutated.loc[mutated["trade_date"].isin(future_dates), "target_return"] += 0.5
+    plans_mutated = build_fold_feature_plans(
+        mutated, _candidate_cols(40), "target_return", "trade_date", cfg, n_splits=3, purge_gap=1
+    )
+    assert [p.selected_features for p in plans] == [p.selected_features for p in plans_mutated]
+    assert [p.gains for p in plans] == [p.gains for p in plans_mutated]
+    assert [p.counts for p in plans] == [p.counts for p in plans_mutated]
+
+    # plan 이 파이프라인에서 재계산 없이 재사용됩니다.
+    result = run_model_pipeline(
+        df,
+        _candidate_cols(40),
+        "target_return",
+        "trade_date",
+        n_splits=3,
+        purge_gap=1,
+        model_type="lgb_regressor",
+        fold_feature_plans=plans,
+    )
+    diagnostics = result["feature_selection_diagnostics"]
+    assert diagnostics is not None
+    assert [list(f["selected_features"]) for f in diagnostics["fold_selections"]] == [
+        list(p.selected_features) for p in plans
+    ]
+    assert diagnostics["config_fingerprint"] == plans[0].config_fingerprint
+    assert diagnostics["final_train_only"] is True
+    assert diagnostics["stability"]["n_permutations"] >= 1
+
+
+def test_mto02_permutation_null_stability_deterministic_gate() -> None:
+    """MTO-02: 날짜 블록 순열 null 게이트가 결정적이고, 동일 fold 선택은 통과하며
+    서로소 fold 선택은 거부합니다."""
+    universe = [chr(ord("a") + i) for i in range(13)]
+    identical = permutation_null_stability(
+        [["a", "b", "c", "d"], ["a", "b", "c", "d"], ["a", "b", "c", "d"]],
+        random_seed=42,
+        universe=universe,
+    )
+    again = permutation_null_stability(
+        [["a", "b", "c", "d"], ["a", "b", "c", "d"], ["a", "b", "c", "d"]],
+        random_seed=42,
+        universe=universe,
+    )
+    assert identical == again
+    assert identical["observed_median_jaccard"] == 1.0
+    assert identical["gate_passed"] is True
+
+    disjoint = permutation_null_stability(
+        [["a", "b", "c", "d"], ["e", "f", "g", "h"], ["i", "j", "k", "l"]],
+        random_seed=42,
+        universe=universe,
+    )
+    assert disjoint["observed_median_jaccard"] == 0.0
+    assert disjoint["gate_passed"] is False
+
+    abstain = permutation_null_stability([["a", "b"]], random_seed=42)
+    assert abstain["reason"] == "fewer_than_two_folds_abstain"
+    assert abstain["gate_passed"] is True
+
+    with pytest.raises(ValueError, match="null_gate_quantile"):
+        permutation_null_stability([["a"], ["b"]], random_seed=1, null_gate_quantile=1.5)
