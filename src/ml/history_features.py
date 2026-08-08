@@ -33,10 +33,12 @@ Streaming 설계 (두 단계):
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -48,6 +50,8 @@ try:
     _HAS_PSUTIL = True
 except Exception:  # pragma: no cover - optional telemetry dependency
     _HAS_PSUTIL = False
+
+logger = logging.getLogger(__name__)
 
 HISTORICAL_CATALOGUE_VERSION = "causal_history_v2"
 
@@ -1069,6 +1073,27 @@ def _build_decision_panel_features(
 # --- 배치 실행/메모리 텔레메트리 --------------------------------------------------------------
 
 
+BatchObserver = Callable[[str, Mapping[str, Any]], None]
+
+
+def _emit_batch_event(
+    observer: BatchObserver | None,
+    stage: str,
+    status: str,
+    details: Mapping[str, Any],
+) -> None:
+    """배치 observer 로 수명주기 이벤트를 전송합니다.
+
+    observer 는 엄격히 비권위적입니다: 관찰 실패는 로그만 남기고 캐시/판넬
+    계산 결과를 바꾸지 않습니다.
+    """
+    if observer is None:
+        return
+    try:
+        observer(stage, {"status": status, **dict(details)})
+    except Exception:  # pragma: no cover - observers must not change build behavior
+        logger.warning("history-feature batch observer failed at stage=%s", stage, exc_info=True)
+
 def _rss_bytes() -> int:
     """현재 프로세스 RSS (psutil 미사용 시 0)."""
     if not _HAS_PSUTIL:
@@ -1189,6 +1214,7 @@ def _build_panel_core(
     config: HistoricalFeatureConfig,
     exec_cfg: HistoryFeatureExecutionConfig,
     input_history_rows: int,
+    batch_observer: BatchObserver | None = None,
 ) -> pd.DataFrame:
     """배치 단위로 시간축 피처를 계산하고 결정 key 판넬로 축소해 최종 판넬을 반환합니다."""
     dsym = config.decision_symbol_col
@@ -1220,23 +1246,56 @@ def _build_panel_core(
     parts: list[pd.DataFrame] = []
     peak_rss = _rss_bytes()
 
-    def build_batch_part(batch: Sequence[str]) -> pd.DataFrame:
+    def build_batch_part(
+        batch_idx: int, batch: Sequence[str]
+    ) -> tuple[pd.DataFrame, dict[str, int | float]]:
+        batch_started = time.perf_counter()
         hist_batch = read_batch(batch)
+        source_rows = len(hist_batch)
         temporal = _build_temporal_features(hist_batch, config)
         batch_keys = keys[keys[dsym].isin(batch)]
         matched = _merge_temporal_keys(batch_keys, hist_batch, temporal, config)
         del hist_batch, temporal
-        return matched
+        profile = {
+            "batch": batch_idx,
+            "symbols": len(batch),
+            "source_rows": source_rows,
+            "output_rows": len(matched),
+            "elapsed_seconds": round(time.perf_counter() - batch_started, 4),
+            "peak_rss_bytes": _rss_bytes(),
+        }
+        return matched, profile
+
+    def emit_batch_event(batch_idx: int, status: str, details: dict[str, int | float]) -> None:
+        _emit_batch_event(
+            batch_observer,
+            "symbol_batch",
+            status,
+            {
+                "batch": batch_idx,
+                "projected_columns": list(exec_cfg.parquet_columns),
+                **details,
+            },
+        )
 
     if exec_cfg.n_jobs != 1 and len(batches) > 1:
         # 독립 배치를 병렬 계산 (결과 순서는 ``pool.map`` 이 입력 배치 순서를
-        # 유지하므로 concat/sort 이후 최종 판넬은 결정적입니다).
+        # 유지하므로 concat/sort 이후 최종 판넬은 결정적입니다). 이벤트는 순서
+        # 보장을 위해 메인 스레드에서만 방출합니다.
+        for batch_idx, _batch in enumerate(batches):
+            emit_batch_event(batch_idx, "started", {})
         max_workers = exec_cfg.n_jobs if exec_cfg.n_jobs > 0 else (os.cpu_count() or 1)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            parts = list(pool.map(build_batch_part, batches))
+            results = list(pool.map(build_batch_part, range(len(batches)), batches))
+        for batch_idx, (matched, profile) in enumerate(results):
+            parts.append(matched)
+            emit_batch_event(batch_idx, "completed", profile)
     else:
-        for batch in batches:
-            parts.append(build_batch_part(batch))
+        for batch_idx, batch in enumerate(batches):
+            emit_batch_event(batch_idx, "started", {})
+            matched, profile = build_batch_part(batch_idx, batch)
+            parts.append(matched)
+            emit_batch_event(batch_idx, "completed", profile)
     gc.collect()
     peak_rss = max(peak_rss, _rss_bytes())
     if (
@@ -1389,12 +1448,16 @@ def build_causal_history_feature_panel_from_parquet(
     decision_keys: pd.DataFrame,
     config: HistoricalFeatureConfig | None = None,
     execution_config: HistoryFeatureExecutionConfig | None = None,
+    batch_observer: BatchObserver | None = None,
 ) -> pd.DataFrame:
     """결정 key 별 causal history 피처 판넬을 Parquet 경로에서 streaming 으로 반환합니다.
 
     PyArrow 컬럼 투영 + symbol predicate pushdown(row-group pruning)을 사용해
     필요한 원천 컬럼과 해당 배치 종목만 읽습니다. 전체 판넬을 ``pd.read_parquet``
     로 메모리에 올리지 않습니다.
+
+    ``batch_observer`` 가 주어지면 두 원천 스캔(symbol/market)과 각 symbol 배치의
+    시작/완료 이벤트를 전송합니다. observer 는 비권위적입니다.
     """
     import pyarrow.parquet as pq
 
@@ -1404,6 +1467,13 @@ def build_causal_history_feature_panel_from_parquet(
     symbol_col = config.history_symbol_col
     date_col = config.history_date_col
 
+    scan_started = time.perf_counter()
+    _emit_batch_event(
+        batch_observer,
+        "parquet_symbol_scan",
+        "started",
+        {"projected_columns": [symbol_col]},
+    )
     parquet_file = pq.ParquetFile(history_path)
     symbol_counts: dict[str, int] = {}
     input_history_rows = 0
@@ -1418,13 +1488,34 @@ def build_causal_history_feature_panel_from_parquet(
             if pd.isna(symbol):
                 continue
             symbol_counts[str(symbol)] = symbol_counts.get(str(symbol), 0) + int(count)
+    _emit_batch_event(
+        batch_observer,
+        "parquet_symbol_scan",
+        "completed",
+        {
+            "scanned_rows": input_history_rows,
+            "distinct_symbols": len(symbol_counts),
+            "row_group_count": parquet_file.num_row_groups,
+            "elapsed_seconds": round(time.perf_counter() - scan_started, 4),
+            "peak_rss_bytes": _rss_bytes(),
+        },
+    )
 
-    market_parts: list[pd.DataFrame] = []
+    market_started = time.perf_counter()
     market_columns = [date_col, "kospi_pct", "kosdaq_pct", "v_kospi", "v_kosdaq"]
+    _emit_batch_event(
+        batch_observer,
+        "parquet_market_scan",
+        "started",
+        {"projected_columns": market_columns},
+    )
+    market_parts: list[pd.DataFrame] = []
+    market_rows = 0
     for batch in parquet_file.iter_batches(
         columns=market_columns, batch_size=exec_cfg.parquet_batch_rows
     ):
         market_batch = batch.to_pandas()
+        market_rows += len(market_batch)
         market_batch[date_col] = pd.to_datetime(market_batch[date_col])
         market_parts.append(_aggregate_market_dates(market_batch, date_col))
     market_dates_df = (
@@ -1432,6 +1523,17 @@ def build_causal_history_feature_panel_from_parquet(
         .pipe(_aggregate_market_dates, date_col)
     )
     del market_parts, parquet_file
+    _emit_batch_event(
+        batch_observer,
+        "parquet_market_scan",
+        "completed",
+        {
+            "scanned_rows": market_rows,
+            "distinct_dates": int(market_dates_df.shape[0]),
+            "elapsed_seconds": round(time.perf_counter() - market_started, 4),
+            "peak_rss_bytes": _rss_bytes(),
+        },
+    )
 
     columns = list(exec_cfg.parquet_columns)
     if date_col not in columns:
@@ -1462,6 +1564,7 @@ def build_causal_history_feature_panel_from_parquet(
         config=config,
         exec_cfg=exec_cfg,
         input_history_rows=input_history_rows,
+        batch_observer=batch_observer,
     )
 
 
