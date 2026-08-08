@@ -1,8 +1,62 @@
-# ML Feature Selection & Optimization Detailed Report
+# ML Feature Selection & Optimization Detailed Report (Latest v2)
 
 **Date**: 2026-08-08  
-**Scope**: 720 Causal History Candidate Features & Fold-Local Feature Selection Audit  
-**Evaluation Mode**: Discovery Mode (`frozen cutoff: 2025-12-30`, `purge_gap: 1`, `n_splits: 2`)  
+**Scope**: Causal History Feature Quality Repair & 2025 Re-training
+**Evaluation Mode**: Discovery Mode (`frozen cutoff: 2025-12-30`, `purge_gap: 1`, `n_splits: 5`, `causal_history_v2`)
+
+> 이 문서의 최신 권위 결과는 아래 v2 실행입니다. 기존 v1/2-fold 수치는 하단에
+> 비교용으로 남겨 둔 과거 스냅샷입니다.
+
+## 0. Latest v2 Execution (2025 cutoff)
+
+### 적용한 문제 해결
+
+| 항목 | 원인 | 조치 | 결과 |
+| :--- | :--- | :--- | :--- |
+| 시장 컨텍스트 전부 결측 | `RangeIndex`와 날짜 index의 pandas 정렬 불일치 | 배열 기반 index 할당 + 날짜별 중앙값 집계 | `index_ret_*_0` 유한율 약 99.4% |
+| 시장 streaming 경로 불일치 | parquet 배치별 첫 행만 보존 | 배치/최종 컬럼별 순서 불변 중앙값 집계 | DataFrame/Parquet 동일성 테스트 통과 |
+| 수급 변화량 결측 | 순매수 0의 0/0 비율 | 부호 보존 signed-log 변화량 | flow ratio 유한율 95.4~99.0% |
+| 0 분산 z-score 결측 | 상수 구간을 데이터 결측으로 처리 | 유효한 0 scale을 중립값 0으로 처리 | 정상 상수 구간 보존 |
+| 안정성 오판 | 2-fold에서 선택 1회도 rate 0.5로 stable 판정 | 기본 `min_fold_selection_rate=1.0` | 모든 fold 선택만 stable |
+| `volume_power` 원천 부족 | trade log의 체결강도 유효 행이 약 0.46% | 보간하지 않고 baseline 결측률 gate에서 제외 | baseline 61→60개 |
+| 장기 룩백 메타데이터 오류 | `ma_slope_w`는 실제로 약 2w 관측 필요 | catalogue lookback을 `2*w`로 수정 | `ma_slope_240` lookback 480 |
+
+### 성능 결과
+
+| 지표 | Control | Candidate (v2) |
+| :--- | ---: | ---: |
+| scheduled dates | 2,040 | 2,040 |
+| buy count | 2,035 | 2,035 |
+| mean return | **1.5933%** | **1.5001%** |
+| win rate | 63.53% | **63.68%** |
+| profit factor | **2.8687** | 2.6713 |
+| Sharpe | **6.3150** | 5.8920 |
+| entry-sequence MDD | **25.87%** | 30.60% |
+
+판정은 **promotion 거부**입니다. Candidate의 평균 수익률과 MDD가 control보다 엄격히
+좋지 않아 현재 모델을 대체할 근거가 없습니다. 다만 candidate 자체는 양의 평균수익과
+PF>1을 유지하므로 피처 연구용 후보로는 유효합니다.
+
+### v2 품질 진단
+
+- 전체 후보: **780개** (baseline 60 + causal history 720), 최종 선택 400개.
+- 5-fold 기준 `capacity_limited` 517개, `unstable` 637개, `source_incomplete` 91개입니다.
+  액션은 중복 집계이므로 합계가 후보 수와 일치하지 않습니다.
+- 시장 패밀리는 72개 중 70개가 적어도 한 fold에서 선택됐고, 평균 선택률은 83.1%입니다.
+- 수급 변화량 ratio 피처는 0 분모 때문에 전부 결측이던 상태에서 벗어났지만, 장기
+  rolling 피처는 종목 이력 길이 부족으로 여전히 자연 결측이 발생합니다.
+- 가장 큰 잔여 이슈는 품질 결함이 아닌 400개 cap입니다. 양의 gain이 있어도 fold별
+  cap 밖으로 밀린 피처가 517개 액션에 포함되므로, cap 변경은 별도 ablation 없이는
+  적용하지 않습니다.
+
+### 실행·아티팩트
+
+- 2026 데이터 제외: **139 rows**, evaluation cutoff **2025-12-30**.
+- history input **5,046,547 rows**, output **33,520 keys**, 8 batches.
+- history build: **457.46s**, peak RSS **1.36GB**, nonfinite sanitization **0**.
+- artifact: `artifacts/models/research-2025-quality-v2/causal_history_v2/2025-12-30/sizing_pipeline_bundle.joblib`
+
+이하의 기존 장은 v1/2-fold 실행의 원인·상세를 보존한 역사적 비교 자료입니다.
 
 ---
 
