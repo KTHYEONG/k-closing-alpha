@@ -38,6 +38,7 @@ from src.ml.feature_selection import (
     FeatureSelectionConfig,
     FeatureSelectionResult,
     FoldFeaturePlan,
+    build_feature_quality_report,
     config_fingerprint,
     median_pairwise_jaccard,
     permutation_null_stability,
@@ -1537,15 +1538,18 @@ def run_model_pipeline(
         if fold_feature_plans is not None:
             plan = fold_feature_plans[fold]
             fold_feature_cols = list(plan.selected_features)
-            fold_selections.append(
-                FeatureSelectionResult(
-                    selected_features=plan.selected_features,
-                    gains=plan.gains,
-                    rejected=plan.rejected,
-                    counts=dict(plan.counts),
-                    metadata=dict(plan.metadata),
+            if plan.selection is not None:
+                fold_selections.append(plan.selection)
+            else:
+                fold_selections.append(
+                    FeatureSelectionResult(
+                        selected_features=plan.selected_features,
+                        gains=plan.gains,
+                        rejected=plan.rejected,
+                        counts=dict(plan.counts),
+                        metadata=dict(plan.metadata),
+                    )
                 )
-            )
             fold_cutoffs.append(plan.data_cutoff)
         elif feature_selection_config is not None:
             selection_started = time.perf_counter()
@@ -1759,6 +1763,17 @@ def run_model_pipeline(
                 else None
             ),
         }
+        if feature_selection_config is not None:
+            min_fold_selection_rate = feature_selection_config.min_fold_selection_rate
+        else:
+            assert fold_feature_plans is not None
+            min_fold_selection_rate = fold_feature_plans[0].config.min_fold_selection_rate
+        feature_selection_diagnostics["quality_report"] = build_feature_quality_report(
+            fold_selections,
+            feature_cols,
+            manifest_catalogue or {},
+            min_fold_selection_rate,
+        )
         manifest_features = feature_selection_diagnostics["final_features"]
 
     profile = {

@@ -26,6 +26,7 @@ from src.ml.history_features import (
     build_catalogue_manifest,
     build_causal_history_feature_panel,
     build_causal_history_feature_panel_from_parquet,
+    catalogue_quality_metadata,
 )
 
 
@@ -200,6 +201,28 @@ def test_fs03_duplicate_decision_keys_are_deduplicated() -> None:
     panel = build_causal_history_feature_panel(hist, keys)
     assert len(panel) == 2
     assert panel.duplicated(subset=["stock_code", "trade_date"]).sum() == 0
+
+
+def test_mto02_feq04_catalogue_quality_metadata_complete() -> None:
+    """MTO-02-FEQ-04: 품질 리포트 메타데이터는 720 피처 전체를 카탈로그 순서와
+    동일하게, 필수 키를 모두 포함해 반환합니다."""
+    metadata = catalogue_quality_metadata()
+    assert len(metadata) == HISTORICAL_CATALOGUE_COUNT == 720
+    expected_order = [str(entry["feature_name"]) for entry in HISTORICAL_CATALOGUE]
+    assert list(metadata) == expected_order
+    required_keys = {
+        "family",
+        "source_column",
+        "transform",
+        "lookback",
+        "availability_rule",
+        "panel_scope",
+    }
+    for entry in metadata.values():
+        assert set(entry) == required_keys
+        assert entry["family"]
+        assert entry["panel_scope"] in {"history_temporal_panel", "decision_candidate_panel"}
+        assert entry["availability_rule"] == "prior_eod_available_at_decision_time"
 
 
 def test_fs01_rejects_missing_required_source_columns() -> None:
