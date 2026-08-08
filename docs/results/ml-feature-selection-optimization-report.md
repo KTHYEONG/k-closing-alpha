@@ -2,12 +2,46 @@
 
 **Date**: 2026-08-08  
 **Scope**: Causal History Feature Quality Repair & 2025 Re-training
-**Evaluation Mode**: Discovery Mode (`frozen cutoff: 2025-12-30`, `purge_gap: 1`, `n_splits: 5`, `causal_history_v2`)
+**Evaluation Mode**: Confirmation Mode (`frozen cutoff: 2025-12-30`, `purge_gap: 1`, `n_splits: 5`, `causal_history_v2`)
 
-> 이 문서의 최신 권위 결과는 아래 v2 실행입니다. 기존 v1/2-fold 수치는 하단에
-> 비교용으로 남겨 둔 과거 스냅샷입니다.
+> 이 문서의 최신 권위 결과는 아래 **0.1 전체 파이프라인 재실행**입니다. 기존 v2
+> 품질 실행과 v1/2-fold 수치는 비교용 과거 스냅샷으로 보존합니다.
 
-## 0. Latest v2 Execution (2025 cutoff)
+## 0.1 Latest Full Pipeline Re-run (2025 cutoff, 2026-08-08)
+
+실제 `trade_log.parquet`와 `price_history.parquet`를 사용해 confirmation 모드로
+파이프라인을 끝까지 실행했습니다. 이번 CLI 호출은 `FeatureSelectionConfig`를
+명시했으므로 신규 `permutation_fwer`가 아닌 기존 `fixed_cap=400` 선택 경로입니다.
+
+### 성능 결과
+
+| 지표 | Control | Candidate | 변화 (Candidate-Control) |
+| :--- | ---: | ---: | ---: |
+| scheduled dates | 2,040 | 2,040 | 0 |
+| buy count | 2,035 | 2,035 | 0 |
+| scheduled mean return | **1.5933%** | 1.4157% | **-0.1776%p** |
+| scheduled win rate | **63.53%** | 62.65% | **-0.88%p** |
+| profit factor | **2.8687** | 2.5248 | -0.3439 |
+| scheduled Sharpe | **6.3146** | 5.5525 | -0.7620 |
+| entry-sequence MDD | **25.8652%** | 25.9978% | **+0.1326%p** |
+
+### 실행 및 판정
+
+- 전체 실행 시간: 약 **663.9초(11분 4초)**
+- history build: **318.4초**, peak RSS **1.52GB**, cold cache
+- history input **5,046,547 rows**, output **33,520 keys**, **9 batches**
+- cutoff 이후 제외: **139 rows**, nonfinite sanitization **0**
+- OOF 날짜 일치: **True**, stability gate: **통과**
+- Candidate는 양의 평균수익과 PF>1을 유지했지만 평균수익이 낮고 MDD가 높아
+  **promotion 거부** (`candidate_mean_not_strictly_higher`,
+  `compounded_mdd_not_strictly_lower`)
+- 연구 번들: `/tmp/ml-research-run/causal_history_v2/2025-12-30/sizing_pipeline_bundle.joblib`
+
+이번 재실행은 현재 control 대비 causal-history candidate가 우위를 보이지 않는다는
+결론을 재확인합니다. `permutation_fwer` 경로의 실데이터 성과는 CLI 선택 옵션을
+추가한 뒤 별도 ablation으로 기록해야 합니다.
+
+## 0.2 Prior v2 Quality Execution (2025 cutoff)
 
 ### 적용한 문제 해결
 
