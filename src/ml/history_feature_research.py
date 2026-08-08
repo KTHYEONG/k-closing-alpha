@@ -35,6 +35,7 @@ import pandas as pd
 from src.ml.feature_selection import (
     FeatureSelectionConfig,
     FeatureSelectionResult,
+    build_feature_quality_report,
     build_fold_feature_plans,
     median_pairwise_jaccard,
     permutation_null_stability,
@@ -48,6 +49,7 @@ from src.ml.history_features import (
     build_catalogue_manifest,
     build_causal_history_feature_panel,
     build_causal_history_feature_panel_from_parquet,
+    catalogue_quality_metadata,
 )
 from src.ml.model_pipeline import (
     run_close_morning_recency_ensemble_experiment,
@@ -318,14 +320,21 @@ def _promotion_gate(
     identical_oof_dates: bool,
     stability: dict[str, Any],
 ) -> dict[str, Any]:
-    """확정 게이트: 동일 OOF 날짜 + 양수 scheduled mean + PF>1 + MDD 엄격 감소 + 안정성."""
+    """확정 게이트: 동일 OOF 날짜 + 양수 scheduled mean + 대조군보다 엄격히 높은
+    mean + PF>1 + MDD 엄격 감소 + 안정성."""
     control_agg = control["aggregate"]["candidate"]
     candidate_agg = candidate["aggregate"]["candidate"]
     cand_mean = float(candidate_agg["scheduled_mean_return"])
+    control_mean = float(control_agg["scheduled_mean_return"])
     cand_pf = float(candidate_agg["profit_factor"])
     cand_mdd = float(candidate_agg["entry_sequence_drawdown"])
     control_mdd = float(control_agg["entry_sequence_drawdown"])
     positive_mean = np.isfinite(cand_mean) and cand_mean > 0.0
+    beats_control = (
+        np.isfinite(cand_mean)
+        and np.isfinite(control_mean)
+        and cand_mean > control_mean
+    )
     pf_above_one = np.isfinite(cand_pf) and cand_pf > 1.0
     lower_mdd = (
         np.isfinite(cand_mdd) and np.isfinite(control_mdd) and cand_mdd < control_mdd
@@ -336,6 +345,8 @@ def _promotion_gate(
         rejected_reasons.append("oof_dates_mismatch")
     if not positive_mean:
         rejected_reasons.append("non_positive_scheduled_mean")
+    if not beats_control:
+        rejected_reasons.append("candidate_mean_not_strictly_higher")
     if not pf_above_one:
         rejected_reasons.append("profit_factor_not_above_one")
     if not lower_mdd:
@@ -346,6 +357,7 @@ def _promotion_gate(
         "promoted": not rejected_reasons,
         "identical_oof_dates": bool(identical_oof_dates),
         "positive_scheduled_net_mean": bool(positive_mean),
+        "candidate_beats_control_mean": bool(beats_control),
         "profit_factor_above_one": bool(pf_above_one),
         "candidate_lower_compounded_mdd": bool(lower_mdd),
         "stability_gate_passed": stability_ok,
@@ -508,6 +520,7 @@ def run_history_feature_research_experiment(
     diagnostics: dict[str, Any] | None = None
     plans: list[Any] | None = None
     final_selection: FeatureSelectionResult | None = None
+    quality_report: dict[str, Any] | None = None
     if config is not None:
         plans = build_fold_feature_plans(
             joined,
@@ -522,6 +535,14 @@ def run_history_feature_research_experiment(
         diagnostics = _build_selection_diagnostics(
             plans, final_selection, str(joined[group_col].max()), config, candidate_feature_cols
         )
+        assert diagnostics is not None
+        quality_report = build_feature_quality_report(
+            [plan.selection for plan in plans if plan.selection is not None],
+            candidate_feature_cols,
+            catalogue_quality_metadata(),
+            config.min_fold_selection_rate,
+        )
+        diagnostics["quality_report"] = quality_report
 
     candidate = run_close_morning_recency_ensemble_experiment(
         joined,
@@ -607,6 +628,7 @@ def run_history_feature_research_experiment(
         "gpu_fallback_reason": final_metadata.get("gpu_fallback_reason"),
         "feature_selection_version": diagnostics.get("version") if diagnostics else None,
         "feature_selection_diagnostics": diagnostics,
+        "quality_report": quality_report,
         "training_cutoff": str(joined[group_col].max()),
         "control_metrics": control_agg,
         "candidate_metrics": candidate_agg,
@@ -657,6 +679,7 @@ def run_history_feature_research_experiment(
             "policy": _ensemble_policy_summary(candidate),
             "final_features": final_features,
             "feature_selection_diagnostics": diagnostics,
+            "quality_report": quality_report,
         },
         "comparison": comparison,
         "promotion": promotion,

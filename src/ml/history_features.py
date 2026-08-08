@@ -1444,3 +1444,29 @@ def catalogue_availability_overrides() -> dict[str, dict[str, str]]:
         }
         for entry in HISTORICAL_CATALOGUE
     }
+
+
+def catalogue_quality_metadata() -> dict[str, dict[str, str]]:
+    """causal_history_v1 품질 리포트용 피처별 메타데이터를 반환합니다.
+
+    ``family``, ``source_column``, ``transform``, ``lookback``,
+    ``availability_rule``, ``panel_scope`` 를 포함하며, 카탈로그에 피처가 정확히
+    ``HISTORICAL_CATALOGUE_COUNT`` 개 있는지 fail-closed 로 검증합니다.
+    """
+    metadata = {
+        str(entry["feature_name"]): {
+            "family": str(entry["family"]),
+            "source_column": str(entry["source_field"]),
+            "transform": str(entry["transform"]),
+            "lookback": str(entry["lookback"]),
+            "availability_rule": "prior_eod_available_at_decision_time",
+            "panel_scope": _feature_panel_scope(str(entry["transform"])),
+        }
+        for entry in HISTORICAL_CATALOGUE
+    }
+    if len(metadata) != HISTORICAL_CATALOGUE_COUNT:
+        raise ValueError(
+            f"catalogue quality metadata must contain exactly "
+            f"{HISTORICAL_CATALOGUE_COUNT} features, got {len(metadata)}"
+        )
+    return metadata

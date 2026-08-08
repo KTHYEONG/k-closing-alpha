@@ -288,3 +288,74 @@ def test_mto01_frozen_research_cutoff_caps_evaluation(tmp_path: Path) -> None:
     assert result["contract"]["excluded_rows_after_cutoff"] > 0
     assert result["comparison"]["identical_oof_dates"] is True
     assert result["comparison"]["control_oof_dates"] == result["comparison"]["candidate_oof_dates"]
+
+
+def test_mto02_feq02_quality_report_persisted_and_lower_return_not_promoted(
+    tmp_path: Path,
+) -> None:
+    """MTO-02-FEQ-02: report-only 품질 프로필이 리서치 번들에 영속화되고, 평균
+    수익이 대조군보다 낮은 후보는 drawdown 이 낮아도 승급되지 않습니다."""
+    import joblib
+
+    from src.ml.history_feature_research import _promotion_gate
+
+    trade_log = _build_trade_log()
+    price_history = _build_price_history(trade_log)
+    cfg = FeatureSelectionConfig(min_retained=5, max_retained=20, hard_max_retained=40)
+    result = run_history_feature_research_experiment(
+        trade_log,
+        theme_df=None,
+        price_history=price_history,
+        n_splits=3,
+        purge_gap=1,
+        feature_selection_config=cfg,
+        export_dir=str(tmp_path),
+    )
+    # report-only: 반환 후보 진단과 저장 번들 모두 품질 리포트를 포함합니다.
+    assert result["candidate"]["quality_report"]["version"] == "feature_quality_v1"
+    assert result["comparison"]["control_oof_dates"] == result["comparison"]["candidate_oof_dates"]
+    assert "candidate_beats_control_mean" in result["promotion"]
+
+    bundle_path = Path(result["candidate_bundle_path"])
+    assert bundle_path.is_file()
+    saved = joblib.load(bundle_path)
+    assert saved["quality_report"]["version"] == "feature_quality_v1"
+    assert saved["quality_report"]["n_folds"] == 3
+    # 65 전부 비유한 마켓 리지먼트 후보는 source_incomplete 로 보고되고 보간되지 않습니다.
+    actions = saved["quality_report"]["actions"]
+    market_incomplete = {
+        feature
+        for feature, feature_actions in actions.items()
+        if "source_incomplete" in feature_actions
+    }
+    assert market_incomplete
+
+    def _agg(mean: float, mdd: float, pf: float = 1.5) -> dict[str, float]:
+        return {
+            "scheduled_mean_return": mean,
+            "profit_factor": pf,
+            "entry_sequence_drawdown": mdd,
+        }
+
+    control = {"aggregate": {"candidate": _agg(0.015, 0.30)}}
+    lower_return = {"aggregate": {"candidate": _agg(0.010, 0.20)}}
+    gate = _promotion_gate(
+        control,
+        lower_return,
+        identical_oof_dates=True,
+        stability={"gate_passed": True},
+    )
+    assert gate["promoted"] is False
+    assert gate["candidate_beats_control_mean"] is False
+    assert "candidate_mean_not_strictly_higher" in gate["rejected_reasons"]
+    assert "compounded_mdd_not_strictly_lower" not in gate["rejected_reasons"]
+
+    higher_return = {"aggregate": {"candidate": _agg(0.020, 0.20)}}
+    gate_ok = _promotion_gate(
+        control,
+        higher_return,
+        identical_oof_dates=True,
+        stability={"gate_passed": True},
+    )
+    assert gate_ok["promoted"] is True
+    assert gate_ok["candidate_beats_control_mean"] is True

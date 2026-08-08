@@ -46,6 +46,28 @@ _REASON_ZERO_GAIN = "zero_gain"
 _REASON_CORRELATED = "correlated_pair_pruned"
 _REASON_BEYOND_CAP = "beyond_max_retained"
 
+_KNOWN_REJECTION_REASONS: frozenset[str] = frozenset(
+    {
+        _REASON_ALL_NONFINITE,
+        _REASON_MISSING_COLUMN,
+        _REASON_TRAIN_MISSING_RATE,
+        _REASON_ZERO_VARIANCE,
+        _REASON_ZERO_GAIN,
+        _REASON_CORRELATED,
+        _REASON_BEYOND_CAP,
+    }
+)
+
+FEATURE_QUALITY_VERSION = "feature_quality_v1"
+_BASELINE_FAMILY = "baseline"
+_QUALITY_ACTION_NAMES = (
+    "source_incomplete",
+    "capacity_limited",
+    "redundant",
+    "unstable",
+    "screening_weak",
+)
+
 
 class FeatureSelectionConfig(pydantic.BaseModel):
     """Fold-local 선택 설정 (불변).
@@ -65,6 +87,7 @@ class FeatureSelectionConfig(pydantic.BaseModel):
     min_gain: float = 0.0
     catalogue_version: str = "unversioned"
     catalogue: Mapping[str, Mapping[str, str]] = {}
+    min_fold_selection_rate: float = 0.5
     screening_device: Literal["cpu", "gpu", "auto"] = "cpu"
     n_jobs: int = -1
 
@@ -86,6 +109,11 @@ class FeatureSelectionConfig(pydantic.BaseModel):
             )
         if self.min_gain < 0.0:
             raise ValueError(f"min_gain must be >= 0, got {self.min_gain}")
+        if not 0.0 < self.min_fold_selection_rate <= 1.0:
+            raise ValueError(
+                f"min_fold_selection_rate must be in (0, 1], "
+                f"got {self.min_fold_selection_rate}"
+            )
         if self.n_jobs != -1 and self.n_jobs < 1:
             raise ValueError(
                 f"n_jobs must be -1 (all cores) or >= 1, got {self.n_jobs}"
@@ -110,6 +138,7 @@ class FeatureSelectionResult(pydantic.BaseModel):
     rejected: tuple[tuple[str, str], ...]
     counts: dict[str, int]
     metadata: dict[str, Any]
+    quality_evidence: Mapping[str, Mapping[str, float | bool]] = {}
 
 
 def config_fingerprint(config: FeatureSelectionConfig) -> str:
@@ -147,6 +176,7 @@ class FoldFeaturePlan:
     config_fingerprint: str
     seed: int
     config: FeatureSelectionConfig
+    selection: FeatureSelectionResult | None = None
 
 
 def build_fold_feature_plans(
@@ -186,6 +216,7 @@ def build_fold_feature_plans(
                 config_fingerprint=fingerprint,
                 seed=config.random_seed,
                 config=config,
+                selection=result,
             )
         )
     return plans
@@ -257,12 +288,16 @@ def _reject_quality(
     train: pd.DataFrame,
     feature_cols: list[str],
     config: FeatureSelectionConfig,
-) -> tuple[list[str], dict[str, str]]:
+) -> tuple[list[str], dict[str, str], dict[str, dict[str, float | bool]]]:
     """품질 기준으로 후보를 거부하고 생존자 목록을 반환합니다 (행렬 단위 검사).
 
     컬럼별 Python 판다스 연산 대신 결측/비유한/분산 판정을 2D 행렬로 벡터화해
     단일 패스로 계산합니다. 거부 우선순위는 기존 계약과 동일합니다:
     missing column -> all nonfinite -> missing rate -> zero variance.
+
+    추가로 후보별 품질 증거(``finite_ratio``, ``missing_rate``, ``zero_variance``)
+    를 함께 반환해 ``FeatureSelectionResult`` 에 보관하고, 품질 리포트가 두 번째
+    데이터 스캔 없이 폴드별 가용성을 집계하도록 합니다.
     """
     rejected: dict[str, str] = {}
     present = [col for col in feature_cols if col in train.columns]
@@ -270,18 +305,25 @@ def _reject_quality(
         if col not in train.columns:
             rejected[col] = _REASON_MISSING_COLUMN
     if not present:
-        return [], rejected
+        return [], rejected, {}
 
     mat = np.column_stack([train[col].to_numpy(dtype=np.float64) for col in present])
     finite = np.isfinite(mat)
     finite_any = finite.any(axis=0)
+    finite_ratio = finite.mean(axis=0)
     is_nan = np.isnan(mat)
     missing_rate = is_nan.mean(axis=0)
     min_val = np.where(finite, mat, np.inf).min(axis=0)
     max_val = np.where(finite, mat, -np.inf).max(axis=0)
     zero_variance = ~is_nan.any(axis=0) & (min_val == max_val)
 
+    evidence: dict[str, dict[str, float | bool]] = {}
     for idx, col in enumerate(present):
+        evidence[col] = {
+            "finite_ratio": float(finite_ratio[idx]),
+            "missing_rate": float(missing_rate[idx]),
+            "zero_variance": bool(zero_variance[idx]),
+        }
         if not finite_any[idx]:
             rejected[col] = _REASON_ALL_NONFINITE
         elif missing_rate[idx] > config.missing_rate_threshold:
@@ -289,7 +331,7 @@ def _reject_quality(
         elif zero_variance[idx]:
             rejected[col] = _REASON_ZERO_VARIANCE
     survivors = [col for col in present if col not in rejected]
-    return survivors, rejected
+    return survivors, rejected, evidence
 
 
 def _prune_correlated(
@@ -410,7 +452,9 @@ def select_features(
         arr = sanitized[col].to_numpy(dtype=np.float64)
         sanitized[col] = np.where(np.isfinite(arr), arr, np.nan)
 
-    survivors, rejected = _reject_quality(sanitized, list(feature_cols), config)
+    survivors, rejected, quality_evidence = _reject_quality(
+        sanitized, list(feature_cols), config
+    )
     if not survivors:
         raise ValueError(
             f"no candidate features survived quality screening "
@@ -477,6 +521,7 @@ def select_features(
         rejected=tuple(sorted(rejected.items(), key=lambda item: item[0])),
         counts=counts,
         metadata=metadata,
+        quality_evidence=quality_evidence,
     )
 
 
@@ -490,3 +535,177 @@ def median_pairwise_jaccard(feature_lists: Sequence[Sequence[str]]) -> float:
         union = len(a | b)
         scores.append(len(a & b) / union if union else 1.0)
     return float(np.median(scores))
+
+
+class FeatureQualityRecord(pydantic.BaseModel):
+    """폴드 선택 결과에서 집계된 피처 품질 프로필 (불변).
+
+    ``finite_ratio`` / ``missing_rate`` / ``zero_variance`` 는 각 fold 의 train
+    행렬에서 한 번 계산되어 ``FeatureSelectionResult.quality_evidence`` 에 보관된
+    값을 폴드 간 평균/논리합으로 집계합니다 (두 번째 데이터 스캔 없음).
+    ``selection_count`` / ``selection_rate`` 는 폴드별 선택 빈도, ``rejection_counts``
+    는 거부 사유별 폴드 수입니다.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True)
+
+    feature_name: str
+    family: str
+    finite_ratio: float | None
+    missing_rate: float | None
+    zero_variance: bool | None
+    selection_count: int
+    selection_rate: float
+    positive_gain_count: int
+    rejection_counts: dict[str, int]
+
+
+def build_feature_quality_report(
+    selections: Sequence[FeatureSelectionResult],
+    candidate_feature_cols: Sequence[str],
+    catalogue: Mapping[str, Mapping[str, str]],
+    min_fold_selection_rate: float,
+) -> dict[str, Any]:
+    """폴드별 ``FeatureSelectionResult`` 를 결정적 피처/가족 품질 리포트로 집계합니다.
+
+    Args:
+        selections: 외부 fold 의 train 분할에서만 파생된 선택 결과 (검증/이후 행
+            라벨은 절대 폴드 리포트에 영향을 주지 않습니다).
+        candidate_feature_cols: 품질을 측정할 후보 컬럼 (선택 빈도 0 인 후보 포함).
+        catalogue: 카탈로그 피처의 품질 메타데이터 (``family`` 필수). 카탈로그에
+            없는 후보는 ``baseline`` 가족으로 분류합니다.
+        min_fold_selection_rate: ``selection_rate`` 가 이 값 미만이면 ``unstable``
+            로 분류합니다.
+
+    Returns:
+        ``version``(feature_quality_v1), ``n_folds``, ``feature_records``,
+        ``family_records``, ``actions`` 로 구성된 결정적 리포트.
+
+    Raises:
+        ValueError: ``min_fold_selection_rate`` 가 (0, 1] 밖이거나, 카탈로그에
+            등재된 히스토리 피처의 ``family`` 메타데이터가 누락됐거나, 선택 증거에
+            알려지지 않은 거부 사유가 있으면 발생합니다.
+    """
+    if not 0.0 < min_fold_selection_rate <= 1.0:
+        raise ValueError(
+            f"min_fold_selection_rate must be in (0, 1], got {min_fold_selection_rate}"
+        )
+    n_folds = len(selections)
+    features = sorted(set(candidate_feature_cols))
+
+    def _family_of(feature: str) -> str:
+        entry = catalogue.get(feature)
+        if entry is None:
+            return _BASELINE_FAMILY
+        family = str(entry.get("family", "") or "")
+        if not family:
+            raise ValueError(
+                f"catalogue metadata missing family for historical feature {feature!r}"
+            )
+        return family
+
+    selection_counts: dict[str, int] = {}
+    positive_gain_counts: dict[str, int] = {}
+    rejection_counts: dict[str, dict[str, int]] = {}
+    finite_ratios: dict[str, list[float]] = {}
+    missing_rates: dict[str, list[float]] = {}
+    zero_variances: dict[str, list[bool]] = {}
+
+    for selection in selections:
+        for _feature, reason in selection.rejected:
+            if reason not in _KNOWN_REJECTION_REASONS:
+                raise ValueError(
+                    f"unknown rejection reason {reason!r} for feature {_feature!r}"
+                )
+        selected = set(selection.selected_features)
+        rejected_by_feature = dict(selection.rejected)
+        for feature in features:
+            if feature in selected:
+                selection_counts[feature] = selection_counts.get(feature, 0) + 1
+            rejected_reason = rejected_by_feature.get(feature)
+            if rejected_reason is not None:
+                per_feature = rejection_counts.setdefault(feature, {})
+                per_feature[rejected_reason] = per_feature.get(rejected_reason, 0) + 1
+        gain_names = {name for name, _gain in selection.gains}
+        for feature in features:
+            if feature in gain_names:
+                positive_gain_counts[feature] = positive_gain_counts.get(feature, 0) + 1
+        for feature, evidence in selection.quality_evidence.items():
+            if feature not in features:
+                continue
+            finite_ratios.setdefault(feature, []).append(
+                float(evidence.get("finite_ratio", float("nan")))
+            )
+            missing_rates.setdefault(feature, []).append(
+                float(evidence.get("missing_rate", float("nan")))
+            )
+            zero_variances.setdefault(feature, []).append(
+                bool(evidence.get("zero_variance", False))
+            )
+
+    feature_records: list[FeatureQualityRecord] = []
+    actions: dict[str, list[str]] = {}
+    for feature in features:
+        rej = rejection_counts.get(feature, {})
+        feature_actions: list[str] = []
+        if rej.get(_REASON_ALL_NONFINITE, 0) or rej.get(_REASON_TRAIN_MISSING_RATE, 0):
+            feature_actions.append("source_incomplete")
+        if rej.get(_REASON_BEYOND_CAP, 0):
+            feature_actions.append("capacity_limited")
+        if rej.get(_REASON_CORRELATED, 0):
+            feature_actions.append("redundant")
+        selection_count = selection_counts.get(feature, 0)
+        selection_rate = selection_count / n_folds if n_folds else 0.0
+        if selection_rate < min_fold_selection_rate:
+            feature_actions.append("unstable")
+        positive_gain_count = positive_gain_counts.get(feature, 0)
+        if positive_gain_count == 0 and "source_incomplete" not in feature_actions:
+            feature_actions.append("screening_weak")
+        actions[feature] = feature_actions
+        feature_records.append(
+            FeatureQualityRecord(
+                feature_name=feature,
+                family=_family_of(feature),
+                finite_ratio=(
+                    float(np.nanmean(finite_ratios[feature])) if finite_ratios.get(feature) else None
+                ),
+                missing_rate=(
+                    float(np.nanmean(missing_rates[feature])) if missing_rates.get(feature) else None
+                ),
+                zero_variance=(
+                    bool(any(zero_variances[feature])) if zero_variances.get(feature) else None
+                ),
+                selection_count=selection_count,
+                selection_rate=selection_rate,
+                positive_gain_count=positive_gain_count,
+                rejection_counts=dict(sorted(rej.items())),
+            )
+        )
+
+    family_records: list[dict[str, Any]] = []
+    for family in sorted({record.family for record in feature_records}):
+        members = [record for record in feature_records if record.family == family]
+        action_counts = dict.fromkeys(_QUALITY_ACTION_NAMES, 0)
+        for record in members:
+            for action in actions[record.feature_name]:
+                action_counts[action] += 1
+        family_records.append(
+            {
+                "family": family,
+                "n_features": len(members),
+                "n_selected": sum(1 for record in members if record.selection_count > 0),
+                "selection_rate": (
+                    sum(record.selection_rate for record in members) / len(members)
+                ),
+                **action_counts,
+                "features": [record.feature_name for record in members],
+            }
+        )
+
+    return {
+        "version": FEATURE_QUALITY_VERSION,
+        "n_folds": n_folds,
+        "feature_records": [record.model_dump() for record in feature_records],
+        "family_records": family_records,
+        "actions": actions,
+    }
