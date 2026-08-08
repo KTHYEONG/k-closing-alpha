@@ -420,7 +420,18 @@ def run_history_feature_research_experiment(
         feature_set=feature_set,
         panel_mode=panel_mode,
     )
-    base_feature_cols = [col for col in _x.columns if col not in cat_features]
+    base_feature_candidates = [col for col in _x.columns if col not in cat_features]
+    base_feature_cols = []
+    base_feature_exclusions: dict[str, str] = {}
+    for column in base_feature_candidates:
+        values = pd.to_numeric(_x[column], errors="coerce").to_numpy(dtype=np.float64)
+        missing_rate = float((~np.isfinite(values)).mean())
+        if missing_rate > config.missing_rate_threshold:
+            base_feature_exclusions[column] = "source_missing_rate"
+        else:
+            base_feature_cols.append(column)
+    if not base_feature_cols:
+        raise ValueError("all baseline features failed the source missing-rate gate")
     target_col = "target_return"
     group_col = "trade_date"
     if target_col not in processed.columns:
@@ -613,6 +624,8 @@ def run_history_feature_research_experiment(
         "panel_mode": panel_mode,
         "feature_cols": final_features,
         "candidate_feature_cols": candidate_feature_cols,
+        "baseline_feature_cols": base_feature_cols,
+        "baseline_feature_exclusions": base_feature_exclusions,
         "feature_manifest": build_feature_manifest(
             final_features, catalogue=config.catalogue
         ),
@@ -661,6 +674,8 @@ def run_history_feature_research_experiment(
             "catalogue_version": HISTORICAL_CATALOGUE_VERSION,
             "cross_sectional_scope": _CROSS_SECTIONAL_SCOPE,
             "candidate_count": len(candidate_feature_cols),
+            "baseline_feature_count": len(base_feature_cols),
+            "baseline_feature_exclusions": base_feature_exclusions,
             "n_splits": n_splits,
             "purge_gap": purge_gap,
             "evaluation_cutoff": str(evaluation_cutoff),

@@ -312,14 +312,14 @@ def test_mto02_feq02_quality_report_persisted_and_lower_return_not_promoted(
         export_dir=str(tmp_path),
     )
     # report-only: 반환 후보 진단과 저장 번들 모두 품질 리포트를 포함합니다.
-    assert result["candidate"]["quality_report"]["version"] == "feature_quality_v1"
+    assert result["candidate"]["quality_report"]["version"] == "feature_quality_v2"
     assert result["comparison"]["control_oof_dates"] == result["comparison"]["candidate_oof_dates"]
     assert "candidate_beats_control_mean" in result["promotion"]
 
     bundle_path = Path(result["candidate_bundle_path"])
     assert bundle_path.is_file()
     saved = joblib.load(bundle_path)
-    assert saved["quality_report"]["version"] == "feature_quality_v1"
+    assert saved["quality_report"]["version"] == "feature_quality_v2"
     assert saved["quality_report"]["n_folds"] == 3
     # 65 전부 비유한 마켓 리지먼트 후보는 source_incomplete 로 보고되고 보간되지 않습니다.
     actions = saved["quality_report"]["actions"]

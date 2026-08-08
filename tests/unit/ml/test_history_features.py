@@ -27,6 +27,8 @@ from src.ml.history_features import (
     build_causal_history_feature_panel,
     build_causal_history_feature_panel_from_parquet,
     catalogue_quality_metadata,
+    _build_market_context_frame,
+    _safe_zscore,
 )
 
 
@@ -296,6 +298,48 @@ def test_hfs02_zero_denominator_and_missing_sources_are_nan_not_inf() -> None:
     assert np.isnan(values).any()
     metrics = panel.attrs["history_feature_build_metrics"]
     assert metrics["nonfinite_to_nan_count"] >= 0
+
+
+def test_hfs04_market_context_uses_values_after_dataframe_alignment() -> None:
+    """시장 날짜 피처는 RangeIndex 정렬 때문에 전부 NaN이 되지 않습니다."""
+    dates = pd.date_range("2024-01-02", periods=65, freq="D")
+    market = pd.DataFrame(
+        {
+            "date": dates,
+            "kospi_pct": np.linspace(0.001, 0.002, len(dates)),
+            "kosdaq_pct": np.linspace(-0.001, 0.001, len(dates)),
+            "v_kospi": np.linspace(18.0, 22.0, len(dates)),
+            "v_kosdaq": np.linspace(20.0, 24.0, len(dates)),
+        }
+    )
+    context = _build_market_context_frame(market, HistoricalFeatureConfig())
+    assert context["index_ret_kospi_0"].notna().all()
+    assert context["broad_market_ma_dist_60"].notna().any()
+
+
+def test_hfs05_market_context_aggregates_columns_independently() -> None:
+    """하루 첫 행의 NaN이 다른 행의 유효 지수 값을 가리지 않습니다."""
+    market = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-01-02"]),
+            "kospi_pct": [np.nan, 0.01],
+            "kosdaq_pct": [0.02, np.nan],
+            "v_kospi": [np.nan, 20.0],
+            "v_kosdaq": [25.0, np.nan],
+        }
+    )
+    context = _build_market_context_frame(market, HistoricalFeatureConfig())
+    assert context.index.tolist() == [pd.Timestamp("2024-01-02")]
+    assert context["index_ret_kospi_0"].iloc[0] == 0.01
+    assert context["index_ret_kosdaq_0"].iloc[0] == 0.02
+
+
+def test_hfs06_zero_scale_zscore_is_neutral() -> None:
+    """유효한 상수 구간은 결측이 아니라 중립 z-score 0입니다."""
+    result = _safe_zscore(pd.Series([0.0, 1.0, np.nan]), pd.Series([0.0, 2.0, 0.0]))
+    assert result.iloc[0] == 0.0
+    assert result.iloc[1] == 0.5
+    assert np.isnan(result.iloc[2])
 
 
 def test_hfs03_memory_budget_fails_closed_and_reports_metrics() -> None:
