@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_FEATURE_ENGINEERING_QUALITY",
+      "date": "2026-08-08",
+      "adr_id": "ADR_20260808_ML_FEATURE_ENGINEERING_QUALITY",
+      "domain": "ml",
+      "title": "Feature engineering quality diagnostics and promotion gate",
+      "why": "The 2025 causal-history retrain showed 65 unavailable candidates, 179 capacity-limited candidates, and lower candidate OOF performance despite feature-count expansion.",
+      "resolution": "Added fold-local feature quality evidence and deterministic family reports, persisted quality_report in research artifacts, exposed source-incomplete/capacity-limited/unstable actions, and required candidate scheduled mean return to strictly beat the identical-date control before promotion.",
+      "impact": "Research now distinguishes unavailable data from redundant or capacity-limited features and prevents lower-return history candidates from promotion; active production artifacts remain unchanged."
+    },
+    {
       "task_id": "ml_training_optimization",
       "date": "2026-08-08",
       "adr_id": "ADR_20260808_ml_training_optimization",
