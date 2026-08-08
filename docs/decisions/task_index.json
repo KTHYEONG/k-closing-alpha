@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_FEATURE_ENGINEERING_QUALITY_REPAIR",
+      "date": "2026-08-08",
+      "adr_id": "ADR_20260808_ML_FEATURE_ENGINEERING_QUALITY_REPAIR",
+      "domain": "signal",
+      "title": "Repair causal history feature quality",
+      "why": "The 2025-only quality audit found market-context alignment, order-dependent aggregation, zero-denominator flow ratios, misleading two-fold stability, and an under-sourced volume_power feature.",
+      "resolution": "Synchronized the causal_history_v2 repairs: deterministic market aggregation, signed-log flow changes, neutral zero-scale z-scores, baseline missing-rate gating, all-fold stability, and effective ma_slope lookback metadata.",
+      "impact": "Documentation, task registry, and code map now reflect the verified 2025 cutoff five-fold retraining; the candidate remains report-only because it does not beat control."
+    },
+    {
       "task_id": "TASK_ML_FEATURE_ENGINEERING_QUALITY",
       "date": "2026-08-08",
       "adr_id": "ADR_20260808_ML_FEATURE_ENGINEERING_QUALITY",
