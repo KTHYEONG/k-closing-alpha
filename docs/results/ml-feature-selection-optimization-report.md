@@ -4,10 +4,10 @@
 **Scope**: Causal History Feature Quality Repair & 2025 Re-training
 **Evaluation Mode**: Confirmation Mode (`frozen cutoff: 2025-12-30`, `purge_gap: 1`, `n_splits: 5`, `causal_history_v2`)
 
-> 이 문서의 최신 권위 결과는 아래 **0.1 전체 파이프라인 재실행**입니다. 기존 v2
+> 이 문서의 최신 권위 결과는 아래 **0.2 동기화 후 전체 파이프라인 재실행**입니다. 기존 v2
 > 품질 실행과 v1/2-fold 수치는 비교용 과거 스냅샷으로 보존합니다.
 
-## 0.1 Latest Full Pipeline Re-run (2025 cutoff, 2026-08-08)
+## 0.1 Prior Full Pipeline Re-run (2025 cutoff, 2026-08-08)
 
 실제 `trade_log.parquet`와 `price_history.parquet`를 사용해 confirmation 모드로
 파이프라인을 끝까지 실행했습니다. 이번 CLI 호출은 `FeatureSelectionConfig`를
@@ -41,7 +41,44 @@
 결론을 재확인합니다. `permutation_fwer` 경로의 실데이터 성과는 CLI 선택 옵션을
 추가한 뒤 별도 ablation으로 기록해야 합니다.
 
-## 0.2 Prior v2 Quality Execution (2025 cutoff)
+## 0.2 Latest Sync + Full Pipeline Re-run (2025 cutoff, 2026-08-08)
+
+`sync` 후 동일한 fingerprint cache를 사용해 단일 프로세스로 confirmation 파이프라인을
+끝까지 재실행했습니다. lifecycle observer가 history 구축, 5-fold selection plan, 최종
+선택, control/candidate, export를 모두 기록했으며 실행 상태는 `completed`입니다.
+
+### 성능 결과
+
+| 지표 | Control | Candidate | 변화 (Candidate-Control) |
+| :--- | ---: | ---: | ---: |
+| scheduled dates | 2,040 | 2,040 | 0 |
+| buy count | 2,035 | 2,035 | 0 |
+| scheduled mean return | **1.5933%** | 1.4157% | **-0.1776%p** |
+| scheduled win rate | **63.53%** | 62.65% | **-0.88%p** |
+| profit factor | **2.8687** | 2.5248 | -0.3439 |
+| scheduled Sharpe | **6.3146** | 5.5525 | -0.7620 |
+| entry-sequence MDD | **25.8652%** | 25.9978% | **+0.1326%p** |
+
+### 실행·무결성·판정
+
+- 전체 lifecycle elapsed: **524.9초(약 8분 45초)**, 단일 프로세스 실행.
+- history input **5,046,547 rows**, output **33,520 keys**, **6 batches**, nonfinite **0**.
+- history build metric은 최초 cold build의 **337.46초**, peak RSS **963,661,824 bytes**를
+  보존하며, 이번 실행은 `cache_state=warm`, `cache_reason=warm_fingerprint_match`입니다.
+- 후보 outer fold에서 관측된 전체 peak RSS는 약 **1.72GB**입니다.
+- 선택 피처 **400개**, OOF 날짜 일치 **True**, stability gate **통과**.
+- 승격은 **거부**되었습니다. `availability_manifest_non_promotable`,
+  `candidate_mean_not_strictly_higher`, `compounded_mdd_not_strictly_lower`가
+  거부 사유이며, 후보의 PF>1 및 양의 평균수익 자체는 유지됩니다.
+- 연구 번들: `/tmp/ml-sync-final/causal_history_v2/2025-12-30/sizing_pipeline_bundle.joblib`
+- Production artifact는 변경하지 않았습니다. 동기화 ADR은
+  `ADR_20260808_ML_HISTORY_PIPELINE_OPERATIONAL_HARDENING`입니다.
+
+이번 실행은 history 산출 중단이 아니라 후속 선택 단계의 관측 공백이 과거 중단 원인이었음을
+재확인했고, 운영 개선 후에도 causal-history candidate가 control을 대체할 성능 근거는
+확보하지 못했다는 결론을 유지합니다.
+
+## 0.3 Prior v2 Quality Execution (2025 cutoff)
 
 ### 적용한 문제 해결
 
