@@ -39,10 +39,16 @@ def test_scenario_history_feature_pipeline_readiness_02_wires_parquet_runner(
         assert callable(progress)
         progress("dataset_built", {"processed_rows": 10})
         return {
-            "build_metrics": {"batch_count": 2},
+            "contract": {
+                "mode": "confirmation",
+                "evaluation_cutoff": "2025-12-30 00:00:00",
+                "excluded_rows_after_cutoff": 0,
+            },
+            "build_metrics": {"batch_count": 2, "cache_state": "cold"},
             "candidate": {"final_features": ["f1", "f2"], "metrics": {"mean": 0.2}},
             "control": {"metrics": {"mean": 0.1}},
             "comparison": {"identical_oof_dates": True},
+            "promotion": {"promoted": False, "rejected_reasons": []},
             "candidate_bundle_path": "research/model.joblib",
         }
 
@@ -58,6 +64,10 @@ def test_scenario_history_feature_pipeline_readiness_02_wires_parquet_runner(
         n_splits=5,
         purge_gap=1,
         screening_device="cpu",
+        research_cutoff=None,
+        cache_dir=None,
+        mode="confirmation",
+        wall_time_budget_seconds=1800.0,
     )
 
     summary = runner.run_research(args)
@@ -72,11 +82,17 @@ def test_scenario_history_feature_pipeline_readiness_02_wires_parquet_runner(
             parquet_batch_rows=100_000,
             enforce_memory_budget=True,
         ),
+        "research_cutoff": None,
+        "cache_dir": None,
+        "mode": "confirmation",
+        "wall_time_budget_seconds": 1800.0,
         "export_dir": str(tmp_path / "research"),
         "progress_callback": captured["kwargs"]["progress_callback"],
     }
     assert summary["selected_feature_count"] == 2
     assert summary["identical_oof_dates"] is True
+    assert summary["mode"] == "confirmation"
+    assert summary["evaluation_cutoff"] is not None
     status = json.loads((tmp_path / "research" / "run_status.json").read_text())
     assert status["state"] == "completed"
     events = (tmp_path / "research" / "run_events.jsonl").read_text().splitlines()
@@ -106,6 +122,10 @@ def test_scenario_history_feature_research_observability_02_records_failure(
         n_splits=5,
         purge_gap=1,
         screening_device="cpu",
+        research_cutoff=None,
+        cache_dir=None,
+        mode="confirmation",
+        wall_time_budget_seconds=1800.0,
     )
 
     with pytest.raises(RuntimeError, match="fold failure"):

@@ -22,14 +22,19 @@ Vectorized 전용이며 ``pd.apply`` 를 사용하지 않습니다. SHAP 은 선
 
 from __future__ import annotations
 
+import hashlib
 import itertools
+import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 import pydantic
 from lightgbm import LGBMRegressor
+
+from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
 
 FEATURE_SELECTION_VERSION = "fold_local_gain_v1"
 
@@ -100,6 +105,147 @@ class FeatureSelectionResult(pydantic.BaseModel):
     rejected: tuple[tuple[str, str], ...]
     counts: dict[str, int]
     metadata: dict[str, Any]
+
+
+def config_fingerprint(config: FeatureSelectionConfig) -> str:
+    """버전 + 설정 JSON 의 결정적 지문 (sha256) 을 반환합니다.
+
+    캐시 키·순열 null 시드·진단 재현에 사용됩니다. ``catalogue`` 매핑을 포함한
+    설정 전부를 정렬된 JSON 으로 직렬화해, 설정이 조금이라도 바뀌면 지문이
+    바뀌도록 합니다.
+    """
+    payload = json.dumps(
+        {"version": FEATURE_SELECTION_VERSION, **config.model_dump()},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class FoldFeaturePlan:
+    """외부 fold 하나의 불변 피처 계획.
+
+    같은 fold 의 expanding/recent return 전문가가 동일한 ``selected_features``
+    를 공유해야 하므로, 선택 결과와 그 근거(거부 사유·gain·카운트·설정 지문·
+    시드)를 불변 값으로 캡슐화합니다. ``config`` 는 OOF 평가 후 research 번들
+    용 full-data ``final_train_only`` 선택을 재현할 때만 사용됩니다.
+    """
+
+    fold: int
+    data_cutoff: str
+    selected_features: tuple[str, ...]
+    gains: tuple[tuple[str, float], ...]
+    rejected: tuple[tuple[str, str], ...]
+    counts: Mapping[str, int]
+    metadata: Mapping[str, Any]
+    config_fingerprint: str
+    seed: int
+    config: FeatureSelectionConfig
+
+
+def build_fold_feature_plans(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    group_col: str,
+    config: FeatureSelectionConfig,
+    n_splits: int = 5,
+    purge_gap: int = 1,
+) -> list[FoldFeaturePlan]:
+    """외부 walk-forward fold 별 train 전용 피처 계획을 1회 구성합니다.
+
+    각 계획은 그 fold 의 train 분할에서만 ``select_features`` 로 선택되므로
+    validation/이후 라벨에 불변입니다. 두 return 전문가(expanding, recent) 가
+    같은 계획을 공유하며, ``_prepare_history_frame`` 계약의 성립 대신 이 함수
+    자체가 fold 단위 train-only 불변량을 보장합니다.
+    """
+    work = df.sort_values(group_col).copy()
+    splitter = PurgedGroupTimeSeriesSplit(n_splits=n_splits, purge_gap=purge_gap)
+    fingerprint = config_fingerprint(config)
+    plans: list[FoldFeaturePlan] = []
+    for fold, (train_idx, _val_idx) in enumerate(
+        splitter.split(work, y=work[target_col], groups=work[group_col])
+    ):
+        train = work.iloc[train_idx]
+        result = select_features(train, feature_cols, target_col, config)
+        plans.append(
+            FoldFeaturePlan(
+                fold=fold,
+                data_cutoff=str(train[group_col].max()),
+                selected_features=result.selected_features,
+                gains=result.gains,
+                rejected=result.rejected,
+                counts=result.counts,
+                metadata=result.metadata,
+                config_fingerprint=fingerprint,
+                seed=config.random_seed,
+                config=config,
+            )
+        )
+    return plans
+
+
+def permutation_null_stability(
+    feature_lists: Sequence[Sequence[str]],
+    *,
+    random_seed: int,
+    n_permutations: int = 199,
+    null_gate_quantile: float = 0.95,
+    universe: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """관측 fold 안정성을 날짜 블록 순열 null 분포와 비교합니다.
+
+    fold 는 서로 다른 날짜 블록에서 나왔으므로, 각 fold 의 선택 크기를 보존한 채
+    후보 유니온 풀에서 무작위 재추출한 순열 목록의 median pairwise Jaccard 로
+    null 을 구성합니다 (결정적 시드). ``universe`` 는 후보 전체 풀 (선택기가
+    선택했을 수 있는 모든 컬럼) 이며 기본은 선택 feature 의 합집합입니다.
+    ``null_gate_quantile`` 분위를 관측값이 초과하지 못하면 게이트 미통과(불안정)
+    로 간주해 약한 피처로 패딩하는 대신 후보를 거부합니다.
+    """
+    if not 0.0 <= null_gate_quantile <= 1.0:
+        raise ValueError(f"null_gate_quantile must be in [0, 1], got {null_gate_quantile}")
+    if n_permutations < 1:
+        raise ValueError(f"n_permutations must be >= 1, got {n_permutations}")
+    lists = [list(features) for features in feature_lists]
+    observed = median_pairwise_jaccard(feature_lists)
+    if len(lists) < 2:
+        return {
+            "observed_median_jaccard": float(observed),
+            "null_mean": None,
+            "null_std": None,
+            "null_gate_value": None,
+            "null_gate_quantile": null_gate_quantile,
+            "n_permutations": 0,
+            "gate_passed": True,
+            "reason": "fewer_than_two_folds_abstain",
+        }
+    if universe is not None:
+        pool = sorted(set(universe))
+    else:
+        pool = sorted({feature for features in lists for feature in features})
+    sizes = [len(features) for features in lists]
+    if any(size > len(pool) for size in sizes):
+        raise ValueError("fold feature list exceeds the candidate universe size")
+    rng = np.random.default_rng(random_seed)
+    null_scores: list[float] = []
+    for _ in range(n_permutations):
+        permuted = [
+            rng.choice(pool, size=size, replace=False).tolist() for size in sizes
+        ]
+        null_scores.append(median_pairwise_jaccard(permuted))
+    null_arr = np.asarray(null_scores, dtype=np.float64)
+    gate_value = float(np.quantile(null_arr, null_gate_quantile))
+    return {
+        "observed_median_jaccard": float(observed),
+        "null_mean": float(null_arr.mean()),
+        "null_std": float(null_arr.std()),
+        "null_gate_value": gate_value,
+        "null_gate_quantile": null_gate_quantile,
+        "n_permutations": n_permutations,
+        "gate_passed": bool(observed > gate_value),
+        "reason": None,
+    }
 
 
 def _reject_quality(
@@ -284,6 +430,7 @@ def select_features(
         "requested_screening_device": config.screening_device,
         "resolved_screening_device": resolved_device,
         "gpu_fallback_reason": fallback_reason,
+        "config_fingerprint": config_fingerprint(config),
     }
     return FeatureSelectionResult(
         selected_features=tuple(selected),

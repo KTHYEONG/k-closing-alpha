@@ -231,3 +231,60 @@ def test_hfs07_experiment_requires_history_input(tmp_path: Path) -> None:
             purge_gap=1,
             export_dir=str(tmp_path),
         )
+
+
+def test_mto01_rows_after_history_cutoff_rejected_before_fitting(tmp_path: Path) -> None:
+    """MTO-01: history 커트오프 이후 행은 후보 학습 전에 거부되고, 컨트롤/후보는
+    거부된 날짜를 절대 평가하지 않습니다."""
+    trade_log = _build_trade_log(n_dates=18, n_stocks=8)
+    price_history = _build_price_history(trade_log)
+    history_dates = sorted(price_history["date"].unique())
+    last_history_date = history_dates[-4]
+    price_history = price_history[price_history["date"] <= last_history_date].copy()
+
+    cfg = FeatureSelectionConfig(min_retained=5, max_retained=20, hard_max_retained=40)
+    result = run_history_feature_research_experiment(
+        trade_log,
+        theme_df=None,
+        price_history=price_history,
+        n_splits=3,
+        purge_gap=1,
+        feature_selection_config=cfg,
+        export_dir=str(tmp_path),
+    )
+    # evaluation_cutoff = min(패널 최대, history 최대).
+    assert result["contract"]["evaluation_cutoff"] == str(last_history_date)
+    assert result["contract"]["excluded_rows_after_cutoff"] > 0
+    assert result["contract"]["excluded_dates"]
+    retained = pd.to_datetime(result["comparison"]["control_oof_dates"])
+    assert len(retained) > 0
+    assert retained.max() <= pd.Timestamp(last_history_date)
+    assert result["comparison"]["identical_oof_dates"] is True
+    assert result["comparison"]["control_oof_dates"] == result["comparison"]["candidate_oof_dates"]
+    # 커트오프 이후 날짜는 excluded_dates 에 기록되고 절대 채워지지 않습니다.
+    assert all(pd.Timestamp(d) > pd.Timestamp(last_history_date) for d in result["contract"]["excluded_dates"])
+
+
+def test_mto01_frozen_research_cutoff_caps_evaluation(tmp_path: Path) -> None:
+    """MTO-01: 명시적 research_cutoff 는 history 최대와 교집합(최솟값)으로 적용됩니다."""
+    trade_log = _build_trade_log(n_dates=24, n_stocks=8)
+    price_history = _build_price_history(trade_log)
+    history_dates = sorted(price_history["date"].unique())
+    frozen = str(history_dates[-6])
+
+    cfg = FeatureSelectionConfig(min_retained=5, max_retained=20, hard_max_retained=40)
+    result = run_history_feature_research_experiment(
+        trade_log,
+        theme_df=None,
+        price_history=price_history,
+        n_splits=3,
+        purge_gap=1,
+        feature_selection_config=cfg,
+        research_cutoff=frozen,
+        export_dir=str(tmp_path),
+    )
+    # min(frozen, history max) 이 커트오프입니다.
+    assert result["contract"]["evaluation_cutoff"] == frozen
+    assert result["contract"]["excluded_rows_after_cutoff"] > 0
+    assert result["comparison"]["identical_oof_dates"] is True
+    assert result["comparison"]["control_oof_dates"] == result["comparison"]["candidate_oof_dates"]

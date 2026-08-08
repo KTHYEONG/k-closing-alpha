@@ -71,6 +71,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--purge-gap", type=int, default=1)
     parser.add_argument("--screening-device", choices=("cpu", "gpu", "auto"), default="cpu")
+    parser.add_argument("--research-cutoff", type=str, default=None)
+    parser.add_argument("--cache-dir", type=Path, default=None)
+    parser.add_argument(
+        "--mode",
+        choices=("confirmation", "discovery"),
+        default="confirmation",
+        help="confirmation은 선형 기준선 포함 확정 실행, discovery는 후보 속도 모드.",
+    )
+    parser.add_argument("--wall-time-budget-seconds", type=float, default=1800.0)
     return parser
 
 
@@ -83,6 +92,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("n_splits must be at least 2")
     if args.purge_gap < 0:
         raise ValueError("purge_gap must be non-negative")
+    if args.wall_time_budget_seconds <= 0.0:
+        raise ValueError("wall_time_budget_seconds must be positive")
     for path in (args.trade_log_path, args.history_path):
         if not path.is_file():
             raise ValueError(f"required input does not exist: {path}")
@@ -92,11 +103,16 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _summary(result: dict[str, Any]) -> dict[str, object]:
     return {
+        "mode": result["contract"]["mode"],
+        "evaluation_cutoff": result["contract"]["evaluation_cutoff"],
+        "excluded_rows_after_cutoff": result["contract"]["excluded_rows_after_cutoff"],
+        "cache_state": result["build_metrics"].get("cache_state"),
         "build_metrics": result["build_metrics"],
         "selected_feature_count": len(result["candidate"]["final_features"]),
         "control_metrics": result["control"]["metrics"],
         "candidate_metrics": result["candidate"]["metrics"],
         "identical_oof_dates": result["comparison"]["identical_oof_dates"],
+        "promotion": result["promotion"],
         "candidate_bundle_path": result["candidate_bundle_path"],
     }
 
@@ -130,6 +146,10 @@ def run_research(args: argparse.Namespace) -> dict[str, object]:
             purge_gap=args.purge_gap,
             feature_selection_config=FeatureSelectionConfig(screening_device=args.screening_device),
             execution_config=execution,
+            research_cutoff=args.research_cutoff,
+            cache_dir=str(args.cache_dir) if args.cache_dir is not None else None,
+            mode=args.mode,
+            wall_time_budget_seconds=args.wall_time_budget_seconds,
             export_dir=str(args.export_dir),
             progress_callback=observer,
         )

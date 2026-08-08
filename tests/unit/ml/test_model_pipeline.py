@@ -543,6 +543,80 @@ def test_run_model_pipeline_rejects_missing_columns() -> None:
         )
 
 
+def test_mto03_candidate_speed_mode_omits_linear_without_changing_pred() -> None:
+    """MTO-03: pred_linear=False 후보 속도 모드가 pred/fold 경계/백테스트 모델
+    지표를 바꾸지 않고 pred_linear 컬럼만 생략합니다."""
+    df = _make_recency_dataset(seed=7, n_groups=40, rows_per_group=3)
+    kwargs = {
+        "feature_cols": ["feature_a", "feature_b"],
+        "target_col": TARGET_COL,
+        "group_col": GROUP_COL,
+        "n_splits": 3,
+        "purge_gap": 1,
+        "model_type": "lgb_regressor",
+    }
+    full = run_model_pipeline(df, pred_linear=True, **kwargs)
+    fast = run_model_pipeline(df, pred_linear=False, **kwargs)
+
+    assert "pred_linear" in full["oof_predictions"].columns
+    assert "pred_linear" not in fast["oof_predictions"].columns
+    np.testing.assert_allclose(
+        full["oof_predictions"]["pred"].to_numpy(),
+        fast["oof_predictions"]["pred"].to_numpy(),
+    )
+    assert full["oof_predictions"]["fold"].tolist() == fast["oof_predictions"]["fold"].tolist()
+    assert full["oof_predictions"].index.equals(fast["oof_predictions"].index)
+    assert full["metrics"] == fast["metrics"]
+    assert full["backtest_eval"]["model_metrics"] == fast["backtest_eval"]["model_metrics"]
+    assert full["profile"]["fold_events"][0]["phase_profiles"][-1]["phase"] == "linear_baseline"
+    assert all(
+        event["phase_profiles"][-1]["phase"] != "linear_baseline"
+        for event in fast["profile"]["fold_events"]
+    )
+
+
+def test_mto03_rejects_fold_plan_count_mismatch() -> None:
+    """MTO-03: fold_feature_plans 수가 n_splits 와 다르면 fail-closed 입니다."""
+    from src.ml.feature_selection import FoldFeaturePlan, config_fingerprint
+
+    cfg = FeatureSelectionConfig(min_retained=1, max_retained=4, hard_max_retained=10)
+    plan = FoldFeaturePlan(
+        fold=0,
+        data_cutoff="2024-03-04",
+        selected_features=("feature_a",),
+        gains=(("feature_a", 1.0),),
+        rejected=(),
+        counts={"n_candidates": 2, "n_retained": 1},
+        metadata={"random_seed": cfg.random_seed},
+        config_fingerprint=config_fingerprint(cfg),
+        seed=cfg.random_seed,
+        config=cfg,
+    )
+    plans = [plan, plan, plan]
+    df = _make_dataset(n_groups=12)
+    with pytest.raises(ValueError, match="exactly n_splits"):
+        run_model_pipeline(
+            df,
+            feature_cols=FEATURE_COLS,
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            n_splits=5,
+            purge_gap=1,
+            fold_feature_plans=plans,
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        run_model_pipeline(
+            df,
+            feature_cols=FEATURE_COLS,
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            n_splits=3,
+            purge_gap=1,
+            feature_selection_config=cfg,
+            fold_feature_plans=plans,
+        )
+
+
 def test_run_sizing_pipeline_exports_model_bundle(tmp_path) -> None:
     """훈련 모드(export_dir)에서 모델 번들을 저장하고 artifact_path 를 반환한다."""
     df = _make_dataset(n_groups=8, rows_per_group=6)

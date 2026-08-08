@@ -8,7 +8,8 @@ Return 지표를 산출합니다.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+import time
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,11 @@ from scipy.stats import spearmanr
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - telemetry best-effort
+    psutil = None
 
 from src.ml.backtest_evaluator import (
     _MIN_YEAR_SAMPLES,
@@ -31,7 +37,10 @@ from src.ml.feature_selection import (
     FEATURE_SELECTION_VERSION,
     FeatureSelectionConfig,
     FeatureSelectionResult,
+    FoldFeaturePlan,
+    config_fingerprint,
     median_pairwise_jaccard,
+    permutation_null_stability,
     select_features,
 )
 from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
@@ -77,6 +86,18 @@ _POLICY_METRIC_KEYS: tuple[str, ...] = (
     "active_trade_win_rate",
     "entry_sequence_drawdown",
 )
+
+_PROFILE_VERSION = "phase_profile_v1"
+
+
+def _rss_bytes() -> int:
+    """현재 프로세스 RSS (psutil 미사용 시 0)."""
+    if psutil is None:
+        return 0
+    try:
+        return int(psutil.Process().memory_info().rss)
+    except Exception:  # pragma: no cover - telemetry best-effort
+        return 0
 
 
 def calculate_recency_sample_weight(
@@ -186,7 +207,13 @@ def _align_close_morning_oof(
     for col in ("stock_code", "chart_analysis"):
         if col not in risk_oof.columns:
             continue
-        if not aligned[col].equals(risk_oof.loc[aligned.index, col]):
+        # ``Series.equals`` 는 dtype 차이(object vs StringDtype)에 민감하므로
+        # 값 기반 비교로 통일합니다. pandas 3.0 의 StringDtype 추론으로 두 OOF 의
+        # 문자열 dtype 이 달라져도 값이 동일하면 정렬은 유효합니다.
+        if not np.array_equal(
+            aligned[col].astype(str).to_numpy(),
+            risk_oof.loc[aligned.index, col].astype(str).to_numpy(),
+        ):
             raise ValueError(
                 f"close-morning OOF alignment: {col} mismatch between return and risk "
                 "OOF on original index"
@@ -739,6 +766,8 @@ def _inner_recency_ensemble_candidate_evaluator(
     min_history_dates: int,
     half_lives: tuple[int, ...],
     alphas: tuple[float, ...],
+    risk_feature_cols: list[str] | None = None,
+    pred_linear: bool = True,
 ) -> dict[str, Any]:
     """외부 fold 의 train 분할만 사용하는 내부 purged walk-forward 후보 평가입니다.
 
@@ -748,6 +777,7 @@ def _inner_recency_ensemble_candidate_evaluator(
     규칙으로 최적 구성을 결정합니다. 선택은 전적으로 이 partition 의 OOF 레이블만
     사용하며 외부 validation 레이블을 절대 읽지 않습니다. partition 이 중첩
     walk-forward 를 지원할 만큼 충분하지 않으면 baseline 으로 fail-closed 합니다.
+    ``risk_feature_cols`` 는 p_good/risk 입력 표면 (기본 ``feature_cols``).
     """
     inner_groups = int(inner_df[group_col].nunique())
     if inner_groups < 3:
@@ -760,6 +790,7 @@ def _inner_recency_ensemble_candidate_evaluator(
             "fail_closed_reason": "insufficient_inner_history",
         }
     inner_splits = max(1, min(n_splits, inner_groups - 2))
+    risk_cols = risk_feature_cols if risk_feature_cols is not None else feature_cols
 
     expanding = run_model_pipeline(
         inner_df,
@@ -769,6 +800,7 @@ def _inner_recency_ensemble_candidate_evaluator(
         n_splits=inner_splits,
         purge_gap=purge_gap,
         model_type="lgb_regressor",
+        pred_linear=pred_linear,
     )
     recent_by_h: dict[int, dict[str, Any]] = {
         half_life: run_model_pipeline(
@@ -780,12 +812,13 @@ def _inner_recency_ensemble_candidate_evaluator(
             purge_gap=purge_gap,
             model_type="lgb_regressor",
             recency_half_life_groups=half_life,
+            pred_linear=pred_linear,
         )
         for half_life in half_lives
     }
     risk_oof = fit_predict_quantile_and_classifier(
         inner_df,
-        feature_cols=feature_cols,
+        feature_cols=risk_cols,
         target_col=target_col,
         group_col=group_col,
         n_splits=inner_splits,
@@ -864,6 +897,14 @@ def run_close_morning_recency_ensemble_experiment(
     half_lives: tuple[int, ...] = (252, 504),
     alphas: tuple[float, ...] = (0.0, 0.25, 0.50, 0.75, 1.0),
     build_research_bundle: bool = False,
+    *,
+    fold_feature_plans: Sequence[FoldFeaturePlan] | None = None,
+    risk_feature_cols: list[str] | None = None,
+    pred_linear: bool = True,
+    final_feature_selection: FeatureSelectionResult | None = None,
+    memory_budget_bytes: int | None = None,
+    wall_time_budget_seconds: float | None = None,
+    fold_event_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """close-morning recency-adaptive dual-horizon ensemble 중첩 선택 실험 (연구 전용).
 
@@ -893,6 +934,13 @@ def run_close_morning_recency_ensemble_experiment(
         half_lives: 최근 전문가 half-life 후보 (252 또는 504).
         alphas: 최근 전문가 가중치 후보 (0.0 baseline 포함).
         build_research_bundle: 승격 게이트 통과 시 연구 번들 영속화 여부.
+        fold_feature_plans: 외부 fold 별 불변 피처 계획 (return 전문가 공유).
+        risk_feature_cols: p_good/risk 입력 표면 (기본 ``feature_cols``).
+        pred_linear: False 면 return 전문가의 Ridge baseline 을 생략 (candidate-speed).
+        final_feature_selection: 번들 매니페스트용 full-data ``final_train_only`` 선택.
+        fold_event_callback: 폴드 단위 프로파일/선택 진단을 append-only 로 방출.
+        memory_budget_bytes: 초과 시 fail-closed.
+        wall_time_budget_seconds: 초과 시 fail-closed.
 
     Returns:
         dict: ``contract``, ``folds``(폴드별 선택 구성·내부 후보 지표·baseline/
@@ -918,6 +966,7 @@ def run_close_morning_recency_ensemble_experiment(
         raise ValueError(
             f"alphas must be a non-empty subset of [0, 1] containing 0.0, got {alphas!r}"
         )
+    risk_cols = risk_feature_cols if risk_feature_cols is not None else feature_cols
 
     work = df.sort_values(group_col).copy()
     expanding = run_model_pipeline(
@@ -928,6 +977,13 @@ def run_close_morning_recency_ensemble_experiment(
         n_splits=n_splits,
         purge_gap=purge_gap,
         model_type="lgb_regressor",
+        fold_feature_plans=fold_feature_plans,
+        final_feature_selection=final_feature_selection,
+        include_final_train_selection=False,
+        pred_linear=pred_linear,
+        memory_budget_bytes=memory_budget_bytes,
+        wall_time_budget_seconds=wall_time_budget_seconds,
+        fold_event_callback=fold_event_callback,
     )
     recent_by_h: dict[int, dict[str, Any]] = {
         half_life: run_model_pipeline(
@@ -939,12 +995,19 @@ def run_close_morning_recency_ensemble_experiment(
             purge_gap=purge_gap,
             model_type="lgb_regressor",
             recency_half_life_groups=half_life,
+            fold_feature_plans=fold_feature_plans,
+            final_feature_selection=final_feature_selection,
+            include_final_train_selection=False,
+            pred_linear=pred_linear,
+            memory_budget_bytes=memory_budget_bytes,
+            wall_time_budget_seconds=wall_time_budget_seconds,
+            fold_event_callback=fold_event_callback,
         )
         for half_life in half_lives
     }
     risk_oof = fit_predict_quantile_and_classifier(
         work,
-        feature_cols=feature_cols,
+        feature_cols=risk_cols,
         target_col=target_col,
         group_col=group_col,
         n_splits=n_splits,
@@ -977,6 +1040,7 @@ def run_close_morning_recency_ensemble_experiment(
     for fold, (train_idx, val_idx) in enumerate(
         splitter.split(work, y=work[target_col], groups=work[group_col])
     ):
+        fold_started = time.perf_counter()
         train_groups = set(work.iloc[train_idx][group_col].unique())
         val_groups = set(work.iloc[val_idx][group_col].unique())
         inner_df = work[work[group_col].isin(train_groups)]
@@ -991,6 +1055,8 @@ def run_close_morning_recency_ensemble_experiment(
             min_history_dates=min_history_dates,
             half_lives=half_lives,
             alphas=alphas,
+            risk_feature_cols=risk_cols,
+            pred_linear=pred_linear,
         )
         chosen_half_life, chosen_alpha = inner["chosen_config"]
 
@@ -1063,6 +1129,24 @@ def run_close_morning_recency_ensemble_experiment(
         candidate_series.append(candidate_eval["scheduled_returns"])
         baseline_dates.append(baseline_eval["dates"])
         candidate_dates.append(candidate_eval["dates"])
+        if fold_event_callback is not None:
+            try:
+                fold_event_callback(
+                    {
+                        "phase": "recency_ensemble_fold",
+                        "fold": fold,
+                        "chosen_config": {
+                            "half_life": chosen_half_life,
+                            "recent_weight": chosen_alpha,
+                        },
+                        "inner_n_groups": int(inner["inner_n_groups"]),
+                        "inner_n_splits": int(inner["inner_n_splits"]),
+                        "elapsed_seconds": time.perf_counter() - fold_started,
+                        "peak_rss_bytes": _rss_bytes(),
+                    }
+                )
+            except Exception:  # pragma: no cover - observers must not change research behavior
+                logger.warning("recency-ensemble fold observer failed at fold=%d", fold, exc_info=True)
 
     baseline_cat = np.concatenate(baseline_series)
     candidate_cat = np.concatenate(candidate_series)
@@ -1344,6 +1428,14 @@ def run_model_pipeline(
     model_params: dict[str, int | float] | None = None,
     recency_half_life_groups: int | None = None,
     feature_selection_config: FeatureSelectionConfig | None = None,
+    *,
+    fold_feature_plans: Sequence[FoldFeaturePlan] | None = None,
+    final_feature_selection: FeatureSelectionResult | None = None,
+    pred_linear: bool = True,
+    include_final_train_selection: bool = True,
+    memory_budget_bytes: int | None = None,
+    wall_time_budget_seconds: float | None = None,
+    fold_event_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Train ML model using Purged Group Walk-Forward CV and evaluate OOF results.
 
@@ -1363,6 +1455,20 @@ def run_model_pipeline(
     ``feature_selection_diagnostics`` 로 반환되며, ``None`` 이면 기존 동작을
     그대로 유지합니다.
 
+    ``fold_feature_plans`` 가 주어지면 내부 선택을 재계산하지 않고 fold 별 불변
+    피처 계획을 그대로 사용합니다 (두 return 전문가가 같은 계획을 공유하기 위함).
+    ``feature_selection_config`` 와 상호 배타적입니다. ``final_feature_selection``
+    로 OOF 평가 후 full-data ``final_train_only`` 선택을 재사용해 번들 매니페스트를
+    확정하고, ``include_final_train_selection=False`` 면 final 선택을 건너뜁니다.
+
+    ``pred_linear=False`` (candidate-speed) 는 비용이 큰 Ridge baseline 을 생략해
+    예측·fold 경계·백테스트 모델 지표를 바꾸지 않습니다. ``run_backtest_evaluation``
+    은 ``pred_linear`` 부재를 이미 지원합니다.
+
+    ``memory_budget_bytes`` / ``wall_time_budget_seconds`` 가 주어지면 각 fold 이후
+    초과 시 ``ValueError`` 로 fail-closed 합니다. ``fold_event_callback`` 은 fold
+    단위 profile payload(시각·RSS·위상)를 append-only 로 방출합니다.
+
     Returns:
         dict containing 'oof_predictions', 'oof_df', 'metrics', 'trained_models',
         'backtest_eval', and bundle metadata (return_unit, round_trip_cost,
@@ -1371,6 +1477,17 @@ def run_model_pipeline(
     """
     if model_type not in _MODEL_TYPES:
         raise ValueError(f"model_type must be one of {list(_MODEL_TYPES)}, got {model_type!r}")
+    if feature_selection_config is not None and fold_feature_plans is not None:
+        raise ValueError(
+            "feature_selection_config and fold_feature_plans are mutually exclusive"
+        )
+    if fold_feature_plans is not None and len(fold_feature_plans) != n_splits:
+        raise ValueError(
+            f"fold_feature_plans must contain exactly n_splits={n_splits} plans, "
+            f"got {len(fold_feature_plans)}"
+        )
+    if final_feature_selection is not None and fold_feature_plans is None:
+        raise ValueError("final_feature_selection requires fold_feature_plans")
     if feature_selection_config is not None and not isinstance(
         feature_selection_config, FeatureSelectionConfig
     ):
@@ -1405,17 +1522,45 @@ def run_model_pipeline(
     training_cutoff: Any = None
     fold_selections: list[FeatureSelectionResult] = []
     fold_cutoffs: list[str] = []
+    started_total = time.perf_counter()
+    peak_rss_total = _rss_bytes()
+    phase_events: list[dict[str, Any]] = []
 
     for fold, (train_idx, val_idx) in enumerate(
         splitter.split(work, y=work[target_col], groups=work[group_col])
     ):
+        fold_started = time.perf_counter()
+        fold_peak = _rss_bytes()
+        phases: list[dict[str, Any]] = []
         train = work.iloc[train_idx]
         val = work.iloc[val_idx]
-        if feature_selection_config is not None:
+        if fold_feature_plans is not None:
+            plan = fold_feature_plans[fold]
+            fold_feature_cols = list(plan.selected_features)
+            fold_selections.append(
+                FeatureSelectionResult(
+                    selected_features=plan.selected_features,
+                    gains=plan.gains,
+                    rejected=plan.rejected,
+                    counts=dict(plan.counts),
+                    metadata=dict(plan.metadata),
+                )
+            )
+            fold_cutoffs.append(plan.data_cutoff)
+        elif feature_selection_config is not None:
+            selection_started = time.perf_counter()
             selection = select_features(train, feature_cols, target_col, feature_selection_config)
             fold_feature_cols = list(selection.selected_features)
             fold_selections.append(selection)
             fold_cutoffs.append(str(train[group_col].max()))
+            phases.append(
+                {
+                    "phase": "feature_selection",
+                    "elapsed_seconds": time.perf_counter() - selection_started,
+                    "peak_rss_bytes": max(fold_peak, _rss_bytes()),
+                    "retained_features": len(fold_feature_cols),
+                }
+            )
         else:
             fold_feature_cols = feature_cols
         sample_weight = (
@@ -1423,6 +1568,7 @@ def run_model_pipeline(
             if recency_half_life_groups is not None
             else None
         )
+        fit_started = time.perf_counter()
         model, pred = _fit_predict(
             model_type,
             train,
@@ -1435,19 +1581,37 @@ def run_model_pipeline(
         )
         trained_models.append(model)
         training_cutoff = train[group_col].max()
-
-        fold_oof = pd.DataFrame(
+        phases.append(
             {
-                group_col: val[group_col].to_numpy(),
-                target_col: val[target_col].to_numpy(),
-                "pred": pred,
-                "pred_linear": _fit_predict_linear_baseline(
-                    train, val, fold_feature_cols, target_col
-                ),
-                "fold": fold,
-            },
-            index=val.index,
+                "phase": "model_fit",
+                "elapsed_seconds": time.perf_counter() - fit_started,
+                "peak_rss_bytes": max(fold_peak, _rss_bytes()),
+            }
         )
+
+        linear_pred: np.ndarray | None = None
+        if pred_linear:
+            linear_started = time.perf_counter()
+            linear_pred = _fit_predict_linear_baseline(
+                train, val, fold_feature_cols, target_col
+            )
+            phases.append(
+                {
+                    "phase": "linear_baseline",
+                    "elapsed_seconds": time.perf_counter() - linear_started,
+                    "peak_rss_bytes": max(fold_peak, _rss_bytes()),
+                }
+            )
+
+        fold_oof_cols: dict[str, Any] = {
+            group_col: val[group_col].to_numpy(),
+            target_col: val[target_col].to_numpy(),
+            "pred": pred,
+            "fold": fold,
+        }
+        if linear_pred is not None:
+            fold_oof_cols["pred_linear"] = linear_pred
+        fold_oof = pd.DataFrame(fold_oof_cols, index=val.index)
         if "selection_rank" in work.columns:
             fold_oof["selection_rank"] = val["selection_rank"].to_numpy()
         for col in (
@@ -1462,6 +1626,33 @@ def run_model_pipeline(
             if col in work.columns:
                 fold_oof[col] = val[col].to_numpy()
         oof_parts.append(fold_oof)
+        fold_profile = {
+            "fold": fold,
+            "train_rows": len(train_idx),
+            "val_rows": len(val_idx),
+            "retained_features": len(fold_feature_cols),
+            "phase_profiles": phases,
+            "elapsed_seconds": time.perf_counter() - fold_started,
+            "peak_rss_bytes": max(fold_peak, _rss_bytes()),
+        }
+        phase_events.append(fold_profile)
+        if fold_event_callback is not None:
+            try:
+                fold_event_callback(fold_profile)
+            except Exception:  # pragma: no cover - observers must not change research behavior
+                logger.warning("fold profile observer failed at fold=%d", fold, exc_info=True)
+        elapsed = time.perf_counter() - started_total
+        current_rss = _rss_bytes()
+        if wall_time_budget_seconds is not None and elapsed > wall_time_budget_seconds:
+            raise ValueError(
+                f"wall-time budget exceeded: elapsed {elapsed:.2f}s > "
+                f"wall_time_budget_seconds={wall_time_budget_seconds:.2f}"
+            )
+        if memory_budget_bytes is not None and current_rss > memory_budget_bytes:
+            raise ValueError(
+                f"memory budget exceeded: peak RSS {current_rss} > "
+                f"memory_budget_bytes={memory_budget_bytes}"
+            )
         logger.info("fold=%d train=%d val=%d", fold, len(train_idx), len(val_idx))
 
     oof_df = pd.concat(oof_parts, axis=0).sort_values(group_col)
@@ -1500,10 +1691,40 @@ def run_model_pipeline(
     manifest_catalogue: Mapping[str, Mapping[str, str]] | None = None
     if feature_selection_config is not None:
         final_selection = select_features(work, feature_cols, target_col, feature_selection_config)
+        manifest_catalogue = feature_selection_config.catalogue
+    elif fold_feature_plans is not None:
+        if final_feature_selection is not None:
+            final_selection = final_feature_selection
+        elif include_final_train_selection:
+            final_selection = select_features(
+                work, feature_cols, target_col, fold_feature_plans[0].config
+            )
+        else:
+            final_selection = None
+        manifest_catalogue = fold_feature_plans[0].config.catalogue
+    else:
+        final_selection = None
+
+    if fold_selections and (feature_selection_config is not None or fold_feature_plans is not None):
         jaccard = median_pairwise_jaccard([s.selected_features for s in fold_selections])
+        stability = permutation_null_stability(
+            [s.selected_features for s in fold_selections],
+            random_seed=fold_selections[0].metadata.get("random_seed", 0),
+            universe=feature_cols,
+        )
+        if feature_selection_config is not None:
+            catalogue_version = feature_selection_config.catalogue_version
+            selection_fingerprint = config_fingerprint(feature_selection_config)
+        else:
+            # fold_selections 는 fold 계획/config 경로에서만 채워지므로 이 분기에서
+            # fold_feature_plans 는 반드시 존재합니다.
+            assert fold_feature_plans is not None
+            catalogue_version = fold_feature_plans[0].config.catalogue_version
+            selection_fingerprint = fold_feature_plans[0].config_fingerprint
         feature_selection_diagnostics = {
             "version": FEATURE_SELECTION_VERSION,
-            "catalogue_version": feature_selection_config.catalogue_version,
+            "catalogue_version": catalogue_version,
+            "config_fingerprint": selection_fingerprint,
             "data_cutoff": str(work[group_col].max()),
             "n_folds": len(fold_selections),
             "fold_selections": [
@@ -1519,17 +1740,33 @@ def run_model_pipeline(
                 for fold, selection in enumerate(fold_selections)
             ],
             "median_pairwise_jaccard": jaccard,
-            "final_features": list(final_selection.selected_features),
-            "final_selection": {
-                "selected_features": list(final_selection.selected_features),
-                "gains": list(final_selection.gains),
-                "rejected": list(final_selection.rejected),
-                "counts": dict(final_selection.counts),
-                "metadata": dict(final_selection.metadata),
-            },
+            "stability": stability,
+            "final_train_only": True,
+            "final_features": (
+                list(final_selection.selected_features)
+                if final_selection is not None
+                else list(fold_selections[-1].selected_features)
+            ),
+            "final_selection": (
+                {
+                    "selected_features": list(final_selection.selected_features),
+                    "gains": list(final_selection.gains),
+                    "rejected": list(final_selection.rejected),
+                    "counts": dict(final_selection.counts),
+                    "metadata": dict(final_selection.metadata),
+                }
+                if final_selection is not None
+                else None
+            ),
         }
         manifest_features = feature_selection_diagnostics["final_features"]
-        manifest_catalogue = feature_selection_config.catalogue
+
+    profile = {
+        "version": _PROFILE_VERSION,
+        "total_elapsed_seconds": time.perf_counter() - started_total,
+        "peak_rss_bytes": max(peak_rss_total, _rss_bytes()),
+        "fold_events": phase_events,
+    }
 
     return {
         "oof_predictions": oof_df,
@@ -1547,6 +1784,7 @@ def run_model_pipeline(
         "single_stock_evaluation": single_stock_evaluation,
         "policy_metadata": policy_metadata,
         "feature_selection_diagnostics": feature_selection_diagnostics,
+        "profile": profile,
         "policy_params": {
             "purge_gap": purge_gap,
             "n_splits": n_splits,
