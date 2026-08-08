@@ -66,6 +66,7 @@ class FeatureSelectionConfig(pydantic.BaseModel):
     catalogue_version: str = "unversioned"
     catalogue: Mapping[str, Mapping[str, str]] = {}
     screening_device: Literal["cpu", "gpu", "auto"] = "cpu"
+    n_jobs: int = -1
 
     @pydantic.model_validator(mode="after")
     def _validate_ranges(self) -> FeatureSelectionConfig:
@@ -85,6 +86,10 @@ class FeatureSelectionConfig(pydantic.BaseModel):
             )
         if self.min_gain < 0.0:
             raise ValueError(f"min_gain must be >= 0, got {self.min_gain}")
+        if self.n_jobs != -1 and self.n_jobs < 1:
+            raise ValueError(
+                f"n_jobs must be -1 (all cores) or >= 1, got {self.n_jobs}"
+            )
         return self
 
 
@@ -253,23 +258,37 @@ def _reject_quality(
     feature_cols: list[str],
     config: FeatureSelectionConfig,
 ) -> tuple[list[str], dict[str, str]]:
-    """품질 기준으로 후보를 거부하고 생존자 목록을 반환합니다."""
+    """품질 기준으로 후보를 거부하고 생존자 목록을 반환합니다 (행렬 단위 검사).
+
+    컬럼별 Python 판다스 연산 대신 결측/비유한/분산 판정을 2D 행렬로 벡터화해
+    단일 패스로 계산합니다. 거부 우선순위는 기존 계약과 동일합니다:
+    missing column -> all nonfinite -> missing rate -> zero variance.
+    """
     rejected: dict[str, str] = {}
+    present = [col for col in feature_cols if col in train.columns]
     for col in feature_cols:
         if col not in train.columns:
             rejected[col] = _REASON_MISSING_COLUMN
-            continue
-        arr = train[col]
-        if not np.isfinite(arr.to_numpy(dtype=np.float64)).any():
+    if not present:
+        return [], rejected
+
+    mat = np.column_stack([train[col].to_numpy(dtype=np.float64) for col in present])
+    finite = np.isfinite(mat)
+    finite_any = finite.any(axis=0)
+    is_nan = np.isnan(mat)
+    missing_rate = is_nan.mean(axis=0)
+    min_val = np.where(finite, mat, np.inf).min(axis=0)
+    max_val = np.where(finite, mat, -np.inf).max(axis=0)
+    zero_variance = ~is_nan.any(axis=0) & (min_val == max_val)
+
+    for idx, col in enumerate(present):
+        if not finite_any[idx]:
             rejected[col] = _REASON_ALL_NONFINITE
-            continue
-        if float(arr.isna().mean()) > config.missing_rate_threshold:
+        elif missing_rate[idx] > config.missing_rate_threshold:
             rejected[col] = _REASON_TRAIN_MISSING_RATE
-            continue
-        if arr.nunique(dropna=False) <= 1:
+        elif zero_variance[idx]:
             rejected[col] = _REASON_ZERO_VARIANCE
-            continue
-    survivors = [col for col in feature_cols if col not in rejected]
+    survivors = [col for col in present if col not in rejected]
     return survivors, rejected
 
 
@@ -278,17 +297,37 @@ def _prune_correlated(
     ordered_names: list[str],
     config: FeatureSelectionConfig,
 ) -> tuple[list[str], dict[str, str]]:
-    """train 행만 사용한 Spearman 상관 가지치기 (결정적 tie-break)."""
+    """train 행만 사용한 Spearman 상관 가지치기 (BLAS 행렬곱, 결정적 tie-break).
+
+    판다스 ``.corr(method="spearman")`` 의 단일 스레드 pairwise 계산 대신,
+    전 컬럼 동시 rank -> 평균 0/표준편차 1 표준화 -> ``Z^T Z / N`` BLAS 행렬곱으로
+    Spearman 행렬을 계산합니다 (결측값은 표준화 후 0으로 처리해 기여하지 않음).
+    유지/거부 판정은 결정적 greedy 스캔으로 NumPy 2D 인덱싱을 사용합니다.
+    """
     if len(ordered_names) < 2:
         return ordered_names, {}
-    corr = train[ordered_names].corr(method="spearman")
-    kept: list[str] = []
+    ranked = train[ordered_names].rank(method="average")
+    mat = ranked.to_numpy(dtype=np.float64)
+    n_rows = mat.shape[0]
+    mu = np.nanmean(mat, axis=0)
+    sd = np.nanstd(mat, axis=0)
+    sd[sd == 0] = np.nan
+    z = np.where(np.isnan((mat - mu) / sd), 0.0, (mat - mu) / sd)
+    corr = (z.T @ z) / n_rows
+    corr = np.clip(corr, -1.0, 1.0)
+    np.fill_diagonal(corr, 1.0)
+
+    kept_indices: list[int] = []
     rejected: dict[str, str] = {}
-    for name in ordered_names:
-        if any(abs(corr.at[name, k]) > config.correlation_threshold for k in kept):
+    for idx, name in enumerate(ordered_names):
+        if (
+            kept_indices
+            and np.abs(corr[idx, kept_indices]).max() > config.correlation_threshold
+        ):
             rejected[name] = _REASON_CORRELATED
         else:
-            kept.append(name)
+            kept_indices.append(idx)
+    kept = [ordered_names[i] for i in kept_indices]
     return kept, rejected
 
 
@@ -382,7 +421,7 @@ def select_features(
     model = LGBMRegressor(
         objective="huber",
         random_state=config.random_seed,
-        n_jobs=1,
+        n_jobs=config.n_jobs,
         verbosity=-1,
         device=resolved_device,
     )
