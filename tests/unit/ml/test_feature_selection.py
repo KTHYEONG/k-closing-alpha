@@ -16,7 +16,9 @@ import pandas as pd
 import pytest
 
 from src.ml.feature_selection import (
+    FEATURE_QUALITY_VERSION,
     FeatureSelectionConfig,
+    build_feature_quality_report,
     build_fold_feature_plans,
     median_pairwise_jaccard,
     permutation_null_stability,
@@ -358,3 +360,122 @@ def test_mto02_permutation_null_stability_deterministic_gate() -> None:
 
     with pytest.raises(ValueError, match="null_gate_quantile"):
         permutation_null_stability([["a"], ["b"]], random_seed=1, null_gate_quantile=1.5)
+
+
+def test_mto02_feq01_fold_quality_report_invariant_to_outer_labels() -> None:
+    """MTO-02-FEQ-01: 외부 validation/이후 라벨 변경은 fold 품질 기록, 가족 선택
+    빈도, 가족 액션을 바꾸지 않습니다."""
+    df = _predictive_df(n_groups=40, rows_per_group=8)
+    cfg = _small_config()
+    plans = build_fold_feature_plans(
+        df, _candidate_cols(40), "target_return", "trade_date", cfg, n_splits=3, purge_gap=1
+    )
+
+    n_groups = df["trade_date"].nunique()
+    future_dates = sorted(df["trade_date"].unique())[-(n_groups // (3 + 1)):]
+    mutated = df.copy()
+    mutated.loc[mutated["trade_date"].isin(future_dates), "target_return"] += 0.5
+    plans_mutated = build_fold_feature_plans(
+        mutated, _candidate_cols(40), "target_return", "trade_date", cfg, n_splits=3, purge_gap=1
+    )
+
+    def _report(ps: list) -> dict:
+        return build_feature_quality_report(
+            [p.selection for p in ps],
+            _candidate_cols(40),
+            {},
+            cfg.min_fold_selection_rate,
+        )
+
+    report = _report(plans)
+    report_mutated = _report(plans_mutated)
+    assert report == report_mutated
+    assert report["version"] == FEATURE_QUALITY_VERSION
+    assert report["n_folds"] == 3
+    # 결정적 정렬: 피처는 이름, 가족은 이름 오름차순.
+    assert [r["feature_name"] for r in report["feature_records"]] == sorted(
+        r["feature_name"] for r in report["feature_records"]
+    )
+    assert [f["family"] for f in report["family_records"]] == sorted(
+        f["family"] for f in report["family_records"]
+    )
+    for record in report["feature_records"]:
+        assert record["selection_rate"] == record["selection_count"] / 3
+    # 각 fold 계획은 train 전용 품질 증거(유한 비율/결측률/영분산)를 보관합니다.
+    for plan in plans:
+        assert set(plan.selection.quality_evidence) <= set(_candidate_cols(40))
+        for evidence in plan.selection.quality_evidence.values():
+            assert "finite_ratio" in evidence
+            assert "missing_rate" in evidence
+            assert "zero_variance" in evidence
+
+    # 모델 파이프라인 진단에도 결정적 품질 리포트가 반영됩니다.
+    result = run_model_pipeline(
+        df,
+        _candidate_cols(40),
+        "target_return",
+        "trade_date",
+        n_splits=3,
+        purge_gap=1,
+        model_type="lgb_regressor",
+        feature_selection_config=cfg,
+    )
+    diagnostics = result["feature_selection_diagnostics"]
+    assert diagnostics["quality_report"]["version"] == FEATURE_QUALITY_VERSION
+    assert diagnostics["quality_report"]["n_folds"] == 3
+
+
+def test_mto02_feq03_source_incomplete_and_capacity_limited() -> None:
+    """MTO-02-FEQ-03: 전부 비유한 히스토리 피처는 source_incomplete 로,
+    beyond_max_retained 피처는 low_quality 가 아닌 capacity_limited 로 분류됩니다."""
+    rng = np.random.default_rng(31)
+    n = 300
+    s1 = rng.normal(0.0, 1.0, n)
+    s2 = rng.normal(0.0, 1.0, n)
+    s3 = rng.normal(0.0, 1.0, n)
+    df = pd.DataFrame(
+        {
+            "target_return": 0.05 * (s1 + s2 + s3) + rng.normal(0.0, 0.01, n),
+            "f_signal_a": s1,
+            "f_signal_b": s2,
+            "f_signal_c": s3,
+            "f_unavailable": np.nan,
+        }
+    )
+    cols = ["f_signal_a", "f_signal_b", "f_signal_c", "f_unavailable"]
+    cfg = FeatureSelectionConfig(min_retained=1, max_retained=1, hard_max_retained=20)
+    result = select_features(df, cols, "target_return", cfg)
+    reasons = dict(result.rejected)
+    assert reasons["f_unavailable"] == "all_nonfinite"
+    beyond = {feature for feature, reason in reasons.items() if reason == "beyond_max_retained"}
+    assert len(beyond) == 2
+    assert beyond <= {"f_signal_a", "f_signal_b", "f_signal_c"}
+
+    catalogue = {
+        "f_signal_a": {"family": "return_trend_mean_reversion"},
+        "f_signal_b": {"family": "ohlc_range_gap"},
+        "f_signal_c": {"family": "liquidity_size_turnover"},
+        "f_unavailable": {"family": "market_regime_context"},
+    }
+    report = build_feature_quality_report([result], cols, catalogue, 1.0)
+    actions = report["actions"]
+    assert "source_incomplete" in actions["f_unavailable"]
+    for feature in beyond:
+        assert "capacity_limited" in actions[feature]
+        assert "source_incomplete" not in actions[feature]
+    assert "screening_weak" not in actions["f_unavailable"]
+
+    by_name = {r["feature_name"]: r for r in report["feature_records"]}
+    assert by_name["f_unavailable"]["family"] == "market_regime_context"
+    for feature in beyond:
+        assert by_name[feature]["family"] != "baseline"
+    assert by_name["f_signal_a"]["finite_ratio"] == 1.0
+    assert by_name["f_unavailable"]["finite_ratio"] == 0.0
+
+    # 카탈로그 누락 family 는 fail-closed 로 거부됩니다.
+    with pytest.raises(ValueError, match="family"):
+        build_feature_quality_report(
+            [result], cols, {"f_unavailable": {}}, 1.0
+        )
+    with pytest.raises(ValueError, match="min_fold_selection_rate"):
+        build_feature_quality_report([result], cols, catalogue, 0.0)
