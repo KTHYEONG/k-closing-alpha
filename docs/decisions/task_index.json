@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_MODEL_PERFORMANCE_HARDENING",
+      "date": "2026-08-08",
+      "adr_id": "ADR_20260808_ML_MODEL_PERFORMANCE_HARDENING",
+      "domain": "ml",
+      "title": "ML 평가 무결성 및 날짜 균형 학습 가중치",
+      "why": "Feature-selection report evaluation had unverified decision-time provenance and a vacuous control/candidate OOF date gate; row-level loss also overweights action-dense dates.",
+      "resolution": "Added fail-closed timestamp provenance, actual paired OOF date comparison, and causal date-balanced Huber sample weighting with nested selection and regression tests.",
+      "impact": "Research promotion remains blocked without capture-time provenance; future date-balanced ablations are evaluated with non-vacuous paired OOF gates. No production default is changed."
+    },
+    {
       "task_id": "ml-feature-selection-optimization",
       "date": "2026-08-08",
       "adr_id": "ADR_20260808_ml-feature-selection-optimization",
