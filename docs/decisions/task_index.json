@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_HISTORY_PIPELINE_OPERATIONAL_HARDENING",
+      "date": "2026-08-08",
+      "adr_id": "ADR_20260808_ML_HISTORY_PIPELINE_OPERATIONAL_HARDENING",
+      "domain": "ml",
+      "title": "ML history pipeline operational hardening",
+      "why": "History construction completed, but sparse lifecycle events made downstream selection appear stalled; repeated cold builds also increased runtime and memory risk.",
+      "resolution": "Added lifecycle diagnostics, fingerprint-validated atomic history caching, bounded history preparation telemetry, and research-only model-retention controls; confirmed the causal history candidate remains report-only after a completed full pipeline run.",
+      "impact": "Warm reruns avoid the cold history build, failures identify the exact stage, OOF and causal evaluation semantics remain unchanged, and no production model artifact is promoted."
+    },
+    {
       "task_id": "TASK_ML_MODEL_PERFORMANCE_HARDENING",
       "date": "2026-08-08",
       "adr_id": "ADR_20260808_ML_MODEL_PERFORMANCE_HARDENING",
