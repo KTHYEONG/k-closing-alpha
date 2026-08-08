@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -19,32 +20,59 @@ from src.ml.history_feature_research import run_history_feature_research_experim
 from src.ml.history_features import HistoryFeatureExecutionConfig
 
 
-@dataclass(frozen=True)
+@dataclass
 class ResearchRunObserver:
-    """연구 실행 상태를 원자적 snapshot과 append-only event log로 기록합니다."""
+    """연구 실행 상태를 원자적 snapshot과 append-only event log로 기록합니다.
+
+    ``run_id`` 는 실행 시작 시 생성되는 불변 식별자이며, 모든 이벤트에 포함됩니다.
+    실패 기록은 마지막 완료 stage 와 구조적 예외 진단을 보존합니다. observer 는
+    비권위적입니다: 관찰 실패는 연구 결과를 바꾸지 않습니다.
+    """
 
     status_path: Path
     events_path: Path
+    run_id: str | None = None
+    _last_completed_stage: str | None = None
+    _started_at: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.run_id is None:
+            self.run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+        if self._started_at is None:
+            self._started_at = time.perf_counter()
 
     def __call__(self, stage: str, details: Mapping[str, Any]) -> None:
+        if details.get("status") == "completed":
+            self._last_completed_stage = stage
         self._record("running", stage, details)
 
     def complete(self, summary: dict[str, object]) -> None:
         self._record("completed", "completed", summary)
 
     def fail(self, exc: BaseException) -> None:
+        elapsed = time.perf_counter() - self._started_at if self._started_at else 0.0
+        try:
+            import psutil as _psutil
+
+            peak_rss = int(_psutil.Process().memory_info().rss)
+        except Exception:  # pragma: no cover - telemetry best-effort
+            peak_rss = 0
         self._record(
             "failed",
             "failed",
             {
+                "last_completed_stage": self._last_completed_stage,
                 "exception_type": type(exc).__name__,
                 "message": str(exc),
                 "traceback": traceback.format_exc(),
+                "elapsed_seconds": round(elapsed, 4),
+                "peak_rss_bytes": peak_rss,
             },
         )
 
     def _record(self, state: str, stage: str, details: Mapping[str, Any]) -> None:
         payload = {
+            "run_id": self.run_id,
             "timestamp": datetime.now(UTC).isoformat(),
             "state": state,
             "stage": stage,
@@ -72,7 +100,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--purge-gap", type=int, default=1)
     parser.add_argument("--screening-device", choices=("cpu", "gpu", "auto"), default="cpu")
     parser.add_argument("--research-cutoff", type=str, default=None)
-    parser.add_argument("--cache-dir", type=Path, default=None)
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path("artifacts/cache/history_features"),
+        help="history panel 캐시 root. 지문 일치 시 warm read 후 원자 출판합니다.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="일회성 실행: 영구 캐시를 완전히 비활성화합니다 (cold build 전용).",
+    )
     parser.add_argument(
         "--mode",
         choices=("confirmation", "discovery"),
@@ -124,6 +162,7 @@ def run_research(args: argparse.Namespace) -> dict[str, object]:
         status_path=status_path,
         events_path=status_path.with_name("run_events.jsonl"),
     )
+    cache_dir: Path | None = None if getattr(args, "no_cache", False) else args.cache_dir
     try:
         _validate_args(args)
         observer("started", {"memory_budget_gib": args.memory_budget_gib})
@@ -147,7 +186,7 @@ def run_research(args: argparse.Namespace) -> dict[str, object]:
             feature_selection_config=FeatureSelectionConfig(screening_device=args.screening_device),
             execution_config=execution,
             research_cutoff=args.research_cutoff,
-            cache_dir=str(args.cache_dir) if args.cache_dir is not None else None,
+            cache_dir=str(cache_dir) if cache_dir is not None else None,
             mode=args.mode,
             wall_time_budget_seconds=args.wall_time_budget_seconds,
             export_dir=str(args.export_dir),
