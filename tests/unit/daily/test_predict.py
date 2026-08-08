@@ -717,7 +717,7 @@ def test_main_runs_redesigned_pipeline_with_mocks() -> None:
         patch.object(
             predict,
             "run_daily_sizing_inference",
-            side_effect=lambda df, *a, **kw: sizing_df[sizing_df["chart_analysis"].isin(df["시나리오"])],
+            side_effect=lambda df, *a, **kw: sizing_df[sizing_df["chart_analysis"].isin(df["chart_analysis"])],
         ),
         patch.object(predict, "print_table") as print_table_mock,
     ):
