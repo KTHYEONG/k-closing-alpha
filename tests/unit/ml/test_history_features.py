@@ -442,3 +442,60 @@ def test_hfs04_parquet_reader_matches_dataframe_input_and_projects_columns(
     for columns in requested_columns:
         assert set(columns) <= allowed
         assert "extra_secret_column" not in columns
+
+def test_scenario_mho_03_parquet_batch_observer_monotonic_and_neutral(tmp_path) -> None:
+    """SCENARIO_MHO_03: Parquet 배치 이벤트는 단조(순서 보존)이며 observer 는
+    판넬 프레임이나 빌드 지표 의미 값을 바꾸지 않습니다."""
+    dates = list(pd.to_datetime([f"2024-01-{d:02d}" for d in range(2, 16)]))
+    hist = make_price_history(symbols=["000001", "000002", "000003"], dates=dates, seed=7)
+    keys = make_decision_keys(["000001", "000002", "000003"], dates[4:10])
+    path = tmp_path / "price_history.parquet"
+    hist.to_parquet(path)
+
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def observer(stage: str, details: dict[str, object]) -> None:
+        events.append((stage, str(details["status"]), details))
+
+    exec_cfg = HistoryFeatureExecutionConfig(symbols_per_batch=1, n_jobs=1)
+    with_obs = build_causal_history_feature_panel_from_parquet(
+        str(path), keys, execution_config=exec_cfg, batch_observer=observer
+    )
+    without_obs = build_causal_history_feature_panel_from_parquet(str(path), keys, execution_config=exec_cfg)
+
+    # observer 는 판넬 값이나 빌드 지표 의미를 바꾸지 않습니다.
+    pd.testing.assert_frame_equal(with_obs, without_obs)
+    for key in (
+        "input_history_rows",
+        "decision_key_rows",
+        "output_rows",
+        "batch_count",
+        "estimated_bytes_per_source_row",
+        "nonfinite_to_nan_count",
+    ):
+        assert (
+            with_obs.attrs["history_feature_build_metrics"][key]
+            == without_obs.attrs["history_feature_build_metrics"][key]
+        )
+
+    # 두 원천 스캔과 symbol 배치 이벤트가 모두 방출됩니다.
+    stages = {stage for stage, _status, _details in events}
+    assert {"parquet_symbol_scan", "parquet_market_scan", "symbol_batch"} <= stages
+
+    # 각 stage 는 started → completed 순서로 단조 emit 됩니다.
+    for stage in ("parquet_symbol_scan", "parquet_market_scan"):
+        statuses = [status for s, status, _d in events if s == stage]
+        assert statuses == ["started", "completed"]
+        completed = next(d for s, status, d in events if s == stage and status == "completed")
+        assert completed["scanned_rows"] > 0
+        assert completed["elapsed_seconds"] >= 0.0
+
+    # symbol_batch 이벤트는 배치 인덱스 순으로 시작 후 완료됩니다.
+    batch_events = [(i, status, d) for i, (s, status, d) in enumerate(events) if s == "symbol_batch"]
+    started_idx = [d["batch"] for _i, status, d in batch_events if status == "started"]
+    completed_idx = [d["batch"] for _i, status, d in batch_events if status == "completed"]
+    assert started_idx == [0, 1, 2]
+    assert completed_idx == [0, 1, 2]
+    for _i, status, d in batch_events:
+        assert "source_rows" in d or status == "started"
+        assert d["batch"] in (0, 1, 2)

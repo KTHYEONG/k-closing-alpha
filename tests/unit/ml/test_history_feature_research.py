@@ -463,3 +463,138 @@ def test_p0a_availability_manifest_non_promotable_blocks_promotion() -> None:
     assert gate["promoted"] is False
     assert gate["availability_manifest_promotable"] is False
     assert "availability_manifest_non_promotable" in gate["rejected_reasons"]
+
+def test_scenario_mho_01_lifecycle_events_ordered_through_export(tmp_path: Path) -> None:
+    """SCENARIO_MHO_01: 성공 실행은 export 까지 순서(단조 stage_id) 있는 수명주기
+    이벤트를 방출하며 selection-plan/final-selection 이벤트를 포함합니다."""
+    events: list[dict[str, object]] = []
+
+    def observer(stage: str, details: dict[str, object]) -> None:
+        events.append({"stage": stage, **details})
+
+    trade_log = _build_trade_log()
+    price_history = _build_price_history(trade_log)
+    cfg = FeatureSelectionConfig(min_retained=5, max_retained=20, hard_max_retained=40)
+    run_history_feature_research_experiment(
+        trade_log,
+        theme_df=None,
+        price_history=price_history,
+        n_splits=3,
+        purge_gap=1,
+        feature_selection_config=cfg,
+        export_dir=str(tmp_path),
+        progress_callback=observer,
+    )
+
+    lifecycle = [e for e in events if "status" in e]
+    assert lifecycle, "no lifecycle events emitted"
+    stage_ids = [int(e["stage_id"]) for e in lifecycle]
+    assert stage_ids == sorted(stage_ids), "stage events must be monotonic"
+    for e in lifecycle:
+        assert e["elapsed_seconds"] >= 0.0
+        assert int(e["current_rss_bytes"]) >= 0
+        if e["status"] in ("completed", "failed"):
+            assert int(e["peak_rss_bytes"]) >= 0
+
+    completed_stages = {e["stage"] for e in lifecycle if e["status"] == "completed"}
+    assert {"history_panel_build", "control", "selection_plan", "final_selection", "candidate", "export"} <= (
+        completed_stages
+    )
+    per_fold = [
+        e
+        for e in lifecycle
+        if e["stage"] == "selection_plan" and e["status"] == "completed" and "fold" in e
+    ]
+    assert len(per_fold) == 3
+    # history panel build 이벤트는 cache 상태와 지문을 담습니다.
+    panel = next(e for e in lifecycle if e["stage"] == "history_panel_build")
+    assert panel["status"] in ("started", "completed")
+    assert "fingerprint" in panel
+
+
+def test_scenario_mho_01_stage_failure_records_failed_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SCENARIO_MHO_01: stage 예외는 실패 stage 와 구조적 진단을 남기고 재시됩니다."""
+    from src.ml import history_feature_research as hfr
+
+    events: list[dict[str, object]] = []
+
+    def observer(stage: str, details: dict[str, object]) -> None:
+        events.append({"stage": stage, **details})
+
+    def boom(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("control stage explosion")
+
+    monkeypatch.setattr(hfr, "run_close_morning_recency_ensemble_experiment", boom)
+    trade_log = _build_trade_log()
+    price_history = _build_price_history(trade_log)
+    cfg = FeatureSelectionConfig(min_retained=5, max_retained=20, hard_max_retained=40)
+    with pytest.raises(RuntimeError, match="control stage explosion"):
+        run_history_feature_research_experiment(
+            trade_log,
+            theme_df=None,
+            price_history=price_history,
+            n_splits=3,
+            purge_gap=1,
+            feature_selection_config=cfg,
+            export_dir=str(tmp_path),
+            progress_callback=observer,
+        )
+
+    failed = [e for e in events if e.get("status") == "failed"]
+    control_fail = [e for e in failed if e["stage"] == "control"]
+    assert control_fail, "control stage must record a failed lifecycle event"
+    assert control_fail[0]["exception_type"] == "RuntimeError"
+    assert control_fail[0]["exception_message"] == "control stage explosion"
+    ids = [int(e["stage_id"]) for e in events if "status" in e]
+    assert ids == sorted(ids)
+
+
+def test_scenario_mho_02_persistent_cache_warm_and_cold_rebuild(tmp_path: Path) -> None:
+    """SCENARIO_MHO_02: 지문 일치 영구 캐시는 두 번째 실행에서 warm, 커트오프 또는
+    source identity 변경은 cold 재구성으로 이어집니다."""
+    trade_log = _build_trade_log()
+    price_history = _build_price_history(trade_log)
+    cache_dir = tmp_path / "cache"
+    cfg = FeatureSelectionConfig(min_retained=5, max_retained=20, hard_max_retained=40)
+
+    def run_once(
+        export_name: str,
+        *,
+        cutoff: str | None = None,
+        history: pd.DataFrame | None = None,
+    ) -> dict[str, object]:
+        return run_history_feature_research_experiment(
+            trade_log,
+            theme_df=None,
+            price_history=history if history is not None else price_history,
+            n_splits=3,
+            purge_gap=1,
+            feature_selection_config=cfg,
+            research_cutoff=cutoff,
+            cache_dir=str(cache_dir),
+            export_dir=str(tmp_path / export_name),
+        )
+
+    first = run_once("r1")
+    assert first["build_metrics"]["cache_state"] == "cold"
+    assert first["build_metrics"]["cache_reason"].startswith("incomplete_cache_pair")
+
+    second = run_once("r2")
+    assert second["build_metrics"]["cache_state"] == "warm"
+    assert second["build_metrics"]["cache_reason"] == "warm_fingerprint_match"
+    assert second["comparison"]["control_oof_dates"] == first["comparison"]["control_oof_dates"]
+    assert second["comparison"]["candidate_oof_dates"] == first["comparison"]["candidate_oof_dates"]
+
+    cutoff_cold = run_once("r3", cutoff="2024-01-16")
+    assert cutoff_cold["build_metrics"]["cache_state"] == "cold"
+
+    wider = _build_price_history(_build_trade_log(n_dates=19, n_stocks=8))
+    source_cold = run_once("r4", history=wider)
+    assert source_cold["build_metrics"]["cache_state"] == "cold"
+    assert "cache_unreadable" not in source_cold["build_metrics"]["cache_reason"]
+
+    back = run_once("r5")
+    assert back["build_metrics"]["cache_state"] == "warm"
+    assert back["comparison"]["candidate_oof_dates"] == first["comparison"]["candidate_oof_dates"]

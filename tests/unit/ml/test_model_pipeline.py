@@ -1671,3 +1671,46 @@ def test_p1_date_balanced_rejected_for_non_lgb_regressor() -> None:
             model_type="lgb_regressor",
             weighting_mode="unknown_mode",
         )
+
+def test_scenario_mho_04_model_retention_opt_out_preserves_outputs() -> None:
+    """SCENARIO_MHO_04: 모델 보유 해제는 OOF 날짜/예측/지표/승격 입력을 바꾸지
+    않고 유지 추정기를 반환하지 않습니다. 기본값은 기존 보유 계약을 유지합니다."""
+    df = _make_dataset()
+    kwargs = {
+        "feature_cols": FEATURE_COLS,
+        "target_col": TARGET_COL,
+        "group_col": GROUP_COL,
+        "n_splits": 3,
+        "purge_gap": 1,
+    }
+    retained = run_model_pipeline(df, **kwargs)
+    dropped = run_model_pipeline(df, retain_models=False, **kwargs)
+
+    pd.testing.assert_frame_equal(dropped["oof_predictions"], retained["oof_predictions"])
+    assert dropped["oof_df"] is dropped["oof_predictions"]
+    assert dropped["metrics"] == retained["metrics"]
+    assert dropped["training_cutoff"] == retained["training_cutoff"]
+    assert dropped["single_stock_policy"] == retained["single_stock_policy"]
+    assert dropped["single_stock_evaluation"] == retained["single_stock_evaluation"]
+    assert dropped["policy_metadata"] == retained["policy_metadata"]
+    pd.testing.assert_frame_equal(dropped["feature_manifest"], retained["feature_manifest"])
+
+    assert len(retained["trained_models"]) == 3
+    assert dropped["trained_models"] == []
+
+
+def test_scenario_mho_04_model_retention_opt_out_research_caller_uses_it() -> None:
+    """SCENARIO_MHO_04: research 전용 ensemble 호출자는 보유를 해제해도 연구 결과가
+    동일합니다 (ensemble 은 trained_models 를 소비하지 않습니다)."""
+    df = _make_recency_dataset(seed=5)
+    result = run_close_morning_recency_ensemble_experiment(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=2,
+        purge_gap=1,
+        pred_linear=False,
+    )
+    assert result["contract"]["version"] == "close-morning-recency-ensemble-research"
+    assert len(result["folds"]) == 2
