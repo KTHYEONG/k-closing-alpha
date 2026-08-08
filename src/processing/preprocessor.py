@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import numpy as np
@@ -457,11 +458,134 @@ def _validate_close_morning61_feature(df: pd.DataFrame) -> None:
         raise ValueError("relative_flow_strength must be finite within [0, 1]")
 
 
+_DECISION_TIME_RULE = "observation_time <= decision_time <= execution_time"
+
+
+def _availability_provenance(
+    *,
+    mode: str,
+    promotable: bool,
+    input_hash: str | None,
+    timestamp_timezone: str | None,
+    rejected_row_count: int,
+    reject_reasons: list[str],
+) -> dict[str, object]:
+    """가용성 증명 페이로드를 결정적으로 구성합니다."""
+    return {
+        "mode": mode,
+        "promotable": promotable,
+        "input_hash": input_hash,
+        "timestamp_timezone": timestamp_timezone,
+        "decision_time_rule": _DECISION_TIME_RULE,
+        "rejected_row_count": rejected_row_count,
+        "reject_reasons": reject_reasons,
+    }
+
+
+def validate_decision_time_availability(
+    df: pd.DataFrame,
+    feature_manifest: pd.DataFrame,
+    observation_time_col: str,
+    decision_time_col: str,
+    execution_time_col: str,
+    *,
+    mode: str = "confirmation",
+) -> pd.DataFrame:
+    """원천 관측 시점/결정 시점/실행 시점의 원산지 증명을 검증합니다.
+
+    ``observation_time <= decision_time <= execution_time`` 계약을 강제합니다.
+    ``feature_manifest`` 의 각 피처가 결정 시점에 사용됨을 전제로, 필수 타임스탬프
+    컬럼이 없거나 파싱 불가/널/타임존 naive 이거나 계약을 위반하는 행이 있으면
+    ``mode="confirmation"`` 에서 ``ValueError`` 로 fail-closed 합니다.
+    ``mode="discovery"`` 는 위반을 승격 불가(non-promotable) 상태로만 기록하고
+    예외를 던지지 않습니다. 입력 행을 절대 이동/대체/삭제하지 않으며, 검증 결과를
+    반환 DataFrame 의 ``attrs['availability_provenance']`` 로 영속화합니다.
+    """
+    if mode not in ("confirmation", "discovery"):
+        raise ValueError(
+            f"availability provenance mode must be one of confirmation/discovery, got {mode!r}"
+        )
+    if feature_manifest is None or not isinstance(feature_manifest, pd.DataFrame):
+        raise ValueError("feature_manifest must be a non-empty feature availability manifest")
+    required_manifest_cols = {"feature_name", "availability_rule"}
+    if not required_manifest_cols.issubset(feature_manifest.columns):
+        raise ValueError(
+            f"feature_manifest must contain {sorted(required_manifest_cols)}, "
+            f"got {sorted(feature_manifest.columns)}"
+        )
+    if feature_manifest.empty:
+        raise ValueError("feature_manifest must not be empty for decision-time availability")
+
+    result = df.copy()
+    reject_reasons: list[str] = []
+    missing_cols = [
+        col
+        for col in (observation_time_col, decision_time_col, execution_time_col)
+        if col not in df.columns
+    ]
+    if missing_cols:
+        reject_reasons.append(f"missing_timestamp_columns={sorted(missing_cols)}")
+
+    parsed: dict[str, pd.Series] = {}
+    tz_values: list[str] = []
+    for col in (observation_time_col, decision_time_col, execution_time_col):
+        if col in missing_cols:
+            continue
+        series = pd.to_datetime(df[col], errors="coerce")
+        if series.isna().any():
+            null_count = int(series.isna().sum())
+            reject_reasons.append(f"unparsable_or_null_timestamp_{col}={null_count}")
+        parsed[col] = series
+        series_tz = getattr(series.dt, "tz", None)
+        if series_tz is None:
+            reject_reasons.append(f"timezone_naive_timestamp_{col}")
+        else:
+            tz_values.append(str(series_tz))
+
+    rejected_row_count = 0
+    if not reject_reasons:
+        ordering = (
+            (parsed[observation_time_col] > parsed[decision_time_col])
+            | (parsed[execution_time_col] < parsed[decision_time_col])
+        )
+        rejected_row_count = int(ordering.sum())
+        if rejected_row_count:
+            reject_reasons.append(f"decision_time_order_violation_rows={rejected_row_count}")
+
+    promotable = not reject_reasons
+    timestamp_timezone = tz_values[0] if tz_values else None
+    if mode == "confirmation" and not promotable:
+        raise ValueError(
+            f"decision-time availability provenance failed for "
+            f"{len(feature_manifest)} feature(s): {'; '.join(reject_reasons)}"
+        )
+
+    result.attrs["availability_provenance"] = _availability_provenance(
+        mode=mode,
+        promotable=promotable,
+        input_hash=_provenance_input_hash(df),
+        timestamp_timezone=timestamp_timezone,
+        rejected_row_count=rejected_row_count,
+        reject_reasons=reject_reasons,
+    )
+    return result
+
+
+def _provenance_input_hash(df: pd.DataFrame) -> str:
+    """불변 입력 해시 (행 순서 포함 결정적 sha256)."""
+    hashable = pd.util.hash_pandas_object(df, index=True).to_numpy()
+    return hashlib.sha256(hashable.tobytes()).hexdigest()
+
 def build_ml_dataset(
     trade_log_df: pd.DataFrame,
     theme_df: pd.DataFrame | None = None,
     feature_set: str = "base40",
     panel_mode: str = "raw_rows",
+    *,
+    observation_time_col: str | None = None,
+    decision_time_col: str | None = None,
+    execution_time_col: str | None = None,
+    provenance_mode: str = "discovery",
 ) -> tuple[pd.DataFrame, dict[str, pd.Series], list[str], pd.DataFrame]:
     """매매일지 원본 데이터를 정제하여 (X, targets, cat_features, processed_df)를 반환합니다.
 
@@ -470,14 +594,22 @@ def build_ml_dataset(
     ``base40`` 은 기존 conservative 피처집합과 호환됩니다. ``production_calendar_flow``
     는 명시적으로 요청할 때만 9개 캘린더/수급 후보 피처를 X 에 포함하는 연구 후보
     피처셋이고, ``close_morning61`` 은 검증된 champion 으로 snapshot49 전체와
-    ``relative_flow_strength`` 정확히 1개만 X 에 포함합니다. 시간 컬럼은
-    검증·합성·검사하지 않습니다 (고정된 15:20 KST 공통 소스 스냅샷 계약).
+    ``relative_flow_strength`` 정확히 1개만 X 에 포함합니다. 기본적으로 시간
+    컬럼은 검증하지 않으며 (고정된 15:20 KST 공통 소스 스냅샷 계약), 가용성
+    증명 컬럼이 주어지면 ``validate_decision_time_availability`` 로 검증합니다.
 
     ``panel_mode`` 는 ``raw_rows``(기본, 원천 행 유지) 또는 ``scenario_action``
     만 허용합니다. ``scenario_action`` 은 clean → 행동 패널 정규화 → 피처/타깃
     생성 순서로 동작하며, 같은 날짜-종목의 서로 다른 시나리오 행동을 모두
     보존합니다. 충돌 중복은 학습에서 제외되고
     ``processed.attrs['scenario_action_rejects']`` 로 노출됩니다.
+
+    ``observation_time_col`` / ``decision_time_col`` / ``execution_time_col``
+    가 모두 주어지면 ``validate_decision_time_availability`` 로 결정 시점 가용성
+    증명을 강제하고 ``provenance_mode`` (``confirmation``/``discovery``) 에 따라
+    fail-closed 또는 승격 불가 기록을 ``processed.attrs['availability_provenance']``
+    에 영속화합니다. 세 컬럼이 모두 주어지지 않으면 (레거시) discovery 모드의
+    승격 불가 증명 상태를 기록합니다.
     """
     if feature_set not in _ALLOWED_FEATURE_SETS:
         raise ValueError(
@@ -486,6 +618,19 @@ def build_ml_dataset(
     if panel_mode not in _ALLOWED_PANEL_MODES:
         raise ValueError(
             f"panel_mode must be one of {list(_ALLOWED_PANEL_MODES)}, got {panel_mode!r}"
+        )
+    if provenance_mode not in ("confirmation", "discovery"):
+        raise ValueError(
+            "provenance_mode must be one of confirmation/discovery, "
+            f"got {provenance_mode!r}"
+        )
+    timestamp_columns = (observation_time_col, decision_time_col, execution_time_col)
+    if any(column is not None for column in timestamp_columns) and not all(
+        column is not None for column in timestamp_columns
+    ) and provenance_mode == "confirmation":
+        raise ValueError(
+            "confirmation provenance requires observation_time_col, "
+            "decision_time_col, and execution_time_col together"
         )
     df = clean_column_names(trade_log_df.copy())
 
@@ -550,10 +695,33 @@ def build_ml_dataset(
     feature_cols = list(dict.fromkeys(feature_cols))
     X = df[feature_cols].copy()
     manifest = build_feature_manifest(feature_cols)
+    if all(
+        col is not None
+        for col in (observation_time_col, decision_time_col, execution_time_col)
+    ):
+        df = validate_decision_time_availability(
+            df,
+            manifest,
+            observation_time_col,
+            decision_time_col,
+            execution_time_col,
+            mode=provenance_mode,
+        )
+    else:
+        df.attrs["availability_provenance"] = _availability_provenance(
+            mode="discovery",
+            promotable=False,
+            input_hash=_provenance_input_hash(df),
+            timestamp_timezone=None,
+            rejected_row_count=0,
+            reject_reasons=["missing_timestamp_provenance"],
+        )
+    availability = df.attrs["availability_provenance"]
     df.attrs["feature_manifest"] = manifest
     df.attrs["feature_set"] = feature_set
     df.attrs["panel_mode"] = panel_mode
     X.attrs["feature_manifest"] = manifest
     X.attrs["feature_set"] = feature_set
     X.attrs["panel_mode"] = panel_mode
+    X.attrs["availability_provenance"] = dict(availability)
     return X, targets, cat_features, df

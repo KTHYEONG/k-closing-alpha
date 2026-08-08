@@ -15,8 +15,80 @@ import pandas as pd
 import pytest
 
 from src.ml.feature_selection import FeatureSelectionConfig
-from src.ml.history_feature_research import run_history_feature_research_experiment
+from src.ml.history_feature_research import (
+    _oof_date_mismatch_diagnostic,
+    _promotion_gate,
+    run_history_feature_research_experiment,
+    validate_research_oof_alignment,
+)
 from src.ml.history_features import HISTORICAL_CATALOGUE_VERSION
+
+
+def test_p0b_oof_identity_equal_arrays_pass_gate() -> None:
+    """P0-OOF-IDENTITY-02: 동일한 실제 날짜 배열은 표준화·보존되고 identity 게이트를 통과합니다."""
+    control = np.array(["2025-01-02", "2025-01-03", "2025-01-04"])
+    candidate = np.array(["2025-01-04", "2025-01-03", "2025-01-02"])
+    identical, control_norm, candidate_norm = validate_research_oof_alignment(
+        control, candidate
+    )
+    assert identical is True
+    assert control_norm == candidate_norm
+    assert control_norm == [
+        "2025-01-02T00:00:00",
+        "2025-01-03T00:00:00",
+        "2025-01-04T00:00:00",
+    ]
+    assert _oof_date_mismatch_diagnostic(control_norm, candidate_norm) == "oof_dates_identical"
+
+
+def test_p0b_oof_identity_omitted_candidate_date_fails() -> None:
+    """P0-OOF-IDENTITY-01: 후보 날짜 누락 시 identical=False 이고 승격 거부 oof_dates_mismatch 입니다."""
+    control = np.array(["2025-01-02", "2025-01-03", "2025-01-04"])
+    candidate = np.array(["2025-01-02", "2025-01-04"])
+    identical, control_norm, candidate_norm = validate_research_oof_alignment(
+        control, candidate
+    )
+    assert identical is False
+    assert "missing=['2025-01-03T00:00:00']" in _oof_date_mismatch_diagnostic(
+        control_norm, candidate_norm
+    )
+    control = {
+        "aggregate": {
+            "candidate": {
+                "scheduled_mean_return": 0.015,
+                "profit_factor": 1.5,
+                "entry_sequence_drawdown": 0.30,
+            }
+        }
+    }
+    candidate = {
+        "aggregate": {
+            "candidate": {
+                "scheduled_mean_return": 0.020,
+                "profit_factor": 1.5,
+                "entry_sequence_drawdown": 0.20,
+            }
+        }
+    }
+    gate = _promotion_gate(control, candidate, identical, {"gate_passed": True})
+    assert gate["promoted"] is False
+    assert "oof_dates_mismatch" in gate["rejected_reasons"]
+
+
+def test_p0b_oof_identity_duplicate_and_unparsable_fail() -> None:
+    """P0-OOF-IDENTITY: 중복 또는 파싱 불가 날짜는 fail-closed 로 False 입니다."""
+    assert (
+        validate_research_oof_alignment(
+            np.array(["2025-01-02", "2025-01-02"]), np.array(["2025-01-02"])
+        )[0]
+        is False
+    )
+    assert (
+        validate_research_oof_alignment(
+            np.array(["2025-01-02"]), np.array(["not-a-date"])
+        )[0]
+        is False
+    )
 
 
 def _build_trade_log(n_dates: int = 18, n_stocks: int = 8, seed: int = 4) -> pd.DataFrame:
@@ -359,3 +431,35 @@ def test_mto02_feq02_quality_report_persisted_and_lower_return_not_promoted(
     )
     assert gate_ok["promoted"] is True
     assert gate_ok["candidate_beats_control_mean"] is True
+
+
+def test_p0a_availability_manifest_non_promotable_blocks_promotion() -> None:
+    """P0-A: 가용성 증명이 승격 불가이면 모든 지표가 통과해도 승격이 거부됩니다."""
+    control = {
+        "aggregate": {
+            "candidate": {
+                "scheduled_mean_return": 0.015,
+                "profit_factor": 1.5,
+                "entry_sequence_drawdown": 0.30,
+            }
+        }
+    }
+    candidate = {
+        "aggregate": {
+            "candidate": {
+                "scheduled_mean_return": 0.020,
+                "profit_factor": 1.5,
+                "entry_sequence_drawdown": 0.20,
+            }
+        }
+    }
+    gate = _promotion_gate(
+        control,
+        candidate,
+        identical_oof_dates=True,
+        stability={"gate_passed": True},
+        availability_promotable=False,
+    )
+    assert gate["promoted"] is False
+    assert gate["availability_manifest_promotable"] is False
+    assert "availability_manifest_non_promotable" in gate["rejected_reasons"]
