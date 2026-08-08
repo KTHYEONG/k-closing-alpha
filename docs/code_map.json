@@ -98,5 +98,9 @@
   },
   "src/tools/run_history_feature_research.py": {
     "testing": "tests/unit/tools/test_run_history_feature_research.py"
+  },
+  "src/ml/history_feature_research.py": {
+    "testing": "tests/unit/ml/test_history_feature_research.py",
+    "architecture": "docs/results/ml-training-optimization-benchmark.md"
   }
 }
