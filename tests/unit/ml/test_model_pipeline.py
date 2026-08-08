@@ -22,6 +22,7 @@ from src.ml.model_pipeline import (
     _fit_predict,
     _select_bad_probability_weight,
     _select_recency_ensemble_config,
+    calculate_date_balanced_sample_weight,
     calculate_recency_sample_weight,
     evaluate_close_morning_quality,
     run_close_morning_recency_ensemble_experiment,
@@ -1307,6 +1308,8 @@ def test_close_morning_recency_ensemble_nested_selection_is_causal() -> None:
         assert "scheduled_mean_return" in fold["baseline"]["metrics"]
         assert "entry_sequence_drawdown" in fold["candidate"]["metrics"]
     assert set(base["aggregate"]) == {"baseline", "candidate"}
+    assert base["baseline_oof_dates"].size == base["candidate_oof_dates"].size
+    np.testing.assert_array_equal(base["baseline_oof_dates"], base["candidate_oof_dates"])
     assert (
         base["aggregate"]["baseline"]["n_scheduled_dates"]
         == base["aggregate"]["candidate"]["n_scheduled_dates"]
@@ -1358,7 +1361,11 @@ def test_close_morning_recency_ensemble_fails_closed_on_insufficient_inner_histo
         n_splits=5,
         min_history_dates=2,
     )
-    assert report["folds"][0]["chosen_config"] == {"half_life": None, "recent_weight": 0.0}
+    assert report["folds"][0]["chosen_config"] == {
+        "half_life": None,
+        "recent_weight": 0.0,
+        "weighting_mode": "current",
+    }
     assert (
         report["folds"][0]["inner"]["fail_closed_reason"] == "insufficient_inner_history"
     )
@@ -1554,3 +1561,113 @@ def test_finite_nan_handles_missing_and_inf_features() -> None:
     assert np.isnan(a[[1, 2]]).all()
     assert out["b"].iloc[3] is np.nan or pd.isna(out["b"].iloc[3])
     assert out["b"].iloc[0] == 1.0
+
+
+def test_p1_date_balanced_weight_equal_mass_and_mean_one() -> None:
+    """P1-DATE-BALANCED-OBJECTIVE-01: 날짜별 총 질량이 동일하고 평균이 1 입니다."""
+    groups = pd.Series(["2025-01-02", "2025-01-02", "2025-01-03"])
+    weights = calculate_date_balanced_sample_weight(groups)
+    np.testing.assert_allclose(weights, np.array([0.75, 0.75, 1.5]))
+    assert weights.mean() == pytest.approx(1.0)
+    # 날짜별 총 질량 동일: date 01-02 (2행) 총 1.5, date 01-03 (1행) 총 1.5.
+    assert weights[:2].sum() == pytest.approx(weights[2:].sum())
+    # recency decay 결합도 mean-one 계약을 유지합니다.
+    combined = calculate_date_balanced_sample_weight(groups, recency_half_life_groups=252)
+    assert combined.mean() == pytest.approx(1.0)
+
+
+def test_p1_date_balanced_weight_rejects_invalid_inputs() -> None:
+    """P1-DATE-BALANCED-OBJECTIVE: null/파싱 불가/빈/미지원 half-life 는 fail-closed 입니다."""
+    with pytest.raises(ValueError, match="one of None, 252, 504"):
+        calculate_date_balanced_sample_weight(pd.Series(["2025-01-01"]), 100)
+    with pytest.raises(ValueError, match="non-empty"):
+        calculate_date_balanced_sample_weight(pd.Series([], dtype="object"))
+    with pytest.raises(ValueError, match="parseable"):
+        calculate_date_balanced_sample_weight(pd.Series(["2025-01-01", "not-a-date"]))
+    with pytest.raises(ValueError, match="parseable"):
+        calculate_date_balanced_sample_weight(pd.Series(["2025-01-01", None]))
+
+
+def test_p1_date_balanced_weighting_mode_is_fold_local() -> None:
+    """P1-DATE-BALANCED-OBJECTIVE: date_balanced 가중치는 fold train 에서만 계산됩니다."""
+    df = _make_recency_dataset(seed=7)
+    n_groups = df[GROUP_COL].nunique()
+    future_dates = sorted(df[GROUP_COL].unique())[-(n_groups // 3) :]
+    mutated = df.copy()
+    mutated.loc[mutated[GROUP_COL].isin(future_dates), TARGET_COL] = -0.19
+
+    def _preds(data: pd.DataFrame) -> np.ndarray:
+        return run_model_pipeline(
+            data,
+            feature_cols=["feature_a", "feature_b"],
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            n_splits=2,
+            model_type="lgb_regressor",
+            weighting_mode="date_balanced",
+        )["oof_predictions"]["pred"].to_numpy()
+
+    np.testing.assert_allclose(_preds(df), _preds(mutated), atol=1e-9)
+
+
+def test_p1_date_balanced_outer_selection_is_causal() -> None:
+    """P1-DATE-BALANCED-OBJECTIVE-02: 외부 validation 타깃 변경은 폴드별 선택 가중치 구성을 바꾸지 않습니다."""
+    df = _make_recency_dataset(seed=7)
+    n_groups = df[GROUP_COL].nunique()
+    future_dates = sorted(df[GROUP_COL].unique())[-(n_groups // 3) :]
+    mutated = df.copy()
+    mutated.loc[mutated[GROUP_COL].isin(future_dates), TARGET_COL] = -0.19
+
+    base = run_close_morning_recency_ensemble_experiment(
+        df,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=2,
+        min_history_dates=2,
+        weighting_modes=("current", "date_balanced"),
+    )
+    altered = run_close_morning_recency_ensemble_experiment(
+        mutated,
+        feature_cols=["feature_a", "feature_b"],
+        target_col=TARGET_COL,
+        group_col=GROUP_COL,
+        n_splits=2,
+        min_history_dates=2,
+        weighting_modes=("current", "date_balanced"),
+    )
+    assert base["contract"]["weighting_modes"] == ["current", "date_balanced"]
+    assert base["chosen_configs"] == altered["chosen_configs"]
+    assert all(
+        config["weighting_mode"] in ("current", "date_balanced")
+        for config in base["chosen_configs"]
+    )
+    for fold in base["folds"]:
+        assert fold["chosen_config"]["weighting_mode"] in ("current", "date_balanced")
+        assert "candidate_stats_by_mode" in fold["inner"]
+        assert set(fold["inner"]["candidate_stats_by_mode"]) == {"current", "date_balanced"}
+
+
+def test_p1_date_balanced_rejected_for_non_lgb_regressor() -> None:
+    """P1-DATE-BALANCED-OBJECTIVE: date_balanced 는 lgb_regressor 학습에만 적용됩니다."""
+    df = _make_recency_dataset(seed=7)
+    with pytest.raises(ValueError, match="only supported for lgb_regressor"):
+        run_model_pipeline(
+            df,
+            feature_cols=["feature_a", "feature_b"],
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            n_splits=2,
+            model_type="ridge",
+            weighting_mode="date_balanced",
+        )
+    with pytest.raises(ValueError, match="weighting_mode"):
+        run_model_pipeline(
+            df,
+            feature_cols=["feature_a", "feature_b"],
+            target_col=TARGET_COL,
+            group_col=GROUP_COL,
+            n_splits=2,
+            model_type="lgb_regressor",
+            weighting_mode="unknown_mode",
+        )
