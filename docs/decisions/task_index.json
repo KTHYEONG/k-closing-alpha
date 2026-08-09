@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_SERVING_LEGACY_SEPARATION",
+      "date": "2026-08-09",
+      "adr_id": "ADR_20260809_ML_SERVING_LEGACY_SEPARATION",
+      "domain": "ml_architecture",
+      "title": "Separate live ML serving from legacy research",
+      "why": "The daily runtime imported training, OOF, and experiment code and could retrain or mutate model artifacts during live inference; archived research also remained in the active source and test trees.",
+      "resolution": "Moved the live inference boundary to src/serving/realtime, renamed runtime APIs to model-bundle, snapshot-feature, and daily-sizing terminology, archived research under ignored legacy/, removed legacy files from the Git index while preserving them on disk, and updated code maps, specs, and tooling exclusions.",
+      "impact": "Live inference now consumes validated published bundles without automatic retraining; the default test and type/lint scope is smaller and clearer, while legacy research remains explicitly runnable from the working tree. Active regression coverage remains green."
+    },
+    {
       "task_id": "TASK_ML_HISTORY_PIPELINE_OPERATIONAL_HARDENING",
       "date": "2026-08-08",
       "adr_id": "ADR_20260808_ML_HISTORY_PIPELINE_OPERATIONAL_HARDENING",
