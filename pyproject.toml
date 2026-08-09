@@ -44,6 +44,7 @@ target-version = "py311"
 exclude = [
     "data", 
     "legacy", 
+    ".legacy",
     "logs", 
     "results", 
     ".pytest_cache", 
@@ -110,6 +111,7 @@ ignore_missing_imports = true
 exclude = [
     "data", 
     "legacy", 
+    ".legacy",
     "logs", 
     "results", 
     ".pytest_cache", 
@@ -129,6 +131,7 @@ ignore_errors = true
 exclude = [
     "data", 
     "legacy", 
+    ".legacy",
     "logs", 
     "results", 
     ".pytest_cache", 

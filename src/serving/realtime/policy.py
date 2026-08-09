@@ -1,14 +1,9 @@
-"""단일 종목 일일 매수 + 인과적 관망(abstention) 정책 모듈.
+"""Persisted single-stock policy schema and BUY/ABSTAIN selection for the live path.
 
-`docs/specs/ml_single_stock_abstention.md` 계약 구현:
-
-- 매 거래일마다 정확히 하나의 결정(BUY 종목 1개 또는 ABSTAIN)을 내립니다.
-- ``rank_score`` / OOF ``pred`` 가 유일한 선택 신호이며, 유틸리티 등급·분위수·
-  ``p_good``/``p_bad`` 는 진단 필드일 뿐 실행 게이트가 아닙니다.
-- 마진 문턱과 정책 선택은 반드시 날짜 ``D`` 이전 OOF 날짜만 사용하는 인과적
-  (causal) 계산입니다. 워밍업 기간은 명시적 ABSTAIN 으로 유지됩니다.
-- exit ledger 가 없으므로 드로다운은 ``entry_sequence_drawdown`` 로만 명명하며
-  포트폴리오 NAV/MDD 로 보고하지 않습니다.
+This module retains only persisted-policy deserialization, BUY/ABSTAIN decision
+selection, and runtime input validation. OOF policy calibration, candidate grid
+construction, and ``evaluate_single_stock_policy_oof`` live under
+``legacy/ml_research/evaluation/``.
 """
 
 from __future__ import annotations
@@ -21,21 +16,9 @@ import numpy as np
 import pandas as pd
 import pydantic
 
-from src.ml.backtest_evaluator import (
-    _aggregate_metrics,
-    _extract_year,
-    _group_starts,
-    _max_drawdown,
-    _yearly_breakdown,
-    resolve_stock_actions,
-)
-
 logger = logging.getLogger(__name__)
 
 _POLICY_VERSION = "ml-single-stock-v1"
-_DEFAULT_QUANTILE_GRID: tuple[float, ...] = (0.70, 0.90)
-_DEFAULT_MIN_HISTORY_DATES = 252
-_MIN_YEAR_SAMPLES = 5
 
 _ALWAYS_BUY_CANDIDATE = "always_buy_top1"
 _MARGIN_CANDIDATE_PREFIX = "margin_quantile."
@@ -147,20 +130,109 @@ def margin_quantile_policy(
     )
 
 
-def default_policy_candidates(
-    calibration_cutoff: str,
-    *,
-    grid: tuple[float, ...] = _DEFAULT_QUANTILE_GRID,
-    score_col: str = "rank_score",
-    version: str = _POLICY_VERSION,
-) -> tuple[SingleStockPolicy, ...]:
-    """버전화된 후보 정책 집합(always_buy + margin quantile grid)을 반환합니다."""
-    always = always_buy_policy(calibration_cutoff, version=version, score_col=score_col)
-    margins = tuple(
-        margin_quantile_policy(q, calibration_cutoff, version=version, score_col=score_col)
-        for q in grid
+def load_single_stock_policy(models_bundle: dict[str, Any]) -> SingleStockPolicy | None:
+    """번들에 영속화된 ``SingleStockPolicy`` 상태를 복원합니다.
+
+    유효한 정책 상태가 없으면 ``None`` 을 반환하며, 호출부가 조용한 Top-N 폴백
+    대신 명시적 ``ABSTAIN``(``missing_validated_policy``)을 산출하게 합니다.
+    """
+    raw = models_bundle.get("single_stock_policy")
+    if raw is None:
+        return None
+    if isinstance(raw, SingleStockPolicy):
+        return raw
+    if isinstance(raw, dict):
+        return SingleStockPolicy(**raw)
+    logger.info(
+        "인식할 수 없는 single_stock_policy 상태입니다. "
+        "ABSTAIN(missing_validated_policy) 으로 결정합니다."
     )
-    return (always, *margins)
+    return None
+
+
+def _group_starts(group_vals: np.ndarray) -> np.ndarray:
+    """그룹화된(정렬된) 배열에서 각 그룹 시작 인덱스를 반환합니다."""
+    change = np.concatenate(([True], group_vals[1:] != group_vals[:-1]))
+    return np.flatnonzero(change)
+
+
+_ACTION_RESOLUTION_MODES: tuple[str, ...] = (
+    "exclude_multi_scenario",
+    "score_best_action",
+    "require_final_action",
+)
+
+
+def resolve_stock_actions(
+    oof_df: pd.DataFrame,
+    group_col: str,
+    stock_col: str = "stock_code",
+    scenario_col: str = "chart_analysis",
+    score_col: str = "pred",
+    mode: str = "exclude_multi_scenario",
+    executable_col: str = "is_executable_action",
+) -> pd.DataFrame:
+    """스코어링된 행동 패널을 유일한 ``(group, stock)`` 종목 패널로 해소합니다.
+
+    시나리오 행동 패널에서 날짜-종목당 실행 가능한 행동 하나를 선택합니다.
+    실현 수익률(``target_col``)이나 원천 행 순서로 행동을 선택하지 않습니다.
+
+    모드:
+    - ``exclude_multi_scenario``: 날짜-종목에 행동이 둘 이상이면 해당 종목을
+      패널에서 제외합니다.
+    - ``score_best_action``: 행동별 예측 점수(``score_col``)가 가장 높은 하나를
+      선택하며, 동점은 ``scenario_col`` 오름차순으로 결정합니다.
+    - ``require_final_action``: ``executable_col`` 이 True 인 행동이 정확히 하나인
+      날짜-종목만 선택하며, 없거나 둘 이상이면 ``ValueError`` 입니다.
+    """
+    if mode not in _ACTION_RESOLUTION_MODES:
+        raise ValueError(f"mode must be one of {list(_ACTION_RESOLUTION_MODES)}, got {mode!r}")
+    required = [group_col, stock_col, scenario_col, score_col]
+    missing = [col for col in required if col not in oof_df.columns]
+    if missing:
+        raise ValueError(f"missing required columns in oof_df for action resolution: {missing}")
+    null_cols = [col for col in required if oof_df[col].isna().any()]
+    if null_cols:
+        raise ValueError(f"required columns contain nulls: {null_cols}")
+
+    work = oof_df.reset_index(drop=True).copy()
+    group_keys = [group_col, stock_col]
+
+    if mode == "exclude_multi_scenario":
+        counts = work.groupby(group_keys, sort=False)[scenario_col].transform("size")
+        resolved = work.loc[counts == 1]
+    elif mode == "score_best_action":
+        resolved = (
+            work.sort_values(
+                [*group_keys, score_col, scenario_col],
+                ascending=[True, True, False, True],
+                kind="mergesort",
+            )
+            .groupby(group_keys, sort=False)
+            .head(1)
+        )
+    else:  # require_final_action
+        if executable_col not in work.columns:
+            raise ValueError(
+                f"executable_col {executable_col!r} is required for require_final_action mode"
+            )
+        executable = work[executable_col].fillna(False).astype(bool)
+        group_sizes = work.groupby(group_keys, sort=False).size()
+        executable_counts = (
+            work.assign(_executable=executable)
+            .groupby(group_keys, sort=False)["_executable"]
+            .sum()
+            .reindex(group_sizes.index, fill_value=0)
+        )
+        invalid = executable_counts[executable_counts != 1]
+        if not invalid.empty:
+            raise ValueError(
+                "require_final_action expects exactly one executable action per "
+                f"{group_col}-{stock_col} group; got {len(invalid)} invalid groups"
+            )
+        resolved = work.loc[executable]
+
+    return resolved.reset_index(drop=True)
 
 
 def _validate_scored_df(
@@ -412,7 +484,7 @@ def select_single_daily_trade(
     group_col: str,
     stock_col: str = "stock_code",
     scenario_col: str = "chart_analysis",
-    score_col: str = "rank_score",
+    score_col: str | None = None,
     *,
     resolve_mode: str = "score_best_action",
     executable_col: str = "is_executable_action",
@@ -420,7 +492,7 @@ def select_single_daily_trade(
     """스코어링된 일일 패널에서 단일 BUY/ABSTAIN 결정 레코드를 반환합니다.
 
     - 같은 날짜-종목의 시나리오 행동을 ``resolve_stock_actions`` 로 해소한 뒤
-      종목을 ``rank_score`` 내림차순으로 정렬합니다(동점은 정규화 종목코드 오름차순).
+      종목을 ``score_col`` 내림차순으로 정렬합니다(동점은 정규화 종목코드 오름차순).
     - 후보가 전혀 없으면 ``no_executable_candidate`` ABSTAIN, 데이터 계약 위반은
       ``ValueError`` 입니다(잘못된 정책 상태 포함).
     """
@@ -432,6 +504,9 @@ def select_single_daily_trade(
             raise ValueError(
                 "invalid policy state: margin_quantile policy requires margin_threshold"
             )
+
+    if score_col is None:
+        score_col = policy.score_col
 
     if scored_df is None or len(scored_df) == 0:
         return _abstain_only_record(
@@ -477,306 +552,4 @@ def select_single_daily_trade(
         score_col=score_col,
         thresholds=thresholds,
         warm_up=warm_up,
-    )
-
-
-def _validate_oof(
-    oof_df: pd.DataFrame,
-    target_col: str,
-    group_col: str,
-    stock_col: str,
-    scenario_col: str,
-    score_col: str,
-) -> None:
-    required = [group_col, target_col, stock_col, scenario_col, score_col]
-    missing = [col for col in required if col not in oof_df.columns]
-    if missing:
-        raise ValueError(f"missing required columns in oof_df: {missing}")
-    null_cols = [col for col in required if oof_df[col].isna().any()]
-    if null_cols:
-        raise ValueError(f"required columns contain nulls: {null_cols}")
-    parsed = pd.to_datetime(oof_df[group_col], errors="coerce", format="mixed")
-    if parsed.isna().any():
-        raise ValueError("group_col contains unparseable dates (chronology contract violation)")
-    for col, label in ((score_col, "score"), (target_col, "target")):
-        values = oof_df[col].to_numpy(dtype=np.float64)
-        if not np.isfinite(values).all():
-            raise ValueError(f"non-finite values in {label} column {col!r}")
-
-
-def _validate_candidates(
-    policy_candidates: tuple[SingleStockPolicy, ...],
-) -> tuple[SingleStockPolicy, ...]:
-    if not policy_candidates:
-        raise ValueError("policy_candidates must not be empty")
-    seen: set[str] = set()
-    for cand in policy_candidates:
-        if not isinstance(cand, SingleStockPolicy):
-            raise ValueError("policy_candidates must be SingleStockPolicy instances")
-        if cand.candidate in seen:
-            raise ValueError(f"duplicate policy candidate {cand.candidate!r}")
-        seen.add(cand.candidate)
-    return policy_candidates
-
-
-def _causal_thresholds(
-    margins: np.ndarray,
-    q: float,
-    min_history_dates: int,
-) -> np.ndarray:
-    """날짜별 마진 문턱을 이전 날짜(< D)의 마진만으로 계산합니다."""
-    n = margins.size
-    thresholds = np.full(n, np.nan)
-    for i in range(min_history_dates, n):
-        prior = margins[:i]
-        prior = prior[np.isfinite(prior)]
-        if prior.size == 0:
-            continue
-        thresholds[i] = float(np.quantile(prior, q))
-    return thresholds
-
-
-def _candidate_stats(scheduled: np.ndarray, buy: np.ndarray) -> dict[str, float]:
-    agg = _aggregate_metrics(scheduled)
-    active = scheduled[buy]
-    return {
-        "scheduled_mean_return": float(agg["top_1_return"]),
-        "scheduled_sharpe": float(agg["sharpe"]),
-        "scheduled_win_rate": float(agg["win_rate"]),
-        "profit_factor": float(agg["profit_factor"]),
-        "entry_sequence_drawdown": _max_drawdown(scheduled),
-        "buy_rate": float(np.mean(buy)) if buy.size else float("nan"),
-        "active_trade_mean_return": float(np.mean(active)) if active.size else float("nan"),
-        "active_trade_win_rate": float(np.mean(active > 0.0)) if active.size else float("nan"),
-    }
-
-
-def _select_best_candidate(outcomes: dict[str, dict[str, Any]]) -> str:
-    """결정적 목적함수 순서로 최적 후보를 선택합니다.
-
-    스케줄 일자당 평균 수익(관망=0) 최대화 → 샤프 → 낮은 entry-sequence 드로다운 →
-    높은 매수율 → 안정적인 정책 식별자.
-    """
-    rows = [
-        {
-            "policy_id": pid,
-            "mean": item["stats"]["scheduled_mean_return"],
-            "sharpe": item["stats"]["scheduled_sharpe"],
-            "mdd": item["stats"]["entry_sequence_drawdown"],
-            "buy_rate": item["stats"]["buy_rate"],
-        }
-        for pid, item in outcomes.items()
-    ]
-    frame = pd.DataFrame(rows)
-    frame["mdd"] = frame["mdd"].fillna(0.0)
-    frame["sharpe"] = frame["sharpe"].fillna(-np.inf)
-    frame = frame.sort_values(
-        ["mean", "sharpe", "mdd", "buy_rate", "policy_id"],
-        ascending=[False, False, True, False, True],
-        kind="mergesort",
-    )
-    return str(frame.iloc[0]["policy_id"])
-
-
-def _turnover_selected_codes(codes: np.ndarray) -> float:
-    """매수일 종목코드 시퀀스의 전일 대비 변경률 평균(턴오버)."""
-    if codes.size <= 1:
-        return float("nan")
-    changed = codes[1:] != codes[:-1]
-    return float(np.mean(changed))
-
-
-def _finalize_selected_policy(
-    candidate: SingleStockPolicy,
-    margins: _PanelMargins,
-    *,
-    n_dates: int,
-    calibration_cutoff: str,
-) -> SingleStockPolicy:
-    """선택된 후보에 OOF 참조 분포/문턱을 채워 영속 가능한 정책을 만듭니다."""
-    if candidate.candidate == _ALWAYS_BUY_CANDIDATE:
-        return always_buy_policy(
-            calibration_cutoff,
-            version=candidate.version,
-            score_col=candidate.score_col,
-        )
-    finite = margins.margin[np.isfinite(margins.margin)]
-    q = _candidate_quantile(candidate.candidate)
-    threshold: float | None = float(np.quantile(finite, q)) if finite.size else None
-    return margin_quantile_policy(
-        q,
-        calibration_cutoff,
-        version=candidate.version,
-        score_col=candidate.score_col,
-        margin_threshold=threshold,
-        reference_margin=tuple(float(v) for v in finite),
-        history_length=n_dates,
-    )
-
-
-def _build_evaluation_metrics(
-    rows: pd.DataFrame,
-    scheduled: np.ndarray,
-    *,
-    group_col: str,
-    stock_col: str,
-    market_type_col: str | None,
-) -> dict[str, Any]:
-    buy = rows["decision"].to_numpy() == "BUY"
-    n = int(scheduled.size)
-    agg = _aggregate_metrics(scheduled)
-    active = scheduled[buy]
-    active_mean = float(np.mean(active)) if active.size else float("nan")
-    active_win = float(np.mean(active > 0.0)) if active.size else float("nan")
-
-    reasons = rows["decision_reason"].to_numpy()
-    reason_counts: dict[str, int] = {}
-    for value in np.unique(reasons):
-        reason_counts[str(value)] = int(np.sum(reasons == value))
-
-    selected = rows[stock_col].to_numpy(dtype=object)[buy]
-    return {
-        "n_scheduled_dates": n,
-        "n_buy": int(buy.sum()),
-        "n_abstain": n - int(buy.sum()),
-        "buy_rate": float(np.mean(buy)),
-        "abstain_rate": float(np.mean(~buy)),
-        "reason_counts": reason_counts,
-        "scheduled_mean_return": float(agg["top_1_return"]),
-        "scheduled_win_rate": float(agg["win_rate"]),
-        "profit_factor": float(agg["profit_factor"]),
-        "scheduled_sharpe": float(agg["sharpe"]),
-        "active_trade_mean_return": active_mean,
-        "active_trade_win_rate": active_win,
-        "turnover": _turnover_selected_codes(selected),
-        "entry_sequence_drawdown": _max_drawdown(scheduled),
-    }
-
-
-@dataclass(frozen=True)
-class SingleStockPolicyEvaluation:
-    """단일 종목 정책의 인과적 OOF 평가 결과."""
-
-    selected_policy: SingleStockPolicy
-    decisions: pd.DataFrame
-    scheduled_returns: np.ndarray
-    metrics: dict[str, Any]
-    yearly_breakdown: dict[int, dict[str, float] | None]
-    market_type_breakdown: dict[str, dict[str, float]]
-    candidate_results: dict[str, dict[str, float]]
-
-
-def evaluate_single_stock_policy_oof(
-    oof_df: pd.DataFrame,
-    target_col: str,
-    group_col: str,
-    stock_col: str,
-    policy_candidates: tuple[SingleStockPolicy, ...],
-    min_history_dates: int,
-    *,
-    scenario_col: str = "chart_analysis",
-    score_col: str = "rank_score",
-) -> SingleStockPolicyEvaluation:
-    """OOF 패널에서 단일 종목 정책을 인과적으로 보정·평가합니다.
-
-    날짜 ``D`` 의 마진 문턱과 정책 선택은 오직 ``D`` 이전 날짜의 결과만
-    사용합니다. 워밍업 기간은 ``insufficient_policy_history`` ABSTAIN 으로
-    유지되며 삭제되지 않습니다. 모든 일자별 지표는 관망(ABSTAIN)을 0 으로
-    계산하며, 드로다운은 ``entry_sequence_drawdown`` 로 명명합니다.
-    """
-    if min_history_dates < 1:
-        raise ValueError(f"min_history_dates must be >= 1, got {min_history_dates}")
-    _validate_candidates(policy_candidates)
-    _validate_oof(oof_df, target_col, group_col, stock_col, scenario_col, score_col)
-
-    resolved = resolve_stock_actions(
-        oof_df,
-        group_col,
-        stock_col=stock_col,
-        scenario_col=scenario_col,
-        score_col=score_col,
-        mode="score_best_action",
-    )
-    duplicates = resolved.duplicated(subset=[group_col, stock_col], keep=False)
-    if duplicates.any():
-        raise ValueError("resolved date-stock keys are not unique (data-contract violation)")
-
-    panel = _build_panel(resolved, group_col, stock_col, scenario_col, score_col)
-    margins = _compute_margins(
-        panel,
-        group_col,
-        stock_col,
-        scenario_col,
-        score_col,
-        target_col=target_col,
-        market_type_col="market_type",
-    )
-    n = margins.sizes.size
-    warm_up = np.arange(n) < min_history_dates
-
-    candidate_outcomes: dict[str, dict[str, Any]] = {}
-    for cand in policy_candidates:
-        if cand.candidate == _ALWAYS_BUY_CANDIDATE:
-            thresholds: np.ndarray | None = None
-        else:
-            thresholds = _causal_thresholds(
-                margins.margin, _candidate_quantile(cand.candidate), min_history_dates
-            )
-        rows = _build_decision_rows(
-            margins,
-            cand,
-            group_col=group_col,
-            stock_col=stock_col,
-            scenario_col=scenario_col,
-            score_col=score_col,
-            thresholds=thresholds,
-            warm_up=warm_up,
-        )
-        buy = rows["decision"].to_numpy() == "BUY"
-        assert margins.winner_target is not None
-        scheduled = np.where(buy, margins.winner_target, 0.0).astype(np.float64)
-        candidate_outcomes[cand.policy_id] = {
-            "candidate": cand,
-            "rows": rows,
-            "scheduled": scheduled,
-            "stats": _candidate_stats(scheduled, buy),
-        }
-
-    selected_id = _select_best_candidate(candidate_outcomes)
-    selected = candidate_outcomes[selected_id]
-    calibration_cutoff = str(panel[group_col].max())
-    selected_policy = _finalize_selected_policy(
-        selected["candidate"], margins, n_dates=n, calibration_cutoff=calibration_cutoff
-    )
-
-    rows_df = selected["rows"].copy()
-    scheduled = selected["scheduled"].astype(np.float64)
-    rows_df["scheduled_return"] = scheduled
-    metrics = _build_evaluation_metrics(
-        rows_df,
-        scheduled,
-        group_col=group_col,
-        stock_col=stock_col,
-        market_type_col="market_type" if "market_type" in rows_df.columns else None,
-    )
-
-    years = _extract_year(rows_df[group_col])
-    yearly = _yearly_breakdown(scheduled, scheduled, years)
-
-    market_breakdown: dict[str, dict[str, float]] = {}
-    if "market_type" in rows_df.columns:
-        buy = rows_df["decision"].to_numpy() == "BUY"
-        market_values = rows_df["market_type"].to_numpy(dtype=object)
-        for value in np.unique(market_values[buy]):
-            mask = buy & (market_values == value)
-            market_breakdown[str(value)] = _aggregate_metrics(scheduled[mask])
-
-    return SingleStockPolicyEvaluation(
-        selected_policy=selected_policy,
-        decisions=rows_df,
-        scheduled_returns=scheduled,
-        metrics=metrics,
-        yearly_breakdown=yearly,
-        market_type_breakdown=market_breakdown,
-        candidate_results={pid: item["stats"] for pid, item in candidate_outcomes.items()},
     )
