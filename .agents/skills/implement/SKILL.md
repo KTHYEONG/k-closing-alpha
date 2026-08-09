@@ -15,9 +15,9 @@ Fast-execution model protocol for mechanical feature implementation based on fro
 2. **Phased Mechanical Implementation**:
    - **Phase A (Scenarios)**: Translate `scenarios` and `python_assertion` from `contract.json` into concrete `pytest` test cases in `target_test_file`.
    - **Phase B (Core Logic)**: Implement source logic at `target_file`.
-     - *Checkpoint*: Run `uv run python tools/agent_skills/lean_check.py --spec-only --spec docs/specs/<feature>_contract.json`. Verify non-dummy implementation.
+     - *Checkpoint*: Run `uv run python tools/agent_skills/lean_check.py --fast --spec docs/specs/<feature>_contract.json`. Verify non-dummy implementation.
    - **Phase C (Wiring Integration)**: Integrate logic into `caller_file` at specified `anchor` location using `import_symbol` and `invocation_expression`.
-     - *Checkpoint*: Re-run `uv run python tools/agent_skills/lean_check.py --spec-only --spec docs/specs/<feature>_contract.json`. Ensure no orphaned implementations remain.
+     - *Checkpoint*: Re-run `uv run python tools/agent_skills/lean_check.py --fast --spec docs/specs/<feature>_contract.json`. Ensure no orphaned implementations remain.
 
 3. **Surgical Code Modifications**:
    - MUST use targeted block/line edits (`replace_file_content` / `multi_replace_file_content`) to prevent code loss or unintended rewrites.
