@@ -77,8 +77,52 @@ flowchart TD
 * **라벨ing 및 손실 함수**:
   - 왕복 거래비용(수수료+슬리피지 0.20%) 차감 후 순수익률(`decimal_net`) 기준
   - `target_good` (+1% 이상) / `target_bad` (-2% 이하) 임계값 기반의 복합 랭킹 알고리즘
-* **점수 산출 공식 (`close-morning-reranker-v1`)**:
-  - `decision_score` = `rank_weight * Rank_Score + p_good_weight * P_Good_Score`
+
+### 4.1. 스코어(Score) 및 매매 결정(Decision) 산출 로직
+
+1. **`Decision Score` 계산**:
+   - `decision_score = rank_weight * Rank_Score + p_good_weight * P_Good_Score` (기본 설정: `rank_weight=1.0`, `p_good_weight=0.5`)
+2. **`Decision` 결정 및 정책 사유 (`SingleStockPolicy`)**:
+   - **`BUY` (매수)**: `always_buy_top1` 정책에 의해 당일 Score 1위 종목을 매수 결정. (`reason: top1_buy`)
+   - **`ABSTAIN` (관망)**: `margin_quantile` 정책 적용 시 top1 마진이 임계값 미달이거나, 유효한 정책 미발행 또는 당일 유니버스 미달 시 매수 보류. (`reason: below_margin_threshold`, `missing_validated_policy` 등)
+
+### 4.2. 포지션 비중 조절 로직 (Position Sizing)
+
+선정된 매수 종목에 대하여 자본 위험을 관리하기 위해 **동적 비중 조절(Dynamic Risk-Adjusted Position Sizing)**을 수행합니다:
+
+$$\text{Position}_i = \text{BaseBudget} \times \text{GradeMultiplier}_i \times \left(\frac{\text{TargetVol}}{\sigma_i}\right) \times \text{UtilityScaling}_i$$
+
+* **유틸리티 스코어 (`utility_score`)**: 순 기대수익(`q50`) 및 하방 리스크/불확실성 반영
+* **하이브리드 등급 (`GradeMultiplier`)**:
+  - 🟢 <span style="color:#2e7d32; font-weight:bold;">Strong</span> (`Multiplier: 1.0`): 상위 10% 이내 & $Utility \ge 0.0030$ & $q50 > 0$
+  - 🟡 <span style="color:#f57f17; font-weight:bold;">Good</span> (`Multiplier: 0.75`): 상위 25% 이내 & $Utility \ge 0.0010$ & $q50 > 0$
+  - 🟠 <span style="color:#e65100; font-weight:bold;">Weak</span> (`Multiplier: 0.5`): 상위 50% 이내 & $Utility \ge 0.0010$ & $q50 > 0$
+  - 🔴 <span style="color:#c62828; font-weight:bold;">Pass</span> (`Multiplier: 0.0`): 미달 종목 또는 관망 (`ABSTAIN`)
+* **위험 한도 (Risk Limits)**: 개별 종목 최대 비중 25% 제한 (`max_position_pct=0.25`), 전체 종목 총 비중 100% 한도 적용. 불리한 시장 국면(평균 Utility < 0) 시 전체 한도 자동 축소.
+
+### 4.3. 터미널 추론 & 매매 결정 출력 예시 (Colorized Example)
+
+추론 파이프라인(`src.daily.predict`) 실행 시 터미널 및 로그에 출력되는 터미널 ANSI 색상 적용 예시입니다:
+
+```text
+=== Daily Closing Alpha Prediction ===
+-----------------------------------------------------------------------------------------
+|  Rank  |    Stock Name    |   Rate   |      Scenario      |   Score  |   Decision   |
+-----------------------------------------------------------------------------------------
+|   1    | 삼성전자         |  +2.35%  | volume_surge       |  0.8421  |   [ BUY ]    |  (Reason: top1_buy | Grade: Strong)
+-----------------------------------------------------------------------------------------
+|   2    | SK하이닉스       |  +1.12%  | new_high           |  0.7105  |  [ABSTAIN]   |  (Reason: top1_only_policy | Grade: Pass)
+|   3    | 현대차           |  -0.45%  | 120_breakout       |  0.5420  |  [ABSTAIN]   |  (Reason: below_threshold | Grade: Pass)
+-----------------------------------------------------------------------------------------
+> Decision: BUY | Reason: top1_buy | Stock: 005930 | Score: 0.8421 | Allocated Weight: 25.00%
+```
+
+| Decision 색상 구분 | 상태 | 설명 | 대표 사유 (Reason) |
+|---|---|---|---|
+| 🟢 **`BUY`** | 매수 | 매수 실행 대상 종목 | `top1_buy`, `top1_buy_margin` |
+| 🔴 **`ABSTAIN`** | 관망 | 매수 보류 / 관망 대상 종목 | `below_margin_threshold`, `no_executable_candidate`, `missing_validated_policy` |
+
+
 
 ---
 
