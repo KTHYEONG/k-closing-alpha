@@ -516,8 +516,41 @@ def _find_test_files(py_files: list[str]) -> list[str]:
     return test_files
 
 
+def _analyze_impact_level(py_files: list[str]) -> tuple[int, str]:
+    """Analyze change scope and return (impact_level, reason)."""
+    if not py_files:
+        return (1, "No python files modified")
+
+    core_keywords = ("config", "base", "core", "schema", "contract")
+    is_core_modified = any(
+        any(kw in f.lower() for kw in core_keywords) for f in py_files
+    )
+    if is_core_modified or len(py_files) >= 5:
+        return (3, "Core module or large multi-file change detected")
+
+    src_files = [f for f in py_files if f.startswith("src/")]
+    if not src_files:
+        return (1, "Only test or tool files modified")
+
+    # Check if modified source files are heavily referenced across src/
+    ref_count = 0
+    src_contents = _get_src_files_contents()
+    for sf in src_files:
+        leaf_name = os.path.splitext(os.path.basename(sf))[0]
+        if leaf_name == "__init__":
+            continue
+        pat = re.compile(rf"\b{re.escape(leaf_name)}\b")
+        for fp, content in src_contents:
+            if _repo_relative(fp) != sf and pat.search(content):
+                ref_count += 1
+
+    if ref_count > 3:
+        return (2, f"Module imported across multiple components ({ref_count} references)")
+    return (1, "Leaf/isolated module change")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Lean Check with JSON diagnostics.")
+    parser = argparse.ArgumentParser(description="Smart Selective Lean Check with JSON diagnostics.")
     parser.add_argument("--files", nargs="*", default=[])
     parser.add_argument("--spec", default=None, help="Path to spec contract JSON")
     parser.add_argument("--skip-lint", action="store_true", help="Skip Ruff linting")
@@ -528,6 +561,12 @@ def main() -> None:
         "--fast",
         action="store_true",
         help="Skip pytest and run fast static checks only",
+    )
+    parser.add_argument(
+        "--smart",
+        action="store_true",
+        default=True,
+        help="Enable Smart Selective Verification (Impact Level targeting)",
     )
     parser.add_argument(
         "--spec-only", action="store_true", help="Run ONLY spec-compliance and exit"
@@ -603,6 +642,9 @@ def main() -> None:
 
     # 1. Co-modification Check
     test_files = _find_test_files(py_files)
+    impact_level, impact_reason = _analyze_impact_level(py_files)
+    print(f"INFO | Impact Level: {impact_level} ({impact_reason})")
+
     for pf in py_files:
         if (
             pf.startswith("src/")
