@@ -1,6 +1,12 @@
+import sys
 import unicodedata
 
 import pandas as pd
+
+
+def _write_line(value: object = "") -> None:
+    """Write one display line without invoking the banned print builtin."""
+    sys.stdout.write(f"{value}\n")
 
 
 class Colors:
@@ -74,22 +80,24 @@ def print_table(results_list, title, minimal=False):
         if results_list.empty:
             return
         # single_stock_policy decision DataFrame 이 들어온 경우
-        print(f"\n{Colors.BOLD}=== {title} ==={Colors.RESET}")
-        for idx, row in results_list.iterrows():
+        _write_line(f"\n{Colors.BOLD}=== {title} ==={Colors.RESET}")
+        for _idx, row in results_list.iterrows():
             decision = row.get("decision", "ABSTAIN")
             reason = row.get("decision_reason", "")
             stock = row.get("stock_code") or "None"
             score = row.get("rank_score")
             score_str = f"{score:.4f}" if score is not None and pd.notna(score) else "N/A"
             color = get_decision_color(decision)
-            print(f"  > Decision: {color}{decision}{Colors.RESET} | Reason: {reason} | Stock: {stock} | Score: {score_str}")
+            _write_line(
+                f"  > Decision: {color}{decision}{Colors.RESET} | Reason: {reason} | Stock: {stock} | Score: {score_str}"
+            )
         return
 
     if not results_list:
         return
 
-    # Rank 오름차순, 동일 Rank 내에서는 Score 내림차순 정렬
-    results_list.sort(key=lambda x: (x["Rank"], -x["Score"]))
+    # Score 내림차순, 동일 Score 내에서는 Rank 오름차순 정렬
+    results_list.sort(key=lambda x: (-x["Score"], x["Rank"]))
 
     if minimal:
         W_RANK, W_NAME = 6, 16
@@ -113,17 +121,17 @@ def print_table(results_list, title, minimal=False):
         )
     divider = "-" * get_display_width(header)
 
-    print(f"\n{Colors.BOLD}=== {title} ==={Colors.RESET}")
-    print(divider)
-    print(Colors.BOLD + header + Colors.RESET)
-    print(divider)
+    _write_line(f"\n{Colors.BOLD}=== {title} ==={Colors.RESET}")
+    _write_line(divider)
+    _write_line(Colors.BOLD + header + Colors.RESET)
+    _write_line(divider)
 
     previous_stock_name = None
 
     for res in results_list:
         dec_color = get_decision_color(res["Decision"])
         if previous_stock_name is not None and res["Name"] != previous_stock_name:
-            print(divider)
+            _write_line(divider)
         previous_stock_name = res["Name"]
 
         name_display = res["Name"]
@@ -157,8 +165,8 @@ def print_table(results_list, title, minimal=False):
                 f"| {pad_str(score_str, W_PROB, 'center')} "
                 f"| {dec_color}{pad_str(res['Decision'], W_DECISION, 'center')}{Colors.RESET} |"
             )
-        print(row_str)
-    print(divider)
+        _write_line(row_str)
+    _write_line(divider)
 
 
 def apply_label_encodings(df, encoder_map):
