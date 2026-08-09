@@ -18,10 +18,12 @@ This document defines testing directives focusing on observable behavior, interf
 
 ---
 
-## 2. Test Execution & Database Strategy
+## 2. Test Execution, Database & Performance Strategy
 - **Realistic Engine Testing:** Use the production database engine (or test containers matching production SQL dialects) when SQL dialect behavior or query optimization matters.
 - **Mocking Boundaries:** Limit mocking to external network boundaries, third-party APIs, clock interfaces, and hardware I/O.
 - **Stable Semantics over String Matching:** Verify exception types and key semantic phrases rather than relying on brittle, full string error message matching.
+- **Heavy Computation Categorization (`@pytest.mark.slow`):** Any test executing multi-year backtests, block-bootstrapping (>100 iterations), or Monte Carlo simulations (>1000 draws) MUST be decorated with `@pytest.mark.slow` to keep default `uv run pytest` runs fast (<1s per test file).
+- **Fast Test Profiles for Heavy Algorithms:** In unit and integration test fixtures, use lightweight fast profiles (e.g., reduced bootstrap/draw counts or stubbed data loaders) to verify contract wiring without sacrificing suite execution speed.
 
 ---
 
