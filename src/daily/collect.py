@@ -147,6 +147,16 @@ async def fetch_single_stock(
         except:
             price, rate = 0, 0.0
 
+        open_price = 0
+        high_price = 0
+        low_price = 0
+        close_price = price
+        prev_close_price = price
+        vol_acml = 0
+        market_name = ""
+        mkt_cap_eok = 0.0
+        trade_amt_eok = 0.0
+
         # KisApiClient를 사용하여 비동기로 여러 API 동시 호출
         res_detail, res_strength, res_investor, res_program = await asyncio.gather(
             client.get_current_price(session, code),
