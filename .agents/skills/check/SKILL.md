@@ -13,7 +13,7 @@ Independent audit gate completing the main development loop (`spec` -> `implemen
    - Inspect modified files using `git status` or `git diff --name-only`.
 
 2. **Standard Audit Execution**:
-   - Run token-efficient audit runner (auto-detects modified `.py` files and `docs/specs/*_contract.json` via git/filesystem):
+   - Run Smart Selective Verification runner (auto-detects modified `.py` files, calculates Impact Level 1~3, and runs targeted tests/static checks synchronously in seconds):
      ```bash
      uv run python tools/agent_skills/lean_check.py
      ```
