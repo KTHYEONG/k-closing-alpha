@@ -2,7 +2,6 @@ import datetime
 import json
 import logging
 import os
-import re
 import sys
 import time
 from typing import Any
@@ -15,34 +14,17 @@ logger = logging.getLogger(__name__)
 # DB 및 시트 관련 임포트
 from src.data.db_loader import load_theme_from_db
 from src.data.sync_sheet_db import sync_theme_only
-from src.ml.model_pipeline import (  # noqa: F401  (Purged Walk-Forward CV 학습 파이프라인 진입점)
-    _calibrate_oof_policy,
-    run_model_pipeline,
-)
-from src.ml.single_stock_policy import (
+from src.processing.schema import normalize_column_names
+from src.serving.realtime.artifacts import load_model_bundle
+from src.serving.realtime.features import build_snapshot_features
+from src.serving.realtime.inference import predict_daily_sizing
+from src.serving.realtime.policy import (
     REASON_MISSING_POLICY,
-    SingleStockPolicy,
     abstain_decision,
+    load_single_stock_policy,
     select_single_daily_trade,
 )
-from src.ml.sizing_engine import (
-    _CLOSE_MORNING_RERANKER_CONFIG,
-    _train_inline_bundle,
-    load_model_artifacts,
-    predict_daily_position_sizing,
-    save_model_artifacts,
-)
-from src.processing.preprocessor import (  # noqa: F401  (파퀘 기반 학습 파이프라인 진입점)
-    _ROBUST_Z_COLUMNS,
-    _apply_robust_z,
-    build_ml_dataset,
-    clean_column_names,
-    engineer_features,
-)
-from src.processing.schema import normalize_column_names
 from src.utils.display import Colors, print_table
-
-# run_model_pipeline(df, feature_cols, target_col, group_col)
 
 # SHAP (모델 해석용) - 필요 시 설치: pip install shap
 try:
@@ -217,51 +199,11 @@ def explain_predictions_with_shap(model, X_final, stock_names, top_n=3):
 
 
 # =========================================================
-# 3. 메인 실행 함수 (Fast Inference + Dynamic Sizing)
-# =========================================================
-
-
-# =========================================================
 # 2. 표준 ML 피처 스키마 정합성 + 출력 포맷 헬퍼
 # =========================================================
 
 # 출력 테이블 기본 상위 후보 수 (Top N)
 _DEFAULT_TOP_N = 15
-
-
-def apply_standard_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
-    """당일 스냅샷을 학습 파이프라인과 1:1 동일한 표준 ML 피처 스키마로 정규화합니다.
-
-    ``normalize_column_names`` 단일 정규화로 일일 CSV 의 한글/괄호 헤더를 표준
-    영문 컬럼으로 변환한 뒤 ``engineer_features`` / ``_apply_robust_z`` 를
-    적용합니다. 당일 스냅샷에는 존재하지 않는 ``trade_date``(오늘)를 보강합니다.
-    ``buy_price`` 가 없으면 이전 종가 중립값 대신 유한 양수 ``close_price`` 로
-    대체합니다(학습 대비 서빙 피처 정합성). 명시적으로 공급된 ``buy_price`` 는
-    변경하지 않습니다. 표시용 메타데이터(``종목명`` 등)는 보존합니다.
-    """
-    work = df.copy()
-    work = normalize_column_names(work)
-    if "trade_date" not in work.columns:
-        work["trade_date"] = pd.Timestamp.today().normalize()
-    if "buy_price" not in work.columns:
-        if "close_price" not in work.columns:
-            raise ValueError(
-                "buy_price is absent and close_price is missing; cannot derive buy_price"
-            )
-        close_price = pd.to_numeric(work["close_price"], errors="coerce")
-        if close_price.isna().any() or not np.isfinite(close_price.to_numpy(dtype=np.float64)).all():
-            raise ValueError(
-                "buy_price is absent and close_price is non-finite; cannot derive buy_price"
-            )
-        if (close_price <= 0.0).any():
-            raise ValueError(
-                "buy_price is absent and close_price is non-positive; cannot derive buy_price"
-            )
-        work["buy_price"] = close_price
-    work = engineer_features(work)
-    # 학습 파이프라인(build_ml_dataset)과 1:1 동일한 횡단면 Robust Z-Score
-    # 피처(change_rate_z, major_density_z 등)를 생성합니다.
-    return _apply_robust_z(work, _ROBUST_Z_COLUMNS)
 
 
 def build_result_rows(sizing_df: pd.DataFrame) -> list[dict[str, Any]]:
@@ -301,194 +243,6 @@ def select_top_actionable(
     if not actionable and results:
         return sorted(results, key=lambda r: r["Score"], reverse=True)[:top_n]
     return sorted(actionable, key=lambda r: r["Score"], reverse=True)[:top_n]
-
-
-def run_daily_sizing_inference(
-    df: pd.DataFrame,
-    models_bundle: dict[str, Any],
-    feature_cols: list[str] | None = None,
-    group_col: str = "date",
-) -> pd.DataFrame:
-    """저장된 모델 아티팩트로 당일 스냅샷에 Fast Inference + Dynamic Sizing 을 수행합니다.
-
-    모델 학습 시 사용된 ``feature_cols`` 를 기준으로 누락 컬럼을 0 으로 채우고,
-    ``group_col`` 이 없으면 오늘 날짜로 단일 그룹을 구성하여
-    ``predict_daily_position_sizing`` 을 호출합니다.
-    """
-    if feature_cols is None:
-        feature_cols = list(models_bundle.get("feature_cols", []))
-    if not feature_cols:
-        raise ValueError("feature_cols is empty; models_bundle must declare feature_cols")
-
-    work = df.copy()
-    for col in feature_cols:
-        if col not in work.columns:
-            work[col] = 0.0
-    if group_col not in work.columns:
-        work[group_col] = str(datetime.date.today())
-
-    return predict_daily_position_sizing(
-        work,
-        feature_cols,
-        group_col=group_col,
-        models_bundle=models_bundle,
-    )
-
-
-def _load_single_stock_policy(models_bundle: dict[str, Any]) -> SingleStockPolicy | None:
-    """모델 번들에 영속화된 ``SingleStockPolicy`` 상태를 반환합니다.
-
-    유효한 정책 상태가 없으면 ``None`` 을 반환하며, 호출부가 조용한 Top-N 폴백
-    대신 명시적 ``ABSTAIN``(``missing_validated_policy``)을 산출하게 합니다.
-    """
-    raw = models_bundle.get("single_stock_policy")
-    if raw is None:
-        return None
-    if isinstance(raw, SingleStockPolicy):
-        return raw
-    if isinstance(raw, dict):
-        return SingleStockPolicy(**raw)
-    logger.info(
-        f"{Colors.YELLOW}[Warning] 인식할 수 없는 single_stock_policy 상태입니다. "
-        f"ABSTAIN(missing_validated_policy) 으로 결정합니다.{Colors.RESET}"
-    )
-    return None
-
-
-# 모델 번들 검증 상수: 단위 테스트 픽스처가 생성하는 더미 피처 패턴 및
-# 실데이터 학습 번들이 반드시 포함해야 하는 모델 키 목록.
-_DUMMY_FEATURE_PATTERN = re.compile(r"^f\d+$")
-_MODEL_BUNDLE_KEYS = ("rank_model", "quantile_models", "calibrators")
-
-# research 후보 피처셋: 활성 아티팩트와 분리된 버전화 하위 디렉터리에 저장합니다.
-# 검증된 champion close_morning61 이 기본 후보이며, 승격 전까지 활성 아티팩트를
-# 덮어쓰지 않도록 cutoff 로 버전화된 후보 경로를 사용합니다.
-_CANDIDATE_FEATURE_SET = "close_morning61"
-
-
-def _candidate_export_dir(
-    export_dir: str, feature_set: str, bundle: dict[str, Any]
-) -> str:
-    """후보 피처셋 번들은 버전화된 하위 디렉터리에 저장할 경로를 반환합니다.
-
-    활성 아티팩트는 ``export_dir`` 루트의 ``sizing_pipeline_bundle.joblib`` 이므로,
-    후보(``close_morning61``)는 훈련 데이터 cutoff 날짜(YYYY-MM-DD)로 버전화된
-    별도 디렉터리에 기록해 활성 아티팩트를 덮어쓰지 않습니다. 다른
-    feature_set(활성 아티팩트 재학습)은 기존대로 루트 경로를 반환합니다.
-    """
-    if feature_set != _CANDIDATE_FEATURE_SET:
-        return export_dir
-    version = str(bundle.get("training_cutoff", ""))[:10] or "candidate"
-    return os.path.join(export_dir, f"{_CANDIDATE_FEATURE_SET}_{version}")
-
-
-def _is_dummy_feature_cols(feature_cols: list[str]) -> bool:
-    """더미 테스트 피처(예: ['f1', 'f2', 'f3']) 여부를 결정적으로 판별합니다."""
-    return any(_DUMMY_FEATURE_PATTERN.match(col) for col in feature_cols)
-
-
-def _is_valid_real_bundle(models_bundle: dict[str, Any]) -> bool:
-    """저장된 번들이 실데이터 학습 산출물인지 검증합니다.
-
-    실데이터 번들은 비어있지 않은 수치 피처 목록과 rank/quantile/calibrator
-    모델 키를 모두 포함해야 합니다. 더미 피처만으로 구성된 번들은 무효로
-    간주합니다.
-    """
-    feature_cols = list(models_bundle.get("feature_cols", []))
-    if not feature_cols or _is_dummy_feature_cols(feature_cols):
-        return False
-    return all(key in models_bundle for key in _MODEL_BUNDLE_KEYS)
-
-
-def train_and_save_real_model_bundle(
-    export_dir: str = "artifacts/models",
-    trade_log_path: str | os.PathLike[str] | None = None,
-    theme_path: str | os.PathLike[str] | None = None,
-    feature_set: str = "close_morning61",
-    panel_mode: str = "scenario_action",
-) -> dict[str, Any]:
-    """``trade_log.parquet`` 실데이터로 표준 ML 번들을 학습·저장한 뒤 반환합니다.
-
-    기본값은 검증된 champion ``close_morning61`` 피처셋 + ``scenario_action``
-    패널 모드입니다. 훈련 절차:
-
-    1. ``build_ml_dataset`` 로 ``close_morning61`` 시나리오 행동 패널을 구성합니다.
-    2. ``run_model_pipeline`` 으로 동일 수치 피처 + 행동 메타데이터로 purged OOF
-       예측과 ``SingleStockPolicy`` 를 생성합니다.
-    3. ``_train_inline_bundle`` 로 전체 이력 최종 추론 모델을 학습합니다.
-    4. ``single_stock_policy.model_dump()`` 와 함께 보정 cutoff, 정책 버전,
-       피처셋 이름, compact OOF 정책 지표를 번들에 영속화합니다.
-       ``close_morning61 + scenario_action`` 은 reranker 결정 스코어
-       (``decision_score``) OOF 정책을 사용하며 ``oof_score_col`` 와
-       ``daily_score_col`` 모두 ``"decision_score"`` 로 기록하고
-       ``decision_score_config`` 를 영속화합니다. 그 외 번들은 기존
-       ``pred``/``rank_score`` 매핑을 유지합니다.
-    5. 버전화된 후보 아티팩트만 저장하며 활성 아티팩트를 자동으로 대체하지
-       않습니다. 정책 상태가 없으면 ``ABSTAIN(missing_validated_policy)`` 로
-       명시 처리되고 Top-N 폴백은 없습니다.
-
-    ``build_ml_dataset`` 산출 feature_cols 에서 범주형 문자열 컬럼
-    (``market_type``, ``theme_sector``, ``chart_analysis``)을 제외한 수치
-    피처만 LightGBM 학습에 사용해 Booster 구성 오류를 방지합니다.
-    """
-    trade_log_path = str(trade_log_path or settings.TRADE_LOG_PARQUET_PATH)
-    theme_path = str(theme_path or settings.THEME_PARQUET_PATH)
-    trade_log_df = pd.read_parquet(trade_log_path)
-    theme_df = pd.read_parquet(theme_path) if os.path.exists(theme_path) else None
-    X, targets, cat_features, processed = build_ml_dataset(
-        trade_log_df, theme_df, feature_set=feature_set, panel_mode=panel_mode
-    )
-    feature_cols = [col for col in X.columns if col not in cat_features]
-    target_col = "target_return"
-    group_col = "trade_date"
-    reranker = feature_set == "close_morning61" and panel_mode == "scenario_action"
-    policy, policy_metadata = _calibrate_oof_policy(
-        processed,
-        feature_cols,
-        target_col,
-        group_col,
-        n_splits=5,
-        purge_gap=1,
-        reranker=reranker,
-    )
-    bundle = _train_inline_bundle(
-        processed[[*feature_cols, target_col, group_col]],
-        feature_cols,
-        target_col,
-        group_col,
-    )
-    bundle["feature_set"] = feature_set
-    bundle["panel_mode"] = panel_mode
-    bundle["single_stock_policy"] = policy.model_dump() if policy is not None else None
-    bundle["policy_metadata"] = policy_metadata
-    if reranker:
-        bundle["decision_score_config"] = dict(_CLOSE_MORNING_RERANKER_CONFIG)
-        bundle["oof_score_col"] = "decision_score"
-        bundle["daily_score_col"] = "decision_score"
-    else:
-        bundle["oof_score_col"] = "pred"
-        bundle["daily_score_col"] = "rank_score"
-    save_dir = _candidate_export_dir(export_dir, feature_set, bundle)
-    save_model_artifacts(bundle, save_dir)
-    logger.info(
-        f"{Colors.GREEN}실데이터 모델 번들 재학습·저장 완료: "
-        f"feature_set={feature_set} panel_mode={panel_mode} "
-        f"feature_cols={len(feature_cols)}개 "
-        f"policy={'serialized' if policy is not None else 'absent(ABSTAIN)'} "
-        f"(save_dir={save_dir}){Colors.RESET}"
-    )
-    return bundle
-
-
-def ensure_valid_model_bundle(models_bundle: dict[str, Any]) -> dict[str, Any]:
-    """더미/무효 모델 번들을 감지하면 실데이터로 재학습한 번들로 대체합니다."""
-    if _is_valid_real_bundle(models_bundle):
-        return models_bundle
-    logger.info(
-        f"{Colors.YELLOW}[Warning] 모델 번들이 더미 테스트 피처이거나 무효합니다. "
-        f"trade_log.parquet 로 실데이터 재학습을 시작합니다.{Colors.RESET}"
-    )
-    return train_and_save_real_model_bundle()
 
 
 def main():
@@ -611,34 +365,27 @@ def main():
     if "change_rate" in df_all.columns:
         df_all.loc[sangdda_mask, "change_rate"] = 29.9
 
-    df_all = apply_standard_feature_engineering(df_all)
+    decision_date = pd.Timestamp.today().normalize()
+    df_all = build_snapshot_features(df_all, decision_date=decision_date)
 
     # 5. Fast Inference & Dynamic Sizing (저장된 모델 아티팩트 로드)
     # 레거시 GMM/Static 판단 로직은 제거되고, artifacts/models/ 의 모델 번들을
     # 로드하여 Utility Score 기반 Sizing Grade(Strong/Good/Weak/Pass) 및 배분을 산출합니다.
     try:
-        models_bundle = load_model_artifacts()
-    except FileNotFoundError as exc:
+        models_bundle = load_model_bundle()
+    except (FileNotFoundError, ValueError) as exc:
         logger.info(
-            f"{Colors.YELLOW}[Warning] 모델 아티팩트가 없어 예측을 건너뜁니다: {exc}{Colors.RESET}"
-        )
-        logger.info(
-            f"{Colors.CYAN}[Guide] 먼저 run_sizing_pipeline(export_dir=...) 로 학습 후 "
-            "save_model_artifacts() 를 실행해 artifacts/models/ 에 저장하세요.{Colors.RESET}"
+            f"{Colors.YELLOW}[Warning] 모델 아티팩트 로드/검증 실패로 예측을 건너뜁니다: {exc}{Colors.RESET}"
         )
         return
-
-    # 모델 번들 검증: 더미 테스트 피처('f1'/'f2'/'f3') 또는 무효 번들이면
-    # trade_log.parquet 실데이터로 자동 재학습합니다.
-    models_bundle = ensure_valid_model_bundle(models_bundle)
 
     start = time.perf_counter()
     df_normal = df_all[~df_all["Scenario_Base"].str.contains("상따", na=False)].copy()
     df_sangdda = df_all[df_all["Scenario_Base"].str.contains("상따", na=False)].copy()
 
-    normal_sizing = run_daily_sizing_inference(df_normal, models_bundle)
+    normal_sizing = predict_daily_sizing(df_normal, models_bundle)
     sangdda_sizing = (
-        run_daily_sizing_inference(df_sangdda, models_bundle)
+        predict_daily_sizing(df_sangdda, models_bundle)
         if not df_sangdda.empty
         else pd.DataFrame()
     )
@@ -674,7 +421,7 @@ def main():
         if not sangdda_sizing.empty
         else normal_sizing
     )
-    policy = _load_single_stock_policy(models_bundle)
+    policy = load_single_stock_policy(models_bundle)
     if policy is None:
         single_decision = abstain_decision(
             REASON_MISSING_POLICY,
