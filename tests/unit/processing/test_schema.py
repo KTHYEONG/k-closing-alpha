@@ -80,9 +80,15 @@ def test_legacy_mapping_file_removal() -> None:
     legacy_path = Path("src/processing/legacy_mapping.py")
     assert not legacy_path.exists()
 
-    preprocessor_src = Path("src/processing/preprocessor.py").read_text(encoding="utf-8")
-    assert "legacy_mapping" not in preprocessor_src
-    assert "from src.processing.schema import RAW_TO_STANDARD_MAP" in preprocessor_src
+    # 실시간 피처 프레임은 normalize_column_names 를 schema 로부터 참조합니다.
+    features_src = Path("src/serving/realtime/features.py").read_text(encoding="utf-8")
+    assert "legacy_mapping" not in features_src
+    assert "from src.processing.schema import normalize_column_names" in features_src
+
+    # 아카이브 데이터셋 빌더는 RAW_TO_STANDARD_MAP 을 schema 로부터 참조합니다.
+    dataset_src = Path("legacy/ml_research/features/dataset.py").read_text(encoding="utf-8")
+    assert "legacy_mapping" not in dataset_src
+    assert "from src.processing.schema import RAW_TO_STANDARD_MAP" in dataset_src
 
     fix_scale_src = Path("src/backfill/fix_scale.py").read_text(encoding="utf-8")
     assert "legacy_mapping" not in fix_scale_src
