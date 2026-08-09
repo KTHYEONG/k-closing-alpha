@@ -24,6 +24,8 @@ dependencies = [
     "setuptools>=69.0.0,<82",
     "scikit-learn>=1.5.0",
     "lightgbm>=4.3.0",
+    "xgboost>=2.1.0",
+    "catboost>=1.2.0",
     "huggingface-hub>=1.26.0",
 ]
 
@@ -90,6 +92,7 @@ ignore = [
 "src/settings.py" = ["N802", "N803"]
 "src/config/*.py" = ["N802", "N803"]
 "src/api/kis_client.py" = ["T20", "ASYNC230", "ASYNC240", "S110", "SIM108", "B006"]
+"src/api/kis/*.py" = ["T20", "ASYNC230", "ASYNC240", "S110", "SIM108", "B006"]
 "src/backfill/*.py" = ["T20", "E402", "N806", "B007", "B905", "S112", "RUF009", "E701", "S110", "RUF059", "RUF015", "B008", "RUF046", "SIM105", "SIM108"]
 "src/daily/*.py" = ["T20", "S608", "E402", "N806", "B007", "B905", "S112", "SIM102", "RUF001", "RUF046", "RUF059", "S110", "ASYNC230", "ASYNC240", "E722", "N803", "SIM108"]
 "src/sync/*.py" = ["T20", "ASYNC240", "ASYNC251", "N806", "B007", "B905", "B023", "S112"]

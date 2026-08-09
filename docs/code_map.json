@@ -1,6 +1,26 @@
 {
+  "src/api/kis/client.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/api/kis/indicators.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
+  "src/api/kis/rate_limit.py": {
+    "testing": "tests/unit/test_facade_imports.py"
+  },
   "src/api/kis_client.py": {
-    "testing": "tests/unit/api/test_kis_client.py"
+    "testing": [
+      "tests/unit/api/kis/test_kis_client.py",
+      "tests/unit/api/kis/test_kis_client_helpers.py",
+      "tests/unit/api/kis/test_kis_rate_limiter.py",
+      "tests/unit/api/kis/test_ohlcv_prefetch.py"
+    ]
+  },
+  "src/backfill/backfill_condition_history.py": {
+    "testing": "tests/unit/backfill/test_backfill_condition_history.py"
+  },
+  "src/backfill/backfill_price.py": {
+    "testing": "tests/unit/test_facade_imports.py"
   },
   "src/backfill/backfill_condition_history.py": {
     "testing": "tests/unit/backfill/test_backfill_condition_history.py"
@@ -65,15 +85,18 @@
     "testing": "tests/unit/processing/test_schema.py"
   },
   "src/settings.py": {
-    "testing": "tests/unit/test_settings.py"
+    "testing": [
+      "tests/unit/config/test_settings_compat.py",
+      "tests/unit/data/test_parquet_loader.py"
+    ]
   },
   "src/sync/fetcher_investor.py": {},
   "src/sync/fetcher_program.py": {},
   "src/sync/foreign.py": {
-    "testing": "tests/integration/test_sync_pipeline.py"
+    "testing": "tests/integration/sync/test_sync_pipeline.py"
   },
   "src/sync/program.py": {
-    "testing": "tests/integration/test_sync_pipeline.py"
+    "testing": "tests/integration/sync/test_sync_pipeline.py"
   },
   "src/sync/sheet_helpers.py": {},
   "src/sync/vmarket.py": {},
