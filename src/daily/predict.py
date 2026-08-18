@@ -364,6 +364,16 @@ def main():
     sangdda_mask = df_all["Scenario_Base"].str.contains("상따", na=False)
     if "change_rate" in df_all.columns:
         df_all.loc[sangdda_mask, "change_rate"] = 29.9
+    if "prev_close_price" in df_all.columns:
+        limit_up_price = np.round(df_all.loc[sangdda_mask, "prev_close_price"] * 1.299)
+        if "close_price" in df_all.columns:
+            df_all.loc[sangdda_mask, "close_price"] = limit_up_price
+        if "buy_price" in df_all.columns:
+            df_all.loc[sangdda_mask, "buy_price"] = limit_up_price
+        if "high_price" in df_all.columns:
+            df_all.loc[sangdda_mask, "high_price"] = np.maximum(
+                df_all.loc[sangdda_mask, "high_price"], limit_up_price
+            )
 
     decision_date = pd.Timestamp.today().normalize()
     df_all = build_snapshot_features(df_all, decision_date=decision_date)

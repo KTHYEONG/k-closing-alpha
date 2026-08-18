@@ -66,6 +66,33 @@ _PRODUCTION_FLOW_SOURCE_COLUMNS: tuple[str, ...] = (
     "prog_dominance",
 )
 
+SCENARIO_ONE_HOT_FEATURES: tuple[str, ...] = (
+    "scenario_is_sangtta",
+    "scenario_is_120_breakout",
+    "scenario_is_volume_surge",
+    "scenario_is_new_high",
+    "scenario_is_near_new_high",
+    "scenario_is_limitup_next_day",
+    "scenario_is_rising_bearish",
+    "scenario_other",
+)
+
+SCENARIO_CONTEXT_FEATURES: tuple[str, ...] = (
+    "scenario_count_for_stock_date",
+    "has_sangtta_for_stock_date",
+    "is_multi_scenario_stock_date",
+)
+
+_SCENARIO_NAME_TO_FEATURE: dict[str, str] = {
+    "상따": "scenario_is_sangtta",
+    "120 돌파": "scenario_is_120_breakout",
+    "거래량 폭증": "scenario_is_volume_surge",
+    "신고가": "scenario_is_new_high",
+    "신고가 근접": "scenario_is_near_new_high",
+    "상한가 다음날": "scenario_is_limitup_next_day",
+    "상승형 음봉": "scenario_is_rising_bearish",
+}
+
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """로그 스케일링, 상대 비율, 횡단면 백분위/robust-z 피처를 생성합니다."""
@@ -195,6 +222,42 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_scenario_features(
+    df: pd.DataFrame,
+    scenario_col: str = "chart_analysis",
+    stock_col: str = "stock_code",
+    date_col: str = "trade_date",
+) -> pd.DataFrame:
+    """고정 8종 시나리오 one-hot 및 3종 날짜-종목 context 수치 피처를 벡터 연산으로 생성합니다."""
+    df = df.copy()
+
+    for feat in SCENARIO_ONE_HOT_FEATURES:
+        df[feat] = 0.0
+
+    scenario_str = df[scenario_col].fillna("").astype(str)
+    for name, feat in _SCENARIO_NAME_TO_FEATURE.items():
+        df.loc[scenario_str == name, feat] = 1.0
+
+    is_known = scenario_str.map(lambda s: s in _SCENARIO_NAME_TO_FEATURE)
+    df.loc[~is_known, "scenario_other"] = 1.0
+
+    group_key = [date_col, stock_col]
+    group_sizes = df.groupby(group_key)[scenario_col].transform("count")
+    df["scenario_count_for_stock_date"] = group_sizes.astype("float64")
+
+    has_sangtta = (
+        scenario_str.eq("상따")
+        .groupby(df[group_key].apply(tuple, axis=1))
+        .transform("any")
+        .astype("float64")
+    )
+    df["has_sangtta_for_stock_date"] = has_sangtta.to_numpy()
+
+    df["is_multi_scenario_stock_date"] = (group_sizes > 1).astype("float64")
+
+    return df
+
+
 def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
     """횡단면 Robust Z-Score((x - median) / MAD)를 생성하고 [-5, 5]로 클리핑합니다.
 
@@ -250,4 +313,6 @@ def build_snapshot_features(
             )
         work["buy_price"] = close_price
     work = engineer_features(work)
-    return _apply_robust_z(work, _ROBUST_Z_COLUMNS)
+    work = _apply_robust_z(work, _ROBUST_Z_COLUMNS)
+    work = add_scenario_features(work)
+    return work

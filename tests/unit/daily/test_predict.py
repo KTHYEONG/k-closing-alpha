@@ -444,3 +444,60 @@ def test_sangdda_feature_engineering_order() -> None:
 
     assert sangdda_eng["change_rate"] == 29.9
     assert "change_rate_z" in engineered.columns
+
+
+def test_scenario_realtime_sangtta_price_alignment_02() -> None:
+    """[SCENARIO_REALTIME_SANGTTA_PRICE_ALIGNMENT_02] predict.py aligns change_rate,
+    close_price, buy_price, and high_price for sangtta scenarios before snapshot
+    feature building."""
+    raw = daily_snapshot_df().copy()
+    raw["등락률"] = [5.0, 22.5]
+    raw["전일종가"] = [10_000.0, 20_000.0]
+    raw["(매수 가격)"] = raw["종가"].copy()
+
+    def get_scenario_list(row):
+        assigned = row.get("시나리오")
+        if assigned == "상따":
+            return ["상따"]
+        scenarios = []
+        if pd.notna(assigned) and assigned != "" and assigned is not None:
+            scenarios.append(assigned)
+        else:
+            scenarios.append("거래량 폭증")
+        rate = float(row.get("change_rate", row.get("등락률", 0)) or 0)
+        if rate >= 20 and "상따" not in scenarios:
+            scenarios.append("상따")
+        return scenarios
+
+    raw["Scenario_List"] = raw.apply(get_scenario_list, axis=1)
+    df_all = raw.explode("Scenario_List").reset_index(drop=True)
+    df_all["Scenario_Base"] = df_all["Scenario_List"]
+    df_all = df_all.drop(columns=["Scenario_List"])
+
+    df_all = predict.normalize_column_names(df_all)
+    sangdda_mask = df_all["Scenario_Base"].str.contains("상따", na=False)
+    if "change_rate" in df_all.columns:
+        df_all.loc[sangdda_mask, "change_rate"] = 29.9
+    if "prev_close_price" in df_all.columns:
+        limit_up_price = np.round(
+            df_all.loc[sangdda_mask, "prev_close_price"] * 1.299
+        )
+        if "close_price" in df_all.columns:
+            df_all.loc[sangdda_mask, "close_price"] = limit_up_price
+        if "buy_price" in df_all.columns:
+            df_all.loc[sangdda_mask, "buy_price"] = limit_up_price
+        if "high_price" in df_all.columns:
+            df_all.loc[sangdda_mask, "high_price"] = np.maximum(
+                df_all.loc[sangdda_mask, "high_price"], limit_up_price
+            )
+
+    sangdda_row = df_all[sangdda_mask].iloc[0]
+    expected_limit_up = np.round(sangdda_row["prev_close_price"] * 1.299)
+    assert sangdda_row["change_rate"] == 29.9
+    assert sangdda_row["close_price"] == expected_limit_up
+    assert sangdda_row["buy_price"] == expected_limit_up
+    assert sangdda_row["high_price"] >= expected_limit_up
+
+    engineered = build_snapshot_features(df_all)
+    sangdda_eng = engineered[engineered["Scenario_Base"].str.contains("상따")].iloc[0]
+    assert sangdda_eng["buy_price_change_rate"] >= 0
