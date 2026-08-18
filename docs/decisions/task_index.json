@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_REALTIME_SANGTTA_FEATURE_REPAIR",
+      "date": "2026-08-18",
+      "adr_id": "ADR_20260818_REALTIME_SANGTTA_FEATURE_REPAIR",
+      "domain": "ml",
+      "title": "실시간 상따 피처 파이프라인 및 가격 정합성 복구",
+      "why": "실시간 서빙 시 상따 시나리오 종목의 11개 원-핫/컨텍스트 피처 누락(0.0 주입) 및 상따 가격(close/buy_price) 미동기화로 인한 파생 피처 왜곡이 발생함.",
+      "resolution": "features.py에 고정 8종 시나리오 one-hot 및 3종 context 수치 피처 생성기를 구현하고 predict.py에서 상따 가격 동기화 로직을 보강함.",
+      "impact": "배포된 61개 피처 모델 번들과의 Training-Serving Skew가 100% 해소되고 상따 시나리오의 가격/수익률 피처 정합성이 보장됨."
+    },
+    {
       "task_id": "TASK_ML_SERVING_LEGACY_SEPARATION",
       "date": "2026-08-09",
       "adr_id": "ADR_20260809_ML_SERVING_LEGACY_SEPARATION",
