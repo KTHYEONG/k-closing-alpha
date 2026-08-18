@@ -7,6 +7,7 @@ import functools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -269,7 +270,7 @@ def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
 def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
     diagnostics: list[JsonDiag] = []
     try:
-        with open(spec_path) as f:
+        with open(spec_path, encoding="utf-8") as f:
             contract = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError) as e:
         return (
@@ -388,7 +389,7 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
         found = False
         ref_pattern = re.compile(rf"\b{re.escape(reference)}\b")
         if target_test_file and os.path.exists(target_test_file):
-            with open(target_test_file) as tf:
+            with open(target_test_file, encoding="utf-8", errors="ignore") as tf:
                 content = tf.read()
             found = bool(ref_pattern.search(content)) or bool(
                 re.search(
@@ -455,7 +456,7 @@ def _check_spec_compliance(spec_path: str) -> tuple[int, list[JsonDiag]]:
                     }
                 )
             continue
-        with open(wf) as f:
+        with open(wf, encoding="utf-8", errors="ignore") as f:
             wf_content = f.read()
             if anchor:
                 found_anchor = anchor in wf_content or any(
@@ -575,9 +576,6 @@ def main() -> None:
         "--deselect", nargs="*", default=[], help="Pytest node ids to deselect"
     )
     parser.add_argument(
-        "--pytest-timeout", type=int, default=None, help="Seconds for pytest step"
-    )
-    parser.add_argument(
         "--pytest-timeout",
         type=int,
         default=None,
@@ -692,7 +690,8 @@ def main() -> None:
 
     # 3. Ruff
     if not args.skip_lint and py_files:
-        ruff_res = run_cmd(["uv", "run", "ruff", "check", *py_files, "--quiet"])
+        ruff_bin = shutil.which("ruff") or "ruff"
+        ruff_res = run_cmd([ruff_bin, "check", *py_files, "--quiet"])
         if ruff_res.returncode != 0:
             out_sliced = "\n".join(
                 (ruff_res.stdout or ruff_res.stderr).strip().splitlines()[:10]
@@ -707,7 +706,7 @@ def main() -> None:
 
     # 4. Mypy
     if not args.skip_mypy and py_files:
-        mypy_res = run_cmd(["uv", "run", "mypy", *py_files, "--ignore-missing-imports"])
+        mypy_res = run_cmd([sys.executable, "-m", "mypy", *py_files, "--ignore-missing-imports"])
         if mypy_res.returncode != 0:
             out_sliced = "\n".join(
                 (mypy_res.stdout or mypy_res.stderr).strip().splitlines()[:10]
@@ -733,8 +732,8 @@ def main() -> None:
 
     deselect_args = [f"--deselect={node}" for node in args.deselect]
     core_cmd = [
-        "uv",
-        "run",
+        sys.executable,
+        "-m",
         "pytest",
         "-m",
         "not slow",
