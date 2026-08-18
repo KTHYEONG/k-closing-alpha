@@ -19,12 +19,6 @@
   "src/backfill/backfill_condition_history.py": {
     "testing": "tests/unit/backfill/test_backfill_condition_history.py"
   },
-  "src/backfill/backfill_price.py": {
-    "testing": "tests/unit/test_facade_imports.py"
-  },
-  "src/backfill/backfill_condition_history.py": {
-    "testing": "tests/unit/backfill/test_backfill_condition_history.py"
-  },
   "src/backfill/backfill_price.py": {},
   "src/backfill/backfill_regime.py": {},
   "src/backfill/backfill_sheet.py": {},
