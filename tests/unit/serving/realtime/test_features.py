@@ -9,6 +9,7 @@ import pytest
 from src.serving.realtime.features import (
     _ROBUST_Z_COLUMNS,
     _apply_robust_z,
+    add_scenario_features,
     build_snapshot_features,
     engineer_features,
 )
@@ -133,3 +134,70 @@ def test_apply_robust_z_bounds() -> None:
         vals = out[z_col].dropna()
         assert vals.between(-5, 5).all()
     assert out["change_rate_z"].notna().sum() > 0
+
+
+def test_scenario_realtime_sangtta_feature_repair_01() -> None:
+    """[SCENARIO_REALTIME_SANGTTA_FEATURE_REPAIR_01] build_snapshot_features generates
+    all 11 scenario one-hot and context features accurately matching the active
+    61-feature model bundle."""
+    expected_one_hot = [
+        "scenario_is_sangtta",
+        "scenario_is_120_breakout",
+        "scenario_is_volume_surge",
+        "scenario_is_new_high",
+        "scenario_is_near_new_high",
+        "scenario_is_limitup_next_day",
+        "scenario_is_rising_bearish",
+        "scenario_other",
+    ]
+    expected_context = [
+        "scenario_count_for_stock_date",
+        "has_sangtta_for_stock_date",
+        "is_multi_scenario_stock_date",
+    ]
+    out = build_snapshot_features(
+        daily_snapshot_df(), decision_date=pd.Timestamp("2026-08-04")
+    )
+    for col in expected_one_hot + expected_context:
+        assert col in out.columns, f"Missing scenario feature: {col}"
+
+    sangtta_row = out[out["chart_analysis"] == "상따"].iloc[0]
+    assert sangtta_row["scenario_is_sangtta"] == 1.0
+    assert sangtta_row["has_sangtta_for_stock_date"] == 1.0
+
+
+def test_add_scenario_features_generates_one_hot_and_context() -> None:
+    """add_scenario_features produces 8 one-hot + 3 context features."""
+    df = pd.DataFrame(
+        {
+            "chart_analysis": ["상따", "거래량 폭증", "상따"],
+            "stock_code": ["000020", "000020", "000030"],
+            "trade_date": ["2026-08-04", "2026-08-04", "2026-08-04"],
+        }
+    )
+    out = add_scenario_features(df)
+    expected_one_hot = [
+        "scenario_is_sangtta",
+        "scenario_is_120_breakout",
+        "scenario_is_volume_surge",
+        "scenario_is_new_high",
+        "scenario_is_near_new_high",
+        "scenario_is_limitup_next_day",
+        "scenario_is_rising_bearish",
+        "scenario_other",
+    ]
+    expected_context = [
+        "scenario_count_for_stock_date",
+        "has_sangtta_for_stock_date",
+        "is_multi_scenario_stock_date",
+    ]
+    for col in expected_one_hot + expected_context:
+        assert col in out.columns
+
+    # Row 0: 상따 → scenario_is_sangtta=1
+    assert out.iloc[0]["scenario_is_sangtta"] == 1.0
+    # Row 1: 거래량 폭증 → scenario_is_volume_surge=1
+    assert out.iloc[1]["scenario_is_volume_surge"] == 1.0
+    # stock 000020 has 2 scenarios → is_multi_scenario_stock_date=1
+    assert out.iloc[0]["is_multi_scenario_stock_date"] == 1.0
+    assert out.iloc[0]["scenario_count_for_stock_date"] == 2.0
