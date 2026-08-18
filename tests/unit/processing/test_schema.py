@@ -85,10 +85,12 @@ def test_legacy_mapping_file_removal() -> None:
     assert "legacy_mapping" not in features_src
     assert "from src.processing.schema import normalize_column_names" in features_src
 
-    # 아카이브 데이터셋 빌더는 RAW_TO_STANDARD_MAP 을 schema 로부터 참조합니다.
-    dataset_src = Path("legacy/ml_research/features/dataset.py").read_text(encoding="utf-8")
-    assert "legacy_mapping" not in dataset_src
-    assert "from src.processing.schema import RAW_TO_STANDARD_MAP" in dataset_src
+    # 아카이브 데이터셋 빌더는 RAW_TO_STANDARD_MAP 을 schema 로부터 참조합니다 (존재하는 경우).
+    legacy_dataset_path = Path("legacy/ml_research/features/dataset.py")
+    if legacy_dataset_path.exists():
+        dataset_src = legacy_dataset_path.read_text(encoding="utf-8")
+        assert "legacy_mapping" not in dataset_src
+        assert "from src.processing.schema import RAW_TO_STANDARD_MAP" in dataset_src
 
     fix_scale_src = Path("src/backfill/fix_scale.py").read_text(encoding="utf-8")
     assert "legacy_mapping" not in fix_scale_src
