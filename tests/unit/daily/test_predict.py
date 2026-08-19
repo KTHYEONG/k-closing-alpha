@@ -274,81 +274,13 @@ def test_main_runs_redesigned_pipeline_with_mocks() -> None:
     ):
         predict.main()
 
-    assert print_table_mock.call_count == 3
+    assert print_table_mock.call_count == 2
     normal_rows = print_table_mock.call_args_list[0].args[0]
     assert [r["Name"] for r in normal_rows] == ["AAA"]
     assert normal_rows[0]["Decision"] == "Strong (10.0%)"
     sangdda_rows = print_table_mock.call_args_list[1].args[0]
     assert len(sangdda_rows) == 1
     assert sangdda_rows[0]["Name"] == "BBB"
-    decision = print_table_mock.call_args_list[2].args[0]
-    assert len(decision) == 1
-    assert decision.iloc[0]["decision"] == "ABSTAIN"
-    assert decision.iloc[0]["decision_reason"] == "missing_validated_policy"
-
-
-def test_main_single_decision_buys_top_stock_over_merged_sangdda() -> None:
-    """정책 상태가 있는 번들은 normal + sangdda 병합 테이블에서 단일 BUY 를 산출합니다."""
-    policy = always_buy_policy("2026-08-04")
-    sizing_df = pd.DataFrame(
-        {
-            "종목명": ["AAA", "BBB"],
-            "theme_sector": ["테마A", "테마A"],
-            "chart_analysis": ["거래량 폭증", "상따"],
-            "stock_code": ["000001", "000002"],
-            "selection_rank": [1, 2],
-            "change_rate": [5.0, 29.9],
-            "rank_score": [1.0, 0.5],
-            "utility_score": [0.5, 0.4],
-            "grade": ["Strong", "Pass"],
-            "allocation": [0.1, 0.0],
-            "kospi": [0.5, 0.5],
-            "kosdaq": [0.3, 0.3],
-            "date": ["2026-08-04", "2026-08-04"],
-        }
-    )
-
-    async def fake_fetch(_code: str) -> tuple[float, float]:
-        return 15.0, 0.05
-
-    with (
-        patch.object(
-            predict, "load_and_preprocess_data", return_value=daily_snapshot_df()
-        ),
-        patch.object(
-            predict,
-            "load_theme_from_db",
-            return_value={"000001": "테마A", "000002": "테마A"},
-        ),
-        patch.object(predict, "sync_theme_only"),
-        patch(
-            "src.api.kis_client.fetch_index_and_calculate_volatility",
-            side_effect=fake_fetch,
-        ),
-        patch.object(
-            predict, "load_model_bundle", return_value={"feature_cols": ["f1"]}
-        ),
-        patch.object(
-            predict,
-            "load_single_stock_policy",
-            return_value=policy,
-        ),
-        patch.object(
-            predict,
-            "predict_daily_sizing",
-            side_effect=lambda df, *a, **kw: sizing_df[
-                sizing_df["chart_analysis"].isin(df["시나리오"])
-            ],
-        ),
-        patch.object(predict, "print_table") as print_table_mock,
-    ):
-        predict.main()
-
-    decision = print_table_mock.call_args_list[2].args[0]
-    assert len(decision) == 1
-    assert decision.iloc[0]["decision"] == "BUY"
-    assert decision.iloc[0]["stock_code"] == "000001"
-    assert decision.iloc[0]["n_unique_stocks"] == 2
 
 
 def test_merged_normal_sangdda_scored_table_yields_one_decision() -> None:

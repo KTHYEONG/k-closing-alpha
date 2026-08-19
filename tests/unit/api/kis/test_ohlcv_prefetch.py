@@ -174,21 +174,33 @@ def test_chunk_loop_sleeps_between_chunks() -> None:
 # ---------------------------------------------------------
 # T04: prefetch_ohlcv_for_sma120
 # ---------------------------------------------------------
-def test_prefetch_single_chunk_call_per_code() -> None:
-    """[T04] prefetch_ohlcv_for_sma120은 codes 수만큼 단일 청크 호출."""
-    codes = ["005930", "000660", "035420"]
-    mock_history = AsyncMock(return_value=_ohlcv_response(200))
+def test_prefetch_chunk_calls_per_code() -> None:
+    """[T04] prefetch_ohlcv_for_sma120은 100건 반환 시 2회 chunk 호출로 120건 이상 확보."""
+    codes = ["005930", "000660"]
+    mock_history = AsyncMock(return_value=_ohlcv_response(80))
     client = _client()
     with patch.object(client, "get_stock_ohlcv_history", mock_history):
         result = _run(prefetch_ohlcv_for_sma120(codes, session=_FakeSession(), client=client))
-    assert mock_history.await_count == len(codes)
+    assert mock_history.await_count == len(codes) * 2
     assert set(result) == set(codes)
     assert all(len(records) >= 120 for records in result.values())
 
 
+def test_prefetch_single_chunk_when_enough_data() -> None:
+    """[T04] 1차 chunk에서 150건 이상 확보 시 2차 chunk 호출을 생략."""
+    codes = ["005930"]
+    mock_history = AsyncMock(return_value=_ohlcv_response(160))
+    client = _client()
+    with patch.object(client, "get_stock_ohlcv_history", mock_history):
+        result = _run(prefetch_ohlcv_for_sma120(codes, session=_FakeSession(), client=client))
+    assert mock_history.await_count == 1
+    assert "005930" in result
+    assert len(result["005930"]) >= 150
+
+
 def test_prefetch_empty_codes_returns_empty() -> None:
     """[T01] 빈 codes면 API 호출 없이 빈 dict 반환."""
-    mock_history = AsyncMock(return_value=_ohlcv_response(200))
+    mock_history = AsyncMock(return_value=_ohlcv_response(100))
     client = _client()
     with patch.object(client, "get_stock_ohlcv_history", mock_history):
         result = _run(prefetch_ohlcv_for_sma120([], session=_FakeSession(), client=client))
@@ -200,10 +212,10 @@ def test_prefetch_excludes_failed_codes() -> None:
     """[T01] 실패한 종목은 반환 dict에서 key로 제외된다."""
     codes = ["005930", "000660"]
 
-    async def _side_effect(session, code, start_date, end_date):
+    async def _side_effect(session, code, start_date, end_date, adj_price="0"):
         if code == "000660":
             return {"rt_cd": "9", "msg1": "조회 실패"}
-        return _ohlcv_response(200)
+        return _ohlcv_response(80)
 
     mock_history = AsyncMock(side_effect=_side_effect)
     client = _client()
