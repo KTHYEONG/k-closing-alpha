@@ -1,4 +1,3 @@
-import datetime
 import json
 import logging
 import os
@@ -18,12 +17,6 @@ from src.processing.schema import normalize_column_names
 from src.serving.realtime.artifacts import load_model_bundle
 from src.serving.realtime.features import build_snapshot_features
 from src.serving.realtime.inference import predict_daily_sizing
-from src.serving.realtime.policy import (
-    REASON_MISSING_POLICY,
-    abstain_decision,
-    load_single_stock_policy,
-    select_single_daily_trade,
-)
 from src.utils.display import Colors, print_table
 
 # SHAP (모델 해석용) - 필요 시 설치: pip install shap
@@ -86,7 +79,7 @@ def load_and_preprocess_data(file_path):
         logger.info(f"{Colors.RED}Error: {file_path} 파일을 찾을 수 없습니다.{Colors.RESET}")
         sys.exit(1)
 
-    logger.info(f"{Colors.CYAN}조건검색 데이터 로드 중... ({file_path}){Colors.RESET}")
+    logger.debug("조건검색 데이터 로드 중... (%s)", file_path)
 
     try:
         df = pd.read_csv(file_path)
@@ -123,9 +116,7 @@ def load_and_preprocess_data(file_path):
             )
 
     # "상따" 시나리오 종목도 함께 로드 (나중에 필터링)
-    logger.info(
-        f"{Colors.GREEN}✅ 데이터 로드 완료: 분석 대상 {len(df)}개 종목{Colors.RESET}"
-    )
+    logger.debug("데이터 로드 완료: %d개 종목", len(df))
     return df
 
 
@@ -292,29 +283,18 @@ def main():
 
         from src.api.kis_client import fetch_index_and_calculate_volatility
 
-        logger.info(
-            f"{Colors.CYAN}실시간 변동성(V-KOSPI/V-KOSDAQ) 데이터를 가져옵니다...{Colors.RESET}"
-        )
-
         # 1. V-KOSPI (1028)
         current_vkospi, current_vkospi_change = asyncio.run(
             fetch_index_and_calculate_volatility("1028")
-        )
-        logger.info(
-            f"  > V-KOSPI : {current_vkospi:.2f} (Change: {current_vkospi_change:+.2%})"
         )
 
         # 2. V-KOSDAQ (2203)
         current_vkosdaq, current_vkosdaq_change = asyncio.run(
             fetch_index_and_calculate_volatility("2203")
         )
-        logger.info(
-            f"  > V-KOSDAQ: {current_vkosdaq:.2f} (Change: {current_vkosdaq_change:+.2%})"
-        )
 
     except Exception as e:
-        logger.info(f"{Colors.YELLOW}[Warning] 변동성 계산 중 오류 발생: {e}{Colors.RESET}")
-        logger.info("  > 변동성 관련 피처는 0으로 처리됩니다.")
+        logger.warning(f"[Warning] 변동성 계산 중 오류 발생: {e}")
 
     # 3. [핵심] 시나리오 확장 - 수집 단계에서 저장된 표준 시나리오를 그대로 사용
     def get_scenario_list(row):
@@ -343,12 +323,6 @@ def main():
     df_all = df_condition.explode("Scenario_List").reset_index(drop=True)
     df_all["Scenario_Base"] = df_all["Scenario_List"]
     df_all = df_all.drop(columns=["Scenario_List"])
-
-    # 결과 요약
-    logger.info(
-        f"{Colors.CYAN}분석 대상: {len(df_condition)}개 종목 "
-        f"(시나리오 확장 포함 {len(df_all)}건){Colors.RESET}"
-    )
 
     # [New] v-kospi & v-kosdaq 피처 주입
     df_all["v_kospi"] = current_vkospi
@@ -399,15 +373,12 @@ def main():
         if not df_sangdda.empty
         else pd.DataFrame()
     )
-    sizing_df = (
-        pd.concat([normal_sizing, sangdda_sizing], ignore_index=True)
-        if not sangdda_sizing.empty
-        else normal_sizing
-    )
 
     elapsed_ms = (time.perf_counter() - start) * 1000
     logger.info(
-        f"{Colors.GREEN}추론 완료: {len(sizing_df)}건 ({elapsed_ms:.0f}ms){Colors.RESET}"
+        f"{Colors.GREEN}🚀 [예측 완료] 대상: {len(df_condition)}종목({len(df_all)}건) "
+        f"| 변동성: VKOSPI {current_vkospi:.2f}({current_vkospi_change:+.2%}), VKOSDAQ {current_vkosdaq:.2f}({current_vkosdaq_change:+.2%}) "
+        f"| 추론: {elapsed_ms:.0f}ms{Colors.RESET}\n"
     )
 
     # 6. 결과 리스트 생성 및 출력 (Top N 액션 가능 후보만 표시)
@@ -422,26 +393,6 @@ def main():
     print_table(
         select_top_actionable(sangdda_results), "상따(29.9%) 시나리오 결과", minimal=True
     )
-
-    # 7. 단일 실행 결정: normal + sangdda 스코어링 테이블을 병합해 정확히 한 번만
-    # 소비하고 BUY(종목 1개) 또는 ABSTAIN 1건만 산출합니다. 정책 상태가 없으면
-    # 조용한 Top-N 폴백 대신 명시적 ABSTAIN(missing_validated_policy) 입니다.
-    scored_all = (
-        pd.concat([normal_sizing, sangdda_sizing], ignore_index=True)
-        if not sangdda_sizing.empty
-        else normal_sizing
-    )
-    policy = load_single_stock_policy(models_bundle)
-    if policy is None:
-        single_decision = abstain_decision(
-            REASON_MISSING_POLICY,
-            group_value=str(datetime.date.today()),
-        )
-    else:
-        single_decision = select_single_daily_trade(
-            scored_all, policy, group_col="date", score_col=policy.score_col
-        )
-    print_table(single_decision, "실행 결정 (Single-Stock: BUY/ABSTAIN)", minimal=True)
 
 
 if __name__ == "__main__":
