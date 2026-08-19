@@ -124,9 +124,9 @@ async def calculate_stock_sma(stock_code, sma_period=120, lookback_days=200, ses
             end_date = (datetime.now() - timedelta(days=100 * chunk)).strftime("%Y%m%d")
             start_date = (datetime.now() - timedelta(days=100 * (chunk + 1) + 50)).strftime("%Y%m%d")
             
-            # API 호출
+            # API 호출 (수정주가 반영)
             resp = await client.get_stock_ohlcv_history(
-                session, stock_code, start_date, end_date
+                session, stock_code, start_date, end_date, adj_price="1"
             )
             
             if resp.get('rt_cd') != '0':
@@ -210,9 +210,9 @@ async def calculate_stock_ema(stock_code, ema_period=20, lookback_days=60, sessi
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y%m%d")
         
-        # API 호출
+        # API 호출 (수정주가 반영)
         resp = await client.get_stock_ohlcv_history(
-            session, stock_code, start_date, end_date
+            session, stock_code, start_date, end_date, adj_price="1"
         )
         
         if resp.get('rt_cd') != '0':
@@ -295,7 +295,7 @@ async def calculate_multiple_emas(stock_code, periods=[5, 10, 20], lookback_days
         start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y%m%d")
         
         resp = await client.get_stock_ohlcv_history(
-            session, stock_code, start_date, end_date
+            session, stock_code, start_date, end_date, adj_price="1"
         )
         
         if resp.get('rt_cd') != '0':
@@ -342,28 +342,45 @@ async def prefetch_ohlcv_for_sma120(
 ) -> dict[str, list[dict[str, str]]]:
     """SMA120 계산용 OHLCV 이력을 사전 일괄 병렬 선조회한다.
 
-    최근 200역일 범위를 단일 청크로 종목당 1회 호출하여 150건 이상의 데이터를
-    확보한다. 실패한 종목은 반환 dict에서 key로 제외되며 예외를 전파하지 않는다.
+    KIS API 단일 호출 100건 제한을 극복하기 위해 2개 청크(최근 100일 + 직전 100일)로
+    수정주가(adj_price='1') 일봉 레코드를 확보한다.
+    실패한 종목은 반환 dict에서 key로 제외되며 예외를 전파하지 않는다.
     """
     if not codes:
         return {}
 
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
+    now = datetime.now()
 
     async def _fetch(code: str) -> tuple[str, list[dict[str, str]]] | None:
+        records: list[dict[str, str]] = []
         try:
-            await client.rate_limiter.acquire()
-            resp = await client.get_stock_ohlcv_history(
-                session, code, start_date, end_date
-            )
-            if resp.get("rt_cd") != "0":
-                return None
-            records = [
-                {"date": item.get("stck_bsop_date", ""), "close": item.get("stck_clpr", "")}
-                for item in resp.get("output2", [])
-            ]
-            records = [r for r in records if r["date"] and r["close"]]
+            for chunk in range(2):
+                end_dt = now - timedelta(days=100 * chunk)
+                start_dt = end_dt - timedelta(days=120)
+                end_date = end_dt.strftime("%Y%m%d")
+                start_date = start_dt.strftime("%Y%m%d")
+
+                await client.rate_limiter.acquire()
+                resp = await client.get_stock_ohlcv_history(
+                    session, code, start_date, end_date, adj_price="1"
+                )
+                if resp.get("rt_cd") != "0":
+                    if chunk == 0:
+                        return None
+                    break
+
+                for item in resp.get("output2", []):
+                    date = item.get("stck_bsop_date", "")
+                    close = item.get("stck_clpr", "")
+                    if date and close:
+                        records.append({"date": str(date), "close": str(close)})
+
+                if len(records) >= 150:
+                    break
+
+                if chunk < 1:
+                    await asyncio.sleep(0.05)
+
             return (code, records) if records else None
         except Exception as e:
             logger.warning("[OHLCV Prefetch] %s: %s: %s", code, type(e).__name__, e)
@@ -422,7 +439,9 @@ async def calculate_all_moving_averages(
                 end_date = end_dt.strftime("%Y%m%d")
                 start_date = start_dt.strftime("%Y%m%d")
 
-                resp = await client.get_stock_ohlcv_history(session, stock_code, start_date, end_date)
+                resp = await client.get_stock_ohlcv_history(
+                    session, stock_code, start_date, end_date, adj_price="1"
+                )
 
                 if resp.get("rt_cd") != "0":
                     if chunk == 0:
