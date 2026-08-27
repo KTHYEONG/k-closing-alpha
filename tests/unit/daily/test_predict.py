@@ -120,6 +120,14 @@ def test_load_and_preprocess_data_filters_insufficient_listing_days() -> None:
     assert result.empty
 
 
+def test_load_and_preprocess_data_handles_alphanumeric_stock_codes(tmp_path) -> None:
+    csv_file = tmp_path / "test_stocks.csv"
+    csv_file.write_text("시나리오,종목명,종목코드\n폭증,삼성SDI,006400\n폭증,해치텍,0155E0\n", encoding="utf-8-sig")
+    result = predict.load_and_preprocess_data(str(csv_file))
+    assert result["종목코드"].tolist() == ["006400", "0155E0"]
+
+
+
 def test_explain_predictions_with_shap_skips_when_not_installed() -> None:
     with patch.object(predict, "HAS_SHAP", False):
         predict.explain_predictions_with_shap(None, None, [])
