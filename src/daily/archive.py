@@ -124,7 +124,7 @@ def import_csv_history_if_needed(history_csv: str, history_db: str) -> None:
     if not missing_dates and table_exists:
         return
 
-    df_csv = pd.read_csv(history_csv)
+    df_csv = pd.read_csv(history_csv, dtype={"종목코드": str})
     if SNAP_DATE_COL not in df_csv.columns:
         logger.info(
             f"[warn] CSV에 '{SNAP_DATE_COL}' 컬럼이 없어 import를 건너뜁니다: {history_csv}"
@@ -470,8 +470,8 @@ def main():
         logger.warning(f"[skip] 아카이브할 최신 조건검색 CSV 파일이 없습니다: {csv_latest}")
         return
 
-    # 최신 결과 불러오기
-    df = pd.read_csv(csv_latest, encoding="utf-8-sig")
+    # 최신 결과 불러오기 (종목코드 0 누락 및 지수 표기 방지)
+    df = pd.read_csv(csv_latest, encoding="utf-8-sig", dtype={"종목코드": str})
 
     # 파일 수정 시각을 스냅샷 시각으로 사용 (없으면 현재 시각)
     snap_dt = datetime.fromtimestamp(os.path.getmtime(csv_latest))
