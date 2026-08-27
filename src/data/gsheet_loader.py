@@ -89,10 +89,20 @@ class GSheetClientManager:
         return self.spreadsheets_cache[sheet_name]
 
     @retry_on_quota_limit()
-    def get_all_records(self, sheet_name: str, worksheet_name: str) -> list[dict[str, Any]]:
+    def get_all_records(
+        self,
+        sheet_name: str,
+        worksheet_name: str,
+        numericise_ignore: list[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        # Time Complexity: O(N) | Space Complexity: O(N)
         sh = self.get_spreadsheet(sheet_name)
         ws = sh.worksheet(worksheet_name)
-        return ws.get_all_records()
+        ignore_target = ["all"] if numericise_ignore is None else numericise_ignore
+        try:
+            return ws.get_all_records(numericise_ignore=ignore_target)
+        except TypeError:
+            return ws.get_all_records()
 
     @retry_on_quota_limit()
     def get_all_values(
@@ -108,7 +118,10 @@ class GSheetClientManager:
 
 
 def load_data_from_gsheet(
-    key_path: str, sheet_name: str, worksheet_name: str
+    key_path: str,
+    sheet_name: str,
+    worksheet_name: str,
+    numericise_ignore: list[Any] | None = None,
 ) -> pd.DataFrame | None:
     """구글 시트에서 데이터를 DataFrame으로 로드하는 함수"""
     if not os.path.exists(key_path):
@@ -116,7 +129,12 @@ def load_data_from_gsheet(
         return None
     try:
         manager = GSheetClientManager(key_path)
-        records = manager.get_all_records(sheet_name, worksheet_name)
+        try:
+            records = manager.get_all_records(
+                sheet_name, worksheet_name, numericise_ignore=numericise_ignore
+            )
+        except TypeError:
+            records = manager.get_all_records(sheet_name, worksheet_name)
         df = pd.DataFrame(records)
         if df.empty:
             logger.warning("'%s' 시트에서 가져온 데이터가 없습니다.", worksheet_name)
