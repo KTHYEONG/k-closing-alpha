@@ -82,14 +82,23 @@ def load_and_preprocess_data(file_path):
     logger.debug("조건검색 데이터 로드 중... (%s)", file_path)
 
     try:
-        df = pd.read_csv(file_path)
+        # 종목코드(0155E0 등 지수 표기 및 0 누락 방지)를 문자열로 명시적 로드
+        df = pd.read_csv(file_path, dtype={"종목코드": str})
     except Exception as e:
         logger.info(f"{Colors.RED}CSV 파일 로드 실패: {e}{Colors.RESET}")
         sys.exit(1)
 
-    # 종목코드 포맷팅 (6자리 zero-fill)
+    # 종목코드 포맷팅 (6자리 zero-fill, 불필요 소수점 제거)
+    # Time Complexity: O(N) | Space Complexity: O(N)
     if "종목코드" in df.columns:
-        df["종목코드"] = df["종목코드"].apply(lambda x: str(x).zfill(6))
+        df["종목코드"] = (
+            df["종목코드"]
+            .astype(str)
+            .str.strip()
+            .str.split(".")
+            .str[0]
+            .str.zfill(6)
+        )
 
     # 단위 변환 (억 -> 원)
     for col in [
