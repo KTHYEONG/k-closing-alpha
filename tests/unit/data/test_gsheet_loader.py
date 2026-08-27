@@ -88,7 +88,7 @@ def fake_gsheet_client(monkeypatch) -> _FakeSpreadsheet:
     monkeypatch.setattr(
         GSheetClientManager,
         "get_all_records",
-        lambda self, sheet, ws_name: spreadsheet.worksheet(ws_name).get_all_records(),
+        lambda self, sheet, ws_name, *args, **kwargs: spreadsheet.worksheet(ws_name).get_all_records(),
     )
     monkeypatch.setattr(
         GSheetClientManager,
