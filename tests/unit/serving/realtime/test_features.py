@@ -201,3 +201,60 @@ def test_add_scenario_features_generates_one_hot_and_context() -> None:
     # stock 000020 has 2 scenarios → is_multi_scenario_stock_date=1
     assert out.iloc[0]["is_multi_scenario_stock_date"] == 1.0
     assert out.iloc[0]["scenario_count_for_stock_date"] == 2.0
+
+
+def test_ml_feature_compatibility_with_auto_theme() -> None:
+    from src.serving.realtime.features import build_snapshot_features
+
+    df_snapshot = pd.DataFrame([
+        {
+            "trade_date": "2026-09-01",
+            "stock_code": "452430",
+            "close_price": 15000,
+            "prev_close_price": 14000,
+            "open_price": 14200,
+            "high_price": 15500,
+            "low_price": 14100,
+            "change_rate": 7.14,
+            "market_cap_100m": 1000,
+            "trade_value_100m": 200,
+            "volume": 100000,
+            "selection_rank": 1,
+            "total_candidate_count": 2,
+            "market_type": "KOSDAQ",
+            "theme_sector": "반도체",
+            "chart_analysis": "거래량 폭증",
+            "kospi_change": 0.5,
+            "kosdaq_change": 1.0,
+            "v_kospi": 15.0,
+            "v_kosdaq": 18.0,
+        },
+        {
+            "trade_date": "2026-09-01",
+            "stock_code": "005930",
+            "close_price": 75000,
+            "prev_close_price": 73000,
+            "open_price": 73500,
+            "high_price": 75500,
+            "low_price": 73000,
+            "change_rate": 2.74,
+            "market_cap_100m": 4500000,
+            "trade_value_100m": 5000,
+            "volume": 7000000,
+            "selection_rank": 2,
+            "total_candidate_count": 2,
+            "market_type": "KOSPI",
+            "theme_sector": "반도체",
+            "chart_analysis": "거래량 폭증",
+            "kospi_change": 0.5,
+            "kosdaq_change": 1.0,
+            "v_kospi": 15.0,
+            "v_kosdaq": 18.0,
+        }
+    ])
+
+    features = build_snapshot_features(df_snapshot, decision_date=pd.Timestamp("2026-09-01"))
+    assert "sector_relative_change" in features.columns
+    expected_mean = (7.14 + 2.74) / 2
+    assert np.isclose(features.loc[0, "sector_relative_change"], 7.14 - expected_mean, atol=1e-4)
+    assert np.isclose(features.loc[1, "sector_relative_change"], 2.74 - expected_mean, atol=1e-4)
