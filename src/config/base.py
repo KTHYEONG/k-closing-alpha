@@ -90,6 +90,11 @@ class PathSettings(BaseSettings):
     def MODEL_PATH(self) -> Path:
         return self.MODELS_DIR / "best_stock_rg_cat.joblib"
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ALTDATA_DIR(self) -> Path:
+        return self.HISTORY_DIR / "altdata"
+
     # ---------------------------------------------------------
     # [스펙 하위 호환 별칭] (spec: base_dir, data_dir, models_dir, ...)
     # ---------------------------------------------------------

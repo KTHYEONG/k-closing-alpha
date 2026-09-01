@@ -12,6 +12,7 @@ from pathlib import Path
 from pydantic import computed_field
 from pydantic_settings import SettingsConfigDict
 
+from src.config.altdata import AltDataSettings
 from src.config.base import PathSettings
 from src.config.gsheet import GSheetSettings
 from src.config.kis import KisSettings
@@ -20,7 +21,7 @@ from src.config.trading import TradingSettings
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-class Settings(PathSettings, KisSettings, GSheetSettings, TradingSettings):
+class Settings(PathSettings, KisSettings, GSheetSettings, TradingSettings, AltDataSettings):
     """프로젝트 전역 설정. `.env` 파일에서 자동 로드.
 
     도메인별 설정 모듈을 통합한 싱글톤으로, 모든 소비자 모듈은
@@ -118,6 +119,8 @@ HISTORY_CSV_PATH = settings.HISTORY_CSV_PATH
 LABEL_ENCODER_PATH = settings.LABEL_ENCODER_PATH
 MODEL_PATH = settings.MODEL_PATH
 CONDITION_CSV_PATH = settings.CONDITION_CSV_PATH
+ALTDATA_DIR = settings.ALTDATA_DIR
+DART_API_KEY = settings.DART_API_KEY
 
 # 스펙 하위 호환 별칭 (소문자)
 base_dir = settings.base_dir
@@ -131,6 +134,7 @@ kis_app_secret = settings.kis_app_secret
 kis_account_id = settings.kis_account_id
 
 __all__ = [
+    "ALTDATA_DIR",
     "API_SEMAPHORE_LIMIT",
     "BASE_DIR",
     "CANDLE_BODY_RATIO_THRESHOLD",
@@ -138,6 +142,7 @@ __all__ = [
     "CONDITION_PARQUET_PATH",
     "CONFIGS_DIR",
     "DAILY_DIR",
+    "DART_API_KEY",
     "DATA_DIR",
     "DAY_NAME_MAP",
     "DEFAULT_SCENARIOS",
@@ -179,6 +184,7 @@ __all__ = [
     "TRADE_WORKSHEETS",
     "UPPER_LIMIT_CONDITION_NAME",
     "UPPER_LIMIT_NEXT_DAY_CONDITION_NAME",
+    "AltDataSettings",
     "GSheetSettings",
     "KisSettings",
     "PathSettings",
