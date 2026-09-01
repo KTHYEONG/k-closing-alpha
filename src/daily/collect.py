@@ -11,7 +11,7 @@ from src import settings
 # 커스텀 모듈 임포트
 from src.api.kis_client import KisApiClient, prefetch_ohlcv_for_sma120
 from src.data.db_loader import load_theme_from_db
-from src.data.gsheet_loader import append_stocks_to_gsheet
+from src.data.theme_resolver import batch_resolve_missing_themes
 from src.processing.schema import STANDARD_COLUMN_ORDER
 from src.utils.display import Colors
 
@@ -558,27 +558,27 @@ async def main():
             # 수집 결과 요약 출력
             success_count = len(results) - len(failed_info)
 
-            # 테마 미매칭 종목 확인 및 구글 시트 자동 등록
+            # 테마 미매칭 종목 자동 분류 및 로컬 Parquet/DB 캐시 갱신 (구글 시트 수동 의존 제거)
             theme_map = load_theme_from_db()
             df["테마"] = df["종목코드"].map(theme_map)
             no_theme_df = df[df["테마"].isna() | (df["테마"] == "")]
 
             if not no_theme_df.empty:
-                no_theme_list = no_theme_df[["종목코드", "종목명"]].to_dict("records")
+                no_theme_list = no_theme_df[["종목코드", "종목명", "시장구분"]].to_dict("records")
                 logger.info(
-                    f"\n{Colors.BOLD}⚠️ [테마 미매칭] {Colors.YELLOW}{len(no_theme_list)}{Colors.RESET} 종목 발견"
+                    f"\n{Colors.BOLD}⚠️ [신규/미분류 종목] {Colors.YELLOW}{len(no_theme_list)}{Colors.RESET} 종목 발견 -> 자동 분류 및 로컬 캐시 갱신..."
                 )
-                logger.info(
-                    f"   👉 대상 종목: {', '.join([s['종목명'] for s in no_theme_list])}"
-                )
-                logger.info("   [진행] 미매칭 종목을 구글 시트에 등록 중...")
-
-                key_path = str(settings.GOOGLE_KEY_PATH)
-                GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
-                THEME_WORKSHEET_NAME = settings.THEME_WORKSHEET_NAME
-                append_stocks_to_gsheet(
-                    key_path, GOOGLE_SHEET_NAME, THEME_WORKSHEET_NAME, no_theme_list
-                )
+                resolved_list = batch_resolve_missing_themes(no_theme_list)
+                for s in resolved_list:
+                    theme_val = s.get("테마", "기타")
+                    mkt_val = s.get("시장구분", "")
+                    logger.info(
+                        f"   👉 {s.get('종목명', '')}({s.get('종목코드', '')}) -> 테마: {theme_val} | 시장: {mkt_val}"
+                    )
+                # 갱신된 로컬 테마 DB 재매핑
+                theme_map = load_theme_from_db()
+                df["테마"] = df["종목코드"].map(theme_map).fillna("기타")
+                save_collected_condition_data(df, save_path)
             logger.info(f"\n{Colors.BOLD}� [데이터 수집 요약]{Colors.RESET}")
             logger.info(f"   ✅ 성공: {Colors.GREEN}{success_count}{Colors.RESET} 종목")
             if failed_info:

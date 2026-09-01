@@ -10,9 +10,9 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# DB 및 시트 관련 임포트
+# DB 및 테마 관련 임포트
 from src.data.db_loader import load_theme_from_db
-from src.data.sync_sheet_db import sync_theme_only
+from src.data.theme_resolver import batch_resolve_missing_themes
 from src.processing.schema import normalize_column_names
 from src.serving.realtime.artifacts import load_model_bundle
 from src.serving.realtime.features import build_snapshot_features
@@ -34,8 +34,6 @@ LABEL_ENCODER_PATH = str(settings.LABEL_ENCODER_PATH)
 CONDITION_CSV_PATH = str(settings.CONDITION_CSV_PATH)
 DEFAULT_SCENARIOS = settings.DEFAULT_SCENARIOS
 DAY_NAME_MAP = settings.DAY_NAME_MAP
-GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
-THEME_WORKSHEET_NAME = settings.THEME_WORKSHEET_NAME
 
 
 def load_label_encoder_map(path):
@@ -246,38 +244,29 @@ def select_top_actionable(
 
 
 def main():
-    # 1. 데이터 로드 및 테마 매핑
+    # 1. 데이터 로드 및 테마 매핑 (로컬 Parquet/DB 기반 자동 판별)
     df_condition = load_and_preprocess_data(settings.CONDITION_CSV_PATH)
     theme_map = load_theme_from_db()
 
-    # [Smart Sync] 현재 분석 종목 중 테마가 없는 종목이 있는지 확인
-    missing_themes = df_condition[
-        ~df_condition["종목코드"].map(theme_map).isin(theme_map.values())
-    ]
+    # 테마가 미매칭된 종목이 있는 경우 자동 분류 및 로컬 캐시 갱신
+    missing_mask = df_condition["종목코드"].map(theme_map).isna() | (
+        df_condition["종목코드"].map(theme_map) == ""
+    )
+    missing_themes = df_condition[missing_mask]
 
     if not missing_themes.empty:
+        missing_list = missing_themes[["종목코드", "종목명", "시장구분"]].to_dict("records")
         logger.info(
-            f"{Colors.CYAN}신규 또는 미분류 종목 발견! 구글 시트에서 테마 정보를 동기화합니다...{Colors.RESET}"
+            f"{Colors.CYAN}신규 또는 미분류 종목 {len(missing_list)}건 발견! 자동 분류 및 로컬 캐시를 갱신합니다...{Colors.RESET}"
         )
-        sync_theme_only()
+        batch_resolve_missing_themes(missing_list, sync_gsheet=False)
         # 동기화 후 다시 로드
         theme_map = load_theme_from_db()
 
-    # 최종 테마 정보를 데이터프레임에 입힙니다.
+    # 최종 테마 정보를 데이터프레임에 입힙니다 (미분류 시 안전 폴백: '기타')
     df_condition["테마_섹터"] = (
-        df_condition["종목코드"].map(theme_map).fillna("테마 없음")
+        df_condition["종목코드"].map(theme_map).fillna("기타")
     )
-
-    # 테마가 없는 종목 알림 출력
-    df_no_theme = df_condition[df_condition["테마_섹터"] == "테마 없음"]
-    if not df_no_theme.empty:
-        no_theme_names = df_no_theme["종목명"].tolist()
-        logger.info(
-            f"{Colors.YELLOW}[알림] 테마 미매칭으로 분석 제외: {', '.join(no_theme_names)}{Colors.RESET}"
-        )
-
-    # 테마가 있는 종목만 분석 대상으로 유지
-    df_condition = df_condition[df_condition["테마_섹터"] != "테마 없음"].copy()
 
     if df_condition.empty:
         logger.info(f"{Colors.RED}분석 대상 종목이 없습니다.{Colors.RESET}")

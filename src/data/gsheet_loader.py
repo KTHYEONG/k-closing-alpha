@@ -206,12 +206,24 @@ def append_stocks_to_gsheet(
         for stock in stocks_to_add:
             code = str(stock["종목코드"]).zfill(6)
             if code not in existing_codes:
+                # Support populated theme and market columns
+                theme_val = str(
+                    stock.get("테마")
+                    or stock.get("테마/섹터")
+                    or stock.get("theme_sector")
+                    or ""
+                )
+                market_val = str(stock.get("시장구분") or stock.get("market_type") or "")
                 row_to_append = []
                 for header in headers:
                     if header == "종목코드":
                         row_to_append.append(code)
                     elif header == "종목명":
                         row_to_append.append(stock["종목명"])
+                    elif header in ("테마", "테마/섹터", "테마_섹터", "(테마/섹터)"):
+                        row_to_append.append(theme_val)
+                    elif header == "시장구분":
+                        row_to_append.append(market_val)
                     else:
                         row_to_append.append("")
                 new_rows.append(row_to_append)
