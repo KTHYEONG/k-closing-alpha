@@ -156,5 +156,8 @@
   "src/ml/champion.py": {
     "architecture": "docs/results/ml-res.md",
     "testing": "tests/integration/ml/test_champion_flow.py"
+  },
+  "src/backfill/altdata/runner.py": {
+    "testing": "tests/integration/backfill/test_altdata_flow.py"
   }
 }

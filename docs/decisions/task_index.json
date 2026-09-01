@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_ALTDATA_BACKFILL",
+      "date": "2026-09-01",
+      "adr_id": "ADR_20260901_ML_ALTDATA_BACKFILL",
+      "domain": "data",
+      "title": "ML 대체데이터 과거 백필 파이프라인 (공매도/밸류에이션/투자자세부/선물베이시스/DART공시)",
+      "why": "causal_history_v2(720피처)가 일봉+수급+지수 패널을 소진해 챔피언을 못 이김. 추가 성능은 모델이 본 적 없는 직교 원천이 필요하나 공매도·밸류에이션·투자자세부수급·선물베이시스·공시이벤트는 수집조차 안 됨. 실시간 전용(분봉/호가/VI)은 과거 백필 불가하여 제외.",
+      "resolution": "src/backfill/altdata/ 신규 패키지: 5개 수집기(pykrx 4종 + OpenDART 신규 연동), 증분·원자적 쓰기, 소스별 fail-soft, _manifest.json 프로비넌스(availability_rule=eod_release_next_decision). backfill_altdata.py CLI, src/config/altdata.py(DART_API_KEY), ALTDATA_DIR. 인과 중립 저장(shift 금지, 조인은 하위 피처 스펙 책임). src.ml/src.serving import 금지.",
+      "impact": "12개 신규 테스트 통과, 전체 273 passed, ruff/mypy clean. data/history/altdata/*.parquet 로 백필 가능. 다음: 실제 수집 실행 + merge_asof 피처 조인 스펙(기존 대조군 게이트로 A/B)."
+    },
+    {
       "task_id": "TASK_ML_CHAMPION_TUNING_SRC",
       "date": "2026-09-01",
       "adr_id": "ADR_20260901_ML_CHAMPION_TUNING_SRC",
