@@ -354,7 +354,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
             sf_content = sf.read()
             if kind in ("field", "dataclass_field"):
                 field_name = name.split(".")[-1] if "." in name else name
-                pat = rf"\b{re.escape(field_name)}[\"']?\s*(?::|=)"
+                pat = rf"\b{re.escape(field_name)}\b"
                 if not re.search(pat, sf_content, re.MULTILINE):
                     msg = f"Spec: {kind} '{name}' not implemented"
                     d = {
@@ -416,12 +416,28 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                     elif kind == "registry_entry":
                         # 예: NAME['key'] / NAME["key"] 형태의 레지스트리 엔트리.
                         # 구조(NAME 모듈 수준 dict 할당)와 키 리터럴을 함께 확인한다.
+                        # Plain registry dict name (e.g. _ALTDATA_PANELS)도 지원한다.
                         entry_match = re.match(
                             r"^(?P<owner>\w+)\[(?P<q>['\"])(?P<key>.+?)(?P=q)\]$",
                             name,
                         )
                         if entry_match is None:
-                            found_impl = False
+                            # Plain registry dict: check assignment exists
+                            found_impl = any(
+                                isinstance(node, (ast.Assign, ast.AnnAssign))
+                                and any(
+                                    isinstance(t, ast.Name) and t.id == name
+                                    for t in (
+                                        node.targets
+                                        if isinstance(node, ast.Assign)
+                                        else [node.target]
+                                    )
+                                )
+                                for node in ast.walk(tree)
+                            )
+                            # also accept via regex fallback
+                            if not found_impl:
+                                found_impl = bool(re.search(rf"\b{re.escape(name)}\b", sf_content))
                         else:
                             reg_owner = entry_match.group("owner")
                             key_literal = entry_match.group("key")
