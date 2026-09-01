@@ -149,5 +149,8 @@
   },
   "legacy/ml_research/training/sizing_training.py": {
     "testing": "legacy/tests/unit/ml/test_sizing_engine.py"
+  },
+  "src/data/theme_resolver.py": {
+    "testing": "tests/unit/data/test_theme_resolver.py"
   }
 }
