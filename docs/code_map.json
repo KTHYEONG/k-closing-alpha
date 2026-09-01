@@ -152,5 +152,9 @@
   },
   "src/data/theme_resolver.py": {
     "testing": "tests/unit/data/test_theme_resolver.py"
+  },
+  "src/ml/champion.py": {
+    "architecture": "docs/results/ml-res.md",
+    "testing": "tests/integration/ml/test_champion_flow.py"
   }
 }
