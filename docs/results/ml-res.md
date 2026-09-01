@@ -110,3 +110,45 @@ relative_flow_strength
 - 이번 결과에는 별도 미사용 기간의 OOS/페이퍼 트레이딩 결과가 없다.
 
 운영 승격 전에는 (1) cutoff 이후 완전 미사용 기간의 OOS 평가, (2) 비용·슬리피지·체결 실패를 포함한 포트폴리오 백테스트, (3) 기존 운영 번들과의 동일 입력 shadow 비교, (4) 승인된 후보만 운영 경로로 원자적 교체하는 릴리스 절차를 추가로 통과해야 한다.
+
+---
+
+# ML 챔피언 튜닝 파이프라인 (src/ml/ 이관 + 근거화)
+
+## 8. 실행 요약 (2026-09-01)
+
+`legacy/ml_research/` 재학습 경로를 `src/ml/` 로 재작성 이관(git 추적·ruff·mypy·pytest 대상).
+동시에 학습 과정을 근거 기반으로 전환: Optuna 중첩 purged walk-forward 튜닝, 최종 모델 seed 앙상블,
+OOF 기반 `p_good` blend 가중치 보정, 라벨 클립/Huber δ config화, chronological 확률 보정기,
+date-balanced·recency 샘플 가중 A/B, 임베고 OOS 예약 + 동일 날짜 대조군 승격 게이트.
+
+- 입력: `data/parquet/trade_log.parquet` 33,944행 / 2,599일
+- 산출물: `scratch/champion_out/close_morning61_2026-02-27/` 후보 번들 (활성 번들 불변)
+- 진입점: `python -m src.ml.retrain [--tuned ...]`
+
+## 9. 성과 (동일 2,070 OOF 날짜, paired 대조)
+
+| 지표 | 대조군(현행 기본값) | 튜닝 후보 | 변화 |
+|---|---:|---:|---:|
+| 스케줄 평균수익 | 1.2028% | 1.2795% | +6.4% |
+| Sharpe | 4.93 | 5.19 | +0.26 |
+| Profit Factor | 2.38 | 2.50 | +0.12 |
+| 스케줄 승률 | 53.96% | 54.64% | +0.68%p |
+| 활성거래 평균수익 | 1.369% | 1.457% | +6.4% |
+| entry-seq drawdown | 26.20% | 25.58% | -0.6%p |
+
+승격 게이트 PASS (`cand_mean 0.012795 >= ctrl_mean 0.012028`, shared_dates 2070).
+
+## 10. 근거화 결과
+
+- **HPO 최적**: `num_leaves=44, learning_rate=0.011, n_estimators=750, colsample_bytree=0.81, subsample=0.72` — 라이브러리 기본값(31/0.1/100) 대비 저학습률·정규화로 과적합 억제가 이득의 주원인. inner OOF top-1 수익 0.0104→0.0157.
+- **blend 가중치 `p_good_weight` → 0.0**: 그리드 {0, 0.25, 0.5, 0.75, 1.0} 에서 스케줄 수익 평탄(~1.28%), DD는 0.0에서 최저(25.6%) → 1.0에서 40.0%. 기존 하드코딩 0.5는 무효했고 DD를 악화시켰음이 데이터로 확인됨.
+- **date_balanced 샘플 가중**이 `current` 대비 게이트 통과에 기여.
+- **OOS 110행(2026-03-01~)** 은 HPO·보정·정책 선택 어디에도 미사용 (`assert_oos_excluded` fail-closed).
+
+## 11. 한계 및 다음 단계
+
+- 여전히 OOF이며 예약 OOS(약 11일, 110행)는 표본 부족.
+- `entry_sequence_drawdown` 은 포지션 중첩·자본배분 미반영 간이지표.
+- 개선폭(+6.4%)은 통계적으로 작음 — 현 61피처셋 신호 상한 근접. 추가 상승은 다일 히스토리 피처(별도 스펙) 필요.
+- 운영 승격 전: (1) 비용·슬리피지·체결실패 포함 포트폴리오 백테스트, (2) 완전 미사용 OOS 구간 확대 평가, (3) 활성 번들 shadow 비교.
