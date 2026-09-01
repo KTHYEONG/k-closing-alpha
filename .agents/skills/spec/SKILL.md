@@ -5,64 +5,57 @@ description: Produce a concise, evidence-based implementation blueprint and mach
 
 # Spec Protocol
 
-Frontier reasoning model protocol for specification engineering and architecture design. Uses high-reasoning autonomy to solve design ambiguities, establish empirical proofs, and produce **precision contracts executable by low-reasoning models without architectural guesswork**.
+Produce an unambiguous implementation plan and precision contract (`contract.json`) optimized for mechanical, zero-search downstream execution (`implement`).
 
-## Core Directives
+## Directives
 
-1. **Context Aggregation & Initial Inspection**:
-   - Run context aggregator helper to quickly collect domain ADRs and code map references:
+1. **Context & Verification**:
+   - Collect domain references & historical ADRs:
      ```bash
      uv run python tools/agent_skills/spec_init.py --feature <feature_name> --domain <domain> --query <keyword>
      ```
-   - **MANDATORY DEEP INSPECTION**: Do NOT rely solely on the aggregated summary. Perform direct codebase searches (`rg`) and file inspections (`view_file`) on target sources, callers, and tests to verify actual signatures, line numbers, and behavior.
+   - Inspect target files, tests, AND immediate callers (1-depth call-sites) using `rg`/`view_file` to verify schemas, invariants, and type contracts.
 
-2. **Ambiguity & Alignment Check**:
-   - Assess if requirements contain open design choices, ambiguous quant trade-offs, or unstated boundary conditions.
-   - If ambiguity exists, ask concise clarification questions. Proceed immediately if clear.
+2. **Ambiguity Gate & Assumptions**:
+   - **Critical Gate**: If requirements leave core financial dynamics, trading risk, or public API breaking changes unstated, stop and ask clarifying questions.
+   - **Autonomous Engineering**: For algorithmic/internal architecture details, state concrete **Assumptions & Invariants** in the Blueprint and proceed autonomously.
 
-3. **Selective Empirical Sandbox**:
-   - For complex algorithms, novel quantitative models, or uncertain performance-critical logic, write temporary scripts in `scratch/test_<topic>.py` and verify metrics via `uv run`.
-   - Skip sandbox experimentation for straightforward refactoring, simple bug fixes, or minor API additions.
+3. **Selective Empirical Proof**:
+   - If algorithm correctness, numeric edge cases, or vectorization is uncertain, verify via a minimal script in `scratch/test_<topic>.py` using `uv run`.
 
-4. **Precision Contract Specification (`contract.json`)**:
-   - High-reasoning model MUST produce a precise, deterministic contract so low-reasoning execution models can implement it mechanically.
-   - Emit `docs/specs/<feature>_contract.json` with explicit declarations:
-     - `target_file`: Absolute path to modify or create.
-     - `symbol` & `signature`: Full Python type-hinted signature without parenthetical hints.
-     - `python_assertion`: Directly executable Python assertion expression (e.g. `assert fee_calc(100) == 0.05`).
-     - `requirements`: Explicit fail-closed exception types (e.g., raise `ValueError` on bad inputs) and performance/vectorization constraints (e.g., vectorized NumPy without `pd.apply`).
-     - `scenarios`: Array of `{ scenario_id, target_test_file, expected_behavior }`.
-     - `wiring`: Object or array containing explicit wiring declarations:
-       - `caller_file`: Absolute path of the integration caller file.
-       - `anchor`: Concrete line pattern, function signature, or class symbol in caller file.
-       - `import_symbol`: Exact symbol name or import statement to be imported.
-       - `invocation_expression`: Exact invocation snippet to be wired into caller.
-   - Create main design blueprint in `docs/specs/<feature>.md`.
+4. **Deliverables (Single Source of Truth)**:
+   - **Precision Contract (`docs/specs/<feature>_contract.json`) ONLY**:
+     - *No separate `.md` file*: All implementation specifications, boundary requirements, and tests live directly in `contract.json`.
+     - `target_file`: Relative path to modify or create.
+     - `context_files`: Minimal prerequisite paths for zero-search context loading.
+     - `changes` (or `symbols`): Array of `{ name, signature, kind, target_file }`.
+     - `wiring`: Array of `{ caller_file, anchor, import_symbol, invocation_expression }` ensuring entry-point hookup.
+     - `requirements`: Explicit fail-closed boundary rules, invariant constraints, and complexity requirements.
+     - `scenarios`: Array of `{ scenario_id, target_test_file, execution_command, expected_behavior, test_skeleton }`.
+       - `scenario_id`: Valid pytest function name (e.g. `test_<func>_<condition>`).
+       - `test_skeleton`: **Mandatory 100% executable Python test function** (Given/When/Then, imports, actual call, concrete assertions). NEVER leave `pass`, `...`, or empty body. This enables 0-reasoning mechanical pasting by downstream low-cost models.
 
-5. **Contract Self-Validation Gate**:
-   - Immediately verify target paths, anchor symbols, and JSON syntax of the newly created contract:
+5. **Self-Validation Gate**:
+   - Validate contract schema, test_skeleton AST syntax, and caller anchors:
      ```bash
-     uv run python tools/agent_skills/lean_check.py --spec-only --spec docs/specs/<feature>_contract.json
+     uv run python tools/agent_skills/lean_check.py --spec docs/specs/<feature>_contract.json --pre-impl
      ```
-   - If spec-only validation fails due to invalid target file paths or non-existent caller anchors, fix `contract.json` before completing the `/spec` phase.
 
+## Chat Output Format
 
-## Output & Chat Notification Directives
-
-Keep the chat response extremely concise (max 4-5 bullet points total, under 80 tokens).
-NEVER dump detailed failure histories, nested function signatures, or multi-paragraph background analyses into the chat window. All deep rationale MUST reside strictly inside `docs/specs/<feature>.md`.
-
-### Format Rule:
-- **Goal**: 1-line core objective.
-- **Diagnosis**: 1-line root cause in `[Component] -> [Bottleneck]` format.
-- **Solution**: 1-line key architectural action.
-- **Artifacts**: Clickable markdown links to the spec and contract files.
+Keep chat response concise, intuitive, and provide copy-pasteable execution command:
 
 ### 📐 [SPEC] <Task Title>
+> **목표**: <1-line objective>
 
-- **Goal**: <Core objective in 1 line>
-- **Diagnosis**: `[Component]` -> `<Short bottleneck description in 1 line>`
-- **Solution**: `<Key architecture change>` (Success: `<1-line verification criteria>`)
-- **Artifacts**:
-  - 📄 Specification: [`<feature>.md`](file:///docs/specs/<feature>.md)
-  - ⚙️ Contract: [`<feature>_contract.json`](file:///docs/specs/<feature>_contract.json)
+* **Before (현재)**
+  * <현재 문제점 / 원인 또는 한계점 1-2줄>
+
+* **After (개선)**
+  * <개선 후 동작 / 해결 방식 및 기대효과 1-2줄>
+
+* **Guards (방어 기준 & 불변식)**
+  * <반드시 지켜져야 할 핵심 비즈니스 불변식 / Fail-closed 원칙>
+
+---
+👉 `/implement docs/specs/<feature>_contract.json`

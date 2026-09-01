@@ -5,36 +5,45 @@ description: Implement an approved spec mechanically with focused TDD and integr
 
 # Implement Protocol
 
-Fast-execution model protocol for mechanical feature implementation based on frozen spec contracts.
+Fast-execution protocol for mechanical code implementation based strictly on frozen spec contracts.
 
 ## Directives
 
-1. **Strict Contract Compliance (Zero Guesswork)**:
-   - Treat `contract.json` as absolute input. Do not invent new parameters, change signatures, or alter thresholds.
+1. **Zero Guesswork & Complete Implementation**:
+   - Treat `contract.json` as absolute truth. Do not invent new parameters, change signatures, or create speculative abstraction layers.
+   - **Anti-Stub Rule**: Never leave `pass`, `...`, `NotImplementedError`, `TODO`, or placeholder return values. Implement the full domain logic specified in `requirements`.
+   - **1:1 Test Mapping**: Every entry in `contract.json` -> `scenarios` MUST be explicitly implemented as a concrete test function across all specified `target_test_file`s (matching `scenario_id`). When using `pytest.raises`, always specify `match=` or concrete exceptions (Ruff PT011).
+   - **Zero-Search Context Loading**: Read only `target_file`, `target_test_file`, and files listed in `context_files` (if present) via targeted `view_file`. Do NOT run exploratory `rg` / `find` / `list_dir` commands across the repository.
 
-2. **Phased Mechanical Implementation**:
-   - **Phase A (Scenarios)**: Translate `scenarios` and `python_assertion` from `contract.json` into concrete `pytest` test cases in `target_test_file`.
-   - **Phase B (Core Logic)**: Implement source logic at `target_file`.
-     - *Checkpoint*: Run `uv run python tools/agent_skills/lean_check.py --fast --spec docs/specs/<feature>_contract.json`. Verify non-dummy implementation.
-   - **Phase C (Wiring Integration)**: Integrate logic into `caller_file` at specified `anchor` location using `import_symbol` and `invocation_expression`.
-     - *Checkpoint*: Re-run `uv run python tools/agent_skills/lean_check.py --fast --spec docs/specs/<feature>_contract.json`. Ensure no orphaned implementations remain.
+2. **Phased Mechanical Workflow (Zero Invention)**:
+   - **Phase A (TDD Scenarios Placement - Red)**:
+     - Group `scenarios` by unique `target_test_file`.
+     - Count total scenarios ($N$). Iterate through each `target_test_file`:
+       1. View `target_test_file`.
+       2. Append all $N$ test functions using `test_skeleton` directly from `contract.json`. **Do NOT rewrite assertions, redesign fixtures, or invent test structures. Paste skeletons faithfully.**
+       3. Run pinpoint verification: `uv run pytest <target_test_file> -k "<scenario_id>" -q --tb=short && uv run ruff check <target_test_file>`.
+     - **Gate Check**: DO NOT touch `target_file` (Phase B) until ALL $N$ scenario tests are physically present in `target_test_file`s.
+   - **Phase B (Core Logic & Wiring - Green)**:
+     - Implement logic in `target_file` according to `changes` and `requirements` to turn tests green.
+     - Complete wiring in `caller_file` at `anchor` using `import_symbol` and `invocation_expression`.
+     - Run: `uv run ruff check <target_file> <caller_file>`.
 
-3. **Surgical Code Modifications & Token Efficiency**:
-   - MUST use targeted block/line edits (`replace_file_content` / `multi_replace_file_content`) to prevent code loss or unintended rewrites.
-   - **NO FLUFF**: Do NOT output intermediate phase explanations or duplicate modified code in chat text. Execute edits and commands immediately.
-   - **Quiet Commands**: Run test commands with quiet/compact flags (e.g. `pytest -q --tb=short`).
-
-4. **Full Audit Verification & Escalation Loop**:
-   - Run full verification via `uv run python tools/agent_skills/lean_check.py --spec docs/specs/<feature>_contract.json`.
-   - If contract conflicts with codebase realities or tests fail due to bad spec logic, STOP and escalate to `/spec`.
+3. **Mandatory Final Verification & Hard Stop**:
+   - **Hard Rule**: You MUST run `uv run python tools/agent_skills/lean_check.py --spec docs/specs/<feature>_contract.json`.
+   - **DO NOT output completion response until `lean_check.py` returns `PASS` (0 errors).**
+   - **Self-Healing on Missing Tests/Symbols**: If `lean_check` reports missing tests/symbols, read the diagnostic, implement the missing elements in designated files, and re-run `lean_check` until status is `PASS`.
+   - **Escalation to `/spec`**: STOP immediately ONLY if:
+     1) `contract.json` signature fundamentally conflicts with existing repository contracts.
+     2) Tests reveal an architectural impossibility or circular dependency.
+     3) 3 autonomous fix attempts fail due to spec-level design flaws.
 
 ## Output
 
-Provide a clear, concise summary with emojis. Example:
-
 ### 🔨 [IMPLEMENT] <Task Title>
 
-- **Status**: COMPLETE
-- **Modified**: <Count> files (`file1.py`, `file2.py`)
-- **Verification**: Pytest <Passed>/<Total> | Ruff <PASS/FAIL> | Mypy <PASS/FAIL>
-
+- **Status**: ✅ COMPLETE (or ❌ ESCALATED TO /spec)
+- **Modified**: <Count> files
+- **Verification**:
+  - 🧪 Pytest: <Passed>/<Total> passed
+  - 🧹 Ruff / Mypy: <PASS/FAIL>
+  - 📐 Spec Compliance: <PASS/FAIL>

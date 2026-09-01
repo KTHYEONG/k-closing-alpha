@@ -17,7 +17,7 @@ Post-development protocol for task finalization, ADR registration, index updatin
    - Automatically updates `docs/decisions/task_index.json` and `docs/code_map.json`.
 
 2. **Artifact Cleanup**:
-   - Purge temporary `docs/specs/` files and `scratch/` test scripts by default, unless requested otherwise.
+   - `sync_task.py` automatically purges temporary `docs/specs/*_contract.json` files, `scratch/` scripts, `tmp/` test roots, and logs. Persistent architecture documents (`docs/architecture/`, `00_architecture.md`) are safely preserved.
 
 ## Output
 

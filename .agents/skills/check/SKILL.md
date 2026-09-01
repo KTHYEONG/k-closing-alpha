@@ -9,11 +9,12 @@ Independent audit gate completing the main development loop (`spec` -> `implemen
 
 ## Directives
 
-1. **Identify Modified Scope**:
-   - Inspect modified files using `git status` or `git diff --name-only`.
+1. **Identify Modified Scope & Active Spec**:
+   - Inspect modified files using `git status --short`.
+   - Identify active spec contract under `docs/specs/*_contract.json` if available.
 
-2. **Standard Audit Execution**:
-   - Run Smart Selective Verification runner (auto-detects modified `.py` files, calculates Impact Level 1~3, and runs targeted tests/static checks synchronously in seconds):
+2. **Tier 1: Deterministic Audit Gate (Fast Script)**:
+   - Run Smart Selective Verification runner (auto-detects modified `.py` files, executes static checks & pinpoint tests):
      ```bash
      uv run python tools/agent_skills/lean_check.py
      ```
@@ -21,17 +22,19 @@ Independent audit gate completing the main development loop (`spec` -> `implemen
      ```bash
      uv run python tools/agent_skills/lean_check.py --spec docs/specs/<feature>_contract.json
      ```
-   - Fallback (if script fails):
-     - Code Style: `uv run ruff check`
-     - Strict Typing: `uv run mypy`
-     - Target Tests: `uv run pytest`
+   - **Immediate Stop on Tier 1 Failure**: If `lean_check.py` fails, immediately report `FAIL` with the root cause diagnostics without proceeding to Tier 2.
 
+3. **Tier 2: Silent Semantic Defect Scan (Targeted Code Review)**:
+   - If Tier 1 passes, perform a silent, token-efficient scan of the modified changes (`git diff`) focused ONLY on critical defects:
+     1) **Test Realism & Exception Specificity**: Ensure tests are non-vacuous (no trivial `assert True`, mocks do not mask core logic, and `pytest.raises` specifies `match=` or precise exception types).
+     2) **Contract & Invariant Integrity**: Verify core business invariants, division by zero / None handling, and boundary edge cases specified in requirements.
+     3) **Production Wire-up & No Ghost Paths**: Verify new logic is actually invoked in the production pipeline/entry-point (replacing legacy callers) and no unhandled branches or orphaned dead code remain.
+   - *Rule*: Do NOT nitpick purely subjective styling or propose cosmetic refactoring. Flag ONLY concrete bugs, spec omissions, or broken invariants.
 
-3. **Strict Audit Gate (No Code Mutation)**:
+4. **Strict Audit Gate (No Code Mutation)**:
    - Perform auditing independently. Do NOT modify source code during the check pass.
-   - Verify non-vacuous tests and contract compliance against `contract.json`.
-   - **Pre-sync Housekeeping Exception**: If the *only* failure is `test_code_map.py` (due to newly added canonical modules not yet registered in `docs/code_map.json`), treat logic audit as **PASS** with a clear note to run `/sync` next to close out code_map registration. Do NOT waste tokens trying to debug code logic for this pre-sync gap.
-   - If actual logic/type/test audit fails, report the exact failure diagnosis clearly for resolution in `/implement` or `/spec`.
+   - **Pre-sync Housekeeping Exception**: If the *only* failure is `test_code_map.py` (due to newly added canonical modules not yet registered in `docs/code_map.json`), treat logic audit as **PASS** with a clear note to run `/sync` next to close out code_map registration.
+   - If any Tier 1 or Tier 2 defect is found, reject the check with a compact failure diagnosis for resolution in `/implement` or `/spec`.
 
 ## Output
 

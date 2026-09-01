@@ -160,34 +160,69 @@ def _clean_scratch_dir() -> int:
     return count
 
 
-def _clean_specs(
-    remove_specs: list[str] | None = None,
-    keep_specs: list[str] | None = None,
-    keep_all_specs: bool = False,
-) -> int:
-    if keep_all_specs:
+def _clean_tmp_dir() -> int:
+    tmp_dir = "tmp"
+    if not os.path.exists(tmp_dir):
         return 0
+    count = 0
+    for root, dirs, files in os.walk(tmp_dir, topdown=False):
+        for f in files:
+            if f == ".gitignore":
+                continue
+            fpath = os.path.join(root, f)
+            try:
+                os.remove(fpath)
+                count += 1
+            except OSError:
+                pass
+        for d in dirs:
+            dpath = os.path.join(root, d)
+            with contextlib.suppress(OSError):
+                os.rmdir(dpath)
+    return count
+
+
+def _clean_logs_dir() -> int:
+    logs_dir = "logs"
+    if not os.path.exists(logs_dir):
+        return 0
+    count = 0
+    for root, dirs, files in os.walk(logs_dir, topdown=False):
+        for f in files:
+            if f == ".gitignore":
+                continue
+            fpath = os.path.join(root, f)
+            try:
+                os.remove(fpath)
+                count += 1
+            except OSError:
+                pass
+        for d in dirs:
+            dpath = os.path.join(root, d)
+            with contextlib.suppress(OSError):
+                os.rmdir(dpath)
+    return count
+
+
+def _clean_specs(remove_specs: list[str] | None = None) -> int:
     specs_dir = "docs/specs"
     if not _path_exists(specs_dir):
         return 0
 
-    keep_set = set(keep_specs) if keep_specs else set()
-
     target_prefixes: set[str] = set()
     if remove_specs:
         for item in remove_specs:
-            base = item.replace(".md", "").replace("_contract.json", "").replace("docs/specs/", "").strip()
+            base = item.replace(".md", "").replace("_contract.json", "").replace("contract.json", "").replace("docs/specs/", "").strip()
             if base:
                 target_prefixes.add(base.lower())
 
     count = 0
     for fname in os.listdir(specs_dir):
-        if fname.endswith((".md", "_contract.json")):
-            if fname in keep_set or fname.lower() in keep_set:
+        if fname.endswith((".md", "_contract.json", "contract.json")):
+            if fname == "00_architecture.md":
                 continue
-
             if target_prefixes:
-                fname_base = fname.replace(".md", "").replace("_contract.json", "").lower()
+                fname_base = fname.replace(".md", "").replace("_contract.json", "").replace("contract.json", "").lower()
                 if fname_base not in target_prefixes and fname.lower() not in target_prefixes:
                     continue
 
@@ -214,8 +249,6 @@ def main() -> None:
     parser.add_argument("--test", default=None, help="Test file path")
     parser.add_argument("--doc", default=None, help="Architecture doc path")
     parser.add_argument("--remove-specs", nargs="*", default=[], help="Spec files to remove")
-    parser.add_argument("--keep-specs", nargs="*", default=[], help="Spec files to preserve")
-    parser.add_argument("--keep-all-specs", action="store_true", help="Preserve all spec files")
     args = parser.parse_args()
 
     logs: list[str] = []
@@ -271,22 +304,23 @@ def main() -> None:
         gen_code_map.main()
 
 
-    # 3. Temp & Scratch Wipe
+    # 3. Temp & Scratch & Logs Wipe
     try:
         wiped = _wipe_temp_artifacts()
         scratch_wiped = _clean_scratch_dir()
-        if wiped > 0 or scratch_wiped > 0:
-            logs.append(f"Wiped {wiped} temp, {scratch_wiped} scratch files")
+        tmp_wiped = _clean_tmp_dir()
+        logs_wiped = _clean_logs_dir()
+        total_cleaned = wiped + scratch_wiped + tmp_wiped + logs_wiped
+        if total_cleaned > 0:
+            logs.append(
+                f"Wiped {wiped} temp, {scratch_wiped} scratch, {tmp_wiped} tmp, {logs_wiped} logs files"
+            )
     except Exception as e:
         errors.append(f"Temp wipe failed: {e}")
 
     # 4. Spec Cleanup
     try:
-        cleaned = _clean_specs(
-            remove_specs=args.remove_specs,
-            keep_specs=args.keep_specs,
-            keep_all_specs=args.keep_all_specs,
-        )
+        cleaned = _clean_specs(remove_specs=args.remove_specs)
         if cleaned > 0:
             logs.append(f"Cleaned {cleaned} spec files")
     except Exception as e:
