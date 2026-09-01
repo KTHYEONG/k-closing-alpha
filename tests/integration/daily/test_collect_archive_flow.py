@@ -180,7 +180,11 @@ def test_collect_main_saves_csv_without_auto_archive(
     monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all_stock_data)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
     monkeypatch.setattr(collect, "load_theme_from_db", lambda: {})
-    monkeypatch.setattr(collect, "append_stocks_to_gsheet", lambda *a, **k: None)
+    monkeypatch.setattr(
+        collect,
+        "batch_resolve_missing_themes",
+        lambda stocks, **kw: [{**s, "테마": "기타", "시장구분": "KOSPI"} for s in stocks],
+    )
 
     asyncio.run(collect.main())
 
