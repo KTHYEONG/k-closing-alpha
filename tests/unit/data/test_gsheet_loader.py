@@ -134,3 +134,22 @@ def test_append_stocks_to_gsheet_dedup(fake_gsheet_client, tmp_path) -> None:
         ],
     )
     assert ws.appended == [["", "123456", "신규종목"]]
+
+
+def test_append_stocks_to_gsheet_with_theme_and_market(fake_gsheet_client, monkeypatch) -> None:
+    from src.data.gsheet_loader import append_stocks_to_gsheet
+
+    ws = fake_gsheet_client.worksheet("Trade")
+    ws._records = [{"종목코드": "005930", "종목명": "삼성전자", "테마/섹터": "반도체", "시장구분": "KOSPI"}]
+
+    stocks_to_add = [
+        {"종목코드": "452430", "종목명": "아이엠티", "테마": "반도체", "시장구분": "KOSDAQ"}
+    ]
+
+    append_stocks_to_gsheet("fake_key", "Trade", "Trade", stocks_to_add)
+    assert len(ws.appended) == 1
+    appended_row = ws.appended[0]
+    assert "452430" in appended_row
+    assert "아이엠티" in appended_row
+    assert "반도체" in appended_row
+    assert "KOSDAQ" in appended_row

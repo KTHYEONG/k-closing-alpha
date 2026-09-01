@@ -188,14 +188,14 @@ def test_explain_predictions_with_shap_formats_non_numeric_values() -> None:
 
 
 def test_main_returns_when_no_actionable_stocks() -> None:
-    df_condition = pd.DataFrame({"종목코드": ["000001"], "종목명": ["AAA"]})
+    df_condition = pd.DataFrame(columns=["종목코드", "종목명", "시장구분"])
     with (
         patch.object(predict.os.path, "exists", return_value=False),
         patch.object(
             predict, "load_and_preprocess_data", return_value=df_condition
         ),
         patch.object(predict, "load_theme_from_db", return_value={}),
-        patch.object(predict, "sync_theme_only"),
+        patch.object(predict, "batch_resolve_missing_themes"),
     ):
         predict.main()
 
@@ -263,7 +263,7 @@ def test_main_runs_redesigned_pipeline_with_mocks() -> None:
             "load_theme_from_db",
             return_value={"000001": "테마A", "000002": "테마A"},
         ),
-        patch.object(predict, "sync_theme_only"),
+        patch.object(predict, "batch_resolve_missing_themes"),
         patch(
             "src.api.kis_client.fetch_index_and_calculate_volatility",
             side_effect=fake_fetch,
