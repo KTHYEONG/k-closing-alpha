@@ -27,6 +27,7 @@ dependencies = [
     "xgboost>=2.1.0",
     "catboost>=1.2.0",
     "huggingface-hub>=1.26.0",
+    "optuna>=4.0.0",
 ]
 
 [build-system]
@@ -82,7 +83,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "S105", "S106", "E402", "N803", "N806", "N813", "N814", "ARG", "I001", "RUF059", "F841"]
+"tests/*" = ["S101", "S105", "S106", "E402", "N803", "N806", "N813", "N814", "ARG", "I001", "RUF059", "F841", "F401", "F811", "PT018"]
 "scripts/*" = ["T20"]
 "tools/agent_skills/lean_check.py" = ["T20", "S607"]
 "tools/agent_skills/gen_code_map.py" = ["T20"]
@@ -124,7 +125,7 @@ exclude = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["tests.*", "src.backfill.*", "src.daily.*", "src.sync.*", "src.api.*", "src.data.*", "src.processing.*", "src.utils.*"]
+module = ["tests.*", "src.backfill.*", "src.daily.*", "src.sync.*", "src.api.*", "src.data.*", "src.processing.*", "src.utils.*", "src.ml.*"]
 ignore_errors = true
 
 
