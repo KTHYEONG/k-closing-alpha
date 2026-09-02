@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ALTDATA_KRX_OPENAPI",
+      "date": "2026-09-02",
+      "adr_id": "ADR_20260902_ALTDATA_KRX_OPENAPI",
+      "domain": "backfill",
+      "title": "KRX Open API 대체데이터 주 경로 통합 및 OpenDART 이중 키 지원",
+      "why": "pykrx 가 KRX 안티봇으로 차단되는 환경에서 파생 베이시스·공시 백필이 빈 결과를 내고, 암호화 볼트(.env.enc)의 OPENDART_API_KEY 와 구 DART_API_KEY 가 불일치",
+      "resolution": "krx_api.py(AUTH_KEY 헤더, 401/404 fail-soft) 추가, derivatives 를 KRX Open API 주 경로 + pykrx fallback 구조로 재편, disclosure 에 창 단위 즉시 flush(on_window/covered_dates) 도입, KRX rate-limit 슬롯 및 krx_requests_per_sec/krx_api_key 설정, OPENDART_API_KEY 우선 dart_key 프로퍼티와 --krx-key CLI 인자 추가",
+      "impact": "KRX 차단 환경에서도 파생·지수 일별매매정보 수집 가능, 공시 백필 중단 시 수신 구간 보존, 암호화 키 체계와 정합"
+    },
+    {
       "task_id": "TASK_ML_ALTDATA_BACKFILL",
       "date": "2026-09-01",
       "adr_id": "ADR_20260901_ML_ALTDATA_BACKFILL",
