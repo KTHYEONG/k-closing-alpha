@@ -217,9 +217,17 @@ def run_altdata_backfill(cfg: AltDataFetchConfig) -> dict[str, Any]:
                         corp_map.to_parquet(corp_map_path, index=False)
                     except Exception:
                         pass
-                raw = disc_mod.collect_disclosures(cfg, corp_map)
-                # For disclosure, need to filter to missing dates? The raw already covers full range but we incremental merge later.
-                # No extra filtering needed, but normalize will handle.
+                # 창 단위 즉시 flush: 중단되어도 이미 받은 구간은 보존.
+                def _flush_window(window_df: pd.DataFrame, _pp: Path = panel_path, _kc: tuple[str, ...] = key_cols) -> None:
+                    norm = normalize_panel(window_df, "disclosure", cfg)
+                    if norm is None or norm.empty:
+                        return
+                    _atomic_write_parquet(_incremental_merge(_pp, norm, _kc), _pp)
+
+                disc_mod.collect_disclosures(
+                    cfg, corp_map, on_window=_flush_window, covered_dates=set(covered)
+                )
+                raw = pd.read_parquet(panel_path) if panel_path.exists() else pd.DataFrame()
             else:
                 raw = pd.DataFrame()
 
