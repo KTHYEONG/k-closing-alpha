@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_MULTIDAY_FEATURE_LAYER",
+      "date": "2026-09-02",
+      "adr_id": "ADR_20260902_ML_MULTIDAY_FEATURE_LAYER",
+      "domain": "ml",
+      "title": "다일 시계열 피처 레이어(Phase 1) 및 실현변동성 실측화 + 학습설정 병목 실증",
+      "why": "close_morning61 61피처가 전부 당일 스냅샷이라 rankIC 0.24→0.17 감쇠, price_history/altdata 완전 미활용, sizing 실현변동성이 상수 0.02 하드코딩",
+      "resolution": "src/ml/history_features.py 추가(merge_asof backward+allow_exact_matches=False 무누수, 트레일링 16피처: 모멘텀/MA이격/실현변동성/ATR/52주고저/거래량비율/Amihud/수급z/상승일비율), build_ml_dataset 에 feature_set='close_morning_history' 가산 통합 및 realized_vol 컬럼 산출(_EXCLUDED_FROM_X), champion/retrain --feature-set 배선, PRICE_HISTORY_PARQUET_PATH 설정 추가",
+      "impact": "무누수 배관은 정상이나 5-fold purged OOF 실측 결과 구현된 그대로(raw)는 top1_net 1.465%→1.351%(-11bp)로 역효과. 원인분해: 횡단면 정규화가 손실 상쇄(1.483%), 결정적 레버는 파라미터 튜닝(baseline+튜닝 1.652%, +19bp p=0.015). Phase 1 승격 금지, 로드맵을 P3(HPO/Huber δ) 선행으로 재정렬"
+    },
+    {
       "task_id": "ALTDATA_KRX_OPENAPI",
       "date": "2026-09-02",
       "adr_id": "ADR_20260902_ALTDATA_KRX_OPENAPI",

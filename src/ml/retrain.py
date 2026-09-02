@@ -21,6 +21,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--theme", default=str(settings.THEME_PARQUET_PATH))
     parser.add_argument("--export-dir", default="artifacts/models")
     parser.add_argument("--tuned", action="store_true")
+    parser.add_argument("--feature-set", default="close_morning61", choices=["close_morning61", "close_morning_history"])
     parser.add_argument("--oos-reserve-start", default=None)
     parser.add_argument("--weighting-mode", default="current")
     parser.add_argument("--recency-half-life", default=None)
@@ -30,6 +31,7 @@ def main(argv: list[str] | None = None) -> None:
 
     trade_log_df = pd.read_parquet(args.trade_log)
     theme_df = pd.read_parquet(args.theme) if os.path.exists(args.theme) else None
+    price_history_df = pd.read_parquet(settings.PRICE_HISTORY_PARQUET_PATH) if args.feature_set == "close_morning_history" and os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH) else None
 
     if args.tuned:
         recency = int(args.recency_half_life) if args.recency_half_life is not None else None
@@ -40,7 +42,7 @@ def main(argv: list[str] | None = None) -> None:
             hpo_trials=args.hpo_trials,
             require_beats_control=not args.no_gate,
         )
-        bundle = train_tuned_champion_bundle(trade_log_df, theme_df, cfg, export_dir=args.export_dir)
+        bundle = train_tuned_champion_bundle(trade_log_df, theme_df, cfg, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df)
         prov = bundle.get("tuning_provenance", {})
         cvc = prov.get("control_vs_candidate", {})
         logger.info(
@@ -48,7 +50,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         logger.info(f"tuned bundle saved: {bundle.get('training_cutoff')} provenance={prov}")
     else:
-        bundle = train_champion_bundle(trade_log_df, theme_df, export_dir=args.export_dir)
+        bundle = train_champion_bundle(trade_log_df, theme_df, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df)
         logger.info(f"champion bundle saved: {bundle.get('training_cutoff')}")
 
 

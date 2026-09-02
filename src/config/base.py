@@ -95,6 +95,11 @@ class PathSettings(BaseSettings):
     def ALTDATA_DIR(self) -> Path:
         return self.HISTORY_DIR / "altdata"
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def PRICE_HISTORY_PARQUET_PATH(self) -> Path:
+        return self.HISTORY_DIR / "price_history.parquet"
+
     # ---------------------------------------------------------
     # [스펙 하위 호환 별칭] (spec: base_dir, data_dir, models_dir, ...)
     # ---------------------------------------------------------
