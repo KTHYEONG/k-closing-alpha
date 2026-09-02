@@ -20,6 +20,9 @@ _PYKRX_NEXT = 0.0
 _DART_LOCK = threading.Lock()
 _DART_NEXT = 0.0
 
+_KRX_LOCK = threading.Lock()
+_KRX_NEXT = 0.0
+
 
 def wait_for_pykrx_slot(cfg: AltDataFetchConfig) -> None:
     """pykrx 호출 간격을 제한합니다.
@@ -49,6 +52,22 @@ def wait_for_dart_slot(cfg: AltDataFetchConfig) -> None:
         now = time.monotonic()
         wait = max(0.0, _DART_NEXT - now)
         _DART_NEXT = max(now, _DART_NEXT) + interval
+    if wait > 0:
+        time.sleep(wait)
+
+
+def wait_for_krx_slot(cfg: AltDataFetchConfig) -> None:
+    """KRX Open API 호출 간격을 제한합니다.
+
+    Args:
+        cfg: Alt-data 설정.
+    """
+    global _KRX_NEXT
+    interval = 1.0 / max(0.1, float(cfg.krx_requests_per_sec))
+    with _KRX_LOCK:
+        now = time.monotonic()
+        wait = max(0.0, _KRX_NEXT - now)
+        _KRX_NEXT = max(now, _KRX_NEXT) + interval
     if wait > 0:
         time.sleep(wait)
 
