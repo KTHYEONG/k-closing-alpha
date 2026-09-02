@@ -17,6 +17,17 @@ def test_altdata_config_rejects_invalid_domains() -> None:
         AltDataFetchConfig(start=pd.Timestamp("2020-01-01"), end=pd.Timestamp("2020-02-01"), out_dir=Path("x"), markets=("NASDAQ",))
     with pytest.raises(ValueError, match="pykrx_requests_per_sec"):
         AltDataFetchConfig(start=pd.Timestamp("2020-01-01"), end=pd.Timestamp("2020-02-01"), out_dir=Path("x"), pykrx_requests_per_sec=0.0)
+    with pytest.raises(ValueError, match="krx_requests_per_sec"):
+        AltDataFetchConfig(start=pd.Timestamp("2020-01-01"), end=pd.Timestamp("2020-02-01"), out_dir=Path("x"), krx_requests_per_sec=0.0)
+
+
+def test_altdata_config_carries_krx_api_key() -> None:
+    cfg = AltDataFetchConfig(
+        start=pd.Timestamp("2020-01-01"), end=pd.Timestamp("2020-02-01"),
+        out_dir=Path("x"), krx_api_key="AUTHKEY", krx_requests_per_sec=3.0,
+    )
+    assert cfg.krx_api_key == "AUTHKEY"
+    assert cfg.krx_requests_per_sec == 3.0
 
 
 import pathlib
