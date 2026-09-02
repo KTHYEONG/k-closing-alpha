@@ -34,9 +34,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--start", type=str, default="2016-01-01", help="start date YYYY-MM-DD")
     parser.add_argument("--end", type=str, default="", help="end date YYYY-MM-DD")
     parser.add_argument("--out-dir", type=str, default=str(settings.ALTDATA_DIR), help="output directory")
-    parser.add_argument("--dart-key", type=str, default=settings.DART_API_KEY, help="DART API key")
+    parser.add_argument(
+        "--dart-key",
+        type=str,
+        default=(settings.OPENDART_API_KEY or settings.DART_API_KEY),
+        help="OpenDART API key",
+    )
+    parser.add_argument(
+        "--krx-key", type=str, default=settings.KRX_OPENAPI_KEY, help="KRX Open API AUTH_KEY"
+    )
     parser.add_argument("--pykrx-rps", type=float, default=6.0, help="pykrx requests per sec")
     parser.add_argument("--dart-rps", type=float, default=8.0, help="DART requests per sec")
+    parser.add_argument("--krx-rps", type=float, default=4.0, help="KRX Open API requests per sec")
     parser.add_argument(
         "--trade-log-universe",
         action="store_true",
@@ -71,9 +80,11 @@ def main(argv: list[str] | None = None) -> None:
 
     out_dir = Path(args.out_dir) if str(args.out_dir).strip() else settings.ALTDATA_DIR
 
-    dart_key = str(args.dart_key).strip() if args.dart_key is not None else settings.DART_API_KEY
+    dart_key = str(args.dart_key or "").strip()
+    krx_key = str(args.krx_key or "").strip()
     pykrx_rps = float(args.pykrx_rps)
     dart_rps = float(args.dart_rps)
+    krx_rps = float(args.krx_rps)
 
     universe_symbols: frozenset[str] | None = None
     if args.trade_log_universe:
@@ -101,8 +112,10 @@ def main(argv: list[str] | None = None) -> None:
         out_dir=out_dir,
         sources=sources,
         dart_api_key=dart_key,
+        krx_api_key=krx_key,
         pykrx_requests_per_sec=pykrx_rps,
         dart_requests_per_sec=dart_rps,
+        krx_requests_per_sec=krx_rps,
         universe_symbols=universe_symbols,
     )
     manifest = run_altdata_backfill(cfg)

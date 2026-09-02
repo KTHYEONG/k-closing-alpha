@@ -1,12 +1,14 @@
-"""KOSPI200 지수-선물 베이시스 수집기."""
+"""KOSPI200 지수-선물 베이시스 수집기 (KRX Open API 주 경로 + pykrx fallback)."""
 
 from __future__ import annotations
 
 import logging
+import re
 
 import pandas as pd
 
 from src.backfill.altdata.config import AltDataFetchConfig
+from src.backfill.altdata.krx_api import KRX_ENDPOINT_FUT_DAILY, fetch_krx_openapi_day
 from src.backfill.altdata.ratelimit import retry_call, wait_for_pykrx_slot
 
 logger = logging.getLogger(__name__)
@@ -16,163 +18,157 @@ try:
 except ImportError:  # pragma: no cover
     stock = None  # type: ignore[assignment]
 
+_COLS = [
+    "date",
+    "kospi200_close",
+    "k200_future_close",
+    "basis",
+    "basis_pct",
+    "future_volume",
+    "future_open_interest",
+]
+
+# KRX drv/fut_bydd_trd 의 코스피200 정규 선물 (미니/위클리/스프레드 제외).
+_K200_PROD = "코스피200 선물"
+_EXPIRY_RE = re.compile(r"(\d{6})")
+
 
 def _to_ymd(ts: pd.Timestamp) -> str:
     return pd.Timestamp(ts).strftime("%Y%m%d")
 
 
-def collect_derivatives_basis(cfg: AltDataFetchConfig, business_days: list[pd.Timestamp]) -> pd.DataFrame:
-    """파생 베이시스 패널을 수집합니다.
+def _krx_front_month_row(raw: pd.DataFrame, ymd: str) -> dict[str, float] | None:
+    """KRX 선물 일별매매 응답에서 코스피200 최근월물 1행을 고릅니다."""
+    if raw is None or raw.empty or "PROD_NM" not in raw.columns:
+        return None
+    work = raw[raw["PROD_NM"].astype(str).str.strip() == _K200_PROD].copy()
+    if "MKT_NM" in work.columns:
+        work = work[work["MKT_NM"].astype(str).str.contains("정규", na=False)]
+    # 스프레드(SP) 종목 제외
+    if "ISU_NM" in work.columns:
+        work = work[~work["ISU_NM"].astype(str).str.contains(" SP ", na=False)]
+    if work.empty:
+        return None
+    # 만기(YYYYMM) 파싱 → 기준일 이후 최근월물
+    ym = work["ISU_NM"].astype(str).str.extract(_EXPIRY_RE, expand=False)
+    work = work.assign(_ym=pd.to_numeric(ym, errors="coerce"))
+    cur_ym = int(ymd[:6])
+    fwd = work[work["_ym"] >= cur_ym]
+    picked = (fwd if not fwd.empty else work).sort_values("_ym").iloc[0]
+
+    spot = pd.to_numeric(picked.get("SPOT_PRC"), errors="coerce")
+    fut = pd.to_numeric(picked.get("TDD_CLSPRC"), errors="coerce")
+    vol = pd.to_numeric(picked.get("ACC_TRDVOL"), errors="coerce")
+    oi = pd.to_numeric(picked.get("ACC_OPNINT_QTY"), errors="coerce")
+    basis = float(fut - spot) if pd.notna(fut) and pd.notna(spot) else float("nan")
+    basis_pct = (
+        float(basis / spot) if pd.notna(spot) and float(spot) != 0.0 and pd.notna(basis) else float("nan")
+    )
+    return {
+        "kospi200_close": float(spot) if pd.notna(spot) else float("nan"),
+        "k200_future_close": float(fut) if pd.notna(fut) else float("nan"),
+        "basis": basis,
+        "basis_pct": basis_pct,
+        "future_volume": float(vol) if pd.notna(vol) else float("nan"),
+        "future_open_interest": float(oi) if pd.notna(oi) else float("nan"),
+    }
+
+
+def _collect_via_krx(cfg: AltDataFetchConfig, business_days: list[pd.Timestamp]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for day in business_days:
+        ymd = _to_ymd(day)
+        raw = fetch_krx_openapi_day(KRX_ENDPOINT_FUT_DAILY, ymd, cfg)
+        picked = _krx_front_month_row(raw, ymd)
+        if picked is None:
+            continue
+        rows.append({"date": pd.Timestamp(day).normalize(), **picked})
+    return pd.DataFrame(rows, columns=_COLS)
+
+
+def _collect_via_pykrx(cfg: AltDataFetchConfig, business_days: list[pd.Timestamp]) -> pd.DataFrame:
+    """pykrx fallback (환경에 따라 KRX 차단으로 빈 결과일 수 있음)."""
+    if stock is None or not business_days:
+        return pd.DataFrame(columns=_COLS)
+
+    def _spot_call() -> pd.DataFrame:
+        wait_for_pykrx_slot(cfg)
+        return stock.get_index_ohlcv(_to_ymd(business_days[0]), _to_ymd(business_days[-1]), "1028")
+
+    spot_df = retry_call(_spot_call, cfg, label="derivatives spot 1028")
+    spot_map: dict[pd.Timestamp, float] = {}
+    if spot_df is not None and not spot_df.empty:
+        idx = pd.to_datetime(spot_df.index, errors="coerce")
+        close_col = next((c for c in ("종가", "Close", "close") if c in spot_df.columns), None)
+        if close_col is not None:
+            for d, v in zip(idx, spot_df[close_col], strict=False):
+                spot_map[pd.Timestamp(d).normalize()] = float(pd.to_numeric(v, errors="coerce"))
+
+    rows: list[dict[str, object]] = []
+    for day in business_days:
+        d_norm = pd.Timestamp(day).normalize()
+        spot = spot_map.get(d_norm, float("nan"))
+
+        def _fut_call(_ymd: str = _to_ymd(day)) -> pd.DataFrame:
+            wait_for_pykrx_slot(cfg)
+            return stock.get_future_ohlcv_by_ticker(_ymd)
+
+        fut_df = retry_call(_fut_call, cfg, label=f"derivatives future {_to_ymd(day)}")
+        fut = vol = oi = float("nan")
+        if fut_df is not None and not fut_df.empty:
+            close_c = next((c for c in ("종가", "Close", "close") if c in fut_df.columns), None)
+            vol_c = next((c for c in ("거래량", "Volume", "volume") if c in fut_df.columns), None)
+            oi_c = next((c for c in ("미결제약정", "open_interest") if c in fut_df.columns), None)
+            first = fut_df.iloc[0]
+            if close_c is not None:
+                fut = float(pd.to_numeric(first[close_c], errors="coerce"))
+            if vol_c is not None:
+                vol = float(pd.to_numeric(first[vol_c], errors="coerce"))
+            if oi_c is not None:
+                oi = float(pd.to_numeric(first[oi_c], errors="coerce"))
+        if pd.isna(spot) and pd.isna(fut):
+            # 휴장일/무자료일 — 빈 행을 만들지 않는다.
+            continue
+        basis = float(fut - spot) if pd.notna(fut) and pd.notna(spot) else float("nan")
+        basis_pct = (
+            float(basis / spot) if pd.notna(spot) and float(spot) != 0.0 and pd.notna(basis) else float("nan")
+        )
+        rows.append(
+            {
+                "date": d_norm,
+                "kospi200_close": spot,
+                "k200_future_close": fut,
+                "basis": basis,
+                "basis_pct": basis_pct,
+                "future_volume": vol,
+                "future_open_interest": oi,
+            }
+        )
+    return pd.DataFrame(rows, columns=_COLS)
+
+
+def collect_derivatives_basis(
+    cfg: AltDataFetchConfig, business_days: list[pd.Timestamp]
+) -> pd.DataFrame:
+    """KOSPI200 지수-선물 베이시스 패널을 수집합니다.
+
+    KRX Open API(``drv/fut_bydd_trd``) 를 주 경로로 사용하고, 유효 행이 하나도
+    없으면 pykrx 로 fallback 합니다.
 
     Args:
         cfg: Alt-data 설정.
         business_days: 영업일 목록.
 
     Returns:
-        수집된 원시 DataFrame.
+        수집된 원시 DataFrame (``date`` 키, 시장 레벨).
     """
-    cols = ["date", "kospi200_close", "k200_future_close", "basis", "basis_pct", "future_volume", "future_open_interest"]
-    if stock is None or not business_days:
-        return pd.DataFrame(columns=cols)
+    if not business_days:
+        return pd.DataFrame(columns=_COLS)
 
-    # Spot: get_index_ohlcv for KOSPI200 (code 1028)
-    def _spot_call() -> pd.DataFrame:
-        wait_for_pykrx_slot(cfg)
-        start_ymd = _to_ymd(business_days[0])
-        end_ymd = _to_ymd(business_days[-1])
-        return stock.get_index_ohlcv(start_ymd, end_ymd, "1028")
+    krx = _collect_via_krx(cfg, business_days)
+    if not krx.empty:
+        # KRX 주 경로가 하나라도 유효 행을 냈으면 그대로 사용 (부분 커버리지 허용).
+        return krx
 
-    spot_df = retry_call(_spot_call, cfg, label="derivatives spot 1028")
-    # Build map date -> close
-    spot_map: dict[pd.Timestamp, float] = {}
-    if spot_df is not None and not spot_df.empty:
-        work = spot_df.copy()
-        # index is date
-        work.index = pd.to_datetime(work.index, errors="coerce")
-        # Find close column
-        close_col = None
-        for cand in ["종가", "Close", "close"]:
-            if cand in work.columns:
-                close_col = cand
-                break
-        if close_col is None and len(work.columns) > 3:
-            close_col = list(work.columns)[3]
-        if close_col is not None:
-            for idx, val in work[close_col].items():
-                d = pd.Timestamp(idx).normalize()
-                try:
-                    spot_map[d] = float(pd.to_numeric(val, errors="coerce"))
-                except Exception:
-                    continue
-
-    rows: list[dict[str, object]] = []
-    for day in business_days:
-        ymd = _to_ymd(day)
-        d_norm = pd.Timestamp(day).normalize()
-        kospi200_close = spot_map.get(d_norm, float("nan"))
-
-        # Future per day
-        def _fut_call() -> pd.DataFrame:
-            wait_for_pykrx_slot(cfg)
-            return stock.get_future_ohlcv_by_ticker(ymd)
-
-        fut_df = retry_call(_fut_call, cfg, label=f"derivatives future {ymd}")
-        future_close = float("nan")
-        future_vol = float("nan")
-        future_oi = float("nan")
-        if fut_df is not None and not fut_df.empty:
-            work = fut_df.copy()
-            # Try to pick nearest expiry >= ymd
-            # If expiry column exists, parse it
-            expiry_col = None
-            for cand in ["만기일", "expiry", "Expiry", "expire"]:
-                if cand in work.columns:
-                    expiry_col = cand
-                    break
-            close_col2 = None
-            for cand in ["종가", "Close", "close"]:
-                if cand in work.columns:
-                    close_col2 = cand
-                    break
-            if close_col2 is None and len(work.columns) > 0:
-                close_col2 = list(work.columns)[0]
-            vol_col = None
-            for cand in ["거래량", "Volume", "volume"]:
-                if cand in work.columns:
-                    vol_col = cand
-                    break
-            oi_col = None
-            for cand in ["미결제약정", "open_interest", "OpenInterest"]:
-                if cand in work.columns:
-                    oi_col = cand
-                    break
-            # If expiry available, filter
-            if expiry_col is not None:
-                try:
-                    work["_expiry_parsed"] = pd.to_datetime(work[expiry_col], errors="coerce")
-                    ymd_ts = pd.Timestamp(ymd)
-                    # Keep rows where expiry >= ymd
-                    valid = work[work["_expiry_parsed"] >= ymd_ts]
-                    if not valid.empty:
-                        valid = valid.sort_values("_expiry_parsed")
-                        picked = valid.iloc[0]
-                    else:
-                        # fallback to first row
-                        picked = work.iloc[0]
-                    if close_col2 is not None:
-                        future_close = float(pd.to_numeric(picked[close_col2], errors="coerce"))
-                    if vol_col is not None:
-                        future_vol = float(pd.to_numeric(picked[vol_col], errors="coerce"))
-                    if oi_col is not None:
-                        future_oi = float(pd.to_numeric(picked[oi_col], errors="coerce"))
-                except Exception:
-                    # fallback to first row close
-                    if close_col2 is not None:
-                        try:
-                            future_close = float(pd.to_numeric(work.iloc[0][close_col2], errors="coerce"))
-                        except Exception:
-                            pass
-            else:
-                # No expiry column: take first row
-                if close_col2 is not None:
-                    try:
-                        future_close = float(pd.to_numeric(work.iloc[0][close_col2], errors="coerce"))
-                    except Exception:
-                        pass
-                if vol_col is not None:
-                    try:
-                        future_vol = float(pd.to_numeric(work.iloc[0][vol_col], errors="coerce"))
-                    except Exception:
-                        pass
-                if oi_col is not None:
-                    try:
-                        future_oi = float(pd.to_numeric(work.iloc[0][oi_col], errors="coerce"))
-                    except Exception:
-                        pass
-
-        # Compute basis
-        try:
-            if pd.notna(kospi200_close) and pd.notna(future_close):
-                basis = float(future_close) - float(kospi200_close)
-                basis_pct = float(basis) / float(kospi200_close) if float(kospi200_close) != 0 else float("nan")
-            else:
-                basis = float("nan")
-                basis_pct = float("nan")
-        except Exception:
-            basis = float("nan")
-            basis_pct = float("nan")
-
-        rows.append(
-            {
-                "date": d_norm,
-                "kospi200_close": kospi200_close,
-                "k200_future_close": future_close,
-                "basis": basis,
-                "basis_pct": basis_pct,
-                "future_volume": future_vol,
-                "future_open_interest": future_oi,
-            }
-        )
-
-    out = pd.DataFrame(rows, columns=cols)
-    return out
+    logger.warning("[DATA] stage=altdata_deriv status=KRX_EMPTY fallback=pykrx")
+    return _collect_via_pykrx(cfg, business_days)
