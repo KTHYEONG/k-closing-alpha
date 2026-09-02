@@ -69,9 +69,11 @@ class AltDataFetchConfig:
     universe_symbols: frozenset[str] | None = None
     pykrx_requests_per_sec: float = 6.0
     dart_requests_per_sec: float = 8.0
+    krx_requests_per_sec: float = 4.0
     retries: int = 4
     retry_sleep_sec: float = 1.0
     dart_api_key: str = ""
+    krx_api_key: str = ""
     page_count: int = 100
 
     def __post_init__(self) -> None:
@@ -106,6 +108,8 @@ class AltDataFetchConfig:
             raise ValueError("pykrx_requests_per_sec must be > 0")
         if not (float(self.dart_requests_per_sec) > 0):
             raise ValueError("dart_requests_per_sec must be > 0")
+        if not (float(self.krx_requests_per_sec) > 0):
+            raise ValueError("krx_requests_per_sec must be > 0")
         if not (int(self.retries) >= 1):
             raise ValueError("retries must be >= 1")
         if not (float(self.retry_sleep_sec) >= 0):
