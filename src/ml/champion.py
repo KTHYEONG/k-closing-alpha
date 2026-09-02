@@ -10,6 +10,7 @@ import pandas as pd
 
 from src.ml.bundle import build_inline_bundle, save_bundle
 from src.ml.dataset import build_ml_dataset, retarget_with_clip
+from src.ml.history_features import HISTORY_FEATURE_COLUMNS  # noqa: F401 (used via dataset)
 from src.ml.oof import purged_oof_predict
 from src.ml.policy_eval import default_policy_candidates, evaluate_single_stock_policy_oof
 from src.ml.tuning import (
@@ -130,10 +131,12 @@ def train_champion_bundle(
     trade_log_df: pd.DataFrame,
     theme_df: pd.DataFrame | None = None,
     export_dir: str = "artifacts/models",
+    feature_set: str = "close_morning61",
+    price_history_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """PHASE1 reproduction of legacy champion bundle."""
     x_features, _targets, cat_features, processed = build_ml_dataset(
-        trade_log_df, theme_df, feature_set="close_morning61", panel_mode="scenario_action"
+        trade_log_df, theme_df, feature_set=feature_set, panel_mode="scenario_action", price_history_df=price_history_df
     )
     feature_cols = [c for c in x_features.columns if c not in cat_features]
     target_col = "target_return"
@@ -145,17 +148,17 @@ def train_champion_bundle(
         target_col,
         group_col,
     )
-    bundle["feature_set"] = "close_morning61"
+    bundle["feature_set"] = feature_set
     bundle["panel_mode"] = "scenario_action"
     bundle["single_stock_policy"] = policy.model_dump() if policy is not None else None
     bundle["policy_metadata"] = policy_metadata
     bundle["decision_score_config"] = dict(_CLOSE_MORNING_RERANKER_CONFIG)
     bundle["oof_score_col"] = "decision_score"
     bundle["daily_score_col"] = "decision_score"
-    save_dir = _candidate_export_dir(export_dir, "close_morning61", bundle)
+    save_dir = _candidate_export_dir(export_dir, feature_set, bundle)
     save_bundle(bundle, save_dir)
     logger.info(
-        f"{Colors.GREEN}champion bundle saved: feature_set=close_morning61 policy={policy.candidate if policy else None} (save_dir={save_dir}){Colors.RESET}"
+        f"{Colors.GREEN}champion bundle saved: feature_set={feature_set} policy={policy.candidate if policy else None} (save_dir={save_dir}){Colors.RESET}"
     )
     return bundle
 
@@ -165,10 +168,12 @@ def train_tuned_champion_bundle(
     theme_df: pd.DataFrame | None,
     config: ChampionTuningConfig,
     export_dir: str = "artifacts/models",
+    feature_set: str = "close_morning61",
+    price_history_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """PHASE2 tuned orchestrator."""
     x_features, _targets, cat_features, processed_raw = build_ml_dataset(
-        trade_log_df, theme_df, feature_set="close_morning61", panel_mode="scenario_action"
+        trade_log_df, theme_df, feature_set=feature_set, panel_mode="scenario_action", price_history_df=price_history_df
     )
     feature_cols = [c for c in x_features.columns if c not in cat_features]
     # Retarget with configured clip
@@ -279,7 +284,7 @@ def train_tuned_champion_bundle(
     }
     bundle["oof_score_col"] = "decision_score"
     bundle["daily_score_col"] = "decision_score"
-    bundle["feature_set"] = "close_morning61"
+    bundle["feature_set"] = feature_set
     bundle["panel_mode"] = "scenario_action"
     bundle["single_stock_policy"] = candidate["policy"].model_dump() if candidate["policy"] is not None else None
     # policy_metadata similar to train_champion
@@ -336,7 +341,7 @@ def train_tuned_champion_bundle(
 
     # Only write artifact if promoted or gate disabled
     if not (config.require_beats_control and not promoted):
-        save_dir = _candidate_export_dir(export_dir, "close_morning61", bundle)
+        save_dir = _candidate_export_dir(export_dir, feature_set, bundle)
         save_bundle(bundle, save_dir)
         logger.info(
             f"[EVAL] cand={cand_mean:.6f} ctrl={ctrl_mean:.6f} shared_dates={int(shared.size)} promoted={bool(promoted)}"
