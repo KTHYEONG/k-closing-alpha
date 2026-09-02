@@ -171,10 +171,12 @@ def _test_references_source(test_file: str, source_file: str) -> bool:
 
 
 def _check_orphaned_implementations(fh: str, kind: str, name: str) -> list[JsonDiag]:
-    if kind in ("field", "cli_argument") or not fh.startswith("src"):
+    if kind in ("field", "cli_argument", "pydantic_computed_field", "module_reexport") or not fh.startswith("src"):
         # field는 정의 자체가 사용처가 아니고, cli_argument 플래그 리터럴은
         # 선행 하이픈 때문에 \b 단어경계 참조 스캔과 구조적으로 불규합이다.
+        # pydantic computed field and module_reexport are config exports, not directly called
         return []
+    # handle module_reexport suffix stripping for alias lookup handled above
     if kind == "registry_entry":
         # NAME['key'] 형태: 엔트리의 "호출자"는 정의 파일 밖에서 이 키를
         # 참조하는 코드다(정의 라인 자신은 제외).
@@ -352,7 +354,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
 
         with open(fh) as sf:
             sf_content = sf.read()
-            if kind in ("field", "dataclass_field"):
+            if kind in ("field", "dataclass_field", "pydantic_computed_field"):
                 field_name = name.split(".")[-1] if "." in name else name
                 pat = rf"\b{re.escape(field_name)}\b"
                 if not re.search(pat, sf_content, re.MULTILINE):
@@ -370,7 +372,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                 found_impl = False
                 try:
                     tree = ast.parse(sf_content, filename=fh)
-                    if kind in ("constant", "type alias"):
+                    if kind in ("constant", "type alias", "module_constant"):
                         # 모듈 수준 상수/타입 별칭(AnnAssign/Assign 타깃)를 인식한다.
                         for node in ast.walk(tree):
                             if (
@@ -386,17 +388,21 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                             ):
                                 found_impl = True
                                 break
-                    elif kind == "reexport":
+                    elif kind in ("reexport", "module_reexport"):
+                        # module_reexport names may have _export suffix; strip it for lookup
+                        lookup_name = name.removesuffix("_export") if name.endswith("_export") else name
+                        # consider either ImportFrom or assignment (e.g. FOO = settings.FOO)
                         imported = any(
                             isinstance(node, ast.ImportFrom)
                             and any(
-                                alias.name == name or alias.asname == name
+                                alias.name == lookup_name or alias.asname == lookup_name
                                 for alias in node.names
                             )
                             for node in ast.walk(tree)
                         )
+                        assigned = bool(re.search(rf"\b{re.escape(lookup_name)}\s*=", sf_content))
                         # 재수출 계약은 __all__ 등재까지 요구한다(인용 문자열 검색).
-                        found_impl = imported and f'"{name}"' in sf_content
+                        found_impl = (imported or assigned) and f'"{lookup_name}"' in sf_content
                     elif kind == "cli_argument":
                         found_impl = bool(
                             re.search(
