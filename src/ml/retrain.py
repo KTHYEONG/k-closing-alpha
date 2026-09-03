@@ -28,6 +28,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--recency-half-life", default=None)
     parser.add_argument("--hpo-trials", type=int, default=40)
     parser.add_argument("--no-gate", action="store_true")
+    parser.add_argument("--eval-mode", default="walkforward", choices=["walkforward", "cpcv"])
+    parser.add_argument("--hpo-objective", default="rank_ic", choices=["rank_ic", "top1_return", "cpcv_top1"])
+    parser.add_argument("--promotion-alpha", type=float, default=0.10)
     args = parser.parse_args(argv)
 
     trade_log_df = pd.read_parquet(args.trade_log)
@@ -43,6 +46,9 @@ def main(argv: list[str] | None = None) -> None:
             hpo_trials=args.hpo_trials,
             require_beats_control=not args.no_gate,
             feature_selection_top_n=args.feature_selection_top_n,
+            eval_mode=args.eval_mode,
+            hpo_objective=args.hpo_objective,
+            promotion_alpha=args.promotion_alpha,
         )
         bundle = train_tuned_champion_bundle(trade_log_df, theme_df, cfg, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df)
         prov = bundle.get("tuning_provenance", {})
