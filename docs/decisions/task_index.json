@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_EXIT_POLICY_RESEARCH",
+      "date": "2026-09-03",
+      "adr_id": "ADR_20260903_ML_EXIT_POLICY_RESEARCH",
+      "domain": "signal",
+      "title": "Close-morning 익일 익절 청산 규칙 리서치/평가 레이어",
+      "why": "리랭커는 데이터로 재확인된 포화 상태(rankIC 0.20, top-1 net ~1.35%/일, 모든 목적함수·모델클래스가 huber 기본값 못 이김). 코드에 청산 모델이 전무해 net_return을 익일 시가 매도로 고정 사용. 익일 next_high가 시가보다 크게 위(오라클 +8%/일)라 청산 타이밍에 미탐색 헤드룸 존재.",
+      "resolution": "src/ml/exit_policy.py 신설(robust_eval.py와 동급 리서치 모듈): attach_next_day_path(익일 OHLC 조인), simulate_take_profit_exit(무-룩어헤드 지정가+MOC 폴백, 결정론적/시드 체결모델), evaluate_exit_grid(CPCV 만장일치 경로 + moving-block bootstrap 승격 게이트), summarize_exit_grid. champion.py train_tuned_champion_bundle에 배선 -> tuning_provenance['exit_policy_grid'] 기록 전용, 서빙/번들 런타임 불변. 실데이터 결과: TP 5%/MOC = +0.84%/일 vs 현행 +0.43%, Δ +41bp p=0.0024, 28개 CPCV 경로 전부 양(+). 보수적 체결가정(85% 체결,-0.3%)에서는 Δ +23bp p=0.11로 유의성 소멸 -> 실체결률 측정이 승격 선결과제.",
+      "impact": "리랭커 피처 연구 동결 유지. 신규 청산 레버는 결정론적 가정 하 게이트 통과했으나 배포 안 함(별도 승격 ADR 필요). champion 번들 provenance에 exit_policy_grid 키 추가, price_history_df=None이면 status:skipped로 기존 동작 불변."
+    },
+    {
       "task_id": "TASK_ML_RERANKER_SATURATION_AND_BUILD_VECTORIZATION",
       "date": "2026-09-03",
       "adr_id": "ADR_20260903_ML_RERANKER_SATURATION_AND_BUILD_VECTORIZATION",
