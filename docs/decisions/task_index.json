@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_SECTOR_AND_FEATURE_SELECTION",
+      "date": "2026-09-03",
+      "adr_id": "ADR_20260903_ML_SECTOR_AND_FEATURE_SELECTION",
+      "domain": "ml",
+      "title": "근거기반 섹터 재정의 + nested 안정성필터 피처선택 + HPO 목적함수 rank_ic 전환",
+      "why": "44개 주관 테마 분류의 후보패널-내 섹터평균이 39.1% 행에서 정확히 0(자기비교)이고 단독 rankIC -0.0071, 순열중요도 49위로 퇴화. theme.parquet 정적 스냅샷의 미래 라벨 누수. 77피처 중 21개가 순열 rankIC 기여 <=0. SHAP 은 일내 상수 피처(v_kospi)를 6위로 과대평가. HPO 목적 top1_return 은 하루 1관측 고분산.",
+      "resolution": "src/ml/sector_features.py: 연1회 재적합 상관 KMeans point-in-time 클러스터(무누수: Y라벨은 Y-01-01 이전만) + 전체시장 멤버십 기준 sector_mkt_ret/breadth/mom_5d(mom_5d 는 shift(1) 엄격 트레일링). src/ml/feature_selection.py: 일자그룹내 순열 rankIC 하락 중요도 + fold내부(train만) nested 선택 + min_folds 안정성필터. dataset.py feature_set='close_morning_sector' 가산(퇴화 sector_relative_change 제거). tuning.py hpo_objective 기본값 rank_ic + feature_selection_top_n/min_folds config. champion/retrain 배선. min_obs 150->120·lookback 500->550(정상국면 커버리지). pytest-timeout dev 의존성 등록.",
+      "impact": "close_morning_sector coverage 39.1%결손→정상국면 87.5~94.7%. train_tuned_champion_bundle 실행: 피처선택 81→25(섹터 5종 전부 nested 탈락, history 6종 생존), HPO best inner rankIC 0.238, dev 게이트 PASS(+4.6bp). 미사용 OOS(2025-07~2026-08, 123일): 챔피언 top1 +0.496%/Sharpe2.15/MDD23.3% vs tuned-61 +0.243%/1.11/30.3% — 방향 긍정이나 p=0.36 무의미, 라이브러리기본 baseline(+0.606%)에 미달. 운영 승격 불가, OOS 확대 필요."
+    },
+    {
       "task_id": "TASK_ML_MULTIDAY_FEATURE_LAYER",
       "date": "2026-09-02",
       "adr_id": "ADR_20260902_ML_MULTIDAY_FEATURE_LAYER",
