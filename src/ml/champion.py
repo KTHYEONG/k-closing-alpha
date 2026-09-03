@@ -14,6 +14,7 @@ from src.ml.feature_selection import select_stable_features
 from src.ml.history_features import HISTORY_FEATURE_COLUMNS  # noqa: F401 (used via dataset)
 from src.ml.oof import purged_oof_predict
 from src.ml.policy_eval import default_policy_candidates, evaluate_single_stock_policy_oof
+from src.ml.robust_eval import deflated_sharpe_ratio, moving_block_bootstrap_delta
 from src.ml.tuning import (
     BlendWeightResult,  # noqa: F401
     ChampionTuningConfig,
@@ -164,6 +165,23 @@ def train_champion_bundle(
     return bundle
 
 
+# from src.ml.champion import evaluate_promotion  # same module: define above train_tuned_champion_bundle
+def evaluate_promotion(cand_returns: np.ndarray, ctrl_returns: np.ndarray, *, alpha: float) -> dict[str, Any]:
+    """Significance-gated promotion on paired daily top-1 returns."""
+    result = moving_block_bootstrap_delta(
+        np.asarray(cand_returns, dtype=np.float64), np.asarray(ctrl_returns, dtype=np.float64)
+    )
+    return {
+        "promoted": bool(result.delta > 0.0 and result.p_value < alpha),
+        "delta": float(result.delta),
+        "p_value": float(result.p_value),
+        "ci_low": float(result.ci_low),
+        "ci_high": float(result.ci_high),
+        "n_obs": int(result.n_obs),
+        "method": "moving_block_bootstrap",
+    }
+
+
 def train_tuned_champion_bundle(
     trade_log_df: pd.DataFrame,
     theme_df: pd.DataFrame | None,
@@ -258,10 +276,15 @@ def train_tuned_champion_bundle(
     ctrl_shared = np.array([ctrl_map[d] for d in shared], dtype=np.float64) if shared.size else np.array([], dtype=np.float64)
     cand_mean = float(np.mean(cand_shared)) if cand_shared.size else float("nan")
     ctrl_mean = float(np.mean(ctrl_shared)) if ctrl_shared.size else float("nan")
-    # 승격 기준: 동일 날짜(paired) OOF 스케줄 평균이 대조군 이상. 비유한 비교는 fail-closed.
-    promoted = bool(
-        np.isfinite(cand_mean) and np.isfinite(ctrl_mean) and cand_mean >= ctrl_mean
-    )
+    promotion = evaluate_promotion(cand_shared, ctrl_shared, alpha=config.promotion_alpha); promoted = promotion["promoted"]  # noqa: E702
+    # control_vs_candidate wiring needs no extra import (none).
+    try:
+        selection_dsr = deflated_sharpe_ratio(
+            np.asarray(candidate["scheduled_returns"], dtype=np.float64),
+            n_independent_trials=max(1, search.n_trials),
+        )
+    except ValueError:
+        selection_dsr = None
 
     if config.require_beats_control and not promoted:
         raise ValueError(
@@ -330,15 +353,11 @@ def train_tuned_champion_bundle(
         "per_weight": {float(k): dict(v) for k, v in blend.per_weight.items()},
         "weighting_mode": config.weighting_mode,
         "recency_half_life_groups": config.recency_half_life_groups,
+        "selection_dsr": selection_dsr,
         "label_clip": (config.label_clip_lower, config.label_clip_upper),
         "huber_delta": config.huber_delta,
         "seed_ensemble": tuple(config.seed_ensemble),
-        "control_vs_candidate": {
-            "shared_dates": int(shared.size),
-            "cand_mean": float(cand_mean),
-            "ctrl_mean": float(ctrl_mean),
-            "promoted": bool(promoted),
-        },
+        "control_vs_candidate": {"shared_dates": int(shared.size), "cand_mean": float(cand_mean), "ctrl_mean": float(ctrl_mean), "promoted": bool(promoted), "delta": promotion["delta"], "p_value": promotion["p_value"], "ci_low": promotion["ci_low"], "ci_high": promotion["ci_high"], "promotion_alpha": float(config.promotion_alpha), "method": promotion["method"]},
         "candidate_metrics": dict(candidate["metrics"]),
         "control_metrics": dict(control["metrics"]),
         "selected_features": list(feature_cols) if config.feature_selection_top_n is not None else None,
