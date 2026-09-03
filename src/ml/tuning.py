@@ -9,7 +9,15 @@ import pandas as pd
 
 from src.ml.oof import purged_oof_predict
 from src.ml.policy_eval import default_policy_candidates, evaluate_single_stock_policy_oof
+from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict, path_top1_returns
 from src.serving.realtime.inference import add_close_morning_decision_score
+
+
+def hpo_objective(value: str) -> str:
+    """Validate the HPO objective name against the accepted domain."""
+    if value not in ("top1_return", "rank_ic", "cpcv_top1"):
+        raise ValueError(f"hpo_objective must be one of top1_return/rank_ic/cpcv_top1, got {value!r}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -32,6 +40,11 @@ class ChampionTuningConfig:
     oos_reserve_start: str | None = None
     min_history_dates: int = 252
     require_beats_control: bool = True
+    eval_mode: str = "walkforward"
+    cpcv_n_groups: int = 8
+    cpcv_k_test: int = 2
+    promotion_alpha: float = 0.10
+    hpo_reg_bias: bool = True
 
     def __post_init__(self) -> None:
         if self.n_splits < 2:
@@ -49,8 +62,9 @@ class ChampionTuningConfig:
             raise ValueError(f"huber_delta must be >0, got {self.huber_delta}")
         if self.hpo_trials < 1:
             raise ValueError(f"hpo_trials must be >=1, got {self.hpo_trials}")
-        if self.hpo_objective not in ("top1_return", "rank_ic"):
-            raise ValueError(f"hpo_objective must be one of top1_return/rank_ic, got {self.hpo_objective!r}")
+        # hpo_objective domain wiring needs no extra import (none).
+        if self.hpo_objective not in ("top1_return", "rank_ic", "cpcv_top1"):
+            hpo_objective(self.hpo_objective)
         if not self.seed_ensemble or not isinstance(self.seed_ensemble, tuple):
             raise ValueError("seed_ensemble must be non-empty tuple of unique ints")
         if len(set(self.seed_ensemble)) != len(self.seed_ensemble):
@@ -84,6 +98,23 @@ class ChampionTuningConfig:
             raise ValueError(f"feature_selection_top_n must be >=5, got {self.feature_selection_top_n}")
         if self.feature_selection_min_folds < 1:
             raise ValueError(f"feature_selection_min_folds must be >=1, got {self.feature_selection_min_folds}")
+        if self.eval_mode not in ("walkforward", "cpcv"):
+            raise ValueError(f"eval_mode must be one of walkforward/cpcv, got {self.eval_mode!r}")
+        if self.cpcv_n_groups < 4:
+            raise ValueError(f"cpcv_n_groups must be >= 4, got {self.cpcv_n_groups}")
+        if not 2 <= self.cpcv_k_test < self.cpcv_n_groups:
+            raise ValueError(f"cpcv_k_test must satisfy 2 <= cpcv_k_test < cpcv_n_groups, got {self.cpcv_k_test}")
+        # CPCV 는 embargo_gap=1 로 구성되므로 빈 train 분할을 막는 하한을 config 단에서도 강제.
+        _cpcv_min_groups = self.cpcv_k_test * (1 + self.purge_gap + 1) + 1
+        if self.cpcv_n_groups < _cpcv_min_groups:
+            raise ValueError(
+                f"cpcv_n_groups must be >= {_cpcv_min_groups} for cpcv_k_test={self.cpcv_k_test}, "
+                f"purge_gap={self.purge_gap}; got {self.cpcv_n_groups}"
+            )
+        if not 0.0 < self.promotion_alpha <= 0.5:
+            raise ValueError(f"promotion_alpha must be in (0, 0.5], got {self.promotion_alpha}")
+        if self.hpo_objective == "cpcv_top1" and self.eval_mode != "cpcv":
+            raise ValueError("hpo_objective='cpcv_top1' requires eval_mode='cpcv'")
 
 
 @dataclass(frozen=True)
@@ -117,69 +148,112 @@ def tune_return_model_params(
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
 
     def _objective(trial: Any) -> float:  # type: ignore[no-untyped-def]
-        params: dict[str, Any] = {
-            "num_leaves": trial.suggest_int("num_leaves", 15, 255),
-            "min_child_samples": trial.suggest_int("min_child_samples", 5, 200, log=True),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-            "n_estimators": trial.suggest_int("n_estimators", 100, 800, step=50),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10, log=True),
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-            "subsample_freq": trial.suggest_categorical("subsample_freq", [0, 1]),
-        }
+        # params suggestion ranges switch on config.hpo_reg_bias; a cpcv_top1 branch after the oof block computes the variance-penalized path objective
+        if config.hpo_reg_bias:
+            params: dict[str, Any] = {
+                "num_leaves": trial.suggest_int("num_leaves", 8, 63),
+                "min_child_samples": trial.suggest_int("min_child_samples", 20, 200, log=True),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "n_estimators": trial.suggest_int("n_estimators", 100, 800, step=50),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10, log=True),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                "subsample_freq": trial.suggest_categorical("subsample_freq", [0, 1]),
+                "min_split_gain": trial.suggest_float("min_split_gain", 1e-4, 0.1, log=True),
+                "path_smooth": trial.suggest_float("path_smooth", 0.0, 2.0),
+            }
+        else:
+            params = {
+                "num_leaves": trial.suggest_int("num_leaves", 15, 255),
+                "min_child_samples": trial.suggest_int("min_child_samples", 5, 200, log=True),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "n_estimators": trial.suggest_int("n_estimators", 100, 800, step=50),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10, log=True),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                "subsample_freq": trial.suggest_categorical("subsample_freq", [0, 1]),
+            }
+        # eval_mode 가 OOF 생성 경로를 결정: 'cpcv' 는 조합적 퍼지 CV(무누수 다경로),
+        # 'walkforward' 는 순차 purged walk-forward. 목적함수 지표는 그 OOF 위에서 계산.
+        is_cpcv = config.eval_mode == "cpcv"
         try:
-            oof = purged_oof_predict(
-                dev_df,
-                feature_cols,
-                target_col,
-                group_col,
-                n_splits=config.inner_n_splits,
-                purge_gap=config.purge_gap,
-                model_params=params,
-                huber_delta=config.huber_delta,
-                predict_proba=False,
-            )
+            if is_cpcv:
+                cv = CombinatorialPurgedCV(
+                    n_groups=config.cpcv_n_groups,
+                    k_test=config.cpcv_k_test,
+                    purge_gap=config.purge_gap,
+                )
+                oof = cpcv_oof_predict(
+                    dev_df,
+                    feature_cols,
+                    target_col,
+                    group_col,
+                    cv=cv,
+                    model_params=params,
+                    huber_delta=config.huber_delta,
+                )
+            else:
+                oof = purged_oof_predict(
+                    dev_df,
+                    feature_cols,
+                    target_col,
+                    group_col,
+                    n_splits=config.inner_n_splits,
+                    purge_gap=config.purge_gap,
+                    model_params=params,
+                    huber_delta=config.huber_delta,
+                    predict_proba=False,
+                )
         except Exception:
             return float("-inf")
         if oof.empty:
             return float("-inf")
+
+        if config.hpo_objective == "cpcv_top1":
+            # 경로별 top-1 평균의 분산을 페널티: 경로 안정성 우선 (희소 패널 과적합 방지).
+            paths = path_top1_returns(oof, group_col, target_col, score_col="pred", fold_col="cpcv_fold")
+            path_arrays = [np.asarray(v, dtype=np.float64) for v in paths.values() if len(v)]
+            if not path_arrays:
+                return float("-inf")
+            path_means = np.array([float(v.mean()) for v in path_arrays], dtype=np.float64)
+            pooled = np.concatenate(path_arrays)
+            value = float(pooled.mean()) - 0.5 * float(np.std(path_means))
+            return value if np.isfinite(value) else float("-inf")
+
+        # cpcv OOF 는 (fold, day) 로, walkforward OOF 는 day 로 그룹화하여 지표 계산.
+        group_keys = ["cpcv_fold", group_col] if is_cpcv else [group_col]
         if config.hpo_objective == "top1_return":
-            # mean per-day realized top-1 target_return at max pred row
             vals: list[float] = []
-            for _, g in oof.groupby(group_col, sort=False):
+            for _, g in oof.groupby(group_keys, sort=False):
                 if g.empty:
                     continue
-                # max pred row
                 idx = g["pred"].to_numpy().argmax()
                 vals.append(float(g[target_col].to_numpy()[idx]))
             if not vals:
                 return float("-inf")
             mean = float(np.mean(vals))
-            if not np.isfinite(mean):
-                return float("-inf")
-            return mean
-        else:  # rank_ic
-            # mean per-group spearman(pred,target)
-            ics: list[float] = []
-            from scipy.stats import spearmanr
+            return mean if np.isfinite(mean) else float("-inf")
 
-            for _, g in oof.groupby(group_col, sort=False):
-                if len(g) < 2:
-                    continue
-                if float(np.std(g["pred"].to_numpy())) == 0.0:
-                    continue
-                if float(np.std(g[target_col].to_numpy())) == 0.0:
-                    continue
-                ic = float(spearmanr(g["pred"], g[target_col]).statistic)
-                if np.isfinite(ic):
-                    ics.append(ic)
-            if not ics:
-                return float("-inf")
-            mean_ic = float(np.mean(ics))
-            if not np.isfinite(mean_ic):
-                return float("-inf")
-            return mean_ic
+        # rank_ic: mean per-group spearman(pred, target)
+        ics: list[float] = []
+        from scipy.stats import spearmanr
+
+        for _, g in oof.groupby(group_keys, sort=False):
+            if len(g) < 2:
+                continue
+            if float(np.std(g["pred"].to_numpy())) == 0.0:
+                continue
+            if float(np.std(g[target_col].to_numpy())) == 0.0:
+                continue
+            ic = float(spearmanr(g["pred"], g[target_col]).statistic)
+            if np.isfinite(ic):
+                ics.append(ic)
+        if not ics:
+            return float("-inf")
+        mean_ic = float(np.mean(ics))
+        return mean_ic if np.isfinite(mean_ic) else float("-inf")
 
     study.optimize(_objective, n_trials=config.hpo_trials, timeout=config.hpo_timeout_seconds)
     best_value = float(study.best_value) if study.best_value is not None else float("nan")
