@@ -22,7 +22,9 @@ class ChampionTuningConfig:
     huber_delta: float = 0.9
     hpo_trials: int = 40
     hpo_timeout_seconds: float | None = None
-    hpo_objective: str = "top1_return"
+    hpo_objective: str = "rank_ic"
+    feature_selection_top_n: int | None = None
+    feature_selection_min_folds: int = 2
     seed_ensemble: tuple[int, ...] = (13, 29, 42, 71, 97)
     p_good_weight_grid: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
     weighting_mode: str = "current"
@@ -78,6 +80,10 @@ class ChampionTuningConfig:
                 raise ValueError(f"oos_reserve_start is not parseable: {self.oos_reserve_start!r}")
         if self.min_history_dates < 1:
             raise ValueError(f"min_history_dates must be >=1, got {self.min_history_dates}")
+        if self.feature_selection_top_n is not None and self.feature_selection_top_n < 5:
+            raise ValueError(f"feature_selection_top_n must be >=5, got {self.feature_selection_top_n}")
+        if self.feature_selection_min_folds < 1:
+            raise ValueError(f"feature_selection_min_folds must be >=1, got {self.feature_selection_min_folds}")
 
 
 @dataclass(frozen=True)

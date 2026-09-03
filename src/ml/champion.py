@@ -10,6 +10,7 @@ import pandas as pd
 
 from src.ml.bundle import build_inline_bundle, save_bundle
 from src.ml.dataset import build_ml_dataset, retarget_with_clip
+from src.ml.feature_selection import select_stable_features
 from src.ml.history_features import HISTORY_FEATURE_COLUMNS  # noqa: F401 (used via dataset)
 from src.ml.oof import purged_oof_predict
 from src.ml.policy_eval import default_policy_candidates, evaluate_single_stock_policy_oof
@@ -184,6 +185,9 @@ def train_tuned_champion_bundle(
     # HPO
     search = tune_return_model_params(dev, feature_cols, "target_return", "trade_date", config)
 
+    if config.feature_selection_top_n is not None:
+        feature_cols = select_stable_features(dev, feature_cols, "target_return", "trade_date", top_n=config.feature_selection_top_n, min_folds=config.feature_selection_min_folds, model_params=search.best_params, huber_delta=config.huber_delta)
+
     # Candidate OOF for blend weight
     candidate_oof = purged_oof_predict(
         dev,
@@ -337,6 +341,8 @@ def train_tuned_champion_bundle(
         },
         "candidate_metrics": dict(candidate["metrics"]),
         "control_metrics": dict(control["metrics"]),
+        "selected_features": list(feature_cols) if config.feature_selection_top_n is not None else None,
+        "selection_top_n": config.feature_selection_top_n,
     }
 
     # Only write artifact if promoted or gate disabled
