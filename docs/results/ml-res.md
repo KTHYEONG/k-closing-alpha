@@ -1,6 +1,6 @@
 # ML 재학습·개선 결과 (2026-09-03)
 
-관련 ADR: `ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS`, `ADR_20260903_ML_PIPELINE_GAIN_RECOVERY`
+관련 ADR: `ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS`, `ADR_20260903_ML_PIPELINE_GAIN_RECOVERY`, `ADR_20260903_ML_RERANKER_SATURATION_AND_BUILD_VECTORIZATION`
 
 ## 1. 실행 요약
 
@@ -91,6 +91,33 @@
 ## 6. 이전 세션 (참고) — CPCV 강건성 인프라
 
 `ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS`: RUN A(`rank_ic`) p=0.358, RUN B(`cpcv_top1`) p=0.665 — 둘 다 승격 거부. 기존 코인플립 게이트(`cand≥ctrl`)였다면 RUN A 승격됐을 것(노이즈 승격). 새 bootstrap 게이트가 차단. `cpcv_oof_predict` attrs concat 버그, `eval_mode` ghost-switch 수정.
+
+## 6.1 독립 검증 (2026-09-03, `ADR_20260903_ML_RERANKER_SATURATION_AND_BUILD_VECTORIZATION`)
+
+P2 로드맵(새 예측정보)을 직접 탐색. 베이스라인 rankIC ~0.20 / top-1 net ~1.52%/일. 신규 **횡단면** 피처군 5종 + LGBMRanker 를 61피처 대조군 대비 검정(일별 top-1 net, moving-block bootstrap; 유의 후보는 CPCV(8,2) 재검정).
+
+| 후보 | walk-forward top-1 Δ | CPCV(8,2) | 판정 |
+|---|---:|---:|---|
+| A 후보 출현동학 (재등장간격·연속스트릭·트레일링 카운트) | +0.074%/d (p=0.28) | — | 무효 |
+| B 당일 밀집도 (테마/시나리오/시장 peer 수·비중) | +0.104%/d (p=0.054) | +0.024%/d (p=0.18) | 게이트 미통과 |
+| C 인과 레짐 prior (시나리오/시장/테마별 expanding mean) | −0.006%/d (p=0.93) | — | 사망 |
+| D 종목별 오버나잇 미시구조 (close-to-open 20d 통계, price_history) | +0.110%/d (p=0.109) | −0.002%/d (p=0.92) | 게이트 미통과 |
+| E 공시 트레일링 (5d/20d supply·earnings·CB/BW·rights 카운트) | +0.069%/d (p=0.25) | — | 무효 |
+| A+B+C / D+E 결합 | +0.09 / +0.01 (p≥0.2) | — | 안 쌓임 = 노이즈 |
+| LGBMRanker(lambdarank) vs huber 회귀 (동일 61피처) | −0.035%/d (p=0.66) | — | 레버 아님 |
+
+- B·D 의 walk-forward 마진 신호는 CPCV 에서 소멸 — §5 의 "격리 ablation +24bp/p=0.0004 가 OOS 예약에서 소멸"과 동일 패턴. 결합 시 붕괴 = 검증노이즈 과적합.
+- 구조적 이유: `decision_score` 는 **당일 횡단면 순위**(`groupby(date).rank(pct=True)`)라 날짜상수 피처(`v_kospi`/`v_kosdaq`/`kospi_change`/`kosdaq_change` 및 변화율)는 원리적으로 top-1 선택·rankIC 에 무효. 날짜상수 6피처 제거는 CPCV-중립(+0.008%/d, p=0.63)이라 안전하나 이득 없음(+ 레거시 컬럼 패리티 테스트 수정 필요).
+- **결론**: 모델·블렌드·정책·가중·윈도우·앙상블·관망 게이트에 이어 **신규 예측정보(5종)와 모델클래스(ranker)도 소진**. 리랭커 피처 연구 동결. 다음 레버는 후보생성기 품질(oracle top-1 +6.6% vs 실현 +0.6%) 또는 트레이드 구성(quantile grade 사이징·청산 타이밍) — `src/ml/` 밖.
+
+### 파이프라인 부수 수정 (알파 무관, 배포 가치 있음)
+
+| 파일 | 변경 | 근거 |
+|---|---|---|
+| `src/serving/realtime/features.py` | `_apply_robust_z` — `groupby.transform(lambda MAD)` → 벡터 MAD + `_z` 컬럼 일괄 `df.assign` | 2.6s → 0.04s, rtol=1e-12 패리티. 프레임 조각화 회피 |
+| `src/ml/dataset.py` | `create_multi_targets` — `trade_date` 그룹 파이썬 랭크 루프 → 그룹크기별 단일 qcut 벡터화 | target_rank 33,827행 loop 구현과 정확 일치 |
+
+`build_ml_dataset` 컴퓨트 ~5.5s → ~1.5s (HPO 40 trial × inner CV, `cpcv_oof_predict` 에서 복리). 초기 측정 90–142s 는 `uv run` 콜드스타트 + 머신 부하(load-avg 20, 파일워처 pytest) 환경 요인이며 알고리즘 버그 아님.
 
 ## 7. 한계 및 다음 단계
 

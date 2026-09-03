@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_RERANKER_SATURATION_AND_BUILD_VECTORIZATION",
+      "date": "2026-09-03",
+      "adr_id": "ADR_20260903_ML_RERANKER_SATURATION_AND_BUILD_VECTORIZATION",
+      "domain": "ml",
+      "title": "리랭커 신규 예측정보 탐색 CPCV 기각 + build_ml_dataset 벡터화",
+      "why": "ml-res.md '리랭커 포화, 새 예측정보만 레버' 명제를 독립 검증. 5개 신규 횡단면 피처군(A 후보출현동학 B 당일밀집도 C 인과레짐prior D 종목별 오버나잇 미시구조 E 공시트레일링) + LGBMRanker(lambdarank) 전부 CPCV(8,2) 유의성 게이트(delta>0 & p<0.10) 미통과. B(+0.104%/d p=0.054 WF) D(+0.110%/d p=0.109 WF) 마진신호는 CPCV에서 p=0.18/0.92로 소멸, 결합시 붕괴(D+E p=0.92)=검증노이즈. 날짜상수 피처(v_kospi 등 6개)는 당일 횡단면 리랭커에 원리적 무효. build_ml_dataset 초기 측정 90-142s는 uv-run 콜드스타트+머신부하 환경요인이고 실제 컴퓨트는 ~5.5s(_apply_robust_z 2.6s + create_multi_targets 2.0s 지배).",
+      "resolution": "신규 알파 코드변경 없음(탐색결과 음성). _apply_robust_z: groupby.transform(lambda MAD)를 벡터 MAD((x-median).abs().groupby.transform(median))로 교체 + N개 _z 컬럼 단일 df.assign 일괄부착(프레임 조각화 회피). 2.6s->0.04s, rtol=1e-12 패리티. create_multi_targets: trade_date 그룹 파이썬 랭크 루프를 그룹크기별 단일 qcut 벡터화로 교체, target_rank 33827행 loop구현과 정확일치. 신규 테스트 test_features_robust_z.py / test_build_perf.py(slow) 추가. 출력 bit-identical, 레거시 컬럼 패리티 불변.",
+      "impact": "리랭커 알파: 모델/블렌드/정책/가중/윈도우/앙상블/관망 게이트에 이어 신규 예측정보(피처군 5종)+모델클래스(ranker)도 소진 확인 -> 리랭커 피처 연구 동결 권고. 다음 레버는 후보생성기 품질(oracle top1 +6.6% vs 실현 +0.6%) 또는 트레이드구성(quantile grade 사이징/청산타이밍)이며 src/ml/ 밖. 파이프라인: build_ml_dataset 컴퓨트 ~5.5s->~1.5s, HPO 40 trial x inner CV 및 cpcv_oof_predict 에서 수백회 복리. 하위호환: 시그니처/컬럼셋/값 불변."
+    },
+    {
       "task_id": "TASK_ML_PIPELINE_GAIN_RECOVERY",
       "date": "2026-09-03",
       "adr_id": "ADR_20260903_ML_PIPELINE_GAIN_RECOVERY",
