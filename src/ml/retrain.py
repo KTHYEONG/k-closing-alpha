@@ -8,6 +8,7 @@ import os
 import pandas as pd
 
 from src import settings
+from src.ml.bundle import CHAMPION_DEFAULT_MODEL_PARAMS
 from src.ml.champion import train_champion_bundle, train_tuned_champion_bundle
 from src.ml.tuning import ChampionTuningConfig
 
@@ -31,6 +32,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--eval-mode", default="walkforward", choices=["walkforward", "cpcv"])
     parser.add_argument("--hpo-objective", default="rank_ic", choices=["rank_ic", "top1_return", "cpcv_top1"])
     parser.add_argument("--promotion-alpha", type=float, default=0.10)
+    parser.add_argument("--no-hpo", action="store_true", help="skip Optuna; use CHAMPION_DEFAULT_MODEL_PARAMS")
     args = parser.parse_args(argv)
 
     trade_log_df = pd.read_parquet(args.trade_log)
@@ -49,6 +51,7 @@ def main(argv: list[str] | None = None) -> None:
             eval_mode=args.eval_mode,
             hpo_objective=args.hpo_objective,
             promotion_alpha=args.promotion_alpha,
+            model_params_override=(CHAMPION_DEFAULT_MODEL_PARAMS if args.no_hpo else None),
         )
         bundle = train_tuned_champion_bundle(trade_log_df, theme_df, cfg, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df)
         prov = bundle.get("tuning_provenance", {})
