@@ -31,6 +31,7 @@ _ALLOWED_FEATURE_SETS: tuple[str, ...] = (
     "production_calendar_flow",
     "close_morning61",
     "close_morning_history",
+    "close_morning_sector",
 )
 _ALLOWED_PANEL_MODES: tuple[str, ...] = ("raw_rows", "scenario_action")
 
@@ -134,6 +135,7 @@ _EXCLUDED_FROM_X: set[str] = {
     "target_good",
     "target_bad",
     "realized_vol",
+    "sector_cluster_id",
 }
 
 _TARGET_NAMES: tuple[str, ...] = ("target_return", "target_rank", "target_good", "target_bad")
@@ -308,6 +310,21 @@ def build_ml_dataset(
 
         df = attach_history_features(df, price_history_df, date_col="trade_date", code_col="stock_code")
         feature_cols.extend(col for col in HISTORY_FEATURE_COLUMNS if col in df.columns)
+    if feature_set == "close_morning_sector":
+        feature_cols.extend(col for col in _SNAPSHOT49_FEATURES if col in df.columns)
+        _validate_close_morning61_feature(df)
+        feature_cols.extend(col for col in _CLOSE_MORNING61_FEATURES if col in df.columns)
+        if price_history_df is None:
+            raise ValueError("close_morning_sector feature_set requires price_history_df")
+        from src.ml.history_features import HISTORY_FEATURE_COLUMNS, attach_history_features
+
+        df = attach_history_features(df, price_history_df, date_col="trade_date", code_col="stock_code")
+        feature_cols.extend(col for col in HISTORY_FEATURE_COLUMNS if col in df.columns)
+        from src.ml.sector_features import SECTOR_FEATURE_COLUMNS, attach_sector_features
+
+        df = attach_sector_features(df, price_history_df, date_col="trade_date", code_col="stock_code", change_col="change_rate")
+        feature_cols = [c for c in feature_cols if c != "sector_relative_change"]
+        feature_cols.extend(col for col in SECTOR_FEATURE_COLUMNS if col in df.columns)
     if panel_mode == "scenario_action":
         feature_cols = [col for col in feature_cols if col != "chart_analysis"]
         cat_features = [col for col in cat_features if col != "chart_analysis"]

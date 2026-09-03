@@ -21,7 +21,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--theme", default=str(settings.THEME_PARQUET_PATH))
     parser.add_argument("--export-dir", default="artifacts/models")
     parser.add_argument("--tuned", action="store_true")
-    parser.add_argument("--feature-set", default="close_morning61", choices=["close_morning61", "close_morning_history"])
+    parser.add_argument("--feature-set", default="close_morning61", choices=["close_morning61", "close_morning_history", "close_morning_sector"])
+    parser.add_argument("--feature-selection-top-n", type=int, default=None)
     parser.add_argument("--oos-reserve-start", default=None)
     parser.add_argument("--weighting-mode", default="current")
     parser.add_argument("--recency-half-life", default=None)
@@ -31,7 +32,7 @@ def main(argv: list[str] | None = None) -> None:
 
     trade_log_df = pd.read_parquet(args.trade_log)
     theme_df = pd.read_parquet(args.theme) if os.path.exists(args.theme) else None
-    price_history_df = pd.read_parquet(settings.PRICE_HISTORY_PARQUET_PATH) if args.feature_set == "close_morning_history" and os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH) else None
+    price_history_df = pd.read_parquet(settings.PRICE_HISTORY_PARQUET_PATH) if args.feature_set in ("close_morning_history", "close_morning_sector") and os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH) else None
 
     if args.tuned:
         recency = int(args.recency_half_life) if args.recency_half_life is not None else None
@@ -41,6 +42,7 @@ def main(argv: list[str] | None = None) -> None:
             recency_half_life_groups=recency,
             hpo_trials=args.hpo_trials,
             require_beats_control=not args.no_gate,
+            feature_selection_top_n=args.feature_selection_top_n,
         )
         bundle = train_tuned_champion_bundle(trade_log_df, theme_df, cfg, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df)
         prov = bundle.get("tuning_provenance", {})
