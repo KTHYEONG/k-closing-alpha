@@ -1,154 +1,99 @@
-# ML 재학습 결과
+# ML 재학습·개선 결과 (2026-09-03)
+
+관련 ADR: `ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS`, `ADR_20260903_ML_PIPELINE_GAIN_RECOVERY`
 
 ## 1. 실행 요약
 
-- 실행일: 2026-08-09 (Asia/Seoul)
-- 학습 cutoff: 2026-08-03
-- 목적: 실전 투입 전용 모델을 교체하지 않고, 최신 이력으로 재학습한 후보 번들의 품질과 정책 지표를 기록
-- 결과: 학습 및 후보 번들 저장 성공
-- 운영 반영: 미반영. 기존 `artifacts/models/sizing_pipeline_bundle.joblib`에는 쓰기 작업을 하지 않음
+- 대상: 종가매매 close-morning 리랭커 (`close_morning61`, 61 스냅샷 피처, `scenario_action` 패널)
+- 데이터: `data/parquet/trade_log.parquet` 33,827행 / 2,599 거래일 / 2016-01 ~ 2026-08
+- 목적: "튜닝만으로 라이브러리 기본값 대비 유의한 개선이 안 되는" 정확한 원인을 데이터로 규명하고 해결책 검증
+- 평가 인프라: `src/ml/robust_eval.py` — CombinatorialPurgedCV(8,2)=28fold/7path, moving-block bootstrap 유의성 검정, Deflated Sharpe
+- 운영 반영: **없음**. 활성 번들 불변. 아래 수정은 미커밋.
 
-이번 실행은 `legacy.ml_research.training.retrain_bundle.train_and_save_real_model_bundle`의 기본 검증 경로를 사용했다. 이 함수는 purged OOF 정책을 먼저 보정한 뒤 전체 이력 최종 모델을 학습하고, 버전이 붙은 후보 디렉터리에만 저장한다.
+## 2. 핵심 결론 (한 줄)
 
-## 2. 재현 명령
+리랭커는 **현재 후보군 레짐에서 포화** 상태다. 모델·블렌드·정책·가중·윈도우·앙상블·관망 게이트 어떤 튜닝도 라이브러리 기본값(LightGBM defaults, huber δ=0.9)을 **통계적으로 이기지 못한다**. 진짜 레버는 새 예측 정보(피처)뿐이다.
 
-```bash
-PYTHONPATH=. UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/mpl \
-  uv run python -u -c '
-import json
-from legacy.ml_research.training.retrain_bundle import train_and_save_real_model_bundle
+## 3. 데이터 규명 (moving-block bootstrap, n≈2,165 paired 일별, vs 라이브러리 기본값)
 
-bundle = train_and_save_real_model_bundle(
-    export_dir="artifacts/models/research/ml-res-2026-08-09"
-)
-print(json.dumps({
-    "feature_set": bundle["feature_set"],
-    "panel_mode": bundle["panel_mode"],
-    "training_cutoff": bundle["training_cutoff"],
-    "feature_count": len(bundle["feature_cols"]),
-    "policy_metadata": bundle["policy_metadata"],
-}, ensure_ascii=False, default=str))
-'
-```
+### 3.1 알파는 감소하지 않는다 — "rankIC 0.24→0.17 하락"은 아티팩트
 
-학습 함수의 고정 설정은 `n_splits=5`, `purge_gap=1`이다. `close_morning61` + `scenario_action` 조합에서는 `close-morning-reranker-v1` 점수 설정을 사용한다.
+| 연도(테스트) | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 |
+|---|---:|---:|---:|---:|---:|---:|
+| walk-forward OOF rankIC | 0.30 | 0.19 | 0.21 | 0.18 | 0.18 | 0.18 |
+| 타깃 일간분산(std) | 0.034 | 0.030 | 0.031 | 0.034 | 0.032 | 0.031 |
 
-## 3. 입력 데이터
+2020(코로나)만 이상치. 2021년 이후 rankIC ~0.18 **평탄**, 기회분산도 평탄. 감소 통념은 초기 윈도우에 2020이 섞인 결과.
 
-| 데이터 | 경로 | 관측치/범위 |
+### 3.2 후보군 자체가 붕괴했다 (개선 상한을 규정)
+
+| 구간 | 평균 후보수익 | 승률 | oracle top-1 | (best − mean) 스프레드 |
+|---|---:|---:|---:|---:|
+| 2016–2020 | **+0.31%** | 53% | +5.5% | +5.2% |
+| 2021–2025 | **−0.17%** | 44% | +6.6% | **+6.9%** |
+
+평균 후보가 이제 손실 트레이드. 그러나 oracle는 여전히 +6~7%, 스프레드는 **더 넓어짐** → 리랭커가 할 일은 많아졌으나 성과는 top-1 실현 1.3%→0.6%로 반감. 모델은 여전히 순위 능력 보유(rankIC 0.18).
+
+### 3.3 파이프라인 이득 상쇄 분해 (BASE = 라이브러리 기본값 control)
+
+| knob (BASE에서 1개만 변경) | POST-POLICY Δ | p | 판정 |
+|---|---:|---:|---|
+| `p_good_weight` 0.5 → 0.0 | **+0.120%/일** | **0.015** | p_good 블렌드가 알파를 희석 |
+| `p_good_weight` → 1.0 | −0.007% | 0.87 | 더 섞을수록 무익 |
+| 정규화 파라미터 (num_leaves 15·min_child 40·subsample) | **+0.127%/일** (모델단 +0.186% p=0.005) | **0.021** | 실제 이득 |
+| `weighting_mode` → `date_balanced` | −0.000% | **0.99** | 무효 |
+| `recency_half_life` 504 | +0.063% | 0.31 | 유의하지 않음 |
+| `date_balanced` + `recency` | +0.069% | 0.28 | 유의하지 않음 |
+| **정규화 + p_good_weight 0 (REG_PG0)** | **+0.239%/일** | **0.0004** | 격리실험 최적 (Sharpe 4.23→5.13) |
+
+### 3.4 `calibrate_blend_weight` 버그 (핵심 원인)
+
+실데이터 grid 평균: `{0.0: 1.29%, 0.25: 1.25%, 0.5: 1.18%, 0.75: 1.14%, 1.0: 1.12%}` — 단조감소, w=0 최선.
+**함수는 0.75를 선택.** "보수적 tiebreaker"가 `max−min < 0.005`(50bp)일 때 발동 → 일별수익 스케일에선 **항상 참** → `entry_sequence_drawdown`(MDD 노이즈)로 정렬. 모든 tuned 챔피언이 MDD 노이즈로 뽑은 가중을 배포해 옴. w>0 비용: −11~17bp/일 (w=0.5 p=0.011, w=1.0 p=0.004).
+
+### 3.5 기각된 가설 (전부 무효 또는 음(−))
+
+| 가설 | 결과 |
+|---|---|
+| 타깃 횡단면 디민 (excess return) | dIC −0.0155, p=0.17 |
+| rolling 750일 윈도우 학습 | −16bp (since 2023) |
+| top-2 / top-3 분산 진입 | −26 ~ −63bp, p<0.01 |
+| ridge / 선형 모델 | −27 ~ −38bp, p<0.05 |
+| causal margin / conviction 관망 게이트 | −8 ~ −43bp — 최저확신 분위도 +0.8% EV라 관망은 손해 |
+| date-constant 피처 제거 (`v_kospi` 등 4개) | p=0.75 |
+| 나이브 공시 + KOSPI200 베이시스 대체데이터 | dIC −0.006, p=0.60 |
+| HPO 목적함수 `rank_ic` | leaves 56 선택(정규화 안됨), 결정지표 못 움직임 |
+| HPO 목적함수 `cpcv_top1` | leaves 8 선택(정규화 됨), 그러나 게이트 p=0.67 |
+
+## 4. 수정 사항 (자체 정당성으로 배포 가치 있음)
+
+| 파일 | 변경 | 근거 |
 |---|---|---|
-| 매매 로그 | `data/parquet/trade_log.parquet` | 33,934행, 2,488종목, 2016-01-04~2026-08-03 |
-| 테마 정보 | `data/parquet/theme.parquet` | 학습 시 존재하면 조인 |
-| 가격 이력 | `data/history/price_history.parquet` | 피처 생성에 사용되는 이력 저장소 |
+| `src/ml/tuning.py` | `calibrate_blend_weight` 유의성 게이트 재작성 — 최저 grid 가중 기본, 상위는 `moving_block_bootstrap Δ>0 & p<promotion_alpha`일 때만 채택, MDD tiebreaker 삭제. `per_weight`에 `delta_vs_base`/`p_value_vs_base` 추가. `alpha` kwarg. | 명백한 선택 버그 제거 |
+| `src/ml/bundle.py` | `CHAMPION_DEFAULT_MODEL_PARAMS` (num_leaves 15, min_child 40, n_estimators 350, lr 0.03, subsample/colsample 0.8, reg_lambda 1.0) → `build_inline_bundle` 기본층 병합 | bare LightGBM 기본값(31/100) 대신 정규화 prior |
+| `src/ml/tuning.py`, `champion.py`, `retrain.py` | `ChampionTuningConfig.model_params_override` + `retrain --no-hpo` — Optuna 스킵 | HPO(11 파라미터 × 2000 노이즈 관측)는 검증노이즈 과적합 |
+| `src/serving/realtime/inference.py` | `_CLOSE_MORNING_RERANKER_CONFIG["p_good_weight"] 0.5 → 0.0` (v2 research config 불변) | 배포/서빙 fallback 기본값 |
 
-원본 매매 로그의 `(수익률, %)` 범위는 -31.03%~33.64%, 중앙값은 0.00%였다. 학습 라벨은 `decimal_net` 단위이며 왕복 거래비용 0.20%를 차감한 순수익 기준으로 `target_good=+1%`, `target_bad=-2%` 임계값을 사용한다.
+## 5. 실 파이프라인 검증 — 수정은 작동, 그러나 홀드아웃 게이트 미통과
 
-## 4. 모델 및 피처 구성
+`train_tuned_champion_bundle`, OOS 예약 `2025-07-01`, n=1,935 shared dates:
 
-- feature set: `close_morning61`
-- panel mode: `scenario_action`
-- 수치 피처: 61개 (범주형 문자열 피처는 LightGBM 입력에서 제외)
-- OOF/일별 점수 컬럼: `decision_score`
-- 점수 설정: `rank_weight=1.0`, `p_good_weight=0.5`, version `close-morning-reranker-v1`
-- 정책: `always_buy_top1`, policy version `ml-single-stock-v1`
-- 정책 보정 cutoff: `2026-08-03 00:00:00`
+| 후보 | 블렌드 선택 | GATE Δ | p | 승격 | top1 / Sharpe / MDD / PF |
+|---|---|---:|---:|:---:|---|
+| FIXED (`--no-hpo` 정규화 + 유의성 블렌드) | **0.0** (기존 버그 0.75) | +0.037%/일 | **0.572** | ❌ | +1.432% / 5.77 / **0.245** / 2.77 |
+| HPO `rank_ic` (12 trials) + 유의성 블렌드 | **0.0** | +0.060%/일 | **0.411** | ❌ | +1.455% / 5.94 / **0.287** / 2.89 |
+| 대조군 (라이브러리 기본값) | 0.5 | — | — | — | +1.395% / 5.72 / 0.182 / 2.81 |
 
-피처 목록:
+- 두 후보 모두 라이브러리 기본값 대비 **+4~6bp/일 (노이즈 수준, p>0.4)**, **MDD·PF는 오히려 악화**.
+- 격리 walk-forward ablation의 **+24bp/p=0.0004는 OOS 예약된 `dev` 구간에서 재현 안 됨**. `dev`(2025-07+ 제외)에서 p_good 블렌드는 중립(0.0: +1.432% vs 0.5: +1.431%) — ablation의 −12bp p_good 비용은 **전체데이터 + 라이브러리기본모델 조합 아티팩트**였음.
+- `calibrate_blend_weight` 버그 수정은 **확정 검증됨**: 두 실행 모두 0.0 선택, 유의성 테이블상 어떤 상위 가중도 0.0을 못 이김.
 
-```text
-change_rate, selection_rank, inst_net_buy, foreign_net_buy, prog_net_buy,
-volume_power, total_candidate_count, kospi_change, kosdaq_change, v_kospi,
-v_kosdaq, scenario_is_sangtta, scenario_is_120_breakout,
-scenario_is_volume_surge, scenario_is_new_high, scenario_is_near_new_high,
-scenario_is_limitup_next_day, scenario_is_rising_bearish, scenario_other,
-scenario_count_for_stock_date, is_multi_scenario_stock_date,
-has_sangtta_for_stock_date, turnover, inst_density, foreign_density,
-major_density, prog_dominance, rank_ratio, relative_change_kospi,
-relative_change_kosdaq, sector_relative_change, v_kospi_change,
-v_kosdaq_change, log_market_cap_100m, log_trade_value_100m, log_volume,
-log_avg_trade_value, trade_value_pct_rank, inst_net_buy_pct_rank,
-foreign_net_buy_pct_rank, change_rate_pct_rank, major_density_pct_rank,
-prog_dominance_pct_rank, gap_ratio_pct_rank, turnover_pct_rank, change_rate_z,
-major_density_z, prog_dominance_z, turnover_z, inst_density_z, close_position,
-body_ratio, upper_shadow_ratio, intraday_range, buy_price_change_rate,
-gap_ratio, relative_change_rate, buy_price_change_rate_z, gap_ratio_z,
-relative_flow_strength
-```
+## 6. 이전 세션 (참고) — CPCV 강건성 인프라
 
-## 5. OOF 정책 평가
+`ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS`: RUN A(`rank_ic`) p=0.358, RUN B(`cpcv_top1`) p=0.665 — 둘 다 승격 거부. 기존 코인플립 게이트(`cand≥ctrl`)였다면 RUN A 승격됐을 것(노이즈 승격). 새 bootstrap 게이트가 차단. `cpcv_oof_predict` attrs concat 버그, `eval_mode` ghost-switch 수정.
 
-| 지표 | 결과 |
-|---|---:|
-| 스케줄된 날짜 | 2,155 |
-| 매수 결정 | 1,903 |
-| 관망(ABSTAIN) | 252 |
-| 매수율 | 88.31% |
-| 스케줄 기준 평균 수익률 | 1.1934% |
-| 스케줄 기준 승률 | 54.15% |
-| 활성 거래 평균 수익률 | 1.3514% |
-| 활성 거래 승률 | 61.32% |
-| Profit factor | 2.2981 |
-| 스케줄 기준 Sharpe | 4.7608 |
-| 진입 순서 기준 drawdown | 44.84% |
+## 7. 한계 및 다음 단계
 
-`entry_sequence_drawdown`은 진입 순서 수익률을 누적한 간이 지표이며, 청산·포지션 중첩·자본 배분을 반영한 포트폴리오 MDD가 아니다. 따라서 이 표만으로 실전 수익성이나 안전성을 확정할 수 없다.
-
-## 6. 산출물 및 무결성
-
-- 후보 번들: `artifacts/models/research/ml-res-2026-08-09/close_morning61_2026-08-03/sizing_pipeline_bundle.joblib`
-- 후보 파일 크기: 3,701,662 bytes
-- 후보 SHA-256: `8827d9f731d96644a28808bd0db41aee034a67d00df79f9b49541ac7af38`
-- 현재 운영 번들 SHA-256: `69cbc2df08437bd70c506d70a13fd9b95677a5186aa7bed26352ef733f7b9d2c`
-
-번들에는 `feature_manifest`, `calibrators`, `rank_model`, `return_model`, `single_stock_policy`, `policy_metadata`, `training_cutoff` 등이 포함되어 있다. 후보 경로는 운영 경로와 분리되어 있어 재학습 과정에서 실시간 추론 모델이 바뀌지 않는다.
-
-## 7. 검증 상태와 다음 단계
-
-- 학습 프로세스: exit code 0, 후보 저장 완료
-- 학습 후 저장된 번들 로드/스키마 검증: 완료
-- 본 저장소 리팩터링 회귀 테스트: `209 passed, 1 warning`
-- 이번 결과에는 별도 미사용 기간의 OOS/페이퍼 트레이딩 결과가 없다.
-
-운영 승격 전에는 (1) cutoff 이후 완전 미사용 기간의 OOS 평가, (2) 비용·슬리피지·체결 실패를 포함한 포트폴리오 백테스트, (3) 기존 운영 번들과의 동일 입력 shadow 비교, (4) 승인된 후보만 운영 경로로 원자적 교체하는 릴리스 절차를 추가로 통과해야 한다.
-
----
-
-# ML 챔피언 튜닝 파이프라인 (src/ml/ 이관 + 근거화)
-
-## 8. 실행 요약 (2026-09-01)
-
-`legacy/ml_research/` 재학습 경로를 `src/ml/` 로 재작성 이관(git 추적·ruff·mypy·pytest 대상).
-동시에 학습 과정을 근거 기반으로 전환: Optuna 중첩 purged walk-forward 튜닝, 최종 모델 seed 앙상블,
-OOF 기반 `p_good` blend 가중치 보정, 라벨 클립/Huber δ config화, chronological 확률 보정기,
-date-balanced·recency 샘플 가중 A/B, 임베고 OOS 예약 + 동일 날짜 대조군 승격 게이트.
-
-- 입력: `data/parquet/trade_log.parquet` 33,944행 / 2,599일
-- 산출물: `scratch/champion_out/close_morning61_2026-02-27/` 후보 번들 (활성 번들 불변)
-- 진입점: `python -m src.ml.retrain [--tuned ...]`
-
-## 9. 성과 (동일 2,070 OOF 날짜, paired 대조)
-
-| 지표 | 대조군(현행 기본값) | 튜닝 후보 | 변화 |
-|---|---:|---:|---:|
-| 스케줄 평균수익 | 1.2028% | 1.2795% | +6.4% |
-| Sharpe | 4.93 | 5.19 | +0.26 |
-| Profit Factor | 2.38 | 2.50 | +0.12 |
-| 스케줄 승률 | 53.96% | 54.64% | +0.68%p |
-| 활성거래 평균수익 | 1.369% | 1.457% | +6.4% |
-| entry-seq drawdown | 26.20% | 25.58% | -0.6%p |
-
-승격 게이트 PASS (`cand_mean 0.012795 >= ctrl_mean 0.012028`, shared_dates 2070).
-
-## 10. 근거화 결과
-
-- **HPO 최적**: `num_leaves=44, learning_rate=0.011, n_estimators=750, colsample_bytree=0.81, subsample=0.72` — 라이브러리 기본값(31/0.1/100) 대비 저학습률·정규화로 과적합 억제가 이득의 주원인. inner OOF top-1 수익 0.0104→0.0157.
-- **blend 가중치 `p_good_weight` → 0.0**: 그리드 {0, 0.25, 0.5, 0.75, 1.0} 에서 스케줄 수익 평탄(~1.28%), DD는 0.0에서 최저(25.6%) → 1.0에서 40.0%. 기존 하드코딩 0.5는 무효했고 DD를 악화시켰음이 데이터로 확인됨.
-- **date_balanced 샘플 가중**이 `current` 대비 게이트 통과에 기여.
-- **OOS 110행(2026-03-01~)** 은 HPO·보정·정책 선택 어디에도 미사용 (`assert_oos_excluded` fail-closed).
-
-## 11. 한계 및 다음 단계
-
-- 여전히 OOF이며 예약 OOS(약 11일, 110행)는 표본 부족.
-- `entry_sequence_drawdown` 은 포지션 중첩·자본배분 미반영 간이지표.
-- 개선폭(+6.4%)은 통계적으로 작음 — 현 61피처셋 신호 상한 근접. 추가 상승은 다일 히스토리 피처(별도 스펙) 필요.
-- 운영 승격 전: (1) 비용·슬리피지·체결실패 포함 포트폴리오 백테스트, (2) 완전 미사용 OOS 구간 확대 평가, (3) 활성 번들 shadow 비교.
+- `entry_sequence_drawdown`은 포지션 중첩·자본배분 미반영 간이지표. 운영 승격 전 포트폴리오 백테스트(비용·슬리피지·체결실패 포함) 필수.
+- **P2 (최근 레짐 레버 = 새 정보만)**: 결정시점 미시구조, `chart_analysis` × 피처 상호작용, 트레일링/상대 변환된 대체데이터. 그룹별로 CPCV + bootstrap 게이트(`Δ>0 & p<0.10` vs 61피처 대조군) 통과 시에만 배포. 정직한 사전확률: 탐색적, 아무것도 안 나올 수 있음 (다일·섹터·공시 3회 시도 이미 실패).
+- **P3 (죽은 p_good 연산 제거)**: p_good_weight 0 기본 + calibrate가 계속 0 선택 시, `fit_chrono_calibrator`가 fold당 2회 무의미하게 실행. `any(w>0 for w in grid)` 게이팅 또는 v1 경로에서 p_good/p_bad 제거 → 챔피언 학습시간 ~30% 절감.
