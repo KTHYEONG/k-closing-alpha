@@ -1,3 +1,4 @@
+# ruff: noqa: I001 (import order pinned for grouped exit_policy/inference wiring)
 """Champion bundle orchestration."""
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from src.ml.feature_selection import select_stable_features
 from src.ml.history_features import HISTORY_FEATURE_COLUMNS  # noqa: F401 (used via dataset)
 from src.ml.oof import purged_oof_predict
 from src.ml.policy_eval import default_policy_candidates, evaluate_single_stock_policy_oof
-from src.ml.robust_eval import deflated_sharpe_ratio, moving_block_bootstrap_delta
+from src.ml.robust_eval import CombinatorialPurgedCV, deflated_sharpe_ratio, moving_block_bootstrap_delta
 from src.ml.tuning import (
     BlendWeightResult,  # noqa: F401
     ChampionTuningConfig,
@@ -23,7 +24,13 @@ from src.ml.tuning import (
     evaluate_config_oof,
     tune_return_model_params,
 )
-from src.serving.realtime.inference import _CLOSE_MORNING_RERANKER_CONFIG, add_close_morning_decision_score
+from src.ml.exit_policy import (  # noqa: F401 (attach/simulate re-exported; research API exercised via evaluate_exit_grid)
+    attach_next_day_path,
+    evaluate_exit_grid,
+    simulate_take_profit_exit,
+    summarize_exit_grid,
+)
+from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO, _CLOSE_MORNING_RERANKER_CONFIG, add_close_morning_decision_score
 from src.utils.display import Colors
 
 logger = logging.getLogger(__name__)
@@ -221,6 +228,19 @@ def train_tuned_champion_bundle(
         predict_proba=True,
     )
     candidate_oof["rank_score"] = candidate_oof["pred"]
+    # 청산 규칙 그리드는 provenance 기록 전용이며 배포 결정 경로를 바꾸지 않는다.
+    exit_policy_provenance: dict[str, Any] = {"status": "skipped", "reason": "price_history_df not supplied"}
+    if price_history_df is not None:
+        try:
+            _exit_cv = CombinatorialPurgedCV(n_groups=config.cpcv_n_groups, k_test=config.cpcv_k_test)
+            _exit_results = evaluate_exit_grid(
+                candidate_oof, price_history_df,
+                group_col="trade_date", code_col="stock_code", score_col="pred", target_col="net_return",
+                cost_ratio=ROUND_TRIP_COST_RATIO, cv=_exit_cv, alpha=config.promotion_alpha,
+            )
+            exit_policy_provenance = {"status": "evaluated", **summarize_exit_grid(_exit_results)}
+        except ValueError as exc:
+            exit_policy_provenance = {"status": "skipped", "reason": str(exc)}
     blend = calibrate_blend_weight(
         candidate_oof,
         "trade_date",
@@ -363,6 +383,7 @@ def train_tuned_champion_bundle(
         "control_metrics": dict(control["metrics"]),
         "selected_features": list(feature_cols) if config.feature_selection_top_n is not None else None,
         "selection_top_n": config.feature_selection_top_n,
+        "exit_policy_grid": exit_policy_provenance,
     }
 
     # Only write artifact if promoted or gate disabled
