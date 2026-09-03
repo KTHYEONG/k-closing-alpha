@@ -122,7 +122,8 @@
   "src/ml/dataset.py": {
     "testing": [
       "tests/unit/ml/test_ml_foundation_parity.py",
-      "tests/unit/ml/test_history_features.py"
+      "tests/unit/ml/test_history_features.py",
+      "tests/unit/ml/test_dataset.py"
     ]
   },
   "src/ml/feature_selection.py": {
