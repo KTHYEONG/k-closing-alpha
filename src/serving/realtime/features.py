@@ -263,14 +263,16 @@ def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
 
     MAD가 0인 그룹은 0-나눗셈 방지를 위해 NaN으로 처리합니다.
     """
+    new_cols: dict[str, pd.Series] = {}
     for col in columns:
         if col not in df.columns:
             continue
-        grouped = df.groupby("trade_date")[col]
-        median = grouped.transform("median")
-        mad = grouped.transform(lambda x: (x - x.median()).abs().median())
+        median = df.groupby("trade_date")[col].transform("median")
+        mad = (df[col] - median).abs().groupby(df["trade_date"]).transform("median")
         mad = mad.replace(0, np.nan)
-        df[f"{col}_z"] = ((df[col] - median) / mad).clip(-5, 5)
+        new_cols[f"{col}_z"] = ((df[col] - median) / mad).clip(-5, 5)
+    if new_cols:
+        df = df.assign(**new_cols)
     return df
 
 

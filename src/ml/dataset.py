@@ -188,10 +188,40 @@ def create_multi_targets(
             group_df["net_return"].rank(method="first"), q=5, labels=[0, 1, 2, 3, 4]
         ).astype(int)
 
-    rank_map: dict[int, int] = {}
-    for _, group_df in df.groupby("trade_date", sort=False):
-        rank_map.update(assign_daily_rank(group_df).to_dict())
-    df["target_rank"] = pd.Series(rank_map, dtype="int64").reindex(df.index)
+    # Vectorized per-date quintiles: one C-level rank/size pass, then one
+    # qcut per distinct group size (identical to per-group qcut on 1..n).
+    first_rank = df.groupby("trade_date", sort=False)["net_return"].rank(
+        method="first", ascending=True
+    )
+    group_size = df.groupby("trade_date", sort=False)["net_return"].transform("size")
+    rank_out = np.empty(len(df), dtype=np.int64)
+    small_mask = (group_size < 5).to_numpy()
+    size_arr = group_size.to_numpy()
+    rank_arr = first_rank.to_numpy()
+    single_mask = small_mask & (size_arr == 1)
+    rank_out[single_mask] = 2
+    multi_small = small_mask & (size_arr > 1)
+    if multi_small.any():
+        rank_out[multi_small] = (
+            ((rank_arr[multi_small] - 1) / (size_arr[multi_small] - 1) * 4)
+            .round()
+            .astype(np.int64)
+            .clip(0, 4)
+        )
+    for n_val in np.unique(size_arr[~small_mask]):
+        n_int = int(n_val)
+        labels = (
+            pd.qcut(
+                pd.Series(np.arange(1, n_int + 1, dtype=float)),
+                q=5,
+                labels=[0, 1, 2, 3, 4],
+            )
+            .astype(int)
+            .to_numpy()
+        )
+        sel = (~small_mask) & (size_arr == n_val)
+        rank_out[sel] = labels[(rank_arr[sel] - 1).astype(np.int64)]
+    df["target_rank"] = pd.Series(rank_out, index=df.index, dtype="int64").reindex(df.index)
     df["target_good"] = (net_of_cost >= LABEL_THRESHOLDS["target_good"]).astype(int)
     df["target_bad"] = (net_of_cost <= LABEL_THRESHOLDS["target_bad"]).astype(int)
     df.attrs["return_unit"] = RETURN_UNIT
