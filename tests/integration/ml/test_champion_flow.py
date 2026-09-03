@@ -41,6 +41,7 @@ def test_train_tuned_champion_bundle_provenance_and_serving_load(tmp_path) -> No
     assert set(prov["best_params"]).issubset({
         "num_leaves", "min_child_samples", "learning_rate", "n_estimators",
         "reg_alpha", "reg_lambda", "subsample", "colsample_bytree", "subsample_freq",
+        "min_split_gain", "path_smooth",
     })
     assert bundle["decision_score_config"]["p_good_weight"] in cfg.p_good_weight_grid
     assert isinstance(bundle["return_model"], SeedEnsembleModel)
