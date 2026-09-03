@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_PIPELINE_GAIN_RECOVERY",
+      "date": "2026-09-03",
+      "adr_id": "ADR_20260903_ML_PIPELINE_GAIN_RECOVERY",
+      "domain": "ml",
+      "title": "Recover reranker model alpha cancelled by champion pipeline: fix blend-weight selection bug + regularized default model",
+      "why": "튜닝만으로 라이브러리 기본값 대비 개선 없던 정확한 원인 규명: calibrate_blend_weight 가 MDD 노이즈로 p_good 가중 0.75(최선 0.0 대비 -17bp) 선택하는 버그 + RUN A/B 가 검증-무효 knob(date_balanced p=0.99, recency p=0.31)과 혼동. 배경: 후보군 EV 가 2020년 이후 붕괴(+0.3%/53% -> -0.2%/44% win)로 리랭커가 현 레짐에서 포화.",
+      "resolution": "calibrate_blend_weight 유의성 게이트 재작성(최저 grid 가중 기본, 상위는 moving_block_bootstrap delta>0 & p<promotion_alpha 일 때만 채택, MDD tiebreaker 삭제; per_weight 에 delta_vs_base/p_value_vs_base 추가). bundle.py CHAMPION_DEFAULT_MODEL_PARAMS 상수(num_leaves 15 등 정규화 config)를 build_inline_bundle 기본층으로 병합. ChampionTuningConfig.model_params_override + retrain --no-hpo 로 Optuna 스킵. _CLOSE_MORNING_RERANKER_CONFIG p_good_weight 0.5->0.0. 실데이터 검증: 블렌드 선택 0.0 정상 동작(기존 버그 0.75), 그러나 홀드아웃 승격 게이트 미통과(FIXED +3.7bp p=0.57, HPO +6.0bp p=0.41, MDD 오히려 악화). 격리 ablation +24bp/p=0.0004 는 OOS 예약에서 소멸.",
+      "impact": "선택 버그 제거(모든 tuned 챔피언이 MDD 노이즈로 가중 선택하던 문제). 배포 비-tuned 모델이 bare LightGBM 기본값 대신 정규화 prior 사용. 블렌드 가중 유의성 기반 결정. 하위호환(positional 시그니처/BlendWeightResult 불변, --no-hpo 없으면 기존과 동일). 모델/블렌드/정책 튜닝은 현 레짐에서 소진 — 다음 레버는 새 예측정보(로드맵 P2)."
+    },
+    {
       "task_id": "TASK_ML_SPARSE_DATA_ROBUSTNESS",
       "date": "2026-09-03",
       "adr_id": "ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS",

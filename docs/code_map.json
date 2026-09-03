@@ -141,7 +141,15 @@
     "testing": [
       "tests/unit/ml/test_tuning.py",
       "tests/unit/ml/test_champion_tuning.py"
-    ]
+    ],
+    "architecture": "docs/decisions/ADR_20260903_ML_PIPELINE_GAIN_RECOVERY.md"
+  },
+  "src/ml/bundle.py": {
+    "testing": [
+      "tests/unit/ml/test_bundle.py",
+      "tests/unit/ml/test_champion_tuning.py"
+    ],
+    "architecture": "docs/decisions/ADR_20260903_ML_PIPELINE_GAIN_RECOVERY.md"
   },
   "src/processing/scale_corrector.py": {
     "testing": "tests/unit/processing/test_scale_corrector.py"
