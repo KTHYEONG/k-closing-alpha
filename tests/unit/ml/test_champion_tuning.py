@@ -243,3 +243,83 @@ def test_tune_return_model_params_walkforward_does_not_use_cpcv(monkeypatch) -> 
     tune_return_model_params(panel, ["f1", "f2"], "target_return", "trade_date", cfg)
 
     assert not calls
+
+
+def test_calibrate_blend_weight_prefers_base_when_higher_weights_worse() -> None:
+    rng = np.random.default_rng(3)
+    dates = np.repeat(pd.bdate_range("2022-01-03", periods=340), 6)
+    m = len(dates)
+    pred = rng.normal(size=m)
+    target = pred * 0.012 + rng.normal(scale=0.02, size=m)
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "stock_code": [f"{i % 40:06d}" for i in range(m)],
+        "chart_analysis": "volume_surge",
+        "market_type": "KOSPI",
+        "target_return": target,
+        "rank_score": pred,
+        # p_good deliberately anti-informative: high when target is low
+        "p_good": (1.0 / (1.0 + np.exp(3.0 * (target - np.median(target))))),
+    })
+
+    result = calibrate_blend_weight(
+        df, "trade_date", "target_return", "stock_code", "chart_analysis", (0.0, 0.25, 0.5, 1.0), 60, alpha=0.10
+    )
+
+    assert result.chosen_weight == 0.0
+    assert result.per_weight[0.0]["p_value_vs_base"] == 1.0
+    assert result.per_weight[1.0]["delta_vs_base"] < 0.0
+
+
+def test_calibrate_blend_weight_selects_higher_weight_only_when_significant() -> None:
+    rng = np.random.default_rng(7)
+    dates = np.repeat(pd.bdate_range("2022-01-03", periods=360), 6)
+    m = len(dates)
+    latent = rng.normal(size=m)
+    pred = 0.3 * latent + rng.normal(scale=1.0, size=m)
+    # target driven mostly by latent; p_good is a clean probe of latent that pred misses
+    target = 0.02 * latent + rng.normal(scale=0.015, size=m)
+    p_good = 1.0 / (1.0 + np.exp(-2.5 * latent))
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "stock_code": [f"{i % 40:06d}" for i in range(m)],
+        "chart_analysis": "volume_surge",
+        "market_type": "KOSPI",
+        "target_return": target,
+        "rank_score": pred,
+        "p_good": p_good,
+    })
+
+    result = calibrate_blend_weight(
+        df, "trade_date", "target_return", "stock_code", "chart_analysis", (0.0, 0.5, 1.0), 60, alpha=0.10
+    )
+
+    assert result.chosen_weight > 0.0
+    assert result.per_weight[result.chosen_weight]["delta_vs_base"] > 0.0
+    assert result.per_weight[result.chosen_weight]["p_value_vs_base"] < 0.10
+
+
+def test_calibrate_blend_weight_rejects_bad_alpha() -> None:
+    dates = np.repeat(pd.bdate_range("2022-01-03", periods=80), 4)
+    m = len(dates)
+    df = pd.DataFrame({
+        "trade_date": dates,
+        "stock_code": [f"{i % 20:06d}" for i in range(m)],
+        "chart_analysis": "volume_surge",
+        "market_type": "KOSPI",
+        "target_return": np.zeros(m),
+        "rank_score": np.arange(m) % 4,
+        "p_good": np.linspace(0.0, 1.0, m),
+    })
+    with pytest.raises(ValueError, match="alpha"):
+        calibrate_blend_weight(df, "trade_date", "target_return", "stock_code", "chart_analysis", (0.0, 0.5), 20, alpha=0.0)
+    with pytest.raises(ValueError, match="alpha"):
+        calibrate_blend_weight(df, "trade_date", "target_return", "stock_code", "chart_analysis", (0.0, 0.5), 20, alpha=0.9)
+
+
+def test_champion_tuning_config_model_params_override() -> None:
+    assert ChampionTuningConfig().model_params_override is None
+    cfg = ChampionTuningConfig(model_params_override={"num_leaves": 15})
+    assert cfg.model_params_override == {"num_leaves": 15}
+    with pytest.raises(ValueError, match="model_params_override"):
+        ChampionTuningConfig(model_params_override={})

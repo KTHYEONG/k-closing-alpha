@@ -100,3 +100,32 @@ def test_tuned_champion_provenance_records_bootstrap_gate() -> None:
     assert cvc["promotion_alpha"] == cfg.promotion_alpha
     assert isinstance(cvc["promoted"], bool)
 
+
+def test_close_morning_reranker_config_p_good_weight_is_zero() -> None:
+    from src.serving.realtime.inference import (
+        _CLOSE_MORNING_RERANKER_CONFIG,
+        _CLOSE_MORNING_RERANKER_V2_RESEARCH_CONFIG,
+    )
+
+    assert _CLOSE_MORNING_RERANKER_CONFIG["p_good_weight"] == 0.0
+    assert _CLOSE_MORNING_RERANKER_V2_RESEARCH_CONFIG["p_good_weight"] == 0.5
+
+
+def test_train_tuned_champion_skips_hpo_with_model_params_override(monkeypatch) -> None:
+    import src.ml.champion as champ
+    from src.ml.bundle import CHAMPION_DEFAULT_MODEL_PARAMS
+
+    calls: list[int] = []
+    monkeypatch.setattr(champ, "tune_return_model_params", lambda *a, **k: calls.append(1))
+
+    cfg = ChampionTuningConfig(
+        seed_ensemble=(13, 29), require_beats_control=False, min_history_dates=20,
+        model_params_override=dict(CHAMPION_DEFAULT_MODEL_PARAMS),
+    )
+    bundle = train_tuned_champion_bundle(_raw_trade_log(), None, cfg, export_dir="tmp/spec_override")
+
+    assert not calls
+    prov = bundle["tuning_provenance"]
+    assert prov["objective"] == "override"
+    assert prov["n_trials"] == 0
+
