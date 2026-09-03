@@ -153,3 +153,93 @@ def test_calibrate_blend_weight_selects_conservatively() -> None:
     result = calibrate_blend_weight(df, "trade_date", "target_return", "stock_code", "chart_analysis", grid, 60)
     assert set(result.per_weight.keys()) == set(grid)
     assert result.chosen_weight == 0.0
+
+
+import pytest
+
+from src.ml.tuning import ChampionTuningConfig
+
+
+def test_champion_tuning_config_cpcv_fields() -> None:
+    cfg = ChampionTuningConfig()
+    assert cfg.eval_mode == "walkforward"
+    assert cfg.cpcv_n_groups == 8
+    assert cfg.cpcv_k_test == 2
+    assert cfg.promotion_alpha == 0.10
+    assert cfg.hpo_reg_bias is True
+
+    assert ChampionTuningConfig(hpo_objective="cpcv_top1", eval_mode="cpcv").hpo_objective == "cpcv_top1"
+    # cpcv_top1 목적함수는 eval_mode='cpcv' 를 강제 (ghost 스위치 방지)
+    with pytest.raises(ValueError, match="cpcv_top1"):
+        ChampionTuningConfig(hpo_objective="cpcv_top1")
+
+    with pytest.raises(ValueError, match="eval_mode"):
+        ChampionTuningConfig(eval_mode="expanding")
+    with pytest.raises(ValueError, match="cpcv_n_groups"):
+        ChampionTuningConfig(cpcv_n_groups=3)
+    with pytest.raises(ValueError, match="cpcv_k_test"):
+        ChampionTuningConfig(cpcv_k_test=8, cpcv_n_groups=8)
+    with pytest.raises(ValueError, match="promotion_alpha"):
+        ChampionTuningConfig(promotion_alpha=0.0)
+    with pytest.raises(ValueError, match="promotion_alpha"):
+        ChampionTuningConfig(promotion_alpha=0.75)
+    with pytest.raises(ValueError, match="hpo_objective"):
+        ChampionTuningConfig(hpo_objective="sharpe")
+
+
+
+import numpy as np
+import pandas as pd
+
+from src.ml import tuning as tuning_mod
+from src.ml.tuning import tune_return_model_params
+
+
+def _toy_panel(n_days: int = 32, per_day: int = 5) -> pd.DataFrame:
+    rng = np.random.default_rng(0)
+    rows = []
+    for i, d in enumerate(pd.bdate_range("2023-01-02", periods=n_days)):
+        for _ in range(per_day):
+            f1 = rng.normal()
+            f2 = rng.normal()
+            rows.append(
+                {
+                    "trade_date": d,
+                    "f1": f1,
+                    "f2": f2,
+                    "target_return": 0.01 * f1 - 0.005 * f2 + rng.normal(scale=0.02) + 0.0001 * i,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_tune_return_model_params_cpcv_eval_mode_routes_through_cpcv(monkeypatch) -> None:
+    panel = _toy_panel()
+    calls: list[int] = []
+    real = tuning_mod.cpcv_oof_predict
+
+    def _spy(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tuning_mod, "cpcv_oof_predict", _spy)
+
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, eval_mode="cpcv", hpo_objective="cpcv_top1", cpcv_n_groups=8, cpcv_k_test=2
+    )
+    result = tune_return_model_params(panel, ["f1", "f2"], "target_return", "trade_date", cfg)
+
+    assert calls, "eval_mode='cpcv' must route HPO scoring through cpcv_oof_predict"
+    assert np.isfinite(result.best_value)
+    assert {"min_split_gain", "path_smooth"}.issubset(result.best_params)
+
+
+def test_tune_return_model_params_walkforward_does_not_use_cpcv(monkeypatch) -> None:
+    panel = _toy_panel()
+    calls: list[int] = []
+    monkeypatch.setattr(tuning_mod, "cpcv_oof_predict", lambda *a, **k: calls.append(1))
+
+    cfg = ChampionTuningConfig(hpo_trials=2, eval_mode="walkforward", hpo_objective="rank_ic")
+    tune_return_model_params(panel, ["f1", "f2"], "target_return", "trade_date", cfg)
+
+    assert not calls
