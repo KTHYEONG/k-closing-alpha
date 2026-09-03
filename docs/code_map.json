@@ -125,11 +125,23 @@
    "tests/unit/ml/test_history_features.py"
   ]
  },
+ "src/ml/feature_selection.py": {
+  "testing": "tests/unit/ml/test_feature_selection.py"
+ },
  "src/ml/history_features.py": {
   "testing": "tests/unit/ml/test_history_features.py"
  },
  "src/ml/retrain.py": {
   "testing": "tests/unit/ml/test_retrain.py"
+ },
+ "src/ml/sector_features.py": {
+  "testing": "tests/unit/ml/test_sector_features.py"
+ },
+ "src/ml/tuning.py": {
+  "testing": [
+   "tests/unit/ml/test_tuning.py",
+   "tests/unit/ml/test_champion_tuning.py"
+  ]
  },
  "src/processing/scale_corrector.py": {
   "testing": "tests/unit/processing/test_scale_corrector.py"
