@@ -12,3 +12,91 @@ def test_champion_entrypoints_accept_feature_set_and_price_history() -> None:
         assert params["feature_set"].default == "close_morning61"
         assert "price_history_df" in params
         assert params["price_history_df"].default is None
+
+
+import numpy as np
+
+from src.ml.champion import evaluate_promotion
+
+
+def test_evaluate_promotion_is_significance_based() -> None:
+    rng = np.random.default_rng(11)
+    ctrl = rng.normal(0.0, 0.03, size=300)
+    strong_cand = ctrl + 0.004
+
+    promoted = evaluate_promotion(strong_cand, ctrl, alpha=0.10)
+    assert promoted["promoted"] is True
+    assert promoted["p_value"] < 0.10
+    assert promoted["delta"] > 0.0
+    assert promoted["method"] == "moving_block_bootstrap"
+    assert promoted["n_obs"] == 300
+
+    tie = evaluate_promotion(ctrl.copy(), ctrl, alpha=0.10)
+    assert tie["promoted"] is False
+
+    noisy_cand = ctrl + rng.normal(0.0005, 0.03, size=300)
+    marginal = evaluate_promotion(noisy_cand, ctrl, alpha=0.10)
+    assert marginal["promoted"] == (marginal["delta"] > 0.0 and marginal["p_value"] < 0.10)
+
+
+import numpy as np
+import pandas as pd
+
+from src.ml.champion import train_tuned_champion_bundle
+from src.ml.tuning import ChampionTuningConfig
+
+
+def _raw_trade_log(n_dates: int = 90, per_day: int = 8) -> pd.DataFrame:
+    rng = np.random.default_rng(5)
+    rows = []
+    for d in pd.bdate_range("2023-01-02", periods=n_dates):
+        for j in range(per_day):
+            e = rng.normal()
+            rows.append(
+                {
+                    "\ub9e4\uc218\ub0a0\uc9dc": d.strftime("%Y-%m-%d"),
+                    "\uc885\ubaa9\ucf54\ub4dc": f"{j:06d}",
+                    "(\uc2dc\uac00)": "10000",
+                    "(\uace0\uac00)": "10400",
+                    "(\uc800\uac00)": "9800",
+                    "(\uc885\uac00)": "10200",
+                    "(\uc804\uc77c\uc885\uac00)": "10000",
+                    "(\uc2dc\uac00\ucd1d\uc561, \uc5b5)": "5000",
+                    "(\uac70\ub798\ub300\uae08, \uc5b5)": "300",
+                    "(\ub4f1\ub77d\ub960)": f"{2 + e:.2f}",
+                    "(\uc120\uc815 \uc21c\uc704)": str(j + 1),
+                    "(\uae30\uad00_\uc21c\ub9e4\uc218)": f"{e * 100:.0f}",
+                    "(\uc678\uad6d\uc778_\uc21c\ub9e4\uc218)": f"{e * 80:.0f}",
+                    "(\ud504\ub85c\uadf8\ub7a8_\uc21c\ub9e4\uc218)": f"{e * 50:.0f}",
+                    "(\uccb4\uacb0\uac15\ub3c4)": "120",
+                    "(\uc2dc\uc7a5\uad6c\ubd84)": "KOSPI",
+                    "(\ucd1d \uc885\ubaa9 \uc218)": str(per_day),
+                    "(\ud3c9\uade0 \uac70\ub798\ub300\uae08)": "250",
+                    "(kospi, %)": "0.3",
+                    "(kosdaq, %)": "0.1",
+                    "v_kospi": "18",
+                    "v_kosdaq": "20",
+                    "(\uac70\ub798\ub7c9)": "100000",
+                    "(\ud14c\ub9c8/\uc139\ud130)": "\ubc18\ub3c4\uccb4",
+                    "(\ucc28\ud2b8\ubd84\uc11d)": "\uac70\ub798\ub7c9 \ud3ed\uc99d",
+                    "(\ub9e4\uc218 \uac00\uaca9)": "10200",
+                    "(\ub9e4\ub3c4 \uac00\uaca9)": f"{10200 * (1 + 0.01 * e):.0f}",
+                    "(\uc218\uc775\ub960, %)": f"{e:.2f}",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_tuned_champion_provenance_records_bootstrap_gate() -> None:
+    trade_log = _raw_trade_log()
+    cfg = ChampionTuningConfig(hpo_trials=2, seed_ensemble=(13, 29), require_beats_control=False, min_history_dates=20)
+
+    bundle = train_tuned_champion_bundle(trade_log, None, cfg, export_dir="tmp/spec_champion")
+
+    cvc = bundle["tuning_provenance"]["control_vs_candidate"]
+    assert "p_value" in cvc
+    assert "delta" in cvc
+    assert "ci_low" in cvc and "ci_high" in cvc
+    assert cvc["promotion_alpha"] == cfg.promotion_alpha
+    assert isinstance(cvc["promoted"], bool)
+
