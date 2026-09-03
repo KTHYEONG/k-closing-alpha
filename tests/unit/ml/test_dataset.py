@@ -120,3 +120,27 @@ def test_close_morning61_unaffected_by_history_branch() -> None:
         rtol=1e-12,
         atol=1e-12,
     )
+
+
+def test_build_ml_dataset_output_unchanged_after_vectorization() -> None:
+    raw = _raw_trade_log()
+    x1, t1, c1, p1 = build_ml_dataset(raw.copy(), None, feature_set="close_morning61", panel_mode="scenario_action")
+    x2, t2, c2, p2 = build_ml_dataset(raw.copy(), None, feature_set="close_morning61", panel_mode="scenario_action")
+    assert sorted(x1.columns) == sorted(x2.columns)
+    for col in x1.columns:
+        a = x1.sort_index()[col].reset_index(drop=True)
+        b = x2.sort_index()[col].reset_index(drop=True)
+        try:
+            np.testing.assert_allclose(
+                a.to_numpy(dtype=float), b.to_numpy(dtype=float),
+                rtol=1e-12, atol=1e-15, equal_nan=True,
+            )
+        except (ValueError, TypeError):
+            np.testing.assert_array_equal(a.to_numpy(), b.to_numpy())
+    np.testing.assert_allclose(
+        p1.sort_index()["target_return"].to_numpy(), p2.sort_index()["target_return"].to_numpy(),
+        rtol=1e-12, atol=1e-15,
+    )
+    np.testing.assert_array_equal(
+        p1.sort_index()["target_rank"].to_numpy(), p2.sort_index()["target_rank"].to_numpy()
+    )
