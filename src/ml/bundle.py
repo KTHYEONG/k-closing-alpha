@@ -31,6 +31,17 @@ _CATEGORICAL_FEATURE_COLS: tuple[str, ...] = (
     "chart_analysis",
 )
 
+CHAMPION_DEFAULT_MODEL_PARAMS: dict[str, Any] = {
+    "num_leaves": 15,
+    "min_child_samples": 40,
+    "n_estimators": 350,
+    "learning_rate": 0.03,
+    "subsample": 0.8,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.8,
+    "reg_lambda": 1.0,
+}
+
 
 class SeedEnsembleModel:
     """Seed ensemble averaging predictions."""
@@ -136,6 +147,7 @@ def build_inline_bundle(
         raise ValueError("feature_cols is empty after excluding categorical columns")
     train = df.sort_values(group_col)
     y = train[target_col].to_numpy(dtype=np.float64)
+    base_return_params = {**CHAMPION_DEFAULT_MODEL_PARAMS, **(return_model_params or {})}
     # ranker
     relevance = train[target_col].groupby(train[group_col], sort=False).rank(pct=True).to_numpy()
     relevance = (relevance * 4.0).round().astype(int)
@@ -146,11 +158,11 @@ def build_inline_bundle(
     # return model
     if seeds is not None:
         return_model = fit_seed_ensemble(
-            train, feature_cols, target_col, seeds, return_model_params or {}, huber_delta
+            train, feature_cols, target_col, seeds, base_return_params, huber_delta
         )
     else:
         train_f = _finite_nan(train, feature_cols)
-        merged_params: dict[str, object] = dict(return_model_params or {})
+        merged_params: dict[str, object] = dict(base_return_params)
         merged_params.setdefault("alpha", huber_delta)
         return_model = LGBMRegressor(objective="huber", random_state=42, verbosity=-1, **merged_params)  # type: ignore[arg-type]
         return_model.fit(train_f[feature_cols], y)

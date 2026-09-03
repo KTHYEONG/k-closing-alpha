@@ -9,7 +9,7 @@ import pandas as pd
 
 from src.ml.oof import purged_oof_predict
 from src.ml.policy_eval import default_policy_candidates, evaluate_single_stock_policy_oof
-from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict, path_top1_returns
+from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict, moving_block_bootstrap_delta, path_top1_returns
 from src.serving.realtime.inference import add_close_morning_decision_score
 
 
@@ -45,6 +45,8 @@ class ChampionTuningConfig:
     cpcv_k_test: int = 2
     promotion_alpha: float = 0.10
     hpo_reg_bias: bool = True
+    # Fixed return-model params bypassing Optuna; callers must not mutate the dict.
+    model_params_override: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.n_splits < 2:
@@ -113,6 +115,10 @@ class ChampionTuningConfig:
             )
         if not 0.0 < self.promotion_alpha <= 0.5:
             raise ValueError(f"promotion_alpha must be in (0, 0.5], got {self.promotion_alpha}")
+        if self.model_params_override is not None and (
+            not isinstance(self.model_params_override, dict) or not self.model_params_override
+        ):
+            raise ValueError("model_params_override must be a non-empty dict")
         if self.hpo_objective == "cpcv_top1" and self.eval_mode != "cpcv":
             raise ValueError("hpo_objective='cpcv_top1' requires eval_mode='cpcv'")
 
@@ -282,11 +288,16 @@ def calibrate_blend_weight(
     scenario_col: str,
     grid: tuple[float, ...],
     min_history_dates: int,
+    *,
+    alpha: float = 0.10,
 ) -> BlendWeightResult:
-    """Select p_good weight via OOF policy evaluation."""
+    """Select p_good weight via significance-gated OOF policy evaluation."""
+    if not 0.0 < alpha <= 0.5:
+        raise ValueError(f"alpha must be in (0, 0.5], got {alpha}")
     if "rank_score" not in oof_df.columns:
         raise ValueError("oof_df must contain rank_score column")
     per_weight: dict[float, dict[str, float]] = {}
+    series: dict[float, pd.Series] = {}
     for w in grid:
         scored = add_close_morning_decision_score(oof_df, group_col=group_col, probability_weight=w)
         cutoff = str(scored[group_col].max())
@@ -307,36 +318,34 @@ def calibrate_blend_weight(
             "entry_sequence_drawdown": float(m["entry_sequence_drawdown"]),
             "buy_rate": float(m["buy_rate"]),
         }
+        series[w] = pd.Series(
+            np.asarray(eval_res.scheduled_returns, dtype=np.float64),
+            index=pd.Index(eval_res.decisions[group_col]),
+        )
 
-    # 보수적 선택: 균일 랜덤 p_good처럼 타깃과 무관한 확률이 혼입된 경우
-    # 스케줄 평균 차이가 미세하면 하위 가중치를 우선합니다.
-    # 테스트가 요구하는 결정적 보수성을 보장합니다.
-    means = [v["scheduled_mean_return"] for v in per_weight.values() if np.isfinite(v["scheduled_mean_return"])]
-    if means and (max(means) - min(means) < 0.005):
-        # 미세 차이는 무승부로 간주해 mdd -> weight 순으로 보수적 선택
-        def _conservative_sort(item: tuple[float, dict[str, float]]) -> tuple[Any, ...]:
-            w, s = item
-            mdd = s["entry_sequence_drawdown"] if np.isfinite(s["entry_sequence_drawdown"]) else float("inf")
-            return (mdd, w)
-        chosen = min(per_weight.items(), key=_conservative_sort)[0]
-        return BlendWeightResult(chosen_weight=chosen, per_weight=per_weight)
-
-    def sort_key(item: tuple[float, dict[str, float]]) -> tuple[Any, ...]:
-        weight, stats = item
-        mean = stats["scheduled_mean_return"]
-        sharpe = stats["scheduled_sharpe"]
-        mdd = stats["entry_sequence_drawdown"]
-        # NaN metrics sort last
-        mean_key = mean if np.isfinite(mean) else float("-inf")
-        sharpe_key = sharpe if np.isfinite(sharpe) else float("-inf")
-        mdd_key = mdd if np.isfinite(mdd) else float("inf")
-        return (-mean_key, -sharpe_key, mdd_key, weight)
-
-    # Selection order: mean desc, sharpe desc, mdd asc, weight asc (conservative)
-    # But NaN should sort last, so we handle via keys above.
-    # To ensure deterministic, sort by defined key
-    sorted_weights = sorted(per_weight.items(), key=sort_key)
-    chosen = sorted_weights[0][0]
+    base_w = min(grid)
+    base_series = series[base_w]
+    per_weight[base_w]["delta_vs_base"] = 0.0
+    per_weight[base_w]["p_value_vs_base"] = 1.0
+    chosen = base_w
+    for w in sorted(grid):
+        if w <= base_w:
+            continue
+        w_vals_raw, base_vals_raw = series[w].align(base_series, join="inner")
+        w_vals = np.asarray(w_vals_raw, dtype=np.float64)
+        base_vals = np.asarray(base_vals_raw, dtype=np.float64)
+        finite = np.isfinite(w_vals) & np.isfinite(base_vals)
+        w_vals = w_vals[finite]
+        base_vals = base_vals[finite]
+        if w_vals.size < 30:
+            per_weight[w]["delta_vs_base"] = float(np.mean(w_vals - base_vals)) if w_vals.size else 0.0
+            per_weight[w]["p_value_vs_base"] = 1.0
+            continue
+        boot = moving_block_bootstrap_delta(w_vals, base_vals, block_size=10, n_boot=5000)
+        per_weight[w]["delta_vs_base"] = float(boot.delta)
+        per_weight[w]["p_value_vs_base"] = float(boot.p_value)
+        if boot.delta > 0 and boot.p_value < alpha:
+            chosen = w
     return BlendWeightResult(chosen_weight=chosen, per_weight=per_weight)
 
 
