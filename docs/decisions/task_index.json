@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ML_SPARSE_DATA_ROBUSTNESS",
+      "date": "2026-09-03",
+      "adr_id": "ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS",
+      "domain": "ml",
+      "title": "Sparse-data ML robustness: CPCV eval + significance-gated promotion + reg-biased HPO",
+      "why": "희소 패널(중앙값 12후보/일)에서 기존 평균비교 승격 게이트가 검증된 +16-18% 개선을 노이즈로 판정(p=0.82). alpha는 안정적(연도별 rankIC ~0.18)이며 병목은 평가 파워.",
+      "resolution": "src/ml/robust_eval.py 신규(CombinatorialPurgedCV/cpcv_oof_predict/path_top1_returns/moving_block_bootstrap_delta/deflated_sharpe_ratio). champion.py evaluate_promotion 유의성 게이트(delta>0 & p<promotion_alpha). tuning.py eval_mode(walkforward|cpcv, _objective OOF 라우팅 스위치)/cpcv_n_groups/cpcv_k_test/promotion_alpha/hpo_reg_bias + cpcv_top1 목적함수(경로분산 페널티). retrain.py --eval-mode/--hpo-objective/--promotion-alpha. 실데이터 검증: A(rank_ic) p=0.358, B(cpcv_top1) p=0.665 둘 다 승격 거부 - 현 61피처로 튜닝만으론 방어 가능한 개선 없음.",
+      "impact": "승격 게이트가 bootstrap 유의성 기준(p<0.10)으로 전환, 노이즈 승격 차단. 기본 경로 하위호환(walkforward/rank_ic). CPCV(8,2)=28fold/7path 평가 인프라 확보. cpcv_oof_predict attrs concat 버그 + eval_mode ghost-switch 수정."
+    },
+    {
       "task_id": "TASK_ML_SECTOR_AND_FEATURE_SELECTION",
       "date": "2026-09-03",
       "adr_id": "ADR_20260903_ML_SECTOR_AND_FEATURE_SELECTION",
