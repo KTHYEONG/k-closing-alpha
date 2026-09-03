@@ -88,7 +88,7 @@ def _calibrate_reranker_policy(
         predict_proba=True,
     )
     oof["rank_score"] = oof["pred"]
-    scored = add_close_morning_decision_score(oof, group_col=group_col, probability_weight=0.5)
+    scored = add_close_morning_decision_score(oof, group_col=group_col, probability_weight=_CLOSE_MORNING_RERANKER_CONFIG["p_good_weight"])
     cutoff = str(scored[group_col].max())
     evaluation = evaluate_single_stock_policy_oof(
         scored,
@@ -201,7 +201,7 @@ def train_tuned_champion_bundle(
     assert_oos_excluded(dev, "trade_date", config.oos_reserve_start)
 
     # HPO
-    search = tune_return_model_params(dev, feature_cols, "target_return", "trade_date", config)
+    search = TunedSearchResult(best_params=dict(config.model_params_override), best_value=float("nan"), objective="override", n_trials=0, trials=()) if config.model_params_override is not None else tune_return_model_params(dev, feature_cols, "target_return", "trade_date", config)
 
     if config.feature_selection_top_n is not None:
         feature_cols = select_stable_features(dev, feature_cols, "target_return", "trade_date", top_n=config.feature_selection_top_n, min_folds=config.feature_selection_min_folds, model_params=search.best_params, huber_delta=config.huber_delta)
@@ -229,6 +229,7 @@ def train_tuned_champion_bundle(
         "chart_analysis",
         config.p_good_weight_grid,
         config.min_history_dates,
+        alpha=config.promotion_alpha,
     )
     candidate = evaluate_config_oof(
         dev,

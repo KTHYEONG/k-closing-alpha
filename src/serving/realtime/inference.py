@@ -42,7 +42,7 @@ _GRADE_MULTIPLIERS: dict[str, float] = {
 _CLOSE_MORNING_RERANKER_CONFIG: dict[str, Any] = {
     "version": "close-morning-reranker-v1",
     "rank_weight": 1.0,
-    "p_good_weight": 0.5,
+    "p_good_weight": 0.0,
     "score_col": "decision_score",
 }
 
