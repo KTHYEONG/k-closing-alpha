@@ -115,6 +115,13 @@
   "src/data/theme_resolver.py": {
     "testing": "tests/unit/data/test_theme_resolver.py"
   },
+  "src/ml/bundle.py": {
+    "testing": [
+      "tests/unit/ml/test_bundle.py",
+      "tests/unit/ml/test_champion_tuning.py"
+    ],
+    "architecture": "docs/decisions/ADR_20260903_ML_PIPELINE_GAIN_RECOVERY.md"
+  },
   "src/ml/champion.py": {
     "architecture": "docs/results/ml-res.md",
     "testing": "tests/integration/ml/test_champion_flow.py"
@@ -126,6 +133,10 @@
       "tests/unit/ml/test_dataset.py"
     ]
   },
+  "src/ml/exit_policy.py": {
+    "architecture": "docs/results/ml-res.md",
+    "testing": "tests/unit/ml/test_exit_policy.py"
+  },
   "src/ml/feature_selection.py": {
     "testing": "tests/unit/ml/test_feature_selection.py"
   },
@@ -135,19 +146,16 @@
   "src/ml/retrain.py": {
     "testing": "tests/unit/ml/test_retrain.py"
   },
+  "src/ml/robust_eval.py": {
+    "architecture": "docs/decisions/ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS.md",
+    "testing": "tests/unit/ml/test_robust_eval.py"
+  },
   "src/ml/sector_features.py": {
     "testing": "tests/unit/ml/test_sector_features.py"
   },
   "src/ml/tuning.py": {
     "testing": [
       "tests/unit/ml/test_tuning.py",
-      "tests/unit/ml/test_champion_tuning.py"
-    ],
-    "architecture": "docs/decisions/ADR_20260903_ML_PIPELINE_GAIN_RECOVERY.md"
-  },
-  "src/ml/bundle.py": {
-    "testing": [
-      "tests/unit/ml/test_bundle.py",
       "tests/unit/ml/test_champion_tuning.py"
     ],
     "architecture": "docs/decisions/ADR_20260903_ML_PIPELINE_GAIN_RECOVERY.md"
@@ -193,9 +201,5 @@
   },
   "src/utils/export_archive.py": {
     "testing": "tests/unit/utils/test_export_spreadsheet.py"
-  },
-  "src/ml/robust_eval.py": {
-    "architecture": "docs/decisions/ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS.md",
-    "testing": "tests/unit/ml/test_robust_eval.py"
   }
 }
