@@ -160,3 +160,91 @@ def test_fetch_single_stock_falls_back_to_krx_when_nxt_unlisted_or_illiquid() ->
         "acml_vol": "0", "prdy_ctrt": "0.5", "lstn_stcn": "100", "rprs_mrkt_kor_name": "KOSPI",
     }}))
     assert record2["sor_effective_price"] == 70000
+
+
+def test_fetch_single_stock_includes_orderbook_snapshot_fields() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    client = AsyncMock()
+
+    async def _fake_get_current_price(session, code, market_div_code=None):
+        return {
+            "rt_cd": "0",
+            "output": {
+                "stck_prpr": "70000", "stck_oprc": "69000", "stck_hgpr": "71000", "stck_lwpr": "68500",
+                "acml_vol": "1000", "prdy_ctrt": "0.5", "lstn_stcn": "100", "rprs_mrkt_kor_name": "KOSPI",
+            },
+        }
+
+    async def _fake_get_orderbook_snapshot(session, code, market_div_code=None):
+        if market_div_code == "J":
+            return {"rt_cd": "0", "output1": {
+                "askp1": "70100", "bidp1": "70000",
+                "total_askp_rsqn": "1200", "total_bidp_rsqn": "1500",
+            }}
+        return {"rt_cd": "0", "output1": {
+            "askp1": "69900", "bidp1": "69800",
+            "total_askp_rsqn": "300", "total_bidp_rsqn": "200",
+        }}
+
+    client.get_current_price = _fake_get_current_price
+    client.get_orderbook_snapshot = _fake_get_orderbook_snapshot
+    client.get_trade_strength = AsyncMock(return_value={"rt_cd": "0", "output": [{"tday_rltv": "120"}]})
+    client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "0", "output2": [{}]})
+    client.get_program_net_buy = AsyncMock(return_value={"rt_cd": "0", "output": [{}]})
+
+    sem = asyncio.Semaphore(1)
+    stock = {"code": "005930", "name": "삼성전자", "price": 70000, "chgrate": 0.5}
+    record, _ = asyncio.run(collect.fetch_single_stock(0, stock, 1, sem, client, session=None))
+
+    assert record["krx_매도호가1"] == 70100
+    assert record["krx_매수호가1"] == 70000
+    assert record["krx_매도잔량"] == 1200
+    assert record["krx_매수잔량"] == 1500
+    assert record["nxt_매도호가1"] == 69900
+    assert record["nxt_매수호가1"] == 69800
+    assert record["nxt_매도잔량"] == 300
+    assert record["nxt_매수잔량"] == 200
+
+
+def test_fetch_single_stock_flags_krx_orderbook_failure_without_blocking_record() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    client = AsyncMock()
+
+    async def _fake_get_current_price(session, code, market_div_code=None):
+        return {
+            "rt_cd": "0",
+            "output": {
+                "stck_prpr": "70000", "stck_oprc": "69000", "stck_hgpr": "71000", "stck_lwpr": "68500",
+                "acml_vol": "1000", "prdy_ctrt": "0.5", "lstn_stcn": "100", "rprs_mrkt_kor_name": "KOSPI",
+            },
+        }
+
+    async def _fake_get_orderbook_snapshot(session, code, market_div_code=None):
+        if market_div_code == "J":
+            return {"rt_cd": "9", "msg1": "일시 오류"}
+        return {"rt_cd": "0", "output1": {
+            "askp1": "69900", "bidp1": "69800",
+            "total_askp_rsqn": "300", "total_bidp_rsqn": "200",
+        }}
+
+    client.get_current_price = _fake_get_current_price
+    client.get_orderbook_snapshot = _fake_get_orderbook_snapshot
+    client.get_trade_strength = AsyncMock(return_value={"rt_cd": "0", "output": [{"tday_rltv": "120"}]})
+    client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "0", "output2": [{}]})
+    client.get_program_net_buy = AsyncMock(return_value={"rt_cd": "0", "output": [{}]})
+
+    sem = asyncio.Semaphore(1)
+    stock = {"code": "005930", "name": "삼성전자", "price": 70000, "chgrate": 0.5}
+    record, failed = asyncio.run(collect.fetch_single_stock(0, stock, 1, sem, client, session=None))
+
+    assert "호가" in failed
+    assert record["krx_매도호가1"] == 0
+    assert record["nxt_매도호가1"] == 69900

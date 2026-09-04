@@ -51,8 +51,8 @@ def test_standard_columns_constants() -> None:
 
 def test_standard_column_order_lengths() -> None:
     """스프레드시트 표준 컬럼 순서의 길이와 필수 컬럼을 검증합니다."""
-    assert len(ARCHIVE_COLUMN_ORDER) == 26
-    assert len(STANDARD_COLUMN_ORDER) == 24
+    assert len(ARCHIVE_COLUMN_ORDER) == 37
+    assert len(STANDARD_COLUMN_ORDER) == 35
     assert ARCHIVE_COLUMN_ORDER[0] == "스냅샷_날짜"
     assert "종목코드" in ARCHIVE_COLUMN_ORDER
     assert "시나리오" in STANDARD_COLUMN_ORDER
@@ -96,3 +96,18 @@ def test_legacy_mapping_file_removal() -> None:
     assert "legacy_mapping" not in fix_scale_src
     assert "RAW_TO_STANDARD_MAP" in fix_scale_src
     assert RAW_TO_STANDARD_MAP["(매수날짜)"] == "trade_date"
+
+
+def test_archive_and_standard_column_order_include_orderbook_and_sor_fields() -> None:
+    from src.processing.schema import ARCHIVE_COLUMN_ORDER, STANDARD_COLUMN_ORDER
+
+    new_fields = [
+        "krx_현재가", "nxt_현재가", "sor_effective_price",
+        "krx_매도호가1", "krx_매수호가1", "krx_매도잔량", "krx_매수잔량",
+        "nxt_매도호가1", "nxt_매수호가1", "nxt_매도잔량", "nxt_매수잔량",
+    ]
+    for f in new_fields:
+        assert f in ARCHIVE_COLUMN_ORDER
+        assert f in STANDARD_COLUMN_ORDER
+    assert len(ARCHIVE_COLUMN_ORDER) == 26 + len(new_fields)
+    assert len(STANDARD_COLUMN_ORDER) == 24 + len(new_fields)
