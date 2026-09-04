@@ -50,3 +50,27 @@ def test_backfill_altdata_main_wires_runner(monkeypatch, tmp_path) -> None:
     assert cfg.sources == ("shorting",)
     assert cfg.start == pd.Timestamp("2024-01-02")
     assert str(cfg.out_dir) == str(tmp_path)
+
+
+def test_run_altdata_backfill_dispatches_credit_balance_and_program_trade_daily(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.altdata import runner
+    from src.backfill.altdata.config import AltDataFetchConfig
+
+    cb_df = pd.DataFrame({"date": [pd.Timestamp("2024-01-02")], "symbol": ["005930"], "loan_balance_qty": [1000.0]})
+    pg_df = pd.DataFrame({"date": [pd.Timestamp("2024-01-02")], "symbol": ["005930"], "program_net_vol": [-200.0]})
+    monkeypatch.setattr(runner, "collect_credit_balance", lambda cfg, days: cb_df)
+    monkeypatch.setattr(runner, "collect_program_trade_daily", lambda cfg, days: pg_df)
+
+    cfg = AltDataFetchConfig(
+        start=pd.Timestamp("2024-01-01"), end=pd.Timestamp("2024-01-03"),
+        out_dir=tmp_path, sources=("credit_balance", "program_trade_daily"), retries=1, retry_sleep_sec=0.0,
+    )
+
+    manifest = runner.run_altdata_backfill(cfg)
+
+    assert manifest["panels"]["credit_balance"]["status"] == "ok"
+    assert manifest["panels"]["program_trade_daily"]["status"] == "ok"
+    assert (tmp_path / "credit_balance.parquet").exists()
+    assert (tmp_path / "program_trade_daily.parquet").exists()
