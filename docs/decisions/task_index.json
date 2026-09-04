@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ARCHIVE_SNAPSHOT_DEDUP_ON_RERUN",
+      "date": "2026-09-04",
+      "adr_id": "ADR_20260904_ARCHIVE_SNAPSHOT_DEDUP_ON_RERUN",
+      "domain": "data",
+      "title": "archive.py 재실행 시 스냅샷 중복 조회 문제 해소 + ARCHIVE_COLUMN_ORDER 하드코딩 회귀 수정",
+      "why": "collect.py 재실행마다 CSV mtime이 바뀌어 snapshot_timestamp가 매번 달라지고, _upsert_sqlite_archive의 삭제 판단이 (날짜,timestamp) 조합이라 이전 스냅샷이 지워지지 않고 (날짜,종목코드) 중복행이 쌓임 -- 스프레드시트 export 등에서 종목당 여러 행이 노출되는 혼란 발생. 데이터 축적이 목적이므로 저장 자체를 막기보다 조회 시점 뷰를 고쳐야 한다는 사용자 지적.",
+      "resolution": "fetch_archive_snapshot에 latest_only=True(기본값) 추가 -- (스냅샷_날짜,종목코드) 그룹 내 snapshot_timestamp 최댓값만 남기고 반환, latest_only=False로 전체 이력 그대로 조회 가능(저장소 원본은 전혀 삭제 안 함). upsert_archive_snapshot은 같은 날짜 재실행 감지 시 INFO 로그로 명시. check 과정에서 tests/unit/daily/test_archive.py의 ARCHIVE_COLUMN_ORDER 길이 하드코딩(==26) 회귀 4곳 발견(지난 orderbook_snapshot_collection 스펙에서 37로 늘었으나 그때는 archive.py가 수정대상이 아니라 lean_check selective 테스트 범위에서 누락됨) -- 실제 출력값 대 스키마 상수 비교로 수정.",
+      "impact": "export_archive.py/archive_intraday.py 등 기존 호출부는 코드 변경 없이 자동으로 중복 제거된 뷰를 받음. lean_check 전체 PASS, Tier2 결함 없음."
+    },
+    {
       "task_id": "TASK_CREDIT_BALANCE_PROGRAM_TRADE_DAILY_PANELS",
       "date": "2026-09-04",
       "adr_id": "ADR_20260904_CREDIT_BALANCE_PROGRAM_TRADE_DAILY_PANELS",
