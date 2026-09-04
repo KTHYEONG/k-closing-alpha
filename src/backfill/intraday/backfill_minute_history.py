@@ -31,17 +31,60 @@ def _resolve_time_field(columns) -> str | None:
     return None
 
 
-def enumerate_backfill_targets(as_of: str | None = None, lookback_days: int = 365) -> list[tuple[str, str]]:
-    """archive의 (스냅샷_날짜, 종목코드) distinct 쌍을 lookback 이내로 필터링해 날짜 오름차순으로 반환."""
-    as_of_date = as_of or datetime.now().strftime("%Y-%m-%d")
-    cutoff = (datetime.strptime(as_of_date, "%Y-%m-%d") - timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
+_LEGACY_CONDITION_HISTORY_PATH_NAME = "condition_history_cleaned.parquet"
+
+
+def _load_condition_history_sources() -> list[pd.DataFrame]:
+    """세 소스(공식 조건검색 아카이브 + 레거시 정제분 + 실제 매매일지)를 모두 로드해 합집합 대상을 만든다.
+
+    - archive.parquet: archive.py 운영 시작(대략 2026-08-04) 이후 조건검색 후보.
+    - condition_history_cleaned.parquet: 그 이전 구간의 레거시 정제 백필분.
+    - trade_log.parquet: 실제 체결된 매매일지(매수날짜/종목코드) -- 조건검색 후보군과 별개로,
+      "실제로 산 종목"은 라벨/수익률이 확정된 가장 가치 높은 백필 대상이라 반드시 포함해야 한다.
+      2016년까지 거슬러 올라가지만 KIS 보관한도(~1년) 밖 날짜는 enumerate_backfill_targets의
+      lookback_days 필터가 자동으로 제외한다.
+    """
+    frames: list[pd.DataFrame] = []
     try:
         df = archive.fetch_archive_snapshot(all_rows=True)
+        if df is not None and not df.empty and "스냅샷_날짜" in df.columns and "종목코드" in df.columns:
+            frames.append(df[["스냅샷_날짜", "종목코드"]])
     except Exception as e:
         logger.warning("Archive snapshot fetch failed: %s", e)
+
+    legacy_path = settings.DATA_DIR / "history" / _LEGACY_CONDITION_HISTORY_PATH_NAME
+    if legacy_path.exists():
+        try:
+            legacy_df = pd.read_parquet(legacy_path)
+            if not legacy_df.empty and "스냅샷_날짜" in legacy_df.columns and "종목코드" in legacy_df.columns:
+                frames.append(legacy_df[["스냅샷_날짜", "종목코드"]])
+        except Exception as e:
+            logger.warning("Legacy condition history read failed %s: %s", legacy_path, e)
+
+    # settings.TRADE_LOG_PARQUET_PATH(호환 재수출 상수)는 프로세스 시작 시 고정되어 테스트에서
+    # DATA_DIR 패치가 반영되지 않는다 -- legacy_path와 동일하게 DATA_DIR에서 직접 계산한다.
+    trade_log_path = settings.DATA_DIR / "parquet" / "trade_log.parquet"
+    if trade_log_path.exists():
+        try:
+            trade_df = pd.read_parquet(trade_log_path)
+            if not trade_df.empty and "매수날짜" in trade_df.columns and "종목코드" in trade_df.columns:
+                renamed = trade_df[["매수날짜", "종목코드"]].rename(columns={"매수날짜": "스냅샷_날짜"})
+                frames.append(renamed)
+        except Exception as e:
+            logger.warning("Trade log read failed %s: %s", trade_log_path, e)
+
+    return frames
+
+
+def enumerate_backfill_targets(as_of: str | None = None, lookback_days: int = 365) -> list[tuple[str, str]]:
+    """archive + 레거시 condition_history_cleaned.parquet의 (스냅샷_날짜, 종목코드) distinct 쌍을
+    lookback 이내로 필터링해 날짜 오름차순으로 반환한다."""
+    as_of_date = as_of or datetime.now().strftime("%Y-%m-%d")
+    cutoff = (datetime.strptime(as_of_date, "%Y-%m-%d") - timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
+    frames = _load_condition_history_sources()
+    if not frames:
         return []
-    if df is None or df.empty or "스냅샷_날짜" not in df.columns or "종목코드" not in df.columns:
-        return []
+    df = pd.concat(frames, ignore_index=True)
     sub = df[["스냅샷_날짜", "종목코드"]].copy()
     sub["스냅샷_날짜"] = sub["스냅샷_날짜"].astype(str)
     sub["종목코드"] = sub["종목코드"].astype(str).str.zfill(6)
@@ -50,6 +93,21 @@ def enumerate_backfill_targets(as_of: str | None = None, lookback_days: int = 36
     sub = sub.drop_duplicates()
     sub = sub.sort_values(["스냅샷_날짜", "종목코드"], kind="stable")
     return [(str(d), str(c)) for d, c in sub.itertuples(index=False)]
+
+
+def _already_collected_codes(bar_interval_minutes: int, snapshot_date: str, session: str) -> set[str]:
+    """해당 날짜/세션 파티션 파일에 이미 저장된 종목코드 집합을 반환한다. 없으면 빈 집합."""
+    target = intraday_partition_path(bar_interval_minutes, snapshot_date, session)
+    if not target.exists():
+        return set()
+    try:
+        existing = pd.read_parquet(target, columns=["종목코드"])
+    except Exception as e:
+        logger.warning("Failed to read existing partition for skip-check %s: %s", target, e)
+        return set()
+    if existing.empty or "종목코드" not in existing.columns:
+        return set()
+    return set(existing["종목코드"].astype(str).str.zfill(6))
 
 
 def _merge_and_write_partition(df: pd.DataFrame, bar_interval_minutes: int, snapshot_date: str, session: str) -> int:
@@ -92,11 +150,19 @@ def run_minute_history_backfill(lookback_days: int = 365, bar_interval_minutes: 
         async with client.create_session() as session:
             await client.ensure_token(session)
             for snap_date in ordered_dates:
-                codes = sorted(set(by_date[snap_date]))
+                all_codes = sorted(set(by_date[snap_date]))
+                # 재실행 시 이미 파티션에 저장된 종목은 다시 조회하지 않는다 (API 콜 낭비 방지, 멱등 재실행 가속).
+                done_regular = _already_collected_codes(bar_interval_minutes, snap_date, INTRADAY_SESSION_REGULAR)
+                done_nxt = _already_collected_codes(bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_AFTERMARKET)
+                regular_codes = [c for c in all_codes if c not in done_regular]
+                nxt_codes = [c for c in all_codes if c not in done_nxt]
+                if not regular_codes and not nxt_codes:
+                    dates += 1
+                    continue
                 try:
                     regular_df, nxt_df = await asyncio.gather(
-                        backfill_regular_bars(client, session, codes, snap_date, bar_interval_minutes),
-                        backfill_nxt_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes),
+                        backfill_regular_bars(client, session, regular_codes, snap_date, bar_interval_minutes),
+                        backfill_nxt_aftermarket_bars(client, session, nxt_codes, snap_date, bar_interval_minutes),
                     )
                 except Exception as e:
                     logger.warning("Backfill failed date=%s: %s", snap_date, e)
