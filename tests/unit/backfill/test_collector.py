@@ -49,3 +49,23 @@ def test_collect_nxt_aftermarket_bars_is_continuous_series_and_skips_unlisted() 
 
     assert len(result) == 2
     assert set(result["종목코드"]) == {"005930"}
+
+
+def test_collect_intraday_trade_ticks_tags_rows_with_code_and_date() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    client = AsyncMock()
+    client.get_intraday_trade_ticks = AsyncMock(
+        return_value={"rt_cd": "0", "output2": [{"stck_cntg_hour": "093000", "acml_vol": "1000", "stck_prpr": "70000"}]}
+    )
+
+    result = asyncio.run(
+        collect_intraday_trade_ticks(client, session=None, stock_codes=["005930", "000660"], snapshot_date="2026-09-03")
+    )
+
+    assert len(result) == 2
+    assert set(result["종목코드"]) == {"005930", "000660"}
+    assert (result["스냅샷_날짜"] == "2026-09-03").all()
