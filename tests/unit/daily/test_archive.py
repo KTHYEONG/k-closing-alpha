@@ -313,3 +313,26 @@ def test_upsert_sqlite_null_timestamp_identity_replacement(tmp_archive: Path) ->
     with sqlite3.connect(db_path) as conn:
         db_df = pd.read_sql("SELECT * FROM condition_history", conn)
     assert len(db_df) == 1
+
+
+def test_archive_main_preserves_real_capture_timestamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_archive: Path
+) -> None:
+    import os
+    from datetime import datetime
+
+    csv_path = tmp_path / "daily_stocks.csv"
+    pd.DataFrame({"종목코드": ["005930"], "종목명": ["삼성전자"]}).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    captured_ts = datetime(2026, 9, 3, 15, 18, 0)
+    mtime_epoch = captured_ts.timestamp()
+    os.utime(csv_path, (mtime_epoch, mtime_epoch))
+
+    monkeypatch.setattr(archive.settings, "CONDITION_CSV_PATH", csv_path)
+
+    archive.main()
+
+    stored = archive.fetch_archive_snapshot(snapshot_date="2026-09-03")
+    ts = pd.to_datetime(stored["snapshot_timestamp"].iloc[0])
+    assert ts.hour == 15
+    assert ts.minute == 18
