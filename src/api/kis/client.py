@@ -650,3 +650,108 @@ class KisApiClient:
         in_range = [r for r in collected if floor_hour <= self._intraday_row_hour(r) <= end_hour]
         in_range.sort(key=lambda r: self._intraday_row_hour(r))
         return {"rt_cd": "0", "output2": in_range}
+
+    async def get_daily_credit_balance_history(
+        self, session, code: str, start_date: str, end_date: str, market_div_code: str | None = None
+    ) -> dict:
+        """국내주식 신용잔고 일별추이(FHPST04760000)를 [start_date, end_date] 구간 역순 페이지네이션으로 취합."""
+        normalized = self._normalize_market_div_code(market_div_code)
+        if not normalized:
+            raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/daily-credit-balance"
+        collected: list[dict] = []
+        seen_dates: set[str] = set()
+        cursor = end_date
+        for _ in range(120):
+            params = {
+                "FID_COND_MRKT_DIV_CODE": normalized,
+                "FID_INPUT_ISCD": code,
+                "FID_COND_SCR_DIV_CODE": "20476",
+                "FID_INPUT_DATE_1": cursor,
+            }
+            res = await self._handle_request(
+                session.get, url, headers=self._get_headers("FHPST04760000"), params=params
+            )
+            if res.get("rt_cd") != "0":
+                if not collected:
+                    return res
+                break
+            rows = res.get("output") or res.get("output2") or []
+            if not rows:
+                break
+            new_rows: list[dict] = []
+            for row in rows:
+                day = str(row.get("deal_date") or "").strip()
+                if day and day not in seen_dates:
+                    seen_dates.add(day)
+                    new_rows.append(row)
+            if new_rows:
+                collected.extend(new_rows)
+            if len(rows) < 30:
+                break
+            dated = [str(r.get("deal_date") or "").strip() for r in new_rows]
+            dated = [d for d in dated if d]
+            if not dated:
+                break
+            earliest = min(dated)
+            try:
+                cursor = (datetime.strptime(earliest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+            except ValueError:
+                break
+            if cursor < start_date:
+                break
+        in_range = [r for r in collected if start_date <= str(r.get("deal_date") or "") <= end_date]
+        in_range.sort(key=lambda r: str(r.get("deal_date") or ""))
+        return {"rt_cd": "0", "output": in_range}
+
+    async def get_program_trade_daily_history(
+        self, session, code: str, start_date: str, end_date: str, market_div_code: str | None = None
+    ) -> dict:
+        """종목별 프로그램매매추이(일별)(FHPPG04650201)를 [start_date, end_date] 구간 역순 페이지네이션으로 취합."""
+        normalized = self._normalize_market_div_code(market_div_code)
+        if not normalized:
+            raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
+        collected: list[dict] = []
+        seen_dates: set[str] = set()
+        cursor = end_date
+        for _ in range(120):
+            params = {
+                "FID_COND_MRKT_DIV_CODE": normalized,
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": cursor,
+            }
+            res = await self._handle_request(
+                session.get, url, headers=self._get_headers("FHPPG04650201"), params=params
+            )
+            if res.get("rt_cd") != "0":
+                if not collected:
+                    return res
+                break
+            rows = res.get("output") or res.get("output2") or []
+            if not rows:
+                break
+            new_rows: list[dict] = []
+            for row in rows:
+                day = str(row.get("stck_bsop_date") or "").strip()
+                if day and day not in seen_dates:
+                    seen_dates.add(day)
+                    new_rows.append(row)
+            if new_rows:
+                collected.extend(new_rows)
+            if len(rows) < 30:
+                break
+            dated = [str(r.get("stck_bsop_date") or "").strip() for r in new_rows]
+            dated = [d for d in dated if d]
+            if not dated:
+                break
+            earliest = min(dated)
+            try:
+                cursor = (datetime.strptime(earliest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+            except ValueError:
+                break
+            if cursor < start_date:
+                break
+        in_range = [r for r in collected if start_date <= str(r.get("stck_bsop_date") or "") <= end_date]
+        in_range.sort(key=lambda r: str(r.get("stck_bsop_date") or ""))
+        return {"rt_cd": "0", "output": in_range}
