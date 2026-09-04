@@ -344,6 +344,25 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
         out = out.drop_duplicates(subset=[SNAP_DATE_COL, STOCK_CODE_COL], keep="last")
 
     settings.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        _target_date = str(out[SNAP_DATE_COL].iloc[0]) if len(out) else str(snapshot_date)
+        _existing = _read_sqlite_archive()
+        if _existing is not None and not _existing.empty and SNAP_DATE_COL in _existing.columns:
+            _prev = _existing[_existing[SNAP_DATE_COL].astype(str) == _target_date]
+            if not _prev.empty:
+                if SNAPSHOT_TIMESTAMP_COL in _prev.columns:
+                    _latest = pd.to_datetime(_prev[SNAPSHOT_TIMESTAMP_COL], errors="coerce").max()
+                else:
+                    _latest = pd.NaT
+                logger.info(
+                    "[DATA] archive rerun detected date=%s existing=%d latest=%s rows=%d",
+                    _target_date,
+                    len(_prev),
+                    str(_latest),
+                    len(out),
+                )
+    except Exception:
+        pass
     row_count = _upsert_sqlite_archive(out, str(settings.HISTORY_DB_PATH))
 
     try:
@@ -361,16 +380,21 @@ def fetch_archive_snapshot(
     snapshot_date: str | None = None,
     month: str | None = None,
     all_rows: bool = False,
+    latest_only: bool = True,
 ) -> pd.DataFrame:
     """Read candidate snapshot from archive in standard 27-column order.
 
     If all_rows is True, returns all historical data. Otherwise filters by snapshot_date,
     month (YYYY-MM), or defaults to the latest available month.
+    With latest_only=True (default), rerun duplicates are collapsed to the latest
+    snapshot per (스냅샷_날짜, 종목코드) by snapshot_timestamp; latest_only=False
+    preserves full history.
 
     Args:
         snapshot_date: Target date (YYYY-MM-DD) or None.
         month: Target month (YYYY-MM) or None.
         all_rows: If True, return all rows without filtering by date/month.
+        latest_only: If True, keep only the latest snapshot per date/code.
 
     Returns:
         DataFrame reordered to ARCHIVE_COLUMN_ORDER, sorted by date and rank.
@@ -395,6 +419,10 @@ def fetch_archive_snapshot(
             df = df[df_dates.str.startswith(latest_month)]
 
     df = _standardize_archive_df(df)
+    if latest_only and not df.empty and SNAP_DATE_COL in df.columns and STOCK_CODE_COL in df.columns:
+        if SNAPSHOT_TIMESTAMP_COL in df.columns:
+            df = df.sort_values(SNAPSHOT_TIMESTAMP_COL, ascending=True, na_position="first", kind="stable")
+        df = df.drop_duplicates(subset=[SNAP_DATE_COL, STOCK_CODE_COL], keep="last")
     return df.sort_values(
         [SNAP_DATE_COL, "선정순위"],
         ascending=[True, True],

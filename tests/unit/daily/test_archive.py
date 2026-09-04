@@ -111,7 +111,7 @@ def test_scenario_archive_fetch_02(tmp_archive: Path) -> None:
     specified = archive.fetch_archive_snapshot("2026-08-03")
     assert specified["스냅샷_날짜"].tolist() == ["2026-08-03"]
     assert specified.columns.tolist() == archive.ARCHIVE_READ_COLUMN_ORDER
-    assert len(archive.ARCHIVE_COLUMN_ORDER) == 26
+    assert len(archive.ARCHIVE_COLUMN_ORDER) == 37
 
 
 def test_scenario_archive_export_03(tmp_archive: Path) -> None:
@@ -124,7 +124,7 @@ def test_scenario_archive_export_03(tmp_archive: Path) -> None:
     lines = tsv.splitlines()
     assert lines[0].split("\t") == archive.ARCHIVE_COLUMN_ORDER
     assert lines[1].startswith("2026-08-04\t005930\t삼성전자\t1000\t")
-    assert len(lines[1].split("\t")) == 26
+    assert len(lines[1].split("\t")) == len(archive.ARCHIVE_COLUMN_ORDER)
 
     latest_tsv = archive.export_archive_for_spreadsheet()
     assert latest_tsv.splitlines()[0].split("\t") == archive.ARCHIVE_COLUMN_ORDER
@@ -219,7 +219,7 @@ def test_export_df_direct_without_header() -> None:
     lines = tsv.splitlines()
     assert len(lines) == 1
     fields = lines[0].split("\t")
-    assert len(fields) == 26
+    assert len(fields) == len(archive.ARCHIVE_COLUMN_ORDER)
     assert fields[1] == "000001"
 
 
@@ -336,3 +336,80 @@ def test_archive_main_preserves_real_capture_timestamp(
     ts = pd.to_datetime(stored["snapshot_timestamp"].iloc[0])
     assert ts.hour == 15
     assert ts.minute == 18
+
+
+def test_fetch_archive_snapshot_defaults_to_latest_snapshot_per_code(tmp_archive: Path) -> None:
+    import pandas as pd
+
+    from src.daily import archive
+
+    row1 = _candidate_row("005930", "삼성전자", 1)
+    row1["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:19:00", tz="Asia/Seoul")
+    row1["등락률"] = 5.0
+    archive.upsert_archive_snapshot(pd.DataFrame([row1]), snapshot_date="2026-08-04")
+
+    row2 = _candidate_row("005930", "삼성전자", 1)
+    row2["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:25:00", tz="Asia/Seoul")
+    row2["등락률"] = 7.0
+    archive.upsert_archive_snapshot(pd.DataFrame([row2]), snapshot_date="2026-08-04")
+
+    result = archive.fetch_archive_snapshot(snapshot_date="2026-08-04")
+
+    assert len(result) == 1
+    assert result.iloc[0]["등락률"] == 7.0
+
+
+def test_fetch_archive_snapshot_latest_only_false_preserves_full_history(tmp_archive: Path) -> None:
+    import pandas as pd
+
+    from src.daily import archive
+
+    row1 = _candidate_row("005930", "삼성전자", 1)
+    row1["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:19:00", tz="Asia/Seoul")
+    archive.upsert_archive_snapshot(pd.DataFrame([row1]), snapshot_date="2026-08-04")
+
+    row2 = _candidate_row("005930", "삼성전자", 1)
+    row2["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:25:00", tz="Asia/Seoul")
+    archive.upsert_archive_snapshot(pd.DataFrame([row2]), snapshot_date="2026-08-04")
+
+    result = archive.fetch_archive_snapshot(snapshot_date="2026-08-04", latest_only=False)
+
+    assert len(result) == 2
+
+
+def test_export_archive_for_spreadsheet_deduplicates_reruns(tmp_archive: Path) -> None:
+    import pandas as pd
+
+    from src.daily import archive
+
+    row1 = _candidate_row("005930", "삼성전자", 1)
+    row1["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:19:00", tz="Asia/Seoul")
+    archive.upsert_archive_snapshot(pd.DataFrame([row1]), snapshot_date="2026-08-04")
+
+    row2 = _candidate_row("005930", "삼성전자", 1)
+    row2["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:25:00", tz="Asia/Seoul")
+    archive.upsert_archive_snapshot(pd.DataFrame([row2]), snapshot_date="2026-08-04")
+
+    tsv = archive.export_archive_for_spreadsheet("2026-08-04")
+
+    data_lines = [ln for ln in tsv.strip().split("\n")][1:]  # noqa: C416
+    assert len(data_lines) == 1
+
+
+def test_upsert_archive_snapshot_logs_rerun_detection(tmp_archive: Path, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    from src.daily import archive
+
+    row1 = _candidate_row("005930", "삼성전자", 1)
+    row1["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:19:00", tz="Asia/Seoul")
+    archive.upsert_archive_snapshot(pd.DataFrame([row1]), snapshot_date="2026-08-04")
+
+    row2 = _candidate_row("005930", "삼성전자", 1)
+    row2["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:25:00", tz="Asia/Seoul")
+    with caplog.at_level(logging.INFO, logger="src.daily.archive"):
+        archive.upsert_archive_snapshot(pd.DataFrame([row2]), snapshot_date="2026-08-04")
+
+    assert any("rerun" in rec.message for rec in caplog.records)
