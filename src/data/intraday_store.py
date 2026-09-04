@@ -12,7 +12,7 @@ from src.data.io_utils import atomic_write_parquet
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["intraday_partition_path", "read_intraday_range", "write_intraday_partition"]
+__all__ = ["intraday_partition_path", "read_intraday_range", "tick_partition_path", "write_intraday_partition", "write_tick_partition"]
 
 
 def intraday_partition_path(bar_interval_minutes: int, snapshot_date: str, session: str) -> Path:
@@ -36,6 +36,29 @@ def write_intraday_partition(df: pd.DataFrame, bar_interval_minutes: int, snapsh
     atomic_write_parquet(df, target)
     logger.info("Wrote intraday partition %s (%d rows)", target, len(df))
     return len(df)
+
+
+def write_tick_partition(df: pd.DataFrame, snapshot_date: str, session: str = "regular") -> int:
+    """틱 일자별 파티션 파일 단위로만 원자적 저장한다. 빈 df는 0 반환 no-op."""
+    if df is None or df.empty:
+        return 0
+    target = tick_partition_path(snapshot_date, session)
+    atomic_write_parquet(df, target)
+    logger.info("Wrote tick partition %s (%d rows)", target, len(df))
+    return len(df)
+
+
+def tick_partition_path(snapshot_date: str, session: str = "regular") -> Path:
+    """data/history/intraday/ticks/{session}/{YYYY-MM}/{YYYY-MM-DD}.parquet 경로 산출."""
+    month = str(snapshot_date)[:7]
+    return (
+        Path(settings.HISTORY_DIR)
+        / "intraday"
+        / "ticks"
+        / str(session)
+        / month
+        / f"{snapshot_date}.parquet"
+    )
 
 
 def read_intraday_range(

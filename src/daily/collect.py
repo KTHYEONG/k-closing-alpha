@@ -162,12 +162,22 @@ async def fetch_single_stock(
         from src.config.market_session import DECISION_PRICE_MARKET_DIV_CODES
 
         _krx_div, _nxt_div = DECISION_PRICE_MARKET_DIV_CODES
-        res_krx, res_nxt, res_strength, res_investor, res_program = await asyncio.gather(
+        (
+            res_krx,
+            res_nxt,
+            res_strength,
+            res_investor,
+            res_program,
+            res_ob_krx,
+            res_ob_nxt,
+        ) = await asyncio.gather(
             client.get_current_price(session, code, market_div_code=_krx_div),
             client.get_current_price(session, code, market_div_code=_nxt_div),
             client.get_trade_strength(session, code),
             client.get_investor_trend_estimate(session, code),
             client.get_program_net_buy(session, code),
+            client.get_orderbook_snapshot(session, code, market_div_code=_krx_div),
+            client.get_orderbook_snapshot(session, code, market_div_code=_nxt_div),
         )
         res_detail = res_krx
 
@@ -181,6 +191,8 @@ async def fetch_single_stock(
             failed_apis.append("투자자추정")
         if res_program.get("rt_cd") != "0":
             failed_apis.append("프로그램")
+        if not isinstance(res_ob_krx, dict) or res_ob_krx.get("rt_cd") != "0":
+            failed_apis.append("호가")
 
         # 데이터 파싱
         detail = res_detail.get("output") if res_detail.get("rt_cd") == "0" else None
@@ -252,6 +264,21 @@ async def fetch_single_stock(
         else:
             sor_effective_price = krx_price
 
+        def _parse_orderbook(res):
+            if not isinstance(res, dict) or res.get("rt_cd") != "0":
+                return 0, 0, 0, 0
+            out1 = res.get("output1")
+            if not isinstance(out1, dict):
+                return 0, 0, 0, 0
+            ask1 = int(safe_float(out1.get("askp1"), 0))
+            bid1 = int(safe_float(out1.get("bidp1"), 0))
+            ask_rsqn = int(safe_float(out1.get("total_askp_rsqn"), 0))
+            bid_rsqn = int(safe_float(out1.get("total_bidp_rsqn"), 0))
+            return ask1, bid1, ask_rsqn, bid_rsqn
+
+        krx_ask1, krx_bid1, krx_ask_rsqn, krx_bid_rsqn = _parse_orderbook(res_ob_krx)
+        nxt_ask1, nxt_bid1, nxt_ask_rsqn, nxt_bid_rsqn = _parse_orderbook(res_ob_nxt)
+
         frgn_net_eok = round((frgn_qty * price) / 100_000_000, 2)
         orgn_net_eok = round((orgn_qty * price) / 100_000_000, 2)
         program_net_eok = round(program_amt_won / 100_000_000, 2)
@@ -315,6 +342,14 @@ async def fetch_single_stock(
             "krx_현재가": krx_price,
             "nxt_현재가": nxt_price,
             "sor_effective_price": sor_effective_price,
+            "krx_매도호가1": krx_ask1,
+            "krx_매수호가1": krx_bid1,
+            "krx_매도잔량": krx_ask_rsqn,
+            "krx_매수잔량": krx_bid_rsqn,
+            "nxt_매도호가1": nxt_ask1,
+            "nxt_매수호가1": nxt_bid1,
+            "nxt_매도잔량": nxt_ask_rsqn,
+            "nxt_매수잔량": nxt_bid_rsqn,
         }, failed_apis
 
 
