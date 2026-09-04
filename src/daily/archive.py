@@ -477,6 +477,7 @@ def main():
     snap_dt = datetime.fromtimestamp(os.path.getmtime(csv_latest))
     snapshot_date = snap_dt.strftime("%Y-%m-%d")
     df.insert(0, SNAP_DATE_COL, snapshot_date)
+    df[SNAPSHOT_TIMESTAMP_COL] = snap_dt
 
     stored_rows = upsert_archive_snapshot(df, snapshot_date=snapshot_date)
     logger.info(

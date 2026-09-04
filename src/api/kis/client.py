@@ -408,3 +408,122 @@ class KisApiClient:
         if res.get("rt_cd") == "0" and used_market_div:
             self._market_div_cache[stock_code] = used_market_div
         return res
+
+    @staticmethod
+    def _intraday_row_hour(row: dict) -> str:
+        val = row.get("stck_cntg_hour")
+        if val is None:
+            for key in ("cntg_hour", "stck_cntg_hour_tm", "bsop_hour", "hour"):
+                if row.get(key) is not None:
+                    val = row.get(key)
+                    break
+        return str(val or "").strip()
+
+    async def get_intraday_minute_chart(
+        self,
+        session,
+        code: str,
+        bar_interval_minutes: int = 1,
+        end_hour: str = "153000",
+        floor_hour: str = "090000",
+        market_div_code: str | None = None,
+    ) -> dict:
+        """주식당일분봉조회(FHKST03010200)를 30건/호출 제한 하 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합."""
+        normalized = self._normalize_market_div_code(market_div_code)
+        if not normalized:
+            raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        collected: list[dict] = []
+        seen_hours: set[str] = set()
+        cursor_hour = end_hour
+        for _ in range(20):
+            params = {
+                "FID_COND_MRKT_DIV_CODE": normalized,
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_HOUR_1": cursor_hour,
+                "FID_PW_DATA_INCU_YN": "Y",
+            }
+            res = await self._handle_request(
+                session.get, url, headers=self._get_headers("FHKST03010200"), params=params
+            )
+            if res.get("rt_cd") != "0":
+                if not collected:
+                    return res
+                break
+            rows = res.get("output2") or []
+            if not rows:
+                break
+            new_rows: list[dict] = []
+            for row in rows:
+                hour = self._intraday_row_hour(row)
+                if hour and hour not in seen_hours:
+                    seen_hours.add(hour)
+                    new_rows.append(row)
+            if not new_rows:
+                break
+            collected.extend(new_rows)
+            earliest = min(self._intraday_row_hour(r) for r in new_rows)
+            if earliest <= floor_hour:
+                break
+            cursor_hour = earliest
+        in_range = [r for r in collected if floor_hour <= self._intraday_row_hour(r) <= end_hour]
+        in_range.sort(key=lambda r: self._intraday_row_hour(r))
+        return {"rt_cd": "0", "output2": in_range}
+
+    async def get_historical_minute_chart(
+        self,
+        session,
+        code: str,
+        target_date: str,
+        bar_interval_minutes: int = 1,
+        end_hour: str = "153000",
+        floor_hour: str = "090000",
+        market_div_code: str | None = None,
+    ) -> dict:
+        """주식일별분봉조회(FHKST03010230)를 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합.
+
+        target_date는 KIS 표준 YYYYMMDD 형식 문자열을 그대로 FID_INPUT_DATE_1에 전달한다.
+        호출부가 YYYYMMDD 변환 책임을 진다. market_div_code는 호출부가 항상 명시한다.
+        KIS 서버 보관 한도(~1년) 밖의 날짜는 rt_cd != '0' 응답이 정상이며 그대로 반환한다.
+        """
+        normalized = self._normalize_market_div_code(market_div_code)
+        if not normalized:
+            raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice"
+        collected: list[dict] = []
+        seen_hours: set[str] = set()
+        cursor_hour = end_hour
+        for _ in range(20):
+            params = {
+                "FID_COND_MRKT_DIV_CODE": normalized,
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": target_date,
+                "FID_INPUT_HOUR_1": cursor_hour,
+                "FID_PW_DATA_INCU_YN": "Y",
+            }
+            res = await self._handle_request(
+                session.get, url, headers=self._get_headers("FHKST03010230"), params=params
+            )
+            if res.get("rt_cd") != "0":
+                if not collected:
+                    return res
+                break
+            rows = res.get("output2") or []
+            if not rows:
+                break
+            new_rows: list[dict] = []
+            for row in rows:
+                hour = self._intraday_row_hour(row)
+                if hour and hour not in seen_hours:
+                    seen_hours.add(hour)
+                    new_rows.append(row)
+            if not new_rows:
+                break
+            collected.extend(new_rows)
+            earliest = min(self._intraday_row_hour(r) for r in new_rows)
+            if earliest <= floor_hour:
+                break
+            cursor_hour = earliest
+        in_range = [r for r in collected if floor_hour <= self._intraday_row_hour(r) <= end_hour]
+        in_range.sort(key=lambda r: self._intraday_row_hour(r))
+        return {"rt_cd": "0", "output2": in_range}

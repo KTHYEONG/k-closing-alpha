@@ -158,14 +158,20 @@ async def fetch_single_stock(
         trade_amt_eok = 0.0
 
         # KisApiClient를 사용하여 비동기로 여러 API 동시 호출
-        res_detail, res_strength, res_investor, res_program = await asyncio.gather(
-            client.get_current_price(session, code),
+        # 실계좌 SOR 대응: 의사결정시점 현재가를 J/NX 각각 명시 조회해 병기한다.
+        from src.config.market_session import DECISION_PRICE_MARKET_DIV_CODES
+
+        _krx_div, _nxt_div = DECISION_PRICE_MARKET_DIV_CODES
+        res_krx, res_nxt, res_strength, res_investor, res_program = await asyncio.gather(
+            client.get_current_price(session, code, market_div_code=_krx_div),
+            client.get_current_price(session, code, market_div_code=_nxt_div),
             client.get_trade_strength(session, code),
             client.get_investor_trend_estimate(session, code),
             client.get_program_net_buy(session, code),
         )
+        res_detail = res_krx
 
-        # 실패한 API 체크
+        # 실패한 API 체크 (NXT 미상장 NX 조회 실패는 정상 케이스로 흡수)
         failed_apis = []
         if res_detail.get("rt_cd") != "0":
             failed_apis.append("현재가")
@@ -230,6 +236,22 @@ async def fetch_single_stock(
             except Exception as e:
                 logger.info(f"\n {Colors.RED}⚠️ [{name}] 파싱 에러: {e}{Colors.RESET}")
 
+        # 듀얼벤뉴 의사결정 가격: NXT는 rt_cd 0 + acml_vol>0일 때만 신뢰한다.
+        nxt_price: int | None = None
+        try:
+            if res_nxt.get("rt_cd") == "0" and res_nxt.get("output"):
+                nxt_out = res_nxt["output"]
+                nxt_vol = int(safe_float(nxt_out.get("acml_vol"), 0))
+                if nxt_vol > 0:
+                    nxt_price = int(safe_float(nxt_out.get("stck_prpr"), 0)) or None
+        except Exception:
+            nxt_price = None
+        krx_price = close_price
+        if nxt_price is not None:
+            sor_effective_price = min(krx_price, nxt_price)
+        else:
+            sor_effective_price = krx_price
+
         frgn_net_eok = round((frgn_qty * price) / 100_000_000, 2)
         orgn_net_eok = round((orgn_qty * price) / 100_000_000, 2)
         program_net_eok = round(program_amt_won / 100_000_000, 2)
@@ -290,6 +312,9 @@ async def fetch_single_stock(
             "프로그램_순매수": program_net_eok,
             "시나리오": scenario,
             "거래량": vol_acml,
+            "krx_현재가": krx_price,
+            "nxt_현재가": nxt_price,
+            "sor_effective_price": sor_effective_price,
         }, failed_apis
 
 
