@@ -201,5 +201,7 @@
   },
   "src/utils/export_archive.py": {
     "testing": "tests/unit/utils/test_export_spreadsheet.py"
-  }
+  },
+  "src/daily/archive_intraday.py": {},
+  "src/backfill/intraday/backfill_minute_history.py": {}
 }
