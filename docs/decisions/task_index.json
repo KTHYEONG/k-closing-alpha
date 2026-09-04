@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_MINUTE_HISTORY_BACKFILL_FIX_AND_RUN",
+      "date": "2026-09-04",
+      "adr_id": "ADR_20260904_MINUTE_HISTORY_BACKFILL_FIX_AND_RUN",
+      "domain": "data",
+      "title": "FHKST03010230 FID_FAKE_TICK_INCU_YN 버그 수정, trade_log 소스 통합, 실백필 완료",
+      "why": "1회성 분봉 백필을 실계좌로 처음 실행한 결과 정규세션까지 0행 -- get_historical_minute_chart 요청에 FID_FAKE_TICK_INCU_YN 필드 키 자체가 빠져 KIS가 전체 요청을 OPSQ2001로 거부하고 있었음. 또한 백필 대상이 condition_history 아카이브(조건검색 후보)로만 한정돼 있었는데, 실제 체결된 매매일지(trade_log.parquet, 2016~)가 라벨/수익률이 확정된 더 가치있는 대상임에도 누락돼 있었음.",
+      "resolution": "client.py::get_historical_minute_chart params에 FID_FAKE_TICK_INCU_YN='' 필드 추가(누락 시 OPSQ2001로 전체 실패하던 회귀 수정, 실계좌로 재검증: 정규 381행/NXT애프터 260행 정상 확인 -- NXT 애프터마켓도 이 TR로 보관됨을 실측 확정). backfill_minute_history.py::_load_condition_history_sources에 trade_log.parquet(매수날짜->스냅샷_날짜 매핑)를 세 번째 소스로 추가. run_minute_history_backfill에 _already_collected_codes 기반 스킵 로직 추가(재실행 시 이미 저장된 종목 재조회 안 함, WSL/네트워크 끊김에도 멱등 재개 가능). src.api.kis.client 직접 참조하는 테스트 파일 신설(기존 테스트가 전부 호환 파사드 경유라 co-modification 게이트 갭 발견/해소). 실제 백필 1회 실행 완료: 2025-09-04~2026-09-03 242일, 정규 519,250행 + NXT애프터 182,596행, 81MB.",
+      "impact": "condition_history+레거시+매매일지 세 소스 합집합으로 KIS 1년 보관한도 전체를 소급 확보. 스킵 최적화로 향후 재실행은 순증분만 처리해 거의 즉시 완료. lean_check 전체 PASS."
+    },
+    {
       "task_id": "TASK_MINUTE_HISTORY_BACKFILL",
       "date": "2026-09-04",
       "adr_id": "ADR_20260904_MINUTE_HISTORY_BACKFILL",
