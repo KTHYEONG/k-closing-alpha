@@ -12,7 +12,7 @@ from typing import Any
 import pandas as pd
 
 # Collectors
-from src.backfill.altdata import derivatives, fundamental, investor_detail, shorting
+from src.backfill.altdata import credit_balance, derivatives, fundamental, investor_detail, program_trade_daily, shorting
 from src.backfill.altdata.config import _ALTDATA_PANELS, AltDataFetchConfig
 from src.backfill.altdata.normalize import normalize_panel
 
@@ -21,6 +21,8 @@ collect_shorting = shorting.collect_shorting
 collect_fundamental = fundamental.collect_fundamental
 collect_investor_detail = investor_detail.collect_investor_detail
 collect_derivatives_basis = derivatives.collect_derivatives_basis
+collect_credit_balance = credit_balance.collect_credit_balance
+collect_program_trade_daily = program_trade_daily.collect_program_trade_daily
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +197,10 @@ def run_altdata_backfill(cfg: AltDataFetchConfig) -> dict[str, Any]:
                 raw = collect_investor_detail(cfg, missing)
             elif source == "derivatives_basis":
                 raw = collect_derivatives_basis(cfg, missing)
+            elif source == "credit_balance":
+                raw = collect_credit_balance(cfg, missing)
+            elif source == "program_trade_daily":
+                raw = collect_program_trade_daily(cfg, missing)
             elif source == "disclosure":
                 # disclosure needs corp map handling
                 from src.backfill.altdata import disclosure as disc_mod

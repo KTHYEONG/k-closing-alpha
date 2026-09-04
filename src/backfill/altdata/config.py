@@ -39,6 +39,18 @@ _ALTDATA_PANELS: dict[str, dict[str, Any]] = {
         "availability_rule": "eod_release_next_decision",
         "level": "symbol",
     },
+    "credit_balance": {
+        "filename": "credit_balance.parquet",
+        "key_cols": ("date", "symbol"),
+        "availability_rule": "eod_release_next_decision",
+        "level": "symbol",
+    },
+    "program_trade_daily": {
+        "filename": "program_trade_daily.parquet",
+        "key_cols": ("date", "symbol"),
+        "availability_rule": "eod_release_next_decision",
+        "level": "symbol",
+    },
 }
 
 
@@ -64,7 +76,7 @@ class AltDataFetchConfig:
     start: pd.Timestamp
     end: pd.Timestamp
     out_dir: Path
-    sources: tuple[str, ...] = ("shorting", "fundamental", "investor_detail", "derivatives_basis", "disclosure")
+    sources: tuple[str, ...] = ("shorting", "fundamental", "investor_detail", "derivatives_basis", "disclosure", "credit_balance", "program_trade_daily")
     markets: tuple[str, ...] = ("KOSPI", "KOSDAQ")
     universe_symbols: frozenset[str] | None = None
     pykrx_requests_per_sec: float = 6.0
