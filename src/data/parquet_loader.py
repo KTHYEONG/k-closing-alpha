@@ -7,8 +7,6 @@ for trade logs, theme mappings, and condition search snapshots using Parquet for
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -33,19 +31,9 @@ def _atomic_write_parquet(df: pd.DataFrame, target_path: Path) -> None:
         df: DataFrame to save.
         target_path: Destination parquet file path.
     """
-    _ensure_dir(target_path)
-    temp_dir = target_path.parent
-    with tempfile.NamedTemporaryFile(dir=temp_dir, delete=False, suffix=".parquet") as tmp:
-        tmp_path = Path(tmp.name)
+    from src.data.io_utils import atomic_write_parquet
 
-    try:
-        df.to_parquet(tmp_path, index=False, compression="snappy")
-        os.replace(tmp_path, target_path)
-    except Exception as e:
-        if tmp_path.exists():
-            tmp_path.unlink()
-        logger.error("Failed to write parquet atomically to %s: %s", target_path, e)
-        raise
+    atomic_write_parquet(df, target_path)
 
 
 def _clean_df_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
