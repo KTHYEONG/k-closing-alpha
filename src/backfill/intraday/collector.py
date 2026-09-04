@@ -93,6 +93,42 @@ async def collect_nxt_aftermarket_bars(client, session, stock_codes: list[str], 
     )
 
 
+async def collect_intraday_trade_ticks(client, session, stock_codes: list[str], snapshot_date: str) -> pd.DataFrame:
+    """KRX 정규세션(09:00~15:30) 틱 체결을 세마포어(10) 동시성으로 취합한다."""
+    if not stock_codes:
+        return pd.DataFrame()
+    sem = asyncio.Semaphore(10)
+
+    async def _fetch_one(code: str) -> pd.DataFrame:
+        async with sem:
+            try:
+                res = await client.get_intraday_trade_ticks(
+                    session,
+                    code,
+                    floor_hour=KRX_REGULAR_HOUR_FLOOR,
+                    end_hour=KRX_REGULAR_HOUR_CEIL,
+                    market_div_code=KRX_CLOSE_MARKET_DIV_CODE,
+                )
+            except Exception as e:
+                logger.warning("Intraday trade ticks failed code=%s: %s", code, e)
+                return pd.DataFrame()
+            if res.get("rt_cd") != "0":
+                return pd.DataFrame()
+            rows = res.get("output2") or []
+            if not rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(rows)
+            df["종목코드"] = str(code).zfill(6)
+            df["스냅샷_날짜"] = snapshot_date
+            return df
+
+    results = await asyncio.gather(*[_fetch_one(c) for c in stock_codes])
+    frames = [d for d in results if d is not None and not d.empty]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 async def backfill_regular_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
     """특정 과거 날짜(snapshot_date, 'YYYY-MM-DD')의 정규세션 1분봉을 FHKST03010230으로 소급 수집."""
     return await _collect_bars(
