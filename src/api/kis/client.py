@@ -470,6 +470,127 @@ class KisApiClient:
         in_range.sort(key=lambda r: self._intraday_row_hour(r))
         return {"rt_cd": "0", "output2": in_range}
 
+    async def get_intraday_trade_ticks(
+        self, session, code: str, floor_hour: str = "090000", end_hour: str = "153000", market_div_code: str | None = None
+    ) -> dict:
+        """주식현재가 당일시간대별체결(FHPST01060000)을 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합."""
+        normalized = self._normalize_market_div_code(market_div_code)
+        if not normalized:
+            raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemconclusion"
+        collected: list[dict] = []
+        seen_vols: set[str] = set()
+        cursor_hour = end_hour
+        for _ in range(120):
+            params = {
+                "FID_COND_MRKT_DIV_CODE": normalized,
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_HOUR_1": cursor_hour,
+                "FID_PW_DATA_INCU_YN": "Y",
+            }
+            res = await self._handle_request(
+                session.get, url, headers=self._get_headers("FHPST01060000"), params=params
+            )
+            if res.get("rt_cd") != "0":
+                if not collected:
+                    return res
+                break
+            rows = res.get("output2") or []
+            if not rows:
+                break
+            new_rows: list[dict] = []
+            for row in rows:
+                vol_key = str(row.get("acml_vol") or "").strip()
+                if vol_key and vol_key not in seen_vols:
+                    seen_vols.add(vol_key)
+                    new_rows.append(row)
+            if not new_rows:
+                break
+            collected.extend(new_rows)
+            earliest = min(self._intraday_row_hour(r) for r in new_rows)
+            if earliest <= floor_hour:
+                break
+            cursor_hour = earliest
+        in_range = [r for r in collected if floor_hour <= self._intraday_row_hour(r) <= end_hour]
+        in_range.sort(key=lambda r: int(str(r.get("acml_vol") or "0").strip() or "0"))
+        return {"rt_cd": "0", "output2": in_range}
+
+    async def get_orderbook_snapshot(
+        self, session, code: str, market_div_code: str | None = None
+    ) -> dict:
+        """주식현재가 호가/예상체결(FHKST01010200) 조회."""
+        normalized = self._normalize_market_div_code(market_div_code)
+        if not normalized:
+            raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": normalized,
+            "FID_INPUT_ISCD": code,
+        }
+        return await self._handle_request(
+            session.get, url, headers=self._get_headers("FHKST01010200"), params=params
+        )
+
+    async def get_daily_short_sale_history(
+        self, session, code: str, start_date: str, end_date: str, market_div_code: str | None = None
+    ) -> dict:
+        """국내주식 공매도 일별추이(FHPST04830000)를 [start_date, end_date](YYYYMMDD) 구간 역순 페이지네이션으로 취합.
+
+        KIS 자체 보관이며 2020-01-10까지 5년+ 정상 조회됨(2026-09-04 라이브 프로브, rt_cd=0).
+        종목당 하루 1행이라 dedup은 stck_bsop_date 기준. 호출당 최대 100행이며
+        len(rows)<100이면 더 이전 데이터 없음으로 간주해 종료한다.
+        거래(체결) 측만 제공하므로 잔고 측 컬럼은 포함하지 않는다.
+        market_div_code는 호출부가 항상 명시한다('J').
+        """
+        normalized = self._normalize_market_div_code(market_div_code)
+        if not normalized:
+            raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/daily-short-sale"
+        collected: list[dict] = []
+        seen_dates: set[str] = set()
+        cursor_end = end_date
+        for _ in range(60):
+            params = {
+                "FID_COND_MRKT_DIV_CODE": normalized,
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": start_date,
+                "FID_INPUT_DATE_2": cursor_end,
+            }
+            res = await self._handle_request(
+                session.get, url, headers=self._get_headers("FHPST04830000"), params=params
+            )
+            if res.get("rt_cd") != "0":
+                if not collected:
+                    return res
+                break
+            rows = res.get("output2") or []
+            if not rows:
+                break
+            new_rows: list[dict] = []
+            for row in rows:
+                day = str(row.get("stck_bsop_date") or "").strip()
+                if day and day not in seen_dates:
+                    seen_dates.add(day)
+                    new_rows.append(row)
+            if new_rows:
+                collected.extend(new_rows)
+            if len(rows) < 100:
+                break
+            dated = [str(r.get("stck_bsop_date") or "").strip() for r in new_rows]
+            dated = [d for d in dated if d]
+            if not dated:
+                break
+            earliest = min(dated)
+            try:
+                cursor_end = (datetime.strptime(earliest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+            except ValueError:
+                break
+            if cursor_end < start_date:
+                break
+        in_range = [r for r in collected if start_date <= str(r.get("stck_bsop_date") or "") <= end_date]
+        in_range.sort(key=lambda r: str(r.get("stck_bsop_date") or ""))
+        return {"rt_cd": "0", "output2": in_range}
+
     async def get_historical_minute_chart(
         self,
         session,
