@@ -48,7 +48,10 @@
     "testing": "legacy/tests/unit/ml/test_sizing_engine.py"
   },
   "src/api/kis/client.py": {
-    "testing": "tests/unit/test_facade_imports.py"
+    "testing": [
+      "tests/unit/test_facade_imports.py",
+      "tests/unit/api/kis/test_client.py"
+    ]
   },
   "src/api/kis/indicators.py": {
     "testing": "tests/unit/test_facade_imports.py"

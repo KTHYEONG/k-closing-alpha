@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ORDERBOOK_TICK_SHORTING_DATA_COLLECTION",
+      "date": "2026-09-04",
+      "adr_id": "ADR_20260904_ORDERBOOK_TICK_SHORTING_DATA_COLLECTION",
+      "domain": "data",
+      "title": "호가/예상체결 + 틱체결(체결강도 시계열) + 공매도(KIS 네이티브) forward-only 데이터 수집 3종 추가",
+      "why": "슬리피지/유동성 정밀화(호가창 부재)와 ML 알파 리서치용 미시구조/오더플로우 데이터 부재를 KIS API 전수조사로 확인. 체결강도는 이미 30틱을 받고도 1건만 쓰고 버리는 중이었고, 공매도 패널은 pykrx anti-bot 차단으로 완전 미수집 상태였음.",
+      "resolution": "client.py에 get_orderbook_snapshot(FHKST01010200)/get_intraday_trade_ticks(FHPST01060000, acml_vol 기준 dedup으로 동시각 복수체결 누락 방지)/get_daily_short_sale_history(FHPST04830000, 5년+ 보관 실측) 3개 fail-closed 함수 추가. collect.py가 KRX/NXT 양쪽 호가(최우선호가/총잔량)를 병렬 캡처, schema.py의 ARCHIVE/STANDARD_COLUMN_ORDER에 11개 신규 컬럼(기존에 계산되고도 유실되던 krx_현재가/nxt_현재가/sor_effective_price 3개 포함) 등재. archive_intraday.py 저녁배치에 정규세션 틱 체결 수집을 추가해 3-tuple 반환으로 변경. shorting.py를 pykrx에서 KIS 네이티브 TR로 전면 교체(거래측 4컬럼만 채움, 잔고측은 대응 TR 미발견으로 NaN 유지, universe_symbols 필수). lean_check 네이밍 게이트 갭(shorting.py/collector.py) 해소용 테스트 파일 신설/리네임. check 과정에서 발견된 테스트-프로덕션 결합 결함(TypeError 오탐 방지용 fallback이 실제로는 test double 디스크립터 바인딩 버그를 은폐) 수정 -- 테스트를 AsyncMock(side_effect=...)로 교체하고 프로덕션의 편법 except 분기 제거.",
+      "impact": "체결 정밀도(슬리피지)와 신규 미시구조/공매도 원천 데이터가 forward-only로 축적 시작(과거 백필은 원천적으로 불가한 스냅샷성 데이터). lean_check 전체 PASS, Tier2 시맨틱 스캔에서 발견된 결함도 수정 완료."
+    },
+    {
       "task_id": "TASK_MINUTE_HISTORY_BACKFILL_FIX_AND_RUN",
       "date": "2026-09-04",
       "adr_id": "ADR_20260904_MINUTE_HISTORY_BACKFILL_FIX_AND_RUN",
