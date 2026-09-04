@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_CREDIT_BALANCE_PROGRAM_TRADE_DAILY_PANELS",
+      "date": "2026-09-04",
+      "adr_id": "ADR_20260904_CREDIT_BALANCE_PROGRAM_TRADE_DAILY_PANELS",
+      "domain": "data",
+      "title": "신용잔고/프로그램매매 일별추이 KIS 네이티브 패널 2종 추가",
+      "why": "shorting 패널 KIS 전환 시 함께 검증해둔 신용잔고(FHPST04760000, 2019~)와 프로그램매매 일별(FHPPG04650201, 2020~)을 마저 altdata 인프라에 등재해 ML/백테스팅용 원본 미시구조 데이터를 forward 시점부터 손실 없이 축적.",
+      "resolution": "client.py에 get_daily_credit_balance_history(FID_COND_SCR_DIV_CODE='20476' 고정필드 필수, 실측 확인)/get_program_trade_daily_history 2개 fail-closed 단일커서 페이지네이션 함수 추가. credit_balance.py/program_trade_daily.py 신규 수집기(shorting.py와 동일 구조: universe_symbols 필수, 세마포어 병렬, 종목별 예외 격리 -- 이전 체크에서 발견된 TypeError 편법 fallback 재발 없음). config.py의 _ALTDATA_PANELS/AltDataFetchConfig.sources에 2개 패널 등재. runner.py 분기 추가. lean_check 네이밍 게이트 선제 대응으로 test_config.py 신설(기존 test_altdata_config.py로는 불충족이던 기존 갭 해소).",
+      "impact": "altdata 패널이 5종에서 7종으로 확장. lean_check 전체 PASS, Tier2 시맨틱 스캔 결함 없음. 실제 다년 백필 실행(backfill_altdata.py --source credit_balance,program_trade_daily --trade-log-universe)은 사용자 판단으로 별도 실행 필요."
+    },
+    {
       "task_id": "TASK_ORDERBOOK_TICK_SHORTING_DATA_COLLECTION",
       "date": "2026-09-04",
       "adr_id": "ADR_20260904_ORDERBOOK_TICK_SHORTING_DATA_COLLECTION",
