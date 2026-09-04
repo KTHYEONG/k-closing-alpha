@@ -30,3 +30,16 @@ def test_intraday_store_write_empty_df_is_noop(tmp_path: Path, monkeypatch: pyte
     rows_written = intraday_store.write_intraday_partition(pd.DataFrame(), 1, "2026-09-03", "regular")
 
     assert rows_written == 0
+
+
+def test_intraday_store_write_and_read_tick_partition_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+
+    df_in = pd.DataFrame({"종목코드": ["005930"], "stck_prpr": [70000], "acml_vol": [1000]})
+    rows_written = intraday_store.write_tick_partition(df_in, "2026-09-03", "regular")
+    assert rows_written == 1
+
+    target = intraday_store.tick_partition_path("2026-09-03", "regular")
+    assert target.exists()
+    stored = pd.read_parquet(target)
+    assert stored.iloc[0]["종목코드"] == "005930"
