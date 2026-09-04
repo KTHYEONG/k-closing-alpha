@@ -197,6 +197,17 @@ ARCHIVE_COLUMN_ORDER: list[str] = [
     "거래량",
     "테마_섹터",
     "시나리오",
+    "krx_현재가",
+    "nxt_현재가",
+    "sor_effective_price",
+    "krx_매도호가1",
+    "krx_매수호가1",
+    "krx_매도잔량",
+    "krx_매수잔량",
+    "nxt_매도호가1",
+    "nxt_매수호가1",
+    "nxt_매도잔량",
+    "nxt_매수잔량",
 ]
 
 
@@ -226,6 +237,17 @@ STANDARD_COLUMN_ORDER: list[str] = [
     "v_kospi",
     "v_kosdaq",
     "거래량",
+    "krx_현재가",
+    "nxt_현재가",
+    "sor_effective_price",
+    "krx_매도호가1",
+    "krx_매수호가1",
+    "krx_매도잔량",
+    "krx_매수잔량",
+    "nxt_매도호가1",
+    "nxt_매수호가1",
+    "nxt_매도잔량",
+    "nxt_매수잔량",
 ]
 
 
