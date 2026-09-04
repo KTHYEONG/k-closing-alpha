@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_MINUTE_HISTORY_BACKFILL",
+      "date": "2026-09-04",
+      "adr_id": "ADR_20260904_MINUTE_HISTORY_BACKFILL",
+      "domain": "data",
+      "title": "FHKST03010230 기반 1회성 과거 분봉 백필 (KIS 서버 보관 최대 1년)",
+      "why": "KIS가 FHKST03010200(당일분봉)만이 아니라 FHKST03010230(주식일별분봉조회)으로 최대 약 1년치 과거 분봉을 서버에 보관·제공한다는 사실을 사용자 피드백으로 확인. condition_history 아카이브에 이미 존재하는 과거 워치리스트 날짜들이 KIS의 롤링 1년 보관기간에서 매일 가장 오래된 날짜부터 소실 중이라 시급성이 있었음.",
+      "resolution": "get_historical_minute_chart(FHKST03010230, target_date=YYYYMMDD, floor/end hour 페이지네이션)를 client.py에 추가. backfill_regular_bars/backfill_nxt_aftermarket_bars(collector.py)가 기존 _collect_bars에 historical 분기를 더해 재사용. enumerate_backfill_targets가 archive 아카이브에서 (날짜,종목코드) distinct 쌍을 오래된 날짜부터 정렬 추출. run_minute_history_backfill이 날짜별로 순회하며 _merge_and_write_partition으로 기존 파티션 파일을 덮어쓰지 않고 멱등 병합 -- 중단 후 재실행 안전. NXT 애프터마켓 보관 여부는 실측 미검증으로 명시하고 실패 시 정규세션 백필과 독립적으로 정상 스킵.",
+      "impact": "정방향 수집(archive_intraday.py)과 완전히 같은 파티션 스토어를 공유해 ML 코드는 백필/신규 데이터를 구분할 필요 없음. 1회성 장시간 스크립트로 README에 별도 커맨드 문서화. lean_check --spec 및 /check 감사 PASS(co-modification 게이트 실패는 테스트 파일명을 test_archive_intraday.py로 정정해 해결)."
+    },
+    {
+      "task_id": "TASK_INTRADAY_DATA_COLLECTION",
+      "date": "2026-09-04",
+      "adr_id": "ADR_20260904_INTRADAY_DATA_COLLECTION",
+      "domain": "data",
+      "title": "정규세션/NXT 애프터마켓 1분봉 원클릭 아카이브 + SOR 듀얼벤뉴 의사결정가 + 캡처시각 버그 수정",
+      "why": "분봉/호가는 KIS가 당일만 제공(FHKST03010200)해 과거 ADR에서 백필불가로 제외됐고, 실계좌가 SOR로 NXT까지 라우팅됨이 확인돼 기존 collect.py의 단일벤뉴 현재가 조회가 실제 체결가와 괴리될 위험이 있었음. archive.py는 실제 캡처시각(mtime)을 계산해두고도 날짜만 저장해 15:30 관례로 덮어쓰는 버그도 발견.",
+      "resolution": "get_intraday_minute_chart(FHKST03010200, floor/end hour 페이지네이션)로 정규세션 1m bars와 NXT 애프터마켓 1m bars를 별도 파티션(data/history/intraday/{interval}m/{session}/)에 저장하는 저녁 1회 독립 CLI(archive_intraday.py) 신설. collect.py::fetch_single_stock은 J/NX 듀얼벤뉴 현재가를 병렬조회해 krx_현재가/nxt_현재가/sor_effective_price(유동성게이트) 부착. archive.py::main()의 snapshot_timestamp 유실 버그 수정. parquet 원자적쓰기를 io_utils.py로 추출 공유. FHKST03010230(주식일별분봉조회, 최대 1년 서버보관)을 활용한 1회성 과거 백필은 범위 밖 후속 작업으로 문서화(docs/architecture/data_collection.md §7).",
+      "impact": "condition_history 워치리스트 스코프로 저장용량 억제(연 ~700MB@1m). archive.py 실시간 흐름(~15:18)과 archive_intraday 저녁 실행(20:00+)을 분리해 애프터마켓 구간 유실 방지. 기존 종가/close_price 필드 값·의미 불변, krx_현재가/nxt_현재가/sor_effective_price는 신규 추가 컬럼. NXT 미상장/저유동성 종목은 정상 스킵(에러 아님). lean_check --spec 및 /check 감사 PASS."
+    },
+    {
       "task_id": "TASK_ML_EXIT_POLICY_RESEARCH",
       "date": "2026-09-03",
       "adr_id": "ADR_20260903_ML_EXIT_POLICY_RESEARCH",

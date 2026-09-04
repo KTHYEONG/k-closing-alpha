@@ -192,6 +192,14 @@ uv run mypy .
 ```bash
 # 장 마감 직전 추론 수행 (Top 종목 추출)
 uv run python -m src.daily.predict
+
+# 저녁 1회 실행(20:00 이후 권장): 당일 워치리스트 정규세션+NXT 애프터마켓 1분봉 아카이브
+# src.daily.archive_intraday
+uv run python -m src.daily.archive_intraday
+
+# 1회성 소급 백필: condition_history 워치리스트 대상 일별분봉(FHKST03010230) 백필
+# src.backfill.intraday.backfill_minute_history
+uv run python -m src.backfill.intraday.backfill_minute_history
 ```
 
 ### 4) ML 연구 및 번들 재학습
