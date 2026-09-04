@@ -500,6 +500,8 @@ class KisApiClient:
                 "FID_INPUT_DATE_1": target_date,
                 "FID_INPUT_HOUR_1": cursor_hour,
                 "FID_PW_DATA_INCU_YN": "Y",
+                # KIS 서버가 이 필드 키 자체의 부재를 에러(OPSQ2001)로 취급함 -- 빈 문자열이라도 반드시 포함해야 함.
+                "FID_FAKE_TICK_INCU_YN": "",
             }
             res = await self._handle_request(
                 session.get, url, headers=self._get_headers("FHKST03010230"), params=params
