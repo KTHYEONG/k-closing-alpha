@@ -78,3 +78,85 @@ def test_scenario_regression() -> None:
     from src.daily.collect import save_collected_condition_data
 
     assert callable(save_collected_condition_data)
+
+
+def test_fetch_single_stock_captures_dual_venue_decision_price() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    client = AsyncMock()
+
+    async def _fake_get_current_price(session, code, market_div_code=None):
+        if market_div_code == "J":
+            prpr, vol = "70000", "1000"
+        else:
+            prpr, vol = "69800", "500"
+        return {
+            "rt_cd": "0",
+            "output": {
+                "stck_prpr": prpr, "stck_oprc": "69000", "stck_hgpr": "71000", "stck_lwpr": "68500",
+                "acml_vol": vol, "prdy_ctrt": "0.5", "lstn_stcn": "100", "rprs_mrkt_kor_name": "KOSPI",
+            },
+        }
+
+    client.get_current_price = _fake_get_current_price
+    client.get_trade_strength = AsyncMock(return_value={"rt_cd": "0", "output": [{"tday_rltv": "120"}]})
+    client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "0", "output2": [{}]})
+    client.get_program_net_buy = AsyncMock(return_value={"rt_cd": "0", "output": [{}]})
+
+    sem = asyncio.Semaphore(1)
+    stock = {"code": "005930", "name": "삼성전자", "price": 70000, "chgrate": 0.5}
+
+    result = asyncio.run(collect.fetch_single_stock(0, stock, 1, sem, client, session=None))
+
+    record = result[0] if isinstance(result, tuple) else result
+    assert record["krx_현재가"] == 70000
+    assert record["nxt_현재가"] == 69800
+    assert record["sor_effective_price"] == 69800
+
+
+def test_fetch_single_stock_falls_back_to_krx_when_nxt_unlisted_or_illiquid() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    async def _run_case(nxt_resp):
+        client = AsyncMock()
+
+        async def _fake(session, code, market_div_code=None):
+            if market_div_code == "J":
+                return {"rt_cd": "0", "output": {
+                    "stck_prpr": "70000", "stck_oprc": "69000", "stck_hgpr": "71000", "stck_lwpr": "68500",
+                    "acml_vol": "1000", "prdy_ctrt": "0.5", "lstn_stcn": "100", "rprs_mrkt_kor_name": "KOSPI",
+                }}
+            return nxt_resp
+
+        client.get_current_price = _fake
+        client.get_trade_strength = AsyncMock(return_value={"rt_cd": "0", "output": [{"tday_rltv": "120"}]})
+        client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "0", "output2": [{}]})
+        client.get_program_net_buy = AsyncMock(return_value={"rt_cd": "0", "output": [{}]})
+        sem = asyncio.Semaphore(1)
+        stock = {"code": "005930", "name": "삼성전자", "price": 70000, "chgrate": 0.5}
+        result = await collect.fetch_single_stock(0, stock, 1, sem, client, session=None)
+        record = result[0] if isinstance(result, tuple) else result
+        failed = result[1] if isinstance(result, tuple) else []
+        return record, failed
+
+    # NXT 미상장 케이스
+    import asyncio as _aio
+
+    record, failed = _aio.run(_run_case({"rt_cd": "9", "msg1": "NXT 미상장"}))
+    assert record["krx_현재가"] == 70000
+    assert record["nxt_현재가"] is None
+    assert record["sor_effective_price"] == 70000
+    assert "현재가" not in failed or failed == []
+
+    # NXT 유동성 0 케이스
+    record2, _ = _aio.run(_run_case({"rt_cd": "0", "output": {
+        "stck_prpr": "69000", "stck_oprc": "69000", "stck_hgpr": "69000", "stck_lwpr": "69000",
+        "acml_vol": "0", "prdy_ctrt": "0.5", "lstn_stcn": "100", "rprs_mrkt_kor_name": "KOSPI",
+    }}))
+    assert record2["sor_effective_price"] == 70000

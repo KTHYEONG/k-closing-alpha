@@ -4,6 +4,7 @@ import pytest
 
 from src import settings
 from src.data.parquet_loader import (
+    _atomic_write_parquet,
     load_condition_data_from_parquet,
     load_theme_from_parquet,
     load_trade_log_from_parquet,
@@ -74,3 +75,14 @@ def test_upsert_and_load_condition_parquet(tmp_parquet_dir: Path) -> None:
     upsert_condition_parquet(df1)
     df_loaded_dedup = load_condition_data_from_parquet(date="2026-08-01")
     assert len(df_loaded_dedup) == 2
+
+
+def test_parquet_loader_atomic_write_delegates_and_still_works(tmp_path: Path) -> None:
+    df = pd.DataFrame({"종목코드": ["005930"], "종가": [70000]})
+    target = tmp_path / "legacy.parquet"
+
+    _atomic_write_parquet(df, target)
+
+    assert target.exists()
+    loaded = pd.read_parquet(target)
+    assert loaded.loc[0, "종목코드"] == "005930"
