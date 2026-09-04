@@ -148,3 +148,54 @@ def test_get_daily_short_sale_history_returns_raw_output_with_date_range_params(
     assert dates == ["20240102", "20240103"]
     params = handle_request.await_args.kwargs.get("params", {})
     assert params.get("FID_INPUT_DATE_1") == "20240101"
+
+
+def test_get_daily_credit_balance_history_requires_explicit_market_div_code() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+
+    async def _runner() -> None:
+        with pytest.raises(ValueError, match="market_div_code"):
+            await client.get_daily_credit_balance_history(_FakeSession(), "005930", "20240101", "20240110")
+
+    asyncio.run(_runner())
+
+
+def test_get_daily_credit_balance_history_includes_fixed_screen_div_code() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+    handle_request = AsyncMock(return_value={"rt_cd": "0", "output": []})
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            return await client.get_daily_credit_balance_history(
+                _FakeSession(), "005930", "20240101", "20240110", market_div_code="J",
+            )
+
+    asyncio.run(_runner())
+    params = handle_request.await_args.kwargs.get("params", {})
+    assert params.get("FID_COND_SCR_DIV_CODE") == "20476"
+
+
+def test_get_program_trade_daily_history_requires_explicit_market_div_code() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+
+    async def _runner() -> None:
+        with pytest.raises(ValueError, match="market_div_code"):
+            await client.get_program_trade_daily_history(_FakeSession(), "005930", "20240101", "20240110")
+
+    asyncio.run(_runner())
+
+
+def test_get_program_trade_daily_history_paginates_backward_by_earliest_date() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+    page1 = {"rt_cd": "0", "output": [{"stck_bsop_date": "20240105"}, {"stck_bsop_date": "20240104"}]}
+    handle_request = AsyncMock(return_value=page1)
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            return await client.get_program_trade_daily_history(
+                _FakeSession(), "005930", "20240101", "20240110", market_div_code="J",
+            )
+
+    res = asyncio.run(_runner())
+    dates = [row["stck_bsop_date"] for row in res["output"]]
+    assert dates == ["20240104", "20240105"]
