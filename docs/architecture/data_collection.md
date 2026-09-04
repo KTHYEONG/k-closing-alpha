@@ -153,6 +153,33 @@ data/history/intraday/{bar_interval}m/{session}/{YYYY-MM}/{YYYY-MM-DD}.parquet
   bar_interval ∈ {1, 3, 5, ...}   session ∈ {regular, nxt_aftermarket}
 ```
 
+Tick 체결 데이터는 분봉 간격 개념이 없으므로 독립된 경로를 사용한다
+(`src/data/intraday_store.py::tick_partition_path`):
+
+```
+data/history/intraday/ticks/{session}/{YYYY-MM}/{YYYY-MM-DD}.parquet
+  session ∈ {regular}
+```
+
+## 4.1 Trade-tick collection (FHPST01060000, forward-only)
+
+주식현재가 당일시간대별체결(FHPST01060000, `inquire-time-itemconclusion`)은
+`FID_INPUT_DATE_1` 같은 과거일자 파라미터가 없는 순수 당일 조회 전용 TR이다
+(과거 날짜 백필 원천 불가, forward-only). 저녁 배치(`archive_intraday.py`) 실행
+시점(당일 장 마감 이후)에 소급 조회하는 것으로 충분함을 실측 확인했다
+(2026-09-04 13:37 KST에 09:05 시점 틱 정상 조회).
+
+- **범위:** KRX(J) 정규세션(09:00–15:30) 한정. NXT 틱(`market_div_code='NX'`)도
+  API가 지원함을 실측했으나 호출량 2배 증가 대비 효용 미검증으로 범위 밖 제외.
+- **페이지네이션:** 페이지당 30틱, `FID_INPUT_HOUR_1` 커서 역순 진행, 캡 120.
+  실측(2026-09-04 13:37 KST 라이브 프로브): 삼성전자 반나절(09:05~13:44) 34페이지,
+  NAVER 21페이지 → 전일 환산 약 40~50페이지이므로 캡 20이 아닌 120으로 설정.
+- **Dedup 근거:** `stck_cntg_hour`(초 단위)가 아닌 `acml_vol`(누적거래량, 체결마다
+  고유·단조증가)을 키로 사용한다. 같은 초에 여러 체결이 있는 경우 hour-dedup는
+  실제 체결을 누락시키므로 `get_intraday_minute_chart`의 `seen_hours` 패턴을
+  그대로 재사용하지 않는다. 페이지 진행 커서 계산에만 기존
+  `_intraday_row_hour` 헬퍼를 사용한다. 최종 `output2`는 `int(acml_vol)` 오름차순 정렬.
+
 Each day's archive run writes only its own partition file — O(day) cost, not O(history). Reads
 for ML/backtesting glob a date range and concatenate (`read_intraday_range`), matching the
 "columnar, PyArrow-backed" directive in `performance.md`.
@@ -214,7 +241,15 @@ now:
 | Trade-strength time series | FHKST01010300 | Evening batch (future extension) | No | Real fill-probability estimation — directly targets the ADR's stated blocker for promoting the take-profit exit policy ("실체결률 측정이 승격 선결과제") |
 | VI (변동성완화장치) trigger log | (broker VI feed / condition search) | Evening batch (future extension) | No | Excluded from causal_history_v2 for this exact reason; same rationale as above |
 | Daily market-wide OHLCV | FHKST03010100 | Existing pipeline | Yes (existing `price_history.parquet`) | Unaffected — keep current pipeline |
-| Alt-data (공시/수급/파생) | existing `backfill/altdata/*` | Existing pipeline | Yes | Unaffected — keep current pipeline |
+ | Alt-data (공시/수급/파생) | existing `backfill/altdata/*` | Existing pipeline | Yes | Unaffected — keep current pipeline |
+
+### 6.1 Shorting panel partial coverage (KIS FHPST04830000)
+
+`collect_shorting`은 KIS 공매도 일별추이 TR(FHPST04830000, 거래/체결 측)만 사용한다.
+`short_volume`/`short_value`/`day_total_volume`/`short_volume_ratio` 4개만 채우고,
+잔고 측 4개(`short_balance_qty`/`short_balance_value`/`listed_shares`/
+`short_balance_ratio`)는 대응 KIS 잔고 TR을 이번 조사 범위에서 발견하지 못해
+NaN으로 남긴다. 완전 미수집이던 이전 상태 대비 개선이나 전체 스키마 완전 충족은 아니다.
 
 Only the first three rows are implemented by this spec; the trade-strength and VI rows are
 identified future extensions, not built here. All are scoped to the watchlist to keep storage
