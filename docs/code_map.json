@@ -195,6 +195,9 @@
   "src/data/theme_resolver.py": {
     "testing": "tests/unit/data/test_theme_resolver.py"
   },
+  "src/execution/cost_model.py": {
+    "testing": "tests/unit/execution/test_cost_model.py"
+  },
   "src/ml/bundle.py": {
     "testing": "tests/unit/ml/test_bundle.py"
   },
