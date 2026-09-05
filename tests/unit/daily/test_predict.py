@@ -291,6 +291,61 @@ def test_main_runs_redesigned_pipeline_with_mocks() -> None:
     assert sangdda_rows[0]["Name"] == "BBB"
 
 
+def test_main_auto_resolves_themes_missing_from_local_cache() -> None:
+    """theme.parquet/DB에 없는 신규 종목은 theme_resolver 자동 분류로 처리된다(코드_테마_DB 시트 폐지 후)."""
+    sizing_df = pd.DataFrame(
+        {
+            "종목명": ["AAA", "BBB"],
+            "theme_sector": ["테마A", "테마B"],
+            "chart_analysis": ["거래량 폭증", "상따"],
+            "selection_rank": [1, 2],
+            "change_rate": [5.0, 29.9],
+            "rank_score": [1.0, 0.5],
+            "utility_score": [0.5, 0.4],
+            "grade": ["Strong", "Pass"],
+            "allocation": [0.1, 0.0],
+            "kospi": [0.5, 0.5],
+            "kosdaq": [0.3, 0.3],
+            "date": ["2026-08-04", "2026-08-04"],
+        }
+    )
+
+    async def fake_fetch(_code: str) -> tuple[float, float]:
+        return 15.0, 0.05
+
+    with (
+        patch.object(
+            predict, "load_and_preprocess_data", return_value=daily_snapshot_df()
+        ),
+        # 000002는 로컬 캐시에 없어 자동 분류 대상이 됨 (신규 상장 등)
+        patch.object(
+            predict, "load_theme_from_db", return_value={"000001": "테마A"}
+        ),
+        patch.object(predict, "batch_resolve_missing_themes") as resolve_mock,
+        patch(
+            "src.api.kis_client.fetch_index_and_calculate_volatility",
+            side_effect=fake_fetch,
+        ),
+        patch.object(
+            predict, "load_model_bundle", return_value={"feature_cols": ["f1"]}
+        ),
+        patch.object(
+            predict,
+            "predict_daily_sizing",
+            side_effect=lambda df, *a, **kw: sizing_df[
+                sizing_df["chart_analysis"].isin(df["chart_analysis"])
+            ],
+        ),
+        patch.object(predict, "print_table"),
+    ):
+        predict.main()
+
+    resolve_mock.assert_called_once()
+    (missing_list,), kwargs = resolve_mock.call_args
+    assert kwargs == {}
+    assert [row["종목코드"] for row in missing_list] == ["000002"]
+
+
 def test_merged_normal_sangdda_scored_table_yields_one_decision() -> None:
     """병합된 normal/sangdda 스코어링 테이블은 독립 Top-N 이 아닌 단일 결정을 만듭니다."""
     normal = pd.DataFrame(
