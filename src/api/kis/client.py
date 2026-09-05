@@ -410,6 +410,14 @@ class KisApiClient:
         return res
 
     @staticmethod
+    def _decrement_hour_one_second(hour_str: str) -> str:
+        s = str(hour_str or "").strip()
+        try:
+            return (datetime.strptime(s, "%H%M%S") - timedelta(seconds=1)).strftime("%H%M%S")
+        except ValueError:
+            return s
+
+    @staticmethod
     def _intraday_row_hour(row: dict) -> str:
         val = row.get("stck_cntg_hour")
         if val is None:
@@ -471,7 +479,7 @@ class KisApiClient:
         return {"rt_cd": "0", "output2": in_range}
 
     async def get_intraday_trade_ticks(
-        self, session, code: str, floor_hour: str = "090000", end_hour: str = "153000", market_div_code: str | None = None
+        self, session, code: str, floor_hour: str = "090000", end_hour: str = "153000", market_div_code: str | None = None, max_pages: int = 2000
     ) -> dict:
         """주식현재가 당일시간대별체결(FHPST01060000)을 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합."""
         normalized = self._normalize_market_div_code(market_div_code)
@@ -480,8 +488,9 @@ class KisApiClient:
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemconclusion"
         collected: list[dict] = []
         seen_vols: set[str] = set()
-        cursor_hour = end_hour
-        for _ in range(120):
+        cursor_hour = "" if end_hour == "153000" else end_hour
+        session_get = getattr(session, "get", None)
+        for _ in range(max_pages):
             params = {
                 "FID_COND_MRKT_DIV_CODE": normalized,
                 "FID_INPUT_ISCD": code,
@@ -489,7 +498,7 @@ class KisApiClient:
                 "FID_PW_DATA_INCU_YN": "Y",
             }
             res = await self._handle_request(
-                session.get, url, headers=self._get_headers("FHPST01060000"), params=params
+                session_get, url, headers=self._get_headers("FHPST01060000"), params=params
             )
             if res.get("rt_cd") != "0":
                 if not collected:
@@ -505,13 +514,18 @@ class KisApiClient:
                     seen_vols.add(vol_key)
                     new_rows.append(row)
             if not new_rows:
-                break
+                base = cursor_hour if cursor_hour else end_hour
+                if base <= floor_hour:
+                    break
+                cursor_hour = self._decrement_hour_one_second(base)
+                continue
             collected.extend(new_rows)
             earliest = min(self._intraday_row_hour(r) for r in new_rows)
             if earliest <= floor_hour:
                 break
             cursor_hour = earliest
-        in_range = [r for r in collected if floor_hour <= self._intraday_row_hour(r) <= end_hour]
+        effective_end = "153059" if end_hour == "153000" else end_hour
+        in_range = [r for r in collected if floor_hour <= self._intraday_row_hour(r) <= effective_end]
         in_range.sort(key=lambda r: int(str(r.get("acml_vol") or "0").strip() or "0"))
         return {"rt_cd": "0", "output2": in_range}
 

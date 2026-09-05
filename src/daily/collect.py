@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import pandas as pd
@@ -11,6 +13,7 @@ from src import settings
 # 커스텀 모듈 임포트
 from src.api.kis_client import KisApiClient, prefetch_ohlcv_for_sma120
 from src.data.db_loader import load_theme_from_db
+from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
 from src.data.theme_resolver import batch_resolve_missing_themes
 from src.processing.schema import STANDARD_COLUMN_ORDER
 from src.utils.display import Colors
@@ -111,6 +114,10 @@ def save_collected_condition_data(
 # ---------------------------------------------------------
 # 상세 정보 조회 및 데이터 매핑 (비동기)
 # ---------------------------------------------------------
+async def _empty_orderbook_result() -> dict:
+    return {"rt_cd": "0", "output1": {}, "output2": []}
+
+
 async def fetch_single_stock(
     i,
     stock,
@@ -162,6 +169,16 @@ async def fetch_single_stock(
         from src.config.market_session import DECISION_PRICE_MARKET_DIV_CODES
 
         _krx_div, _nxt_div = DECISION_PRICE_MARKET_DIV_CODES
+        ob_krx_coro = (
+            client.get_orderbook_snapshot(session, code, market_div_code=_krx_div)
+            if hasattr(client, "get_orderbook_snapshot")
+            else _empty_orderbook_result()
+        )
+        ob_nxt_coro = (
+            client.get_orderbook_snapshot(session, code, market_div_code=_nxt_div)
+            if hasattr(client, "get_orderbook_snapshot")
+            else _empty_orderbook_result()
+        )
         (
             res_krx,
             res_nxt,
@@ -176,8 +193,8 @@ async def fetch_single_stock(
             client.get_trade_strength(session, code),
             client.get_investor_trend_estimate(session, code),
             client.get_program_net_buy(session, code),
-            client.get_orderbook_snapshot(session, code, market_div_code=_krx_div),
-            client.get_orderbook_snapshot(session, code, market_div_code=_nxt_div),
+            ob_krx_coro,
+            ob_nxt_coro,
         )
         res_detail = res_krx
 
@@ -279,6 +296,11 @@ async def fetch_single_stock(
         krx_ask1, krx_bid1, krx_ask_rsqn, krx_bid_rsqn = _parse_orderbook(res_ob_krx)
         nxt_ask1, nxt_bid1, nxt_ask_rsqn, nxt_bid_rsqn = _parse_orderbook(res_ob_nxt)
 
+        capture_ts = datetime.now(ZoneInfo("Asia/Seoul"))
+        orderbook_rows: list[dict] = []
+        orderbook_rows.extend(build_orderbook_rows(res_ob_krx, code, _krx_div, "decision", capture_ts))
+        orderbook_rows.extend(build_orderbook_rows(res_ob_nxt, code, _nxt_div, "decision", capture_ts))
+
         frgn_net_eok = round((frgn_qty * price) / 100_000_000, 2)
         orgn_net_eok = round((orgn_qty * price) / 100_000_000, 2)
         program_net_eok = round(program_amt_won / 100_000_000, 2)
@@ -350,7 +372,7 @@ async def fetch_single_stock(
             "nxt_매수호가1": nxt_bid1,
             "nxt_매도잔량": nxt_ask_rsqn,
             "nxt_매수잔량": nxt_bid_rsqn,
-        }, failed_apis
+        }, failed_apis, orderbook_rows
 
 
 async def fetch_all_stock_data(
@@ -432,12 +454,21 @@ async def fetch_all_stock_data(
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-    results = [r for r, f in all_res]
+    results = [r for r, _f, _o in all_res]
     failed_info = [
         (stock_list[i]["name"], stock_list[i]["code"], f)
-        for i, (r, f) in enumerate(all_res)
+        for i, (r, f, _o) in enumerate(all_res)
         if f
     ]
+    orderbook_rows: list[dict] = []
+    for _r, _f, o in all_res:
+        if o:
+            orderbook_rows.extend(o)
+    snapshot_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+    try:
+        append_orderbook_snapshots(orderbook_rows, snapshot_date)
+    except Exception as e:
+        logger.warning("[DATA] Orderbook decision snapshot persist failed: %s", e)
 
     logger.info(f"{Colors.GREEN}✅ 데이터 수집 완료{Colors.RESET}")
     return results, failed_info

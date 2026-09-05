@@ -16,12 +16,13 @@ from src.config.altdata import AltDataSettings
 from src.config.base import PathSettings
 from src.config.gsheet import GSheetSettings
 from src.config.kis import KisSettings
+from src.config.ls import LsSettings
 from src.config.trading import TradingSettings
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-class Settings(PathSettings, KisSettings, GSheetSettings, TradingSettings, AltDataSettings):
+class Settings(PathSettings, KisSettings, LsSettings, GSheetSettings, TradingSettings, AltDataSettings):
     """프로젝트 전역 설정. `.env` 파일에서 자동 로드.
 
     도메인별 설정 모듈을 통합한 싱글톤으로, 모든 소비자 모듈은
@@ -81,6 +82,9 @@ KIS_ACCOUNT_ID = settings.KIS_ACCOUNT_ID
 KIS_HTS_ID = settings.KIS_HTS_ID
 KIS_BASE_URL = settings.KIS_BASE_URL
 KIS_API_CONFIG = settings.KIS_API_CONFIG
+LS_APP_KEY = settings.LS_APP_KEY
+LS_APP_SECRET = settings.LS_APP_SECRET
+LS_BASE_URL = settings.LS_BASE_URL
 GSPREAD_KEY_PATH_ENV = settings.GSPREAD_KEY_PATH_ENV
 GSPREAD_SA_JSON = settings.GSPREAD_SA_JSON
 GOOGLE_KEY_PATH = settings.GOOGLE_KEY_PATH
@@ -114,6 +118,8 @@ TOKEN_FILE = settings.TOKEN_FILE
 DAILY_DIR = settings.DAILY_DIR
 HISTORY_PARQUET_PATH = settings.HISTORY_PARQUET_PATH
 HISTORY_DIR = settings.HISTORY_DIR
+ORDERBOOK_DIR = settings.ORDERBOOK_DIR
+LS_TICK_MAX_PAGES = settings.LS_TICK_MAX_PAGES
 HISTORY_DB_PATH = settings.HISTORY_DB_PATH
 HISTORY_CSV_PATH = settings.HISTORY_CSV_PATH
 PRICE_HISTORY_PARQUET_PATH = settings.PRICE_HISTORY_PARQUET_PATH
@@ -169,11 +175,16 @@ __all__ = [
     "KIS_HTS_ID",
     "KRX_OPENAPI_KEY",
     "LABEL_ENCODER_PATH",
+    "LS_APP_KEY",
+    "LS_APP_SECRET",
+    "LS_BASE_URL",
+    "LS_TICK_MAX_PAGES",
     "MODELS_DIR",
     "MODEL_PATH",
     "NEAR_NEW_HIGH_CONDITION_NAME",
     "NEW_HIGH_CONDITION_NAME",
     "OPENDART_API_KEY",
+    "ORDERBOOK_DIR",
     "OVERHEATED_CONDITION_NAME",
     "PARQUET_DIR",
     "PRICE_HISTORY_PARQUET_PATH",
@@ -193,6 +204,7 @@ __all__ = [
     "AltDataSettings",
     "GSheetSettings",
     "KisSettings",
+    "LsSettings",
     "PathSettings",
     "Settings",
     "TradingSettings",

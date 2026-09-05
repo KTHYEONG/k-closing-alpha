@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import computed_field
+from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -31,6 +31,9 @@ class PathSettings(BaseSettings):
     CONFIGS_DIR: Path = _PROJECT_ROOT / "configs"
     # 학습 모델 아티팩트는 artifacts/models/ 로 이관 (데이터 아티팩트와 분리)
     MODELS_DIR: Path = _PROJECT_ROOT / "artifacts" / "models"
+
+    # LS 틱 차트 페이지 예산 (100페이지 ~= 심볼당 ~105초 @1.05초 페이싱)
+    LS_TICK_MAX_PAGES: int = Field(default=100)
 
     # ---------------------------------------------------------
     # [파생 경로]
@@ -79,6 +82,11 @@ class PathSettings(BaseSettings):
     @property
     def HISTORY_DIR(self) -> Path:
         return self.DATA_DIR / "history"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ORDERBOOK_DIR(self) -> Path:
+        return self.HISTORY_DIR / "orderbook"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
