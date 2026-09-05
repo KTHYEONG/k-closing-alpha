@@ -47,6 +47,7 @@ class ChampionTuningConfig:
     hpo_reg_bias: bool = True
     # Fixed return-model params bypassing Optuna; callers must not mutate the dict.
     model_params_override: dict[str, Any] | None = None
+    buyability_target_notional_100m: float | None = None
 
     def __post_init__(self) -> None:
         if self.n_splits < 2:
