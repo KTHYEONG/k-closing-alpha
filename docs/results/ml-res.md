@@ -1,147 +1,79 @@
-# ML 재학습·개선 결과 (2026-09-03)
+# ML 재학습·개선 결과 (2026-09-06)
 
-관련 ADR: `ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS`, `ADR_20260903_ML_PIPELINE_GAIN_RECOVERY`, `ADR_20260903_ML_RERANKER_SATURATION_AND_BUILD_VECTORIZATION`
+관련 ADR: `ADR_20260905_BUYABILITY_GATED_RERANKER`
 
-## 1. 실행 요약
+## 1. 핵심 결론
 
-- 대상: 종가매매 close-morning 리랭커 (`close_morning61`, 61 스냅샷 피처, `scenario_action` 패널)
-- 데이터: `data/parquet/trade_log.parquet` 33,827행 / 2,599 거래일 / 2016-01 ~ 2026-08
-- 목적: "튜닝만으로 라이브러리 기본값 대비 유의한 개선이 안 되는" 정확한 원인을 데이터로 규명하고 해결책 검증
-- 평가 인프라: `src/ml/robust_eval.py` — CombinatorialPurgedCV(8,2)=28fold/7path, moving-block bootstrap 유의성 검정, Deflated Sharpe
-- 운영 반영: **없음**. 활성 번들 불변. 아래 수정은 미커밋.
+이전 "리랭커 포화" 결론(2026-09-03)은 **체결 불가능한 상한가(+30%) 종가 픽이 top-1 통계를 지배한 상태에서 측정된 것**이었다. `src/ml/buyability.py`로 체결가능성을 명시 계측해 재선택(`fillable` 슬리브)한 결과, **분봉 커버리지 100%인 2026년 구간에서 rankIC가 사실상 0으로 붕괴**한다. 2017-2024년 결론은 분봉 데이터 부재로 **검증 불가**(확증 아님).
 
-## 2. 핵심 결론 (한 줄)
+## 2. 상한가 체결가능성 게이트 (`ADR_20260905_BUYABILITY_GATED_RERANKER`)
 
-리랭커는 **현재 후보군 레짐에서 포화** 상태다. 모델·블렌드·정책·가중·윈도우·앙상블·관망 게이트 어떤 튜닝도 라이브러리 기본값(LightGBM defaults, huber δ=0.9)을 **통계적으로 이기지 못한다**. 진짜 레버는 새 예측 정보(피처)뿐이다.
+- 정의: `close/prev_close >= 1.29 AND close >= high`. 코퍼스 8.7%(2026년 24.1%), 그러나 top-1 픽의 41.7%(2026년 68.3%) 차지.
+- 진입일 종가 동시호가(1분봉, ts>=152000) 체결대금: 상한가 픽 중앙값 0.24억(p25 0.04억, 9.7%는 정확히 0) vs 비상한가 5.46억.
+- `src/ml/buyability.py`: `classify_ceiling_entry` / `attach_entry_auction_liquidity` / `apply_buyability_gate` / `evaluate_buyability_sleeves` (fillable/ceiling/pooled 재선택, 재라벨링 아님) / `summarize_buyability_sleeves`. `champion.py`에 `tuning_provenance['buyability_sleeves']`로만 배선(`buyability_target_notional_100m` 기본 `None` → opt-in, 서빙/번들 불변).
+- 실측 (walk-forward OOF, `target_notional_100m=0.5억`):
 
-## 3. 데이터 규명 (moving-block bootstrap, n≈2,165 paired 일별, vs 라이브러리 기본값)
+| 연도 | 분봉 커버리지 | pooled top1 | fillable top1 | pooled rankIC | fillable rankIC |
+|---|---:|---:|---:|---:|---:|
+| 2017-2024 | 0% | +1.44~+3.24% | 측정불가(=pooled로 대체) | 0.19~0.27 | 측정불가 |
+| 2025 | 33% | +1.65% | +1.43% | 0.157 | 0.143 |
+| **2026** | **100%** | **+3.19%** | **+0.71%** | **+0.160** | **−0.0004** |
 
-### 3.1 알파는 감소하지 않는다 — "rankIC 0.24→0.17 하락"은 아티팩트
+- ceiling 슬리브는 별도 생존(2026 +4.82%/일, n=157일) — 상따 전략 삭제 아닌 분리.
+- 발견/수정한 실버그: 인트라데이 파티션 242/243개가 `symbol`이 아닌 `종목코드` 컬럼 사용 → 원래 코드가 전 종목을 한 그룹으로 뭉개 커버리지 0% 산출. `attach_entry_auction_liquidity`에 `종목코드` 인식 추가로 수정.
 
-| 연도(테스트) | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 |
-|---|---:|---:|---:|---:|---:|---:|
-| walk-forward OOF rankIC | 0.30 | 0.19 | 0.21 | 0.18 | 0.18 | 0.18 |
-| 타깃 일간분산(std) | 0.034 | 0.030 | 0.031 | 0.034 | 0.032 | 0.031 |
+## 3. 라벨 컨벤션 분리 (2026-09-05)
 
-2020(코로나)만 이상치. 2021년 이후 rankIC ~0.18 **평탄**, 기회분산도 평탄. 감소 통념은 초기 윈도우에 2020이 섞인 결과.
+동일 OOF 예측을 저널링 라벨(운영자 재량 청산) vs 기계적 익일시가 라벨로 각각 채점:
 
-### 3.2 후보군 자체가 붕괴했다 (개선 상한을 규정)
-
-| 구간 | 평균 후보수익 | 승률 | oracle top-1 | (best − mean) 스프레드 |
+| 연도 | IC vs 저널링 | IC vs 익일시가 | top1 저널링 | top1 익일시가 |
 |---|---:|---:|---:|---:|
-| 2016–2020 | **+0.31%** | 53% | +5.5% | +5.2% |
-| 2021–2025 | **−0.17%** | 44% | +6.6% | **+6.9%** |
+| 2018 | 0.260 | 0.169 | +1.63% | +1.04% |
+| 2021 | 0.198 | 0.082 | +1.47% | +0.37% |
+| 2024 | 0.201 | 0.097 | +1.02% | +0.43% |
+| 2025 | 0.141 | 0.059 | +1.01% | +0.42% |
 
-평균 후보가 이제 손실 트레이드. 그러나 oracle는 여전히 +6~7%, 스프레드는 **더 넓어짐** → 리랭커가 할 일은 많아졌으나 성과는 top-1 실현 1.3%→0.6%로 반감. 모델은 여전히 순위 능력 보유(rankIC 0.18).
+기계적 타깃으로 재학습(retarget) → 기계적 결과로 채점: rankIC **+0.0375 (p<1e-4)**, top1 **+24.5bp (p=0.034, 2021+)**. CPCV(8,2): rankIC 개선 27/28 fold 통과, **top1은 19/28로 만장일치 게이트 미통과 → 미승격**. 상한가 게이트 적용 후 재측정 필요.
 
-### 3.3 파이프라인 이득 상쇄 분해 (BASE = 라이브러리 기본값 control)
+## 4. 청산 타이밍 레버 (`ADR_20260903_ML_EXIT_POLICY_RESEARCH`, 미승격 대기)
 
-| knob (BASE에서 1개만 변경) | POST-POLICY Δ | p | 판정 |
-|---|---:|---:|---|
-| `p_good_weight` 0.5 → 0.0 | **+0.120%/일** | **0.015** | p_good 블렌드가 알파를 희석 |
-| `p_good_weight` → 1.0 | −0.007% | 0.87 | 더 섞을수록 무익 |
-| 정규화 파라미터 (num_leaves 15·min_child 40·subsample) | **+0.127%/일** (모델단 +0.186% p=0.005) | **0.021** | 실제 이득 |
-| `weighting_mode` → `date_balanced` | −0.000% | **0.99** | 무효 |
-| `recency_half_life` 504 | +0.063% | 0.31 | 유의하지 않음 |
-| `date_balanced` + `recency` | +0.069% | 0.28 | 유의하지 않음 |
-| **정규화 + p_good_weight 0 (REG_PG0)** | **+0.239%/일** | **0.0004** | 격리실험 최적 (Sharpe 4.23→5.13) |
+실데이터(OOF 31,053행/2,165일, 상한가 제외 유효 1,116일, 현행 익일시가=+0.430%/일):
 
-### 3.4 `calibrate_blend_weight` 버그 (핵심 원인)
+| TP | 후보 %/일 | Δ vs 현행 | p | CPCV 최소경로 | 승격 |
+|---|---:|---:|---:|---:|:--:|
+| 3% | +0.683 | +25.2bp | 0.012 | +8.5bp | ✅ |
+| **5%** | **+0.839** | **+40.9bp** | **0.0024** | +3.7bp | ✅ |
+| 6% | +0.778 | +34.8bp | 0.015 | +1.9bp | ✅ |
 
-실데이터 grid 평균: `{0.0: 1.29%, 0.25: 1.25%, 0.5: 1.18%, 0.75: 1.14%, 1.0: 1.12%}` — 단조감소, w=0 최선.
-**함수는 0.75를 선택.** "보수적 tiebreaker"가 `max−min < 0.005`(50bp)일 때 발동 → 일별수익 스케일에선 **항상 참** → `entry_sequence_drawdown`(MDD 노이즈)로 정렬. 모든 tuned 챔피언이 MDD 노이즈로 뽑은 가중을 배포해 옴. w>0 비용: −11~17bp/일 (w=0.5 p=0.011, w=1.0 p=0.004).
+- 보수적 체결(85%, −0.3% haircut): Δ +23bp/일, p=0.11~0.14 — 유의성 소멸. **실체결률 측정이 승격 조건.**
+- 청산일 분봉 커버리지 9~15%(엔트리일 100%와 비대칭), 미수집 (date,code) 6,257쌍이 KIS 1년 보관한도로 2026-12 15.6%, 2027-03 42.8% 영구소실.
 
-### 3.5 기각된 가설 (전부 무효 또는 음(−))
+## 5. 검정력 분석 — 대기로 해결 불가
 
-| 가설 | 결과 |
+일별 페어드 노이즈(2021+, n=1,352일): top1 sd=4.667%/일, rankIC sd=0.2745.
+
+| 효과 | 필요일수 | 달력 |
+|---|---:|---:|
+| top1 +25bp/일 | 2,732 | 10.8년 |
+| top1 +40bp/일 | 1,067 | 4.2년 |
+| rankIC +0.015 | 2,625 | 10.4년 |
+
+진입일 분봉 미시구조 피처 12종(241일 창): ΔIC +0.0148(19/28 fold), Δtop1 +17.8bp(17/28) — 확증 불가. 36개월 추가 축적해도 top1 MDE는 84bp→41bp.
+
+## 6. 폐기/보류 (2026-09-03 이전 탐색, §2 결과로 무의미해진 것 포함)
+
+| 항목 | 결과 |
 |---|---|
-| 타깃 횡단면 디민 (excess return) | dIC −0.0155, p=0.17 |
-| rolling 750일 윈도우 학습 | −16bp (since 2023) |
-| top-2 / top-3 분산 진입 | −26 ~ −63bp, p<0.01 |
-| ridge / 선형 모델 | −27 ~ −38bp, p<0.05 |
-| causal margin / conviction 관망 게이트 | −8 ~ −43bp — 최저확신 분위도 +0.8% EV라 관망은 손해 |
-| date-constant 피처 제거 (`v_kospi` 등 4개) | p=0.75 |
-| 나이브 공시 + KOSPI200 베이시스 대체데이터 | dIC −0.006, p=0.60 |
-| HPO 목적함수 `rank_ic` | leaves 56 선택(정규화 안됨), 결정지표 못 움직임 |
-| HPO 목적함수 `cpcv_top1` | leaves 8 선택(정규화 됨), 그러나 게이트 p=0.67 |
+| 모델·블렌드·정책·가중·윈도우·앙상블·관망 게이트 튜닝 9종 | 전부 라이브러리 기본값 대비 무효 (p>0.4 또는 음) |
+| 신규 횡단면 피처 5종(출현동학/밀집도/레짐prior/오버나잇/공시) + LGBMRanker | CPCV 게이트 전부 미통과 |
+| `calibrate_blend_weight` MDD tiebreaker 버그 | 수정 완료·검증됨(`src/ml/tuning.py`), 그러나 홀드아웃 게이트(p=0.57) 미통과로 미승격 |
+| 정규화 파라미터 prior (`CHAMPION_DEFAULT_MODEL_PARAMS`) | 격리실험 +12.7bp p=0.021, 홀드아웃 재현 안 됨(p=0.41~0.57) |
 
-## 4. 수정 사항 (자체 정당성으로 배포 가치 있음)
+**주의**: 위 §6 전부 상한가 게이트 적용 전 pooled 지표로 측정됨 — §2 결과로 미루어 재측정 시 결론이 바뀔 수 있음(특히 rankIC 기반 판정).
 
-| 파일 | 변경 | 근거 |
-|---|---|---|
-| `src/ml/tuning.py` | `calibrate_blend_weight` 유의성 게이트 재작성 — 최저 grid 가중 기본, 상위는 `moving_block_bootstrap Δ>0 & p<promotion_alpha`일 때만 채택, MDD tiebreaker 삭제. `per_weight`에 `delta_vs_base`/`p_value_vs_base` 추가. `alpha` kwarg. | 명백한 선택 버그 제거 |
-| `src/ml/bundle.py` | `CHAMPION_DEFAULT_MODEL_PARAMS` (num_leaves 15, min_child 40, n_estimators 350, lr 0.03, subsample/colsample 0.8, reg_lambda 1.0) → `build_inline_bundle` 기본층 병합 | bare LightGBM 기본값(31/100) 대신 정규화 prior |
-| `src/ml/tuning.py`, `champion.py`, `retrain.py` | `ChampionTuningConfig.model_params_override` + `retrain --no-hpo` — Optuna 스킵 | HPO(11 파라미터 × 2000 노이즈 관측)는 검증노이즈 과적합 |
-| `src/serving/realtime/inference.py` | `_CLOSE_MORNING_RERANKER_CONFIG["p_good_weight"] 0.5 → 0.0` (v2 research config 불변) | 배포/서빙 fallback 기본값 |
+## 7. 다음 단계
 
-## 5. 실 파이프라인 검증 — 수정은 작동, 그러나 홀드아웃 게이트 미통과
-
-`train_tuned_champion_bundle`, OOS 예약 `2025-07-01`, n=1,935 shared dates:
-
-| 후보 | 블렌드 선택 | GATE Δ | p | 승격 | top1 / Sharpe / MDD / PF |
-|---|---|---:|---:|:---:|---|
-| FIXED (`--no-hpo` 정규화 + 유의성 블렌드) | **0.0** (기존 버그 0.75) | +0.037%/일 | **0.572** | ❌ | +1.432% / 5.77 / **0.245** / 2.77 |
-| HPO `rank_ic` (12 trials) + 유의성 블렌드 | **0.0** | +0.060%/일 | **0.411** | ❌ | +1.455% / 5.94 / **0.287** / 2.89 |
-| 대조군 (라이브러리 기본값) | 0.5 | — | — | — | +1.395% / 5.72 / 0.182 / 2.81 |
-
-- 두 후보 모두 라이브러리 기본값 대비 **+4~6bp/일 (노이즈 수준, p>0.4)**, **MDD·PF는 오히려 악화**.
-- 격리 walk-forward ablation의 **+24bp/p=0.0004는 OOS 예약된 `dev` 구간에서 재현 안 됨**. `dev`(2025-07+ 제외)에서 p_good 블렌드는 중립(0.0: +1.432% vs 0.5: +1.431%) — ablation의 −12bp p_good 비용은 **전체데이터 + 라이브러리기본모델 조합 아티팩트**였음.
-- `calibrate_blend_weight` 버그 수정은 **확정 검증됨**: 두 실행 모두 0.0 선택, 유의성 테이블상 어떤 상위 가중도 0.0을 못 이김.
-
-## 6. 이전 세션 (참고) — CPCV 강건성 인프라
-
-`ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS`: RUN A(`rank_ic`) p=0.358, RUN B(`cpcv_top1`) p=0.665 — 둘 다 승격 거부. 기존 코인플립 게이트(`cand≥ctrl`)였다면 RUN A 승격됐을 것(노이즈 승격). 새 bootstrap 게이트가 차단. `cpcv_oof_predict` attrs concat 버그, `eval_mode` ghost-switch 수정.
-
-## 6.1 독립 검증 (2026-09-03, `ADR_20260903_ML_RERANKER_SATURATION_AND_BUILD_VECTORIZATION`)
-
-P2 로드맵(새 예측정보)을 직접 탐색. 베이스라인 rankIC ~0.20 / top-1 net ~1.52%/일. 신규 **횡단면** 피처군 5종 + LGBMRanker 를 61피처 대조군 대비 검정(일별 top-1 net, moving-block bootstrap; 유의 후보는 CPCV(8,2) 재검정).
-
-| 후보 | walk-forward top-1 Δ | CPCV(8,2) | 판정 |
-|---|---:|---:|---|
-| A 후보 출현동학 (재등장간격·연속스트릭·트레일링 카운트) | +0.074%/d (p=0.28) | — | 무효 |
-| B 당일 밀집도 (테마/시나리오/시장 peer 수·비중) | +0.104%/d (p=0.054) | +0.024%/d (p=0.18) | 게이트 미통과 |
-| C 인과 레짐 prior (시나리오/시장/테마별 expanding mean) | −0.006%/d (p=0.93) | — | 사망 |
-| D 종목별 오버나잇 미시구조 (close-to-open 20d 통계, price_history) | +0.110%/d (p=0.109) | −0.002%/d (p=0.92) | 게이트 미통과 |
-| E 공시 트레일링 (5d/20d supply·earnings·CB/BW·rights 카운트) | +0.069%/d (p=0.25) | — | 무효 |
-| A+B+C / D+E 결합 | +0.09 / +0.01 (p≥0.2) | — | 안 쌓임 = 노이즈 |
-| LGBMRanker(lambdarank) vs huber 회귀 (동일 61피처) | −0.035%/d (p=0.66) | — | 레버 아님 |
-
-- B·D 의 walk-forward 마진 신호는 CPCV 에서 소멸 — §5 의 "격리 ablation +24bp/p=0.0004 가 OOS 예약에서 소멸"과 동일 패턴. 결합 시 붕괴 = 검증노이즈 과적합.
-- 구조적 이유: `decision_score` 는 **당일 횡단면 순위**(`groupby(date).rank(pct=True)`)라 날짜상수 피처(`v_kospi`/`v_kosdaq`/`kospi_change`/`kosdaq_change` 및 변화율)는 원리적으로 top-1 선택·rankIC 에 무효. 날짜상수 6피처 제거는 CPCV-중립(+0.008%/d, p=0.63)이라 안전하나 이득 없음(+ 레거시 컬럼 패리티 테스트 수정 필요).
-- **결론**: 모델·블렌드·정책·가중·윈도우·앙상블·관망 게이트에 이어 **신규 예측정보(5종)와 모델클래스(ranker)도 소진**. 리랭커 피처 연구 동결. 다음 레버는 후보생성기 품질(oracle top-1 +6.6% vs 실현 +0.6%) 또는 트레이드 구성(quantile grade 사이징·청산 타이밍) — `src/ml/` 밖.
-
-### 파이프라인 부수 수정 (알파 무관, 배포 가치 있음)
-
-| 파일 | 변경 | 근거 |
-|---|---|---|
-| `src/serving/realtime/features.py` | `_apply_robust_z` — `groupby.transform(lambda MAD)` → 벡터 MAD + `_z` 컬럼 일괄 `df.assign` | 2.6s → 0.04s, rtol=1e-12 패리티. 프레임 조각화 회피 |
-| `src/ml/dataset.py` | `create_multi_targets` — `trade_date` 그룹 파이썬 랭크 루프 → 그룹크기별 단일 qcut 벡터화 | target_rank 33,827행 loop 구현과 정확 일치 |
-
-`build_ml_dataset` 컴퓨트 ~5.5s → ~1.5s (HPO 40 trial × inner CV, `cpcv_oof_predict` 에서 복리). 초기 측정 90–142s 는 `uv run` 콜드스타트 + 머신 부하(load-avg 20, 파일워처 pytest) 환경 요인이며 알고리즘 버그 아님.
-
-## 6.2 청산 타이밍 레버 (2026-09-03, `ADR_20260903_ML_EXIT_POLICY_RESEARCH`)
-
-§6.1 이 지목한 "트레이드 구성·청산 타이밍"을 직접 검증. 코드에 청산 모델이 전무해 `net_return` 을 익일 시가 매도로 고정 사용해 왔음. 리랭커 OOF top-1 을 `price_history` 익일 OHLC 에 조인하니 시가 매도 후 종가까지 평균 −0.6% 밀리고 `next_high` 는 시가보다 크게 위(오라클 next_high 매도 ~+8%/일).
-
-신설 `src/ml/exit_policy.py` (리서치 전용, `robust_eval.py` 와 동급): 무-룩어헤드 익절 지정가(시가≥목표가면 시가, 아니면 지정가 대기, 미체결 시 종가 MOC) 그리드를 현행 대비 `moving_block_bootstrap` + CPCV 만장일치 경로 게이트로 검정. `champion.train_tuned_champion_bundle` 에 배선 → `tuning_provenance['exit_policy_grid']` 기록 전용, **서빙/번들 런타임 불변**.
-
-실데이터(OOF 31,053행 / 2,165일, 상한가 진입 제외 유효 1,116일, 현행 익일시가 = +0.430%/일):
-
-| TP | 후보 %/일 | Δ vs 현행 | p | Sharpe | CPCV 최소경로 | 승격 |
-|---|---:|---:|---:|---:|---:|:--:|
-| 3% | +0.683 | +25.2bp | 0.012 | 1.92 | +8.5bp | ✅ |
-| 4% | +0.761 | +33.1bp | 0.006 | 2.05 | −0.7bp | ❌ |
-| **5%** | **+0.839** | **+40.9bp** | **0.0024** | 2.18 | +3.7bp | ✅ |
-| 6% | +0.778 | +34.8bp | 0.015 | 1.94 | +1.9bp | ✅ |
-| 7% | +0.776 | +34.6bp | 0.024 | 1.88 | −13.9bp | ❌ |
-
-- 결정론적 체결 가정(터치=체결)에서 TP 5% 는 일평균 순수익 2배, 28개 CPCV 경로 전부 양(+).
-- **보수적 체결(85% 체결, −0.3% haircut): Δ +23bp/일, p=0.11~0.14 — 유의성 소멸.** 지정가 실체결률이 승격의 관건.
-- 손절은 우측꼬리 비대칭(=엣지 전부)을 훼손해 일관되게 악화. `fallback=next_open` 은 손절 종목 시가 매도가 선행참조라 상한 레퍼런스로만 해석.
-- **다음 단계**: 실체결률·호가 슬리피지 측정 → 통과 시 별도 승격 ADR 로 서빙 청산 규칙 도입. 피처조건부 동적 익절(스냅샷 61피처의 익일 up-excursion Spearman IC ~0.18)은 1차 시도에서 고정 k 못 이겨 P2 보류.
-
-## 7. 한계 및 다음 단계
-
-- `entry_sequence_drawdown`은 포지션 중첩·자본배분 미반영 간이지표. 운영 승격 전 포트폴리오 백테스트(비용·슬리피지·체결실패 포함) 필수.
-- **P2 (최근 레짐 레버 = 새 정보만)**: 결정시점 미시구조, `chart_analysis` × 피처 상호작용, 트레일링/상대 변환된 대체데이터. 그룹별로 CPCV + bootstrap 게이트(`Δ>0 & p<0.10` vs 61피처 대조군) 통과 시에만 배포. 정직한 사전확률: 탐색적, 아무것도 안 나올 수 있음 (다일·섹터·공시 3회 시도 이미 실패).
-- **P3 (죽은 p_good 연산 제거)**: p_good_weight 0 기본 + calibrate가 계속 0 선택 시, `fit_chrono_calibrator`가 fold당 2회 무의미하게 실행. `any(w>0 for w in grid)` 게이팅 또는 v1 경로에서 p_good/p_bad 제거 → 챔피언 학습시간 ~30% 절감.
+1. **최우선**: 청산일 분봉 백필 실행(`src/backfill/intraday/backfill_minute_history.py`) — KIS 보관한도 소실 진행 중, 대기 아닌 즉시 실행 항목.
+2. §6 튜닝/피처 실험을 buyability 게이트 적용 후 재측정.
+3. §3 라벨 재타깃을 buyability 게이트 적용 후 CPCV 재검정 (top1 19/28 미달 원인이 상한가 오염인지 확인).
+4. `target_notional_100m` 가정치(0.5억)를 실제 포지션 사이즈로 교체.
