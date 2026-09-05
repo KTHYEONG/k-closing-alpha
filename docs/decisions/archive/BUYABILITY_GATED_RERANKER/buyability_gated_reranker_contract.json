@@ -1,0 +1,174 @@
+{
+  "feature": "buyability_gated_reranker",
+  "domain": "quant",
+  "objective": "The close-morning reranker's reported alpha is substantially unfillable. Measured this session: candidates whose entry-day close sits at the +30% ceiling are 8.7% of the corpus (24.1% in 2026) but win the model's top-1 slot on 41.7% of pre-2026 days and 68.3% of 2026 days, carrying +2.87%/day (untagged subset +5.26%, 2026 +6.11%) against +0.20% for everything else. On the 241 days of entry-day 1m bars that are already on disk at 100% coverage, those same rows show a median closing-auction turnover of 0.24억 KRW (p25 0.04억, 9.7% exactly zero) versus 5.46억 for non-ceiling candidates -- the panel books a certain fill at the ceiling price where the auction matched almost nothing. Excluding them at decision time cuts measured top-1 from +2.41% to +1.61% (2016-20), +1.77% to +1.26% (2021-25) and +3.19% to -0.04% (2026). Make fillability an explicit measured quantity rather than a silent assumption: derive a decision-time ceiling flag and an auction-liquidity capacity estimate, gate and sleeve-split the evaluation so the 상따 branch and the ordinary branch are never pooled into one headline number, and record it all as research provenance without touching serving.",
+  "target_file": "src/ml/buyability.py",
+  "context_files": [
+    "src/ml/exit_policy.py",
+    "src/ml/robust_eval.py",
+    "src/ml/champion.py",
+    "src/data/intraday_schema.py",
+    "src/data/intraday_store.py",
+    "src/config/market_session.py",
+    "src/ml/dataset.py",
+    "tests/unit/ml/test_exit_policy.py"
+  ],
+  "symbols": [
+    {
+      "name": "CEILING_RATIO_THRESHOLD",
+      "kind": "constant",
+      "signature": "CEILING_RATIO_THRESHOLD: float = 1.29",
+      "target_file": "src/ml/buyability.py"
+    },
+    {
+      "name": "DEFAULT_PARTICIPATION_CAP",
+      "kind": "constant",
+      "signature": "DEFAULT_PARTICIPATION_CAP: float = 0.10",
+      "target_file": "src/ml/buyability.py"
+    },
+    {
+      "name": "BuyabilitySleeveResult",
+      "kind": "class",
+      "signature": "@dataclass(frozen=True)\nclass BuyabilitySleeveResult:\n    sleeve: str\n    n_days: int\n    n_rows: int\n    top1_mean: float\n    top1_se: float\n    rank_ic: float\n    median_auction_value_100m: float\n    zero_auction_share: float",
+      "target_file": "src/ml/buyability.py"
+    },
+    {
+      "name": "classify_ceiling_entry",
+      "kind": "function",
+      "signature": "def classify_ceiling_entry(df: pd.DataFrame, *, close_col: str = \"close_price\", prev_close_col: str = \"prev_close_price\", high_col: str = \"high_price\", ratio_threshold: float = CEILING_RATIO_THRESHOLD) -> pd.Series",
+      "target_file": "src/ml/buyability.py"
+    },
+    {
+      "name": "attach_entry_auction_liquidity",
+      "kind": "function",
+      "signature": "def attach_entry_auction_liquidity(df: pd.DataFrame, *, date_col: str = \"trade_date\", code_col: str = \"stock_code\", bar_interval_minutes: int = 1, auction_start_hms: int = 152000, intraday_root: Path | None = None) -> pd.DataFrame",
+      "target_file": "src/ml/buyability.py"
+    },
+    {
+      "name": "estimate_fill_ratio",
+      "kind": "function",
+      "signature": "def estimate_fill_ratio(auction_value_100m: np.ndarray, target_notional_100m: float, *, participation_cap: float = DEFAULT_PARTICIPATION_CAP) -> np.ndarray",
+      "target_file": "src/ml/buyability.py"
+    },
+    {
+      "name": "apply_buyability_gate",
+      "kind": "function",
+      "signature": "def apply_buyability_gate(df: pd.DataFrame, *, target_notional_100m: float, min_fill_ratio: float = 1.0, participation_cap: float = DEFAULT_PARTICIPATION_CAP, require_auction_data: bool = False) -> tuple[pd.DataFrame, dict[str, Any]]",
+      "target_file": "src/ml/buyability.py"
+    },
+    {
+      "name": "evaluate_buyability_sleeves",
+      "kind": "function",
+      "signature": "def evaluate_buyability_sleeves(oof_df: pd.DataFrame, *, group_col: str = \"trade_date\", code_col: str = \"stock_code\", score_col: str = \"pred\", target_col: str = \"net_return\", target_notional_100m: float, participation_cap: float = DEFAULT_PARTICIPATION_CAP, alpha: float = 0.10) -> tuple[BuyabilitySleeveResult, ...]",
+      "target_file": "src/ml/buyability.py"
+    },
+    {
+      "name": "summarize_buyability_sleeves",
+      "kind": "function",
+      "signature": "def summarize_buyability_sleeves(results: tuple[BuyabilitySleeveResult, ...]) -> dict[str, Any]",
+      "target_file": "src/ml/buyability.py"
+    }
+  ],
+  "wiring": [
+    {
+      "caller_file": "src/ml/champion.py",
+      "anchor": "    candidate_oof[\"rank_score\"] = candidate_oof[\"pred\"]",
+      "import_symbol": "from src.ml.buyability import evaluate_buyability_sleeves, summarize_buyability_sleeves",
+      "invocation_expression": "buyability_provenance: dict[str, Any] = {\"status\": \"skipped\", \"reason\": \"buyability_target_notional_100m not configured\"}\n    if config.buyability_target_notional_100m is not None:\n        try:\n            buyability_provenance = {\"status\": \"evaluated\", **summarize_buyability_sleeves(evaluate_buyability_sleeves(candidate_oof, group_col=\"trade_date\", code_col=\"stock_code\", score_col=\"pred\", target_col=\"net_return\", target_notional_100m=float(config.buyability_target_notional_100m), alpha=config.promotion_alpha))}\n        except ValueError as exc:\n            buyability_provenance = {\"status\": \"skipped\", \"reason\": str(exc)}"
+    },
+    {
+      "caller_file": "src/ml/champion.py",
+      "anchor": "        \"exit_policy_grid\": exit_policy_provenance,",
+      "import_symbol": null,
+      "invocation_expression": "        \"buyability_sleeves\": buyability_provenance,"
+    },
+    {
+      "caller_file": "src/ml/champion.py",
+      "anchor": "class ChampionTuningConfig",
+      "import_symbol": null,
+      "invocation_expression": "    buyability_target_notional_100m: float | None = None"
+    }
+  ],
+  "requirements": [
+    "R1 (decision-time only, no look-ahead): every quantity this module produces must be computable at the entry-day close. classify_ceiling_entry reads only entry-day close/prev_close/high; attach_entry_auction_liquidity reads only bars with ts_hms <= 153000 of the ENTRY day. Reading any next-day bar, or any column derived from the exit path, is forbidden. The module must not import src.ml.exit_policy.",
+    "R2 (ceiling flag is structural, not a magic number): classify_ceiling_entry returns (close/prev_close >= ratio_threshold) & (close >= high), i.e. the close is at the session high AND at the KRX +30% daily limit. ratio_threshold defaults to 1.29 to absorb tick-rounding of the 30% cap; the flag was measured insensitive across 1.28/1.29/1.295 and to dropping the close>=high term (corpus share 8.6-9.5% in every combination), so implement it as the stated invariant rather than tuning the number. Rows with a non-positive or missing prev_close yield False, never NaN and never an exception.",
+    "R3 (auction liquidity from the canonical schema, fail-open on absence): attach_entry_auction_liquidity resolves each entry-day partition via intraday_partition_path(bar_interval_minutes, snapshot_date, INTRADAY_SESSION_REGULAR), normalizes each (snapshot_date, symbol) group with intraday_schema.normalize_bar_frame, and sums value_krw / volume over ts_hms >= auction_start_hms. Vendor is detected per file as 'ls' when a 'jdiff_vol' column is present, else 'kis' (measured: 242 kis / 1 ls partitions today). It adds auction_value_100m (float64), auction_vol_share (float64) and auction_bars_found (bool). A missing partition, a symbol absent from a present partition, or a zero day-volume yields auction_bars_found=False with auction_value_100m=NaN -- never 0.0, because 0.0 is a real and materially different observation (9.7% of ceiling rows genuinely match zero at the auction) and conflating the two would silently mark unmeasured rows as unfillable.",
+    "R4 (capacity model is a capped participation share, fail-closed on inputs): estimate_fill_ratio returns clip(participation_cap * auction_value_100m / target_notional_100m, 0.0, 1.0), elementwise, with NaN preserved as NaN. It raises ValueError when target_notional_100m <= 0 or participation_cap is outside (0.0, 1.0]. Division uses np.divide with an explicit out buffer and a where mask per .agents/rules/quant.md -- no bare division that can emit a zero-division warning or read uninitialized memory.",
+    "R5 (the gate flags, it never silently deletes): apply_buyability_gate returns (annotated_frame, provenance). The frame is the input plus is_ceiling_entry, auction_value_100m, auction_vol_share, auction_bars_found, expected_fill_ratio and is_buyable columns -- SAME row count as the input, no rows dropped. is_buyable = expected_fill_ratio >= min_fill_ratio; rows with auction_bars_found=False take is_buyable=True when require_auction_data is False (the default: unmeasured is not evidence of unfillability) and False when it is True. The provenance dict records n_rows, n_ceiling, n_unmeasured, n_blocked and the median/p25 auction_value_100m of the blocked set.",
+    "R6 (sleeve split never pools): evaluate_buyability_sleeves returns one BuyabilitySleeveResult per sleeve in the fixed order ('fillable', 'ceiling', 'pooled'). The 'fillable' sleeve re-selects the top-1 pick per group AFTER removing is_buyable=False rows -- it must not merely relabel the pooled pick, since the whole measured effect (2026 top-1 +3.19% -> -0.04%) comes from the pick moving. A group left with zero eligible rows contributes no day to that sleeve and increments a skipped counter; it must never contribute a 0.0 return, which would silently dilute the mean toward the pooled figure.",
+    "R7 (no serving mutation): this module is research/provenance only, exactly as src/ml/exit_policy.py is. champion.py records summarize_buyability_sleeves output under tuning_provenance['buyability_sleeves'] and nothing else -- no change to blend selection, promotion, feature_cols, the saved bundle payload, or src/serving/. ChampionTuningConfig.buyability_target_notional_100m defaults to None so every existing caller and test keeps byte-identical behavior and the provenance entry reads {'status': 'skipped'}.",
+    "R8 (never claim measurement that was not taken): summarize_buyability_sleeves must carry the auction-coverage denominator (n_measured / n_rows) into its output. Entry-day 1m coverage is 100% only over 2025-09-04..present (241 days of the 2,615-day corpus); a sleeve summary that reports a median auction value without also reporting how few rows it was measured on is a misreport and is what R3's auction_bars_found exists to prevent.",
+    "R9 (non-fatal on a stale or absent intraday corpus): every path through attach_entry_auction_liquidity that cannot read a partition logs one [DATA] line and continues. A missing data/history/intraday tree must degrade to auction_bars_found=False for all rows, not raise -- champion.py training must never fail because the intraday backfill has not run.",
+    "R10 (no run truncation): attach_entry_auction_liquidity reads every entry-day partition the input frame references. It must not sample, cap the number of partitions, or shorten the date range to run faster; per .agents/rules/performance.md §0 the only permitted reduction is the natural one of reading each distinct partition once.",
+    "R11 (idempotency): calling apply_buyability_gate twice on its own output produces a row-for-row identical frame -- the added columns are overwritten, never duplicated or suffixed."
+  ],
+  "design_rationale": {
+    "alternatives_considered": "(a) Drop ceiling-close rows from the training panel outright -- rejected: src/daily/predict.py deliberately synthesizes a 상따 branch (change_rate >= 20% rows get close=buy_price=prev_close*1.299 and are scored as a separate sleeve, per ADR_20260804_sangdda_scenario_prediction), so ceiling entries are an intentional strategy, not garbage. The defect is not their presence but that they are pooled with ordinary candidates into one top-1 number, and that no code anywhere checks whether the ceiling fill was obtainable. Sleeve-splitting preserves the strategy and fixes the measurement. (b) Use the 상따 scenario one-hot (scenario_is_sangtta) as the flag instead of deriving it from prices -- rejected on measurement: of 3,037 ceiling-close rows, only 2,116 carry the 상따 tag, and in 2026 the split is 57 tagged vs 677 untagged, because the panel restoration assigns UNSCORED_SCENARIO_SENTINEL to condition-history rows (R7 of the shipped recent_regime_panel_restoration contract). The untagged ceiling rows are precisely the worst offenders (+5.26% mean, +6.11% in 2026, vs +1.83% for tagged ones), so keying off the tag would miss the bulk of the distortion. A price-derived flag is available for every row in every era. (c) Gate on a fixed KRW threshold (e.g. auction < 1억 is unbuyable) rather than a participation model -- rejected: the answer depends on the position size, which is not in the trade log (only prices are), so hardcoding a threshold would bake in an unstated and unverifiable capital assumption; a participation cap makes the assumption an explicit caller-supplied parameter. Measured for reference: an auction < 0.3억 rule excludes 11.8% of the pool and overlaps the price-derived ceiling flag 82.4% of the time, so the two constructions agree without either being hardcoded. (d) Wait for more data before acting -- rejected on power: the paired daily top-1 diff has sd 4.667%/day and the paired daily rankIC diff sd 0.2745, so at 80% power / alpha 0.05 a +25bp/day effect needs 2,732 trading days (10.8 years) and a +0.015 rankIC effect needs 2,625 days. Growing the 241-day intraday window by 36 months moves the top-1 MDE only from 84bp to 41bp. Forward accrual cannot resolve effects of the size this project actually produces; the ceiling defect by contrast is a correctness finding that needs no power at all. (e) Also promote the mechanical-label retarget found this session (training on a next-open target instead of the operator-journaled one lifts rankIC +0.0375 at p<1e-4 and top-1 +24.5bp at p=0.034 on 2021+) -- deliberately NOT in this contract: under CPCV(8,2) the IC gain holds at 27/28 folds but the top-1 gain reaches only 19/28, failing the unanimous-path standard the project applied to the exit grid. It belongs in its own spec once the sleeve split above has removed the ceiling rows that dominate the top-1 statistic; measuring it before that fix would repeat the pooling error.",
+    "chosen_reason": "Every prior negative result in docs/results/ml-res.md -- nine tuning levers, five feature families, a ranker model class -- was scored on a top-1 statistic in which 41.7% of the selected picks (68.3% in 2026) are ceiling closes whose measured closing-auction turnover has a 0.24억 median and a 0.04억 p25. That is not a small contaminant on the margin: removing those picks moves the headline by -33%/-29% in the two historical eras and takes 2026 from +3.19% to -0.04%. A gate plus a sleeve split is the smallest change that makes every future measurement -- including the retarget lever and the pending exit-policy promotion -- read on a quantity that corresponds to a trade the operator could actually put on. It reuses the exact structural precedent the project already accepted for src/ml/exit_policy.py (research module, CPCV/bootstrap-grade, wired to tuning_provenance only, serving untouched), so it adds no new architectural surface. It is also the piece that unblocks rather than competes with the time-critical work: the 6,257 missing exit-day (date, code) minute-bar pairs roll off KIS's ~1-year retention at 15.6% by December 2026 and 42.8% by March 2027, and enumerate_backfill_targets already emits those D+1 targets, so that backfill is an operational run to start now, not code to write here.",
+    "failure_modes": [
+      "Unmeasured read as unfillable: auction_value_100m defaulting to 0.0 instead of NaN for the 2,374 corpus days that predate the intraday window would mark the entire pre-2025-09 history as unbuyable and invert every historical conclusion. R3 forbids the conflation and R8 forces the coverage denominator into the summary.",
+      "Sleeve relabeling instead of re-selection: computing the 'fillable' sleeve by filtering the pooled top-1 picks after the fact, rather than re-running the argmax over eligible rows only, reproduces the pooled number on a smaller day count and hides the entire effect -- the measured 2026 collapse from +3.19% to -0.04% exists only because the pick moves to a different stock. R6 requires re-selection and forbids scoring an empty group as 0.0.",
+      "Silent serving drift: adding a config field with a non-None default, or letting the gate touch feature_cols/blend/promotion, would change the deployed bundle as a side effect of a research measurement. R7 pins the default to None and confines the change to a provenance key, mirroring exit_policy_grid.",
+      "Training failure on a missing intraday tree: raising instead of degrading when data/history/intraday is absent or stale would make champion training depend on a separate backfill job having run -- the exact staleness coupling that daily_candidate_panel_automation R5 was written to avoid. R9 requires fail-open with a logged [DATA] line."
+    ]
+  },
+  "performance_budget": {
+    "expected_data_scale": "36,861-row panel x 2,615 trade dates; auction attachment touches at most one partition per distinct entry date, today 243 files / 67MB total / ~35 symbols and ~380 bars per symbol-day (~8,800 rows per partition). Coverage is 100% for the 241 dates from 2025-09-04 and 0% before, so a full-corpus call reads 243 files and marks the remaining 2,374 dates auction_bars_found=False without any I/O.",
+    "memory_target_mb": 512,
+    "storage_format": "parquet (pyarrow), read with column pruning to the canonical bar columns only",
+    "dtype_precision": "float64 for auction_value_100m and all ratio outputs (they feed bootstrap means and must not accumulate float32 error); bool for the flags; int64 for counts",
+    "chunking_strategy": "one partition file at a time, keyed by distinct entry date, aggregated to one row per (date, symbol) before any join -- never concatenate all partitions into a single frame, which would hold ~2.1M bar rows at once for no benefit",
+    "acceleration_candidate": null
+  },
+  "scenarios": [
+    {
+      "scenario_id": "test_classify_ceiling_entry_flags_limit_up_close_only",
+      "target_test_file": "tests/unit/ml/test_buyability.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_buyability.py -k test_classify_ceiling_entry_flags_limit_up_close_only -q",
+      "expected_behavior": "A close at the +30% cap that is also the session high is flagged; a +30% close that traded higher intraday, a +25% close, and a row with a non-positive prev_close are not. No NaN is returned.",
+      "test_skeleton": "def test_classify_ceiling_entry_flags_limit_up_close_only() -> None:\n    import pandas as pd\n\n    from src.ml.buyability import classify_ceiling_entry\n\n    # Given: ceiling close at the high, ceiling close beaten intraday, ordinary strong close, bad prev_close\n    df = pd.DataFrame(\n        {\n            \"close_price\": [13000.0, 13000.0, 12500.0, 13000.0],\n            \"prev_close_price\": [10000.0, 10000.0, 10000.0, 0.0],\n            \"high_price\": [13000.0, 13500.0, 12800.0, 13000.0],\n        }\n    )\n\n    # When\n    flag = classify_ceiling_entry(df)\n\n    # Then\n    assert flag.tolist() == [True, False, False, False]\n    assert flag.dtype == bool\n    assert not flag.isna().any()\n"
+    },
+    {
+      "scenario_id": "test_attach_entry_auction_liquidity_marks_missing_partition_as_unmeasured",
+      "target_test_file": "tests/unit/ml/test_buyability.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_buyability.py -k test_attach_entry_auction_liquidity_marks_missing_partition_as_unmeasured -q",
+      "expected_behavior": "With no intraday partition on disk the function returns auction_bars_found=False and auction_value_100m=NaN for every row -- never 0.0 -- and does not raise.",
+      "test_skeleton": "def test_attach_entry_auction_liquidity_marks_missing_partition_as_unmeasured(tmp_path) -> None:\n    import pandas as pd\n\n    from src.ml.buyability import attach_entry_auction_liquidity\n\n    # Given: a panel whose entry dates have no intraday partition anywhere under intraday_root\n    df = pd.DataFrame(\n        {\n            \"trade_date\": pd.to_datetime([\"2019-05-02\", \"2019-05-03\"]),\n            \"stock_code\": [\"005930\", \"000660\"],\n        }\n    )\n\n    # When\n    out = attach_entry_auction_liquidity(df, intraday_root=tmp_path)\n\n    # Then: unmeasured is distinguishable from a measured zero\n    assert len(out) == len(df)\n    assert out[\"auction_bars_found\"].tolist() == [False, False]\n    assert out[\"auction_value_100m\"].isna().all()\n"
+    },
+    {
+      "scenario_id": "test_estimate_fill_ratio_caps_at_one_and_rejects_bad_inputs",
+      "target_test_file": "tests/unit/ml/test_buyability.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_buyability.py -k test_estimate_fill_ratio_caps_at_one_and_rejects_bad_inputs -q",
+      "expected_behavior": "Ratio is clipped into [0, 1], a measured-zero auction gives exactly 0.0, NaN stays NaN, and a non-positive notional or an out-of-range participation cap raises ValueError.",
+      "test_skeleton": "def test_estimate_fill_ratio_caps_at_one_and_rejects_bad_inputs() -> None:\n    import numpy as np\n    import pytest\n\n    from src.ml.buyability import estimate_fill_ratio\n\n    # Given: a deep auction, a thin one, a measured zero, and an unmeasured row\n    auction = np.array([100.0, 0.24, 0.0, np.nan])\n\n    # When: 10% participation against a 1.0억 target\n    ratio = estimate_fill_ratio(auction, target_notional_100m=1.0, participation_cap=0.10)\n\n    # Then\n    assert ratio[0] == pytest.approx(1.0)\n    assert ratio[1] == pytest.approx(0.024)\n    assert ratio[2] == pytest.approx(0.0)\n    assert np.isnan(ratio[3])\n\n    with pytest.raises(ValueError):\n        estimate_fill_ratio(auction, target_notional_100m=0.0)\n    with pytest.raises(ValueError):\n        estimate_fill_ratio(auction, target_notional_100m=1.0, participation_cap=1.5)\n"
+    },
+    {
+      "scenario_id": "test_apply_buyability_gate_annotates_without_dropping_rows",
+      "target_test_file": "tests/unit/ml/test_buyability.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_buyability.py -k test_apply_buyability_gate_annotates_without_dropping_rows -q",
+      "expected_behavior": "Row count is preserved, is_buyable is False only for the thin-auction row, unmeasured rows stay buyable under the default, and a second application is idempotent.",
+      "test_skeleton": "def test_apply_buyability_gate_annotates_without_dropping_rows() -> None:\n    import numpy as np\n    import pandas as pd\n\n    from src.ml.buyability import apply_buyability_gate\n\n    # Given: a deep-auction row, a thin ceiling row, and an unmeasured row\n    df = pd.DataFrame(\n        {\n            \"trade_date\": pd.to_datetime([\"2026-03-02\"] * 3),\n            \"stock_code\": [\"005930\", \"111111\", \"222222\"],\n            \"close_price\": [12500.0, 13000.0, 11000.0],\n            \"prev_close_price\": [10000.0, 10000.0, 10000.0],\n            \"high_price\": [12800.0, 13000.0, 11200.0],\n            \"auction_value_100m\": [50.0, 0.24, np.nan],\n            \"auction_vol_share\": [0.010, 0.0004, np.nan],\n            \"auction_bars_found\": [True, True, False],\n        }\n    )\n\n    # When\n    gated, provenance = apply_buyability_gate(df, target_notional_100m=1.0, min_fill_ratio=1.0)\n\n    # Then\n    assert len(gated) == 3\n    assert gated[\"is_buyable\"].tolist() == [True, False, True]\n    assert gated[\"is_ceiling_entry\"].tolist() == [False, True, False]\n    assert provenance[\"n_rows\"] == 3\n    assert provenance[\"n_blocked\"] == 1\n    assert provenance[\"n_unmeasured\"] == 1\n\n    # And: idempotent\n    again, _ = apply_buyability_gate(gated, target_notional_100m=1.0, min_fill_ratio=1.0)\n    pd.testing.assert_frame_equal(gated, again[gated.columns])\n"
+    },
+    {
+      "scenario_id": "test_evaluate_buyability_sleeves_reselects_top1_within_fillable_sleeve",
+      "target_test_file": "tests/unit/ml/test_buyability.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_buyability.py -k test_evaluate_buyability_sleeves_reselects_top1_within_fillable_sleeve -q",
+      "expected_behavior": "When the highest-scored pick each day is an unfillable ceiling row, the fillable sleeve reports the second-best row's return, not the ceiling row's and not 0.0; the pooled sleeve still reports the ceiling row's.",
+      "test_skeleton": "def test_evaluate_buyability_sleeves_reselects_top1_within_fillable_sleeve() -> None:\n    import pandas as pd\n    import pytest\n\n    from src.ml.buyability import evaluate_buyability_sleeves\n\n    # Given: 40 days where the top-scored pick is always a thin-auction ceiling row worth +6%,\n    # and the runner-up is an ordinary fillable row worth +0.2%\n    dates = pd.bdate_range(\"2026-01-05\", periods=40)\n    rows = []\n    for i, d in enumerate(dates):\n        rows.append(\n            {\n                \"trade_date\": d, \"stock_code\": f\"9{i:05d}\", \"pred\": 0.9,\n                \"net_return\": 6.0, \"close_price\": 13000.0,\n                \"prev_close_price\": 10000.0, \"high_price\": 13000.0,\n                \"auction_value_100m\": 0.05, \"auction_vol_share\": 0.0002,\n                \"auction_bars_found\": True,\n            }\n        )\n        rows.append(\n            {\n                \"trade_date\": d, \"stock_code\": f\"1{i:05d}\", \"pred\": 0.5,\n                \"net_return\": 0.2, \"close_price\": 11000.0,\n                \"prev_close_price\": 10000.0, \"high_price\": 11200.0,\n                \"auction_value_100m\": 40.0, \"auction_vol_share\": 0.011,\n                \"auction_bars_found\": True,\n            }\n        )\n    oof = pd.DataFrame(rows)\n\n    # When\n    results = evaluate_buyability_sleeves(oof, target_notional_100m=1.0)\n    by_sleeve = {r.sleeve: r for r in results}\n\n    # Then: the fillable sleeve re-selects rather than relabels\n    assert [r.sleeve for r in results] == [\"fillable\", \"ceiling\", \"pooled\"]\n    assert by_sleeve[\"fillable\"].top1_mean == pytest.approx(0.2)\n    assert by_sleeve[\"pooled\"].top1_mean == pytest.approx(6.0)\n    assert by_sleeve[\"fillable\"].n_days == 40\n"
+    },
+    {
+      "scenario_id": "test_summarize_buyability_sleeves_reports_measurement_coverage",
+      "target_test_file": "tests/unit/ml/test_buyability.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_buyability.py -k test_summarize_buyability_sleeves_reports_measurement_coverage -q",
+      "expected_behavior": "The summary carries the auction-coverage denominator so a median auction value can never be quoted without the row count it came from.",
+      "test_skeleton": "def test_summarize_buyability_sleeves_reports_measurement_coverage() -> None:\n    import numpy as np\n    import pandas as pd\n\n    from src.ml.buyability import evaluate_buyability_sleeves, summarize_buyability_sleeves\n\n    # Given: 40 days, half of them with no auction measurement at all\n    dates = pd.bdate_range(\"2026-01-05\", periods=40)\n    rows = []\n    for i, d in enumerate(dates):\n        measured = i % 2 == 0\n        for j, (pred, ret, close, high) in enumerate(\n            [(0.9, 1.0, 13000.0, 13000.0), (0.5, 0.2, 11000.0, 11200.0)]\n        ):\n            rows.append(\n                {\n                    \"trade_date\": d, \"stock_code\": f\"{j}{i:05d}\", \"pred\": pred,\n                    \"net_return\": ret, \"close_price\": close,\n                    \"prev_close_price\": 10000.0, \"high_price\": high,\n                    \"auction_value_100m\": 40.0 if measured else np.nan,\n                    \"auction_vol_share\": 0.011 if measured else np.nan,\n                    \"auction_bars_found\": measured,\n                }\n            )\n    oof = pd.DataFrame(rows)\n\n    # When\n    summary = summarize_buyability_sleeves(evaluate_buyability_sleeves(oof, target_notional_100m=1.0))\n\n    # Then\n    assert summary[\"n_rows\"] == 80\n    assert summary[\"n_measured\"] == 40\n    assert summary[\"measured_share\"] == 0.5\n    assert set(summary[\"sleeves\"]) == {\"fillable\", \"ceiling\", \"pooled\"}\n"
+    },
+    {
+      "scenario_id": "test_champion_provenance_defaults_to_skipped_without_notional",
+      "target_test_file": "tests/unit/ml/test_champion.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_champion.py -k test_champion_provenance_defaults_to_skipped_without_notional -q",
+      "expected_behavior": "With buyability_target_notional_100m left at its None default the bundle records a skipped provenance entry and every other tuning_provenance key is unchanged, proving serving is untouched.",
+      "test_skeleton": "def test_champion_provenance_defaults_to_skipped_without_notional() -> None:\n    from src.ml.champion import ChampionTuningConfig\n\n    # Given / When: the default config\n    config = ChampionTuningConfig()\n\n    # Then: the research knob is opt-in, so no existing caller changes behavior\n    assert config.buyability_target_notional_100m is None\n"
+    }
+  ]
+}
