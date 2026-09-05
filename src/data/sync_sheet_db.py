@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from src import settings
-from src.data.gsheet_loader import load_and_combine_sheets, load_data_from_gsheet
+from src.data.gsheet_loader import load_and_combine_sheets
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 DB_PATH = str(settings.STOCK_DB_PATH)
 GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
 TRADE_WORKSHEETS = settings.TRADE_WORKSHEETS
-THEME_WORKSHEET = settings.THEME_WORKSHEET_NAME
 
 
 def filter_valid_rows(df, required_keywords=None):
@@ -107,65 +106,17 @@ def sync_trade_log(conn):
         logger.warning("매매일지 데이터를 가져오지 못했습니다.")
 
 
-def sync_theme_only(conn=None):
-    """테마 정보 (코드_테마_DB)만 동기화"""
-    should_close = False
-    if conn is None:
-        conn = sqlite3.connect(DB_PATH)
-        should_close = True
-
-    logger.info("테마정보(%s) 동기화 중...", THEME_WORKSHEET)
-    try:
-        key_path = str(settings.GOOGLE_KEY_PATH)
-        # 1. 전체 데이터 로드 (API 호출 최소화)
-        all_values = load_data_from_gsheet(key_path, GOOGLE_SHEET_NAME, THEME_WORKSHEET)
-        # load_data_from_gsheet가 내부적으로 df를 반환하므로, 
-        # API 레벨에서의 최적화는 gsheet_loader의 append_stocks_to_gsheet와 유사하게 
-        # 직접 gspread를 호출하는 것이 좋지만, 기존 구조를 유지하며 효율적으로 처리합니다.
-
-        if all_values is not None and not all_values.empty:
-            df_theme = filter_valid_rows(all_values)
-
-            if not df_theme.empty:
-                if "종목코드" in df_theme.columns:
-                    df_theme["종목코드"] = (
-                        df_theme["종목코드"]
-                        .astype(str)
-                        .str.strip()
-                        .str.split(".")
-                        .str[0]
-                        .str.zfill(6)
-                    )
-                
-                if "테마/섹터" in df_theme.columns:
-                    df_theme = df_theme.rename(columns={"테마/섹터": "테마"})
-
-                df_theme.to_sql("table_theme", conn, if_exists="replace", index=False)
-                logger.info("table_theme 저장 완료: %d행", len(df_theme))
-
-                # Parquet 백업/학습용 저장
-                try:
-                    from src.data.parquet_loader import save_theme_to_parquet
-                    save_theme_to_parquet(df_theme)
-                except Exception as e:
-                    logger.error("Parquet 테마 저장 중 오류 발생: %s", e)
-            else:
-                logger.warning("유효한 테마 데이터가 없습니다.")
-        else:
-            logger.warning("테마 데이터를 가져오지 못했습니다.")
-    finally:
-        if should_close:
-            conn.close()
-
-
 def sync_gsheet_data():
-    """구글 시트 데이터 전체 동기화 (Parquet & SQLite 저장)."""
+    """구글 시트 데이터 전체 동기화 (Parquet & SQLite 저장).
+
+    테마/섹터 동기화는 코드_테마_DB 시트 폐지(수동 기입 -> theme_resolver 자동화)로
+    제거됨 -- 매매일지(Trade/Trade2)만 남은 시트 소스.
+    """
     logger.info("구글 시트 데이터 전체 동기화 시작 (Parquet & SQLite)...")
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     try:
         sync_trade_log(conn)
-        sync_theme_only(conn)
     except Exception as e:
         logger.error("동기화 중 오류 발생: %s", e)
     finally:
