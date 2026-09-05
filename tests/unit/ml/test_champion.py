@@ -129,3 +129,79 @@ def test_train_tuned_champion_skips_hpo_with_model_params_override(monkeypatch) 
     assert prov["objective"] == "override"
     assert prov["n_trials"] == 0
 
+
+def test_champion_provenance_defaults_to_skipped_without_notional() -> None:
+    from src.ml.champion import ChampionTuningConfig
+
+    # Given / When: the default config
+    config = ChampionTuningConfig()
+
+    # Then: the research knob is opt-in, so no existing caller changes behavior
+    assert config.buyability_target_notional_100m is None
+
+
+
+def test_champion_buyability_evaluated_path_records_provenance() -> None:
+    import pandas as pd
+
+    from src.ml.buyability import evaluate_buyability_sleeves, summarize_buyability_sleeves
+    from src.ml.champion import train_tuned_champion_bundle
+    from src.ml.tuning import ChampionTuningConfig
+    from tests.unit.ml.test_champion import _raw_trade_log
+
+    cfg = ChampionTuningConfig(
+        hpo_trials=2,
+        seed_ensemble=(13, 29),
+        require_beats_control=False,
+        min_history_dates=20,
+        model_params_override={"num_leaves": 7},
+        buyability_target_notional_100m=1.0,
+    )
+    bundle = train_tuned_champion_bundle(
+        _raw_trade_log(n_dates=40, per_day=4), None, cfg, export_dir="tmp/spec_buyability"
+    )
+    prov = bundle["tuning_provenance"]["buyability_sleeves"]
+    assert prov["status"] == "evaluated"
+    assert set(prov["sleeves"]) == {"fillable", "ceiling", "pooled"}
+
+    # Direct sleeve call keeps wiring import live
+    oof = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(["2026-01-05", "2026-01-06"]),
+            "stock_code": ["005930", "000660"],
+            "pred": [0.5, 0.6],
+            "net_return": [0.2, 0.3],
+            "close_price": [11000.0, 11000.0],
+            "prev_close_price": [10000.0, 10000.0],
+            "high_price": [11200.0, 11200.0],
+            "auction_value_100m": [40.0, 40.0],
+            "auction_vol_share": [0.01, 0.01],
+            "auction_bars_found": [True, True],
+        }
+    )
+    assert "fillable" in summarize_buyability_sleeves(evaluate_buyability_sleeves(oof, target_notional_100m=1.0))["sleeves"]
+
+
+def test_champion_buyability_value_error_degrades_to_skipped(monkeypatch) -> None:
+    import src.ml.champion as champ
+    from src.ml.tuning import ChampionTuningConfig
+    from tests.unit.ml.test_champion import _raw_trade_log
+
+    def _boom(*a, **k):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(champ, "evaluate_buyability_sleeves", _boom)
+    cfg = ChampionTuningConfig(
+        hpo_trials=2,
+        seed_ensemble=(13, 29),
+        require_beats_control=False,
+        min_history_dates=20,
+        model_params_override={"num_leaves": 7},
+        buyability_target_notional_100m=1.0,
+    )
+    bundle = train_tuned_champion_bundle(
+        _raw_trade_log(n_dates=40, per_day=4), None, cfg, export_dir="tmp/spec_buyability_boom"
+    )
+    prov = bundle["tuning_provenance"]["buyability_sleeves"]
+    assert prov["status"] == "skipped"
+    assert prov["reason"] == "boom"
