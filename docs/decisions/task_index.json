@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "BUYABILITY_GATED_RERANKER",
+      "date": "2026-09-05",
+      "adr_id": "ADR_20260905_BUYABILITY_GATED_RERANKER",
+      "domain": "quant",
+      "title": "Buyability-Gated Reranker Sleeve Evaluation",
+      "why": "Reranker top-1 alpha headline was dominated by +30% ceiling-close picks whose closing auction rarely matched, and by pooling those with the ordinary sleeve",
+      "resolution": "Added src/ml/buyability.py (ceiling flag, auction liquidity attach, fill-ratio gate, fillable/ceiling/pooled sleeve eval); fixed 종목코드-keyed raw KIS partitions being silently ungrouped; wired to champion.py tuning_provenance only, opt-in via buyability_target_notional_100m",
+      "impact": "2026 (100% intraday coverage) fillable-sleeve top1 +3.19%->+0.71% and rankIC +0.160->-0.0004 vs pooled -- prior saturation conclusion in docs/results/ml-res.md was measured on a partly unfillable metric",
+      "archive_path": "docs/decisions/archive/BUYABILITY_GATED_RERANKER/buyability_gated_reranker_contract.json"
+    },
+    {
       "task_id": "TASK_THEME_GSHEET_SYNC_DEPRECATION",
       "date": "2026-09-05",
       "adr_id": "ADR_20260905_THEME_GSHEET_SYNC_DEPRECATION",
