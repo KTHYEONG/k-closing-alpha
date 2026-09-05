@@ -64,7 +64,7 @@ def test_batch_resolve_missing_themes_updates_cache(monkeypatch, tmp_path) -> No
         {"종목코드": "475150", "종목명": "하나스팩", "시장구분": "KOSDAQ", "업종": ""},
     ]
 
-    resolved = theme_resolver.batch_resolve_missing_themes(missing_stocks, sync_gsheet=False)
+    resolved = theme_resolver.batch_resolve_missing_themes(missing_stocks)
     assert len(resolved) == 2
     assert resolved[0]["테마"] == "반도체"
     assert resolved[1]["테마"] == "기타"
