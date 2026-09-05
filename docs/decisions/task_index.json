@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "EXECUTION_COST_MODEL",
+      "date": "2026-09-05",
+      "adr_id": "ADR_20260905_EXECUTION_COST_MODEL",
+      "domain": "quant",
+      "title": "Measured Execution Cost Model",
+      "why": "The project's only cost model was one unmeasured constant (20bp) despite it being the actual binding constraint on the closing-auction strategy, not prediction quality",
+      "resolution": "Added src/execution/cost_model.py (KRX tick-band spread, statutory cost, measured decision-to-auction impact) wired to champion.py tuning_provenance only; fixed the same raw-KIS-partition symbol bug already found in buyability.py",
+      "impact": "Measured round-trip cost 47-51bp vs strategy break-even 40.6bp -- real cost exceeds break-even, invalidating every prior backtest that assumed the flat 20bp constant",
+      "archive_path": "docs/decisions/archive/EXECUTION_COST_MODEL/execution_cost_model_contract.json"
+    },
+    {
       "task_id": "BUYABILITY_GATED_RERANKER",
       "date": "2026-09-05",
       "adr_id": "ADR_20260905_BUYABILITY_GATED_RERANKER",
