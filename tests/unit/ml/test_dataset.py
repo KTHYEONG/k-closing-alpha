@@ -144,3 +144,26 @@ def test_build_ml_dataset_output_unchanged_after_vectorization() -> None:
     np.testing.assert_array_equal(
         p1.sort_index()["target_rank"].to_numpy(), p2.sort_index()["target_rank"].to_numpy()
     )
+
+def test_label_source_is_excluded_from_model_features() -> None:
+    import pandas as pd
+
+    from src.data.candidate_panel import LABEL_SOURCE_COLUMN
+    from src.ml.dataset import _EXCLUDED_FROM_X, build_ml_dataset
+
+    # Arrange
+    assert LABEL_SOURCE_COLUMN in _EXCLUDED_FROM_X
+    trade_log = pd.read_parquet("data/parquet/trade_log.parquet").head(2000)
+    theme = pd.read_parquet("data/parquet/theme.parquet")
+    tagged = trade_log.copy()
+    tagged[LABEL_SOURCE_COLUMN] = "sheet_executed"
+
+    # Act
+    x_plain, _, cat_plain, _ = build_ml_dataset(trade_log, theme, feature_set="close_morning61")
+    x_tagged, _, cat_tagged, _ = build_ml_dataset(tagged, theme, feature_set="close_morning61")
+
+    # Assert
+    assert LABEL_SOURCE_COLUMN not in x_tagged.columns
+    assert LABEL_SOURCE_COLUMN not in cat_tagged
+    assert list(x_tagged.columns) == list(x_plain.columns)
+    assert cat_tagged == cat_plain
