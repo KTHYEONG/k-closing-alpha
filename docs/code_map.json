@@ -1,73 +1,77 @@
 {
-  "legacy/ml_research/evaluation/backtest_evaluator.py": {
-    "testing": "legacy/tests/unit/ml/test_backtest_evaluator.py"
-  },
-  "legacy/ml_research/evaluation/feature_selection.py": {
-    "testing": "legacy/tests/unit/ml/test_feature_selection.py"
-  },
-  "legacy/ml_research/evaluation/model_registry.py": {
-    "testing": "legacy/tests/test_model_registry.py"
-  },
-  "legacy/ml_research/evaluation/single_stock_policy.py": {
-    "testing": "legacy/tests/unit/ml/test_single_stock_policy.py"
-  },
-  "legacy/ml_research/features/dataset.py": {
-    "testing": "legacy/tests/unit/processing/test_preprocessor.py"
-  },
-  "legacy/ml_research/features/feature_manifest.py": {
-    "testing": "legacy/tests/unit/ml/test_feature_manifest.py"
-  },
-  "legacy/ml_research/features/history_feature_research.py": {
-    "testing": [
-      "legacy/tests/unit/ml/test_history_feature_research.py",
-      "legacy/tests/integration/test_history_feature_research.py"
-    ]
-  },
-  "legacy/ml_research/features/history_features.py": {
-    "testing": "legacy/tests/unit/ml/test_history_features.py"
-  },
-  "legacy/ml_research/features/scenario_action_panel.py": {
-    "testing": "legacy/tests/unit/ml/test_scenario_action_panel.py"
-  },
-  "legacy/ml_research/tools/run_history_feature_research.py": {
-    "testing": "legacy/tests/unit/tools/test_run_history_feature_research.py"
-  },
-  "legacy/ml_research/training/model_pipeline.py": {
-    "testing": "legacy/tests/unit/ml/test_model_pipeline.py"
-  },
-  "legacy/ml_research/training/purged_cv.py": {
-    "testing": "legacy/tests/unit/ml/test_purged_cv.py"
-  },
-  "legacy/ml_research/training/quantile_model.py": {
-    "testing": "legacy/tests/unit/ml/test_quantile_model.py"
-  },
-  "legacy/ml_research/training/retrain_bundle.py": {
-    "testing": "legacy/tests/unit/daily/test_predict.py"
-  },
-  "legacy/ml_research/training/sizing_training.py": {
-    "testing": "legacy/tests/unit/ml/test_sizing_engine.py"
-  },
   "src/api/kis/client.py": {
-    "testing": [
-      "tests/unit/test_facade_imports.py",
-      "tests/unit/api/kis/test_client.py"
-    ]
+    "testing": "tests/unit/api/kis/test_client.py"
   },
-  "src/api/kis/indicators.py": {
-    "testing": "tests/unit/test_facade_imports.py"
-  },
-  "src/api/kis/rate_limit.py": {
-    "testing": "tests/unit/test_facade_imports.py"
-  },
+  "src/api/kis/indicators.py": {},
+  "src/api/kis/rate_limit.py": {},
   "src/api/kis_client.py": {
     "testing": [
       "tests/unit/api/kis/test_kis_client.py",
       "tests/unit/api/kis/test_kis_client_helpers.py",
+      "tests/unit/api/kis/test_kis_client_intraday.py",
+      "tests/unit/api/kis/test_kis_client_session.py",
       "tests/unit/api/kis/test_kis_rate_limiter.py",
-      "tests/unit/api/kis/test_ohlcv_prefetch.py"
+      "tests/unit/api/kis/test_ohlcv_prefetch.py",
+      "tests/unit/daily/test_collect_auction.py"
     ]
   },
+  "src/api/ls/client.py": {
+    "testing": "tests/unit/api/ls/test_ls_client.py"
+  },
+  "src/backfill/altdata/config.py": {
+    "testing": [
+      "tests/integration/backfill/test_altdata_flow.py",
+      "tests/unit/backfill/test_altdata_collectors.py",
+      "tests/unit/backfill/test_altdata_config.py",
+      "tests/unit/backfill/test_altdata_disclosure.py",
+      "tests/unit/backfill/test_altdata_krx_api.py",
+      "tests/unit/backfill/test_altdata_normalize.py",
+      "tests/unit/backfill/test_altdata_ratelimit.py",
+      "tests/unit/backfill/test_config.py",
+      "tests/unit/backfill/test_credit_balance.py",
+      "tests/unit/backfill/test_program_trade_daily.py",
+      "tests/unit/backfill/test_shorting.py"
+    ]
+  },
+  "src/backfill/altdata/credit_balance.py": {
+    "testing": "tests/unit/backfill/test_credit_balance.py"
+  },
+  "src/backfill/altdata/derivatives.py": {
+    "testing": "tests/unit/backfill/test_altdata_krx_api.py"
+  },
+  "src/backfill/altdata/disclosure.py": {
+    "testing": "tests/unit/backfill/test_altdata_disclosure.py"
+  },
+  "src/backfill/altdata/fundamental.py": {
+    "testing": "tests/unit/backfill/test_altdata_collectors.py"
+  },
+  "src/backfill/altdata/investor_detail.py": {},
+  "src/backfill/altdata/krx_api.py": {
+    "testing": "tests/unit/backfill/test_altdata_krx_api.py"
+  },
+  "src/backfill/altdata/normalize.py": {
+    "testing": "tests/unit/backfill/test_altdata_normalize.py"
+  },
+  "src/backfill/altdata/program_trade_daily.py": {
+    "testing": "tests/unit/backfill/test_program_trade_daily.py"
+  },
+  "src/backfill/altdata/ratelimit.py": {
+    "testing": "tests/unit/backfill/test_altdata_ratelimit.py"
+  },
   "src/backfill/altdata/runner.py": {
+    "testing": [
+      "tests/integration/backfill/test_altdata_flow.py",
+      "tests/unit/backfill/test_altdata_runner.py",
+      "tests/unit/backfill/test_runner.py"
+    ]
+  },
+  "src/backfill/altdata/shorting.py": {
+    "testing": [
+      "tests/unit/backfill/test_altdata_collectors.py",
+      "tests/unit/backfill/test_shorting.py"
+    ]
+  },
+  "src/backfill/backfill_altdata.py": {
     "testing": "tests/integration/backfill/test_altdata_flow.py"
   },
   "src/backfill/backfill_condition_history.py": {
@@ -78,6 +82,46 @@
   "src/backfill/backfill_sheet.py": {},
   "src/backfill/fix_scale.py": {
     "testing": "tests/unit/backfill/test_fix_scale.py"
+  },
+  "src/backfill/intraday/backfill_minute_history.py": {
+    "testing": [
+      "tests/integration/daily/test_minute_history_backfill_flow.py",
+      "tests/unit/backfill/test_backfill_minute_history.py"
+    ]
+  },
+  "src/backfill/intraday/collector.py": {
+    "testing": [
+      "tests/unit/backfill/test_backfill_minute_history.py",
+      "tests/unit/backfill/test_collector.py"
+    ]
+  },
+  "src/backfill/kis_flow_backfill.py": {
+    "testing": "tests/unit/backfill/test_kis_flow_backfill.py"
+  },
+  "src/backfill/price/config.py": {
+    "testing": [
+      "tests/unit/backfill/test_factors_proxy.py",
+      "tests/unit/backfill/test_index_sources.py",
+      "tests/unit/backfill/test_price_windows.py",
+      "tests/unit/backfill/test_sources_flow.py"
+    ]
+  },
+  "src/backfill/price/factors.py": {
+    "testing": "tests/unit/backfill/test_factors_proxy.py"
+  },
+  "src/backfill/price/krx_openapi.py": {},
+  "src/backfill/price/normalize.py": {},
+  "src/backfill/price/runner.py": {
+    "testing": "tests/unit/backfill/test_price_runner.py"
+  },
+  "src/backfill/price/sources.py": {
+    "testing": [
+      "tests/unit/backfill/test_index_sources.py",
+      "tests/unit/backfill/test_sources_flow.py"
+    ]
+  },
+  "src/backfill/price/universe.py": {
+    "testing": "tests/unit/backfill/test_price_windows.py"
   },
   "src/backfill/run_sheet_backfill.py": {},
   "src/config/altdata.py": {},
@@ -90,14 +134,29 @@
   "src/config/kis.py": {
     "testing": "tests/unit/config/test_kis.py"
   },
+  "src/config/ls.py": {
+    "testing": "tests/unit/config/test_ls.py"
+  },
+  "src/config/market_session.py": {
+    "testing": "tests/unit/config/test_market_session.py"
+  },
   "src/config/trading.py": {
     "testing": "tests/unit/config/test_trading.py"
   },
   "src/daily/archive.py": {
     "testing": "tests/unit/daily/test_archive.py"
   },
+  "src/daily/archive_intraday.py": {
+    "testing": [
+      "tests/integration/daily/test_archive_intraday.py",
+      "tests/unit/daily/test_archive_intraday.py"
+    ]
+  },
   "src/daily/collect.py": {
     "testing": "tests/unit/daily/test_collect.py"
+  },
+  "src/daily/collect_auction.py": {
+    "testing": "tests/unit/daily/test_collect_auction.py"
   },
   "src/daily/predict.py": {
     "testing": "tests/unit/daily/test_predict.py"
@@ -111,6 +170,22 @@
   "src/data/gsheet_loader.py": {
     "testing": "tests/unit/data/test_gsheet_loader.py"
   },
+  "src/data/intraday_schema.py": {
+    "testing": "tests/unit/data/test_intraday_schema.py",
+    "architecture": "docs/architecture/data_collection.md"
+  },
+  "src/data/intraday_store.py": {
+    "testing": "tests/unit/data/test_intraday_store.py"
+  },
+  "src/data/io_utils.py": {
+    "testing": "tests/unit/data/test_io_utils.py"
+  },
+  "src/data/orderbook_store.py": {
+    "testing": "tests/unit/data/test_orderbook_store.py"
+  },
+  "src/data/parquet_codec.py": {
+    "testing": "tests/unit/data/test_parquet_codec.py"
+  },
   "src/data/parquet_loader.py": {
     "testing": "tests/unit/data/test_parquet_loader.py"
   },
@@ -119,49 +194,46 @@
     "testing": "tests/unit/data/test_theme_resolver.py"
   },
   "src/ml/bundle.py": {
-    "testing": [
-      "tests/unit/ml/test_bundle.py",
-      "tests/unit/ml/test_champion_tuning.py"
-    ],
-    "architecture": "docs/decisions/ADR_20260903_ML_PIPELINE_GAIN_RECOVERY.md"
+    "testing": "tests/unit/ml/test_bundle.py"
   },
   "src/ml/champion.py": {
-    "architecture": "docs/results/ml-res.md",
-    "testing": "tests/integration/ml/test_champion_flow.py"
+    "testing": "tests/unit/ml/test_champion.py"
   },
   "src/ml/dataset.py": {
-    "testing": [
-      "tests/unit/ml/test_ml_foundation_parity.py",
-      "tests/unit/ml/test_history_features.py",
-      "tests/unit/ml/test_dataset.py"
-    ]
+    "testing": "tests/unit/ml/test_dataset.py"
   },
   "src/ml/exit_policy.py": {
-    "architecture": "docs/results/ml-res.md",
     "testing": "tests/unit/ml/test_exit_policy.py"
   },
+  "src/ml/feature_manifest.py": {},
   "src/ml/feature_selection.py": {
     "testing": "tests/unit/ml/test_feature_selection.py"
   },
   "src/ml/history_features.py": {
     "testing": "tests/unit/ml/test_history_features.py"
   },
+  "src/ml/metrics.py": {},
+  "src/ml/oof.py": {
+    "testing": "tests/unit/ml/test_champion_tuning.py"
+  },
+  "src/ml/policy_eval.py": {
+    "testing": "tests/unit/ml/test_ml_foundation_parity.py"
+  },
+  "src/ml/purged_cv.py": {
+    "testing": "tests/unit/ml/test_ml_foundation_parity.py"
+  },
   "src/ml/retrain.py": {
     "testing": "tests/unit/ml/test_retrain.py"
   },
   "src/ml/robust_eval.py": {
-    "architecture": "docs/decisions/ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS.md",
     "testing": "tests/unit/ml/test_robust_eval.py"
   },
+  "src/ml/scenario_panel.py": {},
   "src/ml/sector_features.py": {
     "testing": "tests/unit/ml/test_sector_features.py"
   },
   "src/ml/tuning.py": {
-    "testing": [
-      "tests/unit/ml/test_tuning.py",
-      "tests/unit/ml/test_champion_tuning.py"
-    ],
-    "architecture": "docs/decisions/ADR_20260903_ML_PIPELINE_GAIN_RECOVERY.md"
+    "testing": "tests/unit/ml/test_tuning.py"
   },
   "src/processing/scale_corrector.py": {
     "testing": "tests/unit/processing/test_scale_corrector.py"
@@ -183,12 +255,20 @@
   },
   "src/settings.py": {
     "testing": [
+      "tests/unit/config/test_altdata_settings.py",
+      "tests/unit/config/test_ls.py",
       "tests/unit/config/test_settings_compat.py",
-      "tests/unit/data/test_parquet_loader.py"
+      "tests/unit/data/test_parquet_loader.py",
+      "tests/unit/data/test_theme_resolver.py",
+      "tests/unit/ml/test_history_features.py"
     ]
   },
-  "src/sync/fetcher_investor.py": {},
-  "src/sync/fetcher_program.py": {},
+  "src/sync/fetcher_investor.py": {
+    "testing": "tests/unit/sync/test_fetcher_investor.py"
+  },
+  "src/sync/fetcher_program.py": {
+    "testing": "tests/unit/sync/test_fetcher_program.py"
+  },
   "src/sync/foreign.py": {
     "testing": "tests/integration/sync/test_sync_pipeline.py"
   },
@@ -198,13 +278,20 @@
   "src/sync/sheet_helpers.py": {},
   "src/sync/vmarket.py": {},
   "src/sync/volume.py": {},
+  "src/tools/migrate_altdata_storage.py": {
+    "testing": "tests/unit/tools/test_migrate_altdata_storage.py"
+  },
+  "src/tools/migrate_intraday_corpus.py": {
+    "testing": "tests/unit/tools/test_migrate_intraday_corpus.py"
+  },
+  "src/tools/migrate_price_history_storage.py": {
+    "testing": "tests/unit/tools/test_migrate_price_history_storage.py"
+  },
   "src/tools/migrate_sqlite_to_parquet.py": {},
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
   },
   "src/utils/export_archive.py": {
     "testing": "tests/unit/utils/test_export_spreadsheet.py"
-  },
-  "src/daily/archive_intraday.py": {},
-  "src/backfill/intraday/backfill_minute_history.py": {}
+  }
 }
