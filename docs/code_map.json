@@ -198,6 +198,9 @@
   "src/ml/bundle.py": {
     "testing": "tests/unit/ml/test_bundle.py"
   },
+  "src/ml/buyability.py": {
+    "testing": "tests/unit/ml/test_buyability.py"
+  },
   "src/ml/champion.py": {
     "testing": "tests/unit/ml/test_champion.py"
   },
