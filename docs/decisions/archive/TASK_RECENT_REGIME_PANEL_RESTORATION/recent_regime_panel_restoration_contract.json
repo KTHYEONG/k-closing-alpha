@@ -1,0 +1,264 @@
+{
+  "feature": "recent_regime_panel_restoration",
+  "domain": "ml",
+  "target_file": "src/data/candidate_panel.py",
+  "context_files": [
+    "src/ml/dataset.py",
+    "src/ml/retrain.py",
+    "src/processing/schema.py",
+    "src/daily/archive.py",
+    "src/config/base.py",
+    "src/backfill/price/config.py",
+    "src/backfill/price/runner.py",
+    "src/backfill/price/universe.py",
+    "src/backfill/intraday/backfill_minute_history.py",
+    "src/data/parquet_codec.py"
+  ],
+  "problem_evidence": {
+    "panel_sparsity_is_by_design": "trade_log.parquet rows/day: 2025 monthly mean 11.1~24.5, 2026-01 onward exactly 1.00/day for 148 trading days (2026-01-02..2026-08-25). This is NOT a data-loss bug: dividing daily row count by the day's own '(총 종목 수)' candidate-pool size gives a 'journaling ratio' that averages 69-84% every year from 2016 through 2025 (the operator hand-labeled hypothetical buy/sell outcomes -- via chart analysis -- for most of each day's screened candidates, real trade or not) and collapses to 4.2% in 2026 (mean rows/day ~1 against a candidate pool that stayed at 24-45/day per '(총 종목 수)'). The operator confirms this: from 2026 the workflow only records the ONE candidate actually traded: manual hypothetical-outcome journaling for the rest of the daily pool was discontinued. A cross-sectional reranker (decision_score = groupby(trade_date).rank(pct=True)) therefore has near-zero labeled cross-section to learn or be scored on for 148 recent trading days, but nothing was lost -- those labels were simply never produced.",
+    "baseline_walkforward_oof": "purged_oof_predict(n_splits=5, purge_gap=1, CHAMPION_DEFAULT_MODEL_PARAMS, huber 0.9) on 31,053 rows / 2,165 dates -- rankIC by year 2021 0.2215, 2022 0.2045, 2023 0.2032, 2024 0.1855, 2025 0.1655; top-1 net %/day 1.895, 1.692, 1.721, 1.155, 1.252; 2026 not computable (n_ic=0).",
+    "live_2026": "The single logged row/day for 2026 realises -0.484%/day net over n=149 (win 47.7%, std 4.89%), t=-1.20 vs zero -- i.e. the recent regime is statistically unmeasurable, not proven broken. Monthly means range +1.006 to -1.938.",
+    "recoverable_source": "data/history/condition_history_cleaned.parquet holds 5,270 rows / 144 trading days (2025-12-29..2026-08-04), 36.6 rows/day. Per-date candidate count equals trade_log '(총 종목 수)' on 136/138 shared dates (98.6%) and equals its own 전체종목수 on 144/144 (100%). 138/149 logged 2026 trades are present in it. data/history/archive.parquet continues the same panel (515 rows, 2026-08-04..2026-09-04) and additionally carries 시나리오 and orderbook columns.",
+    "schema_parity_proof": "Renaming condition_history columns through RAW_TO_STANDARD_MAP aliases and feeding build_ml_dataset(feature_set='close_morning61', panel_mode='scenario_action') reproduces all 61 reference features with zero missing (only extra column 종목명). 5,199 rows / 144 days survive. NaN rates: prog_dominance_z 0.372, volume_power 0.265, inst_density_z 0.097, all others 0.0.",
+    "scenario_ablation": "Dropping all 11 scenario columns (8 one-hots + 3 context) from the 61-feature model changes top-1 by +0.0805%/day, moving_block_bootstrap p=0.186, n=2014 (2023+ subset: +0.044%/day, p=0.658); rankIC 0.2151 -> 0.2129. The 차트분석 column missing from condition_history is therefore not a blocker.",
+    "scenario_mechanically_available_post_archive": "archive.parquet's '시나리오' column (populated for 100% of its 515 rows) is not a second round of manual chart judgment -- it is the name of the HTS condition-search query that flagged the candidate (거래량 폭증 362, 상따 49, 120 돌파 34, 신고가 25, 기본 분석 23, 상한가 다음날 10, ...). Joining it against the 10 real 2026-08+ trades that also appear in archive.parquet, it agrees with the operator's logged '(차트분석)' on 6/10 (60%) -- close but not identical, because a candidate can match multiple condition-search queries simultaneously. condition_history_cleaned.parquet (2025-12-29..2026-08-04, the pre-archive.py collector) carries no equivalent field.",
+    "label_convention": "net_return == sell_price/buy_price - 1 holds to 5e-9 for 100% of legacy rows. Against price_history, buy_price/close median 0.99843 and sell_price/next_open median 0.99546, so logged net_return sits below the raw close->next_open return by a median of -0.2982pp over 2023+ (n=10,069; -0.1363pp over the full 22,157-row split-consistent overlap). Reconstructing labels as raw next_open/close would bias recent rows +0.30pp/row -- larger than every edge currently under evaluation (+41bp exit lever, +24bp pipeline gain).",
+    "price_history_freeze": "price_history.parquet ends 2025-12-30 while trade_log reaches 2026-08-25. Root cause is the literal FetchConfig.fixed_end_date = pd.Timestamp('2025-12-31') (src/backfill/price/config.py:36, duplicated at src/backfill/price/runner.py:173). Without 2026 daily bars no reconstructed label, history feature, sector feature, or exit-policy path can be computed. 1,207/1,272 (94.9%) of condition-history symbols already exist in price_history, so only the date range and 65 symbols are missing.",
+    "intraday_asymmetry": "1m corpus (data/history/intraday/1m/regular, 243 days, 2025-09-04..2026-09-04) validates exactly against price_history (close ratio 1.0, volume ratio 0.996). It covers candidates on the ENTRY day at 100.0% (1,405/1,405 for the labelled 2025-09..12 window; 5,220/5,244 for the condition-history window) but on the EXIT day at only 8.4%/11.8%, because enumerate_backfill_targets emits (snapshot_date, code) pairs only. KIS minute retention is ~1 year, so each passing day permanently destroys another day of exit-side paths that the take-profit fill-rate question depends on."
+  },
+  "objective": "The operator discontinued manual hypothetical-outcome journaling for the daily candidate pool starting 2026-01 (confirmed operationally, and evidenced by the rows-per-day / candidate-pool-size ratio falling from a 69-84% 2016-2025 average to 4.2% in 2026); only the single actually-traded candidate is still logged each day. This is a workflow change, not data loss or a bug. Automate what that manual process used to produce -- synthetic buy/sell outcomes for the rest of each day's already-collected candidate pool (condition_history/archive), convention-matched against real execution -- so the reranker again has a labeled cross-section to train and evaluate on for the recent regime. Also unfreeze the daily price backfill (a real bug, needed as the synthesis input) and start capturing exit-day minute bars before KIS retention expires them.",
+  "changes": [
+    {
+      "name": "CONDITION_HISTORY_COLUMN_ALIAS",
+      "kind": "module_constant",
+      "target_file": "src/data/candidate_panel.py",
+      "signature": "CONDITION_HISTORY_COLUMN_ALIAS: dict[str, str]",
+      "detail": "Maps condition_history_cleaned.parquet headers onto raw trade-log headers already understood by RAW_TO_STANDARD_MAP: 스냅샷_날짜->매수날짜, 시가총액(억)->'(시가총액, 억)', 거래대금(억)->'(거래대금, 억)', 순위->'(선정 순위)', 기관_순매수(억)->'(기관_순매수)', 외국인_순매수(억)->'(외국인_순매수)', 프로그램_순매수(억)->'(프로그램_순매수)', 전체종목수->'(총 종목 수)', 평균거래대금(억)->'(평균 거래대금)', KOSPI등락률->'(kospi, %)', KOSDAQ등락률->'(kosdaq, %)', (v-kospi)->v_kospi, (v-kosdaq)->v_kosdaq, 시가->'(시가)', 고가->'(고가)', 저가->'(저가)', 종가->'(종가)', 전일종가->'(전일종가)', 등락률->'(등락률)', 체결강도->'(체결강도)', 시장구분->'(시장구분)'. Do NOT invent aliases outside this list."
+    },
+    {
+      "name": "LABEL_SOURCE_COLUMN",
+      "kind": "module_constant",
+      "target_file": "src/data/candidate_panel.py",
+      "signature": "LABEL_SOURCE_COLUMN: str"
+    },
+    {
+      "name": "EXECUTED_LABEL_SOURCE",
+      "kind": "module_constant",
+      "target_file": "src/data/candidate_panel.py",
+      "signature": "EXECUTED_LABEL_SOURCE: str"
+    },
+    {
+      "name": "RECONSTRUCTED_LABEL_SOURCE",
+      "kind": "module_constant",
+      "target_file": "src/data/candidate_panel.py",
+      "signature": "RECONSTRUCTED_LABEL_SOURCE: str"
+    },
+    {
+      "name": "UNSCORED_SCENARIO_SENTINEL",
+      "kind": "module_constant",
+      "target_file": "src/data/candidate_panel.py",
+      "signature": "UNSCORED_SCENARIO_SENTINEL: str",
+      "detail": "Single sentinel value written into the raw '(차트분석)' column for condition-history rows that carry no scenario label. Must map to scenario_other in build_scenario_action_panel (i.e. must not collide with any key of _SCENARIO_NAME_TO_FEATURE)."
+    },
+    {
+      "name": "load_candidate_snapshot_panel",
+      "kind": "function",
+      "target_file": "src/data/candidate_panel.py",
+      "signature": "def load_candidate_snapshot_panel(condition_history_path: Path | None = None, archive_df: pd.DataFrame | None = None, theme_df: pd.DataFrame | None = None) -> pd.DataFrame",
+      "detail": "Load condition_history_cleaned.parquet (default settings.HISTORY_DIR/'condition_history_cleaned.parquet') and the archive snapshot (default archive.fetch_archive_snapshot(all_rows=True)), rename both onto raw trade-log headers, and return their union with columns 매수날짜, 종목코드, (시가), (고가), (저가), (종가), (전일종가), (시가총액, 억), (거래대금, 억), (등락률), (선정 순위), (기관_순매수), (외국인_순매수), (프로그램_순매수), (체결강도), (시장구분), (총 종목 수), (평균 거래대금), (kospi, %), (kosdaq, %), v_kospi, v_kosdaq, (거래량), (테마/섹터), (차트분석). Archive rows take 시나리오 as (차트분석); condition-history rows take UNSCORED_SCENARIO_SENTINEL. (테마/섹터) is filled from theme_df's 종목코드->테마 map where available (measured coverage 98.2%) and '기타' otherwise. 종목명 and orderbook columns are dropped. Rows whose (거래대금, 억) or (등락률) is not finite after pd.to_numeric are dropped (measured 0.55% of condition history) because _validate_close_morning61_feature requires finite relative_flow_strength. On duplicate (매수날짜, 종목코드) the archive row wins."
+    },
+    {
+      "name": "load_candidate_universe_symbols",
+      "kind": "function",
+      "target_file": "src/data/candidate_panel.py",
+      "signature": "def load_candidate_universe_symbols(condition_history_path: Path | None = None, archive_df: pd.DataFrame | None = None) -> pd.DataFrame",
+      "detail": "Return a deduplicated DataFrame with columns ['symbol', 'market'] for every candidate seen in condition_history and archive. symbol is zero-padded to 6 digits and filtered by r'\\d{6}'; market comes from (시장구분), 'UNKNOWN' when absent. Reads only the two identifier/market columns it needs (column pruning) so it never materialises the whole panel."
+    },
+    {
+      "name": "measure_execution_offset_pct",
+      "kind": "function",
+      "target_file": "src/data/candidate_panel.py",
+      "signature": "def measure_execution_offset_pct(trade_log_df: pd.DataFrame, price_history_df: pd.DataFrame, *, since: str = \"2023-01-01\", min_rows: int = 500) -> float",
+      "detail": "Measure the legacy sheet execution convention as a percentage-point offset. Clean trade_log via clean_column_names, join price_history on (stock_code zfill6, trade_date), keep only rows where the logged close_price agrees with the price_history close within rtol=2e-3 (corporate-action-consistent; measured 65.8% of rows), compute theoretical = (next_open/close - 1)*100 with next_open = groupby(symbol).open.shift(-1), and return the MEDIAN of (net_return - theoretical) over rows with trade_date >= since. Median, not mean: the residual is fat-tailed (2023+ IQR -0.98..+0.52 around a -0.298 median while the mean is -0.139). Raise ValueError when fewer than min_rows qualify -- never fall back to 0.0."
+    },
+    {
+      "name": "attach_reconstructed_labels",
+      "kind": "function",
+      "target_file": "src/data/candidate_panel.py",
+      "signature": "def attach_reconstructed_labels(panel_df: pd.DataFrame, price_history_df: pd.DataFrame, *, execution_offset_pct: float) -> pd.DataFrame",
+      "detail": "For each panel row, look up the entry-day close and the NEXT trading day's open from price_history (per-symbol sort by date, open.shift(-1)); set 수익률 = (next_open/close - 1)*100 + execution_offset_pct, (매수 가격) = close, (매도 가격) = close * (1 + 수익률/100) so the legacy invariant net_return == sell/buy - 1 holds exactly, and LABEL_SOURCE_COLUMN = RECONSTRUCTED_LABEL_SOURCE. Rows without a next-trading-day open, or with a non-positive entry close, are DROPPED. Never substitute the same-day close, a later day, or a forward-filled price."
+    },
+    {
+      "name": "build_restored_trade_log",
+      "kind": "function",
+      "target_file": "src/data/candidate_panel.py",
+      "signature": "def build_restored_trade_log(trade_log_df: pd.DataFrame, price_history_df: pd.DataFrame, *, condition_history_path: Path | None = None, archive_df: pd.DataFrame | None = None, theme_df: pd.DataFrame | None = None, offset_since: str = \"2023-01-01\") -> pd.DataFrame",
+      "detail": "Orchestrator: measure the offset, load the snapshot panel, attach reconstructed labels, tag the incoming trade_log rows with EXECUTED_LABEL_SOURCE, concatenate, and drop duplicates on (매수날짜, 종목코드) keeping the trade_log row. Returns the union in raw trade-log header form so it is a drop-in argument for build_ml_dataset/train_champion_bundle. Record {'execution_offset_pct', 'restored_rows', 'restored_dates', 'restored_date_min', 'restored_date_max'} in the returned frame's .attrs['panel_restoration']."
+    },
+    {
+      "name": "default_backfill_end_date",
+      "kind": "function",
+      "target_file": "src/backfill/price/config.py",
+      "signature": "def default_backfill_end_date() -> pd.Timestamp",
+      "detail": "Return pd.Timestamp.today().normalize(). Replaces the hardcoded 2025-12-31 literal."
+    },
+    {
+      "name": "FetchConfig.fixed_end_date",
+      "kind": "dataclass_field",
+      "target_file": "src/backfill/price/config.py",
+      "signature": "fixed_end_date: pd.Timestamp = dataclasses.field(default_factory=default_backfill_end_date)",
+      "detail": "The frozen dataclass must use default_factory so the bound is evaluated per instantiation; a module-import-time literal is what froze price_history 8 months behind."
+    },
+    {
+      "name": "_load_candidate_universe",
+      "kind": "function",
+      "target_file": "src/backfill/price/universe.py",
+      "signature": "def _load_candidate_universe() -> pd.DataFrame",
+      "detail": "Union the existing table_trade_log-derived universe with load_candidate_universe_symbols() before dedup, so the ~36 candidates/day that never reach the trade log still get daily bars fetched. Keep the existing zfill/regex/dedup behaviour; a failure to read the candidate sources must degrade to the trade-log universe with a warning, not raise."
+    },
+    {
+      "name": "_EXCLUDED_FROM_X",
+      "kind": "module_constant",
+      "target_file": "src/ml/dataset.py",
+      "signature": "_EXCLUDED_FROM_X: set[str]",
+      "detail": "Add 'label_source'. build_ml_dataset derives feature_cols as every column not in this set, so without the addition the provenance tag becomes a de-facto regime dummy that perfectly separates the reconstructed era from the legacy era."
+    },
+    {
+      "name": "enumerate_backfill_targets",
+      "kind": "function",
+      "target_file": "src/backfill/intraday/backfill_minute_history.py",
+      "signature": "def enumerate_backfill_targets(as_of: str | None = None, lookback_days: int = 365, *, include_exit_day: bool = True, trading_calendar: pd.DatetimeIndex | None = None) -> list[tuple[str, str]]",
+      "detail": "Additionally emit, for each (snapshot_date, code), the pair (next_trading_day, code) so the exit-side path of every candidate is captured. The next trading day MUST come from the price_history trading calendar (sorted unique dates of settings.PRICE_HISTORY_PARQUET_PATH, column-pruned to 'date') or the injected trading_calendar -- never snapshot_date + 1 calendar day and never the next snapshot date in the sources. When the calendar holds no date greater than snapshot_date the exit target is skipped and counted; log '[DATA] stage=exit_day_targets ...' with the resolved/skipped counts. Exit targets outside the lookback window are still filtered by the existing cutoff. Return value stays sorted and deduplicated."
+    }
+  ],
+  "wiring": [
+    {
+      "caller_file": "src/ml/retrain.py",
+      "anchor": "trade_log_df = pd.read_parquet(args.trade_log)",
+      "import_symbol": "from src.data.candidate_panel import build_restored_trade_log",
+      "invocation_expression": "trade_log_df = build_restored_trade_log(trade_log_df, price_history_df, theme_df=theme_df)"
+    },
+    {
+      "caller_file": "src/ml/retrain.py",
+      "anchor": "parser.add_argument(\"--no-hpo\", action=\"store_true\"",
+      "import_symbol": "argparse",
+      "invocation_expression": "parser.add_argument(\"--no-restore-panel\", action=\"store_true\", help=\"train on the raw trade log only; skip condition_history/archive panel restoration\")"
+    },
+    {
+      "caller_file": "src/backfill/price/runner.py",
+      "anchor": "fixed_end_date=pd.Timestamp(end_date) if end_date is not None else pd.Timestamp(\"2025-12-31\"),",
+      "import_symbol": "from src.backfill.price.config import default_backfill_end_date",
+      "invocation_expression": "fixed_end_date=pd.Timestamp(end_date) if end_date is not None else default_backfill_end_date(),"
+    },
+    {
+      "caller_file": "src/backfill/price/universe.py",
+      "anchor": "def _load_candidate_universe() -> pd.DataFrame:",
+      "import_symbol": "from src.data.candidate_panel import load_candidate_universe_symbols",
+      "invocation_expression": "extra = load_candidate_universe_symbols()"
+    }
+  ],
+  "requirements": [
+    "R1 (no fabricated labels): attach_reconstructed_labels drops every row whose next-trading-day open is unavailable or whose entry close is non-positive. Forward-fill, same-day close substitution, and any exit price dated later than the next trading day are forbidden.",
+    "R2 (label-convention parity): reconstructed 수익률 = (next_open/close - 1)*100 + execution_offset_pct, and (매도 가격) is derived from that return so net_return == sell_price/buy_price - 1 holds to <=1e-6 relative -- the invariant that is exact for all 33,944 legacy rows.",
+    "R3 (offset fail-closed): measure_execution_offset_pct raises ValueError when fewer than min_rows corporate-action-consistent overlap rows exist. It must never silently return 0.0. The expected value on today's data is approximately -0.30 (percentage points) for since='2023-01-01'.",
+    "R4 (corporate-action guard): the offset measurement and any price join must reject rows where the sheet's logged close disagrees with price_history's split-adjusted close beyond rtol=2e-3 (34.2% of the historical overlap fails this test).",
+    "R5 (no provenance leakage): 'label_source' is in _EXCLUDED_FROM_X and must not appear in build_ml_dataset's feature_cols nor in cat_features.",
+    "R6 (feature parity): build_ml_dataset(build_restored_trade_log(...), theme_df, feature_set='close_morning61', panel_mode='scenario_action') must produce exactly the same 61 feature columns as it does for the raw trade log -- no extra column (notably 종목명) and no missing column.",
+    "R7 (scenario sentinel): condition-history rows carry UNSCORED_SCENARIO_SENTINEL in (차트분석) so build_scenario_action_panel maps them to scenario_other. Do not attempt to infer 신고가/상따/거래량 폭증 from OHLCV; the measured cost of losing scenario information is +0.0805%/day at p=0.186.",
+    "R8 (dedup precedence): where a (trade_date, stock_code) exists in both the trade log and the snapshot panel, the trade-log row survives -- its label is the executed one.",
+    "R9 (calendar-anchored exit targets): exit-day minute targets are resolved through the price_history trading calendar only. A stale calendar must produce a logged skip count, never a guessed date.",
+    "R10 (no run truncation): the minute-history backfill over the added exit-day targets is expected to run for hours against a rate-limited broker API. It must not be given a wall-clock cap, an iteration cap, or a shortened lookback to finish sooner; existing per-date resume/merge semantics are the only stopping mechanism.",
+    "R11 (idempotency): rerunning build_restored_trade_log on unchanged inputs returns a frame identical row-for-row (stable sort by 매수날짜, 종목코드), and rerunning the minute backfill re-emits the same target list.",
+    "R12 (provenance): the restored frame's .attrs['panel_restoration'] carries execution_offset_pct and restored row/date counts, and retrain.py logs them at INFO in '[DATA] stage=panel_restore ...' key=value form."
+  ],
+  "design_rationale": {
+    "alternatives_considered": "(a) Recompute every label theoretically from price_history for uniformity, including legacy rows -- rejected: it discards the exact net_return == sell/buy - 1 invariant that holds for all 33,944 operator-journaled rows and invalidates every prior CPCV/bootstrap baseline in docs/results/ml-res.md; synthesis is applied ONLY to the un-journaled remainder of the 2026 candidate pool, never to a row the operator already logged. (b) Wait for the operator to resume manual hypothetical-outcome journaling and keep training on the legacy panel meanwhile -- rejected: the operator has confirmed the discontinuation is intentional going forward (only the traded pick gets logged now), and the 2016-2025 journaling ratio (69-84% of each day's candidate pool) shows how labor-intensive that manual process was; synthetic labeling recovers roughly the same cross-section size (5,199+ rows over 144 days) without depending on that manual step resuming. (c) Rule-reconstruct 차트분석 from OHLCV so the scenario one-hots survive for the condition_history window too -- rejected on measurement: removing all 11 scenario columns moves top-1 by +0.0805%/day (p=0.186, n=2014) and rankIC by -0.0022, so the reconstruction carries risk with no measurable payoff; use archive.parquet's mechanically-derived '시나리오' field where it exists (2026-08-04+) instead of guessing. (d) Use raw next_open/close labels with no offset -- rejected: the operator's logged execution sits a median 0.298pp below that (2023+, n=10,069) even for real trades, which would make every synthetic row look 0.30pp better than a journaled row, a bias larger than the +41bp exit lever and the +24bp pipeline gain the project is trying to detect. (e) Fix the exit-day minute gap later -- rejected: KIS retains ~1 year of minute bars and current exit-day coverage is 8.4%, so every day of delay permanently destroys another day of the fill-rate evidence that gates the only lever that has passed a promotion gate.",
+    "chosen_reason": "The measured constraint on this reranker is sample, not ideas. docs/results/ml-res.md records nine exhausted tuning levers and five exhausted feature families, all evaluated on a panel whose most recent 148 trading days carry almost no journaled cross-section (4.2% of the daily candidate pool, vs 69-84% in 2016-2025) now that manual hypothetical-outcome journaling has stopped. Entry-day 1m coverage is already 100% over the condition-history window, so once a synthetic cross-section and its labels exist, an intraday-microstructure feature family becomes testable on ~220 evaluable days instead of the 76 available today -- the minimum detectable daily IC falls from about 0.083 to about 0.046 at t=2. Automating the discontinued labeling step is therefore the precondition for any further alpha work, and it is achievable from data already on disk (the candidate pool itself was never discontinued -- only its manual outcome journaling was) plus a date-range unfreeze.",
+    "failure_modes": [
+      "Offset applied to the wrong era or measured on a window that includes the pre-2021 years, where the sign flips (2016 median +0.26pp vs 2024 median -0.31pp). Guard: offset_since defaults to 2023-01-01 and the measured value is recorded in provenance.",
+      "Exit-day minute targets silently resolve to nothing because price_history is stale, reproducing the original freeze one layer down. Guard: R9 requires an explicit logged skip count and the price-backfill unfreeze ships in the same change.",
+      "label_source leaks into feature_cols and becomes a perfect regime dummy, letting the model split operator-journaled from synthetic rows and inflating in-sample fit. Guard: R5 plus an explicit parity test.",
+      "Split/merge-adjusted price_history joined against raw sheet prices produces labels off by the adjustment factor. Guard: R4's rtol=2e-3 close-agreement filter, which already rejects 34.2% of the historical overlap.",
+      "Synthetic rows without a next trading day (last available date, delisted symbols) silently become 0% returns and drag the target toward zero. Guard: R1 drops them.",
+      "Synthetic (mechanical next-open exit) rows are treated as equivalent in quality to operator-journaled (chart-timed) rows during training, when the operator's own exits cluster near 09:01-09:05 rather than the open print (measured on 2025-09..12 real trades: sell/09:02-price within 0.5% for 24% of rows vs 12.7% for sell/next_open). Guard: label_source is retained in provenance/attrs (though excluded from features per R5) so downstream training code can weight, filter, or separately evaluate by provenance if the mechanical proxy proves too noisy."
+    ]
+  },
+  "performance_budget": {
+    "expected_data_scale": "price backfill: ~2,500 symbols x ~170 trading days (2026-01-02..today) = ~4.3e5 new rows merged into a 5,046,547-row / 154MB parquet. panel reconstruction: 5,241 condition rows + ~515 archive rows joined against the 5.05M-row price history (per-symbol shift, single vectorised merge). exit-day minute backfill: ~6,600 (date, code) targets x ~380 bars = ~2.5e6 rows across date partitions, network-bound at roughly 1-2 minutes per date for a ~23-symbol batch.",
+    "memory_target_mb": 2000,
+    "storage_format": "parquet, zstd, via src/data/parquet_codec.py (write_price_history_parquet for daily bars, write_intraday_partition for minute bars)",
+    "dtype_precision": "float32 for stored OHLCV/flow columns per the existing codec downcast policy; float64 for the label arithmetic and the offset median so the 0.30pp convention correction is not lost to rounding",
+    "chunking_strategy": "minute bars stay date-partitioned with merge-safe writes and per-date resume; price history is loaded column-pruned (date/symbol/open/close) for the label join rather than as the full 19-column frame; the candidate panel is small enough (<6k rows) for a single in-memory merge",
+    "acceleration_candidate": null
+  },
+  "scenarios": [
+    {
+      "scenario_id": "test_load_candidate_snapshot_panel_maps_condition_history_to_raw_headers",
+      "target_test_file": "tests/unit/data/test_candidate_panel.py",
+      "execution_command": "uv run pytest tests/unit/data/test_candidate_panel.py -k test_load_candidate_snapshot_panel_maps_condition_history_to_raw_headers -q",
+      "expected_behavior": "condition_history headers are renamed onto raw trade-log headers, the scenario sentinel is applied, and rows with non-finite 거래대금/등락률 are dropped.",
+      "test_skeleton": "def test_load_candidate_snapshot_panel_maps_condition_history_to_raw_headers(tmp_path) -> None:\n    import pandas as pd\n\n    from src.data.candidate_panel import (\n        UNSCORED_SCENARIO_SENTINEL,\n        load_candidate_snapshot_panel,\n    )\n\n    # Arrange: two clean rows plus one row with a blank 거래대금(억).\n    raw = pd.DataFrame(\n        {\n            \"스냅샷_날짜\": [\"2026-03-02\", \"2026-03-02\", \"2026-03-02\"],\n            \"종목코드\": [\"005930\", \"000660\", \"035720\"],\n            \"종목명\": [\"A\", \"B\", \"C\"],\n            \"시가\": [100.0, 200.0, 300.0],\n            \"고가\": [110.0, 220.0, 330.0],\n            \"저가\": [95.0, 190.0, 285.0],\n            \"종가\": [108.0, 210.0, 320.0],\n            \"전일종가\": [100.0, 200.0, 300.0],\n            \"등락률\": [8.0, 5.0, 6.67],\n            \"체결강도\": [120.0, 90.0, 110.0],\n            \"시장구분\": [\"KOSPI\", \"KOSPI\", \"KOSDAQ\"],\n            \"시가총액(억)\": [1000.0, 2000.0, 3000.0],\n            \"거래대금(억)\": [500.0, 600.0, float(\"nan\")],\n            \"순위\": [1.0, 2.0, 3.0],\n            \"기관_순매수(억)\": [1.0, 2.0, 3.0],\n            \"외국인_순매수(억)\": [4.0, 5.0, 6.0],\n            \"프로그램_순매수(억)\": [7.0, 8.0, 9.0],\n            \"전체종목수\": [3.0, 3.0, 3.0],\n            \"평균거래대금(억)\": [550.0, 550.0, 550.0],\n            \"KOSPI등락률\": [1.0, 1.0, 1.0],\n            \"KOSDAQ등락률\": [0.5, 0.5, 0.5],\n            \"(v-kospi)\": [15.0, 15.0, 15.0],\n            \"(v-kosdaq)\": [18.0, 18.0, 18.0],\n            \"(거래량)\": [1000.0, 2000.0, 3000.0],\n        }\n    )\n    path = tmp_path / \"condition_history_cleaned.parquet\"\n    raw.to_parquet(path)\n\n    # Act\n    panel = load_candidate_snapshot_panel(condition_history_path=path, archive_df=pd.DataFrame())\n\n    # Assert\n    assert len(panel) == 2\n    assert \"매수날짜\" in panel.columns\n    assert \"(거래대금, 억)\" in panel.columns\n    assert \"(선정 순위)\" in panel.columns\n    assert \"종목명\" not in panel.columns\n    assert set(panel[\"종목코드\"]) == {\"005930\", \"000660\"}\n    assert set(panel[\"(차트분석)\"]) == {UNSCORED_SCENARIO_SENTINEL}\n"
+    },
+    {
+      "scenario_id": "test_attach_reconstructed_labels_preserves_sell_over_buy_invariant",
+      "target_test_file": "tests/unit/data/test_candidate_panel.py",
+      "execution_command": "uv run pytest tests/unit/data/test_candidate_panel.py -k test_attach_reconstructed_labels_preserves_sell_over_buy_invariant -q",
+      "expected_behavior": "Reconstructed return equals next_open/close - 1 plus the offset, sell/buy - 1 reproduces it exactly, and rows with no next trading day are dropped.",
+      "test_skeleton": "def test_attach_reconstructed_labels_preserves_sell_over_buy_invariant() -> None:\n    import numpy as np\n    import pandas as pd\n    import pytest\n\n    from src.data.candidate_panel import (\n        LABEL_SOURCE_COLUMN,\n        RECONSTRUCTED_LABEL_SOURCE,\n        attach_reconstructed_labels,\n    )\n\n    # Arrange: 005930 has a next trading day, 000660 is the last row for its symbol.\n    panel = pd.DataFrame(\n        {\n            \"매수날짜\": [\"2026-03-02\", \"2026-03-02\"],\n            \"종목코드\": [\"005930\", \"000660\"],\n            \"(종가)\": [100.0, 200.0],\n        }\n    )\n    price_history = pd.DataFrame(\n        {\n            \"date\": pd.to_datetime([\"2026-03-02\", \"2026-03-03\", \"2026-03-02\"]),\n            \"symbol\": [\"005930\", \"005930\", \"000660\"],\n            \"open\": [99.0, 104.0, 199.0],\n            \"close\": [100.0, 106.0, 200.0],\n        }\n    )\n\n    # Act\n    out = attach_reconstructed_labels(panel, price_history, execution_offset_pct=-0.30)\n\n    # Assert: 000660 dropped, 005930 = (104/100 - 1)*100 - 0.30 = 3.70\n    assert list(out[\"종목코드\"]) == [\"005930\"]\n    assert out[\"(수익률, %)\"].to_numpy()[0] == pytest.approx(3.70, abs=1e-9)\n    buy = out[\"(매수 가격)\"].to_numpy(dtype=float)\n    sell = out[\"(매도 가격)\"].to_numpy(dtype=float)\n    assert buy[0] == pytest.approx(100.0, abs=1e-9)\n    assert (sell / buy - 1.0) * 100.0 == pytest.approx(3.70, rel=1e-9)\n    assert set(out[LABEL_SOURCE_COLUMN]) == {RECONSTRUCTED_LABEL_SOURCE}\n    assert np.isfinite(sell).all()\n"
+    },
+    {
+      "scenario_id": "test_measure_execution_offset_pct_rejects_thin_and_split_inconsistent_overlap",
+      "target_test_file": "tests/unit/data/test_candidate_panel.py",
+      "execution_command": "uv run pytest tests/unit/data/test_candidate_panel.py -k test_measure_execution_offset_pct_rejects_thin_and_split_inconsistent_overlap -q",
+      "expected_behavior": "Corporate-action-inconsistent rows are excluded from the median, and an overlap thinner than min_rows raises ValueError instead of defaulting to zero.",
+      "test_skeleton": "def test_measure_execution_offset_pct_rejects_thin_and_split_inconsistent_overlap() -> None:\n    import pandas as pd\n    import pytest\n\n    from src.data.candidate_panel import measure_execution_offset_pct\n\n    # Arrange: two consistent rows (offset -1.0pp) and one split-mismatched row that must be ignored.\n    trade_log = pd.DataFrame(\n        {\n            \"매수날짜\": [\"2026-03-02\", \"2026-03-02\", \"2026-03-02\"],\n            \"종목코드\": [\"005930\", \"000660\", \"035720\"],\n            \"(종가)\": [100.0, 200.0, 300.0],\n            \"(수익률, %)\": [1.0, 1.0, 50.0],\n            \"(매수 가격)\": [100.0, 200.0, 300.0],\n            \"(매도 가격)\": [101.0, 202.0, 450.0],\n        }\n    )\n    price_history = pd.DataFrame(\n        {\n            \"date\": pd.to_datetime(\n                [\"2026-03-02\", \"2026-03-03\", \"2026-03-02\", \"2026-03-03\", \"2026-03-02\", \"2026-03-03\"]\n            ),\n            \"symbol\": [\"005930\", \"005930\", \"000660\", \"000660\", \"035720\", \"035720\"],\n            \"open\": [100.0, 102.0, 200.0, 204.0, 30.0, 60.0],\n            \"close\": [100.0, 102.0, 200.0, 204.0, 30.0, 60.0],\n        }\n    )\n\n    # Act: theoretical = +2.0pp for both consistent rows, logged = +1.0pp -> median offset -1.0pp\n    offset = measure_execution_offset_pct(trade_log, price_history, since=\"2026-01-01\", min_rows=2)\n\n    # Assert\n    assert offset == pytest.approx(-1.0, abs=1e-9)\n    with pytest.raises(ValueError):\n        measure_execution_offset_pct(trade_log, price_history, since=\"2026-01-01\", min_rows=99)\n"
+    },
+    {
+      "scenario_id": "test_build_restored_trade_log_keeps_executed_row_on_duplicate_key",
+      "target_test_file": "tests/unit/data/test_candidate_panel.py",
+      "execution_command": "uv run pytest tests/unit/data/test_candidate_panel.py -k test_build_restored_trade_log_keeps_executed_row_on_duplicate_key -q",
+      "expected_behavior": "The union is deduplicated on (매수날짜, 종목코드) with the executed trade-log row winning, and provenance is recorded in attrs.",
+      "test_skeleton": "def test_build_restored_trade_log_keeps_executed_row_on_duplicate_key(tmp_path) -> None:\n    import pandas as pd\n\n    from src.data.candidate_panel import (\n        EXECUTED_LABEL_SOURCE,\n        LABEL_SOURCE_COLUMN,\n        RECONSTRUCTED_LABEL_SOURCE,\n        build_restored_trade_log,\n    )\n\n    # Arrange: 005930 exists in both sources; 000660 only in the snapshot panel.\n    trade_log = pd.DataFrame(\n        {\n            \"매수날짜\": [\"2026-03-02\"],\n            \"종목코드\": [\"005930\"],\n            \"(종가)\": [100.0],\n            \"(수익률, %)\": [7.77],\n            \"(매수 가격)\": [100.0],\n            \"(매도 가격)\": [107.77],\n        }\n    )\n    condition = pd.DataFrame(\n        {\n            \"스냅샷_날짜\": [\"2026-03-02\", \"2026-03-02\"],\n            \"종목코드\": [\"005930\", \"000660\"],\n            \"종가\": [100.0, 200.0],\n            \"거래대금(억)\": [500.0, 600.0],\n            \"등락률\": [8.0, 5.0],\n            \"시장구분\": [\"KOSPI\", \"KOSPI\"],\n        }\n    )\n    path = tmp_path / \"condition_history_cleaned.parquet\"\n    condition.to_parquet(path)\n    price_history = pd.DataFrame(\n        {\n            \"date\": pd.to_datetime([\"2026-03-02\", \"2026-03-03\", \"2026-03-02\", \"2026-03-03\"]),\n            \"symbol\": [\"005930\", \"005930\", \"000660\", \"000660\"],\n            \"open\": [100.0, 102.0, 200.0, 204.0],\n            \"close\": [100.0, 102.0, 200.0, 204.0],\n        }\n    )\n\n    # Act\n    out = build_restored_trade_log(\n        trade_log,\n        price_history,\n        condition_history_path=path,\n        archive_df=pd.DataFrame(),\n        offset_since=\"2026-01-01\",\n    )\n\n    # Assert\n    assert len(out) == 2\n    keyed = out.set_index(\"종목코드\")\n    assert keyed.loc[\"005930\", LABEL_SOURCE_COLUMN] == EXECUTED_LABEL_SOURCE\n    assert float(keyed.loc[\"005930\", \"(수익률, %)\"]) == 7.77\n    assert keyed.loc[\"000660\", LABEL_SOURCE_COLUMN] == RECONSTRUCTED_LABEL_SOURCE\n    prov = out.attrs[\"panel_restoration\"]\n    assert prov[\"restored_rows\"] == 1\n    assert \"execution_offset_pct\" in prov\n"
+    },
+    {
+      "scenario_id": "test_label_source_is_excluded_from_model_features",
+      "target_test_file": "tests/unit/ml/test_dataset.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_dataset.py -k test_label_source_is_excluded_from_model_features -q",
+      "expected_behavior": "A trade log carrying label_source yields the same feature columns as one without it, and label_source never appears in X or cat_features.",
+      "test_skeleton": "def test_label_source_is_excluded_from_model_features() -> None:\n    import pandas as pd\n\n    from src.data.candidate_panel import LABEL_SOURCE_COLUMN\n    from src.ml.dataset import _EXCLUDED_FROM_X, build_ml_dataset\n\n    # Arrange\n    assert LABEL_SOURCE_COLUMN in _EXCLUDED_FROM_X\n    trade_log = pd.read_parquet(\"data/parquet/trade_log.parquet\").head(2000)\n    theme = pd.read_parquet(\"data/parquet/theme.parquet\")\n    tagged = trade_log.copy()\n    tagged[LABEL_SOURCE_COLUMN] = \"sheet_executed\"\n\n    # Act\n    x_plain, _, cat_plain, _ = build_ml_dataset(trade_log, theme, feature_set=\"close_morning61\")\n    x_tagged, _, cat_tagged, _ = build_ml_dataset(tagged, theme, feature_set=\"close_morning61\")\n\n    # Assert\n    assert LABEL_SOURCE_COLUMN not in x_tagged.columns\n    assert LABEL_SOURCE_COLUMN not in cat_tagged\n    assert list(x_tagged.columns) == list(x_plain.columns)\n    assert cat_tagged == cat_plain\n"
+    },
+    {
+      "scenario_id": "test_default_backfill_end_date_tracks_today",
+      "target_test_file": "tests/unit/backfill/test_price_windows.py",
+      "execution_command": "uv run pytest tests/unit/backfill/test_price_windows.py -k test_default_backfill_end_date_tracks_today -q",
+      "expected_behavior": "FetchConfig's default end bound follows the current date instead of a frozen literal.",
+      "test_skeleton": "def test_default_backfill_end_date_tracks_today() -> None:\n    import pandas as pd\n\n    from src.backfill.price.config import FetchConfig, default_backfill_end_date\n\n    # Arrange / Act\n    today = pd.Timestamp.today().normalize()\n    cfg = FetchConfig()\n\n    # Assert\n    assert default_backfill_end_date() == today\n    assert cfg.fixed_end_date == today\n    assert cfg.fixed_end_date > pd.Timestamp(\"2025-12-31\")\n"
+    },
+    {
+      "scenario_id": "test_enumerate_backfill_targets_adds_next_trading_day_from_calendar",
+      "target_test_file": "tests/unit/backfill/test_backfill_minute_history.py",
+      "execution_command": "uv run pytest tests/unit/backfill/test_backfill_minute_history.py -k test_enumerate_backfill_targets_adds_next_trading_day_from_calendar -q",
+      "expected_behavior": "Each snapshot pair gains the calendar's next trading day (skipping the weekend gap), and a snapshot at the calendar's end produces no exit target.",
+      "test_skeleton": "def test_enumerate_backfill_targets_adds_next_trading_day_from_calendar(monkeypatch) -> None:\n    import pandas as pd\n\n    from src.backfill.intraday import backfill_minute_history as mod\n\n    # Arrange: Friday 2026-03-06 -> Monday 2026-03-09; 2026-03-09 is the calendar end.\n    frames = [pd.DataFrame({\"스냅샷_날짜\": [\"2026-03-06\", \"2026-03-09\"], \"종목코드\": [\"005930\", \"000660\"]})]\n    monkeypatch.setattr(mod, \"_load_condition_history_sources\", lambda: frames)\n    calendar = pd.DatetimeIndex(pd.to_datetime([\"2026-03-05\", \"2026-03-06\", \"2026-03-09\"]))\n\n    # Act\n    targets = mod.enumerate_backfill_targets(\n        as_of=\"2026-03-10\", lookback_days=365, include_exit_day=True, trading_calendar=calendar\n    )\n\n    # Assert\n    assert (\"2026-03-06\", \"005930\") in targets\n    assert (\"2026-03-09\", \"005930\") in targets\n    assert (\"2026-03-09\", \"000660\") in targets\n    assert all(code != \"000660\" or date <= \"2026-03-09\" for date, code in targets)\n    assert len(targets) == len(set(targets))\n    assert targets == sorted(targets)\n\n    without = mod.enumerate_backfill_targets(\n        as_of=\"2026-03-10\", lookback_days=365, include_exit_day=False, trading_calendar=calendar\n    )\n    assert (\"2026-03-09\", \"005930\") not in without\n"
+    },
+    {
+      "scenario_id": "test_load_candidate_universe_includes_condition_history_symbols",
+      "target_test_file": "tests/unit/backfill/test_price_windows.py",
+      "execution_command": "uv run pytest tests/unit/backfill/test_price_windows.py -k test_load_candidate_universe_includes_condition_history_symbols -q",
+      "expected_behavior": "The price backfill universe unions trade-log symbols with candidate symbols that never reached the trade log.",
+      "test_skeleton": "def test_load_candidate_universe_includes_condition_history_symbols(monkeypatch) -> None:\n    import pandas as pd\n\n    from src.backfill.price import universe as mod\n\n    # Arrange\n    monkeypatch.setattr(\n        mod,\n        \"load_or_build_snapshot\",\n        lambda **kwargs: pd.DataFrame({\"symbol\": [\"005930\"], \"market\": [\"KOSPI\"]}),\n    )\n    monkeypatch.setattr(\n        mod,\n        \"load_candidate_universe_symbols\",\n        lambda: pd.DataFrame({\"symbol\": [\"000660\", \"035720\"], \"market\": [\"KOSPI\", \"KOSDAQ\"]}),\n    )\n\n    # Act\n    out = mod._load_candidate_universe()\n\n    # Assert\n    assert set(out[\"symbol\"]) == {\"005930\", \"000660\", \"035720\"}\n    assert out[\"symbol\"].is_unique\n    assert list(out.columns) == [\"symbol\", \"market\"]\n"
+    },
+    {
+      "scenario_id": "test_restored_panel_feature_parity_with_legacy_panel",
+      "target_test_file": "tests/integration/ml/test_panel_restoration.py",
+      "execution_command": "uv run pytest tests/integration/ml/test_panel_restoration.py -k test_restored_panel_feature_parity_with_legacy_panel -q",
+      "expected_behavior": "On real repository data the restored panel builds the identical 61-feature close_morning61 matrix and materially increases the recent-regime cross-section.",
+      "test_skeleton": "import pytest\n\n\n@pytest.mark.slow\ndef test_restored_panel_feature_parity_with_legacy_panel() -> None:\n    import pandas as pd\n\n    from src.data.candidate_panel import build_restored_trade_log\n    from src.ml.dataset import build_ml_dataset\n\n    # Arrange\n    trade_log = pd.read_parquet(\"data/parquet/trade_log.parquet\")\n    theme = pd.read_parquet(\"data/parquet/theme.parquet\")\n    price_history = pd.read_parquet(\"data/history/price_history.parquet\")\n    x_legacy, _, cat_legacy, _ = build_ml_dataset(trade_log, theme, feature_set=\"close_morning61\")\n\n    # Act\n    restored = build_restored_trade_log(trade_log, price_history, theme_df=theme)\n    x_new, _, cat_new, proc_new = build_ml_dataset(restored, theme, feature_set=\"close_morning61\")\n\n    # Assert: identical feature contract, strictly more recent-regime rows\n    assert list(x_new.columns) == list(x_legacy.columns)\n    assert cat_new == cat_legacy\n    assert len(x_new) > len(x_legacy)\n    recent = proc_new[proc_new[\"trade_date\"] >= \"2026-01-01\"]\n    per_day = len(recent) / max(recent[\"trade_date\"].nunique(), 1)\n    assert per_day > 5.0\n    assert restored.attrs[\"panel_restoration\"][\"execution_offset_pct\"] < 0.0\n"
+    }
+  ],
+  "post_implementation_verification": [
+    "uv run python -m src.backfill.backfill_price --start-date 2026-01-01 (extends price_history past 2025-12-30; confirm max(date) reaches the last trading day)",
+    "uv run python -m src.backfill.intraday.backfill_minute_history (long-running, must not be truncated; confirm exit-day coverage of condition-history candidates rises from the measured 11.8%)",
+    "uv run python -m src.ml.retrain --tuned --no-hpo (confirm '[DATA] stage=panel_restore' logs restored_rows>5000 and the bundle's tuning_provenance records the restored span)"
+  ]
+}

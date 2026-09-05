@@ -1,6 +1,28 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DAILY_CANDIDATE_PANEL_AUTOMATION",
+      "date": "2026-09-05",
+      "adr_id": "ADR_20260905_DAILY_CANDIDATE_PANEL_AUTOMATION",
+      "domain": "data_collection",
+      "title": "미매매 후보 수동 기입 최소화 - 테마/시나리오 우선순위 수정 및 일일 패널 자동화",
+      "why": "미매매 후보를 스프레드시트에 수동 분석·기입하지 않도록 자동화 경계를 재정의하려 했으나, candidate_panel.py의 테마 우선순위 역전·시나리오/테마 sentinel 분열·price_history 동결 무감지 위험이 발견됨.",
+      "resolution": "테마 병합 우선순위를 archive/condition_history 실값 우선으로 수정, '테마 없음'/'기타' sentinel 통일, src/daily/materialize_ml_panel.py 신설(일일 산출물화), retrain.py에 price_history 신선도 워치독 배선, 실행 검증 중 발견한 수익률 % 문자열 파싱·종가 스케일 불일치·거래정지 자리표시일 라벨 오염 버그 수정.",
+      "impact": "archive 시나리오/테마 100% 보존 확인, 실거래 92%가 NaN 처리되던 버그와 최대 +4899%/-100% 합성 라벨 오염 2건을 실행 검증으로 추가 발견해 수정, lean_check 100% 커버리지 통과.",
+      "archive_path": "docs/decisions/archive/TASK_DAILY_CANDIDATE_PANEL_AUTOMATION/daily_candidate_panel_automation_contract.json"
+    },
+    {
+      "task_id": "TASK_RECENT_REGIME_PANEL_RESTORATION",
+      "date": "2026-09-05",
+      "adr_id": "ADR_20260905_RECENT_REGIME_PANEL_RESTORATION",
+      "domain": "ml",
+      "title": "2026 리랭커 학습 표본 붕괴 원인 규명 및 합성 라벨 패널 복원",
+      "why": "2026년부터 실거래 1건/일만 기록되어(수작업 가정매매 저널링 중단) 리랭커 최근 레짐 학습·평가 표본이 사실상 0이었고, price_history가 2025-12-31 하드코딩으로 8개월간 정지돼 있었음.",
+      "resolution": "candidate_panel.py 신설(condition_history/archive 후보군에 price_history 기반 합성 라벨 부착, 실거래 오프셋·수정주가 불일치·거래정지 자리표시일 가드 포함), FetchConfig.fixed_end_date를 default_factory로 전환해 가격 백필 동결 해제, exit-day 분봉 백필 타깃 추가.",
+      "impact": "2026년 학습 가능 표본 1행/일 -> 33행/일 수준으로 복원(합성 2,917행), 61개 피처 패리티 유지, 실거래 라벨 손상 없이 검증 완료.",
+      "archive_path": "docs/decisions/archive/TASK_RECENT_REGIME_PANEL_RESTORATION/recent_regime_panel_restoration_contract.json"
+    },
+    {
       "task_id": "TASK_INTRADAY_STORAGE_OPTIMIZATION",
       "date": "2026-09-05",
       "adr_id": "ADR_20260905_INTRADAY_STORAGE_OPTIMIZATION",

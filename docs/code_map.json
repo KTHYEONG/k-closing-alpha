@@ -99,12 +99,7 @@
     "testing": "tests/unit/backfill/test_kis_flow_backfill.py"
   },
   "src/backfill/price/config.py": {
-    "testing": [
-      "tests/unit/backfill/test_factors_proxy.py",
-      "tests/unit/backfill/test_index_sources.py",
-      "tests/unit/backfill/test_price_windows.py",
-      "tests/unit/backfill/test_sources_flow.py"
-    ]
+    "testing": "tests/unit/backfill/price/test_config.py"
   },
   "src/backfill/price/factors.py": {
     "testing": "tests/unit/backfill/test_factors_proxy.py"
@@ -112,7 +107,7 @@
   "src/backfill/price/krx_openapi.py": {},
   "src/backfill/price/normalize.py": {},
   "src/backfill/price/runner.py": {
-    "testing": "tests/unit/backfill/test_price_runner.py"
+    "testing": "tests/unit/backfill/price/test_runner.py"
   },
   "src/backfill/price/sources.py": {
     "testing": [
@@ -121,7 +116,7 @@
     ]
   },
   "src/backfill/price/universe.py": {
-    "testing": "tests/unit/backfill/test_price_windows.py"
+    "testing": "tests/unit/backfill/price/test_universe.py"
   },
   "src/backfill/run_sheet_backfill.py": {},
   "src/config/altdata.py": {},
@@ -158,8 +153,14 @@
   "src/daily/collect_auction.py": {
     "testing": "tests/unit/daily/test_collect_auction.py"
   },
+  "src/daily/materialize_ml_panel.py": {
+    "testing": "tests/unit/daily/test_materialize_ml_panel.py"
+  },
   "src/daily/predict.py": {
     "testing": "tests/unit/daily/test_predict.py"
+  },
+  "src/data/candidate_panel.py": {
+    "testing": "tests/unit/data/test_candidate_panel.py"
   },
   "src/data/data_loader.py": {
     "testing": "tests/unit/data/test_db_loader.py"
@@ -171,8 +172,7 @@
     "testing": "tests/unit/data/test_gsheet_loader.py"
   },
   "src/data/intraday_schema.py": {
-    "testing": "tests/unit/data/test_intraday_schema.py",
-    "architecture": "docs/architecture/data_collection.md"
+    "testing": "tests/unit/data/test_intraday_schema.py"
   },
   "src/data/intraday_store.py": {
     "testing": "tests/unit/data/test_intraday_store.py"
@@ -258,6 +258,7 @@
       "tests/unit/config/test_altdata_settings.py",
       "tests/unit/config/test_ls.py",
       "tests/unit/config/test_settings_compat.py",
+      "tests/unit/data/test_candidate_panel.py",
       "tests/unit/data/test_parquet_loader.py",
       "tests/unit/data/test_theme_resolver.py",
       "tests/unit/ml/test_history_features.py"
@@ -278,6 +279,9 @@
   "src/sync/sheet_helpers.py": {},
   "src/sync/vmarket.py": {},
   "src/sync/volume.py": {},
+  "src/tools/fix_price_history_integrity.py": {
+    "testing": "tests/unit/tools/test_fix_price_history_integrity.py"
+  },
   "src/tools/migrate_altdata_storage.py": {
     "testing": "tests/unit/tools/test_migrate_altdata_storage.py"
   },
