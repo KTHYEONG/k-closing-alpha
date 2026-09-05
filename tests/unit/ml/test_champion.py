@@ -205,3 +205,49 @@ def test_champion_buyability_value_error_degrades_to_skipped(monkeypatch) -> Non
     prov = bundle["tuning_provenance"]["buyability_sleeves"]
     assert prov["status"] == "skipped"
     assert prov["reason"] == "boom"
+
+
+def test_champion_execution_cost_evaluated_path_records_provenance() -> None:
+    from src.ml.champion import train_tuned_champion_bundle
+    from src.ml.tuning import ChampionTuningConfig
+    from tests.unit.ml.test_champion import _raw_trade_log
+
+    cfg = ChampionTuningConfig(
+        hpo_trials=2,
+        seed_ensemble=(13, 29),
+        require_beats_control=False,
+        min_history_dates=20,
+        model_params_override={"num_leaves": 7},
+    )
+    bundle = train_tuned_champion_bundle(
+        _raw_trade_log(n_dates=40, per_day=4), None, cfg, export_dir="tmp/spec_execution_cost"
+    )
+    prov = bundle["tuning_provenance"]["execution_cost"]
+    assert prov["status"] == "evaluated"
+    assert prov["n_rows"] > 0
+    assert prov["n_impact_measured"] == 0
+    assert prov["breakeven_cost_bp"] == prov["breakeven_cost_bp"]
+
+
+def test_champion_execution_cost_value_error_degrades_to_skipped(monkeypatch) -> None:
+    import src.ml.champion as champ
+    from src.ml.tuning import ChampionTuningConfig
+    from tests.unit.ml.test_champion import _raw_trade_log
+
+    def _boom(*a, **k):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(champ, "estimate_round_trip_cost_bp", _boom)
+    cfg = ChampionTuningConfig(
+        hpo_trials=2,
+        seed_ensemble=(13, 29),
+        require_beats_control=False,
+        min_history_dates=20,
+        model_params_override={"num_leaves": 7},
+    )
+    bundle = train_tuned_champion_bundle(
+        _raw_trade_log(n_dates=40, per_day=4), None, cfg, export_dir="tmp/spec_execution_cost_boom"
+    )
+    prov = bundle["tuning_provenance"]["execution_cost"]
+    assert prov["status"] == "skipped"
+    assert prov["reason"] == "boom"
