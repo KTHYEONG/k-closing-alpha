@@ -189,7 +189,9 @@
   "src/data/parquet_loader.py": {
     "testing": "tests/unit/data/test_parquet_loader.py"
   },
-  "src/data/sync_sheet_db.py": {},
+  "src/data/sync_sheet_db.py": {
+    "testing": "tests/unit/data/test_sync_sheet_db.py"
+  },
   "src/data/theme_resolver.py": {
     "testing": "tests/unit/data/test_theme_resolver.py"
   },

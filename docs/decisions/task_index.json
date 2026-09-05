@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_THEME_GSHEET_SYNC_DEPRECATION",
+      "date": "2026-09-05",
+      "adr_id": "ADR_20260905_THEME_GSHEET_SYNC_DEPRECATION",
+      "domain": "data_collection",
+      "title": "코드_테마_DB 시트 동기화 제거 및 WSL 데이터 통합",
+      "why": "테마/섹터·시장구분 기록이 수동 스프레드시트에서 theme_resolver 자동 분류로 전환되어 코드_테마_DB 워크시트가 폐지됨",
+      "resolution": "sync_sheet_db.py의 sync_theme_only 및 관련 GSheet 역기록 경로 제거, Windows 로컬 사본 데이터(archive/theme/daily_stocks)를 WSL로 무손실 병합 후 단일 운영 환경으로 통합",
+      "impact": "daily 파이프라인 시트 의존성 감소 및 WSL/Windows 이중 실행으로 인한 데이터 분기(split-brain) 해소"
+    },
+    {
       "task_id": "TASK_DAILY_CANDIDATE_PANEL_AUTOMATION",
       "date": "2026-09-05",
       "adr_id": "ADR_20260905_DAILY_CANDIDATE_PANEL_AUTOMATION",
