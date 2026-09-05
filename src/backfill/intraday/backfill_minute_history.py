@@ -67,9 +67,32 @@ def _load_condition_history_sources() -> list[pd.DataFrame]:
     return frames
 
 
-def enumerate_backfill_targets(as_of: str | None = None, lookback_days: int = 365) -> list[tuple[str, str]]:
+def _load_price_history_trading_calendar() -> pd.DatetimeIndex | None:
+    """price_history의 거래일 달력(정렬된 고유 date)을 컬럼-프루닝 로드로 반환한다."""
+    try:
+        dates = pd.read_parquet(settings.PRICE_HISTORY_PARQUET_PATH, columns=["date"])
+    except Exception as exc:
+        logger.warning("[DATA] stage=exit_day_targets status=no_calendar path=%s error=%s", settings.PRICE_HISTORY_PARQUET_PATH, exc)
+        return None
+    if dates is None or dates.empty or "date" not in dates.columns:
+        return None
+    cal = pd.DatetimeIndex(pd.to_datetime(dates["date"], errors="coerce").dropna().dt.normalize().unique())
+    return cal.sort_values()
+
+
+def enumerate_backfill_targets(
+    as_of: str | None = None,
+    lookback_days: int = 365,
+    *,
+    include_exit_day: bool = True,
+    trading_calendar: pd.DatetimeIndex | None = None,
+) -> list[tuple[str, str]]:
     """archive + 레거시 condition_history_cleaned.parquet의 (스냅샷_날짜, 종목코드) distinct 쌍을
-    lookback 이내로 필터링해 날짜 오름차순으로 반환한다."""
+    lookback 이내로 필터링해 날짜 오름차순으로 반환한다.
+
+    include_exit_day가 True이면 각 (스냅샷_날짜, 종목코드)마다 price_history 거래일 달력의
+    다음 거래일 (next_trading_day, code) 쌍을 추가로 방출해 exit-side 경로를 확보한다.
+    """
     as_of_date = as_of or datetime.now().strftime("%Y-%m-%d")
     cutoff = (datetime.strptime(as_of_date, "%Y-%m-%d") - timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
     frames = _load_condition_history_sources()
@@ -82,8 +105,41 @@ def enumerate_backfill_targets(as_of: str | None = None, lookback_days: int = 36
     sub = sub.dropna()
     sub = sub[(sub["스냅샷_날짜"] >= cutoff) & (sub["스냅샷_날짜"] <= as_of_date)]
     sub = sub.drop_duplicates()
-    sub = sub.sort_values(["스냅샷_날짜", "종목코드"], kind="stable")
-    return [(str(d), str(c)) for d, c in sub.itertuples(index=False)]
+    pairs = [(str(d), str(c)) for d, c in sub.itertuples(index=False)]
+
+    if include_exit_day:
+        cal = trading_calendar if trading_calendar is not None else _load_price_history_trading_calendar()
+        resolved = 0
+        skipped = 0
+        exit_pairs: list[tuple[str, str]] = []
+        if cal is not None and len(cal):
+            cal_parsed = pd.DatetimeIndex(pd.to_datetime(cal, errors="coerce"))
+            if cal_parsed.tz is not None:
+                cal_parsed = cal_parsed.tz_convert("Asia/Seoul").tz_localize(None)
+            cal_norm = cal_parsed.normalize()
+            for snap_date, code in pairs:
+                snap_ts = pd.to_datetime(snap_date, errors="coerce")
+                if pd.isna(snap_ts):
+                    skipped += 1
+                    continue
+                # 다음 거래일은 달력에서만 해결한다 -- snapshot_date + 1일이나
+                # 다음 스냅샷 날짜를 추측값으로 쓰지 않는다.
+                later = cal_norm[cal_norm > snap_ts.normalize()]
+                if len(later) == 0:
+                    skipped += 1
+                    continue
+                exit_date = later.min().strftime("%Y-%m-%d")
+                # No cutoff re-check: exit_date > snapshot_date >= cutoff holds
+                # by construction (entries are pre-filtered to [cutoff, as_of]).
+                exit_pairs.append((exit_date, code))
+                resolved += 1
+        else:
+            skipped = len(pairs)
+        logger.info("[DATA] stage=exit_day_targets resolved=%d skipped=%d", resolved, skipped)
+        pairs = sorted(set(pairs) | set(exit_pairs))
+    else:
+        pairs = sorted(set(pairs))
+    return pairs
 
 
 def _already_collected_codes(bar_interval_minutes: int, snapshot_date: str, session: str) -> set[str]:
