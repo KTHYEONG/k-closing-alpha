@@ -7,6 +7,22 @@ import pandas as pd
 import pytest
 
 from src.backfill.intraday import backfill_minute_history
+from src.data.intraday_schema import normalize_bar_frame
+
+
+def _canon_bar(symbol: str, snapshot_date: str) -> pd.DataFrame:
+    raw = pd.DataFrame(
+        {
+            "time": ["093000"],
+            "open": [70000],
+            "high": [70000],
+            "low": [70000],
+            "close": [70000],
+            "jdiff_vol": [1000],
+            "value": [70],
+        }
+    )
+    return normalize_bar_frame(raw, "ls", snapshot_date, symbol)
 
 
 def test_run_minute_history_backfill_processes_dates_oldest_first(
@@ -23,7 +39,8 @@ def test_run_minute_history_backfill_processes_dates_oldest_first(
 
     async def _fake_regular(client, session, stock_codes, snapshot_date, bar_interval_minutes=1):
         call_order.append(snapshot_date)
-        return pd.DataFrame({"종목코드": stock_codes, "스냅샷_날짜": [snapshot_date] * len(stock_codes)})
+        frames = [_canon_bar(code, snapshot_date) for code in stock_codes]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     async def _fake_nxt(client, session, stock_codes, snapshot_date, bar_interval_minutes=1):
         return pd.DataFrame()

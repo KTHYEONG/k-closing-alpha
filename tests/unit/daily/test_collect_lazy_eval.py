@@ -53,8 +53,8 @@ def _base_responses(close: int = 10500, open_: int = 10000, rate: float = 5.0) -
     }
 
 
-def _run_fetch(client: _FakeClient, *, scenario_sets: dict) -> tuple[dict, list[str]]:
-    async def _runner() -> tuple[dict, list[str]]:
+def _run_fetch(client: _FakeClient, *, scenario_sets: dict) -> tuple[dict, list[str], list[dict]]:
+    async def _runner() -> tuple[dict, list[str], list[dict]]:
         stock = {"code": "005930", "name": "테스트", "price": "10500", "chgrate": "5.0"}
         sem = asyncio.Semaphore(1)
         return await fetch_single_stock(
@@ -80,7 +80,7 @@ def test_primary_scenario_skips_moving_average() -> None:
     ma_calc = AsyncMock(return_value=({}, (0.0, False, 0), (0.0, False), (0.0, False)))
 
     with patch("src.api.kis_client.calculate_all_moving_averages", new=ma_calc):
-        row, failed = _run_fetch(client, scenario_sets={"new_high": {"005930"}})
+        row, failed, _ = _run_fetch(client, scenario_sets={"new_high": {"005930"}})
 
     assert row["시나리오"] == "신고가"
     assert failed == []
@@ -93,7 +93,7 @@ def test_upper_limit_scenario_skips_moving_average() -> None:
     ma_calc = AsyncMock(return_value=({}, (0.0, False, 0), (0.0, False), (0.0, False)))
 
     with patch("src.api.kis_client.calculate_all_moving_averages", new=ma_calc):
-        row, _ = _run_fetch(client, scenario_sets={"upper": {"005930"}})
+        row, _, _ = _run_fetch(client, scenario_sets={"upper": {"005930"}})
 
     assert row["시나리오"] == "상따"
     assert ma_calc.await_count == 0
@@ -106,7 +106,7 @@ def test_non_primary_scenario_calls_moving_average() -> None:
     ma_calc = AsyncMock(return_value=({}, (0.0, False, 0), (0.0, False), (10200.0, True)))
 
     with patch("src.api.kis_client.calculate_all_moving_averages", new=ma_calc):
-        row, failed = _run_fetch(client, scenario_sets={})
+        row, failed, _ = _run_fetch(client, scenario_sets={})
 
     assert row["시나리오"] == "120 돌파"
     assert failed == []
@@ -119,7 +119,7 @@ def test_moving_average_exception_falls_back_to_default() -> None:
     ma_calc = AsyncMock(side_effect=RuntimeError("api down"))
 
     with patch("src.api.kis_client.calculate_all_moving_averages", new=ma_calc):
-        row, _ = _run_fetch(client, scenario_sets={})
+        row, _, _ = _run_fetch(client, scenario_sets={})
 
     assert row["시나리오"] == "거래량 폭증"
     assert ma_calc.await_count == 1

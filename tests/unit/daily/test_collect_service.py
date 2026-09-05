@@ -84,7 +84,7 @@ def _fake_client() -> SimpleNamespace:
     )
 
 
-async def _run_fetch_single_stock(client, **scenario_sets) -> tuple[dict, list[str]]:
+async def _run_fetch_single_stock(client, **scenario_sets) -> tuple[dict, list[str], list[dict]]:
     sem = asyncio.Semaphore(2)
     stock = {"code": "005930", "name": "삼성전자", "price": "10000", "chgrate": "1.0"}
     with patch(
@@ -104,7 +104,7 @@ async def _run_fetch_single_stock(client, **scenario_sets) -> tuple[dict, list[s
 
 
 def test_fetch_single_stock_sangdda_scenario() -> None:
-    result, failed = asyncio.run(
+    result, failed, _ = asyncio.run(
         _run_fetch_single_stock(_fake_client(), upper_limit_stock_codes={"005930"})
     )
     assert failed == []
@@ -113,14 +113,14 @@ def test_fetch_single_stock_sangdda_scenario() -> None:
 
 
 def test_fetch_single_stock_default_scenario_volume_surge() -> None:
-    result, failed = asyncio.run(_run_fetch_single_stock(_fake_client()))
+    result, failed, _ = asyncio.run(_run_fetch_single_stock(_fake_client()))
     assert failed == []
     assert result["시나리오"] == "거래량 폭증"
 
 
 def test_fetch_all_stock_data_aggregates_and_reports_failures() -> None:
-    async def _fake_single_stock(*args, **kwargs) -> tuple[dict, list[str]]:
-        return ({"종목명": "AAA", "종목코드": "005930"}, ["체결강도"])
+    async def _fake_single_stock(*args, **kwargs) -> tuple[dict, list[str], list[dict]]:
+        return ({"종목명": "AAA", "종목코드": "005930"}, ["체결강도"], [])
 
     with patch.object(collect, "fetch_single_stock", side_effect=_fake_single_stock):
         results, failed = asyncio.run(

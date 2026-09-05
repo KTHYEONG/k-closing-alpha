@@ -198,7 +198,7 @@ def test_fetch_single_stock_includes_orderbook_snapshot_fields() -> None:
 
     sem = asyncio.Semaphore(1)
     stock = {"code": "005930", "name": "삼성전자", "price": 70000, "chgrate": 0.5}
-    record, _ = asyncio.run(collect.fetch_single_stock(0, stock, 1, sem, client, session=None))
+    record, _, _ = asyncio.run(collect.fetch_single_stock(0, stock, 1, sem, client, session=None))
 
     assert record["krx_매도호가1"] == 70100
     assert record["krx_매수호가1"] == 70000
@@ -243,8 +243,77 @@ def test_fetch_single_stock_flags_krx_orderbook_failure_without_blocking_record(
 
     sem = asyncio.Semaphore(1)
     stock = {"code": "005930", "name": "삼성전자", "price": 70000, "chgrate": 0.5}
-    record, failed = asyncio.run(collect.fetch_single_stock(0, stock, 1, sem, client, session=None))
+    record, failed, _ = asyncio.run(collect.fetch_single_stock(0, stock, 1, sem, client, session=None))
 
     assert "호가" in failed
     assert record["krx_매도호가1"] == 0
     assert record["nxt_매도호가1"] == 69900
+
+def test_fetch_all_stock_data_persists_full_orderbook_without_widening_archive() -> None:
+    from src.processing.schema import ARCHIVE_COLUMN_ORDER
+
+    # Then: 호가 사다리는 별도 파티션으로 가고 평면 아카이브 스키마는 넓어지지 않는다
+    depth_cols = [c for c in ARCHIVE_COLUMN_ORDER if c.startswith("krx_매도호가") or c.startswith("krx_매수호가")]
+    assert depth_cols == ["krx_매도호가1", "krx_매수호가1"]
+    assert "krx_매도호가2" not in ARCHIVE_COLUMN_ORDER
+    assert len([c for c in ARCHIVE_COLUMN_ORDER if "호가" in c or "잔량" in c]) == 8
+
+
+def test_fetch_single_stock_returns_orderbook_rows_triple(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "70000", "stck_oprc": "69000", "stck_hgpr": "70500", "stck_lwpr": "68900", "acml_vol": "1000", "prdy_ctrt": "1.5", "lstn_stcn": "100", "hts_avls": "1000", "acml_tr_pbmn": "100000000", "rprs_mrkt_kor_name": "KOSPI"}})
+    client.get_trade_strength = AsyncMock(return_value={"rt_cd": "0", "output": [{"tday_rltv": "120"}]})
+    client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]})
+    client.get_program_net_buy = AsyncMock(return_value={"rt_cd": "0", "output": [{"whol_smtn_ntby_tr_pbmn": "100"}]})
+    ladder = {f"askp{i}": str(70000 + i * 100) for i in range(1, 11)}
+    ladder.update({"bidp1": "69900", "total_askp_rsqn": "1200", "total_bidp_rsqn": "1500"})
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
+
+    sem = asyncio.Semaphore(1)
+    result = asyncio.run(
+        collect.fetch_single_stock(0, {"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "1.5"}, 1, sem, client, object())
+    )
+
+    assert len(result) == 3
+    row, failed, orderbook_rows = result
+    assert row["krx_매도호가1"] == 70100
+    assert any("askp10" in ob for ob in orderbook_rows)
+    assert {ob["capture_reason"] for ob in orderbook_rows} == {"decision"}
+
+
+def test_fetch_all_stock_data_persists_orderbook_and_survives_persist_failure(monkeypatch) -> None:
+    """호가 스냅샷을 일괄 영속화하고, 영속화 실패는 로깅만 하고 수집 결과에 영향 없다."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(
+        return_value={"rt_cd": "0", "output": {"stck_prpr": "70000", "stck_oprc": "69000", "stck_hgpr": "70500", "stck_lwpr": "68900", "acml_vol": "1000", "prdy_ctrt": "1.5", "lstn_stcn": "100", "hts_avls": "1000", "acml_tr_pbmn": "100000000", "rprs_mrkt_kor_name": "KOSPI"}}
+    )
+    client.get_trade_strength = AsyncMock(return_value={"rt_cd": "0", "output": [{"tday_rltv": "120"}]})
+    client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]})
+    client.get_program_net_buy = AsyncMock(return_value={"rt_cd": "0", "output": [{"whol_smtn_ntby_tr_pbmn": "100"}]})
+    ladder = {f"askp{i}": str(70000 + i * 100) for i in range(1, 11)}
+    ladder.update({"bidp1": "69900", "total_askp_rsqn": "1200", "total_bidp_rsqn": "1500"})
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
+
+    monkeypatch.setattr(collect, "prefetch_ohlcv_for_sma120", AsyncMock(return_value={}))
+
+    def _raise(rows, snapshot_date):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", _raise)
+
+    stock_list = [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "1.5"}]
+    results, failed_info = asyncio.run(collect.fetch_all_stock_data(stock_list, client, object()))
+
+    assert len(results) == 1
+    assert failed_info == []
+
