@@ -21,15 +21,6 @@ from src.data.intraday_store import intraday_partition_path, write_intraday_part
 
 logger = logging.getLogger(__name__)
 
-_TIME_FIELD_CANDIDATES = ("stck_cntg_hour", "cntg_hour", "stck_cntg_hour_tm", "bsop_hour", "hour")
-
-
-def _resolve_time_field(columns) -> str | None:
-    for key in _TIME_FIELD_CANDIDATES:
-        if key in columns:
-            return key
-    return None
-
 
 _LEGACY_CONDITION_HISTORY_PATH_NAME = "condition_history_cleaned.parquet"
 
@@ -100,35 +91,21 @@ def _already_collected_codes(bar_interval_minutes: int, snapshot_date: str, sess
     target = intraday_partition_path(bar_interval_minutes, snapshot_date, session)
     if not target.exists():
         return set()
-    try:
-        existing = pd.read_parquet(target, columns=["종목코드"])
-    except Exception as e:
-        logger.warning("Failed to read existing partition for skip-check %s: %s", target, e)
-        return set()
-    if existing.empty or "종목코드" not in existing.columns:
-        return set()
-    return set(existing["종목코드"].astype(str).str.zfill(6))
+    for col in ("symbol", "종목코드"):
+        try:
+            existing = pd.read_parquet(target, columns=[col])
+        except Exception as e:
+            logger.warning("Failed to read existing partition for skip-check %s: %s", target, e)
+            return set()
+        if not existing.empty and col in existing.columns:
+            return set(existing[col].astype(str).str.zfill(6))
+    return set()
 
 
 def _merge_and_write_partition(df: pd.DataFrame, bar_interval_minutes: int, snapshot_date: str, session: str) -> int:
-    """기존 파티션 파일과 신규 df를 (종목코드, 시각 필드) 기준 병합 저장. 빈 df는 0 반환 no-op."""
+    """신규 df를 날짜 파티션에 키 기준 병합 저장한다. 빈 df는 0 반환 no-op."""
     if df is None or df.empty:
         return 0
-    target = intraday_partition_path(bar_interval_minutes, snapshot_date, session)
-    if target.exists():
-        try:
-            existing = pd.read_parquet(target)
-        except Exception as e:
-            logger.warning("Failed to read existing partition %s: %s", target, e)
-            existing = pd.DataFrame()
-        if existing is not None and not existing.empty:
-            merged = pd.concat([existing, df], ignore_index=True)
-            time_field = _resolve_time_field(merged.columns) or _resolve_time_field(df.columns)
-            if "종목코드" in merged.columns and time_field and time_field in merged.columns:
-                merged = merged.drop_duplicates(subset=["종목코드", time_field], keep="last")
-            else:
-                merged = merged.drop_duplicates(keep="last")
-            return write_intraday_partition(merged, bar_interval_minutes, snapshot_date, session)
     return write_intraday_partition(df, bar_interval_minutes, snapshot_date, session)
 
 

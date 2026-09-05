@@ -7,10 +7,13 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sqlite3
 import sys
 import time
+
+logger = logging.getLogger(__name__)
 
 # Windows 터미널 한글 인코딩 에러 방지 (이모지 및 UTF-8 강제 출력)
 try:
