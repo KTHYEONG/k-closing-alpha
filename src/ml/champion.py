@@ -2,6 +2,7 @@
 """Champion bundle orchestration."""
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 from typing import Any
@@ -31,6 +32,7 @@ from src.ml.exit_policy import (  # noqa: F401 (attach/simulate re-exported; res
     summarize_exit_grid,
 )
 from src.ml.buyability import evaluate_buyability_sleeves, summarize_buyability_sleeves
+from src.execution.cost_model import estimate_round_trip_cost_bp, summarize_cost_breakdown, breakeven_cost_bp
 from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO, _CLOSE_MORNING_RERANKER_CONFIG, add_close_morning_decision_score
 from src.utils.display import Colors
 
@@ -232,6 +234,14 @@ def train_tuned_champion_bundle(
         predict_proba=True,
     )
     candidate_oof["rank_score"] = candidate_oof["pred"]
+    cost_provenance: dict[str, Any] = {"status": "skipped", "reason": "close_price not available on candidate_oof"}
+    if "close_price" in candidate_oof.columns:
+        try:
+            _costed = estimate_round_trip_cost_bp(candidate_oof, price_col="close_price")
+            _bd = summarize_cost_breakdown(_costed)
+            cost_provenance = {"status": "evaluated", **dataclasses.asdict(_bd), "breakeven_cost_bp": breakeven_cost_bp(candidate_oof["net_return"].to_numpy(dtype=float), candidate_oof["trade_date"].to_numpy())}
+        except ValueError as exc:
+            cost_provenance = {"status": "skipped", "reason": str(exc)}
     buyability_provenance: dict[str, Any] = {"status": "skipped", "reason": "buyability_target_notional_100m not configured"}
     if config.buyability_target_notional_100m is not None:
         try:
@@ -395,6 +405,7 @@ def train_tuned_champion_bundle(
         "selection_top_n": config.feature_selection_top_n,
         "exit_policy_grid": exit_policy_provenance,
         "buyability_sleeves": buyability_provenance,
+        "execution_cost": cost_provenance,
     }
 
     # Only write artifact if promoted or gate disabled
