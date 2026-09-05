@@ -26,7 +26,6 @@ class GSheetSettings(BaseSettings):
     GSPREAD_SA_JSON: str = Field(default="")
     GOOGLE_SHEET_NAME: str = "Stock"
     TRADE_WORKSHEETS: list[str] = ["Trade", "Trade2"]
-    THEME_WORKSHEET_NAME: str = "코드_테마_DB"
 
     # Google Sheets 컬럼명 설정
     GOTTEN_COLS: dict[str, str] = {

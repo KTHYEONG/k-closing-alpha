@@ -246,7 +246,7 @@ def resolve_stock_theme_and_market(
 
 
 def batch_resolve_missing_themes(
-    stocks: list[dict[str, Any]], sync_gsheet: bool = False
+    stocks: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Batch resolve missing themes and persist atomically to local Parquet and SQLite DB."""
     resolved: list[dict[str, Any]] = []
@@ -315,17 +315,5 @@ def batch_resolve_missing_themes(
             conn.close()
     except Exception as e:
         logger.warning("Failed to update theme DB: %s", e)
-
-    # Optional GSheet sync (only if explicitly enabled)
-    if sync_gsheet:
-        try:
-            from src.data.gsheet_loader import append_stocks_to_gsheet
-
-            key_path = str(settings.GOOGLE_KEY_PATH)
-            sheet_name = settings.GOOGLE_SHEET_NAME
-            ws_name = settings.THEME_WORKSHEET_NAME
-            append_stocks_to_gsheet(key_path, sheet_name, ws_name, resolved)
-        except Exception as e:
-            logger.warning("Failed to sync gsheet: %s", e)
 
     return resolved

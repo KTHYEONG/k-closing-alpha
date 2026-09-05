@@ -259,7 +259,7 @@ def main():
         logger.info(
             f"{Colors.CYAN}신규 또는 미분류 종목 {len(missing_list)}건 발견! 자동 분류 및 로컬 캐시를 갱신합니다...{Colors.RESET}"
         )
-        batch_resolve_missing_themes(missing_list, sync_gsheet=False)
+        batch_resolve_missing_themes(missing_list)
         # 동기화 후 다시 로드
         theme_map = load_theme_from_db()
 
