@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
 from src.backfill.price.config import DEFAULT_CONFIG, FetchConfig
+from src.data.candidate_panel import load_candidate_universe_symbols
+
+logger = logging.getLogger(__name__)
 
 
 def load_or_build_snapshot(*args, **kwargs) -> pd.DataFrame:
@@ -39,6 +44,13 @@ def load_or_build_snapshot(*args, **kwargs) -> pd.DataFrame:
 
 def _load_candidate_universe() -> pd.DataFrame:
     raw = load_or_build_snapshot(config=DEFAULT_CONFIG, rebuild=False, sync_gsheet=False)
+    try:
+        extra = load_candidate_universe_symbols()
+    except Exception as exc:
+        logger.warning("[DATA] stage=candidate_universe status=fallback_to_trade_log error=%s", exc)
+        extra = pd.DataFrame(columns=["symbol", "market"])
+    if extra is not None and not extra.empty:
+        raw = pd.concat([raw, extra], ignore_index=True, sort=False)
     required = ["symbol", "market"]
     for col in required:
         if col not in raw.columns:
