@@ -197,6 +197,10 @@ uv run python -m src.daily.predict
 # src.daily.archive_intraday
 uv run python -m src.daily.archive_intraday
 
+# 동시호가 윈도우(15:20-15:30) 한정 실행: 전 종목 호가 스냅샷 폴러 (read-only, 주문 없음)
+# src.daily.collect_auction
+uv run python -m src.daily.collect_auction --date <YYYY-MM-DD> --interval 10 --start 1520 --end 1530
+
 # 1회성 소급 백필: condition_history 워치리스트 대상 일별분봉(FHKST03010230) 백필
 # src.backfill.intraday.backfill_minute_history
 uv run python -m src.backfill.intraday.backfill_minute_history

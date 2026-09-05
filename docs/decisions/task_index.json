@@ -1,6 +1,47 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_INTRADAY_STORAGE_OPTIMIZATION",
+      "date": "2026-09-05",
+      "adr_id": "ADR_20260905_INTRADAY_STORAGE_OPTIMIZATION",
+      "domain": "data_collection",
+      "title": "Parquet 저장 코덱/dtype 단일화 및 기존 코퍼스 마이그레이션",
+      "why": "price_history/altdata/intraday 전량 snappy+float64로 과다 저장, altdata 커버리지 조회가 전체 패널을 불필요하게 전량 읽음",
+      "resolution": "parquet_codec.py로 zstd+다운캐스트 정책 일원화, 3종 마이그레이션 스크립트 작성(백업/검증/dry-run), _covered_dates 컬럼 프루닝",
+      "impact": "price_history 233→154MB, altdata 28~40% 절감, 틱/분봉 최대 4.8배 압축, 커버리지 조회 I/O 약 3800배 절감"
+    },
+    {
+      "task_id": "TASK_INTRADAY_CAPTURE_INTEGRITY",
+      "date": "2026-09-05",
+      "adr_id": "ADR_20260905_INTRADAY_CAPTURE_INTEGRITY",
+      "domain": "data_collection",
+      "title": "Intraday 캡처 계층 KIS/LS 벤더 정합성 및 손실 방지",
+      "why": "KIS/LS acml_tr_pbmn 단위·의미 충돌, LS 틱 캡 무통보 절단, 파티션 덮어쓰기로 인한 조용한 원본 데이터 손실/오염",
+      "resolution": "intraday_schema.py 정규 스키마 도입, 병합-안전 쓰기로 전환, 틱 truncated 플래그 노출, 호가 원본(orderbook_store) 및 동시호가 폴러(collect_auction) 신설, T-1 워치리스트 확장",
+      "impact": "벤더 간 단위 충돌 제거, 무통보 데이터 손실 종료, 동시호가·호가심도 등 기존에 버려지던 원본 데이터 보존",
+      "archive_path": "docs/decisions/archive/TASK_INTRADAY_CAPTURE_INTEGRITY/intraday_storage_optimization_contract.json"
+    },
+    {
+      "task_id": "TASK_LS_INTRADAY_COLLECTOR_ROUTING",
+      "date": "2026-09-04",
+      "adr_id": "ADR_20260904_LS_INTRADAY_COLLECTOR_ROUTING",
+      "domain": "intraday",
+      "title": "LS증권 OpenAPI 기반 정규장 1분봉(t8412) 및 틱(t8411) 고속 수집기 연동 및 KIS 자동 fallback 구축",
+      "why": "KIS 체결 틱 API의 1회 30건 제한으로 인해 워치리스트 23개 종목 전체 틱 수집 시 약 25분 이상 지연되던 구조적 한계를 극복하고, HTS 조건식 및 NXT 대체거래소는 KIS로 유지하면서 대용량 분봉/틱 데이터를 1~2분 만에 전수 수집할 수 있는 고속 수집 인프라 구축 필요.",
+      "resolution": "1) src/api/ls/client.py에 LsApiClient 신설(OAuth2 토큰 발급, t8412 1회 500건 분봉 수신, t8411 cts_date/cts_time 기반 500건 단위 연속조회), 2) collector.py에서 ls_client 인자 지원 및 LS 우선 라우팅 후 KIS 자동 fallback 처리, 3) archive_intraday.py에서 LS 키 존재 시 LsApiClient 인스턴스화 연동, 4) 단위/통합 테스트 신설 및 전체 검증 통과.",
+      "impact": "23개 종목 기준 정규장 전체 1분봉 및 틱 데이터 수집 시간을 25분에서 1~2분대로 95% 이상 단축. KIS API 장애 시 무중단 자동 fallback 보장. 린트/타입/전체 테스트 PASS."
+    },
+    {
+      "task_id": "TASK_INTRADAY_TICK_COLLECTOR_PAGINATION_AND_EFFICIENCY",
+      "date": "2026-09-04",
+      "adr_id": "ADR_20260904_INTRADAY_TICK_COLLECTOR_PAGINATION_AND_EFFICIENCY",
+      "domain": "intraday",
+      "title": "인트라데이 틱 수집 커서 고착 버그 수정 및 파이프라인 수집 효율 최적화",
+      "why": "KIS 틱 체결 API(FHPST01060000)가 동일 시각(HHMMSS) 30건 체결 집중 시 중복 필터링으로 new_rows가 비어 조기 종료되는 버그와, 하드코딩된 120회 상한으로 인해 오전장 체결(09:00~14:20) 및 15:30 종가 단일가 체결이 전량 유실되던 문제 해결 필요. 또한 1분봉과 틱 수집이 18 TPS 토큰을 경합하던 비효율 개선 필요.",
+      "resolution": "1) KisApiClient.get_intraday_trade_ticks에 1초 감산(_decrement_hour_one_second) fallback 도입으로 커서 고착 탈출, 2) max_pages=2000 확장으로 09:00 개장 틱까지 전수 수집, 3) 초기 cursor_hour를 빈 문자열('')로 전달하여 15:30:00 마감 단일가 체결 포함, 4) archive_intraday.py 파이프라인을 1분봉(Fast-lane) 저장 후 틱(Slow-lane) 수집으로 2단계 분리하여 TPS 토큰 버킷 경합 해소 및 장애 격리, 5) collector.py에서 단일 딕셔너리 리스트 취합 후 1회 pd.DataFrame 생성으로 메모리/CPU 부하 절감.",
+      "impact": "2026-09-04 정규장 틱 데이터 누락 문제 및 향후 당일 틱 아카이브 안정성 완전 확보. 린트/타입/전체 테스트 PASS."
+    },
+    {
       "task_id": "TASK_ARCHIVE_SNAPSHOT_DEDUP_ON_RERUN",
       "date": "2026-09-04",
       "adr_id": "ADR_20260904_ARCHIVE_SNAPSHOT_DEDUP_ON_RERUN",
