@@ -11,6 +11,22 @@ from src.backfill.intraday import backfill_minute_history
 from src.backfill.intraday.collector import backfill_regular_bars
 from src.daily import archive
 from src.data import intraday_store
+from src.data.intraday_schema import normalize_bar_frame
+
+
+def _canon_bar(symbol: str, snapshot_date: str = "2026-08-15", close: int = 70000) -> pd.DataFrame:
+    raw = pd.DataFrame(
+        {
+            "time": ["093000"],
+            "open": [close],
+            "high": [close],
+            "low": [close],
+            "close": [close],
+            "jdiff_vol": [1000],
+            "value": [70],
+        }
+    )
+    return normalize_bar_frame(raw, "ls", snapshot_date, symbol)
 
 
 def test_enumerate_backfill_targets_filters_lookback_and_sorts_oldest_first(
@@ -63,7 +79,10 @@ def test_backfill_regular_bars_uses_historical_chart_with_market_div_j() -> None
     async def _fake_chart(session, code, target_date, bar_interval_minutes=1, end_hour=None, floor_hour=None, market_div_code=None):
         assert market_div_code == "J"
         assert target_date == "20260815"
-        return {"rt_cd": "0", "output2": [{"stck_cntg_hour": "093000", "stck_prpr": "70000"}]}
+        return {"rt_cd": "0", "output2": [{
+            "stck_cntg_hour": "093000", "stck_oprc": "70000", "stck_hgpr": "70000",
+            "stck_lwpr": "70000", "stck_prpr": "70000", "cntg_vol": "1000", "acml_tr_pbmn": "70000000",
+        }]}
 
     client.get_historical_minute_chart = _fake_chart
 
@@ -72,8 +91,8 @@ def test_backfill_regular_bars_uses_historical_chart_with_market_div_j() -> None
     )
 
     assert len(result) == 1
-    assert result.iloc[0]["종목코드"] == "005930"
-    assert result.iloc[0]["스냅샷_날짜"] == "2026-08-15"
+    assert result.iloc[0]["symbol"] == "005930"
+    assert result.iloc[0]["snapshot_date"] == "2026-08-15"
 
 
 def test_merge_and_write_partition_preserves_existing_codes_on_rerun(
@@ -83,15 +102,15 @@ def test_merge_and_write_partition_preserves_existing_codes_on_rerun(
     monkeypatch.setattr(backfill_minute_history, "intraday_partition_path", intraday_store.intraday_partition_path)
     monkeypatch.setattr(backfill_minute_history, "write_intraday_partition", intraday_store.write_intraday_partition)
 
-    first = pd.DataFrame({"종목코드": ["005930"], "stck_cntg_hour": ["093000"], "스냅샷_날짜": ["2026-08-15"]})
+    first = _canon_bar("005930")
     backfill_minute_history._merge_and_write_partition(first, 1, "2026-08-15", "regular")
 
-    second = pd.DataFrame({"종목코드": ["000660"], "stck_cntg_hour": ["093000"], "스냅샷_날짜": ["2026-08-15"]})
+    second = _canon_bar("000660")
     backfill_minute_history._merge_and_write_partition(second, 1, "2026-08-15", "regular")
 
     stored = pd.read_parquet(intraday_store.intraday_partition_path(1, "2026-08-15", "regular"))
 
-    assert set(stored["종목코드"]) == {"005930", "000660"}
+    assert set(stored["symbol"]) == {"005930", "000660"}
 
 
 def test_enumerate_backfill_targets_merges_trade_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -121,10 +140,40 @@ def test_already_collected_codes_reflects_existing_partition(
 
     assert backfill_minute_history._already_collected_codes(1, "2026-08-15", "regular") == set()
 
-    df = pd.DataFrame({"종목코드": ["005930", "000660"], "stck_cntg_hour": ["093000", "093000"], "스냅샷_날짜": ["2026-08-15"] * 2})
+    df = pd.concat([_canon_bar("005930"), _canon_bar("000660")], ignore_index=True)
     backfill_minute_history._merge_and_write_partition(df, 1, "2026-08-15", "regular")
 
     assert backfill_minute_history._already_collected_codes(1, "2026-08-15", "regular") == {"005930", "000660"}
+
+
+def test_already_collected_codes_returns_empty_on_missing_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """symbol/종목코드 둘 다 없는 파일은 컬럼 조회 예외로 빈 집합을 반환한다 (line 97-99)."""
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    monkeypatch.setattr(backfill_minute_history, "intraday_partition_path", intraday_store.intraday_partition_path)
+
+    target = intraday_store.intraday_partition_path(1, "2026-08-16", "regular")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"foo": [1, 2]}).to_parquet(target, index=False)
+
+    assert backfill_minute_history._already_collected_codes(1, "2026-08-16", "regular") == set()
+
+
+def test_already_collected_codes_returns_empty_when_columns_present_but_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """symbol/종목코드 컬럼은 존재하나 0행인 파일은 루프를 모두 소진하고 빈 집합을 반환한다 (line 102)."""
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    monkeypatch.setattr(backfill_minute_history, "intraday_partition_path", intraday_store.intraday_partition_path)
+
+    target = intraday_store.intraday_partition_path(1, "2026-08-17", "regular")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"symbol": pd.Series(dtype="object"), "종목코드": pd.Series(dtype="object")}).to_parquet(
+        target, index=False
+    )
+
+    assert backfill_minute_history._already_collected_codes(1, "2026-08-17", "regular") == set()
 
 
 def test_run_minute_history_backfill_skips_already_collected_codes(
@@ -138,14 +187,15 @@ def test_run_minute_history_backfill_skips_already_collected_codes(
     )
 
     # 005930은 정규세션에 이미 저장돼 있다고 가정 -- 이번 호출에서 재조회되면 안 된다.
-    pre_existing = pd.DataFrame({"종목코드": ["005930"], "stck_cntg_hour": ["093000"], "스냅샷_날짜": ["2026-08-15"]})
+    pre_existing = _canon_bar("005930")
     backfill_minute_history.write_intraday_partition(pre_existing, 1, "2026-08-15", "regular")
 
     requested_codes: list[list[str]] = []
 
     async def _fake_regular(client, session, stock_codes, snapshot_date, bar_interval_minutes=1):
         requested_codes.append(list(stock_codes))
-        return pd.DataFrame({"종목코드": stock_codes, "스냅샷_날짜": [snapshot_date] * len(stock_codes)})
+        frames = [_canon_bar(code, snapshot_date) for code in stock_codes]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     async def _fake_nxt(client, session, stock_codes, snapshot_date, bar_interval_minutes=1):
         return pd.DataFrame()
