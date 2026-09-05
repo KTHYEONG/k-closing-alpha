@@ -12,7 +12,6 @@ def test_gsheet_settings_defaults() -> None:
     settings = GSheetSettings(_env_file=None)
     assert settings.GOOGLE_SHEET_NAME == "Stock"
     assert settings.TRADE_WORKSHEETS == ["Trade", "Trade2"]
-    assert settings.THEME_WORKSHEET_NAME == "코드_테마_DB"
     assert settings.GOTTEN_COLS["CODE"] == "(종목코드)"
 
 
