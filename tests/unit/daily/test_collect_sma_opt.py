@@ -115,7 +115,7 @@ def test_phase_a_excludes_primary_matched_codes() -> None:
     stock_list = [_stock(c) for c in ("000001", "000002", "000003", "000004", "000005")]
     client = _FakeClient()
     prefetch_mock = AsyncMock(return_value={})
-    single_mock = AsyncMock(return_value=({}, []))
+    single_mock = AsyncMock(return_value=({}, [], []))
 
     with (
         patch("src.daily.collect.prefetch_ohlcv_for_sma120", new=prefetch_mock),
@@ -141,7 +141,7 @@ def test_phase_a_all_primary_skips_prefetch() -> None:
     stock_list = [_stock(c) for c in ("000001", "000002")]
     client = _FakeClient()
     prefetch_mock = AsyncMock(return_value={})
-    single_mock = AsyncMock(return_value=({}, []))
+    single_mock = AsyncMock(return_value=({}, [], []))
 
     with (
         patch("src.daily.collect.prefetch_ohlcv_for_sma120", new=prefetch_mock),
@@ -163,7 +163,7 @@ def test_cache_miss_falls_back_to_api() -> None:
     ma_calc = AsyncMock(return_value=({}, (0.0, False, 0), (0.0, False), (10200.0, True)))
 
     with patch("src.api.kis_client.calculate_all_moving_averages", new=ma_calc):
-        row, failed = _run_fetch(client, scenario_sets={}, ohlcv_cache={})
+        row, failed, _ = _run_fetch(client, scenario_sets={}, ohlcv_cache={})
 
     assert row["시나리오"] == "120 돌파"
     assert failed == []
@@ -178,7 +178,7 @@ def test_cache_hit_passes_prefetched_records() -> None:
     ma_calc = AsyncMock(return_value=({}, (0.0, False, 150), (0.0, False), (10200.0, True)))
 
     with patch("src.api.kis_client.calculate_all_moving_averages", new=ma_calc):
-        row, failed = _run_fetch(client, scenario_sets={}, ohlcv_cache={"005930": records})
+        row, failed, _ = _run_fetch(client, scenario_sets={}, ohlcv_cache={"005930": records})
 
     assert row["시나리오"] == "120 돌파"
     assert failed == []
