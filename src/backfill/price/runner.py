@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from src.backfill.price.config import FetchConfig, _effective_kis_sleep_sec
+from src.backfill.price.config import default_backfill_end_date
 from src.backfill.price.factors import _merge_index_returns
 from src.backfill.price.normalize import (
     _find_col,
@@ -170,7 +171,7 @@ def run_backfill(
         kis_max_parallel_calls=max(1, int(kis_max_parallel_calls)),
         pykrx_requests_per_sec=max(0.1, float(pykrx_requests_per_sec)),
         fixed_start_date=pd.Timestamp(start_date) if start_date is not None else pd.Timestamp("2016-01-01"),
-        fixed_end_date=pd.Timestamp(end_date) if end_date is not None else pd.Timestamp("2025-12-31"),
+        fixed_end_date=pd.Timestamp(end_date) if end_date is not None else default_backfill_end_date(),
         include_flows=bool(include_flows),
         force_full_history=start_date is not None,
     )
