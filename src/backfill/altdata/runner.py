@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +14,7 @@ import pandas as pd
 from src.backfill.altdata import credit_balance, derivatives, fundamental, investor_detail, program_trade_daily, shorting
 from src.backfill.altdata.config import _ALTDATA_PANELS, AltDataFetchConfig
 from src.backfill.altdata.normalize import normalize_panel
+from src.data.parquet_codec import write_altdata_panel_parquet
 
 # Re-export collectors for test monkeypatching
 collect_shorting = shorting.collect_shorting
@@ -39,7 +39,7 @@ def _covered_dates(panel_path: Path) -> set[pd.Timestamp]:
     if not panel_path.exists():
         return set()
     try:
-        df = pd.read_parquet(panel_path)
+        df = pd.read_parquet(panel_path, columns=["date"])
     except Exception:
         return set()
     if df is None or df.empty or "date" not in df.columns:
@@ -86,20 +86,13 @@ def _incremental_merge(existing_path: Path, new_df: pd.DataFrame, key_cols: tupl
 
 
 def _atomic_write_parquet(df: pd.DataFrame, path: Path) -> None:
-    """DataFrame을 원자적으로 parquet로 저장합니다.
+    """DataFrame을 원자적으로 parquet로 저장합니다 (공유 코덱 위임).
 
     Args:
         df: 저장할 DataFrame.
         path: 대상 경로.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".parquet.tmp")
-    # Ensure suffix handling: with_suffix replaces last suffix; for .parquet -> .tmp
-    # But we want path.parquet.tmp ; use with_suffix('.parquet.tmp') logic: instead construct
-    # Use path + ".tmp" style
-    tmp = Path(str(path) + ".tmp")
-    df.to_parquet(tmp, index=False)
-    os.replace(tmp, path)
+    write_altdata_panel_parquet(df, path)
 
 
 def _write_manifest(out_dir: Path, entries: dict[str, dict[str, Any]]) -> None:

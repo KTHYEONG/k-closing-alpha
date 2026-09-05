@@ -27,6 +27,7 @@ from src.backfill.price.universe import (
     _build_symbol_windows,
     _load_candidate_universe,
 )
+from src.data.parquet_codec import write_price_history_parquet
 
 logger = logging.getLogger(__name__)
 
@@ -115,9 +116,9 @@ def _to_parquet(df: pd.DataFrame, parquet_path: Path) -> None:
         merged = merged.sort_values(["symbol", "date"]).drop_duplicates(
             subset=["symbol", "date"], keep="last"
         )
-        merged.to_parquet(parquet_path, index=False)
+        write_price_history_parquet(merged, parquet_path)
     else:
-        df.to_parquet(parquet_path, index=False)
+        write_price_history_parquet(df, parquet_path)
 
 
 def _load_existing_symbol_last_dates(parquet_path: Path) -> dict[str, pd.Timestamp]:
