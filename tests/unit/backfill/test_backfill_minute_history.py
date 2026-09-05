@@ -214,3 +214,125 @@ def test_run_minute_history_backfill_skips_already_collected_codes(
         backfill_minute_history.run_minute_history_backfill()
 
     assert requested_codes == [["000660"]]
+
+def test_enumerate_backfill_targets_adds_next_trading_day_from_calendar(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.intraday import backfill_minute_history as mod
+
+    # Arrange: Friday 2026-03-06 -> Monday 2026-03-09; 2026-03-09 is the calendar end.
+    frames = [pd.DataFrame({"스냅샷_날짜": ["2026-03-06", "2026-03-09"], "종목코드": ["005930", "000660"]})]
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    calendar = pd.DatetimeIndex(pd.to_datetime(["2026-03-05", "2026-03-06", "2026-03-09"]))
+
+    # Act
+    targets = mod.enumerate_backfill_targets(
+        as_of="2026-03-10", lookback_days=365, include_exit_day=True, trading_calendar=calendar
+    )
+
+    # Assert
+    assert ("2026-03-06", "005930") in targets
+    assert ("2026-03-09", "005930") in targets
+    assert ("2026-03-09", "000660") in targets
+    assert all(code != "000660" or date <= "2026-03-09" for date, code in targets)
+    assert len(targets) == len(set(targets))
+    assert targets == sorted(targets)
+
+    without = mod.enumerate_backfill_targets(
+        as_of="2026-03-10", lookback_days=365, include_exit_day=False, trading_calendar=calendar
+    )
+    assert ("2026-03-09", "005930") not in without
+
+def test_enumerate_backfill_targets_resolves_exit_day_from_price_history_file(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.intraday import backfill_minute_history as mod
+
+    # Arrange: calendar lives in the price-history parquet, not injected.
+    frames = [pd.DataFrame({"스냅샷_날짜": ["2026-03-06"], "종목코드": ["005930"]})]
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    cal_path = tmp_path / "price_history.parquet"
+    pd.DataFrame({"date": pd.to_datetime(["2026-03-05", "2026-03-06", "2026-03-09"])}).to_parquet(cal_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", cal_path)
+
+    # Act
+    targets = mod.enumerate_backfill_targets(as_of="2026-03-10", lookback_days=365)
+
+    # Assert
+    assert ("2026-03-06", "005930") in targets
+    assert ("2026-03-09", "005930") in targets
+
+
+def test_enumerate_backfill_targets_skips_exit_when_calendar_missing(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.intraday import backfill_minute_history as mod
+
+    # Arrange: no calendar file and no injected calendar.
+    frames = [pd.DataFrame({"스냅샷_날짜": ["2026-03-06"], "종목코드": ["005930"]})]
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "missing.parquet")
+
+    # Act
+    targets = mod.enumerate_backfill_targets(as_of="2026-03-10", lookback_days=365)
+
+    # Assert: entry target survives, exit target is skipped and counted, never guessed.
+    assert targets == [("2026-03-06", "005930")]
+
+
+def test_enumerate_backfill_targets_supports_tz_aware_calendar(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.intraday import backfill_minute_history as mod
+
+    # Arrange
+    frames = [pd.DataFrame({"스냅샷_날짜": ["2026-03-06"], "종목코드": ["005930"]})]
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    calendar = pd.DatetimeIndex(pd.to_datetime(["2026-03-06", "2026-03-09"]).tz_localize("Asia/Seoul"))
+
+    # Act
+    targets = mod.enumerate_backfill_targets(
+        as_of="2026-03-10", lookback_days=365, trading_calendar=calendar
+    )
+
+    # Assert
+    assert ("2026-03-09", "005930") in targets
+
+
+def test_enumerate_backfill_targets_skips_unparseable_snapshot_date(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.intraday import backfill_minute_history as mod
+
+    # Arrange: "2026-13-40" passes the string window filter but has no calendar successor.
+    frames = [pd.DataFrame({"스냅샷_날짜": ["2026-13-40", "2026-03-06"], "종목코드": ["005930", "000660"]})]
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    calendar = pd.DatetimeIndex(pd.to_datetime(["2026-03-05", "2026-03-06", "2026-03-09"]))
+
+    # Act
+    targets = mod.enumerate_backfill_targets(
+        as_of="2027-01-01", lookback_days=365, trading_calendar=calendar
+    )
+
+    # Assert: the entry survives but no exit date is guessed from it.
+    assert ("2026-03-09", "000660") in targets
+    assert ("2026-13-40", "005930") in targets
+    assert [t for t in targets if t[1] == "005930"] == [("2026-13-40", "005930")]
+
+def test_enumerate_backfill_targets_treats_calendar_without_date_column_as_missing(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.intraday import backfill_minute_history as mod
+
+    # Arrange: calendar parquet exists but holds no dates.
+    frames = [pd.DataFrame({"스냅샷_날짜": ["2026-03-06"], "종목코드": ["005930"]})]
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    cal_path = tmp_path / "price_history.parquet"
+    pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]")}).to_parquet(cal_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", cal_path)
+
+    # Act
+    targets = mod.enumerate_backfill_targets(as_of="2026-03-10", lookback_days=365)
+
+    # Assert
+    assert targets == [("2026-03-06", "005930")]
