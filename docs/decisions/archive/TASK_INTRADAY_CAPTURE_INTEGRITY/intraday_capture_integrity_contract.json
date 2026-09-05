@@ -1,0 +1,447 @@
+{
+  "feature": "intraday_capture_integrity",
+  "domain": "data_collection",
+  "objective": "Stop ongoing, non-recoverable intraday data loss and corruption at the point of capture: unify KIS/LS vendor semantics into one canonical schema, make silent tick truncation explicit, replace destructive partition overwrite with merge, extend the archive target set to the T-1 watchlist (exit-path measurement), and persist the full 10-level orderbook ladder + closing-auction expected-fill series that the pipeline currently fetches and discards.",
+  "target_file": "src/data/intraday_schema.py",
+  "context_files": [
+    "src/data/intraday_store.py",
+    "src/data/io_utils.py",
+    "src/api/ls/client.py",
+    "src/api/kis/client.py",
+    "src/backfill/intraday/collector.py",
+    "src/daily/archive_intraday.py",
+    "src/daily/archive.py",
+    "src/daily/collect.py",
+    "src/config/market_session.py",
+    "src/config/base.py",
+    "tests/unit/data/test_intraday_store.py",
+    "tests/unit/api/ls/test_ls_client.py",
+    "tests/unit/backfill/test_collector.py",
+    "tests/unit/daily/test_collect.py",
+    "docs/architecture/data_collection.md"
+  ],
+
+  "evidence": {
+    "A_unit_collision": "data/history/intraday/1m/regular/2026-09/2026-09-03.parquet (KIS) acml_tr_pbmn=738988315 is CUMULATIVE KRW; 2026-09-04.parquet (LS) acml_tr_pbmn is per-bar and in MILLIONS of KRW -- measured close*volume/value median = 1,001,385. src/api/ls/client.py::_normalize_bar line 27 maps LS 'value' onto the KIS name 'acml_tr_pbmn'. Same collision for acml_vol (LS maps per-bar jdiff_vol onto the cumulative KIS name).",
+    "B_schema_drift": "485 partition files: 484 carry 10 columns (stck_bsop_date,...), 1 carries 22 columns (date,time,open,... plus KIS aliases). read_intraday_range concatenates them into a ragged frame.",
+    "C_tick_truncation": "src/api/ls/client.py::get_tick_chart max_pages=100 x qrycnt=500 = 50,000 tick hard cap, paged newest-to-oldest. On 2026-09-04, 7 of 23 symbols hit the cap and lost their morning session: 032940 starts at 13:35:44, 108490 at 10:49:52, 336260 at 10:05:06, 030530 at 11:48:40, 014950 at 12:17:25. Non-backfillable TR, so the loss is permanent and currently silent.",
+    "D_gapfill_inversion": "LS t8412 emits a continuous 381-bar series, filling no-trade minutes with volume=0 and a carried price (009900 09:01-09:02 close=7770 vol=0 while the first real print is 09:03 @9100). KIS FHKST03010200 omits no-trade minutes entirely. Opposite gap-fill semantics under one column set.",
+    "E_overwrite_asymmetry": "src/daily/archive_intraday.py calls write_intraday_partition (full overwrite) while src/backfill/intraday/backfill_minute_history.py::_merge_and_write_partition merges. Re-running the evening archive after a backfill silently deletes backfilled symbols.",
+    "G_ls_lock": "src/api/ls/client.py::_post_tr holds self._lock across the HTTP round-trip and resp.json(), so Semaphore(10) in the collector is fully negated; effective throughput is 1/(1.05 + RTT) instead of 1/1.05.",
+    "I_orderbook_discarded": "src/daily/collect.py::_parse_orderbook keeps only askp1/bidp1/total_askp_rsqn/total_bidp_rsqn from the FHKST01010200 (inquire-asking-price-exp-ccn) response that is ALREADY being fetched twice per symbol per day. The full depth ladder and the expected-fill block in the same payload are dropped at zero API cost.",
+    "I_auction_hole": "Every KIS-era 1m partition is structurally missing bars 152000-152900 (no continuous trades during the closing auction). The strategy decides at ~15:18 and its fill prints in that auction, so the single most decision-relevant 10 minutes has no data at all.",
+    "J_exit_path": "src/ml/exit_policy.py::attach_next_day_path consumes only daily OHLC (nd_open/nd_high/nd_low/nd_close). archive_intraday collects bars for date T scoped to T's watchlist only, so the T+1 morning path of positions actually held is never captured and take-profit fill probability cannot be measured."
+  },
+
+  "assumptions_and_invariants": [
+    "Raw-layer fidelity: this contract normalizes NAMES, UNITS and DTYPES only. No column is dropped because it looks derivable, and no value is rounded. Vendor-specific extra fields are carried as nullable canonical columns, never silently discarded.",
+    "The orderbook/auction store persists the vendor payload key-for-key. Field names inside the KIS FHKST01010200 output1 block are NOT enumerated in this contract because they have not been empirically probed on this account; the implementation must copy whatever keys the response carries. Do not invent field names.",
+    "value_krw is always per-bar (incremental) and always in KRW. KIS cumulative acml_tr_pbmn is converted by a per-symbol, time-ordered first difference; LS per-bar value is multiplied by 1_000_000.",
+    "has_trade = (volume > 0). It exists to make LS synthetic zero-volume bars distinguishable from KIS trade-only bars, so downstream code can choose either gap-fill convention without re-deriving it.",
+    "Tick truncation is surfaced, not fixed. Full REST tick capture is not achievable inside the batch window (727,290 ticks for 23 symbols = 1,455 pages x 1.05s pacing ~= 25 minutes). Raising the cap alone would blow the window, so the cap becomes configurable and cap-hits are recorded per symbol as truncated=True plus a warning, ending the silent loss.",
+    "Partition writes become merge-by-key everywhere (union of existing and new, keep=last). A write is never allowed to reduce a partition's symbol coverage.",
+    "The closing-auction poller is a standalone, read-only CLI. It places no orders and does not touch collect.py/predict.py control flow, so it can be started or skipped on any given day without affecting execution.",
+    "Previous trading day is resolved from data (max archive snapshot date strictly less than snapshot_date), never from a calendar offset, so market holidays cannot produce an empty T-1 set."
+  ],
+
+  "out_of_scope": [
+    "Migration of the 485 existing partition files into the canonical schema (follow-up spec: intraday_corpus_migration).",
+    "zstd re-compression and dtype downcasting of price_history.parquet / altdata panels (follow-up spec).",
+    "src/backfill/altdata/runner.py::_covered_dates column pruning (follow-up spec).",
+    "Switching tick routing preference from LS back to KIS. The canonical tick schema reserves nullable trade_strength/ask1/bid1 columns so that decision can be made later without another schema change.",
+    "VI trigger log and KRX 시간외단일가 capture."
+  ],
+
+  "changes": [
+    {
+      "name": "LS_VALUE_UNIT_KRW",
+      "kind": "module_constant",
+      "target_file": "src/data/intraday_schema.py",
+      "signature": "LS_VALUE_UNIT_KRW: int = 1_000_000"
+    },
+    {
+      "name": "CANONICAL_BAR_COLUMNS",
+      "kind": "module_constant",
+      "target_file": "src/data/intraday_schema.py",
+      "signature": "CANONICAL_BAR_COLUMNS: tuple[str, ...] = (\"snapshot_date\", \"symbol\", \"ts_hms\", \"open\", \"high\", \"low\", \"close\", \"volume\", \"value_krw\", \"has_trade\", \"vendor\")"
+    },
+    {
+      "name": "CANONICAL_TICK_COLUMNS",
+      "kind": "module_constant",
+      "target_file": "src/data/intraday_schema.py",
+      "signature": "CANONICAL_TICK_COLUMNS: tuple[str, ...] = (\"snapshot_date\", \"symbol\", \"ts_hms\", \"price\", \"volume\", \"trade_strength\", \"ask1\", \"bid1\", \"truncated\", \"vendor\")"
+    },
+    {
+      "name": "normalize_bar_frame",
+      "kind": "function",
+      "target_file": "src/data/intraday_schema.py",
+      "signature": "def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbol: str) -> pd.DataFrame"
+    },
+    {
+      "name": "normalize_tick_frame",
+      "kind": "function",
+      "target_file": "src/data/intraday_schema.py",
+      "signature": "def normalize_tick_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbol: str, truncated: bool = False) -> pd.DataFrame"
+    },
+    {
+      "name": "assert_canonical_bars",
+      "kind": "function",
+      "target_file": "src/data/intraday_schema.py",
+      "signature": "def assert_canonical_bars(df: pd.DataFrame) -> None"
+    },
+    {
+      "name": "assert_canonical_ticks",
+      "kind": "function",
+      "target_file": "src/data/intraday_schema.py",
+      "signature": "def assert_canonical_ticks(df: pd.DataFrame) -> None"
+    },
+    {
+      "name": "_post_tr",
+      "kind": "function",
+      "target_file": "src/api/ls/client.py",
+      "signature": "async def _post_tr(self, session, tr_cd: str, tr_key: str, body: dict, tr_cont: str = \"N\", tr_cont_key: str = \"\", max_retries: int = 3) -> tuple[dict, dict]"
+    },
+    {
+      "name": "get_tick_chart",
+      "kind": "function",
+      "target_file": "src/api/ls/client.py",
+      "signature": "async def get_tick_chart(self, session, code: str, target_date: str, max_pages: int | None = None) -> dict"
+    },
+    {
+      "name": "get_minute_chart",
+      "kind": "function",
+      "target_file": "src/api/ls/client.py",
+      "signature": "async def get_minute_chart(self, session, code: str, target_date: str) -> dict"
+    },
+    {
+      "name": "merge_partition_frame",
+      "kind": "function",
+      "target_file": "src/data/intraday_store.py",
+      "signature": "def merge_partition_frame(new_df: pd.DataFrame, target: Path, key_cols: tuple[str, ...]) -> pd.DataFrame"
+    },
+    {
+      "name": "write_intraday_partition",
+      "kind": "function",
+      "target_file": "src/data/intraday_store.py",
+      "signature": "def write_intraday_partition(df: pd.DataFrame, bar_interval_minutes: int, snapshot_date: str, session: str) -> int"
+    },
+    {
+      "name": "write_tick_partition",
+      "kind": "function",
+      "target_file": "src/data/intraday_store.py",
+      "signature": "def write_tick_partition(df: pd.DataFrame, snapshot_date: str, session: str = \"regular\") -> int"
+    },
+    {
+      "name": "orderbook_partition_path",
+      "kind": "function",
+      "target_file": "src/data/orderbook_store.py",
+      "signature": "def orderbook_partition_path(snapshot_date: str) -> Path"
+    },
+    {
+      "name": "append_orderbook_snapshots",
+      "kind": "function",
+      "target_file": "src/data/orderbook_store.py",
+      "signature": "def append_orderbook_snapshots(rows: list[dict], snapshot_date: str) -> int"
+    },
+    {
+      "name": "build_orderbook_rows",
+      "kind": "function",
+      "target_file": "src/data/orderbook_store.py",
+      "signature": "def build_orderbook_rows(res: dict, symbol: str, venue: str, capture_reason: str, capture_ts: datetime) -> list[dict]"
+    },
+    {
+      "name": "resolve_previous_archive_date",
+      "kind": "function",
+      "target_file": "src/daily/archive_intraday.py",
+      "signature": "def resolve_previous_archive_date(snapshot_date: str) -> str | None"
+    },
+    {
+      "name": "_archive_target_codes",
+      "kind": "function",
+      "target_file": "src/daily/archive_intraday.py",
+      "signature": "def _archive_target_codes(snapshot_date: str) -> list[str]"
+    },
+    {
+      "name": "run_auction_capture",
+      "kind": "function",
+      "target_file": "src/daily/collect_auction.py",
+      "signature": "def run_auction_capture(snapshot_date: str | None = None, interval_seconds: int = 10, start_hm: str = \"1520\", end_hm: str = \"1530\", client=None, now_fn=None) -> int"
+    },
+    {
+      "name": "main",
+      "kind": "function",
+      "target_file": "src/daily/collect_auction.py",
+      "signature": "def main() -> None"
+    }
+  ],
+
+  "requirements": [
+    {
+      "id": "R1",
+      "area": "src/data/intraday_schema.py",
+      "rule": "normalize_bar_frame is fail-closed on vendor. vendor not in {'kis','ls'} raises ValueError. A missing required source column raises ValueError -- never partially fill and never silently return an empty frame.",
+      "detail": "KIS source keys: stck_cntg_hour->ts_hms, stck_oprc->open, stck_hgpr->high, stck_lwpr->low, stck_prpr->close, cntg_vol->volume, acml_tr_pbmn->(cumulative KRW). LS source keys: time->ts_hms, open/high/low/close as-is, jdiff_vol->volume, value->(per-bar, millions KRW). An empty input frame returns an empty frame carrying exactly CANONICAL_BAR_COLUMNS with the canonical dtypes (this is a no-op, not an error)."
+    },
+    {
+      "id": "R2",
+      "area": "src/data/intraday_schema.py",
+      "rule": "value_krw is ALWAYS per-bar and in KRW. For vendor='kis', sort the frame by ts_hms ascending and take the first difference of the cumulative acml_tr_pbmn, with the first bar keeping the raw cumulative value. For vendor='ls', value_krw = value * LS_VALUE_UNIT_KRW.",
+      "detail": "A negative difference (duplicate or out-of-order source rows) is clamped to 0 and logged once per symbol via logger.warning with the [DATA] tag. This is the single defect that makes the KIS-era and LS-era corpora numerically incomparable, so it must be covered by an explicit test."
+    },
+    {
+      "id": "R3",
+      "area": "src/data/intraday_schema.py",
+      "rule": "has_trade = volume > 0, computed after numeric coercion. LS synthetic no-trade bars (volume==0 with a carried price) therefore land as has_trade=False while every KIS bar lands as has_trade=True.",
+      "detail": "The bar row is retained either way -- do NOT drop zero-volume rows. Dropping them would destroy the LS continuous-series property, which is itself information."
+    },
+    {
+      "id": "R4",
+      "area": "src/data/intraday_schema.py",
+      "rule": "Canonical dtypes are exact and enforced: snapshot_date=str(YYYY-MM-DD), symbol=str zero-filled to 6, ts_hms=int32 (HHMMSS as an integer), open/high/low/close=int32 (KRW is integral), volume=int64, value_krw=int64, has_trade=bool, vendor=str. Tick: price=int32, volume=int64, trade_strength=float32 nullable, ask1/bid1=Int32 nullable, truncated=bool, vendor=str.",
+      "detail": "Column ORDER must equal CANONICAL_BAR_COLUMNS / CANONICAL_TICK_COLUMNS exactly. trade_strength/ask1/bid1 come from the KIS tick TR (tday_rltv/askp/bidp) when present and are left null for LS -- they are reserved so a future routing switch needs no schema change."
+    },
+    {
+      "id": "R5",
+      "area": "src/data/intraday_schema.py",
+      "rule": "assert_canonical_bars / assert_canonical_ticks raise ValueError naming the offending columns when the column set or order does not match the canonical tuple. They are no-ops for an empty frame that still carries the canonical columns.",
+      "detail": "These are the fail-closed gate used by intraday_store writes."
+    },
+    {
+      "id": "R6",
+      "area": "src/api/ls/client.py",
+      "rule": "Delete _normalize_bar entirely. get_minute_chart and get_tick_chart return vendor-native LS rows untouched, and the response dict gains a top-level \"vendor\": \"ls\" key. Vendor mapping happens exactly once, in the collector, via normalize_*_frame.",
+      "detail": "This is what removes the acml_tr_pbmn / acml_vol name collisions at the source. No LS field may be written under a KIS field name anywhere."
+    },
+    {
+      "id": "R7",
+      "area": "src/api/ls/client.py",
+      "rule": "_post_tr must hold self._lock ONLY for the pacing computation and the _last_call_time stamp. The session.post call, the response context manager, and resp.json() must all execute outside the lock.",
+      "detail": "Pacing semantics are unchanged (>= self._min_interval between request starts); only the serialization of the network round-trip is removed. The LS per-TR rate limit is ~1 req/s, so _min_interval stays 1.05 -- do not lower it."
+    },
+    {
+      "id": "R8",
+      "area": "src/api/ls/client.py",
+      "rule": "get_tick_chart takes max_pages: int | None = None, resolving to settings.LS_TICK_MAX_PAGES (new setting, default 100) when None. When the loop exits because the page budget was exhausted rather than because 09:00 was reached, the response must carry \"truncated\": True and log a logger.warning with the [DATA] tag naming the symbol, the page count, and the earliest time actually captured.",
+      "detail": "Fail-loud, not fail-silent: an untruncated result carries \"truncated\": False. The cap is deliberately NOT raised by default -- 100 pages already costs ~105s/symbol at 1.05s pacing, and the operator now has both the knob and the visibility to make that trade-off. Never return a partially-captured series without the flag."
+    },
+    {
+      "id": "R9",
+      "area": "src/backfill/intraday/collector.py",
+      "rule": "Every _fetch_one path (LS bars, KIS bars, LS ticks, KIS ticks, historical backfill bars) must return an ALREADY-CANONICAL frame produced by normalize_bar_frame / normalize_tick_frame with the vendor that actually served the row. Only then may the per-symbol frames be concatenated.",
+      "detail": "Because routing falls back per symbol, a mixed-vendor day is normal; normalizing before concat is what keeps the day's partition homogeneous. Drop the '종목코드'/'스냅샷_날짜' raw-tagging lines -- symbol/snapshot_date are now set by the normalizer. The truncated flag from get_tick_chart is threaded into normalize_tick_frame."
+    },
+    {
+      "id": "R10",
+      "area": "src/data/intraday_store.py",
+      "rule": "write_intraday_partition and write_tick_partition must (a) call the matching assert_canonical_* gate, (b) merge with any existing partition via merge_partition_frame instead of overwriting, and (c) return the row count of the MERGED frame.",
+      "detail": "merge_partition_frame concatenates existing+new, drops duplicates on key_cols keeping the last (new wins), and sorts by key_cols. Bar keys = ('symbol','ts_hms'); tick keys = ('symbol','ts_hms','volume'). It must also assert that the merged symbol set is a superset of the existing symbol set and raise ValueError otherwise -- a write may never reduce partition coverage. A missing or unreadable existing partition degrades to 'new only' with a warning, never to an exception."
+    },
+    {
+      "id": "R11",
+      "area": "src/data/orderbook_store.py",
+      "rule": "build_orderbook_rows copies the vendor payload key-for-key. It reads res['output1'] (dict) and emits ONE row containing capture_ts, symbol, venue, capture_reason plus every key of output1 verbatim. Values are coerced with pd.to_numeric(errors='coerce') only when the raw string is fully numeric; otherwise the original string is kept.",
+      "detail": "Do NOT enumerate, rename, or whitelist KIS field names -- the whole point is capturing the full depth ladder and expected-fill block whose exact keys have not been probed on this account. res with rt_cd != '0' or a non-dict output1 yields an empty list (fail-closed, no exception). capture_reason is one of 'decision' or 'auction'."
+    },
+    {
+      "id": "R12",
+      "area": "src/data/orderbook_store.py",
+      "rule": "append_orderbook_snapshots writes data/history/orderbook/{YYYY-MM}/{YYYY-MM-DD}.parquet, merging with any existing partition on ('capture_ts','symbol','venue') keep=last, and returns the merged row count. An empty rows list is a 0-return no-op.",
+      "detail": "Column union across appends is expected and allowed at this raw layer (a later sweep may carry keys an earlier one did not); reindex to the sorted union and leave gaps null. capture_ts is a tz-aware Asia/Seoul timestamp."
+    },
+    {
+      "id": "R13",
+      "area": "src/daily/collect.py",
+      "rule": "fetch_single_stock returns a 3-tuple (row_dict, failed_apis, orderbook_rows). The existing four flattened columns (krx_매도호가1/krx_매수호가1/krx_매도잔량/krx_매수잔량 and the NXT pair) stay exactly as they are for archive/GSheet backward compatibility; orderbook_rows additionally carries the FULL raw output1 for both venues via build_orderbook_rows.",
+      "detail": "ARCHIVE_COLUMN_ORDER and STANDARD_COLUMN_ORDER must NOT be widened -- the depth ladder goes to the orderbook partition, not into the flat archive row that syncs to GSheet. fetch_all_stock_data collects the per-symbol lists and calls append_orderbook_snapshots ONCE with capture_reason='decision'. A store write failure is logged and swallowed: orderbook capture must never break the live decision path."
+    },
+    {
+      "id": "R14",
+      "area": "src/daily/archive_intraday.py",
+      "rule": "resolve_previous_archive_date returns the greatest archive snapshot date strictly less than snapshot_date, or None when there is none. _archive_target_codes returns the deduplicated union of the watchlists for snapshot_date and that previous date.",
+      "detail": "Derive the previous session from the archive's own date index, never from a calendar offset -- holidays and weekends must not yield an empty T-1 set. Rationale: positions opened on T-1 are exited on T's morning, so T's bar partition must cover them or take-profit fill probability stays unmeasurable (exit_policy currently sees only daily OHLC). An archive read failure degrades to today-only with a warning, never to an exception."
+    },
+    {
+      "id": "R15",
+      "area": "src/daily/collect_auction.py",
+      "rule": "run_auction_capture polls get_orderbook_snapshot(market_div_code='J') for every watchlist symbol once per interval_seconds while start_hm <= now < end_hm, appending each sweep with capture_reason='auction'. It returns the total number of rows appended.",
+      "detail": "now_fn (default datetime.now) and client are injectable so the loop is testable without wall-clock sleeps or network. An empty watchlist returns 0 without entering the loop. A failed sweep is logged and the loop continues -- partial auction coverage beats none, because this window is structurally absent from every minute-bar partition (no continuous trades during 동시호가) and is not backfillable by any TR. main() is a CLI accepting --date/--interval/--start/--end; it must not be wired into collect.py or predict.py."
+    },
+    {
+      "id": "R16",
+      "area": "src/config/base.py",
+      "rule": "Add LS_TICK_MAX_PAGES: int = 100 and ORDERBOOK_DIR (computed_field returning HISTORY_DIR / 'orderbook') following the existing pydantic-settings/computed_field conventions in the file, and re-export both through src/config/__init__.py alongside HISTORY_DIR.",
+      "detail": "No other setting changes."
+    },
+    {
+      "id": "R17",
+      "area": "tests",
+      "rule": "tests/unit/data/test_intraday_store.py currently writes non-canonical frames ({'종목코드','stck_prpr'}) and WILL fail against the R10 gate. Rewrite those three tests to build canonical frames; do not weaken or remove the gate to keep them green.",
+      "detail": "Same for any collector/archive_intraday test asserting the old raw column names or the 2-tuple return of fetch_single_stock."
+    }
+  ],
+
+  "wiring": [
+    {
+      "caller_file": "src/backfill/intraday/collector.py",
+      "anchor": "async def _fetch_one",
+      "import_symbol": "normalize_bar_frame",
+      "invocation_expression": "normalize_bar_frame(pd.DataFrame(rows), vendor, snapshot_date, code)"
+    },
+    {
+      "caller_file": "src/backfill/intraday/collector.py",
+      "anchor": "async def collect_intraday_trade_ticks",
+      "import_symbol": "normalize_tick_frame",
+      "invocation_expression": "normalize_tick_frame(pd.DataFrame(rows), vendor, snapshot_date, code, truncated=truncated)"
+    },
+    {
+      "caller_file": "src/data/intraday_store.py",
+      "anchor": "def write_intraday_partition",
+      "import_symbol": "assert_canonical_bars",
+      "invocation_expression": "assert_canonical_bars(df)"
+    },
+    {
+      "caller_file": "src/data/intraday_store.py",
+      "anchor": "def write_tick_partition",
+      "import_symbol": "assert_canonical_ticks",
+      "invocation_expression": "assert_canonical_ticks(df)"
+    },
+    {
+      "caller_file": "src/daily/archive_intraday.py",
+      "anchor": "def run_intraday_archive",
+      "import_symbol": "_archive_target_codes",
+      "invocation_expression": "_archive_target_codes(snap_date)"
+    },
+    {
+      "caller_file": "src/daily/collect.py",
+      "anchor": "async def fetch_all_stock_data",
+      "import_symbol": "append_orderbook_snapshots",
+      "invocation_expression": "append_orderbook_snapshots(orderbook_rows, snapshot_date)"
+    }
+  ],
+
+  "cli_entrypoints": [
+    {
+      "module": "src.daily.collect_auction",
+      "command": "uv run python -m src.daily.collect_auction --date <YYYY-MM-DD> --interval 10 --start 1520 --end 1530",
+      "self_wiring": "main() parses argparse args and calls run_auction_capture(snapshot_date=args.date, interval_seconds=args.interval, start_hm=args.start, end_hm=args.end); this is the ONLY caller by design (R15) -- it must not be chained into collect.py or predict.py.",
+      "readme_anchor": "README.md Quick Start section, next to the existing `uv run python -m src.daily.archive_intraday` line"
+    }
+  ],
+
+  "scenarios": [
+    {
+      "scenario_id": "test_normalize_bar_frame_ls_value_is_scaled_to_krw_per_bar",
+      "target_test_file": "tests/unit/data/test_intraday_schema.py",
+      "execution_command": "uv run pytest tests/unit/data/test_intraday_schema.py -k test_normalize_bar_frame_ls_value_is_scaled_to_krw_per_bar -q",
+      "expected_behavior": "LS 'value' (millions of KRW, per bar) becomes value_krw in whole KRW; measured LS row close=9100 vol=55226 value=498 must yield 498_000_000, matching close*volume within 1%.",
+      "test_skeleton": "def test_normalize_bar_frame_ls_value_is_scaled_to_krw_per_bar() -> None:\n    import pandas as pd\n\n    from src.data.intraday_schema import normalize_bar_frame\n\n    # Given: 실측 LS t8412 응답 행 (2026-09-04, 009900)\n    raw = pd.DataFrame(\n        {\n            \"time\": [\"090300\", \"090400\"],\n            \"open\": [9100, 9210],\n            \"high\": [9100, 9210],\n            \"low\": [9100, 9210],\n            \"close\": [9100, 9210],\n            \"jdiff_vol\": [55226, 108719],\n            \"value\": [498, 998],\n        }\n    )\n\n    # When\n    out = normalize_bar_frame(raw, \"ls\", \"2026-09-04\", \"009900\")\n\n    # Then\n    assert out[\"value_krw\"].tolist() == [498_000_000, 998_000_000]\n    notional = out[\"close\"].iloc[0] * out[\"volume\"].iloc[0]\n    assert abs(out[\"value_krw\"].iloc[0] - notional) / notional < 0.01\n    assert out[\"symbol\"].tolist() == [\"009900\", \"009900\"]\n    assert out[\"snapshot_date\"].tolist() == [\"2026-09-04\", \"2026-09-04\"]\n"
+    },
+    {
+      "scenario_id": "test_normalize_bar_frame_kis_cumulative_value_becomes_per_bar_diff",
+      "target_test_file": "tests/unit/data/test_intraday_schema.py",
+      "execution_command": "uv run pytest tests/unit/data/test_intraday_schema.py -k test_normalize_bar_frame_kis_cumulative_value_becomes_per_bar_diff -q",
+      "expected_behavior": "KIS cumulative acml_tr_pbmn is first-differenced per symbol in time order; the first bar keeps the raw cumulative value.",
+      "test_skeleton": "def test_normalize_bar_frame_kis_cumulative_value_becomes_per_bar_diff() -> None:\n    import pandas as pd\n\n    from src.data.intraday_schema import normalize_bar_frame\n\n    # Given: 실측 KIS FHKST03010200 응답 행 (2026-09-03, 004710)\n    raw = pd.DataFrame(\n        {\n            \"stck_cntg_hour\": [\"090100\", \"090000\", \"090300\"],\n            \"stck_oprc\": [\"8400\", \"8100\", \"8450\"],\n            \"stck_hgpr\": [\"8420\", \"8130\", \"8500\"],\n            \"stck_lwpr\": [\"8390\", \"8090\", \"8440\"],\n            \"stck_prpr\": [\"8410\", \"8120\", \"8480\"],\n            \"cntg_vol\": [\"89523\", \"90667\", \"135971\"],\n            \"acml_tr_pbmn\": [\"1481173175\", \"738988315\", \"2629666630\"],\n        }\n    )\n\n    # When\n    out = normalize_bar_frame(raw, \"kis\", \"2026-09-03\", \"004710\")\n\n    # Then: 시각 오름차순 정렬 후 1차 차분, 첫 봉은 누적값 그대로\n    assert out[\"ts_hms\"].tolist() == [90000, 90100, 90300]\n    assert out[\"value_krw\"].tolist() == [\n        738_988_315,\n        1_481_173_175 - 738_988_315,\n        2_629_666_630 - 1_481_173_175,\n    ]\n    assert out[\"vendor\"].tolist() == [\"kis\", \"kis\", \"kis\"]\n"
+    },
+    {
+      "scenario_id": "test_normalize_bar_frame_flags_ls_synthetic_zero_volume_bar",
+      "target_test_file": "tests/unit/data/test_intraday_schema.py",
+      "execution_command": "uv run pytest tests/unit/data/test_intraday_schema.py -k test_normalize_bar_frame_flags_ls_synthetic_zero_volume_bar -q",
+      "expected_behavior": "LS gap-fill bars (volume==0 with a carried price) are retained but marked has_trade=False, so downstream can distinguish them from KIS trade-only bars.",
+      "test_skeleton": "def test_normalize_bar_frame_flags_ls_synthetic_zero_volume_bar() -> None:\n    import pandas as pd\n\n    from src.data.intraday_schema import normalize_bar_frame\n\n    # Given: 실측 009900 09:01-09:03 -- 09:01/09:02는 무거래 합성봉(직전가 carry)\n    raw = pd.DataFrame(\n        {\n            \"time\": [\"090100\", \"090200\", \"090300\"],\n            \"open\": [7770, 7770, 9100],\n            \"high\": [7770, 7770, 9100],\n            \"low\": [7770, 7770, 9100],\n            \"close\": [7770, 7770, 9100],\n            \"jdiff_vol\": [0, 0, 55226],\n            \"value\": [6, 0, 498],\n        }\n    )\n\n    # When\n    out = normalize_bar_frame(raw, \"ls\", \"2026-09-04\", \"009900\")\n\n    # Then: 행은 보존하되 합성봉임을 플래그로 구분한다\n    assert len(out) == 3\n    assert out[\"has_trade\"].tolist() == [False, False, True]\n    assert out[\"has_trade\"].dtype == bool\n"
+    },
+    {
+      "scenario_id": "test_normalize_bar_frame_rejects_unknown_vendor",
+      "target_test_file": "tests/unit/data/test_intraday_schema.py",
+      "execution_command": "uv run pytest tests/unit/data/test_intraday_schema.py -k test_normalize_bar_frame_rejects_unknown_vendor -q",
+      "expected_behavior": "An unknown vendor or a missing required source column raises ValueError instead of producing a partially filled frame.",
+      "test_skeleton": "def test_normalize_bar_frame_rejects_unknown_vendor() -> None:\n    import pandas as pd\n    import pytest\n\n    from src.data.intraday_schema import normalize_bar_frame\n\n    raw = pd.DataFrame({\"time\": [\"090100\"], \"open\": [1], \"high\": [1], \"low\": [1], \"close\": [1], \"jdiff_vol\": [1], \"value\": [1]})\n\n    with pytest.raises(ValueError):\n        normalize_bar_frame(raw, \"kiwoom\", \"2026-09-04\", \"005930\")\n\n    incomplete = pd.DataFrame({\"time\": [\"090100\"], \"open\": [1]})\n    with pytest.raises(ValueError):\n        normalize_bar_frame(incomplete, \"ls\", \"2026-09-04\", \"005930\")\n"
+    },
+    {
+      "scenario_id": "test_normalize_tick_frame_carries_truncated_flag_and_optional_kis_fields",
+      "target_test_file": "tests/unit/data/test_intraday_schema.py",
+      "execution_command": "uv run pytest tests/unit/data/test_intraday_schema.py -k test_normalize_tick_frame_carries_truncated_flag_and_optional_kis_fields -q",
+      "expected_behavior": "LS ticks normalize to price/volume with null trade_strength/ask1/bid1; KIS ticks fill those from tday_rltv/askp/bidp. The truncated flag propagates onto every row.",
+      "test_skeleton": "def test_normalize_tick_frame_carries_truncated_flag_and_optional_kis_fields() -> None:\n    import pandas as pd\n\n    from src.data.intraday_schema import CANONICAL_TICK_COLUMNS, normalize_tick_frame\n\n    ls_raw = pd.DataFrame({\"time\": [\"090247\", \"090248\"], \"close\": [8990, 9000], \"jdiff_vol\": [30301, 45]})\n    ls_out = normalize_tick_frame(ls_raw, \"ls\", \"2026-09-04\", \"009900\", truncated=True)\n\n    assert list(ls_out.columns) == list(CANONICAL_TICK_COLUMNS)\n    assert ls_out[\"price\"].tolist() == [8990, 9000]\n    assert ls_out[\"truncated\"].all()\n    assert ls_out[\"trade_strength\"].isna().all()\n\n    kis_raw = pd.DataFrame(\n        {\"stck_cntg_hour\": [\"090247\"], \"stck_prpr\": [\"8990\"], \"cnqn\": [\"30301\"], \"tday_rltv\": [\"120.5\"], \"askp\": [\"9000\"], \"bidp\": [\"8990\"]}\n    )\n    kis_out = normalize_tick_frame(kis_raw, \"kis\", \"2026-09-04\", \"009900\")\n\n    assert kis_out[\"truncated\"].tolist() == [False]\n    assert float(kis_out[\"trade_strength\"].iloc[0]) == 120.5\n    assert int(kis_out[\"ask1\"].iloc[0]) == 9000\n    assert int(kis_out[\"bid1\"].iloc[0]) == 8990\n"
+    },
+    {
+      "scenario_id": "test_ls_get_tick_chart_marks_truncated_when_page_budget_exhausted",
+      "target_test_file": "tests/unit/api/ls/test_ls_client.py",
+      "execution_command": "uv run pytest tests/unit/api/ls/test_ls_client.py -k test_ls_get_tick_chart_marks_truncated_when_page_budget_exhausted -q",
+      "expected_behavior": "Hitting the page cap before reaching 09:00 returns truncated=True instead of a silently short series; reaching 09:00 returns truncated=False.",
+      "test_skeleton": "def test_ls_get_tick_chart_marks_truncated_when_page_budget_exhausted() -> None:\n    import asyncio\n\n    from src.api.ls.client import LsApiClient\n\n    client = LsApiClient(app_key=\"k\", app_secret=\"s\")\n    client.token = \"t\"\n    client._min_interval = 0.0\n\n    calls = {\"n\": 0}\n\n    async def fake_post_tr(session, tr_cd, tr_key, body, tr_cont=\"N\", tr_cont_key=\"\", max_retries=3):\n        calls[\"n\"] += 1\n        # 항상 09:00 이전에 도달하지 못하는 응답 -- 페이지 예산 소진을 강제한다\n        rows = [{\"date\": \"20260904\", \"time\": \"143000\", \"close\": 100, \"jdiff_vol\": 1}]\n        return ({\"rsp_cd\": \"00000\", \"t8411OutBlock1\": rows, \"t8411OutBlock\": {\"cts_date\": \"20260904\", \"cts_time\": \"142959\"}}, {\"tr_cont\": \"Y\", \"tr_cont_key\": \"x\"})\n\n    client._post_tr = fake_post_tr\n\n    res = asyncio.run(client.get_tick_chart(object(), \"005930\", \"2026-09-04\", max_pages=3))\n\n    assert res[\"rt_cd\"] == \"0\"\n    assert res[\"truncated\"] is True\n    assert calls[\"n\"] == 3\n    assert res[\"vendor\"] == \"ls\"\n"
+    },
+    {
+      "scenario_id": "test_ls_post_tr_releases_lock_before_network_roundtrip",
+      "target_test_file": "tests/unit/api/ls/test_ls_client.py",
+      "execution_command": "uv run pytest tests/unit/api/ls/test_ls_client.py -k test_ls_post_tr_releases_lock_before_network_roundtrip -q",
+      "expected_behavior": "Two concurrent _post_tr calls overlap in flight (the lock does not serialize the HTTP round-trip) while still honouring the >= _min_interval pacing between request starts.",
+      "test_skeleton": "def test_ls_post_tr_releases_lock_before_network_roundtrip() -> None:\n    import asyncio\n\n    from src.api.ls.client import LsApiClient\n\n    client = LsApiClient(app_key=\"k\", app_secret=\"s\")\n    client.token = \"t\"\n    client._min_interval = 0.01\n\n    state = {\"in_flight\": 0, \"max_in_flight\": 0}\n\n    class _Resp:\n        headers: dict = {}\n\n        async def json(self):\n            return {\"rsp_cd\": \"00000\"}\n\n        async def __aenter__(self):\n            state[\"in_flight\"] += 1\n            state[\"max_in_flight\"] = max(state[\"max_in_flight\"], state[\"in_flight\"])\n            await asyncio.sleep(0.05)\n            return self\n\n        async def __aexit__(self, *a):\n            state[\"in_flight\"] -= 1\n            return False\n\n    class _Session:\n        def post(self, *a, **kw):\n            return _Resp()\n\n    async def _run():\n        session = _Session()\n        return await asyncio.gather(\n            client._post_tr(session, \"t8412\", \"005930\", {}),\n            client._post_tr(session, \"t8412\", \"000660\", {}),\n        )\n\n    asyncio.run(_run())\n\n    assert state[\"max_in_flight\"] == 2\n"
+    },
+    {
+      "scenario_id": "test_ls_client_returns_vendor_native_rows_without_kis_aliases",
+      "target_test_file": "tests/unit/api/ls/test_ls_client.py",
+      "execution_command": "uv run pytest tests/unit/api/ls/test_ls_client.py -k test_ls_client_returns_vendor_native_rows_without_kis_aliases -q",
+      "expected_behavior": "get_minute_chart no longer injects KIS field names; the acml_tr_pbmn / acml_vol collisions cannot be reintroduced.",
+      "test_skeleton": "def test_ls_client_returns_vendor_native_rows_without_kis_aliases() -> None:\n    import asyncio\n\n    from src.api.ls.client import LsApiClient\n\n    client = LsApiClient(app_key=\"k\", app_secret=\"s\")\n    client.token = \"t\"\n    client._min_interval = 0.0\n\n    async def fake_post_tr(session, tr_cd, tr_key, body, tr_cont=\"N\", tr_cont_key=\"\", max_retries=3):\n        rows = [{\"date\": \"20260904\", \"time\": \"090300\", \"open\": 9100, \"high\": 9100, \"low\": 9100, \"close\": 9100, \"jdiff_vol\": 55226, \"value\": 498}]\n        return ({\"rsp_cd\": \"00000\", \"t8412OutBlock1\": rows}, {})\n\n    client._post_tr = fake_post_tr\n\n    res = asyncio.run(client.get_minute_chart(object(), \"009900\", \"2026-09-04\"))\n\n    assert res[\"rt_cd\"] == \"0\"\n    assert res[\"vendor\"] == \"ls\"\n    row = res[\"output2\"][0]\n    for kis_alias in (\"acml_tr_pbmn\", \"acml_vol\", \"stck_prpr\", \"stck_oprc\", \"stck_hgpr\", \"stck_lwpr\", \"cntg_vol\", \"cnqn\", \"stck_cntg_hour\"):\n        assert kis_alias not in row\n    assert row[\"value\"] == 498\n"
+    },
+    {
+      "scenario_id": "test_write_intraday_partition_merges_instead_of_overwriting",
+      "target_test_file": "tests/unit/data/test_intraday_store.py",
+      "execution_command": "uv run pytest tests/unit/data/test_intraday_store.py -k test_write_intraday_partition_merges_instead_of_overwriting -q",
+      "expected_behavior": "A second write for a different symbol on the same date preserves the first symbol; a re-run can never shrink a partition's symbol coverage.",
+      "test_skeleton": "def test_write_intraday_partition_merges_instead_of_overwriting(tmp_path, monkeypatch) -> None:\n    import pandas as pd\n\n    from src.data import intraday_store\n    from src.data.intraday_schema import normalize_bar_frame\n\n    monkeypatch.setattr(intraday_store.settings, \"HISTORY_DIR\", tmp_path)\n\n    raw = pd.DataFrame({\"time\": [\"090300\"], \"open\": [9100], \"high\": [9100], \"low\": [9100], \"close\": [9100], \"jdiff_vol\": [55226], \"value\": [498]})\n    first = normalize_bar_frame(raw, \"ls\", \"2026-09-04\", \"009900\")\n    second = normalize_bar_frame(raw, \"ls\", \"2026-09-04\", \"005930\")\n\n    intraday_store.write_intraday_partition(first, 1, \"2026-09-04\", \"regular\")\n    merged_rows = intraday_store.write_intraday_partition(second, 1, \"2026-09-04\", \"regular\")\n\n    assert merged_rows == 2\n    stored = pd.read_parquet(intraday_store.intraday_partition_path(1, \"2026-09-04\", \"regular\"))\n    assert set(stored[\"symbol\"]) == {\"009900\", \"005930\"}\n"
+    },
+    {
+      "scenario_id": "test_write_intraday_partition_rejects_non_canonical_frame",
+      "target_test_file": "tests/unit/data/test_intraday_store.py",
+      "execution_command": "uv run pytest tests/unit/data/test_intraday_store.py -k test_write_intraday_partition_rejects_non_canonical_frame -q",
+      "expected_behavior": "A raw vendor frame (the pre-fix shape) is rejected with ValueError, so schema drift can never reach disk again.",
+      "test_skeleton": "def test_write_intraday_partition_rejects_non_canonical_frame(tmp_path, monkeypatch) -> None:\n    import pandas as pd\n    import pytest\n\n    from src.data import intraday_store\n\n    monkeypatch.setattr(intraday_store.settings, \"HISTORY_DIR\", tmp_path)\n\n    legacy_raw = pd.DataFrame({\"종목코드\": [\"005930\"], \"stck_prpr\": [70000], \"acml_tr_pbmn\": [\"123\"]})\n\n    with pytest.raises(ValueError):\n        intraday_store.write_intraday_partition(legacy_raw, 1, \"2026-09-04\", \"regular\")\n\n    assert not intraday_store.intraday_partition_path(1, \"2026-09-04\", \"regular\").exists()\n"
+    },
+    {
+      "scenario_id": "test_build_orderbook_rows_preserves_full_payload_verbatim",
+      "target_test_file": "tests/unit/data/test_orderbook_store.py",
+      "execution_command": "uv run pytest tests/unit/data/test_orderbook_store.py -k test_build_orderbook_rows_preserves_full_payload_verbatim -q",
+      "expected_behavior": "Every key of the vendor output1 block survives -- the full depth ladder and the expected-fill fields, not just the four currently kept.",
+      "test_skeleton": "def test_build_orderbook_rows_preserves_full_payload_verbatim() -> None:\n    from datetime import datetime\n\n    from src.data.orderbook_store import build_orderbook_rows\n\n    output1 = {f\"askp{i}\": str(70000 + i * 100) for i in range(1, 11)}\n    output1.update({f\"bidp{i}\": str(69900 - i * 100) for i in range(1, 11)})\n    output1.update({f\"askp_rsqn{i}\": str(100 * i) for i in range(1, 11)})\n    output1.update({f\"bidp_rsqn{i}\": str(200 * i) for i in range(1, 11)})\n    output1.update({\"total_askp_rsqn\": \"1200\", \"total_bidp_rsqn\": \"1500\", \"antc_cnpr\": \"70050\", \"antc_cnqn\": \"3300\"})\n\n    ts = datetime(2026, 9, 4, 15, 22, 0)\n    rows = build_orderbook_rows({\"rt_cd\": \"0\", \"output1\": output1}, \"005930\", \"J\", \"auction\", ts)\n\n    assert len(rows) == 1\n    row = rows[0]\n    for key in output1:\n        assert key in row\n    assert row[\"askp10\"] == 71000\n    assert row[\"antc_cnqn\"] == 3300\n    assert row[\"symbol\"] == \"005930\"\n    assert row[\"venue\"] == \"J\"\n    assert row[\"capture_reason\"] == \"auction\"\n\n\ndef test_build_orderbook_rows_failed_response_is_empty() -> None:\n    from datetime import datetime\n\n    from src.data.orderbook_store import build_orderbook_rows\n\n    assert build_orderbook_rows({\"rt_cd\": \"1\"}, \"005930\", \"J\", \"decision\", datetime(2026, 9, 4)) == []\n    assert build_orderbook_rows({\"rt_cd\": \"0\", \"output1\": None}, \"005930\", \"J\", \"decision\", datetime(2026, 9, 4)) == []\n"
+    },
+    {
+      "scenario_id": "test_append_orderbook_snapshots_merges_column_union_across_sweeps",
+      "target_test_file": "tests/unit/data/test_orderbook_store.py",
+      "execution_command": "uv run pytest tests/unit/data/test_orderbook_store.py -k test_append_orderbook_snapshots_merges_column_union_across_sweeps -q",
+      "expected_behavior": "Repeated auction sweeps append into one date partition, keyed on (capture_ts, symbol, venue), tolerating a differing key set between sweeps.",
+      "test_skeleton": "def test_append_orderbook_snapshots_merges_column_union_across_sweeps(tmp_path, monkeypatch) -> None:\n    from datetime import datetime\n\n    import pandas as pd\n\n    from src.data import orderbook_store\n\n    monkeypatch.setattr(orderbook_store.settings, \"HISTORY_DIR\", tmp_path)\n\n    first = [{\"capture_ts\": datetime(2026, 9, 4, 15, 20), \"symbol\": \"005930\", \"venue\": \"J\", \"capture_reason\": \"auction\", \"askp1\": 70000}]\n    second = [{\"capture_ts\": datetime(2026, 9, 4, 15, 20, 10), \"symbol\": \"005930\", \"venue\": \"J\", \"capture_reason\": \"auction\", \"askp1\": 70100, \"antc_cnpr\": 70050}]\n\n    assert orderbook_store.append_orderbook_snapshots(first, \"2026-09-04\") == 1\n    assert orderbook_store.append_orderbook_snapshots(second, \"2026-09-04\") == 2\n    assert orderbook_store.append_orderbook_snapshots([], \"2026-09-04\") == 0\n\n    stored = pd.read_parquet(orderbook_store.orderbook_partition_path(\"2026-09-04\"))\n    assert len(stored) == 2\n    assert \"antc_cnpr\" in stored.columns\n    assert stored[\"antc_cnpr\"].isna().sum() == 1\n"
+    },
+    {
+      "scenario_id": "test_archive_target_codes_unions_previous_session_watchlist",
+      "target_test_file": "tests/unit/daily/test_archive_intraday.py",
+      "execution_command": "uv run pytest tests/unit/daily/test_archive_intraday.py -k test_archive_target_codes_unions_previous_session_watchlist -q",
+      "expected_behavior": "The evening archive targets today's watchlist plus the previous archived session's, so the T+1 morning exit path of positions opened on T-1 is captured. The previous session comes from the archive date index, not a calendar offset.",
+      "test_skeleton": "def test_archive_target_codes_unions_previous_session_watchlist(monkeypatch) -> None:\n    import pandas as pd\n\n    from src.daily import archive_intraday\n\n    # Given: 2026-09-04 이전 아카이브 영업일은 금요일이 아닌 2026-09-01 (휴장 가정)\n    frames = {\n        \"2026-09-04\": pd.DataFrame({\"종목코드\": [\"005930\", \"000660\"]}),\n        \"2026-09-01\": pd.DataFrame({\"종목코드\": [\"009900\", \"005930\"]}),\n    }\n    all_rows = pd.DataFrame({\"스냅샷_날짜\": [\"2026-09-01\", \"2026-09-04\"], \"종목코드\": [\"009900\", \"005930\"]})\n\n    def fake_fetch(snapshot_date=None, month=None, all_rows_flag=False, **kwargs):\n        if kwargs.get(\"all_rows\") or all_rows_flag:\n            return all_rows\n        return frames.get(snapshot_date, pd.DataFrame())\n\n    monkeypatch.setattr(archive_intraday.archive, \"fetch_archive_snapshot\", fake_fetch)\n\n    # When\n    codes = archive_intraday._archive_target_codes(\"2026-09-04\")\n\n    # Then\n    assert set(codes) == {\"005930\", \"000660\", \"009900\"}\n    assert len(codes) == 3\n    assert archive_intraday.resolve_previous_archive_date(\"2026-09-04\") == \"2026-09-01\"\n    assert archive_intraday.resolve_previous_archive_date(\"2026-09-01\") is None\n"
+    },
+    {
+      "scenario_id": "test_run_auction_capture_polls_watchlist_until_window_close",
+      "target_test_file": "tests/unit/daily/test_collect_auction.py",
+      "execution_command": "uv run pytest tests/unit/daily/test_collect_auction.py -k test_run_auction_capture_polls_watchlist_until_window_close -q",
+      "expected_behavior": "The 15:20-15:30 closing-auction window is swept once per interval with capture_reason='auction'; an empty watchlist is a 0-return no-op and a failing sweep does not abort the loop.",
+      "test_skeleton": "def test_run_auction_capture_polls_watchlist_until_window_close(monkeypatch) -> None:\n    from datetime import datetime\n\n    import pandas as pd\n\n    from src.daily import collect_auction\n\n    monkeypatch.setattr(\n        collect_auction.archive,\n        \"fetch_archive_snapshot\",\n        lambda *a, **kw: pd.DataFrame({\"종목코드\": [\"005930\", \"000660\"]}),\n    )\n\n    appended: list[dict] = []\n    monkeypatch.setattr(\n        collect_auction,\n        \"append_orderbook_snapshots\",\n        lambda rows, snapshot_date: appended.extend(rows) or len(rows),\n    )\n\n    clock = iter(\n        [\n            datetime(2026, 9, 4, 15, 20, 0),\n            datetime(2026, 9, 4, 15, 20, 0),\n            datetime(2026, 9, 4, 15, 20, 10),\n            datetime(2026, 9, 4, 15, 20, 10),\n            datetime(2026, 9, 4, 15, 30, 1),\n        ]\n    )\n\n    class _Client:\n        async def create_session(self):\n            raise AssertionError(\"session creation must be injectable\")\n\n        async def get_orderbook_snapshot(self, session, code, market_div_code=None):\n            return {\"rt_cd\": \"0\", \"output1\": {\"askp1\": \"70000\", \"bidp1\": \"69900\", \"antc_cnpr\": \"69950\"}}\n\n    total = collect_auction.run_auction_capture(\n        snapshot_date=\"2026-09-04\",\n        interval_seconds=0,\n        client=_Client(),\n        now_fn=lambda: next(clock),\n    )\n\n    assert total == 4\n    assert {r[\"capture_reason\"] for r in appended} == {\"auction\"}\n    assert {r[\"symbol\"] for r in appended} == {\"005930\", \"000660\"}\n\n\ndef test_run_auction_capture_empty_watchlist_is_noop(monkeypatch) -> None:\n    import pandas as pd\n\n    from src.daily import collect_auction\n\n    monkeypatch.setattr(collect_auction.archive, \"fetch_archive_snapshot\", lambda *a, **kw: pd.DataFrame())\n\n    assert collect_auction.run_auction_capture(snapshot_date=\"2026-09-04\") == 0\n"
+    },
+    {
+      "scenario_id": "test_fetch_all_stock_data_persists_full_orderbook_without_widening_archive",
+      "target_test_file": "tests/unit/daily/test_collect.py",
+      "execution_command": "uv run pytest tests/unit/daily/test_collect.py -k test_fetch_all_stock_data_persists_full_orderbook_without_widening_archive -q",
+      "expected_behavior": "The already-fetched depth ladder is persisted to the orderbook partition with capture_reason='decision', while ARCHIVE_COLUMN_ORDER stays unchanged and the four legacy flattened columns keep their values.",
+      "test_skeleton": "def test_fetch_all_stock_data_persists_full_orderbook_without_widening_archive() -> None:\n    from src.processing.schema import ARCHIVE_COLUMN_ORDER\n\n    # Then: 호가 사다리는 별도 파티션으로 가고 평면 아카이브 스키마는 넓어지지 않는다\n    depth_cols = [c for c in ARCHIVE_COLUMN_ORDER if c.startswith(\"krx_매도호가\") or c.startswith(\"krx_매수호가\")]\n    assert depth_cols == [\"krx_매도호가1\", \"krx_매수호가1\"]\n    assert \"krx_매도호가2\" not in ARCHIVE_COLUMN_ORDER\n    assert len([c for c in ARCHIVE_COLUMN_ORDER if \"호가\" in c or \"잔량\" in c]) == 8\n\n\ndef test_fetch_single_stock_returns_orderbook_rows_triple(monkeypatch) -> None:\n    import asyncio\n    from unittest.mock import AsyncMock\n\n    from src.daily import collect\n\n    client = AsyncMock()\n    client.get_current_price = AsyncMock(return_value={\"rt_cd\": \"0\", \"output\": {\"stck_prpr\": \"70000\", \"stck_oprc\": \"69000\", \"stck_hgpr\": \"70500\", \"stck_lwpr\": \"68900\", \"acml_vol\": \"1000\", \"prdy_ctrt\": \"1.5\", \"lstn_stcn\": \"100\", \"hts_avls\": \"1000\", \"acml_tr_pbmn\": \"100000000\", \"rprs_mrkt_kor_name\": \"KOSPI\"}})\n    client.get_trade_strength = AsyncMock(return_value={\"rt_cd\": \"0\", \"output\": [{\"tday_rltv\": \"120\"}]})\n    client.get_investor_trend_estimate = AsyncMock(return_value={\"rt_cd\": \"0\", \"output2\": [{\"frgn_fake_ntby_qty\": \"1\", \"orgn_fake_ntby_qty\": \"2\"}]})\n    client.get_program_net_buy = AsyncMock(return_value={\"rt_cd\": \"0\", \"output\": [{\"whol_smtn_ntby_tr_pbmn\": \"100\"}]})\n    ladder = {f\"askp{i}\": str(70000 + i * 100) for i in range(1, 11)}\n    ladder.update({\"bidp1\": \"69900\", \"total_askp_rsqn\": \"1200\", \"total_bidp_rsqn\": \"1500\"})\n    client.get_orderbook_snapshot = AsyncMock(return_value={\"rt_cd\": \"0\", \"output1\": ladder})\n\n    sem = asyncio.Semaphore(1)\n    result = asyncio.run(\n        collect.fetch_single_stock(0, {\"code\": \"005930\", \"name\": \"삼성전자\", \"price\": \"70000\", \"chgrate\": \"1.5\"}, 1, sem, client, object())\n    )\n\n    assert len(result) == 3\n    row, failed, orderbook_rows = result\n    assert row[\"krx_매도호가1\"] == 70100\n    assert any(\"askp10\" in ob for ob in orderbook_rows)\n    assert {ob[\"capture_reason\"] for ob in orderbook_rows} == {\"decision\"}\n"
+    }
+  ],
+
+  "verification": {
+    "commands": [
+      "uv run ruff check .",
+      "uv run mypy src/data/intraday_schema.py src/data/intraday_store.py src/data/orderbook_store.py src/daily/collect_auction.py src/api/ls/client.py",
+      "uv run pytest tests/unit/data tests/unit/api/ls tests/unit/daily tests/unit/backfill tests/integration/daily -q"
+    ],
+    "manual_probe": "After merge, run `uv run python -m src.daily.collect_auction --date <today>` inside 15:20-15:30 once, then inspect data/history/orderbook/<YYYY-MM>/<date>.parquet to record the actual KIS output1 key set. That probe -- not this contract -- is the source of truth for the expected-fill field names."
+  }
+}
