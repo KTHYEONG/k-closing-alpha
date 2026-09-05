@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 from contextlib import contextmanager
@@ -9,6 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+
+
+def default_backfill_end_date() -> pd.Timestamp:
+    """Return today's date (normalized); the backfill end bound tracks today."""
+    return pd.Timestamp.today().normalize()
 
 
 class PipelineConfig:
@@ -33,7 +39,7 @@ class FetchConfig:
     retry_sleep_sec: float = 0.8
     request_sleep_sec: float = 0.03
     fixed_start_date: pd.Timestamp = pd.Timestamp("2016-01-01")
-    fixed_end_date: pd.Timestamp = pd.Timestamp("2025-12-31")
+    fixed_end_date: pd.Timestamp = dataclasses.field(default_factory=default_backfill_end_date)
     # KIS official samples commonly state REST guidance around 20 req/s.
     # Keep a conservative default to protect stability under parallel backfill.
     kis_rest_limit_per_sec: float = 20.0

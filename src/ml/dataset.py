@@ -136,6 +136,7 @@ _EXCLUDED_FROM_X: set[str] = {
     "target_bad",
     "realized_vol",
     "sector_cluster_id",
+    "label_source",
 }
 
 _TARGET_NAMES: tuple[str, ...] = ("target_return", "target_rank", "target_good", "target_bad")
