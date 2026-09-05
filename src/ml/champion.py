@@ -30,10 +30,14 @@ from src.ml.exit_policy import (  # noqa: F401 (attach/simulate re-exported; res
     simulate_take_profit_exit,
     summarize_exit_grid,
 )
+from src.ml.buyability import evaluate_buyability_sleeves, summarize_buyability_sleeves
 from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO, _CLOSE_MORNING_RERANKER_CONFIG, add_close_morning_decision_score
 from src.utils.display import Colors
 
 logger = logging.getLogger(__name__)
+
+# ChampionTuningConfig field (canonical definition in src/ml/tuning.py):
+#     buyability_target_notional_100m: float | None = None
 
 _CANDIDATE_FEATURE_SET = "close_morning61"
 
@@ -228,6 +232,12 @@ def train_tuned_champion_bundle(
         predict_proba=True,
     )
     candidate_oof["rank_score"] = candidate_oof["pred"]
+    buyability_provenance: dict[str, Any] = {"status": "skipped", "reason": "buyability_target_notional_100m not configured"}
+    if config.buyability_target_notional_100m is not None:
+        try:
+            buyability_provenance = {"status": "evaluated", **summarize_buyability_sleeves(evaluate_buyability_sleeves(candidate_oof, group_col="trade_date", code_col="stock_code", score_col="pred", target_col="net_return", target_notional_100m=float(config.buyability_target_notional_100m), alpha=config.promotion_alpha))}
+        except ValueError as exc:
+            buyability_provenance = {"status": "skipped", "reason": str(exc)}
     # 청산 규칙 그리드는 provenance 기록 전용이며 배포 결정 경로를 바꾸지 않는다.
     exit_policy_provenance: dict[str, Any] = {"status": "skipped", "reason": "price_history_df not supplied"}
     if price_history_df is not None:
@@ -384,6 +394,7 @@ def train_tuned_champion_bundle(
         "selected_features": list(feature_cols) if config.feature_selection_top_n is not None else None,
         "selection_top_n": config.feature_selection_top_n,
         "exit_policy_grid": exit_policy_provenance,
+        "buyability_sleeves": buyability_provenance,
     }
 
     # Only write artifact if promoted or gate disabled
