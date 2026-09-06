@@ -198,6 +198,9 @@
   "src/execution/cost_model.py": {
     "testing": "tests/unit/execution/test_cost_model.py"
   },
+  "src/execution/passive_fill.py": {
+    "testing": "tests/unit/execution/test_passive_fill.py"
+  },
   "src/ml/bundle.py": {
     "testing": "tests/unit/ml/test_bundle.py"
   },
@@ -215,6 +218,9 @@
   },
   "src/ml/exit_policy.py": {
     "testing": "tests/unit/ml/test_exit_policy.py"
+  },
+  "src/ml/expected_value.py": {
+    "testing": "tests/unit/ml/test_expected_value.py"
   },
   "src/ml/feature_manifest.py": {},
   "src/ml/feature_selection.py": {
@@ -251,6 +257,9 @@
   "src/ml/tuning.py": {
     "testing": "tests/unit/ml/test_tuning.py"
   },
+  "src/ml/universe.py": {
+    "testing": "tests/unit/ml/test_universe.py"
+  },
   "src/ml/validation.py": {
     "testing": "tests/unit/ml/test_validation.py"
   },
@@ -280,6 +289,7 @@
       "tests/unit/data/test_candidate_panel.py",
       "tests/unit/data/test_parquet_loader.py",
       "tests/unit/data/test_theme_resolver.py",
+      "tests/unit/ml/test_champion.py",
       "tests/unit/ml/test_history_features.py"
     ]
   },
