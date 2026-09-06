@@ -251,3 +251,75 @@ def test_champion_execution_cost_value_error_degrades_to_skipped(monkeypatch) ->
     prov = bundle["tuning_provenance"]["execution_cost"]
     assert prov["status"] == "skipped"
     assert prov["reason"] == "boom"
+
+
+def test_champion_excludes_ceiling_rows_from_dev_and_control() -> None:
+    import pandas as pd
+
+    from src.ml.champion import train_tuned_champion_bundle
+    from src.ml.tuning import ChampionTuningConfig
+    from tests.unit.ml.test_champion import _raw_trade_log
+
+    cfg = ChampionTuningConfig(
+        hpo_trials=2,
+        seed_ensemble=(13, 29),
+        require_beats_control=False,
+        min_history_dates=20,
+        model_params_override={"num_leaves": 7},
+    )
+    baseline_log = _raw_trade_log(n_dates=40, per_day=6)
+    bundle_baseline = train_tuned_champion_bundle(
+        baseline_log, None, cfg, export_dir="tmp/spec_ceiling_pool_baseline"
+    )
+    prov_baseline = bundle_baseline["tuning_provenance"]["ceiling_excluded_from_pool"]
+
+    # Given: the same log plus one extra ceiling-close row (close/prev_close>=1.29,
+    # close==high) per day, on a stock code absent from the baseline log.
+    dates = sorted(baseline_log["매수날짜"].unique())
+    ceiling_rows = pd.DataFrame(
+        [
+            {
+                "매수날짜": d,
+                "종목코드": "999999",
+                "(시가)": "12900",
+                "(고가)": "12900",
+                "(저가)": "12000",
+                "(종가)": "12900",
+                "(전일종가)": "10000",
+                "(시가총액, 억)": "5000",
+                "(거래대금, 억)": "300",
+                "(등락률)": "29.00",
+                "(선정 순위)": "1",
+                "(기관_순매수)": "0",
+                "(외국인_순매수)": "0",
+                "(프로그램_순매수)": "0",
+                "(체결강도)": "120",
+                "(시장구분)": "KOSPI",
+                "(총 종목 수)": "6",
+                "(평균 거래대금)": "250",
+                "(kospi, %)": "0.3",
+                "(kosdaq, %)": "0.1",
+                "v_kospi": "18",
+                "v_kosdaq": "20",
+                "(거래량)": "100000",
+                "(테마/섹터)": "반도체",
+                "(차트분석)": "상한가 다음날",
+                "(매수 가격)": "12900",
+                "(매도 가격)": "12900",
+                "(수익률, %)": "0.00",
+            }
+            for d in dates
+        ]
+    )
+    augmented_log = pd.concat([baseline_log, ceiling_rows], ignore_index=True)
+
+    # When
+    bundle = train_tuned_champion_bundle(
+        augmented_log, None, cfg, export_dir="tmp/spec_ceiling_pool"
+    )
+    prov = bundle["tuning_provenance"]["ceiling_excluded_from_pool"]
+
+    # Then: the added ceiling rows never reach dev/control_dev -- row counts match
+    # the ceiling-free baseline exactly, not the baseline plus the added rows.
+    assert prov["n_dev_rows"] == prov_baseline["n_dev_rows"]
+    assert prov["n_control_dev_rows"] == prov_baseline["n_control_dev_rows"]
