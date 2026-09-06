@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # DB 및 테마 관련 임포트
 from src.data.db_loader import load_theme_from_db
 from src.data.theme_resolver import batch_resolve_missing_themes
+from src.ml.buyability import classify_ceiling_entry
 from src.processing.schema import normalize_column_names
 from src.serving.realtime.artifacts import load_model_bundle
 from src.serving.realtime.features import build_snapshot_features
@@ -366,6 +367,11 @@ def main():
     df_sangdda = df_all[df_all["Scenario_Base"].str.contains("상따", na=False)].copy()
 
     normal_sizing = predict_daily_sizing(df_normal, models_bundle)
+    if not normal_sizing.empty:
+        _is_ceiling = classify_ceiling_entry(normal_sizing).to_numpy(dtype=bool)
+        normal_sizing.loc[_is_ceiling, "grade"] = "Pass"
+        normal_sizing.loc[_is_ceiling, "grade_multiplier"] = 0.0
+        normal_sizing.loc[_is_ceiling, "allocation"] = 0.0
     sangdda_sizing = (
         predict_daily_sizing(df_sangdda, models_bundle)
         if not df_sangdda.empty
