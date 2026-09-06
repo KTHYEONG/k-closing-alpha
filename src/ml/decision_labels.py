@@ -19,6 +19,7 @@ DECISION_LABEL_COLUMNS: frozenset[str] = frozenset(
         "nd_high",
         "nd_low",
         "nd_close",
+        "nd_date",
         "mechanical_gross",
         "has_mechanical_label",
         "label_price_ratio",
