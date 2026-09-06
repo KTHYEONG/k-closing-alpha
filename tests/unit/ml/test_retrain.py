@@ -265,3 +265,30 @@ def test_main_tuned_wires_screen_and_production_dir(tmp_path, monkeypatch) -> No
 
     assert captured["cfg"].screen is SCREEN_REGISTRY["band_2_15"]
     assert captured["kwargs"]["production_dir"] == str(tmp_path / "prod")
+
+
+def test_retrain_promotion_alpha_flows_to_validation_config(tmp_path, monkeypatch) -> None:
+    import src.ml.retrain as mod
+
+    trade_path = tmp_path / "trade_log.parquet"
+    _write_trade_log(trade_path)
+    theme_path = tmp_path / "theme_missing.parquet"
+
+    captured: dict[str, object] = {}
+
+    def _fake_train_tuned(trade_log_df, theme_df, cfg, **kwargs):
+        captured["cfg"] = cfg
+        return {"training_cutoff": "2026-03-02", "tuning_provenance": {"control_vs_candidate": {}}}
+
+    monkeypatch.setattr(mod, "train_tuned_champion_bundle", _fake_train_tuned)
+
+    main([
+        "--trade-log", str(trade_path), "--theme", str(theme_path),
+        "--tuned", "--no-restore-panel",
+        "--oos-reserve-start", "2025-09-01", "--promotion-alpha", "0.20",
+    ])
+
+    cfg = captured["cfg"]
+    assert cfg.promotion_alpha == 0.20
+    assert cfg.validation is not None
+    assert cfg.validation.promotion_alpha == 0.20
