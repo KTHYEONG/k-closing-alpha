@@ -367,3 +367,120 @@ def test_champion_candidate_oof_computed_once(monkeypatch) -> None:
     champ.train_tuned_champion_bundle(_raw_trade_log(n_dates=70, per_day=6), None, cfg, export_dir="tmp/spec_oof_once")
 
     assert calls["outer"] == 2
+
+
+def test_champion_tuning_config_accepts_decision_label_modes() -> None:
+    import pytest
+
+    from src.ml.tuning import ChampionTuningConfig
+    from src.ml.validation import ValidationConfig
+
+    default = ChampionTuningConfig()
+    assert default.label_mode == "journaled"
+    assert default.cost_mode == "flat"
+    assert default.validation is None
+
+    cfg = ChampionTuningConfig(
+        oos_reserve_start="2025-09-01",
+        label_mode="mechanical",
+        cost_mode="per_row",
+        validation=ValidationConfig(oos_reserve_start="2025-09-01"),
+    )
+    assert cfg.validation is not None
+    assert cfg.validation.oos_reserve_start == "2025-09-01"
+
+    with pytest.raises(ValueError, match="label_mode"):
+        ChampionTuningConfig(label_mode="operator")
+    with pytest.raises(ValueError, match="cost_mode"):
+        ChampionTuningConfig(cost_mode="guess")
+    # A validation protocol without a matching locked window is a contradiction
+    with pytest.raises(ValueError, match="oos_reserve_start"):
+        ChampionTuningConfig(validation=ValidationConfig(oos_reserve_start="2025-09-01"))
+    with pytest.raises(ValueError, match="oos_reserve_start"):
+        ChampionTuningConfig(
+            oos_reserve_start="2025-01-01",
+            validation=ValidationConfig(oos_reserve_start="2025-09-01"),
+        )
+
+
+def _synthetic_price_history(n_dates: int, per_day: int) -> pd.DataFrame:
+    """Minimal price_history matching _raw_trade_log's dates/codes for eval_net_mechanical."""
+    dates = pd.bdate_range("2023-01-02", periods=n_dates + 1)
+    rows = [
+        {
+            "date": d,
+            "symbol": f"{j:06d}",
+            "open": 10000.0,
+            "high": 10400.0,
+            "low": 9800.0,
+            "close": 10200.0,
+            "daily_change_pct": 0.02,
+        }
+        for d in dates
+        for j in range(per_day)
+    ]
+    return pd.DataFrame(rows)
+
+
+def test_champion_validation_requires_mechanical_eval_column(tmp_path) -> None:
+    """Fail-closed: config.validation needs eval_net_mechanical, which requires price_history_df."""
+    import pytest
+
+    import src.ml.champion as champ
+    from src.ml.tuning import ChampionTuningConfig
+    from src.ml.validation import ValidationConfig
+
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10,
+        model_params_override={"num_leaves": 7, "n_estimators": 10}, label_mode="journaled",
+        cost_mode="flat", oos_reserve_start="2025-09-01",
+        validation=ValidationConfig(oos_reserve_start="2025-09-01"),
+    )
+    log = _raw_trade_log(n_dates=70, per_day=6)
+
+    # label_mode='journaled' does not require price_history_df on its own, but a
+    # configured validation protocol always scores eval_net_mechanical -- without
+    # price_history_df that column never exists, so this must fail closed.
+    with pytest.raises(ValueError, match="eval_net_mechanical"):
+        champ.train_tuned_champion_bundle(
+            log, None, cfg, export_dir=str(tmp_path / "cand"), production_dir=str(tmp_path / "prod")
+        )
+
+
+def test_champion_validation_gate_wiring_with_mocks(monkeypatch, tmp_path) -> None:
+    import src.ml.champion as champ
+    from src.ml.tuning import ChampionTuningConfig
+    from src.ml.validation import ValidationConfig
+
+    monkeypatch.setattr(champ, "cpcv_path_evidence", lambda *a, **k: {"path_deltas": [0.001]*6, "n_path_deltas": 6, "top1_path_win_rate": 0.9, "ic_path_win_rate": 0.9, "pooled_delta": 0.001, "p_bootstrap": 0.01, "p_paired_t": 0.01, "ic_candidate": 0.1, "ic_control": 0.05, "ic_delta": 0.05, "mde_top1": 0.01, "mde_ic": 0.01})
+    monkeypatch.setattr(champ, "evaluate_locked_oos", lambda *a, **k: {"n_days": 80, "n_rows": 100, "top1_mean": 0.005, "top1_sd": 0.02, "top1_sharpe": 1.0, "rank_ic": 0.08, "mde_top1": 0.01, "mde_ic": 0.02, "first_date": "2025-09-01", "last_date": "2026-01-01"})
+
+    class _Fill:
+        sleeve = "fillable"
+        n_days = 80
+        n_rows = 100
+        top1_mean = 0.004
+        rank_ic = 0.05
+
+    monkeypatch.setattr(champ, "evaluate_buyability_sleeves", lambda *a, **k: (_Fill(),))
+    monkeypatch.setattr(champ, "summarize_buyability_sleeves", lambda *a, **k: {"measured_share": 0.9})
+    monkeypatch.setattr(champ, "fit_seed_ensemble", lambda *a, **k: type("M", (), {"predict": lambda self, X: [0.0]*len(X)})())
+
+    from src.ml.validation import PromotionDecision, GateOutcome
+    fake_decision = PromotionDecision(deployable=False, verdict="research_only", failed_gates=("oos_rank_ic_above_mde",), gates=(GateOutcome(name="oos_rank_ic_above_mde", passed=False, observed=0.01, threshold=0.02, detail={}),), evidence={"oos_reserve_start": "2025-09-01"})
+    monkeypatch.setattr(champ, "run_promotion_gate", lambda *a, **k: fake_decision)
+    published = {}
+    def _fake_publish(bundle, cand_dir, prod_dir, decision):
+        published["called"] = True
+        from src.ml.bundle import save_bundle
+        save_bundle(dict(bundle), str(cand_dir))
+        return {"published": False}
+    monkeypatch.setattr(champ, "publish_bundle", _fake_publish)
+
+    cfg = ChampionTuningConfig(hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10, model_params_override={"num_leaves": 7, "n_estimators": 10}, label_mode="journaled", cost_mode="flat", oos_reserve_start="2025-09-01", validation=ValidationConfig(oos_reserve_start="2025-09-01"), feature_selection_top_n=5)
+    log = _raw_trade_log(n_dates=70, per_day=6)
+    price_history = _synthetic_price_history(n_dates=70, per_day=6)
+    bundle = champ.train_tuned_champion_bundle(log, None, cfg, price_history_df=price_history, export_dir=str(tmp_path / "cand"), production_dir=str(tmp_path / "prod"))
+    assert published.get("called") is True
+    assert bundle["promotion_decision"]["verdict"] == "research_only"
+    assert bundle["label_mode"] == "journaled"
