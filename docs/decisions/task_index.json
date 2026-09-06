@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "CLOSING_ALPHA_V2_EXECUTION_FIX",
+      "date": "2026-09-06",
+      "adr_id": "ADR_20260906_CLOSING_ALPHA_V2_EXECUTION_FIX",
+      "domain": "ml",
+      "title": "sync 아카이브 제거 + execution_profile 분봉 정규화 버그 수정",
+      "why": "레거시 게이트가 신규 v2 decision 계산 후 raise해 연구 아티팩트를 폐기하는 문제를 --no-gate로 우회 실행하다 execution_profile이 원본 KIS 벤더 포맷 미정규화로 항상 None인 버그를 발견",
+      "resolution": "measure_oos_execution_profile을 _load_normalized_bars_for_entries로 분리해 파티션별 normalize_bar_frame 정규화 적용, sync_task.py의 docs/decisions/archive 이관 로직 제거(계약서는 삭제만)",
+      "impact": "execution_profile_measured 게이트가 처음으로 실측치(fill_rate 0.878)를 반환, 매 /sync마다 불필요하게 쌓이던 docs/decisions/archive 디렉터리 생성 중단"
+    },
+    {
+      "task_id": "CLOSING_ALPHA_ARCHITECTURE_V2",
+      "date": "2026-09-06",
+      "adr_id": "ADR_20260906_CLOSING_ALPHA_ARCHITECTURE_V2",
+      "domain": "ml",
+      "title": "종가매매 아키텍처 v2: 유니버스 스크린 파라미터화 + EV기반 기권 + 체결 실측 게이트",
+      "why": "운영자 상승률>=10% 스크린이 무조건부 기대값 -30.2bp/일(t=-12.15)로 실측되어, 모델이 낼 수 있는 최대 rankIC 알파(+28bp)와 정확히 상쇄되는 산술이 3세션 '포화' 결론의 정체였다",
+      "resolution": "src/ml/universe.py(파라미터화 스크린+모델이전 베이스라인), src/ml/expected_value.py(EV<=0 기권), src/execution/passive_fill.py(패시브체결 역선택 실측) 신설 후 champion.py/retrain.py/validation.py에 --screen·DSR예산·execution_profile 게이트로 실배선",
+      "impact": "체결 실측 없이는 승격 불가(execution_profile_measured 게이트)로 R1을 강제하고, 시간분할 부호반전(스크린 7종 중 6종 half-sample flip 실측) 게이트를 추가해 gate theatre 재발을 구조적으로 차단"
+    },
+    {
       "task_id": "ML_VALIDATION_OVERHAUL",
       "date": "2026-09-06",
       "adr_id": "ADR_20260906_ML_VALIDATION_OVERHAUL",
@@ -8,8 +28,7 @@
       "title": "의사결정 등급 ML 검증: 잠긴 OOS + CPCV 승격 게이트 + 실행가능 라벨",
       "why": "기존 승격 게이트는 oos_row_count=0(선택과 동일 OOF), DSR이 실선택예산의 1/15로 계산, 라벨이 운영자 재량 청산 포함, 비용이 전종목 동일 46bp 고정",
       "resolution": "src/ml/validation.py(잠긴 OOS 1회채점+CPCV(8,2) 경로일치+DSR)와 src/ml/decision_labels.py(행별비용+mechanical_gross 실행가능라벨) 신설, champion.py/tuning.py/retrain.py에 배선, publish_bundle로 production 승격 게이트화",
-      "impact": "기존 워크포워드 부트스트랩이 promoted=true(Δ+0.249%p/일,p=0.0012)로 판정한 후보가 CPCV 28-fold에서는 top1 경로승률 0.536<0.60·p=0.508로 research_only 판정 — gate theatre 실증",
-      "archive_path": "docs/decisions/archive/ML_VALIDATION_OVERHAUL/ml_validation_overhaul_contract.json"
+      "impact": "기존 워크포워드 부트스트랩이 promoted=true(Δ+0.249%p/일,p=0.0012)로 판정한 후보가 CPCV 28-fold에서는 top1 경로승률 0.536<0.60·p=0.508로 research_only 판정 — gate theatre 실증"
     },
     {
       "task_id": "CHAMPION_RETRAIN_HOTPATH_OPT",
@@ -19,8 +38,7 @@
       "title": "Champion Retrain Hot-Path Optimization",
       "why": "The tuned champion retrain took ~810s, dominated by a per-group scipy.spearmanr loop in the rank_ic HPO objective and one fully redundant 5-fold calibrated OOF.",
       "resolution": "Added vectorized metrics.mean_group_rank_ic (Spearman==Pearson-on-average-ranks) used by tuning and metrics.rank_ic, and threaded candidate_oof into evaluate_config_oof via precomputed_oof.",
-      "impact": "Behaviour-identical (best_params, promotion delta/p/promoted unchanged in full A/B); rank_ic sub-step 14s->0.015s, calibrated OOFs 3->2, wall-time ~810s->~220s.",
-      "archive_path": "docs/decisions/archive/CHAMPION_RETRAIN_HOTPATH_OPT/champion_retrain_hotpath_opt_contract.json"
+      "impact": "Behaviour-identical (best_params, promotion delta/p/promoted unchanged in full A/B); rank_ic sub-step 14s->0.015s, calibrated OOFs 3->2, wall-time ~810s->~220s."
     },
     {
       "task_id": "ROUND_TRIP_COST_46BP",
@@ -30,8 +48,7 @@
       "title": "Measured 46bp Round-Trip Cost Constant",
       "why": "The promoted champion's target_return still subtracted the unmeasured legacy 20bp cost while four independent measurements and the pipeline's own provenance put real round-trip cost at ~46bp.",
       "resolution": "Split ROUND_TRIP_COST_RATIO in inference.py into _STATUTORY_COST_RATIO(0.0020)+_SPREAD_COST_RATIO(0.0026)=0.0046 and re-ran the full tuned retrain to re-validate promotion.",
-      "impact": "Promotion verdict holds under honest cost (Δ+0.326pp/day, p<0.0001, promoted=true); target_good/bad class balance shifts 31.5/26.1% -> 28.2/29.9% with thresholds unchanged.",
-      "archive_path": "docs/decisions/archive/ROUND_TRIP_COST_46BP/round_trip_cost_46bp_contract.json"
+      "impact": "Promotion verdict holds under honest cost (Δ+0.326pp/day, p<0.0001, promoted=true); target_good/bad class balance shifts 31.5/26.1% -> 28.2/29.9% with thresholds unchanged."
     },
     {
       "task_id": "CEILING_EXCLUDED_PROMOTION_POOL",
@@ -41,8 +58,7 @@
       "title": "Ceiling-Excluded Training/Promotion Pool + Cost Model Microstructure Fix",
       "why": "Pooled top-1 backtests were dominated by unfillable +30%-ceiling picks, and the execution cost model briefly assumed the wrong microstructure before the operator confirmed both legs execute via continuous trading",
       "resolution": "Wired classify_ceiling_entry to drop ceiling rows from champion.py's dev/control_dev before HPO/promotion and to force Pass/0-allocation in predict.py's live output; reverted cost_model.py round_trip_ticks to 2.0 (both legs cross spread) and updated STATUTORY_COST_BP to 20bp (2026-01-01 KRX tax hike...",
-      "impact": "First promoted champion this project has produced: candidate beats control +0.185pp/day net, p=0.006, Sharpe 4.18 vs 3.48 -- though still measured against the old 20bp cost constant baked into target_return, not the 46bp measured by execution_cost",
-      "archive_path": "docs/decisions/archive/CEILING_EXCLUDED_PROMOTION_POOL/ceiling_excluded_promotion_pool_contract.json"
+      "impact": "First promoted champion this project has produced: candidate beats control +0.185pp/day net, p=0.006, Sharpe 4.18 vs 3.48 -- though still measured against the old 20bp cost constant baked into target_return, not the 46bp measured by execution_cost"
     },
     {
       "task_id": "EXECUTION_COST_MODEL",
@@ -52,8 +68,7 @@
       "title": "Measured Execution Cost Model",
       "why": "The project's only cost model was one unmeasured constant (20bp) despite it being the actual binding constraint on the closing-auction strategy, not prediction quality",
       "resolution": "Added src/execution/cost_model.py (KRX tick-band spread, statutory cost, measured decision-to-auction impact) wired to champion.py tuning_provenance only; fixed the same raw-KIS-partition symbol bug already found in buyability.py",
-      "impact": "Measured round-trip cost 47-51bp vs strategy break-even 40.6bp -- real cost exceeds break-even, invalidating every prior backtest that assumed the flat 20bp constant",
-      "archive_path": "docs/decisions/archive/EXECUTION_COST_MODEL/execution_cost_model_contract.json"
+      "impact": "Measured round-trip cost 47-51bp vs strategy break-even 40.6bp -- real cost exceeds break-even, invalidating every prior backtest that assumed the flat 20bp constant"
     },
     {
       "task_id": "BUYABILITY_GATED_RERANKER",
@@ -63,8 +78,7 @@
       "title": "Buyability-Gated Reranker Sleeve Evaluation",
       "why": "Reranker top-1 alpha headline was dominated by +30% ceiling-close picks whose closing auction rarely matched, and by pooling those with the ordinary sleeve",
       "resolution": "Added src/ml/buyability.py (ceiling flag, auction liquidity attach, fill-ratio gate, fillable/ceiling/pooled sleeve eval); fixed 종목코드-keyed raw KIS partitions being silently ungrouped; wired to champion.py tuning_provenance only, opt-in via buyability_target_notional_100m",
-      "impact": "2026 (100% intraday coverage) fillable-sleeve top1 +3.19%->+0.71% and rankIC +0.160->-0.0004 vs pooled -- prior saturation conclusion in docs/results/ml-res.md was measured on a partly unfillable metric",
-      "archive_path": "docs/decisions/archive/BUYABILITY_GATED_RERANKER/buyability_gated_reranker_contract.json"
+      "impact": "2026 (100% intraday coverage) fillable-sleeve top1 +3.19%->+0.71% and rankIC +0.160->-0.0004 vs pooled -- prior saturation conclusion in docs/results/ml-res.md was measured on a partly unfillable metric"
     },
     {
       "task_id": "TASK_THEME_GSHEET_SYNC_DEPRECATION",
@@ -84,8 +98,7 @@
       "title": "미매매 후보 수동 기입 최소화 - 테마/시나리오 우선순위 수정 및 일일 패널 자동화",
       "why": "미매매 후보를 스프레드시트에 수동 분석·기입하지 않도록 자동화 경계를 재정의하려 했으나, candidate_panel.py의 테마 우선순위 역전·시나리오/테마 sentinel 분열·price_history 동결 무감지 위험이 발견됨.",
       "resolution": "테마 병합 우선순위를 archive/condition_history 실값 우선으로 수정, '테마 없음'/'기타' sentinel 통일, src/daily/materialize_ml_panel.py 신설(일일 산출물화), retrain.py에 price_history 신선도 워치독 배선, 실행 검증 중 발견한 수익률 % 문자열 파싱·종가 스케일 불일치·거래정지 자리표시일 라벨 오염 버그 수정.",
-      "impact": "archive 시나리오/테마 100% 보존 확인, 실거래 92%가 NaN 처리되던 버그와 최대 +4899%/-100% 합성 라벨 오염 2건을 실행 검증으로 추가 발견해 수정, lean_check 100% 커버리지 통과.",
-      "archive_path": "docs/decisions/archive/TASK_DAILY_CANDIDATE_PANEL_AUTOMATION/daily_candidate_panel_automation_contract.json"
+      "impact": "archive 시나리오/테마 100% 보존 확인, 실거래 92%가 NaN 처리되던 버그와 최대 +4899%/-100% 합성 라벨 오염 2건을 실행 검증으로 추가 발견해 수정, lean_check 100% 커버리지 통과."
     },
     {
       "task_id": "TASK_RECENT_REGIME_PANEL_RESTORATION",
@@ -95,8 +108,7 @@
       "title": "2026 리랭커 학습 표본 붕괴 원인 규명 및 합성 라벨 패널 복원",
       "why": "2026년부터 실거래 1건/일만 기록되어(수작업 가정매매 저널링 중단) 리랭커 최근 레짐 학습·평가 표본이 사실상 0이었고, price_history가 2025-12-31 하드코딩으로 8개월간 정지돼 있었음.",
       "resolution": "candidate_panel.py 신설(condition_history/archive 후보군에 price_history 기반 합성 라벨 부착, 실거래 오프셋·수정주가 불일치·거래정지 자리표시일 가드 포함), FetchConfig.fixed_end_date를 default_factory로 전환해 가격 백필 동결 해제, exit-day 분봉 백필 타깃 추가.",
-      "impact": "2026년 학습 가능 표본 1행/일 -> 33행/일 수준으로 복원(합성 2,917행), 61개 피처 패리티 유지, 실거래 라벨 손상 없이 검증 완료.",
-      "archive_path": "docs/decisions/archive/TASK_RECENT_REGIME_PANEL_RESTORATION/recent_regime_panel_restoration_contract.json"
+      "impact": "2026년 학습 가능 표본 1행/일 -> 33행/일 수준으로 복원(합성 2,917행), 61개 피처 패리티 유지, 실거래 라벨 손상 없이 검증 완료."
     },
     {
       "task_id": "TASK_INTRADAY_STORAGE_OPTIMIZATION",
@@ -116,8 +128,7 @@
       "title": "Intraday 캡처 계층 KIS/LS 벤더 정합성 및 손실 방지",
       "why": "KIS/LS acml_tr_pbmn 단위·의미 충돌, LS 틱 캡 무통보 절단, 파티션 덮어쓰기로 인한 조용한 원본 데이터 손실/오염",
       "resolution": "intraday_schema.py 정규 스키마 도입, 병합-안전 쓰기로 전환, 틱 truncated 플래그 노출, 호가 원본(orderbook_store) 및 동시호가 폴러(collect_auction) 신설, T-1 워치리스트 확장",
-      "impact": "벤더 간 단위 충돌 제거, 무통보 데이터 손실 종료, 동시호가·호가심도 등 기존에 버려지던 원본 데이터 보존",
-      "archive_path": "docs/decisions/archive/TASK_INTRADAY_CAPTURE_INTEGRITY/intraday_storage_optimization_contract.json"
+      "impact": "벤더 간 단위 충돌 제거, 무통보 데이터 손실 종료, 동시호가·호가심도 등 기존에 버려지던 원본 데이터 보존"
     },
     {
       "task_id": "TASK_LS_INTRADAY_COLLECTOR_ROUTING",
