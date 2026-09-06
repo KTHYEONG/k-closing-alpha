@@ -176,3 +176,25 @@ def test_assert_no_label_leakage_rejects_next_day_columns() -> None:
         assert_no_label_leakage(["close_position", "nd_open"])
     with pytest.raises(ValueError, match="eval_net_mechanical"):
         assert_no_label_leakage(["eval_net_mechanical"])
+
+
+def test_attach_mechanical_return_passes_through_nd_date() -> None:
+    import pandas as pd
+
+    from src.ml.decision_labels import attach_mechanical_return
+
+    price_history = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        "symbol": ["000001", "000001"],
+        "open": [990.0, 1030.0], "high": [1010.0, 1050.0],
+        "low": [980.0, 1020.0], "close": [1000.0, 1040.0],
+        "daily_change_pct": [0.010, 0.040],
+    })
+    df = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2024-01-02"]), "stock_code": ["000001"], "close_price": [1000.0],
+    })
+
+    out = attach_mechanical_return(df, price_history)
+
+    assert "nd_date" in out.columns
+    assert pd.Timestamp(out["nd_date"].iloc[0]) == pd.Timestamp("2024-01-03")

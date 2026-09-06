@@ -87,6 +87,52 @@ def _raw_trade_log(n_dates: int = 90, per_day: int = 8) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _raw_trade_log_wide_change_rate(n_dates: int = 90, per_day: int = 8) -> pd.DataFrame:
+    """Like _raw_trade_log but change_rate ~ Uniform(1%, 21%) instead of N(2,1)%.
+
+    Screen tests need rows reliably on both sides of a >=10% (or >=5%, >=3%)
+    floor; _raw_trade_log's N(2,1)% draws put essentially no mass above 5%.
+    """
+    rng = np.random.default_rng(5)
+    rows = []
+    for d in pd.bdate_range("2023-01-02", periods=n_dates):
+        for j in range(per_day):
+            e = rng.uniform(1.0, 21.0)
+            rows.append(
+                {
+                    "매수날짜": d.strftime("%Y-%m-%d"),
+                    "종목코드": f"{j:06d}",
+                    "(시가)": "10000",
+                    "(고가)": "10400",
+                    "(저가)": "9800",
+                    "(종가)": "10200",
+                    "(전일종가)": "10000",
+                    "(시가총액, 억)": "5000",
+                    "(거래대금, 억)": "300",
+                    "(등락률)": f"{e:.2f}",
+                    "(선정 순위)": str(j + 1),
+                    "(기관_순매수)": f"{e * 100:.0f}",
+                    "(외국인_순매수)": f"{e * 80:.0f}",
+                    "(프로그램_순매수)": f"{e * 50:.0f}",
+                    "(체결강도)": "120",
+                    "(시장구분)": "KOSPI",
+                    "(총 종목 수)": str(per_day),
+                    "(평균 거래대금)": "250",
+                    "(kospi, %)": "0.3",
+                    "(kosdaq, %)": "0.1",
+                    "v_kospi": "18",
+                    "v_kosdaq": "20",
+                    "(거래량)": "100000",
+                    "(테마/섹터)": "반도체",
+                    "(차트분석)": "거래량 폭증",
+                    "(매수 가격)": "10200",
+                    "(매도 가격)": f"{10200 * (1 + 0.01 * (e - 2.0)):.0f}",
+                    "(수익률, %)": f"{e - 2.0:.2f}",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def test_tuned_champion_provenance_records_bootstrap_gate() -> None:
     trade_log = _raw_trade_log()
     cfg = ChampionTuningConfig(hpo_trials=2, seed_ensemble=(13, 29), require_beats_control=False, min_history_dates=20)
@@ -710,3 +756,317 @@ def test_champion_expected_value_policy_degrades_to_skipped_on_error(monkeypatch
         _raw_trade_log(n_dates=40, per_day=4), None, cfg, export_dir="tmp/spec_ev_boom"
     )
     assert bundle["tuning_provenance"]["expected_value_policy"] == {"status": "skipped", "reason": "boom"}
+
+
+def test_train_tuned_champion_screen_grid_uses_preselection_pool(monkeypatch) -> None:
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.champion as champ
+    from src.ml.tuning import ChampionTuningConfig
+    from src.ml.universe import OPERATOR_LEGACY_SCREEN
+
+    captured: dict[str, object] = {}
+    real_evaluate_screen_grid = champ.evaluate_screen_grid
+
+    def _spy(panel, grid, **kwargs):
+        captured["min_change_rate_pct"] = float(pd.to_numeric(panel["daily_change_pct"], errors="coerce").min()) * 100.0
+        return real_evaluate_screen_grid(panel, grid, **kwargs)
+
+    monkeypatch.setattr(champ, "evaluate_screen_grid", _spy)
+
+    price_history = _synthetic_price_history(n_dates=90, per_day=8)
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10,
+        model_params_override={"num_leaves": 7, "n_estimators": 10}, label_mode="journaled", cost_mode="flat",
+        screen=OPERATOR_LEGACY_SCREEN,
+    )
+    champ.train_tuned_champion_bundle(
+        _raw_trade_log_wide_change_rate(n_dates=90, per_day=8), None, cfg, price_history_df=price_history, export_dir="tmp/spec_audit_grid_order"
+    )
+
+    # change_rate ~ Uniform(1%, 21%) -- rows well below the active 10% screen
+    # exist in the raw panel. The grid call must have seen at least one such
+    # row (i.e. it ran on the PRE-mask pool), not only the >=10% survivors
+    # that config.screen left in `dev`.
+    assert captured["min_change_rate_pct"] < 10.0
+
+
+def test_train_tuned_champion_screen_baseline_reports_the_active_screen_only() -> None:
+    from src.ml.tuning import ChampionTuningConfig
+    from src.ml.universe import ScreenConfig
+
+    strict = ScreenConfig(change_lower=0.05, min_trade_value_100m=0.0, min_market_cap_100m=0.0)
+    price_history = _synthetic_price_history(n_dates=90, per_day=8)
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10,
+        model_params_override={"num_leaves": 7, "n_estimators": 10}, label_mode="journaled", cost_mode="flat",
+        screen=strict,
+    )
+    bundle = train_tuned_champion_bundle(
+        _raw_trade_log_wide_change_rate(n_dates=90, per_day=8), None, cfg, price_history_df=price_history, export_dir="tmp/spec_audit_baseline_active"
+    )
+    prov = bundle["tuning_provenance"]
+    assert prov["screen_baseline"]["status"] == "evaluated"
+    # n_rows in screen_baseline must equal the post-mask dev size, i.e. the
+    # active screen's own row count -- not the full pre-mask pool.
+    assert prov["screen_baseline"]["n_rows"] <= prov["ceiling_excluded_from_pool"]["n_dev_rows"]
+
+
+def test_train_tuned_champion_control_shares_label_mode_with_candidate(monkeypatch) -> None:
+    import src.ml.champion as champ
+    from src.ml.tuning import ChampionTuningConfig
+
+    captured_target_cols: list[str] = []
+    real_evaluate_config_oof = champ.evaluate_config_oof
+
+    def _spy(dev_df, feature_cols, target_col, group_col, **kwargs):
+        # Record the eval_net_mechanical presence on every dev_df handed to
+        # evaluate_config_oof (candidate AND control) -- both must see the
+        # identical mechanical-label target_return column.
+        captured_target_cols.append(
+            "eval_net_mechanical" in dev_df.columns and float(dev_df["target_return"].std()) >= 0.0
+        )
+        return real_evaluate_config_oof(dev_df, feature_cols, target_col, group_col, **kwargs)
+
+    monkeypatch.setattr(champ, "evaluate_config_oof", _spy)
+
+    price_history = _synthetic_price_history(n_dates=40, per_day=4)
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10,
+        model_params_override={"num_leaves": 7, "n_estimators": 10},
+        label_mode="mechanical", cost_mode="per_row",
+    )
+    champ.train_tuned_champion_bundle(
+        _raw_trade_log(n_dates=40, per_day=4), None, cfg, price_history_df=price_history, export_dir="tmp/spec_audit_control_label"
+    )
+
+    # evaluate_config_oof is called exactly twice: once for candidate, once for control.
+    assert len(captured_target_cols) == 2
+    assert all(captured_target_cols)
+
+
+def test_train_tuned_champion_control_applies_same_screen_as_candidate() -> None:
+    from src.ml.tuning import ChampionTuningConfig
+    from src.ml.universe import ScreenConfig
+
+    # A screen strict enough to matter but loose enough to leave rows on both sides.
+    screen = ScreenConfig(change_lower=0.03, min_trade_value_100m=0.0, min_market_cap_100m=0.0)
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10,
+        model_params_override={"num_leaves": 7, "n_estimators": 10}, screen=screen,
+    )
+    bundle = train_tuned_champion_bundle(
+        _raw_trade_log_wide_change_rate(n_dates=90, per_day=8), None, cfg, export_dir="tmp/spec_audit_control_screen"
+    )
+    prov = bundle["tuning_provenance"]["ceiling_excluded_from_pool"]
+    # Both pools were filtered by the same 3% floor over the same underlying
+    # log (change_rate ~ Uniform(1%, 21%)), so candidate and control dev row
+    # counts must be close, not "control kept everything, candidate lost half".
+    assert prov["n_dev_rows"] > 0
+    assert prov["n_control_dev_rows"] > 0
+    ratio = prov["n_control_dev_rows"] / prov["n_dev_rows"]
+    assert 0.5 <= ratio <= 2.0
+
+
+def test_train_tuned_champion_control_no_longer_hardcodes_clip_bounds() -> None:
+    from src.ml.tuning import ChampionTuningConfig
+
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10,
+        model_params_override={"num_leaves": 7, "n_estimators": 10},
+        label_clip_lower=-0.03, label_clip_upper=0.03,
+    )
+    bundle = train_tuned_champion_bundle(
+        _raw_trade_log(n_dates=40, per_day=4), None, cfg, export_dir="tmp/spec_audit_control_clip"
+    )
+    ctrl_metrics = bundle["tuning_provenance"]["control_metrics"]
+    cand_metrics = bundle["tuning_provenance"]["candidate_metrics"]
+    # A tight +/-3% clip must bound BOTH scheduled-return series identically;
+    # the old hardcoded +/-0.10 control clip would let control's extremes run wider.
+    assert abs(ctrl_metrics["scheduled_mean_return"]) <= 0.03 + 1e-9
+    assert abs(cand_metrics["scheduled_mean_return"]) <= 0.03 + 1e-9
+
+
+def test_champion_exit_policy_grid_honors_configured_purge_gap(monkeypatch) -> None:
+    import src.ml.champion as champ
+    from src.ml.tuning import ChampionTuningConfig
+
+    captured: dict[str, object] = {}
+    real_cv_cls = champ.CombinatorialPurgedCV
+
+    def _spy_cv(*, n_groups, k_test, purge_gap=1, embargo_gap=1):
+        captured["purge_gap"] = purge_gap
+        return real_cv_cls(n_groups=n_groups, k_test=k_test, purge_gap=purge_gap, embargo_gap=embargo_gap)
+
+    monkeypatch.setattr(champ, "CombinatorialPurgedCV", _spy_cv)
+
+    price_history = _synthetic_price_history(n_dates=40, per_day=4)
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10,
+        model_params_override={"num_leaves": 7, "n_estimators": 10}, purge_gap=2,
+        cpcv_n_groups=10, cpcv_k_test=2,
+    )
+    champ.train_tuned_champion_bundle(
+        _raw_trade_log(n_dates=40, per_day=4), None, cfg, price_history_df=price_history, export_dir="tmp/spec_audit_exit_purge"
+    )
+
+    assert captured["purge_gap"] == 2
+
+
+def test_measure_oos_execution_profile_combines_entry_and_exit_legs(monkeypatch) -> None:
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.champion as champ
+
+    oos_scored = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2026-01-02", "2026-01-05"]),
+        "nd_date": pd.to_datetime(["2026-01-05", "2026-01-06"]),
+        "stock_code": ["000001", "000002"],
+        "close_price": [10000.0, 20000.0],
+        "pred": [0.01, 0.02],
+        "eval_net_mechanical": [0.005, -0.010],
+    })
+    entry_bars = pd.DataFrame({
+        "symbol": ["000001", "000002"], "ts_hms": [152000, 152000],
+        "low": [9985.0, 20010.0], "high": [10010.0, 20020.0], "close": [10000.0, 20000.0],
+    })
+    exit_bars = pd.DataFrame({
+        "symbol": ["000001", "000002"], "ts_hms": [90100, 90100],
+        "low": [10090.0, 19990.0], "high": [10120.0, 20000.0], "close": [10100.0, 19995.0],
+    })
+
+    def _fake_loader(entries, **kwargs):
+        return entry_bars if kwargs.get("_leg", "entry") == "entry" else exit_bars
+
+    calls: list[str] = []
+
+    def _dispatch(entries, **kwargs):
+        leg = "entry" if "close_price" in entries.columns else "exit"
+        calls.append(leg)
+        return entry_bars if leg == "entry" else exit_bars
+
+    monkeypatch.setattr(champ, "_load_normalized_bars_for_entries", _dispatch)
+
+    profile = champ.measure_oos_execution_profile(oos_scored, "eval_net_mechanical")
+
+    assert profile is not None
+    assert "fill_rate" in profile and "exit_fill_rate" in profile
+    assert "adverse_selection_bp" in profile and "exit_adverse_selection_bp" in profile
+    assert np.isfinite(profile["exit_fill_rate"])  # noqa: E501
+
+
+def test_measure_oos_execution_profile_uses_nd_open_when_present(monkeypatch) -> None:
+    """Covers the nd_open branch: when build_decision_labels attached a real
+    next-day open, the exit limit is anchored on it rather than on close_price."""
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.champion as champ
+
+    oos_scored = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2026-01-02"]),
+        "nd_date": pd.to_datetime(["2026-01-05"]),
+        "nd_open": [10300.0],
+        "stock_code": ["000001"],
+        "close_price": [10000.0],
+        "pred": [0.01],
+        "eval_net_mechanical": [0.005],
+    })
+    entry_bars = pd.DataFrame({
+        "symbol": ["000001"], "ts_hms": [152000], "low": [9985.0], "high": [10010.0], "close": [10000.0],
+    })
+    exit_bars = pd.DataFrame({
+        "symbol": ["000001"], "ts_hms": [90100], "low": [10290.0], "high": [10320.0], "close": [10300.0],
+    })
+
+    def _dispatch(entries, **kwargs):
+        return entry_bars if "close_price" in entries.columns else exit_bars
+
+    captured_next_open: list[float] = []
+    real_simulate_exit = champ.simulate_passive_exit
+
+    def _spy_exit(exits, bars, **kwargs):
+        captured_next_open.append(float(exits["next_open"].iloc[0]))
+        return real_simulate_exit(exits, bars, **kwargs)
+
+    monkeypatch.setattr(champ, "_load_normalized_bars_for_entries", _dispatch)
+    monkeypatch.setattr(champ, "simulate_passive_exit", _spy_exit)
+
+    profile = champ.measure_oos_execution_profile(oos_scored, "eval_net_mechanical")
+
+    assert profile is not None
+    assert captured_next_open == [10300.0]
+    assert np.isfinite(profile["exit_fill_rate"])
+
+
+def test_measure_oos_execution_profile_exit_defaults_when_no_exit_bars(monkeypatch) -> None:
+    """Covers the empty-exit_bars branch: entry leg still reports, exit_* fields fall back to NaN."""
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.champion as champ
+
+    oos_scored = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2026-01-02"]),
+        "nd_date": pd.to_datetime(["2026-01-05"]),
+        "stock_code": ["000001"],
+        "close_price": [10000.0],
+        "pred": [0.01],
+        "eval_net_mechanical": [0.005],
+    })
+    entry_bars = pd.DataFrame({
+        "symbol": ["000001"], "ts_hms": [152000], "low": [9985.0], "high": [10010.0], "close": [10000.0],
+    })
+
+    def _dispatch(entries, **kwargs):
+        return entry_bars if "close_price" in entries.columns else pd.DataFrame()
+
+    monkeypatch.setattr(champ, "_load_normalized_bars_for_entries", _dispatch)
+
+    profile = champ.measure_oos_execution_profile(oos_scored, "eval_net_mechanical")
+
+    assert profile is not None
+    assert np.isfinite(profile["fill_rate"])
+    assert not np.isfinite(profile["exit_fill_rate"])
+    assert profile["exit_saving_survives_adverse_selection"] is False
+
+
+def test_measure_oos_execution_profile_exit_defaults_on_exit_leg_error(monkeypatch) -> None:
+    """Covers the exit-leg except branch: a raising exit simulation must not
+    crash the whole measurement, only fall back to NaN exit_* fields."""
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.champion as champ
+
+    oos_scored = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2026-01-02"]),
+        "nd_date": pd.to_datetime(["2026-01-05"]),
+        "stock_code": ["000001"],
+        "close_price": [10000.0],
+        "pred": [0.01],
+        "eval_net_mechanical": [0.005],
+    })
+    entry_bars = pd.DataFrame({
+        "symbol": ["000001"], "ts_hms": [152000], "low": [9985.0], "high": [10010.0], "close": [10000.0],
+    })
+    exit_bars = pd.DataFrame({
+        "symbol": ["000001"], "ts_hms": [90100], "low": [10090.0], "high": [10120.0], "close": [10100.0],
+    })
+
+    def _dispatch(entries, **kwargs):
+        return entry_bars if "close_price" in entries.columns else exit_bars
+
+    def _boom(*a, **k):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(champ, "_load_normalized_bars_for_entries", _dispatch)
+    monkeypatch.setattr(champ, "simulate_passive_exit", _boom)
+
+    profile = champ.measure_oos_execution_profile(oos_scored, "eval_net_mechanical")
+
+    assert profile is not None
+    assert np.isfinite(profile["fill_rate"])
+    assert not np.isfinite(profile["exit_fill_rate"])

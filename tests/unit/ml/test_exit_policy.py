@@ -356,3 +356,25 @@ def test_summarize_exit_grid_selects_best_promoted() -> None:
     assert summarize_exit_grid(none_promoted)["best"] is None
 
 
+def test_attach_next_day_path_exposes_next_trading_day_date() -> None:
+    import pandas as pd
+
+    from src.ml.exit_policy import attach_next_day_path
+
+    price_history = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+        "symbol": ["000001", "000001", "000001"],
+        "open": [990.0, 1030.0, 1040.0],
+        "high": [1010.0, 1050.0, 1060.0],
+        "low": [980.0, 1020.0, 1030.0],
+        "close": [1000.0, 1040.0, 1050.0],
+        "daily_change_pct": [0.010, 0.040, 0.0096],
+    })
+    df = pd.DataFrame({"trade_date": pd.to_datetime(["2024-01-02"]), "stock_code": ["000001"]})
+
+    out = attach_next_day_path(df, price_history)
+
+    assert "nd_date" in out.columns
+    assert pd.Timestamp(out["nd_date"].iloc[0]) == pd.Timestamp("2024-01-03")
+
+
