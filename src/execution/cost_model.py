@@ -45,7 +45,7 @@ KRX_TICK_BANDS: tuple[tuple[float, float], ...] = (
     (float("inf"), 1000.0),
 )
 
-STATUTORY_COST_BP: float = 21.0
+STATUTORY_COST_BP: float = 20.0
 
 _AUCTION_CLOSE_HMS: int = 153000
 

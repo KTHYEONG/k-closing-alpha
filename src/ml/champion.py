@@ -31,7 +31,7 @@ from src.ml.exit_policy import (  # noqa: F401 (attach/simulate re-exported; res
     simulate_take_profit_exit,
     summarize_exit_grid,
 )
-from src.ml.buyability import evaluate_buyability_sleeves, summarize_buyability_sleeves
+from src.ml.buyability import classify_ceiling_entry, evaluate_buyability_sleeves, summarize_buyability_sleeves
 from src.execution.cost_model import estimate_round_trip_cost_bp, summarize_cost_breakdown, breakeven_cost_bp
 from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO, _CLOSE_MORNING_RERANKER_CONFIG, add_close_morning_decision_score
 from src.utils.display import Colors
@@ -211,6 +211,7 @@ def train_tuned_champion_bundle(
     # Retarget with configured clip
     processed = retarget_with_clip(processed_raw, config.label_clip_lower, config.label_clip_upper)
     dev, oos = split_oos(processed, "trade_date", config.oos_reserve_start)
+    dev = dev[~classify_ceiling_entry(dev).to_numpy(dtype=bool)]
     assert_oos_excluded(dev, "trade_date", config.oos_reserve_start)
 
     # HPO
@@ -289,6 +290,7 @@ def train_tuned_champion_bundle(
     # Control
     control_processed = retarget_with_clip(processed_raw, -0.10, 0.10)
     control_dev, _ = split_oos(control_processed, "trade_date", config.oos_reserve_start)
+    control_dev = control_dev[~classify_ceiling_entry(control_dev).to_numpy(dtype=bool)]
     control = evaluate_config_oof(
         control_dev,
         feature_cols,
@@ -405,6 +407,7 @@ def train_tuned_champion_bundle(
         "selection_top_n": config.feature_selection_top_n,
         "exit_policy_grid": exit_policy_provenance,
         "buyability_sleeves": buyability_provenance,
+        "ceiling_excluded_from_pool": {"n_dev_rows": int(len(dev)), "n_control_dev_rows": int(len(control_dev))},  # noqa: RUF046
         "execution_cost": cost_provenance,
     }
 
