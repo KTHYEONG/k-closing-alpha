@@ -11,6 +11,7 @@ from src.ml.metrics import mean_group_rank_ic
 from src.ml.oof import purged_oof_predict
 from src.ml.policy_eval import default_policy_candidates, evaluate_single_stock_policy_oof
 from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict, moving_block_bootstrap_delta, path_top1_returns
+from src.ml.universe import ScreenConfig
 from src.ml.validation import ValidationConfig
 from src.serving.realtime.inference import add_close_morning_decision_score
 
@@ -53,6 +54,9 @@ class ChampionTuningConfig:
     label_mode: str = "journaled"
     cost_mode: str = "flat"
     validation: ValidationConfig | None = None
+    # None preserves current behaviour (no additional screen filter beyond
+    # ceiling exclusion); CLI callers (retrain.py) default to OPERATOR_LEGACY_SCREEN.
+    screen: ScreenConfig | None = None
 
     def __post_init__(self) -> None:
         if self.n_splits < 2:
@@ -138,6 +142,8 @@ class ChampionTuningConfig:
                 raise ValueError(
                     f"oos_reserve_start mismatch: config {self.oos_reserve_start!r} != validation {self.validation.oos_reserve_start!r}"
                 )
+        if self.screen is not None and not isinstance(self.screen, ScreenConfig):
+            raise ValueError(f"screen must be a ScreenConfig or None, got {self.screen!r}")
 
 
 @dataclass(frozen=True)
