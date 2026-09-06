@@ -69,7 +69,6 @@ def _update_decisions_json(
     domain: str,
     failed_hypothesis: str | None = None,
     failure_reason: str | None = None,
-    archive_path: str | None = None,
 ) -> str:
     date_str = datetime.now().strftime("%Y-%m-%d")
     adr_date = datetime.now().strftime("%Y%m%d")
@@ -95,12 +94,6 @@ def _update_decisions_json(
         "resolution": _cap_field(what),
         "impact": _cap_field(impact),
     }
-    if archive_path:
-        # Pointer, not content -- spec_init.py surfaces this path so a future
-        # spec can Read the full design_rationale/performance_budget on demand,
-        # instead of the archived contract being an unreachable dead file.
-        new_task_entry["archive_path"] = archive_path
-
     # Prepend new task entry
     index_data["tasks"] = [new_task_entry] + [t for t in index_data.get("tasks", []) if t.get("task_id") != task]
     # Keep max 100 entries in task_index.json
@@ -225,10 +218,10 @@ def _clean_logs_dir() -> int:
     return count
 
 
-def _clean_specs(task_id: str, remove_specs: list[str] | None = None) -> tuple[int, list[str]]:
+def _clean_specs(remove_specs: list[str] | None = None) -> int:
     specs_dir = "docs/specs"
     if not _path_exists(specs_dir):
-        return (0, [])
+        return 0
 
     target_prefixes: set[str] = set()
     if remove_specs:
@@ -237,9 +230,7 @@ def _clean_specs(task_id: str, remove_specs: list[str] | None = None) -> tuple[i
             if base:
                 target_prefixes.add(base.lower())
 
-    archive_dir = os.path.join("docs/decisions/archive", task_id)
     count = 0
-    archived: list[str] = []
     for fname in os.listdir(specs_dir):
         if fname.endswith((".md", "_contract.json", "contract.json")):
             if fname == "00_architecture.md":
@@ -251,18 +242,11 @@ def _clean_specs(task_id: str, remove_specs: list[str] | None = None) -> tuple[i
 
             fpath = os.path.join(specs_dir, fname)
             try:
-                if fname.endswith("_contract.json") or fname == "contract.json":
-                    # 계약(설계 근거)은 삭제 대신 아카이브 — spec 재사용 및 감사 추적성 보존
-                    os.makedirs(archive_dir, exist_ok=True)
-                    dest = os.path.join(archive_dir, fname)
-                    shutil.move(fpath, dest)
-                    archived.append(dest)
-                else:
-                    os.remove(fpath)
+                os.remove(fpath)
                 count += 1
             except OSError:
                 pass
-    return (count, archived)
+    return count
 
 
 def main() -> None:
@@ -303,13 +287,11 @@ def main() -> None:
     if not source_file:
         source_file = "src/main.py"
 
-    # 1. Spec Cleanup (archive contracts first so their path can be linked
-    #    into the task_index.json entry created in step 2)
-    archived_contract_paths: list[str] = []
+    # 1. Spec Cleanup
     try:
-        cleaned, archived_contract_paths = _clean_specs(task_id=args.task, remove_specs=args.remove_specs)
+        cleaned = _clean_specs(remove_specs=args.remove_specs)
         if cleaned > 0:
-            logs.append(f"Archived/cleaned {cleaned} spec files")
+            logs.append(f"Cleaned {cleaned} spec files")
     except Exception as e:
         errors.append(f"Spec cleanup failed: {e}")
 
@@ -324,7 +306,6 @@ def main() -> None:
             domain=args.domain,
             failed_hypothesis=args.failed_hypothesis,
             failure_reason=args.failure_reason,
-            archive_path=archived_contract_paths[0] if archived_contract_paths else None,
         )
         logs.append(f"Task Registry updated ({adr_id})")
     except Exception as e:
