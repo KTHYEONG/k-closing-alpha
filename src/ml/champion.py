@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from src.ml.bundle import build_inline_bundle, fit_seed_ensemble, save_bundle
-from src.ml.dataset import build_ml_dataset, retarget_with_clip
+from src.ml.dataset import build_ml_dataset
 from src.ml.feature_selection import select_stable_features
 from src.ml.history_features import HISTORY_FEATURE_COLUMNS  # noqa: F401 (used via dataset)
 from src.ml.oof import purged_oof_predict
@@ -38,7 +38,7 @@ from src.execution.cost_model import measure_auction_impact_bp
 from src.ml.validation import cpcv_path_evidence, evaluate_locked_oos, evaluate_screen_grid, publish_bundle, run_promotion_gate, temporal_sign_consistency
 from src.ml.universe import SCREEN_REGISTRY, apply_screen_mask, screen_baseline_stats
 from src.ml.expected_value import expected_net_value, select_by_expected_value
-from src.execution.passive_fill import measure_execution_profile, simulate_passive_entry
+from src.execution.passive_fill import measure_execution_profile, simulate_passive_entry, simulate_passive_exit
 from src.data.intraday_store import intraday_partition_path
 from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, normalize_bar_frame
 from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO, _CLOSE_MORNING_RERANKER_CONFIG, add_close_morning_decision_score
@@ -203,7 +203,7 @@ def evaluate_promotion(cand_returns: np.ndarray, ctrl_returns: np.ndarray, *, al
     }
 
 
-def _load_normalized_bars_for_entries(entries: pd.DataFrame, *, bar_interval_minutes: int = 1, session: str = "regular") -> pd.DataFrame:
+def _load_normalized_bars_for_entries(entries: pd.DataFrame, *, date_col: str = "trade_date", bar_interval_minutes: int = 1, session: str = "regular") -> pd.DataFrame:
     """Load only the needed (date, symbol) bars, normalizing raw vendor partitions.
 
     242/243 on-disk partitions are unnormalized KIS output keyed by '종목코드'
@@ -212,9 +212,9 @@ def _load_normalized_bars_for_entries(entries: pd.DataFrame, *, bar_interval_min
     would see neither 'symbol' nor 'ts_hms' without this normalization pass.
     Reads one partition per distinct OOS date rather than the whole range.
     """
-    dates = pd.to_datetime(entries["trade_date"]).dt.strftime("%Y-%m-%d").unique().tolist()
+    dates = pd.to_datetime(entries[date_col]).dt.strftime("%Y-%m-%d").unique().tolist()
     wanted_by_date: dict[str, set[str]] = {}
-    for d, sym in zip(pd.to_datetime(entries["trade_date"]).dt.strftime("%Y-%m-%d"), entries["symbol"].astype(str).str.zfill(6), strict=True):
+    for d, sym in zip(pd.to_datetime(entries[date_col]).dt.strftime("%Y-%m-%d"), entries["symbol"].astype(str).str.zfill(6), strict=True):
         wanted_by_date.setdefault(d, set()).add(sym)
     parts: list[pd.DataFrame] = []
     for d in dates:
@@ -271,7 +271,45 @@ def measure_oos_execution_profile(oos_scored: pd.DataFrame, eval_col: str) -> di
             raise ValueError("no intraday bars available in the OOS window")
         filled = simulate_passive_entry(entries, bars, offset_ticks=1)
         filled["mechanical_gross"] = oos_scored.loc[oos_top1_idx, eval_col].to_numpy(dtype=np.float64)
-        return measure_execution_profile(filled)
+        entry_profile = measure_execution_profile(filled)
+        exit_defaults: dict[str, Any] = {
+            "exit_fill_rate": float("nan"),
+            "exit_mean_saving_bp": float("nan"),
+            "exit_filled_gross_bp": float("nan"),
+            "exit_pool_gross_bp": float("nan"),
+            "exit_adverse_selection_bp": float("nan"),
+            "exit_saving_survives_adverse_selection": False,
+        }
+        if "nd_date" not in oos_scored.columns:
+            return {**entry_profile, **exit_defaults}
+        if "nd_open" in oos_scored.columns:
+            next_open_vals = pd.to_numeric(oos_scored.loc[oos_top1_idx, "nd_open"], errors="coerce").to_numpy(dtype=np.float64)
+        else:
+            next_open_vals = pd.to_numeric(oos_scored.loc[oos_top1_idx, "close_price"], errors="coerce").to_numpy(dtype=np.float64)
+        exits = pd.DataFrame({
+            "symbol": oos_scored.loc[oos_top1_idx, "stock_code"].astype(str).to_numpy(),
+            "next_open": next_open_vals,
+            "nd_date": pd.to_datetime(oos_scored.loc[oos_top1_idx, "nd_date"]),
+        })
+        exits["mechanical_gross"] = oos_scored.loc[oos_top1_idx, eval_col].to_numpy(dtype=np.float64)
+        try:
+            exit_bars = _load_normalized_bars_for_entries(exits, date_col="nd_date")
+            if len(exit_bars) == 0:
+                return {**entry_profile, **exit_defaults}
+            exit_filled = simulate_passive_exit(exits, exit_bars, offset_ticks=1)
+            exit_profile = measure_execution_profile(exit_filled, filled_col="exit_filled", saving_col="exit_saving_bp")
+        except (ValueError, KeyError) as exc:
+            logger.info("[EVAL] execution_profile exit leg skipped reason=%s", str(exc))
+            return {**entry_profile, **exit_defaults}
+        return {
+            **entry_profile,
+            "exit_fill_rate": float(exit_profile["fill_rate"]),
+            "exit_mean_saving_bp": float(exit_profile["mean_saving_bp"]),
+            "exit_filled_gross_bp": float(exit_profile["filled_gross_bp"]),
+            "exit_pool_gross_bp": float(exit_profile["pool_gross_bp"]),
+            "exit_adverse_selection_bp": float(exit_profile["adverse_selection_bp"]),
+            "exit_saving_survives_adverse_selection": bool(exit_profile["saving_survives_adverse_selection"]),
+        }
     except (ValueError, KeyError) as exc:
         logger.info("[EVAL] execution_profile status=skipped reason=%s", str(exc))
         return None
@@ -295,6 +333,7 @@ def train_tuned_champion_bundle(
     processed, label_provenance = build_decision_labels(processed_raw, price_history_df, label_mode=config.label_mode, cost_mode=config.cost_mode, clip_lower=config.label_clip_lower, clip_upper=config.label_clip_upper)
     dev, oos = split_oos(processed, "trade_date", config.oos_reserve_start)
     dev = dev[~classify_ceiling_entry(dev).to_numpy(dtype=bool)]
+    dev_prescreen = dev
     if config.screen is not None:
         dev = dev[apply_screen_mask(dev, config.screen)]
     assert_oos_excluded(dev, "trade_date", config.oos_reserve_start)
@@ -308,10 +347,10 @@ def train_tuned_champion_bundle(
     n_screen_trials = 1
     if "mechanical_gross" in dev.columns and len(dev) > 0:
         try:
-            _grid_panel = dev.assign(
-                daily_change_pct=pd.to_numeric(dev["change_rate"], errors="coerce") / 100.0,
-                close=dev["close_price"],
-                high=dev["high_price"],
+            _grid_panel = dev_prescreen.assign(
+                daily_change_pct=pd.to_numeric(dev_prescreen["change_rate"], errors="coerce") / 100.0,
+                close=dev_prescreen["close_price"],
+                high=dev_prescreen["high_price"],
             )
             screen_grid_provenance = {"status": "evaluated", **evaluate_screen_grid(
                 _grid_panel, tuple(SCREEN_REGISTRY.values()), group_col="trade_date", gross_col="mechanical_gross", cost_ratio=float(ROUND_TRIP_COST_RATIO),
@@ -360,7 +399,7 @@ def train_tuned_champion_bundle(
     exit_policy_provenance: dict[str, Any] = {"status": "skipped", "reason": "price_history_df not supplied"}
     if price_history_df is not None:
         try:
-            _exit_cv = CombinatorialPurgedCV(n_groups=config.cpcv_n_groups, k_test=config.cpcv_k_test)
+            _exit_cv = CombinatorialPurgedCV(n_groups=config.cpcv_n_groups, k_test=config.cpcv_k_test, purge_gap=config.purge_gap)
             _exit_results = evaluate_exit_grid(
                 candidate_oof, price_history_df,
                 group_col="trade_date", code_col="stock_code", score_col="pred", target_col="net_return",
@@ -396,9 +435,10 @@ def train_tuned_champion_bundle(
     )
 
     # Control
-    control_processed = retarget_with_clip(processed_raw, -0.10, 0.10)
-    control_dev, _ = split_oos(control_processed, "trade_date", config.oos_reserve_start)
+    control_dev, _ = split_oos(processed, "trade_date", config.oos_reserve_start)
     control_dev = control_dev[~classify_ceiling_entry(control_dev).to_numpy(dtype=bool)]
+    if config.screen is not None:
+        control_dev = control_dev[apply_screen_mask(control_dev, config.screen)]
     control = evaluate_config_oof(
         control_dev,
         feature_cols,
