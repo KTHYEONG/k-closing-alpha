@@ -233,3 +233,35 @@ def test_retrain_publish_requires_locked_oos_window() -> None:
     # Fail-closed: publishing without a locked window is rejected by the parser
     with pytest.raises(SystemExit):
         parser.parse_args(["--tuned", "--publish"])
+
+
+def test_main_tuned_wires_screen_and_production_dir(tmp_path, monkeypatch) -> None:
+    """Regression: --screen was parsed but never read, and --production-dir was
+    parsed but never passed through to train_tuned_champion_bundle."""
+    import src.ml.retrain as mod
+    from src.ml.universe import SCREEN_REGISTRY
+
+    trade_path = tmp_path / "trade_log.parquet"
+    _write_trade_log(trade_path)
+    theme_path = tmp_path / "theme_missing.parquet"
+
+    captured: dict[str, object] = {}
+
+    def _fake_train_tuned(trade_log_df, theme_df, cfg, **kwargs):
+        captured["cfg"] = cfg
+        captured["kwargs"] = kwargs
+        return {"training_cutoff": "2026-03-02", "tuning_provenance": {"control_vs_candidate": {}}}
+
+    monkeypatch.setattr(mod, "train_tuned_champion_bundle", _fake_train_tuned)
+
+    main([
+        "--trade-log", str(trade_path),
+        "--theme", str(theme_path),
+        "--tuned",
+        "--no-restore-panel",
+        "--screen", "band_2_15",
+        "--production-dir", str(tmp_path / "prod"),
+    ])
+
+    assert captured["cfg"].screen is SCREEN_REGISTRY["band_2_15"]
+    assert captured["kwargs"]["production_dir"] == str(tmp_path / "prod")

@@ -403,6 +403,22 @@ def test_champion_tuning_config_accepts_decision_label_modes() -> None:
         )
 
 
+def test_champion_tuning_config_accepts_screen() -> None:
+    import pytest
+
+    from src.ml.tuning import ChampionTuningConfig
+    from src.ml.universe import BAND_2_15_SCREEN
+
+    default = ChampionTuningConfig()
+    assert default.screen is None
+
+    cfg = ChampionTuningConfig(screen=BAND_2_15_SCREEN)
+    assert cfg.screen is BAND_2_15_SCREEN
+
+    with pytest.raises(ValueError, match="screen"):
+        ChampionTuningConfig(screen="operator_legacy")  # type: ignore[arg-type]
+
+
 def _synthetic_price_history(n_dates: int, per_day: int) -> pd.DataFrame:
     """Minimal price_history matching _raw_trade_log's dates/codes for eval_net_mechanical."""
     dates = pd.bdate_range("2023-01-02", periods=n_dates + 1)
@@ -484,3 +500,213 @@ def test_champion_validation_gate_wiring_with_mocks(monkeypatch, tmp_path) -> No
     assert published.get("called") is True
     assert bundle["promotion_decision"]["verdict"] == "research_only"
     assert bundle["label_mode"] == "journaled"
+
+
+def test_measure_oos_execution_profile_reports_fill_and_adverse_selection(monkeypatch) -> None:
+    """R1: with real bars, the profile is actually computed (not just skipped)."""
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.champion as champ
+
+    oos_scored = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2026-01-02", "2026-01-05"]),
+        "stock_code": ["000001", "000002"],
+        "close_price": [10000.0, 20000.0],
+        "pred": [0.01, 0.02],
+        "eval_net_mechanical": [0.005, -0.010],
+    })
+    bars = pd.DataFrame({
+        "symbol": ["000001", "000001", "000002", "000002"],
+        "ts_hms": [152000, 152500, 152000, 152500],
+        "low": [9985.0, 9990.0, 19999.0, 19998.0],  # 000001 touches a 1-tick limit; 000002 does not
+        "high": [10010.0, 10005.0, 20010.0, 20005.0],
+        "close": [10000.0, 10000.0, 20000.0, 20000.0],
+    })
+    monkeypatch.setattr(champ, "_load_normalized_bars_for_entries", lambda *a, **k: bars)
+
+    profile = champ.measure_oos_execution_profile(oos_scored, "eval_net_mechanical")
+
+    assert profile is not None
+    assert profile["fill_rate"] == 0.5
+    assert profile["fill_rate_is_upper_bound"] is True
+    assert np.isfinite(profile["adverse_selection_bp"])
+
+
+def test_measure_oos_execution_profile_fails_open_without_bars(monkeypatch) -> None:
+    import pandas as pd
+
+    import src.ml.champion as champ
+
+    oos_scored = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2026-01-02"]),
+        "stock_code": ["000001"],
+        "close_price": [10000.0],
+        "pred": [0.01],
+        "eval_net_mechanical": [0.005],
+    })
+    monkeypatch.setattr(champ, "_load_normalized_bars_for_entries", lambda *a, **k: pd.DataFrame())
+
+    assert champ.measure_oos_execution_profile(oos_scored, "eval_net_mechanical") is None
+    assert champ.measure_oos_execution_profile(oos_scored.iloc[0:0], "eval_net_mechanical") is None
+
+
+def test_measure_oos_execution_profile_fails_open_on_all_nat_dates() -> None:
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.champion as champ
+
+    oos_scored = pd.DataFrame({
+        "trade_date": pd.to_datetime([None, None]),
+        "stock_code": ["000001", "000002"],
+        "close_price": [10000.0, 20000.0],
+        "pred": [0.01, 0.02],
+        "eval_net_mechanical": [0.005, -0.010],
+    })
+    assert champ.measure_oos_execution_profile(oos_scored, "eval_net_mechanical") is None
+
+
+def test_load_normalized_bars_for_entries_normalizes_raw_kis_partitions(tmp_path, monkeypatch) -> None:
+    """Regression: read_intraday_range concatenates raw vendor partitions verbatim
+    (242/243 on-disk partitions are unnormalized KIS output keyed by '종목코드',
+    not 'symbol'/'ts_hms') -- simulate_passive_entry would silently never fill
+    without normalizing first, exactly like the 2026-09-06 buyability.py bug."""
+    import pandas as pd
+
+    import src.ml.champion as champ
+    from src import settings
+
+    monkeypatch.setattr(settings, "HISTORY_DIR", str(tmp_path))
+    partition_dir = tmp_path / "intraday" / "1m" / "regular" / "2026-01"
+    partition_dir.mkdir(parents=True)
+    raw = pd.DataFrame({
+        "종목코드": ["000001", "000001", "000002"],
+        "stck_bsop_date": ["20260102", "20260102", "20260102"],
+        "stck_cntg_hour": ["152000", "152500", "152000"],
+        "stck_oprc": ["10000", "9990", "20000"],
+        "stck_hgpr": ["10010", "10005", "20010"],
+        "stck_lwpr": ["9985", "9990", "19999"],
+        "stck_prpr": ["10000", "10000", "20000"],
+        "cntg_vol": ["100", "50", "200"],
+        "acml_tr_pbmn": ["1000000", "1500000", "4000000"],
+    })
+    raw.to_parquet(partition_dir / "2026-01-02.parquet")
+    # 2026-01-05: already-canonical partition (some partitions are correctly written)
+    canonical = pd.DataFrame({
+        "snapshot_date": ["2026-01-05"], "symbol": ["000004"], "ts_hms": [152000],
+        "open": [5000.0], "high": [5010.0], "low": [4990.0], "close": [5000.0],
+        "volume": [10], "value_krw": [50000.0], "has_trade": [True], "vendor": ["kis"],
+    })
+    canonical.to_parquet(partition_dir / "2026-01-05.parquet")
+    # 2026-01-06: empty partition
+    pd.DataFrame(columns=["종목코드", "stck_cntg_hour"]).to_parquet(partition_dir / "2026-01-06.parquet")
+    # 2026-01-07: partition with neither 'symbol' nor '종목코드'
+    pd.DataFrame({"unrelated_col": [1, 2]}).to_parquet(partition_dir / "2026-01-07.parquet")
+
+    entries = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2026-01-02", "2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08"]),
+        # 000003 is requested but absent from the 2026-01-02 partition (len(sub)==0 branch);
+        # 2026-01-08 has no partition file at all (path.exists() is False branch).
+        "symbol": ["000001", "000003", "000004", "000005", "000006", "000007"],
+        "close_price": [10000.0, 10000.0, 5000.0, 6000.0, 7000.0, 8000.0],
+    })
+
+    bars = champ._load_normalized_bars_for_entries(entries)
+
+    assert not bars.empty
+    assert {"symbol", "ts_hms", "low", "high", "close"} <= set(bars.columns)
+    assert "000001" in set(bars["symbol"].unique())
+    assert "000004" in set(bars["symbol"].unique())  # survived the already-canonical branch
+    assert "000003" not in set(bars["symbol"].unique())  # requested but absent that day
+    assert (bars["ts_hms"] == 152000).any()
+
+
+def test_load_normalized_bars_for_entries_returns_empty_when_nothing_resolves(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.ml.champion as champ
+    from src import settings
+
+    monkeypatch.setattr(settings, "HISTORY_DIR", str(tmp_path))
+    entries = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2026-02-01"]),
+        "symbol": ["000001"],
+        "close_price": [10000.0],
+    })
+
+    bars = champ._load_normalized_bars_for_entries(entries)
+
+    assert bars.empty
+
+
+def test_train_tuned_champion_applies_screen_filter() -> None:
+    """Regression: --screen was parsed but config.screen was never applied to dev."""
+    from src.ml.tuning import ChampionTuningConfig
+    from src.ml.universe import ScreenConfig
+
+    permissive = ScreenConfig(change_lower=0.0, min_trade_value_100m=0.0, min_market_cap_100m=0.0)
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10,
+        model_params_override={"num_leaves": 7, "n_estimators": 10}, screen=permissive,
+    )
+    bundle = train_tuned_champion_bundle(
+        _raw_trade_log(n_dates=40, per_day=4), None, cfg, export_dir="tmp/spec_screen_filter"
+    )
+    assert bundle["tuning_provenance"]["screen"] == {
+        "change_lower": 0.0, "change_upper": None, "min_trade_value_100m": 0.0,
+        "min_market_cap_100m": 0.0, "exclude_ceiling": True, "require_index_up": False,
+    }
+    # A strict screen that excludes every row must not silently keep training on the old pool.
+    strict = ScreenConfig(change_lower=0.99)
+    cfg_strict = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=1,
+        model_params_override={"num_leaves": 7, "n_estimators": 10}, screen=strict,
+    )
+    import pytest
+
+    with pytest.raises(ValueError, match="unique groups"):
+        train_tuned_champion_bundle(
+            _raw_trade_log(n_dates=40, per_day=4), None, cfg_strict, export_dir="tmp/spec_screen_strict"
+        )
+
+
+def test_champion_screen_baseline_and_grid_degrade_to_skipped_on_error(monkeypatch) -> None:
+    import src.ml.champion as champ
+    from src.ml.tuning import ChampionTuningConfig
+
+    def _boom(*a, **k):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(champ, "screen_baseline_stats", _boom)
+    monkeypatch.setattr(champ, "evaluate_screen_grid", _boom)
+
+    price_history = _synthetic_price_history(n_dates=40, per_day=4)
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10,
+        model_params_override={"num_leaves": 7, "n_estimators": 10}, label_mode="journaled", cost_mode="flat",
+    )
+    bundle = champ.train_tuned_champion_bundle(
+        _raw_trade_log(n_dates=40, per_day=4), None, cfg, price_history_df=price_history, export_dir="tmp/spec_screen_boom"
+    )
+    assert bundle["tuning_provenance"]["screen_baseline"] == {"status": "skipped", "reason": "boom"}
+    assert bundle["tuning_provenance"]["screen_grid"] == {"status": "skipped", "reason": "boom"}
+
+
+def test_champion_expected_value_policy_degrades_to_skipped_on_error(monkeypatch) -> None:
+    import src.ml.champion as champ
+    from src.ml.tuning import ChampionTuningConfig
+
+    def _boom(*a, **k):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(champ, "select_by_expected_value", _boom)
+
+    cfg = ChampionTuningConfig(
+        hpo_trials=2, seed_ensemble=(13,), require_beats_control=False, min_history_dates=10,
+        model_params_override={"num_leaves": 7, "n_estimators": 10},
+    )
+    bundle = champ.train_tuned_champion_bundle(
+        _raw_trade_log(n_dates=40, per_day=4), None, cfg, export_dir="tmp/spec_ev_boom"
+    )
+    assert bundle["tuning_provenance"]["expected_value_policy"] == {"status": "skipped", "reason": "boom"}
