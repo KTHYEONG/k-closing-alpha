@@ -11,6 +11,7 @@ from src.ml.metrics import mean_group_rank_ic
 from src.ml.oof import purged_oof_predict
 from src.ml.policy_eval import default_policy_candidates, evaluate_single_stock_policy_oof
 from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict, moving_block_bootstrap_delta, path_top1_returns
+from src.ml.validation import ValidationConfig
 from src.serving.realtime.inference import add_close_morning_decision_score
 
 
@@ -49,6 +50,9 @@ class ChampionTuningConfig:
     # Fixed return-model params bypassing Optuna; callers must not mutate the dict.
     model_params_override: dict[str, Any] | None = None
     buyability_target_notional_100m: float | None = None
+    label_mode: str = "journaled"
+    cost_mode: str = "flat"
+    validation: ValidationConfig | None = None
 
     def __post_init__(self) -> None:
         if self.n_splits < 2:
@@ -123,6 +127,17 @@ class ChampionTuningConfig:
             raise ValueError("model_params_override must be a non-empty dict")
         if self.hpo_objective == "cpcv_top1" and self.eval_mode != "cpcv":
             raise ValueError("hpo_objective='cpcv_top1' requires eval_mode='cpcv'")
+        if self.label_mode not in ("journaled", "mechanical"):
+            raise ValueError(f"label_mode must be one of journaled/mechanical, got {self.label_mode!r}")
+        if self.cost_mode not in ("flat", "per_row"):
+            raise ValueError(f"cost_mode must be one of flat/per_row, got {self.cost_mode!r}")
+        if self.validation is not None:
+            if self.oos_reserve_start is None:
+                raise ValueError("oos_reserve_start must be set when validation is configured")
+            if self.validation.oos_reserve_start != self.oos_reserve_start:
+                raise ValueError(
+                    f"oos_reserve_start mismatch: config {self.oos_reserve_start!r} != validation {self.validation.oos_reserve_start!r}"
+                )
 
 
 @dataclass(frozen=True)

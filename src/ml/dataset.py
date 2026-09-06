@@ -6,6 +6,7 @@ import logging
 import numpy as np
 import pandas as pd
 
+from src.ml.decision_labels import DECISION_LABEL_COLUMNS
 from src.ml.feature_manifest import build_feature_manifest
 from src.ml.scenario_panel import build_scenario_action_panel
 from src.processing.schema import RAW_TO_STANDARD_MAP
@@ -138,6 +139,8 @@ _EXCLUDED_FROM_X: set[str] = {
     "sector_cluster_id",
     "label_source",
 }
+
+_EXCLUDED_FROM_X |= set(DECISION_LABEL_COLUMNS)
 
 _TARGET_NAMES: tuple[str, ...] = ("target_return", "target_rank", "target_good", "target_bad")
 

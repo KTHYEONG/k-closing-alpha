@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.ml.bundle import build_inline_bundle, save_bundle
+from src.ml.bundle import build_inline_bundle, fit_seed_ensemble, save_bundle
 from src.ml.dataset import build_ml_dataset, retarget_with_clip
 from src.ml.feature_selection import select_stable_features
 from src.ml.history_features import HISTORY_FEATURE_COLUMNS  # noqa: F401 (used via dataset)
@@ -32,7 +32,10 @@ from src.ml.exit_policy import (  # noqa: F401 (attach/simulate re-exported; res
     summarize_exit_grid,
 )
 from src.ml.buyability import classify_ceiling_entry, evaluate_buyability_sleeves, summarize_buyability_sleeves
+from src.ml.decision_labels import assert_no_label_leakage, build_decision_labels
 from src.execution.cost_model import estimate_round_trip_cost_bp, summarize_cost_breakdown, breakeven_cost_bp
+from src.execution.cost_model import measure_auction_impact_bp
+from src.ml.validation import cpcv_path_evidence, evaluate_locked_oos, publish_bundle, run_promotion_gate
 from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO, _CLOSE_MORNING_RERANKER_CONFIG, add_close_morning_decision_score
 from src.utils.display import Colors
 
@@ -202,14 +205,15 @@ def train_tuned_champion_bundle(
     export_dir: str = "artifacts/models",
     feature_set: str = "close_morning61",
     price_history_df: pd.DataFrame | None = None,
+    production_dir: str = "artifacts/models",
 ) -> dict[str, Any]:
     """PHASE2 tuned orchestrator."""
     x_features, _targets, cat_features, processed_raw = build_ml_dataset(
         trade_log_df, theme_df, feature_set=feature_set, panel_mode="scenario_action", price_history_df=price_history_df
     )
     feature_cols = [c for c in x_features.columns if c not in cat_features]
-    # Retarget with configured clip
-    processed = retarget_with_clip(processed_raw, config.label_clip_lower, config.label_clip_upper)
+    assert_no_label_leakage(feature_cols)
+    processed, label_provenance = build_decision_labels(processed_raw, price_history_df, label_mode=config.label_mode, cost_mode=config.cost_mode, clip_lower=config.label_clip_lower, clip_upper=config.label_clip_upper)
     dev, oos = split_oos(processed, "trade_date", config.oos_reserve_start)
     dev = dev[~classify_ceiling_entry(dev).to_numpy(dtype=bool)]
     assert_oos_excluded(dev, "trade_date", config.oos_reserve_start)
@@ -219,6 +223,7 @@ def train_tuned_champion_bundle(
 
     if config.feature_selection_top_n is not None:
         feature_cols = select_stable_features(dev, feature_cols, "target_return", "trade_date", top_n=config.feature_selection_top_n, min_folds=config.feature_selection_min_folds, model_params=search.best_params, huber_delta=config.huber_delta)
+        assert_no_label_leakage(feature_cols)
 
     # Candidate OOF for blend weight
     candidate_oof = purged_oof_predict(
@@ -238,7 +243,7 @@ def train_tuned_champion_bundle(
     cost_provenance: dict[str, Any] = {"status": "skipped", "reason": "close_price not available on candidate_oof"}
     if "close_price" in candidate_oof.columns:
         try:
-            _costed = estimate_round_trip_cost_bp(candidate_oof, price_col="close_price")
+            _costed = estimate_round_trip_cost_bp(measure_auction_impact_bp(candidate_oof), price_col="close_price", impact_col="auction_impact_bp")
             _bd = summarize_cost_breakdown(_costed)
             cost_provenance = {"status": "evaluated", **dataclasses.asdict(_bd), "breakeven_cost_bp": breakeven_cost_bp(candidate_oof["net_return"].to_numpy(dtype=float), candidate_oof["trade_date"].to_numpy())}
         except ValueError as exc:
@@ -322,13 +327,46 @@ def train_tuned_champion_bundle(
     ctrl_mean = float(np.mean(ctrl_shared)) if ctrl_shared.size else float("nan")
     promotion = evaluate_promotion(cand_shared, ctrl_shared, alpha=config.promotion_alpha); promoted = promotion["promoted"]  # noqa: E702
     # control_vs_candidate wiring needs no extra import (none).
+    n_policy_candidates = len(default_policy_candidates(str(dev["trade_date"].max()) if len(dev) else "1970-01-01"))
+    n_selection_trials = max(1, int(config.hpo_trials) * len(config.p_good_weight_grid) * int(n_policy_candidates))
     try:
         selection_dsr = deflated_sharpe_ratio(
             np.asarray(candidate["scheduled_returns"], dtype=np.float64),
-            n_independent_trials=max(1, search.n_trials),
+            n_independent_trials=n_selection_trials,
         )
     except ValueError:
         selection_dsr = None
+
+    cpcv_evidence: dict[str, Any] | None = None
+    oos_result: dict[str, Any] | None = None
+    oos_fillable: dict[str, Any] | None = None
+    decision = None
+    if config.validation is not None:
+        _eval_col = config.validation.eval_col
+        if _eval_col not in dev.columns or _eval_col not in oos.columns:
+            raise ValueError(
+                f"config.validation requires {_eval_col!r} on dev/oos; pass price_history_df so "
+                "build_decision_labels can attach the executable label (label_mode='journaled' does "
+                "not require it, but a validation protocol always does)"
+            )
+        _cv = CombinatorialPurgedCV(
+            n_groups=config.validation.cpcv_n_groups,
+            k_test=config.validation.cpcv_k_test,
+            purge_gap=config.validation.purge_gap,
+        )
+        cpcv_evidence = cpcv_path_evidence(dev, feature_cols, "target_return", _eval_col, "trade_date", cv=_cv, candidate_params=dict(search.best_params), control_params=None, huber_delta=config.huber_delta, control_huber_delta=0.9)
+        oos_result = evaluate_locked_oos(dev, oos, feature_cols, "target_return", _eval_col, "trade_date", model_params=dict(search.best_params), huber_delta=config.huber_delta, seeds=config.seed_ensemble)
+        try:
+            _ens = fit_seed_ensemble(dev, feature_cols, "target_return", config.seed_ensemble, dict(search.best_params), config.huber_delta)
+            _oos_scored = oos.copy()
+            _oos_scored["pred"] = np.asarray(_ens.predict(oos[feature_cols]), dtype=np.float64)
+            _sleeves = evaluate_buyability_sleeves(_oos_scored, group_col="trade_date", code_col="stock_code", score_col="pred", target_col=_eval_col, target_notional_100m=float(config.validation.target_notional_100m), alpha=config.validation.promotion_alpha)
+            _summary = summarize_buyability_sleeves(_sleeves)
+            _fill = next((r for r in _sleeves if r.sleeve == "fillable"), _sleeves[0])
+            oos_fillable = {"n_days": int(_fill.n_days), "n_rows": int(_fill.n_rows), "top1_mean": float(_fill.top1_mean), "rank_ic": float(_fill.rank_ic), "measured_share": float(_summary.get("measured_share", float("nan")))}
+        except ValueError:  # pragma: no cover - fillable fail-closed guard
+            oos_fillable = None
+        decision = run_promotion_gate(cpcv=cpcv_evidence, oos=oos_result, selection_dsr=selection_dsr, n_selection_trials=n_selection_trials, fillable=oos_fillable, config=config.validation)
 
     if config.require_beats_control and not promoted:
         raise ValueError(
@@ -411,6 +449,25 @@ def train_tuned_champion_bundle(
         "ceiling_excluded_from_pool": {"n_dev_rows": int(len(dev)), "n_control_dev_rows": int(len(control_dev))},  # noqa: RUF046
         "execution_cost": cost_provenance,
     }
+
+    bundle["label_mode"] = config.label_mode
+    bundle["cost_mode"] = config.cost_mode
+    bundle["label_provenance"] = dict(label_provenance)
+    if decision is not None:
+        bundle["promotion_decision"] = {
+            "deployable": bool(decision.deployable),
+            "verdict": str(decision.verdict),
+            "failed_gates": list(decision.failed_gates),
+            "gates": [
+                {"name": g.name, "passed": bool(g.passed), "observed": float(g.observed), "threshold": float(g.threshold), "detail": dict(g.detail)}
+                for g in decision.gates
+            ],
+        }
+        publish_result = publish_bundle(bundle, _candidate_export_dir(export_dir, feature_set, bundle), production_dir, decision)
+        logger.info(
+            f"[EVAL] cand={cand_mean:.6f} ctrl={ctrl_mean:.6f} shared_dates={int(shared.size)} promoted={bool(promoted)} published={publish_result.get('published')}"
+        )
+        return bundle
 
     # Only write artifact if promoted or gate disabled
     if not (config.require_beats_control and not promoted):
