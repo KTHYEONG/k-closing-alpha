@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "ML_VALIDATION_OVERHAUL",
+      "date": "2026-09-06",
+      "adr_id": "ADR_20260906_ML_VALIDATION_OVERHAUL",
+      "domain": "ml",
+      "title": "의사결정 등급 ML 검증: 잠긴 OOS + CPCV 승격 게이트 + 실행가능 라벨",
+      "why": "기존 승격 게이트는 oos_row_count=0(선택과 동일 OOF), DSR이 실선택예산의 1/15로 계산, 라벨이 운영자 재량 청산 포함, 비용이 전종목 동일 46bp 고정",
+      "resolution": "src/ml/validation.py(잠긴 OOS 1회채점+CPCV(8,2) 경로일치+DSR)와 src/ml/decision_labels.py(행별비용+mechanical_gross 실행가능라벨) 신설, champion.py/tuning.py/retrain.py에 배선, publish_bundle로 production 승격 게이트화",
+      "impact": "기존 워크포워드 부트스트랩이 promoted=true(Δ+0.249%p/일,p=0.0012)로 판정한 후보가 CPCV 28-fold에서는 top1 경로승률 0.536<0.60·p=0.508로 research_only 판정 — gate theatre 실증",
+      "archive_path": "docs/decisions/archive/ML_VALIDATION_OVERHAUL/ml_validation_overhaul_contract.json"
+    },
+    {
       "task_id": "CHAMPION_RETRAIN_HOTPATH_OPT",
       "date": "2026-09-06",
       "adr_id": "ADR_20260906_CHAMPION_RETRAIN_HOTPATH_OPT",

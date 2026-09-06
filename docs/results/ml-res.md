@@ -1,82 +1,87 @@
-# ML 재학습·개선 결과 (2026-09-06)
+# ML 검증체계 개편 결과 (2026-09-06)
 
-관련 ADR: `ADR_20260905_BUYABILITY_GATED_RERANKER`, `ADR_20260905_EXECUTION_COST_MODEL`, `ADR_20260906_CEILING_EXCLUDED_PROMOTION_POOL`
+관련 ADR: `ADR_20260906_ML_VALIDATION_OVERHAUL` (archive: `docs/decisions/archive/ML_VALIDATION_OVERHAUL/`)
+이전 아카이브: `ADR_20260905_BUYABILITY_GATED_RERANKER`, `ADR_20260905_EXECUTION_COST_MODEL`, `ADR_20260906_CEILING_EXCLUDED_PROMOTION_POOL`, `ADR_20260906_ROUND_TRIP_COST_46BP`, `ADR_20260906_CHAMPION_RETRAIN_HOTPATH_OPT`
 
-## 1. 핵심 결론
+## 1. 아키텍처 변경
 
-**상한가(+30%) 종가 픽을 학습/승격 풀에서 실제로 제거**(`classify_ceiling_entry` → `champion.py` dev/control_dev 필터링)한 후 처음으로 튜닝된 챔피언이 대조군을 통계적으로 유의하게 이겼다: **Δ+0.185%p/일, p=0.006** (2026-09-06 실행, 40-trial HPO, 실데이터 36,861행). 이전 "리랭커 포화"/"rankIC≈0" 결론은 상한가 오염 상태에서 측정된 것이었다 — 오염 제거 후에는 진짜 개선 여지가 있었다.
+- 신설: `src/ml/decision_labels.py` (행별비용 `attach_per_row_cost_ratio`, 기계적 라벨 `attach_mechanical_return`, 합성 `build_decision_labels`), `src/ml/validation.py` (`ValidationConfig`, `GateOutcome`, `PromotionDecision`, `minimum_detectable_effect`, `paired_t_p_value`, `cpcv_path_evidence`, `evaluate_locked_oos`, `run_promotion_gate`, `publish_bundle`).
+- 배선: `champion.py::train_tuned_champion_bundle` — `retarget_with_clip` → `build_decision_labels`, `assert_no_label_leakage`(feature_cols/select_stable_features 후 2회), `estimate_round_trip_cost_bp`에 `measure_auction_impact_bp` 연결, `config.validation` 설정 시 CPCV path evidence + locked OOS + fillable sleeve → `run_promotion_gate` → `publish_bundle`.
+- `ChampionTuningConfig` 필드 추가: `label_mode`("journaled"|"mechanical", 기본 journaled), `cost_mode`("flat"|"per_row", 기본 flat), `validation: ValidationConfig | None`(기본 None). 기본값은 하위호환(기존 `retarget_with_clip` bit-identical).
+- CLI(`retrain.py`) 추가 플래그: `--label-mode`(기본 mechanical), `--cost-mode`(기본 per_row), `--publish`, `--production-dir`, `--target-notional-100m`(기본 0.5), `--min-ic-path-win-rate`(0.75), `--min-top1-path-win-rate`(0.60), `--min-oos-days`(60). `--publish` 없이 `--oos-reserve-start` 미지정 시 parser.error.
+- 게이트 8종: `cpcv_ic_path_win_rate`(≥0.75), `cpcv_top1_path_win_rate`(≥0.60), `cpcv_delta_significance`(max(p_bootstrap,p_paired_t)<α), `selection_dsr`(≥0.95, n_trials=hpo_trials×|p_good_grid|×|policy_candidates|), `oos_min_days`(≥60), `oos_rank_ic_above_mde`(관측>MDE), `oos_top1_sign`(>0, 부호전용), `fillable_top1_sign`(>0, 부호전용). 전부 통과해야 `deployable`, 하나라도 실패 시 `research_only`(candidate 아티팩트는 항상 저장, production 미교체).
 
-거래비용 모델은 이번 세션에 **두 번 정정**됐다: 최종적으로 매수(~15:19)·매도(~09:00+) 둘 다 연속거래로 체결됨을 운영자가 확인 → 왕복 스프레드 2틱 + 세율 20bp(2026-01-01 시행) = **실측 46.1bp**. 단, 오늘 승격된 모델의 `target_return`은 아직 **구형 20bp 상수**로 계산되어 있어 실비용보다 낙관적이다 — 다음 단계 참조.
+## 2. 실행 중 발견·수정한 버그 (구현 후 실측 실행에서 확인)
 
-## 2. 상한가 배제 (`ADR_20260905_BUYABILITY_GATED_RERANKER` → `ADR_20260906_CEILING_EXCLUDED_PROMOTION_POOL`)
+| 버그 | 위치 | 증상 | 수정 |
+|---|---|---|---|
+| NaN top-1 픽 크래시 | `cpcv_path_evidence`, `evaluate_locked_oos` | 상위-1 픽이 `eval_net_mechanical=NaN`(다음날 가격 없음, 실측 커버리지 99.68~99.71%)인 날짜에서 `moving_block_bootstrap_delta`가 `ValueError: paired series must hold only finite values`로 크래시 | finite 마스크로 해당 날짜/폴드 제외 후 집계. 회귀테스트 `test_cpcv_path_evidence_skips_days_with_unlabelled_top1_pick`, `test_evaluate_locked_oos_skips_days_with_unlabelled_top1_pick` 추가 |
+| 잠재 KeyError (구현 시점 /check에서 발견) | `champion.py` validation 분기 | `label_mode='journaled'`+`validation` 설정+`price_history_df=None` 조합 시 `eval_net_mechanical` 컬럼 부재로 하류 KeyError | `dev`/`oos`에 `config.validation.eval_col` 부재 시 명시적 `ValueError` fail-closed 가드 추가 |
+| 중복 임포트 | `champion.py` | `from src.ml.validation import publish_bundle` 두 번(`# noqa: F811`) | 제거 |
 
-- 정의: `close/prev_close >= 1.29 AND close >= high`. 코퍼스 8.7%(2026년 24.1%), top-1 픽의 41.7%(2026년 68.3%) 차지.
-- 4번 독립 재확인: 상한가 포함 풀 top1은 비현실적 성과(Sharpe 3.14, 연 +802%) → 제외 시 현실적 성과(Sharpe 0.61, 연 +20.7%). CPCV(8,2) 28/28 만장일치로 "제외가 수치를 낮춘다" = 애초 그 알파가 체결 불가능한 픽에서 나온 허수였다는 뜻.
-- **`ADR_20260906`에서 실제 배선**: `champion.py`의 `dev`/`control_dev`에서 상한가 행 제거(학습·승격 게이트 양쪽 동일 적용) + `predict.py` 실서빙에서 상한가 종목 강제 Pass/배분0.
-- 등락률 순위 필터·비용 순위 필터·top-K 랭킹 결합 등 추가로 탐색한 "종목 선정 로직"은 **전부 무효화됨**(재검증 스크립트의 룩어헤드 버그로 인한 허상 성과였음, §4 참조) — 상한가 배제만 유일하게 살아남음.
+## 3. 실측 결과 — Arm A: `label_mode=journaled, cost_mode=flat`
 
-## 3. 실행 결과 — 첫 승격 (`ADR_20260906`, 2026-09-06)
+명령: `uv run python -m src.ml.retrain --tuned --oos-reserve-start 2025-09-01 --label-mode journaled --cost-mode flat --hpo-trials 40`
+번들: `artifacts/models/research/exp_a_journaled_flat/close_morning61_2025-08-29/sizing_pipeline_bundle.joblib`
+데이터: 전체 36,744행(패널복원+상한가배제 후 dev 33,547행 상당), dev 기간 2016-01-04~2025-08-29, 잠긴 OOS 2025-09-01~ (245일, 4,514행). `label_provenance`: `n_dropped_no_mechanical=0`(journaled 모드는 미보유 라벨 드롭 안 함), `mechanical_coverage=0.99712`.
 
-`train_tuned_champion_bundle` 전체 실행(HPO 40 trials, 소요 809.9초, `price_history` 신선도 정상):
+### 3.1 판정 비교 (동일 실행, 두 개의 승격 기준)
 
-| | Candidate (튜닝) | Control (기본값) |
-|---|---:|---:|
-| 일평균 target_return | **+0.921%** | +0.735% |
-| Sharpe | **4.18** | 3.48 |
-| 승률 | 52.0% | 51.1% |
-| Profit Factor | **2.12** | 1.86 |
+| 판정 경로 | 결과 | 델타 | p값 | 표본 |
+|---|---|---:|---:|---|
+| 기존 워크포워드 부트스트랩(레거시 게이트) | `promoted: true` | +0.249%p/일 (cand 0.809% vs ctrl 0.559%) | 0.0012 | dev 공유일 1,975 |
+| **신규 CPCV(8,2) 경로일치 + 잠긴OOS 8게이트** | **`research_only`** | pooled path Δ | max(p_bootstrap,p_paired_t)=0.508 | CPCV 28-path |
 
-**Δ+0.185%p/일, p=0.006, CI[+0.053%,+0.312%] → `promoted: true`**. HPO 최적: `num_leaves=63, lr=0.024, n_estimators=650`(rank_ic=0.207). p_good 블렌드 가중치 0.0 재확인(계속 무효). 상한가 배제로 dev/control_dev 각 33,547행(36,861행 중 ~9% 제거).
+**결론: 동일 후보가 레거시 기준으로는 승격, 신규 기준으로는 미승격.** 레거시 판정은 선택과 동일한 OOF 위에서만 유의했던 것으로 재확인됨.
 
-**⚠️ 이 수치는 여전히 구형 20bp 비용 가정 위에서 계산됨** — `create_multi_targets`가 `ROUND_TRIP_COST_RATIO`(0.0020)로 비용을 차감하는데, 같은 실행의 `execution_cost` provenance는 실측 **46.1bp**(statutory 20bp+spread 26.1bp)를 보고한다. candidate가 control을 이긴다는 판정(Δ, p값)은 양쪽에 동일하게 적용된 편향이라 유효하지만, 절대 수익률(+0.92%/일)은 실비용 반영 시 더 낮아진다.
+### 3.2 게이트별 상세
 
-## 4. 거래비용 모델 정정 경위 (`ADR_20260905_EXECUTION_COST_MODEL`)
+| gate | passed | observed | threshold | mde | 비고 |
+|---|:--:|---:|---:|---:|---|
+| cpcv_ic_path_win_rate | ✅ | 0.750 | 0.750 | 0.00823 | 정확히 경계 |
+| cpcv_top1_path_win_rate | ❌ | 0.536 (15/28) | 0.600 | 0.00123 | 미달 |
+| cpcv_delta_significance | ❌ | p=0.508 | 0.05 | 0.00123 | p_bootstrap=0.508, p_paired_t=0.131 |
+| selection_dsr | ✅ | 0.99999999 | 0.95 | — | n_selection_trials=600(40×5×3) |
+| oos_min_days | ✅ | 245 | 60 | — | |
+| oos_rank_ic_above_mde | ✅ | 0.05847 | 0.05662(=mde) | 0.05662 | 경계 통과 |
+| oos_top1_sign | ✅ | +0.00920 (%/일) | 0 | 0.01878 | 부호만, MDE 대비 16배 작아 크기 판별 불가 |
+| fillable_top1_sign | ✅ | +0.00466 (%/일) | 0 | — | measured_share=0.9909 |
 
-세 번의 시행착오:
-1. **최초**: 왕복 2틱 스프레드 + 세금 가정 → 46.9bp
-2. **오판**: "종가매매는 동시호가(단일가매매) 체결이라 스프레드 없음" → `round_trip_ticks=0`으로 "정정" → 20bp — **틀림**
-3. **운영자 확인 후 재정정**: 매수는 15:19 **연속거래**(동시호가 시작 직전 시장가/지정가, 상따는 15:00~15:19 관찰 후 매수), 매도도 09:00 직후 **연속거래**. 둘 다 스프레드 크로싱 발생 → 원래(1번) 가정이 맞았음. 세율만 2026-01-01 시행분(코스피/코스닥 공통 0.20%, 매도시에만) 반영해 21→20bp로 소폭 갱신. **최종 실측 46.1bp.**
+### 3.3 HPO/코스트/기타 provenance
 
-같은 재검증 중 별개로, 분석 스크립트 자체의 룩어헤드 버그(`attach_next_day_path`가 붙인 익일 OHLC 컬럼이 모델 피처에 실수로 포함됨) 발견 — 이 버그 상태에서 "등락률 필터+top3 랭킹" 조합이 Sharpe 1.69로 보였으나 버그 수정 후 Sharpe -0.15로 완전 무효.
+- HPO: 40 trials, `best_value(rank_ic)=0.22666`. `p_good_weight`=0.0(계속 무효).
+- `control_vs_candidate`(레거시): shared_dates=1975, cand_mean=0.008086, ctrl_mean=0.005594, ci=[0.000949, 0.003924].
+- `execution_cost`: statutory=20.0bp, spread=26.182bp, auction_impact=NaN, total=46.182bp, n_rows=27479, **n_impact_measured=0**(dev 구간 대부분 분봉 파티션 미보유 — 2025년만 부분 존재, `measure_auction_impact_bp` 배선은 됐으나 실측 0건), breakeven=19.511bp.
+- `buyability_sleeves`: status=evaluated (이전 실행은 skipped였음 — `target_notional_100m` CLI 기본값 0.5 배선 확인).
 
-## 5. 청산 타이밍 레버 (여전히 미승격)
+## 4. 미실행 Arm (다음 액션)
 
-같은 2026-09-06 실행의 `exit_policy_grid`:
+R14 프로토콜의 나머지 2개 arm은 동일 조건(`--oos-reserve-start 2025-09-01`, hpo-trials=40, 동일 seed)으로 미실행:
 
-| TP | 후보 평균 | 현행 평균 | Δ | p | 승격 |
-|---|---:|---:|---:|---:|:--:|
-| 3% | 0.518% | 0.427% | +0.091%p | 0.323 | ❌ |
-| 4% | 0.585% | 0.427% | +0.158%p | 0.133 | ❌ |
-| 5% | 0.583% | 0.427% | +0.156%p | 0.164 | ❌ |
+| arm | 명령 플래그 | 목적 |
+|---|---|---|
+| B | `--label-mode journaled --cost-mode per_row` | 라벨 고정, 비용만 행별화(실측 분산 p10 32.6bp~p90 60.0bp)했을 때 게이트 영향 분리 |
+| C | `--label-mode mechanical --cost-mode per_row` | 운영자 재량 청산 제거, 기계적 실행가능 라벨(사전근거: rankIC +0.0375 p<1e-4, CPCV 27/28) — **헤드라인 top-1 하락 예상**, rankIC 개선이 실제 레버 |
 
-이전 세션(§구버전, `ADR_20260903_ML_EXIT_POLICY_RESEARCH`)에서 통과했던 TP5%(p=0.0024)가 이번 CPCV 재평가에서는 미통과 — 표본/기간 차이로 추정, 재확인 필요. 실체결률 측정이 여전히 승격 전제조건.
+각 arm 실측 소요시간 ~20분(arm A: 18:57~19:17). B/C는 미실행 상태이며 §3의 표 형식 그대로 채워 넣을 것.
 
-## 6. 검정력 분석 — 대기로 해결 불가 (변경 없음)
+## 5. 이전 세션 결과 (참고, 레거시 게이트 기준 — 위 §3.1로 대체됨)
 
-일별 페어드 노이즈(2021+, n=1,352일): top1 sd=4.667%/일, rankIC sd=0.2745. top1 +25bp/일 효과 검출에 2,732일(10.8년) 필요. 진입일 분봉 미시구조 피처는 확증 불가.
+| 실행일 | 비용가정 | Candidate 일평균 | Control 일평균 | Δ | p | 레거시 판정 |
+|---|---|---:|---:|---:|---:|:--:|
+| 2026-09-06 (상한가배제 첫 승격) | 20bp(구형) | +0.921% | +0.735% | +0.185%p | 0.006 | promoted |
+| 2026-09-06 (46bp 재검증) | 46bp(실측 flat) | +0.729% | +0.404% | +0.326%p | 0.0000 | promoted |
+| 2026-09-06 (Arm A, 신규 게이트) | 46bp(flat) | 0.809%(dev만) | 0.559% | +0.249%p | 0.0012(레거시)/0.508(CPCV) | **research_only** |
+
+상한가 배제(`classify_ceiling_entry`)와 46bp 비용 상수 자체는 유효하며 변경 없음 — 무효화된 것은 "레거시 워크포워드 부트스트랩 단독으로 승격 판정"이라는 **방법론**.
+
+## 6. 검정력 배경 (변경 없음)
+
+일별 페어드 노이즈(2021+, n=1,352일): top1 sd=4.667%/일, rankIC sd=0.2745. top1 +25bp/일 검출에 2,732일(10.8년) 필요 → OOS top-1 게이트는 부호전용일 수밖에 없는 이유. rankIC는 244일 창에서 MDE≈0.049~0.057로 판별 가능 → 승격 판정의 주 통계량.
 
 ## 7. 다음 단계
 
-1. **최우선**: `create_multi_targets`의 `ROUND_TRIP_COST_RATIO`를 실측 46bp로 갱신 후 오늘 승격된 모델을 재검증 — 지금 판정은 구형 20bp 가정 위에 있음.
-2. 청산일 분봉 백필 실행(`src/backfill/intraday/backfill_minute_history.py`) — KIS 보관한도 소실 진행 중.
-3. `buyability_sleeves`를 실제 포지션 사이즈로 활성화(`buyability_target_notional_100m` 설정) — 이번 실행은 skipped.
-4. 청산 타이밍 TP grid, 이전 세션 대비 재현성 확인(§5의 p값 차이 원인 규명).
-
-## 8. 46bp 실측 비용 재검증 (`round_trip_cost_46bp`, 2026-09-06)
-
-`ROUND_TRIP_COST_RATIO`를 `_STATUTORY_COST_RATIO(0.0020) + _SPREAD_COST_RATIO(0.0026) = 0.0046`으로 갱신 후 `uv run python -m src.ml.retrain --tuned` 전체 실행(HPO 40 trials, walkforward, panel restoration on, 소요 ~870초):
-
-| | Candidate (튜닝) | Control (기본값) |
-|---|---:|---:|
-| 일평균 target_return | **+0.729%** | +0.404% |
-| Sharpe | **3.35** | 1.88 |
-| 승률 | 50.8% | 47.2% |
-| Profit Factor | **1.83** | 1.40 |
-
-**Δ+0.326%p/일, p=0.0000, CI[+0.184%,+0.473%] → `promoted: true`** (shared_dates 2,175, moving_block_bootstrap, α=0.10). 구형 20bp에서의 Δ+0.185%p(p=0.006) 대비 델타가 커졌고 승격 판정은 유지된다 — 동일 상수 이동은 양쪽에 동일 적용되므로 판정은 모델 품질이 구동한다(R3). HPO 최적: `num_leaves=54, lr=0.0292, n_estimators=300`(rank_ic=0.20207). p_good 블렌드 가중치 0.0 재확인. dev/control_dev 각 33,547행(동일 패널). 산출 번들: `artifacts/models/close_morning61_2026-09-03/sizing_pipeline_bundle.joblib` (`round_trip_cost` 0.0046 양쪽 경로 일치).
-
-`execution_cost` provenance: statutory 20.0bp + spread 26.12bp = **total 46.12bp** (n_rows 30,999, `n_impact_measured` 0 — 인트라데이 미연결 시 fail-open, breakeven 18.32bp). 결정→동시호가 드리프트는 라벨 상수에 합산하지 않고 `auction_impact_bp` 행별 항으로 분리 유지(R6).
-
-클래스 균형 이동(dev 패널 33,547행, `LABEL_THRESHOLDS` 0.01/-0.02 고정): 20bp 가정 시 target_good 31.48% / target_bad 26.06% → 46bp 실측 시 **target_good 28.18% / target_bad 29.93%**. 의도된 효과이며 임계값은 이동하지 않음(R5).
-
-`exit_policy_grid`는 여전히 미승격(TP3% p=0.405 등) — 청산 레버 결론 변경 없음.
+1. Arm B, C 실행 후 본 문서 §3 형식으로 추가.
+2. `n_impact_measured=0` 해소: 청산일 분봉 백필(`src/backfill/intraday/backfill_minute_history.py`) 이후 dev 구간 경매임팩트 실측 재실행.
+3. `cpcv_top1_path_win_rate`(0.536) 미달 원인 분해 — 어떤 CPCV 폴드(연도/구간)에서 후보가 대조군에 지는지 폴드별 breakdown 추가.
+4. `oos_rank_ic_above_mde`가 경계(0.0585 vs MDE 0.0566)라 표본 추가 시 뒤집힐 수 있음 — 다음 재학습에서 재확인.
