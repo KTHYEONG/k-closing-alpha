@@ -35,7 +35,12 @@ from src.ml.buyability import classify_ceiling_entry, evaluate_buyability_sleeve
 from src.ml.decision_labels import assert_no_label_leakage, build_decision_labels
 from src.execution.cost_model import estimate_round_trip_cost_bp, summarize_cost_breakdown, breakeven_cost_bp
 from src.execution.cost_model import measure_auction_impact_bp
-from src.ml.validation import cpcv_path_evidence, evaluate_locked_oos, publish_bundle, run_promotion_gate
+from src.ml.validation import cpcv_path_evidence, evaluate_locked_oos, evaluate_screen_grid, publish_bundle, run_promotion_gate, temporal_sign_consistency
+from src.ml.universe import SCREEN_REGISTRY, apply_screen_mask, screen_baseline_stats
+from src.ml.expected_value import expected_net_value, select_by_expected_value
+from src.execution.passive_fill import measure_execution_profile, simulate_passive_entry
+from src.data.intraday_store import intraday_partition_path
+from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, normalize_bar_frame
 from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO, _CLOSE_MORNING_RERANKER_CONFIG, add_close_morning_decision_score
 from src.utils.display import Colors
 
@@ -198,6 +203,80 @@ def evaluate_promotion(cand_returns: np.ndarray, ctrl_returns: np.ndarray, *, al
     }
 
 
+def _load_normalized_bars_for_entries(entries: pd.DataFrame, *, bar_interval_minutes: int = 1, session: str = "regular") -> pd.DataFrame:
+    """Load only the needed (date, symbol) bars, normalizing raw vendor partitions.
+
+    242/243 on-disk partitions are unnormalized KIS output keyed by '종목코드'
+    (see src/ml/buyability.py's attach_entry_auction_liquidity for the same
+    fix) -- read_intraday_range concatenates them verbatim, so simulate_passive_entry
+    would see neither 'symbol' nor 'ts_hms' without this normalization pass.
+    Reads one partition per distinct OOS date rather than the whole range.
+    """
+    dates = pd.to_datetime(entries["trade_date"]).dt.strftime("%Y-%m-%d").unique().tolist()
+    wanted_by_date: dict[str, set[str]] = {}
+    for d, sym in zip(pd.to_datetime(entries["trade_date"]).dt.strftime("%Y-%m-%d"), entries["symbol"].astype(str).str.zfill(6), strict=True):
+        wanted_by_date.setdefault(d, set()).add(sym)
+    parts: list[pd.DataFrame] = []
+    for d in dates:
+        path = intraday_partition_path(bar_interval_minutes, d, session)
+        if not path.exists():
+            continue
+        try:
+            raw = pd.read_parquet(path)
+        except Exception as exc:  # pragma: no cover - unreadable partition
+            logger.warning("[DATA] execution_profile partition read failed date=%s path=%s: %s", d, path, exc)
+            continue
+        if raw is None or len(raw) == 0:
+            continue
+        if set(CANONICAL_BAR_COLUMNS).issubset(set(raw.columns)):
+            frame = raw.copy()
+            frame["symbol"] = frame["symbol"].astype(str).str.zfill(6)
+            parts.append(frame[frame["symbol"].isin(wanted_by_date[d])])
+            continue
+        vendor = "ls" if "jdiff_vol" in raw.columns else "kis"
+        raw_symbol_col = "symbol" if "symbol" in raw.columns else ("종목코드" if "종목코드" in raw.columns else None)
+        if raw_symbol_col is None:
+            continue
+        for sym in wanted_by_date[d]:
+            sub = raw[raw[raw_symbol_col].astype(str).str.zfill(6) == sym]
+            if len(sub) == 0:
+                continue
+            try:
+                parts.append(normalize_bar_frame(sub, vendor, d, sym))
+            except Exception as exc:  # pragma: no cover - malformed partition
+                logger.warning("[DATA] execution_profile normalize failed date=%s symbol=%s: %s", d, sym, exc)
+                continue
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True)
+
+
+def measure_oos_execution_profile(oos_scored: pd.DataFrame, eval_col: str) -> dict[str, Any] | None:
+    """R1: measure fill rate/adverse selection for the OOS top-1 pick.
+
+    Best-effort against the OOS-window intraday store; returns None (fail-open)
+    when bars are unavailable so run_promotion_gate's execution_profile_measured
+    gate fails closed rather than crashing.
+    """
+    try:
+        if len(oos_scored) == 0 or "pred" not in oos_scored.columns:
+            raise ValueError("oos_scored is empty or missing pred")
+        oos_top1_idx = oos_scored.groupby("trade_date", sort=True)["pred"].idxmax()
+        entries = oos_scored.loc[oos_top1_idx, ["trade_date", "stock_code", "close_price"]].copy()
+        entries["symbol"] = entries["stock_code"].astype(str)
+        if pd.to_datetime(entries["trade_date"]).isna().all():
+            raise ValueError("no OOS dates to measure execution against")
+        bars = _load_normalized_bars_for_entries(entries)
+        if len(bars) == 0:
+            raise ValueError("no intraday bars available in the OOS window")
+        filled = simulate_passive_entry(entries, bars, offset_ticks=1)
+        filled["mechanical_gross"] = oos_scored.loc[oos_top1_idx, eval_col].to_numpy(dtype=np.float64)
+        return measure_execution_profile(filled)
+    except (ValueError, KeyError) as exc:
+        logger.info("[EVAL] execution_profile status=skipped reason=%s", str(exc))
+        return None
+
+
 def train_tuned_champion_bundle(
     trade_log_df: pd.DataFrame,
     theme_df: pd.DataFrame | None,
@@ -216,7 +295,30 @@ def train_tuned_champion_bundle(
     processed, label_provenance = build_decision_labels(processed_raw, price_history_df, label_mode=config.label_mode, cost_mode=config.cost_mode, clip_lower=config.label_clip_lower, clip_upper=config.label_clip_upper)
     dev, oos = split_oos(processed, "trade_date", config.oos_reserve_start)
     dev = dev[~classify_ceiling_entry(dev).to_numpy(dtype=bool)]
+    if config.screen is not None:
+        dev = dev[apply_screen_mask(dev, config.screen)]
     assert_oos_excluded(dev, "trade_date", config.oos_reserve_start)
+    screen_baseline: dict[str, Any] = {"status": "skipped", "reason": "mechanical_gross not available"}
+    if "mechanical_gross" in dev.columns and len(dev) > 0:
+        try:
+            screen_baseline = {"status": "evaluated", **screen_baseline_stats(dev, group_col="trade_date", gross_col="mechanical_gross", cost_ratio=float(ROUND_TRIP_COST_RATIO))}
+        except ValueError as exc:
+            screen_baseline = {"status": "skipped", "reason": str(exc)}
+    screen_grid_provenance: dict[str, Any] = {"status": "skipped", "reason": "mechanical_gross not available"}
+    n_screen_trials = 1
+    if "mechanical_gross" in dev.columns and len(dev) > 0:
+        try:
+            _grid_panel = dev.assign(
+                daily_change_pct=pd.to_numeric(dev["change_rate"], errors="coerce") / 100.0,
+                close=dev["close_price"],
+                high=dev["high_price"],
+            )
+            screen_grid_provenance = {"status": "evaluated", **evaluate_screen_grid(
+                _grid_panel, tuple(SCREEN_REGISTRY.values()), group_col="trade_date", gross_col="mechanical_gross", cost_ratio=float(ROUND_TRIP_COST_RATIO),
+            )}
+            n_screen_trials = int(screen_grid_provenance.get("selection_trials_multiplier", 1))
+        except (ValueError, KeyError) as exc:
+            screen_grid_provenance = {"status": "skipped", "reason": str(exc)}
 
     # HPO
     search = TunedSearchResult(best_params=dict(config.model_params_override), best_value=float("nan"), objective="override", n_trials=0, trials=()) if config.model_params_override is not None else tune_return_model_params(dev, feature_cols, "target_return", "trade_date", config)
@@ -328,7 +430,9 @@ def train_tuned_champion_bundle(
     promotion = evaluate_promotion(cand_shared, ctrl_shared, alpha=config.promotion_alpha); promoted = promotion["promoted"]  # noqa: E702
     # control_vs_candidate wiring needs no extra import (none).
     n_policy_candidates = len(default_policy_candidates(str(dev["trade_date"].max()) if len(dev) else "1970-01-01"))
-    n_selection_trials = max(1, int(config.hpo_trials) * len(config.p_good_weight_grid) * int(n_policy_candidates))
+    # R3: a screen grid search is a selection decision like HPO/blend/policy and
+    # must inflate the DSR trial count by the same multiplier.
+    n_selection_trials = max(1, int(config.hpo_trials) * len(config.p_good_weight_grid) * int(n_policy_candidates) * n_screen_trials)
     try:
         selection_dsr = deflated_sharpe_ratio(
             np.asarray(candidate["scheduled_returns"], dtype=np.float64),
@@ -337,11 +441,46 @@ def train_tuned_champion_bundle(
     except ValueError:
         selection_dsr = None
 
+    # R4: expected-value policy alongside always_buy_top1, reported regardless
+    # of config.policy_mode so the always-buy default's cost is always visible.
+    expected_value_provenance: dict[str, Any] = {"status": "skipped", "reason": "candidate_oof missing cost_ratio/pred"}
+    if {"cost_ratio", "pred"}.issubset(candidate_oof.columns):
+        try:
+            # EV must be scored on the out-of-fold prediction, never on the
+            # realized target_return -- that would be look-ahead.
+            ev = expected_net_value(
+                candidate_oof["pred"].to_numpy(dtype=np.float64),
+                candidate_oof["cost_ratio"].to_numpy(dtype=np.float64),
+                fill_prob=np.ones(len(candidate_oof), dtype=np.float64),
+                adverse_bp=np.zeros(len(candidate_oof), dtype=np.float64),
+            )
+            ev_df = candidate_oof[["trade_date", "target_return"]].copy()
+            ev_df["ev"] = ev
+            ev_picks = select_by_expected_value(ev_df, group_col="trade_date", ev_col="ev", min_ev=0.0, max_positions=1)
+            n_days_total = int(ev_df["trade_date"].nunique())
+            expected_value_provenance = {
+                "status": "evaluated",
+                "n_days_total": n_days_total,
+                "n_days_with_position": int(ev_picks.attrs.get("n_days", 0)),
+                "buy_rate": float(ev_picks.attrs.get("n_days", 0) / n_days_total) if n_days_total else float("nan"),
+                "mean_ev": float(ev_picks["ev"].mean()) if len(ev_picks) else float("nan"),
+                # realized outcome on the days the EV policy would have traded
+                "mean_realized_return": float(ev_picks["target_return"].mean()) if len(ev_picks) else float("nan"),
+                "mde": float(ev_picks.attrs.get("mde", float("nan"))),
+            }
+        except (ValueError, KeyError) as exc:
+            expected_value_provenance = {"status": "skipped", "reason": str(exc)}
+
     cpcv_evidence: dict[str, Any] | None = None
     oos_result: dict[str, Any] | None = None
     oos_fillable: dict[str, Any] | None = None
+    execution_profile: dict[str, Any] | None = None
     decision = None
     if config.validation is not None:
+        try:
+            temporal = temporal_sign_consistency(pd.Series(candidate["scheduled_returns"], index=pd.Index(candidate["dates"])), split_date=config.validation.temporal_split_date)
+        except ValueError:
+            temporal = {"sign_consistent": False, "first_mean": float("nan"), "second_mean": float("nan"), "n_first": 0, "n_second": 0}
         _eval_col = config.validation.eval_col
         if _eval_col not in dev.columns or _eval_col not in oos.columns:
             raise ValueError(
@@ -366,7 +505,10 @@ def train_tuned_champion_bundle(
             oos_fillable = {"n_days": int(_fill.n_days), "n_rows": int(_fill.n_rows), "top1_mean": float(_fill.top1_mean), "rank_ic": float(_fill.rank_ic), "measured_share": float(_summary.get("measured_share", float("nan")))}
         except ValueError:  # pragma: no cover - fillable fail-closed guard
             oos_fillable = None
-        decision = run_promotion_gate(cpcv=cpcv_evidence, oos=oos_result, selection_dsr=selection_dsr, n_selection_trials=n_selection_trials, fillable=oos_fillable, config=config.validation)
+        # R1: measure execution before ANY promotion. Best-effort against the
+        # OOS-window intraday store; fail-open to None (gate fails closed).
+        execution_profile = measure_oos_execution_profile(_oos_scored, _eval_col)
+        decision = run_promotion_gate(cpcv=cpcv_evidence, oos=oos_result, selection_dsr=selection_dsr, n_selection_trials=n_selection_trials, fillable=oos_fillable, config=config.validation, temporal=temporal, execution_profile=execution_profile)
 
     if config.require_beats_control and not promoted:
         raise ValueError(
@@ -448,6 +590,12 @@ def train_tuned_champion_bundle(
         "buyability_sleeves": buyability_provenance,
         "ceiling_excluded_from_pool": {"n_dev_rows": int(len(dev)), "n_control_dev_rows": int(len(control_dev))},  # noqa: RUF046
         "execution_cost": cost_provenance,
+        "screen": dataclasses.asdict(config.screen) if config.screen is not None else None,
+        "screen_baseline": screen_baseline,
+        "screen_grid": screen_grid_provenance,
+        "n_screen_trials": int(n_screen_trials),
+        "expected_value_policy": expected_value_provenance,
+        "execution_profile": execution_profile,
     }
 
     bundle["label_mode"] = config.label_mode
