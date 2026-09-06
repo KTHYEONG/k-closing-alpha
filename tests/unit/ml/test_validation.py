@@ -107,6 +107,8 @@ def test_run_promotion_gate_promotes_when_every_gate_passes() -> None:
     decision = run_promotion_gate(
         cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600,
         fillable=fillable, config=config,
+        temporal={"sign_consistent": True, "first_mean": 0.002, "second_mean": 0.0011},
+        execution_profile={"fill_rate": 0.4, "saving_survives_adverse_selection": True},
     )
 
     assert decision.deployable is True
@@ -208,6 +210,7 @@ def test_validation_config_rejects_out_of_domain_settings() -> None:
     assert cfg.min_ic_path_win_rate == 0.75
     assert cfg.min_top1_path_win_rate == 0.60
     assert cfg.min_oos_days == 60
+    assert cfg.require_execution_profile is True
 
     with pytest.raises(ValueError, match="oos_reserve_start"):
         ValidationConfig(oos_reserve_start="not-a-date")
@@ -217,6 +220,8 @@ def test_validation_config_rejects_out_of_domain_settings() -> None:
         ValidationConfig(oos_reserve_start="2025-09-01", promotion_alpha=0.0)
     with pytest.raises(ValueError, match="min_oos_days"):
         ValidationConfig(oos_reserve_start="2025-09-01", min_oos_days=0)
+    with pytest.raises(ValueError, match="require_execution_profile"):
+        ValidationConfig(oos_reserve_start="2025-09-01", require_execution_profile="yes")  # type: ignore[arg-type]
 
 def test_evaluate_locked_oos_rejects_dev_overlap_and_scores_once() -> None:
     import numpy as np
@@ -506,3 +511,191 @@ def test_run_promotion_gate_fillable_none_and_opt_out() -> None:
     cfg_opt = ValidationConfig(oos_reserve_start="2025-09-01", require_fillable_sleeve=False)
     opt = run_promotion_gate(cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600, fillable=None, config=cfg_opt)
     assert "fillable_top1_sign" not in opt.failed_gates
+
+
+def test_temporal_sign_consistency_blocks_a_half_sample_flip() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.validation import temporal_sign_consistency
+
+    idx = pd.to_datetime(pd.date_range("2019-01-01", periods=400, freq="D"))
+    # positive in the first half, negative in the second -- the measured failure shape
+    flipping = pd.Series(np.concatenate([np.full(200, 0.002), np.full(200, -0.0015)]), index=idx)
+    stable = pd.Series(np.full(400, 0.0012), index=idx)
+
+    bad = temporal_sign_consistency(flipping, split_date="2019-07-20")
+    good = temporal_sign_consistency(stable, split_date="2019-07-20")
+
+    assert bad["sign_consistent"] is False
+    assert bad["first_mean"] > 0.0 > bad["second_mean"]
+    assert bad["n_first"] > 0 and bad["n_second"] > 0
+    assert good["sign_consistent"] is True
+    assert np.isclose(good["first_mean"], 0.0012)
+
+
+def test_run_promotion_gate_blocks_temporal_sign_flip() -> None:
+    from src.ml.validation import ValidationConfig, run_promotion_gate
+
+    cpcv = {
+        "path_deltas": [0.003] * 28, "n_path_deltas": 28,
+        "top1_path_win_rate": 0.86, "ic_path_win_rate": 0.96,
+        "pooled_delta": 0.0033, "p_bootstrap": 0.0, "p_paired_t": 0.0012,
+        "ic_candidate": 0.20, "ic_control": 0.17, "ic_delta": 0.03,
+        "mde_top1": 0.0027, "mde_ic": 0.016,
+    }
+    oos = {"n_days": 244, "n_rows": 3800, "top1_mean": 0.006, "top1_sd": 0.046,
+           "top1_sharpe": 2.0, "rank_ic": 0.13, "mde_top1": 0.83, "mde_ic": 0.049,
+           "first_date": "2025-09-01", "last_date": "2026-08-25"}
+    fillable = {"n_days": 200, "top1_mean": 0.004, "rank_ic": 0.11, "measured_share": 0.90}
+    config = ValidationConfig(oos_reserve_start="2025-09-01")
+
+    flipped = run_promotion_gate(
+        cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600, fillable=fillable,
+        config=config, temporal={"sign_consistent": False, "first_mean": 0.002, "second_mean": -0.0015},
+    )
+    assert flipped.deployable is False
+    assert "temporal_sign_consistency" in flipped.failed_gates
+
+    held = run_promotion_gate(
+        cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600, fillable=fillable,
+        config=config, temporal={"sign_consistent": True, "first_mean": 0.002, "second_mean": 0.0011},
+        execution_profile={"fill_rate": 0.4, "saving_survives_adverse_selection": True},
+    )
+    assert held.deployable is True
+
+
+def test_run_promotion_gate_blocks_unmeasured_execution_profile() -> None:
+    """R1: promotion requires execution to have been measured at all -- the
+    gate does not require the measurement to be favourable, since
+    fill_rate_is_upper_bound already caps how optimistic it can be."""
+    from src.ml.validation import ValidationConfig, run_promotion_gate
+
+    cpcv = {
+        "path_deltas": [0.003] * 28, "n_path_deltas": 28,
+        "top1_path_win_rate": 0.86, "ic_path_win_rate": 0.96,
+        "pooled_delta": 0.0033, "p_bootstrap": 0.0, "p_paired_t": 0.0012,
+        "ic_candidate": 0.20, "ic_control": 0.17, "ic_delta": 0.03,
+        "mde_top1": 0.0027, "mde_ic": 0.016,
+    }
+    oos = {"n_days": 244, "n_rows": 3800, "top1_mean": 0.006, "top1_sd": 0.046,
+           "top1_sharpe": 2.0, "rank_ic": 0.13, "mde_top1": 0.83, "mde_ic": 0.049,
+           "first_date": "2025-09-01", "last_date": "2026-08-25"}
+    fillable = {"n_days": 200, "top1_mean": 0.004, "rank_ic": 0.11, "measured_share": 0.90}
+    temporal = {"sign_consistent": True, "first_mean": 0.002, "second_mean": 0.0011}
+    config = ValidationConfig(oos_reserve_start="2025-09-01")
+
+    unmeasured = run_promotion_gate(
+        cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600, fillable=fillable,
+        config=config, temporal=temporal, execution_profile=None,
+    )
+    assert unmeasured.deployable is False
+    assert "execution_profile_measured" in unmeasured.failed_gates
+
+    # Unfavourable savings still count as "measured" -- the gate is about
+    # measurement having happened, not about the number being good.
+    unfavourable = run_promotion_gate(
+        cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600, fillable=fillable,
+        config=config, temporal=temporal,
+        execution_profile={"fill_rate": 0.3, "saving_survives_adverse_selection": False},
+    )
+    assert unfavourable.deployable is True
+    assert "execution_profile_measured" not in unfavourable.failed_gates
+
+    # Opting out of the requirement passes even without a measurement.
+    opted_out_config = ValidationConfig(oos_reserve_start="2025-09-01", require_execution_profile=False)
+    opted_out = run_promotion_gate(
+        cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600, fillable=fillable,
+        config=opted_out_config, temporal=temporal, execution_profile=None,
+    )
+    assert opted_out.deployable is True
+
+
+def test_evaluate_screen_grid_charges_the_selection_budget() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.universe import ScreenConfig
+    from src.ml.validation import evaluate_screen_grid
+
+    rng = np.random.default_rng(1)
+    days = pd.to_datetime(pd.date_range("2024-01-01", periods=120, freq="D"))
+    rows = 6
+    n = len(days) * rows
+    panel = pd.DataFrame({
+        "trade_date": np.repeat(days.to_numpy(), rows),
+        "symbol": [f"{i % 40:06d}" for i in range(n)],
+        "daily_change_pct": rng.uniform(0.0, 0.25, size=n),
+        "trade_value_100m": rng.uniform(50.0, 5000.0, size=n),
+        "market_cap_100m": rng.uniform(600.0, 50000.0, size=n),
+        "mechanical_gross": rng.normal(loc=0.002, scale=0.02, size=n),
+    })
+    grid = (
+        ScreenConfig(change_lower=0.10, min_trade_value_100m=100.0, min_market_cap_100m=500.0),
+        ScreenConfig(change_lower=0.02, change_upper=0.15, min_trade_value_100m=100.0, min_market_cap_100m=500.0),
+        ScreenConfig(change_lower=0.05, change_upper=0.15, min_trade_value_100m=1000.0, min_market_cap_100m=500.0),
+    )
+
+    result = evaluate_screen_grid(panel, grid, group_col="trade_date", gross_col="mechanical_gross", cost_ratio=0.0046)
+
+    assert result["n_screens"] == 3
+    assert len(result["screens"]) == 3
+    # every screen reports its model-free baseline, so a negative pool is never hidden
+    for row in result["screens"]:
+        assert {"net_bp", "t_stat", "per_day", "n_days"} <= set(row)
+    assert result["selection_trials_multiplier"] == 3
+
+
+def test_validation_fail_closed_edges() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.universe import ScreenConfig
+    from src.ml.validation import ValidationConfig, evaluate_screen_grid, run_promotion_gate, temporal_sign_consistency
+
+    with pytest.raises(ValueError, match="temporal_split_date"):
+        ValidationConfig(oos_reserve_start="2025-09-01", temporal_split_date="not-a-date")
+    with pytest.raises(ValueError, match="require_temporal_consistency"):
+        ValidationConfig(oos_reserve_start="2025-09-01", require_temporal_consistency="yes")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="split_date"):
+        temporal_sign_consistency(pd.Series([0.01, 0.02]), split_date="not-a-date")
+    idx = pd.to_datetime(pd.date_range("2023-01-01", periods=10, freq="D"))
+    with pytest.raises(ValueError, match="empty"):
+        temporal_sign_consistency(pd.Series(np.full(10, 0.01), index=idx), split_date="2025-01-01")
+    with pytest.raises(ValueError, match="non-empty"):
+        evaluate_screen_grid(
+            pd.DataFrame({"trade_date": idx[:2], "mechanical_gross": [0.01, 0.02]}),
+            (), group_col="trade_date", gross_col="mechanical_gross", cost_ratio=0.0046,
+        )
+
+    # A screen matching nothing still reports a row with zero days
+    days = pd.to_datetime(pd.date_range("2024-01-01", periods=10, freq="D"))
+    panel = pd.DataFrame({
+        "trade_date": np.repeat(days.to_numpy(), 2),
+        "symbol": ["000001", "000002"] * 10,
+        "daily_change_pct": np.full(20, 0.01),
+        "trade_value_100m": np.full(20, 500.0),
+        "market_cap_100m": np.full(20, 1000.0),
+        "close": np.full(20, 10000.0),
+        "high": np.concatenate([np.full(19, 10000.0), np.array([10000.0])]),
+        "mechanical_gross": np.full(20, 0.002),
+    })
+    res = evaluate_screen_grid(
+        panel, (ScreenConfig(change_lower=0.90),), group_col="trade_date", gross_col="mechanical_gross", cost_ratio=0.0046,
+    )
+    assert res["screens"][0]["n_days"] == 0
+    # A ceiling close is dropped inside the grid when price legs are present
+    panel2 = panel.copy()
+    panel2.loc[0, "daily_change_pct"] = 0.30
+    res2 = evaluate_screen_grid(
+        panel2, (ScreenConfig(change_lower=0.0),), group_col="trade_date", gross_col="mechanical_gross", cost_ratio=0.0046,
+    )
+    assert res2["screens"][0]["n_rows"] == 19
+
+    cpcv = {"path_deltas": [0.003] * 28, "n_path_deltas": 28, "top1_path_win_rate": 0.86, "ic_path_win_rate": 0.96, "pooled_delta": 0.0033, "p_bootstrap": 0.0, "p_paired_t": 0.0012, "ic_candidate": 0.20, "ic_control": 0.17, "ic_delta": 0.03, "mde_top1": 0.0027, "mde_ic": 0.016}
+    oos = {"n_days": 244, "n_rows": 3800, "top1_mean": 0.006, "top1_sd": 0.046, "top1_sharpe": 2.0, "rank_ic": 0.13, "mde_top1": 0.83, "mde_ic": 0.049, "first_date": "2025-09-01", "last_date": "2026-08-25"}
+    fillable = {"n_days": 200, "top1_mean": 0.004, "rank_ic": 0.11, "measured_share": 0.90}
+    opt_out = ValidationConfig(oos_reserve_start="2025-09-01", require_temporal_consistency=False)
+    passed = run_promotion_gate(cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600, fillable=fillable, config=opt_out)
+    assert "temporal_sign_consistency" not in passed.failed_gates
