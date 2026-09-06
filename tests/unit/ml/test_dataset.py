@@ -167,3 +167,67 @@ def test_label_source_is_excluded_from_model_features() -> None:
     assert LABEL_SOURCE_COLUMN not in cat_tagged
     assert list(x_tagged.columns) == list(x_plain.columns)
     assert cat_tagged == cat_plain
+
+
+def test_create_multi_targets_subtracts_measured_round_trip_cost() -> None:
+    import numpy as np
+
+    from src.ml.dataset import LABEL_THRESHOLDS, create_multi_targets
+    from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO
+
+    # Given: net_return in percent units, spanning both label thresholds post-cost
+    df = pd.DataFrame(
+        {
+            "trade_date": ["2026-01-05", "2026-01-05", "2026-01-06", "2026-01-06"],
+            "net_return": [3.0, -1.0, 0.5, -5.0],
+        }
+    )
+
+    # When
+    out = create_multi_targets(df, clip_lower=-0.10, clip_upper=0.10)
+
+    # Then
+    net_of_cost = df["net_return"].to_numpy() / 100.0 - ROUND_TRIP_COST_RATIO
+    np.testing.assert_allclose(
+        out["target_return"].to_numpy(),
+        np.clip(net_of_cost, -0.10, 0.10),
+        rtol=0.0,
+        atol=1e-12,
+    )
+    np.testing.assert_array_equal(
+        out["target_good"].to_numpy(),
+        (net_of_cost >= LABEL_THRESHOLDS["target_good"]).astype(int),
+    )
+    np.testing.assert_array_equal(
+        out["target_bad"].to_numpy(),
+        (net_of_cost <= LABEL_THRESHOLDS["target_bad"]).astype(int),
+    )
+
+
+def test_retarget_with_clip_matches_create_multi_targets_cost_basis() -> None:
+    import numpy as np
+
+    from src.ml.dataset import create_multi_targets, retarget_with_clip
+
+    # Given
+    df = pd.DataFrame(
+        {
+            "trade_date": ["2026-02-02", "2026-02-02", "2026-02-03", "2026-02-03", "2026-02-04", "2026-02-04"],
+            "net_return": [4.0, -2.0, 1.0, -0.5, 2.5, -3.0],
+        }
+    )
+    base = create_multi_targets(df, clip_lower=-0.10, clip_upper=0.10)
+
+    # When: retarget the same frame to a tighter candidate clip
+    tight = retarget_with_clip(base, -0.08, 0.08)
+    base_again = retarget_with_clip(base, -0.10, 0.10)
+
+    # Then: identical cost basis -> identical target_return at identical bounds
+    np.testing.assert_allclose(
+        base_again["target_return"].to_numpy(), base["target_return"].to_numpy(), rtol=0.0, atol=1e-12
+    )
+    # tighter clip only ever pulls values inward, never shifts the un-clipped middle
+    mid = np.abs(base["target_return"].to_numpy()) < 0.08
+    np.testing.assert_allclose(
+        tight["target_return"].to_numpy()[mid], base["target_return"].to_numpy()[mid], rtol=0.0, atol=1e-12
+    )

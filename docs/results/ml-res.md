@@ -61,3 +61,22 @@
 2. 청산일 분봉 백필 실행(`src/backfill/intraday/backfill_minute_history.py`) — KIS 보관한도 소실 진행 중.
 3. `buyability_sleeves`를 실제 포지션 사이즈로 활성화(`buyability_target_notional_100m` 설정) — 이번 실행은 skipped.
 4. 청산 타이밍 TP grid, 이전 세션 대비 재현성 확인(§5의 p값 차이 원인 규명).
+
+## 8. 46bp 실측 비용 재검증 (`round_trip_cost_46bp`, 2026-09-06)
+
+`ROUND_TRIP_COST_RATIO`를 `_STATUTORY_COST_RATIO(0.0020) + _SPREAD_COST_RATIO(0.0026) = 0.0046`으로 갱신 후 `uv run python -m src.ml.retrain --tuned` 전체 실행(HPO 40 trials, walkforward, panel restoration on, 소요 ~870초):
+
+| | Candidate (튜닝) | Control (기본값) |
+|---|---:|---:|
+| 일평균 target_return | **+0.729%** | +0.404% |
+| Sharpe | **3.35** | 1.88 |
+| 승률 | 50.8% | 47.2% |
+| Profit Factor | **1.83** | 1.40 |
+
+**Δ+0.326%p/일, p=0.0000, CI[+0.184%,+0.473%] → `promoted: true`** (shared_dates 2,175, moving_block_bootstrap, α=0.10). 구형 20bp에서의 Δ+0.185%p(p=0.006) 대비 델타가 커졌고 승격 판정은 유지된다 — 동일 상수 이동은 양쪽에 동일 적용되므로 판정은 모델 품질이 구동한다(R3). HPO 최적: `num_leaves=54, lr=0.0292, n_estimators=300`(rank_ic=0.20207). p_good 블렌드 가중치 0.0 재확인. dev/control_dev 각 33,547행(동일 패널). 산출 번들: `artifacts/models/close_morning61_2026-09-03/sizing_pipeline_bundle.joblib` (`round_trip_cost` 0.0046 양쪽 경로 일치).
+
+`execution_cost` provenance: statutory 20.0bp + spread 26.12bp = **total 46.12bp** (n_rows 30,999, `n_impact_measured` 0 — 인트라데이 미연결 시 fail-open, breakeven 18.32bp). 결정→동시호가 드리프트는 라벨 상수에 합산하지 않고 `auction_impact_bp` 행별 항으로 분리 유지(R6).
+
+클래스 균형 이동(dev 패널 33,547행, `LABEL_THRESHOLDS` 0.01/-0.02 고정): 20bp 가정 시 target_good 31.48% / target_bad 26.06% → 46bp 실측 시 **target_good 28.18% / target_bad 29.93%**. 의도된 효과이며 임계값은 이동하지 않음(R5).
+
+`exit_policy_grid`는 여전히 미승격(TP3% p=0.405 등) — 청산 레버 결론 변경 없음.
