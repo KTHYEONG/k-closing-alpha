@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.ml.metrics import mean_group_rank_ic
 from src.ml.oof import purged_oof_predict
 from src.ml.policy_eval import default_policy_candidates, evaluate_single_stock_policy_oof
 from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict, moving_block_bootstrap_delta, path_top1_returns
@@ -243,23 +244,9 @@ def tune_return_model_params(
             mean = float(np.mean(vals))
             return mean if np.isfinite(mean) else float("-inf")
 
-        # rank_ic: mean per-group spearman(pred, target)
-        ics: list[float] = []
-        from scipy.stats import spearmanr
-
-        for _, g in oof.groupby(group_keys, sort=False):
-            if len(g) < 2:
-                continue
-            if float(np.std(g["pred"].to_numpy())) == 0.0:
-                continue
-            if float(np.std(g[target_col].to_numpy())) == 0.0:
-                continue
-            ic = float(spearmanr(g["pred"], g[target_col]).statistic)
-            if np.isfinite(ic):
-                ics.append(ic)
-        if not ics:
-            return float("-inf")
-        mean_ic = float(np.mean(ics))
+        # rank_ic: mean per-group spearman(pred, target), vectorized (identical to a
+        # per-group scipy.spearmanr mean; Spearman == Pearson on average ranks).
+        mean_ic = mean_group_rank_ic(oof, list(group_keys), "pred", target_col, min_group_size=2)
         return mean_ic if np.isfinite(mean_ic) else float("-inf")
 
     study.optimize(_objective, n_trials=config.hpo_trials, timeout=config.hpo_timeout_seconds)
@@ -364,21 +351,25 @@ def evaluate_config_oof(
     recency_half_life_groups: int | None,
     p_good_weight: float,
     min_history_dates: int,
+    precomputed_oof: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Evaluate config via OOF purged predict + policy."""
-    oof = purged_oof_predict(
-        dev_df,
-        feature_cols,
-        target_col,
-        group_col,
-        n_splits=n_splits,
-        purge_gap=purge_gap,
-        model_params=model_params,
-        huber_delta=huber_delta,
-        weighting_mode=weighting_mode,
-        recency_half_life_groups=recency_half_life_groups,
-        predict_proba=True,
-    )
+    if precomputed_oof is not None:
+        oof = precomputed_oof.copy()
+    else:
+        oof = purged_oof_predict(
+            dev_df,
+            feature_cols,
+            target_col,
+            group_col,
+            n_splits=n_splits,
+            purge_gap=purge_gap,
+            model_params=model_params,
+            huber_delta=huber_delta,
+            weighting_mode=weighting_mode,
+            recency_half_life_groups=recency_half_life_groups,
+            predict_proba=True,
+        )
     oof["rank_score"] = oof["pred"]
     scored = add_close_morning_decision_score(oof, group_col=group_col, probability_weight=p_good_weight)
     cutoff = str(scored[group_col].max())

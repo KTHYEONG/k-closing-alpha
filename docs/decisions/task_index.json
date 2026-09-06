@@ -1,6 +1,28 @@
 {
   "tasks": [
     {
+      "task_id": "CHAMPION_RETRAIN_HOTPATH_OPT",
+      "date": "2026-09-06",
+      "adr_id": "ADR_20260906_CHAMPION_RETRAIN_HOTPATH_OPT",
+      "domain": "quant",
+      "title": "Champion Retrain Hot-Path Optimization",
+      "why": "The tuned champion retrain took ~810s, dominated by a per-group scipy.spearmanr loop in the rank_ic HPO objective and one fully redundant 5-fold calibrated OOF.",
+      "resolution": "Added vectorized metrics.mean_group_rank_ic (Spearman==Pearson-on-average-ranks) used by tuning and metrics.rank_ic, and threaded candidate_oof into evaluate_config_oof via precomputed_oof.",
+      "impact": "Behaviour-identical (best_params, promotion delta/p/promoted unchanged in full A/B); rank_ic sub-step 14s->0.015s, calibrated OOFs 3->2, wall-time ~810s->~220s.",
+      "archive_path": "docs/decisions/archive/CHAMPION_RETRAIN_HOTPATH_OPT/champion_retrain_hotpath_opt_contract.json"
+    },
+    {
+      "task_id": "ROUND_TRIP_COST_46BP",
+      "date": "2026-09-06",
+      "adr_id": "ADR_20260906_ROUND_TRIP_COST_46BP",
+      "domain": "quant",
+      "title": "Measured 46bp Round-Trip Cost Constant",
+      "why": "The promoted champion's target_return still subtracted the unmeasured legacy 20bp cost while four independent measurements and the pipeline's own provenance put real round-trip cost at ~46bp.",
+      "resolution": "Split ROUND_TRIP_COST_RATIO in inference.py into _STATUTORY_COST_RATIO(0.0020)+_SPREAD_COST_RATIO(0.0026)=0.0046 and re-ran the full tuned retrain to re-validate promotion.",
+      "impact": "Promotion verdict holds under honest cost (Δ+0.326pp/day, p<0.0001, promoted=true); target_good/bad class balance shifts 31.5/26.1% -> 28.2/29.9% with thresholds unchanged.",
+      "archive_path": "docs/decisions/archive/ROUND_TRIP_COST_46BP/round_trip_cost_46bp_contract.json"
+    },
+    {
       "task_id": "CEILING_EXCLUDED_PROMOTION_POOL",
       "date": "2026-09-06",
       "adr_id": "ADR_20260906_CEILING_EXCLUDED_PROMOTION_POOL",

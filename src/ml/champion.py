@@ -285,6 +285,7 @@ def train_tuned_champion_bundle(
         recency_half_life_groups=config.recency_half_life_groups,
         p_good_weight=blend.chosen_weight,
         min_history_dates=config.min_history_dates,
+        precomputed_oof=candidate_oof,
     )
 
     # Control
