@@ -209,3 +209,27 @@ def test_retrain_warns_on_stale_price_history_without_changing_behavior(tmp_path
     assert calls["trained_rows"] == 1
     assert "stage=ml_panel_freshness" in caplog.text
     assert "status=stale" in caplog.text
+
+
+def test_retrain_publish_requires_locked_oos_window() -> None:
+    import pytest
+
+    from src.ml.retrain import build_arg_parser
+
+    parser = build_arg_parser()
+
+    args = parser.parse_args(["--tuned", "--oos-reserve-start", "2025-09-01"])
+    assert args.label_mode == "mechanical"
+    assert args.cost_mode == "per_row"
+    assert args.publish is False
+    assert args.target_notional_100m == 0.5
+    assert args.production_dir == "artifacts/models"
+
+    published = parser.parse_args(
+        ["--tuned", "--oos-reserve-start", "2025-09-01", "--publish"]
+    )
+    assert published.publish is True
+
+    # Fail-closed: publishing without a locked window is rejected by the parser
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--tuned", "--publish"])
