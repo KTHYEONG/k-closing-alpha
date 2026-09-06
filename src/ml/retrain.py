@@ -62,7 +62,8 @@ def main(argv: list[str] | None = None) -> None:
     """Parse retrain arguments and dispatch to the champion training pipeline."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    validation = ValidationConfig(oos_reserve_start=args.oos_reserve_start, min_ic_path_win_rate=args.min_ic_path_win_rate, min_top1_path_win_rate=args.min_top1_path_win_rate, min_oos_days=args.min_oos_days, target_notional_100m=args.target_notional_100m) if args.oos_reserve_start else None
+    # promotion_alpha_wiring: forward CLI flag to ValidationConfig gate.
+    validation = ValidationConfig(oos_reserve_start=args.oos_reserve_start, min_ic_path_win_rate=args.min_ic_path_win_rate, min_top1_path_win_rate=args.min_top1_path_win_rate, min_oos_days=args.min_oos_days, target_notional_100m=args.target_notional_100m, promotion_alpha=args.promotion_alpha) if args.oos_reserve_start else None
 
     trade_log_df = pd.read_parquet(args.trade_log)
     theme_df = pd.read_parquet(args.theme) if os.path.exists(args.theme) else None

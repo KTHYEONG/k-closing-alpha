@@ -63,13 +63,14 @@ def attach_next_day_path(
     grouped = ph.groupby("symbol", sort=False)
     for col in ("open", "high", "low", "close"):
         ph[f"nd_{col}"] = grouped[col].shift(-1)
+    ph["nd_date"] = grouped["date"].shift(-1)
     ph["entry_close"] = ph["close"]
     ph["entry_change_ratio"] = ph["daily_change_pct"].astype(np.float64)
     lookup = ph[
-        ["symbol", "date", "entry_close", "entry_change_ratio", "nd_open", "nd_high", "nd_low", "nd_close"]
+        ["symbol", "date", "entry_close", "entry_change_ratio", "nd_open", "nd_high", "nd_low", "nd_close", "nd_date"]
     ]
     out = df.copy()
-    for col in ("entry_close", "entry_change_ratio", "nd_open", "nd_high", "nd_low", "nd_close", "_merge_date", "_merge_symbol"):
+    for col in ("entry_close", "entry_change_ratio", "nd_open", "nd_high", "nd_low", "nd_close", "nd_date", "_merge_date", "_merge_symbol"):
         if col in out.columns:
             out = out.drop(columns=[col])
     out["_merge_date"] = pd.to_datetime(out[date_col])
@@ -79,6 +80,7 @@ def attach_next_day_path(
     )
     for col in ("entry_close", "entry_change_ratio", "nd_open", "nd_high", "nd_low", "nd_close"):
         out[col] = merged[col].to_numpy(dtype=np.float64)
+    out["nd_date"] = pd.to_datetime(merged["nd_date"])
     out = out.drop(columns=["_merge_date", "_merge_symbol"])
     return out
 
