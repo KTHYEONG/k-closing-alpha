@@ -248,6 +248,9 @@ def test_main_runs_redesigned_pipeline_with_mocks() -> None:
             "kospi": [0.5, 0.5],
             "kosdaq": [0.3, 0.3],
             "date": ["2026-08-04", "2026-08-04"],
+            "close_price": [11000.0, 11000.0],
+            "prev_close_price": [10000.0, 10000.0],
+            "high_price": [11200.0, 11200.0],
         }
     )
 
@@ -307,6 +310,9 @@ def test_main_auto_resolves_themes_missing_from_local_cache() -> None:
             "kospi": [0.5, 0.5],
             "kosdaq": [0.3, 0.3],
             "date": ["2026-08-04", "2026-08-04"],
+            "close_price": [11000.0, 11000.0],
+            "prev_close_price": [10000.0, 10000.0],
+            "high_price": [11200.0, 11200.0],
         }
     )
 
@@ -496,3 +502,34 @@ def test_scenario_realtime_sangtta_price_alignment_02() -> None:
     engineered = build_snapshot_features(df_all)
     sangdda_eng = engineered[engineered["Scenario_Base"].str.contains("상따")].iloc[0]
     assert sangdda_eng["buy_price_change_rate"] >= 0
+
+
+def test_predict_forces_pass_for_ceiling_candidates_only() -> None:
+    import pandas as pd
+
+    from src.ml.buyability import classify_ceiling_entry
+
+    # Given: a sizing_df as if predict_daily_sizing already graded it -- one
+    # ceiling-close row mis-graded Strong, one ordinary row graded Weak
+    df = pd.DataFrame(
+        {
+            "close_price": [12900.0, 11000.0],
+            "prev_close_price": [10000.0, 10000.0],
+            "high_price": [12900.0, 11200.0],
+            "grade": ["Strong", "Weak"],
+            "grade_multiplier": [1.5, 0.5],
+            "allocation": [0.15, 0.05],
+        }
+    )
+
+    # When: mirror predict.py's post-hoc override
+    is_ceiling = classify_ceiling_entry(df).to_numpy(dtype=bool)
+    df.loc[is_ceiling, "grade"] = "Pass"
+    df.loc[is_ceiling, "grade_multiplier"] = 0.0
+    df.loc[is_ceiling, "allocation"] = 0.0
+
+    # Then
+    assert df.loc[0, "grade"] == "Pass"
+    assert df.loc[0, "allocation"] == 0.0
+    assert df.loc[1, "grade"] == "Weak"
+    assert df.loc[1, "allocation"] == 0.05

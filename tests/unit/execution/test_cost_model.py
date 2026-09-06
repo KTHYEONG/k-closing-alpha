@@ -171,3 +171,21 @@ def test_summarize_cost_breakdown_reports_impact_coverage() -> None:
     assert bd.n_impact_measured == 2
     assert bd.spread_bp == pytest.approx(20.0)
     assert bd.auction_impact_bp == pytest.approx(20.0)
+
+
+def test_estimate_round_trip_cost_bp_uses_updated_statutory_rate() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.execution.cost_model import STATUTORY_COST_BP, estimate_round_trip_cost_bp
+
+    # Given: 10,000원 (tick 10 -> 2-tick round trip spread = 20bp)
+    df = pd.DataFrame({"close_price": [10000.0]})
+
+    # When
+    out = estimate_round_trip_cost_bp(df)
+
+    # Then
+    assert STATUTORY_COST_BP == pytest.approx(20.0)  # noqa: SIM300
+    assert out["spread_bp"][0] == pytest.approx(20.0)
+    assert out["round_trip_cost_bp"][0] == pytest.approx(40.0)
