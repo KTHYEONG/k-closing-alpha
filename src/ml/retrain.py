@@ -12,12 +12,13 @@ from src.data.candidate_panel import build_restored_trade_log, check_price_histo
 from src.ml.bundle import CHAMPION_DEFAULT_MODEL_PARAMS
 from src.ml.champion import train_champion_bundle, train_tuned_champion_bundle
 from src.ml.tuning import ChampionTuningConfig
+from src.ml.validation import ValidationConfig
 
 logger = logging.getLogger(__name__)
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Parse retrain arguments and dispatch to the champion training pipeline."""
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Construct the retrain CLI parser (unit-testable contract)."""
     parser = argparse.ArgumentParser(description="Champion bundle retraining")
     parser.add_argument("--trade-log", default=str(settings.TRADE_LOG_PARQUET_PATH))
     parser.add_argument("--theme", default=str(settings.THEME_PARQUET_PATH))
@@ -35,7 +36,31 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--promotion-alpha", type=float, default=0.10)
     parser.add_argument("--no-hpo", action="store_true", help="skip Optuna; use CHAMPION_DEFAULT_MODEL_PARAMS")
     parser.add_argument("--no-restore-panel", action="store_true", help="train on the raw trade log only; skip condition_history/archive panel restoration")
+    parser.add_argument("--label-mode", default="mechanical", choices=["journaled", "mechanical"])
+    parser.add_argument("--cost-mode", default="per_row", choices=["flat", "per_row"])
+    parser.add_argument("--publish", action="store_true")
+    parser.add_argument("--production-dir", default="artifacts/models")
+    parser.add_argument("--target-notional-100m", type=float, default=0.5)
+    parser.add_argument("--min-ic-path-win-rate", type=float, default=0.75)
+    parser.add_argument("--min-top1-path-win-rate", type=float, default=0.60)
+    parser.add_argument("--min-oos-days", type=int, default=60)
+    _orig_parse = parser.parse_args
+
+    def _guarded_parse(args: list[str] | None = None, namespace: argparse.Namespace | None = None) -> argparse.Namespace:
+        parsed = _orig_parse(args, namespace) if namespace is not None else _orig_parse(args)
+        if bool(getattr(parsed, "publish", False)) and not getattr(parsed, "oos_reserve_start", None):
+            parser.error("--publish requires --oos-reserve-start")
+        return parsed
+
+    parser.parse_args = _guarded_parse  # type: ignore[method-assign]
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Parse retrain arguments and dispatch to the champion training pipeline."""
+    parser = build_arg_parser()
     args = parser.parse_args(argv)
+    validation = ValidationConfig(oos_reserve_start=args.oos_reserve_start, min_ic_path_win_rate=args.min_ic_path_win_rate, min_top1_path_win_rate=args.min_top1_path_win_rate, min_oos_days=args.min_oos_days, target_notional_100m=args.target_notional_100m) if args.oos_reserve_start else None
 
     trade_log_df = pd.read_parquet(args.trade_log)
     theme_df = pd.read_parquet(args.theme) if os.path.exists(args.theme) else None
@@ -78,6 +103,10 @@ def main(argv: list[str] | None = None) -> None:
             hpo_objective=args.hpo_objective,
             promotion_alpha=args.promotion_alpha,
             model_params_override=(CHAMPION_DEFAULT_MODEL_PARAMS if args.no_hpo else None),
+            label_mode=args.label_mode,
+            cost_mode=args.cost_mode,
+            validation=validation,
+            buyability_target_notional_100m=float(args.target_notional_100m),
         )
         bundle = train_tuned_champion_bundle(trade_log_df, theme_df, cfg, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df)
         prov = bundle.get("tuning_provenance", {})
