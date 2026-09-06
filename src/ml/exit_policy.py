@@ -69,6 +69,9 @@ def attach_next_day_path(
         ["symbol", "date", "entry_close", "entry_change_ratio", "nd_open", "nd_high", "nd_low", "nd_close"]
     ]
     out = df.copy()
+    for col in ("entry_close", "entry_change_ratio", "nd_open", "nd_high", "nd_low", "nd_close", "_merge_date", "_merge_symbol"):
+        if col in out.columns:
+            out = out.drop(columns=[col])
     out["_merge_date"] = pd.to_datetime(out[date_col])
     out["_merge_symbol"] = out[code_col].astype(str).str.zfill(6)
     merged = out.merge(
@@ -76,6 +79,7 @@ def attach_next_day_path(
     )
     for col in ("entry_close", "entry_change_ratio", "nd_open", "nd_high", "nd_low", "nd_close"):
         out[col] = merged[col].to_numpy(dtype=np.float64)
+    out = out.drop(columns=["_merge_date", "_merge_symbol"])
     return out
 
 
