@@ -1,0 +1,375 @@
+{
+  "feature": "ml_validation_overhaul",
+  "domain": "quant",
+  "title": "Decision-grade ML validation: locked OOS + power-matched CPCV promotion gate + executable labels",
+  "target_file": "src/ml/validation.py",
+  "context_files": [
+    "src/ml/champion.py",
+    "src/ml/tuning.py",
+    "src/ml/robust_eval.py",
+    "src/ml/oof.py",
+    "src/ml/bundle.py",
+    "src/ml/dataset.py",
+    "src/ml/buyability.py",
+    "src/ml/exit_policy.py",
+    "src/ml/metrics.py",
+    "src/ml/policy_eval.py",
+    "src/ml/retrain.py",
+    "src/execution/cost_model.py",
+    "src/serving/realtime/inference.py",
+    "tests/unit/ml/test_robust_eval.py",
+    "tests/unit/ml/test_champion.py"
+  ],
+  "changes": [
+    {
+      "name": "DECISION_LABEL_COLUMNS",
+      "kind": "constant",
+      "target_file": "src/ml/decision_labels.py",
+      "signature": "DECISION_LABEL_COLUMNS: frozenset[str]",
+      "description": "Registry of every column produced by this module (entry_close, entry_change_ratio, nd_open, nd_high, nd_low, nd_close, mechanical_gross, has_mechanical_label, label_price_ratio, cost_ratio, cost_measured, eval_net_journaled, eval_net_mechanical). Single source of truth for the look-ahead guard and for dataset._EXCLUDED_FROM_X."
+    },
+    {
+      "name": "assert_no_label_leakage",
+      "kind": "function",
+      "target_file": "src/ml/decision_labels.py",
+      "signature": "def assert_no_label_leakage(feature_cols: Sequence[str]) -> None",
+      "description": "Raise ValueError naming every offending column if any DECISION_LABEL_COLUMNS member appears in feature_cols. Shipped guard for the 2026-09-06 look-ahead bug (nd_* merged into the feature matrix)."
+    },
+    {
+      "name": "attach_per_row_cost_ratio",
+      "kind": "function",
+      "target_file": "src/ml/decision_labels.py",
+      "signature": "def attach_per_row_cost_ratio(df: pd.DataFrame, *, price_col: str = 'close_price', impact_col: str | None = None, fallback_ratio: float = ROUND_TRIP_COST_RATIO) -> pd.DataFrame",
+      "description": "Delegate to src.execution.cost_model.estimate_round_trip_cost_bp; add cost_ratio = round_trip_cost_bp/1e4 (never NaN; per-row fail-open to fallback_ratio) and cost_measured: bool. Overwrite semantics: drop pre-existing outputs first."
+    },
+    {
+      "name": "attach_mechanical_return",
+      "kind": "function",
+      "target_file": "src/ml/decision_labels.py",
+      "signature": "def attach_mechanical_return(df: pd.DataFrame, price_history_df: pd.DataFrame, *, date_col: str = 'trade_date', code_col: str = 'stock_code') -> pd.DataFrame",
+      "description": "Delegate to src.ml.exit_policy.attach_next_day_path, then add mechanical_gross = nd_open/entry_close - 1 (both legs from price_history, so back-adjustment cancels), has_mechanical_label: bool, and label_price_ratio = close_price/entry_close for adjustment provenance."
+    },
+    {
+      "name": "build_decision_labels",
+      "kind": "function",
+      "target_file": "src/ml/decision_labels.py",
+      "signature": "def build_decision_labels(processed: pd.DataFrame, price_history_df: pd.DataFrame | None, *, label_mode: str, cost_mode: str, clip_lower: float, clip_upper: float) -> tuple[pd.DataFrame, dict[str, Any]]",
+      "description": "Compose cost + labels. Always emits cost_ratio and unclipped eval_net_journaled = net_return/100 - cost_ratio. With price history, also emits mechanical_gross and eval_net_mechanical. target_return = clip(eval_net_<label_mode>, clip_lower, clip_upper). label_mode='mechanical' drops rows lacking a mechanical label. Returns (labelled_df, provenance)."
+    },
+    {
+      "name": "ValidationConfig",
+      "kind": "dataclass",
+      "target_file": "src/ml/validation.py",
+      "signature": "@dataclass(frozen=True) class ValidationConfig",
+      "description": "Fields: oos_reserve_start: str (required), eval_col: str = 'eval_net_mechanical', cpcv_n_groups: int = 8, cpcv_k_test: int = 2, purge_gap: int = 1, promotion_alpha: float = 0.05, min_ic_path_win_rate: float = 0.75, min_top1_path_win_rate: float = 0.60, min_selection_dsr: float = 0.95, min_oos_days: int = 60, min_oos_rank_ic: float = 0.0, require_fillable_sleeve: bool = True, target_notional_100m: float = 0.5. __post_init__ fail-closed on every domain."
+    },
+    {
+      "name": "GateOutcome",
+      "kind": "dataclass",
+      "target_file": "src/ml/validation.py",
+      "signature": "@dataclass(frozen=True) class GateOutcome",
+      "description": "Fields: name: str, passed: bool, observed: float, threshold: float, detail: dict[str, Any]."
+    },
+    {
+      "name": "PromotionDecision",
+      "kind": "dataclass",
+      "target_file": "src/ml/validation.py",
+      "signature": "@dataclass(frozen=True) class PromotionDecision",
+      "description": "Fields: deployable: bool, verdict: str ('deployable'|'research_only'), failed_gates: tuple[str, ...], gates: tuple[GateOutcome, ...], evidence: dict[str, Any]."
+    },
+    {
+      "name": "minimum_detectable_effect",
+      "kind": "function",
+      "target_file": "src/ml/validation.py",
+      "signature": "def minimum_detectable_effect(sd: float, n_obs: int, *, alpha: float = 0.05, power: float = 0.80) -> float",
+      "description": "(z_{1-alpha/2} + z_power) * sd / sqrt(n_obs). Raise on sd<=0 or n_obs<1. Attached to every gate so a null result is labelled underpowered rather than negative."
+    },
+    {
+      "name": "paired_t_p_value",
+      "kind": "function",
+      "target_file": "src/ml/validation.py",
+      "signature": "def paired_t_p_value(delta: np.ndarray) -> float",
+      "description": "Two-sided one-sample t-test p-value on the paired daily difference; raise on non-finite input or n<2. Analytic cross-check on the moving-block bootstrap."
+    },
+    {
+      "name": "cpcv_path_evidence",
+      "kind": "function",
+      "target_file": "src/ml/validation.py",
+      "signature": "def cpcv_path_evidence(dev_df: pd.DataFrame, feature_cols: list[str], train_target_col: str, eval_col: str, group_col: str, *, cv: CombinatorialPurgedCV, candidate_params: dict[str, Any] | None, control_params: dict[str, Any] | None, huber_delta: float, control_huber_delta: float) -> dict[str, Any]",
+      "description": "Run cpcv_oof_predict twice over identical folds (candidate vs control params). Per fold compute top-1 mean of eval_col and mean_group_rank_ic. Return {path_deltas, n_path_deltas, top1_path_win_rate, ic_path_win_rate, pooled_delta, p_bootstrap, p_paired_t, ic_candidate, ic_control, ic_delta, mde_top1, mde_ic}."
+    },
+    {
+      "name": "evaluate_locked_oos",
+      "kind": "function",
+      "target_file": "src/ml/validation.py",
+      "signature": "def evaluate_locked_oos(dev_df: pd.DataFrame, oos_df: pd.DataFrame, feature_cols: list[str], train_target_col: str, eval_col: str, group_col: str, *, model_params: dict[str, Any] | None, huber_delta: float, seeds: tuple[int, ...]) -> dict[str, Any]",
+      "description": "Fit fit_seed_ensemble on dev only, score the reserved window once. Raise on empty oos_df or any shared group value. Return {n_days, n_rows, top1_mean, top1_sd, top1_sharpe, rank_ic, mde_top1, mde_ic, first_date, last_date}."
+    },
+    {
+      "name": "run_promotion_gate",
+      "kind": "function",
+      "target_file": "src/ml/validation.py",
+      "signature": "def run_promotion_gate(*, cpcv: dict[str, Any], oos: dict[str, Any], selection_dsr: float | None, n_selection_trials: int, fillable: dict[str, Any] | None, config: ValidationConfig) -> PromotionDecision",
+      "description": "Compose the eight gates (cpcv_ic_path_win_rate, cpcv_top1_path_win_rate, cpcv_delta_significance on max(p_bootstrap, p_paired_t), selection_dsr, oos_min_days, oos_rank_ic_above_mde, oos_top1_sign, fillable_top1_sign). deployable only if every gate passes; verdict 'deployable' else 'research_only'. Raise on n_selection_trials < 1."
+    },
+    {
+      "name": "publish_bundle",
+      "kind": "function",
+      "target_file": "src/ml/validation.py",
+      "signature": "def publish_bundle(bundle: dict[str, Any], candidate_dir: str, production_dir: str, decision: PromotionDecision, *, force: bool = False) -> dict[str, Any]",
+      "description": "Always save_bundle(bundle, candidate_dir). Publish to production_dir only when decision.deployable or force: back up the incumbent to sizing_pipeline_bundle.joblib.bak_<UTC ISO>, copy the candidate joblib in, write promotion_record.json {published_at, candidate_dir, sha256, verdict, gates, failed_gates, label_mode, cost_mode, round_trip_cost, training_cutoff, oos_reserve_start}. Returns a JSON-serialisable result dict."
+    },
+    {
+      "name": "label_mode",
+      "kind": "dataclass_field",
+      "target_file": "src/ml/tuning.py",
+      "signature": "label_mode: str = 'journaled'",
+      "description": "ChampionTuningConfig field; domain ('journaled','mechanical'). Default preserves incumbent behaviour."
+    },
+    {
+      "name": "cost_mode",
+      "kind": "dataclass_field",
+      "target_file": "src/ml/tuning.py",
+      "signature": "cost_mode: str = 'flat'",
+      "description": "ChampionTuningConfig field; domain ('flat','per_row'). Default preserves incumbent behaviour."
+    },
+    {
+      "name": "validation",
+      "kind": "dataclass_field",
+      "target_file": "src/ml/tuning.py",
+      "signature": "validation: ValidationConfig | None = None",
+      "description": "ChampionTuningConfig field. __post_init__ raises when validation is set and oos_reserve_start is None or differs from validation.oos_reserve_start."
+    },
+    {
+      "name": "build_arg_parser",
+      "kind": "function",
+      "target_file": "src/ml/retrain.py",
+      "signature": "def build_arg_parser() -> argparse.ArgumentParser",
+      "description": "Extract the existing parser construction from main() so the CLI contract is unit-testable. Adds --label-mode (default mechanical), --cost-mode (default per_row), --publish, --production-dir (default artifacts/models), --target-notional-100m (default 0.5), --min-ic-path-win-rate, --min-top1-path-win-rate, --min-oos-days. parser.error when --publish is given without --oos-reserve-start."
+    }
+  ],
+  "wiring": [
+    {
+      "caller_file": "src/ml/dataset.py",
+      "anchor": "_EXCLUDED_FROM_X: set[str] = {",
+      "import_symbol": "from src.ml.decision_labels import DECISION_LABEL_COLUMNS",
+      "invocation_expression": "_EXCLUDED_FROM_X |= set(DECISION_LABEL_COLUMNS)"
+    },
+    {
+      "caller_file": "src/ml/champion.py",
+      "anchor": "    processed = retarget_with_clip(processed_raw, config.label_clip_lower, config.label_clip_upper)",
+      "import_symbol": "from src.ml.decision_labels import assert_no_label_leakage, build_decision_labels",
+      "invocation_expression": "processed, label_provenance = build_decision_labels(processed_raw, price_history_df, label_mode=config.label_mode, cost_mode=config.cost_mode, clip_lower=config.label_clip_lower, clip_upper=config.label_clip_upper)"
+    },
+    {
+      "caller_file": "src/ml/champion.py",
+      "anchor": "    feature_cols = [c for c in x_features.columns if c not in cat_features]",
+      "import_symbol": "from src.ml.decision_labels import assert_no_label_leakage",
+      "invocation_expression": "assert_no_label_leakage(feature_cols)"
+    },
+    {
+      "caller_file": "src/ml/champion.py",
+      "anchor": "            _costed = estimate_round_trip_cost_bp(candidate_oof, price_col=\"close_price\")",
+      "import_symbol": "from src.execution.cost_model import measure_auction_impact_bp",
+      "invocation_expression": "_costed = estimate_round_trip_cost_bp(measure_auction_impact_bp(candidate_oof), price_col=\"close_price\", impact_col=\"auction_impact_bp\")"
+    },
+    {
+      "caller_file": "src/ml/champion.py",
+      "anchor": "    promotion = evaluate_promotion(cand_shared, ctrl_shared, alpha=config.promotion_alpha)",
+      "import_symbol": "from src.ml.validation import cpcv_path_evidence, evaluate_locked_oos, publish_bundle, run_promotion_gate",
+      "invocation_expression": "decision = run_promotion_gate(cpcv=cpcv_evidence, oos=oos_result, selection_dsr=selection_dsr, n_selection_trials=n_selection_trials, fillable=oos_fillable, config=config.validation)"
+    },
+    {
+      "caller_file": "src/ml/champion.py",
+      "anchor": "        save_dir = _candidate_export_dir(export_dir, feature_set, bundle)",
+      "import_symbol": "publish_bundle(bundle,",
+      "invocation_expression": "publish_result = publish_bundle(bundle, _candidate_export_dir(export_dir, feature_set, bundle), production_dir, decision)"
+    },
+    {
+      "caller_file": "src/ml/retrain.py",
+      "anchor": "    args = parser.parse_args(argv)",
+      "import_symbol": "from src.ml.validation import ValidationConfig",
+      "invocation_expression": "validation = ValidationConfig(oos_reserve_start=args.oos_reserve_start, min_ic_path_win_rate=args.min_ic_path_win_rate, min_top1_path_win_rate=args.min_top1_path_win_rate, min_oos_days=args.min_oos_days, target_notional_100m=args.target_notional_100m) if args.oos_reserve_start else None"
+    }
+  ],
+  "requirements": [
+    "R1 (locked OOS, fail-closed): production publish is impossible without a locked window. `publish_bundle` writes to production_dir only when `decision.deployable`; `retrain.py` rejects `--publish` without `--oos-reserve-start`; `ChampionTuningConfig` rejects a `validation` config whose `oos_reserve_start` is None or disagrees with its own. The reserved window is split off before HPO, feature selection, blend-weight search and policy selection (the existing `split_oos` + `assert_oos_excluded` pair already enforces this and must keep guarding `dev` and `control_dev`).",
+    "R2 (score-once): `evaluate_locked_oos` fits on `dev` only and scores the reserved window exactly once per retrain. It raises when `oos_df` is empty or shares any group value with `dev_df`. No tuning, threshold, weight or feature decision may read the returned dict.",
+    "R3 (power-matched statistics): every gate carries the MDE of its own statistic. Gates that decide promotion are stated on rank-IC (measured daily sd 0.2745 -> MDE 0.049 at 244 OOS days, resolvable); top-1 mean net (measured daily sd 4.667%/day -> MDE 0.83%/day at 244 days, not resolvable) is used only as a sign-consistency check and must never be gated on a p-value at OOS scale. `GateOutcome.detail` records the MDE so a failing gate reads 'underpowered', not 'no effect'.",
+    "R4 (conservative significance): the dev-period significance gate uses `max(p_bootstrap, p_paired_t)`. The moving-block bootstrap CI on the shipped 2026-09-03 champion implies se 0.074%/day against an analytic 0.100%/day on n=2,175 paired days; the gate must not inherit the tighter of two disagreeing estimators.",
+    "R5 (honest selection budget): `deflated_sharpe_ratio` is computed with `n_independent_trials = hpo_trials * len(p_good_weight_grid) * len(policy_candidates)` (>= 600 at current defaults), not `search.n_trials` alone, and gates at `min_selection_dsr`. A None DSR fails the gate; it may never pass silently.",
+    "R6 (path consistency, split by power): `cpcv_ic_path_win_rate >= 0.75` and `cpcv_top1_path_win_rate >= 0.60` over the CPCV(8,2) 28 test-bin combinations. A 'path' here is one test-bin combination, matching the shipped `ExitRuleResult.cpcv_path_deltas` vocabulary.",
+    "R7 (executable label): `eval_net_mechanical = nd_open/entry_close - 1 - cost_ratio` is the promotion metric. Both price legs come from `price_history_df`, so per-symbol back-adjustment (measured: the close_price/entry_close ratio is a per-symbol constant, median within-symbol CV 0.0004, 33% of rows affected) cancels exactly. Never mix a trade-log close with a price-history open in one ratio.",
+    "R8 (per-row cost): with `cost_mode='per_row'`, `cost_ratio` comes from `estimate_round_trip_cost_bp` (statutory 20bp + KRX 2-tick spread + measured auction impact). Measured dispersion on the real panel is p10 32.6bp / p50 45.2bp / p90 60.0bp against the flat 46bp constant, so cost varies by ~27bp across the cross-section -- the same order as the whole alpha. Unmeasurable rows fail open to `ROUND_TRIP_COST_RATIO`; `cost_ratio` is never NaN.",
+    "R9 (auction impact wired): `champion.py` must call `measure_auction_impact_bp` before `estimate_round_trip_cost_bp` and pass `impact_col='auction_impact_bp'`. The shipped 2026-09-03 run reported `n_impact_measured=0` because the impact producer was never invoked, silently treating the measured +9.1bp mean / 59bp sd decision-to-auction drift as zero.",
+    "R10 (fillability has gate authority): `buyability_target_notional_100m` defaults to 0.5 in the CLI so `evaluate_buyability_sleeves` actually runs (the shipped run reported `status: skipped`). The fillable sleeve is re-selected inside the OOS window and its top-1 sign gates promotion when `require_fillable_sleeve`. `measured_share` is recorded on every sleeve claim.",
+    "R11 (look-ahead guard shipped): `assert_no_label_leakage` runs on `feature_cols` immediately after `build_ml_dataset` and again after `select_stable_features`, and `dataset._EXCLUDED_FROM_X` is extended with `DECISION_LABEL_COLUMNS`. This closes the 2026-09-06 bug where `attach_next_day_path` outputs entered the feature matrix and produced a phantom Sharpe 1.69 that collapsed to -0.15 once removed.",
+    "R12 (behaviour preservation): `label_mode='journaled'` + `cost_mode='flat'` must reproduce `retarget_with_clip` bit-for-bit, and `config.validation is None` must leave `train_tuned_champion_bundle` on its existing walk-forward path. Every currently passing test in tests/unit/ml must keep passing unchanged.",
+    "R13 (candidate artifact always written): a research_only verdict still writes the candidate bundle to `_candidate_export_dir` with `bundle['promotion_decision']` attached. Only the production root is gated. `promotion_record.json` exists exactly when a publish happened.",
+    "R14 (experiment protocol -- the ML lever): after implementation, run three full retrains with identical CPCV folds, identical seeds and the same locked window `--oos-reserve-start 2025-09-01` (~244 reserved trading days, dev 2016-01-04..2025-08-29): (a) `--label-mode journaled --cost-mode flat` (incumbent baseline), (b) `--label-mode journaled --cost-mode per_row`, (c) `--label-mode mechanical --cost-mode per_row`. Record ic_candidate, ic_path_win_rate, top1_path_win_rate, oos_rank_ic, oos_top1_mean, fillable top1_mean and measured_share for each into docs/results/ml-res.md. Prior evidence for (c): retargeting to the mechanical label moved rank-IC +0.0375 (p<1e-4) holding in 27/28 CPCV folds. Run each to completion -- no shortened date range, no reduced HPO trial count, no timeout (.agents/rules/performance.md section 0).",
+    "R16 (auditable gate logging): `run_promotion_gate` emits one `[EVAL]` line per gate in the project tag schema -- `[EVAL] gate=<name> passed=<bool> observed=%.4f threshold=%.4f mde=%.4f` -- plus a single `[EVAL] verdict=<verdict> failed_gates=<n>` summary, and `publish_bundle` emits `[SYS] stage=publish published=<bool> production_dir=<path>`. Floats at 3-4 decimals; no collections in the message body (.agents/rules/logging.md).",
+    "R15 (expected direction, stated up front): headline top-1 numbers are expected to FALL under (c) because the journaled label carries operator exit skill that a mechanical execution will not reproduce (same predictions score IC 0.20 journaled vs 0.11 mechanical). The improvement claimed by this spec is rank-IC on the label that is actually executable plus an OOS-confirmed portion -- not a higher paper top-1. A run whose paper top-1 rises while oos_rank_ic stays under its MDE must be reported as research_only."
+  ],
+  "design_rationale": {
+    "alternatives_considered": "(1) Keep the walk-forward bootstrap gate and just lower promotion_alpha -- rejected: the p-value is computed on the same OOF that HPO, feature selection, blend weight and policy candidate all maximised, so tightening alpha shrinks nothing that is actually being controlled. (2) Gate on an OOS top-1 significance test -- rejected on power: measured paired daily top-1 sd is 4.667%/day, giving MDE 0.83%/day over a 244-day window, so such a gate would reject every real effect this project can produce; rank-IC (sd 0.2745, MDE 0.049) is the only statistic the available window can resolve. (3) Wait for more data -- rejected and already quantified: 10.8 years for a 25bp/day top-1 effect. (4) Re-introduce rule-based selection filters (change-rate rank, cost rank, top-K) -- rejected: all were invalidated on 2026-09-06 as artifacts of the nd_* look-ahead bug (Sharpe 1.69 -> -0.15). (5) Put publish logic in bundle.py -- rejected: validation.py imports fit_seed_ensemble from bundle.py, so the reverse edge would be a cycle. (6) Flip the ChampionTuningConfig defaults to mechanical/per_row -- rejected: it would silently change every existing caller and test; the CLI defaults carry the new production path instead, and the A/B is run explicitly under R14.",
+    "chosen_reason": "The current pipeline can only produce paper numbers: it selects and tests on one OOF (oos_row_count=0), scores on a label containing discretionary operator exit timing, charges one flat cost to every name, reports fillability and auction impact as provenance with no gate authority, publishes to production by manual copy, and quotes a saturated DSR computed against 1/15th of its real search budget. This spec makes each of those a fail-closed gate with an MDE attached, so the pipeline's own output states whether a bundle is deployable or research-only. The ML lever is placed on the label rather than on the model: training and scoring on nd_open/entry_close (the operator's actual mechanical execution) net of per-row cost is the one change with independent prior evidence (rank-IC +0.0375, p<1e-4, 27/28 CPCV folds) and it simultaneously removes the discretionary component that made every prior number unusable for a real allocation decision.",
+    "failure_modes": [
+      "Silent label downgrade: price_history is missing or stale, label_mode='mechanical' falls back to the journaled label, and the gate scores the very quantity it was built to exclude. Guarded by R1/R7 -- build_decision_labels raises rather than substituting, and rows without nd_open are dropped with the loss in provenance (measured coverage 99.68%, so a sudden drop is a data alarm).",
+      "Look-ahead recurrence: attach_next_day_path outputs re-enter feature_cols through a new code path (exactly the 2026-09-06 bug: phantom Sharpe 1.69 -> -0.15). Guarded by R11 -- DECISION_LABEL_COLUMNS is the single registry feeding both dataset._EXCLUDED_FROM_X and assert_no_label_leakage, called before every fit.",
+      "Adjustment mismatch: mixing the trade log's raw close_price with price_history's back-adjusted next open would inject a per-symbol constant factor into the label (33% of rows affected, ratios spanning 0.2x-9x). Guarded by R7 -- both legs of mechanical_gross come from price_history; label_price_ratio is recorded as provenance only and never enters a return calculation.",
+      "Gate theatre: gates that can never fail (a saturated DSR of 1.0, a fillable sleeve reporting status=skipped, an auction impact of exactly zero from n_impact_measured=0) make the verdict meaningless. Guarded by R5/R9/R10 -- the DSR trial count includes the whole selection budget, a None DSR fails, the impact producer is wired in, and the sleeve evaluator is enabled by CLI default.",
+      "OOS window contamination via panel restoration: build_restored_trade_log synthesises rows from price_history, so a restored row inside the reserved window is still legitimately out-of-sample for the model but its journaled label is synthetic. Mitigated by R7 -- the promotion metric is the mechanical label, which is identically defined for journaled and restored rows.",
+      "Underpowered null read as a negative: an OOS rank-IC of 0.02 against an MDE of 0.049 means 'cannot tell', not 'no skill'. Guarded by R3 -- every GateOutcome.detail carries its MDE, and the failing gate is named oos_rank_ic_above_mde."
+    ]
+  },
+  "performance_budget": {
+    "expected_data_scale": "Panel: 36,744 rows after scenario_action + restoration, 33,547 after ceiling exclusion, ~61 features, 2,615 trade dates (2016-01-04..2026-08-25). Locked OOS at 2025-09-01 reserves ~244 dates / ~4,000 rows. price_history: 5,454,300 rows x 19 cols. Added compute per retrain: CPCV(8,2) = 28 folds x 2 arms = 56 LGBM fits on ~25k x 61, plus a 5-seed dev-only ensemble for the locked window. Incumbent full run is 810s; expect roughly 2-4x that.",
+    "memory_target_mb": 2500,
+    "storage_format": "Parquet via pyarrow. Read price_history with columns=['symbol','date','open','high','low','close','daily_change_pct'] only -- attach_next_day_path copies and sorts the whole frame, so passing all 19 columns costs ~800MB for 7 that are used.",
+    "dtype_precision": "float64 throughout for returns, costs and labels: the gate discriminates differences at bp scale (46bp cost against an 18-33bp pooled edge) and float32 rounding is ~1e-7 relative, which is fine numerically but the arrays are small enough that there is no reason to trade it. LGBM feature matrices stay as they are today.",
+    "chunking_strategy": "None. CPCV folds run sequentially, one LGBM fit per fold per arm; the panel is ~34k rows and fits in memory whole. attach_next_day_path performs one groupby-shift over price_history followed by one left merge -- do it once per retrain and reuse the result, never per fold.",
+    "acceleration_candidate": null
+  },
+  "assumptions": [
+    "A1: The locked OOS window is 2025-09-01 onward (~244 trading dates), chosen because it is the only period with measurable entry-day auction liquidity (2025 coverage 33%, 2026 100%), so the fillable-sleeve gate is meaningful there. The operator may override with --oos-reserve-start; below min_oos_days=60 the gate fails closed.",
+    "A2: The operator's real execution is buy ~15:19 continuous trading (approximately the entry close) and sell ~09:00+ next-day continuous trading, so nd_open/entry_close - 1 is the mechanically reproducible return. Operator-confirmed 2026-09-06; do not re-derive it.",
+    "A3: price_history is back-adjusted while the trade log holds raw traded prices. Verified this session: the close_price/entry_close ratio is a per-symbol constant (median within-symbol CV 0.0004; 59% of symbols with >=5 rows have CV < 0.02) and the exact-match share rises monotonically with recency (2019 55% -> 2025 85%), the signature of cumulative back-adjustment. Ratio labels are therefore unaffected; tick-size costing correctly uses the raw close_price.",
+    "A4: change_rate (trade log) and daily_change_pct (price_history) agree within 0.5pp on only 73% of rows even though daily change ratios should be adjustment-invariant. This is a pre-existing data-integrity question, out of scope here; build_decision_labels records the agreement share in provenance so it is visible, and no label depends on it.",
+    "A5: Existing tests in tests/unit/ml define the incumbent behaviour contract. R12 requires all of them to keep passing without modification."
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "test_attach_per_row_cost_ratio_falls_back_on_bad_price",
+      "target_test_file": "tests/unit/ml/test_decision_labels.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_decision_labels.py -k test_attach_per_row_cost_ratio_falls_back_on_bad_price -q",
+      "expected_behavior": "Every row carries a finite cost_ratio; unusable prices fall back to the flat constant with cost_measured=False, and tradable rows disperse away from the constant.",
+      "test_skeleton": "def test_attach_per_row_cost_ratio_falls_back_on_bad_price() -> None:\n    import numpy as np\n    import pandas as pd\n\n    from src.ml.decision_labels import attach_per_row_cost_ratio\n    from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO\n\n    # Given two tradable closes and two unusable ones\n    df = pd.DataFrame({\"close_price\": [1500.0, 30000.0, np.nan, 0.0]})\n\n    out = attach_per_row_cost_ratio(df)\n\n    # Then no row is ever NaN-costed and unmeasurable rows fall back to the flat constant\n    assert np.isfinite(out[\"cost_ratio\"].to_numpy(dtype=float)).all()\n    assert out[\"cost_measured\"].tolist() == [True, True, False, False]\n    assert np.isclose(out[\"cost_ratio\"].iloc[2], ROUND_TRIP_COST_RATIO)\n    assert np.isclose(out[\"cost_ratio\"].iloc[3], ROUND_TRIP_COST_RATIO)\n    # 1,500원 -> tick 1원 -> 2-tick round trip 13.33bp + 20bp statutory\n    assert np.isclose(out[\"cost_ratio\"].iloc[0], (20.0 + 2.0 * 1.0 / 1500.0 * 1e4) / 1e4)\n    # 30,000원 -> tick 50원 -> 33.33bp + 20bp statutory\n    assert np.isclose(out[\"cost_ratio\"].iloc[1], (20.0 + 2.0 * 50.0 / 30000.0 * 1e4) / 1e4)\n    # The point of per-row costing: identical picks do not carry identical cost\n    assert not np.isclose(out[\"cost_ratio\"].iloc[0], out[\"cost_ratio\"].iloc[1])\n"
+    },
+    {
+      "scenario_id": "test_build_decision_labels_flat_journaled_matches_retarget_with_clip",
+      "target_test_file": "tests/unit/ml/test_decision_labels.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_decision_labels.py -k test_build_decision_labels_flat_journaled_matches_retarget_with_clip -q",
+      "expected_behavior": "label_mode='journaled' + cost_mode='flat' reproduces retarget_with_clip bit-for-bit, so the incumbent champion path is behaviour-preserved.",
+      "test_skeleton": "def test_build_decision_labels_flat_journaled_matches_retarget_with_clip() -> None:\n    import numpy as np\n    import pandas as pd\n\n    from src.ml.dataset import retarget_with_clip\n    from src.ml.decision_labels import build_decision_labels\n\n    df = pd.DataFrame({\n        \"trade_date\": pd.to_datetime([\"2024-01-02\", \"2024-01-02\", \"2024-01-03\"]),\n        \"stock_code\": [\"000001\", \"000002\", \"000001\"],\n        \"net_return\": [3.0, -50.0, 40.0],\n        \"target_return\": [0.0, 0.0, 0.0],\n        \"close_price\": [1500.0, 30000.0, 1500.0],\n    })\n\n    legacy = retarget_with_clip(df, -0.10, 0.10)\n    out, prov = build_decision_labels(\n        df, None, label_mode=\"journaled\", cost_mode=\"flat\", clip_lower=-0.10, clip_upper=0.10\n    )\n\n    # Then the legacy training label is reproduced exactly\n    assert np.allclose(\n        out[\"target_return\"].to_numpy(dtype=float), legacy[\"target_return\"].to_numpy(dtype=float)\n    )\n    # And the unclipped evaluation label is exposed alongside it\n    assert np.isclose(out[\"eval_net_journaled\"].iloc[2], 40.0 / 100.0 - out[\"cost_ratio\"].iloc[2])\n    assert prov[\"label_mode\"] == \"journaled\"\n    assert prov[\"cost_mode\"] == \"flat\"\n    assert prov[\"n_rows\"] == 3\n"
+    },
+    {
+      "scenario_id": "test_build_decision_labels_mechanical_requires_price_history",
+      "target_test_file": "tests/unit/ml/test_decision_labels.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_decision_labels.py -k test_build_decision_labels_mechanical_requires_price_history -q",
+      "expected_behavior": "Fail-closed: the mechanical label cannot be silently downgraded to the journaled one when price history is absent.",
+      "test_skeleton": "def test_build_decision_labels_mechanical_requires_price_history() -> None:\n    import pandas as pd\n    import pytest\n\n    from src.ml.decision_labels import build_decision_labels\n\n    df = pd.DataFrame({\n        \"trade_date\": pd.to_datetime([\"2024-01-02\"]),\n        \"stock_code\": [\"000001\"],\n        \"net_return\": [3.0],\n        \"target_return\": [0.0],\n        \"close_price\": [1500.0],\n    })\n\n    with pytest.raises(ValueError, match=\"price_history\"):\n        build_decision_labels(\n            df, None, label_mode=\"mechanical\", cost_mode=\"per_row\", clip_lower=-0.10, clip_upper=0.10\n        )\n    with pytest.raises(ValueError, match=\"label_mode\"):\n        build_decision_labels(\n            df, None, label_mode=\"operator\", cost_mode=\"flat\", clip_lower=-0.10, clip_upper=0.10\n        )\n    with pytest.raises(ValueError, match=\"cost_mode\"):\n        build_decision_labels(\n            df, None, label_mode=\"journaled\", cost_mode=\"guess\", clip_lower=-0.10, clip_upper=0.10\n        )\n"
+    },
+    {
+      "scenario_id": "test_build_decision_labels_mechanical_prices_next_open_over_entry_close",
+      "target_test_file": "tests/unit/ml/test_decision_labels.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_decision_labels.py -k test_build_decision_labels_mechanical_prices_next_open_over_entry_close -q",
+      "expected_behavior": "The mechanical label is next-day open over entry-day close, both read from price_history (adjustment-invariant), minus the per-row cost.",
+      "test_skeleton": "def test_build_decision_labels_mechanical_prices_next_open_over_entry_close() -> None:\n    import numpy as np\n    import pandas as pd\n\n    from src.ml.decision_labels import attach_mechanical_return, build_decision_labels\n\n    price_history = pd.DataFrame({\n        \"date\": pd.to_datetime([\"2024-01-02\", \"2024-01-03\", \"2024-01-04\"]),\n        \"symbol\": [\"000001\", \"000001\", \"000001\"],\n        \"open\": [990.0, 1030.0, 1040.0],\n        \"high\": [1010.0, 1050.0, 1060.0],\n        \"low\": [980.0, 1020.0, 1030.0],\n        \"close\": [1000.0, 1040.0, 1050.0],\n        \"daily_change_pct\": [0.010, 0.040, 0.0096],\n    })\n    df = pd.DataFrame({\n        \"trade_date\": pd.to_datetime([\"2024-01-02\"]),\n        \"stock_code\": [\"000001\"],\n        \"net_return\": [5.0],\n        \"target_return\": [0.0],\n        \"close_price\": [1000.0],\n    })\n\n    attached = attach_mechanical_return(df, price_history)\n    assert np.isclose(attached[\"mechanical_gross\"].iloc[0], 1030.0 / 1000.0 - 1.0)\n    assert bool(attached[\"has_mechanical_label\"].iloc[0]) is True\n\n    out, prov = build_decision_labels(\n        df, price_history, label_mode=\"mechanical\", cost_mode=\"per_row\",\n        clip_lower=-0.10, clip_upper=0.10,\n    )\n\n    # 1,000원 -> tick 1원 -> 20bp spread + 20bp statutory = 40bp\n    assert np.isclose(out[\"cost_ratio\"].iloc[0], 0.0040)\n    assert np.isclose(out[\"eval_net_mechanical\"].iloc[0], 0.03 - 0.0040)\n    assert np.isclose(out[\"target_return\"].iloc[0], 0.026)\n    # The journaled label survives on the same per-row cost so the A/B is paired\n    assert np.isclose(out[\"eval_net_journaled\"].iloc[0], 0.05 - 0.0040)\n    assert np.isclose(prov[\"mechanical_coverage\"], 1.0)\n    assert prov[\"n_dropped_no_mechanical\"] == 0\n"
+    },
+    {
+      "scenario_id": "test_build_decision_labels_mechanical_drops_rows_without_next_day_price",
+      "target_test_file": "tests/unit/ml/test_decision_labels.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_decision_labels.py -k test_build_decision_labels_mechanical_drops_rows_without_next_day_price -q",
+      "expected_behavior": "Rows whose next trading day is unavailable cannot be trained or scored mechanically and are dropped, with the loss recorded in provenance.",
+      "test_skeleton": "def test_build_decision_labels_mechanical_drops_rows_without_next_day_price() -> None:\n    import numpy as np\n    import pandas as pd\n\n    from src.ml.decision_labels import build_decision_labels\n\n    price_history = pd.DataFrame({\n        \"date\": pd.to_datetime([\"2024-01-02\", \"2024-01-03\", \"2024-01-02\"]),\n        \"symbol\": [\"000001\", \"000001\", \"000002\"],\n        \"open\": [990.0, 1030.0, 500.0],\n        \"high\": [1010.0, 1050.0, 520.0],\n        \"low\": [980.0, 1020.0, 495.0],\n        \"close\": [1000.0, 1040.0, 510.0],\n        \"daily_change_pct\": [0.010, 0.040, 0.020],\n    })\n    # 000002 has no next trading day in price_history -> no mechanical label\n    df = pd.DataFrame({\n        \"trade_date\": pd.to_datetime([\"2024-01-02\", \"2024-01-02\"]),\n        \"stock_code\": [\"000001\", \"000002\"],\n        \"net_return\": [5.0, 7.0],\n        \"target_return\": [0.0, 0.0],\n        \"close_price\": [1000.0, 510.0],\n    })\n\n    out, prov = build_decision_labels(\n        df, price_history, label_mode=\"mechanical\", cost_mode=\"per_row\",\n        clip_lower=-0.10, clip_upper=0.10,\n    )\n\n    assert len(out) == 1\n    assert out[\"stock_code\"].tolist() == [\"000001\"]\n    assert prov[\"n_dropped_no_mechanical\"] == 1\n    assert np.isclose(prov[\"mechanical_coverage\"], 0.5)\n    assert np.isfinite(out[\"target_return\"].to_numpy(dtype=float)).all()\n"
+    },
+    {
+      "scenario_id": "test_assert_no_label_leakage_rejects_next_day_columns",
+      "target_test_file": "tests/unit/ml/test_decision_labels.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_decision_labels.py -k test_assert_no_label_leakage_rejects_next_day_columns -q",
+      "expected_behavior": "The shipped guard against the known look-ahead bug: next-day path and evaluation columns can never enter feature_cols.",
+      "test_skeleton": "def test_assert_no_label_leakage_rejects_next_day_columns() -> None:\n    import pytest\n\n    from src.ml.dataset import _EXCLUDED_FROM_X\n    from src.ml.decision_labels import DECISION_LABEL_COLUMNS, assert_no_label_leakage\n\n    # Given a clean decision-time feature list, the guard is silent\n    assert_no_label_leakage([\"close_position\", \"body_ratio\", \"relative_flow_strength\"])\n\n    # Then every next-day / evaluation column is registered and rejected\n    for col in (\"nd_open\", \"nd_high\", \"nd_close\", \"entry_close\", \"mechanical_gross\",\n                \"eval_net_mechanical\", \"eval_net_journaled\", \"cost_ratio\"):\n        assert col in DECISION_LABEL_COLUMNS\n        assert col in _EXCLUDED_FROM_X\n    with pytest.raises(ValueError, match=\"nd_open\"):\n        assert_no_label_leakage([\"close_position\", \"nd_open\"])\n    with pytest.raises(ValueError, match=\"eval_net_mechanical\"):\n        assert_no_label_leakage([\"eval_net_mechanical\"])\n"
+    },
+    {
+      "scenario_id": "test_minimum_detectable_effect_matches_closed_form",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_minimum_detectable_effect_matches_closed_form -q",
+      "expected_behavior": "MDE is the standard two-sided 80%-power formula, and it shows a 250-day OOS window can resolve rank-IC but not a 25bp/day top-1 edge.",
+      "test_skeleton": "def test_minimum_detectable_effect_matches_closed_form() -> None:\n    import numpy as np\n    import pytest\n    from scipy.stats import norm\n\n    from src.ml.validation import minimum_detectable_effect\n\n    expected = (norm.ppf(0.975) + norm.ppf(0.80)) * 4.667 / np.sqrt(250.0)\n    assert np.isclose(minimum_detectable_effect(4.667, 250), expected)\n\n    # Measured project noise: top-1 sd 4.667%/day, daily rank-IC sd 0.2745\n    assert minimum_detectable_effect(4.667, 250) > 0.25  # 25bp/day is unresolvable\n    assert minimum_detectable_effect(0.2745, 250) < 0.10  # a 0.10 rank-IC is resolvable\n\n    with pytest.raises(ValueError, match=\"n_obs\"):\n        minimum_detectable_effect(4.667, 0)\n    with pytest.raises(ValueError, match=\"sd\"):\n        minimum_detectable_effect(0.0, 250)\n"
+    },
+    {
+      "scenario_id": "test_paired_t_p_value_matches_scipy",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_paired_t_p_value_matches_scipy -q",
+      "expected_behavior": "The analytic cross-check p-value equals scipy's one-sample t-test on the paired daily difference.",
+      "test_skeleton": "def test_paired_t_p_value_matches_scipy() -> None:\n    import numpy as np\n    import pytest\n    from scipy import stats\n\n    from src.ml.validation import paired_t_p_value\n\n    rng = np.random.default_rng(7)\n    delta = rng.normal(loc=0.002, scale=0.045, size=400)\n\n    expected = float(stats.ttest_1samp(delta, 0.0).pvalue)\n    assert np.isclose(paired_t_p_value(delta), expected)\n\n    with pytest.raises(ValueError, match=\"finite\"):\n        paired_t_p_value(np.array([0.01, np.nan, 0.02]))\n    with pytest.raises(ValueError, match=\"n_obs\"):\n        paired_t_p_value(np.array([0.01]))\n"
+    },
+    {
+      "scenario_id": "test_run_promotion_gate_blocks_underpowered_oos_ic",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_run_promotion_gate_blocks_underpowered_oos_ic -q",
+      "expected_behavior": "A dev-period win that the locked OOS window cannot confirm above its own MDE yields research_only, not deployable.",
+      "test_skeleton": "def test_run_promotion_gate_blocks_underpowered_oos_ic() -> None:\n    from src.ml.validation import PromotionDecision, ValidationConfig, run_promotion_gate\n\n    cpcv = {\n        \"path_deltas\": [0.003] * 28,\n        \"n_path_deltas\": 28,\n        \"top1_path_win_rate\": 0.86,\n        \"ic_path_win_rate\": 0.96,\n        \"pooled_delta\": 0.0033,\n        \"p_bootstrap\": 0.0,\n        \"p_paired_t\": 0.0012,\n        \"ic_candidate\": 0.20,\n        \"ic_control\": 0.17,\n        \"ic_delta\": 0.03,\n        \"mde_top1\": 0.0027,\n        \"mde_ic\": 0.016,\n    }\n    oos = {\n        \"n_days\": 244, \"n_rows\": 3800, \"top1_mean\": 0.004, \"top1_sd\": 0.046,\n        \"top1_sharpe\": 1.4, \"rank_ic\": 0.02, \"mde_top1\": 0.83, \"mde_ic\": 0.049,\n        \"first_date\": \"2025-09-01\", \"last_date\": \"2026-08-25\",\n    }\n    fillable = {\"n_days\": 200, \"top1_mean\": 0.003, \"rank_ic\": 0.02, \"measured_share\": 0.90}\n    config = ValidationConfig(oos_reserve_start=\"2025-09-01\")\n\n    decision = run_promotion_gate(\n        cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600,\n        fillable=fillable, config=config,\n    )\n\n    assert isinstance(decision, PromotionDecision)\n    assert decision.deployable is False\n    assert decision.verdict == \"research_only\"\n    assert \"oos_rank_ic_above_mde\" in decision.failed_gates\n    # Every gate is reported, passed or not, so the verdict is auditable\n    assert {g.name for g in decision.gates} >= {\n        \"cpcv_ic_path_win_rate\", \"cpcv_top1_path_win_rate\", \"cpcv_delta_significance\",\n        \"selection_dsr\", \"oos_min_days\", \"oos_rank_ic_above_mde\", \"oos_top1_sign\",\n        \"fillable_top1_sign\",\n    }\n"
+    },
+    {
+      "scenario_id": "test_run_promotion_gate_promotes_when_every_gate_passes",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_run_promotion_gate_promotes_when_every_gate_passes -q",
+      "expected_behavior": "All gates green -> deployable, with no failed gates recorded.",
+      "test_skeleton": "def test_run_promotion_gate_promotes_when_every_gate_passes() -> None:\n    from src.ml.validation import GateOutcome, ValidationConfig, run_promotion_gate\n\n    cpcv = {\n        \"path_deltas\": [0.003] * 28,\n        \"n_path_deltas\": 28,\n        \"top1_path_win_rate\": 0.86,\n        \"ic_path_win_rate\": 0.96,\n        \"pooled_delta\": 0.0033,\n        \"p_bootstrap\": 0.0,\n        \"p_paired_t\": 0.0012,\n        \"ic_candidate\": 0.20,\n        \"ic_control\": 0.17,\n        \"ic_delta\": 0.03,\n        \"mde_top1\": 0.0027,\n        \"mde_ic\": 0.016,\n    }\n    oos = {\n        \"n_days\": 244, \"n_rows\": 3800, \"top1_mean\": 0.006, \"top1_sd\": 0.046,\n        \"top1_sharpe\": 2.0, \"rank_ic\": 0.13, \"mde_top1\": 0.83, \"mde_ic\": 0.049,\n        \"first_date\": \"2025-09-01\", \"last_date\": \"2026-08-25\",\n    }\n    fillable = {\"n_days\": 200, \"top1_mean\": 0.004, \"rank_ic\": 0.11, \"measured_share\": 0.90}\n    config = ValidationConfig(oos_reserve_start=\"2025-09-01\")\n\n    decision = run_promotion_gate(\n        cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600,\n        fillable=fillable, config=config,\n    )\n\n    assert decision.deployable is True\n    assert decision.verdict == \"deployable\"\n    assert decision.failed_gates == ()\n    assert all(isinstance(g, GateOutcome) for g in decision.gates)\n    assert all(g.passed for g in decision.gates)\n"
+    },
+    {
+      "scenario_id": "test_run_promotion_gate_uses_the_conservative_p_value",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_run_promotion_gate_uses_the_conservative_p_value -q",
+      "expected_behavior": "The significance gate takes max(bootstrap, paired-t): a tight bootstrap cannot override a weak analytic t-test.",
+      "test_skeleton": "def test_run_promotion_gate_uses_the_conservative_p_value() -> None:\n    from src.ml.validation import ValidationConfig, run_promotion_gate\n\n    cpcv = {\n        \"path_deltas\": [0.003] * 28,\n        \"n_path_deltas\": 28,\n        \"top1_path_win_rate\": 0.86,\n        \"ic_path_win_rate\": 0.96,\n        \"pooled_delta\": 0.0033,\n        \"p_bootstrap\": 0.0,      # block-bootstrap says \"certain\"\n        \"p_paired_t\": 0.20,      # analytic paired-t disagrees\n        \"ic_candidate\": 0.20,\n        \"ic_control\": 0.17,\n        \"ic_delta\": 0.03,\n        \"mde_top1\": 0.0027,\n        \"mde_ic\": 0.016,\n    }\n    oos = {\n        \"n_days\": 244, \"n_rows\": 3800, \"top1_mean\": 0.006, \"top1_sd\": 0.046,\n        \"top1_sharpe\": 2.0, \"rank_ic\": 0.13, \"mde_top1\": 0.83, \"mde_ic\": 0.049,\n        \"first_date\": \"2025-09-01\", \"last_date\": \"2026-08-25\",\n    }\n    fillable = {\"n_days\": 200, \"top1_mean\": 0.004, \"rank_ic\": 0.11, \"measured_share\": 0.90}\n    config = ValidationConfig(oos_reserve_start=\"2025-09-01\", promotion_alpha=0.05)\n\n    decision = run_promotion_gate(\n        cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=600,\n        fillable=fillable, config=config,\n    )\n\n    assert decision.deployable is False\n    assert \"cpcv_delta_significance\" in decision.failed_gates\n    gate = next(g for g in decision.gates if g.name == \"cpcv_delta_significance\")\n    assert gate.observed == 0.20\n"
+    },
+    {
+      "scenario_id": "test_run_promotion_gate_blocks_saturated_selection_dsr",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_run_promotion_gate_blocks_saturated_selection_dsr -q",
+      "expected_behavior": "DSR must be recomputed against the full selection budget (HPO x blend grid x policy candidates); a saturated 1.0 from an understated trial count cannot pass on its own.",
+      "test_skeleton": "def test_run_promotion_gate_blocks_saturated_selection_dsr() -> None:\n    import pytest\n\n    from src.ml.validation import ValidationConfig, run_promotion_gate\n\n    cpcv = {\n        \"path_deltas\": [0.003] * 28,\n        \"n_path_deltas\": 28,\n        \"top1_path_win_rate\": 0.86,\n        \"ic_path_win_rate\": 0.96,\n        \"pooled_delta\": 0.0033,\n        \"p_bootstrap\": 0.0,\n        \"p_paired_t\": 0.0012,\n        \"ic_candidate\": 0.20,\n        \"ic_control\": 0.17,\n        \"ic_delta\": 0.03,\n        \"mde_top1\": 0.0027,\n        \"mde_ic\": 0.016,\n    }\n    oos = {\n        \"n_days\": 244, \"n_rows\": 3800, \"top1_mean\": 0.006, \"top1_sd\": 0.046,\n        \"top1_sharpe\": 2.0, \"rank_ic\": 0.13, \"mde_top1\": 0.83, \"mde_ic\": 0.049,\n        \"first_date\": \"2025-09-01\", \"last_date\": \"2026-08-25\",\n    }\n    fillable = {\"n_days\": 200, \"top1_mean\": 0.004, \"rank_ic\": 0.11, \"measured_share\": 0.90}\n    config = ValidationConfig(oos_reserve_start=\"2025-09-01\")\n\n    decision = run_promotion_gate(\n        cpcv=cpcv, oos=oos, selection_dsr=0.80, n_selection_trials=600,\n        fillable=fillable, config=config,\n    )\n    assert decision.deployable is False\n    assert \"selection_dsr\" in decision.failed_gates\n\n    # A missing DSR is a hard failure, never a silent pass\n    missing = run_promotion_gate(\n        cpcv=cpcv, oos=oos, selection_dsr=None, n_selection_trials=600,\n        fillable=fillable, config=config,\n    )\n    assert missing.deployable is False\n    assert \"selection_dsr\" in missing.failed_gates\n\n    with pytest.raises(ValueError, match=\"n_selection_trials\"):\n        run_promotion_gate(\n            cpcv=cpcv, oos=oos, selection_dsr=0.99, n_selection_trials=0,\n            fillable=fillable, config=config,\n        )\n"
+    },
+    {
+      "scenario_id": "test_validation_config_rejects_out_of_domain_settings",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_validation_config_rejects_out_of_domain_settings -q",
+      "expected_behavior": "ValidationConfig is fail-closed on its own domain: a locked OOS start is mandatory and parseable, and every rate lives in [0, 1].",
+      "test_skeleton": "def test_validation_config_rejects_out_of_domain_settings() -> None:\n    import pytest\n\n    from src.ml.validation import ValidationConfig\n\n    cfg = ValidationConfig(oos_reserve_start=\"2025-09-01\")\n    assert cfg.eval_col == \"eval_net_mechanical\"\n    assert cfg.min_ic_path_win_rate == 0.75\n    assert cfg.min_top1_path_win_rate == 0.60\n    assert cfg.min_oos_days == 60\n\n    with pytest.raises(ValueError, match=\"oos_reserve_start\"):\n        ValidationConfig(oos_reserve_start=\"not-a-date\")\n    with pytest.raises(ValueError, match=\"min_ic_path_win_rate\"):\n        ValidationConfig(oos_reserve_start=\"2025-09-01\", min_ic_path_win_rate=1.5)\n    with pytest.raises(ValueError, match=\"promotion_alpha\"):\n        ValidationConfig(oos_reserve_start=\"2025-09-01\", promotion_alpha=0.0)\n    with pytest.raises(ValueError, match=\"min_oos_days\"):\n        ValidationConfig(oos_reserve_start=\"2025-09-01\", min_oos_days=0)\n"
+    },
+    {
+      "scenario_id": "test_evaluate_locked_oos_rejects_dev_overlap_and_scores_once",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_evaluate_locked_oos_rejects_dev_overlap_and_scores_once -q",
+      "expected_behavior": "The locked window is fit-once/score-once on dev-only parameters and refuses any date overlap with dev.",
+      "test_skeleton": "def test_evaluate_locked_oos_rejects_dev_overlap_and_scores_once() -> None:\n    import numpy as np\n    import pandas as pd\n    import pytest\n\n    from src.ml.validation import evaluate_locked_oos\n\n    rng = np.random.default_rng(3)\n    days = pd.to_datetime(pd.date_range(\"2024-01-01\", periods=180, freq=\"D\"))\n    rows = 5\n\n    def _panel(dates: pd.DatetimeIndex) -> pd.DataFrame:\n        n = len(dates) * rows\n        f1 = rng.normal(size=n)\n        f2 = rng.normal(size=n)\n        eval_net = 0.02 * f1 + rng.normal(scale=0.01, size=n)\n        return pd.DataFrame({\n            \"trade_date\": np.repeat(dates.to_numpy(), rows),\n            \"stock_code\": [f\"{i % 50:06d}\" for i in range(n)],\n            \"f1\": f1,\n            \"f2\": f2,\n            \"target_return\": eval_net,\n            \"eval_net_mechanical\": eval_net,\n        })\n\n    dev = _panel(days[:150])\n    oos = _panel(days[150:])\n\n    result = evaluate_locked_oos(\n        dev, oos, [\"f1\", \"f2\"], \"target_return\", \"eval_net_mechanical\", \"trade_date\",\n        model_params={\"n_estimators\": 20, \"num_leaves\": 7}, huber_delta=0.9, seeds=(13, 29),\n    )\n\n    assert result[\"n_days\"] == 30\n    assert result[\"n_rows\"] == 30 * rows\n    assert np.isfinite(result[\"top1_mean\"])\n    assert np.isfinite(result[\"rank_ic\"])\n    assert -1.0 <= result[\"rank_ic\"] <= 1.0\n    assert np.isfinite(result[\"mde_ic\"]) and result[\"mde_ic\"] > 0.0\n    assert str(result[\"first_date\"])[:10] == \"2024-05-30\"\n\n    with pytest.raises(ValueError, match=\"overlap\"):\n        evaluate_locked_oos(\n            dev, dev, [\"f1\", \"f2\"], \"target_return\", \"eval_net_mechanical\", \"trade_date\",\n            model_params={\"n_estimators\": 20}, huber_delta=0.9, seeds=(13,),\n        )\n"
+    },
+    {
+      "scenario_id": "test_cpcv_path_evidence_reports_paired_path_rates",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_cpcv_path_evidence_reports_paired_path_rates -q",
+      "expected_behavior": "Candidate and control are scored on identical CPCV folds, yielding per-path top-1 and rank-IC win rates plus both p-values.",
+      "test_skeleton": "def test_cpcv_path_evidence_reports_paired_path_rates() -> None:\n    import numpy as np\n    import pandas as pd\n\n    from src.ml.robust_eval import CombinatorialPurgedCV\n    from src.ml.validation import cpcv_path_evidence\n\n    rng = np.random.default_rng(11)\n    days = pd.to_datetime(pd.date_range(\"2024-01-01\", periods=120, freq=\"D\"))\n    rows = 6\n    n = len(days) * rows\n    f1 = rng.normal(size=n)\n    f2 = rng.normal(size=n)\n    eval_net = 0.03 * f1 + 0.01 * f2 + rng.normal(scale=0.02, size=n)\n    dev = pd.DataFrame({\n        \"trade_date\": np.repeat(days.to_numpy(), rows),\n        \"stock_code\": [f\"{i % 40:06d}\" for i in range(n)],\n        \"f1\": f1,\n        \"f2\": f2,\n        \"target_return\": eval_net,\n        \"eval_net_mechanical\": eval_net,\n    })\n\n    cv = CombinatorialPurgedCV(n_groups=7, k_test=2, purge_gap=1, embargo_gap=1)\n    ev = cpcv_path_evidence(\n        dev, [\"f1\", \"f2\"], \"target_return\", \"eval_net_mechanical\", \"trade_date\",\n        cv=cv,\n        candidate_params={\"n_estimators\": 20, \"num_leaves\": 7},\n        control_params={\"n_estimators\": 5, \"num_leaves\": 2, \"learning_rate\": 0.05},\n        huber_delta=0.9,\n        control_huber_delta=0.9,\n    )\n\n    assert ev[\"n_path_deltas\"] == 21  # C(7, 2) test-bin combinations\n    assert len(ev[\"path_deltas\"]) == 21\n    assert 0.0 <= ev[\"ic_path_win_rate\"] <= 1.0\n    assert 0.0 <= ev[\"top1_path_win_rate\"] <= 1.0\n    assert 0.0 <= ev[\"p_bootstrap\"] <= 1.0\n    assert 0.0 <= ev[\"p_paired_t\"] <= 1.0\n    assert np.isfinite(ev[\"mde_top1\"]) and ev[\"mde_top1\"] > 0.0\n    assert np.isfinite(ev[\"mde_ic\"]) and ev[\"mde_ic\"] > 0.0\n    assert np.isfinite(ev[\"ic_candidate\"]) and np.isfinite(ev[\"ic_control\"])\n    assert np.isclose(ev[\"ic_delta\"], ev[\"ic_candidate\"] - ev[\"ic_control\"])\n    assert np.isclose(ev[\"pooled_delta\"], float(np.mean(ev[\"path_deltas\"])))\n"
+    },
+    {
+      "scenario_id": "test_publish_bundle_refuses_when_not_deployable",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_publish_bundle_refuses_when_not_deployable -q",
+      "expected_behavior": "Fail-closed publish: a research_only decision writes the candidate artifact but never touches the production bundle or the promotion record.",
+      "test_skeleton": "def test_publish_bundle_refuses_when_not_deployable(tmp_path) -> None:\n    import json\n\n    from src.ml.validation import GateOutcome, PromotionDecision, publish_bundle\n\n    candidate_dir = tmp_path / \"candidate\"\n    production_dir = tmp_path / \"production\"\n    production_dir.mkdir()\n    incumbent = production_dir / \"sizing_pipeline_bundle.joblib\"\n    incumbent.write_bytes(b\"incumbent\")\n\n    decision = PromotionDecision(\n        deployable=False,\n        verdict=\"research_only\",\n        failed_gates=(\"oos_rank_ic_above_mde\",),\n        gates=(GateOutcome(name=\"oos_rank_ic_above_mde\", passed=False, observed=0.02, threshold=0.049, detail={}),),\n        evidence={},\n    )\n\n    result = publish_bundle({\"feature_cols\": [\"f1\"]}, str(candidate_dir), str(production_dir), decision)\n\n    assert result[\"published\"] is False\n    assert result[\"failed_gates\"] == [\"oos_rank_ic_above_mde\"]\n    # The candidate artifact is still written for research\n    assert (candidate_dir / \"sizing_pipeline_bundle.joblib\").exists()\n    # Production is untouched: same bytes, no record, no backup\n    assert incumbent.read_bytes() == b\"incumbent\"\n    assert not (production_dir / \"promotion_record.json\").exists()\n    assert not list(production_dir.glob(\"*.bak_*\"))\n    assert json.dumps(result)  # result stays JSON-serialisable for logging\n"
+    },
+    {
+      "scenario_id": "test_publish_bundle_backs_up_incumbent_and_writes_record",
+      "target_test_file": "tests/unit/ml/test_validation.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_validation.py -k test_publish_bundle_backs_up_incumbent_and_writes_record -q",
+      "expected_behavior": "A deployable decision backs up the incumbent, replaces the production bundle, and records the gate evidence next to it.",
+      "test_skeleton": "def test_publish_bundle_backs_up_incumbent_and_writes_record(tmp_path) -> None:\n    import json\n\n    import joblib\n\n    from src.ml.validation import GateOutcome, PromotionDecision, publish_bundle\n\n    candidate_dir = tmp_path / \"candidate\"\n    production_dir = tmp_path / \"production\"\n    production_dir.mkdir()\n    (production_dir / \"sizing_pipeline_bundle.joblib\").write_bytes(b\"incumbent\")\n\n    decision = PromotionDecision(\n        deployable=True,\n        verdict=\"deployable\",\n        failed_gates=(),\n        gates=(GateOutcome(name=\"oos_rank_ic_above_mde\", passed=True, observed=0.13, threshold=0.049, detail={}),),\n        evidence={\"oos_reserve_start\": \"2025-09-01\"},\n    )\n    bundle = {\"feature_cols\": [\"f1\"], \"training_cutoff\": \"2025-08-29\", \"round_trip_cost\": 0.0046}\n\n    result = publish_bundle(bundle, str(candidate_dir), str(production_dir), decision)\n\n    assert result[\"published\"] is True\n    backups = list(production_dir.glob(\"sizing_pipeline_bundle.joblib.bak_*\"))\n    assert len(backups) == 1\n    assert backups[0].read_bytes() == b\"incumbent\"\n\n    promoted = joblib.load(production_dir / \"sizing_pipeline_bundle.joblib\")\n    assert promoted[\"feature_cols\"] == [\"f1\"]\n\n    record = json.loads((production_dir / \"promotion_record.json\").read_text(encoding=\"utf-8\"))\n    assert record[\"verdict\"] == \"deployable\"\n    assert record[\"training_cutoff\"] == \"2025-08-29\"\n    assert record[\"round_trip_cost\"] == 0.0046\n    assert record[\"oos_reserve_start\"] == \"2025-09-01\"\n    assert len(record[\"sha256\"]) == 64\n    assert [g[\"name\"] for g in record[\"gates\"]] == [\"oos_rank_ic_above_mde\"]\n"
+    },
+    {
+      "scenario_id": "test_champion_tuning_config_accepts_decision_label_modes",
+      "target_test_file": "tests/unit/ml/test_champion.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_champion.py -k test_champion_tuning_config_accepts_decision_label_modes -q",
+      "expected_behavior": "ChampionTuningConfig defaults preserve the incumbent journaled/flat path and reject unknown label or cost modes.",
+      "test_skeleton": "def test_champion_tuning_config_accepts_decision_label_modes() -> None:\n    import pytest\n\n    from src.ml.tuning import ChampionTuningConfig\n    from src.ml.validation import ValidationConfig\n\n    default = ChampionTuningConfig()\n    assert default.label_mode == \"journaled\"\n    assert default.cost_mode == \"flat\"\n    assert default.validation is None\n\n    cfg = ChampionTuningConfig(\n        oos_reserve_start=\"2025-09-01\",\n        label_mode=\"mechanical\",\n        cost_mode=\"per_row\",\n        validation=ValidationConfig(oos_reserve_start=\"2025-09-01\"),\n    )\n    assert cfg.validation is not None\n    assert cfg.validation.oos_reserve_start == \"2025-09-01\"\n\n    with pytest.raises(ValueError, match=\"label_mode\"):\n        ChampionTuningConfig(label_mode=\"operator\")\n    with pytest.raises(ValueError, match=\"cost_mode\"):\n        ChampionTuningConfig(cost_mode=\"guess\")\n    # A validation protocol without a matching locked window is a contradiction\n    with pytest.raises(ValueError, match=\"oos_reserve_start\"):\n        ChampionTuningConfig(validation=ValidationConfig(oos_reserve_start=\"2025-09-01\"))\n    with pytest.raises(ValueError, match=\"oos_reserve_start\"):\n        ChampionTuningConfig(\n            oos_reserve_start=\"2025-01-01\",\n            validation=ValidationConfig(oos_reserve_start=\"2025-09-01\"),\n        )\n"
+    },
+    {
+      "scenario_id": "test_retrain_publish_requires_locked_oos_window",
+      "target_test_file": "tests/unit/ml/test_retrain.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_retrain.py -k test_retrain_publish_requires_locked_oos_window -q",
+      "expected_behavior": "The CLI cannot publish to production without a locked OOS window, and the new label/cost flags default to the decision-grade path.",
+      "test_skeleton": "def test_retrain_publish_requires_locked_oos_window() -> None:\n    import pytest\n\n    from src.ml.retrain import build_arg_parser\n\n    parser = build_arg_parser()\n\n    args = parser.parse_args([\"--tuned\", \"--oos-reserve-start\", \"2025-09-01\"])\n    assert args.label_mode == \"mechanical\"\n    assert args.cost_mode == \"per_row\"\n    assert args.publish is False\n    assert args.target_notional_100m == 0.5\n    assert args.production_dir == \"artifacts/models\"\n\n    published = parser.parse_args(\n        [\"--tuned\", \"--oos-reserve-start\", \"2025-09-01\", \"--publish\"]\n    )\n    assert published.publish is True\n\n    # Fail-closed: publishing without a locked window is rejected by the parser\n    with pytest.raises(SystemExit):\n        parser.parse_args([\"--tuned\", \"--publish\"])\n"
+    }
+  ]
+}

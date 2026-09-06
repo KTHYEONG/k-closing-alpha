@@ -210,6 +210,9 @@
   "src/ml/dataset.py": {
     "testing": "tests/unit/ml/test_dataset.py"
   },
+  "src/ml/decision_labels.py": {
+    "testing": "tests/unit/ml/test_decision_labels.py"
+  },
   "src/ml/exit_policy.py": {
     "testing": "tests/unit/ml/test_exit_policy.py"
   },
@@ -247,6 +250,9 @@
   },
   "src/ml/tuning.py": {
     "testing": "tests/unit/ml/test_tuning.py"
+  },
+  "src/ml/validation.py": {
+    "testing": "tests/unit/ml/test_validation.py"
   },
   "src/processing/scale_corrector.py": {
     "testing": "tests/unit/processing/test_scale_corrector.py"
