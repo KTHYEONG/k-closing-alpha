@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
 
 _DAILY_ANNUALIZATION = float(np.sqrt(252.0))
 _MIN_YEAR_SAMPLES = 5
@@ -86,19 +86,56 @@ def ndcg_at_k(relevance: np.ndarray, k: int) -> float:
     return dcg / idcg
 
 
+def mean_group_rank_ic(
+    df: pd.DataFrame,
+    group_cols: Sequence[str],
+    score_col: str,
+    target_col: str,
+    *,
+    min_group_size: int = 2,
+) -> float:
+    """그룹 내 average-rank 벡터의 Pearson 상관계에 대한 비가중 평균 (벡터화 rank-IC)."""
+    cols = list(group_cols)
+    codes = df.groupby(cols, sort=False).ngroup().to_numpy()
+    score = pd.to_numeric(df[score_col], errors="coerce").to_numpy(dtype=np.float64)
+    target = pd.to_numeric(df[target_col], errors="coerce").to_numpy(dtype=np.float64)
+    # average-rank ties match scipy Spearman exactly; NaN-key rows (code -1) are dropped like groupby.
+    rank_score = pd.Series(score).groupby(codes, sort=False).rank(method="average").to_numpy(dtype=np.float64)
+    rank_target = pd.Series(target).groupby(codes, sort=False).rank(method="average").to_numpy(dtype=np.float64)
+    keep = codes >= 0
+    codes = codes[keep]
+    if codes.size == 0:
+        return float("nan")
+    score = score[keep]
+    target = target[keep]
+    rank_score = rank_score[keep]
+    rank_target = rank_target[keep]
+    # Groups with any non-finite value are excluded (scipy returns nan for them).
+    finite = (np.isfinite(score) & np.isfinite(target)).astype(np.float64)
+    n = np.bincount(codes).astype(np.float64)
+    n_finite = np.bincount(codes, weights=finite)
+    all_finite = n_finite == n
+    w_score = np.where(finite > 0.0, rank_score, 0.0)
+    w_target = np.where(finite > 0.0, rank_target, 0.0)
+    mean_score = np.bincount(codes, weights=w_score) / n
+    mean_target = np.bincount(codes, weights=w_target) / n
+    dev_score = (w_score - mean_score[codes]) * finite
+    dev_target = (w_target - mean_target[codes]) * finite
+    cov = np.bincount(codes, weights=dev_score * dev_target) / n
+    var_score = np.bincount(codes, weights=dev_score * dev_score) / n
+    var_target = np.bincount(codes, weights=dev_target * dev_target) / n
+    # Skip rule mirrors the loop: size floor + positive rank variance on both columns.
+    valid = (n >= float(min_group_size)) & all_finite & (var_score > 0.0) & (var_target > 0.0)
+    if not bool(valid.any()):
+        return float("nan")
+    rho = np.zeros_like(cov)
+    rho[valid] = cov[valid] / np.sqrt(var_score[valid] * var_target[valid])
+    return float(np.mean(rho[valid]))
+
+
 def rank_ic(oof: pd.DataFrame, group_col: str, target_col: str, score_col: str = "pred") -> float:
     """평균 per-group Spearman(pred,target) 정규화 IC."""
-    ics: list[float] = []
-    for _, group in oof.groupby(group_col, sort=False):
-        if len(group) < 2:
-            continue
-        if float(np.std(group[score_col].to_numpy())) == 0.0:
-            continue
-        result = spearmanr(group[score_col], group[target_col])
-        ic = float(result.statistic)
-        if not np.isnan(ic):
-            ics.append(ic)
-    return float(np.mean(ics)) if ics else float("nan")
+    return mean_group_rank_ic(oof, [group_col], score_col, target_col, min_group_size=2)
 
 
 def top_k_return(oof: pd.DataFrame, group_col: str, target_col: str, k: int = 1, score_col: str = "pred") -> float:

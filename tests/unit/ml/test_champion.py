@@ -323,3 +323,47 @@ def test_champion_excludes_ceiling_rows_from_dev_and_control() -> None:
     # the ceiling-free baseline exactly, not the baseline plus the added rows.
     assert prov["n_dev_rows"] == prov_baseline["n_dev_rows"]
     assert prov["n_control_dev_rows"] == prov_baseline["n_control_dev_rows"]
+
+
+def test_promotion_delta_invariant_to_common_cost_shift() -> None:
+    import numpy as np
+    import pytest
+
+    from src.ml.champion import evaluate_promotion
+
+    # Given: paired daily top-1 returns for candidate and control
+    rng = np.random.default_rng(0)
+    ctrl = rng.normal(0.004, 0.03, size=200)
+    cand = ctrl + rng.normal(0.001, 0.005, size=200)
+
+    # When: apply an identical additional round-trip cost to both legs
+    extra_cost = 0.0046 - 0.0020
+    base = evaluate_promotion(cand, ctrl, alpha=0.10)
+    shifted = evaluate_promotion(cand - extra_cost, ctrl - extra_cost, alpha=0.10)
+
+    # Then: delta is unchanged by a common additive shift
+    assert shifted["delta"] == pytest.approx(base["delta"], abs=1e-12)
+
+
+def test_champion_candidate_oof_computed_once(monkeypatch) -> None:
+    import src.ml.champion as champ
+    import src.ml.tuning as tuning_mod
+    from src.ml.tuning import ChampionTuningConfig
+    from tests.unit.ml.test_champion import _raw_trade_log
+
+    real = champ.purged_oof_predict
+    calls = {"outer": 0}
+
+    def _spy(*a, **kw):
+        if kw.get("predict_proba") is True and kw.get("n_splits") == 5:
+            calls["outer"] += 1
+        return real(*a, **kw)
+
+    # evaluate_config_oof resolves purged_oof_predict in the tuning namespace,
+    # so both namespaces share the spy to count global outer OOFs.
+    monkeypatch.setattr(champ, "purged_oof_predict", _spy)
+    monkeypatch.setattr(tuning_mod, "purged_oof_predict", _spy)
+    cfg = ChampionTuningConfig(hpo_trials=2, n_splits=5, require_beats_control=False, min_history_dates=20, model_params_override={"num_leaves": 7, "n_estimators": 40})
+    champ.train_tuned_champion_bundle(_raw_trade_log(n_dates=70, per_day=6), None, cfg, export_dir="tmp/spec_oof_once")
+
+    assert calls["outer"] == 2

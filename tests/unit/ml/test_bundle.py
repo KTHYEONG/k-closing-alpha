@@ -73,3 +73,36 @@ def test_fit_seed_ensemble_passes_params_through_verbatim() -> None:
     for member in model.models:
         assert member.get_params()["num_leaves"] == 8
         assert member.get_params()["n_estimators"] == 40
+
+
+def test_bundle_payload_carries_measured_round_trip_cost() -> None:
+    import numpy as np
+    import pytest
+
+    from src.ml.bundle import build_inline_bundle
+    from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO
+
+    # Given
+    rng = np.random.default_rng(1)
+    n_days, per_day = 30, 6
+    rows = []
+    for d in pd.bdate_range("2026-01-05", periods=n_days):
+        for _ in range(per_day):
+            f1, f2 = rng.normal(), rng.normal()
+            rows.append(
+                {
+                    "trade_date": d.strftime("%Y-%m-%d"),
+                    "f1": f1,
+                    "f2": f2,
+                    "target_return": 0.01 * f1 - 0.004 * f2 + rng.normal(scale=0.02),
+                }
+            )
+    df = pd.DataFrame(rows)
+
+    # When
+    bundle = build_inline_bundle(df, ["f1", "f2"], "target_return", "trade_date")
+
+    # Then
+    assert bundle["round_trip_cost"] == pytest.approx(ROUND_TRIP_COST_RATIO)
+    assert bundle["round_trip_cost"] == pytest.approx(0.0046)
+    assert bundle["policy_params"]["round_trip_cost"] == pytest.approx(0.0046)

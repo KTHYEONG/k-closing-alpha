@@ -42,6 +42,8 @@ from src.ml.dataset import retarget_with_clip
 
 
 def test_retarget_with_clip_applies_bounds_and_cost() -> None:
+    from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO
+
     df = pd.DataFrame({
         "net_return": [40.0, -50.0, 3.0],
         "target_return": [0.10, -0.10, 0.028],
@@ -51,7 +53,7 @@ def test_retarget_with_clip_applies_bounds_and_cost() -> None:
     out = retarget_with_clip(df, -0.15, 0.30)
     assert np.isclose(out["target_return"].iloc[0], 0.30)
     assert np.isclose(out["target_return"].iloc[1], -0.15)
-    assert np.isclose(out["target_return"].iloc[2], 3.0 / 100 - 0.0020)
+    assert np.isclose(out["target_return"].iloc[2], 3.0 / 100 - ROUND_TRIP_COST_RATIO)
     assert out["target_good"].tolist() == [1, 0, 1]
     assert out["target_bad"].tolist() == [0, 1, 0]
 
@@ -323,3 +325,29 @@ def test_champion_tuning_config_model_params_override() -> None:
     assert cfg.model_params_override == {"num_leaves": 15}
     with pytest.raises(ValueError, match="model_params_override"):
         ChampionTuningConfig(model_params_override={})
+
+
+def test_evaluate_config_oof_precomputed_matches_fresh() -> None:
+    import pytest
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.oof import purged_oof_predict
+    from src.ml.tuning import evaluate_config_oof
+
+    rng = np.random.default_rng(21)
+    rows = []
+    for d in pd.bdate_range("2024-01-01", periods=90):
+        for j in range(6):
+            sig = rng.normal()
+            rows.append({"trade_date": d.strftime("%Y-%m-%d"), "stock_code": f"{j:06d}", "chart_analysis": "x", "f1": sig, "f2": rng.normal(), "net_return": 0.01 * sig, "target_return": 0.01 * sig + 0.02 * rng.normal()})
+    dev = pd.DataFrame(rows)
+    kw = dict(n_splits=3, purge_gap=1, model_params=None, huber_delta=0.9, weighting_mode="current", recency_half_life_groups=None, p_good_weight=0.0, min_history_dates=20)  # noqa: C408
+
+    fresh = evaluate_config_oof(dev, ["f1", "f2"], "target_return", "trade_date", **kw)
+    pre_oof = purged_oof_predict(dev, ["f1", "f2"], "target_return", "trade_date", n_splits=3, purge_gap=1, model_params=None, huber_delta=0.9, weighting_mode="current", recency_half_life_groups=None, predict_proba=True)
+    reused = evaluate_config_oof(dev, ["f1", "f2"], "target_return", "trade_date", precomputed_oof=pre_oof, **kw)
+
+    np.testing.assert_allclose(reused["scheduled_returns"], fresh["scheduled_returns"], rtol=0.0, atol=1e-9)
+    np.testing.assert_array_equal(reused["dates"], fresh["dates"])
+    assert reused["metrics"]["scheduled_mean_return"] == pytest.approx(fresh["metrics"]["scheduled_mean_return"], abs=1e-9)
