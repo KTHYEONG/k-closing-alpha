@@ -12,6 +12,7 @@ from src.data.candidate_panel import build_restored_trade_log, check_price_histo
 from src.ml.bundle import CHAMPION_DEFAULT_MODEL_PARAMS
 from src.ml.champion import train_champion_bundle, train_tuned_champion_bundle
 from src.ml.tuning import ChampionTuningConfig
+from src.ml.universe import SCREEN_REGISTRY
 from src.ml.validation import ValidationConfig
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-hpo", action="store_true", help="skip Optuna; use CHAMPION_DEFAULT_MODEL_PARAMS")
     parser.add_argument("--no-restore-panel", action="store_true", help="train on the raw trade log only; skip condition_history/archive panel restoration")
     parser.add_argument("--label-mode", default="mechanical", choices=["journaled", "mechanical"])
+    parser.add_argument("--screen", default="operator_legacy", choices=["operator_legacy", "band_2_15", "band_5_15_highvalue"])
     parser.add_argument("--cost-mode", default="per_row", choices=["flat", "per_row"])
     parser.add_argument("--publish", action="store_true")
     parser.add_argument("--production-dir", default="artifacts/models")
@@ -107,8 +109,9 @@ def main(argv: list[str] | None = None) -> None:
             cost_mode=args.cost_mode,
             validation=validation,
             buyability_target_notional_100m=float(args.target_notional_100m),
+            screen=SCREEN_REGISTRY[args.screen],
         )
-        bundle = train_tuned_champion_bundle(trade_log_df, theme_df, cfg, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df)
+        bundle = train_tuned_champion_bundle(trade_log_df, theme_df, cfg, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df, production_dir=args.production_dir)
         prov = bundle.get("tuning_provenance", {})
         cvc = prov.get("control_vs_candidate", {})
         logger.info(

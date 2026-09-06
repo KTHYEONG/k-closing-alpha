@@ -25,6 +25,20 @@ from src.ml.robust_eval import (
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "GateOutcome",
+    "PromotionDecision",
+    "ValidationConfig",
+    "cpcv_path_evidence",
+    "evaluate_locked_oos",
+    "evaluate_screen_grid",
+    "minimum_detectable_effect",
+    "paired_t_p_value",
+    "publish_bundle",
+    "run_promotion_gate",
+    "temporal_sign_consistency",
+]
+
 
 @dataclass(frozen=True)
 class ValidationConfig:
@@ -41,6 +55,9 @@ class ValidationConfig:
     min_oos_rank_ic: float = 0.0
     require_fillable_sleeve: bool = True
     target_notional_100m: float = 0.5
+    require_temporal_consistency: bool = True
+    temporal_split_date: str = "2022-01-01"
+    require_execution_profile: bool = True
 
     def __post_init__(self) -> None:
         parsed = pd.to_datetime(self.oos_reserve_start, errors="coerce")
@@ -69,6 +86,17 @@ class ValidationConfig:
         if not np.isfinite(float(self.target_notional_100m)) or float(self.target_notional_100m) <= 0.0:
             raise ValueError(
                 f"target_notional_100m must be finite and > 0, got {self.target_notional_100m!r}"
+            )
+        parsed_split = pd.to_datetime(self.temporal_split_date, errors="coerce")
+        if pd.isna(parsed_split):
+            raise ValueError(f"temporal_split_date is not parseable: {self.temporal_split_date!r}")
+        if not isinstance(self.require_temporal_consistency, bool):
+            raise ValueError(
+                f"require_temporal_consistency must be bool, got {self.require_temporal_consistency!r}"
+            )
+        if not isinstance(self.require_execution_profile, bool):
+            raise ValueError(
+                f"require_execution_profile must be bool, got {self.require_execution_profile!r}"
             )
 
 
@@ -330,6 +358,93 @@ def evaluate_locked_oos(
     }
 
 
+def temporal_sign_consistency(daily: pd.Series, *, split_date: str) -> dict[str, Any]:
+    """Split a daily net-return series; both halves must share a strict sign."""
+    split = pd.to_datetime(split_date, errors="coerce")
+    if pd.isna(split):
+        raise ValueError(f"split_date is not parseable: {split_date!r}")
+    idx = pd.to_datetime(pd.Series(daily.index), errors="coerce")
+    vals = pd.to_numeric(pd.Series(np.asarray(daily.to_numpy(dtype=np.float64))), errors="coerce").to_numpy(dtype=np.float64)
+    first_mask = (idx < pd.Timestamp(split)).to_numpy() & np.isfinite(vals)
+    second_mask = (idx >= pd.Timestamp(split)).to_numpy() & np.isfinite(vals)
+    first = vals[first_mask]
+    second = vals[second_mask]
+    if first.size == 0 or second.size == 0:
+        raise ValueError(
+            f"temporal split {split_date!r} leaves an empty half: n_first={int(first.size)} n_second={int(second.size)}"
+        )
+    first_mean = float(np.mean(first))
+    second_mean = float(np.mean(second))
+    consistent = bool(
+        (first_mean > 0.0 and second_mean > 0.0) or (first_mean < 0.0 and second_mean < 0.0)
+    )
+    return {
+        "first_mean": float(first_mean),
+        "second_mean": float(second_mean),
+        "n_first": int(first.size),
+        "n_second": int(second.size),
+        "sign_consistent": bool(consistent),
+    }
+
+
+def evaluate_screen_grid(
+    panel: pd.DataFrame,
+    grid: tuple[Any, ...],
+    *,
+    group_col: str,
+    gross_col: str,
+    cost_ratio: float,
+) -> dict[str, Any]:
+    """Score each ScreenConfig on the labelled panel; screens cost DSR trials."""
+    from src.ml.universe import screen_baseline_stats
+
+    if len(grid) == 0:
+        raise ValueError("grid must be non-empty")
+    screens: list[dict[str, Any]] = []
+    for screen in grid:
+        lower = float(screen.change_lower)
+        upper = screen.change_upper
+        chg = pd.to_numeric(panel["daily_change_pct"], errors="coerce").to_numpy(dtype=np.float64) if "daily_change_pct" in panel.columns else np.full(len(panel), np.nan)
+        keep = np.isfinite(chg) & (chg >= lower)
+        if upper is not None:
+            keep &= np.isfinite(chg) & (chg <= float(upper))
+        if "trade_value_100m" in panel.columns:
+            tv = pd.to_numeric(panel["trade_value_100m"], errors="coerce").to_numpy(dtype=np.float64)
+            keep &= np.isfinite(tv) & (tv >= float(getattr(screen, "min_trade_value_100m", 0.0)))
+        if "market_cap_100m" in panel.columns:
+            mc = pd.to_numeric(panel["market_cap_100m"], errors="coerce").to_numpy(dtype=np.float64)
+            keep &= np.isfinite(mc) & (mc >= float(getattr(screen, "min_market_cap_100m", 0.0)))
+        if bool(getattr(screen, "exclude_ceiling", False)) and "close" in panel.columns and "high" in panel.columns:
+            close = pd.to_numeric(panel["close"], errors="coerce").to_numpy(dtype=np.float64)
+            high = pd.to_numeric(panel["high"], errors="coerce").to_numpy(dtype=np.float64)
+            ceiling = np.isfinite(chg) & np.isfinite(close) & np.isfinite(high) & (chg >= 0.29) & (close >= high)
+            keep &= ~ceiling
+        sub = panel.loc[keep].copy()
+        import dataclasses as _dc
+
+        screen_dict = _dc.asdict(screen)
+        if len(sub) == 0:
+            stats: dict[str, Any] = {
+                "n_rows": 0,
+                "n_days": 0,
+                "per_day": 0.0,
+                "gross_bp": float("nan"),
+                "net_bp": float("nan"),
+                "t_stat": float("nan"),
+                "sharpe": float("nan"),
+                "win_rate": float("nan"),
+                "coverage_warning": False,
+            }
+        else:
+            stats = screen_baseline_stats(sub, group_col=group_col, gross_col=gross_col, cost_ratio=float(cost_ratio))
+        screens.append({"screen": dict(screen_dict), **dict(stats)})
+    return {
+        "n_screens": len(grid),
+        "screens": list(screens),
+        "selection_trials_multiplier": len(grid),
+    }
+
+
 def run_promotion_gate(
     *,
     cpcv: dict[str, Any],
@@ -338,6 +453,8 @@ def run_promotion_gate(
     n_selection_trials: int,
     fillable: dict[str, Any] | None,
     config: ValidationConfig,
+    temporal: dict[str, Any] | None = None,
+    execution_profile: dict[str, Any] | None = None,
 ) -> PromotionDecision:
     """Compose the eight fail-closed promotion gates with per-gate MDE evidence."""
     if int(n_selection_trials) < 1:
@@ -436,6 +553,25 @@ def run_promotion_gate(
             detail={"mde": float("nan"), "measured_share": float(fillable.get("measured_share", float("nan"))) if fillable else float("nan")},
         )
     )
+    gates.append(GateOutcome(name="temporal_sign_consistency", passed=bool(temporal is not None and temporal.get("sign_consistent")), observed=float(temporal.get("second_mean", float("nan"))) if temporal else float("nan"), threshold=0.0, detail=dict(temporal or {})))
+    if temporal is None and not bool(config.require_temporal_consistency):
+        gates[-1] = GateOutcome(name="temporal_sign_consistency", passed=True, observed=float("nan"), threshold=0.0, detail={})
+    # R1: execution must be measured (fill_rate/adverse_selection) before ANY
+    # promotion -- this gate only requires the profile to exist, not to be
+    # favourable, since fill_rate_is_upper_bound already caps optimism.
+    exec_passed = execution_profile is not None
+    exec_obs = float(execution_profile.get("fill_rate", float("nan"))) if execution_profile else float("nan")
+    gates.append(
+        GateOutcome(
+            name="execution_profile_measured",
+            passed=bool(exec_passed),
+            observed=exec_obs,
+            threshold=0.0,
+            detail=dict(execution_profile or {}),
+        )
+    )
+    if execution_profile is None and not bool(config.require_execution_profile):
+        gates[-1] = GateOutcome(name="execution_profile_measured", passed=True, observed=float("nan"), threshold=0.0, detail={})
     for g in gates:
         logger.info(
             "[EVAL] gate=%s passed=%s observed=%.4f threshold=%.4f mde=%.4f",
@@ -454,6 +590,7 @@ def run_promotion_gate(
         "selection_dsr": selection_dsr,
         "n_selection_trials": int(n_selection_trials),
         "fillable": dict(fillable) if fillable else None,
+        "temporal": dict(temporal) if temporal else None,
         "oos_reserve_start": config.oos_reserve_start,
     }
     return PromotionDecision(
