@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "CEILING_EXCLUDED_PROMOTION_POOL",
+      "date": "2026-09-06",
+      "adr_id": "ADR_20260906_CEILING_EXCLUDED_PROMOTION_POOL",
+      "domain": "quant",
+      "title": "Ceiling-Excluded Training/Promotion Pool + Cost Model Microstructure Fix",
+      "why": "Pooled top-1 backtests were dominated by unfillable +30%-ceiling picks, and the execution cost model briefly assumed the wrong microstructure before the operator confirmed both legs execute via continuous trading",
+      "resolution": "Wired classify_ceiling_entry to drop ceiling rows from champion.py's dev/control_dev before HPO/promotion and to force Pass/0-allocation in predict.py's live output; reverted cost_model.py round_trip_ticks to 2.0 (both legs cross spread) and updated STATUTORY_COST_BP to 20bp (2026-01-01 KRX tax hike...",
+      "impact": "First promoted champion this project has produced: candidate beats control +0.185pp/day net, p=0.006, Sharpe 4.18 vs 3.48 -- though still measured against the old 20bp cost constant baked into target_return, not the 46bp measured by execution_cost",
+      "archive_path": "docs/decisions/archive/CEILING_EXCLUDED_PROMOTION_POOL/ceiling_excluded_promotion_pool_contract.json"
+    },
+    {
       "task_id": "EXECUTION_COST_MODEL",
       "date": "2026-09-05",
       "adr_id": "ADR_20260905_EXECUTION_COST_MODEL",
