@@ -14,27 +14,6 @@ import pandas as pd
 from scipy import stats
 from scipy.stats import norm
 
-KRX_TICK_BANDS: tuple[tuple[float, float], ...] = (
-    (2000.0, 1.0),
-    (5000.0, 5.0),
-    (20000.0, 10.0),
-    (50000.0, 50.0),
-    (200000.0, 100.0),
-    (500000.0, 500.0),
-    (float("inf"), 1000.0),
-)
-
-
-def krx_tick_size(price: np.ndarray | float) -> np.ndarray:
-    """Calculate KRX statutory tick size for given price levels."""
-    arr = np.asarray(price, dtype=np.float64)
-    tick = np.full(arr.shape, np.nan, dtype=np.float64)
-    valid = np.isfinite(arr) & (arr > 0.0)
-    for bound, size in KRX_TICK_BANDS:
-        take = valid & np.isnan(tick) & (arr < float(bound))
-        tick[take] = float(size)
-    return tick
-
 
 def moving_block_bootstrap_ci(
     series: np.ndarray,

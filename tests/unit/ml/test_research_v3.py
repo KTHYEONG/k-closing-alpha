@@ -18,12 +18,12 @@ from src.ml.research.v3_engine import (
     attach_forward_exit_paths,
     build_candidate_universe,
     compute_derived_features,
+    load_and_prepare_price_history,
 )
 from src.ml.research.v3_metrics import (
     calculate_geometric_cagr,
     calculate_series_metrics,
     deflated_sharpe_ratio,
-    krx_tick_size,
     moving_block_bootstrap_ci,
     simulate_discrete_portfolio,
 )
@@ -256,3 +256,131 @@ def test_future_mutation_test():
 
     for col in FEATURE_COLS:
         assert feats1.iloc[0][col] == pytest.approx(feats2.iloc[0][col])
+
+
+def test_load_and_prepare_price_history_marks_ceiling_via_contract(tmp_path: Path) -> None:
+    # Given: a minimal on-disk parquet with one limit-up close among two normal rows
+    raw = pd.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02", "2026-01-05"],
+            "symbol": ["1", "2", "1"],
+            "daily_change_pct": [5.0, 30.0, 4.0],
+            "trade_value_100m": [200.0, 200.0, 200.0],
+            "volume": [10, 10, 10],
+            "close": [1050.0, 1300.0, 1040.0],
+            "high": [1060.0, 1300.0, 1050.0],
+            "market_cap_100m": [1000.0, 1000.0, 1000.0],
+        }
+    )
+    path = tmp_path / "price_history.parquet"
+    raw.to_parquet(path)
+
+    # When
+    ph, market_dates, d_to_idx = load_and_prepare_price_history(path)
+
+    # Then: ceiling flag comes from src.strategy.contract.mark_ceiling (chg>=29% and close>=high)
+    ph = ph.sort_values(["symbol", "date"]).reset_index(drop=True)
+    assert ph["symbol"].tolist() == ["000001", "000001", "000002"]
+    assert ph["is_ceiling"].tolist() == [False, False, True]
+    assert ph["chg_ratio"].to_numpy() == pytest.approx([0.05, 0.04, 0.30])
+    assert len(market_dates) == 2
+    assert d_to_idx[market_dates[0]] == 0
+
+
+def test_v3_universe_matches_strategy_contract_selection() -> None:
+    # Given
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.research.v3_engine import build_candidate_universe
+    from src.strategy.contract import select_universe
+
+    ph = pd.DataFrame(
+        {
+            "chg_ratio": [0.02, 0.05, 0.10, 0.01, 0.30, 0.07],
+            "tv_clean": [200.0, 200.0, 200.0, 200.0, 200.0, 50.0],
+            "mc_clean": [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0],
+            "close": [1000.0, 1000.0, 1000.0, 1000.0, 1300.0, 1000.0],
+            "volume": [10, 10, 10, 10, 10, 10],
+            "is_ceiling": [False, False, False, False, True, False],
+            "market": ["KOSPI"] * 6,
+            "date": pd.to_datetime(["2026-01-02"] * 6),
+            "symbol": ["000001", "000002", "000003", "000004", "000005", "000006"],
+            "inst_netbuy": [1.0] * 6,
+            "kospi_pct": [0.5] * 6,
+            "kosdaq_pct": [0.5] * 6,
+        }
+    )
+
+    # When
+    u0_df, _ = build_candidate_universe(ph)
+
+    # Then
+    expected = ph[select_universe(ph)]["symbol"].tolist()
+    assert u0_df["symbol"].tolist() == expected
+    assert expected == ["000001", "000002"]
+    assert np.all(u0_df["chg_ratio"].to_numpy() < 0.10)
+
+
+def test_v3_attach_forward_exit_paths_uses_contract_cost() -> None:
+    # Given
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.research.v3_engine import attach_forward_exit_paths
+    from src.strategy.contract import AA_COST, PA_COST, round_trip_cost_bp
+
+    dates = pd.to_datetime(["2026-01-02", "2026-01-05"])
+    market_dates = np.array(dates)
+    d_to_idx = {d: i for i, d in enumerate(market_dates)}
+
+    ph = pd.DataFrame(
+        {
+            "date": [dates[0], dates[1]],
+            "symbol": ["000001", "000001"],
+            "open": [980.0, 10200.0],
+            "high": [1010.0, 10300.0],
+            "low": [970.0, 10100.0],
+            "close": [10000.0, 10250.0],
+            "volume": [100, 100],
+        }
+    )
+    cands = pd.DataFrame({"date": [dates[0]], "symbol": ["000001"], "close": [10000.0]})
+
+    # When
+    out = attach_forward_exit_paths(cands, ph, market_dates, d_to_idx)
+
+    # Then
+    entry = out["close"].to_numpy(dtype=np.float64)
+    np.testing.assert_allclose(out["cost_aa_bp"].to_numpy(), round_trip_cost_bp(entry, AA_COST))
+    np.testing.assert_allclose(out["cost_pa_bp"].to_numpy(), round_trip_cost_bp(entry, PA_COST))
+    np.testing.assert_allclose(out["cost_aa_bp"].to_numpy(), [40.0])
+    np.testing.assert_allclose(out["cost_stress_bp"].to_numpy(), [46.0])
+
+
+def test_v3_metrics_no_longer_duplicates_tick_ladder() -> None:
+    # Given
+    from src.ml.research import v3_metrics
+
+    # When / Then
+    assert not hasattr(v3_metrics, "krx_tick_size")
+    assert not hasattr(v3_metrics, "KRX_TICK_BANDS")
+
+
+def test_v3_metrics_json_headline_unchanged_after_refactor() -> None:
+    # Given
+    import json
+    from pathlib import Path
+
+    metrics_path = Path("docs/research/v3/research_validation_v3_metrics.json")
+    assert metrics_path.exists()
+
+    # When
+    with open(metrics_path, encoding="utf-8") as f:
+        metrics = json.load(f)
+
+    # Then
+    assert metrics["ranking_evaluation"]["mean_rank_ic"] == 0.1089
+    assert metrics["pipelines"]["P1"]["net_bp"] == 27.57
+    assert metrics["pipelines"]["P2"]["net_bp"] == 21.57
+    assert metrics["spec"]["primary_exit"].startswith("Open(T+1)")
