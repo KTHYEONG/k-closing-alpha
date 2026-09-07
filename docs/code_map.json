@@ -226,6 +226,9 @@
   "src/ml/feature_selection.py": {
     "testing": "tests/unit/ml/test_feature_selection.py"
   },
+  "src/ml/forward_path.py": {
+    "testing": "tests/unit/ml/test_forward_path.py"
+  },
   "src/ml/history_features.py": {
     "testing": "tests/unit/ml/test_history_features.py"
   },
@@ -243,6 +246,12 @@
   },
   "src/ml/purged_cv.py": {
     "testing": "tests/unit/ml/test_ml_foundation_parity.py"
+  },
+  "src/ml/research/v3_engine.py": {
+    "testing": "tests/unit/ml/test_research_v3.py"
+  },
+  "src/ml/research/v3_metrics.py": {
+    "testing": "tests/unit/ml/test_research_v3.py"
   },
   "src/ml/retrain.py": {
     "testing": "tests/unit/ml/test_retrain.py"
@@ -301,6 +310,9 @@
       "tests/unit/ml/test_history_features.py"
     ]
   },
+  "src/strategy/contract.py": {
+    "testing": "tests/unit/strategy/test_contract.py"
+  },
   "src/sync/fetcher_investor.py": {
     "testing": "tests/unit/sync/test_fetcher_investor.py"
   },
@@ -334,6 +346,5 @@
   },
   "src/utils/export_archive.py": {
     "testing": "tests/unit/utils/test_export_spreadsheet.py"
-  },
-  "src/main.py": {}
+  }
 }

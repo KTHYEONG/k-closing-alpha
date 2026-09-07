@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_STRATEGY_CONTRACT_LAYER",
+      "date": "2026-09-07",
+      "adr_id": "ADR_20260907_STRATEGY_CONTRACT_LAYER",
+      "domain": "research",
+      "title": "Strategy contract layer: frozen cost/universe/feature-contract specs",
+      "why": "Two-time cost-constant regressions and unproven cross-sectional-rank feature mapping needed a fail-closed shared contract before research/live can be trusted to share definitions.",
+      "resolution": "Added src/strategy/contract.py (CostSpec/UniverseSpec/StrategySpec, round_trip_cost_bp, select_universe, mark_ceiling, classify_feature_contract, assert_production_feature_set) and rewired v3_engine.py/v3_metrics.py onto it, removing duplicated tick-ladder code.",
+      "impact": "V3 OOF reproduces byte-identical (rankIC 0.1089, Top1 27.57bp, Top3 21.57bp); rank features now provably MISMATCH unless population equality is proven, and AA cost floor cannot regress below 2 ticks."
+    },
+    {
       "task_id": "EXIT_GRID_D1_BRACKET_RESEARCH",
       "date": "2026-09-07",
       "adr_id": "ADR_20260907_EXIT_GRID_D1_BRACKET_RESEARCH",
