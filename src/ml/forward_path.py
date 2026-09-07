@@ -95,13 +95,61 @@ def attach_forward_path(
     ph["entry_change_ratio"] = ph["daily_change_pct"].astype(np.float64)
 
     grouped = ph.groupby("symbol", sort=False)
+    # Market trading calendar
+    all_market_dates = np.array(sorted(ph["date"].unique()))
+    date_to_idx = {d: i for i, d in enumerate(all_market_dates)}
+    ph_date_idx = np.array([date_to_idx[d] for d in ph["date"]])
+    n_market_dates = len(all_market_dates)
+
+    has_volume = "volume" in ph.columns
+    ph_indexed = ph.set_index(["date", "symbol"])
+
     lookup_cols = ["symbol", "date", "entry_close", "entry_change_ratio"]
     for h in clean_horizons:
-        ph[f"d{h}_date"] = grouped["date"].shift(-h)
+        # 1. Symbol next observed bar (diagnostic / provenance)
+        observed_date = grouped["date"].shift(-h)
+        ph[f"d{h}_observed_date"] = observed_date
+        lookup_cols.append(f"d{h}_observed_date")
+
         for col in ("open", "high", "low", "close"):
-            ph[f"d{h}_{col}"] = pd.to_numeric(grouped[col].shift(-h), errors="coerce").astype(np.float64)
-            lookup_cols.append(f"d{h}_{col}")
-        lookup_cols.append(f"d{h}_date")
+            ph[f"d{h}_observed_{col}"] = pd.to_numeric(grouped[col].shift(-h), errors="coerce").astype(np.float64)
+            lookup_cols.append(f"d{h}_observed_{col}")
+
+        # 2. Market exchange calendar next trading date
+        valid_market_h = (ph_date_idx + h) < n_market_dates
+        market_d_date = np.where(valid_market_h, all_market_dates[np.minimum(ph_date_idx + h, n_market_dates - 1)], pd.NaT)
+        ph[f"d{h}_market_date"] = market_d_date
+        ph[f"d{h}_date"] = np.where(valid_market_h, market_d_date, pd.NaT)
+        lookup_cols.extend([f"d{h}_market_date", f"d{h}_date"])
+
+        # Lookup (market_d_date, symbol) directly in ph_indexed
+        keys = list(zip(market_d_date, ph["symbol"], strict=False))
+        idx_tuples = pd.MultiIndex.from_tuples(keys, names=["date", "symbol"])
+        matched_bar = ph_indexed.reindex(idx_tuples)
+
+        m_open = pd.to_numeric(matched_bar["open"], errors="coerce").to_numpy(dtype=np.float64)
+        m_high = pd.to_numeric(matched_bar["high"], errors="coerce").to_numpy(dtype=np.float64)
+        m_low = pd.to_numeric(matched_bar["low"], errors="coerce").to_numpy(dtype=np.float64)
+        m_close = pd.to_numeric(matched_bar["close"], errors="coerce").to_numpy(dtype=np.float64)
+
+        if has_volume:
+            m_vol = pd.to_numeric(matched_bar["volume"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+            is_halted = (m_vol == 0.0)
+        else:
+            is_halted = np.zeros(len(ph), dtype=bool)
+
+        has_bar = valid_market_h & np.isfinite(m_open) & (m_open > 0.0)
+        tradable = has_bar & (~is_halted)
+        suspended = (~valid_market_h) | (~has_bar) | is_halted
+
+        ph[f"d{h}_open"] = np.where(tradable, m_open, np.nan)
+        ph[f"d{h}_high"] = np.where(tradable, m_high, np.nan)
+        ph[f"d{h}_low"] = np.where(tradable, m_low, np.nan)
+        ph[f"d{h}_close"] = np.where(tradable, m_close, np.nan)
+        ph[f"d{h}_suspended"] = np.asarray(suspended, dtype=bool)
+        ph[f"d{h}_tradable"] = np.asarray(tradable, dtype=bool)
+
+        lookup_cols.extend([f"d{h}_open", f"d{h}_high", f"d{h}_low", f"d{h}_close", f"d{h}_suspended", f"d{h}_tradable"])
 
     lookup = ph[lookup_cols]
 
@@ -126,8 +174,13 @@ def attach_forward_path(
     out["entry_change_ratio"] = merged["entry_change_ratio"].to_numpy(dtype=np.float64)
     for h in clean_horizons:
         out[f"d{h}_date"] = pd.to_datetime(merged[f"d{h}_date"])
+        out[f"d{h}_market_date"] = pd.to_datetime(merged[f"d{h}_market_date"])
+        out[f"d{h}_observed_date"] = pd.to_datetime(merged[f"d{h}_observed_date"])
+        out[f"d{h}_suspended"] = merged[f"d{h}_suspended"].to_numpy(dtype=bool)
+        out[f"d{h}_tradable"] = merged[f"d{h}_tradable"].to_numpy(dtype=bool)
         for col in ("open", "high", "low", "close"):
             out[f"d{h}_{col}"] = merged[f"d{h}_{col}"].to_numpy(dtype=np.float64)
+            out[f"d{h}_observed_{col}"] = merged[f"d{h}_observed_{col}"].to_numpy(dtype=np.float64)
 
     out = out.drop(columns=["_merge_date", "_merge_symbol"])
     return out
