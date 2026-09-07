@@ -3,7 +3,9 @@
     "testing": "tests/unit/api/kis/test_client.py"
   },
   "src/api/kis/indicators.py": {},
-  "src/api/kis/rate_limit.py": {},
+  "src/api/kis/rate_limit.py": {
+    "testing": "tests/unit/api/kiwoom/test_kiwoom_client.py"
+  },
   "src/api/kis_client.py": {
     "testing": [
       "tests/unit/api/kis/test_kis_client.py",
@@ -14,6 +16,9 @@
       "tests/unit/api/kis/test_ohlcv_prefetch.py",
       "tests/unit/daily/test_collect_auction.py"
     ]
+  },
+  "src/api/kiwoom/client.py": {
+    "testing": "tests/unit/api/kiwoom/test_kiwoom_client.py"
   },
   "src/api/ls/client.py": {
     "testing": "tests/unit/api/ls/test_ls_client.py"
@@ -129,6 +134,9 @@
   "src/config/kis.py": {
     "testing": "tests/unit/config/test_kis.py"
   },
+  "src/config/kiwoom.py": {
+    "testing": "tests/unit/config/test_kiwoom.py"
+  },
   "src/config/ls.py": {
     "testing": "tests/unit/config/test_ls.py"
   },
@@ -158,6 +166,9 @@
   },
   "src/daily/predict.py": {
     "testing": "tests/unit/daily/test_predict.py"
+  },
+  "src/daily/universe_scan.py": {
+    "testing": "tests/unit/daily/test_universe_scan.py"
   },
   "src/data/candidate_panel.py": {
     "testing": "tests/unit/data/test_candidate_panel.py"
@@ -301,6 +312,7 @@
   "src/settings.py": {
     "testing": [
       "tests/unit/config/test_altdata_settings.py",
+      "tests/unit/config/test_kiwoom.py",
       "tests/unit/config/test_ls.py",
       "tests/unit/config/test_settings_compat.py",
       "tests/unit/data/test_candidate_panel.py",

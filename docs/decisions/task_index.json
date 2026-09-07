@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260907_KIWOOM_TICK_VENDOR_PRIMARY",
+      "date": "2026-09-07",
+      "adr_id": "ADR_20260907_ADR_20260907_KIWOOM_TICK_VENDOR_PRIMARY",
+      "domain": "serving",
+      "title": "Kiwoom REST 벤더를 archive_intraday 틱 수집 1순위로 승격",
+      "why": "실측: KIS 30행/페이지(231행/초), LS 500행/페이지(544행/초) vs Kiwoom 900행/페이지+5req/s 확정(4267행/초, 서버 유량=5 실측) -- 틱 수집이 archive_intraday의 유일한 병목.",
+      "resolution": "src/api/kiwoom/client.py(KiwoomApiClient, api-id별 AsyncRateLimiter 재사용, 429 백오프) 신설, collect_intraday_trade_ticks에 Kiwoom(1순위)->LS(2순위)->KIS(3순위) 폴백 추가, normalize_tick_frame에 kiwoom 벤더 분기 추가.",
+      "impact": "분봉/Stream C 랭킹은 Kiwoom에 value_krw/시가총액 소스 필드가 없어 의도적으로 스코프 제외(후속 spec 대상); kiwoom_client=None 시 기존 LS/KIS 동작과 완전 동일."
+    },
+    {
+      "task_id": "TASK_UNIVERSE_SCAN_STREAM_C",
+      "date": "2026-09-07",
+      "adr_id": "ADR_20260907_UNIVERSE_SCAN_STREAM_C",
+      "domain": "serving",
+      "title": "Stream C: KIS ranking-API universe scan + archive_intraday scoping guard",
+      "why": "Live collector only ever observed >=8% momentum picks (0.98% overlap with research U0), and archive_intraday's long runtime was actually the workflow blocking the user, not a bug.",
+      "resolution": "Added src/daily/universe_scan.py (KIS FHPST01700000 ranking call -> in-process archive handoff, no CSV/mtime relay) and a default-safe exclude_scenarios guard on archive_intraday's watchlist so the wider universe cannot silently balloon its runtime.",
+      "impact": "Multi-snapshot (15:18/19/20) capture is now race-free; archive_intraday behavior is unchanged by default; market-cap field presence and cron orchestration remain explicitly open follow-ups."
+    },
+    {
       "task_id": "TASK_STRATEGY_CONTRACT_LAYER",
       "date": "2026-09-07",
       "adr_id": "ADR_20260907_STRATEGY_CONTRACT_LAYER",
