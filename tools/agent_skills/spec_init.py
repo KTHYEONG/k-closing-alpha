@@ -69,6 +69,17 @@ def main() -> None:
     # 3. Create Contract Boilerplate if not exists
     os.makedirs("docs/specs", exist_ok=True)
     if not os.path.exists(output_contract):
+        # Auto-load probe summary if exists from scratch/probe_<feature>.json
+        probe_summary_path = f"scratch/probe_{feature_slug}.json"
+        probe_data = _read_json(probe_summary_path)
+
+        design_rationale = {
+            "alternatives_considered": probe_data.get("alternatives_considered", ""),
+            "chosen_reason": probe_data.get("chosen_reason", ""),
+            "failure_modes": probe_data.get("failure_modes", []),
+        }
+        performance_budget = probe_data.get("performance_budget")
+
         boilerplate_contract = {
             "feature": feature_slug,
             "domain": args.domain,
@@ -90,12 +101,8 @@ def main() -> None:
                 "anchor": "def run_pipeline",
                 "invocation_expression": f"calc_{feature_slug}(val)"
             },
-            "design_rationale": {
-                "alternatives_considered": "",
-                "chosen_reason": "",
-                "failure_modes": []
-            },
-            "performance_budget": None
+            "design_rationale": design_rationale,
+            "performance_budget": performance_budget,
         }
         with open(output_contract, "w", encoding="utf-8") as f:
             json.dump(boilerplate_contract, f, indent=2)
