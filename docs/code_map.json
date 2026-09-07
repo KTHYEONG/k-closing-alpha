@@ -250,7 +250,12 @@
   "src/ml/robust_eval.py": {
     "testing": "tests/unit/ml/test_robust_eval.py"
   },
-  "src/ml/scenario_panel.py": {},
+  "src/ml/scenario_panel.py": {
+    "testing": "tests/unit/ml/test_dataset.py"
+  },
+  "src/ml/scenario_rules.py": {
+    "testing": "tests/unit/ml/test_scenario_rules.py"
+  },
   "src/ml/sector_features.py": {
     "testing": "tests/unit/ml/test_sector_features.py"
   },
@@ -259,6 +264,9 @@
   },
   "src/ml/universe.py": {
     "testing": "tests/unit/ml/test_universe.py"
+  },
+  "src/ml/universe_research.py": {
+    "testing": "tests/unit/ml/test_universe_research.py"
   },
   "src/ml/validation.py": {
     "testing": "tests/unit/ml/test_validation.py"
