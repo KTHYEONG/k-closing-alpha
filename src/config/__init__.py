@@ -16,13 +16,14 @@ from src.config.altdata import AltDataSettings
 from src.config.base import PathSettings
 from src.config.gsheet import GSheetSettings
 from src.config.kis import KisSettings
+from src.config.kiwoom import KiwoomSettings
 from src.config.ls import LsSettings
 from src.config.trading import TradingSettings
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-class Settings(PathSettings, KisSettings, LsSettings, GSheetSettings, TradingSettings, AltDataSettings):
+class Settings(PathSettings, KisSettings, LsSettings, GSheetSettings, TradingSettings, AltDataSettings, KiwoomSettings):
     """프로젝트 전역 설정. `.env` 파일에서 자동 로드.
 
     도메인별 설정 모듈을 통합한 싱글톤으로, 모든 소비자 모듈은
@@ -85,6 +86,10 @@ KIS_API_CONFIG = settings.KIS_API_CONFIG
 LS_APP_KEY = settings.LS_APP_KEY
 LS_APP_SECRET = settings.LS_APP_SECRET
 LS_BASE_URL = settings.LS_BASE_URL
+KIWOM_APP_KEY = settings.KIWOM_APP_KEY
+KIWOM_SECRET_KEY = settings.KIWOM_SECRET_KEY
+KIWOM_BASE_URL = settings.KIWOM_BASE_URL
+KIWOM_TICK_MAX_PAGES = settings.KIWOM_TICK_MAX_PAGES
 GSPREAD_KEY_PATH_ENV = settings.GSPREAD_KEY_PATH_ENV
 GSPREAD_SA_JSON = settings.GSPREAD_SA_JSON
 GOOGLE_KEY_PATH = settings.GOOGLE_KEY_PATH
@@ -172,6 +177,10 @@ __all__ = [
     "KIS_APP_SECRET",
     "KIS_BASE_URL",
     "KIS_HTS_ID",
+    "KIWOM_APP_KEY",
+    "KIWOM_BASE_URL",
+    "KIWOM_SECRET_KEY",
+    "KIWOM_TICK_MAX_PAGES",
     "KRX_OPENAPI_KEY",
     "LABEL_ENCODER_PATH",
     "LS_APP_KEY",
@@ -202,6 +211,7 @@ __all__ = [
     "AltDataSettings",
     "GSheetSettings",
     "KisSettings",
+    "KiwoomSettings",
     "LsSettings",
     "PathSettings",
     "Settings",

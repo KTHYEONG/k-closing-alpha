@@ -75,6 +75,13 @@ _LS_TICK_REQUIRED: tuple[str, ...] = (
 )
 
 
+_KIWOOM_TICK_REQUIRED: tuple[str, ...] = (
+    "cntr_tm",
+    "cur_prc",
+    "trde_qty",
+)
+
+
 def _empty_bar_frame() -> pd.DataFrame:
     out = pd.DataFrame({c: pd.Series(dtype="object") for c in CANONICAL_BAR_COLUMNS})
     return out.astype(
@@ -113,8 +120,8 @@ def _empty_tick_frame() -> pd.DataFrame:
 
 
 def _check_vendor(vendor: str) -> str:
-    if vendor not in ("kis", "ls"):
-        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls')")
+    if vendor not in ("kis", "ls", "kiwoom"):
+        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls', 'kiwoom')")
     return vendor
 
 
@@ -126,7 +133,8 @@ def _require_columns(df: pd.DataFrame, required: tuple[str, ...], vendor: str) -
 
 def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbol: str) -> pd.DataFrame:
     """벤더 원천 분봉 프레임을 정규 바 스키마로 변환한다."""
-    _check_vendor(vendor)
+    if vendor not in ("kis", "ls"):
+        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls')")
     if df is None or len(df) == 0:
         return _empty_bar_frame()
     code = str(symbol).zfill(6)
@@ -237,6 +245,14 @@ def normalize_tick_frame(
             bid1: pd.Series = pd.to_numeric(df["bidp"].astype(str), errors="coerce").astype("Int32")
         else:
             bid1 = pd.Series(pd.NA, index=df.index, dtype="Int32")
+    elif vendor == "kiwoom":
+        _require_columns(df, _KIWOOM_TICK_REQUIRED, vendor)
+        ts_hms = pd.to_numeric(df["cntr_tm"].astype(str).str[-6:], errors="coerce")
+        price = pd.to_numeric(df["cur_prc"].astype(str), errors="coerce")
+        volume = pd.to_numeric(df["trde_qty"].astype(str), errors="coerce")
+        trade_strength = pd.Series(pd.NA, index=df.index, dtype="Float32")
+        ask1 = pd.Series(pd.NA, index=df.index, dtype="Int32")
+        bid1 = pd.Series(pd.NA, index=df.index, dtype="Int32")
     else:
         _require_columns(df, _LS_TICK_REQUIRED, vendor)
         ts_hms = pd.to_numeric(df["time"].astype(str), errors="coerce")

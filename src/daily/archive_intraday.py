@@ -8,6 +8,7 @@ from datetime import datetime
 
 from src import settings
 from src.api.kis_client import KisApiClient
+from src.api.kiwoom.client import KiwoomApiClient
 from src.api.ls.client import LsApiClient
 from src.backfill.intraday.collector import (
     collect_intraday_bars,
@@ -20,12 +21,15 @@ from src.config.market_session import (
     INTRADAY_SESSION_REGULAR,
 )
 from src.daily import archive
+from src.daily.universe_scan import UNIVERSE_SCAN_SCENARIO_TAG
 from src.data.intraday_store import write_intraday_partition, write_tick_partition
 
 logger = logging.getLogger(__name__)
 
+EXCLUDED_INTRADAY_SCENARIOS: frozenset[str] = frozenset({UNIVERSE_SCAN_SCENARIO_TAG})
 
-def _today_watchlist_codes(snapshot_date: str) -> list[str]:
+
+def _today_watchlist_codes(snapshot_date: str, exclude_scenarios: frozenset[str] = EXCLUDED_INTRADAY_SCENARIOS) -> list[str]:
     try:
         df = archive.fetch_archive_snapshot(snapshot_date=snapshot_date)
     except Exception as e:
@@ -33,6 +37,8 @@ def _today_watchlist_codes(snapshot_date: str) -> list[str]:
         return []
     if df is None or df.empty or "종목코드" not in df.columns:
         return []
+    if exclude_scenarios and "시나리오" in df.columns:
+        df = df[~df["시나리오"].isin(exclude_scenarios)]
     return df["종목코드"].astype(str).str.zfill(6).dropna().unique().tolist()
 
 
@@ -75,13 +81,14 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
     async def _run() -> tuple[int, int, int]:
         client = KisApiClient()
         ls_client = LsApiClient() if getattr(settings, 'LS_APP_KEY', None) else None
+        kiwoom_client = KiwoomApiClient() if getattr(settings, 'KIWOM_APP_KEY', None) else None
         async with client.create_session() as session:
             await client.ensure_token(session)
             bars = await collect_intraday_bars(client, session, codes, snap_date, bar_interval_minutes, ls_client=ls_client)
             nxt = await collect_nxt_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes)
             n_bars = write_intraday_partition(bars, bar_interval_minutes, snap_date, INTRADAY_SESSION_REGULAR)
             n_nxt = write_intraday_partition(nxt, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_AFTERMARKET)
-            ticks = await collect_intraday_trade_ticks(client, session, codes, snap_date, ls_client=ls_client)
+            ticks = await collect_intraday_trade_ticks(client, session, codes, snap_date, ls_client=ls_client, kiwoom_client=kiwoom_client)
             n_ticks = write_tick_partition(ticks, snap_date, INTRADAY_SESSION_REGULAR)
             return (n_bars, n_nxt, n_ticks)
 

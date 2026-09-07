@@ -170,8 +170,15 @@ async def collect_nxt_aftermarket_bars(client, session, stock_codes: list[str], 
     )
 
 
-async def collect_intraday_trade_ticks(client, session, stock_codes: list[str], snapshot_date: str, ls_client: Any | None = None) -> pd.DataFrame:
-    """KRX 정규세션(09:00~15:30) 틱 체결을 세마포어(10) 동시성으로 취합한다."""
+async def collect_intraday_trade_ticks(
+    client,
+    session,
+    stock_codes: list[str],
+    snapshot_date: str,
+    ls_client: Any | None = None,
+    kiwoom_client: Any | None = None,
+) -> pd.DataFrame:
+    """KRX 정규세션(09:00~15:30) 틱 체결을 세마포어(10) 동시성으로 취합한다. Kiwoom(1순위) -> LS(2순위) -> KIS(3순위) 폴백."""
     if not stock_codes:
         return pd.DataFrame()
     sem = asyncio.Semaphore(10)
@@ -179,6 +186,25 @@ async def collect_intraday_trade_ticks(client, session, stock_codes: list[str], 
 
     async def _fetch_one(code: str) -> list[dict]:
         async with sem:
+            if kiwoom_client is not None:
+                try:
+                    kw_res = await kiwoom_client.get_tick_chart(session, code, target_date)
+                except Exception as e:
+                    logger.warning("Kiwoom tick chart failed code=%s: %s", code, e)
+                    kw_res = {"rt_cd": "1", "output2": []}
+                if kw_res.get("rt_cd") == "0" and (kw_res.get("output2") or []):
+                    rows = kw_res.get("output2") or []
+                    truncated = bool(kw_res.get("truncated", False))
+                    vendor = str(kw_res.get("vendor", "kiwoom") or "kiwoom")
+                    logger.info("Fetched %d ticks for %s via Kiwoom", len(rows), code)
+                    try:
+                        frame = normalize_tick_frame(pd.DataFrame(rows), vendor, snapshot_date, code, truncated=truncated)
+                    except Exception as e:
+                        logger.warning("[DATA] Kiwoom tick normalize failed code=%s: %s", code, e)
+                        return []
+                    return frame.to_dict("records") if not frame.empty else []
+                if kw_res.get("rt_cd") == "0":
+                    return []
             if ls_client is not None:
                 try:
                     ls_res = await ls_client.get_tick_chart(session, code, target_date)
@@ -220,6 +246,7 @@ async def collect_intraday_trade_ticks(client, session, stock_codes: list[str], 
     if not all_rows:
         return pd.DataFrame()
     return pd.DataFrame(all_rows)
+
 
 
 async def backfill_regular_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
