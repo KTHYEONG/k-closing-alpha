@@ -16,6 +16,22 @@ from src.api.kis.rate_limit import AsyncRateLimiter
 logger = logging.getLogger(__name__)
 
 
+def _format_rate(pct: float) -> str:
+    return f"{pct:g}"
+
+
+# 주의: 아래 7개 기본값은 UNVERIFIED 플레이스홀더로, 운영 필터로 가정 금지 — 1회 라이브 샌드박스 호출로 검증 필요.
+_RANKING_PARAM_DEFAULTS_UNVERIFIED: dict[str, str] = {
+    "FID_PRC_CLS_CODE": "0",
+    "FID_INPUT_PRICE_1": "",
+    "FID_INPUT_PRICE_2": "",
+    "FID_VOL_CNT": "",
+    "FID_TRGT_CLS_CODE": "0000000000",
+    "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+    "FID_DIV_CLS_CODE": "0",
+}
+
+
 class KisApiClient:
     def __init__(
         self,
@@ -769,3 +785,28 @@ class KisApiClient:
         in_range = [r for r in collected if start_date <= str(r.get("stck_bsop_date") or "") <= end_date]
         in_range.sort(key=lambda r: str(r.get("stck_bsop_date") or ""))
         return {"rt_cd": "0", "output": in_range}
+
+    async def get_fluctuation_ranking(
+        self, session, *, rate_min_pct: float, rate_max_pct: float, market_div_code: str | None = None, input_cnt: str = "100"
+    ) -> dict:
+        normalized = self._normalize_market_div_code(market_div_code)
+        if not normalized:
+            raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/ranking/fluctuation"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": normalized,
+            "FID_COND_SCR_DIV_CODE": "20170",
+            "FID_INPUT_ISCD": "0000",
+            "FID_RANK_SORT_CLS_CODE": "0",
+            "FID_INPUT_CNT_1": str(input_cnt),
+            "FID_RSFL_RATE1": _format_rate(rate_min_pct),
+            "FID_RSFL_RATE2": _format_rate(rate_max_pct),
+            **_RANKING_PARAM_DEFAULTS_UNVERIFIED,
+        }
+        res = await self._handle_request(
+            session.get, url, headers=self._get_headers("FHPST01700000"), params=params
+        )
+        if res.get("rt_cd") != "0":
+            return res
+        rows = res.get("output") or res.get("output2") or []
+        return {"rt_cd": "0", "output": rows}
