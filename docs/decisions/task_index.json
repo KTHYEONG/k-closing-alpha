@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "UNIVERSE_RESEARCH_HARNESS",
+      "date": "2026-09-07",
+      "adr_id": "ADR_20260907_UNIVERSE_RESEARCH_HARNESS",
+      "domain": "ml",
+      "title": "재구성 전체시장 유니버스 리서치 하니스",
+      "why": "리랭커가 운영자 임의 스크린(등락률10%·거래대금100억·시총500억) 안에서만 학습돼 왔고, 스크린 비교는 모델없는 EV뿐이라 '랭커가 넓은 풀에서 비용을 넘나'가 미검증",
+      "resolution": "src/ml/universe_research.py 신설: ScreenConfig 패밀리별 재구성 패널→동일 리랭커 학습→모델없는 EV vs 랭커 top-1 비용후 vs CPCV top-1 경로승률 정렬 테이블. retrain.py --universe-research 배선",
+      "impact": "스크린 선택이 손으로 박은 3개 숫자에서 CPCV 게이트 리서치 레코드로 전환. 승격 아님(라이트). 실측: 모든 스크린 비용후 손실이나 gross는 t=8~13"
+    },
+    {
+      "task_id": "DATA_LIMIT_BREAKOUT_SCENARIO_AUTO",
+      "date": "2026-09-07",
+      "adr_id": "ADR_20260907_DATA_LIMIT_BREAKOUT_SCENARIO_AUTO",
+      "domain": "ml",
+      "title": "수동 차트분석 자동화 + 시나리오 ablation 스위치",
+      "why": "재구성 유니버스 행에는 수동 차트분석이 없어 ML 패널을 못 만들었고, 시나리오 피처를 깔끔히 제거해 재는 스위치도 없었다",
+      "resolution": "src/ml/scenario_rules.py 신설(9범주 결정적 우선순위 사다리 + 일치율 리포트), build_ml_dataset에 scenario_source=manual|auto|none 배선, champion/ChampionTuningConfig 통과",
+      "impact": "manual 기본값은 기존과 byte-identical, auto는 price_history 규칙 라벨로 재구성 유니버스 학습 가능, none은 시나리오 블록 전면 제거로 ablation 측정"
+    },
+    {
       "task_id": "ML_PIPELINE_AUDIT_V3",
       "date": "2026-09-06",
       "adr_id": "ADR_20260906_ML_PIPELINE_AUDIT_V3",
