@@ -156,10 +156,11 @@ def train_champion_bundle(
     export_dir: str = "artifacts/models",
     feature_set: str = "close_morning61",
     price_history_df: pd.DataFrame | None = None,
+    scenario_source: str = "manual",
 ) -> dict[str, Any]:
     """PHASE1 reproduction of legacy champion bundle."""
     x_features, _targets, cat_features, processed = build_ml_dataset(
-        trade_log_df, theme_df, feature_set=feature_set, panel_mode="scenario_action", price_history_df=price_history_df
+        trade_log_df, theme_df, feature_set=feature_set, panel_mode="scenario_action", price_history_df=price_history_df, scenario_source=scenario_source
     )
     feature_cols = [c for c in x_features.columns if c not in cat_features]
     target_col = "target_return"
@@ -326,7 +327,7 @@ def train_tuned_champion_bundle(
 ) -> dict[str, Any]:
     """PHASE2 tuned orchestrator."""
     x_features, _targets, cat_features, processed_raw = build_ml_dataset(
-        trade_log_df, theme_df, feature_set=feature_set, panel_mode="scenario_action", price_history_df=price_history_df
+        trade_log_df, theme_df, feature_set=feature_set, panel_mode="scenario_action", price_history_df=price_history_df, scenario_source=config.scenario_source
     )
     feature_cols = [c for c in x_features.columns if c not in cat_features]
     assert_no_label_leakage(feature_cols)
