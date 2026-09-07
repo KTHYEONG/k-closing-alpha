@@ -4,6 +4,12 @@
 - **분석 대상**: Top-1 픽 기반 D+1, D+2, D+3 포트폴리오 및 트레이드 단위 성과
 - **비용 기준**: 편도 23bp / 왕복 46bp (세금 20bp + 스프레드 26bp)
 
+> [!WARNING]
+> **Methodology Invalidation Notice (2026-09-07)**
+> 1. In Table 2, "D+1 Open +254.7 bp" and "Sharpe 8.56" were derived from in-sample final-model historical rescoring (`INVALID_FOR_STRATEGY_DECISION`).
+> 2. In Table 3, "+345.2%" was arithmetic annualization (`mean_daily * 252`), not true compounded CAGR, and was simulated on in-sample picks (`INVALID_FOR_STRATEGY_DECISION`).
+> 3. See `docs/research/corrected_portfolio_analysis.md` for true discrete NAV simulations and compounded CAGR.
+
 ---
 
 ## 1. 연구 목적

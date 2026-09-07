@@ -5,6 +5,12 @@
 - **분석 기간**: 2016-01-04 ~ 2026-09-04 (10.6년)
 - **비용 기준**: 왕복 46bp (세금 20bp + 스프레드 26bp)
 
+> [!WARNING]
+> **Methodology Invalidation Notice (2026-09-07)**
+> 1. Section 3 evaluated univariate cross-sectional spreads on `D+1 Close` rather than the strategy exit `D+1 Open`, and Section 4 proposed linearly summing these correlated spreads (`INVALID_FOR_STRATEGY_DECISION`).
+> 2. Direct joint testing of nested universes (U0, U1, U2, U3) with `D+1 Open` overnight returns was conducted in `docs/research/corrected_universe_analysis.md`.
+> 3. See `docs/research/corrected_universe_analysis.md` for joint filter results and conditional sample sizes.
+
 ---
 
 ## 1. 서론 및 문제 제기
