@@ -1070,3 +1070,60 @@ def test_measure_oos_execution_profile_exit_defaults_on_exit_leg_error(monkeypat
     assert profile is not None
     assert np.isfinite(profile["fill_rate"])
     assert not np.isfinite(profile["exit_fill_rate"])
+
+
+def _raw_trade_log_scenario_thread(n_dates: int = 30, per_day: int = 6) -> pd.DataFrame:
+    rng = np.random.default_rng(5)
+    rows = []
+    for d in pd.bdate_range("2023-01-02", periods=n_dates):
+        for j in range(per_day):
+            e = rng.normal()
+            rows.append({
+                "매수날짜": d.strftime("%Y-%m-%d"), "종목코드": f"{j:06d}",
+                "(시가)": "10000", "(고가)": "10400", "(저가)": "9800", "(종가)": "10200",
+                "(전일종가)": "10000", "(시가총액, 억)": "5000", "(거래대금, 억)": "300",
+                "(등락률)": f"{11 + e:.2f}", "(선정 순위)": str(j + 1),
+                "(기관_순매수)": "0", "(외국인_순매수)": "0", "(프로그램_순매수)": "0",
+                "(체결강도)": "120", "(시장구분)": "KOSPI", "(총 종목 수)": str(per_day),
+                "(평균 거래대금)": "250", "(kospi, %)": "0.3", "(kosdaq, %)": "0.1",
+                "v_kospi": "18", "v_kosdaq": "20", "(거래량)": "100000",
+                "(테마/섹터)": "반도체", "(차트분석)": "거래량 폭증",
+                "(매수 가격)": "10200", "(매도 가격)": "10250", "(수익률, %)": f"{e:.2f}",
+            })
+    return pd.DataFrame(rows)
+
+
+class _StopScenarioThread(Exception):  # noqa: N818 - contract skeleton name
+    pass
+
+
+def test_champion_entrypoints_thread_scenario_source(monkeypatch) -> None:
+    import inspect
+
+    import pytest
+
+    import src.ml.champion as champ
+    from src.ml.tuning import ChampionTuningConfig
+
+    assert inspect.signature(champ.train_champion_bundle).parameters["scenario_source"].default == "manual"
+    assert ChampionTuningConfig().scenario_source == "manual"
+
+    seen: dict[str, object] = {}
+
+    def _spy(*args: object, **kwargs: object) -> None:
+        seen["scenario_source"] = kwargs.get("scenario_source")
+        raise _StopScenarioThread
+
+    monkeypatch.setattr(champ, "build_ml_dataset", _spy)
+
+    with pytest.raises(_StopScenarioThread):
+        champ.train_champion_bundle(_raw_trade_log_scenario_thread(), None)
+    assert seen["scenario_source"] == "manual"
+
+    seen.clear()
+    cfg = ChampionTuningConfig(hpo_trials=2, seed_ensemble=(13, 29),
+                               require_beats_control=False, min_history_dates=20,
+                               scenario_source="none")
+    with pytest.raises(_StopScenarioThread):
+        champ.train_tuned_champion_bundle(_raw_trade_log_scenario_thread(), None, cfg, export_dir="tmp/spec_scen")
+    assert seen["scenario_source"] == "none"

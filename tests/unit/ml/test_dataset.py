@@ -231,3 +231,118 @@ def test_retarget_with_clip_matches_create_multi_targets_cost_basis() -> None:
     np.testing.assert_allclose(
         tight["target_return"].to_numpy()[mid], base["target_return"].to_numpy()[mid], rtol=0.0, atol=1e-12
     )
+
+
+def _raw_trade_log_scenario_auto(n_dates: int = 40, per_day: int = 6) -> pd.DataFrame:
+    rng = np.random.default_rng(5)
+    rows = []
+    for d in pd.bdate_range("2024-01-02", periods=n_dates):
+        for j in range(per_day):
+            e = rng.normal()
+            rows.append({
+                "매수날짜": d.strftime("%Y-%m-%d"), "종목코드": f"{j:06d}",
+                "(시가)": "10000", "(고가)": "10400", "(저가)": "9800", "(종가)": "10200",
+                "(전일종가)": "10000", "(시가총액, 억)": "5000", "(거래대금, 억)": "300",
+                "(등락률)": f"{11 + e:.2f}", "(선정 순위)": str(j + 1),
+                "(기관_순매수)": f"{e*100:.0f}", "(외국인_순매수)": f"{e*80:.0f}",
+                "(프로그램_순매수)": f"{e*50:.0f}", "(체결강도)": "120",
+                "(시장구분)": "KOSPI", "(총 종목 수)": str(per_day), "(평균 거래대금)": "250",
+                "(kospi, %)": "0.3", "(kosdaq, %)": "0.1", "v_kospi": "18", "v_kosdaq": "20",
+                "(거래량)": "100000", "(테마/섹터)": "반도체", "(차트분석)": "거래량 폭증",
+                "(매수 가격)": "10200", "(매도 가격)": f"{10200*(1+0.01*e):.0f}",
+                "(수익률, %)": f"{e:.2f}",
+            })
+    return pd.DataFrame(rows)
+
+
+def _price_history_scenario_auto(codes: list[str]) -> pd.DataFrame:
+    rng = np.random.default_rng(9)
+    dates = pd.bdate_range("2023-06-01", periods=200)
+    frames = []
+    for code in codes:
+        px = 10000.0 * np.cumprod(1.0 + rng.normal(0.0, 0.015, size=200))
+        frames.append(pd.DataFrame({
+            "date": dates, "symbol": code, "open": px, "high": px * 1.02,
+            "low": px * 0.98, "close": px, "volume": 1e5, "trade_value_100m": 300.0,
+            "inst_netbuy": 0.0, "foreign_netbuy": 0.0, "daily_change_pct": 0.02,
+        }))
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_build_ml_dataset_scenario_source_auto_preserves_schema() -> None:
+    # Arrange
+    raw = _raw_trade_log_scenario_auto()
+    # price_history covers only 4 of the 6 daily codes -> the other 2 must fall to '미분류'
+    ph = _price_history_scenario_auto(["000000", "000001", "000002", "000003"])
+
+    x_manual, _t_m, cat_m, _p_m = build_ml_dataset(
+        raw.copy(), None, feature_set="close_morning61", panel_mode="scenario_action",
+        price_history_df=ph,
+    )
+    x_auto, _t_a, cat_a, proc_a = build_ml_dataset(
+        raw.copy(), None, feature_set="close_morning61", panel_mode="scenario_action",
+        price_history_df=ph, scenario_source="auto",
+    )
+
+    # Assert: identical feature schema, auto ran the derivation, no null scenario key
+    assert list(x_auto.columns) == list(x_manual.columns)
+    assert cat_a == cat_m
+    assert proc_a["chart_analysis"].isna().sum() == 0
+    assert proc_a.attrs.get("scenario_source") == "auto"
+
+    with pytest.raises(ValueError, match="price_history"):
+        build_ml_dataset(raw.copy(), None, feature_set="close_morning61",
+                         panel_mode="scenario_action", price_history_df=None,
+                         scenario_source="auto")
+
+
+def _raw_trade_log_scenario_none(n_dates: int = 30, per_day: int = 6) -> pd.DataFrame:
+    rng = np.random.default_rng(7)
+    rows = []
+    scen_cycle = ["거래량 폭증", "신고가", "상따", "120 돌파", "미분류", "신고가 근접"]
+    for d in pd.bdate_range("2024-01-02", periods=n_dates):
+        for j in range(per_day):
+            e = rng.normal()
+            rows.append({
+                "매수날짜": d.strftime("%Y-%m-%d"), "종목코드": f"{j:06d}",
+                "(시가)": "10000", "(고가)": "10400", "(저가)": "9800", "(종가)": "10200",
+                "(전일종가)": "10000", "(시가총액, 억)": "5000", "(거래대금, 억)": "300",
+                "(등락률)": f"{11 + e:.2f}", "(선정 순위)": str(j + 1),
+                "(기관_순매수)": f"{e*100:.0f}", "(외국인_순매수)": f"{e*80:.0f}",
+                "(프로그램_순매수)": f"{e*50:.0f}", "(체결강도)": "120",
+                "(시장구분)": "KOSPI", "(총 종목 수)": str(per_day), "(평균 거래대금)": "250",
+                "(kospi, %)": "0.3", "(kosdaq, %)": "0.1", "v_kospi": "18", "v_kosdaq": "20",
+                "(거래량)": "100000", "(테마/섹터)": "반도체",
+                "(차트분석)": scen_cycle[j % len(scen_cycle)],
+                "(매수 가격)": "10200", "(매도 가격)": f"{10200*(1+0.01*e):.0f}",
+                "(수익률, %)": f"{e:.2f}",
+            })
+    return pd.DataFrame(rows)
+
+
+def test_build_ml_dataset_scenario_source_none_withholds_scenario_features() -> None:
+    from src.ml.scenario_panel import SCENARIO_CONTEXT_FEATURES, SCENARIO_ONE_HOT_FEATURES
+
+    raw = _raw_trade_log_scenario_none()
+
+    x_manual, _tm, _cm, _pm = build_ml_dataset(
+        raw.copy(), None, feature_set="close_morning61", panel_mode="scenario_action",
+    )
+    x_none, _tn, _cn, _pn = build_ml_dataset(
+        raw.copy(), None, feature_set="close_morning61", panel_mode="scenario_action",
+        scenario_source="none",
+    )
+
+    banned = set(SCENARIO_ONE_HOT_FEATURES) | set(SCENARIO_CONTEXT_FEATURES)
+    assert banned & set(x_manual.columns), "guard: manual mode must expose the scenario block"
+    assert not (banned & set(x_none.columns))
+    assert not [c for c in x_none.columns if c.startswith("scenario_")]
+    # non-scenario features retained
+    kept = set(x_manual.columns) - banned
+    assert kept.issubset(set(x_none.columns))
+
+
+def test_build_ml_dataset_scenario_source_rejects_unknown() -> None:
+    raw = _raw_trade_log_scenario_auto()
+    with pytest.raises(ValueError, match="scenario_source"):
+        build_ml_dataset(raw.copy(), None, feature_set="close_morning61", scenario_source="bogus")
