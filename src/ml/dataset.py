@@ -8,7 +8,12 @@ import pandas as pd
 
 from src.ml.decision_labels import DECISION_LABEL_COLUMNS
 from src.ml.feature_manifest import build_feature_manifest
-from src.ml.scenario_panel import build_scenario_action_panel
+from src.ml.scenario_panel import (
+    SCENARIO_CONTEXT_FEATURES,
+    SCENARIO_ONE_HOT_FEATURES,
+    build_scenario_action_panel,
+)
+from src.ml.scenario_rules import derive_scenario_labels
 from src.processing.schema import RAW_TO_STANDARD_MAP
 from src.serving.realtime.features import (
     _ROBUST_Z_COLUMNS,
@@ -35,6 +40,7 @@ _ALLOWED_FEATURE_SETS: tuple[str, ...] = (
     "close_morning_sector",
 )
 _ALLOWED_PANEL_MODES: tuple[str, ...] = ("raw_rows", "scenario_action")
+_ALLOWED_SCENARIO_SOURCES: tuple[str, ...] = ("manual", "auto", "none")
 
 _SNAPSHOT49_FEATURES: tuple[str, ...] = (
     "close_position",
@@ -269,6 +275,7 @@ def build_ml_dataset(
     feature_set: str = "close_morning61",
     panel_mode: str = "scenario_action",
     price_history_df: pd.DataFrame | None = None,
+    scenario_source: str = "manual",
 ) -> tuple[pd.DataFrame, dict[str, pd.Series], list[str], pd.DataFrame]:
     """매매일지 원본 데이터를 정제하여 (X, targets, cat_features, processed_df)를 반환합니다."""
     if feature_set not in _ALLOWED_FEATURE_SETS:
@@ -278,6 +285,10 @@ def build_ml_dataset(
     if panel_mode not in _ALLOWED_PANEL_MODES:
         raise ValueError(
             f"panel_mode must be one of {list(_ALLOWED_PANEL_MODES)}, got {panel_mode!r}"
+        )
+    if scenario_source not in _ALLOWED_SCENARIO_SOURCES:
+        raise ValueError(
+            f"scenario_source must be one of {list(_ALLOWED_SCENARIO_SOURCES)}, got {scenario_source!r}"
         )
     df = clean_column_names(trade_log_df.copy())
 
@@ -303,6 +314,11 @@ def build_ml_dataset(
             "close_morning61 requires the price-change source (change_rate) to "
             "compute relative_flow_strength; missing required source inputs"
         )
+
+    if scenario_source == "auto":
+        if price_history_df is None:
+            raise ValueError("scenario_source=auto requires price_history_df")
+        df["chart_analysis"] = derive_scenario_labels(df, price_history_df).to_numpy()
 
     if panel_mode == "scenario_action":
         df, scenario_rejects = build_scenario_action_panel(df)
@@ -362,13 +378,18 @@ def build_ml_dataset(
     if panel_mode == "scenario_action":
         feature_cols = [col for col in feature_cols if col != "chart_analysis"]
         cat_features = [col for col in cat_features if col != "chart_analysis"]
+        if scenario_source == "none":
+            banned = set(SCENARIO_ONE_HOT_FEATURES) | set(SCENARIO_CONTEXT_FEATURES)
+            feature_cols = [col for col in feature_cols if col not in banned]
     feature_cols = list(dict.fromkeys(feature_cols))
     x_features = df[feature_cols].copy()
     manifest = build_feature_manifest(feature_cols)
     df.attrs["feature_manifest"] = manifest
     df.attrs["feature_set"] = feature_set
     df.attrs["panel_mode"] = panel_mode
+    df.attrs["scenario_source"] = scenario_source
     x_features.attrs["feature_manifest"] = manifest
     x_features.attrs["feature_set"] = feature_set
     x_features.attrs["panel_mode"] = panel_mode
+    x_features.attrs["scenario_source"] = scenario_source
     return x_features, targets, cat_features, df

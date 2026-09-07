@@ -53,6 +53,7 @@ class ChampionTuningConfig:
     buyability_target_notional_100m: float | None = None
     label_mode: str = "journaled"
     cost_mode: str = "flat"
+    scenario_source: str = "manual"
     validation: ValidationConfig | None = None
     # None preserves current behaviour (no additional screen filter beyond
     # ceiling exclusion); CLI callers (retrain.py) default to OPERATOR_LEGACY_SCREEN.

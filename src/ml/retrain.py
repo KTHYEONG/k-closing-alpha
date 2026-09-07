@@ -4,15 +4,18 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from pathlib import Path
 
 import pandas as pd
 
 from src import settings
 from src.data.candidate_panel import build_restored_trade_log, check_price_history_freshness
+from src.data.io_utils import atomic_write_parquet
 from src.ml.bundle import CHAMPION_DEFAULT_MODEL_PARAMS
 from src.ml.champion import train_champion_bundle, train_tuned_champion_bundle
 from src.ml.tuning import ChampionTuningConfig
 from src.ml.universe import SCREEN_REGISTRY
+from src.ml.universe_research import DEFAULT_RESEARCH_SCREENS, run_universe_screen_grid
 from src.ml.validation import ValidationConfig
 
 logger = logging.getLogger(__name__)
@@ -37,8 +40,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--promotion-alpha", type=float, default=0.10)
     parser.add_argument("--no-hpo", action="store_true", help="skip Optuna; use CHAMPION_DEFAULT_MODEL_PARAMS")
     parser.add_argument("--no-restore-panel", action="store_true", help="train on the raw trade log only; skip condition_history/archive panel restoration")
+    parser.add_argument("--universe-research", action="store_true", help="reconstruct full-market panels for a ScreenConfig family, train the ranker on each, print/save the model-free-vs-ranked-vs-CPCV comparison; skips champion training")
     parser.add_argument("--label-mode", default="mechanical", choices=["journaled", "mechanical"])
     parser.add_argument("--screen", default="operator_legacy", choices=["operator_legacy", "band_2_15", "band_5_15_highvalue"])
+    parser.add_argument("--scenario-source", default="manual", choices=["manual", "auto", "none"], help="manual: keep the journaled 차트분석; auto: derive it from price_history; none: drop the scenario feature block")
     parser.add_argument("--cost-mode", default="per_row", choices=["flat", "per_row"])
     parser.add_argument("--publish", action="store_true")
     parser.add_argument("--production-dir", default="artifacts/models")
@@ -52,6 +57,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         parsed = _orig_parse(args, namespace) if namespace is not None else _orig_parse(args)
         if bool(getattr(parsed, "publish", False)) and not getattr(parsed, "oos_reserve_start", None):
             parser.error("--publish requires --oos-reserve-start")
+        # scenario_source=auto needs price_history, which is not loaded when the
+        # panel restore is skipped for a non-history feature_set.
+        if (
+            getattr(parsed, "scenario_source", "manual") == "auto"
+            and bool(getattr(parsed, "no_restore_panel", False))
+            and getattr(parsed, "feature_set", "") not in ("close_morning_history", "close_morning_sector")
+        ):
+            parser.error("--scenario-source auto requires price_history (drop --no-restore-panel)")
         return parsed
 
     parser.parse_args = _guarded_parse  # type: ignore[method-assign]
@@ -93,6 +106,24 @@ def main(argv: list[str] | None = None) -> None:
             prov_restore.get("restored_date_max"),
         )
 
+    if args.universe_research:
+        if price_history_df is None:
+            if not os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH):
+                raise ValueError(f"price_history not found: {settings.PRICE_HISTORY_PARQUET_PATH}")
+            price_history_df = pd.read_parquet(settings.PRICE_HISTORY_PARQUET_PATH)
+        universe_grid = run_universe_screen_grid(
+            price_history_df,
+            DEFAULT_RESEARCH_SCREENS,
+            feature_set=args.feature_set,
+            start_date=str(pd.to_datetime(price_history_df["date"]).min().date()),
+            end_date=str(pd.to_datetime(price_history_df["date"]).max().date()),
+            oos_reserve_start=args.oos_reserve_start,
+            model_params=None,
+        )
+        atomic_write_parquet(universe_grid, Path(args.export_dir) / "universe_grid.parquet")
+        logger.info(universe_grid.to_string())
+        return
+
     if args.tuned:
         recency = int(args.recency_half_life) if args.recency_half_life is not None else None
         cfg = ChampionTuningConfig(
@@ -111,6 +142,7 @@ def main(argv: list[str] | None = None) -> None:
             validation=validation,
             buyability_target_notional_100m=float(args.target_notional_100m),
             screen=SCREEN_REGISTRY[args.screen],
+            scenario_source=args.scenario_source,
         )
         bundle = train_tuned_champion_bundle(trade_log_df, theme_df, cfg, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df, production_dir=args.production_dir)
         prov = bundle.get("tuning_provenance", {})
@@ -120,7 +152,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         logger.info(f"tuned bundle saved: {bundle.get('training_cutoff')} provenance={prov}")
     else:
-        bundle = train_champion_bundle(trade_log_df, theme_df, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df)
+        bundle = train_champion_bundle(trade_log_df, theme_df, export_dir=args.export_dir, feature_set=args.feature_set, price_history_df=price_history_df, scenario_source=args.scenario_source)
         logger.info(f"champion bundle saved: {bundle.get('training_cutoff')}")
 
 
