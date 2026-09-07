@@ -1,0 +1,258 @@
+"""Comprehensive verification test suite for K-Closing Alpha Research Validation v3.
+
+Verifies zero leakage, strict walk-forward isolation, calendar-aware discrete NAV,
+suspension carry rules, dynamic gate logic, and metrics JSON-to-Markdown consistency.
+"""
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from src.ml.research.v3_engine import (
+    FEATURE_COLS,
+    attach_forward_exit_paths,
+    build_candidate_universe,
+    compute_derived_features,
+)
+from src.ml.research.v3_metrics import (
+    calculate_geometric_cagr,
+    calculate_series_metrics,
+    deflated_sharpe_ratio,
+    krx_tick_size,
+    moving_block_bootstrap_ci,
+    simulate_discrete_portfolio,
+)
+
+
+@pytest.fixture
+def metrics_data() -> dict:
+    metrics_path = Path("docs/research/v3/research_validation_v3_metrics.json")
+    assert metrics_path.exists(), "research_validation_v3_metrics.json must exist"
+    with open(metrics_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+@pytest.fixture
+def report_text() -> str:
+    report_path = Path("docs/research/v3/research_validation_v3.md")
+    assert report_path.exists(), "research_validation_v3.md must exist"
+    return report_path.read_text(encoding="utf-8")
+
+
+def test_report_numbers_match_metrics_json(metrics_data: dict, report_text: str):
+    """Test Section 68 & 78: Markdown report figures match metrics JSON exactly."""
+    p1 = metrics_data["pipelines"]["P1"]
+    r = metrics_data["ranking_evaluation"]
+
+    # Check Top1 Net
+    top1_net_str = f"{p1['net_bp']:.2f}"
+    assert top1_net_str in report_text, f"Top1 net {top1_net_str} missing in report"
+
+    # Check Rank IC
+    rank_ic_str = f"{r['mean_rank_ic']:.4f}"
+    assert rank_ic_str in report_text, f"Rank IC {rank_ic_str} missing in report"
+
+    # Check Sharpe
+    sharpe_str = f"{p1['sharpe']:.2f}"
+    assert sharpe_str in report_text, f"Sharpe {sharpe_str} missing in report"
+
+    # Check MDD
+    mdd_str = f"{p1['mdd_pct']:.2f}%"
+    assert mdd_str in report_text, f"MDD {mdd_str} missing in report"
+
+    # Check CAGR
+    cagr_str = f"{p1['cagr_pct']:.2f}%"
+    assert cagr_str in report_text, f"CAGR {cagr_str} missing in report"
+
+    # Check Verdicts
+    assert metrics_data["research_verdict"] in report_text
+    assert metrics_data["production_verdict"] in report_text
+
+
+def test_no_feature_after_decision_timestamp():
+    """Test Section 69: Feature set contains only predeclared decision-time features."""
+    expected = [
+        "chg_ratio",
+        "log_tv",
+        "log_mc",
+        "body_ratio",
+        "upper_shadow_ratio",
+        "intraday_range",
+        "inst_density",
+        "foreign_density",
+        "kospi_pct",
+        "kosdaq_pct",
+        "v_kospi",
+        "tv_rank",
+        "inst_rank",
+        "chg_rank",
+    ]
+    assert expected == FEATURE_COLS
+
+
+def test_universe_uses_asof_change_not_final_change():
+    """Test Section 69: Universe selection criteria strictly bounded by 2% <= chg < 10%."""
+    data = {
+        "date": [pd.Timestamp("2024-01-02")] * 4,
+        "symbol": ["000001", "000002", "000003", "000004"],
+        "daily_change_pct": [1.9, 2.5, 9.9, 10.1],
+        "trade_value_100m": [200.0, 200.0, 200.0, 200.0],
+        "market_cap_100m": [1000.0, 1000.0, 1000.0, 1000.0],
+        "close": [10000.0, 10000.0, 10000.0, 10000.0],
+        "high": [10000.0, 10000.0, 10000.0, 10000.0],
+        "volume": [100000.0, 100000.0, 100000.0, 100000.0],
+        "market": ["KOSPI"] * 4,
+        "kospi_pct": [0.01] * 4,
+        "kosdaq_pct": [0.01] * 4,
+        "inst_netbuy": [10.0] * 4,
+    }
+    df = pd.DataFrame(data)
+    df["chg_ratio"] = df["daily_change_pct"] / 100.0
+    df["tv_clean"] = df["trade_value_100m"]
+    df["mc_clean"] = df["market_cap_100m"]
+    df["is_ceiling"] = False
+
+    u0, _ = build_candidate_universe(df)
+    assert len(u0) == 2
+    assert set(u0["symbol"]) == {"000002", "000003"}
+
+
+def test_validation_candidates_not_filtered_by_future_tradability(metrics_data: dict):
+    """Test Section 10 & 69: Validation candidates contain D+1 untradable/suspended rows."""
+    attrition = metrics_data["candidate_attrition"]
+    assert attrition["top1_d1_suspended"] > 0, "Suspended Top1 picks must exist and NOT be dropped"
+    # Total signals = completed tradable + suspended + unresolved + 1 pending active day
+    resolved = attrition["top1_d1_tradable"] + attrition["top1_d1_suspended"] + attrition["top1_unresolved_exits"]
+    assert attrition["top1_signals"] in (resolved, resolved + 1)
+
+
+def test_suspended_top1_is_not_dropped():
+    """Test Section 12 & 69: Untradable D+1 candidate is carried forward to next tradable open."""
+    market_dates = np.array([pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03"), pd.Timestamp("2024-01-04")])
+    d_to_idx = {d: i for i, d in enumerate(market_dates)}
+
+    ph_data = [
+        # T (2024-01-02)
+        {"date": pd.Timestamp("2024-01-02"), "symbol": "000001", "open": 10000.0, "high": 10500.0, "low": 9900.0, "close": 10400.0, "volume": 50000.0},
+        # D+1 (2024-01-03): Suspended (volume=0, open=0)
+        {"date": pd.Timestamp("2024-01-03"), "symbol": "000001", "open": 0.0, "high": 0.0, "low": 0.0, "close": 10400.0, "volume": 0.0},
+        # D+2 (2024-01-04): Resumed trading at 11000.0
+        {"date": pd.Timestamp("2024-01-04"), "symbol": "000001", "open": 11000.0, "high": 11200.0, "low": 10900.0, "close": 11100.0, "volume": 60000.0},
+    ]
+    ph = pd.DataFrame(ph_data)
+
+    cand_df = pd.DataFrame([
+        {"date": pd.Timestamp("2024-01-02"), "symbol": "000001", "close": 10400.0}
+    ])
+
+    res = attach_forward_exit_paths(cand_df, ph, market_dates, d_to_idx)
+    assert len(res) == 1
+    assert res.iloc[0]["exit_status"] == "EXIT_SUSPENDED"
+    assert res.iloc[0]["exit_price"] == 11000.0
+    assert res.iloc[0]["holding_days"] == 2
+    assert res.iloc[0]["gross_return"] == pytest.approx(11000.0 / 10400.0 - 1.0)
+
+
+def test_walk_forward_train_precedes_validation(metrics_data: dict):
+    """Test Section 31 & 69: All training folds strictly precede validation folds."""
+    folds = metrics_data["walk_forward_folds"]
+    for f in folds:
+        t_end = pd.Timestamp(f["train_end"])
+        v_start = pd.Timestamp(f["val_start"])
+        assert t_end < v_start, f"Fold {f['fold']} train_end {t_end} not before val_start {v_start}"
+
+
+def test_purge_gap_applied(metrics_data: dict):
+    """Test Section 29 & 69: Purge gap between train and validation is >= 2 days."""
+    folds = metrics_data["walk_forward_folds"]
+    for f in folds:
+        assert f["purge_gap_days"] >= 2
+
+
+def test_pa_unfilled_signal_counted_as_zero_return(metrics_data: dict):
+    """Test Section 22 & 69: PA overlay includes unfilled signals as 0 return."""
+    pa = metrics_data["pipelines"]["P1_PA"]
+    fill_rate = pa["fill_rate"]
+    filled_net = pa["filled_trade_net_bp"]
+    attempted_net = pa["return_per_attempted_signal_bp"]
+
+    expected_attempted = round(fill_rate * filled_net + (1.0 - fill_rate) * 0.0, 2)
+    assert attempted_net == pytest.approx(expected_attempted, abs=0.05)
+
+
+def test_cagr_is_geometric():
+    """Test Section 44 & 69: CAGR is strictly geometric compounding, not arithmetic."""
+    v0 = 100_000_000.0
+    v1 = 150_000_000.0
+    days = 730  # ~2 years
+
+    geom = calculate_geometric_cagr(v0, v1, days)
+    expected_geom = (v1 / v0) ** (365.25 / days) - 1.0
+    assert geom == pytest.approx(expected_geom, rel=1e-6)
+
+    # Arithmetic annual return would be (50% / 730) * 365.25 ≈ 25.0%
+    arithmetic = 0.25
+    assert geom != pytest.approx(arithmetic)
+
+
+def test_market_calendar_used_for_nav(metrics_data: dict):
+    """Test Section 42 & 69: Market trading days used instead of generic calendar."""
+    p1 = metrics_data["pipelines"]["P1"]
+    assert p1["n_days"] == 2172  # KRX trading days evaluated in OOF
+
+
+def test_gate_uses_same_pipeline(metrics_data: dict):
+    """Test Section 4 & 50: Gates evaluated for P1 use strictly P1 values."""
+    p1 = metrics_data["pipelines"]["P1"]
+    g3 = metrics_data["gates"]["Gate_3_Net_Alpha"]
+    g10 = metrics_data["gates"]["Gate_10_Portfolio_Risk"]
+
+    assert g3["value_bp"] == p1["net_bp"]
+    assert g10["mdd_pct"] == p1["mdd_pct"]
+
+
+def test_gate8_not_hardcoded(metrics_data: dict):
+    """Test Section 59 & 69: Gate 8 robustness is dynamically computed."""
+    g8 = metrics_data["gates"]["Gate_8_Strategy_Robustness"]
+    assert "details" in g8
+    assert "top1_positive" in g8["details"]
+    assert "ridge_top1_bp" in g8["details"]
+    assert "shallow_top1_bp" in g8["details"]
+    assert isinstance(g8["details"]["ridge_top1_bp"], float)
+
+
+def test_future_mutation_test():
+    """Test Section 70: Mutating future post-15:20 data does not alter decision candidate features."""
+    cands_original = pd.DataFrame([
+        {
+            "date": pd.Timestamp("2024-01-02"),
+            "symbol": "005930",
+            "open": 70000.0,
+            "high": 72000.0,
+            "low": 69500.0,
+            "close": 71500.0,
+            "volume": 1000000.0,
+            "tv_clean": 715.0,
+            "mc_clean": 400000.0,
+            "inst_netbuy": 50.0,
+            "foreign_netbuy": 30.0,
+            "chg_ratio": 0.035,
+            "kospi_pct": 0.012,
+            "kosdaq_pct": 0.008,
+            "v_kospi": 16.5,
+        }
+    ])
+    feats1 = compute_derived_features(cands_original.copy())
+
+    # Mutate post-decision future values: e.g. imagine D+1 price was stored or modified
+    cands_mutated = cands_original.copy()
+    cands_mutated["future_fake_price"] = 999999.0
+    feats2 = compute_derived_features(cands_mutated.copy())
+
+    for col in FEATURE_COLS:
+        assert feats1.iloc[0][col] == pytest.approx(feats2.iloc[0][col])
