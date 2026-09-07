@@ -5,6 +5,12 @@
 - **비용 기준**: 왕복 46bp (세금 20bp + 스프레드 26bp)
 - **분할 기준**: DEV (< 2025-09-01), 잠긴 OOS (>= 2025-09-01)
 
+> [!WARNING]
+> **Methodology Invalidation Notice (2026-09-07)**
+> 1. The TP Grid results (+276bp ~ +290bp, Sharpe 7.0~8.2) in Table 3.1 were generated on in-sample final-model rescored Top-1 picks with an unrealistic 100% limit touch fill assumption (`INVALID_FOR_STRATEGY_DECISION`).
+> 2. Genuine OOF Top-1 evaluation with fill probability / queue adjustments shows realistic TP 5% + MOC yields +7.2bp (Sharpe 0.21), which is inferior to D+1 Open baseline (+32.1bp, Sharpe 1.73).
+> 3. See `docs/research/corrected_exit_analysis.md` for realistic fill-adjusted exit evaluation.
+
 ---
 
 ## 1. 연구 목적

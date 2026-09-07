@@ -6,6 +6,12 @@
 - **비용 기준**: 편도 23bp / 왕복 46bp (KRX 법정 세금 20bp + KRX 2틱 호가 스프레드 26bp)
 - **표본 분할**: DEV (< 2025-09-01, 2,370 거래일), 잠긴 OOS (>= 2025-09-01, 245 거래일)
 
+> [!WARNING]
+> **Methodology Invalidation Notice (2026-09-07)**
+> 1. Level C (ML Top-1/3/5) metrics in this document were generated using final-model historical rescoring and are in-sample contaminated (`INVALID_FOR_STRATEGY_DECISION`).
+> 2. The claim that `shift(-h)` "perfectly reflects suspensions and trading halts" was inaccurate: `shift(-h)` matched across calendar gaps without flagging untradable days.
+> 3. See `docs/research/corrected_exit_analysis.md` and `docs/research/research_validation_v2.md` for corrected calendar-aware results.
+
 ---
 
 ## 1. 연구 목적
