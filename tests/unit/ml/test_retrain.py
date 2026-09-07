@@ -292,3 +292,105 @@ def test_retrain_promotion_alpha_flows_to_validation_config(tmp_path, monkeypatc
     assert cfg.promotion_alpha == 0.20
     assert cfg.validation is not None
     assert cfg.validation.promotion_alpha == 0.20
+
+
+def test_retrain_scenario_source_flows_to_config_and_default(tmp_path, monkeypatch) -> None:
+    import src.ml.retrain as mod
+    from src.ml.retrain import build_arg_parser
+
+    assert build_arg_parser().parse_args(["--tuned"]).scenario_source == "manual"
+
+    trade_path = tmp_path / "trade_log.parquet"
+    _write_trade_log(trade_path)
+    theme_path = tmp_path / "theme_missing.parquet"
+
+    captured: dict[str, object] = {}
+
+    def _fake_train_tuned(trade_log_df, theme_df, cfg, **kwargs):
+        captured["cfg"] = cfg
+        return {"training_cutoff": "2026-03-02", "tuning_provenance": {"control_vs_candidate": {}}}
+
+    monkeypatch.setattr(mod, "train_tuned_champion_bundle", _fake_train_tuned)
+
+    main([
+        "--trade-log", str(trade_path), "--theme", str(theme_path),
+        "--tuned", "--no-restore-panel", "--scenario-source", "none",
+    ])
+    assert captured["cfg"].scenario_source == "none"
+
+
+def test_retrain_scenario_source_auto_requires_price_history(capsys) -> None:
+    from src.ml.retrain import build_arg_parser
+
+    parser = build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--tuned", "--no-restore-panel", "--scenario-source", "auto"])
+    assert "requires price_history" in capsys.readouterr().err
+
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import src.ml.retrain as mod
+from src.ml.retrain import main
+
+
+def _price_history_file(path) -> None:
+    dates = pd.bdate_range("2023-01-02", periods=20)
+    pd.DataFrame({
+        "date": list(dates) * 2,
+        "symbol": ["000001"] * 20 + ["000002"] * 20,
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "prev_close": 100.0,
+        "market_cap_100m": 900.0, "trade_value_100m": 200.0, "daily_change_pct": 0.005,
+        "market": "KOSPI", "volume": 1e5, "foreign_netbuy": 0.0, "inst_netbuy": 0.0,
+        "program_netbuy": 0.0, "kospi_pct": 0.001, "kosdaq_pct": 0.001,
+        "v_kospi": 18.0, "v_kosdaq": 22.0,
+    }).to_parquet(path)
+
+
+def test_retrain_universe_research_mode_dispatches_and_skips_champion(tmp_path, monkeypatch) -> None:
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    trade_path = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2023-01-03"], "종목코드": ["000001"], "(종가)": [100.0],
+                  "(수익률, %)": [1.0], "(매수 가격)": [100.0], "(매도 가격)": [101.0]}).to_parquet(trade_path)
+
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    seen: dict[str, object] = {}
+
+    def _fake_grid(price_history_df, screens, **kwargs):
+        seen["n_screens"] = len(screens)
+        seen["rows"] = len(price_history_df)
+        return pd.DataFrame([{ "screen_name": "operator_legacy", "ranked_top1_net_bp": -10.0 }])
+
+    def _boom_champion(*a, **k):
+        raise AssertionError("champion training must not run in --universe-research mode")
+
+    monkeypatch.setattr(mod, "run_universe_screen_grid", _fake_grid)
+    monkeypatch.setattr(mod, "train_tuned_champion_bundle", _boom_champion)
+    monkeypatch.setattr(mod, "train_champion_bundle", _boom_champion)
+
+    main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+          "--no-restore-panel", "--universe-research", "--export-dir", str(tmp_path)])
+
+    assert seen["n_screens"] >= 5 and seen["rows"] == 40
+    assert (tmp_path / "universe_grid.parquet").exists()
+
+
+import pandas as pd
+import pytest
+
+import src.ml.retrain as mod
+from src.ml.retrain import main
+
+
+def test_retrain_universe_research_missing_price_history_raises(tmp_path, monkeypatch) -> None:
+    trade_path = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2023-01-03"], "종목코드": ["000001"], "(종가)": [100.0],
+                  "(수익률, %)": [1.0], "(매수 가격)": [100.0], "(매도 가격)": [101.0]}).to_parquet(trade_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "nope.parquet")
+
+    with pytest.raises(ValueError, match="price_history not found"):
+        main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+              "--no-restore-panel", "--universe-research", "--export-dir", str(tmp_path)])
