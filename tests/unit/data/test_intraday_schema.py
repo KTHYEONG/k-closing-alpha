@@ -227,3 +227,60 @@ def test_assert_canonical_bars_and_ticks_accept_matching_columns() -> None:
     assert_canonical_bars(pd.DataFrame({c: [] for c in CANONICAL_BAR_COLUMNS}))
     assert_canonical_ticks(pd.DataFrame({c: [] for c in CANONICAL_TICK_COLUMNS}))
 
+def test_normalize_tick_frame_kiwoom_vendor_maps_fields() -> None:
+    import pandas as pd
+
+    from src.data.intraday_schema import CANONICAL_TICK_COLUMNS, normalize_tick_frame
+
+    df = pd.DataFrame([{"cur_prc": "270000", "trde_qty": "150", "cntr_tm": "20260904153000"}])
+
+    out = normalize_tick_frame(df, "kiwoom", "2026-09-04", "005930")
+
+    assert list(out.columns) == list(CANONICAL_TICK_COLUMNS)
+    assert int(out.iloc[0]["ts_hms"]) == 153000
+    assert int(out.iloc[0]["price"]) == 270000
+    assert int(out.iloc[0]["volume"]) == 150
+    assert out.iloc[0]["vendor"] == "kiwoom"
+    assert pd.isna(out.iloc[0]["trade_strength"])
+    assert pd.isna(out.iloc[0]["ask1"])
+    assert pd.isna(out.iloc[0]["bid1"])
+
+
+def test_normalize_tick_frame_kiwoom_missing_required_column_raises() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.data.intraday_schema import normalize_tick_frame
+
+    df = pd.DataFrame([{"cur_prc": "270000", "cntr_tm": "20260904153000"}])
+
+    with pytest.raises(ValueError, match="Missing required kiwoom source columns"):
+        normalize_tick_frame(df, "kiwoom", "2026-09-04", "005930")
+
+
+def test_check_vendor_accepts_kiwoom() -> None:
+    from src.data.intraday_schema import _check_vendor
+
+    assert _check_vendor("kiwoom") == "kiwoom"
+
+
+def test_check_vendor_rejects_unknown_vendor() -> None:
+    import pytest
+
+    from src.data.intraday_schema import _check_vendor
+
+    with pytest.raises(ValueError, match="Unknown intraday vendor"):
+        _check_vendor("unknown_vendor")
+
+
+def test_normalize_tick_frame_rejects_unknown_vendor() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.data.intraday_schema import normalize_tick_frame
+
+    raw = pd.DataFrame({"time": ["090100"], "close": [1000], "jdiff_vol": [10]})
+
+    with pytest.raises(ValueError, match="Unknown intraday vendor"):
+        normalize_tick_frame(raw, "unknown_vendor", "2026-09-04", "005930")
+

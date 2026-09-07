@@ -437,3 +437,131 @@ def test_collector_routes_to_ls_with_fallback() -> None:
     assert res.iloc[0]["symbol"] == "005930"
     mock_ls.get_tick_chart.assert_awaited_once()
     mock_kis.get_intraday_trade_ticks.assert_not_awaited()
+
+def test_collect_intraday_trade_ticks_kiwoom_success_skips_ls_and_kis() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    mock_kiwoom = AsyncMock()
+    mock_kiwoom.get_tick_chart = AsyncMock(
+        return_value={
+            "rt_cd": "0",
+            "vendor": "kiwoom",
+            "truncated": False,
+            "output2": [{"cur_prc": "270000", "trde_qty": "150", "cntr_tm": "20260904153000"}],
+        }
+    )
+    mock_ls = AsyncMock()
+    mock_kis = AsyncMock()
+
+    result = asyncio.run(
+        collect_intraday_trade_ticks(
+            mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04",
+            ls_client=mock_ls, kiwoom_client=mock_kiwoom,
+        )
+    )
+
+    assert len(result) == 1
+    assert result.iloc[0]["symbol"] == "005930"
+    assert result.iloc[0]["vendor"] == "kiwoom"
+    mock_ls.get_tick_chart.assert_not_awaited()
+    mock_kis.get_intraday_trade_ticks.assert_not_awaited()
+
+
+def test_collect_intraday_trade_ticks_kiwoom_exception_falls_back_to_ls() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    mock_kiwoom = AsyncMock()
+    mock_kiwoom.get_tick_chart = AsyncMock(side_effect=RuntimeError("kiwoom unreachable"))
+    mock_ls = AsyncMock()
+    mock_ls.get_tick_chart = AsyncMock(
+        return_value={"rt_cd": "0", "vendor": "ls", "truncated": False, "output2": [{"time": "153000", "close": 1000, "jdiff_vol": 10}]}
+    )
+    mock_kis = AsyncMock()
+
+    result = asyncio.run(
+        collect_intraday_trade_ticks(
+            mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04",
+            ls_client=mock_ls, kiwoom_client=mock_kiwoom,
+        )
+    )
+
+    assert len(result) == 1
+    assert result.iloc[0]["vendor"] == "ls"
+    mock_kis.get_intraday_trade_ticks.assert_not_awaited()
+
+
+def test_collect_intraday_trade_ticks_kiwoom_empty_success_skips_ls_and_kis() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    mock_kiwoom = AsyncMock()
+    mock_kiwoom.get_tick_chart = AsyncMock(return_value={"rt_cd": "0", "output2": []})
+    mock_ls = AsyncMock()
+    mock_kis = AsyncMock()
+
+    result = asyncio.run(
+        collect_intraday_trade_ticks(
+            mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04",
+            ls_client=mock_ls, kiwoom_client=mock_kiwoom,
+        )
+    )
+
+    assert result.empty
+    mock_ls.get_tick_chart.assert_not_awaited()
+    mock_kis.get_intraday_trade_ticks.assert_not_awaited()
+
+
+def test_collect_intraday_trade_ticks_kiwoom_normalize_failure_yields_empty_no_fallback() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    mock_kiwoom = AsyncMock()
+    mock_kiwoom.get_tick_chart = AsyncMock(
+        return_value={"rt_cd": "0", "vendor": "kiwoom", "output2": [{"cur_prc": "270000"}]}
+    )
+    mock_ls = AsyncMock()
+    mock_kis = AsyncMock()
+
+    result = asyncio.run(
+        collect_intraday_trade_ticks(
+            mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04",
+            ls_client=mock_ls, kiwoom_client=mock_kiwoom,
+        )
+    )
+
+    assert result.empty
+    mock_ls.get_tick_chart.assert_not_awaited()
+    mock_kis.get_intraday_trade_ticks.assert_not_awaited()
+
+
+def test_collect_intraday_trade_ticks_no_kiwoom_client_falls_back_to_ls_unchanged() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    mock_ls = AsyncMock()
+    mock_ls.get_tick_chart = AsyncMock(
+        return_value={"rt_cd": "0", "vendor": "ls", "truncated": False, "output2": [{"time": "153000", "close": 1000, "jdiff_vol": 10}]}
+    )
+    mock_kis = AsyncMock()
+
+    result = asyncio.run(
+        collect_intraday_trade_ticks(
+            mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04", ls_client=mock_ls,
+        )
+    )
+
+    assert len(result) == 1
+    assert result.iloc[0]["vendor"] == "ls"
+

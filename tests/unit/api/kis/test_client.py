@@ -199,3 +199,68 @@ def test_get_program_trade_daily_history_paginates_backward_by_earliest_date() -
     res = asyncio.run(_runner())
     dates = [row["stck_bsop_date"] for row in res["output"]]
     assert dates == ["20240104", "20240105"]
+
+
+def test_get_fluctuation_ranking_requires_explicit_market_div_code() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+
+    async def _runner() -> None:
+        with pytest.raises(ValueError, match="market_div_code"):
+            [redacted]
+
+    asyncio.run(_runner())
+
+
+def test_get_fluctuation_ranking_sends_confirmed_tr_params() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+    handle_request = AsyncMock(return_value={"rt_cd": "0", "output": []})
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            return await client.get_fluctuation_ranking(
+                [redacted]
+            )
+
+    asyncio.run(_runner())
+
+    call = handle_request.await_args
+    assert call.args[1] == f"{client.base_url}/uapi/domestic-stock/v1/ranking/fluctuation"
+    params = call.kwargs.get("params", {})
+    assert params["FID_COND_MRKT_DIV_CODE"] == "J"
+    assert params["FID_COND_SCR_DIV_CODE"] == "20170"
+    [redacted]
+    [redacted]
+    headers = call.kwargs.get("headers", {})
+    assert headers.get("tr_id") == "FHPST01700000"
+
+
+def test_get_fluctuation_ranking_returns_raw_rows_with_output_or_output2_fallback() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+    rows = [{"stck_shrn_iscd": "005930", "prdy_ctrt": "5.2"}]
+
+    async def _runner_output():
+        handle_request = AsyncMock(return_value={"rt_cd": "0", "output": rows})
+        with patch.object(client, "_handle_request", handle_request):
+            [redacted]
+
+    async def _runner_output2():
+        handle_request = AsyncMock(return_value={"rt_cd": "0", "output2": rows})
+        with patch.object(client, "_handle_request", handle_request):
+            [redacted]
+
+    res1 = asyncio.run(_runner_output())
+    res2 = asyncio.run(_runner_output2())
+    assert res1["output"] == rows
+    assert res2["output"] == rows
+
+
+def test_get_fluctuation_ranking_propagates_error_response_unchanged() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+    handle_request = AsyncMock(return_value={"rt_cd": "1", "msg1": "조회 실패"})
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            [redacted]
+
+    res = asyncio.run(_runner())
+    assert res == {"rt_cd": "1", "msg1": "조회 실패"}
