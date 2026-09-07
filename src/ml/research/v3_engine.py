@@ -17,10 +17,10 @@ from sklearn.linear_model import Ridge
 
 from src.ml.research.v3_metrics import (
     calculate_series_metrics,
-    krx_tick_size,
     moving_block_bootstrap_ci,
     simulate_discrete_portfolio,
 )
+from src.strategy.contract import AA_COST, PA_COST, mark_ceiling, round_trip_cost_bp, select_universe
 
 logger = logging.getLogger("research_v3_engine")
 
@@ -60,15 +60,13 @@ def load_and_prepare_price_history(path: Path | str) -> tuple[pd.DataFrame, np.n
     tv = ph["trade_value_100m"].to_numpy(dtype=np.float64)
     vol = ph["volume"].to_numpy(dtype=np.float64)
     close = ph["close"].to_numpy(dtype=np.float64)
-    high = ph["high"].to_numpy(dtype=np.float64)
     ph["tv_clean"] = np.where(np.isfinite(tv), tv, close * vol / 1e8)
 
     # Clean market cap: symbol-level forward fill only, no global fillna
     ph["mc_clean"] = ph.groupby("symbol")["market_cap_100m"].ffill()
 
     # Ceiling detection
-    ceiling = (ph["chg_ratio"] >= 0.29) & (close >= high)
-    ph["is_ceiling"] = ceiling
+    ph["is_ceiling"] = mark_ceiling(ph)
 
     # Baseline trading calendar
     market_dates = np.array(sorted(ph["date"].unique()))
@@ -80,19 +78,9 @@ def load_and_prepare_price_history(path: Path | str) -> tuple[pd.DataFrame, np.n
 def build_candidate_universe(ph: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Construct U0_PIT and U3_PIT universes without future tradability filters."""
     logger.info("Filtering PIT candidate universes U0 and U3...")
-    close = ph["close"].to_numpy(dtype=np.float64)
-    vol = ph["volume"].to_numpy(dtype=np.float64)
 
     # U0_PIT mask: 2% <= chg < 10%, tv >= 100억, mc >= 500억, not ceiling, close > 0, vol > 0
-    u0_mask = (
-        (ph["chg_ratio"] >= 0.02)
-        & (ph["chg_ratio"] < 0.10)
-        & (ph["tv_clean"] >= 100.0)
-        & (ph["mc_clean"] >= 500.0)
-        & (~ph["is_ceiling"])
-        & (close > 0.0)
-        & (vol > 0)
-    )
+    u0_mask = select_universe(ph)
 
     u0_df = ph[u0_mask].copy().sort_values(["date", "symbol"]).reset_index(drop=True)
 
@@ -175,13 +163,8 @@ def attach_forward_exit_paths(
 
     # Calculate returns and costs
     entry_p = cands["close"].to_numpy(dtype=np.float64)
-    ticks = krx_tick_size(entry_p)
-    statutory_tax_bp = 20.0  # 2026 normalized tax
-    spread_2ticks_bp = 2.0 * ticks / entry_p * 10000.0
-    spread_1tick_bp = 1.0 * ticks / entry_p * 10000.0
-
-    cost_aa_bp = statutory_tax_bp + spread_2ticks_bp
-    cost_pa_bp = statutory_tax_bp + spread_1tick_bp
+    cost_aa_bp = round_trip_cost_bp(entry_p, AA_COST)
+    cost_pa_bp = round_trip_cost_bp(entry_p, PA_COST)
     cost_stress_bp = np.full(len(cands), 46.0, dtype=np.float64)
 
     gross_ret = exit_prices / entry_p - 1.0
