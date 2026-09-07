@@ -195,3 +195,62 @@ def test_simulate_multiday_tp_exit() -> None:
     assert days3[0] == 3.0
     assert reasons3[0] == "d3_fallback_moc"
     assert abs(rets3[0] - (132.0 / 102.0 - 1.0)) < 1e-6
+
+
+def test_attach_forward_path_calendar_suspension_and_zero_volume() -> None:
+    # 3 market trading days: Tue Jan 2, Wed Jan 3, Thu Jan 4
+    # Stock A trades Tue Jan 2, is SUSPENDED Wed Jan 3 (no bar in ph), resumes Thu Jan 4
+    # Stock B trades Tue Jan 2, has bar Wed Jan 3 with volume=0 (halted), resumes Thu Jan 4 with volume>0
+    # Market baseline: Symbol 'MKT' trades all days
+    rows = [
+        # Baseline market symbol to establish full trading calendar
+        {"date": pd.Timestamp("2024-01-02"), "symbol": "MKT", "open": 1000, "high": 1000, "low": 1000, "close": 1000, "daily_change_pct": 0, "volume": 1000},
+        {"date": pd.Timestamp("2024-01-03"), "symbol": "MKT", "open": 1000, "high": 1000, "low": 1000, "close": 1000, "daily_change_pct": 0, "volume": 1000},
+        {"date": pd.Timestamp("2024-01-04"), "symbol": "MKT", "open": 1000, "high": 1000, "low": 1000, "close": 1000, "daily_change_pct": 0, "volume": 1000},
+        # Stock A: Missing bar on Jan 3
+        {"date": pd.Timestamp("2024-01-02"), "symbol": "000001", "open": 100, "high": 105, "low": 95, "close": 102, "daily_change_pct": 0.02, "volume": 500},
+        {"date": pd.Timestamp("2024-01-04"), "symbol": "000001", "open": 120, "high": 125, "low": 118, "close": 122, "daily_change_pct": 0.20, "volume": 800},
+        # Stock B: Zero volume halt on Jan 3
+        {"date": pd.Timestamp("2024-01-02"), "symbol": "000002", "open": 50, "high": 52, "low": 48, "close": 51, "daily_change_pct": 0.01, "volume": 200},
+        {"date": pd.Timestamp("2024-01-03"), "symbol": "000002", "open": 51, "high": 51, "low": 51, "close": 51, "daily_change_pct": 0.00, "volume": 0},
+        {"date": pd.Timestamp("2024-01-04"), "symbol": "000002", "open": 55, "high": 58, "low": 54, "close": 57, "daily_change_pct": 0.12, "volume": 600},
+    ]
+    ph = pd.DataFrame(rows)
+
+    entries = pd.DataFrame({
+        "trade_date": [pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-02")],
+        "stock_code": ["000001", "000002"],
+    })
+
+    out = attach_forward_path(entries, ph, horizons=(1, 2))
+
+    # Stock A on Jan 2:
+    # Market D+1 is Jan 3. But Stock A has no bar on Jan 3.
+    # Therefore d1_suspended must be True, d1_tradable must be False, d1_open must be NaN.
+    # While d1_observed_date is Jan 4 (resumed bar).
+    row_a = out.iloc[0]
+    assert row_a["d1_date"] == pd.Timestamp("2024-01-03")
+    assert row_a["d1_observed_date"] == pd.Timestamp("2024-01-04")
+    assert row_a["d1_suspended"] is True or row_a["d1_suspended"] == 1
+    assert row_a["d1_tradable"] is False or row_a["d1_tradable"] == 0
+    assert np.isnan(row_a["d1_open"])
+
+    # D+2 for Stock A is Jan 4 -> tradable!
+    assert row_a["d2_date"] == pd.Timestamp("2024-01-04")
+    assert row_a["d2_suspended"] is False or row_a["d2_suspended"] == 0
+    assert row_a["d2_tradable"] is True or row_a["d2_tradable"] == 1
+    assert row_a["d2_open"] == 120.0
+
+    # Stock B on Jan 2:
+    # Market D+1 is Jan 3, bar exists but volume == 0 (halt).
+    # d1_suspended must be True, d1_tradable must be False.
+    row_b = out.iloc[1]
+    assert row_b["d1_date"] == pd.Timestamp("2024-01-03")
+    assert row_b["d1_suspended"] is True or row_b["d1_suspended"] == 1
+    assert row_b["d1_tradable"] is False or row_b["d1_tradable"] == 0
+
+    # D+2 for Stock B is Jan 4 with volume > 0 -> tradable!
+    assert row_b["d2_date"] == pd.Timestamp("2024-01-04")
+    assert row_b["d2_suspended"] is False or row_b["d2_suspended"] == 0
+    assert row_b["d2_tradable"] is True or row_b["d2_tradable"] == 1
+    assert row_b["d2_open"] == 55.0
