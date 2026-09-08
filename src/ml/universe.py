@@ -11,6 +11,7 @@ import pandas as pd
 __all__ = [
     "BAND_2_15_SCREEN",
     "BAND_5_15_HIGHVALUE_SCREEN",
+    "COST_AWARE_SCREEN",
     "OPERATOR_LEGACY_SCREEN",
     "SCREEN_REGISTRY",
     "ScreenConfig",
@@ -28,6 +29,7 @@ class ScreenConfig:
     min_market_cap_100m: float = 0.0
     exclude_ceiling: bool = True
     require_index_up: bool = False
+    max_tick_cost_bp: float | None = None
 
     def __post_init__(self) -> None:
         lower = float(self.change_lower)
@@ -39,6 +41,8 @@ class ScreenConfig:
             v = float(getattr(self, name))
             if not v >= 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {getattr(self, name)!r}")
+        if self.max_tick_cost_bp is not None and not float(self.max_tick_cost_bp) > 0.0:
+            raise ValueError(f"max_tick_cost_bp must be > 0 when set, got {self.max_tick_cost_bp!r}")
 
 
 OPERATOR_LEGACY_SCREEN: ScreenConfig = ScreenConfig(
@@ -67,6 +71,15 @@ BAND_5_15_HIGHVALUE_SCREEN: ScreenConfig = ScreenConfig(
     min_trade_value_100m=3000.0,
     min_market_cap_100m=500.0,
     exclude_ceiling=True,
+)
+
+COST_AWARE_SCREEN: ScreenConfig = ScreenConfig(
+    change_lower=0.02,
+    change_upper=0.10,
+    min_trade_value_100m=100.0,
+    min_market_cap_100m=500.0,
+    exclude_ceiling=True,
+    max_tick_cost_bp=7.5,
 )
 
 SCREEN_REGISTRY: dict[str, ScreenConfig] = {
@@ -147,16 +160,31 @@ def build_universe_panel(
     keep = np.isfinite(chg) & (chg >= float(screen.change_lower))
     if screen.change_upper is not None:
         keep &= np.isfinite(chg) & (chg <= float(screen.change_upper))
-    if "trade_value_100m" in filt.columns:
-        tvf = pd.to_numeric(filt["trade_value_100m"], errors="coerce").to_numpy(dtype=np.float64)
+    # tv_clean/mc_clean 우선: 원천 NaN을 복원한 확정 컬럼이 있으면 그것을 쓴다.
+    tv_col = "tv_clean" if "tv_clean" in filt.columns else "trade_value_100m"
+    if tv_col in filt.columns:
+        tvf = pd.to_numeric(filt[tv_col], errors="coerce").to_numpy(dtype=np.float64)
         keep &= np.isfinite(tvf) & (tvf >= float(screen.min_trade_value_100m))
     elif float(screen.min_trade_value_100m) > 0.0:
         keep &= False
-    if "market_cap_100m" in filt.columns:
-        mcf = pd.to_numeric(filt["market_cap_100m"], errors="coerce").to_numpy(dtype=np.float64)
+    mc_col = "mc_clean" if "mc_clean" in filt.columns else "market_cap_100m"
+    if mc_col in filt.columns:
+        mcf = pd.to_numeric(filt[mc_col], errors="coerce").to_numpy(dtype=np.float64)
         keep &= np.isfinite(mcf) & (mcf >= float(screen.min_market_cap_100m))
     elif float(screen.min_market_cap_100m) > 0.0:
         keep &= False
+    if screen.max_tick_cost_bp is not None:
+        if "tick_cost_bp" not in filt.columns:
+            raise ValueError(
+                "screen.max_tick_cost_bp requires a 'tick_cost_bp' column on price_history_df "
+                "(attach it via src.data.panel_integrity.prepare_price_panel before calling "
+                "build_universe_panel)"
+            )
+        tcb = pd.to_numeric(filt["tick_cost_bp"], errors="coerce").to_numpy(dtype=np.float64)
+        n_tick_cost_excluded = int((~(np.isfinite(tcb) & (tcb <= float(screen.max_tick_cost_bp)))).sum())
+        keep &= np.isfinite(tcb) & (tcb <= float(screen.max_tick_cost_bp))
+    else:
+        n_tick_cost_excluded = 0
     if bool(screen.require_index_up):
         idx_cols = [c for c in ("kospi_pct", "kosdaq_pct") if c in filt.columns]
         if not idx_cols:
@@ -185,6 +213,7 @@ def build_universe_panel(
         "n_raw": int(n_raw),
         "n_screened": len(panel),
         "n_ceiling_excluded": int(n_ceiling_excluded),
+        "n_tick_cost_excluded": int(n_tick_cost_excluded),
         "n_days": int(n_days),
         "per_day": float(len(panel) / n_days) if n_days else 0.0,
         "screen": dataclasses.asdict(screen),
@@ -263,7 +292,17 @@ def apply_screen_mask(
     universe), this filters a panel that is already survivorship-limited to
     what the legacy operator screen logged -- it can narrow the pool but can
     never recover candidates the legacy screen excluded (see R8 caveat).
+    A screen carrying max_tick_cost_bp is rejected here: the cap needs full
+    price_history reconstruction via build_universe_panel.
     """
+    # 틱비용 상한은 저널된 패널에서 복원 불가이므로 구조적으로 거부한다.
+    if screen.max_tick_cost_bp is not None:
+        raise ValueError(
+            "apply_screen_mask cannot apply max_tick_cost_bp: it narrows an already "
+            "journaled/restricted trade-log panel and cannot recover candidates the historical "
+            "screen never logged -- use build_universe_panel (full price_history reconstruction) "
+            "for any screen carrying a tick-cost cap"
+        )
     if change_col not in df.columns:
         raise ValueError(f"df is missing change_col {change_col!r}")
     chg = pd.to_numeric(df[change_col], errors="coerce").to_numpy(dtype=np.float64) / float(change_scale)
