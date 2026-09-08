@@ -28,7 +28,7 @@ from src.ml.dataset import build_ml_dataset
 from src.ml.metrics import mean_group_rank_ic
 from src.ml.oof import purged_oof_predict
 from src.ml.robust_eval import CombinatorialPurgedCV
-from src.ml.universe import ScreenConfig, build_universe_panel, screen_baseline_stats
+from src.ml.universe import COST_AWARE_SCREEN, ScreenConfig, build_universe_panel, screen_baseline_stats
 from src.ml.validation import cpcv_path_evidence
 from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO
 
@@ -62,6 +62,7 @@ DEFAULT_RESEARCH_SCREENS: dict[str, ScreenConfig] = {
     "modest_up": ScreenConfig(0.02, 0.10, 100.0, 500.0),
     "strong_up_capped": ScreenConfig(0.08, 0.20, 100.0, 500.0),
     "index_up_liq": ScreenConfig(-1.0, None, 100.0, 500.0, exclude_ceiling=True, require_index_up=True),
+    "cost_aware": COST_AWARE_SCREEN,
 }
 
 
