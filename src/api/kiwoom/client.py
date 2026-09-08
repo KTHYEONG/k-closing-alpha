@@ -24,6 +24,7 @@ class KiwoomApiClient:
         self.base_url = base_url or getattr(settings, "KIWOM_BASE_URL", "") or "https://api.kiwoom.com"
         self.token: str | None = None
         self._rate_limiters: dict[str, AsyncRateLimiter] = {}
+        self._token_lock: asyncio.Lock | None = None
 
     def _limiter_for(self, api_id: str) -> AsyncRateLimiter:
         if api_id not in self._rate_limiters:
@@ -33,21 +34,26 @@ class KiwoomApiClient:
     async def ensure_token(self, session) -> str:
         if self.token:
             return self.token
-        payload = {"grant_type": "client_credentials", "appkey": self.app_key, "secretkey": self.secret_key}
-        raw = session.post(
-            f"{self.base_url}/oauth2/token",
-            headers={"Content-Type": "application/json;charset=UTF-8"},
-            json=payload,
-        )
-        if inspect.isawaitable(raw):
-            raw = await raw
-        async with raw as resp:
-            body = await resp.json()
-        token = str(body.get("token", ""))
-        if not token:
-            raise RuntimeError(f"Kiwoom token issuance failed: {body}")
-        self.token = token
-        return token
+        if self._token_lock is None:
+            self._token_lock = asyncio.Lock()
+        async with self._token_lock:
+            if self.token:
+                return self.token
+            payload = {"grant_type": "client_credentials", "appkey": self.app_key, "secretkey": self.secret_key}
+            raw = session.post(
+                f"{self.base_url}/oauth2/token",
+                headers={"Content-Type": "application/json;charset=UTF-8"},
+                json=payload,
+            )
+            if inspect.isawaitable(raw):
+                raw = await raw
+            async with raw as resp:
+                body = await resp.json()
+            token = str(body.get("token", ""))
+            if not token:
+                raise RuntimeError(f"Kiwoom token issuance failed: {body}")
+            self.token = token
+            return token
 
     async def _post_tr(
         self,
@@ -96,6 +102,40 @@ class KiwoomApiClient:
             return data, resp_headers
         return data, resp_headers
 
+    async def get_fluctuation_ranking(self, session, *, rate_min_pct: float, rate_max_pct: float, market_type: str = "000", max_pages: int = 5, stex_tp: str = "3") -> dict:
+        cont_yn, next_key = "N", ""
+        collected: list[dict] = []
+        try:
+            for _ in range(max(1, int(max_pages))):
+                data, resp_headers = await self._post_tr(
+                    session, "ka10027", "/api/dostk/rkinfo",
+                    {"mrkt_tp": str(market_type), "stex_tp": str(stex_tp)},
+                    cont_yn=cont_yn, next_key=next_key,
+                )
+                if data.get("return_code") != 0:
+                    return {"rt_cd": "1", "msg1": str(data.get("return_msg", "")), "output": [], "vendor": "kiwoom"}
+                rows = data.get("pred_pre_flu_rt_upper") or []
+                page_rates: list[float] = []
+                for r in rows:
+                    try:
+                        rate = float(str(r.get("flu_rt", "")).strip())
+                    except (ValueError, TypeError):
+                        continue
+                    page_rates.append(rate)
+                    if rate < float(rate_min_pct) or rate > float(rate_max_pct):
+                        continue
+                    collected.append(dict(r))
+                cont_yn = str(resp_headers.get("cont-yn", "N") or "N")
+                next_key = str(resp_headers.get("next-key", "") or "")
+                if cont_yn != "Y":
+                    break
+                if page_rates and min(page_rates) < float(rate_min_pct):
+                    break
+        except Exception as e:
+            logger.warning("Kiwoom fluctuation ranking failed: %s", e)
+            return {"rt_cd": "1", "msg1": str(e), "output": [], "vendor": "kiwoom"}
+        return {"rt_cd": "0", "output": collected, "vendor": "kiwoom"}
+
     async def get_tick_chart(self, session, code: str, target_date: str, max_pages: int | None = None) -> dict:
         ymd = str(target_date).replace("-", "")
         page_budget = int(max_pages) if max_pages is not None else int(getattr(settings, "KIWOM_TICK_MAX_PAGES", 30) or 30)
@@ -133,3 +173,59 @@ class KiwoomApiClient:
         if truncated:
             logger.warning("[DATA] Kiwoom tick page budget exhausted code=%s pages=%d", code, page_budget)
         return {"rt_cd": "0", "output2": filtered, "vendor": "kiwoom", "truncated": truncated}
+
+    async def get_nxt_premarket_chart(self, session, code: str, target_date: str) -> dict:
+        ymd = str(target_date).replace("-", "")
+        nx_code = f"{str(code).split('_')[0].zfill(6)}_NX"
+        try:
+            data, _headers = await self._post_tr(
+                session, "ka10080", "/api/dostk/chart",
+                {"stk_cd": nx_code, "base_dt": ymd, "tic_scope": "1", "upd_stkpc_tp": "0"},
+            )
+        except Exception as e:
+            logger.warning("Kiwoom NXT premarket chart failed code=%s: %s", code, e)
+            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "kiwoom"}
+        if data.get("return_code") != 0:
+            return {"rt_cd": "1", "msg1": str(data.get("return_msg", "")), "output2": [], "vendor": "kiwoom"}
+        rows = data.get("stk_min_pole_chart_qry") or []
+        kept: list[dict] = []
+        for r in rows:
+            cntr_tm = str(r.get("cntr_tm", ""))
+            if not cntr_tm.startswith(ymd):
+                continue
+            try:
+                hms = int(cntr_tm[8:14])
+            except (ValueError, TypeError):
+                continue
+            if hms < 80000 or hms > 85000:
+                continue
+            kept.append(dict(r))
+        return {"rt_cd": "0", "output2": kept, "vendor": "kiwoom"}
+
+    async def get_nxt_minute_chart(self, session, code: str, target_date: str) -> dict:
+        ymd = str(target_date).replace("-", "")
+        nx_code = f"{str(code).split('_')[0].zfill(6)}_NX"
+        try:
+            data, _headers = await self._post_tr(
+                session, "ka10080", "/api/dostk/chart",
+                {"stk_cd": nx_code, "base_dt": ymd, "tic_scope": "1", "upd_stkpc_tp": "0"},
+            )
+        except Exception as e:
+            logger.warning("Kiwoom NXT minute chart failed code=%s: %s", code, e)
+            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "kiwoom"}
+        if data.get("return_code") != 0:
+            return {"rt_cd": "1", "msg1": str(data.get("return_msg", "")), "output2": [], "vendor": "kiwoom"}
+        rows = data.get("stk_min_pole_chart_qry") or []
+        kept: list[dict] = []
+        for r in rows:
+            cntr_tm = str(r.get("cntr_tm", ""))
+            if not cntr_tm.startswith(ymd):
+                continue
+            try:
+                hms = int(cntr_tm[8:14])
+            except (ValueError, TypeError):
+                continue
+            if hms < 154000 or hms > 200000:
+                continue
+            kept.append(dict(r))
+        return {"rt_cd": "0", "output2": kept, "vendor": "kiwoom"}

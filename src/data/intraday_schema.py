@@ -41,7 +41,7 @@ CANONICAL_TICK_COLUMNS: tuple[str, ...] = (
     "vendor",
 )
 
-_BAR_VENDORS: tuple[str, ...] = ("kis", "ls")
+_BAR_VENDORS: tuple[str, ...] = ("kis", "ls", "kiwoom")
 
 _KIS_BAR_REQUIRED: tuple[str, ...] = (
     "stck_cntg_hour",
@@ -62,6 +62,16 @@ _LS_BAR_REQUIRED: tuple[str, ...] = (
     "jdiff_vol",
     "value",
 )
+
+_KIWOOM_BAR_REQUIRED: tuple[str, ...] = (
+    "cntr_tm",
+    "cur_prc",
+    "open_pric",
+    "high_pric",
+    "low_pric",
+    "trde_qty",
+)
+
 
 _KIS_TICK_REQUIRED: tuple[str, ...] = (
     "stck_cntg_hour",
@@ -133,8 +143,8 @@ def _require_columns(df: pd.DataFrame, required: tuple[str, ...], vendor: str) -
 
 def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbol: str) -> pd.DataFrame:
     """벤더 원천 분봉 프레임을 정규 바 스키마로 변환한다."""
-    if vendor not in ("kis", "ls"):
-        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls')")
+    if vendor not in ("kis", "ls", "kiwoom"):
+        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls', 'kiwoom')")
     if df is None or len(df) == 0:
         return _empty_bar_frame()
     code = str(symbol).zfill(6)
@@ -164,7 +174,7 @@ def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbo
                 code,
             )
         value_krw = diff.clip(lower=0)
-    else:
+    elif vendor == "ls":
         _require_columns(df, _LS_BAR_REQUIRED, vendor)
         work = pd.DataFrame(
             {
@@ -177,6 +187,19 @@ def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbo
             }
         )
         value_krw = pd.to_numeric(df["value"], errors="coerce") * LS_VALUE_UNIT_KRW
+    elif vendor == "kiwoom":
+        _require_columns(df, _KIWOOM_BAR_REQUIRED, vendor)
+        work = pd.DataFrame(
+            {
+                "ts_hms": pd.to_numeric(df["cntr_tm"].astype(str).str[-6:], errors="coerce"),
+                "open": pd.to_numeric(df["open_pric"].astype(str), errors="coerce").abs(),
+                "high": pd.to_numeric(df["high_pric"].astype(str), errors="coerce").abs(),
+                "low": pd.to_numeric(df["low_pric"].astype(str), errors="coerce").abs(),
+                "close": pd.to_numeric(df["cur_prc"].astype(str), errors="coerce").abs(),
+                "volume": pd.to_numeric(df["trde_qty"].astype(str), errors="coerce").abs(),
+            }
+        )
+        value_krw = work["close"] * work["volume"]
 
     out = pd.DataFrame(
         {
@@ -208,6 +231,8 @@ def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbo
             "vendor": "str",
         }
     )
+    if vendor == "kiwoom":
+        out["has_trade"] = out["has_trade"].astype(object)
     return out[list(CANONICAL_BAR_COLUMNS)]
 
 
@@ -248,8 +273,8 @@ def normalize_tick_frame(
     elif vendor == "kiwoom":
         _require_columns(df, _KIWOOM_TICK_REQUIRED, vendor)
         ts_hms = pd.to_numeric(df["cntr_tm"].astype(str).str[-6:], errors="coerce")
-        price = pd.to_numeric(df["cur_prc"].astype(str), errors="coerce")
-        volume = pd.to_numeric(df["trde_qty"].astype(str), errors="coerce")
+        price = pd.to_numeric(df["cur_prc"].astype(str), errors="coerce").abs()
+        volume = pd.to_numeric(df["trde_qty"].astype(str), errors="coerce").abs()
         trade_strength = pd.Series(pd.NA, index=df.index, dtype="Float32")
         ask1 = pd.Series(pd.NA, index=df.index, dtype="Int32")
         bid1 = pd.Series(pd.NA, index=df.index, dtype="Int32")
