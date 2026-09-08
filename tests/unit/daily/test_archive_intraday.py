@@ -268,3 +268,71 @@ def test_run_intraday_archive_no_kiwoom_client_when_key_absent(monkeypatch) -> N
     assert captured.get("kiwoom_client_passed") is None
     assert "kiwoom_ctor_called" not in captured
 
+
+def test_run_intraday_archive_passes_kiwoom_to_nxt_collector(monkeypatch) -> None:
+    from unittest.mock import AsyncMock, patch
+    import pandas as pd
+    from src import settings
+    from src.daily.archive_intraday import run_intraday_archive
+
+    monkeypatch.setattr(settings, "KIWOM_APP_KEY", "mock_kw_key")
+    monkeypatch.setattr(settings, "LS_APP_KEY", "mock_ls_key")
+
+    with (
+        patch("src.daily.archive_intraday._archive_target_codes", return_value=["005930"]),
+        patch("src.daily.archive_intraday.collect_intraday_bars", new_callable=AsyncMock) as mock_bars,
+        patch("src.daily.archive_intraday.collect_nxt_aftermarket_bars", new_callable=AsyncMock) as mock_nxt,
+        patch("src.daily.archive_intraday.collect_nxt_premarket_bars", new_callable=AsyncMock) as mock_nxt_pre,
+        patch("src.daily.archive_intraday.collect_intraday_trade_ticks", new_callable=AsyncMock) as mock_ticks,
+        patch("src.daily.archive_intraday.write_intraday_partition", return_value=5),
+        patch("src.daily.archive_intraday.write_tick_partition", return_value=10),
+        patch("src.api.kis_client.KisApiClient.ensure_token", new_callable=AsyncMock),
+    ):
+        mock_bars.return_value = pd.DataFrame()
+        mock_nxt.return_value = pd.DataFrame()
+        mock_nxt_pre.return_value = pd.DataFrame()
+        mock_ticks.return_value = pd.DataFrame()
+
+        res = run_intraday_archive("2026-09-04")
+        assert res == (5, 10, 10)
+        assert mock_nxt.call_count == 1
+        _, kwargs = mock_nxt.call_args
+        assert kwargs.get("kiwoom_client") is not None
+
+
+
+def test_run_intraday_archive_collects_and_writes_premarket_partition(monkeypatch) -> None:
+    from unittest.mock import AsyncMock, patch
+    import pandas as pd
+    from src import settings
+    from src.config.market_session import INTRADAY_SESSION_NXT_PREMARKET
+    from src.daily.archive_intraday import run_intraday_archive
+
+    monkeypatch.setattr(settings, "KIWOM_APP_KEY", "mock_kw_key")
+    monkeypatch.setattr(settings, "LS_APP_KEY", "mock_ls_key")
+
+    partitions_written = []
+
+    def fake_write_partition(df, interval, date, session):
+        partitions_written.append(session)
+        return len(df)
+
+    with (
+        patch("src.daily.archive_intraday._archive_target_codes", return_value=["005930"]),
+        patch("src.daily.archive_intraday.collect_intraday_bars", new_callable=AsyncMock) as mock_bars,
+        patch("src.daily.archive_intraday.collect_nxt_aftermarket_bars", new_callable=AsyncMock) as mock_nxt_after,
+        patch("src.daily.archive_intraday.collect_nxt_premarket_bars", new_callable=AsyncMock) as mock_nxt_pre,
+        patch("src.daily.archive_intraday.collect_intraday_trade_ticks", new_callable=AsyncMock) as mock_ticks,
+        patch("src.daily.archive_intraday.write_intraday_partition", side_effect=fake_write_partition),
+        patch("src.daily.archive_intraday.write_tick_partition", return_value=10),
+        patch("src.api.kis_client.KisApiClient.ensure_token", new_callable=AsyncMock),
+    ):
+        mock_bars.return_value = pd.DataFrame([{"dummy": 1}] * 5)
+        mock_nxt_after.return_value = pd.DataFrame([{"dummy": 1}] * 3)
+        mock_nxt_pre.return_value = pd.DataFrame([{"dummy": 1}] * 2)
+        mock_ticks.return_value = pd.DataFrame([{"dummy": 1}] * 10)
+
+        res = run_intraday_archive("2026-09-04")
+        assert res == (5, 5, 10)
+        assert INTRADAY_SESSION_NXT_PREMARKET in partitions_written
+        assert mock_nxt_pre.call_count == 1
