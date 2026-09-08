@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ML_DATASET_INTEGRITY",
+      "date": "2026-09-08",
+      "adr_id": "ADR_20260908_ML_DATASET_INTEGRITY",
+      "domain": "ml",
+      "title": "패널 무결성 격리 + PIT 비용 라벨",
+      "why": "price_history의 daily_change_pct 16.28% 단위혼재와 비-PIT 틱표가 배선된 스크린/시나리오/라벨 경로를 오염",
+      "resolution": "src/data/panel_integrity.py 신설: 4개 로드경계에서 fail-closed 정규화(chg_ratio 단일원천, PIT tick_cost_bp), cost_model/decision_labels PIT 옵트인 배선",
+      "impact": "855 passed/1 failed(기존 R19)/9 skipped, ruff·mypy clean; operator_legacy 스크린 model-free gross 부호 역전(+3.41bp→-3.05bp) 교정"
+    },
+    {
       "task_id": "tick_collection_throughput_optimization",
       "date": "2026-09-08",
       "adr_id": "ADR_20260908_tick_collection_throughput_optimization",

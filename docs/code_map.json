@@ -194,6 +194,9 @@
   "src/data/orderbook_store.py": {
     "testing": "tests/unit/data/test_orderbook_store.py"
   },
+  "src/data/panel_integrity.py": {
+    "testing": "tests/unit/data/test_panel_integrity.py"
+  },
   "src/data/parquet_codec.py": {
     "testing": "tests/unit/data/test_parquet_codec.py"
   },
