@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "COSTAWARE_TOPK_BACKTEST",
+      "date": "2026-09-08",
+      "adr_id": "ADR_20260908_COSTAWARE_TOPK_BACKTEST",
+      "domain": "ml",
+      "title": "COST_AWARE Top-K 러너 배선 + 레짐 게이트",
+      "why": "KCA_TOPK_COSTAWARE_001이 미배선 상태였고 틱개편(2023-01-25) 전후 레짐을 풀링하면 엣지가 은폐됨",
+      "resolution": "src/ml/costaware_topk.py 신설: PIT tick_cost_bp 오름차순 top-K, pre/post/full 레짐 분리 통계, 3틱 비용 스트레스, retrain.py --cost-aware-backtest 배선",
+      "impact": "878 passed/1 failed(기존 R19)/9 skipped, ruff·mypy clean; 실측 post_reform +18.75bp t=3.08 median+5.79 PASS, full_history +6.92bp t=1.33 INSUFFICIENT_COVERAGE로 정확히 구분"
+    },
+    {
       "task_id": "ML_DATASET_INTEGRITY",
       "date": "2026-09-08",
       "adr_id": "ADR_20260908_ML_DATASET_INTEGRITY",

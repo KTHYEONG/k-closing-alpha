@@ -82,3 +82,7 @@ configs/chart_pass_cache.json
 
 # Temporary trading API files
 .tmp_open_trading_api/
+
+# AI Experimentation & Scratch directories
+scratch/
+tmp/

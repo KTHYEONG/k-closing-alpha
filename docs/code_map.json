@@ -224,6 +224,9 @@
   "src/ml/champion.py": {
     "testing": "tests/unit/ml/test_champion.py"
   },
+  "src/ml/costaware_topk.py": {
+    "testing": "tests/unit/ml/test_costaware_topk.py"
+  },
   "src/ml/dataset.py": {
     "testing": "tests/unit/ml/test_dataset.py"
   },
