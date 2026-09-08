@@ -467,3 +467,61 @@ def test_retrain_universe_research_prepares_price_panel(tmp_path, monkeypatch) -
     assert np.isclose(float(seen["max_abs_chg"]), 0.08)
 
 
+def test_retrain_cost_aware_backtest_mode_dispatches_and_skips_champion(tmp_path, monkeypatch) -> None:
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.retrain as mod
+
+    ph_path = tmp_path / "price_history.parquet"
+    pd.DataFrame({
+        "date": pd.to_datetime(["2023-02-01"]), "symbol": ["000001"], "open": [100.0], "high": [101.0],
+        "low": [99.0], "close": [100.0], "prev_close": [99.0], "volume": [1000.0],
+        "market_cap_100m": [900.0], "trade_value_100m": [300.0], "market": ["KOSPI"],
+    }).to_parquet(ph_path)
+    trade_path = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2023-02-02"], "종목코드": ["000001"], "(종가)": [100.0],
+                  "(수익률, %)": [1.0], "(매수 가격)": [100.0], "(매도 가격)": [101.0]}).to_parquet(trade_path)
+
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+
+    seen: dict[str, object] = {}
+
+    def _fake_run(ph, market_dates, d_to_idx, **kwargs):
+        seen["called"] = True
+        seen["rows"] = len(ph)
+        from src.ml.costaware_topk import CostAwareTopKReport
+        return CostAwareTopKReport(
+            strategy_id="KCA-TOPK-COSTAWARE-001", top_k=3, universe={}, cost={}, date_min="2023-02-01",
+            date_max="2023-02-01", regimes={}, cost_stress=[], verdict="INSUFFICIENT_COVERAGE", verdict_reasons=["synthetic"],
+        )
+
+    def _boom(*a, **k):
+        raise AssertionError("champion training must not run in --cost-aware-backtest mode")
+
+    monkeypatch.setattr(mod, "run_cost_aware_topk_backtest", _fake_run)
+    monkeypatch.setattr(mod, "train_tuned_champion_bundle", _boom)
+    monkeypatch.setattr(mod, "train_champion_bundle", _boom)
+
+    mod.main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+              "--no-restore-panel", "--cost-aware-backtest", "--export-dir", str(tmp_path)])
+
+    assert seen.get("called") is True
+    assert seen["rows"] == 1
+    assert (tmp_path / "costaware_topk_report.parquet").exists()
+
+
+def test_retrain_cost_aware_backtest_missing_price_history_raises(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import pytest
+
+    import src.ml.retrain as mod
+
+    trade_path = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2023-01-03"], "종목코드": ["000001"], "(종가)": [100.0],
+                  "(수익률, %)": [1.0], "(매수 가격)": [100.0], "(매도 가격)": [101.0]}).to_parquet(trade_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "nope.parquet")
+
+    with pytest.raises(ValueError, match="price_history not found"):
+        mod.main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+                  "--no-restore-panel", "--cost-aware-backtest", "--export-dir", str(tmp_path)])
