@@ -84,7 +84,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
     async def _run() -> tuple[int, int, int]:
         client = KisApiClient()
         ls_client = LsApiClient() if getattr(settings, 'LS_APP_KEY', None) else None
-        kiwoom_client = KiwoomApiClient() if getattr(settings, 'KIWOM_APP_KEY', None) else None
+        kiwoom_client = KiwoomApiClient() if (getattr(settings, 'KIWOM_APP_KEY', None) or getattr(settings, 'KIWOOM_APP_KEY', None)) else None
         async with client.create_session() as session:
             await client.ensure_token(session)
             bars = await collect_intraday_bars(client, session, codes, snap_date, bar_interval_minutes, ls_client=ls_client)
