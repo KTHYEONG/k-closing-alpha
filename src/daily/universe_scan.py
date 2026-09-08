@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import pandas as pd
 
@@ -15,6 +16,7 @@ __all__ = [
     "UNIVERSE_SCAN_SCENARIO_TAG",
     "archive_universe_snapshot",
     "collect_universe_scan",
+    "map_kiwoom_ranking_rows_to_archive_frame",
     "map_ranking_rows_to_archive_frame",
 ]
 
@@ -81,6 +83,45 @@ def map_ranking_rows_to_archive_frame(
     return df
 
 
+def map_kiwoom_ranking_rows_to_archive_frame(
+    rows: list[dict], snapshot_date: str, snapshot_timestamp: pd.Timestamp
+) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=_ARCHIVE_COLUMNS)
+    records: list[dict] = []
+    for row in rows:
+        code_raw = str(row.get("stk_cd", "") or "").split("_")[0].strip()
+        code = code_raw.zfill(6) if code_raw else float("nan")
+        name_raw = row.get("stk_nm", None)
+        name = name_raw if name_raw is not None and str(name_raw).strip() != "" else float("nan")
+        close = _to_float(row.get("cur_prc", None))
+        pred_pre = _to_float(row.get("pred_pre", None))
+        prev_close = close - pred_pre
+        chg = _to_float(row.get("flu_rt", None))
+        volume = _to_float(row.get("now_trde_qty", None))
+        tr_amount = round(close * volume / 1e8, 4)
+        market_cap = float("nan")
+        records.append(
+            {
+                "스냅샷_날짜": snapshot_date,
+                "종목코드": code,
+                "종목명": name,
+                "종가": close,
+                "전일종가": prev_close,
+                "등락률": chg,
+                "거래량": volume,
+                "거래대금": tr_amount,
+                "시가총액": market_cap,
+                "시나리오": UNIVERSE_SCAN_SCENARIO_TAG,
+                "snapshot_timestamp": snapshot_timestamp,
+            }
+        )
+    df = pd.DataFrame(records, columns=_ARCHIVE_COLUMNS)
+    for col in ("종가", "전일종가", "등락률", "거래량", "거래대금", "시가총액"):
+        df[col] = df[col].astype("float64")
+    return df
+
+
 async def collect_universe_scan(
     client,
     session,
@@ -88,7 +129,24 @@ async def collect_universe_scan(
     snapshot_timestamp: pd.Timestamp,
     *,
     universe: UniverseSpec = DEFAULT_UNIVERSE,
+    kiwoom_client: Any | None = None,
 ) -> pd.DataFrame:
+    if kiwoom_client is not None:
+        try:
+            kw_res = await kiwoom_client.get_fluctuation_ranking(
+                session,
+                rate_min_pct=universe.chg_min * 100.0,
+                rate_max_pct=universe.chg_max * 100.0,
+            )
+        except Exception as e:
+            logger.warning("Universe scan kiwoom ranking failed, falling back to KIS: %s", e)
+            kw_res = {"rt_cd": "1", "output": []}
+        if kw_res.get("rt_cd") == "0":
+            return map_kiwoom_ranking_rows_to_archive_frame(kw_res.get("output") or [], snapshot_date, snapshot_timestamp)
+        logger.warning(
+            "Universe scan kiwoom ranking failed rt_cd=%s, falling back to KIS",
+            kw_res.get("rt_cd"),
+        )
     res = await client.get_fluctuation_ranking(
         session,
         rate_min_pct=universe.chg_min * 100.0,

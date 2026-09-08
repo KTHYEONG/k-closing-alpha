@@ -14,10 +14,12 @@ from src.backfill.intraday.collector import (
     collect_intraday_bars,
     collect_intraday_trade_ticks,
     collect_nxt_aftermarket_bars,
+    collect_nxt_premarket_bars,
 )
 from src.config.market_session import (
     DEFAULT_BAR_INTERVAL_MINUTES,
     INTRADAY_SESSION_NXT_AFTERMARKET,
+    INTRADAY_SESSION_NXT_PREMARKET,
     INTRADAY_SESSION_REGULAR,
 )
 from src.daily import archive
@@ -85,9 +87,12 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
         async with client.create_session() as session:
             await client.ensure_token(session)
             bars = await collect_intraday_bars(client, session, codes, snap_date, bar_interval_minutes, ls_client=ls_client)
-            nxt = await collect_nxt_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes)
+            nxt_after = await collect_nxt_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes, kiwoom_client=kiwoom_client)
+            nxt_pre = await collect_nxt_premarket_bars(client, session, codes, snap_date, bar_interval_minutes, kiwoom_client=kiwoom_client)
             n_bars = write_intraday_partition(bars, bar_interval_minutes, snap_date, INTRADAY_SESSION_REGULAR)
-            n_nxt = write_intraday_partition(nxt, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_AFTERMARKET)
+            n_nxt_after = write_intraday_partition(nxt_after, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_AFTERMARKET)
+            n_nxt_pre = write_intraday_partition(nxt_pre, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_PREMARKET)
+            n_nxt = n_nxt_after + n_nxt_pre
             ticks = await collect_intraday_trade_ticks(client, session, codes, snap_date, ls_client=ls_client, kiwoom_client=kiwoom_client)
             n_ticks = write_tick_partition(ticks, snap_date, INTRADAY_SESSION_REGULAR)
             return (n_bars, n_nxt, n_ticks)

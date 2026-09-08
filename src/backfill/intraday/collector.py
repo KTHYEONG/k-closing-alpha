@@ -16,6 +16,8 @@ from src.config.market_session import (
     NXT_AFTERMARKET_HOUR_CEIL,
     NXT_AFTERMARKET_HOUR_FLOOR,
     NXT_MARKET_DIV_CODE,
+    NXT_PREMARKET_HOUR_CEIL,
+    NXT_PREMARKET_HOUR_FLOOR,
 )
 from src.data.intraday_schema import normalize_bar_frame, normalize_tick_frame
 
@@ -162,12 +164,106 @@ async def collect_intraday_bars(client, session, stock_codes: list[str], snapsho
     return pd.concat(frames, ignore_index=True)
 
 
-async def collect_nxt_aftermarket_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
+async def collect_nxt_aftermarket_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, kiwoom_client: Any | None = None) -> pd.DataFrame:
     """NXT 애프터마켓(15:40-20:00) 전체를 1분봉 연속 시계열로 수집한다. 미상장은 조용히 스킵."""
-    return await _collect_bars(
-        client, session, stock_codes, snapshot_date, bar_interval_minutes,
-        NXT_AFTERMARKET_HOUR_CEIL, NXT_AFTERMARKET_HOUR_FLOOR, NXT_MARKET_DIV_CODE,
-    )
+    if kiwoom_client is None:
+        return await _collect_bars(
+            client, session, stock_codes, snapshot_date, bar_interval_minutes,
+            NXT_AFTERMARKET_HOUR_CEIL, NXT_AFTERMARKET_HOUR_FLOOR, NXT_MARKET_DIV_CODE,
+        )
+    if not stock_codes:
+        return pd.DataFrame()
+    sem = asyncio.Semaphore(10)
+
+    async def _fetch_one(code: str) -> pd.DataFrame:
+        async with sem:
+            try:
+                kw_res = await kiwoom_client.get_nxt_minute_chart(session, code, snapshot_date)
+            except Exception as e:
+                logger.warning("Kiwoom NXT minute chart failed code=%s: %s", code, e)
+                kw_res = {"rt_cd": "1", "output2": []}
+            if kw_res.get("rt_cd") == "0" and (kw_res.get("output2") or []):
+                rows = kw_res.get("output2") or []
+                vendor = str(kw_res.get("vendor", "kiwoom") or "kiwoom")
+                try:
+                    return normalize_bar_frame(pd.DataFrame(rows), vendor, snapshot_date, code)
+                except Exception as e:
+                    logger.warning("[DATA] Kiwoom NXT bar normalize failed code=%s: %s", code, e)
+                    return pd.DataFrame()
+            if kw_res.get("rt_cd") == "0":
+                return pd.DataFrame()
+            try:
+                res = await client.get_intraday_minute_chart(
+                    session, code, bar_interval_minutes=bar_interval_minutes,
+                    end_hour=NXT_AFTERMARKET_HOUR_CEIL, floor_hour=NXT_AFTERMARKET_HOUR_FLOOR,
+                    market_div_code=NXT_MARKET_DIV_CODE,
+                )
+            except Exception as e:
+                logger.warning("Intraday bars failed code=%s: %s", code, e)
+                return pd.DataFrame()
+            if res.get("rt_cd") != "0":
+                return pd.DataFrame()
+            rows = res.get("output2") or []
+            if not rows:
+                return pd.DataFrame()
+            return _canonical_kis_bars(rows, snapshot_date, code)
+
+    results = await asyncio.gather(*[_fetch_one(c) for c in stock_codes])
+    frames = [d for d in results if d is not None and not d.empty]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+async def collect_nxt_premarket_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, kiwoom_client: Any | None = None) -> pd.DataFrame:
+    """NXT 프리마켓(08:00-08:50) 전체를 1분봉 연속 시계열로 수집한다. 미상장은 조용히 스킵."""
+    if kiwoom_client is None:
+        return await _collect_bars(
+            client, session, stock_codes, snapshot_date, bar_interval_minutes,
+            NXT_PREMARKET_HOUR_CEIL, NXT_PREMARKET_HOUR_FLOOR, NXT_MARKET_DIV_CODE,
+        )
+    if not stock_codes:
+        return pd.DataFrame()
+    sem = asyncio.Semaphore(10)
+
+    async def _fetch_one(code: str) -> pd.DataFrame:
+        async with sem:
+            try:
+                kw_res = await kiwoom_client.get_nxt_premarket_chart(session, code, snapshot_date)
+            except Exception as e:
+                logger.warning("Kiwoom NXT premarket chart failed code=%s: %s", code, e)
+                kw_res = {"rt_cd": "1", "output2": []}
+            if kw_res.get("rt_cd") == "0" and (kw_res.get("output2") or []):
+                rows = kw_res.get("output2") or []
+                vendor = str(kw_res.get("vendor", "kiwoom") or "kiwoom")
+                try:
+                    return normalize_bar_frame(pd.DataFrame(rows), vendor, snapshot_date, code)
+                except Exception as e:
+                    logger.warning("[DATA] Kiwoom NXT bar normalize failed code=%s: %s", code, e)
+                    return pd.DataFrame()
+            if kw_res.get("rt_cd") == "0":
+                return pd.DataFrame()
+            try:
+                res = await client.get_intraday_minute_chart(
+                    session, code, bar_interval_minutes=bar_interval_minutes,
+                    end_hour=NXT_PREMARKET_HOUR_CEIL, floor_hour=NXT_PREMARKET_HOUR_FLOOR,
+                    market_div_code=NXT_MARKET_DIV_CODE,
+                )
+            except Exception as e:
+                logger.warning("Intraday bars failed code=%s: %s", code, e)
+                return pd.DataFrame()
+            if res.get("rt_cd") != "0":
+                return pd.DataFrame()
+            rows = res.get("output2") or []
+            if not rows:
+                return pd.DataFrame()
+            return _canonical_kis_bars(rows, snapshot_date, code)
+
+    results = await asyncio.gather(*[_fetch_one(c) for c in stock_codes])
+    frames = [d for d in results if d is not None and not d.empty]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 async def collect_intraday_trade_ticks(
