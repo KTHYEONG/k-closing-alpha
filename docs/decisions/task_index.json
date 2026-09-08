@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_NXT_PREMARKET_COLLECTION",
+      "date": "2026-09-08",
+      "adr_id": "ADR_20260908_NXT_PREMARKET_COLLECTION",
+      "domain": "market_data",
+      "title": "Nextrade 프리마켓(08:00~08:50) 1분봉 수집 파이프라인 및 Kiwoom ka10080 통합",
+      "why": "08:00~08:50 NXT 프리마켓 거래가 수집되지 않아 시가 갭 및 프리마켓 거래량 분석 데이터 결손이 발생했음.",
+      "resolution": "INTRADAY_SESSION_NXT_PREMARKET 신설, Kiwoom ka10080 및 KIS 폴백 수집 배선, 토큰 동시성 락 및 가격 부호 정규화 적용.",
+      "impact": "run_intraday_archive 3-tuple 인터페이스 불변 하에 프리/정규/애프터 3대 세션 전수 보존 및 20:00 재수행 시 완결적 아카이브 지원."
+    },
+    {
+      "task_id": "TASK_MULTI_VENDOR_INTRADAY_RANKING_AND_BARS",
+      "date": "2026-09-08",
+      "adr_id": "ADR_20260908_MULTI_VENDOR_INTRADAY_RANKING_AND_BARS",
+      "domain": "market_data",
+      "title": "Kiwoom ka10027 랭킹 및 ka10080 NXT 분봉 승격, 정규장 분봉 LS 유지 3-벤더 적재적소 통합",
+      "why": "KIS 30건 하드캡(96% 누락)과 NXT 9회 페이징 비효율을 해결하고, 정규장 분봉 거래대금(value_krw) 훼손을 차단하기 위함.",
+      "resolution": "Kiwoom ka10027 랭킹(200행 페이징, 근사 거래대금)과 ka10080 NXT(1회 완결) 승격 및 KIS 폴백 배선, 정규장 분봉 LS 1순위 유지.",
+      "impact": "Stream C 2~10% 유니버스 100% 전수 수집(0.2s) 및 NXT 수집 4배 가속, 시가총액 NaN Fail-closed 및 기존 동작 완벽 호환 보장."
+    },
+    {
       "task_id": "ADR_20260907_KIWOOM_TICK_VENDOR_PRIMARY",
       "date": "2026-09-07",
       "adr_id": "ADR_20260907_ADR_20260907_KIWOOM_TICK_VENDOR_PRIMARY",

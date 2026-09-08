@@ -315,6 +315,7 @@
       "tests/unit/config/test_kiwoom.py",
       "tests/unit/config/test_ls.py",
       "tests/unit/config/test_settings_compat.py",
+      "tests/unit/daily/test_archive_intraday.py",
       "tests/unit/data/test_candidate_panel.py",
       "tests/unit/data/test_parquet_loader.py",
       "tests/unit/data/test_theme_resolver.py",
