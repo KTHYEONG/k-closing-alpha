@@ -44,6 +44,12 @@ def test_main_restores_panel_and_logs_provenance(tmp_path, monkeypatch, caplog) 
             "symbol": ["005930"],
             "open": [100.0],
             "close": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "prev_close": [99.0],
+            "volume": [1000.0],
+            "market_cap_100m": [900.0],
+            "trade_value_100m": [300.0],
         }
     ).to_parquet(price_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", price_path)
@@ -175,6 +181,12 @@ def test_retrain_warns_on_stale_price_history_without_changing_behavior(tmp_path
             "symbol": ["005930"],
             "open": [100.0],
             "close": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "prev_close": [99.0],
+            "volume": [1000.0],
+            "market_cap_100m": [900.0],
+            "trade_value_100m": [300.0],
         }
     ).to_parquet(price_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", price_path)
@@ -394,3 +406,64 @@ def test_retrain_universe_research_missing_price_history_raises(tmp_path, monkey
     with pytest.raises(ValueError, match="price_history not found"):
         main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
               "--no-restore-panel", "--universe-research", "--export-dir", str(tmp_path)])
+
+
+def test_retrain_universe_research_prepares_price_panel(tmp_path, monkeypatch) -> None:
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    # Given: a price_history whose vendor change column is percent-encoded
+    dates = pd.bdate_range("2023-02-01", periods=6)
+    prev = 10000.0
+    rows = []
+    for sym in ("000001", "000002"):
+        px = prev
+        for d in dates:
+            nxt = px * 1.08
+            rows.append({
+                "date": d, "symbol": sym, "open": px, "high": nxt * 1.01, "low": px * 0.99,
+                "close": nxt, "prev_close": px, "market_cap_100m": 900.0,
+                "trade_value_100m": 300.0, "daily_change_pct": 8.0, "market": "KOSPI",
+                "volume": 1e5, "foreign_netbuy": 0.0, "inst_netbuy": 0.0, "program_netbuy": 0.0,
+                "kospi_pct": 0.001, "kosdaq_pct": 0.001, "v_kospi": 18.0, "v_kosdaq": 22.0,
+            })
+            px = nxt
+    ph_path = tmp_path / "price_history.parquet"
+    pd.DataFrame(rows).to_parquet(ph_path)
+
+    trade_path = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2023-02-02"], "종목코드": ["000001"], "(종가)": [100.0],
+                  "(수익률, %)": [1.0], "(매수 가격)": [100.0], "(매도 가격)": [101.0]}).to_parquet(trade_path)
+
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    seen: dict[str, object] = {}
+
+    def _fake_grid(price_history_df, screens, **kwargs):
+        seen["max_abs_chg"] = float(np.nanmax(np.abs(price_history_df["daily_change_pct"].to_numpy(dtype=float))))
+        seen["has_tick_cost"] = "tick_cost_bp" in price_history_df.columns
+        seen["has_chg_ratio"] = "chg_ratio" in price_history_df.columns
+        seen["rows"] = len(price_history_df)
+        return pd.DataFrame([{"screen_name": "operator_legacy", "ranked_top1_net_bp": -10.0}])
+
+    def _boom(*a, **k):
+        raise AssertionError("champion training must not run in --universe-research mode")
+
+    monkeypatch.setattr(mod, "run_universe_screen_grid", _fake_grid)
+    monkeypatch.setattr(mod, "train_tuned_champion_bundle", _boom)
+    monkeypatch.setattr(mod, "train_champion_bundle", _boom)
+
+    # When
+    main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+          "--no-restore-panel", "--universe-research", "--export-dir", str(tmp_path)])
+
+    # Then: the harness never sees the percent-encoded column again
+    assert seen["rows"] == 12
+    assert seen["has_tick_cost"] is True
+    assert seen["has_chg_ratio"] is True
+    assert float(seen["max_abs_chg"]) < 1.0
+    assert np.isclose(float(seen["max_abs_chg"]), 0.08)
+
+

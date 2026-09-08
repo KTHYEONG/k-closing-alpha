@@ -280,6 +280,9 @@ def test_load_and_prepare_price_history_marks_ceiling_via_contract(tmp_path: Pat
             "close": [1050.0, 1300.0, 1040.0],
             "high": [1060.0, 1300.0, 1050.0],
             "market_cap_100m": [1000.0, 1000.0, 1000.0],
+            "prev_close": [1000.0, 1000.0, 1000.0],
+            "open": [1000.0, 1000.0, 1000.0],
+            "low": [990.0, 990.0, 990.0],
         }
     )
     path = tmp_path / "price_history.parquet"
@@ -378,6 +381,8 @@ def test_v3_load_and_prepare_repairs_mixed_unit_and_attaches_tick_cost(tmp_path:
             "volume": [10, 10, 10],
             "market_cap_100m": [1000.0, 1000.0, 1000.0],
             "market": ["KOSPI", "KOSPI", "KOSDAQ"],
+            "open": [10000.0, 10200.0, 3000.0],
+            "low": [9900.0, 10000.0, 2990.0],
         }
     )
     path = tmp_path / "price_history.parquet"
@@ -455,3 +460,53 @@ def test_v3_metrics_json_headline_unchanged_after_refactor() -> None:
     assert metrics["pipelines"]["P1"]["net_bp"] == 27.57
     assert metrics["pipelines"]["P2"]["net_bp"] == 21.57
     assert metrics["spec"]["primary_exit"].startswith("Open(T+1)")
+
+
+def test_load_and_prepare_price_history_delegates_to_prepare_price_panel(tmp_path) -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.data.panel_integrity import PANEL_INTEGRITY_COLUMNS
+    from src.ml.research.v3_engine import load_and_prepare_price_history
+
+    # Given: a percent-encoded price_history parquet spanning two trading days
+    ph = pd.DataFrame({
+        "date": pd.to_datetime(["2023-02-01", "2023-02-02", "2023-02-01", "2023-02-02"]),
+        "symbol": ["000001", "000001", "000002", "000002"],
+        "open": [10000.0, 10800.0, 20000.0, 20200.0],
+        "high": [10900.0, 11100.0, 20300.0, 20500.0],
+        "low": [9900.0, 10700.0, 19900.0, 20100.0],
+        "close": [10800.0, 11000.0, 20200.0, 20400.0],
+        "prev_close": [10000.0, 10800.0, 20000.0, 20200.0],
+        "volume": [1e5, 1e5, 1e5, 1e5],
+        "market_cap_100m": [900.0, 900.0, 1200.0, 1200.0],
+        "trade_value_100m": [300.0, 300.0, 500.0, 500.0],
+        "market": ["KOSPI", "KOSPI", "KOSDAQ", "KOSDAQ"],
+        "daily_change_pct": [8.0, 1.8518518518518516, 1.0, 0.9900990099009901],
+        "inst_netbuy": [0.0, 0.0, 0.0, 0.0],
+        "foreign_netbuy": [0.0, 0.0, 0.0, 0.0],
+        "program_netbuy": [0.0, 0.0, 0.0, 0.0],
+        "kospi_pct": [0.001] * 4,
+        "kosdaq_pct": [0.001] * 4,
+        "v_kospi": [18.0] * 4,
+        "v_kosdaq": [22.0] * 4,
+    })
+    path = tmp_path / "price_history.parquet"
+    ph.to_parquet(path)
+
+    # When
+    prepared, market_dates, d_to_idx = load_and_prepare_price_history(path)
+
+    # Then: the calendar contract is unchanged and the integrity columns are present
+    assert len(prepared) == 4
+    assert PANEL_INTEGRITY_COLUMNS.issubset(set(prepared.columns))
+    assert len(market_dates) == 2
+    assert d_to_idx[pd.Timestamp("2023-02-01")] == 0
+    assert d_to_idx[pd.Timestamp("2023-02-02")] == 1
+    # And: the percent-encoded vendor value never reaches the screen
+    assert np.isclose(prepared["chg_ratio"].iloc[0], 0.08)
+    assert float(np.nanmax(np.abs(prepared["daily_change_pct"].to_numpy(dtype=float)))) < 1.0
+    assert np.isfinite(prepared["tick_cost_bp"].to_numpy(dtype=float)).all()
+    assert "panel_provenance" in prepared.attrs
+
+

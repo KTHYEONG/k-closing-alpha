@@ -234,3 +234,48 @@ def test_universe_research_main_smoke(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="price_history not found"):
         main(["--price-history", str(tmp_path / "missing.parquet"), "--out", str(out_path)])
+
+
+def test_universe_research_main_prepares_price_panel(tmp_path, monkeypatch) -> None:
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.universe_research as mod
+
+    # Given: a percent-encoded price_history parquet
+    dates = pd.bdate_range("2023-02-01", periods=4)
+    rows = []
+    for sym in ("000001", "000002"):
+        px = 10000.0
+        for d in dates:
+            nxt = px * 1.08
+            rows.append({
+                "date": d, "symbol": sym, "open": px, "high": nxt * 1.01, "low": px * 0.99,
+                "close": nxt, "prev_close": px, "market_cap_100m": 900.0,
+                "trade_value_100m": 300.0, "daily_change_pct": 8.0, "market": "KOSPI",
+                "volume": 1e5, "foreign_netbuy": 0.0, "inst_netbuy": 0.0, "program_netbuy": 0.0,
+                "kospi_pct": 0.001, "kosdaq_pct": 0.001, "v_kospi": 18.0, "v_kosdaq": 22.0,
+            })
+            px = nxt
+    ph_path = tmp_path / "price_history.parquet"
+    pd.DataFrame(rows).to_parquet(ph_path)
+
+    seen: dict[str, object] = {}
+
+    def _fake_grid(price_history_df, screens, **kwargs):
+        seen["max_abs_chg"] = float(np.nanmax(np.abs(price_history_df["daily_change_pct"].to_numpy(dtype=float))))
+        seen["has_tick_cost"] = "tick_cost_bp" in price_history_df.columns
+        return pd.DataFrame([{"screen_name": "operator_legacy", "ranked_top1_net_bp": -10.0}])
+
+    monkeypatch.setattr(mod, "run_universe_screen_grid", _fake_grid)
+
+    # When
+    mod.main(["--price-history", str(ph_path), "--theme", str(tmp_path / "missing.parquet"),
+              "--out", str(tmp_path / "universe_grid.parquet")])
+
+    # Then
+    assert seen["has_tick_cost"] is True
+    assert np.isclose(float(seen["max_abs_chg"]), 0.08)
+    assert (tmp_path / "universe_grid.parquet").exists()
+
+
