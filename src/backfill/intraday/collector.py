@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -22,6 +23,8 @@ from src.config.market_session import (
 from src.data.intraday_schema import normalize_bar_frame, normalize_tick_frame
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_LS_TICK_MAX_PAGES: int = 30
 
 
 def _canonical_kis_bars(rows: list[dict], snapshot_date: str, code: str) -> pd.DataFrame:
@@ -273,16 +276,19 @@ async def collect_intraday_trade_ticks(
     snapshot_date: str,
     ls_client: Any | None = None,
     kiwoom_client: Any | None = None,
+    ls_max_pages: int = DEFAULT_LS_TICK_MAX_PAGES,
 ) -> pd.DataFrame:
     """KRX 정규세션(09:00~15:30) 틱 체결을 세마포어(10) 동시성으로 취합한다. Kiwoom(1순위) -> LS(2순위) -> KIS(3순위) 폴백."""
     if not stock_codes:
         return pd.DataFrame()
     sem = asyncio.Semaphore(10)
     target_date = snapshot_date
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    use_kiwoom = kiwoom_client is not None and str(snapshot_date) >= today_str
 
     async def _fetch_one(code: str) -> list[dict]:
         async with sem:
-            if kiwoom_client is not None:
+            if use_kiwoom:
                 try:
                     kw_res = await kiwoom_client.get_tick_chart(session, code, target_date)
                 except Exception as e:
@@ -299,11 +305,9 @@ async def collect_intraday_trade_ticks(
                         logger.warning("[DATA] Kiwoom tick normalize failed code=%s: %s", code, e)
                         return []
                     return frame.to_dict("records") if not frame.empty else []
-                if kw_res.get("rt_cd") == "0":
-                    return []
             if ls_client is not None:
                 try:
-                    ls_res = await ls_client.get_tick_chart(session, code, target_date)
+                    ls_res = await ls_client.get_tick_chart(session, code, target_date, max_pages=ls_max_pages)
                 except Exception as e:
                     logger.warning("LS tick chart failed code=%s: %s", code, e)
                     ls_res = {"rt_cd": "1", "output2": []}
@@ -318,8 +322,6 @@ async def collect_intraday_trade_ticks(
                         logger.warning("[DATA] LS tick normalize failed code=%s: %s", code, e)
                         return []
                     return frame.to_dict("records") if not frame.empty else []
-                if ls_res.get("rt_cd") == "0":
-                    return []
             try:
                 res = await client.get_intraday_trade_ticks(session, code, floor_hour=KRX_REGULAR_HOUR_FLOOR, end_hour=KRX_REGULAR_HOUR_CEIL, market_div_code=KRX_CLOSE_MARKET_DIV_CODE)
             except Exception as e:
