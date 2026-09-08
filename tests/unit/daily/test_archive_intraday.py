@@ -90,7 +90,8 @@ def test_archive_intraday_main_invokes_run_intraday_archive(monkeypatch) -> None
     assert captured == {"snapshot_date": "2026-09-04"}
 
 
-def test_today_watchlist_codes_excludes_universe_scan_scenario_by_default(monkeypatch) -> None:
+def test_today_watchlist_codes_includes_universe_scan_pool_by_default(monkeypatch) -> None:
+    # Given
     import pandas as pd
 
     from src.daily import archive_intraday
@@ -104,9 +105,13 @@ def test_today_watchlist_codes_excludes_universe_scan_scenario_by_default(monkey
     )
     monkeypatch.setattr(archive_intraday.archive, "fetch_archive_snapshot", lambda **kw: df)
 
+    # When
     codes = archive_intraday._today_watchlist_codes("2026-09-07")
 
-    assert codes == ["005930"]
+    # Then: 비용축 풀의 실측 스프레드 확보를 위해 스캔 풀도 수집한다
+    assert archive_intraday.EXCLUDED_INTRADAY_SCENARIOS == frozenset()  # noqa: SIM300
+    assert set(codes) == {"005930", "000660", "009900"}
+    assert len(codes) == 3
 
 
 def test_today_watchlist_codes_explicit_opt_in_includes_universe_scan_scenario(monkeypatch) -> None:
@@ -336,3 +341,59 @@ def test_run_intraday_archive_collects_and_writes_premarket_partition(monkeypatc
         assert res == (5, 5, 10)
         assert INTRADAY_SESSION_NXT_PREMARKET in partitions_written
         assert mock_nxt_pre.call_count == 1
+
+def test_today_watchlist_codes_still_supports_explicit_scenario_optout(monkeypatch) -> None:
+    # Given
+    import pandas as pd
+
+    from src.daily import archive_intraday
+    from src.daily.universe_scan import UNIVERSE_SCAN_SCENARIO_TAG
+
+    df = pd.DataFrame(
+        {
+            "종목코드": ["005930", "000660"],
+            "시나리오": ["종가매매", UNIVERSE_SCAN_SCENARIO_TAG],
+        }
+    )
+    monkeypatch.setattr(archive_intraday.archive, "fetch_archive_snapshot", lambda **kw: df)
+
+    # When
+    codes = archive_intraday._today_watchlist_codes(
+        "2026-09-07", exclude_scenarios=frozenset({UNIVERSE_SCAN_SCENARIO_TAG})
+    )
+
+    # Then
+    assert codes == ["005930"]
+
+
+def test_archive_target_codes_unions_universe_scan_pool_across_sessions(monkeypatch) -> None:
+    # Given
+    import pandas as pd
+
+    from src.daily import archive_intraday
+    from src.daily.universe_scan import UNIVERSE_SCAN_SCENARIO_TAG
+
+    frames = {
+        "2026-09-04": pd.DataFrame(
+            {"종목코드": ["005930"], "시나리오": [UNIVERSE_SCAN_SCENARIO_TAG]}
+        ),
+        "2026-09-03": pd.DataFrame(
+            {"종목코드": ["000660"], "시나리오": [UNIVERSE_SCAN_SCENARIO_TAG]}
+        ),
+    }
+    all_rows = pd.DataFrame(
+        {"스냅샷_날짜": ["2026-09-03", "2026-09-04"], "종목코드": ["000660", "005930"]}
+    )
+
+    def fake_fetch(snapshot_date=None, month=None, all_rows_flag=False, **kwargs):
+        if kwargs.get("all_rows") or all_rows_flag:
+            return all_rows
+        return frames.get(snapshot_date, pd.DataFrame())
+
+    monkeypatch.setattr(archive_intraday.archive, "fetch_archive_snapshot", fake_fetch)
+
+    # When
+    codes = archive_intraday._archive_target_codes("2026-09-04")
+
+    # Then: 청산일(D+1) 분봉 확보를 위해 전일 풀도 포함
+    assert set(codes) == {"005930", "000660"}
