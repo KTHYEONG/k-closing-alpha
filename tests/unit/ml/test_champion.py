@@ -702,6 +702,7 @@ def test_train_tuned_champion_applies_screen_filter() -> None:
     assert bundle["tuning_provenance"]["screen"] == {
         "change_lower": 0.0, "change_upper": None, "min_trade_value_100m": 0.0,
         "min_market_cap_100m": 0.0, "exclude_ceiling": True, "require_index_up": False,
+        "max_tick_cost_bp": None,
     }
     # A strict screen that excludes every row must not silently keep training on the old pool.
     strict = ScreenConfig(change_lower=0.99)

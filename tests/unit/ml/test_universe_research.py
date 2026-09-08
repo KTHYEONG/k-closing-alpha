@@ -230,7 +230,7 @@ def test_universe_research_main_smoke(tmp_path) -> None:
           "--out", str(out_path), "--cpcv-n-groups", "5", "--cpcv-k-test", "2"])
 
     df = pd.read_parquet(out_path)
-    assert len(df) == 6 and "screen_name" in df.columns and "verdict" in df.columns
+    assert len(df) == 7 and "screen_name" in df.columns and "verdict" in df.columns
 
     with pytest.raises(ValueError, match="price_history not found"):
         main(["--price-history", str(tmp_path / "missing.parquet"), "--out", str(out_path)])
@@ -279,3 +279,10 @@ def test_universe_research_main_prepares_price_panel(tmp_path, monkeypatch) -> N
     assert (tmp_path / "universe_grid.parquet").exists()
 
 
+def test_default_research_screens_includes_cost_aware() -> None:
+    from src.ml.universe import COST_AWARE_SCREEN
+    from src.ml.universe_research import DEFAULT_RESEARCH_SCREENS
+
+    assert "cost_aware" in DEFAULT_RESEARCH_SCREENS
+    assert DEFAULT_RESEARCH_SCREENS["cost_aware"] is COST_AWARE_SCREEN
+    assert DEFAULT_RESEARCH_SCREENS["cost_aware"].max_tick_cost_bp == 7.5
