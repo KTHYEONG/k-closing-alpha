@@ -124,6 +124,12 @@ def build_universe_training_panel(
         empty_processed = pd.DataFrame(columns=["trade_date", "stock_code", "close_price", "prev_close_price", "high_price", "mechanical_gross"])
         return (pd.DataFrame(), {}, [], empty_processed, universe_provenance)
     raw = pd.DataFrame({bracket: panel[universe_col].to_numpy() for universe_col, bracket in UNIVERSE_TO_RAW_PANEL_MAP.items()})
+    # tv_clean/mc_clean(원천 NaN 복원본)이 있으면 우선한다: build_universe_panel의 admission이
+    # 이미 이 컬럼 기준이라, 원천 NaN 그대로 넘기면 admission된 행에서 major_density 등이 NaN이 된다.
+    tv_source = panel["tv_clean"] if "tv_clean" in panel.columns else panel["trade_value_100m"]
+    mc_source = panel["mc_clean"] if "mc_clean" in panel.columns else panel["market_cap_100m"]
+    raw["(거래대금, 억)"] = pd.to_numeric(tv_source, errors="coerce").to_numpy(dtype=np.float64)
+    raw["(시가총액, 억)"] = pd.to_numeric(mc_source, errors="coerce").to_numpy(dtype=np.float64)
     daily_change = pd.to_numeric(panel["daily_change_pct"], errors="coerce").to_numpy(dtype=np.float64)
     kospi_pct = pd.to_numeric(panel["kospi_pct"], errors="coerce").to_numpy(dtype=np.float64)
     kosdaq_pct = pd.to_numeric(panel["kosdaq_pct"], errors="coerce").to_numpy(dtype=np.float64)
@@ -137,7 +143,7 @@ def build_universe_training_panel(
     raw["(수익률, %)"] = gross * 100.0
     raw["(체결강도)"] = np.nan
     raw["(차트분석)"] = "미분류"
-    day_frame = pd.DataFrame({"_day": pd.to_datetime(panel["trade_date"]).to_numpy(), "_tv": pd.to_numeric(panel["trade_value_100m"], errors="coerce").to_numpy(dtype=np.float64)})
+    day_frame = pd.DataFrame({"_day": pd.to_datetime(panel["trade_date"]).to_numpy(), "_tv": pd.to_numeric(tv_source, errors="coerce").to_numpy(dtype=np.float64)})
     raw["(선정 순위)"] = day_frame.groupby("_day")["_tv"].rank(method="min", ascending=False).to_numpy()
     raw["(총 종목 수)"] = day_frame.groupby("_day")["_tv"].transform("size").to_numpy()
     raw["(평균 거래대금)"] = day_frame.groupby("_day")["_tv"].transform("mean").to_numpy()
