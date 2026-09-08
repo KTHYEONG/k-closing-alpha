@@ -249,3 +249,162 @@ def test_strategy_spec_fingerprint_detects_any_parameter_change() -> None:
     assert base == KCA_TOP3_SHADOW_001.fingerprint()
     assert changed_k != base
     assert changed_universe != base
+
+def test_derive_chg_ratio_is_exact_and_independent_of_vendor_column() -> None:
+    # Given: 실제 오염 사례(2022-11-02 025530) — 벤더 컬럼은 1.054018 (percent)
+    import numpy as np
+
+    from src.strategy.contract import derive_chg_ratio
+
+    close = np.array([3835.0, 1100.0, 900.0], dtype=np.float64)
+    prev_close = np.array([3795.0, 1000.0, 1000.0], dtype=np.float64)
+
+    # When
+    ratio = derive_chg_ratio(close, prev_close)
+
+    # Then
+    np.testing.assert_allclose(ratio, [40.0 / 3795.0, 0.10, -0.10])
+    assert abs(float(ratio[0]) - 0.01054018445) < 1e-9
+    # percent 인코딩 벤더값(1.054018)과 100배 차이임을 명시적으로 고정
+    assert abs(float(ratio[0]) * 100.0 - 1.054018445) < 1e-6
+
+
+def test_derive_chg_ratio_nans_out_bad_prev_close_and_limit_violations() -> None:
+    # Given
+    import numpy as np
+
+    from src.strategy.contract import KRX_DAILY_LIMIT_RATIO, derive_chg_ratio
+
+    close = np.array([1000.0, 1000.0, 1000.0, 1400.0, 600.0, 1290.0], dtype=np.float64)
+    prev_close = np.array([0.0, -50.0, np.nan, 1000.0, 1000.0, 1000.0], dtype=np.float64)
+
+    # When
+    ratio = derive_chg_ratio(close, prev_close)
+
+    # Then
+    assert KRX_DAILY_LIMIT_RATIO == 0.31
+    assert np.isnan(ratio[:3]).all()
+    assert not np.any(ratio[:3] == 0.0)
+    assert np.isnan(ratio[3])  # +40% 는 제도 한계 초과
+    assert np.isnan(ratio[4])  # -40% 도 초과
+    np.testing.assert_allclose(ratio[5], 0.29)  # 상한가는 유효
+
+    # limit 을 넓히면 통과한다
+    loose = derive_chg_ratio(close, prev_close, limit=1.0)
+    np.testing.assert_allclose(loose[3], 0.40)
+
+
+def test_detect_mixed_unit_rows_flags_percent_encoded_only() -> None:
+    # Given
+    import numpy as np
+
+    from src.strategy.contract import detect_mixed_unit_rows
+
+    close = np.array([3835.0, 3835.0, 1100.0, 1000.0, 1000.0], dtype=np.float64)
+    prev_close = np.array([3795.0, 3795.0, 1000.0, 0.0, 1000.0], dtype=np.float64)
+    true_ratio = 40.0 / 3795.0
+    vendor = np.array(
+        [true_ratio * 100.0, true_ratio, 0.10, 5.0, np.nan],
+        dtype=np.float64,
+    )
+
+    # When
+    flagged = detect_mixed_unit_rows(close, prev_close, vendor)
+
+    # Then
+    assert flagged.dtype == bool
+    assert flagged.tolist() == [True, False, False, False, False]
+    # prev_close<=0 인 행은 판정 불가이므로 오염으로 단정하지 않는다
+    assert bool(flagged[3]) is False
+
+
+def test_select_universe_applies_tick_cost_cap_when_configured() -> None:
+    # Given
+    import numpy as np
+    import pandas as pd
+
+    from src.strategy.contract import COST_AWARE_UNIVERSE, DEFAULT_UNIVERSE, select_universe
+
+    df = pd.DataFrame(
+        {
+            "chg_ratio": [0.05, 0.05, 0.05, 0.05],
+            "tv_clean": [500.0, 500.0, 500.0, 500.0],
+            "mc_clean": [800.0, 800.0, 800.0, 800.0],
+            "close": [15000.0, 3000.0, 15000.0, 15000.0],
+            "volume": [10, 10, 10, 10],
+            "is_ceiling": [False, False, False, False],
+            "tick_cost_bp": [6.67, 16.67, 7.5, np.nan],
+        }
+    )
+
+    # When
+    capped = select_universe(df, COST_AWARE_UNIVERSE)
+    uncapped = select_universe(df, DEFAULT_UNIVERSE)
+
+    # Then: 7.5bp 상한은 포함(<=), 16.67bp 초과 배제, NaN 배제
+    assert COST_AWARE_UNIVERSE.max_tick_cost_bp == 7.5
+    assert capped.tolist() == [True, False, True, False]
+    # 기본 스펙은 비용축을 적용하지 않는다 (하위호환)
+    assert DEFAULT_UNIVERSE.max_tick_cost_bp is None
+    assert uncapped.tolist() == [True, True, True, True]
+
+
+def test_select_universe_requires_tick_cost_column_only_when_capped() -> None:
+    # Given
+    import pandas as pd
+    import pytest
+
+    from src.strategy.contract import COST_AWARE_UNIVERSE, DEFAULT_UNIVERSE, select_universe
+
+    df = pd.DataFrame(
+        {
+            "chg_ratio": [0.05],
+            "tv_clean": [500.0],
+            "mc_clean": [800.0],
+            "close": [15000.0],
+            "volume": [10],
+            "is_ceiling": [False],
+        }
+    )
+
+    # When / Then
+    with pytest.raises(ValueError) as exc:  # noqa: PT011 - fail-closed column contract
+        select_universe(df, COST_AWARE_UNIVERSE)
+    assert "tick_cost_bp" in str(exc.value)
+
+    # 기본 스펙은 동일 프레임으로 정상 동작 (기존 호출부 회귀 방지)
+    mask = select_universe(df, DEFAULT_UNIVERSE)
+    assert mask.tolist() == [True]
+
+
+def test_cost_aware_strategy_spec_uses_topk_three() -> None:
+    # Given / When
+    from src.strategy.contract import (
+        AA_COST,
+        COST_AWARE_UNIVERSE,
+        DEFAULT_UNIVERSE,
+        KCA_TOP3_SHADOW_001,
+        KCA_TOPK_COSTAWARE_001,
+    )
+
+    # Then: 신규 스펙 계약
+    assert KCA_TOPK_COSTAWARE_001.strategy_id == "KCA-TOPK-COSTAWARE-001"
+    assert KCA_TOPK_COSTAWARE_001.top_k == 3
+    assert KCA_TOPK_COSTAWARE_001.top_k >= 2
+    assert KCA_TOPK_COSTAWARE_001.universe is COST_AWARE_UNIVERSE
+    assert KCA_TOPK_COSTAWARE_001.cost is AA_COST
+    assert len(KCA_TOPK_COSTAWARE_001.fingerprint()) == 64
+    assert KCA_TOPK_COSTAWARE_001.fingerprint() != KCA_TOP3_SHADOW_001.fingerprint()
+
+    # 기존 기본값 불변 (하위호환 회귀 방지)
+    assert DEFAULT_UNIVERSE.max_tick_cost_bp is None
+    assert DEFAULT_UNIVERSE.min_market_cap_100m == 500.0
+    assert DEFAULT_UNIVERSE.chg_min == 0.02
+    assert DEFAULT_UNIVERSE.chg_max == 0.10
+    assert KCA_TOP3_SHADOW_001.universe is DEFAULT_UNIVERSE
+
+    # 신규 풀은 레거시 >=10% 가 아니라 2~10% 밴드를 유지하고 비용축만 추가한다
+    assert COST_AWARE_UNIVERSE.chg_min == 0.02
+    assert COST_AWARE_UNIVERSE.chg_max == 0.10
+    assert COST_AWARE_UNIVERSE.min_trade_value_100m == 100.0
+    assert COST_AWARE_UNIVERSE.exclude_ceiling is True

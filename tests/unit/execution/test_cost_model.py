@@ -189,3 +189,117 @@ def test_estimate_round_trip_cost_bp_uses_updated_statutory_rate() -> None:
     assert STATUTORY_COST_BP == pytest.approx(20.0)  # noqa: SIM300
     assert out["spread_bp"][0] == pytest.approx(20.0)
     assert out["round_trip_cost_bp"][0] == pytest.approx(40.0)
+
+def test_krx_tick_size_asof_switches_bands_at_reform_date() -> None:
+    # Given
+    import numpy as np
+
+    from src.execution.cost_model import TICK_REFORM_DATE, krx_tick_size_asof
+
+    price = np.array([15000.0, 15000.0, 15000.0], dtype=np.float64)
+    trade_date = np.array(
+        [
+            np.datetime64("2022-12-30"),
+            TICK_REFORM_DATE,
+            np.datetime64("2026-09-04"),
+        ],
+        dtype="datetime64[ns]",
+    )
+    market = np.array(["KOSPI", "KOSPI", "KOSPI"], dtype=object)
+
+    # When
+    tick = krx_tick_size_asof(price, trade_date, market)
+
+    # Then: 개편 이전 10,000~50,000 구간은 50원, 개편 이후 10,000~20,000 구간은 10원
+    np.testing.assert_allclose(tick, [50.0, 10.0, 10.0])
+
+
+def test_krx_tick_size_asof_uses_kosdaq_table_before_reform() -> None:
+    # Given
+    import numpy as np
+
+    from src.execution.cost_model import krx_tick_size_asof
+
+    price = np.array([150000.0, 150000.0, 150000.0, 150000.0], dtype=np.float64)
+    trade_date = np.array(
+        [
+            np.datetime64("2020-06-01"),
+            np.datetime64("2020-06-01"),
+            np.datetime64("2020-06-01"),
+            np.datetime64("2026-01-05"),
+        ],
+        dtype="datetime64[ns]",
+    )
+    market = np.array(["KOSDAQ", "KOSPI", "UNKNOWN", "KOSDAQ"], dtype=object)
+
+    # When
+    tick = krx_tick_size_asof(price, trade_date, market)
+
+    # Then: UNKNOWN 은 보수적으로 KOSPI 테이블(500원)로 처리한다
+    np.testing.assert_allclose(tick, [100.0, 500.0, 500.0, 100.0])
+    assert tick[2] == tick[1]
+
+    # KSQ150 도 KOSDAQ 계열로 취급
+    ksq = krx_tick_size_asof(
+        np.array([150000.0]),
+        np.array([np.datetime64("2020-06-01")], dtype="datetime64[ns]"),
+        np.array(["KSQ150"], dtype=object),
+    )
+    np.testing.assert_allclose(ksq, [100.0])
+
+
+def test_krx_tick_size_asof_propagates_nan_never_zero() -> None:
+    # Given
+    import numpy as np
+
+    from src.execution.cost_model import krx_tick_size_asof, tick_cost_bp
+
+    price = np.array([0.0, -100.0, np.nan, np.inf, 15000.0, 15000.0], dtype=np.float64)
+    trade_date = np.array(
+        [
+            np.datetime64("2026-01-05"),
+            np.datetime64("2026-01-05"),
+            np.datetime64("2026-01-05"),
+            np.datetime64("2026-01-05"),
+            np.datetime64("NaT", "ns"),
+            np.datetime64("2026-01-05"),
+        ],
+        dtype="datetime64[ns]",
+    )
+    market = np.array(["KOSPI"] * 6, dtype=object)
+
+    # When
+    tick = krx_tick_size_asof(price, trade_date, market)
+    cost = tick_cost_bp(price, trade_date, market)
+
+    # Then
+    assert np.isnan(tick[:5]).all()
+    assert np.isnan(cost[:5]).all()
+    assert not np.any(tick[:5] == 0.0)
+    assert not np.any(cost[:5] == 0.0)
+    assert np.isfinite(tick[5]) and np.isfinite(cost[5])
+
+
+def test_tick_cost_bp_returns_single_tick_bp() -> None:
+    # Given
+    import numpy as np
+
+    from src.execution.cost_model import spread_cost_bp, tick_cost_bp
+
+    price = np.array([15000.0, 3000.0, 150000.0], dtype=np.float64)
+    trade_date = np.array([np.datetime64("2026-01-05")] * 3, dtype="datetime64[ns]")
+    market = np.array(["KOSPI"] * 3, dtype=object)
+
+    # When
+    per_tick = tick_cost_bp(price, trade_date, market)
+
+    # Then: 개편 후 틱은 10 / 5 / 100
+    np.testing.assert_allclose(
+        per_tick,
+        [10.0 / 15000.0 * 1e4, 5.0 / 3000.0 * 1e4, 100.0 / 150000.0 * 1e4],
+    )
+    # 15,000원 종목의 1틱 비용은 6.67bp 로 7.5bp 상한을 통과한다
+    assert per_tick[0] < 7.5
+    assert per_tick[1] > 7.5
+    # 왕복 2틱은 개편 후 구간에서 기존 spread_cost_bp 와 동일
+    np.testing.assert_allclose(2.0 * per_tick, spread_cost_bp(price, round_trip_ticks=2.0))
