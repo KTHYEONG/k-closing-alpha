@@ -397,3 +397,44 @@ def test_archive_target_codes_unions_universe_scan_pool_across_sessions(monkeypa
 
     # Then: 청산일(D+1) 분봉 확보를 위해 전일 풀도 포함
     assert set(codes) == {"005930", "000660"}
+
+
+def test_run_intraday_archive_instantiates_kiwoom_with_kiwoom_app_key_alias(monkeypatch) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+    import pandas as pd
+    from src.daily import archive_intraday
+
+    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
+    monkeypatch.setattr(archive_intraday.settings, "KIWOM_APP_KEY", "", raising=False)
+    monkeypatch.setattr(archive_intraday.settings, "KIWOOM_APP_KEY", "test_kiwoom_key", raising=False)
+
+    fake_client = MagicMock()
+    fake_session = AsyncMock()
+    fake_client.create_session.return_value.__aenter__.return_value = fake_session
+    fake_client.ensure_token = AsyncMock(return_value="tok")
+
+    captured: dict = {}
+
+    def _fake_kiwoom_ctor():
+        captured["kiwoom_ctor_called"] = True
+        return object()
+
+    async def _mock_collect_ticks(client, session, codes, snap_date, ls_client=None, kiwoom_client=None):
+        captured["kiwoom_client_passed"] = kiwoom_client
+        return pd.DataFrame()
+
+    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda: fake_client)
+    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
+    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", _fake_kiwoom_ctor)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", AsyncMock(return_value=pd.DataFrame()))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", AsyncMock(return_value=pd.DataFrame()))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", AsyncMock(return_value=pd.DataFrame()))
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _mock_collect_ticks)
+    monkeypatch.setattr(archive_intraday, "write_intraday_partition", lambda *a, **kw: 0)
+    monkeypatch.setattr(archive_intraday, "write_tick_partition", lambda *a, **kw: 0)
+
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07")
+
+    assert result == (0, 0, 0)
+    assert captured.get("kiwoom_ctor_called") is True
+    assert captured.get("kiwoom_client_passed") is not None
