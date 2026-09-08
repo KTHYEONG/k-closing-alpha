@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "tick_collection_throughput_optimization",
+      "date": "2026-09-08",
+      "adr_id": "ADR_20260908_tick_collection_throughput_optimization",
+      "domain": "data",
+      "title": "체결틱 수집 처리량 최적화 및 스마트 라우팅",
+      "why": "LS API의 단일 락(1.05s) 및 과도한 기본 페이지로 인한 체결틱 수집 병목을 해소하기 위함.",
+      "resolution": "당일 수집 키움·KIS 우선 및 과거일 LS 전담 라우팅, 빈 응답 폴백 결함 수정, LS 30페이지 상한 가드를 적용함.",
+      "impact": "일일 40개 워치리스트 종목의 틱 수집 소요시간을 1/10 이하로 단축하고 수집 안정성을 확보함."
+    },
+    {
       "task_id": "TASK_UNIVERSE_SCREEN_REDESIGN",
       "date": "2026-09-08",
       "adr_id": "ADR_20260908_UNIVERSE_SCREEN_REDESIGN",
