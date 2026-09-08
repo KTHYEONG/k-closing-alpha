@@ -15,6 +15,7 @@ from src.data.candidate_panel import (
     build_restored_trade_log,
     check_price_history_freshness,
 )
+from src.data.panel_integrity import load_price_panel
 from src.data.parquet_codec import (
     INTRADAY_COMPRESSION,
     PARQUET_COMPRESSION_LEVEL,
@@ -39,7 +40,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     trade_log_df = pd.read_parquet(args.trade_log)
-    price_history_df = pd.read_parquet(args.price_history)
+    price_history_df, panel_prov = load_price_panel(args.price_history)
+    logger.info("[DATA] stage=panel_integrity %s", panel_prov.to_log_kv())
     theme_df = pd.read_parquet(args.theme) if os.path.exists(args.theme) else None
 
     freshness = check_price_history_freshness(price_history_df)

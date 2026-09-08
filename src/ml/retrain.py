@@ -11,6 +11,7 @@ import pandas as pd
 from src import settings
 from src.data.candidate_panel import build_restored_trade_log, check_price_history_freshness
 from src.data.io_utils import atomic_write_parquet
+from src.data.panel_integrity import load_price_panel
 from src.ml.bundle import CHAMPION_DEFAULT_MODEL_PARAMS
 from src.ml.champion import train_champion_bundle, train_tuned_champion_bundle
 from src.ml.tuning import ChampionTuningConfig
@@ -80,7 +81,10 @@ def main(argv: list[str] | None = None) -> None:
 
     trade_log_df = pd.read_parquet(args.trade_log)
     theme_df = pd.read_parquet(args.theme) if os.path.exists(args.theme) else None
-    price_history_df = pd.read_parquet(settings.PRICE_HISTORY_PARQUET_PATH) if (args.feature_set in ("close_morning_history", "close_morning_sector") or not args.no_restore_panel) and os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH) else None
+    price_history_df = None
+    if (args.feature_set in ("close_morning_history", "close_morning_sector") or not args.no_restore_panel) and os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH):
+        price_history_df, panel_prov = load_price_panel(settings.PRICE_HISTORY_PARQUET_PATH)
+        logger.info("[DATA] stage=panel_integrity %s", panel_prov.to_log_kv())
     if not args.no_restore_panel and price_history_df is None:
         logger.warning(
             "[DATA] stage=panel_restore status=skipped reason=price_history_missing path=%s",
@@ -110,7 +114,8 @@ def main(argv: list[str] | None = None) -> None:
         if price_history_df is None:
             if not os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH):
                 raise ValueError(f"price_history not found: {settings.PRICE_HISTORY_PARQUET_PATH}")
-            price_history_df = pd.read_parquet(settings.PRICE_HISTORY_PARQUET_PATH)
+            price_history_df, panel_prov = load_price_panel(settings.PRICE_HISTORY_PARQUET_PATH)
+            logger.info("[DATA] stage=panel_integrity %s", panel_prov.to_log_kv())
         universe_grid = run_universe_screen_grid(
             price_history_df,
             DEFAULT_RESEARCH_SCREENS,

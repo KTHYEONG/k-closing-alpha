@@ -44,12 +44,27 @@ def attach_per_row_cost_ratio(
     price_col: str = "close_price",
     impact_col: str | None = None,
     fallback_ratio: float = ROUND_TRIP_COST_RATIO,
+    date_col: str | None = None,
+    market_col: str | None = None,
 ) -> pd.DataFrame:
-    """Attach per-row cost_ratio with fail-open fallback (never NaN)."""
+    """Attach per-row cost_ratio with fail-open fallback (never NaN).
+
+    Args:
+        df: Input frame with the price column.
+        price_col: Close price column.
+        impact_col: Optional measured auction-impact column.
+        fallback_ratio: Fallback ratio for unmeasurable rows.
+        date_col: Optional trade-date column forwarded for PIT tick costing.
+        market_col: Optional board column forwarded for PIT tick costing.
+
+    Returns:
+        Copy of df with cost_ratio and cost_measured columns.
+    """
     out = df.copy()
     out = out.drop(columns=[c for c in ("cost_ratio", "cost_measured") if c in out.columns])
     costed = estimate_round_trip_cost_bp(
-        out, price_col=price_col, impact_col=impact_col
+        out, price_col=price_col, impact_col=impact_col,
+        date_col=date_col, market_col=market_col,
     )
     total_bp = pd.to_numeric(
         costed["round_trip_cost_bp"], errors="coerce"
@@ -115,7 +130,11 @@ def build_decision_labels(
         out["cost_ratio"] = np.full(len(out), float(ROUND_TRIP_COST_RATIO), dtype=np.float64)
         out["cost_measured"] = np.full(len(out), False, dtype=bool)
     else:
-        out = attach_per_row_cost_ratio(out)
+        out = attach_per_row_cost_ratio(
+            out,
+            date_col="trade_date" if "trade_date" in out.columns else None,
+            market_col="market_type" if ("trade_date" in out.columns and "market_type" in out.columns) else None,
+        )
     gross_decimal = pd.to_numeric(out["net_return"], errors="coerce").to_numpy(dtype=np.float64)
     cost = pd.to_numeric(out["cost_ratio"], errors="coerce").to_numpy(dtype=np.float64)
     out["eval_net_journaled"] = np.asarray(gross_decimal / 100.0 - cost, dtype=np.float64)

@@ -15,7 +15,7 @@ from lightgbm import LGBMRegressor
 from scipy import stats
 from sklearn.linear_model import Ridge
 
-from src.execution.cost_model import tick_cost_bp
+from src.data.panel_integrity import prepare_price_panel
 from src.ml.research.v3_metrics import (
     calculate_series_metrics,
     moving_block_bootstrap_ci,
@@ -26,9 +26,6 @@ from src.strategy.contract import (
     DEFAULT_UNIVERSE,
     PA_COST,
     UniverseSpec,
-    derive_chg_ratio,
-    detect_mixed_unit_rows,
-    mark_ceiling,
     round_trip_cost_bp,
     select_universe,
 )
@@ -56,45 +53,8 @@ FEATURE_COLS: list[str] = [
 def load_and_prepare_price_history(path: Path | str) -> tuple[pd.DataFrame, np.ndarray, dict[pd.Timestamp, int]]:
     """Load price history and construct trading calendar index."""
     logger.info("Loading price history from %s...", path)
-    ph = pd.read_parquet(path)
-    ph["date"] = pd.to_datetime(ph["date"])
-    ph["symbol"] = ph["symbol"].astype(str).str.zfill(6)
-    ph = ph.sort_values(["symbol", "date"]).reset_index(drop=True)
-
-    close = ph["close"].to_numpy(dtype=np.float64)
-
-    # Normalize daily change to ratio
-    chg = ph["daily_change_pct"].to_numpy(dtype=np.float64)
-    if np.nanmedian(np.abs(chg[np.isfinite(chg)])) > 1.0:
-        chg = chg / 100.0
-    ph["chg_ratio"] = chg
-
-    # 벤더 daily_change_pct 는 심볼별 혼합단위(ratio/percent) 오염이 있어,
-    # prev_close 가 있으면 오염 행만 close/prev_close-1 로 결정론적 교정한다.
-    if "prev_close" in ph.columns:
-        prev_close = ph["prev_close"].to_numpy(dtype=np.float64)
-        vendor_change = ph["daily_change_pct"].to_numpy(dtype=np.float64)
-        exact = derive_chg_ratio(close, prev_close)
-        mixed = detect_mixed_unit_rows(close, prev_close, vendor_change)
-        repaired = ph["chg_ratio"].to_numpy(dtype=np.float64).copy()
-        fix = mixed & np.isfinite(exact)
-        repaired[fix] = exact[fix]
-        ph["chg_ratio"] = repaired
-
-    # Recover trade value (in 100M KRW)
-    tv = ph["trade_value_100m"].to_numpy(dtype=np.float64)
-    vol = ph["volume"].to_numpy(dtype=np.float64)
-    ph["tv_clean"] = np.where(np.isfinite(tv), tv, close * vol / 1e8)
-
-    # Clean market cap: symbol-level forward fill only, no global fillna
-    ph["mc_clean"] = ph.groupby("symbol")["market_cap_100m"].ffill()
-
-    # Ceiling detection
-    ph["is_ceiling"] = mark_ceiling(ph)
-
-    # 시점정합 호가단위 기반 1틱 비용(bp) — 비용축 스크린(UniverseSpec.max_tick_cost_bp)의 입력
-    market = ph["market"].to_numpy(dtype=object) if "market" in ph.columns else np.full(len(ph), "UNKNOWN", dtype=object)
-    ph["tick_cost_bp"] = tick_cost_bp(close, ph["date"].to_numpy(), market)
+    ph, prov = prepare_price_panel(pd.read_parquet(path))
+    logger.info("[DATA] stage=panel_integrity %s", prov.to_log_kv())
 
     # Baseline trading calendar
     market_dates = np.array(sorted(ph["date"].unique()))
