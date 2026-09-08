@@ -261,14 +261,44 @@ def estimate_round_trip_cost_bp(
     round_trip_ticks: float = 2.0,
     statutory_bp: float = STATUTORY_COST_BP,
     impact_col: str | None = None,
+    date_col: str | None = None,
+    market_col: str | None = None,
 ) -> pd.DataFrame:
-    """Compose per-row round-trip cost; fail-open on unmeasured inputs."""
+    """Compose per-row round-trip cost; fail-open on unmeasured inputs.
+
+    Args:
+        df: Input frame with the price column.
+        price_col: Close price column.
+        round_trip_ticks: Ticks charged for the round trip.
+        statutory_bp: Statutory cost in bp.
+        impact_col: Optional measured auction-impact column.
+        date_col: Optional trade-date column for PIT tick costing.
+        market_col: Optional board column; requires date_col.
+
+    Returns:
+        Copy of df with tick_krw, spread_bp, statutory_bp and totals.
+    """
+    if market_col is not None and date_col is None:
+        raise ValueError("market_col requires date_col for point-in-time costing")
+    if date_col is not None and date_col not in df.columns:
+        raise ValueError(f"df is missing date_col {date_col!r}")
     if price_col not in df.columns:
         raise ValueError(f"df is missing price_col {price_col!r}")
     out = df.copy()
     prices = pd.to_numeric(out[price_col], errors="coerce").to_numpy(dtype=np.float64)
-    tick = krx_tick_size(prices)
-    spread = spread_cost_bp(prices, round_trip_ticks=float(round_trip_ticks))
+    if date_col is not None:
+        dates = pd.to_datetime(out[date_col], errors="coerce").to_numpy()
+        if market_col is not None:
+            market_values = out[market_col].astype(str).to_numpy(dtype=object)
+        else:
+            market_values = np.full(len(out), "UNKNOWN", dtype=object)
+        tick = krx_tick_size_asof(prices, dates, market_values)
+        spread = np.full(prices.shape, np.nan, dtype=np.float64)
+        ok = np.isfinite(tick) & np.isfinite(prices) & (prices > 0.0)
+        spread[ok] = float(round_trip_ticks) * tick[ok] / prices[ok] * 10000.0
+    else:
+        tick = krx_tick_size(prices)
+        spread = spread_cost_bp(prices, round_trip_ticks=float(round_trip_ticks))
     out["tick_krw"] = np.asarray(tick, dtype=np.float64)
     out["spread_bp"] = np.asarray(spread, dtype=np.float64)
     out["statutory_bp"] = np.full(len(out), float(statutory_bp), dtype=np.float64)

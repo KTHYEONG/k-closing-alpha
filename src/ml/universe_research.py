@@ -21,6 +21,7 @@ import pandas as pd
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet
+from src.data.panel_integrity import load_price_panel
 from src.execution import cost_model
 from src.ml.buyability import classify_ceiling_entry
 from src.ml.dataset import build_ml_dataset
@@ -261,7 +262,8 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
     if not os.path.exists(args.price_history):
         raise ValueError(f"price_history not found: {args.price_history}")
-    price_history_df = pd.read_parquet(args.price_history)
+    price_history_df, panel_prov = load_price_panel(args.price_history)
+    logger.info("[DATA] stage=panel_integrity %s", panel_prov.to_log_kv())
     theme_df = pd.read_parquet(args.theme) if os.path.exists(args.theme) else None
     date_col = "date" if "date" in price_history_df.columns else "trade_date"
     start_date = args.start_date or str(pd.to_datetime(price_history_df[date_col]).min().date())
