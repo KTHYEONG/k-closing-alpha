@@ -99,7 +99,7 @@ def test_universe_research_main_writes_grid_parquet(tmp_path) -> None:
           "--out", str(out_path), "--cpcv-n-groups", "5", "--cpcv-k-test", "2"])
 
     df = pd.read_parquet(out_path)
-    assert len(df) == 6 and "screen_name" in df.columns and "ranked_top1_net_bp" in df.columns
+    assert len(df) == 7 and "screen_name" in df.columns and "ranked_top1_net_bp" in df.columns
 
     with pytest.raises(ValueError, match="price_history not found"):
         main(["--price-history", str(tmp_path / "missing.parquet"), "--out", str(out_path)])
