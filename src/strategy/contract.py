@@ -11,7 +11,36 @@ from enum import StrEnum
 import numpy as np
 import pandas as pd
 
-from src.execution.cost_model import spread_cost_bp
+# tick_cost_bp 는 UniverseSpec.max_tick_cost_bp 가 소비하는 tick_cost_bp 컬럼의
+# 생산자다. 스크린 계약과 함께 쓰이므로 이 모듈에서 재수출한다.
+from src.execution.cost_model import spread_cost_bp, tick_cost_bp
+
+__all__ = [
+    "AA_COST",
+    "APPROXIMATE_SPEARMAN_THRESHOLD",
+    "CEILING_CHG_THRESHOLD",
+    "COST_AWARE_UNIVERSE",
+    "DEFAULT_UNIVERSE",
+    "KCA_TOP3_SHADOW_001",
+    "KCA_TOPK_COSTAWARE_001",
+    "KRX_DAILY_LIMIT_RATIO",
+    "MIN_ROUND_TRIP_TICKS",
+    "PA_COST",
+    "CostSpec",
+    "ExecutionMode",
+    "FeatureContractRow",
+    "StrategySpec",
+    "UniverseSpec",
+    "assert_production_feature_set",
+    "classify_feature_contract",
+    "derive_chg_ratio",
+    "detect_mixed_unit_rows",
+    "mark_ceiling",
+    "round_trip_cost_bp",
+    "select_universe",
+    "spread_cost_bp",
+    "tick_cost_bp",
+]
 
 
 class ExecutionMode(StrEnum):
@@ -22,6 +51,8 @@ class ExecutionMode(StrEnum):
 MIN_ROUND_TRIP_TICKS: dict[ExecutionMode, float] = {ExecutionMode.AA: 2.0, ExecutionMode.PA: 1.0}
 
 CEILING_CHG_THRESHOLD: float = 0.29
+
+KRX_DAILY_LIMIT_RATIO: float = 0.31
 
 APPROXIMATE_SPEARMAN_THRESHOLD: float = 0.99
 
@@ -50,6 +81,7 @@ class UniverseSpec:
     min_trade_value_100m: float = 100.0
     min_market_cap_100m: float = 500.0
     exclude_ceiling: bool = True
+    max_tick_cost_bp: float | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +117,44 @@ KCA_TOP3_SHADOW_001: StrategySpec = StrategySpec(
     strategy_id="KCA-TOP3-SHADOW-001", top_k=3, universe=DEFAULT_UNIVERSE, cost=AA_COST
 )
 
+COST_AWARE_UNIVERSE: UniverseSpec = UniverseSpec(
+    chg_min=0.02,
+    chg_max=0.10,
+    min_trade_value_100m=100.0,
+    min_market_cap_100m=500.0,
+    exclude_ceiling=True,
+    max_tick_cost_bp=7.5,
+)
+
+KCA_TOPK_COSTAWARE_001: StrategySpec = StrategySpec(
+    strategy_id="KCA-TOPK-COSTAWARE-001", top_k=3, universe=COST_AWARE_UNIVERSE, cost=AA_COST
+)
+
+
+def derive_chg_ratio(close: np.ndarray, prev_close: np.ndarray, *, limit: float = KRX_DAILY_LIMIT_RATIO) -> np.ndarray:
+    """Deterministic close/prev_close - 1; bad prev_close and limit violations yield NaN."""
+    c = np.asarray(close, dtype=np.float64)
+    p = np.asarray(prev_close, dtype=np.float64)
+    out = np.full(c.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(c) & np.isfinite(p) & (p > 0.0)
+    np.divide(c, p, out=out, where=valid)
+    ratio = out - 1.0
+    over = valid & np.isfinite(ratio) & (np.abs(ratio) > float(limit))
+    ratio[over] = np.nan
+    return np.asarray(ratio, dtype=np.float64)
+
+
+def detect_mixed_unit_rows(
+    close: np.ndarray, prev_close: np.ndarray, vendor_change: np.ndarray, *, rtol: float = 1e-4
+) -> np.ndarray:
+    """Flag rows where vendor_change matches ratio*100 but not ratio (percent-encoded)."""
+    v = np.asarray(vendor_change, dtype=np.float64)
+    ratio = derive_chg_ratio(np.asarray(close, dtype=np.float64), np.asarray(prev_close, dtype=np.float64))
+    computable = np.isfinite(ratio) & np.isfinite(v)
+    match_pct = np.isclose(v, ratio * 100.0, rtol=float(rtol), atol=0.0, equal_nan=False)
+    match_ratio = np.isclose(v, ratio, rtol=float(rtol), atol=0.0, equal_nan=False)
+    return np.asarray(computable & match_pct & (~match_ratio), dtype=bool)
+
 
 def round_trip_cost_bp(price: np.ndarray | float, cost: CostSpec = AA_COST) -> np.ndarray:
     arr = np.asarray(price, dtype=np.float64)
@@ -107,6 +177,8 @@ def select_universe(df: pd.DataFrame, spec: UniverseSpec = DEFAULT_UNIVERSE) -> 
     required = ["chg_ratio", "tv_clean", "mc_clean", "close", "volume"]
     if spec.exclude_ceiling:
         required = [*required, "is_ceiling"]
+    if spec.max_tick_cost_bp is not None:
+        required = [*required, "tick_cost_bp"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"select_universe missing required columns: {missing}")
@@ -126,6 +198,9 @@ def select_universe(df: pd.DataFrame, spec: UniverseSpec = DEFAULT_UNIVERSE) -> 
     if spec.exclude_ceiling:
         ceiling = df["is_ceiling"].to_numpy(dtype=bool)
         mask = mask & (~ceiling)
+    if spec.max_tick_cost_bp is not None:
+        tick_bp = df["tick_cost_bp"].to_numpy(dtype=np.float64)
+        mask = mask & (tick_bp <= float(spec.max_tick_cost_bp))
     return np.asarray(mask, dtype=bool)
 
 
