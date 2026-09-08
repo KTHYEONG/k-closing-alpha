@@ -98,7 +98,7 @@ def test_normalize_bar_frame_rejects_unknown_vendor() -> None:
     raw = pd.DataFrame({"time": ["090100"], "open": [1], "high": [1], "low": [1], "close": [1], "jdiff_vol": [1], "value": [1]})
 
     with pytest.raises(ValueError):  # noqa: PT011 - contract skeleton asserts fail-closed vendor
-        normalize_bar_frame(raw, "kiwoom", "2026-09-04", "005930")
+        normalize_bar_frame(raw, "unknown_vendor", "2026-09-04", "005930")
 
     incomplete = pd.DataFrame({"time": ["090100"], "open": [1]})
     with pytest.raises(ValueError):  # noqa: PT011 - contract skeleton asserts fail-closed columns
@@ -283,4 +283,61 @@ def test_normalize_tick_frame_rejects_unknown_vendor() -> None:
 
     with pytest.raises(ValueError, match="Unknown intraday vendor"):
         normalize_tick_frame(raw, "unknown_vendor", "2026-09-04", "005930")
+
+
+def test_normalize_bar_frame_kiwoom_vendor() -> None:
+    import pandas as pd
+    from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, normalize_bar_frame
+
+    raw = pd.DataFrame([
+        {
+            "cntr_tm": "20260904195900",
+            "cur_prc": "+257000",
+            "open_pric": "+256500",
+            "high_pric": "+257000",
+            "low_pric": "+256500",
+            "trde_qty": "100",
+        }
+    ])
+    df = normalize_bar_frame(raw, "kiwoom", "2026-09-04", "005930")
+    assert list(df.columns) == list(CANONICAL_BAR_COLUMNS)
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["symbol"] == "005930"
+    assert row["ts_hms"] == 195900
+    assert row["close"] == 257000
+    assert row["open"] == 256500
+    assert row["high"] == 257000
+    assert row["low"] == 256500
+    assert row["volume"] == 100
+    assert row["value_krw"] == 257000 * 100
+    assert row["vendor"] == "kiwoom"
+    assert row["has_trade"] is True
+
+
+def test_normalize_bar_and_tick_kiwoom_strips_negative_signs() -> None:
+    import pandas as pd
+    from src.data.intraday_schema import normalize_bar_frame, normalize_tick_frame
+
+    bar_raw = pd.DataFrame([
+        {
+            "cntr_tm": "20260904084500",
+            "cur_prc": "-257000",
+            "open_pric": "-256500",
+            "high_pric": "-257000",
+            "low_pric": "-256500",
+            "trde_qty": "100",
+        }
+    ])
+    df_bar = normalize_bar_frame(bar_raw, "kiwoom", "2026-09-04", "005930")
+    assert df_bar["close"].iloc[0] == 257000
+    assert df_bar["open"].iloc[0] == 256500
+    assert df_bar["value_krw"].iloc[0] == 257000 * 100
+
+    tick_raw = pd.DataFrame([
+        {"cur_prc": "-257000", "trde_qty": "50", "cntr_tm": "20260904153000"}
+    ])
+    df_tick = normalize_tick_frame(tick_raw, "kiwoom", "2026-09-04", "005930")
+    assert df_tick["price"].iloc[0] == 257000
+    assert df_tick["volume"].iloc[0] == 50
 

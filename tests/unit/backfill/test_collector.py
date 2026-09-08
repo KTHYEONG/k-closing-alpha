@@ -565,3 +565,329 @@ def test_collect_intraday_trade_ticks_no_kiwoom_client_falls_back_to_ls_unchange
     assert len(result) == 1
     assert result.iloc[0]["vendor"] == "ls"
 
+
+def test_collect_nxt_aftermarket_bars_prefers_kiwoom() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_minute_chart.return_value = {
+        "rt_cd": "0",
+        "output2": [{"cntr_tm": "20260904195900", "cur_prc": "+257000", "open_pric": "+256500", "high_pric": "+257000", "low_pric": "+256500", "trde_qty": "100"}],
+        "vendor": "kiwoom",
+    }
+    kis_client = AsyncMock()
+
+    df = asyncio.run(collect_nxt_aftermarket_bars(kis_client, object(), ["005930"], "2026-09-04", kiwoom_client=kw_client))
+
+    assert len(df) == 1
+    assert df.iloc[0]["symbol"] == "005930"
+    assert df.iloc[0]["vendor"] == "kiwoom"
+    assert kw_client.get_nxt_minute_chart.call_count == 1
+    assert kis_client.get_intraday_minute_chart.call_count == 0
+
+
+def test_collect_nxt_aftermarket_bars_falls_back_to_kis_when_kiwoom_fails() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_minute_chart.return_value = {"rt_cd": "1", "output2": []}
+    kis_client = AsyncMock()
+    kis_client.get_intraday_minute_chart.return_value = {
+        "rt_cd": "0",
+        "output2": [{"stck_bsop_date": "20260904", "stck_cntg_hour": "195900", "stck_prpr": "257000", "stck_oprc": "256500", "stck_hgpr": "257000", "stck_lwpr": "256500", "cntg_vol": "100", "acml_tr_pbmn": "25700000"}],
+    }
+
+    df = asyncio.run(collect_nxt_aftermarket_bars(kis_client, object(), ["005930"], "2026-09-04", kiwoom_client=kw_client))
+
+    assert len(df) == 1
+    assert df.iloc[0]["symbol"] == "005930"
+    assert df.iloc[0]["vendor"] == "kis"
+    assert kw_client.get_nxt_minute_chart.call_count == 1
+    assert kis_client.get_intraday_minute_chart.call_count == 1
+
+
+def test_collect_nxt_aftermarket_bars_zero_regression_when_kiwoom_none() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    kis_client = AsyncMock()
+    kis_client.get_intraday_minute_chart.return_value = {
+        "rt_cd": "0",
+        "output2": [{"stck_bsop_date": "20260904", "stck_cntg_hour": "195900", "stck_prpr": "257000", "stck_oprc": "256500", "stck_hgpr": "257000", "stck_lwpr": "256500", "cntg_vol": "100", "acml_tr_pbmn": "25700000"}],
+    }
+
+    df = asyncio.run(collect_nxt_aftermarket_bars(kis_client, object(), ["005930"], "2026-09-04", kiwoom_client=None))
+
+    assert len(df) == 1
+    assert df.iloc[0]["symbol"] == "005930"
+    assert df.iloc[0]["vendor"] == "kis"
+    assert kis_client.get_intraday_minute_chart.call_count == 1
+
+
+def test_collect_nxt_aftermarket_bars_empty_universe_with_kiwoom_returns_empty() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    result = asyncio.run(
+        collect_nxt_aftermarket_bars(AsyncMock(), session=None, stock_codes=[], snapshot_date="2026-09-04", kiwoom_client=AsyncMock())
+    )
+
+    assert result.empty
+
+
+def test_collect_nxt_aftermarket_bars_kiwoom_exception_falls_back_to_kis() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_minute_chart = AsyncMock(side_effect=RuntimeError("kiwoom unreachable"))
+    kis_client = AsyncMock()
+    kis_client.get_intraday_minute_chart = AsyncMock(
+        return_value={"rt_cd": "0", "output2": [_kis_bar("154000", "71000", "100", "7100000")]}
+    )
+
+    df = asyncio.run(collect_nxt_aftermarket_bars(kis_client, object(), ["005930"], "2026-09-04", kiwoom_client=kw_client))
+
+    assert len(df) == 1
+    assert df.iloc[0]["symbol"] == "005930"
+    assert df.iloc[0]["vendor"] == "kis"
+
+
+def test_collect_nxt_aftermarket_bars_kiwoom_normalize_failure_yields_empty_no_fallback() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_minute_chart = AsyncMock(
+        return_value={"rt_cd": "0", "vendor": "kiwoom", "output2": [{"cntr_tm": "20260904195900"}]}
+    )
+    mock_kis = AsyncMock()
+
+    result = asyncio.run(
+        collect_nxt_aftermarket_bars(mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04", kiwoom_client=kw_client)
+    )
+
+    assert result.empty
+    mock_kis.get_intraday_minute_chart.assert_not_awaited()
+
+
+def test_collect_nxt_aftermarket_bars_kiwoom_empty_success_skips_kis() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_minute_chart = AsyncMock(return_value={"rt_cd": "0", "output2": []})
+    mock_kis = AsyncMock()
+
+    result = asyncio.run(
+        collect_nxt_aftermarket_bars(mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04", kiwoom_client=kw_client)
+    )
+
+    assert result.empty
+    mock_kis.get_intraday_minute_chart.assert_not_awaited()
+
+
+def test_collect_nxt_aftermarket_bars_kis_fallback_exception_yields_empty() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_minute_chart = AsyncMock(return_value={"rt_cd": "1", "output2": []})
+    mock_kis = AsyncMock()
+    mock_kis.get_intraday_minute_chart = AsyncMock(side_effect=RuntimeError("KIS unreachable"))
+
+    result = asyncio.run(
+        collect_nxt_aftermarket_bars(mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04", kiwoom_client=kw_client)
+    )
+
+    assert result.empty
+
+
+def test_collect_nxt_aftermarket_bars_kis_fallback_non_zero_rt_cd_yields_empty() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_minute_chart = AsyncMock(return_value={"rt_cd": "1", "output2": []})
+    mock_kis = AsyncMock()
+    mock_kis.get_intraday_minute_chart = AsyncMock(return_value={"rt_cd": "9", "msg1": "error"})
+
+    result = asyncio.run(
+        collect_nxt_aftermarket_bars(mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04", kiwoom_client=kw_client)
+    )
+
+    assert result.empty
+
+
+def test_collect_nxt_aftermarket_bars_kis_fallback_empty_rows_yields_empty() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_minute_chart = AsyncMock(return_value={"rt_cd": "1", "output2": []})
+    mock_kis = AsyncMock()
+    mock_kis.get_intraday_minute_chart = AsyncMock(return_value={"rt_cd": "0", "output2": []})
+
+    result = asyncio.run(
+        collect_nxt_aftermarket_bars(mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04", kiwoom_client=kw_client)
+    )
+
+    assert result.empty
+
+
+
+def test_collect_nxt_premarket_bars_prefers_kiwoom() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_premarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_premarket_chart.return_value = {
+        "rt_cd": "0",
+        "output2": [{"cntr_tm": "20260904080000", "cur_prc": "+251500", "open_pric": "+251000", "high_pric": "+253500", "low_pric": "+251000", "trde_qty": "100"}],
+        "vendor": "kiwoom",
+    }
+    kis_client = AsyncMock()
+
+    df = asyncio.run(collect_nxt_premarket_bars(kis_client, object(), ["005930"], "2026-09-04", kiwoom_client=kw_client))
+
+    assert len(df) == 1
+    assert df.iloc[0]["symbol"] == "005930"
+    assert df.iloc[0]["vendor"] == "kiwoom"
+    assert kw_client.get_nxt_premarket_chart.call_count == 1
+    assert kis_client.get_intraday_minute_chart.call_count == 0
+
+
+def test_collect_nxt_premarket_bars_falls_back_to_kis_when_kiwoom_fails() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_premarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_premarket_chart.return_value = {"rt_cd": "1", "output2": []}
+    kis_client = AsyncMock()
+    kis_client.get_intraday_minute_chart.return_value = {
+        "rt_cd": "0",
+        "output2": [{"stck_bsop_date": "20260904", "stck_cntg_hour": "080000", "stck_prpr": "251500", "stck_oprc": "251000", "stck_hgpr": "253500", "stck_lwpr": "251000", "cntg_vol": "100", "acml_tr_pbmn": "25150000"}],
+    }
+
+    df = asyncio.run(collect_nxt_premarket_bars(kis_client, object(), ["005930"], "2026-09-04", kiwoom_client=kw_client))
+
+    assert len(df) == 1
+    assert df.iloc[0]["symbol"] == "005930"
+    assert df.iloc[0]["vendor"] == "kis"
+    assert kw_client.get_nxt_premarket_chart.call_count == 1
+    assert kis_client.get_intraday_minute_chart.call_count == 1
+
+
+def test_collect_nxt_premarket_bars_zero_regression_when_kiwoom_none() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_premarket_bars
+
+    kis_client = AsyncMock()
+    kis_client.get_intraday_minute_chart.return_value = {
+        "rt_cd": "0",
+        "output2": [{"stck_bsop_date": "20260904", "stck_cntg_hour": "080000", "stck_prpr": "251500", "stck_oprc": "251000", "stck_hgpr": "253500", "stck_lwpr": "251000", "cntg_vol": "100", "acml_tr_pbmn": "25150000"}],
+    }
+
+    df = asyncio.run(collect_nxt_premarket_bars(kis_client, object(), ["005930"], "2026-09-04", kiwoom_client=None))
+
+    assert len(df) == 1
+    assert df.iloc[0]["symbol"] == "005930"
+    assert df.iloc[0]["vendor"] == "kis"
+    assert kis_client.get_intraday_minute_chart.call_count == 1
+
+
+def test_collect_nxt_premarket_bars_empty_universe_with_kiwoom_returns_empty() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_premarket_bars
+
+    result = asyncio.run(
+        collect_nxt_premarket_bars(AsyncMock(), session=None, stock_codes=[], snapshot_date="2026-09-04", kiwoom_client=AsyncMock())
+    )
+
+    assert result.empty
+
+
+def test_collect_nxt_premarket_bars_kiwoom_normalize_failure_yields_empty_no_fallback() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_premarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_premarket_chart = AsyncMock(
+        return_value={"rt_cd": "0", "vendor": "kiwoom", "output2": [{"cntr_tm": "20260904080000"}]}
+    )
+    mock_kis = AsyncMock()
+
+    result = asyncio.run(
+        collect_nxt_premarket_bars(mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04", kiwoom_client=kw_client)
+    )
+
+    assert result.empty
+    mock_kis.get_intraday_minute_chart.assert_not_awaited()
+
+
+def test_collect_nxt_premarket_bars_kiwoom_empty_success_skips_kis() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_premarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_premarket_chart = AsyncMock(return_value={"rt_cd": "0", "output2": []})
+    mock_kis = AsyncMock()
+
+    result = asyncio.run(
+        collect_nxt_premarket_bars(mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04", kiwoom_client=kw_client)
+    )
+
+    assert result.empty
+    mock_kis.get_intraday_minute_chart.assert_not_awaited()
+
+
+def test_collect_nxt_premarket_bars_kis_fallback_non_zero_rt_cd_yields_empty() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_premarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_premarket_chart = AsyncMock(return_value={"rt_cd": "1", "output2": []})
+    mock_kis = AsyncMock()
+    mock_kis.get_intraday_minute_chart = AsyncMock(return_value={"rt_cd": "9", "msg1": "error"})
+
+    result = asyncio.run(
+        collect_nxt_premarket_bars(mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04", kiwoom_client=kw_client)
+    )
+
+    assert result.empty
+
+
+def test_collect_nxt_premarket_bars_kis_fallback_empty_rows_yields_empty() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.backfill.intraday.collector import collect_nxt_premarket_bars
+
+    kw_client = AsyncMock()
+    kw_client.get_nxt_premarket_chart = AsyncMock(return_value={"rt_cd": "1", "output2": []})
+    mock_kis = AsyncMock()
+    mock_kis.get_intraday_minute_chart = AsyncMock(return_value={"rt_cd": "0", "output2": []})
+
+    result = asyncio.run(
+        collect_nxt_premarket_bars(mock_kis, session=None, stock_codes=["005930"], snapshot_date="2026-09-04", kiwoom_client=kw_client)
+    )
+
+    assert result.empty
