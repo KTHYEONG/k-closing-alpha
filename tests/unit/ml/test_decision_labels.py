@@ -198,3 +198,59 @@ def test_attach_mechanical_return_passes_through_nd_date() -> None:
 
     assert "nd_date" in out.columns
     assert pd.Timestamp(out["nd_date"].iloc[0]) == pd.Timestamp("2024-01-03")
+
+
+def test_attach_per_row_cost_ratio_uses_pit_tick_for_pre_reform_rows() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.decision_labels import attach_per_row_cost_ratio
+
+    # Given: one pre-reform and one post-reform 15,000원 entry
+    df = pd.DataFrame({
+        "close_price": [15000.0, 15000.0],
+        "trade_date": pd.to_datetime(["2023-01-24", "2023-01-25"]),
+        "market_type": ["KOSPI", "KOSPI"],
+    })
+
+    # When
+    out = attach_per_row_cost_ratio(df, date_col="trade_date", market_col="market_type")
+
+    # Then
+    assert np.isclose(out["cost_ratio"].iloc[0], (20.0 + 2.0 * 50.0 / 15000.0 * 1e4) / 1e4)
+    assert np.isclose(out["cost_ratio"].iloc[1], (20.0 + 2.0 * 10.0 / 15000.0 * 1e4) / 1e4)
+    assert out["cost_measured"].tolist() == [True, True]
+    # The reform is a real cost break, not a rounding difference
+    assert out["cost_ratio"].iloc[0] > out["cost_ratio"].iloc[1]
+
+
+def test_build_decision_labels_per_row_cost_is_point_in_time() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.decision_labels import build_decision_labels
+
+    # Given: a pre-reform journaled row on a KOSPI 15,000원 close
+    processed = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2023-01-24"]),
+        "stock_code": ["000001"],
+        "market_type": ["KOSPI"],
+        "close_price": [15000.0],
+        "net_return": [3.0],
+        "target_return": [0.0],
+    })
+
+    # When
+    out, prov = build_decision_labels(
+        processed, None, label_mode="journaled", cost_mode="per_row",
+        clip_lower=-0.10, clip_upper=0.10,
+    )
+
+    # Then: the pre-reform 50원 tick is used, not the post-reform 10원 tick
+    expected = (20.0 + 2.0 * 50.0 / 15000.0 * 1e4) / 1e4
+    assert np.isclose(out["cost_ratio"].iloc[0], expected)
+    assert np.isclose(out["eval_net_journaled"].iloc[0], 0.03 - expected)
+    assert np.isclose(out["target_return"].iloc[0], 0.03 - expected)
+    assert prov["cost_mode"] == "per_row"
+
+

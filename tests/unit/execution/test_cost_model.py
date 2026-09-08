@@ -303,3 +303,60 @@ def test_tick_cost_bp_returns_single_tick_bp() -> None:
     assert per_tick[1] > 7.5
     # 왕복 2틱은 개편 후 구간에서 기존 spread_cost_bp 와 동일
     np.testing.assert_allclose(2.0 * per_tick, spread_cost_bp(price, round_trip_ticks=2.0))
+
+
+def test_estimate_round_trip_cost_bp_uses_point_in_time_tick_when_date_given() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.execution.cost_model import STATUTORY_COST_BP, estimate_round_trip_cost_bp
+
+    # Given: the same 15,000원 close either side of the 2023-01-25 tick reform
+    df = pd.DataFrame({
+        "close_price": [15000.0, 15000.0],
+        "trade_date": pd.to_datetime(["2023-01-24", "2023-01-25"]),
+        "market_type": ["KOSPI", "KOSPI"],
+    })
+
+    # When: point-in-time costing is requested
+    out = estimate_round_trip_cost_bp(df, date_col="trade_date", market_col="market_type")
+
+    # Then: 50원 tick pre-reform, 10원 tick post-reform
+    assert out["tick_krw"].tolist() == pytest.approx([50.0, 10.0])
+    assert out["spread_bp"].tolist() == pytest.approx(
+        [2.0 * 50.0 / 15000.0 * 1e4, 2.0 * 10.0 / 15000.0 * 1e4]
+    )
+    assert out["round_trip_cost_bp"].tolist() == pytest.approx(
+        [
+            STATUTORY_COST_BP + 2.0 * 50.0 / 15000.0 * 1e4,
+            STATUTORY_COST_BP + 2.0 * 10.0 / 15000.0 * 1e4,
+        ]
+    )
+
+    # And: the legacy call is unchanged - the post-reform table for both rows
+    legacy = estimate_round_trip_cost_bp(df)
+    assert legacy["tick_krw"].tolist() == pytest.approx([10.0, 10.0])
+
+
+def test_estimate_round_trip_cost_bp_rejects_unpaired_or_missing_pit_columns() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.execution.cost_model import estimate_round_trip_cost_bp
+
+    # Given
+    df = pd.DataFrame({
+        "close_price": [15000.0],
+        "trade_date": pd.to_datetime(["2023-01-24"]),
+        "market_type": ["KOSPI"],
+    })
+
+    # When / Then: a market without a date cannot be point-in-time
+    with pytest.raises(ValueError, match="market_col requires date_col"):
+        estimate_round_trip_cost_bp(df, market_col="market_type")
+
+    # And: a date column that does not exist fails closed rather than silently degrading
+    with pytest.raises(ValueError, match="missing_date"):
+        estimate_round_trip_cost_bp(df, date_col="missing_date")
+
+
