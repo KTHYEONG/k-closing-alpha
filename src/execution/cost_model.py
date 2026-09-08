@@ -45,6 +45,28 @@ KRX_TICK_BANDS: tuple[tuple[float, float], ...] = (
     (float("inf"), 1000.0),
 )
 
+TICK_REFORM_DATE: np.datetime64 = np.datetime64("2023-01-25")
+
+KRX_TICK_BANDS_PRE_REFORM_KOSPI: tuple[tuple[float, float], ...] = (
+    (1000.0, 1.0),
+    (5000.0, 5.0),
+    (10000.0, 10.0),
+    (50000.0, 50.0),
+    (100000.0, 100.0),
+    (500000.0, 500.0),
+    (float("inf"), 1000.0),
+)
+
+KRX_TICK_BANDS_PRE_REFORM_KOSDAQ: tuple[tuple[float, float], ...] = (
+    (1000.0, 1.0),
+    (5000.0, 5.0),
+    (10000.0, 10.0),
+    (50000.0, 50.0),
+    (float("inf"), 100.0),
+)
+
+KOSDAQ_MARKET_LABELS: frozenset[str] = frozenset({"KOSDAQ", "KSQ150"})
+
 STATUTORY_COST_BP: float = 20.0
 
 _AUCTION_CLOSE_HMS: int = 153000
@@ -78,6 +100,40 @@ def spread_cost_bp(price: np.ndarray, *, round_trip_ticks: float = 2.0) -> np.nd
     out = np.full(arr.shape, np.nan, dtype=np.float64)
     ok = np.isfinite(tick) & np.isfinite(arr) & (arr > 0.0)
     out[ok] = float(round_trip_ticks) * tick[ok] / arr[ok] * 10000.0
+    return out
+
+
+def krx_tick_size_asof(price: np.ndarray, trade_date: np.ndarray, market: np.ndarray) -> np.ndarray:
+    """Point-in-time KRX tick with the 2023-01-25 reform boundary; bad inputs propagate NaN."""
+    arr = np.asarray(price, dtype=np.float64)
+    dates = np.asarray(trade_date, dtype="datetime64[ns]")
+    is_nat = np.isnat(dates)
+    is_kosdaq = np.isin(np.asarray(market, dtype=object), list(KOSDAQ_MARKET_LABELS))
+    is_post = dates >= np.datetime64(TICK_REFORM_DATE)
+    valid = np.isfinite(arr) & (arr > 0.0) & (~is_nat)
+    tick = np.full(arr.shape, np.nan, dtype=np.float64)
+    post = valid & is_post
+    for bound, size in KRX_TICK_BANDS:
+        take = post & np.isnan(tick) & (arr < float(bound))
+        tick[take] = float(size)
+    pre_q = valid & (~is_post) & is_kosdaq
+    for bound, size in KRX_TICK_BANDS_PRE_REFORM_KOSDAQ:
+        take = pre_q & np.isnan(tick) & (arr < float(bound))
+        tick[take] = float(size)
+    pre_p = valid & (~is_post) & (~is_kosdaq)
+    for bound, size in KRX_TICK_BANDS_PRE_REFORM_KOSPI:
+        take = pre_p & np.isnan(tick) & (arr < float(bound))
+        tick[take] = float(size)
+    return tick
+
+
+def tick_cost_bp(price: np.ndarray, trade_date: np.ndarray, market: np.ndarray) -> np.ndarray:
+    """Single-tick cost in bp (tick / price * 1e4); bad inputs propagate NaN, never 0."""
+    arr = np.asarray(price, dtype=np.float64)
+    tick = krx_tick_size_asof(arr, trade_date, market)
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    ok = np.isfinite(tick) & np.isfinite(arr) & (arr > 0.0)
+    out[ok] = tick[ok] / arr[ok] * 10000.0
     return out
 
 

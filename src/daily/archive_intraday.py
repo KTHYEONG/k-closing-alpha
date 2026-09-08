@@ -23,12 +23,13 @@ from src.config.market_session import (
     INTRADAY_SESSION_REGULAR,
 )
 from src.daily import archive
-from src.daily.universe_scan import UNIVERSE_SCAN_SCENARIO_TAG
 from src.data.intraday_store import write_intraday_partition, write_tick_partition
 
 logger = logging.getLogger(__name__)
 
-EXCLUDED_INTRADAY_SCENARIOS: frozenset[str] = frozenset({UNIVERSE_SCAN_SCENARIO_TAG})
+# 등락률스캔 풀도 1분봉/틱 수집 대상에 포함한다(비용축 스크린의 실측 스프레드 확보).
+# 명시적 제외가 필요하면 _today_watchlist_codes(exclude_scenarios=...) 로 opt-out.
+EXCLUDED_INTRADAY_SCENARIOS: frozenset[str] = frozenset()
 
 
 def _today_watchlist_codes(snapshot_date: str, exclude_scenarios: frozenset[str] = EXCLUDED_INTRADAY_SCENARIOS) -> list[str]:
