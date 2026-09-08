@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_UNIVERSE_SCREEN_REDESIGN",
+      "date": "2026-09-08",
+      "adr_id": "ADR_20260908_UNIVERSE_SCREEN_REDESIGN",
+      "domain": "strategy",
+      "title": "비용축 진입 스크린: 시점정합 1틱비용 상한 + 등락률 혼합단위 교정",
+      "why": "레거시 운영자 스크린(등락률>=10%)은 비용후 -38.9bp/일(Sharpe -3.43)로 무필터(-34.5bp)보다 나쁘고, 전수패널 분해 결과 실측 지배 필터는 KRX 호가단위에서 유도되는 1틱비용 상한이었다(2023-01-25 개편후 876일: 등락률2~10% -19.8bp -> +1틱<=7.5bp +6.5bp).",
+      "resolution": "UniverseSpec.max_tick_cost_bp 추가; cost_model에 시점정합 krx_tick_size_asof/tick_cost_bp(2023-01-25 개편경계, NaN전파) 신설; contract에 derive_chg_ratio/detect_mixed_unit_rows(벤더 daily_change_pct 심볼별 ratio/percent 혼합오염 교정) 신설; v3_engine.load_and_prepare/build_candidate_universe 배선; archive_intraday의 등락률스캔 수집 허용.",
+      "impact": "DEFAULT_UNIVERSE 및 기존 스펙 불변(하위호환); COST_AWARE_UNIVERSE/KCA_TOPK_COSTAWARE_001은 opt-in; 비용스크린 검증은 2023-01-25 이후로 한정. Open: archive_intraday 런타임 상한 재검증(Stream C 가드 되돌림), 신규풀 왕복틱수 실측(현재 근거 1일), 연구하니스 프로덕션 재실행."
+    },
+    {
       "task_id": "TASK_NXT_PREMARKET_COLLECTION",
       "date": "2026-09-08",
       "adr_id": "ADR_20260908_NXT_PREMARKET_COLLECTION",
