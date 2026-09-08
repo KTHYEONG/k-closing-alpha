@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "COSTAWARE_ML_TRAINING",
+      "date": "2026-09-08",
+      "adr_id": "ADR_20260908_COSTAWARE_ML_TRAINING",
+      "domain": "ml",
+      "title": "COST_AWARE 스크린 ML 학습 경로 개방",
+      "why": "ScreenConfig에 tick-cost cap 필드가 없어 검증된 COST_AWARE_UNIVERSE로 ML 리랭커 학습이 불가능했음",
+      "resolution": "ScreenConfig.max_tick_cost_bp 추가, build_universe_panel의 raw tv/mc NaN(18%) 버그를 tv_clean/mc_clean 우선으로 수정, COST_AWARE_SCREEN을 SCREEN_REGISTRY 밖에 격리해 journaled-population 오사용 구조적 차단",
+      "impact": "886 passed/1 failed(기존 R19)/9 skipped, ruff·mypy clean; build_universe_panel이 select_universe와 실측 row-for-row 일치(11819/879) 확인"
+    },
+    {
       "task_id": "COSTAWARE_TOPK_BACKTEST",
       "date": "2026-09-08",
       "adr_id": "ADR_20260908_COSTAWARE_TOPK_BACKTEST",
