@@ -26,7 +26,7 @@
 - **Concise In-Code Comments & No Ephemeral Spec Refs:** In-line comments must be 1-2 lines maximum, explaining only immediate "Why" or domain constraints without multi-line storytelling. NEVER cite temporary `docs/specs/*.md` or `contract.json` paths in code, docstrings, CLI help, or comments (use persistent `ADR-XXXX` IDs or self-contained logic).
 
 ## 5. Domain & Skill Rule Routing
-- **Python Architecture & Standards:** [python.md](file:///.agents/rules/python.md)
+- **Code Style & Standards:** [code-style.md](file:///.agents/rules/code-style.md)
 - **Financial & Quant Engineering:** [quant.md](file:///.agents/rules/quant.md)
 - **Testing & Coverage Directives:** [testing.md](file:///.agents/rules/testing.md)
 - **Logging & Traceability Standards:** [logging.md](file:///.agents/rules/logging.md)
