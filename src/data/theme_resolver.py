@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sqlite3
 from typing import Any
 
 import pandas as pd
@@ -248,7 +247,7 @@ def resolve_stock_theme_and_market(
 def batch_resolve_missing_themes(
     stocks: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Batch resolve missing themes and persist atomically to local Parquet and SQLite DB."""
+    """Batch resolve missing themes and persist atomically to local Parquet."""
     resolved: list[dict[str, Any]] = []
     for stock in stocks:
         code = _normalize_code(str(stock.get("종목코드") or stock.get("code") or ""))
@@ -289,31 +288,5 @@ def batch_resolve_missing_themes(
         logger.info("Updated theme parquet with %d entries", len(resolved))
     except Exception as e:
         logger.warning("Failed to update theme parquet: %s", e)
-
-    # Persistence: SQLite
-    try:
-        db_path = settings.STOCK_DB_PATH
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(db_path))
-        try:
-            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='table_theme'")
-            if cur.fetchone() is None:
-                conn.execute("CREATE TABLE table_theme (종목코드 TEXT PRIMARY KEY, 테마 TEXT, 시장구분 TEXT)")
-            else:
-                cols = [row[1] for row in conn.execute("PRAGMA table_info(table_theme)")]
-                if "시장구분" not in cols:
-                    conn.execute("ALTER TABLE table_theme ADD COLUMN 시장구분 TEXT")
-                if "테마" not in cols:
-                    conn.execute("ALTER TABLE table_theme ADD COLUMN 테마 TEXT")
-            for r in resolved:
-                conn.execute(
-                    "INSERT OR REPLACE INTO table_theme (종목코드, 테마, 시장구분) VALUES (?, ?, ?)",
-                    (r["종목코드"], r["테마"], r["시장구분"]),
-                )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as e:
-        logger.warning("Failed to update theme DB: %s", e)
 
     return resolved

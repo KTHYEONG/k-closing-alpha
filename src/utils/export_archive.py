@@ -1,9 +1,8 @@
 """export_archive.py
 ------------------
-archive.db / archive.parquet → TSV/CSV 변환 유틸리티 (copy-paste 최적화).
+archive.parquet → TSV/CSV 변환 유틸리티 (copy-paste 최적화).
 
-Parquet 아카이브가 존재하면 우선 로드하고, 없으면 SQLite fallback.
-컬럼 순서는 ARCHIVE_COLUMN_ORDER (26컬럼) 고정.
+컬럼 순서는 ARCHIVE_COLUMN_ORDER 고정.
 
 Usage:
     uv run python src/utils/export_archive.py [--date YYYY-MM-DD] [--out PATH] [--format tsv|csv]
@@ -41,10 +40,9 @@ def export_archive_snapshot(
     fmt: Literal["tsv", "csv"] = "tsv",
     include_header: bool = True,
 ) -> Path:
-    """archive.parquet (또는 archive.db fallback) → TSV/CSV 파일 변환.
+    """archive.parquet → TSV/CSV 파일 변환.
 
-    Parquet 존재 시 우선 로드, 없으면 SQLite fallback.
-    컬럼 순서: ARCHIVE_COLUMN_ORDER (26컬럼) 고정.
+    컬럼 순서는 ARCHIVE_COLUMN_ORDER 고정.
     date 및 month가 None이면 최신월 자동 선택.
 
     Args:
@@ -122,7 +120,7 @@ def export_all_months(
 # ── CLI 진입점 ────────────────────────────────────────────────────────────────
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="archive.db / archive.parquet → TSV/CSV 변환 (copy-paste 최적화)",
+        description="archive.parquet → TSV/CSV 변환 (copy-paste 최적화)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

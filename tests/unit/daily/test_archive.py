@@ -7,7 +7,6 @@ SCENARIO_ARCHIVE_EXPORT_03: Export candidate snapshot as TSV string matching spr
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 import pandas as pd
@@ -25,7 +24,6 @@ def tmp_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(
         archive.settings, "HISTORY_PARQUET_PATH", a_dir / "archive.parquet"
     )
-    monkeypatch.setattr(archive.settings, "HISTORY_DB_PATH", a_dir / "archive.db")
     return a_dir
 
 
@@ -372,6 +370,13 @@ def test_archive_module_no_longer_exposes_sqlite_helpers() -> None:
 
     assert callable(archive.upsert_archive_snapshot)
     assert callable(archive.fetch_archive_snapshot)
+
+
+def test_settings_no_longer_defines_history_db_path() -> None:
+    """archive.db 완전 폐기에 따라 HISTORY_DB_PATH computed field가 제거되었는지 검증합니다."""
+    from src.daily import archive
+
+    assert not hasattr(archive.settings, "HISTORY_DB_PATH")
 
 
 def test_upsert_marks_snapshot_timestamp_synthetic_when_not_supplied(tmp_archive: Path) -> None:

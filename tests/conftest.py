@@ -1,11 +1,10 @@
 """공통 pytest fixture 모듈.
 
-Settings 경로 해석, 임시 SQLite DB, 샘플 매매일지 DataFrame 등을 제공합니다.
+Settings 경로 해석, 샘플 매매일지 DataFrame 등을 제공합니다.
 """
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 import pandas as pd
@@ -37,37 +36,3 @@ def sample_trade_df() -> pd.DataFrame:
             "매도가격": [7_200, 31_000, 7_200],
         }
     )
-
-
-@pytest.fixture
-def tmp_db(tmp_path: Path) -> Path:
-    """임시 SQLite DB 파일을 생성하고 경로를 반환합니다."""
-    db_path = tmp_path / "stock.db"
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            """
-            CREATE TABLE table_trade_log (
-                매수날짜 TEXT,
-                종목코드 TEXT,
-                종가 REAL,
-                매수가격 REAL,
-                매도가격 REAL,
-                수익률 REAL
-            )
-            """
-        )
-        conn.execute(
-            "CREATE TABLE table_theme (종목코드 TEXT, 테마 TEXT)"
-        )
-        conn.executemany(
-            "INSERT INTO table_trade_log VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                ("2024-01-02", "005930", 70000, 7000, 7200, 2.86),
-                ("2024-01-03", "000660", 30000, 30000, 31000, 3.33),
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return db_path

@@ -17,17 +17,22 @@ def test_path_settings_defaults_point_to_project_root() -> None:
 
 def test_path_settings_derived_paths(tmp_path: Path) -> None:
     settings = PathSettings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data", _env_file=None)
-    assert tmp_path / "data" / "stock.db" == settings.STOCK_DB_PATH
     assert tmp_path / "data" / "parquet" == settings.PARQUET_DIR
     assert settings.TRADE_LOG_PARQUET_PATH == settings.PARQUET_DIR / "trade_log.parquet"
     assert settings.THEME_PARQUET_PATH == settings.PARQUET_DIR / "theme.parquet"
     assert tmp_path / "data" / "daily" == settings.DAILY_DIR
-    assert settings.CONDITION_PARQUET_PATH == settings.DAILY_DIR / "daily_stocks.parquet"
     assert settings.HISTORY_PARQUET_PATH == settings.HISTORY_DIR / "archive.parquet"
     assert settings.TOKEN_FILE == settings.CONFIGS_DIR / "kis_token_cache.json"
     assert tmp_path / "data" / "history" == settings.HISTORY_DIR
     assert settings.LABEL_ENCODER_PATH == settings.MODELS_DIR / "best_stock_rg_cat_encoders.json"
     assert settings.MODEL_PATH == settings.MODELS_DIR / "best_stock_rg_cat.joblib"
+
+
+def test_path_settings_no_longer_defines_stock_db_or_condition_csv(tmp_path: Path) -> None:
+    """stock.db 폐기에 따라 STOCK_DB_PATH/CONDITION_PARQUET_PATH computed field가 base 도메인에서 제거되었는지 검증합니다."""
+    settings = PathSettings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data", _env_file=None)
+    assert not hasattr(settings, "STOCK_DB_PATH")
+    assert not hasattr(settings, "CONDITION_PARQUET_PATH")
 
 
 def test_path_settings_spec_alias_backward_compat(tmp_path: Path) -> None:
