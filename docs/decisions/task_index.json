@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "topk_decision_sizing_migration",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_topk_decision_sizing_migration",
+      "domain": "daily",
+      "title": "collect/predict 자동모드 top-3 의사결정·비중 전환",
+      "why": "종가매매 수동 조건검색 및 champion 미교정 등급표 의존을 COST_AWARE 유니버스 기반 top-3 리랭커로 대체 필요",
+      "resolution": "collect가 admitted 플래그만 부여(행 미삭제)해 wide 단면 랭크 정합 보존, predict가 원본 억단위 스냅샷을 직접 적재해 단위오염 차단, automated 모드는 champion 대신 등가중 top-3 단일표 출력",
+      "impact": "automated 모드에서 픽 변동 요인 2건(단위오염 -33%, 랭크스큐 -8.6%) 제거, manual 모드 byte-identical 보존"
+    },
+    {
       "task_id": "topk_reranker_sizing_calibration",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_topk_reranker_sizing_calibration",
