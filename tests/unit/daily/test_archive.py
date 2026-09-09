@@ -111,7 +111,7 @@ def test_scenario_archive_fetch_02(tmp_archive: Path) -> None:
     specified = archive.fetch_archive_snapshot("2026-08-03")
     assert specified["스냅샷_날짜"].tolist() == ["2026-08-03"]
     assert specified.columns.tolist() == archive.ARCHIVE_READ_COLUMN_ORDER
-    assert len(archive.ARCHIVE_COLUMN_ORDER) == 37
+    assert len(archive.ARCHIVE_COLUMN_ORDER) == 19
 
 
 def test_scenario_archive_export_03(tmp_archive: Path) -> None:
@@ -123,7 +123,7 @@ def test_scenario_archive_export_03(tmp_archive: Path) -> None:
     tsv = archive.export_archive_for_spreadsheet("2026-08-04")
     lines = tsv.splitlines()
     assert lines[0].split("\t") == archive.ARCHIVE_COLUMN_ORDER
-    assert lines[1].startswith("2026-08-04\t005930\t삼성전자\t1000\t")
+    assert lines[1].startswith("2026-08-04\t005930\t삼성전자\tKOSPI\t")
     assert len(lines[1].split("\t")) == len(archive.ARCHIVE_COLUMN_ORDER)
 
     latest_tsv = archive.export_archive_for_spreadsheet()
@@ -236,22 +236,6 @@ def test_upsert_adds_missing_columns_to_existing_table(tmp_archive: Path) -> Non
     assert df["종목코드"].tolist() == ["005930"]
 
 
-def test_main_fetch_target_date_saves_tsv(
-    tmp_archive: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """main() FETCH_TARGET_DATE 분기는 조회 결과를 archive_{date}.tsv로 저장합니다."""
-    archive.upsert_archive_snapshot(
-        pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
-        snapshot_date="2026-08-04",
-    )
-    monkeypatch.setattr(archive, "FETCH_TARGET_DATE", "2026-08-04")
-
-    archive.main()
-
-    target_file = tmp_archive / "archive_2026-08-04.tsv"
-    assert target_file.exists()
-    df = pd.read_csv(target_file, sep="\t")
-    assert "2026-08-04" in df["스냅샷_날짜"].astype(str).values
 
 
 def test_upsert_localizes_naive_snapshot_timestamp(tmp_archive: Path) -> None:
@@ -315,27 +299,6 @@ def test_upsert_sqlite_null_timestamp_identity_replacement(tmp_archive: Path) ->
     assert len(db_df) == 1
 
 
-def test_archive_main_preserves_real_capture_timestamp(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_archive: Path
-) -> None:
-    import os
-    from datetime import datetime
-
-    csv_path = tmp_path / "daily_stocks.csv"
-    pd.DataFrame({"종목코드": ["005930"], "종목명": ["삼성전자"]}).to_csv(csv_path, index=False, encoding="utf-8-sig")
-
-    captured_ts = datetime(2026, 9, 3, 15, 18, 0)
-    mtime_epoch = captured_ts.timestamp()
-    os.utime(csv_path, (mtime_epoch, mtime_epoch))
-
-    monkeypatch.setattr(archive.settings, "CONDITION_CSV_PATH", csv_path)
-
-    archive.main()
-
-    stored = archive.fetch_archive_snapshot(snapshot_date="2026-09-03")
-    ts = pd.to_datetime(stored["snapshot_timestamp"].iloc[0])
-    assert ts.hour == 15
-    assert ts.minute == 18
 
 
 def test_fetch_archive_snapshot_defaults_to_latest_snapshot_per_code(tmp_archive: Path) -> None:
@@ -413,3 +376,16 @@ def test_upsert_archive_snapshot_logs_rerun_detection(tmp_archive: Path, caplog)
         archive.upsert_archive_snapshot(pd.DataFrame([row2]), snapshot_date="2026-08-04")
 
     assert any("rerun" in rec.message for rec in caplog.records)
+
+
+
+def test_archive_cli_entrypoint_is_removed() -> None:
+    from src.daily import archive
+
+    # Then: collect writes the store directly, so the CSV-reading CLI is gone
+    assert not hasattr(archive, "main")
+    assert not hasattr(archive, "import_csv_history_if_needed")
+
+    # Then: the storage API itself is untouched
+    assert callable(archive.upsert_archive_snapshot)
+    assert callable(archive.fetch_archive_snapshot)

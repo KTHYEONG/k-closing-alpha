@@ -103,38 +103,7 @@ async def _run_fetch_single_stock(client, **scenario_sets) -> tuple[dict, list[s
         )
 
 
-def test_fetch_single_stock_sangdda_scenario() -> None:
-    result, failed, _ = asyncio.run(
-        _run_fetch_single_stock(_fake_client(), upper_limit_stock_codes={"005930"})
-    )
-    assert failed == []
-    assert result["시나리오"] == "상따"
-    assert result["종목코드"] == "005930"
 
 
-def test_fetch_single_stock_default_scenario_volume_surge() -> None:
-    result, failed, _ = asyncio.run(_run_fetch_single_stock(_fake_client()))
-    assert failed == []
-    assert result["시나리오"] == "거래량 폭증"
 
 
-def test_fetch_all_stock_data_aggregates_and_reports_failures() -> None:
-    async def _fake_single_stock(*args, **kwargs) -> tuple[dict, list[str], list[dict]]:
-        return ({"종목명": "AAA", "종목코드": "005930"}, ["체결강도"], [])
-
-    with patch.object(collect, "fetch_single_stock", side_effect=_fake_single_stock):
-        results, failed = asyncio.run(
-            collect.fetch_all_stock_data(
-                [{"code": "005930", "name": "AAA"}],
-                None,
-                None,
-                set(),
-                set(),
-                set(),
-                set(),
-                set(),
-            )
-        )
-    assert len(results) == 1
-    assert results[0]["종목명"] == "AAA"
-    assert failed == [("AAA", "005930", ["체결강도"])]

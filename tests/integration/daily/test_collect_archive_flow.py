@@ -8,84 +8,6 @@ from pathlib import Path
 import pandas as pd
 
 from src.daily import collect
-from src.daily.collect import STANDARD_COLUMN_ORDER, save_collected_condition_data
-
-
-def _standard_columns_df() -> pd.DataFrame:
-    """표준 열 이름(순서는 뒤섞임) + 비표준 여분 열을 포함한 샘플 DataFrame."""
-    row = {
-        "시나리오": ["신고가", "거래량 폭증"],
-        "상장일수": [300, 500],
-        "종목명": ["AAA", "BBB"],
-        "종목코드": [1, 2],
-        "시가": [10000, 20000],
-        "고가": [11000, 21000],
-        "저가": [9000, 19000],
-        "종가": [10500, 20500],
-        "전일종가": [10000, 20000],
-        "시가총액": [5000.0, 8000.0],
-        "거래대금": [120.0, 250.0],
-        "등락률": [5.0, 2.5],
-        "선정순위": [1, 2],
-        "기관_순매수": [10.0, 20.0],
-        "외국인_순매수": [30.0, 40.0],
-        "프로그램_순매수": [5.0, 6.0],
-        "체결강도": [120.0, 110.0],
-        "시장구분": ["KOSPI", "KOSDAQ"],
-        "총_종목수": [2, 2],
-        "평균_거래대금": [185.0, 185.0],
-        "kospi": [0.5, 0.5],
-        "kosdaq": [0.3, 0.3],
-        "v_kospi": [12.5, 12.5],
-        "v_kosdaq": [15.2, 15.2],
-        "거래량": [100000, 200000],
-        "extra_col": ["x", "y"],
-    }
-    return pd.DataFrame(row)
-
-
-def test_csv_export_order_verification(tmp_path: Path) -> None:
-    """CSV_EXPORT_ORDER_VERIFICATION 시나리오: 저장된 CSV 는 STANDARD_COLUMN_ORDER 와 정확히 일치하고 종목코드는 zero-fill 문자열이다."""
-    csv_path = tmp_path / "condition_종가매매.csv"
-
-    result = save_collected_condition_data(_standard_columns_df(), csv_path)
-
-    assert result == csv_path
-    assert csv_path.exists()
-
-    # utf-8-sig BOM 확인 (Excel/Google Sheets 한글 호환)
-    with open(csv_path, "rb") as fh:
-        assert fh.read(3) == b"\xef\xbb\xbf"
-
-    df = pd.read_csv(csv_path, encoding="utf-8-sig")
-    assert df.columns.tolist() == list(STANDARD_COLUMN_ORDER)
-    assert "extra_col" not in df.columns
-
-    # 파일에 저장된 종목코드는 6자리 zero-fill 문자열
-    raw_df = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=str)
-    assert raw_df["종목코드"].tolist() == ["000001", "000002"]
-    assert (raw_df["종목코드"].str.len() == 6).all()
-
-
-def test_save_collected_condition_data_creates_sibling_parquet(tmp_path: Path) -> None:
-    csv_path = tmp_path / "condition_종가매매.csv"
-
-    save_collected_condition_data(_standard_columns_df(), csv_path)
-
-    parquet_path = csv_path.with_suffix(".parquet")
-    assert parquet_path.exists()
-    df = pd.read_parquet(parquet_path)
-    assert df.columns.tolist() == list(STANDARD_COLUMN_ORDER)
-    assert df["종목코드"].astype(str).str.zfill(6).tolist() == ["000001", "000002"]
-
-
-def test_save_collected_condition_data_returns_path(tmp_path: Path) -> None:
-    csv_path = tmp_path / "nested" / "condition.csv"
-
-    result = save_collected_condition_data(_standard_columns_df(), csv_path)
-
-    assert result == csv_path
-    assert csv_path.parent.exists()
 
 
 class _FakeKisClient:
@@ -132,62 +54,93 @@ class _FakeSession:
         return False
 
 
-async def _fake_fetch_all_stock_data(*args, **kwargs) -> tuple[list[dict], list]:
-    return (
-        [
-            {
-                "종목명": "삼성전자",
-                "종목코드": "005930",
-                "시가": 1000,
-                "고가": 1100,
-                "저가": 900,
-                "종가": 1050,
-                "전일종가": 1000,
-                "시장구분": "KOSPI",
-                "시가총액": 5000.0,
-                "거래대금": 120.0,
-                "체결강도": 120.0,
-                "등락률": 5.0,
-                "선정순위": 1,
-                "기관_순매수": 1.0,
-                "외국인_순매수": 2.0,
-                "프로그램_순매수": 0.5,
-                "시나리오": "거래량 폭증",
-                "거래량": 100000,
-            }
-        ],
-        [],
-    )
 
 
-def test_collect_main_saves_csv_without_auto_archive(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """collect.main() 은 자동 아카이브 없이 지정된 CSV/Parquet 에 수집 데이터를 저장한다."""
-    history_dir = tmp_path / "history"
+def test_collect_main_persists_wide_snapshot_to_store_without_csv(monkeypatch, tmp_path) -> None:
+    """collect.main() 은 CSV 없이 wide 스냅샷을 저장소에 직접 기록한다."""
+    import asyncio
+
+    from src.daily import collect
+
     csv_path = tmp_path / "daily" / "daily_stocks.csv"
-    monkeypatch.setattr(collect.settings, "HISTORY_DIR", history_dir)
-    monkeypatch.setattr(
-        collect.settings, "HISTORY_PARQUET_PATH", history_dir / "archive.parquet"
-    )
-    monkeypatch.setattr(
-        collect.settings, "HISTORY_DB_PATH", history_dir / "archive.db"
-    )
     monkeypatch.setattr(collect.settings, "CONDITION_CSV_PATH", csv_path)
-
     monkeypatch.setattr(collect, "HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
-    monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all_stock_data)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
-    monkeypatch.setattr(collect, "load_theme_from_db", lambda: {})
-    monkeypatch.setattr(
-        collect,
-        "batch_resolve_missing_themes",
-        lambda stocks, **kw: [{**s, "테마": "기타", "시장구분": "KOSPI"} for s in stocks],
-    )
 
+    async def _fake_scan(client, session, **kwargs):
+        return [
+            {"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"},
+            {"code": "000004", "name": "DDD", "price": "30000", "chgrate": "5.0"},
+        ]
+
+    async def _fake_fetch_all(stock_list, client, session):
+        rows = [
+            {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
+             "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
+             "거래량": 1_000_000, "거래대금": 500.0, "시가총액": 3000.0,
+             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0},
+            {"종목명": "DDD", "종목코드": "000004", "시장구분": "KOSPI", "시가": 29900.0,
+             "고가": 30100.0, "저가": 29800.0, "종가": 30000.0, "전일종가": 28571.43,
+             "거래량": 800_000, "거래대금": 400.0, "시가총액": 5000.0,
+             "기관_순매수": 8.0, "외국인_순매수": 6.0, "등락률": 5.0},
+        ]
+        return rows, []
+
+    monkeypatch.setattr(collect, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all)
+
+    captured = {}
+
+    def _fake_upsert(df, snapshot_date=None):
+        captured["df"] = df.copy()
+        return len(df)
+
+    monkeypatch.setattr(collect.archive, "upsert_archive_snapshot", _fake_upsert)
+
+    # When
     asyncio.run(collect.main())
 
-    assert csv_path.exists()
-    assert not (history_dir / "archive.db").exists()
-    assert not (history_dir / "archive.parquet").exists()
+    # Then: no spreadsheet-era file artifact is produced
+    assert not csv_path.exists()
+
+    # Then: the wide cross-section is stored, rejection recorded as a flag
+    stored = captured["df"]
+    assert stored["종목코드"].tolist() == ["000001", "000004"]
+    assert stored["admitted"].tolist() == [True, False]
+
+
+def test_collect_main_returns_early_when_scan_empty(monkeypatch, tmp_path, caplog) -> None:
+    """collect.main() 은 자동 스캔이 비면 upsert 없이 경고와 함께 조기 반환한다."""
+    import asyncio
+    import logging
+
+    from src.daily import collect
+
+    csv_path = tmp_path / "daily" / "daily_stocks.csv"
+    monkeypatch.setattr(collect.settings, "CONDITION_CSV_PATH", csv_path)
+    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
+
+    # Given: the ranking scan finds nothing inside the band today
+    async def _empty_scan(client, session, **kwargs):
+        rows: list[dict] = []
+        return rows
+
+    monkeypatch.setattr(collect, "fetch_candidate_stock_list", _empty_scan)
+
+    upsert_calls: list[object] = []
+    monkeypatch.setattr(
+        collect.archive, "upsert_archive_snapshot",
+        lambda df, snapshot_date=None: upsert_calls.append(df) or len(df),
+    )
+
+    # When
+    with caplog.at_level(logging.INFO, logger=collect.logger.name):
+        asyncio.run(collect.main())
+
+    # Then: no persistence attempt, no CSV artifact, and the emptiness is surfaced
+    assert upsert_calls == []
+    assert not csv_path.exists()
+    assert any("자동 스캔 후보가 없습니다" in rec.message for rec in caplog.records)
