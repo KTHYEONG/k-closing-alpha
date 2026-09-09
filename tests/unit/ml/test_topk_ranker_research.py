@@ -908,24 +908,72 @@ def test_select_topk_equal_weight_rejects_non_certified_top_k() -> None:
         select_topk_equal_weight(snapshot, bundle, top_k=1)
 
 
-def test_select_topk_equal_weight_fills_missing_feature_columns_with_zero() -> None:
+def test_select_topk_equal_weight_rejects_missing_feature_columns() -> None:
+    import pytest
+
+    from src.ml.costaware_topk import MIN_TOP_K
+    from src.ml.topk_ranker_research import select_topk_equal_weight
+
+    # Given: the live snapshot is missing one of the bundle's declared features
+    bundle, snapshot = _synthetic_bundle_and_fixture()
+    thin = snapshot.drop(columns=["log_tv"])
+
+    # When / Then: fail closed naming the missing column instead of zero-filling
+    with pytest.raises(ValueError, match="log_tv"):
+        select_topk_equal_weight(thin, bundle, top_k=MIN_TOP_K)
+
+
+def test_select_topk_equal_weight_selects_only_admitted_rows() -> None:
     import numpy as np
     import pandas as pd
 
     from src.ml.costaware_topk import MIN_TOP_K
     from src.ml.topk_ranker_research import select_topk_equal_weight
 
-    bundle, snapshot = _synthetic_bundle_and_fixture()
-    # Given: the live snapshot is missing one of the bundle's declared features
-    thin = snapshot.drop(columns=["log_tv"])
+    # Given: a wide 5-row cross-section where only 3 rows cleared admission
+    bundle, _ = _synthetic_bundle_and_fixture()
+    wide = pd.DataFrame({
+        "date": [pd.Timestamp("2023-03-15")] * 5,
+        "symbol": ["000001", "000002", "000003", "000004", "000005"],
+        "chg_ratio": [0.05, 0.03, 0.08, 0.04, 0.09],
+        "log_tv": [6.1, 5.9, 6.5, 6.3, 6.7],
+        "admitted": [True, False, True, True, False],
+    })
 
     # When
-    out = select_topk_equal_weight(thin, bundle, top_k=MIN_TOP_K)
+    out = select_topk_equal_weight(wide, bundle, top_k=MIN_TOP_K)
 
-    # Then: it does not raise -- the missing column is filled with 0.0,
-    # matching predict_daily_sizing's existing convention
-    assert len(out) == 3
-    assert np.isfinite(out["pred"].to_numpy(dtype=np.float64)).all()
+    # Then: exactly the admitted names, equally weighted
+    assert sorted(out["symbol"].tolist()) == ["000001", "000003", "000004"]
+    assert np.allclose(out["allocation"].to_numpy(dtype=np.float64), 1.0 / MIN_TOP_K)
+
+
+def test_select_topk_equal_weight_excludes_dates_below_min_admitted() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.costaware_topk import MIN_TOP_K
+    from src.ml.topk_ranker_research import select_topk_equal_weight
+
+    # Given: D1 has 3 admitted names, D2 has only 2 (below the certified K)
+    bundle, _ = _synthetic_bundle_and_fixture()
+    d1, d2 = pd.Timestamp("2023-03-15"), pd.Timestamp("2023-03-16")
+    wide = pd.DataFrame({
+        "date": [d1, d1, d1, d2, d2, d2],
+        "symbol": ["000001", "000002", "000003", "000004", "000005", "000006"],
+        "chg_ratio": [0.05, 0.03, 0.08, 0.04, 0.09, 0.06],
+        "log_tv": [6.1, 5.9, 6.5, 6.3, 6.7, 6.2],
+        "admitted": [True, True, True, True, True, False],
+    })
+
+    # When
+    out = select_topk_equal_weight(wide, bundle, top_k=MIN_TOP_K)
+
+    # Then: D2 is dropped entirely rather than entered with a shrunk denominator
+    assert out["date"].nunique() == 1
+    assert out["date"].iloc[0] == d1
+    assert len(out) == MIN_TOP_K
+    assert np.allclose(out["allocation"].to_numpy(dtype=np.float64), 1.0 / MIN_TOP_K)
 
 
 def test_train_production_bundle_rejects_top_k_below_min() -> None:

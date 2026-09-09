@@ -73,7 +73,7 @@ LABEL_ENCODER_MAP = load_label_encoder_map(LABEL_ENCODER_PATH)
 # 분석할 조건검색 결과 파일 및 모델 파일은 위에서 설정됨
 
 
-def load_and_preprocess_data(file_path):
+def load_condition_snapshot(file_path):
     if not os.path.exists(file_path):
         logger.info(f"{Colors.RED}Error: {file_path} 파일을 찾을 수 없습니다.{Colors.RESET}")
         sys.exit(1)
@@ -99,19 +99,6 @@ def load_and_preprocess_data(file_path):
             .str.zfill(6)
         )
 
-    # 단위 변환 (억 -> 원)
-    for col in [
-        "기관_순매수",
-        "외국인_순매수",
-        "프로그램_순매수",
-        "거래대금",
-        "평균_거래대금",
-    ]:
-        if col in df.columns:
-            df[col] = df[col].apply(
-                lambda x: float(x) * 100_000_000 if pd.notna(x) else 0
-            )
-
     # [New] 상장일수 부족 종목 제외 로직 (EMA 20 계산 불가능한 경우)
     if "상장일수" in df.columns:
         original_count = len(df)
@@ -126,6 +113,26 @@ def load_and_preprocess_data(file_path):
     # "상따" 시나리오 종목도 함께 로드 (나중에 필터링)
     logger.debug("데이터 로드 완료: %d개 종목", len(df))
     return df
+
+
+def convert_amount_units_to_krw(df):
+    # 단위 변환 (억 -> 원) - champion 레거시 경로 전용
+    for col in [
+        "기관_순매수",
+        "외국인_순매수",
+        "프로그램_순매수",
+        "거래대금",
+        "평균_거래대금",
+    ]:
+        if col in df.columns:
+            df[col] = df[col].apply(
+                lambda x: float(x) * 100_000_000 if pd.notna(x) else 0
+            )
+    return df
+
+
+def load_and_preprocess_data(file_path):
+    return convert_amount_units_to_krw(load_condition_snapshot(file_path))
 
 
 def explain_predictions_with_shap(model, X_final, stock_names, top_n=3):
@@ -244,12 +251,12 @@ def select_top_actionable(
     return sorted(actionable, key=lambda r: r["Score"], reverse=True)[:top_n]
 
 
-def run_topk_ranker_sleeve(df_condition: pd.DataFrame, decision_date: pd.Timestamp) -> pd.DataFrame:
+def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, csv_path: str | None = None) -> pd.DataFrame:
     """Run the certified equal-weight top-3 reranker sleeve for automated mode.
 
     Args:
-        df_condition: Daily condition snapshot in the automated-mode shape.
         decision_date: Decision date stamped onto the ranker features.
+        csv_path: Optional condition snapshot path (defaults to settings).
 
     Returns:
         Equal-weight top-k picks, or an empty frame when the sleeve is out of
@@ -258,23 +265,58 @@ def run_topk_ranker_sleeve(df_condition: pd.DataFrame, decision_date: pd.Timesta
     if settings.CANDIDATE_SOURCE_MODE != "automated":
         return pd.DataFrame()
     try:
+        from src.daily.collect import flag_cost_aware_admission
         from src.ml.costaware_topk import MIN_TOP_K
         from src.ml.topk_ranker_research import TOPK_RANKER_BUNDLE_DIR, select_topk_equal_weight
         from src.serving.realtime.features import build_topk_ranker_features
 
+        raw = load_condition_snapshot(csv_path or str(settings.CONDITION_CSV_PATH))
+        flagged = flag_cost_aware_admission(raw, decision_date=decision_date)
+        features_df = build_topk_ranker_features(flagged, decision_date)
+        features_df["admitted"] = flagged["admitted"].to_numpy()
         bundle = load_model_bundle(import_dir=TOPK_RANKER_BUNDLE_DIR)
-        features_df = build_topk_ranker_features(df_condition, decision_date)
-        return select_topk_equal_weight(
+        picks = select_topk_equal_weight(
             features_df, bundle, top_k=int(bundle.get("top_k", MIN_TOP_K))
         )
+        name_map = dict(
+            flagged[["종목코드", "종목명"]].itertuples(index=False, name=None)
+        )
+        picks["name"] = picks["symbol"].map(name_map)
+        return picks
     except (FileNotFoundError, ValueError) as exc:
-        logger.info(
-            f"{Colors.YELLOW}[Warning] top-k ranker sleeve skipped: {exc}{Colors.RESET}"
+        logger.warning(
+            f"{Colors.YELLOW}[Warning] top-k ranker sleeve yielded no decision (미참여): {exc}{Colors.RESET}"
         )
         return pd.DataFrame()
 
 
+def run_automated_topk_decision(decision_date: pd.Timestamp) -> None:
+    """Print the single automated-mode top-3 decision table, if any.
+
+    Args:
+        decision_date: Decision date for the reranker sleeve.
+    """
+    sleeve_df = run_topk_ranker_sleeve(decision_date)
+    if sleeve_df.empty:
+        logger.warning("오늘 자동 유니버스 기준 진입 후보 없음(미참여)")
+        return
+    rows = [
+        {
+            "Code": str(row.get("symbol", "")),
+            "Name": row.get("name", ""),
+            "Pred": round(float(row.get("pred", 0.0)), 4),
+            "Alloc%": round(float(row.get("allocation", 0.0)) * 100.0, 2),
+        }
+        for _, row in sleeve_df.iterrows()
+    ]
+    print_table(rows, "Top-3 Cost-Aware Decision (Equal-Weight)")
+
+
 def main():
+    decision_date = pd.Timestamp.today().normalize()
+    if settings.CANDIDATE_SOURCE_MODE == "automated":
+        run_automated_topk_decision(decision_date)
+        return
     # 1. 데이터 로드 및 테마 매핑 (로컬 Parquet/DB 기반 자동 판별)
     df_condition = load_and_preprocess_data(settings.CONDITION_CSV_PATH)
     theme_map = load_theme_from_db()
@@ -378,7 +420,6 @@ def main():
                 df_all.loc[sangdda_mask, "high_price"], limit_up_price
             )
 
-    decision_date = pd.Timestamp.today().normalize()
     df_all = build_snapshot_features(df_all, decision_date=decision_date)
 
     # 5. Fast Inference & Dynamic Sizing (저장된 모델 아티팩트 로드)
@@ -427,18 +468,6 @@ def main():
     print_table(
         select_top_actionable(sangdda_results), "상따(29.9%) 시나리오 결과", minimal=True
     )
-
-    sleeve_df = run_topk_ranker_sleeve(df_condition, decision_date)
-    if not sleeve_df.empty:
-        sleeve_rows = [
-            {
-                "Code": str(row.get("symbol", "")),
-                "Pred": round(float(row.get("pred", 0.0)), 4),
-                "Alloc%": round(float(row.get("allocation", 0.0)) * 100.0, 2),
-            }
-            for _, row in sleeve_df.iterrows()
-        ]
-        print_table(sleeve_rows, "Top-K Ranker Sleeve (Equal-Weight Top-3)")
 
 
 if __name__ == "__main__":

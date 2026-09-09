@@ -520,25 +520,90 @@ def test_apply_cost_aware_admission_if_automated_gates_on_candidate_source_mode(
     df = pd.DataFrame({"종목코드": ["S1"], "거래대금": [500.0]})
     seen: dict[str, object] = {}
 
-    def _fake_admission(frame, *, decision_date, screen=None):
+    def _fake_flag(frame, *, decision_date, screen=None):
         seen["frame"] = frame
         seen["decision_date"] = decision_date
-        return frame.iloc[0:0]
+        flagged = frame.copy()
+        flagged["admitted"] = True
+        return flagged
 
-    monkeypatch.setattr(collect_mod, "apply_cost_aware_admission", _fake_admission)
+    monkeypatch.setattr(collect_mod, "flag_cost_aware_admission", _fake_flag)
 
     # Given: manual mode (the default) -- df must pass through byte-identical,
-    # apply_cost_aware_admission must never be called
+    # flag_cost_aware_admission must never be called
     monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
     out_manual = apply_cost_aware_admission_if_automated(df)
     assert out_manual is df
     assert "frame" not in seen
 
-    # Given: automated mode -- the admission mask is applied with today's
-    # Asia/Seoul decision date
+    # Given: automated mode -- the admission flag is applied with today's
+    # Asia/Seoul decision date, keeping the wide cross-section
     monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
     out_auto = apply_cost_aware_admission_if_automated(df)
-    assert len(out_auto) == 0
+    assert len(out_auto) == 1
+    assert out_auto["admitted"].tolist() == [True]
     assert seen["frame"] is df
     assert isinstance(seen["decision_date"], pd.Timestamp)
+
+
+def test_flag_cost_aware_admission_marks_rows_without_dropping() -> None:
+    import pandas as pd
+
+    from src.daily.collect import flag_cost_aware_admission
+
+    # Given: the same 5-candidate snapshot the filtering variant is specified on
+    # (S1 admitted; S2 tick-cost, S3 chg-band, S4 liquidity, S5 ceiling excluded)
+    df = pd.DataFrame({
+        "종목코드": ["S1", "S2", "S3", "S4", "S5"],
+        "종가": [18000.0, 30000.0, 23000.0, 18000.0, 13000.0],
+        "전일종가": [17142.86, 28571.43, 20000.0, 17142.86, 10000.0],
+        "고가": [18100.0, 30100.0, 23100.0, 18100.0, 13000.0],
+        "거래량": [1_000_000] * 5,
+        "거래대금": [500.0, 500.0, 500.0, 10.0, 500.0],
+        "시가총액": [3000.0, 3000.0, 3000.0, 3000.0, 3000.0],
+        "시장구분": ["KOSPI"] * 5,
+    })
+
+    # When
+    out = flag_cost_aware_admission(df, decision_date=pd.Timestamp("2026-09-09"))
+
+    # Then: every row survives, carrying the admission verdict as a flag
+    assert len(out) == 5
+    assert out["admitted"].tolist() == [True, False, False, False, False]
+    assert out["종목코드"].tolist() == ["S1", "S2", "S3", "S4", "S5"]
+
+
+def test_apply_cost_aware_admission_if_automated_keeps_wide_rows_with_flag(monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.collect as collect_mod
+    from src.daily.collect import apply_cost_aware_admission_if_automated
+
+    df = pd.DataFrame({
+        "종목코드": ["S1", "S2"],
+        "종가": [18000.0, 30000.0],
+        "전일종가": [17142.86, 28571.43],
+        "고가": [18100.0, 30100.0],
+        "거래량": [1_000_000, 1_000_000],
+        "거래대금": [500.0, 500.0],
+        "시가총액": [3000.0, 3000.0],
+        "시장구분": ["KOSPI", "KOSPI"],
+    })
+
+    # When: automated mode annotates instead of filtering, so the wide
+    # cross-section stays available for train/serve rank parity
+    monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+    auto = apply_cost_aware_admission_if_automated(df)
+
+    # Then
+    assert len(auto) == 2
+    assert auto["admitted"].tolist() == [True, False]
+
+    # When: manual mode is byte-identical passthrough
+    monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
+    manual = apply_cost_aware_admission_if_automated(df)
+
+    # Then
+    assert "admitted" not in manual.columns
+    assert len(manual) == 2
 
