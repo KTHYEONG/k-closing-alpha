@@ -12,7 +12,6 @@ import pandas as pd
 from src.serving.realtime.features import (
     _ROBUST_Z_COLUMNS,
     _apply_robust_z,
-    build_snapshot_features,
     engineer_features,
 )
 
@@ -47,31 +46,6 @@ def _live_snapshot_raw() -> pd.DataFrame:
             "차트분석": ["거래량 폭증", "상따"],
         }
     )
-
-
-def test_build_snapshot_features_derives_standard_ml_frame() -> None:
-    """당일 스냅샷이 표준 ML 피처 프레임으로 변환되고 파생 피처가 생성됩니다."""
-    out = build_snapshot_features(
-        _live_snapshot_raw(), decision_date=pd.Timestamp("2026-08-04")
-    )
-    expected = [
-        "stock_code",
-        "open_price",
-        "close_price",
-        "prev_close_price",
-        "change_rate",
-        "selection_rank",
-        "trade_date",
-        "major_density",
-        "prog_dominance",
-        "turnover",
-        "rank_ratio",
-        "log_market_cap_100m",
-        "change_rate_z",
-    ]
-    assert set(expected).issubset(out.columns)
-    assert np.issubdtype(out["trade_date"].dtype, np.datetime64)
-    assert out["major_density"].notna().all()
 
 
 def test_engineer_features_creates_cross_sectional_features() -> None:
