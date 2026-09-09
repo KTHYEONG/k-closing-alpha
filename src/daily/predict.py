@@ -244,6 +244,36 @@ def select_top_actionable(
     return sorted(actionable, key=lambda r: r["Score"], reverse=True)[:top_n]
 
 
+def run_topk_ranker_sleeve(df_condition: pd.DataFrame, decision_date: pd.Timestamp) -> pd.DataFrame:
+    """Run the certified equal-weight top-3 reranker sleeve for automated mode.
+
+    Args:
+        df_condition: Daily condition snapshot in the automated-mode shape.
+        decision_date: Decision date stamped onto the ranker features.
+
+    Returns:
+        Equal-weight top-k picks, or an empty frame when the sleeve is out of
+        scope (manual mode) or its bundle is missing or malformed.
+    """
+    if settings.CANDIDATE_SOURCE_MODE != "automated":
+        return pd.DataFrame()
+    try:
+        from src.ml.costaware_topk import MIN_TOP_K
+        from src.ml.topk_ranker_research import TOPK_RANKER_BUNDLE_DIR, select_topk_equal_weight
+        from src.serving.realtime.features import build_topk_ranker_features
+
+        bundle = load_model_bundle(import_dir=TOPK_RANKER_BUNDLE_DIR)
+        features_df = build_topk_ranker_features(df_condition, decision_date)
+        return select_topk_equal_weight(
+            features_df, bundle, top_k=int(bundle.get("top_k", MIN_TOP_K))
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        logger.info(
+            f"{Colors.YELLOW}[Warning] top-k ranker sleeve skipped: {exc}{Colors.RESET}"
+        )
+        return pd.DataFrame()
+
+
 def main():
     # 1. 데이터 로드 및 테마 매핑 (로컬 Parquet/DB 기반 자동 판별)
     df_condition = load_and_preprocess_data(settings.CONDITION_CSV_PATH)
@@ -397,6 +427,18 @@ def main():
     print_table(
         select_top_actionable(sangdda_results), "상따(29.9%) 시나리오 결과", minimal=True
     )
+
+    sleeve_df = run_topk_ranker_sleeve(df_condition, decision_date)
+    if not sleeve_df.empty:
+        sleeve_rows = [
+            {
+                "Code": str(row.get("symbol", "")),
+                "Pred": round(float(row.get("pred", 0.0)), 4),
+                "Alloc%": round(float(row.get("allocation", 0.0)) * 100.0, 2),
+            }
+            for _, row in sleeve_df.iterrows()
+        ]
+        print_table(sleeve_rows, "Top-K Ranker Sleeve (Equal-Weight Top-3)")
 
 
 if __name__ == "__main__":

@@ -258,3 +258,51 @@ def test_ml_feature_compatibility_with_auto_theme() -> None:
     expected_mean = (7.14 + 2.74) / 2
     assert np.isclose(features.loc[0, "sector_relative_change"], 7.14 - expected_mean, atol=1e-4)
     assert np.isclose(features.loc[1, "sector_relative_change"], 2.74 - expected_mean, atol=1e-4)
+
+
+def test_build_topk_ranker_features_maps_korean_snapshot_to_feature_cols() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.serving.realtime.features import build_topk_ranker_features
+
+    # Given: a live Korean-column daily snapshot (matches collect.py's saved shape)
+    df = pd.DataFrame({
+        "종목코드": ["005930", "000660"],
+        "종가": [70000.0, 180000.0],
+        "전일종가": [68000.0, 176000.0],
+        "고가": [70500.0, 181000.0],
+        "저가": [68500.0, 177000.0],
+        "시가": [68800.0, 177500.0],
+        "거래량": [1_000_000.0, 500_000.0],
+        "거래대금": [700.0, 900.0],
+        "시가총액": [4_200_000.0, 1_300_000.0],
+        "기관_순매수": [1000.0, -500.0],
+        "외국인_순매수": [2000.0, 300.0],
+        "kospi": [0.52, 0.52],
+        "kosdaq": [0.31, 0.31],
+        "v_kospi": [15.2, 15.2],
+    })
+
+    # When
+    out = build_topk_ranker_features(df, pd.Timestamp("2026-09-09"))
+
+    # Then: every v3_engine FEATURE_COLS is present and finite
+    for col in FEATURE_COLS:
+        assert col in out.columns
+    assert out["kospi_pct"].iloc[0] == pytest.approx(0.0052)  # percent -> decimal fraction
+    assert out["kosdaq_pct"].iloc[0] == pytest.approx(0.0031)
+    assert out["v_kospi"].iloc[0] == pytest.approx(15.2)
+
+
+def test_build_topk_ranker_features_raises_on_missing_required_column() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.serving.realtime.features import build_topk_ranker_features
+
+    df = pd.DataFrame({"종목코드": ["005930"], "종가": [70000.0]})
+
+    with pytest.raises(ValueError, match="거래대금|missing"):  # noqa: RUF043 - spec skeleton alternation
+        build_topk_ranker_features(df, pd.Timestamp("2026-09-09"))

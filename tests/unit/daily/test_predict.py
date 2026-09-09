@@ -533,3 +533,131 @@ def test_predict_forces_pass_for_ceiling_candidates_only() -> None:
     assert df.loc[0, "allocation"] == 0.0
     assert df.loc[1, "grade"] == "Weak"
     assert df.loc[1, "allocation"] == 0.05
+
+
+def test_main_prints_topk_ranker_sleeve_when_automated_and_populated(monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    sizing_df = pd.DataFrame({
+        "종목명": ["AAA", "BBB"], "theme_sector": ["테마A", "테마A"],
+        "chart_analysis": ["거래량 폭증", "상따"], "selection_rank": [1, 2],
+        "change_rate": [5.0, 29.9], "rank_score": [1.0, 0.5], "utility_score": [0.5, 0.4],
+        "grade": ["Strong", "Pass"], "allocation": [0.1, 0.0],
+        "kospi": [0.5, 0.5], "kosdaq": [0.3, 0.3], "date": ["2026-08-04", "2026-08-04"],
+        "close_price": [11000.0, 11000.0], "prev_close_price": [10000.0, 10000.0],
+        "high_price": [11200.0, 11200.0],
+    })
+    sleeve_df = pd.DataFrame({"symbol": ["000001"], "pred": [0.021], "allocation": [1.0 / 3.0]})
+
+    async def fake_fetch(_code: str) -> tuple[float, float]:
+        return 15.0, 0.05
+
+    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+
+    with (
+        patch.object(predict_mod, "load_and_preprocess_data", return_value=daily_snapshot_df()),
+        patch.object(predict_mod, "load_theme_from_db",
+                     return_value={"000001": "테마A", "000002": "테마A"}),
+        patch.object(predict_mod, "batch_resolve_missing_themes"),
+        patch("src.api.kis_client.fetch_index_and_calculate_volatility", side_effect=fake_fetch),
+        patch.object(predict_mod, "load_model_bundle", return_value={"feature_cols": ["f1"]}),
+        patch.object(predict_mod, "predict_daily_sizing",
+                     side_effect=lambda df, *a, **kw: sizing_df[sizing_df["chart_analysis"].isin(df["chart_analysis"])]),
+        patch.object(predict_mod, "run_topk_ranker_sleeve", return_value=sleeve_df) as sleeve_mock,
+        patch.object(predict_mod, "print_table") as print_table_mock,
+    ):
+        predict_mod.main()
+
+    sleeve_mock.assert_called_once()
+    assert print_table_mock.call_count == 3
+    sleeve_rows = print_table_mock.call_args_list[2].args[0]
+    assert sleeve_rows[0]["Code"] == "000001"
+    assert sleeve_rows[0]["Alloc%"] == pytest.approx(33.3, abs=0.1)
+
+
+def test_main_skips_topk_ranker_sleeve_table_when_sleeve_empty(monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    sizing_df = pd.DataFrame({
+        "종목명": ["AAA", "BBB"], "theme_sector": ["테마A", "테마A"],
+        "chart_analysis": ["거래량 폭증", "상따"], "selection_rank": [1, 2],
+        "change_rate": [5.0, 29.9], "rank_score": [1.0, 0.5], "utility_score": [0.5, 0.4],
+        "grade": ["Strong", "Pass"], "allocation": [0.1, 0.0],
+        "kospi": [0.5, 0.5], "kosdaq": [0.3, 0.3], "date": ["2026-08-04", "2026-08-04"],
+        "close_price": [11000.0, 11000.0], "prev_close_price": [10000.0, 10000.0],
+        "high_price": [11200.0, 11200.0],
+    })
+
+    async def fake_fetch(_code: str) -> tuple[float, float]:
+        return 15.0, 0.05
+
+    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
+
+    with (
+        patch.object(predict_mod, "load_and_preprocess_data", return_value=daily_snapshot_df()),
+        patch.object(predict_mod, "load_theme_from_db",
+                     return_value={"000001": "테마A", "000002": "테마A"}),
+        patch.object(predict_mod, "batch_resolve_missing_themes"),
+        patch("src.api.kis_client.fetch_index_and_calculate_volatility", side_effect=fake_fetch),
+        patch.object(predict_mod, "load_model_bundle", return_value={"feature_cols": ["f1"]}),
+        patch.object(predict_mod, "predict_daily_sizing",
+                     side_effect=lambda df, *a, **kw: sizing_df[sizing_df["chart_analysis"].isin(df["chart_analysis"])]),
+        patch.object(predict_mod, "print_table") as print_table_mock,
+    ):
+        predict_mod.main()
+
+    # Then: with the default "manual" mode, run_topk_ranker_sleeve short-circuits
+    # to empty without needing any mock, and no third table is printed --
+    # byte-identical to the pre-Phase-2 behavior.
+    assert print_table_mock.call_count == 2
+
+
+def test_run_topk_ranker_sleeve_returns_empty_when_bundle_missing_in_automated_mode(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+    monkeypatch.setattr(
+        predict_mod, "load_model_bundle",
+        Mock(side_effect=FileNotFoundError("model artifact bundle not found")),
+    )
+
+    # When: the sleeve is in scope (automated mode) but no bundle is published yet
+    out = predict_mod.run_topk_ranker_sleeve(
+        pd.DataFrame({"종목코드": ["005930"]}), pd.Timestamp("2026-09-09")
+    )
+
+    # Then: fails soft -- an empty frame, never a raised exception
+    assert isinstance(out, pd.DataFrame)
+    assert out.empty
+
+
+def test_run_topk_ranker_sleeve_returns_populated_picks_in_automated_mode(monkeypatch) -> None:
+    import numpy as np
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle, daily_snapshot_df
+
+    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
+    bundle["top_k"] = 3
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+
+    # When: the sleeve runs its full success path -- bundle load, feature
+    # mapping from the Korean daily snapshot, and equal-weight selection
+    out = predict_mod.run_topk_ranker_sleeve(daily_snapshot_df(), pd.Timestamp("2026-09-09"))
+
+    # Then: non-empty picks carrying the selection score and equal allocation
+    assert not out.empty
+    assert "symbol" in out.columns
+    assert "pred" in out.columns
+    assert np.allclose(out["allocation"].to_numpy(dtype=np.float64), 1.0 / 3.0)
