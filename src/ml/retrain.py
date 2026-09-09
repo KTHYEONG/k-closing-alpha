@@ -15,7 +15,12 @@ from src.data.panel_integrity import load_price_panel
 from src.ml.bundle import CHAMPION_DEFAULT_MODEL_PARAMS
 from src.ml.champion import train_champion_bundle, train_tuned_champion_bundle
 from src.ml.costaware_topk import report_to_frame, run_cost_aware_topk_backtest
-from src.ml.topk_ranker_research import run_topk_ranker_backtest, topk_ranker_report_to_frame
+from src.ml.topk_ranker_research import (
+    run_topk_ranker_backtest,
+    save_production_bundle,
+    topk_ranker_report_to_frame,
+    train_production_bundle,
+)
 from src.ml.tuning import ChampionTuningConfig
 from src.ml.universe import SCREEN_REGISTRY
 from src.ml.universe_research import DEFAULT_RESEARCH_SCREENS, run_universe_screen_grid
@@ -46,6 +51,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--universe-research", action="store_true", help="reconstruct full-market panels for a ScreenConfig family, train the ranker on each, print/save the model-free-vs-ranked-vs-CPCV comparison; skips champion training")
     parser.add_argument("--cost-aware-backtest", action="store_true", help="run the model-free COST_AWARE top-k regime-gated backtest against full price_history; skips champion training")
     parser.add_argument("--ranker-topk-research", action="store_true", help="train the ranker on the wide screen pool, select top-k from the cost-capped pool, and score it against the model-free cost-sort control on the post-reform regime; skips champion training")
+    parser.add_argument("--train-ranker-bundle", action="store_true", help="train and persist the certified top-3 cost-aware production bundle (build_inline_bundle on the certification-regime population via train_production_bundle); skips champion training")
     parser.add_argument("--ranker-train-start", default=None, help="widen the ranker training window to this YYYY-MM-DD start; augments training only and never moves the certification boundary (default: the certification regime start)")
     parser.add_argument("--label-mode", default="mechanical", choices=["journaled", "mechanical"])
     parser.add_argument("--screen", default="operator_legacy", choices=["operator_legacy", "band_2_15", "band_5_15_highvalue"])
@@ -143,6 +149,17 @@ def main(argv: list[str] | None = None) -> None:
         report = run_cost_aware_topk_backtest(ph, market_dates, d_to_idx)
         atomic_write_parquet(report_to_frame(report), Path(args.export_dir) / "costaware_topk_report.parquet")
         logger.info("[EVAL] stage=costaware_topk verdict=%s reasons=%s", report.verdict, report.verdict_reasons)
+        return
+
+    if args.train_ranker_bundle:
+        from src.ml.research.v3_engine import load_and_prepare_price_history
+
+        if not os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH):
+            raise ValueError(f"price_history not found: {settings.PRICE_HISTORY_PARQUET_PATH}")
+        ph, market_dates, d_to_idx = load_and_prepare_price_history(settings.PRICE_HISTORY_PARQUET_PATH)
+        bundle = train_production_bundle(ph, market_dates, d_to_idx)
+        path = save_production_bundle(bundle, export_dir=os.path.join(args.export_dir, "topk_ranker"))
+        logger.info("[EVAL] stage=train_ranker_bundle path=%s top_k=%s train_start=%s", path, bundle.get("top_k"), bundle.get("train_start"))
         return
 
     if args.ranker_topk_research:

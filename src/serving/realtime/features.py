@@ -12,7 +12,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.ml.research.v3_engine import compute_derived_features
 from src.processing.schema import normalize_column_names
+from src.strategy.contract import derive_chg_ratio
 
 # Robust Z-Score ((x - median) / MAD) 횡단면 표준화 대상
 _ROBUST_Z_COLUMNS: tuple[str, ...] = (
@@ -318,3 +320,59 @@ def build_snapshot_features(
     work = _apply_robust_z(work, _ROBUST_Z_COLUMNS)
     work = add_scenario_features(work)
     return work
+
+
+def build_topk_ranker_features(df: pd.DataFrame, decision_date: pd.Timestamp) -> pd.DataFrame:
+    """Map a live Korean-column snapshot to v3_engine decision-time features.
+
+    Args:
+        df: Live daily snapshot with Korean columns and percent-unit indices.
+        decision_date: Decision date stamped onto every row.
+
+    Returns:
+        Frame carrying every v3_engine FEATURE_COLS entry.
+
+    Raises:
+        ValueError: Naming every missing required Korean column.
+    """
+    # 결측 입력은 플레이스홀더 없이 즉시 차단
+    required = (
+        "종목코드",
+        "종가",
+        "전일종가",
+        "고가",
+        "저가",
+        "시가",
+        "거래량",
+        "거래대금",
+        "시가총액",
+        "기관_순매수",
+        "외국인_순매수",
+        "kospi",
+        "kosdaq",
+        "v_kospi",
+    )
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"missing required columns: {missing}")
+    # collect.py 퍼센트 단위를 소수 분율로 환산 (유일한 단위 변환)
+    close = pd.to_numeric(df["종가"], errors="coerce").to_numpy(dtype=np.float64)
+    prev_close = pd.to_numeric(df["전일종가"], errors="coerce").to_numpy(dtype=np.float64)
+    mapped = pd.DataFrame({
+        "symbol": df["종목코드"].astype(str).to_numpy(),
+        "date": pd.Timestamp(decision_date),
+        "close": pd.to_numeric(df["종가"], errors="coerce").to_numpy(dtype=np.float64),
+        "open": pd.to_numeric(df["시가"], errors="coerce").to_numpy(dtype=np.float64),
+        "high": pd.to_numeric(df["고가"], errors="coerce").to_numpy(dtype=np.float64),
+        "low": pd.to_numeric(df["저가"], errors="coerce").to_numpy(dtype=np.float64),
+        "volume": pd.to_numeric(df["거래량"], errors="coerce").to_numpy(dtype=np.float64),
+        "tv_clean": pd.to_numeric(df["거래대금"], errors="coerce").to_numpy(dtype=np.float64),
+        "mc_clean": pd.to_numeric(df["시가총액"], errors="coerce").to_numpy(dtype=np.float64),
+        "inst_netbuy": pd.to_numeric(df["기관_순매수"], errors="coerce").to_numpy(dtype=np.float64),
+        "foreign_netbuy": pd.to_numeric(df["외국인_순매수"], errors="coerce").to_numpy(dtype=np.float64),
+        "kospi_pct": pd.to_numeric(df["kospi"], errors="coerce").to_numpy(dtype=np.float64) / 100.0,
+        "kosdaq_pct": pd.to_numeric(df["kosdaq"], errors="coerce").to_numpy(dtype=np.float64) / 100.0,
+        "v_kospi": pd.to_numeric(df["v_kospi"], errors="coerce").to_numpy(dtype=np.float64),
+    })
+    mapped["chg_ratio"] = np.asarray(derive_chg_ratio(close, prev_close), dtype=np.float64)
+    return compute_derived_features(mapped)
