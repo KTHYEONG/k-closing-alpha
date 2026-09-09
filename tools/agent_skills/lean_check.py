@@ -283,6 +283,18 @@ def _is_stub_node(node: ast.AST) -> bool:
     return False
 
 
+# Contract change kinds use new_/modified_ prefixes; normalize to the base kind
+# the compliance checks understand (e.g. new_constant is verified as constant).
+_KIND_ALIASES = {
+    "new_function": "function",
+    "modified_function": "function",
+    "new_constant": "constant",
+    "modified_constant": "constant",
+    "new_class": "class",
+    "modified_class": "class",
+}
+
+
 def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = list(contract.get("contracts", []))
     default_target = contract.get("target_file", "")
@@ -294,11 +306,11 @@ def _iter_contract_entries(contract: dict[str, Any]) -> list[dict[str, Any]]:
             or change.get("file")
             or default_target
         )
+        raw_kind = change.get("kind") or ("class" if symbol and symbol[0].isupper() else "function")
         entries.append(
             {
                 "file_hint": _repo_relative(target),
-                "kind": change.get("kind")
-                or ("class" if symbol and symbol[0].isupper() else "function"),
+                "kind": _KIND_ALIASES.get(raw_kind, raw_kind),
                 "name": symbol,
             }
         )
