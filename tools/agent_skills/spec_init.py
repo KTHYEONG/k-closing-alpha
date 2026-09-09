@@ -10,6 +10,7 @@ from typing import Any
 
 
 def _read_json(path: str) -> dict[str, Any]:
+    # Tolerate absent active code_map.json and task_index.json; do not recreate archived records under docs/
     if not os.path.exists(path):
         return {}
     try:
@@ -51,6 +52,7 @@ def main() -> None:
 
 
     # 2. Search code map entries from code_map.json
+    # Tolerate absent active code_map.json
     code_map = _read_json("docs/code_map.json")
     relevant_code = {}
     if args.query:
@@ -93,13 +95,13 @@ def main() -> None:
                     "target_test_file": f"tests/unit/{args.domain}/test_{feature_slug}.py",
                     "execution_command": f"uv run pytest tests/unit/{args.domain}/test_{feature_slug}.py -k test_{feature_slug}_executes_correctly -q",
                     "expected_behavior": "Handles normal input and returns expected result",
-                    "test_skeleton": f"def test_{feature_slug}_executes_correctly() -> None:\n    from src.{args.domain}.{feature_slug} import calc_{feature_slug}\n\n    result = calc_{feature_slug}(1.0)\n    assert result == 1.0\n"
+                    "test_skeleton": f"def test_{feature_slug}_executes_correctly() -> None:\n    from src.{args.domain}.{feature_slug} import calc_{feature_slug}\n\n    result = calc_{feature_slug}(1.0)\n    assert result == 1.0\n",
                 }
             ],
             "wiring": {
                 "file": f"src/{args.domain}/pipeline.py",
                 "anchor": "def run_pipeline",
-                "invocation_expression": f"calc_{feature_slug}(val)"
+                "invocation_expression": f"calc_{feature_slug}(val)",
             },
             "design_rationale": design_rationale,
             "performance_budget": performance_budget,
@@ -108,6 +110,8 @@ def main() -> None:
             json.dump(boilerplate_contract, f, indent=2)
             f.write("\n")
         print(f"\n✅ Created contract boilerplate: {output_contract}")
+        if probe_data:
+            print(f"   (Auto-populated design_rationale from {probe_summary_path})")
     else:
         print(f"\n[i] Contract file already exists: {output_contract}")
 

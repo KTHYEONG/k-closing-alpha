@@ -366,6 +366,67 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
 
         with open(fh) as sf:
             sf_content = sf.read()
+            if kind.startswith("deleted_"):
+                # Deleted symbol contract: verify symbol does NOT exist in target file
+                base_kind = kind.removeprefix("deleted_")
+                symbol_present = False
+                if base_kind in ("constant", "type alias", "module_constant"):
+                    try:
+                        tree = ast.parse(sf_content, filename=fh)
+                        for node in ast.walk(tree):
+                            if (
+                                isinstance(node, ast.AnnAssign)
+                                and isinstance(node.target, ast.Name)
+                                and node.target.id == name
+                            ) or (
+                                isinstance(node, ast.Assign)
+                                and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+                            ):
+                                symbol_present = True
+                                break
+                    except Exception:
+                        symbol_present = bool(re.search(rf"^\s*{re.escape(name)}\s*=", sf_content, re.MULTILINE))
+                elif base_kind in ("function", "class", "async_function"):
+                    owner, _, leaf = name.rpartition(".")
+                    try:
+                        tree = ast.parse(sf_content, filename=fh)
+                        if owner:
+                            for node in ast.walk(tree):
+                                if isinstance(node, ast.ClassDef) and node.name == owner:
+                                    for member in node.body:
+                                        if (
+                                            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                            and member.name == leaf
+                                        ):
+                                            symbol_present = True
+                                            break
+                        else:
+                            for node in ast.walk(tree):
+                                if (
+                                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                                    and node.name == name
+                                ):
+                                    symbol_present = True
+                                    break
+                    except Exception:
+                        pat = rf"^\s*(?:class|def|async\s+def)\s+{re.escape(name)}\b"
+                        symbol_present = bool(re.search(pat, sf_content, re.MULTILINE))
+                else:
+                    # Fallback word-boundary check
+                    pat = rf"\b{re.escape(name)}\b"
+                    symbol_present = bool(re.search(pat, sf_content))
+
+                if symbol_present:
+                    msg = f"Spec: {kind} '{name}' still present in {fh} (should be removed)"
+                    d = {
+                        "file": fh,
+                        "line": 0,
+                        "error": msg,
+                        "fix_hint": f"Remove {name} from {fh}",
+                    }
+                    diagnostics.append(d)
+                continue
+
             if kind in ("field", "dataclass_field", "pydantic_computed_field"):
                 field_name = name.split(".")[-1] if "." in name else name
                 pat = rf"\b{re.escape(field_name)}\b"
