@@ -33,9 +33,13 @@ def test_trading_condition_name_drives_aggregate_paths(tmp_path) -> None:
     assert settings.HISTORY_CSV_PATH == settings.HISTORY_DIR / "archive.csv"
 
 
-def test_trading_settings_candidate_source_mode_defaults_to_manual() -> None:
+
+
+
+def test_candidate_source_mode_setting_is_removed() -> None:
+    from src import settings
     from src.config.trading import TradingSettings
 
-    settings = TradingSettings(_env_file=None)
-
-    assert settings.CANDIDATE_SOURCE_MODE == "manual"
+    # Then: the pipeline is automated-only, so the mode switch is gone
+    assert "CANDIDATE_SOURCE_MODE" not in TradingSettings.model_fields
+    assert not hasattr(settings, "CANDIDATE_SOURCE_MODE")
