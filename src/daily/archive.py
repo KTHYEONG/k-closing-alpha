@@ -182,8 +182,8 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
         out = out.drop_duplicates(subset=[SNAP_DATE_COL, STOCK_CODE_COL], keep="last")
 
     settings.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    _target_date = str(out[SNAP_DATE_COL].iloc[0]) if len(out) else str(snapshot_date or "")
     try:
-        _target_date = str(out[SNAP_DATE_COL].iloc[0]) if len(out) else str(snapshot_date)
         if settings.HISTORY_PARQUET_PATH.exists():
             _existing = pd.read_parquet(settings.HISTORY_PARQUET_PATH)
             if _existing is not None and not _existing.empty and SNAP_DATE_COL in _existing.columns:
@@ -194,7 +194,7 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
                     else:
                         _latest = pd.NaT
                     logger.info(
-                        "[DATA] archive rerun detected date=%s existing=%d latest=%s rows=%d",
+                        "🔄 [아카이브 갱신] %s 당일 스냅샷 rerun detected (기존 %d행, latest=%s, %d행 덮어쓰기)",
                         _target_date,
                         len(_prev),
                         str(_latest),
@@ -206,7 +206,7 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
 
     _write_condition_parquet_with_retry(out)
 
-    logger.info("[DATA] archive upsert date=%s rows=%d", snapshot_date or "latest", row_count)
+    logger.info("💾 [아카이브 저장] %s 스냅샷 적재 완료 (총 %d행)", _target_date or "latest", row_count)
     return row_count
 
 

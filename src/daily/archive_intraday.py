@@ -103,11 +103,31 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
 
 def main() -> None:
     import sys
+
+    from src.utils.display import Colors
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    target_date = sys.argv[1] if len(sys.argv) > 1 else None
-    logger.info("Intraday archive store root: %s (target_date=%s)", settings.HISTORY_DIR, target_date)
+    target_date = sys.argv[1] if len(sys.argv) > 1 else datetime.now().strftime("%Y-%m-%d")
+    target_codes = _archive_target_codes(target_date)
+    logger.info(
+        "🚀 [Intraday 아카이브 시작] 대상일: %s, 대상 종목: %d개, 저장소: %s",
+        target_date,
+        len(target_codes),
+        settings.HISTORY_DIR,
+    )
     bars_rows, nxt_rows, tick_rows = run_intraday_archive(snapshot_date=target_date)
-    logger.info("[SUCCESS] intraday 아카이브 완료 (정규: %d행, NXT 애프터: %d행, 틱: %d행)", bars_rows, nxt_rows, tick_rows)
+
+    box_top = "━" * 60
+    divider = "─" * 60
+    logger.info(f"\n{Colors.BOLD}{box_top}{Colors.RESET}")
+    logger.info(f" {Colors.GREEN}{Colors.BOLD}📦 [Intraday 분봉/틱 아카이브 완료]{Colors.RESET} (기준일: {target_date})")
+    logger.info(f"{Colors.BOLD}{divider}{Colors.RESET}")
+    logger.info(f"   • 대상 종목수 : {Colors.CYAN}{len(target_codes):>5}{Colors.RESET} 종목 (당일 + 직전 영업일 워치리스트)")
+    logger.info(f"   • 정규 세션   : {Colors.GREEN}{bars_rows:>5,}{Colors.RESET} 행 (1분봉)")
+    logger.info(f"   • NXT 세션    : {Colors.GREEN}{nxt_rows:>5,}{Colors.RESET} 행 (프리/애프터마켓)")
+    logger.info(f"   • 체결 틱     : {Colors.GREEN}{tick_rows:>5,}{Colors.RESET} 행 (정규장 틱 데이터)")
+    logger.info(f"   • 저장 경로   : {settings.HISTORY_DIR}")
+    logger.info(f"{Colors.BOLD}{box_top}{Colors.RESET}")
 
 
 if __name__ == "__main__":

@@ -79,7 +79,6 @@ def print_table(results_list, title, minimal=False):
     if isinstance(results_list, pd.DataFrame):
         if results_list.empty:
             return
-        # single_stock_policy decision DataFrame 이 들어온 경우
         _write_line(f"\n{Colors.BOLD}=== {title} ==={Colors.RESET}")
         for _idx, row in results_list.iterrows():
             decision = row.get("decision", "ABSTAIN")
@@ -96,8 +95,58 @@ def print_table(results_list, title, minimal=False):
     if not results_list:
         return
 
-    # Score 내림차순, 동일 Score 내에서는 Rank 오름차순 정렬
-    results_list.sort(key=lambda x: (-x["Score"], x["Rank"]))
+    # Modern Top-K Reranker 결정 행 (Code, Name, Pred, Alloc% 형태)
+    first_item = results_list[0] if isinstance(results_list[0], dict) else {}
+    if "Code" in first_item or "Pred" in first_item:
+        W_RANK, W_CODE, W_NAME, W_PRED, W_ALLOC = 6, 10, 16, 16, 14
+        header = (
+            f"| {pad_str('Rank', W_RANK, 'center')} "
+            f"| {pad_str('Code', W_CODE, 'center')} "
+            f"| {pad_str('Name', W_NAME, 'center')} "
+            f"| {pad_str('Pred(Return)', W_PRED, 'center')} "
+            f"| {pad_str('Alloc(Weight)', W_ALLOC, 'center')} |"
+        )
+        divider = "─" * get_display_width(header)
+        box_top = "━" * get_display_width(header)
+
+        _write_line(f"\n{Colors.BOLD}{box_top}{Colors.RESET}")
+        _write_line(f" {Colors.CYAN}{Colors.BOLD}🎯 [{title}]{Colors.RESET}")
+        _write_line(f"{Colors.BOLD}{box_top}{Colors.RESET}")
+        _write_line(Colors.BOLD + header + Colors.RESET)
+        _write_line(divider)
+
+        for rank, res in enumerate(results_list, start=1):
+            code_display = str(res.get("Code", ""))
+            name_display = str(res.get("Name", ""))
+            if get_display_width(name_display) > W_NAME:
+                while get_display_width(name_display + "..") > W_NAME:
+                    name_display = name_display[:-1]
+                name_display += ".."
+
+            pred_val = res.get("Pred", 0.0)
+            pred_str = f"{pred_val:+.4f}" if isinstance(pred_val, (int, float)) else str(pred_val)
+            alloc_val = res.get("Alloc%", 0.0)
+            alloc_str = f"{alloc_val:.2f}%" if isinstance(alloc_val, (int, float)) else str(alloc_val)
+
+            pred_color = Colors.RED if isinstance(pred_val, (int, float)) and pred_val > 0 else Colors.BLUE if isinstance(pred_val, (int, float)) and pred_val < 0 else Colors.WHITE
+
+            row_str = (
+                f"| {pad_str(str(rank), W_RANK, 'center')} "
+                f"| {pad_str(code_display, W_CODE, 'center')} "
+                f"| {pad_str(name_display, W_NAME, 'left')} "
+                f"| {pred_color}{pad_str(pred_str, W_PRED, 'center')}{Colors.RESET} "
+                f"| {Colors.GREEN}{pad_str(alloc_str, W_ALLOC, 'center')}{Colors.RESET} |"
+            )
+            _write_line(row_str)
+
+        _write_line(box_top)
+        return
+
+    # Legacy Rank/Score/Scenario/Decision 포맷 하위 호환
+    results_list_sorted = sorted(
+        results_list,
+        key=lambda x: (-x.get("Score", 0.0), x.get("Rank", 999)),
+    )
 
     if minimal:
         W_RANK, W_NAME = 6, 16
@@ -128,42 +177,43 @@ def print_table(results_list, title, minimal=False):
 
     previous_stock_name = None
 
-    for res in results_list:
-        dec_color = get_decision_color(res["Decision"])
-        if previous_stock_name is not None and res["Name"] != previous_stock_name:
+    for res in results_list_sorted:
+        dec_color = get_decision_color(res.get("Decision", ""))
+        name = res.get("Name", "")
+        if previous_stock_name is not None and name != previous_stock_name:
             _write_line(divider)
-        previous_stock_name = res["Name"]
+        previous_stock_name = name
 
-        name_display = res["Name"]
-        # 이름이 설정된 너비보다 길 경우에만 최소한의 말줄임 적용
+        name_display = name
         if get_display_width(name_display) > W_NAME:
             while get_display_width(name_display + "..") > W_NAME:
                 name_display = name_display[:-1]
             name_display += ".."
-        score_str = f"{res['Score']:.4f}"
+        score_val = res.get("Score", 0.0)
+        score_str = f"{score_val:.4f}" if isinstance(score_val, (int, float)) else str(score_val)
 
         if minimal:
             row_str = (
-                f"| {pad_str(res['Rank'], W_RANK, 'center')} "
+                f"| {pad_str(str(res.get('Rank', '')), W_RANK, 'center')} "
                 f"| {pad_str(name_display, W_NAME, 'left')} "
                 f"| {pad_str(score_str, W_PROB, 'center')} "
-                f"| {dec_color}{pad_str(res['Decision'], W_DECISION, 'center')}{Colors.RESET} |"
+                f"| {dec_color}{pad_str(str(res.get('Decision', '')), W_DECISION, 'center')}{Colors.RESET} |"
             )
         else:
-            rate_display = f"{res['Applied_Rate']}%"
-            scenario_display = res["Scenario"]
+            rate_display = f"{res.get('Applied_Rate', 'N/A')}%"
+            scenario_display = str(res.get("Scenario", "N/A"))
             if get_display_width(scenario_display) > W_SCENARIO:
                 while get_display_width(scenario_display + "..") > W_SCENARIO:
                     scenario_display = scenario_display[:-1]
                 scenario_display += ".."
 
             row_str = (
-                f"| {pad_str(res['Rank'], W_RANK, 'center')} "
+                f"| {pad_str(str(res.get('Rank', '')), W_RANK, 'center')} "
                 f"| {pad_str(name_display, W_NAME, 'left')} "
                 f"| {pad_str(rate_display, W_RATE, 'center')} "
                 f"| {pad_str(scenario_display, W_SCENARIO, 'left')} "
                 f"| {pad_str(score_str, W_PROB, 'center')} "
-                f"| {dec_color}{pad_str(res['Decision'], W_DECISION, 'center')}{Colors.RESET} |"
+                f"| {dec_color}{pad_str(str(res.get('Decision', '')), W_DECISION, 'center')}{Colors.RESET} |"
             )
         _write_line(row_str)
     _write_line(divider)
