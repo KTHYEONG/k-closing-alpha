@@ -9,13 +9,8 @@ import numpy as np
 import pandas as pd
 
 __all__ = [
-    "BAND_2_15_SCREEN",
-    "BAND_5_15_HIGHVALUE_SCREEN",
     "COST_AWARE_SCREEN",
-    "OPERATOR_LEGACY_SCREEN",
-    "SCREEN_REGISTRY",
     "ScreenConfig",
-    "apply_screen_mask",
     "build_universe_panel",
     "screen_baseline_stats",
 ]
@@ -45,34 +40,6 @@ class ScreenConfig:
             raise ValueError(f"max_tick_cost_bp must be > 0 when set, got {self.max_tick_cost_bp!r}")
 
 
-OPERATOR_LEGACY_SCREEN: ScreenConfig = ScreenConfig(
-    change_lower=0.10,
-    change_upper=None,
-    min_trade_value_100m=100.0,
-    min_market_cap_100m=500.0,
-    exclude_ceiling=True,
-)
-
-# Measured 2026-09-06 (docs/decisions/archive/CLOSING_ALPHA_ARCHITECTURE_V2):
-# gross overnight edge peaks in the +2~10% band and collapses above +20%, while
-# the >=10% legacy cut sits past the peak with ~+1.0bp net-of-universe gain for
-# a 10x smaller pool. Both bands below are net negative in the 2022-2026 half.
-BAND_2_15_SCREEN: ScreenConfig = ScreenConfig(
-    change_lower=0.02,
-    change_upper=0.15,
-    min_trade_value_100m=100.0,
-    min_market_cap_100m=500.0,
-    exclude_ceiling=True,
-)
-
-BAND_5_15_HIGHVALUE_SCREEN: ScreenConfig = ScreenConfig(
-    change_lower=0.05,
-    change_upper=0.15,
-    min_trade_value_100m=3000.0,
-    min_market_cap_100m=500.0,
-    exclude_ceiling=True,
-)
-
 COST_AWARE_SCREEN: ScreenConfig = ScreenConfig(
     change_lower=0.02,
     change_upper=0.10,
@@ -81,12 +48,6 @@ COST_AWARE_SCREEN: ScreenConfig = ScreenConfig(
     exclude_ceiling=True,
     max_tick_cost_bp=7.5,
 )
-
-SCREEN_REGISTRY: dict[str, ScreenConfig] = {
-    "operator_legacy": OPERATOR_LEGACY_SCREEN,
-    "band_2_15": BAND_2_15_SCREEN,
-    "band_5_15_highvalue": BAND_5_15_HIGHVALUE_SCREEN,
-}
 
 
 def _resolve_col(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
@@ -275,48 +236,3 @@ def screen_baseline_stats(
         "win_rate": float(win_rate),
         "coverage_warning": bool(coverage_warning),
     }
-
-
-def apply_screen_mask(
-    df: pd.DataFrame,
-    screen: ScreenConfig,
-    *,
-    change_col: str = "change_rate",
-    change_scale: float = 100.0,
-    trade_value_col: str = "trade_value_100m",
-    market_cap_col: str = "market_cap_100m",
-) -> np.ndarray:
-    """Boolean screen mask over an already trade-log-shaped panel.
-
-    Unlike build_universe_panel (which reconstructs from the full price_history
-    universe), this filters a panel that is already survivorship-limited to
-    what the legacy operator screen logged -- it can narrow the pool but can
-    never recover candidates the legacy screen excluded (see R8 caveat).
-    A screen carrying max_tick_cost_bp is rejected here: the cap needs full
-    price_history reconstruction via build_universe_panel.
-    """
-    # 틱비용 상한은 저널된 패널에서 복원 불가이므로 구조적으로 거부한다.
-    if screen.max_tick_cost_bp is not None:
-        raise ValueError(
-            "apply_screen_mask cannot apply max_tick_cost_bp: it narrows an already "
-            "journaled/restricted trade-log panel and cannot recover candidates the historical "
-            "screen never logged -- use build_universe_panel (full price_history reconstruction) "
-            "for any screen carrying a tick-cost cap"
-        )
-    if change_col not in df.columns:
-        raise ValueError(f"df is missing change_col {change_col!r}")
-    chg = pd.to_numeric(df[change_col], errors="coerce").to_numpy(dtype=np.float64) / float(change_scale)
-    keep = np.isfinite(chg) & (chg >= float(screen.change_lower))
-    if screen.change_upper is not None:
-        keep &= chg <= float(screen.change_upper)
-    if trade_value_col in df.columns:
-        tv = pd.to_numeric(df[trade_value_col], errors="coerce").to_numpy(dtype=np.float64)
-        keep &= np.isfinite(tv) & (tv >= float(screen.min_trade_value_100m))
-    elif float(screen.min_trade_value_100m) > 0.0:
-        keep &= False
-    if market_cap_col in df.columns:
-        mc = pd.to_numeric(df[market_cap_col], errors="coerce").to_numpy(dtype=np.float64)
-        keep &= np.isfinite(mc) & (mc >= float(screen.min_market_cap_100m))
-    elif float(screen.min_market_cap_100m) > 0.0:
-        keep &= False
-    return np.asarray(keep, dtype=bool)

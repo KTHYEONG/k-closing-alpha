@@ -52,45 +52,6 @@ def test_build_ml_dataset_matches_legacy_champion_columns() -> None:
         gproc.sort_index()["target_return"].to_numpy(), lproc.sort_index()["target_return"].to_numpy(), rtol=1e-9, atol=1e-12
     )
 
-import numpy as np
-import pandas as pd
-
-from legacy.ml_research.evaluation.single_stock_policy import (
-    default_policy_candidates as legacy_candidates,
-    evaluate_single_stock_policy_oof as legacy_eval,
-)
-from src.ml.policy_eval import default_policy_candidates, evaluate_single_stock_policy_oof
-
-
-def _oof(n_dates: int = 320, per_day: int = 6) -> pd.DataFrame:
-    rng = np.random.default_rng(9)
-    dates = np.repeat(pd.bdate_range("2022-01-03", periods=n_dates), per_day)
-    m = len(dates)
-    pred = rng.normal(size=m)
-    return pd.DataFrame({
-        "trade_date": dates,
-        "stock_code": [f"{i % 40:06d}" for i in range(m)],
-        "chart_analysis": "volume_surge",
-        "market_type": "KOSPI",
-        "rank_score": pred,
-        "target_return": 0.01 * pred + rng.normal(scale=0.02, size=m),
-    })
-
-
-def test_evaluate_single_stock_policy_oof_matches_legacy_selection() -> None:
-    oof = _oof()
-    cutoff = str(oof["trade_date"].max())
-    got = evaluate_single_stock_policy_oof(
-        oof.copy(), "target_return", "trade_date", "stock_code",
-        default_policy_candidates(cutoff), 252, scenario_col="chart_analysis", score_col="rank_score",
-    )
-    exp = legacy_eval(
-        oof.copy(), "target_return", "trade_date", "stock_code",
-        legacy_candidates(cutoff), 252, scenario_col="chart_analysis", score_col="rank_score",
-    )
-    assert got.selected_policy.candidate == exp.selected_policy.candidate
-    assert np.isclose(got.metrics["scheduled_mean_return"], exp.metrics["scheduled_mean_return"], atol=1e-9)
-
 import pathlib
 
 

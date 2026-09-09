@@ -5,14 +5,14 @@ from __future__ import annotations
 def test_screen_config_rejects_invalid_bands() -> None:
     import pytest
 
-    from src.ml.universe import OPERATOR_LEGACY_SCREEN, ScreenConfig
+    from src.ml.universe import COST_AWARE_SCREEN, ScreenConfig
 
-    # The inherited screen is pinned as the control arm, never as a default
-    assert OPERATOR_LEGACY_SCREEN.change_lower == 0.10
-    assert OPERATOR_LEGACY_SCREEN.change_upper is None
-    assert OPERATOR_LEGACY_SCREEN.min_trade_value_100m == 100.0
-    assert OPERATOR_LEGACY_SCREEN.min_market_cap_100m == 500.0
-    assert OPERATOR_LEGACY_SCREEN.exclude_ceiling is True
+    # The cost-aware screen is pinned as the control arm, never as a default
+    assert COST_AWARE_SCREEN.change_lower == 0.02
+    assert COST_AWARE_SCREEN.change_upper == 0.10
+    assert COST_AWARE_SCREEN.min_trade_value_100m == 100.0
+    assert COST_AWARE_SCREEN.min_market_cap_100m == 500.0
+    assert COST_AWARE_SCREEN.exclude_ceiling is True
 
     band = ScreenConfig(change_lower=0.02, change_upper=0.15, min_trade_value_100m=1000.0)
     assert band.change_upper == 0.15
@@ -164,44 +164,13 @@ def test_universe_fail_closed_edges() -> None:
     assert warn["coverage_warning"] is True
 
 
-def test_apply_screen_mask_uses_percent_scaled_change_rate() -> None:
-    """Regression: apply_screen_mask filters an already-logged (trade-log-shaped)
-    panel using change_rate in PERCENT units, unlike build_universe_panel's
-    daily_change_pct which is a fraction."""
-    import pandas as pd
-    import pytest
-
-    from src.ml.universe import BAND_2_15_SCREEN, OPERATOR_LEGACY_SCREEN, apply_screen_mask
-
-    df = pd.DataFrame({
-        "change_rate": [1.5, 9.9, 12.0, 20.0],  # percent units, as logged in the trade log
-        "trade_value_100m": [500.0, 500.0, 500.0, 500.0],
-        "market_cap_100m": [1000.0, 1000.0, 1000.0, 1000.0],
-    })
-
-    legacy_mask = apply_screen_mask(df, OPERATOR_LEGACY_SCREEN)
-    # OPERATOR_LEGACY_SCREEN.change_lower=0.10 -> 10% -> only 12.0% and 20.0% qualify
-    assert legacy_mask.tolist() == [False, False, True, True]
-
-    band_mask = apply_screen_mask(df, BAND_2_15_SCREEN)
-    # BAND_2_15_SCREEN is [2%, 15%] -> only 12.0% qualifies (9.9% is below 2%? no: 9.9 >= 2)
-    assert band_mask.tolist() == [False, True, True, False]
-
-    with pytest.raises(ValueError, match="change_col"):
-        apply_screen_mask(df.drop(columns=["change_rate"]), OPERATOR_LEGACY_SCREEN)
-
-    # Missing liquidity columns with a positive floor fails closed (nothing qualifies)
-    no_liquidity = df.drop(columns=["trade_value_100m", "market_cap_100m"])
-    assert apply_screen_mask(no_liquidity, OPERATOR_LEGACY_SCREEN).tolist() == [False, False, False, False]
-
-
 def test_screen_config_accepts_max_tick_cost_bp_and_rejects_invalid() -> None:
     import pytest
 
-    from src.ml.universe import OPERATOR_LEGACY_SCREEN, ScreenConfig
+    from src.ml.universe import ScreenConfig
 
-    # Given/Then: every existing screen still defaults to no cap
-    assert OPERATOR_LEGACY_SCREEN.max_tick_cost_bp is None
+    # Given/Then: a plain screen still defaults to no cap
+    assert ScreenConfig(change_lower=0.02).max_tick_cost_bp is None
 
     # When: a positive cap is set
     capped = ScreenConfig(change_lower=0.02, change_upper=0.10, max_tick_cost_bp=7.5)
@@ -267,28 +236,6 @@ def test_build_universe_panel_raises_when_tick_cost_cap_set_but_column_missing()
 
     with pytest.raises(ValueError, match="tick_cost_bp"):
         build_universe_panel(ph, screen, start_date="2023-02-01", end_date="2023-02-01")
-
-
-def test_apply_screen_mask_rejects_max_tick_cost_bp() -> None:
-    import pandas as pd
-    import pytest
-
-    from src.ml.universe import COST_AWARE_SCREEN, apply_screen_mask
-
-    # Given: an empty frame (missing every column apply_screen_mask would otherwise check first)
-    df = pd.DataFrame()
-
-    # When / Then: the max_tick_cost_bp rejection fires before any column-existence check
-    with pytest.raises(ValueError, match="max_tick_cost_bp"):
-        apply_screen_mask(df, COST_AWARE_SCREEN)
-
-
-def test_cost_aware_screen_not_in_registry() -> None:
-    from src.ml.universe import COST_AWARE_SCREEN, SCREEN_REGISTRY
-
-    assert "cost_aware" not in SCREEN_REGISTRY
-    assert COST_AWARE_SCREEN not in SCREEN_REGISTRY.values()
-    assert COST_AWARE_SCREEN.max_tick_cost_bp == 7.5
 
 
 def test_cost_aware_screen_matches_strategy_contract_universe() -> None:
