@@ -1045,9 +1045,13 @@ def main() -> None:
         ):
             parts = pf.split("/")
             test_name = f"test_{parts[-1]}"
-            has_test = any(test_name in tf for tf in test_files) or (
-                pf in spec_target_files and len(test_files) > 0
-            )
+            # Sibling modules sharing a basename (e.g. src/api/{kis,ls,kiwoom}/client.py)
+            # are conventionally disambiguated as test_<parent_dir>_<basename>.py rather
+            # than test_<basename>.py, so accept either naming.
+            qualified_test_name = f"test_{parts[-2]}_{parts[-1]}" if len(parts) >= 2 else test_name
+            has_test = any(
+                test_name in tf or qualified_test_name in tf for tf in test_files
+            ) or (pf in spec_target_files and len(test_files) > 0)
             if not has_test:
                 d = {
                     "file": pf,
