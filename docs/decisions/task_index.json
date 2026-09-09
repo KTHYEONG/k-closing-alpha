@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "topk_pipeline_redesign",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_topk_pipeline_redesign",
+      "domain": "daily",
+      "title": "collect/predict/archive 파이프라인 최소화 재설계",
+      "why": "종가매매 수동 조건검색·스프레드시트 유산 제거 후 top-3 automated 전용 파이프라인 효율화 필요",
+      "resolution": "collect가 CSV 대신 archive에 직접 upsert, 종목당 API 7→4회, SMA120 전종목 프리페치 단계 삭제, ARCHIVE_COLUMN_ORDER 36→19컬럼, predict는 저장소의 admitted 플래그를 재계산 없이 사용",
+      "impact": "API 호출량 대폭 절감, CSV/Excel 이중저장 제거, manual 모드·CANDIDATE_SOURCE_MODE 완전 폐기로 automated 단일경로화"
+    },
+    {
       "task_id": "topk_decision_sizing_migration",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_topk_decision_sizing_migration",
