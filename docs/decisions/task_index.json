@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "decision_timing_and_store_unification",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_decision_timing_and_store_unification",
+      "domain": "daily",
+      "title": "결정 타이밍 재설계 + archive 저장소 단일화 + 캡처 결함 수정",
+      "why": "15:18 연속거래 진입가가 리서치 전제인 공식종가와 21bp 어긋나고, NXT 결정시점 호가는 신규 타이밍 창에서 항상 죽은 값이며, 투자자추정/지수파싱/parquet쓰기 3건이 실패를 0으로 위장",
+      "resolution": "결정을 15:20~15:30 KRX 종가단일가 구간으로 이동(fail-closed 가드), NXT 결정호가 삭제(4→3 API), archive를 parquet 단일화(쓰기 재시도 후 fail-loud), orderbook output1+output2 모두 저장, 수급/지수 실패를 NaN+플래그로 명시, Top-3 결정을 topk_decisions.parquet에 영속화",
+      "impact": "리서치-라이브 진입가 오차 21bp→0, API 호출 4→3회, 실계좌 자동매매/WebSocket/LS·Kiwoom 결정경로 전환은 범위 밖으로 별도 기록"
+    },
+    {
       "task_id": "spreadsheet_legacy_removal",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_spreadsheet_legacy_removal",

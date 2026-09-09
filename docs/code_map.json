@@ -323,6 +323,9 @@
   "src/tools/migrate_price_history_storage.py": {
     "testing": "tests/unit/tools/test_migrate_price_history_storage.py"
   },
+  "src/tools/observe_closing_auction_price_behavior.py": {
+    "testing": "tests/unit/tools/test_observe_closing_auction_price_behavior.py"
+  },
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
   },
