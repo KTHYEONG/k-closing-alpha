@@ -157,29 +157,3 @@ def upsert_condition_parquet(df: pd.DataFrame) -> None:
     df_combined = _clean_df_for_parquet(df_combined)
     _atomic_write_parquet(df_combined, parquet_path)
     logger.info("Upserted condition history parquet: %s (%d rows)", parquet_path, len(df_combined))
-
-
-def load_condition_data_from_parquet(date: str | None = None, limit: int | None = None) -> pd.DataFrame:
-    """Load condition search snapshot history from parquet.
-
-    Args:
-        date: Filter by date prefix string ('YYYY-MM-DD').
-        limit: Limit recent N rows.
-
-    Returns:
-        pd.DataFrame: Condition history DataFrame.
-    """
-    parquet_path = settings.HISTORY_PARQUET_PATH
-    if not parquet_path.exists():
-        logger.info("Condition history parquet file not found at %s.", parquet_path)
-        return pd.DataFrame()
-
-    df = pd.read_parquet(parquet_path)
-
-    if date and "스냅샷_날짜" in df.columns:
-        df = df[df["스냅샷_날짜"].astype(str).str.startswith(date)]
-
-    if limit and len(df) > limit:
-        df = df.tail(limit)
-
-    return df

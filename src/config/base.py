@@ -40,11 +40,6 @@ class PathSettings(BaseSettings):
     # ---------------------------------------------------------
     @computed_field  # type: ignore[prop-decorator]
     @property
-    def STOCK_DB_PATH(self) -> Path:
-        return self.DATA_DIR / "stock.db"
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
     def PARQUET_DIR(self) -> Path:
         return self.DATA_DIR / "parquet"
 
@@ -62,11 +57,6 @@ class PathSettings(BaseSettings):
     @property
     def DAILY_DIR(self) -> Path:
         return self.DATA_DIR / "daily"
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def CONDITION_PARQUET_PATH(self) -> Path:
-        return self.DAILY_DIR / "daily_stocks.parquet"
 
     @computed_field  # type: ignore[prop-decorator]
     @property

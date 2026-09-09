@@ -23,8 +23,6 @@ def test_models_dir_under_artifacts() -> None:
 
 def test_derived_paths_based_on_base_dir(tmp_path: Path) -> None:
     settings = Settings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data")
-    assert tmp_path / "data" / "stock.db" == settings.STOCK_DB_PATH
-    assert tmp_path / "data" / "daily" / "daily_stocks.csv" == settings.CONDITION_CSV_PATH
     assert settings.MODEL_PATH == settings.MODELS_DIR / "best_stock_rg_cat.joblib"
 
 
@@ -65,12 +63,12 @@ def test_config_modularity_and_compatibility() -> None:
     from src.config.kis import KisSettings
     from src.config.trading import TradingSettings
 
-    assert hasattr(settings, "CONDITION_CSV_PATH")
+    assert not hasattr(settings, "CONDITION_CSV_PATH")
     assert isinstance(settings.settings, Settings)
     assert isinstance(PathSettings, type)
     assert isinstance(KisSettings, type)
     assert isinstance(TradingSettings, type)
-    assert settings.settings.STOCK_DB_PATH == settings.STOCK_DB_PATH
+    assert settings.settings.PARQUET_DIR == settings.PARQUET_DIR
     assert settings.settings.KIS_API_CONFIG["app_key"] == settings.KIS_API_CONFIG["app_key"]
 
 

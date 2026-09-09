@@ -27,10 +27,8 @@ def test_trading_condition_name_drives_aggregate_paths(tmp_path) -> None:
         TARGET_CONDITION_NAME="상따",
         _env_file=None,
     )
-    assert tmp_path / "data" / "daily" / "daily_stocks.csv" == settings.CONDITION_CSV_PATH
     assert tmp_path / "data" / "history" == settings.HISTORY_DIR
-    assert settings.HISTORY_DB_PATH == settings.HISTORY_DIR / "archive.db"
-    assert settings.HISTORY_CSV_PATH == settings.HISTORY_DIR / "archive.csv"
+    assert settings.HISTORY_PARQUET_PATH == settings.HISTORY_DIR / "archive.parquet"
 
 
 
@@ -43,3 +41,20 @@ def test_candidate_source_mode_setting_is_removed() -> None:
     # Then: the pipeline is automated-only, so the mode switch is gone
     assert "CANDIDATE_SOURCE_MODE" not in TradingSettings.model_fields
     assert not hasattr(settings, "CANDIDATE_SOURCE_MODE")
+
+
+def test_legacy_sqlite_and_csv_computed_paths_removed() -> None:
+    """stock.db/archive.db/daily_stocks.csv 폐기에 따라 관련 computed path가 완전히 제거되었는지 검증합니다."""
+    from src import settings
+    from src.config import Settings as SettingsClass
+
+    for name in (
+        "STOCK_DB_PATH",
+        "HISTORY_DB_PATH",
+        "HISTORY_CSV_PATH",
+        "CONDITION_CSV_PATH",
+        "CONDITION_PARQUET_PATH",
+    ):
+        assert not hasattr(settings, name), f"{name} should have been removed from settings module"
+        assert not hasattr(settings.settings, name), f"{name} should have been removed from Settings instance"
+        assert name not in SettingsClass.model_fields

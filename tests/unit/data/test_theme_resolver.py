@@ -72,3 +72,11 @@ def test_batch_resolve_missing_themes_updates_cache(monkeypatch, tmp_path) -> No
     assert dummy_parquet.exists()
     saved_df = pd.read_parquet(dummy_parquet)
     assert "452430" in saved_df["종목코드"].values
+
+
+
+def test_theme_resolver_module_has_no_sqlite_dependency() -> None:
+    """stock.db 폐기에 따라 theme_resolver가 sqlite3에 더 이상 의존하지 않는지 검증합니다."""
+    from src.data import theme_resolver
+
+    assert not hasattr(theme_resolver, "sqlite3")

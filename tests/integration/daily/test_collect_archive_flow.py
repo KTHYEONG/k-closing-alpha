@@ -62,8 +62,6 @@ def test_collect_main_persists_wide_snapshot_to_store_without_csv(monkeypatch, t
 
     from src.daily import collect
 
-    csv_path = tmp_path / "daily" / "daily_stocks.csv"
-    monkeypatch.setattr(collect.settings, "CONDITION_CSV_PATH", csv_path)
     monkeypatch.setattr(collect, "HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
@@ -101,8 +99,8 @@ def test_collect_main_persists_wide_snapshot_to_store_without_csv(monkeypatch, t
     # When
     asyncio.run(collect.main(force=True))
 
-    # Then: no spreadsheet-era file artifact is produced
-    assert not csv_path.exists()
+    # Then: the spreadsheet-era CSV path no longer exists as a settings surface at all
+    assert not hasattr(collect.settings, "CONDITION_CSV_PATH")
 
     # Then: the wide cross-section is stored, rejection recorded as a flag
     stored = captured["df"]
@@ -117,8 +115,6 @@ def test_collect_main_returns_early_when_scan_empty(monkeypatch, tmp_path, caplo
 
     from src.daily import collect
 
-    csv_path = tmp_path / "daily" / "daily_stocks.csv"
-    monkeypatch.setattr(collect.settings, "CONDITION_CSV_PATH", csv_path)
     monkeypatch.setattr(collect, "HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
@@ -140,9 +136,8 @@ def test_collect_main_returns_early_when_scan_empty(monkeypatch, tmp_path, caplo
     with caplog.at_level(logging.INFO, logger=collect.logger.name):
         asyncio.run(collect.main(force=True))
 
-    # Then: no persistence attempt, no CSV artifact, and the emptiness is surfaced
+    # Then: no persistence attempt, and the emptiness is surfaced
     assert upsert_calls == []
-    assert not csv_path.exists()
     assert any("자동 스캔 후보가 없습니다" in rec.message for rec in caplog.records)
 
 
@@ -156,8 +151,6 @@ def test_collect_main_marks_index_failed_and_nans_kospi_kosdaq_on_index_failure(
         async def get_market_index_rate(self, session: object, code: str) -> dict:
             return {"rt_cd": "9", "msg1": "index unavailable"}
 
-    csv_path = tmp_path / "daily" / "daily_stocks.csv"
-    monkeypatch.setattr(collect.settings, "CONDITION_CSV_PATH", csv_path)
     monkeypatch.setattr(collect, "HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FailingIndexClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
