@@ -12,7 +12,10 @@ logger = logging.getLogger(__name__)
 
 UNIVERSE_SCAN_SCENARIO_TAG: str = "등락률스캔"
 
+RANKING_SCAN_INPUT_CNT: str = "200"
+
 __all__ = [
+    "RANKING_SCAN_INPUT_CNT",
     "UNIVERSE_SCAN_SCENARIO_TAG",
     "archive_universe_snapshot",
     "collect_universe_scan",
@@ -251,6 +254,7 @@ async def fetch_candidate_stock_list(
         rate_min_pct=universe.chg_min * 100.0,
         rate_max_pct=universe.chg_max * 100.0,
         market_div_code="J",
+        input_cnt=RANKING_SCAN_INPUT_CNT,
     )
     if res.get("rt_cd") != "0":
         logger.warning(

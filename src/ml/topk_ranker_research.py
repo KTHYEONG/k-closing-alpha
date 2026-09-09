@@ -869,7 +869,7 @@ def save_production_bundle(bundle: dict[str, Any], export_dir: str = TOPK_RANKER
 
 
 def select_topk_equal_weight(
-    df: pd.DataFrame, bundle: dict[str, Any], *, top_k: int, date_col: str = "date"
+    df: pd.DataFrame, bundle: dict[str, Any], *, top_k: int, date_col: str = "date", admitted_col: str = "admitted"
 ) -> pd.DataFrame:
     """Select the certified top-k by point-estimate rank with equal weights.
 
@@ -878,23 +878,24 @@ def select_topk_equal_weight(
         bundle: Production bundle carrying return/quantile/calibrator models.
         top_k: Names to select; must equal the certified MIN_TOP_K.
         date_col: Date column name for per-date selection.
+        admitted_col: Admission flag column; only flagged rows are selectable.
 
     Returns:
         Top-k picks with pred, diagnostic columns and uniform allocation.
 
     Raises:
-        ValueError: When top_k is not MIN_TOP_K or feature_cols is empty.
+        ValueError: When top_k is not MIN_TOP_K, feature_cols is empty, or a
+            declared feature column is missing from the snapshot.
     """
     if int(top_k) != MIN_TOP_K:
         raise ValueError(f"top_k {top_k!r} is not the certified MIN_TOP_K {MIN_TOP_K}")
     feature_cols = list(bundle.get("feature_cols", []))
     if not feature_cols:
         raise ValueError("bundle feature_cols is empty; refusing to select")
-    # predict_daily_sizing과 동일한 누락 피처 0.0 보정
+    missing = [col for col in feature_cols if col not in df.columns]
+    if missing:
+        raise ValueError(f"snapshot is missing bundle feature columns: {missing}")
     work = df.copy()
-    for col in feature_cols:
-        if col not in work.columns:
-            work[col] = 0.0
     features = work[feature_cols]
     work["pred"] = np.asarray(bundle["return_model"].predict(features), dtype=np.float64)
     q_models = bundle["quantile_models"]
@@ -912,7 +913,13 @@ def select_topk_equal_weight(
             proba = calibrator.predict_proba(features)
             positive_idx = list(calibrator.classes_).index(True)
             work[name] = proba[:, positive_idx]
-    picks = select_topk_by_score(work, int(top_k), score_col="pred", date_col=date_col)
+    pool = work
+    if admitted_col in work.columns:
+        pool = work[np.asarray(work[admitted_col], dtype=bool)]
+    admitted_counts = pool.groupby(date_col, sort=False).size()
+    certified_dates = admitted_counts[admitted_counts >= int(top_k)].index
+    pool = pool[pool[date_col].isin(certified_dates)]
+    picks = select_topk_by_score(pool, int(top_k), score_col="pred", date_col=date_col)
     picks["allocation"] = 1.0 / float(top_k)
     return picks
 
