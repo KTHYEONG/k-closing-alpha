@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "topk_production_wiring",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_topk_production_wiring",
+      "domain": "daily",
+      "title": "Phase 1: 종가매매 조건검색 자동화 (COST_AWARE 스캔)",
+      "why": "collect.py가 5개 수동 HTS 조건검색식(대형급등/상한가 편향, 비용후 실측 열등)에 의존해 top-3 프로덕션 배선의 전제인 후보소싱 자동화가 필요했음",
+      "resolution": "CANDIDATE_SOURCE_MODE 옵트인 플래그로 resolve_daily_candidates() 신설: automated시 HTS 조건검색 API 전혀 미호출, Stream C 랭킹스캔+apply_cost_aware_admission(등락률2~10%+틱비용≤7.5bp+상한가제외)로 대체; manual(기본값)은 기존 동작 byte-identical 보존; champion.py/predict.py 스코어링·사이징 무변경",
+      "impact": "diff coverage 100%, 40/40 테스트 통과; 프로덕션 top-3 배선의 사전조건 완료, Phase 2(리랭커 번들 배포+사이징 통합)는 별도 probe 필요로 분리"
+    },
+    {
       "task_id": "train_window_scope",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_train_window_scope",
