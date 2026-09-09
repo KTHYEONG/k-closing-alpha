@@ -5,15 +5,12 @@ No next-day bars, no exit-path columns, no serving mutation.
 """
 from __future__ import annotations
 
-import dataclasses
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
 
 from src.config.market_session import INTRADAY_SESSION_REGULAR
 from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, normalize_bar_frame
@@ -25,22 +22,6 @@ CEILING_RATIO_THRESHOLD: float = 1.29
 DEFAULT_PARTICIPATION_CAP: float = 0.10
 
 _AUCTION_CLOSE_HMS: int = 153000
-
-# Coverage registry so summarize can report the measured denominator from
-# results alone (R8). Keyed by a hashable fingerprint of the results tuple.
-_COVERAGE_CACHE: dict[tuple[Any, ...], tuple[int, int]] = {}
-
-
-@dataclass(frozen=True)
-class BuyabilitySleeveResult:
-    sleeve: str
-    n_days: int
-    n_rows: int
-    top1_mean: float
-    top1_se: float
-    rank_ic: float
-    median_auction_value_100m: float
-    zero_auction_share: float
 
 
 def classify_ceiling_entry(
@@ -284,140 +265,3 @@ def apply_buyability_gate(
         "p25_blocked_auction_value_100m": p25,
     }
     return out, provenance
-
-
-def _sleeve_stats(
-    sleeve: str,
-    universe: pd.DataFrame,
-    picks: pd.DataFrame,
-    *,
-    group_col: str,
-    score_col: str,
-    target_col: str,
-) -> BuyabilitySleeveResult:
-    n_rows = len(universe)
-    n_days = len(picks)
-    if n_days:
-        targets = picks[target_col].to_numpy(dtype=np.float64)
-        top1_mean = float(np.mean(targets))
-        top1_se = float(np.std(targets, ddof=1) / np.sqrt(n_days)) if n_days > 1 else 0.0
-    else:
-        top1_mean = float("nan")
-        top1_se = float("nan")
-    # Mean per-group (per-trade_date) Spearman(pred, target), matching the
-    # codebase's canonical cross-sectional rankIC (src/ml/metrics.py:rank_ic).
-    # Pooling ranks across dates instead would conflate day-level return-level
-    # dispersion with within-day ranking skill and is not comparable to any
-    # other rankIC figure in this project.
-    daily_ics: list[float] = []
-    for _, group in universe.groupby(group_col, sort=False):
-        s = pd.to_numeric(group[score_col], errors="coerce").to_numpy(dtype=np.float64)
-        t = pd.to_numeric(group[target_col], errors="coerce").to_numpy(dtype=np.float64)
-        finite = np.isfinite(s) & np.isfinite(t)
-        if int(finite.sum()) < 2:
-            continue
-        sf, tf = s[finite], t[finite]
-        if float(np.std(sf)) == 0.0 or float(np.std(tf)) == 0.0:
-            continue
-        stat = spearmanr(sf, tf).statistic
-        if np.isfinite(stat):
-            daily_ics.append(float(stat))
-    rank_ic = float(np.mean(daily_ics)) if daily_ics else float("nan")
-    if n_days:
-        auc = picks["auction_value_100m"].to_numpy(dtype=np.float64) if "auction_value_100m" in picks.columns else np.full(n_days, np.nan)
-        measured = auc[np.isfinite(auc)]
-        median_auc = float(np.median(measured)) if measured.size else float("nan")
-        zero_share = float(np.mean(measured == 0.0)) if measured.size else 0.0
-    else:
-        median_auc = float("nan")
-        zero_share = 0.0
-    return BuyabilitySleeveResult(
-        sleeve=sleeve,
-        n_days=n_days,
-        n_rows=n_rows,
-        top1_mean=float(top1_mean),
-        top1_se=float(top1_se),
-        rank_ic=float(rank_ic),
-        median_auction_value_100m=float(median_auc),
-        zero_auction_share=float(zero_share),
-    )
-
-
-def evaluate_buyability_sleeves(
-    oof_df: pd.DataFrame,
-    *,
-    group_col: str = "trade_date",
-    code_col: str = "stock_code",
-    score_col: str = "pred",
-    target_col: str = "net_return",
-    target_notional_100m: float,
-    participation_cap: float = DEFAULT_PARTICIPATION_CAP,
-    alpha: float = 0.10,
-) -> tuple[BuyabilitySleeveResult, ...]:
-    """Re-select top-1 within fillable/ceiling/pooled sleeves; never pool."""
-    missing = [c for c in (group_col, code_col, score_col, target_col) if c not in oof_df.columns]
-    if missing:
-        raise ValueError(f"oof_df is missing required columns {missing}")
-    target = float(target_notional_100m)
-    if not np.isfinite(target) or target <= 0.0:
-        raise ValueError(f"target_notional_100m must be finite and > 0, got {target_notional_100m!r}")
-    cap = float(participation_cap)
-    if not np.isfinite(cap) or not 0.0 < cap <= 1.0:
-        raise ValueError(f"participation_cap must be in (0.0, 1.0], got {participation_cap!r}")
-    if not np.isfinite(float(alpha)) or not 0.0 < float(alpha) <= 0.5:
-        raise ValueError(f"alpha must be in (0, 0.5], got {alpha!r}")
-    gated, _ = apply_buyability_gate(
-        oof_df, target_notional_100m=target, participation_cap=cap, require_auction_data=False
-    )
-
-    def _top1(frame: pd.DataFrame) -> pd.DataFrame:
-        if len(frame) == 0:
-            return frame.iloc[0:0].copy()
-        idx = frame.groupby(group_col, sort=True)[score_col].idxmax()
-        return frame.loc[idx].copy().sort_values(group_col).reset_index(drop=True)
-
-    pooled_picks = _top1(gated)
-    fillable_universe = gated[gated["is_buyable"].to_numpy(dtype=bool)].copy()
-    ceiling_universe = gated[gated["is_ceiling_entry"].to_numpy(dtype=bool)].copy()
-    # Re-selection: argmax over eligible rows only; empty groups contribute no day.
-    fillable_picks = _top1(fillable_universe)
-    ceiling_picks = _top1(ceiling_universe)
-    # Drop groups left with zero eligible rows (they are absent from _top1 already).
-    fillable = _sleeve_stats(
-        "fillable", fillable_universe, fillable_picks, group_col=group_col, score_col=score_col, target_col=target_col
-    )
-    ceiling = _sleeve_stats(
-        "ceiling", ceiling_universe, ceiling_picks, group_col=group_col, score_col=score_col, target_col=target_col
-    )
-    pooled = _sleeve_stats(
-        "pooled", gated, pooled_picks, group_col=group_col, score_col=score_col, target_col=target_col
-    )
-    results = (fillable, ceiling, pooled)
-    found = gated["auction_bars_found"].to_numpy(dtype=bool) if "auction_bars_found" in gated.columns else np.zeros(len(gated), dtype=bool)
-    key = tuple((r.sleeve, r.n_days, r.n_rows, float(r.top1_mean) if np.isfinite(r.top1_mean) else -999.0) for r in results)
-    _COVERAGE_CACHE[key] = (len(gated), int(np.sum(found)))
-    return results
-
-
-def summarize_buyability_sleeves(results: tuple[BuyabilitySleeveResult, ...]) -> dict[str, Any]:
-    """Format sleeve results with the auction-coverage denominator (R8)."""
-    if not results:
-        raise ValueError("results must be a non-empty tuple of BuyabilitySleeveResult")
-    sleeves: dict[str, Any] = {}
-    for r in results:
-        row = dataclasses.asdict(r)
-        sleeves[str(r.sleeve)] = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in row.items()}
-    key = tuple((r.sleeve, r.n_days, r.n_rows, float(r.top1_mean) if np.isfinite(r.top1_mean) else -999.0) for r in results)
-    if key in _COVERAGE_CACHE:
-        n_rows, n_measured = _COVERAGE_CACHE[key]
-    else:
-        pooled = next((r for r in results if r.sleeve == "pooled"), results[0])
-        n_rows = int(pooled.n_rows)
-        n_measured = int(pooled.n_rows)
-    measured_share = float(n_measured / n_rows) if n_rows else 0.0
-    return {
-        "n_rows": int(n_rows),
-        "n_measured": int(n_measured),
-        "measured_share": float(measured_share),
-        "sleeves": sleeves,
-    }

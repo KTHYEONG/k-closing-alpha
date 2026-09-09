@@ -103,96 +103,15 @@ def test_apply_buyability_gate_annotates_without_dropping_rows() -> None:
     pd.testing.assert_frame_equal(gated, again[gated.columns])
 
 
-def test_evaluate_buyability_sleeves_reselects_top1_within_fillable_sleeve() -> None:
-    import pandas as pd
-    import pytest
-
-    from src.ml.buyability import evaluate_buyability_sleeves
-
-    # Given: 40 days where the top-scored pick is always a thin-auction ceiling row worth +6%,
-    # and the runner-up is an ordinary fillable row worth +0.2%
-    dates = pd.bdate_range("2026-01-05", periods=40)
-    rows = []
-    for i, d in enumerate(dates):
-        rows.append(
-            {
-                "trade_date": d, "stock_code": f"9{i:05d}", "pred": 0.9,
-                "net_return": 6.0, "close_price": 13000.0,
-                "prev_close_price": 10000.0, "high_price": 13000.0,
-                "auction_value_100m": 0.05, "auction_vol_share": 0.0002,
-                "auction_bars_found": True,
-            }
-        )
-        rows.append(
-            {
-                "trade_date": d, "stock_code": f"1{i:05d}", "pred": 0.5,
-                "net_return": 0.2, "close_price": 11000.0,
-                "prev_close_price": 10000.0, "high_price": 11200.0,
-                "auction_value_100m": 40.0, "auction_vol_share": 0.011,
-                "auction_bars_found": True,
-            }
-        )
-    oof = pd.DataFrame(rows)
-
-    # When
-    results = evaluate_buyability_sleeves(oof, target_notional_100m=1.0)
-    by_sleeve = {r.sleeve: r for r in results}
-
-    # Then: the fillable sleeve re-selects rather than relabels
-    assert [r.sleeve for r in results] == ["fillable", "ceiling", "pooled"]
-    assert by_sleeve["fillable"].top1_mean == pytest.approx(0.2)
-    assert by_sleeve["pooled"].top1_mean == pytest.approx(6.0)
-    assert by_sleeve["fillable"].n_days == 40
-
-
-def test_summarize_buyability_sleeves_reports_measurement_coverage() -> None:
-    import numpy as np
-    import pandas as pd
-
-    from src.ml.buyability import evaluate_buyability_sleeves, summarize_buyability_sleeves
-
-    # Given: 40 days, half of them with no auction measurement at all
-    dates = pd.bdate_range("2026-01-05", periods=40)
-    rows = []
-    for i, d in enumerate(dates):
-        measured = i % 2 == 0
-        for j, (pred, ret, close, high) in enumerate(
-            [(0.9, 1.0, 13000.0, 13000.0), (0.5, 0.2, 11000.0, 11200.0)]
-        ):
-            rows.append(
-                {
-                    "trade_date": d, "stock_code": f"{j}{i:05d}", "pred": pred,
-                    "net_return": ret, "close_price": close,
-                    "prev_close_price": 10000.0, "high_price": high,
-                    "auction_value_100m": 40.0 if measured else np.nan,
-                    "auction_vol_share": 0.011 if measured else np.nan,
-                    "auction_bars_found": measured,
-                }
-            )
-    oof = pd.DataFrame(rows)
-
-    # When
-    summary = summarize_buyability_sleeves(evaluate_buyability_sleeves(oof, target_notional_100m=1.0))
-
-    # Then
-    assert summary["n_rows"] == 80
-    assert summary["n_measured"] == 40
-    assert summary["measured_share"] == 0.5
-    assert set(summary["sleeves"]) == {"fillable", "ceiling", "pooled"}
-
-
 def test_buyability_cover_attach_canonical_and_validations(tmp_path) -> None:
     import numpy as np
     import pandas as pd
     import pytest
 
     from src.ml.buyability import (
-        BuyabilitySleeveResult,
         attach_entry_auction_liquidity,
         apply_buyability_gate,
         classify_ceiling_entry,
-        evaluate_buyability_sleeves,
-        summarize_buyability_sleeves,
     )
 
     # classify missing column raises
@@ -210,19 +129,6 @@ def test_buyability_cover_attach_canonical_and_validations(tmp_path) -> None:
             target_notional_100m=1.0,
             participation_cap=2.0,
         )
-    # evaluate validations raise
-    oof = pd.DataFrame({"trade_date": [], "stock_code": [], "pred": [], "net_return": []})
-    with pytest.raises(ValueError, match="required columns"):
-        evaluate_buyability_sleeves(oof.drop(columns=["pred"]), target_notional_100m=1.0)
-    with pytest.raises(ValueError, match="target_notional"):
-        evaluate_buyability_sleeves(oof, target_notional_100m=-1.0)
-    with pytest.raises(ValueError, match="participation_cap"):
-        evaluate_buyability_sleeves(oof, target_notional_100m=1.0, participation_cap=0.0)
-    with pytest.raises(ValueError, match="alpha"):
-        evaluate_buyability_sleeves(oof, target_notional_100m=1.0, alpha=0.9)
-    with pytest.raises(ValueError, match="non-empty"):
-        summarize_buyability_sleeves(())
-
     # attach with default root (intraday_root None) degrades to unmeasured
     df = pd.DataFrame(
         {"trade_date": pd.to_datetime(["2019-05-02"]), "stock_code": ["005930"]}
@@ -276,35 +182,6 @@ def test_buyability_cover_attach_canonical_and_validations(tmp_path) -> None:
     with pytest.raises(ValueError, match="trade_date"):
         apply_buyability_gate(pd.DataFrame({"close_price": [1.0]}), target_notional_100m=1.0)
 
-    # empty fillable/ceiling sleeves + summarize fallback (cache miss)
-    dates = pd.bdate_range("2026-02-02", periods=35)
-    rows = [
-        {
-            "trade_date": d,
-            "stock_code": f"{i:06d}",
-            "pred": 1.0,
-            "net_return": 0.5,
-            "close_price": 11000.0,
-            "prev_close_price": 10000.0,
-            "high_price": 11200.0,
-            "auction_value_100m": 0.0,
-            "auction_vol_share": 0.0,
-            "auction_bars_found": True,
-        }
-        for i, d in enumerate(dates)
-    ]
-    res = evaluate_buyability_sleeves(pd.DataFrame(rows), target_notional_100m=1.0)
-    by = {r.sleeve: r for r in res}
-    assert by["fillable"].n_days == 0
-    assert by["ceiling"].n_days == 0
-    manual = (
-        BuyabilitySleeveResult("fillable", 2, 4, 0.1, 0.01, 0.5, 1.0, 0.0),
-        BuyabilitySleeveResult("ceiling", 1, 2, 0.2, 0.0, 0.0, 2.0, 0.0),
-        BuyabilitySleeveResult("pooled", 2, 6, 0.15, 0.02, 0.3, 1.5, 0.0),
-    )
-    s = summarize_buyability_sleeves(manual)
-    assert s["n_rows"] == 6 and s["n_measured"] == 6
-
 
 def test_buyability_cover_attach_raw_ls_partition(tmp_path) -> None:
     import pandas as pd
@@ -337,7 +214,7 @@ def test_buyability_cover_zero_volume_nosymbol_and_rank_edge(tmp_path) -> None:
     import numpy as np
     import pandas as pd
 
-    from src.ml.buyability import attach_entry_auction_liquidity, evaluate_buyability_sleeves
+    from src.ml.buyability import attach_entry_auction_liquidity
 
     # attach over a frame that already carries auction cols exercises overwrite (line 99)
     base = pd.DataFrame(
@@ -396,24 +273,6 @@ def test_buyability_cover_zero_volume_nosymbol_and_rank_edge(tmp_path) -> None:
     panel2 = pd.DataFrame({"trade_date": pd.to_datetime([snap2]), "stock_code": ["005930"]})
     got2 = attach_entry_auction_liquidity(panel2, intraday_root=tmp_path)
     assert got2["auction_bars_found"].tolist() == [False]
-
-    # rank_ic with fewer than two finite scores
-    oof = pd.DataFrame(
-        {
-            "trade_date": pd.to_datetime(["2026-01-05", "2026-01-05"]),
-            "stock_code": ["000001", "000002"],
-            "pred": [float("nan"), 0.5],
-            "net_return": [0.2, 0.3],
-            "close_price": [11000.0, 11000.0],
-            "prev_close_price": [10000.0, 10000.0],
-            "high_price": [11200.0, 11200.0],
-            "auction_value_100m": [40.0, 40.0],
-            "auction_vol_share": [0.01, 0.01],
-            "auction_bars_found": [True, True],
-        }
-    )
-    res = evaluate_buyability_sleeves(oof, target_notional_100m=1.0)
-    assert len(res) == 3
 
 
 def test_buyability_cover_raw_zero_day_volume(tmp_path) -> None:
