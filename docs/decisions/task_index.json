@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "topk_reranker_sizing_calibration",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_topk_reranker_sizing_calibration",
+      "domain": "ml",
+      "title": "Phase 2: 리랭커 프로덕션 번들 + 균등가중 top-3 서빙",
+      "why": "champion.py 사이징(고정 임계값+등급)이 COST_AWARE 모집단에 전이되지 않음(top-3 픽 중 99.32% Pass, 액션가능일 1.7%)이 실측 확인됨",
+      "resolution": "build_inline_bundle 재사용한 train_production_bundle(인증구간 광역풀 학습)+select_topk_equal_weight(rank선택+1/K균등배분, quantile/calibrator는 진단전용) 신설; 번들은 champion과 별도경로(artifacts/models/topk_ranker) 저장, predict.py에 automated 모드 전용 슬리브 배선, retrain.py --train-ranker-bundle 추가",
+      "impact": "diff coverage 100%, 91/91 테스트 통과; champion.py 서빙계약/자본예산 무변경, manual 모드 byte-identical 보존"
+    },
+    {
       "task_id": "topk_production_wiring",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_topk_production_wiring",
