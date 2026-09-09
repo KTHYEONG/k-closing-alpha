@@ -1,4 +1,4 @@
-"""호가 사다리/예상체결 원천 스냅샷 저장소 (KIS output1 verbatim)."""
+"""호가 사다리/예상체결 원천 스냅샷 저장소 (KIS output1+output2 verbatim)."""
 
 from __future__ import annotations
 
@@ -36,11 +36,12 @@ def _coerce_value(value: Any) -> Any:
 def build_orderbook_rows(
     res: dict, symbol: str, venue: str, capture_reason: str, capture_ts: datetime
 ) -> list[dict]:
-    """벤더 output1 페이로드를 키 그대로 복사한 단일 행으로 만든다."""
+    """벤더 output1+output2 페이로드를 키 그대로 복사한 단일 행으로 만든다."""
     if not isinstance(res, dict) or str(res.get("rt_cd", "")) != "0":
         return []
     output1 = res.get("output1")
-    if not isinstance(output1, dict):
+    output2 = res.get("output2")
+    if not isinstance(output1, dict) and not isinstance(output2, dict):
         return []
     row: dict[str, Any] = {
         "capture_ts": capture_ts,
@@ -48,8 +49,12 @@ def build_orderbook_rows(
         "venue": str(venue),
         "capture_reason": str(capture_reason),
     }
-    for key, value in output1.items():
-        row[str(key)] = _coerce_value(value)
+    if isinstance(output1, dict):
+        for key, value in output1.items():
+            row[str(key)] = _coerce_value(value)
+    if isinstance(output2, dict):
+        for key, value in output2.items():
+            row[str(key)] = _coerce_value(value)
     return [row]
 
 

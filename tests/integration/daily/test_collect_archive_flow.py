@@ -99,7 +99,7 @@ def test_collect_main_persists_wide_snapshot_to_store_without_csv(monkeypatch, t
     monkeypatch.setattr(collect.archive, "upsert_archive_snapshot", _fake_upsert)
 
     # When
-    asyncio.run(collect.main())
+    asyncio.run(collect.main(force=True))
 
     # Then: no spreadsheet-era file artifact is produced
     assert not csv_path.exists()
@@ -138,9 +138,60 @@ def test_collect_main_returns_early_when_scan_empty(monkeypatch, tmp_path, caplo
 
     # When
     with caplog.at_level(logging.INFO, logger=collect.logger.name):
-        asyncio.run(collect.main())
+        asyncio.run(collect.main(force=True))
 
     # Then: no persistence attempt, no CSV artifact, and the emptiness is surfaced
     assert upsert_calls == []
     assert not csv_path.exists()
     assert any("자동 스캔 후보가 없습니다" in rec.message for rec in caplog.records)
+
+
+def test_collect_main_marks_index_failed_and_nans_kospi_kosdaq_on_index_failure(monkeypatch, tmp_path) -> None:
+    """collect.main() 은 지수 조회 실패 시에도 계속 진행하되 kospi/kosdaq을 NaN, 지수_실패=True로 기록한다."""
+    import asyncio
+
+    from src.daily import collect
+
+    class _FailingIndexClient(_FakeKisClient):
+        async def get_market_index_rate(self, session: object, code: str) -> dict:
+            return {"rt_cd": "9", "msg1": "index unavailable"}
+
+    csv_path = tmp_path / "daily" / "daily_stocks.csv"
+    monkeypatch.setattr(collect.settings, "CONDITION_CSV_PATH", csv_path)
+    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setattr(collect, "KisApiClient", _FailingIndexClient)
+    monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
+
+    async def _fake_scan(client, session, **kwargs):
+        return [{"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"}]
+
+    async def _fake_fetch_all(stock_list, client, session):
+        rows = [
+            {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
+             "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
+             "거래량": 1_000_000, "거래대금": 500.0, "시가총액": 3000.0,
+             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0},
+        ]
+        return rows, []
+
+    monkeypatch.setattr(collect, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all)
+
+    captured = {}
+
+    def _fake_upsert(df, snapshot_date=None):
+        captured["df"] = df.copy()
+        return len(df)
+
+    monkeypatch.setattr(collect.archive, "upsert_archive_snapshot", _fake_upsert)
+
+    # When
+    asyncio.run(collect.main(force=True))
+
+    # Then: index failure is explicit, not silently coerced to 0.0
+    import math
+
+    stored = captured["df"]
+    assert math.isnan(stored["kospi"].iloc[0])
+    assert math.isnan(stored["kosdaq"].iloc[0])
+    assert stored["지수_실패"].iloc[0] == True  # noqa: E712

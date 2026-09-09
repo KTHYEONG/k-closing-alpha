@@ -2,6 +2,9 @@ import logging
 
 import pandas as pd
 
+from src import settings
+from src.data.io_utils import atomic_write_parquet
+
 logger = logging.getLogger(__name__)
 
 from src.daily.archive import fetch_archive_snapshot
@@ -60,6 +63,35 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def persist_topk_decision(decision_date: pd.Timestamp, sleeve_df: pd.DataFrame) -> int:
+    """Persist the automated top-k decision sleeve to the audit parquet store."""
+    if sleeve_df.empty:
+        return 0
+    from src.ml.topk_ranker_research import TOPK_RANKER_BUNDLE_DIR
+
+    out = sleeve_df.copy()
+    out["decision_date"] = decision_date.strftime("%Y-%m-%d")
+    out["decided_at"] = pd.Timestamp.now(tz="Asia/Seoul")
+    out["bundle_dir"] = str(TOPK_RANKER_BUNDLE_DIR)
+    target = settings.PARQUET_DIR / "topk_decisions.parquet"
+    if target.exists():
+        try:
+            existing = pd.read_parquet(target)
+        except Exception as exc:
+            logger.warning("topk_decisions 기존 기록 읽기 실패, 신규로 저장합니다: %s", exc)
+            existing = pd.DataFrame()
+        union_cols = sorted(set(existing.columns.tolist()) | set(out.columns.tolist()))
+        merged = pd.concat(
+            [existing.reindex(columns=union_cols), out.reindex(columns=union_cols)],
+            ignore_index=True,
+        )
+        merged = merged.drop_duplicates(subset=["decision_date", "symbol"], keep="last")
+    else:
+        merged = out
+    atomic_write_parquet(merged, target)
+    return len(sleeve_df)
+
+
 def run_automated_topk_decision(decision_date: pd.Timestamp) -> None:
     """Print the single automated-mode top-3 decision table, if any.
 
@@ -70,6 +102,7 @@ def run_automated_topk_decision(decision_date: pd.Timestamp) -> None:
     if sleeve_df.empty:
         logger.warning("오늘 자동 유니버스 기준 진입 후보 없음(미참여)")
         return
+    persist_topk_decision(decision_date, sleeve_df)
     rows = [
         {
             "Code": str(row.get("symbol", "")),

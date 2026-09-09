@@ -6,7 +6,9 @@ from src.config import market_session
 def test_market_session_constants_cover_regular_and_aftermarket_windows() -> None:
     assert market_session.KRX_CLOSE_MARKET_DIV_CODE == "J"
     assert market_session.NXT_MARKET_DIV_CODE == "NX"
-    assert market_session.DECISION_PRICE_MARKET_DIV_CODES == ("J", "NX")
+    assert not hasattr(market_session, "DECISION_PRICE_MARKET_DIV_CODES")
+    assert market_session.DECISION_WINDOW_START_HHMMSS == "152000"
+    assert market_session.DECISION_WINDOW_END_HHMMSS == "153000"
     assert market_session.DEFAULT_BAR_INTERVAL_MINUTES == 1
     assert market_session.INTRADAY_SESSION_REGULAR == "regular"
     assert market_session.INTRADAY_SESSION_NXT_AFTERMARKET == "nxt_aftermarket"

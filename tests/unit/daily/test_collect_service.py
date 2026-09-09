@@ -19,9 +19,9 @@ def test_safe_float_converts_values() -> None:
 
 
 def test_parse_market_index_rate_returns_zero_on_missing() -> None:
-    assert collect.parse_market_index_rate(None) == 0.0
-    assert collect.parse_market_index_rate({"rt_cd": "1"}) == 0.0
-    assert collect.parse_market_index_rate({"rt_cd": "0", "output1": None}) == 0.0
+    assert collect.parse_market_index_rate(None) is None
+    assert collect.parse_market_index_rate({"rt_cd": "1"}) is None
+    assert collect.parse_market_index_rate({"rt_cd": "0", "output1": None}) is None
 
 
 def test_parse_market_index_rate_uses_rate_and_fallback() -> None:

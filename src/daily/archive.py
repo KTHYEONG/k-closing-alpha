@@ -1,6 +1,4 @@
 import logging
-import os
-import sqlite3
 from datetime import datetime
 
 import pandas as pd
@@ -10,10 +8,8 @@ from src.processing.schema import ARCHIVE_COLUMN_ORDER
 
 logger = logging.getLogger(__name__)
 
-TABLE_NAME = "condition_history"
 SNAP_DATE_COL = "스냅샷_날짜"
 STOCK_CODE_COL = "종목코드"
-RANK_COL = "순위"
 
 # point-in-time 무결성 타임스탬프 (Asia/Seoul timezone-aware)
 SNAPSHOT_TIMESTAMP_COL = "snapshot_timestamp"
@@ -28,81 +24,16 @@ TIMESTAMP_COLS = (
 )
 KST = "Asia/Seoul"
 
-# 조회(읽기) 시 타임스탬프 컬럼이 26개 표준 컬럼 뒤에 붙은 전체 순서
-ARCHIVE_READ_COLUMN_ORDER = [*ARCHIVE_COLUMN_ORDER, *TIMESTAMP_COLS]
+SNAPSHOT_TIMESTAMP_SYNTHETIC_COL: str = "snapshot_timestamp_synthetic"
 
-def upsert_history(df: pd.DataFrame, db_path: str) -> None:
-    """Append snapshot rows to SQLite and deduplicate by 날짜/종목코드."""
-    with sqlite3.connect(db_path) as conn:
-        # 신규 컬럼(예: 차트통과) 대응: 테이블이 이미 존재할 경우 누락된 컬럼을 추가
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-            (TABLE_NAME,),
-        )
-        if cursor.fetchone():
-            existing_cols = [
-                row[1] for row in cursor.execute(f"PRAGMA table_info({TABLE_NAME})")
-            ]
-            for col in df.columns:
-                if col not in existing_cols:
-                    # 특수문자가 포함된 컬럼명을 위해 쌍따옴표로 감싸서 ALTER TABLE 실행
-                    conn.execute(f'ALTER TABLE {TABLE_NAME} ADD COLUMN "{col}"')
-
-        df.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
-
-        if STOCK_CODE_COL in df.columns:
-            conn.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_date_code
-                ON {TABLE_NAME} ("{SNAP_DATE_COL}", "{STOCK_CODE_COL}")
-                """
-            )
-
-        conn.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_date
-            ON {TABLE_NAME} ("{SNAP_DATE_COL}")
-            """
-        )
-        conn.commit()
-
-    # Parquet 아카이브 저장
-    try:
-        from src.data.parquet_loader import upsert_condition_parquet
-        upsert_condition_parquet(df)
-    except Exception as e:
-        logger.error("Parquet 조건검색 아카이브 저장 오류: %s", e)
-
-
-def fetch_date_rows(date_str: str, history_db: str) -> pd.DataFrame:
-    """Return rows for a given date, excluding 스냅샷_시간 column if present."""
-    if not os.path.exists(history_db):
-        raise FileNotFoundError(f"DB not found: {history_db}")
-
-    with sqlite3.connect(history_db) as conn:
-        cols = [row[1] for row in conn.execute(f"PRAGMA table_info({TABLE_NAME})")]
-        if not cols:
-            raise RuntimeError(f"Table {TABLE_NAME} not found in {history_db}")
-        cols = [c for c in cols if c != "스냅샷_시간"]
-        col_clause = ", ".join(f'"{c}"' for c in cols)
-        # 순위 컬럼이 있으면 순위 기준 오름차순, 없으면 종목코드로 정렬
-        if RANK_COL in cols:
-            order_clause = f'"{RANK_COL}"'
-        else:
-            order_clause = f'"{STOCK_CODE_COL}"'
-        query = (
-            f"SELECT {col_clause} FROM {TABLE_NAME} "
-            f'WHERE "{SNAP_DATE_COL}" = ? '
-            f"ORDER BY {order_clause}"
-        )
-        return pd.read_sql(query, conn, params=[date_str])
+# 조회(읽기) 시 타임스탬프 컬럼이 표준 컬럼 뒤에 붙은 전체 순서
+ARCHIVE_READ_COLUMN_ORDER = [*ARCHIVE_COLUMN_ORDER, *TIMESTAMP_COLS, SNAPSHOT_TIMESTAMP_SYNTHETIC_COL]
 
 
 def _standardize_archive_df(df: pd.DataFrame) -> pd.DataFrame:
     """Reorder candidates to ARCHIVE_COLUMN_ORDER with zero-filled stock codes and standardized theme/chart values.
 
-    Timezone-aware timestamp columns(``snapshot_timestamp`` 등)은 26개 표준 컬럼
+    Timezone-aware timestamp columns(``snapshot_timestamp`` 등)은 표준 컬럼
     뒤에 보존되어 스냅샷 시각이 유실되지 않습니다.
     """
     out = df.copy()
@@ -142,18 +73,23 @@ def _standardize_archive_df(df: pd.DataFrame) -> pd.DataFrame:
         out["시나리오"].astype(str).str.replace(r"_[YN]$", "", regex=True)
     )
 
-    # 차트분석 컬럼 완전 제거 (26개 표준 컬럼만 엄격 유지)
+    # 차트분석 컬럼 완전 제거 (표준 컬럼만 엄격 유지)
     if "차트분석" in out.columns:
         out = out.drop(columns=["차트분석"])
 
-    # reindex 는 타임스탬프 컬럼을 버리므로 보존 후 재부착
+    # reindex 는 타임스탬프/합성 컬럼을 버리므로 보존 후 재부착
     timestamp_series = {col: out[col] for col in TIMESTAMP_COLS if col in out.columns}
+    synthetic_series = out[SNAPSHOT_TIMESTAMP_SYNTHETIC_COL] if SNAPSHOT_TIMESTAMP_SYNTHETIC_COL in out.columns else None
     out = out.reindex(columns=ARCHIVE_COLUMN_ORDER)
     for col, series in timestamp_series.items():
         out[col] = series.reindex(out.index)
     for col in TIMESTAMP_COLS:
         if col not in out.columns:
             out[col] = pd.NaT
+    if synthetic_series is not None:
+        out[SNAPSHOT_TIMESTAMP_SYNTHETIC_COL] = synthetic_series.reindex(out.index)
+    elif SNAPSHOT_TIMESTAMP_SYNTHETIC_COL not in out.columns:
+        out[SNAPSHOT_TIMESTAMP_SYNTHETIC_COL] = False
     return out[ARCHIVE_READ_COLUMN_ORDER]
 
 
@@ -175,60 +111,23 @@ def _ensure_tz(series: pd.Series, fallback: pd.Series) -> pd.Series:
     return parsed.fillna(fallback)
 
 
-def _upsert_sqlite_archive(df: pd.DataFrame, db_path: str) -> int:
-    """Overwrite snapshot rows in the SQLite archive for the given snapshot identities."""
-    with sqlite3.connect(db_path) as conn:
-        df.head(0).to_sql(TABLE_NAME, conn, if_exists="append", index=False)
-        existing_cols = [
-            row[1] for row in conn.execute(f"PRAGMA table_info({TABLE_NAME})")
-        ]
-        for col in df.columns:
-            if col not in existing_cols:
-                conn.execute(f'ALTER TABLE {TABLE_NAME} ADD COLUMN "{col}"')
+def _write_condition_parquet_with_retry(out: pd.DataFrame) -> None:
+    """Parquet 아카이브 쓰기를 최대 2회 시도하고 실패 시 RuntimeError를 발생시킨다."""
+    from src.data import parquet_loader
 
-        has_timestamp = SNAPSHOT_TIMESTAMP_COL in existing_cols
-        total = 0
-        group_cols = [SNAP_DATE_COL, SNAPSHOT_TIMESTAMP_COL] if has_timestamp else [SNAP_DATE_COL]
-        for keys, group in df.groupby(group_cols, dropna=False):
-            snap_date = keys[0] if isinstance(keys, tuple) else keys
-            if has_timestamp:
-                snap_ts = keys[1] if isinstance(keys, tuple) else None
-                if pd.isna(snap_ts):
-                    conn.execute(
-                        f'DELETE FROM "{TABLE_NAME}" WHERE "{SNAP_DATE_COL}" = ? AND '
-                        f'"{SNAPSHOT_TIMESTAMP_COL}" IS NULL',
-                        [snap_date],
-                    )
-                else:
-                    conn.execute(
-                        f'DELETE FROM "{TABLE_NAME}" WHERE "{SNAP_DATE_COL}" = ? AND '
-                        f'"{SNAPSHOT_TIMESTAMP_COL}" = ?',
-                        [snap_date, str(snap_ts)],
-                    )
-            else:
-                conn.execute(
-                    f'DELETE FROM "{TABLE_NAME}" WHERE "{SNAP_DATE_COL}" = ?', [snap_date]
-                )
-            group.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
-            total += len(group)
-        conn.commit()
-    return total
-
-
-def _read_sqlite_archive() -> pd.DataFrame:
-    """Load the full SQLite archive table as a DataFrame."""
-    if not os.path.exists(settings.HISTORY_DB_PATH):
-        return pd.DataFrame()
-    with sqlite3.connect(settings.HISTORY_DB_PATH) as conn:
-        cols = [row[1] for row in conn.execute(f"PRAGMA table_info({TABLE_NAME})")]
-        if not cols:
-            return pd.DataFrame()
-        col_clause = ", ".join(f'"{c}"' for c in cols)
-        return pd.read_sql(f"SELECT {col_clause} FROM {TABLE_NAME}", conn)
+    try:
+        parquet_loader.upsert_condition_parquet(out)
+        return
+    except Exception:
+        try:
+            parquet_loader.upsert_condition_parquet(out)
+            return
+        except Exception as second_exc:
+            raise RuntimeError(f"parquet archive write failed after retry: {second_exc}") from second_exc
 
 
 def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) -> int:
-    """Upsert candidate snapshot into both Parquet and SQLite archives.
+    """Upsert candidate snapshot into the parquet archive.
 
     The snapshot date is taken from the argument or, when absent, filled with
     today's date. Timezone-aware ``snapshot_timestamp``/``feature_available_timestamp``
@@ -236,7 +135,7 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
     deterministic 15:30 KST close convention is used. Rows are deduplicated by the
     full snapshot identity (snapshot_timestamp, stock_code) when multiple intraday
     captures exist, falling back to (스냅샷_날짜, 종목코드) otherwise. Stored in the
-    standard 26-column layout plus timestamp columns in both stores.
+    standard column layout plus timestamp columns.
 
     Args:
         df: Candidate snapshot DataFrame.
@@ -258,10 +157,13 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
         out[SNAPSHOT_TIMESTAMP_COL] = out[SNAP_DATE_COL].map(
             lambda d: _kst_timestamp(str(d))
         )
+        out[SNAPSHOT_TIMESTAMP_SYNTHETIC_COL] = True
     else:
         out[SNAPSHOT_TIMESTAMP_COL] = _ensure_tz(
             out[SNAPSHOT_TIMESTAMP_COL], out[SNAP_DATE_COL].map(_kst_timestamp)
         )
+        if SNAPSHOT_TIMESTAMP_SYNTHETIC_COL not in out.columns:
+            out[SNAPSHOT_TIMESTAMP_SYNTHETIC_COL] = False
     for col in (
         FEATURE_AVAILABLE_TIMESTAMP_COL,
         DECISION_TIMESTAMP_COL,
@@ -282,31 +184,27 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
     settings.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     try:
         _target_date = str(out[SNAP_DATE_COL].iloc[0]) if len(out) else str(snapshot_date)
-        _existing = _read_sqlite_archive()
-        if _existing is not None and not _existing.empty and SNAP_DATE_COL in _existing.columns:
-            _prev = _existing[_existing[SNAP_DATE_COL].astype(str) == _target_date]
-            if not _prev.empty:
-                if SNAPSHOT_TIMESTAMP_COL in _prev.columns:
-                    _latest = pd.to_datetime(_prev[SNAPSHOT_TIMESTAMP_COL], errors="coerce").max()
-                else:
-                    _latest = pd.NaT
-                logger.info(
-                    "[DATA] archive rerun detected date=%s existing=%d latest=%s rows=%d",
-                    _target_date,
-                    len(_prev),
-                    str(_latest),
-                    len(out),
-                )
+        if settings.HISTORY_PARQUET_PATH.exists():
+            _existing = pd.read_parquet(settings.HISTORY_PARQUET_PATH)
+            if _existing is not None and not _existing.empty and SNAP_DATE_COL in _existing.columns:
+                _prev = _existing[_existing[SNAP_DATE_COL].astype(str) == _target_date]
+                if not _prev.empty:
+                    if SNAPSHOT_TIMESTAMP_COL in _prev.columns:
+                        _latest = pd.to_datetime(_prev[SNAPSHOT_TIMESTAMP_COL], errors="coerce").max()
+                    else:
+                        _latest = pd.NaT
+                    logger.info(
+                        "[DATA] archive rerun detected date=%s existing=%d latest=%s rows=%d",
+                        _target_date,
+                        len(_prev),
+                        str(_latest),
+                        len(out),
+                    )
     except Exception:
         pass
-    row_count = _upsert_sqlite_archive(out, str(settings.HISTORY_DB_PATH))
+    row_count = len(out)
 
-    try:
-        from src.data.parquet_loader import upsert_condition_parquet
-
-        upsert_condition_parquet(out)
-    except Exception as e:
-        logger.error("Parquet 조건검색 아카이브 저장 오류: %s", e)
+    _write_condition_parquet_with_retry(out)
 
     logger.info("[DATA] archive upsert date=%s rows=%d", snapshot_date or "latest", row_count)
     return row_count
@@ -318,7 +216,7 @@ def fetch_archive_snapshot(
     all_rows: bool = False,
     latest_only: bool = True,
 ) -> pd.DataFrame:
-    """Read candidate snapshot from archive in standard 27-column order.
+    """Read candidate snapshot from archive in standard column order.
 
     If all_rows is True, returns all historical data. Otherwise filters by snapshot_date,
     month (YYYY-MM), or defaults to the latest available month.
@@ -335,10 +233,9 @@ def fetch_archive_snapshot(
     Returns:
         DataFrame reordered to ARCHIVE_COLUMN_ORDER, sorted by date and rank.
     """
-    if settings.HISTORY_PARQUET_PATH.exists():
-        df = pd.read_parquet(settings.HISTORY_PARQUET_PATH)
-    else:
-        df = _read_sqlite_archive()
+    if not settings.HISTORY_PARQUET_PATH.exists():
+        return pd.DataFrame(columns=ARCHIVE_READ_COLUMN_ORDER)
+    df = pd.read_parquet(settings.HISTORY_PARQUET_PATH)
     if df.empty or SNAP_DATE_COL not in df.columns:
         return pd.DataFrame(columns=ARCHIVE_READ_COLUMN_ORDER)
 
@@ -384,7 +281,7 @@ def export_archive_for_spreadsheet(
         month: Target month (YYYY-MM) when df_or_date is None.
 
     Returns:
-        TSV string whose columns match standard 26-column layout.
+        TSV string whose columns match standard column layout.
     """
     if isinstance(df_or_date, pd.DataFrame):
         df = _standardize_archive_df(df_or_date)

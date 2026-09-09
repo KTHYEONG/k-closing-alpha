@@ -61,17 +61,20 @@ def test_main_automated_mode_prints_only_topk_decision_table(monkeypatch) -> Non
         "allocation": [1.0 / 3.0] * 3,
     })
     monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", Mock(return_value=sleeve_df))
+    persist_mock = Mock(return_value=3)
+    monkeypatch.setattr(predict_mod, "persist_topk_decision", persist_mock)
     print_table_mock = Mock()
     monkeypatch.setattr(predict_mod, "print_table", print_table_mock)
 
     # When
     predict_mod.main()
 
-    # Then: the reranker table is the single decision surface
+    # Then: the reranker table is the single decision surface, and the decision was persisted once
     assert print_table_mock.call_count == 1
     rows = print_table_mock.call_args_list[0].args[0]
     assert [r["Code"] for r in rows] == ["000001", "000002", "000003"]
     assert rows[0]["Alloc%"] == pytest.approx(33.3, abs=0.1)
+    persist_mock.assert_called_once()
 
 
 def test_main_automated_mode_warns_and_prints_nothing_when_no_decision(monkeypatch, caplog) -> None:
@@ -86,6 +89,8 @@ def test_main_automated_mode_warns_and_prints_nothing_when_no_decision(monkeypat
     monkeypatch.setattr(
         predict_mod, "run_topk_ranker_sleeve", Mock(return_value=pd.DataFrame())
     )
+    persist_mock = Mock()
+    monkeypatch.setattr(predict_mod, "persist_topk_decision", persist_mock)
     print_table_mock = Mock()
     monkeypatch.setattr(predict_mod, "print_table", print_table_mock)
 
@@ -93,8 +98,9 @@ def test_main_automated_mode_warns_and_prints_nothing_when_no_decision(monkeypat
     with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
         predict_mod.main()
 
-    # Then: silence is made explicit as a no-participation banner
+    # Then: silence is made explicit as a no-participation banner, and nothing is persisted
     print_table_mock.assert_not_called()
+    persist_mock.assert_not_called()
     assert any(rec.levelno >= logging.WARNING for rec in caplog.records)
 
 
@@ -212,3 +218,81 @@ def test_predict_module_drops_champion_surface() -> None:
         "predict_daily_sizing",
     ):
         assert not hasattr(predict_mod, gone), gone
+
+
+def test_persist_topk_decision_writes_new_parquet_and_returns_row_count(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+
+    sleeve_df = pd.DataFrame({
+        "symbol": ["000001", "000002"],
+        "name": ["AAA", "BBB"],
+        "pred": [0.02, 0.01],
+        "allocation": [0.5, 0.5],
+    })
+
+    written = predict_mod.persist_topk_decision(pd.Timestamp("2026-09-10"), sleeve_df)
+
+    assert written == 2
+    saved = pd.read_parquet(tmp_path / "topk_decisions.parquet")
+    assert len(saved) == 2
+    assert set(saved["symbol"]) == {"000001", "000002"}
+    assert (saved["decision_date"] == "2026-09-10").all()
+    assert "decided_at" in saved.columns
+    assert "bundle_dir" in saved.columns
+
+
+def test_persist_topk_decision_returns_zero_for_empty_sleeve(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+
+    written = predict_mod.persist_topk_decision(pd.Timestamp("2026-09-10"), pd.DataFrame())
+
+    assert written == 0
+    assert not (tmp_path / "topk_decisions.parquet").exists()
+
+
+def test_persist_topk_decision_dedups_same_date_symbol_on_rerun(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+
+    first = pd.DataFrame({"symbol": ["000001"], "name": ["AAA"], "pred": [0.02], "allocation": [1.0]})
+    predict_mod.persist_topk_decision(pd.Timestamp("2026-09-10"), first)
+
+    second = pd.DataFrame({"symbol": ["000001"], "name": ["AAA-updated"], "pred": [0.03], "allocation": [1.0]})
+    predict_mod.persist_topk_decision(pd.Timestamp("2026-09-10"), second)
+
+    saved = pd.read_parquet(tmp_path / "topk_decisions.parquet")
+    assert len(saved) == 1
+    assert saved["name"].iloc[0] == "AAA-updated"
+
+
+def test_persist_topk_decision_recovers_from_corrupt_existing_parquet(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+    target = tmp_path / "topk_decisions.parquet"
+    target.write_text("not a valid parquet file")
+
+    sleeve_df = pd.DataFrame({"symbol": ["000001"], "name": ["AAA"], "pred": [0.02], "allocation": [1.0]})
+
+    with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
+        written = predict_mod.persist_topk_decision(pd.Timestamp("2026-09-10"), sleeve_df)
+
+    assert written == 1
+    saved = pd.read_parquet(target)
+    assert len(saved) == 1
+    assert any(rec.levelno >= logging.WARNING for rec in caplog.records)
