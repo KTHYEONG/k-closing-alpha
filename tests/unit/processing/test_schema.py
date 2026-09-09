@@ -84,9 +84,9 @@ def test_legacy_mapping_file_removal() -> None:
         assert "legacy_mapping" not in dataset_src
         assert "from src.processing.schema import RAW_TO_STANDARD_MAP" in dataset_src
 
-    fix_scale_src = Path("src/backfill/fix_scale.py").read_text(encoding="utf-8")
-    assert "legacy_mapping" not in fix_scale_src
-    assert "RAW_TO_STANDARD_MAP" in fix_scale_src
+    # src/backfill/fix_scale.py 는 스프레드시트 매매일지 생태계 제거로 함께
+    # 삭제되었으므로(spreadsheet_legacy_removal), 더 이상 legacy_mapping 참조
+    # 여부를 검증할 대상이 아닙니다.
     assert RAW_TO_STANDARD_MAP["(매수날짜)"] == "trade_date"
 
 

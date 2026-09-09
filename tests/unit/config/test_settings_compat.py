@@ -42,12 +42,6 @@ def test_kis_config_from_env(tmp_path: Path, monkeypatch) -> None:
     assert settings.KIS_API_CONFIG["app_secret"] == "test_secret"  # noqa: S105
 
 
-def test_google_key_path_absolute_resolution(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("GSPREAD_KEY_PATH", "configs/key.json")
-    settings = Settings(BASE_DIR=tmp_path, _env_file=None)
-    assert tmp_path / "configs" / "key.json" == settings.GOOGLE_KEY_PATH
-
-
 def test_module_level_backward_compat_reexports() -> None:
     """기존 `settings.XXX` 모듈 레벨 참조가 유지되는지 검증합니다."""
     from src import settings
@@ -62,11 +56,12 @@ def settings_module_base_dir() -> Path:
     return settings.BASE_DIR
 
 
+
+
 def test_config_modularity_and_compatibility() -> None:
-    """CONFIG_MODULARITY_AND_COMPATIBILITY: Settings 싱글톤 및 도메인 config 모듈이 순환 임포트나 누락 속성 없이 로드된다."""
+    """CONFIG_MODULARITY_AND_COMPATIBILITY: Settings \uc2f1\uae00\ud1a4 \ubc0f \ub3c4\uba54\uc778 config \ubaa8\ub4c8\uc774 \uc21c\ud658 \uc784\ud3ec\ud2b8\ub098 \ub204\ub77d \uc18d\uc131 \uc5c6\uc774 \ub85c\ub4dc\ub41c\ub2e4."""
     from src import settings
     from src.config.base import PathSettings
-    from src.config.gsheet import GSheetSettings
     from src.config.kis import KisSettings
     from src.config.trading import TradingSettings
 
@@ -74,7 +69,26 @@ def test_config_modularity_and_compatibility() -> None:
     assert isinstance(settings.settings, Settings)
     assert isinstance(PathSettings, type)
     assert isinstance(KisSettings, type)
-    assert isinstance(GSheetSettings, type)
     assert isinstance(TradingSettings, type)
     assert settings.settings.STOCK_DB_PATH == settings.STOCK_DB_PATH
     assert settings.settings.KIS_API_CONFIG["app_key"] == settings.KIS_API_CONFIG["app_key"]
+
+
+
+def test_gsheet_settings_removed_from_settings() -> None:
+    from src import settings
+
+    for name in (
+        "GSPREAD_KEY_PATH_ENV",
+        "GSPREAD_SA_JSON",
+        "GOOGLE_KEY_PATH",
+        "GOOGLE_SHEET_NAME",
+        "TRADE_WORKSHEETS",
+        "GOTTEN_COLS",
+        "gspread_key_path",
+        "google_sheet_name",
+        "GSheetSettings",
+    ):
+        assert not hasattr(settings, name), f"{name} should have been removed from settings module"
+        assert not hasattr(settings.settings, name), f"{name} should have been removed from Settings instance"
+

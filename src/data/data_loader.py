@@ -14,7 +14,6 @@ from src import settings
 from src.data.parquet_loader import (
     load_condition_data_from_parquet,
     load_theme_from_parquet,
-    load_trade_log_from_parquet,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,28 +25,6 @@ def _get_db_connection() -> sqlite3.Connection:
     if not settings.STOCK_DB_PATH.exists():
         raise FileNotFoundError(f"SQLite DB file not found: {DB_PATH}")
     return sqlite3.connect(DB_PATH)
-
-
-def load_trade_log() -> pd.DataFrame:
-    """Load trade log DataFrame (prioritizing Parquet dataset).
-
-    Returns:
-        pd.DataFrame: Trade log dataset.
-    """
-    if settings.TRADE_LOG_PARQUET_PATH.exists():
-        df_pq = load_trade_log_from_parquet()
-        if not df_pq.empty:
-            return df_pq
-
-    try:
-        conn = _get_db_connection()
-        query = "SELECT * FROM table_trade_log ORDER BY 매수날짜"
-        df = pd.read_sql(query, conn)
-        conn.close()
-        return df
-    except Exception as e:
-        logger.warning("Failed to load trade log from SQLite fallback: %s", e)
-        return pd.DataFrame()
 
 
 def load_theme() -> dict[str, str]:
@@ -111,6 +88,5 @@ def load_condition_data(date: str | None = None, limit: int | None = None) -> pd
 
 
 # Backward compatibility aliases
-load_trade_log_from_db = load_trade_log
 load_theme_from_db = load_theme
 load_condition_data_from_db = load_condition_data

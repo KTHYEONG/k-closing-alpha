@@ -1,6 +1,6 @@
 """도메인별 설정 패키지 (Settings 싱글톤).
 
-각 도메인 모듈(base/kis/gsheet/trading)의 설정을 통합한 `Settings` 싱글톤과
+각 도메인 모듈(base/kis/trading)의 설정을 통합한 `Settings` 싱글톤과
 기존 `from src import settings` / `from src.settings import ...` 하위 호환
 재수출을 제공합니다.
 """
@@ -14,7 +14,6 @@ from pydantic_settings import SettingsConfigDict
 
 from src.config.altdata import AltDataSettings
 from src.config.base import PathSettings
-from src.config.gsheet import GSheetSettings
 from src.config.kis import KisSettings
 from src.config.kiwoom import KiwoomSettings
 from src.config.ls import LsSettings
@@ -23,7 +22,7 @@ from src.config.trading import TradingSettings
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-class Settings(PathSettings, KisSettings, LsSettings, GSheetSettings, TradingSettings, AltDataSettings, KiwoomSettings):
+class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings):
     """프로젝트 전역 설정. `.env` 파일에서 자동 로드.
 
     도메인별 설정 모듈을 통합한 싱글톤으로, 모든 소비자 모듈은
@@ -39,16 +38,6 @@ class Settings(PathSettings, KisSettings, LsSettings, GSheetSettings, TradingSet
     # ---------------------------------------------------------
     # [도메인 간 파생 설정] (통합 싱글톤에서만 정의)
     # ---------------------------------------------------------
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def GOOGLE_KEY_PATH(self) -> Path:
-        """GSPREAD_KEY_PATH 환경변수를 절대 경로로 변환 (Windows 역슬래시 보정)."""
-        raw = self.GSPREAD_KEY_PATH_ENV.strip().replace("\\", "/")
-        if not raw:
-            return Path("")
-        key_path = Path(raw)
-        return key_path if key_path.is_absolute() else self.BASE_DIR / key_path
-
     @computed_field  # type: ignore[prop-decorator]
     @property
     def HISTORY_DB_PATH(self) -> Path:
@@ -90,12 +79,6 @@ KIWOM_APP_KEY = settings.KIWOM_APP_KEY
 KIWOM_SECRET_KEY = settings.KIWOM_SECRET_KEY
 KIWOM_BASE_URL = settings.KIWOM_BASE_URL
 KIWOM_TICK_MAX_PAGES = settings.KIWOM_TICK_MAX_PAGES
-GSPREAD_KEY_PATH_ENV = settings.GSPREAD_KEY_PATH_ENV
-GSPREAD_SA_JSON = settings.GSPREAD_SA_JSON
-GOOGLE_KEY_PATH = settings.GOOGLE_KEY_PATH
-GOOGLE_SHEET_NAME = settings.GOOGLE_SHEET_NAME
-TRADE_WORKSHEETS = settings.TRADE_WORKSHEETS
-GOTTEN_COLS = settings.GOTTEN_COLS
 TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
 OVERHEATED_CONDITION_NAME = settings.OVERHEATED_CONDITION_NAME
 NEW_HIGH_CONDITION_NAME = settings.NEW_HIGH_CONDITION_NAME
@@ -140,8 +123,6 @@ base_dir = settings.base_dir
 data_dir = settings.data_dir
 artifacts_dir = settings.artifacts_dir
 models_dir = settings.models_dir
-gspread_key_path = settings.gspread_key_path
-google_sheet_name = settings.google_sheet_name
 kis_app_key = settings.kis_app_key
 kis_app_secret = settings.kis_app_secret
 kis_account_id = settings.kis_account_id
@@ -162,11 +143,6 @@ __all__ = [
     "EMA_LOOKBACK_DAYS",
     "EMA_PERIOD",
     "GAP_UP_THRESHOLD",
-    "GOOGLE_KEY_PATH",
-    "GOOGLE_SHEET_NAME",
-    "GOTTEN_COLS",
-    "GSPREAD_KEY_PATH_ENV",
-    "GSPREAD_SA_JSON",
     "HISTORY_CSV_PATH",
     "HISTORY_DB_PATH",
     "HISTORY_DIR",
@@ -205,11 +181,9 @@ __all__ = [
     "THEME_PARQUET_PATH",
     "TOKEN_FILE",
     "TRADE_LOG_PARQUET_PATH",
-    "TRADE_WORKSHEETS",
     "UPPER_LIMIT_CONDITION_NAME",
     "UPPER_LIMIT_NEXT_DAY_CONDITION_NAME",
     "AltDataSettings",
-    "GSheetSettings",
     "KisSettings",
     "KiwoomSettings",
     "LsSettings",
@@ -219,8 +193,6 @@ __all__ = [
     "artifacts_dir",
     "base_dir",
     "data_dir",
-    "google_sheet_name",
-    "gspread_key_path",
     "kis_account_id",
     "kis_app_key",
     "kis_app_secret",
