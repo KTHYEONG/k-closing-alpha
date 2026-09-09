@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import computed_field
 from pydantic_settings import SettingsConfigDict
 
 from src.config.altdata import AltDataSettings
@@ -35,23 +34,6 @@ class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSe
         extra="ignore",
     )
 
-    # ---------------------------------------------------------
-    # [도메인 간 파생 설정] (통합 싱글톤에서만 정의)
-    # ---------------------------------------------------------
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def HISTORY_DB_PATH(self) -> Path:
-        return self.HISTORY_DIR / "archive.db"
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def HISTORY_CSV_PATH(self) -> Path:
-        return self.HISTORY_DIR / "archive.csv"
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def CONDITION_CSV_PATH(self) -> Path:
-        return self.DAILY_DIR / "daily_stocks.csv"
 
 
 settings = Settings()
@@ -96,23 +78,18 @@ SMA60_LOOKBACK_DAYS = settings.SMA60_LOOKBACK_DAYS
 EMA_LOOKBACK_DAYS = settings.EMA_LOOKBACK_DAYS
 DEFAULT_SCENARIOS = settings.DEFAULT_SCENARIOS
 DAY_NAME_MAP = settings.DAY_NAME_MAP
-STOCK_DB_PATH = settings.STOCK_DB_PATH
 PARQUET_DIR = settings.PARQUET_DIR
 TRADE_LOG_PARQUET_PATH = settings.TRADE_LOG_PARQUET_PATH
 THEME_PARQUET_PATH = settings.THEME_PARQUET_PATH
-CONDITION_PARQUET_PATH = settings.CONDITION_PARQUET_PATH
 TOKEN_FILE = settings.TOKEN_FILE
 DAILY_DIR = settings.DAILY_DIR
 HISTORY_PARQUET_PATH = settings.HISTORY_PARQUET_PATH
 HISTORY_DIR = settings.HISTORY_DIR
 ORDERBOOK_DIR = settings.ORDERBOOK_DIR
 LS_TICK_MAX_PAGES = settings.LS_TICK_MAX_PAGES
-HISTORY_DB_PATH = settings.HISTORY_DB_PATH
-HISTORY_CSV_PATH = settings.HISTORY_CSV_PATH
 PRICE_HISTORY_PARQUET_PATH = settings.PRICE_HISTORY_PARQUET_PATH
 LABEL_ENCODER_PATH = settings.LABEL_ENCODER_PATH
 MODEL_PATH = settings.MODEL_PATH
-CONDITION_CSV_PATH = settings.CONDITION_CSV_PATH
 ALTDATA_DIR = settings.ALTDATA_DIR
 DART_API_KEY = settings.DART_API_KEY
 OPENDART_API_KEY = settings.OPENDART_API_KEY
@@ -132,8 +109,6 @@ __all__ = [
     "API_SEMAPHORE_LIMIT",
     "BASE_DIR",
     "CANDLE_BODY_RATIO_THRESHOLD",
-    "CONDITION_CSV_PATH",
-    "CONDITION_PARQUET_PATH",
     "CONFIGS_DIR",
     "DAILY_DIR",
     "DART_API_KEY",
@@ -143,8 +118,6 @@ __all__ = [
     "EMA_LOOKBACK_DAYS",
     "EMA_PERIOD",
     "GAP_UP_THRESHOLD",
-    "HISTORY_CSV_PATH",
-    "HISTORY_DB_PATH",
     "HISTORY_DIR",
     "HISTORY_PARQUET_PATH",
     "KIS_ACCOUNT_ID",
@@ -176,7 +149,6 @@ __all__ = [
     "SMA60_PERIOD",
     "SMA_LOOKBACK_DAYS",
     "SMA_PERIOD",
-    "STOCK_DB_PATH",
     "TARGET_CONDITION_NAME",
     "THEME_PARQUET_PATH",
     "TOKEN_FILE",

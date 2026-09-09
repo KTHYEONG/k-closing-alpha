@@ -5,7 +5,6 @@ import pytest
 from src import settings
 from src.data.parquet_loader import (
     _atomic_write_parquet,
-    load_condition_data_from_parquet,
     load_theme_from_parquet,
     save_theme_to_parquet,
     upsert_condition_parquet,
@@ -46,12 +45,12 @@ def test_upsert_and_load_condition_parquet(tmp_parquet_dir: Path) -> None:
     df1 = pd.DataFrame(data_day1)
     upsert_condition_parquet(df1)
 
-    df_loaded = load_condition_data_from_parquet(date="2026-08-01")
+    df_loaded = pd.read_parquet(settings.HISTORY_PARQUET_PATH)
     assert len(df_loaded) == 2
 
     # 중복 업서트 테스트 (동일 날짜/종목코드)
     upsert_condition_parquet(df1)
-    df_loaded_dedup = load_condition_data_from_parquet(date="2026-08-01")
+    df_loaded_dedup = pd.read_parquet(settings.HISTORY_PARQUET_PATH)
     assert len(df_loaded_dedup) == 2
 
 
@@ -74,5 +73,13 @@ def test_parquet_loader_module_no_longer_exposes_trade_log_functions() -> None:
     assert hasattr(mod, "save_theme_to_parquet")
     assert hasattr(mod, "load_theme_from_parquet")
     assert hasattr(mod, "upsert_condition_parquet")
-    assert hasattr(mod, "load_condition_data_from_parquet")
+    assert not hasattr(mod, "load_condition_data_from_parquet")
+
+
+def test_load_condition_data_from_parquet_removed_as_orphaned() -> None:
+    import src.data.parquet_loader as mod
+
+    assert not hasattr(mod, "load_condition_data_from_parquet")
+    assert hasattr(mod, "upsert_condition_parquet")
+    assert hasattr(mod, "load_theme_from_parquet")
 

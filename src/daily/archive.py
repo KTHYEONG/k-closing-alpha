@@ -43,7 +43,7 @@ def _standardize_archive_df(df: pd.DataFrame) -> pd.DataFrame:
     if STOCK_CODE_COL in out.columns:
         out[STOCK_CODE_COL] = out[STOCK_CODE_COL].astype(str).str.zfill(6)
 
-    # 1. 테마_섹터 표준화 (theme.parquet / table_theme 에서 공식 load_theme 로 조인)
+    # 1. 테마_섹터 표준화 (theme.parquet에서 공식 load_theme 로 조인)
     if "테마_섹터" not in out.columns and "테마" in out.columns:
         out["테마_섹터"] = out["테마"]
 
