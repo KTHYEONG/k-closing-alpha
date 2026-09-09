@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "champion_legacy_removal",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_champion_legacy_removal",
+      "domain": "ml",
+      "title": "champion 서빙/학습 인프라 및 스프레드시트 유산 심볼 단위 제거",
+      "why": "automated top-3 파이프라인 전환 후 champion 모델·서빙 경로가 도달 불가능해져 완전 제거 필요, 단 리랭커 공유 심볼은 보존 필요",
+      "resolution": "champion.py/tuning.py/policy.py/policy_eval.py/feature_selection.py 5개 파일 및 inference.py/validation.py/universe.py/buyability.py/features.py 내 champion 전용 심볼 96개 정밀 삭제, retrain.py CLI 25→8개 인자로 축소 후 fail-closed 처리; build_inline_bundle/CHAMPION_DEFAULT_MODEL_PARAMS 등 리랭커 공유 심볼은 완전 보존",
+      "impact": "champion 관련 코드 약 2500줄+테스트 70여건 제거, 리랭커 학습 경로(bundle.py/dataset.py/universe_research.py) 무영향 확인"
+    },
+    {
       "task_id": "topk_pipeline_redesign",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_topk_pipeline_redesign",

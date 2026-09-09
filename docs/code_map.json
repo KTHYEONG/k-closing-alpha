@@ -221,9 +221,6 @@
   "src/ml/buyability.py": {
     "testing": "tests/unit/ml/test_buyability.py"
   },
-  "src/ml/champion.py": {
-    "testing": "tests/unit/ml/test_champion.py"
-  },
   "src/ml/costaware_topk.py": {
     "testing": "tests/unit/ml/test_costaware_topk.py"
   },
@@ -240,9 +237,6 @@
     "testing": "tests/unit/ml/test_expected_value.py"
   },
   "src/ml/feature_manifest.py": {},
-  "src/ml/feature_selection.py": {
-    "testing": "tests/unit/ml/test_feature_selection.py"
-  },
   "src/ml/forward_path.py": {
     "testing": "tests/unit/ml/test_forward_path.py"
   },
@@ -253,13 +247,7 @@
     "testing": "tests/unit/ml/test_metrics.py"
   },
   "src/ml/oof.py": {
-    "testing": [
-      "tests/unit/ml/test_champion_tuning.py",
-      "tests/unit/ml/test_tuning.py"
-    ]
-  },
-  "src/ml/policy_eval.py": {
-    "testing": "tests/unit/ml/test_ml_foundation_parity.py"
+    "testing": "tests/unit/ml/test_champion_tuning.py"
   },
   "src/ml/purged_cv.py": {
     "testing": "tests/unit/ml/test_ml_foundation_parity.py"
@@ -293,9 +281,6 @@
   "src/ml/topk_ranker_research.py": {
     "testing": "tests/unit/ml/test_topk_ranker_research.py"
   },
-  "src/ml/tuning.py": {
-    "testing": "tests/unit/ml/test_tuning.py"
-  },
   "src/ml/universe.py": {
     "testing": "tests/unit/ml/test_universe.py"
   },
@@ -318,10 +303,14 @@
     "testing": "tests/unit/serving/realtime/test_features.py"
   },
   "src/serving/realtime/inference.py": {
-    "testing": "tests/unit/serving/realtime/test_inference.py"
-  },
-  "src/serving/realtime/policy.py": {
-    "testing": "tests/unit/serving/realtime/test_policy.py"
+    "testing": [
+      "tests/unit/ml/test_bundle.py",
+      "tests/unit/ml/test_champion_legacy_removed.py",
+      "tests/unit/ml/test_champion_tuning.py",
+      "tests/unit/ml/test_dataset.py",
+      "tests/unit/ml/test_decision_labels.py",
+      "tests/unit/serving/realtime/test_inference_cost_ratio.py"
+    ]
   },
   "src/settings.py": {
     "testing": [
@@ -334,7 +323,6 @@
       "tests/unit/data/test_candidate_panel.py",
       "tests/unit/data/test_parquet_loader.py",
       "tests/unit/data/test_theme_resolver.py",
-      "tests/unit/ml/test_champion.py",
       "tests/unit/ml/test_history_features.py"
     ]
   },
