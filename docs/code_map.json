@@ -266,8 +266,10 @@
   },
   "src/ml/research/v3_engine.py": {
     "testing": [
+      "tests/unit/daily/test_predict.py",
       "tests/unit/ml/test_research_v3.py",
-      "tests/unit/ml/test_topk_ranker_research.py"
+      "tests/unit/ml/test_topk_ranker_research.py",
+      "tests/unit/serving/realtime/test_features.py"
     ]
   },
   "src/ml/research/v3_metrics.py": {
