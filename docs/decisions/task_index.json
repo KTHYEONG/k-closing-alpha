@@ -1,6 +1,26 @@
 {
   "tasks": [
     {
+      "task_id": "train_window_scope",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_train_window_scope",
+      "domain": "ml",
+      "title": "CPCV 인증구간 비닝 + 학습윈도우 명시화",
+      "why": "top-3 cost_aware 하네스 실행 시 FAIL(path_win 0.571) 발생, 원인이 학습윈도우가 아닌 CPCV path evidence의 개편전/후 풀링 버그로 판명",
+      "resolution": "split_regime_frames+cpcv_score_with_history 신설: CPCV 빈은 인증구간(2023-01-25~)에서만 구성, train_start는 학습행 증강 전용 노브; compute_path_evidence에 레짐경계 fail-closed 가드 및 폴드 스코어링 커버리지 게이트 추가, retrain.py --ranker-train-start 배선",
+      "impact": "실데이터 재실행 verdict FAIL->PASS_POST_REFORM, 28/28폴드 스코어(수정전 18/28), top-3 랭커 29.72bp t=4.81 DSR0.974 vs 컨트롤 19.02bp"
+    },
+    {
+      "task_id": "topk_costaware_ml_harness",
+      "date": "2026-09-09",
+      "adr_id": "ADR_20260909_topk_costaware_ml_harness",
+      "domain": "ml",
+      "title": "Top-K Cost-Aware Ranker Research Harness",
+      "why": "리랭커가 top-1·journaled 후보로만 학습되어 top-3+비용인지 파이프라인 부재 한계 확인됨",
+      "resolution": "src/ml/topk_ranker_research.py 신설: DEFAULT_UNIVERSE 학습/COST_AWARE_UNIVERSE 선택 이중풀 + PIT tick_cost_bp 라벨 + CPCV(8,2) fold별 top-k, retrain.py --ranker-topk-research 배선",
+      "impact": "post-reform 878일 top-3 리랭커 29.72bp t=4.81 DSR0.974 vs 모델프리 비용정렬 18.75bp t=3.08, CPCV 경로승률 25/28=0.893(K=1은 0.464)"
+    },
+    {
       "task_id": "COSTAWARE_ML_TRAINING",
       "date": "2026-09-08",
       "adr_id": "ADR_20260908_COSTAWARE_ML_TRAINING",
