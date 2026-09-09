@@ -1,4 +1,5 @@
 import asyncio
+# ruff: noqa: I001 - contract mandates contiguous wiring import block after Colors
 import logging
 import sys
 from datetime import datetime
@@ -17,6 +18,9 @@ from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook
 from src.data.theme_resolver import batch_resolve_missing_themes
 from src.processing.schema import STANDARD_COLUMN_ORDER
 from src.utils.display import Colors
+from src.daily.universe_scan import fetch_candidate_stock_list
+from src.execution.cost_model import tick_cost_bp
+from src.strategy.contract import COST_AWARE_UNIVERSE, UniverseSpec, derive_chg_ratio, mark_ceiling, select_universe
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +113,167 @@ def save_collected_condition_data(
 
     logger.debug("표준 CSV 저장 완료: %s (%d행)", csv_path, len(out))
     return csv_path
+
+
+def apply_cost_aware_admission(
+    df: pd.DataFrame, *, decision_date: pd.Timestamp, screen: UniverseSpec = COST_AWARE_UNIVERSE
+) -> pd.DataFrame:
+    """Apply the COST_AWARE_UNIVERSE admission mask to the daily snapshot.
+
+    Args:
+        df: Enriched Korean-column snapshot frame.
+        decision_date: Decision date for point-in-time tick costing.
+        screen: Universe admission spec.
+
+    Returns:
+        Admitted rows as a new frame; empty frame on no admission.
+    """
+    import numpy as np
+
+    if len(df) == 0:
+        logger.info("[DATA] stage=cost_aware_admission n_raw=0 n_admitted=0 n_ceiling_excluded=0")
+        return df.copy()
+    close = pd.to_numeric(df["종가"], errors="coerce").to_numpy(dtype=np.float64)
+    prev_close = pd.to_numeric(df["전일종가"], errors="coerce").to_numpy(dtype=np.float64)
+    high = pd.to_numeric(df["고가"], errors="coerce").to_numpy(dtype=np.float64)
+    volume = pd.to_numeric(df["거래량"], errors="coerce").to_numpy(dtype=np.float64)
+    tv_clean = pd.to_numeric(df["거래대금"], errors="coerce").to_numpy(dtype=np.float64)
+    mc_clean = pd.to_numeric(df["시가총액"], errors="coerce").to_numpy(dtype=np.float64)
+    chg_ratio = derive_chg_ratio(close, prev_close)
+    is_ceiling = mark_ceiling(pd.DataFrame({"chg_ratio": chg_ratio, "close": close, "high": high}))
+    dates = np.full(len(df), np.datetime64(decision_date.strftime("%Y-%m-%d")))
+    market = df["시장구분"].astype(str).to_numpy(dtype=object)
+    tick_bp = tick_cost_bp(close, dates, market)
+    mapped = pd.DataFrame(
+        {
+            "chg_ratio": chg_ratio,
+            "is_ceiling": is_ceiling,
+            "tick_cost_bp": tick_bp,
+            "tv_clean": tv_clean,
+            "mc_clean": mc_clean,
+            "close": close,
+            "volume": volume,
+        }
+    )
+    mask = select_universe(mapped, screen)
+    n_ceiling_excluded = int(np.asarray(is_ceiling, dtype=bool).sum())
+    logger.info(
+        "[DATA] stage=cost_aware_admission n_raw=%d n_admitted=%d n_ceiling_excluded=%d",
+        len(df),
+        int(np.asarray(mask, dtype=bool).sum()),
+        n_ceiling_excluded,
+    )
+    return df.loc[np.asarray(mask, dtype=bool)].reset_index(drop=True)
+
+
+def apply_cost_aware_admission_if_automated(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply cost-aware admission only in automated candidate-source mode.
+
+    Args:
+        df: Enriched daily snapshot frame.
+
+    Returns:
+        Admitted frame in automated mode; the input object unchanged otherwise.
+    """
+    if settings.CANDIDATE_SOURCE_MODE != "automated":
+        return df
+    decision_date = pd.Timestamp(datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d"))
+    return apply_cost_aware_admission(df, decision_date=decision_date)
+
+
+async def resolve_daily_candidates(client, session) -> tuple[list[dict], set[str], set[str], set[str], set[str], set[str]] | None:
+    """Resolve the daily candidate list from the configured source mode.
+
+    Args:
+        client: KIS API client.
+        session: HTTP session.
+
+    Returns:
+        Six-tuple of stock_list plus scenario code sets, or None on failure.
+
+    Raises:
+        ValueError: If settings.CANDIDATE_SOURCE_MODE is not recognised.
+    """
+    mode = settings.CANDIDATE_SOURCE_MODE
+    if mode not in {"manual", "automated"}:
+        raise ValueError(f"Unknown CANDIDATE_SOURCE_MODE: {mode!r}")
+    if mode == "automated":
+        stock_list = await fetch_candidate_stock_list(client, session)
+        return (stock_list, set(), set(), set(), set(), set())
+    res_cond_list = await client.get_condition_list(session)
+    if res_cond_list.get("rt_cd") != "0":
+        logger.info(
+            f"{Colors.RED}조건식 목록 조회 실패: "
+            f"rt_cd={res_cond_list.get('rt_cd')}, "
+            f"msg={res_cond_list.get('msg1', 'N/A')}{Colors.RESET}"
+        )
+        return None
+    my_conditions = res_cond_list.get("output2", [])
+    if not my_conditions:
+        logger.info(
+            f"{Colors.YELLOW}⚠ 저장된 조건이 없습니다. "
+            f"(HTS ID: {HTS_ID}, output2 비어 있음){Colors.RESET}"
+        )
+        return None
+    target_cond = next(
+        (c for c in my_conditions if TARGET_CONDITION_NAME in c["condition_nm"]),
+        None,
+    )
+    if not target_cond:
+        logger.info(
+            f"{Colors.RED}❌ '{TARGET_CONDITION_NAME}' 조건을 찾을 수 없습니다.{Colors.RESET}"
+        )
+        return None
+    res_cond_res = await client.get_condition_result(session, target_cond["seq"])
+    if res_cond_res.get("rt_cd") != "0":
+        logger.error(f"{Colors.RED}❌ 검색 실패: {res_cond_res.get('msg1')}{Colors.RESET}")
+        return None
+    stock_list = res_cond_res.get("output2", [])
+    condition_candidates = [
+        (settings.OVERHEATED_CONDITION_NAME, "overheated"),
+        (settings.NEW_HIGH_CONDITION_NAME, "new_high"),
+        (settings.NEAR_NEW_HIGH_CONDITION_NAME, "near_new_high"),
+        (settings.UPPER_LIMIT_NEXT_DAY_CONDITION_NAME, "upper_limit_next"),
+        (settings.UPPER_LIMIT_CONDITION_NAME, "upper_limit"),
+    ]
+    cond_seq_map = {}
+    for cond_name, key in condition_candidates:
+        matched = next(
+            (c for c in my_conditions if c["condition_nm"] == cond_name),
+            None,
+        )
+        if matched:
+            cond_seq_map[key] = matched["seq"]
+
+    async def _fetch_condition_codes(seq):
+        if seq is None:
+            return set()
+        res = await client.get_condition_result(session, seq)
+        if res.get("rt_cd") != "0":
+            return set()
+        return {stock.get("code") for stock in res.get("output2", [])}
+
+    (
+        overheated_stock_codes,
+        new_high_stock_codes,
+        near_new_high_stock_codes,
+        upper_limit_next_day_stock_codes,
+        upper_limit_stock_codes,
+    ) = await asyncio.gather(
+        _fetch_condition_codes(cond_seq_map.get("overheated")),
+        _fetch_condition_codes(cond_seq_map.get("new_high")),
+        _fetch_condition_codes(cond_seq_map.get("near_new_high")),
+        _fetch_condition_codes(cond_seq_map.get("upper_limit_next")),
+        _fetch_condition_codes(cond_seq_map.get("upper_limit")),
+    )
+    return (
+        stock_list,
+        overheated_stock_codes,
+        new_high_stock_codes,
+        near_new_high_stock_codes,
+        upper_limit_next_day_stock_codes,
+        upper_limit_stock_codes,
+    )
 
 
 # ---------------------------------------------------------
@@ -508,79 +673,18 @@ async def main():
         kospi_rate = parse_market_index_rate(res_kospi)
         kosdaq_rate = parse_market_index_rate(res_kosdaq)
 
-        # 3. 조건 목록 및 대상 조건 찾기
-        res_cond_list = await client.get_condition_list(session)
-        if res_cond_list.get("rt_cd") != "0":
-            logger.info(
-                f"{Colors.RED}조건식 목록 조회 실패: "
-                f"rt_cd={res_cond_list.get('rt_cd')}, "
-                f"msg={res_cond_list.get('msg1', 'N/A')}{Colors.RESET}"
-            )
+        # 3-4. 후보 종목 리스트 확보 (수동 조건검색 또는 자동 비용축 스캔; resolve_daily_candidates 단일 분기점)
+        resolved = await resolve_daily_candidates(client, session)
+        if resolved is None:
             return
-        my_conditions = res_cond_list.get("output2", [])
-
-        if not my_conditions:
-            logger.info(
-                f"{Colors.YELLOW}⚠ 저장된 조건이 없습니다. "
-                f"(HTS ID: {HTS_ID}, output2 비어 있음){Colors.RESET}"
-            )
-            return
-        target_cond = next(
-            (c for c in my_conditions if TARGET_CONDITION_NAME in c["condition_nm"]),
-            None,
-        )
-        if not target_cond:
-            logger.info(
-                f"{Colors.RED}❌ '{TARGET_CONDITION_NAME}' 조건을 찾을 수 없습니다.{Colors.RESET}"
-            )
-            return
-
-        # 4. 조건검색 결과 조회 (종가매매)
-        res_cond_res = await client.get_condition_result(session, target_cond["seq"])
-        if res_cond_res.get("rt_cd") != "0":
-            logger.error(f"{Colors.RED}❌ 검색 실패: {res_cond_res.get('msg1')}{Colors.RESET}")
-            return
-
-        stock_list = res_cond_res.get("output2", [])
-
-        # 4-1~4-5. 조건검색 결과 병렬 조회 (Phase 0 최적화)
-        condition_candidates = [
-            (settings.OVERHEATED_CONDITION_NAME, "overheated"),
-            (settings.NEW_HIGH_CONDITION_NAME, "new_high"),
-            (settings.NEAR_NEW_HIGH_CONDITION_NAME, "near_new_high"),
-            (settings.UPPER_LIMIT_NEXT_DAY_CONDITION_NAME, "upper_limit_next"),
-            (settings.UPPER_LIMIT_CONDITION_NAME, "upper_limit"),
-        ]
-        cond_seq_map = {}
-        for cond_name, key in condition_candidates:
-            matched = next(
-                (c for c in my_conditions if c["condition_nm"] == cond_name),
-                None,
-            )
-            if matched:
-                cond_seq_map[key] = matched["seq"]
-
-        async def _fetch_condition_codes(seq):
-            if seq is None:
-                return set()
-            res = await client.get_condition_result(session, seq)
-            if res.get("rt_cd") != "0":
-                return set()
-            return {stock.get("code") for stock in res.get("output2", [])}
-
         (
+            stock_list,
             overheated_stock_codes,
             new_high_stock_codes,
             near_new_high_stock_codes,
             upper_limit_next_day_stock_codes,
             upper_limit_stock_codes,
-        ) = await asyncio.gather(
-            _fetch_condition_codes(cond_seq_map.get("overheated")),
-            _fetch_condition_codes(cond_seq_map.get("new_high")),
-            _fetch_condition_codes(cond_seq_map.get("near_new_high")),
-            _fetch_condition_codes(cond_seq_map.get("upper_limit_next")),
-            _fetch_condition_codes(cond_seq_map.get("upper_limit")),
-        )
+        ) = resolved
 
         # 조건검색 결과 통합 카드 리포트 출력
         logger.info(
@@ -617,6 +721,7 @@ async def main():
             save_path = str(settings.CONDITION_CSV_PATH)
 
             df = pd.DataFrame(results)
+            df = apply_cost_aware_admission_if_automated(df)
             df = df.sort_values(by="거래대금", ascending=False)
             df["선정순위"] = range(1, len(df) + 1)
 
