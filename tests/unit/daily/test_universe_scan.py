@@ -256,3 +256,133 @@ def test_collect_universe_scan_falls_back_to_kis_when_kiwoom_raises() -> None:
     assert df.iloc[0]["종목코드"] == "005930"
     assert kw_client.get_fluctuation_ranking.call_count == 1
     assert kis_client.get_fluctuation_ranking.call_count == 1
+
+
+def test_map_ranking_rows_to_stock_list_maps_confirmed_fields() -> None:
+    from src.daily.universe_scan import map_ranking_rows_to_stock_list
+
+    # Given: a KIS fluctuation-ranking row
+    rows = [{
+        "stck_shrn_iscd": "5930", "hts_kor_isnm": "삼성전자",
+        "stck_prpr": "70000", "prdy_ctrt": "5.26",
+    }]
+
+    # When
+    out = map_ranking_rows_to_stock_list(rows)
+
+    # Then: shape matches collect.py's stock_list contract (code/name/price/chgrate)
+    assert out == [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "5.26"}]
+
+
+def test_map_ranking_rows_to_stock_list_skips_rows_without_code() -> None:
+    from src.daily.universe_scan import map_ranking_rows_to_stock_list
+
+    rows = [{"hts_kor_isnm": "코드없음", "stck_prpr": "1000", "prdy_ctrt": "3.0"}]
+
+    out = map_ranking_rows_to_stock_list(rows)
+
+    assert out == []
+
+
+def test_map_kiwoom_ranking_rows_to_stock_list_strips_market_suffix() -> None:
+    from src.daily.universe_scan import map_kiwoom_ranking_rows_to_stock_list
+
+    # Given: a Kiwoom ka10027 row whose code carries a market suffix
+    rows = [{"stk_cd": "005930_AL", "stk_nm": "삼성전자", "cur_prc": "70000", "flu_rt": "5.26"}]
+
+    # When
+    out = map_kiwoom_ranking_rows_to_stock_list(rows)
+
+    # Then
+    assert out == [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "5.26"}]
+
+    # Then: empty input returns an empty list, not an error
+    assert map_kiwoom_ranking_rows_to_stock_list([]) == []
+
+
+def test_fetch_candidate_stock_list_uses_universe_bounds_as_percent() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_candidate_stock_list
+
+    client = AsyncMock()
+    client.get_fluctuation_ranking = AsyncMock(return_value={"rt_cd": "0", "output": []})
+
+    out = asyncio.run(fetch_candidate_stock_list(client, object()))
+
+    client.get_fluctuation_ranking.assert_awaited_once()
+    kwargs = client.get_fluctuation_ranking.await_args.kwargs
+    assert kwargs["rate_min_pct"] == 2.0
+    assert kwargs["rate_max_pct"] == 10.0
+    assert out == []
+
+
+def test_fetch_candidate_stock_list_fails_soft_returns_empty_list() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_candidate_stock_list
+
+    client = AsyncMock()
+    client.get_fluctuation_ranking = AsyncMock(return_value={"rt_cd": "1", "msg1": "실패"})
+
+    out = asyncio.run(fetch_candidate_stock_list(client, object()))
+
+    assert out == []
+
+
+def test_fetch_candidate_stock_list_prefers_kiwoom_and_falls_back_to_kis() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_candidate_stock_list
+
+    kis_client = AsyncMock()
+    kis_client.get_fluctuation_ranking = AsyncMock(return_value={"rt_cd": "0", "output": [
+        {"stck_shrn_iscd": "000660", "hts_kor_isnm": "SK하이닉스", "stck_prpr": "180000", "prdy_ctrt": "4.0"},
+    ]})
+    kw_client = AsyncMock()
+    kw_client.get_fluctuation_ranking = AsyncMock(return_value={"rt_cd": "0", "output": [
+        {"stk_cd": "005930", "stk_nm": "삼성전자", "cur_prc": "70000", "flu_rt": "5.26"},
+    ]})
+
+    # When: Kiwoom is available and succeeds
+    out = asyncio.run(fetch_candidate_stock_list(kis_client, object(), kiwoom_client=kw_client))
+
+    # Then: Kiwoom result wins, KIS is never called
+    assert out == [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "5.26"}]
+    kis_client.get_fluctuation_ranking.assert_not_awaited()
+
+    # When: Kiwoom fails
+    kw_client2 = AsyncMock()
+    kw_client2.get_fluctuation_ranking = AsyncMock(return_value={"rt_cd": "1", "output": []})
+    out2 = asyncio.run(fetch_candidate_stock_list(kis_client, object(), kiwoom_client=kw_client2))
+
+    # Then: falls back to KIS
+    assert out2 == [{"code": "000660", "name": "SK하이닉스", "price": "180000", "chgrate": "4.0"}]
+
+    # When: Kiwoom raises
+    kw_client3 = AsyncMock()
+    kw_client3.get_fluctuation_ranking = AsyncMock(side_effect=RuntimeError("network error"))
+    out3 = asyncio.run(fetch_candidate_stock_list(kis_client, object(), kiwoom_client=kw_client3))
+
+    # Then: falls back to KIS without raising
+    assert out3 == [{"code": "000660", "name": "SK하이닉스", "price": "180000", "chgrate": "4.0"}]
+
+
+def test_map_kiwoom_ranking_rows_to_stock_list_skips_rows_without_code() -> None:
+    from src.daily.universe_scan import map_kiwoom_ranking_rows_to_stock_list
+
+    # Given: one row with no stk_cd at all, one with a blank/whitespace stk_cd
+    rows = [
+        {"stk_nm": "코드없음", "cur_prc": "1000", "flu_rt": "3.0"},
+        {"stk_cd": "   ", "stk_nm": "공백코드", "cur_prc": "2000", "flu_rt": "4.0"},
+        {"stk_cd": "005930_AL", "stk_nm": "삼성전자", "cur_prc": "70000", "flu_rt": "5.26"},
+    ]
+
+    # When
+    out = map_kiwoom_ranking_rows_to_stock_list(rows)
+
+    # Then: only the row with a resolvable code survives
+    assert out == [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "5.26"}]

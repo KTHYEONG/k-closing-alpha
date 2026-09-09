@@ -31,3 +31,11 @@ def test_trading_condition_name_drives_aggregate_paths(tmp_path) -> None:
     assert tmp_path / "data" / "history" == settings.HISTORY_DIR
     assert settings.HISTORY_DB_PATH == settings.HISTORY_DIR / "archive.db"
     assert settings.HISTORY_CSV_PATH == settings.HISTORY_DIR / "archive.csv"
+
+
+def test_trading_settings_candidate_source_mode_defaults_to_manual() -> None:
+    from src.config.trading import TradingSettings
+
+    settings = TradingSettings(_env_file=None)
+
+    assert settings.CANDIDATE_SOURCE_MODE == "manual"

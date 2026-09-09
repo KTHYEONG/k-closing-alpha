@@ -16,8 +16,11 @@ __all__ = [
     "UNIVERSE_SCAN_SCENARIO_TAG",
     "archive_universe_snapshot",
     "collect_universe_scan",
+    "fetch_candidate_stock_list",
     "map_kiwoom_ranking_rows_to_archive_frame",
+    "map_kiwoom_ranking_rows_to_stock_list",
     "map_ranking_rows_to_archive_frame",
+    "map_ranking_rows_to_stock_list",
 ]
 
 _ARCHIVE_COLUMNS: list[str] = [
@@ -161,3 +164,97 @@ async def collect_universe_scan(
 
 def archive_universe_snapshot(df: pd.DataFrame, snapshot_date: str) -> int:
     return archive.upsert_archive_snapshot(df, snapshot_date=snapshot_date)
+
+
+def map_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
+    """Map KIS fluctuation-ranking rows to collect.py stock_list shape.
+
+    Args:
+        rows: Raw KIS ranking rows.
+
+    Returns:
+        List of {code, name, price, chgrate} dicts; codeless rows skipped.
+    """
+    out: list[dict] = []
+    for row in rows:
+        code_raw = str(row.get("stck_shrn_iscd") or row.get("mksc_shrn_iscd") or "").strip()
+        if not code_raw:
+            continue
+        out.append(
+            {
+                "code": code_raw.zfill(6),
+                "name": row.get("hts_kor_isnm"),
+                "price": row.get("stck_prpr"),
+                "chgrate": row.get("prdy_ctrt"),
+            }
+        )
+    return out
+
+
+def map_kiwoom_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
+    """Map Kiwoom ka10027 ranking rows to collect.py stock_list shape.
+
+    Args:
+        rows: Raw Kiwoom ranking rows.
+
+    Returns:
+        List of {code, name, price, chgrate} dicts; codeless rows skipped.
+    """
+    out: list[dict] = []
+    for row in rows:
+        code_raw = str(row.get("stk_cd", "") or "").split("_")[0].strip()
+        if not code_raw:
+            continue
+        out.append(
+            {
+                "code": code_raw.zfill(6),
+                "name": row.get("stk_nm"),
+                "price": row.get("cur_prc"),
+                "chgrate": row.get("flu_rt"),
+            }
+        )
+    return out
+
+
+async def fetch_candidate_stock_list(
+    client, session, *, universe: UniverseSpec = DEFAULT_UNIVERSE, kiwoom_client: Any | None = None
+) -> list[dict]:
+    """Fetch candidate stock_list via Kiwoom-primary/KIS-fallback ranking scan.
+
+    Args:
+        client: KIS API client.
+        session: HTTP session.
+        universe: Universe bounds for the ranking call.
+        kiwoom_client: Optional Kiwoom vendor client.
+
+    Returns:
+        Candidate stock_list in collect.py shape; empty list on KIS failure.
+    """
+    if kiwoom_client is not None:
+        try:
+            kw_res = await kiwoom_client.get_fluctuation_ranking(
+                session,
+                rate_min_pct=universe.chg_min * 100.0,
+                rate_max_pct=universe.chg_max * 100.0,
+            )
+        except Exception as e:
+            logger.warning("Universe scan kiwoom ranking failed, falling back to KIS: %s", e)
+            kw_res = {"rt_cd": "1", "output": []}
+        if kw_res.get("rt_cd") == "0":
+            return map_kiwoom_ranking_rows_to_stock_list(kw_res.get("output") or [])
+        logger.warning(
+            "Universe scan kiwoom ranking failed rt_cd=%s, falling back to KIS",
+            kw_res.get("rt_cd"),
+        )
+    res = await client.get_fluctuation_ranking(
+        session,
+        rate_min_pct=universe.chg_min * 100.0,
+        rate_max_pct=universe.chg_max * 100.0,
+        market_div_code="J",
+    )
+    if res.get("rt_cd") != "0":
+        logger.warning(
+            "Universe scan ranking failed rt_cd=%s msg=%s", res.get("rt_cd"), res.get("msg1", "")
+        )
+        return []
+    return map_ranking_rows_to_stock_list(res.get("output") or [])
