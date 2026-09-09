@@ -317,3 +317,228 @@ def test_fetch_all_stock_data_persists_orderbook_and_survives_persist_failure(mo
     assert len(results) == 1
     assert failed_info == []
 
+
+def test_apply_cost_aware_admission_filters_by_chg_tv_mc_tick_cost_and_ceiling() -> None:
+    import pandas as pd
+
+    from src.daily.collect import apply_cost_aware_admission
+
+    # Given: 5 enriched candidates on the live Korean-column snapshot shape.
+    # S1: chg 5%, cheap tick (18000 KRW -> 5.56bp) -> admitted.
+    # S2: chg 5%, expensive tick (30000 KRW -> 16.67bp > 7.5bp cap) -> excluded.
+    # S3: chg 15% (outside the 2-10% band) -> excluded.
+    # S4: chg 5%, thin liquidity (tv/mc below the floor) -> excluded.
+    # S5: chg 30% and close==high (ceiling) -> excluded.
+    df = pd.DataFrame({
+        "종목코드": ["S1", "S2", "S3", "S4", "S5"],
+        "종가": [18000.0, 30000.0, 23000.0, 18000.0, 13000.0],
+        "전일종가": [17142.86, 28571.43, 20000.0, 17142.86, 10000.0],
+        "고가": [18100.0, 30100.0, 23100.0, 18100.0, 13000.0],
+        "거래량": [1_000_000] * 5,
+        "거래대금": [500.0, 500.0, 500.0, 10.0, 500.0],
+        "시가총액": [3000.0, 3000.0, 3000.0, 3000.0, 3000.0],
+        "시장구분": ["KOSPI", "KOSPI", "KOSPI", "KOSPI", "KOSPI"],
+    })
+    decision_date = pd.Timestamp("2026-09-09")
+
+    # When
+    out = apply_cost_aware_admission(df, decision_date=decision_date)
+
+    # Then: only S1 clears every admission criterion
+    assert out["종목코드"].tolist() == ["S1"]
+
+    # Then: an all-excluded snapshot returns an empty frame, never raises
+    thin = df[df["종목코드"] == "S4"].reset_index(drop=True)
+    out_empty = apply_cost_aware_admission(thin, decision_date=decision_date)
+    assert len(out_empty) == 0
+    assert list(out_empty.columns) == list(thin.columns)
+
+
+def test_apply_cost_aware_admission_empty_input_returns_empty_without_raising() -> None:
+    import pandas as pd
+
+    from src.daily.collect import apply_cost_aware_admission
+
+    df = pd.DataFrame(columns=["종목코드", "종가", "전일종가", "고가", "거래량", "거래대금", "시가총액", "시장구분"])
+
+    out = apply_cost_aware_admission(df, decision_date=pd.Timestamp("2026-09-09"))
+
+    assert len(out) == 0
+
+
+def test_resolve_daily_candidates_automated_mode_skips_condition_search_entirely(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import src.daily.collect as collect_mod
+    from src.daily.collect import resolve_daily_candidates
+
+    monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+
+    client = AsyncMock()  # never touched in automated mode
+    fake_stock_list = [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "5.0"}]
+
+    async def _fake_fetch(client_arg, session_arg, **kwargs):
+        return fake_stock_list
+
+    monkeypatch.setattr(collect_mod, "fetch_candidate_stock_list", _fake_fetch)
+
+    # When
+    resolved = asyncio.run(resolve_daily_candidates(client, object()))
+
+    # Then: the automated stock_list is returned with every scenario set empty,
+    # and the manual condition-search API is never consulted
+    assert resolved is not None
+    stock_list, overheated, new_high, near_new_high, upper_limit_next, upper_limit = resolved
+    assert stock_list == fake_stock_list
+    assert overheated == set()
+    assert new_high == set()
+    assert near_new_high == set()
+    assert upper_limit_next == set()
+    assert upper_limit == set()
+    client.get_condition_list.assert_not_awaited()
+    client.get_condition_result.assert_not_awaited()
+
+
+def test_resolve_daily_candidates_manual_mode_preserves_existing_behavior(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import src.daily.collect as collect_mod
+    from src.daily.collect import resolve_daily_candidates
+
+    monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
+    monkeypatch.setattr(collect_mod, "TARGET_CONDITION_NAME", "종가매매")
+
+    client = AsyncMock()
+    client.get_condition_list = AsyncMock(return_value={"rt_cd": "0", "output2": [
+        {"condition_nm": "종가매매", "seq": "0"},
+        {"condition_nm": "단기과열", "seq": "1"},
+    ]})
+
+    async def _fake_condition_result(session, seq):
+        if seq == "0":
+            return {"rt_cd": "0", "output2": [{"code": "005930", "name": "삼성전자"}]}
+        if seq == "1":
+            return {"rt_cd": "0", "output2": [{"code": "005930"}]}
+        return {"rt_cd": "0", "output2": []}
+
+    client.get_condition_result = _fake_condition_result
+
+    # When
+    resolved = asyncio.run(resolve_daily_candidates(client, object()))
+
+    # Then: unchanged HTS condition-search path -- primary result plus the
+    # overheated sub-condition tagging "005930"
+    assert resolved is not None
+    stock_list, overheated, new_high, near_new_high, upper_limit_next, upper_limit = resolved
+    assert stock_list == [{"code": "005930", "name": "삼성전자"}]
+    assert overheated == {"005930"}
+    assert new_high == set()
+    client.get_condition_list.assert_awaited_once()
+
+
+def test_resolve_daily_candidates_manual_mode_condition_not_found_returns_none(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import src.daily.collect as collect_mod
+    from src.daily.collect import resolve_daily_candidates
+
+    monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
+    monkeypatch.setattr(collect_mod, "TARGET_CONDITION_NAME", "종가매매")
+
+    client = AsyncMock()
+    client.get_condition_list = AsyncMock(return_value={"rt_cd": "0", "output2": [
+        {"condition_nm": "다른조건", "seq": "9"},
+    ]})
+
+    # When: the target condition is not among the operator's saved conditions
+    resolved = asyncio.run(resolve_daily_candidates(client, object()))
+
+    # Then: fails closed by returning None, matching the prior inline early-return
+    assert resolved is None
+
+    # Then: an empty saved-condition list also returns None
+    client2 = AsyncMock()
+    client2.get_condition_list = AsyncMock(return_value={"rt_cd": "0", "output2": []})
+    assert asyncio.run(resolve_daily_candidates(client2, object())) is None
+
+    # Then: a failed condition-list fetch also returns None
+    client3 = AsyncMock()
+    client3.get_condition_list = AsyncMock(return_value={"rt_cd": "1", "msg1": "인증 만료"})
+    assert asyncio.run(resolve_daily_candidates(client3, object())) is None
+
+
+def test_resolve_daily_candidates_rejects_invalid_candidate_source_mode(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import pytest
+
+    import src.daily.collect as collect_mod
+    from src.daily.collect import resolve_daily_candidates
+
+    monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "bogus_mode")
+    client = AsyncMock()
+
+    with pytest.raises(ValueError, match="CANDIDATE_SOURCE_MODE"):
+        asyncio.run(resolve_daily_candidates(client, object()))
+
+
+def test_resolve_daily_candidates_manual_mode_primary_result_failure_returns_none(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import src.daily.collect as collect_mod
+    from src.daily.collect import resolve_daily_candidates
+
+    monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
+    monkeypatch.setattr(collect_mod, "TARGET_CONDITION_NAME", "종가매매")
+
+    client = AsyncMock()
+    client.get_condition_list = AsyncMock(return_value={"rt_cd": "0", "output2": [
+        {"condition_nm": "종가매매", "seq": "0"},
+    ]})
+    # Given: the target condition is found, but its result fetch itself fails
+    client.get_condition_result = AsyncMock(return_value={"rt_cd": "1", "msg1": "세션 만료"})
+
+    # When
+    resolved = asyncio.run(resolve_daily_candidates(client, object()))
+
+    # Then: fails closed by returning None, matching the prior inline early-return
+    assert resolved is None
+    client.get_condition_result.assert_awaited_once()
+
+
+def test_apply_cost_aware_admission_if_automated_gates_on_candidate_source_mode(monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.collect as collect_mod
+    from src.daily.collect import apply_cost_aware_admission_if_automated
+
+    df = pd.DataFrame({"종목코드": ["S1"], "거래대금": [500.0]})
+    seen: dict[str, object] = {}
+
+    def _fake_admission(frame, *, decision_date, screen=None):
+        seen["frame"] = frame
+        seen["decision_date"] = decision_date
+        return frame.iloc[0:0]
+
+    monkeypatch.setattr(collect_mod, "apply_cost_aware_admission", _fake_admission)
+
+    # Given: manual mode (the default) -- df must pass through byte-identical,
+    # apply_cost_aware_admission must never be called
+    monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
+    out_manual = apply_cost_aware_admission_if_automated(df)
+    assert out_manual is df
+    assert "frame" not in seen
+
+    # Given: automated mode -- the admission mask is applied with today's
+    # Asia/Seoul decision date
+    monkeypatch.setattr(collect_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+    out_auto = apply_cost_aware_admission_if_automated(df)
+    assert len(out_auto) == 0
+    assert seen["frame"] is df
+    assert isinstance(seen["decision_date"], pd.Timestamp)
+
