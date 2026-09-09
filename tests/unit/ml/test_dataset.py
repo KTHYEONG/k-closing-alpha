@@ -148,8 +148,9 @@ def test_build_ml_dataset_output_unchanged_after_vectorization() -> None:
 def test_label_source_is_excluded_from_model_features() -> None:
     import pandas as pd
 
-    from src.data.candidate_panel import LABEL_SOURCE_COLUMN
     from src.ml.dataset import _EXCLUDED_FROM_X, build_ml_dataset
+
+    LABEL_SOURCE_COLUMN = "label_source"
 
     # Arrange
     assert LABEL_SOURCE_COLUMN in _EXCLUDED_FROM_X

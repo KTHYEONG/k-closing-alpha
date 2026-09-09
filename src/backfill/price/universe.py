@@ -4,62 +4,22 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
 import pandas as pd
 
-from src.backfill.price.config import DEFAULT_CONFIG, FetchConfig
+from src.backfill.price.config import FetchConfig
 from src.data.candidate_panel import load_candidate_universe_symbols
 
 logger = logging.getLogger(__name__)
 
 
-def load_or_build_snapshot(*args, **kwargs) -> pd.DataFrame:
-    """종목 후보 우주(symbol/market) 스냅샷을 로컬 DB에서 로드합니다.
-
-    레거시 `src.pipeline.data.load_or_build_snapshot`을 대체하며,
-    `table_trade_log`에서 symbol/market 컬럼을 구성합니다.
-    """
-    from src.data.db_loader import load_trade_log_from_db
-
-    try:
-        raw = load_trade_log_from_db()
-    except FileNotFoundError:
-        return pd.DataFrame(columns=["symbol", "market"])
-    if raw is None or raw.empty:
-        return pd.DataFrame(columns=["symbol", "market"])
-
-    rename = {}
-    for col in raw.columns:
-        if "종목코드" in str(col):
-            rename[col] = "symbol"
-        elif "시장구분" in str(col) or "시장" in str(col):
-            rename[col] = "market"
-    if "symbol" not in rename.values():
-        return pd.DataFrame(columns=["symbol", "market"])
-    out = raw.rename(columns=rename)
-    if "market" not in out.columns:
-        out["market"] = np.nan
-    return out[["symbol", "market"]]
-
-
 def _load_candidate_universe() -> pd.DataFrame:
-    raw = load_or_build_snapshot(config=DEFAULT_CONFIG, rebuild=False, sync_gsheet=False)
     try:
-        extra = load_candidate_universe_symbols()
+        out = load_candidate_universe_symbols()
     except Exception as exc:
-        logger.warning("[DATA] stage=candidate_universe status=fallback_to_trade_log error=%s", exc)
-        extra = pd.DataFrame(columns=["symbol", "market"])
-    if extra is not None and not extra.empty:
-        raw = pd.concat([raw, extra], ignore_index=True, sort=False)
-    required = ["symbol", "market"]
-    for col in required:
-        if col not in raw.columns:
-            raw[col] = np.nan
-    out = raw[required].copy()
-    out["symbol"] = out["symbol"].astype(str).str.strip().str.zfill(6)
-    out["market"] = out["market"].astype(str).fillna("UNKNOWN")
-    out = out[out["symbol"].str.fullmatch(r"\d{6}", na=False)].copy()
-    out = out.drop_duplicates(subset=["symbol"], keep="last")
+        logger.warning("[DATA] stage=candidate_universe status=candidate_source_unavailable error=%s", exc)
+        return pd.DataFrame(columns=["symbol", "market"])
+    if out is None or out.empty:
+        return pd.DataFrame(columns=["symbol", "market"])
     return out
 
 

@@ -1,7 +1,7 @@
 """Parquet I/O operations and dataset manager module.
 
 Provides high-performance columnar data loading, saving, and upsert capabilities
-for trade logs, theme mappings, and condition search snapshots using Parquet format.
+for theme mappings and condition search snapshots using Parquet format.
 """
 
 from __future__ import annotations
@@ -56,41 +56,6 @@ def _clean_df_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
                 df_clean[col] = df_clean[col].astype(str).replace({"nan": None, "None": None, "<NA>": None})
 
     return df_clean
-
-
-def save_trade_log_to_parquet(df: pd.DataFrame) -> None:
-    """Save trade log DataFrame to parquet format.
-
-    Args:
-        df: Trade log DataFrame.
-    """
-    if df is None or df.empty:
-        logger.warning("Trade log DataFrame is empty. Skipping parquet save.")
-        return
-
-    df_copy = _clean_df_for_parquet(df)
-    if "종목코드" in df_copy.columns:
-        df_copy["종목코드"] = df_copy["종목코드"].astype(str).str.zfill(6)
-
-    _atomic_write_parquet(df_copy, settings.TRADE_LOG_PARQUET_PATH)
-    logger.info("Saved trade log to parquet: %s (%d rows)", settings.TRADE_LOG_PARQUET_PATH, len(df_copy))
-
-
-def load_trade_log_from_parquet() -> pd.DataFrame:
-    """Load trade log DataFrame from parquet file.
-
-    Returns:
-        pd.DataFrame: Trade log DataFrame.
-    """
-    parquet_path = settings.TRADE_LOG_PARQUET_PATH
-    if not parquet_path.exists():
-        logger.info("Trade log parquet file not found at %s. Returning empty DataFrame.", parquet_path)
-        return pd.DataFrame()
-
-    df = pd.read_parquet(parquet_path)
-    if "종목코드" in df.columns:
-        df["종목코드"] = df["종목코드"].astype(str).str.zfill(6)
-    return df
 
 
 def save_theme_to_parquet(df: pd.DataFrame) -> None:
