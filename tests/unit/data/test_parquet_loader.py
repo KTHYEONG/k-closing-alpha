@@ -7,9 +7,7 @@ from src.data.parquet_loader import (
     _atomic_write_parquet,
     load_condition_data_from_parquet,
     load_theme_from_parquet,
-    load_trade_log_from_parquet,
     save_theme_to_parquet,
-    save_trade_log_to_parquet,
     upsert_condition_parquet,
 )
 
@@ -23,26 +21,6 @@ def tmp_parquet_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "THEME_PARQUET_PATH", p_dir / "theme.parquet")
     monkeypatch.setattr(settings, "HISTORY_PARQUET_PATH", p_dir / "condition_history.parquet")
     return p_dir
-
-
-def test_save_and_load_trade_log_parquet(tmp_parquet_dir: Path) -> None:
-    # 빈 상태 로드 테스트
-    df_empty = load_trade_log_from_parquet()
-    assert isinstance(df_empty, pd.DataFrame)
-
-    # 데이터 저장 후 로드 테스트
-    data = {
-        "매수날짜": ["2026-08-01", "2026-08-02"],
-        "종목코드": [5930, "000660"],  # 정수 포함 테스트 (6자리 포맷 검증)
-        "종목명": ["삼성전자", "SK하이닉스"],
-    }
-    df_src = pd.DataFrame(data)
-    save_trade_log_to_parquet(df_src)
-
-    df_loaded = load_trade_log_from_parquet()
-    assert len(df_loaded) == 2
-    assert df_loaded["종목코드"].tolist() == ["005930", "000660"]
-    assert df_loaded["종목명"].tolist() == ["삼성전자", "SK하이닉스"]
 
 
 def test_save_and_load_theme_parquet(tmp_parquet_dir: Path) -> None:
@@ -86,3 +64,15 @@ def test_parquet_loader_atomic_write_delegates_and_still_works(tmp_path: Path) -
     assert target.exists()
     loaded = pd.read_parquet(target)
     assert loaded.loc[0, "종목코드"] == "005930"
+
+
+def test_parquet_loader_module_no_longer_exposes_trade_log_functions() -> None:
+    import src.data.parquet_loader as mod
+
+    assert not hasattr(mod, "save_trade_log_to_parquet")
+    assert not hasattr(mod, "load_trade_log_from_parquet")
+    assert hasattr(mod, "save_theme_to_parquet")
+    assert hasattr(mod, "load_theme_from_parquet")
+    assert hasattr(mod, "upsert_condition_parquet")
+    assert hasattr(mod, "load_condition_data_from_parquet")
+

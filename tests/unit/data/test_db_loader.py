@@ -59,12 +59,6 @@ def patch_db_path(tmp_path, monkeypatch):
     return db_path
 
 
-def test_load_trade_log_from_db(patch_db_path) -> None:
-    df = db_loader.load_trade_log_from_db()
-    assert len(df) == 2
-    assert set(df["종목코드"]) == {"005930", "000660"}
-
-
 def test_load_theme_from_db(patch_db_path) -> None:
     theme_map = db_loader.load_theme_from_db()
     assert theme_map == {"005930": "반도체", "000660": "AI"}
@@ -87,3 +81,20 @@ def test_load_condition_data_from_db_with_date(patch_db_path) -> None:
 def test_load_condition_data_from_db_with_limit(patch_db_path) -> None:
     df = db_loader.load_condition_data_from_db(limit=1)
     assert len(df) == 1
+
+
+def test_data_loader_and_db_loader_no_longer_forward_trade_log() -> None:
+    from src.data import data_loader, db_loader
+
+    assert not hasattr(data_loader, "load_trade_log")
+    assert not hasattr(data_loader, "load_trade_log_from_db")
+    assert not hasattr(db_loader, "load_trade_log")
+    assert not hasattr(db_loader, "load_trade_log_from_db")
+    assert "load_trade_log" not in db_loader.__all__
+    assert "load_trade_log_from_db" not in db_loader.__all__
+
+    assert hasattr(data_loader, "load_theme")
+    assert hasattr(data_loader, "load_condition_data")
+    assert "load_theme" in db_loader.__all__
+    assert "load_condition_data" in db_loader.__all__
+

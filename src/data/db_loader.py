@@ -10,8 +10,6 @@ from src.data.data_loader import (
     load_condition_data_from_db,
     load_theme,
     load_theme_from_db,
-    load_trade_log,
-    load_trade_log_from_db,
 )
 
 __all__ = [
@@ -19,6 +17,4 @@ __all__ = [
     "load_condition_data_from_db",
     "load_theme",
     "load_theme_from_db",
-    "load_trade_log",
-    "load_trade_log_from_db",
 ]
