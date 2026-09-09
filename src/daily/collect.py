@@ -42,6 +42,21 @@ def _validate_hts_id() -> None:
         )
 
 
+def _validate_decision_window(now: datetime, *, force: bool = False) -> None:
+    if force:
+        return
+    from src.config.market_session import (
+        DECISION_WINDOW_END_HHMMSS,
+        DECISION_WINDOW_START_HHMMSS,
+    )
+
+    hhmmss = now.strftime("%H%M%S")
+    if not (DECISION_WINDOW_START_HHMMSS <= hhmmss <= DECISION_WINDOW_END_HHMMSS):
+        raise RuntimeError(
+            f"결정 창({DECISION_WINDOW_START_HHMMSS}~{DECISION_WINDOW_END_HHMMSS} KST) 밖 실행은 금지됩니다. --force로 우회 가능합니다."
+        )
+
+
 def safe_float(value, default=0.0):
     """문자열이나 None 값을 안전하게 float로 변환"""
     if value is None:
@@ -57,10 +72,10 @@ def safe_float(value, default=0.0):
 # ---------------------------------------------------------
 def parse_market_index_rate(data):
     if not data or data.get("rt_cd") != "0":
-        return 0.0
+        return None
     out1 = data.get("output1")
     if not out1:
-        return 0.0
+        return None
     rate_str = out1.get("bstp_nmix_prdy_ctrt") or out1.get("prdy_ctrt")
     try:
         if rate_str and float(rate_str) != 0.0:
@@ -72,7 +87,7 @@ def parse_market_index_rate(data):
             return round((change_amount / prev_close) * 100, 2)
     except Exception:
         pass
-    return 0.0
+    return None
 
 
 # ---------------------------------------------------------
@@ -180,20 +195,18 @@ async def fetch_single_stock(
         mkt_cap_eok = 0.0
         trade_amt_eok = 0.0
 
-        # 종목당 4회로 한정: 현재가(KRX) + 투자자추정 + 호가(KRX/NXT)
-        from src.config.market_session import DECISION_PRICE_MARKET_DIV_CODES
+        # 종목당 3회로 한정: 현재가(KRX) + 투자자추정 + 호가(KRX)
+        from src.config.market_session import KRX_CLOSE_MARKET_DIV_CODE
 
-        _krx_div, _nxt_div = DECISION_PRICE_MARKET_DIV_CODES
+        _krx_div = KRX_CLOSE_MARKET_DIV_CODE
         (
             res_detail,
             res_investor,
             res_ob_krx,
-            res_ob_nxt,
         ) = await asyncio.gather(
             client.get_current_price(session, code, market_div_code=_krx_div),
             client.get_investor_trend_estimate(session, code),
             client.get_orderbook_snapshot(session, code, market_div_code=_krx_div),
-            client.get_orderbook_snapshot(session, code, market_div_code=_nxt_div),
         )
 
         # 실패한 API 체크 (유지 3종만 판정)
@@ -202,14 +215,17 @@ async def fetch_single_stock(
             failed_apis.append("현재가")
         if res_investor.get("rt_cd") != "0":
             failed_apis.append("투자자추정")
-        if res_ob_krx.get("rt_cd") != "0" or res_ob_nxt.get("rt_cd") != "0":
+        if res_ob_krx.get("rt_cd") != "0":
             failed_apis.append("호가")
 
         # 데이터 파싱
         detail = res_detail.get("output") if res_detail.get("rt_cd") == "0" else None
 
+        supply_failed = False
         frgn_qty, orgn_qty = 0, 0
-        if res_investor.get("rt_cd") == "0" and res_investor.get("output2"):
+        if res_investor.get("rt_cd") != "0":
+            supply_failed = True
+        elif res_investor.get("output2"):
             latest = res_investor["output2"][0]
             frgn_qty = int(safe_float(latest.get("frgn_fake_ntby_qty", 0)))
             orgn_qty = int(safe_float(latest.get("orgn_fake_ntby_qty", 0)))
@@ -233,10 +249,13 @@ async def fetch_single_stock(
         capture_ts = datetime.now(ZoneInfo("Asia/Seoul"))
         orderbook_rows: list[dict] = []
         orderbook_rows.extend(build_orderbook_rows(res_ob_krx, code, _krx_div, "decision", capture_ts))
-        orderbook_rows.extend(build_orderbook_rows(res_ob_nxt, code, _nxt_div, "decision", capture_ts))
 
-        frgn_net_eok = round((frgn_qty * price) / 100_000_000, 2)
-        orgn_net_eok = round((orgn_qty * price) / 100_000_000, 2)
+        if supply_failed:
+            frgn_net_eok = float("nan")
+            orgn_net_eok = float("nan")
+        else:
+            frgn_net_eok = round((frgn_qty * price) / 100_000_000, 2)
+            orgn_net_eok = round((orgn_qty * price) / 100_000_000, 2)
 
         return {
             "종목명": name,
@@ -253,6 +272,7 @@ async def fetch_single_stock(
             "기관_순매수": orgn_net_eok,
             "외국인_순매수": frgn_net_eok,
             "등락률": rate,
+            "수급_실패": supply_failed,
         }, failed_apis, orderbook_rows
 
 
@@ -330,10 +350,11 @@ def persist_daily_snapshot(df: pd.DataFrame, snapshot_date: str) -> int:
     return archive.upsert_archive_snapshot(df, snapshot_date=snapshot_date)
 
 
-async def main():
+async def main(force: bool = False):
     from aiohttp.resolver import ThreadedResolver
 
     _validate_hts_id()
+    _validate_decision_window(datetime.now(ZoneInfo("Asia/Seoul")), force=force)
 
     # aiohttp 세션 설정 강화 (네트워크 안정성 향상 + DNS 해결)
     timeout = aiohttp.ClientTimeout(
@@ -378,11 +399,22 @@ async def main():
         results, failed_info = await fetch_all_stock_data(stock_list, client, session)
 
         # 5. wide 단면 구성 후 PIT admitted 플래그 부여 및 저장소 직접 기록
-        snapshot_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+        capture_ts = pd.Timestamp.now(tz="Asia/Seoul")
+        snapshot_date = capture_ts.strftime("%Y-%m-%d")
         df = pd.DataFrame(results)
+        df["snapshot_timestamp"] = capture_ts
         df = flag_cost_aware_admission(df, decision_date=pd.Timestamp(snapshot_date))
-        df["kospi"] = kospi_rate
-        df["kosdaq"] = kosdaq_rate
+        index_failed = False
+        if kospi_rate is None:
+            df["kospi"] = float("nan")
+            index_failed = True
+        else:
+            df["kospi"] = kospi_rate
+        if kosdaq_rate is None:
+            df["kosdaq"] = float("nan")
+            index_failed = True
+        else:
+            df["kosdaq"] = kosdaq_rate
 
         # V-KOSPI만 부착 (V-KOSDAQ 조회 제거)
         try:
@@ -392,8 +424,10 @@ async def main():
                 "1028", session=session
             )
         except Exception:
-            vkospi_val = 0.0
-        df["v_kospi"] = round(vkospi_val, 2)
+            vkospi_val = float("nan")
+            index_failed = True
+        df["v_kospi"] = round(float(vkospi_val), 2)
+        df["지수_실패"] = index_failed
 
         stored_rows = persist_daily_snapshot(df, snapshot_date)
 
@@ -407,4 +441,4 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    asyncio.run(main())
+    asyncio.run(main(force="--force" in sys.argv))  # pragma: no cover

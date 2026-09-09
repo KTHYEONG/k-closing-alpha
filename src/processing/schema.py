@@ -190,6 +190,8 @@ ARCHIVE_COLUMN_ORDER: list[str] = [
     "kosdaq",
     "v_kospi",
     "admitted",
+    "수급_실패",
+    "지수_실패",
 ]
 
 
