@@ -525,3 +525,135 @@ def test_retrain_cost_aware_backtest_missing_price_history_raises(tmp_path, monk
     with pytest.raises(ValueError, match="price_history not found"):
         mod.main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
                   "--no-restore-panel", "--cost-aware-backtest", "--export-dir", str(tmp_path)])
+
+
+def test_retrain_ranker_topk_research_dispatches_and_skips_champion(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    trade_path = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2023-01-03"], "종목코드": ["000001"], "(종가)": [100.0],
+                  "(수익률, %)": [1.0], "(매수 가격)": [100.0], "(매도 가격)": [101.0]}).to_parquet(trade_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    seen: dict[str, object] = {}
+
+    class _Ev:
+        top_k = 3
+        n_paths = 28
+        path_win_rate = 0.893
+        mean_path_delta_bp = 8.04
+        pooled_delta_bp = 10.97
+        p_paired_t = 0.054
+
+    class _Report:
+        verdict = "PASS_POST_REFORM"
+        verdict_reasons = ["ok"]
+        top_k = 3
+        path_evidence = _Ev()
+
+    def _fake_run(ph, market_dates, d_to_idx, **kwargs):
+        seen["rows"] = len(ph)
+        return _Report()
+
+    def _fake_frame(report):
+        seen["framed"] = report.verdict
+        return pd.DataFrame([{"row_type": "path_evidence", "verdict": report.verdict}])
+
+    def _boom_champion(*a, **k):
+        raise AssertionError("champion training must not run in --ranker-topk-research mode")
+
+    monkeypatch.setattr(mod, "run_topk_ranker_backtest", _fake_run)
+    monkeypatch.setattr(mod, "topk_ranker_report_to_frame", _fake_frame)
+    monkeypatch.setattr(mod, "train_tuned_champion_bundle", _boom_champion)
+    monkeypatch.setattr(mod, "train_champion_bundle", _boom_champion)
+
+    main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+          "--no-restore-panel", "--ranker-topk-research", "--export-dir", str(tmp_path)])
+
+    assert seen["rows"] == 40
+    assert seen["framed"] == "PASS_POST_REFORM"
+    assert (tmp_path / "topk_ranker_report.parquet").exists()
+
+
+def test_retrain_ranker_topk_research_missing_price_history_raises(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import pytest
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    trade_path = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2023-01-03"], "종목코드": ["000001"], "(종가)": [100.0],
+                  "(수익률, %)": [1.0], "(매수 가격)": [100.0], "(매도 가격)": [101.0]}).to_parquet(trade_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "nope.parquet")
+
+    with pytest.raises(ValueError, match="price_history not found"):
+        main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+              "--no-restore-panel", "--ranker-topk-research", "--export-dir", str(tmp_path)])
+
+
+def test_retrain_ranker_topk_research_passes_explicit_train_start(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    trade_path = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2023-01-03"], "종목코드": ["000001"], "(종가)": [100.0],
+                  "(수익률, %)": [1.0], "(매수 가격)": [100.0], "(매도 가격)": [101.0]}).to_parquet(trade_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    seen: dict[str, object] = {}
+
+    class _Ev:
+        top_k = 3
+        n_paths = 28
+        n_folds_total = 28
+        n_folds_scored = 28
+        path_win_rate = 1.0
+        mean_path_delta_bp = 9.94
+        pooled_delta_bp = 9.94
+        p_paired_t = 0.068
+
+    class _Report:
+        verdict = "PASS_POST_REFORM"
+        verdict_reasons = ["ok"]
+        top_k = 3
+        train_start = "2021-01-01"
+        path_evidence = _Ev()
+
+    def _fake_run(ph, market_dates, d_to_idx, **kwargs):
+        seen["train_start"] = kwargs.get("train_start")
+        return _Report()
+
+    def _fake_frame(report):
+        seen["framed"] = report.train_start
+        return pd.DataFrame([{"row_type": "path_evidence", "verdict": report.verdict}])
+
+    def _boom(*a, **k):
+        raise AssertionError("champion training must not run in --ranker-topk-research mode")
+
+    monkeypatch.setattr(mod, "run_topk_ranker_backtest", _fake_run)
+    monkeypatch.setattr(mod, "topk_ranker_report_to_frame", _fake_frame)
+    monkeypatch.setattr(mod, "train_tuned_champion_bundle", _boom)
+    monkeypatch.setattr(mod, "train_champion_bundle", _boom)
+
+    # When: the operator widens the training window from the CLI
+    main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+          "--no-restore-panel", "--ranker-topk-research", "--ranker-train-start", "2021-01-01",
+          "--export-dir", str(tmp_path)])
+
+    # Then: the flag reaches the harness as a Timestamp, not a string
+    assert seen["train_start"] == pd.Timestamp("2021-01-01")
+    assert (tmp_path / "topk_ranker_report.parquet").exists()
+
+    # Then: omitting the flag leaves the harness on its certification-regime default
+    seen.clear()
+    main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+          "--no-restore-panel", "--ranker-topk-research", "--export-dir", str(tmp_path)])
+    assert seen["train_start"] is None

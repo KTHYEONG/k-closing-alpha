@@ -1,0 +1,789 @@
+"""Top-K cost-aware ranker research harness tests."""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def _synthetic_prepared_panel() -> tuple[pd.DataFrame, np.ndarray, dict]:
+    """Build a small PIT-prepared panel: 12 symbols x 14 post-reform business days.
+
+    Eight symbols priced 18,000 KRW carry a 10 KRW tick (5.56bp) and clear the
+    7.5bp cap; four priced 30,000 KRW carry a 50 KRW tick (16.67bp) and do not.
+    Every row has chg_ratio 0.05, so the wide pool is 168 rows over 14 days and
+    the cost-capped select pool is 112 rows, 8 per day on all 14 days.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from src.data.panel_integrity import prepare_price_panel
+
+    dates = pd.bdate_range("2023-02-01", periods=14)
+    rng = np.random.default_rng(7)
+    rows = []
+    for i in range(12):
+        base = 18000.0 if i < 8 else 30000.0
+        for d in dates:
+            prev = base / 1.05
+            rows.append({
+                "date": d, "symbol": f"{i:06d}", "open": prev, "high": base * 1.01,
+                "low": prev * 0.99, "close": base, "prev_close": prev, "volume": 1e6,
+                "market_cap_100m": 3000.0, "trade_value_100m": 500.0,
+                "market": "KOSPI" if i % 2 == 0 else "KOSDAQ", "daily_change_pct": 0.05,
+                "inst_netbuy": float(rng.integers(-10**8, 10**8)),
+                "foreign_netbuy": float(rng.integers(-10**8, 10**8)),
+                "program_netbuy": 0.0, "kospi_pct": 0.001, "kosdaq_pct": 0.002,
+                "v_kospi": 18.0, "v_kosdaq": 22.0,
+            })
+    ph, _prov = prepare_price_panel(pd.DataFrame(rows))
+    market_dates = np.array(sorted(ph["date"].unique()))
+    return ph, market_dates, {d: i for i, d in enumerate(market_dates)}
+
+
+def test_assert_nested_universe_specs_accepts_only_cost_cap_difference() -> None:
+    import dataclasses
+
+    import pytest
+
+    from src.ml.topk_ranker_research import assert_nested_universe_specs
+    from src.strategy.contract import COST_AWARE_UNIVERSE, DEFAULT_UNIVERSE
+
+    # Given/When: the shipped pair differs only in max_tick_cost_bp -> accepted
+    assert assert_nested_universe_specs(DEFAULT_UNIVERSE, COST_AWARE_UNIVERSE) is None
+
+    # Then: a train spec that already carries a cap is rejected
+    with pytest.raises(ValueError, match="max_tick_cost_bp"):
+        assert_nested_universe_specs(COST_AWARE_UNIVERSE, COST_AWARE_UNIVERSE)
+
+    # Then: a select spec without a cap is rejected
+    with pytest.raises(ValueError, match="max_tick_cost_bp"):
+        assert_nested_universe_specs(DEFAULT_UNIVERSE, DEFAULT_UNIVERSE)
+
+    # Then: any other differing field is named in the error
+    skewed = dataclasses.replace(COST_AWARE_UNIVERSE, chg_min=0.05)
+    with pytest.raises(ValueError, match="chg_min"):
+        assert_nested_universe_specs(DEFAULT_UNIVERSE, skewed)
+
+
+def test_select_topk_by_score_ranks_descending_and_validates_inputs() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_ranker_research import select_topk_by_score
+
+    # Given: 4 same-day candidates with distinct scores
+    cands = pd.DataFrame({
+        "date": pd.to_datetime(["2023-02-01"] * 4),
+        "symbol": ["S1", "S2", "S3", "S4"],
+        "pred": [0.001, 0.004, 0.003, -0.002],
+    })
+
+    # When
+    picks = select_topk_by_score(cands, 3)
+
+    # Then: highest 3 kept in descending order, S4 dropped
+    assert picks["symbol"].tolist() == ["S2", "S3", "S1"]
+    assert len(picks) == 3
+
+    with pytest.raises(ValueError, match="k must be"):
+        select_topk_by_score(cands, 0)
+    with pytest.raises(ValueError, match="pred"):
+        select_topk_by_score(cands.drop(columns=["pred"]), 3)
+    with pytest.raises(ValueError, match="date"):
+        select_topk_by_score(cands.drop(columns=["date"]), 3)
+
+
+def test_assert_unique_date_symbol_raises_on_cpcv_fold_duplicates() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_ranker_research import assert_unique_date_symbol
+
+    # Given: a clean frame passes
+    clean = pd.DataFrame({
+        "date": pd.to_datetime(["2023-02-01", "2023-02-01"]),
+        "symbol": ["S1", "S2"],
+    })
+    assert assert_unique_date_symbol(clean) is None
+
+    # Given: the measured CPCV shape -- the same pair repeated once per fold
+    dup = pd.DataFrame({
+        "date": pd.to_datetime(["2023-02-01"] * 4),
+        "symbol": ["S1", "S1", "S2", "S2"],
+    })
+
+    # Then: fail closed, reporting duplicate pair count and multiplicity
+    with pytest.raises(ValueError) as exc:  # noqa: PT011 - spec skeleton asserts message content below
+        assert_unique_date_symbol(dup)
+    msg = str(exc.value)
+    assert "2" in msg
+
+
+def test_dedupe_cpcv_oof_collapses_folds_to_one_row_per_pair() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.topk_ranker_research import assert_unique_date_symbol, dedupe_cpcv_oof
+
+    # Given: one date, two symbols, each scored by 2 CPCV folds
+    oof = pd.DataFrame({
+        "date": pd.to_datetime(["2023-02-01"] * 4),
+        "symbol": ["S1", "S1", "S2", "S2"],
+        "cpcv_fold": [0, 1, 0, 1],
+        "pred": [0.002, 0.004, 0.010, 0.010],
+        "net_pit": [0.01, 0.01, -0.02, -0.02],
+        "tick_cost_bp": [5.0, 5.0, 7.0, 7.0],
+    })
+
+    # When
+    out = dedupe_cpcv_oof(oof, value_cols=("net_pit", "tick_cost_bp"))
+
+    # Then: one row per pair, pred averaged, value columns preserved
+    assert len(out) == 2
+    assert assert_unique_date_symbol(out) is None
+    s1 = out[out["symbol"] == "S1"].iloc[0]
+    assert np.isclose(float(s1["pred"]), 0.003)
+    assert np.isclose(float(s1["net_pit"]), 0.01)
+    assert np.isclose(float(s1["tick_cost_bp"]), 5.0)
+
+
+def test_attach_pit_net_label_uses_pit_tick_cost_and_clips_label() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_ranker_research import attach_pit_net_label
+    from src.strategy.contract import AA_COST
+
+    # Given: one ordinary row, one huge-gross row, one NaN tick cost
+    cands = pd.DataFrame({
+        "date": pd.to_datetime(["2023-02-01"] * 3),
+        "symbol": ["S1", "S2", "S3"],
+        "gross_return": [0.02, 0.50, 0.02],
+        "tick_cost_bp": [10.0, 10.0, np.nan],
+    })
+
+    # When
+    out = attach_pit_net_label(cands, cost=AA_COST, label_clip=0.10)
+
+    # Then: net_pit = gross - (20 + 2*tick)/1e4; NaN tick propagates, never 0
+    assert np.isclose(float(out.loc[0, "net_pit"]), 0.016)
+    assert np.isnan(float(out.loc[2, "net_pit"]))
+    # Then: train_label is the clipped net_pit
+    assert np.isclose(float(out.loc[1, "train_label"]), 0.10)
+    assert np.isclose(float(out.loc[0, "train_label"]), 0.016)
+    assert np.isnan(float(out.loc[2, "train_label"]))
+
+    with pytest.raises(ValueError, match="tick_cost_bp"):
+        attach_pit_net_label(cands.drop(columns=["tick_cost_bp"]), cost=AA_COST)
+    with pytest.raises(ValueError, match="gross_return"):
+        attach_pit_net_label(cands.drop(columns=["gross_return"]), cost=AA_COST)
+
+
+def test_compute_yearly_stability_masks_nan_and_reports_each_year() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.topk_ranker_research import compute_yearly_stability
+
+    # Given: two years of daily net returns, one NaN planted in each
+    idx_a = pd.bdate_range("2024-01-01", periods=30)
+    idx_b = pd.bdate_range("2025-01-01", periods=30)
+    vals_a = np.full(30, 0.001, dtype=np.float64)
+    vals_a[0] = np.nan
+    vals_b = np.full(30, 0.004, dtype=np.float64)
+    vals_b[0] = np.nan
+    daily = pd.Series(np.concatenate([vals_a, vals_b]), index=idx_a.append(idx_b))
+
+    # When
+    out = compute_yearly_stability(daily)
+
+    # Then: one record per year, ascending, NaN excluded from n and mean
+    assert [r.year for r in out] == [2024, 2025]
+    assert out[0].n_days == 29
+    assert out[1].n_days == 29
+    assert np.isclose(out[0].mean_net_bp, 10.0)
+    assert np.isclose(out[1].mean_net_bp, 40.0)
+    assert np.isfinite(out[0].median_net_bp)
+
+
+def test_compute_path_evidence_selects_within_fold_not_pooled() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.topk_ranker_research import compute_path_evidence
+
+    # Given: 1 date x 3 symbols x 2 folds. Pooled top-3 would return 3 copies of
+    # the single cheapest symbol (the measured collapse); per-fold top-3 must
+    # average all three distinct symbols instead.
+    rows = []
+    for fold in (0, 1):
+        for sym, tick, net, pred in (
+            ("S1", 4.0, -0.030, 0.005),
+            ("S2", 5.0, 0.030, 0.004),
+            ("S3", 6.0, 0.030, 0.003),
+        ):
+            rows.append({"date": pd.Timestamp("2023-02-01"), "symbol": sym, "cpcv_fold": fold,
+                         "tick_cost_bp": tick, "net_pit": net, "pred": pred})
+    sel = pd.DataFrame(rows)
+
+    # When
+    ev = compute_path_evidence(sel, top_k=3)
+
+    # Then: both folds evaluated; ranker top-3 mean is +0.01 (all three names),
+    # control top-3 mean is identical, so the delta is 0 and no fold is a win.
+    assert ev.n_paths == 2
+    assert ev.top_k == 3
+    assert np.isclose(ev.mean_path_delta_bp, 0.0)
+    assert np.isclose(ev.path_win_rate, 0.0)
+
+
+def test_compute_path_evidence_counts_ranker_wins_and_requires_fold_column() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_ranker_research import compute_path_evidence
+
+    # Given: 2 folds x 1 date x 3 symbols; the ranker's top-1 is the profitable
+    # name while the cheapest name is the loser, so the ranker wins both folds.
+    rows = []
+    for fold in (0, 1):
+        for sym, tick, net, pred in (
+            ("S1", 4.0, -0.010, 0.001),
+            ("S2", 9.0, 0.020, 0.009),
+            ("S3", 5.0, -0.010, 0.002),
+        ):
+            rows.append({"date": pd.Timestamp("2023-02-01"), "symbol": sym, "cpcv_fold": fold,
+                         "tick_cost_bp": tick, "net_pit": net, "pred": pred})
+    sel = pd.DataFrame(rows)
+
+    # When
+    ev = compute_path_evidence(sel, top_k=1)
+
+    # Then: ranker picks S2 (+200bp), control picks S1 (-100bp)
+    assert ev.n_paths == 2
+    assert np.isclose(ev.path_win_rate, 1.0)
+    assert np.isclose(ev.mean_path_delta_bp, 300.0)
+    assert np.isclose(ev.pooled_delta_bp, 300.0)
+
+    # Then: a frame without the fold column fails closed
+    with pytest.raises(ValueError, match="cpcv_fold"):
+        compute_path_evidence(sel.drop(columns=["cpcv_fold"]), top_k=1)
+
+
+def test_evaluate_ranker_verdict_gates_coverage_paths_and_control() -> None:
+    from src.ml.costaware_topk import CostStressPoint, RegimeMetrics
+    from src.ml.topk_ranker_research import (
+        ArmMetrics,
+        PathEvidence,
+        evaluate_ranker_verdict,
+    )
+
+    def _rm(mean: float, median: float, t: float, coverage: str = "OK") -> RegimeMetrics:
+        return RegimeMetrics(
+            regime="post_reform", n_calendar_days=879, n_days_with_signal=878,
+            n_days_feasible=867, feasible_day_fraction=0.9863, coverage_status=coverage,
+            mean_net_bp=mean, median_net_bp=median, std_net_bp=180.0, win_rate=0.56,
+            t_stat=t, sharpe=2.5, ci_low_bp=10.0, ci_high_bp=45.0, dsr=0.9,
+        )
+
+    def _arm(name: str, mean: float, median: float, t: float, coverage: str = "OK",
+             stress_pass: bool = True) -> ArmMetrics:
+        return ArmMetrics(
+            arm=name, top_k=3, regimes={"post_reform": _rm(mean, median, t, coverage)},
+            by_year=[],
+            cost_stress=[CostStressPoint(regime="post_reform", round_trip_ticks=3.0, n_days=878,
+                                         mean_net_bp=24.9, median_net_bp=17.4, t_stat=3.3,
+                                         passes=stress_pass)],
+        )
+
+    good_ev = PathEvidence(top_k=3, n_paths=28, path_win_rate=0.893,
+                           mean_path_delta_bp=8.04, pooled_delta_bp=10.97, p_paired_t=0.054)
+    control = _arm("costsort", 18.75, 5.79, 3.08)
+
+    # Then: all gates satisfied
+    verdict, reasons = evaluate_ranker_verdict(_arm("ranker", 29.72, 18.6, 4.81), control, good_ev)
+    assert verdict == "PASS_POST_REFORM"
+
+    # Then: coverage is checked ahead of any statistic
+    verdict, reasons = evaluate_ranker_verdict(
+        _arm("ranker", 29.72, 18.6, 4.81, coverage="INSUFFICIENT_COVERAGE"), control, good_ev)
+    assert verdict == "INSUFFICIENT_COVERAGE"
+
+    # Then: a path win rate below the gate fails
+    weak_ev = PathEvidence(top_k=3, n_paths=28, path_win_rate=0.464,
+                           mean_path_delta_bp=-0.78, pooled_delta_bp=-0.55, p_paired_t=0.96)
+    verdict, reasons = evaluate_ranker_verdict(_arm("ranker", 29.72, 18.6, 4.81), control, weak_ev)
+    assert verdict == "FAIL"
+    assert any("path_win_rate" in r for r in reasons)
+
+    # Then: not beating the model-free control fails even with strong paths
+    verdict, reasons = evaluate_ranker_verdict(_arm("ranker", 12.0, 4.0, 4.81), control, good_ev)
+    assert verdict == "FAIL"
+    assert any("control" in r for r in reasons)
+
+    # Then: a failing 3-tick stress point fails
+    verdict, reasons = evaluate_ranker_verdict(
+        _arm("ranker", 29.72, 18.6, 4.81, stress_pass=False), control, good_ev)
+    assert verdict == "FAIL"
+
+
+def test_build_dual_pool_returns_wide_pool_with_cost_capped_subset_mask() -> None:
+    import numpy as np
+    import pytest
+
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_ranker_research import build_dual_pool
+    from src.strategy.contract import COST_AWARE_UNIVERSE, DEFAULT_UNIVERSE
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+
+    # When
+    pool, sel_mask = build_dual_pool(
+        ph, market_dates, d_to_idx,
+        train_spec=DEFAULT_UNIVERSE, select_spec=COST_AWARE_UNIVERSE,
+    )
+
+    # Then: the wide pool carries forward-exit and every derived feature column
+    assert len(pool) == 168
+    assert {"gross_return", "tick_cost_bp"}.issubset(pool.columns)
+    assert not [c for c in FEATURE_COLS if c not in pool.columns]
+    # Then: the mask is a strict, non-empty subset of the same frame
+    assert sel_mask.dtype == np.bool_
+    assert len(sel_mask) == len(pool)
+    assert int(sel_mask.sum()) == 112
+    # Then: every selected row respects the PIT tick-cost cap
+    capped = pool.loc[sel_mask, "tick_cost_bp"].to_numpy(dtype=np.float64)
+    assert np.all(capped <= float(COST_AWARE_UNIVERSE.max_tick_cost_bp))
+    assert np.all(pool.loc[~sel_mask, "tick_cost_bp"].to_numpy(dtype=np.float64) > 7.5)
+
+    # Then: a non-nested spec pair fails closed before any panel work
+    with pytest.raises(ValueError, match="max_tick_cost_bp"):
+        build_dual_pool(ph, market_dates, d_to_idx,
+                        train_spec=DEFAULT_UNIVERSE, select_spec=DEFAULT_UNIVERSE)
+
+
+def test_score_pool_cpcv_fails_closed_below_min_rows_and_drops_nan_target() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import score_pool_cpcv
+
+    # Given: 10 dates x 4 symbols with one NaN label planted
+    dates = pd.bdate_range("2023-02-01", periods=10)
+    rows = []
+    rng = np.random.default_rng(3)
+    for d in dates:
+        for s in range(4):
+            rows.append({"date": d, "symbol": f"{s:06d}",  # noqa: PERF401 - spec skeleton
+                         "f1": float(rng.normal()), "f2": float(rng.normal()),
+                         "train_label": float(rng.normal()) * 0.01})
+    train_df = pd.DataFrame(rows)
+    train_df.loc[0, "train_label"] = np.nan
+    cv = CombinatorialPurgedCV(n_groups=8, k_test=2, purge_gap=1, embargo_gap=0)
+
+    # When
+    oof = score_pool_cpcv(train_df, ["f1", "f2"], cv=cv, min_train_rows=10)
+
+    # Then: predictions carry the fold id and the NaN-label row never trains
+    assert "pred" in oof.columns
+    assert "cpcv_fold" in oof.columns
+    assert len(oof) > 0
+    assert np.isfinite(oof["pred"].to_numpy(dtype=np.float64)).all()
+
+    # Then: an undersized pool fails closed rather than training on noise
+    with pytest.raises(ValueError, match="min_train_rows|TRAIN_POOL_MIN_ROWS|rows"):  # noqa: RUF043 - spec skeleton alternation
+        score_pool_cpcv(train_df, ["f1", "f2"], cv=cv, min_train_rows=10_000)
+
+
+def test_compute_arm_metrics_masks_nan_and_carries_regimes_years_and_stress() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.topk_ranker_research import compute_arm_metrics
+    from src.strategy.contract import AA_COST
+
+    # Given: 3 picks/day over 2 pre-reform and 4 post-reform days, one NaN net
+    pre = pd.bdate_range("2022-12-01", periods=2)
+    post = pd.bdate_range("2023-02-01", periods=4)
+    rows = []
+    for d in list(pre) + list(post):
+        for s in range(3):
+            rows.append({"date": d, "symbol": f"{s:06d}", "gross_return": 0.004,  # noqa: PERF401 - spec skeleton
+                         "tick_cost_bp": 6.0, "net_pit": 0.004 - (20.0 + 12.0) / 1e4})
+    picks = pd.DataFrame(rows)
+    picks.loc[0, "net_pit"] = np.nan
+    calendar = pd.DatetimeIndex(list(pre) + list(post))
+    feasibility_full = pd.Series(np.ones(len(calendar), dtype=bool), index=calendar)
+
+    # When
+    arm = compute_arm_metrics(picks, feasibility_full, arm="ranker", top_k=3, cost=AA_COST)
+
+    # Then: all three regimes are present and NaN never propagates into a stat
+    assert arm.arm == "ranker"
+    assert arm.top_k == 3
+    assert set(arm.regimes) == {"pre_reform", "post_reform", "full_history"}
+    assert arm.regimes["post_reform"].n_days_with_signal == 4
+    assert np.isfinite(arm.regimes["post_reform"].mean_net_bp)
+    assert np.isclose(arm.regimes["post_reform"].mean_net_bp, 8.0)
+    assert arm.regimes["post_reform"].coverage_status == "OK"
+    # Then: per-year stability is reported, never aggregated away
+    assert [y.year for y in arm.by_year] == [2022, 2023]
+    # Then: the round-trip-tick stress grid is carried for the post-reform slice
+    assert [p.round_trip_ticks for p in arm.cost_stress] == [2.0, 3.0, 4.0]
+    assert all(p.regime == "post_reform" for p in arm.cost_stress)
+
+
+def test_run_topk_ranker_backtest_reports_both_arms_and_rejects_k_below_min() -> None:
+    import dataclasses
+
+    import pytest
+
+    from src.ml.costaware_topk import MIN_TOP_K
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import TopKRankerReport, run_topk_ranker_backtest
+    from src.strategy.contract import KCA_TOPK_COSTAWARE_001
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    cv = CombinatorialPurgedCV(n_groups=8, k_test=2, purge_gap=1, embargo_gap=0)
+
+    # When
+    report = run_topk_ranker_backtest(
+        ph, market_dates, d_to_idx, spec=KCA_TOPK_COSTAWARE_001,
+        cv=cv, min_train_rows=10,
+    )
+
+    # Then: both arms scored at the same k, over the post-reform regime
+    assert isinstance(report, TopKRankerReport)
+    assert report.top_k == 3
+    assert report.ranker.arm == "ranker"
+    assert report.control.arm == "costsort"
+    assert report.control.top_k == report.ranker.top_k
+    assert set(report.ranker.regimes) == {"pre_reform", "post_reform", "full_history"}
+    assert report.path_evidence.top_k == 3
+    assert report.path_evidence.n_paths > 0
+    assert report.verdict in {"PASS_POST_REFORM", "FAIL", "INSUFFICIENT_COVERAGE"}
+    assert report.n_select_rows < report.n_train_rows
+    # Then: the cost cap is recorded on the select universe only
+    assert report.select_universe["max_tick_cost_bp"] is not None
+    assert report.train_universe["max_tick_cost_bp"] is None
+
+    # Then: k below the investable minimum is rejected by measurement
+    thin = dataclasses.replace(KCA_TOPK_COSTAWARE_001, top_k=MIN_TOP_K - 1)
+    with pytest.raises(ValueError, match="top_k"):
+        run_topk_ranker_backtest(ph, market_dates, d_to_idx, spec=thin, cv=cv, min_train_rows=10)
+
+
+def test_topk_ranker_report_to_frame_flattens_every_row_type() -> None:
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import (
+        run_topk_ranker_backtest,
+        topk_ranker_report_to_frame,
+    )
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    cv = CombinatorialPurgedCV(n_groups=8, k_test=2, purge_gap=1, embargo_gap=0)
+    report = run_topk_ranker_backtest(ph, market_dates, d_to_idx, cv=cv, min_train_rows=10)
+
+    # When
+    frame = topk_ranker_report_to_frame(report)
+
+    # Then: every row type is present and self-describing
+    assert set(frame["row_type"].unique()) >= {"regime", "cost_stress", "path_evidence"}
+    assert set(frame.loc[frame["row_type"] == "regime", "arm"].unique()) == {"ranker", "costsort"}
+    assert frame["strategy_id"].nunique() == 1
+    assert (frame["top_k"] == report.top_k).all()
+    assert (frame["verdict"] == report.verdict).all()
+
+
+def test_main_writes_report_and_fails_closed_on_missing_price_history(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    import logging
+
+    import pytest
+
+    import src.ml.topk_ranker_research as mod
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    ph_path = tmp_path / "price_history.parquet"
+    ph_path.write_text("stub")
+    seen: dict[str, object] = {}
+
+    def _fake_load(path):
+        seen["path"] = str(path)
+        return ph, market_dates, d_to_idx
+
+    def _fake_run(_ph, _md, _d2i, **kwargs):
+        seen["top_k"] = kwargs["spec"].top_k
+        return mod.TopKRankerReport(
+            strategy_id="KCA-TOPK-COSTAWARE-001", top_k=int(kwargs["spec"].top_k),
+            train_universe={}, select_universe={}, cost={}, date_min="2023-02-01",
+            date_max="2023-02-20", n_train_rows=168, n_select_rows=32,
+            ranker=mod.ArmMetrics(arm="ranker", top_k=int(kwargs["spec"].top_k), regimes={},
+                                  by_year=[], cost_stress=[]),
+            control=mod.ArmMetrics(arm="costsort", top_k=int(kwargs["spec"].top_k), regimes={},
+                                   by_year=[], cost_stress=[]),
+            path_evidence=mod.PathEvidence(top_k=int(kwargs["spec"].top_k), n_paths=28,
+                                           path_win_rate=0.893, mean_path_delta_bp=8.04,
+                                           pooled_delta_bp=10.97, p_paired_t=0.054),
+            verdict="PASS_POST_REFORM", verdict_reasons=["ok"],
+        )
+
+    monkeypatch.setattr(mod, "load_and_prepare_price_history", _fake_load)
+    monkeypatch.setattr(mod, "run_topk_ranker_backtest", _fake_run)
+
+    out = tmp_path / "report.parquet"
+    with caplog.at_level(logging.INFO, logger="src.ml.topk_ranker_research"):
+        mod.main(["--price-history", str(ph_path), "--top-k", "5", "--out", str(out)])
+
+    assert seen["top_k"] == 5
+    assert out.exists()
+    assert "PASS_POST_REFORM" in caplog.text
+
+    with pytest.raises(ValueError, match="price_history not found"):
+        mod.main(["--price-history", str(tmp_path / "nope.parquet"),
+                  "--out", str(tmp_path / "x.parquet")])
+
+
+def _two_regime_prepared_panel() -> tuple[pd.DataFrame, np.ndarray, dict]:
+    """Build a PIT-prepared panel straddling the 2023-01-25 tick reform.
+
+    Eight KOSDAQ symbols priced 190,000 KRW carry a 100 KRW tick (5.26bp) and
+    clear the 7.5bp cap in BOTH regimes, so pre-reform rows enter the select
+    pool on cost grounds alone -- only the training window can exclude them.
+    Four KOSPI symbols priced 30,000 KRW (16.67bp) never clear the cap.
+    Yields 312 pool rows over 26 days: 96 pre-reform and 112 post-reform
+    select rows, 8 per day in each regime.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from src.data.panel_integrity import prepare_price_panel
+
+    pre_d = pd.bdate_range("2022-12-01", periods=12)
+    post_d = pd.bdate_range("2023-02-01", periods=14)
+    rng = np.random.default_rng(11)
+    rows = []
+    for i in range(12):
+        base, mkt = (190000.0, "KOSDAQ") if i < 8 else (30000.0, "KOSPI")
+        for d in list(pre_d) + list(post_d):
+            prev = base / 1.05
+            rows.append({
+                "date": d, "symbol": f"{i:06d}", "open": prev, "high": base * 1.01,
+                "low": prev * 0.99, "close": base, "prev_close": prev, "volume": 1e6,
+                "market_cap_100m": 3000.0, "trade_value_100m": 500.0, "market": mkt,
+                "daily_change_pct": 0.05,
+                "inst_netbuy": float(rng.integers(-10**8, 10**8)),
+                "foreign_netbuy": float(rng.integers(-10**8, 10**8)),
+                "program_netbuy": 0.0, "kospi_pct": 0.001, "kosdaq_pct": 0.002,
+                "v_kospi": 18.0, "v_kosdaq": 22.0,
+            })
+    ph, _prov = prepare_price_panel(pd.DataFrame(rows))
+    market_dates = np.array(sorted(ph["date"].unique()))
+    return ph, market_dates, {d: i for i, d in enumerate(market_dates)}
+
+
+
+def test_split_regime_frames_separates_certification_rows_from_history() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_ranker_research import CERT_REGIME_START, split_regime_frames
+
+    # Given: rows straddling the 2023-01-25 tick reform
+    frame = pd.DataFrame({
+        "date": pd.to_datetime(
+            ["2021-06-01", "2022-06-01", "2023-01-24", "2023-01-25", "2023-02-01"]
+        ),
+        "symbol": ["S1", "S2", "S3", "S4", "S5"],
+        "train_label": [0.01, 0.01, 0.01, 0.01, 0.01],
+    })
+
+    # When: the default window keeps no pre-reform history
+    cert, hist = split_regime_frames(frame, train_start=CERT_REGIME_START)
+
+    # Then: the reform date itself certifies; history is empty
+    assert cert["symbol"].tolist() == ["S4", "S5"]
+    assert len(hist) == 0
+
+    # When: the window is widened to 2022 (the knob is augmentation only)
+    cert2, hist2 = split_regime_frames(frame, train_start=pd.Timestamp("2022-01-01"))
+
+    # Then: the certification frame is UNCHANGED -- widening never moves the boundary
+    assert cert2["symbol"].tolist() == ["S4", "S5"]
+    assert hist2["symbol"].tolist() == ["S2", "S3"]
+
+    # Then: a train_start after the certification start is rejected, since it would
+    # silently shrink the certification regime instead of augmenting training
+    with pytest.raises(ValueError, match="train_start"):
+        split_regime_frames(frame, train_start=pd.Timestamp("2023-06-01"))
+
+    # Then: a missing date column fails closed
+    with pytest.raises(ValueError, match="date"):
+        split_regime_frames(frame.drop(columns=["date"]), train_start=CERT_REGIME_START)
+
+def test_cpcv_score_with_history_bins_on_certification_rows_only() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import cpcv_score_with_history
+
+    rng = np.random.default_rng(5)
+
+    def _rows(dates: pd.DatetimeIndex) -> pd.DataFrame:
+        out = []
+        for d in dates:
+            for s in range(4):
+                out.append({"date": d, "symbol": f"{s:06d}",  # noqa: PERF401 - spec skeleton
+                            "f1": float(rng.normal()), "f2": float(rng.normal()),
+                            "train_label": float(rng.normal()) * 0.01})
+        return pd.DataFrame(out)
+
+    cert = _rows(pd.bdate_range("2023-02-01", periods=10))
+    hist = _rows(pd.bdate_range("2022-06-01", periods=20))
+    cv = CombinatorialPurgedCV(n_groups=8, k_test=2, purge_gap=1, embargo_gap=0)
+
+    # When
+    oof = cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=10)
+
+    # Then: every scored row is a certification row -- history trains, never scores
+    assert len(oof) > 0
+    assert (pd.to_datetime(oof["date"]) >= pd.Timestamp("2023-02-01")).all()
+    assert oof["cpcv_fold"].nunique() == 28
+    assert np.isfinite(oof["pred"].to_numpy(dtype=np.float64)).all()
+
+    # Then: an empty history frame is the ordinary default path, not an error
+    oof_no_hist = cpcv_score_with_history(cert, hist.iloc[0:0], ["f1", "f2"], cv=cv, min_train_rows=10)
+    assert oof_no_hist["cpcv_fold"].nunique() == 28
+
+    # Then: a starved training pool fails closed rather than training on noise
+    with pytest.raises(ValueError, match="min_train_rows"):
+        cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=100_000)
+
+def test_compute_path_evidence_rejects_pre_certification_regime_rows() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_ranker_research import CERT_REGIME_START, compute_path_evidence
+
+    # Given: the exact defect that produced the shipped FAIL -- pre-reform rows,
+    # where the select pool is ~1.8 names/day, pooled into the fold deltas.
+    rows = []
+    for fold in (0, 1):
+        for day in ("2022-12-01", "2023-02-01"):
+            for sym, tick, net, pred in (
+                ("S1", 4.0, -0.010, 0.001),
+                ("S2", 9.0, 0.020, 0.009),
+                ("S3", 5.0, -0.010, 0.002),
+            ):
+                rows.append({"date": pd.Timestamp(day), "symbol": sym, "cpcv_fold": fold,
+                             "tick_cost_bp": tick, "net_pit": net, "pred": pred})
+    polluted = pd.DataFrame(rows)
+
+    # Then: fail closed naming the regime boundary, never silently pool
+    with pytest.raises(ValueError, match="2023-01-25|certification regime"):  # noqa: RUF043 - spec skeleton alternation
+        compute_path_evidence(polluted, top_k=3)
+
+    # When: only certification-regime rows are supplied
+    clean = polluted[pd.to_datetime(polluted["date"]) >= CERT_REGIME_START]
+    ev = compute_path_evidence(clean, top_k=1)
+
+    # Then: it scores normally -- ranker takes S2 (+200bp), control takes S1 (-100bp)
+    assert ev.n_paths == 2
+    assert ev.path_win_rate == 1.0
+    assert round(ev.mean_path_delta_bp, 2) == 300.0
+
+def test_compute_path_evidence_reports_fold_accounting_and_fails_on_thin_coverage() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_ranker_research import compute_path_evidence
+
+    def _frame(n_folds: int, n_blank: int) -> pd.DataFrame:
+        rows = []
+        for fold in range(n_folds):
+            blank = fold < n_blank
+            for sym, tick, net, pred in (
+                ("S1", 4.0, -0.010, 0.001),
+                ("S2", 9.0, 0.020, 0.009),
+                ("S3", 5.0, -0.010, 0.002),
+            ):
+                rows.append({
+                    "date": pd.Timestamp("2023-02-01"), "symbol": sym, "cpcv_fold": fold,
+                    "tick_cost_bp": tick, "pred": pred,
+                    # a blank fold carries no usable label, mirroring folds whose
+                    # test bins hold no scorable certification-regime day
+                    "net_pit": np.nan if blank else net,
+                })
+        return pd.DataFrame(rows)
+
+    # When: 10 folds, 1 unscorable -> exactly at the 0.90 floor
+    ev = compute_path_evidence(_frame(10, 1), top_k=1)
+
+    # Then: the silent drop is now visible in the payload
+    assert ev.n_folds_total == 10
+    assert ev.n_folds_scored == 9
+    assert ev.n_paths == 9
+    assert ev.path_win_rate == 1.0
+
+    # Then: below the floor it fails closed instead of certifying on a thinned path set
+    with pytest.raises(ValueError, match="scored"):
+        compute_path_evidence(_frame(10, 4), top_k=1)
+
+def test_run_topk_ranker_backtest_defaults_train_start_to_certification_regime() -> None:
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import CERT_REGIME_START, run_topk_ranker_backtest
+
+    ph, market_dates, d_to_idx = _two_regime_prepared_panel()
+    cv = CombinatorialPurgedCV(n_groups=8, k_test=2, purge_gap=1, embargo_gap=0)
+
+    # When: the default training window is used
+    report = run_topk_ranker_backtest(ph, market_dates, d_to_idx, cv=cv, min_train_rows=10)
+
+    # Then: the window is recorded explicitly, never left implicit
+    assert report.train_start == str(CERT_REGIME_START.date())
+    assert report.certification_regime_start == "2023-01-25"
+
+    # Then: 96 pre-reform rows cleared the cost cap yet none was scored --
+    # only the training window excluded them
+    assert report.n_select_rows == 208
+    assert report.ranker.regimes["pre_reform"].n_days_with_signal == 0
+    assert report.ranker.regimes["post_reform"].n_days_with_signal > 0
+
+    # Then: every CPCV fold carries certification-regime evidence
+    ev = report.path_evidence
+    assert ev.n_folds_total == 28
+    assert ev.n_folds_scored == 28
+    assert ev.n_paths == 28
+    assert report.verdict in {"PASS_POST_REFORM", "FAIL", "INSUFFICIENT_COVERAGE"}
+
+def test_run_topk_ranker_backtest_widened_window_never_moves_the_boundary() -> None:
+    import pandas as pd
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import run_topk_ranker_backtest
+
+    ph, market_dates, d_to_idx = _two_regime_prepared_panel()
+    cv = CombinatorialPurgedCV(n_groups=8, k_test=2, purge_gap=1, embargo_gap=0)
+
+    # When: an operator widens the window past the reform (probe: every window passes)
+    report = run_topk_ranker_backtest(
+        ph, market_dates, d_to_idx, cv=cv, min_train_rows=10,
+        train_start=pd.Timestamp("2000-01-01"),
+    )
+
+    # Then: the requested window is recorded verbatim for audit
+    assert report.train_start == "2000-01-01"
+    # Then: the certification boundary and the fold count are UNCHANGED --
+    # widening augments training only, it never re-bins or re-scopes the verdict
+    assert report.certification_regime_start == "2023-01-25"
+    assert report.path_evidence.n_folds_total == 28
+    assert report.path_evidence.n_folds_scored == 28
+    assert report.ranker.regimes["pre_reform"].n_days_with_signal == 0

@@ -15,6 +15,7 @@ from src.data.panel_integrity import load_price_panel
 from src.ml.bundle import CHAMPION_DEFAULT_MODEL_PARAMS
 from src.ml.champion import train_champion_bundle, train_tuned_champion_bundle
 from src.ml.costaware_topk import report_to_frame, run_cost_aware_topk_backtest
+from src.ml.topk_ranker_research import run_topk_ranker_backtest, topk_ranker_report_to_frame
 from src.ml.tuning import ChampionTuningConfig
 from src.ml.universe import SCREEN_REGISTRY
 from src.ml.universe_research import DEFAULT_RESEARCH_SCREENS, run_universe_screen_grid
@@ -44,6 +45,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-restore-panel", action="store_true", help="train on the raw trade log only; skip condition_history/archive panel restoration")
     parser.add_argument("--universe-research", action="store_true", help="reconstruct full-market panels for a ScreenConfig family, train the ranker on each, print/save the model-free-vs-ranked-vs-CPCV comparison; skips champion training")
     parser.add_argument("--cost-aware-backtest", action="store_true", help="run the model-free COST_AWARE top-k regime-gated backtest against full price_history; skips champion training")
+    parser.add_argument("--ranker-topk-research", action="store_true", help="train the ranker on the wide screen pool, select top-k from the cost-capped pool, and score it against the model-free cost-sort control on the post-reform regime; skips champion training")
+    parser.add_argument("--ranker-train-start", default=None, help="widen the ranker training window to this YYYY-MM-DD start; augments training only and never moves the certification boundary (default: the certification regime start)")
     parser.add_argument("--label-mode", default="mechanical", choices=["journaled", "mechanical"])
     parser.add_argument("--screen", default="operator_legacy", choices=["operator_legacy", "band_2_15", "band_5_15_highvalue"])
     parser.add_argument("--scenario-source", default="manual", choices=["manual", "auto", "none"], help="manual: keep the journaled 차트분석; auto: derive it from price_history; none: drop the scenario feature block")
@@ -140,6 +143,18 @@ def main(argv: list[str] | None = None) -> None:
         report = run_cost_aware_topk_backtest(ph, market_dates, d_to_idx)
         atomic_write_parquet(report_to_frame(report), Path(args.export_dir) / "costaware_topk_report.parquet")
         logger.info("[EVAL] stage=costaware_topk verdict=%s reasons=%s", report.verdict, report.verdict_reasons)
+        return
+
+    if args.ranker_topk_research:
+        from src.ml.research.v3_engine import load_and_prepare_price_history
+
+        if not os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH):
+            raise ValueError(f"price_history not found: {settings.PRICE_HISTORY_PARQUET_PATH}")
+        ph, market_dates, d_to_idx = load_and_prepare_price_history(settings.PRICE_HISTORY_PARQUET_PATH)
+        train_start = pd.Timestamp(args.ranker_train_start) if args.ranker_train_start else None
+        report = run_topk_ranker_backtest(ph, market_dates, d_to_idx, train_start=train_start)
+        atomic_write_parquet(topk_ranker_report_to_frame(report), Path(args.export_dir) / "topk_ranker_report.parquet")
+        logger.info("[EVAL] stage=topk_ranker verdict=%s reasons=%s", report.verdict, report.verdict_reasons)
         return
 
     if args.tuned:
