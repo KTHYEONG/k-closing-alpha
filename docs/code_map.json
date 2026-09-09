@@ -160,10 +160,7 @@
     "testing": "tests/unit/data/test_candidate_panel.py"
   },
   "src/data/data_loader.py": {
-    "testing": "tests/unit/data/test_db_loader.py"
-  },
-  "src/data/db_loader.py": {
-    "testing": "tests/unit/data/test_db_loader.py"
+    "testing": "tests/unit/data/test_data_loader.py"
   },
   "src/data/intraday_schema.py": {
     "testing": "tests/unit/data/test_intraday_schema.py"
@@ -330,6 +327,6 @@
     "testing": "tests/unit/utils/test_display.py"
   },
   "src/utils/export_archive.py": {
-    "testing": "tests/unit/utils/test_export_spreadsheet.py"
+    "testing": "tests/unit/utils/test_export_archive.py"
   }
 }
