@@ -657,3 +657,59 @@ def test_retrain_ranker_topk_research_passes_explicit_train_start(tmp_path, monk
     main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
           "--no-restore-panel", "--ranker-topk-research", "--export-dir", str(tmp_path)])
     assert seen["train_start"] is None
+
+
+def test_retrain_train_ranker_bundle_dispatches_and_skips_champion(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    trade_path = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2023-01-03"], "종목코드": ["000001"], "(종가)": [100.0],
+                  "(수익률, %)": [1.0], "(매수 가격)": [100.0], "(매도 가격)": [101.0]}).to_parquet(trade_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    seen: dict[str, object] = {}
+
+    def _fake_train(ph, market_dates, d_to_idx, **kwargs):
+        seen["rows"] = len(ph)
+        return {"feature_cols": ["f1"], "rank_model": object(), "quantile_models": {},
+                "calibrators": {}, "top_k": 3}
+
+    def _fake_save(bundle, export_dir):
+        seen["export_dir"] = export_dir
+        seen["bundle_top_k"] = bundle["top_k"]
+        return str(tmp_path / "topk_ranker" / "sizing_pipeline_bundle.joblib")
+
+    def _boom(*a, **k):
+        raise AssertionError("champion training must not run in --train-ranker-bundle mode")
+
+    monkeypatch.setattr(mod, "train_production_bundle", _fake_train)
+    monkeypatch.setattr(mod, "save_production_bundle", _fake_save)
+    monkeypatch.setattr(mod, "train_tuned_champion_bundle", _boom)
+    monkeypatch.setattr(mod, "train_champion_bundle", _boom)
+
+    main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+          "--no-restore-panel", "--train-ranker-bundle", "--export-dir", str(tmp_path)])
+
+    assert seen["rows"] == 40
+    assert seen["bundle_top_k"] == 3
+
+
+def test_retrain_train_ranker_bundle_missing_price_history_raises(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import pytest
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    trade_path = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2023-01-03"], "종목코드": ["000001"], "(종가)": [100.0],
+                  "(수익률, %)": [1.0], "(매수 가격)": [100.0], "(매도 가격)": [101.0]}).to_parquet(trade_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "nope.parquet")
+
+    with pytest.raises(ValueError, match="price_history not found"):
+        main(["--trade-log", str(trade_path), "--theme", str(tmp_path / "missing.parquet"),
+              "--no-restore-panel", "--train-ranker-bundle", "--export-dir", str(tmp_path)])

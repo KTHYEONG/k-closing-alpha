@@ -787,3 +787,209 @@ def test_run_topk_ranker_backtest_widened_window_never_moves_the_boundary() -> N
     assert report.path_evidence.n_folds_total == 28
     assert report.path_evidence.n_folds_scored == 28
     assert report.ranker.regimes["pre_reform"].n_days_with_signal == 0
+
+
+def _synthetic_bundle_and_fixture() -> tuple[dict, "pd.DataFrame"]:  # noqa: UP037 - spec skeleton
+    """A minimal 4-feature production bundle plus a matching 2-symbol snapshot.
+
+    Trains via the real build_inline_bundle recipe on synthetic data so the
+    bundle satisfies load_model_bundle's schema (rank_model/quantile_models/
+    calibrators) exactly like a real production bundle would.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.bundle import build_inline_bundle
+
+    rng = np.random.default_rng(3)
+    dates = pd.bdate_range("2023-02-01", periods=30)
+    rows = []
+    for d in dates:
+        for s in range(5):
+            rows.append({  # noqa: PERF401 - spec skeleton
+                "date": d, "symbol": f"{s:06d}",
+                "chg_ratio": float(rng.uniform(0.02, 0.10)),
+                "log_tv": float(rng.normal(6, 1)),
+                "train_label": float(rng.normal(0, 0.01)),
+            })
+    df = pd.DataFrame(rows)
+    bundle = build_inline_bundle(df, ["chg_ratio", "log_tv"], "train_label", "date")
+    bundle["feature_cols"] = ["chg_ratio", "log_tv"]
+
+    snapshot = pd.DataFrame({
+        "date": pd.Timestamp("2023-03-15"),
+        "symbol": ["000001", "000002", "000003"],
+        "chg_ratio": [0.05, 0.03, 0.08],
+        "log_tv": [6.1, 5.9, 6.5],
+    })
+    return bundle, snapshot
+
+
+def test_train_production_bundle_trains_on_certification_regime_wide_pool() -> None:
+    from src.ml.topk_ranker_research import CERT_REGIME_START, train_production_bundle
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+
+    # When
+    bundle = train_production_bundle(ph, market_dates, d_to_idx, min_train_rows=10)
+
+    # Then: satisfies load_model_bundle's schema and carries audit provenance
+    assert bundle["feature_cols"]
+    for key in ("rank_model", "return_model", "quantile_models", "calibrators"):
+        assert key in bundle
+    assert bundle["train_start"] == str(CERT_REGIME_START.date())
+    assert bundle["certification_regime_start"] == str(CERT_REGIME_START.date())
+    assert bundle["top_k"] == 3
+    assert bundle["select_universe"]["max_tick_cost_bp"] is not None
+
+
+def test_train_production_bundle_fails_closed_below_min_train_rows() -> None:
+    import pytest
+
+    from src.ml.topk_ranker_research import train_production_bundle
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+
+    with pytest.raises(ValueError, match="min_train_rows"):
+        train_production_bundle(ph, market_dates, d_to_idx, min_train_rows=1_000_000)
+
+
+def test_save_production_bundle_writes_joblib_loadable_by_load_model_bundle(tmp_path) -> None:
+    from src.serving.realtime.artifacts import load_model_bundle
+    from src.ml.topk_ranker_research import save_production_bundle, train_production_bundle
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    bundle = train_production_bundle(ph, market_dates, d_to_idx, min_train_rows=10)
+    export_dir = str(tmp_path / "topk_ranker")
+
+    # When
+    path = save_production_bundle(bundle, export_dir=export_dir)
+
+    # Then: the artifact round-trips through the EXISTING, unmodified loader
+    assert path.startswith(export_dir)
+    reloaded = load_model_bundle(import_dir=export_dir)
+    assert reloaded["feature_cols"] == bundle["feature_cols"]
+    assert reloaded["top_k"] == 3
+
+
+def test_select_topk_equal_weight_selects_by_rank_score_and_allocates_equally() -> None:
+    import numpy as np
+
+    from src.ml.costaware_topk import MIN_TOP_K
+    from src.ml.topk_ranker_research import select_topk_equal_weight
+
+    bundle, snapshot = _synthetic_bundle_and_fixture()
+
+    # When: top_k matches the certified minimum (3 == the fixture's 3 rows)
+    out = select_topk_equal_weight(snapshot, bundle, top_k=MIN_TOP_K)
+
+    # Then: every row is kept (only 3 candidates for k=3), scored, and
+    # equally weighted
+    assert len(out) == 3
+    assert "pred" in out.columns
+    assert np.allclose(out["allocation"].to_numpy(dtype=np.float64), 1.0 / MIN_TOP_K)
+    # Then: diagnostic-only quantile/probability columns are attached but
+    # never drive selection or allocation
+    for col in ("pred_q10", "pred_q50", "pred_q90", "p_good", "p_bad"):
+        assert col in out.columns
+    # Then: rows are ordered by descending pred (highest score first)
+    preds = out["pred"].to_numpy(dtype=np.float64)
+    assert (preds[:-1] >= preds[1:]).all()
+
+
+def test_select_topk_equal_weight_rejects_non_certified_top_k() -> None:
+    import pytest
+
+    from src.ml.topk_ranker_research import select_topk_equal_weight
+
+    bundle, snapshot = _synthetic_bundle_and_fixture()
+
+    with pytest.raises(ValueError, match="top_k"):
+        select_topk_equal_weight(snapshot, bundle, top_k=1)
+
+
+def test_select_topk_equal_weight_fills_missing_feature_columns_with_zero() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.costaware_topk import MIN_TOP_K
+    from src.ml.topk_ranker_research import select_topk_equal_weight
+
+    bundle, snapshot = _synthetic_bundle_and_fixture()
+    # Given: the live snapshot is missing one of the bundle's declared features
+    thin = snapshot.drop(columns=["log_tv"])
+
+    # When
+    out = select_topk_equal_weight(thin, bundle, top_k=MIN_TOP_K)
+
+    # Then: it does not raise -- the missing column is filled with 0.0,
+    # matching predict_daily_sizing's existing convention
+    assert len(out) == 3
+    assert np.isfinite(out["pred"].to_numpy(dtype=np.float64)).all()
+
+
+def test_train_production_bundle_rejects_top_k_below_min() -> None:
+    import dataclasses
+
+    import pytest
+
+    from src.ml.costaware_topk import MIN_TOP_K
+    from src.ml.topk_ranker_research import train_production_bundle
+    from src.strategy.contract import KCA_TOPK_COSTAWARE_001
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    thin_spec = dataclasses.replace(KCA_TOPK_COSTAWARE_001, top_k=MIN_TOP_K - 1)
+
+    with pytest.raises(ValueError, match="top_k"):
+        train_production_bundle(ph, market_dates, d_to_idx, spec=thin_spec, min_train_rows=10)
+
+
+def test_select_topk_equal_weight_rejects_empty_feature_cols() -> None:
+    import pytest
+
+    from src.ml.costaware_topk import MIN_TOP_K
+    from src.ml.topk_ranker_research import select_topk_equal_weight
+
+    bundle, snapshot = _synthetic_bundle_and_fixture()
+    bundle["feature_cols"] = []
+
+    with pytest.raises(ValueError, match="feature_cols"):
+        select_topk_equal_weight(snapshot, bundle, top_k=MIN_TOP_K)
+
+
+def test_select_topk_equal_weight_uses_float_fallback_for_degenerate_calibrator() -> None:
+    import pandas as pd
+
+    from src.ml.bundle import build_inline_bundle
+    from src.ml.costaware_topk import MIN_TOP_K
+    from src.ml.topk_ranker_research import select_topk_equal_weight
+
+    # Given: every training label sits below the p_good threshold (0.01) and
+    # above the p_bad threshold (-0.02) -- both calibrators degenerate to a
+    # constant float fallback (single-class labels, build_inline_bundle's
+    # _fit_calibrator_cv contract)
+    dates = pd.bdate_range("2023-02-01", periods=10)
+    rows = [
+        {"date": d, "symbol": f"{s:06d}", "chg_ratio": 0.05, "log_tv": 6.0, "train_label": -0.005}
+        for d in dates for s in range(5)
+    ]
+    df = pd.DataFrame(rows)
+    bundle = build_inline_bundle(df, ["chg_ratio", "log_tv"], "train_label", "date")
+    bundle["feature_cols"] = ["chg_ratio", "log_tv"]
+    assert isinstance(bundle["calibrators"]["p_good"], float)
+    assert isinstance(bundle["calibrators"]["p_bad"], float)
+
+    snapshot = pd.DataFrame({
+        "date": pd.Timestamp("2023-03-15"),
+        "symbol": ["000001", "000002", "000003"],
+        "chg_ratio": [0.05, 0.03, 0.08],
+        "log_tv": [6.1, 5.9, 6.5],
+    })
+
+    # When
+    out = select_topk_equal_weight(snapshot, bundle, top_k=MIN_TOP_K)
+
+    # Then: the constant float fallback is broadcast to every row, never a
+    # classifier predict_proba call
+    assert (out["p_good"] == bundle["calibrators"]["p_good"]).all()
+    assert (out["p_bad"] == bundle["calibrators"]["p_bad"]).all()

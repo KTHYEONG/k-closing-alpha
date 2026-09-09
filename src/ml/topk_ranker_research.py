@@ -19,6 +19,7 @@ from scipy.stats import ttest_rel
 from src import settings
 from src.data.io_utils import atomic_write_parquet
 from src.execution.cost_model import TICK_REFORM_DATE
+from src.ml.bundle import build_inline_bundle
 from src.ml.costaware_topk import (
     MIN_POST_REFORM_T_STAT,
     MIN_TOP_K,
@@ -60,6 +61,7 @@ RANKER_MODEL_PARAMS: dict[str, Any] = {"n_estimators": 60, "learning_rate": 0.03
 LABEL_CLIP: float = 0.10
 CERT_REGIME_START: pd.Timestamp = pd.Timestamp(TICK_REFORM_DATE)
 MIN_SCORED_FOLD_FRACTION: float = 0.90
+TOPK_RANKER_BUNDLE_DIR: str = "artifacts/models/topk_ranker"
 
 
 @dataclass(frozen=True)
@@ -782,6 +784,137 @@ def topk_ranker_report_to_frame(report: TopKRankerReport) -> pd.DataFrame:
     ev["verdict"] = report.verdict
     rows.append(ev)
     return pd.DataFrame(rows)
+
+
+def train_production_bundle(
+    ph: pd.DataFrame,
+    market_dates: np.ndarray,
+    d_to_idx: dict[pd.Timestamp, int],
+    *,
+    spec: StrategySpec = KCA_TOPK_COSTAWARE_001,
+    train_spec: UniverseSpec = DEFAULT_UNIVERSE,
+    train_start: pd.Timestamp | None = None,
+    model_params: dict[str, Any] | None = None,
+    huber_delta: float = 0.9,
+    min_train_rows: int = TRAIN_POOL_MIN_ROWS,
+) -> dict[str, Any]:
+    """Train one final production bundle on the certification-regime wide pool.
+
+    Args:
+        ph: Prepared price-history panel.
+        market_dates: Full trading calendar.
+        d_to_idx: Date-to-index lookup for forward exits.
+        spec: Strategy specification carrying top_k, select universe and cost.
+        train_spec: Wide training screen without the cost cap.
+        train_start: Training-window start; None selects CERT_REGIME_START.
+        model_params: LightGBM params forwarded to build_inline_bundle.
+        huber_delta: Huber alpha for the return model.
+        min_train_rows: Fail-closed floor on finite-label rows.
+
+    Returns:
+        Extended bundle dict with audit provenance keys.
+
+    Raises:
+        ValueError: When spec.top_k is below MIN_TOP_K or finite rows are short.
+    """
+    if int(spec.top_k) < MIN_TOP_K:
+        raise ValueError(f"top_k {spec.top_k} below the minimum investable K {MIN_TOP_K}")
+    eff_train_start = CERT_REGIME_START if train_start is None else pd.Timestamp(train_start)
+    # 인증구간 와이드 풀 조립 후 PIT 라벨 부착
+    pool, _sel_mask = build_dual_pool(
+        ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe
+    )
+    labeled = attach_pit_net_label(pool, cost=spec.cost)
+    cert_df, hist_df = split_regime_frames(labeled, train_start=eff_train_start)
+    train_df = pd.concat([hist_df, cert_df]) if len(hist_df) else cert_df
+    labels = train_df["train_label"].to_numpy(dtype=np.float64)
+    fit_df = train_df[np.isfinite(labels)]
+    if len(fit_df) < int(min_train_rows):
+        raise ValueError(
+            f"finite train_label rows {len(fit_df)} below min_train_rows {min_train_rows}"
+        )
+    bundle = build_inline_bundle(
+        fit_df,
+        list(FEATURE_COLS),
+        "train_label",
+        "date",
+        return_model_params=model_params,
+        huber_delta=huber_delta,
+    )
+    bundle["strategy_id"] = spec.strategy_id
+    bundle["top_k"] = int(spec.top_k)
+    bundle["train_start"] = str(eff_train_start.date())
+    bundle["certification_regime_start"] = str(CERT_REGIME_START.date())
+    bundle["select_universe"] = dataclasses.asdict(spec.universe)
+    return bundle
+
+
+def save_production_bundle(bundle: dict[str, Any], export_dir: str = TOPK_RANKER_BUNDLE_DIR) -> str:
+    """Persist a production bundle under the reranker artifact directory.
+
+    Args:
+        bundle: Extended bundle dict from train_production_bundle.
+        export_dir: Destination directory, distinct from champion's directory.
+
+    Returns:
+        Saved joblib path as a string.
+    """
+    from joblib import dump
+
+    # 챔피언 번들과 파일명 충돌 방지용 별도 디렉터리
+    os.makedirs(export_dir, exist_ok=True)
+    path = os.path.join(export_dir, "sizing_pipeline_bundle.joblib")
+    dump(bundle, path)
+    return path
+
+
+def select_topk_equal_weight(
+    df: pd.DataFrame, bundle: dict[str, Any], *, top_k: int, date_col: str = "date"
+) -> pd.DataFrame:
+    """Select the certified top-k by point-estimate rank with equal weights.
+
+    Args:
+        df: Live snapshot with the bundle's feature columns.
+        bundle: Production bundle carrying return/quantile/calibrator models.
+        top_k: Names to select; must equal the certified MIN_TOP_K.
+        date_col: Date column name for per-date selection.
+
+    Returns:
+        Top-k picks with pred, diagnostic columns and uniform allocation.
+
+    Raises:
+        ValueError: When top_k is not MIN_TOP_K or feature_cols is empty.
+    """
+    if int(top_k) != MIN_TOP_K:
+        raise ValueError(f"top_k {top_k!r} is not the certified MIN_TOP_K {MIN_TOP_K}")
+    feature_cols = list(bundle.get("feature_cols", []))
+    if not feature_cols:
+        raise ValueError("bundle feature_cols is empty; refusing to select")
+    # predict_daily_sizing과 동일한 누락 피처 0.0 보정
+    work = df.copy()
+    for col in feature_cols:
+        if col not in work.columns:
+            work[col] = 0.0
+    features = work[feature_cols]
+    work["pred"] = np.asarray(bundle["return_model"].predict(features), dtype=np.float64)
+    q_models = bundle["quantile_models"]
+    q10 = np.asarray(q_models["pred_q10"].predict(features), dtype=np.float64)
+    q50 = np.asarray(q_models["pred_q50"].predict(features), dtype=np.float64)
+    q90 = np.asarray(q_models["pred_q90"].predict(features), dtype=np.float64)
+    work["pred_q10"] = np.minimum(np.minimum(q10, q50), q90)
+    work["pred_q50"] = np.clip(q50, work["pred_q10"].to_numpy(dtype=np.float64), q90)
+    work["pred_q90"] = np.maximum(q90, work["pred_q50"].to_numpy(dtype=np.float64))
+    for name in ("p_good", "p_bad"):
+        calibrator = bundle["calibrators"][name]
+        if isinstance(calibrator, float):
+            work[name] = float(calibrator)
+        else:
+            proba = calibrator.predict_proba(features)
+            positive_idx = list(calibrator.classes_).index(True)
+            work[name] = proba[:, positive_idx]
+    picks = select_topk_by_score(work, int(top_k), score_col="pred", date_col=date_col)
+    picks["allocation"] = 1.0 / float(top_k)
+    return picks
 
 
 def main(argv: list[str] | None = None) -> None:
