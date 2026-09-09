@@ -392,13 +392,16 @@ async def main(force: bool = False):
             return
 
         logger.info(
-            f"{Colors.BOLD}🚀 K-CLOSING ALPHA :: 실시간 종가매매 데이터 수집 ({len(stock_list)}종목 포착){Colors.RESET}"
+            f"{Colors.BOLD}🚀 [1/3] 후보 종목 스캔 (Kiwoom / KIS){Colors.RESET}\n"
+            f"   - 대상: {Colors.CYAN}{len(stock_list)}{Colors.RESET}개 종목 포착 (등락률/유니버스 필터)"
         )
 
         # 4. 상세 데이터 수집
+        logger.info(f"\n{Colors.BOLD}⏳ [2/3] 실시간 단면 데이터 수집{Colors.RESET}")
         results, failed_info = await fetch_all_stock_data(stock_list, client, session)
 
         # 5. wide 단면 구성 후 PIT admitted 플래그 부여 및 저장소 직접 기록
+        logger.info(f"\n{Colors.BOLD}📊 [3/3] 유니버스 적격성(Admission) 평가 및 저장{Colors.RESET}")
         capture_ts = pd.Timestamp.now(tz="Asia/Seoul")
         snapshot_date = capture_ts.strftime("%Y-%m-%d")
         df = pd.DataFrame(results)
@@ -431,10 +434,20 @@ async def main(force: bool = False):
 
         stored_rows = persist_daily_snapshot(df, snapshot_date)
 
-        success_count = len(results) - len(failed_info)
-        logger.info(f"\n{Colors.BOLD}📊 [데이터 수집 요약]{Colors.RESET}")
-        logger.info(f"   ✅ 성공: {Colors.GREEN}{success_count}{Colors.RESET} 종목")
-        logger.info(f"{Colors.GREEN}📂 저장소 직접 기록 완료: {snapshot_date} ({stored_rows}행){Colors.RESET}")
+        n_raw = len(df)
+        n_admitted = int(df["admitted"].sum()) if "admitted" in df.columns else 0
+        n_failed = len(failed_info)
+        success_count = n_raw - n_failed
+
+        divider = "─" * 60
+        box_top = "━" * 60
+        logger.info(f"{Colors.BOLD}{box_top}{Colors.RESET}")
+        logger.info(f" {Colors.GREEN}{Colors.BOLD}📋 [데이터 수집 & 적재 요약]{Colors.RESET} ({snapshot_date})")
+        logger.info(f"{Colors.BOLD}{divider}{Colors.RESET}")
+        logger.info(f"   • 스캔 및 수집 시도 : {n_raw:>3} 종목 (성공: {Colors.GREEN}{success_count}{Colors.RESET}, 실패: {Colors.RED if n_failed > 0 else Colors.GRAY}{n_failed}{Colors.RESET})")
+        logger.info(f"   • 유니버스 적격 통과: {Colors.CYAN}{Colors.BOLD}{n_admitted:>3}{Colors.RESET} 종목 (비용/거래대금 필터 통과)")
+        logger.info(f"   • 스냅샷 저장소 적재: {Colors.GREEN}{stored_rows:>3}{Colors.RESET} 행 적재 완료")
+        logger.info(f"{Colors.BOLD}{box_top}{Colors.RESET}")
 
 
 if __name__ == "__main__":
