@@ -115,10 +115,10 @@ def save_collected_condition_data(
     return csv_path
 
 
-def apply_cost_aware_admission(
+def flag_cost_aware_admission(
     df: pd.DataFrame, *, decision_date: pd.Timestamp, screen: UniverseSpec = COST_AWARE_UNIVERSE
 ) -> pd.DataFrame:
-    """Apply the COST_AWARE_UNIVERSE admission mask to the daily snapshot.
+    """Flag every row of the daily snapshot with the COST_AWARE_UNIVERSE verdict.
 
     Args:
         df: Enriched Korean-column snapshot frame.
@@ -126,13 +126,16 @@ def apply_cost_aware_admission(
         screen: Universe admission spec.
 
     Returns:
-        Admitted rows as a new frame; empty frame on no admission.
+        A copy of the input with a bool ``admitted`` column; no rows dropped.
+        apply_cost_aware_admission wraps this helper and drops non-admitted rows.
     """
     import numpy as np
 
     if len(df) == 0:
+        out = df.copy()
+        out["admitted"] = np.zeros(0, dtype=bool)
         logger.info("[DATA] stage=cost_aware_admission n_raw=0 n_admitted=0 n_ceiling_excluded=0")
-        return df.copy()
+        return out
     close = pd.to_numeric(df["종가"], errors="coerce").to_numpy(dtype=np.float64)
     prev_close = pd.to_numeric(df["전일종가"], errors="coerce").to_numpy(dtype=np.float64)
     high = pd.to_numeric(df["고가"], errors="coerce").to_numpy(dtype=np.float64)
@@ -163,22 +166,42 @@ def apply_cost_aware_admission(
         int(np.asarray(mask, dtype=bool).sum()),
         n_ceiling_excluded,
     )
-    return df.loc[np.asarray(mask, dtype=bool)].reset_index(drop=True)
+    flagged = df.copy()
+    flagged["admitted"] = np.asarray(mask, dtype=bool)
+    return flagged
+
+
+def apply_cost_aware_admission(
+    df: pd.DataFrame, *, decision_date: pd.Timestamp, screen: UniverseSpec = COST_AWARE_UNIVERSE
+) -> pd.DataFrame:
+    """Apply the COST_AWARE_UNIVERSE admission mask to the daily snapshot.
+
+    Args:
+        df: Enriched Korean-column snapshot frame.
+        decision_date: Decision date for point-in-time tick costing.
+        screen: Universe admission spec.
+
+    Returns:
+        Admitted rows as a new frame; empty frame on no admission.
+    """
+    flagged = flag_cost_aware_admission(df, decision_date=decision_date, screen=screen)
+    return flagged[flagged["admitted"]].drop(columns=["admitted"]).reset_index(drop=True)
 
 
 def apply_cost_aware_admission_if_automated(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply cost-aware admission only in automated candidate-source mode.
+    """Flag cost-aware admission only in automated candidate-source mode.
 
     Args:
         df: Enriched daily snapshot frame.
 
     Returns:
-        Admitted frame in automated mode; the input object unchanged otherwise.
+        Wide frame with the ``admitted`` flag in automated mode; the input
+        object unchanged otherwise.
     """
     if settings.CANDIDATE_SOURCE_MODE != "automated":
         return df
     decision_date = pd.Timestamp(datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d"))
-    return apply_cost_aware_admission(df, decision_date=decision_date)
+    return flag_cost_aware_admission(df, decision_date=decision_date)
 
 
 async def resolve_daily_candidates(client, session) -> tuple[list[dict], set[str], set[str], set[str], set[str], set[str]] | None:

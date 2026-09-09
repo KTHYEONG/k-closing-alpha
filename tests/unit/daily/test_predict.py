@@ -535,49 +535,197 @@ def test_predict_forces_pass_for_ceiling_candidates_only() -> None:
     assert df.loc[1, "allocation"] == 0.05
 
 
-def test_main_prints_topk_ranker_sleeve_when_automated_and_populated(monkeypatch) -> None:
+def test_load_condition_snapshot_preserves_100m_units(tmp_path) -> None:
     import pandas as pd
 
     import src.daily.predict as predict_mod
 
-    sizing_df = pd.DataFrame({
-        "종목명": ["AAA", "BBB"], "theme_sector": ["테마A", "테마A"],
-        "chart_analysis": ["거래량 폭증", "상따"], "selection_rank": [1, 2],
-        "change_rate": [5.0, 29.9], "rank_score": [1.0, 0.5], "utility_score": [0.5, 0.4],
-        "grade": ["Strong", "Pass"], "allocation": [0.1, 0.0],
-        "kospi": [0.5, 0.5], "kosdaq": [0.3, 0.3], "date": ["2026-08-04", "2026-08-04"],
-        "close_price": [11000.0, 11000.0], "prev_close_price": [10000.0, 10000.0],
-        "high_price": [11200.0, 11200.0],
-    })
-    sleeve_df = pd.DataFrame({"symbol": ["000001"], "pred": [0.021], "allocation": [1.0 / 3.0]})
+    # Given: a standard snapshot CSV whose amounts are in 100M KRW units
+    csv = tmp_path / "daily_stocks.csv"
+    pd.DataFrame({
+        "종목코드": ["1", "000002"],
+        "거래대금": [500.0, 300.0],
+        "시가총액": [3000.0, 2000.0],
+        "기관_순매수": [10.0, 20.0],
+    }).to_csv(csv, index=False, encoding="utf-8-sig")
 
-    async def fake_fetch(_code: str) -> tuple[float, float]:
-        return 15.0, 0.05
+    # When
+    out = predict_mod.load_condition_snapshot(str(csv))
+
+    # Then: amounts untouched (the reranker trains on 100M-KRW units)
+    assert out["거래대금"].tolist() == [500.0, 300.0]
+    assert out["시가총액"].tolist() == [3000.0, 2000.0]
+    assert out["기관_순매수"].tolist() == [10.0, 20.0]
+    assert out["종목코드"].tolist() == ["000001", "000002"]
+
+
+
+def test_convert_amount_units_to_krw_scales_only_legacy_amount_columns() -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    # Given
+    df = pd.DataFrame({
+        "거래대금": [500.0],
+        "기관_순매수": [10.0],
+        "외국인_순매수": [5.0],
+        "시가총액": [3000.0],
+    })
+
+    # When
+    out = predict_mod.convert_amount_units_to_krw(df)
+
+    # Then: only the legacy champion amount columns are rescaled
+    assert out["거래대금"].tolist() == [500.0 * 1e8]
+    assert out["기관_순매수"].tolist() == [10.0 * 1e8]
+    assert out["외국인_순매수"].tolist() == [5.0 * 1e8]
+    assert out["시가총액"].tolist() == [3000.0]
+
+
+
+def test_run_topk_ranker_sleeve_scores_wide_and_selects_admitted(monkeypatch) -> None:
+    import numpy as np
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    # Given: a wide 4-name snapshot in raw 100M-KRW units where only 3 clear
+    # the cost-aware screen (S4 sits at 30000 KRW -> 16.67bp > the 7.5bp cap)
+    wide = pd.DataFrame({
+        "종목코드": ["000001", "000002", "000003", "000004"],
+        "종목명": ["AAA", "BBB", "CCC", "DDD"],
+        "종가": [18000.0, 18100.0, 17900.0, 30000.0],
+        "전일종가": [17142.86, 17238.10, 17047.62, 28571.43],
+        "고가": [18100.0, 18200.0, 18000.0, 30100.0],
+        "저가": [17800.0, 17900.0, 17700.0, 29800.0],
+        "시가": [17900.0, 18000.0, 17800.0, 29900.0],
+        "거래량": [1_000_000, 900_000, 1_100_000, 800_000],
+        "거래대금": [500.0, 450.0, 550.0, 400.0],
+        "시가총액": [3000.0, 2800.0, 3200.0, 5000.0],
+        "기관_순매수": [10.0, -5.0, 20.0, 8.0],
+        "외국인_순매수": [5.0, 12.0, -3.0, 6.0],
+        "시장구분": ["KOSPI", "KOSPI", "KOSPI", "KOSPI"],
+        "kospi": [0.52, 0.52, 0.52, 0.52],
+        "kosdaq": [-0.31, -0.31, -0.31, -0.31],
+        "v_kospi": [15.2, 15.2, 15.2, 15.2],
+    })
+    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
+    bundle["top_k"] = 3
 
     monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+    monkeypatch.setattr(predict_mod, "load_condition_snapshot", lambda _p: wide)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
 
-    with (
-        patch.object(predict_mod, "load_and_preprocess_data", return_value=daily_snapshot_df()),
-        patch.object(predict_mod, "load_theme_from_db",
-                     return_value={"000001": "테마A", "000002": "테마A"}),
-        patch.object(predict_mod, "batch_resolve_missing_themes"),
-        patch("src.api.kis_client.fetch_index_and_calculate_volatility", side_effect=fake_fetch),
-        patch.object(predict_mod, "load_model_bundle", return_value={"feature_cols": ["f1"]}),
-        patch.object(predict_mod, "predict_daily_sizing",
-                     side_effect=lambda df, *a, **kw: sizing_df[sizing_df["chart_analysis"].isin(df["chart_analysis"])]),
-        patch.object(predict_mod, "run_topk_ranker_sleeve", return_value=sleeve_df) as sleeve_mock,
-        patch.object(predict_mod, "print_table") as print_table_mock,
-    ):
+    # When
+    out = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"))
+
+    # Then: the tick-cost rejected name never enters, weights are uniform
+    assert len(out) == 3
+    assert sorted(out["symbol"].tolist()) == ["000001", "000002", "000003"]
+    assert np.allclose(out["allocation"].to_numpy(dtype=np.float64), 1.0 / 3.0)
+    assert sorted(out["name"].tolist()) == ["AAA", "BBB", "CCC"]
+
+
+
+def test_run_topk_ranker_sleeve_warns_when_bundle_missing(monkeypatch, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    # Given: the sleeve is in scope but no production bundle is published yet
+    wide = pd.DataFrame({
+        "종목코드": ["000001"], "종목명": ["AAA"], "종가": [18000.0],
+        "전일종가": [17142.86], "고가": [18100.0], "저가": [17800.0], "시가": [17900.0],
+        "거래량": [1_000_000], "거래대금": [500.0], "시가총액": [3000.0],
+        "기관_순매수": [10.0], "외국인_순매수": [5.0], "시장구분": ["KOSPI"],
+        "kospi": [0.52], "kosdaq": [-0.31], "v_kospi": [15.2],
+    })
+    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+    monkeypatch.setattr(predict_mod, "load_condition_snapshot", lambda _p: wide)
+
+    def _missing(import_dir=None):
+        raise FileNotFoundError("model artifact bundle not found")
+
+    monkeypatch.setattr(predict_mod, "load_model_bundle", _missing)
+
+    # When
+    with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
+        out = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"))
+
+    # Then: fails soft, but never silently
+    assert out.empty
+    assert any(rec.levelno >= logging.WARNING for rec in caplog.records)
+
+
+
+def test_main_automated_mode_prints_only_topk_decision_table(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    # Given: automated mode with a populated top-3 sleeve
+    sleeve_df = pd.DataFrame({
+        "symbol": ["000001", "000002", "000003"],
+        "name": ["AAA", "BBB", "CCC"],
+        "pred": [0.021, 0.017, 0.011],
+        "allocation": [1.0 / 3.0] * 3,
+    })
+    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", Mock(return_value=sleeve_df))
+    champion_mock = Mock()
+    monkeypatch.setattr(predict_mod, "predict_daily_sizing", champion_mock)
+    print_table_mock = Mock()
+    monkeypatch.setattr(predict_mod, "print_table", print_table_mock)
+
+    # When
+    predict_mod.main()
+
+    # Then: the reranker table is the single decision surface; champion's
+    # fixed-threshold grading is never even computed for this population
+    assert print_table_mock.call_count == 1
+    champion_mock.assert_not_called()
+    rows = print_table_mock.call_args_list[0].args[0]
+    assert [r["Code"] for r in rows] == ["000001", "000002", "000003"]
+    assert rows[0]["Alloc%"] == pytest.approx(33.3, abs=0.1)
+
+
+
+def test_main_automated_mode_warns_and_prints_nothing_when_no_decision(monkeypatch, caplog) -> None:
+    import logging
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    # Given: automated mode where the sleeve yields no actionable decision
+    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+    monkeypatch.setattr(
+        predict_mod, "run_topk_ranker_sleeve", Mock(return_value=pd.DataFrame())
+    )
+    print_table_mock = Mock()
+    monkeypatch.setattr(predict_mod, "print_table", print_table_mock)
+
+    # When
+    with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
         predict_mod.main()
 
-    sleeve_mock.assert_called_once()
-    assert print_table_mock.call_count == 3
-    sleeve_rows = print_table_mock.call_args_list[2].args[0]
-    assert sleeve_rows[0]["Code"] == "000001"
-    assert sleeve_rows[0]["Alloc%"] == pytest.approx(33.3, abs=0.1)
+    # Then: silence is made explicit as a no-participation banner
+    print_table_mock.assert_not_called()
+    assert any(rec.levelno >= logging.WARNING for rec in caplog.records)
 
 
-def test_main_skips_topk_ranker_sleeve_table_when_sleeve_empty(monkeypatch) -> None:
+
+def test_main_manual_mode_keeps_champion_tables_unchanged(monkeypatch) -> None:
+    from unittest.mock import Mock
+
     import pandas as pd
 
     import src.daily.predict as predict_mod
@@ -596,6 +744,8 @@ def test_main_skips_topk_ranker_sleeve_table_when_sleeve_empty(monkeypatch) -> N
         return 15.0, 0.05
 
     monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
+    sleeve_mock = Mock(return_value=pd.DataFrame())
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", sleeve_mock)
 
     with (
         patch.object(predict_mod, "load_and_preprocess_data", return_value=daily_snapshot_df()),
@@ -605,59 +755,37 @@ def test_main_skips_topk_ranker_sleeve_table_when_sleeve_empty(monkeypatch) -> N
         patch("src.api.kis_client.fetch_index_and_calculate_volatility", side_effect=fake_fetch),
         patch.object(predict_mod, "load_model_bundle", return_value={"feature_cols": ["f1"]}),
         patch.object(predict_mod, "predict_daily_sizing",
-                     side_effect=lambda df, *a, **kw: sizing_df[sizing_df["chart_analysis"].isin(df["chart_analysis"])]),
+                     side_effect=lambda df, *a, **kw: sizing_df[
+                         sizing_df["chart_analysis"].isin(df["chart_analysis"])]),
         patch.object(predict_mod, "print_table") as print_table_mock,
     ):
         predict_mod.main()
 
-    # Then: with the default "manual" mode, run_topk_ranker_sleeve short-circuits
-    # to empty without needing any mock, and no third table is printed --
-    # byte-identical to the pre-Phase-2 behavior.
+    # Then: byte-identical to the pre-migration manual behaviour
     assert print_table_mock.call_count == 2
+    sleeve_mock.assert_not_called()
 
 
-def test_run_topk_ranker_sleeve_returns_empty_when_bundle_missing_in_automated_mode(monkeypatch) -> None:
+
+def test_run_topk_ranker_sleeve_short_circuits_in_manual_mode(monkeypatch) -> None:
     from unittest.mock import Mock
 
     import pandas as pd
 
     import src.daily.predict as predict_mod
 
-    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
-    monkeypatch.setattr(
-        predict_mod, "load_model_bundle",
-        Mock(side_effect=FileNotFoundError("model artifact bundle not found")),
-    )
+    # Given: manual mode -- the reranker sleeve is entirely out of scope
+    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
+    snapshot_mock = Mock()
+    bundle_mock = Mock()
+    monkeypatch.setattr(predict_mod, "load_condition_snapshot", snapshot_mock)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", bundle_mock)
 
-    # When: the sleeve is in scope (automated mode) but no bundle is published yet
-    out = predict_mod.run_topk_ranker_sleeve(
-        pd.DataFrame({"종목코드": ["005930"]}), pd.Timestamp("2026-09-09")
-    )
+    # When
+    out = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"))
 
-    # Then: fails soft -- an empty frame, never a raised exception
+    # Then: short-circuits before touching disk or artifacts
     assert isinstance(out, pd.DataFrame)
     assert out.empty
-
-
-def test_run_topk_ranker_sleeve_returns_populated_picks_in_automated_mode(monkeypatch) -> None:
-    import numpy as np
-    import pandas as pd
-
-    import src.daily.predict as predict_mod
-    from src.ml.research.v3_engine import FEATURE_COLS
-    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle, daily_snapshot_df
-
-    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
-    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
-    bundle["top_k"] = 3
-    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
-
-    # When: the sleeve runs its full success path -- bundle load, feature
-    # mapping from the Korean daily snapshot, and equal-weight selection
-    out = predict_mod.run_topk_ranker_sleeve(daily_snapshot_df(), pd.Timestamp("2026-09-09"))
-
-    # Then: non-empty picks carrying the selection score and equal allocation
-    assert not out.empty
-    assert "symbol" in out.columns
-    assert "pred" in out.columns
-    assert np.allclose(out["allocation"].to_numpy(dtype=np.float64), 1.0 / 3.0)
+    snapshot_mock.assert_not_called()
+    bundle_mock.assert_not_called()

@@ -386,3 +386,23 @@ def test_map_kiwoom_ranking_rows_to_stock_list_skips_rows_without_code() -> None
 
     # Then: only the row with a resolvable code survives
     assert out == [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "5.26"}]
+
+
+def test_fetch_candidate_stock_list_requests_widened_input_cnt() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import RANKING_SCAN_INPUT_CNT, fetch_candidate_stock_list
+
+    # Given
+    client = AsyncMock()
+    client.get_fluctuation_ranking = AsyncMock(return_value={"rt_cd": "0", "output": []})
+
+    # When
+    out = asyncio.run(fetch_candidate_stock_list(client, object()))
+
+    # Then: the wide cross-section (p95=136) is not truncated at the 100 default
+    kwargs = client.get_fluctuation_ranking.await_args.kwargs
+    assert kwargs["input_cnt"] == RANKING_SCAN_INPUT_CNT
+    assert int(RANKING_SCAN_INPUT_CNT) >= 200
+    assert out == []
