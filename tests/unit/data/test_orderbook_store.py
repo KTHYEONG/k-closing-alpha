@@ -109,3 +109,66 @@ def test_append_orderbook_snapshots_recovers_from_unreadable_existing_partition(
 
     assert orderbook_store.append_orderbook_snapshots(rows, "2026-09-05") == 1
 
+
+def test_build_orderbook_rows_merges_output1_and_output2() -> None:
+    from datetime import datetime
+
+    from src.data.orderbook_store import build_orderbook_rows
+
+    output1 = {"askp1": "70000", "bidp1": "69900", "total_askp_rsqn": "1200"}
+    output2 = {
+        "antc_mkop_cls_code": "112",
+        "stck_prpr": "70000",
+        "antc_cnpr": "70050",
+        "antc_cntg_vrss": "50",
+        "antc_vol": "12345",
+    }
+    ts = datetime(2026, 9, 10, 15, 22, 0)
+
+    rows = build_orderbook_rows(
+        {"rt_cd": "0", "output1": output1, "output2": output2}, "005930", "J", "decision", ts
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    for key in output1:
+        assert key in row
+    for key in output2:
+        assert key in row
+    assert row["askp1"] == 70000
+    assert row["antc_cnpr"] == 70050
+    assert row["antc_vol"] == 12345
+    assert row["symbol"] == "005930"
+
+
+def test_build_orderbook_rows_output2_wins_on_key_collision() -> None:
+    from datetime import datetime
+
+    from src.data.orderbook_store import build_orderbook_rows
+
+    output1 = {"stck_prpr": "11111"}
+    output2 = {"stck_prpr": "22222"}
+    ts = datetime(2026, 9, 10, 15, 22, 0)
+
+    rows = build_orderbook_rows(
+        {"rt_cd": "0", "output1": output1, "output2": output2}, "005930", "J", "decision", ts
+    )
+
+    assert rows[0]["stck_prpr"] == 22222
+
+
+def test_build_orderbook_rows_works_with_only_output2() -> None:
+    from datetime import datetime
+
+    from src.data.orderbook_store import build_orderbook_rows
+
+    ts = datetime(2026, 9, 10, 15, 22, 0)
+    rows = build_orderbook_rows(
+        {"rt_cd": "0", "output2": {"antc_cnpr": "70050"}}, "005930", "J", "decision", ts
+    )
+    assert len(rows) == 1
+    assert rows[0]["antc_cnpr"] == 70050
+
+    empty = build_orderbook_rows({"rt_cd": "0"}, "005930", "J", "decision", ts)
+    assert empty == []
+

@@ -61,7 +61,7 @@ def _candidate_row(code: str, name: str, rank: int, date: str = "2026-08-04") ->
 
 
 def test_scenario_archive_upsert_01(tmp_archive: Path) -> None:
-    """SCENARIO_ARCHIVE_UPSERT_01: Upsert candidates DataFrame into parquet and db replacing previous snapshot for same date."""
+    """SCENARIO_ARCHIVE_UPSERT_01: Upsert candidates DataFrame into parquet, replacing previous snapshot for same date."""
     df = pd.DataFrame(
         [
             _candidate_row("005930", "삼성전자", 1),
@@ -76,11 +76,6 @@ def test_scenario_archive_upsert_01(tmp_archive: Path) -> None:
     parquet_df = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
     assert len(parquet_df) == 1
     assert set(parquet_df["종목코드"].astype(str).str.zfill(6)) == {"005930"}
-
-    with sqlite3.connect(archive.settings.HISTORY_DB_PATH) as conn:
-        db_df = pd.read_sql("SELECT * FROM condition_history", conn)
-    assert len(db_df) == 1
-    assert set(db_df["종목코드"].astype(str).str.zfill(6)) == {"005930"}
 
 
 def test_python_assertion_archive_upsert(tmp_archive: Path) -> None:
@@ -111,7 +106,7 @@ def test_scenario_archive_fetch_02(tmp_archive: Path) -> None:
     specified = archive.fetch_archive_snapshot("2026-08-03")
     assert specified["스냅샷_날짜"].tolist() == ["2026-08-03"]
     assert specified.columns.tolist() == archive.ARCHIVE_READ_COLUMN_ORDER
-    assert len(archive.ARCHIVE_COLUMN_ORDER) == 19
+    assert len(archive.ARCHIVE_COLUMN_ORDER) == 21
 
 
 def test_scenario_archive_export_03(tmp_archive: Path) -> None:
@@ -187,17 +182,6 @@ def test_upsert_dedups_by_snapshot_identity_when_intraday(tmp_archive: Path) -> 
     )
 
 
-def test_fetch_falls_back_to_sqlite_when_parquet_missing(tmp_archive: Path) -> None:
-    archive.upsert_archive_snapshot(
-        pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
-        snapshot_date="2026-08-04",
-    )
-    archive.settings.HISTORY_PARQUET_PATH.unlink()
-    df = archive.fetch_archive_snapshot("2026-08-04")
-    assert not df.empty
-    assert df["종목코드"].tolist() == ["005930"]
-
-
 def test_fetch_empty_archive_returns_standard_columns(tmp_archive: Path) -> None:
     df = archive.fetch_archive_snapshot()
     assert df.empty
@@ -221,21 +205,6 @@ def test_export_df_direct_without_header() -> None:
     fields = lines[0].split("\t")
     assert len(fields) == len(archive.ARCHIVE_COLUMN_ORDER)
     assert fields[1] == "000001"
-
-
-def test_upsert_adds_missing_columns_to_existing_table(tmp_archive: Path) -> None:
-    with sqlite3.connect(archive.settings.HISTORY_DB_PATH) as conn:
-        conn.execute('CREATE TABLE condition_history ("종목코드" TEXT)')
-    count = archive.upsert_archive_snapshot(
-        pd.DataFrame([{"종목코드": "005930", "종목명": "삼성전자"}]),
-        snapshot_date="2026-08-04",
-    )
-    assert count == 1
-    df = archive.fetch_archive_snapshot("2026-08-04")
-    assert len(df) == 1
-    assert df["종목코드"].tolist() == ["005930"]
-
-
 
 
 def test_upsert_localizes_naive_snapshot_timestamp(tmp_archive: Path) -> None:
@@ -283,22 +252,6 @@ def test_upsert_handles_null_snapshot_timestamp(tmp_archive: Path) -> None:
     archive.upsert_archive_snapshot(pd.DataFrame([row]), snapshot_date="2026-08-04")
     loaded = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
     assert len(loaded) == 1
-
-
-def test_upsert_sqlite_null_timestamp_identity_replacement(tmp_archive: Path) -> None:
-    """NULL snapshot_timestamp 행은 IS NULL 정체성으로 재배치(중복 없이 교체)됩니다."""
-    import sqlite3
-
-    db_path = str(archive.settings.HISTORY_DB_PATH)
-    row = _candidate_row("005930", "삼성전자", 1)
-    with_null = pd.DataFrame([dict(row, snapshot_timestamp=pd.NaT)])
-    archive._upsert_sqlite_archive(with_null, db_path)
-    archive._upsert_sqlite_archive(with_null, db_path)
-    with sqlite3.connect(db_path) as conn:
-        db_df = pd.read_sql("SELECT * FROM condition_history", conn)
-    assert len(db_df) == 1
-
-
 
 
 def test_fetch_archive_snapshot_defaults_to_latest_snapshot_per_code(tmp_archive: Path) -> None:
@@ -389,3 +342,116 @@ def test_archive_cli_entrypoint_is_removed() -> None:
     # Then: the storage API itself is untouched
     assert callable(archive.upsert_archive_snapshot)
     assert callable(archive.fetch_archive_snapshot)
+
+
+def test_fetch_returns_empty_when_parquet_missing(tmp_archive: Path) -> None:
+    archive.upsert_archive_snapshot(
+        pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
+        snapshot_date="2026-08-04",
+    )
+    archive.settings.HISTORY_PARQUET_PATH.unlink()
+
+    df = archive.fetch_archive_snapshot("2026-08-04")
+
+    assert df.empty
+    assert df.columns.tolist() == archive.ARCHIVE_READ_COLUMN_ORDER
+
+
+def test_archive_module_no_longer_exposes_sqlite_helpers() -> None:
+    from src.daily import archive
+
+    for name in (
+        "upsert_history",
+        "fetch_date_rows",
+        "_upsert_sqlite_archive",
+        "_read_sqlite_archive",
+        "TABLE_NAME",
+        "RANK_COL",
+    ):
+        assert not hasattr(archive, name), f"{name} should have been removed"
+
+    assert callable(archive.upsert_archive_snapshot)
+    assert callable(archive.fetch_archive_snapshot)
+
+
+def test_upsert_marks_snapshot_timestamp_synthetic_when_not_supplied(tmp_archive: Path) -> None:
+    archive.upsert_archive_snapshot(
+        pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
+        snapshot_date="2026-08-04",
+    )
+    loaded = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    ts = pd.to_datetime(loaded["snapshot_timestamp"])
+    assert ts.dt.hour.iloc[0] == 15
+    assert ts.dt.minute.iloc[0] == 30
+    assert loaded["snapshot_timestamp_synthetic"].iloc[0] == True  # noqa: E712
+
+
+def test_upsert_marks_snapshot_timestamp_not_synthetic_when_supplied(tmp_archive: Path) -> None:
+    row = _candidate_row("005930", "삼성전자", 1)
+    row["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:22:10", tz="Asia/Seoul")
+    archive.upsert_archive_snapshot(pd.DataFrame([row]), snapshot_date="2026-08-04")
+
+    loaded = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    assert loaded["snapshot_timestamp_synthetic"].iloc[0] == False  # noqa: E712
+    ts = pd.to_datetime(loaded["snapshot_timestamp"])
+    assert ts.dt.minute.iloc[0] == 22
+
+
+def test_upsert_archive_snapshot_raises_after_parquet_write_retries_exhausted(tmp_archive: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.daily import archive
+
+    def _always_fail(df):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("src.data.parquet_loader.upsert_condition_parquet", _always_fail)
+
+    with pytest.raises(RuntimeError, match="parquet"):
+        archive.upsert_archive_snapshot(
+            pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
+            snapshot_date="2026-08-04",
+        )
+
+
+def test_write_condition_parquet_with_retry_succeeds_on_second_attempt(tmp_archive: Path, monkeypatch) -> None:
+    from src.daily import archive
+
+    calls = {"n": 0}
+
+    def _flaky(df):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient")
+        return None
+
+    monkeypatch.setattr("src.data.parquet_loader.upsert_condition_parquet", _flaky)
+
+    count = archive.upsert_archive_snapshot(
+        pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
+        snapshot_date="2026-08-04",
+    )
+
+    assert count == 1
+    assert calls["n"] == 2
+
+
+def test_upsert_archive_snapshot_logs_rerun_with_legacy_parquet_missing_timestamp(tmp_archive: Path, caplog) -> None:
+    import logging
+
+    from src.daily import archive
+
+    # Given: a legacy parquet file for the same date lacking snapshot_timestamp entirely
+    legacy = pd.DataFrame([{"스냅샷_날짜": "2026-08-04", "종목코드": "005930", "종목명": "삼성전자"}])
+    legacy.to_parquet(archive.settings.HISTORY_PARQUET_PATH, index=False)
+
+    # When
+    with caplog.at_level(logging.INFO, logger="src.daily.archive"):
+        count = archive.upsert_archive_snapshot(
+            pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
+            snapshot_date="2026-08-04",
+        )
+
+    # Then: no crash, rerun detected with an unknown ("NaT") latest timestamp
+    assert count == 1
+    assert any("rerun detected" in rec.message and "NaT" in rec.message for rec in caplog.records)

@@ -96,11 +96,11 @@ def test_legacy_mapping_file_removal() -> None:
 def test_archive_column_order_is_minimal_and_carries_admitted() -> None:
     from src.processing.schema import ARCHIVE_COLUMN_ORDER
 
-    # Then: the reranker-required set plus the PIT admission verdict
+    # Then: the reranker-required set plus the PIT admission verdict and data-quality flags
     assert ARCHIVE_COLUMN_ORDER == [
         "스냅샷_날짜", "종목코드", "종목명", "시장구분", "시가", "고가", "저가", "종가",
         "전일종가", "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수",
-        "등락률", "kospi", "kosdaq", "v_kospi", "admitted",
+        "등락률", "kospi", "kosdaq", "v_kospi", "admitted", "수급_실패", "지수_실패",
     ]
 
     # Then: champion-era and flat level-1 orderbook columns are gone (the full

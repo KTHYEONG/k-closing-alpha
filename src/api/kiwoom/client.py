@@ -109,7 +109,17 @@ class KiwoomApiClient:
             for _ in range(max(1, int(max_pages))):
                 data, resp_headers = await self._post_tr(
                     session, "ka10027", "/api/dostk/rkinfo",
-                    {"mrkt_tp": str(market_type), "stex_tp": str(stex_tp)},
+                    {
+                        "mrkt_tp": str(market_type),
+                        "stex_tp": str(stex_tp),
+                        "sort_tp": "1",
+                        "trde_qty_cnd": "0000",
+                        "stk_cnd": "0",
+                        "crd_cnd": "0",
+                        "updown_incls": "0",
+                        "pric_cnd": "0",
+                        "trde_prica_cnd": "0",
+                    },
                     cont_yn=cont_yn, next_key=next_key,
                 )
                 if data.get("return_code") != 0:

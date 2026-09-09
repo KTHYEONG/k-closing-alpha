@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import pandas as pd
+import pytest
 
 
 
@@ -111,14 +112,15 @@ def test_flag_cost_aware_admission_marks_rows_without_dropping() -> None:
 
 
 
-def test_fetch_single_stock_calls_only_the_four_required_apis() -> None:
+def test_fetch_single_stock_calls_only_the_three_required_apis() -> None:
     import asyncio
     from unittest.mock import AsyncMock
 
     from src.daily import collect
 
     # Given: a client exposing every legacy endpoint, so the test proves the
-    # dropped ones are not merely unavailable but deliberately not called
+    # dropped ones (including NXT orderbook) are not merely unavailable but
+    # deliberately not called
     client = AsyncMock()
     client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
     client.get_investor_trend_estimate = AsyncMock(
@@ -127,7 +129,7 @@ def test_fetch_single_stock_calls_only_the_four_required_apis() -> None:
     client.get_trade_strength = AsyncMock(return_value={"rt_cd": "0", "output": [{"tday_rltv": "120"}]})
     client.get_program_net_buy = AsyncMock(return_value={"rt_cd": "0", "output": [{"whol_smtn_ntby_tr_pbmn": "100"}]})
     ladder = {"askp1": "18010", "bidp1": "17990", "total_askp_rsqn": "1200", "total_bidp_rsqn": "1500"}
-    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder, "output2": {"antc_cnpr": "18020"}})
 
     # When
     sem = asyncio.Semaphore(1)
@@ -137,12 +139,15 @@ def test_fetch_single_stock_calls_only_the_four_required_apis() -> None:
         )
     )
 
-    # Then: KRX current price once (no NXT twin), both orderbook venues kept
+    # Then: KRX current price once, KRX orderbook once (NXT twin removed)
     assert client.get_current_price.await_count == 1
-    assert client.get_orderbook_snapshot.await_count == 2
+    assert client.get_orderbook_snapshot.await_count == 1
     assert client.get_investor_trend_estimate.await_count == 1
     client.get_trade_strength.assert_not_awaited()
     client.get_program_net_buy.assert_not_awaited()
+
+    call_kwargs = client.get_orderbook_snapshot.call_args.kwargs
+    assert call_kwargs.get("market_div_code") == "J"
 
 
 
@@ -168,15 +173,17 @@ def test_fetch_single_stock_returns_minimal_row_schema() -> None:
         )
     )
 
-    # Then: exactly the reranker-required fields, nothing champion-era
+    # Then: exactly the reranker-required fields plus the new failure flag
     assert set(row) == {
         "종목명", "종목코드", "시장구분", "시가", "고가", "저가", "종가", "전일종가",
-        "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수", "등락률",
+        "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수", "등락률", "수급_실패",
     }
+    assert row["수급_실패"] is False
     assert failed == []
-    # Then: the ladder partition source is still produced for the cost research store
-    assert orderbook_rows
+    # Then: a single KRX-venue partition row is still produced for the cost research store
+    assert len(orderbook_rows) == 1
     assert {ob["capture_reason"] for ob in orderbook_rows} == {"decision"}
+    assert {ob["venue"] for ob in orderbook_rows} == {"J"}
 
 
 
@@ -203,6 +210,7 @@ def test_fetch_single_stock_reports_failed_apis_for_kept_endpoints() -> None:
     # Then: failures are surfaced, not swallowed, and the row still returns
     assert set(failed) == {"현재가", "투자자추정", "호가"}
     assert row["종목코드"] == "005930"
+    assert row["수급_실패"] is True
     assert orderbook_rows == []
 
 
@@ -326,3 +334,116 @@ def test_persist_daily_snapshot_skips_upsert_on_empty_frame(monkeypatch) -> None
     # Then
     assert stored == 0
     upsert_mock.assert_not_called()
+
+
+def test_parse_market_index_rate_returns_none_on_failure() -> None:
+    from src.daily.collect import parse_market_index_rate
+
+    # Given/When/Then: failure cases return None, not 0.0
+    assert parse_market_index_rate(None) is None
+    assert parse_market_index_rate({"rt_cd": "1"}) is None
+    assert parse_market_index_rate({"rt_cd": "0"}) is None
+    assert parse_market_index_rate({"rt_cd": "0", "output1": {}}) is None
+
+    # A genuine non-zero rate still parses normally
+    ok = parse_market_index_rate({"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "1.23"}})
+    assert ok == pytest.approx(1.23)
+
+    # A genuine zero computed from price/change (not the failure fallback) still returns 0.0
+    zero = parse_market_index_rate(
+        {"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "0.00", "bstp_nmix_prpr": "2500.0", "bstp_nmix_prdy_vrss": "0.0"}}
+    )
+    assert zero == pytest.approx(0.0)
+
+
+def test_validate_decision_window_raises_outside_window_and_force_bypasses() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pytest
+
+    from src.daily.collect import _validate_decision_window
+
+    kst = ZoneInfo("Asia/Seoul")
+
+    # Outside the window: raises
+    with pytest.raises(RuntimeError, match="결정 창"):
+        _validate_decision_window(datetime(2026, 9, 10, 19, 10, 0, tzinfo=kst))
+
+    # Inside the window: passes silently
+    _validate_decision_window(datetime(2026, 9, 10, 15, 25, 0, tzinfo=kst))
+    _validate_decision_window(datetime(2026, 9, 10, 15, 20, 0, tzinfo=kst))
+    _validate_decision_window(datetime(2026, 9, 10, 15, 30, 0, tzinfo=kst))
+
+    # force=True bypasses regardless of time
+    _validate_decision_window(datetime(2026, 9, 10, 19, 10, 0, tzinfo=kst), force=True)
+
+
+def test_fetch_single_stock_marks_supply_flow_failure_and_nans_the_fields() -> None:
+    import asyncio
+    import math
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
+    client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "1", "msg1": "fail"})
+    ladder = {"askp1": "18010", "bidp1": "17990"}
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
+
+    sem = asyncio.Semaphore(1)
+    row, failed, _orderbook_rows = asyncio.run(
+        collect.fetch_single_stock(
+            0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"}, 1, sem, client, object()
+        )
+    )
+
+    assert row["수급_실패"] is True
+    assert math.isnan(row["기관_순매수"])
+    assert math.isnan(row["외국인_순매수"])
+    assert "투자자추정" in failed
+    assert row["종목코드"] == "005930"
+
+
+def test_main_raises_outside_decision_window_without_force(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+    from zoneinfo import ZoneInfo
+
+    import pytest
+
+    from src.daily import collect
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 10, 19, 10, 0, tzinfo=tz)
+
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    never_called = AsyncMock()
+    monkeypatch.setattr(collect, "resolve_daily_candidates", never_called)
+
+    with pytest.raises(RuntimeError, match="결정 창"):
+        asyncio.run(collect.main(force=False))
+
+    never_called.assert_not_awaited()
+
+
+def test_parse_market_index_rate_fallthrough_returns_none() -> None:
+    from src.daily.collect import parse_market_index_rate
+
+    # rate_str reads exactly zero and price/change are also both zero -> prev_close == 0,
+    # cannot be recomputed -> falls through to the terminal `return None`
+    unresolvable = parse_market_index_rate(
+        {"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "0.00", "bstp_nmix_prpr": "0", "bstp_nmix_prdy_vrss": "0"}}
+    )
+    assert unresolvable is None
+
+    # a non-numeric field raises inside the try block -> except: pass -> same terminal None
+    malformed = parse_market_index_rate(
+        {"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "0.00", "bstp_nmix_prpr": "not-a-number", "bstp_nmix_prdy_vrss": "0"}}
+    )
+    assert malformed is None
