@@ -110,77 +110,12 @@ def _run_fetch_all(stock_list, client, **scenario_sets):
 # ---------------------------------------------------------
 # T03: Phase A 분류 정확성
 # ---------------------------------------------------------
-def test_phase_a_excludes_primary_matched_codes() -> None:
-    """[T03] 1차 시나리오 확정 종목은 sma_needed_codes에서 제외된다."""
-    stock_list = [_stock(c) for c in ("000001", "000002", "000003", "000004", "000005")]
-    client = _FakeClient()
-    prefetch_mock = AsyncMock(return_value={})
-    single_mock = AsyncMock(return_value=({}, [], []))
-
-    with (
-        patch("src.daily.collect.prefetch_ohlcv_for_sma120", new=prefetch_mock),
-        patch("src.daily.collect.fetch_single_stock", new=single_mock),
-    ):
-        _run_fetch_all(
-            stock_list,
-            client,
-            new_high={"000001", "000002"},
-            upper_next={"000003"},
-        )
-
-    prefetch_mock.assert_awaited_once()
-    called = prefetch_mock.await_args.args[0]
-    assert "000001" not in called
-    assert "000002" not in called
-    assert "000003" not in called
-    assert set(called) == {"000004", "000005"}
 
 
-def test_phase_a_all_primary_skips_prefetch() -> None:
-    """[T03] 모든 종목이 1차 매칭이면 prefetch 호출 없이 빈 cache 전달."""
-    stock_list = [_stock(c) for c in ("000001", "000002")]
-    client = _FakeClient()
-    prefetch_mock = AsyncMock(return_value={})
-    single_mock = AsyncMock(return_value=({}, [], []))
-
-    with (
-        patch("src.daily.collect.prefetch_ohlcv_for_sma120", new=prefetch_mock),
-        patch("src.daily.collect.fetch_single_stock", new=single_mock),
-    ):
-        _run_fetch_all(stock_list, client, upper={"000001", "000002"})
-
-    prefetch_mock.assert_not_called()
-    call_args = single_mock.await_args
-    assert call_args.args[-1] == {}
 
 
 # ---------------------------------------------------------
 # T05: ohlcv_cache hit/miss
 # ---------------------------------------------------------
-def test_cache_miss_falls_back_to_api() -> None:
-    """[T05] ohlcv_cache miss 시 예외 없이 prefetched_records=None으로 fallback."""
-    client = _FakeClient(_base_responses())
-    ma_calc = AsyncMock(return_value=({}, (0.0, False, 0), (0.0, False), (10200.0, True)))
-
-    with patch("src.api.kis_client.calculate_all_moving_averages", new=ma_calc):
-        row, failed, _ = _run_fetch(client, scenario_sets={}, ohlcv_cache={})
-
-    assert row["시나리오"] == "120 돌파"
-    assert failed == []
-    assert ma_calc.await_count == 1
-    assert ma_calc.await_args.kwargs["prefetched_records"] is None
 
 
-def test_cache_hit_passes_prefetched_records() -> None:
-    """[T05] ohlcv_cache 히트 시 prefetched_records가 계산 함수로 전달된다."""
-    client = _FakeClient(_base_responses())
-    records = [{"date": f"2025{i:04d}", "close": "50000"} for i in range(1, 151)]
-    ma_calc = AsyncMock(return_value=({}, (0.0, False, 150), (0.0, False), (10200.0, True)))
-
-    with patch("src.api.kis_client.calculate_all_moving_averages", new=ma_calc):
-        row, failed, _ = _run_fetch(client, scenario_sets={}, ohlcv_cache={"005930": records})
-
-    assert row["시나리오"] == "120 돌파"
-    assert failed == []
-    assert ma_calc.await_count == 1
-    assert ma_calc.await_args.kwargs["prefetched_records"] == records

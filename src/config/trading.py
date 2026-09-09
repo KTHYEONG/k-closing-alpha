@@ -34,7 +34,6 @@ class TradingSettings(BaseSettings):
 
     # API 요청 제한
     API_SEMAPHORE_LIMIT: int = 8
-    CANDIDATE_SOURCE_MODE: str = "manual"
 
     # 차트 필터링 설정
     EMA_PERIOD: int = 20

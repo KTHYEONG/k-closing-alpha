@@ -24,6 +24,7 @@ from src.serving.realtime.policy import (
     load_single_stock_policy,
     select_single_daily_trade,
 )
+from src.processing.schema import normalize_column_names
 from src.serving.realtime.features import build_snapshot_features
 
 from tests.unit.serving.realtime.fixtures import (
@@ -35,169 +36,33 @@ from tests.unit.serving.realtime.fixtures import (
 FEATURE_COLS = snapshot_feature_cols()
 
 
-def test_load_label_encoder_map_returns_empty_when_file_missing(tmp_path) -> None:
-    missing = tmp_path / "missing.json"
-    assert predict.load_label_encoder_map(str(missing)) == {}
-
-
-def test_load_label_encoder_map_builds_mapping(tmp_path) -> None:
-    encoder_file = tmp_path / "enc.json"
-    encoder_file.write_text(
-        json.dumps({"market_type": ["A", "B", "Unknown"]}), encoding="utf-8"
-    )
-    result = predict.load_label_encoder_map(str(encoder_file))
-    assert result["market_type"]["mapping"] == {"A": 0, "B": 1, "Unknown": 2}
-    assert result["market_type"]["unknown"] == 2
-
-
-def test_load_label_encoder_map_handles_corrupt_json(tmp_path) -> None:
-    encoder_file = tmp_path / "bad.json"
-    encoder_file.write_text("{ not json", encoding="utf-8")
-    assert predict.load_label_encoder_map(str(encoder_file)) == {}
-
-
-def test_load_and_preprocess_data_exits_on_missing_file() -> None:
-    with (
-        patch.object(predict.os.path, "exists", return_value=False),
-        patch.object(predict.sys, "exit", side_effect=SystemExit) as exit_mock,
-        pytest.raises(SystemExit),
-    ):
-        predict.load_and_preprocess_data("no_such.xlsx")
-    exit_mock.assert_called_once_with(1)
-
-
-def test_load_and_preprocess_data_exits_on_read_error() -> None:
-    with (
-        patch.object(predict.os.path, "exists", return_value=True),
-        patch.object(predict.pd, "read_csv", side_effect=OSError("boom")),
-        patch.object(predict.sys, "exit", side_effect=SystemExit),
-        pytest.raises(SystemExit),
-    ):
-        predict.load_and_preprocess_data("fake.xlsx")
-
-
-def test_load_and_preprocess_data_normalizes_columns() -> None:
-    raw = pd.DataFrame(
-        {
-            "종목코드": ["123", 456],
-            "시가총액": [10.0, 20.0],
-            "기관_순매수": [1.0, 2.0],
-            "상장일수": ["300", "500"],
-            "기타": ["x", "y"],
-        }
-    )
-    with (
-        patch.object(predict.os.path, "exists", return_value=True),
-        patch.object(predict.pd, "read_csv", return_value=raw),
-    ):
-        result = predict.load_and_preprocess_data("fake.xlsx")
-    assert result["종목코드"].tolist() == ["000123", "000456"]
-    assert result["기관_순매수"].tolist() == [100_000_000, 200_000_000]
-    assert result["시가총액"].tolist() == [10.0, 20.0]
-    assert (result["상장일수"] >= predict.settings.EMA_PERIOD).all()
-
-
-def test_load_and_preprocess_data_without_listing_days() -> None:
-    raw = pd.DataFrame(
-        {"종목코드": ["000123"], "거래대금": [3.0], "등락률": [1.0]}
-    )
-    with (
-        patch.object(predict.os.path, "exists", return_value=True),
-        patch.object(predict.pd, "read_csv", return_value=raw),
-    ):
-        result = predict.load_and_preprocess_data("fake.xlsx")
-    assert len(result) == 1
-    assert result["거래대금"].tolist() == [300_000_000]
-
-
-def test_load_and_preprocess_data_filters_insufficient_listing_days() -> None:
-    raw = pd.DataFrame({"종목코드": ["000001"], "상장일수": ["1"]})
-    with (
-        patch.object(predict.os.path, "exists", return_value=True),
-        patch.object(predict.pd, "read_csv", return_value=raw),
-    ):
-        result = predict.load_and_preprocess_data("fake.xlsx")
-    assert result.empty
-
-
-def test_load_and_preprocess_data_handles_alphanumeric_stock_codes(tmp_path) -> None:
-    csv_file = tmp_path / "test_stocks.csv"
-    csv_file.write_text("시나리오,종목명,종목코드\n폭증,삼성SDI,006400\n폭증,해치텍,0155E0\n", encoding="utf-8-sig")
-    result = predict.load_and_preprocess_data(str(csv_file))
-    assert result["종목코드"].tolist() == ["006400", "0155E0"]
 
 
 
-def test_explain_predictions_with_shap_skips_when_not_installed() -> None:
-    with patch.object(predict, "HAS_SHAP", False):
-        predict.explain_predictions_with_shap(None, None, [])
 
 
-def test_explain_predictions_with_shap_reports_features() -> None:
-    X = pd.DataFrame(
-        {"f_num": [1.0, 2.0], "f_str": ["high", "low"]}, index=[0, 1]
-    )
-    shap_values = np.array([[0.4, -0.1], [-0.2, 0.3]])
-
-    class FakeExplainer:
-        def __init__(self, model) -> None:
-            self.model = model
-
-        def shap_values(self, X_final) -> np.ndarray:
-            return shap_values
-
-    fake_shap = SimpleNamespace(TreeExplainer=FakeExplainer)
-    with (
-        patch.object(predict, "HAS_SHAP", True),
-        patch.object(predict, "shap", fake_shap, create=True),
-    ):
-        predict.explain_predictions_with_shap(
-            "model", X, stock_names=["A", "A"], top_n=2
-        )
 
 
-def test_explain_predictions_with_shap_handles_exception() -> None:
-    def boom(*args, **kwargs) -> None:
-        raise RuntimeError("shap failed")
-
-    fake_shap = SimpleNamespace(TreeExplainer=boom)
-    with (
-        patch.object(predict, "HAS_SHAP", True),
-        patch.object(predict, "shap", fake_shap, create=True),
-    ):
-        predict.explain_predictions_with_shap("model", None, [])
 
 
-def test_explain_predictions_with_shap_formats_non_numeric_values() -> None:
-    X = pd.DataFrame({"f_obj": [object(), object()]})
-    shap_values = np.array([[0.5], [-0.3]])
-
-    class FakeExplainer:
-        def __init__(self, model) -> None:
-            self.model = model
-
-        def shap_values(self, X_final) -> np.ndarray:
-            return shap_values
-
-    fake_shap = SimpleNamespace(TreeExplainer=FakeExplainer)
-    with (
-        patch.object(predict, "HAS_SHAP", True),
-        patch.object(predict, "shap", fake_shap, create=True),
-    ):
-        predict.explain_predictions_with_shap("model", X, ["A", "B"], top_n=1)
 
 
-def test_main_returns_when_no_actionable_stocks() -> None:
-    df_condition = pd.DataFrame(columns=["종목코드", "종목명", "시장구분"])
-    with (
-        patch.object(predict.os.path, "exists", return_value=False),
-        patch.object(
-            predict, "load_and_preprocess_data", return_value=df_condition
-        ),
-        patch.object(predict, "load_theme_from_db", return_value={}),
-        patch.object(predict, "batch_resolve_missing_themes"),
-    ):
-        predict.main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def test_legacy_gmm_logic_removed() -> None:
@@ -214,7 +79,6 @@ def test_legacy_gmm_logic_removed() -> None:
 def test_predict_exposes_only_live_control_apis() -> None:
     """예측 진입점은 학습/재학습 진입점을 노출하지 않습니다."""
     assert callable(predict.load_model_bundle)
-    assert callable(predict.predict_daily_sizing)
     assert not hasattr(predict, "run_model_pipeline")
     assert not hasattr(predict, "train_and_save_real_model_bundle")
     assert not hasattr(predict, "ensure_valid_model_bundle")
@@ -232,124 +96,8 @@ def _daily_snapshot_with_bundle() -> pd.DataFrame:
     return snapshot
 
 
-def test_main_runs_redesigned_pipeline_with_mocks() -> None:
-    """리디자인된 main() 이 표준 피처 엔지니어링 + Top N 출력으로 완주합니다."""
-    sizing_df = pd.DataFrame(
-        {
-            "종목명": ["AAA", "BBB"],
-            "theme_sector": ["테마A", "테마A"],
-            "chart_analysis": ["거래량 폭증", "상따"],
-            "selection_rank": [1, 2],
-            "change_rate": [5.0, 29.9],
-            "rank_score": [1.0, 0.5],
-            "utility_score": [0.5, 0.4],
-            "grade": ["Strong", "Pass"],
-            "allocation": [0.1, 0.0],
-            "kospi": [0.5, 0.5],
-            "kosdaq": [0.3, 0.3],
-            "date": ["2026-08-04", "2026-08-04"],
-            "close_price": [11000.0, 11000.0],
-            "prev_close_price": [10000.0, 10000.0],
-            "high_price": [11200.0, 11200.0],
-        }
-    )
-
-    async def fake_fetch(_code: str) -> tuple[float, float]:
-        return 15.0, 0.05
-
-    with (
-        patch.object(
-            predict, "load_and_preprocess_data", return_value=daily_snapshot_df()
-        ),
-        patch.object(
-            predict,
-            "load_theme_from_db",
-            return_value={"000001": "테마A", "000002": "테마A"},
-        ),
-        patch.object(predict, "batch_resolve_missing_themes"),
-        patch(
-            "src.api.kis_client.fetch_index_and_calculate_volatility",
-            side_effect=fake_fetch,
-        ),
-        patch.object(
-            predict, "load_model_bundle", return_value={"feature_cols": ["f1"]}
-        ),
-        patch.object(
-            predict,
-            "predict_daily_sizing",
-            side_effect=lambda df, *a, **kw: sizing_df[
-                sizing_df["chart_analysis"].isin(df["chart_analysis"])
-            ],
-        ),
-        patch.object(predict, "print_table") as print_table_mock,
-    ):
-        predict.main()
-
-    assert print_table_mock.call_count == 2
-    normal_rows = print_table_mock.call_args_list[0].args[0]
-    assert [r["Name"] for r in normal_rows] == ["AAA"]
-    assert normal_rows[0]["Decision"] == "Strong (10.0%)"
-    sangdda_rows = print_table_mock.call_args_list[1].args[0]
-    assert len(sangdda_rows) == 1
-    assert sangdda_rows[0]["Name"] == "BBB"
 
 
-def test_main_auto_resolves_themes_missing_from_local_cache() -> None:
-    """theme.parquet/DB에 없는 신규 종목은 theme_resolver 자동 분류로 처리된다(코드_테마_DB 시트 폐지 후)."""
-    sizing_df = pd.DataFrame(
-        {
-            "종목명": ["AAA", "BBB"],
-            "theme_sector": ["테마A", "테마B"],
-            "chart_analysis": ["거래량 폭증", "상따"],
-            "selection_rank": [1, 2],
-            "change_rate": [5.0, 29.9],
-            "rank_score": [1.0, 0.5],
-            "utility_score": [0.5, 0.4],
-            "grade": ["Strong", "Pass"],
-            "allocation": [0.1, 0.0],
-            "kospi": [0.5, 0.5],
-            "kosdaq": [0.3, 0.3],
-            "date": ["2026-08-04", "2026-08-04"],
-            "close_price": [11000.0, 11000.0],
-            "prev_close_price": [10000.0, 10000.0],
-            "high_price": [11200.0, 11200.0],
-        }
-    )
-
-    async def fake_fetch(_code: str) -> tuple[float, float]:
-        return 15.0, 0.05
-
-    with (
-        patch.object(
-            predict, "load_and_preprocess_data", return_value=daily_snapshot_df()
-        ),
-        # 000002는 로컬 캐시에 없어 자동 분류 대상이 됨 (신규 상장 등)
-        patch.object(
-            predict, "load_theme_from_db", return_value={"000001": "테마A"}
-        ),
-        patch.object(predict, "batch_resolve_missing_themes") as resolve_mock,
-        patch(
-            "src.api.kis_client.fetch_index_and_calculate_volatility",
-            side_effect=fake_fetch,
-        ),
-        patch.object(
-            predict, "load_model_bundle", return_value={"feature_cols": ["f1"]}
-        ),
-        patch.object(
-            predict,
-            "predict_daily_sizing",
-            side_effect=lambda df, *a, **kw: sizing_df[
-                sizing_df["chart_analysis"].isin(df["chart_analysis"])
-            ],
-        ),
-        patch.object(predict, "print_table"),
-    ):
-        predict.main()
-
-    resolve_mock.assert_called_once()
-    (missing_list,), kwargs = resolve_mock.call_args
-    assert kwargs == {}
-    assert [row["종목코드"] for row in missing_list] == ["000002"]
 
 
 def test_merged_normal_sangdda_scored_table_yields_one_decision() -> None:
@@ -435,7 +183,7 @@ def test_sangdda_feature_engineering_order() -> None:
     assert len(sangdda_rows) == 1
     assert sangdda_rows.iloc[0]["종목명"] == "BBB"
 
-    df_all = predict.normalize_column_names(df_all)
+    df_all = normalize_column_names(df_all)
     sangdda_mask = df_all["Scenario_Base"].str.contains("상따", na=False)
     if "change_rate" in df_all.columns:
         df_all.loc[sangdda_mask, "change_rate"] = 29.9
@@ -475,7 +223,7 @@ def test_scenario_realtime_sangtta_price_alignment_02() -> None:
     df_all["Scenario_Base"] = df_all["Scenario_List"]
     df_all = df_all.drop(columns=["Scenario_List"])
 
-    df_all = predict.normalize_column_names(df_all)
+    df_all = normalize_column_names(df_all)
     sangdda_mask = df_all["Scenario_Base"].str.contains("상따", na=False)
     if "change_rate" in df_all.columns:
         df_all.loc[sangdda_mask, "change_rate"] = 29.9
@@ -535,131 +283,15 @@ def test_predict_forces_pass_for_ceiling_candidates_only() -> None:
     assert df.loc[1, "allocation"] == 0.05
 
 
-def test_load_condition_snapshot_preserves_100m_units(tmp_path) -> None:
-    import pandas as pd
-
-    import src.daily.predict as predict_mod
-
-    # Given: a standard snapshot CSV whose amounts are in 100M KRW units
-    csv = tmp_path / "daily_stocks.csv"
-    pd.DataFrame({
-        "종목코드": ["1", "000002"],
-        "거래대금": [500.0, 300.0],
-        "시가총액": [3000.0, 2000.0],
-        "기관_순매수": [10.0, 20.0],
-    }).to_csv(csv, index=False, encoding="utf-8-sig")
-
-    # When
-    out = predict_mod.load_condition_snapshot(str(csv))
-
-    # Then: amounts untouched (the reranker trains on 100M-KRW units)
-    assert out["거래대금"].tolist() == [500.0, 300.0]
-    assert out["시가총액"].tolist() == [3000.0, 2000.0]
-    assert out["기관_순매수"].tolist() == [10.0, 20.0]
-    assert out["종목코드"].tolist() == ["000001", "000002"]
 
 
 
-def test_convert_amount_units_to_krw_scales_only_legacy_amount_columns() -> None:
-    import pandas as pd
-
-    import src.daily.predict as predict_mod
-
-    # Given
-    df = pd.DataFrame({
-        "거래대금": [500.0],
-        "기관_순매수": [10.0],
-        "외국인_순매수": [5.0],
-        "시가총액": [3000.0],
-    })
-
-    # When
-    out = predict_mod.convert_amount_units_to_krw(df)
-
-    # Then: only the legacy champion amount columns are rescaled
-    assert out["거래대금"].tolist() == [500.0 * 1e8]
-    assert out["기관_순매수"].tolist() == [10.0 * 1e8]
-    assert out["외국인_순매수"].tolist() == [5.0 * 1e8]
-    assert out["시가총액"].tolist() == [3000.0]
 
 
 
-def test_run_topk_ranker_sleeve_scores_wide_and_selects_admitted(monkeypatch) -> None:
-    import numpy as np
-    import pandas as pd
-
-    import src.daily.predict as predict_mod
-    from src.ml.research.v3_engine import FEATURE_COLS
-    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
-
-    # Given: a wide 4-name snapshot in raw 100M-KRW units where only 3 clear
-    # the cost-aware screen (S4 sits at 30000 KRW -> 16.67bp > the 7.5bp cap)
-    wide = pd.DataFrame({
-        "종목코드": ["000001", "000002", "000003", "000004"],
-        "종목명": ["AAA", "BBB", "CCC", "DDD"],
-        "종가": [18000.0, 18100.0, 17900.0, 30000.0],
-        "전일종가": [17142.86, 17238.10, 17047.62, 28571.43],
-        "고가": [18100.0, 18200.0, 18000.0, 30100.0],
-        "저가": [17800.0, 17900.0, 17700.0, 29800.0],
-        "시가": [17900.0, 18000.0, 17800.0, 29900.0],
-        "거래량": [1_000_000, 900_000, 1_100_000, 800_000],
-        "거래대금": [500.0, 450.0, 550.0, 400.0],
-        "시가총액": [3000.0, 2800.0, 3200.0, 5000.0],
-        "기관_순매수": [10.0, -5.0, 20.0, 8.0],
-        "외국인_순매수": [5.0, 12.0, -3.0, 6.0],
-        "시장구분": ["KOSPI", "KOSPI", "KOSPI", "KOSPI"],
-        "kospi": [0.52, 0.52, 0.52, 0.52],
-        "kosdaq": [-0.31, -0.31, -0.31, -0.31],
-        "v_kospi": [15.2, 15.2, 15.2, 15.2],
-    })
-    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
-    bundle["top_k"] = 3
-
-    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
-    monkeypatch.setattr(predict_mod, "load_condition_snapshot", lambda _p: wide)
-    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
-
-    # When
-    out = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"))
-
-    # Then: the tick-cost rejected name never enters, weights are uniform
-    assert len(out) == 3
-    assert sorted(out["symbol"].tolist()) == ["000001", "000002", "000003"]
-    assert np.allclose(out["allocation"].to_numpy(dtype=np.float64), 1.0 / 3.0)
-    assert sorted(out["name"].tolist()) == ["AAA", "BBB", "CCC"]
 
 
 
-def test_run_topk_ranker_sleeve_warns_when_bundle_missing(monkeypatch, caplog) -> None:
-    import logging
-
-    import pandas as pd
-
-    import src.daily.predict as predict_mod
-
-    # Given: the sleeve is in scope but no production bundle is published yet
-    wide = pd.DataFrame({
-        "종목코드": ["000001"], "종목명": ["AAA"], "종가": [18000.0],
-        "전일종가": [17142.86], "고가": [18100.0], "저가": [17800.0], "시가": [17900.0],
-        "거래량": [1_000_000], "거래대금": [500.0], "시가총액": [3000.0],
-        "기관_순매수": [10.0], "외국인_순매수": [5.0], "시장구분": ["KOSPI"],
-        "kospi": [0.52], "kosdaq": [-0.31], "v_kospi": [15.2],
-    })
-    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
-    monkeypatch.setattr(predict_mod, "load_condition_snapshot", lambda _p: wide)
-
-    def _missing(import_dir=None):
-        raise FileNotFoundError("model artifact bundle not found")
-
-    monkeypatch.setattr(predict_mod, "load_model_bundle", _missing)
-
-    # When
-    with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
-        out = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"))
-
-    # Then: fails soft, but never silently
-    assert out.empty
-    assert any(rec.levelno >= logging.WARNING for rec in caplog.records)
 
 
 
@@ -670,27 +302,22 @@ def test_main_automated_mode_prints_only_topk_decision_table(monkeypatch) -> Non
 
     import src.daily.predict as predict_mod
 
-    # Given: automated mode with a populated top-3 sleeve
+    # Given: a populated top-3 sleeve
     sleeve_df = pd.DataFrame({
         "symbol": ["000001", "000002", "000003"],
         "name": ["AAA", "BBB", "CCC"],
         "pred": [0.021, 0.017, 0.011],
         "allocation": [1.0 / 3.0] * 3,
     })
-    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
     monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", Mock(return_value=sleeve_df))
-    champion_mock = Mock()
-    monkeypatch.setattr(predict_mod, "predict_daily_sizing", champion_mock)
     print_table_mock = Mock()
     monkeypatch.setattr(predict_mod, "print_table", print_table_mock)
 
     # When
     predict_mod.main()
 
-    # Then: the reranker table is the single decision surface; champion's
-    # fixed-threshold grading is never even computed for this population
+    # Then: the reranker table is the single decision surface
     assert print_table_mock.call_count == 1
-    champion_mock.assert_not_called()
     rows = print_table_mock.call_args_list[0].args[0]
     assert [r["Code"] for r in rows] == ["000001", "000002", "000003"]
     assert rows[0]["Alloc%"] == pytest.approx(33.3, abs=0.1)
@@ -705,8 +332,7 @@ def test_main_automated_mode_warns_and_prints_nothing_when_no_decision(monkeypat
 
     import src.daily.predict as predict_mod
 
-    # Given: automated mode where the sleeve yields no actionable decision
-    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "automated")
+    # Given: the sleeve yields no actionable decision
     monkeypatch.setattr(
         predict_mod, "run_topk_ranker_sleeve", Mock(return_value=pd.DataFrame())
     )
@@ -723,69 +349,126 @@ def test_main_automated_mode_warns_and_prints_nothing_when_no_decision(monkeypat
 
 
 
-def test_main_manual_mode_keeps_champion_tables_unchanged(monkeypatch) -> None:
-    from unittest.mock import Mock
 
+
+
+
+
+
+def test_load_daily_snapshot_reads_archive_store_and_zero_fills_code(monkeypatch) -> None:
     import pandas as pd
 
     import src.daily.predict as predict_mod
 
-    sizing_df = pd.DataFrame({
-        "종목명": ["AAA", "BBB"], "theme_sector": ["테마A", "테마A"],
-        "chart_analysis": ["거래량 폭증", "상따"], "selection_rank": [1, 2],
-        "change_rate": [5.0, 29.9], "rank_score": [1.0, 0.5], "utility_score": [0.5, 0.4],
-        "grade": ["Strong", "Pass"], "allocation": [0.1, 0.0],
-        "kospi": [0.5, 0.5], "kosdaq": [0.3, 0.3], "date": ["2026-08-04", "2026-08-04"],
-        "close_price": [11000.0, 11000.0], "prev_close_price": [10000.0, 10000.0],
-        "high_price": [11200.0, 11200.0],
+    # Given: the archive store returns the day's wide snapshot in 100M-KRW units
+    captured = {}
+
+    def _fake_fetch(snapshot_date=None, **kwargs):
+        captured["snapshot_date"] = snapshot_date
+        return pd.DataFrame({"종목코드": [5930, "000660"], "거래대금": [500.0, 300.0], "admitted": [True, False]})
+
+    monkeypatch.setattr(predict_mod, "fetch_archive_snapshot", _fake_fetch)
+
+    # When
+    out = predict_mod.load_daily_snapshot(pd.Timestamp("2026-09-09"))
+
+    # Then
+    assert captured["snapshot_date"] == "2026-09-09"
+    assert out["종목코드"].tolist() == ["005930", "000660"]
+    assert out["거래대금"].tolist() == [500.0, 300.0]
+    assert out["admitted"].tolist() == [True, False]
+
+
+
+def test_run_topk_ranker_sleeve_uses_stored_admitted_without_recompute(monkeypatch) -> None:
+    import numpy as np
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    # Given: a 4-name wide snapshot where the store already marked one rejected
+    wide = pd.DataFrame({
+        "종목코드": ["000001", "000002", "000003", "000004"],
+        "종목명": ["AAA", "BBB", "CCC", "DDD"],
+        "종가": [18000.0, 18100.0, 17900.0, 30000.0],
+        "전일종가": [17142.86, 17238.10, 17047.62, 28571.43],
+        "고가": [18100.0, 18200.0, 18000.0, 30100.0],
+        "저가": [17800.0, 17900.0, 17700.0, 29800.0],
+        "시가": [17900.0, 18000.0, 17800.0, 29900.0],
+        "거래량": [1_000_000, 900_000, 1_100_000, 800_000],
+        "거래대금": [500.0, 450.0, 550.0, 400.0],
+        "시가총액": [3000.0, 2800.0, 3200.0, 5000.0],
+        "기관_순매수": [10.0, -5.0, 20.0, 8.0],
+        "외국인_순매수": [5.0, 12.0, -3.0, 6.0],
+        "시장구분": ["KOSPI", "KOSPI", "KOSPI", "KOSPI"],
+        "kospi": [0.52] * 4,
+        "kosdaq": [-0.31] * 4,
+        "v_kospi": [15.2] * 4,
+        "admitted": [True, True, True, False],
     })
+    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
+    bundle["top_k"] = 3
 
-    async def fake_fetch(_code: str) -> tuple[float, float]:
-        return 15.0, 0.05
-
-    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
-    sleeve_mock = Mock(return_value=pd.DataFrame())
-    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", sleeve_mock)
-
-    with (
-        patch.object(predict_mod, "load_and_preprocess_data", return_value=daily_snapshot_df()),
-        patch.object(predict_mod, "load_theme_from_db",
-                     return_value={"000001": "테마A", "000002": "테마A"}),
-        patch.object(predict_mod, "batch_resolve_missing_themes"),
-        patch("src.api.kis_client.fetch_index_and_calculate_volatility", side_effect=fake_fetch),
-        patch.object(predict_mod, "load_model_bundle", return_value={"feature_cols": ["f1"]}),
-        patch.object(predict_mod, "predict_daily_sizing",
-                     side_effect=lambda df, *a, **kw: sizing_df[
-                         sizing_df["chart_analysis"].isin(df["chart_analysis"])]),
-        patch.object(predict_mod, "print_table") as print_table_mock,
-    ):
-        predict_mod.main()
-
-    # Then: byte-identical to the pre-migration manual behaviour
-    assert print_table_mock.call_count == 2
-    sleeve_mock.assert_not_called()
-
-
-
-def test_run_topk_ranker_sleeve_short_circuits_in_manual_mode(monkeypatch) -> None:
-    from unittest.mock import Mock
-
-    import pandas as pd
-
-    import src.daily.predict as predict_mod
-
-    # Given: manual mode -- the reranker sleeve is entirely out of scope
-    monkeypatch.setattr(predict_mod.settings, "CANDIDATE_SOURCE_MODE", "manual")
-    snapshot_mock = Mock()
-    bundle_mock = Mock()
-    monkeypatch.setattr(predict_mod, "load_condition_snapshot", snapshot_mock)
-    monkeypatch.setattr(predict_mod, "load_model_bundle", bundle_mock)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
 
     # When
     out = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"))
 
-    # Then: short-circuits before touching disk or artifacts
-    assert isinstance(out, pd.DataFrame)
+    # Then: the stored verdict alone decides eligibility
+    assert len(out) == 3
+    assert sorted(out["symbol"].tolist()) == ["000001", "000002", "000003"]
+    assert np.allclose(out["allocation"].to_numpy(dtype=np.float64), 1.0 / 3.0)
+    assert sorted(out["name"].tolist()) == ["AAA", "BBB", "CCC"]
+
+
+
+def test_run_topk_ranker_sleeve_warns_when_bundle_missing(monkeypatch, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    wide = pd.DataFrame({
+        "종목코드": ["000001"], "종목명": ["AAA"], "종가": [18000.0], "전일종가": [17142.86],
+        "고가": [18100.0], "저가": [17800.0], "시가": [17900.0], "거래량": [1_000_000],
+        "거래대금": [500.0], "시가총액": [3000.0], "기관_순매수": [10.0], "외국인_순매수": [5.0],
+        "시장구분": ["KOSPI"], "kospi": [0.52], "kosdaq": [-0.31], "v_kospi": [15.2],
+        "admitted": [True],
+    })
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+
+    def _missing(import_dir=None):
+        raise FileNotFoundError("model artifact bundle not found")
+
+    monkeypatch.setattr(predict_mod, "load_model_bundle", _missing)
+
+    # When
+    with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
+        out = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"))
+
+    # Then: fails soft, never silently
     assert out.empty
-    snapshot_mock.assert_not_called()
-    bundle_mock.assert_not_called()
+    assert any(rec.levelno >= logging.WARNING for rec in caplog.records)
+
+
+
+def test_predict_module_drops_champion_surface() -> None:
+    import src.daily.predict as predict_mod
+
+    # Then: no champion grading/display helpers and no CSV loader remain
+    for gone in (
+        "load_condition_snapshot",
+        "convert_amount_units_to_krw",
+        "load_and_preprocess_data",
+        "build_result_rows",
+        "select_top_actionable",
+        "explain_predictions_with_shap",
+        "load_label_encoder_map",
+        "LABEL_ENCODER_MAP",
+        "predict_daily_sizing",
+    ):
+        assert not hasattr(predict_mod, gone), gone

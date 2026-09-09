@@ -14,8 +14,6 @@ TABLE_NAME = "condition_history"
 SNAP_DATE_COL = "스냅샷_날짜"
 STOCK_CODE_COL = "종목코드"
 RANK_COL = "순위"
-# 조회하고 싶을 때 YYYY-MM-DD 형식으로 지정.
-FETCH_TARGET_DATE = None  # "2025-12-09"
 
 # point-in-time 무결성 타임스탬프 (Asia/Seoul timezone-aware)
 SNAPSHOT_TIMESTAMP_COL = "snapshot_timestamp"
@@ -75,68 +73,6 @@ def upsert_history(df: pd.DataFrame, db_path: str) -> None:
         upsert_condition_parquet(df)
     except Exception as e:
         logger.error("Parquet 조건검색 아카이브 저장 오류: %s", e)
-
-
-# 기존에 저장해두던 데이터 DB로 마이그레이션
-def import_csv_history_if_needed(history_csv: str, history_db: str) -> None:
-    """Import legacy CSV history into SQLite if DB is empty or missing dates."""
-    if not os.path.exists(history_csv):
-        return
-
-    # CSV에 있는 날짜 집합
-    try:
-        csv_dates = set(
-            pd.read_csv(history_csv, usecols=[SNAP_DATE_COL])[SNAP_DATE_COL]
-            .dropna()
-            .unique()
-        )
-    except ValueError:
-        logger.info(
-            f"[warn] CSV에 '{SNAP_DATE_COL}' 컬럼이 없어 import를 건너뜁니다: {history_csv}"
-        )
-        return
-
-    with sqlite3.connect(history_db) as conn:
-        table_exists = (
-            conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                (TABLE_NAME,),
-            ).fetchone()
-            is not None
-        )
-        if not table_exists:
-            db_dates = set()
-        else:
-            db_dates = {
-                row[0]
-                for row in conn.execute(
-                    f'SELECT DISTINCT "{SNAP_DATE_COL}" FROM {TABLE_NAME}'
-                ).fetchall()
-                if row[0] is not None
-            }
-
-    missing_dates = csv_dates - db_dates
-    if not table_exists and not csv_dates:
-        logger.info(
-            f"[warn] CSV에 '{SNAP_DATE_COL}' 데이터가 비어 import를 건너뜁니다: {history_csv}"
-        )
-        return
-    if not missing_dates and table_exists:
-        return
-
-    df_csv = pd.read_csv(history_csv, dtype={"종목코드": str})
-    if SNAP_DATE_COL not in df_csv.columns:
-        logger.info(
-            f"[warn] CSV에 '{SNAP_DATE_COL}' 컬럼이 없어 import를 건너뜁니다: {history_csv}"
-        )
-        return
-
-    # 기존 CSV에 시간 컬럼이 있어도 제거
-    if "스냅샷_시간" in df_csv.columns:
-        df_csv = df_csv.drop(columns=["스냅샷_시간"])
-
-    upsert_history(df_csv, history_db)
-    logger.info(f"[done] 기존 CSV 히스토리를 SQLite로 마이그레이션: {history_db}")
 
 
 def fetch_date_rows(date_str: str, history_db: str) -> pd.DataFrame:
@@ -424,7 +360,7 @@ def fetch_archive_snapshot(
             df = df.sort_values(SNAPSHOT_TIMESTAMP_COL, ascending=True, na_position="first", kind="stable")
         df = df.drop_duplicates(subset=[SNAP_DATE_COL, STOCK_CODE_COL], keep="last")
     return df.sort_values(
-        [SNAP_DATE_COL, "선정순위"],
+        [SNAP_DATE_COL, STOCK_CODE_COL],
         ascending=[True, True],
         na_position="last",
         kind="stable",
@@ -467,51 +403,3 @@ def export_archive_for_spreadsheet(
 
     df = df.reindex(columns=ARCHIVE_COLUMN_ORDER).fillna("")
     return df.to_csv(sep=sep, index=False, header=include_header, lineterminator="\n")
-
-
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-    )
-    history_dir = settings.HISTORY_DIR
-    history_dir.mkdir(parents=True, exist_ok=True)
-
-    # 표준 CSV(utf-8-sig) 경로 우선 인식
-    csv_latest = str(settings.CONDITION_CSV_PATH)
-    history_csv = str(settings.HISTORY_CSV_PATH)
-    history_db = str(settings.HISTORY_DB_PATH)
-
-    import_csv_history_if_needed(history_csv, history_db)
-
-    if FETCH_TARGET_DATE:
-        df = fetch_date_rows(FETCH_TARGET_DATE, history_db)
-        if df.empty:
-            logger.info(f"[info] 조회된 데이터가 없습니다: {FETCH_TARGET_DATE}")
-        else:
-            target_file = os.path.join(history_dir, f"archive_{FETCH_TARGET_DATE}.tsv")
-            df.to_csv(target_file, sep="\t", index=False)
-            logger.info(f"[done] 조회 결과를 저장했습니다: {target_file}")
-        return
-
-    if not os.path.exists(csv_latest):
-        logger.warning(f"[skip] 아카이브할 최신 조건검색 CSV 파일이 없습니다: {csv_latest}")
-        return
-
-    # 최신 결과 불러오기 (종목코드 0 누락 및 지수 표기 방지)
-    df = pd.read_csv(csv_latest, encoding="utf-8-sig", dtype={"종목코드": str})
-
-    # 파일 수정 시각을 스냅샷 시각으로 사용 (없으면 현재 시각)
-    snap_dt = datetime.fromtimestamp(os.path.getmtime(csv_latest))
-    snapshot_date = snap_dt.strftime("%Y-%m-%d")
-    df.insert(0, SNAP_DATE_COL, snapshot_date)
-    df[SNAPSHOT_TIMESTAMP_COL] = snap_dt
-
-    stored_rows = upsert_archive_snapshot(df, snapshot_date=snapshot_date)
-    logger.info(
-        f"[SUCCESS] 조건검색 아카이브 완료 (날짜: {snapshot_date}, 저장 종목 수: {stored_rows}건)"
-    )
-
-
-if __name__ == "__main__":
-    main()

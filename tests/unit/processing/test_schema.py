@@ -13,7 +13,6 @@ from src.processing.schema import (
     ARCHIVE_COLUMN_ORDER,
     LEGACY_RAW_TO_KOREAN_MAP,
     RAW_TO_STANDARD_MAP,
-    STANDARD_COLUMN_ORDER,
     STANDARD_TO_KOREAN_MAP,
     StandardColumns,
     normalize_column_names,
@@ -49,13 +48,6 @@ def test_standard_columns_constants() -> None:
     assert StandardColumns.WIN_CLASSIFICATION == "Win"
 
 
-def test_standard_column_order_lengths() -> None:
-    """스프레드시트 표준 컬럼 순서의 길이와 필수 컬럼을 검증합니다."""
-    assert len(ARCHIVE_COLUMN_ORDER) == 37
-    assert len(STANDARD_COLUMN_ORDER) == 35
-    assert ARCHIVE_COLUMN_ORDER[0] == "스냅샷_날짜"
-    assert "종목코드" in ARCHIVE_COLUMN_ORDER
-    assert "시나리오" in STANDARD_COLUMN_ORDER
 
 
 def test_korean_to_standard_roundtrip() -> None:
@@ -98,16 +90,32 @@ def test_legacy_mapping_file_removal() -> None:
     assert RAW_TO_STANDARD_MAP["(매수날짜)"] == "trade_date"
 
 
-def test_archive_and_standard_column_order_include_orderbook_and_sor_fields() -> None:
-    from src.processing.schema import ARCHIVE_COLUMN_ORDER, STANDARD_COLUMN_ORDER
 
-    new_fields = [
-        "krx_현재가", "nxt_현재가", "sor_effective_price",
-        "krx_매도호가1", "krx_매수호가1", "krx_매도잔량", "krx_매수잔량",
-        "nxt_매도호가1", "nxt_매수호가1", "nxt_매도잔량", "nxt_매수잔량",
+
+
+def test_archive_column_order_is_minimal_and_carries_admitted() -> None:
+    from src.processing.schema import ARCHIVE_COLUMN_ORDER
+
+    # Then: the reranker-required set plus the PIT admission verdict
+    assert ARCHIVE_COLUMN_ORDER == [
+        "스냅샷_날짜", "종목코드", "종목명", "시장구분", "시가", "고가", "저가", "종가",
+        "전일종가", "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수",
+        "등락률", "kospi", "kosdaq", "v_kospi", "admitted",
     ]
-    for f in new_fields:
-        assert f in ARCHIVE_COLUMN_ORDER
-        assert f in STANDARD_COLUMN_ORDER
-    assert len(ARCHIVE_COLUMN_ORDER) == 26 + len(new_fields)
-    assert len(STANDARD_COLUMN_ORDER) == 24 + len(new_fields)
+
+    # Then: champion-era and flat level-1 orderbook columns are gone (the full
+    # ladder lives in the orderbook partition store instead)
+    dropped = {
+        "시나리오", "테마_섹터", "선정순위", "총_종목수", "평균_거래대금",
+        "체결강도", "프로그램_순매수", "v_kosdaq", "sor_effective_price",
+        "krx_현재가", "nxt_현재가", "krx_매도호가1", "nxt_매수잔량",
+    }
+    assert dropped.isdisjoint(ARCHIVE_COLUMN_ORDER)
+
+
+
+def test_standard_column_order_is_removed_from_schema() -> None:
+    import src.processing.schema as schema
+
+    # Then: the spreadsheet copy-paste column order no longer exists
+    assert not hasattr(schema, "STANDARD_COLUMN_ORDER")
