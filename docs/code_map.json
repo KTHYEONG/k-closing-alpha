@@ -265,7 +265,10 @@
     "testing": "tests/unit/ml/test_ml_foundation_parity.py"
   },
   "src/ml/research/v3_engine.py": {
-    "testing": "tests/unit/ml/test_research_v3.py"
+    "testing": [
+      "tests/unit/ml/test_research_v3.py",
+      "tests/unit/ml/test_topk_ranker_research.py"
+    ]
   },
   "src/ml/research/v3_metrics.py": {
     "testing": "tests/unit/ml/test_research_v3.py"
@@ -284,6 +287,9 @@
   },
   "src/ml/sector_features.py": {
     "testing": "tests/unit/ml/test_sector_features.py"
+  },
+  "src/ml/topk_ranker_research.py": {
+    "testing": "tests/unit/ml/test_topk_ranker_research.py"
   },
   "src/ml/tuning.py": {
     "testing": "tests/unit/ml/test_tuning.py"
