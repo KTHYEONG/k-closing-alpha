@@ -679,28 +679,6 @@ def run_backfill_market_regime_factors(
     return merged
 
 
-def run_backfill_market_factors(
-    *,
-    start: str | None = None,
-    end: str | None = None,
-    use_snapshot_range: bool = True,
-    out_path: Path | None = None,
-    config: PipelineConfig = DEFAULT_CONFIG,
-    fetch_cfg: MarketFactorFetchConfig = MarketFactorFetchConfig(),
-) -> pd.DataFrame:
-    """Backward-compatible wrapper."""
-    return run_backfill_market_regime_factors(
-        start=start,
-        end=end,
-        use_snapshot_range=use_snapshot_range,
-        out_path=out_path,
-        collect_vix=True,
-        collect_krx_breadth=True,
-        config=config,
-        fetch_cfg=fetch_cfg,
-    )
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Backfill date-level market regime factors (VIX + KRX breadth via OpenAPI->pykrx fallback)."
