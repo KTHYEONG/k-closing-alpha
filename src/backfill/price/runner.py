@@ -108,7 +108,14 @@ def fetch_one_symbol(
     return out
 
 
-def _to_parquet(df: pd.DataFrame, parquet_path: Path) -> None:
+def _to_parquet(
+    df: pd.DataFrame,
+    parquet_path: Path,
+    fetch_cfg: FetchConfig | None = None,
+    market_hint: dict[str, str] | None = None,
+) -> None:
+    from src.backfill.price.corporate_actions import heal_corporate_action_breach
+
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
     if parquet_path.exists():
         old = pd.read_parquet(parquet_path)
@@ -118,10 +125,15 @@ def _to_parquet(df: pd.DataFrame, parquet_path: Path) -> None:
         merged = merged.sort_values(["symbol", "date"]).drop_duplicates(
             subset=["symbol", "date"], keep="last"
         )
+        if fetch_cfg is not None and market_hint is not None:
+            merged = heal_corporate_action_breach(merged, fetch_cfg, market_hint)
         merged = heal_price_history_panel(merged)
         write_price_history_parquet(merged, parquet_path)
     else:
-        write_price_history_parquet(heal_price_history_panel(df), parquet_path)
+        base = df
+        if fetch_cfg is not None and market_hint is not None:
+            base = heal_corporate_action_breach(base, fetch_cfg, market_hint)
+        write_price_history_parquet(heal_price_history_panel(base), parquet_path)
 
 
 def _load_existing_symbol_last_dates(parquet_path: Path) -> dict[str, pd.Timestamp]:
@@ -243,7 +255,8 @@ def run_backfill(
     )
     history = _merge_index_returns(history, fetch_cfg=fetch_cfg)
 
-    _to_parquet(history, parquet_path=parquet_out)
+    market_hint = universe[["symbol", "market"]].dropna().drop_duplicates(subset=["symbol"], keep="last").set_index("symbol")["market"].to_dict()
+    _to_parquet(history, parquet_path=parquet_out, fetch_cfg=fetch_cfg, market_hint=market_hint)
     logger.info("[DATA] stage=backfill path=%s status=saved", parquet_out)
 
     logger.info(

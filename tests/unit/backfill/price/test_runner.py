@@ -80,3 +80,44 @@ def test_to_parquet_heals_merged_panel_across_incremental_runs(tmp_path) -> None
         [0.05, 0.04, 11000.0 / 10920.0 - 1.0],
         rtol=1e-9,
     )
+
+
+def test_to_parquet_invokes_guard_on_both_exists_and_new_file_branches(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.backfill.price import corporate_actions, runner as mod
+    from src.backfill.price.config import FetchConfig
+
+    calls: list[str] = []
+
+    def _spy(merged, fetch_cfg, market_hint):
+        calls.append("called")
+        return merged
+
+    # _to_parquet가 함수 내부에서 매 호출마다 다시 임포트하므로 corporate_actions 쪽만 패치하면 된다.
+    monkeypatch.setattr(corporate_actions, "heal_corporate_action_breach", _spy)
+
+    # heal_price_history_panel이 요구하는 전체 컬럼(특히 prev_close)을 갖춘 프레임이어야 한다.
+    frame = pd.DataFrame({
+        "date": pd.to_datetime(["2026-09-01"]),
+        "symbol": ["005930"],
+        "open": [70_000], "high": [70_000], "low": [70_000], "close": [70_000],
+        "prev_close": [69_500],
+        "market_cap_100m": [900.0], "trade_value_100m": [300.0],
+        "daily_change_pct": [70_000 / 69_500 - 1.0],
+        "market": ["KOSPI"], "volume": [1000],
+    })
+    target = tmp_path / "price_history.parquet"
+    fetch_cfg = FetchConfig()
+
+    # When: 신규 생성 분기(else)에서 가드 인자를 넘긴다
+    mod._to_parquet(frame, target, fetch_cfg=fetch_cfg, market_hint={"005930": "KOSPI"})
+
+    # Then: 가드가 실제로 실행됐다
+    assert calls == ["called"]
+
+    # When: 기존 파일이 있는 병합 분기에서도 가드 인자를 넘긴다
+    mod._to_parquet(frame, target, fetch_cfg=fetch_cfg, market_hint={"005930": "KOSPI"})
+
+    # Then: 두 번째(병합) 호출에서도 실행됐다
+    assert calls == ["called", "called"]
