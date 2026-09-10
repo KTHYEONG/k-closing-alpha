@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=oneshot
 WorkingDirectory=/home/kth/k-closing-alpha
-ExecStart=/usr/bin/env uv run python -m src.tools.daily_audit
+ExecStart=/home/kth/.local/bin/uv run python -m src.tools.daily_audit
 
 [Install]
 WantedBy=default.target

@@ -1,7 +1,8 @@
 [Unit]
 Description=KCA close finalization (confirmed EOD update)
+OnSuccess=kca-paper-entry.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=/home/kth/k-closing-alpha
-ExecStart=/usr/bin/env uv run python -m src.daily.finalize_close
+ExecStart=/home/kth/.local/bin/uv run python -m src.daily.finalize_close
