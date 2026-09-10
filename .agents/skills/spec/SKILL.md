@@ -53,27 +53,41 @@ Downstream `implement` models have low reasoning capacity and cannot extrapolate
 
 ## Chat Output Format
 
-Keep chat response structured, scannable, and actionable using tables and clear bullet points (avoid dense wall-of-text paragraphs).
-**Language Requirement:** All instructions and template fields below are written in English, but the actual rendered chat response to the user MUST be translated and presented in Korean (한국어) for intuitive review.
+Keep chat response structured, scannable, and hierarchical using progressive disclosure (Executive Summary -> Invariants -> Changes & Wiring -> Verification). Avoid flat symbol-by-symbol tables or text walls.
+**Language Requirement:** All instructions and template fields below are written in English, but the actual rendered chat response to the user MUST be translated and presented in Korean (한국어).
 
 ### 📐 [SPEC] <Feature Name>
+> 📄 **Contract**: `docs/specs/<feature>_contract.json`  
+> 📊 **Scale**: <N> files · <N> changes · <N> wiring · <N> scenarios
 
-#### 1. 변경 요약 (Changes & Wiring)
-| 구분 (Category) | 대상 파일 / 심볼 (Target / Symbol) | 변경 핵심 (Core Logic) |
+#### 1. Executive Summary
+- **Purpose**: <Summary of core problem and why this change is necessary>
+- **Key Changes**: <Core architectural and logic changes (1~3 concise points)>
+- ⚠️ **Breaking Changes & Impact**: <Schema/API incompatibilities, or "None">
+
+#### 2. Core Invariants & Guardrails
+- 🛡️ **<Invariant Name>** (<Fail-Closed / Rule>): <Boundary condition and behavior>
+- 🚪 **<Chokepoint / Contract>**: <Parameter rules, signature constraints>
+- 🚫 **<Gate / Rejection Rule>**: <Early-abort criteria>
+
+#### 3. Changes & Wiring Summary
+| Category | Target Module / File | Core Logic & Wiring Details |
 | :--- | :--- | :--- |
-| **Target** | `<target_file>` / `<symbol_name>` | <Summary of role and behavior in Korean> |
-| **Wiring** | `<caller_file>` / `<anchor_location>` | <Summary of caller hookup in Korean> |
+| **Target** | `[<target_file>](file:///<target_file>)` | • `<symbol_1>`: <Core logic change><br>• `<symbol_2>`: <Core logic change> |
+| **Wiring** | `[<caller_file>](file:///<caller_file>)` | • `<anchor>`: <Caller wiring and parameter pass-through> |
 
-#### 2. 핵심 요구사항 (Key Requirements)
-- <Core domain constraints, invariants, or performance criteria in Korean>
+#### 4. Verification Plan
+| Scope | Count | Key Test Cases | Success Criteria |
+| :--- | :---: | :--- | :--- |
+| **Unit** | <N> | • <Normal / boundary cases><br>• <Error / fail-closed cases> | <Assertion or exception criterion> |
+| **Wiring** | <N> | • <Caller / pipeline integration cases><br>• <CLI / option routing validation> | <Pipeline run / zero unhandled exception> |
+| **Gate** | - | `lean_check --pre-impl` AST & Static Verification | **PASS** (<N>/<N> skeleton AST valid, 0 diagnostics) |
 
-#### 3. 검증 시나리오 요약 (Test Verification Summary)
-- **Unit (<N>개)**: <High-level summary of covered units and core invariants in Korean>
-- **Wiring (<N>개)**: <High-level summary of caller/pipeline integration in Korean>
-- **사전 검증 게이트**: `lean_check --pre-impl` 통과 (<N>/<N> skeleton AST valid)
+#### 5. Out of Scope
+- <Deferred items and rationale, or "None">
 
 ---
-👉 다음 단계: `/implement docs/specs/<feature>_contract.json`
+👉 Next Step: `/implement docs/specs/<feature>_contract.json`
 
 
 
