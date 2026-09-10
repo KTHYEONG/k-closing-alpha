@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA close finalization (Mon-Fri 15:30:30 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 15:30:30 Asia/Seoul
+Persistent=false
+Unit=kca-finalize-close.service
+
+[Install]
+WantedBy=timers.target

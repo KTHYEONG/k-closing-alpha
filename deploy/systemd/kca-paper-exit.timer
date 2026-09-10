@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA paper exit (Mon-Fri 09:00 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 09:00:00 Asia/Seoul
+Persistent=false
+Unit=kca-paper-exit.service
+
+[Install]
+WantedBy=timers.target

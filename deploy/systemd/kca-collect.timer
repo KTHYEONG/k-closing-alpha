@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA daily collect (Mon-Fri 15:15 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 15:15:00 Asia/Seoul
+Persistent=false
+Unit=kca-collect.service
+
+[Install]
+WantedBy=timers.target
