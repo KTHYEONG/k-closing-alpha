@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "kis_client_facade_cleanup",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_kis_client_facade_cleanup",
+      "domain": "infra",
+      "title": "kis_client 호환 퍼사드 완전 은퇴",
+      "why": "src/api/kis_client.py의 '마이그레이션 기간' docstring 주장이 3단계 리팩토링보다 훨씬 전부터 이미 거짓이었고, AST 재측정으로 18개 파일 전부가 순수 기계적 치환임을 확인",
+      "resolution": "퍼사드 삭제, 17개 import 사이트+42개 patch 문자열을 실제 모듈(kis.client/indicators/rate_limit)로 재배선, 지연 import 3곳 지연성 유지, collect_auction.py↔test_collect_auction.py 짝 편집 동반, 다중이름 import 소속 모듈별 분리",
+      "impact": "KisApiClient 동일 클래스 객체 유지로 행위 무변화 실증, rg 전수스캔 0건(예외 2건은 계약이 명시한 무관 사전존재 항목), 영향범위 94개 테스트+13개 진입점 전부 통과"
+    },
+    {
       "task_id": "label_path_and_facade_cleanup",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_label_path_and_facade_cleanup",
@@ -989,16 +999,6 @@
       "why": "Establish zero-leakage Purged Group Walk-Forward CV and model evaluation",
       "resolution": "Implemented src/ml/purged_cv.py, src/ml/model_pipeline.py and unit tests",
       "impact": "Enables cross-validation, LightGBM ranking and backtest metric evaluation"
-    },
-    {
-      "task_id": "PREPROCESSOR_MAIN_CONSOLIDATION",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_PREPROCESSOR_MAIN_CONSOLIDATION",
-      "domain": "processing",
-      "title": "Preprocessor Module Refactoring & Consolidation (v2 -> Main)",
-      "why": "v2 전처리기를 프로젝트 메인 preprocessor.py로 통합하고 기존 legacy v1 코드를 legacy/로 분리 이관",
-      "resolution": "preprocessor_v2.py를 src/processing/preprocessor.py로 승격하고 legacy 전처리기를 legacy/preprocessor.py로 이동, RENAME_MAP을 legacy_mapping.py로 추출 및 re-export",
-      "impact": "메인 전처리 파이프라인 단일화 및 코드베이스 깔끔화, 구형 데이터 호환성 보장"
     }
   ]
 }

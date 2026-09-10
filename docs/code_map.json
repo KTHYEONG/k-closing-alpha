@@ -2,19 +2,20 @@
   "src/api/kis/client.py": {
     "testing": "tests/unit/api/kis/test_client.py"
   },
-  "src/api/kis/indicators.py": {},
-  "src/api/kis/rate_limit.py": {
-    "testing": "tests/unit/api/kiwoom/test_kiwoom_client.py"
-  },
-  "src/api/kis_client.py": {
+  "src/api/kis/indicators.py": {
     "testing": [
       "tests/unit/api/kis/test_kis_client.py",
       "tests/unit/api/kis/test_kis_client_helpers.py",
-      "tests/unit/api/kis/test_kis_client_intraday.py",
-      "tests/unit/api/kis/test_kis_client_session.py",
-      "tests/unit/api/kis/test_kis_rate_limiter.py",
       "tests/unit/api/kis/test_ohlcv_prefetch.py",
-      "tests/unit/daily/test_collect_auction.py"
+      "tests/unit/api/test_kis_client_facade_removed.py"
+    ]
+  },
+  "src/api/kis/rate_limit.py": {
+    "testing": [
+      "tests/unit/api/kis/test_kis_client.py",
+      "tests/unit/api/kis/test_kis_rate_limiter.py",
+      "tests/unit/api/kiwoom/test_kiwoom_client.py",
+      "tests/unit/api/test_kis_client_facade_removed.py"
     ]
   },
   "src/api/kiwoom/client.py": {
@@ -111,10 +112,7 @@
     "testing": "tests/unit/backfill/price/test_runner.py"
   },
   "src/backfill/price/sources.py": {
-    "testing": [
-      "tests/unit/backfill/test_index_sources.py",
-      "tests/unit/backfill/test_sources_flow.py"
-    ]
+    "testing": "tests/unit/backfill/price/test_sources.py"
   },
   "src/backfill/price/universe.py": {
     "testing": "tests/unit/backfill/price/test_universe.py"
