@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "dead_code_subtraction_phase2",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_dead_code_subtraction_phase2",
+      "domain": "architecture",
+      "title": "데드코드 차감 및 legacy 은퇴",
+      "why": "AST 도달성 재검증으로 자동감사 오탐 4건(kiwoom client, export_all_months, setuptools, 자기참조 심볼 6개)을 걸러낸 뒤 진짜 데드코드만 확정",
+      "resolution": "도달불가 모듈 4개·데드심볼 12개·legacy/16069줄(동결 픽스처 전환)·미사용 의존성 11개 제거, backfill_price.py의 기존 ImportError를 재수출 삭제 과정에서 부수적으로 복구",
+      "impact": "src 19435→18045줄, venv 1.4G→655M, 테스트 788→783; 21개 출력 digest 바이트 동일로 무변경 증명, 13개 진입점 import 전부 성공"
+    },
+    {
       "task_id": "refactor_consolidation_phase1_write_path_integrity",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_refactor_consolidation_phase1_write_path_integrity",
