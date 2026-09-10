@@ -104,5 +104,5 @@ def test_bundle_payload_carries_measured_round_trip_cost() -> None:
 
     # Then
     assert bundle["round_trip_cost"] == pytest.approx(ROUND_TRIP_COST_RATIO)
-    assert bundle["round_trip_cost"] == pytest.approx(0.0046)
-    assert bundle["policy_params"]["round_trip_cost"] == pytest.approx(0.0046)
+    assert bundle["round_trip_cost"] == pytest.approx(0.004672792)
+    assert bundle["policy_params"]["round_trip_cost"] == pytest.approx(0.004672792)

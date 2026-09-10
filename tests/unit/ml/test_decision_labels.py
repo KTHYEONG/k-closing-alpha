@@ -5,6 +5,7 @@ def test_attach_per_row_cost_ratio_falls_back_on_bad_price() -> None:
     import numpy as np
     import pandas as pd
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.ml.decision_labels import attach_per_row_cost_ratio
     from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO
 
@@ -18,10 +19,10 @@ def test_attach_per_row_cost_ratio_falls_back_on_bad_price() -> None:
     assert out["cost_measured"].tolist() == [True, True, False, False]
     assert np.isclose(out["cost_ratio"].iloc[2], ROUND_TRIP_COST_RATIO)
     assert np.isclose(out["cost_ratio"].iloc[3], ROUND_TRIP_COST_RATIO)
-    # 1,500원 -> tick 1원 -> 2-tick round trip 13.33bp + 20bp statutory
-    assert np.isclose(out["cost_ratio"].iloc[0], (20.0 + 2.0 * 1.0 / 1500.0 * 1e4) / 1e4)
-    # 30,000원 -> tick 50원 -> 33.33bp + 20bp statutory
-    assert np.isclose(out["cost_ratio"].iloc[1], (20.0 + 2.0 * 50.0 / 30000.0 * 1e4) / 1e4)
+    # 1,500원 -> tick 1원 -> 2-tick round trip 13.33bp + 20bp statutory + 브로커 수수료
+    assert np.isclose(out["cost_ratio"].iloc[0], (20.0 + 2.0 * 1.0 / 1500.0 * 1e4 + BROKERAGE_FEE_BP) / 1e4)
+    # 30,000원 -> tick 50원 -> 33.33bp + 20bp statutory + 브로커 수수료
+    assert np.isclose(out["cost_ratio"].iloc[1], (20.0 + 2.0 * 50.0 / 30000.0 * 1e4 + BROKERAGE_FEE_BP) / 1e4)
     # The point of per-row costing: identical picks do not carry identical cost
     assert not np.isclose(out["cost_ratio"].iloc[0], out["cost_ratio"].iloc[1])
 
@@ -115,12 +116,16 @@ def test_build_decision_labels_mechanical_prices_next_open_over_entry_close() ->
         clip_lower=-0.10, clip_upper=0.10,
     )
 
-    # 1,000원 -> tick 1원 -> 20bp spread + 20bp statutory = 40bp
-    assert np.isclose(out["cost_ratio"].iloc[0], 0.0040)
-    assert np.isclose(out["eval_net_mechanical"].iloc[0], 0.03 - 0.0040)
-    assert np.isclose(out["target_return"].iloc[0], 0.026)
+    # 1,000원 -> tick 1원 -> 20bp spread + 18bp statutory(2024년 PIT 세율, STATUTORY_BP_SCHEDULE)
+    # + 브로커 수수료(0.72792bp) = 38.72792bp
+    from src.execution.cost_model import BROKERAGE_FEE_BP
+
+    expected_cost_ratio = (20.0 + 18.0 + BROKERAGE_FEE_BP) / 1e4
+    assert np.isclose(out["cost_ratio"].iloc[0], expected_cost_ratio)
+    assert np.isclose(out["eval_net_mechanical"].iloc[0], 0.03 - expected_cost_ratio)
+    assert np.isclose(out["target_return"].iloc[0], 0.03 - expected_cost_ratio)
     # The journaled label survives on the same per-row cost so the A/B is paired
-    assert np.isclose(out["eval_net_journaled"].iloc[0], 0.05 - 0.0040)
+    assert np.isclose(out["eval_net_journaled"].iloc[0], 0.05 - expected_cost_ratio)
     assert np.isclose(prov["mechanical_coverage"], 1.0)
     assert prov["n_dropped_no_mechanical"] == 0
 
@@ -207,6 +212,7 @@ def test_attach_per_row_cost_ratio_uses_pit_tick_for_pre_reform_rows() -> None:
     import numpy as np
     import pandas as pd
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.ml.decision_labels import attach_per_row_cost_ratio
 
     # Given: one pre-reform and one post-reform 15,000원 entry
@@ -220,8 +226,8 @@ def test_attach_per_row_cost_ratio_uses_pit_tick_for_pre_reform_rows() -> None:
     out = attach_per_row_cost_ratio(df, date_col="trade_date", market_col="market_type")
 
     # Then
-    assert np.isclose(out["cost_ratio"].iloc[0], (20.0 + 2.0 * 50.0 / 15000.0 * 1e4) / 1e4)
-    assert np.isclose(out["cost_ratio"].iloc[1], (20.0 + 2.0 * 10.0 / 15000.0 * 1e4) / 1e4)
+    assert np.isclose(out["cost_ratio"].iloc[0], (20.0 + 2.0 * 50.0 / 15000.0 * 1e4 + BROKERAGE_FEE_BP) / 1e4)
+    assert np.isclose(out["cost_ratio"].iloc[1], (20.0 + 2.0 * 10.0 / 15000.0 * 1e4 + BROKERAGE_FEE_BP) / 1e4)
     assert out["cost_measured"].tolist() == [True, True]
     # The reform is a real cost break, not a rounding difference
     assert out["cost_ratio"].iloc[0] > out["cost_ratio"].iloc[1]
@@ -231,6 +237,7 @@ def test_build_decision_labels_per_row_cost_is_point_in_time() -> None:
     import numpy as np
     import pandas as pd
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.ml.decision_labels import build_decision_labels
 
     # Given: a pre-reform journaled row on a KOSPI 15,000원 close
@@ -250,7 +257,7 @@ def test_build_decision_labels_per_row_cost_is_point_in_time() -> None:
     )
 
     # Then: the pre-reform 50원 tick is used, not the post-reform 10원 tick
-    expected = (20.0 + 2.0 * 50.0 / 15000.0 * 1e4) / 1e4
+    expected = (20.0 + 2.0 * 50.0 / 15000.0 * 1e4 + BROKERAGE_FEE_BP) / 1e4
     assert np.isclose(out["cost_ratio"].iloc[0], expected)
     assert np.isclose(out["eval_net_journaled"].iloc[0], 0.03 - expected)
     assert np.isclose(out["target_return"].iloc[0], 0.03 - expected)
