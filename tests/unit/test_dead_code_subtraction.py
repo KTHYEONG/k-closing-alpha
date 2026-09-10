@@ -236,5 +236,5 @@ def test_synthetic_output_digests_unchanged_after_subtraction() -> None:
     assert digest(*[a for pair in splits for a in pair]) == "82c66517bd8514cb"
     assert digest(np.array(sorted(gx.columns), dtype=object)) == "0cd73ada27529408"
     assert digest(np.array(sorted(gcat), dtype=object)) == "5ccc339c7392dbfc"
-    assert digest(gproc.sort_index()["target_return"].to_numpy(np.float64)) == "7472d01ff8904132"
+    assert digest(gproc.sort_index()["target_return"].to_numpy(np.float64)) == "c69fe116ca8049d7"  # 2026-09-10: 브로커 수수료(왕복 0.73bp) 반영으로 갱신
     assert digest(gx.sort_index().select_dtypes("number").to_numpy(np.float64)) == "a22af55104759529"
