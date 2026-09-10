@@ -15,17 +15,17 @@ All 3 brokers operate natively on Linux 64-bit via standard HTTPS/OAuth2 protoco
 | **Auth Endpoint** | `POST /oauth2/tokenP` | `POST /oauth2/token` | `POST /oauth2/token` |
 | **Payload Format** | `application/json` | `application/x-www-form-urlencoded` | `application/json;charset=UTF-8` |
 | **Token Validity** | 24 hours (`86400`s), disk-cached | 24 hours (`86400`s), memory-cached | 24 hours (`86400`s), memory-cached |
-| **Token Concurrency Lock** | Filelock + timestamp check | Memory lock on refresh | `_token_lock = asyncio.Lock()` |
-| **Global Rate Limit (TPS)** | **18.0 req/s** (`AsyncRateLimiter`) | **~0.95 req/s** (Strict 1.05s lock) | **5.0 req/s per TR** (Independent buckets) |
-| **Concurrency Model** | `asyncio.Semaphore(10)`, max 50 pool | Concurrency = 1 (Single-flight `Lock`) | Dynamic per-TR limiters (Parallel across TRs) |
+| **Token Concurrency Lock** | asyncio.Lock (single-flight) + atomic 0600 write | Memory lock on refresh | `_token_lock = asyncio.Lock()` |
+| **Global Rate Limit (TPS)** | **18.0 req/s** (process-global shared `AsyncRateLimiter` per app_key) | **~0.95 req/s** (Strict 1.05s lock) | **5.0 req/s per TR** (process-global shared buckets per app_key+api_id) |
+| **Concurrency Model** | Shared limiter (call-site semaphores bound concurrency) | Concurrency = 1 (Single-flight `Lock`) | Dynamic per-TR limiters (Parallel across TRs) |
 | **Throttling Detection** | Body `"초당 거래건수"` / HTTP 429 | `rsp_cd: "IGW00201"` | HTTP 429 (`return_code: 5, 유량=5`) |
 | **Nextrade (NXT) Support** | Supported (`FID_COND_MRKT_DIV_CODE="NX"`) | **None** | **Native Supported** (`<CODE>_NX` suffix) |
 | **1m Bar Capacity** | 30 bars/call (intraday) / 120 bars (hist) | **500 bars/call** (1 call = full day) | **900 bars/call** (1 call = full day) |
 | **Tick Capacity** | 30 ticks/call (same-day only) | 500 ticks/call | **900 ticks/call** (30-page budget cap) |
-| **Ranking Capacity** | 100~200 stocks/call | 100 stocks/call | **200 stocks/page** (up to 1,000 stocks) |
+| **Ranking Capacity** | 30 stocks/call (hard-capped; FID_INPUT_CNT_1 ignored) | 100 stocks/call | **200 stocks/page** (up to 1,000 stocks) |
 | **Orderbook & Auction** | **Level-10 + `antc_cnpr` (output1+2)** | Level-10 ask/bid (`t1101`) | Level-10 ask/bid (`ka10004`) |
 | **Intraday Investor Estimate** | **Yes (`HHPTJ04160200`, 외국인/기관)** | Intraday hourly (`t1405`) | Daily investor trend (`ka10014`) |
-| **Order / Account Trading** | **Fully Implemented** (Cash Buy/Sell/Cancel, Balance, Buying Power) | Supported by server (`CSPAT...`), not integrated | Supported by server (`kt10...`), not integrated |
+| **Order / Account Trading** | **NOT implemented** (paper-only; no order/account TRs in this repo) | Supported by server (`CSPAT...`), not integrated | Supported by server (`kt10...`), not integrated |
 
 ---
 
@@ -40,8 +40,7 @@ flowchart TD
     end
 
     subgraph Universe [Universe Candidate Discovery]
-        U[universe_scan.py] -->|1st Choice: 200행/P 5req/s| KW_SCAN[Kiwoom ka10027]
-        KW_SCAN -.->|Fallback| KIS_SCAN[KIS FHPST01700000]
+        U[universe_scan.py] -->|Sole vendor: 200행/P 5req/s| KW_SCAN[Kiwoom ka10027]
     end
 
     subgraph RegBars [Regular Session 1m Bars 09:00-15:30]
@@ -70,7 +69,7 @@ flowchart TD
 | Operational Task | 1st Priority API | 2nd Priority API | 3rd Priority API | Technical Selection Rationale |
 | :--- | :--- | :--- | :--- | :--- |
 | **Decision Snapshot** (`15:20 KST`) | **KIS** (`FHKST01010100` / `0200` / `HHPTJ04160200`) | *None* | *None* | KIS is the **only** broker providing simultaneous Level-10 ladder, auction match price (`antc_cnpr`), and provisional intraday foreign/institutional flows. |
-| **Universe Scan** (Gainers/Losers) | **Kiwoom** (`ka10027`) | **KIS** (`FHPST01700000`) | **LS** (`t1489`) | Kiwoom provides 200 rows/page, high concurrency (5 req/s), and fast execution without throttling. |
+| **Universe Scan** (Gainers/Losers) | **Kiwoom** (`ka10027`, sole vendor, wired via `build_kiwoom_scan_client`) | *None (KIS FHPST01700000 is hard-capped at 30 rows and MUST NOT feed the tradeable list)* | **LS** (`t1489`) | Kiwoom returns 401 rows for the 2~10% band in ~0.22s; the 30-row KIS sample is small/illiquid-biased (0 cost-screen survivors vs 8). |
 | **Regular Session 1m Bars** | **LS** (`t8412`) | **KIS** (`FHKST03010200`) | *None* | LS retrieves all 390 bars in **1 single call** (`qrycnt=500`), saving 92% of network requests compared to KIS (13 calls). |
 | **NXT Premarket 1m Bars** (`08:00~08:50`) | **Kiwoom** (`ka10080`, `_NX`) | **KIS** (`FHKST03010200`, `NX`) | *None* | Kiwoom retrieves all 50 premarket bars in a single request. |
 | **NXT Aftermarket 1m Bars** (`15:40~20:00`)| **Kiwoom** (`ka10080`, `_NX`) | **KIS** (`FHKST03010200`, `NX`) | *None* | Kiwoom retrieves all 260 aftermarket bars in a single request (`qrycnt` up to 900). |
