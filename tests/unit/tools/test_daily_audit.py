@@ -29,7 +29,8 @@ def test_systemd_units_encode_persistence_and_timezone_policy() -> None:
     root = Path("deploy/systemd")
 
     # Given: 결정창에 묶인 타이머들은 지연 캐치업이 무의미하다
-    for name in ("kca-collect", "kca-predict", "kca-paper-entry", "kca-finalize-close"):
+    # (kca-paper-entry는 고정 타이머가 아니라 finalize-close OnSuccess 체이닝이므로 제외)
+    for name in ("kca-collect", "kca-predict", "kca-finalize-close"):
         text = (root / f"{name}.timer").read_text(encoding="utf-8")
         assert "Persistent=false" in text, f"{name} must not catch up outside the decision window"
         assert "Asia/Seoul" in text, f"{name} must pin KST explicitly"
@@ -42,3 +43,29 @@ def test_systemd_units_encode_persistence_and_timezone_policy() -> None:
     # And: 부팅 감사 유닛은 타이머가 아니라 부팅시 1회 서비스다
     audit = (root / "kca-daily-audit.service").read_text(encoding="utf-8")
     assert "Type=oneshot" in audit
+
+
+def test_systemd_timers_align_with_decision_and_finalize_gates() -> None:
+    import re
+    from pathlib import Path
+
+    from src.config.market_session import DECISION_WINDOW_END_HHMMSS, DECISION_WINDOW_START_HHMMSS
+
+    def _hhmmss(unit: str) -> str:
+        text = Path(f"deploy/systemd/{unit}.timer").read_text(encoding="utf-8")
+        m = re.search(r"OnCalendar=.*?(\d{2}):(\d{2}):(\d{2})", text)
+        assert m, f"no OnCalendar in {unit}"
+        return "".join(m.groups())
+
+    collect_hhmmss = _hhmmss("kca-collect")
+    predict_hhmmss = _hhmmss("kca-predict")
+
+    # collect는 반드시 결정창 안에서 발화해야 한다(그렇지 않으면 매일 RuntimeError)
+    assert DECISION_WINDOW_START_HHMMSS <= collect_hhmmss <= DECISION_WINDOW_END_HHMMSS
+    # predict는 collect 이후
+    assert predict_hhmmss > collect_hhmmss
+
+    # paper-entry는 고정 타이머가 아니라 finalize-close 성공에 이벤트로 체이닝된다
+    assert not Path("deploy/systemd/kca-paper-entry.timer").exists()
+    finalize_text = Path("deploy/systemd/kca-finalize-close.service").read_text(encoding="utf-8")
+    assert "OnSuccess=kca-paper-entry.service" in finalize_text
