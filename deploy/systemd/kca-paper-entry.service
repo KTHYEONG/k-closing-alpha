@@ -4,4 +4,4 @@ Description=KCA paper entry (no real orders)
 [Service]
 Type=oneshot
 WorkingDirectory=/home/kth/k-closing-alpha
-ExecStart=/usr/bin/env uv run python -m src.daily.paper_trade --phase entry
+ExecStart=/home/kth/.local/bin/uv run python -m src.daily.paper_trade --phase entry

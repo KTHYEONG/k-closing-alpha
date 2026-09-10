@@ -2,7 +2,7 @@
 Description=KCA daily predict (Mon-Fri 15:20 KST)
 
 [Timer]
-OnCalendar=Mon..Fri 15:20:00 Asia/Seoul
+OnCalendar=Mon..Fri 15:21:00 Asia/Seoul
 Persistent=false
 Unit=kca-predict.service
 
