@@ -80,6 +80,32 @@ def decide_fill(order: PaperOrder, print_price: int, print_ts: pd.Timestamp) -> 
     return None
 
 
+def build_auction_fill(order: PaperOrder, decision_row: dict[str, Any]) -> PaperFill | None:
+    """동시호가(단일가) 진입 체결 판정. 체결가는 관측된 확정 종가 그대로이다.
+
+    종가_확정이 True가 아니면 None을 반환한다(미확정 종목 진입 보류).
+    확정시각이 주문시각보다 이르면 룩어헤드 금지 위반으로 ValueError를 던진다.
+    """
+    # fetch_archive_snapshot은 legacy NaN 혼재로 종가_확정을 float64로 반환한다
+    # (True/False -> 1.0/0.0). `not float('nan')`은 False라 미확정(NaN)이 확정으로
+    # 오판되는 함정이 있어, "정확히 참"만 확정으로 인정한다(경제적 의미: 확정여부
+    # 불명은 미확정과 동일하게 취급).
+    confirmed = decision_row.get("종가_확정")
+    if not (pd.notna(confirmed) and bool(confirmed)):
+        return None
+    close = decision_row["종가"]
+    if close <= 0:
+        raise ValueError(f"종가 must be positive, got {close}")
+    execution_timestamp = decision_row["execution_timestamp"]
+    if execution_timestamp < order.placed_at:
+        raise ValueError(
+            f"execution_timestamp {execution_timestamp} precedes placed_at {order.placed_at} (lookahead forbidden)"
+        )
+    return PaperFill(
+        order.order_id, order.symbol, order.side, order.qty, close, execution_timestamp, "auction_close"
+    )
+
+
 class PaperLedger:
     """온디스크 페이퍼 원장. 매 상태전이마다 즉시 flush한다(WSL 재기동 내성)."""
 

@@ -20,7 +20,14 @@ from src.api.kis.ws_client import KisWebSocketClient, issue_approval_key
 from src.config.market_session import PAPER_ENTRY_HHMMSS, PAPER_EXIT_MOC_HHMMSS, PAPER_EXIT_SESSION_START_HHMMSS
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.predict import run_topk_ranker_sleeve
-from src.execution.paper_broker import PAPER_TAKE_PROFIT_RATIO, PaperLedger, PaperOrder, decide_fill, size_order_qty
+from src.execution.paper_broker import (
+    PAPER_TAKE_PROFIT_RATIO,
+    PaperLedger,
+    PaperOrder,
+    build_auction_fill,
+    decide_fill,
+    size_order_qty,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,11 +124,36 @@ async def run_paper_session(
         orders = build_entry_orders(
             picks, date_str, seed_capital=settings.PAPER_SEED_CAPITAL, placed_at=placed_at
         )
-    else:
-        placed_at = _placed_at(date_str, PAPER_EXIT_SESSION_START_HHMMSS)
-        positions = ledger.load_open_positions()
-        orders = build_exit_orders(positions, date_str, placed_at, moc=False)
-    if ws_client is None:  # pragma: no cover - live KIS boundary, probe-verified
+        by_code = snap.set_index("종목코드").to_dict("index") if not snap.empty else {}
+        fills: list[dict] = []
+        for order in orders:
+            row = by_code.get(order.symbol)
+            if row is None:
+                logger.warning("[DATA] stage=paper_entry symbol=%s status=NO_SNAPSHOT_ROW", order.symbol)
+                continue
+            fill = build_auction_fill(order, row)
+            if fill is None:
+                logger.warning("[DATA] stage=paper_entry symbol=%s status=UNCONFIRMED", order.symbol)
+                continue
+            fills.append(
+                {
+                    "order_id": fill.order_id,
+                    "symbol": fill.symbol,
+                    "side": fill.side,
+                    "qty": fill.qty,
+                    "fill_price": fill.fill_price,
+                    "filled_at": fill.filled_at,
+                    "decision_date": order.decision_date,
+                    "trigger": fill.trigger,
+                }
+            )
+        if fills:
+            ledger.record(fills, kind="fills")
+        return len(fills)
+    placed_at = _placed_at(date_str, PAPER_EXIT_SESSION_START_HHMMSS)
+    positions = ledger.load_open_positions()
+    orders = build_exit_orders(positions, date_str, placed_at, moc=False)
+    if phase == "exit" and ws_client is None:  # pragma: no cover - live KIS boundary, probe-verified
         owned = session or aiohttp.ClientSession()
         key = await issue_approval_key(owned, settings.KIS_APP_KEY, settings.KIS_APP_SECRET)
         ws_client = KisWebSocketClient(approval_key=key)

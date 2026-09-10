@@ -196,3 +196,74 @@ def test_load_open_positions_survives_symbol_reentry_after_close(tmp_path) -> No
     assert int(open_pos.iloc[0]["qty"]) == 8
     assert int(open_pos.iloc[0]["entry_price"]) == 71_000
     assert open_pos.iloc[0]["decision_date"] == "2026-09-08"
+
+
+def test_build_auction_fill_confirms_only_when_close_confirmed() -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import PaperOrder, build_auction_fill
+
+    placed_at = pd.Timestamp("2026-09-10 15:20:00", tz="Asia/Seoul")
+    order = PaperOrder(
+        order_id="2026-09-10:005930:entry", decision_date="2026-09-10", symbol="005930",
+        side="buy", qty=10, limit_price=None, placed_at=placed_at, reason="entry",
+    )
+
+    # Given: 미확정 행
+    unconfirmed = {"종가_확정": False, "종가": 70_000, "execution_timestamp": placed_at + pd.Timedelta(minutes=11)}
+    assert build_auction_fill(order, unconfirmed) is None
+
+    # When: 확정 행
+    confirmed = {"종가_확정": True, "종가": 70_500, "execution_timestamp": placed_at + pd.Timedelta(minutes=11)}
+    fill = build_auction_fill(order, confirmed)
+
+    # Then: 확정 종가 그대로 체결
+    assert fill is not None
+    assert fill.fill_price == 70_500
+    assert fill.trigger == "auction_close"
+    assert fill.symbol == "005930"
+
+
+def test_build_auction_fill_treats_nan_confirmation_as_unconfirmed() -> None:
+    import math
+
+    import pandas as pd
+
+    from src.execution.paper_broker import PaperOrder, build_auction_fill
+
+    placed_at = pd.Timestamp("2026-09-10 15:20:00", tz="Asia/Seoul")
+    order = PaperOrder(
+        order_id="2026-09-10:005930:entry", decision_date="2026-09-10", symbol="005930",
+        side="buy", qty=10, limit_price=None, placed_at=placed_at, reason="entry",
+    )
+
+    # Given: fetch_archive_snapshot이 실제로 반환하는 float64 컬럼 형태
+    # (bool True/False가 NaN 혼재 컬럼에서 1.0/0.0/NaN으로 업캐스트됨).
+    # not float('nan')은 False라 NaN이 확정으로 오판될 수 있는 함정 케이스.
+    row = {"종가_확정": math.nan, "종가": 70_500, "execution_timestamp": placed_at + pd.Timedelta(minutes=11)}
+
+    # When / Then: 확정 여부 불명은 미확정과 동일하게 취급되어 체결하지 않는다
+    assert build_auction_fill(order, row) is None
+
+
+def test_build_auction_fill_rejects_lookahead_and_nonpositive_price() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.execution.paper_broker import PaperOrder, build_auction_fill
+
+    placed_at = pd.Timestamp("2026-09-10 15:20:00", tz="Asia/Seoul")
+    order = PaperOrder(
+        order_id="o1", decision_date="2026-09-10", symbol="005930",
+        side="buy", qty=10, limit_price=None, placed_at=placed_at, reason="entry",
+    )
+
+    # When / Then: 확정시각이 주문시각보다 이르면 룩어헤드 금지 위반
+    stale = {"종가_확정": True, "종가": 70_000, "execution_timestamp": placed_at - pd.Timedelta(seconds=1)}
+    with pytest.raises(ValueError, match="placed_at"):
+        build_auction_fill(order, stale)
+
+    # And: 종가<=0은 거부
+    zero_price = {"종가_확정": True, "종가": 0, "execution_timestamp": placed_at + pd.Timedelta(minutes=10)}
+    with pytest.raises(ValueError, match="종가"):
+        build_auction_fill(order, zero_price)

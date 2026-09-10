@@ -106,42 +106,6 @@ def test_run_paper_session_rejects_unknown_phase(tmp_path) -> None:
         )
 
 
-def test_run_paper_session_entry_fills_from_stream_prints(tmp_path, monkeypatch) -> None:
-    import asyncio
-
-    import pandas as pd
-
-    from src.daily import paper_trade
-    from src.execution.paper_broker import PaperLedger
-
-    # Given: 픽 1건과, 그 종목의 체결 프린트를 내보내는 가짜 스트림
-    monkeypatch.setattr(
-        paper_trade,
-        "run_topk_ranker_sleeve",
-        lambda _d: pd.DataFrame({"symbol": ["005930"], "allocation": [1.0], "price": [70_000]}),
-    )
-
-    class _FakeWs:
-        async def stream(self, _session, codes):
-            assert codes == ["005930"]
-            yield ("005930", "151901", 70_100)
-
-    ledger = PaperLedger(root=tmp_path)
-
-    # When
-    n = asyncio.run(
-        paper_trade.run_paper_session(
-            pd.Timestamp("2026-09-10"), phase="entry", ledger=ledger, ws_client=_FakeWs(), session=object()
-        )
-    )
-
-    # Then: 시장가 등가 진입이 첫 프린트에 체결되고 원장에 남는다
-    assert n == 1
-    fills = pd.read_parquet(tmp_path / "fills.parquet")
-    assert len(fills) == 1
-    assert int(fills.iloc[0]["fill_price"]) == 70_100
-
-
 def test_run_paper_session_exit_uses_open_positions_and_take_profit(tmp_path) -> None:
     import asyncio
 
@@ -224,3 +188,164 @@ def test_run_paper_session_exit_escalates_to_moc_after_cutoff(tmp_path) -> None:
     assert int(sells.iloc[0]["fill_price"]) == 71_500
     assert sells.iloc[0]["trigger"] != "take_profit"
     assert len(ledger.load_open_positions()) == 0
+
+
+def test_run_paper_session_entry_fills_from_confirmed_close_no_websocket(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    monkeypatch.setattr(
+        paper_trade,
+        "run_topk_ranker_sleeve",
+        lambda _d: pd.DataFrame({"symbol": ["005930"], "allocation": [1.0], "price": [70_000]}),
+    )
+    monkeypatch.setattr(
+        paper_trade,
+        "fetch_archive_snapshot",
+        lambda _d: pd.DataFrame({
+            "종목코드": ["005930"], "종가": [70_500], "종가_확정": [True],
+            "execution_timestamp": [pd.Timestamp("2026-09-10 15:30:20", tz="Asia/Seoul")],
+        }),
+    )
+
+    class _ExplodingWs:
+        async def stream(self, _session, _codes):
+            raise AssertionError("entry must not open a websocket stream")
+            yield  # pragma: no cover
+
+    ledger = PaperLedger(root=tmp_path)
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-10"), phase="entry", ledger=ledger, ws_client=_ExplodingWs(), session=object()
+        )
+    )
+
+    # Then
+    assert n == 1
+    fills = pd.read_parquet(tmp_path / "fills.parquet")
+    assert int(fills.iloc[0]["fill_price"]) == 70_500
+    assert fills.iloc[0]["trigger"] == "auction_close"
+
+
+def test_run_paper_session_entry_skips_unconfirmed_symbol_with_warning(tmp_path, monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    monkeypatch.setattr(
+        paper_trade,
+        "run_topk_ranker_sleeve",
+        lambda _d: pd.DataFrame({
+            "symbol": ["005930", "000660"], "allocation": [0.5, 0.5], "price": [70_000, 200_000],
+        }),
+    )
+    monkeypatch.setattr(
+        paper_trade,
+        "fetch_archive_snapshot",
+        lambda _d: pd.DataFrame({
+            "종목코드": ["005930", "000660"],
+            "종가": [70_500, 205_000],
+            "종가_확정": [False, True],
+            "execution_timestamp": [pd.NaT, pd.Timestamp("2026-09-10 15:30:20", tz="Asia/Seoul")],
+        }),
+    )
+    ledger = PaperLedger(root=tmp_path)
+
+    # When
+    with caplog.at_level(logging.WARNING):
+        n = asyncio.run(
+            paper_trade.run_paper_session(
+                pd.Timestamp("2026-09-10"), phase="entry", ledger=ledger, ws_client=None, session=None
+            )
+        )
+
+    # Then: 확정된 종목 1건만 체결, 미확정 종목코드가 로그에 남는다
+    assert n == 1
+    fills = pd.read_parquet(tmp_path / "fills.parquet")
+    assert list(fills["symbol"]) == ["000660"]
+    assert any("005930" in r.message and "UNCONFIRMED" in r.message for r in caplog.records)
+
+
+def test_run_paper_session_entry_skips_symbol_missing_from_snapshot(tmp_path, monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    monkeypatch.setattr(
+        paper_trade,
+        "run_topk_ranker_sleeve",
+        lambda _d: pd.DataFrame({
+            "symbol": ["005930", "000660"], "allocation": [0.5, 0.5], "price": [70_000, 200_000],
+        }),
+    )
+    monkeypatch.setattr(
+        paper_trade,
+        "fetch_archive_snapshot",
+        lambda _d: pd.DataFrame({
+            "종목코드": ["000660"],
+            "종가": [205_000],
+            "종가_확정": [True],
+            "execution_timestamp": [pd.Timestamp("2026-09-10 15:30:20", tz="Asia/Seoul")],
+        }),
+    )
+    ledger = PaperLedger(root=tmp_path)
+
+    # When
+    with caplog.at_level(logging.WARNING):
+        n = asyncio.run(
+            paper_trade.run_paper_session(
+                pd.Timestamp("2026-09-10"), phase="entry", ledger=ledger, ws_client=None, session=None
+            )
+        )
+
+    # Then: 스냅샷에 없는 종목은 NO_SNAPSHOT_ROW 경고 후 스킵, 확정 종목은 체결
+    assert n == 1
+    fills = pd.read_parquet(tmp_path / "fills.parquet")
+    assert list(fills["symbol"]) == ["000660"]
+    assert any("005930" in r.message and "NO_SNAPSHOT_ROW" in r.message for r in caplog.records)
+
+
+def test_run_paper_session_exit_still_uses_websocket_stream(tmp_path) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [{"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10,
+          "fill_price": 70_000, "decision_date": "2026-09-10"}],
+        kind="fills",
+    )
+
+    class _FakeWs:
+        async def stream(self, _session, codes):
+            assert codes == ["005930"]
+            yield ("005930", "093000", 73_600)
+
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, ws_client=_FakeWs(), session=object()
+        )
+    )
+
+    assert n == 1
+    fills = pd.read_parquet(tmp_path / "fills.parquet")
+    sells = fills[fills["side"] == "sell"]
+    assert int(sells.iloc[0]["fill_price"]) == 73_600
