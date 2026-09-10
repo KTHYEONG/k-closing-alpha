@@ -29,12 +29,7 @@ from src.data.intraday_store import write_intraday_partition, write_tick_partiti
 
 logger = logging.getLogger(__name__)
 
-# 등락률스캔 풀도 1분봉/틱 수집 대상에 포함한다(비용축 스크린의 실측 스프레드 확보).
-# 명시적 제외가 필요하면 _today_watchlist_codes(exclude_scenarios=...) 로 opt-out.
-EXCLUDED_INTRADAY_SCENARIOS: frozenset[str] = frozenset()
-
-
-def _today_watchlist_codes(snapshot_date: str, exclude_scenarios: frozenset[str] = EXCLUDED_INTRADAY_SCENARIOS) -> list[str]:
+def _today_watchlist_codes(snapshot_date: str) -> list[str]:
     try:
         df = archive.fetch_archive_snapshot(snapshot_date=snapshot_date)
     except Exception as e:
@@ -42,8 +37,6 @@ def _today_watchlist_codes(snapshot_date: str, exclude_scenarios: frozenset[str]
         return []
     if df is None or df.empty or "종목코드" not in df.columns:
         return []
-    if exclude_scenarios and "시나리오" in df.columns:
-        df = df[~df["시나리오"].isin(exclude_scenarios)]
     return df["종목코드"].astype(str).str.zfill(6).dropna().unique().tolist()
 
 

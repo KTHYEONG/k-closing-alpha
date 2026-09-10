@@ -69,3 +69,29 @@ def test_systemd_timers_align_with_decision_and_finalize_gates() -> None:
     assert not Path("deploy/systemd/kca-paper-entry.timer").exists()
     finalize_text = Path("deploy/systemd/kca-finalize-close.service").read_text(encoding="utf-8")
     assert "OnSuccess=kca-paper-entry.service" in finalize_text
+
+
+def test_audit_or_skip_skips_non_trading_day(monkeypatch) -> None:
+    from src.tools import daily_audit
+
+    calls = {"n": 0}
+
+    def _never(_date: str) -> dict[str, bool]:
+        calls["n"] += 1
+        return {"archive": True, "minute_bars": True, "decision": True, "close_confirmed": True}
+
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", _never)
+
+    # Given: 휴장일(토요일)
+    monkeypatch.setattr(daily_audit, "is_krx_trading_day", lambda _d: False)
+
+    # When / Then: 감사 자체를 수행하지 않는다(휴장일 MISSING 오탐 제거)
+    assert daily_audit.audit_or_skip("2026-01-03") is None
+    assert calls["n"] == 0
+
+    # And: 거래일이면 기존 4키 결과를 그대로 반환한다
+    monkeypatch.setattr(daily_audit, "is_krx_trading_day", lambda _d: True)
+    result = daily_audit.audit_or_skip("2026-09-09")
+    assert result is not None
+    assert set(result) == {"archive", "minute_bars", "decision", "close_confirmed"}
+    assert calls["n"] == 1
