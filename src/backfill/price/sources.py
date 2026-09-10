@@ -18,8 +18,6 @@ from src.backfill.price.config import (
 )
 from src.backfill.price.normalize import (
     _find_col,
-    _normalize_investor_flow,
-    _subtract_flow_frames,
     _to_ymd,
 )
 
@@ -72,55 +70,6 @@ def _safe_get_market_cap_by_date(
             time.sleep(fetch_cfg.retry_sleep_sec * (attempt + 1))
     # market cap fetch failure is non-fatal for history table.
     logger.warning("[DATA] stage=market_cap symbol=%s status=FAIL error=%s", symbol, last_err)
-    return pd.DataFrame()
-
-
-def _safe_get_trading_value_by_date(
-    from_date: str,
-    to_date: str,
-    symbol: str,
-    fetch_cfg: FetchConfig,
-) -> pd.DataFrame:
-    def _request(on: str, detail: bool) -> pd.DataFrame:
-        last_err: Exception | None = None
-        for attempt in range(fetch_cfg.retries):
-            try:
-                _wait_for_pykrx_slot(fetch_cfg)
-                return stock.get_market_trading_value_by_date(
-                    from_date,
-                    to_date,
-                    symbol,
-                    on=on,
-                    detail=detail,
-                    freq="d",
-                )
-            except Exception as exc:  # pragma: no cover - network/runtime dependent
-                last_err = exc
-                time.sleep(fetch_cfg.retry_sleep_sec * (attempt + 1))
-        logger.warning("[DATA] stage=investor_flow symbol=%s on=%s detail=%s status=FAIL error=%s", symbol, on, detail, last_err)
-        return pd.DataFrame()
-
-    net = _request(on="순매수", detail=False)
-    if net is not None and not net.empty:
-        return net
-
-    net_detail = _request(on="순매수", detail=True)
-    if net_detail is not None and not net_detail.empty:
-        return net_detail
-
-    buy = _request(on="매수", detail=False)
-    sell = _request(on="매도", detail=False)
-    delta = _subtract_flow_frames(buy, sell)
-    if not delta.empty:
-        return delta
-
-    buy_detail = _request(on="매수", detail=True)
-    sell_detail = _request(on="매도", detail=True)
-    delta_detail = _subtract_flow_frames(buy_detail, sell_detail)
-    if not delta_detail.empty:
-        return delta_detail
-
-    logger.warning("[DATA] stage=investor_flow symbol=%s status=empty_after_fallbacks", symbol)
     return pd.DataFrame()
 
 
@@ -252,9 +201,7 @@ def _fetch_investor_history_by_date(
         except Exception as exc:
             logger.warning("[DATA] stage=investor_flow_kis symbol=%s status=FAIL error=%s", symbol, exc)
 
-    # fallback: pykrx (may be empty due KRX endpoint/session changes)
-    flow = _safe_get_trading_value_by_date(_to_ymd(start), _to_ymd(end), symbol, fetch_cfg)
-    return _normalize_investor_flow(flow)
+    return pd.DataFrame(columns=["date", "foreign_netbuy", "inst_netbuy"])
 
 
 def _kis_sync_client():

@@ -193,3 +193,20 @@ def test_fetch_krx_openapi_day_strict_raises_when_retries_exhausted(monkeypatch,
     # When: 재시도가 전부 실패하면(None) 조용한 None 반환이 아니라 예외
     with pytest.raises(RuntimeError, match="retries"):
         krx_api.fetch_krx_openapi_day_strict(krx_api.KRX_ENDPOINT_STK_DAILY, "20260909", cfg)
+
+
+def test_collect_derivatives_basis_returns_empty_without_pykrx_fallback(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.altdata import derivatives
+
+    # Given: KRX 주경로가 빈 프레임을 반환 (기존 _cfg() 헬퍼 재사용, 이 파일 상단에 이미 정의됨)
+    monkeypatch.setattr(derivatives, "fetch_krx_openapi_day", lambda *a, **k: pd.DataFrame())
+
+    # When
+    out = derivatives.collect_derivatives_basis(_cfg(), [pd.Timestamp("2026-09-09")])
+
+    # Then: pykrx 폴백 없이 빈 프레임 그대로(_collect_via_pykrx가 더 이상 존재하지 않는다)
+    assert out.empty
+    assert not hasattr(derivatives, "_collect_via_pykrx")
+    assert not hasattr(derivatives, "stock")
