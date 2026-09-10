@@ -45,3 +45,21 @@ def test_session_constants_have_one_definition_without_import_cycle() -> None:
         inspect.signature(buyability.attach_entry_auction_liquidity).parameters["auction_start_hms"].default
         == market_session.DECISION_WINDOW_START_HMS
     )
+
+
+def test_krx_aftermarket_session_constants_are_disjoint_from_regular() -> None:
+    from src.config.market_session import (
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+        INTRADAY_SESSION_REGULAR,
+        KRX_AFTERMARKET_HOUR_CEIL,
+        KRX_AFTERMARKET_HOUR_FLOOR,
+        KRX_AFTERMARKET_START_DATE,
+        KRX_REGULAR_HOUR_CEIL,
+    )
+
+    assert KRX_AFTERMARKET_HOUR_FLOOR == "160000"
+    assert KRX_AFTERMARKET_HOUR_CEIL == "200000"
+    assert KRX_AFTERMARKET_HOUR_FLOOR > KRX_REGULAR_HOUR_CEIL
+    assert KRX_AFTERMARKET_START_DATE == "2026-09-14"
+    assert INTRADAY_SESSION_KRX_AFTERMARKET not in (INTRADAY_SESSION_REGULAR, INTRADAY_SESSION_NXT_AFTERMARKET)

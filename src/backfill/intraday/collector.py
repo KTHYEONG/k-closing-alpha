@@ -11,6 +11,9 @@ import pandas as pd
 
 from src.api.ls.client import LsApiClient  # noqa: F401 - wiring per spec
 from src.config.market_session import (
+    KRX_AFTERMARKET_HOUR_CEIL,
+    KRX_AFTERMARKET_HOUR_FLOOR,
+    KRX_AFTERMARKET_START_DATE,
     KRX_CLOSE_MARKET_DIV_CODE,
     KRX_REGULAR_HOUR_CEIL,
     KRX_REGULAR_HOUR_FLOOR,
@@ -366,5 +369,26 @@ async def backfill_nxt_aftermarket_bars(client, session, stock_codes: list[str],
     return await _collect_bars(
         client, session, stock_codes, snapshot_date, bar_interval_minutes,
         NXT_AFTERMARKET_HOUR_CEIL, NXT_AFTERMARKET_HOUR_FLOOR, NXT_MARKET_DIV_CODE,
+        historical=True,
+    )
+
+
+async def collect_krx_aftermarket_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
+    """당일 KRX 애프터마켓(16:00-20:00) 1분봉을 KRX_CLOSE_MARKET_DIV_CODE('J')로 수집한다."""
+    if str(snapshot_date) < KRX_AFTERMARKET_START_DATE:
+        return pd.DataFrame()
+    return await _collect_bars(
+        client, session, stock_codes, snapshot_date, bar_interval_minutes,
+        KRX_AFTERMARKET_HOUR_CEIL, KRX_AFTERMARKET_HOUR_FLOOR, KRX_CLOSE_MARKET_DIV_CODE,
+    )
+
+
+async def backfill_krx_aftermarket_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
+    """과거 날짜의 KRX 애프터마켓 1분봉을 historical=True(FHKST03010230)로 소급 수집한다."""
+    if str(snapshot_date) < KRX_AFTERMARKET_START_DATE:
+        return pd.DataFrame()
+    return await _collect_bars(
+        client, session, stock_codes, snapshot_date, bar_interval_minutes,
+        KRX_AFTERMARKET_HOUR_CEIL, KRX_AFTERMARKET_HOUR_FLOOR, KRX_CLOSE_MARKET_DIV_CODE,
         historical=True,
     )

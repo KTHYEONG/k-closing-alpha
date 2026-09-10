@@ -456,7 +456,7 @@ def test_collect_intraday_trade_ticks_kiwoom_success_skips_ls_and_kis() -> None:
             "rt_cd": "0",
             "vendor": "kiwoom",
             "truncated": False,
-            "output2": [{"cur_prc": "270000", "trde_qty": "150", "cntr_tm": "20260904153000"}],
+            "output2": [{"cur_prc": "270000", "trde_qty": "150", "cntr_tm": f"{today_str.replace('-', '')}153000"}],
         }
     )
     mock_ls = AsyncMock()
@@ -1014,3 +1014,64 @@ def test_collect_intraday_trade_ticks_ls_empty_falls_back_to_kis() -> None:
     assert result.iloc[0]["vendor"] == "kis"
     mock_ls.get_tick_chart.assert_awaited_once()
     mock_kis.get_intraday_trade_ticks.assert_awaited_once()
+
+
+def test_collect_krx_aftermarket_bars_skips_dates_before_launch() -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.backfill.intraday.collector import collect_krx_aftermarket_bars
+
+    calls: list[dict] = []
+
+    class _Client:
+        async def get_intraday_minute_chart(self, session, code, **kwargs):
+            calls.append({"code": code, **kwargs})
+            return {
+                "rt_cd": "0",
+                "output2": [{
+                    "stck_bsop_date": "20260914",
+                    "stck_cntg_hour": "160100",
+                    "stck_oprc": "1000", "stck_hgpr": "1010",
+                    "stck_lwpr": "995", "stck_prpr": "1005",
+                    "cntg_vol": "100", "acml_tr_pbmn": "100000",
+                }],
+            }
+
+    client = _Client()
+
+    # Given: 시행일 이전 -> API 호출 없음
+    before = asyncio.run(collect_krx_aftermarket_bars(client, object(), ["005930"], "2026-09-11"))
+    assert isinstance(before, pd.DataFrame) and before.empty
+    assert calls == []
+
+    # When: 시행일 당일 -> KRX 애프터 구간으로 조회
+    after = asyncio.run(collect_krx_aftermarket_bars(client, object(), ["005930"], "2026-09-14"))
+    assert len(calls) == 1
+    assert calls[0]["floor_hour"] == "160000"
+    assert calls[0]["end_hour"] == "200000"
+    assert calls[0]["market_div_code"] == "J"
+    assert after["ts_hms"].tolist() == [160100]
+
+
+def test_backfill_krx_aftermarket_bars_uses_historical_tr_after_launch() -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import backfill_krx_aftermarket_bars
+
+    calls: list[tuple] = []
+
+    class _Client:
+        async def get_historical_minute_chart(self, session, code, target_date, **kwargs):
+            calls.append((code, target_date, kwargs.get("floor_hour"), kwargs.get("end_hour")))
+            return {"rt_cd": "0", "output2": []}
+
+    client = _Client()
+
+    empty = asyncio.run(backfill_krx_aftermarket_bars(client, object(), ["005930"], "2026-09-01"))
+    assert empty.empty
+    assert calls == []
+
+    asyncio.run(backfill_krx_aftermarket_bars(client, object(), ["005930"], "2026-09-15"))
+    assert calls == [("005930", "20260915", "160000", "200000")]
