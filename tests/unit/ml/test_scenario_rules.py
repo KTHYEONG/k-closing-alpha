@@ -24,7 +24,7 @@ def _price_history_with_setups() -> pd.DataFrame:
     for i, d in enumerate(dates):
         px = 5000.0 * (1.0 + 0.001 * i)
         chg = 0.30 if i == 298 else 0.01
-        close = px * 1.05 if i == 298 else px
+        close = px * 1.30 if i == 298 else px
         high = close if i == 298 else px * 1.01
         c.append({"date": d, "symbol": "000002", "open": px, "high": high, "low": px * 0.98,
                   "close": close, "volume": 200000.0, "trade_value_100m": 500.0,
@@ -117,3 +117,82 @@ def test_scenario_agreement_report_contract() -> None:
 
     with pytest.raises(ValueError):  # noqa: PT011 - contract skeleton asserts type only
         scenario_agreement_report(manual, auto.iloc[:3])
+
+
+def test_breakout_and_ceiling_frame_derives_ratio_ignoring_vendor_column() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.scenario_rules import _breakout_and_ceiling_frame
+
+    # Given: symbol 000010's close only rises ~5% day-over-day, but the vendor
+    # daily_change_pct field is deliberately set to 0.30 (a wrong/stale value).
+    dates = pd.bdate_range("2023-01-02", periods=130)
+    px = 6000.0
+    rows = []
+    for i, d in enumerate(dates):
+        close = px * (1.05 if i == 128 else 1.0)
+        rows.append({
+            "date": d, "symbol": "000010", "high": close, "low": px * 0.98,
+            "close": close, "daily_change_pct": 0.30 if i == 128 else 0.01,
+        })
+        px = close
+
+    ph = pd.DataFrame(rows)
+
+    # When
+    out = _breakout_and_ceiling_frame(ph)
+
+    # Then: the vendor's false ceiling claim at i==128 is NOT propagated; the
+    # true ~5% move never crosses CEILING_CHG_THRESHOLD, so day i==129 must not
+    # be flagged as the day after a ceiling.
+    row_129 = out[out["date"] == dates[129]].iloc[0]
+    assert row_129["prev_ceiling"] is np.bool_(False) or bool(row_129["prev_ceiling"]) is False
+
+
+def test_breakout_and_ceiling_frame_flags_genuine_close_derived_ceiling() -> None:
+    import pandas as pd
+
+    from src.ml.scenario_rules import _breakout_and_ceiling_frame
+
+    # Given: a genuine +30% close move on day i==128, no daily_change_pct column
+    # at all -- proving the ceiling gate no longer depends on that column existing.
+    dates = pd.bdate_range("2023-01-02", periods=130)
+    px = 6000.0
+    rows = []
+    for i, d in enumerate(dates):
+        close = px * (1.30 if i == 128 else 1.0)
+        high = close
+        rows.append({"date": d, "symbol": "000011", "high": high, "low": px * 0.98, "close": close})
+        px = close
+
+    ph = pd.DataFrame(rows)
+
+    # When
+    out = _breakout_and_ceiling_frame(ph)
+
+    # Then: the day AFTER the genuine ceiling is flagged prev_ceiling=True.
+    row_129 = out[out["date"] == dates[129]].iloc[0]
+    assert bool(row_129["prev_ceiling"]) is True
+
+
+def test_breakout_and_ceiling_frame_first_bar_is_never_a_ceiling() -> None:
+    import pandas as pd
+
+    from src.ml.scenario_rules import _breakout_and_ceiling_frame
+
+    # Given: a symbol whose very first bar has no prior close to derive a ratio from.
+    ph = pd.DataFrame({
+        "date": pd.bdate_range("2023-01-02", periods=3),
+        "symbol": ["000012"] * 3,
+        "high": [10000.0, 10500.0, 10500.0],
+        "low": [9800.0, 10200.0, 10200.0],
+        "close": [10000.0, 10500.0, 10500.0],
+    })
+
+    # When
+    out = _breakout_and_ceiling_frame(ph)
+
+    # Then: no row is dropped, and the first bar's NaN ratio never registers as a ceiling.
+    assert len(out) == 3
+    assert bool(out.iloc[0]["prev_ceiling"]) is False
