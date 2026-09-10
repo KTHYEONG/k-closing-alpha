@@ -4,4 +4,4 @@ Description=KCA daily collect (read-only snapshot)
 [Service]
 Type=oneshot
 WorkingDirectory=/home/kth/k-closing-alpha
-ExecStart=/usr/bin/env uv run python -m src.daily.collect
+ExecStart=/home/kth/.local/bin/uv run python -m src.daily.collect
