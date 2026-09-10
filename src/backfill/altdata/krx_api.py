@@ -25,6 +25,7 @@ KRX_ENDPOINT_FUT_DAILY = "/svc/apis/drv/fut_bydd_trd"
 KRX_ENDPOINT_KOSPI_INDEX_DAILY = "/svc/apis/idx/kospi_dd_trd"
 KRX_ENDPOINT_STK_BASE_INFO = "/svc/apis/sto/stk_isu_base_info"
 KRX_ENDPOINT_KSQ_BASE_INFO = "/svc/apis/sto/ksq_isu_base_info"
+KRX_ENDPOINT_STK_DAILY = "/svc/apis/sto/stk_bydd_trd"
 
 
 def fetch_krx_openapi_day(
@@ -72,3 +73,52 @@ def fetch_krx_openapi_day(
 
     out = retry_call(_call, cfg, label=f"krx {endpoint} {date_ymd}")
     return out if out is not None else pd.DataFrame()
+
+
+def fetch_krx_openapi_day_strict(
+    endpoint: str, date_ymd: str, cfg: AltDataFetchConfig
+) -> pd.DataFrame:
+    """단일 기준일 KRX Open API 응답을 fail-closed 계약으로 반환합니다.
+
+    기존 :func:`fetch_krx_openapi_day` 의 fail-soft 와 정반대 계약으로,
+    폴백 없는 설계에서 조용한 결손을 막기 위해 401/404/비200 을 절대 빈
+    DataFrame 으로 삼키지 않고 :class:`RuntimeError` 로 드러냅니다.
+    휴장일(200 + 0행)은 정상 응답이므로 빈 DataFrame 을 반환합니다.
+
+    Args:
+        endpoint: ``/svc/apis/...`` 경로.
+        date_ymd: 기준일 (``YYYYMMDD``).
+        cfg: Alt-data 설정 (``krx_api_key`` 필수).
+
+    Returns:
+        ``OutBlock_1`` 행들의 DataFrame. 0행이면 휴장일의 정상 빈 프레임.
+
+    Raises:
+        ValueError: ``krx_api_key`` 가 비어 있을 때.
+        RuntimeError: HTTP 401/404/기타 비200 및 재시도 전체 실패 시.
+    """
+    key = str(cfg.krx_api_key).strip()
+    if not key:
+        raise ValueError("krx api key is required for strict fetch")
+    url = f"{_BASE_URL}{endpoint}"
+
+    def _call() -> pd.DataFrame:
+        wait_for_krx_slot(cfg)
+        resp = requests.get(
+            url, params={"basDd": date_ymd}, headers={"AUTH_KEY": key}, timeout=20
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"krx http_status={resp.status_code} endpoint={endpoint} date={date_ymd}"
+            )
+        payload = resp.json()
+        block = next((k for k in payload if k.startswith("OutBlock")), None)
+        rows = payload.get(block, []) if block else []
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    out = retry_call(_call, cfg, label=f"krx {endpoint} {date_ymd}")
+    if out is None:
+        raise RuntimeError(
+            f"krx http_status=unknown endpoint={endpoint} date={date_ymd} (all retries failed)"
+        )
+    return out

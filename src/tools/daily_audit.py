@@ -14,6 +14,7 @@ import pandas as pd
 from src import settings
 from src.daily.archive import fetch_archive_snapshot
 from src.data.intraday_store import intraday_partition_path
+from src.data.trading_calendar import is_krx_trading_day
 from src.processing.schema import CLOSE_CONFIRMED_COL
 
 logger = logging.getLogger(__name__)
@@ -47,12 +48,27 @@ def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
     }
 
 
+def audit_or_skip(snapshot_date: str) -> dict[str, bool] | None:
+    """비거래일에는 감사를 건너뛰고, 거래일에는 기존 감사를 그대로 수행한다.
+
+    휴장일에는 산출물이 없어 MISSING 오탐만 찍히므로 감사 자체를 수행하지
+    않는다. 거래일 판정 장애(네트워크/인증)는 휴장일로 오판하지 않고 그대로
+    전파한다.
+    """
+    if not is_krx_trading_day(snapshot_date):
+        logger.info("[DATA] stage=daily_audit status=SKIP reason=non_trading_day date=%s", snapshot_date)
+        return None
+    return audit_daily_completeness(snapshot_date)
+
+
 def main() -> None:  # pragma: no cover - CLI entry; logic covered via audit_daily_completeness scenarios
     parser = argparse.ArgumentParser(description="Daily completeness audit (boot-time visibility only)")
     parser.add_argument("--date", default=None, help="Snapshot date YYYY-MM-DD (default today)")
     args = parser.parse_args()
     snapshot_date: str = args.date or pd.Timestamp.today().strftime("%Y-%m-%d")
-    result = audit_daily_completeness(snapshot_date)
+    result = audit_or_skip(snapshot_date)
+    if result is None:
+        return
     missing = sorted(step for step, ok in result.items() if not ok)
     if missing:
         logger.warning("[DATA] stage=daily_audit status=MISSING steps=%s", ",".join(missing))

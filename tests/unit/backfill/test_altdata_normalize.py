@@ -16,7 +16,7 @@ def test_normalize_panel_dedups_and_filters_universe() -> None:
         start=pd.Timestamp("2024-01-01"), end=pd.Timestamp("2024-02-01"),
         out_dir=Path("x"), universe_symbols=frozenset({"005930"}),
     )
-    out = normalize_panel(raw, "fundamental", cfg)
+    out = normalize_panel(raw, "shorting", cfg)
     assert list(out["symbol"]) == ["005930"]
     assert out["per"].iloc[0] == 2.0
     assert str(out["date"].dtype).startswith("datetime64")
