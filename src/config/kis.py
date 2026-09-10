@@ -38,18 +38,3 @@ class KisSettings(BaseSettings):
             "account_id": self.KIS_ACCOUNT_ID,
             "hts_id": self.KIS_HTS_ID,
         }
-
-    # ---------------------------------------------------------
-    # [스펙 하위 호환 별칭] (spec: kis_app_key, kis_app_secret, ...)
-    # ---------------------------------------------------------
-    @property
-    def kis_app_key(self) -> str:
-        return self.KIS_APP_KEY
-
-    @property
-    def kis_app_secret(self) -> str:
-        return self.KIS_APP_SECRET
-
-    @property
-    def kis_account_id(self) -> str:
-        return self.KIS_ACCOUNT_ID

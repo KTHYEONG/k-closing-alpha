@@ -20,10 +20,15 @@ __all__ = [
     "APPROXIMATE_SPEARMAN_THRESHOLD",
     "CEILING_CHG_THRESHOLD",
     "COST_AWARE_UNIVERSE",
+    "DEFAULT_REALIZED_VOL",
     "DEFAULT_UNIVERSE",
     "KCA_TOP3_SHADOW_001",
     "KCA_TOPK_COSTAWARE_001",
     "KRX_DAILY_LIMIT_RATIO",
+    "LABEL_BAD_THRESHOLD",
+    "LABEL_GOOD_THRESHOLD",
+    "MAX_TICK_COST_BP",
+    "MIN_PATH_WIN_RATE",
     "MIN_ROUND_TRIP_TICKS",
     "PA_COST",
     "CostSpec",
@@ -51,6 +56,17 @@ class ExecutionMode(StrEnum):
 MIN_ROUND_TRIP_TICKS: dict[ExecutionMode, float] = {ExecutionMode.AA: 2.0, ExecutionMode.PA: 1.0}
 
 CEILING_CHG_THRESHOLD: float = 0.29
+
+# 비용인식 스크린의 1틱 비용 상한 (bp)
+MAX_TICK_COST_BP: float = 7.5
+# 실현변동성 폴백 (불확실성 지표가 아닌 시그마 추정용)
+DEFAULT_REALIZED_VOL: float = 0.02
+# CPCV 경로승률 게이트 (검증 임계값)
+MIN_PATH_WIN_RATE: float = 0.60
+# 비용차감 후 '좋음' 라벨 경계
+LABEL_GOOD_THRESHOLD: float = 0.01
+# 비용차감 후 '나쁨' 라벨 경계
+LABEL_BAD_THRESHOLD: float = -0.02
 
 KRX_DAILY_LIMIT_RATIO: float = 0.31
 
@@ -123,7 +139,7 @@ COST_AWARE_UNIVERSE: UniverseSpec = UniverseSpec(
     min_trade_value_100m=100.0,
     min_market_cap_100m=500.0,
     exclude_ceiling=True,
-    max_tick_cost_bp=7.5,
+    max_tick_cost_bp=MAX_TICK_COST_BP,
 )
 
 KCA_TOPK_COSTAWARE_001: StrategySpec = StrategySpec(

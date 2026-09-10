@@ -28,13 +28,3 @@ def test_kis_settings_env_resolution(monkeypatch) -> None:
         "account_id": "env_account",
         "hts_id": "env_hts",
     }
-
-
-def test_kis_settings_spec_alias_backward_compat(monkeypatch) -> None:
-    monkeypatch.setenv("KIS_APP_KEY", "alias_key")
-    monkeypatch.setenv("KIS_APP_SECRET", "alias_secret")
-    monkeypatch.setenv("KIS_ACCOUNT_ID", "alias_account")
-    settings = KisSettings(_env_file=None)
-    assert settings.kis_app_key == "alias_key"
-    assert settings.kis_app_secret == "alias_secret"  # noqa: S105
-    assert settings.kis_account_id == "alias_account"

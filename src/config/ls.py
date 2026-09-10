@@ -22,3 +22,5 @@ class LsSettings(BaseSettings):
     LS_APP_KEY: str = Field(default="")
     LS_APP_SECRET: str = Field(default="")
     LS_BASE_URL: str = "https://openapi.ls-sec.co.kr:8080"
+    # LS 틱 차트 페이지 예산 (100페이지 ~= 심볼당 ~105초 @1.05초 페이싱)
+    LS_TICK_MAX_PAGES: int = Field(default=100)

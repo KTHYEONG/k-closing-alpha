@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.strategy.contract import CEILING_CHG_THRESHOLD, MAX_TICK_COST_BP
+
 __all__ = [
     "COST_AWARE_SCREEN",
     "ScreenConfig",
@@ -46,7 +48,7 @@ COST_AWARE_SCREEN: ScreenConfig = ScreenConfig(
     min_trade_value_100m=100.0,
     min_market_cap_100m=500.0,
     exclude_ceiling=True,
-    max_tick_cost_bp=7.5,
+    max_tick_cost_bp=MAX_TICK_COST_BP,
 )
 
 
@@ -109,7 +111,7 @@ def build_universe_panel(
     chg = pd.to_numeric(filt["daily_change_pct"], errors="coerce").to_numpy(dtype=np.float64)
     close = pd.to_numeric(filt["close"], errors="coerce").to_numpy(dtype=np.float64)
     high = pd.to_numeric(filt["high"], errors="coerce").to_numpy(dtype=np.float64)
-    ceiling = np.isfinite(chg) & np.isfinite(close) & np.isfinite(high) & (chg >= 0.29) & (close >= high)
+    ceiling = np.isfinite(chg) & np.isfinite(close) & np.isfinite(high) & (chg >= CEILING_CHG_THRESHOLD) & (close >= high)
     if bool(screen.exclude_ceiling):
         n_ceiling_excluded = int(np.sum(ceiling))
         keep_ceiling = ~ceiling

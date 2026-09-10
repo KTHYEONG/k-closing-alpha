@@ -94,15 +94,9 @@ ALTDATA_DIR = settings.ALTDATA_DIR
 DART_API_KEY = settings.DART_API_KEY
 OPENDART_API_KEY = settings.OPENDART_API_KEY
 KRX_OPENAPI_KEY = settings.KRX_OPENAPI_KEY
-
-# 스펙 하위 호환 별칭 (소문자)
-base_dir = settings.base_dir
-data_dir = settings.data_dir
-artifacts_dir = settings.artifacts_dir
-models_dir = settings.models_dir
-kis_app_key = settings.kis_app_key
-kis_app_secret = settings.kis_app_secret
-kis_account_id = settings.kis_account_id
+KRX_OPENAPI_BASE_URL = settings.KRX_OPENAPI_BASE_URL
+KRX_OPENAPI_BASE_URLS = settings.KRX_OPENAPI_BASE_URLS
+KRX_OPENAPI_ENDPOINTS = settings.KRX_OPENAPI_ENDPOINTS
 
 __all__ = [
     "ALTDATA_DIR",
@@ -130,6 +124,9 @@ __all__ = [
     "KIWOM_BASE_URL",
     "KIWOM_SECRET_KEY",
     "KIWOM_TICK_MAX_PAGES",
+    "KRX_OPENAPI_BASE_URL",
+    "KRX_OPENAPI_BASE_URLS",
+    "KRX_OPENAPI_ENDPOINTS",
     "KRX_OPENAPI_KEY",
     "LABEL_ENCODER_PATH",
     "LS_APP_KEY",
@@ -162,12 +159,5 @@ __all__ = [
     "PathSettings",
     "Settings",
     "TradingSettings",
-    "artifacts_dir",
-    "base_dir",
-    "data_dir",
-    "kis_account_id",
-    "kis_app_key",
-    "kis_app_secret",
-    "models_dir",
     "settings",
 ]

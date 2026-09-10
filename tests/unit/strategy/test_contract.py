@@ -408,3 +408,61 @@ def test_cost_aware_strategy_spec_uses_topk_three() -> None:
     assert COST_AWARE_UNIVERSE.chg_max == 0.10
     assert COST_AWARE_UNIVERSE.min_trade_value_100m == 100.0
     assert COST_AWARE_UNIVERSE.exclude_ceiling is True
+
+
+def test_ceiling_threshold_has_one_definition() -> None:
+    import inspect
+
+    from src.ml import scenario_rules, universe
+    from src.strategy.contract import CEILING_CHG_THRESHOLD
+
+    # Then: the canonical value is unchanged.
+    assert CEILING_CHG_THRESHOLD == 0.29
+
+    # And: the private duplicate is gone.
+    assert not hasattr(scenario_rules, "_CEILING_CHANGE_DECIMAL")
+
+    # And: neither consumer retypes the literal.
+    for mod in (scenario_rules, universe):
+        source = inspect.getsource(mod)
+        assert "0.29" not in source, f"{mod.__name__} still hardcodes the ceiling threshold"
+        assert "CEILING_CHG_THRESHOLD" in source
+
+    # And: the emitted diagnostics key name is preserved for schema stability.
+    assert "_CEILING_CHANGE_DECIMAL" in scenario_rules.SCENARIO_LADDER_THRESHOLDS
+    assert scenario_rules.SCENARIO_LADDER_THRESHOLDS["_CEILING_CHANGE_DECIMAL"] == CEILING_CHG_THRESHOLD
+
+
+def test_shared_domain_constants_have_one_definition() -> None:
+    from src.ml import bundle, dataset, history_features, oof, topk_ranker_research, universe, universe_research
+    from src.serving.realtime import inference
+    from src.strategy import contract
+
+    # Then: values are exactly what they were before consolidation.
+    assert contract.MAX_TICK_COST_BP == 7.5
+    assert contract.DEFAULT_REALIZED_VOL == 0.02
+    assert contract.MIN_PATH_WIN_RATE == 0.60
+    assert contract.LABEL_GOOD_THRESHOLD == 0.01
+    assert contract.LABEL_BAD_THRESHOLD == -0.02
+
+    # And: every private duplicate is gone.
+    assert not hasattr(inference, "_DEFAULT_REALIZED_VOL")
+    assert not hasattr(history_features, "_DEFAULT_REALIZED_VOL_FALLBACK")
+    assert not hasattr(universe_research, "_VERDICT_MIN_PATH_WIN")
+    assert not hasattr(oof, "_GOOD_THRESHOLD")
+    assert not hasattr(oof, "_BAD_THRESHOLD")
+    assert not hasattr(bundle, "_GOOD_THRESHOLD")
+    assert not hasattr(bundle, "_BAD_THRESHOLD")
+
+    # And: the shared numbers still reach both universe implementations identically.
+    assert universe.COST_AWARE_SCREEN.max_tick_cost_bp == contract.COST_AWARE_UNIVERSE.max_tick_cost_bp
+    assert topk_ranker_research.MIN_PATH_WIN_RATE == contract.MIN_PATH_WIN_RATE
+
+    # And: the public label dict keeps its keys and values.
+    assert dataset.LABEL_THRESHOLDS == {
+        "target_good": contract.LABEL_GOOD_THRESHOLD,
+        "target_bad": contract.LABEL_BAD_THRESHOLD,
+    }
+
+    # And: a different quantity that happens to share a number is NOT merged.
+    assert history_features._REALIZED_VOL_FLOOR != contract.LABEL_BAD_THRESHOLD

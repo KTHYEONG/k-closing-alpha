@@ -7,7 +7,6 @@ KRX breadth는 KRX OpenAPI(KRX_OPENAPI_KEY)를 우선 사용하고, 실패 시 p
 from __future__ import annotations
 
 import argparse
-import os
 import threading
 import time
 from dataclasses import dataclass
@@ -95,32 +94,16 @@ def _acquire_krx_request_slot(cfg: MarketFactorFetchConfig) -> None:
         _KRX_REQUEST_COUNT += 1
     if wait > 0:
         time.sleep(wait)
-def _get_env_value(key: str, default: str = "") -> str:
-    raw = os.getenv(key)
-    if raw is not None and str(raw).strip():
-        return str(raw).strip().strip('"').strip("'")
-
-    env_path = settings.BASE_DIR / ".env"
-    if not env_path.exists():
-        return default
-    try:
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            txt = line.strip()
-            if not txt or txt.startswith("#") or "=" not in txt:
-                continue
-            k, v = txt.split("=", 1)
-            if k.strip() == key:
-                return v.strip().strip('"').strip("'")
-    except Exception:
-        return default
-    return default
-
-
-def _get_env_csv(key: str) -> list[str]:
-    txt = _get_env_value(key, "")
-    if not txt:
+def _split_csv(raw: str) -> list[str]:
+    """Split a settings-supplied CSV string into cleaned items."""
+    if not raw or not str(raw).strip():
         return []
-    return [x.strip() for x in txt.split(",") if x.strip()]
+    # 따옴표로 감싼 항목의 앞뒤 공백과 인용부호를 제거하고 빈 항목을 버린다
+    return [
+        item.strip().strip('"').strip("'")
+        for item in (part.strip() for part in str(raw).split(","))
+        if item.strip().strip('"').strip("'")
+    ]
 
 
 def _parse_date_arg(value: str | None) -> pd.Timestamp | None:
@@ -378,13 +361,13 @@ def _fetch_krx_breadth_openapi(
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     dates = pd.date_range(start=start, end=end, freq="B")
-    env_base_urls = _get_env_csv("KRX_OPENAPI_BASE_URLS")
-    env_single_base = _get_env_value("KRX_OPENAPI_BASE_URL", "")
+    env_base_urls = _split_csv(settings.KRX_OPENAPI_BASE_URLS)
+    env_single_base = str(settings.KRX_OPENAPI_BASE_URL).strip()
     if env_single_base:
         env_base_urls = [env_single_base]
     base_urls = env_base_urls or [b for b in cfg.krx_openapi_base_urls if str(b).strip()]
 
-    env_endpoints = _get_env_csv("KRX_OPENAPI_ENDPOINTS")
+    env_endpoints = _split_csv(settings.KRX_OPENAPI_ENDPOINTS)
     endpoints = env_endpoints or [e for e in cfg.krx_openapi_endpoints if str(e).strip()]
     disabled_endpoints: set[str] = set()
 
@@ -489,7 +472,7 @@ def _fetch_krx_breadth(
     end: pd.Timestamp,
     cfg: MarketFactorFetchConfig,
 ) -> pd.DataFrame:
-    auth_key = _get_env_value("KRX_OPENAPI_KEY", "")
+    auth_key = str(settings.KRX_OPENAPI_KEY).strip()
     if auth_key:
         openapi_df = _fetch_krx_breadth_openapi(
             start=start,
