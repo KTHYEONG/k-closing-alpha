@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "refactor_consolidation_phase1_write_path_integrity",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_refactor_consolidation_phase1_write_path_integrity",
+      "domain": "data_collection",
+      "title": "가격 히스토리 쓰기 경로 단위 정합성 복구",
+      "why": "심볼별 median(chg)>1.0 스니핑이 노이즈로 판정되어 888,011행(16.28%)이 percent/ratio 혼재로 오염되고 forward_path/exit_policy 사본은 조건이 발화조차 안 하는 무력한 가드였음",
+      "resolution": "backfill/price/normalize.py·ml/exit_policy.py의 스니핑 삭제, panel_integrity.py에 heal_price_history_panel/assert_price_history_units_clean 신설, write_price_history_parquet를 단일 fail-closed 초크포인트로 배선, 세 번째 사본 보유 forward_path.py 삭제",
+      "impact": "실측 5,454,300행 전수에서 치유 후 오염 0·게이트 통과·멱등 확인, 다음 백필 실행 시 기존 오염 자동 치유되나 그 전 마이그레이션 도구는 fail-closed로 막힘"
+    },
+    {
       "task_id": "data_storage_cleanup",
       "date": "2026-09-09",
       "adr_id": "ADR_20260909_data_storage_cleanup",

@@ -103,7 +103,9 @@
     "testing": "tests/unit/backfill/test_factors_proxy.py"
   },
   "src/backfill/price/krx_openapi.py": {},
-  "src/backfill/price/normalize.py": {},
+  "src/backfill/price/normalize.py": {
+    "testing": "tests/unit/backfill/price/test_normalize.py"
+  },
   "src/backfill/price/runner.py": {
     "testing": "tests/unit/backfill/price/test_runner.py"
   },
@@ -214,9 +216,6 @@
     "testing": "tests/unit/ml/test_expected_value.py"
   },
   "src/ml/feature_manifest.py": {},
-  "src/ml/forward_path.py": {
-    "testing": "tests/unit/ml/test_forward_path.py"
-  },
   "src/ml/history_features.py": {
     "testing": "tests/unit/ml/test_history_features.py"
   },
