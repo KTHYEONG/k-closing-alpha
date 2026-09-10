@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pandas as pd
 
-from src.api.kis_client import (
+from src.api.kis.indicators import (
     calculate_all_moving_averages,
     calculate_multiple_emas,
     calculate_stock_ema,
@@ -47,9 +47,9 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(return_value=_ohlcv_response(200)),
 )
 def test_calculate_stock_sma_success() -> None:
@@ -58,9 +58,9 @@ def test_calculate_stock_sma_success() -> None:
     assert sma_value > 0
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(return_value={"rt_cd": "9", "msg1": "조회 실패"}),
 )
 def test_calculate_stock_sma_first_chunk_failure() -> None:
@@ -69,9 +69,9 @@ def test_calculate_stock_sma_first_chunk_failure() -> None:
     assert sma_value == 0.0
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(side_effect=RuntimeError("api down")),
 )
 def test_calculate_stock_sma_exception() -> None:
@@ -80,9 +80,9 @@ def test_calculate_stock_sma_exception() -> None:
     assert sma_value == 0.0
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(return_value=_ohlcv_response(60)),
 )
 def test_calculate_stock_ema_success() -> None:
@@ -92,9 +92,9 @@ def test_calculate_stock_ema_success() -> None:
     assert count >= 20
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(return_value={"rt_cd": "9", "msg1": "조회 실패"}),
 )
 def test_calculate_stock_ema_failure() -> None:
@@ -104,9 +104,9 @@ def test_calculate_stock_ema_failure() -> None:
     assert count == 0
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(return_value={"rt_cd": "0", "output2": []}),
 )
 def test_calculate_stock_ema_empty_items() -> None:
@@ -116,9 +116,9 @@ def test_calculate_stock_ema_empty_items() -> None:
     assert count == 0
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(side_effect=RuntimeError("api down")),
 )
 def test_calculate_stock_ema_exception() -> None:
@@ -128,9 +128,9 @@ def test_calculate_stock_ema_exception() -> None:
     assert count == 0
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(return_value=_ohlcv_response(60)),
 )
 def test_calculate_multiple_emas_success() -> None:
@@ -139,9 +139,9 @@ def test_calculate_multiple_emas_success() -> None:
     assert all(v > 0 for v in results.values())
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(return_value={"rt_cd": "9", "msg1": "조회 실패"}),
 )
 def test_calculate_multiple_emas_failure() -> None:
@@ -149,9 +149,9 @@ def test_calculate_multiple_emas_failure() -> None:
     assert results == {}
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(return_value=_ohlcv_response(200)),
 )
 def test_calculate_all_moving_averages_success() -> None:
@@ -167,9 +167,9 @@ def test_calculate_all_moving_averages_success() -> None:
     assert sma120 > 0
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(return_value={"rt_cd": "9", "msg1": "조회 실패"}),
 )
 def test_calculate_all_moving_averages_first_chunk_failure() -> None:
@@ -177,9 +177,9 @@ def test_calculate_all_moving_averages_first_chunk_failure() -> None:
     assert result == ({}, (0.0, False, 0), (0.0, False), (0.0, False))
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+    "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
     new=AsyncMock(side_effect=RuntimeError("api down")),
 )
 def test_calculate_all_moving_averages_exception() -> None:
@@ -187,9 +187,9 @@ def test_calculate_all_moving_averages_exception() -> None:
     assert result == ({}, (0.0, False, 0), (0.0, False), (0.0, False))
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_market_index_history",
+    "src.api.kis.client.KisApiClient.get_market_index_history",
     new=AsyncMock(return_value=_index_response(30)),
 )
 def test_fetch_index_volatility_success() -> None:
@@ -198,9 +198,9 @@ def test_fetch_index_volatility_success() -> None:
     assert isinstance(hv_change, float)
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_market_index_history",
+    "src.api.kis.client.KisApiClient.get_market_index_history",
     new=AsyncMock(return_value={"rt_cd": "9", "msg1": "조회 실패"}),
 )
 def test_fetch_index_volatility_failure() -> None:
@@ -209,9 +209,9 @@ def test_fetch_index_volatility_failure() -> None:
     assert hv_change == 0.0
 
 
-@patch("src.api.kis_client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
+@patch("src.api.kis.client.KisApiClient.ensure_token", new=AsyncMock(return_value="tok"))
 @patch(
-    "src.api.kis_client.KisApiClient.get_market_index_history",
+    "src.api.kis.client.KisApiClient.get_market_index_history",
     new=AsyncMock(return_value={"rt_cd": "0", "output2": []}),
 )
 def test_fetch_index_volatility_insufficient_data() -> None:
@@ -227,11 +227,11 @@ def test_fetch_index_volatility_date_range() -> None:
     async def _runner() -> None:
         with (
             patch(
-                "src.api.kis_client.KisApiClient.ensure_token",
+                "src.api.kis.client.KisApiClient.ensure_token",
                 new=AsyncMock(return_value="tok"),
             ),
             patch(
-                "src.api.kis_client.KisApiClient.get_market_index_history",
+                "src.api.kis.client.KisApiClient.get_market_index_history",
                 new=mock_history,
             ),
         ):

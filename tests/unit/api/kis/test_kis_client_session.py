@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock
 
-from src.api.kis_client import KisApiClient
+from src.api.kis.client import KisApiClient
 
 
 def test_create_session_uses_bounded_timeout() -> None:

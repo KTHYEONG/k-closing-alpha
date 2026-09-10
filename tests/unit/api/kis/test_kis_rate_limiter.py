@@ -8,7 +8,8 @@ from unittest.mock import Mock
 
 import aiohttp
 
-from src.api.kis_client import AsyncRateLimiter, KisApiClient
+from src.api.kis.client import KisApiClient
+from src.api.kis.rate_limit import AsyncRateLimiter
 
 
 class _FakeResponse:

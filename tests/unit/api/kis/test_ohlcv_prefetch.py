@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, patch
 
-from src.api.kis_client import (
-    KisApiClient,
+from src.api.kis.client import KisApiClient
+from src.api.kis.indicators import (
     calculate_all_moving_averages,
     prefetch_ohlcv_for_sma120,
 )
@@ -54,7 +54,7 @@ def test_prefetched_records_skips_api_call() -> None:
     """[T01] prefetched_records 주어지면 get_stock_ohlcv_history 호출 횟수 == 0."""
     mock_history = AsyncMock(return_value=_ohlcv_response(200))
     with patch(
-        "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+        "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
         new=mock_history,
     ):
         result = _run(
@@ -72,11 +72,11 @@ def test_prefetched_records_none_uses_chunk_loop() -> None:
     mock_history = AsyncMock(return_value=_ohlcv_response(200))
     with (
         patch(
-            "src.api.kis_client.KisApiClient.ensure_token",
+            "src.api.kis.client.KisApiClient.ensure_token",
             new=AsyncMock(return_value="tok"),
         ),
         patch(
-            "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+            "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
             new=mock_history,
         ),
     ):
@@ -136,11 +136,11 @@ def test_chunk_loop_second_chunk_failure_breaks() -> None:
     )
     with (
         patch(
-            "src.api.kis_client.KisApiClient.ensure_token",
+            "src.api.kis.client.KisApiClient.ensure_token",
             new=AsyncMock(return_value="tok"),
         ),
         patch(
-            "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+            "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
             new=mock_history,
         ),
     ):
@@ -157,11 +157,11 @@ def test_chunk_loop_sleeps_between_chunks() -> None:
     )
     with (
         patch(
-            "src.api.kis_client.KisApiClient.ensure_token",
+            "src.api.kis.client.KisApiClient.ensure_token",
             new=AsyncMock(return_value="tok"),
         ),
         patch(
-            "src.api.kis_client.KisApiClient.get_stock_ohlcv_history",
+            "src.api.kis.client.KisApiClient.get_stock_ohlcv_history",
             new=mock_history,
         ),
     ):

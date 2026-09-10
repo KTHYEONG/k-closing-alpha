@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from src import settings
-from src.api.kis_client import KisApiClient
+from src.api.kis.client import KisApiClient
 from src.backfill.intraday.collector import backfill_nxt_aftermarket_bars, backfill_regular_bars
 from src.config.market_session import INTRADAY_SESSION_NXT_AFTERMARKET, INTRADAY_SESSION_REGULAR
 from src.daily import archive

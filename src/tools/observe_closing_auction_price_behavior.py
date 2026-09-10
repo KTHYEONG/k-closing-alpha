@@ -45,7 +45,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from src import settings
-from src.api.kis_client import KisApiClient
+from src.api.kis.client import KisApiClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
