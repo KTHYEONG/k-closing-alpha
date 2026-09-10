@@ -31,6 +31,10 @@ DECISION_CLOSE_COL: str = "결정_종가"
 CLOSE_CONFIRMED_COL: str = "종가_확정"
 
 
+# 현재가 TR 실패 표식 (fail-closed 플래그; 0값 위조 금지)
+QUOTE_FAILED_COL: str = "현재가_실패"
+
+
 # 스프레드시트 원본(괄호/한글 폼) -> 표준 영문 컬럼명 매핑
 RAW_TO_STANDARD_MAP: dict[str, str] = {
     "매수날짜": StandardColumns.TRADE_DATE,
@@ -202,6 +206,7 @@ ARCHIVE_COLUMN_ORDER: list[str] = [
     "admitted",
     "수급_실패",
     "지수_실패",
+    QUOTE_FAILED_COL,
     DECISION_CLOSE_COL,
     CLOSE_CONFIRMED_COL,
 ]

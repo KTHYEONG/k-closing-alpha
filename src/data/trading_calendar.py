@@ -47,3 +47,16 @@ def is_krx_trading_day(date: pd.Timestamp | str, cfg: AltDataFetchConfig | None 
     result = len(rows) > 0
     _TRADING_DAY_CACHE[key] = result
     return result
+
+
+async def is_kis_trading_day(client, session, date: pd.Timestamp | str) -> bool:
+    """KIS 지수 일별시세(0001) 응답에 요청일이 존재하면 거래일로 판정한다.
+
+    rt_cd != "0"인 장애 응답은 휴장일로 강제하지 않고 RuntimeError로 전파한다.
+    """
+    ymd = pd.Timestamp(date).strftime("%Y%m%d")
+    res = await client.get_market_index_history(session, "0001", ymd, ymd)
+    if res.get("rt_cd") != "0":
+        raise RuntimeError(f"KIS trading-day oracle failed rt_cd={res.get('rt_cd')} msg={res.get('msg1', '')}")
+    rows = res.get("output2") or []
+    return any(str(r.get("stck_bsop_date", "")).strip() == ymd for r in rows)

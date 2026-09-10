@@ -12,11 +12,20 @@ logger = logging.getLogger(__name__)
 
 UNIVERSE_SCAN_SCENARIO_TAG: str = "등락률스캔"
 
+SCAN_PRIMARY_VENDOR: str = "kiwoom"
+
+
+class UniverseScanCoverageError(RuntimeError):
+    """Kiwoom 커버리지 없이 거래 후보 리스트를 만들 수 없을 때의 fail-closed 오류."""
+
+
 RANKING_SCAN_INPUT_CNT: str = "200"
 
 __all__ = [
     "RANKING_SCAN_INPUT_CNT",
+    "SCAN_PRIMARY_VENDOR",
     "UNIVERSE_SCAN_SCENARIO_TAG",
+    "UniverseScanCoverageError",
     "archive_universe_snapshot",
     "collect_universe_scan",
     "fetch_candidate_stock_list",
@@ -222,43 +231,35 @@ def map_kiwoom_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
 async def fetch_candidate_stock_list(
     client, session, *, universe: UniverseSpec = DEFAULT_UNIVERSE, kiwoom_client: Any | None = None
 ) -> list[dict]:
-    """Fetch candidate stock_list via Kiwoom-primary/KIS-fallback ranking scan.
+    """Kiwoom ka10027을 유일한 유니버스 소스로 후보 stock_list를 조회한다 (fail-closed).
 
     Args:
-        client: KIS API client.
+        client: KIS API client (사용하지 않음; 시그니처 호환용).
         session: HTTP session.
         universe: Universe bounds for the ranking call.
-        kiwoom_client: Optional Kiwoom vendor client.
+        kiwoom_client: Kiwoom vendor client (필수).
 
     Returns:
-        Candidate stock_list in collect.py shape; empty list on KIS failure.
+        Candidate stock_list in collect.py shape.
+
+    Raises:
+        UniverseScanCoverageError: kiwoom_client 미주입/호출 실패/논리 실패 시.
     """
-    if kiwoom_client is not None:
-        try:
-            kw_res = await kiwoom_client.get_fluctuation_ranking(
-                session,
-                rate_min_pct=universe.chg_min * 100.0,
-                rate_max_pct=universe.chg_max * 100.0,
-            )
-        except Exception as e:
-            logger.warning("Universe scan kiwoom ranking failed, falling back to KIS: %s", e)
-            kw_res = {"rt_cd": "1", "output": []}
-        if kw_res.get("rt_cd") == "0":
-            return map_kiwoom_ranking_rows_to_stock_list(kw_res.get("output") or [])
-        logger.warning(
-            "Universe scan kiwoom ranking failed rt_cd=%s, falling back to KIS",
-            kw_res.get("rt_cd"),
+    if kiwoom_client is None:
+        raise UniverseScanCoverageError("kiwoom_client is required for the tradeable candidate list")
+    try:
+        kw_res = await kiwoom_client.get_fluctuation_ranking(
+            session,
+            rate_min_pct=universe.chg_min * 100.0,
+            rate_max_pct=universe.chg_max * 100.0,
         )
-    res = await client.get_fluctuation_ranking(
-        session,
-        rate_min_pct=universe.chg_min * 100.0,
-        rate_max_pct=universe.chg_max * 100.0,
-        market_div_code="J",
-        input_cnt=RANKING_SCAN_INPUT_CNT,
-    )
-    if res.get("rt_cd") != "0":
-        logger.warning(
-            "Universe scan ranking failed rt_cd=%s msg=%s", res.get("rt_cd"), res.get("msg1", "")
+    except Exception as e:
+        raise UniverseScanCoverageError(f"kiwoom ranking call failed: {e}") from e
+    if kw_res.get("rt_cd") != "0":
+        raise UniverseScanCoverageError(
+            f"kiwoom ranking failed rt_cd={kw_res.get('rt_cd')} msg={kw_res.get('msg1', '')}"
         )
-        return []
-    return map_ranking_rows_to_stock_list(res.get("output") or [])
+    rows = kw_res.get("output") or []
+    out = map_kiwoom_ranking_rows_to_stock_list(rows)
+    logger.info("[DATA] stage=universe_scan vendor=%s n_rows=%d", SCAN_PRIMARY_VENDOR, len(out))
+    return out
