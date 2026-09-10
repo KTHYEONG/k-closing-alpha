@@ -45,6 +45,7 @@ from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict
 from src.strategy.contract import (
     DEFAULT_UNIVERSE,
     KCA_TOPK_COSTAWARE_001,
+    MIN_PATH_WIN_RATE,
     CostSpec,
     StrategySpec,
     UniverseSpec,
@@ -56,7 +57,6 @@ logger = logging.getLogger(__name__)
 TRAIN_POOL_MIN_ROWS: int = 2000
 CPCV_N_GROUPS: int = 8
 CPCV_K_TEST: int = 2
-MIN_PATH_WIN_RATE: float = 0.60
 RANKER_MODEL_PARAMS: dict[str, Any] = {"n_estimators": 60, "learning_rate": 0.03}
 LABEL_CLIP: float = 0.10
 CERT_REGIME_START: pd.Timestamp = pd.Timestamp(TICK_REFORM_DATE)

@@ -31,10 +31,9 @@ from src.ml.robust_eval import CombinatorialPurgedCV
 from src.ml.universe import COST_AWARE_SCREEN, ScreenConfig, build_universe_panel, screen_baseline_stats
 from src.ml.validation import cpcv_path_evidence
 from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO
+from src.strategy.contract import MIN_PATH_WIN_RATE
 
 logger = logging.getLogger(__name__)
-
-_VERDICT_MIN_PATH_WIN: float = 0.60
 
 UNIVERSE_TO_RAW_PANEL_MAP: dict[str, str] = {
     "symbol": "종목코드",
@@ -217,7 +216,7 @@ def evaluate_universe_screen(
     breakeven_bp = float(cost_model.breakeven_cost_bp(oof_merged["mechanical_gross"].to_numpy(dtype=np.float64), oof_merged["trade_date"].to_numpy()))
     top1_win_rate = float(ev["top1_path_win_rate"])
     ic_win_rate = float(ev["ic_path_win_rate"])
-    verdict = "clears_cost" if ranked_top1_net_bp > 0.0 and top1_win_rate >= _VERDICT_MIN_PATH_WIN else "below_cost"
+    verdict = "clears_cost" if ranked_top1_net_bp > 0.0 and top1_win_rate >= MIN_PATH_WIN_RATE else "below_cost"
     return UniverseScreenRecord(screen_name, screen_dict, n_rows, n_days, per_day, mf_gross_bp, mf_net_bp, mf_t_stat, ranked_rank_ic, ranked_top1_gross_bp, ranked_top1_net_bp, top1_win_rate, ic_win_rate, int(ev["n_path_deltas"]), breakeven_bp, cost_bp, verdict)
 
 

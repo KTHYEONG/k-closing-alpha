@@ -11,7 +11,6 @@ from sklearn.calibration import CalibratedClassifierCV
 from src.ml.feature_manifest import build_feature_manifest
 from src.ml.oof import _finite_nan, fit_chrono_calibrator
 from src.serving.realtime.inference import (
-    _DEFAULT_REALIZED_VOL,
     _GOOD_PCT,
     _GRADE_MULTIPLIERS,
     _QUANTILE_ALPHAS,
@@ -20,9 +19,8 @@ from src.serving.realtime.inference import (
     _WEAK_PCT,
     ROUND_TRIP_COST_RATIO,
 )
+from src.strategy.contract import DEFAULT_REALIZED_VOL, LABEL_BAD_THRESHOLD, LABEL_GOOD_THRESHOLD
 
-_GOOD_THRESHOLD = 0.01
-_BAD_THRESHOLD = -0.02
 _CATEGORICAL_FEATURE_COLS: tuple[str, ...] = (
     "market_type",
     "theme_sector",
@@ -174,14 +172,14 @@ def build_inline_bundle(
     # calibrators
     calibrators: dict[str, Any] = {}
     if calibrator_mode == "cv3":
-        for name, thresh in (("p_good", _GOOD_THRESHOLD), ("p_bad", _BAD_THRESHOLD)):
+        for name, thresh in (("p_good", LABEL_GOOD_THRESHOLD), ("p_bad", LABEL_BAD_THRESHOLD)):
             labels = (train[target_col] >= thresh).to_numpy().astype(bool) if name == "p_good" else (train[target_col] <= thresh).to_numpy().astype(bool)
             calibrators[name] = _fit_calibrator_cv(train[feature_cols], labels)
     else:
         # chrono
         if calib_group_values is None:
             calib_group_values = train[group_col].to_numpy()
-        for name, thresh in (("p_good", _GOOD_THRESHOLD), ("p_bad", _BAD_THRESHOLD)):
+        for name, thresh in (("p_good", LABEL_GOOD_THRESHOLD), ("p_bad", LABEL_BAD_THRESHOLD)):
             labels = (train[target_col] >= thresh).to_numpy().astype(bool) if name == "p_good" else (train[target_col] <= thresh).to_numpy().astype(bool)
             # Use fit_chrono_calibrator with those group values
             # need features DataFrame
@@ -196,7 +194,7 @@ def build_inline_bundle(
         "grade_percentiles": {"strong": _STRONG_PCT, "good": _GOOD_PCT, "weak": _WEAK_PCT},
         "utility_weights": {"lambda_risk": 0.5, "gamma_uncertainty": 0.1, "w_good": 0.0, "w_bad": 0.0},
         "round_trip_cost": ROUND_TRIP_COST_RATIO,
-        "realized_vol_default": _DEFAULT_REALIZED_VOL,
+        "realized_vol_default": DEFAULT_REALIZED_VOL,
     }
     bundle: dict[str, Any] = {
         "feature_cols": list(feature_cols),
@@ -204,7 +202,7 @@ def build_inline_bundle(
         "group_col": group_col,
         "return_unit": "decimal_net",
         "round_trip_cost": ROUND_TRIP_COST_RATIO,
-        "label_thresholds": {"target_good": _GOOD_THRESHOLD, "target_bad": _BAD_THRESHOLD},
+        "label_thresholds": {"target_good": LABEL_GOOD_THRESHOLD, "target_bad": LABEL_BAD_THRESHOLD},
         "feature_manifest": manifest,
         "training_cutoff": training_cutoff,
         "calibration_diagnostics": [],

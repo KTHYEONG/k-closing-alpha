@@ -15,10 +15,6 @@ _STRONG_PCT = 0.90
 _GOOD_PCT = 0.75
 _WEAK_PCT = 0.50
 
-# 변동성 타게팅용 별도 실현 변동성 기본값 (q90-q10 은 불확실성 지표일 뿐
-# 실현 변동성이 아니므로 시그마 추정에 사용하지 않습니다).
-_DEFAULT_REALIZED_VOL = 0.02
-
 _GRADE_MULTIPLIERS: dict[str, float] = {
     "Strong": 1.5,
     "Good": 1.0,

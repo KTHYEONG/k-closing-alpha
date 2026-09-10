@@ -134,10 +134,10 @@ def test_attach_history_features_missing_symbol_safe() -> None:
     import pandas as pd
 
     from src.ml.history_features import (
-        _DEFAULT_REALIZED_VOL_FALLBACK,
         HISTORY_FEATURE_COLUMNS,
         attach_history_features,
     )
+    from src.strategy.contract import DEFAULT_REALIZED_VOL
 
     dates = pd.bdate_range("2024-01-01", periods=20)
     ph = pd.DataFrame(
@@ -161,7 +161,7 @@ def test_attach_history_features_missing_symbol_safe() -> None:
     assert len(out) == 1
     for col in HISTORY_FEATURE_COLUMNS:
         assert pd.isna(out[col].iloc[0])
-    assert out["realized_vol"].iloc[0] == pytest.approx(_DEFAULT_REALIZED_VOL_FALLBACK)
+    assert out["realized_vol"].iloc[0] == pytest.approx(DEFAULT_REALIZED_VOL)
 
 
 def test_attach_history_features_preserves_row_order_and_realized_vol_positive() -> None:

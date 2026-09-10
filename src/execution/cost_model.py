@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.config.market_session import DECISION_WINDOW_END_HMS, DECISION_WINDOW_START_HMS
 from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, normalize_bar_frame
 from src.data.intraday_store import intraday_partition_path
 
@@ -68,8 +69,6 @@ KRX_TICK_BANDS_PRE_REFORM_KOSDAQ: tuple[tuple[float, float], ...] = (
 KOSDAQ_MARKET_LABELS: frozenset[str] = frozenset({"KOSDAQ", "KSQ150"})
 
 STATUTORY_COST_BP: float = 20.0
-
-_AUCTION_CLOSE_HMS: int = 153000
 
 
 @dataclass(frozen=True)
@@ -156,7 +155,7 @@ def measure_auction_impact_bp(
     *,
     date_col: str = "trade_date",
     code_col: str = "stock_code",
-    decision_hms: int = 152000,
+    decision_hms: int = DECISION_WINDOW_START_HMS,
     bar_interval_minutes: int = 1,
     intraday_root: Path | None = None,
 ) -> pd.DataFrame:
@@ -226,7 +225,7 @@ def measure_auction_impact_bp(
                 logger.warning("[DATA] cost_model raw partition yielded no usable symbols date=%s path=%s", snap_str, target)
                 continue
             frame = pd.concat(parts, ignore_index=True)
-        frame = frame[frame["ts_hms"] <= _AUCTION_CLOSE_HMS]
+        frame = frame[frame["ts_hms"] <= DECISION_WINDOW_END_HMS]
         per_symbol: dict[str, float] = {}
         for symbol, group in frame.groupby("symbol", sort=False):
             ordered = group.sort_values("ts_hms", kind="stable")
