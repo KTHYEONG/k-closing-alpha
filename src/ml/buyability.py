@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.config.market_session import INTRADAY_SESSION_REGULAR
+from src.config.market_session import DECISION_WINDOW_END_HMS, DECISION_WINDOW_START_HMS, INTRADAY_SESSION_REGULAR
 from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, normalize_bar_frame
 from src.data.intraday_store import intraday_partition_path
 
@@ -20,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 CEILING_RATIO_THRESHOLD: float = 1.29
 DEFAULT_PARTICIPATION_CAP: float = 0.10
-
-_AUCTION_CLOSE_HMS: int = 153000
 
 
 def classify_ceiling_entry(
@@ -68,7 +66,7 @@ def attach_entry_auction_liquidity(
     date_col: str = "trade_date",
     code_col: str = "stock_code",
     bar_interval_minutes: int = 1,
-    auction_start_hms: int = 152000,
+    auction_start_hms: int = DECISION_WINDOW_START_HMS,
     intraday_root: Path | None = None,
 ) -> pd.DataFrame:
     """Attach entry-day auction liquidity; fail-open with NaN when unmeasured."""
@@ -116,7 +114,7 @@ def attach_entry_auction_liquidity(
                 frame["value_krw"] = pd.to_numeric(frame["value_krw"], errors="coerce")
                 frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce")
                 for symbol, group in frame.groupby("symbol", sort=False):
-                    entry = group[(group["ts_hms"] <= _AUCTION_CLOSE_HMS)]
+                    entry = group[(group["ts_hms"] <= DECISION_WINDOW_END_HMS)]
                     day_vol = float(np.nansum(entry["volume"].to_numpy(dtype=np.float64)))
                     if not np.isfinite(day_vol) or day_vol <= 0.0:
                         continue
@@ -150,7 +148,7 @@ def attach_entry_auction_liquidity(
                     except Exception as exc:  # pragma: no cover
                         logger.warning("[DATA] buyability normalize failed date=%s symbol=%s: %s", snap_str, symbol, exc)  # pragma: no cover
                         continue  # pragma: no cover
-                    entry = norm[norm["ts_hms"] <= _AUCTION_CLOSE_HMS]
+                    entry = norm[norm["ts_hms"] <= DECISION_WINDOW_END_HMS]
                     day_vol = float(entry["volume"].to_numpy(dtype=np.float64).sum())
                     if not np.isfinite(day_vol) or day_vol <= 0.0:
                         continue

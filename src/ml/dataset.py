@@ -22,11 +22,12 @@ from src.serving.realtime.features import (
     engineer_features,
 )
 from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO
+from src.strategy.contract import LABEL_BAD_THRESHOLD, LABEL_GOOD_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
 RETURN_UNIT = "decimal_net"
-LABEL_THRESHOLDS: dict[str, float] = {"target_good": 0.01, "target_bad": -0.02}
+LABEL_THRESHOLDS: dict[str, float] = {"target_good": LABEL_GOOD_THRESHOLD, "target_bad": LABEL_BAD_THRESHOLD}
 RETURN_CLIP_LOWER = -0.10
 RETURN_CLIP_UPPER = 0.10
 

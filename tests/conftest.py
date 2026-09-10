@@ -20,7 +20,6 @@ def mock_settings(tmp_path: Path) -> Settings:
         BASE_DIR=tmp_path,
         DATA_DIR=tmp_path / "data",
         CONFIGS_DIR=tmp_path / "configs",
-        MODELS_DIR=tmp_path / "artifacts" / "models",
     )
 
 

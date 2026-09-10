@@ -24,6 +24,12 @@ class AltDataSettings(BaseSettings):
     DART_API_KEY: str = Field(default="")
     # KRX Open API (data-dbg.krx.co.kr, AUTH_KEY 헤더). 파생·지수 일별매매정보 주 경로.
     KRX_OPENAPI_KEY: str = Field(default="")
+    # 단일 기본 URL (비어 있으면 목록 또는 페치 기본값으로 폴백)
+    KRX_OPENAPI_BASE_URL: str = Field(default="")
+    # 쉼표 구분 원시 문자열 (파싱은 소비자에서 수행)
+    KRX_OPENAPI_BASE_URLS: str = Field(default="")
+    # 쉼표 구분 원시 문자열 (파싱은 소비자에서 수행)
+    KRX_OPENAPI_ENDPOINTS: str = Field(default="")
 
     @property
     def dart_key(self) -> str:

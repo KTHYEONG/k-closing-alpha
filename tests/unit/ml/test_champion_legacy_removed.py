@@ -41,7 +41,6 @@ def test_inference_module_keeps_only_shared_bundle_constants() -> None:
         "_STRONG_PCT",
         "_GOOD_PCT",
         "_WEAK_PCT",
-        "_DEFAULT_REALIZED_VOL",
         "_GRADE_MULTIPLIERS",
     ):
         assert hasattr(inference, kept), kept

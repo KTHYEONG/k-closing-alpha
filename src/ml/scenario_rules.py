@@ -6,6 +6,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.strategy.contract import CEILING_CHG_THRESHOLD
+
 CANONICAL_SCENARIOS: tuple[str, ...] = (
     "상한가 다음날",
     "신고가",
@@ -27,7 +29,6 @@ _OVEREXT_DIST_MA20 = 0.35
 _OVEREXT_VOL_RATIO = 2.3
 _VOLUME_SURGE_RATIO = 1.6
 _BREAKOUT_MA_WINDOW = 120
-_CEILING_CHANGE_DECIMAL = 0.29
 
 SCENARIO_LADDER_THRESHOLDS: dict[str, float] = {
     "_NEW_HIGH_RATIO": _NEW_HIGH_RATIO,
@@ -39,7 +40,7 @@ SCENARIO_LADDER_THRESHOLDS: dict[str, float] = {
     "_OVEREXT_VOL_RATIO": _OVEREXT_VOL_RATIO,
     "_VOLUME_SURGE_RATIO": _VOLUME_SURGE_RATIO,
     "_BREAKOUT_MA_WINDOW": float(_BREAKOUT_MA_WINDOW),
-    "_CEILING_CHANGE_DECIMAL": _CEILING_CHANGE_DECIMAL,
+    "_CEILING_CHANGE_DECIMAL": CEILING_CHG_THRESHOLD,
 }
 
 __all__ = [
@@ -64,7 +65,7 @@ def _breakout_and_ceiling_frame(price_history_df: pd.DataFrame) -> pd.DataFrame:
     prev_ma120 = ma120.groupby(labels.to_numpy(), sort=False).shift(1)
     ma120_breakout = ((prev_close <= prev_ma120) & (close > ma120)).fillna(False)
     dcp = df["daily_change_pct"].astype(np.float64)
-    is_ceiling = ((dcp >= _CEILING_CHANGE_DECIMAL) & (close >= high)).fillna(False)
+    is_ceiling = ((dcp >= CEILING_CHG_THRESHOLD) & (close >= high)).fillna(False)
     prev_ceiling = is_ceiling.groupby(labels.to_numpy(), sort=False).shift(1).fillna(False)
     out = pd.DataFrame(
         {

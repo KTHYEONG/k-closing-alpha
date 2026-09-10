@@ -6,6 +6,8 @@ import os
 import numpy as np
 import pandas as pd
 
+from src.strategy.contract import DEFAULT_REALIZED_VOL
+
 HISTORY_FEATURE_COLUMNS: tuple[str, ...] = (
     "ret_5d",
     "ret_20d",
@@ -30,7 +32,6 @@ _REQUIRED_PRICE_HISTORY_COLUMNS: frozenset[str] = frozenset(
 )
 
 _REALIZED_VOL_FLOOR: float = 0.005
-_DEFAULT_REALIZED_VOL_FALLBACK: float = 0.02
 
 
 def _normalize_price_history_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -235,7 +236,7 @@ def attach_history_features(
     # realized_vol derived from realized_vol_20d
     rv = merged["realized_vol_20d"].to_numpy(dtype=np.float64)
     # finite and >0 -> floored, else fallback
-    realized = np.where(np.isfinite(rv) & (rv > 0), np.maximum(rv, _REALIZED_VOL_FLOOR), _DEFAULT_REALIZED_VOL_FALLBACK)
+    realized = np.where(np.isfinite(rv) & (rv > 0), np.maximum(rv, _REALIZED_VOL_FLOOR), DEFAULT_REALIZED_VOL)
     merged["realized_vol"] = realized.astype(np.float64)
 
     # Drop helper columns: join_date, join_symbol, symbol, date (right side)

@@ -9,9 +9,8 @@ from lightgbm import LGBMClassifier, LGBMRegressor
 from sklearn.linear_model import LogisticRegression
 
 from src.ml.purged_cv import PurgedGroupTimeSeriesSplit, chrono_fit_calibration_split
+from src.strategy.contract import LABEL_BAD_THRESHOLD, LABEL_GOOD_THRESHOLD
 
-_GOOD_THRESHOLD = 0.01
-_BAD_THRESHOLD = -0.02
 _MIN_CALIB_ROWS = 5
 
 
@@ -183,8 +182,8 @@ def purged_oof_predict(
         if predict_proba:
             # p_good / p_bad calibrated
             # Prepare labels for good/bad
-            y_good = (train[target_col] >= _GOOD_THRESHOLD).to_numpy().astype(bool)
-            y_bad = (train[target_col] <= _BAD_THRESHOLD).to_numpy().astype(bool)
+            y_good = (train[target_col] >= LABEL_GOOD_THRESHOLD).to_numpy().astype(bool)
+            y_bad = (train[target_col] <= LABEL_BAD_THRESHOLD).to_numpy().astype(bool)
             # Use chrono split for calibration within train
             # Fit calibrators on this fold's train groups only
             # Build features DataFrames for calibrator

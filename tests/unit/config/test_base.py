@@ -35,9 +35,19 @@ def test_path_settings_no_longer_defines_stock_db_or_condition_csv(tmp_path: Pat
     assert not hasattr(settings, "CONDITION_PARQUET_PATH")
 
 
-def test_path_settings_spec_alias_backward_compat(tmp_path: Path) -> None:
-    settings = PathSettings(BASE_DIR=tmp_path, _env_file=None)
-    assert settings.base_dir == settings.BASE_DIR
-    assert settings.data_dir == settings.DATA_DIR
-    assert settings.artifacts_dir == tmp_path / "artifacts"
-    assert settings.models_dir == settings.MODELS_DIR
+def test_ls_tick_max_pages_moved_to_ls_settings() -> None:
+    from src.config.base import PathSettings
+    from src.config.kiwoom import KiwoomSettings
+    from src.config.ls import LsSettings
+    from src.settings import Settings
+
+    # Then: the vendor budget left the path-settings class.
+    assert "LS_TICK_MAX_PAGES" not in PathSettings.model_fields
+    # And: it now sits beside its twin.
+    assert "LS_TICK_MAX_PAGES" in LsSettings.model_fields
+    assert "KIWOM_TICK_MAX_PAGES" in KiwoomSettings.model_fields
+
+    # And: the value and the consumer-facing access path are unchanged.
+    settings = Settings()
+    assert settings.LS_TICK_MAX_PAGES == 100
+    assert settings.KIWOM_TICK_MAX_PAGES == 30

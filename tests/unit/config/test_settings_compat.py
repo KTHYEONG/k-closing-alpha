@@ -18,11 +18,11 @@ def test_models_dir_under_artifacts() -> None:
     """모델 아티팩트는 artifacts/models/ 로 이관되어야 합니다."""
     settings = Settings()
     assert str(settings.MODELS_DIR).replace("\\", "/").endswith("artifacts/models")
-    assert settings.models_dir == settings.MODELS_DIR
 
 
 def test_derived_paths_based_on_base_dir(tmp_path: Path) -> None:
     settings = Settings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data")
+    assert tmp_path / "artifacts" / "models" == settings.MODELS_DIR
     assert settings.MODEL_PATH == settings.MODELS_DIR / "best_stock_rg_cat.joblib"
 
 
@@ -89,4 +89,63 @@ def test_gsheet_settings_removed_from_settings() -> None:
     ):
         assert not hasattr(settings, name), f"{name} should have been removed from settings module"
         assert not hasattr(settings.settings, name), f"{name} should have been removed from Settings instance"
+
+
+def test_models_dir_follows_base_dir_override(tmp_path: Path) -> None:
+    from src.settings import Settings
+
+    # Given: only BASE_DIR is overridden; MODELS_DIR is NOT passed.
+    settings = Settings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data", CONFIGS_DIR=tmp_path / "configs")
+
+    # Then: the artifact paths follow the override instead of pinning to the repo root.
+    assert tmp_path / "artifacts" / "models" == settings.MODELS_DIR
+    assert settings.MODEL_PATH == settings.MODELS_DIR / "best_stock_rg_cat.joblib"
+    assert settings.LABEL_ENCODER_PATH == settings.MODELS_DIR / "best_stock_rg_cat_encoders.json"
+
+    # And: every other derived path follows too, so the artifact tree is not split.
+    for name in (
+        "PARQUET_DIR", "DAILY_DIR", "HISTORY_DIR", "ORDERBOOK_DIR", "ALTDATA_DIR",
+        "PRICE_HISTORY_PARQUET_PATH", "HISTORY_PARQUET_PATH", "TOKEN_FILE",
+        "MODELS_DIR", "MODEL_PATH", "LABEL_ENCODER_PATH",
+    ):
+        assert str(getattr(settings, name)).startswith(str(tmp_path)), f"{name} ignored the BASE_DIR override"
+
+
+def test_default_settings_paths_are_unchanged() -> None:
+    from pathlib import Path
+
+    from src.settings import Settings
+
+    # Given: the default instance, as production constructs it.
+    settings = Settings()
+    root = Path(__file__).resolve().parents[3]
+
+    # Then: nothing about the default layout moved.
+    assert root == settings.BASE_DIR
+    assert root / "data" == settings.DATA_DIR
+    assert root / "artifacts" / "models" == settings.MODELS_DIR
+    assert root / "artifacts" / "models" / "best_stock_rg_cat.joblib" == settings.MODEL_PATH
+    assert root / "data" / "history" / "price_history.parquet" == settings.PRICE_HISTORY_PARQUET_PATH
+
+
+def test_lowercase_setting_aliases_are_removed() -> None:
+    from src import settings as settings_module
+    from src.settings import Settings
+
+    instance = Settings()
+    aliases = (
+        "base_dir", "data_dir", "artifacts_dir", "models_dir",
+        "kis_app_key", "kis_app_secret", "kis_account_id",
+    )
+
+    # Then: the shim is gone from both access paths.
+    for name in aliases:
+        assert not hasattr(instance, name), f"Settings.{name} alias should be removed"
+        assert not hasattr(settings_module, name), f"settings module {name} re-export should be removed"
+        assert name not in settings_module.__all__
+
+    # And: the real names still work.
+    for name in ("BASE_DIR", "DATA_DIR", "MODELS_DIR", "KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_ID"):
+        assert hasattr(instance, name)
+        assert hasattr(settings_module, name)
 
