@@ -79,6 +79,11 @@ class PathSettings(BaseSettings):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def PAPER_DIR(self) -> Path:
+        return self.DATA_DIR / "paper"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def LABEL_ENCODER_PATH(self) -> Path:
         return self.MODELS_DIR / "best_stock_rg_cat_encoders.json"
 

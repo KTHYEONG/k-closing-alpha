@@ -172,3 +172,38 @@ def test_spec_compliance_deleted_enum_member(tmp_path: Path, monkeypatch) -> Non
 
     code, diags = lean_check._check_spec_compliance(str(spec_file), pre_impl=False)
     assert code == 0, f"Expected 0 diagnostics, got: {diags}"
+
+
+def test_spec_compliance_deleted_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    existing_file = src_dir / "to_delete.py"
+    existing_file.write_text("def old(): pass\n", encoding="utf-8")
+
+    # When file still exists, deleted_file should fail
+    dummy_file = src_dir / "dummy.py"
+    dummy_file.write_text("# anchor\n", encoding="utf-8")
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(
+        """{
+            "changes": [
+                {"target_file": "src/to_delete.py", "kind": "deleted_file", "name": "to_delete"}
+            ],
+            "wiring": [
+                {
+                    "target_file": "src/dummy.py",
+                    "anchor": "anchor"
+                }
+            ]
+        }""",
+        encoding="utf-8",
+    )
+    code, diags = lean_check._check_spec_compliance(str(spec_file), pre_impl=False)
+    assert code == 1
+    assert any("still exists" in d["error"] for d in diags)
+
+    # When file is removed, deleted_file should pass
+    existing_file.unlink()
+    code, diags = lean_check._check_spec_compliance(str(spec_file), pre_impl=False)
+    assert code == 0, f"Expected 0 diagnostics, got: {diags}"

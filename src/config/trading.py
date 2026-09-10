@@ -56,6 +56,9 @@ class TradingSettings(BaseSettings):
         "상승형 음봉",
     ]
 
+    # 모의 운용 시드(원). 정수 주식수 산정의 분자.
+    PAPER_SEED_CAPITAL: int = 10_000_000
+
     # 한글 요일 매핑
     DAY_NAME_MAP: dict[int, str] = {
         0: "월요일",
