@@ -8,7 +8,7 @@ from src.backfill.altdata.config import AltDataFetchConfig
 
 def test_run_altdata_backfill_is_fail_soft_per_source(monkeypatch, tmp_path) -> None:
     good = pd.DataFrame({"date": pd.to_datetime(["2024-01-02"]), "symbol": ["005930"], "per": [10.0], "pbr": [1.0], "eps": [1.0], "bps": [1.0], "div_yield": [1.0], "dps": [1.0]})
-    monkeypatch.setattr(runner, "collect_fundamental", lambda *a, **k: good)
+    monkeypatch.setattr(runner, "collect_credit_balance", lambda *a, **k: good)
 
     def _boom(*a, **k):
         raise RuntimeError("krx blocked")
@@ -16,17 +16,17 @@ def test_run_altdata_backfill_is_fail_soft_per_source(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(runner, "collect_shorting", _boom)
     cfg = AltDataFetchConfig(
         start=pd.Timestamp("2024-01-02"), end=pd.Timestamp("2024-01-04"),
-        out_dir=tmp_path, sources=("shorting", "fundamental", "disclosure"),
+        out_dir=tmp_path, sources=("shorting", "credit_balance", "disclosure"),
         dart_api_key="", retries=1, retry_sleep_sec=0.0,
     )
     manifest = runner.run_altdata_backfill(cfg)
     assert manifest["panels"]["shorting"]["status"] == "unavailable"
-    assert manifest["panels"]["fundamental"]["status"] == "ok"
+    assert manifest["panels"]["credit_balance"]["status"] == "ok"
     assert manifest["panels"]["disclosure"]["status"] == "skipped_no_key"
-    assert (tmp_path / "fundamental.parquet").exists()
+    assert (tmp_path / "credit_balance.parquet").exists()
     assert not (tmp_path / "shorting.parquet").exists()
     saved = json.loads((tmp_path / "_manifest.json").read_text())
-    assert saved["panels"]["fundamental"]["availability_rule"] == "eod_release_next_decision"
+    assert saved["panels"]["credit_balance"]["availability_rule"] == "eod_release_next_decision"
 
 
 import src.backfill.backfill_altdata as cli
