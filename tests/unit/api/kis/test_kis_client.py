@@ -84,3 +84,81 @@ def test_scenario_ma_client_param() -> None:
 
     ensure_token.assert_not_called()
     get_ohlcv.assert_awaited()
+
+
+def test_kis_client_instances_share_process_global_rate_limiter() -> None:
+    from src.api.kis.client import KisApiClient
+
+    # Given: 동일 app_key 로 만든 두 클라이언트 (프로덕션 17개 생성 지점 재현)
+    a = KisApiClient(app_key="SAME", app_secret="s")
+    b = KisApiClient(app_key="SAME", app_secret="s")
+    other = KisApiClient(app_key="OTHER", app_secret="s")
+
+    # Then: 리미터는 프로세스 전역 공유 -> 합산 TPS 가 서버 한도를 넘지 않는다
+    assert a.rate_limiter is b.rate_limiter
+    assert a.rate_limiter is not other.rate_limiter
+    assert a.rate_limiter.max_rate == 18.0
+
+    # And: 사용되지 않던 세마포어 데드코드는 제거되었다
+    assert not hasattr(a, "semaphore")
+
+
+def test_handle_request_reacquires_rate_limit_slot_on_every_retry(monkeypatch) -> None:
+    import asyncio
+
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k", app_secret="s")
+    client.token = "T"
+
+    acquires = {"n": 0}
+
+    async def _counting_acquire() -> None:
+        acquires["n"] += 1
+
+    monkeypatch.setattr(client.rate_limiter, "acquire", _counting_acquire)
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    # Given: 429 -> "초당 거래건수" -> 정상 의 3회 응답 시퀀스
+    responses = [
+        {"status": 429, "body": {}},
+        {"status": 200, "body": {"rt_cd": "1", "msg1": "초당 거래건수를 초과하였습니다"}},
+        {"status": 200, "body": {"rt_cd": "0", "output": {"stck_prpr": "1000"}}},
+    ]
+
+    class _Resp:
+        def __init__(self, spec):
+            self.status = spec["status"]
+            self._body = spec["body"]
+
+        async def json(self):
+            return self._body
+
+    class _Ctx:
+        def __init__(self, spec):
+            self._spec = spec
+
+        async def __aenter__(self):
+            return _Resp(self._spec)
+
+        async def __aexit__(self, *_a):
+            return False
+
+    calls = {"n": 0}
+
+    def _session_get(_url, **_kw):
+        spec = responses[calls["n"]]
+        calls["n"] += 1
+        return _Ctx(spec)
+
+    # When
+    out = asyncio.run(client._handle_request(_session_get, "http://x", headers={"authorization": "Bearer T"}))
+
+    # Then: 3회 발사 = 3회 슬롯 획득 (재시도가 리미터를 우회하지 않는다)
+    assert out["rt_cd"] == "0"
+    assert calls["n"] == 3
+    assert acquires["n"] == 3

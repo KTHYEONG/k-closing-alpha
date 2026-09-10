@@ -156,3 +156,83 @@ def test_ls_client_returns_vendor_native_rows_without_kis_aliases() -> None:
         assert kis_alias not in row
     assert row["value"] == 498
 
+
+
+def test_ls_ensure_token_single_flight_issues_once_under_concurrency() -> None:
+    import asyncio
+
+    from src.api.ls.client import LsApiClient
+
+    client = LsApiClient(app_key="k", app_secret="s")
+    counter = {"token": 0, "tr": 0}
+
+    class _Resp:
+        def __init__(self, body):
+            self._b = body
+            self.status = 200
+            self.headers = {}
+
+        async def json(self):
+            return self._b
+
+    class _Ctx:
+        def __init__(self, body, key):
+            self._b = body
+            self._k = key
+
+        async def __aenter__(self):
+            counter[self._k] += 1
+            await asyncio.sleep(0.01)
+            return _Resp(self._b)
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session:
+        def post(self, url, **_kw):
+            if "oauth2/token" in url:
+                return _Ctx({"access_token": "T"}, "token")
+            return _Ctx({"rsp_cd": "00000", "t8412OutBlock1": []}, "tr")
+
+    async def _run():
+        session = _Session()
+        await asyncio.gather(*[client.get_minute_chart(session, "005930", "2026-09-10") for _ in range(10)])
+
+    # When: 세마포어(10) 동시 태스크가 첫 호출을 동시에 시작
+    asyncio.run(_run())
+
+    # Then: OAuth 발급은 1회 (기존 회귀: 10회)
+    assert counter["token"] == 1
+    assert counter["tr"] == 10
+    assert client.token == "T"
+
+
+
+def test_ls_ensure_token_raises_when_issuance_returns_no_token() -> None:
+    import asyncio
+
+    import pytest
+
+    from src.api.ls.client import LsApiClient
+
+    client = LsApiClient(app_key='k', app_secret='s')
+
+    class _Resp:
+        status = 200
+
+        async def json(self):
+            return {}
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session:
+        def post(self, _url, **_kw):
+            return _Ctx()
+
+    with pytest.raises(RuntimeError, match='LS token issuance failed'):
+        asyncio.run(client.ensure_token(_Session()))

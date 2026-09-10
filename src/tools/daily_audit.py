@@ -49,15 +49,22 @@ def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
 
 
 def audit_or_skip(snapshot_date: str) -> dict[str, bool] | None:
-    """비거래일에는 감사를 건너뛰고, 거래일에는 기존 감사를 그대로 수행한다.
+    """주말에만 감사를 건너뛰고, 평일에는 달력 미게시와 무관하게 감사를 수행한다.
 
-    휴장일에는 산출물이 없어 MISSING 오탐만 찍히므로 감사 자체를 수행하지
-    않는다. 거래일 판정 장애(네트워크/인증)는 휴장일로 오판하지 않고 그대로
-    전파한다.
+    KRX 지수 일별매매정보는 1일 이상 지연 게시되므로 평일 게이트로 쓰면
+    P0 장애가 며칠씩 미탐지된다. 장애 조기 발견을 위해 평일에는 항상 감사한다.
     """
-    if not is_krx_trading_day(snapshot_date):
+    if pd.Timestamp(snapshot_date).weekday() >= 5:
         logger.info("[DATA] stage=daily_audit status=SKIP reason=non_trading_day date=%s", snapshot_date)
         return None
+    # 달력 확인은 로그용 부가정보일 뿐이다. KRX 조회 장애가 감사 자체를 막으면
+    # 장애 조기 발견이라는 이 함수의 목적이 무너지므로 UNKNOWN으로 낮춘다.
+    try:
+        calendar_confirmed: bool | None = is_krx_trading_day(snapshot_date)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("[DATA] stage=daily_audit calendar_lookup=FAIL reason=%s", type(exc).__name__)
+        calendar_confirmed = None
+    logger.info("[DATA] stage=daily_audit calendar_confirmed=%s", calendar_confirmed)
     return audit_daily_completeness(snapshot_date)
 
 

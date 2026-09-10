@@ -124,6 +124,11 @@ def test_run_intraday_archive_wires_kiwoom_client_when_key_present(monkeypatch) 
     monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
     monkeypatch.setattr(archive_intraday.settings, "KIWOM_APP_KEY", "dummy_key", raising=False)
 
+    async def _is_trading(_c, _s, _d):
+        return True
+
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
+
     class _FakeSession:
         async def __aenter__(self):
             return self
@@ -182,6 +187,11 @@ def test_run_intraday_archive_no_kiwoom_client_when_key_absent(monkeypatch) -> N
 
     monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
     monkeypatch.setattr(archive_intraday.settings, "KIWOM_APP_KEY", "", raising=False)
+
+    async def _is_trading(_c, _s, _d):
+        return True
+
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
 
     class _FakeSession:
         async def __aenter__(self):
@@ -341,6 +351,11 @@ def test_run_intraday_archive_instantiates_kiwoom_with_kiwoom_app_key_alias(monk
     monkeypatch.setattr(archive_intraday.settings, "KIWOM_APP_KEY", "", raising=False)
     monkeypatch.setattr(archive_intraday.settings, "KIWOOM_APP_KEY", "test_kiwoom_key", raising=False)
 
+    async def _is_trading(_c, _s, _d):
+        return True
+
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
+
     fake_client = MagicMock()
     fake_session = AsyncMock()
     fake_client.create_session.return_value.__aenter__.return_value = fake_session
@@ -383,6 +398,11 @@ def test_run_intraday_archive_writes_krx_aftermarket_to_its_own_session(monkeypa
     from src.daily import archive_intraday
 
     monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
+
+    async def _is_trading(_c, _s, _d):
+        return True
+
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
 
     class _Session:
         async def __aenter__(self):
@@ -463,3 +483,45 @@ def test_intraday_watchlist_drops_unreachable_scenario_filter(monkeypatch) -> No
     )
     codes = archive_intraday._today_watchlist_codes("2026-09-09")
     assert codes == ["005930", "035720"]
+
+
+def test_run_intraday_archive_skips_non_trading_day_without_collecting(monkeypatch) -> None:
+    from src.daily import archive_intraday
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _FakeClient:
+        def __init__(self, *_a, **_kw):
+            self.token = None
+
+        def create_session(self, **_kw):
+            return _FakeSession()
+
+        async def ensure_token(self, _session, force_refresh=False):
+            self.token = "T"
+            return "T"
+
+    async def _never(*_a, **_kw):
+        raise AssertionError("non-trading day must not trigger collection")
+
+    async def _not_trading(_client, _session, _date):
+        return False
+
+    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
+    monkeypatch.setattr(archive_intraday, "KisApiClient", _FakeClient)
+    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda *_a, **_kw: None)
+    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", lambda *_a, **_kw: None)
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _not_trading)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _never)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _never)
+
+    # When
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-05")
+
+    # Then
+    assert result == (0, 0, 0)

@@ -95,3 +95,37 @@ def test_audit_or_skip_skips_non_trading_day(monkeypatch) -> None:
     assert result is not None
     assert set(result) == {"archive", "minute_bars", "decision", "close_confirmed"}
     assert calls["n"] == 1
+
+
+def test_daily_audit_audits_weekday_even_when_krx_calendar_is_unpublished(monkeypatch) -> None:
+    from src.tools import daily_audit
+
+    expected = {"archive": True, "minute_bars": True, "decision": False, "close_confirmed": False}
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda _d: dict(expected))
+    # Given: KRX 지수 일별매매정보가 아직 미게시(1일 이상 지연) -> False 반환
+    monkeypatch.setattr(daily_audit, "is_krx_trading_day", lambda _d: False)
+
+    # When: 평일(2026-09-10, 목)
+    result = daily_audit.audit_or_skip("2026-09-10")
+
+    # Then: 침묵 스킵하지 않고 감사를 수행한다 (P0 미탐지 회귀 방지)
+    assert result == expected
+
+    # And: 주말(2026-09-12, 토)만 스킵
+    assert daily_audit.audit_or_skip("2026-09-12") is None
+
+
+def test_daily_audit_still_audits_when_calendar_lookup_fails(monkeypatch) -> None:
+    from src.tools import daily_audit
+
+    expected = {"archive": True, "minute_bars": False, "decision": False, "close_confirmed": False}
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda _d: dict(expected))
+
+    def _boom(_date):
+        raise RuntimeError("krx network down")
+
+    # Given: KRX 달력 조회가 네트워크 장애로 실패
+    monkeypatch.setattr(daily_audit, "is_krx_trading_day", _boom)
+
+    # When / Then: 부가 정보 실패가 감사 자체를 막지 않는다 (장애 조기 발견 목적 유지)
+    assert daily_audit.audit_or_skip("2026-09-10") == expected

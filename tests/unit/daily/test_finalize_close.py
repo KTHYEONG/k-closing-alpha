@@ -448,3 +448,53 @@ def test_run_close_finalization_rejects_invariant_violating_quote_without_touchi
 
     assert n == 0
     assert upserts == []
+
+
+def test_finalize_close_main_runs_inside_a_single_event_loop(monkeypatch) -> None:
+    import asyncio
+    import sys
+
+    from src.daily import finalize_close
+
+    seen = {"loop_at_create": None, "runs": 0, "closed": False, "finalized": None}
+
+    class _FakeSession:
+        async def close(self):
+            seen["closed"] = True
+
+    class _FakeClient:
+        def __init__(self, *_a, **_kw):
+            self.token = None
+
+        def create_session(self, **_kw):
+            # 회귀 지점: 러닝 루프 밖에서 호출되면 aiohttp 가 RuntimeError 를 던진다
+            seen["loop_at_create"] = asyncio.get_running_loop()
+            return _FakeSession()
+
+        async def ensure_token(self, _session, force_refresh=False):
+            self.token = "T"
+            return "T"
+
+    async def _fake_finalization(*_a, **kwargs):
+        seen["finalized"] = kwargs.get("snapshot_date")
+        return 7
+
+    real_run = asyncio.run
+
+    def _counting_run(coro, **kw):
+        seen["runs"] += 1
+        return real_run(coro, **kw)
+
+    monkeypatch.setattr(finalize_close, "KisApiClient", _FakeClient)
+    monkeypatch.setattr(finalize_close, "run_close_finalization", _fake_finalization)
+    monkeypatch.setattr(finalize_close.asyncio, "run", _counting_run)
+    monkeypatch.setattr(sys, "argv", ["finalize_close", "--date", "2026-09-10"])
+
+    # When
+    finalize_close.main()
+
+    # Then: 단일 이벤트 루프 안에서 세션 생성/사용/종료가 모두 일어난다
+    assert seen["runs"] == 1
+    assert seen["loop_at_create"] is not None
+    assert seen["closed"] is True
+    assert seen["finalized"] == "2026-09-10"

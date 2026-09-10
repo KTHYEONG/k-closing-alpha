@@ -41,6 +41,7 @@ def test_run_intraday_archive_writes_both_partitions(tmp_path: Path, monkeypatch
     ticks_df = _ticks("005930", "2026-09-03")
 
     with (
+        patch.object(archive_intraday, "is_kis_trading_day", AsyncMock(return_value=True)),
         patch.object(archive_intraday, "collect_intraday_bars", AsyncMock(return_value=bars_df)),
         patch.object(archive_intraday, "collect_nxt_aftermarket_bars", AsyncMock(return_value=nxt_df)),
         patch.object(archive_intraday, "collect_intraday_trade_ticks", AsyncMock(return_value=ticks_df)),
@@ -78,6 +79,7 @@ def test_run_intraday_archive_stages_bars_before_ticks(tmp_path) -> None:
     with (
         patch.object(archive_intraday.settings, "HISTORY_DIR", tmp_path),
         patch.object(archive_intraday, "_archive_target_codes", lambda d: ["005930"]),
+        patch.object(archive_intraday, "is_kis_trading_day", AsyncMock(return_value=True)),
         patch.object(archive_intraday, "collect_intraday_bars", fake_bars),
         patch.object(archive_intraday, "collect_nxt_aftermarket_bars", fake_nxt),
         patch.object(archive_intraday, "collect_intraday_trade_ticks", fake_ticks),

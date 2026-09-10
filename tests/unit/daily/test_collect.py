@@ -177,9 +177,10 @@ def test_fetch_single_stock_returns_minimal_row_schema() -> None:
     assert set(row) == {
         "종목명", "종목코드", "시장구분", "시가", "고가", "저가", "종가", "전일종가",
         "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수", "등락률", "수급_실패",
-        "결정_종가", "종가_확정",
+        "현재가_실패", "결정_종가", "종가_확정",
     }
     assert row["수급_실패"] is False
+    assert row["현재가_실패"] is False
     assert failed == []
     # Then: a single KRX-venue partition row is still produced for the cost research store
     assert len(orderbook_rows) == 1
@@ -497,3 +498,158 @@ def test_fetch_single_stock_records_decision_close_and_unconfirmed_flag() -> Non
     assert row[CLOSE_CONFIRMED_COL] is False
 
 
+
+
+def test_fetch_single_stock_takes_prev_close_from_vendor_field() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    base_detail = {
+        "stck_prpr": "1100",
+        "stck_oprc": "1010",
+        "stck_hgpr": "1120",
+        "stck_lwpr": "1000",
+        "acml_vol": "5000",
+        "prdy_ctrt": "10.00",
+        "lstn_stcn": "1000000",
+        "hts_avls": "1000",
+        "acml_tr_pbmn": "5500000",
+        "rprs_mrkt_kor_name": "KOSDAQ",
+    }
+
+    def _client(detail):
+        c = AsyncMock()
+        c.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": detail})
+        c.get_investor_trend_estimate = AsyncMock(
+            return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]}
+        )
+        c.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": {}})
+        return c
+
+    stock = {"code": "005930", "name": "테스트", "price": "1100", "chgrate": "10.00"}
+    sem = asyncio.Semaphore(1)
+
+    # Given: 벤더가 전일종가(stck_sdpr)를 제공
+    row, failed, _ob = asyncio.run(
+        collect.fetch_single_stock(0, stock, 1, sem, _client({**base_detail, "stck_sdpr": "1000"}), object())
+    )
+
+    # Then: 역산(int(1100/1.10)=999)이 아니라 원본 1000을 그대로 쓴다
+    assert row["전일종가"] == 1000
+    assert failed == []
+
+    # And: 필드가 없을 때만 등락률 역산으로 폴백
+    row2, _f2, _o2 = asyncio.run(
+        collect.fetch_single_stock(0, stock, 1, sem, _client(dict(base_detail)), object())
+    )
+    assert row2["전일종가"] == int(1100 / 1.10)
+
+
+def test_fetch_single_stock_flags_quote_failure_without_zero_fill() -> None:
+    import asyncio
+    import math
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+    from src.processing.schema import ARCHIVE_COLUMN_ORDER, QUOTE_FAILED_COL
+
+    client = AsyncMock()
+    # Given: 현재가 TR 이 실패
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "9", "msg1": "네트워크 연결 실패"})
+    client.get_investor_trend_estimate = AsyncMock(
+        return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]}
+    )
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": {}})
+
+    stock = {"code": "005930", "name": "테스트", "price": "1100", "chgrate": "10.00"}
+
+    # When
+    row, failed, _ob = asyncio.run(
+        collect.fetch_single_stock(0, stock, 1, asyncio.Semaphore(1), client, object())
+    )
+
+    # Then: 실패가 행에 표식되고 0으로 위조되지 않는다
+    assert row[QUOTE_FAILED_COL] is True
+    assert "현재가" in failed
+    for col in ("시가", "고가", "저가", "거래량", "거래대금", "시가총액"):
+        assert math.isnan(float(row[col])), f"{col} must be NaN, not a synthetic zero"
+
+    # And: 플래그가 아카이브 스키마에 포함되어 왕복에서 살아남는다
+    assert QUOTE_FAILED_COL in ARCHIVE_COLUMN_ORDER
+
+    # And: 정상 응답에서는 플래그가 False
+    client.get_current_price = AsyncMock(
+        return_value={
+            "rt_cd": "0",
+            "output": {
+                "stck_prpr": "1100", "stck_sdpr": "1000", "stck_oprc": "1010",
+                "stck_hgpr": "1120", "stck_lwpr": "1000", "acml_vol": "5000",
+                "prdy_ctrt": "10.00", "lstn_stcn": "1000000", "hts_avls": "1000",
+                "acml_tr_pbmn": "5500000", "rprs_mrkt_kor_name": "KOSDAQ",
+            },
+        }
+    )
+    ok_row, ok_failed, _o = asyncio.run(
+        collect.fetch_single_stock(0, stock, 1, asyncio.Semaphore(1), client, object())
+    )
+    assert ok_row[QUOTE_FAILED_COL] is False
+    assert ok_failed == []
+
+
+def test_validate_trading_day_blocks_non_trading_day_and_honours_force(monkeypatch) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.daily import collect
+
+    calls = {"n": 0}
+
+    def _oracle(result):
+        async def _fn(_client, _session, _date):
+            calls["n"] += 1
+            return result
+
+        return _fn
+
+    # Given: 비거래일
+    monkeypatch.setattr(collect, "is_kis_trading_day", _oracle(False))
+    with pytest.raises(collect.NonTradingDayError):
+        asyncio.run(collect._validate_trading_day(object(), object(), "2026-09-05"))
+    assert calls["n"] == 1
+
+    # And: force 는 오라클 호출 없이 통과 (운영 수동 우회 경로)
+    asyncio.run(collect._validate_trading_day(object(), object(), "2026-09-05", force=True))
+    assert calls["n"] == 1
+
+    # And: 거래일은 통과
+    monkeypatch.setattr(collect, "is_kis_trading_day", _oracle(True))
+    asyncio.run(collect._validate_trading_day(object(), object(), "2026-09-10"))
+    assert calls["n"] == 2
+
+
+
+def test_fetch_single_stock_prev_close_equals_close_when_rate_is_zero() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(
+        return_value={'rt_cd': '0', 'output': {'stck_prpr': '1100', 'stck_oprc': '1090', 'stck_hgpr': '1110', 'stck_lwpr': '1080', 'acml_vol': '100', 'prdy_ctrt': '0.00', 'lstn_stcn': '1000', 'hts_avls': '500', 'acml_tr_pbmn': '110000', 'rprs_mrkt_kor_name': 'KOSPI'}}
+    )
+    client.get_investor_trend_estimate = AsyncMock(
+        return_value={'rt_cd': '0', 'output2': [{'frgn_fake_ntby_qty': '1', 'orgn_fake_ntby_qty': '2'}]}
+    )
+    client.get_orderbook_snapshot = AsyncMock(return_value={'rt_cd': '0', 'output1': {}})
+
+    stock = {'code': '005930', 'name': '테스트', 'price': '1100', 'chgrate': '0.00'}
+    row, failed, _ob = asyncio.run(
+        collect.fetch_single_stock(0, stock, 1, asyncio.Semaphore(1), client, object())
+    )
+
+    assert row['전일종가'] == 1100
+    assert failed == []

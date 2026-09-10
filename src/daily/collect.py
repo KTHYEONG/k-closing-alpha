@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sys
 from datetime import datetime
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -16,11 +17,34 @@ from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook
 from src.utils.display import Colors
 from src.daily import archive
 from src.daily.universe_scan import fetch_candidate_stock_list
+from src.data.trading_calendar import is_kis_trading_day
 from src.execution.cost_model import tick_cost_bp
-from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, QUOTE_FAILED_COL
 from src.strategy.contract import COST_AWARE_UNIVERSE, UniverseSpec, derive_chg_ratio, mark_ceiling, select_universe
 
 logger = logging.getLogger(__name__)
+
+
+class NonTradingDayError(RuntimeError):
+    """휴장일에 결정 파이프라인이 발화할 때의 fail-closed 오류."""
+
+
+def build_kiwoom_scan_client() -> Any | None:
+    """Kiwoom 스캔 클라이언트를 구성한다. 자격증명이 없으면 None을 반환한다."""
+    from src.api.kiwoom.client import KiwoomApiClient
+
+    client = KiwoomApiClient()
+    if not client.app_key:
+        return None
+    return client
+
+
+async def _validate_trading_day(client, session, snapshot_date: str, *, force: bool = False) -> None:
+    """휴장일 실행을 차단한다. --force가 유일한 우회 경로다."""
+    if force:
+        return
+    if not await is_kis_trading_day(client, session, snapshot_date):
+        raise NonTradingDayError(f"non-trading day: {snapshot_date}")
 
 # =========================================================
 # [설정] API 접속 정보
@@ -152,17 +176,18 @@ def flag_cost_aware_admission(
     return flagged
 
 
-async def resolve_daily_candidates(client, session) -> list[dict]:
+async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None = None) -> list[dict]:
     """자동 비용축 스캔 결과를 그대로 반환합니다.
 
     Args:
         client: KIS API client.
         session: HTTP session.
+        kiwoom_client: Kiwoom scan client (유일한 후보 소스).
 
     Returns:
         자동 스캔 후보 리스트. 스캔이 비면 빈 리스트를 반환한다.
     """
-    return await fetch_candidate_stock_list(client, session) or []
+    return await fetch_candidate_stock_list(client, session, kiwoom_client=kiwoom_client) or []
 
 
 # ---------------------------------------------------------
@@ -212,7 +237,8 @@ async def fetch_single_stock(
 
         # 실패한 API 체크 (유지 3종만 판정)
         failed_apis = []
-        if res_detail.get("rt_cd") != "0":
+        quote_failed = res_detail.get("rt_cd") != "0"
+        if quote_failed:
             failed_apis.append("현재가")
         if res_investor.get("rt_cd") != "0":
             failed_apis.append("투자자추정")
@@ -238,7 +264,13 @@ async def fetch_single_stock(
             low_price = int(safe_float(detail.get("stck_lwpr"), 0))
             vol_acml = int(safe_float(detail.get("acml_vol"), 0))
             rate = safe_float(detail.get("prdy_ctrt"), rate)
-            prev_close_price = int(close_price / (1 + rate / 100)) if rate != 0 else close_price
+            sdpr = safe_float(detail.get("stck_sdpr"), 0)
+            if sdpr > 0:
+                prev_close_price = int(sdpr)
+            elif rate != 0:
+                prev_close_price = int(close_price / (1 + rate / 100))
+            else:
+                prev_close_price = close_price
             price = close_price
             shares = safe_float(detail.get("lstn_stcn"), 0)
             raw_market = str(detail.get("rprs_mrkt_kor_name", "")).upper()
@@ -246,6 +278,17 @@ async def fetch_single_stock(
             raw_mkt_cap = safe_float(detail.get("hts_avls")) * 100_000_000 or shares * price
             mkt_cap_eok = round(raw_mkt_cap / 100_000_000, 2)
             trade_amt_eok = round(safe_float(detail.get("acml_tr_pbmn")) / 100_000_000, 2)
+
+        if quote_failed:
+            # 현재가 실패: 스캔 행 값(종가/전일종가)만 유지하고 OHLCV는 NaN (0 위조 금지)
+            close_price = price
+            prev_close_price = int(price / (1 + rate / 100)) if rate != 0 else price
+            open_price = float("nan")
+            high_price = float("nan")
+            low_price = float("nan")
+            vol_acml = float("nan")
+            mkt_cap_eok = float("nan")
+            trade_amt_eok = float("nan")
 
         capture_ts = datetime.now(ZoneInfo("Asia/Seoul"))
         orderbook_rows: list[dict] = []
@@ -274,6 +317,7 @@ async def fetch_single_stock(
             "외국인_순매수": frgn_net_eok,
             "등락률": rate,
             "수급_실패": supply_failed,
+            QUOTE_FAILED_COL: quote_failed,
             DECISION_CLOSE_COL: close_price,
             CLOSE_CONFIRMED_COL: False,
         }, failed_apis, orderbook_rows
@@ -379,6 +423,10 @@ async def main(force: bool = False):
         )
         await client.ensure_token(session)
 
+        snapshot_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+        kiwoom_client = build_kiwoom_scan_client()
+        await _validate_trading_day(client, session, snapshot_date, force=force)
+
         # 2. 시장 지수 조회 (병렬 gather)
         res_kospi, res_kosdaq = await asyncio.gather(
             client.get_market_index_rate(session, "0001"),
@@ -389,7 +437,7 @@ async def main(force: bool = False):
         kosdaq_rate = parse_market_index_rate(res_kosdaq)
 
         # 3. 후보 종목 리스트 확보 (자동 비용축 스캔 단일 경로)
-        stock_list = await resolve_daily_candidates(client, session)
+        stock_list = await resolve_daily_candidates(client, session, kiwoom_client=kiwoom_client)
         if not stock_list:
             logger.info(f"{Colors.YELLOW}⚠ 자동 스캔 후보가 없습니다.{Colors.RESET}")
             return
@@ -406,7 +454,6 @@ async def main(force: bool = False):
         # 5. wide 단면 구성 후 PIT admitted 플래그 부여 및 저장소 직접 기록
         logger.info(f"\n{Colors.BOLD}📊 [3/3] 유니버스 적격성(Admission) 평가 및 저장{Colors.RESET}")
         capture_ts = pd.Timestamp.now(tz="Asia/Seoul")
-        snapshot_date = capture_ts.strftime("%Y-%m-%d")
         df = pd.DataFrame(results)
         df["snapshot_timestamp"] = capture_ts
         df = flag_cost_aware_admission(df, decision_date=pd.Timestamp(snapshot_date))
