@@ -73,7 +73,6 @@ def test_dead_symbols_are_absent_but_live_siblings_remain() -> None:
         "src.ml.oof": ["sample_weight_for_fold"],
         "src.ml.costaware_topk": ["split_regime_masks"],
         "src.utils.display": ["get_decision_color"],
-        "src.utils.export_archive": ["export_all_months"],
         "src.backfill.backfill_regime": ["run_backfill_market_regime_factors"],
         "src.ml.robust_eval": ["BootstrapDelta"],
     }
@@ -157,13 +156,11 @@ def test_live_entrypoints_still_import_after_dependency_removal() -> None:
     # Given: the operational entrypoints documented in README.md / docs/guide.md.
     entrypoints = [
         "src.daily.collect",
-        "src.daily.collect_auction",
         "src.daily.predict",
         "src.daily.archive_intraday",
         "src.ml.retrain",
         "src.ml.costaware_topk",
         "src.ml.topk_ranker_research",
-        "src.utils.export_archive",
         "src.backfill.backfill_price",
         "src.backfill.backfill_altdata",
         "src.backfill.backfill_regime",
@@ -238,3 +235,30 @@ def test_synthetic_output_digests_unchanged_after_subtraction() -> None:
     assert digest(np.array(sorted(gcat), dtype=object)) == "5ccc339c7392dbfc"
     assert digest(gproc.sort_index()["target_return"].to_numpy(np.float64)) == "c69fe116ca8049d7"  # 2026-09-10: 브로커 수수료(왕복 0.73bp) 반영으로 갱신
     assert digest(gx.sort_index().select_dtypes("number").to_numpy(np.float64)) == "a22af55104759529"
+
+
+def test_removed_modules_are_gone_and_orderbook_store_survives() -> None:
+    import importlib
+    from pathlib import Path
+
+    import pytest
+
+    # Then: 소비자 0으로 실증된 두 모듈은 삭제된다
+    for rel, mod in {
+        "src/utils/export_archive.py": "src.utils.export_archive",
+        "src/daily/collect_auction.py": "src.daily.collect_auction",
+    }.items():
+        assert not Path(rel).exists(), f"{rel} should be deleted"
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(mod)
+
+    # And: 테스트 전용이던 스프레드시트 렌더러도 함께 사라진다
+    archive = importlib.import_module("src.daily.archive")
+    assert not hasattr(archive, "export_archive_for_spreadsheet")
+
+    # And: collect.py가 결정시점 캡처에 쓰는 호가 저장소는 반드시 존치한다
+    assert Path("src/data/orderbook_store.py").exists()
+    store = importlib.import_module("src.data.orderbook_store")
+    assert callable(store.append_orderbook_snapshots)
+    collect = importlib.import_module("src.daily.collect")
+    assert callable(collect.persist_daily_snapshot)

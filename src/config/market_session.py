@@ -30,3 +30,9 @@ NXT_AFTERMARKET_HOUR_FLOOR: str = "154000"
 NXT_AFTERMARKET_HOUR_CEIL: str = "200000"
 NXT_PREMARKET_HOUR_FLOOR: str = "080000"
 NXT_PREMARKET_HOUR_CEIL: str = "085000"
+# 모의 진입 시각(연속거래 구간, 결정창 시작 이전)
+PAPER_ENTRY_HHMMSS: str = "151900"
+# D+1 익절 미도달 시 MOC 대체 청산 시각
+PAPER_EXIT_MOC_HHMMSS: str = "151900"
+# D+1 청산 세션 시작 시각(kca-paper-exit 타이머 발화 시각)
+PAPER_EXIT_SESSION_START_HHMMSS: str = "090000"
