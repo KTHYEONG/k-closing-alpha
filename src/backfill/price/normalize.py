@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from src.backfill.price.config import KRW_100M
+from src.strategy.contract import derive_chg_ratio
 
 
 def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -152,7 +153,6 @@ def _normalize_symbol_history(
     close_col = _find_col(out, ["종가", "Close", "close"]) or (cols[3] if len(cols) > 3 else None)
     vol_col = _find_col(out, ["거래량", "Volume", "volume"]) or (cols[4] if len(cols) > 4 else None)
     value_col = _find_col(out, ["거래대금", "거래금액", "Value", "TradingValue", "acml_tr_pbmn", "trade_value_krw"])
-    change_col = _find_col(out, ["등락률", "Change", "change", "prdy_ctrt", "daily_change_pct"])
     
     norm = pd.DataFrame(
         {
@@ -164,7 +164,6 @@ def _normalize_symbol_history(
             "close": pd.to_numeric(out[close_col], errors="coerce"),
             "volume": pd.to_numeric(out[vol_col], errors="coerce") if vol_col else np.nan,
             "trade_value_krw": pd.to_numeric(out[value_col], errors="coerce") if value_col else np.nan,
-            "daily_change_pct_raw": pd.to_numeric(out[change_col], errors="coerce") if change_col else np.nan,
             "market": market_hint,
         }
     )
@@ -204,15 +203,11 @@ def _normalize_symbol_history(
     else:
         norm["market_cap_krw"] = np.nan
 
-    raw = pd.to_numeric(norm["daily_change_pct_raw"], errors="coerce")
-    if raw.notna().any() and float(raw.abs().median(skipna=True)) > 1.0:
-        norm["daily_change_pct"] = raw / 100.0
-    else:
-        norm["daily_change_pct"] = raw
-
     norm["trade_value_100m"] = pd.to_numeric(norm["trade_value_krw"], errors="coerce") / KRW_100M
     norm["market_cap_100m"] = pd.to_numeric(norm["market_cap_krw"], errors="coerce") / KRW_100M
+    # 전일 종가를 먼저 확정하고 단일 원천으로 비율을 도출한다.
     norm["prev_close"] = norm.groupby("symbol", sort=False)["close"].shift(1)
+    norm["daily_change_pct"] = derive_chg_ratio(norm["close"].to_numpy(dtype=np.float64), norm["prev_close"].to_numpy(dtype=np.float64))
 
     keep_cols = [
         "date",

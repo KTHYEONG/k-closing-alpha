@@ -55,7 +55,7 @@ def test_run_fix_price_history_file_dry_run_and_backup(tmp_path: Path) -> None:
             "prev_close": [-1000.0, -3000.0],
             "market_cap_100m": [1.0, 1.0],
             "trade_value_100m": [1.0, 1.0],
-            "daily_change_pct": [0.01, -0.04],
+            "daily_change_pct": [float("nan"), 68000.0 / 71000.0 - 1.0],
             "market": ["KOSPI", "KOSPI"],
             "volume": [100, 200],
             "foreign_netbuy": [1.0, 1.0],
