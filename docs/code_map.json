@@ -18,6 +18,9 @@
       "tests/unit/api/test_kis_client_facade_removed.py"
     ]
   },
+  "src/api/kis/ws_client.py": {
+    "testing": "tests/unit/api/kis/test_ws_client.py"
+  },
   "src/api/kiwoom/client.py": {
     "testing": "tests/unit/api/kiwoom/test_kiwoom_client.py"
   },
@@ -150,11 +153,11 @@
   "src/daily/collect.py": {
     "testing": "tests/unit/daily/test_collect.py"
   },
-  "src/daily/collect_auction.py": {
-    "testing": "tests/unit/daily/test_collect_auction.py"
-  },
   "src/daily/finalize_close.py": {
     "testing": "tests/unit/daily/test_finalize_close.py"
+  },
+  "src/daily/paper_trade.py": {
+    "testing": "tests/unit/daily/test_paper_trade.py"
   },
   "src/daily/predict.py": {
     "testing": "tests/unit/daily/test_predict.py"
@@ -191,6 +194,9 @@
   },
   "src/execution/cost_model.py": {
     "testing": "tests/unit/execution/test_cost_model.py"
+  },
+  "src/execution/paper_broker.py": {
+    "testing": "tests/unit/execution/test_paper_broker.py"
   },
   "src/ml/bundle.py": {
     "testing": "tests/unit/ml/test_bundle.py"
@@ -302,6 +308,9 @@
   "src/sync/fetcher_program.py": {
     "testing": "tests/unit/sync/test_fetcher_program.py"
   },
+  "src/tools/daily_audit.py": {
+    "testing": "tests/unit/tools/test_daily_audit.py"
+  },
   "src/tools/fix_price_history_integrity.py": {
     "testing": "tests/unit/tools/test_fix_price_history_integrity.py"
   },
@@ -322,8 +331,5 @@
   },
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
-  },
-  "src/utils/export_archive.py": {
-    "testing": "tests/unit/utils/test_export_archive.py"
   }
 }
