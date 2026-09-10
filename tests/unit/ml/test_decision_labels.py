@@ -95,6 +95,7 @@ def test_build_decision_labels_mechanical_prices_next_open_over_entry_close() ->
         "high": [1010.0, 1050.0, 1060.0],
         "low": [980.0, 1020.0, 1030.0],
         "close": [1000.0, 1040.0, 1050.0],
+        "prev_close": [1000.0 / 1.01, 1000.0, 1040.0],
         "daily_change_pct": [0.010, 0.040, 0.0096],
     })
     df = pd.DataFrame({
@@ -136,6 +137,7 @@ def test_build_decision_labels_mechanical_drops_rows_without_next_day_price() ->
         "high": [1010.0, 1050.0, 520.0],
         "low": [980.0, 1020.0, 495.0],
         "close": [1000.0, 1040.0, 510.0],
+        "prev_close": [1000.0 / 1.01, 1000.0, 500.0],
         "daily_change_pct": [0.010, 0.040, 0.020],
     })
     # 000002 has no next trading day in price_history -> no mechanical label
@@ -188,6 +190,7 @@ def test_attach_mechanical_return_passes_through_nd_date() -> None:
         "symbol": ["000001", "000001"],
         "open": [990.0, 1030.0], "high": [1010.0, 1050.0],
         "low": [980.0, 1020.0], "close": [1000.0, 1040.0],
+        "prev_close": [1000.0 / 1.01, 1000.0],
         "daily_change_pct": [0.010, 0.040],
     })
     df = pd.DataFrame({

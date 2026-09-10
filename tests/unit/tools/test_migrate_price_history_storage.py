@@ -10,7 +10,7 @@ def test_migrate_price_history_file_dry_run_never_writes(tmp_path) -> None:
     cols = {
         "date": pd.to_datetime(["2026-01-02"]), "symbol": ["005930"],
         "open": [70000.0], "high": [70500.0], "low": [69800.0], "close": [70200.0], "prev_close": [69200.0],
-        "market_cap_100m": [1.0], "trade_value_100m": [1.0], "daily_change_pct": [0.01],
+        "market_cap_100m": [1.0], "trade_value_100m": [1.0], "daily_change_pct": [70200.0 / 69200.0 - 1.0],
         "market": ["KOSPI"], "volume": [1000],
         "foreign_netbuy": [1.0], "inst_netbuy": [1.0], "program_netbuy": [1.0],
         "kospi_pct": [0.01], "kosdaq_pct": [0.01], "v_kospi": [18.5], "v_kosdaq": [18.5],
@@ -34,7 +34,7 @@ def test_migrate_price_history_file_skips_write_on_verification_failure(tmp_path
     cols = {
         "date": pd.to_datetime(["2026-01-02"]), "symbol": ["005930"],
         "open": [70000.0], "high": [70500.0], "low": [69800.0], "close": [70200.0], "prev_close": [69200.0],
-        "market_cap_100m": [1.0], "trade_value_100m": [1.0], "daily_change_pct": [0.01],
+        "market_cap_100m": [1.0], "trade_value_100m": [1.0], "daily_change_pct": [70200.0 / 69200.0 - 1.0],
         "market": ["KOSPI"], "volume": [1000],
         "foreign_netbuy": [1.0], "inst_netbuy": [1.0], "program_netbuy": [1.0],
         "kospi_pct": [0.01], "kosdaq_pct": [0.01], "v_kospi": [18.5], "v_kosdaq": [18.5],
@@ -62,7 +62,7 @@ def _price_cols() -> dict:
     return {
         "date": pd.to_datetime(["2026-01-02"]), "symbol": ["005930"],
         "open": [70000.0], "high": [70500.0], "low": [69800.0], "close": [70200.0], "prev_close": [69200.0],
-        "market_cap_100m": [1.0], "trade_value_100m": [1.0], "daily_change_pct": [0.01],
+        "market_cap_100m": [1.0], "trade_value_100m": [1.0], "daily_change_pct": [70200.0 / 69200.0 - 1.0],
         "market": ["KOSPI"], "volume": [1000],
         "foreign_netbuy": [1.0], "inst_netbuy": [1.0], "program_netbuy": [1.0],
         "kospi_pct": [0.01], "kosdaq_pct": [0.01], "v_kospi": [18.5], "v_kosdaq": [18.5],

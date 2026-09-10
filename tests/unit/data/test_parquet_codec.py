@@ -200,3 +200,33 @@ def test_downcast_altdata_panel_frame_sorts_by_symbol_then_date() -> None:
     out = downcast_altdata_panel_frame(df)
 
     assert out["symbol"].astype(str).tolist() == ["000660", "000660", "005930", "005930"]
+
+
+def test_write_price_history_parquet_rejects_contaminated_panel(tmp_path) -> None:
+    import pandas as pd
+    import pytest
+
+    from src.data.panel_integrity import PanelIntegrityError
+    from src.data.parquet_codec import write_price_history_parquet
+
+    # Given: a frame carrying one percent-encoded change value.
+    df = pd.DataFrame({
+        "date": pd.to_datetime(["2026-03-02", "2026-03-03"]),
+        "symbol": ["005930", "005930"],
+        "open": [9900.0, 10000.0],
+        "high": [10100.0, 10600.0],
+        "low": [9850.0, 9950.0],
+        "close": [10000.0, 10500.0],
+        "prev_close": [9900.0, 10000.0],
+        "market_cap_100m": [900.0, 900.0],
+        "trade_value_100m": [300.0, 310.0],
+        "daily_change_pct": [10000.0 / 9900.0 - 1.0, 5.0],
+        "market": ["KOSPI", "KOSPI"],
+        "volume": [1000, 1100],
+    })
+    target = tmp_path / "price_history.parquet"
+
+    # When / Then: the gate fires before anything is persisted.
+    with pytest.raises(PanelIntegrityError):
+        write_price_history_parquet(df, target)
+    assert not target.exists()
