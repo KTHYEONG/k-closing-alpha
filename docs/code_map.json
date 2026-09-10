@@ -311,6 +311,9 @@
   "src/tools/migrate_intraday_corpus.py": {
     "testing": "tests/unit/tools/test_migrate_intraday_corpus.py"
   },
+  "src/tools/migrate_intraday_schema.py": {
+    "testing": "tests/unit/tools/test_migrate_intraday_schema.py"
+  },
   "src/tools/migrate_price_history_storage.py": {
     "testing": "tests/unit/tools/test_migrate_price_history_storage.py"
   },

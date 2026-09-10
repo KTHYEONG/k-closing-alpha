@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "data_foundation_and_krx_aftermarket",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_data_foundation_and_krx_aftermarket",
+      "domain": "data",
+      "title": "인트라데이 스키마 마이그레이션 + KRX 애프터마켓 세션",
+      "why": "레거시 인트라데이 파티션 484/496개가 정규 스키마와 혼재해 청산일 백필 시 병합이 조용히 행을 파괴하고, 벤더 stale 영업일 데이터 14.8%가 미검증 상태였음",
+      "resolution": "영업일 게이트를 정규화 초크포인트에 삽입, merge_partition_frame을 레거시 파티션 병합 거부로 fail-closed화, 마이그레이션 도구 신설, 9/14 KRX 애프터마켓(16-20시) 전용 세션 분리 수집 배선",
+      "impact": "청산일 백필(5,168페어) 실행 안전성 확보, KRX 애프터마켓 데이터 첫날부터 손실 없이 축적 가능"
+    },
+    {
       "task_id": "closing_price_finalization",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_closing_price_finalization",
@@ -989,16 +999,6 @@
       "why": "Validate AI model predictions against selection_rank and equal-weight baselines with yearly breakdown",
       "resolution": "Implemented src/ml/backtest_evaluator.py and integration with model_pipeline",
       "impact": "Proved AI model superiority with Top-1 return +1.53% (vs +0.63% baseline) and Win Rate 62.9% across 10 years"
-    },
-    {
-      "task_id": "TASK-PREPROCESSOR-DATA-RECOVERY",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_TASK-PREPROCESSOR-DATA-RECOVERY",
-      "domain": "processing",
-      "title": "Preprocessor Data Recovery & 33k Full Dataset Restoration",
-      "why": "Fix string percent symbol cleaning in clean_column_names to prevent 92% net_return row loss",
-      "resolution": "Implemented percent/comma string cleaning in src/processing/preprocessor.py clean_column_names",
-      "impact": "Restored all 33,934 rows (100%) for ML training"
     }
   ]
 }
