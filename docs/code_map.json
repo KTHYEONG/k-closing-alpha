@@ -119,7 +119,9 @@
   "src/backfill/price/universe.py": {
     "testing": "tests/unit/backfill/price/test_universe.py"
   },
-  "src/config/altdata.py": {},
+  "src/config/altdata.py": {
+    "testing": "tests/unit/config/test_altdata.py"
+  },
   "src/config/base.py": {
     "testing": "tests/unit/config/test_base.py"
   },
@@ -215,7 +217,7 @@
     "testing": "tests/unit/ml/test_metrics.py"
   },
   "src/ml/oof.py": {
-    "testing": "tests/unit/ml/test_champion_tuning.py"
+    "testing": "tests/unit/ml/test_oof.py"
   },
   "src/ml/purged_cv.py": {
     "testing": [
@@ -272,18 +274,14 @@
     "testing": "tests/unit/serving/realtime/test_features.py"
   },
   "src/serving/realtime/inference.py": {
-    "testing": [
-      "tests/unit/ml/test_bundle.py",
-      "tests/unit/ml/test_champion_legacy_removed.py",
-      "tests/unit/ml/test_champion_tuning.py",
-      "tests/unit/ml/test_dataset.py",
-      "tests/unit/ml/test_decision_labels.py",
-      "tests/unit/serving/realtime/test_inference_cost_ratio.py"
-    ]
+    "testing": "tests/unit/serving/realtime/test_inference.py"
   },
   "src/settings.py": {
     "testing": [
+      "tests/unit/backfill/test_backfill_regime.py",
+      "tests/unit/config/test_altdata.py",
       "tests/unit/config/test_altdata_settings.py",
+      "tests/unit/config/test_base.py",
       "tests/unit/config/test_kiwoom.py",
       "tests/unit/config/test_ls.py",
       "tests/unit/config/test_settings_compat.py",

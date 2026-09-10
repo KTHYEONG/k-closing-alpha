@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "config_constant_consolidation_phase3",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_config_constant_consolidation_phase3",
+      "domain": "architecture",
+      "title": "설정 결함 복구 및 중복 상수 통합",
+      "why": "BASE_DIR 오버라이드 시 MODELS_DIR만 홀로 실제 저장소를 가리키는 결함, 자기검사뿐인 소문자 별칭 7개, 벤더예산 오배치, 수작업 .env 파서의 침묵 예외삼킴, 7개 상수 중복정의를 실측으로 확정",
+      "resolution": "MODELS_DIR을 BASE_DIR 파생 computed_field로 전환, 별칭 7개 삭제, LS_TICK_MAX_PAGES를 LsSettings로 이동, _get_env_value/_get_env_csv를 순수 _split_csv로 교체, 7개 상수를 contract.py/market_session.py로 단일화; 설정5중메커니즘 통합·유니버스 병합·컬럼문자열 중앙화는 구조적/개념적 근거로 명시 기각",
+      "impact": "16개 출력 digest 바이트동일로 무변경 증명, 13개 진입점 import 성공(신규 ml/serving→strategy 엣지 순환없음), 테스트 783→796"
+    },
+    {
       "task_id": "dead_code_subtraction_phase2",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_dead_code_subtraction_phase2",
@@ -989,16 +999,6 @@
       "why": "plan.md 요구사항 대비 전처리 버그(단위 불일치, Data Leakage 등) 수정 및 횡단면 Z-Score/피처 확장",
       "resolution": "preprocessor_v2.py 버그 7건 수정, Phase 1 피처 19종 확장, 테스트 케이스 보강",
       "impact": "학습 피처 정확성 확보 및 Data Leakage 차단으로 모델 성과 및 랭킹 정합성 향상"
-    },
-    {
-      "task_id": "TASK_ML_DATA_PREPROCESS_V2",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_ML_DATA_PREPROCESS_V2",
-      "domain": "ml_data",
-      "title": "Parquet 기반 ML 데이터 전처리 및 피처/다중타깃 엔진 v2 구축",
-      "why": "스프레드시트 괄호/단위 열 이름 혼선 제거, 15:19~20 매수가격 기준 정합성 보장, docs/plan.md 명세에 맞춘 랭킹/회귀/확률 다중 타깃 및 횡단면 백분위 피처 구축",
-      "resolution": "preprocessor_v2.py 모듈 작성, 매수체결가 등락률(buy_price_change_rate) 및 상대 지표 포함, 5단계 ranking/clipped return/binary target 생성 구현 및 테스트 통과",
-      "impact": "데이터 누수 완전 차단, 괄호 열 이름 정규화, LightGBM/CatBoost 다중 타깃 지원 전처리 파이프라인 정립"
     }
   ]
 }
