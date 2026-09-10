@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.strategy.contract import CEILING_CHG_THRESHOLD
+from src.strategy.contract import CEILING_CHG_THRESHOLD, derive_chg_ratio
 
 CANONICAL_SCENARIOS: tuple[str, ...] = (
     "상한가 다음날",
@@ -64,7 +64,7 @@ def _breakout_and_ceiling_frame(price_history_df: pd.DataFrame) -> pd.DataFrame:
     prev_close = grp.shift(1)
     prev_ma120 = ma120.groupby(labels.to_numpy(), sort=False).shift(1)
     ma120_breakout = ((prev_close <= prev_ma120) & (close > ma120)).fillna(False)
-    dcp = df["daily_change_pct"].astype(np.float64)
+    dcp = pd.Series(derive_chg_ratio(close.to_numpy(dtype=np.float64), prev_close.to_numpy(dtype=np.float64)), index=df.index)
     is_ceiling = ((dcp >= CEILING_CHG_THRESHOLD) & (close >= high)).fillna(False)
     prev_ceiling = is_ceiling.groupby(labels.to_numpy(), sort=False).shift(1).fillna(False)
     out = pd.DataFrame(
