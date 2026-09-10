@@ -264,7 +264,7 @@ def _kis_sync_client():
     """
     import asyncio
 
-    from src.api.kis_client import KisApiClient
+    from src.api.kis.client import KisApiClient
 
     global _KIS_CLIENT
     with _KIS_CLIENT_LOCK:

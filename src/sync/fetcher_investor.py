@@ -8,7 +8,7 @@ from typing import Any
 import aiohttp
 import pandas as pd
 
-from src.api.kis_client import KisApiClient
+from src.api.kis.client import KisApiClient
 
 logger = logging.getLogger(__name__)
 

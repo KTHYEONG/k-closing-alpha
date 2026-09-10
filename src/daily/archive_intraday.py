@@ -7,7 +7,7 @@ import logging
 from datetime import datetime
 
 from src import settings
-from src.api.kis_client import KisApiClient
+from src.api.kis.client import KisApiClient
 from src.api.kiwoom.client import KiwoomApiClient
 from src.api.ls.client import LsApiClient
 from src.backfill.intraday.collector import (

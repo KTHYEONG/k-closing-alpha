@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, patch
 
-from src.api.kis_client import KisApiClient
+from src.api.kis.client import KisApiClient
 
 
 class _FakeSession:
