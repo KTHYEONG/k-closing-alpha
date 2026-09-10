@@ -6,13 +6,12 @@ def test_live_entrypoints_import_after_constant_consolidation() -> None:
 
     entrypoints = [
         "src.daily.collect",
-        "src.daily.collect_auction",
+        "src.daily.paper_trade",
         "src.daily.predict",
         "src.daily.archive_intraday",
         "src.ml.retrain",
         "src.ml.costaware_topk",
         "src.ml.topk_ranker_research",
-        "src.utils.export_archive",
         "src.backfill.backfill_price",
         "src.backfill.backfill_altdata",
         "src.backfill.backfill_regime",

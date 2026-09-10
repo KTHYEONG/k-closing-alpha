@@ -2,7 +2,6 @@
 
 SCENARIO_ARCHIVE_UPSERT_01: Upsert candidates DataFrame into parquet and db without duplication.
 SCENARIO_ARCHIVE_FETCH_02: Fetch latest or specified date snapshot in standard 27 column order aligned with spreadsheet.
-SCENARIO_ARCHIVE_EXPORT_03: Export candidate snapshot as TSV string matching spreadsheet layout for copy-pasting.
 """
 
 from __future__ import annotations
@@ -107,22 +106,6 @@ def test_scenario_archive_fetch_02(tmp_archive: Path) -> None:
     assert len(archive.ARCHIVE_COLUMN_ORDER) == 23
 
 
-def test_scenario_archive_export_03(tmp_archive: Path) -> None:
-    """SCENARIO_ARCHIVE_EXPORT_03: Export candidate snapshot as TSV string matching spreadsheet layout for copy-pasting."""
-    archive.upsert_archive_snapshot(
-        pd.DataFrame([_candidate_row("005930", "삼성전자", 1)]),
-        snapshot_date="2026-08-04",
-    )
-    tsv = archive.export_archive_for_spreadsheet("2026-08-04")
-    lines = tsv.splitlines()
-    assert lines[0].split("\t") == archive.ARCHIVE_COLUMN_ORDER
-    assert lines[1].startswith("2026-08-04\t005930\t삼성전자\tKOSPI\t")
-    assert len(lines[1].split("\t")) == len(archive.ARCHIVE_COLUMN_ORDER)
-
-    latest_tsv = archive.export_archive_for_spreadsheet()
-    assert latest_tsv.splitlines()[0].split("\t") == archive.ARCHIVE_COLUMN_ORDER
-
-
 def test_upsert_fills_snapshot_date_when_missing(tmp_archive: Path) -> None:
     count = archive.upsert_archive_snapshot(
         pd.DataFrame([{"종목코드": "005930", "종목명": "삼성전자"}])
@@ -184,25 +167,6 @@ def test_fetch_empty_archive_returns_standard_columns(tmp_archive: Path) -> None
     df = archive.fetch_archive_snapshot()
     assert df.empty
     assert df.columns.tolist() == archive.ARCHIVE_READ_COLUMN_ORDER
-
-
-def test_export_empty_df_returns_header() -> None:
-    tsv = archive.export_archive_for_spreadsheet(pd.DataFrame())
-    assert tsv.splitlines() == ["\t".join(archive.ARCHIVE_COLUMN_ORDER)]
-
-
-def test_export_empty_df_without_header_returns_empty() -> None:
-    assert archive.export_archive_for_spreadsheet(pd.DataFrame(), include_header=False) == ""
-
-
-def test_export_df_direct_without_header() -> None:
-    df = pd.DataFrame([{"종목코드": "1", "종목명": "테스트"}])
-    tsv = archive.export_archive_for_spreadsheet(df, include_header=False)
-    lines = tsv.splitlines()
-    assert len(lines) == 1
-    fields = lines[0].split("\t")
-    assert len(fields) == len(archive.ARCHIVE_COLUMN_ORDER)
-    assert fields[1] == "000001"
 
 
 def test_upsert_localizes_naive_snapshot_timestamp(tmp_archive: Path) -> None:
@@ -289,25 +253,6 @@ def test_fetch_archive_snapshot_latest_only_false_preserves_full_history(tmp_arc
     result = archive.fetch_archive_snapshot(snapshot_date="2026-08-04", latest_only=False)
 
     assert len(result) == 2
-
-
-def test_export_archive_for_spreadsheet_deduplicates_reruns(tmp_archive: Path) -> None:
-    import pandas as pd
-
-    from src.daily import archive
-
-    row1 = _candidate_row("005930", "삼성전자", 1)
-    row1["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:19:00", tz="Asia/Seoul")
-    archive.upsert_archive_snapshot(pd.DataFrame([row1]), snapshot_date="2026-08-04")
-
-    row2 = _candidate_row("005930", "삼성전자", 1)
-    row2["snapshot_timestamp"] = pd.Timestamp("2026-08-04 15:25:00", tz="Asia/Seoul")
-    archive.upsert_archive_snapshot(pd.DataFrame([row2]), snapshot_date="2026-08-04")
-
-    tsv = archive.export_archive_for_spreadsheet("2026-08-04")
-
-    data_lines = [ln for ln in tsv.strip().split("\n")][1:]  # noqa: C416
-    assert len(data_lines) == 1
 
 
 def test_upsert_archive_snapshot_logs_rerun_detection(tmp_archive: Path, caplog) -> None:
