@@ -16,6 +16,7 @@ def test_attach_next_day_path_keys_next_trading_row() -> None:
             "high": [105.0, 118.0, 130.0],
             "low": [98.0, 108.0, 119.0],
             "close": [102.0, 112.0, 125.0],
+            "prev_close": [100.0, 102.0, 112.0],
             "daily_change_pct": [0.02, 0.098, 0.116],
         }
     )
@@ -57,6 +58,7 @@ def test_attach_next_day_path_missing_column_raises() -> None:
             "open": [100.0, 110.0],
             "low": [98.0, 108.0],
             "close": [102.0, 112.0],
+            "prev_close": [100.0, 102.0],
             "daily_change_pct": [0.02, 0.098],
         }
     )
@@ -198,18 +200,24 @@ def _grid_synth(n_days: int = 60, per_day: int = 3, seed: int = 0):
     # spikes through +5% intraday (high ~ +6%), then closes back near flat.
     ph_rows = []
     for code in [f"{j:06d}" for j in range(per_day)]:
+        prev = 100.0
         for d in all_dates:
+            o = 100.6 + rng.normal(0, 0.05)
+            h = 106.0 + rng.normal(0, 0.2)
+            close = 100.0 + rng.normal(0, 0.1)
             ph_rows.append(
                 {
                     "date": d,
                     "symbol": code,
-                    "open": 100.6 + rng.normal(0, 0.05),
-                    "high": 106.0 + rng.normal(0, 0.2),
+                    "open": o,
+                    "high": h,
                     "low": 97.0,
-                    "close": 100.0 + rng.normal(0, 0.1),
+                    "close": close,
+                    "prev_close": prev,
                     "daily_change_pct": 0.03,
                 }
             )
+            prev = close
     return oof, pd.DataFrame(ph_rows)
 
 
@@ -250,19 +258,25 @@ def test_evaluate_exit_grid_rejects_when_moc_fallback_bleeds() -> None:
                 {"trade_date": d, "stock_code": f"{j:06d}", "pred": rng.normal(), "net_return": rng.normal()}
             )
     for code in [f"{j:06d}" for j in range(3)]:
+        prev = 100.0
         for d in all_dates:
             # entry close 100 every day; next open only +0.6%, high never reaches +5%,
             # and the fallback close (== 100) leaves the MOC exit below the incumbent open.
+            o = 100.6 + rng.normal(0, 0.05)
+            h = 101.5 + rng.normal(0, 0.1)
+            close = 100.0 + rng.normal(0, 0.05)
             ph_rows.append(
                 {
                     "date": d, "symbol": code,
-                    "open": 100.6 + rng.normal(0, 0.05),
-                    "high": 101.5 + rng.normal(0, 0.1),
+                    "open": o,
+                    "high": h,
                     "low": 95.0,
-                    "close": 100.0 + rng.normal(0, 0.05),
+                    "close": close,
+                    "prev_close": prev,
                     "daily_change_pct": 0.02,
                 }
             )
+            prev = close
     oof = pd.DataFrame(oof_rows)
     ph = pd.DataFrame(ph_rows)
 
@@ -292,7 +306,7 @@ def test_evaluate_exit_grid_excludes_limit_up_entries() -> None:
         chg = 0.30 if k < 10 else 0.03
         ph_rows.append(
             {"date": d, "symbol": "000000", "open": 100.4, "high": 106.0, "low": 97.0,
-             "close": 100.0, "daily_change_pct": chg}
+             "close": 100.0, "prev_close": 100.0 / (1.0 + chg), "daily_change_pct": chg}
         )
     oof = pd.DataFrame(oof_rows)
     ph = pd.DataFrame(ph_rows)
@@ -320,7 +334,7 @@ def test_evaluate_exit_grid_requires_minimum_days() -> None:
         {
             "date": all_dates, "symbol": ["000000"] * 22,
             "open": [100.4] * 22, "high": [106.0] * 22, "low": [97.0] * 22,
-            "close": [100.0] * 22, "daily_change_pct": [0.03] * 22,
+            "close": [100.0] * 22, "prev_close": [100.0 / 1.03] * 22, "daily_change_pct": [0.03] * 22,
         }
     )
 
@@ -368,6 +382,7 @@ def test_attach_next_day_path_exposes_next_trading_day_date() -> None:
         "high": [1010.0, 1050.0, 1060.0],
         "low": [980.0, 1020.0, 1030.0],
         "close": [1000.0, 1040.0, 1050.0],
+        "prev_close": [1000.0 / 1.01, 1000.0, 1040.0],
         "daily_change_pct": [0.010, 0.040, 0.0096],
     })
     df = pd.DataFrame({"trade_date": pd.to_datetime(["2024-01-02"]), "stock_code": ["000001"]})
@@ -378,3 +393,41 @@ def test_attach_next_day_path_exposes_next_trading_day_date() -> None:
     assert pd.Timestamp(out["nd_date"].iloc[0]) == pd.Timestamp("2024-01-03")
 
 
+
+
+def test_attach_next_day_path_requires_prev_close_and_ignores_vendor_change() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.exit_policy import attach_next_day_path
+
+    # Given: price history carrying a deliberately wrong percent-encoded vendor column.
+    ph = pd.DataFrame({
+        "date": pd.to_datetime(["2026-03-02", "2026-03-03"]),
+        "symbol": ["005930", "005930"],
+        "open": [9900.0, 10100.0],
+        "high": [10100.0, 10600.0],
+        "low": [9850.0, 9950.0],
+        "close": [10000.0, 10500.0],
+        "prev_close": [9900.0, 10000.0],
+        "daily_change_pct": [999.0, 999.0],
+    })
+    entries = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2026-03-02"]),
+        "stock_code": ["005930"],
+    })
+
+    # When
+    out = attach_next_day_path(entries, ph)
+
+    # Then: the vendor column is ignored and the ratio is derived from prices.
+    np.testing.assert_allclose(
+        out["entry_change_ratio"].to_numpy(dtype=float), [10000.0 / 9900.0 - 1.0], rtol=1e-12
+    )
+    np.testing.assert_allclose(out["nd_open"].to_numpy(dtype=float), [10100.0])
+
+    # And: a frame without prev_close now fails closed.
+    with pytest.raises(ValueError, match="prev_close") as excinfo:
+        attach_next_day_path(entries, ph.drop(columns=["prev_close"]))
+    assert "prev_close" in str(excinfo.value)

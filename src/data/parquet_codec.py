@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.data.io_utils import atomic_write_parquet
+from src.data.panel_integrity import assert_price_history_units_clean
 
 INTRADAY_COMPRESSION: str = "zstd"
 PARQUET_COMPRESSION_LEVEL: int = 6
@@ -84,6 +85,7 @@ def downcast_altdata_panel_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 def write_price_history_parquet(df: pd.DataFrame, target_path: Path) -> None:
     """다운캐스트 후 원자적 쓰기 (병합 없이 순수 쓰기)."""
+    assert_price_history_units_clean(df)
     atomic_write_parquet(
         downcast_price_history_frame(df),
         target_path,

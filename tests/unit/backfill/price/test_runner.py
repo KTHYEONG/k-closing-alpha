@@ -35,3 +35,48 @@ def test_run_backfill_end_date_defaults_to_today(monkeypatch, tmp_path) -> None:
     assert out.empty
     assert captured["fixed_end_date"] == pd.Timestamp.today().normalize()
     assert captured["fixed_end_date"] > pd.Timestamp("2025-12-31")
+
+
+def test_to_parquet_heals_merged_panel_across_incremental_runs(tmp_path) -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.backfill.price.runner import _to_parquet
+    from src.data.panel_integrity import assert_price_history_units_clean
+
+    def _frame(dates, closes, prevs, chgs):
+        n = len(dates)
+        return pd.DataFrame({
+            "date": pd.to_datetime(dates),
+            "symbol": ["005930"] * n,
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "prev_close": prevs,
+            "market_cap_100m": [900.0] * n,
+            "trade_value_100m": [300.0] * n,
+            "daily_change_pct": chgs,
+            "market": ["KOSPI"] * n,
+            "volume": [1000] * n,
+        })
+
+    target = tmp_path / "price_history.parquet"
+
+    # Given: a first run persists two bars.
+    first = _frame(["2026-03-02", "2026-03-03"], [10000.0, 10500.0], [np.nan, 10000.0], [np.nan, 0.05])
+    _to_parquet(first, target)
+
+    # When: a second incremental run brings a slice whose first row lost prev_close.
+    second = _frame(["2026-03-04", "2026-03-05"], [10920.0, 11000.0], [np.nan, 10920.0], [np.nan, 11000.0 / 10920.0 - 1.0])
+    _to_parquet(second, target)
+
+    # Then: the boundary is healed from stored history and the panel is clean on disk.
+    stored = pd.read_parquet(target).sort_values("date").reset_index(drop=True)
+    assert len(stored) == 4
+    assert assert_price_history_units_clean(stored) is None
+    np.testing.assert_allclose(
+        stored["daily_change_pct"].to_numpy(dtype=float)[1:],
+        [0.05, 0.04, 11000.0 / 10920.0 - 1.0],
+        rtol=1e-9,
+    )

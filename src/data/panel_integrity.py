@@ -26,7 +26,10 @@ from src.strategy.contract import (
 __all__ = [
     "PANEL_INTEGRITY_COLUMNS",
     "REQUIRED_SOURCE_COLUMNS",
+    "PanelIntegrityError",
     "PanelProvenance",
+    "assert_price_history_units_clean",
+    "heal_price_history_panel",
     "load_price_panel",
     "prepare_price_panel",
 ]
@@ -226,3 +229,99 @@ def load_price_panel(
     return prepare_price_panel(
         frame, date_col=date_col, symbol_col=symbol_col, market_col=market_col
     )
+
+
+class PanelIntegrityError(ValueError):
+    """Raised when a stored change column disagrees with its own prices."""
+
+
+def heal_price_history_panel(
+    df: pd.DataFrame,
+    *,
+    date_col: str = "date",
+    symbol_col: str = "symbol",
+) -> pd.DataFrame:
+    """Re-derive prev_close and change ratios over the whole merged panel.
+
+    Args:
+        df: Price history frame carrying close and prev_close (never mutated).
+        date_col: Name of the trading-date column.
+        symbol_col: Name of the symbol column.
+
+    Returns:
+        Sorted copy with healed prev_close, chg_ratio and daily_change_pct.
+    """
+    out = df.copy()
+    # 캘린더 정규화: 날짜는 datetime, 심볼은 6자리 문자열.
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    out[symbol_col] = out[symbol_col].astype(str).str.zfill(6)
+    out = out.sort_values([symbol_col, date_col], kind="stable").reset_index(drop=True)
+    # 전체 패널 기준 재도출: 슬라이스 경계는 병합된 전일 종가로 치유한다.
+    close = pd.to_numeric(out["close"], errors="coerce").to_numpy(dtype=np.float64)
+    prev_existing = pd.to_numeric(out["prev_close"], errors="coerce").to_numpy(dtype=np.float64)
+    keys = out[symbol_col].to_numpy()
+    shifted = pd.Series(close).groupby(keys, sort=False).shift(1).to_numpy(dtype=np.float64)
+    # 결측 이전 종가만 전일 종가로 메운다; 운반된 유효값은 그대로 둔다.
+    prev = np.where(np.isfinite(prev_existing), prev_existing, shifted)
+    out["prev_close"] = np.asarray(prev, dtype=np.float64)
+    # 단일 결정론적 원천: 벤더 컬럼은 값 생성에 절대 사용하지 않는다.
+    chg = derive_chg_ratio(close, prev)
+    out["chg_ratio"] = np.asarray(chg, dtype=np.float64)
+    out["daily_change_pct"] = np.asarray(chg, dtype=np.float64)
+    return out
+
+
+def assert_price_history_units_clean(
+    df: pd.DataFrame,
+    *,
+    date_col: str = "date",
+    symbol_col: str = "symbol",
+    rtol: float = 1e-6,
+) -> None:
+    """Refuse a panel whose stored change column disagrees with its prices.
+
+    Args:
+        df: Price history frame to validate (never mutated).
+        date_col: Name of the trading-date column.
+        symbol_col: Name of the symbol column.
+        rtol: Relative tolerance for the stored-vs-derived comparison.
+
+    Returns:
+        None on success.
+
+    Raises:
+        PanelIntegrityError: If a column is missing or any row mismatches.
+    """
+    required = {date_col, symbol_col, "close", "prev_close", "daily_change_pct"}
+    missing = sorted(c for c in required if c not in df.columns)
+    if missing:
+        raise PanelIntegrityError(
+            f"assert_price_history_units_clean is missing required columns: {missing}"
+        )
+    work = df.copy()
+    # 결정론적 비교 순서: 심볼·날짜 정렬본 위에서 진릿값을 계산한다.
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    work[symbol_col] = work[symbol_col].astype(str).str.zfill(6)
+    work = work.sort_values([symbol_col, date_col], kind="stable").reset_index(drop=True)
+    close = pd.to_numeric(work["close"], errors="coerce").to_numpy(dtype=np.float64)
+    prev = pd.to_numeric(work["prev_close"], errors="coerce").to_numpy(dtype=np.float64)
+    stored = pd.to_numeric(work["daily_change_pct"], errors="coerce").to_numpy(dtype=np.float64)
+    # 단일 결정론적 원천과의 벡터화 비교; NaN 행은 동등 취급한다.
+    truth = derive_chg_ratio(close, prev)
+    ok = np.isclose(stored, truth, rtol=float(rtol), atol=0.0, equal_nan=True)
+    n_mismatch = int((~np.asarray(ok)).sum())
+    if n_mismatch:
+        total = len(work)
+        syms = work[symbol_col].astype(str).to_numpy()
+        dates = pd.to_datetime(work[date_col], errors="coerce")
+        bad = np.flatnonzero(~np.asarray(ok))[:3]
+        # 최대 3개 행만 보고한다; 연산자는 추가 조회 없이 조치한다.
+        parts = [
+            f"({syms[i]}, {dates.iloc[i]}, stored={stored[i]!r}, expected={truth[i]!r})"
+            for i in bad
+        ]
+        raise PanelIntegrityError(
+            f"price_history panel has {n_mismatch} mismatching rows "
+            f"out of {total}: " + "; ".join(parts)
+        )
+    return None

@@ -10,11 +10,12 @@ import pandas as pd
 
 from src.ml.metrics import aggregate_metrics
 from src.ml.robust_eval import CombinatorialPurgedCV, moving_block_bootstrap_delta
+from src.strategy.contract import derive_chg_ratio
 
 DEFAULT_TAKE_PROFIT_GRID: tuple[float, ...] = (0.03, 0.04, 0.05, 0.06, 0.07)
 LIMIT_UP_BLOCK_THRESHOLD: float = 0.28
 INCUMBENT_EXIT_LABEL: str = "market_next_open"
-_REQUIRED_PATH_COLUMNS: frozenset[str] = frozenset({"date", "symbol", "open", "high", "low", "close", "daily_change_pct"})
+_REQUIRED_PATH_COLUMNS: frozenset[str] = frozenset({"date", "symbol", "open", "high", "low", "close", "prev_close"})
 
 
 @dataclass(frozen=True)
@@ -57,15 +58,13 @@ def attach_next_day_path(
     ph["date"] = pd.to_datetime(ph["date"])
     ph["symbol"] = ph["symbol"].astype(str).str.zfill(6)
     ph = ph.sort_values(["symbol", "date"]).drop_duplicates(["symbol", "date"], keep="last")
-    change = ph["daily_change_pct"].to_numpy(dtype=np.float64)
-    if np.isfinite(change).any() and float(np.nanmedian(np.abs(change[np.isfinite(change)]))) > 1.0:
-        ph["daily_change_pct"] = ph["daily_change_pct"].astype(np.float64) / 100.0
     grouped = ph.groupby("symbol", sort=False)
     for col in ("open", "high", "low", "close"):
         ph[f"nd_{col}"] = grouped[col].shift(-1)
     ph["nd_date"] = grouped["date"].shift(-1)
     ph["entry_close"] = ph["close"]
-    ph["entry_change_ratio"] = ph["daily_change_pct"].astype(np.float64)
+    # 단일 결정론적 원천: 벤더 등락률은 절대 사용하지 않는다.
+    ph["entry_change_ratio"] = derive_chg_ratio(pd.to_numeric(ph["close"], errors="coerce").to_numpy(dtype=np.float64), pd.to_numeric(ph["prev_close"], errors="coerce").to_numpy(dtype=np.float64))
     lookup = ph[
         ["symbol", "date", "entry_close", "entry_change_ratio", "nd_open", "nd_high", "nd_low", "nd_close", "nd_date"]
     ]
