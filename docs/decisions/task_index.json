@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "label_path_and_facade_cleanup",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_label_path_and_facade_cleanup",
+      "domain": "ml",
+      "title": "라벨 경로 마지막 벤더컬럼 의존 제거",
+      "why": "scenario_rules.py 상한가 게이트가 여전히 daily_change_pct 벤더컬럼을 직접 읽어 Phase1 정합성 불변식이 라벨 경로에서 미완성이었음",
+      "resolution": "_breakout_and_ceiling_frame이 이미 계산 중인 prev_close를 재사용해 derive_chg_ratio로 유도, 벤더값과 분리된 테스트 픽스처를 실제 종가로 교정; kis_client 퍼사드는 tests 포함 재측정 시 20개 파일 규모라 제외",
+      "impact": "src/ml/ 전체에서 daily_change_pct 직접 읽기 0건, diff coverage 100%, 신규 시나리오 3개+기존 회귀 2개 무변경 통과"
+    },
+    {
       "task_id": "config_constant_consolidation_phase3",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_config_constant_consolidation_phase3",
@@ -989,16 +999,6 @@
       "why": "v2 전처리기를 프로젝트 메인 preprocessor.py로 통합하고 기존 legacy v1 코드를 legacy/로 분리 이관",
       "resolution": "preprocessor_v2.py를 src/processing/preprocessor.py로 승격하고 legacy 전처리기를 legacy/preprocessor.py로 이동, RENAME_MAP을 legacy_mapping.py로 추출 및 re-export",
       "impact": "메인 전처리 파이프라인 단일화 및 코드베이스 깔끔화, 구형 데이터 호환성 보장"
-    },
-    {
-      "task_id": "ML_FEATURE_ENG_V2",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_ML_FEATURE_ENG_V2",
-      "domain": "processing",
-      "title": "ML Feature Engineering & Preprocessing Pipeline v2",
-      "why": "plan.md 요구사항 대비 전처리 버그(단위 불일치, Data Leakage 등) 수정 및 횡단면 Z-Score/피처 확장",
-      "resolution": "preprocessor_v2.py 버그 7건 수정, Phase 1 피처 19종 확장, 테스트 케이스 보강",
-      "impact": "학습 피처 정확성 확보 및 Data Leakage 차단으로 모델 성과 및 랭킹 정합성 향상"
     }
   ]
 }
