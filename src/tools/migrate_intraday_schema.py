@@ -126,7 +126,10 @@ def run_migration(root: Path | None = None, *, dry_run: bool = True, backup: boo
         n_date_dropped += int(res.get("n_date_dropped", 0))
         n_migrated += 1 if res.get("migrated") else 0
         n_already_canonical += 1 if (not res.get("migrated") and res.get("reason") == "already_canonical") else 0
-        is_failure = not res.get("migrated") and res.get("reason") != "already_canonical"
+        # dry-run에서는 검증 통과(reason=None)도 migrated=False로 나오므로,
+        # migrated 플래그가 아니라 reason 자체로 실패 여부를 판정한다
+        # (그렇지 않으면 dry-run 요약에서 정상 파티션이 전량 실패로 오분류된다).
+        is_failure = res.get("reason") not in (None, "already_canonical")
         n_failed += 1 if is_failure else 0
         if is_failure:
             failures.append({"path": str(res.get("path", p)), "reason": str(res.get("reason"))})
