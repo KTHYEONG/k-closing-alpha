@@ -39,6 +39,9 @@ def merge_partition_frame(new_df: pd.DataFrame, target: Path, key_cols: tuple[st
     if existing is None or len(existing) == 0:
         merged = new_df.copy()
     else:
+        missing_keys = [k for k in key_cols if k not in existing.columns]
+        if missing_keys:
+            raise ValueError(f"Legacy partition missing key columns: {missing_keys}")
         merged = pd.concat([existing, new_df], ignore_index=True)
         merged = merged.drop_duplicates(subset=list(key_cols), keep="last")
     merged = merged.sort_values(list(key_cols), kind="stable").reset_index(drop=True)

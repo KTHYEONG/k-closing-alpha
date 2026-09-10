@@ -129,3 +129,59 @@ def test_write_intraday_partition_rejects_symbol_coverage_reduction(tmp_path: Pa
     with pytest.raises(ValueError, match="reduce symbol coverage"):
         intraday_store.merge_partition_frame(colliding, target, ("ts_hms",))
 
+
+
+def test_merge_partition_frame_rejects_legacy_existing_partition(tmp_path) -> None:
+    import pandas as pd
+    import pytest
+
+    from src.data.intraday_store import merge_partition_frame
+
+    legacy = pd.DataFrame({
+        "stck_bsop_date": ["20260501"] * 3,
+        "stck_cntg_hour": ["090100", "090200", "090300"],
+        "stck_prpr": ["1000", "1010", "1020"],
+        "종목코드": ["005930"] * 3,
+    })
+    target = tmp_path / "2026-05-01.parquet"
+    legacy.to_parquet(target, index=False)
+
+    canonical = pd.DataFrame({
+        "snapshot_date": ["2026-05-01"] * 2,
+        "symbol": ["000660"] * 2,
+        "ts_hms": [90100, 90200],
+        "open": [500, 505], "high": [510, 512], "low": [498, 503],
+        "close": [505, 510], "volume": [10, 20], "value_krw": [5050, 10200],
+        "has_trade": [True, True], "vendor": ["kis", "kis"],
+    })
+
+    with pytest.raises(ValueError):  # noqa: PT011 - contract skeleton asserts fail-closed merge
+        merge_partition_frame(canonical, target, ("symbol", "ts_hms"))
+
+    # 원본 파일은 그대로 보존되어야 한다
+    assert len(pd.read_parquet(target)) == 3
+
+
+def test_merge_partition_frame_still_merges_canonical_partitions(tmp_path) -> None:
+    import pandas as pd
+
+    from src.data.intraday_store import merge_partition_frame
+
+    def _frame(symbol: str, ts: list[int], close: list[int]) -> pd.DataFrame:
+        n = len(ts)
+        return pd.DataFrame({
+            "snapshot_date": ["2026-05-01"] * n,
+            "symbol": [symbol] * n,
+            "ts_hms": ts,
+            "open": close, "high": close, "low": close, "close": close,
+            "volume": [1] * n, "value_krw": [1] * n,
+            "has_trade": [True] * n, "vendor": ["kis"] * n,
+        })
+
+    target = tmp_path / "2026-05-01.parquet"
+    _frame("005930", [90100, 90200], [1000, 1010]).to_parquet(target, index=False)
+
+    merged = merge_partition_frame(_frame("005930", [90200, 90300], [9999, 1020]), target, ("symbol", "ts_hms"))
+
+    assert len(merged) == 3
+    assert merged.loc[merged["ts_hms"] == 90200, "close"].iloc[0] == 9999
