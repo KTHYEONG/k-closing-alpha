@@ -341,3 +341,112 @@ def test_normalize_bar_and_tick_kiwoom_strips_negative_signs() -> None:
     assert df_tick["price"].iloc[0] == 257000
     assert df_tick["volume"].iloc[0] == 50
 
+
+
+def test_extract_vendor_business_dates_per_vendor_and_missing_field() -> None:
+    import pandas as pd
+
+    from src.data.intraday_schema import extract_vendor_business_dates
+
+    kis = pd.DataFrame({"stck_bsop_date": ["20260501", "20260430"], "stck_prpr": ["1", "2"]})
+    assert extract_vendor_business_dates(kis, "kis").tolist() == ["20260501", "20260430"]
+
+    ls = pd.DataFrame({"date": ["20260501"], "close": [1]})
+    assert extract_vendor_business_dates(ls, "ls").tolist() == ["20260501"]
+
+    kiwoom = pd.DataFrame({"cntr_tm": ["20260501160100"], "cur_prc": ["1"]})
+    assert extract_vendor_business_dates(kiwoom, "kiwoom").tolist() == ["20260501"]
+
+    # 필드 부재 -> 검증 불가 신호로 None
+    assert extract_vendor_business_dates(pd.DataFrame({"stck_prpr": ["1"]}), "kis") is None
+
+
+def test_extract_vendor_business_dates_rejects_unknown_vendor() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.data.intraday_schema import extract_vendor_business_dates
+
+    with pytest.raises(ValueError):  # noqa: PT011 - contract skeleton asserts fail-closed vendor
+        extract_vendor_business_dates(pd.DataFrame({"a": [1]}), "bloomberg")
+
+
+def test_filter_to_business_date_drops_stale_rows_and_warns_when_unverifiable(caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    from src.data.intraday_schema import filter_to_business_date
+
+    # Given: 요청일(20260501) 2행 + 타 영업일(20250829) 1행
+    df = pd.DataFrame({
+        "stck_bsop_date": ["20260501", "20250829", "20260501"],
+        "stck_cntg_hour": ["090100", "090100", "090200"],
+    })
+    out = filter_to_business_date(df, "kis", "2026-05-01", "005930")
+    assert len(out) == 2
+    assert set(out["stck_bsop_date"]) == {"20260501"}
+
+    # When: 영업일 필드가 없는 응답 -> 통과시키되 경고
+    with caplog.at_level(logging.WARNING):
+        nofield = pd.DataFrame({"stck_cntg_hour": ["090100"]})
+        passed = filter_to_business_date(nofield, "kis", "2026-05-01", "005930")
+    assert len(passed) == 1
+    assert any("date_verified=false" in r.getMessage() for r in caplog.records)
+
+
+def test_normalize_bar_frame_gates_stale_business_date_before_cumulative_diff() -> None:
+    import pandas as pd
+
+    from src.data.intraday_schema import normalize_bar_frame
+
+    # Given: 요청일 2봉 사이에 타 영업일 1봉(누적 거래대금 계열이 다름)이 섞여 있다
+    df = pd.DataFrame({
+        "stck_bsop_date": ["20260501", "20250829", "20260501"],
+        "stck_cntg_hour": ["090100", "090150", "090200"],
+        "stck_oprc": ["1000", "9999", "1010"],
+        "stck_hgpr": ["1010", "9999", "1020"],
+        "stck_lwpr": ["995", "9999", "1005"],
+        "stck_prpr": ["1005", "9999", "1015"],
+        "cntg_vol": ["100", "777", "200"],
+        "acml_tr_pbmn": ["100000", "50000000", "300000"],
+    })
+
+    out = normalize_bar_frame(df, "kis", "2026-05-01", "005930")
+
+    assert len(out) == 2
+    assert out["ts_hms"].tolist() == [90100, 90200]
+    # 차분이 요청일 행만으로 계산됨: 100000, 300000-100000
+    assert out["value_krw"].tolist() == [100000, 200000]
+    assert out["close"].tolist() == [1005, 1015]
+
+
+def test_normalize_frames_return_empty_when_all_rows_are_stale() -> None:
+    import pandas as pd
+
+    from src.data.intraday_schema import (
+        CANONICAL_BAR_COLUMNS,
+        CANONICAL_TICK_COLUMNS,
+        normalize_bar_frame,
+        normalize_tick_frame,
+    )
+
+    bars = pd.DataFrame({
+        "stck_bsop_date": ["20250829"],
+        "stck_cntg_hour": ["090100"],
+        "stck_oprc": ["1000"], "stck_hgpr": ["1010"], "stck_lwpr": ["995"], "stck_prpr": ["1005"],
+        "cntg_vol": ["100"], "acml_tr_pbmn": ["100000"],
+    })
+    out_bars = normalize_bar_frame(bars, "kis", "2026-05-01", "005930")
+    assert len(out_bars) == 0
+    assert list(out_bars.columns) == list(CANONICAL_BAR_COLUMNS)
+
+    ticks = pd.DataFrame({
+        "stck_bsop_date": ["20250829"],
+        "stck_cntg_hour": ["090100"],
+        "stck_prpr": ["1005"],
+        "cnqn": ["10"],
+    })
+    out_ticks = normalize_tick_frame(ticks, "kis", "2026-05-01", "005930")
+    assert len(out_ticks) == 0
+    assert list(out_ticks.columns) == list(CANONICAL_TICK_COLUMNS)

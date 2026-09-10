@@ -438,3 +438,73 @@ def test_run_intraday_archive_instantiates_kiwoom_with_kiwoom_app_key_alias(monk
     assert result == (0, 0, 0)
     assert captured.get("kiwoom_ctor_called") is True
     assert captured.get("kiwoom_client_passed") is not None
+
+
+def test_run_intraday_archive_writes_krx_aftermarket_to_its_own_session(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.config.market_session import (
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+        INTRADAY_SESSION_REGULAR,
+    )
+    from src.daily import archive_intraday
+
+    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        def create_session(self):
+            return _Session()
+
+        async def ensure_token(self, session):
+            return None
+
+    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _Client())
+    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
+    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", lambda: None)
+
+    def _frame(tag: str) -> pd.DataFrame:
+        return pd.DataFrame({"tag": [tag]})
+
+    async def _regular(*a, **kw):
+        return _frame("regular")
+
+    async def _nxt_after(*a, **kw):
+        return _frame("nxt_after")
+
+    async def _nxt_pre(*a, **kw):
+        return _frame("nxt_pre")
+
+    async def _krx_after(*a, **kw):
+        return _frame("krx_after")
+
+    async def _ticks(*a, **kw):
+        return _frame("ticks")
+
+    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _regular)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _nxt_after)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _nxt_pre)
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _krx_after)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _ticks)
+
+    written: list[tuple[str, str]] = []
+
+    def _write_bars(df, interval, snap, session):
+        written.append((str(df["tag"].iloc[0]), session))
+        return len(df)
+
+    monkeypatch.setattr(archive_intraday, "write_intraday_partition", _write_bars)
+    monkeypatch.setattr(archive_intraday, "write_tick_partition", lambda df, snap, session: len(df))
+
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-14")
+
+    mapping = dict(written)
+    assert mapping["krx_after"] == INTRADAY_SESSION_KRX_AFTERMARKET
+    assert mapping["regular"] == INTRADAY_SESSION_REGULAR
+    assert mapping["krx_after"] != mapping["regular"]

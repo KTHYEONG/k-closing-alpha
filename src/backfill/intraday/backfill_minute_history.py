@@ -14,8 +14,8 @@ import pandas as pd
 
 from src import settings
 from src.api.kis.client import KisApiClient
-from src.backfill.intraday.collector import backfill_nxt_aftermarket_bars, backfill_regular_bars
-from src.config.market_session import INTRADAY_SESSION_NXT_AFTERMARKET, INTRADAY_SESSION_REGULAR
+from src.backfill.intraday.collector import backfill_krx_aftermarket_bars, backfill_nxt_aftermarket_bars, backfill_regular_bars
+from src.config.market_session import INTRADAY_SESSION_KRX_AFTERMARKET, INTRADAY_SESSION_NXT_AFTERMARKET, INTRADAY_SESSION_REGULAR
 from src.daily import archive
 from src.data.intraday_store import intraday_partition_path, write_intraday_partition
 
@@ -180,6 +180,7 @@ def run_minute_history_backfill(lookback_days: int = 365, bar_interval_minutes: 
         dates = 0
         regular_rows = 0
         nxt_rows = 0
+        krx_after_rows = 0
         async with client.create_session() as session:
             await client.ensure_token(session)
             for snap_date in ordered_dates:
@@ -187,15 +188,18 @@ def run_minute_history_backfill(lookback_days: int = 365, bar_interval_minutes: 
                 # 재실행 시 이미 파티션에 저장된 종목은 다시 조회하지 않는다 (API 콜 낭비 방지, 멱등 재실행 가속).
                 done_regular = _already_collected_codes(bar_interval_minutes, snap_date, INTRADAY_SESSION_REGULAR)
                 done_nxt = _already_collected_codes(bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_AFTERMARKET)
+                done_krx_after = _already_collected_codes(bar_interval_minutes, snap_date, INTRADAY_SESSION_KRX_AFTERMARKET)
                 regular_codes = [c for c in all_codes if c not in done_regular]
                 nxt_codes = [c for c in all_codes if c not in done_nxt]
-                if not regular_codes and not nxt_codes:
+                krx_after_codes = [c for c in all_codes if c not in done_krx_after]
+                if not regular_codes and not nxt_codes and not krx_after_codes:
                     dates += 1
                     continue
                 try:
-                    regular_df, nxt_df = await asyncio.gather(
+                    regular_df, nxt_df, krx_after_df = await asyncio.gather(
                         backfill_regular_bars(client, session, regular_codes, snap_date, bar_interval_minutes),
                         backfill_nxt_aftermarket_bars(client, session, nxt_codes, snap_date, bar_interval_minutes),
+                        backfill_krx_aftermarket_bars(client, session, krx_after_codes, snap_date, bar_interval_minutes),
                     )
                 except Exception as e:
                     logger.warning("Backfill failed date=%s: %s", snap_date, e)
@@ -208,8 +212,9 @@ def run_minute_history_backfill(lookback_days: int = 365, bar_interval_minutes: 
                     nxt_rows += _merge_and_write_partition(nxt_df, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_AFTERMARKET)
                 except Exception as e:
                     logger.warning("NXT partition write failed date=%s: %s", snap_date, e)
+                krx_after_rows += _merge_and_write_partition(krx_after_df, bar_interval_minutes, snap_date, INTRADAY_SESSION_KRX_AFTERMARKET)
                 dates += 1
-        return {"dates": dates, "regular_rows": int(regular_rows), "nxt_rows": int(nxt_rows)}
+        return {"dates": dates, "regular_rows": int(regular_rows), "nxt_rows": int(nxt_rows), "krx_after_rows": int(krx_after_rows)}
 
     return asyncio.run(_run())
 

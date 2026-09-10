@@ -336,3 +336,55 @@ def test_enumerate_backfill_targets_treats_calendar_without_date_column_as_missi
 
     # Assert
     assert targets == [("2026-03-06", "005930")]
+
+
+def test_run_minute_history_backfill_collects_krx_aftermarket_partition(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.intraday import backfill_minute_history as bmh
+    from src.config.market_session import INTRADAY_SESSION_KRX_AFTERMARKET
+
+    monkeypatch.setattr(bmh, "enumerate_backfill_targets", lambda **kw: [("2026-09-15", "005930")])
+    monkeypatch.setattr(bmh, "_already_collected_codes", lambda interval, snap, session: set())
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        def create_session(self):
+            return _Session()
+
+        async def ensure_token(self, session):
+            return None
+
+    monkeypatch.setattr(bmh, "KisApiClient", lambda *a, **kw: _Client())
+
+    async def _regular(*a, **kw):
+        return pd.DataFrame({"tag": ["regular"]})
+
+    async def _nxt(*a, **kw):
+        return pd.DataFrame({"tag": ["nxt"]})
+
+    async def _krx(*a, **kw):
+        return pd.DataFrame({"tag": ["krx"]})
+
+    monkeypatch.setattr(bmh, "backfill_regular_bars", _regular)
+    monkeypatch.setattr(bmh, "backfill_nxt_aftermarket_bars", _nxt)
+    monkeypatch.setattr(bmh, "backfill_krx_aftermarket_bars", _krx)
+
+    sessions: list[str] = []
+
+    def _merge(df, interval, snap, session):
+        sessions.append(session)
+        return len(df)
+
+    monkeypatch.setattr(bmh, "_merge_and_write_partition", _merge)
+
+    result = bmh.run_minute_history_backfill()
+
+    assert INTRADAY_SESSION_KRX_AFTERMARKET in sessions
+    assert result["krx_after_rows"] == 1

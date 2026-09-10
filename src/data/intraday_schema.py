@@ -43,6 +43,8 @@ CANONICAL_TICK_COLUMNS: tuple[str, ...] = (
 
 _BAR_VENDORS: tuple[str, ...] = ("kis", "ls", "kiwoom")
 
+VENDOR_BUSINESS_DATE_FIELDS: dict[str, str] = {"kis": "stck_bsop_date", "ls": "date", "kiwoom": "cntr_tm"}
+
 _KIS_BAR_REQUIRED: tuple[str, ...] = (
     "stck_cntg_hour",
     "stck_oprc",
@@ -141,11 +143,51 @@ def _require_columns(df: pd.DataFrame, required: tuple[str, ...], vendor: str) -
         raise ValueError(f"Missing required {vendor} source columns: {missing}")
 
 
+def extract_vendor_business_dates(df: pd.DataFrame, vendor: str) -> pd.Series | None:
+    """벤더 원천 프레임에서 YYYYMMDD 문자열 Series를 추출한다."""
+    if vendor not in VENDOR_BUSINESS_DATE_FIELDS:
+        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls', 'kiwoom')")
+    field = VENDOR_BUSINESS_DATE_FIELDS[vendor]
+    if field not in df.columns:
+        return None
+    return df[field].astype(str).str.replace("-", "", regex=False).str[:8]
+
+
+def filter_to_business_date(df: pd.DataFrame, vendor: str, snapshot_date: str, symbol: str) -> pd.DataFrame:
+    """요청 snapshot_date와 벤더 영업일이 일치하는 행만 남긴다."""
+    dates = extract_vendor_business_dates(df, vendor)
+    if dates is None:
+        logger.warning(
+            "[DATA] stage=business_date_gate symbol=%s snapshot=%s date_verified=false reason=missing_field rows=%d",
+            symbol,
+            snapshot_date,
+            len(df),
+        )
+        return df
+    target = str(snapshot_date).replace("-", "")[:8]
+    mask = dates.astype(str) == target
+    if bool(mask.all()):
+        return df
+    dropped = int((~mask).sum())
+    observed = sorted(set(dates[~mask].astype(str).tolist()))
+    logger.warning(
+        "[DATA] stage=business_date_gate symbol=%s snapshot=%s dropped=%d observed=%s",
+        symbol,
+        snapshot_date,
+        dropped,
+        observed,
+    )
+    return df[mask].copy()
+
+
 def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbol: str) -> pd.DataFrame:
     """벤더 원천 분봉 프레임을 정규 바 스키마로 변환한다."""
     if vendor not in ("kis", "ls", "kiwoom"):
         raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls', 'kiwoom')")
     if df is None or len(df) == 0:
+        return _empty_bar_frame()
+    df = filter_to_business_date(df, vendor, snapshot_date, symbol)
+    if len(df) == 0:
         return _empty_bar_frame()
     code = str(symbol).zfill(6)
 
@@ -244,6 +286,9 @@ def normalize_tick_frame(
     if df is None or len(df) == 0:
         out = _empty_tick_frame()
         return out
+    df = filter_to_business_date(df, vendor, snapshot_date, symbol)
+    if len(df) == 0:
+        return _empty_tick_frame()
     code = str(symbol).zfill(6)
 
     if vendor == "kis":
