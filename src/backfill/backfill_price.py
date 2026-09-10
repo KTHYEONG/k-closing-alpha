@@ -1,4 +1,4 @@
-﻿"""종목별 과거 가격 백필 호환성 퍼사드 모듈.
+"""종목별 과거 가격 백필 호환성 퍼사드 모듈.
 
 구현은 ``src.backfill.price.*`` 로 분리되었으며, 이 모듈은 공개 심볼과 CLI
 ``main`` 만 재-export 합니다. 중복 구현이 없고 마이그레이션 기간 동안 기존
@@ -12,49 +12,9 @@ import logging
 from pathlib import Path
 
 from src.backfill.kis_flow_backfill import main as flow_backfill_main
-from src.backfill.price.config import (
-    DEFAULT_CONFIG,
-    KRW_100M,
-    FetchConfig,
-    PipelineConfig,
-    _effective_kis_sleep_sec,
-    _ensure_kis_semaphore,
-    _kis_slot,
-)
-from src.backfill.price.factors import (
-    _merge_index_returns,
-    compute_vkospi_proxy,
-)
-from src.backfill.price.normalize import (
-    _find_col,
-    _normalize_investor_flow,
-    _normalize_symbol_history,
-    _subtract_flow_frames,
-    _sum_present_cols,
-    _to_ymd,
-)
 from src.backfill.price.runner import (
-    fetch_one_symbol,
     preview_windows,
     run_backfill,
-)
-from src.backfill.price.sources import (
-    _fetch_index_returns,
-    _fetch_investor_history_by_date,
-    _fetch_kis_daily_ohlcv,
-    _fetch_program_history_by_date,
-    _fetch_vkospi_proxy,
-    _kis_sync_client,
-    _resolve_investor_history_func,
-    _resolve_program_history_func,
-    _safe_get_market_cap_by_date,
-    _safe_get_market_ohlcv_by_date,
-    _safe_get_trading_value_by_date,
-)
-from src.backfill.price.universe import (
-    _build_symbol_windows,
-    _load_candidate_universe,
-    load_or_build_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -161,43 +121,6 @@ def main() -> None:
         include_symbols=include_symbols,
         parquet_out=parquet_out,
     )
-
-
-__all__ = [
-    "DEFAULT_CONFIG",
-    "KRW_100M",
-    "FetchConfig",
-    "PipelineConfig",
-    "_build_symbol_windows",
-    "_effective_kis_sleep_sec",
-    "_ensure_kis_semaphore",
-    "_fetch_index_returns",
-    "_fetch_investor_history_by_date",
-    "_fetch_kis_daily_ohlcv",
-    "_fetch_program_history_by_date",
-    "_fetch_vkospi_proxy",
-    "_find_col",
-    "_kis_slot",
-    "_kis_sync_client",
-    "_load_candidate_universe",
-    "_merge_index_returns",
-    "_normalize_investor_flow",
-    "_normalize_symbol_history",
-    "_resolve_investor_history_func",
-    "_resolve_program_history_func",
-    "_safe_get_market_cap_by_date",
-    "_safe_get_market_ohlcv_by_date",
-    "_safe_get_trading_value_by_date",
-    "_subtract_flow_frames",
-    "_sum_present_cols",
-    "_to_ymd",
-    "compute_vkospi_proxy",
-    "fetch_one_symbol",
-    "load_or_build_snapshot",
-    "main",
-    "preview_windows",
-    "run_backfill",
-]
 
 
 if __name__ == "__main__":  # pragma: no cover

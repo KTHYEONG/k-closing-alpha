@@ -219,23 +219,3 @@ def print_table(results_list, title, minimal=False):
     _write_line(divider)
 
 
-def apply_label_encodings(df, encoder_map):
-    """Apply label encoding mappings to categorical columns in-place."""
-    if not encoder_map:
-        object_cols = df.select_dtypes(include=["object"]).columns
-        for col in object_cols:
-            df[col] = pd.Categorical(df[col]).codes.astype(float)
-        return df
-
-    for col, info in encoder_map.items():
-        if col not in df.columns:
-            continue
-        mapping = info["mapping"]
-        unknown_idx = info["unknown"]
-        df[col] = (
-            df[col]
-            .astype(str)
-            .apply(lambda val: mapping.get(val, unknown_idx))
-            .astype(float)
-        )
-    return df

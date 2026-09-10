@@ -1,12 +1,10 @@
 """Bundle assembly for serving compatibility."""
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from joblib import dump
 from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
 from sklearn.calibration import CalibratedClassifierCV
 
@@ -219,9 +217,3 @@ def build_inline_bundle(
     return bundle
 
 
-def save_bundle(bundle: dict[str, Any], export_dir: str) -> str:
-    """joblib dump to <export_dir>/sizing_pipeline_bundle.joblib."""
-    os.makedirs(export_dir, exist_ok=True)
-    path = os.path.join(export_dir, "sizing_pipeline_bundle.joblib")
-    dump(bundle, path)
-    return os.path.abspath(path)

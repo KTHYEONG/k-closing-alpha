@@ -1,25 +1,12 @@
-import numpy as np
-import pandas as pd
+"""Parity of the src ML foundation against the frozen legacy fixture."""
 
-from legacy.ml_research.training.purged_cv import PurgedGroupTimeSeriesSplit as LegacySplit
-from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
+from __future__ import annotations
 
-
-def test_purged_cv_matches_legacy_split_indices() -> None:
-    groups = pd.Series(np.repeat(pd.bdate_range("2024-01-01", periods=40), 5))
-    x = pd.DataFrame({"f": np.arange(len(groups))})
-    got = list(PurgedGroupTimeSeriesSplit(n_splits=4, purge_gap=1).split(x, groups=groups))
-    exp = list(LegacySplit(n_splits=4, purge_gap=1).split(x, groups=groups))
-    assert len(got) == len(exp)
-    for (gtr, gva), (etr, eva) in zip(got, exp, strict=True):
-        np.testing.assert_array_equal(gtr, etr)
-        np.testing.assert_array_equal(gva, eva)
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-from legacy.ml_research.features.dataset import build_ml_dataset as legacy_build
-from src.ml.dataset import build_ml_dataset
 
 
 def _raw_trade_log(n_dates: int = 30, per_day: int = 6) -> pd.DataFrame:
@@ -29,36 +16,92 @@ def _raw_trade_log(n_dates: int = 30, per_day: int = 6) -> pd.DataFrame:
         for j in range(per_day):
             e = rng.normal()
             rows.append({
-                "\ub9e4\uc218\ub0a0\uc9dc": d.strftime("%Y-%m-%d"), "\uc885\ubaa9\ucf54\ub4dc": f"{j:06d}",
-                "(\uc2dc\uac00)": "10000", "(\uace0\uac00)": "10400", "(\uc800\uac00)": "9800", "(\uc885\uac00)": "10200", "(\uc804\uc77c\uc885\uac00)": "10000",
-                "(\uc2dc\uac00\ucd1d\uc561, \uc5b5)": "5000", "(\uac70\ub798\ub300\uae08, \uc5b5)": "300", "(\ub4f1\ub77d\ub960)": f"{2 + e:.2f}",
-                "(\uc120\uc815 \uc21c\uc704)": str(j + 1), "(\uae30\uad00_\uc21c\ub9e4\uc218)": f"{e*100:.0f}", "(\uc678\uad6d\uc778_\uc21c\ub9e4\uc218)": f"{e*80:.0f}",
-                "(\ud504\ub85c\uadf8\ub7a8_\uc21c\ub9e4\uc218)": f"{e*50:.0f}", "(\uccb4\uacb0\uac15\ub3c4)": "120", "(\uc2dc\uc7a5\uad6c\ubd84)": "KOSPI",
-                "(\ucd1d \uc885\ubaa9 \uc218)": str(per_day), "(\ud3c9\uade0 \uac70\ub798\ub300\uae08)": "250", "(kospi, %)": "0.3", "(kosdaq, %)": "0.1",
-                "v_kospi": "18", "v_kosdaq": "20", "(\uac70\ub798\ub7c9)": "100000", "(\ud14c\ub9c8/\uc139\ud130)": "\ubc18\ub3c4\uccb4",
-                "(\ucc28\ud2b8\ubd84\uc11d)": "\uac70\ub798\ub7c9 \ud3ed\uc99d", "(\ub9e4\uc218 \uac00\uaca9)": "10200",
-                "(\ub9e4\ub3c4 \uac00\uaca9)": f"{10200*(1+0.01*e):.0f}", "(\uc218\uc775\ub960, %)": f"{e:.2f}",
+                "매수날짜": d.strftime("%Y-%m-%d"), "종목코드": f"{j:06d}",
+                "(시가)": "10000", "(고가)": "10400", "(저가)": "9800", "(종가)": "10200", "(전일종가)": "10000",
+                "(시가총액, 억)": "5000", "(거래대금, 억)": "300", "(등락률)": f"{2 + e:.2f}",
+                "(선정 순위)": str(j + 1), "(기관_순매수)": f"{e*100:.0f}", "(외국인_순매수)": f"{e*80:.0f}",
+                "(프로그램_순매수)": f"{e*50:.0f}", "(체결강도)": "120", "(시장구분)": "KOSPI",
+                "(총 종목 수)": str(per_day), "(평균 거래대금)": "250", "(kospi, %)": "0.3", "(kosdaq, %)": "0.1",
+                "v_kospi": "18", "v_kosdaq": "20", "(거래량)": "100000", "(테마/섹터)": "반도체",
+                "(차트분석)": "거래량 폭증", "(매수 가격)": "10200",
+                "(매도 가격)": f"{10200*(1+0.01*e):.0f}", "(수익률, %)": f"{e:.2f}",
             })
     return pd.DataFrame(rows)
 
 
-def test_build_ml_dataset_matches_legacy_champion_columns() -> None:
-    raw = _raw_trade_log()
-    gx, _gt, gcat, gproc = build_ml_dataset(raw.copy(), None, feature_set="close_morning61", panel_mode="scenario_action")
-    lx, _lt, lcat, lproc = legacy_build(raw.copy(), None, feature_set="close_morning61", panel_mode="scenario_action")
-    assert sorted(gx.columns) == sorted(lx.columns)
-    assert sorted(gcat) == sorted(lcat)
-    np.testing.assert_allclose(
-        gproc.sort_index()["target_return"].to_numpy(), lproc.sort_index()["target_return"].to_numpy(), rtol=1e-9, atol=1e-12
+def test_purged_cv_matches_frozen_legacy_split_indices() -> None:
+    import json
+    from pathlib import Path
+
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
+
+    # Given: the split indices frozen from legacy before that tree was retired.
+    fixture = json.loads(
+        Path("tests/fixtures/legacy_parity.json").read_text(encoding="utf-8")
+    )
+    expected = fixture["purged_cv_splits"]
+    groups = pd.Series(np.repeat(pd.bdate_range("2024-01-01", periods=40), 5))
+    x = pd.DataFrame({"f": np.arange(len(groups))})
+
+    # When
+    got = list(PurgedGroupTimeSeriesSplit(n_splits=4, purge_gap=1).split(x, groups=groups))
+
+    # Then: fold count and every train/test index array match the frozen record.
+    assert len(got) == len(expected) == 4
+    for (train_idx, test_idx), exp in zip(got, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(train_idx), np.asarray(exp["train"]))
+        np.testing.assert_array_equal(np.asarray(test_idx), np.asarray(exp["test"]))
+
+
+def test_build_ml_dataset_matches_frozen_legacy_parity() -> None:
+    import json
+    from pathlib import Path
+
+    import numpy as np
+
+    from src.ml.dataset import build_ml_dataset
+
+    # Given: the column/categorical/target record frozen from legacy.
+    fixture = json.loads(
+        Path("tests/fixtures/legacy_parity.json").read_text(encoding="utf-8")
+    )
+    expected = fixture["build_ml_dataset"]
+
+    # When: the same seeded synthetic trade log the fixture was generated from.
+    gx, _gt, gcat, gproc = build_ml_dataset(
+        _raw_trade_log(), None, feature_set="close_morning61", panel_mode="scenario_action"
     )
 
-import pathlib
+    # Then: the three original parity assertions, at the original tolerance.
+    assert sorted(map(str, gx.columns)) == expected["columns_sorted"]
+    assert sorted(map(str, gcat)) == expected["cat_features_sorted"]
+    np.testing.assert_allclose(
+        gproc.sort_index()["target_return"].to_numpy(dtype=float),
+        np.asarray(expected["target_return"], dtype=float),
+        rtol=1e-9,
+        atol=1e-12,
+    )
 
 
-def test_src_ml_has_no_legacy_imports() -> None:
-    offenders = []
-    for path in pathlib.Path("src/ml").rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        if "import legacy" in text or "from legacy" in text:
-            offenders.append(str(path))
-    assert offenders == [], f"src/ml must not import legacy: {offenders}"
+def test_legacy_tree_is_absent_and_unimportable() -> None:
+    import importlib
+    import pathlib
+
+    import pytest
+
+    # Given / Then: the tree itself is gone.
+    assert not pathlib.Path("legacy").exists()
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("legacy")
+
+    # And: the guard now covers all of src/, not just src/ml.
+    offenders = [
+        str(path)
+        for path in pathlib.Path("src").rglob("*.py")
+        if "import legacy" in path.read_text(encoding="utf-8")
+        or "from legacy" in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == [], f"src must not import legacy: {offenders}"
