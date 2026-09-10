@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.api.kis_client import KisApiClient
+from src.api.kis.client import KisApiClient
 from src.sync.fetcher_investor import get_investor_trade_daily_async
 from src.sync.fetcher_program import get_program_history_async
 

@@ -14,7 +14,9 @@ import inspect
 import time
 from unittest.mock import AsyncMock, patch
 
-from src.api.kis_client import AsyncRateLimiter, KisApiClient, calculate_all_moving_averages
+from src.api.kis.client import KisApiClient
+from src.api.kis.indicators import calculate_all_moving_averages
+from src.api.kis.rate_limit import AsyncRateLimiter
 
 
 class _FakeSession:

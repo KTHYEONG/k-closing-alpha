@@ -88,7 +88,7 @@ async def _run_fetch_single_stock(client, **scenario_sets) -> tuple[dict, list[s
     sem = asyncio.Semaphore(2)
     stock = {"code": "005930", "name": "삼성전자", "price": "10000", "chgrate": "1.0"}
     with patch(
-        "src.api.kis_client.calculate_all_moving_averages",
+        "src.api.kis.indicators.calculate_all_moving_averages",
         new=AsyncMock(
             return_value=(
                 {5: 10000, 10: 10000, 20: 10000},

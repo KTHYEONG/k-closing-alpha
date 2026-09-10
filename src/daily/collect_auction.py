@@ -52,7 +52,7 @@ def run_auction_capture(
     owned_client = client
     session: Any = None
     if owned_client is None:
-        from src.api.kis_client import KisApiClient
+        from src.api.kis.client import KisApiClient
 
         owned_client = KisApiClient()
         session = owned_client.create_session()

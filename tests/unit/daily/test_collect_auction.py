@@ -142,7 +142,7 @@ def test_run_auction_capture_owns_client_when_none_provided(monkeypatch) -> None
         async def get_orderbook_snapshot(self, session, code, market_div_code=None):
             return {"rt_cd": "0", "output1": {"askp1": "70000"}}
 
-    import src.api.kis_client as kis_client_module
+    import src.api.kis.client as kis_client_module
 
     monkeypatch.setattr(kis_client_module, "KisApiClient", _FakeKisApiClient)
 
@@ -215,4 +215,31 @@ def test_collect_auction_main_invokes_run_auction_capture(monkeypatch) -> None:
         "start_hm": "1520",
         "end_hm": "1530",
     }
+
+
+def test_collect_auction_lazy_import_and_monkeypatch_retarget_together(monkeypatch) -> None:
+    """Reproduces the exact mechanism test_collect_auction.py:145-147 relies on:
+    monkeypatching KisApiClient on the module a lazy import will resolve against."""
+    import src.api.kis.client as kis_client_module
+
+    calls = {"constructed": 0}
+
+    class _FakeKisApiClient:
+        def __init__(self) -> None:
+            calls["constructed"] += 1
+
+    # Given: the monkeypatch targets the DIRECT module (post-rename), matching
+    # what src/daily/collect_auction.py's lazy import now resolves to.
+    monkeypatch.setattr(kis_client_module, "KisApiClient", _FakeKisApiClient)
+
+    # When: a fresh lazy import, exactly as collect_auction.py:55 performs it inside
+    # its function body, happens AFTER the monkeypatch is applied.
+    from src.api.kis.client import KisApiClient
+
+    owned_client = KisApiClient()
+
+    # Then: the fake, not the real client, was resolved and constructed --
+    # proving the paired lazy-import/monkeypatch rename works end-to-end.
+    assert isinstance(owned_client, _FakeKisApiClient)
+    assert calls["constructed"] == 1
 

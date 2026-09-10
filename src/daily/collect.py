@@ -11,7 +11,7 @@ import pandas as pd
 from src import settings
 
 # 커스텀 모듈 임포트
-from src.api.kis_client import KisApiClient
+from src.api.kis.client import KisApiClient
 from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
 from src.utils.display import Colors
 from src.daily import archive
@@ -421,7 +421,7 @@ async def main(force: bool = False):
 
         # V-KOSPI만 부착 (V-KOSDAQ 조회 제거)
         try:
-            from src.api.kis_client import fetch_index_and_calculate_volatility
+            from src.api.kis.indicators import fetch_index_and_calculate_volatility
 
             (vkospi_val, _vkospi_chg) = await fetch_index_and_calculate_volatility(
                 "1028", session=session
