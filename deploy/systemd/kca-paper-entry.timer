@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA paper entry (Mon-Fri 15:19 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 15:19:00 Asia/Seoul
+Persistent=false
+Unit=kca-paper-entry.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=KCA intraday archive (evening batch)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/kth/k-closing-alpha
+ExecStart=/usr/bin/env uv run python -m src.daily.archive_intraday

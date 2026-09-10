@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA daily audit (run once at boot, visualizes missing steps)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/kth/k-closing-alpha
+ExecStart=/usr/bin/env uv run python -m src.tools.daily_audit
+
+[Install]
+WantedBy=default.target
