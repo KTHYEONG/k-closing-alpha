@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # output joins back via impact_col, so no in-module call site exists).
 __all__ = [
     "KRX_TICK_BANDS",
+    "STATUTORY_BP_SCHEDULE",
     "STATUTORY_COST_BP",
     "CostBreakdown",
     "breakeven_cost_bp",
@@ -33,6 +34,7 @@ __all__ = [
     "krx_tick_size",
     "measure_auction_impact_bp",
     "spread_cost_bp",
+    "statutory_bp_asof",
     "summarize_cost_breakdown",
 ]
 
@@ -47,6 +49,18 @@ KRX_TICK_BANDS: tuple[tuple[float, float], ...] = (
 )
 
 TICK_REFORM_DATE: np.datetime64 = np.datetime64("2023-01-25")
+
+# 매도 일괄 과세(증권거래세 + 농어촌특별세 실효율) 일정으로 매도 구간에만 적용되며
+# KOSPI와 KOSDAQ 모두 동일한 실효율을 적용한다.
+STATUTORY_BP_SCHEDULE: tuple[tuple[str, float], ...] = (
+    ("1996-01-01", 30.0),
+    ("2019-06-03", 25.0),
+    ("2021-01-01", 23.0),
+    ("2023-01-01", 20.0),
+    ("2024-01-01", 18.0),
+    ("2025-01-01", 15.0),
+    ("2026-01-01", 20.0),
+)
 
 KRX_TICK_BANDS_PRE_REFORM_KOSPI: tuple[tuple[float, float], ...] = (
     (1000.0, 1.0),
@@ -133,6 +147,18 @@ def tick_cost_bp(price: np.ndarray, trade_date: np.ndarray, market: np.ndarray) 
     out = np.full(arr.shape, np.nan, dtype=np.float64)
     ok = np.isfinite(tick) & np.isfinite(arr) & (arr > 0.0)
     out[ok] = tick[ok] / arr[ok] * 10000.0
+    return out
+
+
+def statutory_bp_asof(trade_date: np.ndarray) -> np.ndarray:
+    """Map each trade date to its effective sell-side statutory bp."""
+    dates = np.asarray(trade_date, dtype="datetime64[ns]")
+    edges = np.array([np.datetime64(d) for d, _ in STATUTORY_BP_SCHEDULE], dtype="datetime64[ns]")
+    rates = np.array([r for _, r in STATUTORY_BP_SCHEDULE], dtype=np.float64)
+    idx = np.searchsorted(edges, dates, side="right") - 1
+    out = np.full(dates.shape, np.nan, dtype=np.float64)
+    valid = (~np.isnat(dates)) & (idx >= 0)
+    out[valid] = rates[idx[valid]]
     return out
 
 
@@ -258,7 +284,7 @@ def estimate_round_trip_cost_bp(
     *,
     price_col: str = "close_price",
     round_trip_ticks: float = 2.0,
-    statutory_bp: float = STATUTORY_COST_BP,
+    statutory_bp: float | None = None,
     impact_col: str | None = None,
     date_col: str | None = None,
     market_col: str | None = None,
@@ -300,7 +326,12 @@ def estimate_round_trip_cost_bp(
         spread = spread_cost_bp(prices, round_trip_ticks=float(round_trip_ticks))
     out["tick_krw"] = np.asarray(tick, dtype=np.float64)
     out["spread_bp"] = np.asarray(spread, dtype=np.float64)
-    out["statutory_bp"] = np.full(len(out), float(statutory_bp), dtype=np.float64)
+    if date_col is not None:
+        if statutory_bp is not None:
+            raise ValueError("statutory_bp must not be set when date_col is given; the PIT schedule owns the statutory leg")
+        out["statutory_bp"] = np.asarray(statutory_bp_asof(dates), dtype=np.float64)
+    else:
+        out["statutory_bp"] = np.full(len(out), float(STATUTORY_COST_BP if statutory_bp is None else statutory_bp), dtype=np.float64)
     if impact_col is None or impact_col not in out.columns:
         out["auction_impact_bp"] = np.full(len(out), np.nan, dtype=np.float64)
         impact_term = np.zeros(len(out), dtype=np.float64)

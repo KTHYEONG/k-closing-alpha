@@ -104,7 +104,7 @@ def test_scenario_archive_fetch_02(tmp_archive: Path) -> None:
     specified = archive.fetch_archive_snapshot("2026-08-03")
     assert specified["스냅샷_날짜"].tolist() == ["2026-08-03"]
     assert specified.columns.tolist() == archive.ARCHIVE_READ_COLUMN_ORDER
-    assert len(archive.ARCHIVE_COLUMN_ORDER) == 21
+    assert len(archive.ARCHIVE_COLUMN_ORDER) == 23
 
 
 def test_scenario_archive_export_03(tmp_archive: Path) -> None:
@@ -460,3 +460,40 @@ def test_upsert_archive_snapshot_logs_rerun_with_legacy_parquet_missing_timestam
     # Then: no crash, rerun detected with an unknown ("NaT") latest timestamp
     assert count == 1
     assert any("rerun detected" in rec.message and "NaT" in rec.message for rec in caplog.records)
+def test_archive_upsert_preserves_finalization_columns_round_trip(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src import settings
+    from src.daily import archive
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    monkeypatch.setattr(settings, "HISTORY_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(settings, "HISTORY_PARQUET_PATH", tmp_path / "archive.parquet", raising=False)
+    monkeypatch.setattr(archive.settings, "HISTORY_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(archive.settings, "HISTORY_PARQUET_PATH", tmp_path / "archive.parquet", raising=False)
+
+    df = pd.DataFrame(
+        {
+            "종목코드": ["005930"],
+            "종목명": ["삼성전자"],
+            "시장구분": ["KOSPI"],
+            "종가": [269000],
+            "전일종가": [269500],
+            "거래량": [28037611],
+            "등락률": [-0.19],
+            "admitted": [True],
+            DECISION_CLOSE_COL: [269250],
+            CLOSE_CONFIRMED_COL: [True],
+            "snapshot_timestamp": [pd.Timestamp("2026-09-10 15:20:18", tz="Asia/Seoul")],
+        }
+    )
+
+    stored = archive.upsert_archive_snapshot(df, snapshot_date="2026-09-10")
+    assert stored == 1
+
+    back = archive.fetch_archive_snapshot(snapshot_date="2026-09-10")
+    assert int(back.loc[0, DECISION_CLOSE_COL]) == 269250
+    assert bool(back.loc[0, CLOSE_CONFIRMED_COL]) is True
+    assert pd.Timestamp(back.loc[0, "snapshot_timestamp"]) == pd.Timestamp("2026-09-10 15:20:18", tz="Asia/Seoul")
+
+

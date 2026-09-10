@@ -43,12 +43,13 @@ def test_compute_net_return_propagates_nan_never_zero() -> None:
 
     # Given: one clean row, one NaN gross, one NaN tick
     picks = pd.DataFrame({
+        "date": pd.to_datetime(["2023-02-01"] * 3),
         "gross_return": [0.02, np.nan, 0.02],
         "tick_cost_bp": [10.0, 10.0, np.nan],
     })
 
     # When
-    net = compute_net_return(picks, round_trip_ticks=2.0, statutory_bp=20.0)
+    net = compute_net_return(picks, round_trip_ticks=2.0)
 
     # Then: row 0 = 0.02 - (20 + 2*10)/1e4 = 0.02 - 0.004 = 0.016
     assert np.isclose(net[0], 0.016)
@@ -508,3 +509,147 @@ def test_main_writes_parquet_report_and_rejects_missing_price_history(tmp_path, 
 
     with pytest.raises(ValueError, match="price_history not found"):
         mod.main(["--price-history", str(tmp_path / "nope.parquet"), "--out", str(tmp_path / "x.parquet")])
+
+
+def test_compute_net_return_uses_point_in_time_statutory() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.costaware_topk import compute_net_return
+
+    # Given: identical gross and tick cost in three tax regimes
+    picks = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2018-06-01", "2025-06-02", "2026-06-01"]),
+            "gross_return": [0.0100, 0.0100, 0.0100],
+            "tick_cost_bp": [5.0, 5.0, 5.0],
+        }
+    )
+
+    # When: netting a 2-tick round trip
+    net = compute_net_return(picks, round_trip_ticks=2.0)
+
+    # Then: only the statutory leg differs (30 / 15 / 20 bp)
+    np.testing.assert_allclose(
+        net, [0.01 - 40.0 / 1e4, 0.01 - 25.0 / 1e4, 0.01 - 30.0 / 1e4]
+    )
+    # And: a flat 20bp assumption would have overstated 2025 cost by 5bp
+    assert net[1] - (0.01 - 30.0 / 1e4) == pytest.approx(5.0 / 1e4)
+
+
+def test_compute_net_return_fails_closed_without_date_or_on_nat() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.costaware_topk import compute_net_return
+
+    # Given: a pick frame whose date is unparseable
+    picks = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-03-04", None]),
+            "gross_return": [0.01, 0.01],
+            "tick_cost_bp": [5.0, 5.0],
+        }
+    )
+
+    # When: netting
+    net = compute_net_return(picks, round_trip_ticks=2.0)
+
+    # Then: the unknown regime propagates NaN instead of borrowing a rate
+    assert net[0] == pytest.approx(0.01 - 28.0 / 1e4)
+    assert np.isnan(net[1])
+
+    # And: dropping the date column is refused outright
+    with pytest.raises(ValueError, match="date"):
+        compute_net_return(picks.drop(columns=["date"]), round_trip_ticks=2.0)
+
+
+def test_compute_cost_stress_varies_ticks_only_and_keeps_statutory_pit() -> None:
+    import inspect
+
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.costaware_topk import compute_cost_stress
+
+    # Given: 60 post-reform days in the 2024 tax regime (18bp), gross alternating
+    #        +/-1bp around 50bp so the daily series has non-zero variance
+    dates = pd.bdate_range("2024-03-01", periods=60)
+    jitter = [0.0001 if i % 2 == 0 else -0.0001 for i in range(60)]
+    picks = pd.DataFrame(
+        {
+            "date": list(dates),
+            "gross_return": [0.0050 + j for j in jitter],
+            "tick_cost_bp": [5.0] * 60,
+        }
+    )
+
+    # When: stressing the round-trip tick assumption
+    points = compute_cost_stress(picks, ticks_grid=(2.0, 4.0), regime="post_reform")
+
+    # Then: the flat statutory knob no longer exists on the signature
+    assert "statutory_bp" not in inspect.signature(compute_cost_stress).parameters
+    # And: net moves by exactly the extra ticks, on an 18bp statutory base
+    by_ticks = {p.round_trip_ticks: p for p in points}
+    assert by_ticks[2.0].mean_net_bp == pytest.approx(50.0 - 18.0 - 10.0, abs=1e-6)
+    assert by_ticks[4.0].mean_net_bp == pytest.approx(50.0 - 18.0 - 20.0, abs=1e-6)
+    assert by_ticks[2.0].n_days == 60
+    assert by_ticks[2.0].passes is True
+    assert np.isfinite(by_ticks[4.0].t_stat)
+
+
+def test_assert_screen_constructible_accepts_a_screen_that_works_in_both_regimes() -> None:
+    import pandas as pd
+
+    from src.ml.costaware_topk import assert_screen_constructible
+
+    # Given: 20 pre-reform and 20 post-reform days each carrying 4 candidates
+    pre = pd.bdate_range("2022-11-01", periods=20)
+    post = pd.bdate_range("2023-02-01", periods=20)
+    rows = [{"date": d, "symbol": f"{i:06d}"} for d in list(pre) + list(post) for i in range(4)]
+    cands = pd.DataFrame(rows)
+
+    # When: checking constructibility of a top-3 basket in both regimes
+    out = assert_screen_constructible(
+        cands, top_k=3, regimes=("pre_reform", "post_reform")
+    )
+
+    # Then: every day in both regimes can form the basket
+    assert out == {"pre_reform": 1.0, "post_reform": 1.0}
+
+
+def test_assert_screen_constructible_rejects_a_regime_below_the_day_floor() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.ml.costaware_topk import assert_screen_constructible
+
+    # Given: post-reform days always carry 4 candidates, pre-reform days only 1
+    #        (the measured shape of the absolute 7.5bp tick-cost cap)
+    pre = pd.bdate_range("2022-11-01", periods=20)
+    post = pd.bdate_range("2023-02-01", periods=20)
+    rows = [{"date": d, "symbol": "000001"} for d in pre]
+    rows += [{"date": d, "symbol": f"{i:06d}"} for d in post for i in range(4)]
+    cands = pd.DataFrame(rows)
+
+    # When / Then: applying it to the pre-reform regime is refused by name
+    with pytest.raises(ValueError, match="pre_reform"):
+        assert_screen_constructible(
+            cands, top_k=3, regimes=("pre_reform", "post_reform")
+        )
+
+    # And: the same screen is still legitimate post-reform only
+    assert assert_screen_constructible(cands, top_k=3, regimes=("post_reform",)) == {
+        "post_reform": 1.0
+    }
+
+    # And: bad arguments are refused rather than silently coerced
+    with pytest.raises(ValueError, match="k must be"):
+        assert_screen_constructible(cands, top_k=0)
+    with pytest.raises(ValueError, match="regime must be one of"):
+        assert_screen_constructible(cands, top_k=3, regimes=("nope",))
+    with pytest.raises(ValueError, match="date_col"):
+        assert_screen_constructible(cands.drop(columns=["date"]), top_k=3)

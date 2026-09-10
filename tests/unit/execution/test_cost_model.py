@@ -360,3 +360,126 @@ def test_estimate_round_trip_cost_bp_rejects_unpaired_or_missing_pit_columns() -
         estimate_round_trip_cost_bp(df, date_col="missing_date")
 
 
+
+
+def test_statutory_bp_asof_maps_every_schedule_boundary() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.execution.cost_model import STATUTORY_BP_SCHEDULE, statutory_bp_asof
+
+    # Given: the KRX sell-side statutory schedule (거래세 + 농특세 실효율)
+    edges = [pd.Timestamp(d) for d, _ in STATUTORY_BP_SCHEDULE]
+    assert edges == sorted(edges)
+    assert len(set(edges)) == len(edges)
+
+    # When: probing each boundary and the trading day before it
+    dates = pd.to_datetime(
+        [
+            "2018-06-01",
+            "2019-06-02",
+            "2019-06-03",
+            "2020-12-31",
+            "2021-01-01",
+            "2022-12-30",
+            "2023-01-02",
+            "2023-12-28",
+            "2024-01-02",
+            "2024-12-30",
+            "2025-01-02",
+            "2025-12-30",
+            "2026-01-02",
+        ]
+    ).to_numpy()
+    out = statutory_bp_asof(dates)
+
+    # Then: the rate steps exactly on each effective date
+    np.testing.assert_allclose(
+        out,
+        [30.0, 30.0, 25.0, 25.0, 23.0, 23.0, 20.0, 20.0, 18.0, 18.0, 15.0, 15.0, 20.0],
+    )
+
+
+def test_statutory_bp_asof_propagates_nan_for_nat_and_prehistory() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.execution.cost_model import statutory_bp_asof
+
+    # Given: a NaT, a pre-schedule date and one valid date
+    dates = pd.to_datetime([None, "1990-01-01", "2024-03-04"]).to_numpy()
+
+    # When: resolving the point-in-time statutory rate
+    out = statutory_bp_asof(dates)
+
+    # Then: unknown regimes fail closed to NaN, never to a default rate
+    assert np.isnan(out[0])
+    assert np.isnan(out[1])
+    assert out[2] == 18.0
+
+
+def test_estimate_round_trip_cost_bp_uses_pit_statutory_when_date_given() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.execution.cost_model import STATUTORY_COST_BP, estimate_round_trip_cost_bp
+
+    # Given: the same 20,000원 KOSDAQ close in three different tax regimes
+    df = pd.DataFrame(
+        {
+            "close_price": [20000.0, 20000.0, 20000.0],
+            "trade_date": pd.to_datetime(["2018-06-01", "2025-06-02", "2026-06-01"]),
+            "market_type": ["KOSDAQ", "KOSDAQ", "KOSDAQ"],
+        }
+    )
+
+    # When: costing point-in-time
+    out = estimate_round_trip_cost_bp(df, date_col="trade_date", market_col="market_type")
+
+    # Then: the statutory leg steps with the schedule, not with a constant
+    np.testing.assert_allclose(out["statutory_bp"].to_numpy(), [30.0, 15.0, 20.0])
+    # And: the totals differ purely by the statutory delta on an identical spread
+    spread = out["spread_bp"].to_numpy()
+    np.testing.assert_allclose(spread, spread[0])
+    np.testing.assert_allclose(
+        out["round_trip_cost_bp"].to_numpy(), np.array([30.0, 15.0, 20.0]) + spread
+    )
+
+    # When: no date column is supplied
+    legacy = estimate_round_trip_cost_bp(df[["close_price"]])
+
+    # Then: the flat fallback is unchanged
+    np.testing.assert_allclose(
+        legacy["statutory_bp"].to_numpy(), np.full(3, float(STATUTORY_COST_BP))
+    )
+
+
+def test_estimate_round_trip_cost_bp_rejects_flat_statutory_with_date_col() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.execution.cost_model import estimate_round_trip_cost_bp
+
+    # Given: a PIT-costed frame carrying one unparseable date
+    df = pd.DataFrame(
+        {
+            "close_price": [20000.0, 20000.0],
+            "trade_date": pd.to_datetime(["2024-03-04", None]),
+            "market_type": ["KOSDAQ", "KOSDAQ"],
+        }
+    )
+
+    # When / Then: a flat statutory knob alongside date_col is refused outright
+    with pytest.raises(ValueError, match="statutory_bp"):
+        estimate_round_trip_cost_bp(
+            df, statutory_bp=20.0, date_col="trade_date", market_col="market_type"
+        )
+
+    # When: costing the frame point-in-time
+    out = estimate_round_trip_cost_bp(df, date_col="trade_date", market_col="market_type")
+
+    # Then: the NaT row fails closed to NaN rather than borrowing a default rate
+    assert out["statutory_bp"].to_numpy()[0] == 18.0
+    assert np.isnan(out["statutory_bp"].to_numpy()[1])
+    assert np.isnan(out["round_trip_cost_bp"].to_numpy()[1])
