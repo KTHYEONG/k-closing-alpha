@@ -101,6 +101,7 @@ def test_archive_column_order_is_minimal_and_carries_admitted() -> None:
         "스냅샷_날짜", "종목코드", "종목명", "시장구분", "시가", "고가", "저가", "종가",
         "전일종가", "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수",
         "등락률", "kospi", "kosdaq", "v_kospi", "admitted", "수급_실패", "지수_실패",
+        "결정_종가", "종가_확정",
     ]
 
     # Then: champion-era and flat level-1 orderbook columns are gone (the full
@@ -119,3 +120,21 @@ def test_standard_column_order_is_removed_from_schema() -> None:
 
     # Then: the spreadsheet copy-paste column order no longer exists
     assert not hasattr(schema, "STANDARD_COLUMN_ORDER")
+def test_archive_column_order_registers_finalization_columns_at_tail() -> None:
+    from src.processing.schema import (
+        ARCHIVE_COLUMN_ORDER,
+        CLOSE_CONFIRMED_COL,
+        DECISION_CLOSE_COL,
+        RAW_TO_STANDARD_MAP,
+        STANDARD_TO_KOREAN_MAP,
+    )
+
+    assert ARCHIVE_COLUMN_ORDER[-2:] == [DECISION_CLOSE_COL, CLOSE_CONFIRMED_COL]
+    assert ARCHIVE_COLUMN_ORDER.index("종가") < ARCHIVE_COLUMN_ORDER.index(DECISION_CLOSE_COL)
+    assert ARCHIVE_COLUMN_ORDER.count(DECISION_CLOSE_COL) == 1
+    assert RAW_TO_STANDARD_MAP[DECISION_CLOSE_COL] == "decision_close_price"
+    assert RAW_TO_STANDARD_MAP[CLOSE_CONFIRMED_COL] == "close_confirmed"
+    assert STANDARD_TO_KOREAN_MAP["decision_close_price"] == DECISION_CLOSE_COL
+    assert STANDARD_TO_KOREAN_MAP["close_confirmed"] == CLOSE_CONFIRMED_COL
+
+

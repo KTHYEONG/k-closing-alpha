@@ -25,6 +25,7 @@ from src.ml.costaware_topk import (
     MIN_TOP_K,
     CostStressPoint,
     RegimeMetrics,
+    assert_screen_constructible,
     compute_cost_stress,
     compute_net_return,
     compute_regime_metrics,
@@ -44,6 +45,7 @@ from src.ml.research.v3_metrics import calculate_series_metrics
 from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict
 from src.strategy.contract import (
     DEFAULT_UNIVERSE,
+    KCA_TOPK_CAPFREE_001,
     KCA_TOPK_COSTAWARE_001,
     MIN_PATH_WIN_RATE,
     CostSpec,
@@ -61,6 +63,8 @@ RANKER_MODEL_PARAMS: dict[str, Any] = {"n_estimators": 60, "learning_rate": 0.03
 LABEL_CLIP: float = 0.10
 CERT_REGIME_START: pd.Timestamp = pd.Timestamp(TICK_REFORM_DATE)
 MIN_SCORED_FOLD_FRACTION: float = 0.90
+# 개편전 반증 판정에 필요한 최소 신호일 수 (약 1년).
+MIN_FALSIFICATION_DAYS: int = 250
 TOPK_RANKER_BUNDLE_DIR: str = "artifacts/models/topk_ranker"
 
 
@@ -121,6 +125,9 @@ class TopKRankerReport:
     verdict_reasons: list[str]
     train_start: str = ""
     certification_regime_start: str = ""
+    falsification_status: str = ""
+    falsification_reasons: list[str] = dataclasses.field(default_factory=list)
+    screen_day_fractions: dict[str, float] = dataclasses.field(default_factory=dict)
 
 
 def assert_nested_universe_specs(train_spec: UniverseSpec, select_spec: UniverseSpec) -> None:
@@ -128,7 +135,7 @@ def assert_nested_universe_specs(train_spec: UniverseSpec, select_spec: Universe
 
     Args:
         train_spec: Wide training screen; its max_tick_cost_bp must be None.
-        select_spec: Cost-capped selection screen; its max_tick_cost_bp must be finite.
+        select_spec: Selection screen; its max_tick_cost_bp is None (cap-free) or finite.
 
     Returns:
         None when the pair is nested.
@@ -141,8 +148,8 @@ def assert_nested_universe_specs(train_spec: UniverseSpec, select_spec: Universe
     if train_d.get("max_tick_cost_bp") is not None:
         raise ValueError(f"train_spec.max_tick_cost_bp must be None, got {train_d.get('max_tick_cost_bp')!r}")
     sel_cap = select_d.get("max_tick_cost_bp")
-    if sel_cap is None or not math.isfinite(float(sel_cap)):
-        raise ValueError(f"select_spec.max_tick_cost_bp must be a finite float, got {sel_cap!r}")
+    if sel_cap is not None and not math.isfinite(float(sel_cap)):
+        raise ValueError(f"select_spec.max_tick_cost_bp must be None or a finite float, got {sel_cap!r}")
     differing = [k for k in train_d if k != "max_tick_cost_bp" and train_d[k] != select_d[k]]
     if differing:
         raise ValueError(f"universe specs are not nested; differing fields: {differing}")
@@ -188,7 +195,7 @@ def attach_pit_net_label(
 
     Args:
         cands: Candidate pool with gross_return and PIT tick_cost_bp columns.
-        cost: Cost specification carrying round-trip ticks and statutory bp.
+        cost: Cost specification carrying the round-trip tick multiplier.
         label_clip: Symmetric clip bound for the training label.
 
     Returns:
@@ -201,12 +208,13 @@ def attach_pit_net_label(
         raise ValueError("cands missing tick_cost_bp column for PIT net label")
     if "gross_return" not in cands.columns:
         raise ValueError("cands missing gross_return column for PIT net label")
+    if "date" not in cands.columns:
+        raise ValueError("cands missing date column for PIT statutory cost")
     # PIT 틱 비용으로 순수익 계산, 결측은 NaN 전파
     out = cands.copy()
     net = compute_net_return(
         out,
         round_trip_ticks=float(cost.round_trip_ticks),
-        statutory_bp=float(cost.statutory_bp),
     )
     out["net_pit"] = np.asarray(net, dtype=np.float64)
     clip = float(label_clip)
@@ -506,7 +514,7 @@ def compute_arm_metrics(
     regimes = compute_regime_metrics(daily_net, feasibility_full)
     by_year = compute_yearly_stability(daily_net)
     cost_stress = compute_cost_stress(
-        picks, statutory_bp=float(cost.statutory_bp), regime="post_reform"
+        picks, regime="post_reform"
     )
     return ArmMetrics(
         arm=arm, top_k=int(top_k), regimes=regimes, by_year=by_year, cost_stress=cost_stress
@@ -606,8 +614,30 @@ def compute_path_evidence(
     )
 
 
+def evaluate_falsification(
+    arm: ArmMetrics, *, min_t_stat: float = MIN_POST_REFORM_T_STAT, min_days: int = MIN_FALSIFICATION_DAYS
+) -> tuple[str, list[str]]:
+    """Stress the cost model out-of-regime: pre-reform must not certify profit.
+
+    Args:
+        arm: Model-free full-history control arm metrics.
+        min_t_stat: Significance threshold mirrored from the post-reform gate.
+        min_days: Minimum pre-reform signal days for a judgement.
+
+    Returns:
+        Falsification status and the human-readable reasons.
+    """
+    # 개편전은 인증 표본이 아니라 역외 경제성 반증 시험이다.
+    pre = arm.regimes["pre_reform"]
+    if int(pre.n_days_with_signal) < int(min_days):
+        return ("INSUFFICIENT_PRE_REFORM_SAMPLE", [f"pre_reform n_days_with_signal={pre.n_days_with_signal} below min_days={min_days}; falsification not evaluated"])
+    if pre.mean_net_bp > 0.0 and pre.t_stat >= float(min_t_stat):
+        return ("REFUTED", [f"pre_reform net is significantly positive under PIT cost: mean_net_bp={pre.mean_net_bp} t_stat={pre.t_stat}; a 46bp-cost regime cannot be profitable, so the cost model or the label is wrong"])
+    return ("CONSISTENT", [])
+
+
 def evaluate_ranker_verdict(
-    ranker: ArmMetrics, control: ArmMetrics, evidence: PathEvidence
+    ranker: ArmMetrics, control: ArmMetrics, evidence: PathEvidence, *, falsification_status: str = "CONSISTENT"
 ) -> tuple[str, list[str]]:
     """Decide the post-reform certification verdict for the ranker arm.
 
@@ -615,11 +645,15 @@ def evaluate_ranker_verdict(
         ranker: Ranker arm metrics.
         control: Model-free cost-sort control metrics at the same top_k.
         evidence: Per-fold CPCV paired evidence.
+        falsification_status: Out-of-regime falsification tier outcome.
 
     Returns:
         Verdict string and the human-readable reasons.
     """
     reasons: list[str] = []
+    if falsification_status == "REFUTED":
+        reasons.append("falsification tier REFUTED: the selection rule certifies positive net return in the pre-reform cost regime")
+        return ("REFUTED", reasons)
     post = ranker.regimes["post_reform"]
     # 커버리지 미달은 통계 판단 이전에 차단
     if post.coverage_status != "OK":
@@ -678,7 +712,7 @@ def run_topk_ranker_backtest(
         huber_delta: Huber alpha for the ranker.
         min_train_rows: Fail-closed floor on finite-target rows.
         train_start: Training-window start; augments training only and never
-            moves the certification boundary. None selects CERT_REGIME_START.
+            moves the certification boundary. None selects the panel minimum date.
 
     Returns:
         Assembled ranker-vs-control report with regime verdict.
@@ -689,11 +723,14 @@ def run_topk_ranker_backtest(
     if int(spec.top_k) < MIN_TOP_K:
         raise ValueError(f"top_k {spec.top_k} below the minimum investable K {MIN_TOP_K}")
     k = int(spec.top_k)
-    eff_train_start = CERT_REGIME_START if train_start is None else pd.Timestamp(train_start)
+    # 기본 학습 시작은 패널 최소일. 비용이 PIT라 개편전도 올바르게 라벨링되며, 인증 경계는 split_regime_frames가 별도로 고정한다.
+    eff_train_start = pd.Timestamp(pd.to_datetime(ph["date"]).min()) if train_start is None else pd.Timestamp(train_start)
     # 이중 풀 → PIT 라벨 → 인증구간 비닝+히스토리 증강 스코어 → 선택 마스크 제한 → 양 팔 평가
     pool, sel_mask = build_dual_pool(
         ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe
     )
+    constructible_regimes = ("pre_reform", "post_reform") if spec.universe.max_tick_cost_bp is None else ("post_reform",)
+    screen_day_fractions = assert_screen_constructible(pool.loc[sel_mask], top_k=k, regimes=constructible_regimes)
     labeled = attach_pit_net_label(pool, cost=spec.cost)
     cert_df, hist_df = split_regime_frames(labeled, train_start=eff_train_start)
     oof = cpcv_score_with_history(
@@ -720,7 +757,12 @@ def run_topk_ranker_backtest(
     control_arm = compute_arm_metrics(
         control_picks, feasibility_full, arm="costsort", top_k=k, cost=spec.cost
     )
-    verdict, verdict_reasons = evaluate_ranker_verdict(ranker_arm, control_arm, evidence)
+    full_sel = labeled[sel_mask]
+    control_full_arm = compute_arm_metrics(
+        select_topk_by_tick_cost(full_sel, k), feasibility_full, arm="costsort_full", top_k=k, cost=spec.cost
+    )
+    falsification_status, falsification_reasons = evaluate_falsification(control_full_arm)
+    verdict, verdict_reasons = evaluate_ranker_verdict(ranker_arm, control_arm, evidence, falsification_status=falsification_status)
     dates_all = pd.to_datetime(ph["date"])
     date_min = str(dates_all.min().date()) if len(dates_all) else ""
     date_max = str(dates_all.max().date()) if len(dates_all) else ""
@@ -741,6 +783,9 @@ def run_topk_ranker_backtest(
         verdict_reasons=list(verdict_reasons),
         train_start=str(eff_train_start.date()),
         certification_regime_start=str(CERT_REGIME_START.date()),
+        falsification_status=falsification_status,
+        falsification_reasons=list(falsification_reasons),
+        screen_day_fractions=dict(screen_day_fractions),
     )
 
 
@@ -782,7 +827,21 @@ def topk_ranker_report_to_frame(report: TopKRankerReport) -> pd.DataFrame:
     ev["strategy_id"] = report.strategy_id
     ev["top_k"] = report.top_k
     ev["verdict"] = report.verdict
+    ev["falsification_status"] = report.falsification_status
+    ev["falsification_reasons"] = "; ".join(report.falsification_reasons)
     rows.append(ev)
+    for regime, fraction in sorted(report.screen_day_fractions.items()):
+        rows.append(
+            {
+                "row_type": "screen_constructibility",
+                "arm": "select",
+                "regime": regime,
+                "constructible_day_fraction": float(fraction),
+                "strategy_id": report.strategy_id,
+                "top_k": report.top_k,
+                "verdict": report.verdict,
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -806,7 +865,7 @@ def train_production_bundle(
         d_to_idx: Date-to-index lookup for forward exits.
         spec: Strategy specification carrying top_k, select universe and cost.
         train_spec: Wide training screen without the cost cap.
-        train_start: Training-window start; None selects CERT_REGIME_START.
+        train_start: Training-window start; None selects the panel minimum date.
         model_params: LightGBM params forwarded to build_inline_bundle.
         huber_delta: Huber alpha for the return model.
         min_train_rows: Fail-closed floor on finite-label rows.
@@ -819,7 +878,7 @@ def train_production_bundle(
     """
     if int(spec.top_k) < MIN_TOP_K:
         raise ValueError(f"top_k {spec.top_k} below the minimum investable K {MIN_TOP_K}")
-    eff_train_start = CERT_REGIME_START if train_start is None else pd.Timestamp(train_start)
+    eff_train_start = pd.Timestamp(pd.to_datetime(ph["date"]).min()) if train_start is None else pd.Timestamp(train_start)
     # 인증구간 와이드 풀 조립 후 PIT 라벨 부착
     pool, _sel_mask = build_dual_pool(
         ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe
@@ -939,20 +998,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--price-history", default=str(settings.PRICE_HISTORY_PARQUET_PATH))
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--out", default="artifacts/research/topk_ranker_report.parquet")
-    parser.add_argument("--train-start", default=None, help="training-window start YYYY-MM-DD; augments training only and never moves the certification boundary (default: the certification regime start)")
+    parser.add_argument("--train-start", default=None, help="training-window start YYYY-MM-DD; augments training only and never moves the certification boundary (default: the panel minimum date)")
+    parser.add_argument("--capfree", action="store_true", help="select with the cap-free universe (KCA-TOPK-CAPFREE-001) instead of the tick-cost-capped one")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
-    if args.top_k is not None:
-        spec = _dataclasses.replace(KCA_TOPK_COSTAWARE_001, top_k=int(args.top_k))
-    else:
-        spec = KCA_TOPK_COSTAWARE_001
+    base_spec = KCA_TOPK_CAPFREE_001 if args.capfree else KCA_TOPK_COSTAWARE_001
+    spec = _dataclasses.replace(base_spec, top_k=int(args.top_k)) if args.top_k is not None else base_spec
     if not os.path.exists(args.price_history):
         raise ValueError(f"price_history not found: {args.price_history}")
     ph, market_dates, d_to_idx = load_and_prepare_price_history(args.price_history)
     train_start = pd.Timestamp(args.train_start) if args.train_start else None
     report = run_topk_ranker_backtest(ph, market_dates, d_to_idx, spec=spec, train_start=train_start)
     atomic_write_parquet(topk_ranker_report_to_frame(report), Path(args.out))
-    logger.info("[EVAL] stage=topk_ranker verdict=%s reasons=%s", report.verdict, report.verdict_reasons)
+    logger.info("[EVAL] stage=topk_ranker verdict=%s falsification=%s reasons=%s", report.verdict, report.falsification_status, report.verdict_reasons)
 
 
 if __name__ == "__main__":  # pragma: no cover

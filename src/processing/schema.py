@@ -25,6 +25,12 @@ class StandardColumns:
     WIN_CLASSIFICATION = "Win"
 
 
+# 결정시점(15:20~15:30 동결) 가격 보존 컬럼 (라이브 판정이 실제 사용한 값)
+DECISION_CLOSE_COL: str = "결정_종가"
+# 종가단일가 확정 이후 값 여부 (fail-closed 플래그; 미확정은 EOD 진실이 아님)
+CLOSE_CONFIRMED_COL: str = "종가_확정"
+
+
 # 스프레드시트 원본(괄호/한글 폼) -> 표준 영문 컬럼명 매핑
 RAW_TO_STANDARD_MAP: dict[str, str] = {
     "매수날짜": StandardColumns.TRADE_DATE,
@@ -90,6 +96,8 @@ RAW_TO_STANDARD_MAP: dict[str, str] = {
     "(ema5)": "ema5",
     "(ema10)": "ema10",
     "(ema20)": "ema20",
+    DECISION_CLOSE_COL: "decision_close_price",
+    CLOSE_CONFIRMED_COL: "close_confirmed",
 }
 
 
@@ -166,6 +174,8 @@ STANDARD_TO_KOREAN_MAP: dict[str, str] = {
     "sell_price": "매도가격",
     StandardColumns.NET_RETURN: "수익률",
     StandardColumns.WIN_CLASSIFICATION: "Win",
+    "decision_close_price": DECISION_CLOSE_COL,
+    "close_confirmed": CLOSE_CONFIRMED_COL,
 }
 
 
@@ -192,6 +202,8 @@ ARCHIVE_COLUMN_ORDER: list[str] = [
     "admitted",
     "수급_실패",
     "지수_실패",
+    DECISION_CLOSE_COL,
+    CLOSE_CONFIRMED_COL,
 ]
 
 

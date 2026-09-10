@@ -8,33 +8,33 @@ def test_cost_spec_rejects_zero_tick_round_trip() -> None:
     from src.strategy.contract import CostSpec, ExecutionMode
 
     with pytest.raises(ValueError, match="round_trip_ticks"):
-        CostSpec(mode=ExecutionMode.AA, statutory_bp=20.0, round_trip_ticks=0.0)
+        CostSpec(mode=ExecutionMode.AA, round_trip_ticks=0.0)
 
     with pytest.raises(ValueError, match="round_trip_ticks"):
-        CostSpec(mode=ExecutionMode.AA, statutory_bp=20.0, round_trip_ticks=1.0)
+        CostSpec(mode=ExecutionMode.AA, round_trip_ticks=1.0)
 
     with pytest.raises(ValueError, match="round_trip_ticks"):
-        CostSpec(mode=ExecutionMode.PA, statutory_bp=20.0, round_trip_ticks=0.0)
-
-    with pytest.raises(ValueError, match="statutory_bp"):
-        CostSpec(mode=ExecutionMode.AA, statutory_bp=-1.0, round_trip_ticks=2.0)
+        CostSpec(mode=ExecutionMode.PA, round_trip_ticks=0.0)
 
     # PA legitimately crosses only the exit leg
-    pa = CostSpec(mode=ExecutionMode.PA, statutory_bp=20.0, round_trip_ticks=1.0)
+    pa = CostSpec(mode=ExecutionMode.PA, round_trip_ticks=1.0)
     assert pa.round_trip_ticks == 1.0
 
 
 def test_round_trip_cost_bp_reproduces_measured_u0_level() -> None:
     # Given
     import numpy as np
+    import pandas as pd
 
     from src.strategy.contract import AA_COST, PA_COST, round_trip_cost_bp
 
     price = np.array([10000.0, 1500.0, 30000.0], dtype=np.float64)
+    trade_date = pd.to_datetime(["2026-06-01"] * 3).to_numpy()
+    market = np.array(["KOSPI"] * 3, dtype=object)
 
     # When
-    aa = round_trip_cost_bp(price, AA_COST)
-    pa = round_trip_cost_bp(price, PA_COST)
+    aa = round_trip_cost_bp(price, trade_date, market, AA_COST)
+    pa = round_trip_cost_bp(price, trade_date, market, PA_COST)
 
     # Then: tick ladder is 10 / 1 / 50 for these prices
     np.testing.assert_allclose(aa, [20.0 + 20.0, 20.0 + 2.0 * 1.0 / 1500.0 * 1e4, 20.0 + 2.0 * 50.0 / 30000.0 * 1e4])
@@ -45,13 +45,16 @@ def test_round_trip_cost_bp_reproduces_measured_u0_level() -> None:
 def test_round_trip_cost_bp_propagates_nan_for_invalid_price() -> None:
     # Given
     import numpy as np
+    import pandas as pd
 
     from src.strategy.contract import AA_COST, round_trip_cost_bp
 
     price = np.array([0.0, -100.0, np.nan, np.inf, 10000.0], dtype=np.float64)
+    trade_date = pd.to_datetime(["2026-06-01"] * 5).to_numpy()
+    market = np.array(["KOSPI"] * 5, dtype=object)
 
     # When
-    cost = round_trip_cost_bp(price, AA_COST)
+    cost = round_trip_cost_bp(price, trade_date, market, AA_COST)
 
     # Then
     assert np.isnan(cost[:4]).all()
@@ -466,3 +469,82 @@ def test_shared_domain_constants_have_one_definition() -> None:
 
     # And: a different quantity that happens to share a number is NOT merged.
     assert history_features._REALIZED_VOL_FLOOR != contract.LABEL_BAD_THRESHOLD
+
+
+def test_round_trip_cost_bp_is_point_in_time_across_the_reform() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.strategy.contract import AA_COST, round_trip_cost_bp
+
+    # Given: 15,000원 either side of the 2023-01-25 tick reform, plus bad inputs
+    price = np.array([15000.0, 15000.0, 0.0, 15000.0], dtype=np.float64)
+    trade_date = pd.to_datetime(
+        ["2018-06-01", "2026-06-01", "2026-06-01", None]
+    ).to_numpy()
+    market = np.array(["KOSPI", "KOSPI", "KOSPI", "KOSPI"], dtype=object)
+
+    # When: costing the round trip at the AA execution mode (2 ticks)
+    out = round_trip_cost_bp(price, trade_date, market, AA_COST)
+
+    # Then: pre-reform is 30bp statutory + 2 ticks of 50원 on 15,000원
+    assert out[0] == pytest.approx(30.0 + 2.0 * 50.0 / 15000.0 * 1e4)
+    # And: post-reform is 20bp statutory + 2 ticks of 10원
+    assert out[1] == pytest.approx(20.0 + 2.0 * 10.0 / 15000.0 * 1e4)
+    # And: a zero price and a NaT date fail closed to NaN, never to a default cost
+    assert np.isnan(out[2])
+    assert np.isnan(out[3])
+
+
+def test_cost_spec_drops_statutory_and_capfree_specs_are_declared() -> None:
+    import dataclasses
+
+    import pytest
+
+    from src.strategy.contract import (
+        AA_COST,
+        CAPFREE_UNIVERSE,
+        COST_AWARE_UNIVERSE,
+        KCA_TOPK_CAPFREE_001,
+        KCA_TOPK_COSTAWARE_001,
+        MAX_TICK_COST_BP,
+        CostSpec,
+        ExecutionMode,
+    )
+
+    # Given: the statutory leg is a date function, so it cannot be a spec constant
+    field_names = {f.name for f in dataclasses.fields(CostSpec)}
+    assert field_names == {"mode", "round_trip_ticks"}
+    with pytest.raises(TypeError):
+        CostSpec(mode=ExecutionMode.AA, statutory_bp=20.0, round_trip_ticks=2.0)
+
+    # And: the round-trip tick floor guard is untouched
+    with pytest.raises(ValueError, match="below floor"):
+        CostSpec(mode=ExecutionMode.AA, round_trip_ticks=1.0)
+    assert AA_COST.round_trip_ticks == 2.0
+
+    # When: reading the two selection arms
+    # Then: the cap-free arm is cap-free and the capped arm is untouched
+    assert CAPFREE_UNIVERSE.max_tick_cost_bp is None
+    assert COST_AWARE_UNIVERSE.max_tick_cost_bp == MAX_TICK_COST_BP
+    assert KCA_TOPK_CAPFREE_001.universe is CAPFREE_UNIVERSE
+    assert KCA_TOPK_CAPFREE_001.top_k == KCA_TOPK_COSTAWARE_001.top_k == 3
+    assert KCA_TOPK_CAPFREE_001.strategy_id != KCA_TOPK_COSTAWARE_001.strategy_id
+    # And: the two specs differ only in the cap, so they stay directly comparable
+    capped = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    free = dataclasses.asdict(CAPFREE_UNIVERSE)
+    assert [k for k in capped if capped[k] != free[k]] == ["max_tick_cost_bp"]
+
+
+def test_contract_does_not_reexport_non_pit_cost_helpers() -> None:
+    from src.strategy import contract
+
+    # Given: a cost helper without a date argument silently assumes one regime
+    # Then: the strategy contract must not re-export any such helper
+    assert "spread_cost_bp" not in contract.__all__
+    assert not hasattr(contract, "spread_cost_bp")
+    assert not hasattr(contract, "krx_tick_size")
+    # And: the date-aware producers stay available to the screens
+    assert "tick_cost_bp" in contract.__all__
+    assert "statutory_bp_asof" in contract.__all__

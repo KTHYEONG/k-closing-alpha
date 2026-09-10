@@ -17,6 +17,7 @@ from src.utils.display import Colors
 from src.daily import archive
 from src.daily.universe_scan import fetch_candidate_stock_list
 from src.execution.cost_model import tick_cost_bp
+from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
 from src.strategy.contract import COST_AWARE_UNIVERSE, UniverseSpec, derive_chg_ratio, mark_ceiling, select_universe
 
 logger = logging.getLogger(__name__)
@@ -273,6 +274,8 @@ async def fetch_single_stock(
             "외국인_순매수": frgn_net_eok,
             "등락률": rate,
             "수급_실패": supply_failed,
+            DECISION_CLOSE_COL: close_price,
+            CLOSE_CONFIRMED_COL: False,
         }, failed_apis, orderbook_rows
 
 

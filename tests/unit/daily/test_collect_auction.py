@@ -214,6 +214,7 @@ def test_collect_auction_main_invokes_run_auction_capture(monkeypatch) -> None:
         "interval_seconds": 5,
         "start_hm": "1520",
         "end_hm": "1530",
+        "finalize": True,
     }
 
 
@@ -242,4 +243,63 @@ def test_collect_auction_lazy_import_and_monkeypatch_retarget_together(monkeypat
     # proving the paired lazy-import/monkeypatch rename works end-to-end.
     assert isinstance(owned_client, _FakeKisApiClient)
     assert calls["constructed"] == 1
+
+def test_run_auction_capture_triggers_close_finalization_after_window(monkeypatch) -> None:
+    from datetime import datetime
+
+    import pandas as pd
+
+    from src.daily import collect_auction, finalize_close
+
+    monkeypatch.setattr(
+        collect_auction.archive,
+        "fetch_archive_snapshot",
+        lambda *a, **kw: pd.DataFrame({"종목코드": ["005930"]}),
+    )
+    monkeypatch.setattr(collect_auction, "append_orderbook_snapshots", lambda rows, snapshot_date: len(rows))
+
+    calls: list[dict] = []
+
+    async def _fake_finalize(snapshot_date=None, **kwargs):
+        calls.append({"snapshot_date": snapshot_date, **kwargs})
+        return 1
+
+    monkeypatch.setattr(finalize_close, "run_close_finalization", _fake_finalize)
+
+    class _Client:
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            return {"rt_cd": "0", "output1": {"askp1": "70000"}, "output2": {"antc_cnpr": "69950"}}
+
+    client = _Client()
+
+    def _clock_factory():
+        ticks = iter(
+            [
+                datetime(2026, 9, 10, 15, 29, 50),
+                datetime(2026, 9, 10, 15, 29, 50),
+                datetime(2026, 9, 10, 15, 30, 1),
+            ]
+        )
+        return lambda: next(ticks)
+
+    # Given/When: finalize=True -> 스윕 종료 후 확정 패스 1회 호출
+    collect_auction.run_auction_capture(
+        snapshot_date="2026-09-10",
+        interval_seconds=0,
+        client=client,
+        now_fn=_clock_factory(),
+        finalize=True,
+    )
+    assert len(calls) == 1
+    assert calls[0]["snapshot_date"] == "2026-09-10"
+
+    # Then: 기본값(finalize 미지정)은 부작용 없음
+    collect_auction.run_auction_capture(
+        snapshot_date="2026-09-10",
+        interval_seconds=0,
+        client=client,
+        now_fn=_clock_factory(),
+    )
+    assert len(calls) == 1
+
 
