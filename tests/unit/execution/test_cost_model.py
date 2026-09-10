@@ -84,7 +84,7 @@ def test_estimate_round_trip_cost_bp_composes_and_is_idempotent() -> None:
     import pandas as pd
     import pytest
 
-    from src.execution.cost_model import STATUTORY_COST_BP, estimate_round_trip_cost_bp
+    from src.execution.cost_model import BROKERAGE_FEE_BP, STATUTORY_COST_BP, estimate_round_trip_cost_bp
 
     # Given: 10,000원 (tick 10 -> 20bp spread) and 100,000원 (tick 100 -> 20bp spread)
     df = pd.DataFrame({"close_price": [10000.0, 100000.0]})
@@ -95,7 +95,7 @@ def test_estimate_round_trip_cost_bp_composes_and_is_idempotent() -> None:
     # Then
     assert len(out) == 2
     assert out["spread_bp"].tolist() == pytest.approx([20.0, 20.0])
-    assert out["round_trip_cost_bp"].tolist() == pytest.approx([STATUTORY_COST_BP + 20.0] * 2)
+    assert out["round_trip_cost_bp"].tolist() == pytest.approx([STATUTORY_COST_BP + 20.0 + BROKERAGE_FEE_BP] * 2)
     # unmeasured impact stays visible rather than becoming a measured zero
     assert "auction_impact_bp" in out.columns
     assert out["auction_impact_bp"].isna().all()
@@ -110,7 +110,7 @@ def test_estimate_round_trip_cost_bp_adds_measured_impact_only_where_measured() 
     import pandas as pd
     import pytest
 
-    from src.execution.cost_model import STATUTORY_COST_BP, estimate_round_trip_cost_bp
+    from src.execution.cost_model import BROKERAGE_FEE_BP, STATUTORY_COST_BP, estimate_round_trip_cost_bp
 
     # Given: one row with a measured +30bp auction move, one unmeasured
     df = pd.DataFrame(
@@ -121,8 +121,8 @@ def test_estimate_round_trip_cost_bp_adds_measured_impact_only_where_measured() 
     out = estimate_round_trip_cost_bp(df, impact_col="auction_impact_bp")
 
     # Then: impact enters the total only where it was measured
-    assert out["round_trip_cost_bp"][0] == pytest.approx(STATUTORY_COST_BP + 20.0 + 30.0)
-    assert out["round_trip_cost_bp"][1] == pytest.approx(STATUTORY_COST_BP + 20.0)
+    assert out["round_trip_cost_bp"][0] == pytest.approx(STATUTORY_COST_BP + 20.0 + BROKERAGE_FEE_BP + 30.0)
+    assert out["round_trip_cost_bp"][1] == pytest.approx(STATUTORY_COST_BP + 20.0 + BROKERAGE_FEE_BP)
     assert np.isnan(out["auction_impact_bp"][1])
 
 
@@ -152,7 +152,7 @@ def test_summarize_cost_breakdown_reports_impact_coverage() -> None:
     import pandas as pd
     import pytest
 
-    from src.execution.cost_model import estimate_round_trip_cost_bp, summarize_cost_breakdown
+    from src.execution.cost_model import BROKERAGE_FEE_BP, estimate_round_trip_cost_bp, summarize_cost_breakdown
 
     # Given: 4 rows, 2 with a measured impact
     df = pd.DataFrame(
@@ -170,6 +170,7 @@ def test_summarize_cost_breakdown_reports_impact_coverage() -> None:
     assert bd.n_rows == 4
     assert bd.n_impact_measured == 2
     assert bd.spread_bp == pytest.approx(20.0)
+    assert bd.brokerage_bp == pytest.approx(BROKERAGE_FEE_BP)
     assert bd.auction_impact_bp == pytest.approx(20.0)
 
 
@@ -177,7 +178,7 @@ def test_estimate_round_trip_cost_bp_uses_updated_statutory_rate() -> None:
     import pandas as pd
     import pytest
 
-    from src.execution.cost_model import STATUTORY_COST_BP, estimate_round_trip_cost_bp
+    from src.execution.cost_model import BROKERAGE_FEE_BP, STATUTORY_COST_BP, estimate_round_trip_cost_bp
 
     # Given: 10,000원 (tick 10 -> 2-tick round trip spread = 20bp)
     df = pd.DataFrame({"close_price": [10000.0]})
@@ -188,7 +189,7 @@ def test_estimate_round_trip_cost_bp_uses_updated_statutory_rate() -> None:
     # Then
     assert STATUTORY_COST_BP == pytest.approx(20.0)  # noqa: SIM300
     assert out["spread_bp"][0] == pytest.approx(20.0)
-    assert out["round_trip_cost_bp"][0] == pytest.approx(40.0)
+    assert out["round_trip_cost_bp"][0] == pytest.approx(40.0 + BROKERAGE_FEE_BP)
 
 def test_krx_tick_size_asof_switches_bands_at_reform_date() -> None:
     # Given
@@ -309,7 +310,7 @@ def test_estimate_round_trip_cost_bp_uses_point_in_time_tick_when_date_given() -
     import pandas as pd
     import pytest
 
-    from src.execution.cost_model import STATUTORY_COST_BP, estimate_round_trip_cost_bp
+    from src.execution.cost_model import BROKERAGE_FEE_BP, STATUTORY_COST_BP, estimate_round_trip_cost_bp
 
     # Given: the same 15,000원 close either side of the 2023-01-25 tick reform
     df = pd.DataFrame({
@@ -328,8 +329,8 @@ def test_estimate_round_trip_cost_bp_uses_point_in_time_tick_when_date_given() -
     )
     assert out["round_trip_cost_bp"].tolist() == pytest.approx(
         [
-            STATUTORY_COST_BP + 2.0 * 50.0 / 15000.0 * 1e4,
-            STATUTORY_COST_BP + 2.0 * 10.0 / 15000.0 * 1e4,
+            STATUTORY_COST_BP + 2.0 * 50.0 / 15000.0 * 1e4 + BROKERAGE_FEE_BP,
+            STATUTORY_COST_BP + 2.0 * 10.0 / 15000.0 * 1e4 + BROKERAGE_FEE_BP,
         ]
     )
 
@@ -422,7 +423,7 @@ def test_estimate_round_trip_cost_bp_uses_pit_statutory_when_date_given() -> Non
     import numpy as np
     import pandas as pd
 
-    from src.execution.cost_model import STATUTORY_COST_BP, estimate_round_trip_cost_bp
+    from src.execution.cost_model import BROKERAGE_FEE_BP, STATUTORY_COST_BP, estimate_round_trip_cost_bp
 
     # Given: the same 20,000원 KOSDAQ close in three different tax regimes
     df = pd.DataFrame(
@@ -442,7 +443,7 @@ def test_estimate_round_trip_cost_bp_uses_pit_statutory_when_date_given() -> Non
     spread = out["spread_bp"].to_numpy()
     np.testing.assert_allclose(spread, spread[0])
     np.testing.assert_allclose(
-        out["round_trip_cost_bp"].to_numpy(), np.array([30.0, 15.0, 20.0]) + spread
+        out["round_trip_cost_bp"].to_numpy(), np.array([30.0, 15.0, 20.0]) + spread + BROKERAGE_FEE_BP
     )
 
     # When: no date column is supplied

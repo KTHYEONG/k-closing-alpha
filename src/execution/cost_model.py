@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # measure_auction_impact_bp (the producer runs ahead of selection; its
 # output joins back via impact_col, so no in-module call site exists).
 __all__ = [
+    "BROKERAGE_FEE_BP",
     "KRX_TICK_BANDS",
     "STATUTORY_BP_SCHEDULE",
     "STATUTORY_COST_BP",
@@ -84,11 +85,15 @@ KOSDAQ_MARKET_LABELS: frozenset[str] = frozenset({"KOSDAQ", "KSQ150"})
 
 STATUTORY_COST_BP: float = 20.0
 
+# 증권사 매매수수료 왕복분(편도 0.0036396% x 매수/매도 각 1회 = 2회). 세금(매도 전용)과 별개 항목.
+BROKERAGE_FEE_BP: float = 0.000036396 * 2 * 10000.0
+
 
 @dataclass(frozen=True)
 class CostBreakdown:
     statutory_bp: float
     spread_bp: float
+    brokerage_bp: float
     auction_impact_bp: float
     total_bp: float
     n_rows: int
@@ -339,7 +344,13 @@ def estimate_round_trip_cost_bp(
         vals = pd.to_numeric(out[impact_col], errors="coerce").to_numpy(dtype=np.float64)
         out["auction_impact_bp"] = np.asarray(vals, dtype=np.float64)
         impact_term = np.where(np.isfinite(vals), vals, 0.0).astype(np.float64)
-    total = out["statutory_bp"].to_numpy(dtype=np.float64) + out["spread_bp"].to_numpy(dtype=np.float64) + impact_term
+    out["brokerage_bp"] = np.full(len(out), float(BROKERAGE_FEE_BP), dtype=np.float64)
+    total = (
+        out["statutory_bp"].to_numpy(dtype=np.float64)
+        + out["spread_bp"].to_numpy(dtype=np.float64)
+        + out["brokerage_bp"].to_numpy(dtype=np.float64)
+        + impact_term
+    )
     out["round_trip_cost_bp"] = np.asarray(total, dtype=np.float64)
     return out
 
@@ -360,6 +371,10 @@ def summarize_cost_breakdown(df: pd.DataFrame) -> CostBreakdown:
         spread = float(np.nanmean(pd.to_numeric(df["spread_bp"], errors="coerce").to_numpy(dtype=np.float64)))
     else:
         spread = float("nan")
+    if "brokerage_bp" in df.columns:
+        brokerage = float(np.nanmean(pd.to_numeric(df["brokerage_bp"], errors="coerce").to_numpy(dtype=np.float64)))
+    else:
+        brokerage = float(BROKERAGE_FEE_BP)
     auction = float(np.nanmean(auction_vals)) if n_measured else float("nan")
     if "round_trip_cost_bp" in df.columns:
         total = float(np.nanmean(pd.to_numeric(df["round_trip_cost_bp"], errors="coerce").to_numpy(dtype=np.float64)))
@@ -368,6 +383,7 @@ def summarize_cost_breakdown(df: pd.DataFrame) -> CostBreakdown:
     return CostBreakdown(
         statutory_bp=statutory,
         spread_bp=spread,
+        brokerage_bp=brokerage,
         auction_impact_bp=auction,
         total_bp=total,
         n_rows=n_rows,
