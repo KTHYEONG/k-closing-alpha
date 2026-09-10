@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "ADR_20260910_daily_automation_and_paper_trading",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_ADR_20260910_daily_automation_and_paper_trading",
+      "domain": "data",
+      "title": "일일 파이프라인 systemd 자동화 + 웹소켓 페이퍼트레이딩 원장 신설",
+      "why": "수집은 27/27일 100%지만 의사결정 기록이 0건이라 실전 투입 전 AI 결정의 감사 가능한 이력이 없었음",
+      "resolution": "systemd 타이머 6종+부팅 감사 유닛으로 collect/predict/paper-entry/finalize_close/archive_intraday/paper-exit를 자동화하고, KIS 웹소켓 실체결 프린트를 오라클로 쓰는 무주문 페이퍼 원장(paper_broker/ws_client/paper_trade)을 신설, 소비자 0인 export_archive/collect_auction 삭제",
+      "impact": "실주문 TR 미참조로 구조적 안전, MOC 폴백 실배선 및 재진입 포지션 유실 결함을 /check에서 발견·수정, 결정 0건인 날도 명시 기록(fail-loud)"
+    },
+    {
       "task_id": "data_foundation_and_krx_aftermarket",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_data_foundation_and_krx_aftermarket",
@@ -989,16 +999,6 @@
       "why": "Implement Quantile Risk Model",
       "resolution": "Created quantile_model.py and sizing_engine.py",
       "impact": "Portfolio risk management"
-    },
-    {
-      "task_id": "TASK-BACKTEST-EVALUATION",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_TASK-BACKTEST-EVALUATION",
-      "domain": "ml",
-      "title": "Backtest Evaluation & 3-Way Baseline Comparison",
-      "why": "Validate AI model predictions against selection_rank and equal-weight baselines with yearly breakdown",
-      "resolution": "Implemented src/ml/backtest_evaluator.py and integration with model_pipeline",
-      "impact": "Proved AI model superiority with Top-1 return +1.53% (vs +0.63% baseline) and Win Rate 62.9% across 10 years"
     }
   ]
 }
