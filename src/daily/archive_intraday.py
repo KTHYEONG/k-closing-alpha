@@ -26,6 +26,7 @@ from src.config.market_session import (
 )
 from src.daily import archive
 from src.data.intraday_store import write_intraday_partition, write_tick_partition
+from src.data.trading_calendar import is_kis_trading_day
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,9 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
         kiwoom_client = KiwoomApiClient() if (getattr(settings, 'KIWOM_APP_KEY', None) or getattr(settings, 'KIWOOM_APP_KEY', None)) else None
         async with client.create_session() as session:
             await client.ensure_token(session)
+            if not await is_kis_trading_day(client, session, snap_date):
+                logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
+                return (0, 0, 0)
             bars = await collect_intraday_bars(client, session, codes, snap_date, bar_interval_minutes, ls_client=ls_client)
             nxt_after = await collect_nxt_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes, kiwoom_client=kiwoom_client)
             nxt_pre = await collect_nxt_premarket_bars(client, session, codes, snap_date, bar_interval_minutes, kiwoom_client=kiwoom_client)

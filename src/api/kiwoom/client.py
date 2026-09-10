@@ -8,7 +8,7 @@ import logging
 import os
 
 from src import settings
-from src.api.kis.rate_limit import AsyncRateLimiter
+from src.api.kis.rate_limit import AsyncRateLimiter, get_shared_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +27,7 @@ class KiwoomApiClient:
         self._token_lock: asyncio.Lock | None = None
 
     def _limiter_for(self, api_id: str) -> AsyncRateLimiter:
-        if api_id not in self._rate_limiters:
-            self._rate_limiters[api_id] = AsyncRateLimiter(max_rate=_KIWOOM_TR_RATE_PER_SEC, time_period=1.0)
-        return self._rate_limiters[api_id]
+        return get_shared_rate_limiter("kiwoom", f"{self.app_key}:{api_id}", _KIWOOM_TR_RATE_PER_SEC)
 
     async def ensure_token(self, session) -> str:
         if self.token:

@@ -27,28 +27,34 @@ class LsApiClient:
         self.app_secret = app_secret or getattr(settings, "LS_APP_SECRET", "") or os.getenv("LS_APP_SECRET", "")
         self.token: str | None = None
         self._lock: asyncio.Lock | None = None
+        self._token_lock: asyncio.Lock | None = None
         self._min_interval: float = 1.05
         self._last_call_time: float = 0.0
 
     async def ensure_token(self, session) -> str:
         if self.token:
             return self.token
-        payload = {
-            "grant_type": "client_credentials",
-            "appkey": self.app_key,
-            "appsecretkey": self.app_secret,
-            "scope": "oob",
-        }
-        raw = session.post(_OAUTH_URL, data=payload)
-        if inspect.isawaitable(raw):
-            raw = await raw
-        async with raw as resp:
-            body = await resp.json()
-        token = str(body.get("access_token", ""))
-        if not token:
-            raise RuntimeError(f"LS token issuance failed: {body}")
-        self.token = token
-        return token
+        if self._token_lock is None:
+            self._token_lock = asyncio.Lock()
+        async with self._token_lock:
+            if self.token:
+                return self.token
+            payload = {
+                "grant_type": "client_credentials",
+                "appkey": self.app_key,
+                "appsecretkey": self.app_secret,
+                "scope": "oob",
+            }
+            raw = session.post(_OAUTH_URL, data=payload)
+            if inspect.isawaitable(raw):
+                raw = await raw
+            async with raw as resp:
+                body = await resp.json()
+            token = str(body.get("access_token", ""))
+            if not token:
+                raise RuntimeError(f"LS token issuance failed: {body}")
+            self.token = token
+            return token
 
     async def _post_tr(
         self,

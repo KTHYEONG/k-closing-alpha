@@ -27,3 +27,16 @@ class AsyncRateLimiter:
                 sleep_time = self._timestamps[0] + self.time_period - now
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
+
+
+_SHARED_RATE_LIMITERS: dict[tuple[str, str, float, float], AsyncRateLimiter] = {}
+
+
+def get_shared_rate_limiter(vendor: str, credential_key: str, max_rate: float, time_period: float = 1.0) -> AsyncRateLimiter:
+    """프로세스 전역 단일 버킷을 (vendor, credential, rate, period) 키로 반환한다."""
+    key = (vendor, credential_key, max_rate, time_period)
+    limiter = _SHARED_RATE_LIMITERS.get(key)
+    if limiter is None:
+        limiter = AsyncRateLimiter(max_rate=max_rate, time_period=time_period)
+        _SHARED_RATE_LIMITERS[key] = limiter
+    return limiter

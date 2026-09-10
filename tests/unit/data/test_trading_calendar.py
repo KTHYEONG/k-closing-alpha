@@ -82,3 +82,38 @@ def test_default_cfg_carries_api_key_from_settings(monkeypatch) -> None:
     cfg = captured["cfg"]
     assert cfg.krx_api_key == settings.KRX_OPENAPI_KEY
     assert str(cfg.krx_api_key).strip() != ""
+
+
+def test_is_kis_trading_day_true_only_when_requested_date_is_returned() -> None:
+    import asyncio
+
+    import pytest
+
+    from src.data.trading_calendar import is_kis_trading_day
+
+    class _Client:
+        def __init__(self, res):
+            self._res = res
+            self.calls = []
+
+        async def get_market_index_history(self, _session, market_code, start, end, *a, **k):
+            self.calls.append((market_code, start, end))
+            return self._res
+
+    # Given: 거래일 (요청일과 동일한 stck_bsop_date 1행)
+    ok = _Client({"rt_cd": "0", "output2": [{"stck_bsop_date": "20260910", "bstp_nmix_prpr": "7033.92"}]})
+    assert asyncio.run(is_kis_trading_day(ok, object(), "2026-09-10")) is True
+    assert ok.calls == [("0001", "20260910", "20260910")]
+
+    # And: 휴장일/장전 (0행)
+    empty = _Client({"rt_cd": "0", "output2": []})
+    assert asyncio.run(is_kis_trading_day(empty, object(), "2026-09-05")) is False
+
+    # And: 다른 날짜만 돌아오면 거래일로 인정하지 않는다
+    mismatch = _Client({"rt_cd": "0", "output2": [{"stck_bsop_date": "20260909"}]})
+    assert asyncio.run(is_kis_trading_day(mismatch, object(), "2026-09-10")) is False
+
+    # And: 장애(rt_cd != "0")는 휴장으로 삼키지 않고 전파
+    outage = _Client({"rt_cd": "9", "msg1": "network"})
+    with pytest.raises(RuntimeError):
+        asyncio.run(is_kis_trading_day(outage, object(), "2026-09-10"))

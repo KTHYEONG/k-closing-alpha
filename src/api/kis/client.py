@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import aiohttp
 
 from src import settings
-from src.api.kis.rate_limit import AsyncRateLimiter
+from src.api.kis.rate_limit import get_shared_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +50,8 @@ class KisApiClient:
         self.token = None
         self.token_file = str(token_file or settings.TOKEN_FILE)
         self._market_div_cache = {}
-        # 동시성 및 레이트 리밋 제어를 위한 세마포어와 AsyncRateLimiter
-        self.semaphore = asyncio.Semaphore(10)
-        self.rate_limiter = AsyncRateLimiter(max_rate=18.0, time_period=1.0)
+        self._token_lock: asyncio.Lock | None = None
+        self.rate_limiter = get_shared_rate_limiter("kis", self.app_key, 18.0)
 
     def create_session(self, *, timeout: aiohttp.ClientTimeout | None = None) -> aiohttp.ClientSession:
         """최적화된 커넥터와 bounded request timeout을 가진 세션을 생성합니다."""
@@ -140,52 +139,91 @@ class KisApiClient:
         self._market_div_cache[code] = "J"
         return "J"
 
-    async def ensure_token(self, session: aiohttp.ClientSession, force_refresh: bool = False):
-        """토큰 유효성을 확인하고 필요시 갱신합니다."""
-        if not force_refresh and os.path.exists(self.token_file):
-            try:
-                with open(self.token_file, encoding="utf-8") as f:
-                    saved_data = json.load(f)
-                if saved_data.get("app_key") == self.app_key:
-                    expired_at = datetime.strptime(
-                        saved_data["expired_at"], "%Y-%m-%d %H:%M:%S"
-                    )
-                    if datetime.now() < expired_at - timedelta(minutes=10):
-                        self.token = saved_data["access_token"]
-                        return self.token
-            except Exception:
-                pass
+    def _write_token_file(self, access_token: str, expired_at: str) -> None:
+        """토큰 캐시를 동일 디렉터리 임시 파일 + os.replace 원자적 교체로 기록한다 (0600)."""
+        import tempfile
 
-        # 새 토큰 발급 요청
-        url = f"{self.base_url}/oauth2/tokenP"
-        headers = {"content-type": "application/json"}
-        body = {
-            "grant_type": "client_credentials",
-            "appkey": self.app_key,
-            "appsecret": self.app_secret,
-        }
-
-        async with session.post(url, headers=headers, json=body) as resp:
-            data = await resp.json()
-            if "access_token" not in data:
-                raise Exception(f"토큰 발급 실패: {data}")
-
-            self.token = data["access_token"]
-            expires_in = data.get("expires_in", 86400)
-            expired_at_str = (datetime.now() + timedelta(seconds=expires_in)).strftime(
-                "%Y-%m-%d %H:%M:%S"
+        dir_name = os.path.dirname(os.path.abspath(self.token_file))
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".kis_token_", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "access_token": access_token,
+                    "expired_at": expired_at,
+                    "app_key": self.app_key,
+                },
+                f,
             )
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, self.token_file)
+        os.chmod(self.token_file, 0o600)
 
-            with open(self.token_file, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "access_token": self.token,
-                        "expired_at": expired_at_str,
-                        "app_key": self.app_key,
-                    },
-                    f,
+    def _read_cached_token(self, *, min_remaining_minutes: int = 10) -> str | None:
+        """디스크 캐시에서 아직 유효한 토큰을 읽는다. 없거나 만료 임박이면 None.
+
+        캐시는 권위 소스가 아니라 재발급 회피용이므로, 판독 불가(구버전 비원자
+        쓰기가 남긴 절단 파일, 스키마 누락, 권한 오류)는 None으로 낮춰 재발급
+        경로로 흘린다. 여기서 예외를 올리면 결정창 인증이 통째로 죽는다.
+        """
+        if not os.path.exists(self.token_file):
+            return None
+        try:
+            with open(self.token_file, encoding="utf-8") as f:
+                saved_data = json.load(f)
+            if saved_data.get("app_key") != self.app_key:
+                return None
+            expired_at = datetime.strptime(saved_data["expired_at"], "%Y-%m-%d %H:%M:%S")
+            access_token = str(saved_data["access_token"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning("[SYS] stage=kis_token_cache status=UNREADABLE reason=%s", type(exc).__name__)
+            return None
+        if datetime.now() < expired_at - timedelta(minutes=min_remaining_minutes):
+            return access_token
+        return None
+
+    async def ensure_token(self, session: aiohttp.ClientSession, force_refresh: bool = False):
+        """토큰 유효성을 확인하고 필요시 갱신합니다 (단일비행 + 원자적 0600 쓰기)."""
+        if not force_refresh:
+            cached = self._read_cached_token()
+            if cached is not None:
+                self.token = cached
+                return self.token
+        if self._token_lock is None:
+            self._token_lock = asyncio.Lock()
+        async with self._token_lock:
+            if not force_refresh:
+                cached = self._read_cached_token()
+                if cached is not None:
+                    self.token = cached
+                    return self.token
+
+            # 새 토큰 발급 요청
+            url = f"{self.base_url}/oauth2/tokenP"
+            headers = {"content-type": "application/json"}
+            body = {
+                "grant_type": "client_credentials",
+                "appkey": self.app_key,
+                "appsecret": self.app_secret,
+            }
+
+            async with session.post(url, headers=headers, json=body) as resp:
+                data = await resp.json()
+                if "access_token" not in data:
+                    if data.get("msg_cd") == "EGW00133":
+                        fallback = self._read_cached_token(min_remaining_minutes=0)
+                        if fallback is not None:
+                            self.token = fallback
+                            return self.token
+                    raise RuntimeError(f"토큰 발급 실패: {data}")
+
+                self.token = data["access_token"]
+                expires_in = data.get("expires_in", 86400)
+                expired_at_str = (datetime.now() + timedelta(seconds=expires_in)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
                 )
-            return self.token
+
+                self._write_token_file(self.token, expired_at_str)
+                return self.token
 
     def _get_headers(self, tr_id):
         """공통 헤더 생성"""
@@ -203,8 +241,8 @@ class KisApiClient:
         import aiohttp
         
         session = getattr(session_method, "__self__", None)
-        await self.rate_limiter.acquire()
         for attempt in range(5):
+            await self.rate_limiter.acquire()
             try:
                 # 최신 토큰으로 headers의 authorization 동기화
                 if "headers" in kwargs and isinstance(kwargs["headers"], dict):

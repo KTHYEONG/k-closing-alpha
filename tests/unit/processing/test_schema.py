@@ -101,7 +101,7 @@ def test_archive_column_order_is_minimal_and_carries_admitted() -> None:
         "스냅샷_날짜", "종목코드", "종목명", "시장구분", "시가", "고가", "저가", "종가",
         "전일종가", "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수",
         "등락률", "kospi", "kosdaq", "v_kospi", "admitted", "수급_실패", "지수_실패",
-        "결정_종가", "종가_확정",
+        "현재가_실패", "결정_종가", "종가_확정",
     ]
 
     # Then: champion-era and flat level-1 orderbook columns are gone (the full

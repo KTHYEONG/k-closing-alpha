@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import logging
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -13,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from src.api.kis.client import KisApiClient
 from src.config.market_session import (
     CLOSING_AUCTION_CONFIRM_EARLIEST_HHMMSS,
     CLOSING_AUCTION_CONFIRMED_MKOP_CODE,
@@ -148,31 +148,32 @@ async def run_close_finalization(
     return n_finalized
 
 
+async def _amain(args) -> int:
+    """단일 이벤트 루프 안에서 세션 생성/토큰/확정/종료를 모두 수행한다."""
+    owned_client = KisApiClient()
+    session = owned_client.create_session()
+    try:
+        await owned_client.ensure_token(session)
+        n = await run_close_finalization(
+            snapshot_date=args.date,
+            client=owned_client,
+            session=session,
+            retry_interval_seconds=args.retry_interval,
+        )
+    finally:
+        await session.close()
+    logger.info("[DATA] stage=close_finalization rows=%d", n)
+    return n
+
+
 def main() -> None:  # pragma: no cover - CLI entry; logic covered via run_close_finalization scenarios
-    """CLI 진입점: 확정 패스를 실행하고 확정 행수를 로깅한다."""
+    """CLI 진입점: 단일 asyncio.run으로 확정 패스를 실행한다."""
     parser = argparse.ArgumentParser(description="Closing-price finalization (in-place EOD update)")
     parser.add_argument("--date", default=None)
     parser.add_argument("--retry-interval", type=float, default=30.0)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    from src.api.kis.client import KisApiClient
-
-    owned_client = KisApiClient()
-    session = owned_client.create_session()
-    asyncio.run(owned_client.ensure_token(session))
-    try:
-        n = asyncio.run(
-            run_close_finalization(
-                snapshot_date=args.date,
-                client=owned_client,
-                session=session,
-                retry_interval_seconds=args.retry_interval,
-            )
-        )
-    finally:
-        with contextlib.suppress(Exception):
-            asyncio.run(session.close())
-    logger.info("[DATA] stage=close_finalization rows=%d", n)
+    asyncio.run(_amain(args))
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
