@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "pykrx_retirement_phase2",
+      "date": "2026-09-11",
+      "adr_id": "ADR_20260911_pykrx_retirement_phase2",
+      "domain": "data",
+      "title": "pykrx 최소화 Phase 2: 무위험 삭제·명시 폴백 제거·분할 감지 가드",
+      "why": "미사용 backfill_regime 모듈과 이미 KRX/KIS 주경로인 곳의 pykrx 폴백을 사용자가 명시적으로 제거 원함",
+      "resolution": "backfill_regime.py 삭제(산출물 미존재), derivatives/investor_flow의 pykrx 폴백 제거, 가격제한(±30%) 이탈 종목만 전체이력 재조회하는 corporate_actions 가드 신설(최종 저장 1회에만 배선)",
+      "impact": "pykrx 호출부 9개->2개(OHLCV+시총 per-symbol 백필만 잔존), 지수수익률 이관은 KRX API의 단일일자 제약으로 오히려 역효과라 재검토 후 범위 제외, 증분 병합 재설계는 미측정 병목이라 보류"
+    },
+    {
       "task_id": "pykrx_retirement_phase1",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_pykrx_retirement_phase1",
@@ -989,16 +999,6 @@
       "why": "Centralized monolithic settings and legacy script names caused high token waste and maintenance overhead",
       "resolution": "Modularized settings into src/config/ domain modules, streamlined src/daily/ scripts to collect/predict/archive, and symmetrically aligned tests/ directory",
       "impact": "Enhanced code maintainability, scalability, and AI-agent token efficiency with symmetrical test discovery"
-    },
-    {
-      "task_id": "ADR_20260804_daily_pipeline_refactor",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_ADR_20260804_daily_pipeline_refactor",
-      "domain": "daily",
-      "title": "Daily Data Pipeline Refactoring & CSV Storage Standardization",
-      "why": "Legacy heuristic judgment logic in collect_data & predict_position and inefficient excel openpyxl serialization",
-      "resolution": "Refactored collect_data & predict_position with single-pass scenario priority logic, standardized UTF-8-sig CSV export with fixed 26-column order",
-      "impact": "Improved prediction speed, eliminated duplicate API calls, guaranteed seamless spreadsheet copy-paste workflow"
     }
   ]
 }
