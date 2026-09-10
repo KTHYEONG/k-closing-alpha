@@ -51,10 +51,6 @@
   "src/backfill/altdata/disclosure.py": {
     "testing": "tests/unit/backfill/test_altdata_disclosure.py"
   },
-  "src/backfill/altdata/fundamental.py": {
-    "testing": "tests/unit/backfill/test_altdata_collectors.py"
-  },
-  "src/backfill/altdata/investor_detail.py": {},
   "src/backfill/altdata/krx_api.py": {
     "testing": "tests/unit/backfill/test_altdata_krx_api.py"
   },
@@ -192,6 +188,9 @@
   "src/data/parquet_loader.py": {
     "testing": "tests/unit/data/test_parquet_loader.py"
   },
+  "src/data/trading_calendar.py": {
+    "testing": "tests/unit/data/test_trading_calendar.py"
+  },
   "src/execution/cost_model.py": {
     "testing": "tests/unit/execution/test_cost_model.py"
   },
@@ -296,6 +295,7 @@
       "tests/unit/daily/test_archive.py",
       "tests/unit/daily/test_archive_intraday.py",
       "tests/unit/data/test_parquet_loader.py",
+      "tests/unit/data/test_trading_calendar.py",
       "tests/unit/ml/test_history_features.py"
     ]
   },
