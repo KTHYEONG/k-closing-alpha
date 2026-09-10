@@ -22,7 +22,10 @@
     "testing": "tests/unit/api/kis/test_ws_client.py"
   },
   "src/api/kiwoom/client.py": {
-    "testing": "tests/unit/api/kiwoom/test_kiwoom_client.py"
+    "testing": [
+      "tests/unit/api/kiwoom/test_kiwoom_client.py",
+      "tests/unit/daily/test_collect_service.py"
+    ]
   },
   "src/api/ls/client.py": {
     "testing": "tests/unit/api/ls/test_ls_client.py"
@@ -150,7 +153,8 @@
     ]
   },
   "src/daily/collect.py": {
-    "testing": "tests/unit/daily/test_collect.py"
+    "testing": "tests/unit/daily/test_collect.py",
+    "architecture": "docs/architecture/api_master.md"
   },
   "src/daily/finalize_close.py": {
     "testing": "tests/unit/daily/test_finalize_close.py"

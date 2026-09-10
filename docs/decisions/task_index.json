@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_API_SURFACE_HARDENING",
+      "date": "2026-09-11",
+      "adr_id": "ADR_20260911_API_SURFACE_HARDENING",
+      "domain": "data_collection",
+      "title": "API 호출 경로 견고성 감사 및 결정 파이프라인 P0 복구",
+      "why": "유니버스 스캔이 Kiwoom 미배선으로 KIS 30행(커버리지 7.5%, 비용축 생존자 0)에 갇혔고 finalize_close가 이벤트루프 밖 create_session으로 매일 crash해 종가_확정이 한 번도 기록되지 않았다",
+      "resolution": "Kiwoom ka10027을 유일한 후보 소스로 fail-closed 전환, finalize_close를 단일 asyncio.run(_amain)으로 재구성, KIS/LS 토큰 단일비행+원자적 0600쓰기+EGW00133 폴백, 레이트리미터 프로세스 전역 공유+재시도 재획득, 거래일 게이트(is_kis_trading_day) 도입, 현재가 실패 플래그(현재가_실패) 신설, daily_audit 평일 무조건 감사로 전환",
+      "impact": "결정 후보 모집단 7.5%->401행 복구, 확정종가/페이퍼진입 체인 정상화, 동시 배치 429 폭주 방지, LS 토큰 스탬피드(10x) 제거, P0 장애 무보고 방지"
+    },
+    {
       "task_id": "pykrx_retirement_phase2",
       "date": "2026-09-11",
       "adr_id": "ADR_20260911_pykrx_retirement_phase2",
@@ -989,16 +999,6 @@
       "why": "Cleanup redundant chart_pass cache and parenthesis column renaming, and adjust daily stock data storage location to data/daily/",
       "resolution": "Removed chart_pass_cache.json and (차트통과) logic, relocated files to data/daily/daily_stocks.csv and parquet, and standardized columns across collect.py and predict.py without duplicate rename_map.",
       "impact": "Clean daily data storage structure, improved maintainability and AI workflow efficiency, zero redundant column renaming."
-    },
-    {
-      "task_id": "ADR_20260804_architecture_refactoring",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_ADR_20260804_architecture_refactoring",
-      "domain": "architecture",
-      "title": "Architecture & Directory Refactoring",
-      "why": "Centralized monolithic settings and legacy script names caused high token waste and maintenance overhead",
-      "resolution": "Modularized settings into src/config/ domain modules, streamlined src/daily/ scripts to collect/predict/archive, and symmetrically aligned tests/ directory",
-      "impact": "Enhanced code maintainability, scalability, and AI-agent token efficiency with symmetrical test discovery"
     }
   ]
 }
