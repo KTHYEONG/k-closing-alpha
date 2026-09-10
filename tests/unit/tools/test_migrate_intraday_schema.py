@@ -235,3 +235,28 @@ def test_migrate_partition_file_allows_repeated_tick_timestamps(tmp_path) -> Non
     out = pd.read_parquet(path)
     assert list(out.columns) == list(CANONICAL_TICK_COLUMNS)
     assert out["volume"].tolist() == [10, 20, 30]
+
+
+def test_run_migration_dry_run_does_not_misclassify_valid_partitions_as_failed(tmp_path) -> None:
+    """dry-run에서 검증만 통과(reason=None)한 정상 레거시 파티션은 실패로 집계되지 않는다."""
+    import pandas as pd
+
+    from src.tools.migrate_intraday_schema import run_migration
+
+    good_dir = tmp_path / "1m" / "regular" / "2026-05"
+    good_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "stck_bsop_date": ["20260501"],
+        "stck_cntg_hour": ["090100"],
+        "stck_oprc": ["1000"], "stck_hgpr": ["1010"], "stck_lwpr": ["995"], "stck_prpr": ["1005"],
+        "cntg_vol": ["100"], "acml_tr_pbmn": ["100000"],
+        "종목코드": ["005930"],
+    }).to_parquet(good_dir / "2026-05-01.parquet", index=False)
+
+    res = run_migration(root=tmp_path, dry_run=True, backup=True)
+
+    assert res["n_files"] == 1
+    assert res["n_migrated"] == 0  # dry-run이라 실제 쓰기는 없음
+    assert res["n_failed"] == 0    # 검증 통과(reason=None)는 실패가 아니다
+    assert res["failures"] == []
+    assert not (good_dir / "2026-05-01.parquet.legacy.bak").exists()
