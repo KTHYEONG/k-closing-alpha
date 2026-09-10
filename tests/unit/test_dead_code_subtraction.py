@@ -66,14 +66,12 @@ def test_dead_symbols_are_absent_but_live_siblings_remain() -> None:
         ],
         "src.ml.bundle": ["save_bundle"],
         "src.utils.display": ["apply_label_encodings"],
-        "src.backfill.backfill_regime": ["run_backfill_market_factors"],
     }
     # And: symbols that look dead by cross-module grep but are alive via self-use.
     alive = {
         "src.ml.oof": ["sample_weight_for_fold"],
         "src.ml.costaware_topk": ["split_regime_masks"],
         "src.utils.display": ["get_decision_color"],
-        "src.backfill.backfill_regime": ["run_backfill_market_regime_factors"],
         "src.ml.robust_eval": ["BootstrapDelta"],
     }
 
@@ -163,7 +161,6 @@ def test_live_entrypoints_still_import_after_dependency_removal() -> None:
         "src.ml.topk_ranker_research",
         "src.backfill.backfill_price",
         "src.backfill.backfill_altdata",
-        "src.backfill.backfill_regime",
         "src.backfill.kis_flow_backfill",
         "src.backfill.intraday.backfill_minute_history",
     ]
