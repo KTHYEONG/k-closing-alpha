@@ -80,9 +80,6 @@
     "testing": "tests/integration/backfill/test_altdata_flow.py"
   },
   "src/backfill/backfill_price.py": {},
-  "src/backfill/backfill_regime.py": {
-    "testing": "tests/unit/backfill/test_backfill_regime.py"
-  },
   "src/backfill/intraday/backfill_minute_history.py": {
     "testing": [
       "tests/integration/daily/test_minute_history_backfill_flow.py",
@@ -100,6 +97,12 @@
   },
   "src/backfill/price/config.py": {
     "testing": "tests/unit/backfill/price/test_config.py"
+  },
+  "src/backfill/price/corporate_actions.py": {
+    "testing": [
+      "tests/unit/backfill/price/test_runner.py",
+      "tests/unit/backfill/test_corporate_actions.py"
+    ]
   },
   "src/backfill/price/factors.py": {
     "testing": "tests/unit/backfill/test_factors_proxy.py"
@@ -284,7 +287,6 @@
   },
   "src/settings.py": {
     "testing": [
-      "tests/unit/backfill/test_backfill_regime.py",
       "tests/unit/config/test_altdata.py",
       "tests/unit/config/test_altdata_settings.py",
       "tests/unit/config/test_base.py",
