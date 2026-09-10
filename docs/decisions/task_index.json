@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "pipeline_hardening_pykrx_timing_columns",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_pipeline_hardening_pykrx_timing_columns",
+      "domain": "data",
+      "title": "결정창 타이머 정합화 + 페이퍼 진입 오라클을 확정종가로 재설계",
+      "why": "kca-collect.timer(15:15)가 결정창 게이트(15:20-15:30)와 충돌해 매일 실패했고, 페이퍼 진입이 존재하지 않는 동시호가 체결틱을 기다리는 아키텍처 모순이 있었음",
+      "resolution": "collect/predict 타이머를 15:20/15:21로 정렬하고 paper-entry를 고정타이머 대신 finalize_close의 OnSuccess 체이닝으로 전환, 진입 체결을 웹소켓 연속체결에서 확정종가(build_auction_fill) 기반으로 교체, NaN 혼재 종가_확정 오판 결함 수정",
+      "impact": "내일 첫 자동 실행부터 정상 동작 확인(실제 systemd 상태까지 재설치·검증), 고아 데이터(ml_training_panel.parquet, data/daily/) 삭제, 8개 회귀 컬럼/NXT-SOR 컬럼/pykrx 이관은 근거를 남기고 별도 과업으로 분리"
+    },
+    {
       "task_id": "ADR_20260910_daily_automation_and_paper_trading",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_ADR_20260910_daily_automation_and_paper_trading",
@@ -989,16 +999,6 @@
       "why": "Integrate trained ML ranker, quantile risk model and utility sizing engine into daily operational pipeline with model persistence and legacy cleanup",
       "resolution": "Refactored src/daily/predict_position.py, added save/load_model_artifacts & predict_daily_position_sizing in src/ml/sizing_engine.py, cleaned legacy GMM/static logic",
       "impact": "Fast 1-second inference from artifacts/models/ and automated risk-managed portfolio sizing for 15:20 daily snapshot"
-    },
-    {
-      "task_id": "quantile_sizing",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_quantile_sizing",
-      "domain": "ml",
-      "title": "Quantile Risk Model & Dynamic Sizing Engine Implementation",
-      "why": "Implement Quantile Risk Model",
-      "resolution": "Created quantile_model.py and sizing_engine.py",
-      "impact": "Portfolio risk management"
     }
   ]
 }
