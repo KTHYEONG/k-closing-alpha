@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "closing_price_finalization",
+      "date": "2026-09-10",
+      "adr_id": "ADR_20260910_closing_price_finalization",
+      "domain": "daily",
+      "title": "종가단일가 결정/확정 2단계 분리",
+      "why": "결정창(15:20-15:30)은 15:19 동결가라 archive 종가가 확정종가와 중앙값 24bp 어긋났음",
+      "resolution": "3중 게이트(시계+mkop+TR일치)로 확정 시 동일 snapshot_timestamp 행을 in-place 갱신, 결정_종가/종가_확정 컬럼 추가",
+      "impact": "리서치 종가 정합성 확보, admitted는 결정시점 값으로 룩어헤드 없이 고정 유지"
+    },
+    {
       "task_id": "kis_client_facade_cleanup",
       "date": "2026-09-10",
       "adr_id": "ADR_20260910_kis_client_facade_cleanup",
@@ -989,16 +999,6 @@
       "why": "Fix string percent symbol cleaning in clean_column_names to prevent 92% net_return row loss",
       "resolution": "Implemented percent/comma string cleaning in src/processing/preprocessor.py clean_column_names",
       "impact": "Restored all 33,934 rows (100%) for ML training"
-    },
-    {
-      "task_id": "TASK-MODEL-PIPELINE",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_TASK-MODEL-PIPELINE",
-      "domain": "ml",
-      "title": "ML Model Selection & Purged Walk-Forward Pipeline",
-      "why": "Establish zero-leakage Purged Group Walk-Forward CV and model evaluation",
-      "resolution": "Implemented src/ml/purged_cv.py, src/ml/model_pipeline.py and unit tests",
-      "impact": "Enables cross-validation, LightGBM ranking and backtest metric evaluation"
     }
   ]
 }

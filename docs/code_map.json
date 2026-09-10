@@ -153,6 +153,9 @@
   "src/daily/collect_auction.py": {
     "testing": "tests/unit/daily/test_collect_auction.py"
   },
+  "src/daily/finalize_close.py": {
+    "testing": "tests/unit/daily/test_finalize_close.py"
+  },
   "src/daily/predict.py": {
     "testing": "tests/unit/daily/test_predict.py"
   },
@@ -284,6 +287,7 @@
       "tests/unit/config/test_ls.py",
       "tests/unit/config/test_settings_compat.py",
       "tests/unit/config/test_trading.py",
+      "tests/unit/daily/test_archive.py",
       "tests/unit/daily/test_archive_intraday.py",
       "tests/unit/data/test_parquet_loader.py",
       "tests/unit/ml/test_history_features.py"
