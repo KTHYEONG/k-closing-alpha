@@ -11,18 +11,20 @@ from enum import StrEnum
 import numpy as np
 import pandas as pd
 
-# tick_cost_bp 는 UniverseSpec.max_tick_cost_bp 가 소비하는 tick_cost_bp 컬럼의
-# 생산자다. 스크린 계약과 함께 쓰이므로 이 모듈에서 재수출한다.
-from src.execution.cost_model import spread_cost_bp, tick_cost_bp
+# tick_cost_bp 와 statutory_bp_asof 는 UniverseSpec.max_tick_cost_bp 가 소비하는
+# 비용 컬럼과 PIT 법정비용의 생산자다. 스크린 계약과 함께 쓰이므로 이 모듈에서 재수출한다.
+from src.execution.cost_model import statutory_bp_asof, tick_cost_bp
 
 __all__ = [
     "AA_COST",
     "APPROXIMATE_SPEARMAN_THRESHOLD",
+    "CAPFREE_UNIVERSE",
     "CEILING_CHG_THRESHOLD",
     "COST_AWARE_UNIVERSE",
     "DEFAULT_REALIZED_VOL",
     "DEFAULT_UNIVERSE",
     "KCA_TOP3_SHADOW_001",
+    "KCA_TOPK_CAPFREE_001",
     "KCA_TOPK_COSTAWARE_001",
     "KRX_DAILY_LIMIT_RATIO",
     "LABEL_BAD_THRESHOLD",
@@ -43,7 +45,7 @@ __all__ = [
     "mark_ceiling",
     "round_trip_cost_bp",
     "select_universe",
-    "spread_cost_bp",
+    "statutory_bp_asof",
     "tick_cost_bp",
 ]
 
@@ -73,10 +75,10 @@ KRX_DAILY_LIMIT_RATIO: float = 0.31
 APPROXIMATE_SPEARMAN_THRESHOLD: float = 0.99
 
 
+# 법정비용은 날짜 함수이므로 전략 스펙 상수가 될 수 없다.
 @dataclass(frozen=True)
 class CostSpec:
     mode: ExecutionMode = ExecutionMode.AA
-    statutory_bp: float = 20.0
     round_trip_ticks: float = 2.0
 
     def __post_init__(self) -> None:
@@ -86,8 +88,6 @@ class CostSpec:
         floor = float(MIN_ROUND_TRIP_TICKS[self.mode])
         if ticks < floor:
             raise ValueError(f"round_trip_ticks {ticks} below floor {floor} for mode {self.mode}")
-        if float(self.statutory_bp) < 0.0:
-            raise ValueError(f"statutory_bp must be >= 0, got {self.statutory_bp!r}")
 
 
 @dataclass(frozen=True)
@@ -123,9 +123,9 @@ class FeatureContractRow:
     action: str
 
 
-AA_COST: CostSpec = CostSpec(mode=ExecutionMode.AA, statutory_bp=20.0, round_trip_ticks=2.0)
+AA_COST: CostSpec = CostSpec(mode=ExecutionMode.AA, round_trip_ticks=2.0)
 
-PA_COST: CostSpec = CostSpec(mode=ExecutionMode.PA, statutory_bp=20.0, round_trip_ticks=1.0)
+PA_COST: CostSpec = CostSpec(mode=ExecutionMode.PA, round_trip_ticks=1.0)
 
 DEFAULT_UNIVERSE: UniverseSpec = UniverseSpec()
 
@@ -144,6 +144,20 @@ COST_AWARE_UNIVERSE: UniverseSpec = UniverseSpec(
 
 KCA_TOPK_COSTAWARE_001: StrategySpec = StrategySpec(
     strategy_id="KCA-TOPK-COSTAWARE-001", top_k=3, universe=COST_AWARE_UNIVERSE, cost=AA_COST
+)
+
+# 절대 틱비용 상한은 가격의 계단함수라 레짐마다 다른 가격창을 의미한다. 비용은 net 라벨로만 반영한다.
+CAPFREE_UNIVERSE: UniverseSpec = UniverseSpec(
+    chg_min=0.02,
+    chg_max=0.10,
+    min_trade_value_100m=100.0,
+    min_market_cap_100m=500.0,
+    exclude_ceiling=True,
+    max_tick_cost_bp=None,
+)
+
+KCA_TOPK_CAPFREE_001: StrategySpec = StrategySpec(
+    strategy_id="KCA-TOPK-CAPFREE-001", top_k=3, universe=CAPFREE_UNIVERSE, cost=AA_COST
 )
 
 
@@ -172,10 +186,11 @@ def detect_mixed_unit_rows(
     return np.asarray(computable & match_pct & (~match_ratio), dtype=bool)
 
 
-def round_trip_cost_bp(price: np.ndarray | float, cost: CostSpec = AA_COST) -> np.ndarray:
+def round_trip_cost_bp(price: np.ndarray | float, trade_date: np.ndarray, market: np.ndarray, cost: CostSpec = AA_COST) -> np.ndarray:
     arr = np.asarray(price, dtype=np.float64)
-    spread = spread_cost_bp(arr, round_trip_ticks=float(cost.round_trip_ticks))
-    return np.asarray(float(cost.statutory_bp) + spread, dtype=np.float64)
+    per_tick = tick_cost_bp(arr, trade_date, market)
+    statutory = statutory_bp_asof(trade_date)
+    return np.asarray(statutory + float(cost.round_trip_ticks) * per_tick, dtype=np.float64)
 
 
 def mark_ceiling(df: pd.DataFrame) -> np.ndarray:

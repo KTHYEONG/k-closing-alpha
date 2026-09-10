@@ -16,7 +16,7 @@ import pandas as pd
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet
-from src.execution.cost_model import TICK_REFORM_DATE
+from src.execution.cost_model import TICK_REFORM_DATE, statutory_bp_asof
 from src.ml.research.v3_engine import (
     attach_forward_exit_paths,
     build_candidate_universe,
@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 COST_STRESS_TICK_GRID: tuple[float, ...] = (2.0, 3.0, 4.0)
 MIN_FEASIBLE_DAY_FRACTION: float = 0.90
+# 스크린이 어떤 레짐에서든 top_k 후보를 확보해야 하는 최소 거래일 비율.
+MIN_CONSTRUCTIBLE_DAY_FRACTION: float = 0.95
 MIN_TOP_K: int = 3
 MIN_POST_REFORM_T_STAT: float = 2.0
 
@@ -115,18 +117,18 @@ def compute_net_return(
     picks: pd.DataFrame,
     *,
     round_trip_ticks: float,
-    statutory_bp: float = 20.0,
     gross_col: str = "gross_return",
     cost_col: str = "tick_cost_bp",
+    date_col: str = "date",
 ) -> np.ndarray:
     """Compute D+1-open net return from gross return and PIT tick cost.
 
     Args:
         picks: Picked candidates with gross and tick-cost columns.
         round_trip_ticks: Round-trip tick multiplier.
-        statutory_bp: Statutory cost in bp.
         gross_col: Gross return column name.
         cost_col: Per-tick cost column name.
+        date_col: Date column name for PIT statutory cost.
 
     Returns:
         Net return array with NaN where inputs are not finite.
@@ -135,11 +137,14 @@ def compute_net_return(
         raise ValueError(f"picks missing gross_col {gross_col!r}")
     if cost_col not in picks.columns:
         raise ValueError(f"picks missing cost_col {cost_col!r}")
+    if date_col not in picks.columns:
+        raise ValueError(f"picks missing date_col {date_col!r} for PIT statutory cost")
     gross = picks[gross_col].to_numpy(dtype=np.float64)
     tick = picks[cost_col].to_numpy(dtype=np.float64)
+    statutory = statutory_bp_asof(pd.to_datetime(picks[date_col], errors="coerce").to_numpy())
     net = np.full(gross.shape, np.nan, dtype=np.float64)
-    ok = np.isfinite(gross) & np.isfinite(tick)
-    net[ok] = gross[ok] - (float(statutory_bp) + float(round_trip_ticks) * tick[ok]) / 1e4
+    ok = np.isfinite(gross) & np.isfinite(tick) & np.isfinite(statutory)
+    net[ok] = gross[ok] - (statutory[ok] + float(round_trip_ticks) * tick[ok]) / 1e4
     return net
 
 
@@ -214,6 +219,52 @@ def day_level_feasibility(
     return pd.Series(aligned.to_numpy() >= int(k), index=calendar)
 
 
+def assert_screen_constructible(
+    cands: pd.DataFrame,
+    *,
+    top_k: int,
+    regimes: tuple[str, ...] = ("post_reform",),
+    date_col: str = "date",
+    min_day_fraction: float = MIN_CONSTRUCTIBLE_DAY_FRACTION,
+) -> dict[str, float]:
+    """Fail closed when a screen cannot form a top_k basket often enough.
+
+    Args:
+        cands: Candidate pool with a date column.
+        top_k: Names required per date.
+        regimes: Regimes the screen is applied to.
+        date_col: Date column name.
+        min_day_fraction: Minimum fraction of trading days supplying top_k.
+
+    Returns:
+        Per-regime constructible day fractions.
+    """
+    if int(top_k) < 1:
+        raise ValueError(f"k must be >= 1, got {top_k!r}")
+    if date_col not in cands.columns:
+        raise ValueError(f"cands missing date_col {date_col!r}")
+    for regime in regimes:
+        if regime not in ("pre_reform", "post_reform", "full_history"):
+            raise ValueError(f"regime must be one of pre_reform/post_reform/full_history, got {regime!r}")
+    dates = pd.DatetimeIndex(pd.to_datetime(cands[date_col]))
+    counts = cands.groupby(date_col).size()
+    day_dates = pd.DatetimeIndex(pd.to_datetime(counts.index))
+    masks = split_regime_masks(day_dates)
+    _ = dates
+    out: dict[str, float] = {}
+    for regime in regimes:
+        sub = counts[masks[regime]]
+        fraction = float((sub >= int(top_k)).sum() / len(sub)) if len(sub) else float("nan")
+        out[regime] = fraction
+    offenders = [r for r, f in out.items() if not np.isfinite(f) or f < float(min_day_fraction)]
+    if offenders:
+        raise ValueError(
+            f"screen is not constructible: {offenders}; each regime must supply >= {int(top_k)} candidates "
+            f"on >= {float(min_day_fraction)} of its trading days"
+        )
+    return out
+
+
 def compute_regime_metrics(
     daily_net: pd.Series,
     feasibility_full: pd.Series,
@@ -268,7 +319,6 @@ def compute_regime_metrics(
 def compute_cost_stress(
     picks: pd.DataFrame,
     *,
-    statutory_bp: float = 20.0,
     ticks_grid: tuple[float, ...] = COST_STRESS_TICK_GRID,
     regime: str = "post_reform",
 ) -> list[CostStressPoint]:
@@ -276,7 +326,6 @@ def compute_cost_stress(
 
     Args:
         picks: Picked candidates with date, gross and tick-cost columns.
-        statutory_bp: Statutory cost in bp.
         ticks_grid: Round-trip tick multipliers to evaluate.
         regime: Regime slice to stress.
 
@@ -289,7 +338,7 @@ def compute_cost_stress(
     sub = picks[masks[regime]]
     points: list[CostStressPoint] = []
     for ticks in ticks_grid:
-        net = compute_net_return(sub, round_trip_ticks=float(ticks), statutory_bp=float(statutory_bp))
+        net = compute_net_return(sub, round_trip_ticks=float(ticks))
         daily = daily_mean_series(sub, net)
         stats = calculate_series_metrics(daily.to_numpy(dtype=np.float64), cost_ratio=0.0)
         passes = bool(stats["mean_net_bp"] > 0.0 and stats["median_net_bp"] > 0.0)
@@ -382,7 +431,6 @@ def run_cost_aware_topk_backtest(
     net = compute_net_return(
         picks,
         round_trip_ticks=float(spec.cost.round_trip_ticks),
-        statutory_bp=float(spec.cost.statutory_bp),
     )
     daily_net = daily_mean_series(picks, net)
     # Entry-eligible calendar: the terminal panel date has no D+1 bar, so no
@@ -390,7 +438,7 @@ def run_cost_aware_topk_backtest(
     calendar_all = pd.DatetimeIndex(pd.to_datetime(pd.Series(market_dates)).sort_values().unique())
     feasibility_full = day_level_feasibility(cands, int(spec.top_k), calendar_all[:-1].to_numpy())
     regimes = compute_regime_metrics(daily_net, feasibility_full)
-    cost_stress = compute_cost_stress(picks, statutory_bp=float(spec.cost.statutory_bp), regime="post_reform")
+    cost_stress = compute_cost_stress(picks, regime="post_reform")
     verdict, verdict_reasons = evaluate_verdict(regimes, cost_stress)
     dates_all = pd.to_datetime(ph["date"])
     date_min = str(dates_all.min().date()) if len(dates_all) else ""

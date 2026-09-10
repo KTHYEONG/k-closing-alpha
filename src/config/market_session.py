@@ -10,6 +10,12 @@ DECISION_WINDOW_END_HHMMSS: str = "153000"
 DECISION_WINDOW_START_HMS: int = int(DECISION_WINDOW_START_HHMMSS)
 # 정수형 비교용 파생값 (문자열과 드리프트 방지)
 DECISION_WINDOW_END_HMS: int = int(DECISION_WINDOW_END_HHMMSS)
+# 종가단일가 체결 확정 상태 코드 (KIS antc_mkop_cls_code; 결정창 진행중은 '121')
+CLOSING_AUCTION_CONFIRMED_MKOP_CODE: str = "112"
+# 확정 승격을 허용하는 최소 시각 (결정창 종료시각과 동일하므로 파생 정의)
+CLOSING_AUCTION_CONFIRM_EARLIEST_HHMMSS: str = DECISION_WINDOW_END_HHMMSS
+# 확정 재폴링 데드라인 (VI 임의연장 + 벤더 반영 지연 포괄)
+CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS: str = "153300"
 DEFAULT_BAR_INTERVAL_MINUTES: int = 1
 INTRADAY_SESSION_REGULAR: str = "regular"
 INTRADAY_SESSION_NXT_AFTERMARKET: str = "nxt_aftermarket"

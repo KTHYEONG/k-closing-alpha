@@ -42,6 +42,7 @@ def run_auction_capture(
     end_hm: str = "1530",
     client: Any | None = None,
     now_fn: Any | None = None,
+    finalize: bool = False,
 ) -> int:
     """동시호가 윈도우 동안 전 종목 호가를 interval 간격으로 스윕한다."""
     snap = snapshot_date or datetime.now().strftime("%Y-%m-%d")
@@ -79,6 +80,11 @@ def run_auction_capture(
                 logger.warning("[DATA] Auction snapshot persist failed: %s", e)
         if interval_seconds and interval_seconds > 0:
             time.sleep(interval_seconds)
+    if finalize:
+        from src.daily.finalize_close import run_close_finalization
+
+        finalized = asyncio.run(run_close_finalization(snapshot_date=snap, client=owned_client, session=session))
+        logger.info("[DATA] stage=close_finalization rows=%d", finalized)
     if session is not None:
         with contextlib.suppress(Exception):
             asyncio.run(session.close())
@@ -91,6 +97,7 @@ def main() -> None:
     parser.add_argument("--interval", type=int, default=10)
     parser.add_argument("--start", default="1520")
     parser.add_argument("--end", default="1530")
+    parser.add_argument("--no-finalize", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     total = run_auction_capture(
@@ -98,6 +105,7 @@ def main() -> None:
         interval_seconds=args.interval,
         start_hm=args.start,
         end_hm=args.end,
+        finalize=not args.no_finalize,
     )
     logger.info("[SUCCESS] auction capture done rows=%d", total)
 

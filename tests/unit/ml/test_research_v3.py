@@ -157,7 +157,7 @@ def test_suspended_top1_is_not_dropped():
     ph = pd.DataFrame(ph_data)
 
     cand_df = pd.DataFrame([
-        {"date": pd.Timestamp("2024-01-02"), "symbol": "000001", "close": 10400.0}
+        {"date": pd.Timestamp("2024-01-02"), "symbol": "000001", "close": 10400.0, "market": "KOSPI"}
     ])
 
     res = attach_forward_exit_paths(cand_df, ph, market_dates, d_to_idx)
@@ -422,15 +422,17 @@ def test_v3_attach_forward_exit_paths_uses_contract_cost() -> None:
             "volume": [100, 100],
         }
     )
-    cands = pd.DataFrame({"date": [dates[0]], "symbol": ["000001"], "close": [10000.0]})
+    cands = pd.DataFrame({"date": [dates[0]], "symbol": ["000001"], "close": [10000.0], "market": ["KOSPI"]})
 
     # When
     out = attach_forward_exit_paths(cands, ph, market_dates, d_to_idx)
 
     # Then
     entry = out["close"].to_numpy(dtype=np.float64)
-    np.testing.assert_allclose(out["cost_aa_bp"].to_numpy(), round_trip_cost_bp(entry, AA_COST))
-    np.testing.assert_allclose(out["cost_pa_bp"].to_numpy(), round_trip_cost_bp(entry, PA_COST))
+    trade_dates = pd.to_datetime(out["date"]).to_numpy()
+    markets = out["market"].astype(str).to_numpy(dtype=object)
+    np.testing.assert_allclose(out["cost_aa_bp"].to_numpy(), round_trip_cost_bp(entry, trade_dates, markets, AA_COST))
+    np.testing.assert_allclose(out["cost_pa_bp"].to_numpy(), round_trip_cost_bp(entry, trade_dates, markets, PA_COST))
     np.testing.assert_allclose(out["cost_aa_bp"].to_numpy(), [40.0])
     np.testing.assert_allclose(out["cost_stress_bp"].to_numpy(), [46.0])
 
@@ -510,3 +512,66 @@ def test_load_and_prepare_price_history_delegates_to_prepare_price_panel(tmp_pat
     assert "panel_provenance" in prepared.attrs
 
 
+
+
+def test_attach_forward_exit_paths_costs_are_point_in_time() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.research.v3_engine import STRESS_COST_BP, attach_forward_exit_paths
+    from src.strategy.contract import AA_COST, PA_COST, round_trip_cost_bp
+
+    # Given: one 15,000원 KOSPI name on a pre-reform and a post-reform date,
+    #        each with a tradable D+1 bar
+    dates = pd.to_datetime(["2018-06-01", "2018-06-04", "2026-06-01", "2026-06-02"])
+    ph = pd.DataFrame(
+        {
+            "date": dates,
+            "symbol": ["000001"] * 4,
+            "open": [15000.0, 15300.0, 15000.0, 15300.0],
+            "high": [15400.0] * 4,
+            "low": [14900.0] * 4,
+            "close": [15000.0] * 4,
+            "volume": [1e6] * 4,
+        }
+    )
+    market_dates = np.array(sorted(ph["date"].unique()))
+    d_to_idx = {d: i for i, d in enumerate(market_dates)}
+    cands = ph[ph["date"].isin([dates[0], dates[2]])].copy().reset_index(drop=True)
+    cands["market"] = ["KOSPI", "KOSPI"]
+
+    # When: attaching forward exits and the per-row costs
+    out = attach_forward_exit_paths(cands, ph, market_dates, d_to_idx)
+
+    # Then: the same price costs more pre-reform (30bp tax, 50원 tick) than
+    #       post-reform (20bp tax, 10원 tick) -- the wiring is point-in-time
+    expected_aa = round_trip_cost_bp(
+        np.array([15000.0, 15000.0]),
+        pd.to_datetime([dates[0], dates[2]]).to_numpy(),
+        np.array(["KOSPI", "KOSPI"], dtype=object),
+        AA_COST,
+    )
+    np.testing.assert_allclose(out["cost_aa_bp"].to_numpy(), expected_aa)
+    assert out["cost_aa_bp"].to_numpy()[0] > out["cost_aa_bp"].to_numpy()[1]
+    expected_pa = round_trip_cost_bp(
+        np.array([15000.0, 15000.0]),
+        pd.to_datetime([dates[0], dates[2]]).to_numpy(),
+        np.array(["KOSPI", "KOSPI"], dtype=object),
+        PA_COST,
+    )
+    np.testing.assert_allclose(out["cost_pa_bp"].to_numpy(), expected_pa)
+    # And: the stress scenario stays a named constant, independent of the schedule
+    np.testing.assert_allclose(
+        out["cost_stress_bp"].to_numpy(), np.full(2, STRESS_COST_BP)
+    )
+    np.testing.assert_allclose(
+        out["net_return_aa"].to_numpy(),
+        out["gross_return"].to_numpy() - expected_aa / 1e4,
+    )
+
+    # And: without a market column the engine refuses to guess a tick table
+    with pytest.raises(ValueError, match="market"):
+        attach_forward_exit_paths(
+            cands.drop(columns=["market"]), ph, market_dates, d_to_idx
+        )

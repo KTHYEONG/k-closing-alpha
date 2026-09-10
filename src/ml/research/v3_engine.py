@@ -40,6 +40,9 @@ FEATURE_COLS: list[str] = [
     "chg_rank",
 ]
 
+# 실측 왕복비용 상단 시나리오(bp). 라벨이 아니라 스트레스 시나리오 전용이므로 PIT 스케줄과 독립이다.
+STRESS_COST_BP: float = 46.0
+
 
 def load_and_prepare_price_history(path: Path | str) -> tuple[pd.DataFrame, np.ndarray, dict[pd.Timestamp, int]]:
     """Load price history and construct trading calendar index."""
@@ -150,9 +153,13 @@ def attach_forward_exit_paths(
 
     # Calculate returns and costs
     entry_p = cands["close"].to_numpy(dtype=np.float64)
-    cost_aa_bp = round_trip_cost_bp(entry_p, AA_COST)
-    cost_pa_bp = round_trip_cost_bp(entry_p, PA_COST)
-    cost_stress_bp = np.full(len(cands), 46.0, dtype=np.float64)
+    if "market" not in cands.columns:
+        raise ValueError("attach_forward_exit_paths requires a 'market' column for point-in-time tick costing")
+    trade_dates = pd.to_datetime(cands["date"]).to_numpy()
+    markets = cands["market"].astype(str).to_numpy(dtype=object)
+    cost_aa_bp = round_trip_cost_bp(entry_p, trade_dates, markets, AA_COST)
+    cost_pa_bp = round_trip_cost_bp(entry_p, trade_dates, markets, PA_COST)
+    cost_stress_bp = np.full(len(cands), STRESS_COST_BP, dtype=np.float64)
 
     gross_ret = exit_prices / entry_p - 1.0
     cands["gross_return"] = gross_ret

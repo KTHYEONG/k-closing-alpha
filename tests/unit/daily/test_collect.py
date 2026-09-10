@@ -177,6 +177,7 @@ def test_fetch_single_stock_returns_minimal_row_schema() -> None:
     assert set(row) == {
         "종목명", "종목코드", "시장구분", "시가", "고가", "저가", "종가", "전일종가",
         "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수", "등락률", "수급_실패",
+        "결정_종가", "종가_확정",
     }
     assert row["수급_실패"] is False
     assert failed == []
@@ -447,3 +448,52 @@ def test_parse_market_index_rate_fallthrough_returns_none() -> None:
         {"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "0.00", "bstp_nmix_prpr": "not-a-number", "bstp_nmix_prdy_vrss": "0"}}
     )
     assert malformed is None
+def test_fetch_single_stock_records_decision_close_and_unconfirmed_flag() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+
+    from src.daily import collect
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(
+        return_value={
+            "rt_cd": "0",
+            "output": {
+                "stck_prpr": "269250",
+                "stck_oprc": "270000",
+                "stck_hgpr": "272000",
+                "stck_lwpr": "268000",
+                "acml_vol": "19525671",
+                "prdy_ctrt": "-0.09",
+                "lstn_stcn": "5969782550",
+                "hts_avls": "1600000",
+                "acml_tr_pbmn": "5220657837500",
+                "rprs_mrkt_kor_name": "KOSPI",
+            },
+        }
+    )
+    client.get_investor_trend_estimate = AsyncMock(
+        return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]}
+    )
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": {"askp1": "269500", "bidp1": "269250"}})
+
+    async def _run():
+        return await collect.fetch_single_stock(
+            0,
+            {"code": "005930", "name": "삼성전자", "price": "269250", "chgrate": "-0.09"},
+            1,
+            asyncio.Semaphore(1),
+            client,
+            object(),
+        )
+
+    row, failed_apis, _orderbook_rows = asyncio.run(_run())
+
+    assert failed_apis == []
+    assert row["종가"] == 269250
+    assert row[DECISION_CLOSE_COL] == 269250
+    assert row[CLOSE_CONFIRMED_COL] is False
+
+
