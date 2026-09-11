@@ -153,8 +153,7 @@
     ]
   },
   "src/daily/collect.py": {
-    "testing": "tests/unit/daily/test_collect.py",
-    "architecture": "docs/architecture/api_master.md"
+    "testing": "tests/unit/daily/test_collect.py"
   },
   "src/daily/finalize_close.py": {
     "testing": "tests/unit/daily/test_finalize_close.py"
@@ -264,6 +263,9 @@
   },
   "src/ml/sector_features.py": {
     "testing": "tests/unit/ml/test_sector_features.py"
+  },
+  "src/ml/topk_history_features.py": {
+    "testing": "tests/unit/ml/test_topk_history_features.py"
   },
   "src/ml/topk_ranker_research.py": {
     "testing": "tests/unit/ml/test_topk_ranker_research.py"
