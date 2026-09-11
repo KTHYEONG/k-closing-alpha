@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260911_TOPK_RANKER_ML_UPLIFT",
+      "date": "2026-09-11",
+      "adr_id": "ADR_20260911_20260911_TOPK_RANKER_ML_UPLIFT",
+      "domain": "ml",
+      "title": "Top-3 비용축 리랭커 피처·라벨·앙상블 인증 v2",
+      "why": "리랭커가 14피처·60트리로 과소적합, 인증(CPCV)과 서빙 번들이 서로 다른 하이퍼파라미터를 쓰고 있었다",
+      "resolution": "종목별 PIT 오버나잇/모멘텀/수급 이력 14개 추가(28피처), 튜닝 파라미터+5시드 앙상블, 날짜내 평균차감 라벨로 통일해 인증·서빙을 동일 설정으로 일원화",
+      "impact": "post-reform 인증 net 28.7->46.2bp/day, 비용정렬 대비 경로승률 23/28->28/28, p 0.167->5e-6; 서빙은 price_history가 직전거래일까지 없으면 fail-closed"
+    },
+    {
       "task_id": "TASK_API_SURFACE_HARDENING",
       "date": "2026-09-11",
       "adr_id": "ADR_20260911_API_SURFACE_HARDENING",
@@ -989,16 +999,6 @@
       "why": "Refactor legacy sqlite archive to 27 standard columns matching Google Spreadsheet layout, with dual persistence (Parquet+SQLite) and TSV export",
       "resolution": "Redesigned src/daily/archive.py, simplified paths to data/history/archive.parquet and archive.db, aligned 27 columns 1:1 with spreadsheet, added TSV export CLI",
       "impact": "Improved archive durability, guaranteed spreadsheet copy-paste compatibility, and simplified history file management"
-    },
-    {
-      "task_id": "daily_data_refactoring",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_daily_data_refactoring",
-      "domain": "daily",
-      "title": "Daily Data Storage, Column Standardization & Logic Cleanup",
-      "why": "Cleanup redundant chart_pass cache and parenthesis column renaming, and adjust daily stock data storage location to data/daily/",
-      "resolution": "Removed chart_pass_cache.json and (차트통과) logic, relocated files to data/daily/daily_stocks.csv and parquet, and standardized columns across collect.py and predict.py without duplicate rename_map.",
-      "impact": "Clean daily data storage structure, improved maintainability and AI workflow efficiency, zero redundant column renaming."
     }
   ]
 }
