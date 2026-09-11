@@ -36,18 +36,24 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp) -> pd.DataFrame:
 
     Returns:
         등가중 top-k 선정 결과. 저장소에 기록된 ``admitted`` 컬럼을 그대로
-        사용하며 재계산하지 않는다. 번들이 없거나 wide 단면이 비정상이면
-        경고를 남기고 빈 프레임을 반환한다.
+        사용하며 재계산하지 않는다. 번들이 없거나 wide 단면이 비정상이거나
+        price_history 가 없거나 직전 거래일까지 갱신되지 않았으면 경고를
+        남기고 빈 프레임을 반환한다.
     """
     try:
+        from src.ml import topk_history_features
         from src.ml.costaware_topk import MIN_TOP_K
         from src.ml.topk_ranker_research import TOPK_RANKER_BUNDLE_DIR, select_topk_equal_weight
         from src.serving.realtime.features import build_topk_ranker_features
 
         wide = load_daily_snapshot(decision_date)
-        features_df = build_topk_ranker_features(wide, decision_date)
-        features_df["admitted"] = wide["admitted"].to_numpy()
         bundle = load_model_bundle(import_dir=TOPK_RANKER_BUNDLE_DIR)
+        # 번들이 선언한 피처가 이력 피처를 요구할 때만 price_history 를 읽는다
+        price_history = None
+        if set(bundle.get("feature_cols", [])) & set(topk_history_features.TOPK_HISTORY_FEATURE_COLS):
+            price_history = topk_history_features.load_serving_price_history(decision_date)
+        features_df = build_topk_ranker_features(wide, decision_date, price_history=price_history)
+        features_df["admitted"] = wide["admitted"].to_numpy()
         picks = select_topk_equal_weight(
             features_df, bundle, top_k=int(bundle.get("top_k", MIN_TOP_K))
         )
