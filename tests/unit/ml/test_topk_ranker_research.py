@@ -1348,3 +1348,169 @@ def test_train_production_bundle_matches_research_training_window() -> None:
     assert bundle["train_start"] == str(pd.to_datetime(ph["date"]).min().date())
     # And: the certification boundary is still recorded and unmoved
     assert bundle["certification_regime_start"] == str(CERT_REGIME_START.date())
+
+
+def test_demean_label_by_date_centres_net_within_date_and_clips() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_ranker_research import demean_label_by_date
+
+    # Given: two dates; one NaN net on day 1, an outlier on day 2
+    labeled = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02"] * 3 + ["2024-01-03"] * 3),
+        "net_pit": [0.01, 0.03, np.nan, 0.50, -0.10, -0.10],
+        "train_label": [9.0] * 6,
+    })
+
+    # When
+    out = demean_label_by_date(labeled, label_clip=0.10)
+
+    # Then: label = clip(net - finite date mean); NaN stays NaN; evaluation column and input untouched
+    assert out["train_label"].iloc[0] == pytest.approx(-0.01)
+    assert out["train_label"].iloc[1] == pytest.approx(0.01)
+    assert np.isnan(out["train_label"].iloc[2])
+    assert out["train_label"].iloc[3:].tolist() == pytest.approx([0.10, -0.10, -0.10])
+    assert out["net_pit"].equals(labeled["net_pit"])
+    assert labeled["train_label"].eq(9.0).all()
+    with pytest.raises(ValueError, match="net_pit"):
+        demean_label_by_date(labeled.drop(columns=["net_pit"]))
+
+
+def test_ranker_configuration_is_single_certified_source() -> None:
+    import src.ml.topk_ranker_research as mod
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_history_features import TOPK_FEATURE_COLS_V2
+
+    # Then: one constant set drives both CPCV certification and the production bundle
+    assert mod.RANKER_MODEL_PARAMS == {
+        "n_estimators": 400, "learning_rate": 0.02, "num_leaves": 15, "min_child_samples": 300,
+        "subsample": 0.8, "subsample_freq": 1, "colsample_bytree": 0.8, "reg_lambda": 5.0,
+    }
+    assert mod.RANKER_SEEDS == (1, 2, 3, 4, 5)
+    assert mod.RANKER_FEATURE_COLS == TOPK_FEATURE_COLS_V2
+    assert len(mod.RANKER_FEATURE_COLS) == 28
+    assert mod.RANKER_FEATURE_COLS[: len(FEATURE_COLS)] == list(FEATURE_COLS)
+    assert mod.LABEL_MODE == "date_demeaned"
+
+
+def test_build_dual_pool_attaches_topk_v2_features() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_history_features import TOPK_FEATURE_COLS_V2
+    from src.ml.topk_ranker_research import build_dual_pool
+    from src.strategy.contract import COST_AWARE_UNIVERSE, DEFAULT_UNIVERSE
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+
+    # When
+    pool, sel_mask = build_dual_pool(
+        ph, market_dates, d_to_idx, train_spec=DEFAULT_UNIVERSE, select_spec=COST_AWARE_UNIVERSE
+    )
+
+    # Then: every v2 feature is present and the positional index contract (sel_mask[oof.index]) holds
+    assert not [c for c in TOPK_FEATURE_COLS_V2 if c not in pool.columns]
+    assert pool.index.equals(pd.RangeIndex(len(pool)))
+    assert sel_mask.shape == (len(pool),)
+    assert np.allclose(pool["f_tick_cost"].to_numpy(), pool["tick_cost_bp"].to_numpy())
+    assert pool["f_gap"].to_numpy() == pytest.approx(0.0)
+
+
+def test_cpcv_score_with_history_averages_seed_ensemble() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import cpcv_score_with_history
+
+    # Given: a learnable synthetic cert frame and a subsampling model so seeds matter
+    rng = np.random.default_rng(9)
+    rows = []
+    for d in pd.bdate_range("2023-02-01", periods=16):
+        for s in range(6):
+            f1 = float(rng.normal())
+            rows.append({"date": d, "symbol": f"{s:06d}", "f1": f1, "f2": float(rng.normal()),
+                         "train_label": 0.01 * f1 + 0.002 * float(rng.normal())})
+    cert = pd.DataFrame(rows)
+    cv = CombinatorialPurgedCV(n_groups=8, k_test=2, purge_gap=1, embargo_gap=0)
+    params = {"n_estimators": 20, "learning_rate": 0.1, "num_leaves": 4, "min_child_samples": 5,
+              "subsample": 0.7, "subsample_freq": 1, "colsample_bytree": 1.0, "reg_lambda": 1.0}
+
+    # When
+    both = cpcv_score_with_history(cert, cert.iloc[0:0], ["f1", "f2"], cv=cv, model_params=params, min_train_rows=10, seeds=(1, 2))
+    one = cpcv_score_with_history(cert, cert.iloc[0:0], ["f1", "f2"], cv=cv, model_params=params, min_train_rows=10, seeds=(1,))
+    two = cpcv_score_with_history(cert, cert.iloc[0:0], ["f1", "f2"], cv=cv, model_params=params, min_train_rows=10, seeds=(2,))
+
+    # Then: the ensemble prediction is the per-row mean of the single-seed predictions
+    key = ["cpcv_fold", "date", "symbol"]
+    m = both.merge(one[[*key, "pred"]], on=key, suffixes=("", "_1")).merge(two[[*key, "pred"]], on=key, suffixes=("", "_2"))
+    assert len(m) == len(both)
+    assert np.allclose(m["pred"].to_numpy(), (m["pred_1"].to_numpy() + m["pred_2"].to_numpy()) / 2.0)
+    assert not np.allclose(m["pred_1"].to_numpy(), m["pred_2"].to_numpy())
+
+
+def test_train_production_bundle_uses_certified_params_seeds_and_demeaned_label() -> None:
+    from src.ml.bundle import SeedEnsembleModel
+    from src.ml.topk_ranker_research import (
+        CERT_REGIME_START,
+        LABEL_MODE,
+        RANKER_FEATURE_COLS,
+        RANKER_MODEL_PARAMS,
+        RANKER_SEEDS,
+        train_production_bundle,
+    )
+
+    ph, market_dates, d_to_idx = _two_regime_prepared_panel()
+
+    # When
+    bundle = train_production_bundle(ph, market_dates, d_to_idx, min_train_rows=10, train_start=CERT_REGIME_START)
+
+    # Then: the served model is exactly the certified configuration
+    assert bundle["feature_cols"] == list(RANKER_FEATURE_COLS)
+    assert isinstance(bundle["return_model"], SeedEnsembleModel)
+    assert bundle["return_model"].seeds == RANKER_SEEDS
+    for model in bundle["return_model"].models:
+        params = model.get_params()
+        for key, value in RANKER_MODEL_PARAMS.items():
+            assert params[key] == value
+    assert bundle["label_mode"] == LABEL_MODE
+    assert bundle["model_params"] == RANKER_MODEL_PARAMS
+    assert bundle["seeds"] == list(RANKER_SEEDS)
+
+
+def test_run_topk_ranker_backtest_trains_on_demeaned_label_and_v2_features(monkeypatch) -> None:
+    import numpy as np
+
+    import src.ml.topk_ranker_research as mod
+    from src.ml.robust_eval import CombinatorialPurgedCV
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    cv = CombinatorialPurgedCV(n_groups=8, k_test=2, purge_gap=1, embargo_gap=0)
+    captured: dict = {}
+    real = mod.cpcv_score_with_history
+
+    def _spy(cert_df, hist_df, feature_cols, **kwargs):
+        captured["cert_df"] = cert_df
+        captured["feature_cols"] = list(feature_cols)
+        captured["seeds"] = kwargs.get("seeds")
+        return real(cert_df, hist_df, feature_cols, **kwargs)
+
+    monkeypatch.setattr(mod, "cpcv_score_with_history", _spy)
+
+    # When
+    mod.run_topk_ranker_backtest(
+        ph, market_dates, d_to_idx, cv=cv, min_train_rows=10, train_start=mod.CERT_REGIME_START, seeds=(42,)
+    )
+
+    # Then: CPCV trains on the v2 feature set with the date-demeaned label and the requested seeds
+    cert = captured["cert_df"]
+    assert captured["feature_cols"] == list(mod.RANKER_FEATURE_COLS)
+    assert captured["seeds"] == (42,)
+    raw = cert["net_pit"] - cert.groupby("date")["net_pit"].transform("mean")
+    # 마지막 날은 D+1 봉이 없어 net_pit 이 NaN → 라벨도 NaN 으로 전파
+    assert np.allclose(cert["train_label"].to_numpy(), raw.clip(-mod.LABEL_CLIP, mod.LABEL_CLIP).to_numpy(), equal_nan=True)
+    assert np.allclose(cert.groupby("date")["train_label"].mean().dropna().to_numpy(), 0.0, atol=1e-12)
+

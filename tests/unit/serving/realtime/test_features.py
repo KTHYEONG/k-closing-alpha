@@ -120,3 +120,69 @@ def test_build_topk_ranker_features_raises_on_missing_required_column() -> None:
 
     with pytest.raises(ValueError, match="거래대금|missing"):  # noqa: RUF043 - spec skeleton alternation
         build_topk_ranker_features(df, pd.Timestamp("2026-09-09"))
+
+
+def test_build_topk_ranker_features_with_price_history_emits_v2_columns() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_history_features import TOPK_FEATURE_COLS_V2
+    from src.serving.realtime.features import build_topk_ranker_features
+
+    # Given: a two-name live snapshot and 70 strictly-past trading days of history
+    decision = pd.Timestamp("2026-09-09")
+    rng = np.random.default_rng(1)
+    hist = pd.DataFrame([
+        {"date": d, "symbol": s, "open": 1000.0, "close": 1000.0 * (1.0 + 0.01 * float(rng.normal())),
+         "prev_close": 1000.0, "volume": 1e5, "inst_netbuy": 1e6, "foreign_netbuy": -1e6}
+        for s in ("005930", "000660")
+        for d in pd.bdate_range(end=decision - pd.Timedelta(days=1), periods=70)
+    ])
+    df = pd.DataFrame({
+        "종목코드": ["005930", "000660"],
+        "종가": [70000.0, 180000.0],
+        "전일종가": [68000.0, 176000.0],
+        "고가": [70500.0, 181000.0],
+        "저가": [68500.0, 177000.0],
+        "시가": [68800.0, 177500.0],
+        "거래량": [1_000_000.0, 500_000.0],
+        "거래대금": [700.0, 900.0],
+        "시가총액": [4_200_000.0, 1_300_000.0],
+        "기관_순매수": [1000.0, -500.0],
+        "외국인_순매수": [2000.0, 300.0],
+        "시장구분": ["KOSPI", "KOSPI"],
+        "kospi": [0.52, 0.52],
+        "kosdaq": [0.31, 0.31],
+        "v_kospi": [15.2, 15.2],
+    })
+
+    # When
+    out = build_topk_ranker_features(df, decision, price_history=hist)
+
+    # Then: row order follows the snapshot and every v2 feature is emitted from decision-time data
+    assert out["symbol"].tolist() == ["005930", "000660"]
+    assert not [c for c in TOPK_FEATURE_COLS_V2 if c not in out.columns]
+    assert out["f_gap"].to_numpy() == pytest.approx([68800.0 / 68000.0 - 1.0, 177500.0 / 176000.0 - 1.0])
+    assert (out["f_tick_cost"] > 0).all()
+    assert out["f_log_close"].to_numpy() == pytest.approx(np.log([70000.0, 180000.0]))
+    assert out["f_ret20"].notna().all()
+
+
+def test_build_topk_ranker_features_with_price_history_requires_market_column() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.serving.realtime.features import build_topk_ranker_features
+
+    df = pd.DataFrame({
+        "종목코드": ["005930"], "종가": [70000.0], "전일종가": [68000.0], "고가": [70500.0], "저가": [68500.0],
+        "시가": [68800.0], "거래량": [1_000_000.0], "거래대금": [700.0], "시가총액": [4_200_000.0],
+        "기관_순매수": [1000.0], "외국인_순매수": [2000.0], "kospi": [0.52], "kosdaq": [0.31], "v_kospi": [15.2],
+    })
+    hist = pd.DataFrame({"date": [pd.Timestamp("2026-09-08")], "symbol": ["005930"], "open": [1.0], "close": [1.0],
+                         "prev_close": [1.0], "volume": [1.0], "inst_netbuy": [0.0], "foreign_netbuy": [0.0]})
+
+    with pytest.raises(ValueError, match="시장구분"):
+        build_topk_ranker_features(df, pd.Timestamp("2026-09-09"), price_history=hist)
+

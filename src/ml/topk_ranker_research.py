@@ -13,13 +13,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMRegressor
 from scipy.stats import ttest_rel
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet
 from src.execution.cost_model import TICK_REFORM_DATE
-from src.ml.bundle import build_inline_bundle
+from src.ml.bundle import build_inline_bundle, fit_seed_ensemble
 from src.ml.costaware_topk import (
     MIN_POST_REFORM_T_STAT,
     MIN_TOP_K,
@@ -35,7 +34,6 @@ from src.ml.costaware_topk import (
 )
 from src.ml.oof import _finite_nan
 from src.ml.research.v3_engine import (
-    FEATURE_COLS,
     attach_forward_exit_paths,
     build_candidate_universe,
     compute_derived_features,
@@ -43,6 +41,7 @@ from src.ml.research.v3_engine import (
 )
 from src.ml.research.v3_metrics import calculate_series_metrics
 from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict
+from src.ml.topk_history_features import TOPK_FEATURE_COLS_V2, attach_topk_features
 from src.strategy.contract import (
     DEFAULT_UNIVERSE,
     KCA_TOPK_CAPFREE_001,
@@ -59,7 +58,22 @@ logger = logging.getLogger(__name__)
 TRAIN_POOL_MIN_ROWS: int = 2000
 CPCV_N_GROUPS: int = 8
 CPCV_K_TEST: int = 2
-RANKER_MODEL_PARAMS: dict[str, Any] = {"n_estimators": 60, "learning_rate": 0.03}
+# 인증·서빙 공용 단일 설정: 인접 하이퍼파라미터 6점이 모두 동일 성능 고원에 있음을 CPCV로 확인한 값
+RANKER_MODEL_PARAMS: dict[str, Any] = {
+    "n_estimators": 400,
+    "learning_rate": 0.02,
+    "num_leaves": 15,
+    "min_child_samples": 300,
+    "subsample": 0.8,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.8,
+    "reg_lambda": 5.0,
+}
+# subsample<1 이라 단일 시드 결과가 임의적 → 5시드 평균으로 분산 제거
+RANKER_SEEDS: tuple[int, ...] = (1, 2, 3, 4, 5)
+RANKER_FEATURE_COLS: list[str] = list(TOPK_FEATURE_COLS_V2)
+# top-3 는 매일 투자하므로 날짜 공통 드리프트는 선택과 무관 → 날짜내 차감 라벨
+LABEL_MODE: str = "date_demeaned"
 LABEL_CLIP: float = 0.10
 CERT_REGIME_START: pd.Timestamp = pd.Timestamp(TICK_REFORM_DATE)
 MIN_SCORED_FOLD_FRACTION: float = 0.90
@@ -184,6 +198,7 @@ def build_dual_pool(
     pool, _ = build_candidate_universe(ph, train_spec)
     pool = attach_forward_exit_paths(pool, ph, market_dates, d_to_idx)
     pool = compute_derived_features(pool)
+    pool = attach_topk_features(pool, ph)
     sel_mask = select_universe(pool, select_spec)
     return pool, np.asarray(sel_mask, dtype=bool)
 
@@ -219,6 +234,41 @@ def attach_pit_net_label(
     out["net_pit"] = np.asarray(net, dtype=np.float64)
     clip = float(label_clip)
     out["train_label"] = np.clip(out["net_pit"].to_numpy(dtype=np.float64), -clip, clip)
+    return out
+
+
+def demean_label_by_date(
+    labeled: pd.DataFrame,
+    *,
+    label_clip: float = LABEL_CLIP,
+    date_col: str = "date",
+    net_col: str = "net_pit",
+    label_col: str = "train_label",
+) -> pd.DataFrame:
+    """Replace the training label with the date-demeaned, clipped net return.
+
+    Args:
+        labeled: Wide pool carrying the PIT net return column.
+        label_clip: Symmetric clip bound applied after demeaning.
+        date_col: Date column defining the cross-section.
+        net_col: Net return column; left untouched for evaluation.
+        label_col: Training label column to overwrite.
+
+    Returns:
+        Copy of labeled whose label_col is clip(net - mean_date(net)); NaN net stays NaN.
+
+    Raises:
+        ValueError: When date_col or net_col is missing.
+    """
+    missing = [c for c in (date_col, net_col) if c not in labeled.columns]
+    if missing:
+        raise ValueError(f"labeled missing required columns: {missing}")
+    out = labeled.copy()
+    net = out[net_col].astype("float64")
+    # 날짜 평균은 유한 순수익 행만으로 계산 (광역풀 단면 기준)
+    day_mean = net.groupby(out[date_col], sort=False).transform("mean")
+    clip = float(label_clip)
+    out[label_col] = (net - day_mean).clip(-clip, clip)
     return out
 
 
@@ -405,6 +455,7 @@ def cpcv_score_with_history(
     model_params: dict[str, Any] | None = None,
     huber_delta: float = 0.9,
     min_train_rows: int = TRAIN_POOL_MIN_ROWS,
+    seeds: tuple[int, ...] = RANKER_SEEDS,
 ) -> pd.DataFrame:
     """Score certification rows with CPCV bins, fitting on history plus fold rows.
 
@@ -418,6 +469,7 @@ def cpcv_score_with_history(
         model_params: LightGBM params; defaults to RANKER_MODEL_PARAMS.
         huber_delta: Huber alpha for the ranker.
         min_train_rows: Fail-closed floor on per-fold training rows.
+        seeds: LightGBM seeds averaged per fold (the serving bundle uses the same).
 
     Returns:
         Out-of-fold predictions covering cert_df rows only, carrying pred and
@@ -443,12 +495,8 @@ def cpcv_score_with_history(
             raise ValueError(
                 f"fold {int(fold_id)} training rows {len(train_full)} below min_train_rows {min_train_rows}"
             )
-        train_f = _finite_nan(train_full, list(feature_cols))
         val_f = _finite_nan(val, list(feature_cols))
-        reg = LGBMRegressor(
-            objective="huber", alpha=float(huber_delta), random_state=42, verbosity=-1, **params
-        )
-        reg.fit(train_f[list(feature_cols)], train_f[target_col].to_numpy(dtype=np.float64))
+        reg = fit_seed_ensemble(train_full, list(feature_cols), target_col, tuple(seeds), params, float(huber_delta))
         fold_df = cert_work.loc[val.index].copy()
         fold_df.attrs = {}
         fold_df["pred"] = np.asarray(reg.predict(val_f[list(feature_cols)]), dtype=np.float64)
@@ -698,6 +746,7 @@ def run_topk_ranker_backtest(
     huber_delta: float = 0.9,
     min_train_rows: int = TRAIN_POOL_MIN_ROWS,
     train_start: pd.Timestamp | None = None,
+    seeds: tuple[int, ...] = RANKER_SEEDS,
 ) -> TopKRankerReport:
     """Run the wide-train / cost-screened-select ranker harness over the full panel.
 
@@ -713,6 +762,7 @@ def run_topk_ranker_backtest(
         min_train_rows: Fail-closed floor on finite-target rows.
         train_start: Training-window start; augments training only and never
             moves the certification boundary. None selects the panel minimum date.
+        seeds: LightGBM seeds averaged per CPCV fold.
 
     Returns:
         Assembled ranker-vs-control report with regime verdict.
@@ -731,16 +781,17 @@ def run_topk_ranker_backtest(
     )
     constructible_regimes = ("pre_reform", "post_reform") if spec.universe.max_tick_cost_bp is None else ("post_reform",)
     screen_day_fractions = assert_screen_constructible(pool.loc[sel_mask], top_k=k, regimes=constructible_regimes)
-    labeled = attach_pit_net_label(pool, cost=spec.cost)
+    labeled = demean_label_by_date(attach_pit_net_label(pool, cost=spec.cost))
     cert_df, hist_df = split_regime_frames(labeled, train_start=eff_train_start)
     oof = cpcv_score_with_history(
         cert_df,
         hist_df,
-        FEATURE_COLS,
+        RANKER_FEATURE_COLS,
         cv=cv,
         model_params=model_params,
         huber_delta=huber_delta,
         min_train_rows=min_train_rows,
+        seeds=seeds,
     )
     sel_oof = oof[sel_mask[oof.index.to_numpy()]]
     evidence = compute_path_evidence(sel_oof, top_k=k)
@@ -856,6 +907,7 @@ def train_production_bundle(
     model_params: dict[str, Any] | None = None,
     huber_delta: float = 0.9,
     min_train_rows: int = TRAIN_POOL_MIN_ROWS,
+    seeds: tuple[int, ...] = RANKER_SEEDS,
 ) -> dict[str, Any]:
     """Train one final production bundle on the certification-regime wide pool.
 
@@ -866,9 +918,11 @@ def train_production_bundle(
         spec: Strategy specification carrying top_k, select universe and cost.
         train_spec: Wide training screen without the cost cap.
         train_start: Training-window start; None selects the panel minimum date.
-        model_params: LightGBM params forwarded to build_inline_bundle.
+        model_params: LightGBM params forwarded to build_inline_bundle; None
+            selects RANKER_MODEL_PARAMS, the configuration CPCV certifies.
         huber_delta: Huber alpha for the return model.
         min_train_rows: Fail-closed floor on finite-label rows.
+        seeds: Seed ensemble for the return model, matching certification.
 
     Returns:
         Extended bundle dict with audit provenance keys.
@@ -883,7 +937,7 @@ def train_production_bundle(
     pool, _sel_mask = build_dual_pool(
         ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe
     )
-    labeled = attach_pit_net_label(pool, cost=spec.cost)
+    labeled = demean_label_by_date(attach_pit_net_label(pool, cost=spec.cost))
     cert_df, hist_df = split_regime_frames(labeled, train_start=eff_train_start)
     train_df = pd.concat([hist_df, cert_df]) if len(hist_df) else cert_df
     labels = train_df["train_label"].to_numpy(dtype=np.float64)
@@ -892,19 +946,25 @@ def train_production_bundle(
         raise ValueError(
             f"finite train_label rows {len(fit_df)} below min_train_rows {min_train_rows}"
         )
+    # 인증 CPCV 와 동일 파라미터·시드로 학습 (서빙=인증 모델 정합)
+    eff_params = dict(RANKER_MODEL_PARAMS) if model_params is None else dict(model_params)
     bundle = build_inline_bundle(
         fit_df,
-        list(FEATURE_COLS),
+        list(RANKER_FEATURE_COLS),
         "train_label",
         "date",
-        return_model_params=model_params,
+        return_model_params=eff_params,
         huber_delta=huber_delta,
+        seeds=tuple(seeds),
     )
     bundle["strategy_id"] = spec.strategy_id
     bundle["top_k"] = int(spec.top_k)
     bundle["train_start"] = str(eff_train_start.date())
     bundle["certification_regime_start"] = str(CERT_REGIME_START.date())
     bundle["select_universe"] = dataclasses.asdict(spec.universe)
+    bundle["label_mode"] = LABEL_MODE
+    bundle["model_params"] = eff_params
+    bundle["seeds"] = list(seeds)
     return bundle
 
 
