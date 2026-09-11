@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260911_PRICE_HISTORY_BULK_INGEST",
+      "date": "2026-09-11",
+      "adr_id": "ADR_20260911_20260911_PRICE_HISTORY_BULK_INGEST",
+      "domain": "daily",
+      "title": "price_history 벌크수집 전환(KRX+KIS+Kiwoom)",
+      "why": "종목별 pykrx 우선 백필이 시총조회 고장·거래대금 결측으로 전종목 KIS 폴백행 매일 88분+ 소요, 유니버스가 1,303종목으로 붕괴, 지수 컬럼(kospi_pct 등)이 코스닥/코스피200과 뒤바뀐 채 저장되고 있었다",
+      "resolution": "KRX OpenAPI 날짜별 전종목 벌크(2회/일)+KIS 비동기 수급/프로그램/지수(0001/1001)+Kiwoom ka10059 폴백+KRX기준가 결정론적 소급수정으로 재설계, 이력 지수 4컬럼 일괄교정, Mon-Fri 08:30/11:30/21:30 멱등 타이머 신설",
+      "impact": "실데이터 드라이런 353.7초에 전종목 2766개 4거래일 반영(기존 88분+/1307종목), 10개 컬럼 100% 일치·불변식 100%; 첫 실행 후 인증 재실행과 v2 번들 재학습 필요"
+    },
+    {
       "task_id": "TASK_20260911_TOPK_RANKER_ML_UPLIFT",
       "date": "2026-09-11",
       "adr_id": "ADR_20260911_20260911_TOPK_RANKER_ML_UPLIFT",
@@ -989,16 +999,6 @@
       "why": "Eliminate duplicate chart_analysis column, integrate theme mapping via theme.parquet, remove legacy _Y suffix, and align 26 columns 1:1 with spreadsheet",
       "resolution": "Updated src/daily/archive.py and predict.py to use official load_theme loader, consolidated scenario to single column 26, and updated docs/specs",
       "impact": "Cleaned legacy artifacts, guaranteed 100% spreadsheet compatibility with exact 26 columns, and resolved all null values"
-    },
-    {
-      "task_id": "ARCHIVE_REDESIGN",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_ARCHIVE_REDESIGN",
-      "domain": "daily",
-      "title": "Daily Candidate Archive Redesign and Spreadsheet Alignment",
-      "why": "Refactor legacy sqlite archive to 27 standard columns matching Google Spreadsheet layout, with dual persistence (Parquet+SQLite) and TSV export",
-      "resolution": "Redesigned src/daily/archive.py, simplified paths to data/history/archive.parquet and archive.db, aligned 27 columns 1:1 with spreadsheet, added TSV export CLI",
-      "impact": "Improved archive durability, guaranteed spreadsheet copy-paste compatibility, and simplified history file management"
     }
   ]
 }
