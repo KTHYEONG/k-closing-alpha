@@ -24,7 +24,8 @@
   "src/api/kiwoom/client.py": {
     "testing": [
       "tests/unit/api/kiwoom/test_kiwoom_client.py",
-      "tests/unit/daily/test_collect_service.py"
+      "tests/unit/daily/test_collect_service.py",
+      "tests/unit/daily/test_price_ingest.py"
     ]
   },
   "src/api/ls/client.py": {
@@ -108,7 +109,10 @@
     ]
   },
   "src/backfill/price/factors.py": {
-    "testing": "tests/unit/backfill/test_factors_proxy.py"
+    "testing": [
+      "tests/unit/backfill/test_factors_proxy.py",
+      "tests/unit/daily/test_price_ingest.py"
+    ]
   },
   "src/backfill/price/normalize.py": {
     "testing": "tests/unit/backfill/price/test_normalize.py"
@@ -163,6 +167,9 @@
   },
   "src/daily/predict.py": {
     "testing": "tests/unit/daily/test_predict.py"
+  },
+  "src/daily/price_ingest.py": {
+    "testing": "tests/unit/daily/test_price_ingest.py"
   },
   "src/daily/universe_scan.py": {
     "testing": "tests/unit/daily/test_universe_scan.py"
