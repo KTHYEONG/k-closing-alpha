@@ -1,0 +1,12 @@
+[Unit]
+Description=KCA price_history ingest (idempotent gap-fill: Mon-Fri 21:30 same-day, 08:30/11:30 next-morning catch-up)
+
+[Timer]
+OnCalendar=Mon..Fri 08:30:00 Asia/Seoul
+OnCalendar=Mon..Fri 11:30:00 Asia/Seoul
+OnCalendar=Mon..Fri 21:30:00 Asia/Seoul
+Persistent=true
+Unit=kca-price-ingest.service
+
+[Install]
+WantedBy=timers.target
