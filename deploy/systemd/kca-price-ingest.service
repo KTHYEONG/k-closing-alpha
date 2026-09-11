@@ -1,0 +1,7 @@
+[Unit]
+Description=KCA price_history ingest (KRX bulk + KIS flows/index)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/kth/k-closing-alpha
+ExecStart=/home/kth/.local/bin/uv run python -m src.daily.price_ingest
