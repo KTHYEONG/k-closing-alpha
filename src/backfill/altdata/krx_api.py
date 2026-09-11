@@ -26,6 +26,7 @@ KRX_ENDPOINT_KOSPI_INDEX_DAILY = "/svc/apis/idx/kospi_dd_trd"
 KRX_ENDPOINT_STK_BASE_INFO = "/svc/apis/sto/stk_isu_base_info"
 KRX_ENDPOINT_KSQ_BASE_INFO = "/svc/apis/sto/ksq_isu_base_info"
 KRX_ENDPOINT_STK_DAILY = "/svc/apis/sto/stk_bydd_trd"
+KRX_ENDPOINT_KSQ_DAILY = "/svc/apis/sto/ksq_bydd_trd"
 
 
 def fetch_krx_openapi_day(
