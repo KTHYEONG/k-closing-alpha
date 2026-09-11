@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 # 응답 바디에 "유량=5, API ID=<api_id>" 명시. api-id(TR)별로 독립된 버킷이 부과된다.
 _KIWOOM_TR_RATE_PER_SEC = 5.0
 
+# 키움 API 앞단 WAF는 aiohttp 기본 User-Agent("Python/x.y aiohttp/x.y")를 자동화 도구로
+# 탐지해 요청을 차단한다(HTML "Request Blocked" 400). IP 등록 여부와 무관하게 UA만으로
+# 통과 여부가 갈리므로, 브라우저/CLI 도구처럼 보이는 값으로 고정한다.
+_KIWOOM_USER_AGENT = "curl/8.5.0"
+
 
 class KiwoomApiClient:
     def __init__(self, app_key: str | None = None, secret_key: str | None = None, base_url: str | None = None) -> None:
@@ -40,7 +45,7 @@ class KiwoomApiClient:
             payload = {"grant_type": "client_credentials", "appkey": self.app_key, "secretkey": self.secret_key}
             raw = session.post(
                 f"{self.base_url}/oauth2/token",
-                headers={"Content-Type": "application/json;charset=UTF-8"},
+                headers={"Content-Type": "application/json;charset=UTF-8", "User-Agent": _KIWOOM_USER_AGENT},
                 json=payload,
             )
             if inspect.isawaitable(raw):
@@ -71,6 +76,7 @@ class KiwoomApiClient:
             await limiter.acquire()
             headers = {
                 "Content-Type": "application/json;charset=UTF-8",
+                "User-Agent": _KIWOOM_USER_AGENT,
                 "authorization": f"Bearer {self.token}",
                 "api-id": api_id,
                 "cont-yn": cont_yn,
