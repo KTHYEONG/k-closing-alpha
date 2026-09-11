@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from src.ml.research.v3_engine import compute_derived_features
-from src.strategy.contract import derive_chg_ratio
+from src.strategy.contract import derive_chg_ratio, tick_cost_bp
 
 # Robust Z-Score ((x - median) / MAD) 횡단면 표준화 대상
 _ROBUST_Z_COLUMNS: tuple[str, ...] = (
@@ -231,18 +231,26 @@ def _apply_robust_z(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
     return df
 
 
-def build_topk_ranker_features(df: pd.DataFrame, decision_date: pd.Timestamp) -> pd.DataFrame:
+def build_topk_ranker_features(
+    df: pd.DataFrame, decision_date: pd.Timestamp, *, price_history: pd.DataFrame | None = None
+) -> pd.DataFrame:
     """Map a live Korean-column snapshot to v3_engine decision-time features.
 
     Args:
         df: Live daily snapshot with Korean columns and percent-unit indices.
         decision_date: Decision date stamped onto every row.
+        price_history: Strictly-past daily rows (HISTORY_REQUIRED_COLUMNS). When
+            given, the snapshot is stitched onto it and the v2 cost/history
+            features are attached; this additionally requires 시장구분.
 
     Returns:
-        Frame carrying every v3_engine FEATURE_COLS entry.
+        Frame carrying every v3_engine FEATURE_COLS entry, plus
+        TOPK_COST_FEATURE_COLS and TOPK_HISTORY_FEATURE_COLS when price_history
+        is given. Row order matches df.
 
     Raises:
-        ValueError: Naming every missing required Korean column.
+        ValueError: Naming every missing required Korean column, or propagated
+            from the history stitching.
     """
     # 결측 입력은 플레이스홀더 없이 즉시 차단
     required = (
@@ -284,4 +292,17 @@ def build_topk_ranker_features(df: pd.DataFrame, decision_date: pd.Timestamp) ->
         "v_kospi": pd.to_numeric(df["v_kospi"], errors="coerce").to_numpy(dtype=np.float64),
     })
     mapped["chg_ratio"] = np.asarray(derive_chg_ratio(close, prev_close), dtype=np.float64)
-    return compute_derived_features(mapped)
+    base = compute_derived_features(mapped)
+    if price_history is None:
+        return base
+    from src.ml.topk_history_features import attach_topk_features, stitch_live_panel
+
+    if "시장구분" not in df.columns:
+        raise ValueError("missing required columns: ['시장구분'] (needed for tick-cost feature)")
+    # 결정일 PIT 호가단위 비용 (collect.flag_cost_aware_admission 과 동일 산식)
+    dates = np.full(len(df), np.datetime64(pd.Timestamp(decision_date).strftime("%Y-%m-%d")))
+    base["prev_close"] = prev_close
+    base["tick_cost_bp"] = tick_cost_bp(close, dates, df["시장구분"].astype(str).to_numpy(dtype=object))
+    live_rows = base[["symbol", "open", "close", "prev_close", "volume", "inst_netbuy", "foreign_netbuy"]]
+    panel = stitch_live_panel(price_history, live_rows, decision_date)
+    return attach_topk_features(base, panel)
