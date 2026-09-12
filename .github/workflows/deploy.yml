@@ -18,6 +18,11 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v3
 
+      # test_kis_client_facade_removed.py 등 코드베이스 스캔 테스트가 요구한다
+      # (ubuntu-latest 러너에는 기본 포함되어 있지 않음).
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep
+
       - name: Install dependencies
         run: uv sync --frozen
 
