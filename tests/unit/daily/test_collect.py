@@ -653,3 +653,51 @@ def test_fetch_single_stock_prev_close_equals_close_when_rate_is_zero() -> None:
 
     assert row['전일종가'] == 1100
     assert failed == []
+
+
+def test_build_toss_scan_client_returns_none_without_app_key(monkeypatch) -> None:
+    import src.api.toss.client as toss_mod
+    import src.daily.collect as collect_mod
+
+    class _NoKeyToss:
+        def __init__(self, *a, **k):
+            self.app_key = ""
+
+    monkeypatch.setattr(toss_mod, "TossApiClient", _NoKeyToss)
+
+    assert collect_mod.build_toss_scan_client() is None
+
+
+def test_build_toss_scan_client_returns_client_with_app_key(monkeypatch) -> None:
+    import src.api.toss.client as toss_mod
+    import src.daily.collect as collect_mod
+
+    class _KeyedToss:
+        def __init__(self, *a, **k):
+            self.app_key = "real-key"
+
+    monkeypatch.setattr(toss_mod, "TossApiClient", _KeyedToss)
+
+    result = collect_mod.build_toss_scan_client()
+
+    assert result is not None and result.app_key == "real-key"
+
+
+def test_resolve_daily_candidates_passes_toss_client_through(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import src.daily.collect as collect_mod
+
+    seen_kwargs = {}
+
+    async def _fake_scan(client_arg, session_arg, **kwargs):
+        seen_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(collect_mod, "fetch_candidate_stock_list", _fake_scan)
+    sentinel_toss = object()
+
+    asyncio.run(collect_mod.resolve_daily_candidates(AsyncMock(), object(), kiwoom_client=None, toss_client=sentinel_toss))
+
+    assert seen_kwargs.get("toss_client") is sentinel_toss
