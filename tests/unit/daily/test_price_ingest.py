@@ -78,6 +78,20 @@ class FakeKiwoom:
         return {"return_code": 0, "stk_invsr_orgn": [{"dt": d.strftime("%Y%m%d"), "orgn": "+30", "frgnr_invsr": "-20", "natfor": "--1"} for d in reversed(days)]}, {}
 
 
+class FakeToss:
+    def __init__(self, fail=()):
+        self.fail = set(fail)
+        self.calls: list[str] = []
+
+    async def get_program_trades(self, session, symbol, count=100, until=None):
+        self.calls.append(symbol)
+        if symbol in self.fail:
+            return {"error": {"code": "invalid-request", "message": "toss fail"}}
+        return {"result": {"records": [
+            {"date": "2026-09-10", "arbitrage": {"netBuyVolume": "5"}, "nonArbitrage": {"netBuyVolume": "6"}},
+        ]}}
+
+
 class _Session:
     get = None
 
@@ -278,11 +292,13 @@ def test_fetch_symbol_flows_uses_kis_then_kiwoom_then_none() -> None:
     kis = FakeKis(fail_investor={"000002", "000003"}, fail_program={"000003"})
     kiwoom = FakeKiwoom(fail={"000003"})
 
-    ok, src_ok = asyncio.run(fetch_symbol_flows(kis, kiwoom, _Session(), "000001", "20260910"))
-    fb, src_fb = asyncio.run(fetch_symbol_flows(kis, kiwoom, _Session(), "000002", "20260910"))
-    none, src_none = asyncio.run(fetch_symbol_flows(kis, kiwoom, _Session(), "000003", "20260910"))
+    ok, src_ok, prg_ok = asyncio.run(fetch_symbol_flows(kis, kiwoom, _Session(), "000001", "20260910"))
+    fb, src_fb, prg_fb = asyncio.run(fetch_symbol_flows(kis, kiwoom, _Session(), "000002", "20260910"))
+    none, src_none, prg_none = asyncio.run(fetch_symbol_flows(kis, kiwoom, _Session(), "000003", "20260910"))
 
     assert (src_ok, src_fb, src_none) == ("kis", "kiwoom", "none")
+    # Then: 000003 has no toss client injected, so its failed program flow has no fallback -> "none"
+    assert (prg_ok, prg_fb, prg_none) == ("kis", "kis", "none")
     last_ok = ok[ok["date"] == pd.Timestamp("2026-09-10")].iloc[0]
     assert (last_ok["inst_netbuy"], last_ok["foreign_netbuy"], last_ok["program_netbuy"]) == (100, -50, 7)
     last_fb = fb[fb["date"] == pd.Timestamp("2026-09-10")].iloc[0]
@@ -294,16 +310,23 @@ def test_fetch_symbol_flows_uses_kis_then_kiwoom_then_none() -> None:
 def test_fetch_symbol_flows_without_kiwoom_client_marks_none() -> None:
     from src.daily.price_ingest import fetch_symbol_flows
 
-    flows, source = asyncio.run(fetch_symbol_flows(FakeKis(fail_investor={"000009"}), None, _Session(), "000009", "20260910"))
+    flows, source, program_source = asyncio.run(
+        fetch_symbol_flows(FakeKis(fail_investor={"000009"}), None, _Session(), "000009", "20260910")
+    )
+
     assert source == "none"
+    assert program_source == "kis"
     assert flows["inst_netbuy"].isna().all()
 
 
 def test_fetch_all_flows_counts_sources() -> None:
     from src.daily.price_ingest import fetch_all_flows
 
-    flows, sources = asyncio.run(fetch_all_flows(FakeKis(fail_investor={"000002"}), FakeKiwoom(), _Session(), ["000001", "000002"], "20260910"))
-    assert sources == {"kis": 1, "kiwoom": 1}
+    flows, sources = asyncio.run(
+        fetch_all_flows(FakeKis(fail_investor={"000002"}), FakeKiwoom(), _Session(), ["000001", "000002"], "20260910")
+    )
+
+    assert sources == {"investor": {"kis": 1, "kiwoom": 1}, "program": {"kis": 2}}
     assert set(flows["symbol"]) == {"000001", "000002"}
 
 
@@ -311,7 +334,9 @@ def test_fetch_all_flows_empty_symbol_list() -> None:
     from src.daily.price_ingest import FLOW_COLUMNS, fetch_all_flows
 
     flows, sources = asyncio.run(fetch_all_flows(FakeKis(), None, _Session(), [], "20260910"))
-    assert flows.empty and list(flows.columns) == ["date", "symbol", *FLOW_COLUMNS] and sources == {}
+
+    assert flows.empty and list(flows.columns) == ["date", "symbol", *FLOW_COLUMNS]
+    assert sources == {"investor": {}, "program": {}}
 
 
 def test_assemble_new_rows_and_check_flow_coverage() -> None:
@@ -322,7 +347,10 @@ def test_assemble_new_rows_and_check_flow_coverage() -> None:
         {"symbol": "B", "close": 50, "prev_close": 50, "volume": 0},
         {"symbol": "C", "close": 20, "prev_close": 20, "volume": 5},
     ]), pd.Timestamp("2026-09-10"))
-    flows = pd.DataFrame({"date": ["2026-09-10", "2026-09-10"], "symbol": ["A", "C"], "inst_netbuy": [1.0, np.nan], "foreign_netbuy": [2.0, 3.0], "program_netbuy": [0.0, 0.0]})
+    flows = pd.DataFrame({
+        "date": ["2026-09-10", "2026-09-10"], "symbol": ["A", "C"],
+        "inst_netbuy": [1.0, np.nan], "foreign_netbuy": [2.0, 3.0], "program_netbuy": [0.0, np.nan],
+    })
 
     rows = assemble_new_rows(krx, flows)
 
@@ -333,6 +361,10 @@ def test_assemble_new_rows_and_check_flow_coverage() -> None:
     assert check_flow_coverage(rows, min_coverage=0.5) == {"2026-09-10": 0.5}
     with pytest.raises(ValueError, match="coverage below"):
         check_flow_coverage(rows)
+    # Then: C also lacks program -> the program gate is independent of the investor gate
+    assert check_flow_coverage(rows, columns=("program_netbuy",), min_coverage=0.5, label="program") == {"2026-09-10": 0.5}
+    with pytest.raises(ValueError, match="program flow coverage below"):
+        check_flow_coverage(rows, columns=("program_netbuy",), label="program")
 
 
 def test_merge_and_adjust_scales_history_for_events_and_ignores_gaps() -> None:
@@ -407,6 +439,8 @@ def test_run_price_ingest_fills_new_date_stale_tail_and_new_listing(monkeypatch,
     assert report.ingested_dates == ["2026-09-08", "2026-09-09", "2026-09-10"]
     assert report.wrote is True and report.n_corporate_events == 1
     assert report.investor_sources == {"kis": 3}
+    # Then: no symbol fails program on the default FakeKis fixture -> every program source is "kis"
+    assert report.program_sources == {"kis": 3}
     out = pd.read_parquet(path)
     out["symbol"] = out["symbol"].astype(str)
     m = out.set_index(["symbol", "date"])
@@ -471,6 +505,7 @@ def test_run_price_ingest_raises_when_past_trading_day_missing(monkeypatch, tmp_
 def test_run_price_ingest_builds_default_clients(monkeypatch, tmp_path) -> None:
     import src.api.kis.client as kis_mod
     import src.api.kiwoom.client as kiwoom_mod
+    import src.api.toss.client as toss_mod
 
     path = tmp_path / "ph.parquet"
     mod, days, _ = _orchestrate_fakes(monkeypatch, set())
@@ -478,12 +513,13 @@ def test_run_price_ingest_builds_default_clients(monkeypatch, tmp_path) -> None:
     built: list[str] = []
     monkeypatch.setattr(kis_mod, "KisApiClient", lambda *a, **k: built.append("kis") or FakeKis())
     monkeypatch.setattr(kiwoom_mod, "KiwoomApiClient", lambda *a, **k: built.append("kiwoom") or FakeKiwoom())
+    monkeypatch.setattr(toss_mod, "TossApiClient", lambda *a, **k: built.append("toss") or FakeToss())
 
     # When: no clients and no KRX config injected (production call shape)
     report = asyncio.run(mod.run_price_ingest(today=pd.Timestamp("2026-09-11"), path=path))
 
     # Then
-    assert built == ["kis", "kiwoom"]
+    assert built == ["kis", "kiwoom", "toss"]
     assert report.ingested_dates == []
 
 
@@ -530,3 +566,69 @@ def test_kca_price_ingest_timer_slots_avoid_decision_and_flow_windows() -> None:
         assert not (8 * 60 + 55 <= t <= 9 * 60 + 10)
         assert t < 15 * 60 or t >= 20 * 60 + 30
     assert "Persistent=true" in content and "Unit=kca-price-ingest.service" in content
+
+
+def test_parse_toss_program_rows_normalizes_and_raises() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.daily.price_ingest import VendorResponseError, parse_toss_program_rows
+
+    ok = parse_toss_program_rows({"result": {"records": [
+        {"date": "2026-09-10", "arbitrage": {"netBuyVolume": "3"}, "nonArbitrage": {"netBuyVolume": "4"}},
+    ]}})
+    assert ok.iloc[0]["program_netbuy"] == 7
+    assert ok.iloc[0]["date"] == pd.Timestamp("2026-09-10")
+
+    empty = parse_toss_program_rows({"result": {"records": []}})
+    assert list(empty.columns) == ["date", "program_netbuy"] and empty.empty
+
+    with pytest.raises(VendorResponseError, match="Toss program-trades"):
+        parse_toss_program_rows({"error": {"code": "invalid-request", "message": "bad symbol"}})
+
+
+def test_fetch_symbol_flows_program_falls_back_to_toss_when_kis_fails() -> None:
+    from src.daily.price_ingest import fetch_symbol_flows
+
+    kis = FakeKis(fail_program={"000004"})
+    toss = FakeToss()
+
+    flows, inv_src, prg_src = asyncio.run(
+        fetch_symbol_flows(kis, None, _Session(), "000004", "20260910", toss)
+    )
+
+    assert inv_src == "kis"
+    assert prg_src == "toss"
+    last = flows[flows["date"] == pd.Timestamp("2026-09-10")].iloc[0]
+    assert last["program_netbuy"] == 11
+    assert toss.calls == ["000004"]
+
+
+def test_fetch_all_flows_uses_toss_program_fallback() -> None:
+    from src.daily.price_ingest import fetch_all_flows
+
+    kis = FakeKis(fail_program={"000004"})
+    toss = FakeToss()
+
+    flows, sources = asyncio.run(fetch_all_flows(kis, None, _Session(), ["000001", "000004"], "20260910", toss))
+
+    assert sources["program"] == {"kis": 1, "toss": 1}
+    assert toss.calls == ["000004"]
+
+
+def test_run_price_ingest_fails_closed_on_low_program_flow_coverage(monkeypatch, tmp_path) -> None:
+    # Given: investor flow is healthy but every symbol's KIS program call fails with no Toss client to recover it
+    path = tmp_path / "ph.parquet"
+    mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    before = path.stat().st_mtime_ns
+
+    # When
+    with pytest.raises(ValueError, match="program flow coverage below"):
+        asyncio.run(mod.run_price_ingest(
+            today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+            kis=FakeKis(fail_program={"000001", "000002", "000003"}), kiwoom=FakeKiwoom(), toss=None,
+        ))
+
+    # Then: nothing written
+    assert path.stat().st_mtime_ns == before
