@@ -185,3 +185,111 @@ def test_merge_partition_frame_still_merges_canonical_partitions(tmp_path) -> No
 
     assert len(merged) == 3
     assert merged.loc[merged["ts_hms"] == 90200, "close"].iloc[0] == 9999
+
+
+def test_log_session_coverage_outliers_flags_symbol_below_peer_ratio(caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    from src.data import intraday_store
+
+    # Given: symbol A has 10 bars (peer max), symbol B has only 3 (30% of peer max, below default 0.8)
+    merged = pd.DataFrame({"symbol": ["A"] * 10 + ["B"] * 3})
+
+    # When
+    with caplog.at_level(logging.WARNING, logger=intraday_store.logger.name):
+        report = intraday_store.log_session_coverage_outliers(merged, 1, "2026-09-11", "regular")
+
+    # Then
+    assert report == {"n_symbols": 2, "n_low_coverage": 1}
+    assert any("session_coverage" in rec.message and "B" in rec.message for rec in caplog.records)
+
+
+def test_log_session_coverage_outliers_returns_zero_when_all_symbols_at_peer_level(caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    from src.data import intraday_store
+
+    # Given: three symbols, all with identical bar counts (a healthy, fully-collected batch)
+    merged = pd.DataFrame({"symbol": ["A"] * 5 + ["B"] * 5 + ["C"] * 5})
+
+    # When
+    with caplog.at_level(logging.WARNING, logger=intraday_store.logger.name):
+        report = intraday_store.log_session_coverage_outliers(merged, 1, "2026-09-11", "regular")
+
+    # Then
+    assert report == {"n_symbols": 3, "n_low_coverage": 0}
+    assert not any("session_coverage" in rec.message for rec in caplog.records)
+
+
+def test_log_session_coverage_outliers_handles_empty_frame() -> None:
+    import pandas as pd
+
+    from src.data import intraday_store
+
+    # Given: an empty frame (write_intraday_partition never reaches this point with one,
+    # since it returns 0 early, but the utility must still be safe standalone)
+    report = intraday_store.log_session_coverage_outliers(pd.DataFrame(), 1, "2026-09-11", "regular")
+
+    # Then
+    assert report == {"n_symbols": 0, "n_low_coverage": 0}
+
+
+def test_log_session_coverage_outliers_respects_custom_min_peer_ratio_boundary() -> None:
+    import pandas as pd
+
+    from src.data import intraday_store
+
+    # Given: peer max = 10; B sits exactly at 80% (8, must NOT be flagged -- strict less-than),
+    # C sits just below (7, MUST be flagged), under an explicit min_peer_ratio=0.8
+    merged = pd.DataFrame({"symbol": ["A"] * 10 + ["B"] * 8 + ["C"] * 7})
+
+    # When
+    report = intraday_store.log_session_coverage_outliers(merged, 1, "2026-09-11", "regular", min_peer_ratio=0.8)
+
+    # Then
+    assert report == {"n_symbols": 3, "n_low_coverage": 1}
+
+    # And: a lone symbol (no peer) is never flagged, regardless of ratio
+    solo = pd.DataFrame({"symbol": ["Z"] * 2})
+    solo_report = intraday_store.log_session_coverage_outliers(solo, 1, "2026-09-11", "regular", min_peer_ratio=0.99)
+    assert solo_report == {"n_symbols": 1, "n_low_coverage": 0}
+
+
+def test_write_intraday_partition_logs_low_coverage_symbol_without_changing_return_value(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    import pandas as pd
+    import pytest
+
+    from src.data import intraday_store
+    from src.data.intraday_schema import normalize_bar_frame
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+
+    # Given: 005930 has 3 bars (full coverage), 000660 has only 1 (sparse, mirrors the
+    # empirically-confirmed 181710/Toss-backfill pattern)
+    raw_full = pd.DataFrame({
+        "time": ["090100", "090200", "090300"],
+        "open": [70000, 70000, 70000], "high": [70100, 70100, 70100],
+        "low": [69900, 69900, 69900], "close": [70000, 70000, 70000],
+        "jdiff_vol": [1000, 1000, 1000], "value": [70, 70, 70],
+    })
+    df_full = normalize_bar_frame(raw_full, "ls", "2026-09-11", "005930")
+    raw_sparse = pd.DataFrame({
+        "time": ["090100"], "open": [50000], "high": [50100], "low": [49900],
+        "close": [50000], "jdiff_vol": [500], "value": [25],
+    })
+    df_sparse = normalize_bar_frame(raw_sparse, "ls", "2026-09-11", "000660")
+    df_in = pd.concat([df_full, df_sparse], ignore_index=True)
+
+    # When
+    with caplog.at_level(logging.WARNING, logger=intraday_store.logger.name):
+        rows_written = intraday_store.write_intraday_partition(df_in, 1, "2026-09-11", "regular")
+
+    # Then: return contract unchanged (still total row count), diagnostic visible via log
+    assert rows_written == 4
+    assert any("session_coverage" in rec.message and "000660" in rec.message for rec in caplog.records)
