@@ -34,6 +34,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-ranker-bundle", action="store_true", help="train and persist the certified top-3 cost-aware production bundle (build_inline_bundle on the certification-regime population via train_production_bundle)")
     parser.add_argument("--ranker-topk-research", action="store_true", help="train the ranker on the wide screen pool, select top-k from the cost-capped pool, and score it against the model-free cost-sort control on the post-reform regime")
     parser.add_argument("--ranker-train-start", default=None, help="widen the ranker training window to this YYYY-MM-DD start; augments training only and never moves the certification boundary (default: the certification regime start)")
+    parser.add_argument("--exit-grid-revalidation", action="store_true", help="re-validate the TP5%%+MOC next-day exit-timing lever (src/ml/exit_policy.py) under the certified ranker's own CPCV(8,2) OOF pipeline and real PIT cost, without touching run_topk_ranker_backtest itself")
     return parser
 
 
@@ -94,7 +95,20 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("[EVAL] stage=topk_ranker verdict=%s reasons=%s", report.verdict, report.verdict_reasons)
         return
 
-    raise ValueError("no action flag given; choose one of --universe-research/--cost-aware-backtest/--train-ranker-bundle/--ranker-topk-research")
+    if args.exit_grid_revalidation:
+        if not os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH):
+            raise ValueError(f"price_history not found: {settings.PRICE_HISTORY_PARQUET_PATH}")
+        from src.ml.research.exit_grid_revalidation import run_exit_grid_revalidation
+
+        summary = run_exit_grid_revalidation(export_dir=args.export_dir)
+        promoted = summary["best"] is not None
+        logger.info(
+            "[EVAL] stage=exit_grid_revalidation promoted=%s n_days=%s cost_ratio=%s best=%s",
+            promoted, summary["n_days"], summary["cost_ratio"], summary["best"],
+        )
+        return
+
+    raise ValueError("no action flag given; choose one of --universe-research/--cost-aware-backtest/--train-ranker-bundle/--ranker-topk-research/--exit-grid-revalidation")
 
 
 if __name__ == "__main__":
