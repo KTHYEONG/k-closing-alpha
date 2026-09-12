@@ -1,0 +1,9 @@
+[Unit]
+Description=KCA offsite backup retention prune (remove _deleted snapshots older than 30 days)
+After=kca-backup.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-closing-alpha
+ExecStart=%h/.local/bin/rclone delete --min-age 30d gdrive:quant-lake/live/k-closing-alpha/_deleted
+ExecStart=%h/.local/bin/rclone rmdirs gdrive:quant-lake/live/k-closing-alpha/_deleted --leave-root

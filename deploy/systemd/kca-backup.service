@@ -5,5 +5,5 @@ After=kca-archive-intraday.service kca-daily-audit.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
-ExecStart=%h/.local/bin/rclone sync %h/k-closing-alpha/data gdrive:quant-lake/live/k-closing-alpha/data
-ExecStart=%h/.local/bin/rclone sync %h/k-closing-alpha/artifacts gdrive:quant-lake/live/k-closing-alpha/artifacts
+ExecStart=/bin/sh -c '%h/.local/bin/rclone sync %h/k-closing-alpha/data gdrive:quant-lake/live/k-closing-alpha/data --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/data/$(date +%%F)'
+ExecStart=/bin/sh -c '%h/.local/bin/rclone sync %h/k-closing-alpha/artifacts gdrive:quant-lake/live/k-closing-alpha/artifacts --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/artifacts/$(date +%%F)'

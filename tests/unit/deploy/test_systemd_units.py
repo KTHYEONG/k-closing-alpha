@@ -83,3 +83,35 @@ def test_backup_timer_schedule_is_after_daily_audit_timer() -> None:
     backup_time = _first_time("kca-backup.timer")
 
     assert backup_time > audit_time
+
+
+def test_backup_uses_backup_dir_instead_of_bare_sync() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-backup.service").read_text(encoding="utf-8")
+
+    assert "--backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/data/" in text
+    assert "--backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/artifacts/" in text
+
+
+def test_backup_prune_removes_deleted_snapshots_older_than_30_days() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-backup-prune.service").read_text(encoding="utf-8")
+
+    assert "rclone delete --min-age 30d gdrive:quant-lake/live/k-closing-alpha/_deleted" in text
+    assert "rclone rmdirs gdrive:quant-lake/live/k-closing-alpha/_deleted" in text
+
+
+def test_backup_prune_timer_exists_and_targets_service() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    timer = (root / "kca-backup-prune.timer").read_text(encoding="utf-8")
+    service = (root / "kca-backup-prune.service").read_text(encoding="utf-8")
+
+    assert "Unit=kca-backup-prune.service" in timer
+    assert "OnCalendar=" in timer
+    assert "After=kca-backup.service" in service
