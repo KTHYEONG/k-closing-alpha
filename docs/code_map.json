@@ -35,6 +35,7 @@
   "src/api/toss/client.py": {
     "testing": [
       "tests/unit/api/toss/test_toss_client.py",
+      "tests/unit/daily/test_collect.py",
       "tests/unit/daily/test_price_ingest.py"
     ]
   },
@@ -179,8 +180,7 @@
     "testing": "tests/unit/daily/test_predict.py"
   },
   "src/daily/price_ingest.py": {
-    "testing": "tests/unit/daily/test_price_ingest.py",
-    "architecture": "docs/architecture/broker_toss.md"
+    "testing": "tests/unit/daily/test_price_ingest.py"
   },
   "src/daily/universe_scan.py": {
     "testing": "tests/unit/daily/test_universe_scan.py"
