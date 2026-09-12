@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA daily audit (Mon-Fri 20:15 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 20:15:00 Asia/Seoul
+Persistent=true
+Unit=kca-daily-audit.service
+
+[Install]
+WantedBy=timers.target

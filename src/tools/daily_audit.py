@@ -1,6 +1,6 @@
-"""WSL 부팅 시 1회 실행되는 당일 결손 가시화 감사.
+"""매 거래일 EOD 이후 스케줄 실행되는 당일 결손 가시화 감사.
 
-누락 단계가 있어도 비정상 종료하지 않는다(부팅 감사용 가시화 전용).
+누락 단계가 있어도 비정상 종료하지 않는다(스케줄 감사용 가시화 전용).
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ def audit_or_skip(snapshot_date: str) -> dict[str, bool] | None:
 
 
 def main() -> None:  # pragma: no cover - CLI entry; logic covered via audit_daily_completeness scenarios
-    parser = argparse.ArgumentParser(description="Daily completeness audit (boot-time visibility only)")
+    parser = argparse.ArgumentParser(description="Daily completeness audit (scheduled after EOD every trading day)")
     parser.add_argument("--date", default=None, help="Snapshot date YYYY-MM-DD (default today)")
     args = parser.parse_args()
     snapshot_date: str = args.date or pd.Timestamp.today().strftime("%Y-%m-%d")
