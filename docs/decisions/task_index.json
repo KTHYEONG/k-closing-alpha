@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260912_INTRADAY_SESSION_COVERAGE_VISIBILITY",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_20260912_INTRADAY_SESSION_COVERAGE_VISIBILITY",
+      "domain": "data_ingest",
+      "title": "인트라데이 분봉 세션-완전성 가시성 진단 추가",
+      "why": "KIS(2026-08-14/18 종목181710 14/381봉)와 Toss백필(2023-07-05 14종목 200/391봉)에서 실제 부분수집이 실증됐고 _already_collected_codes가 존재여부만 봐 영구 미탐지됨",
+      "resolution": "write_intraday_partition 단일 쓰기지점에 log_session_coverage_outliers(peer_max 대비 0.8 미만 WARNING) 배선, 재수집/차단 정책은 의도적으로 미포함",
+      "impact": "저장 데이터/반환값 무변경, 로그 전용 관측성만 추가; 희소유동성 종목 자동재시도 위험 없음; 재시도 정책은 별도 후속 결정 필요"
+    },
+    {
       "task_id": "TASK_20260912_DATA_INGEST_INTEGRITY_BARRIER",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_20260912_DATA_INGEST_INTEGRITY_BARRIER",
@@ -989,16 +999,6 @@
       "why": "120일 이동평균선 조회 API 순차 중복 호출로 수집 시간이 13.7초에서 19.6초로 폭증",
       "resolution": "prefetch_ohlcv_for_sma120 추가 및 calculate_all_moving_averages/fetch_all_stock_data 병렬 prefetch 적용",
       "impact": "OHLCV 추가 호출 102회 -> 51회 50% 감축 및 TPS 제한 한계 내 병렬 처리 안정화"
-    },
-    {
-      "task_id": "COLLECT_PERF_V2",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_COLLECT_PERF_V2",
-      "domain": "daily",
-      "title": "KIS API Data Collection Speed Optimization Phase 2",
-      "why": "Further optimize collection speed under KIS 18 TPS limit by resolving AsyncRateLimiter lock-while-sleeping bug and parallelizing pre-collect condition/index API calls",
-      "resolution": "Removed API_SLEEP_INTERVAL delay, fixed AsyncRateLimiter acquire lock pattern, parallelized condition/index API calls with asyncio.gather, and passed client parameter to calculate_all_moving_averages",
-      "impact": "Eliminated redundant sleep delays and lock contention, achieving max rate limiter throughput while preserving 18 TPS safety limit"
     }
   ]
 }
