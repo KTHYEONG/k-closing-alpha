@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260912_EXIT_GRID_REVALIDATION_FAILS_DEPRECATE",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_20260912_EXIT_GRID_REVALIDATION_FAILS_DEPRECATE",
+      "domain": "ml",
+      "title": "청산레버(TP5%+MOC) locked-OOS 재검증 실패 -> 폐기 권고",
+      "why": "TP5%+MOC 청산레버는 구세대 게이트(Δ+41bp,28/28양수)로만 통과했고 승격없이 방치돼 현행 CPCV(8,2)+실측비용 표준 재검증이 필요했다",
+      "resolution": "실제 전체이력으로 재검증 실행: 전 익절폭(3~7%)에서 시장가청산 대비 -38~-58bp/일 유의열위(p<0.001), CPCV 28/28 경로 전부 음수로 역전 확인",
+      "impact": "승격 ADR 작성 금지, 청산레버 폐기 권고로 결론; 서빙에는 원래 미배선이라 실거래 영향 없음; 결과는 artifacts/models/exit_grid_revalidation_report.parquet에 저장"
+    },
+    {
       "task_id": "TASK_20260912_EXIT_GRID_LOCKED_OOS_REVALIDATION",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_20260912_EXIT_GRID_LOCKED_OOS_REVALIDATION",
@@ -989,16 +999,6 @@
       "why": "Improve real-time data collection throughput while strictly enforcing KIS REST API 18 TPS limit and removing automatic archiving and redundant logs.",
       "resolution": "Implemented AsyncRateLimiter, lazy evaluation for SMA120 calculations, single-line dynamic progress bar logging, and removed automatic archive snapshot upsert in collect.py.",
       "impact": "Significantly reduced daily collection time, 100% prevented EGW00201 rate limit errors, simplified logging output, and isolated archive functionality for manual user execution."
-    },
-    {
-      "task_id": "POSITION_SIZING_COST_FIX",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_POSITION_SIZING_COST_FIX",
-      "domain": "quant",
-      "title": "Korean Stock Fee/Tax Integration & Position Sizing Calibration",
-      "why": "Tax (0.15%), KIS fee (0.028%), and slippage were uncredited, and negative utility scores led to faulty sizing grade allocations.",
-      "resolution": "Deducted 0.20% round-trip cost, fixed assign_sizing_grades thresholds, normalized probability scales, and scaled sizing allocation with utility score magnitude.",
-      "impact": "Eliminated false positive position sizing on sub-zero net return trades and established realistic risk-weighted position allocation."
     }
   ]
 }
