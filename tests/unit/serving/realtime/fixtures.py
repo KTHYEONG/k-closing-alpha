@@ -8,6 +8,7 @@ lightgbm 모델을 직접 구성합니다. 이 모듈은 ``test_*.py`` 가 아�
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import numpy as np
@@ -15,6 +16,7 @@ import pandas as pd
 from lightgbm import LGBMRegressor
 
 from src.serving.realtime.inference import _QUANTILE_ALPHAS, _QUANTILE_COLS
+from src.strategy.contract import COST_AWARE_UNIVERSE
 
 _QUANTILE_ALPHAS = _QUANTILE_ALPHAS
 _QUANTILE_COLS = _QUANTILE_COLS
@@ -50,6 +52,7 @@ def build_fixed_serving_bundle(
         "rank_model": return_model,
         "quantile_models": quantile_models,
         "calibrators": {"p_good": 0.5, "p_bad": 0.1},
+        "select_universe": dataclasses.asdict(COST_AWARE_UNIVERSE),
     }
 
 
