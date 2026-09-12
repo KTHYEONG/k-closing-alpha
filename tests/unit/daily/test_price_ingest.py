@@ -617,7 +617,12 @@ def test_fetch_all_flows_uses_toss_program_fallback() -> None:
 
 
 def test_run_price_ingest_fails_closed_on_low_program_flow_coverage(monkeypatch, tmp_path) -> None:
-    # Given: investor flow is healthy but every symbol's KIS program call fails with no Toss client to recover it
+    # Given: investor flow is healthy but every symbol's KIS program call fails,
+    # and the Toss fallback also fails for every symbol (no viable recovery).
+    # toss=None would let production build a *real* TossApiClient (its
+    # documented default-construction convenience for callers), which reaches
+    # the live network under real credentials -- passing a failing FakeToss
+    # keeps this hermetic while preserving the "no working fallback" intent.
     path = tmp_path / "ph.parquet"
     mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
     _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
@@ -627,7 +632,8 @@ def test_run_price_ingest_fails_closed_on_low_program_flow_coverage(monkeypatch,
     with pytest.raises(ValueError, match="program flow coverage below"):
         asyncio.run(mod.run_price_ingest(
             today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
-            kis=FakeKis(fail_program={"000001", "000002", "000003"}), kiwoom=FakeKiwoom(), toss=None,
+            kis=FakeKis(fail_program={"000001", "000002", "000003"}), kiwoom=FakeKiwoom(),
+            toss=FakeToss(fail={"000001", "000002", "000003"}),
         ))
 
     # Then: nothing written
