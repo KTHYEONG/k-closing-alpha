@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260912_TOSS_UNIVERSE_SCAN_FALLBACK",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_20260912_TOSS_UNIVERSE_SCAN_FALLBACK",
+      "domain": "data_ingest",
+      "title": "Toss 랭킹 폴백으로 유니버스스캔 SPOF 해소",
+      "why": "fetch_candidate_stock_list가 Kiwoom 단일벤더라 실패시 당일 매매후보 생성이 전면중단됐다",
+      "resolution": "Toss TOP_GAINERS 랭킹을 2순위 폴백으로 추가, 밴드필터링(chg_min~max)과 fail-closed 이중실패 처리 구현",
+      "impact": "Kiwoom 장애시에도 degraded(최대100위) 후보리스트 확보 가능; 100위 밖 밴드종목은 여전히 미포착(수용된 열화)"
+    },
+    {
       "task_id": "TASK_20260912_TOSS_PROGRAM_FLOW_FALLBACK",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_20260912_TOSS_PROGRAM_FLOW_FALLBACK",
@@ -989,16 +999,6 @@
       "why": "Constant utility_score (0.0864) caused by dummy test bundle artifacts and preprocessor Z-score feature divergence during daily inference.",
       "resolution": "Synchronized _apply_robust_z in daily preprocessor pipeline, trained real 49-feature GBDT model bundle from trade_log.parquet, and added auto-retrain fallback in predict.py.",
       "impact": "Restored dynamic Utility Score differentiation (-4.66 ~ -5.23) and proper risk-weighted sizing allocations across candidates."
-    },
-    {
-      "task_id": "DAILY_PREDICT_REDESIGN",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_DAILY_PREDICT_REDESIGN",
-      "domain": "daily",
-      "title": "Daily Predict Pipeline Redesign & Standard ML Feature Alignment",
-      "why": "Legacy inline feature engineering and verbose CLI output caused schema mismatches with LightGBM models and terminal clutter.",
-      "resolution": "Integrated standard ML preprocessor (clean_column_names, engineer_features), updated run_daily_sizing_inference, and streamlined CLI output format.",
-      "impact": "Ensured 1:1 feature alignment with model artifacts, accelerated inference output readability, and established contract compliance."
     }
   ]
 }
