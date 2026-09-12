@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "tickcap_relaxation",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_tickcap_relaxation",
+      "domain": "strategy-selection",
+      "title": "비용인식 틱비용 상한 완화 7.5→12bp + 번들-라이브 스크린 정합성 가드",
+      "why": "148개 종가매매 전략 매트릭스가 인샘플 리랭커로 채점되어 전량 누출; purged walk-forward 재채점 결과 틱캡 완화만 전 구간에서 생존",
+      "resolution": "MAX_TICK_COST_BP 12.0 완화 + assert_bundle_screen_parity로 번들-라이브 스크린 불일치 fail-closed 신설, select_topk_equal_weight에 배선",
+      "impact": "라이브 경로는 구번들(cap=7.5) 재인증 전까지 의도적으로 차단됨; uv run python -m src.ml.retrain --train-ranker-bundle 재인증 필수"
+    },
+    {
       "task_id": "TASK_20260912_VPS_FULL_AUTOMATION",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_20260912_VPS_FULL_AUTOMATION",
@@ -989,16 +999,6 @@
       "why": "legacy_mapping.py 및 하드코딩 컬럼 리터럴 산재 문제 해결",
       "resolution": "src/processing/schema.py 중앙 스키마 모듈 도입, legacy_mapping.py 제거, daily/ 및 preprocessor 연동 정제",
       "impact": "표준 영문 컬럼 단일 원천 관리 및 파이프라인 결합도 해소"
-    },
-    {
-      "task_id": "TASK_20260804_CONDITION_HISTORY_BACKFILL",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_20260804_CONDITION_HISTORY_BACKFILL",
-      "domain": "quant",
-      "title": "condition_history Data Cleaning and Backfill Pipeline",
-      "why": "condition_history_종가매매.xlsx contained 307 pre-20251229 obsolete rows, missing fields post-20260520, and missing volume for 281 rows.",
-      "resolution": "Filtered out pre-20251229 rows, built ConditionHistoryBackfiller to restore missing OHLCV/volume/market cap/index returns via KIS API, removed unused EMA columns, and excluded historical volume power.",
-      "impact": "Generated clean data/history/condition_history_cleaned.csv and parquet repositories with 100% volume and code coverage."
     }
   ]
 }
