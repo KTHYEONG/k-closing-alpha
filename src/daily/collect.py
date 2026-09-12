@@ -19,7 +19,7 @@ from src.daily import archive
 from src.daily.universe_scan import fetch_candidate_stock_list
 from src.data.trading_calendar import is_kis_trading_day
 from src.execution.cost_model import tick_cost_bp
-from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, QUOTE_FAILED_COL
+from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, PRICE_ANOMALY_COL, QUOTE_FAILED_COL
 from src.strategy.contract import COST_AWARE_UNIVERSE, UniverseSpec, derive_chg_ratio, mark_ceiling, select_universe
 
 logger = logging.getLogger(__name__)
@@ -184,6 +184,71 @@ def flag_cost_aware_admission(
     flagged = df.copy()
     flagged["admitted"] = np.asarray(mask, dtype=bool)
     return flagged
+
+
+# 실시간 결정 스냅샷의 degraded-row(벤더 실패 또는 값-비정상) 허용 임계치.
+# price_ingest.MIN_FLOW_COVERAGE(0.99, 야간 벌크 흐름 게이트)와 동일 철학을 실시간
+# 경로에 이식한 값이다 -- 두 파이프라인은 별개 흐름이라 상수도 분리해 둔다.
+REALTIME_MIN_QUOTE_COVERAGE: float = 0.99
+
+
+def flag_price_anomaly(df: pd.DataFrame) -> pd.Series:
+    """벤더가 성공(rt_cd='0')을 반환했더라도 값 자체가 비정상인 행을 표식한다.
+
+    현재가_실패(QUOTE_FAILED_COL)는 벤더 호출 자체의 실패만 포착하므로, 호출은
+    성공했지만 종가<=0이거나 OHLC 범위가 내부적으로 모순인 경우(레버리지/인버스
+    ETN 등에서 실측된 패턴)는 별도로 잡아야 한다. NaN(quote_failed 경로)은 이미
+    현재가_실패로 표식되므로 여기서는 이중 표식하지 않는다.
+
+    Args:
+        df: 종가/고가/저가/거래량 컬럼을 포함한 wide 단면 프레임.
+
+    Returns:
+        df와 같은 길이/인덱스의 bool Series. True면 값-비정상.
+    """
+    close = pd.to_numeric(df["종가"], errors="coerce")
+    high = pd.to_numeric(df["고가"], errors="coerce")
+    low = pd.to_numeric(df["저가"], errors="coerce")
+    volume = pd.to_numeric(df["거래량"], errors="coerce")
+    has_quote = close.notna() & high.notna() & low.notna() & volume.notna()
+    non_positive_close = close <= 0.0
+    inconsistent_range = low > high
+    close_out_of_range = (close < low) | (close > high)
+    negative_volume = volume < 0.0
+    anomaly = has_quote & (non_positive_close | inconsistent_range | close_out_of_range | negative_volume)
+    return anomaly.fillna(False).astype(bool)
+
+
+def check_realtime_collection_coverage(
+    df: pd.DataFrame, *, min_coverage: float = REALTIME_MIN_QUOTE_COVERAGE
+) -> dict[str, Any]:
+    """실시간 스냅샷의 degraded 비율이 임계치를 넘으면 fail-closed 한다.
+
+    degraded 행은 QUOTE_FAILED_COL(벤더 호출 실패) 또는 PRICE_ANOMALY_COL
+    (호출 성공했지만 값 비정상)이 True인 행이다. price_ingest.check_flow_coverage와
+    동일한 철학을 실시간 단일 스냅샷에 적용한다.
+
+    Args:
+        df: PRICE_ANOMALY_COL과 QUOTE_FAILED_COL을 포함한 wide 단면 프레임.
+        min_coverage: degraded 되지 않은 행이 차지해야 할 최소 비율.
+
+    Returns:
+        {"n_raw": 전체 행수, "n_degraded": degraded 행수, "coverage": 정상 비율}.
+
+    Raises:
+        ValueError: df가 비었거나 coverage가 min_coverage 미만인 경우.
+    """
+    if len(df) == 0:
+        raise ValueError("check_realtime_collection_coverage received an empty snapshot")
+    degraded = df[QUOTE_FAILED_COL].fillna(False).astype(bool) | df[PRICE_ANOMALY_COL].fillna(False).astype(bool)
+    n_raw = len(df)
+    n_degraded = int(degraded.sum())
+    coverage = 1.0 - (n_degraded / n_raw)
+    if coverage < float(min_coverage):
+        raise ValueError(
+            f"real-time collection coverage {coverage:.4f} below {min_coverage}: n_degraded={n_degraded}/{n_raw}"
+        )
+    return {"n_raw": n_raw, "n_degraded": n_degraded, "coverage": round(coverage, 6)}
 
 
 async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None = None, toss_client: Any | None = None) -> list[dict]:
@@ -493,6 +558,13 @@ async def main(force: bool = False):
             index_failed = True
         df["v_kospi"] = round(float(vkospi_val), 2)
         df["지수_실패"] = index_failed
+
+        df[PRICE_ANOMALY_COL] = flag_price_anomaly(df).to_numpy()
+        coverage_report = check_realtime_collection_coverage(df)
+        logger.info(
+            "[DATA] stage=realtime_coverage n_raw=%d n_degraded=%d coverage=%.4f",
+            coverage_report["n_raw"], coverage_report["n_degraded"], coverage_report["coverage"],
+        )
 
         stored_rows = persist_daily_snapshot(df, snapshot_date)
 

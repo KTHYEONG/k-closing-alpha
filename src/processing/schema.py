@@ -33,6 +33,8 @@ CLOSE_CONFIRMED_COL: str = "종가_확정"
 
 # 현재가 TR 실패 표식 (fail-closed 플래그; 0값 위조 금지)
 QUOTE_FAILED_COL: str = "현재가_실패"
+# 벤더 rt_cd 성공에도 값이 비정상(0/일관성 붕괴)인 표식 (fail-closed 플래그; 현재가_실패와 별개로 값 자체를 검증)
+PRICE_ANOMALY_COL: str = "가격_비정상"
 
 
 # 스프레드시트 원본(괄호/한글 폼) -> 표준 영문 컬럼명 매핑
@@ -207,6 +209,7 @@ ARCHIVE_COLUMN_ORDER: list[str] = [
     "수급_실패",
     "지수_실패",
     QUOTE_FAILED_COL,
+    PRICE_ANOMALY_COL,
     DECISION_CLOSE_COL,
     CLOSE_CONFIRMED_COL,
 ]

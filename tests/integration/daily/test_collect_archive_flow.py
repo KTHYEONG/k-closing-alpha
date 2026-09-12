@@ -77,11 +77,11 @@ def test_collect_main_persists_wide_snapshot_to_store_without_csv(monkeypatch, t
             {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
              "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
              "거래량": 1_000_000, "거래대금": 500.0, "시가총액": 3000.0,
-             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0},
+             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0, "현재가_실패": False},
             {"종목명": "DDD", "종목코드": "000004", "시장구분": "KOSPI", "시가": 29900.0,
              "고가": 30100.0, "저가": 29800.0, "종가": 30000.0, "전일종가": 28571.43,
              "거래량": 800_000, "거래대금": 400.0, "시가총액": 5000.0,
-             "기관_순매수": 8.0, "외국인_순매수": 6.0, "등락률": 5.0},
+             "기관_순매수": 8.0, "외국인_순매수": 6.0, "등락률": 5.0, "현재가_실패": False},
         ]
         return rows, []
 
@@ -163,7 +163,7 @@ def test_collect_main_marks_index_failed_and_nans_kospi_kosdaq_on_index_failure(
             {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
              "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
              "거래량": 1_000_000, "거래대금": 500.0, "시가총액": 3000.0,
-             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0},
+             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0, "현재가_실패": False},
         ]
         return rows, []
 
@@ -188,3 +188,97 @@ def test_collect_main_marks_index_failed_and_nans_kospi_kosdaq_on_index_failure(
     assert math.isnan(stored["kospi"].iloc[0])
     assert math.isnan(stored["kosdaq"].iloc[0])
     assert stored["지수_실패"].iloc[0] == True  # noqa: E712
+
+
+def test_collect_main_raises_and_skips_persist_when_coverage_gate_fails(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.daily import collect
+
+    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
+
+    async def _fake_scan(client, session, **kwargs):
+        return [
+            {"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"},
+            {"code": "000009", "name": "ETN", "price": "0", "chgrate": "0.0"},
+        ]
+
+    async def _fake_fetch_all(stock_list, client, session):
+        # Given: 1 healthy row + 1 degenerate all-zero 'success' row (50% degraded,
+        # far below the 99% default threshold)
+        rows = [
+            {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
+             "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
+             "거래량": 1_000_000, "거래대금": 500.0, "시가총액": 3000.0,
+             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0, "현재가_실패": False},
+            {"종목명": "ETN", "종목코드": "000009", "시장구분": "KOSDAQ", "시가": 0.0,
+             "고가": 0.0, "저가": 0.0, "종가": 0.0, "전일종가": 1.0,
+             "거래량": 0.0, "거래대금": 0.0, "시가총액": 0.0,
+             "기관_순매수": 0.0, "외국인_순매수": 0.0, "등락률": 0.0, "현재가_실패": False},
+        ]
+        return rows, []
+
+    monkeypatch.setattr(collect, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all)
+
+    upsert_calls: list[object] = []
+    monkeypatch.setattr(
+        collect.archive, "upsert_archive_snapshot",
+        lambda df, snapshot_date=None: upsert_calls.append(df) or len(df),
+    )
+
+    # When / Then: the coverage gate raises before any persistence is attempted
+    with pytest.raises(ValueError, match="real-time collection coverage"):
+        asyncio.run(collect.main(force=True))
+    assert upsert_calls == []
+
+
+def test_collect_main_persists_price_anomaly_column_as_all_false_for_healthy_snapshot(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    from src.daily import collect
+
+    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
+
+    async def _fake_scan(client, session, **kwargs):
+        return [
+            {"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"},
+            {"code": "000004", "name": "DDD", "price": "30000", "chgrate": "5.0"},
+        ]
+
+    async def _fake_fetch_all(stock_list, client, session):
+        rows = [
+            {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
+             "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
+             "거래량": 1_000_000, "거래대금": 500.0, "시가총액": 3000.0,
+             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0, "현재가_실패": False},
+            {"종목명": "DDD", "종목코드": "000004", "시장구분": "KOSPI", "시가": 29900.0,
+             "고가": 30100.0, "저가": 29800.0, "종가": 30000.0, "전일종가": 28571.43,
+             "거래량": 800_000, "거래대금": 400.0, "시가총액": 5000.0,
+             "기관_순매수": 8.0, "외국인_순매수": 6.0, "등락률": 5.0, "현재가_실패": False},
+        ]
+        return rows, []
+
+    monkeypatch.setattr(collect, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all)
+
+    captured = {}
+
+    def _fake_upsert(df, snapshot_date=None):
+        captured["df"] = df.copy()
+        return len(df)
+
+    monkeypatch.setattr(collect.archive, "upsert_archive_snapshot", _fake_upsert)
+
+    # When
+    asyncio.run(collect.main(force=True))
+
+    # Then: the gate passed (no raise), persistence happened, and the new column is present
+    stored = captured["df"]
+    assert stored["가격_비정상"].tolist() == [False, False]
