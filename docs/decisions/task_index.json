@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "vps_full_automation",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_vps_full_automation",
+      "domain": "infra/deployment",
+      "title": "Docker/CI-CD + 재학습 컨테이너화 + git 코드동기화 자동화",
+      "why": "VPS 수동 git pull·모델전달 방식이 실제 장애(libgomp 누락, 배포순서 불일치)를 유발했고 공유 2vCPU/12GB에서 재학습 리소스 안전성 미검증 상태였음",
+      "resolution": "crypto-pilot 검증패턴(Tailscale+GHCR) 재사용해 Dockerfile+CI/CD 구축, kca-retrain을 실측(peak 3.72GiB) 기반 리소스가드로 컨테이너화, kca-code-sync로 나머지 9개 서비스 git-pull을 fast-forward+pytest게이트+자동롤백으로 자동화",
+      "impact": "GitHub Secrets 6개(GHCR_PAT 등) 신규 등록 필요; collect/predict 등 5개는 월요일 실측 전까지 컨테이너 미전환 유지"
+    },
+    {
       "task_id": "vps_deploy_architecture",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_vps_deploy_architecture",
@@ -989,16 +999,6 @@
       "why": "Re-evaluate the ML strategy through 2025 after correcting return units, baseline attribution, calibration, and timestamp-contract risks.",
       "resolution": "Implemented decimal-net targets, causal feature manifest checks, chronological calibration diagnostics, retained selection-rank and Ridge baselines, fixed real-data NaN handling for Ridge, and reran OOF comparison through 2025; documented the result and deferred production promotion pending real capture timestamps.",
       "impact": "2017-2025 OOF Regressor achieved +1.074% Top-1 net return and Sharpe 4.27 versus +0.479% and 2.10 for selection rank, but synthetic timestamps, 38.84% maximum drawdown, and 100% Top-1 turnover keep the research score at 60/100."
-    },
-    {
-      "task_id": "sangdda_scenario_prediction",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_sangdda_scenario_prediction",
-      "domain": "quant",
-      "title": "상따(29.9%) 시나리오 예측 확장 및 Dynamic Sizing 통합",
-      "why": "20% 이상 급등 종목에 대한 상따 시나리오 예측 필요성 및 추론 파이프라인 정합성 보장",
-      "resolution": "predict.py 내 20% 이상 종목 상따 시나리오 확장, pre-feature-engineering 29.9% 세팅, sizing_engine 추론 독립성 보장",
-      "impact": "일반 분석 결과와 상따 시나리오 예측 결과가 모두 원본 Score/Decision 수치로 정합되게 시각화됨"
     }
   ]
 }

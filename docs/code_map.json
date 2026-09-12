@@ -338,7 +338,8 @@
       "tests/unit/data/test_parquet_loader.py",
       "tests/unit/data/test_trading_calendar.py",
       "tests/unit/ml/test_exit_grid_revalidation.py",
-      "tests/unit/ml/test_history_features.py"
+      "tests/unit/ml/test_history_features.py",
+      "tests/unit/tools/test_code_sync.py"
     ]
   },
   "src/strategy/contract.py": {
@@ -352,6 +353,9 @@
   },
   "src/tools/alerts.py": {
     "testing": "tests/unit/tools/test_alerts.py"
+  },
+  "src/tools/code_sync.py": {
+    "testing": "tests/unit/tools/test_code_sync.py"
   },
   "src/tools/daily_audit.py": {
     "testing": "tests/unit/tools/test_daily_audit.py"
