@@ -548,7 +548,7 @@ def test_kca_price_ingest_service_runs_module() -> None:
     with open("deploy/systemd/kca-price-ingest.service", encoding="utf-8") as f:
         content = f.read()
     assert "Type=oneshot" in content
-    assert "ExecStart=/home/kth/.local/bin/uv run python -m src.daily.price_ingest" in content
+    assert "ExecStart=%h/.local/bin/uv run python -m src.daily.price_ingest" in content
 
 
 def test_kca_price_ingest_timer_slots_avoid_decision_and_flow_windows() -> None:

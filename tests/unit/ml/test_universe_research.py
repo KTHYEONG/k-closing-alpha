@@ -285,4 +285,4 @@ def test_default_research_screens_includes_cost_aware() -> None:
 
     assert "cost_aware" in DEFAULT_RESEARCH_SCREENS
     assert DEFAULT_RESEARCH_SCREENS["cost_aware"] is COST_AWARE_SCREEN
-    assert DEFAULT_RESEARCH_SCREENS["cost_aware"].max_tick_cost_bp == 7.5
+    assert DEFAULT_RESEARCH_SCREENS["cost_aware"].max_tick_cost_bp == 12.0
