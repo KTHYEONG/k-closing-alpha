@@ -19,7 +19,8 @@ systemctl --user enable --now \
   kca-price-ingest.timer \
   kca-daily-audit.timer \
   kca-backup.timer \
-  kca-backup-prune.timer
+  kca-backup-prune.timer \
+  kca-retrain.timer
 
 # Keep user timers alive without an active login session (WSL).
 loginctl enable-linger "${USER}"

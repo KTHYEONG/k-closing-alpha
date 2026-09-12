@@ -129,3 +129,42 @@ def test_daily_audit_still_audits_when_calendar_lookup_fails(monkeypatch) -> Non
 
     # When / Then: 부가 정보 실패가 감사 자체를 막지 않는다 (장애 조기 발견 목적 유지)
     assert daily_audit.audit_or_skip("2026-09-10") == expected
+
+
+def test_notify_if_missing_dispatches_alert_only_when_steps_missing(monkeypatch) -> None:
+    from src.tools import daily_audit
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        "src.tools.alerts.dispatch_failure_alert",
+        lambda unit, *, detail="": captured.update(unit=unit, detail=detail) or {"webhook": True, "email": True},
+    )
+
+    # When: 두 단계 누락
+    missing = daily_audit._notify_if_missing(
+        "2026-09-10",
+        {"archive": True, "minute_bars": False, "decision": False, "close_confirmed": True},
+    )
+
+    # Then: 정렬된 누락 목록 + 얼러트 발송
+    assert missing == ["decision", "minute_bars"]
+    assert "2026-09-10" in captured["unit"]
+    assert "decision" in captured["detail"]
+    assert "minute_bars" in captured["detail"]
+
+    # Given: 아무것도 누락 없음
+    called = {"n": 0}
+    monkeypatch.setattr(
+        "src.tools.alerts.dispatch_failure_alert",
+        lambda *a, **kw: called.__setitem__("n", called["n"] + 1) or {},
+    )
+
+    # When
+    missing2 = daily_audit._notify_if_missing(
+        "2026-09-10",
+        {"archive": True, "minute_bars": True, "decision": True, "close_confirmed": True},
+    )
+
+    # Then: 얼러트 미발송
+    assert missing2 == []
+    assert called["n"] == 0

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from pydantic_settings import SettingsConfigDict
 
+from src.config.alerts import AlertSettings
 from src.config.altdata import AltDataSettings
 from src.config.base import PathSettings
 from src.config.kis import KisSettings
@@ -22,7 +23,7 @@ from src.config.trading import TradingSettings
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings, TossSettings):
+class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings, TossSettings, AlertSettings):
     """프로젝트 전역 설정. `.env` 파일에서 자동 로드.
 
     도메인별 설정 모듈을 통합한 싱글톤으로, 모든 소비자 모듈은
@@ -65,6 +66,10 @@ KIWOM_TICK_MAX_PAGES = settings.KIWOM_TICK_MAX_PAGES
 TOSS_APP_KEY = settings.TOSS_APP_KEY
 TOSS_APP_SECRET = settings.TOSS_APP_SECRET
 TOSS_BASE_URL = settings.TOSS_BASE_URL
+ALERT_WEBHOOK_URL = settings.ALERT_WEBHOOK_URL
+ALERT_GMAIL_USER = settings.ALERT_GMAIL_USER
+ALERT_GMAIL_APP_PASSWORD = settings.ALERT_GMAIL_APP_PASSWORD
+ALERT_GMAIL_TO = settings.ALERT_GMAIL_TO
 TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
 OVERHEATED_CONDITION_NAME = settings.OVERHEATED_CONDITION_NAME
 NEW_HIGH_CONDITION_NAME = settings.NEW_HIGH_CONDITION_NAME
@@ -105,6 +110,10 @@ KRX_OPENAPI_BASE_URLS = settings.KRX_OPENAPI_BASE_URLS
 KRX_OPENAPI_ENDPOINTS = settings.KRX_OPENAPI_ENDPOINTS
 
 __all__ = [
+    "ALERT_GMAIL_APP_PASSWORD",
+    "ALERT_GMAIL_TO",
+    "ALERT_GMAIL_USER",
+    "ALERT_WEBHOOK_URL",
     "ALTDATA_DIR",
     "API_SEMAPHORE_LIMIT",
     "BASE_DIR",
@@ -163,6 +172,7 @@ __all__ = [
     "TRADE_LOG_PARQUET_PATH",
     "UPPER_LIMIT_CONDITION_NAME",
     "UPPER_LIMIT_NEXT_DAY_CONDITION_NAME",
+    "AlertSettings",
     "AltDataSettings",
     "KisSettings",
     "KiwoomSettings",

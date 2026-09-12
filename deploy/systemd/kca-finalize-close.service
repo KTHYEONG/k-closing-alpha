@@ -1,6 +1,7 @@
 [Unit]
 Description=KCA close finalization (confirmed EOD update)
 OnSuccess=kca-paper-entry.service
+OnFailure=kca-alert@%n.service
 
 [Service]
 Type=oneshot
