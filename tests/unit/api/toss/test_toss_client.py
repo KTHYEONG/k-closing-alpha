@@ -191,3 +191,52 @@ def test_toss_client_get_rankings_forwards_exclude_investment_caution() -> None:
 
     _, called_kwargs = session.get.call_args
     assert called_kwargs["params"]["excludeInvestmentCaution"] == "true"
+
+
+def test_toss_client_get_candles_parses_result_envelope() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.api.toss.client import TossApiClient
+
+    client = TossApiClient(app_key="k", app_secret="s")
+    client.token = "tok"
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value={"result": {"candles": [
+        {"timestamp": "2024-02-28T15:30:00.000+09:00", "openPrice": "70000", "highPrice": "70100", "lowPrice": "69900", "closePrice": "70000", "volume": "10", "currency": "KRW"}
+    ]}})
+    session = AsyncMock()
+    session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+    session.get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    data = asyncio.run(client.get_candles(session, "000250", interval="1m", count=200, before="2024-02-28T15:30:00.000+09:00"))
+
+    assert data["result"]["candles"][0]["closePrice"] == "70000"
+    called_args, called_kwargs = session.get.call_args
+    assert called_args[0] == "https://openapi.tossinvest.com/api/v1/candles"
+    assert called_kwargs["params"] == {"symbol": "000250", "interval": "1m", "count": 200, "before": "2024-02-28T15:30:00.000+09:00"}
+
+
+def test_toss_client_get_candles_forwards_adjusted_flag_and_omits_before_when_absent() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.api.toss.client import TossApiClient
+
+    client = TossApiClient(app_key="k", app_secret="s")
+    client.token = "tok"
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value={"result": {"candles": []}})
+    session = AsyncMock()
+    session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+    session.get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    asyncio.run(client.get_candles(session, "005930", adjusted=False))
+
+    _, called_kwargs = session.get.call_args
+    assert called_kwargs["params"]["adjusted"] == "false"
+    assert "before" not in called_kwargs["params"]

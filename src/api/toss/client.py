@@ -136,3 +136,21 @@ class TossApiClient:
         if exclude_investment_caution is not None:
             params["excludeInvestmentCaution"] = str(bool(exclude_investment_caution)).lower()
         return await self._get(session, "/api/v1/rankings", "RANKING", params=params)
+
+    async def get_candles(
+        self,
+        session,
+        symbol: str,
+        *,
+        interval: str = "1m",
+        count: int = 200,
+        before: str | None = None,
+        adjusted: bool | None = None,
+    ) -> dict:
+        """캔들 차트 조회 (`GET /api/v1/candles`)."""
+        params: dict[str, str | int] = {"symbol": symbol, "interval": interval, "count": int(count)}
+        if before:
+            params["before"] = before
+        if adjusted is not None:
+            params["adjusted"] = str(bool(adjusted)).lower()
+        return await self._get(session, "/api/v1/candles", "MARKET_DATA_CHART", params=params)
