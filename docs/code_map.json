@@ -15,7 +15,8 @@
       "tests/unit/api/kis/test_kis_client.py",
       "tests/unit/api/kis/test_kis_rate_limiter.py",
       "tests/unit/api/kiwoom/test_kiwoom_client.py",
-      "tests/unit/api/test_kis_client_facade_removed.py"
+      "tests/unit/api/test_kis_client_facade_removed.py",
+      "tests/unit/api/toss/test_toss_client.py"
     ]
   },
   "src/api/kis/ws_client.py": {
@@ -30,6 +31,12 @@
   },
   "src/api/ls/client.py": {
     "testing": "tests/unit/api/ls/test_ls_client.py"
+  },
+  "src/api/toss/client.py": {
+    "testing": [
+      "tests/unit/api/toss/test_toss_client.py",
+      "tests/unit/daily/test_price_ingest.py"
+    ]
   },
   "src/backfill/altdata/config.py": {
     "testing": [
@@ -144,6 +151,9 @@
   "src/config/market_session.py": {
     "testing": "tests/unit/config/test_market_session.py"
   },
+  "src/config/toss.py": {
+    "testing": "tests/unit/config/test_toss.py"
+  },
   "src/config/trading.py": {
     "testing": "tests/unit/config/test_trading.py"
   },
@@ -169,7 +179,8 @@
     "testing": "tests/unit/daily/test_predict.py"
   },
   "src/daily/price_ingest.py": {
-    "testing": "tests/unit/daily/test_price_ingest.py"
+    "testing": "tests/unit/daily/test_price_ingest.py",
+    "architecture": "docs/architecture/broker_toss.md"
   },
   "src/daily/universe_scan.py": {
     "testing": "tests/unit/daily/test_universe_scan.py"
@@ -306,6 +317,7 @@
       "tests/unit/config/test_kiwoom.py",
       "tests/unit/config/test_ls.py",
       "tests/unit/config/test_settings_compat.py",
+      "tests/unit/config/test_toss.py",
       "tests/unit/config/test_trading.py",
       "tests/unit/daily/test_archive.py",
       "tests/unit/daily/test_archive_intraday.py",
