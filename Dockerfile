@@ -7,7 +7,12 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Seoul \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_NO_SYNC=1
+# UV_NO_SYNC: 빌드시 --no-dev --frozen 으로 굳힌 venv를 uv run 이 런타임에
+# 다시 동기화(=dev 의존성까지 재설치)하지 않도록 막는다. 실측: 이 변수 없이
+# 컨테이너에서 uv run 을 실행하면 매번 mypy/ruff 등 14개 dev 패키지를
+# 네트워크로 재설치했다.
 
 # lightgbm 은 OpenMP 런타임(libgomp)을 요구한다 (VPS 실측: 누락 시 ImportError).
 # ripgrep 은 test_kis_client_facade_removed.py 등 코드베이스 스캔 테스트가 요구한다.
