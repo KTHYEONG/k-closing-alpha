@@ -202,7 +202,7 @@ def test_log_session_coverage_outliers_flags_symbol_below_peer_ratio(caplog) -> 
         report = intraday_store.log_session_coverage_outliers(merged, 1, "2026-09-11", "regular")
 
     # Then
-    assert report == {"n_symbols": 2, "n_low_coverage": 1}
+    assert report == {"n_symbols": 2, "n_low_coverage": 1, "n_truncated": 0}
     assert any("session_coverage" in rec.message and "B" in rec.message for rec in caplog.records)
 
 
@@ -221,7 +221,7 @@ def test_log_session_coverage_outliers_returns_zero_when_all_symbols_at_peer_lev
         report = intraday_store.log_session_coverage_outliers(merged, 1, "2026-09-11", "regular")
 
     # Then
-    assert report == {"n_symbols": 3, "n_low_coverage": 0}
+    assert report == {"n_symbols": 3, "n_low_coverage": 0, "n_truncated": 0}
     assert not any("session_coverage" in rec.message for rec in caplog.records)
 
 
@@ -235,7 +235,7 @@ def test_log_session_coverage_outliers_handles_empty_frame() -> None:
     report = intraday_store.log_session_coverage_outliers(pd.DataFrame(), 1, "2026-09-11", "regular")
 
     # Then
-    assert report == {"n_symbols": 0, "n_low_coverage": 0}
+    assert report == {"n_symbols": 0, "n_low_coverage": 0, "n_truncated": 0}
 
 
 def test_log_session_coverage_outliers_respects_custom_min_peer_ratio_boundary() -> None:
@@ -251,12 +251,12 @@ def test_log_session_coverage_outliers_respects_custom_min_peer_ratio_boundary()
     report = intraday_store.log_session_coverage_outliers(merged, 1, "2026-09-11", "regular", min_peer_ratio=0.8)
 
     # Then
-    assert report == {"n_symbols": 3, "n_low_coverage": 1}
+    assert report == {"n_symbols": 3, "n_low_coverage": 1, "n_truncated": 0}
 
     # And: a lone symbol (no peer) is never flagged, regardless of ratio
     solo = pd.DataFrame({"symbol": ["Z"] * 2})
     solo_report = intraday_store.log_session_coverage_outliers(solo, 1, "2026-09-11", "regular", min_peer_ratio=0.99)
-    assert solo_report == {"n_symbols": 1, "n_low_coverage": 0}
+    assert solo_report == {"n_symbols": 1, "n_low_coverage": 0, "n_truncated": 0}
 
 
 def test_write_intraday_partition_logs_low_coverage_symbol_without_changing_return_value(tmp_path, monkeypatch, caplog) -> None:
@@ -293,3 +293,106 @@ def test_write_intraday_partition_logs_low_coverage_symbol_without_changing_retu
     # Then: return contract unchanged (still total row count), diagnostic visible via log
     assert rows_written == 4
     assert any("session_coverage" in rec.message and "000660" in rec.message for rec in caplog.records)
+
+
+def test_log_session_coverage_outliers_does_not_flag_full_range_scattered_gaps() -> None:
+    import pandas as pd
+
+    from src.data import intraday_store
+
+    # Given: A has 12 bars spanning the full session (peer reference); B has only 5 bars
+    # (below the 0.8 peer-ratio threshold) but its first and last bar still match A's
+    # floor/ceiling -- scattered internal gaps only, not a truncated session
+    merged = pd.DataFrame({
+        "symbol": ["A"] * 12 + ["B"] * 5,
+        "ts_hms": (
+            [90000, 90100, 90200, 90300, 100000, 110000, 120000, 130000, 140000, 150000, 152900, 153000]  # noqa: RUF005 - contract skeleton verbatim
+            + [90000, 100000, 120000, 140000, 153000]
+        ),
+    })
+
+    # When
+    report = intraday_store.log_session_coverage_outliers(merged, 1, "2026-09-11", "regular")
+
+    # Then: B is flagged low-coverage but NOT truncated
+    assert report == {"n_symbols": 2, "n_low_coverage": 1, "n_truncated": 0}
+
+
+def test_log_session_coverage_outliers_flags_truncated_start_symbol() -> None:
+    import pandas as pd
+
+    from src.data import intraday_store
+
+    # Given: A spans the full session (floor=90000); C starts late at 121100
+    # (mirrors the confirmed 2023-07-05 Toss backfill defect)
+    merged = pd.DataFrame({
+        "symbol": ["A"] * 12 + ["C"] * 6,
+        "ts_hms": (
+            [90000, 90100, 90200, 90300, 100000, 110000, 120000, 130000, 140000, 150000, 152900, 153000]  # noqa: RUF005 - contract skeleton verbatim
+            + [121100, 130000, 140000, 143000, 150000, 153000]
+        ),
+    })
+
+    # When
+    report = intraday_store.log_session_coverage_outliers(merged, 1, "2026-09-11", "regular")
+
+    # Then: C is flagged both low-coverage (6 < 12*0.8) and truncated (starts 31100 past floor)
+    assert report == {"n_symbols": 2, "n_low_coverage": 1, "n_truncated": 1}
+
+
+def test_log_session_coverage_outliers_flags_truncated_end_symbol() -> None:
+    import pandas as pd
+
+    from src.data import intraday_store
+
+    # Given: A spans the full session ending at 153000; D has almost as many bars (11 vs
+    # peer 12, NOT below the 0.8 peer-ratio threshold) but ends early at 151900
+    merged = pd.DataFrame({
+        "symbol": ["A"] * 12 + ["D"] * 11,
+        "ts_hms": (
+            [90000, 90100, 90200, 90300, 100000, 110000, 120000, 130000, 140000, 150000, 152900, 153000]  # noqa: RUF005 - contract skeleton verbatim
+            + [90000, 90100, 90200, 90300, 100000, 110000, 120000, 130000, 140000, 150000, 151900]
+        ),
+    })
+
+    # When
+    report = intraday_store.log_session_coverage_outliers(merged, 1, "2026-09-11", "regular")
+
+    # Then: D is truncated (ends 1100 before ceiling) but NOT flagged low-coverage
+    assert report == {"n_symbols": 2, "n_low_coverage": 0, "n_truncated": 1}
+
+
+def test_write_intraday_partition_logs_truncation_warning_for_partial_session_symbol(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    from src.data import intraday_store
+    from src.data.intraday_schema import normalize_bar_frame
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+
+    # Given: 005930 spans 09:00-09:10 (11 bars, full range); 000660 only has 2 bars
+    # starting at 09:09 (900 HHMMSS units past the batch floor 090000, past the 500 default)
+    times_full = ["090000", "090100", "090200", "090300", "090400", "090500", "090600", "090700", "090800", "090900", "091000"]
+    raw_full = pd.DataFrame({
+        "time": times_full,
+        "open": [70000] * 11, "high": [70100] * 11, "low": [69900] * 11, "close": [70000] * 11,
+        "jdiff_vol": [1000] * 11, "value": [70] * 11,
+    })
+    df_full = normalize_bar_frame(raw_full, "ls", "2026-09-11", "005930")
+    raw_late = pd.DataFrame({
+        "time": ["090900", "091000"],
+        "open": [50000, 50000], "high": [50100, 50100], "low": [49900, 49900], "close": [50000, 50000],
+        "jdiff_vol": [500, 500], "value": [25, 25],
+    })
+    df_late = normalize_bar_frame(raw_late, "ls", "2026-09-11", "000660")
+    df_in = pd.concat([df_full, df_late], ignore_index=True)
+
+    # When
+    with caplog.at_level(logging.WARNING, logger=intraday_store.logger.name):
+        rows_written = intraday_store.write_intraday_partition(df_in, 1, "2026-09-11", "regular")
+
+    # Then: return contract unchanged (total row count), truncation diagnostic visible via log
+    assert rows_written == 13
+    assert any("session_truncation" in rec.message and "000660" in rec.message for rec in caplog.records)
