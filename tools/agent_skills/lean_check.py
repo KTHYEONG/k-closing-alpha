@@ -372,6 +372,16 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
             diagnostics.append(d)
             continue
 
+        if kind in ("new_file", "modified_file"):
+            # AST/symbol-level verification below assumes 'name' is a code
+            # symbol (function/class/constant). For file-level change kinds,
+            # 'name' is a descriptive change label instead (e.g. a docstring
+            # edit, or a non-Python target like an ini unit or shell script),
+            # so there is no symbol to look up. The existence check above is
+            # the only structural guarantee this tool can make here --
+            # content correctness is the scenario tests' job.
+            continue
+
         with open(fh) as sf:
             sf_content = sf.read()
             if kind.startswith("deleted_"):
@@ -813,7 +823,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                     )
             if not pre_impl:
                 clean_import = re.sub(r"\(.*?\)|#.*", "", import_symbol).strip()
-                if clean_import:
+                if clean_import and clean_import.upper() != "N/A":
                     found_import = clean_import in wf_content
                     if not found_import:
                         norm_wf = re.sub(r"\s+", " ", wf_content)
@@ -838,7 +848,7 @@ def _check_spec_compliance(spec_path: str, pre_impl: bool = False) -> tuple[int,
                             }
                         )
                 clean_inv = re.sub(r"#.*", "", invocation_expr).strip()
-                if clean_inv:
+                if clean_inv and clean_inv.upper() != "N/A":
                     found_invocation = clean_inv in wf_content
                     if not found_invocation:
                         norm_wf = re.sub(r"\s+", " ", wf_content)
