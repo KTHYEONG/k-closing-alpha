@@ -14,11 +14,15 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    containerized = {"kca-retrain.service"}
 
     for svc in sorted(root.glob("kca-*.service")):
         text = svc.read_text(encoding="utf-8")
         assert "WorkingDirectory=%h/k-closing-alpha" in text, svc.name
-        assert "%h/.local/bin/" in text, svc.name
+        if svc.name in containerized:
+            assert "%h/k-closing-alpha/data" in text, svc.name
+        else:
+            assert "%h/.local/bin/" in text, svc.name
 
 
 def test_install_script_enables_every_existing_timer() -> None:
@@ -156,3 +160,31 @@ def test_retrain_timer_exists_and_install_script_enables_it() -> None:
 
     # And: install_systemd.sh 가 이 타이머를 활성화 목록에 포함
     assert "kca-retrain.timer" in install_text
+
+
+def test_retrain_service_runs_containerized_with_measured_resource_limits() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-retrain.service").read_text(encoding="utf-8")
+
+    assert "docker run --rm" in text
+    assert "--memory=6g" in text
+    assert "--cpus=1.8" in text
+    assert "OnFailure=kca-alert@%n.service" in text
+    assert "src.ml.retrain --train-ranker-bundle" in text
+
+
+def test_code_sync_timer_exists_and_install_script_enables_it() -> None:
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+    timer = (base / "systemd" / "kca-code-sync.timer").read_text(encoding="utf-8")
+    service = (base / "systemd" / "kca-code-sync.service").read_text(encoding="utf-8")
+    install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
+
+    assert "Unit=kca-code-sync.service" in timer
+    assert "OnCalendar=Mon..Fri" in timer
+    assert "src.tools.code_sync" in service
+    assert "OnFailure=kca-alert@%n.service" in service
+    assert "kca-code-sync.timer" in install_text

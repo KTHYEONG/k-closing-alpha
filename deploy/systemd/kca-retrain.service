@@ -1,8 +1,9 @@
 [Unit]
-Description=KCA weekly ranker bundle retrain + re-certification
+Description=KCA weekly ranker bundle retrain + re-certification (containerized)
 OnFailure=kca-alert@%n.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
-ExecStart=%h/.local/bin/uv run python -m src.ml.retrain --train-ranker-bundle
+ExecStartPre=/usr/bin/docker pull ghcr.io/kthyeong/k-closing-alpha:latest
+ExecStart=/usr/bin/docker run --rm --memory=6g --cpus=1.8 --memory-swap=8g --env-file %h/k-closing-alpha/.env -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.ml.retrain --train-ranker-bundle
