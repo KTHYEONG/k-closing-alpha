@@ -115,3 +115,44 @@ def test_backup_prune_timer_exists_and_targets_service() -> None:
     assert "Unit=kca-backup-prune.service" in timer
     assert "OnCalendar=" in timer
     assert "After=kca-backup.service" in service
+
+
+def test_alert_template_service_and_critical_path_onfailure_hooks() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+
+    # Given/When: 알림 템플릿 유닛
+    template = (root / "kca-alert@.service").read_text(encoding="utf-8")
+
+    # Then
+    assert "WorkingDirectory=%h/k-closing-alpha" in template
+    assert "%h/.local/bin/" in template
+    assert "src.tools.alerts" in template
+    assert "--unit %i" in template
+
+    # And: 결정경로 5개 서비스 전부 OnFailure 훅 보유
+    for name in ("kca-collect", "kca-predict", "kca-finalize-close", "kca-paper-entry", "kca-paper-exit"):
+        text = (root / f"{name}.service").read_text(encoding="utf-8")
+        assert "OnFailure=kca-alert@%n.service" in text, name
+
+
+def test_retrain_timer_exists_and_install_script_enables_it() -> None:
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+    timer = (base / "systemd" / "kca-retrain.timer").read_text(encoding="utf-8")
+    service = (base / "systemd" / "kca-retrain.service").read_text(encoding="utf-8")
+    install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
+
+    # Then: 타이머가 서비스를 정확히 겨냥
+    assert "Unit=kca-retrain.service" in timer
+    assert "OnCalendar=" in timer
+    assert "Persistent=true" in timer
+
+    # And: 서비스가 재학습 커맨드 + 실패 얼러트 훅을 가짐
+    assert "src.ml.retrain --train-ranker-bundle" in service
+    assert "OnFailure=kca-alert@%n.service" in service
+
+    # And: install_systemd.sh 가 이 타이머를 활성화 목록에 포함
+    assert "kca-retrain.timer" in install_text

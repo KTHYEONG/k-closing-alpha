@@ -1,5 +1,6 @@
 [Unit]
 Description=KCA daily collect (read-only snapshot)
+OnFailure=kca-alert@%n.service
 
 [Service]
 Type=oneshot

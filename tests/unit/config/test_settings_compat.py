@@ -149,3 +149,19 @@ def test_lowercase_setting_aliases_are_removed() -> None:
         assert hasattr(instance, name)
         assert hasattr(settings_module, name)
 
+
+
+def test_alert_settings_threaded_into_global_settings_singleton() -> None:
+    from src import settings
+    from src.config import AlertSettings, Settings
+
+    # Then: AlertSettings 가 Settings 의 믹스인 베이스
+    assert issubclass(Settings, AlertSettings)
+    # And: 모듈 레벨 재수출이 싱글톤 인스턴스 값과 일치
+    assert settings.ALERT_WEBHOOK_URL == settings.settings.ALERT_WEBHOOK_URL
+    assert settings.ALERT_GMAIL_USER == settings.settings.ALERT_GMAIL_USER
+    assert settings.ALERT_GMAIL_APP_PASSWORD == settings.settings.ALERT_GMAIL_APP_PASSWORD
+    assert settings.ALERT_GMAIL_TO == settings.settings.ALERT_GMAIL_TO
+    # And: __all__ 에 신규 심볼이 등록됨
+    assert "AlertSettings" in settings.__all__
+    assert "ALERT_WEBHOOK_URL" in settings.__all__
