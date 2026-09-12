@@ -146,7 +146,10 @@ def test_build_ml_dataset_output_unchanged_after_vectorization() -> None:
     )
 
 def test_label_source_is_excluded_from_model_features() -> None:
+    from pathlib import Path
+
     import pandas as pd
+    import pytest
 
     from src.ml.dataset import _EXCLUDED_FROM_X, build_ml_dataset
 
@@ -154,6 +157,8 @@ def test_label_source_is_excluded_from_model_features() -> None:
 
     # Arrange
     assert LABEL_SOURCE_COLUMN in _EXCLUDED_FROM_X
+    if not Path("data/parquet/trade_log.parquet").exists():
+        pytest.skip("production trade_log parquet not present")
     trade_log = pd.read_parquet("data/parquet/trade_log.parquet").head(2000)
     theme = pd.read_parquet("data/parquet/theme.parquet")
     tagged = trade_log.copy()
