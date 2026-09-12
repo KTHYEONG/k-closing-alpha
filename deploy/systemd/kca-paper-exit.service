@@ -3,5 +3,5 @@ Description=KCA paper exit (no real orders)
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/kth/k-closing-alpha
-ExecStart=/home/kth/.local/bin/uv run python -m src.daily.paper_trade --phase exit
+WorkingDirectory=%h/k-closing-alpha
+ExecStart=%h/.local/bin/uv run python -m src.daily.paper_trade --phase exit
