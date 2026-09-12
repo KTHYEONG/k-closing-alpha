@@ -41,7 +41,7 @@ def test_retrain_champion_only_cli_flags_are_removed() -> None:
     for kept in (
         "export_dir", "feature_set", "oos_reserve_start", "universe_research",
         "cost_aware_backtest", "train_ranker_bundle", "ranker_topk_research",
-        "ranker_train_start",
+        "ranker_train_start", "exit_grid_revalidation",
     ):
         assert kept in dests, kept
 
@@ -329,3 +329,37 @@ def test_retrain_train_ranker_bundle_missing_price_history_raises(tmp_path, monk
 
     with pytest.raises(ValueError, match="price_history not found"):
         main(["--train-ranker-bundle", "--export-dir", str(tmp_path)])
+
+
+def test_retrain_exit_grid_revalidation_dispatches(tmp_path, monkeypatch) -> None:
+    import src.ml.research.exit_grid_revalidation as exit_grid_mod
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    seen: dict[str, object] = {}
+
+    def _fake_run(*, export_dir=None, **kwargs):
+        seen["export_dir"] = export_dir
+        return {"n_days": 44, "cost_ratio": 0.00469, "incumbent_mean_net": -0.001, "grid": [], "best": None}
+
+    monkeypatch.setattr(exit_grid_mod, "run_exit_grid_revalidation", _fake_run)
+
+    main(["--exit-grid-revalidation", "--export-dir", str(tmp_path)])
+
+    assert seen["export_dir"] == str(tmp_path)
+
+
+def test_retrain_exit_grid_revalidation_missing_price_history_raises(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "nope.parquet")
+
+    with pytest.raises(ValueError, match="price_history not found"):
+        main(["--exit-grid-revalidation", "--export-dir", str(tmp_path)])
+
