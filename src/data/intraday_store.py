@@ -54,16 +54,29 @@ def merge_partition_frame(new_df: pd.DataFrame, target: Path, key_cols: tuple[st
 
 
 def log_session_coverage_outliers(
-    merged: pd.DataFrame, bar_interval_minutes: int, snapshot_date: str, session: str, *, min_peer_ratio: float = 0.8
+    merged: pd.DataFrame,
+    bar_interval_minutes: int,
+    snapshot_date: str,
+    session: str,
+    *,
+    min_peer_ratio: float = 0.8,
+    max_boundary_gap_hhmmss: int = 500,
 ) -> dict[str, int]:
-    """파티션 병합 후 종목별 봉 수를 같은 배치의 peer 최댓값과 비교해 저조한 종목을 로그로 남긴다.
+    """파티션 병합 후 종목별 봉 수/세션 경계를 peer와 비교해 저조·절단 종목을 로그로 남긴다.
 
-    벤더 응답이 성공(예외 없음)이었어도 특정 종목만 세션 일부만 수집된 경우
-    (부분 수집, 네트워크 중단, 혹은 실제로 희소하게 거래되는 종목) 현재는 어떤
-    진단도 남기지 않는다. peer_max 대비 min_peer_ratio 미만인 종목을 WARNING
-    으로 남겨 가시성만 확보한다 -- 자동 재수집/차단은 하지 않는다. 희소유동성
-    종목의 정상적으로 낮은 봉수와 실제 수집 실패를 이 함수만으로는 구분할 수
-    없으므로(둘 다 같은 신호를 낸다), 조치는 로그를 본 사람의 판단에 맡긴다.
+    두 가지 독립 신호를 낸다:
+    1) n_low_coverage: 종목의 총 봉수가 peer 최댓값의 min_peer_ratio 미만(기존 신호).
+    2) n_truncated: 종목의 첫/마지막 봉이 배치 전체의 세션 floor/ceiling에서
+       max_boundary_gap_hhmmss 이상 벗어남 -- /probe(intraday_gap_retroactive_backfill_policy)
+       실측 결과, peer 봉수비율만으로는 '정상적으로 희소한 거래'(세션 전체범위는
+       채워지되 내부에 산발적 공백만 있는 경우, 실측 217건 중 199건, 92%)와
+       '진짜 부분수집 결함'(세션 시작/끝이 실제로 잘려나간 경우)을 구분하지 못했다
+       (false positive). 절단 여부가 더 정밀한 결함 신호임을 실측으로 확인했다.
+
+    벤더 응답이 성공(예외 없음)이었어도 특정 종목만 세션 일부만 수집된 경우 현재는
+    어떤 진단도 남기지 않는다. 자동 재수집/차단은 하지 않는다 -- 희소유동성 종목의
+    정상적으로 낮은 봉수와 실제 수집 실패를 완전히 구분할 수는 없으므로, 조치는
+    로그를 본 사람의 판단에 맡긴다.
 
     Args:
         merged: write_intraday_partition이 병합해 실제로 쓰는 최종 프레임.
@@ -71,12 +84,15 @@ def log_session_coverage_outliers(
         snapshot_date: 파티션 날짜(로그 컨텍스트용).
         session: 세션 태그(로그 컨텍스트용).
         min_peer_ratio: peer 최댓값 대비 이 비율 미만이면 저조로 표식(strict less-than).
+        max_boundary_gap_hhmmss: ts_hms(HHMMSS 정수) 기준 이 값 이상 floor/ceiling에서
+            벗어나면 절단으로 표식. HHMMSS는 선형 시간이 아니므로(시 경계에서 비선형
+            점프) 여유 있게 잡은 기본값이다.
 
     Returns:
-        {"n_symbols": 전체 종목수, "n_low_coverage": 저조 종목수}.
+        {"n_symbols": 전체 종목수, "n_low_coverage": 저조 종목수, "n_truncated": 절단 종목수}.
     """
     if merged.empty or "symbol" not in merged.columns:
-        return {"n_symbols": 0, "n_low_coverage": 0}
+        return {"n_symbols": 0, "n_low_coverage": 0, "n_truncated": 0}
     counts = merged.groupby("symbol").size()
     peer_max = int(counts.max())
     low = counts[counts < peer_max * float(min_peer_ratio)]
@@ -85,7 +101,21 @@ def log_session_coverage_outliers(
             "[DATA] stage=session_coverage bar_interval=%dm date=%s session=%s peer_max=%d n_low=%d symbols=%s",
             bar_interval_minutes, snapshot_date, session, peer_max, len(low), sorted(low.index.tolist())[:20],
         )
-    return {"n_symbols": len(counts), "n_low_coverage": len(low)}
+    truncated: pd.Index = pd.Index([], dtype=object)
+    if "ts_hms" in merged.columns and len(counts) > 1:
+        session_floor = int(merged["ts_hms"].min())
+        session_ceil = int(merged["ts_hms"].max())
+        first_ts = merged.groupby("symbol")["ts_hms"].min()
+        last_ts = merged.groupby("symbol")["ts_hms"].max()
+        starts_late = first_ts[first_ts > session_floor + max_boundary_gap_hhmmss].index
+        ends_early = last_ts[last_ts < session_ceil - max_boundary_gap_hhmmss].index
+        truncated = starts_late.union(ends_early)
+        if len(truncated):
+            logger.warning(
+                "[DATA] stage=session_truncation bar_interval=%dm date=%s session=%s floor=%d ceil=%d n_truncated=%d symbols=%s",
+                bar_interval_minutes, snapshot_date, session, session_floor, session_ceil, len(truncated), sorted(truncated.tolist())[:20],
+            )
+    return {"n_symbols": len(counts), "n_low_coverage": len(low), "n_truncated": len(truncated)}
 
 
 def write_intraday_partition(df: pd.DataFrame, bar_interval_minutes: int, snapshot_date: str, session: str) -> int:

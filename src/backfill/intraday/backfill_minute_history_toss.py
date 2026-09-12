@@ -27,6 +27,25 @@ from src.data.intraday_schema import normalize_bar_frame
 
 logger = logging.getLogger(__name__)
 
+
+class TossCandleFetchError(RuntimeError):
+    """Toss candles 페이지 응답이 에러 봉투({'error': {...}})인 경우.
+
+    빈 결과({'result': {'candles': []}})와 벤더 오류를 구분하지 못하면 2페이지 중
+    하나가 실패해도 나머지 절반만으로 세션이 조용히 절단된다(2023-07-05 14종목
+    실측 재현 사례: 200/391봉, 오전 절반이 이 경로로 유실됐다).
+    """
+
+
+def _raise_if_toss_error(page: dict, code: str, snapshot_date: str, page_label: str) -> None:
+    """page가 Toss 에러 봉투({'error': {...}})면 TossCandleFetchError를 raise한다."""
+    if isinstance(page, dict) and "error" in page:
+        err = page["error"]
+        raise TossCandleFetchError(
+            f"Toss candles {page_label} failed symbol={code} date={snapshot_date} "
+            f"code={err.get('code')} msg={err.get('message', '')}"
+        )
+
 GAP_START_DATE: str = "2022-09-01"
 GAP_END_DATE: str = "2025-09-01"
 
@@ -43,13 +62,17 @@ async def _fetch_toss_regular_session_bars(toss: Any, session: Any, code: str, s
     파티션(기존 파일이 아직 없는 첫 기록) 병합 시 merge_partition_frame은 new_df 내부의
     중복은 제거하지 않고 신규-vs-기존 비교만 dedupe하므로(실측 확인), 여기서 명시적으로
     (symbol, ts_hms) 기준 중복을 제거해야 한다 -- write 계층에 기대지 않는다.
+    Toss 에러 봉투({'error': {...}})가 어느 페이지에 와도 TossCandleFetchError를
+    raise하고 조용히 '캔들 없음'으로 취급하지 않는다.
     """
     before_close = f"{snapshot_date}T{_hms_colon(KRX_REGULAR_HOUR_CEIL)}.000+09:00"
     page1 = await toss.get_candles(session, code, interval="1m", count=200, before=before_close)
+    _raise_if_toss_error(page1, code, snapshot_date, "page1")
     candles = list((page1.get("result") or {}).get("candles") or [])
     if candles:
         oldest_ts = candles[-1]["timestamp"]
         page2 = await toss.get_candles(session, code, interval="1m", count=200, before=oldest_ts)
+        _raise_if_toss_error(page2, code, snapshot_date, "page2")
         candles += list((page2.get("result") or {}).get("candles") or [])
     df = normalize_bar_frame(pd.DataFrame(candles), "toss", snapshot_date, code)
     if df.empty:
