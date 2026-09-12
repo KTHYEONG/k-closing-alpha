@@ -3,7 +3,9 @@
 Role split (measured): KRX OpenAPI returns every listed stock for one date in one call
 (OHLC, base price, value, market cap); KIS returns 30 trading days of per-stock investor
 and program flow per call under the shared 18 rps bucket, and the KOSPI/KOSDAQ composite
-index history (KIS codes 0001/1001). Kiwoom ka10059 backs up the investor flow only.
+index history (KIS codes 0001/1001). Kiwoom ka10059 backs up the investor flow only; Toss
+STOCK_TRADING_TREND program-trades backs up the program flow only, under its own
+independent rate bucket (never shared with KIS's limiter).
 Corporate actions are re-derived from the KRX base price, so no history refetch is needed.
 """
 
@@ -95,7 +97,9 @@ class IngestReport:
     n_new_rows: int
     n_corporate_events: int
     investor_sources: dict[str, int] = field(default_factory=dict)
+    program_sources: dict[str, int] = field(default_factory=dict)
     flow_coverage: dict[str, float] = field(default_factory=dict)
+    program_flow_coverage: dict[str, float] = field(default_factory=dict)
     wrote: bool = False
 
 
@@ -329,6 +333,32 @@ def parse_kis_program_rows(body: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["date", "program_netbuy"]).drop_duplicates("date")
 
 
+def parse_toss_program_rows(body: dict) -> pd.DataFrame:
+    """Parse Toss `/stocks/{symbol}/program-trades` into daily program net buy (KRW).
+
+    Toss splits program flow into arbitrage/non-arbitrage legs; program_netbuy is the
+    sum of both legs' netBuyVolume, matching KIS's whole-market `whol_smtn_ntby_tr_pbmn`
+    semantics (parse_kis_program_rows). Toss numeric fields are clean decimal strings
+    with no comma or sign-prefix quirk, so a direct float() cast is safe.
+
+    Raises:
+        VendorResponseError: When the response is a Toss error envelope.
+    """
+    if "error" in body:
+        err = body["error"]
+        raise VendorResponseError(f"Toss program-trades code={err.get('code')} msg={err.get('message', '')}")
+    records = (body.get("result") or {}).get("records") or []
+    rows = [
+        {
+            "date": pd.Timestamp(r["date"]),
+            "program_netbuy": float(r["arbitrage"]["netBuyVolume"]) + float(r["nonArbitrage"]["netBuyVolume"]),
+        }
+        for r in records
+        if r.get("date")
+    ]
+    return pd.DataFrame(rows, columns=["date", "program_netbuy"]).drop_duplicates("date")
+
+
 def parse_kiwoom_investor_rows(data: dict) -> pd.DataFrame:
     """Parse Kiwoom ka10059 (amount mode) into KIS-equivalent investor flows.
 
@@ -348,7 +378,9 @@ def parse_kiwoom_investor_rows(data: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["date", "inst_netbuy", "foreign_netbuy"]).drop_duplicates("date")
 
 
-async def fetch_symbol_flows(kis: Any, kiwoom: Any, session: Any, symbol: str, anchor_ymd: str) -> tuple[pd.DataFrame, str]:
+async def fetch_symbol_flows(
+    kis: Any, kiwoom: Any, session: Any, symbol: str, anchor_ymd: str, toss: Any | None = None
+) -> tuple[pd.DataFrame, str, str]:
     """Fetch 30 trading days of investor and program flow for one symbol.
 
     Args:
@@ -357,10 +389,11 @@ async def fetch_symbol_flows(kis: Any, kiwoom: Any, session: Any, symbol: str, a
         session: aiohttp session.
         symbol: Stock code.
         anchor_ymd: Latest date to cover (YYYYMMDD).
+        toss: TossApiClient-compatible client used when KIS program flow fails; may be None.
 
     Returns:
-        Tuple of (frame with date, symbol and FLOW_COLUMNS; source tag among
-        "kis", "kiwoom", "none").
+        Tuple of (frame with date, symbol and FLOW_COLUMNS; investor source tag among
+        "kis"/"kiwoom"/"none"; program source tag among "kis"/"toss"/"none").
     """
     base = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol, "FID_INPUT_DATE_1": anchor_ymd}
     inv_body, prg_body = await asyncio.gather(
@@ -378,28 +411,40 @@ async def fetch_symbol_flows(kis: Any, kiwoom: Any, session: Any, symbol: str, a
                 inv, source = parse_kiwoom_investor_rows(data), "kiwoom"
             except VendorResponseError:
                 logger.warning("[DATA] stage=price_ingest symbol=%s investor=none kis_error=%s", symbol, exc)
+    program_source = "kis"
     try:
         prg = parse_kis_program_rows(prg_body)
-    except VendorResponseError:
-        prg = pd.DataFrame(columns=["date", "program_netbuy"])
+    except VendorResponseError as exc:
+        prg, program_source = pd.DataFrame(columns=["date", "program_netbuy"]), "none"
+        if toss is not None:
+            data = await toss.get_program_trades(session, symbol, count=FLOW_WINDOW_TRADING_DAYS, until=pd.Timestamp(anchor_ymd).strftime("%Y-%m-%d"))
+            try:
+                prg, program_source = parse_toss_program_rows(data), "toss"
+            except VendorResponseError:
+                logger.warning("[DATA] stage=price_ingest symbol=%s program=none kis_error=%s", symbol, exc)
     out = inv.merge(prg, on="date", how="outer")
     out["symbol"] = symbol
-    return out[["date", "symbol", *FLOW_COLUMNS]], source
+    return out[["date", "symbol", *FLOW_COLUMNS]], source, program_source
 
 
-async def fetch_all_flows(kis: Any, kiwoom: Any, session: Any, symbols: list[str], anchor_ymd: str) -> tuple[pd.DataFrame, dict[str, int]]:
+async def fetch_all_flows(
+    kis: Any, kiwoom: Any, session: Any, symbols: list[str], anchor_ymd: str, toss: Any | None = None
+) -> tuple[pd.DataFrame, dict[str, dict[str, int]]]:
     """Fetch flows for every symbol concurrently under the clients' shared rate limiters.
 
     Returns:
-        Tuple of (concatenated flow frame, count of symbols per investor source).
+        Tuple of (concatenated flow frame, {"investor": counts per investor source,
+        "program": counts per program source}).
     """
-    results = await asyncio.gather(*(fetch_symbol_flows(kis, kiwoom, session, s, anchor_ymd) for s in symbols))
-    frames = [f for f, _ in results if not f.empty]
-    sources: dict[str, int] = {}
-    for _, src in results:
-        sources[src] = sources.get(src, 0) + 1
+    results = await asyncio.gather(*(fetch_symbol_flows(kis, kiwoom, session, s, anchor_ymd, toss) for s in symbols))
+    frames = [f for f, _, _ in results if not f.empty]
+    investor_sources: dict[str, int] = {}
+    program_sources: dict[str, int] = {}
+    for _, inv_src, prg_src in results:
+        investor_sources[inv_src] = investor_sources.get(inv_src, 0) + 1
+        program_sources[prg_src] = program_sources.get(prg_src, 0) + 1
     flows = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["date", "symbol", *FLOW_COLUMNS])
-    return flows, sources
+    return flows, {"investor": investor_sources, "program": program_sources}
 
 
 def assemble_new_rows(krx_rows: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFrame:
@@ -418,13 +463,19 @@ def assemble_new_rows(krx_rows: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFra
     return out
 
 
-def check_flow_coverage(new_rows: pd.DataFrame, min_coverage: float = MIN_FLOW_COVERAGE) -> dict[str, float]:
-    """Fail closed when investor flow is missing for too many traded rows on any date.
+def check_flow_coverage(
+    new_rows: pd.DataFrame,
+    columns: tuple[str, ...] = ("inst_netbuy", "foreign_netbuy"),
+    min_coverage: float = MIN_FLOW_COVERAGE,
+    label: str = "investor",
+) -> dict[str, float]:
+    """Fail closed when flow columns are missing for too many traded rows on any date.
 
     Args:
         new_rows: Output of assemble_new_rows.
-        min_coverage: Minimum fraction of traded (volume > 0) rows with both
-            institutional and foreign flow.
+        columns: Flow columns that must all be non-null to count a row as covered.
+        min_coverage: Minimum fraction of traded (volume > 0) rows with every column present.
+        label: Human-readable tag for the raised error message (e.g. "investor", "program").
 
     Returns:
         Coverage per date (YYYY-MM-DD).
@@ -433,11 +484,13 @@ def check_flow_coverage(new_rows: pd.DataFrame, min_coverage: float = MIN_FLOW_C
         ValueError: When any date falls below min_coverage.
     """
     traded = new_rows[pd.to_numeric(new_rows["volume"], errors="coerce") > 0]
-    ok = traded["inst_netbuy"].notna() & traded["foreign_netbuy"].notna()
+    ok = pd.Series(True, index=traded.index)
+    for col in columns:
+        ok &= traded[col].notna()
     cov = ok.groupby(pd.to_datetime(traded["date"]).dt.strftime("%Y-%m-%d")).mean()
     bad = cov[cov < float(min_coverage)]
     if len(bad):
-        raise ValueError(f"investor flow coverage below {min_coverage}: {bad.round(4).to_dict()}")
+        raise ValueError(f"{label} flow coverage below {min_coverage}: {bad.round(4).to_dict()}")
     return {k: round(float(v), 6) for k, v in cov.items()}
 
 
@@ -497,6 +550,7 @@ async def run_price_ingest(
     krx_cfg: AltDataFetchConfig | None = None,
     kis: Any | None = None,
     kiwoom: Any | None = None,
+    toss: Any | None = None,
 ) -> IngestReport:
     """Ingest every newly published trading day plus stale tails, then rewrite index columns.
 
@@ -506,6 +560,7 @@ async def run_price_ingest(
         krx_cfg: KRX config; None builds one from settings.KRX_OPENAPI_KEY.
         kis: KIS client; None builds the configured KisApiClient.
         kiwoom: Kiwoom client for the investor-flow fallback; None builds one.
+        toss: Toss client for the program-flow fallback; None builds one.
 
     Returns:
         IngestReport describing what was written.
@@ -530,6 +585,10 @@ async def run_price_ingest(
         from src.api.kiwoom.client import KiwoomApiClient
 
         kiwoom = KiwoomApiClient()
+    if toss is None:
+        from src.api.toss.client import TossApiClient
+
+        toss = TossApiClient()
     panel = pd.read_parquet(out_path)
     panel["symbol"] = panel["symbol"].astype(str)
     panel["date"] = pd.to_datetime(panel["date"])
@@ -547,8 +606,9 @@ async def run_price_ingest(
                 break  # 미게시: 이후 날짜는 연속성 때문에 시도하지 않는다
             fetched[d] = rows
         new_rows = pd.DataFrame()
-        sources: dict[str, int] = {}
+        sources: dict[str, dict[str, int]] = {}
         coverage: dict[str, float] = {}
+        program_coverage: dict[str, float] = {}
         if fetched:
             latest = max(fetched)
             window = [d for d in trading if d <= latest][-FLOW_WINDOW_TRADING_DAYS:]
@@ -560,9 +620,10 @@ async def run_price_ingest(
                     raise RuntimeError(f"KRX returned no rows for past trading day {d.date()}")
                 fetched[d] = rows
             tail = select_tail_rows(pd.concat(list(fetched.values()), ignore_index=True), panel_last)
-            flows, sources = await fetch_all_flows(kis, kiwoom, session, sorted(tail["symbol"].unique()), latest.strftime("%Y%m%d"))
+            flows, sources = await fetch_all_flows(kis, kiwoom, session, sorted(tail["symbol"].unique()), latest.strftime("%Y%m%d"), toss)
             new_rows = assemble_new_rows(tail, flows)
             coverage = check_flow_coverage(new_rows)
+            program_coverage = check_flow_coverage(new_rows, columns=("program_netbuy",), label="program")
     index_cols = compute_index_columns(kospi, kosdaq)
     if new_rows.empty:
         # 신규 행이 없으면 행 순서가 같으므로 위치 비교로 지수 컬럼 변경 여부만 본다
@@ -584,13 +645,15 @@ async def run_price_ingest(
         ingested_dates=[d.strftime("%Y-%m-%d") for d in sorted(fetched)],
         n_new_rows=len(new_rows),
         n_corporate_events=len(events),
-        investor_sources=sources,
+        investor_sources=sources.get("investor", {}),
+        program_sources=sources.get("program", {}),
         flow_coverage=coverage,
+        program_flow_coverage=program_coverage,
         wrote=wrote,
     )
     logger.info(
         "[DATA] stage=price_ingest dates=%s rows=%d events=%d sources=%s wrote=%s path=%s",
-        report.ingested_dates, report.n_new_rows, report.n_corporate_events, report.investor_sources, report.wrote, out_path,
+        report.ingested_dates, report.n_new_rows, report.n_corporate_events, {"investor": report.investor_sources, "program": report.program_sources}, report.wrote, out_path,
     )
     return report
 

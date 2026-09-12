@@ -16,12 +16,13 @@ from src.config.base import PathSettings
 from src.config.kis import KisSettings
 from src.config.kiwoom import KiwoomSettings
 from src.config.ls import LsSettings
+from src.config.toss import TossSettings
 from src.config.trading import TradingSettings
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings):
+class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings, TossSettings):
     """프로젝트 전역 설정. `.env` 파일에서 자동 로드.
 
     도메인별 설정 모듈을 통합한 싱글톤으로, 모든 소비자 모듈은
@@ -61,6 +62,9 @@ KIWOM_APP_KEY = settings.KIWOM_APP_KEY
 KIWOM_SECRET_KEY = settings.KIWOM_SECRET_KEY
 KIWOM_BASE_URL = settings.KIWOM_BASE_URL
 KIWOM_TICK_MAX_PAGES = settings.KIWOM_TICK_MAX_PAGES
+TOSS_APP_KEY = settings.TOSS_APP_KEY
+TOSS_APP_SECRET = settings.TOSS_APP_SECRET
+TOSS_BASE_URL = settings.TOSS_BASE_URL
 TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
 OVERHEATED_CONDITION_NAME = settings.OVERHEATED_CONDITION_NAME
 NEW_HIGH_CONDITION_NAME = settings.NEW_HIGH_CONDITION_NAME
@@ -153,6 +157,9 @@ __all__ = [
     "TARGET_CONDITION_NAME",
     "THEME_PARQUET_PATH",
     "TOKEN_FILE",
+    "TOSS_APP_KEY",
+    "TOSS_APP_SECRET",
+    "TOSS_BASE_URL",
     "TRADE_LOG_PARQUET_PATH",
     "UPPER_LIMIT_CONDITION_NAME",
     "UPPER_LIMIT_NEXT_DAY_CONDITION_NAME",
@@ -162,6 +169,7 @@ __all__ = [
     "LsSettings",
     "PathSettings",
     "Settings",
+    "TossSettings",
     "TradingSettings",
     "settings",
 ]
