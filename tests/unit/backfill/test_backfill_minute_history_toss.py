@@ -185,3 +185,69 @@ def test_toss_backfill_main_entrypoint(monkeypatch) -> None:
 
     runpy.run_module("src.backfill.intraday.backfill_minute_history_toss", run_name="__main__")
 
+
+def test_fetch_toss_regular_session_bars_raises_on_page1_error_envelope() -> None:
+    import asyncio
+
+    import pytest
+
+    from src.backfill.intraday.backfill_minute_history_toss import (
+        TossCandleFetchError,
+        _fetch_toss_regular_session_bars,
+    )
+
+    class ErrorToss:
+        async def get_candles(self, session, symbol, *, interval="1m", count=200, before=None, adjusted=None):
+            return {"error": {"code": "internal-error", "message": "temporary failure"}}
+
+    with pytest.raises(TossCandleFetchError, match="page1"):
+        asyncio.run(_fetch_toss_regular_session_bars(ErrorToss(), object(), "000250", "2024-02-28"))
+
+
+def test_fetch_toss_regular_session_bars_raises_on_page2_error_envelope() -> None:
+    import asyncio
+
+    import pytest
+
+    from src.backfill.intraday.backfill_minute_history_toss import (
+        TossCandleFetchError,
+        _fetch_toss_regular_session_bars,
+    )
+
+    class Page2ErrorToss:
+        async def get_candles(self, session, symbol, *, interval="1m", count=200, before=None, adjusted=None):
+            # Given: page1 succeeds (mirrors the confirmed 2023-07-05 pattern -- 200 candles
+            # for the afternoon half), but page2 (the morning half) errors
+            if before == "2024-02-28T15:30:00.000+09:00":
+                return {"result": {"candles": [
+                    {"timestamp": "2024-02-28T12:11:00.000+09:00", "openPrice": "69000", "highPrice": "69100", "lowPrice": "68900", "closePrice": "69000", "volume": "20"},
+                ]}}
+            return {"error": {"code": "internal-error", "message": "temporary failure"}}
+
+    with pytest.raises(TossCandleFetchError, match="page2"):
+        asyncio.run(_fetch_toss_regular_session_bars(Page2ErrorToss(), object(), "000250", "2024-02-28"))
+
+
+def test_run_toss_1m_backfill_is_fail_soft_on_toss_error_envelope(tmp_path, monkeypatch) -> None:
+    import src.backfill.intraday.backfill_minute_history_toss as mod
+    from src.data import intraday_store
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    monkeypatch.setattr(
+        mod, "enumerate_backfill_targets",
+        lambda as_of=None, lookback_days=365, include_exit_day=True: [("2024-02-28", "000250"), ("2024-02-28", "999999")],
+    )
+
+    class MixedToss:
+        async def get_candles(self, session, symbol, *, interval="1m", count=200, before=None, adjusted=None):
+            if symbol == "999999":
+                return {"error": {"code": "internal-error", "message": "temporary failure"}}
+            return {"result": {"candles": [
+                {"timestamp": "2024-02-28T15:30:00.000+09:00", "openPrice": "70000", "highPrice": "70100", "lowPrice": "69900", "closePrice": "70000", "volume": "10"},
+            ]}}
+
+    # Then: the Toss-error-envelope symbol contributes 0 rows without aborting the healthy symbol
+    result = mod.run_toss_1m_backfill(gap_start="2024-01-01", gap_end="2024-12-31", toss=MixedToss())
+
+    assert result == {"dates": 1, "rows": 1}
+
