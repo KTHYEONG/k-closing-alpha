@@ -103,7 +103,7 @@ def test_scenario_archive_fetch_02(tmp_archive: Path) -> None:
     specified = archive.fetch_archive_snapshot("2026-08-03")
     assert specified["스냅샷_날짜"].tolist() == ["2026-08-03"]
     assert specified.columns.tolist() == archive.ARCHIVE_READ_COLUMN_ORDER
-    assert len(archive.ARCHIVE_COLUMN_ORDER) == 24
+    assert len(archive.ARCHIVE_COLUMN_ORDER) == 25
 
 
 def test_upsert_fills_snapshot_date_when_missing(tmp_archive: Path) -> None:

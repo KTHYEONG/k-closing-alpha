@@ -701,3 +701,139 @@ def test_resolve_daily_candidates_passes_toss_client_through(monkeypatch) -> Non
     asyncio.run(collect_mod.resolve_daily_candidates(AsyncMock(), object(), kiwoom_client=None, toss_client=sentinel_toss))
 
     assert seen_kwargs.get("toss_client") is sentinel_toss
+
+
+def test_flag_price_anomaly_flags_zero_price_success_row() -> None:
+    import pandas as pd
+
+    from src.daily.collect import flag_price_anomaly
+
+    # Given: a vendor 'success' row that is degenerate (all-zero OHLCV), the
+    # exact pattern /probe found for inverse-leveraged ETN codes
+    df = pd.DataFrame({
+        "종가": [0.0],
+        "고가": [0.0],
+        "저가": [0.0],
+        "거래량": [0.0],
+    })
+
+    # When
+    out = flag_price_anomaly(df)
+
+    # Then
+    assert out.tolist() == [True]
+    assert out.dtype == bool
+
+
+def test_flag_price_anomaly_does_not_flag_nan_quote_failed_row() -> None:
+    import pandas as pd
+
+    from src.daily.collect import flag_price_anomaly
+
+    # Given: the existing quote_failed convention (NaN OHLCV, '0 위조 금지')
+    df = pd.DataFrame({
+        "종가": [float("nan")],
+        "고가": [float("nan")],
+        "저가": [float("nan")],
+        "거래량": [float("nan")],
+    })
+
+    # When
+    out = flag_price_anomaly(df)
+
+    # Then: NaN rows are the quote_failed path's responsibility, not this one's
+    assert out.tolist() == [False]
+    assert out.dtype == bool
+
+
+def test_flag_price_anomaly_flags_inconsistent_ohlc_range() -> None:
+    import pandas as pd
+
+    from src.daily.collect import flag_price_anomaly
+
+    # Given: close (100) is above high (90) -- internally inconsistent OHLC
+    df = pd.DataFrame({
+        "종가": [100.0],
+        "고가": [90.0],
+        "저가": [80.0],
+        "거래량": [1_000.0],
+    })
+
+    # When
+    out = flag_price_anomaly(df)
+
+    # Then
+    assert out.tolist() == [True]
+
+
+def test_flag_price_anomaly_leaves_healthy_row_unflagged() -> None:
+    import pandas as pd
+
+    from src.daily.collect import flag_price_anomaly
+
+    # Given: a healthy row (mirrors S1 from test_flag_cost_aware_admission_marks_rows_without_dropping)
+    df = pd.DataFrame({
+        "종가": [18000.0],
+        "고가": [18100.0],
+        "저가": [17800.0],
+        "거래량": [1_000_000.0],
+    })
+
+    # When
+    out = flag_price_anomaly(df)
+
+    # Then
+    assert out.tolist() == [False]
+
+
+def test_check_realtime_collection_coverage_returns_report_when_within_threshold() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.daily.collect import check_realtime_collection_coverage
+
+    # Given: 1 degraded row out of 200 (0.5% degraded, well within a 10% test threshold)
+    df = pd.DataFrame({
+        "현재가_실패": [True] + [False] * 199,
+        "가격_비정상": [False] * 200,
+    })
+
+    # When
+    report = check_realtime_collection_coverage(df, min_coverage=0.9)
+
+    # Then
+    assert report["n_raw"] == 200
+    assert report["n_degraded"] == 1
+    assert report["coverage"] == pytest.approx(0.995, abs=1e-6)
+
+
+def test_check_realtime_collection_coverage_raises_when_below_threshold() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.daily.collect import check_realtime_collection_coverage
+
+    # Given: 1 degraded row out of 2 (50% degraded), using the production default threshold
+    df = pd.DataFrame({
+        "현재가_실패": [True, False],
+        "가격_비정상": [False, False],
+    })
+
+    # When / Then
+    with pytest.raises(ValueError, match="real-time collection coverage"):
+        check_realtime_collection_coverage(df)
+
+
+def test_check_realtime_collection_coverage_raises_on_empty_snapshot() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.daily.collect import check_realtime_collection_coverage
+
+    # Given: an empty snapshot (should never happen in production -- main() returns
+    # early on an empty scan -- but the utility must still fail closed, not divide by zero)
+    df = pd.DataFrame({"현재가_실패": [], "가격_비정상": []})
+
+    # When / Then
+    with pytest.raises(ValueError, match="empty snapshot"):
+        check_realtime_collection_coverage(df)
