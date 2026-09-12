@@ -1,5 +1,6 @@
 [Unit]
 Description=KCA paper entry (no real orders)
+OnFailure=kca-alert@%n.service
 
 [Service]
 Type=oneshot

@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA weekly ranker bundle retrain (Sat 22:00 KST, off-market)
+
+[Timer]
+OnCalendar=Sat 22:00:00 Asia/Seoul
+Persistent=true
+Unit=kca-retrain.service
+
+[Install]
+WantedBy=timers.target

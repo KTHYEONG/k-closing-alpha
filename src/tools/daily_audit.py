@@ -68,6 +68,20 @@ def audit_or_skip(snapshot_date: str) -> dict[str, bool] | None:
     return audit_daily_completeness(snapshot_date)
 
 
+def _notify_if_missing(snapshot_date: str, result: dict[str, bool]) -> list[str]:
+    """감사 결과에서 누락 단계를 로그+얼러트하고 정렬된 누락 목록을 반환한다."""
+    missing = sorted(step for step, ok in result.items() if not ok)
+    if missing:
+        logger.warning("[DATA] stage=daily_audit status=MISSING steps=%s", ",".join(missing))
+        from src.tools.alerts import dispatch_failure_alert
+
+        dispatch_failure_alert(
+            f"kca-daily-audit(date={snapshot_date})",
+            detail=f"missing steps: {','.join(missing)}",
+        )
+    return missing
+
+
 def main() -> None:  # pragma: no cover - CLI entry; logic covered via audit_daily_completeness scenarios
     parser = argparse.ArgumentParser(description="Daily completeness audit (scheduled after EOD every trading day)")
     parser.add_argument("--date", default=None, help="Snapshot date YYYY-MM-DD (default today)")
@@ -76,9 +90,7 @@ def main() -> None:  # pragma: no cover - CLI entry; logic covered via audit_dai
     result = audit_or_skip(snapshot_date)
     if result is None:
         return
-    missing = sorted(step for step, ok in result.items() if not ok)
-    if missing:
-        logger.warning("[DATA] stage=daily_audit status=MISSING steps=%s", ",".join(missing))
+    _notify_if_missing(snapshot_date, result)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
