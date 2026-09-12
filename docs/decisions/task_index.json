@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "vps_deploy_architecture",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_vps_deploy_architecture",
+      "domain": "infra/deployment",
+      "title": "VPS 실패게이팅+웹훅/이메일 알림+주간 재학습 자동화",
+      "why": "9개 systemd 서비스 중 실패게이팅은 1곳뿐이고 알림채널·재학습 자동화 부재 -> 이번 세션 실제장애(libgomp 누락, 코드-모델 배포순서 불일치) 재발 위험",
+      "resolution": "AlertSettings+src/tools/alerts.py(webhook+Gmail SMTP) 신설, 결정경로 5개 서비스에 OnFailure 훅 배선, kca-retrain.timer(주간)로 재인증 자동화",
+      "impact": "알림 자격증명(.env ALERT_*) 미설정 시 전부 no-op으로 안전; VPS에 git pull 후 install_systemd.sh 재실행 필요"
+    },
+    {
       "task_id": "tickcap_relaxation",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_tickcap_relaxation",
@@ -989,16 +999,6 @@
       "why": "20% 이상 급등 종목에 대한 상따 시나리오 예측 필요성 및 추론 파이프라인 정합성 보장",
       "resolution": "predict.py 내 20% 이상 종목 상따 시나리오 확장, pre-feature-engineering 29.9% 세팅, sizing_engine 추론 독립성 보장",
       "impact": "일반 분석 결과와 상따 시나리오 예측 결과가 모두 원본 Score/Decision 수치로 정합되게 시각화됨"
-    },
-    {
-      "task_id": "TASK_SPREADSHEET_REFACTOR",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_SPREADSHEET_REFACTOR",
-      "domain": "processing",
-      "title": "스프레드시트 열 참조 및 컬럼 정규화 리팩토링",
-      "why": "legacy_mapping.py 및 하드코딩 컬럼 리터럴 산재 문제 해결",
-      "resolution": "src/processing/schema.py 중앙 스키마 모듈 도입, legacy_mapping.py 제거, daily/ 및 preprocessor 연동 정제",
-      "impact": "표준 영문 컬럼 단일 원천 관리 및 파이프라인 결합도 해소"
     }
   ]
 }
