@@ -207,12 +207,20 @@ def test_synthetic_output_digests_unchanged_after_subtraction() -> None:
     from src.ml.dataset import build_ml_dataset
     from src.ml.purged_cv import PurgedGroupTimeSeriesSplit
 
+    # 부동소수점 배열은 CPU/BLAS 벤더별 리덕션 순서에 따라 마지막 ULP가 흔들릴 수
+    # 있으므로(호스트 하드웨어에 따라 실측 확인됨: 구조/카테고리 해시 3종은 전
+    # 환경 일치, float 해시만 불일치), 소수점 8자리로 반올림한 뒤 해싱해 하드웨어
+    # 잡음을 흡수하면서도 그보다 큰(=1e-8 초과) 실제 로직 변경은 계속 잡아낸다.
+    FLOAT_DIGEST_DECIMALS = 8
+
     def digest(*arrays: object) -> str:
         h = hashlib.sha256()
         for a in arrays:
             arr = np.asarray(a)
             if arr.dtype == object:
                 h.update(json.dumps(arr.tolist(), sort_keys=True, default=str).encode())
+            elif np.issubdtype(arr.dtype, np.floating):
+                h.update(np.ascontiguousarray(np.round(arr, FLOAT_DIGEST_DECIMALS)).tobytes())
             else:
                 h.update(np.ascontiguousarray(arr).tobytes())
         return h.hexdigest()[:16]
@@ -226,12 +234,13 @@ def test_synthetic_output_digests_unchanged_after_subtraction() -> None:
         _raw_trade_log_for_digest(), None, feature_set="close_morning61", panel_mode="scenario_action"
     )
 
-    # Then: every digest reproduces byte-for-byte.
+    # Then: structural/categorical digests reproduce byte-for-byte; float digests
+    # tolerate hardware-level ULP noise via FLOAT_DIGEST_DECIMALS rounding above.
     assert digest(*[a for pair in splits for a in pair]) == "82c66517bd8514cb"
     assert digest(np.array(sorted(gx.columns), dtype=object)) == "0cd73ada27529408"
     assert digest(np.array(sorted(gcat), dtype=object)) == "5ccc339c7392dbfc"
-    assert digest(gproc.sort_index()["target_return"].to_numpy(np.float64)) == "c69fe116ca8049d7"  # 2026-09-10: 브로커 수수료(왕복 0.73bp) 반영으로 갱신
-    assert digest(gx.sort_index().select_dtypes("number").to_numpy(np.float64)) == "a22af55104759529"
+    assert digest(gproc.sort_index()["target_return"].to_numpy(np.float64)) == "192a90f712131e32"  # 2026-09-12: 반올림 해싱으로 갱신 (하드웨어 ULP 잡음 흡수)
+    assert digest(gx.sort_index().select_dtypes("number").to_numpy(np.float64)) == "42e66c97d1138fca"  # 2026-09-12: 반올림 해싱으로 갱신 (하드웨어 ULP 잡음 흡수)
 
 
 def test_removed_modules_are_gone_and_orderbook_store_survives() -> None:
