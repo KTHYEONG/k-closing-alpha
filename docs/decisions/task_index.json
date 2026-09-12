@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260912_DATA_INGEST_INTEGRITY_BARRIER",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_20260912_DATA_INGEST_INTEGRITY_BARRIER",
+      "domain": "data_ingest",
+      "title": "실시간 수집 값-무결성/커버리지 배리어 추가",
+      "why": "실시간 collect.py는 벤더 폴백은 있으나 야간 price_ingest.py와 달리 값-비정상(vendor 성공+0값)과 실패율에 대한 fail-closed 게이트가 없어 실측 확인(2026-09-11 ETN 20.4% 0값)됨",
+      "resolution": "가격_비정상 플래그(flag_price_anomaly)와 커버리지 게이트(check_realtime_collection_coverage, 기본 0.99)를 collect.main()에 배선, ARCHIVE_COLUMN_ORDER에 신규 컬럼 반영",
+      "impact": "게이트 미달시 저장 전 raise로 오염 스냅샷 저장 차단; admission(select_universe) 로직은 무변경, 기존 코드 100% 회귀 통과"
+    },
+    {
       "task_id": "TASK_20260912_EXIT_GRID_REVALIDATION_FAILS_DEPRECATE",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_20260912_EXIT_GRID_REVALIDATION_FAILS_DEPRECATE",
@@ -989,16 +999,6 @@
       "why": "Further optimize collection speed under KIS 18 TPS limit by resolving AsyncRateLimiter lock-while-sleeping bug and parallelizing pre-collect condition/index API calls",
       "resolution": "Removed API_SLEEP_INTERVAL delay, fixed AsyncRateLimiter acquire lock pattern, parallelized condition/index API calls with asyncio.gather, and passed client parameter to calculate_all_moving_averages",
       "impact": "Eliminated redundant sleep delays and lock contention, achieving max rate limiter throughput while preserving 18 TPS safety limit"
-    },
-    {
-      "task_id": "TASK_20260804_DATA_COLLECTION_OPT",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_20260804_DATA_COLLECTION_OPT",
-      "domain": "daily",
-      "title": "KIS API Data Collection Speed & Rate Limit Optimization & Logging Cleanup",
-      "why": "Improve real-time data collection throughput while strictly enforcing KIS REST API 18 TPS limit and removing automatic archiving and redundant logs.",
-      "resolution": "Implemented AsyncRateLimiter, lazy evaluation for SMA120 calculations, single-line dynamic progress bar logging, and removed automatic archive snapshot upsert in collect.py.",
-      "impact": "Significantly reduced daily collection time, 100% prevented EGW00201 rate limit errors, simplified logging output, and isolated archive functionality for manual user execution."
     }
   ]
 }
