@@ -101,7 +101,7 @@ def test_archive_column_order_is_minimal_and_carries_admitted() -> None:
         "스냅샷_날짜", "종목코드", "종목명", "시장구분", "시가", "고가", "저가", "종가",
         "전일종가", "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수",
         "등락률", "kospi", "kosdaq", "v_kospi", "admitted", "수급_실패", "지수_실패",
-        "현재가_실패", "결정_종가", "종가_확정",
+        "현재가_실패", "가격_비정상", "결정_종가", "종가_확정",
     ]
 
     # Then: champion-era and flat level-1 orderbook columns are gone (the full
@@ -136,5 +136,18 @@ def test_archive_column_order_registers_finalization_columns_at_tail() -> None:
     assert RAW_TO_STANDARD_MAP[CLOSE_CONFIRMED_COL] == "close_confirmed"
     assert STANDARD_TO_KOREAN_MAP["decision_close_price"] == DECISION_CLOSE_COL
     assert STANDARD_TO_KOREAN_MAP["close_confirmed"] == CLOSE_CONFIRMED_COL
+
+
+def test_archive_column_order_includes_price_anomaly_col() -> None:
+    from src.processing.schema import (
+        ARCHIVE_COLUMN_ORDER,
+        DECISION_CLOSE_COL,
+        PRICE_ANOMALY_COL,
+        QUOTE_FAILED_COL,
+    )
+
+    assert PRICE_ANOMALY_COL in ARCHIVE_COLUMN_ORDER
+    assert ARCHIVE_COLUMN_ORDER.index(PRICE_ANOMALY_COL) == ARCHIVE_COLUMN_ORDER.index(QUOTE_FAILED_COL) + 1
+    assert ARCHIVE_COLUMN_ORDER.index(DECISION_CLOSE_COL) == ARCHIVE_COLUMN_ORDER.index(PRICE_ANOMALY_COL) + 1
 
 
