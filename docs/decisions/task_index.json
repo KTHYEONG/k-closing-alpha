@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260912_TOSS_1M_BACKFILL_2022_2025",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_20260912_TOSS_1M_BACKFILL_2022_2025",
+      "domain": "data_ingest",
+      "title": "Toss 1분봉으로 2022-09~2025-09 청산일 갭 복구",
+      "why": "KIS 분봉 보존기간(~1년) 밖이라 24,510쌍(733일)의 청산일 정규세션 1분봉이 영구유실 직전이었다",
+      "resolution": "TossApiClient.get_candles 신설, intraday_schema에 toss 벤더 정규화 분기 추가, 기존 파티션/멱등병합 인프라 재사용한 1회성 백필 스크립트 작성(before커서 inclusive로 인한 배치내 중복은 자체 dedup 필요함을 실측 확인)",
+      "impact": "TP5%+MOC 청산레버 재검증 표본을 ~1년치에서 ~3년치로 확장 가능; NXT/상시 이중벤더화는 범위 제외, 상장폐지 종목은 fail-soft 스킵"
+    },
+    {
       "task_id": "TASK_20260912_TOSS_UNIVERSE_SCAN_FALLBACK",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_20260912_TOSS_UNIVERSE_SCAN_FALLBACK",
@@ -989,16 +999,6 @@
       "why": "Prevent assigning Strong grades to marginal Break-Even utility scores (+0.001) that fail to cover trading costs and slippage.",
       "resolution": "Configured minimum safety margin thresholds for Strong (>= +0.30%) and Good (>= +0.10%) grades in assign_sizing_grades.",
       "impact": "Eliminated score scale illusions, suppressed risky leverage under marginal expectancy, and enhanced capital preservation."
-    },
-    {
-      "task_id": "MODEL_UTILITY_SCORE_FIX",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_MODEL_UTILITY_SCORE_FIX",
-      "domain": "daily",
-      "title": "Model Utility Score Uniformity Fix & ML Preprocessor Feature Alignment",
-      "why": "Constant utility_score (0.0864) caused by dummy test bundle artifacts and preprocessor Z-score feature divergence during daily inference.",
-      "resolution": "Synchronized _apply_robust_z in daily preprocessor pipeline, trained real 49-feature GBDT model bundle from trade_log.parquet, and added auto-retrain fallback in predict.py.",
-      "impact": "Restored dynamic Utility Score differentiation (-4.66 ~ -5.23) and proper risk-weighted sizing allocations across candidates."
     }
   ]
 }

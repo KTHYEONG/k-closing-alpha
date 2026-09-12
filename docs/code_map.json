@@ -35,6 +35,7 @@
   "src/api/toss/client.py": {
     "testing": [
       "tests/unit/api/toss/test_toss_client.py",
+      "tests/unit/backfill/test_backfill_minute_history_toss.py",
       "tests/unit/daily/test_collect.py",
       "tests/unit/daily/test_price_ingest.py"
     ]
@@ -95,8 +96,12 @@
   "src/backfill/intraday/backfill_minute_history.py": {
     "testing": [
       "tests/integration/daily/test_minute_history_backfill_flow.py",
-      "tests/unit/backfill/test_backfill_minute_history.py"
+      "tests/unit/backfill/test_backfill_minute_history.py",
+      "tests/unit/backfill/test_backfill_minute_history_toss.py"
     ]
+  },
+  "src/backfill/intraday/backfill_minute_history_toss.py": {
+    "testing": "tests/unit/backfill/test_backfill_minute_history_toss.py"
   },
   "src/backfill/intraday/collector.py": {
     "testing": [

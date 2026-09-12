@@ -213,6 +213,9 @@ bash deploy/install_systemd.sh
 # 1회성 소급 백필: condition_history 워치리스트 대상 일별분봉(FHKST03010230) 백필
 # src.backfill.intraday.backfill_minute_history
 uv run python -m src.backfill.intraday.backfill_minute_history
+# 1회성 소급 백필: 2022-09~2025-09 KIS 보존기간 밖 정규세션 1분봉(Toss candles, 청산일 갭 복구)
+# src.backfill.intraday.backfill_minute_history_toss
+uv run python -m src.backfill.intraday.backfill_minute_history_toss
 ```
 
 ### 4) ML 연구 및 번들 재학습
