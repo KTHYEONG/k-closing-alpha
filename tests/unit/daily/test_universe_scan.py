@@ -465,3 +465,67 @@ def test_fetch_candidate_stock_list_fails_closed_without_kiwoom_coverage() -> No
 
     with pytest.raises(UniverseScanCoverageError):
         asyncio.run(fetch_candidate_stock_list(_Kis(), object(), kiwoom_client=_Bad()))
+
+
+def test_map_toss_ranking_rows_to_stock_list_filters_band_and_marks_name_none() -> None:
+    from src.daily.universe_scan import map_toss_ranking_rows_to_stock_list
+    from src.strategy.contract import DEFAULT_UNIVERSE
+
+    rows = [
+        {"rank": 1, "symbol": "000660", "price": {"lastPrice": "180000", "changeRate": "0.05"}},
+        {"rank": 2, "symbol": "005930", "price": {"lastPrice": "70000", "changeRate": "0.15"}},
+        {"rank": 3, "symbol": "000001", "price": {"lastPrice": "1000", "changeRate": "0.01"}},
+        {"rank": 4, "symbol": "", "price": {"lastPrice": "500", "changeRate": "0.05"}},
+    ]
+
+    out = map_toss_ranking_rows_to_stock_list(rows, DEFAULT_UNIVERSE)
+
+    assert out == [{"code": "000660", "name": None, "price": "180000", "chgrate": "0.05"}]
+    assert map_toss_ranking_rows_to_stock_list([]) == []
+
+
+def test_fetch_candidate_stock_list_falls_back_to_toss_when_kiwoom_fails() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_candidate_stock_list
+
+    kw_client = AsyncMock()
+    kw_client.get_fluctuation_ranking = AsyncMock(return_value={"rt_cd": "1", "msg1": "kiwoom down"})
+    toss_client = AsyncMock()
+    toss_client.get_rankings = AsyncMock(return_value={"result": {"rankings": [
+        {"rank": 1, "symbol": "000660", "price": {"lastPrice": "180000", "changeRate": "0.05"}},
+        {"rank": 2, "symbol": "005930", "price": {"lastPrice": "70000", "changeRate": "0.15"}},
+    ]}})
+
+    out = asyncio.run(fetch_candidate_stock_list(AsyncMock(), object(), kiwoom_client=kw_client, toss_client=toss_client))
+
+    assert out == [{"code": "000660", "name": None, "price": "180000", "chgrate": "0.05"}]
+    toss_client.get_rankings.assert_awaited_once()
+    kwargs = toss_client.get_rankings.await_args.kwargs
+    assert kwargs["ranking_type"] == "TOP_GAINERS"
+    assert kwargs["duration"] == "1d"
+
+
+def test_fetch_candidate_stock_list_fails_closed_when_kiwoom_and_toss_both_fail() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import pytest
+
+    from src.daily.universe_scan import UniverseScanCoverageError, fetch_candidate_stock_list
+
+    kw_client = AsyncMock()
+    kw_client.get_fluctuation_ranking = AsyncMock(side_effect=ConnectionError("kiwoom down"))
+
+    # When: Toss also returns a business-level error envelope
+    toss_client = AsyncMock()
+    toss_client.get_rankings = AsyncMock(return_value={"error": {"code": "invalid-request", "message": "bad token"}})
+    with pytest.raises(UniverseScanCoverageError, match=r"kiwoom ranking call failed.*toss ranking failed"):
+        asyncio.run(fetch_candidate_stock_list(AsyncMock(), object(), kiwoom_client=kw_client, toss_client=toss_client))
+
+    # When: Toss itself raises (network-level failure)
+    toss_client2 = AsyncMock()
+    toss_client2.get_rankings = AsyncMock(side_effect=ConnectionError("toss down"))
+    with pytest.raises(UniverseScanCoverageError, match=r"kiwoom ranking call failed.*toss ranking call failed"):
+        asyncio.run(fetch_candidate_stock_list(AsyncMock(), object(), kiwoom_client=kw_client, toss_client=toss_client2))

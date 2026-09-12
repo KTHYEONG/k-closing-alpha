@@ -144,7 +144,7 @@ def test_collect_main_wires_kiwoom_scan_and_trading_day_gate(monkeypatch) -> Non
         seen["gate"] += 1
         seen["force"] = force
 
-    async def _resolve(_client, _session, *, kiwoom_client=None):
+    async def _resolve(_client, _session, *, kiwoom_client=None, toss_client=None):
         seen["scan_kwargs"] = kiwoom_client
         return []
 

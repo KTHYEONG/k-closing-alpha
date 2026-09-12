@@ -115,3 +115,24 @@ class TossApiClient:
         if until:
             params["until"] = until
         return await self._get(session, f"/api/v1/stocks/{symbol}/program-trades", "STOCK_TRADING_TREND", params=params)
+
+    async def get_rankings(
+        self,
+        session,
+        *,
+        ranking_type: str,
+        market_country: str = "KR",
+        duration: str = "1d",
+        count: int = 100,
+        exclude_investment_caution: bool | None = None,
+    ) -> dict:
+        """시장 랭킹 조회 (`GET /api/v1/rankings`)."""
+        params: dict[str, str | int] = {
+            "type": ranking_type,
+            "marketCountry": market_country,
+            "duration": duration,
+            "count": int(count),
+        }
+        if exclude_investment_caution is not None:
+            params["excludeInvestmentCaution"] = str(bool(exclude_investment_caution)).lower()
+        return await self._get(session, "/api/v1/rankings", "RANKING", params=params)

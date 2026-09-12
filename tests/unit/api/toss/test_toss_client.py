@@ -143,3 +143,51 @@ def test_toss_client_unknown_rate_limit_group_raises() -> None:
 
     with pytest.raises(ValueError, match="NOT_A_GROUP"):
         client._limiter_for("NOT_A_GROUP")
+
+
+def test_toss_client_get_rankings_parses_result_envelope() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.api.toss.client import TossApiClient
+
+    client = TossApiClient(app_key="k", app_secret="s")
+    client.token = "tok"
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value={"result": {"rankedAt": "2026-09-11T19:59:46.466+09:00", "rankings": [
+        {"rank": 1, "symbol": "000660", "price": {"lastPrice": "1832000", "changeRate": "-0.0113"}, "tradingVolume": "79878", "tradingAmount": "145941219000"}
+    ]}})
+    session = AsyncMock()
+    session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+    session.get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    data = asyncio.run(client.get_rankings(session, ranking_type="TOP_GAINERS", market_country="KR", duration="1d", count=100))
+
+    assert data["result"]["rankings"][0]["symbol"] == "000660"
+    called_args, called_kwargs = session.get.call_args
+    assert called_args[0] == "https://openapi.tossinvest.com/api/v1/rankings"
+    assert called_kwargs["params"] == {"type": "TOP_GAINERS", "marketCountry": "KR", "duration": "1d", "count": 100}
+
+
+def test_toss_client_get_rankings_forwards_exclude_investment_caution() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.api.toss.client import TossApiClient
+
+    client = TossApiClient(app_key="k", app_secret="s")
+    client.token = "tok"
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value={"result": {"rankedAt": "2026-09-11T19:59:46.466+09:00", "rankings": []}})
+    session = AsyncMock()
+    session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+    session.get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    asyncio.run(client.get_rankings(session, ranking_type="TOP_GAINERS", exclude_investment_caution=True))
+
+    _, called_kwargs = session.get.call_args
+    assert called_kwargs["params"]["excludeInvestmentCaution"] == "true"
