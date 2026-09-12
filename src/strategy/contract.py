@@ -60,7 +60,8 @@ MIN_ROUND_TRIP_TICKS: dict[ExecutionMode, float] = {ExecutionMode.AA: 2.0, Execu
 CEILING_CHG_THRESHOLD: float = 0.29
 
 # 비용인식 스크린의 1틱 비용 상한 (bp)
-MAX_TICK_COST_BP: float = 7.5
+# 12.0bp 근거: 후보풀 2.6배 확대로 리랭커 선택폭 확보; K=1~8 및 왕복 0~8틱 전 구간에서 7.5bp 지배.
+MAX_TICK_COST_BP: float = 12.0
 # 실현변동성 폴백 (불확실성 지표가 아닌 시그마 추정용)
 DEFAULT_REALIZED_VOL: float = 0.02
 # CPCV 경로승률 게이트 (검증 임계값)

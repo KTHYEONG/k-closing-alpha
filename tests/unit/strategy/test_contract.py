@@ -330,13 +330,13 @@ def test_select_universe_applies_tick_cost_cap_when_configured() -> None:
 
     df = pd.DataFrame(
         {
-            "chg_ratio": [0.05, 0.05, 0.05, 0.05],
-            "tv_clean": [500.0, 500.0, 500.0, 500.0],
-            "mc_clean": [800.0, 800.0, 800.0, 800.0],
-            "close": [15000.0, 3000.0, 15000.0, 15000.0],
-            "volume": [10, 10, 10, 10],
-            "is_ceiling": [False, False, False, False],
-            "tick_cost_bp": [6.67, 16.67, 7.5, np.nan],
+            "chg_ratio": [0.05, 0.05, 0.05, 0.05, 0.05],
+            "tv_clean": [500.0, 500.0, 500.0, 500.0, 500.0],
+            "mc_clean": [800.0, 800.0, 800.0, 800.0, 800.0],
+            "close": [15000.0, 10000.0, 8333.0, 3000.0, 15000.0],
+            "volume": [10, 10, 10, 10, 10],
+            "is_ceiling": [False, False, False, False, False],
+            "tick_cost_bp": [6.67, 10.0, 12.0, 16.67, np.nan],
         }
     )
 
@@ -344,12 +344,12 @@ def test_select_universe_applies_tick_cost_cap_when_configured() -> None:
     capped = select_universe(df, COST_AWARE_UNIVERSE)
     uncapped = select_universe(df, DEFAULT_UNIVERSE)
 
-    # Then: 7.5bp 상한은 포함(<=), 16.67bp 초과 배제, NaN 배제
-    assert COST_AWARE_UNIVERSE.max_tick_cost_bp == 7.5
-    assert capped.tolist() == [True, False, True, False]
+    # Then: 완화된 12.0bp 상한은 포함(<=), 16.67bp 초과 배제, NaN 배제
+    assert COST_AWARE_UNIVERSE.max_tick_cost_bp == 12.0
+    assert capped.tolist() == [True, True, True, False, False]
     # 기본 스펙은 비용축을 적용하지 않는다 (하위호환)
     assert DEFAULT_UNIVERSE.max_tick_cost_bp is None
-    assert uncapped.tolist() == [True, True, True, True]
+    assert uncapped.tolist() == [True, True, True, True, True]
 
 
 def test_select_universe_requires_tick_cost_column_only_when_capped() -> None:
@@ -442,7 +442,7 @@ def test_shared_domain_constants_have_one_definition() -> None:
     from src.strategy import contract
 
     # Then: values are exactly what they were before consolidation.
-    assert contract.MAX_TICK_COST_BP == 7.5
+    assert contract.MAX_TICK_COST_BP == 12.0
     assert contract.DEFAULT_REALIZED_VOL == 0.02
     assert contract.MIN_PATH_WIN_RATE == 0.60
     assert contract.LABEL_GOOD_THRESHOLD == 0.01
@@ -548,3 +548,16 @@ def test_contract_does_not_reexport_non_pit_cost_helpers() -> None:
     # And: the date-aware producers stay available to the screens
     assert "tick_cost_bp" in contract.__all__
     assert "statutory_bp_asof" in contract.__all__
+
+
+def test_max_tick_cost_bp_reaches_both_universe_implementations() -> None:
+    from src.ml import universe
+    from src.strategy import contract
+
+    # Then: 단일 정의가 12.0 으로 완화되고 두 구현에 동일 전파
+    assert contract.MAX_TICK_COST_BP == 12.0
+    assert contract.COST_AWARE_UNIVERSE.max_tick_cost_bp == 12.0
+    assert universe.COST_AWARE_SCREEN.max_tick_cost_bp == contract.MAX_TICK_COST_BP
+    # And: 넓은 학습 스펙은 비용축을 계속 적용하지 않는다 (중첩 규약)
+    assert contract.DEFAULT_UNIVERSE.max_tick_cost_bp is None
+    assert contract.CAPFREE_UNIVERSE.max_tick_cost_bp is None
