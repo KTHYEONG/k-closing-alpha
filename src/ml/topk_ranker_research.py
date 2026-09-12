@@ -43,6 +43,7 @@ from src.ml.research.v3_metrics import calculate_series_metrics
 from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict
 from src.ml.topk_history_features import TOPK_FEATURE_COLS_V2, attach_topk_features
 from src.strategy.contract import (
+    COST_AWARE_UNIVERSE,
     DEFAULT_UNIVERSE,
     KCA_TOPK_CAPFREE_001,
     KCA_TOPK_COSTAWARE_001,
@@ -167,6 +168,28 @@ def assert_nested_universe_specs(train_spec: UniverseSpec, select_spec: Universe
     differing = [k for k in train_d if k != "max_tick_cost_bp" and train_d[k] != select_d[k]]
     if differing:
         raise ValueError(f"universe specs are not nested; differing fields: {differing}")
+    return None
+
+
+def _screen_value(value: Any) -> Any:
+    if isinstance(value, bool) or value is None:
+        return value
+    return float(value)
+
+
+def assert_bundle_screen_parity(bundle: dict[str, Any], spec: UniverseSpec = COST_AWARE_UNIVERSE) -> None:
+    screened = bundle.get("select_universe")
+    if not isinstance(screened, dict):
+        raise ValueError(f"bundle select_universe is not certified: got {screened!r}")
+    live = dataclasses.asdict(spec)
+    differing = [k for k in live if _screen_value(screened.get(k)) != _screen_value(live[k])]
+    if differing:
+        bundle_vals = {k: screened.get(k) for k in differing}
+        live_vals = {k: live[k] for k in differing}
+        raise ValueError(
+            f"bundle select_universe differs from live screen in fields {differing}: "
+            f"bundle={bundle_vals} live={live_vals}"
+        )
     return None
 
 
@@ -1008,6 +1031,7 @@ def select_topk_equal_weight(
     """
     if int(top_k) != MIN_TOP_K:
         raise ValueError(f"top_k {top_k!r} is not the certified MIN_TOP_K {MIN_TOP_K}")
+    assert_bundle_screen_parity(bundle)
     feature_cols = list(bundle.get("feature_cols", []))
     if not feature_cols:
         raise ValueError("bundle feature_cols is empty; refusing to select")

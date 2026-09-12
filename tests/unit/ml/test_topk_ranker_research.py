@@ -752,7 +752,10 @@ def _synthetic_bundle_and_fixture() -> tuple[dict, "pd.DataFrame"]:  # noqa: UP0
     import numpy as np
     import pandas as pd
 
+    import dataclasses
+
     from src.ml.bundle import build_inline_bundle
+    from src.strategy.contract import COST_AWARE_UNIVERSE
 
     rng = np.random.default_rng(3)
     dates = pd.bdate_range("2023-02-01", periods=30)
@@ -768,6 +771,7 @@ def _synthetic_bundle_and_fixture() -> tuple[dict, "pd.DataFrame"]:  # noqa: UP0
     df = pd.DataFrame(rows)
     bundle = build_inline_bundle(df, ["chg_ratio", "log_tv"], "train_label", "date")
     bundle["feature_cols"] = ["chg_ratio", "log_tv"]
+    bundle["select_universe"] = dataclasses.asdict(COST_AWARE_UNIVERSE)
 
     snapshot = pd.DataFrame({
         "date": pd.Timestamp("2023-03-15"),
@@ -950,11 +954,14 @@ def test_select_topk_equal_weight_rejects_empty_feature_cols() -> None:
         select_topk_equal_weight(snapshot, bundle, top_k=MIN_TOP_K)
 
 def test_select_topk_equal_weight_uses_float_fallback_for_degenerate_calibrator() -> None:
+    import dataclasses
+
     import pandas as pd
 
     from src.ml.bundle import build_inline_bundle
     from src.ml.costaware_topk import MIN_TOP_K
     from src.ml.topk_ranker_research import select_topk_equal_weight
+    from src.strategy.contract import COST_AWARE_UNIVERSE
 
     # Given: every training label sits below the p_good threshold (0.01) and
     # above the p_bad threshold (-0.02) -- both calibrators degenerate to a
@@ -968,6 +975,7 @@ def test_select_topk_equal_weight_uses_float_fallback_for_degenerate_calibrator(
     df = pd.DataFrame(rows)
     bundle = build_inline_bundle(df, ["chg_ratio", "log_tv"], "train_label", "date")
     bundle["feature_cols"] = ["chg_ratio", "log_tv"]
+    bundle["select_universe"] = dataclasses.asdict(COST_AWARE_UNIVERSE)
     assert isinstance(bundle["calibrators"]["p_good"], float)
     assert isinstance(bundle["calibrators"]["p_bad"], float)
 
@@ -1513,4 +1521,86 @@ def test_run_topk_ranker_backtest_trains_on_demeaned_label_and_v2_features(monke
     # 마지막 날은 D+1 봉이 없어 net_pit 이 NaN → 라벨도 NaN 으로 전파
     assert np.allclose(cert["train_label"].to_numpy(), raw.clip(-mod.LABEL_CLIP, mod.LABEL_CLIP).to_numpy(), equal_nan=True)
     assert np.allclose(cert.groupby("date")["train_label"].mean().dropna().to_numpy(), 0.0, atol=1e-12)
+
+
+def test_assert_bundle_screen_parity_accepts_certified_bundle() -> None:
+    import dataclasses
+
+    from src.ml.topk_ranker_research import assert_bundle_screen_parity
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    # Given: 라이브 스크린과 동일하게 스탬프된 번들
+    bundle = {"select_universe": dataclasses.asdict(COST_AWARE_UNIVERSE)}
+
+    # When / Then: 통과하고 None 을 반환
+    assert assert_bundle_screen_parity(bundle) is None
+
+    # And: joblib 왕복으로 정수화된 값도 동일 스크린으로 인정
+    coerced = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    coerced["min_trade_value_100m"] = 100
+    coerced["min_market_cap_100m"] = 500
+    assert assert_bundle_screen_parity({"select_universe": coerced}) is None
+
+
+def test_assert_bundle_screen_parity_rejects_stale_tick_cap() -> None:
+    import dataclasses
+
+    import pytest
+
+    from src.ml.topk_ranker_research import assert_bundle_screen_parity
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    # Given: 완화 전 상한(7.5bp)으로 인증된 구 번들
+    stale = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    stale["max_tick_cost_bp"] = 7.5
+
+    # When / Then: 재인증 없이는 fail-closed
+    with pytest.raises(ValueError, match="max_tick_cost_bp"):
+        assert_bundle_screen_parity({"select_universe": stale})
+
+    # And: 등락률 밴드가 어긋난 번들도 같은 경로로 차단
+    skewed = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    skewed["chg_max"] = 0.30
+    with pytest.raises(ValueError, match="chg_max"):
+        assert_bundle_screen_parity({"select_universe": skewed})
+
+
+def test_assert_bundle_screen_parity_rejects_missing_select_universe() -> None:
+    import pytest
+
+    from src.ml.topk_ranker_research import assert_bundle_screen_parity
+
+    # Given / When / Then: 키 부재는 미인증 번들로 간주해 즉시 중단
+    with pytest.raises(ValueError, match="select_universe"):
+        assert_bundle_screen_parity({"feature_cols": ["chg_ratio"]})
+
+    # And: dict 가 아닌 값도 동일하게 차단 (조용한 통과 금지)
+    with pytest.raises(ValueError, match="select_universe"):
+        assert_bundle_screen_parity({"select_universe": "COST_AWARE_UNIVERSE"})
+
+
+def test_select_topk_equal_weight_rejects_stale_screen_bundle() -> None:
+    import numpy as np
+    import pytest
+
+    from src.ml.costaware_topk import MIN_TOP_K
+    from src.ml.topk_ranker_research import select_topk_equal_weight
+
+    # Given: 완화 전 상한으로 인증된 번들 + 정상 스냅샷
+    bundle, snapshot = _synthetic_bundle_and_fixture()
+    bundle["select_universe"] = {**bundle["select_universe"], "max_tick_cost_bp": 7.5}
+
+    # When / Then: 라이브 선택이 스크린 불일치로 fail-closed
+    with pytest.raises(ValueError, match="max_tick_cost_bp"):
+        select_topk_equal_weight(snapshot, bundle, top_k=MIN_TOP_K)
+
+    # And: 재인증된 번들에서는 기존 등가중 top-3 동작이 보존된다
+    certified, snapshot2 = _synthetic_bundle_and_fixture()
+    out = select_topk_equal_weight(snapshot2, certified, top_k=MIN_TOP_K)
+    assert len(out) == 3
+    assert np.allclose(out["allocation"].to_numpy(dtype=np.float64), 1.0 / MIN_TOP_K)
+
+    # And: 에러 우선순위는 top_k -> 스크린 순서를 유지한다
+    with pytest.raises(ValueError, match="top_k"):
+        select_topk_equal_weight(snapshot, bundle, top_k=1)
 
