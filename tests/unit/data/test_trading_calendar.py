@@ -60,11 +60,15 @@ def test_default_cfg_carries_api_key_from_settings(monkeypatch) -> None:
     """기본 cfg가 키 없이 만들어지면 strict 페처가 ValueError로 죽는다(부팅 감사 전체 실패).
 
     페처를 목킹하면 이 배선 결함이 숨으므로, 실제로 전달된 cfg를 캡처해 검증한다.
+    실 .env 자격증명이 없는 환경(CI 등)에서도 배선 자체를 검증할 수 있도록
+    settings.KRX_OPENAPI_KEY 를 가짜 비공백 값으로 주입한다 -- 이 테스트의
+    목적은 실제 키의 유효성이 아니라 '주입 경로'이므로 대체 가능하다.
     """
     import pandas as pd
 
-    from src import settings
     from src.data import trading_calendar
+
+    monkeypatch.setattr(trading_calendar.settings, "KRX_OPENAPI_KEY", "test-krx-key", raising=False)
 
     captured: dict[str, object] = {}
 
@@ -80,7 +84,7 @@ def test_default_cfg_carries_api_key_from_settings(monkeypatch) -> None:
 
     # Then: 키가 settings에서 주입돼 있어야 한다(빈 문자열이면 실경로에서 ValueError)
     cfg = captured["cfg"]
-    assert cfg.krx_api_key == settings.KRX_OPENAPI_KEY
+    assert cfg.krx_api_key == trading_calendar.settings.KRX_OPENAPI_KEY
     assert str(cfg.krx_api_key).strip() != ""
 
 
