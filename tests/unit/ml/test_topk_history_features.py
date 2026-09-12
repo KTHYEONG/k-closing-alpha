@@ -316,9 +316,14 @@ def test_load_serving_price_history_reads_pit_window_and_fails_closed(tmp_path) 
         load_serving_price_history(decision, path=path, is_trading_day=lambda _d: True)
     with pytest.raises(FileNotFoundError):
         load_serving_price_history(decision, path=tmp_path / "missing.parquet", is_trading_day=lambda _d: True)
-    # Re-save fresh panel to test default is_trading_day (line 286) with a mid-year date
+    # Re-save fresh panel to test default is_trading_day (line 286) with a mid-year date.
+    # 기본 오라클(is_krx_trading_day)은 실 네트워크/자격증명이 필요하므로, '배선이
+    # trading_calendar.is_krx_trading_day 를 가져다 쓰는지'만 결정적으로 검증한다.
+    import unittest.mock
+
     mid_decision = pd.Timestamp("2025-06-16")  # Monday
     panel.to_parquet(path)
-    out_default = load_serving_price_history(mid_decision, path=path)
+    with unittest.mock.patch("src.data.trading_calendar.is_krx_trading_day", return_value=True):
+        out_default = load_serving_price_history(mid_decision, path=path)
     assert not out_default.empty
 
