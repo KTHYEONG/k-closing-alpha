@@ -259,7 +259,9 @@ def test_run_intraday_archive_passes_kiwoom_to_nxt_collector(monkeypatch) -> Non
         patch("src.daily.archive_intraday.write_intraday_partition", return_value=5),
         patch("src.daily.archive_intraday.write_tick_partition", return_value=10),
         patch("src.api.kis.client.KisApiClient.ensure_token", new_callable=AsyncMock),
+        patch("src.daily.archive_intraday.is_kis_trading_day", new_callable=AsyncMock) as mock_trading_day,
     ):
+        mock_trading_day.return_value = True
         mock_bars.return_value = pd.DataFrame()
         mock_nxt.return_value = pd.DataFrame()
         mock_nxt_pre.return_value = pd.DataFrame()
@@ -298,7 +300,9 @@ def test_run_intraday_archive_collects_and_writes_premarket_partition(monkeypatc
         patch("src.daily.archive_intraday.write_intraday_partition", side_effect=fake_write_partition),
         patch("src.daily.archive_intraday.write_tick_partition", return_value=10),
         patch("src.api.kis.client.KisApiClient.ensure_token", new_callable=AsyncMock),
+        patch("src.daily.archive_intraday.is_kis_trading_day", new_callable=AsyncMock) as mock_trading_day,
     ):
+        mock_trading_day.return_value = True
         mock_bars.return_value = pd.DataFrame([{"dummy": 1}] * 5)
         mock_nxt_after.return_value = pd.DataFrame([{"dummy": 1}] * 3)
         mock_nxt_pre.return_value = pd.DataFrame([{"dummy": 1}] * 2)
