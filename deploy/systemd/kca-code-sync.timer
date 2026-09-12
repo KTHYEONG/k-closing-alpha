@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA git 코드 동기화 (평일 09:00 KST, 장시작 6시간여 전)
+
+[Timer]
+OnCalendar=Mon..Fri 09:00:00 Asia/Seoul
+Persistent=true
+Unit=kca-code-sync.service
+
+[Install]
+WantedBy=timers.target
