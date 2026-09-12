@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA offsite backup (Mon-Fri 20:25 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 20:25:00 Asia/Seoul
+Persistent=true
+Unit=kca-backup.service
+
+[Install]
+WantedBy=timers.target

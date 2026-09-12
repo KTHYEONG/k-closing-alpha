@@ -1,0 +1,9 @@
+[Unit]
+Description=KCA offsite backup (rclone sync to gdrive)
+After=kca-archive-intraday.service kca-daily-audit.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-closing-alpha
+ExecStart=%h/.local/bin/rclone sync %h/k-closing-alpha/data gdrive:quant-lake/live/k-closing-alpha/data
+ExecStart=%h/.local/bin/rclone sync %h/k-closing-alpha/artifacts gdrive:quant-lake/live/k-closing-alpha/artifacts
