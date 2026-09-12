@@ -370,5 +370,8 @@
   },
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
+  },
+  "deploy/systemd/kca-backup.service": {
+    "testing": "tests/unit/deploy/test_systemd_units.py"
   }
 }
