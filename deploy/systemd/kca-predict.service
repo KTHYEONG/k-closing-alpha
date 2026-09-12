@@ -1,6 +1,7 @@
 [Unit]
 Description=KCA daily predict (top-k ranker sleeve)
 After=kca-collect.service
+OnFailure=kca-alert@%n.service
 
 [Service]
 Type=oneshot
