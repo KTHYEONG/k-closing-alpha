@@ -41,9 +41,9 @@ CANONICAL_TICK_COLUMNS: tuple[str, ...] = (
     "vendor",
 )
 
-_BAR_VENDORS: tuple[str, ...] = ("kis", "ls", "kiwoom")
+_BAR_VENDORS: tuple[str, ...] = ("kis", "ls", "kiwoom", "toss")
 
-VENDOR_BUSINESS_DATE_FIELDS: dict[str, str] = {"kis": "stck_bsop_date", "ls": "date", "kiwoom": "cntr_tm"}
+VENDOR_BUSINESS_DATE_FIELDS: dict[str, str] = {"kis": "stck_bsop_date", "ls": "date", "kiwoom": "cntr_tm", "toss": "timestamp"}
 
 _KIS_BAR_REQUIRED: tuple[str, ...] = (
     "stck_cntg_hour",
@@ -72,6 +72,15 @@ _KIWOOM_BAR_REQUIRED: tuple[str, ...] = (
     "high_pric",
     "low_pric",
     "trde_qty",
+)
+
+_TOSS_BAR_REQUIRED: tuple[str, ...] = (
+    "timestamp",
+    "openPrice",
+    "highPrice",
+    "lowPrice",
+    "closePrice",
+    "volume",
 )
 
 
@@ -182,8 +191,8 @@ def filter_to_business_date(df: pd.DataFrame, vendor: str, snapshot_date: str, s
 
 def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbol: str) -> pd.DataFrame:
     """벤더 원천 분봉 프레임을 정규 바 스키마로 변환한다."""
-    if vendor not in ("kis", "ls", "kiwoom"):
-        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls', 'kiwoom')")
+    if vendor not in ("kis", "ls", "kiwoom", "toss"):
+        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls', 'kiwoom', 'toss')")
     if df is None or len(df) == 0:
         return _empty_bar_frame()
     df = filter_to_business_date(df, vendor, snapshot_date, symbol)
@@ -242,6 +251,21 @@ def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbo
             }
         )
         value_krw = work["close"] * work["volume"]
+    elif vendor == "toss":
+        _require_columns(df, _TOSS_BAR_REQUIRED, vendor)
+        hms = df["timestamp"].astype(str).str.split("T").str[1].str.split(".").str[0].str.replace(":", "", regex=False)
+        work = pd.DataFrame(
+            {
+                "ts_hms": pd.to_numeric(hms, errors="coerce"),
+                "open": pd.to_numeric(df["openPrice"].astype(str), errors="coerce"),
+                "high": pd.to_numeric(df["highPrice"].astype(str), errors="coerce"),
+                "low": pd.to_numeric(df["lowPrice"].astype(str), errors="coerce"),
+                "close": pd.to_numeric(df["closePrice"].astype(str), errors="coerce"),
+                "volume": pd.to_numeric(df["volume"].astype(str), errors="coerce"),
+            }
+        )
+        # Toss 캔들 응답엔 봉당 거래대금 필드가 없다 -- Kiwoom 분기와 동일하게 close*volume으로 근사한다.
+        value_krw = work["close"] * work["volume"]
 
     out = pd.DataFrame(
         {
@@ -276,6 +300,7 @@ def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbo
     if vendor == "kiwoom":
         out["has_trade"] = out["has_trade"].astype(object)
     return out[list(CANONICAL_BAR_COLUMNS)]
+
 
 
 def normalize_tick_frame(

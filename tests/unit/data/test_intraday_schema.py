@@ -450,3 +450,47 @@ def test_normalize_frames_return_empty_when_all_rows_are_stale() -> None:
     out_ticks = normalize_tick_frame(ticks, "kis", "2026-05-01", "005930")
     assert len(out_ticks) == 0
     assert list(out_ticks.columns) == list(CANONICAL_TICK_COLUMNS)
+
+
+def test_normalize_bar_frame_toss_vendor_maps_fields() -> None:
+    import pandas as pd
+
+    from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, normalize_bar_frame
+
+    raw = pd.DataFrame([
+        {
+            "timestamp": "2026-09-04T09:01:00.000+09:00",
+            "openPrice": "256500",
+            "highPrice": "257000",
+            "lowPrice": "256500",
+            "closePrice": "257000",
+            "volume": "100",
+            "currency": "KRW",
+        }
+    ])
+
+    df = normalize_bar_frame(raw, "toss", "2026-09-04", "005930")
+
+    assert list(df.columns) == list(CANONICAL_BAR_COLUMNS)
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["symbol"] == "005930"
+    assert row["ts_hms"] == 90100
+    assert row["open"] == 256500
+    assert row["high"] == 257000
+    assert row["low"] == 256500
+    assert row["close"] == 257000
+    assert row["volume"] == 100
+    assert row["value_krw"] == 257000 * 100
+    assert row["vendor"] == "toss"
+    assert bool(row["has_trade"]) is True
+
+
+def test_extract_vendor_business_dates_toss() -> None:
+    import pandas as pd
+
+    from src.data.intraday_schema import extract_vendor_business_dates
+
+    toss = pd.DataFrame({"timestamp": ["2026-09-04T09:01:00.000+09:00"], "closePrice": ["1"]})
+
+    assert extract_vendor_business_dates(toss, "toss").tolist() == ["20260904"]
