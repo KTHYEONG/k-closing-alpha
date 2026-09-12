@@ -139,6 +139,9 @@
   "src/backfill/price/universe.py": {
     "testing": "tests/unit/backfill/price/test_universe.py"
   },
+  "src/config/alerts.py": {
+    "testing": "tests/unit/config/test_alert_settings.py"
+  },
   "src/config/altdata.py": {
     "testing": "tests/unit/config/test_altdata.py"
   },
@@ -346,6 +349,9 @@
   },
   "src/sync/fetcher_program.py": {
     "testing": "tests/unit/sync/test_fetcher_program.py"
+  },
+  "src/tools/alerts.py": {
+    "testing": "tests/unit/tools/test_alerts.py"
   },
   "src/tools/daily_audit.py": {
     "testing": "tests/unit/tools/test_daily_audit.py"
