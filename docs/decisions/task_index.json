@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260912_EXIT_GRID_LOCKED_OOS_REVALIDATION",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_20260912_EXIT_GRID_LOCKED_OOS_REVALIDATION",
+      "domain": "ml",
+      "title": "청산레버 locked-OOS/CPCV(8,2) 재검증 모듈",
+      "why": "TP5%+MOC 청산레버가 구세대 게이트로만 통과했고 승격 ADR 없이 방치돼 현행 표준 재검증 경로가 없었다",
+      "resolution": "인증 리랭커와 동일한 build_dual_pool~cpcv_score_with_history 파이프라인을 재사용하는 신규 연구모듈(build_exit_grid_oof/run_exit_grid_revalidation)과 retrain.py --exit-grid-revalidation CLI 플래그 추가; cost_ratio는 실측 tick_cost_bp 평균, net_return은 net_pit에서 유도",
+      "impact": "인증 리랭커/서빙 코드 무변경; 실제 재검증 실행은 아직 안 함(수동 CLI, 실제 LightGBM 학습 필요)-다음 단계로 백그라운드 실행 필요"
+    },
+    {
       "task_id": "TASK_20260912_TOSS_1M_BACKFILL_2022_2025",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_20260912_TOSS_1M_BACKFILL_2022_2025",
@@ -989,16 +999,6 @@
       "why": "Tax (0.15%), KIS fee (0.028%), and slippage were uncredited, and negative utility scores led to faulty sizing grade allocations.",
       "resolution": "Deducted 0.20% round-trip cost, fixed assign_sizing_grades thresholds, normalized probability scales, and scaled sizing allocation with utility score magnitude.",
       "impact": "Eliminated false positive position sizing on sub-zero net return trades and established realistic risk-weighted position allocation."
-    },
-    {
-      "task_id": "SIZING_SAFETY_MARGIN_REFACTORING",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_SIZING_SAFETY_MARGIN_REFACTORING",
-      "domain": "ml",
-      "title": "Sizing Grade Safety Margin Threshold & Hybrid Criteria Refactoring",
-      "why": "Prevent assigning Strong grades to marginal Break-Even utility scores (+0.001) that fail to cover trading costs and slippage.",
-      "resolution": "Configured minimum safety margin thresholds for Strong (>= +0.30%) and Good (>= +0.10%) grades in assign_sizing_grades.",
-      "impact": "Eliminated score scale illusions, suppressed risky leverage under marginal expectancy, and enhanced capital preservation."
     }
   ]
 }

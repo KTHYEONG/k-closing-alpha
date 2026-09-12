@@ -260,6 +260,12 @@
       "tests/unit/test_dead_code_subtraction.py"
     ]
   },
+  "src/ml/research/exit_grid_revalidation.py": {
+    "testing": [
+      "tests/unit/ml/test_exit_grid_revalidation.py",
+      "tests/unit/ml/test_retrain.py"
+    ]
+  },
   "src/ml/research/v3_engine.py": {
     "testing": [
       "tests/unit/daily/test_predict.py",
@@ -328,6 +334,7 @@
       "tests/unit/daily/test_archive_intraday.py",
       "tests/unit/data/test_parquet_loader.py",
       "tests/unit/data/test_trading_calendar.py",
+      "tests/unit/ml/test_exit_grid_revalidation.py",
       "tests/unit/ml/test_history_features.py"
     ]
   },
