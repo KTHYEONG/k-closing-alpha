@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260912_VPS_FULL_AUTOMATION",
+      "date": "2026-09-12",
+      "adr_id": "ADR_20260912_20260912_VPS_FULL_AUTOMATION",
+      "domain": "infra",
+      "title": "VPS 전면 자동화 배포(경로 이식성+백업+감사 타이머화)",
+      "why": "systemd 유닛에 /home/kth 하드코딩되어 VPS(ubuntu 계정) 이관 불가, kca-price-ingest.timer 활성화 누락, daily-audit가 부팅1회만 실행",
+      "resolution": "%h 스페시파이어로 8개 유닛 경로 이식성 확보, kca-backup.service/.timer 신설(rclone gdrive 동기화), kca-daily-audit.timer 신설로 EOD 반복 실행 전환, install_systemd.sh enable 목록 보정; lean_check.py의 non-symbol file-level 변경 오탐 버그도 함께 수정",
+      "impact": "로컬(kth)/VPS(ubuntu) 단일 유닛 파일셋으로 어디든 설치 가능해졌고, 오프사이트 백업과 반복 감사가 자동 스케줄됨"
+    },
+    {
       "task_id": "TASK_20260912_INTRADAY_GAP_RETROACTIVE_BACKFILL_POLICY",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_20260912_INTRADAY_GAP_RETROACTIVE_BACKFILL_POLICY",
@@ -989,16 +999,6 @@
       "why": "condition_history_종가매매.xlsx contained 307 pre-20251229 obsolete rows, missing fields post-20260520, and missing volume for 281 rows.",
       "resolution": "Filtered out pre-20251229 rows, built ConditionHistoryBackfiller to restore missing OHLCV/volume/market cap/index returns via KIS API, removed unused EMA columns, and excluded historical volume power.",
       "impact": "Generated clean data/history/condition_history_cleaned.csv and parquet repositories with 100% volume and code coverage."
-    },
-    {
-      "task_id": "TASK_EXPORT_SPREADSHEET",
-      "date": "2026-08-04",
-      "adr_id": "ADR_20260804_EXPORT_SPREADSHEET",
-      "domain": "utils",
-      "title": "Archive → Spreadsheet Export Utility 개편 및 export_archive.py 전면 재작성",
-      "why": "기존 db_to_xlsx.py는 구 condition_history 스키마에 종속된 dead code였으며, 스프레드시트 복사-붙여넣기에 최적화된 data/exports/ 경로 저장 유틸리티가 필요함",
-      "resolution": "db_to_xlsx.py 삭제 후 export_archive.py 생성(TSV/CSV 출력, ARCHIVE_COLUMN_ORDER 26컬럼, data/exports/ 저장), CONDITION_EXCEL_PATH 레거시 정리",
-      "impact": "스프레드시트 복사-붙여넣기 편의성 향상 및 과거 xlsx 레거시 코드 완전 정리"
     }
   ]
 }
