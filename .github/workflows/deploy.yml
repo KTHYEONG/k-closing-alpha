@@ -3,6 +3,7 @@ name: Oracle CI/CD Pipeline
 on:
   push:
     branches: [ main ]
+  workflow_dispatch: {}
 
 env:
   IMAGE: ghcr.io/kthyeong/k-closing-alpha
