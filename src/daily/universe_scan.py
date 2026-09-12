@@ -14,6 +14,8 @@ UNIVERSE_SCAN_SCENARIO_TAG: str = "등락률스캔"
 
 SCAN_PRIMARY_VENDOR: str = "kiwoom"
 
+TOSS_RANKING_TYPE_TOP_GAINERS: str = "TOP_GAINERS"
+
 
 class UniverseScanCoverageError(RuntimeError):
     """Kiwoom 커버리지 없이 거래 후보 리스트를 만들 수 없을 때의 fail-closed 오류."""
@@ -24,6 +26,7 @@ RANKING_SCAN_INPUT_CNT: str = "200"
 __all__ = [
     "RANKING_SCAN_INPUT_CNT",
     "SCAN_PRIMARY_VENDOR",
+    "TOSS_RANKING_TYPE_TOP_GAINERS",
     "UNIVERSE_SCAN_SCENARIO_TAG",
     "UniverseScanCoverageError",
     "archive_universe_snapshot",
@@ -33,6 +36,7 @@ __all__ = [
     "map_kiwoom_ranking_rows_to_stock_list",
     "map_ranking_rows_to_archive_frame",
     "map_ranking_rows_to_stock_list",
+    "map_toss_ranking_rows_to_stock_list",
 ]
 
 _ARCHIVE_COLUMNS: list[str] = [
@@ -228,22 +232,65 @@ def map_kiwoom_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
     return out
 
 
+def map_toss_ranking_rows_to_stock_list(rows: list[dict], universe: UniverseSpec = DEFAULT_UNIVERSE) -> list[dict]:
+    """Map Toss `/api/v1/rankings` TOP_GAINERS rows to collect.py stock_list shape.
+
+    Toss rankings carry no company-name field (unlike KIS/Kiwoom); name is
+    always None for these rows -- an explicit gap, not fabricated data. Rows
+    are client-side filtered to [universe.chg_min, universe.chg_max) since
+    Toss has no min/max band query, only a top-N-by-rank list, so coverage
+    may be narrower than Kiwoom's dedicated band query during a real outage.
+
+    Args:
+        rows: Raw Toss rankings result.rankings rows.
+        universe: Change-rate band to keep (mirrors select_universe's >=min, <max convention).
+
+    Returns:
+        List of {code, name, price, chgrate} dicts; codeless or out-of-band rows skipped.
+    """
+    out: list[dict] = []
+    for row in rows:
+        code_raw = str(row.get("symbol", "") or "").strip()
+        if not code_raw:
+            continue
+        price_block = row.get("price") or {}
+        chg = _to_float(price_block.get("changeRate"))
+        if not (float(universe.chg_min) <= chg < float(universe.chg_max)):
+            continue
+        out.append(
+            {
+                "code": code_raw.zfill(6),
+                "name": None,
+                "price": price_block.get("lastPrice"),
+                "chgrate": price_block.get("changeRate"),
+            }
+        )
+    return out
+
+
 async def fetch_candidate_stock_list(
-    client, session, *, universe: UniverseSpec = DEFAULT_UNIVERSE, kiwoom_client: Any | None = None
+    client, session, *, universe: UniverseSpec = DEFAULT_UNIVERSE, kiwoom_client: Any | None = None, toss_client: Any | None = None
 ) -> list[dict]:
-    """Kiwoom ka10027을 유일한 유니버스 소스로 후보 stock_list를 조회한다 (fail-closed).
+    """Kiwoom ka10027을 1순위, Toss TOP_GAINERS 랭킹을 2순위 폴백으로 후보 stock_list를 조회한다 (fail-closed).
 
     Args:
         client: KIS API client (사용하지 않음; 시그니처 호환용).
         session: HTTP session.
         universe: Universe bounds for the ranking call.
         kiwoom_client: Kiwoom vendor client (필수).
+        toss_client: Toss vendor client; Kiwoom 실패 시 폴백으로 사용된다 (선택,
+            None이면 폴백 없이 Kiwoom 실패 즉시 fail-closed).
 
     Returns:
-        Candidate stock_list in collect.py shape.
+        Candidate stock_list in collect.py shape. Toss-sourced rows carry
+        name=None (Toss rankings have no company-name field) and are
+        client-side filtered to [universe.chg_min, universe.chg_max) from at
+        most 100 top-gainer rows, so coverage may be narrower than Kiwoom's
+        dedicated band query during a genuine Kiwoom outage.
 
     Raises:
-        UniverseScanCoverageError: kiwoom_client 미주입/호출 실패/논리 실패 시.
+        UniverseScanCoverageError: kiwoom_client 미주입, 또는 Kiwoom과(toss_client가
+            주입된 경우) Toss 모두 실패 시.
     """
     if kiwoom_client is None:
         raise UniverseScanCoverageError("kiwoom_client is required for the tradeable candidate list")
@@ -254,12 +301,30 @@ async def fetch_candidate_stock_list(
             rate_max_pct=universe.chg_max * 100.0,
         )
     except Exception as e:
-        raise UniverseScanCoverageError(f"kiwoom ranking call failed: {e}") from e
-    if kw_res.get("rt_cd") != "0":
-        raise UniverseScanCoverageError(
-            f"kiwoom ranking failed rt_cd={kw_res.get('rt_cd')} msg={kw_res.get('msg1', '')}"
+        kw_reason = f"kiwoom ranking call failed: {e}"
+    else:
+        if kw_res.get("rt_cd") == "0":
+            rows = kw_res.get("output") or []
+            out = map_kiwoom_ranking_rows_to_stock_list(rows)
+            logger.info("[DATA] stage=universe_scan vendor=%s n_rows=%d", SCAN_PRIMARY_VENDOR, len(out))
+            return out
+        kw_reason = f"kiwoom ranking failed rt_cd={kw_res.get('rt_cd')} msg={kw_res.get('msg1', '')}"
+    logger.warning("[DATA] stage=universe_scan vendor=kiwoom status=FAILED reason=%s", kw_reason)
+    if toss_client is None:
+        raise UniverseScanCoverageError(kw_reason)
+    try:
+        toss_res = await toss_client.get_rankings(
+            session, ranking_type=TOSS_RANKING_TYPE_TOP_GAINERS, market_country="KR", duration="1d", count=100,
         )
-    rows = kw_res.get("output") or []
-    out = map_kiwoom_ranking_rows_to_stock_list(rows)
-    logger.info("[DATA] stage=universe_scan vendor=%s n_rows=%d", SCAN_PRIMARY_VENDOR, len(out))
+    except Exception as e:
+        raise UniverseScanCoverageError(f"{kw_reason}; toss ranking call failed: {e}") from e
+    if "error" in toss_res:
+        err = toss_res["error"]
+        raise UniverseScanCoverageError(f"{kw_reason}; toss ranking failed code={err.get('code')} msg={err.get('message', '')}")
+    rows = (toss_res.get("result") or {}).get("rankings") or []
+    out = map_toss_ranking_rows_to_stock_list(rows, universe)
+    logger.warning(
+        "[DATA] stage=universe_scan vendor=toss status=FALLBACK n_rows=%d note=degraded_top100_band_filter",
+        len(out),
+    )
     return out

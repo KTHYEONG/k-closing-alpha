@@ -39,6 +39,16 @@ def build_kiwoom_scan_client() -> Any | None:
     return client
 
 
+def build_toss_scan_client() -> Any | None:
+    """Toss 랭킹 폴백 클라이언트를 구성한다. 자격증명이 없으면 None을 반환한다."""
+    from src.api.toss.client import TossApiClient
+
+    client = TossApiClient()
+    if not client.app_key:
+        return None
+    return client
+
+
 async def _validate_trading_day(client, session, snapshot_date: str, *, force: bool = False) -> None:
     """휴장일 실행을 차단한다. --force가 유일한 우회 경로다."""
     if force:
@@ -176,18 +186,19 @@ def flag_cost_aware_admission(
     return flagged
 
 
-async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None = None) -> list[dict]:
+async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None = None, toss_client: Any | None = None) -> list[dict]:
     """자동 비용축 스캔 결과를 그대로 반환합니다.
 
     Args:
         client: KIS API client.
         session: HTTP session.
-        kiwoom_client: Kiwoom scan client (유일한 후보 소스).
+        kiwoom_client: Kiwoom scan client (1순위 후보 소스).
+        toss_client: Toss scan client (Kiwoom 실패 시 폴백, 선택).
 
     Returns:
         자동 스캔 후보 리스트. 스캔이 비면 빈 리스트를 반환한다.
     """
-    return await fetch_candidate_stock_list(client, session, kiwoom_client=kiwoom_client) or []
+    return await fetch_candidate_stock_list(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client) or []
 
 
 # ---------------------------------------------------------
@@ -425,6 +436,7 @@ async def main(force: bool = False):
 
         snapshot_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
         kiwoom_client = build_kiwoom_scan_client()
+        toss_client = build_toss_scan_client()
         await _validate_trading_day(client, session, snapshot_date, force=force)
 
         # 2. 시장 지수 조회 (병렬 gather)
@@ -436,8 +448,8 @@ async def main(force: bool = False):
         kospi_rate = parse_market_index_rate(res_kospi)
         kosdaq_rate = parse_market_index_rate(res_kosdaq)
 
-        # 3. 후보 종목 리스트 확보 (자동 비용축 스캔 단일 경로)
-        stock_list = await resolve_daily_candidates(client, session, kiwoom_client=kiwoom_client)
+        # 3. 후보 종목 리스트 확보 (자동 비용축 스캔 단일 경로, Toss 폴백 포함)
+        stock_list = await resolve_daily_candidates(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client)
         if not stock_list:
             logger.info(f"{Colors.YELLOW}⚠ 자동 스캔 후보가 없습니다.{Colors.RESET}")
             return
