@@ -144,6 +144,7 @@ class KisApiClient:
         import tempfile
 
         dir_name = os.path.dirname(os.path.abspath(self.token_file))
+        os.makedirs(dir_name, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".kis_token_", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
