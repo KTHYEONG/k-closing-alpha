@@ -1,0 +1,143 @@
+{
+  "schema_version": "1.0",
+  "feature": "ml_p1_copy_elimination",
+  "target_file": "src/ml/dataset.py",
+  "context_files": [
+    "src/ml/dataset.py",
+    "src/ml/scenario_panel.py",
+    "src/ml/bundle.py",
+    "src/ml/oof.py",
+    "src/ml/universe_research.py",
+    "tests/unit/ml/test_dataset.py",
+    "tests/unit/ml/test_bundle.py",
+    "tests/unit/ml/test_universe_research.py"
+  ],
+  "changes": [
+    {
+      "name": "build_ml_dataset",
+      "signature": "def build_ml_dataset(trade_log_df: pd.DataFrame, theme_df: pd.DataFrame | None = None, feature_set: str = \"close_morning61\", panel_mode: str = \"scenario_action\", price_history_df: pd.DataFrame | None = None, scenario_source: str = \"manual\") -> tuple[pd.DataFrame, dict[str, pd.Series], list[str], pd.DataFrame]",
+      "kind": "modified_function",
+      "target_file": "src/ml/dataset.py"
+    },
+    {
+      "name": "fit_seed_ensemble",
+      "signature": "def fit_seed_ensemble(train_df: pd.DataFrame, feature_cols: list[str], target_col: str, seeds: tuple[int, ...], model_params: dict[str, Any], huber_delta: float, sample_weight: np.ndarray | None = None) -> SeedEnsembleModel",
+      "kind": "modified_function",
+      "target_file": "src/ml/bundle.py"
+    }
+  ],
+  "wiring": [
+    {
+      "caller_file": "src/ml/universe_research.py",
+      "anchor": "x_features, targets, cat_features, processed = build_ml_dataset(raw, theme_df, feature_set=feature_set, panel_mode=\"scenario_action\", price_history_df=price_history_df, scenario_source=\"auto\")",
+      "import_symbol": "build_ml_dataset",
+      "invocation_expression": "build_ml_dataset(raw, theme_df, feature_set=feature_set, panel_mode=\"scenario_action\", price_history_df=price_history_df, scenario_source=\"auto\")"
+    },
+    {
+      "caller_file": "src/ml/bundle.py",
+      "anchor": "return_model = fit_seed_ensemble(",
+      "import_symbol": "fit_seed_ensemble",
+      "invocation_expression": "fit_seed_ensemble(train, feature_cols, target_col, seeds, base_return_params, huber_delta)"
+    }
+  ],
+  "requirements": [
+    "In build_ml_dataset, retain scenario_rejects in a function-local list after build_scenario_action_panel and do not attach that potentially large mutable payload to df.attrs before dropna, engineer_features, robust-z, target construction, feature attachment, or DataFrame copies.",
+    "Initialize the local scenario_rejects value deterministically so every allowed panel_mode has a defined path; attach scenario_action_rejects only when panel_mode == \"scenario_action\".",
+    "Immediately before return, attach the exact same ordered reject-record content to both x_features.attrs[\"scenario_action_rejects\"] and df.attrs[\"scenario_action_rejects\"]. Preserve existing feature_manifest, feature_set, panel_mode, and scenario_source attrs on both outputs.",
+    "Do not mutate, re-sort, serialize, summarize, deduplicate, copy per transformation, or otherwise alter scenario_rejects. Reject row population, record keys/values, record order, and reject_reason must remain exact.",
+    "Preserve build_ml_dataset input/output signatures, row population, index, column order, dtypes, feature values, targets, categorical features, labels, feature manifest, panel semantics, scenario_source behavior, and all validation exceptions exactly.",
+    "In fit_seed_ensemble, call _finite_nan(train_df, feature_cols) exactly once before the seed loop, then materialize fit_x = train_f[feature_cols] and fit_y = train_f[target_col].to_numpy(dtype=np.float64) exactly once and reuse those same objects for every model.fit call.",
+    "Preserve seed iteration order, one LGBMRegressor per seed, objective=\"huber\", random_state per seed, verbosity, alpha defaulting via setdefault, model_params non-mutation, sample_weight identity/content, returned model order, and SeedEnsembleModel seed tuple exactly.",
+    "Do not make fit_x, fit_y, train_f, or sample_weight writable from model-specific code; the implementation must not mutate them between fits. Do not parallelize seed training or change LightGBM/BLAS thread settings in this contract.",
+    "No fold-dependent preprocessing may move across fold boundaries. Do not change Purged CV, chronological calibration, embargo, dataset split, seed, hyperparameters, prediction averaging, rank, Top-K, OOF, PnL, or final model-selection decisions.",
+    "Keep float64 targets/predictions. No float32, Polars/DuckDB migration, cache layer, GPU/JAX, Numba, Rust, multiprocessing, or storage redesign is included.",
+    "Acceptance requires exact DataFrame/Series equality and exact prediction array equality. allclose with widened tolerance is forbidden for this contract.",
+    "Re-run the same dataset benchmark with warm-up and at least three measured repetitions. The observed probe baseline was 1.3232984755s warm median and the local-attrs PoC was 0.4589815860s with exact X/processed digests and 114 rejects restored.",
+    "Record fit_seed_ensemble wall time and peak RSS separately on the same feature matrix, seeds, params, LightGBM threads, and hardware. Its runtime and RAM gain remain NOT MEASURED until that benchmark is run."
+  ],
+  "invariants": [
+    "strategy, signal, features, labels, universe, PIT and split semantics are immutable",
+    "fill, funding, fee, ledger and final gate outputs remain exact whenever possible",
+    "seed, fold membership, prediction rank and Top-K remain unchanged",
+    "event ordering, conn_seq, raw records, DQ and durability remain unchanged",
+    "float64 is retained"
+  ],
+  "design_rationale": {
+    "alternatives_considered": [
+      "pandas/Polars blanket migration",
+      "DuckDB analytical layer",
+      "Numba stateful kernel",
+      "outer multiprocessing",
+      "Rust rewrite",
+      "JAX/GPU migration"
+    ],
+    "chosen_reason": "유일하게 실측 채택 가능한 변경은 KCA attrs 지연 부착이며, 나머지는 exact equivalence harness 뒤의 좁은 PoC로 제한한다.",
+    "project_decision": "build_ml_dataset의 attrs 조기 부착은 pandas __finalize__/deepcopy 증폭의 실측 원인이므로 ADOPT한다. fit_seed_ensemble의 seed별 동일 정제/선택은 좁은 P1 변경으로 구현하되 별도 before/after benchmark 전 gain은 NOT MEASURED이다.",
+    "failure_modes": [
+      "parallel/window reordering changes fills or OOF ordering",
+      "chunk boundary loses cumulative tick state",
+      "cache key omits PIT cutoff or feature contract",
+      "worker/thread expansion exceeds 16GiB RAM",
+      "float operation order changes ledger or Top-K"
+    ]
+  },
+  "performance_budget": {
+    "expected_data_scale": "5459549 daily rows, 176594 fit rows, 11 retained models; dataset benchmark uses the same representative scenario_action input and 114 rejects",
+    "memory_target_mb": "Dataset path must not exceed its same-workload baseline peak RSS; seed-ensemble path target is strictly lower same-workload peak RSS, with measured gain NOT MEASURED until benchmark",
+    "storage_format": "Existing pandas/Parquet and native LightGBM input boundary; unchanged",
+    "dtype_precision": "float64 targets, predictions, weights, and financial outputs",
+    "chunking_strategy": "No new chunking; eliminate attrs propagation copies and seed-loop repeated dataset conversion",
+    "acceleration_candidate": "Pandas object-lifetime reduction and immutable prepared-matrix reuse"
+  },
+  "scenarios": [
+    {
+      "scenario_id": "test_build_ml_dataset_defers_reject_attrs_and_restores_exact_payload",
+      "target_test_file": "tests/unit/ml/test_dataset.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_dataset.py -k defers_reject_attrs_and_restores_exact_payload --tb=short",
+      "expected_behavior": "No reject payload is present during feature transformations, while both returned DataFrames receive the same complete ordered rejects and all existing attrs.",
+      "test_skeleton": "def test_build_ml_dataset_defers_reject_attrs_and_restores_exact_payload(monkeypatch) -> None:\n    import pandas as pd\n\n    import src.ml.dataset as dataset_mod\n\n    raw = _raw_trade_log(n_dates=3, per_day=2)\n    conflict = raw.iloc[[0]].copy()\n    conflict[\"(수익률, %)\"] = \"9.99\"\n    raw_with_conflict = pd.concat([raw, conflict], ignore_index=True)\n    original_engineer = dataset_mod.engineer_features\n    attrs_seen_during_transform = []\n\n    def observed_engineer(frame):\n        attrs_seen_during_transform.append(dict(frame.attrs))\n        assert \"scenario_action_rejects\" not in frame.attrs\n        return original_engineer(frame)\n\n    monkeypatch.setattr(dataset_mod, \"engineer_features\", observed_engineer)\n\n    x_features, targets, cat_features, processed = dataset_mod.build_ml_dataset(\n        raw_with_conflict, feature_set=\"close_morning61\", panel_mode=\"scenario_action\"\n    )\n\n    assert len(attrs_seen_during_transform) == 1\n    expected_rejects = processed.attrs[\"scenario_action_rejects\"]\n    assert len(expected_rejects) == 2\n    assert [row[\"reject_reason\"] for row in expected_rejects] == [\n        \"conflicting_duplicate_action\", \"conflicting_duplicate_action\"\n    ]\n    assert x_features.attrs[\"scenario_action_rejects\"] == expected_rejects\n    assert x_features.attrs[\"scenario_action_rejects\"] is expected_rejects\n    for frame in (x_features, processed):\n        assert frame.attrs[\"feature_manifest\"] == processed.attrs[\"feature_manifest\"]\n        assert frame.attrs[\"feature_set\"] == \"close_morning61\"\n        assert frame.attrs[\"panel_mode\"] == \"scenario_action\"\n        assert frame.attrs[\"scenario_source\"] == \"manual\"\n    assert set(targets) == {\"target_return\", \"target_good\", \"target_bad\", \"target_rank\"}\n    assert \"chart_analysis\" not in x_features.columns\n    assert \"chart_analysis\" not in cat_features"
+    },
+    {
+      "scenario_id": "test_build_ml_dataset_non_scenario_mode_has_no_reject_attr",
+      "target_test_file": "tests/unit/ml/test_dataset.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_dataset.py -k non_scenario_mode_has_no_reject_attr --tb=short",
+      "expected_behavior": "The optimization does not invent scenario_action_rejects for raw_rows panel mode and preserves standard metadata.",
+      "test_skeleton": "def test_build_ml_dataset_non_scenario_mode_has_no_reject_attr() -> None:\n    from src.ml.dataset import build_ml_dataset\n\n    raw = _raw_trade_log(n_dates=3, per_day=2)\n\n    x_features, targets, cat_features, processed = build_ml_dataset(\n        raw, feature_set=\"close_morning61\", panel_mode=\"raw_rows\"\n    )\n\n    assert \"scenario_action_rejects\" not in x_features.attrs\n    assert \"scenario_action_rejects\" not in processed.attrs\n    assert x_features.attrs[\"panel_mode\"] == \"raw_rows\"\n    assert processed.attrs[\"panel_mode\"] == \"raw_rows\"\n    assert len(x_features) == len(processed) == len(raw)\n    assert set(targets) == {\"target_return\", \"target_good\", \"target_bad\", \"target_rank\"}\n    assert isinstance(cat_features, list)"
+    },
+    {
+      "scenario_id": "test_fit_seed_ensemble_prepares_shared_inputs_once",
+      "target_test_file": "tests/unit/ml/test_bundle.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_bundle.py -k prepares_shared_inputs_once --tb=short",
+      "expected_behavior": "Finite-value cleaning, feature selection, and target conversion occur once; every seed receives the same X, y, and sample_weight objects in declared order.",
+      "test_skeleton": "def test_fit_seed_ensemble_prepares_shared_inputs_once(monkeypatch) -> None:\n    import numpy as np\n\n    import src.ml.bundle as bundle_mod\n\n    train = _panel(n_dates=4, per_day=3)\n    train.loc[train.index[0], \"f1\"] = np.inf\n    weights = np.linspace(1.0, 2.0, len(train), dtype=np.float64)\n    finite_calls = []\n    fit_calls = []\n    original_finite = bundle_mod._finite_nan\n\n    def counted_finite(frame, feature_cols):\n        finite_calls.append((id(frame), tuple(feature_cols)))\n        return original_finite(frame, feature_cols)\n\n    class FakeRegressor:\n        def __init__(self, **kwargs):\n            self.kwargs = kwargs\n\n        def fit(self, x_values, y_values, sample_weight=None):\n            fit_calls.append((id(x_values), id(y_values), id(sample_weight), self.kwargs[\"random_state\"]))\n            assert not np.isinf(x_values.to_numpy(dtype=np.float64)).any()\n            return self\n\n        def predict(self, x_values):\n            return np.zeros(len(x_values), dtype=np.float64)\n\n    monkeypatch.setattr(bundle_mod, \"_finite_nan\", counted_finite)\n    monkeypatch.setattr(bundle_mod, \"LGBMRegressor\", FakeRegressor)\n\n    model = bundle_mod.fit_seed_ensemble(\n        train, [\"f1\", \"f2\"], \"target_return\", (7, 11, 23),\n        {\"n_estimators\": 3}, 0.9, sample_weight=weights,\n    )\n\n    assert finite_calls == [(id(train), (\"f1\", \"f2\"))]\n    assert [call[3] for call in fit_calls] == [7, 11, 23]\n    assert len({call[0] for call in fit_calls}) == 1\n    assert len({call[1] for call in fit_calls}) == 1\n    assert {call[2] for call in fit_calls} == {id(weights)}\n    assert model.seeds == (7, 11, 23)\n    assert [member.kwargs[\"alpha\"] for member in model.models] == [0.9, 0.9, 0.9]"
+    },
+    {
+      "scenario_id": "test_fit_seed_ensemble_predictions_match_per_seed_reference_exactly",
+      "target_test_file": "tests/unit/ml/test_bundle.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_bundle.py -k predictions_match_per_seed_reference_exactly --tb=short",
+      "expected_behavior": "Prepared-matrix reuse produces exactly the same per-seed and averaged LightGBM predictions as the pre-change per-seed preparation sequence.",
+      "test_skeleton": "def test_fit_seed_ensemble_predictions_match_per_seed_reference_exactly() -> None:\n    import numpy as np\n    from lightgbm import LGBMRegressor\n\n    from src.ml.bundle import fit_seed_ensemble\n    from src.ml.oof import _finite_nan\n\n    train = _panel(n_dates=12, per_day=4)\n    features = [\"f1\", \"f2\"]\n    seeds = (7, 11)\n    params = {\"n_estimators\": 12, \"num_leaves\": 5, \"n_jobs\": 1}\n    reference_models = []\n    for seed in seeds:\n        train_f = _finite_nan(train, features)\n        reference = LGBMRegressor(\n            objective=\"huber\", random_state=seed, verbosity=-1, alpha=0.9, **params\n        )\n        reference.fit(train_f[features], train_f[\"target_return\"].to_numpy(dtype=np.float64))\n        reference_models.append(reference)\n\n    actual = fit_seed_ensemble(train, features, \"target_return\", seeds, params, 0.9)\n    expected_member_predictions = [model.predict(train[features]) for model in reference_models]\n    actual_member_predictions = [model.predict(train[features]) for model in actual.models]\n\n    for expected, observed in zip(expected_member_predictions, actual_member_predictions, strict=True):\n        np.testing.assert_array_equal(observed, expected)\n    np.testing.assert_array_equal(\n        actual.predict(train[features]),\n        np.column_stack(expected_member_predictions).mean(axis=1, dtype=np.float64),\n    )"
+    },
+    {
+      "scenario_id": "test_build_universe_training_panel_keeps_dataset_contract_after_attr_deferral",
+      "target_test_file": "tests/unit/ml/test_universe_research.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_universe_research.py -k keeps_dataset_contract_after_attr_deferral --tb=short",
+      "expected_behavior": "The production research caller receives aligned features/targets and the complete scenario reject payload through the unchanged build_ml_dataset call.",
+      "test_skeleton": "def test_build_universe_training_panel_keeps_dataset_contract_after_attr_deferral() -> None:\n    from src.ml.universe import ScreenConfig\n    from src.ml.universe_research import build_universe_training_panel\n\n    history = _price_history(n_days=90, n_syms=12)\n    screen = ScreenConfig(\n        change_lower=-1.0, change_upper=None,\n        min_trade_value_100m=100.0, min_market_cap_100m=500.0,\n    )\n\n    x_features, targets, feature_cols, processed, provenance = build_universe_training_panel(\n        history, screen, None, feature_set=\"close_morning61\",\n        start_date=\"2023-01-02\", end_date=\"2023-05-31\",\n    )\n\n    assert len(x_features) == len(processed) > 0\n    assert x_features.index.equals(processed.index)\n    assert all(series.index.equals(processed.index) for series in targets.values())\n    assert feature_cols == [column for column in x_features.columns if column not in (\"market_type\", \"theme_sector\", \"chart_analysis\")]\n    assert x_features.attrs[\"scenario_action_rejects\"] == []\n    assert x_features.attrs[\"panel_mode\"] == \"scenario_action\"\n    assert x_features.attrs[\"scenario_source\"] == \"auto\"\n    assert provenance[\"panel_rows_pre_label\"] >= len(processed)"
+    },
+    {
+      "scenario_id": "test_build_inline_bundle_wires_seed_ensemble_without_contract_change",
+      "target_test_file": "tests/unit/ml/test_bundle.py",
+      "execution_command": "uv run pytest tests/unit/ml/test_bundle.py -k wires_seed_ensemble_without_contract_change --tb=short",
+      "expected_behavior": "The existing serving-bundle caller still exposes the same ordered SeedEnsembleModel and feature manifest when seeds are provided.",
+      "test_skeleton": "def test_build_inline_bundle_wires_seed_ensemble_without_contract_change() -> None:\n    from src.ml.bundle import SeedEnsembleModel, build_inline_bundle\n\n    train = _panel(n_dates=20, per_day=4)\n\n    bundle = build_inline_bundle(\n        train, [\"f1\", \"f2\"], \"target_return\", \"trade_date\",\n        return_model_params={\"n_estimators\": 8, \"num_leaves\": 5, \"n_jobs\": 1},\n        seeds=(7, 11), calibrator_mode=\"chrono\",\n    )\n\n    assert isinstance(bundle[\"return_model\"], SeedEnsembleModel)\n    assert bundle[\"return_model\"].seeds == (7, 11)\n    assert len(bundle[\"return_model\"].models) == 2\n    assert bundle[\"feature_cols\"] == [\"f1\", \"f2\"]\n    assert bundle[\"feature_manifest\"][\"feature_name\"].tolist() == [\"f1\", \"f2\"]"
+    }
+  ],
+  "out_of_scope": [
+    "Feature, label, target, PIT, split, Purged CV, embargo, rank, Top-K, or selection changes",
+    "Polars, DuckDB, Arrow, Numba, JAX/GPU, Rust, multiprocessing, or shared-memory migration",
+    "attach_topk_features redesign or fold-dependent preprocessing cache",
+    "LightGBM hyperparameter or thread-count tuning",
+    "Any tolerance-based equivalence relaxation"
+  ]
+}
