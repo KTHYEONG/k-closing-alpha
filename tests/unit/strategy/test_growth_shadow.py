@@ -162,6 +162,7 @@ def test_build_shadow_ledger_exit_unavailable_yields_nan_arms():
     assert np.isnan(row["arm_k3_net"])
     assert np.isnan(row["arm_k2_net"])
     assert np.isnan(row["arm_k3_trail_net"])
+    assert np.isnan(row["arm_k3_scoreprop_net"])
 
 
 def test_build_shadow_ledger_excludes_pending_dates():
@@ -189,13 +190,14 @@ def test_build_shadow_ledger_rejects_wrong_pick_count():
 def test_run_growth_shadow_writes_ledger(tmp_path):
     import pandas as pd
     import pytest
-    from src.strategy.growth_shadow import run_growth_shadow
+    from src.strategy.growth_shadow import compute_score_proportional_weights, run_growth_shadow
 
     # Given
     dec_path = tmp_path / "topk_decisions.parquet"
     ph_path = tmp_path / "price_history.parquet"
     out_path = tmp_path / "growth_shadow.parquet"
-    _decisions("2026-09-01", [("000001", 0.03), ("000002", 0.02), ("000003", 0.01)]).to_parquet(dec_path)
+    decisions = _decisions("2026-09-01", [("000001", 0.03), ("000002", 0.02), ("000003", 0.01)])
+    decisions.to_parquet(dec_path)
     _ph([
         ("2026-09-01", "000001", 1000, 1000), ("2026-09-01", "000002", 1000, 1000), ("2026-09-01", "000003", 1000, 1000),
         ("2026-09-02", "000001", 1030, 1000), ("2026-09-02", "000002", 1010, 1000), ("2026-09-02", "000003", 960, 1000),
@@ -206,9 +208,18 @@ def test_run_growth_shadow_writes_ledger(tmp_path):
     assert n == 1
     ledger = pd.read_parquet(out_path)
     assert list(ledger.columns) == [
-        "decision_date", "n_picks", "arm_k3_net", "arm_k2_net", "trail_mean_k3", "trail_gate_open", "arm_k3_trail_net"
+        "decision_date", "n_picks", "arm_k3_net", "arm_k2_net", "arm_k3_scoreprop_net",
+        "trail_mean_k3", "trail_gate_open", "arm_k3_trail_net",
     ]
     assert ledger["arm_k2_net"].iloc[0] - ledger["arm_k3_net"].iloc[0] == pytest.approx((0.03 + 0.01) / 2 - 0.0)
+    # All 3 picks share one decision_date and tick_cost_bp, so the per-pick
+    # statutory+tick cost is a constant that cancels in any
+    # weighted-vs-equal-weighted GROSS difference (weights each sum to 1) --
+    # this avoids re-deriving the exact statutory tax rate in the test.
+    gross = pd.Series([0.03, 0.01, -0.04])
+    w = compute_score_proportional_weights(decisions["pred"], decisions["decision_date"])
+    expected_delta = float((w * gross).sum() - gross.mean())
+    assert ledger["arm_k3_scoreprop_net"].iloc[0] - ledger["arm_k3_net"].iloc[0] == pytest.approx(expected_delta)
 
 
 def test_run_growth_shadow_missing_decisions_returns_zero(tmp_path):
@@ -220,3 +231,121 @@ def test_run_growth_shadow_missing_decisions_returns_zero(tmp_path):
     )
     assert n == 0
     assert not out_path.exists()
+
+
+def test_compute_score_proportional_weights_matches_manual_formula_and_sums_to_one():
+    import numpy as np
+    import pandas as pd
+    import pytest
+    from src.strategy.growth_shadow import compute_score_proportional_weights
+
+    # Given: one decision day, 3 picks with distinct pred scores
+    pred = pd.Series([0.01, 0.03, 0.02])
+    decision_date = pd.Series(["2026-09-01"] * 3)
+    # When
+    w = compute_score_proportional_weights(pred, decision_date, gamma=1.0, epsilon=1e-3)
+    # Then: manual gamma=1 formula, range-normalized then epsilon-floored, renormalized to sum 1
+    lo, hi = 0.01, 0.03
+    raw = np.array([(v - lo) / (hi - lo) + 1e-3 for v in pred])
+    expected = raw / raw.sum()
+    assert w == pytest.approx(expected)
+    assert float(np.sum(w)) == pytest.approx(1.0)
+    assert w[1] > w[2] > w[0]
+
+
+def test_compute_score_proportional_weights_uniform_fallback_on_tied_pred():
+    import numpy as np
+    import pandas as pd
+    import pytest
+    from src.strategy.growth_shadow import compute_score_proportional_weights
+
+    # Given: one decision day, 3 picks with an identical pred score (day_range == 0)
+    pred = pd.Series([0.02, 0.02, 0.02])
+    decision_date = pd.Series(["2026-09-01"] * 3)
+    # When
+    w = compute_score_proportional_weights(pred, decision_date)
+    # Then
+    assert np.all(np.isfinite(w))
+    assert w == pytest.approx(np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]))
+
+
+def test_compute_score_proportional_weights_rejects_length_mismatch():
+    import pandas as pd
+    import pytest
+    from src.strategy.growth_shadow import compute_score_proportional_weights
+
+    pred = pd.Series([0.01, 0.02, 0.03])
+    decision_date = pd.Series(["2026-09-01", "2026-09-01"])
+    with pytest.raises(ValueError, match="length"):
+        compute_score_proportional_weights(pred, decision_date)
+
+
+def test_compute_score_proportional_weights_rejects_non_finite_pred():
+    import numpy as np
+    import pandas as pd
+    import pytest
+    from src.strategy.growth_shadow import compute_score_proportional_weights
+
+    pred = pd.Series([0.01, np.nan, 0.03])
+    decision_date = pd.Series(["2026-09-01"] * 3)
+    with pytest.raises(ValueError, match="finite"):
+        compute_score_proportional_weights(pred, decision_date)
+
+    pred_inf = pd.Series([0.01, np.inf, 0.03])
+    with pytest.raises(ValueError, match="finite"):
+        compute_score_proportional_weights(pred_inf, decision_date)
+
+
+def test_compute_score_proportional_weights_rejects_nonpositive_epsilon():
+    import pandas as pd
+    import pytest
+    from src.strategy.growth_shadow import compute_score_proportional_weights
+
+    pred = pd.Series([0.01, 0.02, 0.03])
+    decision_date = pd.Series(["2026-09-01"] * 3)
+    with pytest.raises(ValueError, match="epsilon"):
+        compute_score_proportional_weights(pred, decision_date, epsilon=0.0)
+
+
+def test_compute_score_proportional_weights_groups_independently_across_dates():
+    import numpy as np
+    import pandas as pd
+    import pytest
+    from src.strategy.growth_shadow import compute_score_proportional_weights
+
+    # Given: day1 has a wide pred spread, day2 is tied
+    pred = pd.Series([0.01, 0.05, 0.03, 0.02, 0.02])
+    decision_date = pd.Series(["2026-09-01"] * 3 + ["2026-09-02"] * 2)
+    # When
+    w = compute_score_proportional_weights(pred, decision_date)
+    # Then: each date's weights independently sum to 1
+    day1 = w[:3].sum()
+    day2 = w[3:].sum()
+    assert day1 == pytest.approx(1.0)
+    assert day2 == pytest.approx(1.0)
+    assert w[3] == pytest.approx(w[4])
+
+
+def test_build_shadow_ledger_scoreprop_concentrates_toward_higher_pred_rank():
+    import pandas as pd
+    import pytest
+    from src.strategy.growth_shadow import build_shadow_ledger, compute_score_proportional_weights
+
+    # Given: rank1 (pred=0.03) earns the best return, rank3 (pred=0.01) the worst
+    realized = pd.DataFrame({
+        "decision_date": pd.to_datetime(["2026-09-01"] * 3),
+        "symbol": ["000001", "000002", "000003"],
+        "pred": [0.03, 0.02, 0.01],
+        "rank": [1, 2, 3],
+        "gross_return": [0.05, 0.01, -0.03],
+        "net_return": [0.05, 0.01, -0.03],
+        "status": ["REALIZED"] * 3,
+    })
+    # When
+    ledger = build_shadow_ledger(realized)
+    row = ledger.iloc[0]
+    # Then: manual expected value from the same weight formula
+    w = compute_score_proportional_weights(realized["pred"], realized["decision_date"])
+    expected = float((w * realized["net_return"].to_numpy()).sum())
+    assert row["arm_k3_scoreprop_net"] == pytest.approx(expected)
+    assert row["arm_k3_scoreprop_net"] > row["arm_k3_net"]
