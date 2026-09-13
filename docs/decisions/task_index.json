@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260913_REALTIME_COLLECTION_GAP_FILL",
+      "date": "2026-09-14",
+      "adr_id": "ADR_20260914_20260913_REALTIME_COLLECTION_GAP_FILL",
+      "domain": "data_collection",
+      "title": "거래대금 상위 유니버스 union + T-1 시장폭 피처 추가",
+      "why": "등락률 단일기준 스캔이 거래대금 상위 종목을 영구 소실시키고, kospi/kosdaq/v_kospi 외 시장레벨 피처가 전무해 미래 가설 검증 옵션이 닫혀있었음",
+      "resolution": "universe_scan.py에 Toss MARKET_TRADING_AMOUNT union(fail-open) 추가, panel_integrity.py에 PIT strict compute_latest_market_breadth 신설해 collect.py/schema.py/dataset.py로 배선",
+      "impact": "diff coverage 100%, 신규 12개+회귀 전체 테스트 통과; program_netbuy 실시간화/환율/선물 투자자 순매수는 범위 밖으로 별도 기록"
+    },
+    {
       "task_id": "TASK_20260913_BACKUP_COPY_CONSOLIDATION",
       "date": "2026-09-13",
       "adr_id": "ADR_20260913_20260913_BACKUP_COPY_CONSOLIDATION",
@@ -989,16 +999,6 @@
       "why": "The 2025 causal-history retrain showed 65 unavailable candidates, 179 capacity-limited candidates, and lower candidate OOF performance despite feature-count expansion.",
       "resolution": "Added fold-local feature quality evidence and deterministic family reports, persisted quality_report in research artifacts, exposed source-incomplete/capacity-limited/unstable actions, and required candidate scheduled mean return to strictly beat the identical-date control before promotion.",
       "impact": "Research now distinguishes unavailable data from redundant or capacity-limited features and prevents lower-return history candidates from promotion; active production artifacts remain unchanged."
-    },
-    {
-      "task_id": "ml_training_optimization",
-      "date": "2026-08-08",
-      "adr_id": "ADR_20260808_ml_training_optimization",
-      "domain": "ml_pipeline",
-      "title": "Optimize Cold Cache History Panel and Spearman Feature Selection",
-      "why": "Cold cache causal panel build and 720 fold-local feature selection timeout blocked ML research discovery runs.",
-      "resolution": "Accelerated Spearman correlation matrix calculation via BLAS matrix multiplication and enforced memory-bounded streaming batching to avoid OOM.",
-      "impact": "Fold-local feature selection completed within 456s pipeline wall time with Peak RSS 3.79 GiB, preventing timeouts and OOM."
     }
   ]
 }
