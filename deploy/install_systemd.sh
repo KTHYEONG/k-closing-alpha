@@ -13,7 +13,6 @@ systemctl --user daemon-reload
 systemctl --user enable --now \
   kca-collect.timer \
   kca-predict.timer \
-  kca-paper-entry.timer \
   kca-paper-exit.timer \
   kca-finalize-close.timer \
   kca-archive-intraday.timer \
