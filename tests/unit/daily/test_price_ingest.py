@@ -638,3 +638,22 @@ def test_run_price_ingest_fails_closed_on_low_program_flow_coverage(monkeypatch,
 
     # Then: nothing written
     assert path.stat().st_mtime_ns == before
+
+
+def test_price_ingest_main_runs_growth_shadow_after_ingest(monkeypatch):
+    import src.daily.price_ingest as price_ingest
+    import src.strategy.growth_shadow as growth_shadow
+
+    calls = []
+
+    async def fake_ingest():
+        calls.append("ingest")
+
+    def fake_shadow():
+        calls.append("shadow")
+        return 0
+
+    monkeypatch.setattr(price_ingest, "run_price_ingest", fake_ingest)
+    monkeypatch.setattr(growth_shadow, "run_growth_shadow", fake_shadow)
+    price_ingest.main()
+    assert calls == ["ingest", "shadow"]
