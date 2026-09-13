@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260913_GDRIVE_BACKUP_UNION_SAFE",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_20260913_GDRIVE_BACKUP_UNION_SAFE",
+      "domain": "infra/deployment",
+      "title": "GDrive 백업 합집합화: kca-backup rclone exclude 추가",
+      "why": "VPS kca-backup의 rclone sync가 VPS 로컬을 정답 삼아 WSL 전용 데이터(altdata/intraday/orderbook/legacy parquet) 341MB+115MB+9.5MB를 다음 실행에 삭제할 위험을 dry-run으로 실증",
+      "resolution": "kca-backup.service 두 ExecStart에 --exclude 추가(data: altdata/intraday/orderbook/theme/trade_log, artifacts: WSL전용 캐시·레거시 산출물); VPS dry-run 재검증으로 삭제 0건(의도된 topk_decisions.parquet 1건 제외) 확인",
+      "impact": "VPS/WSL이 GDrive 내 서로 다른 경로만 갱신하는 소유권 분리 구조 확정; altdata 등 WSL전용분은 여전히 WSL이 수동 rclone copy로 갱신 필요(문서 4.3항)"
+    },
+    {
       "task_id": "TASK_20260913_CODE_SYNC_UV_PATH",
       "date": "2026-09-13",
       "adr_id": "ADR_20260913_20260913_CODE_SYNC_UV_PATH",
@@ -989,16 +999,6 @@
       "why": "The latest full real-data pipeline execution must be reproducible and documented after the close-to-morning policy implementation.",
       "resolution": "Recorded the base40, snapshot49, and close_morning61 OOF comparison, single-stock policy counts, close-to-morning risk metrics, quality score, and persisted bundle fields in docs/results/ml-v5.md.",
       "impact": "Provides the current evidence for production-readiness decisions while retaining the explicit research-only promotion gate."
-    },
-    {
-      "task_id": "TASK_ML_SINGLE_STOCK_ABSTENTION",
-      "date": "2026-08-05",
-      "adr_id": "ADR_20260805_ML_SINGLE_STOCK_ABSTENTION",
-      "domain": "ml",
-      "title": "Single-stock daily BUY/ABSTAIN policy",
-      "why": "The ML strategy targets one new stock per day, but the prior sizing/display path exposed multiple candidates and did not make abstention causal.",
-      "resolution": "Added causal OOF single-stock policy calibration, deterministic scenario-action resolution, exactly-one BUY or explicit ABSTAIN decisions, and entry-sequence-only evaluation until an exit ledger exists. The OOF comparison selected always_buy_top1; margin abstention candidates were retained for diagnostics because they reduced scheduled-date return.",
-      "impact": "Daily inference now has a single-stock decision contract; model reports distinguish active-trade returns from scheduled-date returns and do not claim portfolio MDD without exit data."
     }
   ]
 }
