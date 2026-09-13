@@ -5,5 +5,5 @@ After=kca-archive-intraday.service kca-daily-audit.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
-ExecStart=/bin/sh -c '%h/.local/bin/rclone sync %h/k-closing-alpha/data gdrive:quant-lake/live/k-closing-alpha/data --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/data/$(date +%%F)'
-ExecStart=/bin/sh -c '%h/.local/bin/rclone sync %h/k-closing-alpha/artifacts gdrive:quant-lake/live/k-closing-alpha/artifacts --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/artifacts/$(date +%%F)'
+ExecStart=/bin/sh -c '%h/.local/bin/rclone sync %h/k-closing-alpha/data gdrive:quant-lake/live/k-closing-alpha/data --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/data/$(date +%%F) --exclude "history/altdata/**" --exclude "history/intraday/**" --exclude "history/orderbook/**" --exclude "parquet/theme.parquet" --exclude "parquet/trade_log.parquet"'
+ExecStart=/bin/sh -c '%h/.local/bin/rclone sync %h/k-closing-alpha/artifacts gdrive:quant-lake/live/k-closing-alpha/artifacts --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/artifacts/$(date +%%F) --exclude "models/.cache/**" --exclude "models/.gitattributes" --exclude "models/sizing_pipeline_bundle.joblib" --exclude "models/topk_ranker_report.parquet" --exclude "models/universe_grid.parquet"'

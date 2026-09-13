@@ -188,3 +188,31 @@ def test_code_sync_timer_exists_and_install_script_enables_it() -> None:
     assert "src.tools.code_sync" in service
     assert "OnFailure=kca-alert@%n.service" in service
     assert "kca-code-sync.timer" in install_text
+
+
+def test_backup_excludes_wsl_only_altdata_and_legacy_parquet() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-backup.service").read_text(encoding="utf-8")
+    data_line = next(line for line in text.splitlines() if "rclone sync" in line and "/data " in line)
+
+    assert '--exclude "history/altdata/**"' in data_line
+    assert '--exclude "history/intraday/**"' in data_line
+    assert '--exclude "history/orderbook/**"' in data_line
+    assert '--exclude "parquet/theme.parquet"' in data_line
+    assert '--exclude "parquet/trade_log.parquet"' in data_line
+
+
+def test_backup_excludes_wsl_only_artifacts_extras() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-backup.service").read_text(encoding="utf-8")
+    artifacts_line = next(line for line in text.splitlines() if "rclone sync" in line and "/artifacts " in line)
+
+    assert '--exclude "models/.cache/**"' in artifacts_line
+    assert '--exclude "models/.gitattributes"' in artifacts_line
+    assert '--exclude "models/sizing_pipeline_bundle.joblib"' in artifacts_line
+    assert '--exclude "models/topk_ranker_report.parquet"' in artifacts_line
+    assert '--exclude "models/universe_grid.parquet"' in artifacts_line
