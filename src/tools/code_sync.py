@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,26 @@ class SyncResult:
     reason: str
 
 
+def _resolve_uv_bin() -> str:
+    """Resolve the uv executable's absolute path for subprocess calls.
+
+    Every kca-*.service unit launches this module via the absolute
+    %h/.local/bin/uv path, so the outer process always starts. But
+    `systemctl --user show-environment` on the production host carries
+    only the systemd default PATH -- it does not include ~/.local/bin --
+    so a bare "uv" argv element in a subprocess call made *from inside*
+    this already-running process fails with FileNotFoundError even though
+    the process itself is a real uv-launched Python. shutil.which is
+    checked first so a CI/dev shell with uv already on PATH is unaffected;
+    the fixed ~/.local/bin/uv path is the fallback every systemd unit in
+    this project already assumes.
+
+    Returns:
+        Absolute path to the uv executable.
+    """
+    return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+
+
 def _git(args: list[str], cwd: str) -> str:
     """Run git and return trimmed stdout; raise CalledProcessError on a non-zero exit."""
     result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=GIT_TIMEOUT_SEC, check=True)  # noqa: S603, S607
@@ -65,8 +87,8 @@ def _run_test_gate(repo_dir: str) -> tuple[bool, str]:
         (passed, tail_of_combined_output) - output capped to the last
         ALERT_DETAIL_TAIL_CHARS characters so a failing gate's alert stays bounded.
     """
-    result = subprocess.run(  # noqa: S607
-        ["uv", "run", "pytest", "-q"], cwd=repo_dir, capture_output=True, text=True, timeout=TEST_GATE_TIMEOUT_SEC,  # noqa: S607
+    result = subprocess.run(  # noqa: S603, S607
+        [_resolve_uv_bin(), "run", "pytest", "-q"], cwd=repo_dir, capture_output=True, text=True, timeout=TEST_GATE_TIMEOUT_SEC,
     )
     combined = result.stdout + result.stderr
     return result.returncode == 0, combined[-ALERT_DETAIL_TAIL_CHARS:]
@@ -74,7 +96,7 @@ def _run_test_gate(repo_dir: str) -> tuple[bool, str]:
 
 def _uv_sync(repo_dir: str) -> None:
     """Refresh the venv from the freshly fast-forwarded lockfile."""
-    subprocess.run(["uv", "sync"], cwd=repo_dir, check=True, capture_output=True, text=True, timeout=UV_SYNC_TIMEOUT_SEC)  # noqa: S607
+    subprocess.run([_resolve_uv_bin(), "sync"], cwd=repo_dir, check=True, capture_output=True, text=True, timeout=UV_SYNC_TIMEOUT_SEC)  # noqa: S603, S607
 
 
 def sync_repo(

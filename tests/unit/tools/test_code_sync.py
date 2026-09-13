@@ -203,7 +203,8 @@ def test_run_test_gate_reports_pass_and_bounds_output_tail(monkeypatch, tmp_path
 
     # Then
     assert passed is True
-    assert captured["cmd"] == ["uv", "run", "pytest", "-q"]
+    assert captured["cmd"] == [code_sync._resolve_uv_bin(), "run", "pytest", "-q"]
+    assert captured["cmd"][0] != "uv"
     assert captured["cwd"] == str(tmp_path)
     assert len(tail) == code_sync.ALERT_DETAIL_TAIL_CHARS
 
@@ -211,6 +212,7 @@ def test_run_test_gate_reports_pass_and_bounds_output_tail(monkeypatch, tmp_path
 def test_uv_sync_invokes_uv_sync_command(monkeypatch, tmp_path) -> None:
     import subprocess
 
+    from src.tools import code_sync
     from src.tools.code_sync import _uv_sync
 
     captured: dict = {}
@@ -226,7 +228,8 @@ def test_uv_sync_invokes_uv_sync_command(monkeypatch, tmp_path) -> None:
     _uv_sync(str(tmp_path))
 
     # Then
-    assert captured["cmd"] == ["uv", "sync"]
+    assert captured["cmd"] == [code_sync._resolve_uv_bin(), "sync"]
+    assert captured["cmd"][0] != "uv"
     assert captured["cwd"] == str(tmp_path)
     assert captured["check"] is True
 
@@ -248,5 +251,26 @@ def test_code_sync_main_invokes_sync_repo_with_settings_base_dir(monkeypatch) ->
 
     # Then
     assert captured == {"repo_dir": str(settings.BASE_DIR), "remote": "origin", "branch": "main"}
+
+
+def test_resolve_uv_bin_prefers_path_when_available(monkeypatch) -> None:
+    from src.tools import code_sync
+
+    monkeypatch.setattr(code_sync.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    assert code_sync._resolve_uv_bin() == "/usr/bin/uv"
+
+
+def test_resolve_uv_bin_falls_back_to_local_bin_when_not_on_path(monkeypatch) -> None:
+    from pathlib import Path
+
+    from src.tools import code_sync
+
+    monkeypatch.setattr(code_sync.shutil, "which", lambda name: None)
+
+    resolved = code_sync._resolve_uv_bin()
+
+    assert resolved == str(Path.home() / ".local" / "bin" / "uv")
+    assert resolved != "uv"
 
 
