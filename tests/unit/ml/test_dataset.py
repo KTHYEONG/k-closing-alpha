@@ -159,6 +159,8 @@ def test_label_source_is_excluded_from_model_features() -> None:
     assert LABEL_SOURCE_COLUMN in _EXCLUDED_FROM_X
     if not Path("data/parquet/trade_log.parquet").exists():
         pytest.skip("production trade_log parquet not present")
+    if not Path("data/parquet/theme.parquet").exists():
+        pytest.skip("production theme parquet not present")
     trade_log = pd.read_parquet("data/parquet/trade_log.parquet").head(2000)
     theme = pd.read_parquet("data/parquet/theme.parquet")
     tagged = trade_log.copy()
@@ -352,3 +354,16 @@ def test_build_ml_dataset_scenario_source_rejects_unknown() -> None:
     raw = _raw_trade_log_scenario_auto()
     with pytest.raises(ValueError, match="scenario_source"):
         build_ml_dataset(raw.copy(), None, feature_set="close_morning61", scenario_source="bogus")
+
+
+def test_clean_column_names_coerces_market_breadth_to_numeric() -> None:
+    import pandas as pd
+
+    from src.ml.dataset import clean_column_names
+
+    df = pd.DataFrame({"market_breadth": ["0.25", "-0.10", None]})
+
+    out = clean_column_names(df)
+
+    assert out["market_breadth"].tolist()[:2] == [0.25, -0.10]
+    assert pd.isna(out["market_breadth"].iloc[2])

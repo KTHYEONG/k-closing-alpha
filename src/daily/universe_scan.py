@@ -16,6 +16,8 @@ SCAN_PRIMARY_VENDOR: str = "kiwoom"
 
 TOSS_RANKING_TYPE_TOP_GAINERS: str = "TOP_GAINERS"
 
+TOSS_RANKING_TYPE_TRADE_VALUE: str = "MARKET_TRADING_AMOUNT"
+
 
 class UniverseScanCoverageError(RuntimeError):
     """Kiwoom 커버리지 없이 거래 후보 리스트를 만들 수 없을 때의 fail-closed 오류."""
@@ -27,16 +29,19 @@ __all__ = [
     "RANKING_SCAN_INPUT_CNT",
     "SCAN_PRIMARY_VENDOR",
     "TOSS_RANKING_TYPE_TOP_GAINERS",
+    "TOSS_RANKING_TYPE_TRADE_VALUE",
     "UNIVERSE_SCAN_SCENARIO_TAG",
     "UniverseScanCoverageError",
     "archive_universe_snapshot",
     "collect_universe_scan",
     "fetch_candidate_stock_list",
+    "fetch_trade_value_union",
     "map_kiwoom_ranking_rows_to_archive_frame",
     "map_kiwoom_ranking_rows_to_stock_list",
     "map_ranking_rows_to_archive_frame",
     "map_ranking_rows_to_stock_list",
     "map_toss_ranking_rows_to_stock_list",
+    "map_toss_trade_value_rows_to_stock_list",
 ]
 
 _ARCHIVE_COLUMNS: list[str] = [
@@ -265,6 +270,43 @@ def map_toss_ranking_rows_to_stock_list(rows: list[dict], universe: UniverseSpec
                 "chgrate": price_block.get("changeRate"),
             }
         )
+    return out
+
+
+def map_toss_trade_value_rows_to_stock_list(rows: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for row in rows:
+        code_raw = str(row.get("symbol", "") or "").strip()
+        if not code_raw:
+            continue
+        code = code_raw.zfill(6)
+        price_block = row.get("price") or {}
+        out.append(
+            {
+                "code": code,
+                "name": None,
+                "price": price_block.get("lastPrice"),
+                "chgrate": price_block.get("changeRate"),
+            }
+        )
+    return out
+
+
+async def fetch_trade_value_union(session, *, toss_client: Any | None = None, count: int = 100) -> list[dict]:
+    if toss_client is None:
+        return []
+    try:
+        res = await toss_client.get_rankings(session, ranking_type=TOSS_RANKING_TYPE_TRADE_VALUE, market_country="KR", duration="1d", count=count)
+    except Exception as e:
+        logger.warning("[DATA] stage=universe_scan_trade_value_union vendor=toss status=FAILED reason=%s", e)
+        return []
+    if "error" in res:
+        err = res["error"]
+        logger.warning("[DATA] stage=universe_scan_trade_value_union vendor=toss status=FAILED reason=code=%s msg=%s", err.get("code"), err.get("message", ""))
+        return []
+    rows = (res.get("result") or {}).get("rankings") or []
+    out = map_toss_trade_value_rows_to_stock_list(rows)
+    logger.info("[DATA] stage=universe_scan_trade_value_union vendor=toss status=OK n_rows=%d", len(out))
     return out
 
 
