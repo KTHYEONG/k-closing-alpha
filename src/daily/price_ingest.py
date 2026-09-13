@@ -661,6 +661,9 @@ async def run_price_ingest(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     asyncio.run(run_price_ingest())
+    from src.strategy.growth_shadow import run_growth_shadow
+
+    run_growth_shadow()
 
 
 if __name__ == "__main__":  # pragma: no cover
