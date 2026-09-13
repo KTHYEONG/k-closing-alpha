@@ -1,6 +1,66 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260913_BACKUP_COPY_CONSOLIDATION",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_20260913_BACKUP_COPY_CONSOLIDATION",
+      "domain": "infra/deployment",
+      "title": "GDrive 백업을 copy 기반 합집합 구조로 통합",
+      "why": "rclone sync+수동 exclude 목록 방식이 유지보수 부담이었고 min-age 기반 보존이 파일 mtime 오판정으로 실효 없었음",
+      "resolution": "data/artifacts 백업을 rclone copy+backup-dir로 전환(exclude 목록 제거)하고, _deleted 스냅샷 보존을 날짜 폴더명 기준 판정으로 교체",
+      "impact": "VPS/WSL 어느 쪽 전용 데이터도 자동 보호되는 합집합 구조 확정; docs/architecture/vps_gdrive_backup_architecture.md 갱신 필요"
+    },
+    {
+      "task_id": "TASK_20260913_RETRAIN_PROMOTION_GATE",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_20260913_RETRAIN_PROMOTION_GATE",
+      "domain": "ml",
+      "title": "주간 재학습 번들에 승격 게이트 도입",
+      "why": "무인 주간 재학습이 검증 없이 라이브 번들을 덮어씀; 데이터 오염 시 감지 수단 부재",
+      "resolution": "최근 20거래일 선택풀 예측 순위상관으로 현행 대비 합의도 측정(실측 정상 0.983~0.989, 10%오염 0.808, 임계 0.95), 거부시 rejected/에만 저장+RuntimeError, 저장은 tmp+os.replace 원자화",
+      "impact": "다음 토요일 22:00 재학습부터 게이트 적용; --skip-promotion-gate로 의도적 피처변경 우회 가능"
+    },
+    {
+      "task_id": "TASK_20260913_CODE_SYNC_UNIT_INSTALL",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_20260913_CODE_SYNC_UNIT_INSTALL",
+      "domain": "infra/deployment",
+      "title": "code_sync가 systemd 유닛 설치·.env 권한까지 수렴",
+      "why": "git 체크아웃 갱신이 systemd 설치본(~/.config/systemd/user)에 반영 안 돼 수동 cp+daemon-reload가 매번 필요했음, .env 664 확인",
+      "resolution": "install_systemd_units(변경분만 복사·삭제분 disable·신규 timer만 enable)와 ensure_secret_permissions(0600)를 up_to_date/fast_forwarded 양쪽에서 실행",
+      "impact": "다음 code-sync부터 systemd 파일 변경도 자동 반영; 유닛 삭제·비밀권한 교정도 매회 수렴"
+    },
+    {
+      "task_id": "TASK_20260913_SYSTEMD_HARDENING",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_20260913_SYSTEMD_HARDENING",
+      "domain": "infra/deployment",
+      "title": "systemd 유닛 TZ·알림·타이밍 전면 보강",
+      "why": "UTC 호스트에 KST 미고정, 5개 유닛 실패알림 부재, 휴장일 collect 크래시, code-sync/paper-exit 09:00 충돌 확인",
+      "resolution": "전 유닛 TZ=Asia/Seoul, 5개 유닛 OnFailure 추가, 결정경로 타이머 AccuracySec=1s, code-sync 07:30/backup 22:15 이동, collect 휴장일 정상종료",
+      "impact": "실패 감지 사각지대 해소; code-sync·paper-exit 자원 경합 제거"
+    },
+    {
+      "task_id": "TASK_20260913_DAILY_AUDIT_DIGEST",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_20260913_DAILY_AUDIT_DIGEST",
+      "domain": "infra/monitoring",
+      "title": "일일 감사를 실패전용 알림에서 평일 1통 요약으로 전환",
+      "why": "결정 로그 경로 오독으로 정상일마다 오탐, KRX 달력 지연게시로 휴장일마다 오탐 확인",
+      "resolution": "topk_decisions/paper 원장 기반 판정 + KIS 당일오라클 휴장분류 + failed 유닛 조회 + 평일 1통 다이제스트 발송",
+      "impact": "메일 미도착 자체가 스케줄러 정지 신호가 됨; 기존 실패전용 알림과 병행"
+    },
+    {
+      "task_id": "TASK_20260913_PAPER_EXIT_TERMINATION",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_20260913_PAPER_EXIT_TERMINATION",
+      "domain": "execution/paper",
+      "title": "페이퍼 청산 세션 종료조건 도입",
+      "why": "포지션 0개시 빈 구독 ValueError로 매일 크래시, 웹소켓이 안 끊겨 다음날 청산을 막을 위험 확인",
+      "resolution": "전량청산·정규장종료·벽시계 데드라인 중 최초 조건에서 종료하도록 run_paper_session 재작성",
+      "impact": "월요일 09:00 첫 실전 청산부터 정상 동작; now_fn 주입으로 시각 결정성 테스트 가능"
+    },
+    {
       "task_id": "TASK_20260913_GDRIVE_BACKUP_UNION_SAFE",
       "date": "2026-09-13",
       "adr_id": "ADR_20260913_20260913_GDRIVE_BACKUP_UNION_SAFE",
@@ -939,66 +999,6 @@
       "why": "Cold cache causal panel build and 720 fold-local feature selection timeout blocked ML research discovery runs.",
       "resolution": "Accelerated Spearman correlation matrix calculation via BLAS matrix multiplication and enforced memory-bounded streaming batching to avoid OOM.",
       "impact": "Fold-local feature selection completed within 456s pipeline wall time with Peak RSS 3.79 GiB, preventing timeouts and OOM."
-    },
-    {
-      "task_id": "TASK_ML_TRAINING_OPTIMIZATION",
-      "date": "2026-08-08",
-      "adr_id": "ADR_20260808_ML_TRAINING_OPTIMIZATION",
-      "domain": "ml",
-      "title": "ML training optimization and causal history benchmark",
-      "why": "Finalize synchronization after the cold-cache and warm-cache benchmark.",
-      "resolution": "Registered the causal cutoff, 25k Arrow batch benchmark, 267.89-second cold panel build, three warm cache reads, and the candidate-selection timeout; removed completed temporary ML training optimization specs.",
-      "impact": "ADR and code map are current, benchmark evidence is retained in docs/results, and no production model artifact was promoted."
-    },
-    {
-      "task_id": "TASK_ML_HISTORY_FEATURE_PIPELINE",
-      "date": "2026-08-07",
-      "adr_id": "ADR_20260807_ML_HISTORY_FEATURE_PIPELINE",
-      "domain": "ml",
-      "title": "Causal history feature streaming and research observability",
-      "why": "Prepare 720-feature causal history research under WSL memory limits and preserve diagnosable outcomes when long runs terminate.",
-      "resolution": "Added bounded Arrow Parquet scans, RSS budget checks, alphanumeric identifier-safe finite sanitization, a research-only CLI, atomic status snapshots, append-only stage events, and failure traceback persistence. Real history/control stages completed under 8 GiB; 5-fold candidate evaluation exceeded the 30-minute timeout and was not promoted.",
-      "impact": "Research pipeline is reproducible and memory-bounded for history construction, writes non-production artifacts only, and exposes failure checkpoints; GPU remains opt-in/CPU fallback in the current WSL environment."
-    },
-    {
-      "task_id": "TASK_ML_RECENCY_ADAPTIVE_ENSEMBLE",
-      "date": "2026-08-05",
-      "adr_id": "ADR_20260805_ML_RECENCY_ADAPTIVE_ENSEMBLE",
-      "domain": "ml",
-      "title": "ML recency-adaptive dual-horizon ensemble",
-      "why": "The p_bad reranker v2 lowered scheduled return without reducing MDD, indicating that post-prediction risk penalties were not fixing the expanding-history return model's regime sensitivity.",
-      "resolution": "Implemented fold-local exponential recency weighting for 252/504 trade-date half-lives, a percentile-ranked expanding/recent return ensemble, nested inner/outer purged selection, and opt-in research bundle serving. ML v8 through 2025-12-30 passed the nested OOF gate: scheduled mean 1.5316% to 1.5933%, PF 2.74 to 2.87, Sharpe 6.04 to 6.31, and MDD 33.94% to 25.87%.",
-      "impact": "Registers the strongest structural ML candidate to date while keeping production promotion blocked on capture-time provenance, execution slippage, and untouched paper/live OOS validation. The v1 default remains unchanged until those gates pass."
-    },
-    {
-      "task_id": "TASK_ML_RISK_AWARE_RERANKER_V2",
-      "date": "2026-08-05",
-      "adr_id": "ADR_20260805_ML_RISK_AWARE_RERANKER_V2",
-      "domain": "ml",
-      "title": "ML risk-aware reranker v2 nested OOF evaluation",
-      "why": "The v1 reranker improved return and Sharpe but left close-to-morning MDD unchanged; an existing calibrated p_bad estimate required a causal downside-risk experiment.",
-      "resolution": "Implemented p_bad-aware decision scoring with a bounded {0, 0.5, 1.0} penalty grid, nested purged outer/inner walk-forward selection through 2025-12-30, and recorded the real-data v7 result. The penalty was rejected because outer OOF scheduled mean fell from 1.5316% to 1.4726% while MDD stayed 33.94%; v1 remains active and no production bundle was changed.",
-      "impact": "Registers the rejected v2 ablation and preserves v1 as the production research candidate; future promotion still requires lower MDD without lower scheduled mean plus untouched paper/live validation under the 0.20% cost contract."
-    },
-    {
-      "task_id": "TASK_ML_CLOSE_MORNING_RERANKER_V1",
-      "date": "2026-08-05",
-      "adr_id": "ADR_20260805_ML_CLOSE_MORNING_RERANKER_V1",
-      "domain": "ml",
-      "title": "Sync close-to-morning risk reranker implementation and results",
-      "why": "The reranker implementation has been validated on the full real-data pipeline and its metrics, serving contract, and policy mapping must be registered.",
-      "resolution": "Recorded the 5-fold OOF reranker comparison and bundle contract in docs/results/ml-v6.md; registered the task and refreshed the code map; cleaned completed temporary specs and scratch artifacts.",
-      "impact": "The current close-to-morning candidate is reproducibly documented with decision_score semantics, 1-stock-per-day behavior, and explicit research-only promotion gates."
-    },
-    {
-      "task_id": "TASK_ML_CLOSE_MORNING_V5",
-      "date": "2026-08-05",
-      "adr_id": "ADR_20260805_ML_CLOSE_MORNING_V5",
-      "domain": "ml",
-      "title": "Record latest close-to-morning ML pipeline results",
-      "why": "The latest full real-data pipeline execution must be reproducible and documented after the close-to-morning policy implementation.",
-      "resolution": "Recorded the base40, snapshot49, and close_morning61 OOF comparison, single-stock policy counts, close-to-morning risk metrics, quality score, and persisted bundle fields in docs/results/ml-v5.md.",
-      "impact": "Provides the current evidence for production-readiness decisions while retaining the explicit research-only promotion gate."
     }
   ]
 }

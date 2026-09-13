@@ -284,6 +284,9 @@
   "src/ml/retrain.py": {
     "testing": "tests/unit/ml/test_retrain.py"
   },
+  "src/ml/retrain_gate.py": {
+    "testing": "tests/unit/ml/test_retrain_gate.py"
+  },
   "src/ml/robust_eval.py": {
     "testing": "tests/unit/ml/test_robust_eval.py"
   },
@@ -355,6 +358,9 @@
   },
   "src/tools/alerts.py": {
     "testing": "tests/unit/tools/test_alerts.py"
+  },
+  "src/tools/backup_prune.py": {
+    "testing": "tests/unit/tools/test_backup_prune.py"
   },
   "src/tools/code_sync.py": {
     "testing": "tests/unit/tools/test_code_sync.py"
