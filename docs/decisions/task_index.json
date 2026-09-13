@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260913_VPS_AUTOMATION_GAPS",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_20260913_VPS_AUTOMATION_GAPS",
+      "domain": "infra/deployment",
+      "title": "VPS 자동화 공백 수정: paper-entry 타이머·retrain 로깅",
+      "why": "VPS 실사 결과 kca-paper-entry.timer 부재로 페이퍼 매수가 영구 미실행, retrain.py에 basicConfig 누락으로 주간 재학습 로그 전량 유실 확인",
+      "resolution": "kca-paper-entry.timer 신규(15:34 KST, finalize-close 이후) + install_systemd.sh 등재 + After= 순서 명시, retrain.py main() 첫줄에 logging.basicConfig 추가",
+      "impact": "코드 sync 후 VPS에서 daemon-reload+enable --now 재실행 필요(수동, 별도 트래킹); 그 전까지 paper-entry는 여전히 미가동"
+    },
+    {
       "task_id": "TASK_20260913_TOPK_SCOREPROP_SHADOW",
       "date": "2026-09-13",
       "adr_id": "ADR_20260913_20260913_TOPK_SCOREPROP_SHADOW",
@@ -989,16 +999,6 @@
       "why": "The implemented weekday and order-flow feature candidate required a reproducible OOF comparison against base40 before promotion.",
       "resolution": "Ran identical 5-fold purge-1 scenario_action LightGBM Huber evaluations through 2025-12-30, recorded detailed metrics in docs/results/ml-v3.md, and retained production_calendar_flow as an explicit research candidate because primary returns and Sharpe did not improve.",
       "impact": "production_calendar_flow achieved 1.1097% Top-1 net return, 4.369 Sharpe, and 40.46% MDD versus base40 at 1.1393%, 4.473, and 40.23%; it is not promoted. Task and code-map registries are synchronized."
-    },
-    {
-      "task_id": "TASK_ML_V2_SCENARIO_ACTION_PANEL",
-      "date": "2026-08-05",
-      "adr_id": "ADR_20260805_ML_V2_SCENARIO_ACTION_PANEL",
-      "domain": "general",
-      "title": "ML v2 scenario action panel rerun",
-      "why": "동일 날짜·종목의 상따 및 다른 시나리오 중복을 임의 병합하지 않고, 최신 시나리오 행동 패널 구현의 ML 성능과 정책 결과를 2025년까지 재평가해야 했다.",
-      "resolution": "scenario_action 패널로 snapshot49 LightGBM Regressor를 5-fold purge1 OOF 재실행하고, 충돌 동일 행동키는 reject, 다중 시나리오는 exclude_multi_scenario로 보수적 종목 패널을 구성했다. 최신 결과를 docs/results/ml-v2.md에 기록했다.",
-      "impact": "2017–2025 OOF Top-1 +1.457%, Sharpe 5.67, MDD 40.72%를 확인했으며 날짜·종목 유일 정책에서도 +1.449%가 유지됐다. 2026년은 제외했고 실제 캡처 시각·독립 OOS·체결비용이 없어 실전 승격은 보류한다."
     }
   ]
 }
