@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_GROWTH_SHADOW_K2_TRAIL_GATE",
+      "date": "2026-09-13",
+      "adr_id": "ADR_20260913_GROWTH_SHADOW_K2_TRAIL_GATE",
+      "domain": "quant",
+      "title": "성장 섀도 원장(K2/추세게이트) 추가",
+      "why": "closing_strategy_matrix.md 감사 결과 118개 대안 전부 기준선 대비 비유의, 챔피언 수치는 하드코딩으로 무근거였음",
+      "resolution": "라이브 top-3 결정을 실현·재현하는 growth_shadow.py 추가: K3 본선/K2 섀도/trail120 인과게이트를 매일 야간 price_ingest 이후 원장에 기록(관찰전용, 주문 없음)",
+      "impact": "라이브 선정 로직 미변경; K2·게이트 승격 여부는 전방 원장 축적 후 별도 판단"
+    },
+    {
       "task_id": "vps_full_automation",
       "date": "2026-09-12",
       "adr_id": "ADR_20260912_vps_full_automation",
@@ -989,16 +999,6 @@
       "why": "시간/provenance 검증을 과도하게 적용해 15:20 스프레드시트 스냅샷 피처를 제외했고, 실제 후보 패널의 시나리오·보유 정책을 분리할 필요가 있었다.",
       "resolution": "base40/snapshot49/interaction53 feature-set을 추가하고 snapshot49 LGBMRegressor를 champion 경로로 연결했으며, return_model·종목코드 기반 policy simulator·내부 OOF 비교를 추가했다. 2017–2025 재학습에서 snapshot49가 base40보다 Top-1과 Sharpe를 개선했지만, 날짜-종목 중복으로 실제 보유 정책은 보류했다.",
       "impact": "내부 후보 패널만으로 모델 선별력을 비교할 수 있고 2026을 평가에서 제외한다. 실제 운용 전 216개 날짜-종목 중복의 시나리오 결합 규칙이 필요하다."
-    },
-    {
-      "task_id": "TASK_ML_STRATEGY_IMPROVEMENT",
-      "date": "2026-08-05",
-      "adr_id": "ADR_20260805_ML_STRATEGY_IMPROVEMENT",
-      "domain": "ml",
-      "title": "Point-in-Time ML Strategy Re-evaluation",
-      "why": "Re-evaluate the ML strategy through 2025 after correcting return units, baseline attribution, calibration, and timestamp-contract risks.",
-      "resolution": "Implemented decimal-net targets, causal feature manifest checks, chronological calibration diagnostics, retained selection-rank and Ridge baselines, fixed real-data NaN handling for Ridge, and reran OOF comparison through 2025; documented the result and deferred production promotion pending real capture timestamps.",
-      "impact": "2017-2025 OOF Regressor achieved +1.074% Top-1 net return and Sharpe 4.27 versus +0.479% and 2.10 for selection rank, but synthetic timestamps, 38.84% maximum drawdown, and 100% Top-1 turnover keep the research score at 60/100."
     }
   ]
 }
