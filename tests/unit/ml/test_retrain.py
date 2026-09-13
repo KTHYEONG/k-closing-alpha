@@ -294,29 +294,111 @@ def test_retrain_ranker_topk_research_passes_explicit_train_start(tmp_path, monk
 def test_retrain_train_ranker_bundle_dispatches(tmp_path, monkeypatch) -> None:
     import src.ml.retrain as mod
     from src.ml.retrain import main
+    from src.ml.retrain_gate import PromotionVerdict
 
     ph_path = tmp_path / "price_history.parquet"
     _price_history_file(ph_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
-    seen: dict[str, object] = {}
+    saved: list[str] = []
 
     def _fake_train(ph, market_dates, d_to_idx, **kwargs):
-        seen["rows"] = len(ph)
-        return {"feature_cols": ["f1"], "rank_model": object(), "quantile_models": {},
-                "calibrators": {}, "top_k": 3}
+        return {"feature_cols": ["f1"], "rank_model": object(), "quantile_models": {}, "calibrators": {}, "top_k": 3}
 
     def _fake_save(bundle, export_dir):
-        seen["export_dir"] = export_dir
-        seen["bundle_top_k"] = bundle["top_k"]
-        return str(tmp_path / "topk_ranker" / "sizing_pipeline_bundle.joblib")
+        saved.append(export_dir)
+        return f"{export_dir}/sizing_pipeline_bundle.joblib"
 
     monkeypatch.setattr(mod, "train_production_bundle", _fake_train)
     monkeypatch.setattr(mod, "save_production_bundle", _fake_save)
+    monkeypatch.setattr(mod, "load_current_bundle", lambda export_dir: None)
+    monkeypatch.setattr(mod, "build_gate_eval_frame", lambda ph, market_dates, d_to_idx: "eval-frame")
+    seen: dict = {}
 
+    def _approve(candidate, current, eval_frame):
+        seen["eval_frame"] = eval_frame
+        seen["current"] = current
+        return PromotionVerdict(promote=True, reasons=(), agreement=0.99)
+
+    monkeypatch.setattr(mod, "evaluate_retrain_promotion", _approve)
+
+    # When
     main(["--train-ranker-bundle", "--export-dir", str(tmp_path)])
 
-    assert seen["rows"] == 40
-    assert seen["bundle_top_k"] == 3
+    # Then
+    assert saved == [str(tmp_path / "topk_ranker")]
+    assert seen == {"eval_frame": "eval-frame", "current": None}
+
+
+def test_retrain_train_ranker_bundle_rejected_by_gate_keeps_live_bundle(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+    from src.ml.retrain_gate import PromotionVerdict
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    saved: list[str] = []
+
+    def _fake_train(ph, market_dates, d_to_idx, **kwargs):
+        return {"feature_cols": ["f1"], "rank_model": object(), "quantile_models": {}, "calibrators": {}, "top_k": 3}
+
+    def _fake_save(bundle, export_dir):
+        saved.append(export_dir)
+        return f"{export_dir}/sizing_pipeline_bundle.joblib"
+
+    monkeypatch.setattr(mod, "train_production_bundle", _fake_train)
+    monkeypatch.setattr(mod, "save_production_bundle", _fake_save)
+    monkeypatch.setattr(mod, "load_current_bundle", lambda export_dir: None)
+    monkeypatch.setattr(mod, "build_gate_eval_frame", lambda ph, market_dates, d_to_idx: "eval-frame")
+    monkeypatch.setattr(
+        mod,
+        "evaluate_retrain_promotion",
+        lambda candidate, current, eval_frame: PromotionVerdict(promote=False, reasons=("prediction agreement 0.810 below 0.950",), agreement=0.81),
+    )
+
+    # When / Then
+    with pytest.raises(RuntimeError, match="promotion gate rejected"):
+        main(["--train-ranker-bundle", "--export-dir", str(tmp_path)])
+
+    # And: 후보는 rejected 에만 저장되고 라이브 경로는 건드리지 않는다
+    assert saved == [str(tmp_path / "topk_ranker" / "rejected")]
+
+
+def test_retrain_skip_promotion_gate_publishes_without_evaluating(tmp_path, monkeypatch) -> None:
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+    from src.ml.retrain_gate import PromotionVerdict
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    saved: list[str] = []
+
+    def _fake_train(ph, market_dates, d_to_idx, **kwargs):
+        return {"feature_cols": ["f1"], "rank_model": object(), "quantile_models": {}, "calibrators": {}, "top_k": 3}
+
+    def _fake_save(bundle, export_dir):
+        saved.append(export_dir)
+        return f"{export_dir}/sizing_pipeline_bundle.joblib"
+
+    monkeypatch.setattr(mod, "train_production_bundle", _fake_train)
+    monkeypatch.setattr(mod, "save_production_bundle", _fake_save)
+    monkeypatch.setattr(mod, "load_current_bundle", lambda export_dir: None)
+    monkeypatch.setattr(mod, "build_gate_eval_frame", lambda ph, market_dates, d_to_idx: "eval-frame")
+
+    def _never(*args, **kwargs):
+        raise AssertionError("gate must not run with --skip-promotion-gate")
+
+    monkeypatch.setattr(mod, "evaluate_retrain_promotion", _never)
+    monkeypatch.setattr(mod, "build_gate_eval_frame", _never)
+
+    # When
+    main(["--train-ranker-bundle", "--skip-promotion-gate", "--export-dir", str(tmp_path)])
+
+    # Then
+    assert saved == [str(tmp_path / "topk_ranker")]
 
 
 def test_retrain_train_ranker_bundle_missing_price_history_raises(tmp_path, monkeypatch) -> None:

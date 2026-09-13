@@ -12,6 +12,7 @@ from src import settings
 from src.data.io_utils import atomic_write_parquet
 from src.data.panel_integrity import load_price_panel
 from src.ml.costaware_topk import report_to_frame, run_cost_aware_topk_backtest
+from src.ml.retrain_gate import build_gate_eval_frame, evaluate_retrain_promotion, load_current_bundle
 from src.ml.topk_ranker_research import (
     run_topk_ranker_backtest,
     save_production_bundle,
@@ -31,6 +32,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--oos-reserve-start", default=None)
     parser.add_argument("--universe-research", action="store_true", help="reconstruct full-market panels for a ScreenConfig family, train the ranker on each, print/save the model-free-vs-ranked-vs-CPCV comparison")
     parser.add_argument("--cost-aware-backtest", action="store_true", help="run the model-free COST_AWARE top-k regime-gated backtest against full price_history")
+    parser.add_argument("--skip-promotion-gate", action="store_true", help="publish the retrained bundle without the weekly promotion gate (use only after manually certifying a feature-contract change)")
     parser.add_argument("--train-ranker-bundle", action="store_true", help="train and persist the certified top-3 cost-aware production bundle (build_inline_bundle on the certification-regime population via train_production_bundle)")
     parser.add_argument("--ranker-topk-research", action="store_true", help="train the ranker on the wide screen pool, select top-k from the cost-capped pool, and score it against the model-free cost-sort control on the post-reform regime")
     parser.add_argument("--ranker-train-start", default=None, help="widen the ranker training window to this YYYY-MM-DD start; augments training only and never moves the certification boundary (default: the certification regime start)")
@@ -80,7 +82,22 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError(f"price_history not found: {settings.PRICE_HISTORY_PARQUET_PATH}")
         ph, market_dates, d_to_idx = load_and_prepare_price_history(settings.PRICE_HISTORY_PARQUET_PATH)
         bundle = train_production_bundle(ph, market_dates, d_to_idx)
-        path = save_production_bundle(bundle, export_dir=os.path.join(args.export_dir, "topk_ranker"))
+        live_dir = os.path.join(args.export_dir, "topk_ranker")
+        if not args.skip_promotion_gate:
+            verdict = evaluate_retrain_promotion(
+                bundle, load_current_bundle(live_dir), build_gate_eval_frame(ph, market_dates, d_to_idx)
+            )
+            logger.info(
+                "[EVAL] stage=retrain_promotion_gate promote=%s agreement=%s reasons=%s",
+                verdict.promote, verdict.agreement, list(verdict.reasons),
+            )
+            if not verdict.promote:
+                rejected_path = save_production_bundle(bundle, export_dir=os.path.join(live_dir, "rejected"))
+                raise RuntimeError(
+                    f"retrain promotion gate rejected the candidate (live bundle kept): {list(verdict.reasons)}; "
+                    f"candidate saved at {rejected_path}"
+                )
+        path = save_production_bundle(bundle, export_dir=live_dir)
         logger.info("[EVAL] stage=train_ranker_bundle path=%s top_k=%s train_start=%s", path, bundle.get("top_k"), bundle.get("train_start"))
         return
 
