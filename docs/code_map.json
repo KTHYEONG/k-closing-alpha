@@ -176,7 +176,10 @@
     ]
   },
   "src/daily/collect.py": {
-    "testing": "tests/unit/daily/test_collect.py"
+    "testing": [
+      "tests/unit/daily/test_collect.py",
+      "tests/integration/daily/test_collect_archive_flow.py"
+    ]
   },
   "src/daily/finalize_close.py": {
     "testing": "tests/unit/daily/test_finalize_close.py"
