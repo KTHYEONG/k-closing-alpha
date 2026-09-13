@@ -32,10 +32,10 @@ flowchart TD
     end
 
     subgraph Core [Core Pipeline]
-        E_COLLECT[15:20 실시간 수집<br/>collect.py]
-        E_PREDICT[15:21 Top-3 랭킹 추론<br/>predict.py]
-        E_FINALIZE[15:30 종가 확정 게이트<br/>finalize_close.py]
-        E_PAPER[가상 체결 & 청산<br/>paper_trade.py]
+        E_COLLECT["15:20 실시간 단면 수집<br/>(12bp 틱비용 & 커버리지 게이트)"]
+        E_PREDICT["15:21 Top-3 랭킹 추론<br/>(28 PIT 피처 & 5-Seed LGBM)"]
+        E_FINALIZE["15:30 종가 확정 게이트<br/>(시계/코드/체결가 3중 검증)"]
+        E_PAPER["가상 체결 & 익일 09:00 청산<br/>(실시간 체결틱 반영)"]
     end
 
     V_KW -->|200행 스캔| E_COLLECT
