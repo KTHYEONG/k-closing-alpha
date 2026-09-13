@@ -1,228 +1,206 @@
-# 📈 K-Closing Alpha (국내주식 종가매매 퀀트 시스템)
+# K-Closing Alpha
 
-> **국내 주식 시장의 종가 매매(Closing Alpha) 전략을 위한 ML 기반 머신러닝 / 자동화 퀀트 파이프라인**
-
-`K-Closing Alpha`는 한국 주식 시장(KOSPI / KOSDAQ)의 장 마감 직전(15:00~15:20) 조건검색 종목들을 수집하고, 머신러닝(ML) 랭킹 및 분류 모델을 통해 다음 날 오전에 청산하는 **단기 종가매매 전략**을 실행하는 퀀트 파이프라인 프로젝트입니다.
+> **국내 주식(KOSPI/KOSDAQ) 종가단일가(15:20~15:30) 실시간 수집 및 익일 시초가(09:00) 청산 Top-3 머신러닝 퀀트 시스템**
 
 ---
 
-## 📑 목차
-1. [프로젝트 개요](#1-프로젝트-개요)
-2. [전체 시스템 흐름 (Workflow)](#2-전체-시스템-흐름-workflow)
-3. [데이터 파이프라인 및 데이터셋](#3-데이터-파이프라인-및-데이터셋)
-4. [머신러닝(ML) 알고리즘 및 예측 모델](#4-머신러닝ml-알고리즘-및-예측-모델)
-5. [백테스트 및 OOF 평가 결과](#5-백테스트-및-oof-평가-결과)
-6. [디렉토리 구조 (Directory Structure)](#6-디렉토리-구조-directory-structure)
-7. [빠른 시작 (Quick Start)](#7-빠른-시작-quick-start)
+## 1. Project Overview
+
+`k-closing-alpha`는 장 마감 직전 10분의 제한된 시간 창(15:20~15:30) 내에서 당일 강세 후보 종목을 수집·가공하고, 비용 인식형(Cost-Aware) 머신러닝 리랭커를 통해 **당일 종가 매수 후 익일 시초가에 기계적 전량 청산하는 오버나잇 퀀트 트레이딩 파이프라인**입니다.
+
+* **핵심 문제**: 금융 시계열의 미래 정보 누출(Look-Ahead Bias)과 저가주 호가단위 스프레드(Tick Friction)로 인한 실전 수익성 붕괴 방어.
+* **주요 기능**: 전시장 등락률 스캔 $\rightarrow$ 15:20 호가/수급 캡처 $\rightarrow$ 28차원 PIT 피처 생성 $\rightarrow$ 5-Seed LightGBM 앙상블 추론 $\rightarrow$ 15:30 종가 확정 게이트 $\rightarrow$ 익일 청산 리허설 자동화.
+* **핵심 기술**: 4개 증권사 API 분산 라우팅, Combinatorial Purged CV(8,2), Fail-Closed 데이터 무결성 게이트, Parquet 데이터 레이크.
 
 ---
 
-## 1. 프로젝트 개요
+## 2. Why This Project / Problem
 
-* **전략 유형**: 국내 주식 장 마감 직전 매수 후 다음 날 익절/손절 청산하는 **오버나이트 단기 종가매매(Closing Price Trading)**
-* **투자 대상**: KOSPI / KOSDAQ 당일 강세 조건 검색 및 기술적/수급 조건 포착 종목
-* **핵심 목표**: 
-  - 수천 개 후보 종목 중 수익 가능성이 높은 상위 종목을 정밀 랭킹(`Decision Score`)하여 포트폴리오 선정
-  - 수급(기관/외인/프로그램), 시장 지수 변동성(KOSPI, KOSDAQ, V-KOSPI), 개별 주가 기술적 지표를 결합한 61개 고차원 피처 분석
-  - 한국투자증권(KIS) API와 Google Sheets 연동을 통한 실시간 매매 알고리즘 추론 및 데이터 동기화
+1. **Point-in-Time (PIT) 시점 정보 누출 (Look-Ahead Bias)**:
+   - 많은 전략이 15:30에 결정되는 최종 종가나 익일 시초가 갭을 사전에 알고 매수하는 환각 편향을 가집니다.
+   - 본 시스템은 15:20 시점에 관측 가능한 데이터만을 엄격히 분리하여 의사결정을 내립니다.
+2. **호가단위 마찰비용(Tick Cost Friction)에 의한 알파 잠식**:
+   - 국내 5,000원 미만 저가주는 1틱(호가 1칸)이 주가의 20~50bp에 달합니다.
+   - 왕복 2틱(40~100bp) 스프레드 크로싱과 법정 증권거래세(18~23bp)를 차감하면 명목 수익률이 높아도 실질 순손실로 전락합니다.
+3. **단일 증권사 API의 초당 요청 한도(Rate Limit) 병목**:
+   - 15:20~15:30의 10분 내에 전종목을 스캔하고 10단계 호가 및 수급을 조회해야 하므로, 단일 증권사(TPS 18건)로는 수집 지연 및 차단(HTTP 429)이 발생합니다.
 
 ---
 
-## 2. 전체 시스템 흐름 (Workflow)
+## 3. Key Features
+
+* **비용 인식형 유니버스 스크리닝 (`COST_AWARE_UNIVERSE`)**
+  - *구현:* 주가 구간별 1틱 비용이 12.0bp를 초과하는 종목 및 상한가 근접 종목(`chg_ratio >= 0.29`)을 추론 전 원천 배제.
+  - *효과:* 호가 스프레드에 의한 실전 수익성 훼손을 사전 차단하고 백테스트-실전 간 괴리 최소화.
+* **4개 증권사 OpenAPI 특화 분산 라우팅**
+  - *구현:* 키움(200행 고속 전시장 스캔) $\rightarrow$ KIS(15:20 10호가/잠정수급 캡처) $\rightarrow$ LS(단일 호출 500개 1분봉 아카이빙) $\rightarrow$ 토스(멀티 쿼트 폴백).
+  - *효과:* 15:20 의사결정 수집 시간을 6초 이내로 단축하여 API Rate Limit 병목 해결.
+* **3중 Fail-Closed 종가 확정 게이트**
+  - *구현:* 15:30:30 시계 체크 + 단일가 마감 코드('3') + 현재가/호가 체결가 일치 검증.
+  - *효과:* 불완전 체결 시점의 데이터 오염을 방지하고 `decision_close`(15:20)와 `close`(15:30)를 분리 관리.
+* **Combinatorial Purged Cross-Validation (CPCV 8,2) & 5-Seed 앙상블**
+  - *구현:* 8개 시계열 블록 중 2개 테스트 블록 조합으로 28개 무누출 OOF 경로를 평가하고, 5개 시드 LightGBM 앙상블 적용.
+  - *효과:* 시계열 자기상관성으로 인한 과적합을 차단하고 횡단면 상대 랭킹 안정성 확보.
+* **실시간 체결틱 기반 페이퍼 트레이딩 리허설**
+  - *구현:* 실주문 전송 없이 실시간 체결틱(WebSocket `H0STCNT0`)을 구독하여 시장가/목표가 가상 체결 및 원장 기록.
+  - *효과:* 무위험 환경에서 실시간 슬리피지 및 체결 엔진 안정성 리허설.
+
+---
+
+## 4. Architecture
 
 ```mermaid
 flowchart TD
-    A[15:00~15:20 KIS API / 조건검색 종목 포착] --> B[수급/가격/시장 데이터 실시간 집계]
-    B --> C[61개 파생 피처 실시간 산출]
-    C --> D[ML Inference Engine: LightGBM Reranker]
-    D --> E[Decision Score 산출 & Top-N 종목 선별]
-    E --> F[장 마감 직전 종가 매수 주문]
-    F --> G[다음 날 오전 익절/손절 청산 & 매매 로그 기록]
-    G --> H[Parquet Data Lake / GSheet Sync & ML 재학습 파이프라인]
+    subgraph Vendors [Multi-Broker Ingestion]
+        KW[키움증권 REST<br/>전시장 등락률 스캔]
+        KIS[한국투자증권 KIS<br/>15:20 10호가/잠정수급]
+        LS[LS증권 REST<br/>정규장 1분봉 아카이빙]
+    end
+
+    subgraph Pipeline [Decision Pipeline 15:20~15:30]
+        SCAN[1. Universe Scan<br/>2%~10% 상승 후보 추출]
+        COLLECT[2. Ingestion & Admission<br/>Tick <= 12bp & Coverage >= 99%]
+        PREDICT[3. Top-3 Ranking<br/>28 Features & 5-Seed LGBM]
+        FINALIZE[4. Close Finalize<br/>3중 Fail-Closed Gate]
+        PAPER[5. Paper Rehearsal<br/>15:30 진입 & 익일 09:00 청산]
+    end
+
+    subgraph Storage [Parquet Data Lake]
+        ARCH[(archive.parquet<br/>일일 스냅샷)]
+        PRICE[(price_history.parquet<br/>전종목 일별 패널)]
+        DEC[(topk_decisions.parquet<br/>추론 결정 감사로그)]
+    end
+
+    KW --> SCAN --> COLLECT
+    KIS --> COLLECT -->|Upsert| ARCH
+    ARCH & PRICE --> PREDICT -->|Top-3 확정| DEC
+    KIS --> FINALIZE -->|종가 확정| ARCH
+    FINALIZE -->|OnSuccess| PAPER
+    DEC --> PAPER
+    LS -.->|야간 적재| ARCH
 ```
 
-1. **데이터 수집 (`src/sync`, `src/api`)**:
-   - 장중 및 마감 전 KIS API를 통해 실시간 OHLCV, 수급(기관/외인 순매수, 프로그램 매수), 시장 지수(V-KOSPI/V-KOSDAQ 등) 수집.
-2. **피처 엔지니어링 (`src/processing`, `legacy/ml_research/features`)**:
-   - 종목별 기술적 지표, 상대강도, 시나리오 조건(상따, 120일선 돌파, 거래량 폭발 등) 61개 수치 피처 생성.
-3. **ML 추론 및 랭킹 (`src/serving/realtime`)**:
-   - 사전 학습된 LightGBM Reranker 모델이 당일 후보 종목의 `Decision Score`를 실시간으로 계산하여 상위 종목 선택 (`ml-single-stock-v1` 정책).
-4. **실전 매매 및 기록 (`src/daily`)**:
-   - 종가 매수 진행 후 익일 장초 청산. 모든 거래 이력 및 일별 피처는 Parquet 기반 Data Lake에 저장 및 GSheet에 동기화.
+---
+
+## 5. End-to-End Flow
+
+| 단계 | 시각 (KST) | 처리 내용 | 주요 모듈 |
+| :--- | :---: | :--- | :--- |
+| **1. 후보 스캔** | `15:20:00` | 키움 REST API로 당일 2%~10% 등락률 전시장 종목 스캔 (0.2초) | `src/daily/universe_scan.py` |
+| **2. 단면 캡처** | `15:20:10` | KIS 현재가·10호가·잠정수급 수집, 12bp 틱비용 필터, 정상률 99% 검증 | `src/daily/collect.py` |
+| **3. 랭킹 추론** | `15:21:00` | 28차원 PIT 피처 산출 및 5-Seed LightGBM 앙상블로 Top-3 등가중 선정 | `src/daily/predict.py` |
+| **4. 종가 확정** | `15:30:30` | 15:30 장마감 단일가 3중 게이트 검증 후 아카이브 인플레이스 갱신 | `src/daily/finalize_close.py` |
+| **5. 가상 진입** | `15:30:35` | 종가 확정 즉시 트리거되어 자본 비중 할당 및 가상 체결 기록 | `src/daily/paper_trade.py` |
+| **6. 기계적 청산** | 익일 `09:00:00` | 사후 갭 필터 없이 익일 시초가에 전량 기계적 청산 및 손익 반영 | `src/daily/paper_trade.py` |
 
 ---
 
-## 3. 데이터 파이프라인 및 데이터셋
-
-| 데이터 분류 | 저장 경로 / 데이터셋 | 주요 정보 |
-|---|---|---|
-| **매매 로그 (Trade Log)** | `data/parquet/trade_log.parquet` | 2016-01-04 ~ 2026-08-03 (33,934행, 2,488개 종목) |
-| **가격 이력 (Price History)** | `data/history/price_history.parquet` | 전 종목 일별 OHLCV, 시가총액, 거래대금 |
-| **테마 데이터 (Theme Info)** | `data/parquet/theme.parquet` | 당일 주도 테마 및 주도주 조인 피처 |
-
-### 주요 피처 셋 (`close_morning61`)
-총 **61개 수치형 피처**를 사용하며, 크게 4가지 영역으로 구성됩니다:
-1. **가격 & 거래량 지표**: `change_rate`, `turnover`, `body_ratio`, `upper_shadow_ratio`, `intraday_range`, `gap_ratio` 등
-2. **수급 지표**: `inst_net_buy`, `foreign_net_buy`, `prog_net_buy`, `inst_density`, `foreign_density`, `major_density`, `prog_dominance` 등
-3. **시장 & 지수 지표**: `kospi_change`, `kosdaq_change`, `v_kospi`, `v_kosdaq`, `sector_relative_change` 등
-4. **시나리오 패턴 지표**: `scenario_is_sangtta`, `scenario_is_120_breakout`, `scenario_is_volume_surge`, `scenario_is_new_high` 등
-
----
-
-## 4. 머신러닝(ML) 알고리즘 및 예측 모델
-
-* **주요 알고리즘**: **LightGBM (Gradient Boosting Decision Tree)** 기반 Reranker 및 Quantile Regressor
-* **교차 검증 (Cross-Validation)**: **Purged Time-Series Group K-Fold (`n_splits=5`, `purge_gap=1`)**
-  - 타임시리즈 정합성을 유지하고, 거래 간 중첩으로 인한 오버피팅/시합 편향을 방지하기 위한 Purged OOF 적용
-* **라벨ing 및 손실 함수**:
-  - 왕복 거래비용(수수료+슬리피지 0.20%) 차감 후 순수익률(`decimal_net`) 기준
-  - `target_good` (+1% 이상) / `target_bad` (-2% 이하) 임계값 기반의 복합 랭킹 알고리즘
-
-### 4.1. 스코어(Score) 및 매매 결정(Decision) 산출 로직
-
-1. **`Decision Score` 계산**:
-   - `decision_score = rank_weight * Rank_Score + p_good_weight * P_Good_Score` (기본 설정: `rank_weight=1.0`, `p_good_weight=0.5`)
-2. **`Decision` 결정 및 정책 사유 (`SingleStockPolicy`)**:
-   - **`BUY` (매수)**: `always_buy_top1` 정책에 의해 당일 Score 1위 종목을 매수 결정. (`reason: top1_buy`)
-   - **`ABSTAIN` (관망)**: `margin_quantile` 정책 적용 시 top1 마진이 임계값 미달이거나, 유효한 정책 미발행 또는 당일 유니버스 미달 시 매수 보류. (`reason: below_margin_threshold`, `missing_validated_policy` 등)
-
-### 4.2. 포지션 비중 조절 로직 (Position Sizing)
-
-선정된 매수 종목에 대하여 자본 위험을 관리하기 위해 **동적 비중 조절(Dynamic Risk-Adjusted Position Sizing)**을 수행합니다:
-
-$$\text{Position}_i = \text{BaseBudget} \times \text{GradeMultiplier}_i \times \left(\frac{\text{TargetVol}}{\sigma_i}\right) \times \text{UtilityScaling}_i$$
-
-* **유틸리티 스코어 (`utility_score`)**: 순 기대수익(`q50`) 및 하방 리스크/불확실성 반영
-* **하이브리드 등급 (`GradeMultiplier`)**:
-  - 🟢 <span style="color:#2e7d32; font-weight:bold;">Strong</span> (`Multiplier: 1.0`): 상위 10% 이내 & $Utility \ge 0.0030$ & $q50 > 0$
-  - 🟡 <span style="color:#f57f17; font-weight:bold;">Good</span> (`Multiplier: 0.75`): 상위 25% 이내 & $Utility \ge 0.0010$ & $q50 > 0$
-  - 🟠 <span style="color:#e65100; font-weight:bold;">Weak</span> (`Multiplier: 0.5`): 상위 50% 이내 & $Utility \ge 0.0010$ & $q50 > 0$
-  - 🔴 <span style="color:#c62828; font-weight:bold;">Pass</span> (`Multiplier: 0.0`): 미달 종목 또는 관망 (`ABSTAIN`)
-* **위험 한도 (Risk Limits)**: 개별 종목 최대 비중 25% 제한 (`max_position_pct=0.25`), 전체 종목 총 비중 100% 한도 적용. 불리한 시장 국면(평균 Utility < 0) 시 전체 한도 자동 축소.
-
-### 4.3. 터미널 추론 & 매매 결정 출력 예시 (Colorized Example)
-
-추론 파이프라인(`src.daily.predict`) 실행 시 터미널 및 로그에 출력되는 터미널 ANSI 색상 적용 예시입니다:
-
-```text
-=== Daily Closing Alpha Prediction ===
------------------------------------------------------------------------------------------
-|  Rank  |    Stock Name    |   Rate   |      Scenario      |   Score  |   Decision   |
------------------------------------------------------------------------------------------
-|   1    | 삼성전자         |  +2.35%  | volume_surge       |  0.8421  |   [ BUY ]    |  (Reason: top1_buy | Grade: Strong)
------------------------------------------------------------------------------------------
-|   2    | SK하이닉스       |  +1.12%  | new_high           |  0.7105  |  [ABSTAIN]   |  (Reason: top1_only_policy | Grade: Pass)
-|   3    | 현대차           |  -0.45%  | 120_breakout       |  0.5420  |  [ABSTAIN]   |  (Reason: below_threshold | Grade: Pass)
------------------------------------------------------------------------------------------
-> Decision: BUY | Reason: top1_buy | Stock: 005930 | Score: 0.8421 | Allocated Weight: 25.00%
-```
-
-| Decision 색상 구분 | 상태 | 설명 | 대표 사유 (Reason) |
-|---|---|---|---|
-| 🟢 **`BUY`** | 매수 | 매수 실행 대상 종목 | `top1_buy`, `top1_buy_margin` |
-| 🔴 **`ABSTAIN`** | 관망 | 매수 보류 / 관망 대상 종목 | `below_margin_threshold`, `no_executable_candidate`, `missing_validated_policy` |
-
-
-
----
-
-## 5. 백테스트 및 OOF 평가 결과
-
-`legacy/ml_research/training/retrain_bundle.py`를 통해 2016년~2026년 10개년 데이터(33,934건) 기반으로 평가된 OOF(Out-of-Fold) 정책 수행 결과입니다.
-
-| 평가 지표 (OOF Policy Metrics) | 성과 측정 값 |
-|---|---:|
-| **총 스케줄 일수** | 2,155 일 |
-| **매수 실행 결정 비율 (Active Trade Rate)** | **88.31%** (1,903회 매수 / 252회 관망) |
-| **스케줄 기준 평균 수익률 (Daily Return)** | **1.1934%** |
-| **스케줄 기준 승률 (Daily Win Rate)** | **54.15%** |
-| **활성 거래 평균 수익률 (Active Trade Return)** | **1.3514%** |
-| **활성 거래 승률 (Active Trade Win Rate)** | **61.32%** |
-| **Profit Factor** | **2.2981** |
-| **스케줄 기준 Sharpe Ratio** | **4.7608** |
-
-*(※ 위 성과 지표는 거래비용 0.20%가 반영된 순수익 기준 OOF 검증 결과입니다.)*
-
----
-
-## 6. 디렉토리 구조 (Directory Structure)
+## 6. Repository Structure
 
 ```text
 k-closing-alpha/
-├── src/                      # 실전 운영 파이프라인 패키지
-│   ├── api/                  # 한국투자증권(KIS) API 클라이언트 & Rate Limiter
-│   ├── config/               # Pydantic 기반 환경설정 (KIS, Trading, GSheet)
-│   ├── daily/                # 일별 데이터 수집, 예측, 아카이브 스케줄러
-│   ├── data/                 # Parquet / Google Sheets 데이터 로더
-│   ├── processing/           # 스케일 보정 및 데이터 전처리 스키마
-│   ├── serving/realtime/     # 실시간 ML 추론 엔진 & 매매 정책 파이프라인
-│   └── sync/                 # 수급(기관/외인/프로그램) & 시장 지수 동기화
-├── legacy/ml_research/       # ML 모델 연구, 피처 생성, Purged CV 및 백테스팅
-├── data/                     # Data Lake (Parquet 및 수집 데이터 저장소)
-├── artifacts/models/         # 학습된 Sizing & Reranker ML 모델 번들 (.joblib)
-├── docs/                     # 시스템 문서, 코드 맵, 연구 결과 리포트
-├── tests/                    # Unit / Integration 테스트 모듈 (Pytest)
-├── pyproject.toml            # 프로젝트 의존성 및 Ruff / Mypy / Pytest 설정
-└── README.md                 # 프로젝트 통합 설명서
+├── src/
+│   ├── daily/                # 일별 자동화 파이프라인 (스캔, 수집, 추론, 종가확정, 페이퍼매매)
+│   ├── ml/                   # 머신러닝 리서치 (CPCV 8,2, 리랭커, 피처엔지니어링, 재학습 CLI)
+│   ├── serving/realtime/     # 실시간 서빙 피처 변환 및 모델 번들 로더
+│   ├── strategy/             # 유니버스 스크린 및 전략 불변 계약 (COST_AWARE_UNIVERSE)
+│   ├── execution/            # 실측 법정세율 스케줄, 호가단위 틱비용 모델, 페이퍼 브로커
+│   ├── data/                 # Parquet 코덱, 패널 정합성 복구, 일중 분봉/호가 스토어
+│   ├── api/                  # 증권사 4사(KIS, Kiwoom, Toss, LS) OpenAPI 클라이언트
+│   └── tools/                # 시스템 감사(daily_audit), 웹훅 실패 알림(alerts)
+├── artifacts/models/         # 학습된 5-Seed ML 모델 번들 및 CPCV 검증 리포트
+├── data/history/             # Parquet 데이터 레이크 (수정주가, 일일 스냅샷, 분봉/틱)
+├── deploy/systemd/           # 무중단 스케줄링 systemd 서비스 및 타이머 유닛
+├── docs/architecture/        # 아키텍처 개요, 데이터 흐름, 컴포넌트, ADR 문서
+│   └── data/                 # 증권사 OpenAPI 상세 규격서 모음
+└── tests/                    # 1,061개 단위/통합 테스트 스위트 (100% Pass)
 ```
 
 ---
 
-## 7. 빠른 시작 (Quick Start)
+## 7. Technical Decisions
 
-### 1) 환경 설정 (`uv` 패키지 매니저 사용)
-본 프로젝트는 Python 3.11+ 환경 및 `uv` 매니저를 기반으로 작동합니다.
+| 결정 사항 | 선택 이유 (Why) | 트레이드오프 (Trade-off) |
+| :--- | :--- | :--- |
+| **Parquet 컬럼형 스토리지** | 10년 치 전종목 패널에서 15:20 시점 28개 롤링 피처를 1초 내 계산하기 위한 제로카피 I/O | 단일 행 실시간 업데이트 불가 $\rightarrow$ 임시 파일 원자적 교체(`atomic_write_parquet`)로 해결 |
+| **증권사 4사 분산 라우팅** | 단일 증권사의 초당 요청 한도(TPS 18)와 15:20 결정창(10분) 병목 해소 | 증권사별 상이한 인증 규약 및 응답 데이터 정규화 레이어 유지보수 비용 |
+| **12.0bp 틱비용 상한 필터** | 1호가당 20~50bp를 지불해야 하는 저가 동전주 알파 잠식 차단 | 변동성이 큰 저가 테마주 일부 탈락 (단, 포트폴리오 MDD와 실현가능성 대폭 개선) |
+| **CPCV(8,2) & 5-Seed 앙상블** | 시계열 자기상관성 과적합을 방지하고 당일 후보군 내 상대적 랭킹 우위 극대화 | 5개 모델 유지로 추론 시간 소폭 증가 (0.2초 $\rightarrow$ 1.1초, 허용 한도 내) |
+
+---
+
+## 8. Validation & Reliability
+
+* **엄격한 시간 분할**: 
+  - 학습/검증: 2016-01-04 ~ 2026-09-09
+  - 인증(Certification): 2023-01-25(KRX 호가단위 개편일) ~ 2026-09-09 (885 거래일)
+* **Point-in-Time 원칙**: 15:20 의사결정 시점에는 [t-w, t-1] 롤링 창 및 당일 15:20 잠정 수급만 사용하며 미래 데이터 참조 0건.
+* **실측 마찰비용 차단**: 법정 증권거래세(18~23bp) + 보수적 왕복 2.0틱 스프레드 + 위탁수수료 전액 차감.
+* **Fail-Closed 안전장치**: 장 시간 외/휴장일 실행 차단, 단면 수집 정상률 99% 미달 시 저장 거부, 3중 종가 확정 게이트.
+* **테스트 신뢰성**: 1,061개 Unit/Integration 테스트 100% 통과 (`uv run pytest`).
+
+---
+
+## 9. Empirical Results
+
+KRX 호가단위 개편 이후 인증 구간(2023-01-25 ~ 2026-09-09, 885 거래일) 실측 성과:
+
+### 1) 프로덕션 Top-3 랭커 성과 (비용 전액 차감 후 순수익 기준)
+
+| 평가 지표 (Metric) | 실측 측정값 (Measured Value) |
+| :--- | :---: |
+| **검증 기간 (Trading Days)** | **885 일** |
+| **전략 실행 가능일 비율 (Feasibility)** | **99.89%** (884일 진입 / 1일 관망) |
+| **일평균 순수익률 (Mean Net Return)** | **+46.08 bp / 일** (중앙값: **+36.94 bp**) |
+| **일별 승률 (Daily Win Rate)** | **58.98%** (522승 362패) |
+| **연환산 샤프 지수 (Sharpe Ratio)** | **3.48** (t-statistic: **6.53**) |
+| **비용정렬 기준선 대비 우위 (vs Cost-Sort)** | **28 / 28 경로 승리 (100%)**, 평균 초과 알파 **+25.39 bp** ($p=0.000214$) |
+
+### 2) 연도별 안정성 및 비용 스트레스 테스트
+
+| 연도 | 거래일수 | 일평균 순수익 | Sharpe | | 스프레드 시나리오 | 일평균 순수익 | t-stat | 결과 |
+| :---: | :---: | :---: | :---: |---| :--- | :---: | :---: | :---: |
+| **2023** | 230 일 | +34.33 bp | 3.12 | | **기준선 (왕복 2.0틱)** | **+46.08 bp** | **6.53** | **PASS** |
+| **2024** | 244 일 | +28.57 bp | 2.51 | | **1.5배 마찰 (왕복 3.0틱)** | **+38.03 bp** | **5.38** | **PASS** |
+| **2025** | 242 일 | +65.71 bp | 5.30 | | **2.0배 극단 (왕복 4.0틱)** | **+29.98 bp** | **4.24** | **PASS** |
+| **2026** | 169 일 | +59.24 bp | 3.20 | | *(극심한 유동성 경색 시에도 통계적으로 유의한 순알파 유지)* | | | |
+
+---
+
+## 10. Getting Started
 
 ```bash
-# 의존성 설치
+# 1. 의존성 설치
 uv sync
-```
 
-### 2) 테스트 코드 실행
-```bash
-# 전체 unit / integration 테스트 수행
+# 2. 전체 1,061개 테스트 수행
 uv run pytest
 
-# 코드 스타일 및 타입 검사
-uv run ruff check .
-uv run mypy .
-```
+# 3. 실시간 파이프라인 수동 실행
+uv run python -m src.daily.collect         # 15:20 단면 수집
+uv run python -m src.daily.predict         # 15:21 Top-3 랭커 추론
+uv run python -m src.daily.finalize_close  # 15:30 종가 확정
+uv run python -m src.daily.paper_trade --phase entry # 15:30 페이퍼 진입
+uv run python -m src.daily.paper_trade --phase exit  # 익일 09:00 페이퍼 청산
 
-### 3) 일별 추론 파이프라인 실행
-```bash
-# 장 마감 직전 추론 수행 (Top 종목 추출)
-uv run python -m src.daily.predict
-
-# 저녁 1회 실행(20:00 이후 권장): 당일 워치리스트 정규세션+NXT 애프터마켓 1분봉 아카이브
-# src.daily.archive_intraday
-uv run python -m src.daily.archive_intraday
-
-# 페이퍼 트레이딩 (실주문 없음, 실시간 체결틱으로 실행경로 리허설)
-# src.daily.paper_trade
-uv run python -m src.daily.paper_trade --phase entry
-uv run python -m src.daily.paper_trade --phase exit
-
-# 부팅 시 1회 실행: 당일 결손 가시화 감사
-# src.tools.daily_audit
-uv run python -m src.tools.daily_audit
-
-# systemd 타이머 설치 (WSL 부팅 자동기동, Asia/Seoul 기준)
+# 4. systemd 타이머 자동화 설치 (Linux/WSL)
 bash deploy/install_systemd.sh
 ```
 
-# 1회성 소급 백필: condition_history 워치리스트 대상 일별분봉(FHKST03010230) 백필
-# src.backfill.intraday.backfill_minute_history
-uv run python -m src.backfill.intraday.backfill_minute_history
-# 1회성 소급 백필: 2022-09~2025-09 KIS 보존기간 밖 정규세션 1분봉(Toss candles, 청산일 갭 복구)
-# src.backfill.intraday.backfill_minute_history_toss
-uv run python -m src.backfill.intraday.backfill_minute_history_toss
-```
+---
 
-### 4) ML 연구 및 번들 재학습
-```bash
-# Purged CV 기반 번들 학습 및 평가
-uv run python -c "from legacy.ml_research.training.retrain_bundle import train_and_save_real_model_bundle; train_and_save_real_model_bundle()"
-```
+## 11. Documentation
+
+* [System Architecture Overview](file:///home/kth/k-closing-alpha/docs/architecture/overview.md) — 시스템 경계 및 브로커 쿼터 매트릭스
+* [Data Flow & Invariants](file:///home/kth/k-closing-alpha/docs/architecture/data-flow.md) — 듀얼 타임스탬프 규약 및 5대 Fail-Closed 게이트
+* [Component Architecture](file:///home/kth/k-closing-alpha/docs/architecture/components.md) — 모듈별 책임 및 I/O 계약
+* [Architecture Decision Records (ADRs)](file:///home/kth/k-closing-alpha/docs/architecture/design-decisions.md) — 5대 기술적 의사결정 Rationale & Trade-offs
+* [Broker OpenAPI Specifications](file:///home/kth/k-closing-alpha/docs/architecture/data/api_master.md) — 증권사 4사 API 세부 규격서
 
 ---
-*Created & Maintained by K-Closing Alpha Team*
+
+## 12. Limitations
+
+1. **실주문 OMS 미연동 (Paper Rehearsal 한정)**: 현재 파이프라인은 가상 체결 원장 기반 리허설로 운영되며, 실계좌 자금 집행을 위해서는 추가 주문 승인 게이트 및 킬스위치가 필요합니다.
+2. **익일 장중 동적 청산 미지원**: 오버나잇 갭에만 집중하므로 익일 09:00 이후 발생하는 장중 급등락에 대한 트레일링 스탑은 수행하지 않습니다.
+3. **유동성 용량 한계 (Capacity Ceiling)**: Top-3 종목 집중 전략 특성상 운용 자산(AUM) 규모가 수십억 원 이상으로 커질 경우 시장 충격 비용이 증가할 수 있습니다.
