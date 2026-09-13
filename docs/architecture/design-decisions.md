@@ -5,6 +5,20 @@
 
 ---
 
+## 1. Executive Decision Matrix
+
+| ADR | 의사결정 주제 | 기각된 대안 | 채택된 솔루션 | 핵심 엔지니어링 근거 및 트레이드오프 |
+| :--- | :--- | :--- | :--- | :--- |
+| **ADR-001** | **데이터 저장소** | • RDBMS (PostgreSQL)<br>• SQLite 파일 DB | **Parquet 컬럼형 스토리지 & 원자적 교체** | 10년치 패널 제로카피 로딩(피처 슬라이싱 < 1.0s). 단일 행 업데이트 불가 트레이드오프 수용 |
+| **ADR-002** | **브로커 라우팅** | • KIS 단일 브로커 의존<br>• 유료 전용선 피드 | **증권사 4사 특화 분산 라우팅** | 키움(스캔) + KIS(10호가/수급) + LS(1분봉) + 토스(백업) 조합으로 10분 결정창 병목 해소 |
+| **ADR-003** | **의사결정 타이밍** | • 장마감 후 시간외 단일가<br>• 장중 가변 익절/손절 | **15:20 PIT 결정 & 익일 09:00 기계적 청산** | Look-Ahead 편향 0% 차단 및 장중 리스크 노출 시간 0분으로 단축하여 Sharpe 극대화 |
+| **ADR-004** | **마찰비용 제어** | • 비용 비인식형 랭킹<br>• 고정 주가 하한선 | **12.0bp 틱비용 상한 필터** | 1틱당 20~50bp를 지불하는 저가주 알파 잠식 차단. Sharpe +0.84 및 실현가능성 확보 |
+| **ADR-005** | **ML 검증 전략** | • 단순 K-Fold<br>• TimeSeriesSplit | **Combinatorial Purged CV(8,2) & 5-Seed 앙상블** | 28개 무누출 OOF 경로 평가 및 `date_demeaned` 타깃 횡단면 상대 랭킹 학습으로 과적합 방어 |
+
+---
+
+## 2. Detailed Architecture Decision Records
+
 ## ADR-001: Parquet 컬럼형 스토리지 vs RDBMS
 
 * **Decision**: RDBMS나 SQLite 대신 Apache Parquet 기반 컬럼형 파일 저장소와 원자적 파일 교체(`atomic_write_parquet`)를 채택한다.
