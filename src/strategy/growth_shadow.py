@@ -3,7 +3,10 @@
 The shadow is observe-only: it replays persisted top-3 decisions against the
 ingested price history and records what a smaller (K=2) basket and a
 trailing-120-day gated variant would have earned. Live selection is untouched
-and no orders are ever placed.
+and no orders are ever placed. A third arm replays the same top-3 basket with
+score-proportional weights (SCORE_PROP_GAMMA) instead of an equal-weight
+rebalance; gamma is pre-registered as a single value to avoid re-introducing
+a multiple-testing selection bias.
 """
 
 from __future__ import annotations
@@ -24,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 SHADOW_K2_TOP_K: int = 2
 TRAIL_GATE_WINDOW_DAYS: int = 120
+SCORE_PROP_GAMMA: float = 1.0
+SCORE_PROP_EPSILON: float = 1e-3
 STATUS_REALIZED: str = "REALIZED"
 STATUS_PENDING: str = "PENDING"
 STATUS_EXIT_UNAVAILABLE: str = "EXIT_UNAVAILABLE"
@@ -33,6 +38,7 @@ LEDGER_COLUMNS: tuple[str, ...] = (
     "n_picks",
     "arm_k3_net",
     "arm_k2_net",
+    "arm_k3_scoreprop_net",
     "trail_mean_k3",
     "trail_gate_open",
     "arm_k3_trail_net",
@@ -130,6 +136,50 @@ def realize_decision_returns(decisions: pd.DataFrame, price_history: pd.DataFram
     )
 
 
+def compute_score_proportional_weights(pred: pd.Series, decision_date: pd.Series, *, gamma: float = SCORE_PROP_GAMMA, epsilon: float = SCORE_PROP_EPSILON) -> np.ndarray:
+    """Within-day range-normalized score-proportional weights over pred.
+
+    Weight_i = ((pred_i - day_min) / day_range) ** gamma + epsilon, renormalized
+    to sum to 1 within each decision_date group. A date whose picks share one
+    pred value (day_range == 0) falls back to a uniform 1/n weight instead of
+    dividing by zero, so a degenerate or tied top-k never produces an undefined
+    weight.
+
+    Args:
+        pred: Per-pick decision-time prediction score, one row per pick.
+        decision_date: Per-pick decision-date grouping key, same length as pred.
+        gamma: Concentration exponent; 1.0 is the pre-registered probe arm.
+        epsilon: Positive floor keeping every within-day weight in (0, 1].
+
+    Returns:
+        Weight array aligned with pred's positional order, summing to 1.0
+        within each decision_date group.
+
+    Raises:
+        ValueError: When pred and decision_date lengths differ, pred holds a
+            non-finite value, or epsilon is not strictly positive.
+    """
+    if len(pred) != len(decision_date):
+        raise ValueError(f"compute_score_proportional_weights length mismatch: len(pred)={len(pred)} len(decision_date)={len(decision_date)}")
+    if epsilon <= 0.0:
+        raise ValueError(f"compute_score_proportional_weights epsilon must be strictly positive, got {epsilon}")
+    pred = pd.Series(np.asarray(pred, dtype=np.float64))
+    group_key = np.asarray(decision_date)
+    pred_values = pred.to_numpy(dtype=np.float64)
+    non_finite = int(np.sum(~np.isfinite(pred_values)))
+    if non_finite:
+        raise ValueError(f"compute_score_proportional_weights pred must be finite, found {non_finite} non-finite values")
+    lo = pred.groupby(group_key).transform("min")
+    hi = pred.groupby(group_key).transform("max")
+    rng = hi - lo
+    rng_for_div = rng.mask(rng <= 0.0, np.nan)
+    raw = ((pred - lo) / rng_for_div) ** float(gamma) + float(epsilon)
+    raw = raw.fillna(1.0)
+    total = raw.groupby(group_key).transform("sum")
+    weights: np.ndarray = (raw / total).to_numpy(dtype=np.float64)
+    return weights
+
+
 def build_shadow_ledger(realized: pd.DataFrame) -> pd.DataFrame:
     """Aggregate realized picks into the daily K3/K2/trailing-gate ledger.
 
@@ -170,12 +220,16 @@ def build_shadow_ledger(realized: pd.DataFrame) -> pd.DataFrame:
         .reindex(k3_net.index)
     )
     arms_ok = all_realized.to_numpy(dtype=bool)
+    scoreprop_weights = compute_score_proportional_weights(settled["pred"], settled["decision_date"])
+    weighted_net = scoreprop_weights * settled["net_return"].to_numpy(dtype=np.float64)
+    scoreprop_net = pd.Series(weighted_net, index=settled.index).groupby(settled["decision_date"], sort=True).sum().reindex(k3_net.index)
     ledger = pd.DataFrame(
         {
             "decision_date": k3_net.index.to_numpy(),
             "n_picks": counts.reindex(k3_net.index).to_numpy(dtype="int64"),
             "arm_k3_net": np.where(arms_ok, k3_net.to_numpy(dtype=np.float64), np.nan),
             "arm_k2_net": np.where(arms_ok, k2_net.to_numpy(dtype=np.float64), np.nan),
+            "arm_k3_scoreprop_net": np.where(arms_ok, scoreprop_net.to_numpy(dtype=np.float64), np.nan),
         }
     )
     # 인과적 게이트: D-1 결정분은 D 09:00에 끝나므로 shift(1)만 당일 결정에 사용 가능
@@ -219,22 +273,24 @@ def run_growth_shadow(
     # 매일 전체 재계산: 야간 배치는 작아 청크 없이 전량 처리
     ledger = build_shadow_ledger(realize_decision_returns(decisions, price_history))
     atomic_write_parquet(ledger, dest)
-    arms = {c: ledger[c].to_numpy(dtype=np.float64) for c in ("arm_k3_net", "arm_k2_net", "arm_k3_trail_net")}
+    arms = {c: ledger[c].to_numpy(dtype=np.float64) for c in ("arm_k3_net", "arm_k2_net", "arm_k3_scoreprop_net", "arm_k3_trail_net")}
     # 유한 행 평균, 없으면 nan (빈 원장에서도 경고 없이 nan)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         k3_mean_bp = float(np.nanmean(arms["arm_k3_net"]) * 10000.0)
         k2_mean_bp = float(np.nanmean(arms["arm_k2_net"]) * 10000.0)
+        k3_scoreprop_mean_bp = float(np.nanmean(arms["arm_k3_scoreprop_net"]) * 10000.0)
         k3_trail_mean_bp = float(np.nanmean(arms["arm_k3_trail_net"]) * 10000.0)
         gate_open_share = float(np.nanmean(ledger["trail_gate_open"].to_numpy(dtype=bool).astype(np.float64)))
     realized_days = int(np.isfinite(arms["arm_k3_net"]).sum())
     logger.info(
         "[PORTFOLIO] stage=growth_shadow rows=%d realized_days=%d k3_mean_bp=%.2f "
-        "k2_mean_bp=%.2f k3_trail_mean_bp=%.2f gate_open_share=%.3f",
+        "k2_mean_bp=%.2f k3_scoreprop_mean_bp=%.2f k3_trail_mean_bp=%.2f gate_open_share=%.3f",
         len(ledger),
         realized_days,
         k3_mean_bp,
         k2_mean_bp,
+        k3_scoreprop_mean_bp,
         k3_trail_mean_bp,
         gate_open_share,
     )
