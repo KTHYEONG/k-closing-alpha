@@ -480,3 +480,66 @@ def test_unit_sniffing_heuristic_is_absent_from_the_repository() -> None:
     assert not Path("src/ml/forward_path.py").exists()
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("src.ml.forward_path")
+
+
+def test_compute_latest_market_breadth_computes_net_ratio_from_latest_prior_date() -> None:
+    import pandas as pd
+
+    from src.data.panel_integrity import compute_latest_market_breadth
+
+    panel = pd.DataFrame({
+        "date": pd.to_datetime([
+            "2026-09-10", "2026-09-10", "2026-09-10", "2026-09-10",
+            "2026-09-11", "2026-09-11",
+        ]),
+        "symbol": ["000001", "000002", "000003", "000004", "000001", "000002"],
+        "daily_change_pct": [1.0, -2.0, 3.0, 0.0, 5.0, 5.0],
+    })
+
+    # When: as_of_date is 2026-09-12, so 09-11 (the latest date strictly before it) is used, not 09-10
+    out = compute_latest_market_breadth(panel, "2026-09-12")
+
+    # Then: on 09-11 both rows are advancing -> (2-0)/2 = 1.0
+    assert out == 1.0
+
+
+def test_compute_latest_market_breadth_pit_excludes_same_day_and_future() -> None:
+    import pandas as pd
+
+    from src.data.panel_integrity import compute_latest_market_breadth
+
+    panel = pd.DataFrame({
+        "date": pd.to_datetime(["2026-09-11", "2026-09-12", "2026-09-13"]),
+        "symbol": ["000001", "000001", "000001"],
+        # same-day/future rows are all-declining; if leaked in, the sign would flip
+        "daily_change_pct": [2.0, -9.0, -9.0],
+    })
+
+    out = compute_latest_market_breadth(panel, "2026-09-12")
+
+    # Then: only 09-11 (strictly before as_of_date) is used -> single advancing row -> 1.0
+    assert out == 1.0
+
+
+def test_compute_latest_market_breadth_returns_nan_when_no_prior_data_or_all_flat() -> None:
+    import math
+
+    import pandas as pd
+
+    from src.data.panel_integrity import compute_latest_market_breadth
+
+    # Given: no rows before as_of_date at all
+    empty_prior = pd.DataFrame({
+        "date": pd.to_datetime(["2026-09-13"]),
+        "symbol": ["000001"],
+        "daily_change_pct": [1.0],
+    })
+    assert math.isnan(compute_latest_market_breadth(empty_prior, "2026-09-12"))
+
+    # Given: the latest prior date has every stock exactly flat (adv=0, decl=0)
+    all_flat = pd.DataFrame({
+        "date": pd.to_datetime(["2026-09-11", "2026-09-11"]),
+        "symbol": ["000001", "000002"],
+        "daily_change_pct": [0.0, 0.0],
+    })
+    assert math.isnan(compute_latest_market_breadth(all_flat, "2026-09-12"))

@@ -92,6 +92,7 @@ _NUMERIC_COLUMNS: tuple[str, ...] = (
     "kosdaq_change",
     "v_kospi",
     "v_kosdaq",
+    "market_breadth",
     "volume",
     "buy_price",
     "sell_price",

@@ -16,7 +16,7 @@ from src.api.kis.client import KisApiClient
 from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
 from src.utils.display import Colors
 from src.daily import archive
-from src.daily.universe_scan import fetch_candidate_stock_list
+from src.daily.universe_scan import fetch_candidate_stock_list, fetch_trade_value_union
 from src.data.trading_calendar import is_kis_trading_day
 from src.execution.cost_model import tick_cost_bp
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, PRICE_ANOMALY_COL, QUOTE_FAILED_COL
@@ -263,7 +263,11 @@ async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None
     Returns:
         자동 스캔 후보 리스트. 스캔이 비면 빈 리스트를 반환한다.
     """
-    return await fetch_candidate_stock_list(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client) or []
+    primary = await fetch_candidate_stock_list(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client) or []
+    union_rows = await fetch_trade_value_union(session, toss_client=toss_client)
+    seen_codes = {row["code"] for row in primary}
+    merged = primary + [row for row in union_rows if row["code"] not in seen_codes]
+    return merged
 
 
 # ---------------------------------------------------------
@@ -562,6 +566,18 @@ async def main(force: bool = False):
             vkospi_val = float("nan")
             index_failed = True
         df["v_kospi"] = round(float(vkospi_val), 2)
+        breadth_failed = False
+        try:
+            from src.data.panel_integrity import compute_latest_market_breadth, load_price_panel
+            panel, _prov = load_price_panel(settings.PRICE_HISTORY_PARQUET_PATH)
+            breadth_val = compute_latest_market_breadth(panel, snapshot_date)
+            if breadth_val != breadth_val:
+                breadth_failed = True
+        except Exception:
+            breadth_val = float("nan")
+            breadth_failed = True
+        df["market_breadth"] = breadth_val
+        df["시장폭_실패"] = breadth_failed
         df["지수_실패"] = index_failed
 
         df[PRICE_ANOMALY_COL] = flag_price_anomaly(df).to_numpy()

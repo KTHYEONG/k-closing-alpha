@@ -231,6 +231,24 @@ def load_price_panel(
     )
 
 
+def compute_latest_market_breadth(panel: pd.DataFrame, as_of_date: str, *, change_col: str = "daily_change_pct", date_col: str = "date") -> float:
+    as_of = pd.Timestamp(as_of_date)
+    dates = pd.to_datetime(panel[date_col], errors="coerce")
+    prior = panel[dates < as_of]
+    if prior.empty:
+        return float("nan")
+    prior_dates = pd.to_datetime(prior[date_col], errors="coerce")
+    latest_date = prior_dates.max()
+    day = prior[prior_dates == latest_date]
+    chg = pd.to_numeric(day[change_col], errors="coerce")
+    adv = int((chg > 0).sum())
+    decl = int((chg < 0).sum())
+    total = adv + decl
+    if total == 0:
+        return float("nan")
+    return round((adv - decl) / total, 6)
+
+
 class PanelIntegrityError(ValueError):
     """Raised when a stored change column disagrees with its own prices."""
 

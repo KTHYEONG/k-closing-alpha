@@ -282,3 +282,159 @@ def test_collect_main_persists_price_anomaly_column_as_all_false_for_healthy_sna
     # Then: the gate passed (no raise), persistence happened, and the new column is present
     stored = captured["df"]
     assert stored["가격_비정상"].tolist() == [False, False]
+
+
+def test_collect_main_attaches_market_breadth_from_price_history_panel(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
+
+    async def _fake_scan(client, session, **kwargs):
+        return [{"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"}]
+
+    async def _fake_fetch_all(stock_list, client, session):
+        rows = [
+            {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
+             "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
+             "거래량": 1_000_000, "거래대금": 500.0, "시가총액": 3000.0,
+             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0, "현재가_실패": False},
+        ]
+        return rows, []
+
+    monkeypatch.setattr(collect, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all)
+
+    fake_panel = pd.DataFrame({
+        "date": pd.to_datetime(["2026-09-11", "2026-09-11"]),
+        "symbol": ["000001", "000002"],
+        "daily_change_pct": [1.0, -1.0],
+    })
+    import src.data.panel_integrity as panel_integrity_mod
+    monkeypatch.setattr(panel_integrity_mod, "load_price_panel", lambda path: (fake_panel, object()))
+
+    captured = {}
+
+    def _fake_upsert(df, snapshot_date=None):
+        captured["df"] = df.copy()
+        return len(df)
+
+    monkeypatch.setattr(collect.archive, "upsert_archive_snapshot", _fake_upsert)
+
+    # When
+    asyncio.run(collect.main(force=True))
+
+    # Then: one advancing vs one declining stock on the only prior date -> net ratio 0.0
+    stored = captured["df"]
+    assert stored["market_breadth"].iloc[0] == 0.0
+    assert stored["시장폭_실패"].iloc[0] == False  # noqa: E712
+
+
+def test_collect_main_marks_breadth_failed_and_nans_on_panel_load_failure(monkeypatch, tmp_path) -> None:
+    import asyncio
+    import math
+
+    from src.daily import collect
+
+    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
+
+    async def _fake_scan(client, session, **kwargs):
+        return [{"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"}]
+
+    async def _fake_fetch_all(stock_list, client, session):
+        rows = [
+            {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
+             "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
+             "거래량": 1_000_000, "거래대금": 500.0, "시가총액": 3000.0,
+             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0, "현재가_실패": False},
+        ]
+        return rows, []
+
+    monkeypatch.setattr(collect, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all)
+
+    import src.data.panel_integrity as panel_integrity_mod
+
+    def _raise(path):
+        raise FileNotFoundError("price_history parquet not found")
+
+    monkeypatch.setattr(panel_integrity_mod, "load_price_panel", _raise)
+
+    captured = {}
+
+    def _fake_upsert(df, snapshot_date=None):
+        captured["df"] = df.copy()
+        return len(df)
+
+    monkeypatch.setattr(collect.archive, "upsert_archive_snapshot", _fake_upsert)
+
+    # When: main() must not raise despite the panel load failure
+    asyncio.run(collect.main(force=True))
+
+    # Then: fail-open -- NaN value, explicit failure flag, snapshot still persisted
+    stored = captured["df"]
+    assert math.isnan(stored["market_breadth"].iloc[0])
+    assert stored["시장폭_실패"].iloc[0] == True  # noqa: E712
+
+
+def test_collect_main_marks_breadth_failed_when_panel_loads_but_breadth_is_nan(monkeypatch, tmp_path) -> None:
+    import asyncio
+    import math
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
+
+    async def _fake_scan(client, session, **kwargs):
+        return [{"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"}]
+
+    async def _fake_fetch_all(stock_list, client, session):
+        rows = [
+            {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
+             "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
+             "거래량": 1_000_000, "거래대금": 500.0, "시가총액": 3000.0,
+             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0, "현재가_실패": False},
+        ]
+        return rows, []
+
+    monkeypatch.setattr(collect, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all)
+
+    # Given: load_price_panel succeeds (no exception) but every prior-date row is
+    # exactly flat (chg == 0), so compute_latest_market_breadth's real logic
+    # returns NaN via its own total==0 branch, not via a load failure
+    fake_panel = pd.DataFrame({
+        "date": pd.to_datetime(["2026-09-11", "2026-09-11"]),
+        "symbol": ["000001", "000002"],
+        "daily_change_pct": [0.0, 0.0],
+    })
+    import src.data.panel_integrity as panel_integrity_mod
+    monkeypatch.setattr(panel_integrity_mod, "load_price_panel", lambda path: (fake_panel, object()))
+
+    captured = {}
+
+    def _fake_upsert(df, snapshot_date=None):
+        captured["df"] = df.copy()
+        return len(df)
+
+    monkeypatch.setattr(collect.archive, "upsert_archive_snapshot", _fake_upsert)
+
+    # When
+    asyncio.run(collect.main(force=True))
+
+    # Then: NaN surfaces through the success path's `breadth_val != breadth_val` check,
+    # not through except -- still fail-open, snapshot still persisted
+    stored = captured["df"]
+    assert math.isnan(stored["market_breadth"].iloc[0])
+    assert stored["시장폭_실패"].iloc[0] == True  # noqa: E712
