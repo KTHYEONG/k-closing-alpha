@@ -40,6 +40,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     """Parse retrain arguments and dispatch to the ranker research pipeline."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 

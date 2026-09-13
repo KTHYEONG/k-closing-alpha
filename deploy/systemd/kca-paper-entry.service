@@ -1,5 +1,6 @@
 [Unit]
 Description=KCA paper entry (no real orders)
+After=kca-finalize-close.service
 OnFailure=kca-alert@%n.service
 
 [Service]
