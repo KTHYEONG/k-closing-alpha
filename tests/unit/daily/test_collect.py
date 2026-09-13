@@ -879,3 +879,56 @@ def test_main_skips_cleanly_on_non_trading_day(monkeypatch) -> None:
     # Then: 예외 없이 정상 종료, 후보 수집 미호출
     assert result is None
     never_called.assert_not_awaited()
+
+
+def test_resolve_daily_candidates_unions_trade_value_leaders_with_dedup(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import src.daily.collect as collect_mod
+
+    # Given: primary scan returns one stock, trade-value union returns an overlapping
+    # code (must be deduped, primary row wins) plus a genuinely new one
+    primary_rows = [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "5.0"}]
+    union_rows = [
+        {"code": "005930", "name": None, "price": "70001", "chgrate": "0.01"},
+        {"code": "000660", "name": None, "price": "180000", "chgrate": "0.01"},
+    ]
+
+    async def _fake_scan(client_arg, session_arg, **kwargs):
+        return primary_rows
+
+    async def _fake_union(session_arg, **kwargs):
+        return union_rows
+
+    monkeypatch.setattr(collect_mod, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect_mod, "fetch_trade_value_union", _fake_union)
+
+    # When
+    out = asyncio.run(collect_mod.resolve_daily_candidates(AsyncMock(), object(), toss_client=AsyncMock()))
+
+    # Then: primary row kept as-is (not overwritten by union's stale price), new code appended
+    assert out == [
+        {"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "5.0"},
+        {"code": "000660", "name": None, "price": "180000", "chgrate": "0.01"},
+    ]
+
+
+def test_resolve_daily_candidates_zero_regression_without_toss_client(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import src.daily.collect as collect_mod
+
+    scan_rows = [{"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"}]
+
+    async def _fake_scan(client_arg, session_arg, **kwargs):
+        return scan_rows
+
+    monkeypatch.setattr(collect_mod, "fetch_candidate_stock_list", _fake_scan)
+
+    # When: no toss_client passed at all (mirrors existing regression test call shape)
+    out = asyncio.run(collect_mod.resolve_daily_candidates(AsyncMock(), object()))
+
+    # Then: union contributes nothing, output identical to primary-only behavior
+    assert out == scan_rows

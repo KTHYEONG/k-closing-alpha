@@ -100,8 +100,8 @@ def test_archive_column_order_is_minimal_and_carries_admitted() -> None:
     assert ARCHIVE_COLUMN_ORDER == [
         "스냅샷_날짜", "종목코드", "종목명", "시장구분", "시가", "고가", "저가", "종가",
         "전일종가", "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수",
-        "등락률", "kospi", "kosdaq", "v_kospi", "admitted", "수급_실패", "지수_실패",
-        "현재가_실패", "가격_비정상", "결정_종가", "종가_확정",
+        "등락률", "kospi", "kosdaq", "v_kospi", "market_breadth", "admitted", "수급_실패", "지수_실패",
+        "시장폭_실패", "현재가_실패", "가격_비정상", "결정_종가", "종가_확정",
     ]
 
     # Then: champion-era and flat level-1 orderbook columns are gone (the full
@@ -151,3 +151,29 @@ def test_archive_column_order_includes_price_anomaly_col() -> None:
     assert ARCHIVE_COLUMN_ORDER.index(DECISION_CLOSE_COL) == ARCHIVE_COLUMN_ORDER.index(PRICE_ANOMALY_COL) + 1
 
 
+
+
+def test_archive_column_order_includes_market_breadth_and_failure_flag() -> None:
+    from src.processing.schema import ARCHIVE_COLUMN_ORDER, CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    assert ARCHIVE_COLUMN_ORDER == [
+        "스냅샷_날짜", "종목코드", "종목명", "시장구분", "시가", "고가", "저가", "종가",
+        "전일종가", "거래량", "거래대금", "시가총액", "기관_순매수", "외국인_순매수",
+        "등락률", "kospi", "kosdaq", "v_kospi", "market_breadth", "admitted",
+        "수급_실패", "지수_실패", "시장폭_실패",
+        "현재가_실패", "가격_비정상", "결정_종가", "종가_확정",
+    ]
+    assert len(ARCHIVE_COLUMN_ORDER) == 27
+    assert ARCHIVE_COLUMN_ORDER[-2:] == [DECISION_CLOSE_COL, CLOSE_CONFIRMED_COL]
+
+    # And: the pre-existing dropped-column invariant (v_kosdaq, 프로그램_순매수, ...) is untouched
+    dropped = {
+        "시나리오", "테마_섹터", "선정순위", "총_종목수", "평균_거래대금",
+        "체결강도", "프로그램_순매수", "v_kosdaq", "sor_effective_price",
+        "krx_현재가", "nxt_현재가", "krx_매도호가1", "nxt_매수잔량",
+    }
+    assert dropped.isdisjoint(ARCHIVE_COLUMN_ORDER)
+
+    # NOTE: this scenario supersedes/merges test_archive_column_order_is_minimal_and_carries_admitted
+    # (tests/unit/processing/test_schema.py:96-114) and test_collect.py:106's len==25 assertion --
+    # both existing tests MUST be updated in place to these new values, not left stale.

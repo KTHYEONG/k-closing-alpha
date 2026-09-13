@@ -529,3 +529,72 @@ def test_fetch_candidate_stock_list_fails_closed_when_kiwoom_and_toss_both_fail(
     toss_client2.get_rankings = AsyncMock(side_effect=ConnectionError("toss down"))
     with pytest.raises(UniverseScanCoverageError, match=r"kiwoom ranking call failed.*toss ranking call failed"):
         asyncio.run(fetch_candidate_stock_list(AsyncMock(), object(), kiwoom_client=kw_client, toss_client=toss_client2))
+
+
+def test_map_toss_trade_value_rows_to_stock_list_skips_codeless_no_band_filter() -> None:
+    from src.daily.universe_scan import map_toss_trade_value_rows_to_stock_list
+
+    rows = [
+        {"rank": 1, "symbol": "000660", "price": {"lastPrice": "180000", "changeRate": "0.005"}},
+        {"rank": 2, "symbol": "005930", "price": {"lastPrice": "70000", "changeRate": "0.25"}},
+        {"rank": 3, "symbol": "", "price": {"lastPrice": "500", "changeRate": "0.05"}},
+    ]
+
+    out = map_toss_trade_value_rows_to_stock_list(rows)
+
+    assert out == [
+        {"code": "000660", "name": None, "price": "180000", "chgrate": "0.005"},
+        {"code": "005930", "name": None, "price": "70000", "chgrate": "0.25"},
+    ]
+    assert map_toss_trade_value_rows_to_stock_list([]) == []
+
+
+def test_fetch_trade_value_union_returns_rows_on_success() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_trade_value_union
+
+    toss_client = AsyncMock()
+    toss_client.get_rankings = AsyncMock(return_value={"result": {"rankings": [
+        {"rank": 1, "symbol": "005930", "price": {"lastPrice": "70000", "changeRate": "0.01"}},
+    ]}})
+
+    out = asyncio.run(fetch_trade_value_union(object(), toss_client=toss_client))
+
+    assert out == [{"code": "005930", "name": None, "price": "70000", "chgrate": "0.01"}]
+    toss_client.get_rankings.assert_awaited_once()
+    kwargs = toss_client.get_rankings.await_args.kwargs
+    assert kwargs["ranking_type"] == "MARKET_TRADING_AMOUNT"
+    assert kwargs["duration"] == "1d"
+
+
+def test_fetch_trade_value_union_returns_empty_list_when_toss_client_none() -> None:
+    import asyncio
+
+    from src.daily.universe_scan import fetch_trade_value_union
+
+    out = asyncio.run(fetch_trade_value_union(object(), toss_client=None))
+
+    assert out == []
+
+
+def test_fetch_trade_value_union_fails_open_on_error_envelope_and_exception() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_trade_value_union
+
+    # Given: business-level error envelope
+    toss_client = AsyncMock()
+    toss_client.get_rankings = AsyncMock(return_value={"error": {"code": "invalid-request", "message": "bad token"}})
+
+    out = asyncio.run(fetch_trade_value_union(object(), toss_client=toss_client))
+    assert out == []
+
+    # Given: network-level exception
+    toss_client2 = AsyncMock()
+    toss_client2.get_rankings = AsyncMock(side_effect=ConnectionError("toss down"))
+
+    out2 = asyncio.run(fetch_trade_value_union(object(), toss_client=toss_client2))
+    assert out2 == []
