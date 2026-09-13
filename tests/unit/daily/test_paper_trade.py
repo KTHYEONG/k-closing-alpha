@@ -135,6 +135,7 @@ def test_run_paper_session_exit_uses_open_positions_and_take_profit(tmp_path) ->
         paper_trade.run_paper_session(
             pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger,
             ws_client=_FakeWs(), session=object(),
+            now_fn=lambda: pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul"),
         )
     )
 
@@ -177,6 +178,7 @@ def test_run_paper_session_exit_escalates_to_moc_after_cutoff(tmp_path) -> None:
         paper_trade.run_paper_session(
             pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger,
             ws_client=_FakeWs(), session=object(),
+            now_fn=lambda: pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul"),
         )
     )
 
@@ -341,7 +343,8 @@ def test_run_paper_session_exit_still_uses_websocket_stream(tmp_path) -> None:
 
     n = asyncio.run(
         paper_trade.run_paper_session(
-            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, ws_client=_FakeWs(), session=object()
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, ws_client=_FakeWs(), session=object(),
+            now_fn=lambda: pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul"),
         )
     )
 
@@ -349,3 +352,172 @@ def test_run_paper_session_exit_still_uses_websocket_stream(tmp_path) -> None:
     fills = pd.read_parquet(tmp_path / "fills.parquet")
     sells = fills[fills["side"] == "sell"]
     assert int(sells.iloc[0]["fill_price"]) == 73_600
+
+
+def test_run_paper_session_exit_skips_without_open_positions(tmp_path) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    class _ExplodingWs:
+        async def stream(self, _session, _codes):
+            raise AssertionError("exit without positions must not open a websocket stream")
+            yield  # pragma: no cover
+
+    # Given: 원장에 미청산 매수 체결이 하나도 없다
+    ledger = PaperLedger(root=tmp_path)
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-14"), phase="exit", ledger=ledger, ws_client=_ExplodingWs(), session=object(),
+            now_fn=lambda: pd.Timestamp("2026-09-14 09:00:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then
+    assert n == 0
+    assert not (tmp_path / "fills.parquet").exists()
+
+
+def test_run_paper_session_exit_stops_consuming_after_all_orders_filled(tmp_path) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [{"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10,
+          "fill_price": 70_000, "decision_date": "2026-09-10"}],
+        kind="fills",
+    )
+
+    class _NeverEndingWs:
+        async def stream(self, _session, codes):
+            yield ("005930", "093000", 73_600)
+            raise AssertionError("stream consumed after every order was filled")
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, ws_client=_NeverEndingWs(), session=object(),
+            now_fn=lambda: pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then
+    assert n == 1
+    assert len(ledger.load_open_positions()) == 0
+
+
+def test_run_paper_session_exit_stops_at_session_end_print_leaving_unprinted_symbol_open(tmp_path) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.config.market_session import PAPER_EXIT_SESSION_END_HHMMSS
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    # Given: 두 종목 포지션, 000660은 종일 프린트가 없다(거래정지)
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [
+            {"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000, "decision_date": "2026-09-10"},
+            {"order_id": "b2", "symbol": "000660", "side": "buy", "qty": 1, "fill_price": 200_000, "decision_date": "2026-09-10"},
+        ],
+        kind="fills",
+    )
+
+    class _HaltedPeerWs:
+        async def stream(self, _session, codes):
+            yield ("005930", PAPER_EXIT_SESSION_END_HHMMSS, 71_200)
+            raise AssertionError("stream consumed after the session-end print")
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, ws_client=_HaltedPeerWs(), session=object(),
+            now_fn=lambda: pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then: 프린트가 온 종목만 MOC 청산되고 거래정지 종목은 미청산으로 남는다
+    assert n == 1
+    open_positions = ledger.load_open_positions()
+    assert list(open_positions["symbol"]) == ["000660"]
+
+
+def test_run_paper_session_exit_wall_clock_deadline_ends_quiet_stream(tmp_path) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [{"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10,
+          "fill_price": 70_000, "decision_date": "2026-09-10"}],
+        kind="fills",
+    )
+
+    class _QuietWs:
+        async def stream(self, _session, codes):
+            await asyncio.Event().wait()
+            yield ("005930", "093000", 73_600)  # pragma: no cover
+
+    # Given: 장마감 50ms 전에 세션이 시작된 상황(프린트는 영영 오지 않는다)
+    near_close = pd.Timestamp("2026-09-11 15:30:00", tz="Asia/Seoul") - pd.Timedelta(milliseconds=50)
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, ws_client=_QuietWs(), session=object(),
+            now_fn=lambda: near_close,
+        )
+    )
+
+    # Then: 예외 없이 종료, 체결 0건, 포지션 유지
+    assert n == 0
+    assert list(ledger.load_open_positions()["symbol"]) == ["005930"]
+
+
+def test_run_paper_session_exit_skips_when_started_after_session_end(tmp_path) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [{"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10,
+          "fill_price": 70_000, "decision_date": "2026-09-10"}],
+        kind="fills",
+    )
+
+    class _ExplodingWs:
+        async def stream(self, _session, _codes):
+            raise AssertionError("late start must not open a websocket stream")
+            yield  # pragma: no cover
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, ws_client=_ExplodingWs(), session=object(),
+            now_fn=lambda: pd.Timestamp("2026-09-11 15:31:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then
+    assert n == 0
+    assert list(ledger.load_open_positions()["symbol"]) == ["005930"]

@@ -6,4 +6,5 @@ OnFailure=kca-alert@%n.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
+Environment=TZ=Asia/Seoul
 ExecStart=%h/.local/bin/uv run python -m src.daily.finalize_close

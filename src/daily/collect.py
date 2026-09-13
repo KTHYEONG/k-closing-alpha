@@ -502,7 +502,12 @@ async def main(force: bool = False):
         snapshot_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
         kiwoom_client = build_kiwoom_scan_client()
         toss_client = build_toss_scan_client()
-        await _validate_trading_day(client, session, snapshot_date, force=force)
+        try:
+            await _validate_trading_day(client, session, snapshot_date, force=force)
+        except NonTradingDayError:
+            # 휴장일은 장애가 아니다: 정상 종료해 OnFailure 오탐 알림과 하위 단계 오류를 막는다
+            logger.info("[DATA] stage=collect status=SKIP reason=non_trading_day date=%s", snapshot_date)
+            return
 
         # 2. 시장 지수 조회 (병렬 gather)
         res_kospi, res_kosdaq = await asyncio.gather(

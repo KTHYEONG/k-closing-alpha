@@ -1,5 +1,5 @@
 def test_sync_repo_returns_up_to_date_when_no_new_commits() -> None:
-    from src.tools.code_sync import SyncResult, sync_repo
+    from src.tools.code_sync import SyncResult, UnitInstallResult, sync_repo
 
     def fake_git(args: list[str], cwd: str) -> str:
         if args[:2] == ["rev-parse", "HEAD"]:
@@ -13,14 +13,20 @@ def test_sync_repo_returns_up_to_date_when_no_new_commits() -> None:
     def fail_if_called(*args, **kwargs):
         raise AssertionError("should not be called when already up to date")
 
+    units = UnitInstallResult(changed=("kca-backup.service",), removed=(), enabled=())
+    order: list[str] = []
+
     # When
     result = sync_repo(
         "/repo", git_fn=fake_git, fast_forward_fn=fail_if_called,
         test_gate_fn=fail_if_called, uv_sync_fn=fail_if_called,
+        install_units_fn=lambda repo_dir: order.append("install") or units,
+        secure_fn=lambda repo_dir: order.append("secure") or False,
     )
 
     # Then
-    assert result == SyncResult(updated=False, from_sha="a" * 40, to_sha="a" * 40, reason="up_to_date")
+    assert result == SyncResult(updated=False, from_sha="a" * 40, to_sha="a" * 40, reason="up_to_date", units=units)
+    assert order == ["secure", "install"]
 
 
 def test_sync_repo_alerts_and_skips_on_non_fast_forward(monkeypatch) -> None:
@@ -100,9 +106,9 @@ def test_sync_repo_rolls_back_and_alerts_on_test_gate_failure(monkeypatch) -> No
 
 
 def test_sync_repo_fast_forwards_and_syncs_deps_on_success() -> None:
-    from src.tools.code_sync import SyncResult, sync_repo
+    from src.tools.code_sync import SyncResult, UnitInstallResult, sync_repo
 
-    sync_calls: list[str] = []
+    order: list[str] = []
 
     def fake_git(args: list[str], cwd: str) -> str:
         if args[:2] == ["rev-parse", "HEAD"]:
@@ -115,15 +121,19 @@ def test_sync_repo_fast_forwards_and_syncs_deps_on_success() -> None:
             return ""
         raise AssertionError(f"unexpected git call: {args}")
 
+    units = UnitInstallResult(changed=(), removed=(), enabled=())
+
     # When
     result = sync_repo(
         "/repo", git_fn=fake_git, fast_forward_fn=lambda repo_dir, f, t: True,
-        test_gate_fn=lambda repo_dir: (True, ""), uv_sync_fn=lambda repo_dir: sync_calls.append(repo_dir),
+        test_gate_fn=lambda repo_dir: (True, ""), uv_sync_fn=lambda repo_dir: order.append("uv_sync"),
+        install_units_fn=lambda repo_dir: order.append("install") or units,
+        secure_fn=lambda repo_dir: order.append("secure") or True,
     )
 
     # Then
-    assert result == SyncResult(updated=True, from_sha="a" * 40, to_sha="b" * 40, reason="fast_forwarded")
-    assert sync_calls == ["/repo"]
+    assert result == SyncResult(updated=True, from_sha="a" * 40, to_sha="b" * 40, reason="fast_forwarded", units=units)
+    assert order == ["uv_sync", "secure", "install"]
 
 
 def test_git_helper_reads_head_and_raises_on_bad_command(tmp_path) -> None:
@@ -272,5 +282,165 @@ def test_resolve_uv_bin_falls_back_to_local_bin_when_not_on_path(monkeypatch) ->
 
     assert resolved == str(Path.home() / ".local" / "bin" / "uv")
     assert resolved != "uv"
+
+
+def test_install_systemd_units_copies_changed_and_new_units_reloads_and_enables_new_timer(tmp_path) -> None:
+    import subprocess
+
+    from src.tools import code_sync
+
+    repo = tmp_path / "repo"
+    src = repo / "deploy" / "systemd"
+    src.mkdir(parents=True)
+    dest = tmp_path / "user"
+    dest.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        assert kwargs["check"] is True
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+    (src / "kca-backup.service").write_text("[Service]\nExecStart=new\n")
+    (dest / "kca-backup.service").write_text("[Service]\nExecStart=old\n")
+    (src / "kca-new.timer").write_text("[Timer]\nOnCalendar=daily\n")
+    (src / "kca-same.service").write_text("same\n")
+    (dest / "kca-same.service").write_text("same\n")
+
+    # When
+    result = code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=fake_run)
+
+    # Then
+    assert result.changed == ("kca-backup.service", "kca-new.timer")
+    assert result.removed == ()
+    assert result.enabled == ("kca-new.timer",)
+    assert (dest / "kca-backup.service").read_text() == "[Service]\nExecStart=new\n"
+    assert (dest / "kca-new.timer").exists()
+    assert calls == [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "kca-new.timer"],
+    ]
+
+
+def test_install_systemd_units_is_noop_when_installed_copies_match(tmp_path) -> None:
+    import subprocess
+
+    from src.tools import code_sync
+
+    repo = tmp_path / "repo"
+    src = repo / "deploy" / "systemd"
+    src.mkdir(parents=True)
+    dest = tmp_path / "user"
+    dest.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        assert kwargs["check"] is True
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+    (src / "kca-collect.timer").write_text("t\n")
+    (dest / "kca-collect.timer").write_text("t\n")
+
+    # When
+    result = code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=fake_run)
+
+    # Then
+    assert result == code_sync.UnitInstallResult(changed=(), removed=(), enabled=())
+    assert calls == []
+
+
+def test_install_systemd_units_disables_and_removes_units_deleted_from_repo(tmp_path) -> None:
+    import subprocess
+
+    from src.tools import code_sync
+
+    repo = tmp_path / "repo"
+    src = repo / "deploy" / "systemd"
+    src.mkdir(parents=True)
+    dest = tmp_path / "user"
+    dest.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        assert kwargs["check"] is True
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+    (dest / "kca-old.timer").write_text("t\n")
+    (dest / "kca-old.service").write_text("s\n")
+    (dest / "quant-lake-backup.timer").write_text("other project\n")
+
+    # When
+    result = code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=fake_run)
+
+    # Then
+    assert result.removed == ("kca-old.service", "kca-old.timer")
+    assert not (dest / "kca-old.timer").exists()
+    assert not (dest / "kca-old.service").exists()
+    assert (dest / "quant-lake-backup.timer").exists()
+    assert calls == [
+        ["systemctl", "--user", "disable", "--now", "kca-old.timer"],
+        ["systemctl", "--user", "daemon-reload"],
+    ]
+
+
+def test_install_systemd_units_propagates_systemctl_failure(tmp_path) -> None:
+    import subprocess
+
+    import pytest
+
+    from src.tools import code_sync
+
+    repo = tmp_path / "repo"
+    (repo / "deploy" / "systemd").mkdir(parents=True)
+    (repo / "deploy" / "systemd" / "kca-predict.service").write_text("s\n")
+    dest = tmp_path / "user"
+
+    def failing_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(returncode=1, cmd=cmd)
+
+    # When / Then
+    with pytest.raises(subprocess.CalledProcessError):
+        code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=failing_run)
+
+
+def test_ensure_secret_permissions_tightens_group_readable_env(tmp_path) -> None:
+    from src.tools import code_sync
+
+    # Given: 운영 VPS 실측과 같은 664 권한
+    env = tmp_path / ".env"
+    env.write_text("KIS_APP_SECRET=x\n")
+    env.chmod(0o664)
+
+    # When / Then
+    assert code_sync.ensure_secret_permissions(str(tmp_path)) is True
+    assert env.stat().st_mode & 0o777 == 0o600
+    assert code_sync.ensure_secret_permissions(str(tmp_path)) is False
+    assert code_sync.ensure_secret_permissions(str(tmp_path / "absent")) is False
+
+
+def test_sync_repo_does_not_install_units_when_test_gate_fails(monkeypatch) -> None:
+    from src.tools.code_sync import sync_repo
+
+    def fake_git(args: list[str], cwd: str) -> str:
+        if args[:2] == ["rev-parse", "HEAD"]:
+            return "a" * 40
+        if args[:2] == ["rev-parse", "FETCH_HEAD"]:
+            return "b" * 40
+        return ""
+
+    monkeypatch.setattr("src.tools.alerts.dispatch_failure_alert", lambda unit, *, detail="": {})
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("units/secrets must not be touched after a rollback")
+
+    # When
+    result = sync_repo(
+        "/repo", git_fn=fake_git, fast_forward_fn=lambda repo_dir, f, t: True,
+        test_gate_fn=lambda repo_dir: (False, "1 failed"), uv_sync_fn=fail_if_called,
+        install_units_fn=fail_if_called, secure_fn=fail_if_called,
+    )
+
+    # Then
+    assert result.reason == "test_gate_failed"
+    assert result.units is None
 
 

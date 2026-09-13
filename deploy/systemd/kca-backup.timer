@@ -1,8 +1,8 @@
 [Unit]
-Description=KCA offsite backup (Mon-Fri 20:25 KST)
+Description=KCA offsite backup (Mon-Fri 22:15 KST, after price ingest)
 
 [Timer]
-OnCalendar=Mon..Fri 20:25:00 Asia/Seoul
+OnCalendar=Mon..Fri 22:15:00 Asia/Seoul
 Persistent=true
 Unit=kca-backup.service
 

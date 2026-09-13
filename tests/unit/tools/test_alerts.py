@@ -123,3 +123,73 @@ def test_alerts_main_parses_unit_and_dispatches(monkeypatch) -> None:
 
     # Then
     assert captured == {"unit": "kca-finalize-close.service", "detail": "exit code 1"}
+
+
+def test_dispatch_digest_sends_subject_and_body_and_isolates_channel_failures(monkeypatch) -> None:
+    from src.tools import alerts
+
+    monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", "https://hooks.example.com/x", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "bot@example.com", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "pw", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "ops@example.com", raising=False)
+    sent: dict = {}
+
+    class _FakeSMTP:
+        def __init__(self, host, port, timeout):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def login(self, user, password):
+            pass
+
+        def send_message(self, msg):
+            sent["subject"] = msg["Subject"]
+            sent["body"] = msg.get_content()
+
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    posted: dict = {}
+
+    def _post(url, json, timeout):
+        posted["text"] = json["text"]
+        return _FakeResponse()
+
+    monkeypatch.setattr(alerts.smtplib, "SMTP_SSL", _FakeSMTP)
+    monkeypatch.setattr(alerts.requests, "post", _post)
+
+    # When: 두 채널 모두 정상
+    results = alerts.dispatch_digest("[KCA] 2026-09-14 일일점검 OK", "archive=OK")
+
+    # Then
+    assert results == {"webhook": True, "email": True}
+    assert sent["subject"] == "[KCA] 2026-09-14 일일점검 OK"
+    assert "archive=OK" in sent["body"]
+    assert posted["text"].startswith("[KCA] 2026-09-14 일일점검 OK")
+
+    # Given: 웹훅 장애
+    def _down(url, json, timeout):
+        raise alerts.requests.ConnectionError("down")
+
+    monkeypatch.setattr(alerts.requests, "post", _down)
+
+    # Then: 이메일은 여전히 발송된다
+    assert alerts.dispatch_digest("s", "b") == {"webhook": False, "email": True}
+
+    # Given: 반대로 SMTP 장애
+    monkeypatch.setattr(alerts.requests, "post", _post)
+
+    class _BrokenSMTP(_FakeSMTP):
+        def login(self, user, password):
+            raise alerts.smtplib.SMTPAuthenticationError(535, b"bad credentials")
+
+    monkeypatch.setattr(alerts.smtplib, "SMTP_SSL", _BrokenSMTP)
+
+    # Then: 웹훅은 여전히 발송된다
+    assert alerts.dispatch_digest("s", "b") == {"webhook": True, "email": False}

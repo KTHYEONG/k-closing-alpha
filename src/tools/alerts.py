@@ -18,6 +18,85 @@ from src import settings
 logger = logging.getLogger(__name__)
 
 
+def post_webhook_text(webhook_url: str, text: str) -> bool:
+    """Slack/Discord 호환 웹훅으로 임의 텍스트를 보낸다.
+
+    Args:
+        webhook_url: 웹훅 URL. 빈 문자열이면 미설정으로 간주해 스킵한다.
+        text: 보낼 본문.
+
+    Returns:
+        전송을 시도했으면 True, URL이 비어 스킵했으면 False.
+
+    Raises:
+        requests.RequestException: 전송 자체가 실패한 경우 그대로 전파한다.
+    """
+    if not webhook_url:
+        return False
+    resp = requests.post(webhook_url, json={"text": text}, timeout=10)
+    resp.raise_for_status()
+    return True
+
+
+def send_email(*, gmail_user: str, gmail_app_password: str, to_addr: str, subject: str, body: str) -> bool:
+    """Gmail 앱비밀번호 SMTP_SSL로 임의 제목/본문 메일을 보낸다.
+
+    Args:
+        gmail_user: 발신 Gmail 계정.
+        gmail_app_password: Gmail 앱 비밀번호.
+        to_addr: 수신 이메일 주소.
+        subject: 메일 제목.
+        body: 메일 본문.
+
+    Returns:
+        세 자격증명이 모두 있으면 전송 후 True, 하나라도 비어있으면 False.
+
+    Raises:
+        smtplib.SMTPException: 전송 자체가 실패한 경우 그대로 전파한다.
+    """
+    if not gmail_user or not gmail_app_password or not to_addr:
+        return False
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = gmail_user
+    msg["To"] = to_addr
+    msg.set_content(body)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as smtp:
+        smtp.login(gmail_user, gmail_app_password)
+        smtp.send_message(msg)
+    return True
+
+
+def dispatch_digest(subject: str, body: str) -> dict[str, bool]:
+    """일일 요약을 웹훅과 이메일 양쪽에 보내고 채널별 성공여부를 반환한다.
+
+    채널 실패는 dispatch_failure_alert와 같은 방식으로 좁게 잡아 격리한다.
+
+    Args:
+        subject: 요약 제목.
+        body: 요약 본문.
+
+    Returns:
+        {"webhook": bool, "email": bool}.
+    """
+    results = {"webhook": False, "email": False}
+    try:
+        results["webhook"] = post_webhook_text(settings.ALERT_WEBHOOK_URL, f"{subject}\n{body}")
+    except (requests.RequestException, OSError) as exc:
+        logger.warning("[SYS] digest webhook dispatch failed reason=%s", type(exc).__name__)
+    try:
+        results["email"] = send_email(
+            gmail_user=settings.ALERT_GMAIL_USER,
+            gmail_app_password=settings.ALERT_GMAIL_APP_PASSWORD,
+            to_addr=settings.ALERT_GMAIL_TO,
+            subject=subject,
+            body=body,
+        )
+    except (smtplib.SMTPException, OSError) as exc:
+        logger.warning("[SYS] digest email dispatch failed reason=%s", type(exc).__name__)
+    return results
+
+
 def post_webhook_alert(webhook_url: str, *, unit: str, detail: str = "") -> bool:
     """Slack/Discord 호환 웹훅으로 실패 알림을 보낸다.
 
@@ -32,14 +111,10 @@ def post_webhook_alert(webhook_url: str, *, unit: str, detail: str = "") -> bool
     Raises:
         requests.RequestException: 전송 자체가 실패한 경우 그대로 전파한다.
     """
-    if not webhook_url:
-        return False
     text = f"[KCA] systemd unit failed: {unit}"
     if detail:
         text += f"\n{detail}"
-    resp = requests.post(webhook_url, json={"text": text}, timeout=10)
-    resp.raise_for_status()
-    return True
+    return post_webhook_text(webhook_url, text)
 
 
 def send_email_alert(*, gmail_user: str, gmail_app_password: str, to_addr: str, unit: str, detail: str = "") -> bool:
@@ -59,17 +134,13 @@ def send_email_alert(*, gmail_user: str, gmail_app_password: str, to_addr: str, 
     Raises:
         smtplib.SMTPException: 전송 자체가 실패한 경우 그대로 전파한다.
     """
-    if not gmail_user or not gmail_app_password or not to_addr:
-        return False
-    msg = EmailMessage()
-    msg["Subject"] = f"[KCA] systemd unit failed: {unit}"
-    msg["From"] = gmail_user
-    msg["To"] = to_addr
-    msg.set_content(detail or f"unit={unit} failed with no further detail")
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as smtp:
-        smtp.login(gmail_user, gmail_app_password)
-        smtp.send_message(msg)
-    return True
+    return send_email(
+        gmail_user=gmail_user,
+        gmail_app_password=gmail_app_password,
+        to_addr=to_addr,
+        subject=f"[KCA] systemd unit failed: {unit}",
+        body=detail or f"unit={unit} failed with no further detail",
+    )
 
 
 def dispatch_failure_alert(unit: str, *, detail: str = "") -> dict[str, bool]:

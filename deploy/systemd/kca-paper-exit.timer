@@ -3,6 +3,7 @@ Description=KCA paper exit (Mon-Fri 09:00 KST)
 
 [Timer]
 OnCalendar=Mon..Fri 09:00:00 Asia/Seoul
+AccuracySec=1s
 Persistent=false
 Unit=kca-paper-exit.service
 

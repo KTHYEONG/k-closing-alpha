@@ -36,3 +36,5 @@ PAPER_ENTRY_HHMMSS: str = "152000"
 PAPER_EXIT_MOC_HHMMSS: str = "151900"
 # D+1 청산 세션 시작 시각(kca-paper-exit 타이머 발화 시각)
 PAPER_EXIT_SESSION_START_HHMMSS: str = "090000"
+# D+1 청산 세션 종료 시각(KRX 정규장 종료). 이후 프린트에는 청산 기회가 없다
+PAPER_EXIT_SESSION_END_HHMMSS: str = "153000"

@@ -1,28 +1,6 @@
 from __future__ import annotations
 
 
-def test_audit_daily_completeness_flags_missing_steps(monkeypatch, tmp_path) -> None:
-    import pandas as pd
-
-    from src.tools import daily_audit
-
-    # Given: 아카이브에는 오늘 행이 있지만 결정 기록은 없는 상태
-    monkeypatch.setattr(
-        daily_audit,
-        "fetch_archive_snapshot",
-        lambda snapshot_date=None, **kw: pd.DataFrame({"종목코드": ["005930"]}),
-    )
-    monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", tmp_path, raising=False)
-
-    # When
-    result = daily_audit.audit_daily_completeness("2026-09-10")
-
-    # Then
-    assert set(result) == {"archive", "minute_bars", "decision", "close_confirmed"}
-    assert result["archive"] is True
-    assert result["decision"] is False
-
-
 def test_systemd_units_encode_persistence_and_timezone_policy() -> None:
     from pathlib import Path
 
@@ -71,100 +49,248 @@ def test_systemd_timers_align_with_decision_and_finalize_gates() -> None:
     assert "OnSuccess=kca-paper-entry.service" in finalize_text
 
 
-def test_audit_or_skip_skips_non_trading_day(monkeypatch) -> None:
+def test_audit_daily_completeness_reports_all_steps_from_topk_log_and_fills(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    parquet_dir = tmp_path / "parquet"
+    paper_dir = tmp_path / "paper"
+    parquet_dir.mkdir()
+    paper_dir.mkdir()
+    monkeypatch.setattr(daily_audit.settings, "PARQUET_DIR", parquet_dir, raising=False)
+    monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", paper_dir, raising=False)
+    pd.DataFrame({"decision_date": ["2026-09-14"], "symbol": ["005930"]}).to_parquet(parquet_dir / "topk_decisions.parquet")
+    pd.DataFrame(
+        {"order_id": ["2026-09-14:005930:entry"], "symbol": ["005930"], "side": ["buy"], "decision_date": ["2026-09-14"]}
+    ).to_parquet(paper_dir / "fills.parquet")
+    price_history = tmp_path / "price_history.parquet"
+    pd.DataFrame({"date": pd.to_datetime(["2026-09-11"])}).to_parquet(price_history)
+    bars = tmp_path / "bars.parquet"
+    bars.write_text("x")
+    monkeypatch.setattr(daily_audit.settings, "PRICE_HISTORY_PARQUET_PATH", price_history, raising=False)
+    monkeypatch.setattr(
+        daily_audit,
+        "fetch_archive_snapshot",
+        lambda snapshot_date=None, **kw: pd.DataFrame({"종목코드": ["005930"], daily_audit.CLOSE_CONFIRMED_COL: [True]}),
+    )
+    monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: "2026-09-11")
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: bars)
+
+    # When
+    result = daily_audit.audit_daily_completeness("2026-09-14")
+
+    # Then
+    assert set(result) == set(daily_audit.AUDIT_STEPS)
+    assert all(result.values()), result
+
+
+def test_audit_daily_completeness_accepts_explicit_no_decision_record(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    parquet_dir = tmp_path / "parquet"
+    paper_dir = tmp_path / "paper"
+    parquet_dir.mkdir()
+    paper_dir.mkdir()
+    monkeypatch.setattr(daily_audit.settings, "PARQUET_DIR", parquet_dir, raising=False)
+    monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", paper_dir, raising=False)
+    pd.DataFrame({"decision_date": ["2026-09-14"], "symbol": [""], "reason": ["admitted_below_top_k"]}).to_parquet(
+        paper_dir / "decisions.parquet"
+    )
+    monkeypatch.setattr(daily_audit, "fetch_archive_snapshot", lambda snapshot_date=None, **kw: pd.DataFrame())
+    monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: None)
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: tmp_path / "missing.parquet")
+
+    # When
+    result = daily_audit.audit_daily_completeness("2026-09-14")
+
+    # Then
+    assert result["decision"] is True
+    assert result["paper_entry"] is True
+    assert result["archive"] is False
+    assert result["close_confirmed"] is False
+    assert result["minute_bars"] is False
+    # 직전 아카이브 영업일이 없으면 기대치가 없어 신선도는 판정 보류(True)
+    assert result["price_history_fresh"] is True
+
+
+def test_audit_daily_completeness_flags_stale_or_missing_price_history(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    parquet_dir = tmp_path / "parquet"
+    paper_dir = tmp_path / "paper"
+    parquet_dir.mkdir()
+    paper_dir.mkdir()
+    monkeypatch.setattr(daily_audit.settings, "PARQUET_DIR", parquet_dir, raising=False)
+    monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", paper_dir, raising=False)
+    price_history = tmp_path / "price_history.parquet"
+    pd.DataFrame({"date": pd.to_datetime(["2026-09-09"])}).to_parquet(price_history)
+    monkeypatch.setattr(daily_audit.settings, "PRICE_HISTORY_PARQUET_PATH", price_history, raising=False)
+    monkeypatch.setattr(daily_audit, "fetch_archive_snapshot", lambda snapshot_date=None, **kw: pd.DataFrame())
+    monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: "2026-09-11")
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: tmp_path / "missing.parquet")
+
+    # When: 적재가 2영업일 밀림
+    stale = daily_audit.audit_daily_completeness("2026-09-14")
+
+    # Then
+    assert stale["price_history_fresh"] is False
+    assert stale["decision"] is False
+    assert stale["paper_entry"] is False
+
+    # Given: price_history 파일 자체가 없음
+    monkeypatch.setattr(daily_audit.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "absent.parquet", raising=False)
+
+    # Then
+    assert daily_audit.audit_daily_completeness("2026-09-14")["price_history_fresh"] is False
+
+
+def test_audit_daily_completeness_tolerates_empty_or_schema_drifted_ledgers(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    parquet_dir = tmp_path / "parquet"
+    paper_dir = tmp_path / "paper"
+    parquet_dir.mkdir()
+    paper_dir.mkdir()
+    monkeypatch.setattr(daily_audit.settings, "PARQUET_DIR", parquet_dir, raising=False)
+    monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", paper_dir, raising=False)
+    # Given: 컬럼이 빠진 결정 로그, side 없는 체결 원장, 행이 없는 price_history
+    pd.DataFrame({"symbol": ["005930"]}).to_parquet(parquet_dir / "topk_decisions.parquet")
+    pd.DataFrame({"order_id": ["x"], "decision_date": ["2026-09-14"]}).to_parquet(paper_dir / "fills.parquet")
+    price_history = tmp_path / "price_history.parquet"
+    pd.DataFrame({"date": pd.Series([], dtype="datetime64[ns]")}).to_parquet(price_history)
+    monkeypatch.setattr(daily_audit.settings, "PRICE_HISTORY_PARQUET_PATH", price_history, raising=False)
+    monkeypatch.setattr(daily_audit, "fetch_archive_snapshot", lambda snapshot_date=None, **kw: pd.DataFrame())
+    monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: "2026-09-11")
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: tmp_path / "missing.parquet")
+
+    # When
+    result = daily_audit.audit_daily_completeness("2026-09-14")
+
+    # Then: 예외 없이 전부 미수행으로 판정
+    assert result["decision"] is False
+    assert result["paper_entry"] is False
+    assert result["price_history_fresh"] is False
+
+
+def test_classify_day_weekend_holiday_trading_and_lookup_failure() -> None:
     from src.tools import daily_audit
 
     calls = {"n": 0}
 
-    def _never(_date: str) -> dict[str, bool]:
+    def _never(_date: str) -> bool:
         calls["n"] += 1
-        return {"archive": True, "minute_bars": True, "decision": True, "close_confirmed": True}
+        return True
 
-    monkeypatch.setattr(daily_audit, "audit_daily_completeness", _never)
-
-    # Given: 휴장일(토요일)
-    monkeypatch.setattr(daily_audit, "is_krx_trading_day", lambda _d: False)
-
-    # When / Then: 감사 자체를 수행하지 않는다(휴장일 MISSING 오탐 제거)
-    assert daily_audit.audit_or_skip("2026-01-03") is None
+    # Given/When/Then: 주말은 오라클을 호출하지 않는다
+    assert daily_audit.classify_day("2026-09-12", _never) == daily_audit.DAY_WEEKEND
     assert calls["n"] == 0
 
-    # And: 거래일이면 기존 4키 결과를 그대로 반환한다
-    monkeypatch.setattr(daily_audit, "is_krx_trading_day", lambda _d: True)
-    result = daily_audit.audit_or_skip("2026-09-09")
-    assert result is not None
-    assert set(result) == {"archive", "minute_bars", "decision", "close_confirmed"}
-    assert calls["n"] == 1
+    # And: 평일 휴장일(추석)과 거래일
+    assert daily_audit.classify_day("2026-09-24", lambda _d: False) == daily_audit.DAY_HOLIDAY
+    assert daily_audit.classify_day("2026-09-14", lambda _d: True) == daily_audit.DAY_TRADING
+
+    # And: 오라클 장애는 휴장일로 단정하지 않는다
+    def _boom(_date: str) -> bool:
+        raise RuntimeError("KIS trading-day oracle failed")
+
+    assert daily_audit.classify_day("2026-09-14", _boom) == daily_audit.DAY_UNKNOWN
 
 
-def test_daily_audit_audits_weekday_even_when_krx_calendar_is_unpublished(monkeypatch) -> None:
+def test_list_failed_kca_units_parses_plain_output_and_surfaces_unavailable() -> None:
+    import subprocess
+
     from src.tools import daily_audit
 
-    expected = {"archive": True, "minute_bars": True, "decision": False, "close_confirmed": False}
-    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda _d: dict(expected))
-    # Given: KRX 지수 일별매매정보가 아직 미게시(1일 이상 지연) -> False 반환
-    monkeypatch.setattr(daily_audit, "is_krx_trading_day", lambda _d: False)
+    seen: dict = {}
 
-    # When: 평일(2026-09-10, 목)
-    result = daily_audit.audit_or_skip("2026-09-10")
-
-    # Then: 침묵 스킵하지 않고 감사를 수행한다 (P0 미탐지 회귀 방지)
-    assert result == expected
-
-    # And: 주말(2026-09-12, 토)만 스킵
-    assert daily_audit.audit_or_skip("2026-09-12") is None
-
-
-def test_daily_audit_still_audits_when_calendar_lookup_fails(monkeypatch) -> None:
-    from src.tools import daily_audit
-
-    expected = {"archive": True, "minute_bars": False, "decision": False, "close_confirmed": False}
-    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda _d: dict(expected))
-
-    def _boom(_date):
-        raise RuntimeError("krx network down")
-
-    # Given: KRX 달력 조회가 네트워크 장애로 실패
-    monkeypatch.setattr(daily_audit, "is_krx_trading_day", _boom)
-
-    # When / Then: 부가 정보 실패가 감사 자체를 막지 않는다 (장애 조기 발견 목적 유지)
-    assert daily_audit.audit_or_skip("2026-09-10") == expected
-
-
-def test_notify_if_missing_dispatches_alert_only_when_steps_missing(monkeypatch) -> None:
-    from src.tools import daily_audit
-
-    captured: dict = {}
-    monkeypatch.setattr(
-        "src.tools.alerts.dispatch_failure_alert",
-        lambda unit, *, detail="": captured.update(unit=unit, detail=detail) or {"webhook": True, "email": True},
-    )
-
-    # When: 두 단계 누락
-    missing = daily_audit._notify_if_missing(
-        "2026-09-10",
-        {"archive": True, "minute_bars": False, "decision": False, "close_confirmed": True},
-    )
-
-    # Then: 정렬된 누락 목록 + 얼러트 발송
-    assert missing == ["decision", "minute_bars"]
-    assert "2026-09-10" in captured["unit"]
-    assert "decision" in captured["detail"]
-    assert "minute_bars" in captured["detail"]
-
-    # Given: 아무것도 누락 없음
-    called = {"n": 0}
-    monkeypatch.setattr(
-        "src.tools.alerts.dispatch_failure_alert",
-        lambda *a, **kw: called.__setitem__("n", called["n"] + 1) or {},
-    )
+    def _fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=(
+                "kca-price-ingest.service loaded failed failed KCA price_history ingest\n"
+                "kca-backup.service loaded failed failed KCA offsite backup\n"
+            ),
+            stderr="",
+        )
 
     # When
-    missing2 = daily_audit._notify_if_missing(
-        "2026-09-10",
-        {"archive": True, "minute_bars": True, "decision": True, "close_confirmed": True},
-    )
+    units = daily_audit.list_failed_kca_units(_fake_run)
 
-    # Then: 얼러트 미발송
-    assert missing2 == []
-    assert called["n"] == 0
+    # Then
+    assert units == ["kca-backup.service", "kca-price-ingest.service"]
+    assert "--failed" in seen["cmd"] and "kca-*" in seen["cmd"]
+
+    # Given: systemctl 실행 불가
+    def _missing(cmd, **kwargs):
+        raise FileNotFoundError("systemctl")
+
+    # Then: 빈 목록으로 숨기지 않는다
+    assert daily_audit.list_failed_kca_units(_missing) == ["<systemctl unavailable: FileNotFoundError>"]
+
+
+def test_build_digest_ok_warning_and_holiday_subjects() -> None:
+    import pytest
+
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+
+    # When/Then: 정상
+    subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [])
+    assert subject == "[KCA] 2026-09-14 일일점검 OK"
+    assert "failed_units=none" in body
+
+    # And: 누락 + 실패유닛
+    partial = dict(all_ok, paper_entry=False)
+    subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, partial, ["kca-backup.service"])
+    assert "경고" in subject and "paper_entry" in subject and "kca-backup.service" in subject
+    assert "paper_entry=MISSING" in body
+
+    # And: 휴장일
+    subject, _ = daily_audit.build_digest("2026-09-24", daily_audit.DAY_HOLIDAY, None, [])
+    assert subject == "[KCA] 2026-09-24 휴장일 SKIP"
+
+    # And: 거래일인데 감사 결과가 없으면 거부
+    with pytest.raises(ValueError, match="audit result required"):
+        daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, None, [])
+
+
+def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> None:
+    from src.tools import daily_audit
+
+    audited: list[str] = []
+    monkeypatch.setattr(
+        daily_audit,
+        "audit_daily_completeness",
+        lambda d: audited.append(d) or dict.fromkeys(daily_audit.AUDIT_STEPS, True),
+    )
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    # When/Then: 주말은 아무것도 보내지 않는다
+    assert daily_audit.run_daily_audit("2026-09-13", trading_day_fn=lambda _d: True, failed_units_fn=list, dispatch_fn=_dispatch) is None
+    assert sent == [] and audited == []
+
+    # And: 평일 휴장일은 감사 없이 휴장일 요약 1통
+    subject = daily_audit.run_daily_audit("2026-09-24", trading_day_fn=lambda _d: False, failed_units_fn=list, dispatch_fn=_dispatch)
+    assert subject == "[KCA] 2026-09-24 휴장일 SKIP"
+    assert audited == [] and len(sent) == 1
+
+    # And: 거래일은 감사 후 요약 1통
+    subject = daily_audit.run_daily_audit(
+        "2026-09-14", trading_day_fn=lambda _d: True, failed_units_fn=lambda: [], dispatch_fn=_dispatch
+    )
+    assert subject == "[KCA] 2026-09-14 일일점검 OK"
+    assert audited == ["2026-09-14"] and len(sent) == 2
