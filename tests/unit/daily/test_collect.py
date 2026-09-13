@@ -837,3 +837,45 @@ def test_check_realtime_collection_coverage_raises_on_empty_snapshot() -> None:
     # When / Then
     with pytest.raises(ValueError, match="empty snapshot"):
         check_realtime_collection_coverage(df)
+
+
+def test_main_skips_cleanly_on_non_trading_day(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 24, 15, 22, 0, tzinfo=tz)
+
+    class _FakeKis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ensure_token(self, session):
+            return None
+
+        async def get_market_index_rate(self, session, code):
+            raise AssertionError("holiday must not query market indices")
+
+    async def _holiday(_client, _session, _date):
+        return False
+
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _holiday)
+    never_called = AsyncMock()
+    monkeypatch.setattr(collect, "resolve_daily_candidates", never_called)
+
+    # When: 추석 휴장일 결정창 안에서 실행
+    result = asyncio.run(collect.main(force=False))
+
+    # Then: 예외 없이 정상 종료, 후보 수집 미호출
+    assert result is None
+    never_called.assert_not_awaited()

@@ -3,6 +3,7 @@ Description=KCA daily collect (Mon-Fri 15:15 KST)
 
 [Timer]
 OnCalendar=Mon..Fri 15:20:00 Asia/Seoul
+AccuracySec=1s
 Persistent=false
 Unit=kca-collect.service
 

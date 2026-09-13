@@ -26,6 +26,25 @@ FAST_FORWARD_CHECK_TIMEOUT_SEC: int = 30
 TEST_GATE_TIMEOUT_SEC: int = 1800
 UV_SYNC_TIMEOUT_SEC: int = 600
 ALERT_DETAIL_TAIL_CHARS: int = 2000
+SYSTEMD_UNIT_GLOBS: tuple[str, ...] = ("kca-*.service", "kca-*.timer")
+SYSTEMCTL_TIMEOUT_SEC: int = 60
+# 브로커 시크릿·Gmail 앱 비밀번호가 담긴 .env 는 소유자만 읽을 수 있어야 한다
+SECRET_FILE_MODE: int = 0o600
+
+
+@dataclass(frozen=True)
+class UnitInstallResult:
+    """Outcome of converging installed systemd user units onto the repo copies.
+
+    Attributes:
+        changed: Unit file names copied because they were new or differed.
+        removed: kca-* unit file names deleted because the repo no longer has them.
+        enabled: Newly installed timer names enabled and started.
+    """
+
+    changed: tuple[str, ...]
+    removed: tuple[str, ...]
+    enabled: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -37,12 +56,15 @@ class SyncResult:
         from_sha: HEAD before this sync attempt.
         to_sha: origin/<branch>'s HEAD at fetch time (FETCH_HEAD).
         reason: "up_to_date" | "fast_forwarded" | "not_fast_forward" | "test_gate_failed".
+        units: Unit convergence outcome; None when the sync stopped before the
+            checkout was known-good (not_fast_forward / test_gate_failed).
     """
 
     updated: bool
     from_sha: str
     to_sha: str
     reason: str
+    units: UnitInstallResult | None = None
 
 
 def _resolve_uv_bin() -> str:
@@ -99,6 +121,78 @@ def _uv_sync(repo_dir: str) -> None:
     subprocess.run([_resolve_uv_bin(), "sync"], cwd=repo_dir, check=True, capture_output=True, text=True, timeout=UV_SYNC_TIMEOUT_SEC)  # noqa: S603, S607
 
 
+def install_systemd_units(
+    repo_dir: str,
+    *,
+    dest_dir: Path | None = None,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> UnitInstallResult:
+    """Converge the installed kca-* systemd user units onto deploy/systemd in the repo.
+
+    systemd reads its own copies under ~/.config/systemd/user, so a git checkout
+    update alone never changes a schedule. Only differing or new files are
+    copied, kca-* units deleted from the repo are disabled (timers) and removed,
+    daemon-reload runs only when something changed, and only newly installed
+    timers are enabled -- existing timers keep whatever enable state an
+    operator set. Services are never enabled directly: they start from their
+    timer or from OnSuccess=/OnFailure= chaining.
+
+    Args:
+        repo_dir: Repository checkout containing deploy/systemd.
+        dest_dir: Installed unit directory; None selects ~/.config/systemd/user.
+        run_fn: subprocess.run-compatible runner (tests substitute a fake).
+
+    Returns:
+        UnitInstallResult listing changed, removed and enabled unit names.
+
+    Raises:
+        subprocess.CalledProcessError: A systemctl call failed; propagated so
+            kca-code-sync.service fails loudly into its OnFailure alert.
+    """
+    src_dir = Path(repo_dir) / "deploy" / "systemd"
+    dest = dest_dir if dest_dir is not None else Path.home() / ".config" / "systemd" / "user"
+    dest.mkdir(parents=True, exist_ok=True)
+    wanted = {path.name: path for pattern in SYSTEMD_UNIT_GLOBS for path in src_dir.glob(pattern)}
+    installed = {path.name for pattern in SYSTEMD_UNIT_GLOBS for path in dest.glob(pattern)}
+    changed = sorted(
+        name for name, path in wanted.items()
+        if not (dest / name).exists() or (dest / name).read_bytes() != path.read_bytes()
+    )
+    removed = sorted(installed - set(wanted))
+    enabled = sorted(name for name in changed if name.endswith(".timer") and name not in installed)
+
+    def _systemctl(*args: str) -> None:
+        run_fn(["systemctl", "--user", *args], capture_output=True, text=True, timeout=SYSTEMCTL_TIMEOUT_SEC, check=True)
+
+    for name in removed:
+        if name.endswith(".timer"):
+            _systemctl("disable", "--now", name)
+        (dest / name).unlink()
+    for name in changed:
+        shutil.copyfile(wanted[name], dest / name)
+    if changed or removed:
+        _systemctl("daemon-reload")
+    for name in enabled:
+        _systemctl("enable", "--now", name)
+    return UnitInstallResult(changed=tuple(changed), removed=tuple(removed), enabled=tuple(enabled))
+
+
+def ensure_secret_permissions(repo_dir: str) -> bool:
+    """Tighten the repo .env to owner-only (0600) when it is broader.
+
+    Args:
+        repo_dir: Repository checkout that may contain .env.
+
+    Returns:
+        True when permissions were tightened, False when already 0600 or absent.
+    """
+    path = Path(repo_dir) / ".env"
+    if not path.exists() or (path.stat().st_mode & 0o777) == SECRET_FILE_MODE:
+        return False
+    path.chmod(SECRET_FILE_MODE)
+    return True
+
+
 def sync_repo(
     repo_dir: str,
     *,
@@ -108,6 +202,8 @@ def sync_repo(
     fast_forward_fn: Callable[[str, str, str], bool] = _is_fast_forward,
     test_gate_fn: Callable[[str], tuple[bool, str]] = _run_test_gate,
     uv_sync_fn: Callable[[str], None] = _uv_sync,
+    install_units_fn: Callable[[str], UnitInstallResult] = install_systemd_units,
+    secure_fn: Callable[[str], bool] = ensure_secret_permissions,
 ) -> SyncResult:
     """Fast-forward-only, test-gated git sync; roll back and alert on anything short of a clean pass.
 
@@ -119,6 +215,8 @@ def sync_repo(
         fast_forward_fn: Injected ancestor check.
         test_gate_fn: Injected full-suite test runner.
         uv_sync_fn: Injected dependency refresh.
+        install_units_fn: Injected systemd unit convergence (runs on up_to_date and fast_forwarded).
+        secure_fn: Injected .env permission tightening (runs with install_units_fn).
 
     Returns:
         SyncResult describing what happened.
@@ -133,7 +231,10 @@ def sync_repo(
     to_sha = git_fn(["rev-parse", "FETCH_HEAD"], repo_dir)
 
     if from_sha == to_sha:
-        return SyncResult(updated=False, from_sha=from_sha, to_sha=to_sha, reason="up_to_date")
+        # 코드 변경이 없어도 설치본 유닛 드리프트는 매 실행 수렴시킨다
+        secure_fn(repo_dir)
+        units = install_units_fn(repo_dir)
+        return SyncResult(updated=False, from_sha=from_sha, to_sha=to_sha, reason="up_to_date", units=units)
 
     if not fast_forward_fn(repo_dir, from_sha, to_sha):
         from src.tools.alerts import dispatch_failure_alert
@@ -157,7 +258,9 @@ def sync_repo(
         return SyncResult(updated=False, from_sha=from_sha, to_sha=to_sha, reason="test_gate_failed")
 
     uv_sync_fn(repo_dir)
-    return SyncResult(updated=True, from_sha=from_sha, to_sha=to_sha, reason="fast_forwarded")
+    secure_fn(repo_dir)
+    units = install_units_fn(repo_dir)
+    return SyncResult(updated=True, from_sha=from_sha, to_sha=to_sha, reason="fast_forwarded", units=units)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -169,9 +272,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--branch", default=DEFAULT_BRANCH)
     args = parser.parse_args(argv)
     result = sync_repo(str(settings.BASE_DIR), remote=args.remote, branch=args.branch)
+    units = result.units
     logger.info(
-        "[SYS] code_sync updated=%s from=%s to=%s reason=%s",
+        "[SYS] code_sync updated=%s from=%s to=%s reason=%s units_changed=%s units_removed=%s timers_enabled=%s",
         result.updated, result.from_sha[:8], result.to_sha[:8], result.reason,
+        list(units.changed) if units else [], list(units.removed) if units else [], list(units.enabled) if units else [],
     )
 
 

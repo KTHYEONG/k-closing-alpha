@@ -1,8 +1,8 @@
 [Unit]
-Description=KCA git 코드 동기화 (평일 09:00 KST, 장시작 6시간여 전)
+Description=KCA git 코드 동기화 (평일 07:30 KST, 08:30 적재·09:00 청산 이전)
 
 [Timer]
-OnCalendar=Mon..Fri 09:00:00 Asia/Seoul
+OnCalendar=Mon..Fri 07:30:00 Asia/Seoul
 Persistent=true
 Unit=kca-code-sync.service
 

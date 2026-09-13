@@ -9,15 +9,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import math
+from collections.abc import Callable
 
 import aiohttp
 import pandas as pd
 
 from src import settings
 from src.api.kis.ws_client import KisWebSocketClient, issue_approval_key
-from src.config.market_session import PAPER_ENTRY_HHMMSS, PAPER_EXIT_MOC_HHMMSS, PAPER_EXIT_SESSION_START_HHMMSS
+from src.config.market_session import (
+    PAPER_ENTRY_HHMMSS,
+    PAPER_EXIT_MOC_HHMMSS,
+    PAPER_EXIT_SESSION_END_HHMMSS,
+    PAPER_EXIT_SESSION_START_HHMMSS,
+)
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.predict import run_topk_ranker_sleeve
 from src.execution.paper_broker import (
@@ -95,8 +102,9 @@ async def run_paper_session(
     ledger: PaperLedger | None = None,
     ws_client: KisWebSocketClient | None = None,
     session: aiohttp.ClientSession | None = None,
+    now_fn: Callable[[], pd.Timestamp] | None = None,
 ) -> int:
-    """페이퍼 세션을 실행하고 체결 건수를 반환한다. 체결은 원장에 즉시 flush한다."""
+    """페이퍼 세션을 실행하고 체결 건수를 반환한다. 체결은 원장에 즉시 flush한다. 청산 세션은 전량 청산, 정규장 종료 프린트, 장마감 벽시계 데드라인 중 먼저 오는 조건에서 끝난다."""
     if phase not in ("entry", "exit"):
         raise ValueError(f"unknown phase {phase!r}")
     ledger = ledger or PaperLedger()
@@ -153,40 +161,66 @@ async def run_paper_session(
     placed_at = _placed_at(date_str, PAPER_EXIT_SESSION_START_HHMMSS)
     positions = ledger.load_open_positions()
     orders = build_exit_orders(positions, date_str, placed_at, moc=False)
-    if phase == "exit" and ws_client is None:  # pragma: no cover - live KIS boundary, probe-verified
-        owned = session or aiohttp.ClientSession()
-        key = await issue_approval_key(owned, settings.KIS_APP_KEY, settings.KIS_APP_SECRET)
+    # 청산할 포지션이 없으면 웹소켓을 열지 않는다(빈 구독은 스트림 계약상 ValueError)
+    if not orders:
+        logger.info("[DATA] stage=paper_exit status=SKIP reason=no_open_positions date=%s", date_str)
+        return 0
+    session_end = _placed_at(date_str, PAPER_EXIT_SESSION_END_HHMMSS)
+    now = now_fn() if now_fn is not None else pd.Timestamp.now(tz="Asia/Seoul")
+    remaining_seconds = (session_end - now).total_seconds()
+    if remaining_seconds <= 0:
+        logger.warning("[DATA] stage=paper_exit status=SKIP reason=past_session_end date=%s", date_str)
+        return 0
+    owned_session: aiohttp.ClientSession | None = None
+    if ws_client is None:  # pragma: no cover - live KIS boundary, probe-verified
+        if session is None:
+            owned_session = aiohttp.ClientSession()
+            session = owned_session
+        key = await issue_approval_key(session, settings.KIS_APP_KEY, settings.KIS_APP_SECRET)
         ws_client = KisWebSocketClient(approval_key=key)
-        session = owned
     codes = sorted({o.symbol for o in orders})
     fills: list[dict] = []
     filled_ids: set[str] = set()
-    async for symbol, hhmmss, price in ws_client.stream(session, codes):
-        print_ts = _placed_at(date_str, hhmmss)
-        if print_ts >= placed_at:
-            if phase == "exit" and hhmmss >= PAPER_EXIT_MOC_HHMMSS:
-                pending = {o.symbol for o in orders if o.order_id not in filled_ids and o.limit_price is not None}
-                moc_orders = build_exit_orders(
-                    positions[positions["symbol"].isin(pending)], date_str, placed_at, moc=True
-                )
-                moc_by_symbol = {o.symbol: o for o in moc_orders}
-                orders = [moc_by_symbol.get(o.symbol, o) for o in orders]
-            for order in [o for o in orders if o.symbol == symbol and o.order_id not in filled_ids]:
-                fill = decide_fill(order, price, print_ts)
-                if fill is not None:
-                    filled_ids.add(order.order_id)
-                    fills.append(
-                        {
-                            "order_id": fill.order_id,
-                            "symbol": fill.symbol,
-                            "side": fill.side,
-                            "qty": fill.qty,
-                            "fill_price": fill.fill_price,
-                            "filled_at": fill.filled_at,
-                            "decision_date": order.decision_date,
-                            "trigger": fill.trigger,
-                        }
-                    )
+    try:
+        # 장마감 벽시계 데드라인: 프린트가 끊겨도 oneshot 세션이 다음 날까지 살아남지 않는다
+        async with asyncio.timeout(remaining_seconds):
+            async with contextlib.aclosing(ws_client.stream(session, codes)) as prints:
+                async for symbol, hhmmss, price in prints:
+                    print_ts = _placed_at(date_str, hhmmss)
+                    if print_ts >= placed_at:
+                        if hhmmss >= PAPER_EXIT_MOC_HHMMSS:
+                            pending = {o.symbol for o in orders if o.order_id not in filled_ids and o.limit_price is not None}
+                            moc_orders = build_exit_orders(
+                                positions[positions["symbol"].isin(pending)], date_str, placed_at, moc=True
+                            )
+                            moc_by_symbol = {o.symbol: o for o in moc_orders}
+                            orders = [moc_by_symbol.get(o.symbol, o) for o in orders]
+                        for order in [o for o in orders if o.symbol == symbol and o.order_id not in filled_ids]:
+                            fill = decide_fill(order, price, print_ts)
+                            if fill is not None:
+                                filled_ids.add(order.order_id)
+                                fills.append(
+                                    {
+                                        "order_id": fill.order_id,
+                                        "symbol": fill.symbol,
+                                        "side": fill.side,
+                                        "qty": fill.qty,
+                                        "fill_price": fill.fill_price,
+                                        "filled_at": fill.filled_at,
+                                        "decision_date": order.decision_date,
+                                        "trigger": fill.trigger,
+                                    }
+                                )
+                    # 전량 청산 또는 정규장 종료 프린트 이후에는 더 받을 체결 기회가 없다
+                    if len(filled_ids) == len(orders) or hhmmss >= PAPER_EXIT_SESSION_END_HHMMSS:
+                        break
+    except TimeoutError:
+        logger.warning(
+            "[DATA] stage=paper_exit status=DEADLINE date=%s unfilled=%d", date_str, len(orders) - len(filled_ids)
+        )
+    finally:
+        if owned_session is not None:
+            await owned_session.close()  # pragma: no cover - live KIS boundary
     if fills:
         ledger.record(fills, kind="fills")
     return len(fills)

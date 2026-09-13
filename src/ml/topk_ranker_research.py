@@ -1006,7 +1006,10 @@ def save_production_bundle(bundle: dict[str, Any], export_dir: str = TOPK_RANKER
     # 챔피언 번들과 파일명 충돌 방지용 별도 디렉터리
     os.makedirs(export_dir, exist_ok=True)
     path = os.path.join(export_dir, "sizing_pipeline_bundle.joblib")
-    dump(bundle, path)
+    tmp_path = f"{path}.tmp"
+    dump(bundle, tmp_path)
+    # 추론 쪽이 부분 기록된 번들을 읽지 않도록 같은 디렉터리에서 원자적으로 교체한다
+    os.replace(tmp_path, path)
     return path
 
 

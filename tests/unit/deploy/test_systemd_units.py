@@ -49,17 +49,6 @@ def test_daily_audit_timer_exists_and_targets_service() -> None:
     assert "WantedBy=default.target" not in service
 
 
-def test_backup_service_syncs_data_and_artifacts_to_gdrive() -> None:
-    import pathlib
-
-    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    text = (root / "kca-backup.service").read_text(encoding="utf-8")
-
-    assert "rclone sync" in text
-    assert "gdrive:quant-lake/live/k-closing-alpha/data" in text
-    assert "gdrive:quant-lake/live/k-closing-alpha/artifacts" in text
-
-
 def test_backup_runs_after_archive_and_audit() -> None:
     import pathlib
 
@@ -97,16 +86,6 @@ def test_backup_uses_backup_dir_instead_of_bare_sync() -> None:
 
     assert "--backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/data/" in text
     assert "--backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/artifacts/" in text
-
-
-def test_backup_prune_removes_deleted_snapshots_older_than_30_days() -> None:
-    import pathlib
-
-    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    text = (root / "kca-backup-prune.service").read_text(encoding="utf-8")
-
-    assert "rclone delete --min-age 30d gdrive:quant-lake/live/k-closing-alpha/_deleted" in text
-    assert "rclone rmdirs gdrive:quant-lake/live/k-closing-alpha/_deleted" in text
 
 
 def test_backup_prune_timer_exists_and_targets_service() -> None:
@@ -190,29 +169,121 @@ def test_code_sync_timer_exists_and_install_script_enables_it() -> None:
     assert "kca-code-sync.timer" in install_text
 
 
-def test_backup_excludes_wsl_only_altdata_and_legacy_parquet() -> None:
+def test_backup_service_copies_data_and_artifacts_to_gdrive_without_deleting() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     text = (root / "kca-backup.service").read_text(encoding="utf-8")
-    data_line = next(line for line in text.splitlines() if "rclone sync" in line and "/data " in line)
+    exec_lines = [line for line in text.splitlines() if line.startswith("ExecStart=")]
 
-    assert '--exclude "history/altdata/**"' in data_line
-    assert '--exclude "history/intraday/**"' in data_line
-    assert '--exclude "history/orderbook/**"' in data_line
-    assert '--exclude "parquet/theme.parquet"' in data_line
-    assert '--exclude "parquet/trade_log.parquet"' in data_line
+    assert len(exec_lines) == 2
+    assert all("rclone copy" in line for line in exec_lines)
+    assert "rclone sync" not in text
+    assert "--exclude" not in text
+    assert "gdrive:quant-lake/live/k-closing-alpha/data" in text
+    assert "gdrive:quant-lake/live/k-closing-alpha/artifacts" in text
 
 
-def test_backup_excludes_wsl_only_artifacts_extras() -> None:
+def test_backup_prune_service_runs_dated_directory_pruner() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    text = (root / "kca-backup.service").read_text(encoding="utf-8")
-    artifacts_line = next(line for line in text.splitlines() if "rclone sync" in line and "/artifacts " in line)
+    text = (root / "kca-backup-prune.service").read_text(encoding="utf-8")
 
-    assert '--exclude "models/.cache/**"' in artifacts_line
-    assert '--exclude "models/.gitattributes"' in artifacts_line
-    assert '--exclude "models/sizing_pipeline_bundle.joblib"' in artifacts_line
-    assert '--exclude "models/topk_ranker_report.parquet"' in artifacts_line
-    assert '--exclude "models/universe_grid.parquet"' in artifacts_line
+    assert "src.tools.backup_prune" in text
+    assert "--min-age" not in text
+    assert "After=kca-backup.service" in text
+
+
+def test_every_kca_service_pins_kst_timezone() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    services = sorted(root.glob("kca-*.service"))
+
+    assert services
+    offenders = [p.name for p in services if "Environment=TZ=Asia/Seoul" not in p.read_text(encoding="utf-8")]
+    assert offenders == []
+
+
+def test_every_kca_service_except_alert_template_has_failure_alert() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    services = [p for p in sorted(root.glob("kca-*.service")) if p.name != "kca-alert@.service"]
+
+    missing = [p.name for p in services if "OnFailure=kca-alert@%n.service" not in p.read_text(encoding="utf-8")]
+    assert missing == []
+    # 알림 템플릿이 자기 자신을 OnFailure로 부르면 실패 루프가 된다
+    assert "OnFailure=" not in (root / "kca-alert@.service").read_text(encoding="utf-8")
+
+
+def test_decision_path_timers_fire_with_one_second_accuracy() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    for name in ("kca-collect.timer", "kca-predict.timer", "kca-finalize-close.timer", "kca-paper-exit.timer"):
+        assert "AccuracySec=1s" in (root / name).read_text(encoding="utf-8"), name
+
+
+def test_paper_exit_start_timeout_backstops_after_session_end_same_day() -> None:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-paper-exit.service").read_text(encoding="utf-8")
+    match = re.search(r"TimeoutStartSec=(\d+)h", text)
+
+    assert match is not None
+    start_seconds = 9 * 3600
+    end_seconds = start_seconds + int(match.group(1)) * 3600
+    assert end_seconds > 15 * 3600 + 30 * 60
+    assert end_seconds < 24 * 3600
+
+
+def test_code_sync_runs_before_morning_ingest_and_paper_exit() -> None:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    def _first_time(name: str) -> str:
+        text = (root / name).read_text(encoding="utf-8")
+        match = re.search(r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})", text)
+        assert match is not None, name
+        return match.group(1)
+
+    ingest_text = (root / "kca-price-ingest.timer").read_text(encoding="utf-8")
+    ingest_times = sorted(re.findall(r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})", ingest_text))
+
+    assert _first_time("kca-code-sync.timer") < ingest_times[0]
+    assert _first_time("kca-code-sync.timer") < _first_time("kca-paper-exit.timer")
+
+
+def test_backup_runs_after_evening_price_ingest() -> None:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    def _first_time(name: str) -> str:
+        text = (root / name).read_text(encoding="utf-8")
+        match = re.search(r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})", text)
+        assert match is not None, name
+        return match.group(1)
+
+    ingest_text = (root / "kca-price-ingest.timer").read_text(encoding="utf-8")
+    latest_ingest = max(re.findall(r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})", ingest_text))
+    service = (root / "kca-backup.service").read_text(encoding="utf-8")
+    after_line = next(line for line in service.splitlines() if line.startswith("After="))
+
+    assert _first_time("kca-backup.timer") > latest_ingest
+    assert "kca-price-ingest.service" in after_line
+
+
+def test_daily_audit_waits_for_intraday_archive() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-daily-audit.service").read_text(encoding="utf-8")
+    after_line = next(line for line in text.splitlines() if line.startswith("After="))
+
+    assert "kca-archive-intraday.service" in after_line
