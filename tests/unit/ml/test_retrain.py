@@ -363,3 +363,27 @@ def test_retrain_exit_grid_revalidation_missing_price_history_raises(tmp_path, m
     with pytest.raises(ValueError, match="price_history not found"):
         main(["--exit-grid-revalidation", "--export-dir", str(tmp_path)])
 
+
+def test_retrain_main_configures_logging_before_dispatch(monkeypatch) -> None:
+    import logging
+
+    import pytest
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    calls: list[tuple[tuple, dict]] = []
+
+    def fake_basic_config(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(mod.logging, "basicConfig", fake_basic_config)
+
+    with pytest.raises(ValueError, match="no action flag given"):
+        main([])
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == ()
+    assert kwargs == {"level": logging.INFO, "format": "%(message)s"}
+

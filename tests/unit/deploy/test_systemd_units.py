@@ -188,3 +188,43 @@ def test_code_sync_timer_exists_and_install_script_enables_it() -> None:
     assert "src.tools.code_sync" in service
     assert "OnFailure=kca-alert@%n.service" in service
     assert "kca-code-sync.timer" in install_text
+
+
+def test_paper_entry_timer_exists_and_targets_service() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    timer = (root / "kca-paper-entry.timer").read_text(encoding="utf-8")
+
+    assert "Unit=kca-paper-entry.service" in timer
+    assert "OnCalendar=Mon..Fri" in timer
+    assert "Persistent=false" in timer
+
+
+def test_paper_entry_timer_fires_after_finalize_close_deadline() -> None:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+
+    def _first_time(name: str) -> str:
+        text = (root / name).read_text(encoding="utf-8")
+        match = re.search(r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})", text)
+        assert match is not None, name
+        return match.group(1)
+
+    finalize_time = _first_time("kca-finalize-close.timer")
+    entry_time = _first_time("kca-paper-entry.timer")
+
+    assert entry_time > finalize_time
+
+
+def test_paper_entry_runs_after_finalize_close() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-paper-entry.service").read_text(encoding="utf-8")
+    after_line = next(line for line in text.splitlines() if line.startswith("After="))
+
+    assert "kca-finalize-close.service" in after_line
+    assert "OnFailure=kca-alert@%n.service" in text
