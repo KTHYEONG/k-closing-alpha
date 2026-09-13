@@ -127,6 +127,42 @@ def test_kis_ensure_token_writes_token_file_atomically_with_owner_only_mode(tmp_
     assert [p.name for p in tmp_path.iterdir()] == [token_file.name]
 
 
+def test_kis_ensure_token_creates_missing_parent_directory_before_writing(tmp_path) -> None:
+    """설정 디렉터리가 (재배포/마이그레이션 등으로) 아직 없어도 토큰 캐시 쓰기가 자가치유되어야 한다."""
+    import asyncio
+
+    from src.api.kis.client import KisApiClient
+
+    configs_dir = tmp_path / "configs"
+    token_file = configs_dir / "kis_token_cache.json"
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+
+    class _Resp:
+        async def json(self):
+            return {"access_token": "TOK", "expires_in": 86400}
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session:
+        def post(self, _url, **_kw):
+            return _Ctx()
+
+    # Given: configs_dir 자체가 아직 존재하지 않음
+    assert not configs_dir.exists()
+
+    # When
+    asyncio.run(client.ensure_token(_Session()))
+
+    # Then: 디렉터리가 자동 생성되고 토큰이 정상 기록됨
+    assert configs_dir.is_dir()
+    assert token_file.exists()
+
+
 def test_kis_ensure_token_falls_back_to_cached_token_when_issuance_throttled(tmp_path) -> None:
     import asyncio
     import json
