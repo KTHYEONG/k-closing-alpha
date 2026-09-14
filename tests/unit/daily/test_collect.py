@@ -931,8 +931,8 @@ def test_load_eligible_codes_returns_symbols_listed_on_previous_trading_day(tmp_
     path = tmp_path / "price_history.parquet"
     panel.to_parquet(path, index=False)
 
-    # When: 월요일(9/14) 결정, 주말은 오라클 호출 없이 건너뜀
-    out = load_eligible_codes(pd.Timestamp("2026-09-14"), path=path, is_trading_day=lambda _d: True)
+    # When: 직전 거래일(9/11)을 명시 전달
+    out = load_eligible_codes(pd.Timestamp("2026-09-14"), prev_trading_day=pd.Timestamp("2026-09-11"), path=path)
 
     # Then
     assert out == frozenset({"005930", "0220W0", "00088K"})
@@ -951,11 +951,11 @@ def test_load_eligible_codes_fails_closed_when_panel_is_stale_or_missing(tmp_pat
 
     # When / Then: 신선도 미달은 fail-closed
     with pytest.raises(ValueError, match="stale price_history"):
-        load_eligible_codes(pd.Timestamp("2026-09-14"), path=path, is_trading_day=lambda _d: True)
+        load_eligible_codes(pd.Timestamp("2026-09-14"), prev_trading_day=pd.Timestamp("2026-09-11"), path=path)
 
     # And: 파일 부재도 fail-closed
     with pytest.raises(FileNotFoundError):
-        load_eligible_codes(pd.Timestamp("2026-09-14"), path=tmp_path / "absent.parquet", is_trading_day=lambda _d: True)
+        load_eligible_codes(pd.Timestamp("2026-09-14"), prev_trading_day=pd.Timestamp("2026-09-11"), path=tmp_path / "absent.parquet")
 
 
 def test_filter_eligible_candidates_drops_instruments_outside_research_panel(caplog) -> None:
@@ -1034,7 +1034,7 @@ def test_main_filters_candidates_by_eligibility_before_quoting(monkeypatch) -> N
     eligibility_dates = []
     quoted = []
 
-    def _eligible(decision_date):
+    def _eligible(decision_date, **_kwargs):
         eligibility_dates.append(decision_date)
         return frozenset({"005930"})
 
@@ -1088,7 +1088,7 @@ def test_main_fails_closed_when_eligibility_panel_is_stale(monkeypatch) -> None:
     async def _trading_day(_client, _session, _date):
         return True
 
-    def _stale(_decision_date):
+    def _stale(_decision_date, **_kwargs):
         raise ValueError("stale price_history: no rows on prev_trading_day=2026-09-11")
 
     fetch_all = AsyncMock()
@@ -1158,36 +1158,6 @@ def test_superseded_unresolved_instrument_helpers_are_removed() -> None:
     assert collect.QUOTE_UNRESOLVED_API == "현재가_미해석"
 
 
-def test_load_eligible_codes_defaults_to_krx_trading_calendar(tmp_path, monkeypatch) -> None:
-    import pandas as pd
-
-    import src.data.trading_calendar as trading_calendar
-    from src.daily.collect import load_eligible_codes
-
-    # Given: 금요일(9/11)이 휴장, 목요일(9/10)이 직전 거래일
-    panel = pd.DataFrame({
-        "date": pd.to_datetime(["2026-09-10", "2026-09-10"]),
-        "symbol": ["005930", "0220W0"],
-        "close": [70000.0, 6790.0],
-    })
-    path = tmp_path / "price_history.parquet"
-    panel.to_parquet(path, index=False)
-    asked = []
-
-    def _krx_calendar(date):
-        asked.append(pd.Timestamp(date))
-        return pd.Timestamp(date) != pd.Timestamp("2026-09-11")
-
-    monkeypatch.setattr(trading_calendar, "is_krx_trading_day", _krx_calendar)
-
-    # When: 오라클 미지정
-    out = load_eligible_codes(pd.Timestamp("2026-09-14"), path=path)
-
-    # Then: KRX 캘린더로 휴장일을 건너뛴 직전 거래일 구성을 반환
-    assert out == frozenset({"005930", "0220W0"})
-    assert asked == [pd.Timestamp("2026-09-11"), pd.Timestamp("2026-09-10")]
-
-
 def test_collect_module_constants_sourced_from_data_account_kwargs() -> None:
     from src.daily import collect
 
@@ -1198,3 +1168,463 @@ def test_collect_module_constants_sourced_from_data_account_kwargs() -> None:
     assert kwargs["account_id"] == collect.ACCOUNT_ID
     assert kwargs["hts_id"] == collect.HTS_ID
     assert kwargs["token_file"] == collect.TOKEN_FILE
+
+
+def test_resolve_prev_trading_day_kis_skips_weekend_and_kis_holiday(monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    asked = []
+
+    async def _kis(_client, _session, date):
+        asked.append(pd.Timestamp(date))
+        return pd.Timestamp(date) != pd.Timestamp("2026-09-11")
+
+    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+
+    # When: 월요일 결정, 금요일(9/11) 휴장
+    prev = asyncio.run(collect.resolve_prev_trading_day_kis(object(), object(), pd.Timestamp("2026-09-14")))
+
+    # Then: 주말은 호출 없이 건너뛰고 목요일 반환
+    assert prev == pd.Timestamp("2026-09-10")
+    assert asked == [pd.Timestamp("2026-09-11"), pd.Timestamp("2026-09-10")]
+
+
+def test_resolve_prev_trading_day_kis_falls_back_to_krx_when_kis_oracle_fails(monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    async def _kis_down(_client, _session, _date):
+        raise RuntimeError("KIS trading-day oracle failed rt_cd=9")
+
+    krx_asked = []
+
+    def _krx(date):
+        krx_asked.append(pd.Timestamp(date))
+        return True
+
+    monkeypatch.setattr(collect, "is_kis_trading_day", _kis_down)
+
+    # When
+    with caplog.at_level(logging.WARNING, logger="src.daily.collect"):
+        prev = asyncio.run(
+            collect.resolve_prev_trading_day_kis(object(), object(), pd.Timestamp("2026-09-14"), krx_is_trading_day=_krx)
+        )
+
+    # Then
+    assert prev == pd.Timestamp("2026-09-11")
+    assert krx_asked == [pd.Timestamp("2026-09-11")]
+    assert "stage=prev_trading_day" in caplog.text
+    assert "fallback=krx" in caplog.text
+
+
+def test_resolve_prev_trading_day_kis_fails_closed_when_both_oracles_fail_or_no_day(monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+    import pytest
+
+    from src.daily import collect
+
+    async def _kis_down(_client, _session, _date):
+        raise RuntimeError("KIS trading-day oracle failed rt_cd=9")
+
+    def _krx_down(_date):
+        raise RuntimeError("krx down")
+
+    monkeypatch.setattr(collect, "is_kis_trading_day", _kis_down)
+
+    # When / Then: 두 오라클 모두 실패
+    with pytest.raises(RuntimeError, match="krx down"):
+        asyncio.run(
+            collect.resolve_prev_trading_day_kis(object(), object(), pd.Timestamp("2026-09-14"), krx_is_trading_day=_krx_down)
+        )
+
+    async def _always_closed(_client, _session, _date):
+        return False
+
+    monkeypatch.setattr(collect, "is_kis_trading_day", _always_closed)
+
+    # When / Then: 조회 한도 내 거래일 없음
+    with pytest.raises(ValueError, match="no trading day"):
+        asyncio.run(
+            collect.resolve_prev_trading_day_kis(object(), object(), pd.Timestamp("2026-09-14"), max_lookback_days=3)
+        )
+
+
+def test_load_eligible_codes_rejects_prev_trading_day_not_before_decision_date(tmp_path) -> None:
+    import pandas as pd
+    import pytest
+
+    from src.daily.collect import load_eligible_codes
+
+    path = tmp_path / "price_history.parquet"
+    pd.DataFrame({"date": pd.to_datetime(["2026-09-14"]), "symbol": ["005930"], "close": [1.0]}).to_parquet(path, index=False)
+
+    # When / Then: 결정일 당일 구성은 룩어헤드
+    with pytest.raises(ValueError, match="prev_trading_day"):
+        load_eligible_codes(pd.Timestamp("2026-09-14"), prev_trading_day=pd.Timestamp("2026-09-14"), path=path)
+
+
+def test_resolve_eligible_codes_passes_kis_resolved_prev_day_to_panel_lookup(monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    async def _kis(_client, _session, _date):
+        return True
+
+    calls = []
+
+    def _load(decision_date, *, prev_trading_day, path=None):
+        calls.append((decision_date, prev_trading_day))
+        return frozenset({"005930"})
+
+    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+    monkeypatch.setattr(collect, "load_eligible_codes", _load)
+
+    # When
+    out = asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
+
+    # Then
+    assert out == frozenset({"005930"})
+    assert calls == [(pd.Timestamp("2026-09-14"), pd.Timestamp("2026-09-11"))]
+
+
+def test_main_resolves_previous_trading_day_through_kis_before_eligibility(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    import pandas as pd
+    import pytest
+
+    from src.daily import collect
+
+    class _StopError(Exception):
+        pass
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 14, 15, 20, 5, tzinfo=tz)
+
+    class _FakeKis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ensure_token(self, session):
+            return None
+
+        async def get_market_index_rate(self, session, code):
+            return {"rt_cd": "1"}
+
+    oracle_dates = []
+
+    async def _trading_day(_client, _session, date):
+        oracle_dates.append(pd.Timestamp(date).normalize())
+        return True
+
+    eligibility_calls = []
+
+    def _eligible(decision_date, *, prev_trading_day, path=None):
+        eligibility_calls.append((decision_date, prev_trading_day))
+        return frozenset({"005930"})
+
+    async def _fetch_all(stock_list, _client, _session):
+        raise _StopError
+
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
+    monkeypatch.setattr(
+        collect,
+        "resolve_daily_candidates",
+        AsyncMock(return_value=[{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "3.0"}]),
+    )
+    monkeypatch.setattr(collect, "load_eligible_codes", _eligible)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fetch_all)
+
+    # When
+    with pytest.raises(_StopError):
+        asyncio.run(collect.main(force=False))
+
+    # Then: 당일 확인(9/14) 후 직전 거래일(9/11)을 KIS로 확정해 적격성 조회에 전달
+    assert eligibility_calls == [(pd.Timestamp("2026-09-14"), pd.Timestamp("2026-09-11"))]
+    assert oracle_dates == [pd.Timestamp("2026-09-14"), pd.Timestamp("2026-09-11")]
+
+
+def test_requote_failed_quotes_recovers_transient_failure_but_not_unresolved(caplog) -> None:
+    import asyncio
+    import logging
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import collect
+    from src.processing.schema import QUOTE_FAILED_COL
+
+    class _Client:
+        def __init__(self, fail_first_for=(), unresolved=()):
+            self.calls = {}
+            self.fail_first_for = set(fail_first_for)
+            self.unresolved = set(unresolved)
+
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            n = self.calls.get(code, 0) + 1
+            self.calls[code] = n
+            if code in self.unresolved:
+                return {"rt_cd": "0", "msg_cd": "MCA00000", "output": {"stck_prpr": "0"}}
+            if code in self.fail_first_for and n == 1:
+                return {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."}
+            return {"rt_cd": "0", "output": {
+                "stck_shrn_iscd": code, "stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100",
+                "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100",
+                "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI",
+            }}
+
+        async def get_investor_trend_estimate(self, session, code):
+            return {"rt_cd": "0", "output2": []}
+
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            return {"rt_cd": "0", "output1": {}}
+
+    client = _Client(fail_first_for={"000660"}, unresolved={"500041"})
+    stock_list = [
+        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+        {"code": "500041", "name": "C", "price": "35300", "chgrate": "8.47"},
+    ]
+
+    async def _run():
+        sem = asyncio.Semaphore(4)
+        first = await asyncio.gather(*[
+            collect.fetch_single_stock(i, s, len(stock_list), sem, client, object()) for i, s in enumerate(stock_list)
+        ])
+        return first, await collect.requote_failed_quotes(
+            stock_list, list(first), client, object(), sem,
+            now_fn=lambda: datetime(2026, 9, 14, 15, 21, 30, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+
+    # When
+    with caplog.at_level(logging.INFO, logger="src.daily.collect"):
+        first, out = asyncio.run(_run())
+
+    # Then: 일시 실패 행만 1회 재조회되어 복구, 미해석 행은 재시도하지 않음
+    assert first[1][0][QUOTE_FAILED_COL] is True
+    assert out[1][0][QUOTE_FAILED_COL] is False
+    assert out[2][0][QUOTE_FAILED_COL] is True
+    assert client.calls == {"005930": 1, "000660": 2, "500041": 1}
+    assert "stage=realtime_requote" in caplog.text
+    assert "n_retry=1" in caplog.text
+    assert "n_recovered=1" in caplog.text
+
+
+def test_requote_failed_quotes_skips_at_or_after_deadline(caplog) -> None:
+    import asyncio
+    import logging
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.config.market_session import REALTIME_REQUOTE_DEADLINE_HHMMSS
+    from src.daily import collect
+
+    class _Client:
+        def __init__(self, fail_first_for=(), unresolved=()):
+            self.calls = {}
+            self.fail_first_for = set(fail_first_for)
+            self.unresolved = set(unresolved)
+
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            n = self.calls.get(code, 0) + 1
+            self.calls[code] = n
+            if code in self.unresolved:
+                return {"rt_cd": "0", "msg_cd": "MCA00000", "output": {"stck_prpr": "0"}}
+            if code in self.fail_first_for and n == 1:
+                return {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."}
+            return {"rt_cd": "0", "output": {
+                "stck_shrn_iscd": code, "stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100",
+                "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100",
+                "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI",
+            }}
+
+        async def get_investor_trend_estimate(self, session, code):
+            return {"rt_cd": "0", "output2": []}
+
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            return {"rt_cd": "0", "output1": {}}
+
+    client = _Client(fail_first_for={"000660"})
+    stock_list = [{"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"}]
+    hh, mm, ss = int(REALTIME_REQUOTE_DEADLINE_HHMMSS[:2]), int(REALTIME_REQUOTE_DEADLINE_HHMMSS[2:4]), int(REALTIME_REQUOTE_DEADLINE_HHMMSS[4:])
+
+    async def _run():
+        sem = asyncio.Semaphore(1)
+        first = [await collect.fetch_single_stock(0, stock_list[0], 1, sem, client, object())]
+        return await collect.requote_failed_quotes(
+            stock_list, first, client, object(), sem,
+            now_fn=lambda: datetime(2026, 9, 14, hh, mm, ss, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+
+    # When
+    with caplog.at_level(logging.WARNING, logger="src.daily.collect"):
+        out = asyncio.run(_run())
+
+    # Then
+    assert client.calls == {"000660": 1}
+    assert len(out) == 1
+    assert "status=SKIPPED" in caplog.text
+    assert "reason=deadline" in caplog.text
+
+
+def test_fetch_all_stock_data_requotes_and_emits_no_carriage_return_off_tty(monkeypatch, capsys, caplog) -> None:
+    import asyncio
+    import logging
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import collect
+    from src.processing.schema import QUOTE_FAILED_COL
+
+    class _Client:
+        def __init__(self, fail_first_for=(), unresolved=()):
+            self.calls = {}
+            self.fail_first_for = set(fail_first_for)
+            self.unresolved = set(unresolved)
+
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            n = self.calls.get(code, 0) + 1
+            self.calls[code] = n
+            if code in self.unresolved:
+                return {"rt_cd": "0", "msg_cd": "MCA00000", "output": {"stck_prpr": "0"}}
+            if code in self.fail_first_for and n == 1:
+                return {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."}
+            return {"rt_cd": "0", "output": {
+                "stck_shrn_iscd": code, "stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100",
+                "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100",
+                "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI",
+            }}
+
+        async def get_investor_trend_estimate(self, session, code):
+            return {"rt_cd": "0", "output2": []}
+
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            return {"rt_cd": "0", "output1": {}}
+
+    client = _Client(fail_first_for={"000660"})
+    stock_list = [
+        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+    ]
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
+
+    # When
+    with caplog.at_level(logging.INFO, logger="src.daily.collect"):
+        results, failed_info = asyncio.run(
+            collect.fetch_all_stock_data(
+                stock_list, client, object(),
+                now_fn=lambda: datetime(2026, 9, 14, 15, 21, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+            )
+        )
+
+    # Then
+    assert [row[QUOTE_FAILED_COL] for row in results] == [False, False]
+    assert failed_info == []
+    assert "\r" not in capsys.readouterr().out
+    assert "stage=realtime_quote_batch n_rows=2 n_quote_failed=0" in caplog.text
+
+
+def test_resolve_prev_trading_day_kis_uses_default_krx_oracle_on_kis_failure(monkeypatch) -> None:
+    # Diff-coverage supplement: contract-mandated default-oracle branch
+    # (`if oracle is None: from ... import is_krx_trading_day`) has no skeleton.
+    import asyncio
+
+    import pandas as pd
+
+    import src.data.trading_calendar as trading_calendar
+    from src.daily import collect
+
+    async def _kis_down(_client, _session, _date):
+        raise RuntimeError("KIS trading-day oracle failed rt_cd=9")
+
+    monkeypatch.setattr(collect, "is_kis_trading_day", _kis_down)
+    monkeypatch.setattr(trading_calendar, "is_krx_trading_day", lambda _date: True)
+
+    # When: krx_is_trading_day 미지정
+    prev = asyncio.run(collect.resolve_prev_trading_day_kis(object(), object(), pd.Timestamp("2026-09-14")))
+
+    # Then: 기본 KRX 오라클로 9/11 확정
+    assert prev == pd.Timestamp("2026-09-11")
+
+
+def test_fetch_all_stock_data_writes_progress_bar_on_tty(monkeypatch) -> None:
+    # Diff-coverage supplement: contract-mandated TTY branch
+    # (`if sys.stdout.isatty():` write/flush) has no skeleton.
+    import asyncio
+    import io
+    import sys
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_shrn_iscd": "005930", "stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
+    client.get_investor_trend_estimate = AsyncMock(
+        return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]}
+    )
+    client.get_orderbook_snapshot = AsyncMock(
+        return_value={"rt_cd": "0", "output1": {"askp1": "18010", "bidp1": "17990"}}
+    )
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
+
+    buf = io.StringIO()
+    buf.isatty = lambda: True  # type: ignore[method-assign]
+    monkeypatch.setattr(sys, "stdout", buf)
+
+    # When
+    stock_list = [{"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"}]
+    results, failed_info = asyncio.run(collect.fetch_all_stock_data(stock_list, client, object()))
+
+    # Then: TTY에서는 \r 진행바 출력
+    assert len(results) == 1
+    assert failed_info == []
+    assert "\r" in buf.getvalue()
+
+
+def test_resolve_daily_candidates_enables_kis_band_fallback(monkeypatch) -> None:
+    import asyncio
+
+    import src.daily.collect as collect_mod
+
+    captured: dict = {}
+    kis_client = object()
+
+    async def _fake_scan(client, session, **kwargs):
+        captured["client"] = client
+        captured.update(kwargs)
+        return [{"code": "000001", "name": "A", "price": "1000", "chgrate": "3.0"}]
+
+    async def _no_union(session, *, toss_client=None, count=100):
+        return []
+
+    monkeypatch.setattr(collect_mod, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect_mod, "fetch_trade_value_union", _no_union)
+
+    # When
+    out = asyncio.run(collect_mod.resolve_daily_candidates(kis_client, object(), kiwoom_client=object(), toss_client=None))
+
+    # Then
+    assert [r["code"] for r in out] == ["000001"]
+    assert captured["client"] is kis_client
+    assert captured["kis_band_fallback"] is True

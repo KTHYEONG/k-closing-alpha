@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import smtplib
+import subprocess
+from collections.abc import Callable
 from email.message import EmailMessage
 
 import requests
@@ -16,6 +19,11 @@ import requests
 from src import settings
 
 logger = logging.getLogger(__name__)
+
+ALERT_JOURNAL_TAIL_LINES: int = 40
+ALERT_LINE_MAX_CHARS: int = 300
+ALERT_COMMAND_TIMEOUT_SEC: float = 10.0
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def post_webhook_text(webhook_url: str, text: str) -> bool:
@@ -176,13 +184,51 @@ def dispatch_failure_alert(unit: str, *, detail: str = "") -> dict[str, bool]:
     return results
 
 
+def sanitize_journal_tail(text: str) -> str:
+    """Strip ANSI escapes and carriage-return segments, drop blanks, cap line length."""
+    lines = []
+    for raw in text.split("\n"):
+        line = _ANSI_ESCAPE_RE.sub("", raw).split("\r")[-1].rstrip()
+        if not line:
+            continue
+        if len(line) > ALERT_LINE_MAX_CHARS:
+            line = line[:ALERT_LINE_MAX_CHARS] + "…"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def collect_unit_diagnostics(unit: str, *, run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> str:
+    """Collect systemctl status and journal tail for a unit without blocking dispatch.
+
+    Args:
+        unit: systemd unit name.
+        run: command runner (injectable for tests).
+
+    Returns:
+        Status section and sanitized journal tail joined by a blank line.
+    """
+    sections: list[str] = []
+    try:
+        show = run(["systemctl", "--user", "show", unit, "-p", "Result", "-p", "ExecMainStatus", "-p", "ExecMainStartTimestamp", "-p", "ExecMainExitTimestamp"], capture_output=True, text=True, timeout=ALERT_COMMAND_TIMEOUT_SEC, check=True)
+        sections.append(show.stdout.strip())
+    except (OSError, subprocess.SubprocessError) as exc:
+        sections.append(f"unit status unavailable: {type(exc).__name__}")
+    try:
+        journal = run(["journalctl", "--user", "-u", unit, "-n", str(ALERT_JOURNAL_TAIL_LINES), "-o", "cat", "--all", "--no-pager"], capture_output=True, text=True, timeout=ALERT_COMMAND_TIMEOUT_SEC, check=True)
+        sections.append(sanitize_journal_tail(journal.stdout))
+    except (OSError, subprocess.SubprocessError) as exc:
+        sections.append(f"journal tail unavailable: {type(exc).__name__}")
+    return "\n\n".join(sections)
+
+
 def main(argv: list[str] | None = None) -> None:
     """systemd OnFailure= 진입점: --unit 을 파싱해 얼러트를 발송한다."""
     parser = argparse.ArgumentParser(description="Dispatch a failure alert for a systemd unit (OnFailure= entrypoint)")
     parser.add_argument("--unit", required=True, help="failing unit name (systemd %%i specifier)")
     parser.add_argument("--detail", default="", help="optional extra detail text")
     args = parser.parse_args(argv)
-    results = dispatch_failure_alert(args.unit, detail=args.detail)
+    detail = args.detail or collect_unit_diagnostics(args.unit)
+    results = dispatch_failure_alert(args.unit, detail=detail)
     logger.info("[SYS] alert dispatch unit=%s webhook=%s email=%s", args.unit, results["webhook"], results["email"])
 
 

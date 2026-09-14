@@ -25,6 +25,7 @@ from src.data.intraday_store import intraday_partition_path
 from src.data.trading_calendar import is_kis_trading_day
 from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import dispatch_digest
+from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +81,7 @@ def _price_history_fresh(snapshot_date: str) -> bool:
 def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
     """해당 일자의 단계별 산출물 존재 여부를 AUDIT_STEPS 키 bool 딕셔너리로 반환한다.
 
-    존재 판정은 파일/행 존재만으로 하며 값 검증은 하지 않는다. 결정과 페이퍼 진입은
-    결정이 없던 날의 명시적 '결정 없음' 기록도 수행된 것으로 인정한다.
+    존재 판정은 파일/행 존재만으로 하며 값 검증은 하지 않는다. 결정은 영속된 top-k 결정 또는 predict 실행결과 OK(정상 무결정 포함)일 때만 수행으로 인정하고, 페이퍼 무결정 기록은 페이퍼 진입 단계에만 인정한다.
 
     Args:
         snapshot_date: 점검 대상일(YYYY-MM-DD, KST).
@@ -99,10 +99,11 @@ def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
     topk_dates = _column_dates(Path(settings.PARQUET_DIR) / "topk_decisions.parquet", "decision_date")
     no_decision_dates = _column_dates(Path(settings.PAPER_DIR) / "decisions.parquet", "decision_date")
     entry_dates = _entry_fill_dates(Path(settings.PAPER_DIR) / "fills.parquet")
+    outcomes = load_run_outcomes(snapshot_date)
     return {
         "archive": bool(archive_ok),
         "close_confirmed": bool(close_confirmed_ok),
-        "decision": snapshot_date in topk_dates or snapshot_date in no_decision_dates,
+        "decision": snapshot_date in topk_dates or outcomes.get("predict") == RUN_OUTCOME_OK,
         "paper_entry": snapshot_date in entry_dates or snapshot_date in no_decision_dates,
         "minute_bars": bool(intraday_partition_path(1, snapshot_date, "regular").exists()),
         "price_history_fresh": _price_history_fresh(snapshot_date),

@@ -487,6 +487,7 @@ def test_finalize_close_main_runs_inside_a_single_event_loop(monkeypatch) -> Non
 
     monkeypatch.setattr(finalize_close, "KisApiClient", _FakeClient)
     monkeypatch.setattr(finalize_close, "run_close_finalization", _fake_finalization)
+    monkeypatch.setattr(finalize_close, "load_pick_codes", lambda _d: frozenset())
     monkeypatch.setattr(finalize_close.asyncio, "run", _counting_run)
     monkeypatch.setattr(sys, "argv", ["finalize_close", "--date", "2026-09-10"])
 
@@ -518,3 +519,342 @@ def test_fetch_confirmed_quote_requests_krx_price_without_venue_fallback() -> No
     assert price == {"stck_prpr": "1000"}
     assert book == {"antc_mkop_cls_code": "112"}
 
+
+
+def test_order_pending_by_priority_puts_picks_then_admitted_first() -> None:
+    import pandas as pd
+
+    from src.daily.finalize_close import order_pending_by_priority
+
+    df = pd.DataFrame(
+        {
+            "종목코드": ["000001", "000002", "000003", "000004", "000005"],
+            "admitted": [False, True, pd.NA, True, False],
+        }
+    )
+
+    # When
+    ordered = order_pending_by_priority(df, [0, 1, 2, 3, 4], frozenset({"000005", "000003"}))
+
+    # Then: 픽(원래 순서 유지) -> admitted(원래 순서) -> 나머지
+    assert ordered == [2, 4, 1, 3, 0]
+    no_flag = df.drop(columns=["admitted"])
+    assert order_pending_by_priority(no_flag, [0, 1, 2], frozenset({"000002"})) == [1, 0, 2]
+
+
+def test_classify_finalize_outcome_cases() -> None:
+    from src.daily.finalize_close import classify_finalize_outcome
+
+    # 휴장일/수집 실패: 아카이브 비어있음 -> 알림 없음(수집 단계가 이미 알림)
+    assert classify_finalize_outcome(0, 0, 0, []) == ("OK", "empty_archive")
+    # 픽 미확정은 부분 확정이어도 DEGRADED
+    assert classify_finalize_outcome(10, 9, 1, ["005930"]) == ("DEGRADED", "picks_unconfirmed")
+    # 확정 0건(미확정 행 존재)
+    assert classify_finalize_outcome(10, 0, 10, []) == ("DEGRADED", "zero_confirmed")
+    # 픽 전부 확정, 비픽 일부 미확정 -> OK
+    assert classify_finalize_outcome(10, 7, 3, []) == ("OK", "")
+    # 이미 전부 확정된 재실행
+    assert classify_finalize_outcome(10, 0, 0, []) == ("OK", "")
+
+
+def test_run_close_finalization_fetches_picks_first_with_bounded_concurrency(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import finalize_close
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    def _rows(codes, admitted):
+        return pd.DataFrame(
+            {
+                "스냅샷_날짜": ["2026-09-10"] * len(codes),
+                "종목코드": codes,
+                "종가": [10000] * len(codes),
+                "전일종가": [10000] * len(codes),
+                "거래량": [100] * len(codes),
+                "등락률": [0.0] * len(codes),
+                "admitted": admitted,
+                DECISION_CLOSE_COL: [10000] * len(codes),
+                CLOSE_CONFIRMED_COL: [False] * len(codes),
+            }
+        )
+
+    kst = ZoneInfo("Asia/Seoul")
+    snapshot = _rows(
+        ["000001", "000002", "000003", "000004", "000005", "000006"],
+        [False, False, True, False, False, False],
+    )
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: snapshot.copy())
+    monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", lambda df, snapshot_date=None: len(df))
+
+    price_calls: list[str] = []
+    state = {"inflight": 0, "max": 0}
+
+    class _Client:
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            price_calls.append(code)
+            state["inflight"] += 1
+            state["max"] = max(state["max"], state["inflight"])
+            await asyncio.sleep(0)
+            state["inflight"] -= 1
+            return {"rt_cd": "0", "output": {"stck_prpr": "10000"}}
+
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": "121", "stck_prpr": "10000"}}
+
+    clock = iter(
+        [
+            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 34, 0, tzinfo=kst),
+        ]
+    )
+
+    async def _no_sleep(_seconds):
+        return None
+
+    # When
+    n = asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date="2026-09-10",
+            client=_Client(),
+            session=object(),
+            now_fn=lambda: next(clock),
+            sleep_fn=_no_sleep,
+            retry_interval_seconds=0.0,
+            pick_codes=frozenset({"000005"}),
+        )
+    )
+
+    # Then
+    assert n == 0
+    assert finalize_close.FINALIZE_CONCURRENCY == 4
+    assert price_calls == ["000005", "000003", "000001", "000002", "000004", "000006"]
+    assert state["max"] == finalize_close.FINALIZE_CONCURRENCY
+
+
+def test_run_close_finalization_stops_batches_after_deadline(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import finalize_close
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    def _rows(codes, admitted):
+        return pd.DataFrame(
+            {
+                "스냅샷_날짜": ["2026-09-10"] * len(codes),
+                "종목코드": codes,
+                "종가": [10000] * len(codes),
+                "전일종가": [10000] * len(codes),
+                "거래량": [100] * len(codes),
+                "등락률": [0.0] * len(codes),
+                "admitted": admitted,
+                DECISION_CLOSE_COL: [10000] * len(codes),
+                CLOSE_CONFIRMED_COL: [False] * len(codes),
+            }
+        )
+
+    kst = ZoneInfo("Asia/Seoul")
+    snapshot = _rows(["000001", "000002", "000003", "000004", "000005", "000006"], [False] * 6)
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: snapshot.copy())
+    monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", lambda df, snapshot_date=None: len(df))
+
+    price_calls: list[str] = []
+
+    class _Client:
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            price_calls.append(code)
+            return {"rt_cd": "0", "output": {"stck_prpr": "10000"}}
+
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": "121"}}
+
+    clock = iter(
+        [
+            datetime(2026, 9, 10, 15, 32, 59, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 32, 59, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 33, 1, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 33, 5, tzinfo=kst),
+        ]
+    )
+
+    async def _no_sleep(_seconds):
+        return None
+
+    # When
+    n = asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date="2026-09-10",
+            client=_Client(),
+            session=object(),
+            now_fn=lambda: next(clock),
+            sleep_fn=_no_sleep,
+            retry_interval_seconds=0.0,
+        )
+    )
+
+    # Then: 첫 배치(4행)만 조회, 데드라인 이후 배치는 시작하지 않음
+    assert n == 0
+    assert price_calls == ["000001", "000002", "000003", "000004"]
+
+
+def test_run_close_finalization_reports_degraded_outcome_for_unconfirmed_pick(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import finalize_close
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    def _rows(codes, admitted):
+        return pd.DataFrame(
+            {
+                "스냅샷_날짜": ["2026-09-10"] * len(codes),
+                "종목코드": codes,
+                "종가": [10000] * len(codes),
+                "전일종가": [10000] * len(codes),
+                "거래량": [100] * len(codes),
+                "등락률": [0.0] * len(codes),
+                "admitted": admitted,
+                DECISION_CLOSE_COL: [10000] * len(codes),
+                CLOSE_CONFIRMED_COL: [False] * len(codes),
+            }
+        )
+
+    kst = ZoneInfo("Asia/Seoul")
+    snapshot = _rows(["000001", "000002"], [True, True])
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: snapshot.copy())
+    upserts: list[int] = []
+    monkeypatch.setattr(
+        finalize_close.archive, "upsert_archive_snapshot", lambda df, snapshot_date=None: upserts.append(len(df)) or len(df)
+    )
+
+    class _Client:
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            return {
+                "rt_cd": "0",
+                "output": {
+                    "stck_prpr": "10100", "stck_oprc": "10000", "stck_hgpr": "10200", "stck_lwpr": "9900",
+                    "stck_sdpr": "10000", "acml_vol": "500", "acml_tr_pbmn": "5050000", "prdy_ctrt": "1.00",
+                },
+            }
+
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            mkop = "121" if code == "000001" else "112"
+            return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": mkop, "stck_prpr": "10100"}}
+
+    clock = iter(
+        [
+            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 34, 0, tzinfo=kst),
+        ]
+    )
+    outcomes: list[tuple] = []
+
+    async def _no_sleep(_seconds):
+        return None
+
+    # When
+    n = asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date="2026-09-10",
+            client=_Client(),
+            session=object(),
+            now_fn=lambda: next(clock),
+            sleep_fn=_no_sleep,
+            retry_interval_seconds=0.0,
+            pick_codes=frozenset({"000001"}),
+            on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+        )
+    )
+
+    # Then
+    assert n == 1
+    assert upserts == [2]
+    assert len(outcomes) == 1
+    outcome, kw = outcomes[0]
+    assert outcome == "DEGRADED"
+    assert kw["run_date"] == "2026-09-10"
+    assert kw["reason"] == "picks_unconfirmed"
+    assert kw["metrics"] == {"n_rows": 2, "n_finalized": 1, "n_unconfirmed": 1, "unconfirmed_picks": ["000001"]}
+
+
+def test_load_pick_codes_zero_fills_persisted_symbols(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.daily import finalize_close
+
+    seen: list[pd.Timestamp] = []
+
+    def _decision(decision_date):
+        seen.append(pd.Timestamp(decision_date))
+        return pd.DataFrame({"symbol": ["5930", "000660"]})
+
+    monkeypatch.setattr(finalize_close, "load_topk_decision", _decision)
+
+    # When
+    codes = finalize_close.load_pick_codes("2026-09-10")
+
+    # Then
+    assert codes == frozenset({"005930", "000660"})
+    assert seen == [pd.Timestamp("2026-09-10")]
+    monkeypatch.setattr(finalize_close, "load_topk_decision", lambda _d: pd.DataFrame())
+    assert finalize_close.load_pick_codes("2026-09-10") == frozenset()
+
+
+def test_finalize_close_main_wires_pick_codes_and_outcome_recorder(monkeypatch) -> None:
+    import sys
+    from unittest.mock import Mock
+
+    from src.daily import finalize_close
+
+    class _FakeSession:
+        async def close(self):
+            return None
+
+    class _FakeClient:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def create_session(self, **_kw):
+            return _FakeSession()
+
+        async def ensure_token(self, _session, force_refresh=False):
+            return "T"
+
+    captured: dict = {}
+
+    async def _fake_finalization(*_a, **kwargs):
+        captured.update(kwargs)
+        return 0
+
+    picks_seen: list[str] = []
+    recorder = Mock(return_value={})
+    monkeypatch.setattr(finalize_close, "KisApiClient", _FakeClient)
+    monkeypatch.setattr(finalize_close, "run_close_finalization", _fake_finalization)
+    monkeypatch.setattr(finalize_close, "load_pick_codes", lambda d: picks_seen.append(d) or frozenset({"005930"}))
+    monkeypatch.setattr(finalize_close, "record_run_outcome", recorder)
+    monkeypatch.setattr(sys, "argv", ["finalize_close", "--date", "2026-09-10"])
+
+    # When
+    finalize_close.main()
+    captured["on_outcome"]("DEGRADED", run_date="2026-09-10", reason="zero_confirmed", metrics={"n_rows": 1})
+
+    # Then
+    assert picks_seen == ["2026-09-10"]
+    assert captured["snapshot_date"] == "2026-09-10"
+    assert captured["pick_codes"] == frozenset({"005930"})
+    recorder.assert_called_once_with(
+        "finalize_close", "DEGRADED", run_date="2026-09-10", reason="zero_confirmed", metrics={"n_rows": 1}
+    )

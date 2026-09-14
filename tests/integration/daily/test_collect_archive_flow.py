@@ -54,7 +54,9 @@ class _AllListed(frozenset):
 
 @pytest.fixture(autouse=True)
 def _eligible_everything(monkeypatch) -> None:
-    monkeypatch.setattr(collect, "load_eligible_codes", lambda _decision_date: _AllListed())
+    async def _all_listed(_client, _session, _decision_date):
+        return _AllListed()
+    monkeypatch.setattr(collect, "resolve_eligible_codes", _all_listed)
 
 
 class _FakeSession:
