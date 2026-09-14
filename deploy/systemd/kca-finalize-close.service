@@ -1,5 +1,6 @@
 [Unit]
 Description=KCA close finalization (confirmed EOD update)
+After=kca-collect.service kca-predict.service
 OnSuccess=kca-paper-entry.service
 OnFailure=kca-alert@%n.service
 
