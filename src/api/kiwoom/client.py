@@ -106,7 +106,7 @@ class KiwoomApiClient:
             return data, resp_headers
         return data, resp_headers
 
-    async def get_fluctuation_ranking(self, session, *, rate_min_pct: float, rate_max_pct: float, market_type: str = "000", max_pages: int = 5, stex_tp: str = "3") -> dict:
+    async def get_fluctuation_ranking(self, session, *, rate_min_pct: float, rate_max_pct: float, market_type: str = "000", max_pages: int = 20, stex_tp: str = "3") -> dict:
         cont_yn, next_key = "N", ""
         collected: list[dict] = []
         try:
@@ -145,6 +145,9 @@ class KiwoomApiClient:
                     break
                 if page_rates and min(page_rates) < float(rate_min_pct):
                     break
+            else:
+                logger.warning("[DATA] stage=universe_scan vendor=kiwoom status=TRUNCATED max_pages=%d n_rows=%d", int(max_pages), len(collected))
+                return {"rt_cd": "1", "msg1": f"ranking truncated at max_pages={int(max_pages)}", "output": collected, "vendor": "kiwoom", "truncated": True}
         except Exception as e:
             logger.warning("Kiwoom fluctuation ranking failed: %s", e)
             return {"rt_cd": "1", "msg1": str(e), "output": [], "vendor": "kiwoom"}

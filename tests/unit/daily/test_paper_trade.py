@@ -68,7 +68,7 @@ def test_run_paper_session_records_no_decision_when_sleeve_empty(tmp_path, monke
 
     # Given: 오늘 슬리브가 비어 있다(admitted < top_k 상황)
     monkeypatch.setattr(
-        paper_trade, "run_topk_ranker_sleeve", lambda _d: pd.DataFrame()
+        paper_trade, "load_topk_decision", lambda _d: pd.DataFrame()
     )
     ledger = PaperLedger(root=tmp_path)
 
@@ -84,6 +84,7 @@ def test_run_paper_session_records_no_decision_when_sleeve_empty(tmp_path, monke
     df = pd.read_parquet(tmp_path / "decisions.parquet")
     assert len(df) == 1
     assert df.iloc[0]["symbol"] == ""
+    assert df.iloc[0]["reason"] == "no_persisted_decision"
 
 
 def test_run_paper_session_rejects_unknown_phase(tmp_path) -> None:
@@ -202,7 +203,7 @@ def test_run_paper_session_entry_fills_from_confirmed_close_no_websocket(tmp_pat
 
     monkeypatch.setattr(
         paper_trade,
-        "run_topk_ranker_sleeve",
+        "load_topk_decision",
         lambda _d: pd.DataFrame({"symbol": ["005930"], "allocation": [1.0], "price": [70_000]}),
     )
     monkeypatch.setattr(
@@ -246,7 +247,7 @@ def test_run_paper_session_entry_skips_unconfirmed_symbol_with_warning(tmp_path,
 
     monkeypatch.setattr(
         paper_trade,
-        "run_topk_ranker_sleeve",
+        "load_topk_decision",
         lambda _d: pd.DataFrame({
             "symbol": ["005930", "000660"], "allocation": [0.5, 0.5], "price": [70_000, 200_000],
         }),
@@ -289,7 +290,7 @@ def test_run_paper_session_entry_skips_symbol_missing_from_snapshot(tmp_path, mo
 
     monkeypatch.setattr(
         paper_trade,
-        "run_topk_ranker_sleeve",
+        "load_topk_decision",
         lambda _d: pd.DataFrame({
             "symbol": ["005930", "000660"], "allocation": [0.5, 0.5], "price": [70_000, 200_000],
         }),
@@ -521,3 +522,50 @@ def test_run_paper_session_exit_skips_when_started_after_session_end(tmp_path) -
     # Then
     assert n == 0
     assert list(ledger.load_open_positions()["symbol"]) == ["005930"]
+
+
+def test_run_paper_session_entry_consumes_persisted_decision(tmp_path, monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    # Given: 15:21 영속 결정 3종목, archive는 아직 미확정
+    picks = pd.DataFrame({
+        "decision_date": ["2026-09-14"] * 3,
+        "symbol": ["000001", "000002", "000003"],
+        "allocation": [1.0 / 3.0] * 3,
+        "name": ["AAA", "BBB", "CCC"],
+    })
+    requested = []
+
+    def _load(decision_date):
+        requested.append(decision_date)
+        return picks
+
+    snap = pd.DataFrame({
+        "종목코드": ["000001", "000002", "000003"],
+        "종가": [10000.0, 20000.0, 30000.0],
+        "종가_확정": [False, False, False],
+    })
+    monkeypatch.setattr(paper_trade, "load_topk_decision", _load)
+    monkeypatch.setattr(paper_trade, "fetch_archive_snapshot", lambda _d: snap)
+    ledger = PaperLedger(root=tmp_path)
+
+    # When
+    with caplog.at_level(logging.WARNING, logger="src.daily.paper_trade"):
+        n = asyncio.run(
+            paper_trade.run_paper_session(
+                pd.Timestamp("2026-09-14"), phase="entry", ledger=ledger, ws_client=None, session=None
+            )
+        )
+
+    # Then: 재랭킹 경로 부재 + 영속 결정 3건으로 주문, 미확정이라 체결 0
+    assert n == 0
+    assert requested == [pd.Timestamp("2026-09-14")]
+    assert not hasattr(paper_trade, "run_topk_ranker_sleeve")
+    assert caplog.text.count("status=UNCONFIRMED") == 3
+

@@ -162,3 +162,95 @@ def test_handle_request_reacquires_rate_limit_slot_on_every_retry(monkeypatch) -
     assert out["rt_cd"] == "0"
     assert calls["n"] == 3
     assert acquires["n"] == 3
+
+
+def test_handle_request_retries_request_timeout_instead_of_raising(monkeypatch) -> None:
+    import asyncio
+
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k-timeout", app_secret="s")
+    client.token = "T"
+
+    async def _free_acquire() -> None:
+        return None
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(client.rate_limiter, "acquire", _free_acquire)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    class _Ctx:
+        def __init__(self, fail: bool):
+            self._fail = fail
+
+        async def __aenter__(self):
+            if self._fail:
+                raise TimeoutError
+            resp = type("_Resp", (), {"status": 200})()
+
+            async def _json():
+                return {"rt_cd": "0"}
+
+            resp.json = _json
+            return resp
+
+        async def __aexit__(self, *_a):
+            return False
+
+    # Given: 첫 요청은 세션 total 타임아웃, 재시도는 정상
+    calls = {"n": 0}
+
+    def _flaky_get(_url, **_kw):
+        calls["n"] += 1
+        return _Ctx(fail=calls["n"] == 1)
+
+    # When / Then: 타임아웃은 재시도되어 정상 응답을 반환한다
+    assert asyncio.run(client._handle_request(_flaky_get, "http://x", headers={}))["rt_cd"] == "0"
+    assert calls["n"] == 2
+
+    # Given: 모든 시도가 타임아웃
+    def _always_timeout(_url, **_kw):
+        return _Ctx(fail=True)
+
+    # When / Then: 예외 대신 실패 envelope를 반환해 호출자의 degraded 판정 경로로 흐른다
+    assert asyncio.run(client._handle_request(_always_timeout, "http://x", headers={}))["rt_cd"] == "9"
+
+
+def test_get_current_price_without_fallback_queries_only_requested_market(monkeypatch) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k-venue", app_secret="s")
+    client.token = "T"
+    calls = []
+
+    async def _fake_handle(_session_method, _url, **kwargs):
+        calls.append(dict(kwargs["params"]))
+        return {"rt_cd": "1", "msg1": "fail"}
+
+    monkeypatch.setattr(client, "_handle_request", _fake_handle)
+
+    class _Session:
+        get = object()
+
+    # When: 폴백 금지
+    res = asyncio.run(client.get_current_price(_Session(), "005930", market_div_code="J", allow_market_div_fallback=False))
+
+    # Then: J 한 번만 조회
+    assert res["rt_cd"] == "1"
+    assert calls == [{"fid_cond_mrkt_div_code": "J", "fid_input_iscd": "005930"}]
+
+    # And: 기본값은 기존 J->UN->NX 폴백 유지
+    calls.clear()
+    asyncio.run(client.get_current_price(_Session(), "005930", market_div_code="J"))
+    assert [c["fid_cond_mrkt_div_code"] for c in calls] == ["J", "UN", "NX"]
+
+    # And: 폴백 금지인데 시장 미지정이면 거부
+    with pytest.raises(ValueError, match="market_div_code"):
+        asyncio.run(client.get_current_price(_Session(), "005930", allow_market_div_fallback=False))
+

@@ -1,7 +1,7 @@
 """페이퍼 트레이딩 일간 세션 (실주문 없이 실시간 체결틱으로 실행경로 리허설).
 
-주문 전송 TR을 어떤 형태로도 참조하지 않는다. 진입(entry)은 슬리브 픽에
-아카이브 종가를 조인해 시장가 등가 주문을 만들고, 청산(exit)은 미청산
+주문 전송 TR을 어떤 형태로도 참조하지 않는다. 진입(entry)은 15:21에 영속된
+top-k 결정을 소비해 아카이브 종가를 조인해 시장가 등가 주문을 만들고, 청산(exit)은 미청산
 포지션에 익절 지정가 주문을 만든 뒤 H0STCNT0 실체결 프린트로 체결을 판정한다.
 """
 
@@ -26,7 +26,7 @@ from src.config.market_session import (
     PAPER_EXIT_SESSION_START_HHMMSS,
 )
 from src.daily.archive import fetch_archive_snapshot
-from src.daily.predict import run_topk_ranker_sleeve
+from src.daily.predict import load_topk_decision
 from src.execution.paper_broker import (
     PAPER_TAKE_PROFIT_RATIO,
     PaperLedger,
@@ -110,9 +110,9 @@ async def run_paper_session(
     ledger = ledger or PaperLedger()
     date_str = decision_date.strftime("%Y-%m-%d")
     if phase == "entry":
-        picks = run_topk_ranker_sleeve(decision_date)
+        picks = load_topk_decision(decision_date)
         if picks.empty:
-            ledger.record_no_decision(date_str, reason="admitted_below_top_k")
+            ledger.record_no_decision(date_str, reason="no_persisted_decision")
             return 0
         snap = fetch_archive_snapshot(date_str)
         archive_prices = (

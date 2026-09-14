@@ -1,8 +1,11 @@
 import asyncio
 # ruff: noqa: I001 - contract mandates contiguous wiring import block after Colors
 import logging
+import os
 import sys
+from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -18,9 +21,9 @@ from src.utils.display import Colors
 from src.daily import archive
 from src.daily.universe_scan import fetch_candidate_stock_list, fetch_trade_value_union
 from src.data.trading_calendar import is_kis_trading_day
-from src.execution.cost_model import tick_cost_bp
+from src.daily.universe_screen import build_screen_frame
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, PRICE_ANOMALY_COL, QUOTE_FAILED_COL
-from src.strategy.contract import COST_AWARE_UNIVERSE, UniverseSpec, derive_chg_ratio, mark_ceiling, select_universe
+from src.strategy.contract import COST_AWARE_UNIVERSE, UniverseSpec, select_universe
 
 logger = logging.getLogger(__name__)
 
@@ -151,30 +154,9 @@ def flag_cost_aware_admission(
         out["admitted"] = np.zeros(0, dtype=bool)
         logger.info("[DATA] stage=cost_aware_admission n_raw=0 n_admitted=0 n_ceiling_excluded=0")
         return out
-    close = pd.to_numeric(df["종가"], errors="coerce").to_numpy(dtype=np.float64)
-    prev_close = pd.to_numeric(df["전일종가"], errors="coerce").to_numpy(dtype=np.float64)
-    high = pd.to_numeric(df["고가"], errors="coerce").to_numpy(dtype=np.float64)
-    volume = pd.to_numeric(df["거래량"], errors="coerce").to_numpy(dtype=np.float64)
-    tv_clean = pd.to_numeric(df["거래대금"], errors="coerce").to_numpy(dtype=np.float64)
-    mc_clean = pd.to_numeric(df["시가총액"], errors="coerce").to_numpy(dtype=np.float64)
-    chg_ratio = derive_chg_ratio(close, prev_close)
-    is_ceiling = mark_ceiling(pd.DataFrame({"chg_ratio": chg_ratio, "close": close, "high": high}))
-    dates = np.full(len(df), np.datetime64(decision_date.strftime("%Y-%m-%d")))
-    market = df["시장구분"].astype(str).to_numpy(dtype=object)
-    tick_bp = tick_cost_bp(close, dates, market)
-    mapped = pd.DataFrame(
-        {
-            "chg_ratio": chg_ratio,
-            "is_ceiling": is_ceiling,
-            "tick_cost_bp": tick_bp,
-            "tv_clean": tv_clean,
-            "mc_clean": mc_clean,
-            "close": close,
-            "volume": volume,
-        }
-    )
+    mapped = build_screen_frame(df, decision_date=decision_date)
     mask = select_universe(mapped, screen)
-    n_ceiling_excluded = int(np.asarray(is_ceiling, dtype=bool).sum())
+    n_ceiling_excluded = int(mapped["is_ceiling"].to_numpy(dtype=bool).sum())
     logger.info(
         "[DATA] stage=cost_aware_admission n_raw=%d n_admitted=%d n_ceiling_excluded=%d",
         len(df),
@@ -190,6 +172,65 @@ def flag_cost_aware_admission(
 # price_ingest.MIN_FLOW_COVERAGE(0.99, 야간 벌크 흐름 게이트)와 동일 철학을 실시간
 # 경로에 이식한 값이다 -- 두 파이프라인은 별개 흐름이라 상수도 분리해 둔다.
 REALTIME_MIN_QUOTE_COVERAGE: float = 0.99
+
+# fetch_single_stock의 failed_apis 태그: 벤더가 rt_cd=0으로 응답했지만 종목코드를 해석하지 못한 경우
+QUOTE_UNRESOLVED_API: str = "현재가_미해석"
+
+
+def load_eligible_codes(decision_date: pd.Timestamp, *, path: str | os.PathLike[str] | None = None, is_trading_day: Callable[[pd.Timestamp], bool] | None = None) -> frozenset[str]:
+    """Return the symbols listed in price_history on the previous trading day.
+
+    Args:
+        decision_date: Decision date; only rows strictly before it are read.
+        path: Parquet path; None selects settings.PRICE_HISTORY_PARQUET_PATH.
+        is_trading_day: Trading-day oracle; None selects is_krx_trading_day.
+
+    Returns:
+        Symbols present on the latest trading day strictly before decision_date.
+
+    Raises:
+        FileNotFoundError: When the parquet does not exist.
+        ValueError: When no rows exist on the previous trading day.
+    """
+    from src.ml.topk_history_features import resolve_prev_trading_day
+
+    src_path = Path(settings.PRICE_HISTORY_PARQUET_PATH if path is None else path)
+    if not src_path.exists():
+        raise FileNotFoundError(f"price_history not found: {src_path}")
+    if is_trading_day is None:
+        from src.data.trading_calendar import is_krx_trading_day as is_trading_day
+    prev = resolve_prev_trading_day(pd.Timestamp(decision_date).normalize(), is_trading_day)
+    rows = pd.read_parquet(src_path, columns=["date", "symbol"], filters=[("date", "==", prev)])
+    if rows.empty:
+        raise ValueError(f"stale price_history: no rows on prev_trading_day={prev.date()}")
+    return frozenset(rows["symbol"].astype(str))
+
+
+def filter_eligible_candidates(stock_list: list[dict], eligible_codes: frozenset[str]) -> list[dict]:
+    """Drop scanned candidates that are not listed in the research panel.
+
+    Args:
+        stock_list: Scan rows carrying ``code``.
+        eligible_codes: Symbols from load_eligible_codes.
+
+    Returns:
+        Eligible rows in scan order.
+
+    Raises:
+        ValueError: When the scan is non-empty but nothing is eligible.
+    """
+    kept = [row for row in stock_list if str(row["code"]) in eligible_codes]
+    dropped = [str(row["code"]) for row in stock_list if str(row["code"]) not in eligible_codes]
+    logger.info(
+        "[DATA] stage=instrument_eligibility n_raw=%d n_eligible=%d n_dropped=%d dropped_head=%s",
+        len(stock_list),
+        len(kept),
+        len(dropped),
+        dropped[:5],
+    )
+    if stock_list and not kept:
+        raise ValueError(f"no scanned candidate is an eligible listed stock: n_raw={len(stock_list)}")
+    return kept
 
 
 def flag_price_anomaly(df: pd.DataFrame) -> pd.Series:
@@ -310,23 +351,37 @@ async def fetch_single_stock(
             res_investor,
             res_ob_krx,
         ) = await asyncio.gather(
-            client.get_current_price(session, code, market_div_code=_krx_div),
+            client.get_current_price(session, code, market_div_code=_krx_div, allow_market_div_fallback=False),
             client.get_investor_trend_estimate(session, code),
             client.get_orderbook_snapshot(session, code, market_div_code=_krx_div),
         )
 
+        # 데이터 파싱
+        detail = res_detail.get("output") if res_detail.get("rt_cd") == "0" else None
+        # KIS는 인식 못한 종목코드(예: Q 접두어 없는 ETN)에 rt_cd=0과 전 필드 0을 돌려준다 -- 0을 시세로 쓰지 않는다
+        quote_unresolved = bool(detail) and not str(detail.get("stck_shrn_iscd") or "").strip()
+        if quote_unresolved:
+            detail = None
+
         # 실패한 API 체크 (유지 3종만 판정)
         failed_apis = []
-        quote_failed = res_detail.get("rt_cd") != "0"
+        quote_failed = res_detail.get("rt_cd") != "0" or quote_unresolved
         if quote_failed:
+            logger.warning(
+                "[DATA] stage=realtime_quote code=%s status=FAILED unresolved=%s rt_cd=%s msg_cd=%s msg1=%s",
+                code,
+                quote_unresolved,
+                res_detail.get("rt_cd"),
+                res_detail.get("msg_cd"),
+                res_detail.get("msg1"),
+            )
             failed_apis.append("현재가")
+        if quote_unresolved:
+            failed_apis.append(QUOTE_UNRESOLVED_API)
         if res_investor.get("rt_cd") != "0":
             failed_apis.append("투자자추정")
         if res_ob_krx.get("rt_cd") != "0":
             failed_apis.append("호가")
-
-        # 데이터 파싱
-        detail = res_detail.get("output") if res_detail.get("rt_cd") == "0" else None
 
         supply_failed = False
         frgn_qty, orgn_qty = 0, 0
@@ -372,7 +427,8 @@ async def fetch_single_stock(
 
         capture_ts = datetime.now(ZoneInfo("Asia/Seoul"))
         orderbook_rows: list[dict] = []
-        orderbook_rows.extend(build_orderbook_rows(res_ob_krx, code, _krx_div, "decision", capture_ts))
+        if not quote_unresolved:
+            orderbook_rows.extend(build_orderbook_rows(res_ob_krx, code, _krx_div, "decision", capture_ts))
 
         if supply_failed:
             frgn_net_eok = float("nan")
@@ -527,6 +583,7 @@ async def main(force: bool = False):
         if not stock_list:
             logger.info(f"{Colors.YELLOW}⚠ 자동 스캔 후보가 없습니다.{Colors.RESET}")
             return
+        stock_list = filter_eligible_candidates(stock_list, load_eligible_codes(pd.Timestamp(snapshot_date)))
 
         logger.info(
             f"{Colors.BOLD}🚀 [1/3] 후보 종목 스캔 (Kiwoom / KIS){Colors.RESET}\n"
@@ -569,6 +626,7 @@ async def main(force: bool = False):
         breadth_failed = False
         try:
             from src.data.panel_integrity import compute_latest_market_breadth, load_price_panel
+
             panel, _prov = load_price_panel(settings.PRICE_HISTORY_PARQUET_PATH)
             breadth_val = compute_latest_market_breadth(panel, snapshot_date)
             if breadth_val != breadth_val:

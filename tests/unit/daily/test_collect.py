@@ -18,23 +18,6 @@ import pandas as pd
 import pytest
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def test_fetch_all_stock_data_persists_orderbook_and_survives_persist_failure(monkeypatch) -> None:
     """호가 스냅샷을 일괄 영속화하고, 영속화 실패는 로깅만 하고 수집 결과에 영향 없다."""
     import asyncio
@@ -44,7 +27,7 @@ def test_fetch_all_stock_data_persists_orderbook_and_survives_persist_failure(mo
 
     client = AsyncMock()
     client.get_current_price = AsyncMock(
-        return_value={"rt_cd": "0", "output": {"stck_prpr": "70000", "stck_oprc": "69000", "stck_hgpr": "70500", "stck_lwpr": "68900", "acml_vol": "1000", "prdy_ctrt": "1.5", "lstn_stcn": "100", "hts_avls": "1000", "acml_tr_pbmn": "100000000", "rprs_mrkt_kor_name": "KOSPI"}}
+        return_value={"rt_cd": "0", "output": {"stck_shrn_iscd": "005930", "stck_prpr": "70000", "stck_oprc": "69000", "stck_hgpr": "70500", "stck_lwpr": "68900", "acml_vol": "1000", "prdy_ctrt": "1.5", "lstn_stcn": "100", "hts_avls": "1000", "acml_tr_pbmn": "100000000", "rprs_mrkt_kor_name": "KOSPI"}}
     )
     client.get_trade_strength = AsyncMock(return_value={"rt_cd": "0", "output": [{"tday_rltv": "120"}]})
     client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]})
@@ -63,22 +46,6 @@ def test_fetch_all_stock_data_persists_orderbook_and_survives_persist_failure(mo
 
     assert len(results) == 1
     assert failed_info == []
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_flag_cost_aware_admission_marks_rows_without_dropping() -> None:
@@ -108,10 +75,6 @@ def test_flag_cost_aware_admission_marks_rows_without_dropping() -> None:
     assert out["종목코드"].tolist() == ["S1", "S2", "S3", "S4", "S5"]
 
 
-
-
-
-
 def test_fetch_single_stock_calls_only_the_three_required_apis() -> None:
     import asyncio
     from unittest.mock import AsyncMock
@@ -122,7 +85,7 @@ def test_fetch_single_stock_calls_only_the_three_required_apis() -> None:
     # dropped ones (including NXT orderbook) are not merely unavailable but
     # deliberately not called
     client = AsyncMock()
-    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_shrn_iscd": "005930", "stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
     client.get_investor_trend_estimate = AsyncMock(
         return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]}
     )
@@ -150,7 +113,6 @@ def test_fetch_single_stock_calls_only_the_three_required_apis() -> None:
     assert call_kwargs.get("market_div_code") == "J"
 
 
-
 def test_fetch_single_stock_returns_minimal_row_schema() -> None:
     import asyncio
     from unittest.mock import AsyncMock
@@ -158,7 +120,7 @@ def test_fetch_single_stock_returns_minimal_row_schema() -> None:
     from src.daily import collect
 
     client = AsyncMock()
-    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_shrn_iscd": "005930", "stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
     client.get_investor_trend_estimate = AsyncMock(
         return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]}
     )
@@ -188,7 +150,6 @@ def test_fetch_single_stock_returns_minimal_row_schema() -> None:
     assert {ob["venue"] for ob in orderbook_rows} == {"J"}
 
 
-
 def test_fetch_single_stock_reports_failed_apis_for_kept_endpoints() -> None:
     import asyncio
     from unittest.mock import AsyncMock
@@ -216,7 +177,6 @@ def test_fetch_single_stock_reports_failed_apis_for_kept_endpoints() -> None:
     assert orderbook_rows == []
 
 
-
 def test_fetch_all_stock_data_does_not_prefetch_sma120(monkeypatch) -> None:
     import asyncio
     from unittest.mock import AsyncMock
@@ -224,7 +184,7 @@ def test_fetch_all_stock_data_does_not_prefetch_sma120(monkeypatch) -> None:
     from src.daily import collect
 
     client = AsyncMock()
-    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_shrn_iscd": "005930", "stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
     client.get_investor_trend_estimate = AsyncMock(
         return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]}
     )
@@ -244,7 +204,6 @@ def test_fetch_all_stock_data_does_not_prefetch_sma120(monkeypatch) -> None:
 
     assert len(results) == 1
     assert failed_info == []
-
 
 
 def test_resolve_daily_candidates_never_touches_condition_search(monkeypatch) -> None:
@@ -271,7 +230,6 @@ def test_resolve_daily_candidates_never_touches_condition_search(monkeypatch) ->
     client.get_condition_result.assert_not_awaited()
 
 
-
 def test_resolve_daily_candidates_returns_empty_list_when_scan_yields_nothing(monkeypatch) -> None:
     import asyncio
     from unittest.mock import AsyncMock
@@ -291,7 +249,6 @@ def test_resolve_daily_candidates_returns_empty_list_when_scan_yields_nothing(mo
     # Then: an empty list keeps the caller contract total (no None sentinel)
     assert isinstance(out, list)
     assert len(out) == 0
-
 
 
 def test_persist_daily_snapshot_delegates_to_archive_upsert(monkeypatch) -> None:
@@ -317,7 +274,6 @@ def test_persist_daily_snapshot_delegates_to_archive_upsert(monkeypatch) -> None
     assert stored == 2
     assert captured["snapshot_date"] == "2026-09-09"
     assert captured["df"]["admitted"].tolist() == [True, False]
-
 
 
 def test_persist_daily_snapshot_skips_upsert_on_empty_frame(monkeypatch) -> None:
@@ -389,7 +345,7 @@ def test_fetch_single_stock_marks_supply_flow_failure_and_nans_the_fields() -> N
     from src.daily import collect
 
     client = AsyncMock()
-    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_shrn_iscd": "005930", "stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
     client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "1", "msg1": "fail"})
     ladder = {"askp1": "18010", "bidp1": "17990"}
     client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
@@ -462,7 +418,7 @@ def test_fetch_single_stock_records_decision_close_and_unconfirmed_flag() -> Non
         return_value={
             "rt_cd": "0",
             "output": {
-                "stck_prpr": "269250",
+                "stck_shrn_iscd": "005930", "stck_prpr": "269250",
                 "stck_oprc": "270000",
                 "stck_hgpr": "272000",
                 "stck_lwpr": "268000",
@@ -498,8 +454,6 @@ def test_fetch_single_stock_records_decision_close_and_unconfirmed_flag() -> Non
     assert row[CLOSE_CONFIRMED_COL] is False
 
 
-
-
 def test_fetch_single_stock_takes_prev_close_from_vendor_field() -> None:
     import asyncio
     from unittest.mock import AsyncMock
@@ -507,7 +461,7 @@ def test_fetch_single_stock_takes_prev_close_from_vendor_field() -> None:
     from src.daily import collect
 
     base_detail = {
-        "stck_prpr": "1100",
+        "stck_shrn_iscd": "005930", "stck_prpr": "1100",
         "stck_oprc": "1010",
         "stck_hgpr": "1120",
         "stck_lwpr": "1000",
@@ -584,7 +538,7 @@ def test_fetch_single_stock_flags_quote_failure_without_zero_fill() -> None:
         return_value={
             "rt_cd": "0",
             "output": {
-                "stck_prpr": "1100", "stck_sdpr": "1000", "stck_oprc": "1010",
+                "stck_shrn_iscd": "005930", "stck_prpr": "1100", "stck_sdpr": "1000", "stck_oprc": "1010",
                 "stck_hgpr": "1120", "stck_lwpr": "1000", "acml_vol": "5000",
                 "prdy_ctrt": "10.00", "lstn_stcn": "1000000", "hts_avls": "1000",
                 "acml_tr_pbmn": "5500000", "rprs_mrkt_kor_name": "KOSDAQ",
@@ -630,7 +584,6 @@ def test_validate_trading_day_blocks_non_trading_day_and_honours_force(monkeypat
     assert calls["n"] == 2
 
 
-
 def test_fetch_single_stock_prev_close_equals_close_when_rate_is_zero() -> None:
     import asyncio
     from unittest.mock import AsyncMock
@@ -639,7 +592,7 @@ def test_fetch_single_stock_prev_close_equals_close_when_rate_is_zero() -> None:
 
     client = AsyncMock()
     client.get_current_price = AsyncMock(
-        return_value={'rt_cd': '0', 'output': {'stck_prpr': '1100', 'stck_oprc': '1090', 'stck_hgpr': '1110', 'stck_lwpr': '1080', 'acml_vol': '100', 'prdy_ctrt': '0.00', 'lstn_stcn': '1000', 'hts_avls': '500', 'acml_tr_pbmn': '110000', 'rprs_mrkt_kor_name': 'KOSPI'}}
+        return_value={'rt_cd': '0', 'output': {'stck_shrn_iscd': '005930', 'stck_prpr': '1100', 'stck_oprc': '1090', 'stck_hgpr': '1110', 'stck_lwpr': '1080', 'acml_vol': '100', 'prdy_ctrt': '0.00', 'lstn_stcn': '1000', 'hts_avls': '500', 'acml_tr_pbmn': '110000', 'rprs_mrkt_kor_name': 'KOSPI'}}
     )
     client.get_investor_trend_estimate = AsyncMock(
         return_value={'rt_cd': '0', 'output2': [{'frgn_fake_ntby_qty': '1', 'orgn_fake_ntby_qty': '2'}]}
@@ -932,3 +885,304 @@ def test_resolve_daily_candidates_zero_regression_without_toss_client(monkeypatc
 
     # Then: union contributes nothing, output identical to primary-only behavior
     assert out == scan_rows
+
+
+def test_fetch_single_stock_treats_vendor_unresolved_code_as_quote_failure() -> None:
+    import asyncio
+    import math
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+    from src.processing.schema import QUOTE_FAILED_COL
+
+    # Given: Q 접두어 없는 ETN 코드 -- KIS 실측처럼 rt_cd=0이지만 종목코드 공란, 시세 전부 0
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(
+        return_value={"rt_cd": "0", "output": {"stck_prpr": "0", "stck_hgpr": "0", "stck_lwpr": "0", "acml_vol": "0", "rprs_mrkt_kor_name": "KOSPI"}}
+    )
+    client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "0", "output2": []})
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": {"askp1": "0"}})
+    stock = {"code": "500041", "name": "신한 인버스 2X 구리 선물 ETN", "price": "+35300", "chgrate": "+8.47"}
+
+    # When
+    row, failed, orderbook_rows = asyncio.run(
+        collect.fetch_single_stock(0, stock, 1, asyncio.Semaphore(1), client, object())
+    )
+
+    # Then: 0을 시세로 쓰지 않고 현재가 실패 + 미해석 태그로 표식하며 호가 행도 남기지 않는다
+    assert row[QUOTE_FAILED_COL] is True
+    assert "현재가" in failed and collect.QUOTE_UNRESOLVED_API in failed
+    assert math.isnan(float(row["고가"])) and math.isnan(float(row["거래량"]))
+    assert row["종가"] == 35300
+    assert orderbook_rows == []
+
+
+def test_load_eligible_codes_returns_symbols_listed_on_previous_trading_day(tmp_path) -> None:
+    import pandas as pd
+
+    from src.daily.collect import load_eligible_codes
+
+    # Given: 금요일(9/11) 상장 구성에 영문코드 보통주/우선주 포함, 목요일 행은 과거
+    panel = pd.DataFrame({
+        "date": pd.to_datetime(["2026-09-10", "2026-09-11", "2026-09-11", "2026-09-11"]),
+        "symbol": ["000001", "005930", "0220W0", "00088K"],
+        "close": [1000.0, 70000.0, 6790.0, 20000.0],
+    })
+    path = tmp_path / "price_history.parquet"
+    panel.to_parquet(path, index=False)
+
+    # When: 월요일(9/14) 결정, 주말은 오라클 호출 없이 건너뜀
+    out = load_eligible_codes(pd.Timestamp("2026-09-14"), path=path, is_trading_day=lambda _d: True)
+
+    # Then
+    assert out == frozenset({"005930", "0220W0", "00088K"})
+
+
+def test_load_eligible_codes_fails_closed_when_panel_is_stale_or_missing(tmp_path) -> None:
+    import pandas as pd
+    import pytest
+
+    from src.daily.collect import load_eligible_codes
+
+    # Given: 직전 거래일(9/11) 수집이 누락된 패널
+    panel = pd.DataFrame({"date": pd.to_datetime(["2026-09-10"]), "symbol": ["005930"], "close": [70000.0]})
+    path = tmp_path / "price_history.parquet"
+    panel.to_parquet(path, index=False)
+
+    # When / Then: 신선도 미달은 fail-closed
+    with pytest.raises(ValueError, match="stale price_history"):
+        load_eligible_codes(pd.Timestamp("2026-09-14"), path=path, is_trading_day=lambda _d: True)
+
+    # And: 파일 부재도 fail-closed
+    with pytest.raises(FileNotFoundError):
+        load_eligible_codes(pd.Timestamp("2026-09-14"), path=tmp_path / "absent.parquet", is_trading_day=lambda _d: True)
+
+
+def test_filter_eligible_candidates_drops_instruments_outside_research_panel(caplog) -> None:
+    import logging
+
+    from src.daily.collect import filter_eligible_candidates
+
+    # Given: 보통주, 영문코드 보통주, Q접두어 없는 ETN, ETF
+    stock_list = [
+        {"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "3.0"},
+        {"code": "0220W0", "name": None, "price": "6790", "chgrate": "0.0847"},
+        {"code": "500041", "name": "신한 인버스 2X 구리 선물 ETN", "price": "+35300", "chgrate": "+8.47"},
+        {"code": "114800", "name": "KODEX 인버스", "price": "1038", "chgrate": "3.59"},
+    ]
+    eligible = frozenset({"005930", "0220W0", "000660"})
+
+    # When
+    with caplog.at_level(logging.INFO, logger="src.daily.collect"):
+        out = filter_eligible_candidates(stock_list, eligible)
+
+    # Then
+    assert [row["code"] for row in out] == ["005930", "0220W0"]
+    assert "stage=instrument_eligibility" in caplog.text
+    assert "n_dropped=2" in caplog.text
+    assert filter_eligible_candidates([], eligible) == []
+
+
+def test_filter_eligible_candidates_raises_when_no_scanned_row_is_eligible() -> None:
+    import pytest
+
+    from src.daily.collect import filter_eligible_candidates
+
+    # Given: 스캔 전부가 패널 밖 종목 (패널/스캔 코드 체계 불일치 신호)
+    stock_list = [{"code": "500041", "name": "ETN", "price": "1000", "chgrate": "5.0"}]
+
+    # When / Then
+    with pytest.raises(ValueError, match="eligible"):
+        filter_eligible_candidates(stock_list, frozenset({"005930"}))
+
+
+def test_main_filters_candidates_by_eligibility_before_quoting(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    import pandas as pd
+    import pytest
+
+    from src.daily import collect
+
+    class _Stop(Exception):  # noqa: N818 - contract skeleton name
+        pass
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 14, 15, 20, 5, tzinfo=tz)
+
+    class _FakeKis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ensure_token(self, session):
+            return None
+
+        async def get_market_index_rate(self, session, code):
+            return {"rt_cd": "1"}
+
+    async def _trading_day(_client, _session, _date):
+        return True
+
+    scanned = [
+        {"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "3.0"},
+        {"code": "500041", "name": "ETN", "price": "+35300", "chgrate": "+8.47"},
+    ]
+    eligibility_dates = []
+    quoted = []
+
+    def _eligible(decision_date):
+        eligibility_dates.append(decision_date)
+        return frozenset({"005930"})
+
+    async def _fetch_all(stock_list, _client, _session):
+        quoted.append([row["code"] for row in stock_list])
+        raise _Stop
+
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
+    monkeypatch.setattr(collect, "resolve_daily_candidates", AsyncMock(return_value=scanned))
+    monkeypatch.setattr(collect, "load_eligible_codes", _eligible)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fetch_all)
+
+    # When
+    with pytest.raises(_Stop):
+        asyncio.run(collect.main(force=False))
+
+    # Then: 결정일 기준 적격성으로 거른 뒤에만 시세를 조회한다
+    assert eligibility_dates == [pd.Timestamp("2026-09-14")]
+    assert quoted == [["005930"]]
+
+
+def test_main_fails_closed_when_eligibility_panel_is_stale(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    import pytest
+
+    from src.daily import collect
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 14, 15, 20, 5, tzinfo=tz)
+
+    class _FakeKis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ensure_token(self, session):
+            return None
+
+        async def get_market_index_rate(self, session, code):
+            return {"rt_cd": "1"}
+
+    async def _trading_day(_client, _session, _date):
+        return True
+
+    def _stale(_decision_date):
+        raise ValueError("stale price_history: no rows on prev_trading_day=2026-09-11")
+
+    fetch_all = AsyncMock()
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
+    monkeypatch.setattr(
+        collect,
+        "resolve_daily_candidates",
+        AsyncMock(return_value=[{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "3.0"}]),
+    )
+    monkeypatch.setattr(collect, "load_eligible_codes", _stale)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", fetch_all)
+
+    # When / Then
+    with pytest.raises(ValueError, match="stale price_history"):
+        asyncio.run(collect.main(force=False))
+    fetch_all.assert_not_awaited()
+
+
+def test_fetch_single_stock_requests_krx_quote_without_venue_fallback_and_logs_failures(caplog) -> None:
+    import asyncio
+    import logging
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    # Given: TPS 초과로 현재가 실패
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(
+        return_value={"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."}
+    )
+    client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "0", "output2": []})
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": {}})
+    stock = {"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "3.0"}
+
+    # When
+    with caplog.at_level(logging.WARNING, logger="src.daily.collect"):
+        asyncio.run(collect.fetch_single_stock(0, stock, 1, asyncio.Semaphore(1), client, object()))
+
+    # Then: KRX 단일 시장 조회 + 실패 사유 구조화 로그
+    assert client.get_current_price.await_args.kwargs == {"market_div_code": "J", "allow_market_div_fallback": False}
+    assert "stage=realtime_quote" in caplog.text
+    assert "code=005930" in caplog.text
+    assert "unresolved=False" in caplog.text
+    assert "rt_cd=1" in caplog.text
+    assert "msg_cd=EGW00201" in caplog.text
+
+    # And: 미해석(rt_cd=0, 종목코드 공란) 응답도 사유와 함께 남는다
+    caplog.clear()
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "msg_cd": "MCA00000", "output": {"stck_prpr": "0"}})
+    with caplog.at_level(logging.WARNING, logger="src.daily.collect"):
+        asyncio.run(collect.fetch_single_stock(0, stock, 1, asyncio.Semaphore(1), client, object()))
+    assert "unresolved=True" in caplog.text
+    assert "rt_cd=0" in caplog.text
+
+
+def test_superseded_unresolved_instrument_helpers_are_removed() -> None:
+    from src.daily import collect
+
+    # Then: 시세 조회 후 제거 방식은 조회 전 적격성 필터로 대체되어 삭제된다
+    assert not hasattr(collect, "listed_codes_before")
+    assert not hasattr(collect, "drop_unresolved_unlisted_instruments")
+    assert collect.QUOTE_UNRESOLVED_API == "현재가_미해석"
+
+
+def test_load_eligible_codes_defaults_to_krx_trading_calendar(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.data.trading_calendar as trading_calendar
+    from src.daily.collect import load_eligible_codes
+
+    # Given: 금요일(9/11)이 휴장, 목요일(9/10)이 직전 거래일
+    panel = pd.DataFrame({
+        "date": pd.to_datetime(["2026-09-10", "2026-09-10"]),
+        "symbol": ["005930", "0220W0"],
+        "close": [70000.0, 6790.0],
+    })
+    path = tmp_path / "price_history.parquet"
+    panel.to_parquet(path, index=False)
+    asked = []
+
+    def _krx_calendar(date):
+        asked.append(pd.Timestamp(date))
+        return pd.Timestamp(date) != pd.Timestamp("2026-09-11")
+
+    monkeypatch.setattr(trading_calendar, "is_krx_trading_day", _krx_calendar)
+
+    # When: 오라클 미지정
+    out = load_eligible_codes(pd.Timestamp("2026-09-14"), path=path)
+
+    # Then: KRX 캘린더로 휴장일을 건너뛴 직전 거래일 구성을 반환
+    assert out == frozenset({"005930", "0220W0"})
+    assert asked == [pd.Timestamp("2026-09-11"), pd.Timestamp("2026-09-10")]

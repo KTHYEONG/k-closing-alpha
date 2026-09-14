@@ -274,7 +274,8 @@ class KisApiClient:
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
                     return data
-            except (aiohttp.ServerDisconnectedError, aiohttp.ClientError) as e:
+            # aiohttp 세션 total 타임아웃은 ClientError가 아닌 TimeoutError로 올라와, 잡지 않으면 단일 지연 요청이 배치 전체를 중단시킨다
+            except (aiohttp.ClientError, TimeoutError) as e:
                 # 네트워크 연결 에러 시 지수 백오프로 재시도
                 if attempt < 4:  # 마지막 시도가 아니면
                     wait_time = 0.5 * (2 ** attempt)  # 0.5초, 1초, 2초, 4초
@@ -291,9 +292,19 @@ class KisApiClient:
                     return {"rt_cd": "9", "msg1": f"네트워크 연결 실패: {str(e)[:100]}"}
         return {"rt_cd": "9", "msg1": "최대 재시도 횟수 초과 (TPS 제한)"}
 
-    async def get_current_price(self, session, code, market_div_code=None):
+    async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
         """주식 현재가 시세 조회 (FHKST01010100)"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+        if not allow_market_div_fallback:
+            normalized = self._normalize_market_div_code(market_div_code)
+            if not normalized:
+                raise ValueError("market_div_code must be explicitly provided when allow_market_div_fallback is False")
+            return await self._handle_request(
+                session.get,
+                url,
+                headers=self._get_headers("FHKST01010100"),
+                params={"fid_cond_mrkt_div_code": normalized, "fid_input_iscd": code},
+            )
         params = {"fid_input_iscd": code}
         preferred_market_div = market_div_code or self._market_div_cache.get(code)
         res, used_market_div = await self._request_with_market_div_fallback(
