@@ -1050,6 +1050,7 @@ def test_main_filters_candidates_by_eligibility_before_quoting(monkeypatch) -> N
     monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
     monkeypatch.setattr(collect, "resolve_daily_candidates", AsyncMock(return_value=scanned))
     monkeypatch.setattr(collect, "load_eligible_codes", _eligible)
+    monkeypatch.setattr(collect, "load_history_complete_codes", lambda **_kw: frozenset({"005930"}))
     monkeypatch.setattr(collect, "fetch_all_stock_data", _fetch_all)
 
     # When
