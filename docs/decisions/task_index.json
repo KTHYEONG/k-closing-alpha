@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260914_KIS_DATA_ACCOUNT_SEPARATION",
+      "date": "2026-09-14",
+      "adr_id": "ADR_20260914_20260914_KIS_DATA_ACCOUNT_SEPARATION",
+      "domain": "data_collection",
+      "title": "KIS 체결/데이터 계좌 분리",
+      "why": "체결 계좌(수수료 우대)와 데이터 수집이 앱키를 공유해 KIS TPS 한도를 함께 소모하고 다른 프로젝트와도 충돌 위험이 있었음",
+      "resolution": "kis_data_client_kwargs()로 데이터 전용 계좌(별도 앱키+토큰캐시)를 13개 데이터 수집 호출부에 배선, finalize_close/paper_trade의 체결가 경로는 기존 계좌 유지",
+      "impact": "1150 테스트 통과, lean_check PASS; VPS .env에 KIS_DATA_* 값 확인 완료, 커밋 필요"
+    },
+    {
       "task_id": "TASK_20260914_LIVE_UNIVERSE_INTEGRITY",
       "date": "2026-09-14",
       "adr_id": "ADR_20260914_20260914_LIVE_UNIVERSE_INTEGRITY",
@@ -989,16 +999,6 @@
       "why": "The research pipeline truncated positive-gain features at an arbitrary 400-feature cap and used an inaccurate missing-value Spearman approximation.",
       "resolution": "Added fold-local permutation-FWER selection with date-local target permutations, exact pairwise-complete Spearman pruning, deterministic CPU screening metadata, explicit selection provenance, and fail-closed capacity handling.",
       "impact": "Feature selection can derive cardinality from null-calibrated signal instead of silently truncating at 400; OOF and full-training provenance remain separate, with reproducible diagnostics and regression coverage."
-    },
-    {
-      "task_id": "TASK_ML_FEATURE_ENGINEERING_QUALITY_REPAIR",
-      "date": "2026-08-08",
-      "adr_id": "ADR_20260808_ML_FEATURE_ENGINEERING_QUALITY_REPAIR",
-      "domain": "signal",
-      "title": "Repair causal history feature quality",
-      "why": "The 2025-only quality audit found market-context alignment, order-dependent aggregation, zero-denominator flow ratios, misleading two-fold stability, and an under-sourced volume_power feature.",
-      "resolution": "Synchronized the causal_history_v2 repairs: deterministic market aggregation, signed-log flow changes, neutral zero-scale z-scores, baseline missing-rate gating, all-fold stability, and effective ma_slope lookback metadata.",
-      "impact": "Documentation, task registry, and code map now reflect the verified 2025 cutoff five-fold retraining; the candidate remains report-only because it does not beat control."
     }
   ]
 }

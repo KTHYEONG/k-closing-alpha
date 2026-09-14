@@ -331,6 +331,7 @@
   },
   "src/settings.py": {
     "testing": [
+      "tests/unit/api/kis/test_kis_client.py",
       "tests/unit/config/test_altdata.py",
       "tests/unit/config/test_altdata_settings.py",
       "tests/unit/config/test_base.py",
