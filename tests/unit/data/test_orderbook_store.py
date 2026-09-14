@@ -62,6 +62,22 @@ def test_build_orderbook_rows_passes_through_non_scalar_value() -> None:
     assert rows[0]["nested"] == {"a": 1}
 
 
+def test_build_orderbook_rows_preserves_iscd_fields_as_string() -> None:
+    """iscd 종목코드 필드는 숫자만이어도(선행 0 보존), 문자가 섞여도 문자열로 남는다."""
+    from datetime import datetime
+
+    from src.data.orderbook_store import build_orderbook_rows
+
+    output2 = {"stck_shrn_iscd": "005930", "mksc_shrn_iscd": "0220W0"}
+    ts = datetime(2026, 9, 4, 15, 22, 0)
+
+    rows = build_orderbook_rows({"rt_cd": "0", "output2": output2}, "005930", "J", "decision", ts)
+
+    row = rows[0]
+    assert row["stck_shrn_iscd"] == "005930"
+    assert row["mksc_shrn_iscd"] == "0220W0"
+
+
 def test_build_orderbook_rows_failed_response_is_empty() -> None:
     from datetime import datetime
 

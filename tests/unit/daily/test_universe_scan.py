@@ -549,6 +549,21 @@ def test_map_toss_trade_value_rows_to_stock_list_skips_codeless_no_band_filter()
     assert map_toss_trade_value_rows_to_stock_list([]) == []
 
 
+def test_map_toss_trade_value_rows_to_stock_list_skips_non_numeric_codes() -> None:
+    """워런트/신주인수권증서 등 코드에 문자가 섞인 종목은 KIS 현재가 API가
+    실패/비정상값을 반환하므로 순수 숫자 종목코드만 통과시킨다."""
+    from src.daily.universe_scan import map_toss_trade_value_rows_to_stock_list
+
+    rows = [
+        {"rank": 1, "symbol": "005930", "price": {"lastPrice": "70000", "changeRate": "0.01"}},
+        {"rank": 2, "symbol": "220W0", "price": {"lastPrice": "500", "changeRate": "0.05"}},
+    ]
+
+    out = map_toss_trade_value_rows_to_stock_list(rows)
+
+    assert out == [{"code": "005930", "name": None, "price": "70000", "chgrate": "0.01"}]
+
+
 def test_fetch_trade_value_union_returns_rows_on_success() -> None:
     import asyncio
     from unittest.mock import AsyncMock
