@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260914_FINALIZE_GUARDS",
+      "date": "2026-09-14",
+      "adr_id": "ADR_20260914_20260914_FINALIZE_GUARDS",
+      "domain": "daily",
+      "title": "finalize 가드 및 앱키 역할분리",
+      "why": "과거일 재실행시 종가덮어쓰기 위험, ETN맨코드 영구미확정 재폴링, 신규편입종목 이력부족 admitted, finalize/paper-exit가 체결계좌 키를 읽기전용 조회에 사용",
+      "resolution": "same-day가드, 미해석코드 1회조회 후 제외, 9/04 레거시 유니버스 교집합으로 이력가드, finalize/paper-exit 시세조회를 데이터계좌 키로 이전",
+      "impact": "finalize_close.py/paper_trade.py/collect.py 3파일, 체결계좌 키는 실주문 전용으로 정리"
+    },
+    {
       "task_id": "TASK_20260914_VENDOR_DEGRADE_LADDER",
       "date": "2026-09-14",
       "adr_id": "ADR_20260914_20260914_VENDOR_DEGRADE_LADDER",
@@ -989,16 +999,6 @@
       "why": "실시간 서빙 시 상따 시나리오 종목의 11개 원-핫/컨텍스트 피처 누락(0.0 주입) 및 상따 가격(close/buy_price) 미동기화로 인한 파생 피처 왜곡이 발생함.",
       "resolution": "features.py에 고정 8종 시나리오 one-hot 및 3종 context 수치 피처 생성기를 구현하고 predict.py에서 상따 가격 동기화 로직을 보강함.",
       "impact": "배포된 61개 피처 모델 번들과의 Training-Serving Skew가 100% 해소되고 상따 시나리오의 가격/수익률 피처 정합성이 보장됨."
-    },
-    {
-      "task_id": "TASK_ML_SERVING_LEGACY_SEPARATION",
-      "date": "2026-08-09",
-      "adr_id": "ADR_20260809_ML_SERVING_LEGACY_SEPARATION",
-      "domain": "ml_architecture",
-      "title": "Separate live ML serving from legacy research",
-      "why": "The daily runtime imported training, OOF, and experiment code and could retrain or mutate model artifacts during live inference; archived research also remained in the active source and test trees.",
-      "resolution": "Moved the live inference boundary to src/serving/realtime, renamed runtime APIs to model-bundle, snapshot-feature, and daily-sizing terminology, archived research under ignored legacy/, removed legacy files from the Git index while preserving them on disk, and updated code maps, specs, and tooling exclusions.",
-      "impact": "Live inference now consumes validated published bundles without automatic retraining; the default test and type/lint scope is smaller and clearer, while legacy research remains explicitly runnable from the working tree. Active regression coverage remains green."
     }
   ]
 }
