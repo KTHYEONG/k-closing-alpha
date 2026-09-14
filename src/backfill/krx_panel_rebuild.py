@@ -177,7 +177,11 @@ def validate_rebuild(new: pd.DataFrame, old: pd.DataFrame) -> dict[str, float | 
     n_bad = int(((close > 0) & ~(raw > 0)).sum())
     if n_bad:
         raise ValueError(f"{n_bad} rows have close > 0 but non-positive close_raw")
-    old_counts = old.groupby(pd.to_datetime(old["date"])).size()
+    # 새 패널은 KRX 일별 전종목(코스피·코스닥) API만을 원천으로 하므로, 이전 패널에 섞여
+    # 들어간 비-코스피/코스닥 표식 행(ETF 등, 후보 스캔 경유로 우연히 백필된 스코프 밖 데이터)은
+    # 행수 감소 비교에서 제외한다.
+    old_scope = old[old["market"].isin(("KOSPI", "KOSDAQ"))] if "market" in old.columns else old
+    old_counts = old_scope.groupby(pd.to_datetime(old_scope["date"])).size()
     new_counts = new.groupby(pd.to_datetime(new["date"])).size()
     common_dates = old_counts.index.intersection(new_counts.index)
     shrunk = [d for d in common_dates if new_counts[d] < old_counts[d]]
