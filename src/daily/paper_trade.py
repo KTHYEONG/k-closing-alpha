@@ -18,6 +18,7 @@ import aiohttp
 import pandas as pd
 
 from src import settings
+from src.api.kis.client import kis_data_client_kwargs
 from src.api.kis.ws_client import KisWebSocketClient, issue_approval_key
 from src.config.market_session import (
     PAPER_ENTRY_HHMMSS,
@@ -172,11 +173,13 @@ async def run_paper_session(
         logger.warning("[DATA] stage=paper_exit status=SKIP reason=past_session_end date=%s", date_str)
         return 0
     owned_session: aiohttp.ClientSession | None = None
-    if ws_client is None:  # pragma: no cover - live KIS boundary, probe-verified
-        if session is None:
+    if ws_client is None:
+        if session is None:  # pragma: no cover - live KIS boundary
             owned_session = aiohttp.ClientSession()
             session = owned_session
-        key = await issue_approval_key(session, settings.KIS_APP_KEY, settings.KIS_APP_SECRET)
+        # 체결틱 구독은 시세 조회라 데이터 계좌 키를 쓴다(체결 계좌 키는 실주문 전용).
+        creds = kis_data_client_kwargs()
+        key = await issue_approval_key(session, creds["app_key"], creds["app_secret"])
         ws_client = KisWebSocketClient(approval_key=key)
     codes = sorted({o.symbol for o in orders})
     fills: list[dict] = []

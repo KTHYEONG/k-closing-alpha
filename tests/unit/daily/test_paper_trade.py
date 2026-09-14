@@ -569,3 +569,52 @@ def test_run_paper_session_entry_consumes_persisted_decision(tmp_path, monkeypat
     assert not hasattr(paper_trade, "run_topk_ranker_sleeve")
     assert caplog.text.count("status=UNCONFIRMED") == 3
 
+
+def test_run_paper_session_exit_issues_approval_key_with_data_account(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [{"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10,
+          "fill_price": 70_000, "decision_date": "2026-09-10"}],
+        kind="fills",
+    )
+    issued = AsyncMock(return_value="APPROVAL")
+    seen_keys: list[str] = []
+
+    class _FakeWsClient:
+        def __init__(self, approval_key):
+            seen_keys.append(approval_key)
+
+        async def stream(self, _session, codes):
+            assert codes == ["005930"]
+            yield ("005930", "093000", 73_600)
+
+    session = object()
+    monkeypatch.setattr(paper_trade, "issue_approval_key", issued)
+    monkeypatch.setattr(paper_trade, "KisWebSocketClient", _FakeWsClient)
+    monkeypatch.setattr(
+        paper_trade,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "DATA_KEY", "app_secret": "DATA_SECRET", "account_id": "", "hts_id": None, "token_file": "t"},
+    )
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, ws_client=None, session=session,
+            now_fn=lambda: pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then
+    assert n == 1
+    issued.assert_awaited_once_with(session, "DATA_KEY", "DATA_SECRET")
+    assert seen_keys == ["APPROVAL"]
+

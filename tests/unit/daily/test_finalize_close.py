@@ -787,7 +787,7 @@ def test_run_close_finalization_reports_degraded_outcome_for_unconfirmed_pick(mo
     assert outcome == "DEGRADED"
     assert kw["run_date"] == "2026-09-10"
     assert kw["reason"] == "picks_unconfirmed"
-    assert kw["metrics"] == {"n_rows": 2, "n_finalized": 1, "n_unconfirmed": 1, "unconfirmed_picks": ["000001"]}
+    assert kw["metrics"] == {"n_rows": 2, "n_finalized": 1, "n_unconfirmed": 1, "n_unresolved": 0, "unconfirmed_picks": ["000001"]}
 
 
 def test_load_pick_codes_zero_fills_persisted_symbols(monkeypatch) -> None:
@@ -858,3 +858,201 @@ def test_finalize_close_main_wires_pick_codes_and_outcome_recorder(monkeypatch) 
     recorder.assert_called_once_with(
         "finalize_close", "DEGRADED", run_date="2026-09-10", reason="zero_confirmed", metrics={"n_rows": 1}
     )
+
+
+def test_is_quote_unresolved_detects_blank_code_zero_price() -> None:
+    from src.daily.finalize_close import is_quote_unresolved
+
+    # 실측: 맨코드 ETN 500041 -> rt_cd=0, 전 필드 0, 종목코드 공란
+    assert is_quote_unresolved({"stck_shrn_iscd": "", "stck_prpr": "0", "acml_vol": "0"}) is True
+    # 벤더 실패(빈 블록)는 재시도 대상
+    assert is_quote_unresolved({}) is False
+    # 정상 시세
+    assert is_quote_unresolved({"stck_shrn_iscd": "005930", "stck_prpr": "80000"}) is False
+    # 코드 필드가 없어도 가격이 있으면 정상
+    assert is_quote_unresolved({"stck_prpr": "10000"}) is False
+
+
+def test_run_close_finalization_rejects_non_same_day_snapshot(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+    import pytest
+
+    from src.daily import finalize_close
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    def _rows(codes, admitted):
+        return pd.DataFrame(
+            {
+                "스냅샷_날짜": ["2026-09-10"] * len(codes),
+                "종목코드": codes,
+                "종가": [10000] * len(codes),
+                "전일종가": [10000] * len(codes),
+                "거래량": [100] * len(codes),
+                "등락률": [0.0] * len(codes),
+                "admitted": admitted,
+                DECISION_CLOSE_COL: [10000] * len(codes),
+                CLOSE_CONFIRMED_COL: [False] * len(codes),
+            }
+        )
+
+    kst = ZoneInfo("Asia/Seoul")
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: _rows(["005930"], [True]))
+    monkeypatch.setattr(
+        finalize_close.archive,
+        "upsert_archive_snapshot",
+        lambda df, snapshot_date=None: (_ for _ in ()).throw(AssertionError("과거일 쓰기 금지")),
+    )
+    calls: list[str] = []
+
+    class _Client:
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            calls.append(code)
+            return {"rt_cd": "0", "output": {"stck_prpr": "10000"}}
+
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            calls.append(code)
+            return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": "112", "stck_prpr": "10000"}}
+
+    async def _no_sleep(_seconds):
+        return None
+
+    # When/Then: 9/10 스냅샷을 9/14 15:31에 확정 시도
+    with pytest.raises(ValueError, match="same-day"):
+        asyncio.run(
+            finalize_close.run_close_finalization(
+                snapshot_date="2026-09-10",
+                client=_Client(),
+                session=object(),
+                now_fn=lambda: datetime(2026, 9, 14, 15, 31, 0, tzinfo=kst),
+                sleep_fn=_no_sleep,
+                retry_interval_seconds=0.0,
+            )
+        )
+    assert calls == []
+
+
+def test_run_close_finalization_drops_unresolved_rows_without_repolling(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import finalize_close
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    def _rows(codes, admitted):
+        return pd.DataFrame(
+            {
+                "스냅샷_날짜": ["2026-09-10"] * len(codes),
+                "종목코드": codes,
+                "종가": [10000] * len(codes),
+                "전일종가": [10000] * len(codes),
+                "거래량": [100] * len(codes),
+                "등락률": [0.0] * len(codes),
+                "admitted": admitted,
+                DECISION_CLOSE_COL: [10000] * len(codes),
+                CLOSE_CONFIRMED_COL: [False] * len(codes),
+            }
+        )
+
+    kst = ZoneInfo("Asia/Seoul")
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: _rows(["500041", "000660"], [True, False]))
+    monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", lambda df, snapshot_date=None: len(df))
+    price_calls: list[str] = []
+
+    class _Client:
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            price_calls.append(code)
+            if code == "500041":
+                return {"rt_cd": "0", "output": {"stck_shrn_iscd": "", "stck_prpr": "0", "acml_vol": "0"}}
+            return {"rt_cd": "0", "output": {"stck_shrn_iscd": "000660", "stck_prpr": "10000"}}
+
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": "121", "stck_prpr": "10000"}}
+
+    clock = iter(
+        [
+            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 31, 0, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 31, 0, tzinfo=kst),
+            datetime(2026, 9, 10, 15, 34, 0, tzinfo=kst),
+        ]
+    )
+    outcomes: list[tuple] = []
+
+    async def _no_sleep(_seconds):
+        return None
+
+    # When
+    n = asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date="2026-09-10",
+            client=_Client(),
+            session=object(),
+            now_fn=lambda: next(clock),
+            sleep_fn=_no_sleep,
+            retry_interval_seconds=0.0,
+            pick_codes=frozenset({"500041"}),
+            on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+        )
+    )
+
+    # Then: 미해석 행은 1회만 조회, 해석 가능 행은 데드라인까지 재조회
+    assert n == 0
+    assert price_calls == ["500041", "000660", "000660"]
+    outcome, kw = outcomes[0]
+    assert outcome == "DEGRADED"
+    assert kw["reason"] == "picks_unconfirmed"
+    assert kw["metrics"] == {
+        "n_rows": 2,
+        "n_finalized": 0,
+        "n_unconfirmed": 1,
+        "n_unresolved": 1,
+        "unconfirmed_picks": ["500041"],
+    }
+
+
+def test_finalize_close_amain_uses_data_account_client(monkeypatch) -> None:
+    import sys
+    from unittest.mock import Mock
+
+    from src.daily import finalize_close
+
+    built: list[dict] = []
+
+    class _FakeSession:
+        async def close(self):
+            return None
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            built.append(kwargs)
+
+        def create_session(self, **_kw):
+            return _FakeSession()
+
+        async def ensure_token(self, _session, force_refresh=False):
+            return "T"
+
+    async def _fake_finalization(*_a, **_kw):
+        return 0
+
+    data_kwargs = {"app_key": "DATA", "app_secret": "S", "account_id": "", "hts_id": None, "token_file": "t.json"}
+    monkeypatch.setattr(finalize_close, "KisApiClient", _FakeClient)
+    monkeypatch.setattr(finalize_close, "kis_data_client_kwargs", lambda: dict(data_kwargs))
+    monkeypatch.setattr(finalize_close, "run_close_finalization", _fake_finalization)
+    monkeypatch.setattr(finalize_close, "load_pick_codes", lambda _d: frozenset())
+    monkeypatch.setattr(finalize_close, "record_run_outcome", Mock())
+    monkeypatch.setattr(sys, "argv", ["finalize_close", "--date", "2026-09-10"])
+
+    # When
+    finalize_close.main()
+
+    # Then
+    assert built == [data_kwargs]
