@@ -135,8 +135,10 @@ def prepare_price_panel(
     else:
         # UNKNOWN은 KOSPI 밴드로 해석되어 보수적 틱을 준다.
         market_values = np.full(len(out), "UNKNOWN", dtype=object)
+    # 틱 크기는 당시 실제 호가 단위이므로 후행 수정주가가 아닌 원가격(close_raw)으로 판정한다.
+    level_close = pd.to_numeric(out["close_raw"], errors="coerce").to_numpy(dtype=np.float64) if "close_raw" in out.columns else close
     out["tick_cost_bp"] = np.asarray(
-        tick_cost_bp(close, dates, market_values), dtype=np.float64
+        tick_cost_bp(level_close, dates, market_values), dtype=np.float64
     )
 
     # --- provenance (입력 프레임 기준, 정렬 불변) ---

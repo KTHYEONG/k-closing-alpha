@@ -79,7 +79,7 @@ def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in HISTORY_REQUIRED_COLUMNS if c not in panel.columns]
     if missing:
         raise ValueError(f"panel missing required columns: {missing}")
-    p = panel[list(HISTORY_REQUIRED_COLUMNS)].copy()
+    p = panel[[*HISTORY_REQUIRED_COLUMNS, *(["close_raw"] if "close_raw" in panel.columns else [])]].copy()
     p["date"] = pd.to_datetime(p["date"])
     p["symbol"] = p["symbol"].astype(str)
     dup = int(p.duplicated(["date", "symbol"]).sum())
@@ -100,7 +100,9 @@ def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
     on = pd.Series(np.where(on_ok, op / np.where(pc > 0, pc, 1.0) - 1.0, np.nan), index=p.index)
     id_ok = np.isfinite(op) & np.isfinite(cl) & (op > 0) & (cl > 0)
     idr = pd.Series(np.where(id_ok, cl / np.where(op > 0, op, 1.0) - 1.0, np.nan), index=p.index)
-    val = p["close"] * p["volume"]
+    # 순매수 금액 분모는 당시 실거래 금액이므로 원가격을 쓰고, 라이브 행(close_raw 없음)은 원가격 그대로인 close 로 폴백한다.
+    level = pd.to_numeric(p["close_raw"], errors="coerce").astype("float64").fillna(p["close"]) if "close_raw" in p.columns else p["close"]
+    val = level * p["volume"]
 
     def _g(s: pd.Series) -> pd.core.groupby.SeriesGroupBy:
         return s.groupby(labels.to_numpy(), sort=False)
@@ -144,7 +146,8 @@ def attach_topk_features(cands: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFra
 
     Returns:
         Copy of cands (same index and row order, symbol cast to str) carrying
-        TOPK_COST_FEATURE_COLS and TOPK_HISTORY_FEATURE_COLS.
+        TOPK_COST_FEATURE_COLS and TOPK_HISTORY_FEATURE_COLS. f_log_close uses
+        the raw price level when close_raw is present.
 
     Raises:
         ValueError: When a required candidate column is missing, or propagated
@@ -160,7 +163,8 @@ def attach_topk_features(cands: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFra
     merged = out.merge(hist, on=["date", "symbol"], how="left", validate="many_to_one")
     # left merge 는 행 순서를 보존하므로 원 인덱스를 그대로 복원한다 (sel_mask 위치 정합)
     merged.index = cands.index
-    close = pd.to_numeric(merged["close"], errors="coerce").to_numpy(dtype=np.float64)
+    level_col = "close_raw" if "close_raw" in merged.columns else "close"
+    close = pd.to_numeric(merged[level_col], errors="coerce").to_numpy(dtype=np.float64)
     merged["f_tick_cost"] = pd.to_numeric(merged["tick_cost_bp"], errors="coerce").astype("float64")
     merged["f_log_close"] = np.log(np.where(close > 0, close, np.nan))
     return merged

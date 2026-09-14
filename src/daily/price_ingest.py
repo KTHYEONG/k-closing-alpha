@@ -457,12 +457,13 @@ def assemble_new_rows(krx_rows: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFra
     """Join flows onto the KRX tail rows and derive the change columns.
 
     Returns:
-        Rows with KRX_ROW_COLUMNS, FLOW_COLUMNS, chg_ratio and daily_change_pct;
-        a missing flow stays NaN.
+        Rows with KRX_ROW_COLUMNS, FLOW_COLUMNS, chg_ratio, daily_change_pct
+        and close_raw; a missing flow stays NaN.
     """
     work = flows.copy()
     work["date"] = pd.to_datetime(work["date"])
     out = krx_rows.merge(work, on=["date", "symbol"], how="left", validate="one_to_one")
+    out["close_raw"] = pd.to_numeric(out["close"], errors="coerce").to_numpy(dtype=np.float64)
     chg = derive_chg_ratio(out["close"].to_numpy(dtype=np.float64), out["prev_close"].to_numpy(dtype=np.float64))
     out["chg_ratio"] = chg
     out["daily_change_pct"] = chg
@@ -551,7 +552,7 @@ def merge_and_adjust(panel: pd.DataFrame, new_rows: pd.DataFrame, trading_days: 
 
     An event exists on a new row when the stored row of the previous trading
     day disagrees with the KRX base price; every earlier row of that symbol
-    is scaled by factor = base / prior close (prices x factor, volume / factor),
+    is scaled by factor = base / prior close (prices x factor; volume and close_raw are never rescaled),
     matching the stored adjusted-history convention. Gaps are never events.
 
     Args:
@@ -564,6 +565,10 @@ def merge_and_adjust(panel: pd.DataFrame, new_rows: pd.DataFrame, trading_days: 
         symbol, date and factor).
     """
     merged = pd.concat([panel, new_rows], ignore_index=True)
+    if "close_raw" not in merged.columns:
+        merged["close_raw"] = np.nan
+    # 신규 행의 원가격은 조정 전 종가 자체다.
+    merged["close_raw"] = pd.to_numeric(merged["close_raw"], errors="coerce").fillna(pd.to_numeric(merged["close"], errors="coerce"))
     merged["date"] = pd.to_datetime(merged["date"])
     merged["symbol"] = merged["symbol"].astype(str)
     merged = merged.sort_values(["symbol", "date"], kind="stable").drop_duplicates(["symbol", "date"], keep="last").reset_index(drop=True)
@@ -590,7 +595,6 @@ def merge_and_adjust(panel: pd.DataFrame, new_rows: pd.DataFrame, trading_days: 
     touched = scale != 1.0
     for col in _ADJUSTED_PRICE_COLUMNS:
         merged.loc[touched, col] = merged.loc[touched, col] * scale[touched]
-    merged.loc[touched, "volume"] = np.round(merged.loc[touched, "volume"] / scale[touched])
     events = merged.loc[event, ["symbol", "date"]].assign(factor=factor[event].to_numpy()).reset_index(drop=True)
     return merged, events
 

@@ -543,3 +543,30 @@ def test_compute_latest_market_breadth_returns_nan_when_no_prior_data_or_all_fla
         "daily_change_pct": [0.0, 0.0],
     })
     assert math.isnan(compute_latest_market_breadth(all_flat, "2026-09-12"))
+
+
+def test_prepare_price_panel_uses_close_raw_for_tick_cost() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.data.panel_integrity import prepare_price_panel
+    from src.execution.cost_model import tick_cost_bp
+
+    base = pd.DataFrame({
+        "date": pd.to_datetime(["2018-04-27"]), "symbol": ["005930"], "open": [52000.0], "high": [53200.0], "low": [51800.0],
+        "close": [53000.0], "prev_close": [52140.0], "volume": [606216.0], "trade_value_100m": [16112.4], "market_cap_100m": [3402242.0],
+        "market": ["KOSPI"], "daily_change_pct": [0.0165], "kospi_pct": [0.0], "kosdaq_pct": [0.0], "v_kospi": [0.0], "v_kosdaq": [0.0],
+        "inst_netbuy": [0.0], "foreign_netbuy": [0.0], "program_netbuy": [0.0],
+    })
+    dates = base["date"].to_numpy()
+
+    # When: 수정종가 53,000 vs 원가격 2,650,000
+    adjusted_only, _ = prepare_price_panel(base)
+    with_raw, _ = prepare_price_panel(base.assign(close_raw=[2650000.0]))
+
+    # Then
+    assert adjusted_only["tick_cost_bp"].iloc[0] == pytest.approx(float(tick_cost_bp(np.array([53000.0]), dates, np.array(["KOSPI"], dtype=object))[0]))
+    assert with_raw["tick_cost_bp"].iloc[0] == pytest.approx(float(tick_cost_bp(np.array([2650000.0]), dates, np.array(["KOSPI"], dtype=object))[0]))
+    assert with_raw["tick_cost_bp"].iloc[0] < adjusted_only["tick_cost_bp"].iloc[0]
+    assert with_raw["chg_ratio"].iloc[0] == pytest.approx(53000.0 / 52140.0 - 1.0)
