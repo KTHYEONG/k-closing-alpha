@@ -390,6 +390,9 @@
   "src/tools/observe_closing_auction_price_behavior.py": {
     "testing": "tests/unit/tools/test_observe_closing_auction_price_behavior.py"
   },
+  "src/tools/run_outcome.py": {
+    "testing": "tests/unit/tools/test_run_outcome.py"
+  },
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
   }

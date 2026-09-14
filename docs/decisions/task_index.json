@@ -1,6 +1,36 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260914_VENDOR_DEGRADE_LADDER",
+      "date": "2026-09-14",
+      "adr_id": "ADR_20260914_20260914_VENDOR_DEGRADE_LADDER",
+      "domain": "daily",
+      "title": "스캔 KIS 밴드폴백 및 price_ingest 부분기록",
+      "why": "Kiwoom·Toss 모두 실패시 후보스캔 즉시중단, 수급 결측시 완전한 가격행까지 전부 미기록되어 익일 결정 연쇄차단",
+      "resolution": "KIS 등락률순위 30행 상한을 적응형 이분할로 전량복원해 2차폴백 추가(ETN Q접두어 정규화), price_ingest는 가격은 기록·수급NaN+DEGRADED, 매회 창내 결측 재보완",
+      "impact": "universe_scan.py/price_ingest.py 2파일, fail-closed 지점 2곳을 fail-soft 사다리로 전환"
+    },
+    {
+      "task_id": "TASK_20260914_DECISION_CHAIN_OUTCOME",
+      "date": "2026-09-14",
+      "adr_id": "ADR_20260914_20260914_DECISION_CHAIN_OUTCOME",
+      "domain": "daily",
+      "title": "실행결과 분류/알림 및 finalize 우선순위",
+      "why": "predict/finalize가 강등돼도 exit 0로 조용히 넘어가 daily_audit가 OK로 오판, finalize는 순차·순서없이 처리해 픽 미확정 위험",
+      "resolution": "run_outcome.py로 OK/DEGRADED/NO_DECISION 기록+알림, finalize는 픽→admitted→나머지 순 4행 동시조회+행단위 데드라인, daily_audit는 predict OK만 결정 인정",
+      "impact": "run_outcome.py 신규, finalize_close/predict/daily_audit 3파일, 조용한 강등 알림화"
+    },
+    {
+      "task_id": "TASK_20260914_DECISION_DAY_RESILIENCE",
+      "date": "2026-09-14",
+      "adr_id": "ADR_20260914_20260914_DECISION_DAY_RESILIENCE",
+      "domain": "daily",
+      "title": "결정일 소실 방지 (거래일 판정·재조회·알림·토큰재시도)",
+      "why": "직전거래일 KRX 동기호출 블로킹, 실패시세 무재조회, 무상세 알림, 토큰 단발발급이 결정창(15:20-15:30)을 통째로 날릴 수 있었음",
+      "resolution": "KIS 1차+KRX 2차 비동기 거래일 판정, 15:28 이전 1회 실패시세 재조회, 알림에 unit 상태+journal tail 첨부, 비TTY 진행바 제거, 토큰 전송오류만 재시도",
+      "impact": "collect.py/alerts.py/kis client 5개 파일, 결정일 강제종료 리스크 제거"
+    },
+    {
       "task_id": "TASK_20260914_KIS_DATA_ACCOUNT_SEPARATION",
       "date": "2026-09-14",
       "adr_id": "ADR_20260914_20260914_KIS_DATA_ACCOUNT_SEPARATION",
@@ -969,36 +999,6 @@
       "why": "The daily runtime imported training, OOF, and experiment code and could retrain or mutate model artifacts during live inference; archived research also remained in the active source and test trees.",
       "resolution": "Moved the live inference boundary to src/serving/realtime, renamed runtime APIs to model-bundle, snapshot-feature, and daily-sizing terminology, archived research under ignored legacy/, removed legacy files from the Git index while preserving them on disk, and updated code maps, specs, and tooling exclusions.",
       "impact": "Live inference now consumes validated published bundles without automatic retraining; the default test and type/lint scope is smaller and clearer, while legacy research remains explicitly runnable from the working tree. Active regression coverage remains green."
-    },
-    {
-      "task_id": "TASK_ML_HISTORY_PIPELINE_OPERATIONAL_HARDENING",
-      "date": "2026-08-08",
-      "adr_id": "ADR_20260808_ML_HISTORY_PIPELINE_OPERATIONAL_HARDENING",
-      "domain": "ml",
-      "title": "ML history pipeline operational hardening",
-      "why": "History construction completed, but sparse lifecycle events made downstream selection appear stalled; repeated cold builds also increased runtime and memory risk.",
-      "resolution": "Added lifecycle diagnostics, fingerprint-validated atomic history caching, bounded history preparation telemetry, and research-only model-retention controls; confirmed the causal history candidate remains report-only after a completed full pipeline run.",
-      "impact": "Warm reruns avoid the cold history build, failures identify the exact stage, OOF and causal evaluation semantics remain unchanged, and no production model artifact is promoted."
-    },
-    {
-      "task_id": "TASK_ML_MODEL_PERFORMANCE_HARDENING",
-      "date": "2026-08-08",
-      "adr_id": "ADR_20260808_ML_MODEL_PERFORMANCE_HARDENING",
-      "domain": "ml",
-      "title": "ML 평가 무결성 및 날짜 균형 학습 가중치",
-      "why": "Feature-selection report evaluation had unverified decision-time provenance and a vacuous control/candidate OOF date gate; row-level loss also overweights action-dense dates.",
-      "resolution": "Added fail-closed timestamp provenance, actual paired OOF date comparison, and causal date-balanced Huber sample weighting with nested selection and regression tests.",
-      "impact": "Research promotion remains blocked without capture-time provenance; future date-balanced ablations are evaluated with non-vacuous paired OOF gates. No production default is changed."
-    },
-    {
-      "task_id": "ml-feature-selection-optimization",
-      "date": "2026-08-08",
-      "adr_id": "ADR_20260808_ml-feature-selection-optimization",
-      "domain": "ml",
-      "title": "ML Feature Selection Optimization",
-      "why": "The research pipeline truncated positive-gain features at an arbitrary 400-feature cap and used an inaccurate missing-value Spearman approximation.",
-      "resolution": "Added fold-local permutation-FWER selection with date-local target permutations, exact pairwise-complete Spearman pruning, deterministic CPU screening metadata, explicit selection provenance, and fail-closed capacity handling.",
-      "impact": "Feature selection can derive cardinality from null-calibrated signal instead of silently truncating at 400; OOF and full-training provenance remain separate, with reproducible diagnostics and regression coverage."
     }
   ]
 }
