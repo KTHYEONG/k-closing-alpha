@@ -20,7 +20,17 @@ __all__ = ["append_orderbook_snapshots", "build_orderbook_rows", "orderbook_part
 _NUMERIC_RE = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
 
 
-def _coerce_value(value: Any) -> Any:
+def _coerce_value(key: str, value: Any) -> Any:
+    """KIS 필드값을 숫자로 캐스팅한다(단, 종목코드 계열 식별자는 제외).
+
+    stck_shrn_iscd/mksc_shrn_iscd 같은 iscd 필드는 자릿수 전부 숫자인 경우도
+    있고(예: "005930") 워런트/신주인수권 등에서 문자를 포함하기도 한다
+    (예: "0220W0"). 식별자를 숫자로 바꾸면 선행 0이 소실되고, 같은 컬럼 안에
+    숫자/문자열이 섞여 parquet 스키마 추론이 실패하므로 애초에 변환 대상에서
+    제외한다.
+    """
+    if key.endswith("iscd"):
+        return value
     if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
         return value
     if isinstance(value, str):
@@ -51,10 +61,10 @@ def build_orderbook_rows(
     }
     if isinstance(output1, dict):
         for key, value in output1.items():
-            row[str(key)] = _coerce_value(value)
+            row[str(key)] = _coerce_value(str(key), value)
     if isinstance(output2, dict):
         for key, value in output2.items():
-            row[str(key)] = _coerce_value(value)
+            row[str(key)] = _coerce_value(str(key), value)
     return [row]
 
 
