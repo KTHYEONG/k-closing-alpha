@@ -69,6 +69,11 @@ class PathSettings(BaseSettings):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def DATA_TOKEN_FILE(self) -> Path:
+        return self.CONFIGS_DIR / "kis_data_token_cache.json"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def HISTORY_DIR(self) -> Path:
         return self.DATA_DIR / "history"
 

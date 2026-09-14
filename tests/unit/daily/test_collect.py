@@ -1186,3 +1186,15 @@ def test_load_eligible_codes_defaults_to_krx_trading_calendar(tmp_path, monkeypa
     # Then: KRX 캘린더로 휴장일을 건너뛴 직전 거래일 구성을 반환
     assert out == frozenset({"005930", "0220W0"})
     assert asked == [pd.Timestamp("2026-09-11"), pd.Timestamp("2026-09-10")]
+
+
+def test_collect_module_constants_sourced_from_data_account_kwargs() -> None:
+    from src.daily import collect
+
+    kwargs = collect.kis_data_client_kwargs()
+
+    assert kwargs["app_key"] == collect.APP_KEY
+    assert kwargs["app_secret"] == collect.APP_SECRET
+    assert kwargs["account_id"] == collect.ACCOUNT_ID
+    assert kwargs["hts_id"] == collect.HTS_ID
+    assert kwargs["token_file"] == collect.TOKEN_FILE

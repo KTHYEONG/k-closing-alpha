@@ -8,7 +8,7 @@ from typing import Any
 import aiohttp
 import pandas as pd
 
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +207,7 @@ def get_investor_trade_daily(
       TR_ID: FHPTJ04160001
     """
     async def _run() -> pd.DataFrame:
-        client = KisApiClient()
+        client = KisApiClient(**kis_data_client_kwargs())
         async with client.create_session() as session:
             await client.ensure_token(session)
             return await get_investor_trade_daily_async(

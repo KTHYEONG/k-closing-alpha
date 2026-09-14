@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.sync.fetcher_investor import get_investor_trade_daily_async
 from src.sync.fetcher_program import get_program_history_async
 
@@ -179,7 +179,7 @@ async def run_kis_flow_backfill(
     limiter = AsyncRateLimiter(config.requests_per_second)
     semaphore = asyncio.Semaphore(max(1, config.concurrency))
 
-    client = KisApiClient()
+    client = KisApiClient(**kis_data_client_kwargs())
     async with client.create_session() as session:
         await client.ensure_token(session)
         tasks = [

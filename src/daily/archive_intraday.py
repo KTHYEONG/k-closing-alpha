@@ -7,7 +7,7 @@ import logging
 from datetime import datetime
 
 from src import settings
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.api.kiwoom.client import KiwoomApiClient
 from src.api.ls.client import LsApiClient
 from src.backfill.intraday.collector import (
@@ -78,7 +78,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
         return (0, 0, 0)
 
     async def _run() -> tuple[int, int, int]:
-        client = KisApiClient()
+        client = KisApiClient(**kis_data_client_kwargs())
         ls_client = LsApiClient() if getattr(settings, 'LS_APP_KEY', None) else None
         kiwoom_client = KiwoomApiClient() if (getattr(settings, 'KIWOM_APP_KEY', None) or getattr(settings, 'KIWOOM_APP_KEY', None)) else None
         async with client.create_session() as session:

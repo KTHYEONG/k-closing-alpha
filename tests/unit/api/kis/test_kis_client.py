@@ -254,3 +254,50 @@ def test_get_current_price_without_fallback_queries_only_requested_market(monkey
     with pytest.raises(ValueError, match="market_div_code"):
         asyncio.run(client.get_current_price(_Session(), "005930", allow_market_div_fallback=False))
 
+
+def test_kis_data_client_kwargs_reads_data_account_settings(monkeypatch, tmp_path) -> None:
+    from src.api.kis.client import kis_data_client_kwargs
+    from src import settings
+
+    # Given: 데이터 계좌와 체결 계좌가 서로 다른 합성 자격증명
+    monkeypatch.setattr(settings, "KIS_DATA_API_CONFIG", {
+        "app_key": "data-key", "app_secret": "data-secret", "account_id": "", "hts_id": "data-hts",
+    })
+    monkeypatch.setattr(settings, "KIS_API_CONFIG", {
+        "app_key": "exec-key", "app_secret": "exec-secret", "account_id": "exec-acct", "hts_id": "exec-hts",
+    })
+    data_token = tmp_path / "kis_data_token_cache.json"
+    monkeypatch.setattr(settings, "DATA_TOKEN_FILE", data_token)
+
+    # When
+    out = kis_data_client_kwargs()
+
+    # Then: 데이터 계좌 값만 반영, 체결 계좌 값은 섞이지 않는다
+    assert out == {
+        "app_key": "data-key", "app_secret": "data-secret", "account_id": "", "hts_id": "data-hts",
+        "token_file": str(data_token),
+    }
+
+
+def test_kis_data_client_gets_isolated_rate_limiter_from_execution_client(monkeypatch, tmp_path) -> None:
+    from src.api.kis.client import KisApiClient, kis_data_client_kwargs
+    from src import settings
+
+    # Given: 서로 다른 앱키를 가진 데이터/체결 계좌
+    monkeypatch.setattr(settings, "KIS_DATA_API_CONFIG", {
+        "app_key": "data-key-iso", "app_secret": "s", "account_id": "", "hts_id": "h",
+    })
+    monkeypatch.setattr(settings, "DATA_TOKEN_FILE", tmp_path / "kis_data_token_cache.json")
+    monkeypatch.setattr(settings, "KIS_API_CONFIG", {
+        "app_key": "exec-key-iso", "app_secret": "s", "account_id": "a", "hts_id": "h",
+    })
+
+    # When
+    data_client = KisApiClient(**kis_data_client_kwargs())
+    exec_client = KisApiClient()
+
+    # Then: 프로세스 전역 공유 리미터가 앱키별로 분리된 버킷을 갖는다
+    assert data_client.rate_limiter is not exec_client.rate_limiter
+    assert data_client.app_key == "data-key-iso"
+    assert exec_client.app_key == "exec-key-iso"
+
