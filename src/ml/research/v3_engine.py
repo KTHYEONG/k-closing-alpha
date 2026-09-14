@@ -157,8 +157,10 @@ def attach_forward_exit_paths(
         raise ValueError("attach_forward_exit_paths requires a 'market' column for point-in-time tick costing")
     trade_dates = pd.to_datetime(cands["date"]).to_numpy()
     markets = cands["market"].astype(str).to_numpy(dtype=object)
-    cost_aa_bp = round_trip_cost_bp(entry_p, trade_dates, markets, AA_COST)
-    cost_pa_bp = round_trip_cost_bp(entry_p, trade_dates, markets, PA_COST)
+    # 왕복비용의 틱 크기는 원가격 기준, 수익률은 수정주가 체인 기준.
+    level_p = _level_close(cands)
+    cost_aa_bp = round_trip_cost_bp(level_p, trade_dates, markets, AA_COST)
+    cost_pa_bp = round_trip_cost_bp(level_p, trade_dates, markets, PA_COST)
     cost_stress_bp = np.full(len(cands), STRESS_COST_BP, dtype=np.float64)
 
     gross_ret = exit_prices / entry_p - 1.0
@@ -172,6 +174,14 @@ def attach_forward_exit_paths(
     cands["net_return_stress"] = gross_ret - cost_stress_bp / 10000.0
 
     return cands
+
+
+# 가격 레벨(금액·틱) 계산은 원가격, 수정주가는 비율 피처 전용.
+def _level_close(frame: pd.DataFrame) -> np.ndarray:
+    """Return the raw price level per row, falling back to close."""
+    if "close_raw" in frame.columns:
+        return pd.to_numeric(frame["close_raw"], errors="coerce").fillna(frame["close"]).to_numpy(dtype=np.float64)
+    return frame["close"].to_numpy(dtype=np.float64)
 
 
 def compute_derived_features(cands: pd.DataFrame) -> pd.DataFrame:
@@ -190,7 +200,7 @@ def compute_derived_features(cands: pd.DataFrame) -> pd.DataFrame:
     cands["log_tv"] = np.log1p(np.maximum(cands["tv_clean"].to_numpy(dtype=np.float64), 0.0))
     cands["log_mc"] = np.log1p(np.maximum(cands["mc_clean"].to_numpy(dtype=np.float64), 0.0))
 
-    val_krw = np.maximum(p_close * p_vol, 1.0)
+    val_krw = np.maximum(_level_close(cands) * p_vol, 1.0)
     cands["inst_density"] = np.clip(cands["inst_netbuy"].fillna(0).to_numpy(dtype=np.float64) / val_krw, -1.0, 1.0)
     cands["foreign_density"] = np.clip(cands["foreign_netbuy"].fillna(0).to_numpy(dtype=np.float64) / val_krw, -1.0, 1.0)
 

@@ -359,9 +359,9 @@ def test_merge_and_adjust_scales_history_for_events_and_ignores_gaps() -> None:
     merged, events = merge_and_adjust(panel, new, d)
 
     m = merged.set_index(["symbol", "date"])
-    # Then: A split 5:1 on 09-10 -> earlier rows x0.2, volume x5; the event row itself untouched
+    # Then: A split 5:1 on 09-10 -> 이전 행 x0.2, 거래량은 원값 유지; the event row itself untouched
     assert m.loc[("A", d[0]), "close"] == pytest.approx(2000.0)
-    assert m.loc[("A", d[2]), "volume"] == pytest.approx(5000.0)
+    assert m.loc[("A", d[2]), "volume"] == pytest.approx(1000.0)
     assert m.loc[("A", d[3]), "close"] == pytest.approx(2100.0)
     # Then: B's prior row is 09-07 (not the previous trading day) -> a gap, never an event
     assert m.loc[("B", d[0]), "close"] == pytest.approx(3000.0)
@@ -420,7 +420,7 @@ def test_run_price_ingest_fills_new_date_stale_tail_and_new_listing(monkeypatch,
     assert int((out["symbol"] == "000001").sum()) == 4
     # Then: 000002 split on 09-10 (base 4200 vs prior close 21000) -> history x0.2, volume x5
     assert m.loc[("000002", days["2026-09-03"]), "close"] == 4000
-    assert m.loc[("000002", days["2026-09-03"]), "volume"] == 500
+    assert m.loc[("000002", days["2026-09-03"]), "volume"] == 100
     assert m.loc[("000002", days["2026-09-09"]), "close"] == 4200
     assert int((out["symbol"] == "000003").sum()) == 3
     # Then: prev_close equals the prior close on every consecutive row; index columns from composites
@@ -786,3 +786,27 @@ def test_price_ingest_main_wires_outcome_recorder(monkeypatch) -> None:
     recorder.assert_called_once_with(
         "price_ingest", "DEGRADED", run_date="2026-09-11", reason="flow_coverage_below_min", metrics={"n_new_rows": 3}
     )
+
+
+def test_merge_and_adjust_keeps_raw_volume_and_close_raw() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.daily.price_ingest import assemble_new_rows, merge_and_adjust, normalize_krx_daily
+
+    d = [pd.Timestamp(x) for x in ("2026-09-08", "2026-09-09", "2026-09-10")]
+    panel = pd.DataFrame(_panel_rows("A", d[:2], [10000.0, 10000.0], volume=1000.0)).assign(close_raw=10000.0)
+    krx = normalize_krx_daily(_krx_raw([{"symbol": "A", "close": 2100, "prev_close": 2000, "volume": 5000}]), d[2])
+    new = assemble_new_rows(krx, pd.DataFrame(columns=["date", "symbol", "inst_netbuy", "foreign_netbuy", "program_netbuy"]))
+
+    # When
+    merged, events = merge_and_adjust(panel, new, d)
+
+    # Then
+    m = merged.set_index("date")
+    assert len(events) == 1 and events["factor"].iloc[0] == pytest.approx(0.2)
+    assert m.loc[d[0], "close"] == pytest.approx(2000.0)
+    assert m.loc[d[0], "volume"] == pytest.approx(1000.0)
+    assert m.loc[d[0], "close_raw"] == pytest.approx(10000.0)
+    assert m.loc[d[2], "close_raw"] == pytest.approx(2100.0)
+    assert m.loc[d[2], "volume"] == pytest.approx(5000.0)

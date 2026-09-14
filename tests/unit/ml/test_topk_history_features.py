@@ -327,3 +327,34 @@ def test_load_serving_price_history_reads_pit_window_and_fails_closed(tmp_path) 
         out_default = load_serving_price_history(mid_decision, path=path)
     assert not out_default.empty
 
+
+
+def test_topk_cost_and_value_features_use_close_raw_when_present() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_history_features import attach_topk_features, compute_topk_history_features
+
+    days = pd.bdate_range("2026-08-03", periods=8)
+    panel = pd.DataFrame({
+        "date": days, "symbol": ["A"] * 8, "open": 100.0, "close": 100.0, "prev_close": 100.0, "volume": 10.0,
+        "inst_netbuy": 50.0, "foreign_netbuy": 0.0,
+    })
+    with_raw = panel.assign(close_raw=[5000.0] * 7 + [np.nan])
+
+    # When
+    base = compute_topk_history_features(panel)
+    raw = compute_topk_history_features(with_raw)
+
+    # Then: 분모 closexvolume 이 원가격(50배)이면 f_inst_cum5 는 1/50, 마지막 행(라이브, close_raw 결측)은 close 로 폴백
+    assert base["f_inst_cum5"].iloc[-2] == pytest.approx(50.0 * 5 / (100.0 * 10.0 * 5))
+    assert raw["f_inst_cum5"].iloc[-2] == pytest.approx(50.0 * 5 / (5000.0 * 10.0 * 5))
+    assert raw["f_inst_cum5"].iloc[-1] == pytest.approx(50.0 * 5 / (5000.0 * 10.0 * 4 + 100.0 * 10.0))
+    assert np.allclose(base["f_ret5"].to_numpy(), raw["f_ret5"].to_numpy(), equal_nan=True)
+
+    cands = pd.DataFrame({"date": [days[-1]], "symbol": ["A"], "close": [100.0], "close_raw": [5000.0], "tick_cost_bp": [1.0]})
+    out = attach_topk_features(cands, with_raw)
+    assert out["f_log_close"].iloc[0] == pytest.approx(np.log(5000.0))
+    plain = attach_topk_features(cands.drop(columns=["close_raw"]), panel)
+    assert plain["f_log_close"].iloc[0] == pytest.approx(np.log(100.0))
