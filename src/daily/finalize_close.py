@@ -84,7 +84,7 @@ def build_finalized_row(
 async def fetch_confirmed_quote(client: Any, session: Any, code: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """현재가(output)와 호가/예상체결(output2)을 동시 조회한다 (실패 블록은 빈 dict)."""
     price_res, book_res = await asyncio.gather(
-        client.get_current_price(session, code, market_div_code=KRX_CLOSE_MARKET_DIV_CODE),
+        client.get_current_price(session, code, market_div_code=KRX_CLOSE_MARKET_DIV_CODE, allow_market_div_fallback=False),
         client.get_orderbook_snapshot(session, code, market_div_code=KRX_CLOSE_MARKET_DIV_CODE),
     )
     price_output = price_res.get("output") if isinstance(price_res, dict) and price_res.get("rt_cd") == "0" and isinstance(price_res.get("output"), dict) else {}

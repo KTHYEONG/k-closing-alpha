@@ -274,17 +274,10 @@ def map_toss_ranking_rows_to_stock_list(rows: list[dict], universe: UniverseSpec
 
 
 def map_toss_trade_value_rows_to_stock_list(rows: list[dict]) -> list[dict]:
-    """Map Toss trade-value ranking rows to collect.py stock_list shape.
-
-    거래대금 랭킹은 등락률 밴드 필터가 없어 ETF/ETN/워런트/신주인수권증서 등
-    비-보통주 종목(코드에 숫자 외 문자 포함, 예: 신주인수권증서)이 섞여 들어온다.
-    이런 종목은 KIS 국내주식 현재가 API에서 호출 실패나 OHLC 비정상값을
-    유발해 실시간 커버리지 게이트를 훼손하므로, 순수 숫자 종목코드만 통과시킨다.
-    """
     out: list[dict] = []
     for row in rows:
         code_raw = str(row.get("symbol", "") or "").strip()
-        if not code_raw or not code_raw.isdigit():
+        if not code_raw:
             continue
         code = code_raw.zfill(6)
         price_block = row.get("price") or {}
@@ -339,7 +332,8 @@ async def fetch_candidate_stock_list(
 
     Raises:
         UniverseScanCoverageError: kiwoom_client 미주입, 또는 Kiwoom과(toss_client가
-            주입된 경우) Toss 모두 실패 시.
+            주입된 경우) Toss 모두 실패 시, 또는 truncated Kiwoom scan
+            (no Toss fallback, which is narrower).
     """
     if kiwoom_client is None:
         raise UniverseScanCoverageError("kiwoom_client is required for the tradeable candidate list")
@@ -352,6 +346,8 @@ async def fetch_candidate_stock_list(
     except Exception as e:
         kw_reason = f"kiwoom ranking call failed: {e}"
     else:
+        if kw_res.get("truncated"):
+            raise UniverseScanCoverageError(f"kiwoom ranking truncated: {kw_res.get('msg1', '')}")
         if kw_res.get("rt_cd") == "0":
             rows = kw_res.get("output") or []
             out = map_kiwoom_ranking_rows_to_stock_list(rows)

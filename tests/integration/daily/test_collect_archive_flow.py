@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from src.daily import collect
 
@@ -44,6 +45,16 @@ class _FakeKisClient:
                 {"code": "005930", "name": "삼성전자", "price": "1000", "chgrate": "1.00"}
             ],
         }
+
+
+class _AllListed(frozenset):
+    def __contains__(self, item: object) -> bool:
+        return True
+
+
+@pytest.fixture(autouse=True)
+def _eligible_everything(monkeypatch) -> None:
+    monkeypatch.setattr(collect, "load_eligible_codes", lambda _decision_date: _AllListed())
 
 
 class _FakeSession:
