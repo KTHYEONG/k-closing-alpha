@@ -267,3 +267,32 @@ def test_main_runs_rebuild_and_swaps_only_with_flag(monkeypatch, tmp_path) -> No
     assert seen[1]["start"] == pd.Timestamp("2020-01-02") and seen[1]["end"] == pd.Timestamp("2020-01-31")
     assert swaps == [(tmp_path / "price_history_rebuild.parquet", tmp_path / "price_history.parquet")]
 
+
+def test_validate_rebuild_ignores_non_kospi_kosdaq_rows_for_shrink_check() -> None:
+    """비-코스피/코스닥 표식 행(예: 조건검색 경유로 우연히 백필된 ETF)은 KRX 전종목 소스의
+    스코프 밖이므로, 새 패널에서 사라져도 행수 감소로 취급하지 않는다 (2026-09-14 실측:
+    243880 TIGER 200IT레버리지 market='ETF' 4개 날짜에서 fail-closed 오탐)."""
+    import pandas as pd
+
+    from src.backfill import krx_panel_rebuild as mod
+
+    def _panel(rows):
+        return pd.DataFrame(rows, columns=["date", "symbol", "close", "close_raw", "market"]).assign(
+            date=lambda x: pd.to_datetime(x["date"])
+        )
+
+    old = _panel([
+        ("2026-09-07", "005930", 100.0, 100.0, "KOSPI"),
+        ("2026-09-07", "243880", 350000.0, 350000.0, "ETF"),
+    ])
+    new = _panel([
+        ("2026-09-07", "005930", 100.0, 100.0, "KOSPI"),
+    ])
+
+    # When: ETF 행 하나가 새 패널에는 없지만(코스피/코스닥 스코프 밖)
+    metrics = mod.validate_rebuild(new, old)
+
+    # Then: 행수 감소로 실패하지 않고, 코스피/코스닥 행만으로 정상 검증
+    assert metrics["n_rows"] == 1
+    assert metrics["match_rate"] == 1.0
+
