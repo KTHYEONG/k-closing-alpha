@@ -15,7 +15,7 @@ import pandas as pd
 from src import settings
 
 # 커스텀 모듈 임포트
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
 from src.utils.display import Colors
 from src.daily import archive
@@ -62,13 +62,14 @@ async def _validate_trading_day(client, session, snapshot_date: str, *, force: b
 # =========================================================
 # [설정] API 접속 정보
 # =========================================================
-APP_KEY = settings.KIS_API_CONFIG["app_key"]
-APP_SECRET = settings.KIS_API_CONFIG["app_secret"]
-ACCOUNT_ID = settings.KIS_API_CONFIG.get("account_id", "")
-HTS_ID = settings.KIS_API_CONFIG.get("hts_id")
+_KIS_DATA_KWARGS = kis_data_client_kwargs()
+APP_KEY = _KIS_DATA_KWARGS["app_key"]
+APP_SECRET = _KIS_DATA_KWARGS["app_secret"]
+ACCOUNT_ID = _KIS_DATA_KWARGS["account_id"]
+HTS_ID = _KIS_DATA_KWARGS["hts_id"]
 
 TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
-TOKEN_FILE = str(settings.TOKEN_FILE)
+TOKEN_FILE = _KIS_DATA_KWARGS["token_file"]
 
 logger.debug("일일 수집 시작...")
 

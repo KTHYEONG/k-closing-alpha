@@ -577,10 +577,9 @@ async def run_price_ingest(
         raise FileNotFoundError(f"price_history not found: {out_path}")
     cfg = krx_cfg or AltDataFetchConfig(start=run_day, end=run_day + pd.Timedelta(days=1), out_dir=Path("."), krx_api_key=settings.KRX_OPENAPI_KEY)
     if kis is None:
-        from src.api.kis.client import KisApiClient
+        from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 
-        c = settings.KIS_API_CONFIG
-        kis = KisApiClient(c["app_key"], c["app_secret"], c.get("account_id", ""), c.get("hts_id", ""), token_file=str(settings.TOKEN_FILE))
+        kis = KisApiClient(**kis_data_client_kwargs())
     if kiwoom is None:
         from src.api.kiwoom.client import KiwoomApiClient
 

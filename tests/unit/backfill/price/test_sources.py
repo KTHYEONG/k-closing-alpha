@@ -13,7 +13,7 @@ def test_kis_sync_client_resolves_renamed_lazy_import(monkeypatch) -> None:
             return False
 
     class _FakeKisApiClient:
-        def __init__(self) -> None:
+        def __init__(self, *args, **kwargs) -> None:
             self.token = None
 
         def create_session(self):

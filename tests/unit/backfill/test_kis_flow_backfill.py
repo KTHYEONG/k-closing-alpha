@@ -124,6 +124,9 @@ def test_run_backfill_creates_guarded_tasks(tmp_path, monkeypatch) -> None:
             return None
 
     class _Client:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
         def create_session(self):
             return _SessionContext()
 
