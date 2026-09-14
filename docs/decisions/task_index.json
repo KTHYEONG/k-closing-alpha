@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260914_PIT_PANEL_REBUILD",
+      "date": "2026-09-14",
+      "adr_id": "ADR_20260914_20260914_PIT_PANEL_REBUILD",
+      "domain": "daily",
+      "title": "KRX 전종목 PIT 패널 재구축 코드",
+      "why": "패널이 condition_history 유니버스라 생존편향(연 350종목 누락)이고 pykrx 후행수정주가가 틱비용·금액 피처에 미래참조를 흘림",
+      "resolution": "krx_panel_rebuild.py 신설(체크포인트 재개, 기준가 이벤트체인, close_raw 보존, 검증 후 원자교체), 틱비용/f_log_close/금액분모/왕복비용을 close_raw 우선으로 전환",
+      "impact": "신규 backfill 모듈+4파일, 실행은 별도(재구축 CLI→수급백필→swap→재인증), 거래량 재조정 규약 제거"
+    },
+    {
       "task_id": "TASK_20260914_FINALIZE_GUARDS",
       "date": "2026-09-14",
       "adr_id": "ADR_20260914_20260914_FINALIZE_GUARDS",
@@ -989,16 +999,6 @@
       "why": "Eliminated manual Google Sheet intervention and subjective theme labeling by establishing fully automated KIS/Naver-based classification with local Parquet caching and ML train-serve consistency.",
       "resolution": "Built src/data/theme_resolver.py with 4-tier hybrid resolution, updated collect.py and predict.py to use local theme.parquet caching, removed Google Sheets theme sync dependencies, and updated 33,000+ historical trade logs.",
       "impact": "Zero manual intervention between collect and predict, 40ms inference latency, 100% test pass across 247 tests, and full ML train-serve feature integrity."
-    },
-    {
-      "task_id": "TASK_REALTIME_SANGTTA_FEATURE_REPAIR",
-      "date": "2026-08-18",
-      "adr_id": "ADR_20260818_REALTIME_SANGTTA_FEATURE_REPAIR",
-      "domain": "ml",
-      "title": "실시간 상따 피처 파이프라인 및 가격 정합성 복구",
-      "why": "실시간 서빙 시 상따 시나리오 종목의 11개 원-핫/컨텍스트 피처 누락(0.0 주입) 및 상따 가격(close/buy_price) 미동기화로 인한 파생 피처 왜곡이 발생함.",
-      "resolution": "features.py에 고정 8종 시나리오 one-hot 및 3종 context 수치 피처 생성기를 구현하고 predict.py에서 상따 가격 동기화 로직을 보강함.",
-      "impact": "배포된 61개 피처 모델 번들과의 Training-Serving Skew가 100% 해소되고 상따 시나리오의 가격/수익률 피처 정합성이 보장됨."
     }
   ]
 }

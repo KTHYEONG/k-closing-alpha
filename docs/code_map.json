@@ -112,6 +112,9 @@
   "src/backfill/kis_flow_backfill.py": {
     "testing": "tests/unit/backfill/test_kis_flow_backfill.py"
   },
+  "src/backfill/krx_panel_rebuild.py": {
+    "testing": "tests/unit/backfill/test_krx_panel_rebuild.py"
+  },
   "src/backfill/price/config.py": {
     "testing": "tests/unit/backfill/price/test_config.py"
   },
