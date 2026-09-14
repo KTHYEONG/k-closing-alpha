@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import logging
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -21,12 +22,16 @@ from src.config.market_session import (
 )
 from src.daily import archive
 from src.daily.collect import safe_float
+from src.daily.predict import load_topk_decision
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, record_run_outcome
 
 logger = logging.getLogger(__name__)
 
 # 벤더 prdy_ctrt 소수 2자리(%) 반올림 오차(최대 5e-5)의 4배 여유
 CLOSE_RATE_CONSISTENCY_ATOL: float = 2e-4
+# 행당 2콜(현재가+호가). 체결계좌 앱키 리미터(초당 18콜)가 실제 상한이므로 4행(8콜) 동시면 리미터 안에서 순차 대비 처리량을 확보한다.
+FINALIZE_CONCURRENCY: int = 4
 
 
 def is_close_confirmed(
@@ -81,6 +86,41 @@ def build_finalized_row(
     return out
 
 
+def order_pending_by_priority(df: pd.DataFrame, pending: list[Any], pick_codes: frozenset[str]) -> list[Any]:
+    """Picks first, then admitted rows, then the rest, preserving original order within each tier (stable sort)."""
+    admitted = df["admitted"].fillna(False).astype(bool) if "admitted" in df.columns else pd.Series(False, index=df.index)
+
+    def _tier(idx: Any) -> int:
+        if str(df.at[idx, "종목코드"]) in pick_codes:
+            return 0
+        return 1 if bool(admitted.at[idx]) else 2
+
+    return sorted(pending, key=_tier)
+
+
+def classify_finalize_outcome(
+    n_rows: int, n_finalized: int, n_unconfirmed: int, unconfirmed_picks: list[str]
+) -> tuple[str, str]:
+    """Classify the finalize run outcome from confirmation counts.
+
+    Args:
+        n_rows: Total archive rows for the snapshot.
+        n_finalized: Number of confirmed rows.
+        n_unconfirmed: Number of rows left unconfirmed.
+        unconfirmed_picks: Unconfirmed pick codes.
+
+    Returns:
+        (outcome, reason) using the RUN_OUTCOME vocabulary.
+    """
+    if n_rows == 0:
+        return RUN_OUTCOME_OK, "empty_archive"
+    if unconfirmed_picks:
+        return RUN_OUTCOME_DEGRADED, "picks_unconfirmed"
+    if n_finalized == 0 and n_unconfirmed > 0:
+        return RUN_OUTCOME_DEGRADED, "zero_confirmed"
+    return RUN_OUTCOME_OK, ""
+
+
 async def fetch_confirmed_quote(client: Any, session: Any, code: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """현재가(output)와 호가/예상체결(output2)을 동시 조회한다 (실패 블록은 빈 dict)."""
     price_res, book_res = await asyncio.gather(
@@ -100,52 +140,88 @@ async def run_close_finalization(
     now_fn: Callable[[], datetime] | None = None,
     sleep_fn: Callable[[float], Any] | None = None,
     retry_interval_seconds: float = 30.0,
+    pick_codes: frozenset[str] = frozenset(),
+    on_outcome: Callable[..., Any] | None = None,
 ) -> int:
-    """당일 아카이브 행을 확정값으로 in-place 갱신하고 확정 행 수를 반환한다."""
+    """당일 아카이브 행을 확정값으로 in-place 갱신하고 확정 행 수를 반환한다 (우선순위, bounded concurrency, on_outcome)."""
     now_fn = now_fn or (lambda: datetime.now(ZoneInfo("Asia/Seoul")))
     sleep_fn = sleep_fn or asyncio.sleep
     snap = snapshot_date or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
     df = archive.fetch_archive_snapshot(snapshot_date=snap)
     pending = df.index[~df[CLOSE_CONFIRMED_COL].fillna(False).astype(bool)].tolist()
+    n_rows = len(df)
+    pending = order_pending_by_priority(df, pending, pick_codes)
     n_finalized = 0
     while True:
         now = now_fn()
         if now.strftime("%H%M%S") > CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS:
             break
-        for idx in list(pending):
+        confirmed: set[Any] = set()
+        for start in range(0, len(pending), FINALIZE_CONCURRENCY):
+            batch = pending[start : start + FINALIZE_CONCURRENCY]
             tick = now_fn()
-            code = str(df.at[idx, "종목코드"])
-            price_output, book_output2 = await fetch_confirmed_quote(client, session, code)
-            if not is_close_confirmed(price_output, book_output2, tick):
-                continue
-            try:
-                update = build_finalized_row(df.loc[idx].to_dict(), price_output, tick)
-            except ValueError as exc:
-                # 불변식 위반 종목은 행을 건드리지 않고 미확정으로 남긴다 (동결가 승격 금지)
-                logger.warning(
-                    "[DATA] stage=close_finalization code=%s status=REJECTED reason=%s", code, exc
-                )
-                continue
-            for key, value in update.items():
-                if key not in df.columns:
-                    df[key] = pd.NA
-                df.at[idx, key] = value
-            pending.remove(idx)
-            n_finalized += 1
+            if tick.strftime("%H%M%S") > CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS:
+                break  # 행 단위 데드라인 — 데드라인 이후 배치는 시작하지 않는다
+            quotes = await asyncio.gather(
+                *(fetch_confirmed_quote(client, session, str(df.at[idx, "종목코드"])) for idx in batch)
+            )
+            for idx, (price_output, book_output2) in zip(batch, quotes, strict=True):
+                code = str(df.at[idx, "종목코드"])
+                if not is_close_confirmed(price_output, book_output2, tick):
+                    continue
+                try:
+                    update = build_finalized_row(df.loc[idx].to_dict(), price_output, tick)
+                except ValueError as exc:
+                    # 불변식 위반 종목은 행을 건드리지 않고 미확정으로 남긴다 (동결가 승격 금지)
+                    logger.warning(
+                        "[DATA] stage=close_finalization code=%s status=REJECTED reason=%s", code, exc
+                    )
+                    continue
+                for key, value in update.items():
+                    if key not in df.columns:
+                        df[key] = pd.NA
+                    df.at[idx, key] = value
+                confirmed.add(idx)
+                n_finalized += 1
+        pending = [i for i in pending if i not in confirmed]
         if not pending:
             break
         await sleep_fn(retry_interval_seconds)
     if n_finalized >= 1:
         archive.upsert_archive_snapshot(df, snapshot_date=snap)
     unconfirmed = [str(df.at[i, "종목코드"]) for i in pending]
+    unconfirmed_picks = sorted(c for c in unconfirmed if c in pick_codes)
+    outcome, reason = classify_finalize_outcome(n_rows, n_finalized, len(unconfirmed), unconfirmed_picks)
     logger.info(
-        "[DATA] stage=close_finalization date=%s n_finalized=%d n_unconfirmed=%d unconfirmed=%s",
+        "[DATA] stage=close_finalization date=%s n_finalized=%d n_unconfirmed=%d unconfirmed=%s outcome=%s reason=%s",
         snap,
         n_finalized,
         len(unconfirmed),
         unconfirmed[:10],
+        outcome,
+        reason,
     )
+    if on_outcome is not None:
+        on_outcome(
+            outcome,
+            run_date=snap,
+            reason=reason,
+            metrics={
+                "n_rows": n_rows,
+                "n_finalized": n_finalized,
+                "n_unconfirmed": len(unconfirmed),
+                "unconfirmed_picks": unconfirmed_picks,
+            },
+        )
     return n_finalized
+
+
+def load_pick_codes(snapshot_date: str) -> frozenset[str]:
+    """Persisted top-k decision symbols as zero-filled codes."""
+    picks = load_topk_decision(pd.Timestamp(snapshot_date))
+    if picks.empty:
+        return frozenset()
+    return frozenset(picks["symbol"].astype(str).str.zfill(6))
 
 
 async def _amain(args) -> int:
@@ -154,11 +230,14 @@ async def _amain(args) -> int:
     session = owned_client.create_session()
     try:
         await owned_client.ensure_token(session)
+        snap = args.date or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
         n = await run_close_finalization(
-            snapshot_date=args.date,
+            snapshot_date=snap,
             client=owned_client,
             session=session,
             retry_interval_seconds=args.retry_interval,
+            pick_codes=load_pick_codes(snap),
+            on_outcome=functools.partial(record_run_outcome, "finalize_close"),
         )
     finally:
         await session.close()

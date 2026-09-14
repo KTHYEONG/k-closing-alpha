@@ -10,6 +10,8 @@ DECISION_WINDOW_END_HHMMSS: str = "153000"
 DECISION_WINDOW_START_HMS: int = int(DECISION_WINDOW_START_HHMMSS)
 # 정수형 비교용 파생값 (문자열과 드리프트 방지)
 DECISION_WINDOW_END_HMS: int = int(DECISION_WINDOW_END_HHMMSS)
+# 실패 시세 재조회는 스냅샷 영속이 결정창 종료(15:30:00) 전에 끝나도록 이 시각 이전에만 시작한다.
+REALTIME_REQUOTE_DEADLINE_HHMMSS: str = "152800"
 # 종가단일가 체결 확정 상태 코드 (KIS antc_mkop_cls_code; 결정창 진행중은 '121')
 CLOSING_AUCTION_CONFIRMED_MKOP_CODE: str = "112"
 # 확정 승격을 허용하는 최소 시각 (결정창 종료시각과 동일하므로 파생 정의)

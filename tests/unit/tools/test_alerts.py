@@ -193,3 +193,95 @@ def test_dispatch_digest_sends_subject_and_body_and_isolates_channel_failures(mo
 
     # Then: 웹훅은 여전히 발송된다
     assert alerts.dispatch_digest("s", "b") == {"webhook": True, "email": False}
+
+
+def test_sanitize_journal_tail_strips_ansi_carriage_returns_and_caps_length() -> None:
+    from src.tools import alerts
+
+    raw = (
+        "\x1b[92m✅ 데이터 수집 완료\x1b[0m\n"
+        "⏳ 10%\r⏳ 50%\r⏳ 100%\n"
+        "\n"
+        + "x" * 500
+        + "\nValueError: real-time collection coverage 0.8843 below 0.99\n"
+    )
+
+    out = alerts.sanitize_journal_tail(raw)
+
+    assert out.split("\n") == [
+        "✅ 데이터 수집 완료",
+        "⏳ 100%",
+        "x" * alerts.ALERT_LINE_MAX_CHARS + "…",
+        "ValueError: real-time collection coverage 0.8843 below 0.99",
+    ]
+
+
+def test_collect_unit_diagnostics_reports_status_and_tail_and_survives_command_failure() -> None:
+    import subprocess
+
+    from src.tools import alerts
+
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[0] == "systemctl":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Result=exit-code\nExecMainStatus=1\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="\x1b[91mTraceback\x1b[0m\nValueError: boom\n", stderr="")
+
+    # When
+    out = alerts.collect_unit_diagnostics("kca-collect.service", run=_run)
+
+    # Then
+    assert "Result=exit-code" in out
+    assert "ExecMainStatus=1" in out
+    assert "Traceback\nValueError: boom" in out
+    assert calls[0][0][:4] == ["systemctl", "--user", "show", "kca-collect.service"]
+    assert calls[1][0][:4] == ["journalctl", "--user", "-u", "kca-collect.service"]
+    assert all(kw["timeout"] == alerts.ALERT_COMMAND_TIMEOUT_SEC and kw["check"] is True for _cmd, kw in calls)
+
+    def _broken(cmd, **kwargs):
+        if cmd[0] == "systemctl":
+            raise FileNotFoundError("systemctl")
+        raise subprocess.CalledProcessError(1, cmd)
+
+    # When: 명령 실패
+    out2 = alerts.collect_unit_diagnostics("kca-collect.service", run=_broken)
+
+    # Then: 알림 자체는 막지 않고 사유만 남김
+    assert "unit status unavailable: FileNotFoundError" in out2
+    assert "journal tail unavailable: CalledProcessError" in out2
+
+
+def test_alerts_main_attaches_unit_diagnostics_when_detail_absent(monkeypatch) -> None:
+    from src.tools import alerts
+
+    asked = []
+    sent = []
+
+    def _diag(unit):
+        asked.append(unit)
+        return "Result=exit-code\nValueError: boom"
+
+    def _dispatch(unit, *, detail=""):
+        sent.append((unit, detail))
+        return {"webhook": False, "email": True}
+
+    monkeypatch.setattr(alerts, "collect_unit_diagnostics", _diag)
+    monkeypatch.setattr(alerts, "dispatch_failure_alert", _dispatch)
+
+    # When: systemd OnFailure 기본 호출(--detail 없음)
+    alerts.main(["--unit", "kca-collect.service"])
+
+    # Then
+    assert asked == ["kca-collect.service"]
+    assert sent == [("kca-collect.service", "Result=exit-code\nValueError: boom")]
+
+    # When: 명시적 detail
+    asked.clear()
+    sent.clear()
+    alerts.main(["--unit", "kca-collect.service", "--detail", "manual note"])
+
+    # Then
+    assert asked == []
+    assert sent == [("kca-collect.service", "manual note")]

@@ -76,6 +76,7 @@ def test_audit_daily_completeness_reports_all_steps_from_topk_log_and_fills(monk
     )
     monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: "2026-09-11")
     monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: bars)
+    monkeypatch.setattr(daily_audit, "load_run_outcomes", lambda _d: {})
 
     # When
     result = daily_audit.audit_daily_completeness("2026-09-14")
@@ -102,6 +103,7 @@ def test_audit_daily_completeness_accepts_explicit_no_decision_record(monkeypatc
     monkeypatch.setattr(daily_audit, "fetch_archive_snapshot", lambda snapshot_date=None, **kw: pd.DataFrame())
     monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: None)
     monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: tmp_path / "missing.parquet")
+    monkeypatch.setattr(daily_audit, "load_run_outcomes", lambda _d: {"predict": "OK"})
 
     # When
     result = daily_audit.audit_daily_completeness("2026-09-14")
@@ -133,6 +135,7 @@ def test_audit_daily_completeness_flags_stale_or_missing_price_history(monkeypat
     monkeypatch.setattr(daily_audit, "fetch_archive_snapshot", lambda snapshot_date=None, **kw: pd.DataFrame())
     monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: "2026-09-11")
     monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: tmp_path / "missing.parquet")
+    monkeypatch.setattr(daily_audit, "load_run_outcomes", lambda _d: {})
 
     # When: 적재가 2영업일 밀림
     stale = daily_audit.audit_daily_completeness("2026-09-14")
@@ -169,6 +172,7 @@ def test_audit_daily_completeness_tolerates_empty_or_schema_drifted_ledgers(monk
     monkeypatch.setattr(daily_audit, "fetch_archive_snapshot", lambda snapshot_date=None, **kw: pd.DataFrame())
     monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: "2026-09-11")
     monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: tmp_path / "missing.parquet")
+    monkeypatch.setattr(daily_audit, "load_run_outcomes", lambda _d: {})
 
     # When
     result = daily_audit.audit_daily_completeness("2026-09-14")
@@ -294,3 +298,40 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
     )
     assert subject == "[KCA] 2026-09-14 일일점검 OK"
     assert audited == ["2026-09-14"] and len(sent) == 2
+
+
+def test_audit_decision_requires_topk_or_predict_ok_outcome(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    parquet_dir = tmp_path / "parquet"
+    paper_dir = tmp_path / "paper"
+    parquet_dir.mkdir()
+    paper_dir.mkdir()
+    monkeypatch.setattr(daily_audit.settings, "PARQUET_DIR", parquet_dir, raising=False)
+    monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", paper_dir, raising=False)
+    pd.DataFrame({"decision_date": ["2026-09-14"], "symbol": [""], "reason": ["no_persisted_decision"]}).to_parquet(
+        paper_dir / "decisions.parquet"
+    )
+    monkeypatch.setattr(daily_audit, "fetch_archive_snapshot", lambda snapshot_date=None, **kw: pd.DataFrame())
+    monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: None)
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: tmp_path / "missing.parquet")
+    asked: list[str] = []
+
+    def _outcomes(run_date):
+        asked.append(run_date)
+        return {"predict": "NO_DECISION"}
+
+    monkeypatch.setattr(daily_audit, "load_run_outcomes", _outcomes)
+
+    # When: 시스템성 무결정 -> 페이퍼 무결정 기록만으로 OK 처리 금지
+    degraded = daily_audit.audit_daily_completeness("2026-09-14")
+    monkeypatch.setattr(daily_audit, "load_run_outcomes", lambda _d: {"predict": "OK"})
+    normal = daily_audit.audit_daily_completeness("2026-09-14")
+
+    # Then
+    assert asked == ["2026-09-14"]
+    assert degraded["decision"] is False
+    assert degraded["paper_entry"] is True
+    assert normal["decision"] is True

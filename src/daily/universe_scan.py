@@ -24,8 +24,14 @@ class UniverseScanCoverageError(RuntimeError):
 
 
 RANKING_SCAN_INPUT_CNT: str = "200"
+# 실측(2026-09-14): KIS 등락률순위(FHPST01700000)는 INPUT_CNT와 무관하게 요청당 최대 30행이며 연속조회(tr_cont)가 없다.
+KIS_RANKING_ROW_CAP: int = 30
+# 실측 2~10% 밴드 390종목을 41콜(약 3~5초)로 전수 복원. 급등장 후보 3~4배와 이분할 오버헤드를 덮는 상한(데이터 계좌 리미터 기준 약 11초).
+KIS_RANKING_MAX_CALLS: int = 200
 
 __all__ = [
+    "KIS_RANKING_MAX_CALLS",
+    "KIS_RANKING_ROW_CAP",
     "RANKING_SCAN_INPUT_CNT",
     "SCAN_PRIMARY_VENDOR",
     "TOSS_RANKING_TYPE_TOP_GAINERS",
@@ -35,6 +41,7 @@ __all__ = [
     "archive_universe_snapshot",
     "collect_universe_scan",
     "fetch_candidate_stock_list",
+    "fetch_kis_band_ranking",
     "fetch_trade_value_union",
     "map_kiwoom_ranking_rows_to_archive_frame",
     "map_kiwoom_ranking_rows_to_stock_list",
@@ -195,12 +202,16 @@ def map_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
 
     Returns:
         List of {code, name, price, chgrate} dicts; codeless rows skipped.
+        ETN Q prefix is normalized to the bare 6-digit code.
     """
     out: list[dict] = []
     for row in rows:
         code_raw = str(row.get("stck_shrn_iscd") or row.get("mksc_shrn_iscd") or "").strip()
         if not code_raw:
             continue
+        if len(code_raw) == 7 and code_raw.startswith("Q"):
+            # KIS 순위 TR은 ETN을 Q접두어로 반환하지만 1순위(Kiwoom) 후보는 접두어 없는 6자리이므로 동일 표기로 맞춘다(시세 경로의 미해석 처리와 일치).
+            code_raw = code_raw[1:]
         out.append(
             {
                 "code": code_raw.zfill(6),
@@ -310,18 +321,76 @@ async def fetch_trade_value_union(session, *, toss_client: Any | None = None, co
     return out
 
 
-async def fetch_candidate_stock_list(
-    client, session, *, universe: UniverseSpec = DEFAULT_UNIVERSE, kiwoom_client: Any | None = None, toss_client: Any | None = None
+async def fetch_kis_band_ranking(
+    client: Any, session: Any, *, rate_min_pct: float, rate_max_pct: float, max_calls: int = KIS_RANKING_MAX_CALLS
 ) -> list[dict]:
-    """Kiwoom ka10027을 1순위, Toss TOP_GAINERS 랭킹을 2순위 폴백으로 후보 stock_list를 조회한다 (fail-closed).
+    """Fetch full KIS band coverage despite the 30-row cap via adaptive bisection.
+
+    The KIS fluctuation ranking returns at most 30 rows per call with no
+    continuation, so saturated bands are bisected on a 0.01%p grid.
 
     Args:
-        client: KIS API client (사용하지 않음; 시그니처 호환용).
+        client: KIS API client.
+        session: HTTP session.
+        rate_min_pct: Band lower bound (percent).
+        rate_max_pct: Band upper bound (percent).
+        max_calls: Call budget guard.
+
+    Returns:
+        Deduplicated ranking rows across all leaves.
+
+    Raises:
+        UniverseScanCoverageError: On vendor failure, budget exhaustion, or a
+            saturated 1bp leaf band.
+    """
+    lo_bp = int(round(rate_min_pct * 100))
+    hi_bp = int(round(rate_max_pct * 100))
+    rows_by_code: dict[str, dict] = {}
+    n_calls = 0
+    stack: list[tuple[int, int]] = [(lo_bp, hi_bp)]
+    while stack:
+        a, b = stack.pop()
+        if n_calls >= max_calls:
+            raise UniverseScanCoverageError(f"kis ranking call budget {max_calls} exhausted")
+        n_calls += 1
+        res = await client.get_fluctuation_ranking(
+            session, rate_min_pct=a / 100.0, rate_max_pct=b / 100.0, market_div_code="J"
+        )
+        if res.get("rt_cd") != "0":
+            raise UniverseScanCoverageError(f"kis ranking failed rt_cd={res.get('rt_cd')} msg={res.get('msg1', '')}")
+        rows = res.get("output") or []
+        if len(rows) >= KIS_RANKING_ROW_CAP:
+            if b - a <= 1:
+                raise UniverseScanCoverageError(
+                    f"kis ranking band [{a / 100:.2f}, {b / 100:.2f}] saturated at {KIS_RANKING_ROW_CAP} rows"
+                )
+            mid = (a + b) // 2
+            stack.append((mid, b))
+            stack.append((a, mid))
+            continue
+        for row in rows:
+            code = str(row.get("stck_shrn_iscd") or "").strip()
+            if code:
+                # 밴드 경계값은 양쪽 하위 밴드에 모두 포함되므로 코드 기준 중복 제거로 흡수한다.
+                rows_by_code[code] = row
+    logger.info("[DATA] stage=universe_scan_kis_band status=OK n_rows=%d n_calls=%d", len(rows_by_code), n_calls)
+    return list(rows_by_code.values())
+
+
+async def fetch_candidate_stock_list(
+    client, session, *, universe: UniverseSpec = DEFAULT_UNIVERSE, kiwoom_client: Any | None = None, toss_client: Any | None = None, kis_band_fallback: bool = False
+) -> list[dict]:
+    """Kiwoom ka10027을 1순위, KIS 밴드 스캔을 2순위, Toss TOP_GAINERS 랭킹을 3순위 폴백으로 후보 stock_list를 조회한다 (fail-closed).
+
+    Args:
+        client: KIS data client used for the band fallback.
         session: HTTP session.
         universe: Universe bounds for the ranking call.
         kiwoom_client: Kiwoom vendor client (필수).
-        toss_client: Toss vendor client; Kiwoom 실패 시 폴백으로 사용된다 (선택,
+        toss_client: Toss vendor client; Kiwoom·KIS 실패 시 폴백으로 사용된다 (선택,
             None이면 폴백 없이 Kiwoom 실패 즉시 fail-closed).
+        kis_band_fallback: Kiwoom -> KIS band scan -> Toss top-100; default False keeps the Kiwoom-or-Toss behaviour.
+            Truncation only aborts when the flag is off.
 
     Returns:
         Candidate stock_list in collect.py shape. Toss-sourced rows carry
@@ -347,14 +416,29 @@ async def fetch_candidate_stock_list(
         kw_reason = f"kiwoom ranking call failed: {e}"
     else:
         if kw_res.get("truncated"):
-            raise UniverseScanCoverageError(f"kiwoom ranking truncated: {kw_res.get('msg1', '')}")
-        if kw_res.get("rt_cd") == "0":
+            if not kis_band_fallback:
+                raise UniverseScanCoverageError(f"kiwoom ranking truncated: {kw_res.get('msg1', '')}")
+            kw_reason = f"kiwoom ranking truncated: {kw_res.get('msg1', '')}"
+        elif kw_res.get("rt_cd") == "0":
             rows = kw_res.get("output") or []
             out = map_kiwoom_ranking_rows_to_stock_list(rows)
             logger.info("[DATA] stage=universe_scan vendor=%s n_rows=%d", SCAN_PRIMARY_VENDOR, len(out))
             return out
-        kw_reason = f"kiwoom ranking failed rt_cd={kw_res.get('rt_cd')} msg={kw_res.get('msg1', '')}"
+        else:
+            kw_reason = f"kiwoom ranking failed rt_cd={kw_res.get('rt_cd')} msg={kw_res.get('msg1', '')}"
     logger.warning("[DATA] stage=universe_scan vendor=kiwoom status=FAILED reason=%s", kw_reason)
+    if kis_band_fallback:
+        try:
+            kis_rows = await fetch_kis_band_ranking(
+                client, session, rate_min_pct=universe.chg_min * 100.0, rate_max_pct=universe.chg_max * 100.0
+            )
+        except UniverseScanCoverageError as exc:
+            logger.warning("[DATA] stage=universe_scan vendor=kis status=FAILED reason=%s", exc)
+            kw_reason = f"{kw_reason}; {exc}"
+        else:
+            out = map_ranking_rows_to_stock_list(kis_rows)
+            logger.warning("[DATA] stage=universe_scan vendor=kis status=FALLBACK n_rows=%d", len(out))
+            return out
     if toss_client is None:
         raise UniverseScanCoverageError(kw_reason)
     try:

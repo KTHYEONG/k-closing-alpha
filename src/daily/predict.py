@@ -1,15 +1,20 @@
+import functools
 import logging
+from collections.abc import Callable
+from typing import Any
 
 import pandas as pd
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet
+from src.tools.daily_audit import DAY_HOLIDAY, DAY_WEEKEND, classify_day
+from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, RUN_OUTCOME_OK, record_run_outcome
 
 logger = logging.getLogger(__name__)
 
 from src.daily.archive import fetch_archive_snapshot
 from src.serving.realtime.artifacts import load_model_bundle
-from src.utils.display import Colors, print_table
+from src.utils.display import print_table
 
 
 def load_daily_snapshot(decision_date: pd.Timestamp) -> pd.DataFrame:
@@ -63,11 +68,12 @@ def restrict_to_rank_pool(wide: pd.DataFrame, decision_date: pd.Timestamp) -> pd
     return pool
 
 
-def run_topk_ranker_sleeve(decision_date: pd.Timestamp) -> pd.DataFrame:
+def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[[Exception], None] | None = None) -> pd.DataFrame:
     """자동 top-3 리랭커 슬리브를 실행한다.
 
     Args:
         decision_date: 리랭커 피처에 찍는 결정 일자.
+        on_failure: 삼켜진 예외를 받는 콜백(호출자가 실행 결과를 분류할 수 있게 한다).
 
     Returns:
         등가중 top-k 선정 결과. 저장소에 기록된 ``admitted`` 컬럼을 그대로
@@ -99,8 +105,13 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp) -> pd.DataFrame:
         return picks
     except (FileNotFoundError, ValueError) as exc:
         logger.warning(
-            f"{Colors.YELLOW}[Warning] top-k ranker sleeve yielded no decision (미참여): {exc}{Colors.RESET}"
+            "[ALGO] stage=topk_sleeve status=NO_DECISION date=%s reason=%s: %s",
+            pd.Timestamp(decision_date).date(),
+            type(exc).__name__,
+            exc,
         )
+        if on_failure is not None:
+            on_failure(exc)
         return pd.DataFrame()
 
 
@@ -151,17 +162,40 @@ def load_topk_decision(decision_date: pd.Timestamp) -> pd.DataFrame:
     return out.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
 
 
-def run_automated_topk_decision(decision_date: pd.Timestamp) -> None:
+def run_automated_topk_decision(
+    decision_date: pd.Timestamp,
+    *,
+    record_fn: Callable[..., Any] | None = None,
+    trading_day_fn: Callable[[str], bool] | None = None,
+) -> None:
     """Print the single automated-mode top-3 decision table, if any.
 
     Args:
         decision_date: Decision date for the reranker sleeve.
+        record_fn: Run outcome recorder (bound to record_run_outcome).
+        trading_day_fn: Trading-day oracle consulted only on failure.
     """
-    sleeve_df = run_topk_ranker_sleeve(decision_date)
+    failures: list[Exception] = []
+    sleeve_df = run_topk_ranker_sleeve(decision_date, on_failure=failures.append)
+    date_str = pd.Timestamp(decision_date).strftime("%Y-%m-%d")
+    if failures:
+        day = classify_day(date_str, trading_day_fn)
+        if day in (DAY_WEEKEND, DAY_HOLIDAY):
+            outcome, reason = RUN_OUTCOME_OK, "non_trading_day"
+        else:
+            outcome, reason = RUN_OUTCOME_NO_DECISION, f"{type(failures[0]).__name__}: {failures[0]}"
+        logger.warning("오늘 자동 유니버스 기준 진입 후보 없음(미참여)")
+        if record_fn is not None:
+            record_fn(outcome, run_date=date_str, reason=reason, metrics={"n_picks": 0, "day": day})
+        return
     if sleeve_df.empty:
         logger.warning("오늘 자동 유니버스 기준 진입 후보 없음(미참여)")
+        if record_fn is not None:
+            record_fn(RUN_OUTCOME_OK, run_date=date_str, reason="admitted_below_top_k", metrics={"n_picks": 0})
         return
     persist_topk_decision(decision_date, sleeve_df)
+    if record_fn is not None:
+        record_fn(RUN_OUTCOME_OK, run_date=date_str, reason="", metrics={"n_picks": len(sleeve_df)})
     rows = [
         {
             "Code": str(row.get("symbol", "")),
@@ -176,7 +210,7 @@ def run_automated_topk_decision(decision_date: pd.Timestamp) -> None:
 
 def main() -> None:
     decision_date = pd.Timestamp.today().normalize()
-    run_automated_topk_decision(decision_date)
+    run_automated_topk_decision(decision_date, record_fn=functools.partial(record_run_outcome, "predict"))
 
 
 if __name__ == "__main__":

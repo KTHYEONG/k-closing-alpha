@@ -65,6 +65,7 @@ def test_main_automated_mode_prints_only_topk_decision_table(monkeypatch) -> Non
     monkeypatch.setattr(predict_mod, "persist_topk_decision", persist_mock)
     print_table_mock = Mock()
     monkeypatch.setattr(predict_mod, "print_table", print_table_mock)
+    monkeypatch.setattr(predict_mod, "record_run_outcome", Mock())
 
     # When
     predict_mod.main()
@@ -93,6 +94,7 @@ def test_main_automated_mode_warns_and_prints_nothing_when_no_decision(monkeypat
     monkeypatch.setattr(predict_mod, "persist_topk_decision", persist_mock)
     print_table_mock = Mock()
     monkeypatch.setattr(predict_mod, "print_table", print_table_mock)
+    monkeypatch.setattr(predict_mod, "record_run_outcome", Mock())
 
     # When
     with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
@@ -547,3 +549,155 @@ def test_restrict_to_rank_pool_raises_when_no_row_passes_training_screen() -> No
     # When / Then
     with pytest.raises(ValueError, match="rank pool is empty"):
         predict_mod.restrict_to_rank_pool(wide, decision)
+
+
+def test_run_topk_ranker_sleeve_reports_failure_to_callback(monkeypatch, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    wide = pd.DataFrame({"종목코드": ["000001"], "종목명": ["AAA"], "admitted": [True]})
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "restrict_to_rank_pool", lambda w, _d: w)
+
+    def _missing(import_dir=None):
+        raise FileNotFoundError("model artifact bundle not found")
+
+    monkeypatch.setattr(predict_mod, "load_model_bundle", _missing)
+    failures: list[Exception] = []
+
+    # When
+    with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
+        out = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"), on_failure=failures.append)
+
+    # Then
+    assert out.empty
+    assert len(failures) == 1 and isinstance(failures[0], FileNotFoundError)
+    messages = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any("stage=topk_sleeve" in m and "status=NO_DECISION" in m for m in messages)
+    assert not any("\x1b[" in m for m in messages)
+
+
+def test_run_automated_topk_decision_records_no_decision_on_systemic_failure(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    def _sleeve(_d, *, on_failure=None):
+        on_failure(ValueError("stale price_history: latest=2026-09-10"))
+        return pd.DataFrame()
+
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", _sleeve)
+    persist_mock = Mock()
+    monkeypatch.setattr(predict_mod, "persist_topk_decision", persist_mock)
+    recorder = Mock()
+
+    # When
+    predict_mod.run_automated_topk_decision(
+        pd.Timestamp("2026-09-14"), record_fn=recorder, trading_day_fn=lambda _d: True
+    )
+
+    # Then
+    persist_mock.assert_not_called()
+    recorder.assert_called_once()
+    args, kwargs = recorder.call_args
+    assert args == ("NO_DECISION",)
+    assert kwargs["run_date"] == "2026-09-14"
+    assert kwargs["reason"] == "ValueError: stale price_history: latest=2026-09-10"
+    assert kwargs["metrics"] == {"n_picks": 0, "day": "trading"}
+
+
+def test_run_automated_topk_decision_treats_holiday_failure_as_ok(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    def _sleeve(_d, *, on_failure=None):
+        on_failure(ValueError("live_rows is empty; nothing to decide on"))
+        return pd.DataFrame()
+
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", _sleeve)
+    monkeypatch.setattr(predict_mod, "persist_topk_decision", Mock())
+    recorder = Mock()
+
+    # When: 2026-09-25(금) 추석 연휴
+    predict_mod.run_automated_topk_decision(
+        pd.Timestamp("2026-09-25"), record_fn=recorder, trading_day_fn=lambda _d: False
+    )
+
+    # Then
+    args, kwargs = recorder.call_args
+    assert args == ("OK",)
+    assert kwargs["reason"] == "non_trading_day"
+    assert kwargs["metrics"] == {"n_picks": 0, "day": "holiday"}
+
+
+def test_run_automated_topk_decision_records_ok_for_empty_pool_and_picks(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    def _no_calendar(_d):
+        raise AssertionError("calendar lookup only on failure")
+
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", lambda _d, *, on_failure=None: pd.DataFrame())
+    recorder = Mock()
+
+    # When: 정상 무결정(admitted < top_k)
+    predict_mod.run_automated_topk_decision(pd.Timestamp("2026-09-14"), record_fn=recorder, trading_day_fn=_no_calendar)
+
+    # Then
+    args, kwargs = recorder.call_args
+    assert args == ("OK",)
+    assert kwargs["reason"] == "admitted_below_top_k"
+    assert kwargs["metrics"] == {"n_picks": 0}
+
+    sleeve_df = pd.DataFrame(
+        {"symbol": ["000001", "000002", "000003"], "name": ["A", "B", "C"], "pred": [0.02, 0.01, 0.005], "allocation": [1 / 3] * 3}
+    )
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", lambda _d, *, on_failure=None: sleeve_df)
+    persist_mock = Mock(return_value=3)
+    monkeypatch.setattr(predict_mod, "persist_topk_decision", persist_mock)
+    monkeypatch.setattr(predict_mod, "print_table", Mock())
+    recorder_picks = Mock()
+
+    # When: 정상 결정
+    predict_mod.run_automated_topk_decision(pd.Timestamp("2026-09-14"), record_fn=recorder_picks, trading_day_fn=_no_calendar)
+
+    # Then
+    persist_mock.assert_called_once()
+    args, kwargs = recorder_picks.call_args
+    assert args == ("OK",)
+    assert kwargs["reason"] == ""
+    assert kwargs["metrics"] == {"n_picks": 3}
+
+
+def test_predict_main_wires_run_outcome_recorder(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import src.daily.predict as predict_mod
+
+    captured: dict = {}
+
+    def _fake_decision(decision_date, **kwargs):
+        captured["date"] = decision_date
+        captured.update(kwargs)
+
+    recorder = Mock(return_value={})
+    monkeypatch.setattr(predict_mod, "run_automated_topk_decision", _fake_decision)
+    monkeypatch.setattr(predict_mod, "record_run_outcome", recorder)
+
+    # When
+    predict_mod.main()
+    captured["record_fn"]("NO_DECISION", run_date="2026-09-14", reason="x", metrics={"n_picks": 0})
+
+    # Then
+    recorder.assert_called_once_with("predict", "NO_DECISION", run_date="2026-09-14", reason="x", metrics={"n_picks": 0})

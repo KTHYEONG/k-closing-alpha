@@ -639,3 +639,215 @@ def test_fetch_candidate_stock_list_fails_closed_on_truncated_kiwoom_scan() -> N
         asyncio.run(fetch_candidate_stock_list(object(), object(), kiwoom_client=kiwoom, toss_client=toss))
     toss.get_rankings.assert_not_awaited()
 
+
+
+def test_fetch_kis_band_ranking_bisects_saturated_bands_and_dedupes() -> None:
+    import asyncio
+
+    from src.daily import universe_scan
+
+    class _BandKis:
+        """KIS 등락률순위 실측 동작 재현: 양끝 포함 밴드 필터 + 요청당 30행 상한, 연속조회 없음."""
+
+        def __init__(self, rows, rt_cd="0"):
+            self.rows = rows
+            self.rt_cd = rt_cd
+            self.calls = []
+
+        async def get_fluctuation_ranking(self, session, *, rate_min_pct, rate_max_pct, market_div_code=None, input_cnt="100"):
+            self.calls.append((round(rate_min_pct, 2), round(rate_max_pct, 2), market_div_code))
+            if self.rt_cd != "0":
+                return {"rt_cd": self.rt_cd, "msg1": "vendor down"}
+            hit = [r for r in self.rows if rate_min_pct - 1e-9 <= float(r["prdy_ctrt"]) <= rate_max_pct + 1e-9]
+            return {"rt_cd": "0", "output": hit[:30]}
+
+    # Given: 2~10% 밴드에 95종목(30행 상한의 3배 이상), 경계값(4.00%) 포함, ETN Q접두어 포함
+    rows = [
+        {"stck_shrn_iscd": f"{i:06d}", "hts_kor_isnm": f"N{i}", "stck_prpr": "1000", "prdy_ctrt": f"{2.0 + (i % 80) * 0.1:.2f}"}
+        for i in range(1, 95)
+    ]
+    rows.append({"stck_shrn_iscd": "Q500041", "hts_kor_isnm": "ETN", "stck_prpr": "10000", "prdy_ctrt": "4.00"})
+    kis = _BandKis(rows)
+
+    # When
+    out = asyncio.run(universe_scan.fetch_kis_band_ranking(kis, object(), rate_min_pct=2.0, rate_max_pct=10.0))
+
+    # Then
+    assert universe_scan.KIS_RANKING_ROW_CAP == 30
+    assert sorted(r["stck_shrn_iscd"] for r in out) == sorted(r["stck_shrn_iscd"] for r in rows)
+    assert len(kis.calls) > 1
+    assert kis.calls[0] == (2.0, 10.0, "J")
+    assert {venue for _, _, venue in kis.calls} == {"J"}
+
+
+def test_fetch_kis_band_ranking_fails_closed_on_saturation_budget_and_vendor_error() -> None:
+    import asyncio
+
+    import pytest
+
+    from src.daily import universe_scan
+
+    class _BandKis:
+        """KIS 등락률순위 실측 동작 재현: 양끝 포함 밴드 필터 + 요청당 30행 상한, 연속조회 없음."""
+
+        def __init__(self, rows, rt_cd="0"):
+            self.rows = rows
+            self.rt_cd = rt_cd
+            self.calls = []
+
+        async def get_fluctuation_ranking(self, session, *, rate_min_pct, rate_max_pct, market_div_code=None, input_cnt="100"):
+            self.calls.append((round(rate_min_pct, 2), round(rate_max_pct, 2), market_div_code))
+            if self.rt_cd != "0":
+                return {"rt_cd": self.rt_cd, "msg1": "vendor down"}
+            hit = [r for r in self.rows if rate_min_pct - 1e-9 <= float(r["prdy_ctrt"]) <= rate_max_pct + 1e-9]
+            return {"rt_cd": "0", "output": hit[:30]}
+
+    # Given/When/Then: 동일 등락률 31종목 -> 더 쪼갤 수 없는 밴드가 상한에 걸림
+    same_rate = [{"stck_shrn_iscd": f"{i:06d}", "prdy_ctrt": "5.00"} for i in range(31)]
+    with pytest.raises(universe_scan.UniverseScanCoverageError, match="saturated"):
+        asyncio.run(universe_scan.fetch_kis_band_ranking(_BandKis(same_rate), object(), rate_min_pct=2.0, rate_max_pct=10.0))
+
+    # 콜 예산 소진
+    many = [{"stck_shrn_iscd": f"{i:06d}", "prdy_ctrt": f"{2.0 + (i % 80) * 0.1:.2f}"} for i in range(95)]
+    with pytest.raises(universe_scan.UniverseScanCoverageError, match="call budget"):
+        asyncio.run(universe_scan.fetch_kis_band_ranking(_BandKis(many), object(), rate_min_pct=2.0, rate_max_pct=10.0, max_calls=2))
+
+    # 벤더 오류 응답
+    with pytest.raises(universe_scan.UniverseScanCoverageError, match="rt_cd=1"):
+        asyncio.run(universe_scan.fetch_kis_band_ranking(_BandKis(many, rt_cd="1"), object(), rate_min_pct=2.0, rate_max_pct=10.0))
+
+
+def test_map_ranking_rows_to_stock_list_strips_etn_q_prefix() -> None:
+    from src.daily.universe_scan import map_ranking_rows_to_stock_list
+
+    rows = [
+        {"stck_shrn_iscd": "Q500041", "hts_kor_isnm": "ETN", "stck_prpr": "10000", "prdy_ctrt": "4.00"},
+        {"stck_shrn_iscd": "0007C0", "hts_kor_isnm": "영문코드", "stck_prpr": "5000", "prdy_ctrt": "3.00"},
+        {"stck_shrn_iscd": "5930", "hts_kor_isnm": "삼성전자", "stck_prpr": "80000", "prdy_ctrt": "2.50"},
+    ]
+
+    # When
+    out = map_ranking_rows_to_stock_list(rows)
+
+    # Then
+    assert [r["code"] for r in out] == ["500041", "0007C0", "005930"]
+
+
+def test_fetch_candidate_stock_list_uses_kis_band_fallback_before_toss() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_candidate_stock_list
+
+    class _BandKis:
+        """KIS 등락률순위 실측 동작 재현: 양끝 포함 밴드 필터 + 요청당 30행 상한, 연속조회 없음."""
+
+        def __init__(self, rows, rt_cd="0"):
+            self.rows = rows
+            self.rt_cd = rt_cd
+            self.calls = []
+
+        async def get_fluctuation_ranking(self, session, *, rate_min_pct, rate_max_pct, market_div_code=None, input_cnt="100"):
+            self.calls.append((round(rate_min_pct, 2), round(rate_max_pct, 2), market_div_code))
+            if self.rt_cd != "0":
+                return {"rt_cd": self.rt_cd, "msg1": "vendor down"}
+            hit = [r for r in self.rows if rate_min_pct - 1e-9 <= float(r["prdy_ctrt"]) <= rate_max_pct + 1e-9]
+            return {"rt_cd": "0", "output": hit[:30]}
+
+    kiwoom = AsyncMock()
+    kiwoom.get_fluctuation_ranking = AsyncMock(return_value={"rt_cd": "1", "msg1": "kiwoom down"})
+    toss = AsyncMock()
+    kis = _BandKis([
+        {"stck_shrn_iscd": "000001", "hts_kor_isnm": "A", "stck_prpr": "1000", "prdy_ctrt": "3.00"},
+        {"stck_shrn_iscd": "Q500041", "hts_kor_isnm": "ETN", "stck_prpr": "10000", "prdy_ctrt": "4.00"},
+    ])
+
+    # When
+    out = asyncio.run(
+        fetch_candidate_stock_list(kis, object(), kiwoom_client=kiwoom, toss_client=toss, kis_band_fallback=True)
+    )
+
+    # Then
+    assert [r["code"] for r in out] == ["000001", "500041"]
+    toss.get_rankings.assert_not_awaited()
+
+
+def test_fetch_candidate_stock_list_truncated_kiwoom_then_kis_failure_uses_toss() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_candidate_stock_list
+
+    class _BandKis:
+        """KIS 등락률순위 실측 동작 재현: 양끝 포함 밴드 필터 + 요청당 30행 상한, 연속조회 없음."""
+
+        def __init__(self, rows, rt_cd="0"):
+            self.rows = rows
+            self.rt_cd = rt_cd
+            self.calls = []
+
+        async def get_fluctuation_ranking(self, session, *, rate_min_pct, rate_max_pct, market_div_code=None, input_cnt="100"):
+            self.calls.append((round(rate_min_pct, 2), round(rate_max_pct, 2), market_div_code))
+            if self.rt_cd != "0":
+                return {"rt_cd": self.rt_cd, "msg1": "vendor down"}
+            hit = [r for r in self.rows if rate_min_pct - 1e-9 <= float(r["prdy_ctrt"]) <= rate_max_pct + 1e-9]
+            return {"rt_cd": "0", "output": hit[:30]}
+
+    kiwoom = AsyncMock()
+    kiwoom.get_fluctuation_ranking = AsyncMock(
+        return_value={"rt_cd": "1", "msg1": "ranking truncated at max_pages=20", "output": [], "truncated": True}
+    )
+    toss = AsyncMock()
+    toss.get_rankings = AsyncMock(
+        return_value={"result": {"rankings": [{"symbol": "000009", "price": {"lastPrice": "1000", "changeRate": "0.05"}}]}}
+    )
+    kis = _BandKis([], rt_cd="1")
+
+    # When
+    out = asyncio.run(
+        fetch_candidate_stock_list(kis, object(), kiwoom_client=kiwoom, toss_client=toss, kis_band_fallback=True)
+    )
+
+    # Then
+    assert len(kis.calls) == 1
+    assert [r["code"] for r in out] == ["000009"]
+    toss.get_rankings.assert_awaited_once()
+
+
+def test_fetch_candidate_stock_list_fails_closed_when_kiwoom_kis_and_toss_fail() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import pytest
+
+    from src.daily.universe_scan import UniverseScanCoverageError, fetch_candidate_stock_list
+
+    class _BandKis:
+        """KIS 등락률순위 실측 동작 재현: 양끝 포함 밴드 필터 + 요청당 30행 상한, 연속조회 없음."""
+
+        def __init__(self, rows, rt_cd="0"):
+            self.rows = rows
+            self.rt_cd = rt_cd
+            self.calls = []
+
+        async def get_fluctuation_ranking(self, session, *, rate_min_pct, rate_max_pct, market_div_code=None, input_cnt="100"):
+            self.calls.append((round(rate_min_pct, 2), round(rate_max_pct, 2), market_div_code))
+            if self.rt_cd != "0":
+                return {"rt_cd": self.rt_cd, "msg1": "vendor down"}
+            hit = [r for r in self.rows if rate_min_pct - 1e-9 <= float(r["prdy_ctrt"]) <= rate_max_pct + 1e-9]
+            return {"rt_cd": "0", "output": hit[:30]}
+
+    kiwoom = AsyncMock()
+    kiwoom.get_fluctuation_ranking = AsyncMock(side_effect=RuntimeError("kiwoom timeout"))
+    toss = AsyncMock()
+    toss.get_rankings = AsyncMock(return_value={"error": {"code": "unavailable", "message": "toss down"}})
+
+    # When/Then
+    with pytest.raises(UniverseScanCoverageError) as excinfo:
+        asyncio.run(
+            fetch_candidate_stock_list(_BandKis([], rt_cd="1"), object(), kiwoom_client=kiwoom, toss_client=toss, kis_band_fallback=True)
+        )
+    message = str(excinfo.value)
+    assert "kiwoom ranking call failed" in message
+    assert "kis ranking failed rt_cd=1" in message
+    assert "toss ranking failed" in message
