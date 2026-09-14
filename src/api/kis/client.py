@@ -882,8 +882,7 @@ def kis_data_client_kwargs() -> dict[str, str]:
     프로세스 전역 공유 레이트리미터 버킷이 분리되고, 토큰 캐시 파일도
     체결 계좌의 settings.TOKEN_FILE과 충돌하지 않는다.
 
-    체결가 결정 경로(finalize_close의 확정 종가 조회)나 실시간 체결틱
-    (paper_trade의 웹소켓 승인키 발급)에는 절대 사용하지 않는다.
+    시세·호가·체결틱 등 읽기 전용 조회(수집, 종가 확정, 페이퍼 청산 체결틱)는 이 키를 사용한다. 체결 계좌 키(settings.KIS_API_CONFIG)는 실주문 전용이다.
     """
     cfg = settings.KIS_DATA_API_CONFIG
     return {

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.config.market_session import (
     CLOSING_AUCTION_CONFIRM_EARLIEST_HHMMSS,
     CLOSING_AUCTION_CONFIRMED_MKOP_CODE,
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # 벤더 prdy_ctrt 소수 2자리(%) 반올림 오차(최대 5e-5)의 4배 여유
 CLOSE_RATE_CONSISTENCY_ATOL: float = 2e-4
-# 행당 2콜(현재가+호가). 체결계좌 앱키 리미터(초당 18콜)가 실제 상한이므로 4행(8콜) 동시면 리미터 안에서 순차 대비 처리량을 확보한다.
+# 행당 2콜(현재가+호가). 데이터 계좌 앱키 리미터(초당 18콜)가 실제 상한이므로 4행(8콜) 동시면 리미터 안에서 순차 대비 처리량을 확보한다(collect는 15:30 이전 종료, After= 순서 보장).
 FINALIZE_CONCURRENCY: int = 4
 
 
@@ -47,6 +47,12 @@ def is_close_confirmed(
     if price <= 0.0:
         return False
     return price == book
+
+
+def is_quote_unresolved(price_output: Mapping[str, Any]) -> bool:
+    """KIS 미인식 코드의 빈 종목코드+0가 시세 블록을 판정한다."""
+    # KIS는 인식하지 못한 코드(Q접두어 없는 ETN 등)에 rt_cd=0과 전 필드 0, 종목코드 공란을 준다 — 재조회해도 바뀌지 않는다.
+    return bool(price_output) and not str(price_output.get("stck_shrn_iscd") or "").strip() and safe_float(price_output.get("stck_prpr"), 0.0) <= 0.0
 
 
 def build_finalized_row(
@@ -152,11 +158,16 @@ async def run_close_finalization(
     n_rows = len(df)
     pending = order_pending_by_priority(df, pending, pick_codes)
     n_finalized = 0
+    unresolved: list[Any] = []
     while True:
         now = now_fn()
+        # 현재가 TR은 조회 시점 종가만 주므로 과거 스냅샷에 쓰면 다른 날 종가로 덮어쓴다
+        if now.strftime("%Y-%m-%d") != snap:
+            raise ValueError(f"close finalization is same-day only: snapshot_date={snap} now={now.strftime('%Y-%m-%d')}")
         if now.strftime("%H%M%S") > CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS:
             break
         confirmed: set[Any] = set()
+        dropped: set[Any] = set()
         for start in range(0, len(pending), FINALIZE_CONCURRENCY):
             batch = pending[start : start + FINALIZE_CONCURRENCY]
             tick = now_fn()
@@ -167,6 +178,11 @@ async def run_close_finalization(
             )
             for idx, (price_output, book_output2) in zip(batch, quotes, strict=True):
                 code = str(df.at[idx, "종목코드"])
+                if is_quote_unresolved(price_output):
+                    dropped.add(idx)
+                    unresolved.append(idx)
+                    logger.warning("[DATA] stage=close_finalization code=%s status=UNRESOLVED reason=vendor_unrecognized_code", code)
+                    continue
                 if not is_close_confirmed(price_output, book_output2, tick):
                     continue
                 try:
@@ -183,23 +199,25 @@ async def run_close_finalization(
                     df.at[idx, key] = value
                 confirmed.add(idx)
                 n_finalized += 1
-        pending = [i for i in pending if i not in confirmed]
+        pending = [i for i in pending if i not in confirmed and i not in dropped]
         if not pending:
             break
         await sleep_fn(retry_interval_seconds)
     if n_finalized >= 1:
         archive.upsert_archive_snapshot(df, snapshot_date=snap)
     unconfirmed = [str(df.at[i, "종목코드"]) for i in pending]
-    unconfirmed_picks = sorted(c for c in unconfirmed if c in pick_codes)
+    unresolved_codes = [str(df.at[i, "종목코드"]) for i in unresolved]
+    unconfirmed_picks = sorted(c for c in [*unconfirmed, *unresolved_codes] if c in pick_codes)
     outcome, reason = classify_finalize_outcome(n_rows, n_finalized, len(unconfirmed), unconfirmed_picks)
     logger.info(
-        "[DATA] stage=close_finalization date=%s n_finalized=%d n_unconfirmed=%d unconfirmed=%s outcome=%s reason=%s",
+        "[DATA] stage=close_finalization date=%s n_finalized=%d n_unconfirmed=%d unconfirmed=%s outcome=%s reason=%s n_unresolved=%d",
         snap,
         n_finalized,
         len(unconfirmed),
         unconfirmed[:10],
         outcome,
         reason,
+        len(unresolved_codes),
     )
     if on_outcome is not None:
         on_outcome(
@@ -210,6 +228,7 @@ async def run_close_finalization(
                 "n_rows": n_rows,
                 "n_finalized": n_finalized,
                 "n_unconfirmed": len(unconfirmed),
+                "n_unresolved": len(unresolved_codes),
                 "unconfirmed_picks": unconfirmed_picks,
             },
         )
@@ -225,8 +244,8 @@ def load_pick_codes(snapshot_date: str) -> frozenset[str]:
 
 
 async def _amain(args) -> int:
-    """단일 이벤트 루프 안에서 세션 생성/토큰/확정/종료를 모두 수행한다."""
-    owned_client = KisApiClient()
+    """단일 이벤트 루프 안에서 세션 생성/토큰/확정/종료를 모두 수행한다. 종가 확정은 읽기 전용 시세 조회라 데이터 계좌 키로 수행하고 체결 계좌 키는 실주문 전용으로 둔다."""
+    owned_client = KisApiClient(**kis_data_client_kwargs())
     session = owned_client.create_session()
     try:
         await owned_client.ensure_token(session)
