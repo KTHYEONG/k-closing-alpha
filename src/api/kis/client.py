@@ -15,6 +15,10 @@ from src.api.kis.rate_limit import get_shared_rate_limiter
 
 logger = logging.getLogger(__name__)
 
+# 토큰 발급 단발 POST의 일시 전송 오류가 모든 KIS 잡을 중단시키지 않도록 전송 오류만 재시도한다(업무 오류 재시도는 EGW00133 1분 1회 발급 제한을 두드림).
+KIS_TOKEN_ISSUE_ATTEMPTS: int = 3
+KIS_TOKEN_ISSUE_BACKOFF_SEC: float = 1.0
+
 
 def _format_rate(pct: float) -> str:
     return f"{pct:g}"
@@ -207,24 +211,33 @@ class KisApiClient:
                 "appsecret": self.app_secret,
             }
 
-            async with session.post(url, headers=headers, json=body) as resp:
-                data = await resp.json()
-                if "access_token" not in data:
-                    if data.get("msg_cd") == "EGW00133":
-                        fallback = self._read_cached_token(min_remaining_minutes=0)
-                        if fallback is not None:
-                            self.token = fallback
-                            return self.token
-                    raise RuntimeError(f"토큰 발급 실패: {data}")
+            data: dict = {}
+            for attempt in range(1, KIS_TOKEN_ISSUE_ATTEMPTS + 1):
+                try:
+                    async with session.post(url, headers=headers, json=body) as resp:
+                        data = await resp.json()
+                    break
+                except (aiohttp.ClientError, TimeoutError) as exc:
+                    if attempt == KIS_TOKEN_ISSUE_ATTEMPTS:
+                        raise
+                    logger.warning("[SYS] stage=kis_token status=RETRY attempt=%d max_attempts=%d reason=%s", attempt, KIS_TOKEN_ISSUE_ATTEMPTS, type(exc).__name__)
+                    await asyncio.sleep(KIS_TOKEN_ISSUE_BACKOFF_SEC * attempt)
+            if "access_token" not in data:
+                if data.get("msg_cd") == "EGW00133":
+                    fallback = self._read_cached_token(min_remaining_minutes=0)
+                    if fallback is not None:
+                        self.token = fallback
+                        return self.token
+                raise RuntimeError(f"토큰 발급 실패: {data}")
 
-                self.token = data["access_token"]
-                expires_in = data.get("expires_in", 86400)
-                expired_at_str = (datetime.now() + timedelta(seconds=expires_in)).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
+            self.token = data["access_token"]
+            expires_in = data.get("expires_in", 86400)
+            expired_at_str = (datetime.now() + timedelta(seconds=expires_in)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
 
-                self._write_token_file(self.token, expired_at_str)
-                return self.token
+            self._write_token_file(self.token, expired_at_str)
+            return self.token
 
     def _get_headers(self, tr_id):
         """공통 헤더 생성"""

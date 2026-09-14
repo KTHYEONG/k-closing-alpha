@@ -12,8 +12,10 @@ Corporate actions are re-derived from the KRX base price, so no history refetch 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,7 @@ from src.backfill.price.factors import compute_vkospi_proxy
 from src.data.panel_integrity import heal_price_history_panel
 from src.data.parquet_codec import write_price_history_parquet
 from src.strategy.contract import derive_chg_ratio
+from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, record_run_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,9 @@ class IngestReport:
     flow_coverage: dict[str, float] = field(default_factory=dict)
     program_flow_coverage: dict[str, float] = field(default_factory=dict)
     wrote: bool = False
+    flow_shortfall: dict[str, float] = field(default_factory=dict)
+    program_flow_shortfall: dict[str, float] = field(default_factory=dict)
+    n_flow_repaired: int = 0
 
 
 def _to_num(s: pd.Series) -> pd.Series:
@@ -463,35 +469,81 @@ def assemble_new_rows(krx_rows: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFra
     return out
 
 
-def check_flow_coverage(
-    new_rows: pd.DataFrame,
-    columns: tuple[str, ...] = ("inst_netbuy", "foreign_netbuy"),
-    min_coverage: float = MIN_FLOW_COVERAGE,
-    label: str = "investor",
-) -> dict[str, float]:
-    """Fail closed when flow columns are missing for too many traded rows on any date.
+def compute_flow_coverage(rows: pd.DataFrame, columns: tuple[str, ...]) -> dict[str, float]:
+    """Compute per-date flow coverage over traded rows.
+
+    Coverage is the fraction of traded rows (volume > 0) with every column
+    non-null, per YYYY-MM-DD; no raise.
 
     Args:
-        new_rows: Output of assemble_new_rows.
+        rows: Rows with volume, date and flow columns.
         columns: Flow columns that must all be non-null to count a row as covered.
-        min_coverage: Minimum fraction of traded (volume > 0) rows with every column present.
-        label: Human-readable tag for the raised error message (e.g. "investor", "program").
 
     Returns:
         Coverage per date (YYYY-MM-DD).
-
-    Raises:
-        ValueError: When any date falls below min_coverage.
     """
-    traded = new_rows[pd.to_numeric(new_rows["volume"], errors="coerce") > 0]
+    traded = rows[pd.to_numeric(rows["volume"], errors="coerce") > 0]
     ok = pd.Series(True, index=traded.index)
     for col in columns:
         ok &= traded[col].notna()
     cov = ok.groupby(pd.to_datetime(traded["date"]).dt.strftime("%Y-%m-%d")).mean()
-    bad = cov[cov < float(min_coverage)]
-    if len(bad):
-        raise ValueError(f"{label} flow coverage below {min_coverage}: {bad.round(4).to_dict()}")
     return {k: round(float(v), 6) for k, v in cov.items()}
+
+
+def plan_flow_repairs(panel: pd.DataFrame, window_start: pd.Timestamp) -> list[str]:
+    """Plan flow repair symbols for traded window rows with any NaN flow.
+
+    KIS flow endpoints return the last 30 trading days per call, so stored NaN
+    flows are repairable only inside that window.
+
+    Args:
+        panel: Stored price history panel.
+        window_start: First date of the flow window.
+
+    Returns:
+        Sorted symbols needing a flow refetch.
+    """
+    dates = pd.to_datetime(panel["date"])
+    traded = pd.to_numeric(panel["volume"], errors="coerce") > 0
+    gap = panel[list(FLOW_COLUMNS)].isna().any(axis=1)
+    mask = (dates >= pd.Timestamp(window_start).normalize()) & traded & gap
+    return sorted(panel.loc[mask, "symbol"].astype(str).unique().tolist())
+
+
+def apply_flow_repairs(panel: pd.DataFrame, flows: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Fill only null flow cells from matching (date, symbol) flows.
+
+    Never overwrites stored flows; returns the repaired panel and the filled
+    cell count.
+
+    Args:
+        panel: Stored price history panel.
+        flows: Fetched flow frame with date, symbol and FLOW_COLUMNS.
+
+    Returns:
+        Tuple of (repaired panel, filled cell count).
+    """
+    out = panel.copy()
+    if flows.empty:
+        return out, 0
+    src_flows = (
+        flows.assign(date=pd.to_datetime(flows["date"]), symbol=flows["symbol"].astype(str))
+        .drop_duplicates(["date", "symbol"], keep="last")
+        .set_index(["date", "symbol"])
+    )
+    keys = pd.MultiIndex.from_arrays([pd.to_datetime(out["date"]), out["symbol"].astype(str)])
+    n_filled = 0
+    for col in FLOW_COLUMNS:
+        aligned = pd.Series(
+            pd.to_numeric(src_flows[col], errors="coerce").reindex(keys).to_numpy(dtype=np.float64),
+            index=out.index,
+        )
+        mask = out[col].isna() & aligned.notna()
+        if mask.any():
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+            out.loc[mask, col] = aligned[mask]
+            n_filled += int(mask.sum())
+    return out, n_filled
 
 
 def merge_and_adjust(panel: pd.DataFrame, new_rows: pd.DataFrame, trading_days: list[pd.Timestamp]) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -551,6 +603,7 @@ async def run_price_ingest(
     kis: Any | None = None,
     kiwoom: Any | None = None,
     toss: Any | None = None,
+    on_outcome: Callable[..., Any] | None = None,
 ) -> IngestReport:
     """Ingest every newly published trading day plus stale tails, then rewrite index columns.
 
@@ -561,6 +614,7 @@ async def run_price_ingest(
         kis: KIS client; None builds the configured KisApiClient.
         kiwoom: Kiwoom client for the investor-flow fallback; None builds one.
         toss: Toss client for the program-flow fallback; None builds one.
+        on_outcome: Run outcome recorder.
 
     Returns:
         IngestReport describing what was written.
@@ -568,8 +622,7 @@ async def run_price_ingest(
     Raises:
         FileNotFoundError: When the panel parquet does not exist.
         RuntimeError: Propagated vendor failures (KRX strict, KIS index).
-        ValueError: Gap beyond the flow window, flow coverage below the
-            threshold, or index history missing a panel date.
+        ValueError: Gap beyond the flow window or index history missing a panel date.
     """
     run_day = (pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None) if today is None else pd.Timestamp(today)).normalize()
     out_path = Path(settings.PRICE_HISTORY_PARQUET_PATH if path is None else path)
@@ -604,13 +657,13 @@ async def run_price_ingest(
             if rows.empty:
                 break  # 미게시: 이후 날짜는 연속성 때문에 시도하지 않는다
             fetched[d] = rows
+        anchor = max(fetched) if fetched else panel_max
+        window = [d for d in trading if d <= anchor][-FLOW_WINDOW_TRADING_DAYS:]
         new_rows = pd.DataFrame()
         sources: dict[str, dict[str, int]] = {}
-        coverage: dict[str, float] = {}
-        program_coverage: dict[str, float] = {}
+        tail = pd.DataFrame(columns=list(KRX_ROW_COLUMNS))
         if fetched:
-            latest = max(fetched)
-            window = [d for d in trading if d <= latest][-FLOW_WINDOW_TRADING_DAYS:]
+            latest = anchor
             listed = set(fetched[latest]["symbol"])
             stale = [v for s, v in panel_last.items() if s in listed and window[0] <= v < panel_max]
             for d in (d for d in trading if stale and min(stale) < d <= panel_max):
@@ -619,16 +672,21 @@ async def run_price_ingest(
                     raise RuntimeError(f"KRX returned no rows for past trading day {d.date()}")
                 fetched[d] = rows
             tail = select_tail_rows(pd.concat(list(fetched.values()), ignore_index=True), panel_last)
-            flows, sources = await fetch_all_flows(kis, kiwoom, session, sorted(tail["symbol"].unique()), latest.strftime("%Y%m%d"), toss)
+        repairs = plan_flow_repairs(panel, window[0])
+        symbols = sorted(set(tail["symbol"].astype(str)) | set(repairs))
+        flows = pd.DataFrame(columns=["date", "symbol", *FLOW_COLUMNS])
+        if symbols:
+            flows, sources = await fetch_all_flows(kis, kiwoom, session, symbols, anchor.strftime("%Y%m%d"), toss)
+        if not tail.empty:
             new_rows = assemble_new_rows(tail, flows)
-            coverage = check_flow_coverage(new_rows)
-            program_coverage = check_flow_coverage(new_rows, columns=("program_netbuy",), label="program")
+        # 신규 행이 없어도 창 안 결측 수급을 재조회해 채운다 — 부분 기록이 영구 결측으로 굳지 않게.
+        panel, n_repaired = apply_flow_repairs(panel, flows)
     index_cols = compute_index_columns(kospi, kosdaq)
     if new_rows.empty:
         # 신규 행이 없으면 행 순서가 같으므로 위치 비교로 지수 컬럼 변경 여부만 본다
         events = pd.DataFrame(columns=["symbol", "date", "factor"])
         merged = attach_index_columns(panel, index_cols)
-        changed = any(
+        changed = n_repaired > 0 or any(
             not np.allclose(pd.to_numeric(panel[c], errors="coerce").to_numpy(dtype=np.float64), merged[c].to_numpy(dtype=np.float64), rtol=1e-6, atol=1e-9, equal_nan=True)
             for c in INDEX_COLUMNS
         )
@@ -636,6 +694,11 @@ async def run_price_ingest(
         merged, events = merge_and_adjust(panel, new_rows, trading)
         merged = attach_index_columns(merged, index_cols)
         changed = True
+    window_rows = merged[pd.to_datetime(merged["date"]) >= window[0]]
+    coverage = compute_flow_coverage(window_rows, ("inst_netbuy", "foreign_netbuy"))
+    program_coverage = compute_flow_coverage(window_rows, ("program_netbuy",))
+    shortfall = {k: v for k, v in coverage.items() if v < MIN_FLOW_COVERAGE}
+    program_shortfall = {k: v for k, v in program_coverage.items() if v < MIN_FLOW_COVERAGE}
     wrote = False
     if changed:
         write_price_history_parquet(heal_price_history_panel(merged), out_path)
@@ -649,17 +712,47 @@ async def run_price_ingest(
         flow_coverage=coverage,
         program_flow_coverage=program_coverage,
         wrote=wrote,
+        flow_shortfall=shortfall,
+        program_flow_shortfall=program_shortfall,
+        n_flow_repaired=n_repaired,
     )
     logger.info(
-        "[DATA] stage=price_ingest dates=%s rows=%d events=%d sources=%s wrote=%s path=%s",
-        report.ingested_dates, report.n_new_rows, report.n_corporate_events, {"investor": report.investor_sources, "program": report.program_sources}, report.wrote, out_path,
+        "[DATA] stage=price_ingest dates=%s rows=%d events=%d sources=%s wrote=%s path=%s repaired=%d shortfall=%s program_shortfall=%s",
+        report.ingested_dates,
+        report.n_new_rows,
+        report.n_corporate_events,
+        {"investor": report.investor_sources, "program": report.program_sources},
+        report.wrote,
+        out_path,
+        n_repaired,
+        shortfall,
+        program_shortfall,
     )
+    if shortfall or program_shortfall:
+        logger.warning(
+            "[DATA] stage=price_ingest status=DEGRADED shortfall=%s program_shortfall=%s",
+            shortfall,
+            program_shortfall,
+        )
+    if on_outcome is not None:
+        on_outcome(
+            RUN_OUTCOME_DEGRADED if shortfall or program_shortfall else RUN_OUTCOME_OK,
+            run_date=run_day.strftime("%Y-%m-%d"),
+            reason="flow_coverage_below_min" if shortfall or program_shortfall else "",
+            metrics={
+                "ingested_dates": report.ingested_dates,
+                "n_new_rows": report.n_new_rows,
+                "n_flow_repaired": n_repaired,
+                "flow_shortfall": shortfall,
+                "program_flow_shortfall": program_shortfall,
+            },
+        )
     return report
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    asyncio.run(run_price_ingest())
+    asyncio.run(run_price_ingest(on_outcome=functools.partial(record_run_outcome, "price_ingest")))
     from src.strategy.growth_shadow import run_growth_shadow
 
     run_growth_shadow()

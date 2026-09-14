@@ -262,3 +262,107 @@ def test_kis_ensure_token_reissues_when_cached_file_is_unreadable(tmp_path) -> N
     # Then: 예외로 죽지 않고 재발급 경로로 복구하며 캐시를 정상 파일로 치유한다
     assert token == "NEW"
     assert json.loads(token_file.read_text(encoding="utf-8"))["access_token"] == "NEW"
+
+
+def test_kis_ensure_token_retries_transient_network_error_then_issues(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import aiohttp
+
+    from src.api.kis import client as client_mod
+    from src.api.kis.client import KisApiClient
+
+    sleeps = []
+
+    async def _no_sleep(sec):
+        sleeps.append(sec)
+
+    monkeypatch.setattr(client_mod.asyncio, "sleep", _no_sleep)
+    client = KisApiClient(app_key="k-retry", app_secret="s", token_file=str(tmp_path / "tok.json"))
+    posts = {"n": 0}
+
+    class _Resp:
+        async def json(self):
+            return {"access_token": "TOK", "expires_in": 86400}
+
+    class _Ctx:
+        async def __aenter__(self):
+            posts["n"] += 1
+            if posts["n"] == 1:
+                raise aiohttp.ClientConnectionError("reset")
+            return _Resp()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session:
+        def post(self, _url, **_kw):
+            return _Ctx()
+
+    # When
+    token = asyncio.run(client.ensure_token(_Session()))
+
+    # Then
+    assert token == "TOK"
+    assert posts["n"] == 2
+    assert sleeps == [client_mod.KIS_TOKEN_ISSUE_BACKOFF_SEC]
+
+
+def test_kis_ensure_token_raises_after_retries_and_never_retries_business_error(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import aiohttp
+    import pytest
+
+    from src.api.kis import client as client_mod
+    from src.api.kis.client import KisApiClient
+
+    async def _no_sleep(_sec):
+        return None
+
+    monkeypatch.setattr(client_mod.asyncio, "sleep", _no_sleep)
+    posts = {"n": 0}
+
+    class _DownCtx:
+        async def __aenter__(self):
+            posts["n"] += 1
+            raise aiohttp.ClientConnectionError("down")
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _DownSession:
+        def post(self, _url, **_kw):
+            return _DownCtx()
+
+    down = KisApiClient(app_key="k-down", app_secret="s", token_file=str(tmp_path / "down.json"))
+
+    # When / Then: 전송 오류 지속
+    with pytest.raises(aiohttp.ClientConnectionError):
+        asyncio.run(down.ensure_token(_DownSession()))
+    assert posts["n"] == client_mod.KIS_TOKEN_ISSUE_ATTEMPTS
+
+    posts["n"] = 0
+
+    class _Resp:
+        async def json(self):
+            return {"msg_cd": "EGW00103", "msg1": "invalid appkey"}
+
+    class _BizCtx:
+        async def __aenter__(self):
+            posts["n"] += 1
+            return _Resp()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _BizSession:
+        def post(self, _url, **_kw):
+            return _BizCtx()
+
+    biz = KisApiClient(app_key="k-biz", app_secret="s", token_file=str(tmp_path / "biz.json"))
+
+    # When / Then: 업무 오류는 재시도하지 않음
+    with pytest.raises(RuntimeError, match="토큰 발급 실패"):
+        asyncio.run(biz.ensure_token(_BizSession()))
+    assert posts["n"] == 1

@@ -16,11 +16,13 @@ from src import settings
 
 # 커스텀 모듈 임포트
 from src.api.kis.client import KisApiClient, kis_data_client_kwargs
+from src.config.market_session import REALTIME_REQUOTE_DEADLINE_HHMMSS
 from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
 from src.utils.display import Colors
 from src.daily import archive
 from src.daily.universe_scan import fetch_candidate_stock_list, fetch_trade_value_union
 from src.data.trading_calendar import is_kis_trading_day
+from src.ml.topk_history_features import MAX_PREV_TRADING_DAY_LOOKBACK
 from src.daily.universe_screen import build_screen_frame
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, PRICE_ANOMALY_COL, QUOTE_FAILED_COL
 from src.strategy.contract import COST_AWARE_UNIVERSE, UniverseSpec, select_universe
@@ -178,33 +180,73 @@ REALTIME_MIN_QUOTE_COVERAGE: float = 0.99
 QUOTE_UNRESOLVED_API: str = "현재가_미해석"
 
 
-def load_eligible_codes(decision_date: pd.Timestamp, *, path: str | os.PathLike[str] | None = None, is_trading_day: Callable[[pd.Timestamp], bool] | None = None) -> frozenset[str]:
+async def resolve_prev_trading_day_kis(client: Any, session: Any, decision_date: pd.Timestamp, *, krx_is_trading_day: Callable[[pd.Timestamp], bool] | None = None, max_lookback_days: int = MAX_PREV_TRADING_DAY_LOOKBACK) -> pd.Timestamp:
+    """Resolve the previous trading day via KIS first, KRX fallback per date.
+
+    Args:
+        client: KIS API client.
+        session: HTTP session.
+        decision_date: Decision date (time component ignored).
+        krx_is_trading_day: KRX oracle override (tests); None selects is_krx_trading_day.
+        max_lookback_days: Calendar-day search bound.
+
+    Returns:
+        The previous trading day, normalized to midnight.
+
+    Raises:
+        RuntimeError: When both oracles fail.
+        ValueError: When no trading day exists within the bound.
+    """
+    d = pd.Timestamp(decision_date).normalize()
+    for k in range(1, int(max_lookback_days) + 1):
+        cand = d - pd.Timedelta(days=k)
+        if cand.weekday() >= 5:
+            continue
+        try:
+            is_open = await is_kis_trading_day(client, session, cand)
+        except RuntimeError as exc:
+            logger.warning("[DATA] stage=prev_trading_day vendor=kis status=FAILED date=%s reason=%s fallback=krx", cand.date(), exc)
+            oracle = krx_is_trading_day
+            if oracle is None:
+                from src.data.trading_calendar import is_krx_trading_day as oracle
+            is_open = await asyncio.to_thread(oracle, cand)
+        if is_open:
+            return cand
+    raise ValueError(f"no trading day within {int(max_lookback_days)} days before {d.date()}")
+
+
+def load_eligible_codes(decision_date: pd.Timestamp, *, prev_trading_day: pd.Timestamp, path: str | os.PathLike[str] | None = None) -> frozenset[str]:
     """Return the symbols listed in price_history on the previous trading day.
 
     Args:
         decision_date: Decision date; only rows strictly before it are read.
+        prev_trading_day: Previous trading day resolved via resolve_prev_trading_day_kis.
         path: Parquet path; None selects settings.PRICE_HISTORY_PARQUET_PATH.
-        is_trading_day: Trading-day oracle; None selects is_krx_trading_day.
 
     Returns:
         Symbols present on the latest trading day strictly before decision_date.
 
     Raises:
         FileNotFoundError: When the parquet does not exist.
-        ValueError: When no rows exist on the previous trading day.
+        ValueError: When prev_trading_day is not before decision_date, or when
+            no rows exist on the previous trading day.
     """
-    from src.ml.topk_history_features import resolve_prev_trading_day
-
+    prev = pd.Timestamp(prev_trading_day).normalize()
+    if prev >= pd.Timestamp(decision_date).normalize():
+        raise ValueError(f"prev_trading_day {prev.date()} must be before decision_date {pd.Timestamp(decision_date).date()}")
     src_path = Path(settings.PRICE_HISTORY_PARQUET_PATH if path is None else path)
     if not src_path.exists():
         raise FileNotFoundError(f"price_history not found: {src_path}")
-    if is_trading_day is None:
-        from src.data.trading_calendar import is_krx_trading_day as is_trading_day
-    prev = resolve_prev_trading_day(pd.Timestamp(decision_date).normalize(), is_trading_day)
     rows = pd.read_parquet(src_path, columns=["date", "symbol"], filters=[("date", "==", prev)])
     if rows.empty:
         raise ValueError(f"stale price_history: no rows on prev_trading_day={prev.date()}")
     return frozenset(rows["symbol"].astype(str))
+
+
+async def resolve_eligible_codes(client: Any, session: Any, decision_date: pd.Timestamp) -> frozenset[str]:
+    """Resolve eligibility through the async KIS calendar before quoting."""
+    prev = await resolve_prev_trading_day_kis(client, session, decision_date)
+    return load_eligible_codes(decision_date, prev_trading_day=prev)
 
 
 def filter_eligible_candidates(stock_list: list[dict], eligible_codes: frozenset[str]) -> list[dict]:
@@ -267,7 +309,7 @@ def check_realtime_collection_coverage(
     """실시간 스냅샷의 degraded 비율이 임계치를 넘으면 fail-closed 한다.
 
     degraded 행은 QUOTE_FAILED_COL(벤더 호출 실패) 또는 PRICE_ANOMALY_COL
-    (호출 성공했지만 값 비정상)이 True인 행이다. price_ingest.check_flow_coverage와
+    (호출 성공했지만 값 비정상)이 True인 행이다. price_ingest.compute_flow_coverage의 커버리지 정의와
     동일한 철학을 실시간 단일 스냅샷에 적용한다.
 
     Args:
@@ -300,12 +342,12 @@ async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None
         client: KIS API client.
         session: HTTP session.
         kiwoom_client: Kiwoom scan client (1순위 후보 소스).
-        toss_client: Toss scan client (Kiwoom 실패 시 폴백, 선택).
+        toss_client: Toss scan client (Kiwoom·KIS 밴드 스캔 모두 실패 시 최종 폴백, 선택).
 
     Returns:
         자동 스캔 후보 리스트. 스캔이 비면 빈 리스트를 반환한다.
     """
-    primary = await fetch_candidate_stock_list(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client) or []
+    primary = await fetch_candidate_stock_list(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client, kis_band_fallback=True) or []
     union_rows = await fetch_trade_value_union(session, toss_client=toss_client)
     seen_codes = {row["code"] for row in primary}
     merged = primary + [row for row in union_rows if row["code"] not in seen_codes]
@@ -460,10 +502,44 @@ async def fetch_single_stock(
         }, failed_apis, orderbook_rows
 
 
+async def requote_failed_quotes(stock_list: list[dict], all_res: list[tuple[dict, list[str], list[dict]]], client: Any, session: Any, sem: asyncio.Semaphore, *, now_fn: Callable[[], datetime] | None = None) -> list[tuple[dict, list[str], list[dict]]]:
+    """Re-fetch transient quote failures once within the decision-window budget.
+
+    Args:
+        stock_list: Scan rows in fetch order.
+        all_res: First-pass fetch results.
+        client: KIS API client.
+        session: HTTP session.
+        sem: Concurrency limiter.
+        now_fn: Clock override (tests); None uses KST now.
+
+    Returns:
+        Results with recovered rows replaced in place order.
+    """
+    retry_idx = [i for i, (row, apis, _ob) in enumerate(all_res) if row.get(QUOTE_FAILED_COL) and QUOTE_UNRESOLVED_API not in apis]
+    if not retry_idx:
+        return all_res
+    now = now_fn() if now_fn is not None else datetime.now(ZoneInfo("Asia/Seoul"))
+    if now.strftime("%H%M%S") >= REALTIME_REQUOTE_DEADLINE_HHMMSS:
+        logger.warning("[DATA] stage=realtime_requote status=SKIPPED reason=deadline n_failed=%d now=%s", len(retry_idx), now.strftime("%H%M%S"))
+        return all_res
+    retried = await asyncio.gather(*[fetch_single_stock(i, stock_list[i], len(stock_list), sem, client, session) for i in retry_idx])
+    out = list(all_res)
+    n_recovered = 0
+    for i, res in zip(retry_idx, retried):
+        if not res[0].get(QUOTE_FAILED_COL):
+            n_recovered += 1
+        out[i] = res
+    logger.info("[DATA] stage=realtime_requote n_retry=%d n_recovered=%d", len(retry_idx), n_recovered)
+    return out
+
+
 async def fetch_all_stock_data(
     stock_list,
     client,
     session,
+    *,
+    now_fn: Callable[[], datetime] | None = None,
 ):
     """모든 종목의 상세 데이터를 수집합니다."""
     import sys
@@ -487,17 +563,20 @@ async def fetch_all_stock_data(
         bar_len = 25
         filled = int(bar_len * completed_count // total) if total > 0 else bar_len
         bar = "█" * filled + "░" * (bar_len - filled)
-        sys.stdout.write(
-            f"\r⏳ [수집 진행] [{bar}] {pct:5.1f}% ({completed_count}/{total})"
-        )
-        sys.stdout.flush()
+        if sys.stdout.isatty():
+            sys.stdout.write(
+                f"\r⏳ [수집 진행] [{bar}] {pct:5.1f}% ({completed_count}/{total})"
+            )
+            sys.stdout.flush()
         return res
 
     tasks = [_track_task(i, stock) for i, stock in enumerate(stock_list)]
     all_res = await asyncio.gather(*tasks)
-    if total > 0:
+    if total > 0 and sys.stdout.isatty():
         sys.stdout.write("\n")
         sys.stdout.flush()
+    all_res = await requote_failed_quotes(stock_list, list(all_res), client, session, sem, now_fn=now_fn)
+    logger.info("[DATA] stage=realtime_quote_batch n_rows=%d n_quote_failed=%d", total, sum(1 for r, _f, _o in all_res if r.get(QUOTE_FAILED_COL)))
 
     results = [r for r, _f, _o in all_res]
     failed_info = [
@@ -584,7 +663,7 @@ async def main(force: bool = False):
         if not stock_list:
             logger.info(f"{Colors.YELLOW}⚠ 자동 스캔 후보가 없습니다.{Colors.RESET}")
             return
-        stock_list = filter_eligible_candidates(stock_list, load_eligible_codes(pd.Timestamp(snapshot_date)))
+        stock_list = filter_eligible_candidates(stock_list, await resolve_eligible_codes(client, session, pd.Timestamp(snapshot_date)))
 
         logger.info(
             f"{Colors.BOLD}🚀 [1/3] 후보 종목 스캔 (Kiwoom / KIS){Colors.RESET}\n"

@@ -339,34 +339,6 @@ def test_fetch_all_flows_empty_symbol_list() -> None:
     assert sources == {"investor": {}, "program": {}}
 
 
-def test_assemble_new_rows_and_check_flow_coverage() -> None:
-    from src.daily.price_ingest import assemble_new_rows, check_flow_coverage, normalize_krx_daily
-
-    krx = normalize_krx_daily(_krx_raw([
-        {"symbol": "A", "close": 110, "prev_close": 100, "volume": 10},
-        {"symbol": "B", "close": 50, "prev_close": 50, "volume": 0},
-        {"symbol": "C", "close": 20, "prev_close": 20, "volume": 5},
-    ]), pd.Timestamp("2026-09-10"))
-    flows = pd.DataFrame({
-        "date": ["2026-09-10", "2026-09-10"], "symbol": ["A", "C"],
-        "inst_netbuy": [1.0, np.nan], "foreign_netbuy": [2.0, 3.0], "program_netbuy": [0.0, np.nan],
-    })
-
-    rows = assemble_new_rows(krx, flows)
-
-    assert rows.set_index("symbol").loc["A", "chg_ratio"] == pytest.approx(0.1)
-    assert rows["daily_change_pct"].equals(rows["chg_ratio"])
-    assert np.isnan(rows.set_index("symbol").loc["B", "inst_netbuy"])
-    # Then: halted B (volume 0) is excluded; C lacks inst -> 1/2 traded rows covered
-    assert check_flow_coverage(rows, min_coverage=0.5) == {"2026-09-10": 0.5}
-    with pytest.raises(ValueError, match="coverage below"):
-        check_flow_coverage(rows)
-    # Then: C also lacks program -> the program gate is independent of the investor gate
-    assert check_flow_coverage(rows, columns=("program_netbuy",), min_coverage=0.5, label="program") == {"2026-09-10": 0.5}
-    with pytest.raises(ValueError, match="program flow coverage below"):
-        check_flow_coverage(rows, columns=("program_netbuy",), label="program")
-
-
 def test_merge_and_adjust_scales_history_for_events_and_ignores_gaps() -> None:
     from src.daily.price_ingest import merge_and_adjust
 
@@ -477,20 +449,6 @@ def test_run_price_ingest_noop_when_unpublished_and_index_unchanged(monkeypatch,
     assert path.stat().st_mtime_ns == before
 
 
-def test_run_price_ingest_fails_closed_on_low_flow_coverage(monkeypatch, tmp_path) -> None:
-    path = tmp_path / "ph.parquet"
-    mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
-    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
-    before = path.stat().st_mtime_ns
-
-    # When: KIS and Kiwoom both fail investor flow for every symbol
-    with pytest.raises(ValueError, match="coverage below"):
-        asyncio.run(mod.run_price_ingest(today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(), kis=FakeKis(fail_investor={"000001", "000002", "000003"}), kiwoom=FakeKiwoom(fail={"000001", "000002", "000003"})))
-
-    # Then: nothing written
-    assert path.stat().st_mtime_ns == before
-
-
 def test_run_price_ingest_raises_when_past_trading_day_missing(monkeypatch, tmp_path) -> None:
     # Given: 000002 is stale since 09-07 but KRX has no rows for the past day 09-08
     path = tmp_path / "ph.parquet"
@@ -532,6 +490,7 @@ def test_run_price_ingest_missing_panel_raises(tmp_path) -> None:
 
 def test_main_runs_ingest_with_defaults(monkeypatch) -> None:
     import src.daily.price_ingest as mod
+    import src.strategy.growth_shadow as growth_shadow
 
     seen = []
 
@@ -540,8 +499,10 @@ def test_main_runs_ingest_with_defaults(monkeypatch) -> None:
         return mod.IngestReport(ingested_dates=[], n_new_rows=0, n_corporate_events=0)
 
     monkeypatch.setattr(mod, "run_price_ingest", _fake)
+    monkeypatch.setattr(mod, "record_run_outcome", lambda *a, **k: {})
+    monkeypatch.setattr(growth_shadow, "run_growth_shadow", lambda: 0)
     mod.main()
-    assert seen == [{}]
+    assert [sorted(k) for k in seen] == [["on_outcome"]]
 
 
 def test_kca_price_ingest_service_runs_module() -> None:
@@ -616,37 +577,13 @@ def test_fetch_all_flows_uses_toss_program_fallback() -> None:
     assert toss.calls == ["000004"]
 
 
-def test_run_price_ingest_fails_closed_on_low_program_flow_coverage(monkeypatch, tmp_path) -> None:
-    # Given: investor flow is healthy but every symbol's KIS program call fails,
-    # and the Toss fallback also fails for every symbol (no viable recovery).
-    # toss=None would let production build a *real* TossApiClient (its
-    # documented default-construction convenience for callers), which reaches
-    # the live network under real credentials -- passing a failing FakeToss
-    # keeps this hermetic while preserving the "no working fallback" intent.
-    path = tmp_path / "ph.parquet"
-    mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
-    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
-    before = path.stat().st_mtime_ns
-
-    # When
-    with pytest.raises(ValueError, match="program flow coverage below"):
-        asyncio.run(mod.run_price_ingest(
-            today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
-            kis=FakeKis(fail_program={"000001", "000002", "000003"}), kiwoom=FakeKiwoom(),
-            toss=FakeToss(fail={"000001", "000002", "000003"}),
-        ))
-
-    # Then: nothing written
-    assert path.stat().st_mtime_ns == before
-
-
 def test_price_ingest_main_runs_growth_shadow_after_ingest(monkeypatch):
     import src.daily.price_ingest as price_ingest
     import src.strategy.growth_shadow as growth_shadow
 
     calls = []
 
-    async def fake_ingest():
+    async def fake_ingest(**_kwargs):
         calls.append("ingest")
 
     def fake_shadow():
@@ -657,3 +594,195 @@ def test_price_ingest_main_runs_growth_shadow_after_ingest(monkeypatch):
     monkeypatch.setattr(growth_shadow, "run_growth_shadow", fake_shadow)
     price_ingest.main()
     assert calls == ["ingest", "shadow"]
+
+
+def test_assemble_new_rows_and_compute_flow_coverage() -> None:
+    from src.daily.price_ingest import assemble_new_rows, compute_flow_coverage, normalize_krx_daily
+
+    krx = normalize_krx_daily(_krx_raw([
+        {"symbol": "A", "close": 110, "prev_close": 100, "volume": 10},
+        {"symbol": "B", "close": 50, "prev_close": 50, "volume": 0},
+        {"symbol": "C", "close": 20, "prev_close": 20, "volume": 5},
+    ]), pd.Timestamp("2026-09-10"))
+    flows = pd.DataFrame({
+        "date": ["2026-09-10", "2026-09-10"], "symbol": ["A", "C"],
+        "inst_netbuy": [1.0, np.nan], "foreign_netbuy": [2.0, 3.0], "program_netbuy": [0.0, np.nan],
+    })
+
+    rows = assemble_new_rows(krx, flows)
+
+    assert rows.set_index("symbol").loc["A", "chg_ratio"] == pytest.approx(0.1)
+    assert rows["daily_change_pct"].equals(rows["chg_ratio"])
+    assert np.isnan(rows.set_index("symbol").loc["B", "inst_netbuy"])
+    # Then: halted B (volume 0) is excluded; C lacks inst -> 1/2 traded rows covered
+    assert compute_flow_coverage(rows, ("inst_netbuy", "foreign_netbuy")) == {"2026-09-10": 0.5}
+    # Then: C also lacks program -> program coverage is computed independently
+    assert compute_flow_coverage(rows, ("program_netbuy",)) == {"2026-09-10": 0.5}
+    # Then: no traded rows -> empty mapping
+    assert compute_flow_coverage(rows[rows["symbol"] == "B"], ("inst_netbuy",)) == {}
+
+
+def test_plan_flow_repairs_selects_traded_gaps_inside_window() -> None:
+    from src.daily.price_ingest import plan_flow_repairs
+
+    d_old, d1, d2 = pd.Timestamp("2026-07-01"), pd.Timestamp("2026-09-09"), pd.Timestamp("2026-09-10")
+    rows = (
+        _panel_rows("A", [d1, d2], [100.0, 100.0])
+        + _panel_rows("B", [d_old, d2], [100.0, 100.0])
+        + _panel_rows("C", [d2], [100.0], volume=0.0)
+        + _panel_rows("D", [d1, d2], [100.0, 100.0])
+    )
+    panel = pd.DataFrame(rows)
+    panel.loc[(panel["symbol"] == "A") & (panel["date"] == d2), "inst_netbuy"] = np.nan
+    panel.loc[(panel["symbol"] == "B") & (panel["date"] == d_old), "program_netbuy"] = np.nan
+    panel.loc[panel["symbol"] == "C", "foreign_netbuy"] = np.nan
+
+    # When
+    planned = plan_flow_repairs(panel, pd.Timestamp("2026-08-01"))
+
+    # Then: A(창 안 결측) 만; B(창 밖), C(거래 없음), D(완전) 제외
+    assert planned == ["A"]
+
+
+def test_apply_flow_repairs_fills_only_null_cells() -> None:
+    from src.daily.price_ingest import FLOW_COLUMNS, apply_flow_repairs
+
+    d1, d2 = pd.Timestamp("2026-09-09"), pd.Timestamp("2026-09-10")
+    panel = pd.DataFrame(_panel_rows("A", [d1, d2], [100.0, 100.0]))
+    panel.loc[panel["date"] == d2, "inst_netbuy"] = np.nan
+    flows = pd.DataFrame({
+        "date": ["2026-09-09", "2026-09-10", "2026-09-10"],
+        "symbol": ["A", "A", "Z"],
+        "inst_netbuy": [3.0, 7.0, 1.0],
+        "foreign_netbuy": [9.0, 9.0, 1.0],
+        "program_netbuy": [np.nan, 4.0, 1.0],
+    })
+
+    # When
+    repaired, n_filled = apply_flow_repairs(panel, flows)
+
+    # Then
+    m = repaired.set_index("date")
+    assert n_filled == 1
+    assert m.loc[d2, "inst_netbuy"] == 7.0
+    assert m.loc[d1, "inst_netbuy"] == 1.0
+    assert m.loc[d2, "foreign_netbuy"] == 1.0
+    assert m.loc[d2, "program_netbuy"] == 1.0
+    assert np.isnan(panel.loc[panel["date"] == d2, "inst_netbuy"]).all()
+    assert len(repaired) == len(panel)
+    empty = pd.DataFrame(columns=["date", "symbol", *FLOW_COLUMNS])
+    same, n_none = apply_flow_repairs(panel, empty)
+    assert n_none == 0 and same["inst_netbuy"].isna().sum() == 1
+
+
+def test_run_price_ingest_writes_prices_and_degrades_on_low_flow_coverage(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "ph.parquet"
+    mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    outcomes: list[tuple] = []
+
+    # When: KIS and Kiwoom both fail investor flow for every symbol
+    report = asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+        kis=FakeKis(fail_investor={"000001", "000002", "000003"}), kiwoom=FakeKiwoom(fail={"000001", "000002", "000003"}),
+        toss=FakeToss(), on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+    ))
+
+    # Then: 가격 행은 기록, 수급은 NaN 으로 정직하게 남김
+    assert report.wrote is True
+    assert report.ingested_dates == ["2026-09-10"]
+    assert report.flow_shortfall == {"2026-09-10": 0.0}
+    assert report.program_flow_shortfall == {}
+    out = pd.read_parquet(path)
+    out["symbol"] = out["symbol"].astype(str)
+    new = out[out["date"] == days["2026-09-10"]].set_index("symbol")
+    assert sorted(new.index) == ["000001", "000002", "000003"]
+    assert float(new.loc["000001", "close"]) == 10500.0
+    assert new["inst_netbuy"].isna().all()
+    assert len(outcomes) == 1
+    outcome, kw = outcomes[0]
+    assert outcome == "DEGRADED"
+    assert kw["run_date"] == "2026-09-11"
+    assert kw["reason"] == "flow_coverage_below_min"
+    assert kw["metrics"]["flow_shortfall"] == {"2026-09-10": 0.0}
+    assert kw["metrics"]["n_new_rows"] == 3
+
+
+def test_run_price_ingest_writes_prices_and_degrades_on_low_program_flow_coverage(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "ph.parquet"
+    mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    outcomes: list[str] = []
+
+    # When
+    report = asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+        kis=FakeKis(fail_program={"000001", "000002", "000003"}), kiwoom=FakeKiwoom(),
+        toss=FakeToss(fail={"000001", "000002", "000003"}),
+        on_outcome=lambda outcome, **kw: outcomes.append(outcome),
+    ))
+
+    # Then
+    assert report.wrote is True
+    assert report.flow_shortfall == {}
+    assert report.program_flow_shortfall == {"2026-09-10": 0.0}
+    out = pd.read_parquet(path)
+    assert out.loc[out["date"] == days["2026-09-10"], "program_netbuy"].isna().all()
+    assert out.loc[out["date"] == days["2026-09-10"], "inst_netbuy"].notna().all()
+    assert outcomes == ["DEGRADED"]
+
+
+def test_run_price_ingest_repairs_flow_gaps_without_new_dates(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "ph.parquet"
+    mod, days, calls = _orchestrate_fakes(monkeypatch, {"2026-09-08", "2026-09-09", "2026-09-10"})
+    rows = _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"], days["2026-09-10"]], [10000.0] * 3)
+    rows[-1]["inst_netbuy"] = float("nan")
+    _write_panel(path, rows)
+    kiwoom = FakeKiwoom()
+    outcomes: list[tuple] = []
+
+    # When: 09-11 미게시(신규 날짜 없음), 09-10 기관 수급만 결측
+    report = asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(), kis=FakeKis(), kiwoom=kiwoom, toss=FakeToss(),
+        on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+    ))
+
+    # Then
+    assert calls == ["2026-09-11"]
+    assert report.ingested_dates == []
+    assert report.n_flow_repaired == 1
+    assert report.wrote is True
+    assert report.flow_shortfall == {}
+    out = pd.read_parquet(path).set_index("date")
+    assert float(out.loc[days["2026-09-10"], "inst_netbuy"]) == 100.0
+    assert float(out.loc[days["2026-09-09"], "inst_netbuy"]) == 1.0
+    assert kiwoom.calls == []
+    assert outcomes[0][0] == "OK"
+    assert outcomes[0][1]["metrics"]["n_flow_repaired"] == 1
+
+
+def test_price_ingest_main_wires_outcome_recorder(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import src.daily.price_ingest as mod
+    import src.strategy.growth_shadow as growth_shadow
+
+    seen: list[dict] = []
+
+    async def _fake(**kwargs):
+        seen.append(kwargs)
+        return mod.IngestReport(ingested_dates=[], n_new_rows=0, n_corporate_events=0)
+
+    recorder = Mock(return_value={})
+    monkeypatch.setattr(mod, "run_price_ingest", _fake)
+    monkeypatch.setattr(mod, "record_run_outcome", recorder)
+    monkeypatch.setattr(growth_shadow, "run_growth_shadow", lambda: 0)
+
+    # When
+    mod.main()
+    seen[0]["on_outcome"]("DEGRADED", run_date="2026-09-11", reason="flow_coverage_below_min", metrics={"n_new_rows": 3})
+
+    # Then
+    recorder.assert_called_once_with(
+        "price_ingest", "DEGRADED", run_date="2026-09-11", reason="flow_coverage_below_min", metrics={"n_new_rows": 3}
+    )
