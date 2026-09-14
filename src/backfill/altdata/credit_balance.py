@@ -7,7 +7,7 @@ import logging
 
 import pandas as pd
 
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.backfill.altdata.config import AltDataFetchConfig
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ def collect_credit_balance(cfg: AltDataFetchConfig, business_days: list[pd.Times
     end_ymd = _to_ymd(max(days))
 
     async def _run() -> list[tuple[str, dict]]:
-        client = KisApiClient()
+        client = KisApiClient(**kis_data_client_kwargs())
         async with client.create_session() as session:
             await client.ensure_token(session)
             sem = asyncio.Semaphore(10)

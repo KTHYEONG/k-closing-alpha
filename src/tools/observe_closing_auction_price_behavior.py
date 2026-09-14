@@ -45,7 +45,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from src import settings
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -65,11 +65,12 @@ POLL_INTERVAL_SEC = 5.0
 
 OUT_PATH = settings.DATA_DIR / "diagnostics" / "closing_auction_observation.jsonl"
 
-APP_KEY = settings.KIS_API_CONFIG["app_key"]
-APP_SECRET = settings.KIS_API_CONFIG["app_secret"]
-ACCOUNT_ID = settings.KIS_API_CONFIG.get("account_id", "")
-HTS_ID = settings.KIS_API_CONFIG.get("hts_id")
-TOKEN_FILE = str(settings.TOKEN_FILE)
+_KIS_DATA_KWARGS = kis_data_client_kwargs()
+APP_KEY = _KIS_DATA_KWARGS["app_key"]
+APP_SECRET = _KIS_DATA_KWARGS["app_secret"]
+ACCOUNT_ID = _KIS_DATA_KWARGS["account_id"]
+HTS_ID = _KIS_DATA_KWARGS["hts_id"]
+TOKEN_FILE = _KIS_DATA_KWARGS["token_file"]
 
 
 def _now_kst() -> datetime:

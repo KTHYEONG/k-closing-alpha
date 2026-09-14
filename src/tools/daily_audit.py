@@ -18,7 +18,7 @@ import aiohttp
 import pandas as pd
 
 from src import settings
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.archive_intraday import resolve_previous_archive_date
 from src.data.intraday_store import intraday_partition_path
@@ -111,7 +111,7 @@ def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
 
 def _kis_trading_day(snapshot_date: str) -> bool:  # pragma: no cover - live KIS boundary
     async def _run() -> bool:
-        client = KisApiClient()  # type: ignore[no-untyped-call]
+        client = KisApiClient(**kis_data_client_kwargs())  # type: ignore[no-untyped-call]
         async with client.create_session() as session:
             await client.ensure_token(session)
             return await is_kis_trading_day(client, session, snapshot_date)

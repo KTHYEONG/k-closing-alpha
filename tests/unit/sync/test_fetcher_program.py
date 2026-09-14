@@ -71,3 +71,42 @@ def test_program_async_stops_after_request_errors() -> None:
         )
     )
     assert out == {}
+
+
+def test_get_program_history_builds_client_from_data_account(monkeypatch) -> None:
+    from src.sync import fetcher_program
+
+    captured: dict = {}
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    class _FakeKisClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def create_session(self):
+            return _FakeSession()
+
+        async def ensure_token(self, session):
+            return "tok"
+
+    async def _fake_worker(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(fetcher_program, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(fetcher_program, "get_program_history_async", _fake_worker)
+    monkeypatch.setattr(
+        fetcher_program,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "data-key", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "x.json"},
+    )
+
+    out = fetcher_program.get_program_history("005930", "20200102", "20200102")
+
+    assert captured["app_key"] == "data-key"
+    assert out == {}

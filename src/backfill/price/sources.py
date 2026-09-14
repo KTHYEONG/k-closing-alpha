@@ -211,13 +211,13 @@ def _kis_sync_client():
     """
     import asyncio
 
-    from src.api.kis.client import KisApiClient
+    from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 
     global _KIS_CLIENT
     with _KIS_CLIENT_LOCK:
         if _KIS_CLIENT is not None and _KIS_CLIENT.token:
             return _KIS_CLIENT
-        client = KisApiClient()
+        client = KisApiClient(**kis_data_client_kwargs())
 
         async def _ensure() -> None:
             async with client.create_session() as session:

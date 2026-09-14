@@ -8,7 +8,7 @@ from typing import Any
 import aiohttp
 import pandas as pd
 
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +170,7 @@ def get_program_history(
       TR_ID: FHPPG04650201
     """
     async def _run() -> dict[str, float]:
-        client = KisApiClient()
+        client = KisApiClient(**kis_data_client_kwargs())
         async with client.create_session() as session:
             await client.ensure_token(session)
             return await get_program_history_async(

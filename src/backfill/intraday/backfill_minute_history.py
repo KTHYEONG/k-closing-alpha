@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from src import settings
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.backfill.intraday.collector import backfill_krx_aftermarket_bars, backfill_nxt_aftermarket_bars, backfill_regular_bars
 from src.config.market_session import INTRADAY_SESSION_KRX_AFTERMARKET, INTRADAY_SESSION_NXT_AFTERMARKET, INTRADAY_SESSION_REGULAR
 from src.daily import archive
@@ -176,7 +176,7 @@ def run_minute_history_backfill(lookback_days: int = 365, bar_interval_minutes: 
     ordered_dates = sorted(by_date.keys())
 
     async def _run() -> dict[str, int]:
-        client = KisApiClient()
+        client = KisApiClient(**kis_data_client_kwargs())
         dates = 0
         regular_rows = 0
         nxt_rows = 0

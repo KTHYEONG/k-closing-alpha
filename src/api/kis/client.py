@@ -860,3 +860,23 @@ class KisApiClient:
             return res
         rows = res.get("output") or res.get("output2") or []
         return {"rt_cd": "0", "output": rows}
+
+
+def kis_data_client_kwargs() -> dict[str, str]:
+    """데이터 수집 전용 KIS 계좌용 KisApiClient 생성 kwargs를 반환한다.
+
+    체결 계좌와 분리된 앱키를 사용하므로 KIS 서버측 TPS 예산과
+    프로세스 전역 공유 레이트리미터 버킷이 분리되고, 토큰 캐시 파일도
+    체결 계좌의 settings.TOKEN_FILE과 충돌하지 않는다.
+
+    체결가 결정 경로(finalize_close의 확정 종가 조회)나 실시간 체결틱
+    (paper_trade의 웹소켓 승인키 발급)에는 절대 사용하지 않는다.
+    """
+    cfg = settings.KIS_DATA_API_CONFIG
+    return {
+        "app_key": cfg["app_key"],
+        "app_secret": cfg["app_secret"],
+        "account_id": cfg.get("account_id", ""),
+        "hts_id": cfg.get("hts_id"),
+        "token_file": str(settings.DATA_TOKEN_FILE),
+    }

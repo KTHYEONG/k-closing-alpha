@@ -165,7 +165,7 @@ def test_run_intraday_archive_wires_kiwoom_client_when_key_present(monkeypatch) 
         captured["kiwoom_client_passed"] = kiwoom_client
         return pd.DataFrame()
 
-    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda: _FakeKisClient())
+    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _FakeKisClient())
     monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
     monkeypatch.setattr(archive_intraday, "KiwoomApiClient", _fake_kiwoom_ctor)
     monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _fake_collect_bars)
@@ -225,7 +225,7 @@ def test_run_intraday_archive_no_kiwoom_client_when_key_absent(monkeypatch) -> N
         captured["kiwoom_client_passed"] = kiwoom_client
         return pd.DataFrame()
 
-    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda: _FakeKisClient())
+    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _FakeKisClient())
     monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
     monkeypatch.setattr(archive_intraday, "KiwoomApiClient", _fake_kiwoom_ctor)
     monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _fake_collect_bars)
@@ -375,7 +375,7 @@ def test_run_intraday_archive_instantiates_kiwoom_with_kiwoom_app_key_alias(monk
         captured["kiwoom_client_passed"] = kiwoom_client
         return pd.DataFrame()
 
-    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda: fake_client)
+    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: fake_client)
     monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
     monkeypatch.setattr(archive_intraday, "KiwoomApiClient", _fake_kiwoom_ctor)
     monkeypatch.setattr(archive_intraday, "collect_intraday_bars", AsyncMock(return_value=pd.DataFrame()))
@@ -529,3 +529,31 @@ def test_run_intraday_archive_skips_non_trading_day_without_collecting(monkeypat
 
     # Then
     assert result == (0, 0, 0)
+
+
+def test_archive_intraday_builds_client_from_data_account(monkeypatch, tmp_path) -> None:
+    from src.daily import archive_intraday
+
+    captured = {}
+
+    class _FakeKisClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def create_session(self):
+            raise AssertionError("session should not be opened in this scenario")
+
+    token_file = str(tmp_path / "x.json")
+    monkeypatch.setattr(archive_intraday, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(
+        archive_intraday,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "data-key", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": token_file},
+        raising=False,
+    )
+
+    # When
+    archive_intraday.KisApiClient(**archive_intraday.kis_data_client_kwargs())
+
+    # Then
+    assert captured["app_key"] == "data-key"

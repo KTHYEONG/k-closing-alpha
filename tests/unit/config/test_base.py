@@ -51,3 +51,13 @@ def test_ls_tick_max_pages_moved_to_ls_settings() -> None:
     settings = Settings()
     assert settings.LS_TICK_MAX_PAGES == 100
     assert settings.KIWOM_TICK_MAX_PAGES == 30
+
+
+def test_path_settings_data_token_file_distinct_from_execution_token_file() -> None:
+    from src.config.base import PathSettings
+
+    s = PathSettings(_env_file=None)
+
+    assert s.DATA_TOKEN_FILE != s.TOKEN_FILE
+    assert s.DATA_TOKEN_FILE.name == "kis_data_token_cache.json"
+    assert s.DATA_TOKEN_FILE.parent == s.CONFIGS_DIR

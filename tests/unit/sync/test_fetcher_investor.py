@@ -83,3 +83,44 @@ def test_investor_async_stops_after_request_errors() -> None:
         )
     )
     assert out.empty
+
+
+def test_get_investor_trade_daily_builds_client_from_data_account(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.sync import fetcher_investor
+
+    captured: dict = {}
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    class _FakeKisClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def create_session(self):
+            return _FakeSession()
+
+        async def ensure_token(self, session):
+            return "tok"
+
+    async def _fake_worker(*args, **kwargs):
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fetcher_investor, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(fetcher_investor, "get_investor_trade_daily_async", _fake_worker)
+    monkeypatch.setattr(
+        fetcher_investor,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "data-key", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "x.json"},
+    )
+
+    out = fetcher_investor.get_investor_trade_daily("005930", "20200102", "20200102")
+
+    assert captured["app_key"] == "data-key"
+    assert out.empty
