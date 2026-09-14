@@ -177,7 +177,7 @@ def test_run_close_finalization_updates_rows_in_place_without_new_snapshot_ident
     monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", _fake_upsert)
 
     class _Client:
-        async def get_current_price(self, session, code, market_div_code=None):
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
             return {
                 "rt_cd": "0",
                 "output": {
@@ -255,7 +255,7 @@ def test_run_close_finalization_leaves_unconfirmed_rows_untouched_until_deadline
     )
 
     class _NeverConfirms:
-        async def get_current_price(self, session, code, market_div_code=None):
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
             return {"rt_cd": "0", "output": {"stck_prpr": "1860000"}}
 
         async def get_orderbook_snapshot(self, session, code, market_div_code=None):
@@ -325,7 +325,7 @@ def test_run_close_finalization_skips_already_confirmed_rows(monkeypatch) -> Non
     calls: list[str] = []
 
     class _Client:
-        async def get_current_price(self, session, code, market_div_code=None):
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
             calls.append(code)
             return {"rt_cd": "0", "output": {}}
 
@@ -359,7 +359,7 @@ def test_fetch_confirmed_quote_returns_empty_blocks_on_vendor_failure() -> None:
     from zoneinfo import ZoneInfo
 
     class _FailingClient:
-        async def get_current_price(self, session, code, market_div_code=None):
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
             return {"rt_cd": "1", "msg1": "rate limit"}
 
         async def get_orderbook_snapshot(self, session, code, market_div_code=None):
@@ -408,7 +408,7 @@ def test_run_close_finalization_rejects_invariant_violating_quote_without_touchi
     )
 
     class _RegressedVolumeClient:
-        async def get_current_price(self, session, code, market_div_code=None):
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
             # 확정 게이트는 통과하지만 누적거래량이 결정시점보다 작다 (벤더 오류/종목 혼선)
             return {
                 "rt_cd": "0",
@@ -498,3 +498,23 @@ def test_finalize_close_main_runs_inside_a_single_event_loop(monkeypatch) -> Non
     assert seen["loop_at_create"] is not None
     assert seen["closed"] is True
     assert seen["finalized"] == "2026-09-10"
+
+
+def test_fetch_confirmed_quote_requests_krx_price_without_venue_fallback() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.finalize_close import fetch_confirmed_quote
+
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "1000"}})
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output2": {"antc_mkop_cls_code": "112"}})
+
+    # When
+    price, book = asyncio.run(fetch_confirmed_quote(client, object(), "005930"))
+
+    # Then
+    assert client.get_current_price.await_args.kwargs == {"market_div_code": "J", "allow_market_div_fallback": False}
+    assert price == {"stck_prpr": "1000"}
+    assert book == {"antc_mkop_cls_code": "112"}
+

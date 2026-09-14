@@ -549,19 +549,18 @@ def test_map_toss_trade_value_rows_to_stock_list_skips_codeless_no_band_filter()
     assert map_toss_trade_value_rows_to_stock_list([]) == []
 
 
-def test_map_toss_trade_value_rows_to_stock_list_skips_non_numeric_codes() -> None:
-    """워런트/신주인수권증서 등 코드에 문자가 섞인 종목은 KIS 현재가 API가
-    실패/비정상값을 반환하므로 순수 숫자 종목코드만 통과시킨다."""
+def test_map_toss_trade_value_rows_to_stock_list_keeps_alphanumeric_listed_codes() -> None:
+    """KRX 신규 단축코드는 영문을 포함하는 정상 보통주(예: 0220W0)이므로 탈락시키지 않는다."""
     from src.daily.universe_scan import map_toss_trade_value_rows_to_stock_list
 
     rows = [
         {"rank": 1, "symbol": "005930", "price": {"lastPrice": "70000", "changeRate": "0.01"}},
-        {"rank": 2, "symbol": "220W0", "price": {"lastPrice": "500", "changeRate": "0.05"}},
+        {"rank": 2, "symbol": "0220W0", "price": {"lastPrice": "6790", "changeRate": "0.0847"}},
     ]
 
     out = map_toss_trade_value_rows_to_stock_list(rows)
 
-    assert out == [{"code": "005930", "name": None, "price": "70000", "chgrate": "0.01"}]
+    assert [row["code"] for row in out] == ["005930", "0220W0"]
 
 
 def test_fetch_trade_value_union_returns_rows_on_success() -> None:
@@ -613,3 +612,30 @@ def test_fetch_trade_value_union_fails_open_on_error_envelope_and_exception() ->
 
     out2 = asyncio.run(fetch_trade_value_union(object(), toss_client=toss_client2))
     assert out2 == []
+
+
+def test_fetch_candidate_stock_list_fails_closed_on_truncated_kiwoom_scan() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import pytest
+
+    from src.daily.universe_scan import UniverseScanCoverageError, fetch_candidate_stock_list
+
+    kiwoom = AsyncMock()
+    kiwoom.get_fluctuation_ranking = AsyncMock(
+        return_value={
+            "rt_cd": "1",
+            "msg1": "ranking truncated at max_pages=20",
+            "output": [{"stk_cd": "005930_AL", "stk_nm": "삼성전자", "cur_prc": "+80000", "flu_rt": "+5.00"}],
+            "vendor": "kiwoom",
+            "truncated": True,
+        }
+    )
+    toss = AsyncMock()
+
+    # When / Then: 절단 스캔은 폴백 없이 차단
+    with pytest.raises(UniverseScanCoverageError, match="truncated"):
+        asyncio.run(fetch_candidate_stock_list(object(), object(), kiwoom_client=kiwoom, toss_client=toss))
+    toss.get_rankings.assert_not_awaited()
+

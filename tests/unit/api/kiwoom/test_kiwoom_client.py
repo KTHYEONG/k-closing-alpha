@@ -564,3 +564,32 @@ def test_kiwoom_get_nxt_premarket_chart_skips_malformed_cntr_tm() -> None:
     assert res["rt_cd"] == "0"
     assert len(res["output2"]) == 1
     assert res["output2"][0]["cntr_tm"] == "20260904080000"
+
+
+def test_kiwoom_get_fluctuation_ranking_flags_truncation_when_pages_exhausted() -> None:
+    import asyncio
+    import inspect
+
+    from src.api.kiwoom.client import KiwoomApiClient
+
+    client = KiwoomApiClient(app_key="k", secret_key="s")
+    client.token = "tok"
+    calls = {"n": 0}
+
+    async def fake_post_tr(session, api_id, path, body, cont_yn="N", next_key="", max_retries=3):
+        calls["n"] += 1
+        rows = [{"stk_cd": f"00000{calls['n']}_AL", "stk_nm": "X", "cur_prc": "+1000", "pred_pre": "+50", "flu_rt": "+5.00", "now_trde_qty": "1000"}]
+        return ({"return_code": 0, "pred_pre_flu_rt_upper": rows}, {"cont-yn": "Y", "next-key": f"k{calls['n']}"})
+
+    client._post_tr = fake_post_tr
+
+    # When: 모든 페이지가 밴드 안이고 다음 페이지가 남은 채 예산 소진
+    res = asyncio.run(client.get_fluctuation_ranking(object(), rate_min_pct=2.0, rate_max_pct=10.0, max_pages=3))
+
+    # Then: 무경고 성공 금지
+    assert calls["n"] == 3
+    assert res["rt_cd"] == "1"
+    assert res["truncated"] is True
+    assert len(res["output"]) == 3
+    assert inspect.signature(KiwoomApiClient.get_fluctuation_ranking).parameters["max_pages"].default == 20
+

@@ -411,3 +411,139 @@ def test_run_topk_ranker_sleeve_skips_history_for_v1_bundle(monkeypatch) -> None
     # Then
     assert len(out) == 3
 
+
+
+def test_restrict_to_rank_pool_drops_rows_outside_training_screen() -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    # Given: 학습 풀 4행 + 거래대금이 큰 음수 등락 행(Toss union형, 랭크만 왜곡)
+    wide, _hist, decision = _sleeve_wide_and_history()
+    extra = wide.iloc[[0]].copy()
+    extra["종목코드"] = "000005"
+    extra["종가"] = 9500.0
+    extra["전일종가"] = 10000.0
+    extra["고가"] = 9800.0
+    extra["저가"] = 9400.0
+    extra["시가"] = 9900.0
+    extra["거래대금"] = 90000.0
+    extra["admitted"] = False
+    wide = pd.concat([wide, extra], ignore_index=True)
+
+    # When
+    out = predict_mod.restrict_to_rank_pool(wide, decision)
+
+    # Then
+    assert out["종목코드"].tolist() == ["000001", "000002", "000003", "000004"]
+    assert out.index.tolist() == [0, 1, 2, 3]
+
+
+
+def test_restrict_to_rank_pool_fails_closed_on_inconsistent_or_empty_snapshot() -> None:
+    import pandas as pd
+    import pytest
+
+    import src.daily.predict as predict_mod
+
+    # Given: 풀 밖(음수 등락)인데 admitted로 기록된 모순 행
+    wide, _hist, decision = _sleeve_wide_and_history()
+    bad = wide.iloc[[0]].copy()
+    bad["종목코드"] = "000005"
+    bad["종가"] = 9500.0
+    bad["전일종가"] = 10000.0
+    bad["고가"] = 9800.0
+    bad["admitted"] = True
+    wide = pd.concat([wide, bad], ignore_index=True)
+
+    # When / Then
+    with pytest.raises(ValueError, match="outside the training rank pool"):
+        predict_mod.restrict_to_rank_pool(wide, decision)
+    with pytest.raises(ValueError, match="empty"):
+        predict_mod.restrict_to_rank_pool(wide.iloc[0:0], decision)
+
+
+
+def test_run_topk_ranker_sleeve_ranks_within_training_pool(monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    import src.serving.realtime.features as features_mod
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    # Given: 학습 풀 4행 + 풀 밖 음수 등락 대형 거래대금 행
+    wide, _hist, decision = _sleeve_wide_and_history()
+    extra = wide.iloc[[0]].copy()
+    extra["종목코드"] = "000005"
+    extra["종목명"] = "EEE"
+    extra["종가"] = 9500.0
+    extra["전일종가"] = 10000.0
+    extra["고가"] = 9800.0
+    extra["거래대금"] = 90000.0
+    extra["admitted"] = False
+    wide = pd.concat([wide, extra], ignore_index=True)
+    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
+    bundle["top_k"] = 3
+    seen = []
+    real_build = features_mod.build_topk_ranker_features
+
+    def _spy(df, decision_date, price_history=None):
+        seen.append(df["종목코드"].tolist())
+        return real_build(df, decision_date, price_history=price_history)
+
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+    monkeypatch.setattr(features_mod, "build_topk_ranker_features", _spy)
+
+    # When
+    out = predict_mod.run_topk_ranker_sleeve(decision)
+
+    # Then
+    assert seen == [["000001", "000002", "000003", "000004"]]
+    assert sorted(out["symbol"].tolist()) == ["000001", "000002", "000003"]
+
+
+
+def test_load_topk_decision_returns_rows_for_decision_date_only(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+
+    # Given: 저장소 부재
+    assert predict_mod.load_topk_decision(pd.Timestamp("2026-09-14")).empty
+
+    # Given: 다른 날짜 1행 + 당일 재실행으로 중복된 000660
+    pd.DataFrame({
+        "decision_date": ["2026-09-11", "2026-09-14", "2026-09-14", "2026-09-14"],
+        "symbol": ["000001", "000660", "005930", "000660"],
+        "allocation": [1.0 / 3.0] * 4,
+        "pred": [0.1, 0.2, 0.3, 0.25],
+    }).to_parquet(tmp_path / "topk_decisions.parquet", index=False)
+
+    # When
+    out = predict_mod.load_topk_decision(pd.Timestamp("2026-09-14"))
+
+    # Then
+    assert out["symbol"].tolist() == ["005930", "000660"]
+    assert out["pred"].tolist() == [0.3, 0.25]
+    assert out.index.tolist() == [0, 1]
+
+
+def test_restrict_to_rank_pool_raises_when_no_row_passes_training_screen() -> None:
+    import pytest
+
+    import src.daily.predict as predict_mod
+
+    # Given: 전 종목이 음수 등락이라 학습 스크린 밖, admitted 없음
+    wide, _hist, decision = _sleeve_wide_and_history()
+    wide["종가"] = 9500.0
+    wide["전일종가"] = 10000.0
+    wide["고가"] = 9800.0
+    wide["admitted"] = False
+
+    # When / Then
+    with pytest.raises(ValueError, match="rank pool is empty"):
+        predict_mod.restrict_to_rank_pool(wide, decision)

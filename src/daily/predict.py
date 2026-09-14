@@ -28,6 +28,41 @@ def load_daily_snapshot(decision_date: pd.Timestamp) -> pd.DataFrame:
     return df
 
 
+def restrict_to_rank_pool(wide: pd.DataFrame, decision_date: pd.Timestamp) -> pd.DataFrame:
+    """Restrict the snapshot to the training rank pool.
+
+    Args:
+        wide: Daily snapshot frame with Korean columns and ``admitted`` flags.
+        decision_date: Decision date for point-in-time screen inputs.
+
+    Returns:
+        Rank-pool rows with a reset index.
+
+    Raises:
+        ValueError: When the snapshot is empty, an admitted row lies outside
+            the training rank pool, or the pool itself is empty.
+    """
+    from src.daily.universe_screen import rank_pool_mask
+
+    if wide.empty:
+        raise ValueError("live_rows is empty; nothing to decide on")
+    mask = rank_pool_mask(wide, decision_date=pd.Timestamp(decision_date))
+    admitted = wide["admitted"].fillna(False).astype(bool).to_numpy()
+    outside = wide.loc[admitted & ~mask, "종목코드"].astype(str).tolist()
+    if outside:
+        raise ValueError(f"admitted rows outside the training rank pool: {outside}")
+    pool = wide.loc[mask].reset_index(drop=True)
+    logger.info(
+        "[DATA] stage=rank_pool n_snapshot=%d n_pool=%d n_admitted=%d",
+        len(wide),
+        len(pool),
+        int(admitted.sum()),
+    )
+    if pool.empty:
+        raise ValueError("rank pool is empty; nothing to decide on")
+    return pool
+
+
 def run_topk_ranker_sleeve(decision_date: pd.Timestamp) -> pd.DataFrame:
     """자동 top-3 리랭커 슬리브를 실행한다.
 
@@ -46,7 +81,7 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp) -> pd.DataFrame:
         from src.ml.topk_ranker_research import TOPK_RANKER_BUNDLE_DIR, select_topk_equal_weight
         from src.serving.realtime.features import build_topk_ranker_features
 
-        wide = load_daily_snapshot(decision_date)
+        wide = restrict_to_rank_pool(load_daily_snapshot(decision_date), decision_date)
         bundle = load_model_bundle(import_dir=TOPK_RANKER_BUNDLE_DIR)
         # 번들이 선언한 피처가 이력 피처를 요구할 때만 price_history 를 읽는다
         price_history = None
@@ -96,6 +131,24 @@ def persist_topk_decision(decision_date: pd.Timestamp, sleeve_df: pd.DataFrame) 
         merged = out
     atomic_write_parquet(merged, target)
     return len(sleeve_df)
+
+
+def load_topk_decision(decision_date: pd.Timestamp) -> pd.DataFrame:
+    """Load the persisted top-k decision for a decision date.
+
+    Args:
+        decision_date: Decision date to look up.
+
+    Returns:
+        Requested-date rows deduplicated by symbol keeping the last write,
+        or an empty frame when the store is absent.
+    """
+    target = settings.PARQUET_DIR / "topk_decisions.parquet"
+    if not target.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(target)
+    out = df[df["decision_date"].astype(str) == pd.Timestamp(decision_date).strftime("%Y-%m-%d")]
+    return out.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
 
 
 def run_automated_topk_decision(decision_date: pd.Timestamp) -> None:
