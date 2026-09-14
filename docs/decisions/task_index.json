@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260914_LIVE_UNIVERSE_INTEGRITY",
+      "date": "2026-09-14",
+      "adr_id": "ADR_20260914_20260914_LIVE_UNIVERSE_INTEGRITY",
+      "domain": "daily",
+      "title": "라이브 결정 모집단 정합성 복구 (ETN/ETF/랭크풀/진입동결)",
+      "why": "collect가 Q접두어 없는 ETN에 0원 응답을 정상 처리해 커버리지 게이트가 매 평일 실패하고, ETF 유입/랭크 모집단 불일치/페이퍼 진입 룩어헤드 등 후속 결함이 함께 발견됨",
+      "resolution": "시세조회 전 T-1 price_history 멤버십 필터, 현재가 미해석 판정, DEFAULT_UNIVERSE 랭크풀 분리, 페이퍼 진입의 topk_decisions 소비, Kiwoom 페이지 소진 fail-closed, collect/finalize 현재가 J 단일화를 계약 기반으로 구현",
+      "impact": "1145 테스트 통과, lean_check PASS(diff coverage 100%); finalize 동시성/종가확정 0건 원인, daily_audit 의미검증, 패널 영문코드/우선주 이력 백필은 후속 과제로 이연"
+    },
+    {
       "task_id": "TASK_20260913_REALTIME_COLLECTION_GAP_FILL",
       "date": "2026-09-14",
       "adr_id": "ADR_20260914_20260913_REALTIME_COLLECTION_GAP_FILL",
@@ -989,16 +999,6 @@
       "why": "The 2025-only quality audit found market-context alignment, order-dependent aggregation, zero-denominator flow ratios, misleading two-fold stability, and an under-sourced volume_power feature.",
       "resolution": "Synchronized the causal_history_v2 repairs: deterministic market aggregation, signed-log flow changes, neutral zero-scale z-scores, baseline missing-rate gating, all-fold stability, and effective ma_slope lookback metadata.",
       "impact": "Documentation, task registry, and code map now reflect the verified 2025 cutoff five-fold retraining; the candidate remains report-only because it does not beat control."
-    },
-    {
-      "task_id": "TASK_ML_FEATURE_ENGINEERING_QUALITY",
-      "date": "2026-08-08",
-      "adr_id": "ADR_20260808_ML_FEATURE_ENGINEERING_QUALITY",
-      "domain": "ml",
-      "title": "Feature engineering quality diagnostics and promotion gate",
-      "why": "The 2025 causal-history retrain showed 65 unavailable candidates, 179 capacity-limited candidates, and lower candidate OOF performance despite feature-count expansion.",
-      "resolution": "Added fold-local feature quality evidence and deterministic family reports, persisted quality_report in research artifacts, exposed source-incomplete/capacity-limited/unstable actions, and required candidate scheduled mean return to strictly beat the identical-date control before promotion.",
-      "impact": "Research now distinguishes unavailable data from redundant or capacity-limited features and prevents lower-return history candidates from promotion; active production artifacts remain unchanged."
     }
   ]
 }

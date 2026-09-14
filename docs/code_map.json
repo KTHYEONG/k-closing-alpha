@@ -176,10 +176,7 @@
     ]
   },
   "src/daily/collect.py": {
-    "testing": [
-      "tests/unit/daily/test_collect.py",
-      "tests/integration/daily/test_collect_archive_flow.py"
-    ]
+    "testing": "tests/unit/daily/test_collect.py"
   },
   "src/daily/finalize_close.py": {
     "testing": "tests/unit/daily/test_finalize_close.py"
@@ -195,6 +192,9 @@
   },
   "src/daily/universe_scan.py": {
     "testing": "tests/unit/daily/test_universe_scan.py"
+  },
+  "src/daily/universe_screen.py": {
+    "testing": "tests/unit/daily/test_universe_screen.py"
   },
   "src/data/candidate_panel.py": {
     "testing": "tests/unit/data/test_candidate_panel.py"
