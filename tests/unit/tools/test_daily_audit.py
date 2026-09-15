@@ -7,7 +7,6 @@ def test_systemd_units_encode_persistence_and_timezone_policy() -> None:
     root = Path("deploy/systemd")
 
     # Given: 결정창에 묶인 타이머들은 지연 캐치업이 무의미하다
-    # (kca-paper-entry는 고정 타이머가 아니라 finalize-close 종료 ExecStopPost 체이닝이므로 제외)
     for name in ("kca-collect", "kca-predict", "kca-finalize-close"):
         text = (root / f"{name}.timer").read_text(encoding="utf-8")
         assert "Persistent=false" in text, f"{name} must not catch up outside the decision window"
@@ -43,8 +42,8 @@ def test_systemd_timers_align_with_decision_and_finalize_gates() -> None:
     # predict는 collect 이후
     assert predict_hhmmss > collect_hhmmss
 
-    # paper-entry는 고정 타이머가 아니라 finalize-close 종료(성공/실패 무관)에 체이닝된다
-    assert not Path("deploy/systemd/kca-paper-entry.timer").exists()
+    # paper-entry는 finalize-close 종료(성공/실패 무관) ExecStopPost 체이닝이 1차 경로이고,
+    # 체이닝이 조용히 끊기는 경우를 대비한 독립 백스톱 타이머(kca-paper-entry.timer)가 보증 경로다
     finalize_lines = Path("deploy/systemd/kca-finalize-close.service").read_text(encoding="utf-8").splitlines()
     assert "ExecStopPost=/usr/bin/systemctl --user start --no-block kca-paper-entry.service" in finalize_lines
     assert not any(line.startswith("OnSuccess=") for line in finalize_lines)
