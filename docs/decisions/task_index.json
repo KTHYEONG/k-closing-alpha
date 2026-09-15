@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "PAPER_EXIT_OPEN_PARITY_T1_ATTRIBUTION_RETRAIN_REGISTRY",
+      "date": "2026-09-15",
+      "adr_id": "ADR_20260915_PAPER_EXIT_OPEN_PARITY_T1_ATTRIBUTION_RETRAIN_REGISTRY",
+      "domain": "execution/paper",
+      "title": "페이퍼 청산 시가정합화 + T+1 성과귀속 원장 + 재학습 레지스트리",
+      "why": "페이퍼 청산(TP5%+MOC)이 모델 라벨(익일 시가)과 달라 손익으로 모델을 채점할 수 없었고, 풀 전체 rankIC/재학습 승격 이력도 없었다",
+      "resolution": "paper_trade 청산을 D+1 KRX 시가단일가로 교체, t1_attribution.py로 풀 전체 일별 rankIC+TP5%MOC 반사실 원장 추가, retrain_registry.py로 승격/거부 이력+번들 지문 기록",
+      "impact": "페이퍼 손익=모델 채점 기준 일치, H2/M1 관측성 확보; 웹소켓/익절 청산 경로 및 관련 테스트 14개 폐기"
+    },
+    {
       "task_id": "TASK_FLOW_FEATURE_PIT_FIX",
       "date": "2026-09-15",
       "adr_id": "ADR_20260915_FLOW_FEATURE_PIT_FIX",
@@ -989,16 +999,6 @@
       "why": "ml-res.md '리랭커 포화, 새 예측정보만 레버' 명제를 독립 검증. 5개 신규 횡단면 피처군(A 후보출현동학 B 당일밀집도 C 인과레짐prior D 종목별 오버나잇 미시구조 E 공시트레일링) + LGBMRanker(lambdarank) 전부 CPCV(8,2) 유의성 게이트(delta>0 & p<0.10) 미통과. B(+0.104%/d p=0.054 WF) D(+0.110%/d p=0.109 WF) 마진신호는 CPCV에서 p=0.18/0.92로 소멸, 결합시 붕괴(D+E p=0.92)=검증노이즈. 날짜상수 피처(v_kospi 등 6개)는 당일 횡단면 리랭커에 원리적 무효. build_ml_dataset 초기 측정 90-142s는 uv-run 콜드스타트+머신부하 환경요인이고 실제 컴퓨트는 ~5.5s(_apply_robust_z 2.6s + create_multi_targets 2.0s 지배).",
       "resolution": "신규 알파 코드변경 없음(탐색결과 음성). _apply_robust_z: groupby.transform(lambda MAD)를 벡터 MAD((x-median).abs().groupby.transform(median))로 교체 + N개 _z 컬럼 단일 df.assign 일괄부착(프레임 조각화 회피). 2.6s->0.04s, rtol=1e-12 패리티. create_multi_targets: trade_date 그룹 파이썬 랭크 루프를 그룹크기별 단일 qcut 벡터화로 교체, target_rank 33827행 loop구현과 정확일치. 신규 테스트 test_features_robust_z.py / test_build_perf.py(slow) 추가. 출력 bit-identical, 레거시 컬럼 패리티 불변.",
       "impact": "리랭커 알파: 모델/블렌드/정책/가중/윈도우/앙상블/관망 게이트에 이어 신규 예측정보(피처군 5종)+모델클래스(ranker)도 소진 확인 -> 리랭커 피처 연구 동결 권고. 다음 레버는 후보생성기 품질(oracle top1 +6.6% vs 실현 +0.6%) 또는 트레이드구성(quantile grade 사이징/청산타이밍)이며 src/ml/ 밖. 파이프라인: build_ml_dataset 컴퓨트 ~5.5s->~1.5s, HPO 40 trial x inner CV 및 cpcv_oof_predict 에서 수백회 복리. 하위호환: 시그니처/컬럼셋/값 불변."
-    },
-    {
-      "task_id": "TASK_ML_PIPELINE_GAIN_RECOVERY",
-      "date": "2026-09-03",
-      "adr_id": "ADR_20260903_ML_PIPELINE_GAIN_RECOVERY",
-      "domain": "ml",
-      "title": "Recover reranker model alpha cancelled by champion pipeline: fix blend-weight selection bug + regularized default model",
-      "why": "튜닝만으로 라이브러리 기본값 대비 개선 없던 정확한 원인 규명: calibrate_blend_weight 가 MDD 노이즈로 p_good 가중 0.75(최선 0.0 대비 -17bp) 선택하는 버그 + RUN A/B 가 검증-무효 knob(date_balanced p=0.99, recency p=0.31)과 혼동. 배경: 후보군 EV 가 2020년 이후 붕괴(+0.3%/53% -> -0.2%/44% win)로 리랭커가 현 레짐에서 포화.",
-      "resolution": "calibrate_blend_weight 유의성 게이트 재작성(최저 grid 가중 기본, 상위는 moving_block_bootstrap delta>0 & p<promotion_alpha 일 때만 채택, MDD tiebreaker 삭제; per_weight 에 delta_vs_base/p_value_vs_base 추가). bundle.py CHAMPION_DEFAULT_MODEL_PARAMS 상수(num_leaves 15 등 정규화 config)를 build_inline_bundle 기본층으로 병합. ChampionTuningConfig.model_params_override + retrain --no-hpo 로 Optuna 스킵. _CLOSE_MORNING_RERANKER_CONFIG p_good_weight 0.5->0.0. 실데이터 검증: 블렌드 선택 0.0 정상 동작(기존 버그 0.75), 그러나 홀드아웃 승격 게이트 미통과(FIXED +3.7bp p=0.57, HPO +6.0bp p=0.41, MDD 오히려 악화). 격리 ablation +24bp/p=0.0004 는 OOS 예약에서 소멸.",
-      "impact": "선택 버그 제거(모든 tuned 챔피언이 MDD 노이즈로 가중 선택하던 문제). 배포 비-tuned 모델이 bare LightGBM 기본값 대신 정규화 prior 사용. 블렌드 가중 유의성 기반 결정. 하위호환(positional 시그니처/BlendWeightResult 불변, --no-hpo 없으면 기존과 동일). 모델/블렌드/정책 튜닝은 현 레짐에서 소진 — 다음 레버는 새 예측정보(로드맵 P2)."
     }
   ]
 }

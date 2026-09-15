@@ -266,6 +266,9 @@
   "src/ml/retrain_gate.py": {
     "testing": "tests/unit/ml/test_retrain_gate.py"
   },
+  "src/ml/retrain_registry.py": {
+    "testing": "tests/unit/ml/test_retrain_registry.py"
+  },
   "src/ml/robust_eval.py": {
     "testing": "tests/unit/ml/test_robust_eval.py"
   },
@@ -329,6 +332,9 @@
   },
   "src/strategy/growth_shadow.py": {
     "testing": "tests/unit/strategy/test_growth_shadow.py"
+  },
+  "src/strategy/t1_attribution.py": {
+    "testing": "tests/unit/strategy/test_t1_attribution.py"
   },
   "src/sync/fetcher_investor.py": {
     "testing": "tests/unit/sync/test_fetcher_investor.py"
