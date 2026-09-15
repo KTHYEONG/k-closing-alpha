@@ -791,6 +791,9 @@ def main() -> None:
     from src.strategy.growth_shadow import run_growth_shadow
 
     run_growth_shadow()
+    from src.strategy.t1_attribution import run_t1_attribution
+
+    run_t1_attribution()
 
 
 if __name__ == "__main__":  # pragma: no cover
