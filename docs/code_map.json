@@ -3,16 +3,21 @@
     "testing": "tests/unit/api/kis/test_client.py"
   },
   "src/api/kis/indicators.py": {
+    "testing": "tests/unit/api/kis/test_indicators.py"
+  },
+  "src/api/kis/key_pool.py": {
     "testing": [
       "tests/unit/api/kis/test_kis_client.py",
-      "tests/unit/api/kis/test_kis_client_helpers.py",
-      "tests/unit/api/kis/test_ohlcv_prefetch.py",
-      "tests/unit/api/test_kis_client_facade_removed.py"
+      "tests/unit/api/kis/test_kis_host_rate_limiter.py",
+      "tests/unit/api/kis/test_kis_key_pool.py",
+      "tests/unit/api/kis/test_kis_token_store.py",
+      "tests/unit/tools/test_kis_token_warmup.py"
     ]
   },
   "src/api/kis/rate_limit.py": {
     "testing": [
       "tests/unit/api/kis/test_kis_client.py",
+      "tests/unit/api/kis/test_kis_host_rate_limiter.py",
       "tests/unit/api/kis/test_kis_rate_limiter.py",
       "tests/unit/api/kiwoom/test_kiwoom_client.py",
       "tests/unit/api/test_kis_client_facade_removed.py",
@@ -311,6 +316,9 @@
   "src/settings.py": {
     "testing": [
       "tests/unit/api/kis/test_kis_client.py",
+      "tests/unit/api/kis/test_kis_host_rate_limiter.py",
+      "tests/unit/api/kis/test_kis_key_pool.py",
+      "tests/unit/api/kis/test_kis_token_store.py",
       "tests/unit/config/test_altdata.py",
       "tests/unit/config/test_altdata_settings.py",
       "tests/unit/config/test_base.py",
@@ -324,7 +332,8 @@
       "tests/unit/data/test_parquet_loader.py",
       "tests/unit/ml/test_exit_grid_revalidation.py",
       "tests/unit/ml/test_history_features.py",
-      "tests/unit/tools/test_code_sync.py"
+      "tests/unit/tools/test_code_sync.py",
+      "tests/unit/tools/test_kis_token_warmup.py"
     ]
   },
   "src/strategy/contract.py": {
@@ -357,6 +366,9 @@
   "src/tools/fix_price_history_integrity.py": {
     "testing": "tests/unit/tools/test_fix_price_history_integrity.py"
   },
+  "src/tools/kis_token_warmup.py": {
+    "testing": "tests/unit/tools/test_kis_token_warmup.py"
+  },
   "src/tools/migrate_altdata_storage.py": {
     "testing": "tests/unit/tools/test_migrate_altdata_storage.py"
   },
@@ -377,6 +389,5 @@
   },
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
-  },
-  "deploy/systemd/kca-paper-entry.timer": {}
+  }
 }
