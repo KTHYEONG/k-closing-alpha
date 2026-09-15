@@ -215,10 +215,6 @@ async def resolve_prev_trading_day_kis(client: Any, session: Any, decision_date:
     raise ValueError(f"no trading day within {int(max_lookback_days)} days before {d.date()}")
 
 
-# 연구 패널이 조건검색 이력 유니버스로만 적재된 마지막 날짜. 이후 전종목 적재로 편입된 종목(보통주 151·영문코드 81·우선주 52)은 과거 이력이 없어 히스토리 피처가 신규상장처럼 계산되므로, PIT 패널 재구축 전까지 결정 후보에서 제외한다.
-PANEL_LEGACY_UNIVERSE_LAST_DATE: pd.Timestamp = pd.Timestamp("2026-09-04")
-
-
 def load_eligible_codes(decision_date: pd.Timestamp, *, prev_trading_day: pd.Timestamp, path: str | os.PathLike[str] | None = None) -> frozenset[str]:
     """Return the symbols listed in price_history on the previous trading day.
 
@@ -247,38 +243,12 @@ def load_eligible_codes(decision_date: pd.Timestamp, *, prev_trading_day: pd.Tim
     return frozenset(rows["symbol"].astype(str))
 
 
-def load_history_complete_codes(*, path: str | os.PathLike[str] | None = None, legacy_last_date: pd.Timestamp = PANEL_LEGACY_UNIVERSE_LAST_DATE) -> frozenset[str]:
-    """Return symbols present on the legacy universe last date.
-
-    Args:
-        path: Parquet path; None selects settings.PRICE_HISTORY_PARQUET_PATH.
-        legacy_last_date: Legacy universe last date.
-
-    Returns:
-        Symbols present on the legacy universe last date.
-
-    Raises:
-        FileNotFoundError: When the parquet does not exist.
-        ValueError: When no rows exist on the legacy universe date.
-    """
-    src_path = Path(settings.PRICE_HISTORY_PARQUET_PATH if path is None else path)
-    if not src_path.exists():
-        raise FileNotFoundError(f"price_history not found: {src_path}")
-    day = pd.Timestamp(legacy_last_date).normalize()
-    rows = pd.read_parquet(src_path, columns=["date", "symbol"], filters=[("date", "==", day)])
-    if rows.empty:
-        raise ValueError(f"legacy universe date {day.date()} has no price_history rows")
-    return frozenset(rows["symbol"].astype(str))
-
-
 async def resolve_eligible_codes(client: Any, session: Any, decision_date: pd.Timestamp) -> frozenset[str]:
-    """Resolve eligibility through the async KIS calendar before quoting, excluding history-gap symbols until the PIT panel rebuild."""
+    """Resolve eligibility through the async KIS calendar before quoting."""
     prev = await resolve_prev_trading_day_kis(client, session, decision_date)
     listed = load_eligible_codes(decision_date, prev_trading_day=prev)
-    complete = load_history_complete_codes()
-    eligible = listed & complete
-    logger.info("[DATA] stage=eligibility n_listed=%d n_history_complete=%d n_excluded_history_gap=%d", len(listed), len(eligible), len(listed - complete))
-    return eligible
+    logger.info("[DATA] stage=eligibility n_listed=%d", len(listed))
+    return listed
 
 
 def filter_eligible_candidates(stock_list: list[dict], eligible_codes: frozenset[str]) -> list[dict]:

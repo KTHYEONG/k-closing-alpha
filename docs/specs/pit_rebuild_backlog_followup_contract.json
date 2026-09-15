@@ -1,0 +1,28 @@
+{
+  "feature": "pit_rebuild_backlog_followup",
+  "domain": "data",
+  "target_file": "src/data/pit_rebuild_backlog_followup.py",
+  "symbol": "calc_pit_rebuild_backlog_followup",
+  "signature": "def calc_pit_rebuild_backlog_followup(val: float) -> float",
+  "python_assertion": "assert calc_pit_rebuild_backlog_followup(1.0) == 1.0",
+  "scenarios": [
+    {
+      "scenario_id": "test_pit_rebuild_backlog_followup_executes_correctly",
+      "target_test_file": "tests/unit/data/test_pit_rebuild_backlog_followup.py",
+      "execution_command": "uv run pytest tests/unit/data/test_pit_rebuild_backlog_followup.py -k test_pit_rebuild_backlog_followup_executes_correctly -q",
+      "expected_behavior": "Handles normal input and returns expected result",
+      "test_skeleton": "def test_pit_rebuild_backlog_followup_executes_correctly() -> None:\n    from src.data.pit_rebuild_backlog_followup import calc_pit_rebuild_backlog_followup\n\n    result = calc_pit_rebuild_backlog_followup(1.0)\n    assert result == 1.0\n"
+    }
+  ],
+  "wiring": {
+    "file": "src/data/pipeline.py",
+    "anchor": "def run_pipeline",
+    "invocation_expression": "calc_pit_rebuild_backlog_followup(val)"
+  },
+  "design_rationale": {
+    "alternatives_considered": "",
+    "chosen_reason": "",
+    "failure_modes": []
+  },
+  "performance_budget": null
+}

@@ -1050,7 +1050,6 @@ def test_main_filters_candidates_by_eligibility_before_quoting(monkeypatch) -> N
     monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
     monkeypatch.setattr(collect, "resolve_daily_candidates", AsyncMock(return_value=scanned))
     monkeypatch.setattr(collect, "load_eligible_codes", _eligible)
-    monkeypatch.setattr(collect, "load_history_complete_codes", lambda **_kw: frozenset({"005930"}))
     monkeypatch.setattr(collect, "fetch_all_stock_data", _fetch_all)
 
     # When
@@ -1292,7 +1291,6 @@ def test_resolve_eligible_codes_passes_kis_resolved_prev_day_to_panel_lookup(mon
 
     monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
     monkeypatch.setattr(collect, "load_eligible_codes", _load)
-    monkeypatch.setattr(collect, "load_history_complete_codes", lambda **_kw: frozenset({"005930"}))
 
     # When
     out = asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
@@ -1357,7 +1355,6 @@ def test_main_resolves_previous_trading_day_through_kis_before_eligibility(monke
         AsyncMock(return_value=[{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "3.0"}]),
     )
     monkeypatch.setattr(collect, "load_eligible_codes", _eligible)
-    monkeypatch.setattr(collect, "load_history_complete_codes", lambda **_kw: frozenset({"005930"}))
     monkeypatch.setattr(collect, "fetch_all_stock_data", _fetch_all)
 
     # When
@@ -1633,35 +1630,9 @@ def test_resolve_daily_candidates_enables_kis_band_fallback(monkeypatch) -> None
     assert captured["kis_band_fallback"] is True
 
 
-def test_load_history_complete_codes_returns_legacy_universe_symbols(tmp_path) -> None:
-    import pandas as pd
-    import pytest
-
-    from src.daily import collect
-
-    panel = pd.DataFrame({
-        "date": pd.to_datetime(["2026-09-03", "2026-09-04", "2026-09-04", "2026-09-07", "2026-09-07"]),
-        "symbol": ["000001", "005930", "000660", "005930", "138930"],
-        "close": [1.0, 2.0, 3.0, 4.0, 5.0],
-    })
-    path = tmp_path / "price_history.parquet"
-    panel.to_parquet(path, index=False)
-
-    # When
-    out = collect.load_history_complete_codes(path=path)
-
-    # Then: 9/04(구 유니버스 마지막 날) 구성만, 9/07 신규 편입(138930)은 제외
-    assert pd.Timestamp("2026-09-04") == collect.PANEL_LEGACY_UNIVERSE_LAST_DATE
-    assert out == frozenset({"005930", "000660"})
-
-    # And: 해당 날짜 행이 없으면 fail-closed
-    with pytest.raises(ValueError, match="legacy universe"):
-        collect.load_history_complete_codes(path=path, legacy_last_date=pd.Timestamp("2026-09-02"))
-    with pytest.raises(FileNotFoundError):
-        collect.load_history_complete_codes(path=tmp_path / "absent.parquet")
-
-
-def test_resolve_eligible_codes_intersects_history_complete_codes(monkeypatch) -> None:
+def test_resolve_eligible_codes_returns_all_listed_codes_without_history_filter(monkeypatch) -> None:
+    """PIT 재구축 이후 price_history는 전종목 이력을 보유하므로, 별도 history-complete 교집합 없이
+    직전 거래일 상장 종목이 곧 적격 종목이다 (0220W0처럼 예전엔 배제되던 코드도 그대로 통과)."""
     import asyncio
 
     import pandas as pd
@@ -1675,10 +1646,17 @@ def test_resolve_eligible_codes_intersects_history_complete_codes(monkeypatch) -
     monkeypatch.setattr(
         collect, "load_eligible_codes", lambda decision_date, *, prev_trading_day, path=None: frozenset({"005930", "138930", "0220W0"})
     )
-    monkeypatch.setattr(collect, "load_history_complete_codes", lambda **_kw: frozenset({"005930", "000660"}))
 
     # When
     out = asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
 
     # Then
-    assert out == frozenset({"005930"})
+    assert out == frozenset({"005930", "138930", "0220W0"})
+
+
+def test_legacy_universe_guard_symbols_are_fully_deleted() -> None:
+    from src.daily import collect
+
+    # Then: 가드 상수와 함수가 완전히 사라졌다
+    assert not hasattr(collect, "PANEL_LEGACY_UNIVERSE_LAST_DATE")
+    assert not hasattr(collect, "load_history_complete_codes")
