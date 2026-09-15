@@ -270,8 +270,9 @@ def test_kis_data_client_kwargs_reads_data_account_settings(monkeypatch, tmp_pat
     data_token = tmp_path / "kis_data_token_cache.json"
     monkeypatch.setattr(settings, "DATA_TOKEN_FILE", data_token)
 
-    # When
-    out = kis_data_client_kwargs()
+    # When: env={} 로 풀 미정의 상태를 강제해 legacy KIS_DATA_API_CONFIG 폴백 경로를 검증한다
+    # (실행 머신의 실제 .env에 KIS_DATA_SLOTS가 채워져 있어도 이 테스트 결과가 흔들리면 안 된다)
+    out = kis_data_client_kwargs(env={})
 
     # Then: 데이터 계좌 값만 반영, 체결 계좌 값은 섞이지 않는다
     assert out == {
@@ -293,8 +294,9 @@ def test_kis_data_client_gets_isolated_rate_limiter_from_execution_client(monkey
         "app_key": "exec-key-iso", "app_secret": "s", "account_id": "a", "hts_id": "h",
     })
 
-    # When
-    data_client = KisApiClient(**kis_data_client_kwargs())
+    # When: env={} 로 풀 미정의 상태를 강제해 legacy KIS_DATA_API_CONFIG 폴백 경로를 검증한다
+    # (실행 머신의 실제 .env에 KIS_DATA_SLOTS가 채워져 있어도 이 테스트 결과가 흔들리면 안 된다)
+    data_client = KisApiClient(**kis_data_client_kwargs(env={}))
     exec_client = KisApiClient()
 
     # Then: 프로세스 전역 공유 리미터가 앱키별로 분리된 버킷을 갖는다
