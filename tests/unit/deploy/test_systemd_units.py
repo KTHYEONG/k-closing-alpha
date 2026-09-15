@@ -229,21 +229,6 @@ def test_decision_path_timers_fire_with_one_second_accuracy() -> None:
         assert "AccuracySec=1s" in (root / name).read_text(encoding="utf-8"), name
 
 
-def test_paper_exit_start_timeout_backstops_after_session_end_same_day() -> None:
-    import pathlib
-    import re
-
-    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    text = (root / "kca-paper-exit.service").read_text(encoding="utf-8")
-    match = re.search(r"TimeoutStartSec=(\d+)h", text)
-
-    assert match is not None
-    start_seconds = 9 * 3600
-    end_seconds = start_seconds + int(match.group(1)) * 3600
-    assert end_seconds > 15 * 3600 + 30 * 60
-    assert end_seconds < 24 * 3600
-
-
 def test_code_sync_runs_before_morning_ingest_and_paper_exit() -> None:
     import pathlib
     import re
@@ -306,14 +291,25 @@ def test_finalize_close_always_hands_off_to_paper_entry() -> None:
     assert "OnFailure=kca-alert@%n.service" in lines
 
 
-def test_paper_exit_timer_catches_up_missed_runs() -> None:
+
+
+def test_paper_exit_timer_fires_after_open_auction_and_catches_up() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     lines = (root / "kca-paper-exit.timer").read_text(encoding="utf-8").splitlines()
 
-    # Then: 09:00 발화를 놓쳐도 부팅/재개 직후 세션을 이어받는다(15:30 이후면 세션이 스스로 SKIP)
+    # Then: 시가단일가(09:00:00) 체결 후 발화, 놓치면 재개 직후 이어받는다
     assert "Persistent=true" in lines
-    assert "Persistent=false" not in lines
     assert "AccuracySec=1s" in lines
-    assert "OnCalendar=Mon..Fri 09:00:00 Asia/Seoul" in lines
+    assert "OnCalendar=Mon..Fri 09:01:00 Asia/Seoul" in lines
+
+
+def test_paper_exit_service_timeout_covers_quote_retry_budget_only() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    lines = (root / "kca-paper-exit.service").read_text(encoding="utf-8").splitlines()
+
+    assert "TimeoutStartSec=15min" in lines
+    assert not any(line.startswith("TimeoutStartSec=") and line.endswith("h") for line in lines)
