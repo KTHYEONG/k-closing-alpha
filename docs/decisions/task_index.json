@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_FLOW_FEATURE_PIT_FIX",
+      "date": "2026-09-15",
+      "adr_id": "ADR_20260915_FLOW_FEATURE_PIT_FIX",
+      "domain": "ml",
+      "title": "수급 피처 T-1 시차화로 학습-서빙 룩어헤드 제거",
+      "why": "inst_density/inst_rank/f_inst_cum5/f_foreign_cum5가 결정시점(15:20)엔 존재하지 않는 당일 확정 수급을 학습에 사용(t=24 룩어헤드), foreign은 시차화 시 통계적으로 사멸(t=-1.07)",
+      "resolution": "merge_asof 기반 attach_lagged_flow_features로 T-1 확정치만 사용하도록 학습·서빙 배선, foreign_density 삭제, f_inst_cum5/f_foreign_cum5는 _lag_roll로 당일 제외",
+      "impact": "top-k 랭커 결정이 실제 서빙 시점에 관측 가능한 정보만으로 재현되며, 재학습 시 retrain_gate 최초 승격은 --skip-promotion-gate 수동 검토 필요"
+    },
+    {
       "task_id": "TASK_PAPER_CHAIN_HARDENING",
       "date": "2026-09-15",
       "adr_id": "ADR_20260915_PAPER_CHAIN_HARDENING",
@@ -989,16 +999,6 @@
       "why": "튜닝만으로 라이브러리 기본값 대비 개선 없던 정확한 원인 규명: calibrate_blend_weight 가 MDD 노이즈로 p_good 가중 0.75(최선 0.0 대비 -17bp) 선택하는 버그 + RUN A/B 가 검증-무효 knob(date_balanced p=0.99, recency p=0.31)과 혼동. 배경: 후보군 EV 가 2020년 이후 붕괴(+0.3%/53% -> -0.2%/44% win)로 리랭커가 현 레짐에서 포화.",
       "resolution": "calibrate_blend_weight 유의성 게이트 재작성(최저 grid 가중 기본, 상위는 moving_block_bootstrap delta>0 & p<promotion_alpha 일 때만 채택, MDD tiebreaker 삭제; per_weight 에 delta_vs_base/p_value_vs_base 추가). bundle.py CHAMPION_DEFAULT_MODEL_PARAMS 상수(num_leaves 15 등 정규화 config)를 build_inline_bundle 기본층으로 병합. ChampionTuningConfig.model_params_override + retrain --no-hpo 로 Optuna 스킵. _CLOSE_MORNING_RERANKER_CONFIG p_good_weight 0.5->0.0. 실데이터 검증: 블렌드 선택 0.0 정상 동작(기존 버그 0.75), 그러나 홀드아웃 승격 게이트 미통과(FIXED +3.7bp p=0.57, HPO +6.0bp p=0.41, MDD 오히려 악화). 격리 ablation +24bp/p=0.0004 는 OOS 예약에서 소멸.",
       "impact": "선택 버그 제거(모든 tuned 챔피언이 MDD 노이즈로 가중 선택하던 문제). 배포 비-tuned 모델이 bare LightGBM 기본값 대신 정규화 prior 사용. 블렌드 가중 유의성 기반 결정. 하위호환(positional 시그니처/BlendWeightResult 불변, --no-hpo 없으면 기존과 동일). 모델/블렌드/정책 튜닝은 현 레짐에서 소진 — 다음 레버는 새 예측정보(로드맵 P2)."
-    },
-    {
-      "task_id": "TASK_ML_SPARSE_DATA_ROBUSTNESS",
-      "date": "2026-09-03",
-      "adr_id": "ADR_20260903_ML_SPARSE_DATA_ROBUSTNESS",
-      "domain": "ml",
-      "title": "Sparse-data ML robustness: CPCV eval + significance-gated promotion + reg-biased HPO",
-      "why": "희소 패널(중앙값 12후보/일)에서 기존 평균비교 승격 게이트가 검증된 +16-18% 개선을 노이즈로 판정(p=0.82). alpha는 안정적(연도별 rankIC ~0.18)이며 병목은 평가 파워.",
-      "resolution": "src/ml/robust_eval.py 신규(CombinatorialPurgedCV/cpcv_oof_predict/path_top1_returns/moving_block_bootstrap_delta/deflated_sharpe_ratio). champion.py evaluate_promotion 유의성 게이트(delta>0 & p<promotion_alpha). tuning.py eval_mode(walkforward|cpcv, _objective OOF 라우팅 스위치)/cpcv_n_groups/cpcv_k_test/promotion_alpha/hpo_reg_bias + cpcv_top1 목적함수(경로분산 페널티). retrain.py --eval-mode/--hpo-objective/--promotion-alpha. 실데이터 검증: A(rank_ic) p=0.358, B(cpcv_top1) p=0.665 둘 다 승격 거부 - 현 61피처로 튜닝만으론 방어 가능한 개선 없음.",
-      "impact": "승격 게이트가 bootstrap 유의성 기준(p<0.10)으로 전환, 노이즈 승격 차단. 기본 경로 하위호환(walkforward/rank_ic). CPCV(8,2)=28fold/7path 평가 인프라 확보. cpcv_oof_predict attrs concat 버그 + eval_mode ghost-switch 수정."
     }
   ]
 }
