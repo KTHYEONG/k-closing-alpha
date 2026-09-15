@@ -1,6 +1,36 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260915_KIS_FLOW_BACKFILL_TOSS_ACCELERATOR",
+      "date": "2026-09-15",
+      "adr_id": "ADR_20260915_20260915_KIS_FLOW_BACKFILL_TOSS_ACCELERATOR",
+      "domain": "data",
+      "title": "KIS 수급 백필에 Toss 프로그램매매 병행 소스 도입",
+      "why": "KIS 단일 리미터가 대량 신규종목 수급 백필의 병목이었고, Toss가 2019-04 이후 프로그램매매를 독립 버킷으로 이미 실전검증된 상태였음",
+      "resolution": "program_netbuy 2019-04-01 이후는 Toss 우선 시도, 실패·이력한계 시 KIS로 부분/전체 폴백; FlowBackfillConfig.use_toss_program 롤백 스위치 추가",
+      "impact": "kis_flow_backfill.py 신규종목 벌크 백필의 KIS 공유 버킷 부담 감소"
+    },
+    {
+      "task_id": "TASK_20260915_LEGACY_PRICE_RUNNER_RETIREMENT",
+      "date": "2026-09-15",
+      "adr_id": "ADR_20260915_20260915_LEGACY_PRICE_RUNNER_RETIREMENT",
+      "domain": "data",
+      "title": "레거시 pykrx 가격 러너 은퇴",
+      "why": "krx_panel_rebuild가 전체이력 재구축을 완전히 대체해 pykrx 기반 러너와 그 corporate_actions 오염 경로가 상존 위험으로만 남음",
+      "resolution": "compute_vkospi_proxy만 price_ingest.py로 이관 후 backfill_price.py+src/backfill/price/* 8개+죽은 테스트 12개 삭제, pykrx/setuptools 런타임 의존성도 pyproject.toml에서 제거",
+      "impact": "pykrx가 코드베이스에서 완전히 퇴출됨(matplotlib 등 전이 의존성도 함께 정리)"
+    },
+    {
+      "task_id": "TASK_20260915_LEGACY_UNIVERSE_GUARD_REMOVAL",
+      "date": "2026-09-15",
+      "adr_id": "ADR_20260915_20260915_LEGACY_UNIVERSE_GUARD_REMOVAL",
+      "domain": "data",
+      "title": "레거시 유니버스 가드 제거",
+      "why": "PIT 재구축 후 고정 날짜 스냅샷 가드가 향후 모든 신규상장을 영구 배제하는 성장형 버그로 전락함",
+      "resolution": "PANEL_LEGACY_UNIVERSE_LAST_DATE/load_history_complete_codes 삭제, resolve_eligible_codes는 load_eligible_codes 결과 그대로 반환",
+      "impact": "collect.py 적격성 판정이 고정 상수에 의존하지 않게 됨"
+    },
+    {
       "task_id": "TASK_20260915_PIT_REBUILD_ADJUDICATION",
       "date": "2026-09-15",
       "adr_id": "ADR_20260915_20260915_PIT_REBUILD_ADJUDICATION",
@@ -969,36 +999,6 @@
       "why": "close_morning61 61피처가 전부 당일 스냅샷이라 rankIC 0.24→0.17 감쇠, price_history/altdata 완전 미활용, sizing 실현변동성이 상수 0.02 하드코딩",
       "resolution": "src/ml/history_features.py 추가(merge_asof backward+allow_exact_matches=False 무누수, 트레일링 16피처: 모멘텀/MA이격/실현변동성/ATR/52주고저/거래량비율/Amihud/수급z/상승일비율), build_ml_dataset 에 feature_set='close_morning_history' 가산 통합 및 realized_vol 컬럼 산출(_EXCLUDED_FROM_X), champion/retrain --feature-set 배선, PRICE_HISTORY_PARQUET_PATH 설정 추가",
       "impact": "무누수 배관은 정상이나 5-fold purged OOF 실측 결과 구현된 그대로(raw)는 top1_net 1.465%→1.351%(-11bp)로 역효과. 원인분해: 횡단면 정규화가 손실 상쇄(1.483%), 결정적 레버는 파라미터 튜닝(baseline+튜닝 1.652%, +19bp p=0.015). Phase 1 승격 금지, 로드맵을 P3(HPO/Huber δ) 선행으로 재정렬"
-    },
-    {
-      "task_id": "ALTDATA_KRX_OPENAPI",
-      "date": "2026-09-02",
-      "adr_id": "ADR_20260902_ALTDATA_KRX_OPENAPI",
-      "domain": "backfill",
-      "title": "KRX Open API 대체데이터 주 경로 통합 및 OpenDART 이중 키 지원",
-      "why": "pykrx 가 KRX 안티봇으로 차단되는 환경에서 파생 베이시스·공시 백필이 빈 결과를 내고, 암호화 볼트(.env.enc)의 OPENDART_API_KEY 와 구 DART_API_KEY 가 불일치",
-      "resolution": "krx_api.py(AUTH_KEY 헤더, 401/404 fail-soft) 추가, derivatives 를 KRX Open API 주 경로 + pykrx fallback 구조로 재편, disclosure 에 창 단위 즉시 flush(on_window/covered_dates) 도입, KRX rate-limit 슬롯 및 krx_requests_per_sec/krx_api_key 설정, OPENDART_API_KEY 우선 dart_key 프로퍼티와 --krx-key CLI 인자 추가",
-      "impact": "KRX 차단 환경에서도 파생·지수 일별매매정보 수집 가능, 공시 백필 중단 시 수신 구간 보존, 암호화 키 체계와 정합"
-    },
-    {
-      "task_id": "TASK_ML_ALTDATA_BACKFILL",
-      "date": "2026-09-01",
-      "adr_id": "ADR_20260901_ML_ALTDATA_BACKFILL",
-      "domain": "data",
-      "title": "ML 대체데이터 과거 백필 파이프라인 (공매도/밸류에이션/투자자세부/선물베이시스/DART공시)",
-      "why": "causal_history_v2(720피처)가 일봉+수급+지수 패널을 소진해 챔피언을 못 이김. 추가 성능은 모델이 본 적 없는 직교 원천이 필요하나 공매도·밸류에이션·투자자세부수급·선물베이시스·공시이벤트는 수집조차 안 됨. 실시간 전용(분봉/호가/VI)은 과거 백필 불가하여 제외.",
-      "resolution": "src/backfill/altdata/ 신규 패키지: 5개 수집기(pykrx 4종 + OpenDART 신규 연동), 증분·원자적 쓰기, 소스별 fail-soft, _manifest.json 프로비넌스(availability_rule=eod_release_next_decision). backfill_altdata.py CLI, src/config/altdata.py(DART_API_KEY), ALTDATA_DIR. 인과 중립 저장(shift 금지, 조인은 하위 피처 스펙 책임). src.ml/src.serving import 금지.",
-      "impact": "12개 신규 테스트 통과, 전체 273 passed, ruff/mypy clean. data/history/altdata/*.parquet 로 백필 가능. 다음: 실제 수집 실행 + merge_asof 피처 조인 스펙(기존 대조군 게이트로 A/B)."
-    },
-    {
-      "task_id": "TASK_ML_CHAMPION_TUNING_SRC",
-      "date": "2026-09-01",
-      "adr_id": "ADR_20260901_ML_CHAMPION_TUNING_SRC",
-      "domain": "ml",
-      "title": "ML 챔피언 재학습 파이프라인 src/ml 이관 및 근거화",
-      "why": "재학습 로직이 gitignore된 legacy/ 아카이브에 있어 추적·린트·타입·테스트 밖이었고, LightGBM 기본값·하드코딩 blend 가중치·랜덤 KFold 보정·전기간 등가중 등 학습 설정에 근거가 없었으며 미사용 OOS 구간이 없었음.",
-      "resolution": "챔피언 경로(dataset/feature_manifest/scenario_panel/purged_cv/metrics/policy_eval/oof/bundle/champion/retrain)를 src/ml/로 재작성 이관(legacy 무수정, parity 테스트로 동일성 검증). Optuna 중첩 purged walk-forward 튜닝, seed 앙상블, OOF 기반 p_good blend 가중치 보정, 라벨 클립/Huber δ config화, chronological 확률 보정기, date-balanced·recency 가중 A/B, 임베고 OOS 예약 + 동일 날짜 대조군 승격 게이트 구현. src.ml.* mypy override 추가.",
-      "impact": "src/ml/ 14개 신규 테스트 통과, 전체 261 passed, ruff/mypy clean. 튜닝 후보가 동일 2070 OOF 날짜에서 대조군 대비 스케줄 평균수익 +6.4%(1.2028→1.2795%), Sharpe +0.26, PF +0.12, DD -0.6%p로 승격 게이트 PASS. p_good_weight=0.5 하드코딩이 무효였음을 데이터로 확인. 활성 번들 불변, 후보 경로만 저장."
     }
   ]
 }
