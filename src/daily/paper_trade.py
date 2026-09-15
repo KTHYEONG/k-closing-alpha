@@ -10,9 +10,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import aiohttp
 import pandas as pd
@@ -38,13 +39,23 @@ from src.execution.paper_broker import (
     PaperLedger,
     PaperOrder,
     build_auction_fill,
+    build_nav_snapshot,
     decide_fill,
+    investable_capital,
     order_record,
     refresh_trade_ledgers,
     size_order_qty,
 )
 
 logger = logging.getLogger(__name__)
+
+# KIS 웹소켓 순단 복구 한도: 5회 x 5초 공백은 6.5시간 청산 세션 대비 무시 가능하고, 초과하면 경보로 넘긴다
+PAPER_EXIT_MAX_RECONNECTS: int = 5
+PAPER_EXIT_RECONNECT_BACKOFF_SECONDS: float = 5.0
+
+
+class PaperExitStreamError(RuntimeError):
+    """Raised when the exit tick stream keeps dropping before the session end."""
 
 
 def _placed_at(date_str: str, hhmmss: str) -> pd.Timestamp:
@@ -91,7 +102,7 @@ def build_exit_orders(
         limit_price = None if moc else math.ceil(int(row["entry_price"]) * (1 + PAPER_TAKE_PROFIT_RATIO))
         orders.append(
             PaperOrder(
-                order_id=f"{decision_date}:{row['symbol']}:exit",
+                order_id=f"{row['entry_order_id']}:exit:{decision_date}",
                 decision_date=decision_date,
                 symbol=str(row["symbol"]),
                 side="sell",
@@ -99,6 +110,7 @@ def build_exit_orders(
                 limit_price=limit_price,
                 placed_at=placed_at,
                 reason="moc_exit" if moc else "take_profit",
+                entry_order_id=str(row["entry_order_id"]),
             )
         )
     return orders
@@ -111,12 +123,14 @@ async def run_paper_session(
     ws_client: KisWebSocketClient | None = None,
     session: aiohttp.ClientSession | None = None,
     now_fn: Callable[[], pd.Timestamp] | None = None,
+    sleep_fn: Callable[[float], Awaitable[None]] | None = None,
 ) -> int:
-    """페이퍼 세션을 실행하고 체결 건수를 반환한다. 체결은 원장에 즉시 flush한다. 청산 세션은 전량 청산, 정규장 종료 프린트, 장마감 벽시계 데드라인 중 먼저 오는 조건에서 끝난다."""
+    """페이퍼 세션을 실행하고 체결 건수를 반환한다. 체결은 원장에 즉시 flush한다. 청산 세션은 전량 청산, 정규장 종료 프린트, 장마감 벽시계 데드라인 중 먼저 오는 조건에서 끝나며, 종료 전 스트림 단절은 재연결 한도까지 복구하고 초과하면 PaperExitStreamError를 던진다."""
     if phase not in ("entry", "exit"):
         raise ValueError(f"unknown phase {phase!r}")
     ledger = ledger or PaperLedger()
     date_str = decision_date.strftime("%Y-%m-%d")
+    sleep_fn = sleep_fn or asyncio.sleep
     if phase == "entry":
         picks = load_topk_decision(decision_date)
         if picks.empty:
@@ -137,8 +151,10 @@ async def run_paper_session(
         picks = picks.copy()
         picks["price"] = overlay.fillna(base).fillna(0).astype("int64")
         placed_at = _placed_at(date_str, PAPER_ENTRY_HHMMSS)
+        cash = int(build_nav_snapshot(ledger.load("fills"), settings.PAPER_SEED_CAPITAL, date_str).iloc[0]["cash"])
+        capital = investable_capital(cash, settings.PAPER_SEED_CAPITAL)
         orders = build_entry_orders(
-            picks, date_str, seed_capital=settings.PAPER_SEED_CAPITAL, placed_at=placed_at
+            picks, date_str, seed_capital=capital, placed_at=placed_at
         )
         order_rows: list[dict] = []
         order_symbols = {o.symbol for o in orders}
@@ -217,39 +233,51 @@ async def run_paper_session(
     codes = sorted({o.symbol for o in orders})
     fills: list[dict] = []
     filled_ids: set[str] = set()
+    reconnects = 0
+    stream_exhausted = False
     try:
         # 장마감 벽시계 데드라인: 프린트가 끊겨도 oneshot 세션이 다음 날까지 살아남지 않는다
         async with asyncio.timeout(remaining_seconds):
-            async with contextlib.aclosing(ws_client.stream(session, codes)) as prints:
-                async for symbol, hhmmss, price in prints:
-                    print_ts = _placed_at(date_str, hhmmss)
-                    if print_ts >= placed_at:
-                        if hhmmss >= PAPER_EXIT_MOC_HHMMSS:
-                            pending = {o.symbol for o in orders if o.order_id not in filled_ids and o.limit_price is not None}
-                            moc_orders = build_exit_orders(
-                                positions[positions["symbol"].isin(pending)], date_str, placed_at, moc=True
-                            )
-                            moc_by_symbol = {o.symbol: o for o in moc_orders}
-                            orders = [moc_by_symbol.get(o.symbol, o) for o in orders]
-                        for order in [o for o in orders if o.symbol == symbol and o.order_id not in filled_ids]:
-                            fill = decide_fill(order, price, print_ts)
-                            if fill is not None:
-                                filled_ids.add(order.order_id)
-                                fills.append(
-                                    {
-                                        "order_id": fill.order_id,
-                                        "symbol": fill.symbol,
-                                        "side": fill.side,
-                                        "qty": fill.qty,
-                                        "fill_price": fill.fill_price,
-                                        "filled_at": fill.filled_at,
-                                        "decision_date": order.decision_date,
-                                        "trigger": fill.trigger,
-                                    }
-                                )
-                    # 전량 청산 또는 정규장 종료 프린트 이후에는 더 받을 체결 기회가 없다
-                    if len(filled_ids) == len(orders) or hhmmss >= PAPER_EXIT_SESSION_END_HHMMSS:
-                        break
+            while True:
+                session_over = False
+                try:
+                    async with contextlib.aclosing(ws_client.stream(session, codes)) as prints:
+                        async for symbol, hhmmss, price in prints:
+                            print_ts = _placed_at(date_str, hhmmss)
+                            if print_ts >= placed_at:
+                                if hhmmss >= PAPER_EXIT_MOC_HHMMSS:
+                                    orders = [dataclasses.replace(o, limit_price=None, reason="moc_exit") if (o.order_id not in filled_ids and o.limit_price is not None) else o for o in orders]
+                                for order in [o for o in orders if o.symbol == symbol and o.order_id not in filled_ids]:
+                                    fill = decide_fill(order, price, print_ts)
+                                    if fill is not None:
+                                        filled_ids.add(order.order_id)
+                                        fills.append(
+                                            {
+                                                "order_id": fill.order_id,
+                                                "symbol": fill.symbol,
+                                                "side": fill.side,
+                                                "qty": fill.qty,
+                                                "fill_price": fill.fill_price,
+                                                "filled_at": fill.filled_at,
+                                                "decision_date": order.decision_date,
+                                                "trigger": fill.trigger,
+                                                "entry_order_id": order.entry_order_id,
+                                            }
+                                        )
+                            # 전량 청산 또는 정규장 종료 프린트 이후에는 더 받을 체결 기회가 없다
+                            if len(filled_ids) == len(orders) or hhmmss >= PAPER_EXIT_SESSION_END_HHMMSS:
+                                session_over = True
+                                break
+                except (aiohttp.ClientError, ConnectionError) as exc:
+                    logger.warning("[EXEC] stage=paper_exit status=STREAM_ERROR date=%s reason=%s", date_str, type(exc).__name__)
+                if session_over:
+                    break
+                reconnects += 1
+                if reconnects > PAPER_EXIT_MAX_RECONNECTS:
+                    stream_exhausted = True
+                    break
+                logger.warning("[EXEC] stage=paper_exit status=RECONNECT date=%s attempt=%d unfilled=%d", date_str, reconnects, len(orders) - len(filled_ids))
+                await sleep_fn(PAPER_EXIT_RECONNECT_BACKOFF_SECONDS)
     except TimeoutError:
         logger.warning(
             "[DATA] stage=paper_exit status=DEADLINE date=%s unfilled=%d", date_str, len(orders) - len(filled_ids)
@@ -267,6 +295,9 @@ async def run_paper_session(
         kind="orders",
     )
     refresh_trade_ledgers(ledger, settings.PAPER_SEED_CAPITAL, date_str)
+    if stream_exhausted:
+        logger.error("[EXEC] stage=paper_exit status=STREAM_EXHAUSTED date=%s unfilled=%d", date_str, len(orders) - len(filled_ids))
+        raise PaperExitStreamError(f"exit stream dropped {reconnects} times before session end on {date_str}")
     return len(fills)
 
 

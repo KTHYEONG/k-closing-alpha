@@ -133,71 +133,6 @@ def test_paper_ledger_record_no_decision_is_explicit(tmp_path) -> None:
     assert df.iloc[0]["reason"] == "admitted_below_top_k"
 
 
-def test_load_open_positions_excludes_closed_and_returns_schema(tmp_path) -> None:
-    from src.execution.paper_broker import PaperLedger
-
-    # Given: 원장 파일이 아직 없다
-    ledger = PaperLedger(root=tmp_path)
-    empty = ledger.load_open_positions()
-
-    # Then: 스키마는 고정이고 비어 있다
-    assert list(empty.columns) == ["symbol", "qty", "entry_price", "decision_date"]
-    assert len(empty) == 0
-
-    # When: 두 종목 매수 후 한 종목만 매도 체결
-    ledger.record(
-        [
-            {"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10,
-             "fill_price": 70_000, "decision_date": "2026-09-10"},
-            {"order_id": "b2", "symbol": "000660", "side": "buy", "qty": 5,
-             "fill_price": 200_000, "decision_date": "2026-09-10"},
-            {"order_id": "s1", "symbol": "000660", "side": "sell", "qty": 5,
-             "fill_price": 210_000, "decision_date": "2026-09-10"},
-        ],
-        kind="fills",
-    )
-    open_pos = ledger.load_open_positions()
-
-    # Then: 청산된 종목은 빠지고 미청산만 남는다
-    assert list(open_pos["symbol"]) == ["005930"]
-    assert int(open_pos.iloc[0]["qty"]) == 10
-    assert int(open_pos.iloc[0]["entry_price"]) == 70_000
-
-
-def test_load_open_positions_survives_symbol_reentry_after_close(tmp_path) -> None:
-    from src.execution.paper_broker import PaperLedger
-
-    ledger = PaperLedger(root=tmp_path)
-
-    # Given: 진입 후 익일 청산 완료
-    ledger.record(
-        [{"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10,
-          "fill_price": 70_000, "decision_date": "2026-09-01"}],
-        kind="fills",
-    )
-    ledger.record(
-        [{"order_id": "s1", "symbol": "005930", "side": "sell", "qty": 10,
-          "fill_price": 73_500, "decision_date": "2026-09-02"}],
-        kind="fills",
-    )
-    assert len(ledger.load_open_positions()) == 0
-
-    # When: 같은 종목을 나중에 재진입한다(측정된 종목 중복률이 높아 흔한 경로)
-    ledger.record(
-        [{"order_id": "b2", "symbol": "005930", "side": "buy", "qty": 8,
-          "fill_price": 71_000, "decision_date": "2026-09-08"}],
-        kind="fills",
-    )
-    open_pos = ledger.load_open_positions()
-
-    # Then: 과거 청산 이력에 가려 사라지지 않고 신규 포지션이 남는다
-    assert len(open_pos) == 1
-    assert open_pos.iloc[0]["symbol"] == "005930"
-    assert int(open_pos.iloc[0]["qty"]) == 8
-    assert int(open_pos.iloc[0]["entry_price"]) == 71_000
-    assert open_pos.iloc[0]["decision_date"] == "2026-09-08"
-
-
 def test_build_auction_fill_confirms_only_when_close_confirmed() -> None:
     import pandas as pd
 
@@ -303,53 +238,75 @@ def test_order_record_carries_terminal_status_and_rejects_unknown() -> None:
         order_record(order, "PARTIAL")
 
 
-def test_build_round_trips_pairs_fifo_and_applies_explicit_costs() -> None:
+def test_order_record_carries_entry_order_id_link() -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import ORDER_STATUS_UNFILLED, PaperOrder, order_record
+
+    placed = pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul")
+    # Given: 청산 주문은 원 진입 주문을 참조하고 진입 주문은 참조가 없다
+    exit_order = PaperOrder(
+        order_id="2026-09-10:005930:entry:exit:2026-09-11", decision_date="2026-09-11", symbol="005930",
+        side="sell", qty=10, limit_price=73_500, placed_at=placed, reason="take_profit",
+        entry_order_id="2026-09-10:005930:entry",
+    )
+    entry_order = PaperOrder(
+        order_id="2026-09-11:005930:entry", decision_date="2026-09-11", symbol="005930",
+        side="buy", qty=10, limit_price=None, placed_at=placed, reason="entry",
+    )
+
+    # When
+    exit_row = order_record(exit_order, ORDER_STATUS_UNFILLED)
+    entry_row = order_record(entry_order, ORDER_STATUS_UNFILLED)
+
+    # Then
+    assert exit_row["entry_order_id"] == "2026-09-10:005930:entry"
+    assert entry_row["entry_order_id"] is None
+    assert entry_order.entry_order_id is None
+
+
+def test_build_round_trips_pairs_by_entry_link_and_applies_explicit_costs() -> None:
     import pandas as pd
     import pytest
 
     from src.execution.paper_broker import ROUND_TRIP_COLUMNS, build_round_trips
 
     kst = "Asia/Seoul"
-    # Given: 동일 종목 진입-청산이 두 번 반복된 원장(기록순)
+    # Given: 같은 종목 두 로트가 동시에 열려 있고, 매도는 기록순이 진입순과 반대다(FIFO였다면 오페어링)
     fills = pd.DataFrame([
         {"order_id": "2026-09-10:005930:entry", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
-         "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst), "decision_date": "2026-09-10", "trigger": "auction_close"},
-        {"order_id": "2026-09-11:005930:exit", "symbol": "005930", "side": "sell", "qty": 10, "fill_price": 73_600,
-         "filled_at": pd.Timestamp("2026-09-11 09:31:00", tz=kst), "decision_date": "2026-09-11", "trigger": "limit"},
-        {"order_id": "2026-09-11:005930:entry", "symbol": "005930", "side": "buy", "qty": 5, "fill_price": 72_000,
-         "filled_at": pd.Timestamp("2026-09-11 15:30:20", tz=kst), "decision_date": "2026-09-11", "trigger": "auction_close"},
-        {"order_id": "2026-09-14:005930:exit", "symbol": "005930", "side": "sell", "qty": 5, "fill_price": 71_000,
-         "filled_at": pd.Timestamp("2026-09-14 15:19:05", tz=kst), "decision_date": "2026-09-14", "trigger": "market"},
+         "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst), "decision_date": "2026-09-10", "trigger": "auction_close",
+         "entry_order_id": None},
+        {"order_id": "2026-09-11:005930:entry", "symbol": "005930", "side": "buy", "qty": 12, "fill_price": 71_000,
+         "filled_at": pd.Timestamp("2026-09-11 15:30:20", tz=kst), "decision_date": "2026-09-11", "trigger": "auction_close",
+         "entry_order_id": None},
+        {"order_id": "2026-09-11:005930:entry:exit:2026-09-12", "symbol": "005930", "side": "sell", "qty": 12, "fill_price": 74_600,
+         "filled_at": pd.Timestamp("2026-09-12 10:00:00", tz=kst), "decision_date": "2026-09-12", "trigger": "limit",
+         "entry_order_id": "2026-09-11:005930:entry"},
+        {"order_id": "2026-09-10:005930:entry:exit:2026-09-11", "symbol": "005930", "side": "sell", "qty": 10, "fill_price": 73_600,
+         "filled_at": pd.Timestamp("2026-09-12 10:05:00", tz=kst), "decision_date": "2026-09-12", "trigger": "limit",
+         "entry_order_id": "2026-09-10:005930:entry"},
     ])
 
     # When
     trips = build_round_trips(fills)
 
-    # Then: FIFO 페어링
+    # Then: 매도 기록순으로 행이 나오고 각 매도는 자신이 참조한 로트와 짝지어진다
     assert list(trips.columns) == list(ROUND_TRIP_COLUMNS)
-    assert trips["entry_order_id"].tolist() == ["2026-09-10:005930:entry", "2026-09-11:005930:entry"]
-    assert trips["exit_order_id"].tolist() == ["2026-09-11:005930:exit", "2026-09-14:005930:exit"]
-
-    # And: 수수료 편도 0.36396bp 원미만 절사, 2026 매도세 20bp
-    first = trips.iloc[0]
-    assert first["decision_date"] == "2026-09-10"
-    assert int(first["qty"]) == 10
-    assert int(first["entry_price"]) == 70_000 and int(first["exit_price"]) == 73_600
-    assert first["exit_trigger"] == "limit"
-    assert int(first["gross_pnl"]) == 36_000
-    assert int(first["buy_fee"]) == 25
-    assert int(first["sell_fee"]) == 26
-    assert int(first["sell_tax"]) == 1_472
-    assert int(first["cost"]) == 1_523
-    assert int(first["net_pnl"]) == 34_477
-    assert first["gross_ret"] == pytest.approx(73_600 / 70_000 - 1.0)
-    assert first["net_ret"] == pytest.approx(34_477 / 700_000)
-
-    second = trips.iloc[1]
-    assert int(second["buy_fee"]) == 13
-    assert int(second["sell_fee"]) == 12
-    assert int(second["sell_tax"]) == 710
-    assert int(second["net_pnl"]) == -5_000 - 735
+    assert trips["entry_order_id"].tolist() == ["2026-09-11:005930:entry", "2026-09-10:005930:entry"]
+    assert trips["qty"].astype(int).tolist() == [12, 10]
+    second_lot, first_lot = trips.iloc[0], trips.iloc[1]
+    assert int(second_lot["buy_fee"]) == 31
+    assert int(second_lot["sell_fee"]) == 32
+    assert int(second_lot["sell_tax"]) == 1_790
+    assert int(second_lot["cost"]) == 1_853
+    assert int(second_lot["gross_pnl"]) == 43_200
+    assert int(second_lot["net_pnl"]) == 41_347
+    assert second_lot["decision_date"] == "2026-09-11"
+    assert int(first_lot["cost"]) == 1_523
+    assert int(first_lot["net_pnl"]) == 34_477
+    assert first_lot["gross_ret"] == pytest.approx(73_600 / 70_000 - 1.0)
+    assert first_lot["net_ret"] == pytest.approx(34_477 / 700_000)
 
 
 def test_build_round_trips_fails_closed_on_inconsistent_ledger() -> None:
@@ -360,16 +317,27 @@ def test_build_round_trips_fails_closed_on_inconsistent_ledger() -> None:
 
     kst = "Asia/Seoul"
     buy = {"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
-           "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst), "decision_date": "2026-09-10", "trigger": "auction_close"}
+           "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst), "decision_date": "2026-09-10",
+           "trigger": "auction_close", "entry_order_id": None}
     sell = {"order_id": "s1", "symbol": "005930", "side": "sell", "qty": 10, "fill_price": 73_600,
-            "filled_at": pd.Timestamp("2026-09-11 09:31:00", tz=kst), "decision_date": "2026-09-11", "trigger": "limit"}
+            "filled_at": pd.Timestamp("2026-09-11 09:31:00", tz=kst), "decision_date": "2026-09-11",
+            "trigger": "limit", "entry_order_id": "b1"}
 
-    # Then: 매수 없는 매도
-    with pytest.raises(ValueError, match="without an open buy"):
-        build_round_trips(pd.DataFrame([sell]))
+    # Then: 진입 참조 없는 매도
+    with pytest.raises(ValueError, match="entry_order_id"):
+        build_round_trips(pd.DataFrame([buy, {**sell, "entry_order_id": None}]))
+    # Then: 존재하지 않는 진입 참조
+    with pytest.raises(ValueError, match="unknown or closed entry"):
+        build_round_trips(pd.DataFrame([buy, {**sell, "entry_order_id": "b9"}]))
+    # Then: 같은 진입을 두 번 청산
+    with pytest.raises(ValueError, match="unknown or closed entry"):
+        build_round_trips(pd.DataFrame([buy, sell, {**sell, "order_id": "s2"}]))
     # Then: 수량 불일치(부분청산 미지원)
     with pytest.raises(ValueError, match="qty"):
         build_round_trips(pd.DataFrame([buy, {**sell, "qty": 4}]))
+    # Then: 종목 불일치
+    with pytest.raises(ValueError, match="symbol"):
+        build_round_trips(pd.DataFrame([buy, {**sell, "symbol": "000660"}]))
     # Then: 청산 체결시각 없음(세율 기준일 불명)
     with pytest.raises(ValueError, match="filled_at"):
         build_round_trips(pd.DataFrame([buy, {**sell, "filled_at": pd.NaT}]))
@@ -391,11 +359,14 @@ def test_build_nav_snapshot_reconciles_accounting_identity() -> None:
     # Given: 청산 완료 1건 + 미청산 1건
     fills = pd.DataFrame([
         {"order_id": "2026-09-10:005930:entry", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
-         "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst), "decision_date": "2026-09-10", "trigger": "auction_close"},
-        {"order_id": "2026-09-11:005930:exit", "symbol": "005930", "side": "sell", "qty": 10, "fill_price": 73_600,
-         "filled_at": pd.Timestamp("2026-09-11 09:31:00", tz=kst), "decision_date": "2026-09-11", "trigger": "limit"},
+         "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst), "decision_date": "2026-09-10", "trigger": "auction_close",
+         "entry_order_id": None},
+        {"order_id": "2026-09-10:005930:entry:exit:2026-09-11", "symbol": "005930", "side": "sell", "qty": 10, "fill_price": 73_600,
+         "filled_at": pd.Timestamp("2026-09-11 09:31:00", tz=kst), "decision_date": "2026-09-11", "trigger": "limit",
+         "entry_order_id": "2026-09-10:005930:entry"},
         {"order_id": "2026-09-11:000660:entry", "symbol": "000660", "side": "buy", "qty": 5, "fill_price": 100_000,
-         "filled_at": pd.Timestamp("2026-09-11 15:30:20", tz=kst), "decision_date": "2026-09-11", "trigger": "auction_close"},
+         "filled_at": pd.Timestamp("2026-09-11 15:30:20", tz=kst), "decision_date": "2026-09-11", "trigger": "auction_close",
+         "entry_order_id": None},
     ])
 
     # When
@@ -434,9 +405,11 @@ def test_refresh_trade_ledgers_writes_trades_and_nav_idempotently(tmp_path) -> N
 
     kst = "Asia/Seoul"
     buy = {"order_id": "2026-09-10:005930:entry", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
-           "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst), "decision_date": "2026-09-10", "trigger": "auction_close"}
-    sell = {"order_id": "2026-09-11:005930:exit", "symbol": "005930", "side": "sell", "qty": 10, "fill_price": 73_600,
-            "filled_at": pd.Timestamp("2026-09-11 09:31:00", tz=kst), "decision_date": "2026-09-11", "trigger": "limit"}
+           "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst), "decision_date": "2026-09-10", "trigger": "auction_close",
+           "entry_order_id": None}
+    sell = {"order_id": "2026-09-10:005930:entry:exit:2026-09-11", "symbol": "005930", "side": "sell", "qty": 10,
+            "fill_price": 73_600, "filled_at": pd.Timestamp("2026-09-11 09:31:00", tz=kst), "decision_date": "2026-09-11",
+            "trigger": "limit", "entry_order_id": "2026-09-10:005930:entry"}
     ledger = PaperLedger(root=tmp_path)
 
     # Given: 원장 파일이 없으면 load는 빈 프레임, 미정의 kind는 거부
@@ -457,7 +430,7 @@ def test_refresh_trade_ledgers_writes_trades_and_nav_idempotently(tmp_path) -> N
     nav = pd.read_parquet(tmp_path / "nav.parquet")
     assert len(nav) == 1
     assert int(nav.iloc[0]["nav"]) == 10_034_477
-    assert ledger.load("trades")["exit_order_id"].tolist() == ["2026-09-11:005930:exit"]
+    assert ledger.load("trades")["exit_order_id"].tolist() == ["2026-09-10:005930:entry:exit:2026-09-11"]
 
     # And: 미청산만 있으면 trades 파일은 만들지 않고 NAV만 기록
     solo_root = tmp_path / "solo"
@@ -469,3 +442,101 @@ def test_refresh_trade_ledgers_writes_trades_and_nav_idempotently(tmp_path) -> N
     solo_nav = pd.read_parquet(solo_root / "nav.parquet")
     assert int(solo_nav.iloc[0]["n_open_positions"]) == 1
     assert int(solo_nav.iloc[0]["cash"]) == 10_000_000 - 700_025
+
+
+def test_load_open_positions_excludes_closed_and_returns_schema(tmp_path) -> None:
+    import pytest
+
+    from src.execution.paper_broker import PaperLedger
+
+    # Given: 원장 파일이 아직 없다
+    ledger = PaperLedger(root=tmp_path)
+    empty = ledger.load_open_positions()
+
+    # Then: 스키마는 고정이고 비어 있다
+    assert list(empty.columns) == ["entry_order_id", "symbol", "qty", "entry_price", "decision_date"]
+    assert len(empty) == 0
+
+    # When: 두 종목 매수 후 한 종목만 진입 참조 매도 체결
+    ledger.record(
+        [
+            {"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10,
+             "fill_price": 70_000, "decision_date": "2026-09-10", "entry_order_id": None},
+            {"order_id": "b2", "symbol": "000660", "side": "buy", "qty": 5,
+             "fill_price": 200_000, "decision_date": "2026-09-10", "entry_order_id": None},
+            {"order_id": "s1", "symbol": "000660", "side": "sell", "qty": 5,
+             "fill_price": 210_000, "decision_date": "2026-09-11", "entry_order_id": "b2"},
+        ],
+        kind="fills",
+    )
+    open_pos = ledger.load_open_positions()
+
+    # Then: 청산된 로트는 빠지고 미청산만 남는다
+    assert list(open_pos["symbol"]) == ["005930"]
+    assert open_pos.iloc[0]["entry_order_id"] == "b1"
+    assert int(open_pos.iloc[0]["qty"]) == 10
+    assert int(open_pos.iloc[0]["entry_price"]) == 70_000
+
+    # And: 진입 참조 없는 매도가 섞인 원장은 거부(POSITION-LINK)
+    broken = PaperLedger(root=tmp_path / "broken")
+    (tmp_path / "broken").mkdir()
+    broken.record(
+        [
+            {"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
+             "decision_date": "2026-09-10", "entry_order_id": None},
+            {"order_id": "s1", "symbol": "005930", "side": "sell", "qty": 10, "fill_price": 73_500,
+             "decision_date": "2026-09-11", "entry_order_id": None},
+        ],
+        kind="fills",
+    )
+    with pytest.raises(ValueError, match="entry_order_id"):
+        broken.load_open_positions()
+
+
+def test_load_open_positions_survives_symbol_reentry_after_close(tmp_path) -> None:
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+
+    # Given: 진입 후 익일 청산 완료
+    ledger.record(
+        [{"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10,
+          "fill_price": 70_000, "decision_date": "2026-09-01", "entry_order_id": None}],
+        kind="fills",
+    )
+    ledger.record(
+        [{"order_id": "s1", "symbol": "005930", "side": "sell", "qty": 10,
+          "fill_price": 73_500, "decision_date": "2026-09-02", "entry_order_id": "b1"}],
+        kind="fills",
+    )
+    assert len(ledger.load_open_positions()) == 0
+
+    # When: 같은 종목을 두 번 연속 재진입해 두 로트가 동시에 열린다
+    ledger.record(
+        [{"order_id": "b2", "symbol": "005930", "side": "buy", "qty": 8,
+          "fill_price": 71_000, "decision_date": "2026-09-08", "entry_order_id": None},
+         {"order_id": "b3", "symbol": "005930", "side": "buy", "qty": 6,
+          "fill_price": 72_000, "decision_date": "2026-09-09", "entry_order_id": None}],
+        kind="fills",
+    )
+    open_pos = ledger.load_open_positions()
+
+    # Then: 과거 청산 이력에 가려지지 않고 두 로트가 각각 남는다
+    assert open_pos["entry_order_id"].tolist() == ["b2", "b3"]
+    assert open_pos["qty"].astype(int).tolist() == [8, 6]
+    assert open_pos["entry_price"].astype(int).tolist() == [71_000, 72_000]
+    assert open_pos["decision_date"].tolist() == ["2026-09-08", "2026-09-09"]
+
+
+def test_investable_capital_reserves_buy_fee_and_caps_at_seed() -> None:
+    from src.execution.paper_broker import investable_capital
+
+    # Then: 시드 전액 현금이면 편도 수수료분을 남기고 시드 이하로 캡
+    assert investable_capital(10_000_000, 10_000_000) == 9_999_636
+    # Then: 누적 수익으로 현금이 시드를 넘어도 사이징은 시드 기준
+    assert investable_capital(12_000_000, 10_000_000) == 10_000_000
+    # Then: 미청산 포지션으로 줄어든 현금 기준
+    assert investable_capital(999_673, 10_000_000) == 999_636
+    # Then: 음수/0 현금은 신규 진입 불가
+    assert investable_capital(-5, 10_000_000) == 0
+    assert investable_capital(0, 10_000_000) == 0

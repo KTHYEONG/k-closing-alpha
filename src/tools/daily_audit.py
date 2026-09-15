@@ -23,6 +23,7 @@ from src.daily.archive import fetch_archive_snapshot
 from src.daily.archive_intraday import resolve_previous_archive_date
 from src.data.intraday_store import intraday_partition_path
 from src.data.trading_calendar import is_kis_trading_day
+from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import dispatch_digest
 from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes
@@ -39,6 +40,7 @@ AUDIT_STEPS: tuple[str, ...] = (
     "close_confirmed",
     "decision",
     "paper_entry",
+    "paper_exit",
     "minute_bars",
     "price_history_fresh",
 )
@@ -81,7 +83,7 @@ def _price_history_fresh(snapshot_date: str) -> bool:
 def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
     """해당 일자의 단계별 산출물 존재 여부를 AUDIT_STEPS 키 bool 딕셔너리로 반환한다.
 
-    존재 판정은 파일/행 존재만으로 하며 값 검증은 하지 않는다. 결정은 영속된 top-k 결정 또는 predict 실행결과 OK(정상 무결정 포함)일 때만 수행으로 인정하고, 페이퍼 무결정 기록은 페이퍼 진입 단계에만 인정한다.
+    존재 판정은 파일/행 존재만으로 하며 값 검증은 하지 않는다. 결정은 영속된 top-k 결정 또는 predict 실행결과 OK(정상 무결정 포함)일 때만 수행으로 인정하고, 페이퍼 무결정 기록은 페이퍼 진입 단계에만 인정한다. paper_exit는 당일 이전 결정의 미청산 로트가 없을 때 True이다.
 
     Args:
         snapshot_date: 점검 대상일(YYYY-MM-DD, KST).
@@ -100,11 +102,20 @@ def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
     no_decision_dates = _column_dates(Path(settings.PAPER_DIR) / "decisions.parquet", "decision_date")
     entry_dates = _entry_fill_dates(Path(settings.PAPER_DIR) / "fills.parquet")
     outcomes = load_run_outcomes(snapshot_date)
+    try:
+        open_positions = PaperLedger(root=Path(settings.PAPER_DIR)).load_open_positions()
+        # 감사(20:15)는 당일 09:00 청산 이후이므로 당일 이전 결정 로트가 남아 있으면 청산 누락이다
+        stale_exit = bool((open_positions["decision_date"].astype(str) < snapshot_date).any())
+    except (KeyError, ValueError) as exc:
+        # 스키마가 깨졌거나 로트 링크를 위반한 원장은 청산 상태를 보증할 수 없으므로 누락으로 보고한다
+        logger.warning("[DATA] stage=daily_audit step=paper_exit status=LEDGER_INVALID reason=%s: %s", type(exc).__name__, exc)
+        stale_exit = True
     return {
         "archive": bool(archive_ok),
         "close_confirmed": bool(close_confirmed_ok),
         "decision": snapshot_date in topk_dates or outcomes.get("predict") == RUN_OUTCOME_OK,
         "paper_entry": snapshot_date in entry_dates or snapshot_date in no_decision_dates,
+        "paper_exit": not stale_exit,
         "minute_bars": bool(intraday_partition_path(1, snapshot_date, "regular").exists()),
         "price_history_fresh": _price_history_fresh(snapshot_date),
     }
