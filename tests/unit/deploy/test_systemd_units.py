@@ -313,3 +313,46 @@ def test_paper_exit_service_timeout_covers_quote_retry_budget_only() -> None:
 
     assert "TimeoutStartSec=15min" in lines
     assert not any(line.startswith("TimeoutStartSec=") and line.endswith("h") for line in lines)
+
+
+def test_paper_entry_backstop_timer_fires_after_finalize_deadline_and_catches_up() -> None:
+    import pathlib
+    import re
+
+    from src.config.market_session import CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-paper-entry.timer").read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    # Then: 종가확정 데드라인 이후에만 발화(미확정 종가를 진입가로 오인 방지)
+    assert "OnCalendar=Mon..Fri 15:34:00 Asia/Seoul" in lines
+    match = re.search(r"OnCalendar=Mon\.\.Fri (\d{2}):(\d{2}):(\d{2}) Asia/Seoul", text)
+    assert match is not None
+    fire_hhmmss = "".join(match.groups())
+    assert fire_hhmmss > CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS
+    assert "AccuracySec=1s" in lines
+    assert "Persistent=true" in lines
+    assert "Unit=kca-paper-entry.service" in lines
+    assert "WantedBy=timers.target" in lines
+
+
+def test_install_script_enables_paper_entry_backstop_alongside_finalize_close() -> None:
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+    install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
+
+    # Then: ExecStopPost 체이닝이 조용히 끊겨도 독립 타이머가 진입 시도를 보증한다
+    assert "kca-paper-entry.timer" in install_text
+    assert "kca-finalize-close.timer" in install_text
+
+
+def test_finalize_close_still_hands_off_to_paper_entry_via_execstoppost() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    lines = (root / "kca-finalize-close.service").read_text(encoding="utf-8").splitlines()
+
+    # Then: 빠른 경로(ExecStopPost)는 그대로 유지 — 독립 타이머는 보증 경로일 뿐 대체가 아니다
+    assert "ExecStopPost=/usr/bin/systemctl --user start --no-block kca-paper-entry.service" in lines
