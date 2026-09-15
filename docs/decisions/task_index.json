@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_PAPER_CHAIN_HARDENING",
+      "date": "2026-09-15",
+      "adr_id": "ADR_20260915_PAPER_CHAIN_HARDENING",
+      "domain": "execution",
+      "title": "청산 로트 링크·재연결·현금기준 사이징으로 페이퍼체인 강화",
+      "why": "동일종목 복수로트 청산시 order_id 충돌로 원장 영구오염, WS 조기종료 무경보 미체결, 청산누락 무감시, 시드고정 사이징으로 현금음수 가능(2026-09-15 probe)",
+      "resolution": "청산 order_id를 진입로트에 1:1 링크, WS 순단 5회 재연결 후 초과시 예외로 알림, daily_audit에 stale 미청산 로트 감시 추가, 가용현금 기준 진입 사이징 도입, paper-exit 타이머 캐치업 활성화",
+      "impact": "동일종목 재진입·WS 순단·청산누락 상황에서도 체인이 조용히 멈추거나 원장이 오염되지 않고 계속 기록·경보됨"
+    },
+    {
       "task_id": "TASK_SHADOW_PAPER_TRADING",
       "date": "2026-09-15",
       "adr_id": "ADR_20260915_SHADOW_PAPER_TRADING",
@@ -989,16 +999,6 @@
       "why": "희소 패널(중앙값 12후보/일)에서 기존 평균비교 승격 게이트가 검증된 +16-18% 개선을 노이즈로 판정(p=0.82). alpha는 안정적(연도별 rankIC ~0.18)이며 병목은 평가 파워.",
       "resolution": "src/ml/robust_eval.py 신규(CombinatorialPurgedCV/cpcv_oof_predict/path_top1_returns/moving_block_bootstrap_delta/deflated_sharpe_ratio). champion.py evaluate_promotion 유의성 게이트(delta>0 & p<promotion_alpha). tuning.py eval_mode(walkforward|cpcv, _objective OOF 라우팅 스위치)/cpcv_n_groups/cpcv_k_test/promotion_alpha/hpo_reg_bias + cpcv_top1 목적함수(경로분산 페널티). retrain.py --eval-mode/--hpo-objective/--promotion-alpha. 실데이터 검증: A(rank_ic) p=0.358, B(cpcv_top1) p=0.665 둘 다 승격 거부 - 현 61피처로 튜닝만으론 방어 가능한 개선 없음.",
       "impact": "승격 게이트가 bootstrap 유의성 기준(p<0.10)으로 전환, 노이즈 승격 차단. 기본 경로 하위호환(walkforward/rank_ic). CPCV(8,2)=28fold/7path 평가 인프라 확보. cpcv_oof_predict attrs concat 버그 + eval_mode ghost-switch 수정."
-    },
-    {
-      "task_id": "TASK_ML_SECTOR_AND_FEATURE_SELECTION",
-      "date": "2026-09-03",
-      "adr_id": "ADR_20260903_ML_SECTOR_AND_FEATURE_SELECTION",
-      "domain": "ml",
-      "title": "근거기반 섹터 재정의 + nested 안정성필터 피처선택 + HPO 목적함수 rank_ic 전환",
-      "why": "44개 주관 테마 분류의 후보패널-내 섹터평균이 39.1% 행에서 정확히 0(자기비교)이고 단독 rankIC -0.0071, 순열중요도 49위로 퇴화. theme.parquet 정적 스냅샷의 미래 라벨 누수. 77피처 중 21개가 순열 rankIC 기여 <=0. SHAP 은 일내 상수 피처(v_kospi)를 6위로 과대평가. HPO 목적 top1_return 은 하루 1관측 고분산.",
-      "resolution": "src/ml/sector_features.py: 연1회 재적합 상관 KMeans point-in-time 클러스터(무누수: Y라벨은 Y-01-01 이전만) + 전체시장 멤버십 기준 sector_mkt_ret/breadth/mom_5d(mom_5d 는 shift(1) 엄격 트레일링). src/ml/feature_selection.py: 일자그룹내 순열 rankIC 하락 중요도 + fold내부(train만) nested 선택 + min_folds 안정성필터. dataset.py feature_set='close_morning_sector' 가산(퇴화 sector_relative_change 제거). tuning.py hpo_objective 기본값 rank_ic + feature_selection_top_n/min_folds config. champion/retrain 배선. min_obs 150->120·lookback 500->550(정상국면 커버리지). pytest-timeout dev 의존성 등록.",
-      "impact": "close_morning_sector coverage 39.1%결손→정상국면 87.5~94.7%. train_tuned_champion_bundle 실행: 피처선택 81→25(섹터 5종 전부 nested 탈락, history 6종 생존), HPO best inner rankIC 0.238, dev 게이트 PASS(+4.6bp). 미사용 OOS(2025-07~2026-08, 123일): 챔피언 top1 +0.496%/Sharpe2.15/MDD23.3% vs tuned-61 +0.243%/1.11/30.3% — 방향 긍정이나 p=0.36 무의미, 라이브러리기본 baseline(+0.606%)에 미달. 운영 승격 불가, OOS 확대 필요."
     }
   ]
 }
