@@ -377,5 +377,6 @@
   },
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
-  }
+  },
+  "deploy/systemd/kca-paper-entry.timer": {}
 }
