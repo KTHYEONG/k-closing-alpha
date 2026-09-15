@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 import aiohttp
 
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ async def fetch_index_and_calculate_volatility(index_code="1028", session=None):
     import numpy as np
     import pandas as pd
     
-    client = KisApiClient()
+    client = KisApiClient(**kis_data_client_kwargs())
     
     # 최근 30일 데이터 (영업일 기준 약 21일)
     end_date = datetime.now().strftime("%Y%m%d")
@@ -104,7 +104,7 @@ async def calculate_stock_sma(stock_code, sma_period=120, lookback_days=200, ses
     """
     import pandas as pd
     
-    client = KisApiClient()
+    client = KisApiClient(**kis_data_client_kwargs())
     all_records = []
     
     local_session = False
@@ -194,7 +194,7 @@ async def calculate_stock_ema(stock_code, ema_period=20, lookback_days=60, sessi
     """특정 종목의 EMA (지수이동평균)를 계산합니다."""
     import pandas as pd
     
-    client = KisApiClient()
+    client = KisApiClient(**kis_data_client_kwargs())
     
     local_session = False
     if session is None:
@@ -277,7 +277,7 @@ async def calculate_multiple_emas(stock_code, periods=[5, 10, 20], lookback_days
     """
     import pandas as pd
     
-    client = KisApiClient()
+    client = KisApiClient(**kis_data_client_kwargs())
     results = {}
     
     local_session = False
@@ -429,7 +429,7 @@ async def calculate_all_moving_averages(
     try:
         if prefetched_records is None:
             if client is None:
-                client = KisApiClient()
+                client = KisApiClient(**kis_data_client_kwargs())
                 await client.ensure_token(session)
 
             # SMA 120까지 계산하기 위해 충분한 데이터 확보

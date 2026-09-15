@@ -7,5 +7,6 @@ OnFailure=kca-alert@%n.service
 Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
 Environment=TZ=Asia/Seoul
+Environment=KIS_DATA_ROLE=decision
 ExecStart=%h/.local/bin/uv run python -m src.daily.finalize_close
 ExecStopPost=/usr/bin/systemctl --user start --no-block kca-paper-entry.service

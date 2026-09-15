@@ -3,17 +3,38 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from collections.abc import AsyncIterator, Mapping
+from datetime import datetime, time, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
 from src import settings
-from src.api.kis.rate_limit import get_shared_rate_limiter
+from src.api.kis.key_pool import (
+    kis_key_id,
+    load_kis_env,
+    resolve_host_data_credentials,
+    select_data_credential,
+    token_cache_path,
+)
+from src.api.kis.rate_limit import get_host_rate_limiter
 
 logger = logging.getLogger(__name__)
+
+KIS_REST_TPS_PER_APP_KEY: float = 18.0  # KIS 서버 앱키당 초당 20건 한도의 여유분
+KIS_DECISION_WINDOW_START = time(15, 15)
+KIS_DECISION_WINDOW_END = time(15, 35)
+_KST = ZoneInfo("Asia/Seoul")
+
+
+def _now_kst() -> datetime:
+    return datetime.now(_KST)
 
 # 토큰 발급 단발 POST의 일시 전송 오류가 모든 KIS 잡을 중단시키지 않도록 전송 오류만 재시도한다(업무 오류 재시도는 EGW00133 1분 1회 발급 제한을 두드림).
 KIS_TOKEN_ISSUE_ATTEMPTS: int = 3
@@ -52,10 +73,10 @@ class KisApiClient:
         self.hts_id = hts_id or settings.KIS_API_CONFIG.get("hts_id")
         self.base_url = base_url or settings.KIS_BASE_URL
         self.token = None
-        self.token_file = str(token_file or settings.TOKEN_FILE)
+        self.token_file = str(token_file) if token_file else str(token_cache_path(self.app_key or "", settings.KIS_TOKEN_CACHE_DIR))
         self._market_div_cache = {}
         self._token_lock: asyncio.Lock | None = None
-        self.rate_limiter = get_shared_rate_limiter("kis", self.app_key, 18.0)
+        self.rate_limiter = get_host_rate_limiter(settings.KIS_TOKEN_CACHE_DIR / f"tps_{kis_key_id(self.app_key or '')}.state", KIS_REST_TPS_PER_APP_KEY)
 
     def create_session(self, *, timeout: aiohttp.ClientTimeout | None = None) -> aiohttp.ClientSession:
         """최적화된 커넥터와 bounded request timeout을 가진 세션을 생성합니다."""
@@ -143,7 +164,21 @@ class KisApiClient:
         self._market_div_cache[code] = "J"
         return "J"
 
-    def _write_token_file(self, access_token: str, expired_at: str) -> None:
+    @contextlib.asynccontextmanager
+    async def _host_token_lock(self) -> AsyncIterator[None]:
+        lock_path = self.token_file + ".lock"
+        os.makedirs(os.path.dirname(os.path.abspath(self.token_file)), exist_ok=True)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _write_token_file(self, access_token: str, expired_at: str, issued_at: str = "") -> None:
         """토큰 캐시를 동일 디렉터리 임시 파일 + os.replace 원자적 교체로 기록한다 (0600)."""
         import tempfile
 
@@ -156,12 +191,28 @@ class KisApiClient:
                     "access_token": access_token,
                     "expired_at": expired_at,
                     "app_key": self.app_key,
+                    "issued_at": issued_at,
                 },
                 f,
             )
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, self.token_file)
         os.chmod(self.token_file, 0o600)
+
+    def _read_cache_payload(self) -> dict | None:
+        if not os.path.exists(self.token_file):
+            return None
+        try:
+            with open(self.token_file, encoding="utf-8") as f:
+                saved_data = json.load(f)
+            if not isinstance(saved_data, dict):
+                return None
+            if saved_data.get("app_key") != self.app_key:
+                return None
+            return saved_data
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning("[SYS] stage=kis_token_cache status=UNREADABLE reason=%s", type(exc).__name__)
+            return None
 
     def _read_cached_token(self, *, min_remaining_minutes: int = 10) -> str | None:
         """디스크 캐시에서 아직 유효한 토큰을 읽는다. 없거나 만료 임박이면 None.
@@ -170,13 +221,10 @@ class KisApiClient:
         쓰기가 남긴 절단 파일, 스키마 누락, 권한 오류)는 None으로 낮춰 재발급
         경로로 흘린다. 여기서 예외를 올리면 결정창 인증이 통째로 죽는다.
         """
-        if not os.path.exists(self.token_file):
+        saved_data = self._read_cache_payload()
+        if saved_data is None:
             return None
         try:
-            with open(self.token_file, encoding="utf-8") as f:
-                saved_data = json.load(f)
-            if saved_data.get("app_key") != self.app_key:
-                return None
             expired_at = datetime.strptime(saved_data["expired_at"], "%Y-%m-%d %H:%M:%S")
             access_token = str(saved_data["access_token"])
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
@@ -185,6 +233,63 @@ class KisApiClient:
         if datetime.now() < expired_at - timedelta(minutes=min_remaining_minutes):
             return access_token
         return None
+
+    async def _issue_token(self, session: aiohttp.ClientSession) -> bool:
+        """토큰을 발급한다. 호출자는 호스트 파일 락을 보유해야 한다."""
+        url = f"{self.base_url}/oauth2/tokenP"
+        headers = {"content-type": "application/json"}
+        body = {
+            "grant_type": "client_credentials",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+        }
+
+        data: dict = {}
+        for attempt in range(1, KIS_TOKEN_ISSUE_ATTEMPTS + 1):
+            try:
+                async with session.post(url, headers=headers, json=body) as resp:
+                    data = await resp.json()
+                break
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                if attempt == KIS_TOKEN_ISSUE_ATTEMPTS:
+                    raise
+                logger.warning("[SYS] stage=kis_token status=RETRY attempt=%d max_attempts=%d reason=%s", attempt, KIS_TOKEN_ISSUE_ATTEMPTS, type(exc).__name__)
+                await asyncio.sleep(KIS_TOKEN_ISSUE_BACKOFF_SEC * attempt)
+        if "access_token" not in data:
+            if data.get("msg_cd") == "EGW00133":
+                fallback = self._read_cached_token(min_remaining_minutes=0)
+                if fallback is not None:
+                    self.token = fallback
+                    return False
+            raise RuntimeError(f"토큰 발급 실패: {data}")
+
+        self.token = data["access_token"]
+        expires_in = data.get("expires_in", 86400)
+        expired_at_str = (datetime.now() + timedelta(seconds=expires_in)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        previous = self._read_cache_payload()
+        now = _now_kst()
+        if previous is not None and str(previous.get("issued_at", ""))[:10] == now.date().isoformat():
+            logger.error(
+                "[SYS] stage=kis_token status=REPEAT_ISSUE key_id=%s previous_issued_at=%s",
+                kis_key_id(self.app_key or ""),
+                previous.get("issued_at", ""),
+            )
+        if KIS_DECISION_WINDOW_START <= now.time().replace(tzinfo=None) < KIS_DECISION_WINDOW_END:
+            logger.error(
+                "[SYS] stage=kis_token status=DECISION_WINDOW_ISSUE key_id=%s at=%s",
+                kis_key_id(self.app_key or ""),
+                now.isoformat(timespec="seconds"),
+            )
+        self._write_token_file(self.token, expired_at_str, issued_at=now.isoformat(timespec="seconds"))
+        logger.info(
+            "[SYS] stage=kis_token status=ISSUED key_id=%s expired_at=%s",
+            kis_key_id(self.app_key or ""),
+            expired_at_str,
+        )
+        return True
 
     async def ensure_token(self, session: aiohttp.ClientSession, force_refresh: bool = False):
         """토큰 유효성을 확인하고 필요시 갱신합니다 (단일비행 + 원자적 0600 쓰기)."""
@@ -195,49 +300,28 @@ class KisApiClient:
                 return self.token
         if self._token_lock is None:
             self._token_lock = asyncio.Lock()
-        async with self._token_lock:
-            if not force_refresh:
-                cached = self._read_cached_token()
-                if cached is not None:
-                    self.token = cached
-                    return self.token
-
-            # 새 토큰 발급 요청
-            url = f"{self.base_url}/oauth2/tokenP"
-            headers = {"content-type": "application/json"}
-            body = {
-                "grant_type": "client_credentials",
-                "appkey": self.app_key,
-                "appsecret": self.app_secret,
-            }
-
-            data: dict = {}
-            for attempt in range(1, KIS_TOKEN_ISSUE_ATTEMPTS + 1):
-                try:
-                    async with session.post(url, headers=headers, json=body) as resp:
-                        data = await resp.json()
-                    break
-                except (aiohttp.ClientError, TimeoutError) as exc:
-                    if attempt == KIS_TOKEN_ISSUE_ATTEMPTS:
-                        raise
-                    logger.warning("[SYS] stage=kis_token status=RETRY attempt=%d max_attempts=%d reason=%s", attempt, KIS_TOKEN_ISSUE_ATTEMPTS, type(exc).__name__)
-                    await asyncio.sleep(KIS_TOKEN_ISSUE_BACKOFF_SEC * attempt)
-            if "access_token" not in data:
-                if data.get("msg_cd") == "EGW00133":
-                    fallback = self._read_cached_token(min_remaining_minutes=0)
-                    if fallback is not None:
-                        self.token = fallback
-                        return self.token
-                raise RuntimeError(f"토큰 발급 실패: {data}")
-
-            self.token = data["access_token"]
-            expires_in = data.get("expires_in", 86400)
-            expired_at_str = (datetime.now() + timedelta(seconds=expires_in)).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-
-            self._write_token_file(self.token, expired_at_str)
+        async with self._token_lock, self._host_token_lock():
+            cached = self._read_cached_token()
+            if cached is not None and (not force_refresh or cached != self.token):
+                self.token = cached
+                return self.token
+            await self._issue_token(session)
             return self.token
+
+    async def issue_daily_token(self, session: aiohttp.ClientSession) -> bool:
+        if self._token_lock is None:
+            self._token_lock = asyncio.Lock()
+        async with self._token_lock, self._host_token_lock():
+            payload = self._read_cache_payload()
+            cached = self._read_cached_token()
+            if (
+                cached is not None
+                and payload is not None
+                and str(payload.get("issued_at", ""))[:10] == _now_kst().date().isoformat()
+            ):
+                self.token = cached
+                return False
+            return await self._issue_token(session)
 
     def _get_headers(self, tr_id):
         """공통 헤더 생성"""
@@ -875,20 +959,19 @@ class KisApiClient:
         return {"rt_cd": "0", "output": rows}
 
 
-def kis_data_client_kwargs() -> dict[str, str]:
-    """데이터 수집 전용 KIS 계좌용 KisApiClient 생성 kwargs를 반환한다.
+def kis_data_client_kwargs(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """데이터 조회용 KIS 자격증명을 역할에 따라 선택해 KisApiClient kwargs로 반환한다.
 
-    체결 계좌와 분리된 앱키를 사용하므로 KIS 서버측 TPS 예산과
-    프로세스 전역 공유 레이트리미터 버킷이 분리되고, 토큰 캐시 파일도
-    체결 계좌의 settings.TOKEN_FILE과 충돌하지 않는다.
-
-    시세·호가·체결틱 등 읽기 전용 조회(수집, 종가 확정, 페이퍼 청산 체결틱)는 이 키를 사용한다. 체결 계좌 키(settings.KIS_API_CONFIG)는 실주문 전용이다.
+    KIS_DATA_ROLE(process env, decision/batch)에 따라 호스트에 배정된 슬롯을
+    고르고, 토큰 캐시는 호스트 공유 캐시 디렉터리의 앱키 해시 경로를 쓴다.
+    풀 정의와 호스트 배정이 어긋나면 ValueError로 시작 시점에 실패한다.
     """
-    cfg = settings.KIS_DATA_API_CONFIG
+    source = load_kis_env(Path(settings.BASE_DIR) / ".env") if env is None else env
+    cred = select_data_credential(resolve_host_data_credentials(source), settings.KIS_DATA_ROLE)
     return {
-        "app_key": cfg["app_key"],
-        "app_secret": cfg["app_secret"],
-        "account_id": cfg.get("account_id", ""),
-        "hts_id": cfg.get("hts_id"),
-        "token_file": str(settings.DATA_TOKEN_FILE),
+        "app_key": cred.app_key,
+        "app_secret": cred.app_secret,
+        "account_id": "",
+        "hts_id": cred.hts_id,
+        "token_file": str(token_cache_path(cred.app_key, settings.KIS_TOKEN_CACHE_DIR)),
     }

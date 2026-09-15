@@ -257,6 +257,7 @@ def test_get_current_price_without_fallback_queries_only_requested_market(monkey
 
 def test_kis_data_client_kwargs_reads_data_account_settings(monkeypatch, tmp_path) -> None:
     from src.api.kis.client import kis_data_client_kwargs
+    from src.api.kis.key_pool import token_cache_path
     from src import settings
 
     # Given: 데이터 계좌와 체결 계좌가 서로 다른 합성 자격증명
@@ -275,7 +276,7 @@ def test_kis_data_client_kwargs_reads_data_account_settings(monkeypatch, tmp_pat
     # Then: 데이터 계좌 값만 반영, 체결 계좌 값은 섞이지 않는다
     assert out == {
         "app_key": "data-key", "app_secret": "data-secret", "account_id": "", "hts_id": "data-hts",
-        "token_file": str(data_token),
+        "token_file": str(token_cache_path("data-key", settings.KIS_TOKEN_CACHE_DIR)),
     }
 
 

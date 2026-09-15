@@ -13,6 +13,16 @@ import pytest
 from src.settings import Settings
 
 
+@pytest.fixture(autouse=True)
+def _isolate_kis_token_state(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    from src import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "KIS_TOKEN_CACHE_DIR", tmp_path_factory.mktemp("kis_cache"))
+    monkeypatch.delenv("KIS_DATA_SLOTS", raising=False)
+    monkeypatch.delenv("KIS_HOST_DATA_SLOTS", raising=False)
+    monkeypatch.delenv("KIS_DATA_ROLE", raising=False)
+
+
 @pytest.fixture
 def mock_settings(tmp_path: Path) -> Settings:
     """임시 디렉토리를 가리키는 Settings 인스턴스를 반환합니다."""
