@@ -36,6 +36,7 @@
     "testing": [
       "tests/unit/api/toss/test_toss_client.py",
       "tests/unit/backfill/test_backfill_minute_history_toss.py",
+      "tests/unit/backfill/test_kis_flow_backfill.py",
       "tests/unit/daily/test_collect.py",
       "tests/unit/daily/test_price_ingest.py"
     ]
@@ -92,7 +93,6 @@
   "src/backfill/backfill_altdata.py": {
     "testing": "tests/integration/backfill/test_altdata_flow.py"
   },
-  "src/backfill/backfill_price.py": {},
   "src/backfill/intraday/backfill_minute_history.py": {
     "testing": [
       "tests/integration/daily/test_minute_history_backfill_flow.py",
@@ -114,33 +114,6 @@
   },
   "src/backfill/krx_panel_rebuild.py": {
     "testing": "tests/unit/backfill/test_krx_panel_rebuild.py"
-  },
-  "src/backfill/price/config.py": {
-    "testing": "tests/unit/backfill/price/test_config.py"
-  },
-  "src/backfill/price/corporate_actions.py": {
-    "testing": [
-      "tests/unit/backfill/price/test_runner.py",
-      "tests/unit/backfill/test_corporate_actions.py"
-    ]
-  },
-  "src/backfill/price/factors.py": {
-    "testing": [
-      "tests/unit/backfill/test_factors_proxy.py",
-      "tests/unit/daily/test_price_ingest.py"
-    ]
-  },
-  "src/backfill/price/normalize.py": {
-    "testing": "tests/unit/backfill/price/test_normalize.py"
-  },
-  "src/backfill/price/runner.py": {
-    "testing": "tests/unit/backfill/price/test_runner.py"
-  },
-  "src/backfill/price/sources.py": {
-    "testing": "tests/unit/backfill/price/test_sources.py"
-  },
-  "src/backfill/price/universe.py": {
-    "testing": "tests/unit/backfill/price/test_universe.py"
   },
   "src/config/alerts.py": {
     "testing": "tests/unit/config/test_alert_settings.py"
