@@ -1398,7 +1398,7 @@ def test_ranker_configuration_is_single_certified_source() -> None:
     }
     assert mod.RANKER_SEEDS == (1, 2, 3, 4, 5)
     assert mod.RANKER_FEATURE_COLS == TOPK_FEATURE_COLS_V2
-    assert len(mod.RANKER_FEATURE_COLS) == 28
+    assert len(mod.RANKER_FEATURE_COLS) == 27
     assert mod.RANKER_FEATURE_COLS[: len(FEATURE_COLS)] == list(FEATURE_COLS)
     assert mod.LABEL_MODE == "date_demeaned"
 
@@ -1647,3 +1647,25 @@ def test_score_topk_candidates_scores_every_row_including_non_admitted() -> None
     # And: 피처 누락은 fail-closed
     with pytest.raises(ValueError, match="log_tv"):
         score_topk_candidates(wide.drop(columns=["log_tv"]), bundle)
+
+
+def test_build_dual_pool_attaches_lagged_flow_features() -> None:
+    import numpy as np
+
+    from src.ml.topk_history_features import TOPK_FLOW_FEATURE_COLS
+    from src.ml.topk_ranker_research import build_dual_pool
+    from src.strategy.contract import COST_AWARE_UNIVERSE, DEFAULT_UNIVERSE
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+
+    # When
+    pool, _sel_mask = build_dual_pool(
+        ph, market_dates, d_to_idx, train_spec=DEFAULT_UNIVERSE, select_spec=COST_AWARE_UNIVERSE
+    )
+
+    # Then: T-1 flow columns are present and finite past each symbol's first panel day
+    assert not [c for c in TOPK_FLOW_FEATURE_COLS if c not in pool.columns]
+    first_day = sorted(pool["date"].unique())[0]
+    later = pool[pool["date"] != first_day]
+    assert np.isfinite(later["inst_density"].to_numpy(dtype=np.float64)).all()
+    assert np.isfinite(later["inst_rank"].to_numpy(dtype=np.float64)).all()

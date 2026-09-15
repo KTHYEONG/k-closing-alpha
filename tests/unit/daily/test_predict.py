@@ -919,3 +919,31 @@ def test_run_automated_topk_decision_persists_rank_pool_with_code_commit(monkeyp
     monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", _fail)
     predict_mod.run_automated_topk_decision(pd.Timestamp("2026-09-15"), record_fn=Mock(), trading_day_fn=lambda _d: True)
     pool_persist.assert_not_called()
+
+
+def test_run_topk_ranker_sleeve_loads_history_for_flow_only_bundle(monkeypatch) -> None:
+    import src.daily.predict as predict_mod
+    import src.ml.topk_history_features as thf
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    # Given: a bundle needs inst_density/inst_rank but no f_* history feature
+    wide, hist, decision = _sleeve_wide_and_history()
+    bundle = build_fixed_serving_bundle([*FEATURE_COLS, *thf.TOPK_FLOW_FEATURE_COLS])
+    bundle["top_k"] = 3
+    calls = []
+
+    def _fake_loader(d):
+        calls.append(d)
+        return hist
+
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+    monkeypatch.setattr(thf, "load_serving_price_history", _fake_loader)
+
+    # When
+    out = predict_mod.run_topk_ranker_sleeve(decision)
+
+    # Then: the flow-only feature need still triggers the history load (previously skipped)
+    assert calls == [decision]
+    assert len(out) == 3

@@ -295,7 +295,7 @@ def build_topk_ranker_features(
     base = compute_derived_features(mapped)
     if price_history is None:
         return base
-    from src.ml.topk_history_features import attach_topk_features, stitch_live_panel
+    from src.ml.topk_history_features import attach_lagged_flow_features, attach_topk_features, stitch_live_panel
 
     if "시장구분" not in df.columns:
         raise ValueError("missing required columns: ['시장구분'] (needed for tick-cost feature)")
@@ -303,6 +303,7 @@ def build_topk_ranker_features(
     dates = np.full(len(df), np.datetime64(pd.Timestamp(decision_date).strftime("%Y-%m-%d")))
     base["prev_close"] = prev_close
     base["tick_cost_bp"] = tick_cost_bp(close, dates, df["시장구분"].astype(str).to_numpy(dtype=object))
+    base = attach_lagged_flow_features(base, price_history)
     live_rows = base[["symbol", "open", "close", "prev_close", "volume", "inst_netbuy", "foreign_netbuy"]]
     panel = stitch_live_panel(price_history, live_rows, decision_date)
     return attach_topk_features(base, panel)

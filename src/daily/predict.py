@@ -192,7 +192,7 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[
         bundle = load_model_bundle(import_dir=TOPK_RANKER_BUNDLE_DIR)
         # 번들이 선언한 피처가 이력 피처를 요구할 때만 price_history 를 읽는다
         price_history = None
-        if set(bundle.get("feature_cols", [])) & set(topk_history_features.TOPK_HISTORY_FEATURE_COLS):
+        if set(bundle.get("feature_cols", [])) & (set(topk_history_features.TOPK_HISTORY_FEATURE_COLS) | set(topk_history_features.TOPK_FLOW_FEATURE_COLS)):
             price_history = topk_history_features.load_serving_price_history(decision_date)
         features_df = build_topk_ranker_features(wide, decision_date, price_history=price_history)
         features_df["admitted"] = wide["admitted"].to_numpy()
