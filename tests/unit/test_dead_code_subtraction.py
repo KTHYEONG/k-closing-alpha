@@ -119,7 +119,7 @@ def test_metrics_survivors_unchanged_and_orphan_constants_removed() -> None:
     assert not hasattr(m, "re"), "the re import is orphaned by removing extract_year"
 
 
-def test_pyproject_drops_unused_dependencies_but_keeps_setuptools() -> None:
+def test_pyproject_drops_unused_dependencies() -> None:
     import tomllib
     from pathlib import Path
 
@@ -132,19 +132,21 @@ def test_pyproject_drops_unused_dependencies_but_keeps_setuptools() -> None:
     }
 
     # Then: every distribution with zero imports across src/, tests/ and legacy/ is gone.
+    # setuptools/pykrx retired together: pykrx (and its matplotlib/pillow transitive chain)
+    # was the sole runtime importer of pkg_resources; the build backend still gets its own
+    # setuptools from an isolated build environment via [build-system], not this list.
     removed = {
         "python-dotenv", "tenacity", "psutil", "tqdm", "openpyxl", "gspread",
         "oauth2client", "xgboost", "catboost", "huggingface-hub", "optuna",
+        "pykrx", "setuptools",
     }
     assert names & removed == set(), f"still declared: {sorted(names & removed)}"
 
-    # And: setuptools stays — pykrx imports pkg_resources at runtime without declaring it.
-    assert "setuptools" in names
     # And: the build backend requirement is untouched.
     assert any("setuptools" in r for r in data["build-system"]["requires"])
 
     # And: dependencies actually in use are still declared.
-    for kept in ("numpy", "pandas", "pyarrow", "scipy", "pykrx", "lightgbm", "scikit-learn", "joblib"):
+    for kept in ("numpy", "pandas", "pyarrow", "scipy", "lightgbm", "scikit-learn", "joblib"):
         assert kept in names, f"{kept} must remain declared"
 
 
@@ -159,42 +161,25 @@ def test_live_entrypoints_still_import_after_dependency_removal() -> None:
         "src.ml.retrain",
         "src.ml.costaware_topk",
         "src.ml.topk_ranker_research",
-        "src.backfill.backfill_price",
         "src.backfill.backfill_altdata",
         "src.backfill.kis_flow_backfill",
         "src.backfill.intraday.backfill_minute_history",
     ]
 
-    # When / Then: each imports without error. pykrx pulls pkg_resources here,
-    # which is why setuptools must stay declared.
+    # When / Then: each imports without error.
     for name in entrypoints:
         assert importlib.import_module(name) is not None, f"{name} failed to import"
 
 
-def test_backfill_price_facade_has_no_bom_and_no_dead_reexports() -> None:
-    import ast
+def test_backfill_price_facade_symbol_is_fully_deleted() -> None:
     import importlib
     from pathlib import Path
 
-    path = Path("src/backfill/backfill_price.py")
-    raw = path.read_bytes()
+    import pytest
 
-    # Then: the UTF-8 BOM is gone and a plain ast.parse succeeds.
-    assert not raw.startswith(b"\xef\xbb\xbf"), "UTF-8 BOM must be stripped"
-    tree = ast.parse(raw.decode("utf-8"), filename=str(path))
-
-    # And: the dead compatibility re-export block is gone.
-    all_nodes = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(getattr(t, "id", "") == "__all__" for t in node.targets)
-    ]
-    assert all_nodes == [], "the unused __all__ re-export block must be removed"
-
-    # And: the module is still a working CLI entrypoint.
-    mod = importlib.import_module("src.backfill.backfill_price")
-    assert callable(mod.main)
+    assert not Path("src/backfill/backfill_price.py").exists()
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("src.backfill.backfill_price")
 
 
 def test_synthetic_output_digests_unchanged_after_subtraction() -> None:

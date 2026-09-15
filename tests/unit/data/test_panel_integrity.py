@@ -469,17 +469,18 @@ def test_unit_sniffing_heuristic_is_absent_from_the_repository() -> None:
 
     import pytest
 
-    # Given: the two modules that previously sniffed units from a median.
-    for rel in ("src/backfill/price/normalize.py", "src/ml/exit_policy.py"):
-        source = Path(rel).read_text(encoding="utf-8")
-        # Then: no median-based unit inference and no divide-by-100 rescue remains.
-        assert "median" not in source, f"{rel} still infers a unit from a distribution statistic"
-        assert "/ 100.0" not in source, f"{rel} still rescales a change column by 100"
+    # Given: the one surviving module that previously sniffed units from a median.
+    source = Path("src/ml/exit_policy.py").read_text(encoding="utf-8")
+    # Then: no median-based unit inference and no divide-by-100 rescue remains.
+    assert "median" not in source, "src/ml/exit_policy.py still infers a unit from a distribution statistic"
+    assert "/ 100.0" not in source, "src/ml/exit_policy.py still rescales a change column by 100"
 
-    # And: the dead module carrying the third copy is deleted.
-    assert not Path("src/ml/forward_path.py").exists()
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("src.ml.forward_path")
+    # And: the dead modules carrying the other two copies are deleted (the legacy pykrx
+    # price runner that housed normalize.py was retired wholesale, not merely patched).
+    for rel, mod in (("src/ml/forward_path.py", "src.ml.forward_path"), ("src/backfill/price/normalize.py", "src.backfill.price.normalize")):
+        assert not Path(rel).exists()
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(mod)
 
 
 def test_compute_latest_market_breadth_computes_net_ratio_from_latest_prior_date() -> None:

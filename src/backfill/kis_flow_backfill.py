@@ -8,14 +8,19 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
 from src.api.kis.client import KisApiClient, kis_data_client_kwargs
+from src.api.toss.client import TossApiClient
+from src.daily.price_ingest import VendorResponseError, parse_toss_program_rows
 from src.sync.fetcher_investor import get_investor_trade_daily_async
 from src.sync.fetcher_program import get_program_history_async
 
 FLOW_COLUMNS = ("foreign_netbuy", "inst_netbuy", "program_netbuy")
+# Toss 프로그램 이력 시작일(실측: 무관한 대형주 2종목 동일 컷오프) — 이전 날짜는 KIS 전용으로 유지한다.
+TOSS_PROGRAM_HISTORY_START_YMD = "20190401"
 logger = logging.getLogger(__name__)
 
 
@@ -24,6 +29,9 @@ class FlowBackfillConfig:
     requests_per_second: float = 10.0
     concurrency: int = 4
     checkpoint_symbols: int = 25
+    # Toss는 KIS와 독립된 레이트리밋 버킷이라, 켜두면 program_netbuy의 2019-04-01
+    # 이후 구간이 Toss로 갈려 KIS 공유 버킷의 실질 부담이 줄어든다. 장애 시 롤백용 스위치.
+    use_toss_program: bool = True
 
 
 @dataclass(frozen=True)
@@ -104,6 +112,26 @@ def _read_checkpoints(checkpoint_dir: Path) -> pd.DataFrame:
     return pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
 
 
+async def fetch_toss_program_history(session: object, toss: TossApiClient, symbol: str, dates: list[str], *, max_calls: int = 30) -> dict[str, float]:
+    if not dates:
+        return {}
+    floor = pd.Timestamp(min(dates))
+    cursor = pd.Timestamp(max(dates))
+    out: dict[str, float] = {}
+    for _ in range(int(max_calls)):
+        body = await toss.get_program_trades(session, symbol, count=100, until=cursor.strftime("%Y-%m-%d"))
+        rows = parse_toss_program_rows(body)
+        if rows.empty:
+            break
+        for row in rows.itertuples():
+            out[pd.Timestamp(row.date).strftime("%Y%m%d")] = float(row.program_netbuy)
+        next_cursor = pd.Timestamp(rows["date"].min()) - pd.Timedelta(days=1)
+        if next_cursor >= cursor or next_cursor < floor:
+            break
+        cursor = next_cursor
+    return out
+
+
 async def _fetch_symbol(
     session: object,
     client: KisApiClient,
@@ -112,19 +140,33 @@ async def _fetch_symbol(
     dates: list[str],
     need_investor: bool = True,
     need_program: bool = True,
+    *,
+    toss: TossApiClient | None = None,
 ) -> pd.DataFrame:
-    requests = []
+    tasks: list[tuple[str, Any]] = []
     if need_investor:
-        requests.append(get_investor_trade_daily_async(
+        tasks.append(('investor', get_investor_trade_daily_async(
             session, client, symbol, min(dates), max(dates), target_dates=dates, request_slot=limiter.acquire
-        ))
-    if need_program:
-        requests.append(get_program_history_async(
-            session, client, symbol, min(dates), max(dates), target_dates=dates, request_slot=limiter.acquire
-        ))
-    results = await asyncio.gather(*requests) if requests else []
-    investor = results[0] if need_investor else pd.DataFrame()
-    program = results[1 if need_investor else 0] if need_program else {}
+        )))
+    program: dict[str, float] = {}
+    kis_program_dates = list(dates)
+    if need_program and toss is not None:
+        toss_dates = [d for d in dates if d >= TOSS_PROGRAM_HISTORY_START_YMD]
+        kis_program_dates = [d for d in dates if d < TOSS_PROGRAM_HISTORY_START_YMD]
+        if toss_dates:
+            try:
+                program = await fetch_toss_program_history(session, toss, symbol, toss_dates)
+            except VendorResponseError:
+                kis_program_dates.extend(toss_dates)
+            else:
+                kis_program_dates.extend([d for d in toss_dates if d not in program])
+    if need_program and kis_program_dates:
+        tasks.append(('program', get_program_history_async(
+            session, client, symbol, min(kis_program_dates), max(kis_program_dates), target_dates=kis_program_dates, request_slot=limiter.acquire
+        )))
+    results = dict(zip((key for key, _ in tasks), await asyncio.gather(*(coro for _, coro in tasks)), strict=True)) if tasks else {}
+    investor = results.get('investor', pd.DataFrame())
+    program = {**results.get('program', {}), **program}
     base = pd.DataFrame({"symbol": symbol, "date": pd.to_datetime(dates, format="%Y%m%d")})
     if investor.empty:
         investor = pd.DataFrame(columns=["date", "foreign_netbuy", "inst_netbuy"])
@@ -140,12 +182,14 @@ async def _fetch_symbol_guarded(
     field_plan: dict[str, tuple[bool, bool]],
     symbol: str,
     dates: list[str],
+    *,
+    toss: TossApiClient | None = None,
 ) -> pd.DataFrame:
     async with semaphore:
         need_investor, need_program = field_plan[symbol]
         try:
             return await _fetch_symbol(
-                session, client, limiter, symbol, dates, need_investor, need_program
+                session, client, limiter, symbol, dates, need_investor, need_program, toss=toss
             )
         except Exception as exc:
             logger.exception(
@@ -178,13 +222,14 @@ async def run_kis_flow_backfill(
     await asyncio.to_thread(checkpoint_dir.mkdir, parents=True, exist_ok=True)
     limiter = AsyncRateLimiter(config.requests_per_second)
     semaphore = asyncio.Semaphore(max(1, config.concurrency))
+    toss = TossApiClient() if config.use_toss_program else None
 
     client = KisApiClient(**kis_data_client_kwargs())
     async with client.create_session() as session:
         await client.ensure_token(session)
         tasks = [
             asyncio.create_task(
-                _fetch_symbol_guarded(session, client, limiter, semaphore, field_plan, symbol, dates)
+                _fetch_symbol_guarded(session, client, limiter, semaphore, field_plan, symbol, dates, toss=toss)
             )
             for symbol, dates in plan.items()
         ]
@@ -239,6 +284,7 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--checkpoint-symbols", type=int, default=25)
     parser.add_argument("--symbols", default="")
+    parser.add_argument("--no-toss-program", action="store_true", help="disable the Toss program-trades accelerator (KIS-only fallback path)")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--flows-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -248,7 +294,7 @@ def main() -> None:
         logger.info("[DATA] stage=flow_backfill_apply filled=%d", apply_flow_checkpoints(parquet, checkpoint_dir))
         return
     symbols = {value.strip().zfill(6) for value in args.symbols.split(",") if value.strip()} or None
-    result = asyncio.run(run_kis_flow_backfill(parquet, checkpoint_dir, FlowBackfillConfig(args.rps, args.concurrency, args.checkpoint_symbols), symbols))
+    result = asyncio.run(run_kis_flow_backfill(parquet, checkpoint_dir, FlowBackfillConfig(args.rps, args.concurrency, args.checkpoint_symbols, not args.no_toss_program), symbols))
     logger.info(
         "[DATA] stage=flow_backfill planned=%d completed=%d checkpoints=%d",
         result.planned_symbols,

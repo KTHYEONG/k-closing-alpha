@@ -213,8 +213,7 @@ def test_fetch_index_closes_returns_empty_when_range_has_no_rows() -> None:
 
 
 def test_compute_index_columns_returns_and_volatility() -> None:
-    from src.backfill.price.factors import compute_vkospi_proxy
-    from src.daily.price_ingest import compute_index_columns
+    from src.daily.price_ingest import compute_index_columns, compute_vkospi_proxy
 
     days = pd.bdate_range("2026-01-02", periods=30)
     kospi = pd.DataFrame({"date": days, "close": 100.0 * np.cumprod(1 + 0.01 * np.sin(np.arange(30)))})
@@ -228,6 +227,18 @@ def test_compute_index_columns_returns_and_volatility() -> None:
     expect = compute_vkospi_proxy(kospi, output_col="v").set_index("date")["v"]
     assert np.isnan(out.loc[days[10], "v_kospi"])
     assert out.loc[days[25], "v_kospi"] == pytest.approx(expect.loc[days[25]])
+
+
+def test_compute_vkospi_proxy_handles_empty_and_kosdaq_output() -> None:
+    from src.daily.price_ingest import compute_vkospi_proxy
+
+    assert list(compute_vkospi_proxy(pd.DataFrame(), output_col="v_kosdaq").columns) == ["date", "v_kosdaq"]
+    dates = pd.date_range("2020-01-01", periods=25, freq="B")
+    out = compute_vkospi_proxy(pd.DataFrame({"date": dates, "close": np.arange(100, 125)}), output_col="v_kosdaq")
+    assert out.columns.tolist() == ["date", "v_kosdaq"]
+    assert out["v_kosdaq"].notna().sum() == 5
+    assert compute_vkospi_proxy(pd.DataFrame({"date": dates}), output_col="v_kospi").empty
+    assert compute_vkospi_proxy(pd.DataFrame({"date": [None], "close": [None]}), output_col="v_kospi").empty
 
 
 def test_attach_index_columns_overwrites_and_fails_on_missing_date() -> None:
