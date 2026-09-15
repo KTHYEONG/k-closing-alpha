@@ -25,3 +25,6 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY . .
 RUN uv sync --frozen --no-dev
+# 컨테이너에는 .git이 없어 재학습 레지스트리의 코드 커밋을 빌드 인자로 주입한다
+ARG KCA_CODE_COMMIT=UNKNOWN
+ENV KCA_CODE_COMMIT=${KCA_CODE_COMMIT}
