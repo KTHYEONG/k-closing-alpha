@@ -6,5 +6,5 @@ OnFailure=kca-alert@%n.service
 Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
 Environment=TZ=Asia/Seoul
-TimeoutStartSec=7h
+TimeoutStartSec=15min
 ExecStart=%h/.local/bin/uv run python -m src.daily.paper_trade --phase exit
