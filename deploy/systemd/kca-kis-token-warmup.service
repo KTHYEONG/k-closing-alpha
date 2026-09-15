@@ -1,0 +1,9 @@
+[Unit]
+Description=KCA KIS token warmup (host data slots, read-only)
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-closing-alpha
+Environment=TZ=Asia/Seoul
+ExecStart=%h/.local/bin/uv run python -m src.tools.kis_token_warmup
