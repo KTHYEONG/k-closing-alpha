@@ -63,7 +63,8 @@ def test_audit_daily_completeness_reports_all_steps_from_topk_log_and_fills(monk
     monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", paper_dir, raising=False)
     pd.DataFrame({"decision_date": ["2026-09-14"], "symbol": ["005930"]}).to_parquet(parquet_dir / "topk_decisions.parquet")
     pd.DataFrame(
-        {"order_id": ["2026-09-14:005930:entry"], "symbol": ["005930"], "side": ["buy"], "decision_date": ["2026-09-14"]}
+        {"order_id": ["2026-09-14:005930:entry"], "symbol": ["005930"], "side": ["buy"], "qty": [10],
+         "fill_price": [70_000], "decision_date": ["2026-09-14"]}
     ).to_parquet(paper_dir / "fills.parquet")
     price_history = tmp_path / "price_history.parquet"
     pd.DataFrame({"date": pd.to_datetime(["2026-09-11"])}).to_parquet(price_history)
@@ -336,3 +337,56 @@ def test_audit_decision_requires_topk_or_predict_ok_outcome(monkeypatch, tmp_pat
     assert degraded["decision"] is False
     assert degraded["paper_entry"] is True
     assert normal["decision"] is True
+
+
+def test_audit_daily_completeness_flags_stale_open_position(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    parquet_dir = tmp_path / "parquet"
+    paper_dir = tmp_path / "paper"
+    parquet_dir.mkdir()
+    paper_dir.mkdir()
+    monkeypatch.setattr(daily_audit.settings, "PARQUET_DIR", parquet_dir, raising=False)
+    monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", paper_dir, raising=False)
+    pd.DataFrame({"decision_date": ["2026-09-14"], "symbol": ["005930"]}).to_parquet(parquet_dir / "topk_decisions.parquet")
+    price_history = tmp_path / "price_history.parquet"
+    pd.DataFrame({"date": pd.to_datetime(["2026-09-11"])}).to_parquet(price_history)
+    bars = tmp_path / "bars.parquet"
+    bars.write_text("x")
+    monkeypatch.setattr(daily_audit.settings, "PRICE_HISTORY_PARQUET_PATH", price_history, raising=False)
+    monkeypatch.setattr(
+        daily_audit,
+        "fetch_archive_snapshot",
+        lambda snapshot_date=None, **kw: pd.DataFrame({"종목코드": ["005930"], daily_audit.CLOSE_CONFIRMED_COL: [True]}),
+    )
+    monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: "2026-09-11")
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: bars)
+    monkeypatch.setattr(daily_audit, "load_run_outcomes", lambda _d: {})
+
+    def _write_fills(rows: list[dict]) -> None:
+        pd.DataFrame(rows).to_parquet(paper_dir / "fills.parquet")
+
+    today_buy = {"order_id": "2026-09-14:005930:entry", "symbol": "005930", "side": "buy", "qty": 10,
+                 "fill_price": 70_000, "decision_date": "2026-09-14", "entry_order_id": None}
+    old_buy = {"order_id": "2026-09-11:000660:entry", "symbol": "000660", "side": "buy", "qty": 5,
+               "fill_price": 200_000, "decision_date": "2026-09-11", "entry_order_id": None}
+    old_sell = {"order_id": "2026-09-11:000660:entry:exit:2026-09-14", "symbol": "000660", "side": "sell", "qty": 5,
+                "fill_price": 210_000, "decision_date": "2026-09-14", "entry_order_id": "2026-09-11:000660:entry"}
+
+    # When: 직전 결정일 로트가 오늘 청산되지 않고 남아 있다
+    _write_fills([today_buy, old_buy])
+    stale = daily_audit.audit_daily_completeness("2026-09-14")
+
+    # Then
+    assert "paper_exit" in daily_audit.AUDIT_STEPS
+    assert stale["paper_exit"] is False
+    assert stale["paper_entry"] is True
+
+    # When: 같은 로트가 청산되었다
+    _write_fills([today_buy, old_buy, old_sell])
+    healthy = daily_audit.audit_daily_completeness("2026-09-14")
+
+    # Then: 당일 진입 로트만 남아 있으면 정상
+    assert healthy["paper_exit"] is True

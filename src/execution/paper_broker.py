@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import collections
 import logging
 import math
 from dataclasses import dataclass
@@ -98,6 +97,7 @@ class PaperOrder:
     limit_price: int | None
     placed_at: pd.Timestamp
     reason: str
+    entry_order_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +122,20 @@ def size_order_qty(seed_capital: int, allocation: float, price: int) -> int:
     if allocation <= 0:
         raise ValueError(f"allocation must be positive, got {allocation}")
     return math.floor(seed_capital * allocation / price)
+
+
+def investable_capital(cash: int, seed_capital: int) -> int:
+    """Compute capital available for entry sizing from available cash.
+
+    Args:
+        cash: Available cash in KRW from the latest NAV snapshot.
+        seed_capital: Strategy seed capital in KRW used as a sizing cap.
+
+    Returns:
+        Investable capital in KRW reserved for buy fees and capped at seed.
+    """
+    # 매수 수수료까지 현금 안에서 치르도록 편도 수수료분을 남기고, 누적 수익이 있어도 사이징은 시드 기준으로 고정한다
+    return max(0, min(int(seed_capital), math.floor(int(cash) / (1.0 + PAPER_BROKERAGE_SIDE_BP / 10_000))))
 
 
 def decide_fill(order: PaperOrder, print_price: int, print_ts: pd.Timestamp) -> PaperFill | None:
@@ -195,12 +209,13 @@ def order_record(order: PaperOrder, status: str) -> dict[str, Any]:
         "placed_at": order.placed_at,
         "reason": order.reason,
         "status": status,
+        "entry_order_id": order.entry_order_id,
         "recorded_at": pd.Timestamp.now(tz="Asia/Seoul"),
     }
 
 
 def build_round_trips(fills: pd.DataFrame) -> pd.DataFrame:
-    """Pair buy/sell fills into FIFO round trips with explicit costs.
+    """Pair buy/sell fills into entry-linked round trips with explicit costs.
 
     Args:
         fills: Fill ledger rows in record order.
@@ -209,24 +224,29 @@ def build_round_trips(fills: pd.DataFrame) -> pd.DataFrame:
         Round-trip frame with ROUND_TRIP_COLUMNS schema.
 
     Raises:
-        ValueError: On sell without open buy, qty mismatch, missing sell
-            filled_at, or unknown fill side.
+        ValueError: On sell without entry_order_id, unknown or closed entry,
+            symbol mismatch, qty mismatch, missing sell filled_at,
+            or unknown fill side.
     """
     if fills is None or fills.empty:
         return pd.DataFrame(columns=list(ROUND_TRIP_COLUMNS))
     records = fills.to_dict("records")
-    open_buys: dict[str, collections.deque[dict[str, Any]]] = {}
+    open_buys: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
     for rec in records:
         side = rec.get("side")
         symbol = str(rec.get("symbol"))
         if side == "buy":
-            open_buys.setdefault(symbol, collections.deque()).append(rec)
+            open_buys[str(rec["order_id"])] = rec
         elif side == "sell":
-            queue = open_buys.get(symbol)
-            if not queue:
-                raise ValueError(f"sell fill {rec.get('order_id')} without an open buy for {symbol}")
-            buy = queue.popleft()
+            link = rec.get("entry_order_id")
+            if link is None or pd.isna(link):
+                raise ValueError(f"sell fill {rec.get('order_id')} has no entry_order_id")
+            buy = open_buys.pop(str(link), None)
+            if buy is None:
+                raise ValueError(f"sell fill {rec.get('order_id')} references unknown or closed entry {link}")
+            if str(buy["symbol"]) != symbol:
+                raise ValueError(f"sell fill {rec.get('order_id')} symbol {symbol} != entry symbol {buy['symbol']}")
             qty = int(rec["qty"])
             buy_qty = int(buy["qty"])
             if qty != buy_qty:
@@ -450,11 +470,12 @@ class PaperLedger:
         return self._append([row], "decisions", ["decision_date", "symbol"])
 
     def load_open_positions(self) -> pd.DataFrame:
-        """fills 중 같은 symbol의 후속 sell 체결이 없는 buy 체결만 반환한다."""
+        """fills 중 청산 체결이 참조하지 않은 진입 로트만 반환한다."""
         target = self._store("fills")
         if not target.exists():
             return pd.DataFrame(
                 {
+                    "entry_order_id": pd.Series(dtype="str"),
                     "symbol": pd.Series(dtype="str"),
                     "qty": pd.Series(dtype="int64"),
                     "entry_price": pd.Series(dtype="int64"),
@@ -462,21 +483,20 @@ class PaperLedger:
                 }
             )
         fills = pd.read_parquet(target)
-        # 종목 단위 'sell 존재 여부'가 아니라 기록순 매수/매도 쌍으로 상계한다.
-        # 같은 종목 재진입이 흔하므로(과거 청산 이력만으로 신규 포지션을 지우면 영구 유실)
-        # 종목별 미상계 매수 = 매수건수 - 매도건수이며, 그 수만큼 최근 매수를 남긴다.
+        # 청산 체결이 참조한 진입 로트만 닫는다(같은 종목 복수 로트를 독립적으로 추적)
         sides = fills["side"].astype(str)
-        symbols = fills["symbol"].astype(str)
+        sells = fills[sides == "sell"]
+        if len(sells) > 0:
+            if "entry_order_id" not in fills.columns or sells["entry_order_id"].isna().any():
+                raise ValueError("sell fill without entry_order_id violates position link")
+            closed = set(sells["entry_order_id"].astype(str))
+        else:
+            closed = set()
         buys = fills[sides == "buy"]
-        n_sells = symbols[sides == "sell"].value_counts()
-        keep = pd.Series(False, index=buys.index)
-        for symbol, idx in buys.groupby(symbols[sides == "buy"]).groups.items():
-            open_count = len(idx) - int(n_sells.get(symbol, 0))
-            if open_count > 0:
-                keep.loc[list(idx)[-open_count:]] = True
-        open_buys = buys[keep]
+        open_buys = buys[~buys["order_id"].astype(str).isin(closed)]
         return pd.DataFrame(
             {
+                "entry_order_id": open_buys["order_id"].astype(str).to_numpy(),
                 "symbol": open_buys["symbol"].astype(str).to_numpy(),
                 "qty": pd.to_numeric(open_buys["qty"], errors="coerce").fillna(0).astype("int64").to_numpy(),
                 "entry_price": pd.to_numeric(open_buys["fill_price"], errors="coerce").fillna(0).astype("int64").to_numpy(),

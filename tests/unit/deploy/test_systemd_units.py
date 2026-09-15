@@ -1,3 +1,6 @@
+
+
+
 def test_no_unit_hardcodes_home_kth_path() -> None:
     import pathlib
 
@@ -301,3 +304,16 @@ def test_finalize_close_always_hands_off_to_paper_entry() -> None:
     assert "ExecStopPost=/usr/bin/systemctl --user start --no-block kca-paper-entry.service" in lines
     assert not any(line.startswith("OnSuccess=") for line in lines)
     assert "OnFailure=kca-alert@%n.service" in lines
+
+
+def test_paper_exit_timer_catches_up_missed_runs() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    lines = (root / "kca-paper-exit.timer").read_text(encoding="utf-8").splitlines()
+
+    # Then: 09:00 발화를 놓쳐도 부팅/재개 직후 세션을 이어받는다(15:30 이후면 세션이 스스로 SKIP)
+    assert "Persistent=true" in lines
+    assert "Persistent=false" not in lines
+    assert "AccuracySec=1s" in lines
+    assert "OnCalendar=Mon..Fri 09:00:00 Asia/Seoul" in lines
