@@ -1,33 +1,31 @@
-"""페이퍼 트레이딩 일간 세션 (실주문 없이 실시간 체결틱으로 실행경로 리허설).
+"""페이퍼 트레이딩 일간 세션 (실주문 없이 실행경로 리허설).
 
 주문 전송 TR을 어떤 형태로도 참조하지 않는다. 진입(entry)은 15:21에 영속된
 top-k 결정을 소비해 아카이브 종가를 조인해 시장가 등가 주문을 만들고, 청산(exit)은 미청산
-포지션에 익절 지정가 주문을 만든 뒤 H0STCNT0 실체결 프린트로 체결을 판정한다.
+포지션을 D+1 KRX 시가단일가(현재가 API stck_oprc, 데이터 계좌)로 시장가 청산한다.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
-import dataclasses
 import logging
-import math
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import aiohttp
 import pandas as pd
 
 from src import settings
-from src.api.kis.client import kis_data_client_kwargs
-from src.api.kis.ws_client import KisWebSocketClient, issue_approval_key
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.config.market_session import (
+    KRX_CLOSE_MARKET_DIV_CODE,
     PAPER_ENTRY_HHMMSS,
-    PAPER_EXIT_MOC_HHMMSS,
-    PAPER_EXIT_SESSION_END_HHMMSS,
-    PAPER_EXIT_SESSION_START_HHMMSS,
+    PAPER_EXIT_OPEN_AUCTION_HHMMSS,
+    PAPER_EXIT_OPEN_QUOTE_EARLIEST_HHMMSS,
 )
 from src.daily.archive import fetch_archive_snapshot
+from src.daily.collect import safe_float
 from src.daily.predict import load_topk_decision
 from src.execution.paper_broker import (
     ORDER_STATUS_FILLED,
@@ -35,12 +33,11 @@ from src.execution.paper_broker import (
     ORDER_STATUS_UNCONFIRMED,
     ORDER_STATUS_UNFILLED,
     ORDER_STATUS_ZERO_QTY,
-    PAPER_TAKE_PROFIT_RATIO,
     PaperLedger,
     PaperOrder,
     build_auction_fill,
     build_nav_snapshot,
-    decide_fill,
+    build_open_auction_fill,
     investable_capital,
     order_record,
     refresh_trade_ledgers,
@@ -49,13 +46,9 @@ from src.execution.paper_broker import (
 
 logger = logging.getLogger(__name__)
 
-# KIS 웹소켓 순단 복구 한도: 5회 x 5초 공백은 6.5시간 청산 세션 대비 무시 가능하고, 초과하면 경보로 넘긴다
-PAPER_EXIT_MAX_RECONNECTS: int = 5
-PAPER_EXIT_RECONNECT_BACKOFF_SECONDS: float = 5.0
-
-
-class PaperExitStreamError(RuntimeError):
-    """Raised when the exit tick stream keeps dropping before the session end."""
+# 시가 형성 직후 stck_oprc 반영 지연에 대비한 재조회 한도: 6회 x 10초
+PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS: int = 6
+PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS: float = 10.0
 
 
 def _placed_at(date_str: str, hhmmss: str) -> pd.Timestamp:
@@ -92,14 +85,13 @@ def build_entry_orders(
 
 
 def build_exit_orders(
-    open_positions: pd.DataFrame, decision_date: str, placed_at: pd.Timestamp, moc: bool
+    open_positions: pd.DataFrame, decision_date: str, placed_at: pd.Timestamp
 ) -> list[PaperOrder]:
-    """미청산 포지션에 익절 지정가(moc=False) 또는 MOC 대체 청산(moc=True) 주문을 만든다."""
+    """미청산 포지션을 D+1 KRX 시가단일가로 청산하는 시장가 매도 주문을 만든다."""
     if open_positions is None or len(open_positions) == 0:
         return []
     orders: list[PaperOrder] = []
     for _, row in open_positions.iterrows():
-        limit_price = None if moc else math.ceil(int(row["entry_price"]) * (1 + PAPER_TAKE_PROFIT_RATIO))
         orders.append(
             PaperOrder(
                 order_id=f"{row['entry_order_id']}:exit:{decision_date}",
@@ -107,25 +99,40 @@ def build_exit_orders(
                 symbol=str(row["symbol"]),
                 side="sell",
                 qty=int(row["qty"]),
-                limit_price=limit_price,
+                limit_price=None,
                 placed_at=placed_at,
-                reason="moc_exit" if moc else "take_profit",
+                reason="open_exit",
                 entry_order_id=str(row["entry_order_id"]),
             )
         )
     return orders
 
 
+async def fetch_krx_open_quote(client: Any, session: Any, code: str) -> int:
+    """KRX 시가단일가 체결가를 현재가 API stck_oprc로 조회한다."""
+    res = await client.get_current_price(
+        session, code, market_div_code=KRX_CLOSE_MARKET_DIV_CODE, allow_market_div_fallback=False
+    )
+    output = res.get("output") if isinstance(res, dict) and res.get("rt_cd") == "0" else None
+    if isinstance(output, dict):
+        return int(safe_float(output.get("stck_oprc"), 0.0))
+    return 0
+
+
 async def run_paper_session(
     decision_date: pd.Timestamp,
     phase: str,
     ledger: PaperLedger | None = None,
-    ws_client: KisWebSocketClient | None = None,
+    quote_fn: Callable[[str], Awaitable[int]] | None = None,
     session: aiohttp.ClientSession | None = None,
     now_fn: Callable[[], pd.Timestamp] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] | None = None,
 ) -> int:
-    """페이퍼 세션을 실행하고 체결 건수를 반환한다. 체결은 원장에 즉시 flush한다. 청산 세션은 전량 청산, 정규장 종료 프린트, 장마감 벽시계 데드라인 중 먼저 오는 조건에서 끝나며, 종료 전 스트림 단절은 재연결 한도까지 복구하고 초과하면 PaperExitStreamError를 던진다."""
+    """페이퍼 세션을 실행하고 체결 건수를 반환한다. 체결은 원장에 즉시 flush한다. 청산은 미청산 포지션을 D+1 KRX 시가단일가로 시장가 청산한다.
+
+    Raises:
+        ValueError: unknown phase or non-same-day exit.
+    """
     if phase not in ("entry", "exit"):
         raise ValueError(f"unknown phase {phase!r}")
     ledger = ledger or PaperLedger()
@@ -208,80 +215,60 @@ async def run_paper_session(
             ledger.record(order_rows, kind="orders")
         refresh_trade_ledgers(ledger, settings.PAPER_SEED_CAPITAL, date_str)
         return len(fills)
-    placed_at = _placed_at(date_str, PAPER_EXIT_SESSION_START_HHMMSS)
-    positions = ledger.load_open_positions()
-    orders = build_exit_orders(positions, date_str, placed_at, moc=False)
-    # 청산할 포지션이 없으면 웹소켓을 열지 않는다(빈 구독은 스트림 계약상 ValueError)
+    placed_at = _placed_at(date_str, PAPER_EXIT_OPEN_AUCTION_HHMMSS)
+    orders = build_exit_orders(ledger.load_open_positions(), date_str, placed_at)
     if not orders:
         logger.info("[DATA] stage=paper_exit status=SKIP reason=no_open_positions date=%s", date_str)
         return 0
-    session_end = _placed_at(date_str, PAPER_EXIT_SESSION_END_HHMMSS)
     now = now_fn() if now_fn is not None else pd.Timestamp.now(tz="Asia/Seoul")
-    remaining_seconds = (session_end - now).total_seconds()
-    if remaining_seconds <= 0:
-        logger.warning("[DATA] stage=paper_exit status=SKIP reason=past_session_end date=%s", date_str)
-        return 0
+    if now.strftime("%Y-%m-%d") != date_str:
+        raise ValueError(f"paper exit open quote is same-day only: decision_date={date_str} now={now.date()}")
+    earliest = _placed_at(date_str, PAPER_EXIT_OPEN_QUOTE_EARLIEST_HHMMSS)
+    if now < earliest:
+        await sleep_fn((earliest - now).total_seconds())
+    observed_at = max(now, earliest)
     owned_session: aiohttp.ClientSession | None = None
-    if ws_client is None:
-        if session is None:  # pragma: no cover - live KIS boundary
-            owned_session = aiohttp.ClientSession()
-            session = owned_session
-        # 체결틱 구독은 시세 조회라 데이터 계좌 키를 쓴다(체결 계좌 키는 실주문 전용).
-        creds = kis_data_client_kwargs()
-        key = await issue_approval_key(session, creds["app_key"], creds["app_secret"])
-        ws_client = KisWebSocketClient(approval_key=key)
-    codes = sorted({o.symbol for o in orders})
-    fills: list[dict] = []
-    filled_ids: set[str] = set()
-    reconnects = 0
-    stream_exhausted = False
     try:
-        # 장마감 벽시계 데드라인: 프린트가 끊겨도 oneshot 세션이 다음 날까지 살아남지 않는다
-        async with asyncio.timeout(remaining_seconds):
-            while True:
-                session_over = False
-                try:
-                    async with contextlib.aclosing(ws_client.stream(session, codes)) as prints:
-                        async for symbol, hhmmss, price in prints:
-                            print_ts = _placed_at(date_str, hhmmss)
-                            if print_ts >= placed_at:
-                                if hhmmss >= PAPER_EXIT_MOC_HHMMSS:
-                                    orders = [dataclasses.replace(o, limit_price=None, reason="moc_exit") if (o.order_id not in filled_ids and o.limit_price is not None) else o for o in orders]
-                                for order in [o for o in orders if o.symbol == symbol and o.order_id not in filled_ids]:
-                                    fill = decide_fill(order, price, print_ts)
-                                    if fill is not None:
-                                        filled_ids.add(order.order_id)
-                                        fills.append(
-                                            {
-                                                "order_id": fill.order_id,
-                                                "symbol": fill.symbol,
-                                                "side": fill.side,
-                                                "qty": fill.qty,
-                                                "fill_price": fill.fill_price,
-                                                "filled_at": fill.filled_at,
-                                                "decision_date": order.decision_date,
-                                                "trigger": fill.trigger,
-                                                "entry_order_id": order.entry_order_id,
-                                            }
-                                        )
-                            # 전량 청산 또는 정규장 종료 프린트 이후에는 더 받을 체결 기회가 없다
-                            if len(filled_ids) == len(orders) or hhmmss >= PAPER_EXIT_SESSION_END_HHMMSS:
-                                session_over = True
-                                break
-                except (aiohttp.ClientError, ConnectionError) as exc:
-                    logger.warning("[EXEC] stage=paper_exit status=STREAM_ERROR date=%s reason=%s", date_str, type(exc).__name__)
-                if session_over:
-                    break
-                reconnects += 1
-                if reconnects > PAPER_EXIT_MAX_RECONNECTS:
-                    stream_exhausted = True
-                    break
-                logger.warning("[EXEC] stage=paper_exit status=RECONNECT date=%s attempt=%d unfilled=%d", date_str, reconnects, len(orders) - len(filled_ids))
-                await sleep_fn(PAPER_EXIT_RECONNECT_BACKOFF_SECONDS)
-    except TimeoutError:
-        logger.warning(
-            "[DATA] stage=paper_exit status=DEADLINE date=%s unfilled=%d", date_str, len(orders) - len(filled_ids)
-        )
+        if quote_fn is None:
+            if session is None:  # pragma: no cover - live KIS boundary
+                owned_session = aiohttp.ClientSession()
+                session = owned_session
+            client = KisApiClient(**kis_data_client_kwargs())
+
+            async def quote_fn(code: str) -> int:
+                return await fetch_krx_open_quote(client, session, code)
+
+        open_prices: dict[str, int] = {}
+        pending = sorted({o.symbol for o in orders})
+        for attempt in range(PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS):
+            for code in pending:
+                price = await quote_fn(code)
+                if price > 0:
+                    open_prices[code] = price
+            pending = [c for c in pending if c not in open_prices]
+            if not pending:
+                break
+            if attempt < PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS - 1:
+                await sleep_fn(PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS)
+        fills: list[dict] = []
+        filled_ids: set[str] = set()
+        for order in orders:
+            fill = build_open_auction_fill(order, open_prices.get(order.symbol, 0), observed_at)
+            if fill is not None:
+                filled_ids.add(order.order_id)
+                fills.append(
+                    {
+                        "order_id": fill.order_id,
+                        "symbol": fill.symbol,
+                        "side": fill.side,
+                        "qty": fill.qty,
+                        "fill_price": fill.fill_price,
+                        "filled_at": fill.filled_at,
+                        "decision_date": order.decision_date,
+                        "trigger": fill.trigger,
+                        "entry_order_id": order.entry_order_id,
+                    }
+                )
     finally:
         if owned_session is not None:
             await owned_session.close()  # pragma: no cover - live KIS boundary
@@ -294,10 +281,12 @@ async def run_paper_session(
         ],
         kind="orders",
     )
+    if len(filled_ids) < len(orders):
+        unfilled_symbols = sorted({o.symbol for o in orders if o.order_id not in filled_ids})
+        logger.warning(
+            "[EXEC] stage=paper_exit status=OPEN_UNAVAILABLE date=%s symbols=%s", date_str, unfilled_symbols
+        )
     refresh_trade_ledgers(ledger, settings.PAPER_SEED_CAPITAL, date_str)
-    if stream_exhausted:
-        logger.error("[EXEC] stage=paper_exit status=STREAM_EXHAUSTED date=%s unfilled=%d", date_str, len(orders) - len(filled_ids))
-        raise PaperExitStreamError(f"exit stream dropped {reconnects} times before session end on {date_str}")
     return len(fills)
 
 

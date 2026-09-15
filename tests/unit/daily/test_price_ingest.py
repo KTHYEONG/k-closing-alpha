@@ -502,6 +502,7 @@ def test_run_price_ingest_missing_panel_raises(tmp_path) -> None:
 def test_main_runs_ingest_with_defaults(monkeypatch) -> None:
     import src.daily.price_ingest as mod
     import src.strategy.growth_shadow as growth_shadow
+    import src.strategy.t1_attribution as t1_attribution
 
     seen = []
 
@@ -512,6 +513,7 @@ def test_main_runs_ingest_with_defaults(monkeypatch) -> None:
     monkeypatch.setattr(mod, "run_price_ingest", _fake)
     monkeypatch.setattr(mod, "record_run_outcome", lambda *a, **k: {})
     monkeypatch.setattr(growth_shadow, "run_growth_shadow", lambda: 0)
+    monkeypatch.setattr(t1_attribution, "run_t1_attribution", lambda: 0)
     mod.main()
     assert [sorted(k) for k in seen] == [["on_outcome"]]
 
@@ -586,25 +588,6 @@ def test_fetch_all_flows_uses_toss_program_fallback() -> None:
 
     assert sources["program"] == {"kis": 1, "toss": 1}
     assert toss.calls == ["000004"]
-
-
-def test_price_ingest_main_runs_growth_shadow_after_ingest(monkeypatch):
-    import src.daily.price_ingest as price_ingest
-    import src.strategy.growth_shadow as growth_shadow
-
-    calls = []
-
-    async def fake_ingest(**_kwargs):
-        calls.append("ingest")
-
-    def fake_shadow():
-        calls.append("shadow")
-        return 0
-
-    monkeypatch.setattr(price_ingest, "run_price_ingest", fake_ingest)
-    monkeypatch.setattr(growth_shadow, "run_growth_shadow", fake_shadow)
-    price_ingest.main()
-    assert calls == ["ingest", "shadow"]
 
 
 def test_assemble_new_rows_and_compute_flow_coverage() -> None:
@@ -777,6 +760,7 @@ def test_price_ingest_main_wires_outcome_recorder(monkeypatch) -> None:
 
     import src.daily.price_ingest as mod
     import src.strategy.growth_shadow as growth_shadow
+    import src.strategy.t1_attribution as t1_attribution
 
     seen: list[dict] = []
 
@@ -788,6 +772,7 @@ def test_price_ingest_main_wires_outcome_recorder(monkeypatch) -> None:
     monkeypatch.setattr(mod, "run_price_ingest", _fake)
     monkeypatch.setattr(mod, "record_run_outcome", recorder)
     monkeypatch.setattr(growth_shadow, "run_growth_shadow", lambda: 0)
+    monkeypatch.setattr(t1_attribution, "run_t1_attribution", lambda: 0)
 
     # When
     mod.main()
@@ -821,3 +806,32 @@ def test_merge_and_adjust_keeps_raw_volume_and_close_raw() -> None:
     assert m.loc[d[0], "close_raw"] == pytest.approx(10000.0)
     assert m.loc[d[2], "close_raw"] == pytest.approx(2100.0)
     assert m.loc[d[2], "volume"] == pytest.approx(5000.0)
+
+
+def test_price_ingest_main_runs_growth_shadow_then_t1_attribution_after_ingest(monkeypatch):
+    import src.daily.price_ingest as price_ingest
+    import src.strategy.growth_shadow as growth_shadow
+    import src.strategy.t1_attribution as t1_attribution
+
+    calls = []
+
+    async def fake_ingest(**_kwargs):
+        calls.append("ingest")
+
+    def fake_shadow():
+        calls.append("shadow")
+        return 0
+
+    def fake_attribution():
+        calls.append("attribution")
+        return 0
+
+    monkeypatch.setattr(price_ingest, "run_price_ingest", fake_ingest)
+    monkeypatch.setattr(growth_shadow, "run_growth_shadow", fake_shadow)
+    monkeypatch.setattr(t1_attribution, "run_t1_attribution", fake_attribution)
+
+    # When
+    price_ingest.main()
+
+    # Then
+    assert calls == ["ingest", "shadow", "attribution"]
