@@ -356,3 +356,33 @@ def test_finalize_close_still_hands_off_to_paper_entry_via_execstoppost() -> Non
 
     # Then: 빠른 경로(ExecStopPost)는 그대로 유지 — 독립 타이머는 보증 경로일 뿐 대체가 아니다
     assert "ExecStopPost=/usr/bin/systemctl --user start --no-block kca-paper-entry.service" in lines
+def test_kis_token_warmup_timer_precedes_first_kis_job() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    timer = (root / "kca-kis-token-warmup.timer").read_text(encoding="utf-8")
+    service = (root / "kca-kis-token-warmup.service").read_text(encoding="utf-8")
+
+    assert "OnCalendar=Mon..Fri 07:05:00 Asia/Seoul" in timer
+    assert "Unit=kca-kis-token-warmup.service" in timer
+    assert "Persistent=true" in timer
+    assert "ExecStart=%h/.local/bin/uv run python -m src.tools.kis_token_warmup" in service
+    assert "OnFailure=kca-alert@%n.service" in service
+    assert "Type=oneshot" in service
+
+
+def test_decision_window_services_pin_decision_data_role() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    decision = {
+        "kca-collect.service",
+        "kca-finalize-close.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+    }
+
+    for svc in sorted(root.glob("kca-*.service")):
+        text = svc.read_text(encoding="utf-8")
+        assert ("Environment=KIS_DATA_ROLE=decision" in text) == (svc.name in decision), svc.name
+

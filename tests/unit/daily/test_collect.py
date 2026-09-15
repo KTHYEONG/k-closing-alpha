@@ -1159,6 +1159,8 @@ def test_superseded_unresolved_instrument_helpers_are_removed() -> None:
 
 
 def test_collect_module_constants_sourced_from_data_account_kwargs() -> None:
+    from pathlib import Path
+
     from src.daily import collect
 
     kwargs = collect.kis_data_client_kwargs()
@@ -1167,7 +1169,7 @@ def test_collect_module_constants_sourced_from_data_account_kwargs() -> None:
     assert kwargs["app_secret"] == collect.APP_SECRET
     assert kwargs["account_id"] == collect.ACCOUNT_ID
     assert kwargs["hts_id"] == collect.HTS_ID
-    assert kwargs["token_file"] == collect.TOKEN_FILE
+    assert Path(kwargs["token_file"]).name == Path(collect.TOKEN_FILE).name
 
 
 def test_resolve_prev_trading_day_kis_skips_weekend_and_kis_holiday(monkeypatch) -> None:

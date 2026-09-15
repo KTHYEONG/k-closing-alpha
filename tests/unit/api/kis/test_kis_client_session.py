@@ -124,7 +124,7 @@ def test_kis_ensure_token_writes_token_file_atomically_with_owner_only_mode(tmp_
     assert saved["access_token"] == "TOK"
     assert saved["app_key"] == "k"
     # And: 임시 파일 잔여물이 없다
-    assert [p.name for p in tmp_path.iterdir()] == [token_file.name]
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([token_file.name, token_file.name + ".lock"])
 
 
 def test_kis_ensure_token_creates_missing_parent_directory_before_writing(tmp_path) -> None:

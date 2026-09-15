@@ -29,6 +29,8 @@ class KisSettings(BaseSettings):
     KIS_DATA_APP_KEY: str = Field(default="")
     KIS_DATA_APP_SECRET: str = Field(default="")
     KIS_DATA_HTS_ID: str = Field(default="")
+    KIS_DATA_ROLE: str = Field(default="batch")
+    KIS_TOKEN_CACHE_DIR: Path = Field(default_factory=lambda: Path.home() / ".cache" / "kis")
     KIS_BASE_URL: str = "https://openapi.koreainvestment.com:9443"
 
     @computed_field  # type: ignore[prop-decorator]
