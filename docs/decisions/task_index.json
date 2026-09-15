@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "kis_key_pool",
+      "date": "2026-09-15",
+      "adr_id": "ADR_20260915_kis_key_pool",
+      "domain": "api/kis",
+      "title": "KIS 데이터 키 풀 호스트 고정 배정 및 1일 1회 토큰 발급",
+      "why": "or-vps 자동운영 시 다중 호스트/프로젝트가 동일 KIS 앱키 토큰을 각자 재발급해 1일 1회 원칙과 TPS 예산이 흔들림",
+      "resolution": "키를 호스트/역할에 고정 배정(key_pool), 앱키 해시 기반 호스트 공유 토큰 캐시+파일락+07:05 warmup, host-paced rate limiter, indicators TRADE키 누수 제거",
+      "impact": "결정창(15:15-15:35) 토큰 재발급 차단, 앱키당 발급 1일1회 보장, TPS 예산이 호스트 단위로 공유되어 초과 위험 감소"
+    },
+    {
       "task_id": "PAPER_ENTRY_BACKSTOP_TIMER",
       "date": "2026-09-15",
       "adr_id": "ADR_20260915_PAPER_ENTRY_BACKSTOP_TIMER",
@@ -989,16 +999,6 @@
       "why": "분봉/호가는 KIS가 당일만 제공(FHKST03010200)해 과거 ADR에서 백필불가로 제외됐고, 실계좌가 SOR로 NXT까지 라우팅됨이 확인돼 기존 collect.py의 단일벤뉴 현재가 조회가 실제 체결가와 괴리될 위험이 있었음. archive.py는 실제 캡처시각(mtime)을 계산해두고도 날짜만 저장해 15:30 관례로 덮어쓰는 버그도 발견.",
       "resolution": "get_intraday_minute_chart(FHKST03010200, floor/end hour 페이지네이션)로 정규세션 1m bars와 NXT 애프터마켓 1m bars를 별도 파티션(data/history/intraday/{interval}m/{session}/)에 저장하는 저녁 1회 독립 CLI(archive_intraday.py) 신설. collect.py::fetch_single_stock은 J/NX 듀얼벤뉴 현재가를 병렬조회해 krx_현재가/nxt_현재가/sor_effective_price(유동성게이트) 부착. archive.py::main()의 snapshot_timestamp 유실 버그 수정. parquet 원자적쓰기를 io_utils.py로 추출 공유. FHKST03010230(주식일별분봉조회, 최대 1년 서버보관)을 활용한 1회성 과거 백필은 범위 밖 후속 작업으로 문서화(docs/architecture/data_collection.md §7).",
       "impact": "condition_history 워치리스트 스코프로 저장용량 억제(연 ~700MB@1m). archive.py 실시간 흐름(~15:18)과 archive_intraday 저녁 실행(20:00+)을 분리해 애프터마켓 구간 유실 방지. 기존 종가/close_price 필드 값·의미 불변, krx_현재가/nxt_현재가/sor_effective_price는 신규 추가 컬럼. NXT 미상장/저유동성 종목은 정상 스킵(에러 아님). lean_check --spec 및 /check 감사 PASS."
-    },
-    {
-      "task_id": "TASK_ML_EXIT_POLICY_RESEARCH",
-      "date": "2026-09-03",
-      "adr_id": "ADR_20260903_ML_EXIT_POLICY_RESEARCH",
-      "domain": "signal",
-      "title": "Close-morning 익일 익절 청산 규칙 리서치/평가 레이어",
-      "why": "리랭커는 데이터로 재확인된 포화 상태(rankIC 0.20, top-1 net ~1.35%/일, 모든 목적함수·모델클래스가 huber 기본값 못 이김). 코드에 청산 모델이 전무해 net_return을 익일 시가 매도로 고정 사용. 익일 next_high가 시가보다 크게 위(오라클 +8%/일)라 청산 타이밍에 미탐색 헤드룸 존재.",
-      "resolution": "src/ml/exit_policy.py 신설(robust_eval.py와 동급 리서치 모듈): attach_next_day_path(익일 OHLC 조인), simulate_take_profit_exit(무-룩어헤드 지정가+MOC 폴백, 결정론적/시드 체결모델), evaluate_exit_grid(CPCV 만장일치 경로 + moving-block bootstrap 승격 게이트), summarize_exit_grid. champion.py train_tuned_champion_bundle에 배선 -> tuning_provenance['exit_policy_grid'] 기록 전용, 서빙/번들 런타임 불변. 실데이터 결과: TP 5%/MOC = +0.84%/일 vs 현행 +0.43%, Δ +41bp p=0.0024, 28개 CPCV 경로 전부 양(+). 보수적 체결가정(85% 체결,-0.3%)에서는 Δ +23bp p=0.11로 유의성 소멸 -> 실체결률 측정이 승격 선결과제.",
-      "impact": "리랭커 피처 연구 동결 유지. 신규 청산 레버는 결정론적 가정 하 게이트 통과했으나 배포 안 함(별도 승격 ADR 필요). champion 번들 provenance에 exit_policy_grid 키 추가, price_history_df=None이면 status:skipped로 기존 동작 불변."
     }
   ]
 }
