@@ -452,7 +452,7 @@ class KisApiClient:
             start_date: 시작일자 (YYYYMMDD)
             end_date: 종료일자 (YYYYMMDD)
             period_code: D(일), W(주), M(월), Y(년)
-            adj_price: 수정주가 반영여부 (0: 미반영, 1: 반영)
+            adj_price: 수정주가 반영여부 (0: 수정주가, 1: 원주가)
         
         Returns:
             dict: API 응답 데이터
