@@ -7,21 +7,85 @@
 
 from __future__ import annotations
 
+import collections
 import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet
+from src.execution.cost_model import BROKERAGE_FEE_BP, statutory_bp_asof
 
 logger = logging.getLogger(__name__)
 
 # exit-timing 레버 실측(TP 5% 지정가 + MOC 폴백)에서 유래한 익절 폭.
 PAPER_TAKE_PROFIT_RATIO: float = 0.05
+
+ORDER_STATUS_FILLED: str = "FILLED"
+ORDER_STATUS_UNCONFIRMED: str = "UNCONFIRMED"
+ORDER_STATUS_NO_SNAPSHOT_ROW: str = "NO_SNAPSHOT_ROW"
+ORDER_STATUS_ZERO_QTY: str = "ZERO_QTY"
+ORDER_STATUS_UNFILLED: str = "UNFILLED"
+ORDER_STATUSES: tuple[str, ...] = (
+    ORDER_STATUS_FILLED,
+    ORDER_STATUS_UNCONFIRMED,
+    ORDER_STATUS_NO_SNAPSHOT_ROW,
+    ORDER_STATUS_ZERO_QTY,
+    ORDER_STATUS_UNFILLED,
+)
+
+# 왕복 수수료를 매수/매도 편도로 나눈다(체결가에는 스프레드가 이미 반영돼 명시비용만 부과)
+PAPER_BROKERAGE_SIDE_BP: float = BROKERAGE_FEE_BP / 2.0
+
+ROUND_TRIP_COLUMNS: tuple[str, ...] = (
+    "entry_order_id",
+    "exit_order_id",
+    "symbol",
+    "decision_date",
+    "entry_filled_at",
+    "exit_filled_at",
+    "qty",
+    "entry_price",
+    "exit_price",
+    "exit_trigger",
+    "gross_pnl",
+    "buy_fee",
+    "sell_fee",
+    "sell_tax",
+    "cost",
+    "net_pnl",
+    "gross_ret",
+    "net_ret",
+)
+
+NAV_COLUMNS: tuple[str, ...] = (
+    "as_of_date",
+    "seed_capital",
+    "cash",
+    "open_cost_basis",
+    "open_buy_fees",
+    "realized_net_pnl",
+    "cumulative_cost",
+    "nav",
+    "n_open_positions",
+    "n_closed_trades",
+    "recorded_at",
+)
+
+LEDGER_KINDS: tuple[str, ...] = ("orders", "fills", "decisions", "trades", "nav")
+
+_LEDGER_DEDUP_KEYS: dict[str, list[str]] = {
+    "orders": ["order_id"],
+    "fills": ["order_id"],
+    "decisions": ["decision_date", "symbol"],
+    "trades": ["exit_order_id"],
+    "nav": ["as_of_date"],
+}
 
 
 @dataclass(frozen=True)
@@ -106,6 +170,225 @@ def build_auction_fill(order: PaperOrder, decision_row: dict[str, Any]) -> Paper
     )
 
 
+def order_record(order: PaperOrder, status: str) -> dict[str, Any]:
+    """Build a terminal order ledger row for a paper order.
+
+    Args:
+        order: Paper order to record.
+        status: One of ORDER_STATUSES.
+
+    Returns:
+        Ledger row dict with recorded_at timestamp.
+
+    Raises:
+        ValueError: When status is not a known order status.
+    """
+    if status not in ORDER_STATUSES:
+        raise ValueError(f"unknown order status {status!r}")
+    return {
+        "order_id": order.order_id,
+        "decision_date": order.decision_date,
+        "symbol": order.symbol,
+        "side": order.side,
+        "qty": order.qty,
+        "limit_price": order.limit_price,
+        "placed_at": order.placed_at,
+        "reason": order.reason,
+        "status": status,
+        "recorded_at": pd.Timestamp.now(tz="Asia/Seoul"),
+    }
+
+
+def build_round_trips(fills: pd.DataFrame) -> pd.DataFrame:
+    """Pair buy/sell fills into FIFO round trips with explicit costs.
+
+    Args:
+        fills: Fill ledger rows in record order.
+
+    Returns:
+        Round-trip frame with ROUND_TRIP_COLUMNS schema.
+
+    Raises:
+        ValueError: On sell without open buy, qty mismatch, missing sell
+            filled_at, or unknown fill side.
+    """
+    if fills is None or fills.empty:
+        return pd.DataFrame(columns=list(ROUND_TRIP_COLUMNS))
+    records = fills.to_dict("records")
+    open_buys: dict[str, collections.deque[dict[str, Any]]] = {}
+    rows: list[dict[str, Any]] = []
+    for rec in records:
+        side = rec.get("side")
+        symbol = str(rec.get("symbol"))
+        if side == "buy":
+            open_buys.setdefault(symbol, collections.deque()).append(rec)
+        elif side == "sell":
+            queue = open_buys.get(symbol)
+            if not queue:
+                raise ValueError(f"sell fill {rec.get('order_id')} without an open buy for {symbol}")
+            buy = queue.popleft()
+            qty = int(rec["qty"])
+            buy_qty = int(buy["qty"])
+            if qty != buy_qty:
+                raise ValueError(f"sell qty {qty} != buy qty {buy_qty} for {symbol}")
+            sell_filled_at = rec.get("filled_at")
+            if sell_filled_at is None or pd.isna(sell_filled_at):
+                raise ValueError(f"sell fill {rec.get('order_id')} has no filled_at")
+            entry_price = int(buy["fill_price"])
+            exit_price = int(rec["fill_price"])
+            entry_notional = entry_price * qty
+            exit_notional = exit_price * qty
+            buy_fee = math.floor(entry_notional * PAPER_BROKERAGE_SIDE_BP / 10_000)
+            sell_fee = math.floor(exit_notional * PAPER_BROKERAGE_SIDE_BP / 10_000)
+            tax_bp = float(
+                statutory_bp_asof(
+                    np.array([np.datetime64(pd.Timestamp(sell_filled_at).strftime("%Y-%m-%d"))])
+                )[0]
+            )
+            sell_tax = math.floor(exit_notional * tax_bp / 10_000)
+            cost = buy_fee + sell_fee + sell_tax
+            gross_pnl = exit_notional - entry_notional
+            net_pnl = gross_pnl - cost
+            rows.append(
+                {
+                    "entry_order_id": buy.get("order_id"),
+                    "exit_order_id": rec.get("order_id"),
+                    "symbol": symbol,
+                    "decision_date": str(buy.get("decision_date")),
+                    "entry_filled_at": buy.get("filled_at"),
+                    "exit_filled_at": rec.get("filled_at"),
+                    "qty": qty,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "exit_trigger": rec.get("trigger"),
+                    "gross_pnl": gross_pnl,
+                    "buy_fee": buy_fee,
+                    "sell_fee": sell_fee,
+                    "sell_tax": sell_tax,
+                    "cost": cost,
+                    "net_pnl": net_pnl,
+                    "gross_ret": exit_price / entry_price - 1.0,
+                    "net_ret": net_pnl / entry_notional,
+                }
+            )
+        else:
+            raise ValueError(f"unknown fill side {side!r}")
+    if not rows:
+        return pd.DataFrame(columns=list(ROUND_TRIP_COLUMNS))
+    return pd.DataFrame(rows, columns=list(ROUND_TRIP_COLUMNS))
+
+
+def build_nav_snapshot(fills: pd.DataFrame, seed_capital: int, as_of_date: str) -> pd.DataFrame:
+    """Build a single-row NAV snapshot from the fill ledger.
+
+    Args:
+        fills: Fill ledger rows.
+        seed_capital: Starting capital in KRW.
+        as_of_date: Snapshot date string.
+
+    Returns:
+        One-row frame with NAV_COLUMNS schema.
+    """
+    if fills is None or fills.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "as_of_date": as_of_date,
+                    "seed_capital": int(seed_capital),
+                    "cash": int(seed_capital),
+                    "open_cost_basis": 0,
+                    "open_buy_fees": 0,
+                    "realized_net_pnl": 0,
+                    "cumulative_cost": 0,
+                    "nav": int(seed_capital),
+                    "n_open_positions": 0,
+                    "n_closed_trades": 0,
+                    "recorded_at": pd.Timestamp.now(tz="Asia/Seoul"),
+                }
+            ],
+            columns=list(NAV_COLUMNS),
+        )
+    trips = build_round_trips(fills)
+    records = fills.to_dict("records")
+    buy_outflow = 0
+    total_buy_fees = 0
+    for rec in records:
+        if str(rec.get("side")) == "buy":
+            notional = int(rec.get("fill_price")) * int(rec.get("qty"))
+            fee = math.floor(notional * PAPER_BROKERAGE_SIDE_BP / 10_000)
+            buy_outflow += notional + fee
+            total_buy_fees += fee
+    closed_ids = set(trips["entry_order_id"].tolist()) if not trips.empty else set()
+    open_cost_basis = 0
+    open_buy_fees = 0
+    n_open = 0
+    for rec in records:
+        if str(rec.get("side")) == "buy" and rec.get("order_id") not in closed_ids:
+            notional = int(rec.get("fill_price")) * int(rec.get("qty"))
+            fee = math.floor(notional * PAPER_BROKERAGE_SIDE_BP / 10_000)
+            open_cost_basis += notional
+            open_buy_fees += fee
+            n_open += 1
+    exit_inflow = 0
+    realized_net_pnl = 0
+    sell_costs = 0
+    if not trips.empty:
+        for _, t in trips.iterrows():
+            exit_inflow += int(t["exit_price"]) * int(t["qty"]) - int(t["sell_fee"]) - int(t["sell_tax"])
+            sell_costs += int(t["sell_fee"]) + int(t["sell_tax"])
+        realized_net_pnl = int(trips["net_pnl"].sum())
+    cash = int(seed_capital) - buy_outflow + exit_inflow
+    cumulative_cost = total_buy_fees + sell_costs
+    nav = cash + open_cost_basis
+    return pd.DataFrame(
+        [
+            {
+                "as_of_date": as_of_date,
+                "seed_capital": int(seed_capital),
+                "cash": int(cash),
+                "open_cost_basis": int(open_cost_basis),
+                "open_buy_fees": int(open_buy_fees),
+                "realized_net_pnl": int(realized_net_pnl),
+                "cumulative_cost": int(cumulative_cost),
+                "nav": int(nav),
+                "n_open_positions": int(n_open),
+                "n_closed_trades": len(trips),
+                "recorded_at": pd.Timestamp.now(tz="Asia/Seoul"),
+            }
+        ],
+        columns=list(NAV_COLUMNS),
+    )
+
+
+def refresh_trade_ledgers(ledger: PaperLedger, seed_capital: int, as_of_date: str) -> int:
+    """Refresh derived trade and NAV ledgers from fills.
+
+    Args:
+        ledger: Paper ledger to read fills from and write to.
+        seed_capital: Starting capital in KRW.
+        as_of_date: Snapshot date string.
+
+    Returns:
+        Number of closed round trips.
+    """
+    fills = ledger.load("fills")
+    trips = build_round_trips(fills)
+    if not trips.empty:
+        ledger.record(trips.to_dict("records"), kind="trades")
+    nav_df = build_nav_snapshot(fills, seed_capital, as_of_date)
+    ledger.record(nav_df.to_dict("records"), kind="nav")
+    nav_row = nav_df.iloc[0]
+    logger.info(
+        "[PORTFOLIO] stage=paper_ledger_refresh as_of=%s n_trades=%d nav=%d cash=%d n_open=%d",
+        as_of_date,
+        len(trips),
+        int(nav_row["nav"]),
+        int(nav_row["cash"]),
+        int(nav_row["n_open_positions"]),
+    )
+    return len(trips)
+
+
 class PaperLedger:
     """온디스크 페이퍼 원장. 매 상태전이마다 즉시 flush한다(WSL 재기동 내성)."""
 
@@ -131,12 +414,30 @@ class PaperLedger:
         atomic_write_parquet(merged, target)
         return len(merged)
 
+    def load(self, kind: str) -> pd.DataFrame:
+        """Load a ledger parquet store.
+
+        Args:
+            kind: Ledger kind in LEDGER_KINDS.
+
+        Returns:
+            Stored frame, or an empty frame when the file is absent.
+
+        Raises:
+            ValueError: When kind is unknown.
+        """
+        if kind not in LEDGER_KINDS:
+            raise ValueError(f"unknown ledger kind {kind!r}")
+        target = self._store(kind)
+        if not target.exists():
+            return pd.DataFrame()
+        return pd.read_parquet(target)
+
     def record(self, rows: list[dict[str, Any]], kind: str) -> int:
         """kind별 parquet에 원자적으로 append-merge한다."""
-        if kind not in ("orders", "fills", "decisions"):
+        if kind not in LEDGER_KINDS:
             raise ValueError(f"unknown ledger kind {kind!r}")
-        keys = ["order_id"] if kind in ("orders", "fills") else ["decision_date", "symbol"]
-        return self._append(rows, kind, keys)
+        return self._append(rows, kind, _LEDGER_DEDUP_KEYS[kind])
 
     def record_no_decision(self, decision_date: str, reason: str) -> int:
         """결정 0건인 날도 '결정 없음' 행으로 명시 기록한다(무기록 금지)."""

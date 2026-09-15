@@ -29,11 +29,18 @@ from src.config.market_session import (
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.predict import load_topk_decision
 from src.execution.paper_broker import (
+    ORDER_STATUS_FILLED,
+    ORDER_STATUS_NO_SNAPSHOT_ROW,
+    ORDER_STATUS_UNCONFIRMED,
+    ORDER_STATUS_UNFILLED,
+    ORDER_STATUS_ZERO_QTY,
     PAPER_TAKE_PROFIT_RATIO,
     PaperLedger,
     PaperOrder,
     build_auction_fill,
     decide_fill,
+    order_record,
+    refresh_trade_ledgers,
     size_order_qty,
 )
 
@@ -133,16 +140,38 @@ async def run_paper_session(
         orders = build_entry_orders(
             picks, date_str, seed_capital=settings.PAPER_SEED_CAPITAL, placed_at=placed_at
         )
+        order_rows: list[dict] = []
+        order_symbols = {o.symbol for o in orders}
+        for _, pick_row in picks.iterrows():
+            sym = str(pick_row["symbol"])
+            if sym not in order_symbols:
+                order_rows.append(
+                    order_record(
+                        PaperOrder(
+                            order_id=f"{date_str}:{sym}:entry",
+                            decision_date=date_str,
+                            symbol=sym,
+                            side="buy",
+                            qty=0,
+                            limit_price=None,
+                            placed_at=placed_at,
+                            reason="entry",
+                        ),
+                        ORDER_STATUS_ZERO_QTY,
+                    )
+                )
         by_code = snap.set_index("종목코드").to_dict("index") if not snap.empty else {}
         fills: list[dict] = []
         for order in orders:
             row = by_code.get(order.symbol)
             if row is None:
                 logger.warning("[DATA] stage=paper_entry symbol=%s status=NO_SNAPSHOT_ROW", order.symbol)
+                order_rows.append(order_record(order, ORDER_STATUS_NO_SNAPSHOT_ROW))
                 continue
             fill = build_auction_fill(order, row)
             if fill is None:
                 logger.warning("[DATA] stage=paper_entry symbol=%s status=UNCONFIRMED", order.symbol)
+                order_rows.append(order_record(order, ORDER_STATUS_UNCONFIRMED))
                 continue
             fills.append(
                 {
@@ -156,8 +185,12 @@ async def run_paper_session(
                     "trigger": fill.trigger,
                 }
             )
+            order_rows.append(order_record(order, ORDER_STATUS_FILLED))
         if fills:
             ledger.record(fills, kind="fills")
+        if order_rows:
+            ledger.record(order_rows, kind="orders")
+        refresh_trade_ledgers(ledger, settings.PAPER_SEED_CAPITAL, date_str)
         return len(fills)
     placed_at = _placed_at(date_str, PAPER_EXIT_SESSION_START_HHMMSS)
     positions = ledger.load_open_positions()
@@ -226,6 +259,14 @@ async def run_paper_session(
             await owned_session.close()  # pragma: no cover - live KIS boundary
     if fills:
         ledger.record(fills, kind="fills")
+    ledger.record(
+        [
+            order_record(o, ORDER_STATUS_FILLED if o.order_id in filled_ids else ORDER_STATUS_UNFILLED)
+            for o in orders
+        ],
+        kind="orders",
+    )
+    refresh_trade_ledgers(ledger, settings.PAPER_SEED_CAPITAL, date_str)
     return len(fills)
 
 

@@ -1056,3 +1056,82 @@ def test_finalize_close_amain_uses_data_account_client(monkeypatch) -> None:
 
     # Then
     assert built == [data_kwargs]
+
+
+def test_run_close_finalization_confirms_rows_from_float64_archive_flags(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import finalize_close
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    kst = ZoneInfo("Asia/Seoul")
+    decision_ts = pd.Timestamp("2026-09-15 15:20:18", tz="Asia/Seoul")
+    # Given: 아카이브 저장소 실측과 동일하게 종가_확정이 float64(0.0 / NaN)로 로드된다
+    snapshot = pd.DataFrame(
+        {
+            "스냅샷_날짜": ["2026-09-15", "2026-09-15"],
+            "종목코드": ["005930", "000660"],
+            "종가": [269250.0, 269250.0],
+            "전일종가": [269500.0, 269500.0],
+            "거래량": [19525671.0, 1000.0],
+            "거래대금": [52206.58, 26.9],
+            "등락률": [-0.09, -0.09],
+            "admitted": [True, False],
+            DECISION_CLOSE_COL: [269250.0, 269250.0],
+            CLOSE_CONFIRMED_COL: [0.0, float("nan")],
+            "snapshot_timestamp": [decision_ts, decision_ts],
+        }
+    )
+    assert str(snapshot[CLOSE_CONFIRMED_COL].dtype) == "float64"
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: snapshot.copy())
+    captured: list[pd.DataFrame] = []
+
+    def _fake_upsert(df, snapshot_date=None):
+        captured.append(df.copy())
+        return len(df)
+
+    monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", _fake_upsert)
+
+    class _Client:
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            return {
+                "rt_cd": "0",
+                "output": {
+                    "stck_prpr": "269000",
+                    "stck_oprc": "270000",
+                    "stck_hgpr": "272000",
+                    "stck_lwpr": "268000",
+                    "stck_sdpr": "269500",
+                    "acml_vol": "28037611",
+                    "acml_tr_pbmn": "7510369697500",
+                    "hts_avls": "1605000",
+                    "prdy_ctrt": "-0.19",
+                },
+            }
+
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": "112", "stck_prpr": "269000"}}
+
+    async def _no_sleep(_seconds):
+        return None
+
+    # When
+    n = asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date="2026-09-15",
+            client=_Client(),
+            session=object(),
+            now_fn=lambda: datetime(2026, 9, 15, 15, 30, 30, tzinfo=kst),
+            sleep_fn=_no_sleep,
+            retry_interval_seconds=0.0,
+        )
+    )
+
+    # Then: bool 대입 TypeError 없이 두 행 모두 확정되어 저장된다
+    assert n == 2
+    assert len(captured) == 1
+    assert captured[0][CLOSE_CONFIRMED_COL].astype(bool).tolist() == [True, True]

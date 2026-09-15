@@ -1013,27 +1013,20 @@ def save_production_bundle(bundle: dict[str, Any], export_dir: str = TOPK_RANKER
     return path
 
 
-def select_topk_equal_weight(
-    df: pd.DataFrame, bundle: dict[str, Any], *, top_k: int, date_col: str = "date", admitted_col: str = "admitted"
-) -> pd.DataFrame:
-    """Select the certified top-k by point-estimate rank with equal weights.
+def score_topk_candidates(df: pd.DataFrame, bundle: dict[str, Any]) -> pd.DataFrame:
+    """Score every snapshot row with the production bundle models.
 
     Args:
         df: Live snapshot with the bundle's feature columns.
         bundle: Production bundle carrying return/quantile/calibrator models.
-        top_k: Names to select; must equal the certified MIN_TOP_K.
-        date_col: Date column name for per-date selection.
-        admitted_col: Admission flag column; only flagged rows are selectable.
 
     Returns:
-        Top-k picks with pred, diagnostic columns and uniform allocation.
+        Copy of df with pred, quantile and calibration score columns.
 
     Raises:
-        ValueError: When top_k is not MIN_TOP_K, feature_cols is empty, or a
-            declared feature column is missing from the snapshot.
+        ValueError: When feature_cols is empty or a declared feature column
+            is missing from the snapshot.
     """
-    if int(top_k) != MIN_TOP_K:
-        raise ValueError(f"top_k {top_k!r} is not the certified MIN_TOP_K {MIN_TOP_K}")
     assert_bundle_screen_parity(bundle)
     feature_cols = list(bundle.get("feature_cols", []))
     if not feature_cols:
@@ -1059,6 +1052,31 @@ def select_topk_equal_weight(
             proba = calibrator.predict_proba(features)
             positive_idx = list(calibrator.classes_).index(True)
             work[name] = proba[:, positive_idx]
+    return work
+
+
+def select_topk_equal_weight(
+    df: pd.DataFrame, bundle: dict[str, Any], *, top_k: int, date_col: str = "date", admitted_col: str = "admitted"
+) -> pd.DataFrame:
+    """Select the certified top-k by point-estimate rank with equal weights.
+
+    Args:
+        df: Live snapshot with the bundle's feature columns.
+        bundle: Production bundle carrying return/quantile/calibrator models.
+        top_k: Names to select; must equal the certified MIN_TOP_K.
+        date_col: Date column name for per-date selection.
+        admitted_col: Admission flag column; only flagged rows are selectable.
+
+    Returns:
+        Top-k picks with pred, diagnostic columns and uniform allocation.
+
+    Raises:
+        ValueError: When top_k is not MIN_TOP_K, feature_cols is empty, or a
+            declared feature column is missing from the snapshot.
+    """
+    if int(top_k) != MIN_TOP_K:
+        raise ValueError(f"top_k {top_k!r} is not the certified MIN_TOP_K {MIN_TOP_K}")
+    work = score_topk_candidates(df, bundle)
     pool = work
     if admitted_col in work.columns:
         pool = work[np.asarray(work[admitted_col], dtype=bool)]
