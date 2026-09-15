@@ -12,7 +12,6 @@ def test_live_entrypoints_import_after_constant_consolidation() -> None:
         "src.ml.retrain",
         "src.ml.costaware_topk",
         "src.ml.topk_ranker_research",
-        "src.backfill.backfill_price",
         "src.backfill.backfill_altdata",
         "src.backfill.kis_flow_backfill",
         "src.backfill.intraday.backfill_minute_history",

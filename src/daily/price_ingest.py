@@ -31,7 +31,6 @@ from src.backfill.altdata.krx_api import (
     KRX_ENDPOINT_STK_DAILY,
     fetch_krx_openapi_day_strict,
 )
-from src.backfill.price.factors import compute_vkospi_proxy
 from src.data.panel_integrity import heal_price_history_panel
 from src.data.parquet_codec import write_price_history_parquet
 from src.strategy.contract import derive_chg_ratio
@@ -223,6 +222,38 @@ async def fetch_index_closes(
         return pd.DataFrame(columns=["date", "close"])
     out = pd.DataFrame(rows).drop_duplicates("date").sort_values("date")
     return out[(out["date"] >= start_ts) & (out["date"] <= pd.Timestamp(end).normalize())].reset_index(drop=True)
+
+
+def compute_vkospi_proxy(
+    index_close_df: pd.DataFrame,
+    *,
+    window: int = 20,
+    min_periods: int = 20,
+    output_col: str = "v_kospi",
+) -> pd.DataFrame:
+    """Build V-KOSPI proxy (historical volatility) from index close prices."""
+    if index_close_df is None or index_close_df.empty:
+        return pd.DataFrame(columns=["date", output_col])
+
+    if "date" not in index_close_df.columns or "close" not in index_close_df.columns:
+        return pd.DataFrame(columns=["date", output_col])
+
+    out = index_close_df.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    out = out.dropna(subset=["date", "close"]).sort_values("date")
+    out = out.drop_duplicates(subset=["date"], keep="last")
+    if out.empty:
+        return pd.DataFrame(columns=["date", output_col])
+
+    close_ratio = pd.to_numeric(out["close"] / out["close"].shift(1), errors="coerce")
+    log_ret = np.where(close_ratio > 0, np.log(close_ratio), np.nan)
+    roll_std = pd.Series(log_ret, index=out.index).rolling(
+        window=int(window),
+        min_periods=int(min_periods),
+    ).std(ddof=0)
+    out[output_col] = roll_std * np.sqrt(252.0) * 100.0
+    return out[["date", output_col]]
 
 
 def compute_index_columns(kospi: pd.DataFrame, kosdaq: pd.DataFrame) -> pd.DataFrame:
