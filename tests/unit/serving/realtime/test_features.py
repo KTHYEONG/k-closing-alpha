@@ -186,3 +186,37 @@ def test_build_topk_ranker_features_with_price_history_requires_market_column() 
     with pytest.raises(ValueError, match="시장구분"):
         build_topk_ranker_features(df, pd.Timestamp("2026-09-09"), price_history=hist)
 
+
+
+def test_build_topk_ranker_features_inst_density_uses_price_history_not_live_flow() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.serving.realtime.features import build_topk_ranker_features
+
+    decision = pd.Timestamp("2026-09-09")
+    # Given: 60 strictly-past confirmed trading days; the LAST one (T-1) has a known inst_netbuy/volume/close
+    dates = pd.bdate_range(end=decision - pd.Timedelta(days=1), periods=60)
+    hist = pd.DataFrame([
+        {"date": d, "symbol": "005930", "open": 70000.0, "close": 70000.0, "prev_close": 70000.0,
+         "volume": 1_000_000.0, "inst_netbuy": 12_345.0, "foreign_netbuy": 0.0}
+        for d in dates
+    ])
+    df = pd.DataFrame({
+        "종목코드": ["005930"],
+        "종가": [70500.0], "전일종가": [70000.0], "고가": [71000.0], "저가": [69500.0], "시가": [70200.0],
+        "거래량": [900_000.0], "거래대금": [700.0], "시가총액": [4_200_000.0],
+        # live provisional flow is wildly different from the T-1 confirmed value to prove it is ignored
+        "기관_순매수": [999_999_999.0], "외국인_순매수": [0.0],
+        "시장구분": ["KOSPI"], "kospi": [0.1], "kosdaq": [0.1], "v_kospi": [15.0],
+    })
+
+    # When
+    out = build_topk_ranker_features(df, decision, price_history=hist)
+
+    # Then: inst_density comes from T-1's confirmed row, not today's live 기관_순매수
+    expected = 12_345.0 / (70000.0 * 1_000_000.0)
+    assert out["inst_density"].iloc[0] == pytest.approx(expected)
+    assert out["inst_density"].iloc[0] != pytest.approx(999_999_999.0 / (70500.0 * 900_000.0))
+    assert "inst_rank" in out.columns

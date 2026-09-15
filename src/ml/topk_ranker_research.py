@@ -41,7 +41,7 @@ from src.ml.research.v3_engine import (
 )
 from src.ml.research.v3_metrics import calculate_series_metrics
 from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict
-from src.ml.topk_history_features import TOPK_FEATURE_COLS_V2, attach_topk_features
+from src.ml.topk_history_features import TOPK_FEATURE_COLS_V2, attach_lagged_flow_features, attach_topk_features
 from src.strategy.contract import (
     COST_AWARE_UNIVERSE,
     DEFAULT_UNIVERSE,
@@ -221,6 +221,7 @@ def build_dual_pool(
     pool, _ = build_candidate_universe(ph, train_spec)
     pool = attach_forward_exit_paths(pool, ph, market_dates, d_to_idx)
     pool = compute_derived_features(pool)
+    pool = attach_lagged_flow_features(pool, ph)
     pool = attach_topk_features(pool, ph)
     sel_mask = select_universe(pool, select_spec)
     return pool, np.asarray(sel_mask, dtype=bool)

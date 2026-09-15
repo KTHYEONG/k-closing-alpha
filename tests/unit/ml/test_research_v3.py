@@ -93,13 +93,10 @@ def test_no_feature_after_decision_timestamp():
         "body_ratio",
         "upper_shadow_ratio",
         "intraday_range",
-        "inst_density",
-        "foreign_density",
         "kospi_pct",
         "kosdaq_pct",
         "v_kospi",
         "tv_rank",
-        "inst_rank",
         "chg_rank",
     ]
     assert expected == FEATURE_COLS

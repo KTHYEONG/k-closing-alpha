@@ -44,10 +44,10 @@ def test_compute_derived_features_and_costs_use_close_raw() -> None:
     feats = compute_derived_features(cands.copy())
     paths = attach_forward_exit_paths(cands.copy(), ph, market_dates, {d0: 0, d1: 1})
 
-    # Then
-    assert feats["inst_density"].iloc[0] == pytest.approx(1.0e9 / (2650000.0 * 606216.0))
+    # Then: institutional/foreign flow features moved to attach_lagged_flow_features (T-1, causal)
+    assert "inst_density" not in feats.columns
+    assert "foreign_density" not in feats.columns
+    assert "inst_rank" not in feats.columns
     dates = np.array([d0], dtype="datetime64[ns]")
     assert paths["cost_aa_bp"].iloc[0] == pytest.approx(float(round_trip_cost_bp(np.array([2650000.0]), dates, np.array(["KOSPI"], dtype=object), AA_COST)[0]))
     assert paths["gross_return"].iloc[0] == pytest.approx(53000.0 / 53000.0 - 1.0)
-    plain = compute_derived_features(cands.drop(columns=["close_raw"]))
-    assert plain["inst_density"].iloc[0] == pytest.approx(1.0e9 / (53000.0 * 606216.0))

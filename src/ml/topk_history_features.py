@@ -3,7 +3,7 @@
 The ranker's label is the overnight return (decision close -> D+1 open), so the
 history block centres on each symbol's own overnight-gap record. Every window is
 [t-w, t-1] or a value already observed at the 15:20 decision (today's open and
-prev_close, today's provisional flows), so research and serving share one function.
+prev_close); institutional flow features use [t-5, t-1] confirmed values only (2026-09-15: same-day confirmed flow is not published at decision time, so research and serving share one function without look-ahead).
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from src.ml.research.v3_engine import FEATURE_COLS
 from src.strategy.contract import DEFAULT_UNIVERSE, derive_chg_ratio
 
 TOPK_COST_FEATURE_COLS: tuple[str, ...] = ("f_tick_cost", "f_log_close")
+TOPK_FLOW_FEATURE_COLS: tuple[str, ...] = ("inst_density", "inst_rank")
 TOPK_HISTORY_FEATURE_COLS: tuple[str, ...] = (
     "f_ret5",
     "f_ret20",
@@ -35,7 +36,7 @@ TOPK_HISTORY_FEATURE_COLS: tuple[str, ...] = (
     "f_foreign_cum5",
 )
 # 순서 고정: colsample_bytree 가 열 순서에 의존하므로 인증 순서를 그대로 유지한다.
-TOPK_FEATURE_COLS_V2: list[str] = [*FEATURE_COLS, *TOPK_COST_FEATURE_COLS, *TOPK_HISTORY_FEATURE_COLS]
+TOPK_FEATURE_COLS_V2: list[str] = [*FEATURE_COLS, *TOPK_FLOW_FEATURE_COLS, *TOPK_COST_FEATURE_COLS, *TOPK_HISTORY_FEATURE_COLS]
 HISTORY_REQUIRED_COLUMNS: tuple[str, ...] = (
     "date",
     "symbol",
@@ -61,6 +62,64 @@ def _lag_roll(s: pd.Series, labels: pd.Series, window: int, func: str) -> pd.Ser
     # [t-w, t-1] 창: 당일 값을 제외하고 과거만 집계
     lagged = s.groupby(labels.to_numpy(), sort=False).shift(1)
     return _group_rolling(lagged, labels, window, max(3, window // 2), func)
+
+
+def attach_lagged_flow_features(cands: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFrame:
+    """Attach the prior trading day's institutional flow density and rank.
+
+    Institutional net-buy is only confirmed after close, so using a candidate's
+    own date T would look ahead into data not yet published at the 15:20
+    decision. This looks up, per symbol, the most recent panel row strictly
+    before the candidate's date (backward as-of, no exact match) -- the last
+    confirmed trading day at decision time -- independent of whether panel
+    itself carries a row for date T (it never does for live serving).
+
+    Args:
+        cands: Candidate rows with date and symbol columns.
+        panel: Daily panel covering the candidates' history (date, symbol,
+            inst_netbuy, volume, close, optional close_raw), one row per
+            (date, symbol).
+
+    Returns:
+        Copy of cands (same index and row order) carrying inst_density and
+        inst_rank, computed from the prior trading day's confirmed flow.
+
+    Raises:
+        ValueError: When cands or panel is missing a required column, or
+            panel carries duplicate (date, symbol) rows.
+    """
+    missing_c = [c for c in ("date", "symbol") if c not in cands.columns]
+    if missing_c:
+        raise ValueError(f"cands missing required columns: {missing_c}")
+    required_p = ("date", "symbol", "inst_netbuy", "volume", "close")
+    missing_p = [c for c in required_p if c not in panel.columns]
+    if missing_p:
+        raise ValueError(f"panel missing required columns: {missing_p}")
+    p = panel[[*required_p, *(["close_raw"] if "close_raw" in panel.columns else [])]].copy()
+    p["date"] = pd.to_datetime(p["date"])
+    p["symbol"] = p["symbol"].astype(str)
+    dup = int(p.duplicated(["date", "symbol"]).sum())
+    if dup:
+        raise ValueError(f"panel carries {dup} duplicate (date, symbol) rows")
+    level = pd.to_numeric(p["close_raw"], errors="coerce").fillna(p["close"]) if "close_raw" in p.columns else p["close"]
+    p["val_krw"] = level.astype("float64") * pd.to_numeric(p["volume"], errors="coerce").astype("float64")
+    p = p[["date", "symbol", "inst_netbuy", "val_krw"]].sort_values(["date", "symbol"], kind="stable")
+
+    out = cands.copy()
+    out["date"] = pd.to_datetime(out["date"])
+    out["symbol"] = out["symbol"].astype(str)
+    out["_row_order"] = np.arange(len(out))
+    left = out[["date", "symbol", "_row_order"]].sort_values(["date", "symbol"], kind="stable")
+    lagged = pd.merge_asof(
+        left, p, on="date", by="symbol", direction="backward", allow_exact_matches=False
+    ).sort_values("_row_order")
+    lagged.index = out.index
+
+    out["_inst_netbuy_lag1"] = pd.to_numeric(lagged["inst_netbuy"], errors="coerce").to_numpy()
+    val_lag1 = np.maximum(pd.to_numeric(lagged["val_krw"], errors="coerce").to_numpy(dtype=np.float64), 1.0)
+    out["inst_density"] = np.clip(out["_inst_netbuy_lag1"].fillna(0).to_numpy(dtype=np.float64) / val_lag1, -1.0, 1.0)
+    out["inst_rank"] = out.groupby("date")["_inst_netbuy_lag1"].rank(pct=True)
+    return out.drop(columns=["_row_order", "_inst_netbuy_lag1"])
 
 
 def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
@@ -128,10 +187,10 @@ def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
     out["f_upnext_on60"] = cmean.where(ccnt >= MIN_CONDITIONAL_OBS)
     out["f_gap"] = on
     out["f_id_mean20"] = _lag_roll(idr, labels, 20, "mean")
-    # 5일 순매수 금액 / 5일 거래금액 (당일 포함, 결정시점 잠정치)
-    den = _group_rolling(val, labels, 5, 3, "sum").replace(0.0, np.nan)
-    out["f_inst_cum5"] = (_group_rolling(p["inst_netbuy"], labels, 5, 3, "sum") / den).clip(-1.0, 1.0)
-    out["f_foreign_cum5"] = (_group_rolling(p["foreign_netbuy"], labels, 5, 3, "sum") / den).clip(-1.0, 1.0)
+    # 5일 순매수 금액 / 5일 거래금액, 당일 제외 [t-5,t-1] 확정치만 사용(2026-09-15 룩어헤드 수정)
+    den = _lag_roll(val, labels, 5, "sum").replace(0.0, np.nan)
+    out["f_inst_cum5"] = (_lag_roll(p["inst_netbuy"], labels, 5, "sum") / den).clip(-1.0, 1.0)
+    out["f_foreign_cum5"] = (_lag_roll(p["foreign_netbuy"], labels, 5, "sum") / den).clip(-1.0, 1.0)
     cols = list(TOPK_HISTORY_FEATURE_COLS)
     out[cols] = out[cols].replace([np.inf, -np.inf], np.nan)
     return out[["date", "symbol", *cols]]
