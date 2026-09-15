@@ -1604,3 +1604,46 @@ def test_select_topk_equal_weight_rejects_stale_screen_bundle() -> None:
     with pytest.raises(ValueError, match="top_k"):
         select_topk_equal_weight(snapshot, bundle, top_k=1)
 
+
+
+def test_score_topk_candidates_scores_every_row_including_non_admitted() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.costaware_topk import MIN_TOP_K
+    from src.ml.topk_ranker_research import score_topk_candidates, select_topk_equal_weight
+
+    # Given: 5행 단면 중 3행만 admitted
+    bundle, _ = _synthetic_bundle_and_fixture()
+    wide = pd.DataFrame({
+        "date": [pd.Timestamp("2023-03-15")] * 5,
+        "symbol": ["000001", "000002", "000003", "000004", "000005"],
+        "chg_ratio": [0.05, 0.03, 0.08, 0.04, 0.09],
+        "log_tv": [6.1, 5.9, 6.5, 6.3, 6.7],
+        "admitted": [True, False, True, True, False],
+    })
+
+    # When
+    scored = score_topk_candidates(wide, bundle)
+
+    # Then: 비적격 행까지 전 행이 점수화되고 배분 컬럼은 붙지 않는다
+    assert len(scored) == 5
+    assert scored["symbol"].tolist() == wide["symbol"].tolist()
+    for col in ("pred", "pred_q10", "pred_q50", "pred_q90", "p_good", "p_bad"):
+        assert col in scored.columns
+        assert np.isfinite(scored[col].to_numpy(dtype=np.float64)).all()
+    assert "allocation" not in scored.columns
+    assert "pred" not in wide.columns
+
+    # And: 선정 경로의 pred와 동일 값이다(단일 점수화 경로)
+    picks = select_topk_equal_weight(wide, bundle, top_k=MIN_TOP_K)
+    by_symbol = scored.set_index("symbol")["pred"]
+    assert np.allclose(
+        picks["pred"].to_numpy(dtype=np.float64),
+        by_symbol.loc[picks["symbol"].tolist()].to_numpy(dtype=np.float64),
+    )
+
+    # And: 피처 누락은 fail-closed
+    with pytest.raises(ValueError, match="log_tv"):
+        score_topk_candidates(wide.drop(columns=["log_tv"]), bundle)

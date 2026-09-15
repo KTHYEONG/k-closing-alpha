@@ -587,7 +587,7 @@ def test_run_automated_topk_decision_records_no_decision_on_systemic_failure(mon
 
     import src.daily.predict as predict_mod
 
-    def _sleeve(_d, *, on_failure=None):
+    def _sleeve(_d, *, on_failure=None, on_rank_pool=None):
         on_failure(ValueError("stale price_history: latest=2026-09-10"))
         return pd.DataFrame()
 
@@ -618,7 +618,7 @@ def test_run_automated_topk_decision_treats_holiday_failure_as_ok(monkeypatch) -
 
     import src.daily.predict as predict_mod
 
-    def _sleeve(_d, *, on_failure=None):
+    def _sleeve(_d, *, on_failure=None, on_rank_pool=None):
         on_failure(ValueError("live_rows is empty; nothing to decide on"))
         return pd.DataFrame()
 
@@ -648,7 +648,7 @@ def test_run_automated_topk_decision_records_ok_for_empty_pool_and_picks(monkeyp
     def _no_calendar(_d):
         raise AssertionError("calendar lookup only on failure")
 
-    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", lambda _d, *, on_failure=None: pd.DataFrame())
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", lambda _d, *, on_failure=None, on_rank_pool=None: pd.DataFrame())
     recorder = Mock()
 
     # When: 정상 무결정(admitted < top_k)
@@ -663,7 +663,7 @@ def test_run_automated_topk_decision_records_ok_for_empty_pool_and_picks(monkeyp
     sleeve_df = pd.DataFrame(
         {"symbol": ["000001", "000002", "000003"], "name": ["A", "B", "C"], "pred": [0.02, 0.01, 0.005], "allocation": [1 / 3] * 3}
     )
-    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", lambda _d, *, on_failure=None: sleeve_df)
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", lambda _d, *, on_failure=None, on_rank_pool=None: sleeve_df)
     persist_mock = Mock(return_value=3)
     monkeypatch.setattr(predict_mod, "persist_topk_decision", persist_mock)
     monkeypatch.setattr(predict_mod, "print_table", Mock())
@@ -701,3 +701,221 @@ def test_predict_main_wires_run_outcome_recorder(monkeypatch) -> None:
 
     # Then
     recorder.assert_called_once_with("predict", "NO_DECISION", run_date="2026-09-14", reason="x", metrics={"n_picks": 0})
+
+
+def test_bundle_model_version_formats_strategy_and_cutoff() -> None:
+    import src.daily.predict as predict_mod
+
+    # Then
+    assert (
+        predict_mod.bundle_model_version(
+            {"strategy_id": "KCA-TOPK-COSTAWARE-001", "training_cutoff": "2026-09-11 00:00:00"}
+        )
+        == "KCA-TOPK-COSTAWARE-001@2026-09-11 00:00:00"
+    )
+    assert predict_mod.bundle_model_version({}) == "UNKNOWN@UNKNOWN"
+
+
+def test_build_rank_pool_frame_ranks_by_pred_and_flags_selected() -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    # Given
+    scored = pd.DataFrame({
+        "symbol": ["000001", "000002", "000003", "000004"],
+        "admitted": [True, True, False, True],
+        "pred": [0.01, 0.03, 0.05, -0.02],
+    })
+    picks = pd.DataFrame({"symbol": ["000002", "000001", "000004"]})
+    names = {"000001": "AAA", "000002": "BBB", "000003": "CCC", "000004": "DDD"}
+
+    # When
+    out = predict_mod.build_rank_pool_frame(scored, picks, names, "S@C")
+
+    # Then: pred 내림차순 1-based 순위, 선정 여부, 이름, 모델 버전
+    assert out["symbol"].tolist() == ["000003", "000002", "000001", "000004"]
+    assert out["rank"].tolist() == [1, 2, 3, 4]
+    assert out["selected"].tolist() == [False, True, True, True]
+    assert out["name"].tolist() == ["CCC", "BBB", "AAA", "DDD"]
+    assert set(out["model_version"]) == {"S@C"}
+    assert "rank" not in scored.columns
+
+    # And: 빈 픽(admitted < top_k)이면 전부 미선정
+    none_selected = predict_mod.build_rank_pool_frame(scored, pd.DataFrame(), names, "S@C")
+    assert not none_selected["selected"].any()
+    assert len(none_selected) == 4
+
+
+def test_persist_rank_pool_predictions_writes_and_dedups_per_date_symbol(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+    pool = pd.DataFrame({
+        "symbol": ["000001", "000002"],
+        "pred": [0.02, 0.01],
+        "rank": [1, 2],
+        "selected": [True, False],
+        "model_version": ["S@C", "S@C"],
+    })
+
+    # When: 같은 날 재실행 + 다른 날 기록
+    assert predict_mod.persist_rank_pool_predictions(pd.Timestamp("2026-09-15"), pool, code_commit="abc123") == 2
+    rerun = pool.assign(pred=[0.03, 0.01])
+    assert predict_mod.persist_rank_pool_predictions(pd.Timestamp("2026-09-15"), rerun, code_commit="def456") == 2
+    assert predict_mod.persist_rank_pool_predictions(pd.Timestamp("2026-09-16"), pool, code_commit="def456") == 2
+    assert predict_mod.persist_rank_pool_predictions(pd.Timestamp("2026-09-16"), pool.iloc[0:0], code_commit="x") == 0
+
+    # Then
+    stored = pd.read_parquet(tmp_path / "rank_pool_predictions.parquet")
+    assert len(stored) == 4
+    day = stored[stored["decision_date"] == "2026-09-15"].sort_values("rank")
+    assert day["pred"].tolist() == [0.03, 0.01]
+    assert set(day["code_commit"]) == {"def456"}
+    assert stored["decided_at"].notna().all()
+
+
+def test_resolve_code_commit_returns_sha_or_unknown() -> None:
+    import subprocess
+    from pathlib import Path
+
+    import src.daily.predict as predict_mod
+
+    repo_root = str(Path(predict_mod.__file__).resolve().parents[2])
+
+    def _ok(cmd, **kwargs):
+        assert cmd == ["git", "rev-parse", "--short=12", "HEAD"]
+        assert kwargs == {"cwd": repo_root, "capture_output": True, "text": True, "check": True, "timeout": 10}
+        return subprocess.CompletedProcess(cmd, 0, stdout="b846de0abc12\n", stderr="")
+
+    def _fail(cmd, **kwargs):
+        raise subprocess.CalledProcessError(128, cmd)
+
+    def _missing(cmd, **kwargs):
+        raise FileNotFoundError("git")
+
+    def _slow(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 10)
+
+    # Then
+    assert predict_mod.resolve_code_commit(run_fn=_ok) == "b846de0abc12"
+    assert predict_mod.resolve_code_commit(run_fn=_fail) == "UNKNOWN"
+    assert predict_mod.resolve_code_commit(run_fn=_missing) == "UNKNOWN"
+    assert predict_mod.resolve_code_commit(run_fn=_slow) == "UNKNOWN"
+
+
+def test_run_topk_ranker_sleeve_emits_scored_rank_pool_to_callback(monkeypatch) -> None:
+    import numpy as np
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    # Given: 4행 랭크풀 중 000004만 비적격
+    wide = pd.DataFrame({
+        "종목코드": ["000001", "000002", "000003", "000004"],
+        "종목명": ["AAA", "BBB", "CCC", "DDD"],
+        "종가": [18000.0, 18100.0, 17900.0, 30000.0],
+        "전일종가": [17142.86, 17238.10, 17047.62, 28571.43],
+        "고가": [18100.0, 18200.0, 18000.0, 30100.0],
+        "저가": [17800.0, 17900.0, 17700.0, 29800.0],
+        "시가": [17900.0, 18000.0, 17800.0, 29900.0],
+        "거래량": [1_000_000, 900_000, 1_100_000, 800_000],
+        "거래대금": [500.0, 450.0, 550.0, 400.0],
+        "시가총액": [3000.0, 2800.0, 3200.0, 5000.0],
+        "기관_순매수": [10.0, -5.0, 20.0, 8.0],
+        "외국인_순매수": [5.0, 12.0, -3.0, 6.0],
+        "시장구분": ["KOSPI", "KOSPI", "KOSPI", "KOSPI"],
+        "kospi": [0.52] * 4,
+        "kosdaq": [-0.31] * 4,
+        "v_kospi": [15.2] * 4,
+        "admitted": [True, True, True, False],
+    })
+    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
+    bundle["top_k"] = 3
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+    pools: list[pd.DataFrame] = []
+
+    # When
+    out = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"), on_rank_pool=pools.append)
+
+    # Then: 픽에 모델 버전이 찍히고, 전체 풀이 1회 콜백된다
+    assert len(out) == 3
+    assert set(out["model_version"]) == {"UNKNOWN@UNKNOWN"}
+    assert len(pools) == 1
+    pool = pools[0]
+    assert sorted(pool["symbol"].tolist()) == ["000001", "000002", "000003", "000004"]
+    assert pool["rank"].tolist() == [1, 2, 3, 4]
+    preds = pool["pred"].to_numpy(dtype=np.float64)
+    assert (preds[:-1] >= preds[1:]).all()
+    assert int(pool["selected"].sum()) == 3
+    assert pool.loc[pool["symbol"] == "000004", "selected"].tolist() == [False]
+    assert set(pool.loc[pool["selected"], "symbol"]) == set(out["symbol"])
+    assert pool.set_index("symbol").loc["000001", "name"] == "AAA"
+    assert set(pool["model_version"]) == {"UNKNOWN@UNKNOWN"}
+
+    # And: 콜백이 없으면 동일한 픽만 반환
+    again = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"))
+    assert again["symbol"].tolist() == out["symbol"].tolist()
+
+
+def test_run_automated_topk_decision_persists_rank_pool_with_code_commit(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    pool_df = pd.DataFrame({"symbol": ["000001"], "pred": [0.02], "rank": [1], "selected": [True], "model_version": ["S@C"]})
+    sleeve_df = pd.DataFrame({
+        "symbol": ["000001", "000002", "000003"], "name": ["A", "B", "C"],
+        "pred": [0.02, 0.01, 0.005], "allocation": [1 / 3] * 3,
+    })
+
+    def _no_calendar(_d):
+        raise AssertionError("calendar lookup only on failure")
+
+    def _sleeve(_d, *, on_failure=None, on_rank_pool=None):
+        on_rank_pool(pool_df)
+        return sleeve_df
+
+    pool_persist = Mock(return_value=1)
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", _sleeve)
+    monkeypatch.setattr(predict_mod, "persist_topk_decision", Mock(return_value=3))
+    monkeypatch.setattr(predict_mod, "persist_rank_pool_predictions", pool_persist)
+    monkeypatch.setattr(predict_mod, "resolve_code_commit", lambda: "abc123")
+    monkeypatch.setattr(predict_mod, "print_table", Mock())
+
+    # When: 정상 결정
+    predict_mod.run_automated_topk_decision(pd.Timestamp("2026-09-15"), record_fn=Mock(), trading_day_fn=_no_calendar)
+
+    # Then
+    pool_persist.assert_called_once()
+    args, kwargs = pool_persist.call_args
+    assert args[0] == pd.Timestamp("2026-09-15")
+    assert args[1] is pool_df
+    assert kwargs == {"code_commit": "abc123"}
+
+    # And: 빈 픽(admitted < top_k)이어도 풀 예측은 기록된다
+    def _empty(_d, *, on_failure=None, on_rank_pool=None):
+        on_rank_pool(pool_df)
+        return pd.DataFrame()
+
+    pool_persist.reset_mock()
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", _empty)
+    predict_mod.run_automated_topk_decision(pd.Timestamp("2026-09-15"), record_fn=Mock(), trading_day_fn=_no_calendar)
+    pool_persist.assert_called_once()
+
+    # And: 시스템 실패 경로는 풀 기록 없음
+    def _fail(_d, *, on_failure=None, on_rank_pool=None):
+        on_failure(ValueError("stale price_history"))
+        return pd.DataFrame()
+
+    pool_persist.reset_mock()
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", _fail)
+    predict_mod.run_automated_topk_decision(pd.Timestamp("2026-09-15"), record_fn=Mock(), trading_day_fn=lambda _d: True)
+    pool_persist.assert_not_called()

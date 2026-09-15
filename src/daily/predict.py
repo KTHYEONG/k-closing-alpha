@@ -1,8 +1,11 @@
 import functools
 import logging
+import subprocess
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from src import settings
@@ -68,12 +71,110 @@ def restrict_to_rank_pool(wide: pd.DataFrame, decision_date: pd.Timestamp) -> pd
     return pool
 
 
-def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[[Exception], None] | None = None) -> pd.DataFrame:
+def bundle_model_version(bundle: dict[str, Any]) -> str:
+    """Build a deterministic model version string from bundle metadata.
+
+    Args:
+        bundle: Model bundle carrying strategy_id and training_cutoff.
+
+    Returns:
+        Version string in ``strategy_id@training_cutoff`` form.
+    """
+    return f"{bundle.get('strategy_id', 'UNKNOWN')}@{bundle.get('training_cutoff', 'UNKNOWN')}"
+
+
+def build_rank_pool_frame(
+    scored: pd.DataFrame, picks: pd.DataFrame, name_map: dict[str, str], model_version: str
+) -> pd.DataFrame:
+    """Build the ranked full-pool prediction frame.
+
+    Args:
+        scored: Scored full rank pool with symbol and pred columns.
+        picks: Selected picks frame with a symbol column.
+        name_map: Symbol to name mapping.
+        model_version: Model version string to stamp.
+
+    Returns:
+        Ranked frame with selected flags, names, model version and 1-based rank.
+    """
+    out = scored.copy()
+    if "symbol" in picks.columns:
+        selected = out["symbol"].isin(picks["symbol"])
+    else:
+        selected = pd.Series(False, index=out.index)
+    out["selected"] = selected.to_numpy(dtype=bool)
+    out["name"] = out["symbol"].map(name_map)
+    out["model_version"] = model_version
+    out = out.sort_values("pred", ascending=False, kind="stable").reset_index(drop=True)
+    out["rank"] = np.arange(1, len(out) + 1, dtype=np.int64)
+    return out
+
+
+def persist_rank_pool_predictions(
+    decision_date: pd.Timestamp, pool_df: pd.DataFrame, *, code_commit: str
+) -> int:
+    """Persist the full rank-pool predictions for a decision date.
+
+    Args:
+        decision_date: Decision date for the pool.
+        pool_df: Rank pool frame to persist.
+        code_commit: Code commit hash stamped on each row.
+
+    Returns:
+        Number of pool rows persisted.
+    """
+    if pool_df is None or len(pool_df) == 0:
+        return 0
+    out = pool_df.copy()
+    out["decision_date"] = pd.Timestamp(decision_date).strftime("%Y-%m-%d")
+    out["decided_at"] = pd.Timestamp.now(tz="Asia/Seoul")
+    out["code_commit"] = code_commit
+    target = settings.PARQUET_DIR / "rank_pool_predictions.parquet"
+    if target.exists():
+        existing = pd.read_parquet(target)
+        union_cols = sorted(set(existing.columns.tolist()) | set(out.columns.tolist()))
+        merged = pd.concat(
+            [existing.reindex(columns=union_cols), out.reindex(columns=union_cols)],
+            ignore_index=True,
+        )
+        merged = merged.drop_duplicates(subset=["decision_date", "symbol"], keep="last")
+    else:
+        merged = out
+    atomic_write_parquet(merged, target)
+    return len(pool_df)
+
+
+def resolve_code_commit(run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> str:
+    """Resolve the current git short commit hash.
+
+    Args:
+        run_fn: Subprocess runner (injectable for tests).
+
+    Returns:
+        Short commit hash, or ``UNKNOWN`` when git is unavailable.
+    """
+    try:
+        completed = run_fn(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        return str(completed.stdout).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        logger.warning("[SYS] stage=code_commit status=UNKNOWN reason=%s", type(exc).__name__)
+        return "UNKNOWN"
+
+
+def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[[Exception], None] | None = None, on_rank_pool: Callable[[pd.DataFrame], None] | None = None) -> pd.DataFrame:
     """자동 top-3 리랭커 슬리브를 실행한다.
 
     Args:
         decision_date: 리랭커 피처에 찍는 결정 일자.
         on_failure: 삼켜진 예외를 받는 콜백(호출자가 실행 결과를 분류할 수 있게 한다).
+        on_rank_pool: 전체 랭크풀 예측을 받는 콜백(영속은 호출자가 담당한다).
 
     Returns:
         등가중 top-k 선정 결과. 저장소에 기록된 ``admitted`` 컬럼을 그대로
@@ -84,7 +185,7 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[
     try:
         from src.ml import topk_history_features
         from src.ml.costaware_topk import MIN_TOP_K
-        from src.ml.topk_ranker_research import TOPK_RANKER_BUNDLE_DIR, select_topk_equal_weight
+        from src.ml.topk_ranker_research import TOPK_RANKER_BUNDLE_DIR, score_topk_candidates, select_topk_equal_weight
         from src.serving.realtime.features import build_topk_ranker_features
 
         wide = restrict_to_rank_pool(load_daily_snapshot(decision_date), decision_date)
@@ -102,6 +203,10 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[
             wide[["종목코드", "종목명"]].itertuples(index=False, name=None)
         )
         picks["name"] = picks["symbol"].map(name_map)
+        model_version = bundle_model_version(bundle)
+        picks["model_version"] = model_version
+        if on_rank_pool is not None:
+            on_rank_pool(build_rank_pool_frame(score_topk_candidates(features_df, bundle), picks, name_map, model_version))
         return picks
     except (FileNotFoundError, ValueError) as exc:
         logger.warning(
@@ -176,7 +281,8 @@ def run_automated_topk_decision(
         trading_day_fn: Trading-day oracle consulted only on failure.
     """
     failures: list[Exception] = []
-    sleeve_df = run_topk_ranker_sleeve(decision_date, on_failure=failures.append)
+    pools: list[pd.DataFrame] = []
+    sleeve_df = run_topk_ranker_sleeve(decision_date, on_failure=failures.append, on_rank_pool=pools.append)
     date_str = pd.Timestamp(decision_date).strftime("%Y-%m-%d")
     if failures:
         day = classify_day(date_str, trading_day_fn)
@@ -192,8 +298,13 @@ def run_automated_topk_decision(
         logger.warning("오늘 자동 유니버스 기준 진입 후보 없음(미참여)")
         if record_fn is not None:
             record_fn(RUN_OUTCOME_OK, run_date=date_str, reason="admitted_below_top_k", metrics={"n_picks": 0})
+        if pools:
+            persist_rank_pool_predictions(decision_date, pools[-1], code_commit=resolve_code_commit())
         return
     persist_topk_decision(decision_date, sleeve_df)
+    # 분석용 풀 예측 저장 실패가 매매 결정 영속을 막지 않도록 결정 저장 이후에 기록한다
+    if pools:
+        persist_rank_pool_predictions(decision_date, pools[-1], code_commit=resolve_code_commit())
     if record_fn is not None:
         record_fn(RUN_OUTCOME_OK, run_date=date_str, reason="", metrics={"n_picks": len(sleeve_df)})
     rows = [

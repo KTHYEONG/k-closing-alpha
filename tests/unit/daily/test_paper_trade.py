@@ -618,3 +618,154 @@ def test_run_paper_session_exit_issues_approval_key_with_data_account(tmp_path, 
     issued.assert_awaited_once_with(session, "DATA_KEY", "DATA_SECRET")
     assert seen_keys == ["APPROVAL"]
 
+
+
+def test_run_paper_session_entry_records_terminal_order_status_per_pick(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    # Given: 4픽 = 확정 체결 / 미확정 / 0주 / 스냅샷 누락
+    monkeypatch.setattr(paper_trade.settings, "PAPER_SEED_CAPITAL", 10_000_000)
+    monkeypatch.setattr(
+        paper_trade,
+        "load_topk_decision",
+        lambda _d: pd.DataFrame({
+            "symbol": ["005930", "000660", "999999", "111111"],
+            "allocation": [0.25, 0.25, 0.25, 0.25],
+            "price": [70_000, 200_000, 9_000_000, 50_000],
+        }),
+    )
+    ts = pd.Timestamp("2026-09-10 15:30:20", tz="Asia/Seoul")
+    monkeypatch.setattr(
+        paper_trade,
+        "fetch_archive_snapshot",
+        lambda _d: pd.DataFrame({
+            "종목코드": ["005930", "000660", "999999"],
+            "종가": [70_500, 205_000, 9_000_000],
+            "종가_확정": [1.0, 0.0, 1.0],
+            "execution_timestamp": [ts, ts, ts],
+        }),
+    )
+    ledger = PaperLedger(root=tmp_path)
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-10"), phase="entry", ledger=ledger, ws_client=None, session=None
+        )
+    )
+
+    # Then: 픽마다 정확히 1개의 종결 상태
+    assert n == 1
+    orders = pd.read_parquet(tmp_path / "orders.parquet")
+    assert len(orders) == 4
+    status = dict(zip(orders["symbol"], orders["status"], strict=True))
+    assert status == {
+        "005930": "FILLED",
+        "000660": "UNCONFIRMED",
+        "999999": "ZERO_QTY",
+        "111111": "NO_SNAPSHOT_ROW",
+    }
+    assert int(orders.loc[orders["symbol"] == "999999", "qty"].iloc[0]) == 0
+    assert set(orders["order_id"]) == {f"2026-09-10:{s}:entry" for s in status}
+
+    # And: NAV는 진입 체결을 반영(35주 x 70,500 + 수수료 89원)
+    nav = pd.read_parquet(tmp_path / "nav.parquet")
+    assert len(nav) == 1
+    assert nav.iloc[0]["as_of_date"] == "2026-09-10"
+    assert int(nav.iloc[0]["cash"]) == 7_532_411
+    assert int(nav.iloc[0]["n_open_positions"]) == 1
+    assert not (tmp_path / "trades.parquet").exists()
+
+
+def test_run_paper_session_exit_records_orders_trades_and_nav(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    # Given: 전일 70,000원 10주 진입 체결
+    monkeypatch.setattr(paper_trade.settings, "PAPER_SEED_CAPITAL", 10_000_000)
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [{"order_id": "2026-09-10:005930:entry", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
+          "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz="Asia/Seoul"), "decision_date": "2026-09-10",
+          "trigger": "auction_close"}],
+        kind="fills",
+    )
+
+    class _FakeWs:
+        async def stream(self, _session, codes):
+            yield ("005930", "093000", 73_400)
+            yield ("005930", "093100", 73_600)
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger,
+            ws_client=_FakeWs(), session=object(),
+            now_fn=lambda: pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then
+    assert n == 1
+    orders = pd.read_parquet(tmp_path / "orders.parquet")
+    assert orders["status"].tolist() == ["FILLED"]
+    assert orders["reason"].tolist() == ["take_profit"]
+    assert int(orders.iloc[0]["limit_price"]) == 73_500
+    trades = pd.read_parquet(tmp_path / "trades.parquet")
+    assert len(trades) == 1
+    assert int(trades.iloc[0]["net_pnl"]) == 34_477
+    nav = pd.read_parquet(tmp_path / "nav.parquet")
+    assert nav["as_of_date"].tolist() == ["2026-09-11"]
+    assert int(nav.iloc[0]["n_open_positions"]) == 0
+    assert int(nav.iloc[0]["nav"]) == 10_034_477
+
+
+def test_run_paper_session_exit_marks_unfilled_order_when_stream_ends(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    # Given: 익절선 미달 프린트 1건 후 스트림 종료(MOC 컷오프 미도달)
+    monkeypatch.setattr(paper_trade.settings, "PAPER_SEED_CAPITAL", 10_000_000)
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [{"order_id": "2026-09-10:005930:entry", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
+          "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz="Asia/Seoul"), "decision_date": "2026-09-10",
+          "trigger": "auction_close"}],
+        kind="fills",
+    )
+
+    class _FakeWs:
+        async def stream(self, _session, codes):
+            yield ("005930", "093000", 73_400)
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger,
+            ws_client=_FakeWs(), session=object(),
+            now_fn=lambda: pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then: 미체결도 종결 상태로 남고 포지션은 NAV에 미청산으로 잡힌다
+    assert n == 0
+    orders = pd.read_parquet(tmp_path / "orders.parquet")
+    assert orders["status"].tolist() == ["UNFILLED"]
+    assert orders["order_id"].tolist() == ["2026-09-11:005930:exit"]
+    assert not (tmp_path / "trades.parquet").exists()
+    nav = pd.read_parquet(tmp_path / "nav.parquet")
+    assert int(nav.iloc[0]["n_open_positions"]) == 1
+    assert int(nav.iloc[0]["nav"]) == 9_999_975
