@@ -75,12 +75,12 @@ def bundle_model_version(bundle: dict[str, Any]) -> str:
     """Build a deterministic model version string from bundle metadata.
 
     Args:
-        bundle: Model bundle carrying strategy_id and training_cutoff.
+        bundle: Model bundle carrying strategy_id, training_cutoff and trained_at.
 
     Returns:
-        Version string in ``strategy_id@training_cutoff`` form.
+        Version string in ``strategy_id@training_cutoff@trained_at`` form.
     """
-    return f"{bundle.get('strategy_id', 'UNKNOWN')}@{bundle.get('training_cutoff', 'UNKNOWN')}"
+    return f"{bundle.get('strategy_id', 'UNKNOWN')}@{bundle.get('training_cutoff', 'UNKNOWN')}@{bundle.get('trained_at', 'UNKNOWN')}"
 
 
 def build_rank_pool_frame(

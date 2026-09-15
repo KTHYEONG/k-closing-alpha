@@ -540,3 +540,54 @@ def test_investable_capital_reserves_buy_fee_and_caps_at_seed() -> None:
     # Then: 음수/0 현금은 신규 진입 불가
     assert investable_capital(-5, 10_000_000) == 0
     assert investable_capital(0, 10_000_000) == 0
+
+
+def test_build_open_auction_fill_uses_open_price_and_auction_timestamp() -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import PaperOrder, build_open_auction_fill
+
+    # Given: 09:00:00 시가단일가 시장가 매도 주문
+    auction = pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul")
+    order = PaperOrder(order_id="b1:exit:2026-09-11", decision_date="2026-09-11", symbol="005930", side="sell",
+                       qty=10, limit_price=None, placed_at=auction, reason="open_exit", entry_order_id="b1")
+
+    # When
+    fill = build_open_auction_fill(order, 71_000, pd.Timestamp("2026-09-11 09:01:05", tz="Asia/Seoul"))
+
+    # Then
+    assert fill is not None
+    assert fill.fill_price == 71_000
+    assert fill.filled_at == auction
+    assert fill.trigger == "auction_open"
+    assert (fill.order_id, fill.symbol, fill.side, fill.qty) == ("b1:exit:2026-09-11", "005930", "sell", 10)
+
+
+def test_build_open_auction_fill_returns_none_for_non_positive_open() -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import PaperOrder, build_open_auction_fill
+
+    auction = pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul")
+    order = PaperOrder(order_id="b1:exit:2026-09-11", decision_date="2026-09-11", symbol="005930", side="sell",
+                       qty=10, limit_price=None, placed_at=auction, reason="open_exit", entry_order_id="b1")
+    observed = pd.Timestamp("2026-09-11 09:01:00", tz="Asia/Seoul")
+
+    # Then: 시가 미형성(거래정지 등)은 미체결
+    assert build_open_auction_fill(order, 0, observed) is None
+    assert build_open_auction_fill(order, -1, observed) is None
+
+
+def test_build_open_auction_fill_rejects_observation_before_auction() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.execution.paper_broker import PaperOrder, build_open_auction_fill
+
+    auction = pd.Timestamp("2026-09-11 09:00:00", tz="Asia/Seoul")
+    order = PaperOrder(order_id="b1:exit:2026-09-11", decision_date="2026-09-11", symbol="005930", side="sell",
+                       qty=10, limit_price=None, placed_at=auction, reason="open_exit", entry_order_id="b1")
+
+    # When / Then
+    with pytest.raises(ValueError, match="lookahead"):
+        build_open_auction_fill(order, 71_000, pd.Timestamp("2026-09-11 08:59:59", tz="Asia/Seoul"))

@@ -13,6 +13,15 @@ from src.data.io_utils import atomic_write_parquet
 from src.data.panel_integrity import load_price_panel
 from src.ml.costaware_topk import report_to_frame, run_cost_aware_topk_backtest
 from src.ml.retrain_gate import build_gate_eval_frame, evaluate_retrain_promotion, load_current_bundle
+from src.ml.retrain_registry import (
+    RETRAIN_OUTCOME_PROMOTED,
+    RETRAIN_OUTCOME_PROMOTED_UNGATED,
+    RETRAIN_OUTCOME_REJECTED,
+    RETRAIN_REGISTRY_FILENAME,
+    append_retrain_record,
+    build_retrain_record,
+    resolve_code_commit_env,
+)
 from src.ml.topk_ranker_research import (
     run_topk_ranker_backtest,
     save_production_bundle,
@@ -82,7 +91,11 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError(f"price_history not found: {settings.PRICE_HISTORY_PARQUET_PATH}")
         ph, market_dates, d_to_idx = load_and_prepare_price_history(settings.PRICE_HISTORY_PARQUET_PATH)
         bundle = train_production_bundle(ph, market_dates, d_to_idx)
+        # 동일 cutoff 재학습끼리도 결정행에서 구분되도록 학습 시각을 번들에 박는다
+        bundle["trained_at"] = pd.Timestamp.now(tz="Asia/Seoul").isoformat(timespec="seconds")
+        attempted_at = pd.Timestamp.now(tz="Asia/Seoul")
         live_dir = os.path.join(args.export_dir, "topk_ranker")
+        registry_path = Path(live_dir) / RETRAIN_REGISTRY_FILENAME
         if not args.skip_promotion_gate:
             verdict = evaluate_retrain_promotion(
                 bundle, load_current_bundle(live_dir), build_gate_eval_frame(ph, market_dates, d_to_idx)
@@ -93,12 +106,19 @@ def main(argv: list[str] | None = None) -> None:
             )
             if not verdict.promote:
                 rejected_path = save_production_bundle(bundle, export_dir=os.path.join(live_dir, "rejected"))
+                append_retrain_record(registry_path, build_retrain_record(outcome=RETRAIN_OUTCOME_REJECTED, bundle=bundle, bundle_path=rejected_path, agreement=verdict.agreement, reasons=verdict.reasons, attempted_at=attempted_at, code_commit=resolve_code_commit_env()))
                 raise RuntimeError(
                     f"retrain promotion gate rejected the candidate (live bundle kept): {list(verdict.reasons)}; "
                     f"candidate saved at {rejected_path}"
                 )
+            outcome = RETRAIN_OUTCOME_PROMOTED
+            agreement: float | None = verdict.agreement
+        else:
+            outcome = RETRAIN_OUTCOME_PROMOTED_UNGATED
+            agreement = None
         path = save_production_bundle(bundle, export_dir=live_dir)
-        logger.info("[EVAL] stage=train_ranker_bundle path=%s top_k=%s train_start=%s", path, bundle.get("top_k"), bundle.get("train_start"))
+        append_retrain_record(registry_path, build_retrain_record(outcome=outcome, bundle=bundle, bundle_path=path, agreement=agreement, reasons=(), attempted_at=attempted_at, code_commit=resolve_code_commit_env()))
+        logger.info("[EVAL] stage=train_ranker_bundle path=%s top_k=%s train_start=%s trained_at=%s outcome=%s", path, bundle.get("top_k"), bundle.get("train_start"), bundle.get("trained_at"), outcome)
         return
 
     if args.ranker_topk_research:

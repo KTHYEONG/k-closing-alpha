@@ -22,9 +22,6 @@ from src.execution.cost_model import BROKERAGE_FEE_BP, statutory_bp_asof
 
 logger = logging.getLogger(__name__)
 
-# exit-timing 레버 실측(TP 5% 지정가 + MOC 폴백)에서 유래한 익절 폭.
-PAPER_TAKE_PROFIT_RATIO: float = 0.05
-
 ORDER_STATUS_FILLED: str = "FILLED"
 ORDER_STATUS_UNCONFIRMED: str = "UNCONFIRMED"
 ORDER_STATUS_NO_SNAPSHOT_ROW: str = "NO_SNAPSHOT_ROW"
@@ -181,6 +178,29 @@ def build_auction_fill(order: PaperOrder, decision_row: dict[str, Any]) -> Paper
         )
     return PaperFill(
         order.order_id, order.symbol, order.side, order.qty, close, execution_timestamp, "auction_close"
+    )
+
+
+def build_open_auction_fill(order: PaperOrder, open_price: int, observed_at: pd.Timestamp) -> PaperFill | None:
+    """KRX 시가단일가 시장가 매도 체결 판정. 체결가는 관측된 시가 그대로이다.
+
+    Args:
+        order: 시가단일가 시장가 매도 주문.
+        open_price: KRX 시가단일가 체결가.
+        observed_at: 시가를 관측한 시각.
+
+    Returns:
+        시가가 형성됐으면 PaperFill, 미형성(0 이하)이면 None.
+
+    Raises:
+        ValueError: 시가 관측이 주문시각보다 이르면(룩어헤드 금지 위반).
+    """
+    if observed_at < order.placed_at:
+        raise ValueError(f"observed_at {observed_at} precedes placed_at {order.placed_at} (lookahead forbidden)")
+    if int(open_price) <= 0:
+        return None
+    return PaperFill(
+        order.order_id, order.symbol, order.side, order.qty, int(open_price), order.placed_at, "auction_open"
     )
 
 

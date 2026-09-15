@@ -414,7 +414,6 @@ def test_run_topk_ranker_sleeve_skips_history_for_v1_bundle(monkeypatch) -> None
     assert len(out) == 3
 
 
-
 def test_restrict_to_rank_pool_drops_rows_outside_training_screen() -> None:
     import pandas as pd
 
@@ -441,7 +440,6 @@ def test_restrict_to_rank_pool_drops_rows_outside_training_screen() -> None:
     assert out.index.tolist() == [0, 1, 2, 3]
 
 
-
 def test_restrict_to_rank_pool_fails_closed_on_inconsistent_or_empty_snapshot() -> None:
     import pandas as pd
     import pytest
@@ -463,7 +461,6 @@ def test_restrict_to_rank_pool_fails_closed_on_inconsistent_or_empty_snapshot() 
         predict_mod.restrict_to_rank_pool(wide, decision)
     with pytest.raises(ValueError, match="empty"):
         predict_mod.restrict_to_rank_pool(wide.iloc[0:0], decision)
-
 
 
 def test_run_topk_ranker_sleeve_ranks_within_training_pool(monkeypatch) -> None:
@@ -504,7 +501,6 @@ def test_run_topk_ranker_sleeve_ranks_within_training_pool(monkeypatch) -> None:
     # Then
     assert seen == [["000001", "000002", "000003", "000004"]]
     assert sorted(out["symbol"].tolist()) == ["000001", "000002", "000003"]
-
 
 
 def test_load_topk_decision_returns_rows_for_decision_date_only(tmp_path, monkeypatch) -> None:
@@ -703,19 +699,6 @@ def test_predict_main_wires_run_outcome_recorder(monkeypatch) -> None:
     recorder.assert_called_once_with("predict", "NO_DECISION", run_date="2026-09-14", reason="x", metrics={"n_picks": 0})
 
 
-def test_bundle_model_version_formats_strategy_and_cutoff() -> None:
-    import src.daily.predict as predict_mod
-
-    # Then
-    assert (
-        predict_mod.bundle_model_version(
-            {"strategy_id": "KCA-TOPK-COSTAWARE-001", "training_cutoff": "2026-09-11 00:00:00"}
-        )
-        == "KCA-TOPK-COSTAWARE-001@2026-09-11 00:00:00"
-    )
-    assert predict_mod.bundle_model_version({}) == "UNKNOWN@UNKNOWN"
-
-
 def test_build_rank_pool_frame_ranks_by_pred_and_flags_selected() -> None:
     import pandas as pd
 
@@ -845,7 +828,7 @@ def test_run_topk_ranker_sleeve_emits_scored_rank_pool_to_callback(monkeypatch) 
 
     # Then: 픽에 모델 버전이 찍히고, 전체 풀이 1회 콜백된다
     assert len(out) == 3
-    assert set(out["model_version"]) == {"UNKNOWN@UNKNOWN"}
+    assert set(out["model_version"]) == {"UNKNOWN@UNKNOWN@UNKNOWN"}
     assert len(pools) == 1
     pool = pools[0]
     assert sorted(pool["symbol"].tolist()) == ["000001", "000002", "000003", "000004"]
@@ -856,7 +839,7 @@ def test_run_topk_ranker_sleeve_emits_scored_rank_pool_to_callback(monkeypatch) 
     assert pool.loc[pool["symbol"] == "000004", "selected"].tolist() == [False]
     assert set(pool.loc[pool["selected"], "symbol"]) == set(out["symbol"])
     assert pool.set_index("symbol").loc["000001", "name"] == "AAA"
-    assert set(pool["model_version"]) == {"UNKNOWN@UNKNOWN"}
+    assert set(pool["model_version"]) == {"UNKNOWN@UNKNOWN@UNKNOWN"}
 
     # And: 콜백이 없으면 동일한 픽만 반환
     again = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"))
@@ -947,3 +930,20 @@ def test_run_topk_ranker_sleeve_loads_history_for_flow_only_bundle(monkeypatch) 
     # Then: the flow-only feature need still triggers the history load (previously skipped)
     assert calls == [decision]
     assert len(out) == 3
+
+
+def test_bundle_model_version_formats_strategy_cutoff_and_trained_at() -> None:
+    import src.daily.predict as predict_mod
+
+    # Then
+    assert (
+        predict_mod.bundle_model_version(
+            {"strategy_id": "KCA-TOPK-COSTAWARE-001", "training_cutoff": "2026-09-11 00:00:00", "trained_at": "2026-09-19T22:05:00+09:00"}
+        )
+        == "KCA-TOPK-COSTAWARE-001@2026-09-11 00:00:00@2026-09-19T22:05:00+09:00"
+    )
+    assert (
+        predict_mod.bundle_model_version({"strategy_id": "KCA-TOPK-COSTAWARE-001", "training_cutoff": "2026-09-11 00:00:00"})
+        == "KCA-TOPK-COSTAWARE-001@2026-09-11 00:00:00@UNKNOWN"
+    )
+    assert predict_mod.bundle_model_version({}) == "UNKNOWN@UNKNOWN@UNKNOWN"

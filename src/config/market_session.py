@@ -34,9 +34,7 @@ NXT_PREMARKET_HOUR_FLOOR: str = "080000"
 NXT_PREMARKET_HOUR_CEIL: str = "085000"
 # 주문 결정 시각(결정창 시작, 룩어헤드 하한). 체결은 finalize_close 확정종가가 오라클이다.
 PAPER_ENTRY_HHMMSS: str = "152000"
-# D+1 익절 미도달 시 MOC 대체 청산 시각
-PAPER_EXIT_MOC_HHMMSS: str = "151900"
-# D+1 청산 세션 시작 시각(kca-paper-exit 타이머 발화 시각)
-PAPER_EXIT_SESSION_START_HHMMSS: str = "090000"
-# D+1 청산 세션 종료 시각(KRX 정규장 종료). 이후 프린트에는 청산 기회가 없다
-PAPER_EXIT_SESSION_END_HHMMSS: str = "153000"
+# D+1 청산은 모델 라벨(익일 시가)과 동일하게 KRX 시가단일가 체결가로 한다
+PAPER_EXIT_OPEN_AUCTION_HHMMSS: str = KRX_REGULAR_HOUR_FLOOR
+# 현재가 API의 stck_oprc는 시가단일가 체결 직후 반영 지연이 있어 이 시각 이후 조회만 시가로 신뢰한다
+PAPER_EXIT_OPEN_QUOTE_EARLIEST_HHMMSS: str = "090030"
