@@ -77,8 +77,8 @@ def test_compute_topk_history_features_matches_hand_computed_windows() -> None:
     assert out["f_ret20"].iloc[10] == pytest.approx(lr[0:10].sum())
     # Then: f_gap is today's open over prev_close, known at decision time
     assert out["f_gap"].to_numpy() == pytest.approx(np.full(12, 0.01))
-    # Then: 5-day flow is net-buy KRW over traded value KRW, including today
-    assert out["f_inst_cum5"].iloc[6] == pytest.approx(5 * 5000.0 / sum(c * 1000.0 for c in closes[2:7]))
+    # Then: 5-day flow is net-buy KRW over traded value KRW, excluding today (window [t-5, t-1])
+    assert out["f_inst_cum5"].iloc[6] == pytest.approx(5 * 5000.0 / sum(c * 1000.0 for c in closes[1:6]))
     # Then: dist_high60 needs 20 observations, so a 12-day history yields NaN
     assert out["f_dist_high60"].isna().all()
 
@@ -347,10 +347,11 @@ def test_topk_cost_and_value_features_use_close_raw_when_present() -> None:
     base = compute_topk_history_features(panel)
     raw = compute_topk_history_features(with_raw)
 
-    # Then: 분모 closexvolume 이 원가격(50배)이면 f_inst_cum5 는 1/50, 마지막 행(라이브, close_raw 결측)은 close 로 폴백
+    # Then: 분모 close x volume 이 원가격(50배)이면 f_inst_cum5 는 1/50. 창이 [t-5,t-1]이므로
+    # 마지막 행(라이브, close_raw 결측)의 자기 자신 값은 분자·분모 어디에도 쓰이지 않는다.
     assert base["f_inst_cum5"].iloc[-2] == pytest.approx(50.0 * 5 / (100.0 * 10.0 * 5))
     assert raw["f_inst_cum5"].iloc[-2] == pytest.approx(50.0 * 5 / (5000.0 * 10.0 * 5))
-    assert raw["f_inst_cum5"].iloc[-1] == pytest.approx(50.0 * 5 / (5000.0 * 10.0 * 4 + 100.0 * 10.0))
+    assert raw["f_inst_cum5"].iloc[-1] == pytest.approx(50.0 * 5 / (5000.0 * 10.0 * 5))
     assert np.allclose(base["f_ret5"].to_numpy(), raw["f_ret5"].to_numpy(), equal_nan=True)
 
     cands = pd.DataFrame({"date": [days[-1]], "symbol": ["A"], "close": [100.0], "close_raw": [5000.0], "tick_cost_bp": [1.0]})
@@ -358,3 +359,119 @@ def test_topk_cost_and_value_features_use_close_raw_when_present() -> None:
     assert out["f_log_close"].iloc[0] == pytest.approx(np.log(5000.0))
     plain = attach_topk_features(cands.drop(columns=["close_raw"]), panel)
     assert plain["f_log_close"].iloc[0] == pytest.approx(np.log(100.0))
+
+
+def test_attach_lagged_flow_features_uses_prior_trading_day_value() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_history_features import attach_lagged_flow_features
+
+    # Given: one symbol's continuous confirmed history
+    panel = pd.DataFrame({
+        "date": pd.to_datetime(["2026-01-02", "2026-01-05", "2026-01-06"]),
+        "symbol": ["005930"] * 3,
+        "close": [70000.0, 71000.0, 72000.0],
+        "close_raw": [700000.0, 710000.0, 720000.0],
+        "volume": [1000.0, 2000.0, 3000.0],
+        "inst_netbuy": [100.0, -200.0, 300.0],
+    })
+
+    # When: candidate date exists in panel (training shape) -> uses close_raw of the PRIOR row
+    cands = pd.DataFrame({"date": [pd.Timestamp("2026-01-06")], "symbol": ["005930"]})
+    out = attach_lagged_flow_features(cands, panel)
+
+    # Then
+    assert out["inst_density"].iloc[0] == pytest.approx(-200.0 / (710000.0 * 2000.0))
+
+    # And: candidate date absent from panel (live serving shape) resolves to the panel's last row
+    live_cands = pd.DataFrame({"date": [pd.Timestamp("2026-01-07")], "symbol": ["005930"]})
+    live_out = attach_lagged_flow_features(live_cands, panel)
+    assert live_out["inst_density"].iloc[0] == pytest.approx(300.0 / (720000.0 * 3000.0))
+
+    # And: a symbol with no prior panel row is NaN, never zero-filled
+    unseen = pd.DataFrame({"date": [pd.Timestamp("2026-01-06")], "symbol": ["999999"]})
+    unseen_out = attach_lagged_flow_features(unseen, panel)
+    assert np.isnan(unseen_out["inst_density"].iloc[0])
+    assert np.isnan(unseen_out["inst_rank"].iloc[0])
+
+
+def test_attach_lagged_flow_features_ranks_cross_sectionally_and_falls_back_without_close_raw() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_history_features import attach_lagged_flow_features
+
+    # Given: no close_raw anywhere -> falls back to close. Symbol A's OWN date-T row (999.0)
+    # must never be used even though it exists in the panel.
+    panel = pd.DataFrame({
+        "date": pd.to_datetime(["2026-01-05", "2026-01-05", "2026-01-06"]),
+        "symbol": ["A", "B", "A"],
+        "close": [100.0, 100.0, 105.0],
+        "volume": [10.0, 10.0, 10.0],
+        "inst_netbuy": [50.0, 150.0, 999.0],
+    })
+    cands = pd.DataFrame({"date": [pd.Timestamp("2026-01-06"), pd.Timestamp("2026-01-06")], "symbol": ["A", "B"]})
+
+    # When
+    out = attach_lagged_flow_features(cands, panel)
+
+    # Then: both resolve to 2026-01-05's value
+    got = out.set_index("symbol")["inst_density"].to_dict()
+    assert got["A"] == pytest.approx(50.0 / (100.0 * 10.0))
+    assert got["B"] == pytest.approx(150.0 / (100.0 * 10.0))
+    # And: cross-sectional rank among today's two candidates uses the prior day's raw netbuy
+    rank = out.set_index("symbol")["inst_rank"].to_dict()
+    assert rank["A"] == pytest.approx(0.5)
+    assert rank["B"] == pytest.approx(1.0)
+
+
+def test_attach_lagged_flow_features_fails_closed_on_missing_or_duplicate_columns() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_history_features import attach_lagged_flow_features
+
+    panel = pd.DataFrame({
+        "date": pd.to_datetime(["2026-01-05", "2026-01-05"]),
+        "symbol": ["A", "A"],
+        "close": [100.0, 100.0],
+        "volume": [10.0, 10.0],
+        "inst_netbuy": [50.0, 60.0],
+    })
+    cands = pd.DataFrame({"date": [pd.Timestamp("2026-01-06")], "symbol": ["A"]})
+
+    # Then: cands missing a required column
+    with pytest.raises(ValueError, match="symbol"):
+        attach_lagged_flow_features(cands.drop(columns=["symbol"]), panel.drop_duplicates(["date", "symbol"]))
+
+    # Then: panel missing a required column
+    with pytest.raises(ValueError, match="inst_netbuy"):
+        attach_lagged_flow_features(cands, panel.drop(columns=["inst_netbuy"]))
+
+    # Then: duplicate (date, symbol) rows in panel are rejected
+    with pytest.raises(ValueError, match="duplicate"):
+        attach_lagged_flow_features(cands, panel)
+
+
+def test_compute_topk_history_features_flow_features_exclude_todays_own_value() -> None:
+    import numpy as np
+
+    from src.ml.topk_history_features import compute_topk_history_features
+
+    # Given: a panel and a copy whose flow/volume on one specific date is scrambled
+    panel = _panel()
+    target_date = sorted(panel["date"].unique())[10]
+    mutated = panel.copy()
+    is_target = mutated["date"] == target_date
+    mutated.loc[is_target, ["inst_netbuy", "foreign_netbuy", "volume"]] *= 50.0
+
+    # When
+    a = compute_topk_history_features(panel)
+    b = compute_topk_history_features(mutated)
+
+    # Then: that date's own f_inst_cum5/f_foreign_cum5 are unaffected by its own mutated inputs
+    row_a = a[a["date"] == target_date].set_index("symbol")[["f_inst_cum5", "f_foreign_cum5"]]
+    row_b = b[b["date"] == target_date].set_index("symbol")[["f_inst_cum5", "f_foreign_cum5"]]
+    assert np.allclose(row_a.to_numpy(), row_b.to_numpy(), equal_nan=True)

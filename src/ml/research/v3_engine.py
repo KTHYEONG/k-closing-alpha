@@ -30,13 +30,10 @@ FEATURE_COLS: list[str] = [
     "body_ratio",
     "upper_shadow_ratio",
     "intraday_range",
-    "inst_density",
-    "foreign_density",
     "kospi_pct",
     "kosdaq_pct",
     "v_kospi",
     "tv_rank",
-    "inst_rank",
     "chg_rank",
 ]
 
@@ -185,13 +182,12 @@ def _level_close(frame: pd.DataFrame) -> np.ndarray:
 
 
 def compute_derived_features(cands: pd.DataFrame) -> pd.DataFrame:
-    """Compute 14 decision-time features strictly using decision candidate set."""
+    """Compute 11 decision-time features strictly using decision candidate set."""
     logger.info("Computing derived decision-time features and cross-sectional ranks...")
     p_close = cands["close"].to_numpy(dtype=np.float64)
     p_open = cands["open"].to_numpy(dtype=np.float64)
     p_high = cands["high"].to_numpy(dtype=np.float64)
     p_low = cands["low"].to_numpy(dtype=np.float64)
-    p_vol = cands["volume"].to_numpy(dtype=np.float64)
 
     rg = np.maximum(p_high - p_low, 1.0)
     cands["body_ratio"] = (p_close - p_open) / rg
@@ -200,14 +196,9 @@ def compute_derived_features(cands: pd.DataFrame) -> pd.DataFrame:
     cands["log_tv"] = np.log1p(np.maximum(cands["tv_clean"].to_numpy(dtype=np.float64), 0.0))
     cands["log_mc"] = np.log1p(np.maximum(cands["mc_clean"].to_numpy(dtype=np.float64), 0.0))
 
-    val_krw = np.maximum(_level_close(cands) * p_vol, 1.0)
-    cands["inst_density"] = np.clip(cands["inst_netbuy"].fillna(0).to_numpy(dtype=np.float64) / val_krw, -1.0, 1.0)
-    cands["foreign_density"] = np.clip(cands["foreign_netbuy"].fillna(0).to_numpy(dtype=np.float64) / val_krw, -1.0, 1.0)
-
     # Cross-sectional ranks across ALL valid candidates on date T
     grouped_date = cands.groupby("date", sort=False)
     cands["tv_rank"] = grouped_date["tv_clean"].rank(pct=True)
-    cands["inst_rank"] = grouped_date["inst_netbuy"].rank(pct=True)
     cands["chg_rank"] = grouped_date["chg_ratio"].rank(pct=True)
 
     return cands
