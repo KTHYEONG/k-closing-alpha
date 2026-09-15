@@ -154,6 +154,8 @@ async def run_close_finalization(
     sleep_fn = sleep_fn or asyncio.sleep
     snap = snapshot_date or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
     df = archive.fetch_archive_snapshot(snapshot_date=snap)
+    # 아카이브 저장소가 종가_확정을 float64(0.0/1.0/NaN)로 돌려주므로 bool 대입 전에 nullable boolean으로 맞춘다
+    df[CLOSE_CONFIRMED_COL] = df[CLOSE_CONFIRMED_COL].astype("boolean")
     pending = df.index[~df[CLOSE_CONFIRMED_COL].fillna(False).astype(bool)].tolist()
     n_rows = len(df)
     pending = order_pending_by_priority(df, pending, pick_codes)

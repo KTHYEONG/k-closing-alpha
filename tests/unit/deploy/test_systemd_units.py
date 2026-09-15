@@ -287,3 +287,17 @@ def test_daily_audit_waits_for_intraday_archive() -> None:
     after_line = next(line for line in text.splitlines() if line.startswith("After="))
 
     assert "kca-archive-intraday.service" in after_line
+
+
+def test_finalize_close_always_hands_off_to_paper_entry() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+
+    # Given
+    lines = (root / "kca-finalize-close.service").read_text(encoding="utf-8").splitlines()
+
+    # Then: 확정 성공/실패와 무관하게 페이퍼 진입이 기동되어 픽별 종결 레코드를 남긴다
+    assert "ExecStopPost=/usr/bin/systemctl --user start --no-block kca-paper-entry.service" in lines
+    assert not any(line.startswith("OnSuccess=") for line in lines)
+    assert "OnFailure=kca-alert@%n.service" in lines
