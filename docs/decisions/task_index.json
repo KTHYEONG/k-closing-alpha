@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260915_PIT_REBUILD_ADJUDICATION",
+      "date": "2026-09-15",
+      "adr_id": "ADR_20260915_20260915_PIT_REBUILD_ADJUDICATION",
+      "domain": "data",
+      "title": "PIT 재구축 검증을 KIS 이벤트 심판 방식으로 전환",
+      "why": "구 패널 자체의 이음매·날짜 오류 때문에 이를 기준으로 한 98% 일치율 게이트가 정상 재구축을 계속 차단함",
+      "resolution": "배율 불일치 이벤트만 KIS 수정주가로 심판하고 주식수로 보강 확인, 대조군으로 KIS 플래그 자기검증, 일치율은 진단 지표로만 유지",
+      "impact": "krx_panel_rebuild.py 판정 로직 신설, kis client docstring 정정, 재구축 파이프라인이 pykrx 무관 근거로 통과 가능해짐"
+    },
+    {
       "task_id": "TASK_20260914_PIT_PANEL_REBUILD",
       "date": "2026-09-14",
       "adr_id": "ADR_20260914_20260914_PIT_PANEL_REBUILD",
@@ -989,16 +999,6 @@
       "why": "재학습 로직이 gitignore된 legacy/ 아카이브에 있어 추적·린트·타입·테스트 밖이었고, LightGBM 기본값·하드코딩 blend 가중치·랜덤 KFold 보정·전기간 등가중 등 학습 설정에 근거가 없었으며 미사용 OOS 구간이 없었음.",
       "resolution": "챔피언 경로(dataset/feature_manifest/scenario_panel/purged_cv/metrics/policy_eval/oof/bundle/champion/retrain)를 src/ml/로 재작성 이관(legacy 무수정, parity 테스트로 동일성 검증). Optuna 중첩 purged walk-forward 튜닝, seed 앙상블, OOF 기반 p_good blend 가중치 보정, 라벨 클립/Huber δ config화, chronological 확률 보정기, date-balanced·recency 가중 A/B, 임베고 OOS 예약 + 동일 날짜 대조군 승격 게이트 구현. src.ml.* mypy override 추가.",
       "impact": "src/ml/ 14개 신규 테스트 통과, 전체 261 passed, ruff/mypy clean. 튜닝 후보가 동일 2070 OOF 날짜에서 대조군 대비 스케줄 평균수익 +6.4%(1.2028→1.2795%), Sharpe +0.26, PF +0.12, DD -0.6%p로 승격 게이트 PASS. p_good_weight=0.5 하드코딩이 무효였음을 데이터로 확인. 활성 번들 불변, 후보 경로만 저장."
-    },
-    {
-      "task_id": "THEME_AUTO_RESOLVER_ZERO_GSHEET",
-      "date": "2026-09-01",
-      "adr_id": "ADR_20260901_THEME_AUTO_RESOLVER_ZERO_GSHEET",
-      "domain": "quant",
-      "title": "Theme & Market Auto-Resolver with Local Parquet Zero-GSheet Architecture",
-      "why": "Eliminated manual Google Sheet intervention and subjective theme labeling by establishing fully automated KIS/Naver-based classification with local Parquet caching and ML train-serve consistency.",
-      "resolution": "Built src/data/theme_resolver.py with 4-tier hybrid resolution, updated collect.py and predict.py to use local theme.parquet caching, removed Google Sheets theme sync dependencies, and updated 33,000+ historical trade logs.",
-      "impact": "Zero manual intervention between collect and predict, 40ms inference latency, 100% test pass across 247 tests, and full ML train-serve feature integrity."
     }
   ]
 }
