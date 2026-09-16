@@ -38,13 +38,9 @@ def test_parse_market_index_rate_uses_rate_and_fallback() -> None:
 
 
 def test_validate_hts_id_raises_on_placeholder() -> None:
-    with (
-        patch.object(collect, "HTS_ID", "여기에 HTS ID를 입력"),
-        pytest.raises(RuntimeError),
-    ):
-        collect._validate_hts_id()
-    with patch.object(collect, "HTS_ID", "real-hts"):
-        collect._validate_hts_id()  # should not raise
+    with pytest.raises(RuntimeError):
+        collect._validate_hts_id("여기에 HTS ID를 입력")
+    collect._validate_hts_id("real-hts")  # should not raise
 
 
 def _fake_client() -> SimpleNamespace:
@@ -148,7 +144,12 @@ def test_collect_main_wires_kiwoom_scan_and_trading_day_gate(monkeypatch) -> Non
         seen["scan_kwargs"] = kiwoom_client
         return []
 
-    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
     monkeypatch.setattr(collect, "_validate_decision_window", lambda *_a, **_k: None)
     monkeypatch.setattr(collect, "KisApiClient", _FakeClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda *_a, **_kw: _FakeSession())

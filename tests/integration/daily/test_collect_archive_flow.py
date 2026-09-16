@@ -75,7 +75,7 @@ def test_collect_main_persists_wide_snapshot_to_store_without_csv(monkeypatch, t
 
     from src.daily import collect
 
-    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setenv("KIS_DATA_1_HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
 
@@ -128,7 +128,7 @@ def test_collect_main_returns_early_when_scan_empty(monkeypatch, tmp_path, caplo
 
     from src.daily import collect
 
-    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setenv("KIS_DATA_1_HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
 
@@ -164,7 +164,7 @@ def test_collect_main_marks_index_failed_and_nans_kospi_kosdaq_on_index_failure(
         async def get_market_index_rate(self, session: object, code: str) -> dict:
             return {"rt_cd": "9", "msg1": "index unavailable"}
 
-    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setenv("KIS_DATA_1_HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FailingIndexClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
 
@@ -210,7 +210,7 @@ def test_collect_main_raises_and_skips_persist_when_coverage_gate_fails(monkeypa
 
     from src.daily import collect
 
-    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setenv("KIS_DATA_1_HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
 
@@ -255,7 +255,7 @@ def test_collect_main_persists_price_anomaly_column_as_all_false_for_healthy_sna
 
     from src.daily import collect
 
-    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setenv("KIS_DATA_1_HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
 
@@ -304,7 +304,7 @@ def test_collect_main_attaches_market_breadth_from_price_history_panel(monkeypat
 
     from src.daily import collect
 
-    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setenv("KIS_DATA_1_HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
 
@@ -354,7 +354,7 @@ def test_collect_main_marks_breadth_failed_and_nans_on_panel_load_failure(monkey
 
     from src.daily import collect
 
-    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setenv("KIS_DATA_1_HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
 
@@ -405,7 +405,7 @@ def test_collect_main_marks_breadth_failed_when_panel_loads_but_breadth_is_nan(m
 
     from src.daily import collect
 
-    monkeypatch.setattr(collect, "HTS_ID", "TEST")
+    monkeypatch.setenv("KIS_DATA_1_HTS_ID", "TEST")
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
     monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
 
