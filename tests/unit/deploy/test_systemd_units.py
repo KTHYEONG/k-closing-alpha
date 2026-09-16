@@ -386,3 +386,26 @@ def test_decision_window_services_pin_decision_data_role() -> None:
         text = svc.read_text(encoding="utf-8")
         assert ("Environment=KIS_DATA_ROLE=decision" in text) == (svc.name in decision), svc.name
 
+
+def test_every_kca_service_loads_shared_runtime_env_file() -> None:
+    from pathlib import Path
+
+    services = sorted(Path("deploy/systemd").glob("kca-*.service"))
+    assert services, "no kca service units found"
+
+    expected = "EnvironmentFile=%h/quant-secrets/k-closing-alpha.env"
+    offenders = [p.name for p in services if expected not in p.read_text(encoding="utf-8")]
+    assert offenders == [], offenders
+
+    optional = [
+        p.name
+        for p in services
+        if "EnvironmentFile=-" in p.read_text(encoding="utf-8")
+    ]
+    assert optional == [], optional
+
+    hardcoded = [
+        p.name for p in services if "/home/ubuntu" in p.read_text(encoding="utf-8")
+    ]
+    assert hardcoded == [], hardcoded
+
