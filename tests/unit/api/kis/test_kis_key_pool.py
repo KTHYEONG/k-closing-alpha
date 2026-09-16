@@ -173,3 +173,38 @@ def test_resolve_host_data_credentials_falls_back_to_legacy_settings(monkeypatch
     })
     assert pooled == (KisCredential(slot="DATA_3", app_key="key3", app_secret="sec3", hts_id=""),)
 
+
+def test_read_token_issued_date_reads_existing_and_handles_missing_or_corrupt(tmp_path) -> None:
+    import json
+
+    from src.api.kis.key_pool import read_token_issued_date
+
+    # Given: 존재하지 않는 파일
+    missing = tmp_path / "token_missing.json"
+
+    # Then
+    assert read_token_issued_date(missing) is None
+
+    # And: 정상 캐시 파일
+    valid = tmp_path / "token_valid.json"
+    valid.write_text(
+        json.dumps({"access_token": "x", "issued_at": "2026-09-16T07:05:01+09:00", "app_key": "k"}),
+        encoding="utf-8",
+    )
+    assert read_token_issued_date(valid) == "2026-09-16"
+
+    # And: 손상된 JSON
+    corrupt = tmp_path / "token_corrupt.json"
+    corrupt.write_text("{not json", encoding="utf-8")
+    assert read_token_issued_date(corrupt) is None
+
+    # And: issued_at 필드 자체가 없는 파일
+    no_field = tmp_path / "token_no_field.json"
+    no_field.write_text(json.dumps({"access_token": "x"}), encoding="utf-8")
+    assert read_token_issued_date(no_field) is None
+
+    # And: dict가 아닌 JSON 페이로드
+    not_dict = tmp_path / "token_not_dict.json"
+    not_dict.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+    assert read_token_issued_date(not_dict) is None
+

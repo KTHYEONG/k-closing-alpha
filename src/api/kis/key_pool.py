@@ -9,6 +9,7 @@ the cache and issue under an exclusive file lock as a fallback.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from collections.abc import Mapping
@@ -39,6 +40,24 @@ def kis_key_id(app_key: str) -> str:
 
 def token_cache_path(app_key: str, cache_dir: Path) -> Path:
     return Path(cache_dir) / f"token_{kis_key_id(app_key)}.json"
+
+
+def read_token_issued_date(token_file: Path) -> str | None:
+    """토큰 캐시 파일의 issued_at 날짜(YYYY-MM-DD)를 읽는다. 없거나 손상되면 None.
+
+    조회 전용 헬퍼이므로 읽기 실패를 예외로 올리지 않고 None으로 낮춘다
+    (client._read_cache_payload와 동일한 fail-open 정책).
+    """
+    if not token_file.exists():
+        return None
+    try:
+        payload = json.loads(token_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    issued_at = str(payload.get("issued_at", ""))
+    return issued_at[:10] or None
 
 
 def load_kis_env(env_file: Path) -> dict[str, str]:

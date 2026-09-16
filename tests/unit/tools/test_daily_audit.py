@@ -242,6 +242,48 @@ def test_list_failed_kca_units_parses_plain_output_and_surfaces_unavailable() ->
     assert daily_audit.list_failed_kca_units(_missing) == ["<systemctl unavailable: FileNotFoundError>"]
 
 
+def test_list_stale_kis_data_tokens_reports_missing_and_stale_slots(tmp_path) -> None:
+    import json
+
+    from src.api.kis.key_pool import token_cache_path
+    from src.tools import daily_audit
+
+    env = {
+        "KIS_DATA_SLOTS": "1,2,3",
+        "KIS_HOST_DATA_SLOTS": "1,2,3",
+        "KIS_DATA_1_APP_KEY": "key1",
+        "KIS_DATA_1_APP_SECRET": "sec1",
+        "KIS_DATA_2_APP_KEY": "key2",
+        "KIS_DATA_2_APP_SECRET": "sec2",
+        "KIS_DATA_3_APP_KEY": "key3",
+        "KIS_DATA_3_APP_SECRET": "sec3",
+    }
+
+    # Given: 슬롯1은 오늘자 토큰, 슬롯2는 어제자(구식), 슬롯3은 파일 자체 없음
+    token_cache_path("key1", tmp_path).write_text(
+        json.dumps({"issued_at": "2026-09-16T07:05:01+09:00"}), encoding="utf-8"
+    )
+    token_cache_path("key2", tmp_path).write_text(
+        json.dumps({"issued_at": "2026-09-15T07:05:01+09:00"}), encoding="utf-8"
+    )
+
+    # When
+    stale = daily_audit.list_stale_kis_data_tokens("2026-09-16", env=env, cache_dir=tmp_path)
+
+    # Then
+    assert stale == ["DATA_2", "DATA_3"]
+
+    # And: 호스트 슬롯 설정 자체가 어긋나면 숨기지 않고 표식을 반환한다
+    broken_env = {
+        "KIS_DATA_SLOTS": "1,2",
+        "KIS_HOST_DATA_SLOTS": "1,2",
+        "KIS_DATA_1_APP_KEY": "key1",
+        "KIS_DATA_1_APP_SECRET": "sec1",
+    }
+    result = daily_audit.list_stale_kis_data_tokens("2026-09-16", env=broken_env, cache_dir=tmp_path)
+    assert len(result) == 1 and result[0].startswith("<kis host slot config invalid")
+
+
 def test_build_digest_ok_warning_and_holiday_subjects() -> None:
     import pytest
 
@@ -250,23 +292,27 @@ def test_build_digest_ok_warning_and_holiday_subjects() -> None:
     all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
 
     # When/Then: 정상
-    subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [])
+    subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
     assert subject == "[KCA] 2026-09-14 일일점검 OK"
     assert "failed_units=none" in body
+    assert "stale_kis_tokens=none" in body
 
-    # And: 누락 + 실패유닛
+    # And: 누락 + 실패유닛 + KIS 토큰 누락
     partial = dict(all_ok, paper_entry=False)
-    subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, partial, ["kca-backup.service"])
-    assert "경고" in subject and "paper_entry" in subject and "kca-backup.service" in subject
+    subject, body = daily_audit.build_digest(
+        "2026-09-14", daily_audit.DAY_TRADING, partial, ["kca-backup.service"], ["DATA_3"]
+    )
+    assert "경고" in subject and "paper_entry" in subject and "kca-backup.service" in subject and "DATA_3" in subject
     assert "paper_entry=MISSING" in body
+    assert "stale_kis_tokens=DATA_3" in body
 
     # And: 휴장일
-    subject, _ = daily_audit.build_digest("2026-09-24", daily_audit.DAY_HOLIDAY, None, [])
+    subject, _ = daily_audit.build_digest("2026-09-24", daily_audit.DAY_HOLIDAY, None, [], [])
     assert subject == "[KCA] 2026-09-24 휴장일 SKIP"
 
     # And: 거래일인데 감사 결과가 없으면 거부
     with pytest.raises(ValueError, match="audit result required"):
-        daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, None, [])
+        daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, None, [], [])
 
 
 def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> None:
@@ -285,17 +331,33 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         return {"webhook": False, "email": True}
 
     # When/Then: 주말은 아무것도 보내지 않는다
-    assert daily_audit.run_daily_audit("2026-09-13", trading_day_fn=lambda _d: True, failed_units_fn=list, dispatch_fn=_dispatch) is None
+    assert daily_audit.run_daily_audit(
+        "2026-09-13",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+    ) is None
     assert sent == [] and audited == []
 
     # And: 평일 휴장일은 감사 없이 휴장일 요약 1통
-    subject = daily_audit.run_daily_audit("2026-09-24", trading_day_fn=lambda _d: False, failed_units_fn=list, dispatch_fn=_dispatch)
+    subject = daily_audit.run_daily_audit(
+        "2026-09-24",
+        trading_day_fn=lambda _d: False,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+    )
     assert subject == "[KCA] 2026-09-24 휴장일 SKIP"
     assert audited == [] and len(sent) == 1
 
     # And: 거래일은 감사 후 요약 1통
     subject = daily_audit.run_daily_audit(
-        "2026-09-14", trading_day_fn=lambda _d: True, failed_units_fn=lambda: [], dispatch_fn=_dispatch
+        "2026-09-14",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=lambda: [],
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
     )
     assert subject == "[KCA] 2026-09-14 일일점검 OK"
     assert audited == ["2026-09-14"] and len(sent) == 2
