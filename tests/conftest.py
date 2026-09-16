@@ -32,6 +32,10 @@ def _isolate_kis_token_state(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: 
     monkeypatch.delenv("KIS_APP_KEY", raising=False)
     monkeypatch.delenv("KIS_APP_SECRET", raising=False)
     monkeypatch.delenv("KIS_HTS_ID", raising=False)
+    # 실호스트의 KIS_DECISION_SHARD_SLOTS가 새어들면 더미 풀(슬롯 1개)과 충돌해
+    # parse_decision_shard_credentials가 fail-closed ValueError를 던진다(실측:
+    # 2026-09-17 code-sync가 이 누락으로 매일 실패).
+    monkeypatch.delenv("KIS_DECISION_SHARD_SLOTS", raising=False)
 
 
 @pytest.fixture
