@@ -16,6 +16,7 @@ from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, RUN_OUTCOME_OK, recor
 logger = logging.getLogger(__name__)
 
 from src.daily.archive import fetch_archive_snapshot
+from src.ml.retrain_registry import resolve_code_commit_env
 from src.serving.realtime.artifacts import load_model_bundle
 from src.utils.display import print_table
 
@@ -153,6 +154,9 @@ def resolve_code_commit(run_fn: Callable[..., subprocess.CompletedProcess[str]] 
     Returns:
         Short commit hash, or ``UNKNOWN`` when git is unavailable.
     """
+    env_commit = resolve_code_commit_env()
+    if env_commit != "UNKNOWN":
+        return env_commit
     try:
         completed = run_fn(
             ["git", "rev-parse", "--short=12", "HEAD"],

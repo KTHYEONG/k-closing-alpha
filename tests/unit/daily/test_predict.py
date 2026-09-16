@@ -760,12 +760,26 @@ def test_persist_rank_pool_predictions_writes_and_dedups_per_date_symbol(tmp_pat
     assert stored["decided_at"].notna().all()
 
 
-def test_resolve_code_commit_returns_sha_or_unknown() -> None:
+def test_resolve_code_commit_prefers_kca_code_commit_env_over_git(monkeypatch) -> None:
+    import subprocess
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setenv("KCA_CODE_COMMIT", "  f7b15ea0c1d2 ")
+
+    def _must_not_be_called(cmd, **kwargs):
+        raise AssertionError("git must not be invoked when KCA_CODE_COMMIT is set")
+
+    assert predict_mod.resolve_code_commit(run_fn=_must_not_be_called) == "f7b15ea0c1d2"
+
+
+def test_resolve_code_commit_falls_back_to_git_when_env_unset(monkeypatch) -> None:
     import subprocess
     from pathlib import Path
 
     import src.daily.predict as predict_mod
 
+    monkeypatch.delenv("KCA_CODE_COMMIT", raising=False)
     repo_root = str(Path(predict_mod.__file__).resolve().parents[2])
 
     def _ok(cmd, **kwargs):
@@ -782,7 +796,6 @@ def test_resolve_code_commit_returns_sha_or_unknown() -> None:
     def _slow(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 10)
 
-    # Then
     assert predict_mod.resolve_code_commit(run_fn=_ok) == "b846de0abc12"
     assert predict_mod.resolve_code_commit(run_fn=_fail) == "UNKNOWN"
     assert predict_mod.resolve_code_commit(run_fn=_missing) == "UNKNOWN"
