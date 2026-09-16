@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shlex
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -112,9 +113,18 @@ def build_runtime_fragment(source_path: Path) -> str:
 
 
 def install_runtime_fragment(host: str, fragment: str) -> None:
-    """Install fragment to REMOTE_RUNTIME_ENV_PATH over SSH (stdin only, atomic)."""
+    """Install fragment to REMOTE_RUNTIME_ENV_PATH over SSH (stdin only, atomic).
+
+    ssh joins argv[2:] with spaces before the remote login shell sees it, so
+    passing ("bash", "-c", SCRIPT) as separate elements lets the newline-
+    bearing SCRIPT get re-split: -c only receives the first word ("set"),
+    and the remaining lines run in the outer login shell. That stray
+    ``bash -c set`` dumps the whole shell environment to stdout (measured).
+    ``shlex.quote`` collapses the script into one argv element so the
+    remote shell parses it as exactly ``bash -c <SCRIPT>``.
+    """
     subprocess.run(  # noqa: S603
-        ["ssh", host, "bash", "-c", REMOTE_RUNTIME_INSTALL_SCRIPT],  # noqa: S607
+        ["ssh", host, f"bash -c {shlex.quote(REMOTE_RUNTIME_INSTALL_SCRIPT)}"],  # noqa: S607
         input=fragment,
         text=True,
         check=True,
