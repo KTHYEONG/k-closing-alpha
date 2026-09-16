@@ -677,9 +677,20 @@ def test_daily_audit_and_backup_normalize_ownership_before_reading_container_wri
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    chown_line = "ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts"
+    expected_chown_line = {
+        # daily_audit는 data/artifacts(파케이 산출물)뿐 아니라 list_stale_kis_tokens가
+        # 읽는 ~/.cache/kis 토큰 캐시도 컨테이너가 root로 남기므로 함께 정규화해야 한다
+        "kca-daily-audit.service": (
+            "ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu "
+            "%h/k-closing-alpha/data %h/k-closing-alpha/artifacts %h/.cache/kis"
+        ),
+        "kca-backup.service": (
+            "ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu "
+            "%h/k-closing-alpha/data %h/k-closing-alpha/artifacts"
+        ),
+    }
 
-    for name in ("kca-daily-audit.service", "kca-backup.service"):
+    for name, chown_line in expected_chown_line.items():
         lines = (root / name).read_text(encoding="utf-8").splitlines()
         assert chown_line in lines, name
         chown_idx = lines.index(chown_line)
@@ -688,5 +699,5 @@ def test_daily_audit_and_backup_normalize_ownership_before_reading_container_wri
 
     # 컨테이너 유닛 자체는 이미 root로 쓰는 쪽이므로 이 정규화 훅이 필요 없다
     collect_text = (root / "kca-collect.service").read_text(encoding="utf-8")
-    assert chown_line not in collect_text
+    assert "ExecStartPre=/usr/bin/sudo /usr/bin/chown" not in collect_text
 
