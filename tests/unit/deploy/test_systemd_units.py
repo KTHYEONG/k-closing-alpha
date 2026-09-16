@@ -672,3 +672,21 @@ def test_code_sync_timer_fires_before_morning_price_ingest() -> None:
 
     assert warmup_time < code_sync_time < first_ingest_time
 
+
+def test_daily_audit_and_backup_normalize_ownership_before_reading_container_writes() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    chown_line = "ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts"
+
+    for name in ("kca-daily-audit.service", "kca-backup.service"):
+        lines = (root / name).read_text(encoding="utf-8").splitlines()
+        assert chown_line in lines, name
+        chown_idx = lines.index(chown_line)
+        exec_start_idx = next(i for i, line in enumerate(lines) if line.startswith("ExecStart="))
+        assert chown_idx < exec_start_idx, name
+
+    # 컨테이너 유닛 자체는 이미 root로 쓰는 쪽이므로 이 정규화 훅이 필요 없다
+    collect_text = (root / "kca-collect.service").read_text(encoding="utf-8")
+    assert chown_line not in collect_text
+
