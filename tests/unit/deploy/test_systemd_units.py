@@ -376,14 +376,22 @@ def test_retrain_service_uses_shared_runtime_env_file_not_legacy_dotenv() -> Non
     assert "%h/k-closing-alpha/.env" not in text
 
 
-def test_code_sync_unit_and_timer_retired() -> None:
+def test_code_sync_unit_and_timer_restored_for_host_bound_jobs() -> None:
     import pathlib
 
     base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+    service = (base / "systemd" / "kca-code-sync.service").read_text(encoding="utf-8")
+    timer = (base / "systemd" / "kca-code-sync.timer").read_text(encoding="utf-8")
+    install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
 
-    assert not (base / "systemd" / "kca-code-sync.service").exists()
-    assert not (base / "systemd" / "kca-code-sync.timer").exists()
-    assert "kca-code-sync" not in (base / "install_systemd.sh").read_text(encoding="utf-8")
+    assert "src.tools.code_sync" in service
+    assert "OnFailure=kca-alert@%n.service" in service
+    assert "%h/.local/bin/" in service
+    assert "Environment=TZ=Asia/Seoul" in service
+    assert "EnvironmentFile=%h/quant-secrets/k-closing-alpha.env" in service
+    assert "Unit=kca-code-sync.service" in timer
+    assert "Persistent=true" in timer
+    assert "kca-code-sync.timer" in install_text
 
 
 def test_after_ordering_preserved_across_containerization() -> None:
@@ -594,4 +602,27 @@ def test_every_kca_service_loads_shared_runtime_env_file() -> None:
         p.name for p in services if "/home/ubuntu" in p.read_text(encoding="utf-8")
     ]
     assert hardcoded == [], hardcoded
+
+
+def test_code_sync_timer_fires_before_morning_price_ingest() -> None:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+
+    def _first_time(name: str) -> str:
+        text = (root / name).read_text(encoding="utf-8")
+        match = re.search(r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})", text)
+        assert match is not None, name
+        return match.group(1)
+
+    warmup_time = _first_time("kca-kis-token-warmup.timer")
+    code_sync_time = _first_time("kca-code-sync.timer")
+    ingest_times = re.findall(
+        r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})",
+        (root / "kca-price-ingest.timer").read_text(encoding="utf-8"),
+    )
+    first_ingest_time = min(ingest_times)
+
+    assert warmup_time < code_sync_time < first_ingest_time
 
