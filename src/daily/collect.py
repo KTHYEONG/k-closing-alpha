@@ -15,7 +15,7 @@ import pandas as pd
 from src import settings
 
 # 커스텀 모듈 임포트
-from src.api.kis.client import KisApiClient, kis_data_client_kwargs
+from src.api.kis.client import KisApiClient, kis_data_client_kwargs, kis_decision_shard_client_kwargs
 from src.config.market_session import REALTIME_REQUOTE_DEADLINE_HHMMSS
 from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
 from src.utils.display import Colors
@@ -590,6 +590,59 @@ async def fetch_all_stock_data(
     return results, failed_info
 
 
+def _split_stock_list_evenly(stock_list: list[dict], n: int) -> list[list[dict]]:
+    """stock_list를 원래 순서를 보존한 채 n개의 연속 구간으로 최대한 균등 분할한다.
+
+    [STEP-BY-STEP RECIPE FOR IMPLEMENTER]:
+    Step 1. `base, rem = divmod(len(stock_list), n)`을 계산한다.
+    Step 2. `start = 0`에서 시작해 `i in range(n)`을 순회하며 각 청크 크기를
+       `base + (1 if i < rem else 0)`으로 정하고 `stock_list[start:start+size]`를 잘라
+       리스트에 담은 뒤 `start += size`로 진행한다(앞쪽 rem개 청크가 1개씩 더 받는다).
+    Step 3. 길이가 n인 리스트의 리스트를 반환한다(일부 청크가 빈 리스트 `[]`일 수 있다 —
+       `stock_list`가 `n`보다 짧을 때).
+    """
+    base, rem = divmod(len(stock_list), n)
+    chunks: list[list[dict]] = []
+    start = 0
+    for i in range(n):
+        size = base + (1 if i < rem else 0)
+        chunks.append(stock_list[start:start + size])
+        start += size
+    return chunks
+
+
+async def fetch_all_stock_data_sharded(
+    stock_list: list[dict],
+    clients: list,
+    session,
+    *,
+    now_fn: Callable[[], datetime] | None = None,
+) -> tuple[list[dict], list[tuple[str, str, list[str]]]]:
+    """여러 KIS 키로 fetch_all_stock_data를 병렬 분할 실행하고 원래 순서로 병합한다.
+
+    [STEP-BY-STEP RECIPE FOR IMPLEMENTER]:
+    Step 1. `len(clients) <= 1`이면 `fetch_all_stock_data`로 그대로 위임하고 종료한다.
+    Step 2. `chunks = _split_stock_list_evenly(stock_list, len(clients))`로 분할한다.
+    Step 3. 빈 청크를 제외한다. `pairs`가 비어있으면 `return [], []`.
+    Step 4. 각 샤드를 병렬 수집한다.
+    Step 5. 순서대로 이어붙인다.
+    Step 6. `return results, failed_info`.
+    """
+    if len(clients) <= 1:
+        return await fetch_all_stock_data(stock_list, clients[0], session, now_fn=now_fn)
+    chunks = _split_stock_list_evenly(stock_list, len(clients))
+    pairs = [(chunk, client) for chunk, client in zip(chunks, clients) if chunk]
+    if not pairs:
+        return [], []
+    gathered = await asyncio.gather(*[fetch_all_stock_data(chunk, client, session, now_fn=now_fn) for chunk, client in pairs])
+    results: list[dict] = []
+    failed_info: list = []
+    for r, f in gathered:
+        results.extend(r)
+        failed_info.extend(f)
+    return results, failed_info
+
+
 def persist_daily_snapshot(df: pd.DataFrame, snapshot_date: str) -> int:
     """일일 wide 스냅샷을 아카이브 저장소에 직접 기록한다.
 
@@ -635,6 +688,17 @@ async def main(force: bool = False):
             token_file=data_kwargs["token_file"],
         )
         await client.ensure_token(session)
+        decision_shard_clients = [client]
+        for shard_kwargs in kis_decision_shard_client_kwargs()[1:]:
+            shard_client = KisApiClient(
+                shard_kwargs["app_key"],
+                shard_kwargs["app_secret"],
+                shard_kwargs["account_id"],
+                shard_kwargs["hts_id"],
+                token_file=shard_kwargs["token_file"],
+            )
+            await shard_client.ensure_token(session)
+            decision_shard_clients.append(shard_client)
 
         snapshot_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
         kiwoom_client = build_kiwoom_scan_client()
@@ -669,7 +733,7 @@ async def main(force: bool = False):
 
         # 4. 상세 데이터 수집
         logger.info(f"\n{Colors.BOLD}⏳ [2/3] 실시간 단면 데이터 수집{Colors.RESET}")
-        results, failed_info = await fetch_all_stock_data(stock_list, client, session)
+        results, failed_info = await fetch_all_stock_data_sharded(stock_list, decision_shard_clients, session)
 
         # 5. wide 단면 구성 후 PIT admitted 플래그 부여 및 저장소 직접 기록
         logger.info(f"\n{Colors.BOLD}📊 [3/3] 유니버스 적격성(Admission) 평가 및 저장{Colors.RESET}")

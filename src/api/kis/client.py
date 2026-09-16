@@ -19,6 +19,7 @@ from src import settings
 from src.api.kis.key_pool import (
     kis_key_id,
     load_kis_env,
+    resolve_decision_shard_credentials,
     resolve_host_data_credentials,
     select_data_credential,
     token_cache_path,
@@ -978,3 +979,31 @@ def kis_data_client_kwargs(env: Mapping[str, str] | None = None) -> dict[str, st
         "hts_id": cred.hts_id,
         "token_file": str(token_cache_path(cred.app_key, settings.KIS_TOKEN_CACHE_DIR)),
     }
+
+
+def kis_decision_shard_client_kwargs(env: Mapping[str, str] | None = None) -> list[dict[str, str]]:
+    """결정창 벌크 수집용 KIS 자격증명 목록(1개 또는 N개)을 KisApiClient kwargs 리스트로 반환한다.
+
+    [STEP-BY-STEP RECIPE FOR IMPLEMENTER]:
+    Step 1. `source = load_kis_env(Path(settings.BASE_DIR) / ".env") if env is None else env`로
+       소스를 정한다(`kis_data_client_kwargs`와 동일 관례).
+    Step 2. `creds = resolve_decision_shard_credentials(source)`를 호출한다.
+    Step 3. `creds`의 각 자격증명을 아래와 동일한 5개 키의 dict로 변환한다
+       (`kis_data_client_kwargs`와 필드 이름/구성 100% 동일, account_id는 항상 빈 문자열).
+    Step 4. 변환된 dict들을 `creds`와 동일한 순서의 리스트로 반환한다. `KIS_DECISION_SHARD_SLOTS`
+       미설정 시 리스트 길이는 항상 1이고, 그 1개는 `kis_data_client_kwargs(source)`가
+       반환하는 값과 app_key가 동일하다(레거시 경로 보존, `resolve_decision_shard_credentials`
+       Step 3이 이를 보장).
+    """
+    source = load_kis_env(Path(settings.BASE_DIR) / ".env") if env is None else env
+    creds = resolve_decision_shard_credentials(source)
+    return [
+        {
+            "app_key": cred.app_key,
+            "app_secret": cred.app_secret,
+            "account_id": "",
+            "hts_id": cred.hts_id,
+            "token_file": str(token_cache_path(cred.app_key, settings.KIS_TOKEN_CACHE_DIR)),
+        }
+        for cred in creds
+    ]

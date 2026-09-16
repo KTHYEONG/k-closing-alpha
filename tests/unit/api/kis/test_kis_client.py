@@ -301,3 +301,36 @@ def test_kis_data_client_gets_isolated_rate_limiter_from_execution_client(monkey
     assert data_client.app_key == "data-key-iso"
     assert exec_client.app_key == "exec-key-iso"
 
+
+def test_kis_decision_shard_client_kwargs_returns_single_entry_when_unset() -> None:
+    from src.api.kis.client import kis_decision_shard_client_kwargs
+
+    env = {
+        "KIS_DATA_SLOTS": "1,4",
+        "KIS_HOST_DATA_SLOTS": "1,4",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_4_APP_KEY": "key4", "KIS_DATA_4_APP_SECRET": "sec4", "KIS_DATA_4_HTS_ID": "hts4",
+    }
+    result = kis_decision_shard_client_kwargs(env)
+    assert len(result) == 1
+    assert result[0]["app_key"] == "key1"
+    assert result[0]["account_id"] == ""
+
+
+def test_kis_decision_shard_client_kwargs_returns_two_entries_when_configured() -> None:
+    from src.api.kis.client import kis_decision_shard_client_kwargs
+
+    env = {
+        "KIS_DATA_SLOTS": "1,2,3,4,5",
+        "KIS_HOST_DATA_SLOTS": "1,2,3,4",
+        "KIS_DECISION_SHARD_SLOTS": "1,5",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_2_APP_KEY": "key2", "KIS_DATA_2_APP_SECRET": "sec2", "KIS_DATA_2_HTS_ID": "hts2",
+        "KIS_DATA_3_APP_KEY": "key3", "KIS_DATA_3_APP_SECRET": "sec3", "KIS_DATA_3_HTS_ID": "hts3",
+        "KIS_DATA_4_APP_KEY": "key4", "KIS_DATA_4_APP_SECRET": "sec4", "KIS_DATA_4_HTS_ID": "hts4",
+        "KIS_DATA_5_APP_KEY": "key5", "KIS_DATA_5_APP_SECRET": "sec5", "KIS_DATA_5_HTS_ID": "hts5",
+    }
+    result = kis_decision_shard_client_kwargs(env)
+    assert [kw["app_key"] for kw in result] == ["key1", "key5"]
+    assert result[1]["token_file"].endswith(".json")
+
