@@ -536,7 +536,24 @@ def test_kis_token_warmup_timer_precedes_first_kis_job() -> None:
     assert "docker run --rm" in service
     assert "src.tools.kis_token_warmup" in service
     assert "-v %h/.cache/kis:/root/.cache/kis" in service
+    assert "--env-file %h/quant-secrets/kis-data.env" in service
     assert "OnFailure=kca-alert@%n.service" in service
+
+
+def test_kis_token_warmup_forwards_shared_key_pool_env_into_container() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    service = (root / "kca-kis-token-warmup.service").read_text(encoding="utf-8")
+    exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
+
+    # Then: 키풀 원본 자격증명(kis-data.env)은 systemd 드롭인이 아니라 docker run 자체에
+    # 명시돼야 컨테이너 프로세스로 전달된다(드롭인의 EnvironmentFile은 host 'docker'
+    # 클라이언트 프로세스에만 적용되고 컨테이너 내부로 자동 전파되지 않는다).
+    assert "--env-file %h/quant-secrets/kis-data.env" in exec_line
+    assert exec_line.index("--env-file %h/quant-secrets/k-closing-alpha.env") < exec_line.index(
+        "--env-file %h/quant-secrets/kis-data.env"
+    )
     assert "Type=oneshot" in service
 
 
