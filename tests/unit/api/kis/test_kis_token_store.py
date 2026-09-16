@@ -52,11 +52,12 @@ def test_ensure_token_force_refresh_adopts_token_refreshed_by_other_process(tmp_
     import asyncio
     import json
     from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
 
     from src.api.kis.client import KisApiClient
 
     token_file = tmp_path / "tok.json"
-    valid = (datetime.now() + timedelta(hours=20)).strftime("%Y-%m-%d %H:%M:%S")
+    valid = (datetime.now(ZoneInfo("Asia/Seoul")) + timedelta(hours=20)).isoformat(timespec="seconds")
     token_file.write_text(
         json.dumps({"access_token": "FRESH", "expired_at": valid, "app_key": "k", "issued_at": "2026-09-15T07:05:00+09:00"}),
         encoding="utf-8",
@@ -109,7 +110,7 @@ def test_ensure_token_records_issued_at_and_logs_repeat_issue(tmp_path, monkeypa
 
     monkeypatch.setattr(client_mod, "_now_kst", lambda: datetime(2026, 9, 15, 10, 0, 0, tzinfo=ZoneInfo("Asia/Seoul")))
     token_file = tmp_path / "tok.json"
-    expired = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+    expired = datetime(2026, 9, 15, 9, 59, 0, tzinfo=ZoneInfo("Asia/Seoul")).isoformat(timespec="seconds")
     token_file.write_text(
         json.dumps({"access_token": "OLD", "expired_at": expired, "app_key": "k", "issued_at": "2026-09-15T07:05:00+09:00"}),
         encoding="utf-8",
@@ -202,7 +203,7 @@ def test_issue_daily_token_skips_when_issued_today_and_reissues_stale(tmp_path, 
 
     monkeypatch.setattr(client_mod, "_now_kst", lambda: datetime(2026, 9, 16, 7, 5, 0, tzinfo=ZoneInfo("Asia/Seoul")))
     token_file = tmp_path / "tok.json"
-    valid = (datetime.now() + timedelta(hours=20)).strftime("%Y-%m-%d %H:%M:%S")
+    valid = (datetime(2026, 9, 16, 7, 5, 0, tzinfo=ZoneInfo("Asia/Seoul")) + timedelta(hours=20)).isoformat(timespec="seconds")
     posts = {"n": 0}
     reply = {"body": {"access_token": "NEW", "expires_in": 86400}}
 

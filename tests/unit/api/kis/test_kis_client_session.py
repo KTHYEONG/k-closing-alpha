@@ -167,6 +167,7 @@ def test_kis_ensure_token_falls_back_to_cached_token_when_issuance_throttled(tmp
     import asyncio
     import json
     from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
 
     import pytest
 
@@ -174,7 +175,7 @@ def test_kis_ensure_token_falls_back_to_cached_token_when_issuance_throttled(tmp
 
     token_file = tmp_path / "kis_token.json"
     # Given: 10분 미만 남아 조기갱신 대상이지만 아직 만료되지 않은 캐시 토큰
-    near_expiry = (datetime.now() + timedelta(minutes=3)).strftime("%Y-%m-%d %H:%M:%S")
+    near_expiry = (datetime.now(ZoneInfo("Asia/Seoul")) + timedelta(minutes=3)).isoformat(timespec="seconds")
     token_file.write_text(
         json.dumps({"access_token": "CACHED", "expired_at": near_expiry, "app_key": "k"}),
         encoding="utf-8",
@@ -204,7 +205,7 @@ def test_kis_ensure_token_falls_back_to_cached_token_when_issuance_throttled(tmp
     assert client.token == "CACHED"
 
     # And: 쓸 수 있는 캐시가 없으면 침묵하지 않고 raise
-    expired = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+    expired = (datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(minutes=1)).isoformat(timespec="seconds")
     token_file.write_text(
         json.dumps({"access_token": "OLD", "expired_at": expired, "app_key": "k"}),
         encoding="utf-8",
