@@ -61,23 +61,13 @@ async def _validate_trading_day(client, session, snapshot_date: str, *, force: b
     if not await is_kis_trading_day(client, session, snapshot_date):
         raise NonTradingDayError(f"non-trading day: {snapshot_date}")
 
-# =========================================================
-# [설정] API 접속 정보
-# =========================================================
-_KIS_DATA_KWARGS = kis_data_client_kwargs()
-APP_KEY = _KIS_DATA_KWARGS["app_key"]
-APP_SECRET = _KIS_DATA_KWARGS["app_secret"]
-ACCOUNT_ID = _KIS_DATA_KWARGS["account_id"]
-HTS_ID = _KIS_DATA_KWARGS["hts_id"]
-
 TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
-TOKEN_FILE = _KIS_DATA_KWARGS["token_file"]
 
 logger.debug("일일 수집 시작...")
 
 
-def _validate_hts_id() -> None:
-    if not HTS_ID or "여기에" in HTS_ID:
+def _validate_hts_id(hts_id: str) -> None:
+    if not hts_id or "여기에" in hts_id:
         raise RuntimeError(
             ".env 파일의 'KIS_HTS_ID'에 본인의 HTS ID를 입력해주세요!"
         )
@@ -618,7 +608,8 @@ def persist_daily_snapshot(df: pd.DataFrame, snapshot_date: str) -> int:
 async def main(force: bool = False):
     from aiohttp.resolver import ThreadedResolver
 
-    _validate_hts_id()
+    data_kwargs = kis_data_client_kwargs()
+    _validate_hts_id(data_kwargs["hts_id"])
     _validate_decision_window(datetime.now(ZoneInfo("Asia/Seoul")), force=force)
 
     # aiohttp 세션 설정 강화 (네트워크 안정성 향상 + DNS 해결)
@@ -637,7 +628,11 @@ async def main(force: bool = False):
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         # 1. 클라이언트 초기화 및 토큰 확보
         client = KisApiClient(
-            APP_KEY, APP_SECRET, ACCOUNT_ID, HTS_ID, token_file=TOKEN_FILE
+            data_kwargs["app_key"],
+            data_kwargs["app_secret"],
+            data_kwargs["account_id"],
+            data_kwargs["hts_id"],
+            token_file=data_kwargs["token_file"],
         )
         await client.ensure_token(session)
 
