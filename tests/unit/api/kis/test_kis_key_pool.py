@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 def test_parse_host_data_credentials_returns_host_slots_in_order() -> None:
     from src.api.kis.key_pool import KisCredential, parse_host_data_credentials
 
@@ -241,4 +243,164 @@ def test_resolve_host_issued_credentials_includes_declared_non_pool_keys() -> No
             "KIS_DATA_SLOTS": "1", "KIS_HOST_DATA_SLOTS": "1",
             "KIS_DATA_1_APP_KEY": "pool1", "KIS_DATA_1_APP_SECRET": "psec1",
         })
+
+
+def test_parse_decision_shard_credentials_returns_empty_when_unset() -> None:
+    from src.api.kis.key_pool import parse_decision_shard_credentials
+
+    env = {
+        "KIS_DATA_SLOTS": "1,2",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_2_APP_KEY": "key2", "KIS_DATA_2_APP_SECRET": "sec2", "KIS_DATA_2_HTS_ID": "hts2",
+    }
+    assert parse_decision_shard_credentials(env) == ()
+
+
+def test_parse_decision_shard_credentials_returns_empty_when_pool_undeclared() -> None:
+    from src.api.kis.key_pool import parse_decision_shard_credentials
+
+    env = {"KIS_DECISION_SHARD_SLOTS": "1,5"}
+    assert parse_decision_shard_credentials(env) == ()
+
+
+def test_parse_decision_shard_credentials_resolves_named_slots_in_order() -> None:
+    from src.api.kis.key_pool import KisCredential, parse_decision_shard_credentials
+
+    env = {
+        "KIS_DATA_SLOTS": "1,2,3,4,5",
+        "KIS_DECISION_SHARD_SLOTS": "1,5",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_5_APP_KEY": "key5", "KIS_DATA_5_APP_SECRET": "sec5", "KIS_DATA_5_HTS_ID": "hts5",
+    }
+    result = parse_decision_shard_credentials(env)
+    assert result == (
+        KisCredential(slot="DATA_1", app_key="key1", app_secret="sec1", hts_id="hts1"),
+        KisCredential(slot="DATA_5", app_key="key5", app_secret="sec5", hts_id="hts5"),
+    )
+
+
+def test_parse_decision_shard_credentials_rejects_slot_outside_pool() -> None:
+    from src.api.kis.key_pool import parse_decision_shard_credentials
+
+    env = {
+        "KIS_DATA_SLOTS": "1,2",
+        "KIS_DECISION_SHARD_SLOTS": "1,5",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+    }
+    with pytest.raises(ValueError, match="DATA_5 is not in KIS_DATA_SLOTS pool"):
+        parse_decision_shard_credentials(env)
+
+
+def test_parse_decision_shard_credentials_rejects_missing_secret() -> None:
+    from src.api.kis.key_pool import parse_decision_shard_credentials
+
+    env = {
+        "KIS_DATA_SLOTS": "1,5",
+        "KIS_DECISION_SHARD_SLOTS": "1,5",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_5_APP_KEY": "key5", "KIS_DATA_5_APP_SECRET": "",
+    }
+    with pytest.raises(ValueError, match="missing credentials for slot DATA_5"):
+        parse_decision_shard_credentials(env)
+
+
+def test_parse_decision_shard_credentials_rejects_duplicate_app_key() -> None:
+    from src.api.kis.key_pool import parse_decision_shard_credentials
+
+    env = {
+        "KIS_DATA_SLOTS": "1,5",
+        "KIS_DECISION_SHARD_SLOTS": "1,5",
+        "KIS_DATA_1_APP_KEY": "same", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_5_APP_KEY": "same", "KIS_DATA_5_APP_SECRET": "sec5", "KIS_DATA_5_HTS_ID": "hts5",
+    }
+    with pytest.raises(ValueError, match="duplicate app_key in decision shard slot DATA_5"):
+        parse_decision_shard_credentials(env)
+
+
+def test_resolve_decision_shard_credentials_falls_back_to_single_decision_key() -> None:
+    from src.api.kis.key_pool import (
+        resolve_decision_shard_credentials,
+        resolve_host_data_credentials,
+        select_data_credential,
+    )
+
+    env = {
+        "KIS_DATA_SLOTS": "1,4",
+        "KIS_HOST_DATA_SLOTS": "1,4",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_4_APP_KEY": "key4", "KIS_DATA_4_APP_SECRET": "sec4", "KIS_DATA_4_HTS_ID": "hts4",
+    }
+    expected = (select_data_credential(resolve_host_data_credentials(env), "decision"),)
+    assert resolve_decision_shard_credentials(env) == expected
+    assert expected[0].slot == "DATA_1"
+
+
+def test_resolve_decision_shard_credentials_returns_configured_shards() -> None:
+    from src.api.kis.key_pool import KisCredential, resolve_decision_shard_credentials
+
+    env = {
+        "KIS_DATA_SLOTS": "1,2,3,4,5",
+        "KIS_HOST_DATA_SLOTS": "1,2,3,4",
+        "KIS_DECISION_SHARD_SLOTS": "1,5",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_2_APP_KEY": "key2", "KIS_DATA_2_APP_SECRET": "sec2", "KIS_DATA_2_HTS_ID": "hts2",
+        "KIS_DATA_3_APP_KEY": "key3", "KIS_DATA_3_APP_SECRET": "sec3", "KIS_DATA_3_HTS_ID": "hts3",
+        "KIS_DATA_4_APP_KEY": "key4", "KIS_DATA_4_APP_SECRET": "sec4", "KIS_DATA_4_HTS_ID": "hts4",
+        "KIS_DATA_5_APP_KEY": "key5", "KIS_DATA_5_APP_SECRET": "sec5", "KIS_DATA_5_HTS_ID": "hts5",
+    }
+    result = resolve_decision_shard_credentials(env)
+    assert result == (
+        KisCredential(slot="DATA_1", app_key="key1", app_secret="sec1", hts_id="hts1"),
+        KisCredential(slot="DATA_5", app_key="key5", app_secret="sec5", hts_id="hts5"),
+    )
+
+
+def test_resolve_decision_shard_credentials_rejects_misordered_shard_slots() -> None:
+    from src.api.kis.key_pool import resolve_decision_shard_credentials
+
+    env = {
+        "KIS_DATA_SLOTS": "1,2,3,4,5",
+        "KIS_HOST_DATA_SLOTS": "1,2,3,4",
+        "KIS_DECISION_SHARD_SLOTS": "5,1",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_2_APP_KEY": "key2", "KIS_DATA_2_APP_SECRET": "sec2", "KIS_DATA_2_HTS_ID": "hts2",
+        "KIS_DATA_3_APP_KEY": "key3", "KIS_DATA_3_APP_SECRET": "sec3", "KIS_DATA_3_HTS_ID": "hts3",
+        "KIS_DATA_4_APP_KEY": "key4", "KIS_DATA_4_APP_SECRET": "sec4", "KIS_DATA_4_HTS_ID": "hts4",
+        "KIS_DATA_5_APP_KEY": "key5", "KIS_DATA_5_APP_SECRET": "sec5", "KIS_DATA_5_HTS_ID": "hts5",
+    }
+    with pytest.raises(ValueError, match="KIS_DECISION_SHARD_SLOTS must lead with"):
+        resolve_decision_shard_credentials(env)
+
+
+def test_resolve_host_issued_credentials_includes_decision_shard_extra_slot() -> None:
+    from src.api.kis.key_pool import resolve_host_issued_credentials
+
+    env = {
+        "KIS_DATA_SLOTS": "1,2,3,4,5",
+        "KIS_HOST_DATA_SLOTS": "1,2,3,4",
+        "KIS_DECISION_SHARD_SLOTS": "1,5",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_2_APP_KEY": "key2", "KIS_DATA_2_APP_SECRET": "sec2", "KIS_DATA_2_HTS_ID": "hts2",
+        "KIS_DATA_3_APP_KEY": "key3", "KIS_DATA_3_APP_SECRET": "sec3", "KIS_DATA_3_HTS_ID": "hts3",
+        "KIS_DATA_4_APP_KEY": "key4", "KIS_DATA_4_APP_SECRET": "sec4", "KIS_DATA_4_HTS_ID": "hts4",
+        "KIS_DATA_5_APP_KEY": "key5", "KIS_DATA_5_APP_SECRET": "sec5", "KIS_DATA_5_HTS_ID": "hts5",
+        "KIS_APP_KEY": "primary", "KIS_APP_SECRET": "psec", "KIS_HTS_ID": "phts",
+    }
+    slots = [c.slot for c in resolve_host_issued_credentials(env)]
+    assert slots == ["DATA_1", "DATA_2", "DATA_3", "DATA_4", "DATA_5", "PRIMARY"]
+
+
+def test_resolve_host_issued_credentials_dedupes_when_shard_slot_already_a_host_slot() -> None:
+    from src.api.kis.key_pool import resolve_host_issued_credentials
+
+    env = {
+        "KIS_DATA_SLOTS": "1,4",
+        "KIS_HOST_DATA_SLOTS": "1,4",
+        "KIS_DECISION_SHARD_SLOTS": "1,4",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1", "KIS_DATA_1_HTS_ID": "hts1",
+        "KIS_DATA_4_APP_KEY": "key4", "KIS_DATA_4_APP_SECRET": "sec4", "KIS_DATA_4_HTS_ID": "hts4",
+        "KIS_APP_KEY": "primary", "KIS_APP_SECRET": "psec", "KIS_HTS_ID": "phts",
+    }
+    slots = [c.slot for c in resolve_host_issued_credentials(env)]
+    assert slots == ["DATA_1", "DATA_4", "PRIMARY"]
 

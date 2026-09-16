@@ -85,7 +85,7 @@ def test_collect_main_persists_wide_snapshot_to_store_without_csv(monkeypatch, t
             {"code": "000004", "name": "DDD", "price": "30000", "chgrate": "5.0"},
         ]
 
-    async def _fake_fetch_all(stock_list, client, session):
+    async def _fake_fetch_all(stock_list, client, session, **_kwargs):
         rows = [
             {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
              "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
@@ -171,7 +171,7 @@ def test_collect_main_marks_index_failed_and_nans_kospi_kosdaq_on_index_failure(
     async def _fake_scan(client, session, **kwargs):
         return [{"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"}]
 
-    async def _fake_fetch_all(stock_list, client, session):
+    async def _fake_fetch_all(stock_list, client, session, **_kwargs):
         rows = [
             {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
              "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
@@ -220,7 +220,7 @@ def test_collect_main_raises_and_skips_persist_when_coverage_gate_fails(monkeypa
             {"code": "000009", "name": "ETN", "price": "0", "chgrate": "0.0"},
         ]
 
-    async def _fake_fetch_all(stock_list, client, session):
+    async def _fake_fetch_all(stock_list, client, session, **_kwargs):
         # Given: 1 healthy row + 1 degenerate all-zero 'success' row (50% degraded,
         # far below the 99% default threshold)
         rows = [
@@ -265,7 +265,7 @@ def test_collect_main_persists_price_anomaly_column_as_all_false_for_healthy_sna
             {"code": "000004", "name": "DDD", "price": "30000", "chgrate": "5.0"},
         ]
 
-    async def _fake_fetch_all(stock_list, client, session):
+    async def _fake_fetch_all(stock_list, client, session, **_kwargs):
         rows = [
             {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
              "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
@@ -311,7 +311,7 @@ def test_collect_main_attaches_market_breadth_from_price_history_panel(monkeypat
     async def _fake_scan(client, session, **kwargs):
         return [{"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"}]
 
-    async def _fake_fetch_all(stock_list, client, session):
+    async def _fake_fetch_all(stock_list, client, session, **_kwargs):
         rows = [
             {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
              "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
@@ -361,7 +361,7 @@ def test_collect_main_marks_breadth_failed_and_nans_on_panel_load_failure(monkey
     async def _fake_scan(client, session, **kwargs):
         return [{"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"}]
 
-    async def _fake_fetch_all(stock_list, client, session):
+    async def _fake_fetch_all(stock_list, client, session, **_kwargs):
         rows = [
             {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
              "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
@@ -412,7 +412,7 @@ def test_collect_main_marks_breadth_failed_when_panel_loads_but_breadth_is_nan(m
     async def _fake_scan(client, session, **kwargs):
         return [{"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"}]
 
-    async def _fake_fetch_all(stock_list, client, session):
+    async def _fake_fetch_all(stock_list, client, session, **_kwargs):
         rows = [
             {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
              "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,

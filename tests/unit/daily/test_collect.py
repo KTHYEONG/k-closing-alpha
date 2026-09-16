@@ -1048,7 +1048,7 @@ def test_main_filters_candidates_by_eligibility_before_quoting(monkeypatch) -> N
         eligibility_dates.append(decision_date)
         return frozenset({"005930"})
 
-    async def _fetch_all(stock_list, _client, _session):
+    async def _fetch_all(stock_list, _client, _session, **_kwargs):
         quoted.append([row["code"] for row in stock_list])
         raise _Stop
 
@@ -1384,7 +1384,7 @@ def test_main_resolves_previous_trading_day_through_kis_before_eligibility(monke
         eligibility_calls.append((decision_date, prev_trading_day))
         return frozenset({"005930"})
 
-    async def _fetch_all(stock_list, _client, _session):
+    async def _fetch_all(stock_list, _client, _session, **_kwargs):
         raise _StopError
 
     monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
@@ -1709,3 +1709,223 @@ def test_legacy_universe_guard_symbols_are_fully_deleted() -> None:
     # Then: 가드 상수와 함수가 완전히 사라졌다
     assert not hasattr(collect, "PANEL_LEGACY_UNIVERSE_LAST_DATE")
     assert not hasattr(collect, "load_history_complete_codes")
+
+
+def test_fetch_all_stock_data_sharded_single_client_passthrough(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(
+        return_value={
+            "rt_cd": "0",
+            "output": {
+                "stck_shrn_iscd": "005930", "stck_prpr": "70000", "stck_oprc": "69000",
+                "stck_hgpr": "70500", "stck_lwpr": "68900", "acml_vol": "1000",
+                "prdy_ctrt": "1.5", "lstn_stcn": "100", "hts_avls": "1000",
+                "acml_tr_pbmn": "100000000", "rprs_mrkt_kor_name": "KOSPI",
+            },
+        }
+    )
+    client.get_investor_trend_estimate = AsyncMock(
+        return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]}
+    )
+    ladder = {f"askp{i}": str(70000 + i * 100) for i in range(1, 11)}
+    ladder.update({"bidp1": "69900", "total_askp_rsqn": "1200", "total_bidp_rsqn": "1500"})
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: None)
+
+    stock_list = [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "1.5"}]
+    results, failed_info = asyncio.run(
+        collect.fetch_all_stock_data_sharded(stock_list, [client], object())
+    )
+
+    assert len(results) == 1
+    assert failed_info == []
+    assert client.get_current_price.await_count == 1
+
+
+def test_fetch_all_stock_data_sharded_splits_across_clients_and_preserves_order(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    def make_client():
+        c = AsyncMock()
+
+        async def _price(session, code, market_div_code=None, allow_market_div_fallback=True):
+            return {
+                "rt_cd": "0",
+                "output": {
+                    "stck_shrn_iscd": code, "stck_prpr": "1000", "stck_oprc": "1000",
+                    "stck_hgpr": "1000", "stck_lwpr": "1000", "acml_vol": "1",
+                    "prdy_ctrt": "0.0", "lstn_stcn": "1", "hts_avls": "1",
+                    "acml_tr_pbmn": "1", "rprs_mrkt_kor_name": "KOSPI",
+                },
+            }
+
+        c.get_current_price = AsyncMock(side_effect=_price)
+        c.get_investor_trend_estimate = AsyncMock(
+            return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "0", "orgn_fake_ntby_qty": "0"}]}
+        )
+        ladder = {f"askp{i}": "1000" for i in range(1, 11)}
+        ladder.update({"bidp1": "999", "total_askp_rsqn": "1", "total_bidp_rsqn": "1"})
+        c.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
+        return c
+
+    client_a = make_client()
+    client_b = make_client()
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: None)
+
+    stock_list = [
+        {"code": "AAA1", "name": "a1", "price": "1000", "chgrate": "0.0"},
+        {"code": "AAA2", "name": "a2", "price": "1000", "chgrate": "0.0"},
+        {"code": "AAA3", "name": "a3", "price": "1000", "chgrate": "0.0"},
+    ]
+    results, failed_info = asyncio.run(
+        collect.fetch_all_stock_data_sharded(stock_list, [client_a, client_b], object())
+    )
+
+    assert [r["종목코드"] for r in results] == ["AAA1", "AAA2", "AAA3"]
+    assert failed_info == []
+    assert client_a.get_current_price.await_count == 2
+    assert client_b.get_current_price.await_count == 1
+
+
+def test_fetch_all_stock_data_sharded_skips_empty_chunk_when_fewer_stocks_than_clients(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    def make_client():
+        c = AsyncMock()
+
+        async def _price(session, code, market_div_code=None, allow_market_div_fallback=True):
+            return {
+                "rt_cd": "0",
+                "output": {
+                    "stck_shrn_iscd": code, "stck_prpr": "1000", "stck_oprc": "1000",
+                    "stck_hgpr": "1000", "stck_lwpr": "1000", "acml_vol": "1",
+                    "prdy_ctrt": "0.0", "lstn_stcn": "1", "hts_avls": "1",
+                    "acml_tr_pbmn": "1", "rprs_mrkt_kor_name": "KOSPI",
+                },
+            }
+
+        c.get_current_price = AsyncMock(side_effect=_price)
+        c.get_investor_trend_estimate = AsyncMock(
+            return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "0", "orgn_fake_ntby_qty": "0"}]}
+        )
+        ladder = {f"askp{i}": "1000" for i in range(1, 11)}
+        ladder.update({"bidp1": "999", "total_askp_rsqn": "1", "total_bidp_rsqn": "1"})
+        c.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
+        return c
+
+    client_a = make_client()
+    client_b = make_client()
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: None)
+
+    stock_list = [{"code": "AAA1", "name": "a1", "price": "1000", "chgrate": "0.0"}]
+    results, failed_info = asyncio.run(
+        collect.fetch_all_stock_data_sharded(stock_list, [client_a, client_b], object())
+    )
+
+    assert [r["종목코드"] for r in results] == ["AAA1"]
+    assert failed_info == []
+    assert client_a.get_current_price.await_count == 1
+    assert client_b.get_current_price.await_count == 0
+
+
+def test_fetch_all_stock_data_sharded_returns_empty_when_no_pairs() -> None:
+    import asyncio
+
+    from src.daily import collect
+
+    results, failed_info = asyncio.run(
+        collect.fetch_all_stock_data_sharded([], [object(), object()], object())
+    )
+
+    assert results == []
+    assert failed_info == []
+
+
+def test_main_issues_shard_token_and_fans_out_to_sharded_collect(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    import pandas as pd
+    import pytest
+
+    from src.daily import collect
+
+    class _Stop(Exception):  # noqa: N818 - contract skeleton name
+        pass
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 14, 15, 20, 5, tzinfo=tz)
+
+    issued = []
+
+    class _FakeKis:
+        def __init__(self, *args, **kwargs):
+            issued.append(args)
+
+        async def ensure_token(self, session):
+            return None
+
+        async def get_market_index_rate(self, session, code):
+            return {"rt_cd": "1"}
+
+    async def _trading_day(_client, _session, _date):
+        return True
+
+    def _eligible(decision_date, **_kwargs):
+        return frozenset({"005930"})
+
+    captured = {}
+
+    async def _sharded(stock_list, clients, _session, **_kwargs):
+        captured["n_clients"] = len(clients)
+        raise _Stop
+
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(
+        collect,
+        "kis_decision_shard_client_kwargs",
+        lambda: [
+            {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+            {"app_key": "k5", "app_secret": "s5", "account_id": "", "hts_id": "h5", "token_file": "t5"},
+        ],
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
+    monkeypatch.setattr(
+        collect,
+        "resolve_daily_candidates",
+        AsyncMock(return_value=[{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "3.0"}]),
+    )
+    monkeypatch.setattr(collect, "load_eligible_codes", _eligible)
+    monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _sharded)
+
+    # When
+    with pytest.raises(_Stop):
+        asyncio.run(collect.main(force=False))
+
+    # Then: 샤드 키 토큰을 발급하고 2개 클라이언트로 분할 수집한다
+    assert captured["n_clients"] == 2
+    assert len(issued) == 2
+    assert issued[1][0] == "k5"
