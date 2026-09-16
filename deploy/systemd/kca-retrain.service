@@ -8,4 +8,4 @@ WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 ExecStartPre=/usr/bin/docker pull ghcr.io/kthyeong/k-closing-alpha:latest
-ExecStart=/usr/bin/docker run --rm --memory=6g --cpus=1.8 --memory-swap=8g --env-file %h/k-closing-alpha/.env -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.ml.retrain --train-ranker-bundle
+ExecStart=/usr/bin/docker run --rm --memory=6g --cpus=1.8 --memory-swap=8g --env-file %h/quant-secrets/k-closing-alpha.env -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.ml.retrain --train-ranker-bundle
