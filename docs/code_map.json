@@ -11,6 +11,7 @@
       "tests/unit/api/kis/test_kis_host_rate_limiter.py",
       "tests/unit/api/kis/test_kis_key_pool.py",
       "tests/unit/api/kis/test_kis_token_store.py",
+      "tests/unit/tools/test_daily_audit.py",
       "tests/unit/tools/test_kis_token_warmup.py"
     ]
   },
@@ -392,6 +393,5 @@
   },
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
-  },
-  "deploy/systemd/kca-code-sync.service": {}
+  }
 }
