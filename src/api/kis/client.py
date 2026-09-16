@@ -225,14 +225,16 @@ class KisApiClient:
         if saved_data is None:
             return None
         try:
-            expired_at = datetime.strptime(saved_data["expired_at"], "%Y-%m-%d %H:%M:%S")
+            expired_at = datetime.fromisoformat(saved_data["expired_at"])
             access_token = str(saved_data["access_token"])
+            is_valid = _now_kst() < expired_at - timedelta(minutes=min_remaining_minutes)
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            # naive(구버전 %Y-%m-%d %H:%M:%S)와 aware(krx-alpha 등 외부 소비자가 쓰는
+            # 타임존 포함 ISO8601)를 비교하면 TypeError가 나므로, 구버전 캐시는
+            # 파싱은 성공해도 이 비교에서 걸려 여기로 떨어진다 -- 재발급으로 자연 전환.
             logger.warning("[SYS] stage=kis_token_cache status=UNREADABLE reason=%s", type(exc).__name__)
             return None
-        if datetime.now() < expired_at - timedelta(minutes=min_remaining_minutes):
-            return access_token
-        return None
+        return access_token if is_valid else None
 
     async def _issue_token(self, session: aiohttp.ClientSession) -> bool:
         """토큰을 발급한다. 호출자는 호스트 파일 락을 보유해야 한다."""
@@ -265,12 +267,13 @@ class KisApiClient:
 
         self.token = data["access_token"]
         expires_in = data.get("expires_in", 86400)
-        expired_at_str = (datetime.now() + timedelta(seconds=expires_in)).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        now = _now_kst()
+        # expired_at/issued_at 모두 동일한 aware KST 시각(now)에서 파생시킨다 --
+        # 서로 다른 시계(naive datetime.now() vs aware _now_kst())를 섞어 쓰면
+        # 공유 캐시(krx-alpha 등)의 aware-only 비교가 TypeError로 깨진다.
+        expired_at_str = (now + timedelta(seconds=expires_in)).isoformat(timespec="seconds")
 
         previous = self._read_cache_payload()
-        now = _now_kst()
         if previous is not None and str(previous.get("issued_at", ""))[:10] == now.date().isoformat():
             logger.error(
                 "[SYS] stage=kis_token status=REPEAT_ISSUE key_id=%s previous_issued_at=%s",
