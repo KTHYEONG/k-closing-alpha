@@ -5,5 +5,6 @@ OnFailure=kca-alert@%n.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 ExecStart=%h/.local/bin/uv run python -m src.tools.kis_token_warmup
