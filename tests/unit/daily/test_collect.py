@@ -380,7 +380,12 @@ def test_main_raises_outside_decision_window_without_force(monkeypatch) -> None:
             return datetime(2026, 9, 10, 19, 10, 0, tzinfo=tz)
 
     monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
-    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
     never_called = AsyncMock()
     monkeypatch.setattr(collect, "resolve_daily_candidates", never_called)
 
@@ -818,7 +823,12 @@ def test_main_skips_cleanly_on_non_trading_day(monkeypatch) -> None:
         return False
 
     monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
-    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
     monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
@@ -1043,7 +1053,12 @@ def test_main_filters_candidates_by_eligibility_before_quoting(monkeypatch) -> N
         raise _Stop
 
     monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
-    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
     monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
@@ -1093,7 +1108,12 @@ def test_main_fails_closed_when_eligibility_panel_is_stale(monkeypatch) -> None:
 
     fetch_all = AsyncMock()
     monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
-    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
     monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
@@ -1158,18 +1178,40 @@ def test_superseded_unresolved_instrument_helpers_are_removed() -> None:
     assert collect.QUOTE_UNRESOLVED_API == "현재가_미해석"
 
 
-def test_collect_module_constants_sourced_from_data_account_kwargs() -> None:
-    from pathlib import Path
+def test_collect_module_has_no_import_time_kis_credential_globals() -> None:
+    """collect.py는 safe_float 등 순수 헬퍼 재사용을 위해 finalize_close/paper_trade에서도
+    임포트되므로, KIS 자격증명 해석은 main() 호출 시점까지 지연되어야 한다(임포트만으로
+    호스트 KIS 슬롯 설정을 요구하면 안 된다)."""
+    from src.daily import collect
+
+    for stale_global in ("APP_KEY", "APP_SECRET", "ACCOUNT_ID", "HTS_ID", "TOKEN_FILE", "_KIS_DATA_KWARGS"):
+        assert not hasattr(collect, stale_global), stale_global
+
+
+def test_collect_main_resolves_kis_credentials_lazily_at_call_time(monkeypatch) -> None:
+    import asyncio
+
+    import pytest
 
     from src.daily import collect
 
-    kwargs = collect.kis_data_client_kwargs()
+    calls: list[str] = []
 
-    assert kwargs["app_key"] == collect.APP_KEY
-    assert kwargs["app_secret"] == collect.APP_SECRET
-    assert kwargs["account_id"] == collect.ACCOUNT_ID
-    assert kwargs["hts_id"] == collect.HTS_ID
-    assert Path(kwargs["token_file"]).name == Path(collect.TOKEN_FILE).name
+    def _fake_kwargs():
+        calls.append("resolved")
+        return {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"}
+
+    def _stop(*_a, **_k):
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(collect, "kis_data_client_kwargs", _fake_kwargs)
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda hts_id: calls.append(f"validated:{hts_id}"))
+    monkeypatch.setattr(collect, "_validate_decision_window", _stop)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        asyncio.run(collect.main(force=False))
+
+    assert calls == ["resolved", "validated:h"]
 
 
 def test_resolve_prev_trading_day_kis_skips_weekend_and_kis_holiday(monkeypatch) -> None:
@@ -1346,7 +1388,12 @@ def test_main_resolves_previous_trading_day_through_kis_before_eligibility(monke
         raise _StopError
 
     monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
-    monkeypatch.setattr(collect, "_validate_hts_id", lambda: None)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
     monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)

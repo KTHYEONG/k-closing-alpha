@@ -18,9 +18,20 @@ def _isolate_kis_token_state(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: 
     from src import settings as live_settings
 
     monkeypatch.setattr(live_settings, "KIS_TOKEN_CACHE_DIR", tmp_path_factory.mktemp("kis_cache"))
-    monkeypatch.delenv("KIS_DATA_SLOTS", raising=False)
-    monkeypatch.delenv("KIS_HOST_DATA_SLOTS", raising=False)
+    # resolve_host_data_credentials는 풀 미선언시 fail-closed(ValueError)이므로, 그냥
+    # 지우기만 하면 kis_data_client_kwargs()의 기본(무인자) 호출부를 쓰는 테스트가
+    # 전부 이 예외로 깨진다. 실제 호스트 시크릿이 새어들지 않도록 결정론적 더미
+    # 풀 1개로 고정해, 격리 의도(진짜 자격증명 미사용)는 유지하면서 기본 호출부가
+    # 항상 해석 가능하게 한다.
+    monkeypatch.setenv("KIS_DATA_SLOTS", "1")
+    monkeypatch.setenv("KIS_HOST_DATA_SLOTS", "1")
+    monkeypatch.setenv("KIS_DATA_1_APP_KEY", "test-data-key")
+    monkeypatch.setenv("KIS_DATA_1_APP_SECRET", "test-data-secret")
+    monkeypatch.delenv("KIS_DATA_1_HTS_ID", raising=False)
     monkeypatch.delenv("KIS_DATA_ROLE", raising=False)
+    monkeypatch.delenv("KIS_APP_KEY", raising=False)
+    monkeypatch.delenv("KIS_APP_SECRET", raising=False)
+    monkeypatch.delenv("KIS_HTS_ID", raising=False)
 
 
 @pytest.fixture
