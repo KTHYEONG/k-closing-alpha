@@ -9,4 +9,4 @@ EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 Environment=KIS_DATA_ROLE=decision
 TimeoutStartSec=15min
-ExecStart=%h/.local/bin/uv run python -m src.daily.paper_trade --phase exit
+ExecStart=/usr/bin/docker run --rm --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=decision ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.paper_trade --phase exit

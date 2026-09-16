@@ -17,7 +17,17 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    containerized = {"kca-retrain.service"}
+    containerized = {
+        "kca-retrain.service",
+        "kca-archive-intraday.service",
+        "kca-collect.service",
+        "kca-finalize-close.service",
+        "kca-kis-token-warmup.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-predict.service",
+        "kca-price-ingest.service",
+    }
 
     for svc in sorted(root.glob("kca-*.service")):
         text = svc.read_text(encoding="utf-8")
@@ -157,19 +167,26 @@ def test_retrain_service_runs_containerized_with_measured_resource_limits() -> N
     assert "src.ml.retrain --train-ranker-bundle" in text
 
 
-def test_code_sync_timer_exists_and_install_script_enables_it() -> None:
+def test_containerized_units_use_shared_image_and_new_env_file() -> None:
     import pathlib
 
-    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
-    timer = (base / "systemd" / "kca-code-sync.timer").read_text(encoding="utf-8")
-    service = (base / "systemd" / "kca-code-sync.service").read_text(encoding="utf-8")
-    install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
-
-    assert "Unit=kca-code-sync.service" in timer
-    assert "OnCalendar=Mon..Fri" in timer
-    assert "src.tools.code_sync" in service
-    assert "OnFailure=kca-alert@%n.service" in service
-    assert "kca-code-sync.timer" in install_text
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    containerized = (
+        "kca-archive-intraday.service",
+        "kca-collect.service",
+        "kca-finalize-close.service",
+        "kca-kis-token-warmup.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-predict.service",
+        "kca-price-ingest.service",
+    )
+    for name in containerized:
+        text = (root / name).read_text(encoding="utf-8")
+        assert "docker run --rm" in text, name
+        assert "ghcr.io/kthyeong/k-closing-alpha:latest" in text, name
+        assert "--env-file %h/quant-secrets/k-closing-alpha.env" in text, name
+        assert "%h/k-closing-alpha/.env" not in text, name
 
 
 def test_backup_service_copies_data_and_artifacts_to_gdrive_without_deleting() -> None:
@@ -229,22 +246,172 @@ def test_decision_path_timers_fire_with_one_second_accuracy() -> None:
         assert "AccuracySec=1s" in (root / name).read_text(encoding="utf-8"), name
 
 
-def test_code_sync_runs_before_morning_ingest_and_paper_exit() -> None:
+def test_decision_role_units_forward_env_into_container() -> None:
     import pathlib
-    import re
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    def _first_time(name: str) -> str:
+    decision = (
+        "kca-collect.service",
+        "kca-finalize-close.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+    )
+    for name in decision:
         text = (root / name).read_text(encoding="utf-8")
-        match = re.search(r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})", text)
-        assert match is not None, name
-        return match.group(1)
+        assert "Environment=KIS_DATA_ROLE=decision" in text, name
+        exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
+        assert "-e KIS_DATA_ROLE=decision" in exec_line, name
 
-    ingest_text = (root / "kca-price-ingest.timer").read_text(encoding="utf-8")
-    ingest_times = sorted(re.findall(r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})", ingest_text))
+    predict_text = (root / "kca-predict.service").read_text(encoding="utf-8")
+    assert "-e KIS_DATA_ROLE=decision" not in predict_text
 
-    assert _first_time("kca-code-sync.timer") < ingest_times[0]
-    assert _first_time("kca-code-sync.timer") < _first_time("kca-paper-exit.timer")
+
+def test_kis_cache_mounted_only_for_units_using_kis_client() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    needs_kis_cache = (
+        "kca-archive-intraday.service",
+        "kca-collect.service",
+        "kca-finalize-close.service",
+        "kca-kis-token-warmup.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-price-ingest.service",
+    )
+    mount = "-v %h/.cache/kis:/root/.cache/kis"
+    for name in needs_kis_cache:
+        assert mount in (root / name).read_text(encoding="utf-8"), name
+
+    assert mount not in (root / "kca-predict.service").read_text(encoding="utf-8")
+
+
+def test_containerized_units_preserve_data_and_artifacts_mounts() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    containerized = (
+        "kca-archive-intraday.service",
+        "kca-collect.service",
+        "kca-finalize-close.service",
+        "kca-kis-token-warmup.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-predict.service",
+        "kca-price-ingest.service",
+    )
+    for name in containerized:
+        text = (root / name).read_text(encoding="utf-8")
+        assert "-v %h/k-closing-alpha/data:/app/data" in text, name
+        assert "-v %h/k-closing-alpha/artifacts:/app/artifacts" in text, name
+
+
+def test_containerized_units_have_no_docker_pull_before_run() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    containerized = (
+        "kca-archive-intraday.service",
+        "kca-collect.service",
+        "kca-finalize-close.service",
+        "kca-kis-token-warmup.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-predict.service",
+        "kca-price-ingest.service",
+    )
+    for name in containerized:
+        assert "docker pull" not in (root / name).read_text(encoding="utf-8"), name
+
+    assert "docker pull" in (root / "kca-retrain.service").read_text(encoding="utf-8")
+
+
+def test_containerized_units_have_no_unmeasured_resource_caps() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    containerized = (
+        "kca-archive-intraday.service",
+        "kca-collect.service",
+        "kca-finalize-close.service",
+        "kca-kis-token-warmup.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-predict.service",
+        "kca-price-ingest.service",
+    )
+    for name in containerized:
+        text = (root / name).read_text(encoding="utf-8")
+        assert "--memory=" not in text, name
+        assert "--cpus=" not in text, name
+
+    retrain_text = (root / "kca-retrain.service").read_text(encoding="utf-8")
+    assert "--memory=6g" in retrain_text
+    assert "--cpus=1.8" in retrain_text
+
+
+def test_host_bound_units_remain_bare_metal() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    host_bound = (
+        "kca-backup.service",
+        "kca-backup-prune.service",
+        "kca-daily-audit.service",
+        "kca-alert@.service",
+    )
+    for name in host_bound:
+        text = (root / name).read_text(encoding="utf-8")
+        assert "docker run" not in text, name
+        assert "%h/.local/bin/" in text, name
+
+
+def test_retrain_service_uses_shared_runtime_env_file_not_legacy_dotenv() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-retrain.service").read_text(encoding="utf-8")
+
+    assert "--env-file %h/quant-secrets/k-closing-alpha.env" in text
+    assert "%h/k-closing-alpha/.env" not in text
+
+
+def test_code_sync_unit_and_timer_retired() -> None:
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+
+    assert not (base / "systemd" / "kca-code-sync.service").exists()
+    assert not (base / "systemd" / "kca-code-sync.timer").exists()
+    assert "kca-code-sync" not in (base / "install_systemd.sh").read_text(encoding="utf-8")
+
+
+def test_after_ordering_preserved_across_containerization() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+
+    finalize_lines = (root / "kca-finalize-close.service").read_text(encoding="utf-8").splitlines()
+    after_line = next(line for line in finalize_lines if line.startswith("After="))
+    assert "kca-collect.service" in after_line
+    assert "kca-predict.service" in after_line
+    assert "ExecStopPost=/usr/bin/systemctl --user start --no-block kca-paper-entry.service" in finalize_lines
+
+    audit_after = next(
+        line for line in (root / "kca-daily-audit.service").read_text(encoding="utf-8").splitlines()
+        if line.startswith("After=")
+    )
+    assert "kca-archive-intraday.service" in audit_after
+
+    backup_after = next(
+        line for line in (root / "kca-backup.service").read_text(encoding="utf-8").splitlines()
+        if line.startswith("After=")
+    )
+    assert "kca-archive-intraday.service" in backup_after
+    assert "kca-daily-audit.service" in backup_after
+    assert "kca-price-ingest.service" in backup_after
+
+    assert "After=kca-backup.service" in (root / "kca-backup-prune.service").read_text(encoding="utf-8")
 
 
 def test_backup_runs_after_evening_price_ingest() -> None:
@@ -366,7 +533,9 @@ def test_kis_token_warmup_timer_precedes_first_kis_job() -> None:
     assert "OnCalendar=Mon..Fri 07:05:00 Asia/Seoul" in timer
     assert "Unit=kca-kis-token-warmup.service" in timer
     assert "Persistent=true" in timer
-    assert "ExecStart=%h/.local/bin/uv run python -m src.tools.kis_token_warmup" in service
+    assert "docker run --rm" in service
+    assert "src.tools.kis_token_warmup" in service
+    assert "-v %h/.cache/kis:/root/.cache/kis" in service
     assert "OnFailure=kca-alert@%n.service" in service
     assert "Type=oneshot" in service
 
