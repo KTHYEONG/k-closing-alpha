@@ -12,9 +12,6 @@ def test_build_runtime_fragment_emits_declared_keys_in_canonical_order(tmp_path)
         'export KIS_APP_SECRET="kis-secret"',
         "export KIS_ACCOUNT_ID=12345678",
         "export KIS_HTS_ID=hts-id",
-        "export KIS_DATA_APP_KEY=data-key",
-        "export KIS_DATA_APP_SECRET=data-secret",
-        "export KIS_DATA_HTS_ID=data-hts",
         "export KIWOM_APP_KEY=kiwoom-key",
         "export KIWOM_SECRET_KEY=kiwoom-secret",
         "export LS_APP_KEY=ls-key",
@@ -30,7 +27,7 @@ def test_build_runtime_fragment_emits_declared_keys_in_canonical_order(tmp_path)
 
     lines = fragment.splitlines()
     assert [line.partition("=")[0] for line in lines] == [key.target for key in RUNTIME_ENV_SPEC]
-    assert len(lines) == 18
+    assert len(lines) == 15
     assert fragment.endswith("\n")
     assert "export " not in fragment
     assert "KIS_APP_SECRET=kis-secret" in lines
@@ -41,14 +38,27 @@ def test_build_runtime_fragment_emits_declared_keys_in_canonical_order(tmp_path)
     assert "KIS_ACCOUNT_ID=12345678" in lines
 
 
+def test_runtime_env_spec_excludes_legacy_data_single_key_fields() -> None:
+    from src.tools.provision_env import RUNTIME_ENV_SPEC
+
+    targets = [key.target for key in RUNTIME_ENV_SPEC]
+    sources = [source for key in RUNTIME_ENV_SPEC for source in key.sources]
+
+    assert len(targets) == 15
+    assert len(set(targets)) == 15
+    for forbidden in ("KIS_DATA_APP_KEY", "KIS_DATA_APP_SECRET", "KIS_DATA_HTS_ID"):
+        assert forbidden not in targets
+        assert forbidden not in sources
+
+
 def test_runtime_env_spec_excludes_shared_keypool_keys() -> None:
     from src.tools.provision_env import RUNTIME_ENV_SPEC
 
     targets = [key.target for key in RUNTIME_ENV_SPEC]
     sources = [source for key in RUNTIME_ENV_SPEC for source in key.sources]
 
-    assert len(targets) == 18
-    assert len(set(targets)) == 18
+    assert len(targets) == 15
+    assert len(set(targets)) == 15
     for forbidden in ("KIS_DATA_SLOTS", "KIS_HOST_DATA_SLOTS"):
         assert forbidden not in targets
         assert forbidden not in sources

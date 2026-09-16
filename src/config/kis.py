@@ -26,9 +26,6 @@ class KisSettings(BaseSettings):
     KIS_APP_SECRET: str = Field(default="")
     KIS_ACCOUNT_ID: str = Field(default="")
     KIS_HTS_ID: str = Field(default="")
-    KIS_DATA_APP_KEY: str = Field(default="")
-    KIS_DATA_APP_SECRET: str = Field(default="")
-    KIS_DATA_HTS_ID: str = Field(default="")
     KIS_DATA_ROLE: str = Field(default="batch")
     KIS_TOKEN_CACHE_DIR: Path = Field(default_factory=lambda: Path.home() / ".cache" / "kis")
     KIS_BASE_URL: str = "https://openapi.koreainvestment.com:9443"
@@ -42,15 +39,4 @@ class KisSettings(BaseSettings):
             "app_secret": self.KIS_APP_SECRET,
             "account_id": self.KIS_ACCOUNT_ID,
             "hts_id": self.KIS_HTS_ID,
-        }
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def KIS_DATA_API_CONFIG(self) -> dict[str, str]:
-        """데이터 수집 전용 보조 KIS 계좌 접속 정보 딕셔너리 (체결 계좌와 분리)."""
-        return {
-            "app_key": self.KIS_DATA_APP_KEY,
-            "app_secret": self.KIS_DATA_APP_SECRET,
-            "account_id": "",
-            "hts_id": self.KIS_DATA_HTS_ID,
         }
