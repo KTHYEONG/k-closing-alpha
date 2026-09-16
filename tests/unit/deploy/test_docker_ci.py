@@ -47,3 +47,33 @@ def test_image_bakes_code_commit_from_ci_build_arg() -> None:
     # 의존성 레이어 캐시를 깨지 않도록 마지막 uv sync 뒤에 선언
     assert dockerfile.rindex("uv sync --frozen --no-dev") < dockerfile.index("ARG KCA_CODE_COMMIT")
     assert "KCA_CODE_COMMIT=${{ github.sha }}" in workflow
+
+
+def test_dockerfile_keeps_uv_cache_out_of_image() -> None:
+    from pathlib import Path
+
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+
+    assert dockerfile.splitlines()[0].startswith("# syntax=docker/dockerfile:1")
+    assert "UV_CACHE_DIR=/root/.cache/uv" in dockerfile
+    assert dockerfile.count("--mount=type=cache,target=/root/.cache/uv,sharing=locked") == 2
+    assert "UV_NO_SYNC=1" in dockerfile
+    assert "libgomp1" in dockerfile
+    assert "ripgrep" in dockerfile
+
+
+def test_deploy_workflow_builds_native_arm64_and_tags_commit_sha() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    assert "runs-on: ubuntu-24.04-arm" in workflow
+    assert "platforms: linux/arm64" in workflow
+    assert "linux/amd64" not in workflow
+    assert "setup-qemu-action" not in workflow
+    assert "sha-${{ github.sha }}" in workflow
+    assert "${{ env.IMAGE }}:latest" in workflow
+    assert "needs: test" in workflow
+    assert "needs: build-and-push" in workflow
+    assert "uv run pytest -q" in workflow
+    assert "KCA_CODE_COMMIT=${{ github.sha }}" in workflow

@@ -6,6 +6,7 @@ After=kca-archive-intraday.service kca-daily-audit.service kca-price-ingest.serv
 [Service]
 Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 ExecStart=/bin/sh -c '%h/.local/bin/rclone copy %h/k-closing-alpha/data gdrive:quant-lake/live/k-closing-alpha/data --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/data/$(date +%%F)'
 ExecStart=/bin/sh -c '%h/.local/bin/rclone copy %h/k-closing-alpha/artifacts gdrive:quant-lake/live/k-closing-alpha/artifacts --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/artifacts/$(date +%%F)'

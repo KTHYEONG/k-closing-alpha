@@ -5,6 +5,7 @@ OnFailure=kca-alert@%n.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 Environment=KIS_DATA_ROLE=decision
 TimeoutStartSec=15min
