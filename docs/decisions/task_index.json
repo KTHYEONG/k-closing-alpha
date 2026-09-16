@@ -1,6 +1,16 @@
 {
   "tasks": [
     {
+      "task_id": "kca_timer_containerization",
+      "date": "2026-09-16",
+      "adr_id": "ADR_20260916_kca_timer_containerization",
+      "domain": "infrastructure",
+      "title": "kca 타이머 8개 컨테이너화 + retrain env-file 수정 + code-sync 폐지",
+      "why": "VPS Codeless 완성 위해 host git 의존 python 잡 제거, retrain의 레거시 dotenv 참조 방치시 R16 삭제와 충돌",
+      "resolution": "KIS클라이언트 사용 잡만 ~/.cache/kis 마운트, 4개 결정롤 잡은 -e로 forward, rclone/systemctl 의존 4개는 제외, code-sync 폐지",
+      "impact": "호스트 python 실행 경로 8개 제거, retrain silent breakage 사전차단, 결정창 하드데드라인에 불필요한 pull/cap 미도입"
+    },
+    {
       "task_id": "vps_cicd_local_first_restructuring",
       "date": "2026-09-16",
       "adr_id": "ADR_20260916_vps_cicd_local_first_restructuring",
@@ -989,16 +999,6 @@
       "why": "1회성 분봉 백필을 실계좌로 처음 실행한 결과 정규세션까지 0행 -- get_historical_minute_chart 요청에 FID_FAKE_TICK_INCU_YN 필드 키 자체가 빠져 KIS가 전체 요청을 OPSQ2001로 거부하고 있었음. 또한 백필 대상이 condition_history 아카이브(조건검색 후보)로만 한정돼 있었는데, 실제 체결된 매매일지(trade_log.parquet, 2016~)가 라벨/수익률이 확정된 더 가치있는 대상임에도 누락돼 있었음.",
       "resolution": "client.py::get_historical_minute_chart params에 FID_FAKE_TICK_INCU_YN='' 필드 추가(누락 시 OPSQ2001로 전체 실패하던 회귀 수정, 실계좌로 재검증: 정규 381행/NXT애프터 260행 정상 확인 -- NXT 애프터마켓도 이 TR로 보관됨을 실측 확정). backfill_minute_history.py::_load_condition_history_sources에 trade_log.parquet(매수날짜->스냅샷_날짜 매핑)를 세 번째 소스로 추가. run_minute_history_backfill에 _already_collected_codes 기반 스킵 로직 추가(재실행 시 이미 저장된 종목 재조회 안 함, WSL/네트워크 끊김에도 멱등 재개 가능). src.api.kis.client 직접 참조하는 테스트 파일 신설(기존 테스트가 전부 호환 파사드 경유라 co-modification 게이트 갭 발견/해소). 실제 백필 1회 실행 완료: 2025-09-04~2026-09-03 242일, 정규 519,250행 + NXT애프터 182,596행, 81MB.",
       "impact": "condition_history+레거시+매매일지 세 소스 합집합으로 KIS 1년 보관한도 전체를 소급 확보. 스킵 최적화로 향후 재실행은 순증분만 처리해 거의 즉시 완료. lean_check 전체 PASS."
-    },
-    {
-      "task_id": "TASK_MINUTE_HISTORY_BACKFILL",
-      "date": "2026-09-04",
-      "adr_id": "ADR_20260904_MINUTE_HISTORY_BACKFILL",
-      "domain": "data",
-      "title": "FHKST03010230 기반 1회성 과거 분봉 백필 (KIS 서버 보관 최대 1년)",
-      "why": "KIS가 FHKST03010200(당일분봉)만이 아니라 FHKST03010230(주식일별분봉조회)으로 최대 약 1년치 과거 분봉을 서버에 보관·제공한다는 사실을 사용자 피드백으로 확인. condition_history 아카이브에 이미 존재하는 과거 워치리스트 날짜들이 KIS의 롤링 1년 보관기간에서 매일 가장 오래된 날짜부터 소실 중이라 시급성이 있었음.",
-      "resolution": "get_historical_minute_chart(FHKST03010230, target_date=YYYYMMDD, floor/end hour 페이지네이션)를 client.py에 추가. backfill_regular_bars/backfill_nxt_aftermarket_bars(collector.py)가 기존 _collect_bars에 historical 분기를 더해 재사용. enumerate_backfill_targets가 archive 아카이브에서 (날짜,종목코드) distinct 쌍을 오래된 날짜부터 정렬 추출. run_minute_history_backfill이 날짜별로 순회하며 _merge_and_write_partition으로 기존 파티션 파일을 덮어쓰지 않고 멱등 병합 -- 중단 후 재실행 안전. NXT 애프터마켓 보관 여부는 실측 미검증으로 명시하고 실패 시 정규세션 백필과 독립적으로 정상 스킵.",
-      "impact": "정방향 수집(archive_intraday.py)과 완전히 같은 파티션 스토어를 공유해 ML 코드는 백필/신규 데이터를 구분할 필요 없음. 1회성 장시간 스크립트로 README에 별도 커맨드 문서화. lean_check --spec 및 /check 감사 PASS(co-modification 게이트 실패는 테스트 파일명을 test_archive_intraday.py로 정정해 해결)."
     }
   ]
 }
