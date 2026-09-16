@@ -1,6 +1,11 @@
 def test_alert_settings_default_empty_and_env_override(monkeypatch) -> None:
     from src.config.alerts import AlertSettings
 
+    # Given: 실제 운영 호스트(예: code-sync 유닛의 EnvironmentFile)에 이미 설정된
+    # 알림 채널 값이 이 프로세스에 새어들지 않도록 격리한다.
+    for var in ("ALERT_WEBHOOK_URL", "ALERT_GMAIL_USER", "ALERT_GMAIL_APP_PASSWORD", "ALERT_GMAIL_TO"):
+        monkeypatch.delenv(var, raising=False)
+
     # Given / When: 환경변수 미설정
     default = AlertSettings(_env_file=None)
 
