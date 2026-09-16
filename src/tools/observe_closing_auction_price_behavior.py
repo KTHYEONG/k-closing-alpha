@@ -65,13 +65,6 @@ POLL_INTERVAL_SEC = 5.0
 
 OUT_PATH = settings.DATA_DIR / "diagnostics" / "closing_auction_observation.jsonl"
 
-_KIS_DATA_KWARGS = kis_data_client_kwargs()
-APP_KEY = _KIS_DATA_KWARGS["app_key"]
-APP_SECRET = _KIS_DATA_KWARGS["app_secret"]
-ACCOUNT_ID = _KIS_DATA_KWARGS["account_id"]
-HTS_ID = _KIS_DATA_KWARGS["hts_id"]
-TOKEN_FILE = _KIS_DATA_KWARGS["token_file"]
-
 
 def _now_kst() -> datetime:
     return datetime.now(KST)
@@ -137,9 +130,10 @@ async def main() -> None:  # pragma: no cover - live market-hours orchestration 
             )
             return
 
+    data_kwargs = kis_data_client_kwargs()
     timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        client = KisApiClient(APP_KEY, APP_SECRET, ACCOUNT_ID, HTS_ID, token_file=TOKEN_FILE)  # type: ignore[no-untyped-call]
+        client = KisApiClient(**data_kwargs)  # type: ignore[no-untyped-call]
         await client.ensure_token(session)
 
         n_polls = 0
