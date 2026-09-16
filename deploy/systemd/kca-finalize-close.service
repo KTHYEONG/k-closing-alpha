@@ -9,5 +9,5 @@ WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 Environment=KIS_DATA_ROLE=decision
-ExecStart=/usr/bin/docker run --rm --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=decision ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.finalize_close
+ExecStart=/usr/bin/docker run --rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=decision ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.finalize_close
 ExecStopPost=/usr/bin/systemctl --user start --no-block kca-paper-entry.service

@@ -242,7 +242,7 @@ def test_list_failed_kca_units_parses_plain_output_and_surfaces_unavailable() ->
     assert daily_audit.list_failed_kca_units(_missing) == ["<systemctl unavailable: FileNotFoundError>"]
 
 
-def test_list_stale_kis_data_tokens_reports_missing_and_stale_slots(tmp_path) -> None:
+def test_list_stale_kis_tokens_reports_missing_pool_slots_and_declared_keys(tmp_path) -> None:
     import json
 
     from src.api.kis.key_pool import token_cache_path
@@ -257,9 +257,12 @@ def test_list_stale_kis_data_tokens_reports_missing_and_stale_slots(tmp_path) ->
         "KIS_DATA_2_APP_SECRET": "sec2",
         "KIS_DATA_3_APP_KEY": "key3",
         "KIS_DATA_3_APP_SECRET": "sec3",
+        "KIS_APP_KEY": "primary",
+        "KIS_APP_SECRET": "psec",
+        "KIS_HTS_ID": "phts",
     }
 
-    # Given: 슬롯1은 오늘자 토큰, 슬롯2는 어제자(구식), 슬롯3은 파일 자체 없음
+    # Given: 슬롯1은 오늘자 토큰, 슬롯2는 어제자(구식), 슬롯3과 선언키는 파일 자체 없음
     token_cache_path("key1", tmp_path).write_text(
         json.dumps({"issued_at": "2026-09-16T07:05:01+09:00"}), encoding="utf-8"
     )
@@ -268,20 +271,20 @@ def test_list_stale_kis_data_tokens_reports_missing_and_stale_slots(tmp_path) ->
     )
 
     # When
-    stale = daily_audit.list_stale_kis_data_tokens("2026-09-16", env=env, cache_dir=tmp_path)
+    stale = daily_audit.list_stale_kis_tokens("2026-09-16", env=env, cache_dir=tmp_path)
 
-    # Then
-    assert stale == ["DATA_2", "DATA_3"]
+    # Then: 풀 슬롯뿐 아니라 선언된 비풀 키(PRIMARY) 누락도 드러난다
+    assert stale == ["DATA_2", "DATA_3", "PRIMARY"]
 
-    # And: 호스트 슬롯 설정 자체가 어긋나면 숨기지 않고 표식을 반환한다
+    # And: 키 선언 자체가 어긋나면 숨기지 않고 표식을 반환한다
     broken_env = {
         "KIS_DATA_SLOTS": "1,2",
         "KIS_HOST_DATA_SLOTS": "1,2",
         "KIS_DATA_1_APP_KEY": "key1",
         "KIS_DATA_1_APP_SECRET": "sec1",
     }
-    result = daily_audit.list_stale_kis_data_tokens("2026-09-16", env=broken_env, cache_dir=tmp_path)
-    assert len(result) == 1 and result[0].startswith("<kis host slot config invalid")
+    result = daily_audit.list_stale_kis_tokens("2026-09-16", env=broken_env, cache_dir=tmp_path)
+    assert len(result) == 1 and result[0].startswith("<kis host key config invalid")
 
 
 def test_build_digest_ok_warning_and_holiday_subjects() -> None:

@@ -277,13 +277,59 @@ def test_kis_cache_mounted_only_for_units_using_kis_client() -> None:
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
         "kca-paper-exit.service",
+        "kca-predict.service",
         "kca-price-ingest.service",
     )
     mount = "-v %h/.cache/kis:/root/.cache/kis"
     for name in needs_kis_cache:
         assert mount in (root / name).read_text(encoding="utf-8"), name
 
-    assert mount not in (root / "kca-predict.service").read_text(encoding="utf-8")
+    assert mount not in (root / "kca-retrain.service").read_text(encoding="utf-8")
+
+
+def test_kis_using_containerized_units_forward_key_pool_env_and_cache() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    shared_env = "--env-file %h/quant-secrets/k-closing-alpha.env"
+    pool_env = "--env-file %h/quant-secrets/kis-data.env"
+    mount = "-v %h/.cache/kis:/root/.cache/kis"
+    kis_units = (
+        "kca-archive-intraday.service",
+        "kca-collect.service",
+        "kca-finalize-close.service",
+        "kca-kis-token-warmup.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-predict.service",
+        "kca-price-ingest.service",
+    )
+
+    for name in kis_units:
+        text = (root / name).read_text(encoding="utf-8")
+        exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
+        # 드롭인 EnvironmentFile은 docker 클라이언트에만 적용되므로 컨테이너엔 --env-file로 명시해야 한다
+        assert pool_env in exec_line, name
+        assert exec_line.index(shared_env) < exec_line.index(pool_env), name
+        # 풀 키를 받고도 캐시를 못 보면 매 실행 재발급이 되어 1일1토큰 불변식이 깨진다
+        assert mount in exec_line, name
+
+    retrain_text = (root / "kca-retrain.service").read_text(encoding="utf-8")
+    assert pool_env not in retrain_text
+    assert mount not in retrain_text
+
+
+def test_daily_audit_unit_loads_key_pool_env_for_token_coverage() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-daily-audit.service").read_text(encoding="utf-8")
+
+    # 풀 env가 없으면 list_stale_kis_tokens가 키를 하나도 해석하지 못해
+    # 토큰 커버리지 감사가 조용히 무의미해진다
+    assert "EnvironmentFile=%h/quant-secrets/k-closing-alpha.env" in text
+    assert "EnvironmentFile=%h/quant-secrets/kis-data.env" in text
+    assert "src.tools.daily_audit" in text
 
 
 def test_containerized_units_preserve_data_and_artifacts_mounts() -> None:
