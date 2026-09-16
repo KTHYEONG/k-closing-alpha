@@ -48,10 +48,12 @@ Focus on: *What is the fundamental causality behind this state? What competing a
 
 ## Chat Output Format
 
-Keep chat response clear, intuitive for humans, and evidence-focused. Avoid cryptic jargon dumps or robotic abbreviation walls.
+Keep chat response clear, intuitive for humans, and token-efficient. Strictly avoid dense jargon walls or redundant data dumps.
 
 **Output Directives:**
-- **Human-Friendly & Intuitive Context**: Explain the problem, root cause, and solution in clear, natural Korean. Use intuitive, plain analogies where helpful so the user immediately grasps the situation without needing to ask for easier clarification.
+- **Human-Friendly & Intuitive Context**: Explain the problem, root cause, and solution in clear, natural Korean. Use plain analogies or everyday phrasing so any stakeholder can grasp the situation in seconds without needing clarification.
+- **Token Efficiency & Anti-Redundancy**: Do NOT repeat the same numbers or conclusions across both narrative text and markdown tables. Avoid decorative/redundant tables unless presenting raw multidimensional data.
+- **High-Scannability Structure**: Keep each bullet to 1-2 focused lines. Separate bold core takeaway from supporting details.
 - **Zero Typing Next Step**: Point directly to `/spec` without requiring the user to type `--feature` or other CLI arguments.
 - **Language Requirement**: All output rendered to the user MUST be written in Korean (한국어).
 
@@ -60,13 +62,13 @@ Keep chat response clear, intuitive for humans, and evidence-focused. Avoid cryp
 ### 🔬 [PROBE] <기능/토픽 제목>
 
 #### 💡 한눈에 이해하는 문제와 해법
-- 🔍 **상황 및 배경**: <전문 용어 난사 대신, 직관적인 비유나 일상 언어로 어떤 결함/증상인지 1-2줄>
-- ⚙️ **근본 원인 (Root Cause)**: <데이터/상태 전이 상의 근본 원인 1-2줄>
-- 🛠️ **해결 방식**: <경쟁 대안 중 왜 이 방식을 채택했는지 1-2줄>
-- 🎯 **기대 효과**: <이 변경이 시스템과 사용자에게 주는 실질적 영향 1줄>
+- 🔍 **상황**: <전문 용어 난사 대신, 직관적인 비유나 일상 언어로 어떤 결함/증상인지 1-2줄 요약>
+- ⚙️ **근본 원인**: <숨겨진 제약이나 데이터 흐름상의 진짜 원인 1-2줄>
+- 🛠️ **해결 방식**: <왜 다른 대안 대신 이 방식을 택했는지 핵심 근거 1-2줄>
+- 🎯 **기대 효과**: <시스템과 사용자에게 주는 실질적 개선 수치/효과 1줄>
 
-#### 🛡️ 주의할 점 및 경계 맥락 (Caveats)
-- ⚠️ <다음 작업자가 오해하거나 놓치기 쉬운 전제조건 또는 경계 규칙 1줄>
+#### 🛡️ 주의할 점 (Caveats)
+- ⚠️ <다음 작업자가 오해하거나 놓치기 쉬운 전제조건 또는 경계 규칙 1-2줄>
 
 ---
 👉 다음 단계: `/spec`
