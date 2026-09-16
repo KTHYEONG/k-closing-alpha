@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import shlex
 import subprocess
 from collections.abc import Sequence
@@ -15,6 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# ~/.quant.env 는 소싱되는 bash 스크립트라 "KIS_APP_KEY=$KIS_TRADE_APP_KEY" 같은
+# 셸 변수 참조가 정상 문법이다(실측: 2026-09-16 프로덕션 장애 — krx-alpha 에서 이
+# 리터럴 텍스트를 그대로 배포해 자격증명이 빈 문자열로 주입됨. 동일 SSOT 라인을
+# 참조하는 본 저장소도 같은 결함을 갖고 있었다). 값 전체가 단일 참조일 때만 같은
+# 파일 내 다른 할당을 조회해 해석한다.
+_VAR_REF_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
 
 
 class ProvisioningError(RuntimeError):
@@ -67,12 +75,20 @@ chown ubuntu:ubuntu "{REMOTE_RUNTIME_ENV_PATH}"
 
 
 def parse_workstation_assignments(source_path: Path, accepted_keys: frozenset[str]) -> dict[str, str]:
-    """Parse shell-style KEY=VALUE assignments, collecting only accepted keys."""
+    """Parse shell-style KEY=VALUE assignments, collecting only accepted keys.
+
+    A value that is exactly a bare ``$VAR``/``${VAR}`` reference is resolved
+    against other assignments in the same file (mirroring bash ``source``
+    semantics); an unresolvable reference resolves to empty and is therefore
+    treated as absent, so callers fail closed on the true value being missing
+    rather than silently shipping the literal reference text.
+    """
     try:
         text = source_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ProvisioningError(f"cannot read source: {source_path}") from exc
-    parsed: dict[str, str] = {}
+    raw: dict[str, str] = {}
+    accepted_seen: set[str] = set()
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -81,16 +97,32 @@ def parse_workstation_assignments(source_path: Path, accepted_keys: frozenset[st
             stripped = stripped[len("export ") :]
         key, _, raw_value = stripped.partition("=")
         key = key.strip()
+        if not key:
+            continue
         value = raw_value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
             value = value[1:-1]
-        if key not in accepted_keys:
-            continue
-        if not value:
-            continue
-        if key in parsed:
-            raise ProvisioningError(f"duplicate assignment: {key}")
-        parsed[key] = value
+        if key in accepted_keys:
+            if key in accepted_seen:
+                raise ProvisioningError(f"duplicate assignment: {key}")
+            accepted_seen.add(key)
+        raw[key] = value  # 비허용 키의 재할당은 정상 bash 문법이라 마지막 값이 우선한다
+
+    def _resolve(key: str, chain: frozenset[str]) -> str:
+        value = raw.get(key, "")
+        match = _VAR_REF_RE.match(value)
+        if not match:
+            return value
+        ref = match.group(1)
+        if ref in chain:
+            raise ProvisioningError(f"circular variable reference resolving {key}")
+        return _resolve(ref, chain | {ref})
+
+    parsed: dict[str, str] = {}
+    for key in accepted_seen:
+        resolved = _resolve(key, frozenset({key}))
+        if resolved:
+            parsed[key] = resolved
     return parsed
 
 
