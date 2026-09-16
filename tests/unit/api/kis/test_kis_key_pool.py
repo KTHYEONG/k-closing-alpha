@@ -156,17 +156,16 @@ def test_load_kis_env_process_env_overrides_dotenv(tmp_path, monkeypatch) -> Non
     assert missing["KIS_HOST_DATA_SLOTS"] == "2"
 
 
-def test_resolve_host_data_credentials_falls_back_to_legacy_settings(monkeypatch) -> None:
-    from src import settings
+def test_resolve_host_data_credentials_fails_closed_without_pool_env() -> None:
+    import pytest
+
     from src.api.kis.key_pool import KisCredential, resolve_host_data_credentials
 
-    monkeypatch.setattr(settings, "KIS_DATA_API_CONFIG", {
-        "app_key": "legacy", "app_secret": "lsec", "account_id": "", "hts_id": "lhts",
-    })
+    # Given/When/Then: 풀 정의가 없으면 레거시 단일키로 대체하지 않고 즉시 실패한다
+    with pytest.raises(ValueError, match="KIS host data slots are not configured"):
+        resolve_host_data_credentials({})
 
-    assert resolve_host_data_credentials({}) == (
-        KisCredential(slot="DATA", app_key="legacy", app_secret="lsec", hts_id="lhts"),
-    )
+    # And: 풀이 선언되면 그대로 해석한다
     pooled = resolve_host_data_credentials({
         "KIS_DATA_SLOTS": "3", "KIS_HOST_DATA_SLOTS": "3",
         "KIS_DATA_3_APP_KEY": "key3", "KIS_DATA_3_APP_SECRET": "sec3",
@@ -207,4 +206,39 @@ def test_read_token_issued_date_reads_existing_and_handles_missing_or_corrupt(tm
     not_dict = tmp_path / "token_not_dict.json"
     not_dict.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
     assert read_token_issued_date(not_dict) is None
+
+
+
+def test_resolve_host_issued_credentials_includes_declared_non_pool_keys() -> None:
+    import pytest
+
+    from src.api.kis.key_pool import (
+        HOST_ISSUED_KEY_SPECS,
+        KisCredential,
+        resolve_host_issued_credentials,
+    )
+
+    # Given: 풀 슬롯 1개 + 선언된 비풀 키(PRIMARY)
+    env = {
+        "KIS_DATA_SLOTS": "1", "KIS_HOST_DATA_SLOTS": "1",
+        "KIS_DATA_1_APP_KEY": "pool1", "KIS_DATA_1_APP_SECRET": "psec1",
+        "KIS_APP_KEY": "primary", "KIS_APP_SECRET": "psecret", "KIS_HTS_ID": "phts",
+    }
+
+    # When
+    creds = resolve_host_issued_credentials(env)
+
+    # Then: 슬롯 뒤에 선언 키가 붙고 슬롯명이 로그/감사 라벨로 쓰인다
+    assert creds == (
+        KisCredential(slot="DATA_1", app_key="pool1", app_secret="psec1", hts_id=""),
+        KisCredential(slot="PRIMARY", app_key="primary", app_secret="psecret", hts_id="phts"),
+    )
+    assert [spec.name for spec in HOST_ISSUED_KEY_SPECS] == ["PRIMARY"]
+
+    # And: 선언된 키의 자격증명이 비면 fail-closed
+    with pytest.raises(ValueError, match="missing credentials for host key PRIMARY"):
+        resolve_host_issued_credentials({
+            "KIS_DATA_SLOTS": "1", "KIS_HOST_DATA_SLOTS": "1",
+            "KIS_DATA_1_APP_KEY": "pool1", "KIS_DATA_1_APP_SECRET": "psec1",
+        })
 

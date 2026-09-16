@@ -18,8 +18,6 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-from src import settings
-
 KIS_DATA_ROLE_DECISION = "decision"
 KIS_DATA_ROLE_BATCH = "batch"
 
@@ -32,6 +30,37 @@ class KisCredential:
     app_key: str
     app_secret: str
     hts_id: str
+
+
+@dataclass(frozen=True)
+class HostKeySpec:
+    """A non-pool KIS app key this host must issue once per day.
+
+    Attributes:
+        name: Slot label surfaced in warmup results, logs and audit output.
+        app_key_var: Env var holding the app key.
+        app_secret_var: Env var holding the app secret.
+        hts_id_var: Env var holding the HTS id.
+    """
+
+    name: str
+    app_key_var: str
+    app_secret_var: str
+    hts_id_var: str
+
+
+# 데이터 슬롯 풀 밖에서 이 호스트가 발급 책임을 지는 키 선언(단일 원천).
+# PRIMARY(KIS_APP_KEY)는 체결 경로와 외부 실시간 세션이 함께 쓰는 계정 키다.
+# 여기에 선언되지 않은 키는 아무도 발급하지 않으므로, 읽기 전용 소비자는
+# 만료 시점에 fail-closed로 멈춘다 -- 발급 책임은 선언으로만 부여한다.
+HOST_ISSUED_KEY_SPECS: tuple[HostKeySpec, ...] = (
+    HostKeySpec(
+        name="PRIMARY",
+        app_key_var="KIS_APP_KEY",
+        app_secret_var="KIS_APP_SECRET",  # noqa: S106 - env var name, not a hardcoded secret
+        hts_id_var="KIS_HTS_ID",
+    ),
+)
 
 
 def kis_key_id(app_key: str) -> str:
@@ -118,18 +147,69 @@ def parse_host_data_credentials(env: Mapping[str, str]) -> tuple[KisCredential, 
 
 
 def resolve_host_data_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]:
+    """Resolve this host's assigned KIS data slot credentials.
+
+    Args:
+        env: Credential environment mapping.
+
+    Returns:
+        Credentials in KIS_HOST_DATA_SLOTS order.
+
+    Raises:
+        ValueError: The key pool is not declared in env. 선언된 풀 밖의 단일 키로
+            묵시적으로 대체하면 자격증명 배선 누락이 기동 시점에 드러나지 않고
+            결정창(15:20~15:30)의 벤더 인증 실패로 지연 표면화된다.
+    """
     parsed = parse_host_data_credentials(env)
-    if parsed:
-        return parsed
-    cfg = settings.KIS_DATA_API_CONFIG
-    return (
-        KisCredential(
-            slot="DATA",
-            app_key=cfg.get("app_key") or "",
-            app_secret=cfg.get("app_secret") or "",
-            hts_id=cfg.get("hts_id") or "",
-        ),
-    )
+    if not parsed:
+        raise ValueError(
+            "KIS host data slots are not configured; expected KIS_DATA_SLOTS and KIS_HOST_DATA_SLOTS in the credential env"
+        )
+    return parsed
+
+
+def parse_host_extra_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]:
+    """Resolve the declared non-pool keys this host issues daily.
+
+    Args:
+        env: Credential environment mapping.
+
+    Returns:
+        Credentials in HOST_ISSUED_KEY_SPECS order.
+
+    Raises:
+        ValueError: A declared key's app key or secret is missing or blank.
+    """
+    creds: list[KisCredential] = []
+    for spec in HOST_ISSUED_KEY_SPECS:
+        app_key = (env.get(spec.app_key_var) or "").strip()
+        app_secret = (env.get(spec.app_secret_var) or "").strip()
+        if not app_key or not app_secret:
+            raise ValueError(f"missing credentials for host key {spec.name} ({spec.app_key_var})")
+        creds.append(
+            KisCredential(
+                slot=spec.name,
+                app_key=app_key,
+                app_secret=app_secret,
+                hts_id=(env.get(spec.hts_id_var) or "").strip(),
+            )
+        )
+    return tuple(creds)
+
+
+def resolve_host_issued_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]:
+    """Every credential this host must issue exactly once per day.
+
+    Args:
+        env: Credential environment mapping.
+
+    Returns:
+        Host-assigned data slot credentials followed by the declared non-pool keys.
+
+    Raises:
+        ValueError: The slot pool is undeclared or a declared key is missing.
+    """
+    return resolve_host_data_credentials(env) + parse_host_extra_credentials(env)
 
 
 def select_data_credential(credentials: tuple[KisCredential, ...], role: str) -> KisCredential:

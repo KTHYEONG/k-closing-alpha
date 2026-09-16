@@ -19,7 +19,7 @@ import pandas as pd
 
 from src import settings
 from src.api.kis.client import KisApiClient, kis_data_client_kwargs
-from src.api.kis.key_pool import load_kis_env, parse_host_data_credentials, read_token_issued_date, token_cache_path
+from src.api.kis.key_pool import load_kis_env, read_token_issued_date, resolve_host_issued_credentials, token_cache_path
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.archive_intraday import resolve_previous_archive_date
 from src.data.intraday_store import intraday_partition_path
@@ -181,16 +181,17 @@ def list_failed_kca_units(run_fn: Callable[..., subprocess.CompletedProcess[str]
     return sorted(line.split()[0] for line in result.stdout.splitlines() if line.strip())
 
 
-def list_stale_kis_data_tokens(
+def list_stale_kis_tokens(
     snapshot_date: str,
     *,
     env: Mapping[str, str] | None = None,
     cache_dir: Path | None = None,
 ) -> list[str]:
-    """호스트 배정 KIS 데이터 슬롯 중 당일(snapshot_date, KST) 토큰이 없는 슬롯을 반환한다.
+    """이 호스트가 발급 책임을 지는 KIS 키 중 당일(snapshot_date, KST) 토큰이 없는 것을 반환한다.
 
-    발급 자체는 kca-kis-token-warmup 책임이다. 여기서는 그 결과가 배정된 모든
-    슬롯에 실제로 도달했는지만 가시화한다(부분 성공이 exit 0으로 숨는 것을 방지).
+    발급 자체는 kca-kis-token-warmup 책임이다. 여기서는 그 결과가 선언된 모든
+    키(배정 슬롯 + 비풀 선언 키)에 실제로 도달했는지만 가시화한다(부분 성공이
+    exit 0으로 숨는 것을 방지).
 
     Args:
         snapshot_date: 점검 대상일(YYYY-MM-DD, KST).
@@ -198,15 +199,15 @@ def list_stale_kis_data_tokens(
         cache_dir: 토큰 캐시 디렉터리(테스트 주입용). None이면 settings.KIS_TOKEN_CACHE_DIR.
 
     Returns:
-        당일 발급 기록이 없는 슬롯 이름(예: "DATA_3") 목록, 정렬됨. 호스트 슬롯
-        설정 자체가 어긋나면(자격증명 누락 등) 숨기지 않고 표식 1건을 담아 반환한다.
+        당일 발급 기록이 없는 슬롯 이름(예: "DATA_3", "PRIMARY") 목록, 정렬됨.
+        키 선언 자체가 어긋나면(자격증명 누락 등) 숨기지 않고 표식 1건을 담아 반환한다.
     """
     source = env if env is not None else load_kis_env(Path(settings.BASE_DIR) / ".env")
     cache = cache_dir if cache_dir is not None else settings.KIS_TOKEN_CACHE_DIR
     try:
-        creds = parse_host_data_credentials(source)
+        creds = resolve_host_issued_credentials(source)
     except ValueError as exc:
-        return [f"<kis host slot config invalid: {exc}>"]
+        return [f"<kis host key config invalid: {exc}>"]
     return sorted(
         cred.slot
         for cred in creds
@@ -228,7 +229,7 @@ def build_digest(
         day_kind: classify_day 결과(주말 제외).
         result: audit_daily_completeness 결과. 휴장일에만 None을 허용한다.
         failed_units: list_failed_kca_units 결과.
-        stale_kis_tokens: list_stale_kis_data_tokens 결과.
+        stale_kis_tokens: list_stale_kis_tokens 결과.
 
     Returns:
         (제목, 본문) 튜플.
@@ -263,7 +264,7 @@ def run_daily_audit(
     *,
     trading_day_fn: Callable[[str], bool] | None = None,
     failed_units_fn: Callable[[], list[str]] = list_failed_kca_units,
-    stale_tokens_fn: Callable[[str], list[str]] = list_stale_kis_data_tokens,
+    stale_tokens_fn: Callable[[str], list[str]] = list_stale_kis_tokens,
     dispatch_fn: Callable[[str, str], dict[str, bool]] = dispatch_digest,
 ) -> str | None:
     """평일 1회 점검 후 요약을 발송한다. 주말이면 아무것도 보내지 않는다.
@@ -272,7 +273,7 @@ def run_daily_audit(
         snapshot_date: 점검 대상일(YYYY-MM-DD, KST).
         trading_day_fn: 거래일 오라클 주입(테스트용).
         failed_units_fn: 실패 유닛 조회 주입(테스트용).
-        stale_tokens_fn: KIS 데이터 슬롯 토큰 커버리지 조회 주입(테스트용).
+        stale_tokens_fn: 호스트 발급 KIS 토큰 커버리지 조회 주입(테스트용).
         dispatch_fn: 요약 발송 주입(테스트용).
 
     Returns:

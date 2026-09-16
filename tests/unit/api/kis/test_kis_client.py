@@ -255,48 +255,45 @@ def test_get_current_price_without_fallback_queries_only_requested_market(monkey
         asyncio.run(client.get_current_price(_Session(), "005930", allow_market_div_fallback=False))
 
 
-def test_kis_data_client_kwargs_reads_data_account_settings(monkeypatch, tmp_path) -> None:
+def test_kis_data_client_kwargs_reads_data_account_settings(monkeypatch) -> None:
+    from src import settings
     from src.api.kis.client import kis_data_client_kwargs
     from src.api.kis.key_pool import token_cache_path
-    from src import settings
 
-    # Given: 데이터 계좌와 체결 계좌가 서로 다른 합성 자격증명
-    monkeypatch.setattr(settings, "KIS_DATA_API_CONFIG", {
-        "app_key": "data-key", "app_secret": "data-secret", "account_id": "", "hts_id": "data-hts",
-    })
+    # Given: 체결 계좌와 분리된 데이터 슬롯 풀
     monkeypatch.setattr(settings, "KIS_API_CONFIG", {
         "app_key": "exec-key", "app_secret": "exec-secret", "account_id": "exec-acct", "hts_id": "exec-hts",
     })
-    data_token = tmp_path / "kis_data_token_cache.json"
-    monkeypatch.setattr(settings, "DATA_TOKEN_FILE", data_token)
+    env = {
+        "KIS_DATA_SLOTS": "1", "KIS_HOST_DATA_SLOTS": "1",
+        "KIS_DATA_1_APP_KEY": "data-key", "KIS_DATA_1_APP_SECRET": "data-secret", "KIS_DATA_1_HTS_ID": "data-hts",
+    }
 
-    # When: env={} 로 풀 미정의 상태를 강제해 legacy KIS_DATA_API_CONFIG 폴백 경로를 검증한다
-    # (실행 머신의 실제 .env에 KIS_DATA_SLOTS가 채워져 있어도 이 테스트 결과가 흔들리면 안 된다)
-    out = kis_data_client_kwargs(env={})
+    # When
+    out = kis_data_client_kwargs(env)
 
-    # Then: 데이터 계좌 값만 반영, 체결 계좌 값은 섞이지 않는다
+    # Then: 데이터 슬롯 값만 반영, 체결 계좌 값은 섞이지 않는다
     assert out == {
         "app_key": "data-key", "app_secret": "data-secret", "account_id": "", "hts_id": "data-hts",
         "token_file": str(token_cache_path("data-key", settings.KIS_TOKEN_CACHE_DIR)),
     }
 
 
-def test_kis_data_client_gets_isolated_rate_limiter_from_execution_client(monkeypatch, tmp_path) -> None:
-    from src.api.kis.client import KisApiClient, kis_data_client_kwargs
+def test_kis_data_client_gets_isolated_rate_limiter_from_execution_client(monkeypatch) -> None:
     from src import settings
+    from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 
-    # Given: 서로 다른 앱키를 가진 데이터/체결 계좌
-    monkeypatch.setattr(settings, "KIS_DATA_API_CONFIG", {
-        "app_key": "data-key-iso", "app_secret": "s", "account_id": "", "hts_id": "h",
-    })
-    monkeypatch.setattr(settings, "DATA_TOKEN_FILE", tmp_path / "kis_data_token_cache.json")
+    # Given: 서로 다른 앱키를 가진 데이터 슬롯/체결 계좌
     monkeypatch.setattr(settings, "KIS_API_CONFIG", {
         "app_key": "exec-key-iso", "app_secret": "s", "account_id": "a", "hts_id": "h",
     })
+    env = {
+        "KIS_DATA_SLOTS": "1", "KIS_HOST_DATA_SLOTS": "1",
+        "KIS_DATA_1_APP_KEY": "data-key-iso", "KIS_DATA_1_APP_SECRET": "s", "KIS_DATA_1_HTS_ID": "h",
+    }
 
-    # When: env={} 로 풀 미정의 상태를 강제해 legacy KIS_DATA_API_CONFIG 폴백 경로를 검증한다
-    # (실행 머신의 실제 .env에 KIS_DATA_SLOTS가 채워져 있어도 이 테스트 결과가 흔들리면 안 된다)
-    data_client = KisApiClient(**kis_data_client_kwargs(env={}))
+    # When
+    data_client = KisApiClient(**kis_data_client_kwargs(env))
     exec_client = KisApiClient()
 
     # Then: 프로세스 전역 공유 리미터가 앱키별로 분리된 버킷을 갖는다
