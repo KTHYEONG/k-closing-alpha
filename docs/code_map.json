@@ -318,7 +318,6 @@
     "testing": [
       "tests/unit/api/kis/test_kis_client.py",
       "tests/unit/api/kis/test_kis_host_rate_limiter.py",
-      "tests/unit/api/kis/test_kis_key_pool.py",
       "tests/unit/api/kis/test_kis_token_store.py",
       "tests/unit/config/test_altdata.py",
       "tests/unit/config/test_altdata_settings.py",

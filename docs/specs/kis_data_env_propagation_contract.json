@@ -1,0 +1,221 @@
+{
+  "feature": "kis_data_env_propagation",
+  "domain": "infrastructure",
+  "target_file": "src/api/kis/key_pool.py",
+  "context_files": [
+    "src/api/kis/client.py",
+    "src/tools/daily_audit.py",
+    "deploy/systemd/kca-kis-token-warmup.service",
+    "deploy/systemd/kca-finalize-close.service",
+    "deploy/systemd/kca-predict.service",
+    "deploy/systemd/kca-daily-audit.service",
+    "tests/unit/deploy/test_systemd_units.py",
+    "tests/unit/api/kis/test_kis_key_pool.py",
+    "tests/unit/api/kis/test_kis_client.py",
+    "scratch/probe_kis_data_env_propagation.json"
+  ],
+  "changes": [
+    {
+      "name": "kca-collect.service key pool env",
+      "kind": "modified_file",
+      "target_file": "deploy/systemd/kca-collect.service",
+      "signature": "N/A - systemd unit ExecStart edit",
+      "edit_old_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/root/.cache/kis",
+      "edit_new_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis"
+    },
+    {
+      "name": "kca-finalize-close.service key pool env",
+      "kind": "modified_file",
+      "target_file": "deploy/systemd/kca-finalize-close.service",
+      "signature": "N/A - systemd unit ExecStart edit",
+      "edit_old_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/root/.cache/kis",
+      "edit_new_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis"
+    },
+    {
+      "name": "kca-paper-entry.service key pool env",
+      "kind": "modified_file",
+      "target_file": "deploy/systemd/kca-paper-entry.service",
+      "signature": "N/A - systemd unit ExecStart edit",
+      "edit_old_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/root/.cache/kis",
+      "edit_new_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis"
+    },
+    {
+      "name": "kca-paper-exit.service key pool env",
+      "kind": "modified_file",
+      "target_file": "deploy/systemd/kca-paper-exit.service",
+      "signature": "N/A - systemd unit ExecStart edit",
+      "edit_old_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/root/.cache/kis",
+      "edit_new_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis"
+    },
+    {
+      "name": "kca-archive-intraday.service key pool env",
+      "kind": "modified_file",
+      "target_file": "deploy/systemd/kca-archive-intraday.service",
+      "signature": "N/A - systemd unit ExecStart edit",
+      "edit_old_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/root/.cache/kis",
+      "edit_new_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis"
+    },
+    {
+      "name": "kca-price-ingest.service key pool env",
+      "kind": "modified_file",
+      "target_file": "deploy/systemd/kca-price-ingest.service",
+      "signature": "N/A - systemd unit ExecStart edit",
+      "edit_old_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/root/.cache/kis",
+      "edit_new_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis"
+    },
+    {
+      "name": "kca-predict.service key pool env and token cache mount",
+      "kind": "modified_file",
+      "target_file": "deploy/systemd/kca-predict.service",
+      "signature": "N/A - systemd unit ExecStart edit",
+      "edit_old_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env -v %h/k-closing-alpha/data:/app/data",
+      "edit_new_string": "--rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data"
+    },
+    {
+      "name": "kca-daily-audit.service key pool env",
+      "kind": "modified_file",
+      "target_file": "deploy/systemd/kca-daily-audit.service",
+      "signature": "N/A - systemd unit EnvironmentFile edit",
+      "edit_old_string": "EnvironmentFile=%h/quant-secrets/k-closing-alpha.env\nEnvironment=TZ=Asia/Seoul\nExecStart=%h/.local/bin/uv run python -m src.tools.daily_audit\n",
+      "edit_new_string": "EnvironmentFile=%h/quant-secrets/k-closing-alpha.env\nEnvironmentFile=%h/quant-secrets/kis-data.env\nEnvironment=TZ=Asia/Seoul\nExecStart=%h/.local/bin/uv run python -m src.tools.daily_audit\n"
+    },
+    {
+      "name": "key_pool settings import removal",
+      "kind": "modified_file",
+      "target_file": "src/api/kis/key_pool.py",
+      "signature": "N/A - unused import removal after fallback deletion",
+      "edit_old_string": "from dotenv import dotenv_values\n\nfrom src import settings\n\nKIS_DATA_ROLE_DECISION",
+      "edit_new_string": "from dotenv import dotenv_values\n\nKIS_DATA_ROLE_DECISION"
+    },
+    {
+      "name": "resolve_host_data_credentials",
+      "kind": "modified_function",
+      "target_file": "src/api/kis/key_pool.py",
+      "signature": "def resolve_host_data_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]",
+      "edit_old_string": "def resolve_host_data_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]:\n    parsed = parse_host_data_credentials(env)\n    if parsed:\n        return parsed\n    cfg = settings.KIS_DATA_API_CONFIG\n    return (\n        KisCredential(\n            slot=\"DATA\",\n            app_key=cfg.get(\"app_key\") or \"\",\n            app_secret=cfg.get(\"app_secret\") or \"\",\n            hts_id=cfg.get(\"hts_id\") or \"\",\n        ),\n    )",
+      "edit_new_string": "def resolve_host_data_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]:\n    \"\"\"Resolve this host's assigned KIS data slot credentials.\n\n    Args:\n        env: Credential environment mapping.\n\n    Returns:\n        Credentials in KIS_HOST_DATA_SLOTS order.\n\n    Raises:\n        ValueError: The key pool is not declared in env. 선언된 풀 밖의 단일 키로\n            묵시적으로 대체하면 자격증명 배선 누락이 기동 시점에 드러나지 않고\n            결정창(15:20~15:30)의 벤더 인증 실패로 지연 표면화된다.\n    \"\"\"\n    parsed = parse_host_data_credentials(env)\n    if not parsed:\n        raise ValueError(\n            \"KIS host data slots are not configured; expected KIS_DATA_SLOTS and KIS_HOST_DATA_SLOTS in the credential env\"\n        )\n    return parsed"
+    },
+    {
+      "name": "test_resolve_host_data_credentials_falls_back_to_legacy_settings -> fails_closed",
+      "kind": "modified_file",
+      "target_file": "tests/unit/api/kis/test_kis_key_pool.py",
+      "signature": "N/A - obsolete fallback test replacement",
+      "edit_old_string": "def test_resolve_host_data_credentials_falls_back_to_legacy_settings(monkeypatch) -> None:\n    from src import settings\n    from src.api.kis.key_pool import KisCredential, resolve_host_data_credentials\n\n    monkeypatch.setattr(settings, \"KIS_DATA_API_CONFIG\", {\n        \"app_key\": \"legacy\", \"app_secret\": \"lsec\", \"account_id\": \"\", \"hts_id\": \"lhts\",\n    })\n\n    assert resolve_host_data_credentials({}) == (\n        KisCredential(slot=\"DATA\", app_key=\"legacy\", app_secret=\"lsec\", hts_id=\"lhts\"),\n    )\n    pooled = resolve_host_data_credentials({\n        \"KIS_DATA_SLOTS\": \"3\", \"KIS_HOST_DATA_SLOTS\": \"3\",\n        \"KIS_DATA_3_APP_KEY\": \"key3\", \"KIS_DATA_3_APP_SECRET\": \"sec3\",\n    })\n    assert pooled == (KisCredential(slot=\"DATA_3\", app_key=\"key3\", app_secret=\"sec3\", hts_id=\"\"),)",
+      "edit_new_string": "def test_resolve_host_data_credentials_fails_closed_without_pool_env() -> None:\n    import pytest\n\n    from src.api.kis.key_pool import KisCredential, resolve_host_data_credentials\n\n    # Given/When/Then: 풀 정의가 없으면 레거시 단일키로 대체하지 않고 즉시 실패한다\n    with pytest.raises(ValueError, match=\"KIS host data slots are not configured\"):\n        resolve_host_data_credentials({})\n\n    # And: 풀이 선언되면 그대로 해석한다\n    pooled = resolve_host_data_credentials({\n        \"KIS_DATA_SLOTS\": \"3\", \"KIS_HOST_DATA_SLOTS\": \"3\",\n        \"KIS_DATA_3_APP_KEY\": \"key3\", \"KIS_DATA_3_APP_SECRET\": \"sec3\",\n    })\n    assert pooled == (KisCredential(slot=\"DATA_3\", app_key=\"key3\", app_secret=\"sec3\", hts_id=\"\"),)"
+    },
+    {
+      "name": "test_kis_client legacy fallback callers -> pool env",
+      "kind": "modified_file",
+      "target_file": "tests/unit/api/kis/test_kis_client.py",
+      "signature": "N/A - two tests switched from legacy fallback to declared pool env",
+      "edit_old_string": "def test_kis_data_client_kwargs_reads_data_account_settings(monkeypatch, tmp_path) -> None:\n    from src.api.kis.client import kis_data_client_kwargs\n    from src.api.kis.key_pool import token_cache_path\n    from src import settings\n\n    # Given: 데이터 계좌와 체결 계좌가 서로 다른 합성 자격증명\n    monkeypatch.setattr(settings, \"KIS_DATA_API_CONFIG\", {\n        \"app_key\": \"data-key\", \"app_secret\": \"data-secret\", \"account_id\": \"\", \"hts_id\": \"data-hts\",\n    })\n    monkeypatch.setattr(settings, \"KIS_API_CONFIG\", {\n        \"app_key\": \"exec-key\", \"app_secret\": \"exec-secret\", \"account_id\": \"exec-acct\", \"hts_id\": \"exec-hts\",\n    })\n    data_token = tmp_path / \"kis_data_token_cache.json\"\n    monkeypatch.setattr(settings, \"DATA_TOKEN_FILE\", data_token)\n\n    # When: env={} 로 풀 미정의 상태를 강제해 legacy KIS_DATA_API_CONFIG 폴백 경로를 검증한다\n    # (실행 머신의 실제 .env에 KIS_DATA_SLOTS가 채워져 있어도 이 테스트 결과가 흔들리면 안 된다)\n    out = kis_data_client_kwargs(env={})\n\n    # Then: 데이터 계좌 값만 반영, 체결 계좌 값은 섞이지 않는다\n    assert out == {\n        \"app_key\": \"data-key\", \"app_secret\": \"data-secret\", \"account_id\": \"\", \"hts_id\": \"data-hts\",\n        \"token_file\": str(token_cache_path(\"data-key\", settings.KIS_TOKEN_CACHE_DIR)),\n    }",
+      "edit_new_string": "def test_kis_data_client_kwargs_reads_data_account_settings(monkeypatch) -> None:\n    from src import settings\n    from src.api.kis.client import kis_data_client_kwargs\n    from src.api.kis.key_pool import token_cache_path\n\n    # Given: 체결 계좌와 분리된 데이터 슬롯 풀\n    monkeypatch.setattr(settings, \"KIS_API_CONFIG\", {\n        \"app_key\": \"exec-key\", \"app_secret\": \"exec-secret\", \"account_id\": \"exec-acct\", \"hts_id\": \"exec-hts\",\n    })\n    env = {\n        \"KIS_DATA_SLOTS\": \"1\", \"KIS_HOST_DATA_SLOTS\": \"1\",\n        \"KIS_DATA_1_APP_KEY\": \"data-key\", \"KIS_DATA_1_APP_SECRET\": \"data-secret\", \"KIS_DATA_1_HTS_ID\": \"data-hts\",\n    }\n\n    # When\n    out = kis_data_client_kwargs(env)\n\n    # Then: 데이터 슬롯 값만 반영, 체결 계좌 값은 섞이지 않는다\n    assert out == {\n        \"app_key\": \"data-key\", \"app_secret\": \"data-secret\", \"account_id\": \"\", \"hts_id\": \"data-hts\",\n        \"token_file\": str(token_cache_path(\"data-key\", settings.KIS_TOKEN_CACHE_DIR)),\n    }"
+    },
+    {
+      "name": "test_kis_client isolated rate limiter -> pool env",
+      "kind": "modified_file",
+      "target_file": "tests/unit/api/kis/test_kis_client.py",
+      "signature": "N/A - second legacy fallback caller switched to declared pool env",
+      "edit_old_string": "def test_kis_data_client_gets_isolated_rate_limiter_from_execution_client(monkeypatch, tmp_path) -> None:\n    from src.api.kis.client import KisApiClient, kis_data_client_kwargs\n    from src import settings\n\n    # Given: 서로 다른 앱키를 가진 데이터/체결 계좌\n    monkeypatch.setattr(settings, \"KIS_DATA_API_CONFIG\", {\n        \"app_key\": \"data-key-iso\", \"app_secret\": \"s\", \"account_id\": \"\", \"hts_id\": \"h\",\n    })\n    monkeypatch.setattr(settings, \"DATA_TOKEN_FILE\", tmp_path / \"kis_data_token_cache.json\")\n    monkeypatch.setattr(settings, \"KIS_API_CONFIG\", {\n        \"app_key\": \"exec-key-iso\", \"app_secret\": \"s\", \"account_id\": \"a\", \"hts_id\": \"h\",\n    })\n\n    # When: env={} 로 풀 미정의 상태를 강제해 legacy KIS_DATA_API_CONFIG 폴백 경로를 검증한다\n    # (실행 머신의 실제 .env에 KIS_DATA_SLOTS가 채워져 있어도 이 테스트 결과가 흔들리면 안 된다)\n    data_client = KisApiClient(**kis_data_client_kwargs(env={}))\n    exec_client = KisApiClient()",
+      "edit_new_string": "def test_kis_data_client_gets_isolated_rate_limiter_from_execution_client(monkeypatch) -> None:\n    from src import settings\n    from src.api.kis.client import KisApiClient, kis_data_client_kwargs\n\n    # Given: 서로 다른 앱키를 가진 데이터 슬롯/체결 계좌\n    monkeypatch.setattr(settings, \"KIS_API_CONFIG\", {\n        \"app_key\": \"exec-key-iso\", \"app_secret\": \"s\", \"account_id\": \"a\", \"hts_id\": \"h\",\n    })\n    env = {\n        \"KIS_DATA_SLOTS\": \"1\", \"KIS_HOST_DATA_SLOTS\": \"1\",\n        \"KIS_DATA_1_APP_KEY\": \"data-key-iso\", \"KIS_DATA_1_APP_SECRET\": \"s\", \"KIS_DATA_1_HTS_ID\": \"h\",\n    }\n\n    # When\n    data_client = KisApiClient(**kis_data_client_kwargs(env))\n    exec_client = KisApiClient()"
+    },
+    {
+      "name": "test_kis_cache_mounted_only_for_units_using_kis_client",
+      "kind": "modified_file",
+      "target_file": "tests/unit/deploy/test_systemd_units.py",
+      "signature": "N/A - predict now needs the token cache mount; retrain becomes the sole exclusion",
+      "edit_old_string": "    needs_kis_cache = (\n        \"kca-archive-intraday.service\",\n        \"kca-collect.service\",\n        \"kca-finalize-close.service\",\n        \"kca-kis-token-warmup.service\",\n        \"kca-paper-entry.service\",\n        \"kca-paper-exit.service\",\n        \"kca-price-ingest.service\",\n    )\n    mount = \"-v %h/.cache/kis:/root/.cache/kis\"\n    for name in needs_kis_cache:\n        assert mount in (root / name).read_text(encoding=\"utf-8\"), name\n\n    assert mount not in (root / \"kca-predict.service\").read_text(encoding=\"utf-8\")",
+      "edit_new_string": "    needs_kis_cache = (\n        \"kca-archive-intraday.service\",\n        \"kca-collect.service\",\n        \"kca-finalize-close.service\",\n        \"kca-kis-token-warmup.service\",\n        \"kca-paper-entry.service\",\n        \"kca-paper-exit.service\",\n        \"kca-predict.service\",\n        \"kca-price-ingest.service\",\n    )\n    mount = \"-v %h/.cache/kis:/root/.cache/kis\"\n    for name in needs_kis_cache:\n        assert mount in (root / name).read_text(encoding=\"utf-8\"), name\n\n    assert mount not in (root / \"kca-retrain.service\").read_text(encoding=\"utf-8\")"
+    }
+  ],
+  "wiring": [
+    {
+      "caller_file": "deploy/systemd/kca-finalize-close.service",
+      "anchor": "ExecStart=/usr/bin/docker run",
+      "import_symbol": "N/A",
+      "invocation_expression": "N/A"
+    },
+    {
+      "caller_file": "deploy/systemd/kca-daily-audit.service",
+      "anchor": "EnvironmentFile=%h/quant-secrets/k-closing-alpha.env",
+      "import_symbol": "N/A",
+      "invocation_expression": "N/A"
+    },
+    {
+      "caller_file": "src/api/kis/client.py",
+      "anchor": "def kis_data_client_kwargs",
+      "import_symbol": "resolve_host_data_credentials",
+      "invocation_expression": "resolve_host_data_credentials(source)"
+    }
+  ],
+  "requirements": [
+    "INV-ENV-PARITY: KIS를 쓰는 컨테이너 유닛 8종(archive-intraday, collect, finalize-close, kis-token-warmup, paper-entry, paper-exit, predict, price-ingest)은 docker run에 --env-file kis-data.env를 명시해야 한다. systemd 드롭인 EnvironmentFile은 host docker 클라이언트 프로세스에만 적용되고 컨테이너 내부로 전파되지 않는다(실측 확인).",
+    "env-file 순서는 k-closing-alpha.env가 먼저, kis-data.env가 나중이어야 한다 -- kis-token-warmup에 이미 적용된 순서 규약과 동일하게 유지하고 테스트로 고정한다.",
+    "INV-TOKEN-1PD 보전: predict는 KIS 거래일 오라클(classify_day -> is_kis_trading_day)을 호출하므로 풀 키만 주고 토큰 캐시 마운트를 빼면 매 실행 신규 발급이 되어 1일1토큰 불변식이 깨진다. 반드시 -v %h/.cache/kis:/root/.cache/kis를 함께 추가한다.",
+    "kca-retrain은 KIS를 전혀 쓰지 않는 유일한 컨테이너 유닛이므로 kis-data.env와 캐시 마운트를 모두 갖지 않아야 한다(네거티브 단언으로 고정).",
+    "INV-POOL-ONLY(fail-closed): resolve_host_data_credentials는 풀 정의(KIS_DATA_SLOTS/KIS_HOST_DATA_SLOTS)가 없으면 ValueError로 즉시 실패한다. settings.KIS_DATA_API_CONFIG 단일 키로의 묵시적 대체 경로를 완전히 제거하며, try-except로 되살리는 우회 구현을 금지한다.",
+    "폴백 제거로 key_pool.py의 `from src import settings`가 미사용이 되므로 반드시 함께 제거한다(ruff F401).",
+    "kca-daily-audit은 호스트 유닛이라 EnvironmentFile로 충분하지만, 풀 env가 없으면 list_stale_kis_data_tokens가 슬롯을 하나도 해석하지 못해 토큰 커버리지 감사가 무의미해진다. EnvironmentFile=%h/quant-secrets/kis-data.env 추가를 테스트로 고정해 향후 제거를 CI가 막는다.",
+    "범위 제외(별도 처리): 컨테이너 root 실행으로 인한 바인드마운트 소유권 드리프트(data/paper/decisions.parquet이 root:root 0600)는 이 계약에서 다루지 않는다 -- UID 변경시 Path.home() 기반 토큰 캐시 경로와 UV_CACHE_DIR이 함께 깨지므로 별도 probe/spec과 1회성 소유권 교정(sudo)이 필요하다.",
+    "범위 제외: 무효 상태인 레거시 KIS_DATA_APP_KEY/KIS_DATA_APP_SECRET 설정값 자체의 제거는 후속 정리로 미룬다 -- 이번 변경으로 프로덕션 해석 경로에서는 이미 사용되지 않는다."
+  ],
+  "design_rationale": {
+    "alternatives_considered": [
+      "(A1) 7개 유닛 docker run에 --env-file kis-data.env 추가 (08f6e0d가 kis-token-warmup에 적용한 패턴 그대로 확장)",
+      "(A2) provision_env.py SSOT가 KIS_DATA_* 풀 변수를 k-closing-alpha.env에 함께 써서 env 파일 1개로 통합",
+      "(B1) resolve_host_data_credentials()의 레거시 단일키 폴백 제거 -> 풀 env 부재시 fail-closed",
+      "(B2) k-closing-alpha.env의 KIS_DATA_APP_KEY 값을 유효한 키로 교정(운영자 자격증명 필요)",
+      "(D1) Dockerfile에 UID 1000 비root USER 도입 + HOME/캐시 경로 재배선",
+      "(D2) docker run --user 1000:1000 + -e HOME/-e UV_CACHE_DIR 명시",
+      "(D3) 1회성 소유권 교정(chown) 후 구조적 대책은 후속"
+    ],
+    "chosen_reason": "A1+B1 채택. A1은 동일 결함에 이미 검증된 수정 패턴(08f6e0d)의 기계적 확장이고, 실측상 DATA_1 오늘자 캐시 적중으로 신규 발급 없이 즉시 복구된다. B1은 이번 사고의 은폐 메커니즘 자체를 제거해 동일 config drift가 다음번엔 기동 시점 fail-closed로 드러나게 한다. A2는 krx-alpha와 공유하는 kis-data.env 분리 설계를 깨고, B2는 무효 키를 살려 근본 원인(관리 풀 미사용)을 남긴다. D는 독립 결함이라 별도 스펙으로 분리.",
+    "failure_modes": [
+      "[시간임계] archive-intraday 20:05 KST: 동일 토큰 실패로 오늘 정규장 틱 체결 데이터 영구 유실 위험(분봉은 KIS 1년 보관으로 소급 가능, 틱은 당일성)",
+      "[시간임계] daily-audit 20:15 KST: root:root 0600인 data/paper/decisions.parquet을 _column_dates()가 무가드 pd.read_parquet -> PermissionError로 크래시(이 계약 범위 밖, OnFailure 알림으로는 드러남)",
+      "backup 22:15 KST: rclone이 ubuntu로 실행되어 root 0600 파일을 읽지 못함 -> 오프사이트 백업 무통보 누락",
+      "paper-exit 익일 09:01 KST / collect 익일 15:20 KST: 미수정시 동일 EGW00103 반복",
+      "predict는 collect 실패시에도 exit 0(NO_DECISION)으로 종료 -> systemd는 초록, 실제 결정체인은 단절(오늘 실제 발생)",
+      "predict에 풀 키만 주고 캐시 마운트를 빠뜨리면 15:21 결정창에서 매일 신규 토큰을 발급해 DATA_4 토큰을 무효화(1일1토큰 위반)",
+      "레거시 폴백을 남긴 채 A1만 적용하면 향후 env 누락이 다시 조용히 무효키로 흘러 동일 사고 재발"
+    ]
+  },
+  "performance_budget": null,
+  "scenarios": [
+    {
+      "scenario_id": "test_resolve_host_data_credentials_fails_closed_without_pool_env",
+      "target_test_file": "tests/unit/api/kis/test_kis_key_pool.py",
+      "execution_command": "uv run pytest tests/unit/api/kis/test_kis_key_pool.py -k test_resolve_host_data_credentials_fails_closed_without_pool_env -q",
+      "expected_behavior": "풀 env 부재시 ValueError로 fail-closed, 풀 선언시에는 기존대로 해석한다.",
+      "test_skeleton": "def test_resolve_host_data_credentials_fails_closed_without_pool_env() -> None:\n    import pytest\n\n    from src.api.kis.key_pool import KisCredential, resolve_host_data_credentials\n\n    # Given/When/Then: 풀 정의가 없으면 레거시 단일키로 대체하지 않고 즉시 실패한다\n    with pytest.raises(ValueError, match=\"KIS host data slots are not configured\"):\n        resolve_host_data_credentials({})\n\n    # And: 풀이 선언되면 그대로 해석한다\n    pooled = resolve_host_data_credentials({\n        \"KIS_DATA_SLOTS\": \"3\", \"KIS_HOST_DATA_SLOTS\": \"3\",\n        \"KIS_DATA_3_APP_KEY\": \"key3\", \"KIS_DATA_3_APP_SECRET\": \"sec3\",\n    })\n    assert pooled == (KisCredential(slot=\"DATA_3\", app_key=\"key3\", app_secret=\"sec3\", hts_id=\"\"),)\n"
+    },
+    {
+      "scenario_id": "test_kis_data_client_kwargs_reads_data_account_settings",
+      "target_test_file": "tests/unit/api/kis/test_kis_client.py",
+      "execution_command": "uv run pytest tests/unit/api/kis/test_kis_client.py -k test_kis_data_client_kwargs_reads_data_account_settings -q",
+      "expected_behavior": "선언된 풀 env에서 데이터 슬롯 값만 해석하고 체결 계좌 값은 섞이지 않는다.",
+      "test_skeleton": "def test_kis_data_client_kwargs_reads_data_account_settings(monkeypatch) -> None:\n    from src import settings\n    from src.api.kis.client import kis_data_client_kwargs\n    from src.api.kis.key_pool import token_cache_path\n\n    # Given: 체결 계좌와 분리된 데이터 슬롯 풀\n    monkeypatch.setattr(settings, \"KIS_API_CONFIG\", {\n        \"app_key\": \"exec-key\", \"app_secret\": \"exec-secret\", \"account_id\": \"exec-acct\", \"hts_id\": \"exec-hts\",\n    })\n    env = {\n        \"KIS_DATA_SLOTS\": \"1\", \"KIS_HOST_DATA_SLOTS\": \"1\",\n        \"KIS_DATA_1_APP_KEY\": \"data-key\", \"KIS_DATA_1_APP_SECRET\": \"data-secret\", \"KIS_DATA_1_HTS_ID\": \"data-hts\",\n    }\n\n    # When\n    out = kis_data_client_kwargs(env)\n\n    # Then: 데이터 슬롯 값만 반영, 체결 계좌 값은 섞이지 않는다\n    assert out == {\n        \"app_key\": \"data-key\", \"app_secret\": \"data-secret\", \"account_id\": \"\", \"hts_id\": \"data-hts\",\n        \"token_file\": str(token_cache_path(\"data-key\", settings.KIS_TOKEN_CACHE_DIR)),\n    }\n"
+    },
+    {
+      "scenario_id": "test_kis_using_containerized_units_forward_key_pool_env_and_cache",
+      "target_test_file": "tests/unit/deploy/test_systemd_units.py",
+      "execution_command": "uv run pytest tests/unit/deploy/test_systemd_units.py -k test_kis_using_containerized_units_forward_key_pool_env_and_cache -q",
+      "expected_behavior": "KIS를 쓰는 컨테이너 유닛 8종 전부가 kis-data.env를 순서대로 전달하고 토큰 캐시를 마운트하며, retrain은 둘 다 갖지 않는다.",
+      "test_skeleton": "def test_kis_using_containerized_units_forward_key_pool_env_and_cache() -> None:\n    import pathlib\n\n    root = pathlib.Path(__file__).resolve().parents[3] / \"deploy\" / \"systemd\"\n    shared_env = \"--env-file %h/quant-secrets/k-closing-alpha.env\"\n    pool_env = \"--env-file %h/quant-secrets/kis-data.env\"\n    mount = \"-v %h/.cache/kis:/root/.cache/kis\"\n    kis_units = (\n        \"kca-archive-intraday.service\",\n        \"kca-collect.service\",\n        \"kca-finalize-close.service\",\n        \"kca-kis-token-warmup.service\",\n        \"kca-paper-entry.service\",\n        \"kca-paper-exit.service\",\n        \"kca-predict.service\",\n        \"kca-price-ingest.service\",\n    )\n\n    for name in kis_units:\n        text = (root / name).read_text(encoding=\"utf-8\")\n        exec_line = next(line for line in text.splitlines() if line.startswith(\"ExecStart=\") and \"docker run\" in line)\n        # 드롭인 EnvironmentFile은 docker 클라이언트에만 적용되므로 컨테이너엔 --env-file로 명시해야 한다\n        assert pool_env in exec_line, name\n        assert exec_line.index(shared_env) < exec_line.index(pool_env), name\n        # 풀 키를 받고도 캐시를 못 보면 매 실행 재발급이 되어 1일1토큰 불변식이 깨진다\n        assert mount in exec_line, name\n\n    retrain_text = (root / \"kca-retrain.service\").read_text(encoding=\"utf-8\")\n    assert pool_env not in retrain_text\n    assert mount not in retrain_text\n"
+    },
+    {
+      "scenario_id": "test_daily_audit_unit_loads_key_pool_env_for_token_coverage",
+      "target_test_file": "tests/unit/deploy/test_systemd_units.py",
+      "execution_command": "uv run pytest tests/unit/deploy/test_systemd_units.py -k test_daily_audit_unit_loads_key_pool_env_for_token_coverage -q",
+      "expected_behavior": "호스트 감사 유닛이 공유 env와 키풀 env를 모두 로드해 토큰 커버리지 감사가 실제 슬롯을 해석할 수 있다.",
+      "test_skeleton": "def test_daily_audit_unit_loads_key_pool_env_for_token_coverage() -> None:\n    import pathlib\n\n    root = pathlib.Path(__file__).resolve().parents[3] / \"deploy\" / \"systemd\"\n    text = (root / \"kca-daily-audit.service\").read_text(encoding=\"utf-8\")\n\n    # 풀 env가 없으면 list_stale_kis_data_tokens가 슬롯을 하나도 해석하지 못해\n    # 토큰 커버리지 감사가 조용히 무의미해진다\n    assert \"EnvironmentFile=%h/quant-secrets/k-closing-alpha.env\" in text\n    assert \"EnvironmentFile=%h/quant-secrets/kis-data.env\" in text\n    assert \"src.tools.daily_audit\" in text\n"
+    },
+    {
+      "scenario_id": "test_kis_cache_mounted_only_for_units_using_kis_client",
+      "target_test_file": "tests/unit/deploy/test_systemd_units.py",
+      "execution_command": "uv run pytest tests/unit/deploy/test_systemd_units.py -k test_kis_cache_mounted_only_for_units_using_kis_client -q",
+      "expected_behavior": "predict가 캐시 마운트 대상에 포함되고, KIS를 쓰지 않는 retrain만 네거티브 대상으로 남는다.",
+      "test_skeleton": "def test_kis_cache_mounted_only_for_units_using_kis_client() -> None:\n    import pathlib\n\n    root = pathlib.Path(__file__).resolve().parents[3] / \"deploy\" / \"systemd\"\n    needs_kis_cache = (\n        \"kca-archive-intraday.service\",\n        \"kca-collect.service\",\n        \"kca-finalize-close.service\",\n        \"kca-kis-token-warmup.service\",\n        \"kca-paper-entry.service\",\n        \"kca-paper-exit.service\",\n        \"kca-predict.service\",\n        \"kca-price-ingest.service\",\n    )\n    mount = \"-v %h/.cache/kis:/root/.cache/kis\"\n    for name in needs_kis_cache:\n        assert mount in (root / name).read_text(encoding=\"utf-8\"), name\n\n    assert mount not in (root / \"kca-retrain.service\").read_text(encoding=\"utf-8\")\n"
+    }
+  ]
+}
