@@ -1,0 +1,13 @@
+[Unit]
+Description=KCA optional slow-data capture (research, no orders)
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1800
+WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
+EnvironmentFile=%h/quant-secrets/kis-data.env
+Environment=TZ=Asia/Seoul
+Environment=KIS_DATA_ROLE=batch
+ExecStart=/usr/bin/docker run --rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=batch ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.altdata_capture

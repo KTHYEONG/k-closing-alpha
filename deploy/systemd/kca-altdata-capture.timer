@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA optional slow-data capture (daily 21:35:00 KST)
+
+[Timer]
+OnCalendar=*-*-* 21:35:00 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kca-altdata-capture.service
+
+[Install]
+WantedBy=timers.target

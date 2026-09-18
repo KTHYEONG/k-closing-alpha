@@ -5,78 +5,63 @@ description: Produce a machine-readable, zero-invention implementation blueprint
 
 # Spec Protocol
 
-Produce an unambiguous, AI-native implementation blueprint (`docs/specs/<feature>_spec.md`) optimized for mechanical, zero-search, zero-invention downstream execution by low-reasoning worker models (`implement`).
+Produce an unambiguous implementation blueprint (`docs/specs/<feature>_spec.md`) optimized for mechanical downstream execution.
 
-## High-Reasoning Allocation Philosophy
+## Allocation
 
-The design rationale and empirical proof have already been resolved in `/probe`.
-As the contract architect, your cognitive budget is 100% dedicated to:
-1. **Concrete Step-by-Step Recipe in Docstrings/Comments**: An unambiguous, sequential pseudocode recipe (`Step 1`, `Step 2`, ...) inside each target symbol's definition so low-reasoning models translate directly to code without guessing.
-2. **Explicit Wiring Snippets**: Ready-to-paste caller wiring blocks (`Anchor` + clean import/call snippet).
-3. **Uncompromising Concrete Test Suites**: Raw, unescaped test functions with strict assertions and exact exception/output matches.
+The design rationale and empirical proof are resolved in `/probe`.
+Your output in `/spec` focuses strictly on:
+1. **Target Interfaces & Invariants**: Exact signatures, finalized production docstrings (explaining Why and constraints), and bulleted core invariants. Do not include temporary pseudo-code, code skeletons, or recipes in docstrings or invariants (prevents model anchoring and scaffolding leaks).
+2. **Wiring Points**: Caller anchor and invocation snippet.
+3. **Invariant Verification Scenarios**: Concrete scenarios (Given / When / Invariant) validating contracts without freezing internal test syntax prematurely.
 
 ## Directives
 
-1. **Prerequisite & Context Alignment (Auto-Inference)**:
-   - When `/spec` is called without arguments, automatically infer the feature name, domain, and technical context directly from the preceding `/probe` step in the active session.
-   - Carry over the invariants, trade-offs, failure modes, and architectural decisions directly from conversation memory.
-   - Inspect target files and immediate 1-depth callers to ensure exact imports and AST anchors. Do NOT scan unrelated repository paths.
+1. **Context Alignment**:
+   - Infer feature context, invariants, and decisions directly from the preceding probe step.
+   - Inspect target files and immediate callers for exact imports and AST anchors without scanning unrelated paths.
 
-2. **Blueprint Structure (`docs/specs/<feature>_spec.md`)**:
-   Create a pure Markdown specification containing three mandatory sections:
+2. **Sizing & Modularity (Single-Bolt Rule)**:
+   - **Sweet Spot**: A single spec typically targets 2–4 related production files, 1–2 test files, and 10–15 invariant scenarios (200–350 lines).
+   - **Mandatory Split**: Split into sequential sub-specs (e.g. ordered by layer or dependency: `<feature>_<sub_layer>_spec.md`) if:
+     1) Total invariant scenarios exceed 20 or spec exceeds 500 lines.
+     2) Targets span distinct architectural layers (e.g., Domain Core Engine vs. CLI / External Adapters).
+
+3. **Blueprint Structure (`docs/specs/<feature>_spec.md`)**:
+   Organize targets with **component-centric co-location** (group Target, Wiring, and Invariant Scenarios together per component to prevent cross-referencing context loss). For multi-component specs, repeat this 3-part sequence for each component unit:
 
    ### A. Target Blueprint (`## Target: <relative_path>`)
-   Write the exact function/class signature with a comprehensive docstring containing the algorithmic execution steps:
-   ```python
-   def target_function(param1: Type1, param2: Type2) -> ReturnType:
-       """
-       [STEP-BY-STEP RECIPE FOR IMPLEMENTER]:
-       Step 1. Precondition / Fail-closed check:
-          Validate inputs. Raise DomainError if invalid.
-       Step 2. Core Transformation:
-          Execute logic in exact mathematical/domain order.
-       Step 3. Failure Mode Defense:
-          Handle boundary edge case X explicitly.
-       Step 4. Postcondition Guarantee:
-          Return formatted result.
-       """
-   ```
+   - Function/class signature with finalized production docstring (domain context, Args, Returns, Raises).
+   - Core Invariants: bulleted preconditions, calculation sequence, negative constraints ("Do NOT..."), edge case handling, and postconditions.
+   - **No Code Skeletons**: Specify strict types and invariants only; do not provide implementation code snippets or algorithms to avoid model overfitting.
 
    ### B. Wiring Blueprint (`## Wiring: <caller_file>`)
-   Specify the exact anchor and ready-to-insert code:
-   - `- Anchor: <function_name_or_class>`
-   ```python
-   from path.to.module import target_function
-   # Replace / Insert at anchor:
-   result = target_function(...)
-   ```
+   - Anchor point (`- Anchor: <symbol_or_line>`) and invocation snippet.
 
-   ### C. Test Suite (`## Test Suite: <target_test_file>`)
-   Write raw, 100% executable Python test functions. NEVER use JSON string escaping (`\n`, `\"`). Write clean pytest code directly:
-   ```python
-   def test_target_function_normal():
-       ...
-   def test_target_function_boundary():
-       ...
-   ```
-
-3. **Self-Validation Gate**:
-   Validate the markdown spec with `lean_check.py`:
-   ```bash
-   uv run python tools/agent_skills/lean_check.py --spec docs/specs/<feature>_spec.md --pre-impl
-   ```
+   ### C. Invariant Scenarios (`## Invariant Scenarios: <target_test_file>`)
+   - Bulleted test scenarios with descriptive domain titles:
+     - `- **<Behavior/Invariant Name>** Given ...; When ...; Invariant: ...`
+     - Keep titles clear so they translate directly into clean test function names (`test_<target>_<behavior>`).
 
 ## Chat Output Format
 
-Keep chat output ultra-compact. Detailed recipes and test code already reside inside `_spec.md`. Output only the minimal hand-off card below:
+Keep chat output ultra-compact and token-efficient. Do NOT execute CLI commands or pre-impl validation loops.
+Output only the minimal card below:
 
 ### 📐 [SPEC] <기능명>
-> 📄 **청사진**: [`docs/specs/<feature>_spec.md`](file:///docs/specs/<feature>_spec.md)  
-> 🚦 **하네스 검증**: `lean_check --pre-impl` **PASS**
+> 📄 **청사진**: [`docs/specs/<feature>_spec.md`](file:///docs/specs/<feature>_spec.md)
 
-- 🎯 **작업 요약**: <구현할 핵심 기능 1줄 요약>
-- 📦 **작업 규모**: <N>개 파일 수정 · <N>개 테스트 작성 완료
+- 🎯 **작업 요약**: <구현할 핵심 기능 1줄 요약> (<N>개 파일 대상 · <N>개 시나리오)
 
----
-👉 **다음 단계 (OpenCode)**: 
-`/implement docs/specs/<feature>_spec.md`
+*(단일 스펙인 경우)*:
+```bash
+/implement docs/specs/<feature>_spec.md
+```
+
+*(다중 스펙으로 분할된 경우: 순차 실행할 /implement 명령어를 복사하기 쉽게 나열)*:
+```bash
+/implement docs/specs/<sub_spec_1>.md
+```
+```bash
+/implement docs/specs/<sub_spec_2>.md
+```
