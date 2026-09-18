@@ -80,3 +80,126 @@ def test_main_runs_configured_capture_and_reports_manifest_status(tmp_path, monk
 
     assert rc == 0
     assert captured["trading_day"].isoformat() == "2026-09-18"
+
+
+def test_krx_listed_universe_returns_none_on_holiday(tmp_path, monkeypatch) -> None:
+    """비거래일(양쪽 시장 0행)에는 유니버스를 조작하지 않고 None을 반환한다."""
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+
+    monkeypatch.setattr(altdata_capture, "fetch_krx_daily", lambda window_end, cfg: pd.DataFrame(columns=["symbol"]))
+    cfg = AltDataFetchConfig(start=pd.Timestamp("2026-09-17"), end=pd.Timestamp("2026-09-18"), out_dir=tmp_path)
+
+    universe = altdata_capture._krx_listed_universe(pd.Timestamp("2026-09-18"), cfg)
+
+    assert universe is None
+
+
+def test_krx_listed_universe_returns_deduped_frozenset(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+
+    monkeypatch.setattr(
+        altdata_capture,
+        "fetch_krx_daily",
+        lambda window_end, cfg: pd.DataFrame({"symbol": ["005930", "000660", "005930", " "]}),
+    )
+    cfg = AltDataFetchConfig(start=pd.Timestamp("2026-09-17"), end=pd.Timestamp("2026-09-18"), out_dir=tmp_path)
+
+    universe = altdata_capture._krx_listed_universe(pd.Timestamp("2026-09-18"), cfg)
+
+    assert universe == frozenset({"005930", "000660"})
+
+
+def test_run_altdata_capture_fills_declared_universe_from_krx_when_absent(tmp_path, monkeypatch) -> None:
+    """실측 회귀: universe_symbols 미설정 시 shorting/credit_balance/program_trade_daily
+    3개 종목별 패널이 늘 스킵돼 manifest가 영구히 COMPLETE 못 되던 문제(2026-09-19 실측)."""
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    captured: dict[str, Any] = {}
+
+    def _fake_backfill(cfg, *, capture_store, run_id, reobserve):
+        captured["cfg"] = cfg
+        captured["run_id"] = run_id
+        return {"capture": "ok"}
+
+    class _Context:
+        def __init__(self, run_id: str) -> None:
+            self.run_id = run_id
+
+    class _Manifest:
+        def __init__(self, run_id: str) -> None:
+            self.status = CaptureStatus.COMPLETE
+            self.context = _Context(run_id)
+
+    class _Store:
+        def read_manifests(self, date_str: str) -> list[Any]:
+            return [_Manifest(captured["run_id"])]
+
+    monkeypatch.setattr(altdata_capture, "run_altdata_backfill", _fake_backfill)
+    monkeypatch.setattr(
+        altdata_capture,
+        "fetch_krx_daily",
+        lambda window_end, cfg: pd.DataFrame({"symbol": ["005930", "000660"]}),
+    )
+
+    profile = _profile(tmp_path, COLLECTION_ALTDATA_LOOKBACK_DAYS=2)
+    window_start, window_end = altdata_capture._rolling_bounds(pd.Timestamp("2026-09-18").date(), 2)
+    cfg = AltDataFetchConfig(start=window_start, end=window_end, out_dir=tmp_path, krx_api_key="k")
+
+    manifest = altdata_capture.run_altdata_capture(pd.Timestamp("2026-09-18").date(), profile=profile, store=_Store(), cfg=cfg)
+
+    assert manifest.status == CaptureStatus.COMPLETE
+    assert captured["cfg"].universe_symbols == frozenset({"005930", "000660"})
+
+
+def test_run_altdata_capture_preserves_explicit_universe(tmp_path, monkeypatch) -> None:
+    """이미 명시적으로 설정된 universe_symbols는 KRX 재조회로 덮어쓰지 않는다."""
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    captured: dict[str, Any] = {}
+
+    def _fake_backfill(cfg, *, capture_store, run_id, reobserve):
+        captured["cfg"] = cfg
+        captured["run_id"] = run_id
+        return {"capture": "ok"}
+
+    def _boom(window_end, cfg):
+        raise AssertionError("fetch_krx_daily must not be called when universe already declared")
+
+    class _Context:
+        def __init__(self, run_id: str) -> None:
+            self.run_id = run_id
+
+    class _Manifest:
+        def __init__(self, run_id: str) -> None:
+            self.status = CaptureStatus.COMPLETE
+            self.context = _Context(run_id)
+
+    class _Store:
+        def read_manifests(self, date_str: str) -> list[Any]:
+            return [_Manifest(captured["run_id"])]
+
+    monkeypatch.setattr(altdata_capture, "run_altdata_backfill", _fake_backfill)
+    monkeypatch.setattr(altdata_capture, "fetch_krx_daily", _boom)
+
+    profile = _profile(tmp_path, COLLECTION_ALTDATA_LOOKBACK_DAYS=2)
+    window_start, window_end = altdata_capture._rolling_bounds(pd.Timestamp("2026-09-18").date(), 2)
+    declared = frozenset({"999999"})
+    cfg = AltDataFetchConfig(start=window_start, end=window_end, out_dir=tmp_path, krx_api_key="k", universe_symbols=declared)
+
+    altdata_capture.run_altdata_capture(pd.Timestamp("2026-09-18").date(), profile=profile, store=_Store(), cfg=cfg)
+
+    assert captured["cfg"].universe_symbols == declared
