@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import uuid
 from collections.abc import Sequence
@@ -15,6 +16,7 @@ from src import settings
 from src.backfill.altdata.config import AltDataFetchConfig
 from src.backfill.altdata.runner import run_altdata_backfill
 from src.config.collection import CollectionSettings
+from src.daily.price_ingest import fetch_krx_daily
 from src.data.capture_contracts import SEOUL, CaptureManifest, CaptureStatus
 from src.data.capture_store import CaptureStore
 
@@ -31,6 +33,20 @@ def _rolling_bounds(trading_day: date, lookback_days: int) -> tuple[pd.Timestamp
     end = pd.Timestamp(trading_day).normalize()
     start = end - pd.Timedelta(days=int(lookback_days) - 1)
     return start, end
+
+
+def _krx_listed_universe(window_end: pd.Timestamp, cfg: AltDataFetchConfig) -> frozenset[str] | None:
+    """Fetch the full KRX-listed symbol set for window_end (no screen/trade bias).
+
+    Returns None on a non-trading day (both markets publish zero rows), leaving
+    the caller's symbol-scoped panels to skip that date rather than fabricate
+    a universe.
+    """
+    frame = fetch_krx_daily(window_end, cfg)
+    if frame.empty:
+        return None
+    symbols = {str(s).strip() for s in frame["symbol"].astype(str).tolist() if str(s).strip()}
+    return frozenset(symbols) if symbols else None
 
 
 def run_altdata_capture(trading_date: date, *, profile: CollectionSettings, store: CaptureStore, cfg: AltDataFetchConfig) -> CaptureManifest:
@@ -53,6 +69,10 @@ def run_altdata_capture(trading_date: date, *, profile: CollectionSettings, stor
     window_start, window_end = _rolling_bounds(trading_date, lookback)
     if pd.Timestamp(cfg.start).normalize() != window_start or pd.Timestamp(cfg.end).normalize() != window_end:
         raise ValueError("cfg rolling bounds must equal the declared inclusive window")
+    if cfg.universe_symbols is None:
+        universe = _krx_listed_universe(window_end, cfg)
+        if universe is not None:
+            cfg = dataclasses.replace(cfg, universe_symbols=universe)
     run_id = f"altdata-{window_end.strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
     started = datetime.now(SEOUL)
     report = run_altdata_backfill(cfg, capture_store=store, run_id=run_id, reobserve=True)
