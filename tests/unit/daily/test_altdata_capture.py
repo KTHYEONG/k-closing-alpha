@@ -115,6 +115,27 @@ def test_krx_listed_universe_returns_deduped_frozenset(tmp_path, monkeypatch) ->
     assert universe == frozenset({"005930", "000660"})
 
 
+def test_krx_listed_universe_drops_non_6digit_codes(tmp_path, monkeypatch) -> None:
+    """실측 회귀: KRX 일별 목록에 ETN(예: '0013V0')이 섞여 있어 그대로 넘기면
+    AltDataFetchConfig가 '6-digit string이어야 한다'며 ValueError를 던졌다
+    (2026-09-18 실측). 일반주식 6자리 숫자 코드만 유니버스로 채택한다."""
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+
+    monkeypatch.setattr(
+        altdata_capture,
+        "fetch_krx_daily",
+        lambda window_end, cfg: pd.DataFrame({"symbol": ["005930", "0013V0", "A05930", "12345"]}),
+    )
+    cfg = AltDataFetchConfig(start=pd.Timestamp("2026-09-17"), end=pd.Timestamp("2026-09-18"), out_dir=tmp_path)
+
+    universe = altdata_capture._krx_listed_universe(pd.Timestamp("2026-09-18"), cfg)
+
+    assert universe == frozenset({"005930"})
+
+
 def test_krx_listed_universe_walks_back_past_publication_lag(tmp_path, monkeypatch) -> None:
     """실측 회귀: KRX 일별 API가 당일 데이터를 아직 발행하지 않아(2026-09-18 저녁
     시각에도 0행) window_end 그대로 조회하면 항상 빈 유니버스가 됐다. 발행된
