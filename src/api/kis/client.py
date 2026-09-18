@@ -673,6 +673,8 @@ class KisApiClient:
                 "FID_INPUT_ISCD": code,
                 "FID_INPUT_HOUR_1": cursor_hour,
                 "FID_PW_DATA_INCU_YN": "Y",
+                # KIS 서버가 이 필드 키 자체의 부재를 에러(ERROR INPUT FIELD NOT FOUND)로 취급함 -- 빈 문자열이라도 반드시 포함해야 함.
+                "FID_ETC_CLS_CODE": "",
             }
             res = await self._handle_request(
                 session.get, url, headers=self._get_headers("FHKST03010200"), params=params

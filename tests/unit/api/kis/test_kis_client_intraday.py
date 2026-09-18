@@ -32,6 +32,9 @@ def test_get_intraday_minute_chart_paginates_within_floor_and_ceil() -> None:
     for call in handle_request.await_args_list:
         params = call.kwargs.get("params", {})
         assert params.get("FID_COND_MRKT_DIV_CODE") == "NX"
+        # 실측 회귀: 이 필드가 빠지면 KIS가 "ERROR INPUT FIELD NOT FOUND [FID_ETC_CLS_CODE]"로
+        # 거부해 2026-09-18 archive-intraday가 정규세션 1분봉을 0행으로 받았다.
+        assert params.get("FID_ETC_CLS_CODE") == ""
 
 def test_get_historical_minute_chart_paginates_with_target_date() -> None:
     client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
