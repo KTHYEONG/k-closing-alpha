@@ -8,9 +8,11 @@ import fcntl
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextvars import ContextVar
 from datetime import datetime, time, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -26,12 +28,17 @@ from src.api.kis.key_pool import (
 )
 from src.api.kis.rate_limit import get_host_rate_limiter
 
+if TYPE_CHECKING:
+    from src.data.capture_contracts import BrokerPayload, PageObserver
+
 logger = logging.getLogger(__name__)
 
 KIS_REST_TPS_PER_APP_KEY: float = 18.0  # KIS 서버 앱키당 초당 20건 한도의 여유분
 KIS_DECISION_WINDOW_START = time(15, 15)
 KIS_DECISION_WINDOW_END = time(15, 35)
 _KST = ZoneInfo("Asia/Seoul")
+
+_SCOPED_MARKET_OBSERVER: ContextVar[PageObserver | None] = ContextVar("kis_market_observer", default=None)
 
 
 def _now_kst() -> datetime:
@@ -341,8 +348,10 @@ class KisApiClient:
     async def _handle_request(self, session_method, url, **kwargs):
         """재시도 로직을 포함한 공통 요청 처리 (네트워크 및 토큰 재발급 에러 처리 강화)"""
         import aiohttp
-        
+
         session = getattr(session_method, "__self__", None)
+        headers_arg = kwargs.get("headers")
+        tr_id = str(headers_arg.get("tr_id", "")) if isinstance(headers_arg, dict) else ""
         for attempt in range(5):
             await self.rate_limiter.acquire()
             try:
@@ -350,12 +359,26 @@ class KisApiClient:
                 if "headers" in kwargs and isinstance(kwargs["headers"], dict):
                     kwargs["headers"]["authorization"] = f"Bearer {self.token}"
 
+                started = _now_kst()
                 async with session_method(url, **kwargs) as resp:
                     if resp.status == 429:  # Too Many Requests
+                        try:
+                            evidence = await resp.json()
+                        except Exception:
+                            evidence = None
+                        received = _now_kst()
+                        self._emit_page(evidence if isinstance(evidence, dict) else None, {"tr_id": tr_id, "error_type": "rate_limited", "http_status": "429"}, started, received, attempt)
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
 
-                    data = await resp.json()
+                    try:
+                        data = await resp.json()
+                    except Exception as exc:
+                        received = _now_kst()
+                        self._emit_page(None, {"tr_id": tr_id, "error_type": type(exc).__name__}, started, received, attempt)
+                        raise
+                    received = _now_kst()
+                    self._emit_page(data, {"tr_id": tr_id, "rt_cd": str(data.get("rt_cd", "")), "msg_cd": str(data.get("msg_cd", ""))}, started, received, attempt)
                     # 토큰 만료/유효하지 않음 에러 자동 재발급 처리
                     msg_cd = data.get("msg_cd", "")
                     msg1 = data.get("msg1", "")
@@ -377,6 +400,8 @@ class KisApiClient:
                     return data
             # aiohttp 세션 total 타임아웃은 ClientError가 아닌 TimeoutError로 올라와, 잡지 않으면 단일 지연 요청이 배치 전체를 중단시킨다
             except (aiohttp.ClientError, TimeoutError) as e:
+                received = _now_kst()
+                self._emit_page(None, {"tr_id": tr_id, "error_type": type(e).__name__}, started, received, attempt)
                 # 네트워크 연결 에러 시 지수 백오프로 재시도
                 if attempt < 4:  # 마지막 시도가 아니면
                     wait_time = 0.5 * (2 ** attempt)  # 0.5초, 1초, 2초, 4초
@@ -392,6 +417,37 @@ class KisApiClient:
                     # 마지막 시도에서도 실패하면 에러 반환
                     return {"rt_cd": "9", "msg1": f"네트워크 연결 실패: {str(e)[:100]}"}
         return {"rt_cd": "9", "msg1": "최대 재시도 횟수 초과 (TPS 제한)"}
+
+    def _emit_page(
+        self,
+        payload: BrokerPayload | None,
+        metadata: Mapping[str, str],
+        started: datetime,
+        received: datetime,
+        attempt: int,
+    ) -> None:
+        """바인딩된 작업-로컬 관측자에게 실제 응답 증거를 전달한다. 관측자 없으면 no-op."""
+        observer = _SCOPED_MARKET_OBSERVER.get()
+        if observer is None:
+            return
+        observer(payload, metadata, started, received, 0, attempt)
+
+    @contextlib.contextmanager
+    def observe_market_responses(self, on_page: PageObserver) -> Iterator[None]:
+        """Scope a task-local observer to market REST calls without changing return values.
+
+        Args:
+            on_page: Durable observer receiving each actual response or transport failure.
+        Returns:
+            Synchronous context manager isolated between concurrent asyncio tasks.
+        Raises:
+            RawCaptureError: Observer could not preserve a decoded market response.
+        """
+        token = _SCOPED_MARKET_OBSERVER.set(on_page)
+        try:
+            yield
+        finally:
+            _SCOPED_MARKET_OBSERVER.reset(token)
 
     async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
         """주식 현재가 시세 조회 (FHKST01010100)"""
@@ -984,17 +1040,12 @@ def kis_data_client_kwargs(env: Mapping[str, str] | None = None) -> dict[str, st
 def kis_decision_shard_client_kwargs(env: Mapping[str, str] | None = None) -> list[dict[str, str]]:
     """결정창 벌크 수집용 KIS 자격증명 목록(1개 또는 N개)을 KisApiClient kwargs 리스트로 반환한다.
 
-    [STEP-BY-STEP RECIPE FOR IMPLEMENTER]:
-    Step 1. `source = load_kis_env(Path(settings.BASE_DIR) / ".env") if env is None else env`로
-       소스를 정한다(`kis_data_client_kwargs`와 동일 관례).
-    Step 2. `creds = resolve_decision_shard_credentials(source)`를 호출한다.
-    Step 3. `creds`의 각 자격증명을 아래와 동일한 5개 키의 dict로 변환한다
-       (`kis_data_client_kwargs`와 필드 이름/구성 100% 동일, account_id는 항상 빈 문자열).
-    Step 4. 변환된 dict들을 `creds`와 동일한 순서의 리스트로 반환한다. `KIS_DECISION_SHARD_SLOTS`
-       미설정 시 리스트 길이는 항상 1이고, 그 1개는 `kis_data_client_kwargs(source)`가
-       반환하는 값과 app_key가 동일하다(레거시 경로 보존, `resolve_decision_shard_credentials`
-       Step 3이 이를 보장).
+    `kis_data_client_kwargs`와 동일한 5개 키 dict를 `resolve_decision_shard_credentials`
+    순서대로 반환한다. `KIS_DECISION_SHARD_SLOTS` 미설정 시 리스트 길이는 항상 1이고,
+    그 1개는 `kis_data_client_kwargs(source)` 값과 app_key가 동일하다.
     """
+    # Research clients are explicitly constructed by auction_capture with the same
+    # KisApiClient/token_cache_path/host pacing contracts used here.
     source = load_kis_env(Path(settings.BASE_DIR) / ".env") if env is None else env
     creds = resolve_decision_shard_credentials(source)
     return [

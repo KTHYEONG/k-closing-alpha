@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -28,6 +29,9 @@ UV_SYNC_TIMEOUT_SEC: int = 600
 ALERT_DETAIL_TAIL_CHARS: int = 2000
 SYSTEMD_UNIT_GLOBS: tuple[str, ...] = ("kca-*.service", "kca-*.timer")
 SYSTEMCTL_TIMEOUT_SEC: int = 60
+OPTIONAL_MANUAL_TIMERS: frozenset[str] = frozenset(
+    {"kca-auction-close.timer", "kca-auction-open.timer", "kca-altdata-capture.timer"}
+)
 # 브로커 시크릿·Gmail 앱 비밀번호가 담긴 .env 는 소유자만 읽을 수 있어야 한다
 SECRET_FILE_MODE: int = 0o600
 
@@ -116,6 +120,28 @@ def _run_test_gate(repo_dir: str) -> tuple[bool, str]:
     return result.returncode == 0, combined[-ALERT_DETAIL_TAIL_CHARS:]
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def format_test_gate_tail(raw: str) -> str:
+    """Format pytest output for failure alerts: strip ANSI, extract failure summary, wrap in code block."""
+    cleaned = _ANSI_ESCAPE_RE.sub("", raw).strip()
+    if not cleaned:
+        return ""
+    lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
+    summary_start = -1
+    for i, line in enumerate(lines):
+        if "short test summary info" in line or line.startswith("FAILED "):
+            summary_start = i
+            break
+    snippet_lines = lines[summary_start:] if summary_start >= 0 else lines[-25:]
+    snippet = "\n".join(snippet_lines)
+    if len(snippet) > ALERT_DETAIL_TAIL_CHARS:
+        snippet = snippet[-ALERT_DETAIL_TAIL_CHARS:]
+    return f"```\n{snippet}\n```"
+
+
+
 def _uv_sync(repo_dir: str) -> None:
     """Refresh the venv from the freshly fast-forwarded lockfile."""
     subprocess.run([_resolve_uv_bin(), "sync"], cwd=repo_dir, check=True, capture_output=True, text=True, timeout=UV_SYNC_TIMEOUT_SEC)  # noqa: S603, S607
@@ -159,7 +185,8 @@ def install_systemd_units(
         if not (dest / name).exists() or (dest / name).read_bytes() != path.read_bytes()
     )
     removed = sorted(installed - set(wanted))
-    enabled = sorted(name for name in changed if name.endswith(".timer") and name not in installed)
+    # Exclude the three declared optional timer names from newly installed auto-enable candidates.
+    enabled = sorted(name for name in changed if name.endswith(".timer") and name not in installed and name not in OPTIONAL_MANUAL_TIMERS)
 
     def _systemctl(*args: str) -> None:
         run_fn(["systemctl", "--user", *args], capture_output=True, text=True, timeout=SYSTEMCTL_TIMEOUT_SEC, check=True)
@@ -251,9 +278,14 @@ def sync_repo(
         git_fn(["reset", "--hard", from_sha], repo_dir)
         from src.tools.alerts import dispatch_failure_alert
 
+        formatted_tail = format_test_gate_tail(tail)
         dispatch_failure_alert(
             "kca-code-sync.service",
-            detail=f"test gate failed at {to_sha[:8]}, rolled back to {from_sha[:8]}: {tail}",
+            detail=(
+                f"test gate failed at {to_sha[:8]}, rolled back to {from_sha[:8]}:\n{formatted_tail}"
+                if formatted_tail
+                else f"test gate failed at {to_sha[:8]}, rolled back to {from_sha[:8]}"
+            ),
         )
         return SyncResult(updated=False, from_sha=from_sha, to_sha=to_sha, reason="test_gate_failed")
 

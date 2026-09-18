@@ -119,6 +119,7 @@ def test_load_daily_snapshot_reads_archive_store_and_zero_fills_code(monkeypatch
         return pd.DataFrame({"종목코드": [5930, "000660"], "거래대금": [500.0, 300.0], "admitted": [True, False]})
 
     monkeypatch.setattr(predict_mod, "fetch_archive_snapshot", _fake_fetch)
+    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", False)
 
     # When
     out = predict_mod.load_daily_snapshot(pd.Timestamp("2026-09-09"))
@@ -161,7 +162,7 @@ def test_run_topk_ranker_sleeve_uses_stored_admitted_without_recompute(monkeypat
     bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
     bundle["top_k"] = 3
 
-    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
     monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
 
     # When
@@ -188,7 +189,7 @@ def test_run_topk_ranker_sleeve_warns_when_bundle_missing(monkeypatch, caplog) -
         "시장구분": ["KOSPI"], "kospi": [0.52], "kosdaq": [-0.31], "v_kospi": [15.2],
         "admitted": [True],
     })
-    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
 
     def _missing(import_dir=None):
         raise FileNotFoundError("model artifact bundle not found")
@@ -349,7 +350,7 @@ def test_run_topk_ranker_sleeve_loads_history_when_bundle_needs_it(monkeypatch) 
         calls.append(d)
         return hist
 
-    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
     monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
     monkeypatch.setattr(thf, "load_serving_price_history", _fake_loader)
 
@@ -377,7 +378,7 @@ def test_run_topk_ranker_sleeve_stale_history_yields_no_decision(monkeypatch, ca
     def _stale(_d):
         raise ValueError("stale price_history: latest=2026-09-07 < prev_trading_day=2026-09-08")
 
-    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
     monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
     monkeypatch.setattr(thf, "load_serving_price_history", _stale)
 
@@ -403,7 +404,7 @@ def test_run_topk_ranker_sleeve_skips_history_for_v1_bundle(monkeypatch) -> None
     def _must_not_load(_d):
         raise AssertionError("v1 bundle must not read price_history")
 
-    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
     monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
     monkeypatch.setattr(thf, "load_serving_price_history", _must_not_load)
 
@@ -491,7 +492,7 @@ def test_run_topk_ranker_sleeve_ranks_within_training_pool(monkeypatch) -> None:
         seen.append(df["종목코드"].tolist())
         return real_build(df, decision_date, price_history=price_history)
 
-    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
     monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
     monkeypatch.setattr(features_mod, "build_topk_ranker_features", _spy)
 
@@ -555,7 +556,7 @@ def test_run_topk_ranker_sleeve_reports_failure_to_callback(monkeypatch, caplog)
     import src.daily.predict as predict_mod
 
     wide = pd.DataFrame({"종목코드": ["000001"], "종목명": ["AAA"], "admitted": [True]})
-    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
     monkeypatch.setattr(predict_mod, "restrict_to_rank_pool", lambda w, _d: w)
 
     def _missing(import_dir=None):
@@ -832,7 +833,7 @@ def test_run_topk_ranker_sleeve_emits_scored_rank_pool_to_callback(monkeypatch) 
     })
     bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
     bundle["top_k"] = 3
-    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
     monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
     pools: list[pd.DataFrame] = []
 
@@ -933,7 +934,7 @@ def test_run_topk_ranker_sleeve_loads_history_for_flow_only_bundle(monkeypatch) 
         calls.append(d)
         return hist
 
-    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d: wide)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
     monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
     monkeypatch.setattr(thf, "load_serving_price_history", _fake_loader)
 
@@ -960,3 +961,183 @@ def test_bundle_model_version_formats_strategy_cutoff_and_trained_at() -> None:
         == "KCA-TOPK-COSTAWARE-001@2026-09-11 00:00:00@UNKNOWN"
     )
     assert predict_mod.bundle_model_version({}) == "UNKNOWN@UNKNOWN@UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# closing_capture_06 decision-input invariant guards
+# ---------------------------------------------------------------------------
+
+def _certified_wide_frame(completed_at, run_label="run-early"):
+    import pandas as pd
+
+    return pd.DataFrame([
+        {"종목코드": "000001", "symbol": "000001", "종가": 18000.0, "admitted": True,
+         "snapshot_timestamp": pd.Timestamp("2026-09-14 15:20:01", tz="Asia/Seoul"),
+         "feature_available_timestamp": completed_at},
+        {"종목코드": "000002", "symbol": "000002", "종가": 30000.0, "admitted": False,
+         "snapshot_timestamp": pd.Timestamp("2026-09-14 15:20:02", tz="Asia/Seoul"),
+         "feature_available_timestamp": completed_at},
+    ])
+
+
+def _publish_certified_run(store, cohort, frame, run_id, completed_at):
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry
+
+    entries = (CoverageEntry(
+        symbol=None, dataset=CaptureDataset.PRICE, venue="KRX", session="regular",
+        scheduled_at=None, status=CaptureStatus.COMPLETE, rows=len(frame),
+        first_event_time=None, last_event_time=None, reason="decision-input", raw_refs=(),
+    ),)
+    return store.publish_decision(frame, cohort=cohort, run_id=run_id, completed_at=completed_at, entries=entries)
+
+
+def test_load_daily_snapshot_replays_certified_input_before_cutoff(tmp_path, monkeypatch) -> None:
+    """Immutable 15:20 input survives later legacy changes and late captures."""
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.data.capture_contracts import build_cohort
+    from src.data.capture_store import CaptureStore
+
+    kst = ZoneInfo("Asia/Seoul")
+    store = CaptureStore(tmp_path / "capture")
+    monkeypatch.setattr(predict_mod, "_capture_root", lambda: tmp_path / "capture")
+    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
+    cohort = build_cohort(
+        date(2026, 9, 14), ["000001", "000002"], ["000001", "000002"], {},
+        eligibility_rule_version="price_history_panel@v1",
+    )
+    early_at = datetime(2026, 9, 14, 15, 20, 30, tzinfo=kst)
+    late_at = datetime(2026, 9, 14, 15, 25, 30, tzinfo=kst)
+    _publish_certified_run(store, cohort, _certified_wide_frame(early_at), "run-early", early_at)
+    late_frame = _certified_wide_frame(late_at)
+    late_frame.loc[late_frame["종목코드"] == "000001", "종가"] = 99999.0
+    _publish_certified_run(store, cohort, late_frame, "run-late", late_at)
+
+    out = predict_mod.load_daily_snapshot(
+        pd.Timestamp("2026-09-14"), available_by=datetime(2026, 9, 14, 15, 22, 0, tzinfo=kst)
+    )
+    assert out[out["종목코드"] == "000001"]["종가"].iloc[0] == 18000.0
+    assert out["capture_run_id"].iloc[0] == "run-early"
+    assert out["cohort_id"].iloc[0] == cohort.cohort_id
+    assert out["종목코드"].tolist() == ["000001", "000002"]
+
+
+def test_load_daily_snapshot_fails_closed_without_legacy_substitution(tmp_path, monkeypatch) -> None:
+    """New-mode input absence never falls back to finalized legacy archive."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+    import pytest
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod, "_capture_root", lambda: tmp_path / "capture")
+    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
+
+    def _must_not_fallback(snapshot_date=None, **kwargs):
+        raise AssertionError("legacy archive must not substitute certified input")
+
+    monkeypatch.setattr(predict_mod, "fetch_archive_snapshot", _must_not_fallback)
+    with pytest.raises(FileNotFoundError):
+        predict_mod.load_daily_snapshot(
+            pd.Timestamp("2026-09-14"),
+            available_by=datetime(2026, 9, 14, 15, 22, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+
+
+def test_load_daily_snapshot_rejects_naive_cutoff(monkeypatch) -> None:
+    """Inference cutoff must be an aware timestamp."""
+    from datetime import datetime
+
+    import pandas as pd
+    import pytest
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
+    with pytest.raises(ValueError, match="aware cutoff"):
+        predict_mod.load_daily_snapshot(pd.Timestamp("2026-09-14"), available_by=datetime(2026, 9, 14, 15, 22, 0))
+
+
+def test_sleeve_binds_inference_cutoff_and_provenance(monkeypatch) -> None:
+    """Input reference is bound before scoring with certified provenance."""
+    from datetime import datetime
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    wide = pd.DataFrame({
+        "종목코드": ["000001", "000002", "000003", "000004"],
+        "종목명": ["AAA", "BBB", "CCC", "DDD"],
+        "종가": [18000.0, 18100.0, 17900.0, 30000.0],
+        "전일종가": [17142.86, 17238.10, 17047.62, 28571.43],
+        "고가": [18100.0, 18200.0, 18000.0, 30100.0],
+        "저가": [17800.0, 17900.0, 17700.0, 29800.0],
+        "시가": [17900.0, 18000.0, 17800.0, 29900.0],
+        "거래량": [1_000_000, 900_000, 1_100_000, 800_000],
+        "거래대금": [500.0, 450.0, 550.0, 400.0],
+        "시가총액": [3000.0, 2800.0, 3200.0, 5000.0],
+        "기관_순매수": [10.0, -5.0, 20.0, 8.0],
+        "외국인_순매수": [5.0, 12.0, -3.0, 6.0],
+        "시장구분": ["KOSPI"] * 4,
+        "kospi": [0.52] * 4, "kosdaq": [-0.31] * 4, "v_kospi": [15.2] * 4,
+        "admitted": [True, True, True, False],
+        "capture_run_id": ["run-early"] * 4,
+        "cohort_id": ["cohort-x"] * 4,
+        "feature_available_timestamp": [pd.Timestamp("2026-09-09 15:20:01", tz="Asia/Seoul")] * 4,
+    })
+    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
+    bundle["top_k"] = 3
+    seen = {}
+
+    def _fake_load(decision_date, **kwargs):
+        seen.update(kwargs)
+        return wide
+
+    pools = []
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", _fake_load)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+
+    out = predict_mod.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"), on_rank_pool=pools.append)
+
+    assert isinstance(seen.get("available_by"), datetime)
+    assert seen["available_by"].tzinfo is not None
+    assert set(out["capture_run_id"]) == {"run-early"}
+    assert set(out["cohort_id"]) == {"cohort-x"}
+    assert out["inference_started_at"].notna().all()
+    assert out["input_available_at"].notna().all()
+    assert len(pools) == 1
+    assert set(pools[0]["capture_run_id"]) == {"run-early"}
+
+
+def test_capture_root_resolution_follows_settings_override(tmp_path, monkeypatch) -> None:
+    """Capture root honors configured overrides and the history default."""
+    from pathlib import Path
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "COLLECTION_ROOT", tmp_path / "custom")
+    assert predict_mod._capture_root() == Path(tmp_path / "custom")
+    monkeypatch.setattr(predict_mod.settings, "COLLECTION_ROOT", None)
+    assert predict_mod._capture_root() == Path(predict_mod.settings.HISTORY_DIR) / "capture"
+
+
+def test_load_daily_snapshot_defaults_cutoff_to_call_time(tmp_path, monkeypatch) -> None:
+    """Omitted cutoff uses the actual call time without legacy substitution."""
+    import pandas as pd
+    import pytest
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod, "_capture_root", lambda: tmp_path / "capture")
+    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
+    with pytest.raises(FileNotFoundError):
+        predict_mod.load_daily_snapshot(pd.Timestamp("2026-09-14"))

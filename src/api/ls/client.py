@@ -6,13 +6,51 @@ import asyncio
 import inspect
 import logging
 import os
+import re
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 from src import settings
+
+if TYPE_CHECKING:
+    import aiohttp
+
+    from src.data.capture_contracts import BrokerPayload, ChartBudget, PageObserver
 
 logger = logging.getLogger(__name__)
 
 _OAUTH_URL = "https://openapi.ls-sec.co.kr:8080/oauth2/token"
 _QUERY_URL = "https://openapi.ls-sec.co.kr:8080/stock/chart"
+
+_SEOUL = ZoneInfo("Asia/Seoul")
+_YMD_RE = re.compile(r"^\d{8}$")
+_HHMMSS_RE = re.compile(r"^\d{6}$")
+
+
+def _now_seoul() -> datetime:
+    return datetime.now(_SEOUL)
+
+
+def _validate_target_ymd(target_date: str) -> str:
+    ymd = str(target_date).replace("-", "")
+    try:
+        datetime.strptime(ymd, "%Y%m%d")
+    except ValueError:
+        raise ValueError(f"invalid target date: {target_date!r}") from None
+    return ymd
+
+
+def _resolve_chart_budget(budget: ChartBudget | None, default_pages: int) -> tuple[int, datetime | None]:
+    if budget is None:
+        return max(1, int(default_pages)), None
+    return max(1, int(budget.max_pages)), budget.deadline
+
+
+def _deadline_remaining(deadline: datetime | None) -> float | None:
+    if deadline is None:
+        return None
+    return (deadline - _now_seoul()).total_seconds()
 
 
 def _resolve_tick_max_pages(explicit: int | None) -> int:
@@ -111,71 +149,285 @@ class LsApiClient:
             return data, resp_headers
         return data, resp_headers
 
-    async def get_minute_chart(self, session, code: str, target_date: str) -> dict:
-        ymd = str(target_date).replace("-", "")
-        try:
-            data, _ = await self._post_tr(
-                session, "t8412", str(code),
-                {"t8412InBlock": {"shcode": str(code), "ncnt": 1, "qrycnt": 500, "nday": "0", "sdate": ymd, "stime": "090000", "edate": ymd, "etime": "153000", "cts_date": "", "cts_time": "", "comp_yn": "N"}},
-            )
-        except Exception as e:
-            logger.warning("LS t8412 failed code=%s: %s", code, e)
-            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "ls"}
-        if str(data.get("rsp_cd", "")) not in ("00000", "0"):
-            return {"rt_cd": "1", "msg1": str(data.get("rsp_msg", "")), "output2": [], "vendor": "ls"}
-        rows = data.get("t8412OutBlock1") or []
-        return {"rt_cd": "0", "output2": [dict(r) for r in rows], "vendor": "ls"}
+    async def get_minute_chart(
+        self,
+        session: aiohttp.ClientSession,
+        code: str,
+        target_date: str,
+        *,
+        budget: ChartBudget | None = None,
+        on_page: PageObserver | None = None,
+    ) -> BrokerPayload:
+        """Read all required chart pages before claiming acquisition completion.
 
-    async def get_tick_chart(self, session, code: str, target_date: str, max_pages: int | None = None) -> dict:
-        ymd = str(target_date).replace("-", "")
-        page_budget = _resolve_tick_max_pages(max_pages)
+        LS can return late-day and extended-session records despite requested clock
+        boundaries. Every raw page must be preserved; the caller classifies venue
+        and session only after acquisition.
+
+        Args:
+            session: Existing authenticated HTTP session.
+            code: Security identifier retained as a string.
+            target_date: Requested market date.
+            budget: Explicit page/deadline/timeout limits, or configured defaults.
+            on_page: Optional synchronous observer of actual raw page evidence.
+
+        Returns:
+            Compatible rt_cd/output2/vendor payload plus truncated, termination_reason,
+            pages_fetched, and the final permitted continuation state.
+
+        Raises:
+            ValueError: Invalid budget or target date.
+            OSError: Mandatory raw-page persistence fails.
+        """
+        ymd = _validate_target_ymd(target_date)
+        max_pages, deadline = _resolve_chart_budget(budget, int(getattr(settings, "COLLECTION_CHART_MAX_PAGES", 30) or 30))
         cts_date, cts_time = "", ""
         tr_cont, tr_cont_key = "N", ""
-        all_rows: list[dict] = []
-        reached_open = False
+        all_rows: list[dict[str, Any]] = []
+        metadata: dict[str, str] = {}
+        termination = "exhausted"
+        truncated = False
+        pages_fetched = 0
+        failure_msg = ""
+        prev_identity: tuple[Any, ...] | None = None
+        stalls = 0
+        in_observer = False
         try:
-            for _ in range(max(1, int(page_budget))):
-                data, resp_headers = await self._post_tr(
+            for page_index in range(max_pages):
+                remaining = _deadline_remaining(deadline)
+                if remaining is not None and remaining <= 0:
+                    termination = "deadline"
+                    truncated = True
+                    break
+                started = _now_seoul()
+                call = self._post_tr(
+                    session,
+                    "t8412",
+                    str(code),
+                    {"t8412InBlock": {"shcode": str(code), "ncnt": 1, "qrycnt": 500, "nday": "0", "sdate": ymd, "stime": "090000", "edate": ymd, "etime": "153000", "cts_date": cts_date, "cts_time": cts_time, "comp_yn": "N"}},
+                    tr_cont=tr_cont,
+                    tr_cont_key=tr_cont_key,
+                )
+                if remaining is None:
+                    data, resp_headers = await call
+                else:
+                    data, resp_headers = await asyncio.wait_for(call, timeout=remaining)
+                received = _now_seoul()
+                out_block = data.get("t8412OutBlock") or {}
+                body_cts_date = str(out_block.get("cts_date", "") or "").strip()
+                body_cts_time = str(out_block.get("cts_time", "") or "").strip()
+                header_cont = str(resp_headers.get("tr_cont", "N") or "N")
+                header_key = str(resp_headers.get("tr_cont_key", "") or "")
+                metadata = {
+                    "cts_date": body_cts_date,
+                    "cts_time": body_cts_time,
+                    "tr_cont": header_cont,
+                    "tr_cont_key": header_key,
+                }
+                in_observer = True
+                if on_page is not None:
+                    on_page(dict(data), metadata, started, received, page_index, 0)
+                in_observer = False
+                pages_fetched += 1
+                if str(data.get("rsp_cd", "")) not in ("00000", "0"):
+                    termination = "vendor_failure"
+                    truncated = True
+                    failure_msg = str(data.get("rsp_msg", ""))
+                    break
+                rows = data.get("t8412OutBlock1") or []
+                if rows:
+                    all_rows = [dict(r) for r in rows if isinstance(r, dict)] + all_rows
+                identity = (
+                    body_cts_date,
+                    body_cts_time,
+                    header_cont,
+                    header_key,
+                    tuple((str(r.get("date", "")), str(r.get("time", ""))) for r in rows if isinstance(r, dict)),
+                )
+                if identity == prev_identity:
+                    stalls += 1
+                else:
+                    stalls = 0
+                    prev_identity = identity
+                if stalls >= 2:
+                    termination = "nonprogress"
+                    truncated = True
+                    break
+                oldest_date = ""
+                for r in rows:
+                    day = str(r.get("date", "") or "").strip()
+                    if _YMD_RE.fullmatch(day) and (not oldest_date or day < oldest_date):
+                        oldest_date = day
+                if oldest_date and oldest_date < ymd:
+                    termination = "crossed_target_date"
+                    break
+                if not body_cts_date and not body_cts_time and header_cont != "Y":
+                    termination = "exhausted"
+                    break
+                if not body_cts_date and not body_cts_time:
+                    termination = "cursor_unknown"
+                    truncated = True
+                    break
+                cts_date, cts_time = body_cts_date, body_cts_time
+                tr_cont, tr_cont_key = header_cont, header_key
+            else:
+                termination = "page_budget"
+                truncated = True
+        except TimeoutError:
+            termination = "deadline"
+            truncated = True
+        except Exception as e:
+            if in_observer:
+                raise
+            logger.warning("LS t8412 failed code=%s: %s", code, e)
+            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "ls", "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": pages_fetched, "continuation": metadata}
+        if termination == "vendor_failure":
+            return {"rt_cd": "1", "msg1": failure_msg, "output2": [], "vendor": "ls", "truncated": True, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata}
+        filtered = [dict(r) for r in all_rows if str(r.get("date", ymd)) == ymd]
+        return {"rt_cd": "0", "output2": filtered, "vendor": "ls", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata}
+
+    async def get_tick_chart(
+        self,
+        session: aiohttp.ClientSession,
+        code: str,
+        target_date: str,
+        max_pages: int | None = None,
+        *,
+        budget: ChartBudget | None = None,
+        on_page: PageObserver | None = None,
+    ) -> BrokerPayload:
+        """Keep tick multiplicity and termination evidence across bounded pagination.
+
+        Args:
+            session: Existing HTTP session.
+            code: Security identifier.
+            target_date: Requested market date.
+            max_pages: Legacy explicit limit; conflicts with budget are rejected.
+            budget: Typed page/deadline/timeout bound.
+            on_page: Raw page observer called before filtering or normalization.
+
+        Returns:
+            Legacy payload and explicit task termination metadata.
+
+        Raises:
+            ValueError: Invalid or conflicting acquisition limits.
+            OSError: Mandatory evidence persistence fails.
+        """
+        ymd = _validate_target_ymd(target_date)
+        if max_pages is not None and budget is not None and int(max_pages) != int(budget.max_pages):
+            raise ValueError("conflicting tick acquisition limits")
+        if max_pages is not None and int(max_pages) <= 0:
+            raise ValueError("invalid tick acquisition limits")
+        if budget is not None:
+            page_budget, deadline = _resolve_chart_budget(budget, _resolve_tick_max_pages(None))
+        elif max_pages is not None:
+            page_budget, deadline = max(1, int(max_pages)), None
+        else:
+            page_budget, deadline = _resolve_chart_budget(None, _resolve_tick_max_pages(None))
+        cts_date, cts_time = "", ""
+        tr_cont, tr_cont_key = "N", ""
+        all_rows: list[dict[str, Any]] = []
+        metadata: dict[str, str] = {}
+        termination = "exhausted"
+        truncated = False
+        pages_fetched = 0
+        failure_msg = ""
+        prev_identity: tuple[Any, ...] | None = None
+        stalls = 0
+        in_observer = False
+        try:
+            for page_index in range(max(1, int(page_budget))):
+                remaining = _deadline_remaining(deadline)
+                if remaining is not None and remaining <= 0:
+                    termination = "deadline"
+                    truncated = True
+                    break
+                started = _now_seoul()
+                call = self._post_tr(
                     session, "t8411", str(code),
                     {"t8411InBlock": {"shcode": str(code), "ncnt": 1, "qrycnt": 500, "nday": "0", "sdate": ymd, "stime": "090000", "edate": ymd, "etime": "153000", "cts_date": cts_date, "cts_time": cts_time, "comp_yn": "N"}},
                     tr_cont=tr_cont,
                     tr_cont_key=tr_cont_key,
                 )
+                if remaining is None:
+                    data, resp_headers = await call
+                else:
+                    data, resp_headers = await asyncio.wait_for(call, timeout=remaining)
+                received = _now_seoul()
+                out_block = data.get("t8411OutBlock") or {}
+                body_cts_date = str(out_block.get("cts_date", "") or "").strip()
+                body_cts_time = str(out_block.get("cts_time", "") or "").strip()
+                header_cont = str(resp_headers.get("tr_cont", "N") or "N")
+                header_key = str(resp_headers.get("tr_cont_key", "") or "")
+                metadata = {
+                    "cts_date": body_cts_date,
+                    "cts_time": body_cts_time,
+                    "tr_cont": header_cont,
+                    "tr_cont_key": header_key,
+                }
+                in_observer = True
+                if on_page is not None:
+                    on_page(dict(data), metadata, started, received, page_index, 0)
+                in_observer = False
+                pages_fetched += 1
                 if str(data.get("rsp_cd", "")) not in ("00000", "0"):
-                    return {"rt_cd": "1", "msg1": str(data.get("rsp_msg", "")), "output2": [], "vendor": "ls", "truncated": False}
+                    termination = "vendor_failure"
+                    truncated = True
+                    failure_msg = str(data.get("rsp_msg", ""))
+                    break
                 rows = data.get("t8411OutBlock1") or []
                 if rows:
-                    all_rows = rows + all_rows
-                cts = data.get("t8411OutBlock") or {}
-                cts_date = str(cts.get("cts_date", "") or "").strip()
-                cts_time = str(cts.get("cts_time", "") or "").strip()
-                tr_cont = resp_headers.get("tr_cont", "N")
-                tr_cont_key = resp_headers.get("tr_cont_key", "")
-                if not cts_date and not cts_time and tr_cont != "Y":
-                    reached_open = True
+                    all_rows = [dict(r) for r in rows if isinstance(r, dict)] + all_rows
+                identity = (
+                    body_cts_date,
+                    body_cts_time,
+                    header_cont,
+                    header_key,
+                    tuple((str(r.get("date", "")), str(r.get("time", ""))) for r in rows if isinstance(r, dict)),
+                )
+                if identity == prev_identity:
+                    stalls += 1
+                else:
+                    stalls = 0
+                    prev_identity = identity
+                if stalls >= 2:
+                    termination = "nonprogress"
+                    truncated = True
                     break
-                date_val = str(rows[0].get("date", "") or "").strip() if rows else ""
-                if date_val and date_val < ymd:
-                    reached_open = True
+                head = rows[0] if rows else {}
+                head_date = str(head.get("date", "") or "").strip()
+                head_time = str(head.get("time", "") or "").strip()
+                if _YMD_RE.fullmatch(head_date) and head_date < ymd:
+                    termination = "crossed_target_date"
                     break
-                if rows and str(rows[0].get("time", "")) <= "090000":
-                    reached_open = True
+                if _YMD_RE.fullmatch(head_date) and head_date == ymd and _HHMMSS_RE.fullmatch(head_time) and head_time <= "090000":
+                    termination = "crossed_target_date"
                     break
+                if header_cont != "Y" and not body_cts_date and not body_cts_time:
+                    termination = "exhausted"
+                    break
+                if not body_cts_date and not body_cts_time:
+                    termination = "cursor_unknown"
+                    truncated = True
+                    break
+                cts_date, cts_time = body_cts_date, body_cts_time
+                tr_cont, tr_cont_key = header_cont, header_key
+            else:
+                termination = "page_budget"
+                truncated = True
+        except TimeoutError:
+            termination = "deadline"
+            truncated = True
         except Exception as e:
+            if in_observer:
+                raise
             logger.warning("LS t8411 failed code=%s: %s", code, e)
-            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "ls", "truncated": False}
+            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "ls", "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": pages_fetched, "continuation": metadata}
+        if termination == "vendor_failure":
+            return {"rt_cd": "1", "msg1": failure_msg, "output2": [], "vendor": "ls", "truncated": True, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata}
         filtered = [
             dict(r) for r in all_rows
-            if str(r.get("date", ymd)) == ymd and "090000" <= str(r.get("time", "")) <= "153059"
+            if str(r.get("date", ymd)) == ymd and _HHMMSS_RE.fullmatch(str(r.get("time", ""))) and "090000" <= str(r.get("time", "")) <= "153059"
         ]
-        truncated = not reached_open
-        if truncated:
-            earliest = min((str(r.get("time", "")) for r in filtered), default="")
-            logger.warning(
-                "[DATA] LS tick page budget exhausted code=%s pages=%d earliest=%s",
-                code,
-                page_budget,
-                earliest,
-            )
-        return {"rt_cd": "0", "output2": filtered, "vendor": "ls", "truncated": truncated}
+        return {"rt_cd": "0", "output2": filtered, "vendor": "ls", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata}
 

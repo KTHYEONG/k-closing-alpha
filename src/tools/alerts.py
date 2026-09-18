@@ -119,9 +119,9 @@ def post_webhook_alert(webhook_url: str, *, unit: str, detail: str = "") -> bool
     Raises:
         requests.RequestException: 전송 자체가 실패한 경우 그대로 전파한다.
     """
-    text = f"[KCA] systemd unit failed: {unit}"
+    text = f"[KCA][실패] systemd unit failed: {unit}"
     if detail:
-        text += f"\n{detail}"
+        text += f"\n\n{detail}"
     return post_webhook_text(webhook_url, text)
 
 
@@ -146,7 +146,7 @@ def send_email_alert(*, gmail_user: str, gmail_app_password: str, to_addr: str, 
         gmail_user=gmail_user,
         gmail_app_password=gmail_app_password,
         to_addr=to_addr,
-        subject=f"[KCA] systemd unit failed: {unit}",
+        subject=f"[KCA][실패] systemd unit failed: {unit}",
         body=detail or f"unit={unit} failed with no further detail",
     )
 
@@ -210,14 +210,15 @@ def collect_unit_diagnostics(unit: str, *, run: Callable[..., subprocess.Complet
     sections: list[str] = []
     try:
         show = run(["systemctl", "--user", "show", unit, "-p", "Result", "-p", "ExecMainStatus", "-p", "ExecMainStartTimestamp", "-p", "ExecMainExitTimestamp"], capture_output=True, text=True, timeout=ALERT_COMMAND_TIMEOUT_SEC, check=True)
-        sections.append(show.stdout.strip())
+        sections.append(f"[시스템 상태]\n{show.stdout.strip()}")
     except (OSError, subprocess.SubprocessError) as exc:
-        sections.append(f"unit status unavailable: {type(exc).__name__}")
+        sections.append(f"[시스템 상태]\nunit status unavailable: {type(exc).__name__}")
     try:
         journal = run(["journalctl", "--user", "-u", unit, "-n", str(ALERT_JOURNAL_TAIL_LINES), "-o", "cat", "--all", "--no-pager"], capture_output=True, text=True, timeout=ALERT_COMMAND_TIMEOUT_SEC, check=True)
-        sections.append(sanitize_journal_tail(journal.stdout))
+        sanitized = sanitize_journal_tail(journal.stdout)
+        sections.append(f"[최근 저널 로그 (최대 {ALERT_JOURNAL_TAIL_LINES}줄)]\n{sanitized}" if sanitized else "[최근 저널 로그]\n(기록 없음)")
     except (OSError, subprocess.SubprocessError) as exc:
-        sections.append(f"journal tail unavailable: {type(exc).__name__}")
+        sections.append(f"[최근 저널 로그]\njournal tail unavailable: {type(exc).__name__}")
     return "\n\n".join(sections)
 
 

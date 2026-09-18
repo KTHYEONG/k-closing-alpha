@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -303,14 +306,40 @@ def map_toss_trade_value_rows_to_stock_list(rows: list[dict]) -> list[dict]:
     return out
 
 
-async def fetch_trade_value_union(session, *, toss_client: Any | None = None, count: int = 100) -> list[dict]:
+def _emit_scan_page(
+    on_page: Any | None,
+    payload: Any,
+    metadata: Mapping[str, str],
+    started: datetime,
+    received: datetime,
+    page_index: int = 0,
+    attempt_index: int = 0,
+) -> None:
+    if on_page is None:
+        return
+    body = dict(payload) if isinstance(payload, dict) else None
+    on_page(body, metadata, started, received, int(page_index), int(attempt_index))
+
+
+async def fetch_trade_value_union(session, *, toss_client: Any | None = None, count: int = 100, on_page: Any | None = None) -> list[dict]:
     if toss_client is None:
         return []
+    started = datetime.now(ZoneInfo("Asia/Seoul"))
     try:
         res = await toss_client.get_rankings(session, ranking_type=TOSS_RANKING_TYPE_TRADE_VALUE, market_country="KR", duration="1d", count=count)
     except Exception as e:
         logger.warning("[DATA] stage=universe_scan_trade_value_union vendor=toss status=FAILED reason=%s", e)
         return []
+    received = datetime.now(ZoneInfo("Asia/Seoul"))
+    _emit_scan_page(
+        on_page,
+        res,
+        {"vendor": "toss", "endpoint": "rankings-trade-value", "scope": "trade_value_top100"},
+        started,
+        received,
+        0,
+        0,
+    )
     if "error" in res:
         err = res["error"]
         logger.warning("[DATA] stage=universe_scan_trade_value_union vendor=toss status=FAILED reason=code=%s msg=%s", err.get("code"), err.get("message", ""))
@@ -322,7 +351,7 @@ async def fetch_trade_value_union(session, *, toss_client: Any | None = None, co
 
 
 async def fetch_kis_band_ranking(
-    client: Any, session: Any, *, rate_min_pct: float, rate_max_pct: float, max_calls: int = KIS_RANKING_MAX_CALLS
+    client: Any, session: Any, *, rate_min_pct: float, rate_max_pct: float, max_calls: int = KIS_RANKING_MAX_CALLS, on_page: Any | None = None
 ) -> list[dict]:
     """Fetch full KIS band coverage despite the 30-row cap via adaptive bisection.
 
@@ -335,6 +364,7 @@ async def fetch_kis_band_ranking(
         rate_min_pct: Band lower bound (percent).
         rate_max_pct: Band upper bound (percent).
         max_calls: Call budget guard.
+        on_page: Observer of raw band sub-query pages and actual clocks.
 
     Returns:
         Deduplicated ranking rows across all leaves.
@@ -342,6 +372,7 @@ async def fetch_kis_band_ranking(
     Raises:
         UniverseScanCoverageError: On vendor failure, budget exhaustion, or a
             saturated 1bp leaf band.
+        OSError: Required raw scan evidence cannot be persisted.
     """
     lo_bp = int(round(rate_min_pct * 100))
     hi_bp = int(round(rate_max_pct * 100))
@@ -353,8 +384,25 @@ async def fetch_kis_band_ranking(
         if n_calls >= max_calls:
             raise UniverseScanCoverageError(f"kis ranking call budget {max_calls} exhausted")
         n_calls += 1
+        started = datetime.now(ZoneInfo("Asia/Seoul"))
         res = await client.get_fluctuation_ranking(
             session, rate_min_pct=a / 100.0, rate_max_pct=b / 100.0, market_div_code="J"
+        )
+        received = datetime.now(ZoneInfo("Asia/Seoul"))
+        _emit_scan_page(
+            on_page,
+            res,
+            {
+                "vendor": "kis",
+                "endpoint": "fluctuation-ranking",
+                "scope": "band",
+                "rate_min_pct": f"{a / 100.0:.2f}",
+                "rate_max_pct": f"{b / 100.0:.2f}",
+            },
+            started,
+            received,
+            n_calls - 1,
+            0,
         )
         if res.get("rt_cd") != "0":
             raise UniverseScanCoverageError(f"kis ranking failed rt_cd={res.get('rt_cd')} msg={res.get('msg1', '')}")
@@ -378,31 +426,25 @@ async def fetch_kis_band_ranking(
 
 
 async def fetch_candidate_stock_list(
-    client, session, *, universe: UniverseSpec = DEFAULT_UNIVERSE, kiwoom_client: Any | None = None, toss_client: Any | None = None, kis_band_fallback: bool = False
+    client, session, *, universe: UniverseSpec = DEFAULT_UNIVERSE, kiwoom_client: Any | None = None, toss_client: Any | None = None, kis_band_fallback: bool = False, on_page: Any | None = None
 ) -> list[dict]:
-    """Kiwoom ka10027을 1순위, KIS 밴드 스캔을 2순위, Toss TOP_GAINERS 랭킹을 3순위 폴백으로 후보 stock_list를 조회한다 (fail-closed).
+    """Retain scan evidence independently of the candidate selection outcome.
 
     Args:
-        client: KIS data client used for the band fallback.
-        session: HTTP session.
-        universe: Universe bounds for the ranking call.
-        kiwoom_client: Kiwoom vendor client (필수).
-        toss_client: Toss vendor client; Kiwoom·KIS 실패 시 폴백으로 사용된다 (선택,
-            None이면 폴백 없이 Kiwoom 실패 즉시 fail-closed).
-        kis_band_fallback: Kiwoom -> KIS band scan -> Toss top-100; default False keeps the Kiwoom-or-Toss behaviour.
-            Truncation only aborts when the flag is off.
+        client: Existing KIS scan fallback.
+        session: Existing HTTP session.
+        universe: Existing unmodified trading bounds.
+        kiwoom_client: Existing primary scan client.
+        toss_client: Existing narrower ranking fallback.
+        kis_band_fallback: Existing fallback behavior switch.
+        on_page: Observer of raw scan response pages and actual clocks.
 
     Returns:
-        Candidate stock_list in collect.py shape. Toss-sourced rows carry
-        name=None (Toss rankings have no company-name field) and are
-        client-side filtered to [universe.chg_min, universe.chg_max) from at
-        most 100 top-gainer rows, so coverage may be narrower than Kiwoom's
-        dedicated band query during a genuine Kiwoom outage.
+        Existing candidate rows with selection/fallback behavior unchanged.
 
     Raises:
-        UniverseScanCoverageError: kiwoom_client 미주입, 또는 Kiwoom과(toss_client가
-            주입된 경우) Toss 모두 실패 시, 또는 truncated Kiwoom scan
-            (no Toss fallback, which is narrower).
+        UniverseScanCoverageError: Existing incomplete/failed candidate scan.
+        OSError: Required raw scan evidence cannot be persisted.
     """
     if kiwoom_client is None:
         raise UniverseScanCoverageError("kiwoom_client is required for the tradeable candidate list")
@@ -411,6 +453,7 @@ async def fetch_candidate_stock_list(
             session,
             rate_min_pct=universe.chg_min * 100.0,
             rate_max_pct=universe.chg_max * 100.0,
+            on_page=on_page,
         )
     except Exception as e:
         kw_reason = f"kiwoom ranking call failed: {e}"
@@ -430,7 +473,7 @@ async def fetch_candidate_stock_list(
     if kis_band_fallback:
         try:
             kis_rows = await fetch_kis_band_ranking(
-                client, session, rate_min_pct=universe.chg_min * 100.0, rate_max_pct=universe.chg_max * 100.0
+                client, session, rate_min_pct=universe.chg_min * 100.0, rate_max_pct=universe.chg_max * 100.0, on_page=on_page
             )
         except UniverseScanCoverageError as exc:
             logger.warning("[DATA] stage=universe_scan vendor=kis status=FAILED reason=%s", exc)
@@ -441,12 +484,23 @@ async def fetch_candidate_stock_list(
             return out
     if toss_client is None:
         raise UniverseScanCoverageError(kw_reason)
+    started = datetime.now(ZoneInfo("Asia/Seoul"))
     try:
         toss_res = await toss_client.get_rankings(
             session, ranking_type=TOSS_RANKING_TYPE_TOP_GAINERS, market_country="KR", duration="1d", count=100,
         )
     except Exception as e:
         raise UniverseScanCoverageError(f"{kw_reason}; toss ranking call failed: {e}") from e
+    received = datetime.now(ZoneInfo("Asia/Seoul"))
+    _emit_scan_page(
+        on_page,
+        toss_res,
+        {"vendor": "toss", "endpoint": "rankings-top-gainers", "scope": "top100"},
+        started,
+        received,
+        0,
+        0,
+    )
     if "error" in toss_res:
         err = toss_res["error"]
         raise UniverseScanCoverageError(f"{kw_reason}; toss ranking failed code={err.get('code')} msg={err.get('message', '')}")

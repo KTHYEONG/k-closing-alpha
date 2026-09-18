@@ -404,3 +404,247 @@ def test_resolve_host_issued_credentials_dedupes_when_shard_slot_already_a_host_
     slots = [c.slot for c in resolve_host_issued_credentials(env)]
     assert slots == ["DATA_1", "DATA_4", "PRIMARY"]
 
+
+def _research_env() -> dict[str, str]:
+    return {
+        "KIS_DATA_SLOTS": "1,5",
+        "KIS_HOST_DATA_SLOTS": "1",
+        "KIS_DATA_1_APP_KEY": "key1",
+        "KIS_DATA_1_APP_SECRET": "sec1",
+        "KIS_DATA_5_APP_KEY": "key5",
+        "KIS_DATA_5_APP_SECRET": "sec5",
+        "KIS_DATA_5_HTS_ID": "hts5",
+    }
+
+
+def _write_ownership(tmp_path, owners) -> object:
+    import json
+
+    from src.api.kis.key_pool import kis_key_id  # noqa: F401
+
+    _ = kis_key_id
+    doc = {
+        "schema_version": 1,
+        "host_id": "host-a",
+        "verified_at": "2026-09-17T10:00:00+09:00",
+        "credential_owners": owners,
+    }
+    path = tmp_path / "ownership.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+def _owner_entry(slot: str, app_key: str, evidence: dict[str, str] | None = None) -> dict[str, object]:
+    from src.api.kis.key_pool import kis_key_id
+
+    if evidence is None:
+        resolved: dict[str, str] = {"collect.py": "abc123", "auction_capture.py": "def456"}
+    else:
+        resolved = dict(evidence)
+    return {
+        "slot": slot,
+        "key_id": kis_key_id(app_key),
+        "owner": "k-closing-alpha",
+        "purpose": "research",
+        "exclusive": True,
+        "allowed_rest_roles": ["research"],
+        "verified_consumer_config_sha256": resolved,
+    }
+
+
+def test_research_credentials_require_explicit_slot_ownership(tmp_path) -> None:
+    """No implicit fifth-slot ownership without evidence."""
+    import pytest
+
+    from src.api.kis.key_pool import resolve_research_credentials
+
+    env = _research_env()
+    path = _write_ownership(tmp_path, [_owner_entry("DATA_1", "key1")])
+    with pytest.raises(ValueError, match="uncertified ownership") as exc_info:
+        resolve_research_credentials(env, slots=("5",), ownership_path=path)
+    assert "key5" not in str(exc_info.value) and "sec5" not in str(exc_info.value)
+
+
+def test_research_credentials_reject_fingerprint_mismatch(tmp_path) -> None:
+    """Ownership key fingerprint differs from configured key."""
+    import pytest
+
+    from src.api.kis.key_pool import resolve_research_credentials
+
+    env = _research_env()
+    bad = _owner_entry("DATA_5", "key5")
+    bad["key_id"] = "deadbeefcafe"
+    path = _write_ownership(tmp_path, [bad])
+    with pytest.raises(ValueError, match="uncertified ownership"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=path)
+
+
+def test_research_credentials_reject_inconsistent_consumer_evidence(tmp_path) -> None:
+    """Missing audited-consumer hashes invalidate exclusive ownership."""
+    import pytest
+
+    from src.api.kis.key_pool import resolve_research_credentials
+
+    env = _research_env()
+    bad = _owner_entry("DATA_5", "key5", evidence={})
+    path = _write_ownership(tmp_path, [bad])
+    with pytest.raises(ValueError, match="uncertified ownership"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=path)
+
+
+def test_research_credentials_forbid_trade_key_collision(tmp_path) -> None:
+    """Research slot sharing execution app key stays forbidden."""
+    import pytest
+
+    from src.api.kis.key_pool import resolve_research_credentials
+
+    env = {**_research_env(), "KIS_APP_KEY": "key5"}
+    path = _write_ownership(tmp_path, [_owner_entry("DATA_5", "key5")])
+    with pytest.raises(ValueError, match="collides"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=path)
+
+
+def test_research_credentials_return_declared_order(tmp_path) -> None:
+    from src.api.kis.key_pool import resolve_research_credentials
+
+    env = _research_env()
+    path = _write_ownership(tmp_path, [_owner_entry("DATA_1", "key1"), _owner_entry("DATA_5", "key5")])
+    creds = resolve_research_credentials(env, slots=("5", "1"), ownership_path=path)
+    assert [c.slot for c in creds] == ["DATA_5", "DATA_1"]
+    assert creds[0].app_key == "key5"
+
+
+def test_research_credentials_reject_malformed_declarations(tmp_path) -> None:
+    import json
+
+    import pytest
+
+    from src.api.kis.key_pool import resolve_research_credentials
+
+    env = _research_env()
+    good = _write_ownership(tmp_path, [_owner_entry("DATA_5", "key5")])
+    with pytest.raises(ValueError, match="not declared"):
+        resolve_research_credentials({}, slots=("5",), ownership_path=good)
+    with pytest.raises(ValueError, match="not declared"):
+        resolve_research_credentials(env, slots=(), ownership_path=good)
+    with pytest.raises(ValueError, match="duplicate research slot"):
+        resolve_research_credentials(env, slots=("5", "5"), ownership_path=good)
+    with pytest.raises(ValueError, match="invalid research slot"):
+        resolve_research_credentials(env, slots=("0",), ownership_path=good)
+    with pytest.raises(ValueError, match="not in KIS_DATA_SLOTS"):
+        resolve_research_credentials(env, slots=("9",), ownership_path=good)
+    missing = dict(env)
+    del missing["KIS_DATA_5_APP_SECRET"]
+    with pytest.raises(ValueError, match="missing credentials"):
+        resolve_research_credentials(missing, slots=("5",), ownership_path=good)
+    dup = dict(env)
+    dup["KIS_DATA_1_APP_KEY"] = "key5"
+    dup["KIS_DATA_1_APP_SECRET"] = "sec1"
+    with pytest.raises(ValueError, match="duplicate app_key"):
+        resolve_research_credentials(dup, slots=("5", "1"), ownership_path=good)
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="uncertified"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=bad_json)
+    not_dict = tmp_path / "list.json"
+    not_dict.write_text(json.dumps(["x"]), encoding="utf-8")
+    with pytest.raises(ValueError, match="uncertified"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=not_dict)
+
+
+def _write_doc(tmp_path, doc: object, name: str = "doc.json") -> object:
+    import json
+
+    path = tmp_path / name
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+def _base_doc(app_key: str) -> dict[str, object]:
+    from src.api.kis.key_pool import kis_key_id
+
+    return {
+        "schema_version": 1,
+        "host_id": "host-a",
+        "verified_at": "2026-09-17T10:00:00+09:00",
+        "credential_owners": [
+            {
+                "slot": "DATA_5",
+                "key_id": kis_key_id(app_key),
+                "owner": "k-closing-alpha",
+                "purpose": "research",
+                "exclusive": True,
+                "allowed_rest_roles": ["research"],
+                "verified_consumer_config_sha256": {"collect.py": "abc123"},
+            }
+        ],
+    }
+
+
+def test_research_credentials_reject_uncertified_documents(tmp_path) -> None:
+    import pytest
+
+    from src.api.kis.key_pool import resolve_research_credentials
+
+    env = _research_env()
+    doc = _base_doc("key5")
+    assert isinstance(doc, dict)
+    bad_version = dict(doc)
+    bad_version["schema_version"] = 2
+    with pytest.raises(ValueError, match="uncertified"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, bad_version, "v2.json"))
+    bad_host = dict(doc)
+    bad_host["host_id"] = "  "
+    with pytest.raises(ValueError, match="uncertified"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, bad_host, "host.json"))
+    bad_time_type = dict(doc)
+    bad_time_type["verified_at"] = 123
+    with pytest.raises(ValueError, match="uncertified"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, bad_time_type, "t1.json"))
+    bad_time_parse = dict(doc)
+    bad_time_parse["verified_at"] = "not-a-time"
+    with pytest.raises(ValueError, match="uncertified"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, bad_time_parse, "t2.json"))
+    naive_time = dict(doc)
+    naive_time["verified_at"] = "2026-09-17T10:00:00"
+    with pytest.raises(ValueError, match="uncertified"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, naive_time, "t3.json"))
+    bad_owners = dict(doc)
+    bad_owners["credential_owners"] = {"DATA_5": {}}
+    with pytest.raises(ValueError, match="uncertified"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, bad_owners, "o1.json"))
+    bad_item = dict(doc)
+    bad_item["credential_owners"] = ["DATA_5"]
+    with pytest.raises(ValueError, match="uncertified"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, bad_item, "o2.json"))
+
+
+def test_research_credentials_reject_unqualified_entries(tmp_path) -> None:
+    import pytest
+
+    from src.api.kis.key_pool import resolve_research_credentials
+
+    env = _research_env()
+
+    def _doc_with(**fields: object) -> dict[str, object]:
+        base = _base_doc("key5")
+        owners = base["credential_owners"]
+        assert isinstance(owners, list)
+        entry = dict(owners[0])  # type: ignore[arg-type]
+        entry.update(fields)
+        base["credential_owners"] = [entry]
+        return base
+
+    with pytest.raises(ValueError, match="uncertified ownership"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, _doc_with(owner="krx-alpha"), "e1.json"))
+    with pytest.raises(ValueError, match="uncertified ownership"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, _doc_with(purpose="trade"), "e2.json"))
+    with pytest.raises(ValueError, match="uncertified ownership"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, _doc_with(exclusive=False), "e3.json"))
+    with pytest.raises(ValueError, match="uncertified ownership"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, _doc_with(allowed_rest_roles="research"), "e4.json"))
+    with pytest.raises(ValueError, match="uncertified ownership"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, _doc_with(verified_consumer_config_sha256={"": "abc"}), "e5.json"))
+    with pytest.raises(ValueError, match="uncertified ownership"):
+        resolve_research_credentials(env, slots=("5",), ownership_path=_write_doc(tmp_path, _doc_with(verified_consumer_config_sha256={"collect.py": " "}), "e6.json"))
+

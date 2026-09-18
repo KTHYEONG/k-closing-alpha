@@ -153,10 +153,10 @@ def test_fetch_krx_daily_unpublished_partial_and_full(monkeypatch) -> None:
     kosdaq = _krx_raw([{"symbol": "900001", "close": 50, "prev_close": 50}], "KOSDAQ")
 
     def _fetch(kosdaq_frame):
-        return lambda ep, ymd, cfg: kospi if ep == mod.KRX_ENDPOINT_STK_DAILY else kosdaq_frame
+        return lambda ep, ymd, cfg, *, on_page=None: kospi if ep == mod.KRX_ENDPOINT_STK_DAILY else kosdaq_frame
 
     # Given/When/Then: both markets empty -> unpublished (empty), one empty -> partial (raise), both -> concat
-    monkeypatch.setattr(mod, "fetch_krx_openapi_day_strict", lambda ep, ymd, cfg: pd.DataFrame())
+    monkeypatch.setattr(mod, "fetch_krx_openapi_day_strict", lambda ep, ymd, cfg, *, on_page=None: pd.DataFrame())
     assert mod.fetch_krx_daily(pd.Timestamp("2026-09-10"), cfg=None).empty
     monkeypatch.setattr(mod, "fetch_krx_openapi_day_strict", _fetch(pd.DataFrame()))
     with pytest.raises(RuntimeError, match="partial"):
@@ -396,7 +396,7 @@ def _orchestrate_fakes(monkeypatch, published: set[str]):
     }
     calls: list[str] = []
 
-    def _fetch(d, cfg):
+    def _fetch(d, cfg, *, on_page=None):
         key = pd.Timestamp(d).strftime("%Y-%m-%d")
         calls.append(key)
         if key not in published:
@@ -836,3 +836,192 @@ def test_price_ingest_main_runs_growth_shadow_then_t1_attribution_after_ingest(m
 
     # Then
     assert calls == ["ingest", "shadow", "attribution"]
+
+
+def test_fetch_krx_daily_preserves_both_market_payloads(monkeypatch) -> None:
+    """Both market originals are referenced."""
+    import src.daily.price_ingest as mod
+
+    kospi = _krx_raw([{"symbol": "000001", "close": 100, "prev_close": 99}], "KOSPI")
+    kosdaq = _krx_raw([{"symbol": "900001", "close": 50, "prev_close": 50}], "KOSDAQ")
+    seen: list[tuple] = []
+
+    def _strict(ep, ymd, cfg, *, on_page=None):
+        from datetime import datetime
+
+        from src.data.capture_contracts import SEOUL
+
+        payload = {"OutBlock_1": [{"ISU_CD": "x"}], "extra": ep}
+        if on_page is not None:
+            on_page(payload, {"endpoint": ep, "basDd": ymd}, datetime.now(SEOUL), datetime.now(SEOUL), 0, 0)
+        return kospi if ep == mod.KRX_ENDPOINT_STK_DAILY else kosdaq
+
+    monkeypatch.setattr(mod, "fetch_krx_openapi_day_strict", _strict)
+    out = mod.fetch_krx_daily(pd.Timestamp("2026-09-10"), cfg=object(), on_page=lambda *a: seen.append(a))
+
+    assert sorted(out["symbol"]) == ["000001", "900001"]
+    assert {m["endpoint"] for _, m, *_ in seen} == {mod.KRX_ENDPOINT_STK_DAILY, mod.KRX_ENDPOINT_KSQ_DAILY}
+    assert all("extra" in (p or {}) for p, *_ in seen)
+
+
+def test_fetch_krx_daily_partial_market_still_fails(monkeypatch) -> None:
+    """Existing strict gate remains."""
+    import src.daily.price_ingest as mod
+
+    kospi = _krx_raw([{"symbol": "000001", "close": 100, "prev_close": 99}], "KOSPI")
+    seen: list[str] = []
+
+    def _strict(ep, ymd, cfg, *, on_page=None):
+        from datetime import datetime
+
+        from src.data.capture_contracts import SEOUL
+
+        if on_page is not None:
+            on_page({"OutBlock_1": []}, {"endpoint": ep}, datetime.now(SEOUL), datetime.now(SEOUL), 0, 0)
+            seen.append(ep)
+        return kospi if ep == mod.KRX_ENDPOINT_STK_DAILY else pd.DataFrame()
+
+    monkeypatch.setattr(mod, "fetch_krx_openapi_day_strict", _strict)
+    with pytest.raises(RuntimeError, match="partial"):
+        mod.fetch_krx_daily(pd.Timestamp("2026-09-10"), cfg=object(), on_page=lambda *a, **k: None)
+    assert sorted(seen) == sorted([mod.KRX_ENDPOINT_STK_DAILY, mod.KRX_ENDPOINT_KSQ_DAILY])
+
+
+def test_price_capture_root_respects_override(monkeypatch, tmp_path) -> None:
+    """Capture root follows the configured override."""
+    import src.daily.price_ingest as mod
+
+    monkeypatch.setattr(mod.settings, "COLLECTION_ROOT", tmp_path / "cap")
+    assert mod._capture_root() == tmp_path / "cap"
+    monkeypatch.setattr(mod.settings, "COLLECTION_ROOT", None)
+    assert mod._capture_root() == mod.settings.HISTORY_DIR / "capture"
+
+
+def test_run_price_ingest_preserves_unadjusted_rows_before_adjustment(monkeypatch, tmp_path) -> None:
+    """Original prices remain immutable."""
+    import src.daily.price_ingest as mod
+
+    path = tmp_path / "ph.parquet"
+    mod_, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-08", "2026-09-09", "2026-09-10"})
+    _write_panel(path, _panel_rows("000001", [days["2026-09-07"], days["2026-09-08"], days["2026-09-09"]], [10000.0] * 3)
+                 + _panel_rows("000002", [days["2026-09-03"], days["2026-09-04"], days["2026-09-07"]], [20000.0] * 3, volume=100.0))
+    monkeypatch.setattr(mod_, "_capture_root", lambda: tmp_path / "capture")
+    monkeypatch.setattr(mod_.settings, "COLLECTION_RAW_ENABLED", True)
+
+    report = asyncio.run(mod_.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+    ))
+
+    assert report.n_corporate_events >= 1
+    frames = list((tmp_path / "capture").rglob("PRICE-unadjusted.parquet"))
+    assert len(frames) == 1
+    raw = pd.read_parquet(frames[0])
+    kept = raw[(raw["symbol"] == "000002") & (pd.to_datetime(raw["date"]) == days["2026-09-09"])]
+    assert float(kept["close"].iloc[0]) == pytest.approx(21000.0)
+    out = pd.read_parquet(path)
+    adj = out[(out["symbol"].astype(str) == "000002") & (pd.to_datetime(out["date"]) == days["2026-09-09"])]
+    assert float(adj["close"].iloc[0]) == pytest.approx(4200.0)
+    assert list((tmp_path / "capture").rglob("PRICE-adjusted.parquet")) != []
+
+
+def test_run_price_ingest_adjustment_failure_keeps_raw_evidence(monkeypatch, tmp_path) -> None:
+    """Raw observations remain available."""
+    import src.daily.price_ingest as mod
+
+    path = tmp_path / "ph.parquet"
+    mod_, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    monkeypatch.setattr(mod_, "_capture_root", lambda: tmp_path / "capture")
+    monkeypatch.setattr(mod_.settings, "COLLECTION_RAW_ENABLED", True)
+
+    def _boom(panel, new_rows, trading_days):
+        raise RuntimeError("adjust boom")
+
+    monkeypatch.setattr(mod_, "merge_and_adjust", _boom)
+    with pytest.raises(RuntimeError, match="adjust boom"):
+        asyncio.run(mod_.run_price_ingest(
+            today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+            kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+        ))
+    assert list((tmp_path / "capture").rglob("PRICE-unadjusted.parquet")) != []
+
+
+def test_run_price_ingest_receipt_constrains_historical_use(tmp_path) -> None:
+    """Availability is today's receipt."""
+    import hashlib
+    from datetime import date, datetime
+
+    import src.daily.price_ingest as mod
+    from src.data.capture_contracts import SEOUL, ArtifactRef
+    from src.data.capture_store import CaptureStore
+
+    store = CaptureStore(tmp_path / "cap")
+    observer = mod._price_page_observer(store, date(2020, 1, 2), "run-receipt")
+    received = datetime(2026, 9, 17, 9, 0, 1, tzinfo=SEOUL)
+    observer({"OutBlock_1": []}, {"endpoint": "stk", "basDd": "20200102"}, datetime(2026, 9, 17, 9, 0, tzinfo=SEOUL), received, 0, 0)
+    observer(None, {"endpoint": "ksq", "basDd": "20200102"}, datetime(2026, 9, 17, 9, 0, tzinfo=SEOUL), received, 0, 1)
+    files = sorted((tmp_path / "cap").rglob("*.json.gz"))
+    assert len(files) == 2
+    data = files[0].read_bytes()
+    ref = ArtifactRef(path=str(files[0].relative_to(tmp_path / "cap")), sha256=hashlib.sha256(data).hexdigest(), bytes=len(data))
+    envelope = store.read_artifact(ref)
+    assert envelope["context"]["trading_date"] == "2020-01-02"
+    assert envelope["received_at"].startswith("2026-09-17")
+    assert envelope["source_published_at"] is None
+
+
+def test_run_price_ingest_membership_is_observed_only(monkeypatch, tmp_path) -> None:
+    """No inferred historical listing state."""
+    import src.daily.price_ingest as mod
+
+    path = tmp_path / "ph.parquet"
+    mod_, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    monkeypatch.setattr(mod_, "_capture_root", lambda: tmp_path / "capture")
+    monkeypatch.setattr(mod_.settings, "COLLECTION_RAW_ENABLED", True)
+
+    asyncio.run(mod_.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+    ))
+
+    out = pd.read_parquet(path)
+    out["symbol"] = out["symbol"].astype(str)
+    new_dates = set(pd.to_datetime(out[out["symbol"] == "000003"]["date"]).dt.strftime("%Y-%m-%d"))
+    assert new_dates and new_dates <= {"2026-09-08", "2026-09-09", "2026-09-10"}
+
+
+def test_run_price_ingest_skips_capture_when_raw_disabled(monkeypatch, tmp_path) -> None:
+    """Disabled raw mode performs no capture writes."""
+    path = tmp_path / "ph.parquet"
+    mod_, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    monkeypatch.setattr(mod_.settings, "COLLECTION_RAW_ENABLED", False)
+
+    report = asyncio.run(mod_.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+    ))
+
+    assert report.wrote is True
+    assert not (tmp_path / "capture").exists()
+
+
+def test_price_page_observer_capture_failure_propagates(tmp_path) -> None:
+    """Durable observation failure surfaces."""
+    from datetime import datetime
+
+    import src.daily.price_ingest as mod
+    from src.data.capture_contracts import SEOUL, RawCaptureError
+    from src.data.capture_store import CaptureStore
+
+    store = CaptureStore(tmp_path / "cap")
+
+    def _boom(response):
+        raise OSError("disk full")
+
+    store.append_response = _boom  # type: ignore[method-assign]
+    observer = mod._price_page_observer(store, pd.Timestamp("2026-09-10").date(), "run-boom")
+    with pytest.raises(RawCaptureError):
+        observer({"a": 1}, {"endpoint": "stk"}, datetime.now(SEOUL), datetime.now(SEOUL), 0, 0)

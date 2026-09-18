@@ -78,7 +78,7 @@ def test_archive_intraday_main_invokes_run_intraday_archive(monkeypatch) -> None
 
     captured: dict = {}
 
-    def _fake_run(snapshot_date=None):
+    def _fake_run(snapshot_date=None, **kwargs):
         captured["snapshot_date"] = snapshot_date
         return (1, 2, 3)
 
@@ -557,3 +557,701 @@ def test_archive_intraday_builds_client_from_data_account(monkeypatch, tmp_path)
 
     # Then
     assert captured["app_key"] == "data-key"
+
+
+def _raw_profile(tmp_path):
+    from src.config.collection import CollectionSettings
+
+    return CollectionSettings(COLLECTION_ROOT=tmp_path / "cap")
+
+
+def _archive_store(tmp_path):
+    from src.data.capture_store import CaptureStore
+
+    return CaptureStore(tmp_path / "cap")
+
+
+def _publish_cohort(store, snapshot_date, eligible):
+    import datetime as _dt
+
+    from src.data.capture_contracts import (
+        SEOUL as _SEOUL,
+        CaptureContext,
+        CaptureDataset,
+        CaptureManifest,
+        CaptureStatus,
+        Cohort,
+    )
+
+    trading_day = _dt.date.fromisoformat(snapshot_date)
+    cohort = Cohort(
+        trading_date=trading_day,
+        cohort_id=f"c-{snapshot_date}",
+        eligible_symbols=tuple(eligible),
+        scanned_symbols=tuple(eligible),
+        eligibility_rule_version="v1",
+        rejections={},
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=CaptureContext(
+            trading_date=trading_day, run_id="decision-1", dataset=CaptureDataset.SCAN,
+            vendor="owner-local", endpoint="decision-input", symbol=None, venue="KRX",
+            session="regular", capture_reason="test", cohort_id=cohort.cohort_id, scheduled_at=None,
+        ),
+        cohort=cohort,
+        completed_at=_dt.datetime(2026, 9, 1, 15, 34, tzinfo=_SEOUL),
+        entries=(),
+        artifacts=(),
+        status=CaptureStatus.COMPLETE,
+    )
+    store.publish_manifest(manifest)
+    return cohort
+
+
+def _canon_bar_frame(snapshot_date, symbol):
+    import pandas as pd
+
+    from src.data.intraday_schema import normalize_bar_frame
+
+    raw = pd.DataFrame({"time": ["090300"], "open": [70000], "high": [70100], "low": [69900],
+                        "close": [70000], "jdiff_vol": [100], "value": [70]})
+    return normalize_bar_frame(raw, "ls", snapshot_date, symbol)
+
+
+def _empty_bar_frame_for(snapshot_date):
+    import pandas as pd
+
+    from src.data.intraday_schema import normalize_bar_frame
+
+    return normalize_bar_frame(pd.DataFrame(), "ls", snapshot_date, "000000")
+
+
+def _fake_entry(symbol, dataset, session, status, rows=0):
+    from src.data.capture_contracts import CaptureDataset as _Dataset
+    from src.data.capture_contracts import CaptureStatus as _Status
+    from src.data.capture_contracts import CoverageEntry
+
+    _ = _Dataset
+    return CoverageEntry(
+        symbol=symbol, dataset=dataset, venue="KRX", session=session, scheduled_at=None,
+        status=_Status(status), rows=rows, first_event_time=None, last_event_time=None,
+        reason="test-fake", raw_refs=(),
+    )
+
+
+def _archive_fakes(entries_map):
+    seen = {}
+
+    async def _collect(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        seen.setdefault("codes", []).append(list(codes))
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            frame, entry = entries_map[code]
+            on_symbol(code, frame, entry)
+        import pandas as pd
+
+        return pd.DataFrame()
+
+    return _collect, seen
+
+
+def _raw_archive_mocks(monkeypatch, tmp_path, fake_collect):
+    from src.daily import archive_intraday
+
+    monkeypatch.setattr(archive_intraday.settings, "HISTORY_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(archive_intraday.settings, "LS_APP_KEY", "", raising=False)
+    monkeypatch.setattr(archive_intraday.settings, "KIWOM_APP_KEY", "", raising=False)
+    monkeypatch.setattr(archive_intraday.settings, "KIWOOM_APP_KEY", "", raising=False)
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        def create_session(self):
+            return _Session()
+
+        async def ensure_token(self, session):
+            return "tok"
+
+    async def _trading(_client, _session, _date):
+        return True
+
+    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _Client())
+    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
+    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", lambda: None)
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _trading)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", fake_collect)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", fake_collect)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", fake_collect)
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", fake_collect)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", fake_collect)
+
+
+def test_run_archive_uses_calendar_previous_day_cohort(monkeypatch, tmp_path) -> None:
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930", "000660"])
+    _publish_cohort(store, "2026-09-04", ["009900"])
+    entries_map = {
+        code: (_empty_bar_frame_for("2026-09-07"), _fake_entry(code, __import__("src.data.capture_contracts", fromlist=["CaptureDataset"]).CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+        for code in ("005930", "000660", "009900")
+    }
+    fake_collect, seen = _archive_fakes(entries_map)
+    _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+
+    assert result == (0, 0, 0)
+    assert sorted(seen["codes"][0]) == ["000660", "005930", "009900"]
+    manifests = store.read_manifests("2026-09-07")
+    assert len([item for item in manifests if item.context.run_id.startswith("archive-")]) == 5
+
+
+def test_run_archive_ignores_unavailable_external_collector(monkeypatch, tmp_path) -> None:
+    import sys
+
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+    entries_map = {
+        "005930": (_empty_bar_frame_for("2026-09-07"), _fake_entry("005930", __import__("src.data.capture_contracts", fromlist=["CaptureDataset"]).CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN")),
+    }
+    fake_collect, _ = _archive_fakes(entries_map)
+    _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    monkeypatch.setitem(sys.modules, "krx_alpha", None)
+
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+
+    assert result == (0, 0, 0)
+
+
+def test_run_archive_partial_work_reported_degraded(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930", "000660"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+    good_frame = _canon_bar_frame("2026-09-07", "005930")
+    entries_map = {
+        "005930": (good_frame, _fake_entry("005930", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=len(good_frame))),
+        "000660": (_empty_bar_frame_for("2026-09-07"), _fake_entry("000660", CaptureDataset.MINUTE_BARS, "regular", "PARTIAL")),
+    }
+
+    async def _fake_bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            frame, entry = entries_map[code]
+            on_symbol(code, frame, entry)
+        return pd.DataFrame()
+
+    async def _fake_other(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _empty_bar_frame_for(snap_date),
+                      _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    async def _fake_ticks(client, session, codes, snap_date, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _empty_bar_frame_for(snap_date),
+                      _fake_entry(code, CaptureDataset.TRADE_TICKS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _fake_bars)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _fake_other)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _fake_other)
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _fake_other)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _fake_ticks)
+
+    with caplog.at_level(logging.WARNING, logger=archive_intraday.logger.name):
+        result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+
+    assert result[0] == 1
+    assert any("DEGRADED" in rec.message for rec in caplog.records)
+    manifests = store.read_manifests("2026-09-07")
+    bars_manifest = next(item for item in manifests if item.context.run_id == "archive-2026-09-07-regular-bars")
+    assert bars_manifest.status.value == "PARTIAL"
+    assert {item.symbol for item in bars_manifest.entries} == {"005930", "000660"}
+
+
+def test_repair_cli_stages_evidence_without_applying(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    import src.tools.repair_intraday_capture as repair_mod
+    from src.data.intraday_schema import normalize_tick_frame
+
+    monkeypatch.setattr(repair_mod.settings, "HISTORY_DIR", tmp_path, raising=False)
+    part = tmp_path / "intraday" / "ticks" / "regular" / "2026-09" / "2026-09-03.parquet"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    raw = pd.DataFrame({"time": ["090300"], "close": [70000], "jdiff_vol": [5]})
+    normalize_tick_frame(raw, "ls", "2026-09-03", "005930").to_parquet(part, index=False)
+    before = part.read_bytes()
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        async def ensure_token(self, session):
+            return "tok"
+
+    monkeypatch.setattr(repair_mod, "_open_clients", lambda: (_Client(), _Session(), None, None))
+
+    async def _fake_ticks(client, session, codes, snap_date, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _empty_bar_frame_for(snap_date),
+                      _fake_entry(code, __import__("src.data.capture_contracts", fromlist=["CaptureDataset"]).CaptureDataset.TRADE_TICKS, "regular", "PARTIAL"))
+        return pd.DataFrame()
+
+    monkeypatch.setattr("src.backfill.intraday.collector.collect_intraday_trade_ticks", _fake_ticks)
+
+    repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_ticks"])
+
+    assert part.read_bytes() == before
+    report = tmp_path / "capture" / "staging" / "intraday" / "repair-2026-09-03-2026-09-03.json"
+    assert report.exists()
+    import json as _json
+
+    payload = _json.loads(report.read_text())
+    assert payload["attempts"][0]["unresolved"] == "005930"
+
+    import pytest
+
+    with pytest.raises(ValueError, match="range"):
+        repair_mod.main(["--start", "2026-09-05", "--end", "2026-09-03", "--dataset", "regular_ticks"])
+    with pytest.raises(ValueError, match="--dataset"):
+        repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "bogus"])
+    with pytest.raises(ValueError, match="at least one"):
+        repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03"])
+    with pytest.raises(ValueError, match="--max-pages"):
+        repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_ticks", "--max-pages", "0"])
+    with pytest.raises(ValueError, match="aware"):
+        repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_ticks", "--deadline", "2026-09-04T00:00:00"])
+    with pytest.raises(ValueError, match="no symbols"):
+        repair_mod.main(["--start", "2026-09-10", "--end", "2026-09-10", "--dataset", "regular_ticks"])
+
+
+def test_repair_cli_apply_publishes_certified_partition(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    import src.tools.repair_intraday_capture as repair_mod
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.intraday_schema import normalize_tick_frame
+
+    monkeypatch.setattr(repair_mod.settings, "HISTORY_DIR", tmp_path, raising=False)
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        async def ensure_token(self, session):
+            return "tok"
+
+    monkeypatch.setattr(repair_mod, "_open_clients", lambda: (_Client(), _Session(), None, None))
+
+    async def _fake_ticks(client, session, codes, snap_date, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            raw = pd.DataFrame({"time": ["090300"], "close": [71000], "jdiff_vol": [7]})
+            frame = normalize_tick_frame(raw, "ls", snap_date, code)
+            on_symbol(code, frame, _fake_entry(code, CaptureDataset.TRADE_TICKS, "regular", "COMPLETE", rows=len(frame)))
+        return pd.DataFrame()
+
+    monkeypatch.setattr("src.backfill.intraday.collector.collect_intraday_trade_ticks", _fake_ticks)
+
+    repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_ticks",
+                     "--symbol", "005930", "--apply"])
+
+    from src.data import intraday_store
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
+    stored = pd.read_parquet(intraday_store.tick_partition_path("2026-09-03", "regular"))
+    assert len(stored) == 1
+    assert stored.iloc[0]["price"] == 71000
+
+
+def test_run_archive_cohort_and_cli_boundaries(monkeypatch, tmp_path) -> None:
+    import pytest
+
+    from src.daily import archive_intraday
+
+    assert archive_intraday._previous_trading_day("2026-09-07") == "2026-09-04"
+    assert archive_intraday._previous_trading_day("2026-09-08") == "2026-09-07"
+    with pytest.raises(ValueError, match="snapshot_date"):
+        archive_intraday._previous_trading_day("bogus")
+    with pytest.raises(ValueError, match="snapshot_date"):
+        archive_intraday.run_intraday_archive(snapshot_date="bogus", profile=_raw_profile(tmp_path))
+    with pytest.raises(ValueError, match="bar_interval"):
+        archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", bar_interval_minutes=0, profile=_raw_profile(tmp_path))
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    with pytest.raises(FileNotFoundError, match="no qualifying cohort"):
+        archive_intraday.run_intraday_archive(snapshot_date="2026-09-08", profile=_raw_profile(tmp_path))
+    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: [])
+    monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
+    monkeypatch.setattr("sys.argv", ["archive_intraday", "bogus-date"])
+    with pytest.raises(SystemExit) as exc:
+        archive_intraday.main()
+    assert exc.value.code == 2
+    monkeypatch.setattr("sys.argv", ["archive_intraday", "2026-09-08"])
+    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
+    with pytest.raises(SystemExit) as exc:
+        archive_intraday.main()
+    assert exc.value.code == 1
+
+
+def test_run_archive_default_root_paper_and_prev_gap(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    from src import settings as _settings
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    monkeypatch.setattr(_settings, "HISTORY_DIR", tmp_path, raising=False)
+    from src.data.capture_store import CaptureStore as _CaptureStore
+
+    store = _CaptureStore(tmp_path / "capture")
+    _publish_cohort(store, "2026-09-07", ["005930"])
+
+    class _Ledger:
+        def load_open_positions(self):
+            return pd.DataFrame({"symbol": ["099999"]})
+
+    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", lambda *a, **k: _Ledger())
+
+    async def _fake(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _empty_bar_frame_for(snap_date),
+                      _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _fake)
+    profile = _raw_profile(tmp_path).model_copy(update={"COLLECTION_ROOT": None})
+
+    with caplog.at_level(logging.WARNING, logger=archive_intraday.logger.name):
+        result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=profile)
+
+    assert result == (0, 0, 0)
+    assert any("INCOMPLETE" in rec.message for rec in caplog.records)
+
+    def _boom_ledger(*a, **k):
+        raise RuntimeError("ledger down")
+
+    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", _boom_ledger)
+    from src.data.capture_store import CaptureStore as _SecondStore
+
+    _publish_cohort(_SecondStore(tmp_path / "cap2"), "2026-09-07", ["005930"])
+    fallback_profile = _raw_profile(tmp_path).model_copy(update={"COLLECTION_ROOT": tmp_path / "cap2"})
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=fallback_profile)
+    assert result == (0, 0, 0)
+
+
+def test_run_archive_non_trading_day_skips_in_raw_mode(monkeypatch, tmp_path) -> None:
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+
+    async def _never(*args, **kwargs):
+        raise AssertionError("must not collect on non-trading day")
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _never)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _never)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _never)
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _never)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _never)
+
+    async def _not_trading(_client, _session, _date):
+        return False
+
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _not_trading)
+
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+
+    assert result == (0, 0, 0)
+
+
+def test_run_archive_full_complete_and_partial_fragments(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.daily import archive_intraday
+    from src.data import intraday_store
+    from src.data.capture_contracts import CaptureDataset
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930", "000660"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+
+    import datetime as _dt
+
+    from src.data.capture_contracts import SEOUL as _SEOUL, CapturedResponse, CaptureStatus as _CS
+
+    _seed_ctx = __import__("src.data.capture_contracts", fromlist=["CaptureContext"]).CaptureContext(
+        trading_date=_dt.date(2026, 9, 7), run_id="seed", dataset=__import__("src.data.capture_contracts", fromlist=["CaptureDataset"]).CaptureDataset.SCAN,
+        vendor="owner-local", endpoint="seed", symbol=None, venue="KRX", session="regular",
+        capture_reason="seed", cohort_id=None, scheduled_at=None,
+    )
+    _now = _dt.datetime.now(_SEOUL)
+    shared = store.append_response(CapturedResponse(
+        context=_seed_ctx, request_started_at=_now, received_at=_now, payload={"seed": True},
+        status=_CS.COMPLETE, source_timestamp=None, source_published_at=None,
+        page_index=0, attempt_index=0, continuation={}, error_type=None,
+    ))
+
+    def _entry(symbol, dataset, session, status, rows=0, refs=()):
+        from src.data.capture_contracts import CoverageEntry
+
+        return CoverageEntry(
+            symbol=symbol, dataset=dataset, venue="KRX", session=session, scheduled_at=None,
+            status=status, rows=rows, first_event_time=None, last_event_time=None,
+            reason="test-full", raw_refs=tuple(refs),
+        )
+
+    from src.data.capture_contracts import CaptureStatus
+
+    def _tick_frame(symbol):
+        raw = pd.DataFrame({"time": ["090300"], "close": [71000], "jdiff_vol": [7]})
+        from src.data.intraday_schema import normalize_tick_frame
+
+        return normalize_tick_frame(raw, "ls", "2026-09-07", symbol)
+
+    async def _fake_bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            if code == "005930":
+                frame = _canon_bar_frame(snap_date, code)
+                on_symbol(code, frame, _entry(code, CaptureDataset.MINUTE_BARS, "regular", CaptureStatus.COMPLETE, rows=len(frame), refs=[shared]))
+            else:
+                on_symbol(code, _canon_bar_frame(snap_date, code),
+                          _entry(code, CaptureDataset.MINUTE_BARS, "regular", CaptureStatus.PARTIAL, refs=[shared]))
+        return pd.DataFrame()
+
+    def _fake_session_bars_factory(session_tag):
+        async def _fake_session_bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+            on_symbol = kwargs.get("on_symbol")
+            for code in codes:
+                frame = _canon_bar_frame(snap_date, code)
+                on_symbol(code, frame, _entry(code, CaptureDataset.MINUTE_BARS, session_tag, CaptureStatus.COMPLETE, rows=len(frame), refs=[shared]))
+            return pd.DataFrame()
+
+        return _fake_session_bars
+
+    async def _fake_ticks(client, session, codes, snap_date, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            if code == "005930":
+                frame = _tick_frame(code)
+                on_symbol(code, frame, _entry(code, CaptureDataset.TRADE_TICKS, "regular", CaptureStatus.COMPLETE, rows=len(frame), refs=[shared]))
+            else:
+                on_symbol(code, _tick_frame(code),
+                          _entry(code, CaptureDataset.TRADE_TICKS, "regular", CaptureStatus.PARTIAL, refs=[shared]))
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _fake_bars)
+    from src.config.market_session import (
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+        INTRADAY_SESSION_NXT_PREMARKET,
+    )
+
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _fake_session_bars_factory(INTRADAY_SESSION_NXT_AFTERMARKET))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _fake_session_bars_factory(INTRADAY_SESSION_NXT_PREMARKET))
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _fake_session_bars_factory(INTRADAY_SESSION_KRX_AFTERMARKET))
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _fake_ticks)
+
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+
+    assert result == (1, 4, 1)
+    manifests = store.read_manifests("2026-09-07")
+    by_run = {item.context.run_id: item for item in manifests if item.context.run_id.startswith("archive-")}
+    assert by_run["archive-2026-09-07-regular-bars"].status.value == "PARTIAL"
+    assert by_run["archive-2026-09-07-regular-ticks"].status.value == "PARTIAL"
+    assert by_run["archive-2026-09-07-nxt-aftermarket"].status.value == "COMPLETE"
+    stored_ticks = pd.read_parquet(intraday_store.tick_partition_path("2026-09-07", "regular"))
+    assert len(stored_ticks) == 1
+
+
+def test_repair_cli_bars_and_deadline_branches(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    import src.tools.repair_intraday_capture as repair_mod
+    from src.data.intraday_schema import normalize_bar_frame
+
+    monkeypatch.setattr(repair_mod.settings, "HISTORY_DIR", tmp_path, raising=False)
+    part = tmp_path / "intraday" / "1m" / "regular" / "2026-09" / "2026-09-03.parquet"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    raw = pd.DataFrame({"time": ["090300"], "open": [70000], "high": [70100], "low": [69900],
+                        "close": [70000], "jdiff_vol": [100], "value": [70]})
+    normalize_bar_frame(raw, "ls", "2026-09-03", "005930").to_parquet(part, index=False)
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        async def ensure_token(self, session):
+            return "tok"
+
+    monkeypatch.setattr(repair_mod, "_open_clients", lambda: (_Client(), _Session(), None, None))
+
+    async def _fake_bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _empty_bar_frame_for(snap_date),
+                      _fake_entry(code, __import__("src.data.capture_contracts", fromlist=["CaptureDataset"]).CaptureDataset.MINUTE_BARS, "regular", "PARTIAL"))
+        return pd.DataFrame()
+
+    monkeypatch.setattr("src.backfill.intraday.collector.collect_intraday_bars", _fake_bars)
+
+    import pytest
+
+    with pytest.raises(ValueError, match="--start"):
+        repair_mod.main(["--start", "bogus", "--end", "2026-09-03", "--dataset", "regular_bars"])
+    with pytest.raises(ValueError, match="--deadline"):
+        repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_bars",
+                         "--deadline", "bogus"])
+    repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_bars",
+                     "--deadline", "2030-01-01T00:00:00+09:00"])
+    repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_bars",
+                     "--deadline", "2020-01-01T00:00:00+09:00"])
+    import json as _json
+
+    payload = _json.loads((tmp_path / "capture" / "staging" / "intraday" / "repair-2026-09-03-2026-09-03.json").read_text())
+    assert any(item.get("status") == "deadline-exceeded" for item in payload["attempts"])
+
+
+def test_repair_open_clients_constructs(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import src.tools.repair_intraday_capture as repair_mod
+
+    async def _open():
+        client, session_ctx, ls_client, kiwoom_client = repair_mod._open_clients()
+        async with session_ctx:
+            return (client is not None, ls_client, kiwoom_client)
+
+    _, ls_client, _ = asyncio.run(_open())
+    assert ls_client is None or hasattr(ls_client, "get_tick_chart")
+
+
+def test_repair_cli_selection_and_publication_branches(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+    import pytest
+
+    import src.tools.repair_intraday_capture as repair_mod
+    from src.config.collection import CollectionSettings
+
+    monkeypatch.setattr(repair_mod.settings, "HISTORY_DIR", tmp_path, raising=False)
+    assert repair_mod._capture_root(CollectionSettings(COLLECTION_ROOT=tmp_path / "cap-x")) == tmp_path / "cap-x"
+    real_open_clients = repair_mod._open_clients
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        async def ensure_token(self, session):
+            return "tok"
+
+    monkeypatch.setattr(repair_mod, "_open_clients", lambda: (_Client(), _Session(), None, None))
+
+    async def _fake_bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            frame = _canon_bar_frame(snap_date, code)
+            on_symbol(code, frame, _fake_entry(code, __import__("src.data.capture_contracts", fromlist=["CaptureDataset"]).CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=len(frame)))
+        return pd.DataFrame()
+
+    monkeypatch.setattr("src.backfill.intraday.collector.collect_intraday_bars", _fake_bars)
+
+    with pytest.raises(ValueError, match="span"):
+        repair_mod.main(["--start", "2026-01-01", "--end", "2026-03-15", "--dataset", "regular_bars", "--symbol", "005930"])
+    many = []
+    for idx in range(9):
+        many.extend(["--symbol", f"{900000 + idx:06d}"])
+    with pytest.raises(ValueError, match="attempts"):
+        repair_mod.main(["--start", "2026-09-01", "--end", "2026-09-30", "--dataset", "regular_bars",
+                         "--dataset", "regular_ticks", *many])
+    repair_mod.main(["--start", "2020-01-01", "--end", "2020-01-01", "--dataset", "regular_bars",
+                     "--symbol", "005930"])
+    import json as _json
+
+    payload = _json.loads((tmp_path / "capture" / "staging" / "intraday" / "repair-2020-01-01-2020-01-01.json").read_text())
+    assert payload["attempts"][0]["status"] == "unsupported-horizon"
+    repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_bars",
+                     "--symbol", "005930", "--max-pages", "5", "--apply"])
+    from src.data import intraday_store
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
+    stored = pd.read_parquet(intraday_store.intraday_partition_path(1, "2026-09-03", "regular"))
+    assert len(stored) == 1
+
+    async def _boom(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        raise OSError("network down")
+
+    monkeypatch.setattr("src.backfill.intraday.collector.collect_intraday_bars", _boom)
+    with pytest.raises(RuntimeError, match="Repair publication failed"):
+        repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_bars",
+                         "--symbol", "005930"])
+
+    async def _fake_ok(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _canon_bar_frame(snap_date, code),
+                      _fake_entry(code, __import__("src.data.capture_contracts", fromlist=["CaptureDataset"]).CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
+        return pd.DataFrame()
+
+    monkeypatch.setattr("src.backfill.intraday.collector.collect_intraday_bars", _fake_ok)
+    monkeypatch.setattr("src.data.intraday_store.write_intraday_partition", lambda *a, **k: 0)
+    with pytest.raises(RuntimeError, match="verification failed"):
+        repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_bars",
+                         "--symbol", "005930", "--apply"])
+
+    monkeypatch.setattr(repair_mod.settings, "KIWOM_APP_KEY", "", raising=False)
+    monkeypatch.setattr(repair_mod.settings, "KIWOOM_APP_KEY", "", raising=False)
+    monkeypatch.setattr(repair_mod.settings, "LS_APP_KEY", "", raising=False)
+
+    import asyncio as _asyncio
+
+    async def _use_real_open():
+        client, session_ctx, ls_client, kiwoom_client = real_open_clients()
+        assert client is not None
+        assert ls_client is None
+        assert kiwoom_client is None
+        async with session_ctx:
+            return True
+
+    assert _asyncio.run(_use_real_open())
