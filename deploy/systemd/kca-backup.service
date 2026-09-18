@@ -9,5 +9,5 @@ WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts
-ExecStart=/bin/sh -c '%h/.local/bin/rclone copy %h/k-closing-alpha/data gdrive:quant-lake/live/k-closing-alpha/data --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/data/$(date +%%F)'
-ExecStart=/bin/sh -c '%h/.local/bin/rclone copy %h/k-closing-alpha/artifacts gdrive:quant-lake/live/k-closing-alpha/artifacts --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/artifacts/$(date +%%F)'
+ExecStart=/bin/sh -c '%h/.local/bin/rclone copy %h/k-closing-alpha/data gdrive:quant-lake/live/k-closing-alpha/data --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/data/$(date +%%F) --transfers 32 --checkers 32 --fast-list'
+ExecStart=/bin/sh -c '%h/.local/bin/rclone copy %h/k-closing-alpha/artifacts gdrive:quant-lake/live/k-closing-alpha/artifacts --backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/artifacts/$(date +%%F) --transfers 32 --checkers 32 --fast-list'
