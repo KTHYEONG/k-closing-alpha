@@ -27,21 +27,14 @@ def test_capture_root_follows_configured_data_directory(tmp_path: Path) -> None:
     assert settings.COLLECTION_ROOT is None
 
 
-def test_enabled_auctions_require_ownership(tmp_path: Path) -> None:
-    """Enabled auctions require ownership."""
-    with pytest.raises(ValueError, match="declared ownership and research credentials") as exc:
+def test_enabled_auctions_require_research_slots() -> None:
+    """Enabled auctions require declared research slots."""
+    with pytest.raises(ValueError, match="declared research credentials") as exc:
         CollectionSettings(COLLECTION_AUCTION_ENABLED=True, _env_file=None)
     assert "DATA_5" not in str(exc.value)
-    with pytest.raises(ValueError, match="declared ownership and research credentials"):
-        CollectionSettings(
-            COLLECTION_AUCTION_ENABLED=True,
-            COLLECTION_RESEARCH_SLOTS=("1",),
-            _env_file=None,
-        )
     owned = CollectionSettings(
         COLLECTION_AUCTION_ENABLED=True,
         COLLECTION_RESEARCH_SLOTS=("1", "2"),
-        COLLECTION_KEY_OWNERSHIP_PATH=tmp_path / "ownership.json",
         _env_file=None,
     )
     assert owned.COLLECTION_RESEARCH_SLOTS == ("1", "2")
@@ -78,7 +71,6 @@ def test_existing_exports_remain_stable() -> None:
         "COLLECTION_AUCTION_ENABLED",
         "COLLECTION_ALTDATA_ENABLED",
         "COLLECTION_RESEARCH_SLOTS",
-        "COLLECTION_KEY_OWNERSHIP_PATH",
         "COLLECTION_AUCTION_INTERVAL_SECONDS",
         "COLLECTION_REQUEST_TIMEOUT_SECONDS",
         "COLLECTION_CONCURRENCY_PER_KEY",
@@ -147,7 +139,7 @@ def test_verified_exceptional_session_preserved() -> None:
     assert kept.provenance == "verified-notice"
 
 
-def test_legacy_mode_blocks_independent_publication(tmp_path: Path) -> None:
+def test_legacy_mode_blocks_independent_publication() -> None:
     profile = CollectionSettings(_env_file=None)
     assert profile.COLLECTION_RAW_ENABLED is True
     with pytest.raises(ValueError, match="legacy operating mode"):
@@ -155,7 +147,6 @@ def test_legacy_mode_blocks_independent_publication(tmp_path: Path) -> None:
             COLLECTION_RAW_ENABLED=False,
             COLLECTION_AUCTION_ENABLED=True,
             COLLECTION_RESEARCH_SLOTS=("1",),
-            COLLECTION_KEY_OWNERSHIP_PATH=tmp_path / "ownership.json",
             _env_file=None,
         )
     with pytest.raises(ValueError, match="legacy operating mode"):

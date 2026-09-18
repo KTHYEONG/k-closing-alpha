@@ -12,10 +12,6 @@ def _collection_profile(tmp_path, *, raw=True, auction=False, altdata=False):
         "COLLECTION_RESEARCH_SLOTS": ("1",) if auction else (),
         "_env_file": None,
     }
-    if auction:
-        ownership = tmp_path / "ownership.json"
-        ownership.write_text("{}", encoding="utf-8")
-        kwargs["COLLECTION_KEY_OWNERSHIP_PATH"] = ownership
     return CollectionSettings(**kwargs)
 
 

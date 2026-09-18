@@ -14,7 +14,6 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -277,23 +276,18 @@ def resolve_decision_shard_credentials(env: Mapping[str, str]) -> tuple[KisCrede
         )
     return parsed
 
-def resolve_research_credentials(env: Mapping[str, str], *, slots: tuple[str, ...], ownership_path: Path) -> tuple[KisCredential, ...]:
-    """Require explicit research-key ownership before independent acquisition starts.
-
-    Token-cache sharing does not enforce a shared REST or subscription budget.
-    Research must not consume a key assigned to another collector by assumption.
+def resolve_research_credentials(env: Mapping[str, str], *, slots: tuple[str, ...]) -> tuple[KisCredential, ...]:
+    """Resolve independently budgeted research slots, refusing decision/trading overlap.
 
     Args:
         env: Credential source already supplied to this project.
         slots: Explicit configured pool identifiers for research.
-        ownership_path: Verified host ownership evidence document.
 
     Returns:
         Declared unique credentials in stable configured order.
 
     Raises:
-        ValueError: Missing keys, collisions, or uncertified/conflicting ownership.
-        OSError: Ownership evidence cannot be read.
+        ValueError: Missing keys, duplicates, or overlap with trading/decision credentials.
     """
     pool = _parse_slot_list(env.get("KIS_DATA_SLOTS"))
     if pool is None:
@@ -308,6 +302,10 @@ def resolve_research_credentials(env: Mapping[str, str], *, slots: tuple[str, ..
             raise ValueError(f"invalid research slot token: {token}")
         if token not in pool_set:
             raise ValueError(f"research slot DATA_{token} is not in KIS_DATA_SLOTS pool")
+    decision_shards = set(_parse_slot_list(env.get("KIS_DECISION_SHARD_SLOTS")) or [])
+    for token in slots:
+        if token in decision_shards:
+            raise ValueError(f"research slot DATA_{token} overlaps KIS_DECISION_SHARD_SLOTS")
     creds: list[KisCredential] = []
     for token in slots:
         app_key = (env.get(f"KIS_DATA_{token}_APP_KEY") or "").strip()
@@ -325,58 +323,4 @@ def resolve_research_credentials(env: Mapping[str, str], *, slots: tuple[str, ..
         trade_key = (env.get(trade_var) or "").strip()
         if trade_key and trade_key in seen:
             raise ValueError(f"data slot app_key collides with {trade_var}")
-    raw = Path(ownership_path).read_text(encoding="utf-8")
-    try:
-        document: object = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError("uncertified ownership evidence") from exc
-    if not isinstance(document, dict):
-        raise ValueError("uncertified ownership evidence")
-    if document.get("schema_version") != 1:
-        raise ValueError("uncertified ownership evidence")
-    host_id = document.get("host_id")
-    if not isinstance(host_id, str) or not host_id.strip():
-        raise ValueError("uncertified ownership evidence")
-    verified_at = document.get("verified_at")
-    if not isinstance(verified_at, str):
-        raise ValueError("uncertified ownership evidence")
-    try:
-        moment = datetime.fromisoformat(verified_at)
-    except ValueError as exc:
-        raise ValueError("uncertified ownership evidence") from exc
-    if moment.tzinfo is None or moment.utcoffset() is None:
-        raise ValueError("uncertified ownership evidence")
-    owners = document.get("credential_owners")
-    if not isinstance(owners, list):
-        raise ValueError("uncertified ownership evidence")
-    by_slot: dict[str, dict[str, object]] = {}
-    for item in owners:
-        if not isinstance(item, dict):
-            raise ValueError("uncertified ownership evidence")
-        label = item.get("slot")
-        if isinstance(label, str) and label not in by_slot:
-            by_slot[label] = item
-    for cred in creds:
-        entry = by_slot.get(cred.slot)
-        if entry is None:
-            raise ValueError(f"uncertified ownership for slot {cred.slot}")
-        if entry.get("owner") != "k-closing-alpha":
-            raise ValueError(f"uncertified ownership for slot {cred.slot}")
-        if entry.get("purpose") != "research":
-            raise ValueError(f"uncertified ownership for slot {cred.slot}")
-        if entry.get("exclusive") is not True:
-            raise ValueError(f"uncertified ownership for slot {cred.slot}")
-        if entry.get("key_id") != kis_key_id(cred.app_key):
-            raise ValueError(f"uncertified ownership for slot {cred.slot}")
-        roles = entry.get("allowed_rest_roles")
-        if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
-            raise ValueError(f"uncertified ownership for slot {cred.slot}")
-        evidence = entry.get("verified_consumer_config_sha256")
-        if not isinstance(evidence, dict) or not evidence:
-            raise ValueError(f"uncertified ownership for slot {cred.slot}")
-        for name, digest in evidence.items():
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"uncertified ownership for slot {cred.slot}")
-            if not isinstance(digest, str) or not digest.strip():
-                raise ValueError(f"uncertified ownership for slot {cred.slot}")
     return tuple(creds)
