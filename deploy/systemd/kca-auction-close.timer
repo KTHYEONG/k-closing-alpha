@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA optional auction close capture (Mon-Fri 15:21:05 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 15:21:05 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kca-auction-close.service
+
+[Install]
+WantedBy=timers.target

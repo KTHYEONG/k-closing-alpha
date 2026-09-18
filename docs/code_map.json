@@ -395,5 +395,8 @@
   },
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
+  },
+  "src/daily/auction_capture.py": {
+    "testing": "tests/unit/daily/test_auction_capture.py"
   }
 }
