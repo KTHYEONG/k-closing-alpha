@@ -15,6 +15,7 @@ import asyncio
 import functools
 import logging
 import os
+import re
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -201,7 +202,11 @@ def _price_page_observer(store: CaptureStore, trading_day: date, run_id: str) ->
         page_index: int,
         attempt_index: int,
     ) -> None:
-        endpoint = str(dict(meta).get("endpoint", "krx-daily"))
+        # KRX 원본 엔드포인트는 '/svc/apis/...' 형태의 경로라 CaptureContext.endpoint의
+        # path-safe 제약(슬래시 금지)을 위반한다 -- 실측: 2026-09-18 price_ingest가
+        # ValidationError로 크래시. capture_store._raw_rel의 SCAN 새니타이즈와 동일 규칙 적용.
+        raw_endpoint = str(dict(meta).get("endpoint", "krx-daily"))
+        endpoint = re.sub(r"[^A-Za-z0-9_-]+", "-", raw_endpoint).strip("-") or "krx-daily"
         try:
             store.append_response(
                 CapturedResponse(
