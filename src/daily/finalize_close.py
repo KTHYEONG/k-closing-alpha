@@ -135,7 +135,7 @@ def classify_finalize_outcome(
     return RUN_OUTCOME_OK, ""
 
 
-async def fetch_confirmed_quote(client: Any, session: Any, code: str, *, capture_store: CaptureStore | None = None, run_id: str | None = None, cohort_id: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+async def fetch_confirmed_quote(client: Any, session: Any, code: str, *, capture_store: CaptureStore | None = None, run_id: str | None = None, cohort_id: str | None = None, poll_round: int = 0) -> tuple[dict[str, Any], dict[str, Any]]:
     """Retain full close-confirmation responses while preserving the existing gate.
 
     Args:
@@ -145,6 +145,12 @@ async def fetch_confirmed_quote(client: Any, session: Any, code: str, *, capture
         capture_store: Owner-local confirmation evidence store.
         run_id: Confirmation task identity.
         cohort_id: Original decision population reference.
+        poll_round: Zero-based polling-round index within run_close_finalization's
+            while-loop. A symbol that is still pending gets re-fetched on later
+            rounds, and each round's response legitimately differs (price settles
+            toward confirmation) -- recorded as attempt_index so the immutable
+            artifact store sees distinct identities instead of raising a false
+            conflict when round N+1's bytes differ from round N's.
 
     Returns:
         Existing price and orderbook output2 blocks used by the confirmation gate.
@@ -195,7 +201,7 @@ async def fetch_confirmed_quote(client: Any, session: Any, code: str, *, capture
                         source_timestamp=None,
                         source_published_at=None,
                         page_index=0,
-                        attempt_index=0,
+                        attempt_index=poll_round,
                         continuation={},
                         error_type=None,
                     )
@@ -236,6 +242,7 @@ async def run_close_finalization(
     pending = order_pending_by_priority(df, pending, pick_codes)
     n_finalized = 0
     unresolved: list[Any] = []
+    poll_round = 0
     while True:
         now = now_fn()
         # 현재가 TR은 조회 시점 종가만 주므로 과거 스냅샷에 쓰면 다른 날 종가로 덮어쓴다
@@ -251,7 +258,13 @@ async def run_close_finalization(
             if tick.strftime("%H%M%S") > CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS:
                 break  # 행 단위 데드라인 — 데드라인 이후 배치는 시작하지 않는다
             quotes = await asyncio.gather(
-                *(fetch_confirmed_quote(client, session, str(df.at[idx, "종목코드"]), capture_store=capture_store, run_id=run_id, cohort_id=cohort_id) for idx in batch)
+                *(
+                    fetch_confirmed_quote(
+                        client, session, str(df.at[idx, "종목코드"]),
+                        capture_store=capture_store, run_id=run_id, cohort_id=cohort_id, poll_round=poll_round,
+                    )
+                    for idx in batch
+                )
             )
             for idx, (price_output, book_output2) in zip(batch, quotes, strict=True):
                 code = str(df.at[idx, "종목코드"])
@@ -279,6 +292,7 @@ async def run_close_finalization(
         pending = [i for i in pending if i not in confirmed and i not in dropped]
         if not pending:
             break
+        poll_round += 1
         await sleep_fn(retry_interval_seconds)
     if n_finalized >= 1:
         archive.upsert_archive_snapshot(df, snapshot_date=snap)

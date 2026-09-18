@@ -1233,6 +1233,44 @@ def test_rejected_confirmation_keeps_raw_evidence(tmp_path) -> None:
     assert any((envelope.get("payload") or {}).get("output2", {}).get("antc_mkop_cls_code") == "121" for envelope in payloads)
 
 
+def test_fetch_confirmed_quote_second_poll_round_does_not_collide_with_first(tmp_path) -> None:
+    """실측 회귀: 동일 종목이 여러 폴링 라운드를 거치며 시세가 달라지면(미확정→확정),
+    라운드마다 동일한 attempt_index=0으로 남겨 '불변 아티팩트 충돌' ValueError로
+    2026-09-18 종가확정이 크래시하던 버그. 라운드 번호를 attempt_index에 반영해야 한다."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.finalize_close import fetch_confirmed_quote
+    from src.data.capture_store import CaptureStore
+
+    store = CaptureStore(tmp_path / "capture")
+    client = AsyncMock()
+    # Round 0: 아직 종가 미확정(호가 유동)
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "269250"}})
+    client.get_orderbook_snapshot = AsyncMock(return_value={
+        "rt_cd": "0", "output1": {}, "output2": {"antc_mkop_cls_code": "121", "stck_prpr": "269250"},
+    })
+    asyncio.run(
+        fetch_confirmed_quote(client, object(), "012450", capture_store=store, run_id="close-2026-09-18", cohort_id="cohort-x", poll_round=0)
+    )
+
+    # Round 1: 같은 종목, 서로 다른(확정된) 응답 -- 이전 버전은 여기서 ValueError를 던졌다
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "269500"}})
+    client.get_orderbook_snapshot = AsyncMock(return_value={
+        "rt_cd": "0", "output1": {}, "output2": {"antc_mkop_cls_code": "112", "stck_prpr": "269500"},
+    })
+    price_out, book_out2 = asyncio.run(
+        fetch_confirmed_quote(client, object(), "012450", capture_store=store, run_id="close-2026-09-18", cohort_id="cohort-x", poll_round=1)
+    )
+
+    assert price_out["stck_prpr"] == "269500"
+    assert book_out2["antc_mkop_cls_code"] == "112"
+    raws = list((tmp_path / "capture" / "raw").rglob("*012450-p0000-a0*.json.gz"))
+    assert len(raws) == 4
+    assert any(p.name.endswith("-a00.json.gz") for p in raws)
+    assert any(p.name.endswith("-a01.json.gz") for p in raws)
+
+
 def test_confirmation_persistence_failure_records_degraded() -> None:
     """Raw confirmation persistence failure keeps payload and safety checks."""
     import asyncio
