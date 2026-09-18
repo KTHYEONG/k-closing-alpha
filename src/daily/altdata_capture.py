@@ -46,13 +46,17 @@ def _krx_listed_universe(window_end: pd.Timestamp, cfg: AltDataFetchConfig) -> f
     this walks back from window_end until a published day is found. Returns
     None only after exhausting the lookback (e.g. a multi-day holiday cluster),
     leaving the caller's symbol-scoped panels to skip that date.
+
+    ETN/ELW/non-6-digit codes are dropped: AltDataFetchConfig.universe_symbols
+    requires plain 6-digit tickers, and these alt-data endpoints are scoped to
+    common stock, not derivative/ETN listings.
     """
     for offset in range(_UNIVERSE_LOOKBACK_DAYS):
         candidate = window_end - pd.Timedelta(days=offset)
         frame = fetch_krx_daily(candidate, cfg)
         if frame.empty:
             continue
-        symbols = {str(s).strip() for s in frame["symbol"].astype(str).tolist() if str(s).strip()}
+        symbols = {s for s in frame["symbol"].astype(str).str.strip().tolist() if len(s) == 6 and s.isdigit()}
         if symbols:
             return frozenset(symbols)
     return None
