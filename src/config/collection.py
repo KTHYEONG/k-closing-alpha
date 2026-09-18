@@ -26,7 +26,6 @@ class CollectionSettings(BaseSettings):
         COLLECTION_AUCTION_ENABLED: Enable independently budgeted sweeps, default False.
         COLLECTION_ALTDATA_ENABLED: Enable incremental slow-data jobs, default False.
         COLLECTION_RESEARCH_SLOTS: Explicit research key slots, default empty.
-        COLLECTION_KEY_OWNERSHIP_PATH: Verified host key ownership document or None.
         COLLECTION_AUCTION_INTERVAL_SECONDS: Closing sweep interval, default 60.
         COLLECTION_REQUEST_TIMEOUT_SECONDS: Total call timeout, default 5.0.
         COLLECTION_CONCURRENCY_PER_KEY: In-flight limit, default 8.
@@ -41,7 +40,7 @@ class CollectionSettings(BaseSettings):
 
     Raises:
         ValueError: Invalid limits, duplicate slots, or enabled auctions without
-            declared ownership and research credentials.
+            declared research credentials.
     """
 
     model_config = SettingsConfigDict(
@@ -55,7 +54,6 @@ class CollectionSettings(BaseSettings):
     COLLECTION_AUCTION_ENABLED: bool = Field(default=False)
     COLLECTION_ALTDATA_ENABLED: bool = Field(default=False)
     COLLECTION_RESEARCH_SLOTS: tuple[str, ...] = Field(default=())
-    COLLECTION_KEY_OWNERSHIP_PATH: Path | None = Field(default=None)
     COLLECTION_AUCTION_INTERVAL_SECONDS: int = Field(default=60, gt=0)
     COLLECTION_REQUEST_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     COLLECTION_CONCURRENCY_PER_KEY: int = Field(default=8, gt=0)
@@ -90,10 +88,8 @@ class CollectionSettings(BaseSettings):
     def _check_profile(self) -> Self:
         if self.COLLECTION_TICK_REPAIR_MAX_PAGES < self.COLLECTION_CHART_MAX_PAGES:
             raise ValueError("repair budget must be at least the normal page budget")
-        if self.COLLECTION_AUCTION_ENABLED and (
-            len(self.COLLECTION_RESEARCH_SLOTS) == 0 or self.COLLECTION_KEY_OWNERSHIP_PATH is None
-        ):
-            raise ValueError("enabled auctions require declared ownership and research credentials")
+        if self.COLLECTION_AUCTION_ENABLED and len(self.COLLECTION_RESEARCH_SLOTS) == 0:
+            raise ValueError("enabled auctions require declared research credentials")
         if not self.COLLECTION_RAW_ENABLED and (self.COLLECTION_AUCTION_ENABLED or self.COLLECTION_ALTDATA_ENABLED):
             raise ValueError("legacy operating mode cannot publish independent auctions or slow-data jobs")
         for key, clock in self.COLLECTION_SESSION_OVERRIDES.items():

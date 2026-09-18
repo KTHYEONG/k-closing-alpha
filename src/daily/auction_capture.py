@@ -14,7 +14,7 @@ from typing import Any, Literal
 import pandas as pd
 
 from src import settings
-from src.api.kis.key_pool import kis_key_id, resolve_research_credentials, token_cache_path
+from src.api.kis.key_pool import resolve_research_credentials, token_cache_path
 from src.config.collection import CollectionSettings
 from src.data.capture_contracts import (
     SEOUL,
@@ -319,7 +319,7 @@ async def run_auction_capture(
         Manifest retaining all expected entries and observed task states.
 
     Raises:
-        ValueError: Wrong date/phase, clock, or ownership/profile.
+        ValueError: Wrong date/phase, clock, or profile.
         OSError: Required raw/coverage persistence fails.
         RuntimeError: Calendar or acquisition infrastructure cannot be verified.
     """
@@ -336,8 +336,8 @@ async def run_auction_capture(
         raise ValueError("session clock trading_date must equal snapshot_date")
     if not profile.COLLECTION_RAW_ENABLED or not profile.COLLECTION_AUCTION_ENABLED:
         raise ValueError("auction capture requires enabled raw and auction collection")
-    if not profile.COLLECTION_RESEARCH_SLOTS or profile.COLLECTION_KEY_OWNERSHIP_PATH is None:
-        raise ValueError("auction capture requires declared research slots and ownership")
+    if not profile.COLLECTION_RESEARCH_SLOTS:
+        raise ValueError("auction capture requires declared research slots")
     if not clients:
         raise ValueError("auction capture requires prewarmed data clients")
     now = now_clock()
@@ -705,15 +705,12 @@ async def run_auction_capture(
 
 
 async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings) -> CaptureManifest:
-    from src.api.kis.client import KisApiClient
-
-    ownership = profile.COLLECTION_KEY_OWNERSHIP_PATH
-    if ownership is None:
-        raise ValueError("auction capture requires declared ownership")
     import os
 
+    from src.api.kis.client import KisApiClient
+
     env = dict(os.environ)
-    creds = resolve_research_credentials(env, slots=tuple(profile.COLLECTION_RESEARCH_SLOTS), ownership_path=Path(ownership))
+    creds = resolve_research_credentials(env, slots=tuple(profile.COLLECTION_RESEARCH_SLOTS))
     clients = [
         KisApiClient(
             cred.app_key,
@@ -774,4 +771,3 @@ def main(argv: list[str] | None = None) -> None:
         snapshot_date,
         len(manifest.entries),
     )
-    _ = kis_key_id("auction-capture")

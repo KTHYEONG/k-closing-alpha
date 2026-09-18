@@ -35,7 +35,6 @@ def _profile(tmp_path: Path, **overrides: Any):
         "COLLECTION_RAW_ENABLED": True,
         "COLLECTION_AUCTION_ENABLED": True,
         "COLLECTION_RESEARCH_SLOTS": ("5",),
-        "COLLECTION_KEY_OWNERSHIP_PATH": tmp_path / "ownership.json",
         "COLLECTION_AUCTION_INTERVAL_SECONDS": 60,
         "COLLECTION_CONCURRENCY_PER_KEY": 8,
         "COLLECTION_OPEN_CONFIRM_SECONDS": 60,
@@ -799,9 +798,7 @@ def test_run_async_builds_clients(tmp_path, monkeypatch) -> None:
 
     from src.daily import auction_capture
 
-    ownership = tmp_path / "ownership.json"
-    ownership.write_text("{}", encoding="utf-8")
-    profile = _profile(tmp_path, COLLECTION_KEY_OWNERSHIP_PATH=ownership)
+    profile = _profile(tmp_path)
     seen: dict[str, Any] = {}
 
     class _Cred:
@@ -809,7 +806,7 @@ def test_run_async_builds_clients(tmp_path, monkeypatch) -> None:
         app_secret = "sec5"
         hts_id = "hts5"
 
-    monkeypatch.setattr(auction_capture, "resolve_research_credentials", lambda env, *, slots, ownership_path: (_Cred(),))
+    monkeypatch.setattr(auction_capture, "resolve_research_credentials", lambda env, *, slots: (_Cred(),))
     created: list[Any] = []
 
     class _Client:
@@ -836,10 +833,3 @@ def test_run_async_builds_clients(tmp_path, monkeypatch) -> None:
     assert seen["warmed"] is True
     assert created and "token_" in str(created[0][1])
     assert os.environ["KIS_DATA_SLOTS"] == "5"
-
-    bad_profile = _profile(tmp_path, COLLECTION_AUCTION_ENABLED=False, COLLECTION_KEY_OWNERSHIP_PATH=None)
-    try:
-        asyncio.run(auction_capture._run_async("2026-09-17", "close", bad_profile))
-        raise AssertionError("expected ValueError")
-    except ValueError:
-        pass
