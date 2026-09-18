@@ -971,6 +971,35 @@ def test_run_price_ingest_receipt_constrains_historical_use(tmp_path) -> None:
     assert envelope["source_published_at"] is None
 
 
+def test_price_page_observer_sanitizes_raw_krx_endpoint_path(tmp_path) -> None:
+    """실측 회귀: KRX_ENDPOINT_STK_DAILY 같은 실제 엔드포인트는 '/svc/apis/...' 형태라
+    CaptureContext.endpoint의 path-safe 제약(슬래시 금지)을 위반해 ValidationError로
+    price_ingest 전체가 크래시했다(2026-09-18 실측: kca-price-ingest 실패)."""
+    import hashlib
+    from datetime import date, datetime
+
+    from src.backfill.altdata.krx_api import KRX_ENDPOINT_STK_DAILY
+    from src.data.capture_contracts import SEOUL, ArtifactRef
+    from src.data.capture_store import CaptureStore
+    import src.daily.price_ingest as mod
+
+    store = CaptureStore(tmp_path / "cap")
+    observer = mod._price_page_observer(store, date(2026, 9, 18), "run-sanitize")
+
+    observer(
+        {"OutBlock_1": []}, {"endpoint": KRX_ENDPOINT_STK_DAILY, "basDd": "20260918"},
+        datetime(2026, 9, 18, 20, 30, tzinfo=SEOUL), datetime(2026, 9, 18, 20, 30, 1, tzinfo=SEOUL), 0, 0,
+    )
+
+    files = sorted((tmp_path / "cap").rglob("*.json.gz"))
+    assert len(files) == 1
+    data = files[0].read_bytes()
+    ref = ArtifactRef(path=str(files[0].relative_to(tmp_path / "cap")), sha256=hashlib.sha256(data).hexdigest(), bytes=len(data))
+    envelope = store.read_artifact(ref)
+    assert "/" not in envelope["context"]["endpoint"]
+    assert envelope["context"]["endpoint"] == "svc-apis-sto-stk_bydd_trd"
+
+
 def test_run_price_ingest_membership_is_observed_only(monkeypatch, tmp_path) -> None:
     """No inferred historical listing state."""
     import src.daily.price_ingest as mod
