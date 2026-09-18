@@ -35,18 +35,27 @@ def _rolling_bounds(trading_day: date, lookback_days: int) -> tuple[pd.Timestamp
     return start, end
 
 
-def _krx_listed_universe(window_end: pd.Timestamp, cfg: AltDataFetchConfig) -> frozenset[str] | None:
-    """Fetch the full KRX-listed symbol set for window_end (no screen/trade bias).
+_UNIVERSE_LOOKBACK_DAYS: int = 7
 
-    Returns None on a non-trading day (both markets publish zero rows), leaving
-    the caller's symbol-scoped panels to skip that date rather than fabricate
-    a universe.
+
+def _krx_listed_universe(window_end: pd.Timestamp, cfg: AltDataFetchConfig) -> frozenset[str] | None:
+    """Fetch the most recently published full KRX-listed symbol set (no screen/trade bias).
+
+    KRX's daily open API publishes a trading date's rows with a settlement lag
+    (same-day queries for the run date itself observably return zero rows), so
+    this walks back from window_end until a published day is found. Returns
+    None only after exhausting the lookback (e.g. a multi-day holiday cluster),
+    leaving the caller's symbol-scoped panels to skip that date.
     """
-    frame = fetch_krx_daily(window_end, cfg)
-    if frame.empty:
-        return None
-    symbols = {str(s).strip() for s in frame["symbol"].astype(str).tolist() if str(s).strip()}
-    return frozenset(symbols) if symbols else None
+    for offset in range(_UNIVERSE_LOOKBACK_DAYS):
+        candidate = window_end - pd.Timedelta(days=offset)
+        frame = fetch_krx_daily(candidate, cfg)
+        if frame.empty:
+            continue
+        symbols = {str(s).strip() for s in frame["symbol"].astype(str).tolist() if str(s).strip()}
+        if symbols:
+            return frozenset(symbols)
+    return None
 
 
 def run_altdata_capture(trading_date: date, *, profile: CollectionSettings, store: CaptureStore, cfg: AltDataFetchConfig) -> CaptureManifest:
