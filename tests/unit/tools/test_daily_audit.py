@@ -1,6 +1,249 @@
 from __future__ import annotations
 
 
+def _collection_profile(tmp_path, *, raw=True, auction=False, altdata=False):
+    from src.config.collection import CollectionSettings
+
+    kwargs: dict = {
+        "COLLECTION_ROOT": tmp_path / "capture",
+        "COLLECTION_RAW_ENABLED": raw,
+        "COLLECTION_AUCTION_ENABLED": auction,
+        "COLLECTION_ALTDATA_ENABLED": altdata,
+        "COLLECTION_RESEARCH_SLOTS": ("1",) if auction else (),
+        "_env_file": None,
+    }
+    if auction:
+        ownership = tmp_path / "ownership.json"
+        ownership.write_text("{}", encoding="utf-8")
+        kwargs["COLLECTION_KEY_OWNERSHIP_PATH"] = ownership
+    return CollectionSettings(**kwargs)
+
+
+def _session_clock(day):
+    from datetime import date
+
+    from src.data.capture_contracts import SessionClock
+
+    return SessionClock.standard(date.fromisoformat(day))
+
+
+def _audit_moment(day, clock="20:15:00"):
+    from datetime import datetime
+
+    return datetime.fromisoformat(f"{day}T{clock}+09:00")
+
+
+def _capture_context(day, run_id, dataset, reason, session="regular"):
+    from datetime import date
+
+    from src.data.capture_contracts import CaptureContext
+
+    return CaptureContext(
+        trading_date=date.fromisoformat(day),
+        run_id=run_id,
+        dataset=dataset,
+        vendor="kis",
+        endpoint="test-endpoint",
+        symbol=None,
+        venue="KRX",
+        session=session,
+        capture_reason=reason,
+        cohort_id=None,
+        scheduled_at=None,
+    )
+
+
+def _publish_cohort_decision(store, day, eligible, *, run_id="run-decision", admitted=None):
+    from datetime import date, datetime
+
+    import pandas as pd
+
+    from src.data.capture_contracts import build_cohort
+
+    trading_day = date.fromisoformat(day)
+    rejected = {} if "999999" in eligible else {"999999": "out_of_band"}
+    cohort = build_cohort(
+        trading_day, [*eligible, *rejected], list(eligible), rejected, eligibility_rule_version="v1"
+    )
+    flags = list(admitted) if admitted is not None else [True] * len(eligible)
+    stamp = datetime.fromisoformat(f"{day}T15:19:00+09:00")
+    frame = pd.DataFrame(
+        {
+            "symbol": list(eligible),
+            "admitted": flags,
+            "snapshot_timestamp": [stamp] * len(eligible),
+            "feature_available_timestamp": [stamp] * len(eligible),
+        }
+    )
+    store.publish_decision(
+        frame,
+        cohort=cohort,
+        run_id=run_id,
+        completed_at=datetime.fromisoformat(f"{day}T15:20:00+09:00"),
+        entries=(),
+    )
+    return cohort
+
+
+def _publish_chart_manifest(
+    store,
+    day,
+    run_id,
+    dataset,
+    symbols,
+    *,
+    status=None,
+    reason="exhausted:regular=10",
+    first_time="09:00:00",
+    last_time="15:30:00",
+):
+    from datetime import datetime
+
+    from src.data.capture_contracts import CaptureManifest, CaptureStatus, CoverageEntry
+
+    first = datetime.fromisoformat(f"{day}T{first_time}+09:00")
+    last = datetime.fromisoformat(f"{day}T{last_time}+09:00")
+    entries = [
+        CoverageEntry(
+            symbol=symbol,
+            dataset=dataset,
+            venue="KRX",
+            session="regular",
+            scheduled_at=None,
+            status=status or CaptureStatus.COMPLETE,
+            rows=10,
+            first_event_time=first,
+            last_event_time=last,
+            reason=reason,
+            raw_refs=(),
+        )
+        for symbol in symbols
+    ]
+    manifest_status = (
+        CaptureStatus.COMPLETE
+        if all(e.status == CaptureStatus.COMPLETE for e in entries)
+        else CaptureStatus.PARTIAL
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, run_id, dataset, f"intraday-{dataset.value.lower()}"),
+        cohort=None,
+        completed_at=datetime.fromisoformat(f"{day}T19:00:00+09:00"),
+        entries=tuple(entries),
+        artifacts=(),
+        status=manifest_status,
+    )
+    return store.publish_manifest(manifest)
+
+
+def _publish_slow_manifest(store, day, run_id, *, status):
+    from datetime import datetime
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest
+
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, run_id, CaptureDataset.SHORTING, "altdata-backfill"),
+        cohort=None,
+        completed_at=datetime.fromisoformat(f"{day}T21:40:00+09:00"),
+        entries=(),
+        artifacts=(),
+        status=status,
+    )
+    return store.publish_manifest(manifest)
+
+
+def _publish_auction_close(store, day, run_id, symbols, *, clock, interval=60):
+    from datetime import datetime
+
+    from src.daily.auction_capture import _close_rounds, _program_rounds
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus, CoverageEntry
+
+    rounds = [(slot, CaptureDataset.ORDERBOOK) for slot in _close_rounds(clock, interval)]
+    rounds.extend((slot, CaptureDataset.PROGRAM) for slot in _program_rounds(clock))
+    entries = [
+        CoverageEntry(
+            symbol=symbol,
+            dataset=dataset,
+            venue="KRX",
+            session="regular",
+            scheduled_at=slot,
+            status=CaptureStatus.COMPLETE,
+            rows=1,
+            first_event_time=slot,
+            last_event_time=slot,
+            reason="auction-close",
+            raw_refs=(),
+        )
+        for symbol in symbols
+        for slot, dataset in rounds
+    ]
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, run_id, CaptureDataset.ORDERBOOK, "auction-close"),
+        cohort=None,
+        completed_at=datetime.fromisoformat(f"{day}T15:40:00+09:00"),
+        entries=tuple(entries),
+        artifacts=(),
+        status=CaptureStatus.COMPLETE,
+    )
+    return store.publish_manifest(manifest)
+
+
+def _publish_auction_open(store, day, run_id, symbols, *, clock, status=None):
+    from datetime import datetime, timedelta
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus, CoverageEntry
+
+    floor = clock.open_at + timedelta(seconds=30)
+    entries = [
+        CoverageEntry(
+            symbol=symbol,
+            dataset=CaptureDataset.PRICE,
+            venue="KRX",
+            session="regular",
+            scheduled_at=floor,
+            status=status or CaptureStatus.COMPLETE,
+            rows=1,
+            first_event_time=floor,
+            last_event_time=floor,
+            reason="auction-open",
+            raw_refs=(),
+        )
+        for symbol in symbols
+    ]
+    manifest_status = (
+        CaptureStatus.COMPLETE
+        if all(e.status == CaptureStatus.COMPLETE for e in entries)
+        else CaptureStatus.PARTIAL
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, run_id, CaptureDataset.PRICE, "auction-open"),
+        cohort=None,
+        completed_at=datetime.fromisoformat(f"{day}T09:05:00+09:00"),
+        entries=tuple(entries),
+        artifacts=(),
+        status=manifest_status,
+    )
+    return store.publish_manifest(manifest)
+
+
+def _audit(store, day, profile, clock, moment):
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    return daily_audit.audit_collection_manifests(
+        date.fromisoformat(day),
+        store=store,
+        profile=profile,
+        session_clock=clock,
+        audit_at=moment,
+    )
+
+
 def test_systemd_units_encode_persistence_and_timezone_policy() -> None:
     from pathlib import Path
 
@@ -343,7 +586,7 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
     ) is None
     assert sent == [] and audited == []
 
-    # And: 평일 휴장일은 감사 없이 휴장일 요약 1통
+    # And: 평일 휴장일(정상)은 요약 발송 스킵
     subject = daily_audit.run_daily_audit(
         "2026-09-24",
         trading_day_fn=lambda _d: False,
@@ -352,9 +595,9 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         dispatch_fn=_dispatch,
     )
     assert subject == "[KCA] 2026-09-24 휴장일 SKIP"
-    assert audited == [] and len(sent) == 1
+    assert audited == [] and len(sent) == 0
 
-    # And: 거래일은 감사 후 요약 1통
+    # And: 거래일 정상 동작(OK)은 요약 발송 스킵
     subject = daily_audit.run_daily_audit(
         "2026-09-14",
         trading_day_fn=lambda _d: True,
@@ -363,7 +606,20 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         dispatch_fn=_dispatch,
     )
     assert subject == "[KCA] 2026-09-14 일일점검 OK"
-    assert audited == ["2026-09-14"] and len(sent) == 2
+    assert audited == ["2026-09-14"] and len(sent) == 0
+
+    # And: 경고 발생 시에는 요약 발송
+    subject = daily_audit.run_daily_audit(
+        "2026-09-15",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=lambda: ["kca-predict.service"],
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+    )
+    assert "경고" in subject
+    assert len(sent) == 1
+    assert sent[0][0] == subject
+
 
 
 def test_audit_decision_requires_topk_or_predict_ok_outcome(monkeypatch, tmp_path) -> None:
@@ -454,3 +710,667 @@ def test_audit_daily_completeness_flags_stale_open_position(monkeypatch, tmp_pat
 
     # Then: 당일 진입 로트만 남아 있으면 정상
     assert healthy["paper_exit"] is True
+
+
+def test_audit_collection_uses_whole_candidate_denominator(tmp_path) -> None:
+    """454 defines coverage."""
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    eligible = [f"{i:06d}" for i in range(1, 455)]
+    _publish_cohort_decision(store, day, eligible, admitted=[i <= 30 for i in range(1, 455)])
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, eligible[:30])
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then: admitted 30이 아니라 eligible 454이 분모다
+    assert "collection:charts:424:missing_entries" in issues
+    assert "collection:ticks:454:missing_entries" in issues
+
+
+def test_audit_collection_reports_partial_chart_as_incomplete(tmp_path) -> None:
+    """Incompleteness is reported."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(
+        store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"],
+        status=CaptureStatus.PARTIAL, reason="incomplete:capped",
+    )
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then: 파일 존재가 아니라 터미널 상태로 판정한다
+    assert "collection:charts:1:incomplete_entries" in issues
+    assert not any("terminal_proof_missing" in issue for issue in issues)
+
+
+def test_audit_collection_accepts_duplicate_tick_events(tmp_path) -> None:
+    """No event deduplication assumption."""
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"])
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    pending = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, "run-pending", CaptureDataset.MINUTE_BARS, "intraday-minute_bars"),
+        cohort=None,
+        completed_at=_audit_moment(day, "19:00:00"),
+        entries=(),
+        artifacts=(),
+        status=CaptureStatus.PENDING,
+    )
+    store.publish_manifest(pending)
+
+    # When: 동일 이벤트가 중복 적재돼도(행 수준 중복) 커버리지는 정상이다
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then
+    assert not any(issue.startswith("collection:ticks") for issue in issues)
+    assert not any(issue.startswith("collection:charts") for issue in issues)
+
+
+def test_audit_collection_exposes_wrong_session_event(tmp_path) -> None:
+    """Venue/session violation is reported."""
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930", "000660"])
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930", "000660"])
+    _publish_chart_manifest(
+        store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"], last_time="20:00:00"
+    )
+    _publish_chart_manifest(
+        store, day, "run-ticks-early", CaptureDataset.TRADE_TICKS, ["000660"], first_time="08:00:00"
+    )
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then: 정규 세션 파일을 벗어난 20:00 이벤트와 이른 08:00 이벤트가 드러난다
+    assert "collection:ticks:2:session_violation" in issues
+
+
+def test_audit_collection_requires_chart_terminal_proof(tmp_path) -> None:
+    """Terminal proof is required."""
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(
+        store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"], reason="capped:regular=5"
+    )
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"])
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then
+    assert "collection:charts:1:terminal_proof_missing" in issues
+
+
+def test_audit_collection_reports_tampered_decision_evidence(tmp_path) -> None:
+    """Integrity failure is reported."""
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+
+    # Given: 불변 결정 산출물이 사후 변경됐다
+    inputs = list((tmp_path / "capture").rglob("input.parquet"))
+    assert len(inputs) == 1
+    with open(inputs[0], "ab") as handle:
+        handle.write(b"\x00")
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then
+    assert "collection:manifest:1:unreadable_evidence" in issues
+
+
+def test_audit_collection_keeps_future_slow_data_pending(tmp_path) -> None:
+    """Future task is not failed."""
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+
+    # When: 20:15 감사는 21:35 슬로우데이터를 실패로 단정하지 않는다
+    issues = _audit(
+        store, day, _collection_profile(tmp_path, altdata=True), _session_clock(day), _audit_moment(day)
+    )
+
+    # Then
+    assert not any(issue.startswith("collection:slow_data") for issue in issues)
+
+
+def test_audit_collection_reports_overdue_slow_data_run(tmp_path) -> None:
+    """Missing run is reported."""
+    from src.data.capture_store import CaptureStore
+
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, "2026-09-17", ["005930"])
+
+    # When: 다음날 감사가 전날 밤 due였던 실행의 부재를 본다
+    issues = _audit(
+        store,
+        "2026-09-17",
+        _collection_profile(tmp_path, altdata=True),
+        _session_clock("2026-09-17"),
+        _audit_moment("2026-09-18"),
+    )
+
+    # Then
+    assert "collection:slow_data:1:missing_run" in issues
+
+
+def test_audit_collection_reports_incomplete_slow_data_run(tmp_path) -> None:
+    """Partial slow-data acquisition is reported."""
+    from src.data.capture_contracts import CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_slow_manifest(store, day, "run-slow", status=CaptureStatus.PARTIAL)
+
+    # When
+    issues = _audit(
+        store,
+        day,
+        _collection_profile(tmp_path, altdata=True),
+        _session_clock(day),
+        _audit_moment("2026-09-18", "22:00:00"),
+    )
+
+    # Then
+    assert "collection:slow_data:1:incomplete_run" in issues
+
+
+def test_audit_collection_marks_disabled_jobs_explicitly(tmp_path) -> None:
+    """Disabled is distinct from success."""
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"])
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then: 비활성 작업은 성공으로 보이지 않고 명시된다
+    assert "collection:auction:0:disabled" in issues
+    assert "collection:slow_data:0:disabled" in issues
+    assert "COMPLETE" not in " ".join(issues)
+
+
+def test_audit_collection_rejects_inconsistent_date_and_naive_cutoff(tmp_path) -> None:
+    """Inconsistent date or naive audit cutoff."""
+    from datetime import date, datetime
+
+    import pytest
+
+    from src.data.capture_store import CaptureStore
+    from src.tools import daily_audit
+
+    store = CaptureStore(tmp_path / "capture")
+    profile = _collection_profile(tmp_path)
+    clock = _session_clock("2026-09-18")
+
+    with pytest.raises(ValueError, match="trading_date"):
+        daily_audit.audit_collection_manifests(
+            date.fromisoformat("2026-09-17"),
+            store=store,
+            profile=profile,
+            session_clock=clock,
+            audit_at=_audit_moment("2026-09-18"),
+        )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        daily_audit.audit_collection_manifests(
+            date.fromisoformat("2026-09-18"),
+            store=store,
+            profile=profile,
+            session_clock=clock,
+            audit_at=datetime.fromisoformat("2026-09-18T20:15:00"),
+        )
+
+
+def test_audit_collection_reports_legacy_mode_without_provenance(tmp_path) -> None:
+    """Raw-disabled legacy mode has explicit provenance-unavailable issues."""
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+
+    # When
+    issues = _audit(
+        store, day, _collection_profile(tmp_path, raw=False), _session_clock(day), _audit_moment(day)
+    )
+
+    # Then
+    assert issues == ("collection:provenance:0:raw_disabled",)
+
+
+def test_audit_collection_reports_missing_decision_input(tmp_path) -> None:
+    """Partial decision publication without qualifying input is reported."""
+    from datetime import date, datetime
+
+    import pandas as pd
+
+    from src.data.capture_contracts import (
+        CaptureDataset,
+        CaptureStatus,
+        CoverageEntry,
+        build_cohort,
+    )
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    cohort = build_cohort(
+        date.fromisoformat(day),
+        ["005930", "000660", "999999"],
+        ["005930", "000660"],
+        {"999999": "out_of_band"},
+        eligibility_rule_version="v1",
+    )
+    failed = CoverageEntry(
+        symbol="005930",
+        dataset=CaptureDataset.SCAN,
+        venue="KRX",
+        session="regular",
+        scheduled_at=None,
+        status=CaptureStatus.FAILED,
+        rows=0,
+        first_event_time=None,
+        last_event_time=None,
+        reason="vendor_failure",
+        raw_refs=(),
+    )
+    stamp = datetime.fromisoformat(f"{day}T15:19:00+09:00")
+    frame = pd.DataFrame(
+        {
+            "symbol": ["005930", "000660"],
+            "admitted": [True, False],
+            "snapshot_timestamp": [stamp, stamp],
+            "feature_available_timestamp": [stamp, stamp],
+        }
+    )
+    store.publish_decision(
+        frame,
+        cohort=cohort,
+        run_id="run-broken",
+        completed_at=datetime.fromisoformat(f"{day}T15:20:00+09:00"),
+        entries=(failed,),
+    )
+
+    # When: 결정 매니페스트는 있으나 적격 입력이 복원되지 않는다
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then
+    assert "collection:decision:1:missing_decision_input" in issues
+
+
+def test_audit_collection_reports_decision_without_input_artifact(tmp_path) -> None:
+    """Decision manifest without restorable input is reported."""
+    from datetime import date
+
+    from src.data.capture_contracts import (
+        CaptureDataset,
+        CaptureManifest,
+        CaptureStatus,
+        build_cohort,
+    )
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    cohort = build_cohort(
+        date.fromisoformat(day),
+        ["005930", "999999"],
+        ["005930"],
+        {"999999": "out_of_band"},
+        eligibility_rule_version="v1",
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, "run-hollow", CaptureDataset.SCAN, "decision-input"),
+        cohort=cohort,
+        completed_at=_audit_moment(day, "15:20:00"),
+        entries=(),
+        artifacts=(),
+        status=CaptureStatus.COMPLETE,
+    )
+    store.publish_manifest(manifest)
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then
+    assert "collection:decision:1:integrity_failure" in issues
+
+
+def test_audit_collection_omits_secrets_from_issues(tmp_path) -> None:
+    """Credentials and raw request headers are absent."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(
+        store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"],
+        status=CaptureStatus.FAILED, reason="auth:appkey=SECRET app_secret=XYZ",
+    )
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"])
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then: 실패는 보고하되 자격증명은 노출하지 않는다
+    assert "collection:charts:1:incomplete_entries" in issues
+    joined = " ".join(issues)
+    assert "SECRET" not in joined and "appkey" not in joined and "app_secret" not in joined
+
+
+def test_audit_collection_reconciles_enabled_auction_sweeps(tmp_path) -> None:
+    """Elapsed sweeps may not disappear from coverage."""
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    clock = _session_clock(day)
+    profile = _collection_profile(tmp_path, auction=True)
+
+    symbols = ["005930", "000660"]
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, symbols)
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, symbols)
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, symbols)
+    _publish_auction_close(store, day, "run-close", symbols, clock=clock)
+
+    # When: open 스윕 매니페스트가 통째로 없다
+    issues = _audit(store, day, profile, clock, _audit_moment(day))
+
+    # Then
+    assert "collection:auction_open:1:missing_manifest" in issues
+    assert not any(issue.startswith("collection:auction_close") for issue in issues)
+
+
+def test_audit_collection_reports_partial_auction_close_coverage(tmp_path) -> None:
+    """Missing slots and failed entries stay visible."""
+    from src.daily.auction_capture import _close_rounds, _program_rounds
+    from src.data.capture_contracts import (
+        CaptureDataset,
+        CaptureManifest,
+        CaptureStatus,
+        CoverageEntry,
+    )
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    clock = _session_clock(day)
+    profile = _collection_profile(tmp_path, auction=True)
+    store = CaptureStore(tmp_path / "capture")
+    symbols = ["005930", "000660"]
+    _publish_cohort_decision(store, day, symbols)
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, symbols)
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, symbols)
+    rounds = _close_rounds(clock, 60)
+    program_rounds = _program_rounds(clock)
+    prog_slot = program_rounds[0]
+    entries = [
+        CoverageEntry(
+            symbol="005930",
+            dataset=CaptureDataset.ORDERBOOK,
+            venue="KRX",
+            session="regular",
+            scheduled_at=slot,
+            status=CaptureStatus.COMPLETE,
+            rows=1,
+            first_event_time=slot,
+            last_event_time=slot,
+            reason="auction-close",
+            raw_refs=(),
+        )
+        for slot in rounds
+    ]
+    entries.append(
+        CoverageEntry(
+            symbol="005930",
+            dataset=CaptureDataset.PROGRAM,
+            venue="KRX",
+            session="regular",
+            scheduled_at=prog_slot,
+            status=CaptureStatus.FAILED,
+            rows=0,
+            first_event_time=prog_slot,
+            last_event_time=prog_slot,
+            reason="vendor_failure",
+            raw_refs=(),
+        )
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, "run-close-partial", CaptureDataset.ORDERBOOK, "auction-close"),
+        cohort=None,
+        completed_at=_audit_moment(day, "15:40:00"),
+        entries=tuple(entries),
+        artifacts=(),
+        status=CaptureStatus.PARTIAL,
+    )
+    store.publish_manifest(manifest)
+    _publish_auction_open(store, day, "run-open", symbols, clock=clock)
+
+    # When
+    issues = _audit(store, day, profile, clock, _audit_moment(day))
+
+    # Then: 22개 기대 슬롯 중 10개만 있고 실패 1건이 보인다
+    assert "collection:auction_close:12:missing_entries" in issues
+    assert "collection:auction_close:1:incomplete_entries" in issues
+
+
+def test_audit_collection_reports_failed_auction_open_entries(tmp_path) -> None:
+    """Auction failures stay visible."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    clock = _session_clock(day)
+    profile = _collection_profile(tmp_path, auction=True)
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"])
+    _publish_auction_close(store, day, "run-close", ["005930"], clock=clock)
+    _publish_auction_open(store, day, "run-open", ["005930"], clock=clock, status=CaptureStatus.FAILED)
+
+    # When
+    issues = _audit(store, day, profile, clock, _audit_moment(day))
+
+    # Then
+    assert "collection:auction_open:1:incomplete_entries" in issues
+
+
+def test_audit_collection_passes_clean_when_everything_certified(tmp_path) -> None:
+    """Complete acquisition reports no issues."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    clock = _session_clock(day)
+    profile = _collection_profile(tmp_path, auction=True, altdata=True)
+    store = CaptureStore(tmp_path / "capture")
+    symbols = ["005930", "000660"]
+    _publish_cohort_decision(store, day, symbols)
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, symbols)
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, symbols)
+    _publish_auction_close(store, day, "run-close", symbols, clock=clock)
+    _publish_auction_open(store, day, "run-open", symbols, clock=clock)
+    _publish_slow_manifest(store, day, "run-slow", status=CaptureStatus.COMPLETE)
+
+    # When
+    issues = _audit(store, day, profile, clock, _audit_moment(day, "22:00:00"))
+
+    # Then
+    assert issues == ()
+
+
+def test_build_digest_includes_collection_issues_compatibly() -> None:
+    """Prior result format remains valid."""
+    import pytest
+
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+
+    # Given: 기존 위치 인자 호출
+    subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
+
+    # Then: 기존 형식 그대로
+    assert subject == "[KCA] 2026-09-14 일일점검 OK"
+    assert "collection_issues=none" in body
+
+    # When: 수집 이상이 함께 보고된다
+    subject, body = daily_audit.build_digest(
+        "2026-09-14",
+        daily_audit.DAY_TRADING,
+        all_ok,
+        [],
+        [],
+        collection_issues=("collection:charts:2:missing_entries",),
+    )
+
+    # Then
+    assert "경고" in subject and "collection:charts:2:missing_entries" in subject
+    assert "collection_issues=collection:charts:2:missing_entries" in body
+
+    # And: 지원하지 않는 일자 구분은 거부된다
+    with pytest.raises(ValueError, match="unsupported day_kind"):
+        daily_audit.build_digest("2026-09-14", "lunar", all_ok, [], [])
+
+
+def test_run_daily_audit_keeps_unknown_calendar_visible(monkeypatch) -> None:
+    """UNKNOWN remains visible."""
+    from src.tools import daily_audit
+
+    monkeypatch.setattr(
+        daily_audit,
+        "audit_daily_completeness",
+        lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True),
+    )
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    def _boom(_date: str) -> bool:
+        raise RuntimeError("KIS trading-day oracle failed")
+
+    # When: 달력 조회가 실패한 평일
+    subject = daily_audit.run_daily_audit(
+        "2026-09-14",
+        trading_day_fn=_boom,
+        failed_units_fn=lambda: ["kca-backup.service"],
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+    )
+
+    # Then: 휴장일 면제로 숨지 않고 UNKNOWN이 그대로 보인다
+    assert subject is not None and "휴장일" not in subject
+    assert len(sent) == 1
+    assert "day=unknown" in sent[0][1]
+
+
+def test_run_daily_audit_includes_collection_gaps(monkeypatch, tmp_path) -> None:
+    """Manifest audit wires into the daily digest."""
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+    from src.tools import daily_audit
+
+    profile = _collection_profile(tmp_path)
+    monkeypatch.setattr(daily_audit, "CollectionSettings", lambda *a, **k: profile)
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, "2026-09-14", ["005930", "000660"])
+    _publish_chart_manifest(store, "2026-09-14", "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    _publish_chart_manifest(store, "2026-09-14", "run-ticks", CaptureDataset.TRADE_TICKS, ["005930", "000660"])
+    monkeypatch.setattr(
+        daily_audit,
+        "audit_daily_completeness",
+        lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True),
+    )
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    # When
+    subject = daily_audit.run_daily_audit(
+        "2026-09-14",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+    )
+
+    # Then
+    assert subject is not None and "경고" in subject
+    assert "collection:charts:1:missing_entries" in subject
+    assert len(sent) == 1
+    assert "collection:charts:1:missing_entries" in sent[0][1]
+
+
+def test_run_daily_audit_survives_collection_prep_failure(monkeypatch) -> None:
+    """Collection audit failure degrades to an explicit issue."""
+    from src.tools import daily_audit
+
+    def _boom(*args, **kwargs):
+        raise ValueError("bad profile")
+
+    monkeypatch.setattr(daily_audit, "CollectionSettings", _boom)
+    monkeypatch.setattr(
+        daily_audit,
+        "audit_daily_completeness",
+        lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True),
+    )
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    # When
+    subject = daily_audit.run_daily_audit(
+        "2026-09-14",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+    )
+
+    # Then: 기존 감사는 계속되고 수집 감시는 unavailable으로 명시된다
+    assert subject is not None and "collection:audit:1:unavailable" in subject
+    assert len(sent) == 1

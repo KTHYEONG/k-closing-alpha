@@ -15,8 +15,10 @@ import asyncio
 import functools
 import logging
 import os
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,16 @@ from src.backfill.altdata.krx_api import (
     KRX_ENDPOINT_STK_DAILY,
     fetch_krx_openapi_day_strict,
 )
+from src.data.capture_contracts import (
+    BrokerPayload,
+    CaptureContext,
+    CaptureDataset,
+    CapturedResponse,
+    CaptureStatus,
+    PageObserver,
+    RawCaptureError,
+)
+from src.data.capture_store import CaptureStore
 from src.data.panel_integrity import heal_price_history_panel
 from src.data.parquet_codec import write_price_history_parquet
 from src.strategy.contract import derive_chg_ratio
@@ -157,23 +169,76 @@ def normalize_krx_daily(raw: pd.DataFrame, trade_date: pd.Timestamp) -> pd.DataF
     return out
 
 
-def fetch_krx_daily(trade_date: pd.Timestamp, cfg: AltDataFetchConfig) -> pd.DataFrame:
-    """Fetch every listed KOSPI and KOSDAQ stock for one date from KRX OpenAPI.
+def _capture_root() -> Path:
+    root = settings.COLLECTION_ROOT
+    if root is not None:
+        return Path(root)
+    return Path(settings.HISTORY_DIR) / "capture"
+
+
+def _price_capture_context(trading_day: date, run_id: str, endpoint: str, *, symbol: str | None = None) -> CaptureContext:
+    return CaptureContext(
+        trading_date=trading_day,
+        run_id=run_id,
+        dataset=CaptureDataset.PRICE,
+        vendor="krx",
+        endpoint=endpoint,
+        symbol=symbol,
+        venue="KRX",
+        session="regular",
+        capture_reason="price-ingest",
+        cohort_id=None,
+        scheduled_at=None,
+    )
+
+
+def _price_page_observer(store: CaptureStore, trading_day: date, run_id: str) -> PageObserver:
+    def _on_page(
+        payload: BrokerPayload | None,
+        meta: Mapping[str, str],
+        started: datetime,
+        received: datetime,
+        page_index: int,
+        attempt_index: int,
+    ) -> None:
+        endpoint = str(dict(meta).get("endpoint", "krx-daily"))
+        try:
+            store.append_response(
+                CapturedResponse(
+                    context=_price_capture_context(trading_day, run_id, endpoint),
+                    request_started_at=started,
+                    received_at=received,
+                    payload=dict(payload) if isinstance(payload, dict) else None,
+                    source_timestamp=None,
+                    source_published_at=None,
+                    status=CaptureStatus.COMPLETE if isinstance(payload, dict) else CaptureStatus.FAILED,
+                    page_index=int(page_index),
+                    attempt_index=int(attempt_index),
+                    continuation={k: str(v) for k, v in dict(meta).items() if k not in ("endpoint",)},
+                    error_type=None if isinstance(payload, dict) else "transport",
+                )
+            )
+        except OSError as exc:
+            raise RawCaptureError(str(exc)) from exc
+
+    return _on_page
+
+
+def fetch_krx_daily(trade_date: pd.Timestamp, cfg: AltDataFetchConfig, *, on_page: PageObserver | None = None) -> pd.DataFrame:
+    """Preserve daily source responses before normalization and price adjustment.
 
     Args:
-        trade_date: Trading date to fetch.
-        cfg: Alt-data config carrying krx_api_key.
-
+        trade_date: Existing requested trading date.
+        cfg: Existing KRX fetch configuration.
+        on_page: Durable observer forwarded to both market endpoints.
     Returns:
-        Normalized rows for both markets, or an empty frame when KRX has not
-        published the date (both markets return zero rows).
-
+        Existing normalized daily market frame.
     Raises:
-        RuntimeError: When only one market is published (partial publication)
-            or propagated from the strict fetcher (401/404/non-200).
+        RuntimeError: Existing incomplete-market or strict-fetch failure.
+        RawCaptureError: Original response preservation failed.
     """
     ymd = pd.Timestamp(trade_date).strftime("%Y%m%d")
-    parts = [normalize_krx_daily(fetch_krx_openapi_day_strict(ep, ymd, cfg), trade_date) for ep, _ in KRX_DAILY_MARKETS]
+    parts = [normalize_krx_daily(fetch_krx_openapi_day_strict(ep, ymd, cfg, on_page=on_page), trade_date) for ep, _ in KRX_DAILY_MARKETS]
     sizes = [len(p) for p in parts]
     if all(n == 0 for n in sizes):
         return pd.DataFrame(columns=list(KRX_ROW_COLUMNS))
@@ -664,6 +729,9 @@ async def run_price_ingest(
     if not out_path.exists():
         raise FileNotFoundError(f"price_history not found: {out_path}")
     cfg = krx_cfg or AltDataFetchConfig(start=run_day, end=run_day + pd.Timedelta(days=1), out_dir=Path("."), krx_api_key=settings.KRX_OPENAPI_KEY)
+    raw_enabled = bool(settings.COLLECTION_RAW_ENABLED)
+    store = CaptureStore(_capture_root()) if raw_enabled else None
+    run_id = f"price-{run_day.strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}" if store is not None else None
     if kis is None:
         from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 
@@ -688,7 +756,11 @@ async def run_price_ingest(
         trading = sorted(pd.Timestamp(d) for d in kospi["date"])
         fetched: dict[pd.Timestamp, pd.DataFrame] = {}
         for d in plan_new_dates(panel_max, trading, run_day):
-            rows = fetch_krx_daily(d, cfg)
+            trade_date = d
+            krx_cfg = cfg
+            observer = _price_page_observer(store, pd.Timestamp(trade_date).normalize().date(), run_id) if store is not None and run_id is not None else None
+            krx_rows = fetch_krx_daily(trade_date, krx_cfg, on_page=observer)
+            rows = krx_rows
             if rows.empty:
                 break  # 미게시: 이후 날짜는 연속성 때문에 시도하지 않는다
             fetched[d] = rows
@@ -702,7 +774,11 @@ async def run_price_ingest(
             listed = set(fetched[latest]["symbol"])
             stale = [v for s, v in panel_last.items() if s in listed and window[0] <= v < panel_max]
             for d in (d for d in trading if stale and min(stale) < d <= panel_max):
-                rows = fetch_krx_daily(d, cfg)
+                trade_date = d
+                krx_cfg = cfg
+                observer = _price_page_observer(store, pd.Timestamp(trade_date).normalize().date(), run_id) if store is not None and run_id is not None else None
+                krx_rows = fetch_krx_daily(trade_date, krx_cfg, on_page=observer)
+                rows = krx_rows
                 if rows.empty:
                     raise RuntimeError(f"KRX returned no rows for past trading day {d.date()}")
                 fetched[d] = rows
@@ -716,6 +792,8 @@ async def run_price_ingest(
             new_rows = assemble_new_rows(tail, flows)
         # 신규 행이 없어도 창 안 결측 수급을 재조회해 채운다 — 부분 기록이 영구 결측으로 굳지 않게.
         panel, n_repaired = apply_flow_repairs(panel, flows)
+    if store is not None and run_id is not None and not tail.empty:
+        store.publish_frame(tail, context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-unadjusted", symbol="unadjusted"))
     index_cols = compute_index_columns(kospi, kosdaq)
     if new_rows.empty:
         # 신규 행이 없으면 행 순서가 같으므로 위치 비교로 지수 컬럼 변경 여부만 본다
@@ -738,6 +816,8 @@ async def run_price_ingest(
     if changed:
         write_price_history_parquet(heal_price_history_panel(merged), out_path)
         wrote = True
+        if store is not None and run_id is not None and not new_rows.empty:
+            store.publish_frame(merged, context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-adjusted", symbol="adjusted"))
     report = IngestReport(
         ingested_dates=[d.strftime("%Y-%m-%d") for d in sorted(fetched)],
         n_new_rows=len(new_rows),

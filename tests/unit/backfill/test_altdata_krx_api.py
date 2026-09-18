@@ -204,9 +204,188 @@ def test_collect_derivatives_basis_returns_empty_without_pykrx_fallback(monkeypa
     monkeypatch.setattr(derivatives, "fetch_krx_openapi_day", lambda *a, **k: pd.DataFrame())
 
     # When
-    out = derivatives.collect_derivatives_basis(_cfg(), [pd.Timestamp("2026-09-09")])
+    out = derivatives.collect_derivatives_basis(_cfg(), [pd.Timestamp("2025-06-09")])
 
     # Then: pykrx 폴백 없이 빈 프레임 그대로(_collect_via_pykrx가 더 이상 존재하지 않는다)
     assert out.empty
     assert not hasattr(derivatives, "_collect_via_pykrx")
     assert not hasattr(derivatives, "stock")
+
+
+def _strict_cfg(**kw: object):
+    base: dict[str, object] = {
+        "start": pd.Timestamp("2026-09-01"),
+        "end": pd.Timestamp("2026-09-30"),
+        "out_dir": Path("x"),
+        "retries": 2,
+        "retry_sleep_sec": 0.0,
+        "krx_api_key": "dummy-key",
+    }
+    base.update(kw)
+    return AltDataFetchConfig(**base)  # type: ignore[arg-type]
+
+
+class _StrictResp:
+    def __init__(self, status: int, payload: object) -> None:
+        self.status_code = status
+        self._payload = payload
+
+    def json(self) -> object:
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+def _observe_sink() -> tuple[list, object]:
+    seen: list = []
+
+    def _on_page(payload: object, meta: object, started: object, received: object, page: int, attempt: int) -> None:
+        seen.append((payload, meta, started, received, page, attempt))
+
+    return seen, _on_page
+
+
+def test_fetch_strict_observer_receives_full_response(monkeypatch) -> None:
+    from src.backfill.altdata import krx_api
+
+    payload = {
+        "OutBlock_1": [{"BAS_DD": "20250602", "TDD_CLSPRC": "359.14"}],
+        "extra_top": {"note": "kept"},
+        "respCd": "0000",
+    }
+    monkeypatch.setattr(krx_api, "wait_for_krx_slot", lambda _cfg: None)
+    monkeypatch.setattr(krx_api.requests, "get", lambda *a, **k: _StrictResp(200, payload))
+    seen, on_page = _observe_sink()
+    out = krx_api.fetch_krx_openapi_day_strict(krx_api.KRX_ENDPOINT_STK_DAILY, "20250602", _strict_cfg(), on_page=on_page)  # type: ignore[arg-type]
+    assert len(seen) == 1
+    observed, meta, started, received, page, attempt = seen[0]
+    assert observed == payload
+    assert observed["extra_top"] == {"note": "kept"}
+    assert page == 0 and attempt == 0
+    assert getattr(started, "tzinfo", None) is not None and getattr(received, "tzinfo", None) is not None
+    assert received >= started
+    assert set(meta) <= {"endpoint", "basDd"}
+    assert "AUTH_KEY" not in str(meta) and "dummy-key" not in str(meta)
+    assert len(out) == 1 and out.iloc[0]["TDD_CLSPRC"] == "359.14"
+
+
+def test_fetch_strict_observer_precedes_normalization(monkeypatch) -> None:
+    from src.backfill.altdata import krx_api
+
+    payload = {"OutBlock_1": [{"BAS_DD": "20250602", "TDD_CLSPRC": "359.14", "ACC_TRDVOL": "300000"}]}
+    monkeypatch.setattr(krx_api, "wait_for_krx_slot", lambda _cfg: None)
+    monkeypatch.setattr(krx_api.requests, "get", lambda *a, **k: _StrictResp(200, payload))
+    seen, on_page = _observe_sink()
+    out = krx_api.fetch_krx_openapi_day_strict(krx_api.KRX_ENDPOINT_STK_DAILY, "20250602", _strict_cfg(), on_page=on_page)  # type: ignore[arg-type]
+    assert isinstance(seen[0][0]["OutBlock_1"][0]["TDD_CLSPRC"], str)
+    assert seen[0][0]["OutBlock_1"][0]["TDD_CLSPRC"] == "359.14"
+    assert out.iloc[0]["TDD_CLSPRC"] == "359.14"
+
+
+def test_fetch_strict_receipt_is_not_publication(monkeypatch) -> None:
+    from src.backfill.altdata import krx_api
+
+    payload = {"OutBlock_1": [], "basDd": "20260101"}
+    monkeypatch.setattr(krx_api, "wait_for_krx_slot", lambda _cfg: None)
+    monkeypatch.setattr(krx_api.requests, "get", lambda *a, **k: _StrictResp(200, payload))
+    seen, on_page = _observe_sink()
+    out = krx_api.fetch_krx_openapi_day_strict(krx_api.KRX_ENDPOINT_STK_DAILY, "20260101", _strict_cfg(), on_page=on_page)  # type: ignore[arg-type]
+    assert out.empty
+    assert len(seen) == 1
+    assert set(seen[0][1]) == {"endpoint", "basDd"}
+    assert not any("publish" in key for key in seen[0][1])
+
+
+def test_fetch_strict_empty_source_remains_ambiguous(monkeypatch) -> None:
+    from src.backfill.altdata import krx_api
+
+    payload = {"OutBlock_1": []}
+    monkeypatch.setattr(krx_api, "wait_for_krx_slot", lambda _cfg: None)
+    monkeypatch.setattr(krx_api.requests, "get", lambda *a, **k: _StrictResp(200, payload))
+    seen, on_page = _observe_sink()
+    out = krx_api.fetch_krx_openapi_day_strict(krx_api.KRX_ENDPOINT_STK_DAILY, "20260101", _strict_cfg(), on_page=on_page)  # type: ignore[arg-type]
+    assert out.empty
+    assert seen[0][0]["OutBlock_1"] == []
+
+
+def test_fetch_strict_retry_attempts_stay_distinct(monkeypatch) -> None:
+    from src.backfill.altdata import krx_api
+
+    payload = {"OutBlock_1": [{"BAS_DD": "20250602", "TDD_CLSPRC": "359.14"}]}
+    calls = {"n": 0}
+
+    def _flaky(*a: object, **k: object) -> _StrictResp:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("transport down")
+        return _StrictResp(200, payload)
+
+    monkeypatch.setattr(krx_api, "wait_for_krx_slot", lambda _cfg: None)
+    monkeypatch.setattr(krx_api.requests, "get", _flaky)
+    seen, on_page = _observe_sink()
+    out = krx_api.fetch_krx_openapi_day_strict(krx_api.KRX_ENDPOINT_STK_DAILY, "20250602", _strict_cfg(), on_page=on_page)  # type: ignore[arg-type]
+    assert len(out) == 1
+    assert [attempt for _, _, _, _, _, attempt in seen] == [0, 1]
+    assert seen[0][0] is None
+    assert seen[0][1]["error_type"] == "ConnectionError"
+    assert seen[1][0] == payload
+
+
+def test_fetch_strict_capture_failure_propagates(monkeypatch) -> None:
+    import pytest
+
+    from src.backfill.altdata import krx_api
+    from src.data.capture_contracts import RawCaptureError
+
+    payload = {"OutBlock_1": [{"BAS_DD": "20250602"}]}
+    calls = {"n": 0}
+
+    def _counted(*a: object, **k: object) -> _StrictResp:
+        calls["n"] += 1
+        return _StrictResp(200, payload)
+
+    def _failing(*a: object, **k: object) -> None:
+        raise RawCaptureError("store full")
+
+    monkeypatch.setattr(krx_api, "wait_for_krx_slot", lambda _cfg: None)
+    monkeypatch.setattr(krx_api.requests, "get", _counted)
+    with pytest.raises(RawCaptureError):
+        krx_api.fetch_krx_openapi_day_strict(krx_api.KRX_ENDPOINT_STK_DAILY, "20250602", _strict_cfg(retries=3), on_page=_failing)  # type: ignore[arg-type]
+    assert calls["n"] == 1
+
+
+def test_fetch_strict_observer_error_wrapped_without_credentials(monkeypatch) -> None:
+    import pytest
+
+    from src.backfill.altdata import krx_api
+    from src.data.capture_contracts import RawCaptureError
+
+    payload = {"OutBlock_1": [{"BAS_DD": "20250602"}]}
+
+    def _leaky(*a: object, **k: object) -> None:
+        raise ValueError("store blew up with SECRET-XYZ")
+
+    monkeypatch.setattr(krx_api, "wait_for_krx_slot", lambda _cfg: None)
+    monkeypatch.setattr(krx_api.requests, "get", lambda *a, **k: _StrictResp(200, payload))
+    with pytest.raises(RawCaptureError) as exc_info:
+        krx_api.fetch_krx_openapi_day_strict(krx_api.KRX_ENDPOINT_STK_DAILY, "20250602", _strict_cfg(), on_page=_leaky)  # type: ignore[arg-type]
+    assert "SECRET-XYZ" not in str(exc_info.value)
+
+
+def test_fetch_strict_malformed_response_fails_explicit(monkeypatch, caplog) -> None:
+    import logging
+
+    import pytest
+
+    from src.backfill.altdata import krx_api
+
+    monkeypatch.setattr(krx_api, "wait_for_krx_slot", lambda _cfg: None)
+    monkeypatch.setattr(krx_api.requests, "get", lambda *a, **k: _StrictResp(200, ValueError("not json")))
+    with caplog.at_level(logging.WARNING, logger="src.backfill.altdata.ratelimit"), pytest.raises(RuntimeError, match="retries failed"):
+        krx_api.fetch_krx_openapi_day_strict(krx_api.KRX_ENDPOINT_STK_DAILY, "20250602", _strict_cfg(retries=1), on_page=None)
+    assert any("malformed" in record.message for record in caplog.records)
+    caplog.clear()
+    monkeypatch.setattr(krx_api.requests, "get", lambda *a, **k: _StrictResp(200, ["not", "a", "dict"]))
+    with caplog.at_level(logging.WARNING, logger="src.backfill.altdata.ratelimit"), pytest.raises(RuntimeError, match="retries failed"):
+        krx_api.fetch_krx_openapi_day_strict(krx_api.KRX_ENDPOINT_STK_DAILY, "20250602", _strict_cfg(retries=1), on_page=None)
+    assert any("malformed" in record.message for record in caplog.records)

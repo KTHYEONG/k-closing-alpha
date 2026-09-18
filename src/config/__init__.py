@@ -14,6 +14,7 @@ from pydantic_settings import SettingsConfigDict
 from src.config.alerts import AlertSettings
 from src.config.altdata import AltDataSettings
 from src.config.base import PathSettings
+from src.config.collection import CollectionSettings
 from src.config.kis import KisSettings
 from src.config.kiwoom import KiwoomSettings
 from src.config.ls import LsSettings
@@ -23,11 +24,12 @@ from src.config.trading import TradingSettings
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings, TossSettings, AlertSettings):
-    """프로젝트 전역 설정. `.env` 파일에서 자동 로드.
+class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings, TossSettings, AlertSettings, CollectionSettings):
+    """Expose collection configuration through the existing application settings facade.
 
-    도메인별 설정 모듈을 통합한 싱글톤으로, 모든 소비자 모듈은
-    `from src import settings` 후 `settings.XXX`로 참조합니다.
+The existing field names, environment loading and public exports remain compatible.
+Collection root resolution belongs to owner-local capture construction rather than
+cross-base defaults that depend on Pydantic multiple-inheritance ordering.
     """
 
     model_config = SettingsConfigDict(
@@ -50,6 +52,23 @@ BASE_DIR = settings.BASE_DIR
 DATA_DIR = settings.DATA_DIR
 CONFIGS_DIR = settings.CONFIGS_DIR
 MODELS_DIR = settings.MODELS_DIR
+COLLECTION_ROOT = settings.COLLECTION_ROOT
+COLLECTION_RAW_ENABLED = settings.COLLECTION_RAW_ENABLED
+COLLECTION_AUCTION_ENABLED = settings.COLLECTION_AUCTION_ENABLED
+COLLECTION_ALTDATA_ENABLED = settings.COLLECTION_ALTDATA_ENABLED
+COLLECTION_RESEARCH_SLOTS = settings.COLLECTION_RESEARCH_SLOTS
+COLLECTION_KEY_OWNERSHIP_PATH = settings.COLLECTION_KEY_OWNERSHIP_PATH
+COLLECTION_AUCTION_INTERVAL_SECONDS = settings.COLLECTION_AUCTION_INTERVAL_SECONDS
+COLLECTION_REQUEST_TIMEOUT_SECONDS = settings.COLLECTION_REQUEST_TIMEOUT_SECONDS
+COLLECTION_CONCURRENCY_PER_KEY = settings.COLLECTION_CONCURRENCY_PER_KEY
+COLLECTION_CHART_MAX_PAGES = settings.COLLECTION_CHART_MAX_PAGES
+COLLECTION_TICK_REPAIR_MAX_PAGES = settings.COLLECTION_TICK_REPAIR_MAX_PAGES
+COLLECTION_ARROW_BATCH_ROWS = settings.COLLECTION_ARROW_BATCH_ROWS
+COLLECTION_MAX_RSS_MIB = settings.COLLECTION_MAX_RSS_MIB
+COLLECTION_ALTDATA_LOOKBACK_DAYS = settings.COLLECTION_ALTDATA_LOOKBACK_DAYS
+COLLECTION_VERIFIED_CHART_ROUTES = settings.COLLECTION_VERIFIED_CHART_ROUTES
+COLLECTION_OPEN_CONFIRM_SECONDS = settings.COLLECTION_OPEN_CONFIRM_SECONDS
+COLLECTION_SESSION_OVERRIDES = settings.COLLECTION_SESSION_OVERRIDES
 KIS_APP_KEY = settings.KIS_APP_KEY
 KIS_APP_SECRET = settings.KIS_APP_SECRET
 KIS_ACCOUNT_ID = settings.KIS_ACCOUNT_ID
@@ -121,6 +140,23 @@ __all__ = [
     "API_SEMAPHORE_LIMIT",
     "BASE_DIR",
     "CANDLE_BODY_RATIO_THRESHOLD",
+    "COLLECTION_ALTDATA_ENABLED",
+    "COLLECTION_ALTDATA_LOOKBACK_DAYS",
+    "COLLECTION_ARROW_BATCH_ROWS",
+    "COLLECTION_AUCTION_ENABLED",
+    "COLLECTION_AUCTION_INTERVAL_SECONDS",
+    "COLLECTION_CHART_MAX_PAGES",
+    "COLLECTION_CONCURRENCY_PER_KEY",
+    "COLLECTION_KEY_OWNERSHIP_PATH",
+    "COLLECTION_MAX_RSS_MIB",
+    "COLLECTION_OPEN_CONFIRM_SECONDS",
+    "COLLECTION_RAW_ENABLED",
+    "COLLECTION_REQUEST_TIMEOUT_SECONDS",
+    "COLLECTION_RESEARCH_SLOTS",
+    "COLLECTION_ROOT",
+    "COLLECTION_SESSION_OVERRIDES",
+    "COLLECTION_TICK_REPAIR_MAX_PAGES",
+    "COLLECTION_VERIFIED_CHART_ROUTES",
     "CONFIGS_DIR",
     "DAILY_DIR",
     "DART_API_KEY",
@@ -180,6 +216,7 @@ __all__ = [
     "UPPER_LIMIT_NEXT_DAY_CONDITION_NAME",
     "AlertSettings",
     "AltDataSettings",
+    "CollectionSettings",
     "KisSettings",
     "KiwoomSettings",
     "LsSettings",

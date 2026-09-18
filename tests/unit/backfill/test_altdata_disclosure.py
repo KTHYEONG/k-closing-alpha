@@ -26,7 +26,7 @@ def test_aggregate_rows_categorizes_and_flags_material() -> None:
 def test_collect_disclosures_uses_pblntf_ty_and_flushes_per_window(monkeypatch) -> None:
     calls: list[tuple[str, str, str]] = []
 
-    def _fake_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock):  # noqa: ANN001, ANN202
+    def _fake_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock, *, on_page=None):  # noqa: ANN001, ANN202
         calls.append((pblntf_ty, start_ymd, end_ymd))
         return [{"stock_code": "005930", "report_nm": "유상증자결정", "rcept_dt": f"{start_ymd}"}]
 
@@ -50,7 +50,7 @@ def test_collect_disclosures_uses_pblntf_ty_and_flushes_per_window(monkeypatch) 
 def test_collect_disclosures_skips_fully_covered_windows(monkeypatch) -> None:
     fetched_windows: list[str] = []
 
-    def _fake_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock):  # noqa: ANN001, ANN202
+    def _fake_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock, *, on_page=None):  # noqa: ANN001, ANN202
         fetched_windows.append(start_ymd)
         return []
 
@@ -103,3 +103,216 @@ def test_download_corp_code_map_parses_zip(monkeypatch) -> None:
         disclosure.download_corp_code_map(
             AltDataFetchConfig(start=pd.Timestamp("2024-01-01"), end=pd.Timestamp("2024-02-01"), out_dir=Path("x"))
         )
+
+
+def _dart_cfg(**kw: object) -> AltDataFetchConfig:
+    base: dict[str, object] = {
+        "start": pd.Timestamp("2024-01-01"),
+        "end": pd.Timestamp("2024-02-20"),
+        "out_dir": Path("x"),
+        "dart_api_key": "k",
+        "retries": 1,
+        "retry_sleep_sec": 0.0,
+    }
+    base.update(kw)
+    return AltDataFetchConfig(**base)  # type: ignore[arg-type]
+
+
+class _DartResp:
+    def __init__(self, payload: object, status: int = 200) -> None:
+        self.status_code = status
+        self._payload = payload
+
+    def json(self) -> object:
+        return self._payload
+
+
+def _dart_item(rcept_no: str, report_nm: str = "유상증자결정") -> dict[str, str]:
+    return {
+        "corp_cls": "Y",
+        "corp_code": "00126380",
+        "stock_code": "005930",
+        "report_nm": report_nm,
+        "rcept_dt": "20240115",
+        "rcept_no": rcept_no,
+    }
+
+
+def _dart_page(items: list[dict[str, str]], total_page: int = 1, status: str = "000") -> dict[str, object]:
+    return {"status": status, "message": "정상" if status == "000" else "조회된 데이터가 없습니다.", "total_page": total_page, "list": items}
+
+
+def test_collect_disclosures_retains_receipt_identifiers(monkeypatch) -> None:
+    items = [_dart_item("20240115000123"), _dart_item("20240115000124", "전환사채권발행결정")]
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", lambda *a, **k: _DartResp(_dart_page(items)))
+    seen: list = []
+    out = disclosure.collect_disclosures(
+        _dart_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+        on_page=lambda p, m, s, r, pi, ai: seen.append((p, m, s, r, pi, ai)),
+    )
+    assert len(seen) == 2
+    observed_nos = {item["rcept_no"] for payload, *_ in seen for item in payload["list"]}
+    assert observed_nos == {"20240115000123", "20240115000124"}
+    assert "005930" in set(out["symbol"])
+
+
+def test_collect_disclosures_correction_reobserved(monkeypatch) -> None:
+    from src.backfill.altdata import disclosure as disc
+
+    original = {"status": "000", "total_page": 1, "list": [_dart_item("20240115000123", "유상증자결정")]}
+    amended = {"status": "000", "total_page": 1, "list": [_dart_item("20240115000123", "유상증자결정(정정)"), dict(_dart_item("20240115000123"), rm="정정")]}
+    monkeypatch.setattr(disc, "wait_for_dart_slot", lambda _cfg: None)
+    seen: list = []
+    cfg = _dart_cfg()
+    params: dict[str, object] = {"crtfc_key": "k", "page_no": 1}
+    monkeypatch.setattr(disc.requests, "get", lambda *a, **k: _DartResp(original))
+    disc._dart_get_json(
+        disc._LIST_URL, params, cfg,
+        on_page=lambda p, m, s, r, pi, ai: seen.append((p, m, s, r, pi, ai)),
+    )
+    monkeypatch.setattr(disc.requests, "get", lambda *a, **k: _DartResp(amended))
+    disc._dart_get_json(
+        disc._LIST_URL, params, cfg,
+        on_page=lambda p, m, s, r, pi, ai: seen.append((p, m, s, r, pi, ai)),
+    )
+    assert len(seen) == 2
+    assert seen[0][0]["list"][0]["report_nm"] == "유상증자결정"
+    assert seen[1][0]["list"][0]["report_nm"] == "유상증자결정(정정)"
+    assert all(entry[0]["list"][0]["rcept_no"] == "20240115000123" for entry in seen)
+
+
+def test_collect_disclosures_parallel_pages_all_retained(monkeypatch) -> None:
+    def _paged(url: str, params: object = None, timeout: object = None) -> _DartResp:
+        page = int(dict(params)["page_no"])  # type: ignore[arg-type]
+        return _DartResp(_dart_page([_dart_item(f"2024011500000{page}", f"공시{page}")], total_page=4))
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _paged)
+    seen: list = []
+    disclosure.collect_disclosures(
+        _dart_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+        on_page=lambda p, m, s, r, pi, ai: seen.append((p, m, s, r, pi, ai)),
+    )
+    assert len(seen) == 8
+    assert {meta["page_no"] for _, meta, *_ in seen} == {"1", "2", "3", "4"}
+    for _, meta, started, received, page, _attempt in seen:
+        assert meta["page_no"] == str(page)
+        assert getattr(started, "tzinfo", None) is not None and getattr(received, "tzinfo", None) is not None
+
+
+def test_dart_get_json_retains_no_result_status(monkeypatch) -> None:
+    payload = {"status": "013", "message": "조회된 데이터가 없습니다.", "list": []}
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", lambda *a, **k: _DartResp(payload))
+    seen: list = []
+    out = disclosure._dart_get_json(
+        disclosure._LIST_URL, {"crtfc_key": "k", "page_no": 1}, _dart_cfg(),
+        on_page=lambda p, m, s, r, pi, ai: seen.append((p, m, s, r, pi, ai)),
+    )
+    assert out["status"] == "013"
+    assert len(seen) == 1 and seen[0][0]["status"] == "013"
+
+
+def test_dart_get_json_rejects_unsupported_status_after_observing(monkeypatch) -> None:
+    import pytest
+
+    payload = {"status": "020", "message": "에러", "list": []}
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", lambda *a, **k: _DartResp(payload))
+    seen: list = []
+    with pytest.raises(RuntimeError, match="020"):
+        disclosure._dart_get_json(
+            disclosure._LIST_URL, {"crtfc_key": "k", "page_no": 1}, _dart_cfg(),
+            on_page=lambda p, m, s, r, pi, ai: seen.append((p, m, s, r, pi, ai)),
+        )
+    assert len(seen) == 1 and seen[0][0]["status"] == "020"
+
+
+def test_collect_disclosures_scope_unchanged(monkeypatch) -> None:
+    requested: list = []
+
+    def _tracked(url: str, params: object = None, timeout: object = None) -> _DartResp:
+        requested.append((url, dict(params)))  # type: ignore[arg-type]
+        return _DartResp(_dart_page([_dart_item("20240115000123")]))
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _tracked)
+    out = disclosure.collect_disclosures(
+        _dart_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+    )
+    assert {url for url, _ in requested} == {disclosure._LIST_URL}
+    assert {params["pblntf_ty"] for _, params in requested} == {"B", "I"}
+    assert list(out.columns) == list(disclosure._OUT_COLS)
+
+
+def test_collect_disclosures_missing_publication_time_unknown(monkeypatch) -> None:
+    items = [_dart_item("20240115000123")]
+    assert "publish" not in str(items).lower()
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", lambda *a, **k: _DartResp(_dart_page(items)))
+    seen: list = []
+    out = disclosure.collect_disclosures(
+        _dart_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+        on_page=lambda p, m, s, r, pi, ai: seen.append((p, m, s, r, pi, ai)),
+    )
+    assert len(seen) == 2
+    for _, meta, *_ in seen:
+        assert set(meta) <= {"endpoint", "page_no"}
+        assert not any("publish" in key for key in meta)
+    assert out.iloc[0]["date"] == pd.Timestamp("2024-01-15")
+
+
+def test_dart_list_page_retry_uses_actual_attempt(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def _flaky(url: str, params: object = None, timeout: object = None) -> _DartResp:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("transport down")
+        return _DartResp(_dart_page([_dart_item("20240115000123")]))
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _flaky)
+    seen: list = []
+    rows, total = disclosure._fetch_list_page(
+        _dart_cfg(retries=2), {"crtfc_key": "k", "page_no": 1}, 1,
+        on_page=lambda p, m, s, r, pi, ai: seen.append((p, m, s, r, pi, ai)),
+    )
+    assert len(rows) == 1 and total == 1
+    assert len(seen) == 1
+    assert seen[0][4] == 1 and seen[0][5] == 1
+
+
+def test_collect_disclosures_capture_failure_propagates(monkeypatch) -> None:
+    import pytest
+
+    from src.data.capture_contracts import RawCaptureError
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    calls = {"n": 0}
+
+    def _counted(url: str, params: object = None, timeout: object = None) -> _DartResp:
+        calls["n"] += 1
+        return _DartResp(_dart_page([_dart_item("20240115000123")]))
+
+    def _failing(*a: object, **k: object) -> None:
+        raise RawCaptureError("store full")
+
+    monkeypatch.setattr(disclosure.requests, "get", _counted)
+    with pytest.raises(RawCaptureError):
+        disclosure.collect_disclosures(
+            _dart_cfg(retries=3), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+            on_page=_failing,  # type: ignore[arg-type]
+        )
+    assert calls["n"] == 1
+
+    def _leaky(*a: object, **k: object) -> None:
+        raise OSError("disk SECRET-XYZ")
+
+    with pytest.raises(RawCaptureError) as exc_info:
+        disclosure.collect_disclosures(
+            _dart_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+            on_page=_leaky,  # type: ignore[arg-type]
+        )
+    assert "SECRET-XYZ" not in str(exc_info.value)

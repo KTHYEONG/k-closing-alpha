@@ -7,12 +7,13 @@ import asyncio
 import functools
 import logging
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from src import settings
 from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.config.market_session import (
     CLOSING_AUCTION_CONFIRM_EARLIEST_HHMMSS,
@@ -23,6 +24,13 @@ from src.config.market_session import (
 from src.daily import archive
 from src.daily.collect import safe_float
 from src.daily.predict import load_topk_decision
+from src.data.capture_contracts import (
+    CaptureContext,
+    CaptureDataset,
+    CapturedResponse,
+    CaptureStatus,
+)
+from src.data.capture_store import CaptureStore
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, record_run_outcome
 
@@ -127,12 +135,73 @@ def classify_finalize_outcome(
     return RUN_OUTCOME_OK, ""
 
 
-async def fetch_confirmed_quote(client: Any, session: Any, code: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    """현재가(output)와 호가/예상체결(output2)을 동시 조회한다 (실패 블록은 빈 dict)."""
+async def fetch_confirmed_quote(client: Any, session: Any, code: str, *, capture_store: CaptureStore | None = None, run_id: str | None = None, cohort_id: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Retain full close-confirmation responses while preserving the existing gate.
+
+    Args:
+        client: Existing explicit KRX data client.
+        session: Existing HTTP session.
+        code: Security identifier.
+        capture_store: Owner-local confirmation evidence store.
+        run_id: Confirmation task identity.
+        cohort_id: Original decision population reference.
+
+    Returns:
+        Existing price and orderbook output2 blocks used by the confirmation gate.
+
+    Raises:
+        ValueError: Inconsistent context or date.
+        RuntimeError: Propagated acquisition failure under existing caller contracts.
+    """
+    capture_on = not (capture_store is None and run_id is None and cohort_id is None)
+    if capture_on and (capture_store is None or not run_id or not cohort_id):
+        raise ValueError("inconsistent close-confirmation capture context")
+    started = datetime.now(ZoneInfo("Asia/Seoul"))
     price_res, book_res = await asyncio.gather(
         client.get_current_price(session, code, market_div_code=KRX_CLOSE_MARKET_DIV_CODE, allow_market_div_fallback=False),
         client.get_orderbook_snapshot(session, code, market_div_code=KRX_CLOSE_MARKET_DIV_CODE),
     )
+    received = datetime.now(ZoneInfo("Asia/Seoul"))
+    if capture_on:
+        assert capture_store is not None
+        assert run_id is not None
+        assert cohort_id is not None
+        try:
+            trading_day = received.date()
+            for dataset, payload, endpoint in (
+                (CaptureDataset.PRICE, price_res, "inquire-price"),
+                (CaptureDataset.ORDERBOOK, book_res, "inquire-asking-price"),
+            ):
+                body = dict(payload) if isinstance(payload, dict) else None
+                capture_store.append_response(
+                    CapturedResponse(
+                        context=CaptureContext(
+                            trading_date=trading_day,
+                            run_id=run_id,
+                            dataset=dataset,
+                            vendor="kis",
+                            endpoint=endpoint,
+                            symbol=str(code),
+                            venue="KRX",
+                            session="regular",
+                            capture_reason="close_confirmation",
+                            cohort_id=cohort_id,
+                            scheduled_at=None,
+                        ),
+                        request_started_at=started,
+                        received_at=received,
+                        payload=body,
+                        status=CaptureStatus.COMPLETE if isinstance(body, dict) else CaptureStatus.FAILED,
+                        source_timestamp=None,
+                        source_published_at=None,
+                        page_index=0,
+                        attempt_index=0,
+                        continuation={},
+                        error_type=None,
+                    )
+                )
+        except OSError as exc:
+            logger.warning("[DATA] stage=close_confirmation code=%s status=DEGRADED reason=%s", code, type(exc).__name__)
     price_output = price_res.get("output") if isinstance(price_res, dict) and price_res.get("rt_cd") == "0" and isinstance(price_res.get("output"), dict) else {}
     book_output2 = book_res.get("output2") if isinstance(book_res, dict) and book_res.get("rt_cd") == "0" and isinstance(book_res.get("output2"), dict) else {}
     return price_output, book_output2
@@ -148,8 +217,14 @@ async def run_close_finalization(
     retry_interval_seconds: float = 30.0,
     pick_codes: frozenset[str] = frozenset(),
     on_outcome: Callable[..., Any] | None = None,
+    capture_store: CaptureStore | None = None,
+    run_id: str | None = None,
+    cohort_id: str | None = None,
 ) -> int:
     """당일 아카이브 행을 확정값으로 in-place 갱신하고 확정 행 수를 반환한다 (우선순위, bounded concurrency, on_outcome)."""
+    capture_on = not (capture_store is None and run_id is None and cohort_id is None)
+    if capture_on and (capture_store is None or not run_id or not cohort_id):
+        raise ValueError("inconsistent close-confirmation capture context")
     now_fn = now_fn or (lambda: datetime.now(ZoneInfo("Asia/Seoul")))
     sleep_fn = sleep_fn or asyncio.sleep
     snap = snapshot_date or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
@@ -176,7 +251,7 @@ async def run_close_finalization(
             if tick.strftime("%H%M%S") > CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS:
                 break  # 행 단위 데드라인 — 데드라인 이후 배치는 시작하지 않는다
             quotes = await asyncio.gather(
-                *(fetch_confirmed_quote(client, session, str(df.at[idx, "종목코드"])) for idx in batch)
+                *(fetch_confirmed_quote(client, session, str(df.at[idx, "종목코드"]), capture_store=capture_store, run_id=run_id, cohort_id=cohort_id) for idx in batch)
             )
             for idx, (price_output, book_output2) in zip(batch, quotes, strict=True):
                 code = str(df.at[idx, "종목코드"])
@@ -207,6 +282,31 @@ async def run_close_finalization(
         await sleep_fn(retry_interval_seconds)
     if n_finalized >= 1:
         archive.upsert_archive_snapshot(df, snapshot_date=snap)
+    if capture_on:
+        assert capture_store is not None
+        assert run_id is not None
+        assert cohort_id is not None
+        try:
+            confirmed_frame = df[df[CLOSE_CONFIRMED_COL].fillna(False).astype(bool)].copy()
+            if len(confirmed_frame) > 0:
+                capture_store.publish_frame(
+                    confirmed_frame,
+                    context=CaptureContext(
+                        trading_date=date.fromisoformat(snap),
+                        run_id=run_id,
+                        dataset=CaptureDataset.DAILY_BARS,
+                        vendor="owner-local",
+                        endpoint="close-confirmation",
+                        symbol=None,
+                        venue="KRX",
+                        session="regular",
+                        capture_reason="close_confirmation",
+                        cohort_id=cohort_id,
+                        scheduled_at=None,
+                    ),
+                )
+        except OSError as exc:
+            logger.warning("[DATA] stage=close_confirmation status=DEGRADED reason=%s", type(exc).__name__)
     unconfirmed = [str(df.at[i, "종목코드"]) for i in pending]
     unresolved_codes = [str(df.at[i, "종목코드"]) for i in unresolved]
     unconfirmed_picks = sorted(c for c in [*unconfirmed, *unresolved_codes] if c in pick_codes)
@@ -252,6 +352,20 @@ async def _amain(args) -> int:
     try:
         await owned_client.ensure_token(session)
         snap = args.date or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+        capture_store = None
+        run_id = None
+        cohort_id = None
+        if bool(settings.COLLECTION_RAW_ENABLED):
+            try:
+                from src.data.capture_store import CaptureStore as _Store
+
+                root = settings.COLLECTION_ROOT
+                _root = root if root is not None else settings.HISTORY_DIR / "capture"
+                _store = _Store(_root)
+                _cohort = _store.read_cohort(snap, available_by=datetime.now(ZoneInfo("Asia/Seoul")))
+                capture_store, run_id, cohort_id = _store, f"close-{snap}", _cohort.cohort_id
+            except (FileNotFoundError, ValueError, OSError):
+                capture_store, run_id, cohort_id = None, None, None
         n = await run_close_finalization(
             snapshot_date=snap,
             client=owned_client,
@@ -259,6 +373,9 @@ async def _amain(args) -> int:
             retry_interval_seconds=args.retry_interval,
             pick_codes=load_pick_codes(snap),
             on_outcome=functools.partial(record_run_outcome, "finalize_close"),
+            capture_store=capture_store,
+            run_id=run_id,
+            cohort_id=cohort_id,
         )
     finally:
         await session.close()

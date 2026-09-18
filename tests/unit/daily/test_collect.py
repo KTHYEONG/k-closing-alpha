@@ -801,6 +801,7 @@ def test_main_skips_cleanly_on_non_trading_day(monkeypatch) -> None:
     import asyncio
     from datetime import datetime
     from unittest.mock import AsyncMock
+    from zoneinfo import ZoneInfo
 
     from src.daily import collect
 
@@ -1929,3 +1930,672 @@ def test_main_issues_shard_token_and_fans_out_to_sharded_collect(monkeypatch) ->
     assert captured["n_clients"] == 2
     assert len(issued) == 2
     assert issued[1][0] == "k5"
+
+
+# ---------------------------------------------------------------------------
+# closing_capture_06 decision-input invariant guards
+# ---------------------------------------------------------------------------
+
+def _capture_quote_payload(code="005930", price="18000"):
+    return {
+        "rt_cd": "0",
+        "output": {
+            "stck_shrn_iscd": code, "stck_prpr": price, "stck_sdpr": "17142",
+            "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800",
+            "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100",
+            "hts_avls": "3000", "acml_tr_pbmn": "50000000000",
+            "rprs_mrkt_kor_name": "KOSPI",
+        },
+    }
+
+
+def _capture_investor_payload():
+    return {"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "10", "orgn_fake_ntby_qty": "20"}]}
+
+
+def _capture_book_payload():
+    return {"rt_cd": "0", "output1": {"askp1": "18010", "bidp1": "17990"}, "output2": {"antc_cnpr": "18020"}}
+
+
+def _capture_cohort(codes=("005930",), trading_day="2026-09-14"):
+    from datetime import date
+
+    from src.data.capture_contracts import build_cohort
+
+    scanned = [str(c) for c in codes]
+    return build_cohort(
+        date.fromisoformat(trading_day), scanned, scanned, {},
+        eligibility_rule_version="price_history_panel@v1",
+    )
+
+
+def _raw_envelopes(root):
+    import gzip
+    import json
+    from pathlib import Path
+
+    return [
+        (str(path), json.loads(gzip.decompress(path.read_bytes()).decode("utf-8")))
+        for path in sorted(Path(root).rglob("*.json.gz"))
+    ]
+
+
+class _DelayedCaptureClient:
+    def __init__(self, price=None, investor=None, book=None, delays=(0.05, 0.0, 0.02)):
+        import asyncio as _asyncio
+
+        self._asyncio = _asyncio
+        self.price = price if price is not None else _capture_quote_payload()
+        self.investor = investor if investor is not None else _capture_investor_payload()
+        self.book = book if book is not None else _capture_book_payload()
+        self.delays = delays
+
+    async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+        await self._asyncio.sleep(self.delays[0])
+        return self.price
+
+    async def get_investor_trend_estimate(self, session, code):
+        await self._asyncio.sleep(self.delays[1])
+        return self.investor
+
+    async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+        await self._asyncio.sleep(self.delays[2])
+        return self.book
+
+
+def test_fetch_single_stock_preserves_per_response_clocks(tmp_path, monkeypatch) -> None:
+    """Raw observations keep individual clocks and row capture is their maximum."""
+    import asyncio
+    from datetime import datetime
+
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
+    store = CaptureStore(tmp_path / "capture")
+    cohort = _capture_cohort()
+    client = _DelayedCaptureClient()
+
+    row, failed, _ob = asyncio.run(
+        collect.fetch_single_stock(
+            0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"},
+            1, asyncio.Semaphore(1), client, object(),
+            capture_store=store, cohort=cohort, run_id="run-clocks",
+        )
+    )
+
+    assert failed == []
+    envelopes = _raw_envelopes(tmp_path / "capture")
+    assert len(envelopes) == 3
+    received = sorted(e["received_at"] for _, e in envelopes)
+    assert len(set(received)) >= 2
+    import pandas as _pd
+    assert _pd.Timestamp(row["snapshot_timestamp"]) == _pd.Timestamp(max(received))
+
+
+def test_fetch_single_stock_uses_scoped_observer_receipts(tmp_path, monkeypatch) -> None:
+    """Observer receipts, not the outer gather clock, certify per-response times."""
+    import asyncio
+    import contextlib
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
+    kst = ZoneInfo("Asia/Seoul")
+    base = datetime(2026, 9, 14, 15, 20, 0, tzinfo=kst)
+
+    class _Scoped(_DelayedCaptureClient):
+        def __init__(self):
+            super().__init__(delays=(0.0, 0.0, 0.0))
+            self.calls = 0
+
+        @contextlib.contextmanager
+        def observe_market_responses(self, on_page):
+            self.calls += 1
+            started = base + timedelta(seconds=self.calls * 10)
+            yield
+            on_page({"rt_cd": "0"}, {"tr_id": "X"}, started, started + timedelta(seconds=self.calls), 0, 0)
+
+    store = CaptureStore(tmp_path / "capture")
+    row, failed, _ob = asyncio.run(
+        collect.fetch_single_stock(
+            0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"},
+            1, asyncio.Semaphore(1), _Scoped(), object(),
+            capture_store=store, cohort=_capture_cohort(), run_id="run-scoped",
+        )
+    )
+
+    assert failed == []
+    import pandas as _pd2
+    assert _pd2.Timestamp(row["snapshot_timestamp"]) == _pd2.Timestamp(base + timedelta(seconds=33))
+
+
+def test_scoped_observer_without_event_uses_call_clock_and_failure_metadata(tmp_path, monkeypatch) -> None:
+    """A silent observer falls back to the call clock, while observed failures retain their error class."""
+    import asyncio
+    import contextlib
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
+
+    class _SilentScoped(_DelayedCaptureClient):
+        @contextlib.contextmanager
+        def observe_market_responses(self, _on_page):
+            yield
+
+    store = CaptureStore(tmp_path / "capture")
+    row, failed, _ = asyncio.run(
+        collect.fetch_single_stock(
+            0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"},
+            1, asyncio.Semaphore(1), _SilentScoped(delays=(0.0, 0.0, 0.0)), object(),
+            capture_store=store, cohort=_capture_cohort(), run_id="run-silent",
+        )
+    )
+    assert failed == []
+    assert row["snapshot_timestamp"].tzinfo is not None
+
+    now = datetime(2026, 9, 14, 15, 20, tzinfo=ZoneInfo("Asia/Seoul"))
+    context = collect._capture_context_for(
+        _capture_cohort().trading_date, "run-error", _capture_cohort().cohort_id,
+        collect.CaptureDataset.PRICE, "005930", "inquire-price",
+    )
+    collect._persist_observed_market_page(
+        store, context, None, {"error_type": "TimeoutError"}, now, now, 0, 0
+    )
+    failure = [
+        envelope for _, envelope in _raw_envelopes(tmp_path / "capture")
+        if envelope["context"]["run_id"] == "run-error"
+    ]
+    assert failure[0]["error_type"] == "TimeoutError"
+
+
+def test_fetch_single_stock_rejects_incomplete_capture_context() -> None:
+    """Capture context is all-or-nothing."""
+    import asyncio
+
+    import pytest
+
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+
+    store = CaptureStore.__new__(CaptureStore)
+    with pytest.raises(ValueError, match="incomplete or inconsistent"):
+        asyncio.run(
+            collect.fetch_single_stock(
+                0, {"code": "005930", "name": "X", "price": "1", "chgrate": "0"},
+                1, asyncio.Semaphore(1), object(), object(),
+                capture_store=store, cohort=None, run_id=None,
+            )
+        )
+
+
+def test_fetch_single_stock_propagates_capture_persistence_failure(monkeypatch) -> None:
+    """Capture-store persistence failure prevents a new audited decision input."""
+    import asyncio
+
+    import pytest
+
+    from src.daily import collect
+
+    class _FailingStore:
+        def append_response(self, response):
+            raise OSError("disk unavailable")
+
+    client = _DelayedCaptureClient(delays=(0.0, 0.0, 0.0))
+    with pytest.raises(OSError, match="disk unavailable"):
+        asyncio.run(
+            collect.fetch_single_stock(
+                0, {"code": "005930", "name": "X", "price": "18000", "chgrate": "5.0"},
+                1, asyncio.Semaphore(1), client, object(),
+                capture_store=_FailingStore(), cohort=_capture_cohort(), run_id="run-fail",
+            )
+        )
+
+
+def test_persist_market_response_retries_conflicting_identity(tmp_path) -> None:
+    """Retry attempts keep separate identities instead of discarding the first."""
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+
+    store = CaptureStore(tmp_path / "capture")
+    cohort = _capture_cohort()
+    client = _DelayedCaptureClient(delays=(0.0, 0.0, 0.0))
+    now_fn = lambda: datetime(2026, 9, 14, 15, 21, 0, tzinfo=ZoneInfo("Asia/Seoul"))  # noqa: E731
+
+    async def _run():
+        first = await collect.fetch_single_stock(
+            0, {"code": "005930", "name": "X", "price": "18000", "chgrate": "5.0"},
+            1, asyncio.Semaphore(1), client, object(),
+            capture_store=store, cohort=cohort, run_id="run-retry",
+        )
+        client.price = {"rt_cd": "1", "msg1": "tps"}
+        failed_first = await collect.fetch_single_stock(
+            0, {"code": "005930", "name": "X", "price": "18000", "chgrate": "5.0"},
+            1, asyncio.Semaphore(1), client, object(),
+            capture_store=store, cohort=cohort, run_id="run-retry",
+        )
+        return first, failed_first
+
+    first, failed_first = asyncio.run(_run())
+    assert first[1] == []
+    assert "현재가" in failed_first[1]
+    price_files = [p for p, e in _raw_envelopes(tmp_path / "capture") if e["context"]["dataset"] == "PRICE"]
+    assert len(price_files) == 2
+    _ = now_fn
+
+
+def test_requote_keeps_failed_first_attempt_evidence(tmp_path, monkeypatch) -> None:
+    """Both raw attempts survive with distinct identities when requote succeeds."""
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+    from src.processing.schema import QUOTE_FAILED_COL
+
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
+    store = CaptureStore(tmp_path / "capture")
+    cohort = _capture_cohort()
+
+    class _Flaky(_DelayedCaptureClient):
+        def __init__(self):
+            super().__init__(delays=(0.0, 0.0, 0.0))
+            self.n = 0
+
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            self.n += 1
+            if self.n == 1:
+                return {"rt_cd": "1", "msg1": "tps"}
+            return _capture_quote_payload()
+
+    stock_list = [{"code": "005930", "name": "X", "price": "18000", "chgrate": "5.0"}]
+    results, _failed = asyncio.run(
+        collect.fetch_all_stock_data(
+            stock_list, _Flaky(), object(),
+            now_fn=lambda: datetime(2026, 9, 14, 15, 21, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+            capture_store=store, cohort=cohort, run_id="run-requote",
+        )
+    )
+    assert results[0][QUOTE_FAILED_COL] is False
+    price_files = [p for p, e in _raw_envelopes(tmp_path / "capture") if e["context"]["dataset"] == "PRICE"]
+    assert len(price_files) == 2
+
+
+def test_missing_investor_estimate_is_unknown_not_zero(tmp_path, monkeypatch) -> None:
+    """Empty investor output2 is an unknown estimate, never certified zero flow."""
+    import asyncio
+    import math
+
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+
+    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
+    store = CaptureStore(tmp_path / "capture")
+    client = _DelayedCaptureClient(investor={"rt_cd": "0", "output2": []}, delays=(0.0, 0.0, 0.0))
+    row, _failed, _ob = asyncio.run(
+        collect.fetch_single_stock(
+            0, {"code": "005930", "name": "X", "price": "18000", "chgrate": "5.0"},
+            1, asyncio.Semaphore(1), client, object(),
+            capture_store=store, cohort=_capture_cohort(), run_id="run-unknown",
+        )
+    )
+    assert row["수급_실패"] is True
+    assert math.isnan(float(row["기관_순매수"]))
+    assert math.isnan(float(row["외국인_순매수"]))
+
+
+def test_capture_root_follows_configured_override(tmp_path, monkeypatch) -> None:
+    """Capture root honors the configured override directory."""
+    from pathlib import Path
+
+    from src.daily import collect
+
+    monkeypatch.setattr(collect.settings, "COLLECTION_ROOT", tmp_path / "custom")
+    assert collect._capture_root() == Path(tmp_path / "custom")
+
+
+def test_persist_conflicting_identity_eventually_fails() -> None:
+    """Repeated identity conflicts surface as publication failure."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pytest
+
+    from src.daily import collect
+
+    class _AlwaysConflict:
+        def append_response(self, response):
+            raise ValueError("conflicting immutable artifact identity: 'x'")
+
+    cohort = _capture_cohort()
+    now = datetime(2026, 9, 14, 15, 20, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    context = collect._capture_context_for(cohort.trading_date, "run-x", cohort.cohort_id, collect.CaptureDataset.PRICE, "005930", "inquire-price")
+    with pytest.raises(OSError, match="cannot be published"):
+        collect._persist_market_response(_AlwaysConflict(), context, {"rt_cd": "0", "a": 2}, now, now)
+
+
+def test_persist_non_conflicting_value_error_propagates(tmp_path) -> None:
+    """Non-identity validation errors are not retried as new attempts."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pytest
+
+    from src.daily import collect
+
+    class _BadStore:
+        def append_response(self, response):
+            raise ValueError("bad payload")
+
+    now = datetime(2026, 9, 14, 15, 20, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    context = collect._capture_context_for(_capture_cohort().trading_date, "run-x", "cohort-y", collect.CaptureDataset.PRICE, "005930", "inquire-price")
+    with pytest.raises(ValueError, match="bad payload"):
+        collect._persist_market_response(_BadStore(), context, {"rt_cd": "0"}, now, now)
+
+
+def _healthy_wide_row(code="005930", quote_failed=False):
+    return {
+        "종목명": code, "종목코드": code, "시장구분": "KOSPI",
+        "시가": 17900.0, "고가": 18100.0, "저가": 17800.0, "종가": 18000.0,
+        "전일종가": 17142.86, "거래량": 1_000_000.0, "거래대금": 500.0,
+        "시가총액": 3000.0, "기관_순매수": 10.0, "외국인_순매수": 5.0,
+        "등락률": 5.0, "수급_실패": False, "현재가_실패": quote_failed,
+        "결정_종가": 18000.0, "종가_확정": False,
+    }
+
+
+def _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, eligible, *, with_snapshot=False, call_observer=False):
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+    from zoneinfo import ZoneInfo
+
+    from src.daily import collect
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 14, 15, 20, 5, tzinfo=tz)
+
+    class _FakeKis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ensure_token(self, session):
+            return None
+
+        async def get_market_index_rate(self, session, code):
+            return {"rt_cd": "1"}
+
+    async def _trading_day(_client, _session, _date):
+        return True
+
+    async def _fake_scan(client_arg, session_arg, **kwargs):
+        observer = kwargs.get("on_page")
+        if call_observer and observer is not None:
+            observer({"rt_cd": "0", "output": []}, {"vendor": "kiwoom"}, _FrozenDatetime.now(ZoneInfo("Asia/Seoul")), _FrozenDatetime.now(ZoneInfo("Asia/Seoul")), 0, 0)
+        return scanned
+
+    async def _fake_sharded(stock_list, clients, session, **kwargs):
+        out_rows = []
+        for row in rows:
+            duplicated = dict(row)
+            if with_snapshot:
+                import pandas as pd
+
+                duplicated["snapshot_timestamp"] = pd.Timestamp("2026-09-14 15:20:01", tz="Asia/Seoul")
+            out_rows.append(duplicated)
+        return out_rows, []
+
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
+    monkeypatch.setattr(collect, "kis_decision_shard_client_kwargs", lambda: [{}])
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
+    monkeypatch.setattr(collect, "resolve_daily_candidates", _fake_scan)
+    monkeypatch.setattr(collect, "resolve_eligible_codes", AsyncMock(return_value=eligible))
+    monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _fake_sharded)
+    monkeypatch.setattr(collect, "persist_daily_snapshot", lambda df, snapshot_date=None: len(df))
+    monkeypatch.setattr(collect, "_capture_root", lambda: tmp_path / "capture")
+    import src.api.kis.indicators as indicators_mod
+
+    async def _no_vol(*args, **kwargs):
+        raise RuntimeError("no vol")
+
+    monkeypatch.setattr(indicators_mod, "fetch_index_and_calculate_volatility", _no_vol)
+    import src.data.panel_integrity as panel_mod
+
+    def _no_panel(*args, **kwargs):
+        raise RuntimeError("no panel")
+
+    monkeypatch.setattr(panel_mod, "load_price_panel", _no_panel)
+    return asyncio.run(collect.main(force=False))
+
+
+def test_main_publishes_partial_inputs_before_coverage_failure(tmp_path, monkeypatch) -> None:
+    """Coverage rejection does not erase stored decision inputs."""
+    from pathlib import Path
+
+    import pytest
+
+    rows = [_healthy_wide_row("005930", quote_failed=True), _healthy_wide_row("000660", quote_failed=True)]
+    scanned = [
+        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+    ]
+    with pytest.raises(ValueError, match="coverage"):
+        _run_main_with_mocks(
+            monkeypatch, tmp_path, rows, scanned, frozenset({"005930", "000660"}),
+            with_snapshot=True,
+            call_observer=True,
+        )
+    assert list(Path(tmp_path / "capture" / "decision").rglob("input.parquet")) != []
+
+
+def test_main_publishes_certified_inputs_before_legacy_finalization(tmp_path, monkeypatch) -> None:
+    """Qualified decision publication precedes coverage checks and archive writes."""
+    from pathlib import Path
+
+    import pandas as pd
+
+    rows = [_healthy_wide_row("005930"), _healthy_wide_row("000660")]
+    scanned = [
+        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+    ]
+    _run_main_with_mocks(
+        monkeypatch, tmp_path, rows, scanned, frozenset({"005930", "000660"}),
+        with_snapshot=True,
+    )
+    stored = list(Path(tmp_path / "capture" / "decision").rglob("input.parquet"))
+    assert stored != []
+    frame = pd.read_parquet(stored[0])
+    assert set(frame["종목코드"].astype(str)) == {"005930", "000660"}
+    assert "feature_available_timestamp" in frame.columns
+
+
+def test_main_legacy_mode_skips_certified_capture(tmp_path, monkeypatch) -> None:
+    """Explicit legacy mode retains existing behavior without certified captures."""
+    from src.daily import collect
+
+    monkeypatch.setattr(collect.settings, "COLLECTION_RAW_ENABLED", False)
+    rows = [_healthy_wide_row("005930"), _healthy_wide_row("000660")]
+    scanned = [
+        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+    ]
+    _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, frozenset({"005930", "000660"}))
+    assert not (tmp_path / "capture").exists()
+
+
+def test_decision_publication_retains_admission_failures(tmp_path) -> None:
+    """Admission failure stays in research with values and admitted=False."""
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.data.capture_contracts import CoverageEntry, CaptureDataset, CaptureStatus, build_cohort
+    from src.data.capture_store import CaptureStore
+
+    trading_day = date(2026, 9, 14)
+    cohort = build_cohort(
+        trading_day, ["000001", "000002"], ["000001", "000002"], {},
+        eligibility_rule_version="price_history_panel@v1",
+    )
+    completed_at = datetime(2026, 9, 14, 15, 20, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+    frame = pd.DataFrame([
+        {"종목코드": "000001", "종가": 18000.0, "admitted": True,
+         "snapshot_timestamp": pd.Timestamp("2026-09-14 15:20:01", tz="Asia/Seoul"),
+         "feature_available_timestamp": completed_at},
+        {"종목코드": "000002", "종가": 30000.0, "admitted": False,
+         "snapshot_timestamp": pd.Timestamp("2026-09-14 15:20:02", tz="Asia/Seoul"),
+         "feature_available_timestamp": completed_at},
+    ])
+    store = CaptureStore(tmp_path / "capture")
+    entries = (CoverageEntry(
+        symbol=None, dataset=CaptureDataset.PRICE, venue="KRX", session="regular",
+        scheduled_at=None, status=CaptureStatus.COMPLETE, rows=2,
+        first_event_time=None, last_event_time=None, reason="decision-input", raw_refs=(),
+    ),)
+    store.publish_decision(frame, cohort=cohort, run_id="run-admit", completed_at=completed_at, entries=entries)
+    replayed = store.read_decision("2026-09-14", available_by=datetime(2026, 9, 14, 15, 21, 0, tzinfo=ZoneInfo("Asia/Seoul")))
+    rejected = replayed[replayed["종목코드"] == "000002"].iloc[0]
+    assert bool(rejected["admitted"]) is False
+    assert float(rejected["종가"]) == 30000.0
+
+
+def test_scan_prefilter_evidence_survives_without_widening() -> None:
+    """Raw prefilter evidence survives without widening trading picks."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_candidate_stock_list
+
+    seen = []
+
+    class _Kiwoom:
+        async def get_fluctuation_ranking(self, session, *, rate_min_pct, rate_max_pct, on_page=None):
+            raw = [
+                {"stk_cd": "000001", "stk_nm": "IN", "cur_prc": "18000", "flu_rt": "5.0"},
+                {"stk_cd": "999999", "stk_nm": "OUT", "cur_prc": "1000", "flu_rt": "50.0"},
+            ]
+            if on_page is not None:
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+
+                now = datetime.now(ZoneInfo("Asia/Seoul"))
+                on_page({"output": raw}, {"vendor": "kiwoom"}, now, now, 0, 0)
+            filtered = [r for r in raw if float(r["flu_rt"]) < 10.0]
+            return {"rt_cd": "0", "output": filtered}
+
+    def _observer(payload, metadata, started, received, page, attempt):
+        seen.append(payload)
+
+    out = asyncio.run(fetch_candidate_stock_list(AsyncMock(), object(), kiwoom_client=_Kiwoom(), on_page=_observer))
+    assert [row["code"] for row in out] == ["000001"]
+    assert seen and len(seen[0]["output"]) == 2
+
+
+def test_narrow_toss_fallback_scope_is_explicit() -> None:
+    """Toss fallback records its narrower top-100 source scope."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_candidate_stock_list
+
+    scopes = []
+
+    class _FailingKiwoom:
+        async def get_fluctuation_ranking(self, session, **kwargs):
+            return {"rt_cd": "1", "msg1": "down", "output": []}
+
+    class _Toss:
+        async def get_rankings(self, session, **kwargs):
+            return {"result": {"rankings": [
+                {"symbol": "000001", "price": {"lastPrice": "18000", "changeRate": "0.05"}},
+            ]}}
+
+    def _observer(payload, metadata, started, received, page, attempt):
+        scopes.append(dict(metadata))
+
+    out = asyncio.run(
+        fetch_candidate_stock_list(AsyncMock(), object(), kiwoom_client=_FailingKiwoom(), toss_client=_Toss(), on_page=_observer)
+    )
+    assert [row["code"] for row in out] == ["000001"]
+    assert any(scope.get("scope") == "top100" for scope in scopes)
+
+
+def test_kis_band_subquery_evidence_uses_actual_clocks() -> None:
+    """KIS band sub-query responses are recorded with actual receive times."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily.universe_scan import fetch_kis_band_ranking
+
+    stamps = []
+
+    class _Kis:
+        async def get_fluctuation_ranking(self, session, *, rate_min_pct, rate_max_pct, market_div_code=None):
+            return {"rt_cd": "0", "output": [
+                {"stck_shrn_iscd": "000001", "hts_kor_isnm": "A", "stck_prpr": "18000",
+                 "stck_sdpr": "17142", "prdy_ctrt": "5.0", "acml_vol": "100", "acml_tr_pbmn": "100000000"},
+            ]}
+
+    def _observer(payload, metadata, started, received, page, attempt):
+        stamps.append((started, received, dict(metadata)))
+
+    rows = asyncio.run(
+        fetch_kis_band_ranking(_Kis(), AsyncMock(), rate_min_pct=2.0, rate_max_pct=2.01, on_page=_observer)
+    )
+    assert len(rows) == 1
+    assert stamps and stamps[0][1] >= stamps[0][0]
+    assert stamps[0][2]["vendor"] == "kis"
+
+
+def test_resolve_daily_candidates_forwards_scan_observer(monkeypatch) -> None:
+    """Scan observer reaches both the primary scan and the trade-value union."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import src.daily.collect as collect_mod
+
+    seen: dict = {}
+    union_seen: dict = {}
+
+    async def _fake_scan(client_arg, session_arg, **kwargs):
+        seen.update(kwargs)
+        return [{"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"}]
+
+    async def _fake_union(session_arg, **kwargs):
+        union_seen.update(kwargs)
+        return [{"code": "000660", "name": None, "price": "180000", "chgrate": "0.01"}]
+
+    monkeypatch.setattr(collect_mod, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect_mod, "fetch_trade_value_union", _fake_union)
+    sentinel = object()
+
+    out = asyncio.run(collect_mod.resolve_daily_candidates(AsyncMock(), object(), toss_client=AsyncMock(), on_page=sentinel))
+
+    assert [row["code"] for row in out] == ["005930", "000660"]
+    assert seen.get("on_page") is sentinel
+    assert union_seen.get("on_page") is sentinel

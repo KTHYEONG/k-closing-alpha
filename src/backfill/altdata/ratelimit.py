@@ -9,6 +9,7 @@ from collections.abc import Callable
 from typing import TypeVar
 
 from src.backfill.altdata.config import AltDataFetchConfig
+from src.data.capture_contracts import RawCaptureError
 
 logger = logging.getLogger(__name__)
 
@@ -73,20 +74,23 @@ def wait_for_krx_slot(cfg: AltDataFetchConfig) -> None:
 
 
 def retry_call(fn: Callable[[], _T], cfg: AltDataFetchConfig, *, label: str) -> _T | None:
-    """함수를 재시도 로직으로 호출합니다.
+    """Retry source operations while allowing durable-capture failures to escape.
 
     Args:
-        fn: 호출할 함수.
-        cfg: Alt-data 설정.
-        label: 로그 레이블.
-
+        fn: Existing source operation.
+        cfg: Existing retry configuration.
+        label: Credential-free diagnostic label.
     Returns:
-        성공 시 함수의 반환값, 전체 실패 시 None.
+        Successful operation result or None after existing source retries.
+    Raises:
+        RawCaptureError: Durable observation failed; it is not a recoverable source error.
     """
     last_exc: Exception | None = None
     for attempt in range(max(1, int(cfg.retries))):
         try:
             return fn()
+        except RawCaptureError:
+            raise
         except Exception as exc:
             last_exc = exc
             if attempt < int(cfg.retries) - 1:

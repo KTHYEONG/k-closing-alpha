@@ -11,7 +11,8 @@ import argparse
 import asyncio
 import logging
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import aiohttp
@@ -20,8 +21,19 @@ import pandas as pd
 from src import settings
 from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.api.kis.key_pool import load_kis_env, read_token_issued_date, resolve_host_issued_credentials, token_cache_path
+from src.config.collection import CollectionSettings
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.archive_intraday import resolve_previous_archive_date
+from src.daily.auction_capture import _close_rounds, _program_rounds
+from src.data.capture_contracts import (
+    SEOUL,
+    CaptureDataset,
+    CaptureManifest,
+    CaptureStatus,
+    CoverageEntry,
+    SessionClock,
+)
+from src.data.capture_store import CaptureStore
 from src.data.intraday_store import intraday_partition_path
 from src.data.trading_calendar import is_kis_trading_day
 from src.execution.paper_broker import PaperLedger
@@ -36,6 +48,9 @@ DAY_HOLIDAY: str = "holiday"
 DAY_TRADING: str = "trading"
 # 달력 조회 장애: 휴장일로 단정하지 않고 감사를 수행한다(장애 조기 발견 우선)
 DAY_UNKNOWN: str = "unknown"
+_CHART_DATASETS: tuple[CaptureDataset, CaptureDataset] = (CaptureDataset.MINUTE_BARS, CaptureDataset.TRADE_TICKS)
+_TERMINAL_REASONS: frozenset[str] = frozenset({"exhausted", "crossed_target_date"})
+_SLOW_DATA_DUE_HHMMSS: str = "213500"
 AUDIT_STEPS: tuple[str, ...] = (
     "archive",
     "close_confirmed",
@@ -215,12 +230,227 @@ def list_stale_kis_tokens(
     )
 
 
+def _collection_issue(dataset: str, count: int, reason: str) -> str:
+    return f"collection:{dataset}:{count}:{reason}"
+
+
+def _terminal_proof(reason: str) -> bool:
+    return reason.split(":")[0] in _TERMINAL_REASONS
+
+
+def _outside_regular_session(entry: CoverageEntry, session_clock: SessionClock) -> bool:
+    if entry.first_event_time is not None and entry.first_event_time < session_clock.open_at:
+        return True
+    return entry.last_event_time is not None and entry.last_event_time > session_clock.close_at
+
+
+def _audit_regular_bars(
+    manifests: tuple[CaptureManifest, ...],
+    expected: tuple[str, ...],
+    session_clock: SessionClock,
+) -> list[str]:
+    issues: list[str] = []
+    for dataset in _CHART_DATASETS:
+        label = "charts" if dataset is CaptureDataset.MINUTE_BARS else "ticks"
+        by_symbol: dict[str, list[CoverageEntry]] = {}
+        for manifest in manifests:
+            if manifest.status == CaptureStatus.PENDING:
+                continue
+            for entry in manifest.entries:
+                if entry.dataset is not dataset or entry.session != "regular" or entry.symbol is None:
+                    continue
+                by_symbol.setdefault(entry.symbol, []).append(entry)
+        missing = sum(1 for symbol in expected if not by_symbol.get(symbol))
+        incomplete = sum(
+            1
+            for symbol in expected
+            if by_symbol.get(symbol) and not any(e.status == CaptureStatus.COMPLETE for e in by_symbol[symbol])
+        )
+        unproven = 0
+        violations = 0
+        for symbol in expected:
+            entries = by_symbol.get(symbol, [])
+            complete = [e for e in entries if e.status == CaptureStatus.COMPLETE]
+            if entries and complete and any(not _terminal_proof(e.reason) for e in complete):
+                unproven += 1
+            if any(_outside_regular_session(e, session_clock) for e in entries):
+                violations += 1
+        if missing:
+            issues.append(_collection_issue(label, missing, "missing_entries"))
+        if incomplete:
+            issues.append(_collection_issue(label, incomplete, "incomplete_entries"))
+        if unproven:
+            issues.append(_collection_issue(label, unproven, "terminal_proof_missing"))
+        if violations:
+            issues.append(_collection_issue(label, violations, "session_violation"))
+    return issues
+
+
+def _audit_auction_sweeps(
+    manifests: tuple[CaptureManifest, ...],
+    expected: tuple[str, ...],
+    profile: CollectionSettings,
+    session_clock: SessionClock,
+    audit_at: datetime,
+) -> list[str]:
+    issues: list[str] = []
+    if audit_at >= session_clock.close_at:
+        rounds = _close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS))
+        program_rounds = _program_rounds(session_clock)
+        actual: set[tuple[str, str, datetime]] = set()
+        incomplete = 0
+        for manifest in manifests:
+            if manifest.context.capture_reason != "auction-close" or manifest.status == CaptureStatus.PENDING:
+                continue
+            for entry in manifest.entries:
+                if entry.status != CaptureStatus.COMPLETE:
+                    incomplete += 1
+                if entry.symbol is not None and entry.scheduled_at is not None:
+                    actual.add((entry.symbol, entry.dataset.value, entry.scheduled_at))
+        missing = 0
+        for symbol in expected:
+            for slot in rounds:
+                if (symbol, CaptureDataset.ORDERBOOK.value, slot) not in actual:
+                    missing += 1
+            for slot in program_rounds:
+                if (symbol, CaptureDataset.PROGRAM.value, slot) not in actual:
+                    missing += 1
+        if missing:
+            issues.append(_collection_issue("auction_close", missing, "missing_entries"))
+        if incomplete:
+            issues.append(_collection_issue("auction_close", incomplete, "incomplete_entries"))
+    open_due_at = session_clock.open_at + timedelta(seconds=int(profile.COLLECTION_OPEN_CONFIRM_SECONDS))
+    if audit_at >= open_due_at:
+        terminal = [
+            m
+            for m in manifests
+            if m.context.capture_reason == "auction-open" and m.status != CaptureStatus.PENDING
+        ]
+        if not terminal:
+            issues.append(_collection_issue("auction_open", 1, "missing_manifest"))
+        else:
+            bad = sum(1 for m in terminal for e in m.entries if e.status != CaptureStatus.COMPLETE)
+            if bad:
+                issues.append(_collection_issue("auction_open", bad, "incomplete_entries"))
+    return issues
+
+
+def _audit_slow_data(
+    manifests: tuple[CaptureManifest, ...],
+    trading_date: date,
+    audit_at: datetime,
+) -> tuple[str, ...]:
+    due_at = datetime(
+        trading_date.year,
+        trading_date.month,
+        trading_date.day,
+        int(_SLOW_DATA_DUE_HHMMSS[0:2]),
+        int(_SLOW_DATA_DUE_HHMMSS[2:4]),
+        int(_SLOW_DATA_DUE_HHMMSS[4:6]),
+        tzinfo=SEOUL,
+    )
+    if audit_at < due_at:
+        return ()
+    terminal = [
+        m for m in manifests if m.context.capture_reason == "altdata-backfill" and m.status != CaptureStatus.PENDING
+    ]
+    if not terminal:
+        return (_collection_issue("slow_data", 1, "missing_run"),)
+    if not any(m.status == CaptureStatus.COMPLETE for m in terminal):
+        return (_collection_issue("slow_data", len(terminal), "incomplete_run"),)
+    return ()
+
+
+def audit_collection_manifests(
+    trading_date: date,
+    *,
+    store: CaptureStore,
+    profile: CollectionSettings,
+    session_clock: SessionClock,
+    audit_at: datetime,
+) -> tuple[str, ...]:
+    """Explain collection gaps against the owner-local expected population and schedule.
+
+    Args:
+        trading_date: Actual audited market date.
+        store: Immutable artifacts and coverage manifests.
+        profile: Enabled dataset and acquisition profiles.
+        session_clock: Verified session times for this date.
+        audit_at: Aware cutoff; future scheduled tasks are pending.
+    Returns:
+        Stable credential-free issue strings with dataset, count and reason.
+    Raises:
+        ValueError: Inconsistent date or naive audit cutoff.
+    """
+    if session_clock.trading_date != trading_date:
+        raise ValueError(
+            f"session clock trading_date {session_clock.trading_date.isoformat()} != trading_date {trading_date.isoformat()}"
+        )
+    if audit_at.tzinfo is None or audit_at.utcoffset() is None:
+        raise ValueError("audit_at must be timezone-aware")
+    if not profile.COLLECTION_RAW_ENABLED:
+        return (_collection_issue("provenance", 0, "raw_disabled"),)
+    try:
+        manifests = store.read_manifests(trading_date.isoformat())
+    except (OSError, ValueError):
+        return (_collection_issue("manifest", 1, "unreadable_evidence"),)
+    try:
+        cohort = store.read_cohort(trading_date.isoformat(), available_by=audit_at)
+    except FileNotFoundError:
+        cohort = None
+    auction_enabled = bool(profile.COLLECTION_AUCTION_ENABLED)
+    altdata_enabled = bool(profile.COLLECTION_ALTDATA_ENABLED)
+    if cohort is None and not manifests and not auction_enabled and not altdata_enabled:
+        return ()
+    issues: list[str] = []
+    expected: tuple[str, ...] = cohort.eligible_symbols if cohort is not None else ()
+    if cohort is None:
+        issues.append(_collection_issue("cohort", 0, "missing_cohort"))
+    decision_manifests = [m for m in manifests if m.cohort is not None]
+    if decision_manifests:
+        qualified = False
+        tampered = False
+        for manifest in decision_manifests:
+            try:
+                store.read_decision(
+                    trading_date.isoformat(), available_by=audit_at, run_id=manifest.context.run_id
+                )
+                qualified = True
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                tampered = True
+        if tampered:
+            issues.append(_collection_issue("decision", len(decision_manifests), "integrity_failure"))
+        elif not qualified:
+            issues.append(_collection_issue("decision", len(decision_manifests), "missing_decision_input"))
+    if cohort is not None:
+        issues.extend(_audit_regular_bars(manifests, expected, session_clock))
+    if auction_enabled:
+        issues.extend(_audit_auction_sweeps(manifests, expected, profile, session_clock, audit_at))
+    else:
+        issues.append(_collection_issue("auction", 0, "disabled"))
+    if altdata_enabled:
+        issues.extend(_audit_slow_data(manifests, trading_date, audit_at))
+    else:
+        issues.append(_collection_issue("slow_data", 0, "disabled"))
+    return tuple(issues)
+
+
+def _collection_capture_root(profile: CollectionSettings) -> Path:
+    if profile.COLLECTION_ROOT is not None:
+        return Path(profile.COLLECTION_ROOT)
+    return Path(settings.HISTORY_DIR) / "capture"
+
+
 def build_digest(
     snapshot_date: str,
     day_kind: str,
     result: dict[str, bool] | None,
     failed_units: list[str],
     stale_kis_tokens: list[str],
+    *,
+    collection_issues: Sequence[str] = (),
 ) -> tuple[str, str]:
     """일일 요약의 (제목, 본문)을 만든다.
 
@@ -230,13 +460,17 @@ def build_digest(
         result: audit_daily_completeness 결과. 휴장일에만 None을 허용한다.
         failed_units: list_failed_kca_units 결과.
         stale_kis_tokens: list_stale_kis_tokens 결과.
+        collection_issues: Independently assessed raw-data and schedule gaps.
 
     Returns:
         (제목, 본문) 튜플.
 
     Raises:
         ValueError: 휴장일이 아닌데 result가 None인 경우.
+        ValueError: Existing unsupported date/day-kind combinations.
     """
+    if day_kind not in (DAY_WEEKEND, DAY_HOLIDAY, DAY_TRADING, DAY_UNKNOWN):
+        raise ValueError(f"unsupported day_kind={day_kind!r}")
     lines = [f"date={snapshot_date}", f"day={day_kind}"]
     missing: list[str] = []
     if day_kind != DAY_HOLIDAY:
@@ -246,17 +480,27 @@ def build_digest(
         lines += [f"{step}={'OK' if result.get(step, False) else 'MISSING'}" for step in AUDIT_STEPS]
     lines.append(f"failed_units={','.join(failed_units) if failed_units else 'none'}")
     lines.append(f"stale_kis_tokens={','.join(stale_kis_tokens) if stale_kis_tokens else 'none'}")
-    if not missing and not failed_units and not stale_kis_tokens:
+    lines.append(f"collection_issues={','.join(collection_issues) if collection_issues else 'none'}")
+    if not missing and not failed_units and not stale_kis_tokens and not collection_issues:
         label = "휴장일 SKIP" if day_kind == DAY_HOLIDAY else "일일점검 OK"
         return f"[KCA] {snapshot_date} {label}", "\n".join(lines)
     problems = []
+    summary_lines = ["[🚨 일일점검 경고 요약]"]
     if missing:
         problems.append(f"누락 {','.join(missing)}")
+        summary_lines.append(f"• 누락 단계: {', '.join(missing)}")
     if failed_units:
         problems.append(f"실패유닛 {','.join(failed_units)}")
+        summary_lines.append(f"• 실패 유닛: {', '.join(failed_units)}")
     if stale_kis_tokens:
         problems.append(f"KIS토큰누락 {','.join(stale_kis_tokens)}")
-    return f"[KCA] {snapshot_date} 일일점검 경고: {' / '.join(problems)}", "\n".join(lines)
+        summary_lines.append(f"• KIS 토큰 누락: {', '.join(stale_kis_tokens)}")
+    if collection_issues:
+        problems.append(f"수집이상 {','.join(collection_issues)}")
+        summary_lines.append(f"• 수집 이상: {', '.join(collection_issues)}")
+    body = "\n".join(summary_lines) + "\n\n[상세 내역]\n" + "\n".join(lines)
+    return f"[KCA] {snapshot_date} 일일점검 경고: {' / '.join(problems)}", body
+
 
 
 def run_daily_audit(
@@ -284,10 +528,32 @@ def run_daily_audit(
         logger.info("[DATA] stage=daily_audit status=SKIP reason=weekend date=%s", snapshot_date)
         return None
     result = None if day_kind == DAY_HOLIDAY else audit_daily_completeness(snapshot_date)
-    subject, body = build_digest(snapshot_date, day_kind, result, failed_units_fn(), stale_tokens_fn(snapshot_date))
-    logger.info("[DATA] stage=daily_audit day=%s subject=%s", day_kind, subject)
-    dispatch_fn(subject, body)
+    trading_date = date.fromisoformat(snapshot_date)
+    audit_at = datetime.now(SEOUL)
+    try:
+        profile = CollectionSettings()
+        session_clock = profile.COLLECTION_SESSION_OVERRIDES.get(
+            snapshot_date, SessionClock.standard(trading_date)
+        )
+        store = CaptureStore(_collection_capture_root(profile))
+        collection_issues = audit_collection_manifests(
+            trading_date, store=store, profile=profile, session_clock=session_clock, audit_at=audit_at
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning("[DATA] stage=daily_audit collection_audit=UNAVAILABLE reason=%s", type(exc).__name__)
+        collection_issues = (_collection_issue("audit", 1, "unavailable"),)
+    subject, body = build_digest(
+        snapshot_date, day_kind, result, failed_units_fn(), stale_tokens_fn(snapshot_date),
+        collection_issues=collection_issues,
+    )
+    has_warning = "경고:" in subject
+    if has_warning:
+        logger.warning("[DATA] stage=daily_audit day=%s status=WARNING subject=%s", day_kind, subject)
+        dispatch_fn(subject, body)
+    else:
+        logger.info("[DATA] stage=daily_audit day=%s status=OK subject=%s (dispatch skipped)", day_kind, subject)
     return subject
+
 
 
 def main() -> None:  # pragma: no cover - CLI entry; logic covered via run_daily_audit scenarios
