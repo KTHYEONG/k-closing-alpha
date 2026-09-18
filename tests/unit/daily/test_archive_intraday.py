@@ -713,6 +713,32 @@ def test_run_archive_uses_calendar_previous_day_cohort(monkeypatch, tmp_path) ->
     assert len([item for item in manifests if item.context.run_id.startswith("archive-")]) == 5
 
 
+def test_run_archive_same_day_retry_does_not_collide_with_prior_attempt(monkeypatch, tmp_path) -> None:
+    """실측 회귀: run_id가 날짜로만 고정돼 있어 같은 날 두 번째 실행(수동 재시도 또는
+    실패 후 재기동)이 이전 시도의 불변 매니페스트와 충돌해 ValueError로 즉시 실패하던 버그
+    (2026-09-18 실측: 수동 재실행이 'conflicting immutable artifact identity'로 죽음)."""
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+    entries_map = {
+        "005930": (_empty_bar_frame_for("2026-09-07"), _fake_entry("005930", __import__("src.data.capture_contracts", fromlist=["CaptureDataset"]).CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN")),
+    }
+    fake_collect, _ = _archive_fakes(entries_map)
+    _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+
+    # When: 같은 날 두 번 연속 실행
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+
+    # Then: 두 번째 실행도 충돌 없이 자기 몫의 매니페스트를 남긴다
+    manifests = store.read_manifests("2026-09-07")
+    archive_manifests = [item for item in manifests if item.context.run_id.startswith("archive-")]
+    assert len(archive_manifests) == 10
+    assert len({item.context.run_id for item in archive_manifests}) == 10
+
+
 def test_run_archive_ignores_unavailable_external_collector(monkeypatch, tmp_path) -> None:
     import sys
 
@@ -783,7 +809,7 @@ def test_run_archive_partial_work_reported_degraded(monkeypatch, tmp_path, caplo
     assert result[0] == 1
     assert any("DEGRADED" in rec.message for rec in caplog.records)
     manifests = store.read_manifests("2026-09-07")
-    bars_manifest = next(item for item in manifests if item.context.run_id == "archive-2026-09-07-regular-bars")
+    bars_manifest = next(item for item in manifests if item.context.run_id.startswith("archive-2026-09-07-regular-bars-"))
     assert bars_manifest.status.value == "PARTIAL"
     assert {item.symbol for item in bars_manifest.entries} == {"005930", "000660"}
 
@@ -1090,10 +1116,12 @@ def test_run_archive_full_complete_and_partial_fragments(monkeypatch, tmp_path) 
 
     assert result == (1, 4, 1)
     manifests = store.read_manifests("2026-09-07")
-    by_run = {item.context.run_id: item for item in manifests if item.context.run_id.startswith("archive-")}
-    assert by_run["archive-2026-09-07-regular-bars"].status.value == "PARTIAL"
-    assert by_run["archive-2026-09-07-regular-ticks"].status.value == "PARTIAL"
-    assert by_run["archive-2026-09-07-nxt-aftermarket"].status.value == "COMPLETE"
+    def _by_prefix(prefix: str):
+        return next(item for item in manifests if item.context.run_id.startswith(prefix))
+
+    assert _by_prefix("archive-2026-09-07-regular-bars-").status.value == "PARTIAL"
+    assert _by_prefix("archive-2026-09-07-regular-ticks-").status.value == "PARTIAL"
+    assert _by_prefix("archive-2026-09-07-nxt-aftermarket-").status.value == "COMPLETE"
     stored_ticks = pd.read_parquet(intraday_store.tick_partition_path("2026-09-07", "regular"))
     assert len(stored_ticks) == 1
 
