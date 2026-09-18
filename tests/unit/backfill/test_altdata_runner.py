@@ -354,6 +354,7 @@ def test_run_altdata_capture_refreshes_declared_window(monkeypatch, tmp_path) ->
     profile = _capture_profile()
     store = CaptureStore(tmp_path / "capture")
     cfg = _capture_cfg(tmp_path, trading_day)
+    monkeypatch.setattr(cap, "fetch_krx_daily", lambda window_end, cfg_: pd.DataFrame(columns=["symbol"]))
     seen: dict = {}
 
     def _fake_backfill(cfg_, *, capture_store=None, run_id=None, reobserve=False):
@@ -408,6 +409,7 @@ def test_run_altdata_capture_rejects_disabled_profile_and_mismatched_bounds(monk
     trading_day = __import__("datetime").date(2026, 9, 10)
     store = CaptureStore(tmp_path / "capture")
     cfg = _capture_cfg(tmp_path, trading_day)
+    monkeypatch.setattr(cap, "fetch_krx_daily", lambda window_end, cfg_: __import__("pandas").DataFrame(columns=["symbol"]))
     with pytest.raises(ValueError, match="enabled raw and altdata"):
         cap.run_altdata_capture(trading_day, profile=_capture_profile(COLLECTION_ALTDATA_ENABLED=False), store=store, cfg=cfg)
     with pytest.raises(ValueError, match="rolling bounds"):
