@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -299,20 +300,24 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                                              coverage={symbol: entry}, batch_rows=batch_rows)
                     counts["krx_after"] += len(frame)
 
-            bars_run = f"archive-{snap_date}-regular-bars"
+            # 같은 날 재시도(수동 재실행 또는 실패 후 재기동)가 이전 시도의 불변 매니페스트와
+            # 충돌하지 않도록 시도별 고유 접미사를 붙인다(실측: 2026-09-18 수동 재실행이
+            # 고정 run_id 때문에 "conflicting immutable artifact identity"로 즉시 실패).
+            attempt = uuid.uuid4().hex[:8]
+            bars_run = f"archive-{snap_date}-regular-bars-{attempt}"
             await collect_intraday_bars(client, session, codes, str(snap_date), interval, ls_client=ls_client,
                                         profile=prof, capture_store=store, run_id=bars_run, on_symbol=publish_bars)
-            after_run = f"archive-{snap_date}-nxt-aftermarket"
+            after_run = f"archive-{snap_date}-nxt-aftermarket-{attempt}"
             await collect_nxt_aftermarket_bars(client, session, codes, str(snap_date), interval, kiwoom_client=kiwoom_client,
                                                profile=prof, capture_store=store, run_id=after_run, on_symbol=publish_nxt_after)
-            pre_run = f"archive-{snap_date}-nxt-premarket"
+            pre_run = f"archive-{snap_date}-nxt-premarket-{attempt}"
             await collect_nxt_premarket_bars(client, session, codes, str(snap_date), interval, kiwoom_client=kiwoom_client,
                                              profile=prof, capture_store=store, run_id=pre_run, on_symbol=publish_nxt_pre)
-            krx_run = f"archive-{snap_date}-krx-aftermarket"
+            krx_run = f"archive-{snap_date}-krx-aftermarket-{attempt}"
             await collect_krx_aftermarket_bars(client, session, codes, str(snap_date), interval,
                                                profile=prof, capture_store=store, run_id=krx_run, on_symbol=publish_krx_after)
             logger.info("[DATA] stage=krx_aftermarket date=%s rows=%d", snap_date, counts["krx_after"])
-            ticks_run = f"archive-{snap_date}-regular-ticks"
+            ticks_run = f"archive-{snap_date}-regular-ticks-{attempt}"
             await collect_intraday_trade_ticks(client, session, codes, str(snap_date), ls_client=ls_client,
                                                kiwoom_client=kiwoom_client, profile=prof, capture_store=store,
                                                run_id=ticks_run, on_symbol=publish_ticks)
