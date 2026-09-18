@@ -91,7 +91,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     profile = CollectionSettings()
     if not (bool(profile.COLLECTION_RAW_ENABLED) and bool(profile.COLLECTION_ALTDATA_ENABLED)):
         logger.info("[DATA] stage=altdata_capture status=SKIP reason=disabled")
-        return 2
+        return 0
     window_start, window_end = _rolling_bounds(trading_day, int(profile.COLLECTION_ALTDATA_LOOKBACK_DAYS))
     end_ts = window_end if window_end > window_start else window_start + pd.Timedelta(hours=12)
     cfg = AltDataFetchConfig(

@@ -445,7 +445,9 @@ def test_altdata_capture_main_skips_when_disabled_and_rejects_bad_date(monkeypat
     monkeypatch.setattr(cap, "CollectionSettings", lambda *a, **k: _capture_profile(COLLECTION_ALTDATA_ENABLED=False))
     called: list[str] = []
     monkeypatch.setattr(cap, "run_altdata_capture", lambda day, **kw: called.append("x") or None)
-    assert cap.main(["--date", "2026-09-10"]) == 2
+    # 실측 회귀: disabled는 설정상 정상 상태이지 실패가 아니다 -- 0이 아닌 값을 반환하면
+    # systemd가 이를 진짜 실패로 취급해 OnFailure 얼러트를 쏜다(2026-09-18 실측).
+    assert cap.main(["--date", "2026-09-10"]) == 0
     assert called == []
     with pytest.raises(ValueError, match="Invalid date"):
         cap.main(["--date", "not-a-date"])
