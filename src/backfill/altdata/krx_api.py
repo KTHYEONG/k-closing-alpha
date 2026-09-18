@@ -9,12 +9,15 @@ KRX 안티봇으로 차단된 환경에서도 동작한다. 구독되지 않은 
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+from typing import Any
 
 import pandas as pd
 import requests
 
 from src.backfill.altdata.config import AltDataFetchConfig
 from src.backfill.altdata.ratelimit import retry_call, wait_for_krx_slot
+from src.data.capture_contracts import PageObserver, RawCaptureError, SEOUL
 
 logger = logging.getLogger(__name__)
 
@@ -76,43 +79,82 @@ def fetch_krx_openapi_day(
     return out if out is not None else pd.DataFrame()
 
 
-def fetch_krx_openapi_day_strict(
-    endpoint: str, date_ymd: str, cfg: AltDataFetchConfig
-) -> pd.DataFrame:
-    """단일 기준일 KRX Open API 응답을 fail-closed 계약으로 반환합니다.
+def _observe_krx_page(
+    on_page: PageObserver,
+    payload: dict[str, Any] | None,
+    endpoint: str,
+    date_ymd: str,
+    started: datetime,
+    received: datetime,
+    attempt: int,
+    *,
+    error: str | None = None,
+) -> None:
+    meta: dict[str, str] = {"endpoint": endpoint, "basDd": date_ymd}
+    if error is not None:
+        meta["error_type"] = error
+    try:
+        on_page(payload, meta, started, received, 0, attempt)
+    except RawCaptureError:
+        raise
+    except Exception as exc:
+        raise RawCaptureError(type(exc).__name__) from exc
 
-    기존 :func:`fetch_krx_openapi_day` 의 fail-soft 와 정반대 계약으로,
-    폴백 없는 설계에서 조용한 결손을 막기 위해 401/404/비200 을 절대 빈
-    DataFrame 으로 삼키지 않고 :class:`RuntimeError` 로 드러냅니다.
-    휴장일(200 + 0행)은 정상 응답이므로 빈 DataFrame 을 반환합니다.
+
+def fetch_krx_openapi_day_strict(
+    endpoint: str, date_ymd: str, cfg: AltDataFetchConfig, *, on_page: PageObserver | None = None
+) -> pd.DataFrame:
+    """Return strict daily rows while retaining the complete decoded source response.
 
     Args:
-        endpoint: ``/svc/apis/...`` 경로.
-        date_ymd: 기준일 (``YYYYMMDD``).
-        cfg: Alt-data 설정 (``krx_api_key`` 필수).
-
+        endpoint: Existing supported KRX endpoint.
+        date_ymd: Requested business date, not publication time.
+        cfg: Existing authenticated fetch configuration.
+        on_page: Optional synchronous persistence observer before row normalization.
     Returns:
-        ``OutBlock_1`` 행들의 DataFrame. 0행이면 휴장일의 정상 빈 프레임.
-
+        Existing OutBlock rows with unchanged compatibility columns.
     Raises:
-        ValueError: ``krx_api_key`` 가 비어 있을 때.
-        RuntimeError: HTTP 401/404/기타 비200 및 재시도 전체 실패 시.
+        ValueError: Missing authentication.
+        RuntimeError: Exhausted transport or source failures.
+        RawCaptureError: Observer persistence failed; never retried as a source error.
     """
     key = str(cfg.krx_api_key).strip()
     if not key:
         raise ValueError("krx api key is required for strict fetch")
     url = f"{_BASE_URL}{endpoint}"
+    state = {"attempt": 0}
 
     def _call() -> pd.DataFrame:
+        attempt = state["attempt"]
+        state["attempt"] += 1
         wait_for_krx_slot(cfg)
-        resp = requests.get(
-            url, params={"basDd": date_ymd}, headers={"AUTH_KEY": key}, timeout=20
-        )
+        started = datetime.now(SEOUL)
+        try:
+            resp = requests.get(
+                url, params={"basDd": date_ymd}, headers={"AUTH_KEY": key}, timeout=20
+            )
+        except Exception as exc:
+            received = datetime.now(SEOUL)
+            if on_page is not None:
+                _observe_krx_page(on_page, None, endpoint, date_ymd, started, received, attempt, error=type(exc).__name__)
+            raise
         if resp.status_code != 200:
             raise RuntimeError(
                 f"krx http_status={resp.status_code} endpoint={endpoint} date={date_ymd}"
             )
-        payload = resp.json()
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"krx malformed response endpoint={endpoint} date={date_ymd}: {type(exc).__name__}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"krx malformed response endpoint={endpoint} date={date_ymd}: non-object payload"
+            )
+        received = datetime.now(SEOUL)
+        if on_page is not None:
+            _observe_krx_page(on_page, payload, endpoint, date_ymd, started, received, attempt)
         block = next((k for k in payload if k.startswith("OutBlock")), None)
         rows = payload.get(block, []) if block else []
         return pd.DataFrame(rows) if rows else pd.DataFrame()

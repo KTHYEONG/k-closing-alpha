@@ -2,8 +2,10 @@ import functools
 import logging
 import subprocess
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -21,20 +23,47 @@ from src.serving.realtime.artifacts import load_model_bundle
 from src.utils.display import print_table
 
 
-def load_daily_snapshot(decision_date: pd.Timestamp) -> pd.DataFrame:
-    """당일 wide 스냅샷을 아카이브 저장소에서 읽는다.
+def _capture_root() -> Path:
+    root = settings.COLLECTION_ROOT
+    if root is not None:
+        return Path(root)
+    return Path(settings.HISTORY_DIR) / "capture"
+
+
+def load_daily_snapshot(decision_date: pd.Timestamp, *, available_by: datetime | None = None) -> pd.DataFrame:
+    """Read the exact observable decision state instead of a finalized archive view.
 
     Args:
-        decision_date: 조회 대상 일자.
+        decision_date: Requested market date.
+        available_by: Explicit aware inference cutoff; None uses the actual call time.
 
     Returns:
-        종목코드가 6자리 zero-fill 문자열로 정규화된 wide 단면. 금액 단위
-        환산은 수행하지 않는다(저장소가 억 단위 원본을 그대로 보관).
+        Verified wide decision input with normalized string security codes and provenance.
+
+    Raises:
+        FileNotFoundError: No qualifying new-mode input exists.
+        ValueError: Observations, membership, or hashes cannot be certified.
     """
-    df = fetch_archive_snapshot(snapshot_date=decision_date.strftime("%Y-%m-%d"))
-    if "종목코드" in df.columns:
-        df["종목코드"] = df["종목코드"].astype(str).str.zfill(6)
-    return df
+    if not bool(settings.COLLECTION_RAW_ENABLED):
+        df = fetch_archive_snapshot(snapshot_date=decision_date.strftime("%Y-%m-%d"))
+        if "종목코드" in df.columns:
+            df["종목코드"] = df["종목코드"].astype(str).str.zfill(6)
+        return df
+    from src.data.capture_store import CaptureStore
+
+    cutoff = available_by
+    if cutoff is None:
+        cutoff = datetime.now(ZoneInfo("Asia/Seoul"))
+    if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+        raise ValueError("available_by must be an aware cutoff")
+    frame = CaptureStore(_capture_root()).read_decision(
+        decision_date.strftime("%Y-%m-%d"), available_by=cutoff
+    )
+    if "종목코드" in frame.columns:
+        frame["종목코드"] = frame["종목코드"].astype(str).str.zfill(6)
+    if "symbol" in frame.columns:
+        frame["symbol"] = frame["symbol"].astype(str).str.zfill(6)
+    return frame
 
 
 def restrict_to_rank_pool(wide: pd.DataFrame, decision_date: pd.Timestamp) -> pd.DataFrame:
@@ -192,7 +221,8 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[
         from src.ml.topk_ranker_research import TOPK_RANKER_BUNDLE_DIR, score_topk_candidates, select_topk_equal_weight
         from src.serving.realtime.features import build_topk_ranker_features
 
-        wide = restrict_to_rank_pool(load_daily_snapshot(decision_date), decision_date)
+        inference_started_at = datetime.now(ZoneInfo("Asia/Seoul"))
+        wide = restrict_to_rank_pool(load_daily_snapshot(decision_date, available_by=inference_started_at), decision_date)
         bundle = load_model_bundle(import_dir=TOPK_RANKER_BUNDLE_DIR)
         # 번들이 선언한 피처가 이력 피처를 요구할 때만 price_history 를 읽는다
         price_history = None
@@ -209,8 +239,23 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[
         picks["name"] = picks["symbol"].map(name_map)
         model_version = bundle_model_version(bundle)
         picks["model_version"] = model_version
+        if "capture_run_id" in wide.columns:
+            picks["capture_run_id"] = str(wide["capture_run_id"].iloc[0])
+        if "cohort_id" in wide.columns:
+            picks["cohort_id"] = str(wide["cohort_id"].iloc[0])
+        picks["inference_started_at"] = inference_started_at
+        if "feature_available_timestamp" in wide.columns:
+            picks["input_available_at"] = pd.to_datetime(wide["feature_available_timestamp"]).max()
         if on_rank_pool is not None:
-            on_rank_pool(build_rank_pool_frame(score_topk_candidates(features_df, bundle), picks, name_map, model_version))
+            pool = build_rank_pool_frame(score_topk_candidates(features_df, bundle), picks, name_map, model_version)
+            if "capture_run_id" in picks.columns:
+                pool["capture_run_id"] = picks["capture_run_id"].iloc[0]
+            if "cohort_id" in picks.columns:
+                pool["cohort_id"] = picks["cohort_id"].iloc[0]
+            pool["inference_started_at"] = inference_started_at
+            if "input_available_at" in picks.columns:
+                pool["input_available_at"] = picks["input_available_at"].iloc[0]
+            on_rank_pool(pool)
         return picks
     except (FileNotFoundError, ValueError) as exc:
         logger.warning(

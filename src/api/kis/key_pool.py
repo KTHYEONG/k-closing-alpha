@@ -14,6 +14,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -228,22 +229,8 @@ def select_data_credential(credentials: tuple[KisCredential, ...], role: str) ->
 def parse_decision_shard_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]:
     """15:20 결정창 벌크 수집을 나눌 추가 슬롯을 KIS_DECISION_SHARD_SLOTS에서 읽는다.
 
-    [STEP-BY-STEP RECIPE FOR IMPLEMENTER]:
-    Step 1. `KIS_DATA_SLOTS`를 `_parse_slot_list`로 파싱해 pool을 얻는다. pool이 None이면
-       빈 튜플 `()`을 반환한다(선언된 풀 자체가 없으면 이 기능은 조용히 꺼진다).
-    Step 2. `env.get("KIS_DECISION_SHARD_SLOTS")`를 `_parse_slot_list`로 파싱한다. 결과가
-       None이면(미설정) 빈 튜플 `()`을 반환한다 — 이것이 "기능 꺼짐" 기본값이다.
-    Step 3. 파싱된 각 슬롯 번호 n이 pool(Step 1의 set)에 없으면
-       `ValueError(f"decision shard slot DATA_{n} is not in KIS_DATA_SLOTS pool")`을 던진다.
-    Step 4. 각 슬롯 n에 대해 `KIS_DATA_{n}_APP_KEY`/`KIS_DATA_{n}_APP_SECRET`/`KIS_DATA_{n}_HTS_ID`를
-       읽어 `.strip()`한다. app_key 또는 app_secret이 비었으면
-       `ValueError(f"missing credentials for slot DATA_{n}")`을 던진다(hts_id는 빈 문자열 허용,
-       `parse_host_data_credentials`와 동일 관례).
-    Step 5. `KisCredential(slot=f"DATA_{n}", app_key=..., app_secret=..., hts_id=...)`를
-       Step 2에서 파싱된 순서 그대로 리스트에 쌓는다.
-    Step 6. app_key 중복을 검사한다: 이미 본 app_key가 재등장하면
-       `ValueError(f"duplicate app_key in decision shard slot {c.slot}")`을 던진다.
-    Step 7. 튜플로 변환해 반환한다.
+    선언된 풀이 없거나 샤드 슬롯이 미설정이면 빈 튜플을 반환한다.
+    샤드 슬롯은 선언된 풀에 속해야 하며 자격증명과 고유성이 검증된다.
     """
     pool = _parse_slot_list(env.get("KIS_DATA_SLOTS"))
     if pool is None:
@@ -274,17 +261,8 @@ def parse_decision_shard_credentials(env: Mapping[str, str]) -> tuple[KisCredent
 def resolve_decision_shard_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]:
     """collect.py가 실제로 사용할 결정창 샤드 자격증명 목록(1개 또는 N개)을 확정한다.
 
-    [STEP-BY-STEP RECIPE FOR IMPLEMENTER]:
-    Step 1. `parsed = parse_decision_shard_credentials(env)`를 호출한다.
-    Step 2. `primary = select_data_credential(resolve_host_data_credentials(env), KIS_DATA_ROLE_DECISION)`을
-       계산한다(기존 단일 키 경로가 실제로 고르는 자격증명 — 레거시 동작의 단일 진실 원천).
-    Step 3. `parsed`가 빈 튜플이면(KIS_DECISION_SHARD_SLOTS 미설정) `(primary,)`를 반환한다.
-       이것이 기능 꺼짐 상태의 레거시 폴백이며, `main()`이 이미 발급한 `client`를 그대로
-       재사용할 수 있도록 슬롯 1개짜리 튜플이어야 한다.
-    Step 4. `parsed`가 비어있지 않으면 fail-closed 불변식을 검사한다: `parsed[0].app_key`가
-       `primary.app_key`와 달라야 한다면(즉 다르면) 아래 메시지로 즉시 예외를 던진다 —
-       원문 앱키/시크릿은 로그/예외에 절대 노출하지 않고 `kis_key_id()` 지문만 사용한다.
-    Step 5. 검사를 통과하면 `parsed`를 그대로 반환한다.
+    샤드 미설정 시 결정 역할의 단일 자격증명으로 폴백한다.
+    설정된 샤드는 결정 역할의 선두 자격증명과 일치해야 한다.
     """
     parsed = parse_decision_shard_credentials(env)
     primary = select_data_credential(resolve_host_data_credentials(env), KIS_DATA_ROLE_DECISION)
@@ -298,3 +276,107 @@ def resolve_decision_shard_credentials(env: Mapping[str, str]) -> tuple[KisCrede
             f"got slot={parsed[0].slot} key_id={kis_key_id(parsed[0].app_key)})"
         )
     return parsed
+
+def resolve_research_credentials(env: Mapping[str, str], *, slots: tuple[str, ...], ownership_path: Path) -> tuple[KisCredential, ...]:
+    """Require explicit research-key ownership before independent acquisition starts.
+
+    Token-cache sharing does not enforce a shared REST or subscription budget.
+    Research must not consume a key assigned to another collector by assumption.
+
+    Args:
+        env: Credential source already supplied to this project.
+        slots: Explicit configured pool identifiers for research.
+        ownership_path: Verified host ownership evidence document.
+
+    Returns:
+        Declared unique credentials in stable configured order.
+
+    Raises:
+        ValueError: Missing keys, collisions, or uncertified/conflicting ownership.
+        OSError: Ownership evidence cannot be read.
+    """
+    pool = _parse_slot_list(env.get("KIS_DATA_SLOTS"))
+    if pool is None:
+        raise ValueError("KIS_DATA_SLOTS pool is not declared")
+    if not slots:
+        raise ValueError("research slots are not declared")
+    if len(set(slots)) != len(slots):
+        raise ValueError("duplicate research slot")
+    pool_set = set(pool)
+    for token in slots:
+        if not _SLOT_RE.match(token):
+            raise ValueError(f"invalid research slot token: {token}")
+        if token not in pool_set:
+            raise ValueError(f"research slot DATA_{token} is not in KIS_DATA_SLOTS pool")
+    creds: list[KisCredential] = []
+    for token in slots:
+        app_key = (env.get(f"KIS_DATA_{token}_APP_KEY") or "").strip()
+        app_secret = (env.get(f"KIS_DATA_{token}_APP_SECRET") or "").strip()
+        hts_id = (env.get(f"KIS_DATA_{token}_HTS_ID", "") or "").strip()
+        if not app_key or not app_secret:
+            raise ValueError(f"missing credentials for slot DATA_{token}")
+        creds.append(KisCredential(slot=f"DATA_{token}", app_key=app_key, app_secret=app_secret, hts_id=hts_id))
+    seen: set[str] = set()
+    for cred in creds:
+        if cred.app_key in seen:
+            raise ValueError(f"duplicate app_key in slot {cred.slot}")
+        seen.add(cred.app_key)
+    for trade_var in ("KIS_TRADE_APP_KEY", "KIS_APP_KEY"):
+        trade_key = (env.get(trade_var) or "").strip()
+        if trade_key and trade_key in seen:
+            raise ValueError(f"data slot app_key collides with {trade_var}")
+    raw = Path(ownership_path).read_text(encoding="utf-8")
+    try:
+        document: object = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("uncertified ownership evidence") from exc
+    if not isinstance(document, dict):
+        raise ValueError("uncertified ownership evidence")
+    if document.get("schema_version") != 1:
+        raise ValueError("uncertified ownership evidence")
+    host_id = document.get("host_id")
+    if not isinstance(host_id, str) or not host_id.strip():
+        raise ValueError("uncertified ownership evidence")
+    verified_at = document.get("verified_at")
+    if not isinstance(verified_at, str):
+        raise ValueError("uncertified ownership evidence")
+    try:
+        moment = datetime.fromisoformat(verified_at)
+    except ValueError as exc:
+        raise ValueError("uncertified ownership evidence") from exc
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError("uncertified ownership evidence")
+    owners = document.get("credential_owners")
+    if not isinstance(owners, list):
+        raise ValueError("uncertified ownership evidence")
+    by_slot: dict[str, dict[str, object]] = {}
+    for item in owners:
+        if not isinstance(item, dict):
+            raise ValueError("uncertified ownership evidence")
+        label = item.get("slot")
+        if isinstance(label, str) and label not in by_slot:
+            by_slot[label] = item
+    for cred in creds:
+        entry = by_slot.get(cred.slot)
+        if entry is None:
+            raise ValueError(f"uncertified ownership for slot {cred.slot}")
+        if entry.get("owner") != "k-closing-alpha":
+            raise ValueError(f"uncertified ownership for slot {cred.slot}")
+        if entry.get("purpose") != "research":
+            raise ValueError(f"uncertified ownership for slot {cred.slot}")
+        if entry.get("exclusive") is not True:
+            raise ValueError(f"uncertified ownership for slot {cred.slot}")
+        if entry.get("key_id") != kis_key_id(cred.app_key):
+            raise ValueError(f"uncertified ownership for slot {cred.slot}")
+        roles = entry.get("allowed_rest_roles")
+        if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
+            raise ValueError(f"uncertified ownership for slot {cred.slot}")
+        evidence = entry.get("verified_consumer_config_sha256")
+        if not isinstance(evidence, dict) or not evidence:
+            raise ValueError(f"uncertified ownership for slot {cred.slot}")
+        for name, digest in evidence.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"uncertified ownership for slot {cred.slot}")
+            if not isinstance(digest, str) or not digest.strip():
+                raise ValueError(f"uncertified ownership for slot {cred.slot}")
+    return tuple(creds)

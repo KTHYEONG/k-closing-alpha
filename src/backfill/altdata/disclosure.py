@@ -14,12 +14,14 @@ import logging
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
+from datetime import datetime
 
 import pandas as pd
 import requests
 
 from src.backfill.altdata.config import AltDataFetchConfig
 from src.backfill.altdata.ratelimit import retry_call, wait_for_dart_slot
+from src.data.capture_contracts import PageObserver, RawCaptureError, SEOUL
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +52,37 @@ _OUT_COLS: list[str] = (
 )
 
 
-def _dart_get_json(url: str, params: dict[str, object], cfg: AltDataFetchConfig) -> dict[str, object]:
+def _dart_get_json(url: str, params: dict[str, object], cfg: AltDataFetchConfig, *, on_page: PageObserver | None = None, page_index: int = 0, attempt_index: int = 0) -> dict[str, object]:
+    """Observe decoded DART list pages before status validation and count aggregation.
+
+    Args:
+        url: Existing DART endpoint.
+        params: Source request parameters, never persisted with authentication.
+        cfg: Existing rate and retry settings.
+        on_page: Optional durable source observer.
+        page_index: Zero-based list page index.
+        attempt_index: Actual zero-based retry attempt.
+    Returns:
+        Existing validated JSON response.
+    Raises:
+        RuntimeError: Source status is unsupported.
+        RawCaptureError: Durable observation failed.
+    """
+    started = datetime.now(SEOUL)
     wait_for_dart_slot(cfg)
     resp = requests.get(url, params=params, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"DART request failed status={resp.status_code}")
     data = resp.json()
+    received = datetime.now(SEOUL)
+    if on_page is not None:
+        meta: dict[str, str] = {"endpoint": url, "page_no": str(params.get("page_no", page_index))}
+        try:
+            on_page(data if isinstance(data, dict) else None, meta, started, received, page_index, attempt_index)
+        except RawCaptureError:
+            raise
+        except Exception as exc:
+            raise RawCaptureError(type(exc).__name__) from exc
     if isinstance(data, dict) and "status" in data:
         status = str(data.get("status", "")).strip()
         # 000 정상, 013 무자료 — 그 외는 오류.
@@ -139,11 +166,18 @@ def _parse_items(
 
 
 def _fetch_list_page(
-    cfg: AltDataFetchConfig, base_params: dict[str, object], page_no: int
+    cfg: AltDataFetchConfig, base_params: dict[str, object], page_no: int, *, on_page: PageObserver | None = None
 ) -> tuple[list[dict[str, str]], int | None]:
     """단일 페이지 조회 → (parsed rows, total_page). 실패 시 ([], None)."""
     params = {**base_params, "page_no": page_no}
-    data = retry_call(lambda: _dart_get_json(_LIST_URL, params, cfg), cfg, label=f"dart list p{page_no}")
+    state = {"attempt": 0}
+
+    def _call() -> dict[str, object]:
+        attempt = state["attempt"]
+        state["attempt"] += 1
+        return _dart_get_json(_LIST_URL, params, cfg, on_page=on_page, page_index=page_no, attempt_index=attempt)
+
+    data = retry_call(_call, cfg, label=f"dart list p{page_no}")
     if not isinstance(data, dict) or str(data.get("status", "")).strip() == "013":
         return [], None
     lst = data.get("list")
@@ -162,6 +196,8 @@ def _fetch_disclosure_window(
     start_ymd: str,
     end_ymd: str,
     corp_to_stock: dict[str, str],
+    *,
+    on_page: PageObserver | None = None,
 ) -> list[dict[str, str]]:
     """단일 (공시유형, ≤3개월 창) 목록을 1페이지 조회 후 나머지 페이지를 병렬 수집합니다."""
     from concurrent.futures import ThreadPoolExecutor
@@ -173,7 +209,7 @@ def _fetch_disclosure_window(
         "pblntf_ty": pblntf_ty,
         "page_count": int(cfg.page_count),
     }
-    first_lst, total_page = _fetch_list_page(cfg, base_params, 1)
+    first_lst, total_page = _fetch_list_page(cfg, base_params, 1, on_page=on_page)
     rows = _parse_items(first_lst, corp_to_stock)
     if not first_lst or not total_page or total_page <= 1:
         return rows
@@ -181,7 +217,7 @@ def _fetch_disclosure_window(
     max_page = min(int(total_page), 10000)
     with ThreadPoolExecutor(max_workers=_PAGE_WORKERS) as pool:
         for lst, _tp in pool.map(
-            lambda p: _fetch_list_page(cfg, base_params, p), range(2, max_page + 1)
+            lambda p: _fetch_list_page(cfg, base_params, p, on_page=on_page), range(2, max_page + 1)
         ):
             rows.extend(_parse_items(lst, corp_to_stock))
     return rows
@@ -235,19 +271,20 @@ def collect_disclosures(
     *,
     on_window: Callable[[pd.DataFrame], None] | None = None,
     covered_dates: set[pd.Timestamp] | None = None,
+    on_page: PageObserver | None = None,
 ) -> pd.DataFrame:
-    """DART 공시 목록을 일별 종목 집계 패널로 수집합니다.
+    """Collect the existing disclosure scope with optional original-page provenance.
 
     Args:
-        cfg: Alt-data 설정 (``dart_api_key`` 필수).
-        corp_map: corp_code-stock_code 맵 (blank stock_code 보완용).
-        on_window: 주어지면 각 창의 집계 프레임으로 즉시 호출하고 누적하지 않습니다
-            (중단 안전 + 메모리 bounded). 이 경우 반환값은 빈 프레임입니다.
-        covered_dates: 이미 수집된 날짜 집합. 창의 모든 영업일이 여기 포함되면
-            해당 창을 건너뜁니다 (재개 시 재조회 방지).
-
+        cfg: Existing inclusive source window configuration.
+        corp_map: Existing corporation-to-security mapping.
+        on_window: Existing bounded aggregated-window callback.
+        covered_dates: Existing skip contract; rolling refresh passes an empty set.
+        on_page: Observer forwarded through every list page and retry.
     Returns:
-        ``on_window`` 미지정 시 전체 기간 (date, symbol) 집계 DataFrame.
+        Existing aggregate panel, or empty when on_window consumes each window.
+    Raises:
+        RawCaptureError: A page could not be retained.
     """
     if not str(cfg.dart_api_key).strip():
         raise ValueError("DART_API_KEY is required for disclosure backfill")
@@ -268,7 +305,7 @@ def collect_disclosures(
         window_rows: list[dict[str, str]] = []
         for pblntf_ty in _PBLNTF_TYPES:
             window_rows.extend(
-                _fetch_disclosure_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock)
+                _fetch_disclosure_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock, on_page=on_page)
             )
         window_df = _aggregate_rows(window_rows)
         logger.info(

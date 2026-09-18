@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,19 @@ import pandas as pd
 from src.backfill.altdata import credit_balance, derivatives, program_trade_daily, shorting
 from src.backfill.altdata.config import _ALTDATA_PANELS, AltDataFetchConfig
 from src.backfill.altdata.normalize import normalize_panel
+from src.data.capture_contracts import (
+    BrokerPayload,
+    CaptureContext,
+    CaptureDataset,
+    CapturedResponse,
+    CaptureManifest,
+    CaptureStatus,
+    CoverageEntry,
+    PageObserver,
+    RawCaptureError,
+    SEOUL,
+)
+from src.data.capture_store import CaptureStore
 from src.data.parquet_codec import write_altdata_panel_parquet
 
 # Re-export collectors for test monkeypatching
@@ -110,21 +124,106 @@ def _write_manifest(out_dir: Path, entries: dict[str, dict[str, Any]]) -> None:
         json.dump(manifest, f, indent=2, default=str, ensure_ascii=False)
 
 
-def run_altdata_backfill(cfg: AltDataFetchConfig) -> dict[str, Any]:
-    """Alt-data 백필을 실행합니다.
+_SOURCE_DATASETS: dict[str, CaptureDataset] = {
+    "shorting": CaptureDataset.SHORTING,
+    "derivatives_basis": CaptureDataset.DERIVATIVES_BASIS,
+    "disclosure": CaptureDataset.DISCLOSURE,
+    "credit_balance": CaptureDataset.CREDIT_BALANCE,
+    "program_trade_daily": CaptureDataset.PROGRAM_DAILY,
+}
+
+_OK_ENTRY_STATES: frozenset[str] = frozenset({"ok", "up_to_date"})
+
+_CLOCK_COLUMNS: frozenset[str] = frozenset({
+    "observed_at",
+    "received_at",
+    "request_started_at",
+    "source_timestamp",
+    "source_published_at",
+    "capture_ref",
+    "artifact_ref",
+    "manifest_ref",
+})
+
+
+def _altdata_capture_context(trading_day: pd.Timestamp, run_id: str, source: str) -> CaptureContext:
+    return CaptureContext(
+        trading_date=pd.Timestamp(trading_day).normalize().date(),
+        run_id=run_id,
+        dataset=_SOURCE_DATASETS.get(source, CaptureDataset.SHORTING),
+        vendor="owner-local",
+        endpoint=f"{source}-collector",
+        symbol=None,
+        venue="KRX",
+        session="regular",
+        capture_reason="altdata-backfill",
+        cohort_id=None,
+        scheduled_at=None,
+    )
+
+
+def _dart_page_observer(store: CaptureStore, trading_day: pd.Timestamp, run_id: str, sink: list[Any]) -> PageObserver:
+    def _on_page(
+        payload: BrokerPayload | None,
+        meta: Mapping[str, str],
+        started: datetime,
+        received: datetime,
+        page_index: int,
+        attempt_index: int,
+    ) -> None:
+        try:
+            ref = store.append_response(
+                CapturedResponse(
+                    context=_altdata_capture_context(trading_day, run_id, "disclosure"),
+                    request_started_at=started,
+                    received_at=received,
+                    payload=dict(payload) if isinstance(payload, dict) else None,
+                    source_timestamp=None,
+                    source_published_at=None,
+                    status=CaptureStatus.COMPLETE if isinstance(payload, dict) else CaptureStatus.FAILED,
+                    page_index=int(page_index),
+                    attempt_index=int(attempt_index),
+                    continuation={k: str(v) for k, v in dict(meta).items()},
+                    error_type=None if isinstance(payload, dict) else "transport",
+                )
+            )
+        except OSError as exc:
+            raise RawCaptureError(str(exc)) from exc
+        sink.append(ref)
+
+    return _on_page
+
+
+def _capture_collector_output(
+    store: CaptureStore, run_id: str, trading_day: pd.Timestamp, source: str, raw: pd.DataFrame,
+) -> Any:
+    return store.publish_frame(raw.copy(), context=_altdata_capture_context(trading_day, run_id, source))
+
+
+def run_altdata_backfill(cfg: AltDataFetchConfig, *, capture_store: CaptureStore | None = None, run_id: str | None = None, reobserve: bool = False) -> dict[str, Any]:
+    """Retain source observations and refresh a bounded slow-data window independently.
 
     Args:
-        cfg: Alt-data 설정.
-
+        cfg: Existing source/date configuration.
+        capture_store: Optional owner-local immutable provenance store.
+        run_id: Required unique run identity when capture_store is supplied.
+        reobserve: Re-fetch the configured window despite prior date presence.
     Returns:
-        매니페스트 딕셔너리.
+        Existing source report with separate capture manifest references.
+    Raises:
+        ValueError: Capture configuration is inconsistent.
+        RawCaptureError: Required observation persistence failed.
     """
+    if (capture_store is None) != (run_id is None):
+        raise ValueError("capture_store and run_id must be supplied together")
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     business_days = pd.bdate_range(cfg.start, cfg.end).tolist()
     # Ensure Timestamp
     business_days = [pd.Timestamp(d).normalize() for d in business_days]
 
     entries: dict[str, dict[str, Any]] = {}
+    capture_refs: dict[str, list[Any]] = {}
+    anchor_day = pd.Timestamp(cfg.end).normalize()
 
     for source in cfg.sources:
         meta = _ALTDATA_PANELS.get(source)
@@ -147,7 +246,7 @@ def run_altdata_backfill(cfg: AltDataFetchConfig) -> dict[str, Any]:
 
         # Determine covered dates
         covered = _covered_dates(panel_path)
-        missing = [d for d in business_days if d not in covered]
+        missing = list(business_days) if reobserve else [d for d in business_days if d not in covered]
 
         if not missing:
             # Already up to date
@@ -217,12 +316,22 @@ def run_altdata_backfill(cfg: AltDataFetchConfig) -> dict[str, Any]:
                         return
                     _atomic_write_parquet(_incremental_merge(_pp, norm, _kc), _pp)
 
+                disc_page_refs: list[Any] = []
                 disc_mod.collect_disclosures(
-                    cfg, corp_map, on_window=_flush_window, covered_dates=set(covered)
+                    cfg,
+                    corp_map,
+                    on_window=_flush_window,
+                    covered_dates=set() if reobserve else set(covered),
+                    on_page=_dart_page_observer(capture_store, anchor_day, run_id, disc_page_refs) if capture_store is not None and run_id is not None else None,
                 )
+                if capture_store is not None and run_id is not None:
+                    capture_refs[source] = list(disc_page_refs)
                 raw = pd.read_parquet(panel_path) if panel_path.exists() else pd.DataFrame()
             else:
                 raw = pd.DataFrame()
+
+            if capture_store is not None and run_id is not None and source != "disclosure" and raw is not None and not raw.empty:
+                capture_refs[source] = [_capture_collector_output(capture_store, run_id, anchor_day, source, raw)]
 
             # Empty result => unavailable
             if raw is None or raw.empty:
@@ -238,7 +347,8 @@ def run_altdata_backfill(cfg: AltDataFetchConfig) -> dict[str, Any]:
                 }
                 continue
 
-            normalized = normalize_panel(raw, source, cfg)
+            feature_raw = raw.drop(columns=[c for c in raw.columns if c in _CLOCK_COLUMNS])
+            normalized = normalize_panel(feature_raw, source, cfg)
             if normalized is None or normalized.empty:
                 entries[source] = {
                     "status": "unavailable",
@@ -312,5 +422,51 @@ def run_altdata_backfill(cfg: AltDataFetchConfig) -> dict[str, Any]:
             }
 
     manifest = {"generated_at": datetime.now(UTC).isoformat(), "panels": entries}
+    if capture_store is not None and run_id is not None:
+        coverage: list[CoverageEntry] = []
+        for source in cfg.sources:
+            state = str(entries.get(source, {}).get("status", "unavailable"))
+            status = CaptureStatus.COMPLETE if state in _OK_ENTRY_STATES else CaptureStatus.FAILED
+            rows = int(entries.get(source, {}).get("rows", 0) or 0)
+            coverage.append(
+                CoverageEntry(
+                    symbol=None,
+                    dataset=_SOURCE_DATASETS.get(source, CaptureDataset.SHORTING),
+                    venue="KRX",
+                    session="regular",
+                    scheduled_at=None,
+                    status=status,
+                    rows=rows,
+                    first_event_time=None,
+                    last_event_time=None,
+                    reason=state,
+                    raw_refs=tuple(capture_refs.get(source, ())),
+                )
+            )
+        overall = CaptureStatus.COMPLETE if all(e.status == CaptureStatus.COMPLETE for e in coverage) else CaptureStatus.PARTIAL
+        first_dataset = _SOURCE_DATASETS.get(cfg.sources[0], CaptureDataset.SHORTING)
+        capture_manifest = CaptureManifest(
+            schema_version=1,
+            context=CaptureContext(
+                trading_date=anchor_day.date(),
+                run_id=run_id,
+                dataset=first_dataset,
+                vendor="owner-local",
+                endpoint="altdata-backfill",
+                symbol=None,
+                venue="KRX",
+                session="regular",
+                capture_reason="altdata-backfill",
+                cohort_id=None,
+                scheduled_at=None,
+            ),
+            cohort=None,
+            completed_at=datetime.now(SEOUL),
+            entries=tuple(coverage),
+            artifacts=tuple(r for refs in capture_refs.values() for r in refs),
+            status=overall,
+        )
+        manifest_ref = capture_store.publish_manifest(capture_manifest)
+        manifest["capture"] = {"run_id": run_id, "manifest": manifest_ref.path, "status": overall.value}
     _write_manifest(cfg.out_dir, entries)
     return manifest

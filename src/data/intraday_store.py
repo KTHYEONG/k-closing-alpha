@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
+import uuid
+from collections.abc import Mapping
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from src import settings
-from src.data.intraday_schema import assert_canonical_bars, assert_canonical_ticks
-from src.data.io_utils import atomic_write_parquet
+from src.data.capture_contracts import CaptureStatus, CoverageEntry
+from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, assert_canonical_bars, assert_canonical_ticks
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["intraday_partition_path", "log_session_coverage_outliers", "merge_partition_frame", "read_intraday_range", "tick_partition_path", "write_intraday_partition", "write_tick_partition"]
+
+_LOCK_TIMEOUT_SECONDS = 30.0
 
 
 def intraday_partition_path(bar_interval_minutes: int, snapshot_date: str, session: str) -> Path:
@@ -34,8 +42,7 @@ def merge_partition_frame(new_df: pd.DataFrame, target: Path, key_cols: tuple[st
     try:
         existing = pd.read_parquet(target) if target.exists() else pd.DataFrame()
     except Exception as e:
-        logger.warning("[DATA] Failed to read existing partition %s; writing new only: %s", target, e)
-        existing = pd.DataFrame()
+        raise OSError(f"Cannot read existing partition evidence: {target}") from e
     if existing is None or len(existing) == 0:
         merged = new_df.copy()
     else:
@@ -118,29 +125,414 @@ def log_session_coverage_outliers(
     return {"n_symbols": len(counts), "n_low_coverage": len(low), "n_truncated": len(truncated)}
 
 
-def write_intraday_partition(df: pd.DataFrame, bar_interval_minutes: int, snapshot_date: str, session: str) -> int:
-    """정규 바 파티션을 게이트 검증 후 병합 저장한다. 빈 df는 0 반환 no-op."""
-    if df is None or df.empty:
-        return 0
-    assert_canonical_bars(df)
-    target = intraday_partition_path(bar_interval_minutes, snapshot_date, session)
-    merged = merge_partition_frame(df, target, ("symbol", "ts_hms"))
-    atomic_write_parquet(merged, target)
-    log_session_coverage_outliers(merged, bar_interval_minutes, snapshot_date, session)
-    logger.info("Wrote intraday partition %s (%d rows)", target, len(merged))
-    return len(merged)
+def _batch_rows_or_default(batch_rows: int | None) -> int:
+    if batch_rows is None:
+        return int(settings.COLLECTION_ARROW_BATCH_ROWS)
+    if int(batch_rows) <= 0:
+        raise ValueError(f"batch_rows must be positive: {batch_rows!r}")
+    return int(batch_rows)
 
 
-def write_tick_partition(df: pd.DataFrame, snapshot_date: str, session: str = "regular") -> int:
-    """틱 파티션을 게이트 검증 후 병합 저장한다. 빈 df는 0 반환 no-op."""
-    if df is None or df.empty:
-        return 0
+def _capture_root() -> Path:
+    root = settings.COLLECTION_ROOT
+    if root is not None:
+        return Path(root)
+    return Path(settings.HISTORY_DIR) / "capture"
+
+
+def _is_valid_hhmmss(value: int) -> bool:
+    if value < 0 or value > 235959:
+        return False
+    hour = value // 10000
+    minute = (value // 100) % 100
+    second = value % 100
+    return 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59
+
+
+def _validate_tick_frame(
+    df: pd.DataFrame, snapshot_date: str, session: str, coverage: Mapping[str, CoverageEntry] | None
+) -> list[str]:
     assert_canonical_ticks(df)
+    dates = df["snapshot_date"].astype(str)
+    if bool((dates != str(snapshot_date)).any()):
+        raise ValueError(f"Tick frame carries non-requested snapshot_date for {snapshot_date!r}")
+    ts_values = pd.to_numeric(df["ts_hms"], errors="coerce")
+    if bool(ts_values.isna().any()):
+        raise ValueError("Tick frame carries non-numeric ts_hms")
+    for raw in ts_values.astype(int).tolist():
+        if not _is_valid_hhmmss(int(raw)):
+            raise ValueError(f"Tick frame carries invalid HHMMSS: {raw!r}")
+    volumes = pd.to_numeric(df["volume"], errors="coerce")
+    if bool(volumes.isna().any()) or bool((volumes < 0).any()):
+        raise ValueError("Tick frame carries invalid negative volume")
+    symbols = sorted({str(item) for item in df["symbol"].astype(str).tolist()})
+    if coverage is not None:
+        missing = [item for item in symbols if item not in coverage]
+        if missing:
+            raise ValueError(f"Tick frame symbols lack coverage certification: {missing}")
+        for item in symbols:
+            entry = coverage[item]
+            if entry.session != str(session):
+                raise ValueError(f"Tick coverage session mismatch for {item!r}")
+    return symbols
+
+
+def _validate_bar_frame(
+    df: pd.DataFrame, snapshot_date: str, session: str, coverage: Mapping[str, CoverageEntry] | None
+) -> list[str]:
+    assert_canonical_bars(df)
+    dates = df["snapshot_date"].astype(str)
+    if bool((dates != str(snapshot_date)).any()):
+        raise ValueError(f"Bar frame carries non-requested snapshot_date for {snapshot_date!r}")
+    ts_values = pd.to_numeric(df["ts_hms"], errors="coerce")
+    if bool(ts_values.isna().any()):
+        raise ValueError("Bar frame carries non-numeric ts_hms")
+    for raw in ts_values.astype(int).tolist():
+        if not _is_valid_hhmmss(int(raw)):
+            raise ValueError(f"Bar frame carries invalid HHMMSS: {raw!r}")
+    volumes = pd.to_numeric(df["volume"], errors="coerce")
+    if bool(volumes.isna().any()) or bool((volumes < 0).any()):
+        raise ValueError("Bar frame carries invalid negative volume")
+    symbols = sorted({str(item) for item in df["symbol"].astype(str).tolist()})
+    if coverage is not None:
+        missing = [item for item in symbols if item not in coverage]
+        if missing:
+            raise ValueError(f"Bar frame symbols lack coverage certification: {missing}")
+        for item in symbols:
+            entry = coverage[item]
+            if entry.session != str(session):
+                raise ValueError(f"Bar coverage session mismatch for {item!r}")
+    return symbols
+
+
+def _require_certified(symbols: list[str], coverage: Mapping[str, CoverageEntry], session: str) -> set[str]:
+    replaced: set[str] = set()
+    for symbol in symbols:
+        entry = coverage[symbol]
+        if entry.venue == "UNKNOWN":
+            raise ValueError(f"UNKNOWN venue cannot certify {symbol!r}")
+        if entry.status in (CaptureStatus.PARTIAL, CaptureStatus.FAILED, CaptureStatus.UNKNOWN):
+            _preserve_staged_attempt(symbol, entry)
+            raise ValueError(f"Non-certified attempt cannot replace authoritative partition: {symbol!r} status={entry.status.value}")
+        if entry.status in (CaptureStatus.NO_TRADES, CaptureStatus.COMPLETE):
+            replaced.add(symbol)
+        else:
+            _preserve_staged_attempt(symbol, entry)
+            raise ValueError(f"Non-certified attempt cannot replace authoritative partition: {symbol!r} status={entry.status.value}")
+    for symbol, entry in coverage.items():
+        if (
+            entry.status == CaptureStatus.NO_TRADES
+            and symbol not in replaced
+            and len(entry.raw_refs) > 0
+            and entry.session == str(session)
+            and entry.venue != "UNKNOWN"
+        ):
+            replaced.add(str(symbol))
+    return replaced
+
+
+def _preserve_staged_attempt(symbol: str, entry: CoverageEntry) -> None:
+    root = _capture_root()
+    staged = root / "staging" / "intraday" / f"{symbol}-{entry.status.value.lower()}.parquet"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    marker = staged.parent / f"{symbol}-{entry.status.value.lower()}.manifest.json"
+    marker.write_text(f'{{"symbol": "{symbol}", "status": "{entry.status.value}"}}', encoding="utf-8")
+
+
+def _partition_row_count(target: Path) -> int:
+    if not target.exists():
+        return 0
+    try:
+        handle = pq.ParquetFile(target)
+    except Exception as e:
+        raise OSError(f"Cannot read existing partition evidence: {target}") from e
+    return int(handle.metadata.num_rows)
+
+
+def _acquire_partition_lock(target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock = target.parent / (target.name + ".lock")
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return lock
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise OSError(f"Timed out acquiring partition lock: {lock}") from None
+            time.sleep(0.01)
+
+
+def _release_partition_lock(lock: Path) -> None:
+    if lock.exists():
+        lock.unlink()
+
+
+def _retain_backup_ref(target: Path, snapshot_date: str, session: str) -> str:
+    root = _capture_root()
+    backup_dir = root / "backups" / "intraday" / str(session) / str(snapshot_date)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / f"{target.stem}-pre-{uuid.uuid4().hex}.parquet"
+    os.link(target, backup)
+    return str(backup)
+
+
+def _deduplicate_bars(df: pd.DataFrame) -> pd.DataFrame:
+    key_cols = ["symbol", "ts_hms"]
+    grouped = df.groupby(key_cols, sort=False)
+    rows: list[pd.DataFrame] = []
+    for _, group in grouped:
+        distinct = group.drop_duplicates(ignore_index=True)
+        if len(distinct) > 1:
+            raise ValueError(f"Contradictory bar slot for {group.iloc[0]['symbol']!r} ts={group.iloc[0]['ts_hms']!r}")
+        rows.append(distinct.iloc[[0]])
+    reconciled = pd.concat(rows, ignore_index=True) if rows else df.copy()
+    reconciled = reconciled.sort_values(["symbol", "ts_hms"], kind="stable").reset_index(drop=True)
+    return reconciled[list(CANONICAL_BAR_COLUMNS)]
+
+
+def _collect_legacy_overlap(target: Path, symbols: set[str], batch_rows: int) -> dict[str, pd.DataFrame]:
+    collected: dict[str, list[pd.DataFrame]] = {item: [] for item in symbols}
+    try:
+        handle = pq.ParquetFile(target)
+    except Exception as e:
+        raise OSError(f"Cannot read existing partition evidence: {target}") from e
+    for batch in handle.iter_batches(batch_size=batch_rows):
+        frame = batch.to_pandas()
+        if "symbol" not in frame.columns:
+            raise ValueError("Legacy partition missing key columns: ['symbol']")
+        for symbol, group in frame.groupby("symbol"):
+            key = str(symbol)
+            if key in collected:
+                collected[key].append(group.copy())
+    return {key: (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()) for key, parts in collected.items()}
+
+
+def _frames_equal(old: pd.DataFrame, new: pd.DataFrame) -> bool:
+    if len(old) != len(new):
+        return False
+    order = sorted(old.columns)
+    left = old[order].sort_values(order, kind="stable").reset_index(drop=True)
+    right = new[order].sort_values(order, kind="stable").reset_index(drop=True)
+
+    def _rows(frame: pd.DataFrame) -> list[tuple[str, ...]]:
+        return sorted(tuple("∅" if pd.isna(value) else str(value) for value in row) for row in frame.itertuples(index=False, name=None))
+
+    return _rows(left) == _rows(right)
+
+
+def _check_legacy_unchanged(target: Path, incoming: pd.DataFrame, symbols: set[str], batch_rows: int) -> None:
+    overlap = _collect_legacy_overlap(target, symbols, batch_rows)
+    for symbol in symbols:
+        old = overlap.get(symbol, pd.DataFrame())
+        new = incoming[incoming["symbol"].astype(str) == symbol].copy()
+        if len(old) == 0:
+            continue
+        if not _frames_equal(old, new):
+            raise ValueError(f"Changed uncertified attempt requires certification: {symbol!r}")
+
+
+def _bounded_symbol_replace(
+    target: Path,
+    incoming: pd.DataFrame,
+    replaced: set[str],
+    batch_rows: int,
+    snapshot_date: str,
+    session: str,
+    *,
+    sort_output: bool,
+) -> int:
+    lock = _acquire_partition_lock(target)
+    try:
+        before_count = _partition_row_count(target)
+        before_symbols: set[str] = set()
+        backup_ref = ""
+        if target.exists():
+            backup_ref = _retain_backup_ref(target, snapshot_date, session)
+        staging = target.parent / f".stage-{uuid.uuid4().hex}.parquet"
+        kept_rows = 0
+        writer: pq.ParquetWriter | None = None
+        schema: pa.Schema | None = None
+        try:
+            if target.exists():
+                handle = pq.ParquetFile(target)
+                for batch in handle.iter_batches(batch_size=batch_rows):
+                    frame = batch.to_pandas()
+                    if "symbol" in frame.columns:
+                        before_symbols.update({str(item) for item in frame["symbol"].astype(str).tolist()})
+                    keep = frame[~frame["symbol"].astype(str).isin(replaced)] if "symbol" in frame.columns else frame
+                    if keep.empty:
+                        continue
+                    table = pa.Table.from_pandas(keep, preserve_index=False)
+                    if writer is None:
+                        schema = table.schema
+                        staging.parent.mkdir(parents=True, exist_ok=True)
+                        writer = pq.ParquetWriter(staging, schema)
+                    kept_rows += len(keep)
+                    writer.write_table(table.cast(schema))
+            if len(incoming) > 0:
+                ordered = incoming
+                if sort_output:
+                    ordered = incoming.sort_values(["symbol", "ts_hms"], kind="stable").reset_index(drop=True)
+                table = pa.Table.from_pandas(ordered, preserve_index=False)
+                if schema is None:
+                    schema = table.schema
+                if writer is None:
+                    staging.parent.mkdir(parents=True, exist_ok=True)
+                    writer = pq.ParquetWriter(staging, schema)
+                writer.write_table(table.cast(schema))
+            if writer is None:
+                if replaced and target.exists() and before_symbols and before_symbols <= replaced:
+                    target.unlink()
+                    logger.info(
+                        "[DATA] stage=intraday_replace date=%s session=%s before_rows=%d after_rows=%d replaced=%s backup=%s",
+                        snapshot_date, session, before_count, 0, sorted(replaced), backup_ref,
+                    )
+                    return 0
+                return before_count
+            writer.close()
+            writer = None
+            staged_count = _partition_row_count(staging)
+            expected = kept_rows + len(incoming)
+            if staged_count != expected:
+                raise OSError(f"Staged partition verification failed: expected={expected} staged={staged_count}")
+            try:
+                os.replace(staging, target)
+            except OSError as e:
+                raise OSError(f"Partition publication failed: {target}") from e
+            after_symbols = (before_symbols - replaced) | set(incoming["symbol"].astype(str).tolist()) if len(incoming) else (before_symbols - replaced)
+            logger.info(
+                "[DATA] stage=intraday_replace date=%s session=%s before_rows=%d after_rows=%d replaced=%s backup=%s",
+                snapshot_date, session, before_count, staged_count, sorted(replaced), backup_ref,
+            )
+            _ = after_symbols
+            return staged_count
+        finally:
+            if writer is not None:
+                writer.close()
+            if staging.exists():
+                staging.unlink()
+        return before_count
+    finally:
+        _release_partition_lock(lock)
+
+
+def write_intraday_partition(
+    df: pd.DataFrame,
+    bar_interval_minutes: int,
+    snapshot_date: str,
+    session: str = "regular",
+    *,
+    coverage: Mapping[str, CoverageEntry] | None = None,
+    batch_rows: int | None = None,
+) -> int:
+    """Publish complete bar attempts without retaining contaminated earlier ranges.
+
+    Args:
+        df: Canonical bars from whole-symbol certified attempts.
+        bar_interval_minutes: Declared bar interval.
+        snapshot_date: Requested market date.
+        session: Verified session partition.
+        coverage: Expected membership and bounded task certification.
+        batch_rows: Arrow rewrite batch bound.
+
+    Returns:
+        Total published rows.
+
+    Raises:
+        ValueError: Invalid replacement or contradictory duplicate bars.
+        OSError: Existing evidence or staging/publication fails.
+    """
+    bound = _batch_rows_or_default(batch_rows)
+    target = intraday_partition_path(bar_interval_minutes, snapshot_date, session)
+    if df is None or len(df) == 0:
+        if coverage is None:
+            return _partition_row_count(target)
+        no_trades = {
+            str(symbol)
+            for symbol, entry in coverage.items()
+            if entry.status == CaptureStatus.NO_TRADES
+            and entry.session == str(session)
+            and entry.venue != "UNKNOWN"
+            and len(entry.raw_refs) > 0
+        }
+        if not no_trades:
+            return _partition_row_count(target)
+        return _bounded_symbol_replace(target, df, no_trades, bound, str(snapshot_date), str(session), sort_output=True)
+    symbols = _validate_bar_frame(df, str(snapshot_date), str(session), coverage)
+    reconciled = _deduplicate_bars(df)
+    if coverage is None:
+        replaced = set(symbols)
+        if target.exists():
+            _check_legacy_unchanged(target, reconciled, replaced, bound)
+        total = _bounded_symbol_replace(target, reconciled, replaced, bound, str(snapshot_date), str(session), sort_output=True)
+        log_session_coverage_outliers(reconciled, bar_interval_minutes, str(snapshot_date), str(session))
+        logger.info("Wrote intraday partition %s (%d rows)", target, total)
+        return total
+    replaced = _require_certified(symbols, coverage, str(session))
+    total = _bounded_symbol_replace(target, reconciled, replaced, bound, str(snapshot_date), str(session), sort_output=True)
+    log_session_coverage_outliers(reconciled, bar_interval_minutes, str(snapshot_date), str(session))
+    logger.info("Wrote intraday partition %s (%d rows)", target, total)
+    return total
+
+
+def write_tick_partition(
+    df: pd.DataFrame,
+    snapshot_date: str,
+    session: str = "regular",
+    *,
+    coverage: Mapping[str, CoverageEntry] | None = None,
+    batch_rows: int | None = None,
+) -> int:
+    """Publish verified symbol attempts without inventing trade identities.
+
+    Same-second same-size events, including identical trades, are distinct
+    observations. Safe replacement requires a whole-symbol acquisition contract;
+    merging events on lossy market fields destroys multiplicity.
+
+    Args:
+        df: Canonical records of complete symbol attempts.
+        snapshot_date: Exact market date.
+        session: Explicit verified session partition.
+        coverage: Per-symbol acquisition and venue/session certification.
+        batch_rows: Configured bounded Arrow rewrite batch size.
+
+    Returns:
+        Total rows in the newly published partition.
+
+    Raises:
+        ValueError: Unsafe replacement, incomplete certification, or bad schema.
+        OSError: Existing evidence cannot be read or publication fails.
+    """
+    bound = _batch_rows_or_default(batch_rows)
     target = tick_partition_path(snapshot_date, session)
-    merged = merge_partition_frame(df, target, ("symbol", "ts_hms", "volume"))
-    atomic_write_parquet(merged, target)
-    logger.info("Wrote tick partition %s (%d rows)", target, len(merged))
-    return len(merged)
+    if df is None or len(df) == 0:
+        if coverage is None:
+            return _partition_row_count(target)
+        no_trades = {
+            str(symbol)
+            for symbol, entry in coverage.items()
+            if entry.status == CaptureStatus.NO_TRADES
+            and entry.session == str(session)
+            and entry.venue != "UNKNOWN"
+            and len(entry.raw_refs) > 0
+        }
+        if not no_trades:
+            return _partition_row_count(target)
+        return _bounded_symbol_replace(target, df, no_trades, bound, str(snapshot_date), str(session), sort_output=False)
+    symbols = _validate_tick_frame(df, str(snapshot_date), str(session), coverage)
+    if coverage is None:
+        replaced = set(symbols)
+        if target.exists():
+            _check_legacy_unchanged(target, df, replaced, bound)
+        total = _bounded_symbol_replace(target, df, replaced, bound, str(snapshot_date), str(session), sort_output=False)
+        logger.info("Wrote tick partition %s (%d rows)", target, total)
+        return total
+    replaced = _require_certified(symbols, coverage, str(session))
+    total = _bounded_symbol_replace(target, df, replaced, bound, str(snapshot_date), str(session), sort_output=False)
+    logger.info("Wrote tick partition %s (%d rows)", target, total)
+    return total
 
 
 def tick_partition_path(snapshot_date: str, session: str = "regular") -> Path:

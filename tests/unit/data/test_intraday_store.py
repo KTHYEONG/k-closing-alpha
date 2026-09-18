@@ -99,7 +99,7 @@ def test_write_intraday_partition_rejects_non_canonical_frame(tmp_path, monkeypa
 
 
 def test_merge_partition_frame_recovers_from_unreadable_existing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """기존 파티션 파일이 손상되어 읽기 실패해도 신규 데이터만으로 안전하게 계속 진행한다."""
+    """손상된 기존 파티션은 증거 보존을 위해 명시적 실패로 처리한다."""
     monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
 
     target = intraday_store.intraday_partition_path(1, "2026-09-05", "regular")
@@ -107,10 +107,9 @@ def test_merge_partition_frame_recovers_from_unreadable_existing_file(tmp_path: 
     target.write_text("not a valid parquet file")
 
     new_df = _canon_bar("005930", "2026-09-05")
-    merged = intraday_store.merge_partition_frame(new_df, target, ("symbol", "ts_hms"))
 
-    assert len(merged) == 1
-    assert merged.iloc[0]["symbol"] == "005930"
+    with pytest.raises(OSError, match="Cannot read existing partition"):
+        intraday_store.merge_partition_frame(new_df, target, ("symbol", "ts_hms"))
 
 
 def test_write_intraday_partition_rejects_symbol_coverage_reduction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -396,3 +395,392 @@ def test_write_intraday_partition_logs_truncation_warning_for_partial_session_sy
     # Then: return contract unchanged (total row count), truncation diagnostic visible via log
     assert rows_written == 13
     assert any("session_truncation" in rec.message and "000660" in rec.message for rec in caplog.records)
+
+
+def _tick_rows(symbol: str, snapshot_date: str, rows: list[tuple[str, int, int]]) -> pd.DataFrame:
+    raw = pd.DataFrame({
+        "time": [item[0] for item in rows],
+        "close": [item[1] for item in rows],
+        "jdiff_vol": [item[2] for item in rows],
+    })
+    return normalize_tick_frame(raw, "ls", snapshot_date, symbol)
+
+
+def _tick_entry(symbol: str, status: str = "COMPLETE", session: str = "regular", venue: str = "KRX") -> object:
+    from src.data.capture_contracts import ArtifactRef, CaptureDataset, CaptureStatus, CoverageEntry
+
+    refs: tuple[object, ...] = ()
+    reason = "sweep done"
+    if status in ("NO_TRADES", "NOT_APPLICABLE"):
+        refs = (ArtifactRef(path=f"raw/{symbol}.json.gz", sha256="a" * 64, bytes=8, rows=0),)
+        reason = "verified empty with proof"
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.TRADE_TICKS,
+        venue=venue,
+        session=session,
+        scheduled_at=None,
+        status=CaptureStatus(status),
+        rows=0,
+        first_event_time=None,
+        last_event_time=None,
+        reason=reason,
+        raw_refs=refs,  # type: ignore[arg-type]
+    )
+
+
+def _bar_entry(symbol: str, status: str = "COMPLETE", session: str = "regular", venue: str = "KRX") -> object:
+    from src.data.capture_contracts import ArtifactRef, CaptureDataset, CaptureStatus, CoverageEntry
+
+    refs: tuple[object, ...] = ()
+    reason = "sweep done"
+    if status in ("NO_TRADES", "NOT_APPLICABLE"):
+        refs = (ArtifactRef(path=f"raw/{symbol}.json.gz", sha256="a" * 64, bytes=8, rows=0),)
+        reason = "verified empty with proof"
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.MINUTE_BARS,
+        venue=venue,
+        session=session,
+        scheduled_at=None,
+        status=CaptureStatus(status),
+        rows=0,
+        first_event_time=None,
+        last_event_time=None,
+        reason=reason,
+        raw_refs=refs,  # type: ignore[arg-type]
+    )
+
+
+def _canon_bar_at(symbol: str, snapshot_date: str, time: str, close: int, vol: int = 100) -> pd.DataFrame:
+    raw = pd.DataFrame({"time": [time], "open": [close], "high": [close], "low": [close], "close": [close], "jdiff_vol": [vol], "value": [10]})
+    return normalize_bar_frame(raw, "ls", snapshot_date, symbol)
+
+
+def test_write_tick_partition_preserves_same_second_trades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    df = _tick_rows("005930", "2026-09-03", [("090300", 70000, 10), ("090300", 70100, 10)])
+    cov = {"005930": _tick_entry("005930")}
+    first = intraday_store.write_tick_partition(df, "2026-09-03", "regular", coverage=cov)  # type: ignore[arg-type]
+    assert first == 2
+    second = intraday_store.write_tick_partition(df, "2026-09-03", "regular", coverage=cov)  # type: ignore[arg-type]
+    assert second == 2
+    stored = pd.read_parquet(intraday_store.tick_partition_path("2026-09-03", "regular"))
+    assert len(stored) == 2
+    assert int(stored["volume"].sum()) == 20
+    assert sorted(stored["price"].tolist()) == [70000, 70100]
+
+
+def test_write_tick_partition_preserves_identical_repeated_trades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    df = _tick_rows("005930", "2026-09-03", [("090300", 70000, 5), ("090300", 70000, 5)])
+    cov = {"005930": _tick_entry("005930")}
+    assert intraday_store.write_tick_partition(df, "2026-09-03", "regular", coverage=cov) == 2  # type: ignore[arg-type]
+    assert intraday_store.write_tick_partition(df, "2026-09-03", "regular", coverage=cov) == 2  # type: ignore[arg-type]
+    stored = pd.read_parquet(intraday_store.tick_partition_path("2026-09-03", "regular"))
+    assert len(stored) == 2
+
+
+def test_write_tick_partition_conserves_unaffected_symbols(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    old_a = _tick_rows("005930", date, [("090300", 70000, 10)])
+    old_b = _tick_rows("000660", date, [("090300", 50000, 7)])
+    both = pd.concat([old_a, old_b], ignore_index=True)
+    cov_both = {"005930": _tick_entry("005930"), "000660": _tick_entry("000660")}
+    intraday_store.write_tick_partition(both, date, "regular", coverage=cov_both)  # type: ignore[arg-type]
+    before_b = pd.read_parquet(intraday_store.tick_partition_path(date, "regular")).query("symbol == '000660'")
+    new_a = _tick_rows("005930", date, [("090400", 70100, 3), ("090500", 70200, 4)])
+    total = intraday_store.write_tick_partition(new_a, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    assert total == 3
+    stored = pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))
+    after_b = stored.query("symbol == '000660'")
+    assert len(after_b) == 1
+    assert after_b.reset_index(drop=True).astype(str).equals(before_b.reset_index(drop=True).astype(str))
+    assert len(stored.query("symbol == '005930'")) == 2
+
+
+def test_write_tick_partition_rejects_partial_replacement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    full = _tick_rows("005930", date, [("090300", 70000, 10)])
+    intraday_store.write_tick_partition(full, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    before = pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))
+    partial = _tick_rows("005930", date, [("090400", 70100, 2)])
+    with pytest.raises(ValueError, match="Non-certified"):
+        intraday_store.write_tick_partition(partial, date, "regular", coverage={"005930": _tick_entry("005930", status="PARTIAL")})  # type: ignore[arg-type]
+    after = pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))
+    assert after.reset_index(drop=True).astype(str).equals(before.reset_index(drop=True).astype(str))
+    assert (tmp_path / "capture" / "staging" / "intraday").exists()
+
+
+def test_write_tick_partition_repair_removes_contamination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    legacy = _tick_rows("005930", date, [("090000", 70000, 1), ("200000", 70000, 9)])
+    intraday_store.write_tick_partition(legacy, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    clean = _tick_rows("005930", date, [("090100", 70100, 2), ("090200", 70200, 3)])
+    total = intraday_store.write_tick_partition(clean, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    assert total == 2
+    stored = pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))
+    assert 200000 not in stored["ts_hms"].tolist()
+    assert sorted(stored["ts_hms"].tolist()) == [90100, 90200]
+    backups = list((tmp_path / "capture" / "backups").rglob("*.parquet"))
+    assert len(backups) >= 1
+
+
+def test_write_tick_partition_fails_on_corrupt_partition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    target = intraday_store.tick_partition_path("2026-09-03", "regular")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("corrupt bytes")
+    df = _tick_rows("005930", "2026-09-03", [("090300", 70000, 1)])
+    with pytest.raises(OSError, match="Cannot read existing"):
+        intraday_store.write_tick_partition(df, "2026-09-03", "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    assert target.read_text() == "corrupt bytes"
+
+
+def test_write_tick_partition_failed_staging_keeps_original(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    first = _tick_rows("005930", date, [("090300", 70000, 1)])
+    intraday_store.write_tick_partition(first, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    before_bytes = intraday_store.tick_partition_path(date, "regular").read_bytes()
+    real_writer = intraday_store.pq.ParquetWriter
+
+    class _BoomWriter(real_writer):  # type: ignore[misc]
+        def write_table(self, *args: object, **kwargs: object) -> None:
+            raise OSError("arrow write boom")
+
+    monkeypatch.setattr(intraday_store.pq, "ParquetWriter", _BoomWriter)
+    second = _tick_rows("000660", date, [("090300", 50000, 2)])
+    with pytest.raises(OSError, match="arrow write boom"):
+        intraday_store.write_tick_partition(second, date, "regular", coverage={"000660": _tick_entry("000660")})  # type: ignore[arg-type]
+    assert intraday_store.tick_partition_path(date, "regular").read_bytes() == before_bytes
+    monkeypatch.setattr(intraday_store.pq, "ParquetWriter", real_writer)
+    monkeypatch.setattr(intraday_store.os, "replace", lambda _s, _d: (_ for _ in ()).throw(OSError("rename boom")))
+    with pytest.raises(OSError, match="publication failed"):
+        intraday_store.write_tick_partition(second, date, "regular", coverage={"000660": _tick_entry("000660")})  # type: ignore[arg-type]
+    assert intraday_store.tick_partition_path(date, "regular").read_bytes() == before_bytes
+
+
+def test_write_tick_partition_serializes_concurrent_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    df_a = _tick_rows("005930", date, [("090300", 70000, 1)])
+    df_b = _tick_rows("000660", date, [("090300", 50000, 2)])
+    cov_a = {"005930": _tick_entry("005930")}
+    cov_b = {"000660": _tick_entry("000660")}
+
+    def _write_a() -> int:
+        return intraday_store.write_tick_partition(df_a, date, "regular", coverage=cov_a)  # type: ignore[arg-type]
+
+    def _write_b() -> int:
+        return intraday_store.write_tick_partition(df_b, date, "regular", coverage=cov_b)  # type: ignore[arg-type]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda fn: fn(), [_write_a, _write_b]))
+    assert sorted(results) in ([1, 2], [2, 2], [1, 1])
+    stored = pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))
+    assert set(stored["symbol"].tolist()) == {"005930", "000660"}
+
+
+def test_write_tick_partition_empty_frame_preserves_trades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    df = _tick_rows("005930", date, [("090300", 70000, 4)])
+    intraday_store.write_tick_partition(df, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    total = intraday_store.write_tick_partition(pd.DataFrame(), date, "regular")
+    assert total == 1
+    total_none = intraday_store.write_tick_partition(None, date, "regular")  # type: ignore[arg-type]
+    assert total_none == 1
+    stored = pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))
+    assert len(stored) == 1
+    cleared = intraday_store.write_tick_partition(
+        pd.DataFrame(), date, "regular", coverage={"005930": _tick_entry("005930", status="NO_TRADES")}  # type: ignore[arg-type]
+    )
+    assert cleared == 0
+    target = intraday_store.tick_partition_path(date, "regular")
+    if target.exists():
+        assert len(pd.read_parquet(target)) == 0
+
+
+
+def test_write_intraday_partition_rejects_contradictory_bar_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-04"
+    first = _canon_bar_at("005930", date, "090300", 70000)
+    intraday_store.write_intraday_partition(first, 1, date, "regular", coverage={"005930": _bar_entry("005930")})  # type: ignore[arg-type]
+    before = pd.read_parquet(intraday_store.intraday_partition_path(1, date, "regular"))
+    bad = pd.concat([_canon_bar_at("005930", date, "090400", 70000), _canon_bar_at("005930", date, "090400", 71000)], ignore_index=True)
+    with pytest.raises(ValueError, match="Contradictory"):
+        intraday_store.write_intraday_partition(bad, 1, date, "regular", coverage={"005930": _bar_entry("005930")})  # type: ignore[arg-type]
+    after = pd.read_parquet(intraday_store.intraday_partition_path(1, date, "regular"))
+    assert after.reset_index(drop=True).astype(str).equals(before.reset_index(drop=True).astype(str))
+    dup = pd.concat([_canon_bar_at("005930", date, "090500", 70000), _canon_bar_at("005930", date, "090500", 70000)], ignore_index=True)
+    total = intraday_store.write_intraday_partition(dup, 1, date, "regular", coverage={"005930": _bar_entry("005930")})  # type: ignore[arg-type]
+    assert total == 1
+    assert pd.read_parquet(intraday_store.intraday_partition_path(1, date, "regular"))["ts_hms"].tolist() == [90500]
+
+
+def test_write_tick_partition_processes_large_partition_in_batches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    seed = _tick_rows("005930", date, [("090300", 70000, 1)])
+    intraday_store.write_tick_partition(seed, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    big_parts = [_tick_rows(f"{900000 + idx:06d}", date, [("090300", 60000, 1)]) for idx in range(30)]
+    big = pd.concat(big_parts, ignore_index=True)
+    big_cov = {str(symbol): _tick_entry(str(symbol)) for symbol in big["symbol"].unique().tolist()}
+    intraday_store.write_tick_partition(big, date, "regular", coverage=big_cov, batch_rows=8)  # type: ignore[arg-type]
+    seen_sizes: list[int] = []
+    import pyarrow.parquet as pq_mod
+
+    real_file = pq_mod.ParquetFile
+    real_read = pd.read_parquet
+    target = intraday_store.tick_partition_path(date, "regular")
+
+    def _guarded_read(path: object, *args: object, **kwargs: object) -> pd.DataFrame:
+        if str(path) == str(target):
+            raise AssertionError("bounded rewrite must not pandas-read the whole partition")
+        return real_read(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    class _SpyFile(real_file):  # type: ignore[misc]
+        def iter_batches(self, batch_size: int | None = None, **kwargs: object):  # type: ignore[override]
+            seen_sizes.append(int(batch_size or 0))
+            yield from super().iter_batches(batch_size=batch_size, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", _guarded_read)
+    monkeypatch.setattr(pq_mod, "ParquetFile", _SpyFile)
+    monkeypatch.setattr(intraday_store.pq, "ParquetFile", _SpyFile)
+    small = _tick_rows("000001", date, [("090400", 50000, 2)])
+    total = intraday_store.write_tick_partition(small, date, "regular", coverage={"000001": _tick_entry("000001")}, batch_rows=8)  # type: ignore[arg-type]
+    assert total == 32
+    assert seen_sizes and max(seen_sizes) <= 8
+
+
+def test_write_tick_partition_legacy_changed_attempt_requires_certification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    first = _tick_rows("005930", date, [("090300", 70000, 1)])
+    assert intraday_store.write_tick_partition(first, date, "regular") == 1
+    assert intraday_store.write_tick_partition(first, date, "regular") == 1
+    changed = _tick_rows("005930", date, [("090400", 70100, 9)])
+    with pytest.raises(ValueError, match="requires certification"):
+        intraday_store.write_tick_partition(changed, date, "regular")
+    stored = pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))
+    assert len(stored) == 1
+    assert int(stored.iloc[0]["ts_hms"]) == 90300
+    with pytest.raises(ValueError, match="batch_rows must be positive"):
+        intraday_store.write_tick_partition(first, date, "regular", batch_rows=0)
+    with pytest.raises(ValueError, match="UNKNOWN venue"):
+        intraday_store.write_tick_partition(first, date, "regular", coverage={"005930": _tick_entry("005930", status="PARTIAL", venue="UNKNOWN")})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="session mismatch"):
+        intraday_store.write_tick_partition(first, date, "regular", coverage={"005930": _tick_entry("005930", session="nxt_aftermarket")})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="lack coverage"):
+        intraday_store.write_tick_partition(first, date, "regular", coverage={"000660": _tick_entry("000660")})  # type: ignore[arg-type]
+    bad_date = _tick_rows("005930", "2026-09-04", [("090300", 70000, 1)])
+    with pytest.raises(ValueError, match="snapshot_date"):
+        intraday_store.write_tick_partition(bad_date, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    longer = _tick_rows("005930", date, [("090300", 70000, 1), ("090400", 70100, 2)])
+    with pytest.raises(ValueError, match="requires certification"):
+        intraday_store.write_tick_partition(longer, date, "regular")
+
+
+def test_write_partitions_reject_invalid_frames_and_certification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    monkeypatch.setattr(intraday_store.settings, "COLLECTION_ROOT", tmp_path / "custom-capture")
+    date = "2026-09-03"
+    base_tick = _tick_rows("005930", date, [("090300", 70000, 1)])
+    bad_ts = base_tick.copy()
+    bad_ts["ts_hms"] = -5
+    with pytest.raises(ValueError, match="HHMMSS"):
+        intraday_store.write_tick_partition(bad_ts, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    non_numeric = base_tick.copy()
+    non_numeric["ts_hms"] = "not-a-time"
+    with pytest.raises(ValueError, match="non-numeric"):
+        intraday_store.write_tick_partition(non_numeric, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    neg_vol = base_tick.copy()
+    neg_vol["volume"] = -1
+    with pytest.raises(ValueError, match="negative volume"):
+        intraday_store.write_tick_partition(neg_vol, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    base_bar = _canon_bar_at("005930", date, "090300", 70000)
+    bad_bar_ts = base_bar.copy()
+    bad_bar_ts["ts_hms"] = 999999
+    with pytest.raises(ValueError, match="HHMMSS"):
+        intraday_store.write_intraday_partition(bad_bar_ts, 1, date, "regular", coverage={"005930": _bar_entry("005930")})  # type: ignore[arg-type]
+    bad_bar_num = base_bar.copy()
+    bad_bar_num["ts_hms"] = "xx"
+    with pytest.raises(ValueError, match="non-numeric"):
+        intraday_store.write_intraday_partition(bad_bar_num, 1, date, "regular", coverage={"005930": _bar_entry("005930")})  # type: ignore[arg-type]
+    bad_bar_vol = base_bar.copy()
+    bad_bar_vol["volume"] = -2
+    with pytest.raises(ValueError, match="negative volume"):
+        intraday_store.write_intraday_partition(bad_bar_vol, 1, date, "regular", coverage={"005930": _bar_entry("005930")})  # type: ignore[arg-type]
+    bad_bar_date = _canon_bar_at("005930", "2026-09-04", "090300", 70000)
+    with pytest.raises(ValueError, match="snapshot_date"):
+        intraday_store.write_intraday_partition(bad_bar_date, 1, date, "regular", coverage={"005930": _bar_entry("005930")})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="lack coverage"):
+        intraday_store.write_intraday_partition(base_bar, 1, date, "regular", coverage={"000660": _bar_entry("000660")})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="session mismatch"):
+        intraday_store.write_intraday_partition(base_bar, 1, date, "regular", coverage={"005930": _bar_entry("005930", session="nxt_aftermarket")})  # type: ignore[arg-type]
+    for status in ("FAILED", "UNKNOWN", "PENDING", "NOT_APPLICABLE"):
+        with pytest.raises(ValueError, match="Non-certified"):
+            intraday_store.write_tick_partition(base_tick, date, "regular", coverage={"005930": _tick_entry("005930", status=status)})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="UNKNOWN venue"):
+        intraday_store.write_intraday_partition(base_bar, 1, date, "regular", coverage={"005930": _bar_entry("005930", venue="UNKNOWN")})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="session mismatch"):
+        intraday_store.write_intraday_partition(base_bar, 1, date, "regular", coverage={"005930": _bar_entry("005930", session="nxt_aftermarket")})  # type: ignore[arg-type]
+
+
+def test_write_partitions_handle_storage_boundaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    assert intraday_store._capture_root() == tmp_path / "capture"
+    assert intraday_store._is_valid_hhmmss(-1) is False
+    assert intraday_store._is_valid_hhmmss(240000) is False
+    assert intraday_store._is_valid_hhmmss(126060) is False
+    assert intraday_store._is_valid_hhmmss(90300) is True
+    target = intraday_store.tick_partition_path("2026-09-10", "regular")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("broken")
+    legacy = _tick_rows("005930", "2026-09-10", [("090300", 70000, 1)])
+    with pytest.raises(OSError, match="Cannot read existing"):
+        intraday_store.write_tick_partition(legacy, "2026-09-10", "regular")
+    legacy_bad = tmp_path / "legacy.parquet"
+    pd.DataFrame({"ts_hms": [90300]}).to_parquet(legacy_bad, index=False)
+    with pytest.raises(ValueError, match="missing key columns"):
+        intraday_store._collect_legacy_overlap(legacy_bad, {"005930"}, 16)
+    with pytest.raises(OSError, match="Cannot read existing"):
+        intraday_store._collect_legacy_overlap(target, {"005930"}, 16)
+    lock_target = intraday_store.tick_partition_path(date, "locked")
+    lock_target.parent.mkdir(parents=True, exist_ok=True)
+    (lock_target.parent / (lock_target.name + ".lock")).touch()
+    monkeypatch.setattr(intraday_store, "_LOCK_TIMEOUT_SECONDS", 0.0)
+    with pytest.raises(OSError, match="Timed out acquiring"):
+        intraday_store._acquire_partition_lock(lock_target)
+    good = _tick_rows("005930", date, [("090300", 70000, 1)])
+    intraday_store.write_tick_partition(good, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    real_count = intraday_store._partition_row_count
+    monkeypatch.setattr(intraday_store, "_partition_row_count", lambda p: 999 if p.name.startswith(".stage-") else real_count(p))
+    extra = _tick_rows("000660", date, [("090300", 50000, 1)])
+    with pytest.raises(OSError, match="verification failed"):
+        intraday_store.write_tick_partition(extra, date, "regular", coverage={"000660": _tick_entry("000660")})  # type: ignore[arg-type]
+    assert intraday_store._partition_row_count(intraday_store.tick_partition_path(date, "regular")) == 1
+    monkeypatch.setattr(intraday_store, "_partition_row_count", real_count)
+    assert intraday_store.write_tick_partition(pd.DataFrame(), "2026-09-20", "regular", coverage={"005930": _tick_entry("005930", status="NO_TRADES")}) == 0  # type: ignore[arg-type]
+    assert intraday_store.write_tick_partition(pd.DataFrame(), date, "regular", coverage={"005930": _tick_entry("005930")}) == 1  # type: ignore[arg-type]
+    old_with_b = pd.concat([good, _tick_rows("000660", date, [("090310", 50000, 3)])], ignore_index=True)
+    intraday_store.write_tick_partition(old_with_b, date, "regular", coverage={"005930": _tick_entry("005930"), "000660": _tick_entry("000660")})  # type: ignore[arg-type]
+    new_a_only = _tick_rows("005930", date, [("090320", 70200, 5)])
+    mixed_cov = {"005930": _tick_entry("005930"), "000660": _tick_entry("000660", status="NO_TRADES")}
+    total = intraday_store.write_tick_partition(new_a_only, date, "regular", coverage=mixed_cov)  # type: ignore[arg-type]
+    assert total == 1
+    assert pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))["symbol"].tolist() == ["005930"]
+    assert intraday_store.write_intraday_partition(pd.DataFrame(), 1, "2026-09-21", "regular") == 0
+    assert intraday_store.write_intraday_partition(pd.DataFrame(), 1, date, "regular", coverage={"005930": _bar_entry("005930")}) == 0  # type: ignore[arg-type]
+    bar_gone = intraday_store.write_intraday_partition(pd.DataFrame(), 1, "2026-09-22", "regular", coverage={"005930": _bar_entry("005930", status="NO_TRADES")})  # type: ignore[arg-type]
+    assert bar_gone == 0
+
+

@@ -444,3 +444,179 @@ def test_sync_repo_does_not_install_units_when_test_gate_fails(monkeypatch) -> N
     assert result.units is None
 
 
+def test_format_test_gate_tail_strips_ansi_and_extracts_summary() -> None:
+    from src.tools.code_sync import format_test_gate_tail
+
+    # Empty string
+    assert format_test_gate_tail("") == ""
+
+    # ANSI stripped + short test summary info extraction
+    raw = (
+        "\x1b[31mFAILURES\x1b[0m\n"
+        "some verbose logs 1\n"
+        "some verbose logs 2\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/unit/test_foo.py::test_bar - AssertionError: expected 1 got 2\n"
+        "1 failed, 10 passed in 0.5s\n"
+    )
+    formatted = format_test_gate_tail(raw)
+    assert formatted.startswith("```\n")
+    assert formatted.endswith("\n```")
+    assert "\x1b[" not in formatted
+    assert "short test summary info" in formatted
+    assert "FAILED tests/unit/test_foo.py::test_bar" in formatted
+    assert "some verbose logs 1" not in formatted
+
+
+def test_format_test_gate_tail_truncates_oversized_snippet() -> None:
+    from src.tools.code_sync import ALERT_DETAIL_TAIL_CHARS, format_test_gate_tail
+
+    raw = "FAILED tests/unit/test_foo.py::test_bar - boom\n" + "y" * (ALERT_DETAIL_TAIL_CHARS + 100)
+
+    formatted = format_test_gate_tail(raw)
+
+    assert formatted.startswith("```\n")
+    assert len(formatted) <= ALERT_DETAIL_TAIL_CHARS + len("```\n\n```")
+
+
+def _write_units(directory, names_to_text: dict) -> None:
+    for name, text in names_to_text.items():
+        (directory / name).write_text(text)
+
+
+def _fake_systemctl(calls: list):
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    return fake_run
+
+
+def test_install_systemd_units_leaves_new_optional_timers_disabled(tmp_path) -> None:
+    from src.tools import code_sync
+
+    repo = tmp_path / "repo"
+    src = repo / "deploy" / "systemd"
+    src.mkdir(parents=True)
+    dest = tmp_path / "user"
+    dest.mkdir()
+    calls: list = []
+    _write_units(src, {
+        "kca-auction-close.timer": "close\n",
+        "kca-auction-open.timer": "open\n",
+        "kca-altdata-capture.timer": "alt\n",
+    })
+
+    result = code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=_fake_systemctl(calls))
+
+    assert result.changed == ("kca-altdata-capture.timer", "kca-auction-close.timer", "kca-auction-open.timer")
+    assert result.enabled == ()
+    assert calls == [["systemctl", "--user", "daemon-reload"]]
+
+
+def test_install_systemd_units_retains_previously_enabled_optional_timer(tmp_path) -> None:
+    from src.tools import code_sync
+
+    repo = tmp_path / "repo"
+    src = repo / "deploy" / "systemd"
+    src.mkdir(parents=True)
+    dest = tmp_path / "user"
+    dest.mkdir()
+    calls: list = []
+    _write_units(src, {"kca-auction-close.timer": "v2\n"})
+    _write_units(dest, {"kca-auction-close.timer": "v1\n"})
+
+    result = code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=_fake_systemctl(calls))
+
+    assert result.changed == ("kca-auction-close.timer",)
+    assert result.enabled == ()
+    assert (dest / "kca-auction-close.timer").read_text() == "v2\n"
+    assert calls == [["systemctl", "--user", "daemon-reload"]]
+
+
+def test_install_systemd_units_still_auto_enables_ordinary_timer(tmp_path) -> None:
+    from src.tools import code_sync
+
+    repo = tmp_path / "repo"
+    src = repo / "deploy" / "systemd"
+    src.mkdir(parents=True)
+    dest = tmp_path / "user"
+    dest.mkdir()
+    calls: list = []
+    _write_units(src, {"kca-collect.timer": "t\n"})
+
+    result = code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=_fake_systemctl(calls))
+
+    assert result.enabled == ("kca-collect.timer",)
+    assert calls == [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "kca-collect.timer"],
+    ]
+
+
+def test_install_systemd_units_removes_deleted_optional_unit(tmp_path) -> None:
+    from src.tools import code_sync
+
+    repo = tmp_path / "repo"
+    src = repo / "deploy" / "systemd"
+    src.mkdir(parents=True)
+    dest = tmp_path / "user"
+    dest.mkdir()
+    calls: list = []
+    _write_units(dest, {"kca-auction-open.timer": "old\n", "kca-auction-open.service": "old\n"})
+
+    result = code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=_fake_systemctl(calls))
+
+    assert result.removed == ("kca-auction-open.service", "kca-auction-open.timer")
+    assert not (dest / "kca-auction-open.timer").exists()
+    assert calls == [
+        ["systemctl", "--user", "disable", "--now", "kca-auction-open.timer"],
+        ["systemctl", "--user", "daemon-reload"],
+    ]
+
+
+def test_install_systemd_units_keeps_existing_trading_schedule_intact(tmp_path) -> None:
+    from src.tools import code_sync
+
+    repo = tmp_path / "repo"
+    src = repo / "deploy" / "systemd"
+    src.mkdir(parents=True)
+    dest = tmp_path / "user"
+    dest.mkdir()
+    calls: list = []
+    trading = "[Timer]\nOnCalendar=Mon..Fri 15:20:00 Asia/Seoul\n"
+    _write_units(src, {"kca-collect.timer": trading, "kca-auction-close.timer": "close\n"})
+    _write_units(dest, {"kca-collect.timer": trading})
+
+    result = code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=_fake_systemctl(calls))
+
+    assert result.changed == ("kca-auction-close.timer",)
+    assert result.enabled == ()
+    assert (dest / "kca-collect.timer").read_text() == trading
+
+
+def test_install_systemd_units_second_run_is_idempotent(tmp_path) -> None:
+    from src.tools import code_sync
+
+    repo = tmp_path / "repo"
+    src = repo / "deploy" / "systemd"
+    src.mkdir(parents=True)
+    dest = tmp_path / "user"
+    dest.mkdir()
+    _write_units(src, {"kca-auction-close.timer": "close\n", "kca-collect.timer": "t\n"})
+    _write_units(dest, {"kca-collect.timer": "t\n"})
+    calls: list = []
+    first = code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=_fake_systemctl(calls))
+    assert first.changed == ("kca-auction-close.timer",)
+
+    second_calls: list = []
+    second = code_sync.install_systemd_units(str(repo), dest_dir=dest, run_fn=_fake_systemctl(second_calls))
+
+    assert second == code_sync.UnitInstallResult(changed=(), removed=(), enabled=())
+    assert second_calls == []
+
+
+
+

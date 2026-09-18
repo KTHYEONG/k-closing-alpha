@@ -3,8 +3,9 @@ import asyncio
 import logging
 import os
 import sys
-from collections.abc import Callable
-from datetime import datetime
+import uuid
+from collections.abc import Callable, Mapping
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -17,6 +18,16 @@ from src import settings
 # 커스텀 모듈 임포트
 from src.api.kis.client import KisApiClient, kis_data_client_kwargs, kis_decision_shard_client_kwargs
 from src.config.market_session import REALTIME_REQUOTE_DEADLINE_HHMMSS
+from src.data.capture_contracts import (
+    CaptureContext,
+    CaptureDataset,
+    CapturedResponse,
+    CaptureStatus,
+    Cohort,
+    CoverageEntry,
+    build_cohort,
+)
+from src.data.capture_store import CaptureStore
 from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
 from src.utils.display import Colors
 from src.daily import archive
@@ -168,6 +179,133 @@ REALTIME_MIN_QUOTE_COVERAGE: float = 0.99
 
 # fetch_single_stock의 failed_apis 태그: 벤더가 rt_cd=0으로 응답했지만 종목코드를 해석하지 못한 경우
 QUOTE_UNRESOLVED_API: str = "현재가_미해석"
+
+_DECISION_ELIGIBILITY_RULE_VERSION: str = "price_history_panel@v1"
+
+
+def _capture_root() -> Path:
+    root = settings.COLLECTION_ROOT
+    if root is not None:
+        return Path(root)
+    return Path(settings.HISTORY_DIR) / "capture"
+
+
+def _validate_capture_context(
+    capture_store: CaptureStore | None, cohort: Cohort | None, run_id: str | None
+) -> bool:
+    if capture_store is None and cohort is None and run_id is None:
+        return False
+    if capture_store is None or cohort is None or not run_id:
+        raise ValueError("capture context is incomplete or inconsistent")
+    return True
+
+
+def _capture_context_for(
+    trading_day: date, run_id: str, cohort_id: str | None, dataset: CaptureDataset, symbol: str | None, endpoint: str
+) -> CaptureContext:
+    return CaptureContext(
+        trading_date=trading_day,
+        run_id=run_id,
+        dataset=dataset,
+        vendor="kis",
+        endpoint=endpoint,
+        symbol=symbol,
+        venue="KRX",
+        session="regular",
+        capture_reason="decision-input",
+        cohort_id=cohort_id,
+        scheduled_at=None,
+    )
+
+
+def _append_with_unique_attempt(store: CaptureStore, response: CapturedResponse) -> None:
+    """Persist one observed response, shifting attempt_index on identity conflict.
+
+    The raw artifact path carries vendor/endpoint/page/attempt, so a repeated
+    call (e.g. requote) with the same identifiers but different bytes must keep
+    both evidences under distinct identities instead of dropping either one.
+    """
+    base_attempt = int(response.attempt_index)
+    for offset in range(6):
+        candidate = response if offset == 0 else response.model_copy(update={"attempt_index": base_attempt + offset})
+        try:
+            store.append_response(candidate)
+            return
+        except ValueError as exc:
+            if "conflicting immutable artifact identity" not in str(exc):
+                raise
+    raise OSError("required decision evidence cannot be published")
+
+
+def _persist_market_response(
+    store: CaptureStore,
+    context: CaptureContext,
+    payload: dict[str, Any] | None,
+    started: datetime,
+    received: datetime,
+) -> None:
+    status = CaptureStatus.COMPLETE if payload is not None and payload.get("rt_cd") == "0" else CaptureStatus.FAILED
+    body = dict(payload) if isinstance(payload, dict) else None
+    _append_with_unique_attempt(
+        store,
+        CapturedResponse(
+            context=context,
+            request_started_at=started,
+            received_at=received,
+            payload=body,
+            status=status,
+            source_timestamp=None,
+            source_published_at=None,
+            page_index=0,
+            attempt_index=0,
+            continuation={},
+            error_type=None if status == CaptureStatus.COMPLETE else "vendor_failure",
+        ),
+    )
+
+
+def _persist_observed_market_page(
+    store: CaptureStore,
+    context: CaptureContext,
+    payload: Any,
+    metadata: Mapping[str, Any],
+    started: datetime,
+    received: datetime,
+    page_index: int,
+    attempt_index: int,
+) -> None:
+    """Immediately persist one retry-level vendor response observed via callback."""
+    body = dict(payload) if isinstance(payload, dict) else None
+    status = CaptureStatus.COMPLETE if isinstance(payload, dict) and payload.get("rt_cd") == "0" else CaptureStatus.FAILED
+    meta = dict(metadata) if isinstance(metadata, Mapping) else {}
+    if status == CaptureStatus.COMPLETE:
+        error_type = None
+    else:
+        raw_err = meta.get("error_type")
+        error_type = str(raw_err) if isinstance(raw_err, str) and raw_err.strip() else "vendor_failure"
+    _append_with_unique_attempt(
+        store,
+        CapturedResponse(
+            context=context,
+            request_started_at=started,
+            received_at=received,
+            payload=body,
+            status=status,
+            source_timestamp=None,
+            source_published_at=None,
+            page_index=int(page_index),
+            attempt_index=int(attempt_index),
+            continuation={str(k): str(v) for k, v in meta.items()},
+            error_type=error_type,
+        ),
+    )
+
+
+_MARKET_LABEL_ROUTE: dict[str, tuple[CaptureDataset, str]] = {
+    "price": (CaptureDataset.PRICE, "inquire-price"),
+    "investor": (CaptureDataset.INVESTOR_ESTIMATE, "investor-trend-estimate"),
+    "orderbook": (CaptureDataset.ORDERBOOK, "inquire-asking-price"),
+}
 
 
 async def resolve_prev_trading_day_kis(client: Any, session: Any, decision_date: pd.Timestamp, *, krx_is_trading_day: Callable[[pd.Timestamp], bool] | None = None, max_lookback_days: int = MAX_PREV_TRADING_DAY_LOOKBACK) -> pd.Timestamp:
@@ -327,7 +465,7 @@ def check_realtime_collection_coverage(
     return {"n_raw": n_raw, "n_degraded": n_degraded, "coverage": round(coverage, 6)}
 
 
-async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None = None, toss_client: Any | None = None) -> list[dict]:
+async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None = None, toss_client: Any | None = None, on_page: Any | None = None) -> list[dict]:
     """자동 비용축 스캔 결과를 그대로 반환합니다.
 
     Args:
@@ -335,12 +473,16 @@ async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None
         session: HTTP session.
         kiwoom_client: Kiwoom scan client (1순위 후보 소스).
         toss_client: Toss scan client (Kiwoom·KIS 밴드 스캔 모두 실패 시 최종 폴백, 선택).
+        on_page: 원시 스캔 페이지 관찰자.
 
     Returns:
         자동 스캔 후보 리스트. 스캔이 비면 빈 리스트를 반환한다.
     """
-    primary = await fetch_candidate_stock_list(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client, kis_band_fallback=True) or []
-    union_rows = await fetch_trade_value_union(session, toss_client=toss_client)
+    scan_kwargs: dict[str, Any] = {}
+    if on_page is not None:
+        scan_kwargs["on_page"] = on_page
+    primary = await fetch_candidate_stock_list(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client, kis_band_fallback=True, **scan_kwargs) or []
+    union_rows = await fetch_trade_value_union(session, toss_client=toss_client, **scan_kwargs)
     seen_codes = {row["code"] for row in primary}
     merged = primary + [row for row in union_rows if row["code"] not in seen_codes]
     return merged
@@ -352,14 +494,38 @@ async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None
 
 
 async def fetch_single_stock(
-    i,
-    stock,
-    total,
-    sem,
-    client,
-    session,
-):
-    """단일 종목의 상세 데이터를 수집합니다."""
+    i: int,
+    stock: dict[str, Any],
+    total: int,
+    sem: asyncio.Semaphore,
+    client: Any,
+    session: Any,
+    *,
+    capture_store: CaptureStore | None = None,
+    cohort: Cohort | None = None,
+    run_id: str | None = None,
+) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
+    """Preserve independently timed quote, investor, and book evidence before parsing.
+
+    Args:
+        i: Existing progress index.
+        stock: Existing scan candidate row.
+        total: Declared candidate count.
+        sem: Existing bounded concurrency gate.
+        client: Explicit-route KIS data client.
+        session: Existing HTTP session.
+        capture_store: Owner-local raw evidence store.
+        cohort: Dated complete eligible and rejected research population.
+        run_id: Shared acquisition identity.
+
+    Returns:
+        Compatible wide row, failed API tags, and legacy orderbook rows.
+
+    Raises:
+        ValueError: Capture context is incomplete or inconsistent.
+        OSError: Required decision evidence cannot be published.
+    """
+    capture_on = _validate_capture_context(capture_store, cohort, run_id)
     async with sem:
         code = stock["code"]
         name = stock["name"]
@@ -367,38 +533,99 @@ async def fetch_single_stock(
         price = int(float(stock.get("price", 0)))
         rate = float(stock.get("chgrate", 0))
 
-        open_price = 0
-        high_price = 0
-        low_price = 0
-        close_price = price
-        prev_close_price = price
-        vol_acml = 0
+        open_price: Any = 0
+        high_price: Any = 0
+        low_price: Any = 0
+        close_price: Any = price
+        prev_close_price: Any = price
+        vol_acml: Any = 0
         market_name = ""
-        mkt_cap_eok = 0.0
-        trade_amt_eok = 0.0
+        mkt_cap_eok: Any = 0.0
+        trade_amt_eok: Any = 0.0
 
-        # 종목당 3회로 한정: 현재가(KRX) + 투자자추정 + 호가(KRX)
         from src.config.market_session import KRX_CLOSE_MARKET_DIV_CODE
 
         _krx_div = KRX_CLOSE_MARKET_DIV_CODE
+        marks: dict[str, tuple[datetime, datetime]] = {}
+        observed_pages: dict[str, list[tuple[Any, Mapping[str, Any], datetime, datetime, int, int]]] = {}
+
+        async def _timed(label: str, coro: Any) -> Any:
+            started = datetime.now(ZoneInfo("Asia/Seoul"))
+            scope = getattr(client, "observe_market_responses", None)
+            if callable(scope) and not asyncio.iscoroutinefunction(scope):
+                events: list[tuple[Any, Mapping[str, Any], datetime, datetime, int, int]] = []
+
+                def _collect(
+                    _payload: Any,
+                    _meta: Mapping[str, Any],
+                    _s: datetime,
+                    _r: datetime,
+                    _p: int,
+                    _a: int,
+                ) -> None:
+                    events.append((_payload, _meta, _s, _r, int(_p), int(_a)))
+
+                with scope(_collect):
+                    res = await coro
+                if events:
+                    observed_pages[label] = events
+                    marks[label] = (
+                        min(_s for _, _, _s, _, _, _ in events),
+                        max(_r for _, _, _, _r, _, _ in events),
+                    )
+                else:
+                    marks[label] = (started, datetime.now(ZoneInfo("Asia/Seoul")))
+                return res
+            res = await coro
+            marks[label] = (started, datetime.now(ZoneInfo("Asia/Seoul")))
+            return res
+
         (
             res_detail,
             res_investor,
             res_ob_krx,
         ) = await asyncio.gather(
-            client.get_current_price(session, code, market_div_code=_krx_div, allow_market_div_fallback=False),
-            client.get_investor_trend_estimate(session, code),
-            client.get_orderbook_snapshot(session, code, market_div_code=_krx_div),
+            _timed("price", client.get_current_price(session, code, market_div_code=_krx_div, allow_market_div_fallback=False)),
+            _timed("investor", client.get_investor_trend_estimate(session, code)),
+            _timed("orderbook", client.get_orderbook_snapshot(session, code, market_div_code=_krx_div)),
         )
+        row_receipt_max = max(r for _, r in marks.values()) if marks else datetime.now(ZoneInfo("Asia/Seoul"))
 
-        # 데이터 파싱
+        if capture_on:
+            assert capture_store is not None
+            assert cohort is not None
+            assert run_id is not None
+            trading_day = cohort.trading_date
+            cohort_id = cohort.cohort_id
+            finals: dict[str, Any] = {
+                "price": res_detail,
+                "investor": res_investor,
+                "orderbook": res_ob_krx,
+            }
+            for label, (dataset, endpoint) in _MARKET_LABEL_ROUTE.items():
+                context = _capture_context_for(trading_day, run_id, cohort_id, dataset, str(code), endpoint)
+                events = observed_pages.get(label)
+                if events:
+                    for _payload, _meta, _s, _r, _p, _a in events:
+                        _persist_observed_market_page(
+                            capture_store, context, _payload, _meta, _s, _r, _p, _a
+                        )
+                    continue
+                mark = marks.get(label, (row_receipt_max, row_receipt_max))
+                final = finals[label]
+                _persist_market_response(
+                    capture_store,
+                    context,
+                    final if isinstance(final, dict) else None,
+                    mark[0],
+                    mark[1],
+                )
+
         detail = res_detail.get("output") if res_detail.get("rt_cd") == "0" else None
-        # KIS는 인식 못한 종목코드(예: Q 접두어 없는 ETN)에 rt_cd=0과 전 필드 0을 돌려준다 -- 0을 시세로 쓰지 않는다
         quote_unresolved = bool(detail) and not str(detail.get("stck_shrn_iscd") or "").strip()
         if quote_unresolved:
             detail = None
 
-        # 실패한 API 체크 (유지 3종만 판정)
         failed_apis = []
         quote_failed = res_detail.get("rt_cd") != "0" or quote_unresolved
         if quote_failed:
@@ -420,10 +647,11 @@ async def fetch_single_stock(
 
         supply_failed = False
         frgn_qty, orgn_qty = 0, 0
-        if res_investor.get("rt_cd") != "0":
+        investor_rows = res_investor.get("output2") if res_investor.get("rt_cd") == "0" else None
+        if not investor_rows:
             supply_failed = True
-        elif res_investor.get("output2"):
-            latest = res_investor["output2"][0]
+        else:
+            latest = investor_rows[0]
             frgn_qty = int(safe_float(latest.get("frgn_fake_ntby_qty", 0)))
             orgn_qty = int(safe_float(latest.get("orgn_fake_ntby_qty", 0)))
 
@@ -472,7 +700,7 @@ async def fetch_single_stock(
             frgn_net_eok = round((frgn_qty * price) / 100_000_000, 2)
             orgn_net_eok = round((orgn_qty * price) / 100_000_000, 2)
 
-        return {
+        row: dict[str, Any] = {
             "종목명": name,
             "종목코드": code,
             "시장구분": market_name,
@@ -491,10 +719,13 @@ async def fetch_single_stock(
             QUOTE_FAILED_COL: quote_failed,
             DECISION_CLOSE_COL: close_price,
             CLOSE_CONFIRMED_COL: False,
-        }, failed_apis, orderbook_rows
+        }
+        if capture_on:
+            row["snapshot_timestamp"] = row_receipt_max
+        return row, failed_apis, orderbook_rows
 
 
-async def requote_failed_quotes(stock_list: list[dict], all_res: list[tuple[dict, list[str], list[dict]]], client: Any, session: Any, sem: asyncio.Semaphore, *, now_fn: Callable[[], datetime] | None = None) -> list[tuple[dict, list[str], list[dict]]]:
+async def requote_failed_quotes(stock_list: list[dict], all_res: list[tuple[dict, list[str], list[dict]]], client: Any, session: Any, sem: asyncio.Semaphore, *, now_fn: Callable[[], datetime] | None = None, capture_store: CaptureStore | None = None, cohort: Cohort | None = None, run_id: str | None = None) -> list[tuple[dict, list[str], list[dict]]]:
     """Re-fetch transient quote failures once within the decision-window budget.
 
     Args:
@@ -504,6 +735,9 @@ async def requote_failed_quotes(stock_list: list[dict], all_res: list[tuple[dict
         session: HTTP session.
         sem: Concurrency limiter.
         now_fn: Clock override (tests); None uses KST now.
+        capture_store: Owner-local raw evidence store.
+        cohort: Dated research population.
+        run_id: Shared acquisition identity.
 
     Returns:
         Results with recovered rows replaced in place order.
@@ -515,7 +749,7 @@ async def requote_failed_quotes(stock_list: list[dict], all_res: list[tuple[dict
     if now.strftime("%H%M%S") >= REALTIME_REQUOTE_DEADLINE_HHMMSS:
         logger.warning("[DATA] stage=realtime_requote status=SKIPPED reason=deadline n_failed=%d now=%s", len(retry_idx), now.strftime("%H%M%S"))
         return all_res
-    retried = await asyncio.gather(*[fetch_single_stock(i, stock_list[i], len(stock_list), sem, client, session) for i in retry_idx])
+    retried = await asyncio.gather(*[fetch_single_stock(i, stock_list[i], len(stock_list), sem, client, session, capture_store=capture_store, cohort=cohort, run_id=run_id) for i in retry_idx])
     out = list(all_res)
     n_recovered = 0
     for i, res in zip(retry_idx, retried):
@@ -532,6 +766,9 @@ async def fetch_all_stock_data(
     session,
     *,
     now_fn: Callable[[], datetime] | None = None,
+    capture_store: CaptureStore | None = None,
+    cohort: Cohort | None = None,
+    run_id: str | None = None,
 ):
     """모든 종목의 상세 데이터를 수집합니다."""
     import sys
@@ -549,6 +786,9 @@ async def fetch_all_stock_data(
             sem,
             client,
             session,
+            capture_store=capture_store,
+            cohort=cohort,
+            run_id=run_id,
         )
         completed_count += 1
         pct = (completed_count / total) * 100 if total > 0 else 100.0
@@ -567,7 +807,7 @@ async def fetch_all_stock_data(
     if total > 0 and sys.stdout.isatty():
         sys.stdout.write("\n")
         sys.stdout.flush()
-    all_res = await requote_failed_quotes(stock_list, list(all_res), client, session, sem, now_fn=now_fn)
+    all_res = await requote_failed_quotes(stock_list, list(all_res), client, session, sem, now_fn=now_fn, capture_store=capture_store, cohort=cohort, run_id=run_id)
     logger.info("[DATA] stage=realtime_quote_batch n_rows=%d n_quote_failed=%d", total, sum(1 for r, _f, _o in all_res if r.get(QUOTE_FAILED_COL)))
 
     results = [r for r, _f, _o in all_res]
@@ -591,16 +831,7 @@ async def fetch_all_stock_data(
 
 
 def _split_stock_list_evenly(stock_list: list[dict], n: int) -> list[list[dict]]:
-    """stock_list를 원래 순서를 보존한 채 n개의 연속 구간으로 최대한 균등 분할한다.
-
-    [STEP-BY-STEP RECIPE FOR IMPLEMENTER]:
-    Step 1. `base, rem = divmod(len(stock_list), n)`을 계산한다.
-    Step 2. `start = 0`에서 시작해 `i in range(n)`을 순회하며 각 청크 크기를
-       `base + (1 if i < rem else 0)`으로 정하고 `stock_list[start:start+size]`를 잘라
-       리스트에 담은 뒤 `start += size`로 진행한다(앞쪽 rem개 청크가 1개씩 더 받는다).
-    Step 3. 길이가 n인 리스트의 리스트를 반환한다(일부 청크가 빈 리스트 `[]`일 수 있다 —
-       `stock_list`가 `n`보다 짧을 때).
-    """
+    """원래 순서를 보존한 채 n개의 연속 구간으로 최대한 균등 분할한다."""
     base, rem = divmod(len(stock_list), n)
     chunks: list[list[dict]] = []
     start = 0
@@ -617,24 +848,18 @@ async def fetch_all_stock_data_sharded(
     session,
     *,
     now_fn: Callable[[], datetime] | None = None,
+    capture_store: CaptureStore | None = None,
+    cohort: Cohort | None = None,
+    run_id: str | None = None,
 ) -> tuple[list[dict], list[tuple[str, str, list[str]]]]:
-    """여러 KIS 키로 fetch_all_stock_data를 병렬 분할 실행하고 원래 순서로 병합한다.
-
-    [STEP-BY-STEP RECIPE FOR IMPLEMENTER]:
-    Step 1. `len(clients) <= 1`이면 `fetch_all_stock_data`로 그대로 위임하고 종료한다.
-    Step 2. `chunks = _split_stock_list_evenly(stock_list, len(clients))`로 분할한다.
-    Step 3. 빈 청크를 제외한다. `pairs`가 비어있으면 `return [], []`.
-    Step 4. 각 샤드를 병렬 수집한다.
-    Step 5. 순서대로 이어붙인다.
-    Step 6. `return results, failed_info`.
-    """
+    """여러 KIS 키로 분할 수집하고 원래 순서로 병합한다."""
     if len(clients) <= 1:
-        return await fetch_all_stock_data(stock_list, clients[0], session, now_fn=now_fn)
+        return await fetch_all_stock_data(stock_list, clients[0], session, now_fn=now_fn, capture_store=capture_store, cohort=cohort, run_id=run_id)
     chunks = _split_stock_list_evenly(stock_list, len(clients))
     pairs = [(chunk, client) for chunk, client in zip(chunks, clients) if chunk]
     if not pairs:
         return [], []
-    gathered = await asyncio.gather(*[fetch_all_stock_data(chunk, client, session, now_fn=now_fn) for chunk, client in pairs])
+    gathered = await asyncio.gather(*[fetch_all_stock_data(chunk, client, session, now_fn=now_fn, capture_store=capture_store, cohort=cohort, run_id=run_id) for chunk, client in pairs])
     results: list[dict] = []
     failed_info: list = []
     for r, f in gathered:
@@ -659,6 +884,8 @@ def persist_daily_snapshot(df: pd.DataFrame, snapshot_date: str) -> int:
 
 
 async def main(force: bool = False):
+    # auction_capture is a separate command; it loads this job's published cohort
+    # through CaptureStore rather than being awaited inside initial collect.
     from aiohttp.resolver import ThreadedResolver
 
     data_kwargs = kis_data_client_kwargs()
@@ -720,11 +947,72 @@ async def main(force: bool = False):
         kosdaq_rate = parse_market_index_rate(res_kosdaq)
 
         # 3. 후보 종목 리스트 확보 (자동 비용축 스캔 단일 경로, Toss 폴백 포함)
-        stock_list = await resolve_daily_candidates(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client)
+        raw_enabled = bool(settings.COLLECTION_RAW_ENABLED)
+        store = CaptureStore(_capture_root()) if raw_enabled else None
+        run_id = f"decision-{snapshot_date}-{uuid.uuid4().hex[:8]}" if raw_enabled else None
+        trading_day = date.fromisoformat(snapshot_date)
+        scan_observer = None
+        if store is not None and run_id is not None:
+            def scan_observer(
+                payload: Any,
+                metadata: Mapping[str, str],
+                started: datetime,
+                received: datetime,
+                page_index: int,
+                attempt: int,
+            ) -> None:
+                assert store is not None
+                assert run_id is not None
+                meta = dict(metadata) if isinstance(metadata, Mapping) else {}
+                vendor = str(meta.get("vendor") or "scan").strip() or "scan"
+                endpoint = str(meta.get("endpoint") or meta.get("scope") or "scan").strip() or "scan"
+                _append_with_unique_attempt(
+                    store,
+                    CapturedResponse(
+                        context=CaptureContext(
+                            trading_date=trading_day,
+                            run_id=run_id,
+                            dataset=CaptureDataset.SCAN,
+                            vendor=vendor,
+                            endpoint=endpoint,
+                            symbol=None,
+                            venue="UNKNOWN",
+                            session="regular",
+                            capture_reason="decision-input",
+                            cohort_id=None,
+                            scheduled_at=None,
+                        ),
+                        request_started_at=started,
+                        received_at=received,
+                        payload=dict(payload) if isinstance(payload, dict) else None,
+                        status=CaptureStatus.COMPLETE if isinstance(payload, dict) else CaptureStatus.FAILED,
+                        source_timestamp=None,
+                        source_published_at=None,
+                        page_index=int(page_index),
+                        attempt_index=int(attempt),
+                        continuation={str(k): str(v) for k, v in meta.items()},
+                        error_type=None if isinstance(payload, dict) else "vendor_failure",
+                    ),
+                )
+
+        stock_list = await resolve_daily_candidates(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client, on_page=scan_observer)
         if not stock_list:
             logger.info(f"{Colors.YELLOW}⚠ 자동 스캔 후보가 없습니다.{Colors.RESET}")
             return
-        stock_list = filter_eligible_candidates(stock_list, await resolve_eligible_codes(client, session, pd.Timestamp(snapshot_date)))
+        scanned_codes = [str(row["code"]) for row in stock_list]
+        eligible_codes = await resolve_eligible_codes(client, session, pd.Timestamp(snapshot_date))
+        cohort = None
+        if store is not None and run_id is not None:
+            eligible_in_scan = [c for c in scanned_codes if c in eligible_codes]
+            rejections = {c: "not_listed_in_panel" for c in scanned_codes if c not in eligible_codes}
+            cohort = build_cohort(
+                trading_day,
+                scanned_codes,
+                eligible_in_scan,
+                rejections,
+                eligibility_rule_version=_DECISION_ELIGIBILITY_RULE_VERSION,
+            )
+        stock_list = filter_eligible_candidates(stock_list, eligible_codes)
 
         logger.info(
             f"{Colors.BOLD}🚀 [1/3] 후보 종목 스캔 (Kiwoom / KIS){Colors.RESET}\n"
@@ -733,13 +1021,16 @@ async def main(force: bool = False):
 
         # 4. 상세 데이터 수집
         logger.info(f"\n{Colors.BOLD}⏳ [2/3] 실시간 단면 데이터 수집{Colors.RESET}")
-        results, failed_info = await fetch_all_stock_data_sharded(stock_list, decision_shard_clients, session)
+        results, failed_info = await fetch_all_stock_data_sharded(stock_list, decision_shard_clients, session, capture_store=store, cohort=cohort, run_id=run_id)
 
         # 5. wide 단면 구성 후 PIT admitted 플래그 부여 및 저장소 직접 기록
         logger.info(f"\n{Colors.BOLD}📊 [3/3] 유니버스 적격성(Admission) 평가 및 저장{Colors.RESET}")
         capture_ts = pd.Timestamp.now(tz="Asia/Seoul")
         df = pd.DataFrame(results)
-        df["snapshot_timestamp"] = capture_ts
+        if "snapshot_timestamp" in df.columns:
+            df["snapshot_timestamp"] = pd.to_datetime(df["snapshot_timestamp"]).fillna(capture_ts)
+        else:
+            df["snapshot_timestamp"] = capture_ts
         df = flag_cost_aware_admission(df, decision_date=pd.Timestamp(snapshot_date))
         index_failed = False
         if kospi_rate is None:
@@ -780,7 +1071,28 @@ async def main(force: bool = False):
         df["지수_실패"] = index_failed
 
         df[PRICE_ANOMALY_COL] = flag_price_anomaly(df).to_numpy()
-        coverage_report = check_realtime_collection_coverage(df)
+        enrichment_completed_at = datetime.now(ZoneInfo("Asia/Seoul"))
+        df["feature_available_timestamp"] = enrichment_completed_at
+        if store is not None and cohort is not None and run_id is not None:
+            entries = (
+                CoverageEntry(
+                    symbol=None,
+                    dataset=CaptureDataset.PRICE,
+                    venue="KRX",
+                    session="regular",
+                    scheduled_at=None,
+                    status=CaptureStatus.COMPLETE,
+                    rows=len(df),
+                    first_event_time=None,
+                    last_event_time=None,
+                    reason="decision-input",
+                    raw_refs=(),
+                ),
+            )
+            store.publish_decision(df, cohort=cohort, run_id=run_id, completed_at=enrichment_completed_at, entries=entries)
+            coverage_report = check_realtime_collection_coverage(df)
+        else:
+            coverage_report = check_realtime_collection_coverage(df)
         logger.info(
             "[DATA] stage=realtime_coverage n_raw=%d n_degraded=%d coverage=%.4f",
             coverage_report["n_raw"], coverage_report["n_degraded"], coverage_report["coverage"],

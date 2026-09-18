@@ -88,6 +88,8 @@ def build_exit_orders(
     open_positions: pd.DataFrame, decision_date: str, placed_at: pd.Timestamp
 ) -> list[PaperOrder]:
     """미청산 포지션을 D+1 KRX 시가단일가로 청산하는 시장가 매도 주문을 만든다."""
+    # Opening cohort includes symbols with outstanding paper positions via the
+    # existing PaperLedger/positions contract; no order is sent or amended.
     if open_positions is None or len(open_positions) == 0:
         return []
     orders: list[PaperOrder] = []

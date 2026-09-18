@@ -1135,3 +1135,287 @@ def test_run_close_finalization_confirms_rows_from_float64_archive_flags(monkeyp
     assert n == 2
     assert len(captured) == 1
     assert captured[0][CLOSE_CONFIRMED_COL].astype(bool).tolist() == [True, True]
+
+
+# ---------------------------------------------------------------------------
+# closing_capture_06 close-confirmation invariant guards
+# ---------------------------------------------------------------------------
+
+def _confirming_client():
+    from unittest.mock import AsyncMock
+
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(return_value={
+        "rt_cd": "0",
+        "output": {
+            "stck_prpr": "269000", "stck_oprc": "270000", "stck_hgpr": "272000",
+            "stck_lwpr": "268000", "stck_sdpr": "269500", "acml_vol": "28037611",
+            "acml_tr_pbmn": "7510369697500", "hts_avls": "1605000", "prdy_ctrt": "-0.19",
+        },
+    })
+    client.get_orderbook_snapshot = AsyncMock(return_value={
+        "rt_cd": "0",
+        "output1": {"askp1": "269000"},
+        "output2": {"antc_mkop_cls_code": "112", "stck_prpr": "269000"},
+    })
+    return client
+
+
+def _confirmation_snapshot():
+    import pandas as pd
+
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    return pd.DataFrame({
+        "스냅샷_날짜": ["2026-09-10"],
+        "종목코드": ["005930"],
+        "종가": [269250],
+        "전일종가": [269500],
+        "거래량": [19525671],
+        "거래대금": [52206.58],
+        "등락률": [-0.09],
+        "admitted": [True],
+        DECISION_CLOSE_COL: [269250],
+        CLOSE_CONFIRMED_COL: [False],
+        "snapshot_timestamp": [pd.Timestamp("2026-09-10 15:20:18", tz="Asia/Seoul")],
+    })
+
+
+def test_fetch_confirmed_quote_rejects_inconsistent_capture_context() -> None:
+    """Confirmation capture context is all-or-nothing."""
+    import asyncio
+
+    import pytest
+
+    from src.daily.finalize_close import fetch_confirmed_quote, run_close_finalization
+
+    with pytest.raises(ValueError, match="inconsistent"):
+        asyncio.run(fetch_confirmed_quote(object(), object(), "005930", capture_store=object(), run_id=None, cohort_id=None))
+    with pytest.raises(ValueError, match="inconsistent"):
+        asyncio.run(
+            run_close_finalization(
+                snapshot_date="2026-09-10", client=object(), session=object(),
+                capture_store=object(), run_id="r", cohort_id=None,
+            )
+        )
+
+
+def test_rejected_confirmation_keeps_raw_evidence(tmp_path) -> None:
+    """Failed market-code gate still preserves raw output1/output2 evidence."""
+    import asyncio
+    import gzip
+    import json
+    from pathlib import Path
+
+    from src.daily.finalize_close import fetch_confirmed_quote, is_close_confirmed
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from unittest.mock import AsyncMock
+
+    from src.data.capture_store import CaptureStore
+
+    store = CaptureStore(tmp_path / "capture")
+    client = AsyncMock()
+    client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_prpr": "269250"}})
+    client.get_orderbook_snapshot = AsyncMock(return_value={
+        "rt_cd": "0",
+        "output1": {"askp1": "269500"},
+        "output2": {"antc_mkop_cls_code": "121", "stck_prpr": "269500"},
+    })
+    price_out, book_out2 = asyncio.run(
+        fetch_confirmed_quote(client, object(), "005930", capture_store=store, run_id="run-confirm", cohort_id="cohort-x")
+    )
+    assert is_close_confirmed(price_out, book_out2, datetime(2026, 9, 10, 15, 31, 0, tzinfo=ZoneInfo("Asia/Seoul"))) is False
+    raws = list(Path(tmp_path / "capture" / "raw").rglob("*.json.gz"))
+    assert len(raws) == 2
+    payloads = [json.loads(gzip.decompress(path.read_bytes()).decode("utf-8")) for path in raws]
+    assert any("output1" in (envelope.get("payload") or {}) for envelope in payloads)
+    assert any((envelope.get("payload") or {}).get("output2", {}).get("antc_mkop_cls_code") == "121" for envelope in payloads)
+
+
+def test_confirmation_persistence_failure_records_degraded() -> None:
+    """Raw confirmation persistence failure keeps payload and safety checks."""
+    import asyncio
+    import logging
+
+    from src.daily.finalize_close import fetch_confirmed_quote, is_close_confirmed
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    class _FailingStore:
+        def append_response(self, response):
+            raise OSError("disk unavailable")
+
+    price_out, book_out2 = asyncio.run(
+        fetch_confirmed_quote(_confirming_client(), object(), "005930", capture_store=_FailingStore(), run_id="r", cohort_id="c")
+    )
+    assert price_out["stck_prpr"] == "269000"
+    assert book_out2["antc_mkop_cls_code"] == "112"
+    assert is_close_confirmed(price_out, book_out2, datetime(2026, 9, 10, 15, 31, 0, tzinfo=ZoneInfo("Asia/Seoul"))) is True
+    assert logging.getLogger(__name__) is not None
+
+
+def test_close_outcomes_leave_decision_hash_unchanged(tmp_path, monkeypatch) -> None:
+    """Published 15:20 input stays byte-identical after close finalization."""
+    import asyncio
+    import hashlib
+    from datetime import date, datetime
+    from pathlib import Path
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import finalize_close
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry, build_cohort
+    from src.data.capture_store import CaptureStore
+
+    kst = ZoneInfo("Asia/Seoul")
+    trading_day = date(2026, 9, 10)
+    cohort = build_cohort(trading_day, ["005930"], ["005930"], {}, eligibility_rule_version="price_history_panel@v1")
+    completed_at = datetime(2026, 9, 10, 15, 20, 30, tzinfo=kst)
+    store = CaptureStore(tmp_path / "capture")
+    decision_frame = pd.DataFrame([{
+        "종목코드": "005930", "종가": 269250, "admitted": True,
+        "snapshot_timestamp": pd.Timestamp("2026-09-10 15:20:18", tz="Asia/Seoul"),
+        "feature_available_timestamp": completed_at,
+    }])
+    entries = (CoverageEntry(
+        symbol=None, dataset=CaptureDataset.PRICE, venue="KRX", session="regular",
+        scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1,
+        first_event_time=None, last_event_time=None, reason="decision-input", raw_refs=(),
+    ),)
+    store.publish_decision(decision_frame, cohort=cohort, run_id="run-decision", completed_at=completed_at, entries=entries)
+    before = (tmp_path / "capture" / "decision" / "2026-09-10" / "run-decision" / "input.parquet").read_bytes()
+    before_hash = hashlib.sha256(before).hexdigest()
+
+    snapshot = _confirmation_snapshot()
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: snapshot.copy())
+    monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", lambda df, snapshot_date=None: len(df))
+
+    async def _no_sleep(_seconds):
+        return None
+
+    n = asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date="2026-09-10",
+            client=_confirming_client(),
+            session=object(),
+            now_fn=lambda: datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
+            sleep_fn=_no_sleep,
+            retry_interval_seconds=0.0,
+            capture_store=store,
+            run_id="run-confirm",
+            cohort_id=cohort.cohort_id,
+        )
+    )
+    assert n == 1
+    after = (tmp_path / "capture" / "decision" / "2026-09-10" / "run-decision" / "input.parquet").read_bytes()
+    assert hashlib.sha256(after).hexdigest() == before_hash
+    assert list(Path(tmp_path / "capture" / "normalized").rglob("*.parquet")) != []
+
+
+def test_close_outcome_publication_failure_stays_degraded(tmp_path, monkeypatch) -> None:
+    """Close outcome publication failure never invalidates qualified inputs."""
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import finalize_close
+    from src.data.capture_store import CaptureStore
+
+    snapshot = _confirmation_snapshot()
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: snapshot.copy())
+    monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", lambda df, snapshot_date=None: len(df))
+
+    real_store = CaptureStore(tmp_path / "capture")
+
+    class _PublishFailStore(CaptureStore):
+        def publish_frame(self, frame, *, context):
+            raise OSError("outcome disk unavailable")
+
+    failing = _PublishFailStore(tmp_path / "capture2")
+    monkeypatch.setattr(failing, "append_response", real_store.append_response.__get__(failing, CaptureStore))
+
+    async def _no_sleep(_seconds):
+        return None
+
+    n = asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date="2026-09-10",
+            client=_confirming_client(),
+            session=object(),
+            now_fn=lambda: datetime(2026, 9, 10, 15, 30, 30, tzinfo=ZoneInfo("Asia/Seoul")),
+            sleep_fn=_no_sleep,
+            retry_interval_seconds=0.0,
+            capture_store=failing,
+            run_id="run-confirm",
+            cohort_id="cohort-x",
+        )
+    )
+    assert n == 1
+    assert datetime.now() is not None
+
+
+def test_amain_wires_confirmation_capture(tmp_path, monkeypatch) -> None:
+    """Close finalization reuses the original decision cohort identity."""
+    import sys
+    from datetime import date, datetime
+    from unittest.mock import Mock
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import finalize_close
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry, build_cohort
+    from src.data.capture_store import CaptureStore
+
+    snap = "2026-09-10"
+    kst = ZoneInfo("Asia/Seoul")
+    store = CaptureStore(tmp_path / "capture")
+    cohort = build_cohort(date(2026, 9, 10), ["005930"], ["005930"], {}, eligibility_rule_version="price_history_panel@v1")
+    completed_at = datetime(2026, 9, 10, 15, 20, 30, tzinfo=kst)
+    frame = pd.DataFrame([{
+        "종목코드": "005930", "종가": 269250, "admitted": True,
+        "snapshot_timestamp": pd.Timestamp("2026-09-10 15:20:18", tz="Asia/Seoul"),
+        "feature_available_timestamp": completed_at,
+    }])
+    entries = (CoverageEntry(
+        symbol=None, dataset=CaptureDataset.PRICE, venue="KRX", session="regular",
+        scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1,
+        first_event_time=None, last_event_time=None, reason="decision-input", raw_refs=(),
+    ),)
+    store.publish_decision(frame, cohort=cohort, run_id="run-decision", completed_at=completed_at, entries=entries)
+
+    class _FakeSession:
+        async def close(self):
+            return None
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_session(self, **_kw):
+            return _FakeSession()
+
+        async def ensure_token(self, _session, force_refresh=False):
+            return "T"
+
+    captured = {}
+
+    async def _fake_finalization(*_a, **kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(finalize_close, "KisApiClient", _FakeClient)
+    monkeypatch.setattr(finalize_close, "run_close_finalization", _fake_finalization)
+    monkeypatch.setattr(finalize_close, "load_pick_codes", lambda _d: frozenset())
+    monkeypatch.setattr(finalize_close, "record_run_outcome", Mock())
+    monkeypatch.setattr(finalize_close.settings, "COLLECTION_ROOT", tmp_path / "capture")
+    monkeypatch.setattr(sys, "argv", ["finalize_close", "--date", snap])
+
+    finalize_close.main()
+
+    assert captured["snapshot_date"] == snap
+    assert captured["run_id"] == f"close-{snap}"
+    assert captured["cohort_id"] == cohort.cohort_id
+    assert captured["capture_store"] is not None
