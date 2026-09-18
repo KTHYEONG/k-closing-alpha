@@ -343,6 +343,10 @@ def _bounded_symbol_replace(
     *,
     sort_output: bool,
 ) -> int:
+    # 지연 임포트: parquet_codec -> panel_integrity -> cost_model -> intraday_store로
+    # 되돌아오는 순환 임포트를 모듈 로드 시점에 막기 위해 호출 시점에만 가져온다.
+    from src.data.parquet_codec import INTRADAY_COMPRESSION, PARQUET_COMPRESSION_LEVEL
+
     lock = _acquire_partition_lock(target)
     try:
         before_count = _partition_row_count(target)
@@ -368,7 +372,9 @@ def _bounded_symbol_replace(
                     if writer is None:
                         schema = table.schema
                         staging.parent.mkdir(parents=True, exist_ok=True)
-                        writer = pq.ParquetWriter(staging, schema)
+                        writer = pq.ParquetWriter(
+                            staging, schema, compression=INTRADAY_COMPRESSION, compression_level=PARQUET_COMPRESSION_LEVEL
+                        )
                     kept_rows += len(keep)
                     writer.write_table(table.cast(schema))
             if len(incoming) > 0:
@@ -380,7 +386,9 @@ def _bounded_symbol_replace(
                     schema = table.schema
                 if writer is None:
                     staging.parent.mkdir(parents=True, exist_ok=True)
-                    writer = pq.ParquetWriter(staging, schema)
+                    writer = pq.ParquetWriter(
+                        staging, schema, compression=INTRADAY_COMPRESSION, compression_level=PARQUET_COMPRESSION_LEVEL
+                    )
                 writer.write_table(table.cast(schema))
             if writer is None:
                 if replaced and target.exists() and before_symbols and before_symbols <= replaced:
