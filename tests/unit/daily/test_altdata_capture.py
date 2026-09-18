@@ -115,6 +115,53 @@ def test_krx_listed_universe_returns_deduped_frozenset(tmp_path, monkeypatch) ->
     assert universe == frozenset({"005930", "000660"})
 
 
+def test_krx_listed_universe_walks_back_past_publication_lag(tmp_path, monkeypatch) -> None:
+    """실측 회귀: KRX 일별 API가 당일 데이터를 아직 발행하지 않아(2026-09-18 저녁
+    시각에도 0행) window_end 그대로 조회하면 항상 빈 유니버스가 됐다. 발행된
+    가장 최근 날짜까지 거슬러 올라가 조회한다."""
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+
+    seen_dates: list[pd.Timestamp] = []
+
+    def _fake_fetch(window_end, cfg):
+        seen_dates.append(window_end)
+        if window_end == pd.Timestamp("2026-09-18"):
+            return pd.DataFrame(columns=["symbol"])
+        return pd.DataFrame({"symbol": ["005930"]})
+
+    monkeypatch.setattr(altdata_capture, "fetch_krx_daily", _fake_fetch)
+    cfg = AltDataFetchConfig(start=pd.Timestamp("2026-09-17"), end=pd.Timestamp("2026-09-18"), out_dir=tmp_path)
+
+    universe = altdata_capture._krx_listed_universe(pd.Timestamp("2026-09-18"), cfg)
+
+    assert universe == frozenset({"005930"})
+    assert seen_dates == [pd.Timestamp("2026-09-18"), pd.Timestamp("2026-09-17")]
+
+
+def test_krx_listed_universe_gives_up_after_lookback_exhausted(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+
+    calls: list[pd.Timestamp] = []
+
+    def _always_empty(window_end, cfg):
+        calls.append(window_end)
+        return pd.DataFrame(columns=["symbol"])
+
+    monkeypatch.setattr(altdata_capture, "fetch_krx_daily", _always_empty)
+    cfg = AltDataFetchConfig(start=pd.Timestamp("2026-09-17"), end=pd.Timestamp("2026-09-18"), out_dir=tmp_path)
+
+    universe = altdata_capture._krx_listed_universe(pd.Timestamp("2026-09-18"), cfg)
+
+    assert universe is None
+    assert len(calls) == altdata_capture._UNIVERSE_LOOKBACK_DAYS
+
+
 def test_run_altdata_capture_fills_declared_universe_from_krx_when_absent(tmp_path, monkeypatch) -> None:
     """실측 회귀: universe_symbols 미설정 시 shorting/credit_balance/program_trade_daily
     3개 종목별 패널이 늘 스킵돼 manifest가 영구히 COMPLETE 못 되던 문제(2026-09-19 실측)."""
