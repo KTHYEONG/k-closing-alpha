@@ -27,6 +27,9 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
         "kca-paper-exit.service",
         "kca-predict.service",
         "kca-price-ingest.service",
+        "kca-altdata-capture.service",
+        "kca-auction-close.service",
+        "kca-auction-open.service",
     }
 
     for svc in sorted(root.glob("kca-*.service")):
@@ -45,7 +48,15 @@ def test_install_script_enables_every_existing_timer() -> None:
     timers = sorted(p.name for p in (base / "systemd").glob("kca-*.timer"))
     install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
 
-    missing = [t for t in timers if t not in install_text]
+    # 연구용(무주문) 수집기는 RSS/소요시간 실측과 감사 없이 상시 가동시키지 않는다는
+    # 설계 결정에 따라 install_systemd.sh가 의도적으로 자동 활성화하지 않는다.
+    optional_manual_activation = {
+        "kca-altdata-capture.timer",
+        "kca-auction-close.timer",
+        "kca-auction-open.timer",
+    }
+
+    missing = [t for t in timers if t not in install_text and t not in optional_manual_activation]
 
     assert missing == [], f"install_systemd.sh 가 활성화하지 않는 타이머: {missing}"
 
