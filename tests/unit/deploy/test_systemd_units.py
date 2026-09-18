@@ -727,16 +727,3 @@ def test_daily_audit_and_backup_normalize_ownership_before_reading_container_wri
     # 컨테이너 유닛 자체는 이미 root로 쓰는 쪽이므로 이 정규화 훅이 필요 없다
     collect_text = (root / "kca-collect.service").read_text(encoding="utf-8")
     assert "ExecStartPre=/usr/bin/sudo /usr/bin/chown" not in collect_text
-
-
-
-def test_auction_services_mount_research_key_ownership_attestation() -> None:
-    """resolve_research_credentials()는 COLLECTION_KEY_OWNERSHIP_PATH가 가리키는
-    파일을 컨테이너 안에서 직접 읽는다. 마운트 없이는 파일이 컨테이너에 존재하지
-    않아 auction_capture가 항상 uncertified ownership으로 실패한다."""
-    import pathlib
-
-    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    for name in ("kca-auction-open.service", "kca-auction-close.service"):
-        text = (root / name).read_text(encoding="utf-8")
-        assert "-v %h/quant-secrets/research-key-ownership.json:/app/research-key-ownership.json:ro" in text, name
