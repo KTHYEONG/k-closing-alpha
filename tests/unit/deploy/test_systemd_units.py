@@ -215,6 +215,22 @@ def test_backup_service_copies_data_and_artifacts_to_gdrive_without_deleting() -
     assert "gdrive:quant-lake/live/k-closing-alpha/artifacts" in text
 
 
+def test_backup_uses_higher_transfer_concurrency_for_many_small_files() -> None:
+    """실측 회귀: capture 아티팩트별 개별 파일화로 하루 수천개의 소용량 원본이
+    쌓이면서(2026-09-18 실측 2,477개) 기본 --transfers=4로는 gdrive 백업이
+    32분까지 늘어졌다. 파일당 지연시간이 병목이므로(대역폭 아님) 동시성을
+    높여 완료 시간을 단축한다."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-backup.service").read_text(encoding="utf-8")
+    exec_lines = [line for line in text.splitlines() if line.startswith("ExecStart=")]
+
+    assert all("--transfers 32" in line for line in exec_lines)
+    assert all("--checkers 32" in line for line in exec_lines)
+    assert all("--fast-list" in line for line in exec_lines)
+
+
 def test_backup_prune_service_runs_dated_directory_pruner() -> None:
     import pathlib
 
