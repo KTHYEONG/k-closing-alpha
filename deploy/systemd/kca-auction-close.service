@@ -9,4 +9,4 @@ EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 EnvironmentFile=%h/quant-secrets/kis-data.env
 Environment=TZ=Asia/Seoul
 Environment=KIS_DATA_ROLE=batch
-ExecStart=/usr/bin/docker run --rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=batch ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.auction_capture --phase close
+ExecStart=/usr/bin/docker run --rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -v %h/quant-secrets/research-key-ownership.json:/app/research-key-ownership.json:ro -e KIS_DATA_ROLE=batch ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.auction_capture --phase close
