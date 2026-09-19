@@ -20,12 +20,16 @@ import pandas as pd
 import requests
 
 from src.backfill.altdata.config import AltDataFetchConfig
-from src.backfill.altdata.ratelimit import retry_call, wait_for_dart_slot
+from src.backfill.altdata.ratelimit import DartNonRetryableError, retry_call, wait_for_dart_slot
 from src.data.capture_contracts import PageObserver, RawCaptureError, SEOUL
 
 logger = logging.getLogger(__name__)
 
 _LIST_URL = "https://opendart.fss.or.kr/api/list.json"
+
+# DART 계정 한도초과(020) — k-stock-engine 과 DART_API_KEY 를 공유하므로 발생 가능.
+# 재시도로 회복되지 않는 계정 레벨 오류라 즉시 실패 처리한다.
+_DART_NONRETRYABLE_STATUS: frozenset[str] = frozenset({"020"})
 
 # 수집 대상 공시유형: B(주요사항보고서), I(거래소공시). 아래 카테고리를 모두 포함.
 _PBLNTF_TYPES: tuple[str, ...] = ("B", "I")
@@ -87,7 +91,10 @@ def _dart_get_json(url: str, params: dict[str, object], cfg: AltDataFetchConfig,
         status = str(data.get("status", "")).strip()
         # 000 정상, 013 무자료 — 그 외는 오류.
         if status not in ("000", "013"):
-            raise RuntimeError(f"DART error status={status} msg={data.get('message', '')}")
+            msg = f"DART error status={status} msg={data.get('message', '')}"
+            if status in _DART_NONRETRYABLE_STATUS:
+                raise DartNonRetryableError(msg)
+            raise RuntimeError(msg)
     return data  # type: ignore[return-value]
 
 
