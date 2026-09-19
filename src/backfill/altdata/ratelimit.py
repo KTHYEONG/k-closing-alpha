@@ -25,6 +25,14 @@ _KRX_LOCK = threading.Lock()
 _KRX_NEXT = 0.0
 
 
+class DartNonRetryableError(RuntimeError):
+    """DART account-level error unresolvable by retrying (e.g. daily quota exhausted).
+
+    다른 프로젝트(k-stock-engine)와 DART_API_KEY 를 공유하므로 하루 중 언제든
+    계정 한도가 소진될 수 있다. 재시도해도 당일 내 회복되지 않으므로 즉시 실패시킨다.
+    """
+
+
 def wait_for_pykrx_slot(cfg: AltDataFetchConfig) -> None:
     """pykrx 호출 간격을 제한합니다.
 
@@ -90,6 +98,9 @@ def retry_call(fn: Callable[[], _T], cfg: AltDataFetchConfig, *, label: str) -> 
         try:
             return fn()
         except RawCaptureError:
+            raise
+        except DartNonRetryableError as exc:
+            logger.warning("[DATA] stage=altdata_retry label=%s status=FAIL_FATAL error=%s", label, exc)
             raise
         except Exception as exc:
             last_exc = exc

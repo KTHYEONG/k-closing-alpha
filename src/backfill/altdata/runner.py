@@ -15,6 +15,7 @@ import pandas as pd
 from src.backfill.altdata import credit_balance, derivatives, program_trade_daily, shorting
 from src.backfill.altdata.config import _ALTDATA_PANELS, AltDataFetchConfig
 from src.backfill.altdata.normalize import normalize_panel
+from src.backfill.altdata.ratelimit import DartNonRetryableError
 from src.data.capture_contracts import (
     BrokerPayload,
     CaptureContext,
@@ -409,6 +410,19 @@ def run_altdata_backfill(cfg: AltDataFetchConfig, *, capture_store: CaptureStore
                     "updated_at": datetime.now(UTC).isoformat(),
                     "error": repr(ve),
                 }
+        except DartNonRetryableError as exc:
+            # DART_API_KEY 를 k-stock-engine 과 공유하므로 계정 한도가 이미 소진된 상태일 수
+            # 있다. "empty collector result" 로 뭉뚱그리지 않고 원인을 그대로 남긴다.
+            entries[source] = {
+                "status": "quota_exceeded",
+                "source": source,
+                "availability_rule": availability_rule,
+                "rows": 0,
+                "first_date": None,
+                "last_date": None,
+                "updated_at": datetime.now(UTC).isoformat(),
+                "error": repr(exc),
+            }
         except Exception as exc:
             entries[source] = {
                 "status": "unavailable",
