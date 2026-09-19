@@ -5,14 +5,16 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import os
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 
 from src import settings
+from src.api.kis.key_pool import resolve_research_credentials
 from src.backfill.altdata.config import AltDataFetchConfig
 from src.backfill.altdata.runner import run_altdata_backfill
 from src.config.collection import CollectionSettings
@@ -33,6 +35,22 @@ def _rolling_bounds(trading_day: date, lookback_days: int) -> tuple[pd.Timestamp
     end = pd.Timestamp(trading_day).normalize()
     start = end - pd.Timedelta(days=int(lookback_days) - 1)
     return start, end
+
+
+def _extra_altdata_client_kwargs(profile: CollectionSettings, env: Mapping[str, str]) -> tuple[tuple[str, str, str], ...]:
+    """추가 alt-data 슬롯의 자격증명을 수집 설정 형식으로 변환한다.
+
+    Args:
+        profile: 추가 슬롯 선언을 담은 수집 설정.
+        env: 자격증명 소스.
+
+    Returns:
+        수집 설정에 대입 가능한 자격증명 튜플.
+    """
+    if len(profile.COLLECTION_ALTDATA_EXTRA_SLOTS) == 0:
+        return ()
+    creds = resolve_research_credentials(env, slots=tuple(profile.COLLECTION_ALTDATA_EXTRA_SLOTS))
+    return tuple((cred.app_key, cred.app_secret, cred.hts_id) for cred in creds)
 
 
 _UNIVERSE_LOOKBACK_DAYS: int = 7
@@ -86,6 +104,10 @@ def run_altdata_capture(trading_date: date, *, profile: CollectionSettings, stor
         universe = _krx_listed_universe(window_end, cfg)
         if universe is not None:
             cfg = dataclasses.replace(cfg, universe_symbols=universe)
+    if not cfg.extra_client_kwargs:
+        extra = _extra_altdata_client_kwargs(profile, dict(os.environ))
+        if extra:
+            cfg = dataclasses.replace(cfg, extra_client_kwargs=extra)
     run_id = f"altdata-{window_end.strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
     started = datetime.now(SEOUL)
     report = run_altdata_backfill(cfg, capture_store=store, run_id=run_id, reobserve=True)

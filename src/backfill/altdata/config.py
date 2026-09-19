@@ -59,6 +59,7 @@ class AltDataFetchConfig:
         retry_sleep_sec: 재시도 대기 시간.
         dart_api_key: DART 인증 키.
         page_count: 페이지 당 레코드 수.
+        extra_client_kwargs: 병렬 호출용 추가 KIS 데이터 키.
     """
 
     start: pd.Timestamp
@@ -75,6 +76,7 @@ class AltDataFetchConfig:
     dart_api_key: str = ""
     krx_api_key: str = ""
     page_count: int = 100
+    extra_client_kwargs: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         # Coerce start/end via pd.Timestamp
@@ -116,6 +118,12 @@ class AltDataFetchConfig:
             raise ValueError("retry_sleep_sec must be >= 0")
         if not (1 <= int(self.page_count) <= 100):
             raise ValueError("page_count must be in [1, 100]")
+        for item in self.extra_client_kwargs:
+            if not isinstance(item, tuple) or len(item) != 3:
+                raise ValueError(f"extra_client_kwargs entry {item!r} must be a (app_key, app_secret, hts_id) tuple with non-empty app_key/app_secret")
+            app_key, app_secret, _hts_id = item
+            if not isinstance(app_key, str) or not app_key or not isinstance(app_secret, str) or not app_secret:
+                raise ValueError(f"extra_client_kwargs entry {item!r} must be a (app_key, app_secret, hts_id) tuple with non-empty app_key/app_secret")
         # Validate universe_symbols
         if self.universe_symbols is not None:
             if not isinstance(self.universe_symbols, frozenset):

@@ -155,6 +155,21 @@ def test_legacy_mode_blocks_independent_publication() -> None:
     assert legacy.COLLECTION_RAW_ENABLED is False
 
 
+def test_altdata_extra_slots_default_empty() -> None:
+    profile = CollectionSettings(_env_file=None)
+    assert profile.COLLECTION_ALTDATA_EXTRA_SLOTS == ()
+
+
+def test_altdata_extra_slots_reject_non_decimal() -> None:
+    with pytest.raises(ValueError, match="decimal pool identifiers"):
+        CollectionSettings(COLLECTION_ALTDATA_EXTRA_SLOTS=("abc",), _env_file=None)
+
+
+def test_altdata_extra_slots_reject_duplicates() -> None:
+    with pytest.raises(ValueError, match="unique"):
+        CollectionSettings(COLLECTION_ALTDATA_EXTRA_SLOTS=("2", "2"), _env_file=None)
+
+
 def test_session_override_keys_must_match_trading_date() -> None:
     clock = _clock(date(2026, 9, 17))
     with pytest.raises(ValueError, match="ISO dates"):
