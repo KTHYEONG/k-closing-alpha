@@ -227,6 +227,28 @@ def test_run_altdata_backfill_partial_sources_never_certify_complete(monkeypatch
     assert list((tmp_path / "capture").rglob("SHORTING-nosymbol.parquet")) != []
 
 
+def test_run_altdata_backfill_dart_quota_exceeded_labeled_distinctly(monkeypatch, tmp_path) -> None:
+    """DART 계정 한도초과(k-stock-engine 과 키 공유)는 'empty collector result' 로 뭉개지지 않고
+    별도 상태(quota_exceeded)와 원인 메시지를 보존해야 진단이 가능하다."""
+    import pandas as pd
+
+    from src.backfill.altdata import disclosure as disc_mod
+    from src.backfill.altdata import runner
+    from src.backfill.altdata.ratelimit import DartNonRetryableError
+
+    cfg = _altdata_cfg(tmp_path, sources=("disclosure",), dart_api_key="k")
+    monkeypatch.setattr(disc_mod, "download_corp_code_map", lambda cfg_: pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}))
+
+    def _quota_boom(cfg_, corp_map, **kw):
+        raise DartNonRetryableError("DART error status=020 msg=사용한도를 초과하였습니다.")
+
+    monkeypatch.setattr(disc_mod, "collect_disclosures", _quota_boom)
+    report = runner.run_altdata_backfill(cfg)
+    panel = report["panels"]["disclosure"]
+    assert panel["status"] == "quota_exceeded"
+    assert "020" in panel["error"] and "사용한도" in panel["error"]
+
+
 def test_run_altdata_backfill_rejects_inconsistent_capture_context(tmp_path) -> None:
     """Capture configuration is inconsistent."""
     import pytest
