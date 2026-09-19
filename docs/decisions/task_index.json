@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "altdata_multikey_fanout",
+      "date": "2026-09-19",
+      "adr_id": "ADR_20260919_altdata_multikey_fanout",
+      "domain": "data",
+      "title": "altdata 종목별 패널 다중 KIS 키 분산 수집",
+      "why": "shorting/credit_balance/program_trade_daily가 단일 앱키(18 TPS 상한)로 종목별 순차 호출해 매일 반복되는 수집 소요시간이 길었다",
+      "resolution": "resolve_research_credentials로 얻은 추가 KIS 슬롯을 fan_out_symbol_calls로 라운드로빈 분산하고, 미선언 시 기존 단일키 동작으로 완전 폴백",
+      "impact": "실측 3키 분산 시 15.7->26.7 TPS(1.7배) 개선, COLLECTION_ALTDATA_EXTRA_SLOTS 미설정 배포는 회귀 없음",
+      "caveat": "계정 단위 공유 상한으로 추정되는 한계 때문에 키를 늘려도 선형으로 확장되지 않음(실측 확인)"
+    },
+    {
       "task_id": "TASK_20260918_KCA_RAW_CAPTURE_COMPLETENESS",
       "date": "2026-09-18",
       "adr_id": "ADR_20260918_20260918_KCA_RAW_CAPTURE_COMPLETENESS",
@@ -991,16 +1002,6 @@
       "why": "price_history/altdata/intraday 전량 snappy+float64로 과다 저장, altdata 커버리지 조회가 전체 패널을 불필요하게 전량 읽음",
       "resolution": "parquet_codec.py로 zstd+다운캐스트 정책 일원화, 3종 마이그레이션 스크립트 작성(백업/검증/dry-run), _covered_dates 컬럼 프루닝",
       "impact": "price_history 233→154MB, altdata 28~40% 절감, 틱/분봉 최대 4.8배 압축, 커버리지 조회 I/O 약 3800배 절감"
-    },
-    {
-      "task_id": "TASK_INTRADAY_CAPTURE_INTEGRITY",
-      "date": "2026-09-05",
-      "adr_id": "ADR_20260905_INTRADAY_CAPTURE_INTEGRITY",
-      "domain": "data_collection",
-      "title": "Intraday 캡처 계층 KIS/LS 벤더 정합성 및 손실 방지",
-      "why": "KIS/LS acml_tr_pbmn 단위·의미 충돌, LS 틱 캡 무통보 절단, 파티션 덮어쓰기로 인한 조용한 원본 데이터 손실/오염",
-      "resolution": "intraday_schema.py 정규 스키마 도입, 병합-안전 쓰기로 전환, 틱 truncated 플래그 노출, 호가 원본(orderbook_store) 및 동시호가 폴러(collect_auction) 신설, T-1 워치리스트 확장",
-      "impact": "벤더 간 단위 충돌 제거, 무통보 데이터 손실 종료, 동시호가·호가심도 등 기존에 버려지던 원본 데이터 보존"
     }
   ]
 }
