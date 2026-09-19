@@ -271,3 +271,123 @@ def test_run_altdata_capture_preserves_explicit_universe(tmp_path, monkeypatch) 
     altdata_capture.run_altdata_capture(pd.Timestamp("2026-09-18").date(), profile=profile, store=_Store(), cfg=cfg)
 
     assert captured["cfg"].universe_symbols == declared
+
+
+def _capture_harness(monkeypatch, captured):
+    from src.daily import altdata_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    def _fake_backfill(cfg, *, capture_store, run_id, reobserve):
+        captured["cfg"] = cfg
+        captured["run_id"] = run_id
+        return {"capture": "ok"}
+
+    class _Context:
+        def __init__(self, run_id: str) -> None:
+            self.run_id = run_id
+
+    class _Manifest:
+        def __init__(self, run_id: str) -> None:
+            self.status = CaptureStatus.COMPLETE
+            self.context = _Context(run_id)
+
+    class _Store:
+        def read_manifests(self, date_str: str) -> list[Any]:
+            return [_Manifest(captured["run_id"])]
+
+    monkeypatch.setattr(altdata_capture, "run_altdata_backfill", _fake_backfill)
+    return _Store()
+
+
+def test_run_altdata_capture_keeps_single_key_without_extra_slots(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+
+    captured: dict[str, Any] = {}
+    store = _capture_harness(monkeypatch, captured)
+    profile = _profile(tmp_path, COLLECTION_ALTDATA_LOOKBACK_DAYS=2)
+    assert profile.COLLECTION_ALTDATA_EXTRA_SLOTS == ()
+    window_start, window_end = altdata_capture._rolling_bounds(pd.Timestamp("2026-09-18").date(), 2)
+    cfg = AltDataFetchConfig(
+        start=window_start, end=window_end, out_dir=tmp_path, krx_api_key="k",
+        universe_symbols=frozenset({"005930"}),
+    )
+    altdata_capture.run_altdata_capture(pd.Timestamp("2026-09-18").date(), profile=profile, store=store, cfg=cfg)
+    assert captured["cfg"].extra_client_kwargs == ()
+
+
+def test_run_altdata_capture_injects_declared_slot_credentials(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+
+    captured: dict[str, Any] = {}
+    store = _capture_harness(monkeypatch, captured)
+    monkeypatch.setenv("KIS_DATA_SLOTS", "2,3")
+    monkeypatch.setenv("KIS_DATA_2_APP_KEY", "key2")
+    monkeypatch.setenv("KIS_DATA_2_APP_SECRET", "sec2")
+    monkeypatch.setenv("KIS_DATA_2_HTS_ID", "hts2")
+    monkeypatch.setenv("KIS_DATA_3_APP_KEY", "key3")
+    monkeypatch.setenv("KIS_DATA_3_APP_SECRET", "sec3")
+    monkeypatch.setenv("KIS_DATA_3_HTS_ID", "hts3")
+    monkeypatch.delenv("KIS_DECISION_SHARD_SLOTS", raising=False)
+    monkeypatch.delenv("KIS_TRADE_APP_KEY", raising=False)
+    monkeypatch.delenv("KIS_APP_KEY", raising=False)
+    profile = _profile(tmp_path, COLLECTION_ALTDATA_LOOKBACK_DAYS=2, COLLECTION_ALTDATA_EXTRA_SLOTS=("2", "3"))
+    window_start, window_end = altdata_capture._rolling_bounds(pd.Timestamp("2026-09-18").date(), 2)
+    cfg = AltDataFetchConfig(
+        start=window_start, end=window_end, out_dir=tmp_path, krx_api_key="k",
+        universe_symbols=frozenset({"005930"}),
+    )
+    altdata_capture.run_altdata_capture(pd.Timestamp("2026-09-18").date(), profile=profile, store=store, cfg=cfg)
+    assert captured["cfg"].extra_client_kwargs == (("key2", "sec2", "hts2"), ("key3", "sec3", "hts3"))
+
+
+def test_run_altdata_capture_preserves_prefilled_extra_keys(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+
+    captured: dict[str, Any] = {}
+    store = _capture_harness(monkeypatch, captured)
+
+    def _boom(env, *, slots):
+        raise AssertionError("resolve must not be called when extra keys already set")
+
+    monkeypatch.setattr(altdata_capture, "resolve_research_credentials", _boom)
+    profile = _profile(tmp_path, COLLECTION_ALTDATA_LOOKBACK_DAYS=2, COLLECTION_ALTDATA_EXTRA_SLOTS=("2",))
+    window_start, window_end = altdata_capture._rolling_bounds(pd.Timestamp("2026-09-18").date(), 2)
+    prefilled = (("pre", "sec", "hts"),)
+    cfg = AltDataFetchConfig(
+        start=window_start, end=window_end, out_dir=tmp_path, krx_api_key="k",
+        universe_symbols=frozenset({"005930"}), extra_client_kwargs=prefilled,
+    )
+    altdata_capture.run_altdata_capture(pd.Timestamp("2026-09-18").date(), profile=profile, store=store, cfg=cfg)
+    assert captured["cfg"].extra_client_kwargs == prefilled
+
+
+def test_run_altdata_capture_propagates_shard_overlap_error(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import pytest
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+
+    captured: dict[str, Any] = {}
+    store = _capture_harness(monkeypatch, captured)
+    monkeypatch.setenv("KIS_DATA_SLOTS", "2,3")
+    monkeypatch.setenv("KIS_DECISION_SHARD_SLOTS", "2")
+    monkeypatch.setenv("KIS_DATA_2_APP_KEY", "key2")
+    monkeypatch.setenv("KIS_DATA_2_APP_SECRET", "sec2")
+    profile = _profile(tmp_path, COLLECTION_ALTDATA_LOOKBACK_DAYS=2, COLLECTION_ALTDATA_EXTRA_SLOTS=("2",))
+    window_start, window_end = altdata_capture._rolling_bounds(pd.Timestamp("2026-09-18").date(), 2)
+    cfg = AltDataFetchConfig(
+        start=window_start, end=window_end, out_dir=tmp_path, krx_api_key="k",
+        universe_symbols=frozenset({"005930"}),
+    )
+    with pytest.raises(ValueError, match="overlaps KIS_DECISION_SHARD_SLOTS"):
+        altdata_capture.run_altdata_capture(pd.Timestamp("2026-09-18").date(), profile=profile, store=store, cfg=cfg)

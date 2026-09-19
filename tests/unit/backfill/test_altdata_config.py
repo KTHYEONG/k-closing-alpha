@@ -30,6 +30,41 @@ def test_altdata_config_carries_krx_api_key() -> None:
     assert cfg.krx_requests_per_sec == 3.0
 
 
+def test_altdata_config_defaults_to_single_key() -> None:
+    cfg = AltDataFetchConfig(start=pd.Timestamp("2020-01-01"), end=pd.Timestamp("2020-02-01"), out_dir=Path("x"))
+    assert cfg.extra_client_kwargs == ()
+
+
+def test_altdata_config_accepts_valid_extra_keys() -> None:
+    cfg = AltDataFetchConfig(
+        start=pd.Timestamp("2020-01-01"),
+        end=pd.Timestamp("2020-02-01"),
+        out_dir=Path("x"),
+        extra_client_kwargs=(("key2", "sec2", "hts2"),),
+    )
+    assert cfg.extra_client_kwargs == (("key2", "sec2", "hts2"),)
+
+
+def test_altdata_config_rejects_empty_app_key() -> None:
+    with pytest.raises(ValueError, match="non-empty app_key"):
+        AltDataFetchConfig(
+            start=pd.Timestamp("2020-01-01"),
+            end=pd.Timestamp("2020-02-01"),
+            out_dir=Path("x"),
+            extra_client_kwargs=(("", "sec2", "hts2"),),
+        )
+
+
+def test_altdata_config_rejects_bad_tuple_length() -> None:
+    with pytest.raises(ValueError, match="extra_client_kwargs"):
+        AltDataFetchConfig(
+            start=pd.Timestamp("2020-01-01"),
+            end=pd.Timestamp("2020-02-01"),
+            out_dir=Path("x"),
+            extra_client_kwargs=(("key2", "sec2"),),
+        )
+
+
 import pathlib
 
 

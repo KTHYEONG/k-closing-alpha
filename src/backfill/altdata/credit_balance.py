@@ -7,7 +7,7 @@ import logging
 
 import pandas as pd
 
-from src.api.kis.client import KisApiClient, kis_data_client_kwargs
+from src.backfill.altdata.client_pool import fan_out_symbol_calls
 from src.backfill.altdata.config import AltDataFetchConfig
 
 logger = logging.getLogger(__name__)
@@ -47,23 +47,14 @@ def collect_credit_balance(cfg: AltDataFetchConfig, business_days: list[pd.Times
     end_ymd = _to_ymd(max(days))
 
     async def _run() -> list[tuple[str, dict]]:
-        client = KisApiClient(**kis_data_client_kwargs())
-        async with client.create_session() as session:
-            await client.ensure_token(session)
-            sem = asyncio.Semaphore(10)
+        async def _call(client, session, code):
+            return await client.get_daily_credit_balance_history(session, code, start_ymd, end_ymd, market_div_code="J")
 
-            async def _one(code: str) -> tuple[str, dict]:
-                async with sem:
-                    try:
-                        res = await client.get_daily_credit_balance_history(
-                            session, code, start_ymd, end_ymd, market_div_code="J"
-                        )
-                    except Exception as e:
-                        logger.warning("Daily credit balance history failed code=%s: %s", code, e)
-                        return code, {"rt_cd": "9", "output": []}
-                    return code, res
+        def _on_error(code, exc):
+            logger.warning("Daily credit balance history failed code=%s: %s", code, exc)
+            return {"rt_cd": "9", "output": []}
 
-            return list(await asyncio.gather(*[_one(c) for c in symbols]))
+        return await fan_out_symbol_calls(cfg, symbols, _call, _on_error)
 
     fetched = asyncio.run(_run())
     rows: list[dict] = []

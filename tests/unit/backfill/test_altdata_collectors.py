@@ -23,10 +23,12 @@ def test_collect_shorting_builds_symbol_date_panel(monkeypatch) -> None:
         universe_symbols=frozenset({"005930"}),
     )
 
+    from src.api.kis.client import KisApiClient
+
     with (
-        patch.object(shorting.KisApiClient, "get_daily_short_sale_history", AsyncMock(side_effect=_fake_history)),
-        patch.object(shorting.KisApiClient, "create_session") as mock_create_session,
-        patch.object(shorting.KisApiClient, "ensure_token", AsyncMock(return_value="tok")),
+        patch.object(KisApiClient, "get_daily_short_sale_history", AsyncMock(side_effect=_fake_history)),
+        patch.object(KisApiClient, "create_session") as mock_create_session,
+        patch.object(KisApiClient, "ensure_token", AsyncMock(return_value="tok")),
     ):
         mock_create_session.return_value.__aenter__ = AsyncMock(return_value=object())
         mock_create_session.return_value.__aexit__ = AsyncMock(return_value=False)

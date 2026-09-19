@@ -26,6 +26,7 @@ class CollectionSettings(BaseSettings):
         COLLECTION_AUCTION_ENABLED: Enable independently budgeted sweeps, default False.
         COLLECTION_ALTDATA_ENABLED: Enable incremental slow-data jobs, default False.
         COLLECTION_RESEARCH_SLOTS: Explicit research key slots, default empty.
+        COLLECTION_ALTDATA_EXTRA_SLOTS: Extra KIS data slots for alt-data fan-out, default empty.
         COLLECTION_AUCTION_INTERVAL_SECONDS: Closing sweep interval, default 60.
         COLLECTION_REQUEST_TIMEOUT_SECONDS: Total call timeout, default 5.0.
         COLLECTION_CONCURRENCY_PER_KEY: In-flight limit, default 8.
@@ -54,6 +55,7 @@ class CollectionSettings(BaseSettings):
     COLLECTION_AUCTION_ENABLED: bool = Field(default=False)
     COLLECTION_ALTDATA_ENABLED: bool = Field(default=False)
     COLLECTION_RESEARCH_SLOTS: tuple[str, ...] = Field(default=())
+    COLLECTION_ALTDATA_EXTRA_SLOTS: tuple[str, ...] = Field(default=())
     COLLECTION_AUCTION_INTERVAL_SECONDS: int = Field(default=60, gt=0)
     COLLECTION_REQUEST_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     COLLECTION_CONCURRENCY_PER_KEY: int = Field(default=8, gt=0)
@@ -66,7 +68,7 @@ class CollectionSettings(BaseSettings):
     COLLECTION_OPEN_CONFIRM_SECONDS: int = Field(default=180, gt=30)
     COLLECTION_SESSION_OVERRIDES: dict[str, SessionClock] = Field(default_factory=dict)
 
-    @field_validator("COLLECTION_RESEARCH_SLOTS", mode="after")
+    @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", mode="after")
     @classmethod
     def _check_slots(cls, v: tuple[str, ...]) -> tuple[str, ...]:
         for slot in v:
