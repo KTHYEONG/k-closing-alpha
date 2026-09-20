@@ -164,23 +164,21 @@ class CaptureStore:
         context = response.context
         symbol = context.symbol if context.symbol is not None else "nosymbol"
         name = f"{symbol}-p{response.page_index:04d}-a{response.attempt_index:02d}.json.gz"
-        if context.dataset == CaptureDataset.SCAN:
-            # SCAN은 Kiwoom/KIS/Toss가 동일 run에서 각자 첫 페이지를 남기므로
-            # vendor/endpoint/page/attempt를 모두 경로에 반영해 충돌을 막는다.
-            endpoint = re.sub(r"[^A-Za-z0-9_-]+", "-", str(context.endpoint)).strip("-") or "endpoint"
-            return "/".join(
-                [
-                    "raw",
-                    context.trading_date.isoformat(),
-                    context.vendor,
-                    context.dataset.value,
-                    endpoint,
-                    context.run_id,
-                    name,
-                ]
-            )
+        # 동일 run이 여러 endpoint(예: PRICE의 KOSPI/KOSDAQ)를 순회할 때 심볼 없는
+        # 첫 페이지 이름이 겹칠 수 있으므로 endpoint를 항상 경로에 반영한다.
+        # 실측: 2026-09-20 price_ingest가 KOSPI/KOSDAQ 응답을 같은 경로로 써서
+        # conflicting immutable artifact identity로 크래시.
+        endpoint = re.sub(r"[^A-Za-z0-9_-]+", "-", str(context.endpoint)).strip("-") or "endpoint"
         return "/".join(
-            ["raw", context.trading_date.isoformat(), context.vendor, context.dataset.value, context.run_id, name]
+            [
+                "raw",
+                context.trading_date.isoformat(),
+                context.vendor,
+                context.dataset.value,
+                endpoint,
+                context.run_id,
+                name,
+            ]
         )
 
     def append_response(self, response: CapturedResponse) -> ArtifactRef:
