@@ -29,6 +29,9 @@ def atomic_write_parquet(
         if compression == "zstd" and compression_level is not None:
             kwargs["compression_level"] = compression_level
         df.to_parquet(tmp_path, **kwargs)  # type: ignore[arg-type]
+        # NamedTemporaryFile은 umask와 무관하게 항상 0600으로 생성되고 os.replace가 그 권한을
+        # 그대로 승계한다 -- 실측: 2026-09-19 오프사이트 백업(다른 유저 실행)이 permission denied로 실패.
+        os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, target_path)
     except Exception as e:
         if tmp_path.exists():
