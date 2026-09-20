@@ -127,12 +127,30 @@ def test_appended_raw_payload_round_trips(tmp_path: Path) -> None:
     """Raw payload is preserved."""
     store = CaptureStore(tmp_path / "capture")
     ref = store.append_response(_response())
-    assert ref.path == "raw/2026-09-17/kis/PRICE/run-1/005930-p0000-a00.json.gz"
+    assert ref.path == "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.gz"
     envelope = store.read_artifact(ref)
     assert envelope["payload"] == {"output": {"code": "005930", "price": "72000"}}
     assert envelope["source_published_at"] is None
     assert envelope["source_timestamp"] is None
     assert envelope["received_at"] == (START + timedelta(seconds=1)).isoformat()
+
+
+def test_same_run_distinct_endpoints_do_not_collide(tmp_path: Path) -> None:
+    """price_ingest fetches KOSPI/KOSDAQ under one run_id with no symbol; endpoint must disambiguate the path.
+
+    실측: 2026-09-20 두 마켓의 첫 페이지가 같은 경로로 써져
+    conflicting immutable artifact identity로 크래시했다.
+    """
+    store = CaptureStore(tmp_path / "capture")
+    kospi = store.append_response(
+        _response(context=_context(endpoint="stk-bydd-trd", symbol=None), payload={"output": {"market": "KOSPI"}})
+    )
+    kosdaq = store.append_response(
+        _response(context=_context(endpoint="ksq-bydd-trd", symbol=None), payload={"output": {"market": "KOSDAQ"}})
+    )
+    assert kospi.path != kosdaq.path
+    assert store.read_artifact(kospi)["payload"] == {"output": {"market": "KOSPI"}}
+    assert store.read_artifact(kosdaq)["payload"] == {"output": {"market": "KOSDAQ"}}
 
 
 def test_concurrent_appends_lose_no_response(tmp_path: Path) -> None:
@@ -176,7 +194,7 @@ def test_corrupt_evidence_never_qualifies(tmp_path: Path) -> None:
     store = CaptureStore(tmp_path / "capture")
     completed = START + timedelta(minutes=4)
     _publish_decision(store, "run-1", completed)
-    raw_path = tmp_path / "capture" / "raw/2026-09-17/kis/PRICE/run-1/005930-p0000-a00.json.gz"
+    raw_path = tmp_path / "capture" / "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.gz"
     tampered = raw_path.read_bytes() + b"\x00"
     raw_path.write_bytes(tampered)
     with pytest.raises(ValueError, match="hash-inconsistent"):
@@ -394,7 +412,7 @@ def test_publish_manifest_rejects_inconsistent_coverage(tmp_path: Path) -> None:
 
 def test_publish_manifest_rejects_missing_reference(tmp_path: Path) -> None:
     store = CaptureStore(tmp_path / "capture")
-    ghost = ArtifactRef(path="raw/2026-09-17/kis/PRICE/run-9/ghost-p0000-a00.json.gz", sha256="0" * 64, bytes=10)
+    ghost = ArtifactRef(path="raw/2026-09-17/kis/PRICE/price/run-9/ghost-p0000-a00.json.gz", sha256="0" * 64, bytes=10)
     entry = _entry(ghost, status=CaptureStatus.NO_TRADES, reason="market holiday proof")
     manifest = CaptureManifest(
         schema_version=1,
@@ -545,12 +563,12 @@ def test_publish_frame_failure_surfaces(tmp_path: Path, monkeypatch: Any) -> Non
 
 def test_read_artifact_rejects_malformed(tmp_path: Path) -> None:
     store = CaptureStore(tmp_path / "capture")
-    raw_dir = tmp_path / "capture" / "raw/2026-09-17/kis/PRICE/run-1"
+    raw_dir = tmp_path / "capture" / "raw/2026-09-17/kis/PRICE/price/run-1"
     raw_dir.mkdir(parents=True, exist_ok=True)
     garbage = raw_dir / "garbage.json.gz"
     garbage.write_bytes(b"not-gzip-bytes")
     garbage_ref = ArtifactRef(
-        path="raw/2026-09-17/kis/PRICE/run-1/garbage.json.gz",
+        path="raw/2026-09-17/kis/PRICE/price/run-1/garbage.json.gz",
         sha256=hashlib.sha256(b"not-gzip-bytes").hexdigest(),
         bytes=len(b"not-gzip-bytes"),
     )
@@ -560,13 +578,13 @@ def test_read_artifact_rejects_malformed(tmp_path: Path) -> None:
     empty_path = raw_dir / "empty.json.gz"
     empty_path.write_bytes(empty_gz)
     empty_ref = ArtifactRef(
-        path="raw/2026-09-17/kis/PRICE/run-1/empty.json.gz",
+        path="raw/2026-09-17/kis/PRICE/price/run-1/empty.json.gz",
         sha256=hashlib.sha256(empty_gz).hexdigest(),
         bytes=len(empty_gz),
     )
     with pytest.raises(ValueError, match="malformed raw evidence"):
         store.read_artifact(empty_ref)
-    missing = ArtifactRef(path="raw/2026-09-17/kis/PRICE/run-1/missing.json.gz", sha256="0" * 64, bytes=1)
+    missing = ArtifactRef(path="raw/2026-09-17/kis/PRICE/price/run-1/missing.json.gz", sha256="0" * 64, bytes=1)
     with pytest.raises(FileNotFoundError):
         store.read_artifact(missing)
     ref = store.append_response(_response())
@@ -582,7 +600,7 @@ def test_read_artifact_rejects_malformed(tmp_path: Path) -> None:
 def test_publish_lock_timeout_fails_explicitly(tmp_path: Path, monkeypatch: Any) -> None:
     store = CaptureStore(tmp_path / "capture")
     monkeypatch.setattr(store_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
-    target = tmp_path / "capture" / "raw/2026-09-17/kis/PRICE/run-1/005930-p0000-a00.json.gz"
+    target = tmp_path / "capture" / "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.gz"
     target.parent.mkdir(parents=True, exist_ok=True)
     (target.parent / (target.name + ".lock")).write_text("held")
     with pytest.raises(OSError, match="timed out acquiring publish lock"):
