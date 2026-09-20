@@ -1897,3 +1897,32 @@ def test_collect_bars_kis_filtered_empty_unknown(tmp_path) -> None:
     )
     assert delivered["005930"][1].status.value == "UNKNOWN"
     assert delivered["005930"][0].empty
+
+
+def test_publish_pending_manifest_retry_does_not_raise(tmp_path) -> None:
+    """동일 run_id로 재실행 시 completed_at 차이로 인한 immutable identity 충돌을 흡수한다.
+
+    실측: 2026-09-18 archive-intraday 재시도가 이 충돌(ValueError)로 전체 아카이브를
+    실패시킴 -- PENDING 매니페스트는 진행 중 체크포인트일 뿐이라 발행 실패해도
+    실제 수집은 계속돼야 한다.
+    """
+    from datetime import date
+
+    from src.backfill.intraday.collector import _publish_pending_manifest
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    kwargs = dict(
+        store=store,
+        trading_day=date(2026, 9, 18),
+        run_id="archive-2026-09-18-regular-bars",
+        dataset=CaptureDataset.MINUTE_BARS,
+        vendor="owner-local",
+        endpoint="pending",
+        session="regular",
+        symbols=["005930"],
+    )
+    _publish_pending_manifest(**kwargs)
+    # 재실행: completed_at이 달라져 동일 경로에 다른 바이트를 쓰려는 충돌이 발생하지만
+    # 예외가 밖으로 전파되지 않아야 한다.
+    _publish_pending_manifest(**kwargs)

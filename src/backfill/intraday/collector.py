@@ -292,7 +292,14 @@ def _publish_pending_manifest(
         artifacts=(),
         status=CaptureStatus.PENDING,
     )
-    store.publish_manifest(manifest)
+    try:
+        store.publish_manifest(manifest)
+    except ValueError as exc:
+        # PENDING 매니페스트는 completed_at이 매번 달라 재실행 시 동일 run_id 경로와
+        # 내용이 반드시 어긋난다 -- 실측: 2026-09-18 재시도 실행이 immutable identity
+        # 충돌로 아카이브 전체를 실패시킴. 완료 인증(COMPLETE/PARTIAL)이 아닌 진행 중
+        # 체크포인트일 뿐이라 발행 실패해도 실제 수집 작업은 계속 진행한다.
+        logger.warning("[DATA] stage=intraday_archive status=DEGRADED reason=pending_manifest_conflict run_id=%s detail=%s", run_id, exc)
 
 
 def _event_key(row: Mapping[str, Any], vendor: str) -> tuple[str, str]:

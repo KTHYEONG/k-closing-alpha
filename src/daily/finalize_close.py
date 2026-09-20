@@ -206,7 +206,11 @@ async def fetch_confirmed_quote(client: Any, session: Any, code: str, *, capture
                         error_type=None,
                     )
                 )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError는 capture_store의 immutable identity 충돌(예: 동일 run_id/attempt에 대한
+            # 재확인 시세가 이전 값과 달라짐)도 포함한다 -- 실측: 2026-09-18 finalize-close가
+            # 이 예외로 전체 확정 루프를 중단시켜 파이프 하위 paper-entry가 UNCONFIRMED로 넘어감.
+            # 원본 증거 보존은 부가 기능이므로 실패해도 확정 로직 자체는 계속 진행한다.
             logger.warning("[DATA] stage=close_confirmation code=%s status=DEGRADED reason=%s", code, type(exc).__name__)
     price_output = price_res.get("output") if isinstance(price_res, dict) and price_res.get("rt_cd") == "0" and isinstance(price_res.get("output"), dict) else {}
     book_output2 = book_res.get("output2") if isinstance(book_res, dict) and book_res.get("rt_cd") == "0" and isinstance(book_res.get("output2"), dict) else {}
