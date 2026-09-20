@@ -1293,6 +1293,29 @@ def test_confirmation_persistence_failure_records_degraded() -> None:
     assert logging.getLogger(__name__) is not None
 
 
+def test_confirmation_identity_conflict_records_degraded_without_aborting() -> None:
+    """capture_store의 immutable identity 충돌(ValueError)도 확정 로직을 중단시키지 않는다.
+
+    실측: 2026-09-18 finalize-close가 append_response의 ValueError를 잡지 못해
+    전체 확정 루프가 죽고 하위 paper-entry가 UNCONFIRMED로 넘어간 사고 재발 방지.
+    """
+    import asyncio
+
+    from src.daily.finalize_close import fetch_confirmed_quote, is_close_confirmed
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    class _ConflictingStore:
+        def append_response(self, response):
+            raise ValueError("conflicting immutable artifact identity: 'raw/...'")
+
+    price_out, book_out2 = asyncio.run(
+        fetch_confirmed_quote(_confirming_client(), object(), "005930", capture_store=_ConflictingStore(), run_id="r", cohort_id="c")
+    )
+    assert price_out["stck_prpr"] == "269000"
+    assert is_close_confirmed(price_out, book_out2, datetime(2026, 9, 10, 15, 31, 0, tzinfo=ZoneInfo("Asia/Seoul"))) is True
+
+
 def test_close_outcomes_leave_decision_hash_unchanged(tmp_path, monkeypatch) -> None:
     """Published 15:20 input stays byte-identical after close finalization."""
     import asyncio
