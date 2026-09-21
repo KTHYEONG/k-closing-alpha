@@ -26,7 +26,7 @@ def test_aggregate_rows_categorizes_and_flags_material() -> None:
 def test_collect_disclosures_uses_pblntf_ty_and_flushes_per_window(monkeypatch) -> None:
     calls: list[tuple[str, str, str]] = []
 
-    def _fake_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock, *, on_page=None):  # noqa: ANN001, ANN202
+    def _fake_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock, *, on_page=None, page_offset=0):  # noqa: ANN001, ANN202
         calls.append((pblntf_ty, start_ymd, end_ymd))
         return [{"stock_code": "005930", "report_nm": "유상증자결정", "rcept_dt": f"{start_ymd}"}]
 
@@ -50,7 +50,7 @@ def test_collect_disclosures_uses_pblntf_ty_and_flushes_per_window(monkeypatch) 
 def test_collect_disclosures_skips_fully_covered_windows(monkeypatch) -> None:
     fetched_windows: list[str] = []
 
-    def _fake_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock, *, on_page=None):  # noqa: ANN001, ANN202
+    def _fake_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock, *, on_page=None, page_offset=0):  # noqa: ANN001, ANN202
         fetched_windows.append(start_ymd)
         return []
 
@@ -196,8 +196,12 @@ def test_collect_disclosures_parallel_pages_all_retained(monkeypatch) -> None:
     )
     assert len(seen) == 8
     assert {meta["page_no"] for _, meta, *_ in seen} == {"1", "2", "3", "4"}
+    # Then: page_index는 (pblntf_ty, 창) 버킷 오프셋 + page_no라 두 유형(B/I)의 동일 page_no가
+    # 서로 다른 page_index로 갈려 evidence 경로가 겹치지 않는다.
+    seen_indices = {pi for _, _, _, _, pi, _ in seen}
+    assert len(seen_indices) == 8
     for _, meta, started, received, page, _attempt in seen:
-        assert meta["page_no"] == str(page)
+        assert page % disclosure._MAX_PAGES_PER_BUCKET == int(meta["page_no"])
         assert getattr(started, "tzinfo", None) is not None and getattr(received, "tzinfo", None) is not None
 
 
@@ -316,3 +320,46 @@ def test_collect_disclosures_capture_failure_propagates(monkeypatch) -> None:
             on_page=_leaky,  # type: ignore[arg-type]
         )
     assert "SECRET-XYZ" not in str(exc_info.value)
+
+
+def test_collect_disclosures_two_types_do_not_collide_in_capture_store(monkeypatch, tmp_path) -> None:
+    """실측: 2026-09-21 B/I 두 공시유형이 같은 (page_no=1, attempt=0)로 같은 evidence
+    경로에 써져 conflicting immutable artifact identity로 매번 PARTIAL 처리됐다."""
+    import uuid
+
+    from src.data.capture_contracts import CaptureContext, CapturedResponse, CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", lambda *a, **k: _DartResp(_dart_page([_dart_item("20240115000123")])))
+
+    store = CaptureStore(tmp_path / "capture")
+    run_id = f"disclosure-{uuid.uuid4().hex[:8]}"
+    refs = []
+
+    def _on_page(payload, meta, started, received, page_index, attempt_index):  # noqa: ANN001
+        refs.append(
+            store.append_response(
+                CapturedResponse(
+                    context=CaptureContext(
+                        trading_date=pd.Timestamp("2024-02-20").date(), run_id=run_id, dataset=CaptureDataset.DISCLOSURE,
+                        vendor="owner-local", endpoint="disclosure-collector", symbol=None, venue="KRX",
+                        session="regular", capture_reason="altdata-backfill", cohort_id=None, scheduled_at=None,
+                    ),
+                    request_started_at=started, received_at=received,
+                    payload=dict(payload) if isinstance(payload, dict) else None,
+                    source_timestamp=None, source_published_at=None,
+                    status=CaptureStatus.COMPLETE if isinstance(payload, dict) else CaptureStatus.FAILED,
+                    page_index=int(page_index), attempt_index=int(attempt_index),
+                    continuation={k: str(v) for k, v in dict(meta).items()},
+                    error_type=None if isinstance(payload, dict) else "transport",
+                )
+            )
+        )
+
+    disclosure.collect_disclosures(
+        _dart_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}), on_page=_on_page,
+    )
+
+    assert len(refs) == 2  # B, I 유형별 page 1
+    assert len({r.path for r in refs}) == 2  # 경로가 서로 다르다 -> 충돌 없음

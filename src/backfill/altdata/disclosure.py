@@ -172,8 +172,16 @@ def _parse_items(
     return rows
 
 
+_MAX_PAGES_PER_BUCKET = 10_001
+
+
 def _fetch_list_page(
-    cfg: AltDataFetchConfig, base_params: dict[str, object], page_no: int, *, on_page: PageObserver | None = None
+    cfg: AltDataFetchConfig,
+    base_params: dict[str, object],
+    page_no: int,
+    *,
+    on_page: PageObserver | None = None,
+    page_offset: int = 0,
 ) -> tuple[list[dict[str, str]], int | None]:
     """단일 페이지 조회 → (parsed rows, total_page). 실패 시 ([], None)."""
     params = {**base_params, "page_no": page_no}
@@ -182,7 +190,11 @@ def _fetch_list_page(
     def _call() -> dict[str, object]:
         attempt = state["attempt"]
         state["attempt"] += 1
-        return _dart_get_json(_LIST_URL, params, cfg, on_page=on_page, page_index=page_no, attempt_index=attempt)
+        # page_offset은 (pblntf_ty, 창) 조합마다 고유한 버킷을 부여한다. page_no는 각
+        # 조합마다 1부터 다시 시작해, 그대로 쓰면 CaptureStore 경로(nosymbol-pNNNN-aAA)가
+        # 조합 간에 겹쳐 conflicting immutable artifact identity로 크래시한다
+        # (실측: 2026-09-21 disclosure 수집이 이 충돌로 매번 PARTIAL).
+        return _dart_get_json(_LIST_URL, params, cfg, on_page=on_page, page_index=page_offset + page_no, attempt_index=attempt)
 
     data = retry_call(_call, cfg, label=f"dart list p{page_no}")
     if not isinstance(data, dict) or str(data.get("status", "")).strip() == "013":
@@ -205,6 +217,7 @@ def _fetch_disclosure_window(
     corp_to_stock: dict[str, str],
     *,
     on_page: PageObserver | None = None,
+    page_offset: int = 0,
 ) -> list[dict[str, str]]:
     """단일 (공시유형, ≤3개월 창) 목록을 1페이지 조회 후 나머지 페이지를 병렬 수집합니다."""
     from concurrent.futures import ThreadPoolExecutor
@@ -216,7 +229,7 @@ def _fetch_disclosure_window(
         "pblntf_ty": pblntf_ty,
         "page_count": int(cfg.page_count),
     }
-    first_lst, total_page = _fetch_list_page(cfg, base_params, 1, on_page=on_page)
+    first_lst, total_page = _fetch_list_page(cfg, base_params, 1, on_page=on_page, page_offset=page_offset)
     rows = _parse_items(first_lst, corp_to_stock)
     if not first_lst or not total_page or total_page <= 1:
         return rows
@@ -224,7 +237,7 @@ def _fetch_disclosure_window(
     max_page = min(int(total_page), 10000)
     with ThreadPoolExecutor(max_workers=_PAGE_WORKERS) as pool:
         for lst, _tp in pool.map(
-            lambda p: _fetch_list_page(cfg, base_params, p, on_page=on_page), range(2, max_page + 1)
+            lambda p: _fetch_list_page(cfg, base_params, p, on_page=on_page, page_offset=page_offset), range(2, max_page + 1)
         ):
             rows.extend(_parse_items(lst, corp_to_stock))
     return rows
@@ -303,6 +316,7 @@ def collect_disclosures(
         corp_to_stock = {c: s for c, s in zip(cc, sc, strict=True) if s and s != "000000"}
 
     parts: list[pd.DataFrame] = []
+    bucket = 0
     for start_ymd, end_ymd in _iter_windows(cfg.start, cfg.end):
         if covered_dates:
             win_days = pd.bdate_range(start_ymd, end_ymd)
@@ -311,9 +325,13 @@ def collect_disclosures(
                 continue
         window_rows: list[dict[str, str]] = []
         for pblntf_ty in _PBLNTF_TYPES:
+            # 창 x 공시유형 조합마다 고유한 page_offset 버킷을 줘 evidence 경로 충돌을 막는다.
             window_rows.extend(
-                _fetch_disclosure_window(cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock, on_page=on_page)
+                _fetch_disclosure_window(
+                    cfg, pblntf_ty, start_ymd, end_ymd, corp_to_stock, on_page=on_page, page_offset=bucket * _MAX_PAGES_PER_BUCKET
+                )
             )
+            bucket += 1
         window_df = _aggregate_rows(window_rows)
         logger.info(
             "[DATA] stage=altdata_disc window=%s..%s rows=%d", start_ymd, end_ymd, len(window_df)
