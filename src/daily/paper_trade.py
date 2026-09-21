@@ -141,6 +141,18 @@ async def run_paper_session(
     date_str = decision_date.strftime("%Y-%m-%d")
     sleep_fn = sleep_fn or asyncio.sleep
     if phase == "entry":
+        # kca-paper-entry는 kca-finalize-close의 ExecStopPost 체인과 독립 백스톱
+        # 타이머(15:34 KST) 양쪽에서 매일 트리거된다. 이미 오늘자 entry를 기록한
+        # 뒤 재실행되면 cash가 첫 실행분만큼 줄어든 상태로 재사이징해 포지션이
+        # 실제보다 작게 재체결되고 orders 감사기록도 덮어써진다(실측: 2026-09-21
+        # 017900이 301주에서 50주로 축소, 402340/009150 orders가 ZERO_QTY로
+        # 오기록). 오늘자 entry 시도 흔적이 있으면 두 번째 트리거는 조용히 스킵한다.
+        existing_orders = ledger.load("orders")
+        if not existing_orders.empty and (
+            (existing_orders["decision_date"] == date_str) & (existing_orders["reason"] == "entry")
+        ).any():
+            logger.info("[DATA] stage=paper_entry status=SKIP reason=already_recorded date=%s", date_str)
+            return 0
         picks = load_topk_decision(decision_date)
         if picks.empty:
             ledger.record_no_decision(date_str, reason="no_persisted_decision")
