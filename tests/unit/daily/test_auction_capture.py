@@ -792,6 +792,28 @@ def test_main_skip_and_success(tmp_path, monkeypatch, caplog) -> None:
         pass
 
 
+def test_module_execution_actually_invokes_main(monkeypatch, caplog) -> None:
+    """실측: 2026-09-21 __main__ 가드 자체가 파일에 없어 `python -m ...`로 실행해도
+    main()이 전혀 호출되지 않고 조용히 성공 종료했다(kca-auction-open/close가 매번
+    "성공"으로 보이면서 실제로는 아무 것도 수집하지 않음). main()을 직접 호출하는
+    테스트만으로는 이 가드 누락을 잡지 못하므로, 모듈을 __main__으로 실행해 확인한다.
+    conftest의 autouse 픽스처가 COLLECTION_AUCTION_ENABLED를 지우므로 main()이 실제로
+    호출됐다면 SKIP 로그가 결정론적으로 찍힌다.
+    """
+    import logging
+    import runpy
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["auction_capture", "--phase", "open"])
+
+    # __main__으로 재실행되는 코드는 __name__="__main__"이라 별도 logger 인스턴스를
+    # 얻으므로, 특정 logger name이 아니라 루트 레벨로 캡처해야 한다.
+    with caplog.at_level(logging.INFO):
+        runpy.run_module("src.daily.auction_capture", run_name="__main__")
+
+    assert any("SKIP" in r.message and "disabled" in r.message for r in caplog.records)
+
+
 def test_run_async_builds_clients(tmp_path, monkeypatch) -> None:
     """Research clients use token cache and host pacing contracts."""
     import os
