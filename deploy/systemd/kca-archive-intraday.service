@@ -1,5 +1,5 @@
 [Unit]
-Description=KCA intraday archive (evening batch)
+Description=KCA intraday archive - NXT/KRX aftermarket bars only (evening batch)
 OnFailure=kca-alert@%n.service
 
 [Service]
@@ -7,4 +7,4 @@ Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
-ExecStart=/usr/bin/docker run --rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.archive_intraday
+ExecStart=/usr/bin/docker run --rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.archive_intraday --phase aftermarket

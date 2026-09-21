@@ -1,7 +1,7 @@
 [Unit]
 Description=KCA offsite backup (rclone copy to gdrive; overwritten versions kept 30 days)
 OnFailure=kca-alert@%n.service
-After=kca-archive-intraday.service kca-daily-audit.service kca-price-ingest.service
+After=kca-archive-intraday.service kca-archive-intraday-regular.service kca-daily-audit.service kca-price-ingest.service
 
 [Service]
 Type=oneshot

@@ -80,14 +80,16 @@ def test_archive_intraday_main_invokes_run_intraday_archive(monkeypatch) -> None
 
     def _fake_run(snapshot_date=None, **kwargs):
         captured["snapshot_date"] = snapshot_date
+        captured["kwargs"] = kwargs
         return (1, 2, 3)
 
     monkeypatch.setattr(archive_intraday, "run_intraday_archive", _fake_run)
-    monkeypatch.setattr("sys.argv", ["archive_intraday", "2026-09-04"])
+    monkeypatch.setattr("sys.argv", ["archive_intraday", "--date", "2026-09-04"])
 
     archive_intraday.main()
 
-    assert captured == {"snapshot_date": "2026-09-04"}
+    assert captured["snapshot_date"] == "2026-09-04"
+    assert captured["kwargs"]["phase"] == "all"
 
 
 def test_archive_target_codes_unions_previous_session_watchlist_regression_unchanged() -> None:
@@ -465,6 +467,95 @@ def test_run_intraday_archive_writes_krx_aftermarket_to_its_own_session(monkeypa
     assert mapping["krx_after"] == INTRADAY_SESSION_KRX_AFTERMARKET
     assert mapping["regular"] == INTRADAY_SESSION_REGULAR
     assert mapping["krx_after"] != mapping["regular"]
+
+
+def _wire_legacy_run_fakes(monkeypatch, calls: list[str]):
+    import pandas as pd
+
+    from src.daily import archive_intraday
+
+    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
+
+    async def _is_trading(_c, _s, _d):
+        return True
+
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        def create_session(self):
+            return _Session()
+
+        async def ensure_token(self, session):
+            return None
+
+    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _Client())
+    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
+    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", lambda: None)
+
+    def _frame(tag: str) -> pd.DataFrame:
+        return pd.DataFrame({"tag": [tag]})
+
+    def _tracked(name: str, tag: str):
+        async def _fn(*a, **kw):
+            calls.append(name)
+            return _frame(tag)
+
+        return _fn
+
+    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _tracked("bars", "regular"))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _tracked("nxt_after", "nxt_after"))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _tracked("nxt_pre", "nxt_pre"))
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _tracked("krx_after", "krx_after"))
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _tracked("ticks", "ticks"))
+    monkeypatch.setattr(archive_intraday, "write_intraday_partition", lambda df, interval, snap, session: len(df))
+    monkeypatch.setattr(archive_intraday, "write_tick_partition", lambda df, snap, session: len(df))
+
+
+def test_run_intraday_archive_phase_regular_only_collects_regular_session(monkeypatch) -> None:
+    from src.daily import archive_intraday
+
+    calls: list[str] = []
+    _wire_legacy_run_fakes(monkeypatch, calls)
+
+    n_bars, n_nxt, n_ticks = archive_intraday.run_intraday_archive(snapshot_date="2026-09-14", phase="regular")
+
+    assert calls == ["bars", "ticks"]
+    assert n_bars == 1 and n_ticks == 1
+    assert n_nxt == 0
+
+
+def test_run_intraday_archive_phase_aftermarket_only_collects_aftermarket_sessions(monkeypatch) -> None:
+    from src.daily import archive_intraday
+
+    calls: list[str] = []
+    _wire_legacy_run_fakes(monkeypatch, calls)
+
+    n_bars, n_nxt, n_ticks = archive_intraday.run_intraday_archive(snapshot_date="2026-09-14", phase="aftermarket")
+
+    assert calls == ["nxt_after", "nxt_pre", "krx_after"]
+    assert n_nxt == 2  # nxt_after(1 row) + nxt_pre(1 row); krx_after is not summed into n_nxt
+    assert n_bars == 0 and n_ticks == 0
+
+
+def test_run_intraday_archive_rejects_unknown_phase(monkeypatch) -> None:
+    import pytest
+
+    from src.daily import archive_intraday
+
+    calls: list[str] = []
+    _wire_legacy_run_fakes(monkeypatch, calls)
+
+    with pytest.raises(ValueError, match="Invalid phase"):
+        archive_intraday.run_intraday_archive(snapshot_date="2026-09-14", phase="bogus")
+
+    assert calls == []
 
 
 def test_intraday_watchlist_drops_unreachable_scenario_filter(monkeypatch) -> None:
@@ -937,11 +1028,11 @@ def test_run_archive_cohort_and_cli_boundaries(monkeypatch, tmp_path) -> None:
         archive_intraday.run_intraday_archive(snapshot_date="2026-09-08", profile=_raw_profile(tmp_path))
     monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: [])
     monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
-    monkeypatch.setattr("sys.argv", ["archive_intraday", "bogus-date"])
+    monkeypatch.setattr("sys.argv", ["archive_intraday", "--date", "bogus-date"])
     with pytest.raises(SystemExit) as exc:
         archive_intraday.main()
     assert exc.value.code == 2
-    monkeypatch.setattr("sys.argv", ["archive_intraday", "2026-09-08"])
+    monkeypatch.setattr("sys.argv", ["archive_intraday", "--date", "2026-09-08"])
     monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
     with pytest.raises(SystemExit) as exc:
         archive_intraday.main()

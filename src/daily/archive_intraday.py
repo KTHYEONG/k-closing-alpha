@@ -47,6 +47,13 @@ logger = logging.getLogger(__name__)
 
 _GOOD_ENTRY_STATES = frozenset({CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE})
 
+_VALID_PHASES = ("regular", "aftermarket", "all")
+
+
+def _validate_phase(phase: str) -> None:
+    if phase not in _VALID_PHASES:
+        raise ValueError(f"Invalid phase: {phase!r} (expected one of {', '.join(_VALID_PHASES)})")
+
 
 def _today_watchlist_codes(snapshot_date: str) -> list[str]:
     try:
@@ -182,11 +189,15 @@ def _publish_task_manifest(
     return manifest
 
 
-def _legacy_run(snapshot_date: str | None, bar_interval_minutes: int) -> tuple[int, int, int]:
+def _legacy_run(snapshot_date: str | None, bar_interval_minutes: int, *, phase: str = "all") -> tuple[int, int, int]:
+    _validate_phase(phase)
     snap_date = snapshot_date or datetime.now().strftime("%Y-%m-%d")
     codes = _archive_target_codes(snap_date)
     if not codes:
         return (0, 0, 0)
+
+    do_regular = phase in ("regular", "all")
+    do_aftermarket = phase in ("aftermarket", "all")
 
     async def _run() -> tuple[int, int, int]:
         client = KisApiClient(**kis_data_client_kwargs())
@@ -197,37 +208,68 @@ def _legacy_run(snapshot_date: str | None, bar_interval_minutes: int) -> tuple[i
             if not await is_kis_trading_day(client, session, snap_date):
                 logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
                 return (0, 0, 0)
-            bars = await collect_intraday_bars(client, session, codes, snap_date, bar_interval_minutes, ls_client=ls_client)
-            nxt_after = await collect_nxt_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes, kiwoom_client=kiwoom_client)
-            nxt_pre = await collect_nxt_premarket_bars(client, session, codes, snap_date, bar_interval_minutes, kiwoom_client=kiwoom_client)
-            krx_after = await collect_krx_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes)
-            n_bars = write_intraday_partition(bars, bar_interval_minutes, snap_date, INTRADAY_SESSION_REGULAR)
-            n_nxt_after = write_intraday_partition(nxt_after, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_AFTERMARKET)
-            n_nxt_pre = write_intraday_partition(nxt_pre, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_PREMARKET)
-            n_krx_after = write_intraday_partition(krx_after, bar_interval_minutes, snap_date, INTRADAY_SESSION_KRX_AFTERMARKET)
-            logger.info("[DATA] stage=krx_aftermarket date=%s rows=%d", snap_date, n_krx_after)
-            n_nxt = n_nxt_after + n_nxt_pre
-            ticks = await collect_intraday_trade_ticks(client, session, codes, snap_date, ls_client=ls_client, kiwoom_client=kiwoom_client)
-            n_ticks = write_tick_partition(ticks, snap_date, INTRADAY_SESSION_REGULAR)
+            bars = None
+            nxt_after = None
+            nxt_pre = None
+            krx_after = None
+            ticks = None
+            if do_regular:
+                bars = await collect_intraday_bars(client, session, codes, snap_date, bar_interval_minutes, ls_client=ls_client)
+            if do_aftermarket:
+                nxt_after = await collect_nxt_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes, kiwoom_client=kiwoom_client)
+                nxt_pre = await collect_nxt_premarket_bars(client, session, codes, snap_date, bar_interval_minutes, kiwoom_client=kiwoom_client)
+                krx_after = await collect_krx_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes)
+            if do_regular:
+                assert bars is not None
+                n_bars = write_intraday_partition(bars, bar_interval_minutes, snap_date, INTRADAY_SESSION_REGULAR)
+            else:
+                n_bars = 0
+            if do_aftermarket:
+                assert nxt_after is not None
+                assert nxt_pre is not None
+                assert krx_after is not None
+                n_nxt_after = write_intraday_partition(nxt_after, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_AFTERMARKET)
+                n_nxt_pre = write_intraday_partition(nxt_pre, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_PREMARKET)
+                n_krx_after = write_intraday_partition(krx_after, bar_interval_minutes, snap_date, INTRADAY_SESSION_KRX_AFTERMARKET)
+                logger.info("[DATA] stage=krx_aftermarket date=%s rows=%d", snap_date, n_krx_after)
+                n_nxt = n_nxt_after + n_nxt_pre
+            else:
+                n_nxt = 0
+            if do_regular:
+                ticks = await collect_intraday_trade_ticks(client, session, codes, snap_date, ls_client=ls_client, kiwoom_client=kiwoom_client)
+                assert ticks is not None
+                n_ticks = write_tick_partition(ticks, snap_date, INTRADAY_SESSION_REGULAR)
+            else:
+                n_ticks = 0
             return (n_bars, n_nxt, n_ticks)
 
     return asyncio.run(_run())
 
 
-def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes: int = DEFAULT_BAR_INTERVAL_MINUTES, *, profile: CollectionSettings | None = None) -> tuple[int, int, int]:
+def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes: int = DEFAULT_BAR_INTERVAL_MINUTES, *, profile: CollectionSettings | None = None, phase: str = "all") -> tuple[int, int, int]:
     """Archive the project's dated candidate cohort independently of other collectors.
 
     Args:
         snapshot_date: Exact trading date, default current Asia/Seoul date.
         bar_interval_minutes: Existing bar interval.
         profile: Validated bounded acquisition profile.
+        phase: Which session group to collect. "regular" acquires KIS/LS/Kiwoom
+            regular-session (09:00-15:30) 1m bars and trade ticks only -- both are
+            fully settled by 15:30 KST close, so this phase is meant to run right
+            after close (e.g. 15:40 KST) independently of the aftermarket phase.
+            "aftermarket" acquires NXT premarket, NXT aftermarket, and KRX
+            aftermarket 1m bars only -- these sessions do not close until 20:00
+            KST, so this phase cannot run meaningfully before then. "all" (the
+            default) runs every session, preserving the pre-split behavior for
+            ad-hoc backfills and existing callers that pass no phase.
 
     Returns:
-        Existing regular-bar, NXT-bar, and regular-tick row-count tuple.
+        (regular-bar rows, NXT-bar rows, regular-tick rows) written this call.
+        A count is exactly 0 for any session group `phase` did not collect.
 
     Raises:
         FileNotFoundError: Expected owner-local cohort evidence is absent.
-        ValueError: Invalid date, certification, or profile.
+        ValueError: Invalid date, certification, profile, or unrecognized phase.
         OSError: Acquisition evidence or verified publication fails.
     """
     prof = profile if profile is not None else CollectionSettings(COLLECTION_RAW_ENABLED=False)
@@ -238,10 +280,13 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
         raise ValueError(f"Invalid snapshot_date: {snap_date!r}") from None
     if int(bar_interval_minutes) <= 0:
         raise ValueError(f"Invalid bar_interval_minutes: {bar_interval_minutes!r}")
+    _validate_phase(phase)
     if not prof.COLLECTION_RAW_ENABLED:
-        return _legacy_run(str(snap_date), int(bar_interval_minutes))
+        return _legacy_run(str(snap_date), int(bar_interval_minutes), phase=phase)
     store = CaptureStore(_capture_root(prof))
     codes, prev_incomplete = _resolve_cohort_codes(str(snap_date), prof, store)
+    do_regular = phase in ("regular", "all")
+    do_aftermarket = phase in ("aftermarket", "all")
 
     async def _run() -> tuple[int, int, int]:
         client = KisApiClient(**kis_data_client_kwargs())
@@ -305,45 +350,61 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
             # 고정 run_id 때문에 "conflicting immutable artifact identity"로 즉시 실패).
             attempt = uuid.uuid4().hex[:8]
             bars_run = f"archive-{snap_date}-regular-bars-{attempt}"
-            await collect_intraday_bars(client, session, codes, str(snap_date), interval, ls_client=ls_client,
-                                        profile=prof, capture_store=store, run_id=bars_run, on_symbol=publish_bars)
             after_run = f"archive-{snap_date}-nxt-aftermarket-{attempt}"
-            await collect_nxt_aftermarket_bars(client, session, codes, str(snap_date), interval, kiwoom_client=kiwoom_client,
-                                               profile=prof, capture_store=store, run_id=after_run, on_symbol=publish_nxt_after)
             pre_run = f"archive-{snap_date}-nxt-premarket-{attempt}"
-            await collect_nxt_premarket_bars(client, session, codes, str(snap_date), interval, kiwoom_client=kiwoom_client,
-                                             profile=prof, capture_store=store, run_id=pre_run, on_symbol=publish_nxt_pre)
             krx_run = f"archive-{snap_date}-krx-aftermarket-{attempt}"
-            await collect_krx_aftermarket_bars(client, session, codes, str(snap_date), interval,
-                                               profile=prof, capture_store=store, run_id=krx_run, on_symbol=publish_krx_after)
-            logger.info("[DATA] stage=krx_aftermarket date=%s rows=%d", snap_date, counts["krx_after"])
             ticks_run = f"archive-{snap_date}-regular-ticks-{attempt}"
-            await collect_intraday_trade_ticks(client, session, codes, str(snap_date), ls_client=ls_client,
-                                               kiwoom_client=kiwoom_client, profile=prof, capture_store=store,
-                                               run_id=ticks_run, on_symbol=publish_ticks)
-            _publish_task_manifest(store, trading_day=trading_day, run_id=bars_run,
-                                   dataset=CaptureDataset.MINUTE_BARS, vendor="kis",
-                                   session=INTRADAY_SESSION_REGULAR, entries=bar_entries)
-            _publish_task_manifest(store, trading_day=trading_day, run_id=after_run,
-                                   dataset=CaptureDataset.MINUTE_BARS, vendor="kiwoom",
-                                   session=INTRADAY_SESSION_NXT_AFTERMARKET, entries=nxt_after_entries)
-            _publish_task_manifest(store, trading_day=trading_day, run_id=pre_run,
-                                   dataset=CaptureDataset.MINUTE_BARS, vendor="kiwoom",
-                                   session=INTRADAY_SESSION_NXT_PREMARKET, entries=nxt_pre_entries)
-            _publish_task_manifest(store, trading_day=trading_day, run_id=krx_run,
-                                   dataset=CaptureDataset.MINUTE_BARS, vendor="kis",
-                                   session=INTRADAY_SESSION_KRX_AFTERMARKET, entries=krx_after_entries)
-            _publish_task_manifest(store, trading_day=trading_day, run_id=ticks_run,
-                                   dataset=CaptureDataset.TRADE_TICKS, vendor="kis",
-                                   session=INTRADAY_SESSION_REGULAR, entries=tick_entries)
+            if do_regular:
+                await collect_intraday_bars(client, session, codes, str(snap_date), interval, ls_client=ls_client,
+                                            profile=prof, capture_store=store, run_id=bars_run, on_symbol=publish_bars)
+            if do_aftermarket:
+                await collect_nxt_aftermarket_bars(client, session, codes, str(snap_date), interval, kiwoom_client=kiwoom_client,
+                                                   profile=prof, capture_store=store, run_id=after_run, on_symbol=publish_nxt_after)
+                await collect_nxt_premarket_bars(client, session, codes, str(snap_date), interval, kiwoom_client=kiwoom_client,
+                                                 profile=prof, capture_store=store, run_id=pre_run, on_symbol=publish_nxt_pre)
+                await collect_krx_aftermarket_bars(client, session, codes, str(snap_date), interval,
+                                                   profile=prof, capture_store=store, run_id=krx_run, on_symbol=publish_krx_after)
+                logger.info("[DATA] stage=krx_aftermarket date=%s rows=%d", snap_date, counts["krx_after"])
+            if do_regular:
+                await collect_intraday_trade_ticks(client, session, codes, str(snap_date), ls_client=ls_client,
+                                                   kiwoom_client=kiwoom_client, profile=prof, capture_store=store,
+                                                   run_id=ticks_run, on_symbol=publish_ticks)
+            if do_regular:
+                _publish_task_manifest(store, trading_day=trading_day, run_id=bars_run,
+                                       dataset=CaptureDataset.MINUTE_BARS, vendor="kis",
+                                       session=INTRADAY_SESSION_REGULAR, entries=bar_entries)
+            if do_aftermarket:
+                _publish_task_manifest(store, trading_day=trading_day, run_id=after_run,
+                                       dataset=CaptureDataset.MINUTE_BARS, vendor="kiwoom",
+                                       session=INTRADAY_SESSION_NXT_AFTERMARKET, entries=nxt_after_entries)
+                _publish_task_manifest(store, trading_day=trading_day, run_id=pre_run,
+                                       dataset=CaptureDataset.MINUTE_BARS, vendor="kiwoom",
+                                       session=INTRADAY_SESSION_NXT_PREMARKET, entries=nxt_pre_entries)
+                _publish_task_manifest(store, trading_day=trading_day, run_id=krx_run,
+                                       dataset=CaptureDataset.MINUTE_BARS, vendor="kis",
+                                       session=INTRADAY_SESSION_KRX_AFTERMARKET, entries=krx_after_entries)
+            if do_regular:
+                _publish_task_manifest(store, trading_day=trading_day, run_id=ticks_run,
+                                       dataset=CaptureDataset.TRADE_TICKS, vendor="kis",
+                                       session=INTRADAY_SESSION_REGULAR, entries=tick_entries)
+            collected_entries: list[CoverageEntry] = []
+            if do_regular:
+                collected_entries.extend(bar_entries)
+                collected_entries.extend(tick_entries)
+            if do_aftermarket:
+                collected_entries.extend(nxt_after_entries)
+                collected_entries.extend(nxt_pre_entries)
+                collected_entries.extend(krx_after_entries)
             incomplete = prev_incomplete or any(
                 item.status not in _GOOD_ENTRY_STATES
-                for item in [*bar_entries, *nxt_after_entries, *nxt_pre_entries, *krx_after_entries, *tick_entries]
+                for item in collected_entries
             )
             if incomplete:
                 logger.warning("[DATA] stage=intraday_archive status=DEGRADED date=%s", snap_date)
-            n_nxt = counts["nxt_after"] + counts["nxt_pre"]
-            return (counts["bars"], n_nxt, counts["ticks"])
+            n_bars = counts["bars"] if do_regular else 0
+            n_nxt = (counts["nxt_after"] + counts["nxt_pre"]) if do_aftermarket else 0
+            n_ticks = counts["ticks"] if do_regular else 0
+            return (n_bars, n_nxt, n_ticks)
 
     return asyncio.run(_run())
 
@@ -368,21 +429,26 @@ def _fragment_context(trading_day: date, symbol: str, dataset: CaptureDataset) -
 
 
 def main() -> None:
-    import sys
+    import argparse
 
     from src.utils.display import Colors
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    target_date = sys.argv[1] if len(sys.argv) > 1 else datetime.now().strftime("%Y-%m-%d")
+    parser = argparse.ArgumentParser(description="Intraday archive session split")
+    parser.add_argument("--phase", choices=["regular", "aftermarket", "all"], default="all")
+    parser.add_argument("--date", default=None, help="Snapshot date YYYY-MM-DD (default today)")
+    args = parser.parse_args()
+    target_date = args.date or datetime.now().strftime("%Y-%m-%d")
     target_codes = _archive_target_codes(target_date)
     logger.info(
-        "🚀 [Intraday 아카이브 시작] 대상일: %s, 대상 종목: %d개, 저장소: %s",
+        "🚀 [Intraday 아카이브 시작] 대상일: %s, 대상 종목: %d개, 저장소: %s, phase=%s",
         target_date,
         len(target_codes),
         settings.HISTORY_DIR,
+        args.phase,
     )
     try:
-        bars_rows, nxt_rows, tick_rows = run_intraday_archive(snapshot_date=target_date, profile=CollectionSettings())
+        bars_rows, nxt_rows, tick_rows = run_intraday_archive(snapshot_date=target_date, profile=CollectionSettings(), phase=args.phase)
     except ValueError as e:
         logger.error("[DATA] stage=intraday_archive status=ERROR reason=%s", e)
         raise SystemExit(2) from e
@@ -393,7 +459,7 @@ def main() -> None:
     box_top = "━" * 60
     divider = "─" * 60
     logger.info(f"\n{Colors.BOLD}{box_top}{Colors.RESET}")
-    logger.info(f" {Colors.GREEN}{Colors.BOLD}📦 [Intraday 분봉/틱 아카이브 완료]{Colors.RESET} (기준일: {target_date})")
+    logger.info(f" {Colors.GREEN}{Colors.BOLD}📦 [Intraday 분봉/틱 아카이브 완료]{Colors.RESET} (기준일: {target_date}, phase={args.phase})")
     logger.info(f"{Colors.BOLD}{divider}{Colors.RESET}")
     logger.info(f"   • 대상 종목수 : {Colors.CYAN}{len(target_codes):>5}{Colors.RESET} 종목 (당일 + 직전 영업일 워치리스트)")
     logger.info(f"   • 정규 세션   : {Colors.GREEN}{bars_rows:>5,}{Colors.RESET} 행 (1분봉)")

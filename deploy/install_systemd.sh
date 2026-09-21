@@ -17,6 +17,7 @@ systemctl --user enable --now \
   kca-finalize-close.timer \
   kca-paper-entry.timer \
   kca-archive-intraday.timer \
+  kca-archive-intraday-regular.timer \
   kca-price-ingest.timer \
   kca-daily-audit.timer \
   kca-backup.timer \
