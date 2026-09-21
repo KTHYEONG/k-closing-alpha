@@ -771,3 +771,12 @@ def main(argv: list[str] | None = None) -> None:
         snapshot_date,
         len(manifest.entries),
     )
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    # 실측: __main__ 가드가 없어 `python -m`으로 실행해도 main()이 전혀 호출되지 않고
+    # 조용히 성공 종료(exit 0)했다 -- kca-auction-open/kca-auction-close가 매번
+    # "성공"으로 보이면서 실제로는 아무 것도 수집하지 않았다(2026-09-21 daily-audit이
+    # collection:auction_open:1:missing_manifest / auction_close:*:missing_entries로 포착).
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    main()
