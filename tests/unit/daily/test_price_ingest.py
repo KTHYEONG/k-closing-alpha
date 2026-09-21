@@ -367,7 +367,7 @@ def test_merge_and_adjust_scales_history_for_events_and_ignores_gaps() -> None:
         {"date": d[3], "symbol": "E", "open": 5.0, "high": 5.0, "low": 5.0, "close": 5.0, "prev_close": 5.0, "volume": 1.0},
     ])
 
-    merged, events = merge_and_adjust(panel, new, d)
+    merged, events, changed = merge_and_adjust(panel, new, d)
 
     m = merged.set_index(["symbol", "date"])
     # Then: A split 5:1 on 09-10 -> 이전 행 x0.2, 거래량은 원값 유지; the event row itself untouched
@@ -381,6 +381,23 @@ def test_merge_and_adjust_scales_history_for_events_and_ignores_gaps() -> None:
     assert m.loc[("D", d[2]), "close"] == pytest.approx(800.0)
     assert m.loc[("D", d[0]), "volume"] == pytest.approx(500.0)
     assert ("E", d[3]) in m.index
+    # Then: changed mask는 전체 패널이 아니라 신규행 + 소급조정으로 값이 실제로
+    # 바뀐 과거행만 담는다 -- evidence 발행을 패널 전체 크기에서 분리하는 근거.
+    new_keys = set(zip(new["symbol"], new["date"], strict=True))
+    is_new = pd.Series(
+        [(s, dt) in new_keys for s, dt in zip(merged["symbol"], merged["date"], strict=True)], index=merged.index
+    )
+    assert bool((changed >= is_new).all())  # 신규행은 전부 changed에 포함
+    stored = panel.set_index(["symbol", "date"])["close"]
+    for idx, row in merged.loc[~changed].iterrows():
+        key = (row["symbol"], row["date"])
+        assert key in stored.index and not is_new[idx]
+        assert row["close"] == pytest.approx(stored.loc[key])  # changed=False 행은 원본 그대로
+    # D의 09-07/09-08은 두 이벤트(0.5, 2.0)가 상쇄돼 값이 안 바뀌므로 changed에서 빠진다
+    assert not bool(changed[(merged["symbol"] == "D") & (merged["date"] == d[0])].iloc[0])
+    assert not bool(changed[(merged["symbol"] == "D") & (merged["date"] == d[1])].iloc[0])
+    assert bool(changed[(merged["symbol"] == "D") & (merged["date"] == d[2])].iloc[0])  # 09-09는 실값이 바뀜(400->800)
+    assert not bool(changed[(merged["symbol"] == "B") & (merged["date"] == d[0])].iloc[0])  # gap: 이벤트 아님
     got = sorted(zip(events["symbol"], events["date"].dt.strftime("%m-%d"), events["factor"].round(6), strict=True))
     assert got == [("A", "09-10", 0.2), ("D", "09-09", 0.5), ("D", "09-10", 2.0)]
 
@@ -797,7 +814,7 @@ def test_merge_and_adjust_keeps_raw_volume_and_close_raw() -> None:
     new = assemble_new_rows(krx, pd.DataFrame(columns=["date", "symbol", "inst_netbuy", "foreign_netbuy", "program_netbuy"]))
 
     # When
-    merged, events = merge_and_adjust(panel, new, d)
+    merged, events, _changed = merge_and_adjust(panel, new, d)
 
     # Then
     m = merged.set_index("date")
@@ -923,6 +940,33 @@ def test_run_price_ingest_preserves_unadjusted_rows_before_adjustment(monkeypatc
     adj = out[(out["symbol"].astype(str) == "000002") & (pd.to_datetime(out["date"]) == days["2026-09-09"])]
     assert float(adj["close"].iloc[0]) == pytest.approx(4200.0)
     assert list((tmp_path / "capture").rglob("PRICE-adjusted.parquet")) != []
+
+
+def test_run_price_ingest_adjusted_evidence_excludes_untouched_history(monkeypatch, tmp_path) -> None:
+    """실측: 2026-09-21 전체 패널(240MB+)을 그대로 발행해 64MB 아티팩트 상한을 초과,
+    kca-price-ingest가 크래시했다. 무관한 과거 종목의 미변경 행은 evidence에서 빠져야 한다."""
+    import src.daily.price_ingest as mod
+
+    path = tmp_path / "ph.parquet"
+    mod_, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-08", "2026-09-09", "2026-09-10"})
+    rows = _panel_rows("000001", [days["2026-09-07"], days["2026-09-08"], days["2026-09-09"]], [10000.0] * 3)
+    for i in range(50):
+        rows += _panel_rows(f"UNTOUCHED{i:02d}", [days["2026-09-07"]], [1000.0])
+    _write_panel(path, rows)
+    monkeypatch.setattr(mod_, "_capture_root", lambda: tmp_path / "capture")
+    monkeypatch.setattr(mod_.settings, "COLLECTION_RAW_ENABLED", True)
+
+    asyncio.run(mod_.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+    ))
+
+    frames = list((tmp_path / "capture").rglob("PRICE-adjusted.parquet"))
+    assert len(frames) == 1
+    published = pd.read_parquet(frames[0])
+    full_panel = pd.read_parquet(path)
+    assert len(published) < len(full_panel)  # 전체 패널을 통째로 발행하지 않는다
+    assert not (published["symbol"].astype(str).str.startswith("UNTOUCHED")).any()
 
 
 def test_run_price_ingest_adjustment_failure_keeps_raw_evidence(monkeypatch, tmp_path) -> None:

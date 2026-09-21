@@ -648,7 +648,9 @@ def apply_flow_repairs(panel: pd.DataFrame, flows: pd.DataFrame) -> tuple[pd.Dat
     return out, n_filled
 
 
-def merge_and_adjust(panel: pd.DataFrame, new_rows: pd.DataFrame, trading_days: list[pd.Timestamp]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def merge_and_adjust(
+    panel: pd.DataFrame, new_rows: pd.DataFrame, trading_days: list[pd.Timestamp]
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     """Append tail rows and retro-adjust history for corporate actions.
 
     An event exists on a new row when the stored row of the previous trading
@@ -663,7 +665,9 @@ def merge_and_adjust(panel: pd.DataFrame, new_rows: pd.DataFrame, trading_days: 
 
     Returns:
         Tuple of (merged panel sorted by symbol/date, events frame with
-        symbol, date and factor).
+        symbol, date and factor, boolean mask over merged marking rows that
+        are new or were retroactively rescaled -- the bounded evidence set;
+        the full panel can be years of history and must never be published whole).
     """
     merged = pd.concat([panel, new_rows], ignore_index=True)
     if "close_raw" not in merged.columns:
@@ -697,7 +701,8 @@ def merge_and_adjust(panel: pd.DataFrame, new_rows: pd.DataFrame, trading_days: 
     for col in _ADJUSTED_PRICE_COLUMNS:
         merged.loc[touched, col] = merged.loc[touched, col] * scale[touched]
     events = merged.loc[event, ["symbol", "date"]].assign(factor=factor[event].to_numpy()).reset_index(drop=True)
-    return merged, events
+    changed = is_new | touched
+    return merged, events, changed
 
 
 async def run_price_ingest(
@@ -809,7 +814,7 @@ async def run_price_ingest(
             for c in INDEX_COLUMNS
         )
     else:
-        merged, events = merge_and_adjust(panel, new_rows, trading)
+        merged, events, evidence_mask = merge_and_adjust(panel, new_rows, trading)
         merged = attach_index_columns(merged, index_cols)
         changed = True
     window_rows = merged[pd.to_datetime(merged["date"]) >= window[0]]
@@ -822,7 +827,13 @@ async def run_price_ingest(
         write_price_history_parquet(heal_price_history_panel(merged), out_path)
         wrote = True
         if store is not None and run_id is not None and not new_rows.empty:
-            store.publish_frame(merged, context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-adjusted", symbol="adjusted"))
+            # merged는 수년치 전체 패널이라 그대로 발행하면 아티팩트 크기 상한을 넘는다
+            # (실측: 2026-09-21 240MB+ 패널이 64MB 상한을 초과해 크래시). 신규/소급조정
+            # 행만 evidence_mask로 골라 발행해도 "무엇이 바뀌었는지"는 완전히 보존된다.
+            store.publish_frame(
+                merged.loc[evidence_mask],
+                context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-adjusted", symbol="adjusted"),
+            )
     report = IngestReport(
         ingested_dates=[d.strftime("%Y-%m-%d") for d in sorted(fetched)],
         n_new_rows=len(new_rows),
