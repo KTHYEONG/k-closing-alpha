@@ -36,6 +36,16 @@ def _isolate_kis_token_state(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: 
     # parse_decision_shard_credentials가 fail-closed ValueError를 던진다(실측:
     # 2026-09-17 code-sync가 이 누락으로 매일 실패).
     monkeypatch.delenv("KIS_DECISION_SHARD_SLOTS", raising=False)
+    # CollectionSettings(**partial)/`_env_file=None` 은 클래스 전용 dotenv만 끄고
+    # OS 환경변수 소스는 그대로 남긴다. 실호스트의 COLLECTION_AUCTION_ENABLED/
+    # COLLECTION_ALTDATA_ENABLED/COLLECTION_RESEARCH_SLOTS 등이 새어들면
+    # model_validator("legacy operating mode...")와 충돌한다(실측: 2026-09-20
+    # kca-code-sync가 이 누락으로 며칠간 test_gate_failed 반복, 배포 정지).
+    monkeypatch.delenv("COLLECTION_RAW_ENABLED", raising=False)
+    monkeypatch.delenv("COLLECTION_AUCTION_ENABLED", raising=False)
+    monkeypatch.delenv("COLLECTION_ALTDATA_ENABLED", raising=False)
+    monkeypatch.delenv("COLLECTION_RESEARCH_SLOTS", raising=False)
+    monkeypatch.delenv("COLLECTION_ALTDATA_EXTRA_SLOTS", raising=False)
 
 
 @pytest.fixture
