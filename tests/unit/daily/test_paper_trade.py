@@ -358,6 +358,46 @@ def test_run_paper_session_entry_sizes_from_available_cash(tmp_path, monkeypatch
     assert int(nav.iloc[0]["n_open_positions"]) == 2
 
 
+def test_run_paper_session_entry_second_trigger_same_day_is_a_noop(tmp_path, monkeypatch) -> None:
+    """실측: 2026-09-21 kca-finalize-close의 ExecStopPost 체인과 독립 백스톱
+    타이머가 같은 날 entry를 두 번 트리거해, 두 번째 실행이 첫 실행의 지출로
+    줄어든 현금을 기준으로 재사이징하며 017900을 301주->50주로 축소시키고
+    402340/009150 orders 감사기록을 ZERO_QTY로 오기록했다."""
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    kst = "Asia/Seoul"
+    monkeypatch.setattr(paper_trade.settings, "PAPER_SEED_CAPITAL", 10_000_000)
+    ledger = PaperLedger(root=tmp_path)
+    monkeypatch.setattr(
+        paper_trade,
+        "load_topk_decision",
+        lambda _d: pd.DataFrame({"symbol": ["005930"], "allocation": [1.0], "price": [70_000]}),
+    )
+    ts = pd.Timestamp("2026-09-10 15:30:20", tz=kst)
+    monkeypatch.setattr(
+        paper_trade,
+        "fetch_archive_snapshot",
+        lambda _d: pd.DataFrame({"종목코드": ["005930"], "종가": [70_500], "종가_확정": [1.0], "execution_timestamp": [ts]}),
+    )
+
+    # When: ExecStopPost 체인과 백스톱 타이머가 둘 다 같은 날 entry를 트리거한다
+    first = asyncio.run(paper_trade.run_paper_session(pd.Timestamp("2026-09-10"), phase="entry", ledger=ledger, session=None))
+    second = asyncio.run(paper_trade.run_paper_session(pd.Timestamp("2026-09-10"), phase="entry", ledger=ledger, session=None))
+
+    # Then: 두 번째 트리거는 아무것도 하지 않는다 -- 첫 체결이 그대로 남는다
+    assert first == 1
+    assert second == 0
+    fills = pd.read_parquet(tmp_path / "fills.parquet")
+    buy = fills[fills["order_id"] == "2026-09-10:005930:entry"]
+    assert len(buy) == 1
+    assert int(buy.iloc[0]["qty"]) == 141  # 시드 전액(10,000,000/70,500) 기준 최초 사이징, 재축소되지 않음
+
+
 def test_build_exit_orders_emits_market_open_exit_orders() -> None:
     import pandas as pd
 
