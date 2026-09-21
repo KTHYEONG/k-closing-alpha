@@ -21,7 +21,6 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
         "kca-retrain.service",
         "kca-archive-intraday.service",
         "kca-collect.service",
-        "kca-daily-audit.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
@@ -186,7 +185,6 @@ def test_containerized_units_use_shared_image_and_new_env_file() -> None:
     containerized = (
         "kca-archive-intraday.service",
         "kca-collect.service",
-        "kca-daily-audit.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
@@ -368,7 +366,6 @@ def test_containerized_units_preserve_data_and_artifacts_mounts() -> None:
     containerized = (
         "kca-archive-intraday.service",
         "kca-collect.service",
-        "kca-daily-audit.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
@@ -389,7 +386,6 @@ def test_containerized_units_have_no_docker_pull_before_run() -> None:
     containerized = (
         "kca-archive-intraday.service",
         "kca-collect.service",
-        "kca-daily-audit.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
@@ -410,7 +406,6 @@ def test_containerized_units_have_no_unmeasured_resource_caps() -> None:
     containerized = (
         "kca-archive-intraday.service",
         "kca-collect.service",
-        "kca-daily-audit.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
@@ -435,6 +430,7 @@ def test_host_bound_units_remain_bare_metal() -> None:
     host_bound = (
         "kca-backup.service",
         "kca-backup-prune.service",
+        "kca-daily-audit.service",
         "kca-alert@.service",
     )
     for name in host_bound:
@@ -682,8 +678,15 @@ def test_daily_audit_and_backup_normalize_ownership_before_reading_container_wri
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     expected_chown_line = {
-        # kca-backup 은 호스트 rclone 프로세스(ubuntu)로 돌아 컨테이너가 root로 남긴
-        # data/artifacts를 그대로 읽지 못하므로 정규화가 필요하다.
+        # daily_audit는 data/artifacts(파케이 산출물)뿐 아니라 list_stale_kis_tokens가
+        # 읽는 ~/.cache/kis 토큰 캐시도 컨테이너가 root로 남기므로 함께 정규화해야 한다.
+        # systemctl --user list-units(호스트 systemd 세션) 조회가 필요해 Docker화할 수
+        # 없다 -- 실측: 컨테이너 안엔 systemctl이 없어 실패유닛 점검이
+        # "<systemctl unavailable: FileNotFoundError>"로 조용히 무력화됐다.
+        "kca-daily-audit.service": (
+            "ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu "
+            "%h/k-closing-alpha/data %h/k-closing-alpha/artifacts %h/.cache/kis"
+        ),
         "kca-backup.service": (
             "ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu "
             "%h/k-closing-alpha/data %h/k-closing-alpha/artifacts"
@@ -698,7 +701,5 @@ def test_daily_audit_and_backup_normalize_ownership_before_reading_container_wri
         assert chown_idx < exec_start_idx, name
 
     # 컨테이너 유닛 자체는 이미 root로 쓰는 쪽이므로 이 정규화 훅이 필요 없다
-    # (daily-audit도 root로 우선 정규화가 필요 없으니 다른 컨테이너 유닛과 같다)
-    for name in ("kca-collect.service", "kca-daily-audit.service"):
-        text = (root / name).read_text(encoding="utf-8")
-        assert "ExecStartPre=/usr/bin/sudo /usr/bin/chown" not in text
+    collect_text = (root / "kca-collect.service").read_text(encoding="utf-8")
+    assert "ExecStartPre=/usr/bin/sudo /usr/bin/chown" not in collect_text
