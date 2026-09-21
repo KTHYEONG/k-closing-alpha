@@ -100,6 +100,10 @@ jobs:
           docker image prune -f
           # 이 커밋은 위 test job이 이미 pytest 전체스위트로 검증했으므로, 호스트 체크아웃과
           # systemd 유닛(deploy/systemd)을 그대로 이 커밋에 맞춰 수렴시킨다(재테스트 없음).
+          # code_sync.py 자체도 이 체크아웃 안의 파일이므로, 실행 전에 먼저 checkout을
+          # 맞춰야 한다 -- 그렇지 않으면 구버전 code_sync.py가 신규 CLI 인자를 몰라 실패한다.
           cd ~/k-closing-alpha
+          git fetch origin $COMMIT_SHA --quiet
+          git reset --hard $COMMIT_SHA
           ~/.local/bin/uv run python -m src.tools.code_sync --sha $COMMIT_SHA
           EOF
