@@ -27,9 +27,13 @@ uv run python -m src.daily.paper_trade --phase entry
 ```
 
 ### 5. 일중 분봉/틱 아카이브 (`archive_intraday`)
-- **실행 시점**: NXT 애프터마켓 마감 이후 (20:05)
+- **실행 시점 (정규 세션)**: 정규장 마감 직후 (15:40)
 ```bash
-uv run python -m src.daily.archive_intraday
+uv run python -m src.daily.archive_intraday --phase regular
+```
+- **실행 시점 (애프터마켓)**: NXT 애프터마켓 마감 이후 (20:05)
+```bash
+uv run python -m src.daily.archive_intraday --phase aftermarket
 ```
 
 ### 6. 페이퍼 청산 (`paper_trade --phase exit`)
@@ -46,7 +50,8 @@ uv run python -m src.daily.paper_trade --phase exit
 | Mon..Fri 15:21:00 | `kca-predict` | `uv run python -m src.daily.predict` |
 | Mon..Fri 15:30:30 | `kca-finalize-close` | `uv run python -m src.daily.finalize_close` |
 | finalize-close 성공 직후 (`OnSuccess=`) | `kca-paper-entry` | `uv run python -m src.daily.paper_trade --phase entry` |
-| Mon..Fri 20:05 | `kca-archive-intraday` | `uv run python -m src.daily.archive_intraday` |
+| Mon..Fri 15:40 | `kca-archive-intraday-regular` | `uv run python -m src.daily.archive_intraday --phase regular` |
+| Mon..Fri 20:05 | `kca-archive-intraday` | `uv run python -m src.daily.archive_intraday --phase aftermarket` |
 | Mon..Fri 09:00 | `kca-paper-exit` | `uv run python -m src.daily.paper_trade --phase exit` |
 | 부팅 시 1회 | `kca-daily-audit` | `uv run python -m src.tools.daily_audit` |
 
