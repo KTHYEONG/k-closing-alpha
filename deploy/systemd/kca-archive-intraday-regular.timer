@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA intraday archive - regular session (Mon-Fri 15:40 KST, catch-up allowed)
+
+[Timer]
+OnCalendar=Mon..Fri 15:40:00 Asia/Seoul
+Persistent=true
+Unit=kca-archive-intraday-regular.service
+
+[Install]
+WantedBy=timers.target

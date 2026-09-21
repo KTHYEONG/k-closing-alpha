@@ -1,7 +1,7 @@
 [Unit]
 Description=KCA daily audit (visualizes missing steps)
 OnFailure=kca-alert@%n.service
-After=network.target kca-archive-intraday.service
+After=network.target kca-archive-intraday.service kca-archive-intraday-regular.service
 
 [Service]
 Type=oneshot

@@ -1,5 +1,5 @@
 [Unit]
-Description=KCA intraday archive (Mon-Fri 20:05 KST, catch-up allowed)
+Description=KCA intraday archive - NXT/KRX aftermarket only (Mon-Fri 20:05 KST, catch-up allowed)
 
 [Timer]
 OnCalendar=Mon..Fri 20:05:00 Asia/Seoul

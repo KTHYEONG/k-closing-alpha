@@ -20,6 +20,7 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
     containerized = {
         "kca-retrain.service",
         "kca-archive-intraday.service",
+        "kca-archive-intraday-regular.service",
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
@@ -184,6 +185,7 @@ def test_containerized_units_use_shared_image_and_new_env_file() -> None:
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     containerized = (
         "kca-archive-intraday.service",
+        "kca-archive-intraday-regular.service",
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
@@ -299,6 +301,7 @@ def test_kis_cache_mounted_only_for_units_using_kis_client() -> None:
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     needs_kis_cache = (
         "kca-archive-intraday.service",
+        "kca-archive-intraday-regular.service",
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
@@ -323,6 +326,7 @@ def test_kis_using_containerized_units_forward_key_pool_env_and_cache() -> None:
     mount = "-v %h/.cache/kis:/root/.cache/kis"
     kis_units = (
         "kca-archive-intraday.service",
+        "kca-archive-intraday-regular.service",
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
@@ -365,6 +369,7 @@ def test_containerized_units_preserve_data_and_artifacts_mounts() -> None:
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     containerized = (
         "kca-archive-intraday.service",
+        "kca-archive-intraday-regular.service",
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
@@ -385,6 +390,7 @@ def test_containerized_units_have_no_docker_pull_before_run() -> None:
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     containerized = (
         "kca-archive-intraday.service",
+        "kca-archive-intraday-regular.service",
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
@@ -405,6 +411,7 @@ def test_containerized_units_have_no_unmeasured_resource_caps() -> None:
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     containerized = (
         "kca-archive-intraday.service",
+        "kca-archive-intraday-regular.service",
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
