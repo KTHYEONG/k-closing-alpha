@@ -21,6 +21,7 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
         "kca-retrain.service",
         "kca-archive-intraday.service",
         "kca-collect.service",
+        "kca-daily-audit.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
@@ -185,6 +186,7 @@ def test_containerized_units_use_shared_image_and_new_env_file() -> None:
     containerized = (
         "kca-archive-intraday.service",
         "kca-collect.service",
+        "kca-daily-audit.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
@@ -366,6 +368,7 @@ def test_containerized_units_preserve_data_and_artifacts_mounts() -> None:
     containerized = (
         "kca-archive-intraday.service",
         "kca-collect.service",
+        "kca-daily-audit.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
@@ -386,6 +389,7 @@ def test_containerized_units_have_no_docker_pull_before_run() -> None:
     containerized = (
         "kca-archive-intraday.service",
         "kca-collect.service",
+        "kca-daily-audit.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
@@ -406,6 +410,7 @@ def test_containerized_units_have_no_unmeasured_resource_caps() -> None:
     containerized = (
         "kca-archive-intraday.service",
         "kca-collect.service",
+        "kca-daily-audit.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
         "kca-paper-entry.service",
@@ -430,7 +435,6 @@ def test_host_bound_units_remain_bare_metal() -> None:
     host_bound = (
         "kca-backup.service",
         "kca-backup-prune.service",
-        "kca-daily-audit.service",
         "kca-alert@.service",
     )
     for name in host_bound:
@@ -449,22 +453,18 @@ def test_retrain_service_uses_shared_runtime_env_file_not_legacy_dotenv() -> Non
     assert "%h/k-closing-alpha/.env" not in text
 
 
-def test_code_sync_unit_and_timer_restored_for_host_bound_jobs() -> None:
+def test_code_sync_unit_retired_in_favor_of_ci_deploy() -> None:
+    """실무 정리: 호스트 pytest 재실행형 code-sync는 CI(deploy.yml)의 단일
+    커밋 수렴(uv run python -m src.tools.code_sync --sha)으로 대체됐다.
+    운영 시크릿을 물고 호스트에서 전체스위트를 재실행하는 경로가 격리
+    결함에 취약해(실측: 2026-09-16~21) 배포를 며칠간 조용히 막았다."""
     import pathlib
 
     base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
-    service = (base / "systemd" / "kca-code-sync.service").read_text(encoding="utf-8")
-    timer = (base / "systemd" / "kca-code-sync.timer").read_text(encoding="utf-8")
+    assert not (base / "systemd" / "kca-code-sync.service").exists()
+    assert not (base / "systemd" / "kca-code-sync.timer").exists()
     install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
-
-    assert "src.tools.code_sync" in service
-    assert "OnFailure=kca-alert@%n.service" in service
-    assert "%h/.local/bin/" in service
-    assert "Environment=TZ=Asia/Seoul" in service
-    assert "EnvironmentFile=%h/quant-secrets/k-closing-alpha.env" in service
-    assert "Unit=kca-code-sync.service" in timer
-    assert "Persistent=true" in timer
-    assert "kca-code-sync.timer" in install_text
+    assert "kca-code-sync.timer" not in install_text
 
 
 def test_after_ordering_preserved_across_containerization() -> None:
@@ -677,40 +677,13 @@ def test_every_kca_service_loads_shared_runtime_env_file() -> None:
     assert hardcoded == [], hardcoded
 
 
-def test_code_sync_timer_fires_before_morning_price_ingest() -> None:
-    import pathlib
-    import re
-
-    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-
-    def _first_time(name: str) -> str:
-        text = (root / name).read_text(encoding="utf-8")
-        match = re.search(r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})", text)
-        assert match is not None, name
-        return match.group(1)
-
-    warmup_time = _first_time("kca-kis-token-warmup.timer")
-    code_sync_time = _first_time("kca-code-sync.timer")
-    ingest_times = re.findall(
-        r"OnCalendar=.*?(\d{2}:\d{2}:\d{2})",
-        (root / "kca-price-ingest.timer").read_text(encoding="utf-8"),
-    )
-    first_ingest_time = min(ingest_times)
-
-    assert warmup_time < code_sync_time < first_ingest_time
-
-
 def test_daily_audit_and_backup_normalize_ownership_before_reading_container_writes() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     expected_chown_line = {
-        # daily_audit는 data/artifacts(파케이 산출물)뿐 아니라 list_stale_kis_tokens가
-        # 읽는 ~/.cache/kis 토큰 캐시도 컨테이너가 root로 남기므로 함께 정규화해야 한다
-        "kca-daily-audit.service": (
-            "ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu "
-            "%h/k-closing-alpha/data %h/k-closing-alpha/artifacts %h/.cache/kis"
-        ),
+        # kca-backup 은 호스트 rclone 프로세스(ubuntu)로 돌아 컨테이너가 root로 남긴
+        # data/artifacts를 그대로 읽지 못하므로 정규화가 필요하다.
         "kca-backup.service": (
             "ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu "
             "%h/k-closing-alpha/data %h/k-closing-alpha/artifacts"
@@ -725,5 +698,7 @@ def test_daily_audit_and_backup_normalize_ownership_before_reading_container_wri
         assert chown_idx < exec_start_idx, name
 
     # 컨테이너 유닛 자체는 이미 root로 쓰는 쪽이므로 이 정규화 훅이 필요 없다
-    collect_text = (root / "kca-collect.service").read_text(encoding="utf-8")
-    assert "ExecStartPre=/usr/bin/sudo /usr/bin/chown" not in collect_text
+    # (daily-audit도 root로 우선 정규화가 필요 없으니 다른 컨테이너 유닛과 같다)
+    for name in ("kca-collect.service", "kca-daily-audit.service"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "ExecStartPre=/usr/bin/sudo /usr/bin/chown" not in text

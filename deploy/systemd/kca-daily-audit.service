@@ -9,5 +9,4 @@ WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 EnvironmentFile=%h/quant-secrets/kis-data.env
 Environment=TZ=Asia/Seoul
-ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts %h/.cache/kis
-ExecStart=%h/.local/bin/uv run python -m src.tools.daily_audit
+ExecStart=/usr/bin/docker run --rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.tools.daily_audit

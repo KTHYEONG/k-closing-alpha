@@ -78,13 +78,14 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      - name: Pull latest image on VPS over Tailscale
+      - name: Pull latest image and converge host units on VPS over Tailscale
         env:
           SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           HOST: ${{ secrets.HOST }}
           REMOTE_USER: ${{ secrets.USERNAME }}
           GHCR_USER: ${{ github.repository_owner }}
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
@@ -97,4 +98,8 @@ jobs:
           echo '$GHCR_PAT' | docker login ghcr.io -u '$GHCR_USER' --password-stdin
           docker pull ghcr.io/kthyeong/k-closing-alpha:latest
           docker image prune -f
+          # 이 커밋은 위 test job이 이미 pytest 전체스위트로 검증했으므로, 호스트 체크아웃과
+          # systemd 유닛(deploy/systemd)을 그대로 이 커밋에 맞춰 수렴시킨다(재테스트 없음).
+          cd ~/k-closing-alpha
+          ~/.local/bin/uv run python -m src.tools.code_sync --sha $COMMIT_SHA
           EOF

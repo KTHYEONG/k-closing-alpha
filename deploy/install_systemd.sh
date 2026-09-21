@@ -22,8 +22,7 @@ systemctl --user enable --now \
   kca-backup.timer \
   kca-backup-prune.timer \
   kca-retrain.timer \
-  kca-kis-token-warmup.timer \
-  kca-code-sync.timer
+  kca-kis-token-warmup.timer
 
 # Keep user timers alive without an active login session (WSL).
 loginctl enable-linger "${USER}"
