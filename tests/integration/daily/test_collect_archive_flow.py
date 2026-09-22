@@ -451,3 +451,73 @@ def test_collect_main_marks_breadth_failed_when_panel_loads_but_breadth_is_nan(m
     stored = captured["df"]
     assert math.isnan(stored["market_breadth"].iloc[0])
     assert stored["시장폭_실패"].iloc[0] == True  # noqa: E712
+
+
+def test_collect_in_tests_never_touches_real_data_dir(monkeypatch, tmp_path) -> None:
+    """Collect in tests never touches the real data dir (fixture-cohort collect)."""
+    import asyncio
+
+    from src import settings as live_settings
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+
+    monkeypatch.setenv("KIS_DATA_1_HTS_ID", "TEST")
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
+    monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda **kw: _FakeSession())
+
+    async def _fake_scan(client, session, **kwargs):
+        return [
+            {"code": "000001", "name": "AAA", "price": "18000", "chgrate": "5.0"},
+            {"code": "000004", "name": "DDD", "price": "30000", "chgrate": "5.0"},
+        ]
+
+    async def _fake_fetch_all(stock_list, client, session, **_kwargs):
+        rows = [
+            {"종목명": "AAA", "종목코드": "000001", "시장구분": "KOSPI", "시가": 17900.0,
+             "고가": 18100.0, "저가": 17800.0, "종가": 18000.0, "전일종가": 17142.86,
+             "거래량": 1_000_000, "거래대금": 500.0, "시가총액": 3000.0,
+             "기관_순매수": 10.0, "외국인_순매수": 5.0, "등락률": 5.0, "현재가_실패": False},
+            {"종목명": "DDD", "종목코드": "000004", "시장구분": "KOSPI", "시가": 29900.0,
+             "고가": 30100.0, "저가": 29800.0, "종가": 30000.0, "전일종가": 28571.43,
+             "거래량": 800_000, "거래대금": 400.0, "시가총액": 5000.0,
+             "기관_순매수": 8.0, "외국인_순매수": 6.0, "등락률": 5.0, "현재가_실패": False},
+        ]
+        return rows, []
+
+    monkeypatch.setattr(collect, "fetch_candidate_stock_list", _fake_scan)
+    monkeypatch.setattr(collect, "fetch_all_stock_data", _fake_fetch_all)
+
+    captured = {}
+
+    def _fake_upsert(df, snapshot_date=None):
+        captured["df"] = df.copy()
+        return len(df)
+
+    monkeypatch.setattr(collect.archive, "upsert_archive_snapshot", _fake_upsert)
+
+    asyncio.run(collect.main(force=True))
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    snapshot_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+    store = CaptureStore(collect._capture_root())
+    manifests = store.read_manifests(snapshot_date)
+    assert manifests, "decision manifest must exist under the temp capture root"
+    assert store.root == live_settings.HISTORY_DIR / "capture"
+    project_data = (live_settings.BASE_DIR / "data").resolve()
+    resolved_history = live_settings.HISTORY_DIR.resolve()
+    assert resolved_history != project_data / "history"
+    assert project_data not in [resolved_history, *resolved_history.parents]
+
+
+def test_host_collection_root_does_not_leak(monkeypatch) -> None:
+    """Host COLLECTION_ROOT does not leak into freshly constructed settings."""
+    import os
+
+    from src.config.collection import CollectionSettings
+
+    monkeypatch.setenv("COLLECTION_ROOT", "/sentinel/collect")
+    monkeypatch.delenv("COLLECTION_ROOT", raising=False)
+    assert os.environ.get("COLLECTION_ROOT") is None
+    assert CollectionSettings().COLLECTION_ROOT is None

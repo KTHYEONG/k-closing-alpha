@@ -10,17 +10,21 @@ import pytest
 CAL = pd.bdate_range("2015-11-02", "2026-09-11")
 
 
-def _krx_raw(rows: list[dict], market: str = "KOSPI") -> pd.DataFrame:
-    return pd.DataFrame([
-        {
-            "ISU_CD": r["symbol"], "MKT_NM": market, "TDD_OPNPRC": str(r.get("open", r["close"])),
+def _krx_raw(rows: list[dict], market: str = "KOSPI", bas_dd: str = "20260910") -> pd.DataFrame:
+    frames = []
+    for r in rows:
+        diff = r["close"] - r["prev_close"]
+        base = r["prev_close"]
+        fluc = round(diff / base * 100, 2) if base else 0.0
+        frames.append({
+            "ISU_CD": r["symbol"], "MKT_NM": market, "BAS_DD": bas_dd, "FLUC_RT": str(fluc),
+            "TDD_OPNPRC": str(r.get("open", r["close"])),
             "TDD_HGPRC": str(r.get("high", r["close"])), "TDD_LWPRC": str(r.get("low", r["close"])),
-            "TDD_CLSPRC": str(r["close"]), "CMPPREVDD_PRC": str(r["close"] - r["prev_close"]),
+            "TDD_CLSPRC": str(r["close"]), "CMPPREVDD_PRC": str(diff),
             "ACC_TRDVOL": str(r.get("volume", 1000)), "ACC_TRDVAL": str(r.get("value", 5_000_000_000)),
             "MKTCAP": str(r.get("mcap", 100_000_000_000)),
-        }
-        for r in rows
-    ])
+        })
+    return pd.DataFrame(frames)
 
 
 class FakeKis:
@@ -418,7 +422,7 @@ def _orchestrate_fakes(monkeypatch, published: set[str]):
         calls.append(key)
         if key not in published:
             return pd.DataFrame(columns=list(mod.KRX_ROW_COLUMNS))
-        return mod.normalize_krx_daily(_krx_raw(krx[key]), pd.Timestamp(key))
+        return mod.normalize_krx_daily(_krx_raw(krx[key], bas_dd=pd.Timestamp(key).strftime("%Y%m%d")), pd.Timestamp(key))
 
     monkeypatch.setattr(mod, "fetch_krx_daily", _fetch)
     return mod, days, calls
@@ -1098,3 +1102,207 @@ def test_price_page_observer_capture_failure_propagates(tmp_path) -> None:
     observer = mod._price_page_observer(store, pd.Timestamp("2026-09-10").date(), "run-boom")
     with pytest.raises(RawCaptureError):
         observer({"a": 1}, {"endpoint": "stk"}, datetime.now(SEOUL), datetime.now(SEOUL), 0, 0)
+
+
+def _day_rows(day: str, symbols: list[str], closes: dict[str, float] | None = None, volume: float = 1000.0) -> pd.DataFrame:
+    vals = [float(closes[s]) if closes and s in closes else 100.0 for s in symbols]
+    return pd.DataFrame({
+        "date": pd.Timestamp(day), "symbol": symbols,
+        "open": vals, "high": vals, "low": vals, "close": vals, "prev_close": vals,
+        "volume": float(volume), "trade_value_100m": 50.0, "market_cap_100m": 1000.0, "market": "KOSPI",
+    })
+
+
+def test_validate_krx_daily_block_rejects_date_mismatch() -> None:
+    from src.daily.price_ingest import KrxIntegrityError, normalize_krx_daily
+
+    raw = _krx_raw([{"symbol": "005930", "close": 70000, "prev_close": 68000}], "KOSPI", bas_dd="20260909")
+
+    with pytest.raises(KrxIntegrityError, match="BAS_DD") as exc:
+        normalize_krx_daily(raw, pd.Timestamp("2026-09-10"))
+    assert "KOSPI" in str(exc.value) and "005930" in str(exc.value)
+
+
+def test_normalize_krx_daily_rejects_missing_integrity_columns() -> None:
+    from src.daily.price_ingest import normalize_krx_daily
+
+    raw = _krx_raw([{"symbol": "000001", "close": 100, "prev_close": 100}]).drop(columns=["FLUC_RT"])
+
+    with pytest.raises(ValueError, match="FLUC_RT"):
+        normalize_krx_daily(raw, pd.Timestamp("2026-09-10"))
+
+
+def test_validate_krx_daily_block_rejects_zero_base() -> None:
+    from src.daily.price_ingest import KrxIntegrityError, normalize_krx_daily
+
+    raw = _krx_raw([{"symbol": "000001", "close": 100, "prev_close": 100}])
+    raw.loc[:, "CMPPREVDD_PRC"] = raw["TDD_CLSPRC"]
+
+    with pytest.raises(KrxIntegrityError, match="base"):
+        normalize_krx_daily(raw, pd.Timestamp("2026-09-10"))
+
+
+def test_validate_krx_daily_block_rejects_negative_base() -> None:
+    from src.daily.price_ingest import KrxIntegrityError, normalize_krx_daily
+
+    raw = _krx_raw([{"symbol": "000001", "close": 100, "prev_close": 90}])
+    raw.loc[:, "CMPPREVDD_PRC"] = "150"
+
+    with pytest.raises(KrxIntegrityError, match="base"):
+        normalize_krx_daily(raw, pd.Timestamp("2026-09-10"))
+
+
+def test_validate_krx_daily_block_rejects_non_positive_close() -> None:
+    from src.daily.price_ingest import KrxIntegrityError, normalize_krx_daily
+
+    raw = _krx_raw([{"symbol": "000001", "close": 5000, "prev_close": 5000, "volume": 0}])
+    raw.loc[:, "TDD_OPNPRC"] = "0"
+    raw.loc[:, "TDD_HGPRC"] = "0"
+    raw.loc[:, "TDD_LWPRC"] = "0"
+    raw.loc[:, "TDD_CLSPRC"] = "0"
+
+    with pytest.raises(KrxIntegrityError, match="close"):
+        normalize_krx_daily(raw, pd.Timestamp("2026-09-10"))
+
+
+def test_validate_krx_daily_block_rejects_fluc_rate_disagreement() -> None:
+    from src.daily.price_ingest import KrxIntegrityError, normalize_krx_daily
+
+    raw = _krx_raw([{"symbol": "000001", "close": 4700, "prev_close": 3700}])
+    raw.loc[:, "FLUC_RT"] = "370.0"
+
+    with pytest.raises(KrxIntegrityError, match="cross-check"):
+        normalize_krx_daily(raw, pd.Timestamp("2026-09-10"))
+    raw.loc[:, "FLUC_RT"] = "N/A"
+    with pytest.raises(KrxIntegrityError, match="cross-check"):
+        normalize_krx_daily(raw, pd.Timestamp("2026-09-10"))
+
+
+def test_validate_krx_daily_block_tolerates_fluc_rate_rounding() -> None:
+    from src.daily.price_ingest import normalize_krx_daily
+
+    out = normalize_krx_daily(_krx_raw([{"symbol": "000001", "close": 4150, "prev_close": 4110}]), pd.Timestamp("2026-09-10"))
+
+    assert out.iloc[0]["prev_close"] == 4110
+
+
+def test_validate_krx_daily_block_rejects_traded_ohlc_inconsistency() -> None:
+    from src.daily.price_ingest import KrxIntegrityError, normalize_krx_daily
+
+    raw = _krx_raw([{"symbol": "000001", "close": 100, "prev_close": 100}])
+    raw.loc[:, "TDD_HGPRC"] = "90"
+
+    with pytest.raises(KrxIntegrityError, match="ohlc"):
+        normalize_krx_daily(raw, pd.Timestamp("2026-09-10"))
+
+
+def test_validate_krx_daily_block_accepts_untraded_zero_ohlc_row() -> None:
+    from src.daily.price_ingest import normalize_krx_daily
+
+    raw = _krx_raw([{"symbol": "000001", "close": 5000, "prev_close": 5000, "volume": 0}])
+    raw.loc[:, "TDD_OPNPRC"] = "0"
+    raw.loc[:, "TDD_HGPRC"] = "0"
+    raw.loc[:, "TDD_LWPRC"] = "0"
+
+    out = normalize_krx_daily(raw, pd.Timestamp("2026-09-10"))
+
+    assert out.iloc[0]["prev_close"] == 5000
+
+
+def test_merge_and_adjust_applies_legit_reverse_split() -> None:
+    from src.daily.price_ingest import merge_and_adjust, normalize_krx_daily
+
+    d = [pd.Timestamp(x) for x in ("2026-09-08", "2026-09-09", "2026-09-10")]
+    panel = pd.DataFrame(_panel_rows("A", d[:2], [2000.0, 2000.0]))
+    new = normalize_krx_daily(_krx_raw([{"symbol": "A", "close": 10500, "prev_close": 10000, "volume": 5000}]), d[2])
+
+    merged, events, _changed = merge_and_adjust(panel, new, d)
+
+    assert len(events) == 1 and events["factor"].iloc[0] == pytest.approx(5.0)
+    m = merged.set_index("date")
+    assert m.loc[d[0], "close"] == pytest.approx(10000.0)
+    assert m.loc[d[0], "close_raw"] == pytest.approx(2000.0)
+    assert m.loc[d[0], "volume"] == pytest.approx(1000.0)
+    assert m.loc[d[2], "close_raw"] == pytest.approx(10500.0)
+
+
+def test_check_day_continuity_rejects_truncated_day() -> None:
+    from src.daily.price_ingest import KrxIntegrityError, check_day_continuity
+
+    syms = [f"S{i:03d}" for i in range(100)]
+    prior = _day_rows("2026-09-09", syms)
+    new = _day_rows("2026-09-10", syms[:90])
+
+    with pytest.raises(KrxIntegrityError, match="row_ratio"):
+        check_day_continuity(new, prior)
+
+
+def test_check_day_continuity_rejects_stale_copy_day() -> None:
+    from src.daily.price_ingest import KrxIntegrityError, check_day_continuity
+
+    syms = [f"S{i:03d}" for i in range(100)]
+    prior = _day_rows("2026-09-09", syms)
+    new = _day_rows("2026-09-10", syms)
+
+    with pytest.raises(KrxIntegrityError, match="stale_share"):
+        check_day_continuity(new, prior)
+
+
+def test_check_day_continuity_passes_normal_day() -> None:
+    from src.daily.price_ingest import check_day_continuity
+
+    syms = [f"S{i:04d}" for i in range(1000)]
+    prior = _day_rows("2026-09-09", syms, {s: 100.0 + i for i, s in enumerate(syms)})
+    bumped = {s: 101.0 + i for i, s in enumerate(syms[:998])}
+    bumped[syms[0]] = 100.0
+    new = _day_rows("2026-09-10", syms[:998], bumped)
+
+    check_day_continuity(new, prior)
+
+
+def test_run_price_ingest_integrity_failure_leaves_panel_untouched(monkeypatch, tmp_path) -> None:
+    import hashlib
+
+    import src.daily.price_ingest as mod
+
+    path = tmp_path / "ph.parquet"
+    days = {x: pd.Timestamp(x) for x in ("2026-09-08", "2026-09-09", "2026-09-10")}
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _strict(ep, ymd, cfg, *, on_page=None):
+        if ep == mod.KRX_ENDPOINT_STK_DAILY:
+            return _krx_raw([{"symbol": "000001", "close": 10500, "prev_close": 10000}], "KOSPI", bas_dd=ymd)
+        frame = _krx_raw([{"symbol": "900001", "close": 50, "prev_close": 50}], "KOSDAQ", bas_dd=ymd)
+        frame.loc[:, "BAS_DD"] = "20260909"
+        return frame
+
+    monkeypatch.setattr(mod, "fetch_krx_openapi_day_strict", _strict)
+    outcomes: list = []
+
+    with pytest.raises(mod.KrxIntegrityError):
+        asyncio.run(mod.run_price_ingest(
+            today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+            kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+            on_outcome=lambda outcome, **kw: outcomes.append(outcome),
+        ))
+
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    assert "OK" not in outcomes
+
+
+def test_check_day_continuity_skips_when_prior_empty() -> None:
+    from src.daily.price_ingest import check_day_continuity
+
+    new = _day_rows("2026-09-10", ["A", "B"])
+
+    check_day_continuity(new, pd.DataFrame())
+
+
+def test_check_day_continuity_skips_stale_check_without_common_traded_symbols() -> None:
+    from src.daily.price_ingest import check_day_continuity
+
+    prior = _day_rows("2026-09-09", [f"P{i:03d}" for i in range(100)])
+    new = _day_rows("2026-09-10", [f"N{i:03d}" for i in range(100)])
+
+    check_day_continuity(new, prior)
