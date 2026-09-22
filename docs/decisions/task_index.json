@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "INTRADAY_ARCHIVE_CONCURRENCY_AND_WRITE_BATCHING",
+      "date": "2026-09-22",
+      "adr_id": "ADR_20260922_INTRADAY_ARCHIVE_CONCURRENCY_AND_WRITE_BATCHING",
+      "domain": "data_collection",
+      "title": "인트라데이 틱/1분봉 아카이브 동시성 도입 및 쓰기 배치화",
+      "why": "evidence-capture 도입 과정에서 _collect_with_observer의 동시성이 유실되어 583종목이 완전 순차 처리됐고, 종목마다 파케이 전체를 재작성해 실측상 쓰기만으로 207.67초(배치 시 0.53초)가 소요됨",
+      "resolution": "COLLECTION_CONCURRENCY_PER_KEY 기반 세마포어를 _collect_with_observer에 배선하고, publish_bars/ticks 등 5개 on_symbol 콜백을 _BatchedPartitionPublisher로 묶어 종목별 즉시쓰기를 배치 flush로 전환",
+      "impact": "틱/1분봉 5개 세션 파티션 전부에서 네트워크 대기 병렬화 + 쓰기비용 최대 ~390배 감소로 저녁 아카이브 전체 소요시간 대폭 단축",
+      "caveat": "raw evidence는 CaptureStore에 종목별 즉시 저장되어 배치 flush로도 크래시 시 재수집 손실 없음; 배치 크기(COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE, 기본 25)는 크래시 시 재수집 범위와 트레이드오프"
+    },
+    {
       "task_id": "SECURITY_CLASSIFICATION_UNIVERSE_FILTER",
       "date": "2026-09-22",
       "adr_id": "ADR_20260922_SECURITY_CLASSIFICATION_UNIVERSE_FILTER",
@@ -996,26 +1007,6 @@
       "why": "The project's only cost model was one unmeasured constant (20bp) despite it being the actual binding constraint on the closing-auction strategy, not prediction quality",
       "resolution": "Added src/execution/cost_model.py (KRX tick-band spread, statutory cost, measured decision-to-auction impact) wired to champion.py tuning_provenance only; fixed the same raw-KIS-partition symbol bug already found in buyability.py",
       "impact": "Measured round-trip cost 47-51bp vs strategy break-even 40.6bp -- real cost exceeds break-even, invalidating every prior backtest that assumed the flat 20bp constant"
-    },
-    {
-      "task_id": "BUYABILITY_GATED_RERANKER",
-      "date": "2026-09-05",
-      "adr_id": "ADR_20260905_BUYABILITY_GATED_RERANKER",
-      "domain": "quant",
-      "title": "Buyability-Gated Reranker Sleeve Evaluation",
-      "why": "Reranker top-1 alpha headline was dominated by +30% ceiling-close picks whose closing auction rarely matched, and by pooling those with the ordinary sleeve",
-      "resolution": "Added src/ml/buyability.py (ceiling flag, auction liquidity attach, fill-ratio gate, fillable/ceiling/pooled sleeve eval); fixed 종목코드-keyed raw KIS partitions being silently ungrouped; wired to champion.py tuning_provenance only, opt-in via buyability_target_notional_100m",
-      "impact": "2026 (100% intraday coverage) fillable-sleeve top1 +3.19%->+0.71% and rankIC +0.160->-0.0004 vs pooled -- prior saturation conclusion in docs/results/ml-res.md was measured on a partly unfillable metric"
-    },
-    {
-      "task_id": "TASK_THEME_GSHEET_SYNC_DEPRECATION",
-      "date": "2026-09-05",
-      "adr_id": "ADR_20260905_THEME_GSHEET_SYNC_DEPRECATION",
-      "domain": "data_collection",
-      "title": "코드_테마_DB 시트 동기화 제거 및 WSL 데이터 통합",
-      "why": "테마/섹터·시장구분 기록이 수동 스프레드시트에서 theme_resolver 자동 분류로 전환되어 코드_테마_DB 워크시트가 폐지됨",
-      "resolution": "sync_sheet_db.py의 sync_theme_only 및 관련 GSheet 역기록 경로 제거, Windows 로컬 사본 데이터(archive/theme/daily_stocks)를 WSL로 무손실 병합 후 단일 운영 환경으로 통합",
-      "impact": "daily 파이프라인 시트 의존성 감소 및 WSL/Windows 이중 실행으로 인한 데이터 분기(split-brain) 해소"
     }
   ]
 }
