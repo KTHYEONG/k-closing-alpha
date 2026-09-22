@@ -18,11 +18,14 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.data.intraday_store import _capture_root
+
 logger = logging.getLogger(__name__)
 
 BACKUP_REMOTE_ROOT: str = "gdrive:quant-lake/live/k-closing-alpha/_deleted"
 BACKUP_SUBTREES: tuple[str, ...] = ("data", "artifacts")
 BACKUP_RETENTION_DAYS: int = 30
+LOCAL_INTRADAY_BACKUP_RETENTION_DAYS: int = 3
 RCLONE_TIMEOUT_SEC: int = 600
 # rclone 문서화된 종료코드: 3 = directory not found (아직 한 번도 옮겨진 파일이 없는 하위 트리)
 RCLONE_EXIT_DIRECTORY_NOT_FOUND: int = 3
@@ -100,12 +103,55 @@ def prune_backups(
     return purged
 
 
+def prune_local_intraday_backups(
+    *,
+    today: pd.Timestamp,
+    backups_root: Path | None = None,
+    retention_days: int = LOCAL_INTRADAY_BACKUP_RETENTION_DAYS,
+) -> list[str]:
+    """intraday 파티션 교체-직전 로컬 스냅샷 중 보존기간이 지난 것을 삭제한다.
+
+    src.data.intraday_store._retain_backup_ref가 파티션을 교체할 때마다
+    <backups_root>/<session>/<snapshot_date>/ 아래 하드링크 스냅샷을 남기지만
+    회수 로직이 없어 무한 누적된다(실측 3GB/일). daily_audit가 당일 저녁
+    이상을 감지하므로 retention_days 경과 후엔 복구 목적의 가치가 없다.
+
+    Args:
+        today: 기준일(KST, tz 미보유 자정 정규화 Timestamp) — expired_snapshot_dirs와
+            동일한 규약.
+        backups_root: <capture_root>/backups/intraday 루트. None이면
+            src.data.intraday_store._capture_root() 기준으로 해석한다(테스트 주입용).
+        retention_days: 보존일수.
+
+    Returns:
+        삭제된 `<session>/<date>` 디렉터리 경로 문자열 목록(정렬됨). 루트가
+        아직 존재하지 않으면(백업이 한 번도 생성된 적 없음) 빈 리스트.
+
+    Raises:
+        OSError: 디렉터리 삭제 실패(권한 등) — 부분 삭제 상태를 침묵하지 않는다.
+    """
+    root = backups_root if backups_root is not None else _capture_root() / "backups" / "intraday"
+    if not root.exists():
+        return []
+    purged: list[str] = []
+    for session_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        names = [p.name for p in session_dir.iterdir() if p.is_dir()]
+        for name in expired_snapshot_dirs(names, today, retention_days):
+            shutil.rmtree(session_dir / name)
+            purged.append(f"{session_dir.name}/{name}")
+    return sorted(purged)
+
+
 def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry; logic covered via prune_backups scenarios
     parser = argparse.ArgumentParser(description="Purge _deleted backup snapshots older than the retention window")
     parser.parse_args(argv)
     today = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None).normalize()
     purged = prune_backups(today=today)
-    logger.info("[SYS] stage=backup_prune purged=%d targets=%s", len(purged), purged)
+    local_purged = prune_local_intraday_backups(today=today)
+    logger.info(
+        "[SYS] stage=backup_prune purged=%d targets=%s local_purged=%d local_targets=%s",
+        len(purged), purged, len(local_purged), local_purged,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

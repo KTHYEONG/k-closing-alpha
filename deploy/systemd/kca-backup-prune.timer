@@ -1,8 +1,8 @@
 [Unit]
-Description=KCA offsite backup retention prune (monthly, 1st 21:00 KST)
+Description=KCA offsite backup retention prune (weekdays 21:00 KST)
 
 [Timer]
-OnCalendar=*-*-01 21:00:00 Asia/Seoul
+OnCalendar=Mon..Fri 21:00:00 Asia/Seoul
 Persistent=true
 Unit=kca-backup-prune.service
 
