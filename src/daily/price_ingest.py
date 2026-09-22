@@ -1022,7 +1022,11 @@ async def run_price_ingest(
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    asyncio.run(run_price_ingest(on_outcome=functools.partial(record_run_outcome, "price_ingest")))
+    report = asyncio.run(run_price_ingest(on_outcome=functools.partial(record_run_outcome, "price_ingest")))
+    if report.ingested_dates:
+        from src.daily.security_classification import run_security_classification_ingest
+
+        run_security_classification_ingest([pd.Timestamp(d) for d in report.ingested_dates])
     from src.strategy.growth_shadow import run_growth_shadow
 
     run_growth_shadow()

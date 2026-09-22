@@ -35,6 +35,7 @@ from src.daily.universe_scan import fetch_candidate_stock_list, fetch_trade_valu
 from src.data.trading_calendar import is_kis_trading_day
 from src.ml.topk_history_features import MAX_PREV_TRADING_DAY_LOOKBACK
 from src.daily.universe_screen import build_screen_frame
+from src.daily.security_classification import load_security_classification
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, PRICE_ANOMALY_COL, QUOTE_FAILED_COL
 from src.strategy.contract import COST_AWARE_UNIVERSE, UniverseSpec, select_universe
 
@@ -375,8 +376,10 @@ async def resolve_eligible_codes(client: Any, session: Any, decision_date: pd.Ti
     """Resolve eligibility through the async KIS calendar before quoting."""
     prev = await resolve_prev_trading_day_kis(client, session, decision_date)
     listed = load_eligible_codes(decision_date, prev_trading_day=prev)
-    logger.info("[DATA] stage=eligibility n_listed=%d", len(listed))
-    return listed
+    screenable = load_security_classification(decision_date, prev_trading_day=prev)
+    eligible = listed & screenable
+    logger.info("[DATA] stage=eligibility n_listed=%d n_screenable=%d n_eligible=%d", len(listed), len(screenable), len(eligible))
+    return eligible
 
 
 def filter_eligible_candidates(stock_list: list[dict], eligible_codes: frozenset[str]) -> list[dict]:
