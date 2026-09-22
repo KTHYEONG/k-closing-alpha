@@ -561,3 +561,90 @@ def test_max_tick_cost_bp_reaches_both_universe_implementations() -> None:
     # And: 넓은 학습 스펙은 비용축을 계속 적용하지 않는다 (중첩 규약)
     assert contract.DEFAULT_UNIVERSE.max_tick_cost_bp is None
     assert contract.CAPFREE_UNIVERSE.max_tick_cost_bp is None
+
+
+def test_select_universe_default_toggle_leaves_screens_identical() -> None:
+    import pandas as pd
+
+    from src.strategy.contract import COST_AWARE_UNIVERSE, DEFAULT_UNIVERSE, select_universe
+
+    df = pd.DataFrame(
+        {
+            "chg_ratio": [0.05, 0.05],
+            "tv_clean": [500.0, 500.0],
+            "mc_clean": [800.0, 800.0],
+            "close": [1000.0, 1000.0],
+            "volume": [10, 10],
+            "is_ceiling": [False, False],
+        }
+    )
+    assert DEFAULT_UNIVERSE.exclude_non_screenable_class is False
+    assert COST_AWARE_UNIVERSE.exclude_non_screenable_class is False
+    assert select_universe(df, DEFAULT_UNIVERSE).tolist() == [True, True]
+
+
+def test_select_universe_opt_in_without_column_fails_closed() -> None:
+    import dataclasses
+
+    import pandas as pd
+    import pytest
+
+    from src.strategy.contract import DEFAULT_UNIVERSE, select_universe
+
+    df = pd.DataFrame(
+        {
+            "chg_ratio": [0.05],
+            "tv_clean": [500.0],
+            "mc_clean": [800.0],
+            "close": [1000.0],
+            "volume": [10],
+            "is_ceiling": [False],
+        }
+    )
+    spec = dataclasses.replace(DEFAULT_UNIVERSE, exclude_non_screenable_class=True)
+    with pytest.raises(ValueError, match="is_screenable"):
+        select_universe(df, spec)
+
+
+def test_select_universe_excludes_non_screenable_row() -> None:
+    import dataclasses
+
+    import pandas as pd
+
+    from src.strategy.contract import DEFAULT_UNIVERSE, select_universe
+
+    df = pd.DataFrame(
+        {
+            "chg_ratio": [0.05, 0.05],
+            "tv_clean": [500.0, 500.0],
+            "mc_clean": [800.0, 800.0],
+            "close": [1000.0, 1000.0],
+            "volume": [10, 10],
+            "is_ceiling": [False, False],
+            "is_screenable": [False, True],
+        }
+    )
+    spec = dataclasses.replace(DEFAULT_UNIVERSE, exclude_non_screenable_class=True)
+    assert select_universe(df, spec).tolist() == [False, True]
+
+
+def test_select_universe_screenable_row_matches_toggle_off() -> None:
+    import dataclasses
+
+    import pandas as pd
+
+    from src.strategy.contract import DEFAULT_UNIVERSE, select_universe
+
+    df = pd.DataFrame(
+        {
+            "chg_ratio": [0.05, 0.15],
+            "tv_clean": [500.0, 500.0],
+            "mc_clean": [800.0, 800.0],
+            "close": [1000.0, 1000.0],
+            "volume": [10, 10],
+            "is_ceiling": [False, False],
+            "is_screenable": [True, True],
+        }
+    )
+    spec_on = dataclasses.replace(DEFAULT_UNIVERSE, exclude_non_screenable_class=True)
+    assert select_universe(df, spec_on).tolist() == select_universe(df, DEFAULT_UNIVERSE).tolist()
