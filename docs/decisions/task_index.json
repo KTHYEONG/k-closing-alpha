@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_COLLECTION_INTEGRITY_GUARDS",
+      "date": "2026-09-22",
+      "adr_id": "ADR_20260922_COLLECTION_INTEGRITY_GUARDS",
+      "domain": "data_collection",
+      "title": "수집 무결성 가드: 코호트 오염 차단 + KRX 벤더값 검증",
+      "why": "구 kca-code-sync 호스트 pytest 게이트가 운영 capture store에 픽스처 코호트(000001/000004,000001/000009) 105건을 오염시켜 09-18 실분봉 유실, 09-21에 전부 0인 000001 632행 혼입; price_ingest 기업행사 소급조정도 벤더 기준가를 무검증 신뢰해 base<=0/전일복사 시 종목 전체이력 오스케일 가능",
+      "resolution": "conftest에 data 폴더 경로 11종 자동격리 fixture 추가, archive_intraday에 코호트-패널 대조 검증(_verify_cohort_against_panel) 추가로 오염코호트 fail-closed, price_ingest에 validate_krx_daily_block(BAS_DD/FLUC_RT 교차검증/OHLC 일관성)과 check_day_continuity(행수비율/stale비중) 추가; or-vps 운영 저장소의 기존 오염물 105 manifest+632행을 data/quarantine/로 격리",
+      "impact": "테스트가 운영 데이터를 다시 오염시킬 경로 차단, 벤더 기준가 불량으로 인한 소급 재조정 오염을 쓰기 전에 차단(fail-closed+알림), 실측 근거(KRX FLUC_RT 교차오차 max 7e-5, 행수비율 하한 0.97, stale비중 상한 0.05)로 고정 배율상한 없이 가드 확보",
+      "caveat": "09-18 분봉 재수집은 미실행(KIS 보존기간 약 1년 내 가능); or-vps 배포는 아직 안 됨, code_sync fast-forward 시 반영"
+    },
+    {
       "task_id": "ADR_20260922_vps_unattended_stability",
       "date": "2026-09-22",
       "adr_id": "ADR_20260922_ADR_20260922_vps_unattended_stability",
@@ -994,16 +1005,6 @@
       "why": "테마/섹터·시장구분 기록이 수동 스프레드시트에서 theme_resolver 자동 분류로 전환되어 코드_테마_DB 워크시트가 폐지됨",
       "resolution": "sync_sheet_db.py의 sync_theme_only 및 관련 GSheet 역기록 경로 제거, Windows 로컬 사본 데이터(archive/theme/daily_stocks)를 WSL로 무손실 병합 후 단일 운영 환경으로 통합",
       "impact": "daily 파이프라인 시트 의존성 감소 및 WSL/Windows 이중 실행으로 인한 데이터 분기(split-brain) 해소"
-    },
-    {
-      "task_id": "TASK_DAILY_CANDIDATE_PANEL_AUTOMATION",
-      "date": "2026-09-05",
-      "adr_id": "ADR_20260905_DAILY_CANDIDATE_PANEL_AUTOMATION",
-      "domain": "data_collection",
-      "title": "미매매 후보 수동 기입 최소화 - 테마/시나리오 우선순위 수정 및 일일 패널 자동화",
-      "why": "미매매 후보를 스프레드시트에 수동 분석·기입하지 않도록 자동화 경계를 재정의하려 했으나, candidate_panel.py의 테마 우선순위 역전·시나리오/테마 sentinel 분열·price_history 동결 무감지 위험이 발견됨.",
-      "resolution": "테마 병합 우선순위를 archive/condition_history 실값 우선으로 수정, '테마 없음'/'기타' sentinel 통일, src/daily/materialize_ml_panel.py 신설(일일 산출물화), retrain.py에 price_history 신선도 워치독 배선, 실행 검증 중 발견한 수익률 % 문자열 파싱·종가 스케일 불일치·거래정지 자리표시일 라벨 오염 버그 수정.",
-      "impact": "archive 시나리오/테마 100% 보존 확인, 실거래 92%가 NaN 처리되던 버그와 최대 +4899%/-100% 합성 라벨 오염 2건을 실행 검증으로 추가 발견해 수정, lean_check 100% 커버리지 통과."
     }
   ]
 }
