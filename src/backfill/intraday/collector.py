@@ -830,24 +830,33 @@ async def _collect_with_observer(
     run_id: str,
     acquire: Any,
     on_symbol: SymbolObserver | None,
+    max_concurrency: int = 1,
 ) -> pd.DataFrame:
+    if max_concurrency <= 0:
+        raise ValueError(f"Invalid max_concurrency: {max_concurrency!r}")
     trading_day = _parse_snapshot_date(snapshot_date)
     _publish_pending_manifest(
         store, trading_day=trading_day, run_id=run_id, dataset=dataset,
         vendor="owner-local", endpoint="pending", session=session_tag, symbols=list(codes),
     )
-    frames: list[pd.DataFrame] = []
-    for code in codes:
-        frame, entry = await acquire(code)
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def _run_one(code: str) -> tuple[str, tuple[pd.DataFrame, CoverageEntry]]:
+        async with sem:
+            return code, await acquire(code)
+
+    results = await asyncio.gather(*[_run_one(code) for code in codes])
+    collected: list[pd.DataFrame] = []
+    for code, (frame, entry) in results:
         if on_symbol is not None:
             on_symbol(code, frame, entry)
         elif not frame.empty:
-            frames.append(frame)
+            collected.append(frame)
     if on_symbol is not None:
         return _empty_bar_frame(snapshot_date) if dataset == CaptureDataset.MINUTE_BARS else _empty_tick_frame(snapshot_date)
-    if not frames:
+    if not collected:
         return _empty_bar_frame(snapshot_date) if dataset == CaptureDataset.MINUTE_BARS else _empty_tick_frame(snapshot_date)
-    return pd.concat(frames, ignore_index=True)
+    return pd.concat(collected, ignore_index=True)
 
 
 async def _collect_bars(
@@ -1002,7 +1011,7 @@ async def collect_intraday_bars(client: Any, session: Any, stock_codes: list[str
     return await _collect_with_observer(
         codes=codes, snapshot_date=str(snapshot_date), dataset=CaptureDataset.MINUTE_BARS,
         session_tag=INTRADAY_SESSION_REGULAR, store=store, run_id=resolved_run,
-        acquire=_acquire, on_symbol=on_symbol,
+        acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
     )
 
 
@@ -1147,7 +1156,7 @@ async def collect_nxt_aftermarket_bars(client: Any, session: Any, stock_codes: l
     return await _collect_with_observer(
         codes=codes, snapshot_date=str(snapshot_date), dataset=CaptureDataset.MINUTE_BARS,
         session_tag="nxt_aftermarket", store=store, run_id=resolved_run,
-        acquire=_acquire, on_symbol=on_symbol,
+        acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
     )
 
 
@@ -1225,7 +1234,7 @@ async def collect_nxt_premarket_bars(client: Any, session: Any, stock_codes: lis
     return await _collect_with_observer(
         codes=codes, snapshot_date=str(snapshot_date), dataset=CaptureDataset.MINUTE_BARS,
         session_tag="nxt_premarket", store=store, run_id=resolved_run,
-        acquire=_acquire, on_symbol=on_symbol,
+        acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
     )
 
 
@@ -1349,7 +1358,7 @@ async def collect_intraday_trade_ticks(client: Any, session: Any, stock_codes: l
     return await _collect_with_observer(
         codes=codes, snapshot_date=str(snapshot_date), dataset=CaptureDataset.TRADE_TICKS,
         session_tag=INTRADAY_SESSION_REGULAR, store=store, run_id=resolved_run,
-        acquire=_acquire, on_symbol=on_symbol,
+        acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
     )
 
 
@@ -1403,7 +1412,7 @@ async def collect_krx_aftermarket_bars(client: Any, session: Any, stock_codes: l
         return await _collect_with_observer(
             codes=codes, snapshot_date=str(snapshot_date), dataset=CaptureDataset.MINUTE_BARS,
             session_tag="krx_aftermarket", store=store, run_id=resolved_run,
-            acquire=_acquire_na, on_symbol=on_symbol,
+            acquire=_acquire_na, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
         )
     prof = _resolve_profile(profile)
     trading_day = _parse_snapshot_date(snapshot_date)
@@ -1424,7 +1433,7 @@ async def collect_krx_aftermarket_bars(client: Any, session: Any, stock_codes: l
     return await _collect_with_observer(
         codes=codes, snapshot_date=str(snapshot_date), dataset=CaptureDataset.MINUTE_BARS,
         session_tag="krx_aftermarket", store=store, run_id=resolved_run,
-        acquire=_acquire, on_symbol=on_symbol,
+        acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
     )
 
 

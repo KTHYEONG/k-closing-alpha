@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -285,6 +286,37 @@ def _legacy_run(snapshot_date: str | None, bar_interval_minutes: int, *, phase: 
     return asyncio.run(_run())
 
 
+class _BatchedPartitionPublisher:
+    """Buffer certified per-symbol results and flush them as one partition write."""
+
+    def __init__(
+        self, write_fn: Callable[[pd.DataFrame, dict[str, CoverageEntry]], int], batch_size: int
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"Invalid batch_size: {batch_size!r}")
+        self._write_fn = write_fn
+        self._batch_size = batch_size
+        self._frames: list[pd.DataFrame] = []
+        self._coverage: dict[str, CoverageEntry] = {}
+
+    def add(self, symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
+        """Buffer one write-eligible symbol; auto-flush once the batch fills."""
+        self._frames.append(frame)
+        self._coverage[symbol] = entry
+        if len(self._coverage) >= self._batch_size:
+            self.flush()
+
+    def flush(self) -> int:
+        """Write every buffered symbol in one call; no-op returning 0 when empty."""
+        if not self._coverage:
+            return 0
+        combined = pd.concat(self._frames, ignore_index=True)
+        written = self._write_fn(combined, dict(self._coverage))
+        self._frames = []
+        self._coverage = {}
+        return written
+
+
 def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes: int = DEFAULT_BAR_INTERVAL_MINUTES, *, profile: CollectionSettings | None = None, phase: str = "all") -> tuple[int, int, int]:
     """Archive the project's dated candidate cohort independently of other collectors.
 
@@ -338,6 +370,42 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                 return (0, 0, 0)
             interval = int(bar_interval_minutes)
             batch_rows = int(prof.COLLECTION_ARROW_BATCH_ROWS)
+            batch_size = int(prof.COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE)
+            bars_publisher = _BatchedPartitionPublisher(
+                lambda df, coverage: write_intraday_partition(
+                    df, interval, str(snap_date), INTRADAY_SESSION_REGULAR,
+                    coverage=coverage, batch_rows=batch_rows,
+                ),
+                batch_size,
+            )
+            ticks_publisher = _BatchedPartitionPublisher(
+                lambda df, coverage: write_tick_partition(
+                    df, str(snap_date), INTRADAY_SESSION_REGULAR,
+                    coverage=coverage, batch_rows=batch_rows,
+                ),
+                batch_size,
+            )
+            nxt_after_publisher = _BatchedPartitionPublisher(
+                lambda df, coverage: write_intraday_partition(
+                    df, interval, str(snap_date), INTRADAY_SESSION_NXT_AFTERMARKET,
+                    coverage=coverage, batch_rows=batch_rows,
+                ),
+                batch_size,
+            )
+            nxt_pre_publisher = _BatchedPartitionPublisher(
+                lambda df, coverage: write_intraday_partition(
+                    df, interval, str(snap_date), INTRADAY_SESSION_NXT_PREMARKET,
+                    coverage=coverage, batch_rows=batch_rows,
+                ),
+                batch_size,
+            )
+            krx_after_publisher = _BatchedPartitionPublisher(
+                lambda df, coverage: write_intraday_partition(
+                    df, interval, str(snap_date), INTRADAY_SESSION_KRX_AFTERMARKET,
+                    coverage=coverage, batch_rows=batch_rows,
+                ),
+                batch_size,
+            )
             bar_entries: list[CoverageEntry] = []
             tick_entries: list[CoverageEntry] = []
             nxt_after_entries: list[CoverageEntry] = []
@@ -348,8 +416,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
             def publish_bars(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 bar_entries.append(entry)
                 if entry.status == CaptureStatus.COMPLETE and not frame.empty:
-                    write_intraday_partition(frame, interval, str(snap_date), INTRADAY_SESSION_REGULAR,
-                                             coverage={symbol: entry}, batch_rows=batch_rows)
+                    bars_publisher.add(symbol, frame, entry)
                     counts["bars"] += len(frame)
                 elif not frame.empty:
                     store.publish_frame(frame, context=_fragment_context(trading_day, symbol, CaptureDataset.MINUTE_BARS))
@@ -357,8 +424,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
             def publish_ticks(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 tick_entries.append(entry)
                 if entry.status == CaptureStatus.COMPLETE and not frame.empty:
-                    write_tick_partition(frame, str(snap_date), INTRADAY_SESSION_REGULAR,
-                                         coverage={symbol: entry}, batch_rows=batch_rows)
+                    ticks_publisher.add(symbol, frame, entry)
                     counts["ticks"] += len(frame)
                 elif not frame.empty:
                     store.publish_frame(frame, context=_fragment_context(trading_day, symbol, CaptureDataset.TRADE_TICKS))
@@ -366,22 +432,19 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
             def publish_nxt_after(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 nxt_after_entries.append(entry)
                 if entry.status == CaptureStatus.COMPLETE and not frame.empty:
-                    write_intraday_partition(frame, interval, str(snap_date), INTRADAY_SESSION_NXT_AFTERMARKET,
-                                             coverage={symbol: entry}, batch_rows=batch_rows)
+                    nxt_after_publisher.add(symbol, frame, entry)
                     counts["nxt_after"] += len(frame)
 
             def publish_nxt_pre(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 nxt_pre_entries.append(entry)
                 if entry.status == CaptureStatus.COMPLETE and not frame.empty:
-                    write_intraday_partition(frame, interval, str(snap_date), INTRADAY_SESSION_NXT_PREMARKET,
-                                             coverage={symbol: entry}, batch_rows=batch_rows)
+                    nxt_pre_publisher.add(symbol, frame, entry)
                     counts["nxt_pre"] += len(frame)
 
             def publish_krx_after(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 krx_after_entries.append(entry)
                 if entry.status == CaptureStatus.COMPLETE and not frame.empty:
-                    write_intraday_partition(frame, interval, str(snap_date), INTRADAY_SESSION_KRX_AFTERMARKET,
-                                             coverage={symbol: entry}, batch_rows=batch_rows)
+                    krx_after_publisher.add(symbol, frame, entry)
                     counts["krx_after"] += len(frame)
 
             # 같은 날 재시도(수동 재실행 또는 실패 후 재기동)가 이전 시도의 불변 매니페스트와
@@ -396,18 +459,23 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
             if do_regular:
                 await collect_intraday_bars(client, session, codes, str(snap_date), interval, ls_client=ls_client,
                                             profile=prof, capture_store=store, run_id=bars_run, on_symbol=publish_bars)
+                bars_publisher.flush()
             if do_aftermarket:
                 await collect_nxt_aftermarket_bars(client, session, codes, str(snap_date), interval, kiwoom_client=kiwoom_client,
                                                    profile=prof, capture_store=store, run_id=after_run, on_symbol=publish_nxt_after)
+                nxt_after_publisher.flush()
                 await collect_nxt_premarket_bars(client, session, codes, str(snap_date), interval, kiwoom_client=kiwoom_client,
                                                  profile=prof, capture_store=store, run_id=pre_run, on_symbol=publish_nxt_pre)
+                nxt_pre_publisher.flush()
                 await collect_krx_aftermarket_bars(client, session, codes, str(snap_date), interval,
                                                    profile=prof, capture_store=store, run_id=krx_run, on_symbol=publish_krx_after)
+                krx_after_publisher.flush()
                 logger.info("[DATA] stage=krx_aftermarket date=%s rows=%d", snap_date, counts["krx_after"])
             if do_regular:
                 await collect_intraday_trade_ticks(client, session, codes, str(snap_date), ls_client=ls_client,
                                                    kiwoom_client=kiwoom_client, profile=prof, capture_store=store,
                                                    run_id=ticks_run, on_symbol=publish_ticks)
+                ticks_publisher.flush()
             if do_regular:
                 _publish_task_manifest(store, trading_day=trading_day, run_id=bars_run,
                                        dataset=CaptureDataset.MINUTE_BARS, vendor="kis",

@@ -30,6 +30,8 @@ class CollectionSettings(BaseSettings):
         COLLECTION_AUCTION_INTERVAL_SECONDS: Closing sweep interval, default 60.
         COLLECTION_REQUEST_TIMEOUT_SECONDS: Total call timeout, default 5.0.
         COLLECTION_CONCURRENCY_PER_KEY: In-flight limit, default 8.
+        COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE: Symbols buffered before an intraday partition flush,
+            default 25.
         COLLECTION_CHART_MAX_PAGES: Normal page budget, default 30.
         COLLECTION_TICK_REPAIR_MAX_PAGES: Explicit total repair budget, default 120.
         COLLECTION_ARROW_BATCH_ROWS: Bounded rewrite batch size, default 65536.
@@ -59,6 +61,7 @@ class CollectionSettings(BaseSettings):
     COLLECTION_AUCTION_INTERVAL_SECONDS: int = Field(default=60, gt=0)
     COLLECTION_REQUEST_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     COLLECTION_CONCURRENCY_PER_KEY: int = Field(default=8, gt=0)
+    COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE: int = Field(default=25, gt=0)
     COLLECTION_CHART_MAX_PAGES: int = Field(default=30, gt=0)
     COLLECTION_TICK_REPAIR_MAX_PAGES: int = Field(default=120, gt=0)
     COLLECTION_ARROW_BATCH_ROWS: int = Field(default=65536, gt=0)

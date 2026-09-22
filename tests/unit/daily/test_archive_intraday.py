@@ -1548,3 +1548,187 @@ def test_stale_panel_window_rejected(monkeypatch, tmp_path) -> None:
 
     with pytest.raises(ValueError, match="stale price_history"):
         archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+
+
+def _batched_frame(symbol: str):
+    import pandas as pd
+
+    return pd.DataFrame([{"symbol": symbol}])
+
+
+def test_batched_partition_publisher_defers_write_until_threshold() -> None:
+    from src.daily.archive_intraday import _BatchedPartitionPublisher
+    from src.data.capture_contracts import CaptureDataset
+
+    calls: list = []
+    publisher = _BatchedPartitionPublisher(
+        write_fn=lambda df, coverage: calls.append((df, coverage)) or 0, batch_size=3,
+    )
+    publisher.add("005930", _batched_frame("005930"),
+                  _fake_entry("005930", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
+    publisher.add("000660", _batched_frame("000660"),
+                  _fake_entry("000660", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
+
+    assert calls == []
+
+
+def test_batched_partition_publisher_auto_flushes_at_threshold() -> None:
+    from src.daily.archive_intraday import _BatchedPartitionPublisher
+    from src.data.capture_contracts import CaptureDataset
+
+    calls: list = []
+    publisher = _BatchedPartitionPublisher(
+        write_fn=lambda df, coverage: calls.append((df, coverage)) or len(df), batch_size=3,
+    )
+    codes = ["005930", "000660", "035420"]
+    for code in codes:
+        publisher.add(code, _batched_frame(code),
+                      _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
+
+    assert len(calls) == 1
+    frame, coverage = calls[0]
+    assert len(frame) == 3
+    assert set(coverage) == set(codes)
+    assert publisher.flush() == 0
+    assert len(calls) == 1
+
+
+def test_batched_partition_publisher_flush_writes_partial_batch() -> None:
+    from src.daily.archive_intraday import _BatchedPartitionPublisher
+    from src.data.capture_contracts import CaptureDataset
+
+    calls: list = []
+
+    def _spy(df, coverage):
+        calls.append((df, coverage))
+        return 7
+
+    publisher = _BatchedPartitionPublisher(write_fn=_spy, batch_size=10)
+    for code in ("005930", "000660"):
+        publisher.add(code, _batched_frame(code),
+                      _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
+
+    assert publisher.flush() == 7
+    assert len(calls) == 1
+    frame, coverage = calls[0]
+    assert len(frame) == 2
+    assert set(coverage) == {"005930", "000660"}
+
+
+def test_batched_partition_publisher_flush_without_buffer_is_noop() -> None:
+    from src.daily.archive_intraday import _BatchedPartitionPublisher
+
+    calls: list = []
+    publisher = _BatchedPartitionPublisher(
+        write_fn=lambda df, coverage: calls.append((df, coverage)) or 0, batch_size=3,
+    )
+
+    assert publisher.flush() == 0
+    assert calls == []
+
+
+def test_batched_partition_publisher_write_failure_propagates() -> None:
+    import pytest
+
+    from src.daily.archive_intraday import _BatchedPartitionPublisher
+    from src.data.capture_contracts import CaptureDataset
+
+    def _boom(df, coverage):
+        raise ValueError("partition unavailable")
+
+    publisher = _BatchedPartitionPublisher(write_fn=_boom, batch_size=2)
+    publisher.add("005930", _batched_frame("005930"),
+                  _fake_entry("005930", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
+    with pytest.raises(ValueError, match="partition unavailable"):
+        publisher.add("000660", _batched_frame("000660"),
+                      _fake_entry("000660", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
+
+
+def test_batched_partition_publisher_rejects_nonpositive_batch_size() -> None:
+    import pytest
+
+    from src.daily.archive_intraday import _BatchedPartitionPublisher
+
+    with pytest.raises(ValueError, match="batch_size"):
+        _BatchedPartitionPublisher(write_fn=lambda df, coverage: 0, batch_size=0)
+
+
+def test_run_archive_batches_bar_writes_across_symbols(monkeypatch, tmp_path) -> None:
+    from src.config.collection import CollectionSettings
+    from src.config.market_session import INTRADAY_SESSION_REGULAR
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    codes = ["005930", "000660", "035420"]
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", codes)
+    _publish_cohort(store, "2026-09-04", ["005930"])
+
+    async def _fake_bars(client, session, codes_arg, snap_date, bar_interval_minutes=1, **kwargs):
+        import pandas as pd
+
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes_arg:
+            frame = _canon_bar_frame(snap_date, code)
+            on_symbol(code, frame, _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=len(frame)))
+        return pd.DataFrame()
+
+    async def _fake_other(client, session, codes_arg, snap_date, bar_interval_minutes=1, **kwargs):
+        import pandas as pd
+
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes_arg:
+            on_symbol(code, _empty_bar_frame_for(snap_date),
+                      _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    async def _fake_ticks(client, session, codes_arg, snap_date, **kwargs):
+        import pandas as pd
+
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes_arg:
+            on_symbol(code, _empty_bar_frame_for(snap_date),
+                      _fake_entry(code, CaptureDataset.TRADE_TICKS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _fake_bars)
+    _seed_panel(tmp_path, {"2026-09-04": codes, "2026-09-03": ["005930"]})
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _fake_other)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _fake_other)
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _fake_other)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _fake_ticks)
+
+    writes: list = []
+
+    def _spy_write(df, interval, snap_date, session, *, coverage=None, batch_rows=None):
+        writes.append((session, len(df), sorted(coverage or {})))
+        return len(df)
+
+    monkeypatch.setattr(archive_intraday, "write_intraday_partition", _spy_write)
+    monkeypatch.setattr(archive_intraday, "write_tick_partition", lambda *a, **k: 0)
+
+    profile = CollectionSettings(COLLECTION_ROOT=tmp_path / "cap", COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE=2)
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=profile)
+
+    regular_writes = [item for item in writes if item[0] == INTRADAY_SESSION_REGULAR]
+    assert [item[1] for item in regular_writes] == [2, 1]
+    assert regular_writes[0][2] == ["000660", "005930"]
+    assert regular_writes[1][2] == ["035420"]
+    assert len(writes) == 2
+    assert result == (3, 0, 0)
+
+
+def test_collection_archive_symbol_batch_size_defaults_to_25() -> None:
+    from src.config.collection import CollectionSettings
+
+    assert CollectionSettings().COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE == 25
+
+
+def test_collection_archive_symbol_batch_size_rejects_nonpositive() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from src.config.collection import CollectionSettings
+
+    with pytest.raises(ValidationError):
+        CollectionSettings(COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE=0)
