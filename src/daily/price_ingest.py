@@ -58,6 +58,8 @@ KRX_DAILY_MARKETS: tuple[tuple[str, str], ...] = (
 KRX_REQUIRED_COLUMNS: tuple[str, ...] = (
     "ISU_CD",
     "MKT_NM",
+    "BAS_DD",
+    "FLUC_RT",
     "TDD_OPNPRC",
     "TDD_HGPRC",
     "TDD_LWPRC",
@@ -94,6 +96,12 @@ FLOW_WINDOW_TRADING_DAYS: int = 30
 MIN_FLOW_COVERAGE: float = 0.99
 # 가격은 원 단위 정수 격자라 반올림 오차 이상 차이만 기업행사로 본다
 PRICE_EVENT_TOLERANCE: float = 0.5
+# base(CMPPREVDD)-base(FLUC_RT) 상대오차 상한: 최대 7e-5, p99.9 5e-5 (5,522행, 2026-09-22 or-vps 실측)
+KRX_BASE_CROSSCHECK_RTOL: float = 0.005
+# 일자별 행수 비율 하한: 2020년 이후 최소 0.9973 (2026-09-22 or-vps 실측)
+MIN_DAILY_ROW_RATIO: float = 0.97
+# 전일 동일 OHLCV 비중 상한: 2020년 이후 최대 0.0013 (2026-09-22 or-vps 실측)
+MAX_STALE_SHARE: float = 0.05
 KRW_PER_100M: float = 1e8
 _ADJUSTED_PRICE_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "prev_close")
 _INVESTOR_PATH = "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
@@ -102,6 +110,14 @@ _PROGRAM_PATH = "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily
 
 class VendorResponseError(RuntimeError):
     """A vendor answered with a business-level failure code (not a transport error)."""
+
+
+class KrxIntegrityError(RuntimeError):
+    """A KRX daily block is internally inconsistent or implausible versus the stored panel.
+
+    Raised before any panel write so a corrupted vendor day can never trigger
+    corporate-action back-adjustment of stored history.
+    """
 
 
 @dataclass(frozen=True)
@@ -131,6 +147,125 @@ def _signed_num(value: Any) -> float:
     return float(text) if text not in ("", "-") else float("nan")
 
 
+def _parse_fluc_rate(value: Any) -> float:
+    try:
+        text = str(value if value is not None else "").replace(",", "").strip().lstrip("+")
+        return float(text)
+    except (ValueError, TypeError):
+        return float("nan")
+
+
+def validate_krx_daily_block(raw: pd.DataFrame, trade_date: pd.Timestamp) -> None:
+    """Reject a raw KRX daily block whose values cannot be trusted as a base-price source.
+
+    The base price derived from CMPPREVDD_PRC drives irreversible back-adjustment of
+    history, so it must agree with the independently published FLUC_RT and be positive,
+    and the block must describe the requested date.
+
+    Args:
+        raw: One market's raw OutBlock_1 frame (all required KRX columns present).
+        trade_date: Requested trading date.
+
+    Raises:
+        KrxIntegrityError: On any BAS_DD mismatch, non-positive or unparsable close/base,
+            FLUC_RT/CMPPREVDD base disagreement beyond KRX_BASE_CROSSCHECK_RTOL, or an
+            OHLC-inconsistent traded row.
+    """
+    ymd = pd.Timestamp(trade_date).strftime("%Y%m%d")
+    market = ", ".join(sorted(raw["MKT_NM"].astype(str).str.strip().unique().tolist()))
+
+    def _reject(check: str, idx: pd.Index) -> None:
+        samples = raw["ISU_CD"].astype(str).iloc[list(idx[:5])].tolist()
+        raise KrxIntegrityError(
+            f"KRX block market={market} check={check} n_violating={len(idx)} samples={samples}"
+        )
+
+    bas = raw["BAS_DD"].astype(str).str.replace("-", "", regex=False).str.strip()
+    bad = bas[bas != ymd].index
+    if len(bad):
+        _reject("BAS_DD", bad)
+    close = _to_num(raw["TDD_CLSPRC"])
+    bad = close[(close.isna()) | (close <= 0)].index
+    if len(bad):
+        _reject("close_positive", bad)
+    base = close - _to_num(raw["CMPPREVDD_PRC"])
+    bad = base[(base.isna()) | (base <= 0)].index
+    if len(bad):
+        _reject("base_positive", bad)
+    fluc = raw["FLUC_RT"].map(lambda v: _parse_fluc_rate(v) if pd.notna(v) else float("nan"))
+    denom = 1.0 + fluc / 100.0
+    base_fluc = close / denom
+    rel_err = (base - base_fluc).abs() / base
+    bad = rel_err[(fluc.isna()) | (denom <= 0) | (rel_err.isna()) | (rel_err > KRX_BASE_CROSSCHECK_RTOL)].index
+    if len(bad):
+        _reject("base_crosscheck(FLUC_RT cross-check)", bad)
+    volume = _to_num(raw["ACC_TRDVOL"])
+    traded = volume[volume > 0].index
+    if len(traded):
+        block = raw.loc[traded]
+        open_p = _to_num(block["TDD_OPNPRC"])
+        high_p = _to_num(block["TDD_HGPRC"])
+        low_p = _to_num(block["TDD_LWPRC"])
+        close_t = close.loc[traded]
+        inconsistent = (
+            open_p.isna() | high_p.isna() | low_p.isna()
+            | (open_p <= 0) | (high_p <= 0) | (low_p <= 0)
+            | (low_p > pd.concat([open_p, close_t], axis=1).min(axis=1))
+            | (pd.concat([open_p, close_t], axis=1).max(axis=1) > high_p)
+        )
+        bad = inconsistent[inconsistent].index
+        if len(bad):
+            _reject("ohlc_consistency", bad)
+
+
+def check_day_continuity(new_rows: pd.DataFrame, prior_rows: pd.DataFrame) -> None:
+    """Reject a newly published day that is truncated or a stale copy of the prior day.
+
+    Args:
+        new_rows: Normalized rows (KRX_ROW_COLUMNS) of the candidate trading day.
+        prior_rows: Stored or already-fetched rows of the immediately preceding trading day.
+
+    Raises:
+        KrxIntegrityError: When len(new_rows)/len(prior_rows) < MIN_DAILY_ROW_RATIO, or when
+            the share of symbols traded on both days whose open/high/low/close/volume are all
+            identical exceeds MAX_STALE_SHARE.
+    """
+    if prior_rows.empty:
+        return
+    ratio = len(new_rows) / len(prior_rows)
+    if ratio < MIN_DAILY_ROW_RATIO:
+        raise KrxIntegrityError(
+            f"day_continuity row_ratio={ratio:.4f} below MIN_DAILY_ROW_RATIO={MIN_DAILY_ROW_RATIO} "
+            f"(row ratio check) n_new={len(new_rows)} n_prior={len(prior_rows)}"
+        )
+    cols = ("open", "high", "low", "close", "volume")
+    new = new_rows.copy()
+    prior = prior_rows.copy()
+    new["symbol"] = new["symbol"].astype(str)
+    prior["symbol"] = prior["symbol"].astype(str)
+    for col in cols:
+        new[col] = pd.to_numeric(new[col], errors="coerce").astype("float64")
+        prior[col] = pd.to_numeric(prior[col], errors="coerce").astype("float64")
+    new_traded = set(new.loc[new["volume"] > 0, "symbol"])
+    prior_traded = set(prior.loc[prior["volume"] > 0, "symbol"])
+    common = sorted(new_traded & prior_traded)
+    if not common:
+        return
+    new_m = new.drop_duplicates("symbol", keep="last").set_index("symbol")
+    prior_m = prior.drop_duplicates("symbol", keep="last").set_index("symbol")
+    same = pd.Series(True, index=pd.Index(common))
+    for col in cols:
+        same &= (new_m.loc[common, col].to_numpy() == prior_m.loc[common, col].to_numpy())
+    n_stale = int(pd.Series(same).sum())
+    share = n_stale / len(common)
+    if share > MAX_STALE_SHARE:
+        stale_syms = [s for s, flag in zip(common, same, strict=True) if flag][:5]
+        raise KrxIntegrityError(
+            f"day_continuity stale_share={share:.4f} above MAX_STALE_SHARE={MAX_STALE_SHARE} "
+            f"(stale share check) n_stale={n_stale} n_common={len(common)} samples={stale_syms}"
+        )
+
+
 def normalize_krx_daily(raw: pd.DataFrame, trade_date: pd.Timestamp) -> pd.DataFrame:
     """Map one KRX OpenAPI daily stock block to price_history row columns.
 
@@ -150,6 +285,7 @@ def normalize_krx_daily(raw: pd.DataFrame, trade_date: pd.Timestamp) -> pd.DataF
     missing = [c for c in KRX_REQUIRED_COLUMNS if c not in raw.columns]
     if missing:
         raise ValueError(f"KRX daily block missing columns: {missing}")
+    validate_krx_daily_block(raw, trade_date)
     close = _to_num(raw["TDD_CLSPRC"])
     out = pd.DataFrame({
         "date": pd.Timestamp(trade_date).normalize(),
@@ -765,6 +901,7 @@ async def run_price_ingest(
         kosdaq = await fetch_index_closes(kis, session, KIS_INDEX_KOSDAQ_CODE, INDEX_HISTORY_START, run_day)
         trading = sorted(pd.Timestamp(d) for d in kospi["date"])
         fetched: dict[pd.Timestamp, pd.DataFrame] = {}
+        prior = panel[pd.to_datetime(panel["date"]).dt.normalize() == panel_max] if not panel.empty else panel
         for d in plan_new_dates(panel_max, trading, run_day):
             trade_date = d
             krx_cfg = cfg
@@ -773,7 +910,9 @@ async def run_price_ingest(
             rows = krx_rows
             if rows.empty:
                 break  # 미게시: 이후 날짜는 연속성 때문에 시도하지 않는다
+            check_day_continuity(rows, prior)
             fetched[d] = rows
+            prior = rows
         anchor = max(fetched) if fetched else panel_max
         window = [d for d in trading if d <= anchor][-FLOW_WINDOW_TRADING_DAYS:]
         new_rows = pd.DataFrame()

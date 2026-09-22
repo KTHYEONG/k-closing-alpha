@@ -37,6 +37,7 @@ from src.data.capture_contracts import (
     CaptureDataset,
     CaptureManifest,
     CaptureStatus,
+    Cohort,
     CoverageEntry,
 )
 from src.data.capture_store import CaptureStore
@@ -126,9 +127,41 @@ def _paper_follow_symbols() -> list[str]:
     return sorted({str(item) for item in open_positions["symbol"].astype(str).tolist() if str(item).strip()})
 
 
+def _panel_listed_before(cohort_date: str) -> frozenset[str]:
+    """Return symbols listed on the latest panel date strictly before cohort_date."""
+    panel_path = Path(settings.PRICE_HISTORY_PARQUET_PATH)
+    if not panel_path.exists():
+        raise FileNotFoundError(f"price_history not found: {panel_path}")
+    cohort_day = date.fromisoformat(str(cohort_date))
+    # 코호트 적격성 규칙(collect)과 동일: 코호트일 직전 최신 패널일의 상장 종목. 공휴일 연휴를 덮는 14일 창.
+    rows = pd.read_parquet(
+        panel_path,
+        columns=["date", "symbol"],
+        filters=[("date", ">=", pd.Timestamp(cohort_day) - pd.Timedelta(days=14)), ("date", "<", pd.Timestamp(cohort_day))],
+    )
+    rows = rows.assign(_d=pd.to_datetime(rows["date"]).dt.normalize())
+    if rows.empty:
+        raise ValueError(f"stale price_history: no rows in 14d window before {cohort_day.isoformat()}")
+    latest = rows["_d"].max()
+    listed = rows.loc[rows["_d"] == latest, "symbol"].astype(str)
+    return frozenset(listed.tolist())
+
+
+def _verify_cohort_against_panel(cohort: Cohort) -> None:
+    cohort_date = cohort.trading_date.isoformat()
+    listed = _panel_listed_before(cohort_date)
+    offending = [str(item) for item in cohort.eligible_symbols if str(item) not in listed]
+    if offending:
+        raise ValueError(
+            f"cohort_contamination cohort_id={cohort.cohort_id} date={cohort_date} "
+            f"n_offending={len(offending)} samples={offending[:5]}"
+        )
+
+
 def _resolve_cohort_codes(snapshot_date: str, profile: CollectionSettings, store: CaptureStore) -> tuple[list[str], bool]:
     now = datetime.now(SEOUL)
     today_cohort = store.read_cohort(str(snapshot_date), available_by=now)
+    _verify_cohort_against_panel(today_cohort)
     codes: list[str] = [str(item) for item in today_cohort.eligible_symbols]
     prev_day = _previous_trading_day(str(snapshot_date))
     incomplete = False
@@ -139,12 +172,18 @@ def _resolve_cohort_codes(snapshot_date: str, profile: CollectionSettings, store
         prev_cohort = None
         incomplete = True
     if prev_cohort is not None:
+        _verify_cohort_against_panel(prev_cohort)
         for item in prev_cohort.eligible_symbols:
             if str(item) not in codes:
                 codes.append(str(item))
     for item in _paper_follow_symbols():
         if item not in codes:
             codes.append(item)
+    n_prev = len(prev_cohort.eligible_symbols) if prev_cohort is not None else 0
+    logger.info(
+        "[DATA] stage=cohort status=VERIFIED date=%s n_today=%d n_prev=%d",
+        snapshot_date, len(today_cohort.eligible_symbols), n_prev,
+    )
     return codes, incomplete
 
 
