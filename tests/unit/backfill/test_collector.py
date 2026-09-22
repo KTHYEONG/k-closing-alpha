@@ -1912,17 +1912,358 @@ def test_publish_pending_manifest_retry_does_not_raise(tmp_path) -> None:
     from src.data.capture_contracts import CaptureDataset
 
     store = _capture_store(tmp_path)
-    kwargs = dict(
-        store=store,
-        trading_day=date(2026, 9, 18),
-        run_id="archive-2026-09-18-regular-bars",
-        dataset=CaptureDataset.MINUTE_BARS,
-        vendor="owner-local",
-        endpoint="pending",
-        session="regular",
-        symbols=["005930"],
-    )
+    kwargs = {
+        "store": store,
+        "trading_day": date(2026, 9, 18),
+        "run_id": "archive-2026-09-18-regular-bars",
+        "dataset": CaptureDataset.MINUTE_BARS,
+        "vendor": "owner-local",
+        "endpoint": "pending",
+        "session": "regular",
+        "symbols": ["005930"],
+    }
     _publish_pending_manifest(**kwargs)
     # 재실행: completed_at이 달라져 동일 경로에 다른 바이트를 쓰려는 충돌이 발생하지만
     # 예외가 밖으로 전파되지 않아야 한다.
     _publish_pending_manifest(**kwargs)
+
+
+def test_collect_with_observer_default_runs_sequentially(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import _collect_with_observer
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    codes = ["005930", "000660", "035420"]
+    entered: list[str] = []
+
+    async def _acquire(code: str):
+        entered.append(code)
+        return __import__("pandas").DataFrame(), None
+
+    asyncio.run(
+        _collect_with_observer(
+            codes=codes, snapshot_date="2026-09-04", dataset=CaptureDataset.MINUTE_BARS,
+            session_tag="regular", store=store, run_id="run-seq-default",
+            acquire=_acquire, on_symbol=None,
+        )
+    )
+
+    assert entered == codes
+
+
+def test_collect_with_observer_default_preserves_observer_and_concat_contracts(tmp_path) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.backfill.intraday.collector import _collect_with_observer
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+
+    async def _acquire(code: str):
+        return pd.DataFrame([{"symbol": code}]), None
+
+    fired: list[str] = []
+
+    def _on_symbol(symbol, frame, entry) -> None:
+        fired.append(symbol)
+
+    observed = asyncio.run(
+        _collect_with_observer(
+            codes=["005930", "000660", "035420"], snapshot_date="2026-09-04",
+            dataset=CaptureDataset.MINUTE_BARS, session_tag="regular", store=store,
+            run_id="run-seq-observed", acquire=_acquire, on_symbol=_on_symbol,
+        )
+    )
+
+    assert fired == ["005930", "000660", "035420"]
+    assert observed.empty
+
+    combined = asyncio.run(
+        _collect_with_observer(
+            codes=["005930", "000660", "035420"], snapshot_date="2026-09-04",
+            dataset=CaptureDataset.MINUTE_BARS, session_tag="regular", store=store,
+            run_id="run-seq-combined", acquire=_acquire, on_symbol=None,
+        )
+    )
+
+    assert combined["symbol"].tolist() == ["005930", "000660", "035420"]
+
+
+def test_collect_with_observer_bounds_concurrent_acquire(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import _collect_with_observer
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    inflight = 0
+    peak = 0
+
+    async def _acquire(code: str):
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        try:
+            await asyncio.sleep(0)
+            return __import__("pandas").DataFrame(), None
+        finally:
+            inflight -= 1
+
+    delivered: dict[str, int] = {}
+
+    def _on_symbol(symbol, frame, entry) -> None:
+        delivered[symbol] = delivered.get(symbol, 0) + 1
+
+    asyncio.run(
+        _collect_with_observer(
+            codes=["005930", "000660", "035420", "035720", "051910"], snapshot_date="2026-09-04",
+            dataset=CaptureDataset.MINUTE_BARS, session_tag="regular", store=store,
+            run_id="run-bound", acquire=_acquire, on_symbol=_on_symbol,
+            max_concurrency=2,
+        )
+    )
+
+    assert peak <= 2
+    assert peak == 2
+    assert len(delivered) == 5
+
+
+def test_collect_with_observer_delivers_each_code_once(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import _collect_with_observer
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    codes = ["005930", "000660", "035420", "035720", "051910"]
+    delivered: dict[str, int] = {}
+
+    async def _acquire(code: str):
+        await asyncio.sleep(0)
+        return __import__("pandas").DataFrame(), None
+
+    def _on_symbol(symbol, frame, entry) -> None:
+        delivered[symbol] = delivered.get(symbol, 0) + 1
+
+    asyncio.run(
+        _collect_with_observer(
+            codes=codes, snapshot_date="2026-09-04", dataset=CaptureDataset.MINUTE_BARS,
+            session_tag="regular", store=store, run_id="run-once",
+            acquire=_acquire, on_symbol=_on_symbol, max_concurrency=3,
+        )
+    )
+
+    assert set(delivered) == set(codes)
+    assert all(count == 1 for count in delivered.values())
+
+
+def test_collect_with_observer_rejects_nonpositive_concurrency(tmp_path) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.backfill.intraday.collector import _collect_with_observer
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+
+    async def _acquire(code: str):
+        raise AssertionError("must fail before acquiring")
+
+    with pytest.raises(ValueError, match="0"):
+        asyncio.run(
+            _collect_with_observer(
+                codes=["005930"], snapshot_date="2026-09-04",
+                dataset=CaptureDataset.MINUTE_BARS, session_tag="regular",
+                store=store, run_id="run-invalid", acquire=_acquire,
+                on_symbol=None, max_concurrency=0,
+            )
+        )
+
+
+def test_collect_with_observer_concat_covers_all_rows_regardless_of_order(tmp_path) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.backfill.intraday.collector import _collect_with_observer
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    codes = ["005930", "000660", "035420"]
+
+    async def _acquire(code: str):
+        await asyncio.sleep((len(codes) - 1 - codes.index(code)) * 0.02)
+        return pd.DataFrame([{"symbol": code}]), None
+
+    result = asyncio.run(
+        _collect_with_observer(
+            codes=codes, snapshot_date="2026-09-04", dataset=CaptureDataset.MINUTE_BARS,
+            session_tag="regular", store=store, run_id="run-concat",
+            acquire=_acquire, on_symbol=None, max_concurrency=3,
+        )
+    )
+
+    assert set(result["symbol"]) == set(codes)
+    assert len(result) == len(codes)
+
+
+def test_collect_intraday_trade_ticks_bounds_inflight_by_profile(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+    from src.config.collection import CollectionSettings
+
+    inflight = 0
+    peak = 0
+
+    class _TrackingLs:
+        async def get_tick_chart(self, session, code, target_date, max_pages=None, on_page=None):
+            nonlocal inflight, peak
+            inflight += 1
+            peak = max(peak, inflight)
+            try:
+                await asyncio.sleep(0.01)
+                return {
+                    "rt_cd": "0", "output2": [_ls_tick_row("093000", day="20200102")],
+                    "vendor": "ls", "truncated": False, "termination_reason": "exhausted",
+                    "pages_fetched": 1, "continuation": {},
+                }
+            finally:
+                inflight -= 1
+
+    store = _capture_store(tmp_path)
+    profile = CollectionSettings(
+        COLLECTION_ROOT=tmp_path / "capture",
+        COLLECTION_VERIFIED_CHART_ROUTES={"ls:t8411": "KRX"},
+        COLLECTION_CONCURRENCY_PER_KEY=4,
+    )
+    delivered = {}
+    codes = ["005930", "000660", "035420", "035720", "051910", "068270"]
+
+    asyncio.run(
+        collect_intraday_trade_ticks(
+            _KisBars([]), None, codes, "2020-01-02", ls_client=_TrackingLs(),
+            profile=profile, capture_store=store, run_id="run-tick-conc",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+
+    assert peak <= 4
+    assert set(delivered) == set(codes)
+
+
+def test_collect_intraday_bars_bounds_inflight_by_profile(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_intraday_bars
+    from src.config.collection import CollectionSettings
+
+    inflight = 0
+    peak = 0
+
+    class _TrackingLsBars:
+        async def get_minute_chart(self, session, code, target_date, budget=None, on_page=None):
+            nonlocal inflight, peak
+            inflight += 1
+            peak = max(peak, inflight)
+            try:
+                await asyncio.sleep(0.01)
+                return {
+                    "rt_cd": "0", "output2": [_ls_bar_row("090100")], "vendor": "ls",
+                    "truncated": False, "termination_reason": "exhausted",
+                    "pages_fetched": 1, "continuation": {},
+                }
+            finally:
+                inflight -= 1
+
+    store = _capture_store(tmp_path)
+    profile = CollectionSettings(
+        COLLECTION_ROOT=tmp_path / "capture",
+        COLLECTION_VERIFIED_CHART_ROUTES={"ls:t8412": "KRX"},
+        COLLECTION_CONCURRENCY_PER_KEY=2,
+    )
+    delivered = {}
+    codes = ["005930", "000660", "035420", "035720", "051910"]
+
+    asyncio.run(
+        collect_intraday_bars(
+            _KisBars([]), None, codes, "2026-09-04", 1, ls_client=_TrackingLsBars(),
+            profile=profile, capture_store=store, run_id="run-bar-conc",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+
+    assert peak <= 2
+    assert set(delivered) == set(codes)
+
+
+def test_collect_krx_aftermarket_bars_bounds_inflight_on_both_branches(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from src.backfill.intraday import collector as collector_mod
+    from src.backfill.intraday.collector import collect_krx_aftermarket_bars
+    from src.config.collection import CollectionSettings
+
+    real_sleep = asyncio.sleep
+    state = {"inflight": 0, "peak": 0}
+
+    async def _tracking_sleep(delay, *args, **kwargs):
+        state["inflight"] += 1
+        state["peak"] = max(state["peak"], state["inflight"])
+        try:
+            return await real_sleep(delay, *args, **kwargs)
+        finally:
+            state["inflight"] -= 1
+
+    monkeypatch.setattr(asyncio, "sleep", _tracking_sleep)
+    store = _capture_store(tmp_path)
+    profile = CollectionSettings(
+        COLLECTION_ROOT=tmp_path / "capture",
+        COLLECTION_VERIFIED_CHART_ROUTES={},
+        COLLECTION_CONCURRENCY_PER_KEY=2,
+    )
+    delivered = {}
+    codes = ["005930", "000660", "035420", "035720", "051910", "068270"]
+
+    asyncio.run(
+        collect_krx_aftermarket_bars(
+            _KisBars([]), None, codes, "2026-09-01", 1,
+            profile=profile, capture_store=store, run_id="run-krx-na-conc",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+
+    assert state["peak"] <= 2
+    assert set(delivered) == set(codes)
+    assert collector_mod.KRX_AFTERMARKET_START_DATE == "2026-09-14"
+
+    inflight = 0
+    peak = 0
+
+    class _TrackingKis:
+        async def get_intraday_minute_chart(self, session, code, **kwargs):
+            nonlocal inflight, peak
+            inflight += 1
+            peak = max(peak, inflight)
+            try:
+                await real_sleep(0.01)
+                return {"rt_cd": "0", "output2": [_kis_bar_row("160100")]}
+            finally:
+                inflight -= 1
+
+    delivered.clear()
+    asyncio.run(
+        collect_krx_aftermarket_bars(
+            _TrackingKis(), None, codes[:5], "2026-09-14", 1,
+            profile=profile, capture_store=store, run_id="run-krx-conc",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+
+    assert peak <= 2
+    assert set(delivered) == set(codes[:5])
