@@ -51,6 +51,7 @@ DAY_UNKNOWN: str = "unknown"
 _CHART_DATASETS: tuple[CaptureDataset, CaptureDataset] = (CaptureDataset.MINUTE_BARS, CaptureDataset.TRADE_TICKS)
 _TERMINAL_REASONS: frozenset[str] = frozenset({"exhausted", "crossed_target_date"})
 _SLOW_DATA_DUE_HHMMSS: str = "213500"
+_SNAPSHOT_CATCHUP_CUTOFF_HOUR: int = 12
 AUDIT_STEPS: tuple[str, ...] = (
     "archive",
     "close_confirmed",
@@ -503,6 +504,31 @@ def build_digest(
 
 
 
+def resolve_snapshot_date(now: pd.Timestamp, *, catchup_cutoff_hour: int = _SNAPSHOT_CATCHUP_CUTOFF_HOUR) -> str:
+    """실행 시각 기준으로 감사 대상 영업일(KST)을 결정한다.
+
+    daily_audit는 평일 20:15 KST 타이머로만 트리거되며(Mon..Fri 20:15:00 Asia/Seoul),
+    선행 아카이브 잡과의 After= 순서 의존성 때문에 실제 프로세스 시작이 자정을 넘길
+    수 있다. 이때 wall-clock '오늘'을 그대로 쓰면 아직 파이프라인이 전혀 돌지 않은
+    새 영업일을 감사하게 되어, 정작 검증해야 할 전일 점검이 영구 누락된다.
+    자정~catchup_cutoff_hour 사이의 실행은 전일 파이프라인의 지연 실행으로 간주해
+    전일자를 반환한다. daily-audit의 유일한 정상 트리거가 평일 저녁이므로
+    (다음 트리거는 최소 다음 평일 20:15), 이 창 안에서의 실행은 항상 '어제 저녁
+    사이클의 지연분'이지 '오늘 저녁 사이클의 조기 실행'일 수 없다 — 따라서
+    거래일력(공휴일) 보정 없이 달력일 -1만으로 충분하다.
+
+    Args:
+        now: 기준 시각(Asia/Seoul tz-aware Timestamp).
+        catchup_cutoff_hour: 이 시각(KST, 0-23) 이전 실행은 전일 지연실행으로 간주.
+
+    Returns:
+        감사 대상 날짜(YYYY-MM-DD, KST).
+    """
+    if int(now.hour) < int(catchup_cutoff_hour):
+        return str((now.normalize() - pd.Timedelta(days=1)).date())
+    return str(now.date())
+
+
 def run_daily_audit(
     snapshot_date: str,
     *,
@@ -560,7 +586,8 @@ def main() -> None:  # pragma: no cover - CLI entry; logic covered via run_daily
     parser = argparse.ArgumentParser(description="Daily automation audit + digest (every weekday after EOD)")
     parser.add_argument("--date", default=None, help="Snapshot date YYYY-MM-DD (default today in KST)")
     args = parser.parse_args()
-    snapshot_date: str = args.date or pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d")
+    now = pd.Timestamp.now(tz="Asia/Seoul")
+    snapshot_date: str = args.date or resolve_snapshot_date(now)
     run_daily_audit(snapshot_date)
 
 
