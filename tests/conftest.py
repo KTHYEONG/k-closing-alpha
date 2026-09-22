@@ -14,6 +14,49 @@ from src.settings import Settings
 
 
 @pytest.fixture(autouse=True)
+def _isolate_production_data_dir(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Point every data-writing path at a per-test temp root.
+
+    Tests exercising entry points (collect/archive/price_ingest) resolve capture, archive
+    and panel paths from the live settings singleton; left unpatched they write into the
+    real data directory and, on a production host, poison operational stores.
+    """
+    if "slow" in request.node.keywords:
+        return
+    from pathlib import Path
+
+    from src import settings as live_settings
+
+    tmp_data = Path(tmp_path_factory.mktemp("kca-prod-isolation"))
+    tmp_history = tmp_data / "history"
+    tmp_parquet = tmp_data / "parquet"
+    tmp_daily = tmp_data / "daily"
+    tmp_paper = tmp_data / "paper"
+    # Pydantic singleton: computed paths (HISTORY_DIR, ...) follow DATA_DIR.
+    monkeypatch.setattr(live_settings.settings, "DATA_DIR", tmp_data)
+    monkeypatch.setattr(live_settings.settings, "COLLECTION_ROOT", None)
+    # Module-level snapshots (from src.config import * at import time) do not
+    # follow the singleton; patch every DATA_DIR-derived surface explicitly.
+    monkeypatch.setattr(live_settings, "DATA_DIR", tmp_data)
+    monkeypatch.setattr(live_settings, "COLLECTION_ROOT", None)
+    monkeypatch.setattr(live_settings, "HISTORY_DIR", tmp_history)
+    monkeypatch.setattr(live_settings, "PARQUET_DIR", tmp_parquet)
+    monkeypatch.setattr(live_settings, "DAILY_DIR", tmp_daily)
+    monkeypatch.setattr(live_settings, "PAPER_DIR", tmp_paper)
+    monkeypatch.setattr(live_settings, "ORDERBOOK_DIR", tmp_history / "orderbook")
+    monkeypatch.setattr(live_settings, "ALTDATA_DIR", tmp_history / "altdata")
+    monkeypatch.setattr(live_settings, "PRICE_HISTORY_PARQUET_PATH", tmp_history / "price_history.parquet")
+    monkeypatch.setattr(live_settings, "HISTORY_PARQUET_PATH", tmp_history / "archive.parquet")
+    monkeypatch.setattr(live_settings, "TRADE_LOG_PARQUET_PATH", tmp_parquet / "trade_log.parquet")
+    monkeypatch.setattr(live_settings, "THEME_PARQUET_PATH", tmp_parquet / "theme.parquet")
+    monkeypatch.delenv("COLLECTION_ROOT", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_kis_token_state(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
     from src import settings as live_settings
 

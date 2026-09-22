@@ -747,10 +747,27 @@ def _archive_fakes(entries_map):
     return _collect, seen
 
 
+def _seed_panel(tmp_path, symbols_by_date: dict[str, list[str]]) -> None:
+    import pandas as pd
+
+    from src.daily import archive_intraday
+
+    panel_path = archive_intraday.settings.PRICE_HISTORY_PARQUET_PATH
+    rows: list[dict[str, str]] = [
+        {"date": day, "symbol": symbol} for day, symbols in symbols_by_date.items() for symbol in symbols
+    ]
+    frame = pd.DataFrame(rows, columns=["date", "symbol"])
+    frame["date"] = pd.to_datetime(frame["date"])
+    panel_file = __import__("pathlib").Path(panel_path)
+    panel_file.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(panel_file, index=False)
+
+
 def _raw_archive_mocks(monkeypatch, tmp_path, fake_collect):
     from src.daily import archive_intraday
 
     monkeypatch.setattr(archive_intraday.settings, "HISTORY_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(archive_intraday.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "price_history.parquet", raising=False)
     monkeypatch.setattr(archive_intraday.settings, "LS_APP_KEY", "", raising=False)
     monkeypatch.setattr(archive_intraday.settings, "KIWOM_APP_KEY", "", raising=False)
     monkeypatch.setattr(archive_intraday.settings, "KIWOOM_APP_KEY", "", raising=False)
@@ -795,6 +812,7 @@ def test_run_archive_uses_calendar_previous_day_cohort(monkeypatch, tmp_path) ->
     }
     fake_collect, seen = _archive_fakes(entries_map)
     _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930", "000660"], "2026-09-03": ["009900"]})
 
     result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
 
@@ -818,6 +836,7 @@ def test_run_archive_same_day_retry_does_not_collide_with_prior_attempt(monkeypa
     }
     fake_collect, _ = _archive_fakes(entries_map)
     _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
 
     # When: 같은 날 두 번 연속 실행
     archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
@@ -843,6 +862,7 @@ def test_run_archive_ignores_unavailable_external_collector(monkeypatch, tmp_pat
     }
     fake_collect, _ = _archive_fakes(entries_map)
     _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
     monkeypatch.setitem(sys.modules, "krx_alpha", None)
 
     result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
@@ -889,6 +909,7 @@ def test_run_archive_partial_work_reported_degraded(monkeypatch, tmp_path, caplo
         return pd.DataFrame()
 
     _raw_archive_mocks(monkeypatch, tmp_path, _fake_bars)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930", "000660"], "2026-09-03": ["005930"]})
     monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _fake_other)
     monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _fake_other)
     monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _fake_other)
@@ -1068,6 +1089,8 @@ def test_run_archive_default_root_paper_and_prev_gap(monkeypatch, tmp_path, capl
         return pd.DataFrame()
 
     _raw_archive_mocks(monkeypatch, tmp_path, _fake)
+    monkeypatch.setattr(archive_intraday.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "price_history.parquet", raising=False)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
     profile = _raw_profile(tmp_path).model_copy(update={"COLLECTION_ROOT": None})
 
     with caplog.at_level(logging.WARNING, logger=archive_intraday.logger.name):
@@ -1099,6 +1122,7 @@ def test_run_archive_non_trading_day_skips_in_raw_mode(monkeypatch, tmp_path) ->
         raise AssertionError("must not collect on non-trading day")
 
     _raw_archive_mocks(monkeypatch, tmp_path, _never)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
     monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _never)
     monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _never)
     monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _never)
@@ -1192,6 +1216,7 @@ def test_run_archive_full_complete_and_partial_fragments(monkeypatch, tmp_path) 
         return pd.DataFrame()
 
     _raw_archive_mocks(monkeypatch, tmp_path, _fake_bars)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930", "000660"], "2026-09-03": ["005930"]})
     from src.config.market_session import (
         INTRADAY_SESSION_KRX_AFTERMARKET,
         INTRADAY_SESSION_NXT_AFTERMARKET,
@@ -1374,3 +1399,152 @@ def test_repair_cli_selection_and_publication_branches(monkeypatch, tmp_path) ->
             return True
 
     assert _asyncio.run(_use_real_open())
+
+
+def test_fixture_cohort_rejected_without_panel_listing(monkeypatch, tmp_path) -> None:
+    """Fixture cohort rejected: COMPLETE manifest with unlisted symbols fails closed."""
+    import logging
+
+    import pytest
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _archive_store(tmp_path)
+    cohort = _publish_cohort(store, "2026-09-07", ["000001", "000009"])
+    entries_map = {
+        code: (_empty_bar_frame_for("2026-09-07"), _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+        for code in ("000001", "000009")
+    }
+    fake_collect, _ = _archive_fakes(entries_map)
+    _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930", "000660"]})
+
+    with pytest.raises(ValueError, match=cohort.cohort_id):
+        archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+    from src.data import intraday_store
+
+    assert not intraday_store.intraday_partition_path(1, "2026-09-07", "regular").exists()
+    manifests = store.read_manifests("2026-09-07")
+    assert not [m for m in manifests if m.context.run_id.startswith("archive-")]
+
+
+def test_contaminated_previous_day_cohort_rejected(monkeypatch, tmp_path) -> None:
+    """Contaminated previous-day cohort rejected: valid today, unlisted prev fails closed."""
+    import pytest
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["000001"])
+    entries_map = {
+        "005930": (_empty_bar_frame_for("2026-09-07"), _fake_entry("005930", CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN")),
+        "000001": (_empty_bar_frame_for("2026-09-07"), _fake_entry("000001", CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN")),
+    }
+    fake_collect, _ = _archive_fakes(entries_map)
+    _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+
+    with pytest.raises(ValueError, match="cohort_contamination"):
+        archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+    manifests = store.read_manifests("2026-09-07")
+    assert not [m for m in manifests if m.context.run_id.startswith("archive-")]
+
+
+def test_genuine_cohort_after_holiday_passes(monkeypatch, tmp_path, caplog) -> None:
+    """Genuine cohort after holiday passes: Tuesday resolves against preceding Friday panel."""
+    import logging
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-08", ["005930", "000660"])
+    entries_map = {
+        code: (_empty_bar_frame_for("2026-09-08"), _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+        for code in ("005930", "000660")
+    }
+    fake_collect, seen = _archive_fakes(entries_map)
+    _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930", "000660"]})
+
+    with caplog.at_level(logging.INFO, logger=archive_intraday.logger.name):
+        result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-08", profile=_raw_profile(tmp_path))
+
+    assert result == (0, 0, 0)
+    assert seen["codes"][0] == ["005930", "000660"]
+    assert any("status=VERIFIED" in rec.message for rec in caplog.records)
+
+
+def test_paper_follow_symbols_exempt(monkeypatch, tmp_path) -> None:
+    """Paper-follow symbols exempt: ledger symbol absent from panel is appended without error."""
+    import pandas as pd
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+    entries_map = {
+        code: (_empty_bar_frame_for("2026-09-07"), _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+        for code in ("005930", "099999")
+    }
+    fake_collect, seen = _archive_fakes(entries_map)
+    _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+
+    class _Ledger:
+        def load_open_positions(self):
+            return pd.DataFrame({"symbol": ["099999"]})
+
+    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", lambda *a, **k: _Ledger())
+
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+
+    assert result == (0, 0, 0)
+    assert "099999" in seen["codes"][0]
+
+
+def test_missing_panel_fails_closed(monkeypatch, tmp_path) -> None:
+    """Missing panel fails closed: FileNotFoundError propagates before any vendor call."""
+    import pytest
+
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+
+    async def _never(*args, **kwargs):
+        raise AssertionError("vendor must not be called without panel")
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _never)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _never)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _never)
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _never)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _never)
+
+    with pytest.raises(FileNotFoundError):
+        archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
+
+
+def test_stale_panel_window_rejected(monkeypatch, tmp_path) -> None:
+    """Stale panel window rejected: no rows in the 14d window fails closed."""
+    import pytest
+
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+    fake_collect, _ = _archive_fakes(
+        {"005930": (_empty_bar_frame_for("2026-09-07"), _fake_entry("005930", __import__("src.data.capture_contracts", fromlist=["CaptureDataset"]).CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))}
+    )
+    _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    _seed_panel(tmp_path, {"2026-08-01": ["005930"]})
+
+    with pytest.raises(ValueError, match="stale price_history"):
+        archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
