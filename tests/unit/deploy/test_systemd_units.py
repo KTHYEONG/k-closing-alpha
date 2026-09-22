@@ -710,3 +710,14 @@ def test_daily_audit_and_backup_normalize_ownership_before_reading_container_wri
     # 컨테이너 유닛 자체는 이미 root로 쓰는 쪽이므로 이 정규화 훅이 필요 없다
     collect_text = (root / "kca-collect.service").read_text(encoding="utf-8")
     assert "ExecStartPre=/usr/bin/sudo /usr/bin/chown" not in collect_text
+
+
+def test_backup_prune_timer_runs_every_weekday() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-backup-prune.timer").read_text(encoding="utf-8")
+
+    assert "OnCalendar=Mon..Fri 21:00:00 Asia/Seoul" in text
+    assert "*-*-01" not in text
+    assert "Persistent=true" in text
