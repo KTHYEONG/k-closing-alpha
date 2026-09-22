@@ -34,7 +34,7 @@ from src.data.capture_contracts import (
     SessionClock,
 )
 from src.data.capture_store import CaptureStore
-from src.data.intraday_store import intraday_partition_path
+from src.data.intraday_store import intraday_partition_path, tick_partition_path
 from src.data.trading_calendar import is_kis_trading_day
 from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
@@ -42,6 +42,59 @@ from src.tools.alerts import dispatch_digest
 from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes
 
 logger = logging.getLogger(__name__)
+
+
+def _format_count_kr(n: int) -> str:
+    """건수를 한국어 만/건 단위로 축약 포맷팅한다."""
+    if n >= 10_000:
+        return f"{n / 10_000:.1f}만 건"
+    return f"{n:,}건"
+
+
+def _extract_paper_summary(snapshot_date: str) -> tuple[str, str]:
+    """사람이 읽기 좋은 NAV 및 당일 매수 진입 종목 요약을 추출한다."""
+    nav_str = "확인 불가"
+    entry_str = "당일 진입 없음"
+    try:
+        nav_path = Path(settings.PAPER_DIR) / "nav.parquet"
+        if nav_path.exists():
+            nav_df = pd.read_parquet(nav_path)
+            if not nav_df.empty:
+                latest = nav_df.iloc[-1]
+                val = latest.get("cash", latest.get("nav", None))
+                if val is not None and pd.notna(val):
+                    nav_str = f"{int(val):,}원"
+        fills_path = Path(settings.PAPER_DIR) / "fills.parquet"
+        if fills_path.exists():
+            fdf = pd.read_parquet(fills_path)
+            if not fdf.empty and "decision_date" in fdf.columns:
+                day_fills = fdf[(fdf["decision_date"].astype(str) == str(snapshot_date)) & (fdf["side"] == "buy")]
+                if not day_fills.empty and "symbol" in day_fills.columns:
+                    syms = list(dict.fromkeys(day_fills["symbol"].astype(str).tolist()))
+                    entry_str = f"{', '.join(syms[:3])} ({len(syms)}종목)"
+    except Exception as exc:
+        logger.debug("[SYS] stage=daily_audit extract_paper failed: %s", exc)
+    return nav_str, entry_str
+
+
+def _extract_intraday_summary(snapshot_date: str) -> tuple[str, str]:
+    """사람이 읽기 좋은 당일 정규장 1분봉 및 체결 틱 건수 요약을 추출한다."""
+    bars_str = "0건"
+    ticks_str = "0건"
+    try:
+        import pyarrow.parquet as pq
+
+        bp = intraday_partition_path(1, snapshot_date, "regular")
+        if bp.exists():
+            cnt = pq.ParquetFile(bp).metadata.num_rows
+            bars_str = _format_count_kr(cnt)
+        tp = tick_partition_path(snapshot_date, "regular")
+        if tp.exists():
+            cnt = pq.ParquetFile(tp).metadata.num_rows
+            ticks_str = _format_count_kr(cnt)
+    except Exception as exc:
+        logger.debug("[SYS] stage=daily_audit extract_intraday failed: %s", exc)
+    return bars_str, ticks_str
 
 DAY_WEEKEND: str = "weekend"
 DAY_HOLIDAY: str = "holiday"
@@ -482,11 +535,46 @@ def build_digest(
     lines.append(f"failed_units={','.join(failed_units) if failed_units else 'none'}")
     lines.append(f"stale_kis_tokens={','.join(stale_kis_tokens) if stale_kis_tokens else 'none'}")
     lines.append(f"collection_issues={','.join(collection_issues) if collection_issues else 'none'}")
-    if not missing and not failed_units and not stale_kis_tokens and not collection_issues:
-        label = "휴장일 SKIP" if day_kind == DAY_HOLIDAY else "일일점검 OK"
-        return f"[KCA] {snapshot_date} {label}", "\n".join(lines)
+
+    if day_kind == DAY_HOLIDAY:
+        label = "휴장일 SKIP"
+        header = (
+            "==================================================\n"
+            f"⏸️ K-Closing Alpha 휴장일 알림 ({snapshot_date})\n"
+            "==================================================\n"
+            "• 상태: ⏸️ 거래소 휴장일 (배치 스킵)\n\n"
+        )
+        return f"[kca] ⏸️ {snapshot_date} {label}", header + "[상세 내역]\n" + "\n".join(lines)
+
+    ignored_reasons = (":incomplete_entries", ":disabled", ":raw_disabled")
+    critical_collection = [
+        iss for iss in collection_issues
+        if not any(iss.endswith(suffix) for suffix in ignored_reasons)
+    ]
+    is_warning = bool(missing or failed_units or stale_kis_tokens or critical_collection)
+
+    if not is_warning:
+        nav_str, entry_str = _extract_paper_summary(snapshot_date)
+        bars_str, ticks_str = _extract_intraday_summary(snapshot_date)
+        subject = f"[kca] 🟢 {snapshot_date} 일일점검 완료 (정상)"
+        summary_block = [
+            "==================================================",
+            f"📊 K-Closing Alpha 일일 운영 요약 ({snapshot_date})",
+            "==================================================",
+            "• 상태: 🟢 전 단계 정상 완료 (누락 0 / 실패 0)",
+            f"• 자산: 💼 NAV {nav_str}",
+            f"• 진입: 🎯 {entry_str}",
+            f"• 데이터: 📦 1분봉 {bars_str} / 체결 틱 {ticks_str} 적재 완료",
+        ]
+        body = "\n".join(summary_block) + "\n\n[상세 내역]\n" + "\n".join(lines)
+        return subject, body
+
     problems = []
-    summary_lines = ["[🚨 일일점검 경고 요약]"]
+    summary_lines = [
+        "==================================================",
+        f"🚨 K-Closing Alpha 장애/누락 알림 ({snapshot_date})",
+        "==================================================",
+    ]
     if missing:
         problems.append(f"누락 {','.join(missing)}")
         summary_lines.append(f"• 누락 단계: {', '.join(missing)}")
@@ -496,11 +584,12 @@ def build_digest(
     if stale_kis_tokens:
         problems.append(f"KIS토큰누락 {','.join(stale_kis_tokens)}")
         summary_lines.append(f"• KIS 토큰 누락: {', '.join(stale_kis_tokens)}")
-    if collection_issues:
-        problems.append(f"수집이상 {','.join(collection_issues)}")
-        summary_lines.append(f"• 수집 이상: {', '.join(collection_issues)}")
+    if critical_collection:
+        problems.append(f"수집이상 {','.join(critical_collection)}")
+        summary_lines.append(f"• 수집 이상: {', '.join(critical_collection)}")
+    summary_lines.append("• 조치 안내: or-vps 서버 상태 점검 요망")
     body = "\n".join(summary_lines) + "\n\n[상세 내역]\n" + "\n".join(lines)
-    return f"[KCA] {snapshot_date} 일일점검 경고: {' / '.join(problems)}", body
+    return f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(problems)}", body
 
 
 
@@ -572,12 +661,15 @@ def run_daily_audit(
         snapshot_date, day_kind, result, failed_units_fn(), stale_tokens_fn(snapshot_date),
         collection_issues=collection_issues,
     )
-    has_warning = "경고:" in subject
+    has_warning = "경고:" in subject or "🚨" in subject
     if has_warning:
         logger.warning("[DATA] stage=daily_audit day=%s status=WARNING subject=%s", day_kind, subject)
         dispatch_fn(subject, body)
+    elif day_kind == DAY_HOLIDAY:
+        logger.info("[DATA] stage=daily_audit day=%s status=SKIP subject=%s (holiday dispatch skipped)", day_kind, subject)
     else:
-        logger.info("[DATA] stage=daily_audit day=%s status=OK subject=%s (dispatch skipped)", day_kind, subject)
+        logger.info("[DATA] stage=daily_audit day=%s status=OK subject=%s", day_kind, subject)
+        dispatch_fn(subject, body)
     return subject
 
 

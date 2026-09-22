@@ -535,7 +535,7 @@ def test_build_digest_ok_warning_and_holiday_subjects() -> None:
 
     # When/Then: 정상
     subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
-    assert subject == "[KCA] 2026-09-14 일일점검 OK"
+    assert subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
     assert "failed_units=none" in body
     assert "stale_kis_tokens=none" in body
 
@@ -550,7 +550,7 @@ def test_build_digest_ok_warning_and_holiday_subjects() -> None:
 
     # And: 휴장일
     subject, _ = daily_audit.build_digest("2026-09-24", daily_audit.DAY_HOLIDAY, None, [], [])
-    assert subject == "[KCA] 2026-09-24 휴장일 SKIP"
+    assert subject == "[kca] ⏸️ 2026-09-24 휴장일 SKIP"
 
     # And: 거래일인데 감사 결과가 없으면 거부
     with pytest.raises(ValueError, match="audit result required"):
@@ -590,10 +590,10 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         stale_tokens_fn=lambda _d: [],
         dispatch_fn=_dispatch,
     )
-    assert subject == "[KCA] 2026-09-24 휴장일 SKIP"
+    assert subject == "[kca] ⏸️ 2026-09-24 휴장일 SKIP"
     assert audited == [] and len(sent) == 0
 
-    # And: 거래일 정상 동작(OK)은 요약 발송 스킵
+    # And: 거래일 정상 동작(OK)은 요약 발송
     subject = daily_audit.run_daily_audit(
         "2026-09-14",
         trading_day_fn=lambda _d: True,
@@ -601,8 +601,9 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         stale_tokens_fn=lambda _d: [],
         dispatch_fn=_dispatch,
     )
-    assert subject == "[KCA] 2026-09-14 일일점검 OK"
-    assert audited == ["2026-09-14"] and len(sent) == 0
+    assert subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
+    assert audited == ["2026-09-14"] and len(sent) == 1
+    assert sent[0][0] == subject
 
     # And: 경고 발생 시에는 요약 발송
     subject = daily_audit.run_daily_audit(
@@ -613,8 +614,8 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         dispatch_fn=_dispatch,
     )
     assert "경고" in subject
-    assert len(sent) == 1
-    assert sent[0][0] == subject
+    assert len(sent) == 2
+    assert sent[1][0] == subject
 
 
 
@@ -1245,7 +1246,7 @@ def test_build_digest_includes_collection_issues_compatibly() -> None:
     subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
 
     # Then: 기존 형식 그대로
-    assert subject == "[KCA] 2026-09-14 일일점검 OK"
+    assert subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
     assert "collection_issues=none" in body
 
     # When: 수집 이상이 함께 보고된다
