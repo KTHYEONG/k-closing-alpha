@@ -1370,3 +1370,89 @@ def test_run_daily_audit_survives_collection_prep_failure(monkeypatch) -> None:
     # Then: 기존 감사는 계속되고 수집 감시는 unavailable으로 명시된다
     assert subject is not None and "collection:audit:1:unavailable" in subject
     assert len(sent) == 1
+
+
+def test_resolve_snapshot_date_treats_post_midnight_delay_as_prior_day() -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    # Given: 아카이브 지연으로 자정을 넘긴 실행
+    now = pd.Timestamp("2026-09-22 00:24", tz="Asia/Seoul")
+
+    # When
+    resolved = daily_audit.resolve_snapshot_date(now)
+
+    # Then: 전일자를 감사 대상으로 잡는다
+    assert resolved == "2026-09-21"
+
+
+def test_resolve_snapshot_date_keeps_scheduled_evening_run_on_same_day() -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    # Given: 정상 스케줄(평일 20:15 KST)
+    now = pd.Timestamp("2026-09-21 20:15", tz="Asia/Seoul")
+
+    # When
+    resolved = daily_audit.resolve_snapshot_date(now)
+
+    # Then
+    assert resolved == "2026-09-21"
+
+
+def test_resolve_snapshot_date_treats_cutoff_boundary_as_today() -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    # Given: 정확히 컷오프 시각 실행
+    now = pd.Timestamp("2026-09-21 12:00", tz="Asia/Seoul")
+
+    # When
+    resolved = daily_audit.resolve_snapshot_date(now, catchup_cutoff_hour=12)
+
+    # Then: 지연실행 창이 아니므로 당일
+    assert resolved == "2026-09-21"
+
+
+def test_resolve_snapshot_date_uses_plain_calendar_arithmetic_across_weekend() -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    # Given: 토요일 새벽 지연실행 (2026-09-26은 토요일)
+    now = pd.Timestamp("2026-09-26 03:00", tz="Asia/Seoul")
+    assert now.weekday() == 5
+
+    # When
+    resolved = daily_audit.resolve_snapshot_date(now)
+
+    # Then: 요일 보정 없이 하루 전(금요일) 반환
+    assert resolved == "2026-09-25"
+
+
+def test_main_skips_snapshot_resolution_when_date_is_explicit(monkeypatch) -> None:
+    import sys
+
+    from src.tools import daily_audit
+
+    calls: list = []
+    original = daily_audit.resolve_snapshot_date
+
+    def _spy(now, **kwargs):
+        calls.append(now)
+        return original(now, **kwargs)
+
+    monkeypatch.setattr(daily_audit, "resolve_snapshot_date", _spy)
+    seen: dict = {}
+    monkeypatch.setattr(daily_audit, "run_daily_audit", lambda d: seen.setdefault("date", d))
+    monkeypatch.setattr(sys, "argv", ["daily_audit", "--date", "2026-09-01"])
+
+    # When
+    daily_audit.main()
+
+    # Then
+    assert calls == []
+    assert seen["date"] == "2026-09-01"
