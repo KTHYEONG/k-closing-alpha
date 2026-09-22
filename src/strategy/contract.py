@@ -99,6 +99,7 @@ class UniverseSpec:
     min_market_cap_100m: float = 500.0
     exclude_ceiling: bool = True
     max_tick_cost_bp: float | None = None
+    exclude_non_screenable_class: bool = False
 
 
 @dataclass(frozen=True)
@@ -211,6 +212,8 @@ def select_universe(df: pd.DataFrame, spec: UniverseSpec = DEFAULT_UNIVERSE) -> 
         required = [*required, "is_ceiling"]
     if spec.max_tick_cost_bp is not None:
         required = [*required, "tick_cost_bp"]
+    if spec.exclude_non_screenable_class:
+        required = [*required, "is_screenable"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"select_universe missing required columns: {missing}")
@@ -233,6 +236,9 @@ def select_universe(df: pd.DataFrame, spec: UniverseSpec = DEFAULT_UNIVERSE) -> 
     if spec.max_tick_cost_bp is not None:
         tick_bp = df["tick_cost_bp"].to_numpy(dtype=np.float64)
         mask = mask & (tick_bp <= float(spec.max_tick_cost_bp))
+    if spec.exclude_non_screenable_class:
+        screenable = df["is_screenable"].to_numpy(dtype=bool)
+        mask = mask & screenable
     return np.asarray(mask, dtype=bool)
 
 

@@ -1066,6 +1066,7 @@ def test_main_filters_candidates_by_eligibility_before_quoting(monkeypatch) -> N
     monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
     monkeypatch.setattr(collect, "resolve_daily_candidates", AsyncMock(return_value=scanned))
     monkeypatch.setattr(collect, "load_eligible_codes", _eligible)
+    monkeypatch.setattr(collect, "load_security_classification", lambda *a, **k: frozenset({"005930", "138930", "0220W0", "000660", "500041"}))
     monkeypatch.setattr(collect, "fetch_all_stock_data", _fetch_all)
 
     # When
@@ -1125,6 +1126,7 @@ def test_main_fails_closed_when_eligibility_panel_is_stale(monkeypatch) -> None:
         AsyncMock(return_value=[{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "3.0"}]),
     )
     monkeypatch.setattr(collect, "load_eligible_codes", _stale)
+    monkeypatch.setattr(collect, "load_security_classification", lambda *a, **k: frozenset({"005930"}))
     monkeypatch.setattr(collect, "fetch_all_stock_data", fetch_all)
 
     # When / Then
@@ -1336,6 +1338,7 @@ def test_resolve_eligible_codes_passes_kis_resolved_prev_day_to_panel_lookup(mon
 
     monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
     monkeypatch.setattr(collect, "load_eligible_codes", _load)
+    monkeypatch.setattr(collect, "load_security_classification", lambda *a, **k: frozenset({"005930", "138930", "0220W0", "000660", "500041"}))
 
     # When
     out = asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
@@ -1405,6 +1408,7 @@ def test_main_resolves_previous_trading_day_through_kis_before_eligibility(monke
         AsyncMock(return_value=[{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "3.0"}]),
     )
     monkeypatch.setattr(collect, "load_eligible_codes", _eligible)
+    monkeypatch.setattr(collect, "load_security_classification", lambda *a, **k: frozenset({"005930", "138930", "0220W0", "000660", "500041"}))
     monkeypatch.setattr(collect, "fetch_all_stock_data", _fetch_all)
 
     # When
@@ -1696,6 +1700,9 @@ def test_resolve_eligible_codes_returns_all_listed_codes_without_history_filter(
     monkeypatch.setattr(
         collect, "load_eligible_codes", lambda decision_date, *, prev_trading_day, path=None: frozenset({"005930", "138930", "0220W0"})
     )
+    monkeypatch.setattr(
+        collect, "load_security_classification", lambda decision_date, *, prev_trading_day, path=None: frozenset({"005930", "138930", "0220W0"})
+    )
 
     # When
     out = asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
@@ -1920,6 +1927,7 @@ def test_main_issues_shard_token_and_fans_out_to_sharded_collect(monkeypatch) ->
         AsyncMock(return_value=[{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "3.0"}]),
     )
     monkeypatch.setattr(collect, "load_eligible_codes", _eligible)
+    monkeypatch.setattr(collect, "load_security_classification", lambda *a, **k: frozenset({"005930", "138930", "0220W0", "000660", "500041"}))
     monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _sharded)
 
     # When
@@ -2599,3 +2607,70 @@ def test_resolve_daily_candidates_forwards_scan_observer(monkeypatch) -> None:
     assert [row["code"] for row in out] == ["005930", "000660"]
     assert seen.get("on_page") is sentinel
     assert union_seen.get("on_page") is sentinel
+
+
+def test_resolve_eligible_codes_narrows_to_screenable_subset(monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    async def _kis(_client, _session, _date):
+        return True
+
+    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+    monkeypatch.setattr(
+        collect, "load_eligible_codes", lambda decision_date, *, prev_trading_day, path=None: frozenset({"A", "B", "C"})
+    )
+    monkeypatch.setattr(
+        collect, "load_security_classification", lambda decision_date, *, prev_trading_day, path=None: frozenset({"A", "C"})
+    )
+    out = asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
+    assert out == frozenset({"A", "C"})
+
+
+def test_resolve_eligible_codes_fails_on_classification_coverage_gap(monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+    import pytest
+
+    from src.daily import collect
+
+    async def _kis(_client, _session, _date):
+        return True
+
+    def _stale(decision_date, *, prev_trading_day, path=None):
+        raise ValueError("stale security_classification: no rows on prev_trading_day=2026-09-11")
+
+    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+    monkeypatch.setattr(
+        collect, "load_eligible_codes", lambda decision_date, *, prev_trading_day, path=None: frozenset({"A"})
+    )
+    monkeypatch.setattr(collect, "load_security_classification", _stale)
+    with pytest.raises(ValueError, match="no rows"):
+        asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
+
+
+def test_resolve_eligible_codes_fails_on_missing_classification_panel(monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+    import pytest
+
+    from src.daily import collect
+
+    async def _kis(_client, _session, _date):
+        return True
+
+    def _missing(decision_date, *, prev_trading_day, path=None):
+        raise FileNotFoundError("security_classification not found")
+
+    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+    monkeypatch.setattr(
+        collect, "load_eligible_codes", lambda decision_date, *, prev_trading_day, path=None: frozenset({"A"})
+    )
+    monkeypatch.setattr(collect, "load_security_classification", _missing)
+    with pytest.raises(FileNotFoundError, match="security_classification"):
+        asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))

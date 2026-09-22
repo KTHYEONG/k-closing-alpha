@@ -837,8 +837,12 @@ def test_price_ingest_main_runs_growth_shadow_then_t1_attribution_after_ingest(m
 
     calls = []
 
+    class _EmptyReport:
+        ingested_dates: list[str] = []
+
     async def fake_ingest(**_kwargs):
         calls.append("ingest")
+        return _EmptyReport()
 
     def fake_shadow():
         calls.append("shadow")
