@@ -398,5 +398,8 @@
   },
   "src/daily/auction_capture.py": {
     "testing": "tests/unit/daily/test_auction_capture.py"
+  },
+  "src/tools/capture_offsite.py": {
+    "testing": "tests/unit/tools/test_capture_offsite.py"
   }
 }
