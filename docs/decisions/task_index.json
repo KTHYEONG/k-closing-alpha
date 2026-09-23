@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "CAPTURE_OFFSITE_SEGMENT_BACKUP",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_CAPTURE_OFFSITE_SEGMENT_BACKUP",
+      "domain": "data_collection",
+      "title": "캡처 오프사이트 세그먼트 백업 도입 및 백업 헬스체크 배선",
+      "why": "gdrive는 초당 2~3 객체 생성만 허용하는데 capture raw/normalized가 하루 4만개 이상 개별 소파일을 만들어 kca-backup이 1시간 이상 지연됨",
+      "resolution": "raw/normalized를 trading_date 단위 append-only tar.zst 세그먼트로 봉인해 업로드-MD5검증-원장기록 순으로 오프사이트 반영하고, 나머지는 기존 loose copy를 유지하며 모든 gdrive 쓰기를 flock으로 직렬화, daily_audit에 백업 신선도 점검을 배선함",
+      "impact": "오프사이트 반영 객체수가 하루 4만개 수준에서 세그먼트 수십개로 줄어 백업 소요시간이 수시간에서 수분대로 단축되고, 백업 누락/실패/지연이 daily_audit 경고로 가시화됨",
+      "caveat": "capture/backups(로컬 스냅샷)와 staging은 오프사이트 제외 대상이며, or-vps에서의 실제 배포·flock 적용·복원 드릴·기존 loose 파일 정리는 별도 운영 절차로 남아있음"
+    },
+    {
       "task_id": "INTRADAY_ARCHIVE_CONCURRENCY_AND_WRITE_BATCHING",
       "date": "2026-09-22",
       "adr_id": "ADR_20260922_INTRADAY_ARCHIVE_CONCURRENCY_AND_WRITE_BATCHING",
@@ -997,16 +1008,6 @@
       "why": "Pooled top-1 backtests were dominated by unfillable +30%-ceiling picks, and the execution cost model briefly assumed the wrong microstructure before the operator confirmed both legs execute via continuous trading",
       "resolution": "Wired classify_ceiling_entry to drop ceiling rows from champion.py's dev/control_dev before HPO/promotion and to force Pass/0-allocation in predict.py's live output; reverted cost_model.py round_trip_ticks to 2.0 (both legs cross spread) and updated STATUTORY_COST_BP to 20bp (2026-01-01 KRX tax hike...",
       "impact": "First promoted champion this project has produced: candidate beats control +0.185pp/day net, p=0.006, Sharpe 4.18 vs 3.48 -- though still measured against the old 20bp cost constant baked into target_return, not the 46bp measured by execution_cost"
-    },
-    {
-      "task_id": "EXECUTION_COST_MODEL",
-      "date": "2026-09-05",
-      "adr_id": "ADR_20260905_EXECUTION_COST_MODEL",
-      "domain": "quant",
-      "title": "Measured Execution Cost Model",
-      "why": "The project's only cost model was one unmeasured constant (20bp) despite it being the actual binding constraint on the closing-auction strategy, not prediction quality",
-      "resolution": "Added src/execution/cost_model.py (KRX tick-band spread, statutory cost, measured decision-to-auction impact) wired to champion.py tuning_provenance only; fixed the same raw-KIS-partition symbol bug already found in buyability.py",
-      "impact": "Measured round-trip cost 47-51bp vs strategy break-even 40.6bp -- real cost exceeds break-even, invalidating every prior backtest that assumed the flat 20bp constant"
     }
   ]
 }
