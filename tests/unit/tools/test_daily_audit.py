@@ -579,6 +579,7 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         failed_units_fn=list,
         stale_tokens_fn=lambda _d: [],
         dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
     ) is None
     assert sent == [] and audited == []
 
@@ -589,6 +590,7 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         failed_units_fn=list,
         stale_tokens_fn=lambda _d: [],
         dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
     )
     assert subject == "[kca] ⏸️ 2026-09-24 휴장일 SKIP"
     assert audited == [] and len(sent) == 0
@@ -600,6 +602,7 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         failed_units_fn=lambda: [],
         stale_tokens_fn=lambda _d: [],
         dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
     )
     assert subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
     assert audited == ["2026-09-14"] and len(sent) == 1
@@ -612,6 +615,7 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         failed_units_fn=lambda: ["kca-predict.service"],
         stale_tokens_fn=lambda _d: [],
         dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
     )
     assert "경고" in subject
     assert len(sent) == 2
@@ -1293,6 +1297,7 @@ def test_run_daily_audit_keeps_unknown_calendar_visible(monkeypatch) -> None:
         failed_units_fn=lambda: ["kca-backup.service"],
         stale_tokens_fn=lambda _d: [],
         dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
     )
 
     # Then: 휴장일 면제로 숨지 않고 UNKNOWN이 그대로 보인다
@@ -1331,6 +1336,7 @@ def test_run_daily_audit_includes_collection_gaps(monkeypatch, tmp_path) -> None
         failed_units_fn=list,
         stale_tokens_fn=lambda _d: [],
         dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
     )
 
     # Then
@@ -1366,6 +1372,7 @@ def test_run_daily_audit_survives_collection_prep_failure(monkeypatch) -> None:
         failed_units_fn=list,
         stale_tokens_fn=lambda _d: [],
         dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
     )
 
     # Then: 기존 감사는 계속되고 수집 감시는 unavailable으로 명시된다
@@ -1457,3 +1464,53 @@ def test_main_skips_snapshot_resolution_when_date_is_explicit(monkeypatch) -> No
     # Then
     assert calls == []
     assert seen["date"] == "2026-09-01"
+
+
+def test_digest_warns_on_backup_issue() -> None:
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+
+    # Given all steps OK and one backup issue
+    subject, body = daily_audit.build_digest(
+        "2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [], backup_issues=["offsite_backup:stale"]
+    )
+
+    # Then warning subject with backup problem and detail line
+    assert "🚨" in subject and "백업이상" in subject
+    assert "backup_issues=offsite_backup:stale" in body
+    assert "• 백업 이상: offsite_backup:stale" in body
+
+
+def test_digest_ok_when_no_backup_issue() -> None:
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+
+    # Given all OK and no backup issues
+    subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
+
+    # Then green subject and none detail
+    assert "🟢" in subject
+    assert "backup_issues=none" in body
+
+
+def test_default_backup_issues_reads_report_under_capture_root(tmp_path, monkeypatch) -> None:
+    import json
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.tools import daily_audit
+
+    capture_root = tmp_path / "capture"
+    report_path = capture_root / "offsite" / "last_run.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps({"started_at": "2026-09-18T13:30:00+00:00", "finished_at": "2026-09-18T13:31:00+00:00", "status": "ok", "steps": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daily_audit, "_capture_root", lambda: capture_root)
+    audit_at = datetime(2026, 9, 21, 20, 15, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    # When reading through the default injection
+    assert daily_audit._default_backup_issues(audit_at) == []

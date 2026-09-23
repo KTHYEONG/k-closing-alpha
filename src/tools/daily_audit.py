@@ -34,11 +34,12 @@ from src.data.capture_contracts import (
     SessionClock,
 )
 from src.data.capture_store import CaptureStore
-from src.data.intraday_store import intraday_partition_path, tick_partition_path
+from src.data.intraday_store import _capture_root, intraday_partition_path, tick_partition_path
 from src.data.trading_calendar import is_kis_trading_day
 from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import dispatch_digest
+from src.tools.offsite_backup import REPORT_RELPATH, backup_staleness_issues
 from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes
 
 logger = logging.getLogger(__name__)
@@ -505,6 +506,7 @@ def build_digest(
     stale_kis_tokens: list[str],
     *,
     collection_issues: Sequence[str] = (),
+    backup_issues: Sequence[str] = (),
 ) -> tuple[str, str]:
     """일일 요약의 (제목, 본문)을 만든다.
 
@@ -535,6 +537,7 @@ def build_digest(
     lines.append(f"failed_units={','.join(failed_units) if failed_units else 'none'}")
     lines.append(f"stale_kis_tokens={','.join(stale_kis_tokens) if stale_kis_tokens else 'none'}")
     lines.append(f"collection_issues={','.join(collection_issues) if collection_issues else 'none'}")
+    lines.append(f"backup_issues={','.join(backup_issues) if backup_issues else 'none'}")
 
     if day_kind == DAY_HOLIDAY:
         label = "휴장일 SKIP"
@@ -551,7 +554,7 @@ def build_digest(
         iss for iss in collection_issues
         if not any(iss.endswith(suffix) for suffix in ignored_reasons)
     ]
-    is_warning = bool(missing or failed_units or stale_kis_tokens or critical_collection)
+    is_warning = bool(missing or failed_units or stale_kis_tokens or critical_collection or backup_issues)
 
     if not is_warning:
         nav_str, entry_str = _extract_paper_summary(snapshot_date)
@@ -587,6 +590,9 @@ def build_digest(
     if critical_collection:
         problems.append(f"수집이상 {','.join(critical_collection)}")
         summary_lines.append(f"• 수집 이상: {', '.join(critical_collection)}")
+    if backup_issues:
+        problems.append(f"백업이상 {','.join(backup_issues)}")
+        summary_lines.append(f"• 백업 이상: {', '.join(backup_issues)}")
     summary_lines.append("• 조치 안내: or-vps 서버 상태 점검 요망")
     body = "\n".join(summary_lines) + "\n\n[상세 내역]\n" + "\n".join(lines)
     return f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(problems)}", body
@@ -618,6 +624,10 @@ def resolve_snapshot_date(now: pd.Timestamp, *, catchup_cutoff_hour: int = _SNAP
     return str(now.date())
 
 
+def _default_backup_issues(audit_at: datetime) -> list[str]:
+    return backup_staleness_issues(_capture_root() / REPORT_RELPATH, audit_at)
+
+
 def run_daily_audit(
     snapshot_date: str,
     *,
@@ -625,6 +635,7 @@ def run_daily_audit(
     failed_units_fn: Callable[[], list[str]] = list_failed_kca_units,
     stale_tokens_fn: Callable[[str], list[str]] = list_stale_kis_tokens,
     dispatch_fn: Callable[[str, str], dict[str, bool]] = dispatch_digest,
+    backup_issues_fn: Callable[[datetime], list[str]] = _default_backup_issues,
 ) -> str | None:
     """평일 1회 점검 후 요약을 발송한다. 주말이면 아무것도 보내지 않는다.
 
@@ -634,6 +645,7 @@ def run_daily_audit(
         failed_units_fn: 실패 유닛 조회 주입(테스트용).
         stale_tokens_fn: 호스트 발급 KIS 토큰 커버리지 조회 주입(테스트용).
         dispatch_fn: 요약 발송 주입(테스트용).
+        backup_issues_fn: 오프사이트 백업 신선도 조회 주입(테스트용).
 
     Returns:
         발송한 요약 제목. 주말이면 None.
@@ -660,6 +672,7 @@ def run_daily_audit(
     subject, body = build_digest(
         snapshot_date, day_kind, result, failed_units_fn(), stale_tokens_fn(snapshot_date),
         collection_issues=collection_issues,
+        backup_issues=backup_issues_fn(audit_at),
     )
     has_warning = "경고:" in subject or "🚨" in subject
     if has_warning:

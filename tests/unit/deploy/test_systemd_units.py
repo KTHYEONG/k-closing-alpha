@@ -103,14 +103,30 @@ def test_backup_timer_schedule_is_after_daily_audit_timer() -> None:
     assert backup_time > audit_time
 
 
-def test_backup_uses_backup_dir_instead_of_bare_sync() -> None:
+def test_backup_service_runs_offsite_runner_under_shared_drive_lock() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     text = (root / "kca-backup.service").read_text(encoding="utf-8")
+    exec_lines = [line for line in text.splitlines() if line.startswith("ExecStart=")]
 
-    assert "--backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/data/" in text
-    assert "--backup-dir gdrive:quant-lake/live/k-closing-alpha/_deleted/artifacts/" in text
+    assert len(exec_lines) == 1
+    assert "/usr/bin/flock -w" in exec_lines[0]
+    assert "%t/quant-gdrive.lock" in exec_lines[0]
+    assert "src.tools.offsite_backup" in exec_lines[0]
+    assert "TimeoutStartSec=" in text
+    assert "rclone" not in text
+
+
+def test_backup_prune_service_holds_shared_drive_lock() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-backup-prune.service").read_text(encoding="utf-8")
+
+    assert "ExecStart=/usr/bin/flock -w 7200 %t/quant-gdrive.lock" in text
+    assert "src.tools.backup_prune" in text
+    assert "TimeoutStartSec=" in text
 
 
 def test_backup_prune_timer_exists_and_targets_service() -> None:
@@ -200,37 +216,6 @@ def test_containerized_units_use_shared_image_and_new_env_file() -> None:
         assert "ghcr.io/kthyeong/k-closing-alpha:latest" in text, name
         assert "--env-file %h/quant-secrets/k-closing-alpha.env" in text, name
         assert "%h/k-closing-alpha/.env" not in text, name
-
-
-def test_backup_service_copies_data_and_artifacts_to_gdrive_without_deleting() -> None:
-    import pathlib
-
-    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    text = (root / "kca-backup.service").read_text(encoding="utf-8")
-    exec_lines = [line for line in text.splitlines() if line.startswith("ExecStart=")]
-
-    assert len(exec_lines) == 2
-    assert all("rclone copy" in line for line in exec_lines)
-    assert "rclone sync" not in text
-    assert "--exclude" not in text
-    assert "gdrive:quant-lake/live/k-closing-alpha/data" in text
-    assert "gdrive:quant-lake/live/k-closing-alpha/artifacts" in text
-
-
-def test_backup_uses_higher_transfer_concurrency_for_many_small_files() -> None:
-    """실측 회귀: capture 아티팩트별 개별 파일화로 하루 수천개의 소용량 원본이
-    쌓이면서(2026-09-18 실측 2,477개) 기본 --transfers=4로는 gdrive 백업이
-    32분까지 늘어졌다. 파일당 지연시간이 병목이므로(대역폭 아님) 동시성을
-    높여 완료 시간을 단축한다."""
-    import pathlib
-
-    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    text = (root / "kca-backup.service").read_text(encoding="utf-8")
-    exec_lines = [line for line in text.splitlines() if line.startswith("ExecStart=")]
-
-    assert all("--transfers 32" in line for line in exec_lines)
-    assert all("--checkers 32" in line for line in exec_lines)
-    assert all("--fast-list" in line for line in exec_lines)
 
 
 def test_backup_prune_service_runs_dated_directory_pruner() -> None:
