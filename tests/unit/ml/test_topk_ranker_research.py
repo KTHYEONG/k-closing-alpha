@@ -1669,3 +1669,29 @@ def test_build_dual_pool_attaches_lagged_flow_features() -> None:
     later = pool[pool["date"] != first_day]
     assert np.isfinite(later["inst_density"].to_numpy(dtype=np.float64)).all()
     assert np.isfinite(later["inst_rank"].to_numpy(dtype=np.float64)).all()
+
+
+def test_assert_bundle_screen_parity_reads_missing_field_as_default() -> None:
+    import dataclasses
+
+    import pytest
+
+    from src.ml.topk_ranker_research import assert_bundle_screen_parity
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    # Given: 필드 도입 이전에 인증되어 키가 없는 구 번들
+    legacy = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    legacy.pop("exclude_non_screenable_class")
+
+    # When / Then: 라이브가 기본값이면 통과
+    assert assert_bundle_screen_parity({"select_universe": legacy}) is None
+
+    # And: 라이브가 기본값에서 벗어나면 재인증 전까지 차단
+    live = dataclasses.replace(COST_AWARE_UNIVERSE, exclude_non_screenable_class=True)
+    with pytest.raises(ValueError, match="exclude_non_screenable_class"):
+        assert_bundle_screen_parity({"select_universe": legacy}, live)
+
+    # And: 라이브가 모르는 필드를 가진 번들도 fail-closed
+    extra = {**dataclasses.asdict(COST_AWARE_UNIVERSE), "future_field": True}
+    with pytest.raises(ValueError, match="future_field"):
+        assert_bundle_screen_parity({"select_universe": extra})

@@ -182,9 +182,15 @@ def assert_bundle_screen_parity(bundle: dict[str, Any], spec: UniverseSpec = COS
     if not isinstance(screened, dict):
         raise ValueError(f"bundle select_universe is not certified: got {screened!r}")
     live = dataclasses.asdict(spec)
-    differing = [k for k in live if _screen_value(screened.get(k)) != _screen_value(live[k])]
+    unknown = sorted(set(screened) - set(live))
+    if unknown:
+        raise ValueError(f"bundle select_universe carries fields unknown to live screen: {unknown}")
+    # 번들에 없는 키 = 필드 도입 이전 학습 → 기본값(도입 이전 동작)으로 학습된 것으로 간주
+    defaults = dataclasses.asdict(UniverseSpec())
+    certified = {k: screened.get(k, defaults[k]) for k in live}
+    differing = [k for k in live if _screen_value(certified[k]) != _screen_value(live[k])]
     if differing:
-        bundle_vals = {k: screened.get(k) for k in differing}
+        bundle_vals = {k: certified[k] for k in differing}
         live_vals = {k: live[k] for k in differing}
         raise ValueError(
             f"bundle select_universe differs from live screen in fields {differing}: "
