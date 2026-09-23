@@ -93,6 +93,13 @@ class CostSpec:
 
 @dataclass(frozen=True)
 class UniverseSpec:
+    """Universe admission screen.
+
+    New fields must default to the behavior that predates them: bundles certified
+    before a field existed omit its key, and screen parity reads the omission as
+    the default.
+    """
+
     chg_min: float = None  # private strategy store
     chg_max: float = None  # private strategy store
     min_trade_value_100m: float = 100.0
