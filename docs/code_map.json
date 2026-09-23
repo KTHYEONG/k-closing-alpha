@@ -401,5 +401,8 @@
   },
   "src/tools/capture_offsite.py": {
     "testing": "tests/unit/tools/test_capture_offsite.py"
+  },
+  "src/tools/offsite_legacy_cleanup.py": {
+    "testing": "tests/unit/tools/test_offsite_legacy_cleanup.py"
   }
 }
