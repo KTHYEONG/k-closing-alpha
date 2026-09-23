@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_20260923_GDRIVE_OFFSITE_LEGACY_CLEANUP",
+      "date": "2026-09-23",
+      "adr_id": "ADR_20260923_20260923_GDRIVE_OFFSITE_LEGACY_CLEANUP",
+      "domain": "data_collection",
+      "title": "kca 세그먼트 이전 loose 캡처 잔재 및 롤백 스냅샷 사본 Drive 정리 도구 도입",
+      "why": "세그먼트 백업 도입 전 파일단위로 올라간 raw/normalized 5.4만개와 로컬전용 롤백 스냅샷의 우발적 Drive 사본 2.4천개(8.3GB)가 남아 Drive 객체수 부담을 더한다",
+      "resolution": "봉인 세그먼트 원장과 원격 MD5로 무손실 대체가 증명된 loose 파일만, 그리고 backups/ 하위 전량을 대상으로 복원 드릴 통과 후 공용 락 안에서 파일목록 기반 일괄 rclone delete로 제거하는 offsite_legacy_cleanup을 추가했다",
+      "impact": "Drive 객체수가 수만개 수준에서 정리되고 공용 락 점유시간이 파일당 호출 대비 대폭 줄어든다",
+      "caveat": "오늘 밤 첫 세그먼트 백업 성공과 last_run.json status=ok 확인 전까지는 --apply를 실행하지 않는다"
+    },
+    {
       "task_id": "CAPTURE_OFFSITE_SEGMENT_BACKUP",
       "date": "2026-09-23",
       "adr_id": "ADR_20260923_CAPTURE_OFFSITE_SEGMENT_BACKUP",
@@ -998,16 +1009,6 @@
       "why": "The promoted champion's target_return still subtracted the unmeasured legacy 20bp cost while four independent measurements and the pipeline's own provenance put real round-trip cost at ~46bp.",
       "resolution": "Split ROUND_TRIP_COST_RATIO in inference.py into _STATUTORY_COST_RATIO(0.0020)+_SPREAD_COST_RATIO(0.0026)=0.0046 and re-ran the full tuned retrain to re-validate promotion.",
       "impact": "Promotion verdict holds under honest cost (Δ+0.326pp/day, p<0.0001, promoted=true); target_good/bad class balance shifts 31.5/26.1% -> 28.2/29.9% with thresholds unchanged."
-    },
-    {
-      "task_id": "CEILING_EXCLUDED_PROMOTION_POOL",
-      "date": "2026-09-06",
-      "adr_id": "ADR_20260906_CEILING_EXCLUDED_PROMOTION_POOL",
-      "domain": "quant",
-      "title": "Ceiling-Excluded Training/Promotion Pool + Cost Model Microstructure Fix",
-      "why": "Pooled top-1 backtests were dominated by unfillable +30%-ceiling picks, and the execution cost model briefly assumed the wrong microstructure before the operator confirmed both legs execute via continuous trading",
-      "resolution": "Wired classify_ceiling_entry to drop ceiling rows from champion.py's dev/control_dev before HPO/promotion and to force Pass/0-allocation in predict.py's live output; reverted cost_model.py round_trip_ticks to 2.0 (both legs cross spread) and updated STATUTORY_COST_BP to 20bp (2026-01-01 KRX tax hike...",
-      "impact": "First promoted champion this project has produced: candidate beats control +0.185pp/day net, p=0.006, Sharpe 4.18 vs 3.48 -- though still measured against the old 20bp cost constant baked into target_return, not the 46bp measured by execution_cost"
     }
   ]
 }
