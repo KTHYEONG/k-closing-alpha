@@ -8,4 +8,5 @@ Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
-ExecStart=%h/.local/bin/uv run python -m src.tools.backup_prune
+TimeoutStartSec=3h
+ExecStart=/usr/bin/flock -w 7200 %t/quant-gdrive.lock %h/.local/bin/uv run python -m src.tools.backup_prune
