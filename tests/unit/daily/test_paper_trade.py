@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 
+async def _open_day(_day: str) -> bool:
+    return True
+
+
 def test_build_entry_orders_sizes_and_skips_zero_qty() -> None:
     import pandas as pd
 
@@ -453,7 +457,7 @@ def test_run_paper_session_exit_fills_at_krx_open_quote(tmp_path, monkeypatch) -
     # When
     n = asyncio.run(
         paper_trade.run_paper_session(
-            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, quote_fn=_quote,
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, quote_fn=_quote, trading_day_fn=_open_day,
             now_fn=lambda: pd.Timestamp("2026-09-11 09:01:00", tz="Asia/Seoul"),
         )
     )
@@ -516,7 +520,7 @@ def test_run_paper_session_exit_retries_open_quote_then_leaves_unavailable_lot_o
     with caplog.at_level(logging.WARNING, logger="src.daily.paper_trade"):
         n = asyncio.run(
             paper_trade.run_paper_session(
-                pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, quote_fn=_quote,
+                pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, quote_fn=_quote, trading_day_fn=_open_day,
                 now_fn=lambda: pd.Timestamp("2026-09-11 09:01:00", tz=kst), sleep_fn=_sleep,
             )
         )
@@ -563,7 +567,7 @@ def test_run_paper_session_exit_waits_until_open_quote_is_trustworthy(tmp_path, 
     # When: 08:59:00 기동(부팅 캐치업 등) -> 09:00:30까지 대기
     n = asyncio.run(
         paper_trade.run_paper_session(
-            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, quote_fn=_quote,
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, quote_fn=_quote, trading_day_fn=_open_day,
             now_fn=lambda: pd.Timestamp("2026-09-11 08:59:00", tz="Asia/Seoul"), sleep_fn=_sleep,
         )
     )
@@ -597,7 +601,7 @@ def test_run_paper_session_exit_rejects_non_same_day_run(tmp_path) -> None:
     with pytest.raises(ValueError, match="same-day"):
         asyncio.run(
             paper_trade.run_paper_session(
-                pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, quote_fn=_quote,
+                pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, quote_fn=_quote, trading_day_fn=_open_day,
                 now_fn=lambda: pd.Timestamp("2026-09-12 09:01:00", tz="Asia/Seoul"),
             )
         )
@@ -621,7 +625,7 @@ def test_run_paper_session_exit_skips_without_open_positions(tmp_path) -> None:
     # When
     n = asyncio.run(
         paper_trade.run_paper_session(
-            pd.Timestamp("2026-09-14"), phase="exit", ledger=ledger, quote_fn=_quote,
+            pd.Timestamp("2026-09-14"), phase="exit", ledger=ledger, quote_fn=_quote, trading_day_fn=_open_day,
             now_fn=lambda: pd.Timestamp("2026-09-14 09:01:00", tz="Asia/Seoul"),
         )
     )
@@ -660,7 +664,7 @@ def test_run_paper_session_exit_closes_two_lots_of_same_symbol_at_one_open(tmp_p
     # When
     n = asyncio.run(
         paper_trade.run_paper_session(
-            pd.Timestamp("2026-09-12"), phase="exit", ledger=ledger, quote_fn=_quote,
+            pd.Timestamp("2026-09-12"), phase="exit", ledger=ledger, quote_fn=_quote, trading_day_fn=_open_day,
             now_fn=lambda: pd.Timestamp("2026-09-12 09:01:00", tz=kst),
         )
     )
@@ -744,7 +748,7 @@ def test_run_paper_session_exit_default_quote_uses_data_account_client(tmp_path,
     # When
     n = asyncio.run(
         paper_trade.run_paper_session(
-            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, session=object(),
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, session=object(), trading_day_fn=_open_day,
             now_fn=lambda: pd.Timestamp("2026-09-11 09:01:00", tz="Asia/Seoul"),
         )
     )
@@ -752,3 +756,120 @@ def test_run_paper_session_exit_default_quote_uses_data_account_client(tmp_path,
     # Then
     assert n == 1
     assert built == [{"app_key": "DATA_KEY", "app_secret": "DATA_SECRET"}]
+
+
+def _seed_open_lot(tmp_path):
+    import pandas as pd
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [{"order_id": "2026-09-23:005930:entry", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
+          "filled_at": pd.Timestamp("2026-09-23 15:30:20", tz="Asia/Seoul"), "decision_date": "2026-09-23",
+          "trigger": "auction_close"}],
+        kind="fills",
+    )
+    return ledger
+
+
+def test_run_paper_session_exit_on_holiday_keeps_lots_open_without_quoting(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+
+    # Given: 평일 휴장일(2026-09-24) 아침, 전일 진입 로트 1개. 휴장일에도 시세 API는 직전 시가를 돌려준다.
+    monkeypatch.setattr(paper_trade.settings, "PAPER_SEED_CAPITAL", 10_000_000)
+    ledger = _seed_open_lot(tmp_path)
+    asked: list[str] = []
+
+    async def _stale_quote(code: str) -> int:
+        asked.append(code)
+        return 69_000
+
+    async def _holiday(_day: str) -> bool:
+        return False
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-24"), phase="exit", ledger=ledger, quote_fn=_stale_quote, trading_day_fn=_holiday,
+            now_fn=lambda: pd.Timestamp("2026-09-24 09:01:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then: 체결·주문 기록 없음, 로트는 다음 실제 시가까지 유지
+    assert n == 0
+    assert asked == []
+    assert ledger.load("orders").empty
+    assert (ledger.load("fills")["side"] == "buy").all()
+    assert ledger.load_open_positions()["entry_order_id"].tolist() == ["2026-09-23:005930:entry"]
+
+
+def test_run_paper_session_exit_fails_closed_when_trading_day_oracle_fails(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+    import pytest
+
+    from src.daily import paper_trade
+
+    monkeypatch.setattr(paper_trade.settings, "PAPER_SEED_CAPITAL", 10_000_000)
+    ledger = _seed_open_lot(tmp_path)
+
+    async def _quote(code: str) -> int:
+        raise AssertionError("must not quote when the trading day is unknown")
+
+    async def _oracle_down(_day: str) -> bool:
+        raise RuntimeError("KIS trading-day oracle failed rt_cd=1")
+
+    with pytest.raises(RuntimeError, match="oracle failed"):
+        asyncio.run(
+            paper_trade.run_paper_session(
+                pd.Timestamp("2026-09-24"), phase="exit", ledger=ledger, quote_fn=_quote, trading_day_fn=_oracle_down,
+                now_fn=lambda: pd.Timestamp("2026-09-24 09:01:00", tz="Asia/Seoul"),
+            )
+        )
+
+    assert ledger.load("orders").empty
+    assert len(ledger.load_open_positions()) == 1
+
+
+def test_run_paper_session_exit_default_oracle_uses_data_account_index_history(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+
+    monkeypatch.setattr(paper_trade.settings, "PAPER_SEED_CAPITAL", 10_000_000)
+    ledger = _seed_open_lot(tmp_path)
+    asked_days: list[str] = []
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def get_market_index_history(self, session, code, start, end):
+            asked_days.append(start)
+            # 휴장일 조회는 요청일 행 없이 직전 거래일 행만 돌려준다
+            return {"rt_cd": "0", "output2": [{"stck_bsop_date": "20260923"}]}
+
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            raise AssertionError("must not quote on a holiday")
+
+    monkeypatch.setattr(paper_trade, "KisApiClient", _FakeClient)
+    monkeypatch.setattr(paper_trade, "kis_data_client_kwargs", lambda: {})
+
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-24"), phase="exit", ledger=ledger, session=object(),
+            now_fn=lambda: pd.Timestamp("2026-09-24 09:01:00", tz="Asia/Seoul"),
+        )
+    )
+
+    assert n == 0
+    assert asked_days == ["20260924"]
+    assert len(ledger.load_open_positions()) == 1
