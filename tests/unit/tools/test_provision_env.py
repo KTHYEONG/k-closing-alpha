@@ -281,10 +281,9 @@ def test_main_builds_before_install_and_dry_run_installs_nothing(tmp_path, monke
     import src.tools.provision_env as cli
 
     events: list[str] = []
-
+    _stub_remote(monkeypatch, cli, env_text="", commit="abc")
     monkeypatch.setattr(cli, "build_runtime_fragment", lambda path: events.append("build") or "KIS_APP_SECRET=secret-value\n")
     monkeypatch.setattr(cli, "install_runtime_fragment", lambda host, fragment: events.append(f"install:{host}"))
-
     source = tmp_path / ".quant.env"
     source.write_text("KIS_APP_SECRET=secret-value\n", encoding="utf-8")
 
@@ -344,3 +343,287 @@ def test_build_runtime_fragment_required_key_absent_fails_closed(tmp_path) -> No
     source.write_text("\n".join(_full_source_lines(exclude={"OPENDART_API_KEY"})) + "\n", encoding="utf-8")
     with pytest.raises(ProvisioningError):
         build_runtime_fragment(source)
+
+
+def test_merge_remote_env_preserves_foreign_keys_and_replaces_managed(monkeypatch) -> None:
+    from src.tools.provision_env import VPS_SELECTORS, merge_remote_env
+
+    fragment = "KIS_APP_KEY=new-key\nOPENDART_API_KEY=dart-new\n"
+    remote = "\n".join(
+        [
+            "# operator note",
+            "KIS_APP_KEY=stale-key",
+            "OPENDART_API_KEY_2=removed-locally-value",
+            "KIS_DECISION_SHARD_SLOTS=9,9",
+            "SOME_HOST_ONLY_FLAG=keep-me",
+            "SOME_HOST_ONLY_FLAG=keep-me-latest",
+            "",
+        ]
+    )
+
+    merged, preserved = merge_remote_env(fragment, remote)
+
+    lines = merged.splitlines()
+    assert lines[:2] == fragment.splitlines()
+    assert lines[2 : 2 + len(VPS_SELECTORS)] == [f"{name}={value}" for name, value in VPS_SELECTORS]
+    assert lines[-1] == "SOME_HOST_ONLY_FLAG=keep-me-latest"
+    assert preserved == ("SOME_HOST_ONLY_FLAG",)
+    assert "stale-key" not in merged
+    assert "removed-locally-value" not in merged
+    assert "9,9" not in merged
+    assert len(lines) == len({line.partition("=")[0] for line in lines})
+    assert merged.endswith("\n")
+
+
+def test_merge_remote_env_on_absent_remote_emits_fragment_and_selectors_only() -> None:
+    from src.tools.provision_env import VPS_SELECTORS, merge_remote_env
+
+    merged, preserved = merge_remote_env("KIS_APP_KEY=k\n", "")
+
+    assert preserved == ()
+    assert merged.splitlines() == ["KIS_APP_KEY=k", *[f"{n}={v}" for n, v in VPS_SELECTORS]]
+
+
+def test_vps_selectors_form_a_valid_runtime_configuration() -> None:
+    """Selectors must satisfy the project's own parsers against the documented pool."""
+    from src.api.kis.key_pool import resolve_decision_shard_credentials, resolve_research_credentials
+    from src.config.collection import CollectionSettings
+    from src.tools.provision_env import VPS_SELECTORS
+
+    env = dict(VPS_SELECTORS)
+    env.update({"KIS_DATA_SLOTS": "1,2,3,4,5", "KIS_HOST_DATA_SLOTS": "1,2,3,4", "KIS_APP_KEY": "primary"})
+    for slot in range(1, 6):
+        env[f"KIS_DATA_{slot}_APP_KEY"] = f"key-{slot}"
+        env[f"KIS_DATA_{slot}_APP_SECRET"] = f"secret-{slot}"
+
+    profile = CollectionSettings(
+        _env_file=None,
+        COLLECTION_AUCTION_ENABLED=env["COLLECTION_AUCTION_ENABLED"],
+        COLLECTION_ALTDATA_ENABLED=env["COLLECTION_ALTDATA_ENABLED"],
+        COLLECTION_RESEARCH_SLOTS=env["COLLECTION_RESEARCH_SLOTS"],
+    )
+    research = resolve_research_credentials(env, slots=profile.COLLECTION_RESEARCH_SLOTS)
+    shards = resolve_decision_shard_credentials(env)
+
+    extras = resolve_research_credentials(env, slots=CollectionSettings(
+        _env_file=None, COLLECTION_ALTDATA_EXTRA_SLOTS=env["COLLECTION_ALTDATA_EXTRA_SLOTS"]
+    ).COLLECTION_ALTDATA_EXTRA_SLOTS)
+
+    assert profile.COLLECTION_AUCTION_ENABLED and profile.COLLECTION_ALTDATA_ENABLED
+    assert len(research) >= 1
+    assert len(shards) >= 2
+    assert len(extras) >= 1
+    shard_slots = {c.slot for c in shards}
+    assert {c.slot for c in research}.isdisjoint(shard_slots)
+
+
+def test_intraday_kca_slots_never_share_the_krx_snapshot_slot() -> None:
+    """krx snapshot REST owns its slot 08:00-15:39; kca intraday users must avoid it."""
+    from src.tools.provision_env import KRX_SNAPSHOT_DATA_SLOT, VPS_SELECTORS
+
+    env = dict(VPS_SELECTORS)
+    decision_lead = "1"  # KIS_HOST_DATA_SLOTS 선두 = 결정 역할
+    intraday = {decision_lead, *env["KIS_DECISION_SHARD_SLOTS"].split(","), *env["COLLECTION_RESEARCH_SLOTS"].split(",")}
+    assert KRX_SNAPSHOT_DATA_SLOT not in intraday
+
+
+def _stub_remote(monkeypatch, cli, *, env_text: str, commit: str, local: str | None = None, validate=None) -> None:
+    monkeypatch.setattr(cli, "read_remote_state", lambda host: cli.RemoteState(env_text=env_text, kis_data_text="", image_commit=commit))
+    monkeypatch.setattr(cli, "local_code_commit", lambda repo: commit if local is None else local)
+    monkeypatch.setattr(cli, "validate_runtime_env", validate or (lambda env_text, kis_text: None))
+
+
+def _kis_data_text() -> str:
+    lines = ["KIS_DATA_SLOTS=1,2,3,4,5", "KIS_HOST_DATA_SLOTS=1,2,3,4"]
+    for slot in range(1, 6):
+        lines += [f"KIS_DATA_{slot}_APP_KEY=key-{slot}", f"KIS_DATA_{slot}_APP_SECRET=secret-{slot}", f"KIS_DATA_{slot}_HTS_ID=hts"]
+    return "\n".join(lines) + "\n"
+
+
+def _valid_env_text() -> str:
+    from src.tools.provision_env import VPS_SELECTORS
+
+    base = ["KIS_APP_KEY=primary", "KIS_APP_SECRET=primary-secret", "OPENDART_API_KEY=dart-1"]
+    return "\n".join(base + [f"{n}={v}" for n, v in VPS_SELECTORS]) + "\n"
+
+
+def test_validate_runtime_env_accepts_the_declared_host_configuration(monkeypatch) -> None:
+    from src.tools.provision_env import validate_runtime_env
+
+    # 워크스테이션 환경변수가 검증 결과를 바꾸면 안 된다(대상 파일만 반영).
+    monkeypatch.setenv("COLLECTION_AUCTION_ENABLED", "false")
+    validate_runtime_env(_valid_env_text(), _kis_data_text())
+
+
+def test_validate_runtime_env_rejects_silently_disabled_collection() -> None:
+    import pytest
+
+    from src.tools.provision_env import ProvisioningError, validate_runtime_env
+
+    text = "\n".join(line for line in _valid_env_text().splitlines() if not line.startswith("COLLECTION_ALTDATA_ENABLED")) + "\n"
+    with pytest.raises(ProvisioningError, match="COLLECTION_ALTDATA_ENABLED"):
+        validate_runtime_env(text, _kis_data_text())
+
+
+def test_validate_runtime_env_rejects_unresolvable_slots_without_leaking_values() -> None:
+    import pytest
+
+    from src.tools.provision_env import ProvisioningError, validate_runtime_env
+
+    kis = "\n".join(line for line in _kis_data_text().splitlines() if not line.startswith("KIS_DATA_5_")) + "\n"
+    with pytest.raises(ProvisioningError, match="DATA_5") as exc_info:
+        validate_runtime_env(_valid_env_text(), kis)
+    assert "secret-" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_validate_runtime_env_rejects_unparsable_collection_value() -> None:
+    import pytest
+
+    from src.tools.provision_env import ProvisioningError, validate_runtime_env
+
+    text = _valid_env_text().replace("COLLECTION_RESEARCH_SLOTS=3,4", "COLLECTION_RESEARCH_SLOTS=DATA_3")
+    with pytest.raises(ProvisioningError, match="COLLECTION_RESEARCH_SLOTS"):
+        validate_runtime_env(text, _kis_data_text())
+
+
+def test_validate_runtime_env_requires_a_dart_key_when_altdata_enabled() -> None:
+    import pytest
+
+    from src.tools.provision_env import ProvisioningError, validate_runtime_env
+
+    text = _valid_env_text().replace("OPENDART_API_KEY=dart-1\n", "")
+    with pytest.raises(ProvisioningError, match="OpenDART"):
+        validate_runtime_env(text, _kis_data_text())
+
+
+def test_diff_env_names_reports_names_only() -> None:
+    from src.tools.provision_env import diff_env_names
+
+    added, removed, changed = diff_env_names("A=1\nB=2\nC=3\n", "A=1\nB=20\nD=4\n")
+
+    assert (added, removed, changed) == (("D",), ("C",), ("B",))
+
+
+def test_main_refuses_removal_without_flag_and_never_installs(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    import src.tools.provision_env as cli
+
+    _stub_remote(monkeypatch, cli, env_text="OPENDART_API_KEY_2=old\n", commit="abc")
+    monkeypatch.setattr(cli, "build_runtime_fragment", lambda path: "KIS_APP_KEY=k\n")
+    monkeypatch.setattr(cli, "install_runtime_fragment", lambda host, text: pytest.fail("must not install"))
+
+    with pytest.raises(cli.ProvisioningError, match="OPENDART_API_KEY_2"):
+        cli.main(["--source", str(tmp_path / "x")])
+
+    installed: list[str] = []
+    monkeypatch.setattr(cli, "install_runtime_fragment", lambda host, text: installed.append(text))
+    assert cli.main(["--source", str(tmp_path / "x"), "--allow-remove"]) == 0
+    assert "OPENDART_API_KEY_2" not in installed[0]
+
+
+def test_main_refuses_version_skew_even_on_dry_run(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    import src.tools.provision_env as cli
+
+    monkeypatch.setattr(cli, "build_runtime_fragment", lambda path: "KIS_APP_KEY=k\n")
+    monkeypatch.setattr(cli, "install_runtime_fragment", lambda host, text: pytest.fail("must not install"))
+    for local in ("new-commit", ""):
+        _stub_remote(monkeypatch, cli, env_text="", commit="old-commit", local=local)
+        with pytest.raises(cli.ProvisioningError, match="deploy first"):
+            cli.main(["--source", str(tmp_path / "x"), "--dry-run"])
+    assert cli.main(["--source", str(tmp_path / "x"), "--dry-run", "--allow-version-skew"]) == 0
+
+
+def test_main_validation_failure_blocks_install(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    import src.tools.provision_env as cli
+
+    def _invalid(env_text: str, kis_text: str) -> None:
+        raise cli.ProvisioningError("collection settings invalid: COLLECTION_RESEARCH_SLOTS")
+
+    _stub_remote(monkeypatch, cli, env_text="", commit="abc", validate=_invalid)
+    monkeypatch.setattr(cli, "build_runtime_fragment", lambda path: "KIS_APP_KEY=k\n")
+    monkeypatch.setattr(cli, "install_runtime_fragment", lambda host, text: pytest.fail("must not install"))
+    with pytest.raises(cli.ProvisioningError, match="invalid"):
+        cli.main(["--source", str(tmp_path / "x")])
+
+
+def test_main_logs_names_but_no_values(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    import src.tools.provision_env as cli
+
+    installed: list[str] = []
+    _stub_remote(monkeypatch, cli, env_text="HOST_ONLY=host-secret-value\nKIS_APP_KEY=old-secret\n", commit="abc")
+    monkeypatch.setattr(cli, "build_runtime_fragment", lambda path: "KIS_APP_KEY=new-secret\n")
+    monkeypatch.setattr(cli, "install_runtime_fragment", lambda host, text: installed.append(text))
+
+    with caplog.at_level(logging.INFO):
+        assert cli.main(["--source", str(tmp_path / "x")]) == 0
+
+    assert "HOST_ONLY=host-secret-value" in installed[0]
+    assert "changed=KIS_APP_KEY" in caplog.text and "preserved=HOST_ONLY" in caplog.text
+    for secret in ("host-secret-value", "old-secret", "new-secret"):
+        assert secret not in caplog.text
+
+
+def test_read_remote_state_splits_sections_and_fails_closed(monkeypatch) -> None:
+    import subprocess
+
+    import pytest
+
+    import src.tools.provision_env as provisioning
+
+    sentinel = provisioning._SECTION_SENTINEL
+    stdout = f"A=1\n\n{sentinel}\nKIS_DATA_SLOTS=1\n\n{sentinel}\nabc123\n"
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    monkeypatch.setattr(provisioning.subprocess, "run", fake_run)
+    state = provisioning.read_remote_state("or-vps")
+    assert state.env_text.strip() == "A=1"
+    assert state.kis_data_text.strip() == "KIS_DATA_SLOTS=1"
+    assert state.image_commit == "abc123"
+    assert calls[0][:2] == ["ssh", "or-vps"] and len(calls[0]) == 3
+
+    monkeypatch.setattr(provisioning.subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0, "garbage", ""))
+    with pytest.raises(provisioning.ProvisioningError, match="layout"):
+        provisioning.read_remote_state("or-vps")
+
+    def failing_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(255, args)
+
+    monkeypatch.setattr(provisioning.subprocess, "run", failing_run)
+    with pytest.raises(provisioning.ProvisioningError, match="refusing blind install"):
+        provisioning.read_remote_state("or-vps")
+
+
+def test_local_code_commit_treats_dirty_src_as_unknown(monkeypatch, tmp_path) -> None:
+    import subprocess
+
+    import src.tools.provision_env as provisioning
+
+    def fake_run(dirty: str):
+        def _run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            out = "abc123\n" if "rev-parse" in args else dirty
+            return subprocess.CompletedProcess(args, 0, out, "")
+
+        return _run
+
+    monkeypatch.setattr(provisioning.subprocess, "run", fake_run(""))
+    assert provisioning.local_code_commit(tmp_path) == "abc123"
+    monkeypatch.setattr(provisioning.subprocess, "run", fake_run(" M src/x.py\n"))
+    assert provisioning.local_code_commit(tmp_path) == ""
+
+    def boom(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise OSError("no git")
+
+    monkeypatch.setattr(provisioning.subprocess, "run", boom)
+    assert provisioning.local_code_commit(tmp_path) == ""

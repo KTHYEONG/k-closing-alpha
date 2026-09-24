@@ -177,3 +177,23 @@ def test_session_override_keys_must_match_trading_date() -> None:
     with pytest.raises(ValueError, match="must equal its trading_date"):
         CollectionSettings(COLLECTION_SESSION_OVERRIDES={"2026-09-18": clock}, _env_file=None)
     assert _clock(date(2026, 9, 17)).provenance == "standard_profile"
+
+
+def test_slot_env_spellings_parse_identically(monkeypatch) -> None:
+    """docker --env-file keeps quotes and systemd EnvironmentFile strips them; every spelling must agree."""
+    import pytest
+
+    from src.config.collection import CollectionSettings
+
+    for raw, want in (("3", ("3",)), ("2,3", ("2", "3")), (" 2 , 3 ", ("2", "3")), ('["2","3"]', ("2", "3")), ("[2,3]", ("2", "3")), ("", ())):
+        monkeypatch.setenv("COLLECTION_RESEARCH_SLOTS", raw)
+        monkeypatch.setenv("COLLECTION_ALTDATA_EXTRA_SLOTS", raw)
+        profile = CollectionSettings(_env_file=None)
+        assert (want, want) == (profile.COLLECTION_RESEARCH_SLOTS, profile.COLLECTION_ALTDATA_EXTRA_SLOTS)
+
+    monkeypatch.setenv("COLLECTION_RESEARCH_SLOTS", "2,2")
+    with pytest.raises(ValueError, match="unique"):
+        CollectionSettings(_env_file=None)
+    monkeypatch.setenv("COLLECTION_RESEARCH_SLOTS", "DATA_5")
+    with pytest.raises(ValueError, match="decimal"):
+        CollectionSettings(_env_file=None)
