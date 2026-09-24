@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
@@ -19,12 +18,12 @@ import aiohttp
 import pandas as pd
 
 from src import settings
-from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.api.kis.key_pool import load_kis_env, read_token_issued_date, resolve_host_issued_credentials, token_cache_path
 from src.config.collection import CollectionSettings
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.archive_intraday import resolve_previous_archive_date
 from src.daily.auction_capture import _close_rounds, _program_rounds
+from src.data.altdata_health import AltdataVerdict, altdata_verdict
 from src.data.capture_contracts import (
     SEOUL,
     CaptureDataset,
@@ -35,7 +34,7 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.intraday_store import _capture_root, intraday_partition_path, tick_partition_path
-from src.data.trading_calendar import is_kis_trading_day
+from src.data.trading_calendar import is_kis_trading_day_sync
 from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import dispatch_digest
@@ -192,16 +191,6 @@ def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
     }
 
 
-def _kis_trading_day(snapshot_date: str) -> bool:  # pragma: no cover - live KIS boundary
-    async def _run() -> bool:
-        client = KisApiClient(**kis_data_client_kwargs())  # type: ignore[no-untyped-call]
-        async with client.create_session() as session:
-            await client.ensure_token(session)
-            return await is_kis_trading_day(client, session, snapshot_date)
-
-    return asyncio.run(_run())
-
-
 def classify_day(snapshot_date: str, trading_day_fn: Callable[[str], bool] | None = None) -> str:
     """점검 대상일을 주말/휴장일/거래일/미상 중 하나로 분류한다.
 
@@ -218,7 +207,7 @@ def classify_day(snapshot_date: str, trading_day_fn: Callable[[str], bool] | Non
     """
     if pd.Timestamp(snapshot_date).weekday() >= 5:
         return DAY_WEEKEND
-    oracle = trading_day_fn if trading_day_fn is not None else _kis_trading_day
+    oracle = trading_day_fn if trading_day_fn is not None else is_kis_trading_day_sync
     try:
         return DAY_TRADING if oracle(snapshot_date) else DAY_HOLIDAY
     except (RuntimeError, OSError, aiohttp.ClientError) as exc:
@@ -411,7 +400,7 @@ def _audit_slow_data(
     ]
     if not terminal:
         return (_collection_issue("slow_data", 1, "missing_run"),)
-    if not any(m.status == CaptureStatus.COMPLETE for m in terminal):
+    if not any(altdata_verdict(m) in (AltdataVerdict.COMPLETE, AltdataVerdict.DEGRADED) for m in terminal):
         return (_collection_issue("slow_data", len(terminal), "incomplete_run"),)
     return ()
 

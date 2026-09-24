@@ -121,3 +121,55 @@ def test_is_kis_trading_day_true_only_when_requested_date_is_returned() -> None:
     outage = _Client({"rt_cd": "9", "msg1": "network"})
     with pytest.raises(RuntimeError):
         asyncio.run(is_kis_trading_day(outage, object(), "2026-09-10"))
+
+
+def _sync_harness(monkeypatch, oracle):
+    from src.data import trading_calendar
+
+    async def _stub_oracle(_client, _session, _date):
+        return await oracle(_date)
+
+    class _Session:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def create_session(self):
+            return _Session()
+
+        async def ensure_token(self, _session) -> None:
+            return None
+
+    monkeypatch.setattr(trading_calendar, "is_kis_trading_day", _stub_oracle)
+    monkeypatch.setattr("src.api.kis.client.KisApiClient", _Client)
+    monkeypatch.setattr("src.api.kis.client.kis_data_client_kwargs", lambda *a, **k: {})
+    return trading_calendar
+
+
+def test_is_kis_trading_day_sync_forwards_oracle_result(monkeypatch) -> None:
+    """Sync wrapper forwards the oracle result."""
+
+    async def _oracle(_date):
+        return _date == "2026-09-10"
+
+    trading_calendar = _sync_harness(monkeypatch, _oracle)
+    assert trading_calendar.is_kis_trading_day_sync("2026-09-10") is True
+    assert trading_calendar.is_kis_trading_day_sync("2026-09-11") is False
+
+
+def test_is_kis_trading_day_sync_propagates_oracle_failure(monkeypatch) -> None:
+    """Sync wrapper propagates oracle failure."""
+    import pytest
+
+    async def _boom(_date):
+        raise RuntimeError("KIS trading-day oracle failed")
+
+    trading_calendar = _sync_harness(monkeypatch, _boom)
+    with pytest.raises(RuntimeError, match="oracle failed"):
+        trading_calendar.is_kis_trading_day_sync("2026-09-10")

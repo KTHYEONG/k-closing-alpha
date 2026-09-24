@@ -21,6 +21,8 @@ class AltDataSettings(BaseSettings):
 
     # OpenDART: 암호화 볼트(.env.enc)는 OPENDART_API_KEY 를 쓰고, 구 설정은 DART_API_KEY 를 씀.
     OPENDART_API_KEY: str = Field(default="")
+    # Second slot of the shared OpenDART key pool (same SSOT line used by sibling projects).
+    OPENDART_API_KEY_2: str = Field(default="")
     DART_API_KEY: str = Field(default="")
     # KRX Open API (data-dbg.krx.co.kr, AUTH_KEY 헤더). 파생·지수 일별매매정보 주 경로.
     KRX_OPENAPI_KEY: str = Field(default="")
