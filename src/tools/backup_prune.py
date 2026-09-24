@@ -148,10 +148,15 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry
     today = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None).normalize()
     purged = prune_backups(today=today)
     local_purged = prune_local_intraday_backups(today=today)
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    sealed_report = prune_local_sealed_capture(_capture_root(), today=today.date())
     logger.info(
-        "[SYS] stage=backup_prune purged=%d targets=%s local_purged=%d local_targets=%s",
+        "[SYS] stage=backup_prune purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d",
         len(purged), purged, len(local_purged), local_purged,
+        len(sealed_report.removed), sealed_report.bytes_removed, len(sealed_report.kept),
     )
+    logger.debug("[SYS] stage=backup_prune sealed_kept=%s", sealed_report.kept)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
