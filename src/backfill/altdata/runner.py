@@ -13,9 +13,9 @@ import pandas as pd
 
 # Collectors
 from src.backfill.altdata import credit_balance, derivatives, program_trade_daily, shorting
-from src.backfill.altdata.config import _ALTDATA_PANELS, AltDataFetchConfig
+from src.backfill.altdata.config import _ALTDATA_PANELS, AltDataFetchConfig, dart_pool_for
 from src.backfill.altdata.normalize import normalize_panel
-from src.backfill.altdata.ratelimit import DartNonRetryableError
+from src.backfill.altdata.ratelimit import DartNonRetryableError, DartQuotaExhaustedError
 from src.data.capture_contracts import (
     BrokerPayload,
     CaptureContext,
@@ -292,7 +292,7 @@ def run_altdata_backfill(cfg: AltDataFetchConfig, *, capture_store: CaptureStore
                 # disclosure needs corp map handling
                 from src.backfill.altdata import disclosure as disc_mod
 
-                if not str(cfg.dart_api_key).strip():
+                if dart_pool_for(cfg).is_empty():
                     raise ValueError("DART_API_KEY is required for disclosure backfill")
                 # Cache corp map
                 corp_map_path = cfg.out_dir / "corp_code_map.parquet"
@@ -410,11 +410,22 @@ def run_altdata_backfill(cfg: AltDataFetchConfig, *, capture_store: CaptureStore
                     "updated_at": datetime.now(UTC).isoformat(),
                     "error": repr(ve),
                 }
-        except DartNonRetryableError as exc:
-            # DART_API_KEY 를 k-stock-engine 과 공유하므로 계정 한도가 이미 소진된 상태일 수
-            # 있다. "empty collector result" 로 뭉뚱그리지 않고 원인을 그대로 남긴다.
+        except DartQuotaExhaustedError as exc:
+            # Every pooled key is exhausted by daily quota; the rolling window
+            # re-fetches the missed days on the next successful run.
             entries[source] = {
                 "status": "quota_exceeded",
+                "source": source,
+                "availability_rule": availability_rule,
+                "rows": 0,
+                "first_date": None,
+                "last_date": None,
+                "updated_at": datetime.now(UTC).isoformat(),
+                "error": repr(exc),
+            }
+        except DartNonRetryableError as exc:
+            entries[source] = {
+                "status": "unavailable",
                 "source": source,
                 "availability_rule": availability_rule,
                 "rows": 0,

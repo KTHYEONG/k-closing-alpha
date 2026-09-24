@@ -363,3 +363,278 @@ def test_collect_disclosures_two_types_do_not_collide_in_capture_store(monkeypat
 
     assert len(refs) == 2  # B, I 유형별 page 1
     assert len({r.path for r in refs}) == 2  # 경로가 서로 다르다 -> 충돌 없음
+
+
+def _pool_cfg(**kw: object):
+    from src.backfill.altdata.dart_keys import DartCredential, DartKeyPool
+
+    pool = kw.pop("pool", None)
+    base: dict[str, object] = {
+        "start": pd.Timestamp("2024-01-01"),
+        "end": pd.Timestamp("2024-01-10"),
+        "out_dir": Path("x"),
+        "retries": 1,
+        "retry_sleep_sec": 0.0,
+    }
+    base.update(kw)
+    if pool is None:
+        pool = DartKeyPool([DartCredential(label="KEY_1", key="KEY-A-VALUE"), DartCredential(label="KEY_2", key="KEY-B-VALUE")])
+    base["dart_key_pool"] = pool
+    return AltDataFetchConfig(**base)  # type: ignore[arg-type]
+
+
+def test_collect_disclosures_quota_failover_to_next_key(monkeypatch) -> None:
+    counts: dict[str, int] = {"KEY-A-VALUE": 0, "KEY-B-VALUE": 0}
+
+    def _fake(url: str, params: object = None, timeout: object = None):
+        key = str(dict(params)["crtfc_key"])  # type: ignore[arg-type]
+        counts[key] += 1
+        if key == "KEY-A-VALUE":
+            return _DartResp({"status": "020", "message": "한도초과", "list": []})
+        return _DartResp(_dart_page([_dart_item("20240115000123")]))
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _fake)
+    out = disclosure.collect_disclosures(
+        _pool_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+    )
+    assert not out.empty
+    assert counts["KEY-A-VALUE"] <= 2
+    assert counts["KEY-B-VALUE"] >= 1
+
+
+def test_collect_disclosures_failover_uses_unique_capture_identities(monkeypatch) -> None:
+    def _fake(url: str, params: object = None, timeout: object = None):
+        key = str(dict(params)["crtfc_key"])  # type: ignore[arg-type]
+        if key == "KEY-A-VALUE":
+            return _DartResp({"status": "020", "message": "한도초과", "list": []})
+        return _DartResp(_dart_page([_dart_item("20240115000123")]))
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _fake)
+    seen: list = []
+    disclosure.collect_disclosures(
+        _pool_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+        on_page=lambda p, m, s, r, pi, ai: seen.append((pi, ai)),
+    )
+    pairs = [(pi, ai) for pi, ai in seen]
+    assert len(pairs) == len(set(pairs)) and len(pairs) >= 1
+
+
+def test_collect_disclosures_all_exhausted_stops_requesting(monkeypatch) -> None:
+    import pytest
+
+    from src.backfill.altdata.ratelimit import DartQuotaExhaustedError
+
+    calls = {"n": 0}
+
+    def _fake(url: str, params: object = None, timeout: object = None):
+        calls["n"] += 1
+        return _DartResp({"status": "020", "message": "한도초과", "list": []})
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _fake)
+
+    def _boom_sleep(_s: float) -> None:
+        raise AssertionError("no retry sleeps on quota exhaustion")
+
+    import time as _time
+
+    monkeypatch.setattr(_time, "sleep", _boom_sleep)
+    with pytest.raises(DartQuotaExhaustedError):
+        disclosure.collect_disclosures(
+            _pool_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+        )
+    assert calls["n"] == 2
+
+
+def test_collect_disclosures_bad_new_key_fails_over(monkeypatch, caplog) -> None:
+    import logging
+
+    def _fake(url: str, params: object = None, timeout: object = None):
+        key = str(dict(params)["crtfc_key"])  # type: ignore[arg-type]
+        if key == "KEY-A-VALUE":
+            return _DartResp({"status": "010", "message": "미등록키", "list": []})
+        return _DartResp(_dart_page([_dart_item("20240115000123")]))
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _fake)
+    with caplog.at_level(logging.ERROR, logger="src.backfill.altdata.dart_keys"):
+        out = disclosure.collect_disclosures(
+            _pool_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+        )
+    assert not out.empty
+    assert "KEY_1" in caplog.text and "010" in caplog.text
+
+
+def test_collect_disclosures_rejected_plus_exhausted_not_tolerable(monkeypatch) -> None:
+    import pytest
+
+    from src.backfill.altdata.ratelimit import DartKeysUnusableError
+
+    def _fake(url: str, params: object = None, timeout: object = None):
+        key = str(dict(params)["crtfc_key"])  # type: ignore[arg-type]
+        if key == "KEY-A-VALUE":
+            return _DartResp({"status": "010", "message": "미등록키", "list": []})
+        return _DartResp({"status": "020", "message": "한도초과", "list": []})
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _fake)
+    with pytest.raises(DartKeysUnusableError):
+        disclosure.collect_disclosures(
+            _pool_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+        )
+
+
+def test_collect_disclosures_single_key_behavior_unchanged(monkeypatch) -> None:
+    import pytest
+
+    from src.backfill.altdata.ratelimit import DartNonRetryableError
+
+    seen_params: list = []
+
+    def _fake(url: str, params: object = None, timeout: object = None):
+        seen_params.append(dict(params))  # type: ignore[arg-type]
+        return _DartResp(_dart_page([_dart_item("20240115000123")]))
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _fake)
+    out = disclosure.collect_disclosures(
+        _dart_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+    )
+    assert not out.empty
+    assert all("crtfc_key" in p for p in seen_params)
+
+    def _quota(url: str, params: object = None, timeout: object = None):
+        return _DartResp({"status": "020", "message": "한도초과", "list": []})
+
+    monkeypatch.setattr(disclosure.requests, "get", _quota)
+    with pytest.raises(DartNonRetryableError):
+        disclosure.collect_disclosures(
+            _dart_cfg(), pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}),
+        )
+
+
+def _assert_no_secret_in_traceback(exc: BaseException, secret: str) -> None:
+    """The requests error text embeds the key-bearing URL; it must not survive via chaining either."""
+    import traceback
+
+    rendered = "".join(traceback.format_exception(exc))
+    assert secret not in rendered
+    assert exc.__cause__ is None
+
+
+def test_collect_disclosures_transport_errors_never_leak_key(monkeypatch) -> None:
+    import pytest
+
+    secret = "SUPER-SECRET-KEY-VALUE"
+
+    def _boom(url: str, params: object = None, timeout: object = None):
+        raise ConnectionError(f"failed fetching {params} containing {secret}")
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _boom)
+    cfg = AltDataFetchConfig(
+        start=pd.Timestamp("2024-01-01"), end=pd.Timestamp("2024-01-10"),
+        out_dir=Path("x"), dart_api_key=secret, retries=1, retry_sleep_sec=0.0,
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        disclosure._dart_get_json(
+            disclosure._LIST_URL, {"page_no": 1}, cfg,
+            credential=__import__("src.backfill.altdata.dart_keys", fromlist=["DartCredential"]).DartCredential(label="DEFAULT", key=secret),
+        )
+    _assert_no_secret_in_traceback(exc_info.value, secret)
+
+
+def test_download_corp_code_map_failover(monkeypatch) -> None:
+    import io
+    import zipfile
+
+    xml = (
+        "<result><list><corp_code>00126380</corp_code><corp_name>삼성전자</corp_name>"
+        "<stock_code>005930</stock_code><modify_date>20240101</modify_date></list></result>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("CORPCODE.xml", xml)
+    payload = buf.getvalue()
+
+    class _Resp:
+        def __init__(self, content: bytes, ctype: str = "application/x-msdownload") -> None:
+            self.status_code = 200
+            self.content = content
+            self.headers = {"content-type": ctype}
+
+    def _fake(url: str, params: object = None, timeout: object = None):
+        key = str(dict(params)["crtfc_key"])  # type: ignore[arg-type]
+        if key == "KEY-A-VALUE":
+            return _Resp("<result><status>020</status><message>한도초과</message></result>".encode(), "text/xml")
+        return _Resp(payload)
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _fake)
+    df = disclosure.download_corp_code_map(_pool_cfg())
+    assert list(df["stock_code"]) == ["005930"]
+
+    def _unknown(url: str, params: object = None, timeout: object = None):
+        return _Resp(b"not a zip at all", "text/html")
+
+    monkeypatch.setattr(disclosure.requests, "get", _unknown)
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        disclosure.download_corp_code_map(_pool_cfg())
+
+
+def test_download_corp_code_map_rejected_key_fails_over(monkeypatch) -> None:
+    import io
+    import zipfile
+
+    xml = (
+        "<result><list><corp_code>00126380</corp_code><corp_name>삼성전자</corp_name>"
+        "<stock_code>005930</stock_code><modify_date>20240101</modify_date></list></result>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("CORPCODE.xml", xml)
+    payload = buf.getvalue()
+
+    class _Resp:
+        def __init__(self, content: bytes) -> None:
+            self.status_code = 200
+            self.content = content
+
+    def _fake(url: str, params: object = None, timeout: object = None):
+        key = str(dict(params)["crtfc_key"])  # type: ignore[arg-type]
+        if key == "KEY-A-VALUE":
+            return _Resp("<result><status>010</status><message>미등록</message></result>".encode())
+        return _Resp(payload)
+
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+    monkeypatch.setattr(disclosure.requests, "get", _fake)
+    df = disclosure.download_corp_code_map(_pool_cfg())
+    assert list(df["stock_code"]) == ["005930"]
+
+
+def test_download_corp_code_map_transport_and_http_errors(monkeypatch) -> None:
+    import pytest
+
+    secret = "CORP-SECRET-VALUE"
+    monkeypatch.setattr(disclosure, "wait_for_dart_slot", lambda _cfg: None)
+
+    def _boom(url: str, params: object = None, timeout: object = None):
+        raise ConnectionError(f"down {secret}")
+
+    monkeypatch.setattr(disclosure.requests, "get", _boom)
+    cfg = _pool_cfg()
+    with pytest.raises(RuntimeError) as exc_info:
+        disclosure.download_corp_code_map(cfg)
+    _assert_no_secret_in_traceback(exc_info.value, secret)
+
+    class _Bad:
+        status_code = 500
+        content = b""
+
+    monkeypatch.setattr(disclosure.requests, "get", lambda *a, **k: _Bad())
+    with pytest.raises(RuntimeError, match="500"):
+        disclosure.download_corp_code_map(cfg)

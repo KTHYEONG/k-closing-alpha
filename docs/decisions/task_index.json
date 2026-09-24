@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DART_KEY_POOL_ALTDATA_POLICY",
+      "date": "2026-09-24",
+      "adr_id": "ADR_20260924_DART_KEY_POOL_ALTDATA_POLICY",
+      "domain": "data",
+      "title": "DART 키 풀과 altdata 실행 정책 정비",
+      "why": "DART 한도 소진과 휴장일 실행이 공시 수집 실패 메일을 유발했고, 새 키를 전용으로 묶어두면 k-stock-engine 대비 호출량 차이로 낭비가 커진다.",
+      "resolution": "OPENDART_API_KEY 슬롯 순서 풀(KEY_1, KEY_2, LEGACY)로 요청 단위 전환을 도입하고, 거래일 게이트와 공시 quota 한정 DEGRADED 허용 판정을 종료코드와 daily-audit에 공통 적용했다.",
+      "impact": "휴장일과 주말에는 수집이 건너뛰어지고, 전 키 소진 시에도 실패 메일 없이 다음 성공 실행이 회수하며, 키 오설정과 실제 결함은 실패로 드러난다.",
+      "caveat": "OPENDART_API_KEY_2 값은 ~/.quant.env에 추가 후 provision_env로 반영해야 하며, k-stock-engine 클라이언트는 아직 단일 키만 읽는다."
+    },
+    {
       "task_id": "TASK_ALERT_FORMATTING",
       "date": "2026-09-24",
       "adr_id": "ADR_20260924_ALERT_FORMATTING",
@@ -1001,16 +1012,6 @@
       "why": "운영자 상승률>=10% 스크린이 무조건부 기대값 -30.2bp/일(t=-12.15)로 실측되어, 모델이 낼 수 있는 최대 rankIC 알파(+28bp)와 정확히 상쇄되는 산술이 3세션 '포화' 결론의 정체였다",
       "resolution": "src/ml/universe.py(파라미터화 스크린+모델이전 베이스라인), src/ml/expected_value.py(EV<=0 기권), src/execution/passive_fill.py(패시브체결 역선택 실측) 신설 후 champion.py/retrain.py/validation.py에 --screen·DSR예산·execution_profile 게이트로 실배선",
       "impact": "체결 실측 없이는 승격 불가(execution_profile_measured 게이트)로 R1을 강제하고, 시간분할 부호반전(스크린 7종 중 6종 half-sample flip 실측) 게이트를 추가해 gate theatre 재발을 구조적으로 차단"
-    },
-    {
-      "task_id": "ML_VALIDATION_OVERHAUL",
-      "date": "2026-09-06",
-      "adr_id": "ADR_20260906_ML_VALIDATION_OVERHAUL",
-      "domain": "ml",
-      "title": "의사결정 등급 ML 검증: 잠긴 OOS + CPCV 승격 게이트 + 실행가능 라벨",
-      "why": "기존 승격 게이트는 oos_row_count=0(선택과 동일 OOF), DSR이 실선택예산의 1/15로 계산, 라벨이 운영자 재량 청산 포함, 비용이 전종목 동일 46bp 고정",
-      "resolution": "src/ml/validation.py(잠긴 OOS 1회채점+CPCV(8,2) 경로일치+DSR)와 src/ml/decision_labels.py(행별비용+mechanical_gross 실행가능라벨) 신설, champion.py/tuning.py/retrain.py에 배선, publish_bundle로 production 승격 게이트화",
-      "impact": "기존 워크포워드 부트스트랩이 promoted=true(Δ+0.249%p/일,p=0.0012)로 판정한 후보가 CPCV 28-fold에서는 top1 경로승률 0.536<0.60·p=0.508로 research_only 판정 — gate theatre 실증"
     }
   ]
 }

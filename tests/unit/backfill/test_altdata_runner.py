@@ -234,19 +234,19 @@ def test_run_altdata_backfill_dart_quota_exceeded_labeled_distinctly(monkeypatch
 
     from src.backfill.altdata import disclosure as disc_mod
     from src.backfill.altdata import runner
-    from src.backfill.altdata.ratelimit import DartNonRetryableError
+    from src.backfill.altdata.ratelimit import DartQuotaExhaustedError
 
     cfg = _altdata_cfg(tmp_path, sources=("disclosure",), dart_api_key="k")
     monkeypatch.setattr(disc_mod, "download_corp_code_map", lambda cfg_: pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}))
 
     def _quota_boom(cfg_, corp_map, **kw):
-        raise DartNonRetryableError("DART error status=020 msg=사용한도를 초과하였습니다.")
+        raise DartQuotaExhaustedError("DART quota exhausted for keys: KEY_1")
 
     monkeypatch.setattr(disc_mod, "collect_disclosures", _quota_boom)
     report = runner.run_altdata_backfill(cfg)
     panel = report["panels"]["disclosure"]
     assert panel["status"] == "quota_exceeded"
-    assert "020" in panel["error"] and "사용한도" in panel["error"]
+    assert "KEY_1" in panel["error"]
 
 
 def test_run_altdata_backfill_rejects_inconsistent_capture_context(tmp_path) -> None:
@@ -450,10 +450,13 @@ def test_altdata_capture_main_reports_complete_and_incomplete(monkeypatch, tmp_p
         def __init__(self, status):
             self.status = status
 
+        entries = ()
+
     monkeypatch.setattr(cap, "CollectionSettings", lambda *a, **k: _capture_profile())
     monkeypatch.setattr(cap, "_capture_root", lambda profile: tmp_path / "cap")
     monkeypatch.setattr(cap.settings, "ALTDATA_DIR", tmp_path / "altdata", raising=False)
     monkeypatch.setattr(cap.settings, "KRX_OPENAPI_KEY", "k", raising=False)
+    monkeypatch.setattr(cap, "is_kis_trading_day_sync", lambda _d: True)
     monkeypatch.setattr(cap, "run_altdata_capture", lambda day, **kw: _Manifest(CaptureStatus.COMPLETE))
     assert cap.main(["--date", "2026-09-10"]) == 0
     monkeypatch.setattr(cap, "run_altdata_capture", lambda day, **kw: _Manifest(CaptureStatus.PARTIAL))
@@ -492,9 +495,11 @@ def test_altdata_capture_main_covers_single_day_window(monkeypatch, tmp_path) ->
 
     class _Manifest:
         status = CaptureStatus.COMPLETE
+        entries = ()
 
     seen: dict = {}
     monkeypatch.setattr(cap, "CollectionSettings", lambda *a, **k: _capture_profile(COLLECTION_ALTDATA_LOOKBACK_DAYS=1))
+    monkeypatch.setattr(cap, "is_kis_trading_day_sync", lambda _d: True)
     monkeypatch.setattr(cap, "_capture_root", lambda profile: tmp_path / "cap1")
     monkeypatch.setattr(cap.settings, "ALTDATA_DIR", tmp_path / "altdata", raising=False)
     monkeypatch.setattr(cap.settings, "KRX_OPENAPI_KEY", "k", raising=False)
@@ -506,3 +511,50 @@ def test_altdata_capture_main_covers_single_day_window(monkeypatch, tmp_path) ->
     monkeypatch.setattr(cap, "run_altdata_capture", _fake_run)
     assert cap.main(["--date", "2026-09-10"]) == 0
     assert seen["cfg"].start != seen["cfg"].end
+
+
+def test_run_altdata_backfill_quota_exhaustion_maps_to_quota_exceeded(monkeypatch, tmp_path) -> None:
+    """Quota exhaustion maps to quota_exceeded."""
+    from src.backfill.altdata import disclosure as disc_mod
+    from src.backfill.altdata import runner
+    from src.backfill.altdata.ratelimit import DartQuotaExhaustedError
+
+    secret = "POOL-SECRET-A"
+    cfg = _altdata_cfg(tmp_path, sources=("disclosure",), dart_api_key=secret)
+    monkeypatch.setattr(disc_mod, "download_corp_code_map", lambda cfg_: pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}))
+
+    def _boom(cfg_, corp_map, **kw):
+        raise DartQuotaExhaustedError("DART quota exhausted for keys: KEY_1, KEY_2")
+
+    monkeypatch.setattr(disc_mod, "collect_disclosures", _boom)
+    report = runner.run_altdata_backfill(cfg)
+    panel = report["panels"]["disclosure"]
+    assert panel["status"] == "quota_exceeded"
+    assert secret not in panel["error"]
+
+
+def test_run_altdata_backfill_unusable_keys_map_to_unavailable(monkeypatch, tmp_path) -> None:
+    """Unusable keys map to unavailable."""
+    from src.backfill.altdata import disclosure as disc_mod
+    from src.backfill.altdata import runner
+    from src.backfill.altdata.ratelimit import DartKeysUnusableError
+
+    cfg = _altdata_cfg(tmp_path, sources=("disclosure",), dart_api_key="k")
+    monkeypatch.setattr(disc_mod, "download_corp_code_map", lambda cfg_: pd.DataFrame({"corp_code": [], "stock_code": [], "corp_name": []}))
+
+    def _boom(cfg_, corp_map, **kw):
+        raise DartKeysUnusableError("DART keys unusable: KEY_1=010")
+
+    monkeypatch.setattr(disc_mod, "collect_disclosures", _boom)
+    report = runner.run_altdata_backfill(cfg)
+    assert report["panels"]["disclosure"]["status"] == "unavailable"
+
+
+def test_run_altdata_backfill_empty_pool_maps_to_skipped_no_key(tmp_path) -> None:
+    """Empty pool maps to skipped_no_key."""
+    from src.backfill.altdata import runner
+    from src.backfill.altdata.dart_keys import DartKeyPool
+
+    cfg = _altdata_cfg(tmp_path, sources=("disclosure",), dart_key_pool=DartKeyPool([]))
+    report = runner.run_altdata_backfill(cfg)
+    assert report["panels"]["disclosure"]["status"] == "skipped_no_key"

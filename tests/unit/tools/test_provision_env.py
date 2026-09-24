@@ -26,8 +26,9 @@ def test_build_runtime_fragment_emits_declared_keys_in_canonical_order(tmp_path)
     fragment = build_runtime_fragment(source)
 
     lines = fragment.splitlines()
-    assert [line.partition("=")[0] for line in lines] == [key.target for key in RUNTIME_ENV_SPEC]
-    assert len(lines) == 15
+    required = [key.target for key in RUNTIME_ENV_SPEC if not key.optional]
+    assert [line.partition("=")[0] for line in lines] == required
+    assert len(lines) == len(required)
     assert fragment.endswith("\n")
     assert "export " not in fragment
     assert "KIS_APP_SECRET=kis-secret" in lines
@@ -44,8 +45,8 @@ def test_runtime_env_spec_excludes_legacy_data_single_key_fields() -> None:
     targets = [key.target for key in RUNTIME_ENV_SPEC]
     sources = [source for key in RUNTIME_ENV_SPEC for source in key.sources]
 
-    assert len(targets) == 15
-    assert len(set(targets)) == 15
+    assert len(targets) == 16
+    assert len(set(targets)) == 16
     for forbidden in ("KIS_DATA_APP_KEY", "KIS_DATA_APP_SECRET", "KIS_DATA_HTS_ID"):
         assert forbidden not in targets
         assert forbidden not in sources
@@ -57,8 +58,8 @@ def test_runtime_env_spec_excludes_shared_keypool_keys() -> None:
     targets = [key.target for key in RUNTIME_ENV_SPEC]
     sources = [source for key in RUNTIME_ENV_SPEC for source in key.sources]
 
-    assert len(targets) == 15
-    assert len(set(targets)) == 15
+    assert len(targets) == 16
+    assert len(set(targets)) == 16
     for forbidden in ("KIS_DATA_SLOTS", "KIS_HOST_DATA_SLOTS"):
         assert forbidden not in targets
         assert forbidden not in sources
@@ -301,3 +302,45 @@ def test_main_builds_before_install_and_dry_run_installs_nothing(tmp_path, monke
     monkeypatch.setattr(cli, "install_runtime_fragment", fail_install)
     assert cli.main(["--host", "or-vps", "--source", str(source), "--dry-run"]) == 0
     assert events == ["build"]
+
+
+def _full_source_lines(exclude: set[str] | None = None) -> list[str]:
+    from src.tools.provision_env import RUNTIME_ENV_SPEC
+
+    exclude = exclude or set()
+    return [f"{key.target}=value-{i}" for i, key in enumerate(RUNTIME_ENV_SPEC) if key.target not in exclude]
+
+
+def test_build_runtime_fragment_optional_key_absent_is_omitted(tmp_path) -> None:
+    """Optional key absent is omitted."""
+    from src.tools.provision_env import build_runtime_fragment
+
+    source = tmp_path / ".quant.env"
+    source.write_text("\n".join(_full_source_lines(exclude={"OPENDART_API_KEY_2"})) + "\n", encoding="utf-8")
+    fragment = build_runtime_fragment(source)
+    assert "OPENDART_API_KEY_2" not in fragment
+
+
+def test_build_runtime_fragment_optional_key_present_in_spec_order(tmp_path) -> None:
+    """Optional key present is emitted in spec order."""
+    from src.tools.provision_env import RUNTIME_ENV_SPEC, build_runtime_fragment
+
+    source = tmp_path / ".quant.env"
+    source.write_text("\n".join(_full_source_lines()) + "\n", encoding="utf-8")
+    fragment = build_runtime_fragment(source)
+    lines = fragment.splitlines()
+    targets = [line.partition("=")[0] for line in lines]
+    assert targets == [key.target for key in RUNTIME_ENV_SPEC]
+    assert targets.index("OPENDART_API_KEY_2") == targets.index("OPENDART_API_KEY") + 1
+
+
+def test_build_runtime_fragment_required_key_absent_fails_closed(tmp_path) -> None:
+    """Required key absent still fails closed."""
+    import pytest
+
+    from src.tools.provision_env import ProvisioningError, build_runtime_fragment
+
+    source = tmp_path / ".quant.env"
+    source.write_text("\n".join(_full_source_lines(exclude={"OPENDART_API_KEY"})) + "\n", encoding="utf-8")
+    with pytest.raises(ProvisioningError):
+        build_runtime_fragment(source)

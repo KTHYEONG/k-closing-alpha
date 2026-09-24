@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from src.backfill.altdata.dart_keys import DartKeyPool
 
 _ALTDATA_PANELS: dict[str, dict[str, Any]] = {
     "shorting": {
@@ -58,6 +61,9 @@ class AltDataFetchConfig:
         retries: 재시도 횟수.
         retry_sleep_sec: 재시도 대기 시간.
         dart_api_key: DART 인증 키.
+        dart_key_pool: Ordered OpenDART key pool. Single-key shorthand
+            ``dart_api_key`` is used only when ``dart_key_pool is None``
+            (CLI ``backfill_altdata`` keeps using it unchanged).
         page_count: 페이지 당 레코드 수.
         extra_client_kwargs: 병렬 호출용 추가 KIS 데이터 키.
     """
@@ -74,6 +80,7 @@ class AltDataFetchConfig:
     retries: int = 4
     retry_sleep_sec: float = 1.0
     dart_api_key: str = ""
+    dart_key_pool: DartKeyPool | None = None
     krx_api_key: str = ""
     page_count: int = 100
     extra_client_kwargs: tuple[tuple[str, str, str], ...] = ()
@@ -135,3 +142,20 @@ class AltDataFetchConfig:
             for sym in self.universe_symbols:
                 if not isinstance(sym, str) or len(sym) != 6 or not sym.isdigit():
                     raise ValueError(f"universe_symbols entry '{sym}' must be 6-digit string")
+
+
+def dart_pool_for(cfg: AltDataFetchConfig) -> DartKeyPool:
+    """Return the configured pool or a single-key fallback pool.
+
+    Args:
+        cfg: Alt-data fetch configuration.
+
+    Returns:
+        Configured pool when set, otherwise a pool holding one credential
+        labeled ``DEFAULT`` from ``cfg.dart_api_key``.
+    """
+    if cfg.dart_key_pool is not None:
+        return cfg.dart_key_pool
+    from src.backfill.altdata.dart_keys import DartCredential, DartKeyPool
+
+    return DartKeyPool([DartCredential(label="DEFAULT", key=cfg.dart_api_key)])

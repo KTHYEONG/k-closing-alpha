@@ -76,7 +76,7 @@ def test_main_runs_configured_capture_and_reports_manifest_status(tmp_path, monk
     monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path))
     monkeypatch.setattr(altdata_capture, "run_altdata_capture", _fake_run)
 
-    rc = altdata_capture.main(["--date", "2026-09-18"])
+    rc = altdata_capture.main(["--date", "2026-09-18"], trading_day_fn=lambda _d: True)
 
     assert rc == 0
     assert captured["trading_day"].isoformat() == "2026-09-18"
@@ -391,3 +391,231 @@ def test_run_altdata_capture_propagates_shard_overlap_error(tmp_path, monkeypatc
     )
     with pytest.raises(ValueError, match="overlaps KIS_DECISION_SHARD_SLOTS"):
         altdata_capture.run_altdata_capture(pd.Timestamp("2026-09-18").date(), profile=profile, store=store, cfg=cfg)
+
+
+def test_main_builds_pool_from_settings_in_priority_order(tmp_path, monkeypatch) -> None:
+    """main builds the pool from settings in priority order."""
+    from src.daily import altdata_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    captured: dict[str, Any] = {}
+
+    class _Manifest:
+        status = CaptureStatus.COMPLETE
+
+    def _fake_run(trading_day, *, profile, store, cfg):
+        captured["cfg"] = cfg
+        return _Manifest()
+
+    monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path))
+    monkeypatch.setattr(altdata_capture, "run_altdata_capture", _fake_run)
+    monkeypatch.setattr(altdata_capture.settings, "OPENDART_API_KEY", "key-a", raising=False)
+    monkeypatch.setattr(altdata_capture.settings, "OPENDART_API_KEY_2", "key-b", raising=False)
+    monkeypatch.setattr(altdata_capture.settings, "DART_API_KEY", "key-c", raising=False)
+    altdata_capture.main(["--date", "2026-09-18"], trading_day_fn=lambda _d: True)
+    pool = captured["cfg"].dart_key_pool
+    assert pool.labels == ("KEY_1", "KEY_2", "LEGACY")
+    assert captured["cfg"].dart_api_key == ""
+
+
+def _harness_manifest(status, entries):
+    from datetime import date, datetime
+
+    from src.data.capture_contracts import (
+        CaptureContext,
+        CaptureDataset,
+        CaptureManifest,
+        SEOUL,
+    )
+
+    return CaptureManifest(
+        schema_version=1,
+        context=CaptureContext(
+            trading_date=date(2026, 9, 18),
+            run_id="run-harness",
+            dataset=CaptureDataset.SHORTING,
+            vendor="owner-local",
+            endpoint="altdata-backfill",
+            symbol=None,
+            venue="KRX",
+            session="regular",
+            capture_reason="altdata-backfill",
+            cohort_id=None,
+            scheduled_at=None,
+        ),
+        cohort=None,
+        completed_at=datetime(2026, 9, 18, 21, 40, tzinfo=SEOUL),
+        entries=tuple(entries),
+        artifacts=(),
+        status=status,
+    )
+
+
+def _harness_entry(dataset, status, reason):
+    from src.data.capture_contracts import CoverageEntry
+
+    return CoverageEntry(
+        symbol=None,
+        dataset=dataset,
+        venue="KRX",
+        session="regular",
+        scheduled_at=None,
+        status=status,
+        rows=0,
+        first_event_time=None,
+        last_event_time=None,
+        reason=reason,
+        raw_refs=(),
+    )
+
+
+def _harness_main(monkeypatch, tmp_path, manifest):
+    from src.daily import altdata_capture
+
+    calls: list[str] = []
+
+    def _fake_run(trading_day, *, profile, store, cfg):
+        calls.append(trading_day.isoformat())
+        return manifest
+
+    monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path))
+    monkeypatch.setattr(altdata_capture, "run_altdata_capture", _fake_run)
+    return altdata_capture, calls
+
+
+def test_main_weekend_skips_without_calendar_or_network(tmp_path, monkeypatch) -> None:
+    """Weekend skips without calendar or network."""
+    from src.daily import altdata_capture
+
+    def _boom_oracle(_d: str) -> bool:
+        raise AssertionError("oracle must not be called on weekends")
+
+    def _boom_config(*a: Any, **k: Any) -> Any:
+        raise AssertionError("config must not be constructed on weekends")
+
+    def _boom_store(*a: Any, **k: Any) -> Any:
+        raise AssertionError("store must not be constructed on weekends")
+
+    monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path))
+    monkeypatch.setattr(altdata_capture, "AltDataFetchConfig", _boom_config)
+    monkeypatch.setattr(altdata_capture, "CaptureStore", _boom_store)
+    rc = altdata_capture.main(["--date", "2026-09-12"], trading_day_fn=_boom_oracle)
+    assert rc == 0
+
+
+def test_main_weekday_holiday_skips(tmp_path, monkeypatch, caplog) -> None:
+    """Weekday holiday skips."""
+    import logging
+
+    from src.daily import altdata_capture
+
+    def _boom_run(*a: Any, **k: Any) -> Any:
+        raise AssertionError("run must not be invoked on holidays")
+
+    monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path))
+    monkeypatch.setattr(altdata_capture, "run_altdata_capture", _boom_run)
+    with caplog.at_level(logging.INFO, logger=altdata_capture.logger.name):
+        rc = altdata_capture.main(["--date", "2026-09-24"], trading_day_fn=lambda _d: False)
+    assert rc == 0
+    assert "reason=non_trading_day" in caplog.text
+
+
+def test_main_trading_day_runs(tmp_path, monkeypatch) -> None:
+    """Trading day runs."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    manifest = _harness_manifest(
+        CaptureStatus.COMPLETE, (_harness_entry(CaptureDataset.SHORTING, CaptureStatus.COMPLETE, "ok"),)
+    )
+    altdata_capture, calls = _harness_main(monkeypatch, tmp_path, manifest)
+    rc = altdata_capture.main(["--date", "2026-09-18"], trading_day_fn=lambda _d: True)
+    assert rc == 0
+    assert calls == ["2026-09-18"]
+
+
+def test_main_oracle_outage_proceeds(tmp_path, monkeypatch, caplog) -> None:
+    """Oracle outage proceeds."""
+    import logging
+
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    manifest = _harness_manifest(
+        CaptureStatus.COMPLETE, (_harness_entry(CaptureDataset.SHORTING, CaptureStatus.COMPLETE, "ok"),)
+    )
+    altdata_capture, calls = _harness_main(monkeypatch, tmp_path, manifest)
+
+    def _outage(_d: str) -> bool:
+        raise RuntimeError("KIS trading-day oracle failed")
+
+    with caplog.at_level(logging.WARNING, logger=altdata_capture.logger.name):
+        rc = altdata_capture.main(["--date", "2026-09-18"], trading_day_fn=_outage)
+    assert rc == 0
+    assert calls == ["2026-09-18"]
+    assert "calendar_lookup=FAIL" in caplog.text and "proceed=true" in caplog.text
+
+
+def test_main_unexpected_oracle_error_propagates(tmp_path, monkeypatch) -> None:
+    """Unexpected oracle error propagates."""
+    import pytest
+
+    from src.daily import altdata_capture
+
+    monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path))
+
+    def _broken(_d: str) -> bool:
+        raise ValueError("oracle contract violated")
+
+    with pytest.raises(ValueError, match="contract violated"):
+        altdata_capture.main(["--date", "2026-09-18"], trading_day_fn=_broken)
+
+
+def test_main_disclosure_quota_exit_is_clean(tmp_path, monkeypatch, caplog) -> None:
+    """Disclosure quota exit is clean."""
+    import logging
+
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    manifest = _harness_manifest(
+        CaptureStatus.PARTIAL,
+        (
+            _harness_entry(CaptureDataset.SHORTING, CaptureStatus.COMPLETE, "ok"),
+            _harness_entry(CaptureDataset.DISCLOSURE, CaptureStatus.FAILED, "quota_exceeded"),
+        ),
+    )
+    altdata_capture, _calls = _harness_main(monkeypatch, tmp_path, manifest)
+    with caplog.at_level(logging.WARNING, logger=altdata_capture.logger.name):
+        rc = altdata_capture.main(["--date", "2026-09-18"], trading_day_fn=lambda _d: True)
+    assert rc == 0
+    assert "status=DEGRADED" in caplog.text
+
+
+def test_main_real_source_failure_still_fails(tmp_path, monkeypatch) -> None:
+    """Real source failure still fails."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    manifest = _harness_manifest(
+        CaptureStatus.PARTIAL,
+        (
+            _harness_entry(CaptureDataset.DISCLOSURE, CaptureStatus.FAILED, "quota_exceeded"),
+            _harness_entry(CaptureDataset.CREDIT_BALANCE, CaptureStatus.FAILED, "vendor_failure"),
+        ),
+    )
+    altdata_capture, _calls = _harness_main(monkeypatch, tmp_path, manifest)
+    rc = altdata_capture.main(["--date", "2026-09-18"], trading_day_fn=lambda _d: True)
+    assert rc == 1
+
+
+def test_main_disabled_profile_stays_first(tmp_path, monkeypatch, caplog) -> None:
+    """Disabled profile stays first."""
+    import logging
+
+    from src.daily import altdata_capture
+
+    def _boom_oracle(_d: str) -> bool:
+        raise AssertionError("oracle must not be called when disabled")
+
+    monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path, COLLECTION_ALTDATA_ENABLED=False))
+    with caplog.at_level(logging.INFO, logger=altdata_capture.logger.name):
+        rc = altdata_capture.main(["--date", "2026-09-24"], trading_day_fn=_boom_oracle)
+    assert rc == 0
+    assert "reason=disabled" in caplog.text
