@@ -216,72 +216,256 @@ def test_sanitize_journal_tail_strips_ansi_carriage_returns_and_caps_length() ->
     ]
 
 
-def test_collect_unit_diagnostics_reports_status_and_tail_and_survives_command_failure() -> None:
+def test_collect_unit_diagnostics_isolates_invocation_id_and_survives_command_failure() -> None:
     import subprocess
 
     from src.tools import alerts
 
     calls = []
 
-    def _run(cmd, **kwargs):
+    def _run_with_inv(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[0] == "systemctl":
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="Result=exit-code\nExecMainStatus=1\nInvocationID=13f7ced75516425e9282aaf0973ce250\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="\x1b[91mTraceback\x1b[0m\nValueError: boom\n", stderr="")
+
+    # When: InvocationID 가 존재하는 경우
+    status, journal = alerts.collect_unit_diagnostics("kca-collect.service", run=_run_with_inv)
+
+    # Then: _SYSTEMD_INVOCATION_ID= 가 사용되고 단위 상태가 정확히 파싱됨
+    assert status["Result"] == "exit-code"
+    assert status["ExecMainStatus"] == "1"
+    assert status["InvocationID"] == "13f7ced75516425e9282aaf0973ce250"
+    assert "Traceback\nValueError: boom" in journal
+    assert calls[0][0][:4] == ["systemctl", "--user", "show", "kca-collect.service"]
+    assert calls[1][0][:3] == ["journalctl", "--user", "_SYSTEMD_INVOCATION_ID=13f7ced75516425e9282aaf0973ce250"]
+
+    # Given: InvocationID 가 없는 경우 fallback 으로 -u unit -n 40 사용
+    calls.clear()
+
+    def _run_without_inv(cmd, **kwargs):
         calls.append((cmd, kwargs))
         if cmd[0] == "systemctl":
             return subprocess.CompletedProcess(cmd, 0, stdout="Result=exit-code\nExecMainStatus=1\n", stderr="")
-        return subprocess.CompletedProcess(cmd, 0, stdout="\x1b[91mTraceback\x1b[0m\nValueError: boom\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="fallback log\n", stderr="")
 
-    # When
-    out = alerts.collect_unit_diagnostics("kca-collect.service", run=_run)
-
-    # Then
-    assert "Result=exit-code" in out
-    assert "ExecMainStatus=1" in out
-    assert "Traceback\nValueError: boom" in out
-    assert calls[0][0][:4] == ["systemctl", "--user", "show", "kca-collect.service"]
+    status2, journal2 = alerts.collect_unit_diagnostics("kca-collect.service", run=_run_without_inv)
     assert calls[1][0][:4] == ["journalctl", "--user", "-u", "kca-collect.service"]
-    assert all(kw["timeout"] == alerts.ALERT_COMMAND_TIMEOUT_SEC and kw["check"] is True for _cmd, kw in calls)
+    assert "fallback log" in journal2
 
+    # Given: 명령 실행 실패
     def _broken(cmd, **kwargs):
         if cmd[0] == "systemctl":
             raise FileNotFoundError("systemctl")
         raise subprocess.CalledProcessError(1, cmd)
 
-    # When: 명령 실패
-    out2 = alerts.collect_unit_diagnostics("kca-collect.service", run=_broken)
-
-    # Then: 알림 자체는 막지 않고 사유만 남김
-    assert "unit status unavailable: FileNotFoundError" in out2
-    assert "journal tail unavailable: CalledProcessError" in out2
+    status_fail, journal_fail = alerts.collect_unit_diagnostics("kca-collect.service", run=_broken)
+    assert "unavailable: FileNotFoundError" in status_fail["Result"]
+    assert "journal unavailable: CalledProcessError" in journal_fail
 
 
-def test_alerts_main_attaches_unit_diagnostics_when_detail_absent(monkeypatch) -> None:
+def test_extract_failure_summary_identifies_python_traceback_and_location() -> None:
     from src.tools import alerts
 
-    asked = []
-    sent = []
+    raw_journal = (
+        "Finished kca-auction-close.service - KCA optional auction close capture.\n"
+        "Starting kca-auction-close.service - KCA optional auction close capture...\n"
+        "Traceback (most recent call last):\n"
+        '  File "<frozen runpy>", line 198, in _run_module_as_main\n'
+        '  File "/app/src/daily/auction_capture.py", line 96, in _resolve_roster\n'
+        "    cohort = store.read_cohort(snapshot_date, available_by=now)\n"
+        '  File "/app/src/data/capture_store.py", line 441, in read_cohort\n'
+        "    raise FileNotFoundError(f\"no qualifying cohort: {snapshot_date!r}\")\n"
+        "FileNotFoundError: no qualifying cohort: '2026-09-24'\n"
+        '  File "/usr/local/lib/python3.11/asyncio/runners.py", line 190, in run\n'
+    )
+    status = {"Result": "exit-code", "ExecMainStatus": "1"}
 
-    def _diag(unit):
-        asked.append(unit)
-        return "Result=exit-code\nValueError: boom"
+    diag = alerts.extract_failure_summary(raw_journal, status)
 
-    def _dispatch(unit, *, detail=""):
-        sent.append((unit, detail))
+    assert diag["reason"] == "FileNotFoundError: no qualifying cohort: '2026-09-24'"
+    # stdlib/frozen 러너 대신 프로젝트 코드(src/...) 위치 우선 식별
+    assert diag["location"] == "/app/src/data/capture_store.py:441 in read_cohort"
+    assert "FileNotFoundError" in diag["context"]
+
+
+def test_extract_failure_summary_identifies_structured_error_log() -> None:
+    from src.tools import alerts
+
+    raw_journal = (
+        "2026-09-24 15:40:17,015 [INFO] 🚀 [Intraday 아카이브 시작] 대상일: 2026-09-24\n"
+        "2026-09-24 15:40:17,461 [ERROR] [DATA] stage=intraday_archive status=ERROR reason=no qualifying cohort: '2026-09-24'\n"
+        "kca-archive-intraday-regular.service: Main process exited, code=exited, status=1/FAILURE\n"
+    )
+    status = {"Result": "exit-code", "ExecMainStatus": "1"}
+
+    diag = alerts.extract_failure_summary(raw_journal, status)
+
+    assert "[ERROR]" in diag["reason"]
+    assert "reason=no qualifying cohort: '2026-09-24'" in diag["reason"]
+
+
+def test_extract_failure_summary_falls_back_to_systemctl_result_when_log_empty() -> None:
+    from src.tools import alerts
+
+    status = {"Result": "oom-kill", "ExecMainStatus": "137"}
+    diag = alerts.extract_failure_summary("", status)
+
+    assert diag["reason"] == "Process exited with oom-kill (status 137)"
+    assert diag["location"] == ""
+    assert diag["context"] == "(상세 로그 없음)"
+
+
+def test_extract_failure_summary_prunes_noise_and_caps_context() -> None:
+    from src.tools import alerts
+
+    noisy_journal = (
+        "2026-09-23 16:33:19,504 [INFO] [DATA] stage=intraday_replace date=2026-09-23 session=regular replaced=['420770', '424760']\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        '<frozen runpy>: line 88\n'
+        "2026-09-24 15:40:17,461 [ERROR] [DATA] stage=intraday_archive status=ERROR reason=failed\n"
+    )
+    status = {"Result": "exit-code", "ExecMainStatus": "1"}
+
+    diag = alerts.extract_failure_summary(noisy_journal, status)
+
+    assert "replaced=" not in diag["context"]
+    assert "━━━━" not in diag["context"]
+    assert "<frozen " not in diag["context"]
+    assert "[ERROR]" in diag["context"]
+
+
+def test_format_failure_alert_builds_unified_card_and_subject() -> None:
+    from src.tools import alerts
+
+    status = {
+        "Result": "exit-code",
+        "ExecMainStatus": "1",
+        "ExecMainStartTimestamp": "Thu 2026-09-24 15:40:13 KST",
+        "ExecMainExitTimestamp": "Thu 2026-09-24 15:40:17 KST",
+    }
+    diag = {
+        "reason": "FileNotFoundError: no qualifying cohort: '2026-09-24'",
+        "location": "src/daily/auction_capture.py:96 in _resolve_roster",
+        "context": "FileNotFoundError: no qualifying cohort: '2026-09-24'",
+    }
+
+    subject, body = alerts.format_failure_alert("kca-auction-close.service", status, diag)
+
+    assert subject == "[kca] 🚨 유닛 실행 실패: kca-auction-close.service"
+    assert "==================================================" in body
+    assert "🚨 KCA 시스템 유닛 장애 알림 (kca-auction-close.service)" in body
+    assert "• 실패 유닛: kca-auction-close.service" in body
+    assert "• 종료 상태: exit-code (exit code: 1)" in body
+    assert "• 발생 시각: Thu 2026-09-24 15:40:17 KST (시작: Thu 2026-09-24 15:40:13 KST)" in body
+    assert "• 핵심 원인: FileNotFoundError: no qualifying cohort: '2026-09-24'" in body
+    assert "• 발생 위치: src/daily/auction_capture.py:96 in _resolve_roster" in body
+    assert "• 저널 확인: journalctl --user -u kca-auction-close.service -n 50 --no-pager" in body
+    assert "[핵심 에러 로그]" in body
+
+
+def test_alerts_main_attaches_formatted_failure_alert_when_detail_absent(monkeypatch) -> None:
+    from src.tools import alerts
+
+    captured = {}
+
+    def _fake_diag(unit):
+        return (
+            {"Result": "exit-code", "ExecMainStatus": "1", "ExecMainStartTimestamp": "T1", "ExecMainExitTimestamp": "T2"},
+            "ValueError: test boom",
+        )
+
+    def _fake_dispatch(unit, *, detail="", subject=None):
+        captured["unit"] = unit
+        captured["detail"] = detail
+        captured["subject"] = subject
         return {"webhook": False, "email": True}
 
-    monkeypatch.setattr(alerts, "collect_unit_diagnostics", _diag)
-    monkeypatch.setattr(alerts, "dispatch_failure_alert", _dispatch)
+    monkeypatch.setattr(alerts, "collect_unit_diagnostics", _fake_diag)
+    monkeypatch.setattr(alerts, "dispatch_failure_alert", _fake_dispatch)
 
     # When: systemd OnFailure 기본 호출(--detail 없음)
     alerts.main(["--unit", "kca-collect.service"])
 
     # Then
-    assert asked == ["kca-collect.service"]
-    assert sent == [("kca-collect.service", "Result=exit-code\nValueError: boom")]
+    assert captured["unit"] == "kca-collect.service"
+    assert captured["subject"] == "[kca] 🚨 유닛 실행 실패: kca-collect.service"
+    assert "🚨 KCA 시스템 유닛 장애 알림" in captured["detail"]
+    assert "ValueError: test boom" in captured["detail"]
 
     # When: 명시적 detail
-    asked.clear()
-    sent.clear()
+    captured.clear()
     alerts.main(["--unit", "kca-collect.service", "--detail", "manual note"])
 
     # Then
-    assert asked == []
-    assert sent == [("kca-collect.service", "manual note")]
+    assert captured["unit"] == "kca-collect.service"
+    assert captured["detail"] == "manual note"
+
+
+def test_parse_systemctl_show_handles_empty_and_malformed_lines() -> None:
+    from src.tools import alerts
+
+    raw = "\n  \nKey1=Val1\nInvalidLineWithoutEquals\nKey2 = Val2 \n\n"
+    res = alerts.parse_systemctl_show(raw)
+    assert res == {"Key1": "Val1", "Key2": "Val2"}
+
+
+def test_extract_failure_summary_identifies_critical_or_fatal_log() -> None:
+    from src.tools import alerts
+
+    raw_journal = "2026-09-24 12:00:00 [CRITICAL] kernel out of resources\n"
+    diag = alerts.extract_failure_summary(raw_journal, {"Result": "exit-code", "ExecMainStatus": "1"})
+    assert "[CRITICAL] kernel out of resources" in diag["reason"]
+
+    raw_journal2 = "2026-09-24 12:00:00 [FATAL] aborting process\n"
+    diag2 = alerts.extract_failure_summary(raw_journal2, {"Result": "exit-code", "ExecMainStatus": "1"})
+    assert "[FATAL] aborting process" in diag2["reason"]
+
+
+def test_dispatch_failure_alert_propagates_custom_subject(monkeypatch) -> None:
+    from src.tools import alerts
+
+    passed = {}
+
+    def _fake_post(url, *, unit, detail="", subject=None):
+        passed["webhook_subject"] = subject
+        return True
+
+    def _fake_email(*, gmail_user, gmail_app_password, to_addr, unit, detail="", subject=None):
+        passed["email_subject"] = subject
+        return True
+
+    monkeypatch.setattr(alerts, "post_webhook_alert", _fake_post)
+    monkeypatch.setattr(alerts, "send_email_alert", _fake_email)
+
+    alerts.dispatch_failure_alert("kca-predict.service", detail="d", subject="[kca] 🚨 유닛 실행 실패: kca-predict.service")
+    assert passed["webhook_subject"] == "[kca] 🚨 유닛 실행 실패: kca-predict.service"
+    assert passed["email_subject"] == "[kca] 🚨 유닛 실행 실패: kca-predict.service"
+
+
+def test_collect_unit_diagnostics_falls_back_when_invocation_id_fails() -> None:
+    import subprocess
+
+    from src.tools import alerts
+
+    def _run(cmd, **kwargs):
+        if cmd[0] == "systemctl":
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="Result=exit-code\nExecMainStatus=1\nInvocationID=fail_id\n",
+                stderr="",
+            )
+        if "_SYSTEMD_INVOCATION_ID=fail_id" in cmd[2]:
+            raise subprocess.CalledProcessError(1, cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="recovered fallback log\n", stderr="")
+
+    status, journal = alerts.collect_unit_diagnostics("kca-collect.service", run=_run)
+    assert status["InvocationID"] == "fail_id"
+    assert "recovered fallback log" in journal
+
