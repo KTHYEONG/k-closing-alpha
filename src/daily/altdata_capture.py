@@ -198,4 +198,6 @@ def main(argv: Sequence[str] | None = None, *, trading_day_fn: Callable[[str], b
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    # 설정이 없으면 INFO(SKIP·키 풀 구성)가 저널에 남지 않아 게이트 동작을 확인할 수 없다.
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     raise SystemExit(main())
