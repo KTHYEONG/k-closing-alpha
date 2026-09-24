@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_ALERT_FORMATTING",
+      "date": "2026-09-24",
+      "adr_id": "ADR_20260924_ALERT_FORMATTING",
+      "domain": "ops",
+      "title": "systemd 유닛 실패 알림 메일 가독성 개편 및 노이즈 격리",
+      "why": "systemd 유닛 실패 알림 메일에 이전 세션 정상 로그와 날것의 저널 덤프가 전송되어 실제 장애 원인 파악이 저해됨",
+      "resolution": "InvocationID 기반 저널 격리, 예외/에러 원인 1줄 자동 추출 및 상단 5줄 요약 카드 알림 포맷 도입",
+      "impact": "유닛 장애 메일 수신 즉시 1초 만에 핵심 에러 원인 및 발생 위치를 파악하고 저널 점검 명령어 원클릭 제공",
+      "caveat": "InvocationID 조회가 불가한 구형 환경에서는 유닛 저널 테일로 안전하게 fallback 보장"
+    },
+    {
       "task_id": "CAPTURE_LOCAL_RETENTION",
       "date": "2026-09-24",
       "adr_id": "ADR_20260924_CAPTURE_LOCAL_RETENTION",
@@ -1000,16 +1011,6 @@
       "why": "기존 승격 게이트는 oos_row_count=0(선택과 동일 OOF), DSR이 실선택예산의 1/15로 계산, 라벨이 운영자 재량 청산 포함, 비용이 전종목 동일 46bp 고정",
       "resolution": "src/ml/validation.py(잠긴 OOS 1회채점+CPCV(8,2) 경로일치+DSR)와 src/ml/decision_labels.py(행별비용+mechanical_gross 실행가능라벨) 신설, champion.py/tuning.py/retrain.py에 배선, publish_bundle로 production 승격 게이트화",
       "impact": "기존 워크포워드 부트스트랩이 promoted=true(Δ+0.249%p/일,p=0.0012)로 판정한 후보가 CPCV 28-fold에서는 top1 경로승률 0.536<0.60·p=0.508로 research_only 판정 — gate theatre 실증"
-    },
-    {
-      "task_id": "CHAMPION_RETRAIN_HOTPATH_OPT",
-      "date": "2026-09-06",
-      "adr_id": "ADR_20260906_CHAMPION_RETRAIN_HOTPATH_OPT",
-      "domain": "quant",
-      "title": "Champion Retrain Hot-Path Optimization",
-      "why": "The tuned champion retrain took ~810s, dominated by a per-group scipy.spearmanr loop in the rank_ic HPO objective and one fully redundant 5-fold calibrated OOF.",
-      "resolution": "Added vectorized metrics.mean_group_rank_ic (Spearman==Pearson-on-average-ranks) used by tuning and metrics.rank_ic, and threaded candidate_oof into evaluate_config_oof via precomputed_oof.",
-      "impact": "Behaviour-identical (best_params, promotion delta/p/promoted unchanged in full A/B); rank_ic sub-step 14s->0.015s, calibrated OOFs 3->2, wall-time ~810s->~220s."
     }
   ]
 }
