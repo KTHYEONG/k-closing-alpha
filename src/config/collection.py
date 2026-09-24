@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
-from typing import Self
+from typing import Annotated, Any, Self
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from src.data.capture_contracts import SessionClock
 
@@ -56,8 +57,8 @@ class CollectionSettings(BaseSettings):
     COLLECTION_RAW_ENABLED: bool = Field(default=True)
     COLLECTION_AUCTION_ENABLED: bool = Field(default=False)
     COLLECTION_ALTDATA_ENABLED: bool = Field(default=False)
-    COLLECTION_RESEARCH_SLOTS: tuple[str, ...] = Field(default=())
-    COLLECTION_ALTDATA_EXTRA_SLOTS: tuple[str, ...] = Field(default=())
+    COLLECTION_RESEARCH_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
+    COLLECTION_ALTDATA_EXTRA_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     COLLECTION_AUCTION_INTERVAL_SECONDS: int = Field(default=60, gt=0)
     COLLECTION_REQUEST_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     COLLECTION_CONCURRENCY_PER_KEY: int = Field(default=8, gt=0)
@@ -70,6 +71,23 @@ class CollectionSettings(BaseSettings):
     COLLECTION_VERIFIED_CHART_ROUTES: dict[str, str] = Field(default_factory=dict)
     COLLECTION_OPEN_CONFIRM_SECONDS: int = Field(default=180, gt=30)
     COLLECTION_SESSION_OVERRIDES: dict[str, SessionClock] = Field(default_factory=dict)
+
+    @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", mode="before")
+    @classmethod
+    def _parse_slot_env(cls, v: Any) -> Any:
+        """Accept the slot-list spelling every env loader agrees on.
+
+        docker ``--env-file`` keeps quotes literally while systemd
+        ``EnvironmentFile`` strips them, so a JSON list such as ``["3"]`` reads
+        as ``[3]`` under systemd. The comma spelling (``2,3``, the same as
+        ``KIS_DATA_SLOTS``) is identical under both loaders; JSON lists remain
+        accepted for existing deployments.
+        """
+        if not isinstance(v, str):
+            return v
+        text = v.strip()
+        items = json.loads(text) if text.startswith("[") else text.split(",")
+        return tuple(str(item).strip() for item in items if str(item).strip())
 
     @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", mode="after")
     @classmethod
