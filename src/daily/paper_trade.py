@@ -27,6 +27,7 @@ from src.config.market_session import (
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.collect import safe_float
 from src.daily.predict import load_topk_decision
+from src.data.trading_calendar import is_kis_trading_day
 from src.execution.paper_broker import (
     ORDER_STATUS_FILLED,
     ORDER_STATUS_NO_SNAPSHOT_ROW,
@@ -129,11 +130,17 @@ async def run_paper_session(
     session: aiohttp.ClientSession | None = None,
     now_fn: Callable[[], pd.Timestamp] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] | None = None,
+    trading_day_fn: Callable[[str], Awaitable[bool]] | None = None,
 ) -> int:
     """페이퍼 세션을 실행하고 체결 건수를 반환한다. 체결은 원장에 즉시 flush한다. 청산은 미청산 포지션을 D+1 KRX 시가단일가로 시장가 청산한다.
 
+    Exit on a KRX holiday records nothing and keeps every lot open, so the lots
+    exit at the next real open auction. ``trading_day_fn`` defaults to the KIS
+    trading-day oracle on the data account.
+
     Raises:
         ValueError: unknown phase or non-same-day exit.
+        RuntimeError: the trading-day oracle fails (fail-closed, no fills).
     """
     if phase not in ("entry", "exit"):
         raise ValueError(f"unknown phase {phase!r}")
@@ -237,21 +244,32 @@ async def run_paper_session(
     now = now_fn() if now_fn is not None else pd.Timestamp.now(tz="Asia/Seoul")
     if now.strftime("%Y-%m-%d") != date_str:
         raise ValueError(f"paper exit open quote is same-day only: decision_date={date_str} now={now.date()}")
-    earliest = _placed_at(date_str, PAPER_EXIT_OPEN_QUOTE_EARLIEST_HHMMSS)
-    if now < earliest:
-        await sleep_fn((earliest - now).total_seconds())
-    observed_at = max(now, earliest)
     owned_session: aiohttp.ClientSession | None = None
     try:
-        if quote_fn is None:
+        if quote_fn is None or trading_day_fn is None:
             if session is None:  # pragma: no cover - live KIS boundary
                 owned_session = aiohttp.ClientSession()
                 session = owned_session
             client = KisApiClient(**kis_data_client_kwargs())
+            if trading_day_fn is None:
 
-            async def quote_fn(code: str) -> int:
-                return await fetch_krx_open_quote(client, session, code)
+                async def trading_day_fn(day: str) -> bool:
+                    return await is_kis_trading_day(client, session, day)
 
+            if quote_fn is None:
+
+                async def quote_fn(code: str) -> int:
+                    return await fetch_krx_open_quote(client, session, code)
+
+        # 휴장일에도 현재가 API는 직전 거래일 stck_oprc를 정상 응답한다. 판정 없이 조회하면
+        # 존재하지 않는 시가로 가상 청산이 기록된다(실측: 2026-09-24 추석 연휴 3건).
+        if not await trading_day_fn(date_str):
+            logger.info("[EXEC] stage=paper_exit status=SKIP reason=non_trading_day date=%s n_open=%d", date_str, len(orders))
+            return 0
+        earliest = _placed_at(date_str, PAPER_EXIT_OPEN_QUOTE_EARLIEST_HHMMSS)
+        if now < earliest:
+            await sleep_fn((earliest - now).total_seconds())
+        observed_at = max(now, earliest)
         open_prices: dict[str, int] = {}
         pending = sorted({o.symbol for o in orders})
         for attempt in range(PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS):
