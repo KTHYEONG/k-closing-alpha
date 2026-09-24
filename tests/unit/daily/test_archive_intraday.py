@@ -1043,6 +1043,12 @@ def test_run_archive_cohort_and_cli_boundaries(monkeypatch, tmp_path) -> None:
         archive_intraday.run_intraday_archive(snapshot_date="bogus", profile=_raw_profile(tmp_path))
     with pytest.raises(ValueError, match="bar_interval"):
         archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", bar_interval_minutes=0, profile=_raw_profile(tmp_path))
+
+    async def _never(*args, **kwargs):
+        raise AssertionError("must not collect without a cohort")
+
+    # 거래일로 판정된 날의 코호트 부재는 여전히 fail-closed여야 한다(휴장일 SKIP과 구분).
+    _raw_archive_mocks(monkeypatch, tmp_path, _never)
     store = _archive_store(tmp_path)
     _publish_cohort(store, "2026-09-07", ["005930"])
     with pytest.raises(FileNotFoundError, match="no qualifying cohort"):
@@ -1136,6 +1142,27 @@ def test_run_archive_non_trading_day_skips_in_raw_mode(monkeypatch, tmp_path) ->
     result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
 
     assert result == (0, 0, 0)
+
+
+def test_run_archive_non_trading_day_without_cohort_skips_cleanly(monkeypatch, tmp_path) -> None:
+    """A weekday holiday has no cohort (collect skips it); the archive must skip, not fail."""
+    from src.daily import archive_intraday
+
+    _archive_store(tmp_path)
+
+    async def _never(*args, **kwargs):
+        raise AssertionError("must not collect on non-trading day")
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _never)
+
+    async def _not_trading(_client, _session, _date):
+        return False
+
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _not_trading)
+
+    for phase in ("regular", "aftermarket"):
+        result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-24", profile=_raw_profile(tmp_path), phase=phase)
+        assert result == (0, 0, 0)
 
 
 def test_run_archive_full_complete_and_partial_fragments(monkeypatch, tmp_path) -> None:

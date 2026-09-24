@@ -355,7 +355,6 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
     if not prof.COLLECTION_RAW_ENABLED:
         return _legacy_run(str(snap_date), int(bar_interval_minutes), phase=phase)
     store = CaptureStore(_capture_root(prof))
-    codes, prev_incomplete = _resolve_cohort_codes(str(snap_date), prof, store)
     do_regular = phase in ("regular", "all")
     do_aftermarket = phase in ("aftermarket", "all")
 
@@ -368,6 +367,8 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
             if not await is_kis_trading_day(client, session, str(snap_date)):
                 logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
                 return (0, 0, 0)
+            # 휴장일엔 collect가 코호트를 발행하지 않으므로, 코호트 조회는 거래일 판정 뒤에 해야 오탐 실패가 없다.
+            codes, prev_incomplete = _resolve_cohort_codes(str(snap_date), prof, store)
             interval = int(bar_interval_minutes)
             batch_rows = int(prof.COLLECTION_ARROW_BATCH_ROWS)
             batch_size = int(prof.COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE)
