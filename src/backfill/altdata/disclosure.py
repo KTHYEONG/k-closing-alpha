@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
@@ -19,7 +20,8 @@ from datetime import datetime
 import pandas as pd
 import requests
 
-from src.backfill.altdata.config import AltDataFetchConfig
+from src.backfill.altdata.config import AltDataFetchConfig, dart_pool_for
+from src.backfill.altdata.dart_keys import DartCredential
 from src.backfill.altdata.ratelimit import DartNonRetryableError, retry_call, wait_for_dart_slot
 from src.data.capture_contracts import PageObserver, RawCaptureError, SEOUL
 
@@ -30,6 +32,17 @@ _LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 # DART 계정 한도초과(020) — k-stock-engine 과 DART_API_KEY 를 공유하므로 발생 가능.
 # 재시도로 회복되지 않는 계정 레벨 오류라 즉시 실패 처리한다.
 _DART_NONRETRYABLE_STATUS: frozenset[str] = frozenset({"020"})
+_DART_REJECTED_STATUS: frozenset[str] = frozenset({"010", "011", "012"})
+
+_STATUS_TAG_RE = re.compile(r"<status>\s*(\d{3})")
+
+
+class _DartKeyStatusError(RuntimeError):
+    """DART configuration rejection for one key (status 010/011/012)."""
+
+    def __init__(self, status: str) -> None:
+        super().__init__(f"DART key rejected status={status}")
+        self.status = status
 
 # 수집 대상 공시유형: B(주요사항보고서), I(거래소공시). 아래 카테고리를 모두 포함.
 _PBLNTF_TYPES: tuple[str, ...] = ("B", "I")
@@ -56,13 +69,14 @@ _OUT_COLS: list[str] = (
 )
 
 
-def _dart_get_json(url: str, params: dict[str, object], cfg: AltDataFetchConfig, *, on_page: PageObserver | None = None, page_index: int = 0, attempt_index: int = 0) -> dict[str, object]:
+def _dart_get_json(url: str, params: dict[str, object], cfg: AltDataFetchConfig, *, credential: DartCredential | None = None, on_page: PageObserver | None = None, page_index: int = 0, attempt_index: int = 0) -> dict[str, object]:
     """Observe decoded DART list pages before status validation and count aggregation.
 
     Args:
         url: Existing DART endpoint.
         params: Source request parameters, never persisted with authentication.
         cfg: Existing rate and retry settings.
+        credential: Key to inject as ``crtfc_key`` for this request.
         on_page: Optional durable source observer.
         page_index: Zero-based list page index.
         attempt_index: Actual zero-based retry attempt.
@@ -74,7 +88,13 @@ def _dart_get_json(url: str, params: dict[str, object], cfg: AltDataFetchConfig,
     """
     started = datetime.now(SEOUL)
     wait_for_dart_slot(cfg)
-    resp = requests.get(url, params=params, timeout=20)
+    request_params = dict(params)
+    if credential is not None:
+        request_params["crtfc_key"] = credential.key
+    try:
+        resp = requests.get(url, params=request_params, timeout=20)
+    except OSError as exc:
+        raise RuntimeError(f"DART request failed error={type(exc).__name__}") from None
     if resp.status_code != 200:
         raise RuntimeError(f"DART request failed status={resp.status_code}")
     data = resp.json()
@@ -94,29 +114,51 @@ def _dart_get_json(url: str, params: dict[str, object], cfg: AltDataFetchConfig,
             msg = f"DART error status={status} msg={data.get('message', '')}"
             if status in _DART_NONRETRYABLE_STATUS:
                 raise DartNonRetryableError(msg)
+            if status in _DART_REJECTED_STATUS:
+                raise _DartKeyStatusError(status)
             raise RuntimeError(msg)
     return data  # type: ignore[return-value]
 
 
+def _extract_error_status(content: bytes) -> str | None:
+    """Return a DART status code embedded in a non-ZIP error body, if any."""
+    match = _STATUS_TAG_RE.search(content.decode("utf-8", errors="ignore"))
+    return match.group(1) if match is not None else None
+
+
 def download_corp_code_map(cfg: AltDataFetchConfig) -> pd.DataFrame:
     """DART corpCode.xml 을 받아 corp_code-stock_code 맵(상장 종목만)을 반환합니다."""
-    if not str(cfg.dart_api_key).strip():
+    pool = dart_pool_for(cfg)
+    if pool.is_empty():
         raise ValueError("DART_API_KEY is required for disclosure backfill")
-    wait_for_dart_slot(cfg)
-    resp = requests.get(
-        "https://opendart.fss.or.kr/api/corpCode.xml",
-        params={"crtfc_key": cfg.dart_api_key},
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"DART corpCode request failed status={resp.status_code}")
-    try:
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            names = zf.namelist()
-            target = next((n for n in names if n.lower() == "corpcode.xml"), names[0])
-            xml_bytes = zf.read(target)
-    except zipfile.BadZipFile as exc:
-        raise RuntimeError(f"DART corpCode ZIP parse failed: {exc}") from exc
+    while True:
+        credential = pool.current()
+        wait_for_dart_slot(cfg)
+        try:
+            resp = requests.get(
+                "https://opendart.fss.or.kr/api/corpCode.xml",
+                params={"crtfc_key": credential.key},
+                timeout=30,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"DART corpCode request failed error={type(exc).__name__}") from None
+        if resp.status_code != 200:
+            raise RuntimeError(f"DART corpCode request failed status={resp.status_code}")
+        try:
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                names = zf.namelist()
+                target = next((n for n in names if n.lower() == "corpcode.xml"), names[0])
+                xml_bytes = zf.read(target)
+            break
+        except zipfile.BadZipFile as exc:
+            status = _extract_error_status(resp.content)
+            if status == "020":
+                pool.mark_exhausted(credential)
+                continue
+            if status is not None and status in _DART_REJECTED_STATUS:
+                pool.mark_rejected(credential, status)
+                continue
+            raise RuntimeError(f"DART corpCode ZIP parse failed: {exc}") from exc
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as exc:
@@ -184,17 +226,25 @@ def _fetch_list_page(
     page_offset: int = 0,
 ) -> tuple[list[dict[str, str]], int | None]:
     """단일 페이지 조회 → (parsed rows, total_page). 실패 시 ([], None)."""
+    pool = dart_pool_for(cfg)
     params = {**base_params, "page_no": page_no}
     state = {"attempt": 0}
 
     def _call() -> dict[str, object]:
-        attempt = state["attempt"]
-        state["attempt"] += 1
-        # page_offset은 (pblntf_ty, 창) 조합마다 고유한 버킷을 부여한다. page_no는 각
-        # 조합마다 1부터 다시 시작해, 그대로 쓰면 CaptureStore 경로(nosymbol-pNNNN-aAA)가
-        # 조합 간에 겹쳐 conflicting immutable artifact identity로 크래시한다
-        # (실측: 2026-09-21 disclosure 수집이 이 충돌로 매번 PARTIAL).
-        return _dart_get_json(_LIST_URL, params, cfg, on_page=on_page, page_index=page_offset + page_no, attempt_index=attempt)
+        while True:
+            credential = pool.current()
+            attempt = state["attempt"]
+            state["attempt"] += 1
+            # page_offset은 (pblntf_ty, 창) 조합마다 고유한 버킷을 부여한다. page_no는 각
+            # 조합마다 1부터 다시 시작해, 그대로 쓰면 CaptureStore 경로(nosymbol-pNNNN-aAA)가
+            # 조합 간에 겹쳐 conflicting immutable artifact identity로 크래시한다
+            # (실측: 2026-09-21 disclosure 수집이 이 충돌로 매번 PARTIAL).
+            try:
+                return _dart_get_json(_LIST_URL, params, cfg, credential=credential, on_page=on_page, page_index=page_offset + page_no, attempt_index=attempt)
+            except _DartKeyStatusError as exc:
+                pool.mark_rejected(credential, exc.status)
+            except DartNonRetryableError:
+                pool.mark_exhausted(credential)
 
     data = retry_call(_call, cfg, label=f"dart list p{page_no}")
     if not isinstance(data, dict) or str(data.get("status", "")).strip() == "013":
@@ -223,7 +273,6 @@ def _fetch_disclosure_window(
     from concurrent.futures import ThreadPoolExecutor
 
     base_params: dict[str, object] = {
-        "crtfc_key": cfg.dart_api_key,
         "bgn_de": start_ymd,
         "end_de": end_ymd,
         "pblntf_ty": pblntf_ty,
@@ -306,7 +355,7 @@ def collect_disclosures(
     Raises:
         RawCaptureError: A page could not be retained.
     """
-    if not str(cfg.dart_api_key).strip():
+    if dart_pool_for(cfg).is_empty():
         raise ValueError("DART_API_KEY is required for disclosure backfill")
 
     corp_to_stock: dict[str, str] = {}

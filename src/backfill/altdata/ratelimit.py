@@ -33,6 +33,14 @@ class DartNonRetryableError(RuntimeError):
     """
 
 
+class DartQuotaExhaustedError(DartNonRetryableError):
+    """Every configured DART key returned the daily-quota status in this process; the message lists the key labels only."""
+
+
+class DartKeysUnusableError(DartNonRetryableError):
+    """No DART key is usable and at least one was rejected for a non-quota reason (unregistered, unusable, or IP-blocked key); the message lists label=reason pairs only."""
+
+
 def wait_for_pykrx_slot(cfg: AltDataFetchConfig) -> None:
     """pykrx 호출 간격을 제한합니다.
 

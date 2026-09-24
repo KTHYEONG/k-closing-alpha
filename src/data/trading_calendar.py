@@ -60,3 +60,32 @@ async def is_kis_trading_day(client, session, date: pd.Timestamp | str) -> bool:
         raise RuntimeError(f"KIS trading-day oracle failed rt_cd={res.get('rt_cd')} msg={res.get('msg1', '')}")
     rows = res.get("output2") or []
     return any(str(r.get("stck_bsop_date", "")).strip() == ymd for r in rows)
+
+
+def is_kis_trading_day_sync(snapshot_date: str) -> bool:  # pragma: no cover - live KIS boundary
+    """Synchronous KIS trading-day lookup on the data account.
+
+    Wraps ``is_kis_trading_day`` with its own client and session so scheduled
+    scripts without an event loop can consult the calendar.
+
+    Args:
+        snapshot_date: KST date ``YYYY-MM-DD``.
+
+    Returns:
+        True when KIS lists the date as a trading day.
+
+    Raises:
+        RuntimeError: The oracle returned a failure response.
+        OSError: Transport failure.
+    """
+    import asyncio
+
+    from src.api.kis.client import KisApiClient, kis_data_client_kwargs
+
+    async def _run() -> bool:
+        client = KisApiClient(**kis_data_client_kwargs())  # type: ignore[no-untyped-call]
+        async with client.create_session() as session:
+            await client.ensure_token(session)
+            return await is_kis_trading_day(client, session, snapshot_date)
+
+    return asyncio.run(_run())

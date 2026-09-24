@@ -1514,3 +1514,136 @@ def test_default_backup_issues_reads_report_under_capture_root(tmp_path, monkeyp
 
     # When reading through the default injection
     assert daily_audit._default_backup_issues(audit_at) == []
+
+
+def _publish_slow_manifest_with_entries(store, day, run_id, *, status, entries):
+    from datetime import datetime
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CoverageEntry
+
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, run_id, CaptureDataset.SHORTING, "altdata-backfill"),
+        cohort=None,
+        completed_at=datetime.fromisoformat(f"{day}T21:40:00+09:00"),
+        entries=tuple(entries),
+        artifacts=(),
+        status=status,
+    )
+    return store.publish_manifest(manifest)
+
+
+def _slow_entry(dataset, status, reason):
+    from src.data.capture_contracts import CoverageEntry
+
+    return CoverageEntry(
+        symbol=None,
+        dataset=dataset,
+        venue="KRX",
+        session="regular",
+        scheduled_at=None,
+        status=status,
+        rows=0,
+        first_event_time=None,
+        last_event_time=None,
+        reason=reason,
+        raw_refs=(),
+    )
+
+
+def test_audit_collection_degraded_run_raises_no_slow_data_issue(tmp_path) -> None:
+    """Degraded run raises no slow-data issue."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_slow_manifest_with_entries(
+        store,
+        day,
+        "run-slow-degraded",
+        status=CaptureStatus.PARTIAL,
+        entries=(
+            _slow_entry(CaptureDataset.SHORTING, CaptureStatus.COMPLETE, "ok"),
+            _slow_entry(CaptureDataset.DISCLOSURE, CaptureStatus.FAILED, "quota_exceeded"),
+        ),
+    )
+    issues = _audit(
+        store,
+        day,
+        _collection_profile(tmp_path, altdata=True),
+        _session_clock(day),
+        _audit_moment(day, "22:00:00"),
+    )
+    assert not any(issue.startswith("collection:slow_data") for issue in issues)
+
+
+def test_audit_collection_failed_run_still_raises_incomplete_run(tmp_path) -> None:
+    """Failed run still raises incomplete_run."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_slow_manifest_with_entries(
+        store,
+        day,
+        "run-slow-failed",
+        status=CaptureStatus.PARTIAL,
+        entries=(_slow_entry(CaptureDataset.DISCLOSURE, CaptureStatus.FAILED, "unavailable"),),
+    )
+    issues = _audit(
+        store,
+        day,
+        _collection_profile(tmp_path, altdata=True),
+        _session_clock(day),
+        _audit_moment(day, "22:00:00"),
+    )
+    assert "collection:slow_data:1:incomplete_run" in issues
+
+
+def test_audit_collection_missing_run_on_trading_day_still_reported(tmp_path) -> None:
+    """Missing run on a trading day still reported."""
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    issues = _audit(
+        store,
+        day,
+        _collection_profile(tmp_path, altdata=True),
+        _session_clock(day),
+        _audit_moment(day, "22:00:00"),
+    )
+    assert "collection:slow_data:1:missing_run" in issues
+
+
+def test_audit_collection_holiday_raises_no_slow_data_issue(tmp_path) -> None:
+    """Holiday raises no slow-data issue."""
+    from src.data.capture_store import CaptureStore
+    from src.tools import daily_audit
+
+    day = "2026-09-24"
+    assert daily_audit.classify_day(day, lambda _d: False) == daily_audit.DAY_HOLIDAY
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    issues = _audit(
+        store, day, _collection_profile(tmp_path, altdata=True), _session_clock(day), _audit_moment(day)
+    )
+    assert not any(issue.startswith("collection:slow_data") for issue in issues)
+
+
+def test_classify_day_default_oracle_is_shared_sync_helper(monkeypatch) -> None:
+    """Calendar oracle default is the shared sync helper."""
+    from src.tools import daily_audit
+
+    assert not hasattr(daily_audit, "_kis_trading_day")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        daily_audit, "is_kis_trading_day_sync", lambda snapshot_date: calls.append(snapshot_date) or True
+    )
+    assert daily_audit.classify_day("2026-09-14") == daily_audit.DAY_TRADING
+    assert calls == ["2026-09-14"]

@@ -33,6 +33,7 @@ class ProvisioningError(RuntimeError):
 class RuntimeEnvKey:
     target: str
     sources: tuple[str, ...]
+    optional: bool = False
 
 
 RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
@@ -53,6 +54,7 @@ RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
     RuntimeEnvKey(target="TOSS_APP_KEY", sources=("TOSS_APP_KEY",)),
     RuntimeEnvKey(target="TOSS_APP_SECRET", sources=("TOSS_APP_SECRET",)),
     RuntimeEnvKey(target="OPENDART_API_KEY", sources=("OPENDART_API_KEY",)),
+    RuntimeEnvKey(target="OPENDART_API_KEY_2", sources=("OPENDART_API_KEY_2",), optional=True),
 )
 
 REMOTE_RUNTIME_ENV_PATH: str = "/home/ubuntu/quant-secrets/k-closing-alpha.env"
@@ -136,6 +138,8 @@ def build_runtime_fragment(source_path: Path) -> str:
                 value = candidate
                 break
         if not value:
+            if key.optional:
+                continue
             raise ProvisioningError(f"missing required key: {key.target}")
         lines.append(f"{key.target}={value}")
     return "\n".join(lines) + "\n"
@@ -169,7 +173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     source = Path(args.source)
     fragment = build_runtime_fragment(source)
-    logger.info("provisioned %d keys to %s from %s", len(RUNTIME_ENV_SPEC), args.host, source)
+    logger.info("provisioned %d keys to %s from %s", len(fragment.splitlines()), args.host, source)
     if args.dry_run:
         return 0
     install_runtime_fragment(args.host, fragment)

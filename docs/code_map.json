@@ -404,5 +404,8 @@
   },
   "src/tools/offsite_legacy_cleanup.py": {
     "testing": "tests/unit/tools/test_offsite_legacy_cleanup.py"
+  },
+  "src/backfill/altdata/dart_keys.py": {
+    "testing": "tests/unit/backfill/test_altdata_dart_keys.py"
   }
 }
