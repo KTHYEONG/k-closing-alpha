@@ -27,6 +27,7 @@ from src.data.capture_contracts import (
     SessionClock,
 )
 from src.data.capture_store import CaptureStore
+from src.data.trading_calendar import is_kis_trading_day
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ def _resolve_roster(
     phase: str,
     store: CaptureStore,
     now: datetime,
+    previous_trading_day: str | None = None,
 ) -> tuple[list[str], str | None, bool]:
     if phase == "close":
         try:
@@ -97,7 +99,7 @@ def _resolve_roster(
         except FileNotFoundError as exc:
             raise RuntimeError(f"auction cohort cannot be verified: {snapshot_date!r}") from exc
         return [str(item) for item in cohort.eligible_symbols], cohort.cohort_id, False
-    prev_day = _previous_trading_day(snapshot_date)
+    prev_day = previous_trading_day or _previous_trading_day(snapshot_date)
     try:
         prev_cohort = store.read_cohort(prev_day, available_by=now)
     except FileNotFoundError:
@@ -298,6 +300,7 @@ async def run_auction_capture(
     session_clock: SessionClock,
     now_fn: Callable[[], datetime] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] | None = None,
+    previous_trading_day: str | None = None,
 ) -> CaptureManifest:
     """Capture the complete project cohort through independently timed auctions.
 
@@ -341,7 +344,7 @@ async def run_auction_capture(
     if not clients:
         raise ValueError("auction capture requires prewarmed data clients")
     now = now_clock()
-    roster, cohort_id, cohort_incomplete = _resolve_roster(snapshot_date, phase, store, now)
+    roster, cohort_id, cohort_incomplete = _resolve_roster(snapshot_date, phase, store, now, previous_trading_day)
     if phase == "close":
         rounds = _close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS))
         phase_end = session_clock.close_at
@@ -704,7 +707,8 @@ async def run_auction_capture(
     return manifest
 
 
-async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings) -> CaptureManifest:
+async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings) -> CaptureManifest | None:
+    """Run one capture phase; ``None`` when KIS reports ``snapshot_date`` as a market holiday."""
     import os
 
     from src.api.kis.client import KisApiClient
@@ -724,9 +728,19 @@ async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings
     store = CaptureStore(_capture_root(profile))
     trading_day = date.fromisoformat(snapshot_date)
     clock = profile.COLLECTION_SESSION_OVERRIDES.get(snapshot_date, SessionClock.standard(trading_day))
+    previous_trading_day: str | None = None
     async with clients[0].create_session() as broker_session:
         for client in clients:
             await client.ensure_token(broker_session)
+        # 평일 공휴일(명절 등)은 주말 판정으로 걸러지지 않는다. collect 와 같은 KIS 거래일 오라클로 판정한다.
+        if not await is_kis_trading_day(clients[0], broker_session, snapshot_date):
+            return None
+        if phase == "open":
+            from src.daily.collect import resolve_prev_trading_day_kis
+
+            # 연휴 직후 개장의 모집단은 직전 '실제' 거래일 코호트여야 한다(주말만 건너뛰면 휴장일을 가리킨다).
+            prev = await resolve_prev_trading_day_kis(clients[0], broker_session, pd.Timestamp(snapshot_date))
+            previous_trading_day = prev.strftime("%Y-%m-%d")
     return await run_auction_capture(
         snapshot_date,
         phase=phase,  # type: ignore[arg-type]
@@ -734,6 +748,7 @@ async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings
         store=store,
         clients=clients,
         session_clock=clock,
+        previous_trading_day=previous_trading_day,
     )
 
 
@@ -764,6 +779,10 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("[DATA] stage=auction_capture status=SKIP reason=holiday date=%s", snapshot_date)
         return
     manifest = asyncio.run(_run_async(snapshot_date, args.phase, profile))
+    if manifest is None:
+        # 휴장일은 장애가 아니다: 정상 종료해 OnFailure 오탐 알림과 무의미한 캡처를 막는다.
+        logger.info("[DATA] stage=auction_capture status=SKIP reason=non_trading_day date=%s", snapshot_date)
+        return
     logger.info(
         "[DATA] stage=auction_capture status=%s phase=%s date=%s entries=%d",
         manifest.status.value,

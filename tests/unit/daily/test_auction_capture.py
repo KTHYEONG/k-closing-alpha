@@ -850,8 +850,112 @@ def test_run_async_builds_clients(tmp_path, monkeypatch) -> None:
         return "manifest-ok"
 
     monkeypatch.setattr(auction_capture, "run_auction_capture", _fake_capture)
+
+    async def _open(client: Any, session: Any, date: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(auction_capture, "is_kis_trading_day", _open)
     out = asyncio.run(auction_capture._run_async("2026-09-17", "close", profile))
     assert out == "manifest-ok"
     assert seen["warmed"] is True
     assert created and "token_" in str(created[0][1])
     assert os.environ["KIS_DATA_SLOTS"] == "5"
+
+
+def _stub_research_clients(monkeypatch: Any) -> None:
+    from src.daily import auction_capture
+
+    class _Cred:
+        app_key = "key5"
+        app_secret = "sec5"
+        hts_id = "hts5"
+
+    class _Client:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def create_session(self) -> _Session:
+            return _Session()
+
+        async def ensure_token(self, session: Any) -> None:
+            return None
+
+    monkeypatch.setattr(auction_capture, "resolve_research_credentials", lambda env, *, slots: (_Cred(),))
+    monkeypatch.setattr("src.api.kis.client.KisApiClient", _Client)
+
+
+def test_run_async_skips_weekday_market_holiday(tmp_path, monkeypatch) -> None:
+    """Weekday holidays (e.g. Chuseok) return None without capturing."""
+    from src.daily import auction_capture
+
+    _stub_research_clients(monkeypatch)
+
+    async def _closed(client: Any, session: Any, date: Any) -> bool:
+        return False
+
+    async def _must_not_run(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("capture must not run on a holiday")
+
+    monkeypatch.setattr(auction_capture, "is_kis_trading_day", _closed)
+    monkeypatch.setattr(auction_capture, "run_auction_capture", _must_not_run)
+    assert asyncio.run(auction_capture._run_async("2026-09-24", "close", _profile(tmp_path))) is None
+
+
+def test_run_async_open_uses_actual_previous_trading_day(tmp_path, monkeypatch) -> None:
+    """Opening after a holiday run uses the real previous trading day, not the previous weekday."""
+    import pandas as pd
+
+    from src.daily import auction_capture, collect
+
+    _stub_research_clients(monkeypatch)
+
+    async def _open(client: Any, session: Any, date: Any) -> bool:
+        return True
+
+    async def _prev(client: Any, session: Any, decision_date: Any, **kwargs: Any) -> Any:
+        return pd.Timestamp("2026-09-23")
+
+    seen: dict[str, Any] = {}
+
+    async def _capture(*args: Any, **kwargs: Any) -> str:
+        seen.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(auction_capture, "is_kis_trading_day", _open)
+    monkeypatch.setattr(collect, "resolve_prev_trading_day_kis", _prev)
+    monkeypatch.setattr(auction_capture, "run_auction_capture", _capture)
+    assert asyncio.run(auction_capture._run_async("2026-09-28", "open", _profile(tmp_path))) == "ok"
+    assert seen["previous_trading_day"] == "2026-09-23"
+
+
+def test_resolve_roster_prefers_supplied_previous_trading_day(tmp_path, monkeypatch) -> None:
+    """The weekday walk would pick 2026-09-25 (holiday); the supplied day wins."""
+    from src.daily import auction_capture
+
+    requested: list[str] = []
+
+    class _Store:
+        def read_cohort(self, day: str, *, available_by: Any) -> Any:
+            requested.append(day)
+            raise FileNotFoundError(day)
+
+    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    from datetime import datetime
+
+    auction_capture._resolve_roster("2026-09-28", "open", _Store(), datetime(2026, 9, 28, 8, 0), "2026-09-23")  # type: ignore[arg-type]
+    assert requested == ["2026-09-23"]
+
+
+def test_main_logs_non_trading_day_skip(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    from src.daily import auction_capture
+
+    async def _holiday(snapshot_date: str, phase: str, profile: Any) -> None:
+        return None
+
+    monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path))
+    monkeypatch.setattr(auction_capture, "_run_async", _holiday)
+    with caplog.at_level(logging.INFO, logger=auction_capture.logger.name):
+        auction_capture.main(["--phase", "close", "--date", "2026-09-24"])
+    assert any("reason=non_trading_day" in r.message for r in caplog.records)
