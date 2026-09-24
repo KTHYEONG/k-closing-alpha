@@ -856,3 +856,384 @@ def test_restore_rejects_unlisted_unsafe_link_and_missing(tmp_path: Path, monkey
     ledger_path.write_text(json.dumps(two) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="missing ledger members"):
         restore_date(tmp_path, "raw", day, tmp_path / "u4", run_fn=run_fn, config=cfg)
+
+
+def _write_prune_ledger(root: Path, tier: str, day: str, rels: list[str], archive_md5: str = "d41d8cd98f00b204e9800998ecf8427e") -> str:
+    from src.tools.capture_offsite import LedgerEntry, SegmentMember, _append_ledger_entry, _ledger_path
+
+    members = tuple(
+        SegmentMember(path=rel, size=(root / rel).stat().st_size, sha256="0" * 64) for rel in rels
+    )
+    entry = LedgerEntry(
+        tier=tier,
+        trading_date=day,
+        segment_name="seg-abc",
+        remote_path=f"gdrive:test/{tier}/{day[:7]}/{day}/seg-abc.tar.zst",
+        members=members,
+        archive_bytes=10,
+        archive_md5=archive_md5,
+        committed_at="2026-09-15T00:00:00+00:00",
+    )
+    _append_ledger_entry(_ledger_path(root, tier, day), entry)
+    return entry.remote_path
+
+
+def _md5_run_fn(expected_md5: str, calls: list, *, mode: str = "match"):
+    def run_fn(cmd, **kwargs):
+        calls.append(list(cmd))
+        assert cmd[1] == "md5sum"
+        if mode == "error":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="not found")
+        if mode == "raise":
+            raise OSError("drive unavailable")
+        if mode == "mismatch":
+            return subprocess.CompletedProcess(cmd, 0, stdout="ffffffffffffffffffffffffffffffff  seg.tar.zst\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"{expected_md5}  seg.tar.zst\n", stderr="")
+
+    return run_fn
+
+
+def test_prune_removes_fully_sealed_expired_date_whole(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    rel = _raw_rel(day, "a", "b.json")
+    _write_member(tmp_path, rel, b"sealed-payload")
+    size = (tmp_path / rel).stat().st_size
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    _write_prune_ledger(tmp_path, "raw", day, [rel], archive_md5=md5)
+    calls: list = []
+
+    # When today is 2026-09-24 (54 days past the date)
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, calls), config=_config()
+    )
+
+    # Then the whole directory is gone, ledger survives, bytes accounted
+    assert report.removed == ("raw/2026-08-01",)
+    assert report.kept == ()
+    assert report.bytes_removed == size
+    assert not (tmp_path / "raw" / day).exists()
+    assert (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").exists()
+    assert len(calls) == 1
+
+
+def test_prune_keeps_cutoff_and_window_dates_untouched(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    for day in ("2026-08-25", "2026-09-20"):
+        rel = _raw_rel(day, "a.bin")
+        _write_member(tmp_path, rel, b"x")
+        _write_prune_ledger(tmp_path, "raw", day, [rel], archive_md5=md5)
+    calls: list = []
+
+    # When cutoff is exactly 2026-08-25 (today - 30) and 2026-09-20 is in-window
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, calls), config=_config()
+    )
+
+    # Then both remain and neither is reported
+    assert report.removed == () and report.kept == ()
+    assert (tmp_path / "raw" / "2026-08-25").exists()
+    assert (tmp_path / "raw" / "2026-09-20").exists()
+    assert calls == []
+
+
+def test_prune_keeps_directory_with_unsealed_file(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    rel = _raw_rel(day, "a.bin")
+    _write_member(tmp_path, rel, b"xx")
+    _write_member(tmp_path, _raw_rel(day, "extra.bin"), b"unlisted")
+    _write_prune_ledger(tmp_path, "raw", day, [rel])
+    calls: list = []
+
+    # When an extra file is not a ledger member
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("d41d8cd98f00b204e9800998ecf8427e", calls), config=_config()
+    )
+
+    # Then the directory is intact with reason unsealed_file, no remote check
+    assert report.removed == ()
+    assert report.kept == (("raw/2026-08-01", "unsealed_file"),)
+    assert (tmp_path / "raw" / day).exists()
+    assert calls == []
+
+
+def test_prune_keeps_directory_on_size_drift(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    rel = _raw_rel(day, "a.bin")
+    _write_member(tmp_path, rel, b"xx")
+    _write_prune_ledger(tmp_path, "raw", day, [rel])
+    (tmp_path / rel).write_bytes(b"xx-appended-drift")
+    calls: list = []
+
+    # When a sealed member's current size differs from the ledger
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("d41d8cd98f00b204e9800998ecf8427e", calls), config=_config()
+    )
+
+    # Then kept with size_mismatch before any remote call
+    assert report.kept == (("raw/2026-08-01", "size_mismatch"),)
+    assert (tmp_path / "raw" / day).exists()
+    assert calls == []
+
+
+def test_prune_keeps_directory_without_ledger_and_issues_no_rclone_call(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    _write_member(tmp_path, _raw_rel(day, "a.bin"), b"x")
+    calls: list = []
+
+    def _must_not_call(cmd, **kwargs):
+        calls.append(list(cmd))
+        raise AssertionError("rclone must not be called without a ledger")
+
+    # When no ledger file exists
+    report = prune_local_sealed_capture(tmp_path, today=date(2026, 9, 24), run_fn=_must_not_call, config=_config())
+
+    # Then kept with no_ledger and no Drive traffic
+    assert report.kept == (("raw/2026-08-01", "no_ledger"),)
+    assert calls == []
+    assert (tmp_path / "raw" / day).exists()
+
+
+def test_prune_keeps_directory_on_remote_md5_mismatch_and_error(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    rel = _raw_rel(day, "a.bin")
+    _write_member(tmp_path, rel, b"xx")
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    _write_prune_ledger(tmp_path, "raw", day, [rel], archive_md5=md5)
+
+    # When md5sum returns another hash
+    mismatch_calls: list = []
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, mismatch_calls, mode="mismatch"), config=_config()
+    )
+    assert report.kept == (("raw/2026-08-01", "remote_unverified"),)
+    assert (tmp_path / "raw" / day).exists()
+
+    # When md5sum exits non-zero
+    error_calls: list = []
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, error_calls, mode="error"), config=_config()
+    )
+    assert report.kept == (("raw/2026-08-01", "remote_unverified"),)
+    assert (tmp_path / "raw" / day).exists()
+
+    # When the runner itself raises
+    raise_calls: list = []
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, raise_calls, mode="raise"), config=_config()
+    )
+    assert report.kept == (("raw/2026-08-01", "remote_unverified"),)
+    assert (tmp_path / "raw" / day).exists()
+
+
+def test_prune_keeps_directory_with_inflight_artifact(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    rel = _raw_rel(day, "a.bin")
+    _write_member(tmp_path, rel, b"xx")
+    _write_member(tmp_path, _raw_rel(day, "stage-x.tmp"), b"partial")
+    _write_prune_ledger(tmp_path, "raw", day, [rel])
+    calls: list = []
+
+    # When a stage-*.tmp artifact is present
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("d41d8cd98f00b204e9800998ecf8427e", calls), config=_config()
+    )
+
+    # Then kept with inflight before any remote call
+    assert report.kept == (("raw/2026-08-01", "inflight"),)
+    assert calls == []
+
+    (tmp_path / _raw_rel(day, "stage-x.tmp")).unlink()
+    _write_member(tmp_path, _raw_rel(day, "a.json.gz.lock"), b"lock")
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("d41d8cd98f00b204e9800998ecf8427e", calls), config=_config()
+    )
+    assert report.kept == (("raw/2026-08-01", "inflight"),)
+
+
+def test_prune_leaves_non_capture_subtrees_alone(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    for subtree in ("decision", "manifests", "backups"):
+        _write_member(tmp_path, f"{subtree}/2026-08-01/f.bin", b"x")
+    calls: list = []
+
+    # When expired dirs exist outside the capture tiers
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("x", calls), config=_config()
+    )
+
+    # Then untouched and absent from the report
+    assert report.removed == () and report.kept == ()
+    for subtree in ("decision", "manifests", "backups"):
+        assert (tmp_path / subtree / "2026-08-01").exists()
+    assert calls == []
+
+
+def test_pruned_date_is_invisible_to_next_seal(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    rel = _raw_rel(day, "a", "b.json")
+    _write_member(tmp_path, rel, b"sealed")
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    _write_prune_ledger(tmp_path, "raw", day, [rel], archive_md5=md5)
+
+    # Given the date was pruned after full verification
+    pruned = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, []), config=_config()
+    )
+    assert pruned.removed == ("raw/2026-08-01",)
+
+    # When the sealer runs over the remaining store
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    sealed = seal_and_upload(tmp_path, today=date(2026, 9, 24), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=_config())
+
+    # Then no missing member is counted and no segment is built for the gone date
+    assert sealed.missing_sealed_members == 0
+    assert sealed.segments_committed == 0
+
+
+def test_prune_rejects_retention_shorter_than_append_window(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    _write_member(tmp_path, _raw_rel(day, "a.bin"), b"x")
+
+    # When retention_days=2 with recent_window_days=3
+    with pytest.raises(ValueError, match="append window"):
+        prune_local_sealed_capture(tmp_path, today=date(2026, 9, 24), retention_days=2, run_fn=_md5_run_fn("x", []), config=_config())
+
+    # Then nothing was deleted
+    assert (tmp_path / "raw" / day).exists()
+
+
+def test_prune_ignores_non_date_names(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    _write_member(tmp_path, "raw/notes/memo.txt", b"keep")
+
+    # When a non-date name sits under a tier
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("x", []), config=_config()
+    )
+
+    # Then no exception and the subtree is untouched
+    assert report.removed == () and report.kept == ()
+    assert (tmp_path / "raw" / "notes" / "memo.txt").exists()
+
+
+def test_prune_keeps_symlinked_date_and_rejects_invalid_ledger(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    real = tmp_path / "raw" / f"{day}-real"
+    real.mkdir(parents=True)
+    (tmp_path / "raw" / day).symlink_to(real, target_is_directory=True)
+
+    # When the date directory itself is a symlink
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("x", []), config=_config()
+    )
+    assert report.kept == (("raw/2026-08-01", "symlink"),)
+
+    # When the ledger line is malformed
+    (tmp_path / "raw" / day).unlink()
+    _write_member(tmp_path, _raw_rel(day, "a.bin"), b"x")
+    ledger = tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("not-json\n", encoding="utf-8")
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("x", []), config=_config()
+    )
+    assert report.kept == (("raw/2026-08-01", "ledger_invalid"),)
+
+
+def test_prune_keeps_directory_with_symlink_member(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    rel = _raw_rel(day, "a.bin")
+    _write_member(tmp_path, rel, b"xx")
+    (tmp_path / _raw_rel(day, "link.bin")).symlink_to(tmp_path / rel)
+    outside = tmp_path / "outside-real"
+    outside.mkdir(parents=True)
+    (tmp_path / "raw" / day / "linkdir").symlink_to(outside, target_is_directory=True)
+    _write_prune_ledger(tmp_path, "raw", day, [rel])
+    calls: list = []
+
+    # When symlinks sit inside an otherwise sealed directory
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("d41d8cd98f00b204e9800998ecf8427e", calls), config=_config()
+    )
+
+    # Then kept with symlink_member before any remote call
+    assert report.kept == (("raw/2026-08-01", "symlink_member"),)
+    assert calls == []
+    assert (tmp_path / "raw" / day).exists()
+
+
+def test_prune_skips_unexpected_tier_layout_and_file_children(tmp_path: Path, monkeypatch) -> None:
+    import os
+
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    # Given the raw tier root is a plain file and a date-named child is a file
+    (tmp_path / "normalized").mkdir(parents=True)
+    (tmp_path / "raw").write_bytes(b"not-a-dir")
+
+    # When pruning with a file tier root present
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("x", []), config=_config(tiers=("raw",))
+    )
+
+    # Then the file tier is skipped without error
+    assert report.removed == () and report.kept == ()
+
+    # Given a date-named regular file plus a sealed dir holding a fifo
+    day = "2026-08-01"
+    (tmp_path / "normalized" / day).write_bytes(b"file-not-dir")
+    fifo_day = "2026-07-01"
+    rel = f"normalized/{fifo_day}/a.bin"
+    _write_member(tmp_path, rel, b"xx")
+    os.mkfifo(tmp_path / f"normalized/{fifo_day}/pipe.fifo")
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    _write_prune_ledger(tmp_path, "normalized", fifo_day, [rel], archive_md5=md5)
+
+    # When pruning again over the normalized tier
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, []), config=_config(tiers=("normalized",))
+    )
+
+    # Then the date-named file is skipped and the fifo does not block removal
+    assert report.removed == ((f"normalized/{fifo_day}"),)
+    assert (tmp_path / "normalized" / day).is_file()

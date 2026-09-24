@@ -15,11 +15,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tarfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
@@ -628,6 +629,157 @@ def _seal_locked(
         archive_bytes=archive_bytes_total,
         missing_sealed_members=missing_sealed_members,
     )
+
+
+LOCAL_SEALED_RETENTION_DAYS: int = 30
+
+
+@dataclass(frozen=True)
+class LocalRetentionReport:
+    removed: tuple[str, ...]
+    kept: tuple[tuple[str, str], ...]
+    bytes_removed: int
+
+
+def prune_local_sealed_capture(
+    capture_root: Path,
+    *,
+    today: date,
+    retention_days: int = LOCAL_SEALED_RETENTION_DAYS,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    config: OffsiteConfig = OffsiteConfig(),  # noqa: B008
+) -> LocalRetentionReport:
+    """Remove local capture date directories whose every file is sealed offsite and verified.
+
+    Raw and normalized capture tiers are append-only evidence whose durable copy is the
+    sealed tar.zst segment set (ledger + remote MD5). Past the retention window, the local
+    copy only costs disk and seal-scan time; production readers need at most the previous
+    trading day. A directory is removed whole or not at all, because the sealer counts
+    ledger members missing from a directory it still scans.
+
+    Args:
+        capture_root: Capture store root (holds the tiers and offsite/ledger).
+        today: KST calendar date of the run.
+        retention_days: Date directories strictly older than today - retention_days are candidates.
+        run_fn: Subprocess runner for ``rclone md5sum`` (test injection).
+        config: Offsite contract (tiers, remote_root, rclone timeout).
+
+    Returns:
+        Removed directories, expired directories kept with a reason, and bytes reclaimed.
+
+    Raises:
+        OSError: Deleting an eligible directory failed; partial removal is never silenced.
+        ValueError: Retention window shorter than the append window.
+    """
+    if retention_days < config.recent_window_days + 1:
+        raise ValueError(
+            f"retention_days={retention_days} shorter than append window "
+            f"(recent_window_days={config.recent_window_days})"
+        )
+    capture_root = Path(capture_root)
+    cutoff = today - timedelta(days=retention_days)
+    rclone: str | None = None
+    removed: list[str] = []
+    kept: list[tuple[str, str]] = []
+    bytes_removed = 0
+    for tier in sorted(config.tiers):
+        tier_root = capture_root / tier
+        if not tier_root.exists():
+            continue
+        if tier_root.is_symlink() or not tier_root.is_dir():
+            continue
+        for child in sorted(tier_root.iterdir(), key=lambda entry: entry.name):
+            name = child.name
+            if not _is_valid_date(name):
+                continue
+            parsed = date.fromisoformat(name)
+            if parsed >= cutoff:
+                continue
+            label = f"{tier}/{name}"
+            if child.is_symlink():
+                kept.append((label, "symlink"))
+                continue
+            if not child.is_dir():
+                continue
+            try:
+                entries = read_ledger(capture_root, tier, name)
+            except ValueError:
+                kept.append((label, "ledger_invalid"))
+                continue
+            if not entries:
+                kept.append((label, "no_ledger"))
+                continue
+            sealed_sizes: dict[str, int] = {}
+            for ledger_entry in entries:
+                for member in ledger_entry.members:
+                    sealed_sizes[member.path] = member.size
+            found_inflight = False
+            found_unsealed = False
+            found_size_mismatch = False
+            found_symlink = False
+            regular_sizes = 0
+            for root, dirs, files in os.walk(child):
+                for dirname in dirs:
+                    if (Path(root) / dirname).is_symlink():
+                        found_symlink = True
+                for filename in files:
+                    if _is_inflight(filename):
+                        found_inflight = True
+                    full = Path(root) / filename
+                    if full.is_symlink():
+                        found_symlink = True
+                        continue
+                    if not full.is_file():
+                        continue
+                    rel = full.relative_to(capture_root).as_posix()
+                    recorded = sealed_sizes.get(rel)
+                    if recorded is None:
+                        found_unsealed = True
+                    elif full.stat().st_size != recorded:
+                        found_size_mismatch = True
+                    regular_sizes += full.stat().st_size
+            if found_inflight:
+                kept.append((label, "inflight"))
+                continue
+            if found_unsealed:
+                kept.append((label, "unsealed_file"))
+                continue
+            if found_size_mismatch:
+                kept.append((label, "size_mismatch"))
+                continue
+            if found_symlink:
+                kept.append((label, "symlink_member"))
+                continue
+            if rclone is None:
+                rclone = _resolve_rclone_bin()
+            verified = True
+            for ledger_entry in entries:
+                try:
+                    result = run_fn(
+                        [rclone, "md5sum", ledger_entry.remote_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=config.rclone_timeout_sec,
+                        check=False,
+                    )
+                except Exception:  # noqa: BLE001 - any runner failure keeps the directory
+                    verified = False
+                    break
+                if result.returncode != 0:
+                    verified = False
+                    break
+                if _parse_remote_md5(result.stdout) != ledger_entry.archive_md5:
+                    verified = False
+                    break
+            if not verified:
+                kept.append((label, "remote_unverified"))
+                continue
+            shutil.rmtree(child)
+            removed.append(label)
+            bytes_removed += regular_sizes
+    removed_sorted = tuple(sorted(removed))
+    kept_sorted = tuple(sorted(kept))
+    return LocalRetentionReport(removed=removed_sorted, kept=kept_sorted, bytes_removed=bytes_removed)
 
 
 def restore_date(
