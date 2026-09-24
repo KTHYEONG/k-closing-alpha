@@ -183,6 +183,17 @@ def test_main_purges_remote_and_local_with_single_summary_log(monkeypatch, caplo
     monkeypatch.setattr(backup_prune, "prune_backups", _fake_remote)
     monkeypatch.setattr(backup_prune, "prune_local_intraday_backups", _fake_local)
 
+    import src.tools.capture_offsite as capture_offsite
+
+    def _fake_sealed(capture_root, *, today, **kwargs):
+        return capture_offsite.LocalRetentionReport(
+            removed=("raw/2026-08-01", "raw/2026-08-02"),
+            kept=(("raw/2026-08-03", "remote_unverified"),),
+            bytes_removed=99,
+        )
+
+    monkeypatch.setattr(capture_offsite, "prune_local_sealed_capture", _fake_sealed)
+
     # When
     with caplog.at_level(logging.INFO, logger="src.tools.backup_prune"):
         backup_prune.main([])
@@ -195,4 +206,6 @@ def test_main_purges_remote_and_local_with_single_summary_log(monkeypatch, caplo
     summary = [r for r in caplog.records if "purged=" in r.getMessage() and "local_purged=" in r.getMessage()]
     assert len(summary) == 1
     assert "local_targets=" in summary[0].getMessage()
+    assert "sealed_removed=2" in summary[0].getMessage()
+    assert "sealed_kept=1" in summary[0].getMessage()
 
