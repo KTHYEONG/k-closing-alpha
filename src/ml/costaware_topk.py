@@ -16,14 +16,15 @@ import pandas as pd
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet
-from src.execution.cost_model import TICK_REFORM_DATE, statutory_bp_asof
+from src.execution.cost_model import TICK_REFORM_DATE, pit_round_trip_cost_bp
 from src.ml.research.v3_engine import (
     attach_forward_exit_paths,
     build_candidate_universe,
     load_and_prepare_price_history,
 )
 from src.ml.research.v3_metrics import calculate_series_metrics
-from src.strategy.contract import KCA_TOPK_COSTAWARE_001, StrategySpec
+from src.strategy.contract import KCA_TOPK_COSTAWARE_001, MIN_TOP_K, StrategySpec
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,6 @@ COST_STRESS_TICK_GRID: tuple[float, ...] = (2.0, 3.0, 4.0)
 MIN_FEASIBLE_DAY_FRACTION: float = 0.90
 # 스크린이 어떤 레짐에서든 top_k 후보를 확보해야 하는 최소 거래일 비율.
 MIN_CONSTRUCTIBLE_DAY_FRACTION: float = 0.95
-MIN_TOP_K: int = 3
 MIN_POST_REFORM_T_STAT: float = 2.0
 
 
@@ -121,17 +121,25 @@ def compute_net_return(
     cost_col: str = "tick_cost_bp",
     date_col: str = "date",
 ) -> np.ndarray:
-    """Compute D+1-open net return from gross return and PIT tick cost.
+    """Compute D+1-open net return after PIT tax, spread ticks and brokerage.
+
+    The certified ranker label, the growth shadow ledger and the T+1 attribution
+    ledger all net through this function, so it must charge the same frictions
+    as the paper ledger: statutory tax as of the decision date, ``round_trip_ticks``
+    ticks of spread, and the round-trip KIS preferential brokerage.
 
     Args:
-        picks: Picked candidates with gross and tick-cost columns.
+        picks: Picked candidates with gross, per-tick cost and date columns.
         round_trip_ticks: Round-trip tick multiplier.
-        gross_col: Gross return column name.
-        cost_col: Per-tick cost column name.
-        date_col: Date column name for PIT statutory cost.
+        gross_col: Gross return column (decimal).
+        cost_col: Single-tick cost column in bp.
+        date_col: Decision date column for PIT statutory cost.
 
     Returns:
-        Net return array with NaN where inputs are not finite.
+        Net return array (decimal) with NaN where any input is non-finite.
+
+    Raises:
+        ValueError: If gross, cost or date columns are missing.
     """
     if gross_col not in picks.columns:
         raise ValueError(f"picks missing gross_col {gross_col!r}")
@@ -141,10 +149,11 @@ def compute_net_return(
         raise ValueError(f"picks missing date_col {date_col!r} for PIT statutory cost")
     gross = picks[gross_col].to_numpy(dtype=np.float64)
     tick = picks[cost_col].to_numpy(dtype=np.float64)
-    statutory = statutory_bp_asof(pd.to_datetime(picks[date_col], errors="coerce").to_numpy())
+    dates = pd.to_datetime(picks[date_col], errors="coerce").to_numpy()
+    cost_bp = pit_round_trip_cost_bp(tick, dates, round_trip_ticks=float(round_trip_ticks))
     net = np.full(gross.shape, np.nan, dtype=np.float64)
-    ok = np.isfinite(gross) & np.isfinite(tick) & np.isfinite(statutory)
-    net[ok] = gross[ok] - (statutory[ok] + float(round_trip_ticks) * tick[ok]) / 1e4
+    ok = np.isfinite(gross) & np.isfinite(cost_bp)
+    net[ok] = gross[ok] - cost_bp[ok] / 1e4
     return net
 
 
@@ -501,7 +510,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--out", default="artifacts/research/costaware_topk_report.parquet")
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO)
+    configure_cli_logging(logging.BASIC_FORMAT)
     if args.top_k is not None:
         spec = _dataclasses.replace(KCA_TOPK_COSTAWARE_001, top_k=int(args.top_k))
     else:

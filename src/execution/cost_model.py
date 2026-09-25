@@ -3,7 +3,9 @@
 Every component is computable at the entry-day close: tick/spread read only
 the entry price, and the auction impact reads only entry-day bars with
 ``ts_hms <= 153000``. No next-day bar or realized exit price is ever read.
-This module is measurement-only and never changes ``ROUND_TRIP_COST_RATIO``.
+This module is the single owner of every cost component (statutory schedule,
+tick ladder, brokerage, legacy flat ratio); measurement functions never read
+next-day data.
 """
 
 from __future__ import annotations
@@ -26,7 +28,10 @@ logger = logging.getLogger(__name__)
 # output joins back via impact_col, so no in-module call site exists).
 __all__ = [
     "BROKERAGE_FEE_BP",
+    "BROKERAGE_SIDE_BP",
     "KRX_TICK_BANDS",
+    "LEGACY_FLAT_SPREAD_COST_BP",
+    "ROUND_TRIP_COST_RATIO",
     "STATUTORY_BP_SCHEDULE",
     "STATUTORY_COST_BP",
     "CostBreakdown",
@@ -34,6 +39,7 @@ __all__ = [
     "estimate_round_trip_cost_bp",
     "krx_tick_size",
     "measure_auction_impact_bp",
+    "pit_round_trip_cost_bp",
     "spread_cost_bp",
     "statutory_bp_asof",
     "summarize_cost_breakdown",
@@ -85,8 +91,17 @@ KOSDAQ_MARKET_LABELS: frozenset[str] = frozenset({"KOSDAQ", "KSQ150"})
 
 STATUTORY_COST_BP: float = 20.0
 
+# 운용자가 적용받는 KIS 우대 수수료율로 매수·매도 각 1회씩 부과되며 매도 전용 세금과 별개 항목이다.
+BROKERAGE_SIDE_BP: float = 0.000036396 * 10000.0
+
 # 증권사 매매수수료 왕복분(편도 0.0036396% x 매수/매도 각 1회 = 2회). 세금(매도 전용)과 별개 항목.
-BROKERAGE_FEE_BP: float = 0.000036396 * 2 * 10000.0
+BROKERAGE_FEE_BP: float = 2 * BROKERAGE_SIDE_BP
+
+# 구형 close_morning 분류기 비율 전용 평탄 2틱 스프레드 중앙값으로 다른 용도로 재사용하지 않는다.
+LEGACY_FLAT_SPREAD_COST_BP: float = 26.0
+
+# 구형 분류기 계보 전용 평탄 비율이다. 법정 20bp는 시점불변 평탄값이며 인증 랭커는 pit_round_trip_cost_bp를 사용한다.
+ROUND_TRIP_COST_RATIO: float = STATUTORY_COST_BP / 1e4 + LEGACY_FLAT_SPREAD_COST_BP / 1e4 + BROKERAGE_FEE_BP / 1e4
 
 
 @dataclass(frozen=True)
@@ -165,6 +180,43 @@ def statutory_bp_asof(trade_date: np.ndarray) -> np.ndarray:
     valid = (~np.isnat(dates)) & (idx >= 0)
     out[valid] = rates[idx[valid]]
     return out
+
+
+def pit_round_trip_cost_bp(
+    per_tick_bp: np.ndarray,
+    trade_date: np.ndarray,
+    *,
+    round_trip_ticks: float,
+) -> np.ndarray:
+    """Point-in-time round-trip friction in bp for a decision-day entry.
+
+    Composes the three frictions every certified net return must carry: the
+    sell-side statutory tax effective on ``trade_date``, ``round_trip_ticks``
+    ticks of spread at the entry price, and the round-trip brokerage commission
+    (KIS preferential schedule). Tax and tick are point-in-time; brokerage is a
+    flat broker contract.
+
+    Args:
+        per_tick_bp: Single-tick cost in bp at the entry price (see ``tick_cost_bp``).
+        trade_date: Decision/entry dates, coercible to ``datetime64[ns]``.
+        round_trip_ticks: Ticks crossed over the round trip (execution-mode floor
+            is enforced by ``CostSpec``, not here).
+
+    Returns:
+        Float64 array, same shape as ``per_tick_bp``; NaN wherever the tick cost
+        is non-finite or the date is NaT/pre-schedule.
+
+    Raises:
+        ValueError: If ``round_trip_ticks`` is not finite.
+    """
+    ticks = float(round_trip_ticks)
+    if not np.isfinite(ticks):
+        raise ValueError(f"round_trip_ticks must be finite, got {round_trip_ticks!r}")
+    per = np.asarray(per_tick_bp, dtype=np.float64)
+    statutory = statutory_bp_asof(trade_date)
+    statutory = np.broadcast_to(statutory, per.shape).astype(np.float64, copy=True)
+    out = (statutory + ticks * per) + float(BROKERAGE_FEE_BP)
+    return np.asarray(out, dtype=np.float64)
 
 
 def _candidate_partition_paths(

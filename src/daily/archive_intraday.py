@@ -36,6 +36,7 @@ from src.config.market_session import (
 )
 from src.daily import archive
 from src.data.capture_contracts import (
+    GOOD_ENTRY_STATES,
     SEOUL,
     CaptureContext,
     CaptureDataset,
@@ -45,14 +46,14 @@ from src.data.capture_contracts import (
     CoverageEntry,
 )
 from src.data.capture_store import CaptureStore
+from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_store import write_intraday_partition, write_tick_partition
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, record_run_outcome
+from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
-
-_GOOD_ENTRY_STATES = frozenset({CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE})
 
 _VALID_PHASES = ("regular", "aftermarket", "all")
 
@@ -138,17 +139,6 @@ def archive_phase_complete(store: CaptureStore, target_date: str, phase: str) ->
     return True
 
 
-def _today_watchlist_codes(snapshot_date: str) -> list[str]:
-    try:
-        df = archive.fetch_archive_snapshot(snapshot_date=snapshot_date)
-    except Exception as e:
-        logger.warning("Watchlist fetch failed date=%s: %s", snapshot_date, e)
-        return []
-    if df is None or df.empty or "종목코드" not in df.columns:
-        return []
-    return df["종목코드"].astype(str).str.zfill(6).dropna().unique().tolist()
-
-
 def resolve_previous_archive_date(snapshot_date: str) -> str | None:
     """아카이브 날짜 인덱스에서 snapshot_date 직전 영업일을 찾는다."""
     try:
@@ -162,38 +152,33 @@ def resolve_previous_archive_date(snapshot_date: str) -> str | None:
     return dates[-1] if dates else None
 
 
-def _archive_target_codes(snapshot_date: str) -> list[str]:
-    """당일 + 직전 아카이브 영업일 워치리스트의 중복 제거 합집합.
+async def _resolve_previous_trading_day(client: Any, session: Any, snapshot_date: str) -> str | None:
+    """Resolve the actual previous KRX trading day through the KIS oracle (KRX fallback).
 
-    _today_watchlist_codes/resolve_previous_archive_date는 자체적으로 조회 실패를
-    흡수해 빈 결과를 반환하므로(never raise), 여기서는 별도 예외 처리가 필요 없다.
+    Returns None instead of raising when both oracles fail or no trading day exists within the
+    lookback bound, so a calendar outage degrades the archive to today's cohort (INCOMPLETE)
+    rather than losing the whole day's intraday capture.
+
+    Args:
+        client: Authenticated KIS data client.
+        session: Open HTTP session of that client.
+        snapshot_date: KST archive date `YYYY-MM-DD`.
+
+    Returns:
+        Previous trading day `YYYY-MM-DD`, or None when unresolved.
     """
-    today = _today_watchlist_codes(snapshot_date)
-    prev_date = resolve_previous_archive_date(snapshot_date)
-    codes: list[str] = list(today)
-    if prev_date is not None:
-        for code in _today_watchlist_codes(prev_date):
-            if code not in codes:
-                codes.append(code)
-    return codes
+    from src.daily.collect import resolve_prev_trading_day_kis
 
-
-def _previous_trading_day(snapshot_date: str) -> str:
-    """달력 기준 직전 영업일(토/일 제외)을 확정한다."""
     try:
-        day = date.fromisoformat(str(snapshot_date))
-    except ValueError:
-        raise ValueError(f"Invalid snapshot_date: {snapshot_date!r}") from None
-    day -= pd.Timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= pd.Timedelta(days=1)
-    return day.isoformat()
-
-
-def _capture_root(profile: CollectionSettings) -> Path:
-    if profile.COLLECTION_ROOT is not None:
-        return Path(profile.COLLECTION_ROOT)
-    return Path(settings.HISTORY_DIR) / "capture"
+        prev = await resolve_prev_trading_day_kis(client, session, pd.Timestamp(snapshot_date))
+    except (RuntimeError, ValueError) as exc:
+        logger.warning(
+            "[DATA] stage=cohort status=INCOMPLETE reason=previous_day_unresolved date=%s error=%s",
+            snapshot_date,
+            type(exc).__name__,
+        )
+        return None
+    return prev.strftime("%Y-%m-%d")
 
 
 def _paper_follow_symbols() -> list[str]:
@@ -240,17 +225,46 @@ def _verify_cohort_against_panel(cohort: Cohort) -> None:
         )
 
 
-def _resolve_cohort_codes(snapshot_date: str, profile: CollectionSettings, store: CaptureStore) -> tuple[list[str], bool]:
+def _resolve_cohort_codes(
+    snapshot_date: str,
+    profile: CollectionSettings,
+    store: CaptureStore,
+    *,
+    previous_trading_day: str | None,
+) -> tuple[list[str], bool]:
+    """Resolve the archive cohort as today's verified codes plus the prior session's carryover.
+
+    `previous_trading_day` is the oracle-resolved prior session; None means it could not be
+    resolved and the previous cohort is treated as missing.
+
+    Args:
+        snapshot_date: KST archive date `YYYY-MM-DD`.
+        profile: Bounded acquisition profile (unused; kept for call-site symmetry).
+        store: Capture store holding verified cohorts.
+        previous_trading_day: Oracle-resolved prior session; None degrades to today's cohort.
+
+    Returns:
+        (codes, incomplete) with today's eligible codes plus the previous cohort's eligible
+        codes and paper-follow symbols; incomplete True when any prior coverage is missing.
+    """
     now = datetime.now(SEOUL)
     today_cohort = store.read_cohort(str(snapshot_date), available_by=now)
     _verify_cohort_against_panel(today_cohort)
     codes: list[str] = [str(item) for item in today_cohort.eligible_symbols]
-    prev_day = _previous_trading_day(str(snapshot_date))
+    if previous_trading_day is None:
+        for item in _paper_follow_symbols():
+            if item not in codes:
+                codes.append(item)
+        logger.info(
+            "[DATA] stage=cohort status=VERIFIED date=%s n_today=%d n_prev=%d",
+            snapshot_date, len(today_cohort.eligible_symbols), 0,
+        )
+        return codes, True
     incomplete = False
     try:
-        prev_cohort = store.read_cohort(prev_day, available_by=now)
+        prev_cohort = store.read_cohort(previous_trading_day, available_by=now)
     except FileNotFoundError:
-        logger.warning("[DATA] stage=cohort status=INCOMPLETE reason=missing_previous date=%s prev=%s", snapshot_date, prev_day)
+        logger.warning("[DATA] stage=cohort status=INCOMPLETE reason=missing_previous date=%s prev=%s", snapshot_date, previous_trading_day)
         prev_cohort = None
         incomplete = True
     if prev_cohort is not None:
@@ -284,7 +298,7 @@ def _publish_task_manifest(
         for ref in entry.raw_refs:
             if ref not in refs:
                 refs.append(ref)
-    status = CaptureStatus.COMPLETE if all(item.status in _GOOD_ENTRY_STATES for item in entries) else CaptureStatus.PARTIAL
+    status = CaptureStatus.COMPLETE if all(item.status in GOOD_ENTRY_STATES for item in entries) else CaptureStatus.PARTIAL
     manifest = CaptureManifest(
         schema_version=1,
         context=CaptureContext(
@@ -308,63 +322,6 @@ def _publish_task_manifest(
     )
     store.publish_manifest(manifest)
     return manifest
-
-
-def _legacy_run(snapshot_date: str | None, bar_interval_minutes: int, *, phase: str = "all") -> tuple[int, int, int]:
-    _validate_phase(phase)
-    snap_date = snapshot_date or datetime.now().strftime("%Y-%m-%d")
-    codes = _archive_target_codes(snap_date)
-    if not codes:
-        return (0, 0, 0)
-
-    do_regular = phase in ("regular", "all")
-    do_aftermarket = phase in ("aftermarket", "all")
-
-    async def _run() -> tuple[int, int, int]:
-        client = KisApiClient(**kis_data_client_kwargs())
-        ls_client = LsApiClient() if getattr(settings, 'LS_APP_KEY', None) else None
-        kiwoom_client = KiwoomApiClient() if (getattr(settings, 'KIWOM_APP_KEY', None) or getattr(settings, 'KIWOOM_APP_KEY', None)) else None
-        async with client.create_session() as session:
-            await client.ensure_token(session)
-            if not await is_kis_trading_day(client, session, snap_date):
-                logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
-                return (0, 0, 0)
-            bars = None
-            nxt_after = None
-            nxt_pre = None
-            krx_after = None
-            ticks = None
-            if do_regular:
-                bars = await collect_intraday_bars(client, session, codes, snap_date, bar_interval_minutes, ls_client=ls_client)
-            if do_aftermarket:
-                nxt_after = await collect_nxt_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes, kiwoom_client=kiwoom_client)
-                nxt_pre = await collect_nxt_premarket_bars(client, session, codes, snap_date, bar_interval_minutes, kiwoom_client=kiwoom_client)
-                krx_after = await collect_krx_aftermarket_bars(client, session, codes, snap_date, bar_interval_minutes)
-            if do_regular:
-                assert bars is not None
-                n_bars = write_intraday_partition(bars, bar_interval_minutes, snap_date, INTRADAY_SESSION_REGULAR)
-            else:
-                n_bars = 0
-            if do_aftermarket:
-                assert nxt_after is not None
-                assert nxt_pre is not None
-                assert krx_after is not None
-                n_nxt_after = write_intraday_partition(nxt_after, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_AFTERMARKET)
-                n_nxt_pre = write_intraday_partition(nxt_pre, bar_interval_minutes, snap_date, INTRADAY_SESSION_NXT_PREMARKET)
-                n_krx_after = write_intraday_partition(krx_after, bar_interval_minutes, snap_date, INTRADAY_SESSION_KRX_AFTERMARKET)
-                logger.info("[DATA] stage=krx_aftermarket date=%s rows=%d", snap_date, n_krx_after)
-                n_nxt = n_nxt_after + n_nxt_pre
-            else:
-                n_nxt = 0
-            if do_regular:
-                ticks = await collect_intraday_trade_ticks(client, session, codes, snap_date, ls_client=ls_client, kiwoom_client=kiwoom_client)
-                assert ticks is not None
-                n_ticks = write_tick_partition(ticks, snap_date, INTRADAY_SESSION_REGULAR)
-            else:
-                n_ticks = 0
-            return (n_bars, n_nxt, n_ticks)
-
-    return asyncio.run(_run())
 
 
 class _BatchedPartitionPublisher:
@@ -404,7 +361,8 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
     Args:
         snapshot_date: Exact trading date, default current Asia/Seoul date.
         bar_interval_minutes: Existing bar interval.
-        profile: Validated bounded acquisition profile.
+        profile: Validated bounded acquisition profile; None loads CollectionSettings()
+            from the environment. Capture evidence is always written.
         phase: Which session group to collect. "regular" acquires KIS/LS/Kiwoom
             regular-session (09:00-15:30) 1m bars and trade ticks only -- both are
             fully settled by 15:30 KST close, so this phase is meant to run right
@@ -424,7 +382,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
         ValueError: Invalid date, certification, profile, or unrecognized phase.
         OSError: Acquisition evidence or verified publication fails.
     """
-    prof = profile if profile is not None else CollectionSettings(COLLECTION_RAW_ENABLED=False)
+    prof = profile if profile is not None else CollectionSettings()
     snap_date = snapshot_date or datetime.now(SEOUL).date().isoformat()
     try:
         trading_day = date.fromisoformat(str(snap_date))
@@ -437,23 +395,22 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
     if session_day.kind is SessionKind.CLOSED:
         logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
         return (0, 0, 0)
-    if not prof.COLLECTION_RAW_ENABLED:
-        return _legacy_run(str(snap_date), int(bar_interval_minutes), phase=phase)
     store = CaptureStore(_capture_root(prof))
     do_regular = phase in ("regular", "all")
     do_aftermarket = phase in ("aftermarket", "all")
 
     async def _run() -> tuple[int, int, int]:
         client = KisApiClient(**kis_data_client_kwargs())
-        ls_client = LsApiClient() if getattr(settings, 'LS_APP_KEY', None) else None
-        kiwoom_client = KiwoomApiClient() if (getattr(settings, 'KIWOM_APP_KEY', None) or getattr(settings, 'KIWOOM_APP_KEY', None)) else None
+        ls_client = LsApiClient() if settings.LS_APP_KEY else None
+        kiwoom_client = KiwoomApiClient() if settings.KIWOOM_APP_KEY else None
         async with client.create_session() as session:
             await client.ensure_token(session)
             if not await is_kis_trading_day(client, session, str(snap_date)):
                 logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
                 return (0, 0, 0)
             # 휴장일엔 collect가 코호트를 발행하지 않으므로, 코호트 조회는 거래일 판정 뒤에 해야 오탐 실패가 없다.
-            codes, prev_incomplete = _resolve_cohort_codes(str(snap_date), prof, store)
+            prev_trading_day = await _resolve_previous_trading_day(client, session, str(snap_date))
+            codes, prev_incomplete = _resolve_cohort_codes(str(snap_date), prof, store, previous_trading_day=prev_trading_day)
             interval = int(bar_interval_minutes)
             batch_rows = int(prof.COLLECTION_ARROW_BATCH_ROWS)
             batch_size = int(prof.COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE)
@@ -589,7 +546,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                 collected_entries.extend(nxt_pre_entries)
                 collected_entries.extend(krx_after_entries)
             incomplete = prev_incomplete or any(
-                item.status not in _GOOD_ENTRY_STATES
+                item.status not in GOOD_ENTRY_STATES
                 for item in collected_entries
             )
             if incomplete:
@@ -631,7 +588,7 @@ def main() -> None:
 
     from src.utils.display import Colors
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    configure_cli_logging(CLI_LOG_FORMAT_TIMESTAMPED)
     parser = argparse.ArgumentParser(description="Intraday archive session split")
     parser.add_argument("--phase", choices=["regular", "aftermarket", "all"], default="all")
     parser.add_argument("--date", default=None, help="Snapshot date YYYY-MM-DD (default today)")
@@ -649,11 +606,9 @@ def main() -> None:
     if args.phase in ("aftermarket", "all") and target_date < today_str:
         record_run_outcome("archive_intraday", RUN_OUTCOME_DEGRADED, run_date=target_date, reason="aftermarket_not_replayable")
         if args.phase == "aftermarket":
-            target_codes = _archive_target_codes(target_date)
             logger.info(
-                "🚀 [Intraday 아카이브 시작] 대상일: %s, 대상 종목: %d개, 저장소: %s, phase=%s",
+                "🚀 [Intraday 아카이브 시작] 대상일: %s, 저장소: %s, phase=%s",
                 target_date,
-                len(target_codes),
                 settings.HISTORY_DIR,
                 args.phase,
             )
@@ -663,11 +618,9 @@ def main() -> None:
             logger.info("[DATA] stage=intraday_archive status=SKIP reason=already_archived date=%s phase=%s", target_date, "regular")
             return
         effective_phase = "regular"
-    target_codes = _archive_target_codes(target_date)
     logger.info(
-        "🚀 [Intraday 아카이브 시작] 대상일: %s, 대상 종목: %d개, 저장소: %s, phase=%s",
+        "🚀 [Intraday 아카이브 시작] 대상일: %s, 저장소: %s, phase=%s",
         target_date,
-        len(target_codes),
         settings.HISTORY_DIR,
         args.phase,
     )
@@ -685,7 +638,6 @@ def main() -> None:
     logger.info(f"\n{Colors.BOLD}{box_top}{Colors.RESET}")
     logger.info(f" {Colors.GREEN}{Colors.BOLD}📦 [Intraday 분봉/틱 아카이브 완료]{Colors.RESET} (기준일: {target_date}, phase={args.phase})")
     logger.info(f"{Colors.BOLD}{divider}{Colors.RESET}")
-    logger.info(f"   • 대상 종목수 : {Colors.CYAN}{len(target_codes):>5}{Colors.RESET} 종목 (당일 + 직전 영업일 워치리스트)")
     logger.info(f"   • 정규 세션   : {Colors.GREEN}{bars_rows:>5,}{Colors.RESET} 행 (1분봉)")
     logger.info(f"   • NXT 세션    : {Colors.GREEN}{nxt_rows:>5,}{Colors.RESET} 행 (프리/애프터마켓)")
     logger.info(f"   • 체결 틱     : {Colors.GREEN}{tick_rows:>5,}{Colors.RESET} 행 (정규장 틱 데이터)")

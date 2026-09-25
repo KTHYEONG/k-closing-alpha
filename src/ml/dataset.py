@@ -6,6 +6,7 @@ import logging
 import numpy as np
 import pandas as pd
 
+from src.execution.cost_model import ROUND_TRIP_COST_RATIO
 from src.ml.decision_labels import DECISION_LABEL_COLUMNS
 from src.ml.feature_manifest import build_feature_manifest
 from src.ml.scenario_panel import (
@@ -21,7 +22,6 @@ from src.serving.realtime.features import (
     _apply_robust_z,
     engineer_features,
 )
-from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO
 from src.strategy.contract import LABEL_BAD_THRESHOLD, LABEL_GOOD_THRESHOLD
 
 logger = logging.getLogger(__name__)

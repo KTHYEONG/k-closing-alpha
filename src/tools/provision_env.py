@@ -20,6 +20,8 @@ from typing import Any
 from dotenv import dotenv_values
 from pydantic import ValidationError
 
+from src.utils.cli_logging import configure_cli_logging
+
 logger = logging.getLogger(__name__)
 
 # ~/.quant.env 는 소싱되는 bash 스크립트라 "KIS_APP_KEY=$KIS_TRADE_APP_KEY" 같은
@@ -51,8 +53,8 @@ RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
     RuntimeEnvKey(target="KIS_APP_SECRET", sources=("KIS_APP_SECRET",)),
     RuntimeEnvKey(target="KIS_ACCOUNT_ID", sources=("KIS_ACCOUNT_ID", "KIS_ACCOUNT_NO")),
     RuntimeEnvKey(target="KIS_HTS_ID", sources=("KIS_HTS_ID",)),
-    RuntimeEnvKey(target="KIWOM_APP_KEY", sources=("KIWOM_APP_KEY",)),
-    RuntimeEnvKey(target="KIWOM_SECRET_KEY", sources=("KIWOM_SECRET_KEY",)),
+    RuntimeEnvKey(target="KIWOOM_APP_KEY", sources=("KIWOOM_APP_KEY", "KIWOM_APP_KEY")),
+    RuntimeEnvKey(target="KIWOOM_SECRET_KEY", sources=("KIWOOM_SECRET_KEY", "KIWOM_SECRET_KEY")),
     RuntimeEnvKey(target="LS_APP_KEY", sources=("LS_APP_KEY",)),
     RuntimeEnvKey(target="LS_APP_SECRET", sources=("LS_APP_SECRET",)),
     RuntimeEnvKey(target="KRX_OPENAPI_KEY", sources=("KRX_OPENAPI_KEY",)),
@@ -184,8 +186,17 @@ def build_runtime_fragment(source_path: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+# 개명되어 제거된 런타임 키. 관리 대상에서 빠지면 원격 파일의 낡은 라인이
+# 영원히 외부 키로 취급되어 보존되므로, 명시적으로 관리 집합에 포함해 삭제한다.
+RETIRED_RUNTIME_KEYS: tuple[str, ...] = ("KIWOM_APP_KEY", "KIWOM_SECRET_KEY")
+
+
 def _managed_keys() -> frozenset[str]:
-    return frozenset(key.target for key in RUNTIME_ENV_SPEC) | frozenset(name for name, _ in VPS_SELECTORS)
+    return (
+        frozenset(key.target for key in RUNTIME_ENV_SPEC)
+        | frozenset(name for name, _ in VPS_SELECTORS)
+        | frozenset(RETIRED_RUNTIME_KEYS)
+    )
 
 
 def merge_remote_env(fragment: str, remote_text: str) -> tuple[str, tuple[str, ...]]:
@@ -443,5 +454,5 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     raise SystemExit(main())

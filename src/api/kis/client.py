@@ -147,31 +147,6 @@ class KisApiClient:
             last_res = res
         return last_res, None
 
-    async def resolve_stock_market_div_code(
-        self, session: aiohttp.ClientSession, code: str, preferred_market_div_code=None
-    ) -> str:
-        cached = self._market_div_cache.get(code)
-        if cached:
-            return cached
-
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
-        params = {"fid_input_iscd": code}
-        res, used_market_div = await self._request_with_market_div_fallback(
-            session=session,
-            url=url,
-            tr_id="FHKST01010100",
-            params=params,
-            market_div_param_key="fid_cond_mrkt_div_code",
-            preferred_market_div_code=preferred_market_div_code,
-        )
-        if res.get("rt_cd") == "0" and used_market_div:
-            self._market_div_cache[code] = used_market_div
-            return used_market_div
-
-        # Fallback default for resiliency
-        self._market_div_cache[code] = "J"
-        return "J"
-
     @contextlib.asynccontextmanager
     async def _host_token_lock(self) -> AsyncIterator[None]:
         lock_path = self.token_file + ".lock"
@@ -543,39 +518,6 @@ class KisApiClient:
         params = {"MKSC_SHRN_ISCD": code}
         return await self._handle_request(
             session.get, url, headers=self._get_headers("HHPTJ04160200"), params=params
-        )
-
-    async def get_trade_strength(self, session, code, market_div_code=None):
-        """종목별 체결강도 조회 (FHKST01010300)"""
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-ccnl"
-        params = {"FID_INPUT_ISCD": code}
-        preferred_market_div = market_div_code or self._market_div_cache.get(code)
-        res, used_market_div = await self._request_with_market_div_fallback(
-            session=session,
-            url=url,
-            tr_id="FHKST01010300",
-            params=params,
-            market_div_param_key="FID_COND_MRKT_DIV_CODE",
-            preferred_market_div_code=preferred_market_div,
-        )
-        if res.get("rt_cd") == "0" and used_market_div:
-            self._market_div_cache[code] = used_market_div
-        return res
-
-    async def get_condition_list(self, session):
-        """내 조건 목록 가져오기 (HHKST03900300)"""
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/psearch-title"
-        params = {"user_id": self.hts_id}
-        return await self._handle_request(
-            session.get, url, headers=self._get_headers("HHKST03900300"), params=params
-        )
-
-    async def get_condition_result(self, session, seq):
-        """조건검색 결과 조회 (HHKST03900400)"""
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/psearch-result"
-        params = {"user_id": self.hts_id, "seq": seq}
-        return await self._handle_request(
-            session.get, url, headers=self._get_headers("HHKST03900400"), params=params
         )
 
     async def get_stock_ohlcv_history(

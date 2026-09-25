@@ -7,13 +7,14 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
-from src.ml.costaware_topk import MIN_TOP_K
 from src.ml.topk_ranker_research import (
     RANKER_FEATURE_COLS,
     TOPK_RANKER_BUNDLE_DIR,
     assert_bundle_screen_parity,
 )
 from src.serving.realtime.artifacts import load_model_bundle
+from src.strategy.contract import MIN_TOP_K
+from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -83,5 +84,5 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    configure_cli_logging(CLI_LOG_FORMAT_TIMESTAMPED)
     main()

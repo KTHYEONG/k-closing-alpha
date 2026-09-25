@@ -25,6 +25,7 @@ def test_realize_pool_exit_arms_scores_open_and_take_profit_arms() -> None:
         "close": [10_000.0] * 5 + [10_100.0, 9_900.0, 10_000.0, 9_800.0, 9_700.0],
     })
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.strategy.t1_attribution import REALIZED_COLUMNS, realize_pool_exit_arms
 
     # When
@@ -34,12 +35,20 @@ def test_realize_pool_exit_arms_scores_open_and_take_profit_arms() -> None:
     assert tuple(out.columns) == REALIZED_COLUMNS
     day1 = out[out["decision_date"] == pd.Timestamp("2026-09-10")].set_index("symbol")
     assert (day1["status"] == "REALIZED").all()
-    # 시가 청산: 시가/전일종가 - 1, 2026년 법정비용 20bp 차감(틱비용 0)
+    # 시가 청산: 시가/전일종가 - 1, 2026년 법정비용 20bp + 왕복 수수료 차감(틱비용 0)
     np.testing.assert_allclose(day1["open_gross"].to_numpy(), [0.03, 0.02, 0.01, 0.0, -0.01], atol=1e-12)
-    np.testing.assert_allclose(day1["open_net"].to_numpy(), [0.028, 0.018, 0.008, -0.002, -0.012], atol=1e-12)
+    np.testing.assert_allclose(
+        day1["open_net"].to_numpy(),
+        np.array([0.028, 0.018, 0.008, -0.002, -0.012]) - BROKERAGE_FEE_BP / 1e4,
+        atol=1e-12,
+    )
     # TP5%+MOC: 000001은 고가 10,600 >= 10,500 익절, 나머지는 종가(MOC)
     np.testing.assert_allclose(day1["tp_gross"].to_numpy(), [0.05, -0.01, 0.0, -0.02, -0.03], atol=1e-12)
-    np.testing.assert_allclose(day1["tp_net"].to_numpy(), [0.048, -0.012, -0.002, -0.022, -0.032], atol=1e-12)
+    np.testing.assert_allclose(
+        day1["tp_net"].to_numpy(),
+        np.array([0.048, -0.012, -0.002, -0.022, -0.032]) - BROKERAGE_FEE_BP / 1e4,
+        atol=1e-12,
+    )
     assert day1["rank"].tolist() == [1, 2, 3, 4, 5]
     day2 = out[out["decision_date"] == pd.Timestamp("2026-09-11")]
     assert (day2["status"] == "PENDING").all()
@@ -147,6 +156,7 @@ def test_build_attribution_ledger_computes_daily_rank_ic_and_basket_arms() -> No
         "close": [10_000.0] * 5 + [10_100.0, 9_900.0, 10_000.0, 9_800.0, 9_700.0],
     })
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.strategy.t1_attribution import T1_LEDGER_COLUMNS, build_attribution_ledger, realize_pool_exit_arms
 
     # When
@@ -159,9 +169,9 @@ def test_build_attribution_ledger_computes_daily_rank_ic_and_basket_arms() -> No
     assert (d1["n_pool"], d1["n_pool_realized"], d1["n_admitted"], d1["n_admitted_realized"], d1["n_selected"], d1["n_selected_realized"]) == (5, 5, 4, 4, 3, 3)
     assert d1["ic_pool_net"] == pytest.approx(1.0)
     assert d1["ic_admitted_net"] == pytest.approx(1.0)
-    assert d1["selected_open_net"] == pytest.approx(0.018)
-    assert d1["selected_tp_net"] == pytest.approx((0.048 - 0.012 - 0.002) / 3)
-    assert d1["admitted_open_net"] == pytest.approx(0.013)
+    assert d1["selected_open_net"] == pytest.approx(0.018 - BROKERAGE_FEE_BP / 1e4)
+    assert d1["selected_tp_net"] == pytest.approx((0.048 - 0.012 - 0.002) / 3 - BROKERAGE_FEE_BP / 1e4)
+    assert d1["admitted_open_net"] == pytest.approx(0.013 - BROKERAGE_FEE_BP / 1e4)
     assert d1["selection_edge_net"] == pytest.approx(0.005)
     assert d1["model_version"] == "KCA-TOPK-COSTAWARE-001@2026-09-04 00:00:00@UNKNOWN"
     d2 = ledger.iloc[1]
@@ -194,6 +204,7 @@ def test_build_attribution_ledger_guards_small_pools_partial_baskets_and_mixed_v
         "close": [10_000.0] * 5 + [10_100.0, 9_900.0, 10_000.0, 9_800.0, 9_700.0],
     })
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.strategy.t1_attribution import build_attribution_ledger, realize_pool_exit_arms
 
     # Given: 선택 종목 000002 익일 봉 누락 + 000004/000005 누락 -> 실현 3종목(< 4)
@@ -208,7 +219,7 @@ def test_build_attribution_ledger_guards_small_pools_partial_baskets_and_mixed_v
     assert row["n_pool_realized"] == 2
     assert np.isnan(row["ic_pool_net"]) and np.isnan(row["ic_admitted_net"])
     assert np.isnan(row["selected_open_net"]) and np.isnan(row["selected_tp_net"])
-    assert row["admitted_open_net"] == pytest.approx((0.028 + 0.008) / 2)
+    assert row["admitted_open_net"] == pytest.approx((0.028 + 0.008) / 2 - BROKERAGE_FEE_BP / 1e4)
 
     # And: 한 결정일에 모델 버전이 섞이면 귀속 불가 -> fail-closed
     mixed = day1.copy()
@@ -328,6 +339,7 @@ def test_attribution_handles_no_pick_days_and_empty_inputs() -> None:
         "close": [10_000.0] * 5 + [10_100.0, 9_900.0, 10_000.0, 9_800.0, 9_700.0],
     })
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.strategy.t1_attribution import REALIZED_COLUMNS, T1_LEDGER_COLUMNS, build_attribution_ledger, realize_pool_exit_arms, summarize_attribution
 
     # Given: admitted < top_k 로 선정 없이 풀만 저장된 날
@@ -340,7 +352,7 @@ def test_attribution_handles_no_pick_days_and_empty_inputs() -> None:
     assert row["day_status"] == "SETTLED"
     assert row["n_selected"] == 0
     assert row["ic_pool_net"] == pytest.approx(1.0)
-    assert row["admitted_open_net"] == pytest.approx(0.013)
+    assert row["admitted_open_net"] == pytest.approx(0.013 - BROKERAGE_FEE_BP / 1e4)
     assert np.isnan(row["selected_open_net"]) and np.isnan(row["selected_tp_net"]) and np.isnan(row["selection_edge_net"])
 
     # When: 풀 저장소가 비어 있는 경우

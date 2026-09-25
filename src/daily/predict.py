@@ -11,24 +11,19 @@ import numpy as np
 import pandas as pd
 
 from src import settings
+from src.config.base import RANK_POOL_PARQUET_NAME, TOPK_DECISIONS_PARQUET_NAME
+from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.io_utils import atomic_write_parquet
 from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day, trading_session_gate
-from src.tools.daily_audit import DAY_HOLIDAY, DAY_WEEKEND, classify_day
+from src.data.trading_calendar import DAY_HOLIDAY, DAY_WEEKEND, classify_day
 from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, RUN_OUTCOME_OK, record_run_outcome
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
-from src.daily.archive import fetch_archive_snapshot
 from src.ml.retrain_registry import resolve_code_commit_env
 from src.serving.realtime.artifacts import load_model_bundle
 from src.utils.display import print_table
-
-
-def _capture_root() -> Path:
-    root = settings.COLLECTION_ROOT
-    if root is not None:
-        return Path(root)
-    return Path(settings.HISTORY_DIR) / "capture"
 
 
 def load_daily_snapshot(decision_date: pd.Timestamp, *, available_by: datetime | None = None) -> pd.DataFrame:
@@ -45,11 +40,6 @@ def load_daily_snapshot(decision_date: pd.Timestamp, *, available_by: datetime |
         FileNotFoundError: No qualifying new-mode input exists.
         ValueError: Observations, membership, or hashes cannot be certified.
     """
-    if not bool(settings.COLLECTION_RAW_ENABLED):
-        df = fetch_archive_snapshot(snapshot_date=decision_date.strftime("%Y-%m-%d"))
-        if "종목코드" in df.columns:
-            df["종목코드"] = df["종목코드"].astype(str).str.zfill(6)
-        return df
     from src.data.capture_store import CaptureStore
 
     cutoff = available_by
@@ -160,7 +150,7 @@ def persist_rank_pool_predictions(
     out["decision_date"] = pd.Timestamp(decision_date).strftime("%Y-%m-%d")
     out["decided_at"] = pd.Timestamp.now(tz="Asia/Seoul")
     out["code_commit"] = code_commit
-    target = settings.PARQUET_DIR / "rank_pool_predictions.parquet"
+    target = settings.PARQUET_DIR / RANK_POOL_PARQUET_NAME
     if target.exists():
         existing = pd.read_parquet(target)
         union_cols = sorted(set(existing.columns.tolist()) | set(out.columns.tolist()))
@@ -218,9 +208,9 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[
     """
     try:
         from src.ml import topk_history_features
-        from src.ml.costaware_topk import MIN_TOP_K
         from src.ml.topk_ranker_research import TOPK_RANKER_BUNDLE_DIR, score_topk_candidates, select_topk_equal_weight
         from src.serving.realtime.features import build_topk_ranker_features
+        from src.strategy.contract import MIN_TOP_K
 
         inference_started_at = datetime.now(ZoneInfo("Asia/Seoul"))
         wide = restrict_to_rank_pool(load_daily_snapshot(decision_date, available_by=inference_started_at), decision_date)
@@ -280,7 +270,7 @@ def persist_topk_decision(decision_date: pd.Timestamp, sleeve_df: pd.DataFrame) 
     out["decision_date"] = decision_date.strftime("%Y-%m-%d")
     out["decided_at"] = pd.Timestamp.now(tz="Asia/Seoul")
     out["bundle_dir"] = str(TOPK_RANKER_BUNDLE_DIR)
-    target = settings.PARQUET_DIR / "topk_decisions.parquet"
+    target = settings.PARQUET_DIR / TOPK_DECISIONS_PARQUET_NAME
     if target.exists():
         try:
             existing = pd.read_parquet(target)
@@ -309,7 +299,7 @@ def load_topk_decision(decision_date: pd.Timestamp) -> pd.DataFrame:
         Requested-date rows deduplicated by symbol keeping the last write,
         or an empty frame when the store is absent.
     """
-    target = settings.PARQUET_DIR / "topk_decisions.parquet"
+    target = settings.PARQUET_DIR / TOPK_DECISIONS_PARQUET_NAME
     if not target.exists():
         return pd.DataFrame()
     df = pd.read_parquet(target)
@@ -400,6 +390,6 @@ def main() -> None:
     run_automated_topk_decision(decision_date, record_fn=functools.partial(record_run_outcome, "predict"))
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    configure_cli_logging()
     main()

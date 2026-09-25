@@ -5,14 +5,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 import re
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
-from src import settings
 from src.api.kis.rate_limit import AsyncRateLimiter, get_shared_rate_limiter
+from src.config import settings
 from src.data.capture_contracts import RawCaptureError
 
 if TYPE_CHECKING:
@@ -62,9 +61,16 @@ def _deadline_remaining(deadline: datetime | None) -> float | None:
 
 class KiwoomApiClient:
     def __init__(self, app_key: str | None = None, secret_key: str | None = None, base_url: str | None = None) -> None:
-        self.app_key = app_key or getattr(settings, "KIWOM_APP_KEY", "") or os.getenv("KIWOM_APP_KEY", "")
-        self.secret_key = secret_key or getattr(settings, "KIWOM_SECRET_KEY", "") or os.getenv("KIWOM_SECRET_KEY", "")
-        self.base_url = base_url or getattr(settings, "KIWOM_BASE_URL", "") or "https://api.kiwoom.com"
+        """Bind credentials, preferring explicit arguments over the live Settings instance.
+
+        Args:
+            app_key: Explicit app key; falls back to ``settings.KIWOOM_APP_KEY``.
+            secret_key: Explicit secret; falls back to ``settings.KIWOOM_SECRET_KEY``.
+            base_url: Explicit origin; falls back to ``settings.KIWOOM_BASE_URL``.
+        """
+        self.app_key = app_key or settings.KIWOOM_APP_KEY
+        self.secret_key = secret_key or settings.KIWOOM_SECRET_KEY
+        self.base_url = base_url or settings.KIWOOM_BASE_URL
         self.token: str | None = None
         self._rate_limiters: dict[str, AsyncRateLimiter] = {}
         self._token_lock: asyncio.Lock | None = None
@@ -268,11 +274,11 @@ class KiwoomApiClient:
         if max_pages is not None and int(max_pages) <= 0:
             raise ValueError("invalid tick acquisition limits")
         if budget is not None:
-            page_budget, deadline = _resolve_chart_budget(budget, int(getattr(settings, "KIWOM_TICK_MAX_PAGES", 30) or 30))
+            page_budget, deadline = _resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
         elif max_pages is not None:
             page_budget, deadline = max(1, int(max_pages)), None
         else:
-            page_budget, deadline = _resolve_chart_budget(None, int(getattr(settings, "KIWOM_TICK_MAX_PAGES", 30) or 30))
+            page_budget, deadline = _resolve_chart_budget(None, int(settings.COLLECTION_CHART_MAX_PAGES))
         cont_yn, next_key = "N", ""
         all_rows: list[dict[str, Any]] = []
         metadata: dict[str, str] = {}

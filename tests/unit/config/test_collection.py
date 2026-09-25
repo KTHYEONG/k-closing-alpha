@@ -61,13 +61,9 @@ def test_existing_exports_remain_stable() -> None:
     from src import settings as settings_module
 
     settings = Settings(_env_file=None)
-    assert settings.TARGET_CONDITION_NAME == "종가매매"
-    assert settings.KIWOM_TICK_MAX_PAGES == 30
     assert settings.COLLECTION_CHART_MAX_PAGES == 30
-    assert settings.COLLECTION_RAW_ENABLED is True
     for name in (
         "COLLECTION_ROOT",
-        "COLLECTION_RAW_ENABLED",
         "COLLECTION_AUCTION_ENABLED",
         "COLLECTION_ALTDATA_ENABLED",
         "COLLECTION_RESEARCH_SLOTS",
@@ -84,7 +80,7 @@ def test_existing_exports_remain_stable() -> None:
         "COLLECTION_SESSION_OVERRIDES",
     ):
         assert hasattr(settings, name)
-        assert name in settings_module.__all__
+        assert hasattr(settings_module, name)
     assert "CollectionSettings" in settings_module.__all__
 
 
@@ -139,20 +135,26 @@ def test_verified_exceptional_session_preserved() -> None:
     assert kept.provenance == "verified-notice"
 
 
-def test_legacy_mode_blocks_independent_publication() -> None:
+def test_raw_flag_is_not_a_settings_field() -> None:
+    """COLLECTION_RAW_ENABLED is retired from fields and module exports."""
+    from src import settings as settings_module
+
+    assert "COLLECTION_RAW_ENABLED" not in CollectionSettings.model_fields
+    assert "COLLECTION_RAW_ENABLED" not in settings_module.__all__
+
+
+def test_stale_raw_env_value_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale COLLECTION_RAW_ENABLED env value cannot break construction."""
+    monkeypatch.setenv("COLLECTION_RAW_ENABLED", "false")
     profile = CollectionSettings(_env_file=None)
-    assert profile.COLLECTION_RAW_ENABLED is True
-    with pytest.raises(ValueError, match="legacy operating mode"):
-        CollectionSettings(
-            COLLECTION_RAW_ENABLED=False,
-            COLLECTION_AUCTION_ENABLED=True,
-            COLLECTION_RESEARCH_SLOTS=("1",),
-            _env_file=None,
-        )
-    with pytest.raises(ValueError, match="legacy operating mode"):
-        CollectionSettings(COLLECTION_RAW_ENABLED=False, COLLECTION_ALTDATA_ENABLED=True, _env_file=None)
-    legacy = CollectionSettings(COLLECTION_RAW_ENABLED=False, _env_file=None)
-    assert legacy.COLLECTION_RAW_ENABLED is False
+    assert profile.COLLECTION_AUCTION_ENABLED is False
+    assert profile.COLLECTION_ALTDATA_ENABLED is False
+
+
+def test_altdata_opt_in_no_longer_depends_on_raw_mode() -> None:
+    """Altdata opt-in succeeds without research slots."""
+    profile = CollectionSettings(COLLECTION_ALTDATA_ENABLED=True, _env_file=None)
+    assert profile.COLLECTION_ALTDATA_ENABLED is True
 
 
 def test_altdata_extra_slots_default_empty() -> None:

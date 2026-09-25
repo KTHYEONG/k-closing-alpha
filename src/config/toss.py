@@ -2,22 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+from src.config._env import EnvSettings
 
 
-class TossSettings(BaseSettings):
+class TossSettings(EnvSettings):
     """토스증권 OpenAPI 접속 설정."""
-
-    model_config = SettingsConfigDict(
-        env_file=_PROJECT_ROOT / ".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
 
     TOSS_APP_KEY: str = Field(default="")
     TOSS_APP_SECRET: str = Field(default="")

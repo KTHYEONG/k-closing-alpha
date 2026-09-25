@@ -33,6 +33,8 @@ from src.daily.price_ingest import (
 from src.data.panel_integrity import heal_price_history_panel
 from src.data.parquet_codec import write_price_history_parquet
 
+from src.utils.cli_logging import configure_cli_logging
+
 logger = logging.getLogger(__name__)
 
 # KRX Open API 일별 전종목 응답이 확인된 첫 거래일이자 기존 패널 시작일
@@ -496,7 +498,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out", default=None)
     parser.add_argument("--swap", action="store_true")
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     live = Path(settings.PRICE_HISTORY_PARQUET_PATH)
     start = REBUILD_START_DATE if args.start is None else pd.Timestamp(args.start)
     end = pd.Timestamp.today().normalize() if args.end is None else pd.Timestamp(args.end)

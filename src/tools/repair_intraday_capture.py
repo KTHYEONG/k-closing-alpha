@@ -18,6 +18,7 @@ from src.config.collection import CollectionSettings
 from src.config.market_session import INTRADAY_SESSION_REGULAR
 from src.data.capture_contracts import SEOUL, CaptureStatus, CoverageEntry
 from src.data.capture_store import CaptureStore
+from src.data.capture_store import resolve_capture_root as _capture_root
 
 logger = logging.getLogger(__name__)
 
@@ -82,18 +83,9 @@ def _open_clients() -> tuple[Any, Any, Any | None, Any | None]:
     from src.api.ls.client import LsApiClient
 
     client = KisApiClient(**kis_data_client_kwargs())  # type: ignore[no-untyped-call]
-    ls_client = LsApiClient() if getattr(settings, "LS_APP_KEY", None) else None
-    if getattr(settings, "KIWOM_APP_KEY", None) or getattr(settings, "KIWOOM_APP_KEY", None):
-        kiwoom_client = KiwoomApiClient()
-    else:
-        kiwoom_client = None
+    ls_client = LsApiClient() if settings.LS_APP_KEY else None
+    kiwoom_client = KiwoomApiClient() if settings.KIWOOM_APP_KEY else None
     return client, client.create_session(), ls_client, kiwoom_client
-
-
-def _capture_root(profile: CollectionSettings) -> Path:
-    if profile.COLLECTION_ROOT is not None:
-        return Path(profile.COLLECTION_ROOT)
-    return Path(settings.HISTORY_DIR) / "capture"
 
 
 async def _repair_symbol(

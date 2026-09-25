@@ -670,3 +670,88 @@ def test_ls_exhausted_retries_logged_distinctly(caplog) -> None:
         data, _ = asyncio.run(_run())
     assert data["rsp_cd"] == "IGW00201"
     assert any("RATE_LIMITED" in r.getMessage() and "attempts=5" in r.getMessage() for r in caplog.records)
+
+
+def test_ls_client_honors_pacing_overrides_from_settings_instance(monkeypatch) -> None:
+    from src.api.ls.client import LsApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "LS_MIN_INTERVAL_SECONDS", 9.9)
+    monkeypatch.setattr(settings_instance, "LS_RATE_LIMIT_MAX_RETRIES", 7)
+    monkeypatch.setattr(settings_instance, "LS_RATE_LIMIT_BACKOFF_SECONDS", 2.5)
+
+    client = LsApiClient(app_key="k", app_secret="s")
+
+    assert client._min_interval == 9.9
+    assert client._rate_limit_max_retries == 7
+    assert client._rate_limit_backoff == 2.5
+
+
+def test_ls_client_explicit_credentials_win_over_instance(monkeypatch) -> None:
+    from src.api.ls.client import LsApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "LS_APP_KEY", "inst")
+    assert LsApiClient().app_key == "inst"
+    assert LsApiClient(app_key="arg").app_key == "arg"
+
+    monkeypatch.setattr(settings_instance, "LS_APP_KEY", "")
+    monkeypatch.setenv("LS_APP_KEY", "late")
+    assert LsApiClient().app_key == ""
+
+
+def test_ls_client_requests_use_configured_origin(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.api.ls.client import LsApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "LS_BASE_URL", "https://ls.example:1")
+    client = LsApiClient(app_key="k", app_secret="s")
+    posted: list[str] = []
+
+    def _resp(payload: dict) -> AsyncMock:
+        mock_resp = AsyncMock()
+        mock_resp.json = AsyncMock(return_value=payload)
+        return mock_resp
+
+    token_resp = _resp({"access_token": "t"})
+    chart_resp = _resp({"rsp_cd": "00000", "t8412OutBlock1": []})
+    session = AsyncMock()
+
+    async def _post(url: str, *args: Any, **kwargs: Any) -> Any:
+        posted.append(url)
+        body = token_resp if url.endswith("/oauth2/token") else chart_resp
+
+        class _Ctx:
+            async def __aenter__(self) -> AsyncMock:
+                return body
+
+            async def __aexit__(self, *exc: Any) -> bool:
+                return False
+
+        return _Ctx()
+
+    session.post.side_effect = _post
+    res = asyncio.run(client.get_minute_chart(session, "005930", "2026-09-04"))
+
+    assert res["rt_cd"] == "0"
+    assert posted[0] == "https://ls.example:1/oauth2/token"
+    assert posted[1] == "https://ls.example:1/stock/chart"
+
+
+def test_ls_tick_fallback_budget_equals_chart_budget(monkeypatch) -> None:
+    import asyncio
+
+    from src.api.ls.client import LsApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "COLLECTION_CHART_MAX_PAGES", 2)
+    client, state = _paging_client(
+        [_tick_page([{"date": "20260904", "time": "153000"}], "20260904", "151500", "Y", "k1")] * 2
+    )
+    res = asyncio.run(client.get_tick_chart(None, "005930", "2026-09-04"))
+
+    assert state["calls"] == 2
+    assert res["termination_reason"] == "page_budget"

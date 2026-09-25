@@ -1,9 +1,8 @@
 """KRX Open API (data-dbg.krx.co.kr) 일별 조회 클라이언트.
 
-``AUTH_KEY`` 헤더 인증. 파생상품/지수 일별매매정보의 주 경로이며, pykrx 가
-KRX 안티봇으로 차단된 환경에서도 동작한다. 구독되지 않은 엔드포인트는
+``AUTH_KEY`` 헤더 인증. 파생상품/지수 일별매매정보의 주 경로이다. 구독되지 않은 엔드포인트는
 401(``Unauthorized API Call``), 오타 경로는 404 를 반환하며 두 경우 모두
-빈 DataFrame 으로 fail-soft 처리한다 (호출부는 pykrx fallback 으로 진행).
+빈 DataFrame 으로 fail-soft 처리한다.
 """
 
 from __future__ import annotations

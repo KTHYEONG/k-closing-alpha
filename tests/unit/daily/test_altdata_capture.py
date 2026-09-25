@@ -11,7 +11,6 @@ def _profile(tmp_path: Path, **overrides: Any):
 
     base: dict[str, Any] = {
         "COLLECTION_ROOT": tmp_path / "capture",
-        "COLLECTION_RAW_ENABLED": True,
         "COLLECTION_ALTDATA_ENABLED": True,
     }
     base.update(overrides)
@@ -34,14 +33,14 @@ def test_main_returns_zero_when_disabled_not_a_failure(tmp_path, monkeypatch, ca
     assert any("SKIP" in r.message for r in caplog.records)
 
 
-def test_main_returns_zero_when_raw_capture_disabled(tmp_path, monkeypatch, caplog) -> None:
+def test_main_returns_zero_when_altdata_disabled(tmp_path, monkeypatch, caplog) -> None:
     import logging
 
     from src.daily import altdata_capture
 
     monkeypatch.setattr(
         altdata_capture, "CollectionSettings",
-        lambda: _profile(tmp_path, COLLECTION_RAW_ENABLED=False, COLLECTION_ALTDATA_ENABLED=False),
+        lambda: _profile(tmp_path, COLLECTION_ALTDATA_ENABLED=False),
     )
     with caplog.at_level(logging.INFO, logger=altdata_capture.logger.name):
         rc = altdata_capture.main([])

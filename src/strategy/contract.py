@@ -13,7 +13,7 @@ import pandas as pd
 
 # tick_cost_bp 와 statutory_bp_asof 는 UniverseSpec.max_tick_cost_bp 가 소비하는
 # 비용 컬럼과 PIT 법정비용의 생산자다. 스크린 계약과 함께 쓰이므로 이 모듈에서 재수출한다.
-from src.execution.cost_model import statutory_bp_asof, tick_cost_bp
+from src.execution.cost_model import pit_round_trip_cost_bp, statutory_bp_asof, tick_cost_bp
 
 __all__ = [
     "AA_COST",
@@ -32,6 +32,7 @@ __all__ = [
     "MAX_TICK_COST_BP",
     "MIN_PATH_WIN_RATE",
     "MIN_ROUND_TRIP_TICKS",
+    "MIN_TOP_K",
     "PA_COST",
     "CostSpec",
     "ExecutionMode",
@@ -43,6 +44,7 @@ __all__ = [
     "derive_chg_ratio",
     "detect_mixed_unit_rows",
     "mark_ceiling",
+    "pit_round_trip_cost_bp",
     "round_trip_cost_bp",
     "select_universe",
     "statutory_bp_asof",
@@ -74,6 +76,9 @@ LABEL_BAD_THRESHOLD: float = -0.02
 KRX_DAILY_LIMIT_RATIO: float = 0.31
 
 APPROXIMATE_SPEARMAN_THRESHOLD: float = 0.99
+
+# 비용인식 랭커가 인증받은 최소 투자 바스켓 크기로 모든 StrategySpec.top_k의 유일한 수치 원천이다.
+MIN_TOP_K: int = 3
 
 
 # 법정비용은 날짜 함수이므로 전략 스펙 상수가 될 수 없다.
@@ -139,7 +144,7 @@ PA_COST: CostSpec = CostSpec(mode=ExecutionMode.PA, round_trip_ticks=1.0)
 DEFAULT_UNIVERSE: UniverseSpec = UniverseSpec()
 
 KCA_TOP3_SHADOW_001: StrategySpec = StrategySpec(
-    strategy_id="KCA-TOP3-SHADOW-001", top_k=3, universe=DEFAULT_UNIVERSE, cost=AA_COST
+    strategy_id="KCA-TOP3-SHADOW-001", top_k=MIN_TOP_K, universe=DEFAULT_UNIVERSE, cost=AA_COST
 )
 
 COST_AWARE_UNIVERSE: UniverseSpec = UniverseSpec(
@@ -152,7 +157,7 @@ COST_AWARE_UNIVERSE: UniverseSpec = UniverseSpec(
 )
 
 KCA_TOPK_COSTAWARE_001: StrategySpec = StrategySpec(
-    strategy_id="KCA-TOPK-COSTAWARE-001", top_k=3, universe=COST_AWARE_UNIVERSE, cost=AA_COST
+    strategy_id="KCA-TOPK-COSTAWARE-001", top_k=MIN_TOP_K, universe=COST_AWARE_UNIVERSE, cost=AA_COST
 )
 
 # 절대 틱비용 상한은 가격의 계단함수라 레짐마다 다른 가격창을 의미한다. 비용은 net 라벨로만 반영한다.
@@ -166,7 +171,7 @@ CAPFREE_UNIVERSE: UniverseSpec = UniverseSpec(
 )
 
 KCA_TOPK_CAPFREE_001: StrategySpec = StrategySpec(
-    strategy_id="KCA-TOPK-CAPFREE-001", top_k=3, universe=CAPFREE_UNIVERSE, cost=AA_COST
+    strategy_id="KCA-TOPK-CAPFREE-001", top_k=MIN_TOP_K, universe=CAPFREE_UNIVERSE, cost=AA_COST
 )
 
 
@@ -196,10 +201,28 @@ def detect_mixed_unit_rows(
 
 
 def round_trip_cost_bp(price: np.ndarray | float, trade_date: np.ndarray, market: np.ndarray, cost: CostSpec = AA_COST) -> np.ndarray:
+    """Point-in-time round-trip cost in bp for entries at ``price``.
+
+    Tick size is taken from the entry price and market on ``trade_date`` (pre/post
+    2023-01-25 reform ladders), then composed with the statutory tax and the
+    round-trip brokerage by ``pit_round_trip_cost_bp`` so every certified cost
+    path shares one friction definition.
+
+    Args:
+        price: Unadjusted entry price(s).
+        trade_date: Entry dates.
+        market: Market labels (KOSPI/KOSDAQ families) for the tick ladder.
+        cost: Execution-mode cost spec supplying ``round_trip_ticks``.
+
+    Returns:
+        Float64 bp array; NaN for bad price, unknown ladder, or NaT date.
+    """
     arr = np.asarray(price, dtype=np.float64)
     per_tick = tick_cost_bp(arr, trade_date, market)
-    statutory = statutory_bp_asof(trade_date)
-    return np.asarray(statutory + float(cost.round_trip_ticks) * per_tick, dtype=np.float64)
+    return np.asarray(
+        pit_round_trip_cost_bp(per_tick, trade_date, round_trip_ticks=float(cost.round_trip_ticks)),
+        dtype=np.float64,
+    )
 
 
 def mark_ceiling(df: pd.DataFrame) -> np.ndarray:

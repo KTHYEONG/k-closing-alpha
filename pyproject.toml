@@ -23,7 +23,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*", "src.backfill*"]
+include = ["src*"]
 
 
 
@@ -32,12 +32,12 @@ include = ["src*", "src.backfill*"]
 line-length = 120
 target-version = "py311"
 exclude = [
-    "data", 
-    "legacy", 
-    ".legacy",
-    "logs", 
-    "results", 
-    ".pytest_cache", 
+    "./data",
+    "./legacy",
+    "./.legacy",
+    "./logs",
+    "./results",
+    ".pytest_cache",
     ".git",
     ".venv",
 ]
@@ -71,15 +71,11 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106", "E402", "N803", "N806", "N813", "N814", "ARG", "I001", "RUF059", "F841", "F401", "F811", "PT018", "RUF012"]
-"scripts/*" = ["T20"]
 "tools/agent_skills/lean_check.py" = ["T20", "S607"]
 "tools/agent_skills/gen_code_map.py" = ["T20"]
-"tools/agent_skills/spec_init.py" = ["T20"]
 "tools/agent_skills/sync_task.py" = ["T20", "S607", "S110"]
-"tools/devops/clean_logs.py" = ["T20"]
 "src/settings.py" = ["N802", "N803"]
 "src/config/*.py" = ["N802", "N803"]
-"src/api/kis_client.py" = ["T20", "ASYNC230", "ASYNC240", "S110", "SIM108", "B006"]
 "src/api/kis/*.py" = ["T20", "ASYNC230", "ASYNC240", "S110", "SIM108", "B006"]
 "src/backfill/*.py" = ["T20", "E402", "N806", "B007", "B905", "S112", "RUF009", "E701", "S110", "RUF059", "RUF015", "B008", "RUF046", "SIM105", "SIM108"]
 "src/backfill/**/*.py" = ["T20", "E402", "N806", "B007", "B905", "B023", "S112", "RUF009", "E701", "S110", "RUF059", "RUF015", "B008", "RUF046", "SIM105", "SIM108", "S314", "SIM102", "I001", "C401", "UP035", "UP017", "F841"]
@@ -101,14 +97,14 @@ check_untyped_defs = true
 show_error_codes = true
 ignore_missing_imports = true
 exclude = [
-    "data", 
-    "legacy", 
-    ".legacy",
-    "logs", 
-    "results", 
-    ".pytest_cache", 
-    ".git",
-    ".venv",
+    "^data/",
+    "^legacy/",
+    "^\\.legacy/",
+    "^logs/",
+    "^results/",
+    "^\\.pytest_cache/",
+    "^\\.git/",
+    "^\\.venv/",
     "^tests/.*/conftest\\.py$",
 ]
 

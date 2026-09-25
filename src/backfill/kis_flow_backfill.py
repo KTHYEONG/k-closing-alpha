@@ -17,10 +17,12 @@ from src.api.toss.client import TossApiClient
 from src.daily.price_ingest import VendorResponseError, parse_toss_program_rows
 from src.sync.fetcher_investor import get_investor_trade_daily_async
 from src.sync.fetcher_program import get_program_history_async
+from src.utils.cli_logging import configure_cli_logging
 
 FLOW_COLUMNS = ("foreign_netbuy", "inst_netbuy", "program_netbuy")
 # Toss 프로그램 이력 시작일(실측: 무관한 대형주 2종목 동일 컷오프) — 이전 날짜는 KIS 전용으로 유지한다.
 TOSS_PROGRAM_HISTORY_START_YMD = "20190401"
+
 logger = logging.getLogger(__name__)
 
 
@@ -276,7 +278,7 @@ def apply_flow_checkpoints(parquet_path: Path, checkpoint_dir: Path) -> int:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")  # pragma: no cover
+    configure_cli_logging("%(asctime)s %(levelname)s %(message)s")  # pragma: no cover
     parser = argparse.ArgumentParser(description="KIS flow-only historical backfill")
     parser.add_argument("--parquet", default="data/history/price_history.parquet")
     parser.add_argument("--checkpoint-dir", default="data/history/flow_backfill")

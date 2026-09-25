@@ -348,7 +348,7 @@ def test_run_altdata_backfill_capture_failure_propagates(monkeypatch, tmp_path) 
 def _capture_profile(**overrides):
     from src.config.collection import CollectionSettings
 
-    base = {"COLLECTION_RAW_ENABLED": True, "COLLECTION_ALTDATA_ENABLED": True, "COLLECTION_ALTDATA_LOOKBACK_DAYS": 3}
+    base = {"COLLECTION_ALTDATA_ENABLED": True, "COLLECTION_ALTDATA_LOOKBACK_DAYS": 3}
     base.update(overrides)
     return CollectionSettings(**base, _env_file=None)
 
@@ -432,7 +432,7 @@ def test_run_altdata_capture_rejects_disabled_profile_and_mismatched_bounds(monk
     store = CaptureStore(tmp_path / "capture")
     cfg = _capture_cfg(tmp_path, trading_day)
     monkeypatch.setattr(cap, "fetch_krx_daily", lambda window_end, cfg_: __import__("pandas").DataFrame(columns=["symbol"]))
-    with pytest.raises(ValueError, match="enabled raw and altdata"):
+    with pytest.raises(ValueError, match="enabled altdata collection"):
         cap.run_altdata_capture(trading_day, profile=_capture_profile(COLLECTION_ALTDATA_ENABLED=False), store=store, cfg=cfg)
     with pytest.raises(ValueError, match="rolling bounds"):
         cap.run_altdata_capture(trading_day, profile=_capture_profile(), store=store, cfg=_capture_cfg(tmp_path, __import__("datetime").date(2026, 9, 9)))
@@ -460,7 +460,7 @@ def test_altdata_capture_main_reports_complete_and_incomplete(monkeypatch, tmp_p
     monkeypatch.setattr(cap, "run_altdata_capture", lambda day, **kw: _Manifest(CaptureStatus.COMPLETE))
     assert cap.main(["--date", "2026-09-10"]) == 0
     monkeypatch.setattr(cap, "run_altdata_capture", lambda day, **kw: _Manifest(CaptureStatus.PARTIAL))
-    assert cap.main([]) == 1
+    assert cap.main(["--date", "2026-09-10"]) == 1
 
 
 def test_altdata_capture_main_skips_when_disabled_and_rejects_bad_date(monkeypatch) -> None:

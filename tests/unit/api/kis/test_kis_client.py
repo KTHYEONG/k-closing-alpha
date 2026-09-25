@@ -2,36 +2,15 @@
 
 SCENARIO_RATE_LIMITER_NO_LOCK_WHILE_SLEEP:
   acquire() 호출 시 Lock 외부에서 sleep 수행 — lock-while-sleeping 버그 수정 검증.
-
-SCENARIO_MA_CLIENT_PARAM:
-  calculate_all_moving_averages에 client 파라미터 주입 시 ensure_token 미호출 검증.
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 import time
-from unittest.mock import AsyncMock, patch
 
 from src.api.kis.client import KisApiClient
-from src.api.kis.indicators import calculate_all_moving_averages
 from src.api.kis.rate_limit import AsyncRateLimiter
-
-
-class _FakeSession:
-    """네트워크 접속 없는 가짜 aiohttp 세션."""
-
-
-def _ohlcv_response(rows: int) -> dict:
-    import pandas as pd
-
-    base = pd.Timestamp("2024-01-01")
-    items = []
-    for i in range(rows):
-        date = (base + pd.Timedelta(days=i)).strftime("%Y%m%d")
-        items.append({"stck_bsop_date": date, "stck_clpr": str(10_000 + i)})
-    return {"rt_cd": "0", "output2": items}
 
 
 def test_scenario_rate_limiter_no_lock_while_sleep() -> None:
@@ -56,34 +35,6 @@ def test_scenario_rate_limiter_no_lock_while_sleep() -> None:
         assert wait_c < 0.7
 
     asyncio.run(_runner())
-
-
-def test_scenario_ma_client_param() -> None:
-    """[SCENARIO_MA_CLIENT_PARAM]
-    calculate_all_moving_averages(code, session, client=existing_client) 호출 시
-    ensure_token이 호출되지 않아야 한다.
-    """
-    sig = inspect.signature(calculate_all_moving_averages)
-    assert "stock_code" in sig.parameters
-    assert "client" in sig.parameters
-
-    client = KisApiClient(app_key="test-key", account_id="test-account", hts_id="test-hts")
-    ensure_token = AsyncMock(return_value="tok")
-    get_ohlcv = AsyncMock(return_value=_ohlcv_response(200))
-
-    async def _runner() -> None:
-        with (
-            patch.object(client, "ensure_token", ensure_token),
-            patch.object(client, "get_stock_ohlcv_history", get_ohlcv),
-        ):
-            await calculate_all_moving_averages(
-                "005930", session=_FakeSession(), client=client
-            )
-
-    asyncio.run(_runner())
-
-    ensure_token.assert_not_called()
-    get_ohlcv.assert_awaited()
 
 
 def test_kis_client_instances_share_process_global_rate_limiter() -> None:

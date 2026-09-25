@@ -44,10 +44,12 @@ from src.data.capture_contracts import (
     RawCaptureError,
 )
 from src.data.capture_store import CaptureStore
+from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.panel_integrity import heal_price_history_panel
 from src.data.parquet_codec import write_price_history_parquet
 from src.strategy.contract import derive_chg_ratio
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, record_run_outcome
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -318,13 +320,6 @@ def normalize_krx_daily(raw: pd.DataFrame, trade_date: pd.Timestamp) -> pd.DataF
     if dup:
         raise ValueError(f"KRX daily block repeats {dup} symbols on {pd.Timestamp(trade_date).date()}")
     return out
-
-
-def _capture_root() -> Path:
-    root = settings.COLLECTION_ROOT
-    if root is not None:
-        return Path(root)
-    return Path(settings.HISTORY_DIR) / "capture"
 
 
 def _price_capture_context(trading_day: date, run_id: str, endpoint: str, *, symbol: str | None = None) -> CaptureContext:
@@ -896,9 +891,8 @@ async def run_price_ingest(
     if not out_path.exists():
         raise FileNotFoundError(f"price_history not found: {out_path}")
     cfg = krx_cfg or AltDataFetchConfig(start=run_day, end=run_day + pd.Timedelta(days=1), out_dir=Path("."), krx_api_key=settings.KRX_OPENAPI_KEY)
-    raw_enabled = bool(settings.COLLECTION_RAW_ENABLED)
-    store = CaptureStore(_capture_root()) if raw_enabled else None
-    run_id = f"price-{run_day.strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}" if store is not None else None
+    store = CaptureStore(_capture_root())
+    run_id = f"price-{run_day.strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
     if kis is None:
         from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 
@@ -926,7 +920,7 @@ async def run_price_ingest(
         for d in plan_new_dates(panel_max, trading, run_day):
             trade_date = d
             krx_cfg = cfg
-            observer = _price_page_observer(store, pd.Timestamp(trade_date).normalize().date(), run_id) if store is not None and run_id is not None else None
+            observer = _price_page_observer(store, pd.Timestamp(trade_date).normalize().date(), run_id)
             krx_rows = fetch_krx_daily(trade_date, krx_cfg, on_page=observer)
             rows = krx_rows
             if rows.empty:
@@ -946,7 +940,7 @@ async def run_price_ingest(
             for d in (d for d in trading if stale and min(stale) < d <= panel_max):
                 trade_date = d
                 krx_cfg = cfg
-                observer = _price_page_observer(store, pd.Timestamp(trade_date).normalize().date(), run_id) if store is not None and run_id is not None else None
+                observer = _price_page_observer(store, pd.Timestamp(trade_date).normalize().date(), run_id)
                 krx_rows = fetch_krx_daily(trade_date, krx_cfg, on_page=observer)
                 rows = krx_rows
                 if rows.empty:
@@ -962,7 +956,7 @@ async def run_price_ingest(
             new_rows = assemble_new_rows(tail, flows)
         # 신규 행이 없어도 창 안 결측 수급을 재조회해 채운다 — 부분 기록이 영구 결측으로 굳지 않게.
         panel, n_repaired = apply_flow_repairs(panel, flows)
-    if store is not None and run_id is not None and not tail.empty:
+    if not tail.empty:
         store.publish_frame(tail, context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-unadjusted", symbol="unadjusted"))
     index_cols = compute_index_columns(kospi, kosdaq)
     if new_rows.empty:
@@ -986,7 +980,7 @@ async def run_price_ingest(
     if changed:
         write_price_history_parquet(heal_price_history_panel(merged), out_path)
         wrote = True
-        if store is not None and run_id is not None and not new_rows.empty:
+        if not new_rows.empty:
             # merged는 수년치 전체 패널이라 그대로 발행하면 아티팩트 크기 상한을 넘는다
             # (실측: 2026-09-21 240MB+ 패널이 64MB 상한을 초과해 크래시). 신규/소급조정
             # 행만 evidence_mask로 골라 발행해도 "무엇이 바뀌었는지"는 완전히 보존된다.
@@ -1042,7 +1036,7 @@ async def run_price_ingest(
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     report = asyncio.run(run_price_ingest(on_outcome=functools.partial(record_run_outcome, "price_ingest")))
     if report.ingested_dates:
         from src.daily.security_classification import run_security_classification_ingest

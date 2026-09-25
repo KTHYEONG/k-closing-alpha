@@ -1,4 +1,4 @@
-"""KOSPI200 지수-선물 베이시스 수집기 (KRX Open API 주 경로 + pykrx fallback)."""
+"""KOSPI200 지수-선물 베이시스 수집기 (KRX Open API 단일 경로)."""
 
 from __future__ import annotations
 

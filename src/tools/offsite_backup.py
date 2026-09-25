@@ -14,15 +14,17 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from src.data.intraday_store import _capture_root
-from src.tools.backup_prune import _resolve_rclone_bin
+from src.data.capture_store import resolve_capture_root as _capture_root
 from src.tools.capture_offsite import OffsiteConfig, SealReport, seal_and_upload
+from src.tools.offsite_common import OFFSITE_REMOTE_BASE
+from src.tools.offsite_common import resolve_rclone_bin as _resolve_rclone_bin
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 
-BACKUP_REMOTE_BASE: str = "gdrive:quant-lake/live/k-closing-alpha"
+BACKUP_REMOTE_BASE: str = OFFSITE_REMOTE_BASE
 LOOSE_SUBTREES: tuple[str, ...] = ("data", "artifacts")
 LOOSE_EXCLUDES: tuple[str, ...] = (
     "/history/capture/raw/**",
@@ -309,5 +311,5 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     main()

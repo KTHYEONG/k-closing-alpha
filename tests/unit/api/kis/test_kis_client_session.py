@@ -27,7 +27,6 @@ def test_client_quote_helpers_reuse_common_request_path() -> None:
         session = type("Session", (), {"get": object()})()
         assert (await client.get_current_price(session, "005930"))["rt_cd"] == "0"
         assert (await client.get_program_net_buy(session, "005930"))["rt_cd"] == "0"
-        assert (await client.get_trade_strength(session, "005930"))["rt_cd"] == "0"
         assert (await client.get_market_index_rate(session, "0001"))["rt_cd"] == "0"
         assert (await client.get_market_index_history(session, "0001", "20200101", "20200102"))["rt_cd"] == "0"
         assert (await client.get_investor_trend_estimate(session, "005930"))["rt_cd"] == "0"

@@ -11,7 +11,6 @@ def test_path_settings_defaults_point_to_project_root() -> None:
     settings = PathSettings()
     assert Path(__file__).resolve().parent.parent.parent.parent == settings.BASE_DIR
     assert settings.DATA_DIR == settings.BASE_DIR / "data"
-    assert settings.CONFIGS_DIR == settings.BASE_DIR / "configs"
     assert settings.MODELS_DIR == settings.BASE_DIR / "artifacts" / "models"
 
 
@@ -20,12 +19,8 @@ def test_path_settings_derived_paths(tmp_path: Path) -> None:
     assert tmp_path / "data" / "parquet" == settings.PARQUET_DIR
     assert settings.TRADE_LOG_PARQUET_PATH == settings.PARQUET_DIR / "trade_log.parquet"
     assert settings.THEME_PARQUET_PATH == settings.PARQUET_DIR / "theme.parquet"
-    assert tmp_path / "data" / "daily" == settings.DAILY_DIR
     assert settings.HISTORY_PARQUET_PATH == settings.HISTORY_DIR / "archive.parquet"
-    assert settings.TOKEN_FILE == settings.CONFIGS_DIR / "kis_token_cache.json"
     assert tmp_path / "data" / "history" == settings.HISTORY_DIR
-    assert settings.LABEL_ENCODER_PATH == settings.MODELS_DIR / "best_stock_rg_cat_encoders.json"
-    assert settings.MODEL_PATH == settings.MODELS_DIR / "best_stock_rg_cat.joblib"
 
 
 def test_path_settings_no_longer_defines_stock_db_or_condition_csv(tmp_path: Path) -> None:
@@ -41,23 +36,55 @@ def test_ls_tick_max_pages_moved_to_ls_settings() -> None:
     from src.config.ls import LsSettings
     from src.settings import Settings
 
-    # Then: the vendor budget left the path-settings class.
+    # Then: the per-vendor tick budgets are retired; COLLECTION_CHART_MAX_PAGES
+    # is the single source for the first-pass chart/tick page budget.
     assert "LS_TICK_MAX_PAGES" not in PathSettings.model_fields
-    # And: it now sits beside its twin.
-    assert "LS_TICK_MAX_PAGES" in LsSettings.model_fields
-    assert "KIWOM_TICK_MAX_PAGES" in KiwoomSettings.model_fields
+    assert "LS_TICK_MAX_PAGES" not in LsSettings.model_fields
+    assert "KIWOM_TICK_MAX_PAGES" not in KiwoomSettings.model_fields
 
-    # And: the value and the consumer-facing access path are unchanged.
+    # And: the surviving budget keeps its default.
     settings = Settings()
-    assert settings.LS_TICK_MAX_PAGES == 100
-    assert settings.KIWOM_TICK_MAX_PAGES == 30
+    assert settings.COLLECTION_CHART_MAX_PAGES == 30
 
 
-def test_path_settings_data_token_file_distinct_from_execution_token_file() -> None:
-    from src.config.base import PathSettings
+def test_decision_artifact_names_are_stable() -> None:
+    from src.config.base import RANK_POOL_PARQUET_NAME, TOPK_DECISIONS_PARQUET_NAME
 
-    s = PathSettings(_env_file=None)
+    assert TOPK_DECISIONS_PARQUET_NAME == "topk_decisions.parquet"
+    assert RANK_POOL_PARQUET_NAME == "rank_pool_predictions.parquet"
 
-    assert s.DATA_TOKEN_FILE != s.TOKEN_FILE
-    assert s.DATA_TOKEN_FILE.name == "kis_data_token_cache.json"
-    assert s.DATA_TOKEN_FILE.parent == s.CONFIGS_DIR
+
+def test_predict_call_time_join_honors_parquet_dir_override(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.daily import predict
+
+    monkeypatch.setattr(predict.settings, "PARQUET_DIR", tmp_path)
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": "005930",
+                "score": 0.5,
+            }
+        ]
+    )
+
+    assert predict.persist_topk_decision(pd.Timestamp("2026-09-18"), frame) == 1
+    assert (tmp_path / "topk_decisions.parquet").exists()
+
+
+def test_no_duplicated_decision_filename_literal() -> None:
+    import ast
+    from pathlib import Path
+
+    hits: list[str] = []
+    for path in sorted(Path("src").rglob("*.py")):
+        if path == Path("src/config/base.py"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "topk_decisions.parquet" in text or "rank_pool_predictions.parquet" in text:
+            hits.append(str(path))
+    assert hits == []

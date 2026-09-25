@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from src import settings
+from src.config.base import RANK_POOL_PARQUET_NAME
 from src.data.io_utils import atomic_write_parquet
 from src.ml.costaware_topk import compute_net_return
 from src.ml.exit_policy import simulate_take_profit_exit
@@ -25,7 +26,6 @@ from src.strategy.growth_shadow import STATUS_PENDING, STATUS_REALIZED, realize_
 logger = logging.getLogger(__name__)
 
 T1_ATTRIBUTION_PARQUET_NAME: str = "t1_attribution.parquet"
-RANK_POOL_PARQUET_NAME: str = "rank_pool_predictions.parquet"
 TP_COUNTERFACTUAL_RATIO: float = 0.05
 KRX_DAILY_PRICE_LIMIT_RATIO: float = 0.30
 STATUS_PRICE_DISCONTINUITY: str = "PRICE_DISCONTINUITY"

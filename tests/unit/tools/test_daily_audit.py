@@ -21,12 +21,11 @@ def _standard_session(monkeypatch) -> None:
     monkeypatch.setattr(daily_audit, "resolve_session_day", _resolve)
 
 
-def _collection_profile(tmp_path, *, raw=True, auction=False, altdata=False):
+def _collection_profile(tmp_path, *, auction=False, altdata=False):
     from src.config.collection import CollectionSettings
 
     kwargs: dict = {
         "COLLECTION_ROOT": tmp_path / "capture",
-        "COLLECTION_RAW_ENABLED": raw,
         "COLLECTION_AUCTION_ENABLED": auction,
         "COLLECTION_ALTDATA_ENABLED": altdata,
         "COLLECTION_RESEARCH_SLOTS": ("1",) if auction else (),
@@ -172,12 +171,12 @@ def _publish_slow_manifest(store, day, run_id, *, status):
 def _publish_auction_close(store, day, run_id, symbols, *, clock, interval=60):
     from datetime import datetime
 
-    from src.daily.auction_capture import _close_rounds, _program_rounds
+    from src.daily.auction_capture import close_rounds, program_rounds
 
     from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus, CoverageEntry
 
-    rounds = [(slot, CaptureDataset.ORDERBOOK) for slot in _close_rounds(clock, interval)]
-    rounds.extend((slot, CaptureDataset.PROGRAM) for slot in _program_rounds(clock))
+    rounds = [(slot, CaptureDataset.ORDERBOOK) for slot in close_rounds(clock, interval)]
+    rounds.extend((slot, CaptureDataset.PROGRAM) for slot in program_rounds(clock))
     entries = [
         CoverageEntry(
             symbol=symbol,
@@ -651,7 +650,6 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
     assert sent[1][0] == subject
 
 
-
 def test_audit_decision_requires_topk_or_predict_ok_outcome(monkeypatch, tmp_path) -> None:
     import pandas as pd
 
@@ -986,22 +984,6 @@ def test_audit_collection_rejects_inconsistent_date_and_naive_cutoff(tmp_path) -
         )
 
 
-def test_audit_collection_reports_legacy_mode_without_provenance(tmp_path) -> None:
-    """Raw-disabled legacy mode has explicit provenance-unavailable issues."""
-    from src.data.capture_store import CaptureStore
-
-    day = "2026-09-18"
-    store = CaptureStore(tmp_path / "capture")
-
-    # When
-    issues = _audit(
-        store, day, _collection_profile(tmp_path, raw=False), _session_clock(day), _audit_moment(day)
-    )
-
-    # Then
-    assert issues == ("collection:provenance:0:raw_disabled",)
-
-
 def test_audit_collection_reports_missing_decision_input(tmp_path) -> None:
     """Partial decision publication without qualifying input is reported."""
     from datetime import date, datetime
@@ -1150,7 +1132,7 @@ def test_audit_collection_reconciles_enabled_auction_sweeps(tmp_path) -> None:
 
 def test_audit_collection_reports_partial_auction_close_coverage(tmp_path) -> None:
     """Missing slots and failed entries stay visible."""
-    from src.daily.auction_capture import _close_rounds, _program_rounds
+    from src.daily.auction_capture import close_rounds, program_rounds
     from src.data.capture_contracts import (
         CaptureDataset,
         CaptureManifest,
@@ -1167,9 +1149,9 @@ def test_audit_collection_reports_partial_auction_close_coverage(tmp_path) -> No
     _publish_cohort_decision(store, day, symbols)
     _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, symbols)
     _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, symbols)
-    rounds = _close_rounds(clock, 60)
-    program_rounds = _program_rounds(clock)
-    prog_slot = program_rounds[0]
+    rounds = close_rounds(clock, 60)
+    prog_rounds = program_rounds(clock)
+    prog_slot = prog_rounds[0]
     entries = [
         CoverageEntry(
             symbol="005930",
@@ -1667,12 +1649,13 @@ def test_audit_collection_holiday_raises_no_slow_data_issue(tmp_path) -> None:
 
 def test_classify_day_default_oracle_is_shared_sync_helper(monkeypatch) -> None:
     """Calendar oracle default is the shared sync helper."""
+    from src.data import trading_calendar
     from src.tools import daily_audit
 
     assert not hasattr(daily_audit, "_kis_trading_day")
     calls: list[str] = []
     monkeypatch.setattr(
-        daily_audit, "is_kis_trading_day_sync", lambda snapshot_date: calls.append(snapshot_date) or True
+        trading_calendar, "is_kis_trading_day_sync", lambda snapshot_date: calls.append(snapshot_date) or True
     )
     assert daily_audit.classify_day("2026-09-14") == daily_audit.DAY_TRADING
     assert calls == ["2026-09-14"]

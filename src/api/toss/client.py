@@ -11,10 +11,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 
-from src import settings
 from src.api.kis.rate_limit import AsyncRateLimiter, get_shared_rate_limiter
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +46,9 @@ class TossResponseError(RuntimeError):
 
 class TossApiClient:
     def __init__(self, app_key: str | None = None, app_secret: str | None = None, base_url: str | None = None) -> None:
-        self.app_key = app_key or getattr(settings, "TOSS_APP_KEY", "") or os.getenv("TOSS_APP_KEY", "")
-        self.app_secret = app_secret or getattr(settings, "TOSS_APP_SECRET", "") or os.getenv("TOSS_APP_SECRET", "")
-        self.base_url = base_url or getattr(settings, "TOSS_BASE_URL", "") or "https://openapi.tossinvest.com"
+        self.app_key = app_key or settings.TOSS_APP_KEY
+        self.app_secret = app_secret or settings.TOSS_APP_SECRET
+        self.base_url = base_url or settings.TOSS_BASE_URL
         self.token: str | None = None
         self._token_lock: asyncio.Lock | None = None
 

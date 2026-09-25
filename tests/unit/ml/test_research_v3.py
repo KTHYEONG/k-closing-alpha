@@ -430,7 +430,10 @@ def test_v3_attach_forward_exit_paths_uses_contract_cost() -> None:
     markets = out["market"].astype(str).to_numpy(dtype=object)
     np.testing.assert_allclose(out["cost_aa_bp"].to_numpy(), round_trip_cost_bp(entry, trade_dates, markets, AA_COST))
     np.testing.assert_allclose(out["cost_pa_bp"].to_numpy(), round_trip_cost_bp(entry, trade_dates, markets, PA_COST))
-    np.testing.assert_allclose(out["cost_aa_bp"].to_numpy(), [40.0])
+    from src.execution.cost_model import BROKERAGE_FEE_BP
+
+    # 20bp 거래세 + 2틱 x 10bp + 왕복 KIS 우대수수료
+    np.testing.assert_allclose(out["cost_aa_bp"].to_numpy(), [40.0 + BROKERAGE_FEE_BP])
     np.testing.assert_allclose(out["cost_stress_bp"].to_numpy(), [46.0])
 
 

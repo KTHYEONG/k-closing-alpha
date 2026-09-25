@@ -7,6 +7,7 @@ import logging
 
 from src import settings
 from src.execution.paper_broker import PaperLedger, refresh_trade_ledgers
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -78,5 +79,5 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     main()

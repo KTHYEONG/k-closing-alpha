@@ -240,3 +240,16 @@ def test_toss_client_get_candles_forwards_adjusted_flag_and_omits_before_when_ab
     _, called_kwargs = session.get.call_args
     assert called_kwargs["params"]["adjusted"] == "false"
     assert "before" not in called_kwargs["params"]
+
+
+def test_toss_client_explicit_credentials_win_over_instance(monkeypatch) -> None:
+    from src.api.toss.client import TossApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "TOSS_APP_KEY", "inst")
+    monkeypatch.setattr(settings_instance, "TOSS_BASE_URL", "https://toss.example")
+
+    assert TossApiClient().app_key == "inst"
+    assert TossApiClient().base_url == "https://toss.example"
+    assert TossApiClient(app_key="arg").app_key == "arg"
+    assert TossApiClient(base_url="https://arg.example").base_url == "https://arg.example"

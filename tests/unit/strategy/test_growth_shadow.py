@@ -24,7 +24,7 @@ def _realized(n_days, nets_by_day):
 def test_realize_decision_returns_net_matches_cost_model():
     import numpy as np
     import pytest
-    from src.execution.cost_model import statutory_bp_asof
+    from src.execution.cost_model import BROKERAGE_FEE_BP, statutory_bp_asof
     from src.strategy.growth_shadow import STATUS_REALIZED, realize_decision_returns
 
     # Given: 3 picks decided 2026-09-01, next trading day 2026-09-02 opens known
@@ -41,8 +41,8 @@ def test_realize_decision_returns_net_matches_cost_model():
     assert out.loc["000003", "rank"] == 3
     assert (out["status"] == STATUS_REALIZED).all()
     assert out.loc["000001", "gross_return"] == pytest.approx(0.01)
-    assert out.loc["000001", "net_return"] == pytest.approx(0.01 - (stat + 2.0 * 5.0) / 1e4)
-    assert out.loc["000002", "net_return"] == pytest.approx(-0.01 - (stat + 10.0) / 1e4)
+    assert out.loc["000001", "net_return"] == pytest.approx(0.01 - (stat + 2.0 * 5.0 + BROKERAGE_FEE_BP) / 1e4)
+    assert out.loc["000002", "net_return"] == pytest.approx(-0.01 - (stat + 10.0 + BROKERAGE_FEE_BP) / 1e4)
 
 
 def test_realize_decision_returns_marks_pending_when_next_day_not_ingested():

@@ -29,6 +29,7 @@ from src.ml.topk_ranker_research import (
     train_production_bundle,
 )
 from src.ml.universe_research import DEFAULT_RESEARCH_SCREENS, run_universe_screen_grid
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     """Parse retrain arguments and dispatch to the ranker research pipeline."""
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
