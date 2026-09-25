@@ -1,10 +1,16 @@
 [Unit]
 Description=KCA KIS token warmup (host data slots, read-only)
 OnFailure=kca-alert@%n.service
+StartLimitIntervalSec=2h
+StartLimitBurst=4
 
 [Service]
 Type=oneshot
+# RestartMode=direct는 중간 재시도에서 OnFailure를 억제하고 최종 실패에서만 알림한다
+Restart=on-failure
+RestartMode=direct
+RestartSec=5min
 WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
-ExecStart=/usr/bin/docker run --rm --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/root/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.tools.kis_token_warmup
+ExecStart=/usr/bin/docker run --rm --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.tools.kis_token_warmup

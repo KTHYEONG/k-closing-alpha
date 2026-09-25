@@ -584,3 +584,89 @@ def test_ls_ensure_token_raises_when_issuance_returns_no_token() -> None:
 
     with pytest.raises(RuntimeError, match='LS token issuance failed'):
         asyncio.run(client.ensure_token(_Session()))
+
+
+def test_ls_rate_limit_retries_back_off_exponentially() -> None:
+    import asyncio
+
+    from src.api.ls.client import LsApiClient
+
+    client = LsApiClient(app_key="k", app_secret="s")
+    client.token = "t"
+    client._min_interval = 0.0
+    calls = {"n": 0}
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def _fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    class _Resp:
+        headers: dict = {}
+
+        def __init__(self, body: dict):
+            self._b = body
+
+        async def json(self):
+            return self._b
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session:
+        def post(self, *a, **k):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                return _Resp({"rsp_cd": "IGW00201", "rsp_msg": "rate limited"})
+            return _Resp({"rsp_cd": "00000", "t8412OutBlock": {}, "t8412OutBlock1": []})
+
+    async def _run():
+        import unittest.mock as mock
+
+        with mock.patch("asyncio.sleep", _fake_sleep):
+            return await client._post_tr(_Session(), "t8412", "005930", {})
+
+    data, _ = asyncio.run(_run())
+    assert data["rsp_cd"] == "00000"
+    assert sleeps == [1.2, 2.4, 4.8]
+
+
+def test_ls_exhausted_retries_logged_distinctly(caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.api.ls.client import LsApiClient
+
+    client = LsApiClient(app_key="k", app_secret="s")
+    client.token = "t"
+    client._min_interval = 0.0
+
+    class _Resp:
+        headers: dict = {}
+
+        async def json(self):
+            return {"rsp_cd": "IGW00201", "rsp_msg": "rate limited"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session:
+        def post(self, *a, **k):
+            return _Resp()
+
+    async def _run():
+        import unittest.mock as mock
+
+        with mock.patch("asyncio.sleep", return_value=asyncio.sleep(0)):
+            return await client._post_tr(_Session(), "t8412", "005930", {})
+
+    with caplog.at_level(logging.WARNING, logger="src.api.ls.client"):
+        data, _ = asyncio.run(_run())
+    assert data["rsp_cd"] == "IGW00201"
+    assert any("RATE_LIMITED" in r.getMessage() and "attempts=5" in r.getMessage() for r in caplog.records)

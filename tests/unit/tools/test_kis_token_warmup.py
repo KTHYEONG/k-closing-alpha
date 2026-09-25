@@ -92,6 +92,7 @@ def test_warmup_main_runs_host_warmup_with_project_env_and_bounded_session(monke
     monkeypatch.setattr(settings, "BASE_DIR", tmp_path)
     monkeypatch.setattr(kis_token_warmup, "load_kis_env", _fake_load)
     monkeypatch.setattr(kis_token_warmup, "warmup_host_tokens", _fake_warmup)
+    monkeypatch.setattr(kis_token_warmup, "should_skip_warmup", lambda _today: False)
 
     # When
     kis_token_warmup.main()
@@ -109,6 +110,7 @@ def test_warmup_module_entrypoint_invokes_main(monkeypatch, tmp_path) -> None:
 
     from src import settings
     from src.api.kis import key_pool
+    from src.data.session_calendar import SessionDay, SessionKind
 
     seen: dict[str, object] = {}
 
@@ -124,6 +126,15 @@ def test_warmup_module_entrypoint_invokes_main(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(settings, "BASE_DIR", tmp_path)
     monkeypatch.setattr(key_pool, "load_kis_env", _fake_load)
     monkeypatch.setattr(key_pool, "resolve_host_issued_credentials", _fake_resolve)
+
+    # And: 모듈 재실행 네임스페이스가 참조하는 실제 달력 해석을 표준일로 고정
+    import src.data.session_calendar as session_calendar_mod
+
+    monkeypatch.setattr(
+        session_calendar_mod,
+        "resolve_session_day",
+        lambda day, **_k: SessionDay(trading_date=day, kind=SessionKind.STANDARD, clock=None, provenance="test"),
+    )
 
     # When
     with warnings.catch_warnings():
@@ -174,6 +185,181 @@ def test_warmup_host_tokens_fails_when_cache_not_refreshed(monkeypatch, tmp_path
             return _Ctx()
 
     # When/Then: 캐시 반영 확인 실패는 침묵하지 않고 실패로 드러난다
-    with pytest.raises(RuntimeError, match="token cache not refreshed"):
+    with pytest.raises(RuntimeError, match="failed slots"):
         asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today="2026-09-16"))
+
+
+def _warmup_env_three_slots() -> dict[str, str]:
+    return {
+        "KIS_DATA_SLOTS": "1,2", "KIS_HOST_DATA_SLOTS": "1,2",
+        "KIS_DATA_1_APP_KEY": "warm-key-1", "KIS_DATA_1_APP_SECRET": "warm-sec-1",
+        "KIS_DATA_2_APP_KEY": "warm-key-2", "KIS_DATA_2_APP_SECRET": "warm-sec-2",
+        "KIS_APP_KEY": "warm-primary", "KIS_APP_SECRET": "warm-psec", "KIS_HTS_ID": "warm-hts",
+    }
+
+
+def _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, *, day, fail_keys=(), stale_keys=()):
+    """Fake KisApiClient honoring the same-day guard so re-runs skip issued slots."""
+    import json
+    from pathlib import Path
+
+    from src import settings
+
+    monkeypatch.setattr(settings, "KIS_TOKEN_CACHE_DIR", tmp_path)
+    calls: list[str] = []
+
+    def _factory(*, app_key, app_secret, hts_id, token_file):
+        class _FakeClient:
+            async def issue_daily_token(self, session):
+                from src.api.kis.key_pool import read_token_issued_date
+
+                path = Path(token_file)
+                if read_token_issued_date(path) == day:
+                    return False
+                calls.append(app_key)
+                if app_key in fail_keys:
+                    raise RuntimeError("토큰 발급 실패: {'msg_cd': 'EGW00103', 'msg1': 'invalid'}")
+                stamped = day if app_key not in stale_keys else "2026-09-01"
+                path.parent.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 - test fake cache write
+                path.write_text(json.dumps({  # noqa: ASYNC240 - test fake cache write
+                    "access_token": "tok", "expired_at": f"{stamped}T23:59:59+09:00",
+                    "app_key": app_key, "issued_at": f"{stamped}T07:05:00+09:00",
+                }), encoding="utf-8")
+                return True
+
+        return _FakeClient()
+
+    monkeypatch.setattr(kis_token_warmup, "KisApiClient", _factory)
+    return calls
+
+
+def test_warmup_host_tokens_isolates_slot_failure(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.api.kis.key_pool import kis_key_id, read_token_issued_date, token_cache_path
+    from src.tools import kis_token_warmup
+
+    day = "2026-09-16"
+    env = _warmup_env_three_slots()
+    _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day, fail_keys={"warm-key-2"})
+
+    class _Session:
+        pass
+
+    with pytest.raises(RuntimeError, match="DATA_2") as exc:
+        asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today=day))
+
+    assert "warm-key-2" not in str(exc.value)
+    assert kis_key_id("warm-key-2") in str(exc.value)
+    assert read_token_issued_date(token_cache_path("warm-key-1", tmp_path)) == day
+    assert read_token_issued_date(token_cache_path("warm-primary", tmp_path)) == day
+
+
+def test_warmup_host_tokens_rerun_issues_only_missing_slots(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.tools import kis_token_warmup
+
+    day = "2026-09-16"
+    env = _warmup_env_three_slots()
+    calls = _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day, fail_keys={"warm-key-2"})
+
+    class _Session:
+        pass
+
+    with pytest.raises(RuntimeError, match="DATA_2"):
+        asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today=day))
+    assert sorted(calls) == ["warm-key-1", "warm-key-2", "warm-primary"]
+
+    calls.clear()
+    rerun_calls = _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day)
+    result = asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today=day))
+
+    assert result == {"DATA_1": False, "DATA_2": True, "PRIMARY": False}
+    assert rerun_calls == ["warm-key-2"]
+
+
+def test_warmup_host_tokens_stale_cache_joins_failure_list(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.tools import kis_token_warmup
+
+    day = "2026-09-16"
+    env = _warmup_env_three_slots()
+    calls = _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day, stale_keys={"warm-key-1"})
+
+    class _Session:
+        pass
+
+    with pytest.raises(RuntimeError, match="DATA_1"):
+        asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today=day))
+
+    assert sorted(calls) == ["warm-key-1", "warm-key-2", "warm-primary"]
+
+
+def test_warmup_failure_hides_credentials(monkeypatch, tmp_path, caplog) -> None:
+    import asyncio
+    import logging
+
+    import pytest
+
+    from src.api.kis.key_pool import kis_key_id
+    from src.tools import kis_token_warmup
+
+    day = "2026-09-16"
+    env = _warmup_env_three_slots()
+    _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day, fail_keys={"warm-key-2"})
+
+    class _Session:
+        pass
+
+    with caplog.at_level(logging.ERROR, logger=kis_token_warmup.logger.name), pytest.raises(RuntimeError) as exc:
+        asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today=day))
+
+    message = str(exc.value)
+    assert kis_key_id("warm-key-2") in message
+    assert "warm-key-2" not in message
+    assert "warm-sec-2" not in message
+    assert any(
+        kis_key_id("warm-key-2") in rec.message and "EGW00103" in rec.message for rec in caplog.records
+    )
+    assert not any("warm-sec-2" in rec.message for rec in caplog.records)
+
+
+def test_warmup_main_skips_on_verified_closure(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    from src import settings
+    from src.tools import kis_token_warmup
+
+    monkeypatch.setattr(settings, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(kis_token_warmup, "should_skip_warmup", lambda _today: True)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("no client on closed day")
+
+    monkeypatch.setattr(kis_token_warmup, "KisApiClient", _boom)
+
+    with caplog.at_level(logging.INFO, logger=kis_token_warmup.logger.name):
+        assert kis_token_warmup.main() is None
+
+    assert any("status=SKIP" in rec.message for rec in caplog.records)
+
+
+def test_should_skip_warmup_only_on_closed() -> None:
+    from datetime import date
+
+    from src.data.session_calendar import SessionDay, SessionKind
+    from src.tools.kis_token_warmup import should_skip_warmup
+
+    day = date(2026, 9, 16)
+    assert should_skip_warmup(day, session_day_fn=lambda _d: SessionDay(trading_date=day, kind=SessionKind.CLOSED, clock=None, provenance="test")) is True
+    assert should_skip_warmup(day, session_day_fn=lambda _d: SessionDay(trading_date=day, kind=SessionKind.UNKNOWN, clock=None, provenance="test")) is False
+    assert should_skip_warmup(day, session_day_fn=lambda _d: SessionDay(trading_date=day, kind=SessionKind.SHIFTED, clock=None, provenance="test")) is False
 

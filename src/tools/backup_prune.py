@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 BACKUP_REMOTE_ROOT: str = "gdrive:quant-lake/live/k-closing-alpha/_deleted"
 BACKUP_SUBTREES: tuple[str, ...] = ("data", "artifacts")
 BACKUP_RETENTION_DAYS: int = 30
+BACKUP_MAX_PURGE_DIRS_PER_SUBTREE: int = 7
 LOCAL_INTRADAY_BACKUP_RETENTION_DAYS: int = 3
 RCLONE_TIMEOUT_SEC: int = 600
 # rclone 문서화된 종료코드: 3 = directory not found (아직 한 번도 옮겨진 파일이 없는 하위 트리)
@@ -68,6 +69,8 @@ def prune_backups(
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     remote_root: str = BACKUP_REMOTE_ROOT,
     retention_days: int = BACKUP_RETENTION_DAYS,
+    dry_run: bool = False,
+    max_purge_per_subtree: int = BACKUP_MAX_PURGE_DIRS_PER_SUBTREE,
 ) -> list[str]:
     """Purge expired dated snapshot directories under every backup subtree.
 
@@ -76,16 +79,19 @@ def prune_backups(
         run_fn: subprocess.run-compatible runner (tests substitute a fake).
         remote_root: rclone path of the _deleted root.
         retention_days: Days a snapshot directory is kept.
+        dry_run: List targets without purging.
+        max_purge_per_subtree: Per-subtree purge cap.
 
     Returns:
-        Remote paths that were purged.
+        Remote paths that were (or, for dry_run, would be) purged.
 
     Raises:
+        RuntimeError: One subtree's expired set exceeds the purge cap.
         subprocess.CalledProcessError: Listing failed for a reason other than a
             missing subtree, or a purge failed.
     """
     rclone = _resolve_rclone_bin()
-    purged: list[str] = []
+    expired_by_subtree: dict[str, list[str]] = {}
     for subtree in BACKUP_SUBTREES:
         base = f"{remote_root}/{subtree}"
         listing = run_fn(
@@ -96,10 +102,18 @@ def prune_backups(
         if listing.returncode != 0:
             raise subprocess.CalledProcessError(listing.returncode, listing.args, listing.stdout, listing.stderr)
         names = [line.strip().rstrip("/") for line in listing.stdout.splitlines() if line.strip()]
-        for name in expired_snapshot_dirs(names, today, retention_days):
-            target = f"{base}/{name}"
-            run_fn([rclone, "purge", target], capture_output=True, text=True, timeout=RCLONE_TIMEOUT_SEC, check=True)
-            purged.append(target)
+        expired_by_subtree[subtree] = expired_snapshot_dirs(names, today, retention_days)
+    for subtree, expired in expired_by_subtree.items():
+        # 정상 운영에서는 평일마다 하루치(연휴 직후 최대 수일치)만 만료되므로 상한 초과는 시계/파싱 이상 신호다.
+        if len(expired) > max_purge_per_subtree:
+            raise RuntimeError(f"backup prune cap exceeded in {subtree}: {len(expired)} expired dirs")
+    targets = [f"{remote_root}/{subtree}/{name}" for subtree, expired in expired_by_subtree.items() for name in expired]
+    if dry_run:
+        return sorted(targets)
+    purged: list[str] = []
+    for target in sorted(targets):
+        run_fn([rclone, "purge", target], capture_output=True, text=True, timeout=RCLONE_TIMEOUT_SEC, check=True)
+        purged.append(target)
     return purged
 
 
@@ -144,9 +158,10 @@ def prune_local_intraday_backups(
 
 def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry; logic covered via prune_backups scenarios
     parser = argparse.ArgumentParser(description="Purge _deleted backup snapshots older than the retention window")
-    parser.parse_args(argv)
+    parser.add_argument("--dry-run", action="store_true", help="list purge targets without deleting")
+    args = parser.parse_args(argv)
     today = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None).normalize()
-    purged = prune_backups(today=today)
+    purged = prune_backups(today=today, dry_run=True) if args.dry_run else prune_backups(today=today)
     local_purged = prune_local_intraday_backups(today=today)
     from src.tools.capture_offsite import prune_local_sealed_capture
 

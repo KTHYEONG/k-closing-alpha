@@ -20,6 +20,21 @@ import pandas as pd
 from src import settings
 from src.api.kis.key_pool import load_kis_env, read_token_issued_date, resolve_host_issued_credentials, token_cache_path
 from src.config.collection import CollectionSettings
+from src.config.market_session import (
+    DECISION_WINDOW_END_HHMMSS,
+    DECISION_WINDOW_START_HHMMSS,
+    INTRADAY_SESSION_KRX_AFTERMARKET,
+    INTRADAY_SESSION_NXT_AFTERMARKET,
+    INTRADAY_SESSION_NXT_PREMARKET,
+    INTRADAY_SESSION_REGULAR,
+    KRX_AFTERMARKET_HOUR_CEIL,
+    KRX_AFTERMARKET_HOUR_FLOOR,
+    KRX_AFTERMARKET_START_DATE,
+    NXT_AFTERMARKET_HOUR_CEIL,
+    NXT_AFTERMARKET_HOUR_FLOOR,
+    NXT_PREMARKET_HOUR_CEIL,
+    NXT_PREMARKET_HOUR_FLOOR,
+)
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.archive_intraday import resolve_previous_archive_date
 from src.daily.auction_capture import _close_rounds, _program_rounds
@@ -34,10 +49,11 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.intraday_store import _capture_root, intraday_partition_path, tick_partition_path
+from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day_sync
 from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
-from src.tools.alerts import dispatch_digest
+from src.tools.alerts import dispatch_digest, drain_alert_outbox
 from src.tools.offsite_backup import REPORT_RELPATH, backup_staleness_issues
 from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes
 
@@ -112,6 +128,7 @@ AUDIT_STEPS: tuple[str, ...] = (
     "paper_entry",
     "paper_exit",
     "minute_bars",
+    "intraday_complete",
     "price_history_fresh",
 )
 SYSTEMCTL_TIMEOUT_SEC: int = 30
@@ -487,6 +504,188 @@ def _collection_capture_root(profile: CollectionSettings) -> Path:
     return Path(settings.HISTORY_DIR) / "capture"
 
 
+def _intraday_issue(session: str, count: int, reason: str) -> str:
+    return f"intraday:{session}:{count}:{reason}"
+
+
+def _hhmm_to_minutes(hhmmss: str) -> int:
+    return int(hhmmss[0:2]) * 60 + int(hhmmss[2:4])
+
+
+def expected_regular_stamps(clock: SessionClock) -> tuple[int, ...]:
+    """Expected end-labeled regular-session 1m stamps (HHMMSS ints) for a session clock.
+
+    Continuous trading produces one bar per minute ending at open+1m through
+    the start of the closing call; the closing auction prints once at close.
+    The closing-call length is DECISION_WINDOW_END - DECISION_WINDOW_START.
+    For the standard clock this is 09:01..15:20 plus 15:30 (381 stamps).
+    """
+    call_minutes = _hhmm_to_minutes(DECISION_WINDOW_END_HHMMSS) - _hhmm_to_minutes(DECISION_WINDOW_START_HHMMSS)
+    tick = clock.open_at + timedelta(minutes=1)
+    last_continuous = clock.close_at - timedelta(minutes=call_minutes)
+    stamps: list[int] = []
+    while tick <= last_continuous:
+        stamps.append(tick.hour * 10000 + tick.minute * 100 + tick.second)
+        tick += timedelta(minutes=1)
+    stamps.append(clock.close_at.hour * 10000 + clock.close_at.minute * 100 + clock.close_at.second)
+    return tuple(stamps)
+
+
+def expected_krx_aftermarket_stamps() -> tuple[int, ...]:
+    """Expected KRX aftermarket 1m stamps: KRX_AFTERMARKET_HOUR_FLOOR..CEIL inclusive (241)."""
+    start = _hhmm_to_minutes(KRX_AFTERMARKET_HOUR_FLOOR)
+    end = _hhmm_to_minutes(KRX_AFTERMARKET_HOUR_CEIL)
+    return tuple((minute // 60) * 10000 + (minute % 60) * 100 for minute in range(start, end + 1))
+
+
+def _read_stored_partition(snapshot_date: str, session: str) -> pd.DataFrame | None:
+    path = intraday_partition_path(1, snapshot_date, session)
+    if not path.exists():
+        return None
+    return pd.read_parquet(path, columns=["symbol", "ts_hms"])
+
+
+def _stamps_by_symbol(frame: pd.DataFrame) -> dict[str, set[int]]:
+    symbols = frame["symbol"].astype(str).tolist()
+    raw_stamps = frame["ts_hms"].tolist()
+    by_symbol: dict[str, set[int]] = {}
+    for index in range(len(frame)):
+        by_symbol.setdefault(str(symbols[index]), set()).add(int(raw_stamps[index]))
+    return by_symbol
+
+
+def _audit_dense_partition(
+    session: str,
+    frame: pd.DataFrame | None,
+    expected_stamps: tuple[int, ...],
+    expected_symbols: tuple[str, ...],
+) -> list[str]:
+    if frame is None:
+        return [_intraday_issue(session, 1, "missing_partition")]
+    expected_set = set(expected_stamps)
+    by_symbol = _stamps_by_symbol(frame)
+    present = set(by_symbol)
+    issues: list[str] = []
+    missing_symbols = sorted(symbol for symbol in expected_symbols if symbol not in present)
+    if missing_symbols:
+        issues.append(_intraday_issue(session, len(missing_symbols), "missing_symbols"))
+    missing_bar_symbols = sorted(symbol for symbol in present if not expected_set.issubset(by_symbol[symbol]))
+    first_missing: list[int] = []
+    if missing_bar_symbols:
+        issues.append(_intraday_issue(session, len(missing_bar_symbols), "missing_bars"))
+        union_missing: set[int] = set()
+        for symbol in missing_bar_symbols:
+            union_missing |= expected_set - by_symbol[symbol]
+        first_missing = sorted(union_missing)[:5]
+    unexpected_symbols = sorted(symbol for symbol in present if by_symbol[symbol] - expected_set)
+    if unexpected_symbols:
+        issues.append(_intraday_issue(session, len(unexpected_symbols), "unexpected_bars"))
+    if issues:
+        implicated = set(missing_symbols) | set(missing_bar_symbols) | set(unexpected_symbols)
+        logger.debug(
+            "[DATA] stage=daily_audit step=intraday_complete session=%s status=FAIL reasons=%s symbols=%d first_missing=%s",
+            session,
+            ",".join(issue.split(":")[-1] for issue in issues),
+            len(implicated),
+            first_missing,
+        )
+    return issues
+
+
+def _audit_sparse_partition(
+    session: str,
+    frame: pd.DataFrame | None,
+    floor_hhmmss: str,
+    ceil_hhmmss: str,
+) -> list[str]:
+    if frame is None:
+        return [_intraday_issue(session, 1, "missing_partition")]
+    floor = int(floor_hhmmss)
+    ceil = int(ceil_hhmmss)
+    by_symbol = _stamps_by_symbol(frame)
+    bad_symbols = sorted(symbol for symbol, stamps in by_symbol.items() if any(stamp < floor or stamp >= ceil for stamp in stamps))
+    if not bad_symbols:
+        return []
+    window_breaks = sorted({stamp for symbol in bad_symbols for stamp in by_symbol[symbol] if stamp < floor or stamp >= ceil})[:5]
+    logger.debug(
+        "[DATA] stage=daily_audit step=intraday_complete session=%s status=FAIL reasons=out_of_window symbols=%d first_missing=%s",
+        session,
+        len(bad_symbols),
+        window_breaks,
+    )
+    return [_intraday_issue(session, len(bad_symbols), "out_of_window")]
+
+
+def audit_intraday_partitions(
+    trading_date: date,
+    *,
+    clock: SessionClock,
+    session_kind: SessionKind,
+    cohort_symbols: tuple[str, ...],
+    read_partition: Callable[[str], pd.DataFrame | None] | None = None,
+) -> tuple[str, ...]:
+    """Audit stored 1m partitions for presence, cohort coverage and grid completeness.
+
+    Manifests prove what was attempted; this audit proves what was stored.
+    Dense sessions (regular, krx_aftermarket) must hold every expected stamp
+    for every expected symbol; sparse NXT sessions must exist and stay inside
+    their session window.
+
+    Args:
+        trading_date: Audited KST date.
+        clock: Verified session clock for the date.
+        session_kind: Resolved session status; aftermarket grid checks are
+            skipped (with an explicit issue) on non-STANDARD days.
+        cohort_symbols: Declared eligible symbols of the day.
+        read_partition: session -> frame with symbol and ts_hms, None when the
+            partition file is absent (injectable for tests). None reads parquet
+            with column pruning (symbol, ts_hms).
+
+    Returns:
+        Issue strings `intraday:<session>:<count>:<reason>` with reasons
+        missing_partition, missing_symbols, missing_bars, unexpected_bars,
+        out_of_window, aftermarket_unverified; empty when complete.
+    """
+    day_str = trading_date.isoformat()
+    sessions = [INTRADAY_SESSION_REGULAR, INTRADAY_SESSION_NXT_PREMARKET, INTRADAY_SESSION_NXT_AFTERMARKET]
+    if day_str >= KRX_AFTERMARKET_START_DATE:
+        sessions.append(INTRADAY_SESSION_KRX_AFTERMARKET)
+    reader = read_partition if read_partition is not None else (lambda session: _read_stored_partition(day_str, session))
+    frames = {session: reader(session) for session in sessions}
+    issues: list[str] = []
+    issues.extend(
+        _audit_dense_partition(
+            INTRADAY_SESSION_REGULAR, frames[INTRADAY_SESSION_REGULAR], expected_regular_stamps(clock), tuple(cohort_symbols)
+        )
+    )
+    if session_kind is not SessionKind.STANDARD:
+        issues.append(_intraday_issue("aftermarket", 0, "aftermarket_unverified"))
+        return tuple(issues)
+    issues.extend(
+        _audit_sparse_partition(
+            INTRADAY_SESSION_NXT_PREMARKET, frames[INTRADAY_SESSION_NXT_PREMARKET], NXT_PREMARKET_HOUR_FLOOR, NXT_PREMARKET_HOUR_CEIL
+        )
+    )
+    issues.extend(
+        _audit_sparse_partition(
+            INTRADAY_SESSION_NXT_AFTERMARKET, frames[INTRADAY_SESSION_NXT_AFTERMARKET], NXT_AFTERMARKET_HOUR_FLOOR, NXT_AFTERMARKET_HOUR_CEIL
+        )
+    )
+    if INTRADAY_SESSION_KRX_AFTERMARKET in frames:
+        regular_frame = frames[INTRADAY_SESSION_REGULAR]
+        regular_symbols = (
+            tuple(sorted({str(value) for value in regular_frame["symbol"].astype(str).tolist()}))
+            if regular_frame is not None
+            else ()
+        )
+        issues.extend(
+            _audit_dense_partition(
+                INTRADAY_SESSION_KRX_AFTERMARKET, frames[INTRADAY_SESSION_KRX_AFTERMARKET], expected_krx_aftermarket_stamps(), regular_symbols
+            )
+        )
+    return tuple(issues)
+
+
 def build_digest(
     snapshot_date: str,
     day_kind: str,
@@ -496,6 +695,8 @@ def build_digest(
     *,
     collection_issues: Sequence[str] = (),
     backup_issues: Sequence[str] = (),
+    session_kind: str = "UNKNOWN",
+    undelivered_alerts: int = 0,
 ) -> tuple[str, str]:
     """일일 요약의 (제목, 본문)을 만든다.
 
@@ -506,6 +707,8 @@ def build_digest(
         failed_units: list_failed_kca_units 결과.
         stale_kis_tokens: list_stale_kis_tokens 결과.
         collection_issues: Independently assessed raw-data and schedule gaps.
+        session_kind: Resolved SessionKind value for the date.
+        undelivered_alerts: Outbox에 적체된 미전송 알림 수. 0보다 크면 경고.
 
     Returns:
         (제목, 본문) 튜플.
@@ -516,7 +719,7 @@ def build_digest(
     """
     if day_kind not in (DAY_WEEKEND, DAY_HOLIDAY, DAY_TRADING, DAY_UNKNOWN):
         raise ValueError(f"unsupported day_kind={day_kind!r}")
-    lines = [f"date={snapshot_date}", f"day={day_kind}"]
+    lines = [f"date={snapshot_date}", f"day={day_kind}", f"session={session_kind}"]
     missing: list[str] = []
     if day_kind != DAY_HOLIDAY:
         if result is None:
@@ -527,6 +730,7 @@ def build_digest(
     lines.append(f"stale_kis_tokens={','.join(stale_kis_tokens) if stale_kis_tokens else 'none'}")
     lines.append(f"collection_issues={','.join(collection_issues) if collection_issues else 'none'}")
     lines.append(f"backup_issues={','.join(backup_issues) if backup_issues else 'none'}")
+    lines.append(f"undelivered_alerts={undelivered_alerts}")
 
     if day_kind == DAY_HOLIDAY:
         label = "휴장일 SKIP"
@@ -543,7 +747,7 @@ def build_digest(
         iss for iss in collection_issues
         if not any(iss.endswith(suffix) for suffix in ignored_reasons)
     ]
-    is_warning = bool(missing or failed_units or stale_kis_tokens or critical_collection or backup_issues)
+    is_warning = bool(missing or failed_units or stale_kis_tokens or critical_collection or backup_issues or undelivered_alerts)
 
     if not is_warning:
         nav_str, entry_str = _extract_paper_summary(snapshot_date)
@@ -582,6 +786,9 @@ def build_digest(
     if backup_issues:
         problems.append(f"백업이상 {','.join(backup_issues)}")
         summary_lines.append(f"• 백업 이상: {', '.join(backup_issues)}")
+    if undelivered_alerts:
+        problems.append(f"미전송알림 {undelivered_alerts}건")
+        summary_lines.append(f"• 미전송 알림: {undelivered_alerts}건 (outbox 적체)")
     summary_lines.append("• 조치 안내: or-vps 서버 상태 점검 요망")
     body = "\n".join(summary_lines) + "\n\n[상세 내역]\n" + "\n".join(lines)
     return f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(problems)}", body
@@ -646,22 +853,44 @@ def run_daily_audit(
     result = None if day_kind == DAY_HOLIDAY else audit_daily_completeness(snapshot_date)
     trading_date = date.fromisoformat(snapshot_date)
     audit_at = datetime.now(SEOUL)
+    session_day = resolve_session_day(trading_date)
     try:
         profile = CollectionSettings()
-        session_clock = profile.COLLECTION_SESSION_OVERRIDES.get(
-            snapshot_date, SessionClock.standard(trading_date)
-        )
+        session_clock = session_day.clock if session_day.clock is not None else SessionClock.standard(trading_date)
         store = CaptureStore(_collection_capture_root(profile))
         collection_issues = audit_collection_manifests(
             trading_date, store=store, profile=profile, session_clock=session_clock, audit_at=audit_at
         )
+        try:
+            cohort_symbols = store.read_cohort(trading_date.isoformat(), available_by=audit_at).eligible_symbols or ()
+        except FileNotFoundError:
+            intraday_issues: tuple[str, ...] = (_intraday_issue("regular", 0, "missing_cohort"),)
+        else:
+            intraday_issues = audit_intraday_partitions(
+                trading_date,
+                clock=session_clock,
+                session_kind=session_day.kind,
+                cohort_symbols=tuple(cohort_symbols),
+            )
     except (OSError, ValueError) as exc:
         logger.warning("[DATA] stage=daily_audit collection_audit=UNAVAILABLE reason=%s", type(exc).__name__)
         collection_issues = (_collection_issue("audit", 1, "unavailable"),)
+        intraday_issues = ()
+    if result is not None:
+        result["intraday_complete"] = not intraday_issues
+    if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
+        collection_issues = (*collection_issues, _collection_issue("session", 0, session_day.kind.value.lower()))
+    try:
+        _, undelivered_alerts = drain_alert_outbox(max_items=settings.ALERT_OUTBOX_MAX_DRAIN)
+    except Exception as exc:
+        logger.warning("[DATA] stage=daily_audit alert_drain=FAILED reason=%s", type(exc).__name__)
+        undelivered_alerts = 0
     subject, body = build_digest(
         snapshot_date, day_kind, result, failed_units_fn(), stale_tokens_fn(snapshot_date),
         collection_issues=collection_issues,
         backup_issues=backup_issues_fn(audit_at),
+        session_kind=session_day.kind.value,
+        undelivered_alerts=undelivered_alerts,
     )
     has_warning = "경고:" in subject or "🚨" in subject
     if has_warning:

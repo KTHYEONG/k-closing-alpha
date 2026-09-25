@@ -106,6 +106,20 @@ KRW_PER_100M: float = 1e8
 _ADJUSTED_PRICE_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "prev_close")
 _INVESTOR_PATH = "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
 _PROGRAM_PATH = "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
+_TOSS_PROGRAM_AMOUNT_KEYS: tuple[str, ...] = ("netBuyAmount", "netBuyAmt", "netBuyValue", "netBuyTradeAmount")
+
+
+def _toss_leg_amount(leg: object) -> float | None:
+    if not isinstance(leg, dict):
+        return None
+    for key in _TOSS_PROGRAM_AMOUNT_KEYS:
+        value = leg.get(key)
+        if value is not None:
+            try:
+                return float(str(value).replace(",", "").strip())
+            except (ValueError, TypeError):
+                return None
+    return None
 
 
 class VendorResponseError(RuntimeError):
@@ -577,28 +591,31 @@ def parse_kis_program_rows(body: dict) -> pd.DataFrame:
 
 
 def parse_toss_program_rows(body: dict) -> pd.DataFrame:
-    """Parse Toss `/stocks/{symbol}/program-trades` into daily program net buy (KRW).
-
-    Toss splits program flow into arbitrage/non-arbitrage legs; program_netbuy is the
-    sum of both legs' netBuyVolume, matching KIS's whole-market `whol_smtn_ntby_tr_pbmn`
-    semantics (parse_kis_program_rows). Toss numeric fields are clean decimal strings
-    with no comma or sign-prefix quirk, so a direct float() cast is safe.
+    """Parse Toss program trades into daily program net buy in the KIS unit (KRW 1e6).
 
     Raises:
-        VendorResponseError: When the response is a Toss error envelope.
+        VendorResponseError: Toss error envelope, or the payload lacks the
+            amount field proven by the probe to match KIS whol_smtn_ntby_tr_pbmn.
     """
     if "error" in body:
         err = body["error"]
         raise VendorResponseError(f"Toss program-trades code={err.get('code')} msg={err.get('message', '')}")
     records = (body.get("result") or {}).get("records") or []
-    rows = [
-        {
-            "date": pd.Timestamp(r["date"]),
-            "program_netbuy": float(r["arbitrage"]["netBuyVolume"]) + float(r["nonArbitrage"]["netBuyVolume"]),
-        }
-        for r in records
-        if r.get("date")
-    ]
+    if not records:
+        return pd.DataFrame(columns=["date", "program_netbuy"])
+    rows = []
+    for r in records:
+        if not r.get("date"):
+            continue
+        arb = r.get("arbitrage") or {}
+        non_arb = r.get("nonArbitrage") or {}
+        arb_amount = _toss_leg_amount(arb)
+        non_arb_amount = _toss_leg_amount(non_arb)
+        if arb_amount is None or non_arb_amount is None:
+            raise VendorResponseError(
+                "Toss program-trades lacks the net-buy amount field matching KIS whol_smtn_ntby_tr_pbmn"
+            )
+        rows.append({"date": pd.Timestamp(r["date"]), "program_netbuy": (arb_amount + non_arb_amount) / 1e6})
     return pd.DataFrame(rows, columns=["date", "program_netbuy"]).drop_duplicates("date")
 
 
@@ -692,6 +709,10 @@ async def fetch_all_flows(
 
 def assemble_new_rows(krx_rows: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFrame:
     """Join flows onto the KRX tail rows and derive the change columns.
+
+    Zero-volume convention (H4 probe): a missing flow stays NaN, including on
+    zero-volume rows; flows are never zero-filled. Historical rows are not
+    rewritten by this join.
 
     Returns:
         Rows with KRX_ROW_COLUMNS, FLOW_COLUMNS, chg_ratio, daily_change_pct

@@ -96,7 +96,9 @@ jobs:
           ssh $SSH_OPTS "$REMOTE_USER@$HOST" bash -s <<EOF
           set -e
           echo '$GHCR_PAT' | docker login ghcr.io -u '$GHCR_USER' --password-stdin
-          docker pull ghcr.io/kthyeong/k-closing-alpha:latest
+          docker pull ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA
+          docker run --rm -v ~/k-closing-alpha/artifacts:/app/artifacts:ro ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA uv run python -m src.tools.deploy_preflight
+          docker tag ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA ghcr.io/kthyeong/k-closing-alpha:latest
           docker image prune -f
           # 이 커밋은 위 test job이 이미 pytest 전체스위트로 검증했으므로, 호스트 체크아웃과
           # systemd 유닛(deploy/systemd)을 그대로 이 커밋에 맞춰 수렴시킨다(재테스트 없음).

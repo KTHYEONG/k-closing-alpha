@@ -1,6 +1,160 @@
 {
   "tasks": [
     {
+      "task_id": "OPS_HYGIENE",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_OPS_HYGIENE",
+      "domain": "sys",
+      "title": "운영 위생: 비루트 컨테이너·유닛 설명·LS 백오프·altdata 타이머",
+      "why": "루트 컨테이너 산출물, 실제 발화 시각과 다른 타이머 설명, LS IGW00201 충돌이 있었다",
+      "resolution": "유닛 설명 정정, LS 백오프 개선, altdata 타이머 정렬을 반영했다",
+      "impact": "운영 소음과 chown 의존이 줄어든다",
+      "caveat": "toss program_netbuy 단위 불일치는 프로브가 필요하며 LS 앱키는 krx-alpha와 공유된다"
+    },
+    {
+      "task_id": "BACKUP_RETENTION_GUARD",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_BACKUP_RETENTION_GUARD",
+      "domain": "sys",
+      "title": "백업 보존 가드: 코어 패널 스냅샷·무결성 게이트·삭제 상한·불변 세그먼트",
+      "why": "손상된 패널이 야간 백업으로 원격 정상본을 덮고 30일 뒤 영구 삭제될 수 있었다",
+      "resolution": "core_snapshot과 무결성 검증, prune 상한, 세그먼트 --immutable, 복구 런북(backup-restore.md)을 추가했다",
+      "impact": "마지막 정상본이 조용히 사라지는 경로가 차단된다",
+      "caveat": "기존 원격 세그먼트가 다르면 덮어쓰지 않고 실패한다"
+    },
+    {
+      "task_id": "ALERT_DELIVERY_DURABILITY",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_ALERT_DELIVERY_DURABILITY",
+      "domain": "sys",
+      "title": "알림 전달 내구성: 채널별 재시도와 미전송 outbox",
+      "why": "채널 실패 시 알림이 영구 유실되고 SMTP 단일 실패가 알림을 침묵시켰다",
+      "resolution": "채널별 유한 재시도와 outbox 영속화, 다음 알림·일일 감사 시 drain을 추가했다",
+      "impact": "실패한 알림이 지연 전송되고 적체 수가 다이제스트에 표시된다",
+      "caveat": "drain 실패 시 다이제스트의 미전송 수는 0으로 보고된다"
+    },
+    {
+      "task_id": "INTRADAY_COMPLETENESS_AUDIT",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_INTRADAY_COMPLETENESS_AUDIT",
+      "domain": "data",
+      "title": "분봉 완전성 감사: 파티션·코호트·기대 바 격자",
+      "why": "파티션 존재만 검사해 NXT 누락과 종목 전체의 12:50 바 결측을 놓쳤다",
+      "resolution": "세션별 기대 격자와 코호트 커버리지를 검사해 intraday_complete와 이슈를 다이제스트에 반영했다",
+      "impact": "분봉 결측이 일일 감사에서 즉시 드러난다",
+      "caveat": "NXT는 희소 격자라 NXT 상장 부분집합만 기대한다"
+    },
+    {
+      "task_id": "DEPLOY_BUNDLE_PARITY_PREFLIGHT",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_DEPLOY_BUNDLE_PARITY_PREFLIGHT",
+      "domain": "sys",
+      "title": "배포 프리플라이트: 라이브 번들과 비호환 이미지 활성화 거부",
+      "why": "라이브 스크린 변경이 구 번들과 배포되어 09-23 NO_DECISION이 15:21에야 발견됐다",
+      "resolution": "latest 태그 이동 전에 sha 이미지에서 번들 호환성을 검사하는 deploy_preflight를 추가하고 deploy.yml에 배선했다",
+      "impact": "비호환 배포는 GitHub run이 실패하고 호스트는 이전 이미지를 유지한다",
+      "caveat": "번들을 읽기 전용으로 마운트한 호스트에서만 검증된다"
+    },
+    {
+      "task_id": "KIS_TOKEN_WARMUP_RESILIENCE",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_KIS_TOKEN_WARMUP_RESILIENCE",
+      "domain": "execution",
+      "title": "KIS 토큰 워밍업 복원력: 슬롯 격리·재시도·휴장 스킵",
+      "why": "첫 슬롯 실패가 나머지 슬롯 발급을 중단시켜 krx 소비 토큰도 못 받았다",
+      "resolution": "슬롯별 실패 격리, systemd 재시도, 휴장일 스킵을 추가했다",
+      "impact": "재실행이 멱등이라 미발급 슬롯만 채워지고 휴장일 발급이 사라진다",
+      "caveat": "systemd 254 이상의 Restart 동작에 의존한다"
+    },
+    {
+      "task_id": "ARCHIVE_CATCHUP_TARGET",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_ARCHIVE_CATCHUP_TARGET",
+      "domain": "data",
+      "title": "분봉 아카이브 catch-up이 누락 세션일을 대상으로 함",
+      "why": "catch-up이 오늘 날짜를 대상으로 해 코호트 부재로 실패하고 누락일은 영영 보관되지 않았다",
+      "resolution": "대상 날짜를 직전 마감 세션으로 결정하고 CLOSED는 스킵하도록 했다",
+      "impact": "Persistent 재실행이 놓친 날을 복구한다",
+      "caveat": "과거일 틱과 NXT·KRX 시간외 소스는 데이터셋별 지원이 다르다"
+    },
+    {
+      "task_id": "SESSION_CALENDAR_WIRING",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_SESSION_CALENDAR_WIRING",
+      "domain": "data",
+      "title": "세션 캘린더 배선: 모든 스케줄 잡이 resolve_session_day 사용",
+      "why": "잡마다 서로 다른 거래일 판정 로직이 있어 단축·불명 세션에서 NO_TRADE 처리가 일관되지 않았다",
+      "resolution": "collect/predict/paper/finalize/auction/audit/altdata에 단일 리졸버를 배선했다",
+      "impact": "휴장은 스킵, 단축·UNKNOWN은 명시 결과로 처리된다",
+      "caveat": "KIS 오라클 실패 시 finalize는 calendar_unavailable로 DEGRADED"
+    },
+    {
+      "task_id": "SESSION_CALENDAR_CORE",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_SESSION_CALENDAR_CORE",
+      "domain": "data",
+      "title": "세션 캘린더 코어: 날짜별 KRX 세션 단일 리졸버",
+      "why": "세션 시각이 상수로 흩어지고 개장 전에 답할 수 있는 캘린더가 없었다",
+      "resolution": "휴장·단축 세션·검증 범위를 가진 타입드 캘린더와 순수 resolve_session_day를 추가했다",
+      "impact": "검증 범위 밖 날짜는 UNKNOWN으로 fail-closed 되며 override는 같은 리졸버에 계층화된다",
+      "caveat": "캘린더는 사람이 유지보수해야 하며 만료 시 매매가 멈춘다"
+    },
+    {
+      "task_id": "DECISION_PUBLISH_COVERAGE_GATE",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_DECISION_PUBLISH_COVERAGE_GATE",
+      "domain": "data",
+      "title": "결정 발행 커버리지 게이트: 부분 스냅샷은 COMPLETE 불가",
+      "why": "호가 커버리지 미달 스냅샷이 COMPLETE로 발행되어 predict가 소비했다",
+      "resolution": "커버리지를 먼저 평가해 COMPLETE/PARTIAL로 발행하고 read_cohort는 PARTIAL도 허용, finalize 빈 아카이브는 거래일에 DEGRADED로 분류했다",
+      "impact": "열화 입력은 NO_DECISION(NO_TRADE)으로 이어진다",
+      "caveat": "read_decision은 여전히 COMPLETE만 허용한다"
+    },
+    {
+      "task_id": "PAPER_ENTRY_LIVE_PARITY",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_PAPER_ENTRY_LIVE_PARITY",
+      "domain": "execution",
+      "title": "모의 진입 라이브 정합: 결정시점 사이징·미체결 게이트·현금 가드",
+      "why": "확정 종가로 수량을 산정해 실주문이 재현할 수 없는 룩어헤드가 있었다",
+      "resolution": "결정시점 가격 기반 사이징, 15:30 이후 결정 MISSED_AUCTION 게이트, 현금 초과 방지를 추가했다",
+      "impact": "모의 성과가 실제 MOC 주문 절차와 일치한다",
+      "caveat": "체결가가 결정가보다 높을 때 현금 가드로 수량이 줄 수 있다"
+    },
+    {
+      "task_id": "PAPER_EXECUTION_WINDOWS",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_PAPER_EXECUTION_WINDOWS",
+      "domain": "execution",
+      "title": "모의 청산·진입 실행 시간창과 catch-up 대상일",
+      "why": "Persistent=true catch-up이 임의 시각에 시가 체결하거나 누락 진입을 no_decision으로 덮었다",
+      "resolution": "청산·진입에 wall-clock 상하한과 결정일 해석을 추가했다",
+      "impact": "지연 실행이 과거 시각 체결로 기록되는 것을 막는다",
+      "caveat": "시간창 상수는 신규 설정값이며 systemd 타임아웃과 함께 조정해야 한다"
+    },
+    {
+      "task_id": "PAPER_EXIT_SESSION_ATTESTATION",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_PAPER_EXIT_SESSION_ATTESTATION",
+      "domain": "execution",
+      "title": "모의청산 세션 증명: 당일 세션 시세만 체결",
+      "why": "휴장일에 전 세션 stck_oprc로 가상 청산되어 NAV가 -5.2% 왜곡됐다",
+      "resolution": "일봉 stck_bsop_date가 결정일과 같고 시가가 inquire 시가와 일치할 때만 체결하도록 이중 검증을 추가했다",
+      "impact": "캘린더 오라클이 틀려도 휴장일 유령 체결이 생성되지 않는다",
+      "caveat": "두 TR 중 하나라도 실패하면 미체결(open=0)로 fail-closed 한다"
+    },
+    {
+      "task_id": "PAPER_LEDGER_INTEGRITY",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_PAPER_LEDGER_INTEGRITY",
+      "domain": "execution",
+      "title": "모의원장 무결성: append-only 체결·정정 이벤트·호스트 락",
+      "why": "락 없는 read-modify-write와 수기 원장 수정으로 체결이 덮어써지고 감사 흔적이 없었다",
+      "resolution": "PaperLedger에 호스트 전역 세션 락과 append-only fills, 정정 이벤트 경로(paper_ledger_correct)를 도입했다",
+      "impact": "동시 entry/exit 경합과 무흔적 수기 수정을 구조적으로 차단한다",
+      "caveat": "기존 VPS 원장의 과거 수기 삭제분은 소급 복원되지 않는다"
+    },
+    {
       "task_id": "TASK_DART_KEY_POOL_ALTDATA_POLICY",
       "date": "2026-09-24",
       "adr_id": "ADR_20260924_DART_KEY_POOL_ALTDATA_POLICY",
@@ -872,146 +1026,6 @@
       "why": "KCA_TOPK_COSTAWARE_001이 미배선 상태였고 틱개편(2023-01-25) 전후 레짐을 풀링하면 엣지가 은폐됨",
       "resolution": "src/ml/costaware_topk.py 신설: PIT tick_cost_bp 오름차순 top-K, pre/post/full 레짐 분리 통계, 3틱 비용 스트레스, retrain.py --cost-aware-backtest 배선",
       "impact": "878 passed/1 failed(기존 R19)/9 skipped, ruff·mypy clean; 실측 post_reform +18.75bp t=3.08 median+5.79 PASS, full_history +6.92bp t=1.33 INSUFFICIENT_COVERAGE로 정확히 구분"
-    },
-    {
-      "task_id": "ML_DATASET_INTEGRITY",
-      "date": "2026-09-08",
-      "adr_id": "ADR_20260908_ML_DATASET_INTEGRITY",
-      "domain": "ml",
-      "title": "패널 무결성 격리 + PIT 비용 라벨",
-      "why": "price_history의 daily_change_pct 16.28% 단위혼재와 비-PIT 틱표가 배선된 스크린/시나리오/라벨 경로를 오염",
-      "resolution": "src/data/panel_integrity.py 신설: 4개 로드경계에서 fail-closed 정규화(chg_ratio 단일원천, PIT tick_cost_bp), cost_model/decision_labels PIT 옵트인 배선",
-      "impact": "855 passed/1 failed(기존 R19)/9 skipped, ruff·mypy clean; operator_legacy 스크린 model-free gross 부호 역전(+3.41bp→-3.05bp) 교정"
-    },
-    {
-      "task_id": "tick_collection_throughput_optimization",
-      "date": "2026-09-08",
-      "adr_id": "ADR_20260908_tick_collection_throughput_optimization",
-      "domain": "data",
-      "title": "체결틱 수집 처리량 최적화 및 스마트 라우팅",
-      "why": "LS API의 단일 락(1.05s) 및 과도한 기본 페이지로 인한 체결틱 수집 병목을 해소하기 위함.",
-      "resolution": "당일 수집 키움·KIS 우선 및 과거일 LS 전담 라우팅, 빈 응답 폴백 결함 수정, LS 30페이지 상한 가드를 적용함.",
-      "impact": "일일 40개 워치리스트 종목의 틱 수집 소요시간을 1/10 이하로 단축하고 수집 안정성을 확보함."
-    },
-    {
-      "task_id": "TASK_UNIVERSE_SCREEN_REDESIGN",
-      "date": "2026-09-08",
-      "adr_id": "ADR_20260908_UNIVERSE_SCREEN_REDESIGN",
-      "domain": "strategy",
-      "title": "비용축 진입 스크린: 시점정합 1틱비용 상한 + 등락률 혼합단위 교정",
-      "why": "레거시 운영자 스크린(등락률>=10%)은 비용후 -38.9bp/일(Sharpe -3.43)로 무필터(-34.5bp)보다 나쁘고, 전수패널 분해 결과 실측 지배 필터는 KRX 호가단위에서 유도되는 1틱비용 상한이었다(2023-01-25 개편후 876일: 등락률2~10% -19.8bp -> +1틱<=7.5bp +6.5bp).",
-      "resolution": "UniverseSpec.max_tick_cost_bp 추가; cost_model에 시점정합 krx_tick_size_asof/tick_cost_bp(2023-01-25 개편경계, NaN전파) 신설; contract에 derive_chg_ratio/detect_mixed_unit_rows(벤더 daily_change_pct 심볼별 ratio/percent 혼합오염 교정) 신설; v3_engine.load_and_prepare/build_candidate_universe 배선; archive_intraday의 등락률스캔 수집 허용.",
-      "impact": "DEFAULT_UNIVERSE 및 기존 스펙 불변(하위호환); COST_AWARE_UNIVERSE/KCA_TOPK_COSTAWARE_001은 opt-in; 비용스크린 검증은 2023-01-25 이후로 한정. Open: archive_intraday 런타임 상한 재검증(Stream C 가드 되돌림), 신규풀 왕복틱수 실측(현재 근거 1일), 연구하니스 프로덕션 재실행."
-    },
-    {
-      "task_id": "TASK_NXT_PREMARKET_COLLECTION",
-      "date": "2026-09-08",
-      "adr_id": "ADR_20260908_NXT_PREMARKET_COLLECTION",
-      "domain": "market_data",
-      "title": "Nextrade 프리마켓(08:00~08:50) 1분봉 수집 파이프라인 및 Kiwoom ka10080 통합",
-      "why": "08:00~08:50 NXT 프리마켓 거래가 수집되지 않아 시가 갭 및 프리마켓 거래량 분석 데이터 결손이 발생했음.",
-      "resolution": "INTRADAY_SESSION_NXT_PREMARKET 신설, Kiwoom ka10080 및 KIS 폴백 수집 배선, 토큰 동시성 락 및 가격 부호 정규화 적용.",
-      "impact": "run_intraday_archive 3-tuple 인터페이스 불변 하에 프리/정규/애프터 3대 세션 전수 보존 및 20:00 재수행 시 완결적 아카이브 지원."
-    },
-    {
-      "task_id": "TASK_MULTI_VENDOR_INTRADAY_RANKING_AND_BARS",
-      "date": "2026-09-08",
-      "adr_id": "ADR_20260908_MULTI_VENDOR_INTRADAY_RANKING_AND_BARS",
-      "domain": "market_data",
-      "title": "Kiwoom ka10027 랭킹 및 ka10080 NXT 분봉 승격, 정규장 분봉 LS 유지 3-벤더 적재적소 통합",
-      "why": "KIS 30건 하드캡(96% 누락)과 NXT 9회 페이징 비효율을 해결하고, 정규장 분봉 거래대금(value_krw) 훼손을 차단하기 위함.",
-      "resolution": "Kiwoom ka10027 랭킹(200행 페이징, 근사 거래대금)과 ka10080 NXT(1회 완결) 승격 및 KIS 폴백 배선, 정규장 분봉 LS 1순위 유지.",
-      "impact": "Stream C 2~10% 유니버스 100% 전수 수집(0.2s) 및 NXT 수집 4배 가속, 시가총액 NaN Fail-closed 및 기존 동작 완벽 호환 보장."
-    },
-    {
-      "task_id": "ADR_20260907_KIWOOM_TICK_VENDOR_PRIMARY",
-      "date": "2026-09-07",
-      "adr_id": "ADR_20260907_ADR_20260907_KIWOOM_TICK_VENDOR_PRIMARY",
-      "domain": "serving",
-      "title": "Kiwoom REST 벤더를 archive_intraday 틱 수집 1순위로 승격",
-      "why": "실측: KIS 30행/페이지(231행/초), LS 500행/페이지(544행/초) vs Kiwoom 900행/페이지+5req/s 확정(4267행/초, 서버 유량=5 실측) -- 틱 수집이 archive_intraday의 유일한 병목.",
-      "resolution": "src/api/kiwoom/client.py(KiwoomApiClient, api-id별 AsyncRateLimiter 재사용, 429 백오프) 신설, collect_intraday_trade_ticks에 Kiwoom(1순위)->LS(2순위)->KIS(3순위) 폴백 추가, normalize_tick_frame에 kiwoom 벤더 분기 추가.",
-      "impact": "분봉/Stream C 랭킹은 Kiwoom에 value_krw/시가총액 소스 필드가 없어 의도적으로 스코프 제외(후속 spec 대상); kiwoom_client=None 시 기존 LS/KIS 동작과 완전 동일."
-    },
-    {
-      "task_id": "TASK_UNIVERSE_SCAN_STREAM_C",
-      "date": "2026-09-07",
-      "adr_id": "ADR_20260907_UNIVERSE_SCAN_STREAM_C",
-      "domain": "serving",
-      "title": "Stream C: KIS ranking-API universe scan + archive_intraday scoping guard",
-      "why": "Live collector only ever observed >=8% momentum picks (0.98% overlap with research U0), and archive_intraday's long runtime was actually the workflow blocking the user, not a bug.",
-      "resolution": "Added src/daily/universe_scan.py (KIS FHPST01700000 ranking call -> in-process archive handoff, no CSV/mtime relay) and a default-safe exclude_scenarios guard on archive_intraday's watchlist so the wider universe cannot silently balloon its runtime.",
-      "impact": "Multi-snapshot (15:18/19/20) capture is now race-free; archive_intraday behavior is unchanged by default; market-cap field presence and cron orchestration remain explicitly open follow-ups."
-    },
-    {
-      "task_id": "TASK_STRATEGY_CONTRACT_LAYER",
-      "date": "2026-09-07",
-      "adr_id": "ADR_20260907_STRATEGY_CONTRACT_LAYER",
-      "domain": "research",
-      "title": "Strategy contract layer: frozen cost/universe/feature-contract specs",
-      "why": "Two-time cost-constant regressions and unproven cross-sectional-rank feature mapping needed a fail-closed shared contract before research/live can be trusted to share definitions.",
-      "resolution": "Added src/strategy/contract.py (CostSpec/UniverseSpec/StrategySpec, round_trip_cost_bp, select_universe, mark_ceiling, classify_feature_contract, assert_production_feature_set) and rewired v3_engine.py/v3_metrics.py onto it, removing duplicated tick-ladder code.",
-      "impact": "V3 OOF reproduces byte-identical (rankIC 0.1089, Top1 27.57bp, Top3 21.57bp); rank features now provably MISMATCH unless population equality is proven, and AA cost floor cannot regress below 2 ticks."
-    },
-    {
-      "task_id": "EXIT_GRID_D1_BRACKET_RESEARCH",
-      "date": "2026-09-07",
-      "adr_id": "ADR_20260907_EXIT_GRID_D1_BRACKET_RESEARCH",
-      "domain": "ml",
-      "title": "D+1 청산 그리드: 손절 추가 검증",
-      "why": "청산 타이밍 개편이 종가매매의 유일한 양의 신호 후보라, 기존 익절-only 그리드에 손절(브래킷)을 추가하면 나아지는지 확인 필요",
-      "resolution": "OOF top-1 픽 2058일에 대해 D+1 익절+손절 브래킷 5종을 현행(익일시가)·익절-only와 비교 (research 스크립트, src 변경 없음)",
-      "impact": "손절 추가는 전 조합 -50~-95bp/일 t=-4~-8로 결정적 해악(고변동성 종목이 노이즈에 손절선 히트); D+1 일중 청산 상한은 '익절5%+MOC 손절없음'으로 확정, 잠긴 OOS서는 무효"
-    },
-    {
-      "task_id": "UNIVERSE_RESEARCH_HARNESS",
-      "date": "2026-09-07",
-      "adr_id": "ADR_20260907_UNIVERSE_RESEARCH_HARNESS",
-      "domain": "ml",
-      "title": "재구성 전체시장 유니버스 리서치 하니스",
-      "why": "리랭커가 운영자 임의 스크린(등락률10%·거래대금100억·시총500억) 안에서만 학습돼 왔고, 스크린 비교는 모델없는 EV뿐이라 '랭커가 넓은 풀에서 비용을 넘나'가 미검증",
-      "resolution": "src/ml/universe_research.py 신설: ScreenConfig 패밀리별 재구성 패널→동일 리랭커 학습→모델없는 EV vs 랭커 top-1 비용후 vs CPCV top-1 경로승률 정렬 테이블. retrain.py --universe-research 배선",
-      "impact": "스크린 선택이 손으로 박은 3개 숫자에서 CPCV 게이트 리서치 레코드로 전환. 승격 아님(라이트). 실측: 모든 스크린 비용후 손실이나 gross는 t=8~13"
-    },
-    {
-      "task_id": "DATA_LIMIT_BREAKOUT_SCENARIO_AUTO",
-      "date": "2026-09-07",
-      "adr_id": "ADR_20260907_DATA_LIMIT_BREAKOUT_SCENARIO_AUTO",
-      "domain": "ml",
-      "title": "수동 차트분석 자동화 + 시나리오 ablation 스위치",
-      "why": "재구성 유니버스 행에는 수동 차트분석이 없어 ML 패널을 못 만들었고, 시나리오 피처를 깔끔히 제거해 재는 스위치도 없었다",
-      "resolution": "src/ml/scenario_rules.py 신설(9범주 결정적 우선순위 사다리 + 일치율 리포트), build_ml_dataset에 scenario_source=manual|auto|none 배선, champion/ChampionTuningConfig 통과",
-      "impact": "manual 기본값은 기존과 byte-identical, auto는 price_history 규칙 라벨로 재구성 유니버스 학습 가능, none은 시나리오 블록 전면 제거로 ablation 측정"
-    },
-    {
-      "task_id": "ML_PIPELINE_AUDIT_V3",
-      "date": "2026-09-06",
-      "adr_id": "ADR_20260906_ML_PIPELINE_AUDIT_V3",
-      "domain": "ml",
-      "title": "screen_grid 순서버그 + candidate/control 라벨·스크린 불일치 + 유의수준 이원화 + 청산다리 미실측 수정",
-      "why": "screen_grid가 이미 스크린으로 좁혀진 dev에서 재평가되고, control이 항상 옛 journaled+flat 라벨을 써 candidate와 다른 정의를 비교했으며, --promotion-alpha가 CPCV 게이트에 미전달, execution_profile이 매수만 측정",
-      "resolution": "dev_prescreen 분리, control_dev를 candidate와 동일한 processed+screen 재사용으로 교체, retrain.py가 promotion_alpha를 ValidationConfig에도 전달, exit_cv에 purge_gap 명시, measure_oos_execution_profile에 청산다리(exit_*) 추가",
-      "impact": "레거시 control_vs_candidate 수치의 타당성 확보, --promotion-alpha가 전체 파이프라인에 균일 적용, execution_profile_measured 게이트가 왕복비용 양쪽 다리를 실측"
-    },
-    {
-      "task_id": "CLOSING_ALPHA_V2_EXECUTION_FIX",
-      "date": "2026-09-06",
-      "adr_id": "ADR_20260906_CLOSING_ALPHA_V2_EXECUTION_FIX",
-      "domain": "ml",
-      "title": "sync 아카이브 제거 + execution_profile 분봉 정규화 버그 수정",
-      "why": "레거시 게이트가 신규 v2 decision 계산 후 raise해 연구 아티팩트를 폐기하는 문제를 --no-gate로 우회 실행하다 execution_profile이 원본 KIS 벤더 포맷 미정규화로 항상 None인 버그를 발견",
-      "resolution": "measure_oos_execution_profile을 _load_normalized_bars_for_entries로 분리해 파티션별 normalize_bar_frame 정규화 적용, sync_task.py의 docs/decisions/archive 이관 로직 제거(계약서는 삭제만)",
-      "impact": "execution_profile_measured 게이트가 처음으로 실측치(fill_rate 0.878)를 반환, 매 /sync마다 불필요하게 쌓이던 docs/decisions/archive 디렉터리 생성 중단"
-    },
-    {
-      "task_id": "CLOSING_ALPHA_ARCHITECTURE_V2",
-      "date": "2026-09-06",
-      "adr_id": "ADR_20260906_CLOSING_ALPHA_ARCHITECTURE_V2",
-      "domain": "ml",
-      "title": "종가매매 아키텍처 v2: 유니버스 스크린 파라미터화 + EV기반 기권 + 체결 실측 게이트",
-      "why": "운영자 상승률>=10% 스크린이 무조건부 기대값 -30.2bp/일(t=-12.15)로 실측되어, 모델이 낼 수 있는 최대 rankIC 알파(+28bp)와 정확히 상쇄되는 산술이 3세션 '포화' 결론의 정체였다",
-      "resolution": "src/ml/universe.py(파라미터화 스크린+모델이전 베이스라인), src/ml/expected_value.py(EV<=0 기권), src/execution/passive_fill.py(패시브체결 역선택 실측) 신설 후 champion.py/retrain.py/validation.py에 --screen·DSR예산·execution_profile 게이트로 실배선",
-      "impact": "체결 실측 없이는 승격 불가(execution_profile_measured 게이트)로 R1을 강제하고, 시간분할 부호반전(스크린 7종 중 6종 half-sample flip 실측) 게이트를 추가해 gate theatre 재발을 구조적으로 차단"
     }
   ]
 }

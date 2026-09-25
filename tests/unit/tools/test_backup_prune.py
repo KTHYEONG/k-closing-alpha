@@ -209,3 +209,53 @@ def test_main_purges_remote_and_local_with_single_summary_log(monkeypatch, caplo
     assert "sealed_removed=2" in summary[0].getMessage()
     assert "sealed_kept=1" in summary[0].getMessage()
 
+
+
+def test_prune_cap_aborts_before_any_purge(monkeypatch) -> None:
+    import subprocess
+
+    import pandas as pd
+    import pytest
+
+    from src.tools import backup_prune
+
+    monkeypatch.setattr(backup_prune, "_resolve_rclone_bin", lambda: "rclone")
+    calls: list[list[str]] = []
+    expired = "\n".join(f"2026-07-{day:02d}/" for day in range(1, 13)) + "\n"
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "lsf":
+            if cmd[-1].endswith("/data"):
+                return subprocess.CompletedProcess(cmd, 0, stdout=expired, stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError("purge must not run when cap exceeded")
+
+    with pytest.raises(RuntimeError, match="cap exceeded"):
+        backup_prune.prune_backups(today=pd.Timestamp("2026-10-01"), run_fn=fake_run, remote_root="gdrive:x/_deleted")
+    assert not any(c[1] == "purge" for c in calls)
+
+
+def test_prune_dry_run_lists_without_purging(monkeypatch) -> None:
+    import subprocess
+
+    import pandas as pd
+
+    from src.tools import backup_prune
+
+    monkeypatch.setattr(backup_prune, "_resolve_rclone_bin", lambda: "rclone")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "lsf" and cmd[-1].endswith("/data"):
+            return subprocess.CompletedProcess(cmd, 0, stdout="2026-08-01/\n2026-08-02/\n", stderr="")
+        if cmd[1] == "lsf":
+            return subprocess.CompletedProcess(cmd, backup_prune.RCLONE_EXIT_DIRECTORY_NOT_FOUND, stdout="", stderr="directory not found")
+        raise AssertionError("purge must not run in dry-run")
+
+    targets = backup_prune.prune_backups(
+        today=pd.Timestamp("2026-10-01"), run_fn=fake_run, remote_root="gdrive:x/_deleted", dry_run=True
+    )
+    assert targets == ["gdrive:x/_deleted/data/2026-08-01", "gdrive:x/_deleted/data/2026-08-02"]
+    assert not any(c[1] == "purge" for c in calls)

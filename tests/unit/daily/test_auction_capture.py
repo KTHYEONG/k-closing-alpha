@@ -959,3 +959,79 @@ def test_main_logs_non_trading_day_skip(tmp_path, monkeypatch, caplog) -> None:
     with caplog.at_level(logging.INFO, logger=auction_capture.logger.name):
         auction_capture.main(["--phase", "close", "--date", "2026-09-24"])
     assert any("reason=non_trading_day" in r.message for r in caplog.records)
+
+
+def _shifted_close_clock(trading_day):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.data.capture_contracts import SessionClock
+
+    seoul = ZoneInfo("Asia/Seoul")
+
+    def _at(hour: int, minute: int) -> datetime:
+        return datetime(trading_day.year, trading_day.month, trading_day.day, hour, minute, 0, tzinfo=seoul)
+
+    return SessionClock(
+        trading_date=trading_day,
+        open_at=_at(10, 0),
+        close_at=_at(16, 30),
+        close_confirmation_deadline=_at(16, 33),
+        provenance="csat_delayed_open",
+    )
+
+
+def test_run_async_uses_calendar_clock_for_shifted_session(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from datetime import date
+
+    from src.daily import auction_capture
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    _stub_research_clients(monkeypatch)
+    target = date(2026, 11, 19)
+    clock = _shifted_close_clock(target)
+    monkeypatch.setattr(
+        auction_capture, "resolve_session_day",
+        lambda _d, **_k: SessionDay(trading_date=target, kind=SessionKind.SHIFTED, clock=clock, provenance="krx_calendar"),
+    )
+
+    async def _open(client: Any, session: Any, date: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(auction_capture, "is_kis_trading_day", _open)
+    seen: dict[str, Any] = {}
+
+    async def _capture_clock(*args: Any, **kwargs: Any) -> str:
+        seen["clock"] = kwargs["session_clock"]
+        return "manifest-ok"
+
+    monkeypatch.setattr(auction_capture, "run_auction_capture", _capture_clock)
+    assert asyncio.run(auction_capture._run_async("2026-11-19", "close", _profile(tmp_path))) == "manifest-ok"
+    assert seen["clock"].close_at.strftime("%H:%M") == "16:30"
+
+
+def test_run_async_skips_closed_day_before_broker_session(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from datetime import date
+
+    from src.daily import auction_capture
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    _stub_research_clients(monkeypatch)
+    monkeypatch.setattr(
+        auction_capture, "resolve_session_day",
+        lambda _d, **_k: SessionDay(trading_date=date(2026, 10, 9), kind=SessionKind.CLOSED, clock=None, provenance="krx_calendar"),
+    )
+
+    class _RaisingClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("closed day must not construct broker clients")
+
+    monkeypatch.setattr("src.api.kis.client.KisApiClient", _RaisingClient)
+
+    async def _must_not_run(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("capture must not run on a closed day")
+
+    monkeypatch.setattr(auction_capture, "run_auction_capture", _must_not_run)
+    assert asyncio.run(auction_capture._run_async("2026-10-09", "close", _profile(tmp_path))) is None

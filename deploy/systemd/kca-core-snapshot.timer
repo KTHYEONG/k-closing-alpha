@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA immutable core snapshot (Sun 10:00 KST, weekly)
+
+[Timer]
+OnCalendar=Sun 10:00:00 Asia/Seoul
+Persistent=true
+Unit=kca-core-snapshot.service
+
+[Install]
+WantedBy=timers.target

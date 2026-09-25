@@ -252,3 +252,190 @@ def test_backup_slot_constant_matches_timer_schedule() -> None:
     start, end = day_index[match.group(1)], day_index[match.group(2)]
     assert frozenset(range(start, end + 1)) == BACKUP_SLOT_WEEKDAYS
     assert time(int(match.group(3)), int(match.group(4))) == BACKUP_SLOT_KST
+
+
+def _write_core_parquet(path, rows: int, max_date: str) -> None:
+    import pandas as pd
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"date": [max_date] * rows, "value": range(rows)}).to_parquet(path, index=False)
+
+
+def test_corrupt_core_panel_excluded_from_nightly_copy(tmp_path: Path, monkeypatch) -> None:
+    import json
+    import subprocess
+
+    import pytest
+
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import REPORT_RELPATH, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    project = tmp_path / "proj"
+    capture = tmp_path / "capture"
+    _write_core_parquet(project / "data/history/price_history.parquet", 900, "2026-09-23")
+    capture.mkdir(parents=True, exist_ok=True)
+    (capture / "offsite").mkdir(parents=True, exist_ok=True)
+    (capture / REPORT_RELPATH).parent.mkdir(parents=True, exist_ok=True)
+    (capture / REPORT_RELPATH).write_text(
+        json.dumps(
+            {
+                "started_at": "2026-09-17T13:15:00+00:00",
+                "finished_at": "2026-09-17T13:15:00+00:00",
+                "status": "ok",
+                "steps": {},
+                "core_panels": [
+                    {
+                        "relpath": "data/history/price_history.parquet",
+                        "sha256": "a" * 64,
+                        "bytes": 10,
+                        "rows": 1000,
+                        "max_date": "2026-09-23",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    seen: list[list[str]] = []
+
+    def _run(cmd, **kwargs):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="offsite backup failed"):
+        run_offsite_backup(project, capture, now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+    data_cmds = [c for c in seen if len(c) > 2 and c[2].endswith("/data")]
+    assert len(data_cmds) == 1
+    assert "--exclude" in data_cmds[0]
+    assert "/history/price_history.parquet" in data_cmds[0]
+    persisted = json.loads((capture / REPORT_RELPATH).read_text(encoding="utf-8"))
+    assert persisted["steps"]["core_panels"]["status"] == "failed"
+    assert any("rows_shrank" in issue for issue in persisted["steps"]["core_panels"]["issues"])
+    assert persisted["steps"]["data"]["status"] == "failed"
+
+
+def test_healthy_panels_leave_copy_unchanged(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import loose_copy_command, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    project = tmp_path / "proj"
+    capture = tmp_path / "capture"
+
+    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    seen: list[list[str]] = []
+
+    def _run(cmd, **kwargs):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    report = run_offsite_backup(project, capture, now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+    assert report.status == "ok"
+    data_cmds = [c for c in seen if len(c) > 2 and c[2].endswith("/data")]
+    assert len(data_cmds) == 1
+    expected = loose_copy_command("rclone", project, "data", "2026-09-18")
+    assert data_cmds[0] == expected
+
+
+def test_offsite_helpers_cover_error_branches(tmp_path: Path) -> None:
+    import json
+
+    from src.tools.offsite_backup import _excludes_for_subtree, _load_previous_core_panels, loose_copy_command
+
+    assert _excludes_for_subtree(["bad-issue"], "data") == []
+    assert _excludes_for_subtree(["core_panel:data/history/a.parquet:missing"], "artifacts") == []
+    cmd = loose_copy_command("rclone", tmp_path, "artifacts", "2026-09-18", ["/x.parquet"])
+    assert "/x.parquet" in cmd
+    from src.tools.offsite_backup import REPORT_RELPATH as _RR
+
+    def _cap_with(content: str) -> Path:
+        cap = tmp_path / f"cap_{abs(hash(content)) % 100000}"
+        target = cap / _RR
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return cap
+
+    assert _load_previous_core_panels(tmp_path / "nope") == []
+    assert _load_previous_core_panels(_cap_with("{bad")) == []
+    assert _load_previous_core_panels(_cap_with("[1]")) == []
+    assert _load_previous_core_panels(_cap_with(json.dumps({"a": 1}))) == []
+    assert _load_previous_core_panels(_cap_with(json.dumps({"core_panels": "nope"}))) == []
+
+
+def test_offsite_failed_copy_keeps_core_issues(tmp_path: Path, monkeypatch) -> None:
+    import json
+    import subprocess
+
+    import pytest
+
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import REPORT_RELPATH, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    project = tmp_path / "proj"
+    capture = tmp_path / "capture2"
+    _write_core_parquet(project / "data/history/price_history.parquet", 900, "2026-09-23")
+    (capture / REPORT_RELPATH).parent.mkdir(parents=True, exist_ok=True)
+    (capture / REPORT_RELPATH).write_text(
+        json.dumps(
+            {
+                "started_at": "2026-09-17T13:15:00+00:00",
+                "finished_at": "2026-09-17T13:15:00+00:00",
+                "status": "ok",
+                "steps": {},
+                "core_panels": [
+                    {"relpath": "data/history/price_history.parquet", "sha256": "a" * 64, "bytes": 1, "rows": 1000, "max_date": "2026-09-23"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="drive down")
+
+    with pytest.raises(RuntimeError, match="offsite backup failed"):
+        run_offsite_backup(project, capture, now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+    persisted = json.loads((capture / REPORT_RELPATH).read_text(encoding="utf-8"))
+    assert persisted["steps"]["data"]["issues"][0].endswith("rows_shrank")
+
+
+def test_offsite_first_run_unreadable_persists_current(tmp_path: Path, monkeypatch) -> None:
+    import json
+    import subprocess
+
+    import pytest
+
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import REPORT_RELPATH, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    project = tmp_path / "proj_first"
+    capture = tmp_path / "cap_first"
+    target = project / "data/history/price_history.parquet"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"truncated")
+
+    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="offsite backup failed"):
+        run_offsite_backup(project, capture, now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+    persisted = json.loads((capture / REPORT_RELPATH).read_text(encoding="utf-8"))
+    assert persisted["steps"]["core_panels"]["status"] == "failed"
+    assert persisted["core_panels"]

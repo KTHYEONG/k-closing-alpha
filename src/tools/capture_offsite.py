@@ -564,7 +564,7 @@ def _seal_locked(
                     remote_pre = _parse_remote_md5(pre.stdout) if pre.returncode == 0 else None
                     if remote_pre != local_md5:
                         uploaded = run_fn(
-                            [rclone, "copyto", str(staging_path), remote],
+                            [rclone, "copyto", str(staging_path), remote, "--immutable"],
                             capture_output=True,
                             text=True,
                             timeout=config.rclone_timeout_sec,
