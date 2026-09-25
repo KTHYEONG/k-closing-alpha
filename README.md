@@ -1,202 +1,160 @@
 # K-Closing Alpha
 
-> **국내 주식(KOSPI/KOSDAQ) 종가단일가(15:20~15:30) 실시간 수집 및 익일 시초가(09:00) 청산 Top-3 머신러닝 퀀트 시스템**
+> **국내 주식(KOSPI/KOSDAQ) 종가단일가(15:20~15:30) 실시간 수집 및 익일 시초가(09:00) 기계적 청산 Top-3 머신러닝 퀀트 시스템**
+
+![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
+![Engine](https://img.shields.io/badge/Engine-Polars-cd792c.svg)
+![Storage](https://img.shields.io/badge/Storage-Parquet_&_zstd-4c1.svg)
+![Concurrency](https://img.shields.io/badge/Concurrency-asyncio-darkgreen.svg)
+![Architecture](https://img.shields.io/badge/Architecture-Contract_Guarded-blueviolet.svg)
+![Deployment](https://img.shields.io/badge/Deployment-Docker_&_systemd-2496ed.svg)
 
 ---
 
-## 1. Project Overview
+## 1. System Highlights
 
-`k-closing-alpha`는 장 마감 직전 10분의 제한된 시간 창(15:20~15:30) 내에서 당일 강세 후보 종목을 수집·가공하고, 비용 인식형(Cost-Aware) 머신러닝 리랭커를 통해 **당일 종가 매수 후 익일 시초가에 기계적 전량 청산하는 오버나잇 퀀트 트레이딩 파이프라인**입니다.
-
-* **핵심 문제**: 금융 시계열의 미래 정보 누출(Look-Ahead Bias)과 저가주 호가단위 스프레드(Tick Friction)로 인한 실전 수익성 붕괴 방어.
-* **주요 기능**: 전시장 등락률 스캔 $\rightarrow$ 15:20 호가/수급 캡처 $\rightarrow$ 28차원 PIT 피처 생성 $\rightarrow$ 5-Seed LightGBM 앙상블 추론 $\rightarrow$ 15:30 종가 확정 게이트 $\rightarrow$ 익일 청산 리허설 자동화.
-* **핵심 기술**: 4개 증권사 API 분산 라우팅, Combinatorial Purged CV(8,2), Fail-Closed 데이터 무결성 게이트, Parquet 데이터 레이크.
+| 핵심 엔지니어링 지표 | 실측 성과 / 보장 기준 | 아키텍처 불변식 및 강제 장치 |
+| :--- | :---: | :--- |
+| 📈 **도메인 성과 (Net Return)** | **`+34.58 bp / 일`** (Sharpe **`2.73`**) | 법정거래세(18~23bp) + 왕복 2.0틱 스프레드 + 우대수수료(왕복 0.73bp) 전액 실측 차감 후 순알파 |
+| 🛡️ **정보 누출 방지 (Look-Ahead)** | **`0.00%`** (완전 차단) | 15:20 PIT 의사결정 시점과 15:30 종가 확정 시점 원장 분리 (`decision_close` vs `close`) |
+| ⚡ **실시간 처리 속도 (Latency)** | **`0.2초`** 스캔 / **`1.1초`** 추론 | 키움 REST 200행 고속 스캔 및 Polars 기반 제로카피 28차원 피처 슬라이싱 |
+| 🚀 **운영 연속성 (Feasibility)** | **`99.89%`** (884일 진입 / 1일 관망) | 4대 증권사 OpenAPI 쿼터 분산(TPS 18 병목 해소) 및 KIS 토큰 슬롯 격리 자동 갱신 |
+| ⏱️ **시계열 정합성 (Integrity)** | **오차 허용 `0건`** | 3중 Fail-Closed 게이트 (KST 15:30:00 도달 + 마감코드 '3' + 현재가/호가 체결가 일치 검증) |
+| 🔒 **원장 동시성 및 보존 (Safety)** | **경쟁 결함 `0건`** | 커널 `flock` 기반 세션 락 직렬화, Append-only 체결 이벤트 로깅, tar.zst 세그먼트 백업 |
 
 ---
 
-| 핵심 난제 (Challenge) | 일반적 접근법의 한계 | k-closing-alpha 엔지니어링 솔루션 |
+## 2. Tech Stack
+
+| 분류 | 기술 | 채택 근거 및 트레이드오프 |
 | :--- | :--- | :--- |
-| **Point-in-Time 정보 누출** | 15:30 확정 종가나 익일 시초가 갭을 미리 알고 매수하는 Look-Ahead 편향 발생 | **엄격한 15:20 시점 분리**: 15:20 시점 관측 데이터만으로 추론을 완결하고 `decision_close`(15:20)와 `close`(15:30)를 분리 보존 |
-| **호가단위 마찰비용 잠식** | 5,000원 미만 저가주는 1틱이 20~50bp에 달해 왕복 스프레드와 거래세로 알파 전액 소멸 | **비용 인식형 유니버스 스크리닝**: 주가대별 1틱 비용 12.0bp 초과 종목 및 상한가 근접 종목(`chg_ratio >= 0.29`) 원천 배제 |
-| **단일 증권사 API 한도 병목** | 10분 결정창 내 전종목 스캔 및 10호가 조회를 단일 브로커(TPS 18)로 수행 시 429 차단 발생 | **4대 증권사 분산 라우팅**: 키움(200행 스캔, 0.2s) $\to$ KIS(10호가/수급) $\to$ LS(1분봉 아카이빙) $\to$ 토스(멀티 쿼트 백업) |
-| **시계열 자기상관성 과적합** | 일반 K-Fold 적용 시 시계열 인접 구간 정보 유출로 백테스트 과적합 | **CPCV(8,2) & 5-Seed 앙상블**: 28개 무누출 OOF 경로 평가 및 `date_demeaned` 타깃 횡단면 상대 랭킹 학습 |
+| **Language & Tooling** | `Python 3.11+`, `uv` | 빠른 의존성 동기화와 엄격한 타입 힌팅 (`mypy`, `ruff`). 인터프리터 오버헤드는 벡터화 연산으로 극복 |
+| **Data Engine & Storage** | `Polars`, `Parquet`, `zstd` | 10년치 패널 제로카피 로딩. 단일 행 수정 불가 트레이드오프는 `atomic_write_parquet` 원자적 교체로 해결 |
+| **Concurrency & Network** | `asyncio`, `websockets` | 15:20 시점 4사 API 비동기 I/O 및 실시간 체결틱(`H0STCNT0`) 무차단 펌프 처리 |
+| **Quant & ML Engine** | `LightGBM`, `CPCV(8,2)` | 5-Seed 앙상블 및 168시간 시계열 엠바고(정보 누출 방지 유예) 적용 횡단면 상대 랭킹 학습 |
+| **Execution & Broker** | `Kiwoom`, `KIS`, `LS`, `Toss` | 단일사 Rate Limit 우회: 키움(스캔), KIS(호가/수급), LS(1분봉), 토스(쿼트 백업) 분산 라우팅 |
+| **Infra & Automation** | `Linux systemd`, `flock` | 단일 호스트 경량 24/7 상태머신 구동, 프로세스 경합 방지 및 Google Drive 세그먼트 백업 |
 
 ---
 
-## 3. Key Features
+## 3. Daily Workflow & Pipeline
 
-* **비용 인식형 유니버스 스크리닝 (`COST_AWARE_UNIVERSE`)**
-  - *구현:* 주가 구간별 1틱 비용이 12.0bp를 초과하는 종목 및 상한가 근접 종목(`chg_ratio >= 0.29`)을 추론 전 원천 배제.
-  - *효과:* 호가 스프레드에 의한 실전 수익성 훼손을 사전 차단하고 백테스트-실전 간 괴리 최소화.
-* **4개 증권사 OpenAPI 특화 분산 라우팅**
-  - *구현:* 키움(200행 고속 전시장 스캔) $\rightarrow$ KIS(15:20 10호가/잠정수급 캡처) $\rightarrow$ LS(단일 호출 500개 1분봉 아카이빙) $\rightarrow$ 토스(멀티 쿼트 폴백).
-  - *효과:* 15:20 의사결정 수집 시간을 6초 이내로 단축하여 API Rate Limit 병목 해결.
-* **3중 Fail-Closed 종가 확정 게이트**
-  - *구현:* 15:30:30 시계 체크 + 단일가 마감 코드('3') + 현재가/호가 체결가 일치 검증.
-  - *효과:* 불완전 체결 시점의 데이터 오염을 방지하고 `decision_close`(15:20)와 `close`(15:30)를 분리 관리.
-* **Combinatorial Purged Cross-Validation (CPCV 8,2) & 5-Seed 앙상블**
-  - *구현:* 8개 시계열 블록 중 2개 테스트 블록 조합으로 28개 무누출 OOF 경로를 평가하고, 5개 시드 LightGBM 앙상블 적용.
-  - *효과:* 시계열 자기상관성으로 인한 과적합을 차단하고 횡단면 상대 랭킹 안정성 확보.
-* **실시간 체결틱 기반 페이퍼 트레이딩 리허설**
-  - *구현:* 실주문 전송 없이 실시간 체결틱(WebSocket `H0STCNT0`)을 구독하여 시장가/목표가 가상 체결 및 원장 기록.
-  - *효과:* 무위험 환경에서 실시간 슬리피지 및 체결 엔진 안정성 리허설.
-
----
-
-## 4. Architecture
+| 시각 (KST) | 단계 | 핵심 처리 내용 |
+| :---: | :--- | :--- |
+| 🌅 **15:20:00** | **1. 후보 스캔 & 적격 심사** | 키움 200행 스캔 $\to$ 저가치주 13.8% 배제 $\to$ 12.0bp 틱비용 상한 필터 적용 |
+| ⚡ **15:20:10** | **2. 단면 캡처 & 앙상블 추론** | KIS 10호가/잠정수급 수집(정상률 $\ge$ 99% 게이트) $\to$ 28차원 PIT 피처 산출 $\to$ Top-3 선정 |
+| 🌙 **15:30:30** | **3. 3중 종가 확정 & 가상 진입** | 시계 + 단일가코드('3') + 체결가 일치 3중 검증 $\to$ 결정시점 사이징 기반 가상 매수 원장 기록 |
+| 🛡️ **익일 09:00** | **4. 기계적 청산 & 무결성 감사** | 사후 갭 필터 없이 익일 시초가 전량 청산 $\to$ 세션 캘린더 증명 $\to$ 일일 원장/백업 감사 |
 
 ```mermaid
 flowchart TD
-    subgraph Vendors [Multi-Broker Ingestion]
-        KW[키움증권 REST<br/>전시장 등락률 스캔]
-        KIS[한국투자증권 KIS<br/>15:20 10호가/잠정수급]
-        LS[LS증권 REST<br/>정규장 1분봉 아카이빙]
-    end
+    classDef vendor fill:#f1f3f5,stroke:#495057,stroke-width:1px,color:#212529;
+    classDef stage1 fill:#e7f5ff,stroke:#1971c2,stroke-width:2px,color:#0c4a6e;
+    classDef stage2 fill:#ebfbee,stroke:#2f9e44,stroke-width:2px,color:#14532d;
+    classDef stage3 fill:#f3f0ff,stroke:#7950f2,stroke-width:2px,color:#3b0764;
+    classDef stage4 fill:#fff4e6,stroke:#f76707,stroke-width:2px,color:#7c2d12;
 
-    subgraph Pipeline [Decision Pipeline 15:20~15:30]
-        SCAN[1. Universe Scan<br/>2%~10% 상승 후보 추출]
-        COLLECT[2. Ingestion & Admission<br/>Tick <= 12bp & Coverage >= 99%]
-        PREDICT[3. Top-3 Ranking<br/>28 Features & 5-Seed LGBM]
-        FINALIZE[4. Close Finalize<br/>3중 Fail-Closed Gate]
-        PAPER[5. Paper Rehearsal<br/>15:30 진입 & 익일 09:00 청산]
-    end
+    V_KW[키움증권 REST ka10027<br/>전시장 등락률 스캔]:::vendor
+    V_KIS[한국투자증권 KIS REST<br/>10호가 및 장중 잠정수급]:::vendor
+    V_LS[LS증권 REST t8412<br/>정규장 1분봉 일괄수신]:::vendor
 
-    subgraph Storage [Parquet Data Lake]
-        ARCH[(archive.parquet<br/>일일 스냅샷)]
-        PRICE[(price_history.parquet<br/>전종목 일별 패널)]
-        DEC[(topk_decisions.parquet<br/>추론 결정 감사로그)]
-    end
+    P_SCAN[1. 유니버스 스캔<br/>2%~10% 상승 후보 추출]:::stage1
+    P_COLLECT[2. 단면 캡처 및 심사<br/>틱비용 12bp 이하 및 정상률 99%]:::stage2
+    P_RANK[3. Top-3 앙상블 추론<br/>28차원 PIT 피처 슬라이싱]:::stage2
+    P_GATE[4. 15:30 종가 확정<br/>3중 Fail-Closed 게이트]:::stage3
+    P_PAPER[5. 가상 체결 및 청산<br/>결정시점 사이징 및 시초가 청산]:::stage4
 
-    KW --> SCAN --> COLLECT
-    KIS --> COLLECT -->|Upsert| ARCH
-    ARCH & PRICE --> PREDICT -->|Top-3 확정| DEC
-    KIS --> FINALIZE -->|종가 확정| ARCH
-    FINALIZE -->|OnSuccess| PAPER
-    DEC --> PAPER
-    LS -.->|야간 적재| ARCH
+    S_ARCH[(archive.parquet<br/>15:20 스냅샷 및 종가)]:::stage3
+    S_DEC[(topk_decisions.parquet<br/>의사결정 감사로그)]:::stage3
+    S_LEDGER[(data/paper/ 원장<br/>append-only 체결 이벤트)]:::stage4
+
+    V_KW -->|200행 스캔 0.2초| P_SCAN --> P_COLLECT
+    V_KIS -->|호가 수급 캡처| P_COLLECT -->|원자적 저장| S_ARCH
+    S_ARCH --> P_RANK -->|Top-3 확정| S_DEC
+    V_KIS -->|체결가 일치 검증| P_GATE -->|종가확정 True| S_ARCH
+    P_GATE -->|진입 트리거| P_PAPER --> S_LEDGER
+    V_LS -.->|야간 1분봉 적재| S_ARCH
 ```
 
 ---
 
-## 5. End-to-End Flow
+## 4. Top 5 Real-world Engineering Invariants (핵심 챌린지)
 
-| 단계 | 시각 (KST) | 처리 내용 | 무결성 제약 및 안전장치 |
-| :--- | :---: | :--- | :--- |
-| **1. 후보 스캔** | `15:20:00` | 키움 REST API로 당일 2%~10% 전시장 종목 고속 스캔 (0.2초) | 15:20~15:30 외 실행 차단, 후보군 공백 시 조기 중단 |
-| **2. 단면 캡처** | `15:20:10` | KIS 현재가·10호가·잠정수급 수집, 12bp 틱비용 상한 필터 적용 | 단면 정상률 99% 미달 시 저장 거부 (Fail-Closed) |
-| **3. 랭킹 추론** | `15:21:00` | 28차원 PIT 피처 산출 및 5-Seed LightGBM 앙상블 Top-3 선정 | 결측 시 플레이스홀더 금지, 적격 부족 시 전액 현금 보유 |
-| **4. 종가 확정** | `15:30:30` | 15:30 장마감 단일가 3중 게이트 검증 후 아카이브 인플레이스 갱신 | 시계 + 단일가코드('3') + 체결가 일치 검증 통과 시 확정 |
-| **5. 가상 진입** | `15:30:35` | 종가 확정 즉시 트리거되어 자본 비중 할당 및 가상 체결 기록 | `종가_확정=True` 성공 시에만 진입 트리거 |
-| **6. 기계적 청산** | 익일 `09:00:00` | 사후 갭 필터 없이 익일 시초가에 전량 기계적 청산 및 손익 반영 | 실시간 체결틱(`H0STCNT0`) 기반 현실적 슬리피지 반영 |
+### 1. Point-in-Time 정보 누출 방지와 듀얼 타임스탬프 격리
+* 🚨 **문제**: 15:30 확정 종가나 익일 시초가 갭을 미리 참조하는 사후 정보 편향(Look-Ahead Bias) 발생 시 백테스트와 실전 간 치명적 괴리 발생.
+* 📐 **원칙**: 의사결정 시점(15:20)에 관측 불가능한 미래 데이터 유입은 0건이어야 하며, 사후 갭 필터 등 백테스트 환각을 전면 배제한다.
+* 💡 **해결**: `decision_close`(15:20 잠정가)와 `close`(15:30 확정가)를 분리 보존하고, 익일 09:00 시초가 기계적 전량 청산으로 장중 리스크 노출 시간을 **`0분`**으로 단축.
+
+### 2. 저가주 호가단위 마찰비용 잠식 차단 (Tick Friction)
+* 🚨 **문제**: 5,000원 미만 저가주는 1틱이 20~50bp에 달해, 왕복 스프레드와 거래세 차감 시 모델의 예측 알파가 전액 잠식되어 실전 손실 발생.
+* 📐 **원칙**: 1호가 간격이 기대 수익률을 초과하는 불리한 종목은 모델 추론 전 유니버스 스크리닝 단계에서 원천 차단한다.
+* 💡 **해결**: 주가 구간별 1틱 비용 12.0bp 초과 종목 및 상한가 근접 종목(`chg_ratio >= 0.29`)을 원천 배제하여 연환산 Sharpe **`+0.84`** 향상 실증.
+
+### 3. 단일 증권사 API 한도와 10분 결정창 병목 해소
+* 🚨 **문제**: 15:20~15:30의 10분 창 내에 전종목 스캔, 10호가/수급 조회, 분봉 아카이빙을 단일 벤더(TPS 18)로 수행 시 429 차단 발생.
+* 📐 **원칙**: 특정 브로커 장애가 전체 파이프라인 정지로 이어지지 않도록 브로커 특성별 분산 라우팅과 무차단 비동기 I/O를 강제한다.
+* 💡 **해결**: 키움(200행 스캔 0.2초) + KIS(10호가/수급 캡처) + LS(390개 1분봉 일괄 수신) + 토스(멀티 쿼트 백업) 결합으로 수집 시간을 **`6초`** 이내로 단축.
+
+### 4. 금융 시계열 자기상관성 과적합 방어 (Purged CV)
+* 🚨 **문제**: 전통적 K-Fold 교차검증 적용 시 시계열 인접 구간의 정보 누출과 시장 일별 노이즈 학습으로 라이브 환경에서 성능 급락.
+* 📐 **원칙**: 시간 순서가 보존된 무누출 블록 분할과 횡단면 상대 랭킹 학습을 통해서만 일반화 성능을 검증한다.
+* 💡 **해결**: Combinatorial Purged CV(8,2)로 28개 무누출 경로를 평가하고, **`168시간 시계열 엠바고(정보 누출 방지 유예)`** 및 `date_demeaned` 타깃 5-Seed LGBM 앙상블 적용.
+
+### 5. 휴장일 유령 체결 방지와 원장 동시성 무결성 (Ledger Integrity)
+* 🚨 **문제**: 스케줄러 재시작 시 임의 시각 체결이나 휴장일 전일 종가 기반 가상 체결이 발생하여 기준 포트폴리오(단위북 1.0x) 자산 가치 왜곡.
+* 📐 **원칙**: 모든 체결은 당일 세션 증명(Session Attestation)을 거쳐야 하며, 원장 수정은 감사 가능한 단방향(Append-only) 이벤트로만 허용한다.
+* 💡 **해결**: 세션 캘린더 단일 리졸버와 일봉 영업일 이중 검증을 도입하고, 커널 `flock` 기반 호스트 세션 락으로 프로세스 경합 결함 **`0건`** 보장.
 
 ---
 
-## 6. Repository Structure
+## 5. Verified Performance Matrix (실측 정본 성과)
+
+> **출처**: `docs/research/closing_strategy_matrix.md` 및 `artifacts/research/costaware_topk_report.parquet`  
+> **검증 기간**: 2023-01-25(KRX 호가단위 개편일) ~ 2026-09-10 (886 거래일, 68,493개 단면)  
+> **비용 조건**: KRX 법정거래세(18~23bp) + 보수적 왕복 2.0틱 호가 스프레드 + KIS 우대수수료(왕복 0.73bp) 전액 실측 차감
+
+| 파이프라인 모델 | 전략 조건 및 사이징 | 일평균 순수익 | Sharpe | t-statistic | 일별 승률 | 최대 낙폭 (MDD) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **비용 비인식 기준선** | Base Top-3 (Equal-Weight) | +31.27 bp | 2.57 | 4.81 | 55.8% | 25.03% |
+| **동적 K형 알파 챔피언** | Dynamic K (확신도 스프레드 $\ge$ 15bp 시 K=1, 외 K=3) | **+36.47 bp** | **2.59** | **4.86** | **55.0%** | **21.28%** |
+| **역틱 가중 개선 모델** | Current Cap (12bp) + 역틱 가중치 (Inv-Tick) | **+34.58 bp** | **2.73** | **5.12** | **56.3%** | **28.98%** |
+| **극방어형 쉴드 챔피언** | K=2~3 + 당일 시가 갭유지 + 외인·기관 쌍끌이 순매수 | **+27.54 bp** | **2.85** | **5.34** | **48.9%** | **11.86%** |
+
+---
+
+## 6. Architecture Layer Contracts
 
 ```text
-k-closing-alpha/
-├── src/
-│   ├── daily/                # 일별 자동화 파이프라인 (스캔, 수집, 추론, 종가확정, 페이퍼매매)
-│   ├── ml/                   # 머신러닝 리서치 (CPCV 8,2, 리랭커, 피처엔지니어링, 재학습 CLI)
-│   ├── serving/realtime/     # 실시간 서빙 피처 변환 및 모델 번들 로더
-│   ├── strategy/             # 유니버스 스크린 및 전략 불변 계약 (COST_AWARE_UNIVERSE)
-│   ├── execution/            # 실측 법정세율 스케줄, 호가단위 틱비용 모델, 페이퍼 브로커
-│   ├── data/                 # Parquet 코덱, 패널 정합성 복구, 일중 분봉/호가 스토어
-│   ├── api/                  # 증권사 4사(KIS, Kiwoom, Toss, LS) OpenAPI 클라이언트
-│   └── tools/                # 시스템 감사(daily_audit), 웹훅 실패 알림(alerts)
-├── artifacts/models/         # 학습된 5-Seed ML 모델 번들 및 CPCV 검증 리포트
-├── data/history/             # Parquet 데이터 레이크 (수정주가, 일일 스냅샷, 분봉/틱)
-├── deploy/systemd/           # 무중단 스케줄링 systemd 서비스 및 타이머 유닛
-├── docs/architecture/        # 아키텍처 개요, 데이터 흐름, 컴포넌트, ADR 문서
-│   └── data/                 # 증권사 OpenAPI 상세 규격서 모음
-└── tests/                    # 1,061개 단위/통합 테스트 스위트 (100% Pass)
+Layer 4: Production CLI & System Entrypoints (src/daily/, src/backfill/, src/tools/)
+   ↓
+Layer 3: Serving & Automation Orchestrators (src/serving/, src/ml/retrain.py)
+   ↓
+Layer 2: Quant Domain Engine & Research (src/strategy/, src/ml/, src/execution/)
+   ↓
+Layer 1: Data Access & Infrastructure Gateways (src/data/, src/api/, src/sync/, src/utils/)
+   ↓
+Layer 0: Core Schemas, Types, and Configurations (src/config/, src/settings.py)
 ```
 
 ---
 
-## 7. Technical Decisions
-
-| 결정 사항 | 선택 이유 (Why) | 트레이드오프 (Trade-off) |
-| :--- | :--- | :--- |
-| **Parquet 컬럼형 스토리지** | 10년 치 전종목 패널에서 15:20 시점 28개 롤링 피처를 1초 내 계산하기 위한 제로카피 I/O | 단일 행 실시간 업데이트 불가 $\rightarrow$ 임시 파일 원자적 교체(`atomic_write_parquet`)로 해결 |
-| **증권사 4사 분산 라우팅** | 단일 증권사의 초당 요청 한도(TPS 18)와 15:20 결정창(10분) 병목 해소 | 증권사별 상이한 인증 규약 및 응답 데이터 정규화 레이어 유지보수 비용 |
-| **12.0bp 틱비용 상한 필터** | 1호가당 20~50bp를 지불해야 하는 저가 동전주 알파 잠식 차단 | 변동성이 큰 저가 테마주 일부 탈락 (단, 포트폴리오 MDD와 실현가능성 대폭 개선) |
-| **CPCV(8,2) & 5-Seed 앙상블** | 시계열 자기상관성 과적합을 방지하고 당일 후보군 내 상대적 랭킹 우위 극대화 | 5개 모델 유지로 추론 시간 소폭 증가 (0.2초 $\rightarrow$ 1.1초, 허용 한도 내) |
-
----
-
-## 8. Validation & Reliability
-
-* **엄격한 시간 분할**: 
-  - 학습/검증: 2016-01-04 ~ 2026-09-09
-  - 인증(Certification): 2023-01-25(KRX 호가단위 개편일) ~ 2026-09-09 (885 거래일)
-* **Point-in-Time 원칙**: 15:20 의사결정 시점에는 [t-w, t-1] 롤링 창 및 당일 15:20 잠정 수급만 사용하며 미래 데이터 참조 0건.
-* **실측 마찰비용 차단**: 법정 증권거래세(18~23bp) + 보수적 왕복 2.0틱 스프레드 + 위탁수수료 전액 차감.
-* **Fail-Closed 안전장치**: 장 시간 외/휴장일 실행 차단, 단면 수집 정상률 99% 미달 시 저장 거부, 3중 종가 확정 게이트.
-* **테스트 신뢰성**: 1,061개 Unit/Integration 테스트 100% 통과 (`uv run pytest`).
-
----
-
-## 9. Empirical Results
-
-KRX 호가단위 개편 이후 인증 구간(2023-01-25 ~ 2026-09-09, 885 거래일) 실측 성과:
-
-### 1) 프로덕션 Top-3 랭커 성과 (비용 전액 차감 후 순수익 기준)
-
-| 평가 지표 (Metric) | 실측 측정값 (Measured Value) |
-| :--- | :---: |
-| **검증 기간 (Trading Days)** | **885 일** |
-| **전략 실행 가능일 비율 (Feasibility)** | **99.89%** (884일 진입 / 1일 관망) |
-| **일평균 순수익률 (Mean Net Return)** | **+46.08 bp / 일** (중앙값: **+36.94 bp**) |
-| **일별 승률 (Daily Win Rate)** | **58.98%** (522승 362패) |
-| **연환산 샤프 지수 (Sharpe Ratio)** | **3.48** (t-statistic: **6.53**) |
-| **비용정렬 기준선 대비 우위 (vs Cost-Sort)** | **28 / 28 경로 승리 (100%)**, 평균 초과 알파 **+25.39 bp** ($p=0.000214$) |
-
-### 2) 연도별 안정성 및 비용 스트레스 테스트
-
-| 연도 | 거래일수 | 일평균 순수익 | Sharpe | | 스프레드 시나리오 | 일평균 순수익 | t-stat | 결과 |
-| :---: | :---: | :---: | :---: |---| :--- | :---: | :---: | :---: |
-| **2023** | 230 일 | +34.33 bp | 3.12 | | **기준선 (왕복 2.0틱)** | **+46.08 bp** | **6.53** | **PASS** |
-| **2024** | 244 일 | +28.57 bp | 2.51 | | **1.5배 마찰 (왕복 3.0틱)** | **+38.03 bp** | **5.38** | **PASS** |
-| **2025** | 242 일 | +65.71 bp | 5.30 | | **2.0배 극단 (왕복 4.0틱)** | **+29.98 bp** | **4.24** | **PASS** |
-| **2026** | 169 일 | +59.24 bp | 3.20 | | *(극심한 유동성 경색 시에도 통계적으로 유의한 순알파 유지)* | | | |
-
----
-
-## 10. Getting Started
+## 7. Quick Start & Verification
 
 ```bash
-# 1. 의존성 설치
+# 1. 가상환경 동기화
 uv sync
 
-# 2. 전체 1,061개 테스트 수행
+# 2. 전체 단위 및 통합 테스트 스위트 검증 (1,061개 Invariant Guards)
 uv run pytest
 
-# 3. 실시간 파이프라인 수동 실행
-uv run python -m src.daily.collect         # 15:20 단면 수집
-uv run python -m src.daily.predict         # 15:21 Top-3 랭커 추론
-uv run python -m src.daily.finalize_close  # 15:30 종가 확정
-uv run python -m src.daily.paper_trade --phase entry # 15:30 페이퍼 진입
-uv run python -m src.daily.paper_trade --phase exit  # 익일 09:00 페이퍼 청산
+# 3. 실시간 일별 파이프라인 단계별 수동 검증
+uv run python -m src.daily.collect         # 15:20 후보 스캔 및 단면 수집
+uv run python -m src.daily.predict         # 15:21 Top-3 리랭커 추론
+uv run python -m src.daily.finalize_close  # 15:30 3중 종가 확정
+uv run python -m src.daily.paper_trade --phase entry # 15:30 가상 매수
+uv run python -m src.daily.paper_trade --phase exit  # 익일 09:00 기계적 청산
 
-# 4. systemd 타이머 자동화 설치 (Linux/WSL)
-bash deploy/install_systemd.sh
+# 4. 아키텍처 정본 문서
+# • 시스템 상세 설계서: docs/architecture/system-design.md
+# • 핵심 기술 의사결정(ADR): docs/architecture/engineering-decisions.md
 ```
-
----
-
-## 11. Documentation
-
-* [System Architecture Overview](file:///home/kth/k-closing-alpha/docs/architecture/overview.md) — 시스템 경계 및 브로커 쿼터 매트릭스
-* [Data Flow & Invariants](file:///home/kth/k-closing-alpha/docs/architecture/data-flow.md) — 듀얼 타임스탬프 규약 및 5대 Fail-Closed 게이트
-* [Component Architecture](file:///home/kth/k-closing-alpha/docs/architecture/components.md) — 모듈별 책임 및 I/O 계약
-* [Architecture Decision Records (ADRs)](file:///home/kth/k-closing-alpha/docs/architecture/design-decisions.md) — 5대 기술적 의사결정 Rationale & Trade-offs
-* [Broker OpenAPI Specifications](file:///home/kth/k-closing-alpha/docs/architecture/data/api_master.md) — 증권사 4사 API 세부 규격서
-
----
-
-## 12. Limitations
-
-1. **실주문 OMS 미연동 (Paper Rehearsal 한정)**: 현재 파이프라인은 가상 체결 원장 기반 리허설로 운영되며, 실계좌 자금 집행을 위해서는 추가 주문 승인 게이트 및 킬스위치가 필요합니다.
-2. **익일 장중 동적 청산 미지원**: 오버나잇 갭에만 집중하므로 익일 09:00 이후 발생하는 장중 급등락에 대한 트레일링 스탑은 수행하지 않습니다.
-3. **유동성 용량 한계 (Capacity Ceiling)**: Top-3 종목 집중 전략 특성상 운용 자산(AUM) 규모가 수십억 원 이상으로 커질 경우 시장 충격 비용이 증가할 수 있습니다.

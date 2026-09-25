@@ -32,7 +32,7 @@
     "access_token_token_expired": "2026-09-10 20:50:00"
   }
   ```
-* **Lifecycle:** 24h validity, stored per app key under `KIS_TOKEN_CACHE_DIR` (`token_cache_path`). Auto-refreshed if under 10m remains, or upon `EGW00121`/`EGW00123` errors.
+* **Lifecycle:** 24h validity. Stored in `settings.TOKEN_FILE`. Auto-refreshed if under 10m remains, or upon `EGW00121`/`EGW00123` errors.
 
 ### 1.3 Common Request Headers
 ```http
@@ -158,19 +158,25 @@ custtype: P
 ## 5. Ranking & Screening TRs (순위 / 조건검색)
 
 ### 5.1 `FHPST01700000` — 등락률 순위 (Fluctuation Ranking)
+> [!IMPORTANT]
+> 실측 정정(2026-09-17): 이 TR은 14개 필드가 전부 필수다. 이전 문서는 6개만
+> 기재해 나머지 7개(`FID_PRC_CLS_CODE` 등)가 누락된 채 배포됐고 KIS가
+> `OPSQ2001 ERROR INPUT FIELD NOT FOUND`로 거부했다(라이브 호출로 검증).
 * **Path:** `GET /uapi/domestic-stock/v1/ranking/fluctuation`
-* **Params:** `FID_COND_MRKT_DIV_CODE` (`J`), `FID_COND_SCR_DIV_CODE` (`20170`), `FID_INPUT_ISCD` (`0000`), `FID_RANK_SORT_CLS_CODE` (`0`: 상승률순), `FID_INPUT_CNT_1` (`200`), `FID_RSFL_RATE1` (min%), `FID_RSFL_RATE2` (max%).
-* **Output (`output`):** `stck_shrn_iscd`, `hts_kor_isnm`, `stck_prpr`, `prdy_ctrt`, `acml_vol`, `acml_tr_pbmn`.
+* **Params:** `FID_COND_MRKT_DIV_CODE` (`J`), `FID_COND_SCR_DIV_CODE` (`20170`), `FID_INPUT_ISCD` (`0000`), `FID_RANK_SORT_CLS_CODE` (`0`: 상승률순), `FID_INPUT_CNT_1` (`200`), `FID_PRC_CLS_CODE` (`0`: 전체), `FID_INPUT_PRICE_1` (`""`), `FID_INPUT_PRICE_2` (`""`), `FID_VOL_CNT` (`""`), `FID_TRGT_CLS_CODE` (`0`), `FID_TRGT_EXLS_CLS_CODE` (`0`), `FID_DIV_CLS_CODE` (`0`), `FID_RSFL_RATE1` (min%), `FID_RSFL_RATE2` (max%).
+* **Output (`output`):** `stck_shrn_iscd`, `hts_kor_isnm`, `stck_prpr`, `prdy_ctrt`, `acml_vol`. `acml_tr_pbmn`(누적거래대금)은 이 TR에 없다 — 이전 문서 기재가 오류였다(실측 확인). 클라이언트는 미제공을 0으로 취급한다(선정 순위는 랭크 위치로 결정되고 이 값은 메타데이터 표시용이라 영향 없음).
 
-### 5.2 `FHPST01710000` — 거래량 순위 (Volume Ranking)
-* **Path:** `GET /uapi/domestic-stock/v1/ranking/volume`
-* **Params:** `FID_COND_MRKT_DIV_CODE` (`J`), `FID_COND_SCR_DIV_CODE` (`20171`), `FID_INPUT_ISCD` (`0000`), `FID_DIV_CLS_CODE` (`0`), `FID_BLNG_CLS_CODE` (`0`), `FID_TRGT_CLS_CODE` (`0000000000`), `FID_TRGT_EXLS_CLS_CODE` (`0000000000`), `FID_INPUT_PRICE_1` (`""`), `FID_INPUT_PRICE_2` (`""`), `FID_VOL_CNT` (`""`), `FID_INPUT_CNT_1` (`100`).
-* **Output (`output`):** `stck_shrn_iscd`, `hts_kor_isnm`, `stck_prpr`, `prdy_ctrt`, `acml_vol`, `vol_inrt` (거래량증가율).
-
-### 5.3 `FHPST01720000` — 거래대금 순위 (Trade Amount Ranking)
-* **Path:** `GET /uapi/domestic-stock/v1/ranking/trade-amount`
-* **Params:** `FID_COND_MRKT_DIV_CODE` (`J`), `FID_COND_SCR_DIV_CODE` (`20172`), `FID_INPUT_ISCD` (`0000`), `FID_INPUT_CNT_1` (`100`).
-* **Output (`output`):** `stck_shrn_iscd`, `hts_kor_isnm`, `stck_prpr`, `prdy_ctrt`, `acml_tr_pbmn` (누적거래대금).
+### 5.2 `FHPST01710000` — 거래량/거래대금 순위 (Volume/Trade-Amount Ranking, `FID_BLNG_CLS_CODE`로 정렬 기준 선택)
+> [!IMPORTANT]
+> 실측 정정(2026-09-17): 이 화면은 하나의 TR로 여러 정렬 기준을 제공하는 템플릿이다.
+> 이전 문서(구 5.3)가 "거래대금 순위"를 별도 TR `FHPST01720000`·경로
+> `/ranking/trade-amount`로 잘못 기재해 프로덕션에서 404(JSONDecodeError)가
+> 발생했다. `FHPST01720000`의 실제 정체는 "호가잔량 순위"이며 해당 경로는
+> KIS에 존재하지 않는다(공식 `koreainvestment/open-trading-api` 재확인, 라이브
+> 호출로 검증). 거래대금순위는 아래처럼 `FID_BLNG_CLS_CODE="3"`으로 조회한다.
+* **Path:** `GET /uapi/domestic-stock/v1/quotations/volume-rank`
+* **Params:** `FID_COND_MRKT_DIV_CODE` (`J`), `FID_COND_SCR_DIV_CODE` (`20171`), `FID_INPUT_ISCD` (`0000`), `FID_DIV_CLS_CODE` (`0`), `FID_BLNG_CLS_CODE` (`0`: 평균거래량, `3`: 거래금액순), `FID_TRGT_CLS_CODE` (`0000000000`), `FID_TRGT_EXLS_CLS_CODE` (`0000001100`: ETF·ETN 제외 — 미제외 시 6자리 숫자가 아닌 종목코드가 섞여 스키마 검증 거부됨, 실측 확인), `FID_INPUT_PRICE_1` (`""`), `FID_INPUT_PRICE_2` (`""`), `FID_VOL_CNT` (`""`), `FID_INPUT_DATE_1` (`""`).
+* **Output (`output`):** `mksc_shrn_iscd` (종목코드 — 5.1의 `stck_shrn_iscd`와 필드명이 다름), `hts_kor_isnm`, `stck_prpr`, `prdy_ctrt`, `acml_vol`, `acml_tr_pbmn` (누적거래대금).
 
 ### 5.4 `FHKST01010600` — 시가총액 순위 (Market Cap Ranking)
 * **Path:** `GET /uapi/domestic-stock/v1/ranking/market-cap`
@@ -193,9 +199,11 @@ custtype: P
 > [!IMPORTANT]
 > 주문 및 계좌 관련 TR은 실전계좌(`TTTC...`)와 모의투자(`VTTC...`)에서 서로 다른 `tr_id`를 사용합니다.
 
-### 6.1 `TTTC0802U` / `VTTC0802U` — 주식 현금 매수 주문 (Buy Order)
+### 6.1 `TTTC0012U` / `VTTC0012U` — 주식 현금 매수 주문 (Buy Order)
+> [!NOTE]
+> 2026-09-11 기준 공식 저장소(`koreainvestment/open-trading-api`) 재확인 결과 이 문서의 구 TR(`TTTC0802U` 등)은 최신 규격이 아니며, 실제 구현(`src/execution/kis_client.py`)은 `TTTC0012U`/`TTTC0011U`/`TTTC0013U`/`TTTC0081R`을 사용한다.
 * **Path:** `POST /uapi/domestic-stock/v1/trading/order-cash`
-* **Headers:** `tr_id: "TTTC0802U"` (실전) / `"VTTC0802U"` (모의투자), `custtype: "P"`
+* **Headers:** `tr_id: "TTTC0012U"` (실전) / `"VTTC0012U"` (모의투자), `custtype: "P"`
 * **Body:**
   ```json
   {
@@ -204,7 +212,10 @@ custtype: P
     "PDNO": "005930",
     "ORD_DVSN": "00",
     "ORD_QTY": "10",
-    "ORD_UNPR": "70000"
+    "ORD_UNPR": "70000",
+    "EXCG_ID_DVSN_CD": "KRX",
+    "SLL_TYPE": "",
+    "CNDT_PRIC": ""
   }
   ```
 * **Order Type (`ORD_DVSN`):**
@@ -213,23 +224,23 @@ custtype: P
   * `02`: 조건부지정가
   * `03`: 최유리지정가
   * `04`: 최우선지정가
-  * `05`: 장전 시간외 종가 (08:30~08:40)
-  * `06`: 장후 시간외 종가 (15:40~16:00)
-  * `07`: 시간외 단일가 (16:00~18:00)
+  * `05`: 장전 시간외종가 (08:30~08:40)
+  * `06`: 장후 시간외종가 (15:40~16:00)
+  * `07`: KRX 2026-09-14 세션 개편으로 대상 세션(16:00~18:00 단일가) 소멸 — 사용 금지. 애프터마켓(16:00~20:00)은 연속매매이며 본 코드와 무관.
 * **Response Body (`output`):**
   * `KRX_FWDG_ORD_ORGNO`: 한국거래소 전송 주문조직번호
   * `ODNO`: 주문번호 (Order Number)
   * `ORD_TMD`: 주문시각 (`HHMMSS`)
 
-### 6.2 `TTTC0801U` / `VTTC0801U` — 주식 현금 매도 주문 (Sell Order)
+### 6.2 `TTTC0011U` / `VTTC0011U` — 주식 현금 매도 주문 (Sell Order)
 * **Path:** `POST /uapi/domestic-stock/v1/trading/order-cash`
-* **Headers:** `tr_id: "TTTC0801U"` (실전) / `"VTTC0801U"` (모의투자), `custtype: "P"`
-* **Body:** `CANO`, `ACNT_PRDT_CD`, `PDNO`, `ORD_DVSN`, `ORD_QTY`, `ORD_UNPR`
+* **Headers:** `tr_id: "TTTC0011U"` (실전) / `"VTTC0011U"` (모의투자), `custtype: "P"`
+* **Body:** `CANO`, `ACNT_PRDT_CD`, `PDNO`, `ORD_DVSN`, `ORD_QTY`, `ORD_UNPR`, `EXCG_ID_DVSN_CD`, `SLL_TYPE`(`"01"` 일반매도), `CNDT_PRIC`
 * **Response Body (`output`):** `ODNO` (주문번호), `ORD_TMD`.
 
-### 6.3 `TTTC0803U` / `VTTC0803U` — 주식 정정 / 취소 주문 (Modify / Cancel)
+### 6.3 `TTTC0013U` / `VTTC0013U` — 주식 정정 / 취소 주문 (Modify / Cancel)
 * **Path:** `POST /uapi/domestic-stock/v1/trading/order-rvsecncl`
-* **Headers:** `tr_id: "TTTC0803U"` (실전) / `"VTTC0803U"` (모의투자)
+* **Headers:** `tr_id: "TTTC0013U"` (실전) / `"VTTC0013U"` (모의투자)
 * **Body:**
   ```json
   {
@@ -282,9 +293,9 @@ custtype: P
     * `evlu_amt_smtl_amt`: 평가금액합계
     * `evlu_pfls_smtl_amt`: 평가손익합계
 
-### 6.5 `TTTC8908R` / `VTTC8908R` — 주식 체결 / 미체결 내역 조회 (Fills & Open Orders)
+### 6.5 `TTTC0081R` / `VTTC0081R` — 주식 체결 / 미체결 내역 조회 (Fills & Open Orders, 3개월 이내)
 * **Path:** `GET /uapi/domestic-stock/v1/trading/inquire-daily-ccld`
-* **Headers:** `tr_id: "TTTC8908R"` (실전) / `"VTTC8908R"` (모의투자)
+* **Headers:** `tr_id: "TTTC0081R"` (실전) / `"VTTC0081R"` (모의투자) — 3개월 이전 조회는 `CTSC9215R`/`VTSC9215R`
 * **Query Params:**
   * `CANO`, `ACNT_PRDT_CD`
   * `INQR_STRT_DT`: 조회시작일 (`YYYYMMDD`)
