@@ -145,6 +145,7 @@ def test_attach_pit_net_label_uses_pit_tick_cost_and_clips_label() -> None:
     import pandas as pd
     import pytest
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.ml.topk_ranker_research import attach_pit_net_label
     from src.strategy.contract import AA_COST
 
@@ -159,12 +160,12 @@ def test_attach_pit_net_label_uses_pit_tick_cost_and_clips_label() -> None:
     # When
     out = attach_pit_net_label(cands, cost=AA_COST, label_clip=0.10)
 
-    # Then: net_pit = gross - (20 + 2*tick)/1e4; NaN tick propagates, never 0
-    assert np.isclose(float(out.loc[0, "net_pit"]), 0.016)
+    # Then: net_pit = gross - (20 + 2*tick + brokerage)/1e4; NaN tick propagates, never 0
+    assert np.isclose(float(out.loc[0, "net_pit"]), 0.02 - (20.0 + 2 * 10.0 + BROKERAGE_FEE_BP) / 1e4)
     assert np.isnan(float(out.loc[2, "net_pit"]))
     # Then: train_label is the clipped net_pit
     assert np.isclose(float(out.loc[1, "train_label"]), 0.10)
-    assert np.isclose(float(out.loc[0, "train_label"]), 0.016)
+    assert np.isclose(float(out.loc[0, "train_label"]), 0.02 - (20.0 + 2 * 10.0 + BROKERAGE_FEE_BP) / 1e4)
     assert np.isnan(float(out.loc[2, "train_label"]))
 
     with pytest.raises(ValueError, match="tick_cost_bp"):
@@ -1032,6 +1033,7 @@ def test_attach_pit_net_label_nets_with_the_point_in_time_statutory_rate() -> No
     import pandas as pd
     import pytest
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.ml.topk_ranker_research import attach_pit_net_label
     from src.strategy.contract import AA_COST
 
@@ -1048,9 +1050,10 @@ def test_attach_pit_net_label_nets_with_the_point_in_time_statutory_rate() -> No
     # When: attaching the PIT net label
     out = attach_pit_net_label(cands, cost=AA_COST, label_clip=0.10)
 
-    # Then: the statutory leg is 30bp in 2018 and 15bp in 2025
+    # Then: the statutory leg is 30bp in 2018 and 15bp in 2025, plus brokerage
     np.testing.assert_allclose(
-        out["net_pit"].to_numpy(), [0.20 - 40.0 / 1e4, 0.01 - 25.0 / 1e4]
+        out["net_pit"].to_numpy(),
+        [0.20 - (40.0 + BROKERAGE_FEE_BP) / 1e4, 0.01 - (25.0 + BROKERAGE_FEE_BP) / 1e4],
     )
     # And: the training label is clipped symmetrically
     assert out["train_label"].to_numpy()[0] == pytest.approx(0.10)

@@ -1677,3 +1677,48 @@ def test_finalize_amain_skips_quoting_on_shifted_session(monkeypatch) -> None:
 
     assert asyncio.run(finalize_close._amain(SimpleNamespace(date="2026-11-19", retry_interval=30.0))) == 0
     recorder.assert_called_once_with("finalize_close", "OK", run_date="2026-11-19", reason="session_shifted")
+
+
+def test_amain_missing_cohort_degrades_to_uncaptured_finalization(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from src.daily import finalize_close
+    from src.data.session_calendar import SessionKind
+
+    class _FakeSession:
+        async def close(self):
+            return None
+
+    class _FakeClient:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def create_session(self, **_kw):
+            return _FakeSession()
+
+        async def ensure_token(self, _session, force_refresh=False):
+            return "T"
+
+    seen: dict = {}
+
+    async def _fake_finalization(*_a, **kwargs):
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(finalize_close, "KisApiClient", _FakeClient)
+    monkeypatch.setattr(
+        finalize_close, "resolve_session_day",
+        lambda _d: SimpleNamespace(kind=SessionKind.STANDARD),
+    )
+    monkeypatch.setattr(finalize_close.settings, "HISTORY_DIR", tmp_path)
+    monkeypatch.setattr(finalize_close.settings, "COLLECTION_ROOT", None)
+    monkeypatch.setattr(finalize_close, "load_pick_codes", lambda _d: frozenset())
+    monkeypatch.setattr(finalize_close, "run_close_finalization", _fake_finalization)
+
+    rc = asyncio.run(finalize_close._amain(SimpleNamespace(date="2026-09-10", retry_interval=30.0)))
+
+    assert rc == 0
+    assert seen["capture_store"] is None
+    assert seen["run_id"] is None
+    assert seen["cohort_id"] is None

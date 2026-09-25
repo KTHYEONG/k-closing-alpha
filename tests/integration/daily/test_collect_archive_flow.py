@@ -21,31 +21,6 @@ class _FakeKisClient:
     async def get_market_index_rate(self, session: object, code: str) -> dict:
         return {"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "1.00"}}
 
-    async def get_condition_list(self, session: object) -> dict:
-        cond_names = [
-            collect.settings.TARGET_CONDITION_NAME,
-            collect.settings.OVERHEATED_CONDITION_NAME,
-            collect.settings.NEW_HIGH_CONDITION_NAME,
-            collect.settings.NEAR_NEW_HIGH_CONDITION_NAME,
-        ]
-        return {
-            "rt_cd": "0",
-            "output2": [
-                {"condition_nm": name, "seq": idx + 1}
-                for idx, name in enumerate(cond_names)
-            ],
-        }
-
-    async def get_condition_result(self, session: object, seq: int) -> dict:
-        if seq == 4:  # 신고가 근접 조건: 실패 응답 경로 검증
-            return {"rt_cd": "9", "msg1": "조회 실패"}
-        return {
-            "rt_cd": "0",
-            "output2": [
-                {"code": "005930", "name": "삼성전자", "price": "1000", "chgrate": "1.00"}
-            ],
-        }
-
 
 class _AllListed(frozenset):
     def __contains__(self, item: object) -> bool:
@@ -245,7 +220,7 @@ def test_collect_main_raises_and_skips_persist_when_coverage_gate_fails(monkeypa
     )
 
     # When / Then: the coverage gate raises before any persistence is attempted
-    with pytest.raises(ValueError, match="real-time collection coverage"):
+    with pytest.raises(ValueError, match="coverage_below_threshold"):
         asyncio.run(collect.main(force=True))
     assert upsert_calls == []
 

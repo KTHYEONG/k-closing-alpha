@@ -2,24 +2,21 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from pydantic import AliasChoices, Field
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+from src.config._env import EnvSettings
 
 
-class KiwoomSettings(BaseSettings):
-    """키움증권 REST API 접속 설정."""
+class KiwoomSettings(EnvSettings):
+    """Kiwoom Securities REST API connection settings.
 
-    model_config = SettingsConfigDict(
-        env_file=_PROJECT_ROOT / ".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+    Field names use the vendor's correct spelling (KIWOOM). The historical
+    misspelled environment names (KIWOM_*) are still accepted as aliases because
+    the workstation secret source is shared with another repository and the VPS
+    env file is re-provisioned separately from code deploys; the new name wins
+    when both are present.
+    """
 
-    KIWOM_APP_KEY: str = Field(default="")
-    KIWOM_SECRET_KEY: str = Field(default="")
-    KIWOM_BASE_URL: str = "https://api.kiwoom.com"
-    KIWOM_TICK_MAX_PAGES: int = Field(default=30)
+    KIWOOM_APP_KEY: str = Field(default="", validation_alias=AliasChoices("KIWOOM_APP_KEY", "KIWOM_APP_KEY"))
+    KIWOOM_SECRET_KEY: str = Field(default="", validation_alias=AliasChoices("KIWOOM_SECRET_KEY", "KIWOM_SECRET_KEY"))
+    KIWOOM_BASE_URL: str = Field(default="https://api.kiwoom.com", validation_alias=AliasChoices("KIWOOM_BASE_URL", "KIWOM_BASE_URL"))

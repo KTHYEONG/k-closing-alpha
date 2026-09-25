@@ -19,7 +19,7 @@ def test_indicators_kis_clients_use_data_key_kwargs() -> None:
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "KisApiClient"
     ]
 
-    assert len(calls) == 5
+    assert len(calls) == 1
     for call in calls:
         assert call.args == []
         assert len(call.keywords) == 1

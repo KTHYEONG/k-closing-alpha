@@ -357,3 +357,38 @@ def test_capture_boundaries_cover_optional_branches() -> None:
             eligibility_rule_version="v1",
             rejections={"005930": "halted"},
         )
+
+
+def test_good_entry_states_are_exactly_terminal_successes() -> None:
+    from src.data.capture_contracts import GOOD_ENTRY_STATES, CaptureStatus
+
+    assert frozenset(
+        {CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE}
+    ) == GOOD_ENTRY_STATES
+    assert not (GOOD_ENTRY_STATES & {CaptureStatus.PENDING, CaptureStatus.PARTIAL, CaptureStatus.FAILED, CaptureStatus.UNKNOWN})
+
+
+def test_good_entry_states_defined_once_in_capture_contracts() -> None:
+    import ast
+    from pathlib import Path
+
+    hits: list[str] = []
+    for path in sorted(Path("src").rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                names = [
+                    target.id
+                    for target in node.targets
+                    if isinstance(target, ast.Name) and target.id in ("_GOOD_ENTRY_STATES", "GOOD_ENTRY_STATES")
+                ]
+                if names:
+                    hits.append(str(path))
+            elif isinstance(node, ast.AnnAssign):
+                target = node.target
+                if isinstance(target, ast.Name) and target.id in ("_GOOD_ENTRY_STATES", "GOOD_ENTRY_STATES"):
+                    hits.append(str(path))
+    assert hits == ["src/data/capture_contracts.py"]

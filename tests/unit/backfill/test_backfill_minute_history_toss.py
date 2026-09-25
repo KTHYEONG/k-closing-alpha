@@ -49,7 +49,7 @@ def test_fetch_toss_regular_session_bars_pages_and_filters_to_regular_hours() ->
     # Then: the 08:52 pre-market bar is excluded (before the 09:00 regular-session floor).
     # The 12:11 boundary bar is returned by BOTH pages (Toss's `before` cursor is inclusive),
     # but _fetch_toss_regular_session_bars dedupes on (symbol, ts_hms) itself -- relying on
-    # write_intraday_partition's merge-time dedup is NOT enough, since merge_partition_frame
+    # write_intraday_partition's merge-time dedup is NOT enough, since the write path
     # only dedupes new-vs-existing rows and does nothing for duplicates WITHIN a first write
     # (no pre-existing partition file yet), as verified empirically for this contract.
     assert sorted(out["ts_hms"].tolist()) == [121100, 153000]

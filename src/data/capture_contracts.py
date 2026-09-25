@@ -36,6 +36,16 @@ class CaptureStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+GOOD_ENTRY_STATES: frozenset[CaptureStatus] = frozenset(
+    {CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE}
+)
+"""Coverage statuses that certify a symbol's capture as usable.
+
+NO_TRADES and NOT_APPLICABLE are terminal successes (the venue produced nothing to capture), so a
+manifest whose entries are all in this set is COMPLETE; any other status makes it PARTIAL.
+"""
+
+
 class CaptureDataset(StrEnum):
     """Declared acquisition dataset of a capture context."""
 

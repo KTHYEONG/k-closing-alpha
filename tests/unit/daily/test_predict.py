@@ -123,31 +123,6 @@ def test_main_automated_mode_warns_and_prints_nothing_when_no_decision(monkeypat
     assert any(rec.levelno >= logging.WARNING for rec in caplog.records)
 
 
-def test_load_daily_snapshot_reads_archive_store_and_zero_fills_code(monkeypatch) -> None:
-    import pandas as pd
-
-    import src.daily.predict as predict_mod
-
-    # Given: the archive store returns the day's wide snapshot in 100M-KRW units
-    captured = {}
-
-    def _fake_fetch(snapshot_date=None, **kwargs):
-        captured["snapshot_date"] = snapshot_date
-        return pd.DataFrame({"종목코드": [5930, "000660"], "거래대금": [500.0, 300.0], "admitted": [True, False]})
-
-    monkeypatch.setattr(predict_mod, "fetch_archive_snapshot", _fake_fetch)
-    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", False)
-
-    # When
-    out = predict_mod.load_daily_snapshot(pd.Timestamp("2026-09-09"))
-
-    # Then
-    assert captured["snapshot_date"] == "2026-09-09"
-    assert out["종목코드"].tolist() == ["005930", "000660"]
-    assert out["거래대금"].tolist() == [500.0, 300.0]
-    assert out["admitted"].tolist() == [True, False]
-
-
 def test_run_topk_ranker_sleeve_uses_stored_admitted_without_recompute(monkeypatch) -> None:
     import numpy as np
     import pandas as pd
@@ -1022,7 +997,6 @@ def test_load_daily_snapshot_replays_certified_input_before_cutoff(tmp_path, mon
     kst = ZoneInfo("Asia/Seoul")
     store = CaptureStore(tmp_path / "capture")
     monkeypatch.setattr(predict_mod, "_capture_root", lambda: tmp_path / "capture")
-    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
     cohort = build_cohort(
         date(2026, 9, 14), ["000001", "000002"], ["000001", "000002"], {},
         eligibility_rule_version="price_history_panel@v1",
@@ -1054,12 +1028,6 @@ def test_load_daily_snapshot_fails_closed_without_legacy_substitution(tmp_path, 
     import src.daily.predict as predict_mod
 
     monkeypatch.setattr(predict_mod, "_capture_root", lambda: tmp_path / "capture")
-    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
-
-    def _must_not_fallback(snapshot_date=None, **kwargs):
-        raise AssertionError("legacy archive must not substitute certified input")
-
-    monkeypatch.setattr(predict_mod, "fetch_archive_snapshot", _must_not_fallback)
     with pytest.raises(FileNotFoundError):
         predict_mod.load_daily_snapshot(
             pd.Timestamp("2026-09-14"),
@@ -1076,7 +1044,6 @@ def test_load_daily_snapshot_rejects_naive_cutoff(monkeypatch) -> None:
 
     import src.daily.predict as predict_mod
 
-    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
     with pytest.raises(ValueError, match="aware cutoff"):
         predict_mod.load_daily_snapshot(pd.Timestamp("2026-09-14"), available_by=datetime(2026, 9, 14, 15, 22, 0))
 
@@ -1155,7 +1122,6 @@ def test_load_daily_snapshot_defaults_cutoff_to_call_time(tmp_path, monkeypatch)
     import src.daily.predict as predict_mod
 
     monkeypatch.setattr(predict_mod, "_capture_root", lambda: tmp_path / "capture")
-    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
     with pytest.raises(FileNotFoundError):
         predict_mod.load_daily_snapshot(pd.Timestamp("2026-09-14"))
 
@@ -1174,7 +1140,6 @@ def test_predict_fails_closed_on_degraded_snapshot(tmp_path, monkeypatch) -> Non
 
     kst = ZoneInfo("Asia/Seoul")
     monkeypatch.setattr(predict_mod, "_capture_root", lambda: tmp_path / "capture")
-    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
     monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path / "parquet")
 
     cohort = build_cohort(

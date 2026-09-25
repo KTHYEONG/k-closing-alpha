@@ -293,3 +293,44 @@ def test_build_universe_panel_cost_aware_screen_matches_select_universe_row_for_
         ("2023-02-01", "000001"), ("2023-02-01", "000002"),
         ("2023-02-02", "000001"), ("2023-02-02", "000002"),
     }
+
+
+def test_cost_aware_research_screen_mirrors_contract_field_by_field() -> None:
+    from src.ml.universe import COST_AWARE_SCREEN
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    # Given COST_AWARE_SCREEN and COST_AWARE_UNIVERSE; When fields compared
+    # Then: all six bounds are equal field-by-field
+    assert COST_AWARE_SCREEN.change_lower == COST_AWARE_UNIVERSE.chg_min
+    assert COST_AWARE_SCREEN.change_upper == COST_AWARE_UNIVERSE.chg_max
+    assert COST_AWARE_SCREEN.min_trade_value_100m == COST_AWARE_UNIVERSE.min_trade_value_100m
+    assert COST_AWARE_SCREEN.min_market_cap_100m == COST_AWARE_UNIVERSE.min_market_cap_100m
+    assert COST_AWARE_SCREEN.exclude_ceiling == COST_AWARE_UNIVERSE.exclude_ceiling
+    assert COST_AWARE_SCREEN.max_tick_cost_bp == COST_AWARE_UNIVERSE.max_tick_cost_bp
+
+
+def test_upper_change_bound_is_exclusive_like_contract() -> None:
+    import pandas as pd
+
+    from src.ml.universe import COST_AWARE_SCREEN, build_universe_panel
+
+    # Given a synthetic panel with changes 0.02, 0.0999, 0.10
+    ph = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02"] * 3),
+        "symbol": ["000001", "000002", "000003"],
+        "open": [10000.0, 10000.0, 10000.0],
+        "high": [10200.0, 10200.0, 10200.0],
+        "low": [9800.0, 9800.0, 9800.0],
+        "close": [10000.0, 10000.0, 10000.0],
+        "daily_change_pct": [0.02, 0.0999, 0.10],
+        "market_cap_100m": [1000.0, 1000.0, 1000.0],
+        "trade_value_100m": [500.0, 500.0, 500.0],
+        "tick_cost_bp": [5.0, 5.0, 5.0],
+        "market": ["KOSPI"] * 3,
+    })
+
+    # When
+    panel, _ = build_universe_panel(ph, COST_AWARE_SCREEN, start_date="2024-01-02", end_date="2024-01-02")
+
+    # Then: 0.02 and 0.0999 admitted, 0.10 excluded
+    assert set(panel["symbol"].tolist()) == {"000001", "000002"}

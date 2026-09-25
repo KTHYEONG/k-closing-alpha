@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from src.data.io_utils import atomic_write_parquet
-from src.ml.costaware_topk import MIN_TOP_K, assert_screen_constructible
+from src.ml.costaware_topk import assert_screen_constructible
 from src.ml.exit_policy import DEFAULT_TAKE_PROFIT_GRID, evaluate_exit_grid, summarize_exit_grid
 from src.ml.research.v3_engine import load_and_prepare_price_history
 from src.ml.robust_eval import CombinatorialPurgedCV
@@ -38,7 +38,8 @@ from src.ml.topk_ranker_research import (
     demean_label_by_date,
     split_regime_frames,
 )
-from src.strategy.contract import DEFAULT_UNIVERSE, KCA_TOPK_COSTAWARE_001, StrategySpec, UniverseSpec
+from src.strategy.contract import DEFAULT_UNIVERSE, KCA_TOPK_COSTAWARE_001, MIN_TOP_K, StrategySpec, UniverseSpec
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +166,7 @@ def run_exit_grid_revalidation(
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     run_exit_grid_revalidation(export_dir="artifacts/models")
 
 

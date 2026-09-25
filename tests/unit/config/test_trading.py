@@ -8,23 +8,16 @@ from src.config.trading import TradingSettings
 
 def test_trading_settings_defaults() -> None:
     settings = TradingSettings(_env_file=None)
-    assert settings.TARGET_CONDITION_NAME == "종가매매"
-    assert settings.OVERHEATED_CONDITION_NAME == "단기과열"
     assert settings.API_SEMAPHORE_LIMIT == 8
     assert not hasattr(settings, "API_SLEEP_INTERVAL")
-    assert settings.EMA_PERIOD == 20
-    assert settings.SMA_PERIOD == 120
-    assert settings.CANDLE_BODY_RATIO_THRESHOLD == 0.5
-    assert settings.GAP_UP_THRESHOLD == 0.1
-    assert "거래량 폭증" in settings.DEFAULT_SCENARIOS
-    assert settings.DAY_NAME_MAP[0] == "월요일"
+    assert settings.PAPER_SEED_CAPITAL == 10_000_000
+    assert settings.PAPER_ENTRY_SIZING_BUFFER_BP == 0.0
 
 
-def test_trading_condition_name_drives_aggregate_paths(tmp_path) -> None:
+def test_settings_history_paths_follow_data_dir(tmp_path) -> None:
     settings = Settings(
         BASE_DIR=tmp_path,
         DATA_DIR=tmp_path / "data",
-        TARGET_CONDITION_NAME="상따",
         _env_file=None,
     )
     assert tmp_path / "data" / "history" == settings.HISTORY_DIR

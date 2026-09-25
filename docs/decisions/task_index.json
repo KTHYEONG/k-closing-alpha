@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "REFACTOR_W1",
+      "date": "2026-09-25",
+      "adr_id": "ADR_20260925_REFACTOR_W1",
+      "domain": "sys",
+      "title": "리팩토링 Wave-1: 죽은코드 삭제·잠금 flock·킬스위치 제거·KIWOOM 개명·수수료 포함 비용 단일화·헬퍼/설정 정리",
+      "why": "비용 상수 5곳 분산과 설정 이중객체·O_EXCL 잔존 잠금·미사용 코드가 유지보수와 라벨 정합성을 해쳤다",
+      "resolution": "cost_model 단일 소유(KIS 우대수수료 왕복 포함), flock 공용 잠금, RAW 킬스위치·일회성 도구 은퇴, settings 실시간 위임, capture_root·offsite 공통화를 반영했다",
+      "impact": "라벨·섀도우·t1 순수익이 왕복 0.73bp 낮아지고 약 8천줄이 줄며 설정·헬퍼 진입점이 하나로 모인다",
+      "caveat": "kca-retrain 재학습과 or-vps env의 KIWOM→KIWOOM 키 교체가 필요하고 OPENDART_API_KEY_2 테스트 격리 실패 1건은 기존 결함이다"
+    },
+    {
       "task_id": "OPS_HYGIENE",
       "date": "2026-09-25",
       "adr_id": "ADR_20260925_OPS_HYGIENE",
@@ -1016,16 +1027,6 @@
       "why": "ScreenConfig에 tick-cost cap 필드가 없어 검증된 COST_AWARE_UNIVERSE로 ML 리랭커 학습이 불가능했음",
       "resolution": "ScreenConfig.max_tick_cost_bp 추가, build_universe_panel의 raw tv/mc NaN(18%) 버그를 tv_clean/mc_clean 우선으로 수정, COST_AWARE_SCREEN을 SCREEN_REGISTRY 밖에 격리해 journaled-population 오사용 구조적 차단",
       "impact": "886 passed/1 failed(기존 R19)/9 skipped, ruff·mypy clean; build_universe_panel이 select_universe와 실측 row-for-row 일치(11819/879) 확인"
-    },
-    {
-      "task_id": "COSTAWARE_TOPK_BACKTEST",
-      "date": "2026-09-08",
-      "adr_id": "ADR_20260908_COSTAWARE_TOPK_BACKTEST",
-      "domain": "ml",
-      "title": "COST_AWARE Top-K 러너 배선 + 레짐 게이트",
-      "why": "KCA_TOPK_COSTAWARE_001이 미배선 상태였고 틱개편(2023-01-25) 전후 레짐을 풀링하면 엣지가 은폐됨",
-      "resolution": "src/ml/costaware_topk.py 신설: PIT tick_cost_bp 오름차순 top-K, pre/post/full 레짐 분리 통계, 3틱 비용 스트레스, retrain.py --cost-aware-backtest 배선",
-      "impact": "878 passed/1 failed(기존 R19)/9 skipped, ruff·mypy clean; 실측 post_reform +18.75bp t=3.08 median+5.79 PASS, full_history +6.92bp t=1.33 INSUFFICIENT_COVERAGE로 정확히 구분"
     }
   ]
 }

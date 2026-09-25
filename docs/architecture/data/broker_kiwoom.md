@@ -18,8 +18,8 @@
   ```json
   {
     "grant_type": "client_credentials",
-    "appkey": "<KIWOM_APP_KEY>",
-    "secretkey": "<KIWOM_SECRET_KEY>"
+    "appkey": "<KIWOOM_APP_KEY>",
+    "secretkey": "<KIWOOM_SECRET_KEY>"
   }
   ```
 * **Response:**
@@ -33,6 +33,7 @@
   }
   ```
 * **Concurrency Lock:** `KiwoomApiClient` wraps issuance in `_token_lock = asyncio.Lock()` ensuring that concurrent tasks reuse a single in-flight token fetch.
+* **Credential names:** settings use the correct spelling (`KIWOOM_APP_KEY`/`KIWOOM_SECRET_KEY`); the legacy `KIWOM_*` names are accepted as aliases during the transition.
 
 ### 1.3 Common Request Headers
 ```http

@@ -836,3 +836,37 @@ def test_kiwoom_get_fluctuation_ranking_flags_truncation_when_pages_exhausted() 
     assert len(res["output"]) == 3
     assert inspect.signature(KiwoomApiClient.get_fluctuation_ranking).parameters["max_pages"].default == 20
 
+
+
+def test_kiwoom_client_explicit_credentials_win_over_instance(monkeypatch) -> None:
+    from src.api.kiwoom.client import KiwoomApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "KIWOOM_APP_KEY", "inst")
+    monkeypatch.setattr(settings_instance, "KIWOOM_BASE_URL", "https://kw.example")
+
+    assert KiwoomApiClient().app_key == "inst"
+    assert KiwoomApiClient().base_url == "https://kw.example"
+    assert KiwoomApiClient(app_key="arg", base_url="https://arg.example").app_key == "arg"
+    assert KiwoomApiClient(app_key="arg", base_url="https://arg.example").base_url == "https://arg.example"
+
+    monkeypatch.setattr(settings_instance, "KIWOOM_APP_KEY", "")
+    monkeypatch.setenv("KIWOM_APP_KEY", "late")
+    assert KiwoomApiClient().app_key == ""
+
+
+def test_kiwoom_tick_fallback_budget_equals_chart_budget(monkeypatch) -> None:
+    import asyncio
+
+    from src.api.kiwoom.client import KiwoomApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "COLLECTION_CHART_MAX_PAGES", 2)
+    client = _kiwoom_client()
+    rows = [{"cntr_tm": "20260904153000"}]
+    fake_post_tr, state = _tick_pages([_tick_page(rows, "Y", "k1"), _tick_page(rows, "Y", "k2")])
+    client._post_tr = fake_post_tr  # type: ignore[method-assign]
+    res = asyncio.run(client.get_tick_chart(None, "005930", "2026-09-04"))
+
+    assert state["calls"] == 2
+    assert res["termination_reason"] == "page_budget"

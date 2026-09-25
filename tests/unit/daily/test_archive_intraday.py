@@ -1,55 +1,30 @@
 from __future__ import annotations
 
+import datetime as _dt
+
+import pytest
+
+from src.daily.archive_intraday import _resolve_previous_trading_day as _real_resolve_previous_trading_day
 
 
-def test_archive_target_codes_unions_previous_session_watchlist(monkeypatch) -> None:
-    import pandas as pd
+@pytest.fixture(autouse=True)
+def _stub_prev_trading_day(monkeypatch):
+    """Keep `_run`-driving tests on the weekday calendar while the oracle is unit-stubbed.
 
-    from src.daily import archive_intraday
+    The production `_resolve_previous_trading_day` reaches the KIS oracle through
+    `src.daily.collect`; tests that drive `run_intraday_archive` with a stubbed
+    `is_kis_trading_day` gate would otherwise hit the live oracle.
+    """
 
-    # Given: 2026-09-04 이전 아카이브 영업일은 금요일이 아닌 2026-09-01 (휴장 가정)
-    frames = {
-        "2026-09-04": pd.DataFrame({"종목코드": ["005930", "000660"]}),
-        "2026-09-01": pd.DataFrame({"종목코드": ["009900", "005930"]}),
-    }
-    all_rows = pd.DataFrame({"스냅샷_날짜": ["2026-09-01", "2026-09-04"], "종목코드": ["009900", "005930"]})
+    async def _fake_prev_weekday(client, session, snapshot_date):
+        day = _dt.date.fromisoformat(str(snapshot_date)) - _dt.timedelta(days=1)
+        while day.weekday() >= 5:
+            day -= _dt.timedelta(days=1)
+        return day.isoformat()
 
-    def fake_fetch(snapshot_date=None, month=None, all_rows_flag=False, **kwargs):
-        if kwargs.get("all_rows") or all_rows_flag:
-            return all_rows
-        return frames.get(snapshot_date, pd.DataFrame())
-
-    monkeypatch.setattr(archive_intraday.archive, "fetch_archive_snapshot", fake_fetch)
-
-    # When
-    codes = archive_intraday._archive_target_codes("2026-09-04")
-
-    # Then
-    assert set(codes) == {"005930", "000660", "009900"}
-    assert len(codes) == 3
-    assert archive_intraday.resolve_previous_archive_date("2026-09-04") == "2026-09-01"
-    assert archive_intraday.resolve_previous_archive_date("2026-09-01") is None
-
-
-def test_today_watchlist_codes_returns_empty_on_fetch_failure(monkeypatch) -> None:
-    from src.daily import archive_intraday
-
-    def _raise(*a, **kw):
-        raise RuntimeError("archive unavailable")
-
-    monkeypatch.setattr(archive_intraday.archive, "fetch_archive_snapshot", _raise)
-
-    assert archive_intraday._today_watchlist_codes("2026-09-04") == []
-
-
-def test_today_watchlist_codes_returns_empty_when_column_missing(monkeypatch) -> None:
-    import pandas as pd
-
-    from src.daily import archive_intraday
-
-    monkeypatch.setattr(archive_intraday.archive, "fetch_archive_snapshot", lambda **kw: pd.DataFrame())
-
-    assert archive_intraday._today_watchlist_codes("2026-09-04") == []
+    monkeypatch.setattr(
+        "src.daily.archive_intraday._resolve_previous_trading_day", _fake_prev_weekday
+    )
 
 
 def test_resolve_previous_archive_date_returns_none_on_fetch_failure(monkeypatch) -> None:
@@ -104,536 +79,6 @@ def test_archive_intraday_main_invokes_run_intraday_archive(monkeypatch) -> None
 
     assert captured["snapshot_date"] == "2026-09-04"
     assert captured["kwargs"]["phase"] == "all"
-
-
-def test_archive_target_codes_unions_previous_session_watchlist_regression_unchanged() -> None:
-    import pandas as pd
-
-    from src.daily import archive_intraday
-
-    frames = {
-        "2026-09-04": pd.DataFrame({"종목코드": ["005930", "000660"]}),
-        "2026-09-01": pd.DataFrame({"종목코드": ["009900", "005930"]}),
-    }
-    all_rows = pd.DataFrame({"스냅샷_날짜": ["2026-09-01", "2026-09-04"], "종목코드": ["009900", "005930"]})
-
-    def fake_fetch(snapshot_date=None, month=None, all_rows_flag=False, **kwargs):
-        if kwargs.get("all_rows") or all_rows_flag:
-            return all_rows
-        return frames.get(snapshot_date, pd.DataFrame())
-
-    orig = archive_intraday.archive.fetch_archive_snapshot
-    archive_intraday.archive.fetch_archive_snapshot = fake_fetch
-    try:
-        codes = archive_intraday._archive_target_codes("2026-09-04")
-    finally:
-        archive_intraday.archive.fetch_archive_snapshot = orig
-
-    assert set(codes) == {"005930", "000660", "009900"}
-    assert len(codes) == 3
-
-def test_run_intraday_archive_wires_kiwoom_client_when_key_present(monkeypatch) -> None:
-    import pandas as pd
-
-    from src.daily import archive_intraday
-
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
-    monkeypatch.setattr(archive_intraday.settings, "KIWOM_APP_KEY", "dummy_key", raising=False)
-
-    async def _is_trading(_c, _s, _d):
-        return True
-
-    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
-
-    class _FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            assert self is not None
-            return False
-
-    class _FakeKisClient:
-        def create_session(self):
-            return _FakeSession()
-
-        async def ensure_token(self, session):
-            assert session is not None
-            return "tok"
-
-    captured: dict = {}
-
-    class _FakeKiwoomClient:
-        pass
-
-    def _fake_kiwoom_ctor():
-        inst = _FakeKiwoomClient()
-        captured["kiwoom_instance"] = inst
-        return inst
-
-    async def _fake_collect_bars(*a, **kw):
-        return pd.DataFrame()
-
-    async def _fake_collect_nxt(*a, **kw):
-        return pd.DataFrame()
-
-    async def _fake_collect_ticks(client, session, codes, snap_date, ls_client=None, kiwoom_client=None):
-        captured["kiwoom_client_passed"] = kiwoom_client
-        return pd.DataFrame()
-
-    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _FakeKisClient())
-    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
-    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", _fake_kiwoom_ctor)
-    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _fake_collect_bars)
-    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _fake_collect_nxt)
-    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _fake_collect_ticks)
-    monkeypatch.setattr(archive_intraday, "write_intraday_partition", lambda *a, **kw: 0)
-    monkeypatch.setattr(archive_intraday, "write_tick_partition", lambda *a, **kw: 0)
-
-    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07")
-
-    assert result == (0, 0, 0)
-    assert captured["kiwoom_client_passed"] is captured["kiwoom_instance"]
-
-
-def test_run_intraday_archive_no_kiwoom_client_when_key_absent(monkeypatch) -> None:
-    import pandas as pd
-
-    from src.daily import archive_intraday
-
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
-    monkeypatch.setattr(archive_intraday.settings, "KIWOM_APP_KEY", "", raising=False)
-
-    async def _is_trading(_c, _s, _d):
-        return True
-
-    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
-
-    class _FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            assert self is not None
-            return False
-
-    class _FakeKisClient:
-        def create_session(self):
-            return _FakeSession()
-
-        async def ensure_token(self, session):
-            assert session is not None
-            return "tok"
-
-    captured: dict = {}
-
-    def _fake_kiwoom_ctor():
-        captured["kiwoom_ctor_called"] = True
-        return object()
-
-    async def _fake_collect_bars(*a, **kw):
-        return pd.DataFrame()
-
-    async def _fake_collect_nxt(*a, **kw):
-        return pd.DataFrame()
-
-    async def _fake_collect_ticks(client, session, codes, snap_date, ls_client=None, kiwoom_client=None):
-        captured["kiwoom_client_passed"] = kiwoom_client
-        return pd.DataFrame()
-
-    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _FakeKisClient())
-    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
-    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", _fake_kiwoom_ctor)
-    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _fake_collect_bars)
-    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _fake_collect_nxt)
-    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _fake_collect_ticks)
-    monkeypatch.setattr(archive_intraday, "write_intraday_partition", lambda *a, **kw: 0)
-    monkeypatch.setattr(archive_intraday, "write_tick_partition", lambda *a, **kw: 0)
-
-    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07")
-
-    assert result == (0, 0, 0)
-    assert captured.get("kiwoom_client_passed") is None
-    assert "kiwoom_ctor_called" not in captured
-
-
-def test_run_intraday_archive_passes_kiwoom_to_nxt_collector(monkeypatch) -> None:
-    from unittest.mock import AsyncMock, patch
-    import pandas as pd
-    from src import settings
-    from src.daily.archive_intraday import run_intraday_archive
-
-    monkeypatch.setattr(settings, "KIWOM_APP_KEY", "mock_kw_key")
-    monkeypatch.setattr(settings, "LS_APP_KEY", "mock_ls_key")
-
-    with (
-        patch("src.daily.archive_intraday._archive_target_codes", return_value=["005930"]),
-        patch("src.daily.archive_intraday.collect_intraday_bars", new_callable=AsyncMock) as mock_bars,
-        patch("src.daily.archive_intraday.collect_nxt_aftermarket_bars", new_callable=AsyncMock) as mock_nxt,
-        patch("src.daily.archive_intraday.collect_nxt_premarket_bars", new_callable=AsyncMock) as mock_nxt_pre,
-        patch("src.daily.archive_intraday.collect_intraday_trade_ticks", new_callable=AsyncMock) as mock_ticks,
-        patch("src.daily.archive_intraday.write_intraday_partition", return_value=5),
-        patch("src.daily.archive_intraday.write_tick_partition", return_value=10),
-        patch("src.api.kis.client.KisApiClient.ensure_token", new_callable=AsyncMock),
-        patch("src.daily.archive_intraday.is_kis_trading_day", new_callable=AsyncMock) as mock_trading_day,
-    ):
-        mock_trading_day.return_value = True
-        mock_bars.return_value = pd.DataFrame()
-        mock_nxt.return_value = pd.DataFrame()
-        mock_nxt_pre.return_value = pd.DataFrame()
-        mock_ticks.return_value = pd.DataFrame()
-
-        res = run_intraday_archive("2026-09-04")
-        assert res == (5, 10, 10)
-        assert mock_nxt.call_count == 1
-        _, kwargs = mock_nxt.call_args
-        assert kwargs.get("kiwoom_client") is not None
-
-
-
-def test_run_intraday_archive_collects_and_writes_premarket_partition(monkeypatch) -> None:
-    from unittest.mock import AsyncMock, patch
-    import pandas as pd
-    from src import settings
-    from src.config.market_session import INTRADAY_SESSION_NXT_PREMARKET
-    from src.daily.archive_intraday import run_intraday_archive
-
-    monkeypatch.setattr(settings, "KIWOM_APP_KEY", "mock_kw_key")
-    monkeypatch.setattr(settings, "LS_APP_KEY", "mock_ls_key")
-
-    partitions_written = []
-
-    def fake_write_partition(df, interval, date, session):
-        partitions_written.append(session)
-        return len(df)
-
-    with (
-        patch("src.daily.archive_intraday._archive_target_codes", return_value=["005930"]),
-        patch("src.daily.archive_intraday.collect_intraday_bars", new_callable=AsyncMock) as mock_bars,
-        patch("src.daily.archive_intraday.collect_nxt_aftermarket_bars", new_callable=AsyncMock) as mock_nxt_after,
-        patch("src.daily.archive_intraday.collect_nxt_premarket_bars", new_callable=AsyncMock) as mock_nxt_pre,
-        patch("src.daily.archive_intraday.collect_intraday_trade_ticks", new_callable=AsyncMock) as mock_ticks,
-        patch("src.daily.archive_intraday.write_intraday_partition", side_effect=fake_write_partition),
-        patch("src.daily.archive_intraday.write_tick_partition", return_value=10),
-        patch("src.api.kis.client.KisApiClient.ensure_token", new_callable=AsyncMock),
-        patch("src.daily.archive_intraday.is_kis_trading_day", new_callable=AsyncMock) as mock_trading_day,
-    ):
-        mock_trading_day.return_value = True
-        mock_bars.return_value = pd.DataFrame([{"dummy": 1}] * 5)
-        mock_nxt_after.return_value = pd.DataFrame([{"dummy": 1}] * 3)
-        mock_nxt_pre.return_value = pd.DataFrame([{"dummy": 1}] * 2)
-        mock_ticks.return_value = pd.DataFrame([{"dummy": 1}] * 10)
-
-        res = run_intraday_archive("2026-09-04")
-        assert res == (5, 5, 10)
-        assert INTRADAY_SESSION_NXT_PREMARKET in partitions_written
-        assert mock_nxt_pre.call_count == 1
-
-def test_archive_target_codes_unions_universe_scan_pool_across_sessions(monkeypatch) -> None:
-    # Given
-    import pandas as pd
-
-    from src.daily import archive_intraday
-    from src.daily.universe_scan import UNIVERSE_SCAN_SCENARIO_TAG
-
-    frames = {
-        "2026-09-04": pd.DataFrame(
-            {"종목코드": ["005930"], "시나리오": [UNIVERSE_SCAN_SCENARIO_TAG]}
-        ),
-        "2026-09-03": pd.DataFrame(
-            {"종목코드": ["000660"], "시나리오": [UNIVERSE_SCAN_SCENARIO_TAG]}
-        ),
-    }
-    all_rows = pd.DataFrame(
-        {"스냅샷_날짜": ["2026-09-03", "2026-09-04"], "종목코드": ["000660", "005930"]}
-    )
-
-    def fake_fetch(snapshot_date=None, month=None, all_rows_flag=False, **kwargs):
-        if kwargs.get("all_rows") or all_rows_flag:
-            return all_rows
-        return frames.get(snapshot_date, pd.DataFrame())
-
-    monkeypatch.setattr(archive_intraday.archive, "fetch_archive_snapshot", fake_fetch)
-
-    # When
-    codes = archive_intraday._archive_target_codes("2026-09-04")
-
-    # Then: 청산일(D+1) 분봉 확보를 위해 전일 풀도 포함
-    assert set(codes) == {"005930", "000660"}
-
-
-def test_run_intraday_archive_instantiates_kiwoom_with_kiwoom_app_key_alias(monkeypatch) -> None:
-    from unittest.mock import AsyncMock, MagicMock
-    import pandas as pd
-    from src.daily import archive_intraday
-
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
-    monkeypatch.setattr(archive_intraday.settings, "KIWOM_APP_KEY", "", raising=False)
-    monkeypatch.setattr(archive_intraday.settings, "KIWOOM_APP_KEY", "test_kiwoom_key", raising=False)
-
-    async def _is_trading(_c, _s, _d):
-        return True
-
-    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
-
-    fake_client = MagicMock()
-    fake_session = AsyncMock()
-    fake_client.create_session.return_value.__aenter__.return_value = fake_session
-    fake_client.ensure_token = AsyncMock(return_value="tok")
-
-    captured: dict = {}
-
-    def _fake_kiwoom_ctor():
-        captured["kiwoom_ctor_called"] = True
-        return object()
-
-    async def _mock_collect_ticks(client, session, codes, snap_date, ls_client=None, kiwoom_client=None):
-        captured["kiwoom_client_passed"] = kiwoom_client
-        return pd.DataFrame()
-
-    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: fake_client)
-    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
-    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", _fake_kiwoom_ctor)
-    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", AsyncMock(return_value=pd.DataFrame()))
-    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", AsyncMock(return_value=pd.DataFrame()))
-    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", AsyncMock(return_value=pd.DataFrame()))
-    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _mock_collect_ticks)
-    monkeypatch.setattr(archive_intraday, "write_intraday_partition", lambda *a, **kw: 0)
-    monkeypatch.setattr(archive_intraday, "write_tick_partition", lambda *a, **kw: 0)
-
-    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07")
-
-    assert result == (0, 0, 0)
-    assert captured.get("kiwoom_ctor_called") is True
-    assert captured.get("kiwoom_client_passed") is not None
-
-
-def test_run_intraday_archive_writes_krx_aftermarket_to_its_own_session(monkeypatch) -> None:
-    import pandas as pd
-
-    from src.config.market_session import (
-        INTRADAY_SESSION_KRX_AFTERMARKET,
-        INTRADAY_SESSION_REGULAR,
-    )
-    from src.daily import archive_intraday
-
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
-
-    async def _is_trading(_c, _s, _d):
-        return True
-
-    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
-
-    class _Session:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-    class _Client:
-        def create_session(self):
-            return _Session()
-
-        async def ensure_token(self, session):
-            return None
-
-    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _Client())
-    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
-    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", lambda: None)
-
-    def _frame(tag: str) -> pd.DataFrame:
-        return pd.DataFrame({"tag": [tag]})
-
-    async def _regular(*a, **kw):
-        return _frame("regular")
-
-    async def _nxt_after(*a, **kw):
-        return _frame("nxt_after")
-
-    async def _nxt_pre(*a, **kw):
-        return _frame("nxt_pre")
-
-    async def _krx_after(*a, **kw):
-        return _frame("krx_after")
-
-    async def _ticks(*a, **kw):
-        return _frame("ticks")
-
-    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _regular)
-    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _nxt_after)
-    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _nxt_pre)
-    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _krx_after)
-    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _ticks)
-
-    written: list[tuple[str, str]] = []
-
-    def _write_bars(df, interval, snap, session):
-        written.append((str(df["tag"].iloc[0]), session))
-        return len(df)
-
-    monkeypatch.setattr(archive_intraday, "write_intraday_partition", _write_bars)
-    monkeypatch.setattr(archive_intraday, "write_tick_partition", lambda df, snap, session: len(df))
-
-    archive_intraday.run_intraday_archive(snapshot_date="2026-09-14")
-
-    mapping = dict(written)
-    assert mapping["krx_after"] == INTRADAY_SESSION_KRX_AFTERMARKET
-    assert mapping["regular"] == INTRADAY_SESSION_REGULAR
-    assert mapping["krx_after"] != mapping["regular"]
-
-
-def _wire_legacy_run_fakes(monkeypatch, calls: list[str]):
-    import pandas as pd
-
-    from src.daily import archive_intraday
-
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda snap: ["005930"])
-
-    async def _is_trading(_c, _s, _d):
-        return True
-
-    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
-
-    class _Session:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-    class _Client:
-        def create_session(self):
-            return _Session()
-
-        async def ensure_token(self, session):
-            return None
-
-    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _Client())
-    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
-    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", lambda: None)
-
-    def _frame(tag: str) -> pd.DataFrame:
-        return pd.DataFrame({"tag": [tag]})
-
-    def _tracked(name: str, tag: str):
-        async def _fn(*a, **kw):
-            calls.append(name)
-            return _frame(tag)
-
-        return _fn
-
-    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _tracked("bars", "regular"))
-    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _tracked("nxt_after", "nxt_after"))
-    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _tracked("nxt_pre", "nxt_pre"))
-    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _tracked("krx_after", "krx_after"))
-    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _tracked("ticks", "ticks"))
-    monkeypatch.setattr(archive_intraday, "write_intraday_partition", lambda df, interval, snap, session: len(df))
-    monkeypatch.setattr(archive_intraday, "write_tick_partition", lambda df, snap, session: len(df))
-
-
-def test_run_intraday_archive_phase_regular_only_collects_regular_session(monkeypatch) -> None:
-    from src.daily import archive_intraday
-
-    calls: list[str] = []
-    _wire_legacy_run_fakes(monkeypatch, calls)
-
-    n_bars, n_nxt, n_ticks = archive_intraday.run_intraday_archive(snapshot_date="2026-09-14", phase="regular")
-
-    assert calls == ["bars", "ticks"]
-    assert n_bars == 1 and n_ticks == 1
-    assert n_nxt == 0
-
-
-def test_run_intraday_archive_phase_aftermarket_only_collects_aftermarket_sessions(monkeypatch) -> None:
-    from src.daily import archive_intraday
-
-    calls: list[str] = []
-    _wire_legacy_run_fakes(monkeypatch, calls)
-
-    n_bars, n_nxt, n_ticks = archive_intraday.run_intraday_archive(snapshot_date="2026-09-14", phase="aftermarket")
-
-    assert calls == ["nxt_after", "nxt_pre", "krx_after"]
-    assert n_nxt == 2  # nxt_after(1 row) + nxt_pre(1 row); krx_after is not summed into n_nxt
-    assert n_bars == 0 and n_ticks == 0
-
-
-def test_run_intraday_archive_rejects_unknown_phase(monkeypatch) -> None:
-    import pytest
-
-    from src.daily import archive_intraday
-
-    calls: list[str] = []
-    _wire_legacy_run_fakes(monkeypatch, calls)
-
-    with pytest.raises(ValueError, match="Invalid phase"):
-        archive_intraday.run_intraday_archive(snapshot_date="2026-09-14", phase="bogus")
-
-    assert calls == []
-
-
-def test_intraday_watchlist_drops_unreachable_scenario_filter(monkeypatch) -> None:
-    import inspect
-
-    import pandas as pd
-
-    from src.daily import archive_intraday
-
-    # Then: 도달 불가능하던 고스트 훅이 사라진다
-    assert not hasattr(archive_intraday, "EXCLUDED_INTRADAY_SCENARIOS")
-    params = inspect.signature(archive_intraday._today_watchlist_codes).parameters
-    assert list(params) == ["snapshot_date"]
-
-    # And: 워치리스트 추출 자체는 정상 동작한다(6자리 zero-fill 포함)
-    monkeypatch.setattr(
-        archive_intraday.archive,
-        "fetch_archive_snapshot",
-        lambda snapshot_date=None, **kw: pd.DataFrame({"종목코드": ["5930", "035720"]}),
-    )
-    codes = archive_intraday._today_watchlist_codes("2026-09-09")
-    assert codes == ["005930", "035720"]
-
-
-def test_run_intraday_archive_skips_non_trading_day_without_collecting(monkeypatch) -> None:
-    from src.daily import archive_intraday
-
-    class _FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_a):
-            return False
-
-    class _FakeClient:
-        def __init__(self, *_a, **_kw):
-            self.token = None
-
-        def create_session(self, **_kw):
-            return _FakeSession()
-
-        async def ensure_token(self, _session, force_refresh=False):
-            self.token = "T"
-            return "T"
-
-    async def _never(*_a, **_kw):
-        raise AssertionError("non-trading day must not trigger collection")
-
-    async def _not_trading(_client, _session, _date):
-        return False
-
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
-    monkeypatch.setattr(archive_intraday, "KisApiClient", _FakeClient)
-    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda *_a, **_kw: None)
-    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", lambda *_a, **_kw: None)
-    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _not_trading)
-    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _never)
-    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _never)
-
-    # When
-    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-05")
-
-    # Then
-    assert result == (0, 0, 0)
 
 
 def test_archive_intraday_builds_client_from_data_account(monkeypatch, tmp_path) -> None:
@@ -783,8 +228,7 @@ def _raw_archive_mocks(monkeypatch, tmp_path, fake_collect):
     monkeypatch.setattr(archive_intraday.settings, "HISTORY_DIR", tmp_path, raising=False)
     monkeypatch.setattr(archive_intraday.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "price_history.parquet", raising=False)
     monkeypatch.setattr(archive_intraday.settings, "LS_APP_KEY", "", raising=False)
-    monkeypatch.setattr(archive_intraday.settings, "KIWOM_APP_KEY", "", raising=False)
-    monkeypatch.setattr(archive_intraday.settings, "KIWOOM_APP_KEY", "", raising=False)
+    monkeypatch.setattr(archive_intraday.settings, "KIWOOM_APP_KEY", "")
 
     class _Session:
         async def __aenter__(self):
@@ -1049,10 +493,6 @@ def test_run_archive_cohort_and_cli_boundaries(monkeypatch, tmp_path) -> None:
 
     from src.daily import archive_intraday
 
-    assert archive_intraday._previous_trading_day("2026-09-07") == "2026-09-04"
-    assert archive_intraday._previous_trading_day("2026-09-08") == "2026-09-07"
-    with pytest.raises(ValueError, match="snapshot_date"):
-        archive_intraday._previous_trading_day("bogus")
     with pytest.raises(ValueError, match="snapshot_date"):
         archive_intraday.run_intraday_archive(snapshot_date="bogus", profile=_raw_profile(tmp_path))
     with pytest.raises(ValueError, match="bar_interval"):
@@ -1067,14 +507,12 @@ def test_run_archive_cohort_and_cli_boundaries(monkeypatch, tmp_path) -> None:
     _publish_cohort(store, "2026-09-07", ["005930"])
     with pytest.raises(FileNotFoundError, match="no qualifying cohort"):
         archive_intraday.run_intraday_archive(snapshot_date="2026-09-08", profile=_raw_profile(tmp_path))
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: [])
     monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
     monkeypatch.setattr("sys.argv", ["archive_intraday", "--date", "bogus-date"])
     with pytest.raises(SystemExit) as exc:
         archive_intraday.main()
     assert exc.value.code == 2
     monkeypatch.setattr("sys.argv", ["archive_intraday", "--date", "2026-09-08"])
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
     with pytest.raises(SystemExit) as exc:
         archive_intraday.main()
     assert exc.value.code == 1
@@ -1425,8 +863,7 @@ def test_repair_cli_selection_and_publication_branches(monkeypatch, tmp_path) ->
         repair_mod.main(["--start", "2026-09-03", "--end", "2026-09-03", "--dataset", "regular_bars",
                          "--symbol", "005930", "--apply"])
 
-    monkeypatch.setattr(repair_mod.settings, "KIWOM_APP_KEY", "", raising=False)
-    monkeypatch.setattr(repair_mod.settings, "KIWOOM_APP_KEY", "", raising=False)
+    monkeypatch.setattr(repair_mod.settings, "KIWOOM_APP_KEY", "")
     monkeypatch.setattr(repair_mod.settings, "LS_APP_KEY", "", raising=False)
 
     import asyncio as _asyncio
@@ -1821,7 +1258,7 @@ def test_run_intraday_archive_flags_shifted_day_degraded(monkeypatch, tmp_path) 
         archive_intraday, "record_run_outcome", lambda *a, **k: outcomes.append((a, k))
     )
     profile = CollectionSettings(
-        COLLECTION_ROOT=tmp_path / "capture", COLLECTION_RAW_ENABLED=True, _env_file=None
+        COLLECTION_ROOT=tmp_path / "capture", _env_file=None
     )
 
     result = archive_intraday.run_intraday_archive(snapshot_date="2026-11-19", phase="regular", profile=profile)
@@ -2021,7 +1458,6 @@ def test_archive_main_aftermarket_catchup_refused(monkeypatch, tmp_path) -> None
 
     _freeze_archive_now(monkeypatch, archive_intraday, _dt.datetime(2026, 9, 23, 0, 30, tzinfo=_SEOUL))
     monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: [])
     calls: list = []
     monkeypatch.setattr(archive_intraday, "run_intraday_archive", lambda **k: calls.append(k) or (0, 0, 0))
     outcomes: list = []
@@ -2046,7 +1482,6 @@ def test_archive_main_already_archived_skipped(monkeypatch, tmp_path, caplog) ->
     _publish_evening_manifest(store, "2026-09-22", CaptureDataset.TRADE_TICKS, "regular", "COMPLETE", "ticks")
     _freeze_archive_now(monkeypatch, archive_intraday, _dt.datetime(2026, 9, 22, 21, 0, tzinfo=_SEOUL))
     monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
     calls: list = []
     monkeypatch.setattr(archive_intraday, "run_intraday_archive", lambda **k: calls.append(k) or (0, 0, 0))
     monkeypatch.setattr("sys.argv", ["archive_intraday", "--phase", "regular", "--date", "2026-09-22"])
@@ -2066,7 +1501,6 @@ def test_archive_main_all_past_runs_regular_only(monkeypatch, tmp_path) -> None:
 
     _freeze_archive_now(monkeypatch, archive_intraday, _dt.datetime(2026, 9, 23, 7, 10, tzinfo=_SEOUL))
     monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
     calls: list = []
     monkeypatch.setattr(archive_intraday, "run_intraday_archive", lambda **k: calls.append(k) or (1, 0, 1))
     outcomes: list = []
@@ -2092,7 +1526,6 @@ def test_archive_main_all_past_skips_when_regular_done(monkeypatch, tmp_path, ca
     _publish_evening_manifest(store, "2026-09-22", CaptureDataset.TRADE_TICKS, "regular", "COMPLETE", "ticks")
     _freeze_archive_now(monkeypatch, archive_intraday, _dt.datetime(2026, 9, 23, 7, 10, tzinfo=_SEOUL))
     monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
-    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
     calls: list = []
     monkeypatch.setattr(archive_intraday, "run_intraday_archive", lambda **k: calls.append(k) or (0, 0, 0))
     outcomes: list = []
@@ -2105,3 +1538,292 @@ def test_archive_main_all_past_skips_when_regular_done(monkeypatch, tmp_path, ca
     assert calls == []
     assert outcomes == [(("archive_intraday", "DEGRADED"), {"run_date": "2026-09-22", "reason": "aftermarket_not_replayable"})]
     assert any("already_archived" in rec.message for rec in caplog.records)
+
+
+def test_run_archive_default_profile_archives_with_capture_evidence(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.config.market_session import (
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+        INTRADAY_SESSION_NXT_PREMARKET,
+    )
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+    from src.data.intraday_schema import normalize_tick_frame
+
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+
+    def _tick_frame(symbol):
+        raw = pd.DataFrame({"time": ["090300"], "close": [71000], "jdiff_vol": [7]})
+        return normalize_tick_frame(raw, "ls", "2026-09-07", symbol)
+
+    async def _fake_bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _canon_bar_frame(snap_date, code),
+                      _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
+        return pd.DataFrame()
+
+    def _fake_session_bars_factory(session_tag):
+        async def _fake_session_bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+            on_symbol = kwargs.get("on_symbol")
+            for code in codes:
+                on_symbol(code, _canon_bar_frame(snap_date, code),
+                          _fake_entry(code, CaptureDataset.MINUTE_BARS, session_tag, "COMPLETE", rows=1))
+            return pd.DataFrame()
+
+        return _fake_session_bars
+
+    async def _fake_ticks(client, session, codes, snap_date, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _tick_frame(code),
+                      _fake_entry(code, CaptureDataset.TRADE_TICKS, "regular", "COMPLETE", rows=1))
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _fake_bars)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _fake_session_bars_factory(INTRADAY_SESSION_NXT_AFTERMARKET))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _fake_session_bars_factory(INTRADAY_SESSION_NXT_PREMARKET))
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _fake_session_bars_factory(INTRADAY_SESSION_KRX_AFTERMARKET))
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _fake_ticks)
+
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07")
+
+    assert result[0] >= 1
+    manifests = store.read_manifests("2026-09-07")
+    assert any(item.context.run_id.startswith("archive-2026-09-07-") for item in manifests)
+
+
+def test_run_archive_phase_gating_on_capture_path(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+
+    calls: list[str] = []
+
+    def _tracked(name: str):
+        async def _fn(*a, **kw):
+            calls.append(name)
+            return pd.DataFrame()
+
+        return _fn
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _tracked("bars"))
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _tracked("nxt_after"))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _tracked("nxt_pre"))
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _tracked("krx_after"))
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _tracked("ticks"))
+
+    assert archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="regular") == (0, 0, 0)
+    assert calls == ["bars", "ticks"]
+    calls.clear()
+    assert archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="aftermarket") == (0, 0, 0)
+    assert calls == ["nxt_after", "nxt_pre", "krx_after"]
+
+
+def test_run_archive_unknown_phase_rejected_before_io(monkeypatch, tmp_path) -> None:
+    import pytest
+
+    from src.daily import archive_intraday
+
+    constructed: list = []
+    _raw_archive_mocks(monkeypatch, tmp_path, None)
+
+    def _forbidden_client(*a: object, **kw: object) -> object:
+        raise AssertionError("must not construct")
+
+    monkeypatch.setattr(archive_intraday, "KisApiClient", _forbidden_client)
+
+    with pytest.raises(ValueError, match="Invalid phase"):
+        archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="bogus")
+
+
+def test_archive_main_skips_legacy_watchlist_read(monkeypatch, tmp_path, caplog) -> None:
+    import datetime as _dt
+    import logging
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import SEOUL as _SEOUL, CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_evening_manifest(store, "2026-09-22", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", "bars")
+    _publish_evening_manifest(store, "2026-09-22", CaptureDataset.TRADE_TICKS, "regular", "COMPLETE", "ticks")
+    _freeze_archive_now(monkeypatch, archive_intraday, _dt.datetime(2026, 9, 22, 21, 0, tzinfo=_SEOUL))
+    monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
+    calls: list = []
+    monkeypatch.setattr(archive_intraday, "run_intraday_archive", lambda **k: calls.append(k) or (0, 0, 0))
+    monkeypatch.setattr("sys.argv", ["archive_intraday", "--phase", "regular", "--date", "2026-09-22"])
+
+    def _forbidden(**kw):
+        raise AssertionError("main must not read the legacy watchlist")
+
+    monkeypatch.setattr(archive_intraday.archive, "fetch_archive_snapshot", _forbidden)
+
+    with caplog.at_level(logging.INFO, logger=archive_intraday.logger.name):
+        archive_intraday.main()
+
+    assert calls == []
+    assert any("already_archived" in rec.message for rec in caplog.records)
+
+
+def test_run_archive_kiwoom_client_built_only_with_canonical_key(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+
+    built: list = []
+    seen: dict = {}
+
+    def _tracked(name: str):
+        async def _fn(*a, **kw):
+            seen[name] = kw.get("kiwoom_client")
+            return pd.DataFrame()
+
+        return _fn
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _tracked("bars"))
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _tracked("nxt_after"))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _tracked("nxt_pre"))
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _tracked("krx_after"))
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _tracked("ticks"))
+
+    def _kiwoom_factory(*a: object, **kw: object) -> object:
+        inst = object()
+        built.append(inst)
+        return inst
+
+    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", _kiwoom_factory)
+
+    monkeypatch.setattr(archive_intraday.settings, "KIWOOM_APP_KEY", "k")
+    assert archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="regular") == (0, 0, 0)
+    assert len(built) == 1
+    assert seen["ticks"] is built[0]
+
+    built.clear()
+    seen.clear()
+    monkeypatch.setattr(archive_intraday.settings, "KIWOOM_APP_KEY", "")
+    assert archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="regular") == (0, 0, 0)
+    assert built == []
+    assert seen["ticks"] is None
+
+
+def test_archive_skips_holiday_for_previous_cohort(monkeypatch, tmp_path) -> None:
+    """First run after a weekday holiday unions today's cohort with the real prior session."""
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-28", ["005930"])
+    _publish_cohort(store, "2026-09-23", ["009900"])
+    entries_map = {
+        code: (_empty_bar_frame_for("2026-09-28"), _fake_entry(code, __import__("src.data.capture_contracts", fromlist=["CaptureDataset"]).CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+        for code in ("005930", "009900")
+    }
+    fake_collect, seen = _archive_fakes(entries_map)
+    _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    _seed_panel(tmp_path, {"2026-09-25": ["005930"], "2026-09-22": ["009900"]})
+
+    async def _resolver(client, session, snapshot_date):
+        assert snapshot_date == "2026-09-28"
+        return "2026-09-23"
+
+    monkeypatch.setattr(archive_intraday, "_resolve_previous_trading_day", _resolver)
+
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-28", profile=_raw_profile(tmp_path))
+
+    assert result == (0, 0, 0)
+    assert sorted(seen["codes"][0]) == ["005930", "009900"]
+    codes, incomplete = archive_intraday._resolve_cohort_codes(
+        "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day="2026-09-23"
+    )
+    assert sorted(codes) == ["005930", "009900"]
+    assert incomplete is False
+
+
+def test_unresolved_previous_day_degrades_never_aborts(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    from src.daily import archive_intraday
+
+    async def _boom(client, session, snapshot_date):
+        raise RuntimeError("oracle down")
+
+    monkeypatch.setattr("src.daily.collect.resolve_prev_trading_day_kis", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        resolved = __import__("asyncio").run(
+            _real_resolve_previous_trading_day(object(), object(), "2026-09-28")
+        )
+    assert resolved is None
+    assert "reason=previous_day_unresolved" in caplog.text
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-28", ["005930"])
+    _seed_panel(tmp_path, {"2026-09-25": ["005930"]})
+
+    codes, incomplete = archive_intraday._resolve_cohort_codes(
+        "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day=None
+    )
+    assert codes == ["005930"]
+    assert incomplete is True
+
+
+def test_resolved_but_missing_previous_cohort_keeps_signal(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-28", ["005930"])
+    _seed_panel(tmp_path, {"2026-09-25": ["005930"]})
+
+    with caplog.at_level(logging.WARNING):
+        codes, incomplete = archive_intraday._resolve_cohort_codes(
+            "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day="2026-09-23"
+        )
+    assert codes == ["005930"]
+    assert incomplete is True
+    assert "missing_previous" in caplog.text
+
+
+def test_resolve_previous_trading_day_returns_oracle_date(monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    async def _oracle(client, session, decision_date, **kwargs):
+        return pd.Timestamp("2026-09-23")
+
+    monkeypatch.setattr("src.daily.collect.resolve_prev_trading_day_kis", _oracle)
+
+    assert asyncio.run(_real_resolve_previous_trading_day(object(), object(), "2026-09-28")) == "2026-09-23"
+
+
+def test_unresolved_previous_day_still_follows_paper_positions(monkeypatch, tmp_path) -> None:
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-28", ["005930"])
+    _seed_panel(tmp_path, {"2026-09-25": ["005930"]})
+    monkeypatch.setattr(archive_intraday, "_paper_follow_symbols", lambda: ["009900"])
+
+    codes, incomplete = archive_intraday._resolve_cohort_codes(
+        "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day=None
+    )
+
+    assert sorted(codes) == ["005930", "009900"]
+    assert incomplete is True

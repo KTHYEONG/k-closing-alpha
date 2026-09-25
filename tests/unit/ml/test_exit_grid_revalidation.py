@@ -55,9 +55,8 @@ def test_build_exit_grid_oof_rejects_top_k_below_minimum() -> None:
 
     import pytest
 
-    from src.ml.costaware_topk import MIN_TOP_K
     from src.ml.research.exit_grid_revalidation import build_exit_grid_oof
-    from src.strategy.contract import KCA_TOPK_COSTAWARE_001
+    from src.strategy.contract import KCA_TOPK_COSTAWARE_001, MIN_TOP_K
 
     ph, market_dates, d_to_idx = _synthetic_panel(45)
     bad_spec = dataclasses.replace(KCA_TOPK_COSTAWARE_001, top_k=MIN_TOP_K - 1)

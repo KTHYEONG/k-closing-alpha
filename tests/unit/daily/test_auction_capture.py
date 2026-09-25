@@ -32,7 +32,6 @@ def _profile(tmp_path: Path, **overrides: Any):
 
     base: dict[str, Any] = {
         "COLLECTION_ROOT": tmp_path / "capture",
-        "COLLECTION_RAW_ENABLED": True,
         "COLLECTION_AUCTION_ENABLED": True,
         "COLLECTION_RESEARCH_SLOTS": ("5",),
         "COLLECTION_AUCTION_INTERVAL_SECONDS": 60,
@@ -165,7 +164,7 @@ def test_closing_baseline_includes_non_admitted(tmp_path) -> None:
             now_fn=lambda: now,
         )
     )
-    rounds = auction_capture._close_rounds(clock, 60)
+    rounds = auction_capture.close_rounds(clock, 60)
     orderbook_entries = [e for e in manifest.entries if e.dataset == CaptureDataset.ORDERBOOK]
     assert len(orderbook_entries) == len(rounds) * 2
     assert {e.symbol for e in orderbook_entries} == {"000001", "000002"}
@@ -210,10 +209,10 @@ def test_close_and_program_requests_follow_scheduled_rounds(tmp_path) -> None:
     )
     expected = {
         ("orderbook", round_at)
-        for round_at in auction_capture._close_rounds(clock, 60)
+        for round_at in auction_capture.close_rounds(clock, 60)
     } | {
         ("program", round_at)
-        for round_at in auction_capture._program_rounds(clock)
+        for round_at in auction_capture.program_rounds(clock)
     }
     for kind, scheduled_at in expected:
         assert any(observed_kind == kind and observed_at >= scheduled_at for observed_kind, observed_at in observed)
@@ -307,7 +306,7 @@ def test_exceptional_hours_shift_schedule(tmp_path) -> None:
             now_fn=lambda: now,
         )
     )
-    rounds = auction_capture._close_rounds(clock, 60)
+    rounds = auction_capture.close_rounds(clock, 60)
     assert rounds[0] == clock.close_at - dt.timedelta(minutes=9)
     assert all(r < clock.close_at for r in rounds)
     assert manifest.entries[0].scheduled_at == rounds[0]
@@ -340,7 +339,7 @@ def test_expired_rounds_do_not_burst(tmp_path) -> None:
         )
     )
     orderbook_calls = [c for c in client.calls if c[0] == "orderbook"]
-    assert len(orderbook_calls) < 2 * len(auction_capture._close_rounds(clock, 60))
+    assert len(orderbook_calls) < 2 * len(auction_capture.close_rounds(clock, 60))
     partial_deadlines = [e for e in manifest.entries if e.status == CaptureStatus.PARTIAL and e.reason == "deadline"]
     assert partial_deadlines
 
@@ -749,7 +748,7 @@ def test_capture_root_and_positions_helpers(tmp_path, monkeypatch) -> None:
     missing_frame = auction_capture._fragment_frame("000001", now, now, {"rt_cd": "0"})
     assert missing_frame["output1"].iloc[0] is None
     assert auction_capture._open_rounds(_clock("2026-09-17"))[0] < _clock("2026-09-17").open_at
-    assert len(auction_capture._program_rounds(_clock("2026-09-17"))) == 2
+    assert len(auction_capture.program_rounds(_clock("2026-09-17"))) == 2
 
 
 def test_main_skip_and_success(tmp_path, monkeypatch, caplog) -> None:
@@ -1035,3 +1034,55 @@ def test_run_async_skips_closed_day_before_broker_session(tmp_path, monkeypatch)
 
     monkeypatch.setattr(auction_capture, "run_auction_capture", _must_not_run)
     assert asyncio.run(auction_capture._run_async("2026-10-09", "close", _profile(tmp_path))) is None
+
+
+def test_run_auction_capture_rejects_disabled_auction(tmp_path) -> None:
+    """A profile without the auction opt-in fails closed before any vendor call."""
+    import pytest
+
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    profile = _profile(tmp_path, COLLECTION_AUCTION_ENABLED=False)
+    clock = _clock("2026-09-17")
+    with pytest.raises(ValueError, match="enabled auction collection"):
+        _run(
+            auction_capture.run_auction_capture(
+                "2026-09-17",
+                phase="close",
+                profile=profile,
+                store=store,
+                clients=[],
+                session_clock=clock,
+            )
+        )
+
+
+def test_audit_and_capture_schedule_identical_rounds() -> None:
+    import datetime as dt
+
+    from src.daily import auction_capture
+
+    clock = _clock("2026-09-17")
+    close_rounds = auction_capture.close_rounds(clock, 60)
+    assert len(close_rounds) == 9
+    assert close_rounds[0] == clock.close_at - dt.timedelta(minutes=9)
+    assert close_rounds[-1] == clock.close_at - dt.timedelta(minutes=1)
+    assert all(
+        (close_rounds[index + 1] - close_rounds[index]).total_seconds() == 60
+        for index in range(len(close_rounds) - 1)
+    )
+    program_rounds = auction_capture.program_rounds(clock)
+    assert len(program_rounds) == 2
+
+
+def test_daily_audit_imports_no_private_round_names() -> None:
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("src/tools/daily_audit.py").read_text(encoding="utf-8"))
+    private: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "src.daily.auction_capture":
+            private.extend(alias.name for alias in node.names if alias.name.startswith("_"))
+    assert private == []

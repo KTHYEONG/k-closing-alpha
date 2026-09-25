@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import shutil
@@ -15,22 +14,35 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
+from src.config.base import RANK_POOL_PARQUET_NAME, TOPK_DECISIONS_PARQUET_NAME
+from src.tools.offsite_common import (
+    DATED_DIR_RE as _DATED_DIR_RE,
+)
+from src.tools.offsite_common import (
+    OFFSITE_REMOTE_BASE,
+)
+from src.tools.offsite_common import (
+    resolve_rclone_bin as _resolve_rclone_bin,
+)
+from src.tools.offsite_common import (
+    sha256_file as _sha256_file,
+)
+from src.utils.cli_logging import configure_cli_logging
+
 logger = logging.getLogger(__name__)
 
-CORE_SNAPSHOT_REMOTE_ROOT: str = "gdrive:quant-lake/live/k-closing-alpha/snapshots"
+CORE_SNAPSHOT_REMOTE_ROOT: str = OFFSITE_REMOTE_BASE + "/snapshots"
 CORE_SNAPSHOT_KEEP_WEEKLY: int = 8
 CORE_SNAPSHOT_KEEP_MONTHLY: int = 12
 CORE_ROW_SHRINK_TOLERANCE: float = 0.0
 
 RCLONE_TIMEOUT_SEC: int = 600
-_CHUNK = 1024 * 1024
-_DATED_DIR_RE = __import__("re").compile(r"^\d{4}-\d{2}-\d{2}$")
 
 FIXED_CORE_REL_PATHS: tuple[str, ...] = (
     "data/history/price_history.parquet",
     "data/history/archive.parquet",
-    "data/parquet/topk_decisions.parquet",
-    "data/parquet/rank_pool_predictions.parquet",
+    "data/parquet/" + TOPK_DECISIONS_PARQUET_NAME,
+    "data/parquet/" + RANK_POOL_PARQUET_NAME,
 )
 PAPER_GLOB_DIR: str = "data/paper"
 BUNDLE_DIR: str = "artifacts/models/topk_ranker"
@@ -82,17 +94,6 @@ def core_panel_paths(project_root: Path) -> tuple[Path, ...]:
             if child not in paths:
                 paths.append(child)
     return tuple(paths)
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while True:
-            chunk = handle.read(_CHUNK)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _stat_one(abs_path: Path, rel: str) -> CorePanelStat | None:
@@ -176,12 +177,6 @@ def validate_core_panels(
         if entry.max_date and old.max_date and entry.max_date < old.max_date:
             issues.append(f"core_panel:{relpath}:max_date_regressed")
     return sorted(issues)
-
-
-def _resolve_rclone_bin() -> str:
-    import shutil as _shutil
-
-    return _shutil.which("rclone") or str(Path.home() / ".local" / "bin" / "rclone")
 
 
 def _list_remote_snapshot_dirs(rclone: str, run_fn: Callable[..., subprocess.CompletedProcess[str]]) -> list[str]:
@@ -343,5 +338,5 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     main()

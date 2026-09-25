@@ -2,22 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+from src.config._env import EnvSettings
 
 
-class AltDataSettings(BaseSettings):
+class AltDataSettings(EnvSettings):
     """Alt-data(대체데이터) 백필 접속 설정: OpenDART · KRX Open API 인증 키."""
-
-    model_config = SettingsConfigDict(
-        env_file=_PROJECT_ROOT / ".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
 
     # OpenDART: 암호화 볼트(.env.enc)는 OPENDART_API_KEY 를 쓰고, 구 설정은 DART_API_KEY 를 씀.
     OPENDART_API_KEY: str = Field(default="")

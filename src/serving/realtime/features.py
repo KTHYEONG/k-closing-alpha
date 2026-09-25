@@ -67,24 +67,6 @@ _PRODUCTION_FLOW_SOURCE_COLUMNS: tuple[str, ...] = (
     "prog_dominance",
 )
 
-SCENARIO_ONE_HOT_FEATURES: tuple[str, ...] = (
-    "scenario_is_sangtta",
-    "scenario_is_120_breakout",
-    "scenario_is_volume_surge",
-    "scenario_is_new_high",
-    "scenario_is_near_new_high",
-    "scenario_is_limitup_next_day",
-    "scenario_is_rising_bearish",
-    "scenario_other",
-)
-
-SCENARIO_CONTEXT_FEATURES: tuple[str, ...] = (
-    "scenario_count_for_stock_date",
-    "has_sangtta_for_stock_date",
-    "is_multi_scenario_stock_date",
-)
-
-
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """로그 스케일링, 상대 비율, 횡단면 백분위/robust-z 피처를 생성합니다."""
     df = df.copy()

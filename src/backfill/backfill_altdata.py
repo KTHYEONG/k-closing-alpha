@@ -43,7 +43,6 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--krx-key", type=str, default=settings.KRX_OPENAPI_KEY, help="KRX Open API AUTH_KEY"
     )
-    parser.add_argument("--pykrx-rps", type=float, default=6.0, help="pykrx requests per sec")
     parser.add_argument("--dart-rps", type=float, default=8.0, help="DART requests per sec")
     parser.add_argument("--krx-rps", type=float, default=4.0, help="KRX Open API requests per sec")
     parser.add_argument(
@@ -82,7 +81,6 @@ def main(argv: list[str] | None = None) -> None:
 
     dart_key = str(args.dart_key or "").strip()
     krx_key = str(args.krx_key or "").strip()
-    pykrx_rps = float(args.pykrx_rps)
     dart_rps = float(args.dart_rps)
     krx_rps = float(args.krx_rps)
 
@@ -113,7 +111,6 @@ def main(argv: list[str] | None = None) -> None:
         sources=sources,
         dart_api_key=dart_key,
         krx_api_key=krx_key,
-        pykrx_requests_per_sec=pykrx_rps,
         dart_requests_per_sec=dart_rps,
         krx_requests_per_sec=krx_rps,
         universe_symbols=universe_symbols,

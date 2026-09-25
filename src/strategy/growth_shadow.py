@@ -19,9 +19,10 @@ import numpy as np
 import pandas as pd
 
 from src import settings
+from src.config.base import TOPK_DECISIONS_PARQUET_NAME
 from src.data.io_utils import atomic_write_parquet
-from src.ml.costaware_topk import MIN_TOP_K, compute_net_return
-from src.strategy.contract import AA_COST
+from src.ml.costaware_topk import compute_net_return
+from src.strategy.contract import AA_COST, MIN_TOP_K
 
 logger = logging.getLogger(__name__)
 
@@ -261,7 +262,7 @@ def run_growth_shadow(
     Returns:
         Number of ledger rows written, or 0 when no decisions exist yet.
     """
-    dec_path = Path(settings.PARQUET_DIR / "topk_decisions.parquet" if decisions_path is None else decisions_path)
+    dec_path = Path(settings.PARQUET_DIR / TOPK_DECISIONS_PARQUET_NAME if decisions_path is None else decisions_path)
     ph_path = Path(settings.PRICE_HISTORY_PARQUET_PATH if price_history_path is None else price_history_path)
     dest = Path(settings.PARQUET_DIR / GROWTH_SHADOW_PARQUET_NAME if out_path is None else out_path)
     # 결정 기록이 없으면 쓸 원장이 없음 → 경고만 남기고 종료

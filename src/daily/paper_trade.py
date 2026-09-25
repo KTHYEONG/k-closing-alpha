@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import functools
 import logging
-import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -47,7 +46,6 @@ from src.execution.paper_broker import (
     ORDER_STATUS_UNCONFIRMED,
     ORDER_STATUS_UNFILLED,
     ORDER_STATUS_ZERO_QTY,
-    PAPER_BROKERAGE_SIDE_BP,
     PaperLedger,
     PaperOrder,
     build_auction_fill,
@@ -56,10 +54,12 @@ from src.execution.paper_broker import (
     investable_capital,
     order_record,
     refresh_trade_ledgers,
+    side_fee_krw,
     size_order_qty,
     sizing_price,
 )
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_NO_DECISION, record_run_outcome
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -536,9 +536,8 @@ async def run_paper_session(
                     logger.warning("[DATA] stage=paper_entry symbol=%s status=UNCONFIRMED", order.symbol)
                     order_rows.append(order_record(order, ORDER_STATUS_UNCONFIRMED))
                     continue
-                fill_cost = fill.fill_price * fill.qty + math.floor(
-                    fill.fill_price * fill.qty * PAPER_BROKERAGE_SIDE_BP / 10_000
-                )
+                notional = fill.fill_price * fill.qty
+                fill_cost = notional + side_fee_krw(notional)
                 if fill_cost > remaining_cash:
                     logger.warning("[DATA] stage=paper_entry symbol=%s status=INSUFFICIENT_CASH", order.symbol)
                     order_rows.append(order_record(order, ORDER_STATUS_INSUFFICIENT_CASH))
@@ -766,5 +765,5 @@ def main() -> None:  # pragma: no cover - CLI entry; logic covered via run_paper
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     main()

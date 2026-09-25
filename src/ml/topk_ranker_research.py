@@ -21,7 +21,6 @@ from src.execution.cost_model import TICK_REFORM_DATE
 from src.ml.bundle import build_inline_bundle, fit_seed_ensemble
 from src.ml.costaware_topk import (
     MIN_POST_REFORM_T_STAT,
-    MIN_TOP_K,
     CostStressPoint,
     RegimeMetrics,
     assert_screen_constructible,
@@ -48,11 +47,13 @@ from src.strategy.contract import (
     KCA_TOPK_CAPFREE_001,
     KCA_TOPK_COSTAWARE_001,
     MIN_PATH_WIN_RATE,
+    MIN_TOP_K,
     CostSpec,
     StrategySpec,
     UniverseSpec,
     select_universe,
 )
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -1113,7 +1114,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--train-start", default=None, help="training-window start YYYY-MM-DD; augments training only and never moves the certification boundary (default: the panel minimum date)")
     parser.add_argument("--capfree", action="store_true", help="select with the cap-free universe (KCA-TOPK-CAPFREE-001) instead of the tick-cost-capped one")
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO)
+    configure_cli_logging(logging.BASIC_FORMAT)
     base_spec = KCA_TOPK_CAPFREE_001 if args.capfree else KCA_TOPK_COSTAWARE_001
     spec = _dataclasses.replace(base_spec, top_k=int(args.top_k)) if args.top_k is not None else base_spec
     if not os.path.exists(args.price_history):

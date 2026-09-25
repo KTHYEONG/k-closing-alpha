@@ -19,6 +19,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.utils.cli_logging import configure_cli_logging
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_REMOTE: str = "origin"
@@ -198,5 +200,5 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     main()

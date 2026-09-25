@@ -1,9 +1,6 @@
 {
   "src/api/kis/client.py": {
-    "testing": [
-      "tests/unit/api/kis/test_client.py",
-      "tests/unit/api/kis/test_kis_key_pool.py"
-    ]
+    "testing": "tests/unit/api/kis/test_client.py"
   },
   "src/api/kis/indicators.py": {
     "testing": "tests/unit/api/kis/test_indicators.py"
@@ -14,8 +11,10 @@
       "tests/unit/api/kis/test_kis_host_rate_limiter.py",
       "tests/unit/api/kis/test_kis_key_pool.py",
       "tests/unit/api/kis/test_kis_token_store.py",
+      "tests/unit/backfill/test_client_pool.py",
       "tests/unit/tools/test_daily_audit.py",
-      "tests/unit/tools/test_kis_token_warmup.py"
+      "tests/unit/tools/test_kis_token_warmup.py",
+      "tests/unit/tools/test_provision_env.py"
     ]
   },
   "src/api/kis/rate_limit.py": {
@@ -35,7 +34,8 @@
     "testing": [
       "tests/unit/api/kiwoom/test_kiwoom_client.py",
       "tests/unit/daily/test_collect_service.py",
-      "tests/unit/daily/test_price_ingest.py"
+      "tests/unit/daily/test_price_ingest.py",
+      "tests/unit/test_dead_code_subtraction.py"
     ]
   },
   "src/api/ls/client.py": {
@@ -50,6 +50,9 @@
       "tests/unit/daily/test_price_ingest.py"
     ]
   },
+  "src/backfill/altdata/client_pool.py": {
+    "testing": "tests/unit/backfill/test_client_pool.py"
+  },
   "src/backfill/altdata/config.py": {
     "testing": [
       "tests/integration/backfill/test_altdata_flow.py",
@@ -59,54 +62,68 @@
       "tests/unit/backfill/test_altdata_krx_api.py",
       "tests/unit/backfill/test_altdata_normalize.py",
       "tests/unit/backfill/test_altdata_ratelimit.py",
+      "tests/unit/backfill/test_altdata_runner.py",
+      "tests/unit/backfill/test_client_pool.py",
       "tests/unit/backfill/test_config.py",
       "tests/unit/backfill/test_credit_balance.py",
       "tests/unit/backfill/test_program_trade_daily.py",
-      "tests/unit/backfill/test_shorting.py"
+      "tests/unit/backfill/test_shorting.py",
+      "tests/unit/daily/test_altdata_capture.py",
+      "tests/unit/daily/test_security_classification.py",
+      "tests/unit/test_dead_code_subtraction.py"
     ]
   },
-  "src/backfill/altdata/credit_balance.py": {
-    "testing": "tests/unit/backfill/test_credit_balance.py"
+  "src/backfill/altdata/credit_balance.py": {},
+  "src/backfill/altdata/dart_keys.py": {
+    "testing": [
+      "tests/unit/backfill/test_altdata_dart_keys.py",
+      "tests/unit/backfill/test_altdata_disclosure.py",
+      "tests/unit/backfill/test_altdata_runner.py"
+    ]
   },
-  "src/backfill/altdata/derivatives.py": {
-    "testing": "tests/unit/backfill/test_altdata_krx_api.py"
-  },
-  "src/backfill/altdata/disclosure.py": {
-    "testing": "tests/unit/backfill/test_altdata_disclosure.py"
-  },
+  "src/backfill/altdata/derivatives.py": {},
+  "src/backfill/altdata/disclosure.py": {},
   "src/backfill/altdata/krx_api.py": {
-    "testing": "tests/unit/backfill/test_altdata_krx_api.py"
+    "testing": [
+      "tests/unit/daily/test_price_ingest.py",
+      "tests/unit/test_dead_code_subtraction.py"
+    ]
   },
   "src/backfill/altdata/normalize.py": {
     "testing": "tests/unit/backfill/test_altdata_normalize.py"
   },
-  "src/backfill/altdata/program_trade_daily.py": {
-    "testing": "tests/unit/backfill/test_program_trade_daily.py"
-  },
+  "src/backfill/altdata/program_trade_daily.py": {},
   "src/backfill/altdata/ratelimit.py": {
-    "testing": "tests/unit/backfill/test_altdata_ratelimit.py"
+    "testing": [
+      "tests/unit/backfill/test_altdata_dart_keys.py",
+      "tests/unit/backfill/test_altdata_disclosure.py",
+      "tests/unit/backfill/test_altdata_krx_api.py",
+      "tests/unit/backfill/test_altdata_ratelimit.py",
+      "tests/unit/backfill/test_altdata_runner.py"
+    ]
   },
   "src/backfill/altdata/runner.py": {
     "testing": [
       "tests/integration/backfill/test_altdata_flow.py",
-      "tests/unit/backfill/test_altdata_runner.py",
-      "tests/unit/backfill/test_runner.py"
+      "tests/unit/backfill/test_altdata_krx_api.py",
+      "tests/unit/backfill/test_altdata_runner.py"
     ]
   },
   "src/backfill/altdata/shorting.py": {
-    "testing": [
-      "tests/unit/backfill/test_altdata_collectors.py",
-      "tests/unit/backfill/test_shorting.py"
-    ]
+    "testing": "tests/unit/backfill/test_shorting.py"
   },
   "src/backfill/backfill_altdata.py": {
-    "testing": "tests/integration/backfill/test_altdata_flow.py"
+    "testing": [
+      "tests/integration/backfill/test_altdata_flow.py",
+      "tests/unit/test_config_constant_consolidation.py",
+      "tests/unit/test_dead_code_subtraction.py"
+    ]
   },
   "src/backfill/intraday/backfill_minute_history.py": {
     "testing": [
-      "tests/integration/daily/test_minute_history_backfill_flow.py",
-      "tests/unit/backfill/test_backfill_minute_history.py",
-      "tests/unit/backfill/test_backfill_minute_history_toss.py"
+      "tests/unit/backfill/test_backfill_minute_history_toss.py",
+      "tests/unit/test_config_constant_consolidation.py",
+      "tests/unit/test_dead_code_subtraction.py"
     ]
   },
   "src/backfill/intraday/backfill_minute_history_toss.py": {
@@ -115,7 +132,8 @@
   "src/backfill/intraday/collector.py": {
     "testing": [
       "tests/unit/backfill/test_backfill_minute_history.py",
-      "tests/unit/backfill/test_collector.py"
+      "tests/unit/backfill/test_collector.py",
+      "tests/unit/daily/test_archive_intraday.py"
     ]
   },
   "src/backfill/kis_flow_backfill.py": {
@@ -133,11 +151,17 @@
   "src/config/base.py": {
     "testing": "tests/unit/config/test_base.py"
   },
+  "src/config/collection.py": {
+    "testing": "tests/unit/config/test_collection.py"
+  },
   "src/config/kis.py": {
     "testing": "tests/unit/config/test_kis.py"
   },
   "src/config/kiwoom.py": {
     "testing": "tests/unit/config/test_kiwoom.py"
+  },
+  "src/config/krx_calendar.py": {
+    "testing": "tests/unit/config/test_krx_calendar.py"
   },
   "src/config/ls.py": {
     "testing": "tests/unit/config/test_ls.py"
@@ -151,6 +175,9 @@
   "src/config/trading.py": {
     "testing": "tests/unit/config/test_trading.py"
   },
+  "src/daily/altdata_capture.py": {
+    "testing": "tests/unit/daily/test_altdata_capture.py"
+  },
   "src/daily/archive.py": {
     "testing": "tests/unit/daily/test_archive.py"
   },
@@ -159,6 +186,9 @@
       "tests/integration/daily/test_archive_intraday.py",
       "tests/unit/daily/test_archive_intraday.py"
     ]
+  },
+  "src/daily/auction_capture.py": {
+    "testing": "tests/unit/daily/test_auction_capture.py"
   },
   "src/daily/collect.py": {
     "testing": "tests/unit/daily/test_collect.py"
@@ -175,14 +205,23 @@
   "src/daily/price_ingest.py": {
     "testing": "tests/unit/daily/test_price_ingest.py"
   },
+  "src/daily/security_classification.py": {
+    "testing": "tests/unit/daily/test_security_classification.py"
+  },
   "src/daily/universe_scan.py": {
     "testing": "tests/unit/daily/test_universe_scan.py"
   },
   "src/daily/universe_screen.py": {
     "testing": "tests/unit/daily/test_universe_screen.py"
   },
-  "src/data/candidate_panel.py": {
-    "testing": "tests/unit/data/test_candidate_panel.py"
+  "src/data/altdata_health.py": {
+    "testing": "tests/unit/data/test_altdata_health.py"
+  },
+  "src/data/capture_contracts.py": {
+    "testing": "tests/unit/data/test_capture_contracts.py"
+  },
+  "src/data/capture_store.py": {
+    "testing": "tests/unit/data/test_capture_store.py"
   },
   "src/data/data_loader.py": {
     "testing": "tests/unit/data/test_data_loader.py"
@@ -207,6 +246,9 @@
   },
   "src/data/parquet_loader.py": {
     "testing": "tests/unit/data/test_parquet_loader.py"
+  },
+  "src/data/session_calendar.py": {
+    "testing": "tests/unit/data/test_session_calendar.py"
   },
   "src/data/trading_calendar.py": {
     "testing": "tests/unit/data/test_trading_calendar.py"
@@ -263,7 +305,8 @@
       "tests/unit/ml/test_research_v3.py",
       "tests/unit/ml/test_research_v3_engine.py",
       "tests/unit/ml/test_topk_ranker_research.py",
-      "tests/unit/serving/realtime/test_features.py"
+      "tests/unit/serving/realtime/test_features.py",
+      "tests/unit/test_dead_code_subtraction.py"
     ]
   },
   "src/ml/research/v3_metrics.py": {
@@ -319,24 +362,11 @@
   },
   "src/settings.py": {
     "testing": [
-      "tests/unit/api/kis/test_kis_client.py",
-      "tests/unit/api/kis/test_kis_host_rate_limiter.py",
-      "tests/unit/api/kis/test_kis_token_store.py",
+      "tests/conftest.py",
       "tests/unit/config/test_altdata.py",
-      "tests/unit/config/test_altdata_settings.py",
       "tests/unit/config/test_base.py",
-      "tests/unit/config/test_kiwoom.py",
-      "tests/unit/config/test_ls.py",
       "tests/unit/config/test_settings_compat.py",
-      "tests/unit/config/test_toss.py",
-      "tests/unit/config/test_trading.py",
-      "tests/unit/daily/test_archive.py",
-      "tests/unit/daily/test_archive_intraday.py",
-      "tests/unit/data/test_parquet_loader.py",
-      "tests/unit/ml/test_exit_grid_revalidation.py",
-      "tests/unit/ml/test_history_features.py",
-      "tests/unit/tools/test_code_sync.py",
-      "tests/unit/tools/test_kis_token_warmup.py"
+      "tests/unit/test_dead_code_subtraction.py"
     ]
   },
   "src/strategy/contract.py": {
@@ -358,63 +388,42 @@
     "testing": "tests/unit/tools/test_alerts.py"
   },
   "src/tools/backup_prune.py": {
-    "testing": [
-      "tests/unit/tools/test_backup_prune.py",
-      "tests/unit/tools/test_offsite_backup.py"
-    ]
+    "testing": "tests/unit/tools/test_backup_prune.py"
+  },
+  "src/tools/capture_offsite.py": {
+    "testing": "tests/unit/tools/test_capture_offsite.py"
   },
   "src/tools/code_sync.py": {
     "testing": "tests/unit/tools/test_code_sync.py"
   },
+  "src/tools/core_snapshot.py": {
+    "testing": "tests/unit/tools/test_core_snapshot.py"
+  },
   "src/tools/daily_audit.py": {
     "testing": "tests/unit/tools/test_daily_audit.py"
   },
-  "src/tools/fix_price_history_integrity.py": {
-    "testing": "tests/unit/tools/test_fix_price_history_integrity.py"
+  "src/tools/deploy_preflight.py": {
+    "testing": "tests/unit/tools/test_deploy_preflight.py"
   },
   "src/tools/kis_token_warmup.py": {
     "testing": "tests/unit/tools/test_kis_token_warmup.py"
   },
-  "src/tools/migrate_altdata_storage.py": {
-    "testing": "tests/unit/tools/test_migrate_altdata_storage.py"
+  "src/tools/offsite_backup.py": {
+    "testing": "tests/unit/tools/test_offsite_backup.py"
   },
-  "src/tools/migrate_intraday_corpus.py": {
-    "testing": "tests/unit/tools/test_migrate_intraday_corpus.py"
-  },
-  "src/tools/migrate_intraday_schema.py": {
-    "testing": "tests/unit/tools/test_migrate_intraday_schema.py"
-  },
-  "src/tools/migrate_price_history_storage.py": {
-    "testing": "tests/unit/tools/test_migrate_price_history_storage.py"
-  },
-  "src/tools/observe_closing_auction_price_behavior.py": {
-    "testing": "tests/unit/tools/test_observe_closing_auction_price_behavior.py"
+  "src/tools/paper_ledger_correct.py": {
+    "testing": "tests/unit/tools/test_paper_ledger_correct.py"
   },
   "src/tools/provision_env.py": {
     "testing": "tests/unit/tools/test_provision_env.py"
+  },
+  "src/tools/repair_intraday_capture.py": {
+    "testing": "tests/unit/daily/test_archive_intraday.py"
   },
   "src/tools/run_outcome.py": {
     "testing": "tests/unit/tools/test_run_outcome.py"
   },
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
-  },
-  "src/daily/auction_capture.py": {
-    "testing": "tests/unit/daily/test_auction_capture.py"
-  },
-  "src/tools/capture_offsite.py": {
-    "testing": "tests/unit/tools/test_capture_offsite.py"
-  },
-  "src/tools/offsite_legacy_cleanup.py": {
-    "testing": "tests/unit/tools/test_offsite_legacy_cleanup.py"
-  },
-  "src/backfill/altdata/dart_keys.py": {
-    "testing": "tests/unit/backfill/test_altdata_dart_keys.py"
-  },
-  "src/data/session_calendar.py": {
-    "testing": "tests/unit/data/test_session_calendar.py"
-  },
-  "src/tools/deploy_preflight.py": {
-    "testing": "tests/unit/tools/test_deploy_preflight.py"
   }
 }

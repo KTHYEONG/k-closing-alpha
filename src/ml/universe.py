@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.strategy.contract import CEILING_CHG_THRESHOLD, MAX_TICK_COST_BP
+from src.strategy.contract import CEILING_CHG_THRESHOLD, COST_AWARE_UNIVERSE
 
 __all__ = [
     "COST_AWARE_SCREEN",
@@ -43,12 +43,12 @@ class ScreenConfig:
 
 
 COST_AWARE_SCREEN: ScreenConfig = ScreenConfig(
-    change_lower=0.02,
-    change_upper=0.10,
-    min_trade_value_100m=100.0,
-    min_market_cap_100m=500.0,
-    exclude_ceiling=True,
-    max_tick_cost_bp=MAX_TICK_COST_BP,
+    change_lower=COST_AWARE_UNIVERSE.chg_min,
+    change_upper=COST_AWARE_UNIVERSE.chg_max,
+    min_trade_value_100m=COST_AWARE_UNIVERSE.min_trade_value_100m,
+    min_market_cap_100m=COST_AWARE_UNIVERSE.min_market_cap_100m,
+    exclude_ceiling=COST_AWARE_UNIVERSE.exclude_ceiling,
+    max_tick_cost_bp=COST_AWARE_UNIVERSE.max_tick_cost_bp,
 )
 
 
@@ -66,7 +66,11 @@ def build_universe_panel(
     start_date: str,
     end_date: str,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Rebuild candidate panel from price_history with ceiling exclusion."""
+    """Rebuild candidate panel from price_history with ceiling exclusion.
+
+    Screens on vendor ``daily_change_pct`` (the contract screens on derived
+    ``chg_ratio``); this input difference is a documented residual.
+    """
     date_col = _resolve_col(price_history_df, ("date", "trade_date"))
     symbol_col = _resolve_col(price_history_df, ("symbol", "stock_code", "code"))
     if date_col is None or symbol_col is None:
@@ -122,7 +126,7 @@ def build_universe_panel(
     chg = pd.to_numeric(filt["daily_change_pct"], errors="coerce").to_numpy(dtype=np.float64)
     keep = np.isfinite(chg) & (chg >= float(screen.change_lower))
     if screen.change_upper is not None:
-        keep &= np.isfinite(chg) & (chg <= float(screen.change_upper))
+        keep &= np.isfinite(chg) & (chg < float(screen.change_upper))
     # tv_clean/mc_clean 우선: 원천 NaN을 복원한 확정 컬럼이 있으면 그것을 쓴다.
     tv_col = "tv_clean" if "tv_clean" in filt.columns else "trade_value_100m"
     if tv_col in filt.columns:

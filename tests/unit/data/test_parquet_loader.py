@@ -6,7 +6,6 @@ from src import settings
 from src.data.parquet_loader import (
     _atomic_write_parquet,
     load_theme_from_parquet,
-    save_theme_to_parquet,
     upsert_condition_parquet,
 )
 
@@ -22,13 +21,13 @@ def tmp_parquet_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return p_dir
 
 
-def test_save_and_load_theme_parquet(tmp_parquet_dir: Path) -> None:
+def test_load_theme_from_parquet_reads_normalized_codes(tmp_parquet_dir: Path) -> None:
     data = {
-        "종목코드": [5930, "000660"],
+        "종목코드": ["005930", "000660"],
         "테마": ["반도체", "반도체"],
     }
     df_theme = pd.DataFrame(data)
-    save_theme_to_parquet(df_theme)
+    df_theme.to_parquet(settings.THEME_PARQUET_PATH)
 
     theme_map = load_theme_from_parquet()
     assert isinstance(theme_map, dict)
@@ -70,7 +69,7 @@ def test_parquet_loader_module_no_longer_exposes_trade_log_functions() -> None:
 
     assert not hasattr(mod, "save_trade_log_to_parquet")
     assert not hasattr(mod, "load_trade_log_from_parquet")
-    assert hasattr(mod, "save_theme_to_parquet")
+    assert not hasattr(mod, "save_theme_to_parquet")
     assert hasattr(mod, "load_theme_from_parquet")
     assert hasattr(mod, "upsert_condition_parquet")
     assert not hasattr(mod, "load_condition_data_from_parquet")

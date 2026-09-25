@@ -1,15 +1,8 @@
-"""도메인별 설정 패키지 (Settings 싱글톤).
-
-각 도메인 모듈(base/kis/trading)의 설정을 통합한 `Settings` 싱글톤과
-기존 `from src import settings` / `from src.settings import ...` 하위 호환
-재수출을 제공합니다.
-"""
+"""Domain settings package (Settings singleton)."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from pydantic_settings import SettingsConfigDict
+from typing import Any
 
 from src.config.alerts import AlertSettings
 from src.config.altdata import AltDataSettings
@@ -21,209 +14,15 @@ from src.config.ls import LsSettings
 from src.config.toss import TossSettings
 from src.config.trading import TradingSettings
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-
 
 class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings, TossSettings, AlertSettings, CollectionSettings):
-    """Expose collection configuration through the existing application settings facade.
-
-The existing field names, environment loading and public exports remain compatible.
-Collection root resolution belongs to owner-local capture construction rather than
-cross-base defaults that depend on Pydantic multiple-inheritance ordering.
-    """
-
-    model_config = SettingsConfigDict(
-        env_file=_PROJECT_ROOT / ".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-
+    """Combined application settings singleton."""
 
 
 settings = Settings()
 
 
-# =========================================================
-# [모듈 레벨 하위 호환 재수출]
-# 기존 소비자 모듈(`from src import settings` 후 `settings.XXX` 참조)을 깨지 않도록
-# Singleton 인스턴스의 속성을 모듈 레벨로 재수출합니다.
-# =========================================================
-BASE_DIR = settings.BASE_DIR
-DATA_DIR = settings.DATA_DIR
-CONFIGS_DIR = settings.CONFIGS_DIR
-MODELS_DIR = settings.MODELS_DIR
-COLLECTION_ROOT = settings.COLLECTION_ROOT
-COLLECTION_RAW_ENABLED = settings.COLLECTION_RAW_ENABLED
-COLLECTION_AUCTION_ENABLED = settings.COLLECTION_AUCTION_ENABLED
-COLLECTION_ALTDATA_ENABLED = settings.COLLECTION_ALTDATA_ENABLED
-COLLECTION_RESEARCH_SLOTS = settings.COLLECTION_RESEARCH_SLOTS
-COLLECTION_ALTDATA_EXTRA_SLOTS = settings.COLLECTION_ALTDATA_EXTRA_SLOTS
-COLLECTION_AUCTION_INTERVAL_SECONDS = settings.COLLECTION_AUCTION_INTERVAL_SECONDS
-COLLECTION_REQUEST_TIMEOUT_SECONDS = settings.COLLECTION_REQUEST_TIMEOUT_SECONDS
-COLLECTION_CONCURRENCY_PER_KEY = settings.COLLECTION_CONCURRENCY_PER_KEY
-COLLECTION_CHART_MAX_PAGES = settings.COLLECTION_CHART_MAX_PAGES
-COLLECTION_TICK_REPAIR_MAX_PAGES = settings.COLLECTION_TICK_REPAIR_MAX_PAGES
-COLLECTION_ARROW_BATCH_ROWS = settings.COLLECTION_ARROW_BATCH_ROWS
-COLLECTION_MAX_RSS_MIB = settings.COLLECTION_MAX_RSS_MIB
-COLLECTION_ALTDATA_LOOKBACK_DAYS = settings.COLLECTION_ALTDATA_LOOKBACK_DAYS
-COLLECTION_VERIFIED_CHART_ROUTES = settings.COLLECTION_VERIFIED_CHART_ROUTES
-COLLECTION_OPEN_CONFIRM_SECONDS = settings.COLLECTION_OPEN_CONFIRM_SECONDS
-COLLECTION_SESSION_OVERRIDES = settings.COLLECTION_SESSION_OVERRIDES
-KIS_APP_KEY = settings.KIS_APP_KEY
-KIS_APP_SECRET = settings.KIS_APP_SECRET
-KIS_ACCOUNT_ID = settings.KIS_ACCOUNT_ID
-KIS_HTS_ID = settings.KIS_HTS_ID
-KIS_BASE_URL = settings.KIS_BASE_URL
-KIS_API_CONFIG = settings.KIS_API_CONFIG
-KIS_DATA_ROLE = settings.KIS_DATA_ROLE
-KIS_TOKEN_CACHE_DIR = settings.KIS_TOKEN_CACHE_DIR
-LS_APP_KEY = settings.LS_APP_KEY
-LS_APP_SECRET = settings.LS_APP_SECRET
-LS_BASE_URL = settings.LS_BASE_URL
-KIWOM_APP_KEY = settings.KIWOM_APP_KEY
-KIWOM_SECRET_KEY = settings.KIWOM_SECRET_KEY
-KIWOM_BASE_URL = settings.KIWOM_BASE_URL
-KIWOM_TICK_MAX_PAGES = settings.KIWOM_TICK_MAX_PAGES
-TOSS_APP_KEY = settings.TOSS_APP_KEY
-TOSS_APP_SECRET = settings.TOSS_APP_SECRET
-TOSS_BASE_URL = settings.TOSS_BASE_URL
-ALERT_WEBHOOK_URL = settings.ALERT_WEBHOOK_URL
-ALERT_GMAIL_USER = settings.ALERT_GMAIL_USER
-ALERT_GMAIL_APP_PASSWORD = settings.ALERT_GMAIL_APP_PASSWORD
-ALERT_GMAIL_TO = settings.ALERT_GMAIL_TO
-ALERT_RETRY_ATTEMPTS = settings.ALERT_RETRY_ATTEMPTS
-ALERT_RETRY_BACKOFF_SECONDS = settings.ALERT_RETRY_BACKOFF_SECONDS
-ALERT_OUTBOX_MAX_DRAIN = settings.ALERT_OUTBOX_MAX_DRAIN
-TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
-OVERHEATED_CONDITION_NAME = settings.OVERHEATED_CONDITION_NAME
-NEW_HIGH_CONDITION_NAME = settings.NEW_HIGH_CONDITION_NAME
-NEAR_NEW_HIGH_CONDITION_NAME = settings.NEAR_NEW_HIGH_CONDITION_NAME
-UPPER_LIMIT_NEXT_DAY_CONDITION_NAME = settings.UPPER_LIMIT_NEXT_DAY_CONDITION_NAME
-UPPER_LIMIT_CONDITION_NAME = settings.UPPER_LIMIT_CONDITION_NAME
-API_SEMAPHORE_LIMIT = settings.API_SEMAPHORE_LIMIT
-EMA_PERIOD = settings.EMA_PERIOD
-SMA_PERIOD = settings.SMA_PERIOD
-SMA60_PERIOD = settings.SMA60_PERIOD
-CANDLE_BODY_RATIO_THRESHOLD = settings.CANDLE_BODY_RATIO_THRESHOLD
-GAP_UP_THRESHOLD = settings.GAP_UP_THRESHOLD
-SMA_LOOKBACK_DAYS = settings.SMA_LOOKBACK_DAYS
-SMA60_LOOKBACK_DAYS = settings.SMA60_LOOKBACK_DAYS
-EMA_LOOKBACK_DAYS = settings.EMA_LOOKBACK_DAYS
-DEFAULT_SCENARIOS = settings.DEFAULT_SCENARIOS
-DAY_NAME_MAP = settings.DAY_NAME_MAP
-PARQUET_DIR = settings.PARQUET_DIR
-TRADE_LOG_PARQUET_PATH = settings.TRADE_LOG_PARQUET_PATH
-THEME_PARQUET_PATH = settings.THEME_PARQUET_PATH
-TOKEN_FILE = settings.TOKEN_FILE
-DATA_TOKEN_FILE = settings.DATA_TOKEN_FILE
-DAILY_DIR = settings.DAILY_DIR
-HISTORY_PARQUET_PATH = settings.HISTORY_PARQUET_PATH
-HISTORY_DIR = settings.HISTORY_DIR
-ORDERBOOK_DIR = settings.ORDERBOOK_DIR
-PAPER_DIR = settings.PAPER_DIR
-PAPER_ENTRY_SIZING_BUFFER_BP = settings.PAPER_ENTRY_SIZING_BUFFER_BP
-PAPER_SEED_CAPITAL = settings.PAPER_SEED_CAPITAL
-LS_TICK_MAX_PAGES = settings.LS_TICK_MAX_PAGES
-PRICE_HISTORY_PARQUET_PATH = settings.PRICE_HISTORY_PARQUET_PATH
-LABEL_ENCODER_PATH = settings.LABEL_ENCODER_PATH
-MODEL_PATH = settings.MODEL_PATH
-ALTDATA_DIR = settings.ALTDATA_DIR
-DART_API_KEY = settings.DART_API_KEY
-OPENDART_API_KEY = settings.OPENDART_API_KEY
-OPENDART_API_KEY_2 = settings.OPENDART_API_KEY_2
-KRX_OPENAPI_KEY = settings.KRX_OPENAPI_KEY
-KRX_OPENAPI_BASE_URL = settings.KRX_OPENAPI_BASE_URL
-KRX_OPENAPI_BASE_URLS = settings.KRX_OPENAPI_BASE_URLS
-KRX_OPENAPI_ENDPOINTS = settings.KRX_OPENAPI_ENDPOINTS
-
 __all__ = [
-    "ALERT_GMAIL_APP_PASSWORD",
-    "ALERT_GMAIL_TO",
-    "ALERT_GMAIL_USER",
-    "ALERT_OUTBOX_MAX_DRAIN",
-    "ALERT_RETRY_ATTEMPTS",
-    "ALERT_RETRY_BACKOFF_SECONDS",
-    "ALERT_WEBHOOK_URL",
-    "ALTDATA_DIR",
-    "API_SEMAPHORE_LIMIT",
-    "BASE_DIR",
-    "CANDLE_BODY_RATIO_THRESHOLD",
-    "COLLECTION_ALTDATA_ENABLED",
-    "COLLECTION_ALTDATA_EXTRA_SLOTS",
-    "COLLECTION_ALTDATA_LOOKBACK_DAYS",
-    "COLLECTION_ARROW_BATCH_ROWS",
-    "COLLECTION_AUCTION_ENABLED",
-    "COLLECTION_AUCTION_INTERVAL_SECONDS",
-    "COLLECTION_CHART_MAX_PAGES",
-    "COLLECTION_CONCURRENCY_PER_KEY",
-    "COLLECTION_MAX_RSS_MIB",
-    "COLLECTION_OPEN_CONFIRM_SECONDS",
-    "COLLECTION_RAW_ENABLED",
-    "COLLECTION_REQUEST_TIMEOUT_SECONDS",
-    "COLLECTION_RESEARCH_SLOTS",
-    "COLLECTION_ROOT",
-    "COLLECTION_SESSION_OVERRIDES",
-    "COLLECTION_TICK_REPAIR_MAX_PAGES",
-    "COLLECTION_VERIFIED_CHART_ROUTES",
-    "CONFIGS_DIR",
-    "DAILY_DIR",
-    "DART_API_KEY",
-    "DATA_DIR",
-    "DATA_TOKEN_FILE",
-    "DAY_NAME_MAP",
-    "DEFAULT_SCENARIOS",
-    "EMA_LOOKBACK_DAYS",
-    "EMA_PERIOD",
-    "GAP_UP_THRESHOLD",
-    "HISTORY_DIR",
-    "HISTORY_PARQUET_PATH",
-    "KIS_ACCOUNT_ID",
-    "KIS_API_CONFIG",
-    "KIS_APP_KEY",
-    "KIS_APP_SECRET",
-    "KIS_BASE_URL",
-    "KIS_DATA_ROLE",
-    "KIS_HTS_ID",
-    "KIS_TOKEN_CACHE_DIR",
-    "KIWOM_APP_KEY",
-    "KIWOM_BASE_URL",
-    "KIWOM_SECRET_KEY",
-    "KIWOM_TICK_MAX_PAGES",
-    "KRX_OPENAPI_BASE_URL",
-    "KRX_OPENAPI_BASE_URLS",
-    "KRX_OPENAPI_ENDPOINTS",
-    "KRX_OPENAPI_KEY",
-    "LABEL_ENCODER_PATH",
-    "LS_APP_KEY",
-    "LS_APP_SECRET",
-    "LS_BASE_URL",
-    "LS_TICK_MAX_PAGES",
-    "MODELS_DIR",
-    "MODEL_PATH",
-    "NEAR_NEW_HIGH_CONDITION_NAME",
-    "NEW_HIGH_CONDITION_NAME",
-    "OPENDART_API_KEY",
-    "OPENDART_API_KEY_2",
-    "ORDERBOOK_DIR",
-    "OVERHEATED_CONDITION_NAME",
-    "PAPER_DIR",
-    "PAPER_ENTRY_SIZING_BUFFER_BP",
-    "PAPER_SEED_CAPITAL",
-    "PARQUET_DIR",
-    "PRICE_HISTORY_PARQUET_PATH",
-    "SMA60_LOOKBACK_DAYS",
-    "SMA60_PERIOD",
-    "SMA_LOOKBACK_DAYS",
-    "SMA_PERIOD",
-    "TARGET_CONDITION_NAME",
-    "THEME_PARQUET_PATH",
-    "TOKEN_FILE",
-    "TOSS_APP_KEY",
-    "TOSS_APP_SECRET",
-    "TOSS_BASE_URL",
-    "TRADE_LOG_PARQUET_PATH",
-    "UPPER_LIMIT_CONDITION_NAME",
-    "UPPER_LIMIT_NEXT_DAY_CONDITION_NAME",
     "AlertSettings",
     "AltDataSettings",
     "CollectionSettings",
@@ -236,3 +35,18 @@ __all__ = [
     "TradingSettings",
     "settings",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve Settings field names against the live singleton at access time.
+
+    Module-level names used to be import-time copies, so runtime mutation of the singleton was
+    invisible to module-attribute consumers and fields absent from the copy list were unreachable.
+    Delegation keeps `config.X` reads live while preserving the attribute-style API.
+
+    Raises:
+        AttributeError: `name` is neither a Settings model field nor a computed field.
+    """
+    if name in Settings.model_fields or name in Settings.model_computed_fields:
+        return getattr(settings, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -83,20 +83,9 @@ def _fake_client() -> SimpleNamespace:
 async def _run_fetch_single_stock(client, **scenario_sets) -> tuple[dict, list[str], list[dict]]:
     sem = asyncio.Semaphore(2)
     stock = {"code": "005930", "name": "삼성전자", "price": "10000", "chgrate": "1.0"}
-    with patch(
-        "src.api.kis.indicators.calculate_all_moving_averages",
-        new=AsyncMock(
-            return_value=(
-                {5: 10000, 10: 10000, 20: 10000},
-                (10000.0, True, 300),
-                (10000.0, True),
-                (10000.0, True),
-            )
-        ),
-    ):
-        return await collect.fetch_single_stock(
-            0, stock, 1, sem, client, None, **scenario_sets
-        )
+    return await collect.fetch_single_stock(
+        0, stock, 1, sem, client, None, **scenario_sets
+    )
 
 
 

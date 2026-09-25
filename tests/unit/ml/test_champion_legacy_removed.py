@@ -113,15 +113,18 @@ def test_buyability_module_keeps_ceiling_and_liquidity_helpers_only() -> None:
 def test_features_module_keeps_engineer_features_and_ranker_features_only() -> None:
     import src.serving.realtime.features as features
 
-    for gone in ("build_snapshot_features", "add_scenario_features"):
+    for gone in (
+        "build_snapshot_features",
+        "add_scenario_features",
+        "SCENARIO_ONE_HOT_FEATURES",
+        "SCENARIO_CONTEXT_FEATURES",
+    ):
         assert not hasattr(features, gone), gone
 
     for kept in (
         "engineer_features",
         "_apply_robust_z",
         "build_topk_ranker_features",
-        "SCENARIO_ONE_HOT_FEATURES",
-        "SCENARIO_CONTEXT_FEATURES",
     ):
         assert hasattr(features, kept), kept
 

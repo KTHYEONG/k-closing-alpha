@@ -388,3 +388,15 @@ def test_run_minute_history_backfill_collects_krx_aftermarket_partition(monkeypa
 
     assert INTRADAY_SESSION_KRX_AFTERMARKET in sessions
     assert result["krx_after_rows"] == 1
+
+
+def test_backfill_minute_history_main_entrypoint(monkeypatch) -> None:
+    import src.backfill.intraday.backfill_minute_history as bmh
+
+    monkeypatch.setattr(
+        bmh,
+        "run_minute_history_backfill",
+        lambda: {"dates": 0, "regular_rows": 0, "nxt_rows": 0, "krx_after_rows": 0},
+    )
+
+    bmh.main()

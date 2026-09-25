@@ -627,3 +627,70 @@ def test_local_code_commit_treats_dirty_src_as_unknown(monkeypatch, tmp_path) ->
 
     monkeypatch.setattr(provisioning.subprocess, "run", boom)
     assert provisioning.local_code_commit(tmp_path) == ""
+
+
+def _full_kiwoom_source(tmp_path, extra: list[str] | None = None):
+    source = tmp_path / ".quant.env"
+    assignments = [
+        "export LIVE_ALERT_GMAIL_USER=alert@example.com",
+        "export LIVE_ALERT_GMAIL_APP_PASSWORD=alert-pass",
+        "export ALERT_GMAIL_TO=ops@example.com",
+        "export KIS_APP_KEY=kis-key",
+        "export KIS_APP_SECRET=kis-secret",
+        "export KIS_ACCOUNT_ID=12345678",
+        "export KIS_HTS_ID=hts-id",
+        "export KIWOM_APP_KEY=kiwoom-key",
+        "export KIWOM_SECRET_KEY=kiwoom-secret",
+        "export LS_APP_KEY=ls-key",
+        "export LS_APP_SECRET=ls-secret",
+        "export KRX_OPENAPI_KEY=krx-key",
+        "export TOSS_APP_KEY=toss-key",
+        "export TOSS_APP_SECRET=toss-secret",
+        "export OPENDART_API_KEY=dart-key",
+    ]
+    assignments.extend(extra or [])
+    source.write_text("\n".join(assignments) + "\n", encoding="utf-8")
+    return source
+
+
+def test_build_runtime_fragment_emits_canonical_kiwoom_targets_from_legacy_names(tmp_path) -> None:
+    from src.tools.provision_env import build_runtime_fragment
+
+    fragment = build_runtime_fragment(_full_kiwoom_source(tmp_path))
+    lines = fragment.splitlines()
+
+    assert "KIWOOM_APP_KEY=kiwoom-key" in lines
+    assert "KIWOOM_SECRET_KEY=kiwoom-secret" in lines
+    assert not any(line.startswith("KIWOM_") for line in lines)
+
+
+def test_build_runtime_fragment_prefers_new_kiwoom_name_over_legacy(tmp_path) -> None:
+    from src.tools.provision_env import build_runtime_fragment
+
+    fragment = build_runtime_fragment(
+        _full_kiwoom_source(tmp_path, ["export KIWOOM_APP_KEY=new-key", "export KIWOOM_SECRET_KEY=new-secret"])
+    )
+    lines = fragment.splitlines()
+
+    assert "KIWOOM_APP_KEY=new-key" in lines
+    assert "KIWOOM_SECRET_KEY=new-secret" in lines
+    assert "kiwoom-key" not in fragment
+
+
+def test_merge_remote_env_drops_retired_keys_and_main_requires_consent(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    import src.tools.provision_env as cli
+    from src.tools.provision_env import merge_remote_env
+
+    merged, preserved = merge_remote_env("KIWOOM_APP_KEY=k\n", "KIWOM_APP_KEY=x\nFOO=1\n")
+
+    assert "KIWOM_APP_KEY" not in merged
+    assert "FOO=1" in merged.splitlines()
+    assert preserved == ("FOO",)
+
+    _stub_remote(monkeypatch, cli, env_text="KIWOM_APP_KEY=x\nFOO=1\n", commit="abc")
+    monkeypatch.setattr(cli, "build_runtime_fragment", lambda path: "KIWOOM_APP_KEY=k\n")
+    monkeypatch.setattr(cli, "install_runtime_fragment", lambda host, text: pytest.fail("must not install"))
+    with pytest.raises(cli.ProvisioningError, match="KIWOM_APP_KEY"):
+        cli.main(["--source", str(tmp_path / "x")])

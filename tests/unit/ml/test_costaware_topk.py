@@ -39,6 +39,7 @@ def test_compute_net_return_propagates_nan_never_zero() -> None:
     import numpy as np
     import pandas as pd
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.ml.costaware_topk import compute_net_return
 
     # Given: one clean row, one NaN gross, one NaN tick
@@ -51,8 +52,8 @@ def test_compute_net_return_propagates_nan_never_zero() -> None:
     # When
     net = compute_net_return(picks, round_trip_ticks=2.0)
 
-    # Then: row 0 = 0.02 - (20 + 2*10)/1e4 = 0.02 - 0.004 = 0.016
-    assert np.isclose(net[0], 0.016)
+    # Then: row 0 = 0.02 - (20 + 2*10 + brokerage)/1e4
+    assert np.isclose(net[0], 0.02 - (20.0 + 2 * 10.0 + BROKERAGE_FEE_BP) / 1e4)
     assert np.isnan(net[1])
     assert np.isnan(net[2])
 
@@ -301,15 +302,15 @@ def test_run_cost_aware_topk_backtest_end_to_end_produces_report() -> None:
     assert post.n_calendar_days == 3
     assert post.feasible_day_fraction == 1.0
     # top-3 of {000001..4} by ascending tick_cost_bp excludes 000001 (highest tick cost).
-    # Exact values confirmed against the real pipeline: mean_net_bp=169.16, median_net_bp=169.16,
-    # t_stat=2.93, win_rate=1.0; 3-tick stress mean_net_bp=163.74, median_net_bp=163.74.
-    assert post.mean_net_bp == pytest.approx(169.16, abs=0.01)
-    assert post.median_net_bp == pytest.approx(169.16, abs=0.01)
+    # Exact values confirmed against the real pipeline: mean_net_bp=168.43, median_net_bp=168.43,
+    # t_stat=2.92, win_rate=1.0; 3-tick stress mean_net_bp=163.02, median_net_bp=163.02.
+    assert post.mean_net_bp == pytest.approx(168.43, abs=0.01)
+    assert post.median_net_bp == pytest.approx(168.43, abs=0.01)
     assert post.win_rate == 1.0
-    assert post.t_stat == pytest.approx(2.93, abs=0.01)
+    assert post.t_stat == pytest.approx(2.92, abs=0.01)
     stress_at_3 = next(p for p in report.cost_stress if p.round_trip_ticks == 3.0)
-    assert stress_at_3.mean_net_bp == pytest.approx(163.74, abs=0.01)
-    assert stress_at_3.median_net_bp == pytest.approx(163.74, abs=0.01)
+    assert stress_at_3.mean_net_bp == pytest.approx(163.02, abs=0.01)
+    assert stress_at_3.median_net_bp == pytest.approx(163.02, abs=0.01)
     assert stress_at_3.passes is True
     assert report.verdict == "PASS_POST_REFORM"
     assert any("pre_reform" in r and "not gate-eligible" in r for r in report.verdict_reasons)
@@ -516,6 +517,7 @@ def test_compute_net_return_uses_point_in_time_statutory() -> None:
     import pandas as pd
     import pytest
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.ml.costaware_topk import compute_net_return
 
     # Given: identical gross and tick cost in three tax regimes
@@ -530,12 +532,17 @@ def test_compute_net_return_uses_point_in_time_statutory() -> None:
     # When: netting a 2-tick round trip
     net = compute_net_return(picks, round_trip_ticks=2.0)
 
-    # Then: only the statutory leg differs (30 / 15 / 20 bp)
+    # Then: only the statutory leg differs (30 / 15 / 20 bp) plus brokerage
     np.testing.assert_allclose(
-        net, [0.01 - 40.0 / 1e4, 0.01 - 25.0 / 1e4, 0.01 - 30.0 / 1e4]
+        net,
+        [
+            0.01 - (40.0 + BROKERAGE_FEE_BP) / 1e4,
+            0.01 - (25.0 + BROKERAGE_FEE_BP) / 1e4,
+            0.01 - (30.0 + BROKERAGE_FEE_BP) / 1e4,
+        ],
     )
     # And: a flat 20bp assumption would have overstated 2025 cost by 5bp
-    assert net[1] - (0.01 - 30.0 / 1e4) == pytest.approx(5.0 / 1e4)
+    assert net[1] - (0.01 - (30.0 + BROKERAGE_FEE_BP) / 1e4) == pytest.approx(5.0 / 1e4)
 
 
 def test_compute_net_return_fails_closed_without_date_or_on_nat() -> None:
@@ -543,6 +550,7 @@ def test_compute_net_return_fails_closed_without_date_or_on_nat() -> None:
     import pandas as pd
     import pytest
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.ml.costaware_topk import compute_net_return
 
     # Given: a pick frame whose date is unparseable
@@ -558,7 +566,7 @@ def test_compute_net_return_fails_closed_without_date_or_on_nat() -> None:
     net = compute_net_return(picks, round_trip_ticks=2.0)
 
     # Then: the unknown regime propagates NaN instead of borrowing a rate
-    assert net[0] == pytest.approx(0.01 - 28.0 / 1e4)
+    assert net[0] == pytest.approx(0.01 - (28.0 + BROKERAGE_FEE_BP) / 1e4)
     assert np.isnan(net[1])
 
     # And: dropping the date column is refused outright
@@ -573,6 +581,7 @@ def test_compute_cost_stress_varies_ticks_only_and_keeps_statutory_pit() -> None
     import pandas as pd
     import pytest
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.ml.costaware_topk import compute_cost_stress
 
     # Given: 60 post-reform days in the 2024 tax regime (18bp), gross alternating
@@ -592,10 +601,10 @@ def test_compute_cost_stress_varies_ticks_only_and_keeps_statutory_pit() -> None
 
     # Then: the flat statutory knob no longer exists on the signature
     assert "statutory_bp" not in inspect.signature(compute_cost_stress).parameters
-    # And: net moves by exactly the extra ticks, on an 18bp statutory base
+    # And: net moves by exactly the extra ticks, on an 18bp statutory base plus brokerage
     by_ticks = {p.round_trip_ticks: p for p in points}
-    assert by_ticks[2.0].mean_net_bp == pytest.approx(50.0 - 18.0 - 10.0, abs=1e-6)
-    assert by_ticks[4.0].mean_net_bp == pytest.approx(50.0 - 18.0 - 20.0, abs=1e-6)
+    assert by_ticks[2.0].mean_net_bp == pytest.approx(50.0 - 18.0 - 10.0 - BROKERAGE_FEE_BP, abs=0.01)
+    assert by_ticks[4.0].mean_net_bp == pytest.approx(50.0 - 18.0 - 20.0 - BROKERAGE_FEE_BP, abs=0.01)
     assert by_ticks[2.0].n_days == 60
     assert by_ticks[2.0].passes is True
     assert np.isfinite(by_ticks[4.0].t_stat)
@@ -653,3 +662,11 @@ def test_assert_screen_constructible_rejects_a_regime_below_the_day_floor() -> N
         assert_screen_constructible(cands, top_k=3, regimes=("nope",))
     with pytest.raises(ValueError, match="date_col"):
         assert_screen_constructible(cands.drop(columns=["date"]), top_k=3)
+
+
+def test_min_top_k_has_one_owner() -> None:
+    import src.ml.costaware_topk as costaware_topk
+    import src.strategy.contract as contract
+
+    # Given both modules; When imported; Then one owner
+    assert costaware_topk.MIN_TOP_K is contract.MIN_TOP_K

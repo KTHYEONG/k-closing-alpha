@@ -2492,18 +2492,6 @@ def test_main_publishes_certified_inputs_before_legacy_finalization(tmp_path, mo
     assert "feature_available_timestamp" in frame.columns
 
 
-def test_main_legacy_mode_skips_certified_capture(tmp_path, monkeypatch) -> None:
-    """Explicit legacy mode retains existing behavior without certified captures."""
-    from src.daily import collect
-
-    monkeypatch.setattr(collect.settings, "COLLECTION_RAW_ENABLED", False)
-    rows = [_healthy_wide_row("005930"), _healthy_wide_row("000660")]
-    scanned = [
-        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
-        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
-    ]
-    _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, frozenset({"005930", "000660"}))
-    assert not (tmp_path / "capture").exists()
 
 
 def test_decision_publication_retains_admission_failures(tmp_path) -> None:
@@ -2862,7 +2850,6 @@ def _run_main_with_quote_failures(monkeypatch, tmp_path, n_degraded: int):
     monkeypatch.setattr(
         collect, "flag_cost_aware_admission", lambda df, **k: df.assign(admitted=True)
     )
-    monkeypatch.setattr(collect.settings, "COLLECTION_RAW_ENABLED", True)
     monkeypatch.setattr(collect.settings, "COLLECTION_ROOT", tmp_path / "capture")
     persisted = {"called": False}
 
