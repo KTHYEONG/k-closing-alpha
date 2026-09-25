@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-# 왕복 거래 비용 = KRX 매도 거래세(2026-01-01 시행, 양시장 0.20%) + 검증된 1분봉 패널의 왕복 2틱 스프레드 중앙값(~26bp)
-# + 증권사 매매수수료(편도 0.0036396%, 매수/매도 각 1회 부과 -> 왕복 2회).
-# 진입(~15:19)·청산(~09:00+) 모두 연속거래 체결로 스프레드를 크로싱한다. 결정→동시호가 드리프트(중앙값 0)는 cost_model의 행별 auction_impact_bp로 분리.
-_STATUTORY_COST_RATIO: float = 0.0020
-_SPREAD_COST_RATIO: float = 0.0026
-_BROKERAGE_FEE_RATIO: float = 0.000036396 * 2  # 편도 0.0036396% x 왕복(매수+매도) 2회
-ROUND_TRIP_COST_RATIO: float = _STATUTORY_COST_RATIO + _SPREAD_COST_RATIO + _BROKERAGE_FEE_RATIO
+from src.execution.cost_model import ROUND_TRIP_COST_RATIO  # noqa: F401  # single-source re-export
+
+# 왕복 거래 비용 = 평탄 법정비용 + 평탄 스프레드 + 왕복 수수료로 cost_model이 단일 소유한다.
+
+__all__ = [
+    "ROUND_TRIP_COST_RATIO",
+    "_GOOD_PCT",
+    "_GRADE_MULTIPLIERS",
+    "_QUANTILE_ALPHAS",
+    "_QUANTILE_COLS",
+    "_STRONG_PCT",
+    "_WEAK_PCT",
+]
 
 _QUANTILE_COLS = ("pred_q10", "pred_q50", "pred_q90")
 _QUANTILE_ALPHAS = (0.10, 0.50, 0.90)

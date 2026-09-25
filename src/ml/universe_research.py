@@ -23,6 +23,7 @@ from src import settings
 from src.data.io_utils import atomic_write_parquet
 from src.data.panel_integrity import load_price_panel
 from src.execution import cost_model
+from src.execution.cost_model import ROUND_TRIP_COST_RATIO
 from src.ml.buyability import classify_ceiling_entry
 from src.ml.dataset import build_ml_dataset
 from src.ml.metrics import mean_group_rank_ic
@@ -30,8 +31,8 @@ from src.ml.oof import purged_oof_predict
 from src.ml.robust_eval import CombinatorialPurgedCV
 from src.ml.universe import COST_AWARE_SCREEN, ScreenConfig, build_universe_panel, screen_baseline_stats
 from src.ml.validation import cpcv_path_evidence
-from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO
 from src.strategy.contract import MIN_PATH_WIN_RATE
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +266,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--cpcv-k-test", type=int, default=2)
     parser.add_argument("--out", default="artifacts/research/universe_grid.parquet")
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO)
+    configure_cli_logging(logging.BASIC_FORMAT)
     if not os.path.exists(args.price_history):
         raise ValueError(f"price_history not found: {args.price_history}")
     price_history_df, panel_prov = load_price_panel(args.price_history)

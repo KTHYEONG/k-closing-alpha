@@ -23,7 +23,7 @@ import pandas as pd
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet
-from src.execution.cost_model import BROKERAGE_FEE_BP, statutory_bp_asof
+from src.execution.cost_model import BROKERAGE_SIDE_BP, statutory_bp_asof
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,23 @@ ORDER_STATUSES: tuple[str, ...] = (
 )
 
 # 왕복 수수료를 매수/매도 편도로 나눈다(체결가에는 스프레드가 이미 반영돼 명시비용만 부과)
-PAPER_BROKERAGE_SIDE_BP: float = BROKERAGE_FEE_BP / 2.0
+PAPER_BROKERAGE_SIDE_BP: float = BROKERAGE_SIDE_BP
+
+
+def side_fee_krw(notional_krw: int) -> int:
+    """One-side brokerage fee in whole KRW for a fill notional.
+
+    The paper ledger charges the KIS preferential commission per side and floors to whole won,
+    matching broker statements; every ledger path (entry cash check, round trips, NAV) must use
+    this single definition so cash, fees and NAV reconcile exactly.
+
+    Args:
+        notional_krw: Fill price x quantity in KRW (non-negative integer).
+
+    Returns:
+        `floor(notional_krw * PAPER_BROKERAGE_SIDE_BP / 10_000)`.
+    """
+    return math.floor(int(notional_krw) * PAPER_BROKERAGE_SIDE_BP / 10_000)
 
 ROUND_TRIP_COLUMNS: tuple[str, ...] = (
     "entry_order_id",
@@ -332,8 +348,8 @@ def build_round_trips(fills: pd.DataFrame) -> pd.DataFrame:
             exit_price = int(rec["fill_price"])
             entry_notional = entry_price * qty
             exit_notional = exit_price * qty
-            buy_fee = math.floor(entry_notional * PAPER_BROKERAGE_SIDE_BP / 10_000)
-            sell_fee = math.floor(exit_notional * PAPER_BROKERAGE_SIDE_BP / 10_000)
+            buy_fee = side_fee_krw(entry_notional)
+            sell_fee = side_fee_krw(exit_notional)
             tax_bp = float(
                 statutory_bp_asof(
                     np.array([np.datetime64(pd.Timestamp(sell_filled_at).strftime("%Y-%m-%d"))])
@@ -409,7 +425,7 @@ def build_nav_snapshot(fills: pd.DataFrame, seed_capital: int, as_of_date: str) 
     for rec in records:
         if str(rec.get("side")) == "buy":
             notional = int(rec.get("fill_price")) * int(rec.get("qty"))
-            fee = math.floor(notional * PAPER_BROKERAGE_SIDE_BP / 10_000)
+            fee = side_fee_krw(notional)
             buy_outflow += notional + fee
             total_buy_fees += fee
     closed_ids = set(trips["entry_order_id"].tolist()) if not trips.empty else set()
@@ -419,7 +435,7 @@ def build_nav_snapshot(fills: pd.DataFrame, seed_capital: int, as_of_date: str) 
     for rec in records:
         if str(rec.get("side")) == "buy" and rec.get("order_id") not in closed_ids:
             notional = int(rec.get("fill_price")) * int(rec.get("qty"))
-            fee = math.floor(notional * PAPER_BROKERAGE_SIDE_BP / 10_000)
+            fee = side_fee_krw(notional)
             open_cost_basis += notional
             open_buy_fees += fee
             n_open += 1

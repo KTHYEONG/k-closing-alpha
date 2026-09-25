@@ -962,3 +962,93 @@ def test_order_record_accepts_missed_auction_and_insufficient_cash() -> None:
     # When / Then: 신규 종결 상태 두 건을 모두 수용한다
     assert order_record(order, ORDER_STATUS_MISSED_AUCTION)["status"] == "MISSED_AUCTION"
     assert order_record(order, ORDER_STATUS_INSUFFICIENT_CASH)["status"] == "INSUFFICIENT_CASH"
+
+
+def test_paper_ledger_side_fee_is_kis_preferential_single_source() -> None:
+    import src.execution.cost_model as cost_model
+    import src.execution.paper_broker as paper_broker
+
+    # Given the module; When compared; Then single source
+    assert paper_broker.PAPER_BROKERAGE_SIDE_BP == cost_model.BROKERAGE_SIDE_BP
+    assert paper_broker.PAPER_BROKERAGE_SIDE_BP == 0.36396
+
+
+def test_side_fee_floors_to_whole_won() -> None:
+    import math
+
+    from src.execution.paper_broker import PAPER_BROKERAGE_SIDE_BP, side_fee_krw
+
+    for notional in (0, 1, 13_736, 1_000_000, 987_654_321):
+        assert side_fee_krw(notional) == math.floor(notional * PAPER_BROKERAGE_SIDE_BP / 10_000)
+        assert isinstance(side_fee_krw(notional), int)
+
+
+def test_single_fee_definition_outside_investable_capital() -> None:
+    import ast
+    from pathlib import Path
+
+    offenders: list[str] = []
+    for path in sorted(Path("src").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "PAPER_BROKERAGE_SIDE_BP / 10_000" not in text:
+            continue
+        if path.name != "paper_broker.py":
+            offenders.append(str(path))
+            continue
+        tree = ast.parse(text)
+        allowed = {"side_fee_krw", "investable_capital"}
+        for index, line in enumerate(text.splitlines(), start=1):
+            if "PAPER_BROKERAGE_SIDE_BP / 10_000" not in line:
+                continue
+            owner = next(
+                (
+                    node.name
+                    for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.lineno <= index <= (node.end_lineno or node.lineno)
+                ),
+                "<module>",
+            )
+            assert owner in allowed, f"{path}:{index} in {owner}"
+    assert offenders == []
+
+
+def test_ledger_conservation_matches_golden_values() -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import build_nav_snapshot, build_round_trips
+
+    fills = pd.DataFrame(
+        [
+            {
+                "order_id": "o1", "symbol": "005930", "side": "buy", "qty": 10,
+                "fill_price": 100_000, "filled_at": pd.Timestamp("2026-09-17 15:30", tz="Asia/Seoul"),
+                "decision_date": "2026-09-17", "trigger": "auction_close", "entry_order_id": None,
+            },
+            {
+                "order_id": "o2", "symbol": "005930", "side": "sell", "qty": 10,
+                "fill_price": 110_000, "filled_at": pd.Timestamp("2026-09-18 09:00", tz="Asia/Seoul"),
+                "decision_date": "2026-09-17", "trigger": "auction_open", "entry_order_id": "o1",
+            },
+            {
+                "order_id": "o3", "symbol": "000660", "side": "buy", "qty": 5,
+                "fill_price": 200_000, "filled_at": pd.Timestamp("2026-09-18 15:30", tz="Asia/Seoul"),
+                "decision_date": "2026-09-18", "trigger": "auction_close", "entry_order_id": None,
+            },
+        ]
+    )
+
+    trips = build_round_trips(fills)
+    assert len(trips) == 1
+    row = trips.iloc[0]
+    assert (row["buy_fee"], row["sell_fee"], row["sell_tax"]) == (36, 40, 2200)
+    assert (row["cost"], row["gross_pnl"], row["net_pnl"]) == (2276, 100_000, 97_724)
+
+    nav = build_nav_snapshot(fills, 10_000_000, "2026-09-18").iloc[0]
+    assert nav["cash"] == 9_097_688
+    assert nav["open_cost_basis"] == 1_000_000
+    assert nav["open_buy_fees"] == 36
+    assert nav["realized_net_pnl"] == 97_724
+    assert nav["cumulative_cost"] == 2312
+    assert nav["nav"] == 10_097_688
+    assert (nav["n_open_positions"], nav["n_closed_trades"]) == (1, 1)

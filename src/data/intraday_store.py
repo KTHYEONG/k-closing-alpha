@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -15,13 +14,15 @@ import pyarrow.parquet as pq
 
 from src import settings
 from src.data.capture_contracts import CaptureStatus, CoverageEntry
+from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, assert_canonical_bars, assert_canonical_ticks
+from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["intraday_partition_path", "log_session_coverage_outliers", "merge_partition_frame", "read_intraday_range", "tick_partition_path", "write_intraday_partition", "write_tick_partition"]
+__all__ = ["intraday_partition_path", "log_session_coverage_outliers", "tick_partition_path", "write_intraday_partition", "write_tick_partition"]
 
-_LOCK_TIMEOUT_SECONDS = 30.0
+_LOCK_TIMEOUT_SECONDS = DEFAULT_LOCK_TIMEOUT_SECONDS
 
 
 def intraday_partition_path(bar_interval_minutes: int, snapshot_date: str, session: str) -> Path:
@@ -35,29 +36,6 @@ def intraday_partition_path(bar_interval_minutes: int, snapshot_date: str, sessi
         / month
         / f"{snapshot_date}.parquet"
     )
-
-
-def merge_partition_frame(new_df: pd.DataFrame, target: Path, key_cols: tuple[str, ...]) -> pd.DataFrame:
-    """기존 파티션과 신규 프레임을 키 기준 병합한다 (new wins, 키 정렬)."""
-    try:
-        existing = pd.read_parquet(target) if target.exists() else pd.DataFrame()
-    except Exception as e:
-        raise OSError(f"Cannot read existing partition evidence: {target}") from e
-    if existing is None or len(existing) == 0:
-        merged = new_df.copy()
-    else:
-        missing_keys = [k for k in key_cols if k not in existing.columns]
-        if missing_keys:
-            raise ValueError(f"Legacy partition missing key columns: {missing_keys}")
-        merged = pd.concat([existing, new_df], ignore_index=True)
-        merged = merged.drop_duplicates(subset=list(key_cols), keep="last")
-    merged = merged.sort_values(list(key_cols), kind="stable").reset_index(drop=True)
-    if "symbol" in merged.columns and existing is not None and len(existing) > 0 and "symbol" in existing.columns:
-        before = set(existing["symbol"].astype(str).unique().tolist())
-        after = set(merged["symbol"].astype(str).unique().tolist())
-        if not before.issubset(after):
-            raise ValueError(f"Partition write would reduce symbol coverage: lost={sorted(before - after)}")
-    return merged
 
 
 def log_session_coverage_outliers(
@@ -131,13 +109,6 @@ def _batch_rows_or_default(batch_rows: int | None) -> int:
     if int(batch_rows) <= 0:
         raise ValueError(f"batch_rows must be positive: {batch_rows!r}")
     return int(batch_rows)
-
-
-def _capture_root() -> Path:
-    root = settings.COLLECTION_ROOT
-    if root is not None:
-        return Path(root)
-    return Path(settings.HISTORY_DIR) / "capture"
 
 
 def _is_valid_hhmmss(value: int) -> bool:
@@ -249,26 +220,6 @@ def _partition_row_count(target: Path) -> int:
     return int(handle.metadata.num_rows)
 
 
-def _acquire_partition_lock(target: Path) -> Path:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    lock = target.parent / (target.name + ".lock")
-    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
-    while True:
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            return lock
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise OSError(f"Timed out acquiring partition lock: {lock}") from None
-            time.sleep(0.01)
-
-
-def _release_partition_lock(lock: Path) -> None:
-    if lock.exists():
-        lock.unlink()
-
-
 def _retain_backup_ref(target: Path, snapshot_date: str, session: str) -> str:
     root = _capture_root()
     backup_dir = root / "backups" / "intraday" / str(session) / str(snapshot_date)
@@ -347,8 +298,7 @@ def _bounded_symbol_replace(
     # 되돌아오는 순환 임포트를 모듈 로드 시점에 막기 위해 호출 시점에만 가져온다.
     from src.data.parquet_codec import INTRADAY_COMPRESSION, PARQUET_COMPRESSION_LEVEL
 
-    lock = _acquire_partition_lock(target)
-    try:
+    with exclusive_file_lock(sidecar_lock_path(target), timeout_seconds=_LOCK_TIMEOUT_SECONDS, purpose="partition"):
         before_count = _partition_row_count(target)
         before_symbols: set[str] = set()
         backup_ref = ""
@@ -422,8 +372,6 @@ def _bounded_symbol_replace(
             if staging.exists():
                 staging.unlink()
         return before_count
-    finally:
-        _release_partition_lock(lock)
 
 
 def write_intraday_partition(
@@ -555,27 +503,3 @@ def tick_partition_path(snapshot_date: str, session: str = "regular") -> Path:
         / f"{snapshot_date}.parquet"
     )
 
-
-def read_intraday_range(
-    bar_interval_minutes: int, start_date: str, end_date: str, session: str = "regular"
-) -> pd.DataFrame:
-    """날짜 범위에 해당하는 파티션 파일만 글롭하여 concat. 대상 없으면 빈 DataFrame."""
-    base = (
-        Path(settings.HISTORY_DIR)
-        / "intraday"
-        / f"{int(bar_interval_minutes)}m"
-        / str(session)
-    )
-    if not base.exists():
-        return pd.DataFrame()
-    frames: list[pd.DataFrame] = []
-    for path in sorted(base.rglob("*.parquet")):
-        date_str = path.stem
-        if start_date <= date_str <= end_date:
-            try:
-                frames.append(pd.read_parquet(path))
-            except Exception as e:
-                logger.warning("Failed to read intraday partition %s: %s", path, e)
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)

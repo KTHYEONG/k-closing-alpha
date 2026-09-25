@@ -185,11 +185,11 @@ def test_fetch_toss_program_history_pages_backward_until_empty() -> None:
             calls.append(until)
             if until == "2020-01-05":
                 records = [
-                    {"date": "2020-01-05", "arbitrage": {"netBuyVolume": 1.0}, "nonArbitrage": {"netBuyVolume": 1.0}},
-                    {"date": "2020-01-03", "arbitrage": {"netBuyVolume": 2.0}, "nonArbitrage": {"netBuyVolume": 0.0}},
+                    {"date": "2020-01-05", "arbitrage": {"netBuyAmount": 1000000.0}, "nonArbitrage": {"netBuyAmount": 1000000.0}},
+                    {"date": "2020-01-03", "arbitrage": {"netBuyAmount": 2000000.0}, "nonArbitrage": {"netBuyAmount": 0.0}},
                 ]
             elif until == "2020-01-02":
-                records = [{"date": "2020-01-02", "arbitrage": {"netBuyVolume": 3.0}, "nonArbitrage": {"netBuyVolume": 0.0}}]
+                records = [{"date": "2020-01-02", "arbitrage": {"netBuyAmount": 3000000.0}, "nonArbitrage": {"netBuyAmount": 0.0}}]
             else:
                 records = []
             return {"result": {"records": records}}
@@ -210,7 +210,7 @@ def test_fetch_toss_program_history_stops_at_requested_floor() -> None:
     class _FakeToss:
         async def get_program_trades(self, session, symbol, count, until):
             calls.append(until)
-            return {"result": {"records": [{"date": "2019-04-01", "arbitrage": {"netBuyVolume": 5.0}, "nonArbitrage": {"netBuyVolume": 0.0}}]}}
+            return {"result": {"records": [{"date": "2019-04-01", "arbitrage": {"netBuyAmount": 5000000.0}, "nonArbitrage": {"netBuyAmount": 0.0}}]}}
 
     from src.backfill.kis_flow_backfill import fetch_toss_program_history
 
@@ -251,7 +251,7 @@ def test_fetch_toss_program_history_returns_empty_for_no_dates() -> None:
 def test_fetch_symbol_splits_program_dates_between_toss_and_kis() -> None:
     class _FakeToss:
         async def get_program_trades(self, session, symbol, count, until):
-            return {"result": {"records": [{"date": "2020-01-02", "arbitrage": {"netBuyVolume": 9.0}, "nonArbitrage": {"netBuyVolume": 0.0}}]}}
+            return {"result": {"records": [{"date": "2020-01-02", "arbitrage": {"netBuyAmount": 9000000.0}, "nonArbitrage": {"netBuyAmount": 0.0}}]}}
 
     kis_program_dates: list[str] = []
 
@@ -316,7 +316,7 @@ def test_fetch_symbol_fills_toss_depth_gap_from_kis() -> None:
     class _FakeToss:
         async def get_program_trades(self, session, symbol, count, until):
             # 2019-04-01만 반환(2019-04-02 요청분은 실제 Toss 이력 한계처럼 누락)
-            return {"result": {"records": [{"date": "2019-04-01", "arbitrage": {"netBuyVolume": 4.0}, "nonArbitrage": {"netBuyVolume": 0.0}}]}}
+            return {"result": {"records": [{"date": "2019-04-01", "arbitrage": {"netBuyAmount": 4000000.0}, "nonArbitrage": {"netBuyAmount": 0.0}}]}}
 
     kis_program_dates: list[str] = []
 
@@ -396,7 +396,7 @@ def test_fetch_toss_program_history_stops_when_toss_has_no_further_history() -> 
         async def get_program_trades(self, session, symbol, count, until):
             calls.append(until)
             if until == "2020-01-05":
-                return {"result": {"records": [{"date": "2020-01-05", "arbitrage": {"netBuyVolume": 1.0}, "nonArbitrage": {"netBuyVolume": 0.0}}]}}
+                return {"result": {"records": [{"date": "2020-01-05", "arbitrage": {"netBuyAmount": 1000000.0}, "nonArbitrage": {"netBuyAmount": 0.0}}]}}
             # 실제 Toss 이력 하한(2019-03-31)에 해당하는 빈 성공 응답을 재현: 요청 최저일(2016-01-04)에
             # 아직 도달하지 않았지만 Toss가 더 줄 데이터가 없다는 신호이므로 여기서 멈춰야 한다.
             return {"result": {"records": []}}

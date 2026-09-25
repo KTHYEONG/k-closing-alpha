@@ -8,6 +8,7 @@ import pandas as pd
 from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
 from sklearn.calibration import CalibratedClassifierCV
 
+from src.execution.cost_model import ROUND_TRIP_COST_RATIO
 from src.ml.feature_manifest import build_feature_manifest
 from src.ml.oof import _finite_nan, fit_chrono_calibrator
 from src.serving.realtime.inference import (
@@ -17,7 +18,6 @@ from src.serving.realtime.inference import (
     _QUANTILE_COLS,
     _STRONG_PCT,
     _WEAK_PCT,
-    ROUND_TRIP_COST_RATIO,
 )
 from src.strategy.contract import DEFAULT_REALIZED_VOL, LABEL_BAD_THRESHOLD, LABEL_GOOD_THRESHOLD
 

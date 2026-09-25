@@ -8,14 +8,13 @@ from pathlib import Path
 from typing import Annotated, Any, Self
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import NoDecode
 
+from src.config._env import EnvSettings
 from src.data.capture_contracts import SessionClock
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-
-class CollectionSettings(BaseSettings):
+class CollectionSettings(EnvSettings):
     """Define acquisition limits independently of trading selection thresholds.
 
     These settings bound optional research work; they must never silently reduce
@@ -23,7 +22,6 @@ class CollectionSettings(BaseSettings):
 
     Attributes:
         COLLECTION_ROOT: Optional owner-local override, default None; resolved beneath HISTORY_DIR/capture.
-        COLLECTION_RAW_ENABLED: Enable first-party provenance, default True.
         COLLECTION_AUCTION_ENABLED: Enable independently budgeted sweeps, default False.
         COLLECTION_ALTDATA_ENABLED: Enable incremental slow-data jobs, default False.
         COLLECTION_RESEARCH_SLOTS: Explicit research key slots, default empty.
@@ -47,14 +45,7 @@ class CollectionSettings(BaseSettings):
             declared research credentials.
     """
 
-    model_config = SettingsConfigDict(
-        env_file=_PROJECT_ROOT / ".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-
     COLLECTION_ROOT: Path | None = Field(default=None)
-    COLLECTION_RAW_ENABLED: bool = Field(default=True)
     COLLECTION_AUCTION_ENABLED: bool = Field(default=False)
     COLLECTION_ALTDATA_ENABLED: bool = Field(default=False)
     COLLECTION_RESEARCH_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
@@ -113,8 +104,6 @@ class CollectionSettings(BaseSettings):
             raise ValueError("repair budget must be at least the normal page budget")
         if self.COLLECTION_AUCTION_ENABLED and len(self.COLLECTION_RESEARCH_SLOTS) == 0:
             raise ValueError("enabled auctions require declared research credentials")
-        if not self.COLLECTION_RAW_ENABLED and (self.COLLECTION_AUCTION_ENABLED or self.COLLECTION_ALTDATA_ENABLED):
-            raise ValueError("legacy operating mode cannot publish independent auctions or slow-data jobs")
         for key, clock in self.COLLECTION_SESSION_OVERRIDES.items():
             try:
                 parsed = date.fromisoformat(key)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fcntl
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -24,7 +26,7 @@ def _canon_bar(symbol: str, snapshot_date: str = "2026-09-03") -> pd.DataFrame:
     return normalize_bar_frame(raw, "ls", snapshot_date, symbol)
 
 
-def test_intraday_store_write_and_range_read_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_intraday_store_write_partition_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
 
     df_in = _canon_bar("005930")
@@ -34,10 +36,14 @@ def test_intraday_store_write_and_range_read_roundtrip(tmp_path: Path, monkeypat
     df_out_of_range = _canon_bar("000660", "2026-08-01")
     intraday_store.write_intraday_partition(df_out_of_range, 1, "2026-08-01", "regular")
 
-    result = intraday_store.read_intraday_range(1, "2026-09-01", "2026-09-30", session="regular")
+    target = intraday_store.intraday_partition_path(1, "2026-09-03", "regular")
+    result = pd.read_parquet(target)
 
     assert len(result) == 1
     assert result.iloc[0]["symbol"] == "005930"
+    other = intraday_store.intraday_partition_path(1, "2026-08-01", "regular")
+    assert other.exists()
+    assert other != target
 
 
 def test_intraday_store_write_empty_df_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -96,94 +102,6 @@ def test_write_intraday_partition_rejects_non_canonical_frame(tmp_path, monkeypa
         intraday_store.write_intraday_partition(legacy_raw, 1, "2026-09-04", "regular")
 
     assert not intraday_store.intraday_partition_path(1, "2026-09-04", "regular").exists()
-
-
-def test_merge_partition_frame_recovers_from_unreadable_existing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """손상된 기존 파티션은 증거 보존을 위해 명시적 실패로 처리한다."""
-    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
-
-    target = intraday_store.intraday_partition_path(1, "2026-09-05", "regular")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("not a valid parquet file")
-
-    new_df = _canon_bar("005930", "2026-09-05")
-
-    with pytest.raises(OSError, match="Cannot read existing partition"):
-        intraday_store.merge_partition_frame(new_df, target, ("symbol", "ts_hms"))
-
-
-def test_write_intraday_partition_rejects_symbol_coverage_reduction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """기존 파티션에 있던 종목이 신규 병합 결과에서 사라지면 커버리지 축소로 거부한다."""
-    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
-
-    first = _canon_bar("005930", "2026-09-06")
-    intraday_store.write_intraday_partition(first, 1, "2026-09-06", "regular")
-
-    target = intraday_store.intraday_partition_path(1, "2026-09-06", "regular")
-    # 서로 다른 종목이지만 동일 ts_hms를 가지는 신규 프레임을 symbol을 뺀 key_cols로
-    # 병합하면 drop_duplicates가 기존 종목 행을 통째로 지워버리는 오용 시나리오를 재현한다.
-    colliding = _canon_bar("000660", "2026-09-06")
-    colliding["ts_hms"] = first.iloc[0]["ts_hms"]
-
-    with pytest.raises(ValueError, match="reduce symbol coverage"):
-        intraday_store.merge_partition_frame(colliding, target, ("ts_hms",))
-
-
-
-def test_merge_partition_frame_rejects_legacy_existing_partition(tmp_path) -> None:
-    import pandas as pd
-    import pytest
-
-    from src.data.intraday_store import merge_partition_frame
-
-    legacy = pd.DataFrame({
-        "stck_bsop_date": ["20260501"] * 3,
-        "stck_cntg_hour": ["090100", "090200", "090300"],
-        "stck_prpr": ["1000", "1010", "1020"],
-        "종목코드": ["005930"] * 3,
-    })
-    target = tmp_path / "2026-05-01.parquet"
-    legacy.to_parquet(target, index=False)
-
-    canonical = pd.DataFrame({
-        "snapshot_date": ["2026-05-01"] * 2,
-        "symbol": ["000660"] * 2,
-        "ts_hms": [90100, 90200],
-        "open": [500, 505], "high": [510, 512], "low": [498, 503],
-        "close": [505, 510], "volume": [10, 20], "value_krw": [5050, 10200],
-        "has_trade": [True, True], "vendor": ["kis", "kis"],
-    })
-
-    with pytest.raises(ValueError):  # noqa: PT011 - contract skeleton asserts fail-closed merge
-        merge_partition_frame(canonical, target, ("symbol", "ts_hms"))
-
-    # 원본 파일은 그대로 보존되어야 한다
-    assert len(pd.read_parquet(target)) == 3
-
-
-def test_merge_partition_frame_still_merges_canonical_partitions(tmp_path) -> None:
-    import pandas as pd
-
-    from src.data.intraday_store import merge_partition_frame
-
-    def _frame(symbol: str, ts: list[int], close: list[int]) -> pd.DataFrame:
-        n = len(ts)
-        return pd.DataFrame({
-            "snapshot_date": ["2026-05-01"] * n,
-            "symbol": [symbol] * n,
-            "ts_hms": ts,
-            "open": close, "high": close, "low": close, "close": close,
-            "volume": [1] * n, "value_krw": [1] * n,
-            "has_trade": [True] * n, "vendor": ["kis"] * n,
-        })
-
-    target = tmp_path / "2026-05-01.parquet"
-    _frame("005930", [90100, 90200], [1000, 1010]).to_parquet(target, index=False)
-
-    merged = merge_partition_frame(_frame("005930", [90200, 90300], [9999, 1020]), target, ("symbol", "ts_hms"))
-
-    assert len(merged) == 3
-    assert merged.loc[merged["ts_hms"] == 90200, "close"].iloc[0] == 9999
 
 
 def test_log_session_coverage_outliers_flags_symbol_below_peer_ratio(caplog) -> None:
@@ -754,14 +672,22 @@ def test_write_partitions_handle_storage_boundaries(tmp_path: Path, monkeypatch:
         intraday_store._collect_legacy_overlap(legacy_bad, {"005930"}, 16)
     with pytest.raises(OSError, match="Cannot read existing"):
         intraday_store._collect_legacy_overlap(target, {"005930"}, 16)
-    lock_target = intraday_store.tick_partition_path(date, "locked")
-    lock_target.parent.mkdir(parents=True, exist_ok=True)
-    (lock_target.parent / (lock_target.name + ".lock")).touch()
-    monkeypatch.setattr(intraday_store, "_LOCK_TIMEOUT_SECONDS", 0.0)
-    with pytest.raises(OSError, match="Timed out acquiring"):
-        intraday_store._acquire_partition_lock(lock_target)
     good = _tick_rows("005930", date, [("090300", 70000, 1)])
     intraday_store.write_tick_partition(good, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    held_target = intraday_store.tick_partition_path(date, "regular")
+    before_bytes = held_target.read_bytes()
+    sidecar = held_target.parent / (held_target.name + ".lock")
+    holder_fd = os.open(sidecar, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        monkeypatch.setattr(intraday_store, "_LOCK_TIMEOUT_SECONDS", 0.0)
+        blocked = _tick_rows("000660", date, [("090310", 50000, 1)])
+        with pytest.raises(OSError, match="timed out acquiring partition lock"):
+            intraday_store.write_tick_partition(blocked, date, "regular", coverage={"000660": _tick_entry("000660")})  # type: ignore[arg-type]
+    finally:
+        os.close(holder_fd)
+    assert held_target.read_bytes() == before_bytes
+    monkeypatch.setattr(intraday_store, "_LOCK_TIMEOUT_SECONDS", 30.0)
     real_count = intraday_store._partition_row_count
     monkeypatch.setattr(intraday_store, "_partition_row_count", lambda p: 999 if p.name.startswith(".stage-") else real_count(p))
     extra = _tick_rows("000660", date, [("090300", 50000, 1)])
@@ -782,5 +708,21 @@ def test_write_partitions_handle_storage_boundaries(tmp_path: Path, monkeypatch:
     assert intraday_store.write_intraday_partition(pd.DataFrame(), 1, date, "regular", coverage={"005930": _bar_entry("005930")}) == 0  # type: ignore[arg-type]
     bar_gone = intraday_store.write_intraday_partition(pd.DataFrame(), 1, "2026-09-22", "regular", coverage={"005930": _bar_entry("005930", status="NO_TRADES")})  # type: ignore[arg-type]
     assert bar_gone == 0
+
+
+def test_tick_write_with_stale_sidecar_succeeds_and_leaves_no_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    good = _tick_rows("005930", date, [("090300", 70000, 1)])
+    assert intraday_store.write_tick_partition(good, date, "regular", coverage={"005930": _tick_entry("005930")}) == 1  # type: ignore[arg-type]
+    target = intraday_store.tick_partition_path(date, "regular")
+    (target.parent / (target.name + ".lock")).write_text("stale", encoding="utf-8")
+    more = _tick_rows("000660", date, [("090310", 50000, 1)])
+    assert intraday_store.write_tick_partition(more, date, "regular", coverage={"000660": _tick_entry("000660")}) == 2  # type: ignore[arg-type]
+    assert list(target.parent.glob("*.lock")) == []
+    vacated = intraday_store.write_tick_partition(pd.DataFrame(), date, "regular", coverage={"005930": _tick_entry("005930", status="NO_TRADES")})  # type: ignore[arg-type]
+    assert vacated == 1
+    assert list(target.parent.glob("*.lock")) == []
+
 
 

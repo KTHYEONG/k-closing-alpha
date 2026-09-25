@@ -41,27 +41,13 @@ def test_kis_client_facade_module_is_removed() -> None:
 
 def test_kis_api_symbols_reachable_from_their_real_modules() -> None:
     from src.api.kis.client import KisApiClient
-    from src.api.kis.indicators import (
-        calculate_all_moving_averages,
-        calculate_multiple_emas,
-        calculate_stock_ema,
-        calculate_stock_sma,
-        fetch_index_and_calculate_volatility,
-        fetch_kospi200_and_calculate_vkospi,
-        prefetch_ohlcv_for_sma120,
-    )
+    from src.api.kis.indicators import fetch_index_and_calculate_volatility
     from src.api.kis.rate_limit import AsyncRateLimiter
 
     # Then: every symbol imports cleanly and is the expected kind of object.
     assert isinstance(KisApiClient, type)
     assert isinstance(AsyncRateLimiter, type)
     for fn in (
-        calculate_all_moving_averages,
-        calculate_multiple_emas,
-        calculate_stock_ema,
-        calculate_stock_sma,
         fetch_index_and_calculate_volatility,
-        fetch_kospi200_and_calculate_vkospi,
-        prefetch_ohlcv_for_sma120,
     ):
         assert callable(fn)

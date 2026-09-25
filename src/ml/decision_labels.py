@@ -7,9 +7,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.execution.cost_model import estimate_round_trip_cost_bp
+from src.execution.cost_model import ROUND_TRIP_COST_RATIO, estimate_round_trip_cost_bp
 from src.ml.exit_policy import attach_next_day_path
-from src.serving.realtime.inference import ROUND_TRIP_COST_RATIO
 
 DECISION_LABEL_COLUMNS: frozenset[str] = frozenset(
     {

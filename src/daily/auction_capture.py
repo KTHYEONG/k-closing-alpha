@@ -8,7 +8,6 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Any, Literal
 
 import pandas as pd
@@ -17,6 +16,7 @@ from src import settings
 from src.api.kis.key_pool import resolve_research_credentials, token_cache_path
 from src.config.collection import CollectionSettings
 from src.data.capture_contracts import (
+    GOOD_ENTRY_STATES,
     SEOUL,
     CaptureContext,
     CaptureDataset,
@@ -27,22 +27,16 @@ from src.data.capture_contracts import (
     SessionClock,
 )
 from src.data.capture_store import CaptureStore
+from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
 _OPEN_OFFSET_MINUTES: tuple[int, ...] = (-20, -10, -5, -2, -1)
 _PROGRAM_OFFSET_MINUTES: tuple[int, ...] = (-8, -4)
 _OPEN_TRUST_FLOOR_SECONDS: int = 30
-
-_GOOD_ENTRY_STATES = frozenset({CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE})
-
-
-def _capture_root(profile: CollectionSettings) -> Path:
-    if profile.COLLECTION_ROOT is not None:
-        return Path(profile.COLLECTION_ROOT)
-    return Path(settings.HISTORY_DIR) / "capture"
 
 
 def _previous_trading_day(snapshot_date: str) -> str:
@@ -69,7 +63,11 @@ def _open_position_symbols() -> list[str]:
     return sorted({str(item) for item in frame["symbol"].astype(str).tolist() if str(item).strip()})
 
 
-def _close_rounds(clock: SessionClock, interval_seconds: int) -> list[datetime]:
+def close_rounds(clock: SessionClock, interval_seconds: int) -> list[datetime]:
+    """Closing-auction orderbook sweep instants: every `interval_seconds` from close-9min up to (excluding) close.
+
+    Shared with the daily audit, which must expect exactly the rounds the capture job schedules.
+    """
     start = clock.close_at - timedelta(minutes=9)
     rounds: list[datetime] = []
     moment = start
@@ -83,7 +81,11 @@ def _open_rounds(clock: SessionClock) -> list[datetime]:
     return [clock.open_at + timedelta(minutes=offset) for offset in _OPEN_OFFSET_MINUTES]
 
 
-def _program_rounds(clock: SessionClock) -> list[datetime]:
+def program_rounds(clock: SessionClock) -> list[datetime]:
+    """Program-trading snapshot instants at the configured minute offsets from the session close.
+
+    Shared with the daily audit for the same expected-coverage reason.
+    """
     return [clock.close_at + timedelta(minutes=offset) for offset in _PROGRAM_OFFSET_MINUTES]
 
 
@@ -338,8 +340,8 @@ async def run_auction_capture(
         raise ValueError(f"unknown phase {phase!r}")
     if session_clock.trading_date != trading_day:
         raise ValueError("session clock trading_date must equal snapshot_date")
-    if not profile.COLLECTION_RAW_ENABLED or not profile.COLLECTION_AUCTION_ENABLED:
-        raise ValueError("auction capture requires enabled raw and auction collection")
+    if not profile.COLLECTION_AUCTION_ENABLED:
+        raise ValueError("auction capture requires enabled auction collection")
     if not profile.COLLECTION_RESEARCH_SLOTS:
         raise ValueError("auction capture requires declared research slots")
     if not clients:
@@ -347,7 +349,7 @@ async def run_auction_capture(
     now = now_clock()
     roster, cohort_id, cohort_incomplete = _resolve_roster(snapshot_date, phase, store, now, previous_trading_day)
     if phase == "close":
-        rounds = _close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS))
+        rounds = close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS))
         phase_end = session_clock.close_at
     else:
         rounds = _open_rounds(session_clock)
@@ -365,7 +367,7 @@ async def run_auction_capture(
             program_task = asyncio.create_task(
                 _capture_program_rounds(
                     session=broker_session,
-                    rounds=_program_rounds(session_clock),
+                    rounds=program_rounds(session_clock),
                     roster=roster,
                     clients=clients,
                     semaphore=sem,
@@ -538,7 +540,7 @@ async def run_auction_capture(
             if program_task is not None:
                 program_entries = await program_task
                 entries.extend(program_entries)
-                if any(entry.status not in _GOOD_ENTRY_STATES for entry in program_entries):
+                if any(entry.status not in GOOD_ENTRY_STATES for entry in program_entries):
                     incomplete = True
         else:
             floor = session_clock.open_at + timedelta(seconds=_OPEN_TRUST_FLOOR_SECONDS)
@@ -675,7 +677,7 @@ async def run_auction_capture(
                     )
     status = CaptureStatus.COMPLETE
     for item in entries:
-        if item.status not in _GOOD_ENTRY_STATES:
+        if item.status not in GOOD_ENTRY_STATES:
             status = CaptureStatus.PARTIAL
             break
     if incomplete and status == CaptureStatus.COMPLETE:
@@ -803,5 +805,5 @@ if __name__ == "__main__":  # pragma: no cover - CLI entry point
     # 조용히 성공 종료(exit 0)했다 -- kca-auction-open/kca-auction-close가 매번
     # "성공"으로 보이면서 실제로는 아무 것도 수집하지 않았다(2026-09-21 daily-audit이
     # collection:auction_open:1:missing_manifest / auction_close:*:missing_entries로 포착).
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     main()

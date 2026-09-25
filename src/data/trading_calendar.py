@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from pathlib import Path
 
+import aiohttp
 import pandas as pd
 
 from src import settings
@@ -13,7 +16,15 @@ from src.backfill.altdata.krx_api import (
     fetch_krx_openapi_day_strict,
 )
 
+logger = logging.getLogger(__name__)
+
 _TRADING_DAY_CACHE: dict[str, bool] = {}
+
+DAY_WEEKEND: str = "weekend"
+DAY_HOLIDAY: str = "holiday"
+DAY_TRADING: str = "trading"
+# 달력 조회 장애: 휴장일로 단정하지 않고 감사를 수행한다(장애 조기 발견 우선)
+DAY_UNKNOWN: str = "unknown"
 
 
 def is_krx_trading_day(date: pd.Timestamp | str, cfg: AltDataFetchConfig | None = None) -> bool:
@@ -89,3 +100,27 @@ def is_kis_trading_day_sync(snapshot_date: str) -> bool:  # pragma: no cover - l
             return await is_kis_trading_day(client, session, snapshot_date)
 
     return asyncio.run(_run())
+
+
+def classify_day(snapshot_date: str, trading_day_fn: Callable[[str], bool] | None = None) -> str:
+    """Classify a KST date as weekend, holiday, trading day, or unknown.
+
+    The KIS daily index quote is published the same day, so it can answer "is today a holiday"
+    before the close; the official KRX index lags by a day and cannot. A lookup failure degrades
+    to UNKNOWN instead of raising so a calendar outage never silently suppresses audits.
+
+    Args:
+        snapshot_date: KST date `YYYY-MM-DD`.
+        trading_day_fn: Trading-day oracle; None uses `is_kis_trading_day_sync`.
+
+    Returns:
+        One of DAY_WEEKEND, DAY_HOLIDAY, DAY_TRADING, DAY_UNKNOWN.
+    """
+    if pd.Timestamp(snapshot_date).weekday() >= 5:
+        return DAY_WEEKEND
+    oracle = trading_day_fn if trading_day_fn is not None else is_kis_trading_day_sync
+    try:
+        return DAY_TRADING if oracle(snapshot_date) else DAY_HOLIDAY
+    except (RuntimeError, OSError, aiohttp.ClientError) as exc:
+        logger.warning("[DATA] stage=daily_audit calendar_lookup=FAIL reason=%s", type(exc).__name__)
+        return DAY_UNKNOWN

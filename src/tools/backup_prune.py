@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -18,11 +17,14 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.data.intraday_store import _capture_root
+from src.data.capture_store import resolve_capture_root as _capture_root
+from src.tools.capture_offsite import prune_local_sealed_capture
+from src.tools.offsite_common import DATED_DIR_RE, OFFSITE_REMOTE_BASE, resolve_rclone_bin
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
-BACKUP_REMOTE_ROOT: str = "gdrive:quant-lake/live/k-closing-alpha/_deleted"
+BACKUP_REMOTE_ROOT: str = OFFSITE_REMOTE_BASE + "/_deleted"
 BACKUP_SUBTREES: tuple[str, ...] = ("data", "artifacts")
 BACKUP_RETENTION_DAYS: int = 30
 BACKUP_MAX_PURGE_DIRS_PER_SUBTREE: int = 7
@@ -30,12 +32,10 @@ LOCAL_INTRADAY_BACKUP_RETENTION_DAYS: int = 3
 RCLONE_TIMEOUT_SEC: int = 600
 # rclone 문서화된 종료코드: 3 = directory not found (아직 한 번도 옮겨진 파일이 없는 하위 트리)
 RCLONE_EXIT_DIRECTORY_NOT_FOUND: int = 3
-_DATED_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATED_DIR = DATED_DIR_RE
 
 
-def _resolve_rclone_bin() -> str:
-    """Resolve the rclone executable; systemd user PATH does not include ~/.local/bin."""
-    return shutil.which("rclone") or str(Path.home() / ".local" / "bin" / "rclone")
+_resolve_rclone_bin = resolve_rclone_bin
 
 
 def expired_snapshot_dirs(
@@ -163,8 +163,6 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry
     today = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None).normalize()
     purged = prune_backups(today=today, dry_run=True) if args.dry_run else prune_backups(today=today)
     local_purged = prune_local_intraday_backups(today=today)
-    from src.tools.capture_offsite import prune_local_sealed_capture
-
     sealed_report = prune_local_sealed_capture(_capture_root(), today=today.date())
     logger.info(
         "[SYS] stage=backup_prune purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d",
@@ -175,5 +173,5 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     main()

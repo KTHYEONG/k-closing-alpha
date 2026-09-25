@@ -14,7 +14,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import tarfile
@@ -25,13 +24,23 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from src.tools.backup_prune import _resolve_rclone_bin
+from src.tools.offsite_common import (
+    DATED_DIR_RE as _DATE_RE,
+)
+from src.tools.offsite_common import (
+    OFFSITE_REMOTE_BASE,
+)
+from src.tools.offsite_common import (
+    resolve_rclone_bin as _resolve_rclone_bin,
+)
+from src.tools.offsite_common import (
+    sha256_file as _sha256_file,
+)
 
 logger = logging.getLogger(__name__)
 
 RUN_DIR_DEPTH: Mapping[str, int] = {"raw": 5, "normalized": 2}
 
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _CHUNK = 1024 * 1024
 
 
@@ -55,7 +64,7 @@ class OffsiteConfig:
         rclone_timeout_sec: Per rclone subprocess timeout.
     """
 
-    remote_root: str = "gdrive:quant-lake/live/k-closing-alpha/capture_sealed"
+    remote_root: str = OFFSITE_REMOTE_BASE + "/capture_sealed"
     tiers: tuple[str, ...] = ("raw", "normalized")
     max_segment_member_bytes: int = 1_000_000_000
     recent_window_days: int = 3
@@ -223,17 +232,6 @@ def read_ledger(capture_root: Path, tier: str, trading_date: str) -> list[Ledger
 
 def _is_inflight(name: str) -> bool:
     return name.endswith(".lock") or (name.startswith("stage-") and name.endswith(".tmp"))
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while True:
-            chunk = handle.read(_CHUNK)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _local_md5(path: Path) -> str:

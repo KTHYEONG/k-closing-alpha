@@ -192,7 +192,7 @@ def test_main_purges_remote_and_local_with_single_summary_log(monkeypatch, caplo
             bytes_removed=99,
         )
 
-    monkeypatch.setattr(capture_offsite, "prune_local_sealed_capture", _fake_sealed)
+    monkeypatch.setattr(backup_prune, "prune_local_sealed_capture", _fake_sealed)
 
     # When
     with caplog.at_level(logging.INFO, logger="src.tools.backup_prune"):

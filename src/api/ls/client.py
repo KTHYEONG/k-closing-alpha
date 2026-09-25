@@ -5,13 +5,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 import re
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
-from src import settings
+from src.config import settings
 
 if TYPE_CHECKING:
     import aiohttp
@@ -19,9 +18,6 @@ if TYPE_CHECKING:
     from src.data.capture_contracts import BrokerPayload, ChartBudget, PageObserver
 
 logger = logging.getLogger(__name__)
-
-_OAUTH_URL = "https://openapi.ls-sec.co.kr:8080/oauth2/token"
-_QUERY_URL = "https://openapi.ls-sec.co.kr:8080/stock/chart"
 
 _SEOUL = ZoneInfo("Asia/Seoul")
 _YMD_RE = re.compile(r"^\d{8}$")
@@ -53,23 +49,29 @@ def _deadline_remaining(deadline: datetime | None) -> float | None:
     return (deadline - _now_seoul()).total_seconds()
 
 
-def _resolve_tick_max_pages(explicit: int | None) -> int:
-    if explicit is not None:
-        return int(explicit)
-    return int(getattr(settings, "LS_TICK_MAX_PAGES", 100) or 100)
-
-
 class LsApiClient:
     def __init__(self, app_key: str | None = None, app_secret: str | None = None) -> None:
-        self.app_key = app_key or getattr(settings, "LS_APP_KEY", "") or os.getenv("LS_APP_KEY", "")
-        self.app_secret = app_secret or getattr(settings, "LS_APP_SECRET", "") or os.getenv("LS_APP_SECRET", "")
+        """Bind credentials, origin and pacing from explicit arguments or the live Settings instance.
+
+        Pacing and 429 backoff come from ``LS_MIN_INTERVAL_SECONDS``,
+        ``LS_RATE_LIMIT_MAX_RETRIES`` and ``LS_RATE_LIMIT_BACKOFF_SECONDS`` so an
+        operator can tune them per host: the LS app key is shared with another
+        repository, so in-process pacing alone cannot guarantee the per-key limit.
+
+        Args:
+            app_key: Explicit app key; falls back to ``settings.LS_APP_KEY``.
+            app_secret: Explicit secret; falls back to ``settings.LS_APP_SECRET``.
+        """
+        self.app_key = app_key or settings.LS_APP_KEY
+        self.app_secret = app_secret or settings.LS_APP_SECRET
+        self.base_url = settings.LS_BASE_URL
         self.token: str | None = None
         self._lock: asyncio.Lock | None = None
         self._token_lock: asyncio.Lock | None = None
         # LS_APP_KEY는 krx-alpha와 공유되어 프로세스 내부 페이싱만으로는 키 단위 한도를 보장할 수 없다.
-        self._min_interval: float = float(getattr(settings, "LS_MIN_INTERVAL_SECONDS", 1.05) or 1.05)
-        self._rate_limit_max_retries: int = int(getattr(settings, "LS_RATE_LIMIT_MAX_RETRIES", 5) or 5)
-        self._rate_limit_backoff: float = float(getattr(settings, "LS_RATE_LIMIT_BACKOFF_SECONDS", 1.2) or 1.2)
+        self._min_interval: float = float(settings.LS_MIN_INTERVAL_SECONDS)
+        self._rate_limit_max_retries: int = int(settings.LS_RATE_LIMIT_MAX_RETRIES)
+        self._rate_limit_backoff: float = float(settings.LS_RATE_LIMIT_BACKOFF_SECONDS)
         self._last_call_time: float = 0.0
 
     async def ensure_token(self, session) -> str:
@@ -86,7 +88,7 @@ class LsApiClient:
                 "appsecretkey": self.app_secret,
                 "scope": "oob",
             }
-            raw = session.post(_OAUTH_URL, data=payload)
+            raw = session.post(f"{self.base_url}/oauth2/token", data=payload)
             if inspect.isawaitable(raw):
                 raw = await raw
             async with raw as resp:
@@ -129,7 +131,7 @@ class LsApiClient:
                 "tr_cont": tr_cont,
                 "tr_cont_key": tr_cont_key,
             }
-            raw = session.post(_QUERY_URL, json={**body, "tr_cd": tr_cd}, headers=headers)
+            raw = session.post(f"{self.base_url}/stock/chart", json={**body, "tr_cd": tr_cd}, headers=headers)
             if inspect.isawaitable(raw):
                 raw = await raw
             async with raw as resp:
@@ -188,7 +190,7 @@ class LsApiClient:
             OSError: Mandatory raw-page persistence fails.
         """
         ymd = _validate_target_ymd(target_date)
-        max_pages, deadline = _resolve_chart_budget(budget, int(getattr(settings, "COLLECTION_CHART_MAX_PAGES", 30) or 30))
+        max_pages, deadline = _resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
         cts_date, cts_time = "", ""
         tr_cont, tr_cont_key = "N", ""
         all_rows: list[dict[str, Any]] = []
@@ -327,11 +329,11 @@ class LsApiClient:
         if max_pages is not None and int(max_pages) <= 0:
             raise ValueError("invalid tick acquisition limits")
         if budget is not None:
-            page_budget, deadline = _resolve_chart_budget(budget, _resolve_tick_max_pages(None))
+            page_budget, deadline = _resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
         elif max_pages is not None:
             page_budget, deadline = max(1, int(max_pages)), None
         else:
-            page_budget, deadline = _resolve_chart_budget(None, _resolve_tick_max_pages(None))
+            page_budget, deadline = _resolve_chart_budget(None, int(settings.COLLECTION_CHART_MAX_PAGES))
         cts_date, cts_time = "", ""
         tr_cont, tr_cont_key = "N", ""
         all_rows: list[dict[str, Any]] = []

@@ -19,6 +19,6 @@ def test_kis_settings_key_pool_defaults_and_reexport(monkeypatch) -> None:
     assert KisSettings(_env_file=None).KIS_DATA_ROLE == "decision"
 
     import src.config as config_pkg
-    assert "KIS_DATA_ROLE" in config_pkg.__all__
-    assert "KIS_TOKEN_CACHE_DIR" in config_pkg.__all__
+    assert config_pkg.KIS_DATA_ROLE == config_pkg.settings.KIS_DATA_ROLE
+    assert config_pkg.KIS_TOKEN_CACHE_DIR == config_pkg.settings.KIS_TOKEN_CACHE_DIR
 

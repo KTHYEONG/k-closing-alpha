@@ -938,7 +938,6 @@ def test_run_price_ingest_preserves_unadjusted_rows_before_adjustment(monkeypatc
     _write_panel(path, _panel_rows("000001", [days["2026-09-07"], days["2026-09-08"], days["2026-09-09"]], [10000.0] * 3)
                  + _panel_rows("000002", [days["2026-09-03"], days["2026-09-04"], days["2026-09-07"]], [20000.0] * 3, volume=100.0))
     monkeypatch.setattr(mod_, "_capture_root", lambda: tmp_path / "capture")
-    monkeypatch.setattr(mod_.settings, "COLLECTION_RAW_ENABLED", True)
 
     report = asyncio.run(mod_.run_price_ingest(
         today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
@@ -969,7 +968,6 @@ def test_run_price_ingest_adjusted_evidence_excludes_untouched_history(monkeypat
         rows += _panel_rows(f"UNTOUCHED{i:02d}", [days["2026-09-07"]], [1000.0])
     _write_panel(path, rows)
     monkeypatch.setattr(mod_, "_capture_root", lambda: tmp_path / "capture")
-    monkeypatch.setattr(mod_.settings, "COLLECTION_RAW_ENABLED", True)
 
     asyncio.run(mod_.run_price_ingest(
         today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
@@ -992,7 +990,6 @@ def test_run_price_ingest_adjustment_failure_keeps_raw_evidence(monkeypatch, tmp
     mod_, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
     _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
     monkeypatch.setattr(mod_, "_capture_root", lambda: tmp_path / "capture")
-    monkeypatch.setattr(mod_.settings, "COLLECTION_RAW_ENABLED", True)
 
     def _boom(panel, new_rows, trading_days):
         raise RuntimeError("adjust boom")
@@ -1067,7 +1064,6 @@ def test_run_price_ingest_membership_is_observed_only(monkeypatch, tmp_path) -> 
     mod_, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
     _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
     monkeypatch.setattr(mod_, "_capture_root", lambda: tmp_path / "capture")
-    monkeypatch.setattr(mod_.settings, "COLLECTION_RAW_ENABLED", True)
 
     asyncio.run(mod_.run_price_ingest(
         today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
@@ -1078,22 +1074,6 @@ def test_run_price_ingest_membership_is_observed_only(monkeypatch, tmp_path) -> 
     out["symbol"] = out["symbol"].astype(str)
     new_dates = set(pd.to_datetime(out[out["symbol"] == "000003"]["date"]).dt.strftime("%Y-%m-%d"))
     assert new_dates and new_dates <= {"2026-09-08", "2026-09-09", "2026-09-10"}
-
-
-def test_run_price_ingest_skips_capture_when_raw_disabled(monkeypatch, tmp_path) -> None:
-    """Disabled raw mode performs no capture writes."""
-    path = tmp_path / "ph.parquet"
-    mod_, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
-    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
-    monkeypatch.setattr(mod_.settings, "COLLECTION_RAW_ENABLED", False)
-
-    report = asyncio.run(mod_.run_price_ingest(
-        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
-        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
-    ))
-
-    assert report.wrote is True
-    assert not (tmp_path / "capture").exists()
 
 
 def test_price_page_observer_capture_failure_propagates(tmp_path) -> None:

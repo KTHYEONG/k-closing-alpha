@@ -484,3 +484,76 @@ def test_estimate_round_trip_cost_bp_rejects_flat_statutory_with_date_col() -> N
     assert out["statutory_bp"].to_numpy()[0] == 18.0
     assert np.isnan(out["statutory_bp"].to_numpy()[1])
     assert np.isnan(out["round_trip_cost_bp"].to_numpy()[1])
+
+
+def test_brokerage_constants_are_one_kis_preferential_source() -> None:
+    import src.execution.cost_model as cost_model
+
+    # Given: the module constants
+    # When: read
+    # Then: exact equality, no approx
+    assert cost_model.BROKERAGE_SIDE_BP == 0.000036396 * 10000.0
+    assert cost_model.BROKERAGE_FEE_BP == 2 * cost_model.BROKERAGE_SIDE_BP
+
+
+def test_legacy_flat_ratio_is_bitwise_preserved() -> None:
+    import src.execution.cost_model as cost_model
+
+    # Given: the relocated constant
+    # When: compared
+    # Then: bitwise preserved
+    assert cost_model.ROUND_TRIP_COST_RATIO == 0.004672792
+    assert (
+        cost_model.ROUND_TRIP_COST_RATIO
+        == cost_model.STATUTORY_COST_BP / 1e4
+        + cost_model.LEGACY_FLAT_SPREAD_COST_BP / 1e4
+        + cost_model.BROKERAGE_FEE_BP / 1e4
+    )
+
+
+def test_pit_friction_adds_brokerage_once_on_top_of_tax_and_ticks() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.execution.cost_model import BROKERAGE_FEE_BP, pit_round_trip_cost_bp
+
+    # Given
+    per_tick_bp = np.array([5.0, 5.0, 5.0], dtype=np.float64)
+    trade_date = pd.to_datetime(["2018-06-01", "2025-06-02", "2026-06-01"]).to_numpy()
+
+    # When
+    out = pit_round_trip_cost_bp(per_tick_bp, trade_date, round_trip_ticks=2.0)
+
+    # Then
+    np.testing.assert_allclose(out, np.array([30 + 10, 15 + 10, 20 + 10]) + BROKERAGE_FEE_BP)
+
+
+def test_pit_friction_fails_closed() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from src.execution.cost_model import pit_round_trip_cost_bp
+
+    # Given: a NaN tick cost and a NaT date among valid rows
+    per_tick_bp = np.array([5.0, np.nan, 5.0], dtype=np.float64)
+    trade_date = pd.to_datetime(["2026-06-01", "2026-06-01", None]).to_numpy()
+
+    # When
+    out = pit_round_trip_cost_bp(per_tick_bp, trade_date, round_trip_ticks=2.0)
+
+    # Then: those rows are NaN, valid rows finite; no zero or default substitution
+    assert np.isfinite(out[0])
+    assert np.isnan(out[1])
+    assert np.isnan(out[2])
+
+
+def test_pit_friction_rejects_non_finite_tick_multiplier() -> None:
+    import numpy as np
+
+    import pytest
+
+    from src.execution.cost_model import pit_round_trip_cost_bp
+
+    # Given / When / Then
+    with pytest.raises(ValueError, match="round_trip_ticks"):
+        pit_round_trip_cost_bp(np.array([5.0]), np.array(["2026-06-01"], dtype="datetime64[ns]"), round_trip_ticks=float("nan"))

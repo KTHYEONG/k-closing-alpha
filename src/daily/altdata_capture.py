@@ -23,16 +23,12 @@ from src.daily.price_ingest import fetch_krx_daily
 from src.data.altdata_health import AltdataVerdict, altdata_verdict
 from src.data.capture_contracts import SEOUL, CaptureManifest, CaptureStatus
 from src.data.capture_store import CaptureStore
+from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day_sync
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
-
-
-def _capture_root(profile: CollectionSettings) -> Path:
-    if profile.COLLECTION_ROOT is not None:
-        return Path(profile.COLLECTION_ROOT)
-    return Path(settings.HISTORY_DIR) / "capture"
 
 
 def _rolling_bounds(trading_day: date, lookback_days: int) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -98,8 +94,8 @@ def run_altdata_capture(trading_date: date, *, profile: CollectionSettings, stor
         ValueError: Disabled profile or mismatched rolling bounds.
         RawCaptureError: Durable output failed.
     """
-    if not (bool(profile.COLLECTION_RAW_ENABLED) and bool(profile.COLLECTION_ALTDATA_ENABLED)):
-        raise ValueError("altdata capture requires enabled raw and altdata collection")
+    if not bool(profile.COLLECTION_ALTDATA_ENABLED):
+        raise ValueError("altdata capture requires enabled altdata collection")
     lookback = int(profile.COLLECTION_ALTDATA_LOOKBACK_DAYS)
     window_start, window_end = _rolling_bounds(trading_date, lookback)
     if pd.Timestamp(cfg.start).normalize() != window_start or pd.Timestamp(cfg.end).normalize() != window_end:
@@ -152,7 +148,7 @@ def main(argv: Sequence[str] | None = None, *, trading_day_fn: Callable[[str], b
     except ValueError:
         raise ValueError(f"Invalid date: {args.date!r}") from None
     profile = CollectionSettings()
-    if not (bool(profile.COLLECTION_RAW_ENABLED) and bool(profile.COLLECTION_ALTDATA_ENABLED)):
+    if not bool(profile.COLLECTION_ALTDATA_ENABLED):
         logger.info("[DATA] stage=altdata_capture status=SKIP reason=disabled")
         return 0
     if trading_day.weekday() >= 5:
@@ -203,5 +199,5 @@ def main(argv: Sequence[str] | None = None, *, trading_day_fn: Callable[[str], b
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
     # 설정이 없으면 INFO(SKIP·키 풀 구성)가 저널에 남지 않아 게이트 동작을 확인할 수 없다.
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     raise SystemExit(main())

@@ -12,8 +12,6 @@ from typing import Any
 
 import pandas as pd
 
-from src import settings
-from src.api.ls.client import LsApiClient  # noqa: F401 - wiring per spec
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
     INTRADAY_SESSION_REGULAR,
@@ -43,14 +41,12 @@ from src.data.capture_contracts import (
     SymbolObserver,
 )
 from src.data.capture_store import CaptureStore
+from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_schema import normalize_bar_frame, normalize_tick_frame
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LS_TICK_MAX_PAGES: int = 30
-
 _EXHAUSTED_TERMINALS = frozenset({"exhausted", "crossed_target_date"})
-_GOOD_ENTRY_STATES = frozenset({CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE})
 _NONCERTIFIED = frozenset({CaptureStatus.PARTIAL, CaptureStatus.FAILED, CaptureStatus.UNKNOWN})
 _ERROR_RE = re.compile(r"[^A-Za-z0-9_]+")
 
@@ -104,12 +100,6 @@ def _is_past_date(snapshot_date: str) -> bool:
 
 def _resolve_profile(profile: CollectionSettings | None) -> CollectionSettings:
     return profile if profile is not None else CollectionSettings()
-
-
-def _capture_root(profile: CollectionSettings) -> Any:
-    if profile.COLLECTION_ROOT is not None:
-        return profile.COLLECTION_ROOT
-    return settings.HISTORY_DIR / "capture"
 
 
 def _resolve_store(capture_store: CaptureStore | None, profile: CollectionSettings) -> CaptureStore:
@@ -914,58 +904,6 @@ async def _collect_bars(
     return pd.concat(frames, ignore_index=True)
 
 
-async def _legacy_collect_intraday_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, ls_client: Any | None = None) -> pd.DataFrame:
-    if ls_client is None:
-        return await _collect_bars(
-            client, session, stock_codes, snapshot_date, bar_interval_minutes,
-            KRX_REGULAR_HOUR_CEIL, KRX_REGULAR_HOUR_FLOOR, KRX_CLOSE_MARKET_DIV_CODE,
-        )
-    if not stock_codes:
-        return pd.DataFrame()
-    sem = asyncio.Semaphore(10)
-    target_date = snapshot_date
-
-    async def _fetch_one(code: str) -> pd.DataFrame:
-        async with sem:
-            try:
-                res = await ls_client.get_minute_chart(session, code, target_date)
-            except Exception as e:
-                logger.warning("LS minute chart failed code=%s: %s", code, e)
-                res = {"rt_cd": "1", "output2": []}
-            if res.get("rt_cd") == "0" and (res.get("output2") or []):
-                rows = res.get("output2") or []
-                logger.info("Fetched %d minute bars for %s via LS", len(rows), code)
-                vendor = str(res.get("vendor", "ls") or "ls")
-                try:
-                    return normalize_bar_frame(pd.DataFrame(rows), vendor, snapshot_date, code)
-                except Exception as e:
-                    logger.warning("[DATA] LS bar normalize failed code=%s: %s", code, e)
-                    return pd.DataFrame()
-            else:
-                try:
-                    res = await client.get_intraday_minute_chart(
-                        session, code, bar_interval_minutes=bar_interval_minutes,
-                        end_hour=KRX_REGULAR_HOUR_CEIL, floor_hour=KRX_REGULAR_HOUR_FLOOR,
-                        market_div_code=KRX_CLOSE_MARKET_DIV_CODE,
-                    )
-                except Exception as e:
-                    logger.warning("Intraday bars failed code=%s: %s", code, e)
-                    return pd.DataFrame()
-                if res.get("rt_cd") != "0":
-                    return pd.DataFrame()
-                rows = res.get("output2") or []
-                logger.info("Fetched %d minute bars for %s via KIS fallback", len(rows), code)
-            if not rows:
-                return pd.DataFrame()
-            return _canonical_kis_bars(rows, snapshot_date, code)
-
-    results = await asyncio.gather(*[_fetch_one(c) for c in stock_codes])
-    frames = [d for d in results if d is not None and not d.empty]
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
-
-
 async def collect_intraday_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, ls_client: Any | None = None, *, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
     """Classify complete source attempts before publishing regular-session bars.
 
@@ -982,14 +920,13 @@ async def collect_intraday_bars(client: Any, session: Any, stock_codes: list[str
         on_symbol: Bounded symbol result consumer; suppresses all-symbol accumulation.
 
     Returns:
-        Compatible frame when on_symbol is None, otherwise an empty canonical frame.
+        Concatenated canonical frame of every symbol when on_symbol is None,
+        otherwise an empty canonical frame (rows are delivered to on_symbol).
 
     Raises:
         ValueError: Invalid profile, route, or date.
         OSError: Required evidence or publication fails.
     """
-    if profile is None and capture_store is None and on_symbol is None and run_id is None:
-        return await _legacy_collect_intraday_bars(client, session, stock_codes, snapshot_date, bar_interval_minutes, ls_client)
     if int(bar_interval_minutes) <= 0:
         raise ValueError(f"Invalid bar_interval_minutes: {bar_interval_minutes!r}")
     prof = _resolve_profile(profile)
@@ -1013,56 +950,6 @@ async def collect_intraday_bars(client: Any, session: Any, stock_codes: list[str
         session_tag=INTRADAY_SESSION_REGULAR, store=store, run_id=resolved_run,
         acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
     )
-
-
-async def _legacy_collect_nxt_aftermarket_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, kiwoom_client: Any | None = None) -> pd.DataFrame:
-    if kiwoom_client is None:
-        return await _collect_bars(
-            client, session, stock_codes, snapshot_date, bar_interval_minutes,
-            NXT_AFTERMARKET_HOUR_CEIL, NXT_AFTERMARKET_HOUR_FLOOR, NXT_MARKET_DIV_CODE,
-        )
-    if not stock_codes:
-        return pd.DataFrame()
-    sem = asyncio.Semaphore(10)
-
-    async def _fetch_one(code: str) -> pd.DataFrame:
-        async with sem:
-            try:
-                kw_res = await kiwoom_client.get_nxt_minute_chart(session, code, snapshot_date)
-            except Exception as e:
-                logger.warning("Kiwoom NXT minute chart failed code=%s: %s", code, e)
-                kw_res = {"rt_cd": "1", "output2": []}
-            if kw_res.get("rt_cd") == "0" and (kw_res.get("output2") or []):
-                rows = kw_res.get("output2") or []
-                vendor = str(kw_res.get("vendor", "kiwoom") or "kiwoom")
-                try:
-                    return normalize_bar_frame(pd.DataFrame(rows), vendor, snapshot_date, code)
-                except Exception as e:
-                    logger.warning("[DATA] Kiwoom NXT bar normalize failed code=%s: %s", code, e)
-                    return pd.DataFrame()
-            if kw_res.get("rt_cd") == "0":
-                return pd.DataFrame()
-            try:
-                res = await client.get_intraday_minute_chart(
-                    session, code, bar_interval_minutes=bar_interval_minutes,
-                    end_hour=NXT_AFTERMARKET_HOUR_CEIL, floor_hour=NXT_AFTERMARKET_HOUR_FLOOR,
-                    market_div_code=NXT_MARKET_DIV_CODE,
-                )
-            except Exception as e:
-                logger.warning("Intraday bars failed code=%s: %s", code, e)
-                return pd.DataFrame()
-            if res.get("rt_cd") != "0":
-                return pd.DataFrame()
-            rows = res.get("output2") or []
-            if not rows:
-                return pd.DataFrame()
-            return _canonical_kis_bars(rows, snapshot_date, code)
-
-    results = await asyncio.gather(*[_fetch_one(c) for c in stock_codes])
-    frames = [d for d in results if d is not None and not d.empty]
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
 
 
 async def _acquire_extended_bars_symbol(
@@ -1133,9 +1020,12 @@ async def _acquire_extended_bars_symbol(
 
 
 async def collect_nxt_aftermarket_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, kiwoom_client: Any | None = None, *, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
-    """NXT 애프터마켓(15:40-20:00) 전체를 1분봉 연속 시계열로 수집한다. 미상장은 조용히 스킵."""
-    if profile is None and capture_store is None and on_symbol is None and run_id is None:
-        return await _legacy_collect_nxt_aftermarket_bars(client, session, stock_codes, snapshot_date, bar_interval_minutes, kiwoom_client)
+    """NXT 애프터마켓(15:40-20:00) 전체를 1분봉 연속 시계열로 수집한다. 미상장은 조용히 스킵.
+
+    Returns:
+        Concatenated canonical frame of every symbol when on_symbol is None,
+        otherwise an empty canonical frame (rows are delivered to on_symbol).
+    """
     prof = _resolve_profile(profile)
     trading_day = _parse_snapshot_date(snapshot_date)
     ymd = trading_day.isoformat().replace("-", "")
@@ -1160,60 +1050,13 @@ async def collect_nxt_aftermarket_bars(client: Any, session: Any, stock_codes: l
     )
 
 
-async def _legacy_collect_nxt_premarket_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, kiwoom_client: Any | None = None) -> pd.DataFrame:
-    if kiwoom_client is None:
-        return await _collect_bars(
-            client, session, stock_codes, snapshot_date, bar_interval_minutes,
-            NXT_PREMARKET_HOUR_CEIL, NXT_PREMARKET_HOUR_FLOOR, NXT_MARKET_DIV_CODE,
-        )
-    if not stock_codes:
-        return pd.DataFrame()
-    sem = asyncio.Semaphore(10)
-
-    async def _fetch_one(code: str) -> pd.DataFrame:
-        async with sem:
-            try:
-                kw_res = await kiwoom_client.get_nxt_premarket_chart(session, code, snapshot_date)
-            except Exception as e:
-                logger.warning("Kiwoom NXT premarket chart failed code=%s: %s", code, e)
-                kw_res = {"rt_cd": "1", "output2": []}
-            if kw_res.get("rt_cd") == "0" and (kw_res.get("output2") or []):
-                rows = kw_res.get("output2") or []
-                vendor = str(kw_res.get("vendor", "kiwoom") or "kiwoom")
-                try:
-                    return normalize_bar_frame(pd.DataFrame(rows), vendor, snapshot_date, code)
-                except Exception as e:
-                    logger.warning("[DATA] Kiwoom NXT bar normalize failed code=%s: %s", code, e)
-                    return pd.DataFrame()
-            if kw_res.get("rt_cd") == "0":
-                return pd.DataFrame()
-            try:
-                res = await client.get_intraday_minute_chart(
-                    session, code, bar_interval_minutes=bar_interval_minutes,
-                    end_hour=NXT_PREMARKET_HOUR_CEIL, floor_hour=NXT_PREMARKET_HOUR_FLOOR,
-                    market_div_code=NXT_MARKET_DIV_CODE,
-                )
-            except Exception as e:
-                logger.warning("Intraday bars failed code=%s: %s", code, e)
-                return pd.DataFrame()
-            if res.get("rt_cd") != "0":
-                return pd.DataFrame()
-            rows = res.get("output2") or []
-            if not rows:
-                return pd.DataFrame()
-            return _canonical_kis_bars(rows, snapshot_date, code)
-
-    results = await asyncio.gather(*[_fetch_one(c) for c in stock_codes])
-    frames = [d for d in results if d is not None and not d.empty]
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
-
-
 async def collect_nxt_premarket_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, kiwoom_client: Any | None = None, *, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
-    """NXT 프리마켓(08:00-08:50) 전체를 1분봉 연속 시계열로 수집한다. 미상장은 조용히 스킵."""
-    if profile is None and capture_store is None and on_symbol is None and run_id is None:
-        return await _legacy_collect_nxt_premarket_bars(client, session, stock_codes, snapshot_date, bar_interval_minutes, kiwoom_client)
+    """NXT 프리마켓(08:00-08:50) 전체를 1분봉 연속 시계열로 수집한다. 미상장은 조용히 스킵.
+
+    Returns:
+        Concatenated canonical frame of every symbol when on_symbol is None,
+        otherwise an empty canonical frame (rows are delivered to on_symbol).
+    """
     prof = _resolve_profile(profile)
     trading_day = _parse_snapshot_date(snapshot_date)
     ymd = trading_day.isoformat().replace("-", "")
@@ -1238,83 +1081,7 @@ async def collect_nxt_premarket_bars(client: Any, session: Any, stock_codes: lis
     )
 
 
-async def _legacy_collect_intraday_trade_ticks(
-    client,
-    session,
-    stock_codes: list[str],
-    snapshot_date: str,
-    ls_client: Any | None = None,
-    kiwoom_client: Any | None = None,
-    ls_max_pages: int = DEFAULT_LS_TICK_MAX_PAGES,
-) -> pd.DataFrame:
-    if not stock_codes:
-        return pd.DataFrame()
-    sem = asyncio.Semaphore(10)
-    target_date = snapshot_date
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    use_kiwoom = kiwoom_client is not None and str(snapshot_date) >= today_str
-
-    async def _fetch_one(code: str) -> list[dict]:
-        async with sem:
-            if use_kiwoom:
-                try:
-                    kw_res = await kiwoom_client.get_tick_chart(session, code, target_date)
-                except Exception as e:
-                    logger.warning("Kiwoom tick chart failed code=%s: %s", code, e)
-                    kw_res = {"rt_cd": "1", "output2": []}
-                if kw_res.get("rt_cd") == "0" and (kw_res.get("output2") or []):
-                    rows = kw_res.get("output2") or []
-                    truncated = bool(kw_res.get("truncated", False))
-                    vendor = str(kw_res.get("vendor", "kiwoom") or "kiwoom")
-                    logger.info("Fetched %d ticks for %s via Kiwoom", len(rows), code)
-                    try:
-                        frame = normalize_tick_frame(pd.DataFrame(rows), vendor, snapshot_date, code, truncated=truncated)
-                    except Exception as e:
-                        logger.warning("[DATA] Kiwoom tick normalize failed code=%s: %s", code, e)
-                        return []
-                    return frame.to_dict("records") if not frame.empty else []
-            if ls_client is not None:
-                try:
-                    ls_res = await ls_client.get_tick_chart(session, code, target_date, max_pages=ls_max_pages)
-                except Exception as e:
-                    logger.warning("LS tick chart failed code=%s: %s", code, e)
-                    ls_res = {"rt_cd": "1", "output2": []}
-                if ls_res.get("rt_cd") == "0" and (ls_res.get("output2") or []):
-                    rows = ls_res.get("output2") or []
-                    truncated = bool(ls_res.get("truncated", False))
-                    vendor = str(ls_res.get("vendor", "ls") or "ls")
-                    logger.info("Fetched %d ticks for %s via LS", len(rows), code)
-                    try:
-                        frame = normalize_tick_frame(pd.DataFrame(rows), vendor, snapshot_date, code, truncated=truncated)
-                    except Exception as e:
-                        logger.warning("[DATA] LS tick normalize failed code=%s: %s", code, e)
-                        return []
-                    return frame.to_dict("records") if not frame.empty else []
-            try:
-                res = await client.get_intraday_trade_ticks(session, code, floor_hour=KRX_REGULAR_HOUR_FLOOR, end_hour=KRX_REGULAR_HOUR_CEIL, market_div_code=KRX_CLOSE_MARKET_DIV_CODE)
-            except Exception as e:
-                logger.warning("Intraday trade ticks failed code=%s: %s", code, e)
-                return []
-            if res.get("rt_cd") != "0":
-                return []
-            rows = res.get("output2") or []
-            if not rows:
-                return []
-            frame = _canonical_kis_ticks(rows, snapshot_date, code)
-            logger.info("Fetched %d ticks for %s via KIS fallback", len(frame), code)
-            return frame.to_dict("records") if not frame.empty else []
-
-    results = await asyncio.gather(*[_fetch_one(c) for c in stock_codes])
-    all_rows: list[dict] = []
-    for rows in results:
-        if rows:
-            all_rows.extend(rows)
-    if not all_rows:
-        return pd.DataFrame()
-    return pd.DataFrame(all_rows)
-
-
-async def collect_intraday_trade_ticks(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, ls_client: Any | None = None, kiwoom_client: Any | None = None, ls_max_pages: int = DEFAULT_LS_TICK_MAX_PAGES, *, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
+async def collect_intraday_trade_ticks(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, ls_client: Any | None = None, kiwoom_client: Any | None = None, ls_max_pages: int | None = None, *, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
     """Deliver one certified whole-symbol attempt without merging broker tapes.
 
     Args:
@@ -1324,24 +1091,24 @@ async def collect_intraday_trade_ticks(client: Any, session: Any, stock_codes: l
         snapshot_date: Exact requested market date.
         ls_client: Optional independent LS source.
         kiwoom_client: Optional current-day Kiwoom source.
-        ls_max_pages: Compatible explicit LS limit.
+        ls_max_pages: First-pass page limit for Kiwoom/LS tick sources; defaults to the profile's COLLECTION_CHART_MAX_PAGES.
         profile: Normal/repair budgets and route certification.
         capture_store: Owner-local raw and partial-attempt storage.
         run_id: Acquisition identity.
         on_symbol: Bounded consumer of frame and task coverage.
 
     Returns:
-        Legacy combined frame without an observer, otherwise empty canonical frame.
+        Concatenated canonical frame of every symbol when on_symbol is None,
+        otherwise an empty canonical frame (rows are delivered to on_symbol).
 
     Raises:
         ValueError: Conflicting or unverified classification inputs.
         OSError: Mandatory evidence cannot be preserved.
     """
-    if profile is None and capture_store is None and on_symbol is None and run_id is None:
-        return await _legacy_collect_intraday_trade_ticks(client, session, stock_codes, snapshot_date, ls_client, kiwoom_client, ls_max_pages)
-    if int(ls_max_pages) <= 0:
-        raise ValueError(f"Invalid ls_max_pages: {ls_max_pages!r}")
     prof = _resolve_profile(profile)
+    resolved_pages = prof.COLLECTION_CHART_MAX_PAGES if ls_max_pages is None else ls_max_pages
+    if int(resolved_pages) <= 0:
+        raise ValueError(f"Invalid ls_max_pages: {resolved_pages!r}")
     trading_day = _parse_snapshot_date(snapshot_date)
     ymd = trading_day.isoformat().replace("-", "")
     store = _resolve_store(capture_store, prof)
@@ -1352,7 +1119,7 @@ async def collect_intraday_trade_ticks(client: Any, session: Any, stock_codes: l
         return await _acquire_ticks_symbol(
             client=client, session=session, code=code, snapshot_date=str(snapshot_date),
             trading_day=trading_day, ymd=ymd, ls_client=ls_client, kiwoom_client=kiwoom_client,
-            ls_max_pages=int(ls_max_pages), profile=prof, store=store, run_id=resolved_run,
+            ls_max_pages=int(resolved_pages), profile=prof, store=store, run_id=resolved_run,
         )
 
     return await _collect_with_observer(
@@ -1360,7 +1127,6 @@ async def collect_intraday_trade_ticks(client: Any, session: Any, stock_codes: l
         session_tag=INTRADAY_SESSION_REGULAR, store=store, run_id=resolved_run,
         acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
     )
-
 
 
 async def backfill_regular_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
@@ -1387,14 +1153,12 @@ async def backfill_nxt_aftermarket_bars(client, session, stock_codes: list[str],
 
 
 async def collect_krx_aftermarket_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, *, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
-    """당일 KRX 애프터마켓(16:00-20:00) 1분봉을 KRX_CLOSE_MARKET_DIV_CODE('J')로 수집한다."""
-    if profile is None and capture_store is None and on_symbol is None and run_id is None:
-        if str(snapshot_date) < KRX_AFTERMARKET_START_DATE:
-            return pd.DataFrame()
-        return await _collect_bars(
-            client, session, stock_codes, snapshot_date, bar_interval_minutes,
-            KRX_AFTERMARKET_HOUR_CEIL, KRX_AFTERMARKET_HOUR_FLOOR, KRX_CLOSE_MARKET_DIV_CODE,
-        )
+    """당일 KRX 애프터마켓(16:00-20:00) 1분봉을 KRX_CLOSE_MARKET_DIV_CODE('J')로 수집한다.
+
+    Returns:
+        Concatenated canonical frame of every symbol when on_symbol is None,
+        otherwise an empty canonical frame (rows are delivered to on_symbol).
+    """
     if str(snapshot_date) < KRX_AFTERMARKET_START_DATE:
         prof = _resolve_profile(profile)
         trading_day = _parse_snapshot_date(snapshot_date)

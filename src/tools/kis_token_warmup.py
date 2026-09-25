@@ -27,6 +27,7 @@ from src.api.kis.key_pool import (
     token_cache_path,
 )
 from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day
+from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +117,7 @@ async def warmup_host_tokens(
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    configure_cli_logging(CLI_LOG_FORMAT_TIMESTAMPED)
     today = datetime.now(ZoneInfo("Asia/Seoul")).date()
     if should_skip_warmup(today):
         logger.info("[SYS] stage=kis_token_warmup status=SKIP reason=non_trading_day date=%s", today.isoformat())

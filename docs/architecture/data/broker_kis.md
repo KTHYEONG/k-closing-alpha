@@ -32,7 +32,7 @@
     "access_token_token_expired": "2026-09-10 20:50:00"
   }
   ```
-* **Lifecycle:** 24h validity. Stored in `settings.TOKEN_FILE`. Auto-refreshed if under 10m remains, or upon `EGW00121`/`EGW00123` errors.
+* **Lifecycle:** 24h validity, stored per app key under `KIS_TOKEN_CACHE_DIR` (`token_cache_path`). Auto-refreshed if under 10m remains, or upon `EGW00121`/`EGW00123` errors.
 
 ### 1.3 Common Request Headers
 ```http

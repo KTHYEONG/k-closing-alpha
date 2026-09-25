@@ -253,3 +253,203 @@ def test_removed_modules_are_gone_and_orderbook_store_survives() -> None:
     assert callable(store.append_orderbook_snapshots)
     collect = importlib.import_module("src.daily.collect")
     assert callable(collect.persist_daily_snapshot)
+
+
+def test_dead_kis_client_methods_absent_live_quote_methods_present() -> None:
+    from src.api.kis.client import KisApiClient
+
+    for name in (
+        "resolve_stock_market_div_code",
+        "get_trade_strength",
+        "get_condition_list",
+        "get_condition_result",
+    ):
+        assert not hasattr(KisApiClient, name), f"KisApiClient.{name} should be deleted"
+    for name in (
+        "get_current_price",
+        "get_program_net_buy",
+        "get_investor_trend_estimate",
+        "get_orderbook_snapshot",
+    ):
+        assert hasattr(KisApiClient, name), f"KisApiClient.{name} must remain"
+
+
+def test_altdata_config_has_no_pykrx_field() -> None:
+    import dataclasses
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+
+    names = {f.name for f in dataclasses.fields(AltDataFetchConfig)}
+    assert "pykrx_requests_per_sec" not in names
+    assert AltDataFetchConfig.dart_requests_per_sec == 8.0
+    assert AltDataFetchConfig.krx_requests_per_sec == 4.0
+
+
+def test_intraday_store_public_surface_shrinks() -> None:
+    from src.data import intraday_store
+
+    assert not hasattr(intraday_store, "merge_partition_frame")
+    assert not hasattr(intraday_store, "read_intraday_range")
+    for name in (
+        "write_intraday_partition",
+        "write_tick_partition",
+        "intraday_partition_path",
+        "tick_partition_path",
+    ):
+        assert hasattr(intraday_store, name), f"intraday_store.{name} must remain"
+
+
+def test_write_partition_fails_closed_on_unreadable_existing(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import pytest
+
+    from src.data import intraday_store
+    from src.data.intraday_schema import normalize_bar_frame
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    target = intraday_store.intraday_partition_path(1, "2026-09-05", "regular")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"not a valid parquet file")
+    before = target.read_bytes()
+
+    raw = pd.DataFrame(
+        {
+            "time": ["090300"],
+            "open": [70000],
+            "high": [70100],
+            "low": [69900],
+            "close": [70000],
+            "jdiff_vol": [1000],
+            "value": [70],
+        }
+    )
+    new_df = normalize_bar_frame(raw, "ls", "2026-09-05", "005930")
+    with pytest.raises(OSError, match="Cannot read existing partition evidence"):
+        intraday_store.write_intraday_partition(new_df, 1, "2026-09-05", "regular")
+    assert target.read_bytes() == before
+
+
+def test_universe_scan_archive_surface_removed() -> None:
+    from src.daily import universe_scan as mod
+
+    for name in (
+        "collect_universe_scan",
+        "archive_universe_snapshot",
+        "map_ranking_rows_to_archive_frame",
+        "map_kiwoom_ranking_rows_to_archive_frame",
+        "_ARCHIVE_COLUMNS",
+        "RANKING_SCAN_INPUT_CNT",
+        "UNIVERSE_SCAN_SCENARIO_TAG",
+    ):
+        assert not hasattr(mod, name), f"universe_scan.{name} should be deleted"
+        assert name not in mod.__all__, f"universe_scan.__all__ still lists {name}"
+
+
+def test_schema_spreadsheet_helpers_removed() -> None:
+    from src.processing import schema as mod
+
+    for name in (
+        "StandardColumns",
+        "LEGACY_RAW_TO_KOREAN_MAP",
+        "STANDARD_TO_KOREAN_MAP",
+        "normalize_column_names",
+    ):
+        assert not hasattr(mod, name), f"schema.{name} should be deleted"
+
+
+def test_raw_to_standard_map_values_preserved() -> None:
+    from src.processing.schema import RAW_TO_STANDARD_MAP
+
+    assert RAW_TO_STANDARD_MAP["매수날짜"] == "trade_date"
+    assert RAW_TO_STANDARD_MAP["(매수날짜)"] == "trade_date"
+    assert RAW_TO_STANDARD_MAP["종목코드"] == "stock_code"
+    assert RAW_TO_STANDARD_MAP["(종목코드)"] == "stock_code"
+    assert RAW_TO_STANDARD_MAP["수익률"] == "net_return"
+    assert RAW_TO_STANDARD_MAP["(수익률, %)"] == "net_return"
+    assert RAW_TO_STANDARD_MAP["(Win)"] == "Win"
+
+
+_DELETED_SETTINGS_FIELDS = (
+    "TARGET_CONDITION_NAME",
+    "OVERHEATED_CONDITION_NAME",
+    "NEW_HIGH_CONDITION_NAME",
+    "NEAR_NEW_HIGH_CONDITION_NAME",
+    "UPPER_LIMIT_NEXT_DAY_CONDITION_NAME",
+    "UPPER_LIMIT_CONDITION_NAME",
+    "EMA_PERIOD",
+    "SMA_PERIOD",
+    "SMA60_PERIOD",
+    "CANDLE_BODY_RATIO_THRESHOLD",
+    "GAP_UP_THRESHOLD",
+    "SMA_LOOKBACK_DAYS",
+    "SMA60_LOOKBACK_DAYS",
+    "EMA_LOOKBACK_DAYS",
+    "DEFAULT_SCENARIOS",
+    "DAY_NAME_MAP",
+    "CONFIGS_DIR",
+    "DAILY_DIR",
+    "TOKEN_FILE",
+    "DATA_TOKEN_FILE",
+    "ORDERBOOK_DIR",
+    "LABEL_ENCODER_PATH",
+    "MODEL_PATH",
+)
+
+
+def test_deleted_settings_fields_gone() -> None:
+    from src import settings as settings_module
+    from src.config import Settings
+
+    for name in _DELETED_SETTINGS_FIELDS:
+        assert name not in Settings.model_fields, f"{name} should be deleted from Settings"
+        assert not hasattr(settings_module.settings, name), f"{name} should be gone from Settings instance"
+        assert not hasattr(settings_module, name), f"{name} should be gone from src.settings module"
+        assert name not in settings_module.__all__, f"{name} should be gone from src.config.__all__"
+
+
+def test_live_path_fields_follow_overrides(tmp_path) -> None:
+    from src.config import Settings
+
+    settings = Settings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data", _env_file=None)
+    for name in (
+        "PARQUET_DIR",
+        "HISTORY_DIR",
+        "ALTDATA_DIR",
+        "PRICE_HISTORY_PARQUET_PATH",
+        "HISTORY_PARQUET_PATH",
+        "MODELS_DIR",
+    ):
+        assert str(getattr(settings, name)).startswith(str(tmp_path)), f"{name} ignored the override"
+
+
+def test_stale_env_names_ignored(monkeypatch) -> None:
+    from src.config import Settings
+
+    monkeypatch.setenv("EMA_PERIOD", "5")
+    monkeypatch.setenv("CONFIGS_DIR", "/nonexistent")
+    settings = Settings(_env_file=None)
+    assert not hasattr(settings, "EMA_PERIOD")
+    assert not hasattr(settings, "CONFIGS_DIR")
+
+
+def test_indicators_module_uses_data_key_client_once() -> None:
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("src/api/kis/indicators.py").read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "KisApiClient"
+    ]
+    assert len(calls) == 1
+    (call,) = calls
+    assert call.args == []
+    assert len(call.keywords) == 1
+    (kw,) = call.keywords
+    assert kw.arg is None
+    assert isinstance(kw.value, ast.Call)
+    assert isinstance(kw.value.func, ast.Name)
+    assert kw.value.func.id == "kis_data_client_kwargs"

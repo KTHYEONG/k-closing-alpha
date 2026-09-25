@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import gzip
 import hashlib
 import json
@@ -29,6 +30,7 @@ from src.data.capture_contracts import (
     build_cohort,
 )
 from src.data.capture_store import CaptureStore
+from src.utils.file_lock import sidecar_lock_path
 
 SEOUL = ZoneInfo("Asia/Seoul")
 DAY = date(2026, 9, 17)
@@ -600,11 +602,38 @@ def test_read_artifact_rejects_malformed(tmp_path: Path) -> None:
 def test_publish_lock_timeout_fails_explicitly(tmp_path: Path, monkeypatch: Any) -> None:
     store = CaptureStore(tmp_path / "capture")
     monkeypatch.setattr(store_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
-    target = tmp_path / "capture" / "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.gz"
+    response = _response()
+    target = store._root / store._raw_rel(response)
     target.parent.mkdir(parents=True, exist_ok=True)
-    (target.parent / (target.name + ".lock")).write_text("held")
-    with pytest.raises(OSError, match="timed out acquiring publish lock"):
-        store.append_response(_response())
+    holder_fd = os.open(sidecar_lock_path(target), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(OSError, match="timed out acquiring publish lock"):
+            store.append_response(response)
+    finally:
+        os.close(holder_fd)
+    assert not target.exists()
+
+
+def test_stale_publish_sidecar_does_not_block(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    response = _response()
+    target = store._root / store._raw_rel(response)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    sidecar = sidecar_lock_path(target)
+    sidecar.write_text("held", encoding="utf-8")
+    ref = store.append_response(response)
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == ref.sha256
+    assert not sidecar.exists()
+
+
+def test_immutable_identity_preserved_under_new_lock(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    first = store.append_response(_response())
+    assert store.append_response(_response()) == first
+    with pytest.raises(ValueError, match="conflicting immutable artifact identity"):
+        store.append_response(_response(payload={"output": {"code": "005930", "price": "73000"}}))
+    assert list((tmp_path / "capture").rglob("*.lock")) == []
 
 
 def _partial_entry() -> CoverageEntry:
@@ -649,3 +678,105 @@ def test_complete_decision_wins_over_earlier_partial(tmp_path: Path) -> None:
     assert store.read_cohort("2026-09-17", available_by=cutoff).cohort_id == _cohort().cohort_id
     frame = store.read_decision("2026-09-17", available_by=cutoff)
     assert frame["capture_run_id"].iloc[0] == "run-late"
+
+
+def test_resolve_capture_root_profile_override_wins(tmp_path: Path) -> None:
+    from src import settings as app_settings
+    from src.config.collection import CollectionSettings
+    from src.data.capture_store import resolve_capture_root
+
+    old = app_settings.COLLECTION_ROOT
+    app_settings.COLLECTION_ROOT = tmp_path / "b"
+    try:
+        assert resolve_capture_root(CollectionSettings(COLLECTION_ROOT=tmp_path / "a")) == tmp_path / "a"
+    finally:
+        app_settings.COLLECTION_ROOT = old
+
+
+def test_resolve_capture_root_settings_override_without_profile(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from src import settings as app_settings
+    from src.data.capture_store import resolve_capture_root
+
+    monkeypatch.setattr(app_settings, "COLLECTION_ROOT", tmp_path / "b", raising=False)
+
+    assert resolve_capture_root() == tmp_path / "b"
+
+
+def test_resolve_capture_root_history_fallback_for_both_variants(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from src import settings as app_settings
+    from src.config.collection import CollectionSettings
+    from src.data.capture_store import resolve_capture_root
+
+    monkeypatch.setattr(app_settings, "COLLECTION_ROOT", None, raising=False)
+    monkeypatch.setattr(app_settings, "HISTORY_DIR", tmp_path / "h", raising=False)
+
+    assert resolve_capture_root() == tmp_path / "h" / "capture"
+    assert resolve_capture_root(CollectionSettings(COLLECTION_ROOT=None)) == tmp_path / "h" / "capture"
+
+
+def test_resolve_capture_root_string_override_normalized(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from pathlib import Path as _Path
+
+    from src.config.collection import CollectionSettings
+    from src.data.capture_store import resolve_capture_root
+
+    profile = CollectionSettings(COLLECTION_ROOT=_Path(str(tmp_path / "s")))
+    result = resolve_capture_root(profile)
+
+    assert isinstance(result, _Path)
+
+
+def test_resolve_capture_root_has_no_filesystem_side_effect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from src import settings as app_settings
+    from src.data.capture_store import resolve_capture_root
+
+    target = tmp_path / "no-such-dir" / "capture-root"
+    assert not target.exists()
+    monkeypatch.setattr(app_settings, "COLLECTION_ROOT", target, raising=False)
+
+    assert resolve_capture_root() == target
+    assert not target.exists()
+
+
+def test_capture_root_has_single_owner_across_consumers() -> None:
+    import ast
+    import importlib
+    from pathlib import Path as _Path
+
+    from src.data.capture_store import resolve_capture_root
+
+    consumers = [
+        "src.daily.collect",
+        "src.daily.price_ingest",
+        "src.daily.predict",
+        "src.data.intraday_store",
+        "src.daily.auction_capture",
+        "src.daily.archive_intraday",
+        "src.daily.altdata_capture",
+        "src.tools.repair_intraday_capture",
+        "src.backfill.intraday.collector",
+        "src.tools.daily_audit",
+        "src.tools.backup_prune",
+        "src.tools.offsite_backup",
+    ]
+    for name in consumers:
+        module = importlib.import_module(name)
+        assert module._capture_root is resolve_capture_root, name
+
+    root = _Path("src")
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        offenders.extend(
+            str(path)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_capture_root"
+        )
+    assert offenders == []

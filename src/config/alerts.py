@@ -7,22 +7,13 @@ systemd OnFailure= 훅과 daily_audit 결손 감사가 공유하는 웹훅/이�
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+from src.config._env import EnvSettings
 
 
-class AlertSettings(BaseSettings):
+class AlertSettings(EnvSettings):
     """실패 알림 웹훅/이메일 자격증명."""
-
-    model_config = SettingsConfigDict(
-        env_file=_PROJECT_ROOT / ".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
 
     ALERT_WEBHOOK_URL: str = Field(default="")
     ALERT_GMAIL_USER: str = Field(default="")

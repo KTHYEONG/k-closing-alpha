@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import time
 import uuid
 from collections.abc import Sequence
 from datetime import date, datetime
@@ -16,7 +15,9 @@ from typing import Any
 
 import pandas as pd
 
+from src.config.collection import CollectionSettings
 from src.data.capture_contracts import (
+    GOOD_ENTRY_STATES,
     ArtifactRef,
     BrokerPayload,
     CaptureContext,
@@ -28,12 +29,42 @@ from src.data.capture_contracts import (
     CoverageEntry,
     RawCaptureError,
 )
+from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
 
-__all__ = ["CaptureStore"]
+__all__ = ["CaptureStore", "resolve_capture_root"]
 
 _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
-_LOCK_TIMEOUT_SECONDS = 30.0
-_GOOD_ENTRY_STATES = frozenset({CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE})
+_LOCK_TIMEOUT_SECONDS = DEFAULT_LOCK_TIMEOUT_SECONDS
+
+
+def resolve_capture_root(profile: CollectionSettings | None = None) -> Path:
+    """Resolve the owner-local raw capture root.
+
+    The collection root is an operator override (`COLLECTION_ROOT`); when unset, capture evidence
+    lives under the history tree so backups and audits find it next to the canonical panels.
+    Jobs that run with an explicit bounded `CollectionSettings` profile (auction, intraday archive,
+    altdata, repair) take the override from that profile; jobs without a profile (collect, predict,
+    price ingest, intraday store, backup tooling) take it from the application settings. The
+    history fallback always comes from the application settings so a single `HISTORY_DIR` override
+    relocates every job consistently.
+
+    Args:
+        profile: Explicit collection profile; None reads `COLLECTION_ROOT` from application settings.
+
+    Returns:
+        Absolute-or-relative `Path` exactly as configured (no resolution, no mkdir).
+    """
+    from src import settings as _settings
+
+    if profile is not None:
+        root = profile.COLLECTION_ROOT
+        if root is not None:
+            return Path(root)
+        return Path(_settings.HISTORY_DIR) / "capture"
+    root = _settings.COLLECTION_ROOT
+    if root is not None:
+        return Path(root)
+    return Path(_settings.HISTORY_DIR) / "capture"
 
 
 def _sha256(data: bytes) -> str:
@@ -80,26 +111,11 @@ class CaptureStore:
             raise ValueError(f"artifact path escapes capture root: {rel!r}")
         return full
 
-    def _acquire(self, target: Path) -> Path:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        lock = target.parent / (target.name + ".lock")
-        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.close(fd)
-                return lock
-            except FileExistsError:
-                if time.monotonic() >= deadline:
-                    raise OSError(f"timed out acquiring publish lock: {lock}") from None
-                time.sleep(0.01)
-
     def _publish_bytes(self, rel: str, data: bytes, rows: int | None) -> ArtifactRef:
         if len(data) > _MAX_ARTIFACT_BYTES:
             raise ValueError(f"artifact exceeds bounded size: {rel!r}")
         target = self._root / rel
-        lock = self._acquire(target)
-        try:
+        with exclusive_file_lock(sidecar_lock_path(target), timeout_seconds=_LOCK_TIMEOUT_SECONDS, purpose="publish"):
             if target.exists():
                 existing = target.read_bytes()
                 if existing == data:
@@ -113,9 +129,6 @@ class CaptureStore:
                 if tmp_path.exists():
                     tmp_path.unlink()
             return ArtifactRef(path=rel, sha256=_sha256(data), bytes=len(data), rows=rows)
-        finally:
-            if lock.exists():
-                lock.unlink()
 
     def _check_ref(self, ref: ArtifactRef) -> bytes:
         full = self._resolve(ref.path)
@@ -218,7 +231,7 @@ class CaptureStore:
             OSError: Publication or lock failure.
         """
         if manifest.status == CaptureStatus.COMPLETE and any(
-            entry.status not in _GOOD_ENTRY_STATES for entry in manifest.entries
+            entry.status not in GOOD_ENTRY_STATES for entry in manifest.entries
         ):
             raise ValueError("COMPLETE manifest cannot certify failed or pending entries")
         self._verify_manifest_refs(manifest)
@@ -288,7 +301,7 @@ class CaptureStore:
         listed = list(entries)
         status = (
             CaptureStatus.COMPLETE
-            if all(entry.status in _GOOD_ENTRY_STATES for entry in listed)
+            if all(entry.status in GOOD_ENTRY_STATES for entry in listed)
             else CaptureStatus.PARTIAL
         )
         first = listed[0] if listed else None

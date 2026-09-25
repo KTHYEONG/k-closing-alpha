@@ -25,6 +25,8 @@ from src.backfill.intraday.backfill_minute_history import (
 from src.config.market_session import INTRADAY_SESSION_REGULAR, KRX_REGULAR_HOUR_CEIL, KRX_REGULAR_HOUR_FLOOR
 from src.data.intraday_schema import normalize_bar_frame
 
+from src.utils.cli_logging import configure_cli_logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,7 +61,7 @@ async def _fetch_toss_regular_session_bars(toss: Any, session: Any, code: str, s
     """한 종목의 과거 하루치 정규세션(09:00-15:30) 1분봉을 Toss로 2콜 페이징 수집+정규화한다.
 
     Toss의 before 커서는 inclusive라 두 페이지 경계에 중복 캔들이 1개 생긴다. 신규
-    파티션(기존 파일이 아직 없는 첫 기록) 병합 시 merge_partition_frame은 new_df 내부의
+    파티션(기존 파일이 아직 없는 첫 기록) 병합 시 write_intraday_partition은 new_df 내부의
     중복은 제거하지 않고 신규-vs-기존 비교만 dedupe하므로(실측 확인), 여기서 명시적으로
     (symbol, ts_hms) 기준 중복을 제거해야 한다 -- write 계층에 기대지 않는다.
     Toss 에러 봉투({'error': {...}})가 어느 페이지에 와도 TossCandleFetchError를
@@ -144,7 +146,7 @@ def run_toss_1m_backfill(
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     logger.info(
         "[SYS] stage=toss_1m_backfill status=START gap=%s..%s (KIS 보존기간 밖 1회성 복구, 오래 걸릴 수 있음)",
         GAP_START_DATE, GAP_END_DATE,

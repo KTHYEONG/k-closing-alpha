@@ -1,75 +1,20 @@
-"""트레이딩 설정 도메인 (TradingSettings).
-
-조건검색 조건명, 차트 판단 임계값, 시나리오 우선순위, API 요청 제한 및
-조건명에 의존하는 파생 경로를 담당합니다.
-"""
+"""Trading-operation settings domain (TradingSettings): API concurrency limit and paper-trading sizing."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+from src.config._env import EnvSettings
 
 
-class TradingSettings(BaseSettings):
-    """당일 트레이딩 운영(조건검색/차트 판단/시나리오) 설정."""
-
-    model_config = SettingsConfigDict(
-        env_file=_PROJECT_ROOT / ".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-
-    # ---------------------------------------------------------
-    # [데이터 수집 설정 (collect)]
-    # ---------------------------------------------------------
-    TARGET_CONDITION_NAME: str = "종가매매"
-    OVERHEATED_CONDITION_NAME: str = "단기과열"
-    NEW_HIGH_CONDITION_NAME: str = "신고가"
-    NEAR_NEW_HIGH_CONDITION_NAME: str = "신고가 근접"
-    UPPER_LIMIT_NEXT_DAY_CONDITION_NAME: str = "상한가 다음날"
-    UPPER_LIMIT_CONDITION_NAME: str = "상한가"
+class TradingSettings(EnvSettings):
+    """당일 운영 API 동시성 한도 및 모의 운용 사이징 설정."""
 
     # API 요청 제한
     API_SEMAPHORE_LIMIT: int = 8
-
-    # 차트 필터링 설정
-    EMA_PERIOD: int = 20
-    SMA_PERIOD: int = 120
-    SMA60_PERIOD: int = 60
-    CANDLE_BODY_RATIO_THRESHOLD: float = 0.5
-    GAP_UP_THRESHOLD: float = 0.1
-    SMA_LOOKBACK_DAYS: int = 200
-    SMA60_LOOKBACK_DAYS: int = 120
-    EMA_LOOKBACK_DAYS: int = 60
-
-    # AI 분석 기본 시나리오 (시트에서 새로운 유형 기록시 추가 필요)
-    DEFAULT_SCENARIOS: list[str] = [
-        "신고가",
-        "상따",
-        "신고가 근접",
-        "거래량 폭증",
-        "상한가 다음날",
-        "120 돌파",
-        "상승형 음봉",
-    ]
 
     # 모의 운용 시드(원). 정수 주식수 산정의 분자.
     PAPER_SEED_CAPITAL: int = 10_000_000
 
     # 결정가(15:20 스냅샷) 대비 종가 상승분을 흡수하는 사이징 여유(bp). 0이면 결정가 그대로 사이징한다.
     PAPER_ENTRY_SIZING_BUFFER_BP: float = Field(default=0.0, ge=0.0)
-
-    # 한글 요일 매핑
-    DAY_NAME_MAP: dict[int, str] = {
-        0: "월요일",
-        1: "화요일",
-        2: "수요일",
-        3: "목요일",
-        4: "금요일",
-        5: "토요일",
-        6: "일요일",
-    }

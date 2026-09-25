@@ -19,6 +19,8 @@ from src.config.market_session import INTRADAY_SESSION_KRX_AFTERMARKET, INTRADAY
 from src.daily import archive
 from src.data.intraday_store import intraday_partition_path, write_intraday_partition
 
+from src.utils.cli_logging import configure_cli_logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -220,7 +222,7 @@ def run_minute_history_backfill(lookback_days: int = 365, bar_interval_minutes: 
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     logger.info("1회성 분봉 히스토리 백필 시작 (다수 날짜 x 종목 조합으로 오래 걸릴 수 있음, store=%s)", settings.HISTORY_DIR)
     result = run_minute_history_backfill()
     logger.info(

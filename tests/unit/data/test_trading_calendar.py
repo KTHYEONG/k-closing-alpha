@@ -173,3 +173,74 @@ def test_is_kis_trading_day_sync_propagates_oracle_failure(monkeypatch) -> None:
     trading_calendar = _sync_harness(monkeypatch, _boom)
     with pytest.raises(RuntimeError, match="oracle failed"):
         trading_calendar.is_kis_trading_day_sync("2026-09-10")
+
+
+def test_classify_day_weekend_short_circuits_oracle() -> None:
+    from src.data import trading_calendar
+
+    def _boom(snapshot_date: str) -> bool:
+        raise AssertionError("oracle must not be consulted on weekends")
+
+    assert trading_calendar.classify_day("2026-09-12", _boom) == trading_calendar.DAY_WEEKEND
+
+
+def test_classify_day_oracle_verdicts_map_to_holiday_and_trading() -> None:
+    from src.data import trading_calendar
+
+    assert trading_calendar.classify_day("2026-09-24", lambda _d: False) == trading_calendar.DAY_HOLIDAY
+    assert trading_calendar.classify_day("2026-09-14", lambda _d: True) == trading_calendar.DAY_TRADING
+
+
+def test_classify_day_lookup_failure_degrades_to_unknown(caplog) -> None:
+    import logging
+
+    import aiohttp
+
+    from src.data import trading_calendar
+
+    for exc in (RuntimeError("boom"), OSError("down"), aiohttp.ClientError("reset")):
+        def _raise(_d: str, _exc: BaseException = exc) -> bool:
+            raise _exc
+
+        with caplog.at_level(logging.WARNING):
+            assert trading_calendar.classify_day("2026-09-14", _raise) == trading_calendar.DAY_UNKNOWN
+    assert "calendar_lookup=FAIL" in caplog.text
+
+
+def test_classify_day_default_oracle_is_shared_sync_helper(monkeypatch) -> None:
+    from src.data import trading_calendar
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        trading_calendar,
+        "is_kis_trading_day_sync",
+        lambda snapshot_date: calls.append(snapshot_date) or True,
+    )
+
+    assert trading_calendar.classify_day("2026-09-14") == trading_calendar.DAY_TRADING
+    assert calls == ["2026-09-14"]
+
+
+def test_daily_audit_reexports_calendar_classifier() -> None:
+    from src.data import trading_calendar
+    from src.tools import daily_audit
+
+    assert daily_audit.classify_day is trading_calendar.classify_day
+    assert daily_audit.DAY_WEEKEND is trading_calendar.DAY_WEEKEND
+    assert daily_audit.DAY_HOLIDAY is trading_calendar.DAY_HOLIDAY
+    assert daily_audit.DAY_TRADING is trading_calendar.DAY_TRADING
+    assert daily_audit.DAY_UNKNOWN is trading_calendar.DAY_UNKNOWN
+
+
+def test_predict_no_longer_imports_audit_tool() -> None:
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("src/daily/predict.py").read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+    assert "src.tools.daily_audit" not in imported

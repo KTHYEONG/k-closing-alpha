@@ -28,6 +28,7 @@ from src.data.capture_contracts import (
     build_cohort,
 )
 from src.data.capture_store import CaptureStore
+from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
 from src.data.session_calendar import SessionKind, resolve_session_day, trading_session_gate
 from src.utils.display import Colors
@@ -39,6 +40,8 @@ from src.daily.universe_screen import build_screen_frame
 from src.daily.security_classification import load_security_classification
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, PRICE_ANOMALY_COL, QUOTE_FAILED_COL
 from src.strategy.contract import COST_AWARE_UNIVERSE, UniverseSpec, select_universe
+
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +77,6 @@ async def _validate_trading_day(client, session, snapshot_date: str, *, force: b
     if not await is_kis_trading_day(client, session, snapshot_date):
         raise NonTradingDayError(f"non-trading day: {snapshot_date}")
 
-TARGET_CONDITION_NAME = settings.TARGET_CONDITION_NAME
 
 logger.debug("일일 수집 시작...")
 
@@ -183,13 +185,6 @@ REALTIME_MIN_QUOTE_COVERAGE: float = 0.99
 QUOTE_UNRESOLVED_API: str = "현재가_미해석"
 
 _DECISION_ELIGIBILITY_RULE_VERSION: str = "price_history_panel@v1"
-
-
-def _capture_root() -> Path:
-    root = settings.COLLECTION_ROOT
-    if root is not None:
-        return Path(root)
-    return Path(settings.HISTORY_DIR) / "capture"
 
 
 def _validate_capture_context(
@@ -991,53 +986,48 @@ async def main(force: bool = False):
         kosdaq_rate = parse_market_index_rate(res_kosdaq)
 
         # 3. 후보 종목 리스트 확보 (자동 비용축 스캔 단일 경로, Toss 폴백 포함)
-        raw_enabled = bool(settings.COLLECTION_RAW_ENABLED)
-        store = CaptureStore(_capture_root()) if raw_enabled else None
-        run_id = f"decision-{snapshot_date}-{uuid.uuid4().hex[:8]}" if raw_enabled else None
+        store = CaptureStore(_capture_root())
+        run_id = f"decision-{snapshot_date}-{uuid.uuid4().hex[:8]}"
         trading_day = date.fromisoformat(snapshot_date)
-        scan_observer = None
-        if store is not None and run_id is not None:
-            def scan_observer(
-                payload: Any,
-                metadata: Mapping[str, str],
-                started: datetime,
-                received: datetime,
-                page_index: int,
-                attempt: int,
-            ) -> None:
-                assert store is not None
-                assert run_id is not None
-                meta = dict(metadata) if isinstance(metadata, Mapping) else {}
-                vendor = str(meta.get("vendor") or "scan").strip() or "scan"
-                endpoint = str(meta.get("endpoint") or meta.get("scope") or "scan").strip() or "scan"
-                _append_with_unique_attempt(
-                    store,
-                    CapturedResponse(
-                        context=CaptureContext(
-                            trading_date=trading_day,
-                            run_id=run_id,
-                            dataset=CaptureDataset.SCAN,
-                            vendor=vendor,
-                            endpoint=endpoint,
-                            symbol=None,
-                            venue="UNKNOWN",
-                            session="regular",
-                            capture_reason="decision-input",
-                            cohort_id=None,
-                            scheduled_at=None,
-                        ),
-                        request_started_at=started,
-                        received_at=received,
-                        payload=dict(payload) if isinstance(payload, dict) else None,
-                        status=CaptureStatus.COMPLETE if isinstance(payload, dict) else CaptureStatus.FAILED,
-                        source_timestamp=None,
-                        source_published_at=None,
-                        page_index=int(page_index),
-                        attempt_index=int(attempt),
-                        continuation={str(k): str(v) for k, v in meta.items()},
-                        error_type=None if isinstance(payload, dict) else "vendor_failure",
+        def scan_observer(
+            payload: Any,
+            metadata: Mapping[str, str],
+            started: datetime,
+            received: datetime,
+            page_index: int,
+            attempt: int,
+        ) -> None:
+            meta = dict(metadata) if isinstance(metadata, Mapping) else {}
+            vendor = str(meta.get("vendor") or "scan").strip() or "scan"
+            endpoint = str(meta.get("endpoint") or meta.get("scope") or "scan").strip() or "scan"
+            _append_with_unique_attempt(
+                store,
+                CapturedResponse(
+                    context=CaptureContext(
+                        trading_date=trading_day,
+                        run_id=run_id,
+                        dataset=CaptureDataset.SCAN,
+                        vendor=vendor,
+                        endpoint=endpoint,
+                        symbol=None,
+                        venue="UNKNOWN",
+                        session="regular",
+                        capture_reason="decision-input",
+                        cohort_id=None,
+                        scheduled_at=None,
                     ),
-                )
+                    request_started_at=started,
+                    received_at=received,
+                    payload=dict(payload) if isinstance(payload, dict) else None,
+                    status=CaptureStatus.COMPLETE if isinstance(payload, dict) else CaptureStatus.FAILED,
+                    source_timestamp=None,
+                    source_published_at=None,
+                    page_index=int(page_index),
+                    attempt_index=int(attempt),
+                    continuation={str(k): str(v) for k, v in meta.items()},
+                    error_type=None if isinstance(payload, dict) else "vendor_failure",
+                ),
+            )
 
         stock_list = await resolve_daily_candidates(client, session, kiwoom_client=kiwoom_client, toss_client=toss_client, on_page=scan_observer)
         if not stock_list:
@@ -1045,17 +1035,15 @@ async def main(force: bool = False):
             return
         scanned_codes = [str(row["code"]) for row in stock_list]
         eligible_codes = await resolve_eligible_codes(client, session, pd.Timestamp(snapshot_date))
-        cohort = None
-        if store is not None and run_id is not None:
-            eligible_in_scan = [c for c in scanned_codes if c in eligible_codes]
-            rejections = {c: "not_listed_in_panel" for c in scanned_codes if c not in eligible_codes}
-            cohort = build_cohort(
-                trading_day,
-                scanned_codes,
-                eligible_in_scan,
-                rejections,
-                eligibility_rule_version=_DECISION_ELIGIBILITY_RULE_VERSION,
-            )
+        eligible_in_scan = [c for c in scanned_codes if c in eligible_codes]
+        rejections = {c: "not_listed_in_panel" for c in scanned_codes if c not in eligible_codes}
+        cohort = build_cohort(
+            trading_day,
+            scanned_codes,
+            eligible_in_scan,
+            rejections,
+            eligibility_rule_version=_DECISION_ELIGIBILITY_RULE_VERSION,
+        )
         stock_list = filter_eligible_candidates(stock_list, eligible_codes)
 
         logger.info(
@@ -1117,42 +1105,32 @@ async def main(force: bool = False):
         df[PRICE_ANOMALY_COL] = flag_price_anomaly(df).to_numpy()
         enrichment_completed_at = datetime.now(ZoneInfo("Asia/Seoul"))
         df["feature_available_timestamp"] = enrichment_completed_at
-        if store is not None and cohort is not None and run_id is not None:
-            report, status, reason = evaluate_realtime_coverage(df)
-            entries = (
-                CoverageEntry(
-                    symbol=None,
-                    dataset=CaptureDataset.PRICE,
-                    venue="KRX",
-                    session="regular",
-                    scheduled_at=None,
-                    status=status,
-                    rows=len(df),
-                    first_event_time=None,
-                    last_event_time=None,
-                    reason="decision-input" if status is CaptureStatus.COMPLETE else reason,
-                    raw_refs=(),
-                ),
-            )
-            store.publish_decision(df, cohort=cohort, run_id=run_id, completed_at=enrichment_completed_at, entries=entries)
-            logger.info(
-                "[DATA] stage=realtime_coverage n_raw=%d n_degraded=%d coverage=%.4f status=%s",
-                report["n_raw"],
-                report["n_degraded"],
-                report["coverage"],
-                status.value,
-            )
-            if status is CaptureStatus.PARTIAL:
-                raise ValueError(reason)
-            coverage_report = report
-        else:
-            coverage_report = check_realtime_collection_coverage(df)
-            logger.info(
-                "[DATA] stage=realtime_coverage n_raw=%d n_degraded=%d coverage=%.4f",
-                coverage_report["n_raw"],
-                coverage_report["n_degraded"],
-                coverage_report["coverage"],
-            )
+        report, status, reason = evaluate_realtime_coverage(df)
+        entries = (
+            CoverageEntry(
+                symbol=None,
+                dataset=CaptureDataset.PRICE,
+                venue="KRX",
+                session="regular",
+                scheduled_at=None,
+                status=status,
+                rows=len(df),
+                first_event_time=None,
+                last_event_time=None,
+                reason="decision-input" if status is CaptureStatus.COMPLETE else reason,
+                raw_refs=(),
+            ),
+        )
+        store.publish_decision(df, cohort=cohort, run_id=run_id, completed_at=enrichment_completed_at, entries=entries)
+        logger.info(
+            "[DATA] stage=realtime_coverage n_raw=%d n_degraded=%d coverage=%.4f status=%s",
+            report["n_raw"],
+            report["n_degraded"],
+            report["coverage"],
+            status.value,
+        )
+        if status is CaptureStatus.PARTIAL:
+            raise ValueError(reason)
 
         stored_rows = persist_daily_snapshot(df, snapshot_date)
 
@@ -1172,8 +1150,8 @@ async def main(force: bool = False):
         logger.info(f"{Colors.BOLD}{box_top}{Colors.RESET}")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     asyncio.run(main(force="--force" in sys.argv))  # pragma: no cover

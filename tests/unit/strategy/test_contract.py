@@ -27,6 +27,7 @@ def test_round_trip_cost_bp_reproduces_measured_u0_level() -> None:
     import pandas as pd
 
     from src.strategy.contract import AA_COST, PA_COST, round_trip_cost_bp
+    from src.execution.cost_model import BROKERAGE_FEE_BP
 
     price = np.array([10000.0, 1500.0, 30000.0], dtype=np.float64)
     trade_date = pd.to_datetime(["2026-06-01"] * 3).to_numpy()
@@ -37,8 +38,22 @@ def test_round_trip_cost_bp_reproduces_measured_u0_level() -> None:
     pa = round_trip_cost_bp(price, trade_date, market, PA_COST)
 
     # Then: tick ladder is 10 / 1 / 50 for these prices
-    np.testing.assert_allclose(aa, [20.0 + 20.0, 20.0 + 2.0 * 1.0 / 1500.0 * 1e4, 20.0 + 2.0 * 50.0 / 30000.0 * 1e4])
-    np.testing.assert_allclose(pa, [20.0 + 10.0, 20.0 + 1.0 * 1.0 / 1500.0 * 1e4, 20.0 + 1.0 * 50.0 / 30000.0 * 1e4])
+    np.testing.assert_allclose(
+        aa,
+        [
+            20.0 + 20.0 + BROKERAGE_FEE_BP,
+            20.0 + 2.0 * 1.0 / 1500.0 * 1e4 + BROKERAGE_FEE_BP,
+            20.0 + 2.0 * 50.0 / 30000.0 * 1e4 + BROKERAGE_FEE_BP,
+        ],
+    )
+    np.testing.assert_allclose(
+        pa,
+        [
+            20.0 + 10.0 + BROKERAGE_FEE_BP,
+            20.0 + 1.0 * 1.0 / 1500.0 * 1e4 + BROKERAGE_FEE_BP,
+            20.0 + 1.0 * 50.0 / 30000.0 * 1e4 + BROKERAGE_FEE_BP,
+        ],
+    )
     assert np.all(aa > pa)
 
 
@@ -476,6 +491,7 @@ def test_round_trip_cost_bp_is_point_in_time_across_the_reform() -> None:
     import pandas as pd
     import pytest
 
+    from src.execution.cost_model import BROKERAGE_FEE_BP
     from src.strategy.contract import AA_COST, round_trip_cost_bp
 
     # Given: 15,000원 either side of the 2023-01-25 tick reform, plus bad inputs
@@ -489,9 +505,9 @@ def test_round_trip_cost_bp_is_point_in_time_across_the_reform() -> None:
     out = round_trip_cost_bp(price, trade_date, market, AA_COST)
 
     # Then: pre-reform is 30bp statutory + 2 ticks of 50원 on 15,000원
-    assert out[0] == pytest.approx(30.0 + 2.0 * 50.0 / 15000.0 * 1e4)
+    assert out[0] == pytest.approx(30.0 + 2.0 * 50.0 / 15000.0 * 1e4 + BROKERAGE_FEE_BP)
     # And: post-reform is 20bp statutory + 2 ticks of 10원
-    assert out[1] == pytest.approx(20.0 + 2.0 * 10.0 / 15000.0 * 1e4)
+    assert out[1] == pytest.approx(20.0 + 2.0 * 10.0 / 15000.0 * 1e4 + BROKERAGE_FEE_BP)
     # And: a zero price and a NaT date fail closed to NaN, never to a default cost
     assert np.isnan(out[2])
     assert np.isnan(out[3])
@@ -648,3 +664,21 @@ def test_select_universe_screenable_row_matches_toggle_off() -> None:
     )
     spec_on = dataclasses.replace(DEFAULT_UNIVERSE, exclude_non_screenable_class=True)
     assert select_universe(df, spec_on).tolist() == select_universe(df, DEFAULT_UNIVERSE).tolist()
+
+
+def test_strategy_specs_derive_top_k_from_min_top_k() -> None:
+    from src.strategy.contract import (
+        KCA_TOP3_SHADOW_001,
+        KCA_TOPK_CAPFREE_001,
+        KCA_TOPK_COSTAWARE_001,
+        MIN_TOP_K,
+    )
+
+    # Given: the exported StrategySpec constants
+    # When: inspected
+    # Then: every .top_k == MIN_TOP_K == 3 and fingerprint equals its pre-change value
+    assert MIN_TOP_K == 3
+    assert KCA_TOP3_SHADOW_001.top_k == MIN_TOP_K
+    assert KCA_TOPK_COSTAWARE_001.top_k == MIN_TOP_K
+    assert KCA_TOPK_CAPFREE_001.top_k == MIN_TOP_K
+    assert KCA_TOPK_COSTAWARE_001.fingerprint() == "5946152fe2df5d60b570635191fb4957595f7d06196134797b6f82d47c42cdb9"

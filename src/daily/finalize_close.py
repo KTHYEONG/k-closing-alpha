@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from src import settings
+from src import settings as settings  # noqa: F401 - test seam: tests patch finalize_close.settings
 from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.config.market_session import (
     CLOSING_AUCTION_CONFIRM_EARLIEST_HHMMSS,
@@ -34,6 +34,7 @@ from src.data.capture_store import CaptureStore
 from src.data.session_calendar import SessionKind, resolve_session_day, trading_session_gate
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, record_run_outcome
+from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -412,17 +413,16 @@ async def _amain(args) -> int:
         capture_store = None
         run_id = None
         cohort_id = None
-        if bool(settings.COLLECTION_RAW_ENABLED):
-            try:
-                from src.data.capture_store import CaptureStore as _Store
+        try:
+            from src.data.capture_store import CaptureStore as _Store
+            from src.data.capture_store import resolve_capture_root
 
-                root = settings.COLLECTION_ROOT
-                _root = root if root is not None else settings.HISTORY_DIR / "capture"
-                _store = _Store(_root)
-                _cohort = _store.read_cohort(snap, available_by=datetime.now(ZoneInfo("Asia/Seoul")))
-                capture_store, run_id, cohort_id = _store, f"close-{snap}", _cohort.cohort_id
-            except (FileNotFoundError, ValueError, OSError):
-                capture_store, run_id, cohort_id = None, None, None
+            _root = resolve_capture_root()
+            _store = _Store(_root)
+            _cohort = _store.read_cohort(snap, available_by=datetime.now(ZoneInfo("Asia/Seoul")))
+            capture_store, run_id, cohort_id = _store, f"close-{snap}", _cohort.cohort_id
+        except (FileNotFoundError, ValueError, OSError):
+            capture_store, run_id, cohort_id = None, None, None
         n = await run_close_finalization(
             snapshot_date=snap,
             client=owned_client,
@@ -446,7 +446,7 @@ def main() -> None:  # pragma: no cover - CLI entry; logic covered via run_close
     parser.add_argument("--date", default=None)
     parser.add_argument("--retry-interval", type=float, default=30.0)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    configure_cli_logging(CLI_LOG_FORMAT_TIMESTAMPED)
     asyncio.run(_amain(args))
 
 

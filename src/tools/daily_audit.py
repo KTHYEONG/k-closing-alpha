@@ -14,11 +14,11 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-import aiohttp
 import pandas as pd
 
 from src import settings
 from src.api.kis.key_pool import load_kis_env, read_token_issued_date, resolve_host_issued_credentials, token_cache_path
+from src.config.base import TOPK_DECISIONS_PARQUET_NAME
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
     DECISION_WINDOW_END_HHMMSS,
@@ -37,7 +37,7 @@ from src.config.market_session import (
 )
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.archive_intraday import resolve_previous_archive_date
-from src.daily.auction_capture import _close_rounds, _program_rounds
+from src.daily.auction_capture import close_rounds, program_rounds
 from src.data.altdata_health import AltdataVerdict, altdata_verdict
 from src.data.capture_contracts import (
     SEOUL,
@@ -47,15 +47,28 @@ from src.data.capture_contracts import (
     CoverageEntry,
     SessionClock,
 )
-from src.data.capture_store import CaptureStore
-from src.data.intraday_store import _capture_root, intraday_partition_path, tick_partition_path
+from src.data.capture_store import (
+    CaptureStore,
+    resolve_capture_root,
+)
+from src.data.capture_store import (
+    resolve_capture_root as _capture_root,
+)
+from src.data.intraday_store import intraday_partition_path, tick_partition_path
 from src.data.session_calendar import SessionKind, resolve_session_day
-from src.data.trading_calendar import is_kis_trading_day_sync
+from src.data.trading_calendar import (
+    DAY_HOLIDAY,
+    DAY_TRADING,
+    DAY_UNKNOWN,
+    DAY_WEEKEND,
+    classify_day,
+)
 from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import dispatch_digest, drain_alert_outbox
 from src.tools.offsite_backup import REPORT_RELPATH, backup_staleness_issues
 from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +125,6 @@ def _extract_intraday_summary(snapshot_date: str) -> tuple[str, str]:
         logger.debug("[SYS] stage=daily_audit extract_intraday failed: %s", exc)
     return bars_str, ticks_str
 
-DAY_WEEKEND: str = "weekend"
-DAY_HOLIDAY: str = "holiday"
-DAY_TRADING: str = "trading"
-# 달력 조회 장애: 휴장일로 단정하지 않고 감사를 수행한다(장애 조기 발견 우선)
-DAY_UNKNOWN: str = "unknown"
 _CHART_DATASETS: tuple[CaptureDataset, CaptureDataset] = (CaptureDataset.MINUTE_BARS, CaptureDataset.TRADE_TICKS)
 _TERMINAL_REASONS: frozenset[str] = frozenset({"exhausted", "crossed_target_date"})
 _SLOW_DATA_DUE_HHMMSS: str = "213500"
@@ -185,7 +193,7 @@ def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
         and CLOSE_CONFIRMED_COL in frame.columns
         and bool(frame[CLOSE_CONFIRMED_COL].fillna(False).astype(bool).any())
     )
-    topk_dates = _column_dates(Path(settings.PARQUET_DIR) / "topk_decisions.parquet", "decision_date")
+    topk_dates = _column_dates(Path(settings.PARQUET_DIR) / TOPK_DECISIONS_PARQUET_NAME, "decision_date")
     no_decision_dates = _column_dates(Path(settings.PAPER_DIR) / "decisions.parquet", "decision_date")
     entry_dates = _entry_fill_dates(Path(settings.PAPER_DIR) / "fills.parquet")
     outcomes = load_run_outcomes(snapshot_date)
@@ -206,30 +214,6 @@ def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
         "minute_bars": bool(intraday_partition_path(1, snapshot_date, "regular").exists()),
         "price_history_fresh": _price_history_fresh(snapshot_date),
     }
-
-
-def classify_day(snapshot_date: str, trading_day_fn: Callable[[str], bool] | None = None) -> str:
-    """점검 대상일을 주말/휴장일/거래일/미상 중 하나로 분류한다.
-
-    KIS 지수 일별시세는 당일 게시되므로 휴장일 판정에 쓴다(KRX 공식 지수는 1일 이상
-    지연 게시되어 당일 휴장일 판정에 쓸 수 없다). 조회 장애는 미상으로 낮춰 감사를
-    막지 않는다.
-
-    Args:
-        snapshot_date: 점검 대상일(YYYY-MM-DD).
-        trading_day_fn: 거래일 오라클. None이면 KIS 실조회를 사용한다.
-
-    Returns:
-        DAY_WEEKEND, DAY_HOLIDAY, DAY_TRADING, DAY_UNKNOWN 중 하나.
-    """
-    if pd.Timestamp(snapshot_date).weekday() >= 5:
-        return DAY_WEEKEND
-    oracle = trading_day_fn if trading_day_fn is not None else is_kis_trading_day_sync
-    try:
-        return DAY_TRADING if oracle(snapshot_date) else DAY_HOLIDAY
-    except (RuntimeError, OSError, aiohttp.ClientError) as exc:
-        logger.warning("[DATA] stage=daily_audit calendar_lookup=FAIL reason=%s", type(exc).__name__)
-        return DAY_UNKNOWN
 
 
 def list_failed_kca_units(run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> list[str]:
@@ -356,8 +340,8 @@ def _audit_auction_sweeps(
 ) -> list[str]:
     issues: list[str] = []
     if audit_at >= session_clock.close_at:
-        rounds = _close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS))
-        program_rounds = _program_rounds(session_clock)
+        rounds = close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS))
+        prog_rounds = program_rounds(session_clock)
         actual: set[tuple[str, str, datetime]] = set()
         incomplete = 0
         for manifest in manifests:
@@ -373,7 +357,7 @@ def _audit_auction_sweeps(
             for slot in rounds:
                 if (symbol, CaptureDataset.ORDERBOOK.value, slot) not in actual:
                     missing += 1
-            for slot in program_rounds:
+            for slot in prog_rounds:
                 if (symbol, CaptureDataset.PROGRAM.value, slot) not in actual:
                     missing += 1
         if missing:
@@ -449,8 +433,6 @@ def audit_collection_manifests(
         )
     if audit_at.tzinfo is None or audit_at.utcoffset() is None:
         raise ValueError("audit_at must be timezone-aware")
-    if not profile.COLLECTION_RAW_ENABLED:
-        return (_collection_issue("provenance", 0, "raw_disabled"),)
     try:
         manifests = store.read_manifests(trading_date.isoformat())
     except (OSError, ValueError):
@@ -496,12 +478,6 @@ def audit_collection_manifests(
     else:
         issues.append(_collection_issue("slow_data", 0, "disabled"))
     return tuple(issues)
-
-
-def _collection_capture_root(profile: CollectionSettings) -> Path:
-    if profile.COLLECTION_ROOT is not None:
-        return Path(profile.COLLECTION_ROOT)
-    return Path(settings.HISTORY_DIR) / "capture"
 
 
 def _intraday_issue(session: str, count: int, reason: str) -> str:
@@ -857,7 +833,7 @@ def run_daily_audit(
     try:
         profile = CollectionSettings()
         session_clock = session_day.clock if session_day.clock is not None else SessionClock.standard(trading_date)
-        store = CaptureStore(_collection_capture_root(profile))
+        store = CaptureStore(resolve_capture_root(profile))
         collection_issues = audit_collection_manifests(
             trading_date, store=store, profile=profile, session_clock=session_clock, audit_at=audit_at
         )
@@ -915,5 +891,5 @@ def main() -> None:  # pragma: no cover - CLI entry; logic covered via run_daily
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_cli_logging()
     main()

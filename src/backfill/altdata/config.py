@@ -56,7 +56,6 @@ class AltDataFetchConfig:
         sources: 수집할 패널 이름 튜플.
         markets: 대상 시장 튜플.
         universe_symbols: 필터링할 종목 코드 집합.
-        pykrx_requests_per_sec: pykrx 호출 제한.
         dart_requests_per_sec: DART 호출 제한.
         retries: 재시도 횟수.
         retry_sleep_sec: 재시도 대기 시간.
@@ -74,7 +73,6 @@ class AltDataFetchConfig:
     sources: tuple[str, ...] = ("shorting", "derivatives_basis", "disclosure", "credit_balance", "program_trade_daily")
     markets: tuple[str, ...] = ("KOSPI", "KOSDAQ")
     universe_symbols: frozenset[str] | None = None
-    pykrx_requests_per_sec: float = 6.0
     dart_requests_per_sec: float = 8.0
     krx_requests_per_sec: float = 4.0
     retries: int = 4
@@ -113,8 +111,6 @@ class AltDataFetchConfig:
             if m not in allowed_markets:
                 raise ValueError(f"market '{m}' is not allowed")
         # Validate rates
-        if not (float(self.pykrx_requests_per_sec) > 0):
-            raise ValueError("pykrx_requests_per_sec must be > 0")
         if not (float(self.dart_requests_per_sec) > 0):
             raise ValueError("dart_requests_per_sec must be > 0")
         if not (float(self.krx_requests_per_sec) > 0):

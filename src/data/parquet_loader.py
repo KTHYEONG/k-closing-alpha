@@ -58,31 +58,6 @@ def _clean_df_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
     return df_clean
 
 
-def save_theme_to_parquet(df: pd.DataFrame) -> None:
-    """Save theme mapping DataFrame to parquet format.
-
-    Args:
-        df: Theme DataFrame containing 종목코드 and 테마 columns.
-    """
-    if df is None or df.empty:
-        logger.warning("Theme DataFrame is empty. Skipping parquet save.")
-        return
-
-    df_copy = _clean_df_for_parquet(df)
-    if "종목코드" in df_copy.columns:
-        df_copy["종목코드"] = (
-            df_copy["종목코드"]
-            .astype(str)
-            .str.strip()
-            .str.split(".")
-            .str[0]
-            .str.zfill(6)
-        )
-
-    _atomic_write_parquet(df_copy, settings.THEME_PARQUET_PATH)
-    logger.info("Saved theme mapping to parquet: %s (%d rows)", settings.THEME_PARQUET_PATH, len(df_copy))
-
-
 def load_theme_from_parquet() -> dict[str, str]:
     """Load theme mapping dictionary from parquet file.
 

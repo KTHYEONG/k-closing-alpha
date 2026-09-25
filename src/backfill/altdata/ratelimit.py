@@ -15,9 +15,6 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_PYKRX_LOCK = threading.Lock()
-_PYKRX_NEXT = 0.0
-
 _DART_LOCK = threading.Lock()
 _DART_NEXT = 0.0
 
@@ -39,22 +36,6 @@ class DartQuotaExhaustedError(DartNonRetryableError):
 
 class DartKeysUnusableError(DartNonRetryableError):
     """No DART key is usable and at least one was rejected for a non-quota reason (unregistered, unusable, or IP-blocked key); the message lists label=reason pairs only."""
-
-
-def wait_for_pykrx_slot(cfg: AltDataFetchConfig) -> None:
-    """pykrx 호출 간격을 제한합니다.
-
-    Args:
-        cfg: Alt-data 설정.
-    """
-    global _PYKRX_NEXT
-    interval = 1.0 / max(0.1, float(cfg.pykrx_requests_per_sec))
-    with _PYKRX_LOCK:
-        now = time.monotonic()
-        wait = max(0.0, _PYKRX_NEXT - now)
-        _PYKRX_NEXT = max(now, _PYKRX_NEXT) + interval
-    if wait > 0:
-        time.sleep(wait)
 
 
 def wait_for_dart_slot(cfg: AltDataFetchConfig) -> None:
