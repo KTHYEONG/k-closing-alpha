@@ -92,7 +92,9 @@ class FakeToss:
         if symbol in self.fail:
             return {"error": {"code": "invalid-request", "message": "toss fail"}}
         return {"result": {"records": [
-            {"date": "2026-09-10", "arbitrage": {"netBuyVolume": "5"}, "nonArbitrage": {"netBuyVolume": "6"}},
+            {"date": "2026-09-10",
+             "arbitrage": {"netBuyVolume": "5", "netBuyAmount": "5000000"},
+             "nonArbitrage": {"netBuyVolume": "6", "netBuyAmount": "6000000"}},
         ]}}
 
 
@@ -571,9 +573,9 @@ def test_parse_toss_program_rows_normalizes_and_raises() -> None:
     from src.daily.price_ingest import VendorResponseError, parse_toss_program_rows
 
     ok = parse_toss_program_rows({"result": {"records": [
-        {"date": "2026-09-10", "arbitrage": {"netBuyVolume": "3"}, "nonArbitrage": {"netBuyVolume": "4"}},
+        {"date": "2026-09-10", "arbitrage": {"netBuyVolume": "3", "netBuyAmount": "617000000"}, "nonArbitrage": {"netBuyVolume": "4", "netBuyAmount": "617000000"}},
     ]}})
-    assert ok.iloc[0]["program_netbuy"] == 7
+    assert ok.iloc[0]["program_netbuy"] == 1234.0
     assert ok.iloc[0]["date"] == pd.Timestamp("2026-09-10")
 
     empty = parse_toss_program_rows({"result": {"records": []}})
@@ -581,6 +583,11 @@ def test_parse_toss_program_rows_normalizes_and_raises() -> None:
 
     with pytest.raises(VendorResponseError, match="Toss program-trades"):
         parse_toss_program_rows({"error": {"code": "invalid-request", "message": "bad symbol"}})
+
+    with pytest.raises(VendorResponseError, match="amount field"):
+        parse_toss_program_rows({"result": {"records": [
+            {"date": "2026-09-10", "arbitrage": {"netBuyVolume": "3"}, "nonArbitrage": {"netBuyVolume": "4"}},
+        ]}})
 
 
 def test_fetch_symbol_flows_program_falls_back_to_toss_when_kis_fails() -> None:
@@ -1310,3 +1317,43 @@ def test_check_day_continuity_skips_stale_check_without_common_traded_symbols() 
     new = _day_rows("2026-09-10", [f"N{i:03d}" for i in range(100)])
 
     check_day_continuity(new, prior)
+
+
+def test_parse_toss_program_fallback_never_mixes_units() -> None:
+    import pytest
+
+    from src.daily.price_ingest import VendorResponseError, parse_toss_program_rows
+
+    with pytest.raises(VendorResponseError, match="amount field"):
+        parse_toss_program_rows({"result": {"records": [
+            {"date": "2026-09-10", "arbitrage": {"netBuyVolume": "1"}, "nonArbitrage": {"netBuyVolume": "2"}},
+        ]}})
+
+
+def test_parse_toss_program_fallback_scaled_to_krw_millions() -> None:
+    from src.daily.price_ingest import parse_toss_program_rows
+
+    out = parse_toss_program_rows({"result": {"records": [
+        {"date": "2026-09-10", "arbitrage": {"netBuyAmount": "617000000"}, "nonArbitrage": {"netBuyAmount": "617000000"}},
+    ]}})
+    assert out.iloc[0]["program_netbuy"] == 1234.0
+
+
+def test_parse_toss_program_skips_dateless_and_rejects_bad_legs() -> None:
+    import pytest
+
+    from src.daily.price_ingest import VendorResponseError, _toss_leg_amount, parse_toss_program_rows
+
+    assert _toss_leg_amount(None) is None
+    assert _toss_leg_amount({"netBuyAmount": "not-a-number"}) is None
+    assert _toss_leg_amount({"netBuyAmount": "1,234,000"}) == 1234000.0
+    out = parse_toss_program_rows({"result": {"records": [{"arbitrage": {"netBuyAmount": "1"}}]}})
+    assert out.empty
+    with pytest.raises(VendorResponseError, match="amount field"):
+        parse_toss_program_rows({"result": {"records": [
+            {"date": "2026-09-10", "arbitrage": None, "nonArbitrage": {"netBuyAmount": "1"}},
+        ]}})
+    with pytest.raises(VendorResponseError, match="amount field"):
+        parse_toss_program_rows({"result": {"records": [
+            {"date": "2026-09-10", "arbitrage": {"netBuyAmount": "bad"}, "nonArbitrage": {"netBuyAmount": "1"}},
+        ]}})

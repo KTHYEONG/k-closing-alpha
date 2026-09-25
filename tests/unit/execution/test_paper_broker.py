@@ -102,12 +102,14 @@ def test_paper_ledger_records_and_rejects_unknown_kind(tmp_path) -> None:
     assert n == 1
     assert (tmp_path / "fills.parquet").exists()
 
-    # And: 같은 order_id 재기록은 중복되지 않는다
-    ledger.record(
-        [{"order_id": "o1", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000}],
-        kind="fills",
-    )
-    assert len(pd.read_parquet(tmp_path / "fills.parquet")) == 1
+    # And: 같은 order_id 재기록은 append-only 계약 위반으로 거부되고 파일은 그대로다
+    before = (tmp_path / "fills.parquet").read_bytes()
+    with pytest.raises(ValueError, match="already stored"):
+        ledger.record(
+            [{"order_id": "o1", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000}],
+            kind="fills",
+        )
+    assert (tmp_path / "fills.parquet").read_bytes() == before
 
     # And: 알 수 없는 kind는 fail-closed
     with pytest.raises(ValueError, match="kind"):
@@ -231,7 +233,7 @@ def test_order_record_carries_terminal_status_and_rejects_unknown() -> None:
     assert row["reason"] == "entry"
     assert row["status"] == "FILLED"
     assert pd.Timestamp(row["recorded_at"]).tzinfo is not None
-    assert set(ORDER_STATUSES) == {"FILLED", "UNCONFIRMED", "NO_SNAPSHOT_ROW", "ZERO_QTY", "UNFILLED"}
+    assert set(ORDER_STATUSES) == {"FILLED", "UNCONFIRMED", "NO_SNAPSHOT_ROW", "ZERO_QTY", "UNFILLED", "MISSED_AUCTION", "INSUFFICIENT_CASH"}
 
     # And: 미정의 상태는 거부
     with pytest.raises(ValueError, match="status"):
@@ -401,7 +403,7 @@ def test_refresh_trade_ledgers_writes_trades_and_nav_idempotently(tmp_path) -> N
     import pandas as pd
     import pytest
 
-    from src.execution.paper_broker import PaperLedger, refresh_trade_ledgers
+    from src.execution.paper_broker import ROUND_TRIP_COLUMNS, PaperLedger, refresh_trade_ledgers
 
     kst = "Asia/Seoul"
     buy = {"order_id": "2026-09-10:005930:entry", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
@@ -432,13 +434,15 @@ def test_refresh_trade_ledgers_writes_trades_and_nav_idempotently(tmp_path) -> N
     assert int(nav.iloc[0]["nav"]) == 10_034_477
     assert ledger.load("trades")["exit_order_id"].tolist() == ["2026-09-10:005930:entry:exit:2026-09-11"]
 
-    # And: 미청산만 있으면 trades 파일은 만들지 않고 NAV만 기록
+    # And: 미청산만 있으면 빈 trades 프레임(스키마 유지)을 쓰고 NAV만 기록
     solo_root = tmp_path / "solo"
     solo_root.mkdir()
     solo = PaperLedger(root=solo_root)
     solo.record([buy], kind="fills")
     assert refresh_trade_ledgers(solo, seed_capital=10_000_000, as_of_date="2026-09-10") == 0
-    assert not (solo_root / "trades.parquet").exists()
+    solo_trades = pd.read_parquet(solo_root / "trades.parquet")
+    assert solo_trades.empty
+    assert list(solo_trades.columns) == list(ROUND_TRIP_COLUMNS)
     solo_nav = pd.read_parquet(solo_root / "nav.parquet")
     assert int(solo_nav.iloc[0]["n_open_positions"]) == 1
     assert int(solo_nav.iloc[0]["cash"]) == 10_000_000 - 700_025
@@ -591,3 +595,370 @@ def test_build_open_auction_fill_rejects_observation_before_auction() -> None:
     # When / Then
     with pytest.raises(ValueError, match="lookahead"):
         build_open_auction_fill(order, 71_000, pd.Timestamp("2026-09-11 08:59:59", tz="Asia/Seoul"))
+
+
+def _seed_round_trip(ledger) -> tuple[dict, dict]:
+    import pandas as pd
+
+    kst = "Asia/Seoul"
+    buy = {"order_id": "2026-09-10:005930:entry", "symbol": "005930", "side": "buy", "qty": 10,
+           "fill_price": 70_000, "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst),
+           "decision_date": "2026-09-10", "trigger": "auction_close", "entry_order_id": None}
+    sell = {"order_id": "2026-09-10:005930:entry:exit:2026-09-11", "symbol": "005930", "side": "sell", "qty": 10,
+            "fill_price": 73_600, "filled_at": pd.Timestamp("2026-09-11 09:00:00", tz=kst),
+            "decision_date": "2026-09-11", "trigger": "auction_open",
+            "entry_order_id": "2026-09-10:005930:entry"}
+    ledger.record([buy, sell], kind="fills")
+    return buy, sell
+
+
+def test_record_rejects_in_batch_duplicate_fill(tmp_path) -> None:
+    import pytest
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+
+    # When: 한 호출 안에 같은 order_id 두 행
+    with pytest.raises(ValueError, match="duplicate"):
+        ledger.record(
+            [
+                {"order_id": "x1", "symbol": "005930", "side": "buy", "qty": 1, "fill_price": 100},
+                {"order_id": "x1", "symbol": "005930", "side": "buy", "qty": 1, "fill_price": 100},
+            ],
+            kind="fills",
+        )
+
+    # Then: 아무것도 쓰지 않는다
+    assert not (tmp_path / "fills.parquet").exists()
+
+
+def test_record_keeps_order_status_update_semantics(tmp_path) -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+
+    # Given: UNFILLED 주문 행
+    ledger.record([{"order_id": "o9", "symbol": "005930", "side": "buy", "qty": 5, "status": "UNFILLED"}], kind="orders")
+
+    # When: 같은 order_id가 FILLED로 갱신
+    ledger.record([{"order_id": "o9", "symbol": "005930", "side": "buy", "qty": 5, "status": "FILLED"}], kind="orders")
+
+    # Then: 한 행으로 합쳐지고 상태는 FILLED
+    df = pd.read_parquet(tmp_path / "orders.parquet")
+    assert len(df) == 1
+    assert df.iloc[0]["status"] == "FILLED"
+
+
+def test_void_fill_reopens_lot_and_restates_nav(tmp_path) -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import PaperLedger, refresh_trade_ledgers
+
+    ledger = PaperLedger(root=tmp_path)
+    buy, sell = _seed_round_trip(ledger)
+    refresh_trade_ledgers(ledger, seed_capital=10_000_000, as_of_date="2026-09-11")
+    assert len(ledger.load_open_positions()) == 0
+
+    # When: 매도 체결을 void하고 파생 원장을 갱신
+    row = ledger.void_fill(
+        sell["order_id"], reason="holiday_phantom_exit", evidence="oracle says holiday",
+        operator="tester", as_of_date="2026-09-11",
+    )
+    assert row["correction_id"] == f"2026-09-11:VOID_FILL:{sell['order_id']}"
+    refresh_trade_ledgers(ledger, seed_capital=10_000_000, as_of_date="2026-09-11")
+
+    # Then: 로트가 다시 열리고, trades에서 매도 행이 사라지고, NAV 현금은 매수 지출만 반영
+    open_pos = ledger.load_open_positions()
+    assert open_pos["entry_order_id"].tolist() == [buy["order_id"]]
+    trades = pd.read_parquet(tmp_path / "trades.parquet")
+    assert trades.empty
+    nav = pd.read_parquet(tmp_path / "nav.parquet").set_index("as_of_date")
+    assert int(nav.loc["2026-09-11", "cash"]) == 10_000_000 - 700_025
+    assert int(nav.loc["2026-09-11", "n_open_positions"]) == 1
+    # And: 원시 fills에는 매도 행이 그대로 남는다(증거 보존)
+    raw = pd.read_parquet(tmp_path / "fills.parquet")
+    assert sell["order_id"] in set(raw["order_id"].astype(str).tolist())
+
+
+def test_void_fill_rejects_entry_while_sell_effective(tmp_path) -> None:
+    import pytest
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    buy, sell = _seed_round_trip(ledger)
+
+    # When / Then: 매도가 유효한 동안 진입 void는 거부
+    with pytest.raises(ValueError, match="still referenced"):
+        ledger.void_fill(
+            buy["order_id"], reason="r", evidence="e", operator="tester", as_of_date="2026-09-11",
+        )
+
+    # And: 매도를 먼저 void하면 진입 void가 성공하고 로트는 사라진다
+    ledger.void_fill(
+        sell["order_id"], reason="r", evidence="e", operator="tester", as_of_date="2026-09-11",
+    )
+    ledger.void_fill(
+        buy["order_id"], reason="r", evidence="e", operator="tester", as_of_date="2026-09-11",
+    )
+    assert ledger.load_effective_fills().empty
+    assert len(ledger.load_open_positions()) == 0
+
+
+def test_void_fill_rejects_double_void_and_unknown(tmp_path) -> None:
+    import pytest
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    _, sell = _seed_round_trip(ledger)
+    ledger.void_fill(
+        sell["order_id"], reason="r", evidence="e", operator="tester", as_of_date="2026-09-11",
+    )
+
+    # When / Then: 같은 체결을 다시 void하면 거부
+    with pytest.raises(ValueError, match="already voided"):
+        ledger.void_fill(
+            sell["order_id"], reason="r", evidence="e", operator="tester", as_of_date="2026-09-11",
+        )
+    # And: 없는 order_id도 거부
+    with pytest.raises(ValueError, match="unknown fill"):
+        ledger.void_fill(
+            "no-such-order", reason="r", evidence="e", operator="tester", as_of_date="2026-09-11",
+        )
+    # And: 빈 reason/operator도 거부
+    with pytest.raises(ValueError, match="reason"):
+        ledger.void_fill(
+            sell["order_id"], reason="  ", evidence="e", operator="tester", as_of_date="2026-09-12",
+        )
+
+
+def test_record_note_changes_no_economic_state(tmp_path) -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    buy, sell = _seed_round_trip(ledger)
+    before_fills = ledger.load_effective_fills()
+    before_open = ledger.load_open_positions()
+
+    # When: 존재하지 않는 id를 향한 NOTE 기록
+    row = ledger.record_note(
+        target_order_ids=("ghost:1", "ghost:2"), reason="retro_doc", evidence="manual repair log",
+        operator="tester", as_of_date="2026-09-24",
+    )
+
+    # Then: 경제 상태는 동일하고 corrections 행만 남는다
+    assert row["correction_id"] == "2026-09-24:NOTE:retro_doc"
+    pd.testing.assert_frame_equal(ledger.load_effective_fills().reset_index(drop=True), before_fills.reset_index(drop=True))
+    pd.testing.assert_frame_equal(ledger.load_open_positions().reset_index(drop=True), before_open.reset_index(drop=True))
+    corrections = pd.read_parquet(tmp_path / "corrections.parquet")
+    assert len(corrections) == 1
+    assert corrections.iloc[0]["action"] == "NOTE"
+    _ = (buy, sell)
+
+
+def test_refresh_trade_ledgers_rewrites_trades_without_merge(tmp_path) -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import PaperLedger, refresh_trade_ledgers
+
+    ledger = PaperLedger(root=tmp_path)
+    buy, sell = _seed_round_trip(ledger)
+    refresh_trade_ledgers(ledger, seed_capital=10_000_000, as_of_date="2026-09-11")
+    assert len(pd.read_parquet(tmp_path / "trades.parquet")) == 1
+
+    # When: 매도를 void한 뒤 파생 원장을 갱신
+    ledger.void_fill(
+        sell["order_id"], reason="r", evidence="e", operator="tester", as_of_date="2026-09-11",
+    )
+    refresh_trade_ledgers(ledger, seed_capital=10_000_000, as_of_date="2026-09-11")
+
+    # Then: void된 매도의 trades 행은 병합 잔재 없이 사라진다
+    trades = pd.read_parquet(tmp_path / "trades.parquet")
+    assert trades.empty
+    _ = buy
+
+
+def test_rewrite_derived_rejects_non_trades_kind(tmp_path) -> None:
+    import pandas as pd
+    import pytest
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+
+    # When / Then: trades가 아닌 kind는 거부
+    with pytest.raises(ValueError, match="only 'trades'"):
+        ledger.rewrite_derived(pd.DataFrame([{"a": 1}]), "fills")
+    with pytest.raises(ValueError, match="only 'trades'"):
+        ledger.rewrite_derived(pd.DataFrame([{"a": 1}]), "nav")
+
+
+def test_ledger_lock_serializes_two_holders(tmp_path) -> None:
+    import threading
+
+    import pytest
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _holder() -> None:
+        with ledger.exclusive():
+            entered.set()
+            assert release.wait(timeout=10)
+
+    t = threading.Thread(target=_holder, daemon=True)
+    t.start()
+    assert entered.wait(timeout=10)
+
+    # When: 다른 핸들이 짧은 타임아웃으로 진입 시도
+    other = PaperLedger(root=tmp_path, lock_timeout_seconds=0.5)
+    with pytest.raises(TimeoutError), other.exclusive():
+        pass
+
+    # Then: 해제 후에는 새로 진입할 수 있다
+    release.set()
+    t.join(timeout=10)
+    with other.exclusive():
+        pass
+
+
+def test_ledger_lock_acquires_on_readonly_lock_file(tmp_path) -> None:
+    import os
+
+    from src.execution.paper_broker import PAPER_LEDGER_LOCK_FILENAME, PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    lock_path = tmp_path / PAPER_LEDGER_LOCK_FILENAME
+    lock_path.touch()
+    os.chmod(lock_path, 0o444)
+
+    # When / Then: 읽기 전용 락 파일이어도 flock 진입에 성공한다
+    with ledger.exclusive():
+        pass
+
+
+def test_ledger_rejects_nonpositive_lock_timeout(tmp_path) -> None:
+    import pytest
+
+    from src.execution.paper_broker import PaperLedger
+
+    # When / Then: 0 이하 타임아웃은 fail-closed
+    with pytest.raises(ValueError, match="lock_timeout_seconds"):
+        PaperLedger(root=tmp_path, lock_timeout_seconds=0)
+    with pytest.raises(ValueError, match="lock_timeout_seconds"):
+        PaperLedger(root=tmp_path, lock_timeout_seconds=-1.0)
+
+
+def test_ledger_lock_is_not_reentrant(tmp_path) -> None:
+    import pytest
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+
+    # When / Then: 같은 핸들로 중첩 진입은 거부된다
+    ctx = ledger.exclusive()
+    ctx.__enter__()
+    try:
+        with pytest.raises(RuntimeError, match="re-entrant"), ledger.exclusive():
+            pass
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_effective_fills_skips_malformed_correction_targets(tmp_path) -> None:
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [{"order_id": "b1", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000}],
+        kind="fills",
+    )
+    # Given: 수기로 망가진 corrections 행(VOID_FILL인데 target NaN)
+    ledger.record(
+        [{"correction_id": "2026-09-24:VOID_FILL:b1", "action": "VOID_FILL", "target_order_ids": None,
+          "reason": "broken", "evidence": "e", "operator": "tester", "as_of_date": "2026-09-24"}],
+        kind="corrections",
+    )
+
+    # When / Then: NaN 타깃은 건너뛰고 fills는 그대로 유효하다
+    assert len(ledger.load_effective_fills()) == 1
+
+
+def test_void_fill_rejects_empty_operator(tmp_path) -> None:
+    import pytest
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+    _, sell = _seed_round_trip(ledger)
+
+    # When / Then
+    with pytest.raises(ValueError, match="operator"):
+        ledger.void_fill(
+            sell["order_id"], reason="r", evidence="e", operator="  ", as_of_date="2026-09-11",
+        )
+
+
+def test_record_note_rejects_empty_reason_and_operator(tmp_path) -> None:
+    import pytest
+
+    from src.execution.paper_broker import PaperLedger
+
+    ledger = PaperLedger(root=tmp_path)
+
+    # When / Then
+    with pytest.raises(ValueError, match="reason"):
+        ledger.record_note(
+            target_order_ids=("a",), reason="  ", evidence="e", operator="tester", as_of_date="2026-09-24",
+        )
+    with pytest.raises(ValueError, match="operator"):
+        ledger.record_note(
+            target_order_ids=("a",), reason="r", evidence="e", operator="", as_of_date="2026-09-24",
+        )
+
+
+def test_sizing_price_rounds_up_and_validates() -> None:
+    import pytest
+
+    from src.execution.paper_broker import sizing_price
+
+    # Then: 버퍼 없이 결정가 그대로, 버퍼는 올림
+    assert sizing_price(10000, 0.0) == 10000
+    assert sizing_price(10000, 15.0) == 10015
+    assert sizing_price(9999, 1.0) == 10000
+    # And: 비정상 입력은 fail-closed
+    with pytest.raises(ValueError, match="decision_price"):
+        sizing_price(0, 0.0)
+    with pytest.raises(ValueError, match="buffer_bp"):
+        sizing_price(1000, -1.0)
+
+
+def test_order_record_accepts_missed_auction_and_insufficient_cash() -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import (
+        ORDER_STATUS_INSUFFICIENT_CASH,
+        ORDER_STATUS_MISSED_AUCTION,
+        PaperOrder,
+        order_record,
+    )
+
+    placed = pd.Timestamp("2026-09-25 15:20:00", tz="Asia/Seoul")
+    order = PaperOrder(
+        order_id="2026-09-25:005930:entry", decision_date="2026-09-25", symbol="005930",
+        side="buy", qty=100, limit_price=None, placed_at=placed, reason="entry",
+    )
+
+    # When / Then: 신규 종결 상태 두 건을 모두 수용한다
+    assert order_record(order, ORDER_STATUS_MISSED_AUCTION)["status"] == "MISSED_AUCTION"
+    assert order_record(order, ORDER_STATUS_INSUFFICIENT_CASH)["status"] == "INSUFFICIENT_CASH"

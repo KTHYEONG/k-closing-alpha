@@ -7,8 +7,13 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
 import math
+import os
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,12 +32,16 @@ ORDER_STATUS_UNCONFIRMED: str = "UNCONFIRMED"
 ORDER_STATUS_NO_SNAPSHOT_ROW: str = "NO_SNAPSHOT_ROW"
 ORDER_STATUS_ZERO_QTY: str = "ZERO_QTY"
 ORDER_STATUS_UNFILLED: str = "UNFILLED"
+ORDER_STATUS_MISSED_AUCTION: str = "MISSED_AUCTION"
+ORDER_STATUS_INSUFFICIENT_CASH: str = "INSUFFICIENT_CASH"
 ORDER_STATUSES: tuple[str, ...] = (
     ORDER_STATUS_FILLED,
     ORDER_STATUS_UNCONFIRMED,
     ORDER_STATUS_NO_SNAPSHOT_ROW,
     ORDER_STATUS_ZERO_QTY,
     ORDER_STATUS_UNFILLED,
+    ORDER_STATUS_MISSED_AUCTION,
+    ORDER_STATUS_INSUFFICIENT_CASH,
 )
 
 # 왕복 수수료를 매수/매도 편도로 나눈다(체결가에는 스프레드가 이미 반영돼 명시비용만 부과)
@@ -73,7 +82,24 @@ NAV_COLUMNS: tuple[str, ...] = (
     "recorded_at",
 )
 
-LEDGER_KINDS: tuple[str, ...] = ("orders", "fills", "decisions", "trades", "nav")
+LEDGER_KINDS: tuple[str, ...] = ("orders", "fills", "decisions", "trades", "nav", "corrections")
+
+CORRECTION_ACTION_VOID_FILL: str = "VOID_FILL"
+CORRECTION_ACTION_NOTE: str = "NOTE"
+CORRECTION_ACTIONS: tuple[str, ...] = (CORRECTION_ACTION_VOID_FILL, CORRECTION_ACTION_NOTE)
+CORRECTION_COLUMNS: tuple[str, ...] = (
+    "correction_id",
+    "action",
+    "target_order_ids",
+    "reason",
+    "evidence",
+    "operator",
+    "as_of_date",
+    "recorded_at",
+)
+
+PAPER_LEDGER_LOCK_FILENAME: str = ".ledger.lock"
+PAPER_LEDGER_LOCK_TIMEOUT_SECONDS: float = 300.0
 
 _LEDGER_DEDUP_KEYS: dict[str, list[str]] = {
     "orders": ["order_id"],
@@ -81,7 +107,11 @@ _LEDGER_DEDUP_KEYS: dict[str, list[str]] = {
     "decisions": ["decision_date", "symbol"],
     "trades": ["exit_order_id"],
     "nav": ["as_of_date"],
+    "corrections": ["correction_id"],
 }
+
+# fills와 corrections는 append-only 증거물이다. 키 충돌은 갱신이 아니라 계약 위반이다.
+_APPEND_ONLY_KINDS: frozenset[str] = frozenset({"fills", "corrections"})
 
 
 @dataclass(frozen=True)
@@ -133,6 +163,30 @@ def investable_capital(cash: int, seed_capital: int) -> int:
     """
     # 매수 수수료까지 현금 안에서 치르도록 편도 수수료분을 남기고, 누적 수익이 있어도 사이징은 시드 기준으로 고정한다
     return max(0, min(int(seed_capital), math.floor(int(cash) / (1.0 + PAPER_BROKERAGE_SIDE_BP / 10_000))))
+
+
+def sizing_price(decision_price: int, buffer_bp: float) -> int:
+    """Price used to fix an entry quantity before the closing auction.
+
+    A live market-on-close order must carry its quantity before 15:30, so the
+    only admissible price is the one observed at decision time, optionally
+    inflated by a configured buffer so that a higher close still settles in cash.
+
+    Args:
+        decision_price: Decision-time snapshot close in KRW (> 0).
+        buffer_bp: Non-negative buffer in basis points.
+
+    Returns:
+        ceil(decision_price * (1 + buffer_bp / 10_000)) in KRW.
+
+    Raises:
+        ValueError: decision_price <= 0 or buffer_bp < 0.
+    """
+    if decision_price <= 0:
+        raise ValueError(f"decision_price must be positive, got {decision_price}")
+    if buffer_bp < 0:
+        raise ValueError(f"buffer_bp must be non-negative, got {buffer_bp}")
+    return math.ceil(decision_price * (1.0 + buffer_bp / 10_000))
 
 
 def decide_fill(order: PaperOrder, print_price: int, print_ts: pd.Timestamp) -> PaperFill | None:
@@ -401,7 +455,7 @@ def build_nav_snapshot(fills: pd.DataFrame, seed_capital: int, as_of_date: str) 
 
 
 def refresh_trade_ledgers(ledger: PaperLedger, seed_capital: int, as_of_date: str) -> int:
-    """Refresh derived trade and NAV ledgers from fills.
+    """Refresh derived trade and NAV ledgers from effective fills.
 
     Args:
         ledger: Paper ledger to read fills from and write to.
@@ -411,10 +465,11 @@ def refresh_trade_ledgers(ledger: PaperLedger, seed_capital: int, as_of_date: st
     Returns:
         Number of closed round trips.
     """
-    fills = ledger.load("fills")
+    fills = ledger.load_effective_fills()
     trips = build_round_trips(fills)
-    if not trips.empty:
-        ledger.record(trips.to_dict("records"), kind="trades")
+    if trips.empty:
+        trips = pd.DataFrame(columns=list(ROUND_TRIP_COLUMNS))
+    ledger.rewrite_derived(trips, "trades")
     nav_df = build_nav_snapshot(fills, seed_capital, as_of_date)
     ledger.record(nav_df.to_dict("records"), kind="nav")
     nav_row = nav_df.iloc[0]
@@ -432,16 +487,95 @@ def refresh_trade_ledgers(ledger: PaperLedger, seed_capital: int, as_of_date: st
 class PaperLedger:
     """온디스크 페이퍼 원장. 매 상태전이마다 즉시 flush한다(WSL 재기동 내성)."""
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(self, root: Path | None = None, *, lock_timeout_seconds: float = PAPER_LEDGER_LOCK_TIMEOUT_SECONDS) -> None:
+        if lock_timeout_seconds <= 0:
+            raise ValueError(f"lock_timeout_seconds must be positive, got {lock_timeout_seconds}")
         self._root = Path(root) if root is not None else Path(settings.PAPER_DIR)
+        self._lock_timeout_seconds = float(lock_timeout_seconds)
+        self._lock_fd: int | None = None
 
     def _store(self, kind: str) -> Path:
         return self._root / f"{kind}.parquet"
+
+    def _lock_path(self) -> Path:
+        return self._root / PAPER_LEDGER_LOCK_FILENAME
+
+    @contextlib.contextmanager
+    def exclusive(self) -> Iterator[None]:
+        """Hold the host-wide paper ledger lock for one read-modify-write session.
+
+        Entry and exit run in separate containers that share the ledger directory
+        through a bind mount; flock on a file inside that directory serializes them
+        on the host kernel. Every caller that reads ledger state and writes a
+        decision derived from it (cash sizing, open-lot selection, corrections)
+        must hold this lock for the whole read-decide-write span, not per write.
+
+        Raises:
+            TimeoutError: The lock was not acquired within the ledger's lock timeout.
+            OSError: The lock file cannot be created or opened.
+        """
+        if self._lock_fd is not None:
+            raise RuntimeError("PaperLedger.exclusive is not re-entrant")
+        self._root.mkdir(parents=True, exist_ok=True)
+        # 가장 오래 합법적으로 잡는 쪽은 exit 시가 조회 루프(6회 x 10초 + lot당 TR 2회)로
+        # 300초에 한참 못 미친다. 그 이상 대기는 wedged 홀더이므로 줄 세우지 말고 크게 실패한다.
+        lock_path = self._lock_path()
+        fd = os.open(str(lock_path), os.O_RDONLY | os.O_CREAT, 0o666)
+        start = time.monotonic()
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (BlockingIOError, OSError) as exc:
+                    import errno as _errno
+
+                    if isinstance(exc, OSError) and exc.errno not in (_errno.EACCES, _errno.EAGAIN, _errno.EWOULDBLOCK):
+                        raise  # pragma: no cover - unexpected flock errno
+                    if time.monotonic() - start >= self._lock_timeout_seconds:
+                        raise TimeoutError(
+                            f"paper ledger lock not acquired within {self._lock_timeout_seconds:.1f}s: {lock_path}"
+                        ) from exc
+                    time.sleep(0.05)
+            self._lock_fd = fd
+            waited = time.monotonic() - start
+            logger.info("[PORTFOLIO] stage=paper_ledger_lock status=ACQUIRED waited_s=%.1f", waited)
+            yield
+        finally:
+            if self._lock_fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    self._lock_fd = None
+                    os.close(fd)
+            else:
+                os.close(fd)
 
     def _append(self, rows: list[dict[str, Any]], kind: str, dedup_keys: list[str]) -> int:
         target = self._store(kind)
         new_df = pd.DataFrame(rows)
         existing = pd.read_parquet(target) if target.exists() else pd.DataFrame()
+        if kind in _APPEND_ONLY_KINDS:
+            key = dedup_keys[0]
+            if not new_df.empty:
+                batch_keys = new_df[key].astype(str).tolist() if key in new_df.columns else []
+                if len(set(batch_keys)) != len(batch_keys):
+                    raise ValueError(f"duplicate {key} within append-only {kind} batch")
+                if not existing.empty and key in existing.columns:
+                    stored = set(existing[key].astype(str).tolist())
+                    for k in batch_keys:
+                        if k in stored:
+                            raise ValueError(f"append-only {kind} key {k!r} already stored")
+            if existing.empty:
+                merged = new_df.copy()
+            else:
+                union_cols = sorted(set(existing.columns.tolist()) | set(new_df.columns.tolist()))
+                merged = pd.concat(
+                    [existing.reindex(columns=union_cols), new_df.reindex(columns=union_cols)],
+                    ignore_index=True,
+                )
+            atomic_write_parquet(merged, target)
+            return len(merged)
         if existing.empty:
             merged = new_df.copy()
         else:
@@ -474,7 +608,24 @@ class PaperLedger:
         return pd.read_parquet(target)
 
     def record(self, rows: list[dict[str, Any]], kind: str) -> int:
-        """kind별 parquet에 원자적으로 append-merge한다."""
+        """Append rows to a ledger kind atomically.
+
+        fills and corrections are append-only evidence: a row whose key already
+        exists is a contract violation, never an update. Other kinds keep
+        last-write-wins merge semantics because they carry status updates
+        (orders) or per-date snapshots (nav, decisions).
+
+        Args:
+            rows: Ledger rows to append.
+            kind: One of LEDGER_KINDS.
+
+        Returns:
+            Row count of the stored ledger after the write.
+
+        Raises:
+            ValueError: Unknown kind, or an append-only key collides with a stored or
+                in-batch row.
+        """
         if kind not in LEDGER_KINDS:
             raise ValueError(f"unknown ledger kind {kind!r}")
         return self._append(rows, kind, _LEDGER_DEDUP_KEYS[kind])
@@ -491,8 +642,8 @@ class PaperLedger:
 
     def load_open_positions(self) -> pd.DataFrame:
         """fills 중 청산 체결이 참조하지 않은 진입 로트만 반환한다."""
-        target = self._store("fills")
-        if not target.exists():
+        fills = self.load_effective_fills()
+        if fills.empty:
             return pd.DataFrame(
                 {
                     "entry_order_id": pd.Series(dtype="str"),
@@ -502,7 +653,6 @@ class PaperLedger:
                     "decision_date": pd.Series(dtype="str"),
                 }
             )
-        fills = pd.read_parquet(target)
         # 청산 체결이 참조한 진입 로트만 닫는다(같은 종목 복수 로트를 독립적으로 추적)
         sides = fills["side"].astype(str)
         sells = fills[sides == "sell"]
@@ -523,3 +673,141 @@ class PaperLedger:
                 "decision_date": open_buys["decision_date"].astype(str).to_numpy(),
             }
         )
+
+    def _voided_order_ids(self) -> set[str]:
+        corrections = self.load("corrections")
+        if corrections.empty:
+            return set()
+        voided: set[str] = set()
+        mask = corrections["action"].astype(str) == CORRECTION_ACTION_VOID_FILL
+        for _, row in corrections[mask].iterrows():
+            targets = row.get("target_order_ids", "")
+            if targets is None or (not isinstance(targets, str) and pd.isna(targets)):
+                continue
+            for part in str(targets).split(","):
+                part = part.strip()
+                if part:
+                    voided.add(part)
+        return voided
+
+    def load_effective_fills(self) -> pd.DataFrame:
+        """Return fills minus every fill voided by a VOID_FILL correction.
+
+        The raw fills store is never rewritten; economic state (cash, open lots,
+        round trips, NAV) is always derived from this effective view so a
+        correction is an auditable event instead of a silent edit.
+
+        Returns:
+            Fill rows in stored order excluding voided order_ids; an empty frame when
+            no fills exist.
+        """
+        fills = self.load("fills")
+        if fills.empty:
+            return fills
+        voided = self._voided_order_ids()
+        if not voided:
+            return fills
+        return fills[~fills["order_id"].astype(str).isin(voided)].reset_index(drop=True)
+
+    def void_fill(
+        self, order_id: str, *, reason: str, evidence: str, operator: str, as_of_date: str
+    ) -> dict[str, Any]:
+        """Void one recorded fill through an append-only correction event.
+
+        Args:
+            order_id: Fill order_id to void.
+            reason: Short machine-readable reason (e.g. holiday_phantom_exit).
+            evidence: Free text or JSON describing how the error was established.
+            operator: Human operator identity recorded for accountability.
+            as_of_date: KST date (YYYY-MM-DD) whose NAV the correction restates.
+
+        Returns:
+            The stored correction row.
+
+        Raises:
+            ValueError: Unknown or already-voided order_id, empty reason/operator, or
+                voiding a buy fill still referenced by a non-voided sell fill.
+        """
+        if not str(reason).strip():
+            raise ValueError("reason must not be empty")
+        if not str(operator).strip():
+            raise ValueError("operator must not be empty")
+        fills = self.load("fills")
+        if fills.empty or order_id not in set(fills["order_id"].astype(str).tolist()):
+            raise ValueError(f"unknown fill order_id {order_id!r}")
+        if order_id in self._voided_order_ids():
+            raise ValueError(f"fill order_id {order_id!r} already voided")
+        target_side = str(fills.loc[fills["order_id"].astype(str) == order_id, "side"].iloc[0])
+        if target_side == "buy":
+            effective = self.load_effective_fills()
+            eff_sides = effective["side"].astype(str)
+            eff_sells = effective[eff_sides == "sell"]
+            if not eff_sells.empty and "entry_order_id" in eff_sells.columns:
+                refs = set(eff_sells["entry_order_id"].astype(str).tolist())
+                if order_id in refs:
+                    raise ValueError(f"buy fill {order_id!r} still referenced by an effective sell fill")
+        row: dict[str, Any] = {
+            "correction_id": f"{as_of_date}:{CORRECTION_ACTION_VOID_FILL}:{order_id}",
+            "action": CORRECTION_ACTION_VOID_FILL,
+            "target_order_ids": order_id,
+            "reason": reason,
+            "evidence": evidence,
+            "operator": operator,
+            "as_of_date": as_of_date,
+            "recorded_at": pd.Timestamp.now(tz="Asia/Seoul"),
+        }
+        self.record([row], "corrections")
+        return row
+
+    def record_note(
+        self,
+        *,
+        target_order_ids: tuple[str, ...],
+        reason: str,
+        evidence: str,
+        operator: str,
+        as_of_date: str,
+    ) -> dict[str, Any]:
+        """Record a correction that changes no economic state.
+
+        Used for retroactive documentation of repairs performed before correction
+        events existed, and for operator annotations of anomalies.
+
+        Returns:
+            The stored correction row.
+
+        Raises:
+            ValueError: Empty reason/operator or duplicate correction_id.
+        """
+        if not str(reason).strip():
+            raise ValueError("reason must not be empty")
+        if not str(operator).strip():
+            raise ValueError("operator must not be empty")
+        row: dict[str, Any] = {
+            "correction_id": f"{as_of_date}:{CORRECTION_ACTION_NOTE}:{reason}",
+            "action": CORRECTION_ACTION_NOTE,
+            "target_order_ids": ",".join(target_order_ids),
+            "reason": reason,
+            "evidence": evidence,
+            "operator": operator,
+            "as_of_date": as_of_date,
+            "recorded_at": pd.Timestamp.now(tz="Asia/Seoul"),
+        }
+        self.record([row], "corrections")
+        return row
+
+    def rewrite_derived(self, frame: pd.DataFrame, kind: str) -> int:
+        """Atomically replace a derived ledger with a full recomputation.
+
+        Returns:
+            Stored row count.
+
+        Raises:
+            ValueError: kind is not "trades".
+        """
+        if kind != "trades":
+            raise ValueError(f"rewrite_derived supports only 'trades', got {kind!r}")
+        target = self._store(kind)
+        out = frame.copy() if frame is not None else pd.DataFrame(columns=list(ROUND_TRIP_COLUMNS))
+        atomic_write_parquet(out, target)
+        return len(out)

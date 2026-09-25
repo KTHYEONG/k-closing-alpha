@@ -28,3 +28,6 @@ class AlertSettings(BaseSettings):
     ALERT_GMAIL_USER: str = Field(default="")
     ALERT_GMAIL_APP_PASSWORD: str = Field(default="")
     ALERT_GMAIL_TO: str = Field(default="")
+    ALERT_RETRY_ATTEMPTS: int = Field(default=3, ge=1)
+    ALERT_RETRY_BACKOFF_SECONDS: float = Field(default=5.0, gt=0.0)
+    ALERT_OUTBOX_MAX_DRAIN: int = Field(default=20, ge=1)

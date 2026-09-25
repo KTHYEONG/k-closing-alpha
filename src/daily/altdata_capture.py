@@ -23,6 +23,7 @@ from src.daily.price_ingest import fetch_krx_daily
 from src.data.altdata_health import AltdataVerdict, altdata_verdict
 from src.data.capture_contracts import SEOUL, CaptureManifest, CaptureStatus
 from src.data.capture_store import CaptureStore
+from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day_sync
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,9 @@ def main(argv: Sequence[str] | None = None, *, trading_day_fn: Callable[[str], b
         return 0
     if trading_day.weekday() >= 5:
         logger.info("[DATA] stage=altdata_capture status=SKIP reason=weekend date=%s", trading_day.isoformat())
+        return 0
+    if resolve_session_day(trading_day).kind is SessionKind.CLOSED:
+        logger.info("[DATA] stage=altdata_capture status=SKIP reason=non_trading_day date=%s", trading_day.isoformat())
         return 0
     oracle = trading_day_fn if trading_day_fn is not None else is_kis_trading_day_sync
     try:

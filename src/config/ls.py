@@ -24,3 +24,6 @@ class LsSettings(BaseSettings):
     LS_BASE_URL: str = "https://openapi.ls-sec.co.kr:8080"
     # LS 틱 차트 페이지 예산 (100페이지 ~= 심볼당 ~105초 @1.05초 페이싱)
     LS_TICK_MAX_PAGES: int = Field(default=100)
+    LS_MIN_INTERVAL_SECONDS: float = Field(default=1.05, gt=0.0)
+    LS_RATE_LIMIT_MAX_RETRIES: int = Field(default=5, ge=1)
+    LS_RATE_LIMIT_BACKOFF_SECONDS: float = Field(default=1.2, gt=0.0)

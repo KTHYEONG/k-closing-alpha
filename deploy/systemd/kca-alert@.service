@@ -3,6 +3,7 @@ Description=KCA failure alert (webhook + email) for %i
 
 [Service]
 Type=oneshot
+TimeoutStartSec=5min
 WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul

@@ -605,3 +605,47 @@ def test_publish_lock_timeout_fails_explicitly(tmp_path: Path, monkeypatch: Any)
     (target.parent / (target.name + ".lock")).write_text("held")
     with pytest.raises(OSError, match="timed out acquiring publish lock"):
         store.append_response(_response())
+
+
+def _partial_entry() -> CoverageEntry:
+    return CoverageEntry(
+        symbol=None,
+        dataset=CaptureDataset.PRICE,
+        venue="KRX",
+        session="regular",
+        scheduled_at=None,
+        status=CaptureStatus.PARTIAL,
+        rows=2,
+        first_event_time=None,
+        last_event_time=None,
+        reason="coverage_below_threshold:0.9800",
+        raw_refs=(),
+    )
+
+
+def test_degraded_decision_is_unreadable_for_trading(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    completed = START + timedelta(minutes=4)
+    store.publish_decision(_frame(), cohort=_cohort(), run_id="run-1", completed_at=completed, entries=[_partial_entry()])
+    with pytest.raises(FileNotFoundError):
+        store.read_decision("2026-09-17", available_by=completed + timedelta(minutes=1))
+
+
+def test_degraded_decision_still_declares_cohort(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    completed = START + timedelta(minutes=4)
+    store.publish_decision(_frame(), cohort=_cohort(), run_id="run-1", completed_at=completed, entries=[_partial_entry()])
+    cohort = store.read_cohort("2026-09-17", available_by=completed + timedelta(minutes=1))
+    assert cohort.cohort_id == _cohort().cohort_id
+
+
+def test_complete_decision_wins_over_earlier_partial(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    early = START + timedelta(seconds=40)
+    late = START + timedelta(seconds=70)
+    store.publish_decision(_frame(), cohort=_cohort(), run_id="run-early", completed_at=early, entries=[_partial_entry()])
+    _publish_decision(store, "run-late", late)
+    cutoff = late + timedelta(minutes=1)
+    assert store.read_cohort("2026-09-17", available_by=cutoff).cohort_id == _cohort().cohort_id
+    frame = store.read_decision("2026-09-17", available_by=cutoff)
+    assert frame["capture_run_id"].iloc[0] == "run-late"

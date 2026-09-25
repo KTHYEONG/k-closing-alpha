@@ -22,6 +22,7 @@ systemctl --user enable --now \
   kca-daily-audit.timer \
   kca-backup.timer \
   kca-backup-prune.timer \
+  kca-core-snapshot.timer \
   kca-retrain.timer \
   kca-kis-token-warmup.timer
 

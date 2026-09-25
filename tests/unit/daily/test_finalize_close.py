@@ -2,6 +2,26 @@
 
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _standard_session(monkeypatch) -> None:
+    """Pre-gate scenarios run under a STANDARD session; gate scenarios inject their own resolver."""
+    from src.daily import finalize_close
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    def _resolve(trading_day, **_kwargs):
+        return SessionDay(
+            trading_date=trading_day,
+            kind=SessionKind.STANDARD,
+            clock=SessionClock.standard(trading_day),
+            provenance="standard",
+        )
+
+    monkeypatch.setattr(finalize_close, "resolve_session_day", _resolve)
+
 
 def test_is_close_confirmed_passes_only_when_all_three_gates_hold() -> None:
     from datetime import datetime
@@ -545,16 +565,158 @@ def test_order_pending_by_priority_puts_picks_then_admitted_first() -> None:
 def test_classify_finalize_outcome_cases() -> None:
     from src.daily.finalize_close import classify_finalize_outcome
 
-    # 휴장일/수집 실패: 아카이브 비어있음 -> 알림 없음(수집 단계가 이미 알림)
-    assert classify_finalize_outcome(0, 0, 0, []) == ("OK", "empty_archive")
+    # 거래일 빈 아카이브: 15:20 실패가 outcome 로그에 노출된다
+    assert classify_finalize_outcome(0, 0, 0, [], is_trading_day=True) == ("DEGRADED", "empty_archive")
+    # 휴장일 빈 아카이브: 정상 휴일
+    assert classify_finalize_outcome(0, 0, 0, [], is_trading_day=False) == ("OK", "non_trading_day")
     # 픽 미확정은 부분 확정이어도 DEGRADED
-    assert classify_finalize_outcome(10, 9, 1, ["005930"]) == ("DEGRADED", "picks_unconfirmed")
+    assert classify_finalize_outcome(10, 9, 1, ["005930"], is_trading_day=True) == ("DEGRADED", "picks_unconfirmed")
     # 확정 0건(미확정 행 존재)
-    assert classify_finalize_outcome(10, 0, 10, []) == ("DEGRADED", "zero_confirmed")
+    assert classify_finalize_outcome(10, 0, 10, [], is_trading_day=True) == ("DEGRADED", "zero_confirmed")
     # 픽 전부 확정, 비픽 일부 미확정 -> OK
-    assert classify_finalize_outcome(10, 7, 3, []) == ("OK", "")
+    assert classify_finalize_outcome(10, 7, 3, [], is_trading_day=True) == ("OK", "")
     # 이미 전부 확정된 재실행
-    assert classify_finalize_outcome(10, 0, 0, []) == ("OK", "")
+    assert classify_finalize_outcome(10, 0, 0, [], is_trading_day=True) == ("OK", "")
+
+
+def _empty_archive_frame():
+    import pandas as pd
+
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    return pd.DataFrame({
+        "스냅샷_날짜": pd.Series([], dtype=str),
+        "종목코드": pd.Series([], dtype=str),
+        "종가": pd.Series([], dtype=float),
+        "전일종가": pd.Series([], dtype=float),
+        "거래량": pd.Series([], dtype=float),
+        "등락률": pd.Series([], dtype=float),
+        "admitted": pd.Series([], dtype=bool),
+        DECISION_CLOSE_COL: pd.Series([], dtype=float),
+        CLOSE_CONFIRMED_COL: pd.Series([], dtype=bool),
+    })
+
+
+def test_empty_archive_on_trading_day_is_degraded(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import finalize_close
+
+    snap = "2026-09-14"
+    kst = ZoneInfo("Asia/Seoul")
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **k: _empty_archive_frame().copy())
+
+    async def _trading(_date: str) -> bool:
+        return True
+
+    outcomes: list = []
+    n = asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date=snap,
+            client=None,
+            session=None,
+            now_fn=lambda: datetime(2026, 9, 14, 15, 32, 0, tzinfo=kst),
+            sleep_fn=lambda _s: asyncio.sleep(0),
+            on_outcome=lambda o, **k: outcomes.append((o, k)),
+            trading_day_fn=_trading,
+        )
+    )
+    assert n == 0
+    assert outcomes and outcomes[0][0] == "DEGRADED"
+    assert outcomes[0][1]["reason"] == "empty_archive"
+
+
+def test_empty_archive_on_holiday_is_ok(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import finalize_close
+
+    snap = "2026-09-14"
+    kst = ZoneInfo("Asia/Seoul")
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **k: _empty_archive_frame().copy())
+
+    async def _holiday(_date: str) -> bool:
+        return False
+
+    outcomes: list = []
+    asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date=snap,
+            client=None,
+            session=None,
+            now_fn=lambda: datetime(2026, 9, 14, 15, 32, 0, tzinfo=kst),
+            sleep_fn=lambda _s: asyncio.sleep(0),
+            on_outcome=lambda o, **k: outcomes.append((o, k)),
+            trading_day_fn=_holiday,
+        )
+    )
+    assert outcomes and outcomes[0][0] == "OK"
+    assert outcomes[0][1]["reason"] == "non_trading_day"
+
+
+def test_empty_archive_oracle_failure_never_reports_ok(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import finalize_close
+
+    snap = "2026-09-14"
+    kst = ZoneInfo("Asia/Seoul")
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **k: _empty_archive_frame().copy())
+
+    async def _broken(_date: str) -> bool:
+        raise RuntimeError("oracle down")
+
+    outcomes: list = []
+    asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date=snap,
+            client=None,
+            session=None,
+            now_fn=lambda: datetime(2026, 9, 14, 15, 32, 0, tzinfo=kst),
+            sleep_fn=lambda _s: asyncio.sleep(0),
+            on_outcome=lambda o, **k: outcomes.append((o, k)),
+            trading_day_fn=_broken,
+        )
+    )
+    assert outcomes and outcomes[0][0] == "DEGRADED"
+    assert outcomes[0][1]["reason"] == "calendar_unavailable"
+
+
+def test_empty_archive_consults_kis_oracle_by_default(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+    from zoneinfo import ZoneInfo
+
+    import src.data.trading_calendar as calendar
+    from src.daily import finalize_close
+
+    snap = "2026-09-14"
+    kst = ZoneInfo("Asia/Seoul")
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **k: _empty_archive_frame().copy())
+    oracle = AsyncMock(return_value=True)
+    monkeypatch.setattr(calendar, "is_kis_trading_day", oracle)
+
+    outcomes: list = []
+    asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date=snap,
+            client=None,
+            session=None,
+            now_fn=lambda: datetime(2026, 9, 14, 15, 32, 0, tzinfo=kst),
+            sleep_fn=lambda _s: asyncio.sleep(0),
+            on_outcome=lambda o, **k: outcomes.append((o, k)),
+        )
+    )
+    oracle.assert_awaited_once()
+    assert outcomes and outcomes[0][0] == "DEGRADED"
+    assert outcomes[0][1]["reason"] == "empty_archive"
 
 
 def test_run_close_finalization_fetches_picks_first_with_bounded_concurrency(monkeypatch) -> None:
@@ -1480,3 +1642,38 @@ def test_amain_wires_confirmation_capture(tmp_path, monkeypatch) -> None:
     assert captured["run_id"] == f"close-{snap}"
     assert captured["cohort_id"] == cohort.cohort_id
     assert captured["capture_store"] is not None
+
+
+def test_finalize_amain_skips_quoting_on_shifted_session(monkeypatch) -> None:
+    import asyncio
+    from datetime import date
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from src.daily import finalize_close
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    target = date(2026, 11, 19)
+    clock = SessionClock(
+        trading_date=target,
+        open_at=SessionClock.standard(target).open_at.replace(hour=10),
+        close_at=SessionClock.standard(target).close_at.replace(hour=16, minute=30),
+        close_confirmation_deadline=SessionClock.standard(target).close_at.replace(hour=16, minute=33),
+        provenance="csat_delayed_open",
+    )
+    monkeypatch.setattr(
+        finalize_close, "resolve_session_day", lambda _d, **_k: SessionDay(
+            trading_date=target, kind=SessionKind.SHIFTED, clock=clock, provenance="krx_calendar"
+        ),
+    )
+
+    def _raising_client(*args, **kwargs):
+        raise AssertionError("session-gated SKIP must not construct clients")
+
+    monkeypatch.setattr(finalize_close, "KisApiClient", _raising_client)
+    recorder = Mock()
+    monkeypatch.setattr(finalize_close, "record_run_outcome", recorder)
+
+    assert asyncio.run(finalize_close._amain(SimpleNamespace(date="2026-11-19", retry_interval=30.0))) == 0
+    recorder.assert_called_once_with("finalize_close", "OK", run_date="2026-11-19", reason="session_shifted")

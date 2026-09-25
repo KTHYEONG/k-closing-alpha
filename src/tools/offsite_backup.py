@@ -7,7 +7,7 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from pathlib import Path
@@ -44,9 +44,12 @@ class BackupRunReport:
     finished_at: str
     status: str
     steps: dict[str, dict[str, Any]]
+    core_panels: list[dict[str, Any]] | None = None
 
 
-def loose_copy_command(rclone: str, project_root: Path, subtree: str, snapshot_day: str) -> list[str]:
+def loose_copy_command(
+    rclone: str, project_root: Path, subtree: str, snapshot_day: str, extra_excludes: Sequence[str] = ()
+) -> list[str]:
     """Build the loose-tier rclone copy for one project subtree.
 
     Copy (never sync) so local deletions never propagate; overwritten remote
@@ -65,9 +68,41 @@ def loose_copy_command(rclone: str, project_root: Path, subtree: str, snapshot_d
         *LOOSE_RCLONE_FLAGS,
     ]
     if subtree == "data":
-        for pattern in LOOSE_EXCLUDES:
+        for pattern in (*LOOSE_EXCLUDES, *extra_excludes):
+            cmd += ["--exclude", pattern]
+    elif extra_excludes:
+        for pattern in extra_excludes:
             cmd += ["--exclude", pattern]
     return cmd
+
+
+def _load_previous_core_panels(capture_root: Path) -> list[dict[str, Any]]:
+    path = capture_root / REPORT_RELPATH
+    if not path.exists():
+        return []
+    try:
+        raw: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, dict):
+        return []
+    panels = raw.get("core_panels")
+    if isinstance(panels, list):
+        return [item for item in panels if isinstance(item, dict)]
+    return []
+
+
+def _excludes_for_subtree(issues: Sequence[str], subtree: str) -> list[str]:
+    excludes: list[str] = []
+    prefix = f"{subtree}/"
+    for issue in issues:
+        parts = issue.split(":")
+        if len(parts) < 3:
+            continue
+        relpath = ":".join(parts[1:-1])
+        if relpath.startswith(prefix):
+            excludes.append("/" + relpath[len(prefix):])
+    return sorted(set(excludes))
 
 
 def _kst_now(now: datetime) -> datetime:
@@ -80,11 +115,16 @@ def _write_report(capture_root: Path, report: BackupRunReport) -> None:
     path = capture_root / REPORT_RELPATH
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
+    payload: dict[str, Any] = {
+        "started_at": report.started_at,
+        "finished_at": report.finished_at,
+        "status": report.status,
+        "steps": report.steps,
+    }
+    if report.core_panels is not None:
+        payload["core_panels"] = report.core_panels
     tmp.write_text(
-        json.dumps(
-            {"started_at": report.started_at, "finished_at": report.finished_at, "status": report.status, "steps": report.steps},
-            sort_keys=True,
-        ),
+        json.dumps(payload, sort_keys=True),
         encoding="utf-8",
     )
     os.replace(tmp, path)
@@ -117,6 +157,27 @@ def run_offsite_backup(
     rclone = _resolve_rclone_bin()
     steps: dict[str, dict[str, Any]] = {}
 
+    from src.tools.core_snapshot import CorePanelStat, collect_core_stats, validate_core_panels
+
+    current_stats = collect_core_stats(project_root)
+    raw_previous = _load_previous_core_panels(capture_root)
+    previous_stats = [
+        CorePanelStat(
+            relpath=str(item.get("relpath", "")),
+            sha256=str(item.get("sha256", "")),
+            bytes=int(item.get("bytes", 0)),
+            rows=None if item.get("rows") is None else int(item["rows"]),
+            max_date=str(item.get("max_date", "")),
+        )
+        for item in raw_previous
+        if isinstance(item.get("relpath"), str)
+    ]
+    core_issues = validate_core_panels(current_stats, previous_stats)
+    if core_issues:
+        steps["core_panels"] = {"status": "failed", "issues": core_issues}
+    else:
+        steps["core_panels"] = {"status": "ok", "issues": []}
+
     try:
         report = seal_fn(capture_root, today=today, full_scan=full_scan)
         steps["capture_seal"] = {
@@ -131,20 +192,44 @@ def run_offsite_backup(
         steps["capture_seal"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
     for subtree in LOOSE_SUBTREES:
-        cmd = loose_copy_command(rclone, project_root, subtree, snapshot_day)
+        cmd = loose_copy_command(rclone, project_root, subtree, snapshot_day, _excludes_for_subtree(core_issues, subtree))
         try:
             result = run_fn(cmd, capture_output=True, text=True, timeout=LOOSE_RCLONE_TIMEOUT_SEC, check=False)
         except Exception as exc:
             steps[subtree] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
             continue
         if result.returncode == 0:
-            steps[subtree] = {"status": "ok"}
+            if core_issues and _excludes_for_subtree(core_issues, subtree):
+                steps[subtree] = {"status": "failed", "issues": core_issues}
+            else:
+                steps[subtree] = {"status": "ok"}
         else:
-            steps[subtree] = {"status": "failed", "returncode": result.returncode, "stderr": (result.stderr or "")[-2000:]}
+            payload: dict[str, Any] = {
+                "status": "failed",
+                "returncode": result.returncode,
+                "stderr": (result.stderr or "")[-2000:],
+            }
+            if core_issues:
+                payload["issues"] = core_issues
+            steps[subtree] = payload
 
     status = "ok" if all(step.get("status") == "ok" for step in steps.values()) else "failed"
     finished_at = datetime.now(UTC).isoformat()
-    run_report = BackupRunReport(started_at=started_at, finished_at=finished_at, status=status, steps=steps)
+    if core_issues:
+        persisted_panels = [{"relpath": e.relpath, "sha256": e.sha256, "bytes": e.bytes, "rows": e.rows, "max_date": e.max_date} for e in previous_stats] if raw_previous else None
+        if persisted_panels is None:
+            persisted_panels = [
+                {"relpath": e.relpath, "sha256": e.sha256, "bytes": e.bytes, "rows": e.rows, "max_date": e.max_date}
+                for e in current_stats
+            ]
+    else:
+        persisted_panels = [
+            {"relpath": e.relpath, "sha256": e.sha256, "bytes": e.bytes, "rows": e.rows, "max_date": e.max_date}
+            for e in current_stats
+        ]
+    run_report = BackupRunReport(
+        started_at=started_at, finished_at=finished_at, status=status, steps=steps, core_panels=persisted_panels
+    )
     _write_report(capture_root, run_report)
     if status != "ok":
         failed = sorted(name for name, step in steps.items() if step.get("status") != "ok")

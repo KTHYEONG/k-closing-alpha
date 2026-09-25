@@ -27,6 +27,23 @@ from tests.unit.serving.realtime.fixtures import (
 FEATURE_COLS = snapshot_feature_cols()
 
 
+@pytest.fixture(autouse=True)
+def _standard_session(monkeypatch) -> None:
+    """Pre-gate scenarios run under a STANDARD session; gate scenarios inject their own resolver."""
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    def _resolve(trading_day, **_kwargs):
+        return SessionDay(
+            trading_date=trading_day,
+            kind=SessionKind.STANDARD,
+            clock=SessionClock.standard(trading_day),
+            provenance="standard",
+        )
+
+    monkeypatch.setattr(predict, "resolve_session_day", _resolve)
+
+
 def test_legacy_gmm_logic_removed() -> None:
     """레거시 GMM/Static 의사결정 및 하드코딩 Safety Floor 가 제거되었는지 확인한다."""
     assert not hasattr(predict, "get_decision_batch")
@@ -1141,3 +1158,206 @@ def test_load_daily_snapshot_defaults_cutoff_to_call_time(tmp_path, monkeypatch)
     monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
     with pytest.raises(FileNotFoundError):
         predict_mod.load_daily_snapshot(pd.Timestamp("2026-09-14"))
+
+
+def test_predict_fails_closed_on_degraded_snapshot(tmp_path, monkeypatch) -> None:
+    """Degraded PARTIAL input never becomes a persisted top-k decision."""
+    from datetime import date, datetime
+    from unittest.mock import Mock
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry, build_cohort
+    from src.data.capture_store import CaptureStore
+
+    kst = ZoneInfo("Asia/Seoul")
+    monkeypatch.setattr(predict_mod, "_capture_root", lambda: tmp_path / "capture")
+    monkeypatch.setattr(predict_mod.settings, "COLLECTION_RAW_ENABLED", True)
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path / "parquet")
+
+    cohort = build_cohort(
+        date(2026, 9, 14), ["000001", "000002"], ["000001", "000002"], {},
+        eligibility_rule_version="price_history_panel@v1",
+    )
+    completed_at = datetime(2026, 9, 14, 15, 20, 30, tzinfo=kst)
+    frame = pd.DataFrame([
+        {"종목코드": "000001", "symbol": "000001", "종가": 18000.0, "admitted": True,
+         "snapshot_timestamp": pd.Timestamp("2026-09-14 15:20:01", tz="Asia/Seoul"),
+         "feature_available_timestamp": completed_at},
+        {"종목코드": "000002", "symbol": "000002", "종가": 30000.0, "admitted": False,
+         "snapshot_timestamp": pd.Timestamp("2026-09-14 15:20:02", tz="Asia/Seoul"),
+         "feature_available_timestamp": completed_at},
+    ])
+    store = CaptureStore(tmp_path / "capture")
+    store.publish_decision(
+        frame,
+        cohort=cohort,
+        run_id="run-degraded",
+        completed_at=completed_at,
+        entries=(CoverageEntry(
+            symbol=None, dataset=CaptureDataset.PRICE, venue="KRX", session="regular",
+            scheduled_at=None, status=CaptureStatus.PARTIAL, rows=2,
+            first_event_time=None, last_event_time=None,
+            reason="coverage_below_threshold:0.9800", raw_refs=(),
+        ),),
+    )
+
+    recorder = Mock()
+    predict_mod.run_automated_topk_decision(
+        pd.Timestamp("2026-09-14"), record_fn=recorder, trading_day_fn=lambda _d: True
+    )
+
+    assert not (tmp_path / "parquet" / "topk_decisions.parquet").exists()
+    recorder.assert_called_once()
+    args, kwargs = recorder.call_args
+    assert args == ("NO_DECISION",)
+
+
+def _session_day(kind, trading_day):
+    from datetime import date
+
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay
+
+    target = trading_day if isinstance(trading_day, date) else trading_day.date()
+    clock = None if kind.value in ("CLOSED", "UNKNOWN") else SessionClock.standard(target)
+    return SessionDay(trading_date=target, kind=kind, clock=clock, provenance="test")
+
+
+def test_run_automated_topk_decision_skips_inference_on_shifted_session(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.data.session_calendar import SessionKind
+
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", Mock(side_effect=AssertionError("must not infer")))
+    persist_mock = Mock()
+    monkeypatch.setattr(predict_mod, "persist_topk_decision", persist_mock)
+    recorder = Mock()
+
+    predict_mod.run_automated_topk_decision(
+        pd.Timestamp("2026-10-06"),
+        record_fn=recorder,
+        trading_day_fn=lambda _d: True,
+        session_day_fn=lambda d: _session_day(SessionKind.SHIFTED, d),
+    )
+
+    persist_mock.assert_not_called()
+    recorder.assert_called_once()
+    args, kwargs = recorder.call_args
+    assert args == ("NO_DECISION",)
+    assert kwargs["run_date"] == "2026-10-06"
+    assert kwargs["reason"] == "session_shifted"
+    assert kwargs["metrics"] == {"n_picks": 0, "session": "SHIFTED"}
+
+
+def test_run_automated_topk_decision_skips_inference_on_unverified_calendar(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.data.session_calendar import SessionKind
+
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", Mock(side_effect=AssertionError("must not infer")))
+    recorder = Mock()
+
+    predict_mod.run_automated_topk_decision(
+        pd.Timestamp("2027-01-04"),
+        record_fn=recorder,
+        trading_day_fn=lambda _d: True,
+        session_day_fn=lambda d: _session_day(SessionKind.UNKNOWN, d),
+    )
+
+    recorder.assert_called_once()
+    args, kwargs = recorder.call_args
+    assert args == ("NO_DECISION",)
+    assert kwargs["reason"] == "calendar_unverified"
+    assert kwargs["metrics"] == {"n_picks": 0, "session": "UNKNOWN"}
+
+
+def test_run_automated_topk_decision_reports_calendar_disagreement(monkeypatch, tmp_path) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.data.session_calendar import SessionKind
+
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", Mock(side_effect=AssertionError("must not infer")))
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+    recorder = Mock()
+
+    predict_mod.run_automated_topk_decision(
+        pd.Timestamp("2026-10-09"),
+        record_fn=recorder,
+        trading_day_fn=lambda _d: True,
+        session_day_fn=lambda d: _session_day(SessionKind.CLOSED, d),
+    )
+
+    assert not (tmp_path / "topk_decisions.parquet").exists()
+    recorder.assert_called_once()
+    args, kwargs = recorder.call_args
+    assert args == ("NO_DECISION",)
+    assert kwargs["reason"] == "calendar_disagreement"
+
+
+def test_run_automated_topk_decision_treats_confirmed_closure_as_holiday(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.data.session_calendar import SessionKind
+
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", Mock(side_effect=AssertionError("must not infer")))
+    recorder = Mock()
+
+    predict_mod.run_automated_topk_decision(
+        pd.Timestamp("2026-10-09"),
+        record_fn=recorder,
+        trading_day_fn=lambda _d: False,
+        session_day_fn=lambda d: _session_day(SessionKind.CLOSED, d),
+    )
+
+    recorder.assert_called_once()
+    args, kwargs = recorder.call_args
+    assert args == ("OK",)
+    assert kwargs["reason"] == "non_trading_day"
+    assert kwargs["metrics"] == {"n_picks": 0, "day": "holiday", "session": "CLOSED"}
+
+
+def test_run_automated_topk_decision_standard_session_behaves_as_before(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+    from src.data.session_calendar import SessionKind
+
+    sleeve_df = pd.DataFrame({
+        "symbol": ["000001", "000002", "000003"], "name": ["A", "B", "C"],
+        "pred": [0.02, 0.01, 0.005], "allocation": [1 / 3] * 3,
+    })
+    monkeypatch.setattr(predict_mod, "run_topk_ranker_sleeve", lambda _d, *, on_failure=None, on_rank_pool=None: sleeve_df)
+    persist_mock = Mock(return_value=3)
+    monkeypatch.setattr(predict_mod, "persist_topk_decision", persist_mock)
+    monkeypatch.setattr(predict_mod, "persist_rank_pool_predictions", Mock())
+    monkeypatch.setattr(predict_mod, "print_table", Mock())
+    recorder = Mock()
+
+    predict_mod.run_automated_topk_decision(
+        pd.Timestamp("2026-10-06"),
+        record_fn=recorder,
+        trading_day_fn=lambda _d: True,
+        session_day_fn=lambda d: _session_day(SessionKind.STANDARD, d),
+    )
+
+    persist_mock.assert_called_once()
+    args, kwargs = recorder.call_args
+    assert args == ("OK",)
+    assert kwargs["metrics"] == {"n_picks": 3}

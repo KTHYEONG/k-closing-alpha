@@ -18,6 +18,24 @@ import pandas as pd
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _standard_session(monkeypatch) -> None:
+    """Pre-gate scenarios run under a STANDARD session; gate scenarios inject their own resolver."""
+    from src.daily import collect
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    def _resolve(trading_day, **_kwargs):
+        return SessionDay(
+            trading_date=trading_day,
+            kind=SessionKind.STANDARD,
+            clock=SessionClock.standard(trading_day),
+            provenance="standard",
+        )
+
+    monkeypatch.setattr(collect, "resolve_session_day", _resolve)
+
+
 def test_fetch_all_stock_data_persists_orderbook_and_survives_persist_failure(monkeypatch) -> None:
     """호가 스냅샷을 일괄 영속화하고, 영속화 실패는 로깅만 하고 수집 결과에 영향 없다."""
     import asyncio
@@ -843,6 +861,39 @@ def test_main_skips_cleanly_on_non_trading_day(monkeypatch) -> None:
     # Then: 예외 없이 정상 종료, 후보 수집 미호출
     assert result is None
     never_called.assert_not_awaited()
+
+
+def test_collect_main_skips_shifted_and_unknown_before_vendor_calls(monkeypatch) -> None:
+    import asyncio
+    from datetime import date, datetime
+
+    from src.daily import collect
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 6, 15, 22, 0, tzinfo=tz)
+
+    def _raising_client(*args, **kwargs):
+        raise AssertionError("session-gated SKIP must not construct clients")
+
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "KisApiClient", _raising_client)
+
+    for kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
+        target = date(2026, 10, 6)
+        clock = None if kind is SessionKind.UNKNOWN else SessionClock.standard(target)
+        day = SessionDay(trading_date=target, kind=kind, clock=clock, provenance="test")
+        monkeypatch.setattr(collect, "resolve_session_day", lambda _d, _day=day, **_k: _day)
+        assert asyncio.run(collect.main(force=False)) is None
 
 
 def test_resolve_daily_candidates_unions_trade_value_leaders_with_dedup(monkeypatch) -> None:
@@ -2674,3 +2725,218 @@ def test_resolve_eligible_codes_fails_on_missing_classification_panel(monkeypatc
     monkeypatch.setattr(collect, "load_security_classification", _missing)
     with pytest.raises(FileNotFoundError, match="security_classification"):
         asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
+
+
+def _coverage_frame(n_raw: int, n_degraded: int):
+    import pandas as pd
+
+    failed = [True] * n_degraded + [False] * (n_raw - n_degraded)
+    return pd.DataFrame({"현재가_실패": failed, "가격_비정상": [False] * n_raw})
+
+
+def test_evaluate_realtime_coverage_reports_partial_on_shortfall() -> None:
+    from src.daily.collect import evaluate_realtime_coverage
+    from src.data.capture_contracts import CaptureStatus
+
+    report, status, reason = evaluate_realtime_coverage(_coverage_frame(100, 2))
+
+    assert report == {"n_raw": 100, "n_degraded": 2, "coverage": 0.98}
+    assert status is CaptureStatus.PARTIAL
+    assert reason == "coverage_below_threshold:0.9800"
+
+
+def test_evaluate_realtime_coverage_boundary() -> None:
+    import pandas as pd
+
+    from src.daily.collect import evaluate_realtime_coverage
+    from src.data.capture_contracts import CaptureStatus
+
+    n_raw = 10000
+    exact = pd.DataFrame({
+        "현재가_실패": [True] * 100 + [False] * (n_raw - 100),
+        "가격_비정상": [False] * n_raw,
+    })
+    _report, status, _reason = evaluate_realtime_coverage(exact)
+    assert status is CaptureStatus.COMPLETE
+
+    just_below = pd.DataFrame({
+        "현재가_실패": [True] * 101 + [False] * (n_raw - 101),
+        "가격_비정상": [False] * n_raw,
+    })
+    _report2, status2, reason2 = evaluate_realtime_coverage(just_below)
+    assert status2 is CaptureStatus.PARTIAL
+    assert reason2.startswith("coverage_below_threshold:")
+
+
+def test_evaluate_realtime_coverage_rejects_empty_snapshot() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.daily.collect import evaluate_realtime_coverage
+
+    with pytest.raises(ValueError, match="empty snapshot"):
+        evaluate_realtime_coverage(pd.DataFrame({"현재가_실패": [], "가격_비정상": []}))
+
+
+def test_check_realtime_collection_coverage_contract_preserved() -> None:
+    import pytest
+
+    from src.daily.collect import check_realtime_collection_coverage
+
+    with pytest.raises(ValueError, match="real-time collection coverage"):
+        check_realtime_collection_coverage(_coverage_frame(2, 1))
+
+
+def _run_main_with_quote_failures(monkeypatch, tmp_path, n_degraded: int):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    import pandas as pd
+
+    from src.daily import collect
+    from src.processing.schema import QUOTE_FAILED_COL
+
+    n_raw = 100
+    codes = [f"{i:06d}" for i in range(1, n_raw + 1)]
+    stock_list = [
+        {"code": c, "name": f"N{c}", "price": "18000", "chgrate": "1.0"} for c in codes
+    ]
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def ensure_token(self, _s):
+            return None
+
+        async def get_market_index_rate(self, _s, _code):
+            return {"rt_cd": "0", "output1": {"prdy_ctrt": "0.5"}}
+
+    import aiohttp as _aio
+
+    monkeypatch.setattr(_aio, "ClientSession", lambda *a, **k: _FakeSession())
+    monkeypatch.setattr(collect, "KisApiClient", _FakeClient)
+    monkeypatch.setattr(collect, "kis_data_client_kwargs", lambda: {
+        "app_key": "k", "app_secret": "s", "account_id": "a", "hts_id": "h", "token_file": str(tmp_path / "t.json"),
+    })
+    monkeypatch.setattr(collect, "kis_decision_shard_client_kwargs", lambda: [{}])
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "_validate_trading_day", AsyncMock(return_value=None))
+    monkeypatch.setattr(collect, "resolve_daily_candidates", AsyncMock(return_value=list(stock_list)))
+    monkeypatch.setattr(
+        collect, "resolve_eligible_codes", AsyncMock(return_value=frozenset(codes))
+    )
+
+    async def _fake_fetch(stock_list_arg, *a, **k):
+        rows = []
+        for i, s in enumerate(stock_list_arg):
+            rows.append({
+                "종목명": s["name"],
+                "종목코드": s["code"],
+                "시장구분": "KOSPI",
+                "시가": 17900,
+                "고가": 18100,
+                "저가": 17800,
+                "종가": 18000,
+                "전일종가": 17800,
+                "거래량": 1000000,
+                "거래대금": 500.0,
+                "시가총액": 3000.0,
+                "기관_순매수": 10.0,
+                "외국인_순매수": 5.0,
+                "등락률": 1.0,
+                "수급_실패": False,
+                QUOTE_FAILED_COL: i < n_degraded,
+            })
+        return rows, []
+
+    monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _fake_fetch)
+    monkeypatch.setattr(
+        collect, "flag_cost_aware_admission", lambda df, **k: df.assign(admitted=True)
+    )
+    monkeypatch.setattr(collect.settings, "COLLECTION_RAW_ENABLED", True)
+    monkeypatch.setattr(collect.settings, "COLLECTION_ROOT", tmp_path / "capture")
+    persisted = {"called": False}
+
+    def _fake_persist(df, snapshot_date):
+        persisted["called"] = True
+        return len(df)
+
+    monkeypatch.setattr(collect, "persist_daily_snapshot", _fake_persist)
+    return persisted
+
+
+def test_collect_main_publishes_partial_and_raises_without_archive(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.daily import collect
+    from src.data.capture_contracts import CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    persisted = _run_main_with_quote_failures(monkeypatch, tmp_path, 2)
+
+    with pytest.raises(ValueError, match="coverage_below_threshold"):
+        asyncio.run(collect.main(force=True))
+
+    assert persisted["called"] is False
+    manifests = CaptureStore(tmp_path / "capture").read_manifests(
+        __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+    )
+    assert len(manifests) == 1
+    assert manifests[0].status is CaptureStatus.PARTIAL
+    assert len(manifests[0].entries) == 1
+    assert manifests[0].entries[0].status is CaptureStatus.PARTIAL
+    assert manifests[0].entries[0].reason.startswith("coverage_below_threshold")
+
+
+def test_collect_main_publishes_complete_then_persists(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    from src.daily import collect
+    from src.data.capture_contracts import CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    persisted = _run_main_with_quote_failures(monkeypatch, tmp_path, 0)
+
+    asyncio.run(collect.main(force=True))
+
+    assert persisted["called"] is True
+    manifests = CaptureStore(tmp_path / "capture").read_manifests(
+        __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+    )
+    assert len(manifests) == 1
+    assert manifests[0].status is CaptureStatus.COMPLETE
+
+
+def test_full_coverage_publishes_complete_entry() -> None:
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry
+    from src.daily import collect
+
+    df = _coverage_frame(100, 0)
+    report, status, reason = collect.evaluate_realtime_coverage(df)
+    assert status is CaptureStatus.COMPLETE
+    entry = CoverageEntry(
+        symbol=None,
+        dataset=CaptureDataset.PRICE,
+        venue="KRX",
+        session="regular",
+        scheduled_at=None,
+        status=status,
+        rows=len(df),
+        first_event_time=None,
+        last_event_time=None,
+        reason="decision-input" if status is CaptureStatus.COMPLETE else reason,
+        raw_refs=(),
+    )
+    assert entry.status is CaptureStatus.COMPLETE
+    assert entry.reason == "decision-input"

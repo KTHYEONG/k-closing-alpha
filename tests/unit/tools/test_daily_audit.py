@@ -1,5 +1,25 @@
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _standard_session(monkeypatch) -> None:
+    """Pre-gate scenarios run under a STANDARD session; gate scenarios inject their own resolver."""
+    from src.tools import daily_audit
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    def _resolve(trading_day, **_kwargs):
+        return SessionDay(
+            trading_date=trading_day,
+            kind=SessionKind.STANDARD,
+            clock=SessionClock.standard(trading_day),
+            provenance="standard",
+        )
+
+    monkeypatch.setattr(daily_audit, "resolve_session_day", _resolve)
+
 
 def _collection_profile(tmp_path, *, raw=True, auction=False, altdata=False):
     from src.config.collection import CollectionSettings
@@ -322,7 +342,7 @@ def test_audit_daily_completeness_reports_all_steps_from_topk_log_and_fills(monk
     result = daily_audit.audit_daily_completeness("2026-09-14")
 
     # Then
-    assert set(result) == set(daily_audit.AUDIT_STEPS)
+    assert set(result) == set(daily_audit.AUDIT_STEPS) - {"intraday_complete"}
     assert all(result.values()), result
 
 
@@ -558,7 +578,16 @@ def test_build_digest_ok_warning_and_holiday_subjects() -> None:
 
 
 def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> None:
+    from types import SimpleNamespace
+
     from src.tools import daily_audit
+
+    monkeypatch.setattr(
+        daily_audit.CaptureStore,
+        "read_cohort",
+        lambda self, *args, **kwargs: SimpleNamespace(eligible_symbols=()),
+    )
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *args, **kwargs: ())
 
     audited: list[str] = []
     monkeypatch.setattr(
@@ -1647,3 +1676,478 @@ def test_classify_day_default_oracle_is_shared_sync_helper(monkeypatch) -> None:
     )
     assert daily_audit.classify_day("2026-09-14") == daily_audit.DAY_TRADING
     assert calls == ["2026-09-14"]
+
+
+def test_run_daily_audit_uses_resolved_clock_and_surfaces_shifted_session(monkeypatch) -> None:
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+    from src.tools import daily_audit
+
+    target = date(2026, 11, 19)
+    seoul = ZoneInfo("Asia/Seoul")
+    clock = SessionClock(
+        trading_date=target,
+        open_at=datetime(2026, 11, 19, 10, 0, 0, tzinfo=seoul),
+        close_at=datetime(2026, 11, 19, 16, 30, 0, tzinfo=seoul),
+        close_confirmation_deadline=datetime(2026, 11, 19, 16, 33, 0, tzinfo=seoul),
+        provenance="csat_delayed_open",
+    )
+    monkeypatch.setattr(
+        daily_audit, "resolve_session_day",
+        lambda _d, **_k: SessionDay(trading_date=target, kind=SessionKind.SHIFTED, clock=clock, provenance="krx_calendar"),
+    )
+    monkeypatch.setattr(
+        daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    )
+    seen: dict = {}
+    monkeypatch.setattr(
+        daily_audit, "audit_collection_manifests",
+        lambda *a, **k: seen.update(k) or (),
+    )
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    subject = daily_audit.run_daily_audit(
+        "2026-11-19",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
+    )
+
+    assert seen.get("session_clock") is clock
+    assert subject is not None
+    assert len(sent) == 1
+    assert "session=SHIFTED" in sent[0][1]
+    assert "session:0:shifted" in sent[0][1]
+
+
+def _stamp_frame(symbols, stamps):
+    import pandas as pd
+
+    return pd.DataFrame(
+        {
+            "symbol": [symbol for symbol in symbols for _ in stamps],
+            "ts_hms": [stamp for _ in symbols for stamp in stamps],
+        }
+    )
+
+
+def _standard_grid(day="2026-09-23"):
+    from src.tools import daily_audit
+
+    return daily_audit.expected_regular_stamps(_session_clock(day))
+
+
+def _clean_nxt_reader(regular_frame, krx_frame, *, pre_stamps=(80000, 81000), after_stamps=(154000, 154100)):
+    def _read(session):
+        if session == "regular":
+            return regular_frame
+        if session == "krx_aftermarket":
+            return krx_frame
+        if session == "nxt_premarket":
+            return _stamp_frame(["005930"], list(pre_stamps))
+        if session == "nxt_aftermarket":
+            return _stamp_frame(["005930"], list(after_stamps))
+        raise AssertionError(f"unexpected session {session}")
+
+    return _read
+
+
+def test_expected_regular_stamps_standard_grid() -> None:
+    from src.tools import daily_audit
+
+    stamps = daily_audit.expected_regular_stamps(_session_clock("2026-09-23"))
+
+    assert len(stamps) == 381
+    assert stamps[0] == 90100
+    assert stamps[-2:] == (152000, 153000)
+
+
+def test_expected_krx_aftermarket_stamps_window() -> None:
+    from src.tools import daily_audit
+
+    stamps = daily_audit.expected_krx_aftermarket_stamps()
+
+    assert len(stamps) == 241
+    assert stamps[0] == 160000
+    assert stamps[-1] == 200000
+
+
+def test_audit_intraday_partitions_flags_missing_minute_for_all_symbols(caplog) -> None:
+    import logging
+    from datetime import date
+
+    from src.data.session_calendar import SessionKind
+    from src.tools import daily_audit
+
+    grid = _standard_grid()
+    symbols = tuple(f"S{i:05d}" for i in range(357))
+    thinned = [stamp for stamp in grid if stamp != 125000]
+    regular_frame = _stamp_frame(symbols, thinned)
+    krx_frame = _stamp_frame(symbols, daily_audit.expected_krx_aftermarket_stamps())
+
+    with caplog.at_level(logging.DEBUG, logger=daily_audit.logger.name):
+        issues = daily_audit.audit_intraday_partitions(
+            date(2026, 9, 23),
+            clock=_session_clock("2026-09-23"),
+            session_kind=SessionKind.STANDARD,
+            cohort_symbols=symbols,
+            read_partition=_clean_nxt_reader(regular_frame, krx_frame),
+        )
+
+    assert issues == ("intraday:regular:357:missing_bars",)
+    assert any("125000" in rec.message for rec in caplog.records)
+
+
+def test_audit_intraday_partitions_flags_missing_nxt_partitions() -> None:
+    from datetime import date
+
+    from src.data.session_calendar import SessionKind
+    from src.tools import daily_audit
+
+    symbols = ("005930", "000660")
+    regular_frame = _stamp_frame(symbols, _standard_grid())
+    krx_frame = _stamp_frame(symbols, daily_audit.expected_krx_aftermarket_stamps())
+
+    def _read(session):
+        if session == "regular":
+            return regular_frame
+        if session == "krx_aftermarket":
+            return krx_frame
+        return None
+
+    issues = daily_audit.audit_intraday_partitions(
+        date(2026, 9, 23),
+        clock=_session_clock("2026-09-23"),
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=symbols,
+        read_partition=_read,
+    )
+
+    assert "intraday:nxt_premarket:1:missing_partition" in issues
+    assert "intraday:nxt_aftermarket:1:missing_partition" in issues
+
+
+def test_audit_intraday_partitions_flags_every_session_when_nothing_stored() -> None:
+    from datetime import date
+
+    from src.data.session_calendar import SessionKind
+    from src.tools import daily_audit
+
+    issues = daily_audit.audit_intraday_partitions(
+        date(2026, 9, 18),
+        clock=_session_clock("2026-09-18"),
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=("005930",),
+        read_partition=lambda _session: None,
+    )
+
+    assert set(issues) == {
+        "intraday:regular:1:missing_partition",
+        "intraday:nxt_premarket:1:missing_partition",
+        "intraday:nxt_aftermarket:1:missing_partition",
+        "intraday:krx_aftermarket:1:missing_partition",
+    }
+
+
+def test_audit_intraday_partitions_accepts_sparse_nxt_bars() -> None:
+    from datetime import date
+
+    from src.data.session_calendar import SessionKind
+    from src.tools import daily_audit
+
+    symbols = ("005930", "000660")
+    regular_frame = _stamp_frame(symbols, _standard_grid())
+    krx_frame = _stamp_frame(symbols, daily_audit.expected_krx_aftermarket_stamps())
+
+    issues = daily_audit.audit_intraday_partitions(
+        date(2026, 9, 23),
+        clock=_session_clock("2026-09-23"),
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=symbols,
+        read_partition=_clean_nxt_reader(regular_frame, krx_frame, after_stamps=tuple(range(154000, 154007))),
+    )
+
+    assert issues == ()
+
+
+def test_audit_intraday_partitions_flags_nxt_stamp_out_of_window() -> None:
+    from datetime import date
+
+    from src.data.session_calendar import SessionKind
+    from src.tools import daily_audit
+
+    symbols = ("005930", "000660")
+    regular_frame = _stamp_frame(symbols, _standard_grid())
+    krx_frame = _stamp_frame(symbols, daily_audit.expected_krx_aftermarket_stamps())
+
+    issues = daily_audit.audit_intraday_partitions(
+        date(2026, 9, 23),
+        clock=_session_clock("2026-09-23"),
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=symbols,
+        read_partition=_clean_nxt_reader(regular_frame, krx_frame, after_stamps=(154000, 200100)),
+    )
+
+    assert issues == ("intraday:nxt_aftermarket:1:out_of_window",)
+
+
+def test_audit_intraday_partitions_flags_cohort_symbol_absent_from_regular() -> None:
+    from datetime import date
+
+    from src.data.session_calendar import SessionKind
+    from src.tools import daily_audit
+
+    stored = ("005930", "000660")
+    regular_frame = _stamp_frame(stored, _standard_grid())
+    krx_frame = _stamp_frame(stored, daily_audit.expected_krx_aftermarket_stamps())
+
+    issues = daily_audit.audit_intraday_partitions(
+        date(2026, 9, 23),
+        clock=_session_clock("2026-09-23"),
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=("005930", "000660", "035420"),
+        read_partition=_clean_nxt_reader(regular_frame, krx_frame),
+    )
+
+    assert issues == ("intraday:regular:1:missing_symbols",)
+
+
+def test_audit_intraday_partitions_flags_unexpected_regular_stamp() -> None:
+    from datetime import date
+
+    import pandas as pd
+
+    from src.data.session_calendar import SessionKind
+    from src.tools import daily_audit
+
+    grid = _standard_grid()
+    regular_frame = _stamp_frame(("005930",), grid)
+    regular_frame = pd.concat(
+        [regular_frame, pd.DataFrame({"symbol": ["005930"], "ts_hms": [160000]})], ignore_index=True
+    )
+    krx_frame = _stamp_frame(("005930",), daily_audit.expected_krx_aftermarket_stamps())
+
+    issues = daily_audit.audit_intraday_partitions(
+        date(2026, 9, 23),
+        clock=_session_clock("2026-09-23"),
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=("005930",),
+        read_partition=_clean_nxt_reader(regular_frame, krx_frame),
+    )
+
+    assert issues == ("intraday:regular:1:unexpected_bars",)
+
+
+def test_audit_intraday_partitions_skips_krx_before_start_date() -> None:
+    from datetime import date
+
+    from src.data.session_calendar import SessionKind
+    from src.tools import daily_audit
+
+    symbols = ("005930", "000660")
+    regular_frame = _stamp_frame(symbols, daily_audit.expected_regular_stamps(_session_clock("2026-09-11")))
+
+    def _read(session):
+        if session == "regular":
+            return regular_frame
+        return None
+
+    issues = daily_audit.audit_intraday_partitions(
+        date(2026, 9, 11),
+        clock=_session_clock("2026-09-11"),
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=symbols,
+        read_partition=_read,
+    )
+
+    assert set(issues) == {
+        "intraday:nxt_premarket:1:missing_partition",
+        "intraday:nxt_aftermarket:1:missing_partition",
+    }
+    assert not any("krx_aftermarket" in issue for issue in issues)
+
+
+def test_audit_intraday_partitions_shifted_clock_skips_aftermarket_grids() -> None:
+    from datetime import date, datetime
+
+    from src.data.capture_contracts import SEOUL as _SEOUL, SessionClock
+    from src.data.session_calendar import SessionKind
+    from src.tools import daily_audit
+
+    target = date(2026, 11, 19)
+    clock = SessionClock(
+        trading_date=target,
+        open_at=datetime(2026, 11, 19, 10, 0, 0, tzinfo=_SEOUL),
+        close_at=datetime(2026, 11, 19, 16, 30, 0, tzinfo=_SEOUL),
+        close_confirmation_deadline=datetime(2026, 11, 19, 16, 33, 0, tzinfo=_SEOUL),
+        provenance="csat_delayed_open",
+    )
+    stamps = daily_audit.expected_regular_stamps(clock)
+
+    assert stamps[-2:] == (162000, 163000)
+
+    regular_frame = _stamp_frame(("005930",), stamps)
+    issues = daily_audit.audit_intraday_partitions(
+        target,
+        clock=clock,
+        session_kind=SessionKind.SHIFTED,
+        cohort_symbols=("005930",),
+        read_partition=lambda session: regular_frame if session == "regular" else None,
+    )
+
+    assert "intraday:aftermarket:0:aftermarket_unverified" in issues
+    assert not any("nxt_" in issue or "krx_" in issue for issue in issues)
+
+
+def test_read_stored_partition_prunes_columns_and_reports_absence(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.data.intraday_store import intraday_partition_path
+    from src.tools import daily_audit
+
+    monkeypatch.setattr(daily_audit.settings, "HISTORY_DIR", tmp_path, raising=False)
+    assert daily_audit._read_stored_partition("2026-09-23", "regular") is None
+
+    path = intraday_partition_path(1, "2026-09-23", "regular")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {"symbol": ["005930"], "ts_hms": [90100], "close": [70000], "volume": [10]}
+    ).to_parquet(path, index=False)
+
+    frame = daily_audit._read_stored_partition("2026-09-23", "regular")
+
+    assert frame is not None
+    assert list(frame.columns) == ["symbol", "ts_hms"]
+
+
+def test_build_digest_warns_when_intraday_incomplete() -> None:
+    from src.tools import daily_audit
+
+    result = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    result["intraday_complete"] = False
+
+    subject, body = daily_audit.build_digest("2026-09-23", daily_audit.DAY_TRADING, result, [], [])
+
+    assert "경고" in subject
+    assert "intraday_complete=MISSING" in body
+
+
+def test_run_daily_audit_flags_missing_intraday_cohort(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+
+    profile = _collection_profile(tmp_path)
+    monkeypatch.setattr(daily_audit, "CollectionSettings", lambda *a, **k: profile)
+    monkeypatch.setattr(
+        daily_audit,
+        "audit_daily_completeness",
+        lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True),
+    )
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    subject = daily_audit.run_daily_audit(
+        "2026-09-23",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
+    )
+
+    assert subject is not None and "경고" in subject and "intraday_complete" in subject
+    assert len(sent) == 1
+    assert "intraday_complete=MISSING" in sent[0][1]
+
+
+def test_run_daily_audit_surfaces_undelivered_alerts(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from src.tools import alerts, daily_audit
+
+    alerts.enqueue_undelivered("stuck-1", "body-1", kind="digest")
+    alerts.enqueue_undelivered("stuck-2", "body-2", kind="digest")
+    monkeypatch.setattr(
+        daily_audit.CaptureStore,
+        "read_cohort",
+        lambda self, *args, **kwargs: SimpleNamespace(eligible_symbols=()),
+    )
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *args, **kwargs: ())
+    monkeypatch.setattr(
+        daily_audit,
+        "audit_daily_completeness",
+        lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True),
+    )
+    monkeypatch.setattr(daily_audit.settings, "ALERT_RETRY_ATTEMPTS", 1, raising=False)
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    subject = daily_audit.run_daily_audit(
+        "2026-09-14",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
+    )
+
+    assert subject is not None and "경고" in subject and "미전송알림" in subject
+    assert len(sent) == 1
+    assert "undelivered_alerts=2" in sent[0][1]
+
+
+def test_run_daily_audit_survives_drain_failure(monkeypatch, caplog) -> None:
+    import logging
+    from types import SimpleNamespace
+
+    from src.tools import daily_audit
+
+    def _boom(**kwargs):
+        raise OSError("outbox unreadable")
+
+    monkeypatch.setattr(daily_audit, "drain_alert_outbox", _boom)
+    monkeypatch.setattr(
+        daily_audit.CaptureStore,
+        "read_cohort",
+        lambda self, *args, **kwargs: SimpleNamespace(eligible_symbols=()),
+    )
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *args, **kwargs: ())
+    monkeypatch.setattr(
+        daily_audit,
+        "audit_daily_completeness",
+        lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True),
+    )
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    with caplog.at_level(logging.WARNING, logger=daily_audit.logger.name):
+        subject = daily_audit.run_daily_audit(
+            "2026-09-14",
+            trading_day_fn=lambda _d: True,
+            failed_units_fn=list,
+            stale_tokens_fn=lambda _d: [],
+            dispatch_fn=_dispatch,
+            backup_issues_fn=lambda _at: [],
+        )
+
+    assert subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
+    assert len(sent) == 1
+    assert "undelivered_alerts=0" in sent[0][1]
+    assert any("alert_drain=FAILED" in rec.message for rec in caplog.records)

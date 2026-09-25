@@ -1237,3 +1237,19 @@ def test_prune_skips_unexpected_tier_layout_and_file_children(tmp_path: Path, mo
     # Then the date-named file is skipped and the fifo does not block removal
     assert report.removed == ((f"normalized/{fifo_day}"),)
     assert (tmp_path / "normalized" / day).is_file()
+
+
+def test_sealed_segment_upload_is_immutable(tmp_path: Path, monkeypatch) -> None:
+    from datetime import date
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.json.gz"), b"payload")
+    run_fn, calls = _make_fake(tmp_path / "remote", "gdrive:test")
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=_config())
+    copytos = [c for c in calls if c[1] == "copyto"]
+    assert copytos
+    assert all("--immutable" in c for c in copytos)

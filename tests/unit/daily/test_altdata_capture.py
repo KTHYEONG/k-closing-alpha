@@ -520,6 +520,29 @@ def test_main_weekday_holiday_skips(tmp_path, monkeypatch, caplog) -> None:
     assert "reason=non_trading_day" in caplog.text
 
 
+def test_main_calendar_closure_skips_without_oracle(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+    from datetime import date
+
+    from src.daily import altdata_capture
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    def _boom_oracle(_d: str) -> bool:
+        raise AssertionError("calendar closure must skip before the oracle")
+
+    monkeypatch.setattr(
+        altdata_capture, "resolve_session_day",
+        lambda _d, **_k: SessionDay(
+            trading_date=date(2026, 10, 9), kind=SessionKind.CLOSED, clock=None, provenance="krx_calendar"
+        ),
+    )
+    monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path))
+    with caplog.at_level(logging.INFO, logger=altdata_capture.logger.name):
+        rc = altdata_capture.main(["--date", "2026-10-09"], trading_day_fn=_boom_oracle)
+    assert rc == 0
+    assert "reason=non_trading_day" in caplog.text
+
+
 def test_main_trading_day_runs(tmp_path, monkeypatch) -> None:
     """Trading day runs."""
     from src.data.capture_contracts import CaptureDataset, CaptureStatus

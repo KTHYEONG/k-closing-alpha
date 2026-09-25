@@ -2,7 +2,7 @@ import functools
 import logging
 import subprocess
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -12,6 +12,7 @@ import pandas as pd
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet
+from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day, trading_session_gate
 from src.tools.daily_audit import DAY_HOLIDAY, DAY_WEEKEND, classify_day
 from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, RUN_OUTCOME_OK, record_run_outcome
 
@@ -321,18 +322,44 @@ def run_automated_topk_decision(
     *,
     record_fn: Callable[..., Any] | None = None,
     trading_day_fn: Callable[[str], bool] | None = None,
+    session_day_fn: Callable[[date], SessionDay] | None = None,
 ) -> None:
     """Print the single automated-mode top-3 decision table, if any.
+
+    The session gate runs before any model or snapshot access: only a STANDARD
+    session matches the 15:20 decision / 15:30 close geometry the model was
+    certified on, so SHIFTED and UNKNOWN dates are NO_DECISION without
+    inference, and a calendar closure that the KIS oracle contradicts is
+    reported instead of silently skipped.
 
     Args:
         decision_date: Decision date for the reranker sleeve.
         record_fn: Run outcome recorder (bound to record_run_outcome).
-        trading_day_fn: Trading-day oracle consulted only on failure.
+        trading_day_fn: Trading-day oracle consulted on failure and on calendar closures.
+        session_day_fn: Session resolver; None uses resolve_session_day.
     """
+    date_str = pd.Timestamp(decision_date).strftime("%Y-%m-%d")
+    resolve = session_day_fn if session_day_fn is not None else resolve_session_day
+    day = resolve(decision_date.date())
+    gate = trading_session_gate(day)
+    if gate is not None:
+        if day.kind is SessionKind.CLOSED:
+            trading_day = classify_day(date_str, trading_day_fn)
+            if trading_day in (DAY_WEEKEND, DAY_HOLIDAY):
+                outcome, reason = RUN_OUTCOME_OK, "non_trading_day"
+            else:
+                outcome, reason = RUN_OUTCOME_NO_DECISION, "calendar_disagreement"
+            metrics: dict[str, Any] = {"n_picks": 0, "day": trading_day, "session": day.kind.value}
+        else:
+            outcome, reason = RUN_OUTCOME_NO_DECISION, gate
+            metrics = {"n_picks": 0, "session": day.kind.value}
+        logger.warning("오늘 자동 유니버스 기준 진입 후보 없음(미참여)")
+        if record_fn is not None:
+            record_fn(outcome, run_date=date_str, reason=reason, metrics=metrics)
+        return
     failures: list[Exception] = []
     pools: list[pd.DataFrame] = []
     sleeve_df = run_topk_ranker_sleeve(decision_date, on_failure=failures.append, on_rank_pool=pools.append)
-    date_str = pd.Timestamp(decision_date).strftime("%Y-%m-%d")
     if failures:
         day = classify_day(date_str, trading_day_fn)
         if day in (DAY_WEEKEND, DAY_HOLIDAY):

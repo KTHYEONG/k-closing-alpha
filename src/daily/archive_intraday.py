@@ -6,7 +6,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,11 +25,14 @@ from src.backfill.intraday.collector import (
 )
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
+    ARCHIVE_AFTERMARKET_READY_HHMMSS,
+    ARCHIVE_REGULAR_READY_HHMMSS,
     DEFAULT_BAR_INTERVAL_MINUTES,
     INTRADAY_SESSION_KRX_AFTERMARKET,
     INTRADAY_SESSION_NXT_AFTERMARKET,
     INTRADAY_SESSION_NXT_PREMARKET,
     INTRADAY_SESSION_REGULAR,
+    KRX_AFTERMARKET_START_DATE,
 )
 from src.daily import archive
 from src.data.capture_contracts import (
@@ -43,7 +46,9 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.intraday_store import write_intraday_partition, write_tick_partition
+from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day
+from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, record_run_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,82 @@ _VALID_PHASES = ("regular", "aftermarket", "all")
 def _validate_phase(phase: str) -> None:
     if phase not in _VALID_PHASES:
         raise ValueError(f"Invalid phase: {phase!r} (expected one of {', '.join(_VALID_PHASES)})")
+
+
+def resolve_archive_target_date(now: datetime, phase: str) -> str:
+    """Resolve which session date an archive run must cover.
+
+    A run before the phase's ready time on day T is a catch-up of the previous
+    weekday's missed run (Persistent timers fire late after downtime); it must
+    never archive T, whose session has not finished.
+
+    Args:
+        now: Aware KST wall clock.
+        phase: "regular", "aftermarket" or "all" ("all" uses the aftermarket ready time).
+
+    Returns:
+        ISO date: today when now is at/after the ready time, else the previous weekday.
+
+    Raises:
+        ValueError: naive now or unknown phase.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    _validate_phase(phase)
+    current = now.astimezone(SEOUL)
+    today = current.date()
+    ready = ARCHIVE_AFTERMARKET_READY_HHMMSS if phase in ("aftermarket", "all") else ARCHIVE_REGULAR_READY_HHMMSS
+    if current.strftime("%H%M%S") >= ready:
+        return today.isoformat()
+    prev_day = today - timedelta(days=1)
+    while prev_day.weekday() >= 5:
+        prev_day -= timedelta(days=1)
+    return prev_day.isoformat()
+
+
+def archive_phase_complete(store: CaptureStore, target_date: str, phase: str) -> bool:
+    """Return True when every session manifest of the phase is COMPLETE for the date.
+
+    Args:
+        store: Capture store holding evening-archive manifests.
+        target_date: ISO date.
+        phase: "regular" (regular MINUTE_BARS + TRADE_TICKS) or "aftermarket"
+            (nxt_premarket, nxt_aftermarket and, from KRX_AFTERMARKET_START_DATE,
+            krx_aftermarket MINUTE_BARS); "all" requires both.
+
+    Returns:
+        True only if, for each required (dataset, session), the latest
+        evening-archive manifest is COMPLETE.
+    """
+    _validate_phase(phase)
+    try:
+        manifests = store.read_manifests(str(target_date))
+    except (ValueError, OSError):
+        return False
+    required: list[tuple[CaptureDataset, str]] = []
+    if phase in ("regular", "all"):
+        required.append((CaptureDataset.MINUTE_BARS, INTRADAY_SESSION_REGULAR))
+        required.append((CaptureDataset.TRADE_TICKS, INTRADAY_SESSION_REGULAR))
+    if phase in ("aftermarket", "all"):
+        required.append((CaptureDataset.MINUTE_BARS, INTRADAY_SESSION_NXT_PREMARKET))
+        required.append((CaptureDataset.MINUTE_BARS, INTRADAY_SESSION_NXT_AFTERMARKET))
+        if str(target_date) >= KRX_AFTERMARKET_START_DATE:
+            required.append((CaptureDataset.MINUTE_BARS, INTRADAY_SESSION_KRX_AFTERMARKET))
+    for dataset, session in required:
+        candidates = [
+            item
+            for item in manifests
+            if item.context.capture_reason == "evening-archive"
+            and item.context.endpoint == "archive-task"
+            and item.context.dataset == dataset
+            and item.context.session == session
+        ]
+        if not candidates:
+            return False
+        latest = max(candidates, key=lambda item: (item.completed_at, item.context.run_id))
+        if latest.status != CaptureStatus.COMPLETE:
+            return False
+    return True
 
 
 def _today_watchlist_codes(snapshot_date: str) -> list[str]:
@@ -352,6 +433,10 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
     if int(bar_interval_minutes) <= 0:
         raise ValueError(f"Invalid bar_interval_minutes: {bar_interval_minutes!r}")
     _validate_phase(phase)
+    session_day = resolve_session_day(trading_day)
+    if session_day.kind is SessionKind.CLOSED:
+        logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
+        return (0, 0, 0)
     if not prof.COLLECTION_RAW_ENABLED:
         return _legacy_run(str(snap_date), int(bar_interval_minutes), phase=phase)
     store = CaptureStore(_capture_root(prof))
@@ -514,7 +599,12 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
             n_ticks = counts["ticks"] if do_regular else 0
             return (n_bars, n_nxt, n_ticks)
 
-    return asyncio.run(_run())
+    n_bars, n_nxt, n_ticks = asyncio.run(_run())
+    if session_day.kind is SessionKind.SHIFTED:
+        record_run_outcome(
+            "archive_intraday", RUN_OUTCOME_DEGRADED, run_date=str(snap_date), reason="shifted_session_standard_window"
+        )
+    return (n_bars, n_nxt, n_ticks)
 
 
 def _fragment_context(trading_day: date, symbol: str, dataset: CaptureDataset) -> CaptureContext:
@@ -546,7 +636,33 @@ def main() -> None:
     parser.add_argument("--phase", choices=["regular", "aftermarket", "all"], default="all")
     parser.add_argument("--date", default=None, help="Snapshot date YYYY-MM-DD (default today)")
     args = parser.parse_args()
-    target_date = args.date or datetime.now().strftime("%Y-%m-%d")
+    profile = CollectionSettings()
+    target_date = args.date or resolve_archive_target_date(datetime.now(SEOUL), args.phase)
+    today_str = datetime.now(SEOUL).date().isoformat()
+    catchup = target_date != today_str
+    logger.info("[DATA] stage=intraday_archive target_date=%s phase=%s catchup=%s", target_date, args.phase, catchup)
+    store = CaptureStore(_capture_root(profile))
+    if archive_phase_complete(store, target_date, args.phase):
+        logger.info("[DATA] stage=intraday_archive status=SKIP reason=already_archived date=%s phase=%s", target_date, args.phase)
+        return
+    effective_phase = args.phase
+    if args.phase in ("aftermarket", "all") and target_date < today_str:
+        record_run_outcome("archive_intraday", RUN_OUTCOME_DEGRADED, run_date=target_date, reason="aftermarket_not_replayable")
+        if args.phase == "aftermarket":
+            target_codes = _archive_target_codes(target_date)
+            logger.info(
+                "🚀 [Intraday 아카이브 시작] 대상일: %s, 대상 종목: %d개, 저장소: %s, phase=%s",
+                target_date,
+                len(target_codes),
+                settings.HISTORY_DIR,
+                args.phase,
+            )
+            logger.info("[DATA] stage=intraday_archive status=SKIP reason=aftermarket_not_replayable date=%s", target_date)
+            return
+        if archive_phase_complete(store, target_date, "regular"):
+            logger.info("[DATA] stage=intraday_archive status=SKIP reason=already_archived date=%s phase=%s", target_date, "regular")
+            return
+        effective_phase = "regular"
     target_codes = _archive_target_codes(target_date)
     logger.info(
         "🚀 [Intraday 아카이브 시작] 대상일: %s, 대상 종목: %d개, 저장소: %s, phase=%s",
@@ -556,7 +672,7 @@ def main() -> None:
         args.phase,
     )
     try:
-        bars_rows, nxt_rows, tick_rows = run_intraday_archive(snapshot_date=target_date, profile=CollectionSettings(), phase=args.phase)
+        bars_rows, nxt_rows, tick_rows = run_intraday_archive(snapshot_date=target_date, profile=profile, phase=effective_phase)
     except ValueError as e:
         logger.error("[DATA] stage=intraday_archive status=ERROR reason=%s", e)
         raise SystemExit(2) from e

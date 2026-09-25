@@ -84,8 +84,10 @@ def test_dispatch_failure_alert_isolates_channel_failures(monkeypatch) -> None:
     monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "bot@example.com", raising=False)
     monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "pw", raising=False)
     monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "ops@example.com", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_ATTEMPTS", 2, raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_BACKOFF_SECONDS", 0.01, raising=False)
 
-    def _boom_webhook(url, *, unit, detail=""):
+    def _boom_webhook(url, *, unit, detail="", subject=None):
         raise alerts.requests.RequestException("network down")
 
     # Given: 웹훅 채널은 예외, 이메일 채널은 성공
@@ -99,7 +101,7 @@ def test_dispatch_failure_alert_isolates_channel_failures(monkeypatch) -> None:
         raise alerts.smtplib.SMTPException("auth failed")
 
     # Given: 반대로 웹훅은 성공, 이메일 채널이 예외
-    monkeypatch.setattr(alerts, "post_webhook_alert", lambda url, *, unit, detail="": True)
+    monkeypatch.setattr(alerts, "post_webhook_alert", lambda url, *, unit, detail="", subject=None: True)
     monkeypatch.setattr(alerts, "send_email_alert", _boom_email)
 
     # When / Then: 실패가 이메일에만 격리되고 웹훅은 정상 시도/성공
@@ -117,6 +119,7 @@ def test_alerts_main_parses_unit_and_dispatches(monkeypatch) -> None:
         return {"webhook": True, "email": False}
 
     monkeypatch.setattr(alerts, "dispatch_failure_alert", _fake_dispatch)
+    monkeypatch.setattr(alerts, "drain_alert_outbox", lambda **kw: (0, 0))
 
     # When
     alerts.main(["--unit", "kca-finalize-close.service", "--detail", "exit code 1"])
@@ -132,6 +135,8 @@ def test_dispatch_digest_sends_subject_and_body_and_isolates_channel_failures(mo
     monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "bot@example.com", raising=False)
     monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "pw", raising=False)
     monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "ops@example.com", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_ATTEMPTS", 2, raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_BACKOFF_SECONDS", 0.01, raising=False)
     sent: dict = {}
 
     class _FakeSMTP:
@@ -388,6 +393,7 @@ def test_alerts_main_attaches_formatted_failure_alert_when_detail_absent(monkeyp
 
     monkeypatch.setattr(alerts, "collect_unit_diagnostics", _fake_diag)
     monkeypatch.setattr(alerts, "dispatch_failure_alert", _fake_dispatch)
+    monkeypatch.setattr(alerts, "drain_alert_outbox", lambda **kw: (0, 0))
 
     # When: systemd OnFailure 기본 호출(--detail 없음)
     alerts.main(["--unit", "kca-collect.service"])
@@ -469,3 +475,359 @@ def test_collect_unit_diagnostics_falls_back_when_invocation_id_fails() -> None:
     assert status["InvocationID"] == "fail_id"
     assert "recovered fallback log" in journal
 
+
+
+def _fast_retry(monkeypatch) -> None:
+    from src.tools import alerts
+
+    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_ATTEMPTS", 3, raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_BACKOFF_SECONDS", 5.0, raising=False)
+
+
+def _empty_alert_creds(monkeypatch) -> None:
+    from src.tools import alerts
+
+    monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", "", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "", raising=False)
+
+
+def test_deliver_with_retry_delivers_after_transient_failure() -> None:
+    import smtplib
+
+    from src.tools import alerts
+
+    calls: list = []
+    sleeps: list = []
+
+    def _send():
+        calls.append(1)
+        if len(calls) == 1:
+            raise smtplib.SMTPException("temporary")
+        return True
+
+    outcome = alerts.deliver_with_retry(
+        _send, channel="email", attempts=3, backoff_seconds=5.0, sleep_fn=sleeps.append
+    )
+
+    assert outcome is alerts.ChannelOutcome.DELIVERED
+    assert len(calls) == 2
+    assert sleeps == [5.0]
+    assert not alerts.alert_outbox_dir().exists()
+
+
+def test_deliver_with_retry_skips_retry_when_unconfigured() -> None:
+    from src.tools import alerts
+
+    calls: list = []
+    sleeps: list = []
+
+    outcome = alerts.deliver_with_retry(
+        lambda: calls.append(1) or False, channel="webhook", attempts=3, backoff_seconds=5.0, sleep_fn=sleeps.append
+    )
+
+    assert outcome is alerts.ChannelOutcome.NOT_CONFIGURED
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_deliver_with_retry_fails_after_exhausting_attempts(caplog) -> None:
+    import logging
+    import smtplib
+
+    from src.tools import alerts
+
+    sleeps: list = []
+
+    def _always_fail():
+        raise smtplib.SMTPException("down")
+
+    with caplog.at_level(logging.WARNING, logger=alerts.logger.name):
+        outcome = alerts.deliver_with_retry(
+            _always_fail, channel="email", attempts=3, backoff_seconds=5.0, sleep_fn=sleeps.append
+        )
+
+    assert outcome is alerts.ChannelOutcome.FAILED
+    assert sleeps == [5.0, 10.0]
+    assert any("attempt=1/3 status=RETRY" in rec.message for rec in caplog.records)
+    assert any("attempt=3/3 status=FAILED" in rec.message for rec in caplog.records)
+
+
+def test_dispatch_failure_alert_persists_total_failure(monkeypatch, caplog) -> None:
+    import json
+    import logging
+    import smtplib
+
+    from src.tools import alerts
+
+    _fast_retry(monkeypatch)
+    monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", "", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "bot@example.com", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "pw", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "ops@example.com", raising=False)
+    real_retry = alerts.deliver_with_retry
+    sleeps: list = []
+    monkeypatch.setattr(alerts, "deliver_with_retry", lambda send, **kw: real_retry(send, sleep_fn=sleeps.append, **kw))
+
+    def _boom(**kw):
+        raise smtplib.SMTPException("auth failed")
+
+    monkeypatch.setattr(alerts, "send_email", _boom)
+
+    with caplog.at_level(logging.ERROR, logger=alerts.logger.name):
+        results = alerts.dispatch_failure_alert("kca-collect.service", detail="boom")
+
+    assert results == {"webhook": False, "email": False}
+    assert sleeps == [5.0, 10.0]
+    files = sorted(alerts.alert_outbox_dir().glob("*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text(encoding="utf-8"))
+    assert payload["kind"] == "failure"
+    assert "kca-collect.service" in payload["subject"]
+    assert "boom" in payload["body"]
+    assert any("status=UNDELIVERED" in rec.message for rec in caplog.records)
+
+
+def test_dispatch_digest_persists_when_nothing_configured(monkeypatch) -> None:
+    import json
+
+    from src.tools import alerts
+
+    _empty_alert_creds(monkeypatch)
+    _fast_retry(monkeypatch)
+    calls = {"webhook": 0, "email": 0}
+
+    def _no_webhook(url, text):
+        calls["webhook"] += 1
+        return False
+
+    def _no_email(**kw):
+        calls["email"] += 1
+        return False
+
+    monkeypatch.setattr(alerts, "post_webhook_text", _no_webhook)
+    monkeypatch.setattr(alerts, "send_email", _no_email)
+
+    results = alerts.dispatch_digest("s", "b")
+
+    assert results == {"webhook": False, "email": False}
+    assert calls == {"webhook": 1, "email": 1}
+    files = sorted(alerts.alert_outbox_dir().glob("*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text(encoding="utf-8"))
+    assert (payload["subject"], payload["body"], payload["kind"]) == ("s", "b", "digest")
+
+
+def _write_outbox_file(box, name, subject, body="x-body") -> None:
+    import json
+
+    (box).mkdir(parents=True, exist_ok=True)
+    (box / name).write_text(
+        json.dumps({"subject": subject, "body": body, "kind": "digest", "enqueued_at": "2020-01-01T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+
+
+def test_drain_alert_outbox_delivers_oldest_first_and_stops(tmp_path) -> None:
+    from src.tools import alerts
+
+    box = tmp_path / "outbox"
+    _write_outbox_file(box, "20200101T000000000000_aaaaaaaa.json", "first")
+    _write_outbox_file(box, "20200101T000001000000_bbbbbbbb.json", "second")
+    _write_outbox_file(box, "20200101T000002000000_cccccccc.json", "third")
+    sent: list = []
+
+    def _send(subject, body):
+        sent.append(subject)
+        return {"webhook": subject != "[지연전송] second", "email": False}
+
+    delivered, remaining = alerts.drain_alert_outbox(outbox=box, send_fn=_send)
+
+    assert (delivered, remaining) == (1, 2)
+    assert sent == ["[지연전송] first", "[지연전송] second"]
+    assert not (box / "20200101T000000000000_aaaaaaaa.json").exists()
+    assert (box / "20200101T000001000000_bbbbbbbb.json").exists()
+    assert (box / "20200101T000002000000_cccccccc.json").exists()
+
+
+def test_drain_alert_outbox_respects_max_items(tmp_path) -> None:
+    from src.tools import alerts
+
+    box = tmp_path / "outbox"
+    _write_outbox_file(box, "20200101T000000000000_aaaaaaaa.json", "first")
+    _write_outbox_file(box, "20200101T000001000000_bbbbbbbb.json", "second")
+    _write_outbox_file(box, "20200101T000002000000_cccccccc.json", "third")
+
+    delivered, remaining = alerts.drain_alert_outbox(
+        outbox=box, max_items=2, send_fn=lambda subject, body: {"webhook": True, "email": False}
+    )
+
+    assert (delivered, remaining) == (2, 1)
+
+
+def test_drain_alert_outbox_marks_redelivery(tmp_path) -> None:
+    from src.tools import alerts
+
+    box = tmp_path / "outbox"
+    _write_outbox_file(box, "20200101T000000000000_aaaaaaaa.json", "s", body="b")
+    sent: dict = {}
+
+    def _send(subject, body):
+        sent["subject"] = subject
+        sent["body"] = body
+        return {"webhook": True, "email": False}
+
+    assert alerts.drain_alert_outbox(outbox=box, send_fn=_send) == (1, 0)
+    assert sent["subject"].startswith("[지연전송] ")
+    assert "original_enqueued_at=2020-01-01T00:00:00+00:00" in sent["body"]
+
+
+def test_drain_alert_outbox_empty_when_missing(tmp_path) -> None:
+    from src.tools import alerts
+
+    def _never(subject, body):
+        raise AssertionError("missing outbox must not attempt delivery")
+
+    assert alerts.drain_alert_outbox(outbox=tmp_path / "nope", send_fn=_never) == (0, 0)
+
+
+def test_drain_alert_outbox_keeps_corrupt_file(tmp_path, caplog) -> None:
+    import logging
+
+    from src.tools import alerts
+
+    box = tmp_path / "outbox"
+    box.mkdir()
+    (box / "20200101T000000000000_aaaaaaaa.json").write_text("not json{{{", encoding="utf-8")
+
+    def _never(subject, body):
+        raise AssertionError("corrupt file must stop the drain")
+
+    with caplog.at_level(logging.WARNING, logger=alerts.logger.name):
+        assert alerts.drain_alert_outbox(outbox=box, send_fn=_never) == (0, 1)
+    assert any("CORRUPT_OUTBOX" in rec.message for rec in caplog.records)
+
+    box2 = tmp_path / "outbox2"
+    box2.mkdir()
+    (box2 / "20200101T000000000000_aaaaaaaa.json").write_text('["not", "a", "dict"]', encoding="utf-8")
+    assert alerts.drain_alert_outbox(outbox=box2, send_fn=_never) == (0, 1)
+
+
+def test_enqueue_undelivered_is_atomic(monkeypatch, tmp_path) -> None:
+    import pytest
+
+    from src.tools import alerts
+
+    box = tmp_path / "outbox"
+
+    def _crash(src, dst):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(alerts.os, "replace", _crash)
+
+    with pytest.raises(OSError, match="disk gone"):
+        alerts.enqueue_undelivered("s", "b", kind="digest", outbox=box)
+
+    assert list(box.glob("*.json")) == []
+    assert list(box.glob("*.tmp")) == []
+
+
+def test_alert_logs_never_leak_credentials(monkeypatch, caplog) -> None:
+    import logging
+    import smtplib
+
+    from src.tools import alerts
+
+    webhook_url = "https://hooks.example.com/secret-token-abc"
+    gmail_pw = "super-secret-app-password"
+    monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", webhook_url, raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "bot@example.com", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", gmail_pw, raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "ops@example.com", raising=False)
+    _fast_retry(monkeypatch)
+
+    def _boom_webhook(url, text):
+        raise alerts.requests.RequestException(f"POST {url} connection refused")
+
+    def _boom_email(**kw):
+        raise smtplib.SMTPException(f"login failed for {kw.get('gmail_user')}")
+
+    monkeypatch.setattr(alerts, "post_webhook_text", _boom_webhook)
+    monkeypatch.setattr(alerts, "send_email", _boom_email)
+
+    with caplog.at_level(logging.WARNING, logger=alerts.logger.name):
+        results = alerts.dispatch_digest("subject-line", "body-line")
+
+    assert results == {"webhook": False, "email": False}
+    assert webhook_url not in caplog.text
+    assert gmail_pw not in caplog.text
+
+
+def test_persist_undelivered_survives_outbox_failure(monkeypatch, caplog) -> None:
+    import logging
+
+    from src.tools import alerts
+
+    _empty_alert_creds(monkeypatch)
+    _fast_retry(monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise OSError("read-only fs")
+
+    monkeypatch.setattr(alerts, "enqueue_undelivered", _boom)
+
+    with caplog.at_level(logging.WARNING, logger=alerts.logger.name):
+        results = alerts.dispatch_digest("s", "b")
+
+    assert results == {"webhook": False, "email": False}
+    assert any("OUTBOX_FAILED" in rec.message for rec in caplog.records)
+    assert any("UNDELIVERED" in rec.message for rec in caplog.records)
+
+
+def test_alerts_main_drains_before_dispatch(monkeypatch) -> None:
+    from src.tools import alerts
+
+    order: list = []
+
+    def _drain(**kw):
+        order.append("drain")
+        assert kw.get("max_items") == alerts.settings.ALERT_OUTBOX_MAX_DRAIN
+        return (0, 0)
+
+    def _dispatch(unit, *, detail="", subject=None):
+        order.append("dispatch")
+        return {"webhook": True, "email": False}
+
+    monkeypatch.setattr(alerts, "drain_alert_outbox", _drain)
+    monkeypatch.setattr(alerts, "dispatch_failure_alert", _dispatch)
+    monkeypatch.setattr(alerts, "collect_unit_diagnostics", lambda unit: ({}, ""))
+
+    alerts.main(["--unit", "krx-host-backup.service"])
+
+    assert order == ["drain", "dispatch"]
+
+
+def test_alerts_main_survives_drain_failure(monkeypatch, caplog) -> None:
+    import logging
+
+    from src.tools import alerts
+
+    def _boom(**kw):
+        raise OSError("outbox unreadable")
+
+    captured: dict = {}
+
+    def _dispatch(unit, *, detail="", subject=None):
+        captured["unit"] = unit
+        return {"webhook": False, "email": False}
+
+    monkeypatch.setattr(alerts, "drain_alert_outbox", _boom)
+    monkeypatch.setattr(alerts, "dispatch_failure_alert", _dispatch)
+    monkeypatch.setattr(alerts, "collect_unit_diagnostics", lambda unit: ({}, ""))
+
+    with caplog.at_level(logging.WARNING, logger=alerts.logger.name):
+        alerts.main(["--unit", "kca-collect.service"])
+
+    assert captured == {"unit": "kca-collect.service"}
+    assert any("DRAIN_FAILED" in rec.message for rec in caplog.records)

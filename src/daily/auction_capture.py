@@ -27,6 +27,7 @@ from src.data.capture_contracts import (
     SessionClock,
 )
 from src.data.capture_store import CaptureStore
+from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day
 
 logger = logging.getLogger(__name__)
@@ -709,6 +710,11 @@ async def run_auction_capture(
 
 async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings) -> CaptureManifest | None:
     """Run one capture phase; ``None`` when KIS reports ``snapshot_date`` as a market holiday."""
+    trading_day = date.fromisoformat(snapshot_date)
+    session_day = resolve_session_day(trading_day, overrides=profile.COLLECTION_SESSION_OVERRIDES)
+    if session_day.kind is SessionKind.CLOSED:
+        logger.info("[DATA] stage=auction_capture status=SKIP reason=non_trading_day date=%s", snapshot_date)
+        return None
     import os
 
     from src.api.kis.client import KisApiClient
@@ -727,7 +733,7 @@ async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings
     ]
     store = CaptureStore(_capture_root(profile))
     trading_day = date.fromisoformat(snapshot_date)
-    clock = profile.COLLECTION_SESSION_OVERRIDES.get(snapshot_date, SessionClock.standard(trading_day))
+    clock = session_day.clock if session_day.clock is not None else SessionClock.standard(trading_day)
     previous_trading_day: str | None = None
     async with clients[0].create_session() as broker_session:
         for client in clients:

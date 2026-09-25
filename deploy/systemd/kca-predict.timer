@@ -1,5 +1,5 @@
 [Unit]
-Description=KCA daily predict (Mon-Fri 15:20 KST)
+Description=KCA daily predict (Mon-Fri 15:21 KST)
 
 [Timer]
 OnCalendar=Mon..Fri 15:21:00 Asia/Seoul

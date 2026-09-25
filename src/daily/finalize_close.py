@@ -6,7 +6,7 @@ import argparse
 import asyncio
 import functools
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -31,6 +31,7 @@ from src.data.capture_contracts import (
     CaptureStatus,
 )
 from src.data.capture_store import CaptureStore
+from src.data.session_calendar import SessionKind, resolve_session_day, trading_session_gate
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, record_run_outcome
 
@@ -113,21 +114,35 @@ def order_pending_by_priority(df: pd.DataFrame, pending: list[Any], pick_codes: 
 
 
 def classify_finalize_outcome(
-    n_rows: int, n_finalized: int, n_unconfirmed: int, unconfirmed_picks: list[str]
+    n_rows: int,
+    n_finalized: int,
+    n_unconfirmed: int,
+    unconfirmed_picks: list[str],
+    *,
+    is_trading_day: bool,
 ) -> tuple[str, str]:
     """Classify the finalize run outcome from confirmation counts.
 
+    An empty archive on a trading day means the decision snapshot was never
+    persisted (collect failed or refused a degraded snapshot); reporting it as
+    OK hid the 15:20 failure from the outcome log.
+
     Args:
-        n_rows: Total archive rows for the snapshot.
+        n_rows: Archive rows for the date.
         n_finalized: Number of confirmed rows.
         n_unconfirmed: Number of rows left unconfirmed.
         unconfirmed_picks: Unconfirmed pick codes.
+        is_trading_day: KIS trading-day verdict for the date.
 
     Returns:
-        (outcome, reason) using the RUN_OUTCOME vocabulary.
+        (outcome, reason) using the RUN_OUTCOME vocabulary; empty archive yields
+        (DEGRADED, "empty_archive") on a trading day and (OK, "non_trading_day")
+        otherwise.
     """
     if n_rows == 0:
-        return RUN_OUTCOME_OK, "empty_archive"
+        if is_trading_day:
+            return RUN_OUTCOME_DEGRADED, "empty_archive"
+        return RUN_OUTCOME_OK, "non_trading_day"
     if unconfirmed_picks:
         return RUN_OUTCOME_DEGRADED, "picks_unconfirmed"
     if n_finalized == 0 and n_unconfirmed > 0:
@@ -230,6 +245,7 @@ async def run_close_finalization(
     capture_store: CaptureStore | None = None,
     run_id: str | None = None,
     cohort_id: str | None = None,
+    trading_day_fn: Callable[[str], Awaitable[bool]] | None = None,
 ) -> int:
     """당일 아카이브 행을 확정값으로 in-place 갱신하고 확정 행 수를 반환한다 (우선순위, bounded concurrency, on_outcome)."""
     capture_on = not (capture_store is None and run_id is None and cohort_id is None)
@@ -328,7 +344,24 @@ async def run_close_finalization(
     unconfirmed = [str(df.at[i, "종목코드"]) for i in pending]
     unresolved_codes = [str(df.at[i, "종목코드"]) for i in unresolved]
     unconfirmed_picks = sorted(c for c in [*unconfirmed, *unresolved_codes] if c in pick_codes)
-    outcome, reason = classify_finalize_outcome(n_rows, n_finalized, len(unconfirmed), unconfirmed_picks)
+    if n_rows == 0:
+        try:
+            if trading_day_fn is not None:
+                is_trading_day = bool(await trading_day_fn(snap))
+            else:
+                from src.data.trading_calendar import is_kis_trading_day
+
+                is_trading_day = bool(await is_kis_trading_day(client, session, snap))
+        except Exception:
+            outcome, reason = RUN_OUTCOME_DEGRADED, "calendar_unavailable"
+        else:
+            outcome, reason = classify_finalize_outcome(
+                n_rows, n_finalized, len(unconfirmed), unconfirmed_picks, is_trading_day=is_trading_day
+            )
+    else:
+        outcome, reason = classify_finalize_outcome(
+            n_rows, n_finalized, len(unconfirmed), unconfirmed_picks, is_trading_day=False
+        )
     logger.info(
         "[DATA] stage=close_finalization date=%s n_finalized=%d n_unconfirmed=%d unconfirmed=%s outcome=%s reason=%s n_unresolved=%d",
         snap,
@@ -365,11 +398,17 @@ def load_pick_codes(snapshot_date: str) -> frozenset[str]:
 
 async def _amain(args) -> int:
     """단일 이벤트 루프 안에서 세션 생성/토큰/확정/종료를 모두 수행한다. 종가 확정은 읽기 전용 시세 조회라 데이터 계좌 키로 수행하고 체결 계좌 키는 실주문 전용으로 둔다."""
+    snap = args.date or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+    session_day = resolve_session_day(date.fromisoformat(snap))
+    if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
+        gate = trading_session_gate(session_day)
+        assert gate is not None
+        record_run_outcome("finalize_close", RUN_OUTCOME_OK, run_date=snap, reason=gate)
+        return 0
     owned_client = KisApiClient(**kis_data_client_kwargs())
     session = owned_client.create_session()
     try:
         await owned_client.ensure_token(session)
-        snap = args.date or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
         capture_store = None
         run_id = None
         cohort_id = None

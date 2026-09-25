@@ -28,6 +28,10 @@ KRX_REGULAR_HOUR_CEIL: str = "153000"
 KRX_AFTERMARKET_HOUR_FLOOR: str = "160000"
 KRX_AFTERMARKET_HOUR_CEIL: str = "200000"
 KRX_AFTERMARKET_START_DATE: str = "2026-09-14"
+# 정규장 분봉·틱은 15:30 종가 확정 후 정산되므로 15:40 이후에만 당일분으로 아카이브한다(kca-archive-intraday-regular.timer와 동일)
+ARCHIVE_REGULAR_READY_HHMMSS: str = "154000"
+# NXT/KRX 애프터마켓은 20:00 종료 후 20:05 이후에만 당일분으로 아카이브한다(kca-archive-intraday.timer와 동일)
+ARCHIVE_AFTERMARKET_READY_HHMMSS: str = "200500"
 NXT_AFTERMARKET_HOUR_FLOOR: str = "154000"
 NXT_AFTERMARKET_HOUR_CEIL: str = "200000"
 NXT_PREMARKET_HOUR_FLOOR: str = "080000"
@@ -38,3 +42,11 @@ PAPER_ENTRY_HHMMSS: str = "152000"
 PAPER_EXIT_OPEN_AUCTION_HHMMSS: str = KRX_REGULAR_HOUR_FLOOR
 # 현재가 API의 stck_oprc는 시가단일가 체결 직후 반영 지연이 있어 이 시각 이후 조회만 시가로 신뢰한다
 PAPER_EXIT_OPEN_QUOTE_EARLIEST_HHMMSS: str = "090030"
+# 가상 청산은 시가단일가 체결 이후 이 시각까지만 기록한다(그 이후 기록은 실계좌가 재현할 수 없는 시가 체결이다)
+PAPER_EXIT_WINDOW_END_HHMMSS: str = "093000"
+# 이 시간보다 이르게 기동되면 대기 대신 SKIP한다 — 당일 09:01 정규 발화가 처리하며, 대기가 TimeoutStartSec(15분)를 넘지 않게 한다
+PAPER_EXIT_MAX_PRESTART_WAIT_SECONDS: int = 600
+# 확정 종가는 결정창 종료 이전에 존재할 수 없으므로 진입 기록의 하한은 결정창 종료와 같다(파생 정의)
+PAPER_ENTRY_EARLIEST_HHMMSS: str = DECISION_WINDOW_END_HHMMSS
+# 다음 달력일 이 시각 이후 진입 기록은 거부한다 — 다음 시가 청산(최조 08:50:30 기동)보다 앞서야 로트가 청산 대상에 포함된다
+PAPER_ENTRY_CATCHUP_DEADLINE_HHMMSS: str = "083000"

@@ -7,12 +7,20 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import logging
+import os
 import re
 import smtplib
 import subprocess
+import time
+import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime
 from email.message import EmailMessage
+from enum import StrEnum
+from pathlib import Path
 
 import requests
 
@@ -23,7 +31,173 @@ logger = logging.getLogger(__name__)
 ALERT_JOURNAL_TAIL_LINES: int = 40
 ALERT_LINE_MAX_CHARS: int = 300
 ALERT_COMMAND_TIMEOUT_SEC: float = 10.0
+_REDELIVERY_SUBJECT_PREFIX: str = "[지연전송] "
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+class ChannelOutcome(StrEnum):
+    """Delivery result of one alert channel."""
+
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+    DELIVERED = "DELIVERED"
+    FAILED = "FAILED"
+
+
+def deliver_with_retry(
+    send: Callable[[], bool],
+    *,
+    channel: str,
+    attempts: int,
+    backoff_seconds: float,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> ChannelOutcome:
+    """Deliver through one channel with bounded exponential backoff.
+
+    A send callable returning False means the channel is not configured and is
+    never retried. Transport/SMTP failures are retried up to `attempts` total
+    tries with waits backoff_seconds * 2**k between them.
+
+    Args:
+        send: Channel sender; True on delivery, False when not configured.
+        channel: Channel label for logs ("webhook" or "email").
+        attempts: Total tries (>= 1).
+        backoff_seconds: Base wait before the second try.
+        sleep_fn: Injectable sleeper.
+
+    Returns:
+        NOT_CONFIGURED, DELIVERED or FAILED.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            if send():
+                return ChannelOutcome.DELIVERED
+            return ChannelOutcome.NOT_CONFIGURED
+        except (requests.RequestException, smtplib.SMTPException, OSError) as exc:
+            reason = type(exc).__name__
+            if attempt >= attempts:
+                logger.warning(
+                    "[SYS] stage=alert_delivery channel=%s attempt=%d/%d status=FAILED reason=%s",
+                    channel, attempt, attempts, reason,
+                )
+            else:
+                logger.warning(
+                    "[SYS] stage=alert_delivery channel=%s attempt=%d/%d status=RETRY reason=%s",
+                    channel, attempt, attempts, reason,
+                )
+                sleep_fn(backoff_seconds * (2.0 ** (attempt - 1)))
+    return ChannelOutcome.FAILED
+
+
+def _deliver_channel(send: Callable[[], bool], *, channel: str) -> bool:
+    attempts = int(settings.ALERT_RETRY_ATTEMPTS)
+    backoff_seconds = float(settings.ALERT_RETRY_BACKOFF_SECONDS)
+    return deliver_with_retry(send, channel=channel, attempts=attempts, backoff_seconds=backoff_seconds) is ChannelOutcome.DELIVERED
+
+
+def alert_outbox_dir() -> Path:
+    """Directory of undelivered alerts: DATA_DIR/logs/alerts/outbox."""
+    return Path(settings.DATA_DIR) / "logs" / "alerts" / "outbox"
+
+
+def enqueue_undelivered(subject: str, body: str, *, kind: str, outbox: Path | None = None) -> Path:
+    """Persist an alert that no configured channel delivered.
+
+    One JSON file per alert (`<utc_ts>_<uuid8>.json`, written via temp file +
+    os.replace) so concurrent writers from containers and host never interleave
+    and a partially written alert is never read.
+
+    Args:
+        subject: Alert subject.
+        body: Alert body.
+        kind: "failure" or "digest".
+        outbox: Override directory (tests).
+
+    Returns:
+        Path of the stored alert file.
+    """
+    box = Path(outbox) if outbox is not None else alert_outbox_dir()
+    box.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(UTC)
+    name = f"{now.strftime('%Y%m%dT%H%M%S%f')}_{uuid.uuid4().hex[:8]}.json"
+    payload = {"subject": subject, "body": body, "kind": kind, "enqueued_at": now.isoformat()}
+    target = box / name
+    tmp = box / f"{name}.tmp"
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.replace(tmp, target)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    return target
+
+
+def _deliver_now(subject: str, body: str) -> dict[str, bool]:
+    """Send a digest-shaped alert through both channels without enqueueing."""
+    return {
+        "webhook": _deliver_channel(
+            lambda: post_webhook_text(settings.ALERT_WEBHOOK_URL, f"{subject}\n{body}"),
+            channel="webhook",
+        ),
+        "email": _deliver_channel(
+            lambda: send_email(
+                gmail_user=settings.ALERT_GMAIL_USER,
+                gmail_app_password=settings.ALERT_GMAIL_APP_PASSWORD,
+                to_addr=settings.ALERT_GMAIL_TO,
+                subject=subject,
+                body=body,
+            ),
+            channel="email",
+        ),
+    }
+
+
+def _persist_undelivered(subject: str, body: str, *, kind: str) -> None:
+    try:
+        stored = enqueue_undelivered(subject, body, kind=kind)
+    except OSError as exc:
+        logger.warning("[SYS] stage=alert_delivery status=OUTBOX_FAILED reason=%s", type(exc).__name__)
+        stored = alert_outbox_dir()
+    logger.error("[SYS] stage=alert_delivery status=UNDELIVERED subject=%s outbox=%s", subject, stored)
+
+
+def drain_alert_outbox(
+    *, max_items: int | None = None, outbox: Path | None = None, send_fn: Callable[[str, str], dict[str, bool]] | None = None
+) -> tuple[int, int]:
+    """Re-deliver stored alerts oldest-first and delete each one delivered.
+
+    Stops at the first alert that still fails (preserves order, avoids hammering
+    a down channel).
+
+    Returns:
+        (delivered_count, remaining_count).
+    """
+    box = Path(outbox) if outbox is not None else alert_outbox_dir()
+    if not box.is_dir():
+        return (0, 0)
+    files = sorted(box.glob("*.json"))
+    if max_items is not None:
+        files = files[:max_items]
+    sender = send_fn if send_fn is not None else _deliver_now
+    delivered = 0
+    for path in files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logger.warning("[SYS] stage=alert_delivery status=CORRUPT_OUTBOX path=%s", path.name)
+            break
+        if not isinstance(payload, dict) or not isinstance(payload.get("subject"), str) or not isinstance(payload.get("body"), str):
+            logger.warning("[SYS] stage=alert_delivery status=CORRUPT_OUTBOX path=%s", path.name)
+            break
+        redelivered_subject = f"{_REDELIVERY_SUBJECT_PREFIX}{payload['subject']}"
+        redelivered_body = f"{payload['body']}\noriginal_enqueued_at={payload.get('enqueued_at', '')}"
+        results = sender(redelivered_subject, redelivered_body)
+        if not any(results.values()):
+            break
+        path.unlink()
+        delivered += 1
+    remaining = len(list(box.glob("*.json")))
+    return (delivered, remaining)
 
 
 def post_webhook_text(webhook_url: str, text: str) -> bool:
@@ -78,7 +252,8 @@ def send_email(*, gmail_user: str, gmail_app_password: str, to_addr: str, subjec
 def dispatch_digest(subject: str, body: str) -> dict[str, bool]:
     """일일 요약을 웹훅과 이메일 양쪽에 보내고 채널별 성공여부를 반환한다.
 
-    채널 실패는 dispatch_failure_alert와 같은 방식으로 좁게 잡아 격리한다.
+    각 채널은 bounded 재시도로 전송한다. 어떤 채널도 전달하지 못하면(미설정
+    포함) 요약을 outbox에 적재해 다음 기회에 지연전송한다.
 
     Args:
         subject: 요약 제목.
@@ -87,21 +262,9 @@ def dispatch_digest(subject: str, body: str) -> dict[str, bool]:
     Returns:
         {"webhook": bool, "email": bool}.
     """
-    results = {"webhook": False, "email": False}
-    try:
-        results["webhook"] = post_webhook_text(settings.ALERT_WEBHOOK_URL, f"{subject}\n{body}")
-    except (requests.RequestException, OSError) as exc:
-        logger.warning("[SYS] digest webhook dispatch failed reason=%s", type(exc).__name__)
-    try:
-        results["email"] = send_email(
-            gmail_user=settings.ALERT_GMAIL_USER,
-            gmail_app_password=settings.ALERT_GMAIL_APP_PASSWORD,
-            to_addr=settings.ALERT_GMAIL_TO,
-            subject=subject,
-            body=body,
-        )
-    except (smtplib.SMTPException, OSError) as exc:
-        logger.warning("[SYS] digest email dispatch failed reason=%s", type(exc).__name__)
+    results = _deliver_now(subject, body)
+    if not any(results.values()):
+        _persist_undelivered(subject, body, kind="digest")
     return results
 
 
@@ -163,9 +326,10 @@ def send_email_alert(
 def dispatch_failure_alert(unit: str, *, detail: str = "", subject: str | None = None) -> dict[str, bool]:
     """웹훅과 이메일 채널 모두 시도하고 채널별 성공여부를 반환한다.
 
-    각 채널의 전송 실패(네트워크/SMTP 오류)는 이 함수 안에서만 좁게 잡아
-    한 채널의 실패가 다른 채널 시도를 막지 않게 한다. 두 값 모두 False 인
-    상태(미설정 또는 두 채널 모두 실패)도 정상 반환이며 예외가 아니다.
+    각 채널은 bounded 재시도로 전송하며 한 채널의 실패가 다른 채널 시도를
+    막지 않는다. 두 값 모두 False 인 상태(미설정 또는 두 채널 모두 실패)도
+    정상 반환이며 예외가 아니다. 전달된 채널이 하나도 없으면 알림을 outbox에
+    적재해 다음 기회에 지연전송한다.
 
     Args:
         unit: 실패한 systemd 유닛 이름(OnFailure= 의 %i, 또는 호출부가
@@ -176,34 +340,27 @@ def dispatch_failure_alert(unit: str, *, detail: str = "", subject: str | None =
     Returns:
         {"webhook": bool, "email": bool}.
     """
-    results = {"webhook": False, "email": False}
-    try:
-        if subject is not None:
-            results["webhook"] = post_webhook_alert(settings.ALERT_WEBHOOK_URL, unit=unit, detail=detail, subject=subject)
-        else:
-            results["webhook"] = post_webhook_alert(settings.ALERT_WEBHOOK_URL, unit=unit, detail=detail)
-    except (requests.RequestException, OSError) as exc:
-        logger.warning("[SYS] alert webhook dispatch failed unit=%s reason=%s", unit, type(exc).__name__)
-    try:
-        if subject is not None:
-            results["email"] = send_email_alert(
+    title = subject if subject is not None else f"[KCA][실패] systemd unit failed: {unit}"
+    email_body = detail or f"unit={unit} failed with no further detail"
+    results = {
+        "webhook": _deliver_channel(
+            lambda: post_webhook_alert(settings.ALERT_WEBHOOK_URL, unit=unit, detail=detail, subject=subject),
+            channel="webhook",
+        ),
+        "email": _deliver_channel(
+            lambda: send_email_alert(
                 gmail_user=settings.ALERT_GMAIL_USER,
                 gmail_app_password=settings.ALERT_GMAIL_APP_PASSWORD,
                 to_addr=settings.ALERT_GMAIL_TO,
                 unit=unit,
                 detail=detail,
                 subject=subject,
-            )
-        else:
-            results["email"] = send_email_alert(
-                gmail_user=settings.ALERT_GMAIL_USER,
-                gmail_app_password=settings.ALERT_GMAIL_APP_PASSWORD,
-                to_addr=settings.ALERT_GMAIL_TO,
-                unit=unit,
-                detail=detail,
-            )
-    except (smtplib.SMTPException, OSError) as exc:
-        logger.warning("[SYS] alert email dispatch failed unit=%s reason=%s", unit, type(exc).__name__)
+            ),
+            channel="email",
+        ),
+    }
+    if not any(results.values()):
+        _persist_undelivered(title, email_body, kind="failure")
     return results
 
 
@@ -450,11 +607,19 @@ def collect_unit_diagnostics(
 
 
 def main(argv: list[str] | None = None) -> None:
-    """systemd OnFailure= 진입점: --unit 을 파싱해 얼러트를 발송한다."""
+    """systemd OnFailure= 진입점: --unit 을 파싱해 얼러트를 발송한다.
+
+    새로운 알림을 보내기 전에 outbox에 적체된 미전송 알림부터 지연전송한다.
+    drain 실패는 새 알림을 막지 않는다.
+    """
     parser = argparse.ArgumentParser(description="Dispatch a failure alert for a systemd unit (OnFailure= entrypoint)")
     parser.add_argument("--unit", required=True, help="failing unit name (systemd %%i specifier)")
     parser.add_argument("--detail", default="", help="optional extra detail text")
     args = parser.parse_args(argv)
+    try:
+        drain_alert_outbox(max_items=settings.ALERT_OUTBOX_MAX_DRAIN)
+    except Exception as exc:
+        logger.warning("[SYS] stage=alert_delivery status=DRAIN_FAILED reason=%s", type(exc).__name__)
     if args.detail:
         results = dispatch_failure_alert(args.unit, detail=args.detail)
     else:
