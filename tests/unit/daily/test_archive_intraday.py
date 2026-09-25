@@ -74,7 +74,10 @@ def test_resolve_previous_archive_date_returns_none_when_column_missing(monkeypa
 
 
 def test_archive_intraday_main_invokes_run_intraday_archive(monkeypatch) -> None:
+    from datetime import datetime as _dt
+
     from src.daily import archive_intraday
+    from src.data.capture_contracts import SEOUL as _SEOUL
 
     captured: dict = {}
 
@@ -84,7 +87,18 @@ def test_archive_intraday_main_invokes_run_intraday_archive(monkeypatch) -> None
         return (1, 2, 3)
 
     monkeypatch.setattr(archive_intraday, "run_intraday_archive", _fake_run)
+    monkeypatch.setattr(archive_intraday, "archive_phase_complete", lambda *a, **k: False)
     monkeypatch.setattr("sys.argv", ["archive_intraday", "--date", "2026-09-04"])
+    frozen = _dt(2026, 9, 4, 21, 0, tzinfo=_SEOUL)
+
+    class _FrozenDt(_dt):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            if tz is not None:
+                return frozen.astimezone(tz)
+            return frozen
+
+    monkeypatch.setattr(archive_intraday, "datetime", _FrozenDt)
 
     archive_intraday.main()
 
@@ -1759,3 +1773,335 @@ def test_collection_archive_symbol_batch_size_rejects_nonpositive() -> None:
 
     with pytest.raises(ValidationError):
         CollectionSettings(COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE=0)
+
+
+def test_run_intraday_archive_flags_shifted_day_degraded(monkeypatch, tmp_path) -> None:
+    from datetime import date
+
+    from src.config.collection import CollectionSettings
+    from src.daily import archive_intraday
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    target = date(2026, 11, 19)
+    monkeypatch.setattr(
+        archive_intraday, "resolve_session_day",
+        lambda _d, **_k: SessionDay(trading_date=target, kind=SessionKind.SHIFTED, clock=None, provenance="krx_calendar"),
+    )
+    monkeypatch.setattr(archive_intraday, "_resolve_cohort_codes", lambda *a, **k: (["005930"], False))
+
+    async def _is_trading(_c, _s, _d):
+        return True
+
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeKisClient:
+        def create_session(self):
+            return _FakeSession()
+
+        async def ensure_token(self, session):
+            return "tok"
+
+    async def _noop_collector(*a, **k):
+        return None
+
+    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _FakeKisClient())
+    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
+    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", lambda: None)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _noop_collector)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _noop_collector)
+    outcomes: list[tuple] = []
+    monkeypatch.setattr(
+        archive_intraday, "record_run_outcome", lambda *a, **k: outcomes.append((a, k))
+    )
+    profile = CollectionSettings(
+        COLLECTION_ROOT=tmp_path / "capture", COLLECTION_RAW_ENABLED=True, _env_file=None
+    )
+
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-11-19", phase="regular", profile=profile)
+
+    assert result == (0, 0, 0)
+    assert outcomes == [
+        (("archive_intraday", "DEGRADED"), {"run_date": "2026-11-19", "reason": "shifted_session_standard_window"})
+    ]
+
+
+def _publish_evening_manifest(store, target_date, dataset, session, status, run_suffix):
+    import datetime as _dt
+
+    from src.data.capture_contracts import (
+        SEOUL as _SEOUL,
+        CaptureContext,
+        CaptureManifest,
+        CaptureStatus,
+        CoverageEntry,
+    )
+
+    entry_status = CaptureStatus(status)
+    entry = CoverageEntry(
+        symbol="005930", dataset=dataset, venue="KRX", session=session, scheduled_at=None,
+        status=entry_status, rows=1 if entry_status == CaptureStatus.COMPLETE else 0,
+        first_event_time=None, last_event_time=None, reason="test-evening", raw_refs=(),
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=CaptureContext(
+            trading_date=_dt.date.fromisoformat(target_date), run_id=f"archive-{target_date}-{session}-{run_suffix}",
+            dataset=dataset, vendor="kis", endpoint="archive-task", symbol=None, venue="KRX",
+            session=session, capture_reason="evening-archive", cohort_id=None, scheduled_at=None,
+        ),
+        cohort=None,
+        completed_at=_dt.datetime(2026, 9, 22, 21, 0, tzinfo=_SEOUL),
+        entries=(entry,),
+        artifacts=(),
+        status=entry_status,
+    )
+    store.publish_manifest(manifest)
+
+
+def _freeze_archive_now(monkeypatch, archive_intraday, frozen):
+    from datetime import datetime as _dt
+
+    class _FrozenDt(_dt):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            if tz is not None:
+                return frozen.astimezone(tz)
+            return frozen
+
+    monkeypatch.setattr(archive_intraday, "datetime", _FrozenDt)
+
+
+def test_resolve_archive_target_date_next_morning_catchup() -> None:
+    from datetime import datetime as _dt
+
+    from src.daily.archive_intraday import resolve_archive_target_date
+    from src.data.capture_contracts import SEOUL as _SEOUL
+
+    now = _dt(2026, 9, 23, 7, 10, tzinfo=_SEOUL)
+
+    assert resolve_archive_target_date(now, "regular") == "2026-09-22"
+
+
+def test_resolve_archive_target_date_monday_catchup() -> None:
+    from datetime import datetime as _dt
+
+    from src.daily.archive_intraday import resolve_archive_target_date
+    from src.data.capture_contracts import SEOUL as _SEOUL
+
+    now = _dt(2026, 9, 28, 7, 10, tzinfo=_SEOUL)
+
+    assert resolve_archive_target_date(now, "regular") == "2026-09-25"
+
+
+def test_resolve_archive_target_date_on_time() -> None:
+    from datetime import datetime as _dt
+
+    from src.daily.archive_intraday import resolve_archive_target_date
+    from src.data.capture_contracts import SEOUL as _SEOUL
+
+    now = _dt(2026, 9, 23, 15, 40, 0, tzinfo=_SEOUL)
+
+    assert resolve_archive_target_date(now, "regular") == "2026-09-23"
+
+
+def test_resolve_archive_target_date_aftermarket_ready_time() -> None:
+    from datetime import datetime as _dt
+
+    from src.daily.archive_intraday import resolve_archive_target_date
+    from src.data.capture_contracts import SEOUL as _SEOUL
+
+    assert resolve_archive_target_date(_dt(2026, 9, 23, 20, 5, 0, tzinfo=_SEOUL), "aftermarket") == "2026-09-23"
+    assert resolve_archive_target_date(_dt(2026, 9, 23, 0, 30, tzinfo=_SEOUL), "aftermarket") == "2026-09-22"
+    assert resolve_archive_target_date(_dt(2026, 9, 23, 0, 30, tzinfo=_SEOUL), "all") == "2026-09-22"
+
+
+def test_resolve_archive_target_date_rejects_naive_and_unknown_phase() -> None:
+    from datetime import datetime as _dt
+
+    import pytest
+
+    from src.daily.archive_intraday import resolve_archive_target_date
+    from src.data.capture_contracts import SEOUL as _SEOUL
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        resolve_archive_target_date(_dt(2026, 9, 23, 7, 10), "regular")
+    with pytest.raises(ValueError, match="Invalid phase"):
+        resolve_archive_target_date(_dt(2026, 9, 23, 7, 10, tzinfo=_SEOUL), "bogus")
+
+
+def test_archive_phase_complete_regular_complete_and_partial(tmp_path) -> None:
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_evening_manifest(store, "2026-09-22", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", "bars")
+    _publish_evening_manifest(store, "2026-09-22", CaptureDataset.TRADE_TICKS, "regular", "COMPLETE", "ticks")
+
+    assert archive_intraday.archive_phase_complete(store, "2026-09-22", "regular") is True
+
+    store2 = _archive_store(tmp_path / "cap2")
+    _publish_evening_manifest(store2, "2026-09-22", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", "bars")
+    _publish_evening_manifest(store2, "2026-09-22", CaptureDataset.TRADE_TICKS, "regular", "PARTIAL", "ticks")
+
+    assert archive_intraday.archive_phase_complete(store2, "2026-09-22", "regular") is False
+
+
+def test_archive_phase_complete_ignores_non_evening_and_unreadable(tmp_path) -> None:
+    import datetime as _dt
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import (
+        SEOUL as _SEOUL,
+        CaptureContext,
+        CaptureDataset,
+        CaptureManifest,
+        CaptureStatus,
+        CoverageEntry,
+    )
+
+    store = _archive_store(tmp_path)
+    entry = CoverageEntry(
+        symbol="005930", dataset=CaptureDataset.MINUTE_BARS, venue="KRX", session="regular",
+        scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1,
+        first_event_time=None, last_event_time=None, reason="test", raw_refs=(),
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=CaptureContext(
+            trading_date=_dt.date(2026, 9, 22), run_id="decision-1", dataset=CaptureDataset.SCAN,
+            vendor="owner-local", endpoint="decision-input", symbol=None, venue="KRX",
+            session="regular", capture_reason="decision-input", cohort_id=None, scheduled_at=None,
+        ),
+        cohort=None,
+        completed_at=_dt.datetime(2026, 9, 22, 16, 0, tzinfo=_SEOUL),
+        entries=(entry,),
+        artifacts=(),
+        status=CaptureStatus.COMPLETE,
+    )
+    store.publish_manifest(manifest)
+
+    assert archive_intraday.archive_phase_complete(store, "2026-09-22", "regular") is False
+
+    class _BrokenStore:
+        def read_manifests(self, _date):
+            raise ValueError("unreadable manifest evidence")
+
+    assert archive_intraday.archive_phase_complete(_BrokenStore(), "2026-09-22", "regular") is False
+
+
+def test_archive_phase_complete_krx_required_only_from_start_date(tmp_path) -> None:
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_evening_manifest(store, "2026-09-10", CaptureDataset.MINUTE_BARS, "nxt_premarket", "COMPLETE", "pre")
+    _publish_evening_manifest(store, "2026-09-10", CaptureDataset.MINUTE_BARS, "nxt_aftermarket", "COMPLETE", "after")
+
+    assert archive_intraday.archive_phase_complete(store, "2026-09-10", "aftermarket") is True
+
+    store2 = _archive_store(tmp_path / "cap2")
+    _publish_evening_manifest(store2, "2026-09-22", CaptureDataset.MINUTE_BARS, "nxt_premarket", "COMPLETE", "pre")
+    _publish_evening_manifest(store2, "2026-09-22", CaptureDataset.MINUTE_BARS, "nxt_aftermarket", "COMPLETE", "after")
+
+    assert archive_intraday.archive_phase_complete(store2, "2026-09-22", "aftermarket") is False
+
+
+def test_archive_main_aftermarket_catchup_refused(monkeypatch, tmp_path) -> None:
+    import datetime as _dt
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import SEOUL as _SEOUL
+
+    _freeze_archive_now(monkeypatch, archive_intraday, _dt.datetime(2026, 9, 23, 0, 30, tzinfo=_SEOUL))
+    monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
+    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: [])
+    calls: list = []
+    monkeypatch.setattr(archive_intraday, "run_intraday_archive", lambda **k: calls.append(k) or (0, 0, 0))
+    outcomes: list = []
+    monkeypatch.setattr(archive_intraday, "record_run_outcome", lambda *a, **k: outcomes.append((a, k)))
+    monkeypatch.setattr("sys.argv", ["archive_intraday", "--phase", "aftermarket"])
+
+    archive_intraday.main()
+
+    assert calls == []
+    assert outcomes == [(("archive_intraday", "DEGRADED"), {"run_date": "2026-09-22", "reason": "aftermarket_not_replayable"})]
+
+
+def test_archive_main_already_archived_skipped(monkeypatch, tmp_path, caplog) -> None:
+    import datetime as _dt
+    import logging
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import SEOUL as _SEOUL, CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_evening_manifest(store, "2026-09-22", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", "bars")
+    _publish_evening_manifest(store, "2026-09-22", CaptureDataset.TRADE_TICKS, "regular", "COMPLETE", "ticks")
+    _freeze_archive_now(monkeypatch, archive_intraday, _dt.datetime(2026, 9, 22, 21, 0, tzinfo=_SEOUL))
+    monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
+    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
+    calls: list = []
+    monkeypatch.setattr(archive_intraday, "run_intraday_archive", lambda **k: calls.append(k) or (0, 0, 0))
+    monkeypatch.setattr("sys.argv", ["archive_intraday", "--phase", "regular", "--date", "2026-09-22"])
+
+    with caplog.at_level(logging.INFO, logger=archive_intraday.logger.name):
+        archive_intraday.main()
+
+    assert calls == []
+    assert any("already_archived" in rec.message for rec in caplog.records)
+
+
+def test_archive_main_all_past_runs_regular_only(monkeypatch, tmp_path) -> None:
+    import datetime as _dt
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import SEOUL as _SEOUL
+
+    _freeze_archive_now(monkeypatch, archive_intraday, _dt.datetime(2026, 9, 23, 7, 10, tzinfo=_SEOUL))
+    monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
+    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
+    calls: list = []
+    monkeypatch.setattr(archive_intraday, "run_intraday_archive", lambda **k: calls.append(k) or (1, 0, 1))
+    outcomes: list = []
+    monkeypatch.setattr(archive_intraday, "record_run_outcome", lambda *a, **k: outcomes.append((a, k)))
+    monkeypatch.setattr("sys.argv", ["archive_intraday", "--phase", "all"])
+
+    archive_intraday.main()
+
+    assert [item["phase"] for item in calls] == ["regular"]
+    assert calls[0]["snapshot_date"] == "2026-09-22"
+    assert outcomes == [(("archive_intraday", "DEGRADED"), {"run_date": "2026-09-22", "reason": "aftermarket_not_replayable"})]
+
+
+def test_archive_main_all_past_skips_when_regular_done(monkeypatch, tmp_path, caplog) -> None:
+    import datetime as _dt
+    import logging
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import SEOUL as _SEOUL, CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_evening_manifest(store, "2026-09-22", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", "bars")
+    _publish_evening_manifest(store, "2026-09-22", CaptureDataset.TRADE_TICKS, "regular", "COMPLETE", "ticks")
+    _freeze_archive_now(monkeypatch, archive_intraday, _dt.datetime(2026, 9, 23, 7, 10, tzinfo=_SEOUL))
+    monkeypatch.setattr(archive_intraday, "CollectionSettings", lambda: _raw_profile(tmp_path))
+    monkeypatch.setattr(archive_intraday, "_archive_target_codes", lambda _d: ["005930"])
+    calls: list = []
+    monkeypatch.setattr(archive_intraday, "run_intraday_archive", lambda **k: calls.append(k) or (0, 0, 0))
+    outcomes: list = []
+    monkeypatch.setattr(archive_intraday, "record_run_outcome", lambda *a, **k: outcomes.append((a, k)))
+    monkeypatch.setattr("sys.argv", ["archive_intraday", "--phase", "all"])
+
+    with caplog.at_level(logging.INFO, logger=archive_intraday.logger.name):
+        archive_intraday.main()
+
+    assert calls == []
+    assert outcomes == [(("archive_intraday", "DEGRADED"), {"run_date": "2026-09-22", "reason": "aftermarket_not_replayable"})]
+    assert any("already_archived" in rec.message for rec in caplog.records)

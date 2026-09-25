@@ -1,5 +1,5 @@
 [Unit]
-Description=KCA daily collect (Mon-Fri 15:15 KST)
+Description=KCA daily collect (Mon-Fri 15:20 KST)
 
 [Timer]
 OnCalendar=Mon..Fri 15:20:00 Asia/Seoul

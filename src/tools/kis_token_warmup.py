@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
-from datetime import datetime
+import re
+from collections.abc import Callable, Mapping
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,55 +26,101 @@ from src.api.kis.key_pool import (
     resolve_host_issued_credentials,
     token_cache_path,
 )
+from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day
 
 logger = logging.getLogger(__name__)
+
+_MSG_CD_RE = re.compile(r"EGW\d+")
+
+
+def _warmup_failure_reason(exc: BaseException) -> str:
+    """Summarize a slot failure without credentials (exception type + vendor msg_cd)."""
+    name = type(exc).__name__
+    match = _MSG_CD_RE.search(str(exc))
+    return f"{name}:{match.group(0)}" if match is not None else name
+
+
+def should_skip_warmup(today: date, *, session_day_fn: Callable[[date], SessionDay] | None = None) -> bool:
+    """Return True only when the verified calendar declares the date CLOSED.
+
+    Token issuance is cheap and consumers break without it, so only a verified
+    closure skips; UNKNOWN (calendar not extended) and SHIFTED dates still warm up.
+    """
+    resolver = session_day_fn if session_day_fn is not None else resolve_session_day
+    return resolver(today).kind is SessionKind.CLOSED
 
 
 async def warmup_host_tokens(
     session: aiohttp.ClientSession, env: Mapping[str, str], *, today: str | None = None
 ) -> dict[str, bool]:
-    """선언된 호스트 발급 키 전부를 당일 1회 발급하고 캐시 반영까지 검증한다.
+    """Issue every declared host-issued KIS token once per day, isolating slot failures.
+
+    Consumers on this host (kca jobs and the krx-alpha collector) only read the
+    shared cache, so one slot's vendor error must not deprive the remaining
+    slots of their daily token. Every slot is attempted; failures are raised
+    together after the loop so systemd retries the unit and only missing slots
+    are re-issued (the same-day guard skips slots already issued today).
 
     Args:
-        session: HTTP 세션.
-        env: KIS 자격증명 매핑.
-        today: 기준일(YYYY-MM-DD, KST). None이면 현재 KST 날짜.
+        session: HTTP session.
+        env: KIS credential mapping.
+        today: KST date (YYYY-MM-DD); None uses the current KST date.
 
     Returns:
-        슬롯명 -> 이번 실행에서 실제로 발급했는지 여부(당일 캐시 적중이면 False).
+        Slot name -> True when issued in this run, False on a same-day cache hit.
 
     Raises:
-        RuntimeError: 발급 호출은 성공했으나 토큰 캐시가 당일자로 갱신되지 않은 경우.
-            읽기전용 마운트나 권한 오류로 소비자가 토큰을 읽지 못하는 상태를 침묵시키지 않는다.
+        RuntimeError: At least one slot failed to issue or its cache was not
+            refreshed to today; the message lists every failed slot with its
+            key_id and exception type, never credentials.
     """
     day = today or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
     results: dict[str, bool] = {}
+    failures: list[str] = []
     for cred in resolve_host_issued_credentials(env):
-        token_file = token_cache_path(cred.app_key, settings.KIS_TOKEN_CACHE_DIR)
-        client = KisApiClient(  # type: ignore[no-untyped-call]
-            app_key=cred.app_key,
-            app_secret=cred.app_secret,
-            hts_id=cred.hts_id,
-            token_file=str(token_file),
-        )
-        issued = await client.issue_daily_token(session)
-        results[cred.slot] = issued
-        logger.info(
-            "[SYS] stage=kis_token_warmup slot=%s key_id=%s issued=%s",
-            cred.slot,
-            kis_key_id(cred.app_key),
-            issued,
-        )
-        cached = read_token_issued_date(token_file)
-        if cached != day:
-            raise RuntimeError(
-                f"token cache not refreshed slot={cred.slot} key_id={kis_key_id(cred.app_key)} cached={cached} expected={day}"
+        key_id = kis_key_id(cred.app_key)
+        try:
+            token_file = token_cache_path(cred.app_key, settings.KIS_TOKEN_CACHE_DIR)
+            client = KisApiClient(  # type: ignore[no-untyped-call]
+                app_key=cred.app_key,
+                app_secret=cred.app_secret,
+                hts_id=cred.hts_id,
+                token_file=str(token_file),
             )
+            issued = await client.issue_daily_token(session)
+            results[cred.slot] = issued
+            logger.info(
+                "[SYS] stage=kis_token_warmup slot=%s key_id=%s issued=%s",
+                cred.slot,
+                key_id,
+                issued,
+            )
+            cached = read_token_issued_date(token_file)
+            if cached != day:
+                raise RuntimeError(
+                    f"token cache not refreshed slot={cred.slot} key_id={key_id} cached={cached} expected={day}"
+                )
+        except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError) as exc:
+            reason = _warmup_failure_reason(exc)
+            logger.error(
+                "[SYS] stage=kis_token_warmup slot=%s key_id=%s status=FAILED reason=%s",
+                cred.slot,
+                key_id,
+                reason,
+            )
+            results.pop(cred.slot, None)
+            failures.append(f"{cred.slot}(key_id={key_id}, reason={reason})")
+    if failures:
+        raise RuntimeError(f"kis_token_warmup failed slots: {'; '.join(failures)}")
     return results
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    if should_skip_warmup(today):
+        logger.info("[SYS] stage=kis_token_warmup status=SKIP reason=non_trading_day date=%s", today.isoformat())
+        return
     env = load_kis_env(Path(settings.BASE_DIR) / ".env")
 
     async def _run() -> dict[str, bool]:

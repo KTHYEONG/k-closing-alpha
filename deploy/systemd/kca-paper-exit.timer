@@ -1,5 +1,5 @@
 [Unit]
-Description=KCA paper exit (Mon-Fri 09:00 KST)
+Description=KCA paper exit (Mon-Fri 09:01 KST; booking window 09:00:30-09:30)
 
 [Timer]
 OnCalendar=Mon..Fri 09:01:00 Asia/Seoul

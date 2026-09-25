@@ -40,7 +40,7 @@ class CollectionSettings(BaseSettings):
         COLLECTION_ALTDATA_LOOKBACK_DAYS: Rolling re-observation window, default 30.
         COLLECTION_VERIFIED_CHART_ROUTES: Explicit vendor chart-to-venue mapping, default empty.
         COLLECTION_OPEN_CONFIRM_SECONDS: Opening confirmation budget, default 180.
-        COLLECTION_SESSION_OVERRIDES: Verified date-specific session times, default empty.
+        COLLECTION_SESSION_OVERRIDES: Operator emergency session clocks resolved by src.data.session_calendar.resolve_session_day; not a second calendar.
 
     Raises:
         ValueError: Invalid limits, duplicate slots, or enabled auctions without

@@ -29,6 +29,7 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
+from src.data.session_calendar import SessionKind, resolve_session_day, trading_session_gate
 from src.utils.display import Colors
 from src.daily import archive
 from src.daily.universe_scan import fetch_candidate_stock_list, fetch_trade_value_union
@@ -436,6 +437,38 @@ def flag_price_anomaly(df: pd.DataFrame) -> pd.Series:
     return anomaly.fillna(False).astype(bool)
 
 
+def evaluate_realtime_coverage(
+    df: pd.DataFrame, *, min_coverage: float = REALTIME_MIN_QUOTE_COVERAGE
+) -> tuple[dict[str, Any], CaptureStatus, str]:
+    """Classify decision-input quote coverage without raising on a shortfall.
+
+    The decision manifest must carry the coverage verdict so that downstream
+    readers can refuse a degraded snapshot; a shortfall is therefore data, not
+    control flow, at publication time.
+
+    Args:
+        df: Enriched wide snapshot with QUOTE_FAILED_COL and PRICE_ANOMALY_COL.
+        min_coverage: Minimum non-degraded row fraction.
+
+    Returns:
+        (report with n_raw/n_degraded/coverage, COMPLETE or PARTIAL, reason
+        "" or "coverage_below_threshold:<coverage>").
+
+    Raises:
+        ValueError: df is empty (an empty snapshot is not a coverage verdict).
+    """
+    if len(df) == 0:
+        raise ValueError("check_realtime_collection_coverage received an empty snapshot")
+    degraded = df[QUOTE_FAILED_COL].fillna(False).astype(bool) | df[PRICE_ANOMALY_COL].fillna(False).astype(bool)
+    n_raw = len(df)
+    n_degraded = int(degraded.sum())
+    coverage = 1.0 - (n_degraded / n_raw)
+    report = {"n_raw": n_raw, "n_degraded": n_degraded, "coverage": round(coverage, 6)}
+    if coverage < float(min_coverage):
+        return report, CaptureStatus.PARTIAL, f"coverage_below_threshold:{coverage:.4f}"
+    return report, CaptureStatus.COMPLETE, ""
+
+
 def check_realtime_collection_coverage(
     df: pd.DataFrame, *, min_coverage: float = REALTIME_MIN_QUOTE_COVERAGE
 ) -> dict[str, Any]:
@@ -455,17 +488,15 @@ def check_realtime_collection_coverage(
     Raises:
         ValueError: df가 비었거나 coverage가 min_coverage 미만인 경우.
     """
-    if len(df) == 0:
-        raise ValueError("check_realtime_collection_coverage received an empty snapshot")
-    degraded = df[QUOTE_FAILED_COL].fillna(False).astype(bool) | df[PRICE_ANOMALY_COL].fillna(False).astype(bool)
-    n_raw = len(df)
-    n_degraded = int(degraded.sum())
-    coverage = 1.0 - (n_degraded / n_raw)
-    if coverage < float(min_coverage):
+    report, status, _reason = evaluate_realtime_coverage(df, min_coverage=min_coverage)
+    if status == CaptureStatus.PARTIAL:
+        n_raw = report["n_raw"]
+        n_degraded = report["n_degraded"]
+        coverage = 1.0 - (n_degraded / n_raw)
         raise ValueError(
             f"real-time collection coverage {coverage:.4f} below {min_coverage}: n_degraded={n_degraded}/{n_raw}"
         )
-    return {"n_raw": n_raw, "n_degraded": n_degraded, "coverage": round(coverage, 6)}
+    return report
 
 
 async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None = None, toss_client: Any | None = None, on_page: Any | None = None) -> list[dict]:
@@ -894,6 +925,16 @@ async def main(force: bool = False):
     data_kwargs = kis_data_client_kwargs()
     _validate_hts_id(data_kwargs["hts_id"])
     _validate_decision_window(datetime.now(ZoneInfo("Asia/Seoul")), force=force)
+    if not force:
+        session_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+        session_day = resolve_session_day(session_today)
+        if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
+            logger.info(
+                "[DATA] stage=collect status=SKIP reason=%s date=%s",
+                trading_session_gate(session_day),
+                session_today.isoformat(),
+            )
+            return
 
     # aiohttp 세션 설정 강화 (네트워크 안정성 향상 + DNS 해결)
     timeout = aiohttp.ClientTimeout(
@@ -1077,6 +1118,7 @@ async def main(force: bool = False):
         enrichment_completed_at = datetime.now(ZoneInfo("Asia/Seoul"))
         df["feature_available_timestamp"] = enrichment_completed_at
         if store is not None and cohort is not None and run_id is not None:
+            report, status, reason = evaluate_realtime_coverage(df)
             entries = (
                 CoverageEntry(
                     symbol=None,
@@ -1084,22 +1126,33 @@ async def main(force: bool = False):
                     venue="KRX",
                     session="regular",
                     scheduled_at=None,
-                    status=CaptureStatus.COMPLETE,
+                    status=status,
                     rows=len(df),
                     first_event_time=None,
                     last_event_time=None,
-                    reason="decision-input",
+                    reason="decision-input" if status is CaptureStatus.COMPLETE else reason,
                     raw_refs=(),
                 ),
             )
             store.publish_decision(df, cohort=cohort, run_id=run_id, completed_at=enrichment_completed_at, entries=entries)
-            coverage_report = check_realtime_collection_coverage(df)
+            logger.info(
+                "[DATA] stage=realtime_coverage n_raw=%d n_degraded=%d coverage=%.4f status=%s",
+                report["n_raw"],
+                report["n_degraded"],
+                report["coverage"],
+                status.value,
+            )
+            if status is CaptureStatus.PARTIAL:
+                raise ValueError(reason)
+            coverage_report = report
         else:
             coverage_report = check_realtime_collection_coverage(df)
-        logger.info(
-            "[DATA] stage=realtime_coverage n_raw=%d n_degraded=%d coverage=%.4f",
-            coverage_report["n_raw"], coverage_report["n_degraded"], coverage_report["coverage"],
-        )
+            logger.info(
+                "[DATA] stage=realtime_coverage n_raw=%d n_degraded=%d coverage=%.4f",
+                coverage_report["n_raw"],
+                coverage_report["n_degraded"],
+                coverage_report["coverage"],
+            )
 
         stored_rows = persist_daily_snapshot(df, snapshot_date)
 

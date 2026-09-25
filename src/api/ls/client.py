@@ -66,7 +66,10 @@ class LsApiClient:
         self.token: str | None = None
         self._lock: asyncio.Lock | None = None
         self._token_lock: asyncio.Lock | None = None
-        self._min_interval: float = 1.05
+        # LS_APP_KEY는 krx-alpha와 공유되어 프로세스 내부 페이싱만으로는 키 단위 한도를 보장할 수 없다.
+        self._min_interval: float = float(getattr(settings, "LS_MIN_INTERVAL_SECONDS", 1.05) or 1.05)
+        self._rate_limit_max_retries: int = int(getattr(settings, "LS_RATE_LIMIT_MAX_RETRIES", 5) or 5)
+        self._rate_limit_backoff: float = float(getattr(settings, "LS_RATE_LIMIT_BACKOFF_SECONDS", 1.2) or 1.2)
         self._last_call_time: float = 0.0
 
     async def ensure_token(self, session) -> str:
@@ -102,14 +105,15 @@ class LsApiClient:
         body: dict,
         tr_cont: str = "N",
         tr_cont_key: str = "",
-        max_retries: int = 3,
+        max_retries: int | None = None,
     ) -> tuple[dict, dict]:
         if not self.token:
             await self.ensure_token(session)
         if self._lock is None:
             self._lock = asyncio.Lock()
+        limit = int(max_retries) if max_retries is not None else self._rate_limit_max_retries
 
-        for attempt in range(max_retries):
+        for attempt in range(limit):
             async with self._lock:
                 loop = asyncio.get_running_loop()
                 now = loop.time()
@@ -142,10 +146,14 @@ class LsApiClient:
                     resp_headers = {}
 
             rsp_cd = str(data.get("rsp_cd", ""))
-            if rsp_cd == "IGW00201" and attempt < max_retries - 1:
-                logger.warning("LS rate limit hit (IGW00201). Retrying in 1.2s... (attempt %d/%d)", attempt + 1, max_retries)
-                await asyncio.sleep(1.2)
+            if rsp_cd == "IGW00201" and attempt < limit - 1:
+                wait = self._rate_limit_backoff * (2**attempt)
+                logger.warning("LS rate limit hit (IGW00201). Retrying in %.1fs... (attempt %d/%d)", wait, attempt + 1, limit)
+                await asyncio.sleep(wait)
+                self._last_call_time = asyncio.get_running_loop().time()
                 continue
+            if rsp_cd == "IGW00201":
+                logger.warning("[DATA] stage=ls_tr tr_cd=%s status=RATE_LIMITED attempts=%d", tr_cd, limit)
             return data, resp_headers
         return data, resp_headers
 

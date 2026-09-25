@@ -62,6 +62,21 @@ def test_dockerfile_keeps_uv_cache_out_of_image() -> None:
     assert "ripgrep" in dockerfile
 
 
+def test_deploy_validates_commit_image_before_moving_latest() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    pull = "docker pull ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA"
+    run = "docker run --rm -v ~/k-closing-alpha/artifacts:/app/artifacts:ro ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA uv run python -m src.tools.deploy_preflight"
+    tag = "docker tag ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA ghcr.io/kthyeong/k-closing-alpha:latest"
+    reset = "git reset --hard $COMMIT_SHA"
+
+    positions = [workflow.index(line) for line in (pull, run, tag, reset)]
+    assert positions == sorted(positions)
+    assert "docker pull ghcr.io/kthyeong/k-closing-alpha:latest" not in workflow
+
+
 def test_deploy_workflow_builds_native_arm64_and_tags_commit_sha() -> None:
     from pathlib import Path
 

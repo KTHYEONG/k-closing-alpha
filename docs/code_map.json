@@ -358,7 +358,10 @@
     "testing": "tests/unit/tools/test_alerts.py"
   },
   "src/tools/backup_prune.py": {
-    "testing": "tests/unit/tools/test_backup_prune.py"
+    "testing": [
+      "tests/unit/tools/test_backup_prune.py",
+      "tests/unit/tools/test_offsite_backup.py"
+    ]
   },
   "src/tools/code_sync.py": {
     "testing": "tests/unit/tools/test_code_sync.py"
@@ -407,5 +410,11 @@
   },
   "src/backfill/altdata/dart_keys.py": {
     "testing": "tests/unit/backfill/test_altdata_dart_keys.py"
+  },
+  "src/data/session_calendar.py": {
+    "testing": "tests/unit/data/test_session_calendar.py"
+  },
+  "src/tools/deploy_preflight.py": {
+    "testing": "tests/unit/tools/test_deploy_preflight.py"
   }
 }

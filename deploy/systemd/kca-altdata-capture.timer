@@ -1,8 +1,8 @@
 [Unit]
-Description=KCA optional slow-data capture (daily 21:35:00 KST)
+Description=KCA optional slow-data capture (Mon-Fri 21:35 KST)
 
 [Timer]
-OnCalendar=*-*-* 21:35:00 Asia/Seoul
+OnCalendar=Mon..Fri 21:35:00 Asia/Seoul
 AccuracySec=1s
 Persistent=false
 Unit=kca-altdata-capture.service

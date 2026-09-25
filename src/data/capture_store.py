@@ -420,6 +420,10 @@ class CaptureStore:
     def read_cohort(self, snapshot_date: str, *, available_by: datetime) -> Cohort:
         """Resolve a declared cohort without inferring it from trading picks or stale days.
 
+        A PARTIAL decision manifest still declares the day's population; quote
+        coverage does not change membership. Trading readers use read_decision,
+        which accepts COMPLETE only.
+
         Args:
             snapshot_date: Exact actual trading date requested by the caller.
             available_by: Latest permitted capture publication time.
@@ -435,7 +439,9 @@ class CaptureStore:
         qualifying = [
             item
             for item in self.read_manifests(snapshot_date)
-            if item.status == CaptureStatus.COMPLETE and item.completed_at <= cutoff and item.cohort is not None
+            if item.status in (CaptureStatus.COMPLETE, CaptureStatus.PARTIAL)
+            and item.completed_at <= cutoff
+            and item.cohort is not None
         ]
         if not qualifying:
             raise FileNotFoundError(f"no qualifying cohort: {snapshot_date!r}")

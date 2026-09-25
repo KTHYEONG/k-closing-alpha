@@ -161,6 +161,17 @@ def test_alert_template_service_and_critical_path_onfailure_hooks() -> None:
         assert "OnFailure=kca-alert@%n.service" in text, name
 
 
+def test_alert_template_bounds_its_runtime() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    lines = (root / "kca-alert@.service").read_text(encoding="utf-8").splitlines()
+
+    assert "TimeoutStartSec=5min" in lines
+    exec_line = next(line for line in lines if line.startswith("ExecStart="))
+    assert "--unit %i" in exec_line
+
+
 def test_retrain_timer_exists_and_install_script_enables_it() -> None:
     import pathlib
 
@@ -295,7 +306,7 @@ def test_kis_cache_mounted_only_for_units_using_kis_client() -> None:
         "kca-predict.service",
         "kca-price-ingest.service",
     )
-    mount = "-v %h/.cache/kis:/root/.cache/kis"
+    mount = "-v %h/.cache/kis:/app/.cache/kis"
     for name in needs_kis_cache:
         assert mount in (root / name).read_text(encoding="utf-8"), name
 
@@ -308,7 +319,7 @@ def test_kis_using_containerized_units_forward_key_pool_env_and_cache() -> None:
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     shared_env = "--env-file %h/quant-secrets/k-closing-alpha.env"
     pool_env = "--env-file %h/quant-secrets/kis-data.env"
-    mount = "-v %h/.cache/kis:/root/.cache/kis"
+    mount = "-v %h/.cache/kis:/app/.cache/kis"
     kis_units = (
         "kca-archive-intraday.service",
         "kca-archive-intraday-regular.service",
@@ -604,7 +615,7 @@ def test_kis_token_warmup_timer_precedes_first_kis_job() -> None:
     assert "Persistent=true" in timer
     assert "docker run --rm" in service
     assert "src.tools.kis_token_warmup" in service
-    assert "-v %h/.cache/kis:/root/.cache/kis" in service
+    assert "-v %h/.cache/kis:/app/.cache/kis" in service
     assert "--env-file %h/quant-secrets/kis-data.env" in service
     assert "OnFailure=kca-alert@%n.service" in service
 
@@ -706,3 +717,176 @@ def test_backup_prune_timer_runs_every_weekday() -> None:
     assert "OnCalendar=Mon..Fri 21:00:00 Asia/Seoul" in text
     assert "*-*-01" not in text
     assert "Persistent=true" in text
+
+
+def test_paper_entry_orders_after_finalize() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    lines = (root / "kca-paper-entry.service").read_text(encoding="utf-8").splitlines()
+
+    # Then: 15:34 백스톱이 아직 도는 finalize를 기다린다(양쪽 발화의 15:45 재기동 경합은 원장 락이 제거)
+    assert "After=kca-finalize-close.service" in lines
+
+
+def test_paper_exit_timeout_covers_max_wait_plus_quote_budget() -> None:
+    import pathlib
+    import re
+
+    from src.config.market_session import PAPER_EXIT_MAX_PRESTART_WAIT_SECONDS
+    from src.daily.paper_trade import (
+        PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS,
+        PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS,
+    )
+
+    lines = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / "deploy"
+        / "systemd"
+        / "kca-paper-exit.service"
+    ).read_text(encoding="utf-8").splitlines()
+    match = next(re.search(r"TimeoutStartSec=(\d+)min", line) for line in lines if "TimeoutStartSec=" in line)
+    timeout_seconds = int(match.group(1)) * 60
+
+    # Then: 최대 사전대기 + 재조회 간격 + 시도당 1회 조회+차트 왕복(관대한 30초 가정)도 15분 안에 든다
+    per_attempt_round_seconds = 30.0
+    budget = (
+        PAPER_EXIT_MAX_PRESTART_WAIT_SECONDS
+        + PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS * (PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS - 1)
+        + per_attempt_round_seconds * PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS
+    )
+    assert budget < timeout_seconds
+
+
+def test_archive_ready_constants_match_timer_schedules() -> None:
+    import pathlib
+    import re
+
+    from src.config.market_session import (
+        ARCHIVE_AFTERMARKET_READY_HHMMSS,
+        ARCHIVE_REGULAR_READY_HHMMSS,
+    )
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+
+    def _oncalendar_hhmmss(name: str) -> str:
+        text = (root / name).read_text(encoding="utf-8")
+        match = re.search(r"OnCalendar=.*?(\d{2}):(\d{2}):(\d{2})", text)
+        assert match is not None, name
+        assert "Persistent=true" in text.splitlines(), name
+        return "".join(match.groups())
+
+    assert _oncalendar_hhmmss("kca-archive-intraday-regular.timer") == ARCHIVE_REGULAR_READY_HHMMSS
+    assert _oncalendar_hhmmss("kca-archive-intraday.timer") == ARCHIVE_AFTERMARKET_READY_HHMMSS
+
+
+def test_warmup_unit_retries_without_per_attempt_alerts() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-kis-token-warmup.service").read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    assert "Restart=on-failure" in lines
+    assert "RestartMode=direct" in lines
+    assert "RestartSec=5min" in lines
+    assert "StartLimitBurst=4" in lines
+    assert "StartLimitIntervalSec=2h" in lines
+    assert "Type=oneshot" in lines
+    assert "-v %h/.cache/kis:/app/.cache/kis" in text
+    assert "OnFailure=kca-alert@%n.service" in text
+
+
+def test_warmup_retry_budget_finishes_before_first_consumer() -> None:
+    import pathlib
+    import re
+    from datetime import datetime
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    service = (root / "kca-kis-token-warmup.service").read_text(encoding="utf-8")
+    timer = (root / "kca-kis-token-warmup.timer").read_text(encoding="utf-8")
+
+    burst = int(re.search(r"StartLimitBurst=(\d+)", service).group(1))  # type: ignore[union-attr]
+    restart_min = int(re.search(r"RestartSec=(\d+)min", service).group(1))  # type: ignore[union-attr]
+    start = datetime.strptime(re.search(r"OnCalendar=\S+ (\d{2}:\d{2}:\d{2})", timer).group(1), "%H:%M:%S")  # type: ignore[union-attr]
+
+    end_minute = start.hour * 60 + start.minute + (burst - 1) * restart_min
+    assert end_minute < 8 * 60
+
+
+def test_core_snapshot_unit_holds_shared_drive_lock_and_alerts() -> None:
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+    service = (base / "systemd" / "kca-core-snapshot.service").read_text(encoding="utf-8")
+    timer = (base / "systemd" / "kca-core-snapshot.timer").read_text(encoding="utf-8")
+    install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
+
+    assert "/usr/bin/flock -w 7200 %t/quant-gdrive.lock" in service
+    assert "src.tools.core_snapshot" in service
+    assert "OnFailure=kca-alert@%n.service" in service
+    assert "Persistent=true" in timer
+    assert "OnCalendar=Sun 10:00:00 Asia/Seoul" in timer
+    assert "kca-core-snapshot.timer" in install_text
+
+
+def test_containers_run_as_host_user_with_tmp_caches() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    services = [p for p in sorted(root.glob("kca-*.service")) if "docker run --rm" in p.read_text(encoding="utf-8")]
+    assert services
+    for svc in services:
+        text = svc.read_text(encoding="utf-8")
+        exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
+        assert "--user %U:%G" in exec_line, svc.name
+        assert "-e HOME=/tmp" in exec_line, svc.name
+        assert "-e UV_CACHE_DIR=/tmp/uv-cache" in exec_line, svc.name
+
+
+def test_kis_cache_mount_follows_non_root_home() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    needs_kis_cache = (
+        "kca-archive-intraday.service",
+        "kca-archive-intraday-regular.service",
+        "kca-collect.service",
+        "kca-finalize-close.service",
+        "kca-kis-token-warmup.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-predict.service",
+        "kca-price-ingest.service",
+    )
+    for name in needs_kis_cache:
+        text = (root / name).read_text(encoding="utf-8")
+        assert "-v %h/.cache/kis:/app/.cache/kis" in text, name
+        assert "-e KIS_TOKEN_CACHE_DIR=/app/.cache/kis" in text, name
+    for svc in sorted(root.glob("kca-*.service")):
+        assert "/root/.cache/kis" not in svc.read_text(encoding="utf-8"), svc.name
+
+
+def test_timer_descriptions_state_real_schedule() -> None:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    for timer in sorted(root.glob("kca-*.timer")):
+        text = timer.read_text(encoding="utf-8")
+        cals = re.findall(r"OnCalendar=\S+ (\d{2}):(\d{2}):\d{2}", text)
+        if len(cals) != 1:
+            continue
+        desc_match = re.search(r"Description=.*?(\d{2}):(\d{2})", text)
+        if desc_match is None:
+            continue
+        assert (desc_match.group(1), desc_match.group(2)) == (cals[0][0], cals[0][1]), timer.name
+
+
+def test_altdata_timer_fires_on_weekdays_only() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    lines = (root / "kca-altdata-capture.timer").read_text(encoding="utf-8").splitlines()
+    assert "OnCalendar=Mon..Fri 21:35:00 Asia/Seoul" in lines
+    assert "Persistent=false" in lines
