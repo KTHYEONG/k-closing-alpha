@@ -121,6 +121,7 @@
   },
   "src/backfill/intraday/backfill_minute_history.py": {
     "testing": [
+      "tests/unit/backfill/test_backfill_minute_history.py",
       "tests/unit/backfill/test_backfill_minute_history_toss.py",
       "tests/unit/test_config_constant_consolidation.py",
       "tests/unit/test_dead_code_subtraction.py"
@@ -133,7 +134,8 @@
     "testing": [
       "tests/unit/backfill/test_backfill_minute_history.py",
       "tests/unit/backfill/test_collector.py",
-      "tests/unit/daily/test_archive_intraday.py"
+      "tests/unit/daily/test_archive_intraday.py",
+      "tests/unit/data/test_capture_store.py"
     ]
   },
   "src/backfill/kis_flow_backfill.py": {
@@ -141,6 +143,9 @@
   },
   "src/backfill/krx_panel_rebuild.py": {
     "testing": "tests/unit/backfill/test_krx_panel_rebuild.py"
+  },
+  "src/config/_env.py": {
+    "testing": "tests/unit/config/test_settings_delegation.py"
   },
   "src/config/alerts.py": {
     "testing": "tests/unit/config/test_alert_settings.py"
@@ -182,10 +187,7 @@
     "testing": "tests/unit/daily/test_archive.py"
   },
   "src/daily/archive_intraday.py": {
-    "testing": [
-      "tests/integration/daily/test_archive_intraday.py",
-      "tests/unit/daily/test_archive_intraday.py"
-    ]
+    "testing": "tests/unit/daily/test_archive_intraday.py"
   },
   "src/daily/auction_capture.py": {
     "testing": "tests/unit/daily/test_auction_capture.py"
@@ -365,7 +367,9 @@
       "tests/conftest.py",
       "tests/unit/config/test_altdata.py",
       "tests/unit/config/test_base.py",
+      "tests/unit/config/test_settings_access_guard.py",
       "tests/unit/config/test_settings_compat.py",
+      "tests/unit/config/test_settings_delegation.py",
       "tests/unit/test_dead_code_subtraction.py"
     ]
   },
@@ -411,6 +415,9 @@
   "src/tools/offsite_backup.py": {
     "testing": "tests/unit/tools/test_offsite_backup.py"
   },
+  "src/tools/offsite_common.py": {
+    "testing": "tests/unit/tools/test_offsite_common.py"
+  },
   "src/tools/paper_ledger_correct.py": {
     "testing": "tests/unit/tools/test_paper_ledger_correct.py"
   },
@@ -418,12 +425,21 @@
     "testing": "tests/unit/tools/test_provision_env.py"
   },
   "src/tools/repair_intraday_capture.py": {
-    "testing": "tests/unit/daily/test_archive_intraday.py"
+    "testing": [
+      "tests/unit/daily/test_archive_intraday.py",
+      "tests/unit/data/test_capture_store.py"
+    ]
   },
   "src/tools/run_outcome.py": {
     "testing": "tests/unit/tools/test_run_outcome.py"
   },
+  "src/utils/cli_logging.py": {
+    "testing": "tests/unit/utils/test_cli_logging.py"
+  },
   "src/utils/display.py": {
     "testing": "tests/unit/utils/test_display.py"
+  },
+  "src/utils/file_lock.py": {
+    "testing": "tests/unit/utils/test_file_lock.py"
   }
 }
