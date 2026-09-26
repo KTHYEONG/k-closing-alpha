@@ -5,6 +5,21 @@ Settings 경로 해석, 샘플 매매일지 DataFrame 등을 제공합니다.
 
 from __future__ import annotations
 
+import os
+# 다중 프로젝트 및 로컬 동시성 환경 리소스 안전 가드:
+# Polars, NumPy, OpenBLAS, MKL, Numba 등이 8코어 머신에서 스레드를 과도하게 점유하지 못하도록 상한선 강제
+for _key, _val in (
+    ("POLARS_MAX_THREADS", "2"),
+    ("OMP_NUM_THREADS", "1"),
+    ("OPENBLAS_NUM_THREADS", "1"),
+    ("MKL_NUM_THREADS", "1"),
+    ("NUMBA_NUM_THREADS", "1"),
+    ("RAY_ACCEL_NUM_WORKERS", "1"),
+    ("PYTHONDONTWRITEBYTECODE", "1"),
+):
+    os.environ.setdefault(_key, _val)
+
+
 from collections.abc import Generator
 from pathlib import Path
 
