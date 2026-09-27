@@ -109,21 +109,41 @@ def test_append_orderbook_snapshots_merges_column_union_across_sweeps(tmp_path, 
     assert stored["antc_cnpr"].isna().sum() == 1
 
 
-def test_append_orderbook_snapshots_recovers_from_unreadable_existing_partition(tmp_path, monkeypatch) -> None:
-    """기존 파티션 파일이 손상되어 읽기 실패해도 신규 행만으로 안전하게 계속 진행한다."""
+def test_append_orderbook_refuses_to_overwrite_unreadable_partition(tmp_path, monkeypatch) -> None:
+    """기존 파티션이 손상되어 읽을 수 없으면 쓰지 않고 typed error로 실패한다."""
     from datetime import datetime
 
+    import pytest
+
+    from src.data import orderbook_store
+    from src.data.io_utils import ExistingStoreUnreadableError
+
+    monkeypatch.setattr(orderbook_store.settings, "HISTORY_DIR", tmp_path)
+
+    target = orderbook_store.orderbook_partition_path("2026-09-05")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"not a valid parquet file")
+
+    rows = [{"capture_ts": datetime(2026, 9, 5, 15, 20), "symbol": "005930", "venue": "J", "capture_reason": "auction", "askp1": 70000}]
+
+    with pytest.raises(ExistingStoreUnreadableError, match="2026-09-05"):
+        orderbook_store.append_orderbook_snapshots(rows, "2026-09-05")
+
+    assert target.read_bytes() == b"not a valid parquet file"
+
+
+def test_append_orderbook_empty_rows_noop_even_if_partition_corrupt(tmp_path, monkeypatch) -> None:
+    """빈 입력은 읽기 전에 0을 반환하므로 손상된 파티션도 건드리지 않는다."""
     from src.data import orderbook_store
 
     monkeypatch.setattr(orderbook_store.settings, "HISTORY_DIR", tmp_path)
 
     target = orderbook_store.orderbook_partition_path("2026-09-05")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("not a valid parquet file")
+    target.write_bytes(b"not a valid parquet file")
 
-    rows = [{"capture_ts": datetime(2026, 9, 5, 15, 20), "symbol": "005930", "venue": "J", "capture_reason": "auction", "askp1": 70000}]
-
-    assert orderbook_store.append_orderbook_snapshots(rows, "2026-09-05") == 1
+    assert orderbook_store.append_orderbook_snapshots([], "2026-09-05") == 0
+    assert target.read_bytes() == b"not a valid parquet file"
 
 
 def test_build_orderbook_rows_merges_output1_and_output2() -> None:

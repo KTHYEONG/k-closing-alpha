@@ -139,6 +139,7 @@ def run_offsite_backup(
     now: datetime,
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     seal_fn: Callable[..., SealReport] = seal_and_upload,
+    accepted_missing: frozenset[str] = frozenset(),
 ) -> BackupRunReport:
     """Run one nightly offsite backup: seal capture segments, then loose copies.
 
@@ -174,7 +175,7 @@ def run_offsite_backup(
         for item in raw_previous
         if isinstance(item.get("relpath"), str)
     ]
-    core_issues = validate_core_panels(current_stats, previous_stats)
+    core_issues = validate_core_panels(current_stats, previous_stats, accepted_missing=accepted_missing)
     if core_issues:
         steps["core_panels"] = {"status": "failed", "issues": core_issues}
     else:
@@ -289,13 +290,14 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry
     import time as _time
 
     parser = argparse.ArgumentParser(description="Nightly offsite backup: seal segments then loose copy")
-    parser.parse_args(argv)
+    parser.add_argument("--accept-missing", action="append", default=[], metavar="RELPATH")
+    args = parser.parse_args(argv)
     project_root = Path.cwd()
     capture_root = _capture_root()
     now = datetime.now(KST)
     started = _time.monotonic()
     try:
-        report = run_offsite_backup(project_root, capture_root, now=now)
+        report = run_offsite_backup(project_root, capture_root, now=now, accepted_missing=frozenset(args.accept_missing))
     except RuntimeError as exc:
         logger.info("[SYS] stage=offsite_backup status=failed duration_s=%.0f error=%s", _time.monotonic() - started, exc)
         sys.exit(1)

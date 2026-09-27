@@ -11,7 +11,7 @@ from typing import Any
 import pandas as pd
 
 from src import settings
-from src.data.io_utils import atomic_write_parquet
+from src.data.io_utils import atomic_write_parquet, read_existing_parquet
 
 logger = logging.getLogger(__name__)
 
@@ -80,12 +80,8 @@ def append_orderbook_snapshots(rows: list[dict], snapshot_date: str) -> int:
         return 0
     target = orderbook_partition_path(snapshot_date)
     new_df = pd.DataFrame(rows)
-    try:
-        existing = pd.read_parquet(target) if target.exists() else pd.DataFrame()
-    except Exception as e:
-        logger.warning("[DATA] Failed to read existing orderbook partition %s; writing new only: %s", target, e)
-        existing = pd.DataFrame()
-    if existing is None or len(existing) == 0:
+    existing = read_existing_parquet(target)
+    if len(existing) == 0:
         merged = new_df.copy()
     else:
         union_cols = sorted(set(existing.columns.tolist()) | set(new_df.columns.tolist()))

@@ -15,6 +15,8 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from src.config.base import RANK_POOL_PARQUET_NAME, TOPK_DECISIONS_PARQUET_NAME
+from src.ml.retrain_gate import BUNDLE_FILENAME
+from src.ml.retrain_registry import RETRAIN_REGISTRY_FILENAME
 from src.tools.offsite_common import (
     DATED_DIR_RE as _DATED_DIR_RE,
 )
@@ -46,6 +48,7 @@ FIXED_CORE_REL_PATHS: tuple[str, ...] = (
 )
 PAPER_GLOB_DIR: str = "data/paper"
 BUNDLE_DIR: str = "artifacts/models/topk_ranker"
+CORE_BUNDLE_TRACKED_FILENAMES: tuple[str, ...] = (BUNDLE_FILENAME, RETRAIN_REGISTRY_FILENAME)
 
 _DATE_COLUMNS: tuple[str, ...] = ("date", "decision_date", "trading_date")
 
@@ -69,6 +72,27 @@ class CorePanelStat:
     max_date: str
 
 
+def is_tracked_core_relpath(relpath: str) -> bool:
+    """Whether a relpath belongs to the core set the integrity baseline guards.
+
+    Fixed core panels, paper ledgers (data/paper/*.parquet) and the declared
+    live-bundle files are tracked; operator scratch copies inside the bundle
+    directory (*.bak, temp files) are not, so housekeeping cannot trip the
+    missing-file alarm.
+    """
+    if relpath in FIXED_CORE_REL_PATHS:
+        return True
+    paper_prefix = PAPER_GLOB_DIR + "/"
+    if relpath.startswith(paper_prefix):
+        rest = relpath[len(paper_prefix):]
+        return "/" not in rest and rest.endswith(".parquet")
+    bundle_prefix = BUNDLE_DIR + "/"
+    if relpath.startswith(bundle_prefix):
+        rest = relpath[len(bundle_prefix):]
+        return "/" not in rest and rest in CORE_BUNDLE_TRACKED_FILENAMES
+    return False
+
+
 def core_panel_paths(project_root: Path) -> tuple[Path, ...]:
     """Files whose loss or corruption cannot be rebuilt from vendor APIs alone.
 
@@ -90,6 +114,8 @@ def core_panel_paths(project_root: Path) -> tuple[Path, ...]:
     if bundle_dir.is_dir() and not bundle_dir.is_symlink():
         for child in sorted(bundle_dir.rglob("*")):
             if child.is_symlink() or not child.is_file():
+                continue
+            if not is_tracked_core_relpath(child.relative_to(root).as_posix()):
                 continue
             if child not in paths:
                 paths.append(child)
@@ -145,21 +171,32 @@ def collect_core_stats(project_root: Path) -> list[CorePanelStat]:
 
 
 def validate_core_panels(
-    stats: Sequence[CorePanelStat], previous: Sequence[CorePanelStat]
+    stats: Sequence[CorePanelStat],
+    previous: Sequence[CorePanelStat],
+    *,
+    accepted_missing: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Detect corruption signatures before a copy can overwrite a good remote version.
 
-    Append-only/growing panels must stay readable, must not lose rows beyond
-    CORE_ROW_SHRINK_TOLERANCE and must not move max_date backwards relative to
-    the previous verified snapshot manifest.
+    Previous entries are first filtered through is_tracked_core_relpath so a
+    tracking-policy change never reports the untracked files as missing.
+    Relpaths in accepted_missing are an explicit operator acknowledgement that
+    a tracked file was removed on purpose; they are not reported.
 
     Returns:
         Issue strings `core_panel:<relpath>:<reason>` (unreadable, rows_shrank,
         max_date_regressed, missing); empty when valid.
     """
     current = {entry.relpath: entry for entry in stats}
-    prev = {entry.relpath: entry for entry in previous}
-    issues: list[str] = [f"core_panel:{relpath}:missing" for relpath in sorted(set(prev) - set(current))]
+    prev = {entry.relpath: entry for entry in previous if is_tracked_core_relpath(entry.relpath)}
+    for relpath in sorted(accepted_missing):
+        if relpath in current:
+            logger.warning("[SYS] stage=core_snapshot accepted_missing_noop relpath=%s", relpath)
+    issues: list[str] = []
+    for relpath in sorted(set(prev) - set(current)):
+        if relpath in accepted_missing:
+            continue
+        issues.append(f"core_panel:{relpath}:missing")
     for relpath in sorted(set(current)):
         entry = current[relpath]
         if not entry.sha256:
@@ -251,6 +288,7 @@ def run_core_snapshot(
     *,
     today: date,
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    accepted_missing: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Copy validated core files to an immutable dated snapshot and apply retention.
 
@@ -271,7 +309,7 @@ def run_core_snapshot(
     previous: list[CorePanelStat] = []
     if names:
         previous = _read_remote_manifest(rclone, names[-1], run_fn)
-    issues = validate_core_panels(stats, previous)
+    issues = validate_core_panels(stats, previous, accepted_missing=accepted_missing)
     if issues:
         raise RuntimeError(f"core snapshot validation failed: {'; '.join(issues)}")
     day = today.isoformat()
@@ -322,7 +360,8 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry
     from zoneinfo import ZoneInfo
 
     parser = argparse.ArgumentParser(description="Immutable snapshot of rebuild-irreplaceable core panels")
-    parser.parse_args(argv)
+    parser.add_argument("--accept-missing", action="append", default=[], metavar="RELPATH")
+    args = parser.parse_args(argv)
     project_root = Path.cwd()
     today = date.today().isoformat()
     import datetime as _dt
@@ -330,7 +369,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry
     kst = _dt.datetime.now(ZoneInfo("Asia/Seoul")).date()
     started = _time.monotonic()
     try:
-        pruned = run_core_snapshot(project_root, today=kst)
+        pruned = run_core_snapshot(project_root, today=kst, accepted_missing=frozenset(args.accept_missing))
     except RuntimeError as exc:
         logger.info("[SYS] stage=core_snapshot date=%s status=failed duration_s=%.0f error=%s", today, _time.monotonic() - started, exc)
         raise SystemExit(1) from exc

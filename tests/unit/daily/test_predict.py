@@ -271,26 +271,30 @@ def test_persist_topk_decision_dedups_same_date_symbol_on_rerun(tmp_path, monkey
     assert saved["name"].iloc[0] == "AAA-updated"
 
 
-def test_persist_topk_decision_recovers_from_corrupt_existing_parquet(tmp_path, monkeypatch, caplog) -> None:
+def test_persist_topk_decision_refuses_to_overwrite_unreadable_history(tmp_path, monkeypatch, caplog) -> None:
     import logging
 
     import pandas as pd
+    import pytest
 
     import src.daily.predict as predict_mod
+    from src.data.io_utils import ExistingStoreUnreadableError
 
     monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
     target = tmp_path / "topk_decisions.parquet"
-    target.write_text("not a valid parquet file")
+    target.write_bytes(b"not a valid parquet file")
 
     sleeve_df = pd.DataFrame({"symbol": ["000001"], "name": ["AAA"], "pred": [0.02], "allocation": [1.0]})
 
-    with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
-        written = predict_mod.persist_topk_decision(pd.Timestamp("2026-09-10"), sleeve_df)
+    with caplog.at_level(logging.ERROR, logger=predict_mod.logger.name), pytest.raises(
+        ExistingStoreUnreadableError, match="topk_decisions\\.parquet"
+    ):
+        predict_mod.persist_topk_decision(pd.Timestamp("2026-09-10"), sleeve_df)
 
-    assert written == 1
-    saved = pd.read_parquet(target)
-    assert len(saved) == 1
-    assert any(rec.levelno >= logging.WARNING for rec in caplog.records)
+    assert target.read_bytes() == b"not a valid parquet file"
+    assert any(
+        rec.levelno >= logging.ERROR and "history_unreadable" in rec.message for rec in caplog.records
+    )
 
 
 def _sleeve_wide_and_history():
@@ -1326,3 +1330,21 @@ def test_run_automated_topk_decision_standard_session_behaves_as_before(monkeypa
     args, kwargs = recorder.call_args
     assert args == ("OK",)
     assert kwargs["metrics"] == {"n_picks": 3}
+
+
+def test_persist_topk_decision_merges_readable_history(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+
+    prior = pd.DataFrame({"symbol": ["000001"], "name": ["AAA"], "pred": [0.02], "allocation": [1.0]})
+    predict_mod.persist_topk_decision(pd.Timestamp("2026-09-09"), prior)
+
+    today = pd.DataFrame({"symbol": ["000001", "000002"], "name": ["AAA-new", "BBB"], "pred": [0.03, 0.01], "allocation": [0.5, 0.5]})
+    assert predict_mod.persist_topk_decision(pd.Timestamp("2026-09-10"), today) == 2
+
+    saved = pd.read_parquet(tmp_path / "topk_decisions.parquet")
+    assert set(saved["decision_date"].astype(str).unique()) == {"2026-09-09", "2026-09-10"}
+    assert saved.loc[saved["symbol"] == "000001", "name"].iloc[-1] == "AAA-new"

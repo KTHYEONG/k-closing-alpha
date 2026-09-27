@@ -18,7 +18,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.data.capture_store import resolve_capture_root as _capture_root
-from src.tools.capture_offsite import prune_local_sealed_capture
+from src.tools.capture_offsite import LocalRetentionReport, prune_local_sealed_capture
 from src.tools.offsite_common import DATED_DIR_RE, OFFSITE_REMOTE_BASE, resolve_rclone_bin
 from src.utils.cli_logging import configure_cli_logging
 
@@ -122,6 +122,7 @@ def prune_local_intraday_backups(
     today: pd.Timestamp,
     backups_root: Path | None = None,
     retention_days: int = LOCAL_INTRADAY_BACKUP_RETENTION_DAYS,
+    dry_run: bool = False,
 ) -> list[str]:
     """intraday 파티션 교체-직전 로컬 스냅샷 중 보존기간이 지난 것을 삭제한다.
 
@@ -151,25 +152,62 @@ def prune_local_intraday_backups(
     for session_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         names = [p.name for p in session_dir.iterdir() if p.is_dir()]
         for name in expired_snapshot_dirs(names, today, retention_days):
-            shutil.rmtree(session_dir / name)
+            if not dry_run:
+                shutil.rmtree(session_dir / name)
             purged.append(f"{session_dir.name}/{name}")
     return sorted(purged)
 
 
-def main(argv: list[str] | None = None) -> None:  # pragma: no cover - CLI entry; logic covered via prune_backups scenarios
+def main(argv: list[str] | None = None) -> None:
+    """Run remote purge, local intraday prune and local sealed prune as isolated steps.
+
+    Every step runs even if an earlier one raised; each failure is logged with its
+    traceback, and the process exits 1 after all steps if any failed, so the
+    OnFailure alert fires without starving local disk reclamation.
+    """
     parser = argparse.ArgumentParser(description="Purge _deleted backup snapshots older than the retention window")
     parser.add_argument("--dry-run", action="store_true", help="list purge targets without deleting")
+    parser.add_argument(
+        "--max-purge-per-subtree",
+        type=int,
+        default=BACKUP_MAX_PURGE_DIRS_PER_SUBTREE,
+        help="override the remote purge cap for a manual catch-up run",
+    )
     args = parser.parse_args(argv)
     today = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None).normalize()
-    purged = prune_backups(today=today, dry_run=True) if args.dry_run else prune_backups(today=today)
-    local_purged = prune_local_intraday_backups(today=today)
-    sealed_report = prune_local_sealed_capture(_capture_root(), today=today.date())
+    failures: list[str] = []
+    purged: list[str] = []
+    local_purged: list[str] = []
+    sealed_report = LocalRetentionReport(removed=(), kept=(), bytes_removed=0)
+    steps: list[tuple[str, Callable[[], None]]] = []
+
+    def _run_remote() -> None:
+        nonlocal purged
+        purged = prune_backups(today=today, dry_run=args.dry_run, max_purge_per_subtree=args.max_purge_per_subtree)
+
+    def _run_local() -> None:
+        nonlocal local_purged
+        local_purged = prune_local_intraday_backups(today=today, dry_run=args.dry_run)
+
+    def _run_sealed() -> None:
+        nonlocal sealed_report
+        sealed_report = prune_local_sealed_capture(_capture_root(), today=today.date(), dry_run=args.dry_run)
+
+    steps = [("remote", _run_remote), ("local_intraday", _run_local), ("local_sealed", _run_sealed)]
+    for name, fn in steps:
+        try:
+            fn()
+        except Exception:
+            logger.exception("[SYS] stage=backup_prune step=%s status=failed", name)
+            failures.append(name)
     logger.info(
-        "[SYS] stage=backup_prune purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d",
-        len(purged), purged, len(local_purged), local_purged,
+        "[SYS] stage=backup_prune dry_run=%s purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d",
+        args.dry_run, len(purged), purged, len(local_purged), local_purged,
         len(sealed_report.removed), sealed_report.bytes_removed, len(sealed_report.kept),
     )
     logger.debug("[SYS] stage=backup_prune sealed_kept=%s", sealed_report.kept)
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

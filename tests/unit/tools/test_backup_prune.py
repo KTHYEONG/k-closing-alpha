@@ -172,11 +172,11 @@ def test_main_purges_remote_and_local_with_single_summary_log(monkeypatch, caplo
     remote_calls: list = []
     local_calls: list = []
 
-    def _fake_remote(*, today):
+    def _fake_remote(*, today, **kwargs):
         remote_calls.append(today)
         return ["gdrive:x/_deleted/data/2026-08-01"]
 
-    def _fake_local(*, today):
+    def _fake_local(*, today, **kwargs):
         local_calls.append(today)
         return ["regular/2026-09-17"]
 
@@ -259,3 +259,82 @@ def test_prune_dry_run_lists_without_purging(monkeypatch) -> None:
     )
     assert targets == ["gdrive:x/_deleted/data/2026-08-01", "gdrive:x/_deleted/data/2026-08-02"]
     assert not any(c[1] == "purge" for c in calls)
+
+
+def test_prune_local_intraday_backups_dry_run_deletes_nothing(tmp_path) -> None:
+    import pandas as pd
+
+    from src.tools import backup_prune
+
+    root = tmp_path
+    expired_dir = root / "regular" / "2026-09-17"
+    expired_dir.mkdir(parents=True)
+    (expired_dir / "2026-09-17-pre-abc.parquet").write_bytes(b"dummy")
+
+    purged = backup_prune.prune_local_intraday_backups(
+        today=pd.Timestamp("2026-09-21"), backups_root=root, retention_days=3, dry_run=True
+    )
+
+    assert purged == ["regular/2026-09-17"]
+    assert expired_dir.exists()
+
+
+def test_backup_prune_main_runs_local_steps_after_remote_failure(monkeypatch) -> None:
+    import pytest
+
+    from src.tools import backup_prune
+
+    calls: list[str] = []
+
+    def _boom_remote(*, today, **kwargs):
+        raise RuntimeError("remote down")
+
+    def _ok_local(*, today, **kwargs):
+        calls.append("local_intraday")
+        return []
+
+    import src.tools.capture_offsite as capture_offsite
+
+    def _ok_sealed(capture_root, *, today, **kwargs):
+        calls.append("local_sealed")
+        return capture_offsite.LocalRetentionReport(removed=(), kept=(), bytes_removed=0)
+
+    monkeypatch.setattr(backup_prune, "prune_backups", _boom_remote)
+    monkeypatch.setattr(backup_prune, "prune_local_intraday_backups", _ok_local)
+    monkeypatch.setattr(backup_prune, "prune_local_sealed_capture", _ok_sealed)
+
+    with pytest.raises(SystemExit) as exc:
+        backup_prune.main([])
+    assert exc.value.code == 1
+    assert calls == ["local_intraday", "local_sealed"]
+
+
+def test_backup_prune_max_purge_override_is_forwarded(monkeypatch) -> None:
+    from src.tools import backup_prune
+
+    seen: dict[str, object] = {}
+
+    def _fake_remote(*, today, dry_run=False, max_purge_per_subtree=7):
+        seen["max_purge_per_subtree"] = max_purge_per_subtree
+        seen["dry_run"] = dry_run
+        return []
+
+    def _fake_local(*, today, dry_run=False, **kwargs):
+        return []
+
+    import src.tools.capture_offsite as capture_offsite
+
+    def _fake_sealed(capture_root, *, today, dry_run=False, **kwargs):
+        seen["sealed_dry_run"] = dry_run
+        return capture_offsite.LocalRetentionReport(removed=(), kept=(), bytes_removed=0)
+
+    monkeypatch.setattr(backup_prune, "prune_backups", _fake_remote)
+    monkeypatch.setattr(backup_prune, "prune_local_intraday_backups", _fake_local)
+    monkeypatch.setattr(backup_prune, "prune_local_sealed_capture", _fake_sealed)
+
+    backup_prune.main(["--max-purge-per-subtree", "30"])
+    assert seen["max_purge_per_subtree"] == 30
+
+    backup_prune.main(["--dry-run"])
+    assert seen["dry_run"] is True
+    assert seen["sealed_dry_run"] is True

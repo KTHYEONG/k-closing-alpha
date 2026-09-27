@@ -23,6 +23,7 @@ systemctl --user enable --now \
   kca-backup.timer \
   kca-backup-prune.timer \
   kca-core-snapshot.timer \
+  kca-offsite-verify.timer \
   kca-retrain.timer \
   kca-kis-token-warmup.timer
 

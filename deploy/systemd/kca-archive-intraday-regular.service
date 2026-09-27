@@ -7,4 +7,7 @@ Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
-ExecStart=/usr/bin/docker run --rm --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.archive_intraday --phase regular
+# 실측 최대 6904초 → 3시간 (20:05 애프터마켓 적재 전에 종료)
+TimeoutStartSec=3h
+ExecStart=/usr/bin/docker run --rm --name kca-archive-intraday-regular --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.archive_intraday --phase regular
+ExecStopPost=-/usr/bin/docker rm -f kca-archive-intraday-regular

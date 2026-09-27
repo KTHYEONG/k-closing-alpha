@@ -54,3 +54,57 @@ def test_atomic_write_parquet_snappy_override_still_works(tmp_path) -> None:
 
     meta = pq.ParquetFile(target).metadata
     assert meta.row_group(0).column(0).compression.upper() == "SNAPPY"
+
+
+def test_read_existing_missing_returns_empty(tmp_path: Path) -> None:
+    import pandas as pd
+
+    from src.data.io_utils import read_existing_parquet
+
+    target = tmp_path / "absent.parquet"
+
+    result = read_existing_parquet(target)
+
+    assert isinstance(result, pd.DataFrame) and result.empty
+    assert not target.exists()
+
+
+def test_read_existing_corrupt_raises_typed_error(tmp_path: Path) -> None:
+    import pytest
+
+    from src.data.io_utils import ExistingStoreUnreadableError, read_existing_parquet
+
+    target = tmp_path / "history.parquet"
+    target.write_bytes(b"not a valid parquet file")
+
+    with pytest.raises(ExistingStoreUnreadableError, match="history\\.parquet") as exc_info:
+        read_existing_parquet(target)
+
+    assert exc_info.value.__cause__ is not None
+    assert target.read_bytes() == b"not a valid parquet file"
+
+
+def test_read_existing_zero_row_file_is_valid(tmp_path: Path) -> None:
+    import pandas as pd
+
+    from src.data.io_utils import read_existing_parquet
+
+    target = tmp_path / "empty.parquet"
+    pd.DataFrame({"a": pd.Series(dtype="int64")}).to_parquet(target, index=False)
+
+    result = read_existing_parquet(target)
+
+    assert isinstance(result, pd.DataFrame) and result.empty
+
+
+def test_read_existing_projects_columns(tmp_path: Path) -> None:
+    import pandas as pd
+
+    from src.data.io_utils import read_existing_parquet
+
+    target = tmp_path / "panel.parquet"
+    pd.DataFrame({"date": ["2026-09-29"], "symbol": ["005930"]}).to_parquet(target, index=False)
+
+    result = read_existing_parquet(target, columns=["date"])
+
+    assert list(result.columns) == ["date"]

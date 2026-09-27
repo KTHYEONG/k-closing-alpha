@@ -576,11 +576,25 @@ def test_build_digest_ok_warning_and_holiday_subjects() -> None:
         daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, None, [], [])
 
 
-def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> None:
+def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch, tmp_path) -> None:
     from types import SimpleNamespace
 
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
     from src.tools import daily_audit
 
+    def _standard(trading_day, **_kwargs):
+        return SessionDay(
+            trading_date=trading_day,
+            kind=SessionKind.STANDARD,
+            clock=SessionClock.standard(trading_day),
+            provenance="standard",
+        )
+
+    def _closed(trading_day, **_kwargs):
+        return SessionDay(trading_date=trading_day, kind=SessionKind.CLOSED, clock=None, provenance="test")
+
+    monkeypatch.setattr(daily_audit.settings, "DATA_DIR", tmp_path, raising=False)
     monkeypatch.setattr(
         daily_audit.CaptureStore,
         "read_cohort",
@@ -611,7 +625,20 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
     ) is None
     assert sent == [] and audited == []
 
-    # And: 평일 휴장일(정상)은 요약 발송 스킵
+    # And: 휴장일 + 정적 개장 세션 = 달력 불일치 경고 발송
+    subject = daily_audit.run_daily_audit(
+        "2026-09-24",
+        trading_day_fn=lambda _d: False,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
+    )
+    assert "calendar_disagreement" in subject
+    assert audited == [] and len(sent) == 1
+
+    # And: 합의된 휴장일(CLOSED)은 정상 스킵
+    monkeypatch.setattr(daily_audit, "resolve_session_day", _closed)
     subject = daily_audit.run_daily_audit(
         "2026-09-24",
         trading_day_fn=lambda _d: False,
@@ -621,7 +648,8 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         backup_issues_fn=lambda _at: [],
     )
     assert subject == "[kca] ⏸️ 2026-09-24 휴장일 SKIP"
-    assert audited == [] and len(sent) == 0
+    assert audited == [] and len(sent) == 1
+    monkeypatch.setattr(daily_audit, "resolve_session_day", _standard)
 
     # And: 거래일 정상 동작(OK)은 요약 발송
     subject = daily_audit.run_daily_audit(
@@ -633,8 +661,8 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         backup_issues_fn=lambda _at: [],
     )
     assert subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
-    assert audited == ["2026-09-14"] and len(sent) == 1
-    assert sent[0][0] == subject
+    assert audited == ["2026-09-14"] and len(sent) == 2
+    assert sent[1][0] == subject
 
     # And: 경고 발생 시에는 요약 발송
     subject = daily_audit.run_daily_audit(
@@ -646,8 +674,8 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch) -> No
         backup_issues_fn=lambda _at: [],
     )
     assert "경고" in subject
-    assert len(sent) == 2
-    assert sent[1][0] == subject
+    assert len(sent) == 3
+    assert sent[2][0] == subject
 
 
 def test_audit_decision_requires_topk_or_predict_ok_outcome(monkeypatch, tmp_path) -> None:
@@ -2134,3 +2162,293 @@ def test_run_daily_audit_survives_drain_failure(monkeypatch, caplog) -> None:
     assert len(sent) == 1
     assert "undelivered_alerts=0" in sent[0][1]
     assert any("alert_drain=FAILED" in rec.message for rec in caplog.records)
+
+
+def _stub_weekday_audit(monkeypatch, tmp_path, dispatch_fn):
+    from types import SimpleNamespace
+
+    from src.tools import daily_audit
+
+    monkeypatch.setattr(daily_audit.settings, "DATA_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(
+        daily_audit.CaptureStore,
+        "read_cohort",
+        lambda self, *args, **kwargs: SimpleNamespace(eligible_symbols=()),
+    )
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *args, **kwargs: ())
+    monkeypatch.setattr(
+        daily_audit,
+        "audit_daily_completeness",
+        lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True),
+    )
+    return {
+        "failed_units_fn": list,
+        "stale_tokens_fn": lambda _d: [],
+        "dispatch_fn": dispatch_fn,
+        "backup_issues_fn": lambda _at: [],
+    }
+
+
+def _read_heartbeat(tmp_path):
+    import json
+
+    return json.loads((tmp_path / "logs" / "heartbeat" / "daily_audit.json").read_text(encoding="utf-8"))
+
+
+def test_heartbeat_written_on_trading_and_holiday_runs(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    stubs = _stub_weekday_audit(monkeypatch, tmp_path, _dispatch)
+
+    daily_audit.run_daily_audit("2026-09-29", trading_day_fn=lambda _d: True, **stubs)
+    heartbeat = _read_heartbeat(tmp_path)
+    assert heartbeat["snapshot_date"] == "2026-09-29"
+    assert heartbeat["day_kind"] == "trading"
+    assert "+09:00" in heartbeat["finished_at"]
+
+    daily_audit.run_daily_audit("2026-09-25", trading_day_fn=lambda _d: False, **stubs)
+    heartbeat = _read_heartbeat(tmp_path)
+    assert heartbeat["snapshot_date"] == "2026-09-25"
+    assert heartbeat["day_kind"] == "holiday"
+
+
+def test_heartbeat_not_written_on_weekend(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+
+    stubs = _stub_weekday_audit(
+        monkeypatch, tmp_path, lambda subject, body: {"webhook": False, "email": True}
+    )
+
+    assert daily_audit.run_daily_audit("2026-09-27", trading_day_fn=lambda _d: True, **stubs) is None
+    assert not (tmp_path / "logs" / "heartbeat" / "daily_audit.json").exists()
+
+
+def test_heartbeat_written_even_when_dispatch_fails(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+
+    stubs = _stub_weekday_audit(
+        monkeypatch, tmp_path, lambda subject, body: {"webhook": False, "email": False}
+    )
+
+    daily_audit.run_daily_audit("2026-09-29", trading_day_fn=lambda _d: True, **stubs)
+
+    assert _read_heartbeat(tmp_path)["snapshot_date"] == "2026-09-29"
+
+
+def test_heartbeat_write_is_atomic(tmp_path) -> None:
+    import json
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.tools.daily_audit import write_audit_heartbeat
+
+    target = tmp_path / "logs" / "heartbeat" / "daily_audit.json"
+    finished_at = datetime(2026, 9, 29, 20, 15, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    written = write_audit_heartbeat(
+        "2026-09-29",
+        day_kind="trading",
+        subject="[kca] test",
+        undelivered_alerts=0,
+        finished_at=finished_at,
+        path=target,
+    )
+
+    assert written == target
+    assert list(tmp_path.rglob("*.tmp")) == []
+    assert set(json.loads(target.read_text(encoding="utf-8"))) == {
+        "snapshot_date",
+        "day_kind",
+        "subject",
+        "undelivered_alerts",
+        "finished_at",
+    }
+    assert (target.stat().st_mode & 0o777) == 0o644
+
+
+def test_heartbeat_write_failure_raises_oserror(tmp_path) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pytest
+
+    from src.tools.daily_audit import write_audit_heartbeat
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+
+    with pytest.raises(OSError, match="blocker"):
+        write_audit_heartbeat(
+            "2026-09-29",
+            day_kind="trading",
+            subject=None,
+            undelivered_alerts=0,
+            finished_at=datetime(2026, 9, 29, 20, 15, tzinfo=ZoneInfo("Asia/Seoul")),
+            path=blocker / "daily_audit.json",
+        )
+
+
+def test_holiday_with_standard_session_warns_calendar_disagreement() -> None:
+    from src.tools import daily_audit
+
+    subject, body = daily_audit.build_digest(
+        "2026-09-25", daily_audit.DAY_HOLIDAY, None, [], [], session_kind="STANDARD"
+    )
+
+    assert "🚨" in subject and "calendar_disagreement" in subject
+    assert "session=STANDARD" in body
+
+
+def test_holiday_surfaces_failed_units_and_backup_issues() -> None:
+    from src.tools import daily_audit
+
+    subject, body = daily_audit.build_digest(
+        "2026-09-24",
+        daily_audit.DAY_HOLIDAY,
+        None,
+        ["kca-backup.service"],
+        [],
+        backup_issues=["backup:stale:1"],
+        session_kind="CLOSED",
+        undelivered_alerts=3,
+    )
+
+    assert "🚨" in subject and "kca-backup.service" in subject
+    assert "미전송알림 3건" in subject
+    assert "failed_units=kca-backup.service" in body
+    assert "미전송 알림: 3건 (outbox 적체)" in body
+
+
+def test_run_daily_audit_dispatches_holiday_warning(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    stubs = _stub_weekday_audit(monkeypatch, tmp_path, _dispatch)
+
+    subject = daily_audit.run_daily_audit("2026-09-25", trading_day_fn=lambda _d: False, **stubs)
+
+    assert subject is not None and "🚨" in subject
+    assert len(sent) == 1 and sent[0][0] == subject
+
+
+def test_notice_keeps_healthy_digest_green() -> None:
+    from src.tools import daily_audit
+
+    result = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    subject, body = daily_audit.build_digest(
+        "2026-09-29",
+        daily_audit.DAY_TRADING,
+        result,
+        [],
+        [],
+        session_kind="STANDARD",
+        expiry_notices=("KIS_DATA_1:d20:2026-10-19",),
+    )
+
+    assert "🟢" in subject and "🔑갱신필요 1건" in subject
+    assert "expiry_notices=KIS_DATA_1:d20:2026-10-19" in body
+    assert "expiry_warnings=none" in body
+
+
+def test_expiry_warning_escalates_digest() -> None:
+    from src.tools import daily_audit
+
+    result = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    subject, body = daily_audit.build_digest(
+        "2026-09-29",
+        daily_audit.DAY_TRADING,
+        result,
+        [],
+        [],
+        session_kind="STANDARD",
+        expiry_notices=("KIS_DATA_9:d20:2026-10-19",),
+        expiry_warnings=("KIS_DATA_1:d3:2026-10-02",),
+    )
+
+    assert "🚨" in subject and "만료임박" in subject
+    assert "🔑 갱신 필요: KIS_DATA_9:d20:2026-10-19" in body
+    assert "expiry_warnings=KIS_DATA_1:d3:2026-10-02" in body
+
+
+def test_run_daily_audit_passes_expiry_report(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+    from src.tools.expiry_notices import ExpiryReport
+
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    stubs = _stub_weekday_audit(monkeypatch, tmp_path, _dispatch)
+    monkeypatch.setattr(
+        daily_audit,
+        "evaluate_expiries",
+        lambda _today: ExpiryReport(notices=("KIS_X:d9:2026-10-08",), warnings=()),
+    )
+
+    daily_audit.run_daily_audit("2026-09-29", trading_day_fn=lambda _d: True, **stubs)
+
+    assert len(sent) == 1 and "KIS_X:d9:2026-10-08" in sent[0][1]
+
+
+def test_calendar_expiry_renders_renew_hint() -> None:
+    from src.tools import daily_audit
+
+    result = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    subject, body = daily_audit.build_digest(
+        "2026-12-11",
+        daily_audit.DAY_TRADING,
+        result,
+        [],
+        [],
+        session_kind="STANDARD",
+        expiry_notices=("krx_calendar:d20:2026-12-31",),
+    )
+
+    assert "🔑갱신필요 1건" in subject
+    assert "• 달력 갱신: KRX 다음 해 휴장일·개장시간 공지 반영" in body
+
+
+def test_holiday_expiry_warning_dispatches() -> None:
+    from src.tools import daily_audit
+
+    subject, body = daily_audit.build_digest(
+        "2026-09-24",
+        daily_audit.DAY_HOLIDAY,
+        None,
+        [],
+        [],
+        session_kind="CLOSED",
+        expiry_warnings=("KIS_DATA_1:d3:2026-09-27",),
+    )
+
+    assert "🚨" in subject and "만료임박" in subject
+    assert "• 만료 임박: KIS_DATA_1:d3:2026-09-27" in body
+
+
+def test_holiday_with_only_notices_stays_quiet() -> None:
+    from src.tools import daily_audit
+
+    subject, _ = daily_audit.build_digest(
+        "2026-09-24",
+        daily_audit.DAY_HOLIDAY,
+        None,
+        [],
+        [],
+        session_kind="CLOSED",
+        expiry_notices=("KIS_DATA_1:d20:2026-10-14",),
+    )
+
+    assert subject == "[kca] ⏸️ 2026-09-24 휴장일 SKIP"

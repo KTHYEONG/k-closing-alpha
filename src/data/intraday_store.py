@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pyarrow as pa
@@ -220,11 +222,18 @@ def _partition_row_count(target: Path) -> int:
     return int(handle.metadata.num_rows)
 
 
-def _retain_backup_ref(target: Path, snapshot_date: str, session: str) -> str:
+def _retain_backup_ref(
+    target: Path,
+    snapshot_date: str,
+    session: str,
+    *,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(ZoneInfo("Asia/Seoul")),
+) -> str:
     root = _capture_root()
-    backup_dir = root / "backups" / "intraday" / str(session) / str(snapshot_date)
+    retained_on = now_fn().date().isoformat()
+    backup_dir = root / "backups" / "intraday" / str(session) / retained_on
     backup_dir.mkdir(parents=True, exist_ok=True)
-    backup = backup_dir / f"{target.stem}-pre-{uuid.uuid4().hex}.parquet"
+    backup = backup_dir / f"{target.stem}-{snapshot_date}-pre-{uuid.uuid4().hex}.parquet"
     os.link(target, backup)
     return str(backup)
 

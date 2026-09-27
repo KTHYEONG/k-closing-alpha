@@ -29,12 +29,13 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
-from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
+from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows, orderbook_partition_path
 from src.data.session_calendar import SessionKind, resolve_session_day, trading_session_gate
 from src.utils.display import Colors
 from src.daily import archive
 from src.daily.universe_scan import fetch_candidate_stock_list, fetch_trade_value_union
 from src.data.trading_calendar import is_kis_trading_day
+from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, record_run_outcome
 from src.ml.topk_history_features import MAX_PREV_TRADING_DAY_LOOKBACK
 from src.daily.universe_screen import build_screen_frame
 from src.daily.security_classification import load_security_classification
@@ -853,7 +854,11 @@ async def fetch_all_stock_data(
     try:
         append_orderbook_snapshots(orderbook_rows, snapshot_date)
     except Exception as e:
-        logger.warning("[DATA] Orderbook decision snapshot persist failed: %s", e)
+        logger.error(
+            "[DATA] stage=orderbook_persist status=FAILED reason=%s path=%s",
+            type(e).__name__,
+            orderbook_partition_path(snapshot_date),
+        )
 
     logger.info(f"{Colors.GREEN}✅ 데이터 수집 완료{Colors.RESET}")
     return results, failed_info
@@ -920,9 +925,9 @@ async def main(force: bool = False):
     data_kwargs = kis_data_client_kwargs()
     _validate_hts_id(data_kwargs["hts_id"])
     _validate_decision_window(datetime.now(ZoneInfo("Asia/Seoul")), force=force)
+    session_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    session_day = resolve_session_day(session_today)
     if not force:
-        session_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
-        session_day = resolve_session_day(session_today)
         if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
             logger.info(
                 "[DATA] stage=collect status=SKIP reason=%s date=%s",
@@ -972,6 +977,18 @@ async def main(force: bool = False):
         try:
             await _validate_trading_day(client, session, snapshot_date, force=force)
         except NonTradingDayError:
+            if session_day.kind is SessionKind.STANDARD:
+                # 정적 달력은 개장인데 KIS 오라클이 휴일로 응답한다: fail-closed로
+                # 수집 없이 종료하되 NO_DECISION outcome으로 알려 operator가 인지한다
+                record_run_outcome(
+                    "collect",
+                    RUN_OUTCOME_NO_DECISION,
+                    run_date=snapshot_date,
+                    reason="calendar_disagreement",
+                    metrics={"session": "STANDARD", "kis": "holiday"},
+                )
+                logger.info("[DATA] stage=collect status=SKIP reason=calendar_disagreement date=%s", snapshot_date)
+                return
             # 휴장일은 장애가 아니다: 정상 종료해 OnFailure 오탐 알림과 하위 단계 오류를 막는다
             logger.info("[DATA] stage=collect status=SKIP reason=non_trading_day date=%s", snapshot_date)
             return
