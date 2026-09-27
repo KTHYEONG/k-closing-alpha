@@ -4,10 +4,12 @@ OnFailure=kca-alert@%n.service
 
 [Service]
 Type=oneshot
+# 실측 최대 245초 → 1800초 (기존 유지)
 TimeoutStartSec=1800
 WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 EnvironmentFile=%h/quant-secrets/kis-data.env
 Environment=TZ=Asia/Seoul
 Environment=KIS_DATA_ROLE=batch
-ExecStart=/usr/bin/docker run --rm --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=batch ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.altdata_capture
+ExecStart=/usr/bin/docker run --rm --name kca-altdata-capture --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=batch ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.altdata_capture
+ExecStopPost=-/usr/bin/docker rm -f kca-altdata-capture

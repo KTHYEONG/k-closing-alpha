@@ -439,3 +439,60 @@ def test_offsite_first_run_unreadable_persists_current(tmp_path: Path, monkeypat
     persisted = json.loads((capture / REPORT_RELPATH).read_text(encoding="utf-8"))
     assert persisted["steps"]["core_panels"]["status"] == "failed"
     assert persisted["core_panels"]
+
+
+def test_offsite_backup_accepted_missing_persists_current_baseline(tmp_path: Path, monkeypatch) -> None:
+    import json
+    import subprocess
+
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import REPORT_RELPATH, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    project = tmp_path / "proj_acc"
+    capture = tmp_path / "cap_acc"
+    _write_core_parquet(project / "data/history/price_history.parquet", 10, "2026-09-23")
+    (capture / REPORT_RELPATH).parent.mkdir(parents=True, exist_ok=True)
+    (capture / REPORT_RELPATH).write_text(
+        json.dumps(
+            {
+                "started_at": "2026-09-17T13:15:00+00:00",
+                "finished_at": "2026-09-17T13:15:00+00:00",
+                "status": "ok",
+                "steps": {},
+                "core_panels": [
+                    {
+                        "relpath": "data/history/price_history.parquet",
+                        "sha256": "a" * 64,
+                        "bytes": 10,
+                        "rows": 10,
+                        "max_date": "2026-09-23",
+                    },
+                    {
+                        "relpath": "data/paper/x.parquet",
+                        "sha256": "b" * 64,
+                        "bytes": 5,
+                        "rows": 5,
+                        "max_date": "2026-09-20",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    report = run_offsite_backup(
+        project, capture, now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal, accepted_missing=frozenset({"data/paper/x.parquet"})
+    )
+    assert report.status == "ok"
+    assert report.steps["core_panels"]["status"] == "ok"
+    persisted = json.loads((capture / REPORT_RELPATH).read_text(encoding="utf-8"))
+    rels = {item["relpath"] for item in persisted["core_panels"]}
+    assert "data/paper/x.parquet" not in rels
+    assert "data/history/price_history.parquet" in rels

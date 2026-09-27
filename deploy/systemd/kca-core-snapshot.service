@@ -8,5 +8,6 @@ Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
+# 주간 스냅샷 상한 2시간 (기존 유지)
 TimeoutStartSec=2h
 ExecStart=/usr/bin/flock -w 7200 %t/quant-gdrive.lock %h/.local/bin/uv run python -m src.tools.core_snapshot

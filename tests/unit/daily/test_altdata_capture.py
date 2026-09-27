@@ -114,10 +114,10 @@ def test_krx_listed_universe_returns_deduped_frozenset(tmp_path, monkeypatch) ->
     assert universe == frozenset({"005930", "000660"})
 
 
-def test_krx_listed_universe_drops_non_6digit_codes(tmp_path, monkeypatch) -> None:
-    """실측 회귀: KRX 일별 목록에 ETN(예: '0013V0')이 섞여 있어 그대로 넘기면
-    AltDataFetchConfig가 '6-digit string이어야 한다'며 ValueError를 던졌다
-    (2026-09-18 실측). 일반주식 6자리 숫자 코드만 유니버스로 채택한다."""
+def test_krx_listed_universe_keeps_alphanumeric_common_stock(tmp_path, monkeypatch) -> None:
+    """숫자 코드가 고갈된 뒤 KRX가 신규 상장 전부에 부여하는 영숫자 단축코드는
+    일반 보통주이므로 유니버스에 포함한다. 탈락하는 것은 단축코드 문법 밖의
+    형태(접두사, 5/7자리, ETN 'Q' 코드)뿐이다."""
     import pandas as pd
 
     from src.backfill.altdata.config import AltDataFetchConfig
@@ -126,13 +126,13 @@ def test_krx_listed_universe_drops_non_6digit_codes(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(
         altdata_capture,
         "fetch_krx_daily",
-        lambda window_end, cfg: pd.DataFrame({"symbol": ["005930", "0013V0", "A05930", "12345"]}),
+        lambda window_end, cfg: pd.DataFrame({"symbol": ["005930", "0013V0", "A005930", "12345", "Q500001"]}),
     )
     cfg = AltDataFetchConfig(start=pd.Timestamp("2026-09-17"), end=pd.Timestamp("2026-09-18"), out_dir=tmp_path)
 
     universe = altdata_capture._krx_listed_universe(pd.Timestamp("2026-09-18"), cfg)
 
-    assert universe == frozenset({"005930"})
+    assert universe == frozenset({"005930", "0013V0"})
 
 
 def test_krx_listed_universe_walks_back_past_publication_lag(tmp_path, monkeypatch) -> None:
@@ -641,3 +641,48 @@ def test_main_disabled_profile_stays_first(tmp_path, monkeypatch, caplog) -> Non
         rc = altdata_capture.main(["--date", "2026-09-24"], trading_day_fn=_boom_oracle)
     assert rc == 0
     assert "reason=disabled" in caplog.text
+
+
+def test_run_altdata_capture_universe_includes_new_listings(tmp_path, monkeypatch) -> None:
+    """KRX 목록의 영숫자 신규상장 코드가 백필 cfg의 universe_symbols까지 전달된다."""
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+    from src.daily import altdata_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    captured: dict[str, Any] = {}
+
+    def _fake_backfill(cfg, *, capture_store, run_id, reobserve):
+        captured["cfg"] = cfg
+        captured["run_id"] = run_id
+        return {"capture": "ok"}
+
+    class _Context:
+        def __init__(self, run_id: str) -> None:
+            self.run_id = run_id
+
+    class _Manifest:
+        def __init__(self, run_id: str) -> None:
+            self.status = CaptureStatus.COMPLETE
+            self.context = _Context(run_id)
+
+    class _Store:
+        def read_manifests(self, date_str: str) -> list[Any]:
+            return [_Manifest(captured["run_id"])]
+
+    monkeypatch.setattr(altdata_capture, "run_altdata_backfill", _fake_backfill)
+    monkeypatch.setattr(
+        altdata_capture,
+        "fetch_krx_daily",
+        lambda window_end, cfg: pd.DataFrame({"symbol": ["005930", "0009K0"]}),
+    )
+
+    profile = _profile(tmp_path, COLLECTION_ALTDATA_LOOKBACK_DAYS=2)
+    window_start, window_end = altdata_capture._rolling_bounds(pd.Timestamp("2026-09-18").date(), 2)
+    cfg = AltDataFetchConfig(start=window_start, end=window_end, out_dir=tmp_path, krx_api_key="k")
+
+    manifest = altdata_capture.run_altdata_capture(pd.Timestamp("2026-09-18").date(), profile=profile, store=_Store(), cfg=cfg)
+
+    assert manifest.status == CaptureStatus.COMPLETE
+    assert "0009K0" in captured["cfg"].universe_symbols

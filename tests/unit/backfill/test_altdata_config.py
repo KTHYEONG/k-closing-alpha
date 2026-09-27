@@ -75,3 +75,53 @@ def test_altdata_package_has_no_ml_or_realtime_imports() -> None:
         if "inquire-asking-price" in t or "websocket" in t.lower():
             bad.append((str(p), "realtime endpoint"))
     assert bad == [], bad
+
+
+def test_short_code_accepts_numeric_and_alphanumeric() -> None:
+    from src.backfill.altdata.config import is_krx_short_code
+
+    assert is_krx_short_code("005930")
+    assert is_krx_short_code("0009K0")
+    assert is_krx_short_code("00088K")
+
+
+def test_short_code_rejects_non_short_forms() -> None:
+    from src.backfill.altdata.config import is_krx_short_code
+
+    for bad in ("A005930", "12345", "Q500001", "0009k0", ""):
+        assert not is_krx_short_code(bad)
+    assert not is_krx_short_code(None)
+
+
+def test_config_accepts_alphanumeric_universe() -> None:
+    from pathlib import Path
+
+    import pandas as pd
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+
+    cfg = AltDataFetchConfig(
+        start=pd.Timestamp("2020-01-01"),
+        end=pd.Timestamp("2020-02-01"),
+        out_dir=Path("x"),
+        universe_symbols=frozenset({"005930", "0013V0"}),
+    )
+
+    assert cfg.universe_symbols == frozenset({"005930", "0013V0"})
+
+
+def test_config_rejects_malformed_universe_symbol() -> None:
+    from pathlib import Path
+
+    import pandas as pd
+    import pytest
+
+    from src.backfill.altdata.config import AltDataFetchConfig
+
+    with pytest.raises(ValueError, match="short code"):
+        AltDataFetchConfig(
+            start=pd.Timestamp("2020-01-01"),
+            end=pd.Timestamp("2020-02-01"),
+            out_dir=Path("x"),
+            universe_symbols=frozenset({"12345"}),
+        )

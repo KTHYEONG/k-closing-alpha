@@ -29,6 +29,7 @@ from src.data.capture_contracts import (
     SEOUL,
 )
 from src.data.capture_store import CaptureStore
+from src.data.io_utils import ExistingStoreUnreadableError, read_existing_parquet
 from src.data.parquet_codec import write_altdata_panel_parquet
 
 # Re-export collectors for test monkeypatching
@@ -48,14 +49,17 @@ def _covered_dates(panel_path: Path) -> set[pd.Timestamp]:
 
     Returns:
         날짜 집합.
+
+    Raises:
+        ExistingStoreUnreadableError: 패널이 존재하지만 읽을 수 없습니다.
     """
-    if not panel_path.exists():
-        return set()
     try:
-        df = pd.read_parquet(panel_path, columns=["date"])
-    except Exception:
-        return set()
-    if df is None or df.empty or "date" not in df.columns:
+        df = read_existing_parquet(panel_path, columns=["date"])
+    except ExistingStoreUnreadableError:
+        # Projection fails when the file lacks a "date" column; fall back to a
+        # full read (which raises again when the file is truly unreadable).
+        df = read_existing_parquet(panel_path)
+    if df.empty or "date" not in df.columns:
         return set()
     try:
         dates = pd.to_datetime(df["date"], errors="coerce").dropna().dt.normalize()
@@ -74,13 +78,13 @@ def _incremental_merge(existing_path: Path, new_df: pd.DataFrame, key_cols: tupl
 
     Returns:
         병합된 DataFrame.
+
+    Raises:
+        ExistingStoreUnreadableError: 기존 패널이 존재하지만 읽을 수 없습니다.
     """
     if existing_path.exists():
-        try:
-            existing = pd.read_parquet(existing_path)
-        except Exception:
-            existing = pd.DataFrame()
-        if existing is not None and not existing.empty:
+        existing = read_existing_parquet(existing_path)
+        if not existing.empty:
             combined = pd.concat([existing, new_df], ignore_index=True)
         else:
             combined = new_df.copy()
@@ -245,41 +249,42 @@ def run_altdata_backfill(cfg: AltDataFetchConfig, *, capture_store: CaptureStore
         availability_rule: str = meta["availability_rule"]
         panel_path = cfg.out_dir / filename
 
-        # Determine covered dates
-        covered = _covered_dates(panel_path)
-        missing = list(business_days) if reobserve else [d for d in business_days if d not in covered]
-
-        if not missing:
-            # Already up to date
-            # Read existing to report rows/dates
-            try:
-                existing = pd.read_parquet(panel_path) if panel_path.exists() else pd.DataFrame()
-                rows = len(existing) if existing is not None and not existing.empty else 0
-                if rows > 0 and "date" in existing.columns:
-                    first = pd.to_datetime(existing["date"], errors="coerce").min()
-                    last = pd.to_datetime(existing["date"], errors="coerce").max()
-                    first_s = str(pd.Timestamp(first).date()) if pd.notna(first) else None
-                    last_s = str(pd.Timestamp(last).date()) if pd.notna(last) else None
-                else:
-                    first_s = None
-                    last_s = None
-            except Exception:
-                rows = 0
-                first_s = None
-                last_s = None
-            entries[source] = {
-                "status": "up_to_date",
-                "source": source,
-                "availability_rule": availability_rule,
-                "rows": rows,
-                "first_date": first_s,
-                "last_date": last_s,
-                "updated_at": datetime.now(UTC).isoformat(),
-            }
-            continue
-
         # Collect
         try:
+            # Determine covered dates; an unreadable panel raises here and is
+            # recorded as unavailable below, leaving the file byte-identical.
+            covered = _covered_dates(panel_path)
+            missing = list(business_days) if reobserve else [d for d in business_days if d not in covered]
+
+            if not missing:
+                # Already up to date
+                # Read existing to report rows/dates
+                try:
+                    existing = pd.read_parquet(panel_path) if panel_path.exists() else pd.DataFrame()
+                    rows = len(existing) if existing is not None and not existing.empty else 0
+                    if rows > 0 and "date" in existing.columns:
+                        first = pd.to_datetime(existing["date"], errors="coerce").min()
+                        last = pd.to_datetime(existing["date"], errors="coerce").max()
+                        first_s = str(pd.Timestamp(first).date()) if pd.notna(first) else None
+                        last_s = str(pd.Timestamp(last).date()) if pd.notna(last) else None
+                    else:
+                        first_s = None
+                        last_s = None
+                except Exception:
+                    rows = 0
+                    first_s = None
+                    last_s = None
+                entries[source] = {
+                    "status": "up_to_date",
+                    "source": source,
+                    "availability_rule": availability_rule,
+                    "rows": rows,
+                    "first_date": first_s,
+                    "last_date": last_s,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+                continue
+
             if source == "shorting":
                 raw = collect_shorting(cfg, missing)
             elif source == "derivatives_basis":

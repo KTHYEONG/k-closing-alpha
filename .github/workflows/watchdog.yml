@@ -1,0 +1,58 @@
+name: External Dead-Man Watchdog
+
+# 07:40 KST Tue-Sat, i.e. after every weekday's 20:15 audit has landed.
+on:
+  schedule:
+    - cron: "40 22 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: watchdog
+      cancel-in-progress: true
+    steps:
+      # GitHub 러너(Azure 대역)는 Oracle Cloud 인바운드가 드롭되므로 Tailscale 사설망으로 접속한다.
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Probe VPS liveness over Tailscale
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          HOST: ${{ secrets.HOST }}
+          REMOTE_USER: ${{ secrets.USERNAME }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/watchdog_key
+          chmod 600 ~/.ssh/watchdog_key
+          SSH_OPTS="-i $HOME/.ssh/watchdog_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
+
+          # 프로브는 PyPI 없이 돌아야 하므로 --no-sync로 실행한다.
+          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "cd ~/k-closing-alpha && ~/.local/bin/uv run --no-sync python -m src.tools.watchdog_probe"
+
+      - name: Check GHCR PAT expiry
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          headers="$(curl -sS -D - -o /dev/null -H "Authorization: Bearer $GHCR_PAT" https://api.github.com/)"
+          expiry="$(printf '%s' "$headers" | grep -i '^github-authentication-token-expiration:' | cut -d: -f2- | xargs || true)"
+          if [ -z "$expiry" ]; then
+            echo "GHCR_PAT has no expiry; passing"
+            exit 0
+          fi
+          expiry_epoch="$(date -u -d "$expiry" +%s)"
+          now_epoch="$(date -u +%s)"
+          days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+          if [ "$days_left" -le 30 ]; then
+            echo "GHCR_PAT expires $expiry"
+            exit 1
+          fi
+          echo "GHCR_PAT valid for ${days_left} more days"

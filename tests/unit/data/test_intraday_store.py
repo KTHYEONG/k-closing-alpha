@@ -725,4 +725,25 @@ def test_tick_write_with_stale_sidecar_succeeds_and_leaves_no_lock(tmp_path: Pat
     assert list(target.parent.glob("*.lock")) == []
 
 
+def test_backup_dir_keyed_by_retention_date(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    monkeypatch.setattr(intraday_store, "_capture_root", lambda: tmp_path / "capture")
+    target = tmp_path / "partition.parquet"
+    target.write_bytes(b"evidence")
+    clock_now = datetime(2026, 9, 28, 12, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    def _clock() -> datetime:
+        return clock_now
+
+    ref = intraday_store._retain_backup_ref(target, "2026-06-01", "regular", now_fn=_clock)
+
+    backup = Path(ref)
+    assert backup.parent == tmp_path / "capture" / "backups" / "intraday" / "regular" / "2026-09-28"
+    assert "2026-06-01" in backup.name
+    assert backup.exists()
+
+
 

@@ -149,9 +149,36 @@ class KisApiClient:
 
     @contextlib.asynccontextmanager
     async def _host_token_lock(self) -> AsyncIterator[None]:
+        """Serialize token issuance across processes sharing the host token cache.
+
+        The cache directory is shared with other projects' containers that may run
+        as a different uid and pre-create the sidecar lock file. flock only needs an
+        open descriptor, so a lock file that exists but is not writable is opened
+        read-only instead of failing authentication.
+
+        Raises:
+            OSError: The lock file can be neither opened read-write nor
+                read-only (e.g. mode 0600 owned by another uid, or a directory); logged with
+                `[SYS] stage=kis_token_lock status=UNOPENABLE` before raising.
+        """
         lock_path = self.token_file + ".lock"
         os.makedirs(os.path.dirname(os.path.abspath(self.token_file)), exist_ok=True)
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd: int | None = None
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except PermissionError:
+            if os.path.isfile(lock_path):
+                with contextlib.suppress(OSError):
+                    fd = os.open(lock_path, os.O_RDONLY)
+            if fd is None:
+                logger.warning("[SYS] stage=kis_token_lock status=UNOPENABLE key_id=%s", kis_key_id(self.app_key or ""))
+                raise
+            logger.warning(
+                "[SYS] stage=kis_token_lock status=READONLY_FALLBACK key_id=%s", kis_key_id(self.app_key or "")
+            )
+        except OSError:
+            logger.warning("[SYS] stage=kis_token_lock status=UNOPENABLE key_id=%s", kis_key_id(self.app_key or ""))
+            raise
         try:
             await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
             try:

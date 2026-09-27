@@ -558,3 +558,86 @@ def test_run_altdata_backfill_empty_pool_maps_to_skipped_no_key(tmp_path) -> Non
     cfg = _altdata_cfg(tmp_path, sources=("disclosure",), dart_key_pool=DartKeyPool([]))
     report = runner.run_altdata_backfill(cfg)
     assert report["panels"]["disclosure"]["status"] == "skipped_no_key"
+
+
+def test_incremental_merge_raises_on_unreadable_panel(tmp_path) -> None:
+    import pandas as pd
+    import pytest
+
+    from src.backfill.altdata import runner
+    from src.data.io_utils import ExistingStoreUnreadableError
+
+    panel = tmp_path / "credit_balance.parquet"
+    panel.write_bytes(b"not a valid parquet file")
+    new_df = pd.DataFrame({"date": ["2026-09-10"], "symbol": ["005930"]})
+
+    with pytest.raises(ExistingStoreUnreadableError, match="credit_balance\\.parquet"):
+        runner._incremental_merge(panel, new_df, ("date", "symbol"))
+
+    assert panel.read_bytes() == b"not a valid parquet file"
+
+
+def test_run_altdata_backfill_marks_source_unavailable_and_preserves_panel(monkeypatch, tmp_path) -> None:
+    """Corrupt panel fails the source loudly; the file is left byte-identical."""
+    import pandas as pd
+
+    from src.backfill.altdata import runner
+
+    cfg = _altdata_cfg(tmp_path, sources=("credit_balance",))
+    panel = cfg.out_dir / "credit_balance.parquet"
+    panel.parent.mkdir(parents=True, exist_ok=True)
+    panel.write_bytes(b"not a valid parquet file")
+
+    def _collect(cfg_, missing):
+        return pd.DataFrame({"date": missing, "symbol": ["005930"] * len(missing), "balance": [1.0] * len(missing)})
+
+    monkeypatch.setattr(runner, "collect_credit_balance", _collect)
+    report = runner.run_altdata_backfill(cfg)
+
+    assert report["panels"]["credit_balance"]["status"] == "unavailable"
+    assert "ExistingStoreUnreadableError" in report["panels"]["credit_balance"]["error"]
+    assert panel.read_bytes() == b"not a valid parquet file"
+
+
+def test_covered_dates_empty_without_date_column(tmp_path) -> None:
+    import pandas as pd
+
+    from src.backfill.altdata import runner
+
+    panel = tmp_path / "shorting.parquet"
+    pd.DataFrame({"symbol": ["005930"]}).to_parquet(panel, index=False)
+
+    assert runner._covered_dates(panel) == set()
+
+
+def test_up_to_date_empty_week_for_missing_panel(tmp_path) -> None:
+    import pandas as pd
+
+    from src.backfill.altdata import runner
+
+    cfg = _altdata_cfg(tmp_path, start=pd.Timestamp("2026-09-12"), end=pd.Timestamp("2026-09-13"))
+    assert pd.bdate_range(cfg.start, cfg.end).empty
+
+    report = runner.run_altdata_backfill(cfg)
+
+    assert report["panels"]["shorting"]["status"] == "up_to_date"
+    assert report["panels"]["shorting"]["rows"] == 0
+
+
+def test_up_to_date_report_tolerates_torn_panel_read(monkeypatch, tmp_path) -> None:
+    """Covered-dates check passed but the report read tore: report zeros, keep status."""
+    import pandas as pd
+
+    from src.backfill.altdata import runner
+
+    cfg = _altdata_cfg(tmp_path)
+    days = [pd.Timestamp(d).normalize() for d in pd.bdate_range(cfg.start, cfg.end)]
+    panel = cfg.out_dir / "shorting.parquet"
+    panel.parent.mkdir(parents=True, exist_ok=True)
+    panel.write_bytes(b"not a valid parquet file")
+    monkeypatch.setattr(runner, "_covered_dates", lambda _path: set(days))
+
+    report = runner.run_altdata_backfill(cfg)
+
+    assert report["panels"]["shorting"]["status"] == "up_to_date"
+    assert report["panels"]["shorting"]["rows"] == 0

@@ -85,16 +85,24 @@ flowchart TD
 
 | 시각 (KST) | 타이머 유닛 | 오케스트레이션 단계 | 핵심 안전장치 및 실패 처리 |
 | :---: | :--- | :--- | :--- |
-| **08:30** | `kca-kis-token-warmup` | **인증 사전 워밍업** | 브로커 API 슬롯별 격리 발급, 휴장일 자동 스킵, 멱등 갱신 |
-| **09:00** | `kca-paper-exit` | **익일 기계적 청산** | 세션 캘린더 증명(당일 시세 일치 검증), 휴장일 유령 체결 0% 차단 |
+| **07:05** | `kca-kis-token-warmup` | **인증 사전 워밍업** | 브로커 API 슬롯별 격리 발급, 휴장일 자동 스킵, 멱등 갱신 |
+| **09:01** | `kca-paper-exit` | **익일 기계적 청산** | 세션 캘린더 증명(당일 시세 일치 검증), 휴장일 유령 체결 0% 차단 |
 | **15:20** | `kca-collect` | **15:20 단면 스냅샷** | 실행 시간창(15:20~15:30) 검증, 단면 수집 정상률 99% 미달 시 즉시 중단 |
 | **15:21** | `kca-predict` | **Top-3 랭킹 추론** | 28차원 PIT 피처 산출, 결측치 플레이스홀더 금지 (미달 시 전액 현금) |
 | **15:30** | `kca-finalize-close` | **장마감 종가 확정** | 3중 Fail-Closed 게이트 (시계 + 마감코드 '3' + 호가/체결가 일치) |
 | **15:30** | `kca-paper-entry` | **가상 매수 진입** | `종가_확정=True` 확인 시 발화, 결정시점 사이징 및 현금 초과 방지 |
+| **15:34** | `kca-paper-entry` | **가상 매수 진입 백스톱** | `finalize-close` 체이닝이 끊겨도 독립 타이머가 진입 시도를 보증 |
+| **15:40** | `kca-archive-intraday-regular` | **정규장 분봉/틱 적재** | 15:30 종가 확정 후 당일분 정규장 1분봉 아카이브 |
 | **20:05** | `kca-archive-intraday`| **분봉/틱 야간 적재** | 세마포어 동시성 제어 및 배치 플러시 (쓰기 지연 207s $\to$ 0.53s) |
-| **21:00** | `kca-price-ingest` | **EOD 시세 통합** | KRX 전종목 패널 통합, 기준/레버리지 포트폴리오 성과 귀속 계산 |
-| **22:00** | `kca-backup` | **오프사이트 세그먼트**| 파일 잠금(flock) 직렬화, tar.zst 세그먼트 봉인 및 원격 MD5 검증 |
-| **23:00** | `kca-daily-audit` | **일일 무결성 감사** | 분봉 완전성 감사, 백업 신선도 점검, 미전송 알림(outbox) 자동 회수 |
+| **08:30/11:30/21:30** | `kca-price-ingest` | **EOD 시세 통합** | KRX 전종목 패널 통합, 기준/레버리지 포트폴리오 성과 귀속 계산 |
+| **22:15** | `kca-backup` | **오프사이트 세그먼트**| 파일 잠금(flock) 직렬화, tar.zst 세그먼트 봉인 및 원격 MD5 검증 |
+| **20:15** | `kca-daily-audit` | **일일 무결성 감사** | 분봉 완전성 감사, 백업 신선도 점검, 미전송 알림(outbox) 자동 회수 |
+
+모든 oneshot 유닛은 유한한 `TimeoutStartSec` 상한을 가지며, 타임아웃은 `failed` 상태와 `OnFailure` 알림으로 표면화된다.
+
+Restore a capture tier with `uv run python -m src.tools.capture_offsite restore --tier <tier> --date <YYYY-MM-DD> --dest <path>` (dest must be outside the live capture tiers); weekly `kca-offsite-verify` (Sun 11:00 KST) re-verifies every ledgered segment's remote MD5 and rehearses a rotating date end-to-end.
+
+Deploys converge the VPS only outside the 08:50–09:40 and 15:10–15:43 KST weekday blackout; retrain uses the locally gated image.
 
 ---
 

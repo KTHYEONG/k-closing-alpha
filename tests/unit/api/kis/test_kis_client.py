@@ -285,3 +285,174 @@ def test_kis_decision_shard_client_kwargs_returns_two_entries_when_configured() 
     assert [kw["app_key"] for kw in result] == ["key1", "key5"]
     assert result[1]["token_file"].endswith(".json")
 
+
+def _skip_if_root() -> None:
+    import os
+
+    import pytest
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses file permission checks")
+
+
+def _lock_client(tmp_path, app_key: str = "KEY123456"):
+    from src.api.kis.client import KisApiClient
+
+    return KisApiClient(app_key=app_key, app_secret="SECRET999", token_file=str(tmp_path / "token.json"))
+
+
+class _TokenIssuedResponse:
+    async def json(self):
+        return {"access_token": "TOKEN-ABC", "expires_in": 86400}
+
+
+class _TokenIssuedContext:
+    async def __aenter__(self):
+        return _TokenIssuedResponse()
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _TokenIssueSession:
+    """Stub aiohttp session serving one successful token issuance."""
+
+    def __init__(self) -> None:
+        self.posts = 0
+
+    def post(self, _url, **_kwargs):
+        self.posts += 1
+        return _TokenIssuedContext()
+
+
+class _BoomSession:
+    def post(self, _url, **_kwargs):
+        raise AssertionError("no token request must be sent")
+
+
+def test_host_token_lock_falls_back_to_readonly_descriptor(tmp_path, caplog) -> None:
+    import asyncio
+    import json
+    import logging
+    import os
+    import stat
+
+    _skip_if_root()
+    lock_path = tmp_path / "token.json.lock"
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o444)
+    client = _lock_client(tmp_path)
+    session = _TokenIssueSession()
+
+    with caplog.at_level(logging.INFO, logger="src.api.kis.client"):
+        token = asyncio.run(client.ensure_token(session))  # type: ignore[arg-type]
+
+    assert token == "TOKEN-ABC"
+    assert session.posts == 1
+    assert json.loads((tmp_path / "token.json").read_text(encoding="utf-8"))["access_token"] == "TOKEN-ABC"
+    records = [rec for rec in caplog.records if rec.name == "src.api.kis.client"]
+    assert any("READONLY_FALLBACK" in rec.getMessage() for rec in records)
+    assert all("KEY123456" not in rec.getMessage() and "SECRET999" not in rec.getMessage() for rec in records)
+    assert stat.S_IMODE(os.stat(lock_path).st_mode) == 0o444
+
+
+def test_host_token_lock_readonly_descriptor_still_excludes(tmp_path) -> None:
+    import asyncio
+    import time
+
+    _skip_if_root()
+    lock_path = tmp_path / "token.json.lock"
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o444)
+    first = _lock_client(tmp_path)
+    second = _lock_client(tmp_path)
+    spans: dict[str, list[float]] = {}
+
+    async def _worker(client, tag: str) -> None:
+        async with client._host_token_lock():
+            spans[tag] = [time.monotonic()]
+            await asyncio.sleep(0.05)
+            spans[tag].append(time.monotonic())
+
+    async def _main() -> None:
+        await asyncio.gather(_worker(first, "a"), _worker(second, "b"))
+
+    asyncio.run(_main())
+
+    assert set(spans) == {"a", "b"}
+    assert spans["a"][1] <= spans["b"][0] or spans["b"][1] <= spans["a"][0]
+
+
+def test_host_token_lock_unopenable_directory_raises_with_log(tmp_path, caplog) -> None:
+    import asyncio
+    import logging
+
+    import pytest
+
+    (tmp_path / "token.json.lock").mkdir()
+    client = _lock_client(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="src.api.kis.client"), pytest.raises(IsADirectoryError):
+        asyncio.run(client.ensure_token(_BoomSession()))  # type: ignore[arg-type]
+    records = [rec for rec in caplog.records if rec.name == "src.api.kis.client"]
+    assert any("UNOPENABLE" in rec.getMessage() for rec in records)
+
+
+def test_host_token_lock_unopenable_mode_raises_with_log(tmp_path, caplog) -> None:
+    import asyncio
+    import logging
+
+    import pytest
+
+    _skip_if_root()
+    lock_path = tmp_path / "token.json.lock"
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o000)
+    client = _lock_client(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="src.api.kis.client"), pytest.raises(PermissionError):
+        asyncio.run(client.ensure_token(_BoomSession()))  # type: ignore[arg-type]
+    records = [rec for rec in caplog.records if rec.name == "src.api.kis.client"]
+    assert any("UNOPENABLE" in rec.getMessage() for rec in records)
+
+
+def test_host_token_lock_uncreatable_lock_raises_with_log(tmp_path, caplog) -> None:
+    import asyncio
+    import logging
+    import os
+
+    import pytest
+
+    _skip_if_root()
+    from src.api.kis.client import KisApiClient
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    os.chmod(cache_dir, 0o555)  # noqa: S103 - fixture needs a directory where file creation fails
+    try:
+        client = KisApiClient(app_key="KEY123456", app_secret="SECRET999", token_file=str(cache_dir / "token.json"))
+        with caplog.at_level(logging.INFO, logger="src.api.kis.client"), pytest.raises(PermissionError):
+            asyncio.run(client.ensure_token(_BoomSession()))  # type: ignore[arg-type]
+    finally:
+        os.chmod(cache_dir, 0o755)  # noqa: S103 - restore test fixture permissions
+    records = [rec for rec in caplog.records if rec.name == "src.api.kis.client"]
+    assert any("UNOPENABLE" in rec.getMessage() for rec in records)
+
+
+def test_host_token_lock_normal_path_unchanged(tmp_path, caplog) -> None:
+    import asyncio
+    import logging
+    import os
+    import stat
+
+    client = _lock_client(tmp_path)
+    session = _TokenIssueSession()
+
+    with caplog.at_level(logging.INFO, logger="src.api.kis.client"):
+        token = asyncio.run(client.ensure_token(session))  # type: ignore[arg-type]
+
+    assert token == "TOKEN-ABC"
+    assert stat.S_IMODE(os.stat(tmp_path / "token.json.lock").st_mode) == 0o600
+    records = [rec for rec in caplog.records if rec.name == "src.api.kis.client"]
+    assert not any("READONLY_FALLBACK" in rec.getMessage() or "UNOPENABLE" in rec.getMessage() for rec in records)
+

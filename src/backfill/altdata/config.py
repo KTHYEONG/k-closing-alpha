@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -43,6 +44,22 @@ _ALTDATA_PANELS: dict[str, dict[str, Any]] = {
         "level": "symbol",
     },
 }
+
+
+KRX_SHORT_CODE_PATTERN: str = r"^[0-9A-Z]{6}$"
+
+_SHORT_CODE_RE = re.compile(KRX_SHORT_CODE_PATTERN)
+
+
+def is_krx_short_code(symbol: object) -> bool:
+    """Return True for a KRX 6-character listed-security short code.
+
+    Numeric codes were exhausted, so KRX assigns alphanumeric short codes
+    (e.g. "0009K0") to new listings; both forms identify ordinary stocks.
+    Lower-case, 5/7-character and prefixed forms ("A005930", ETN "Q...") are
+    not short codes.
+    """
+    return isinstance(symbol, str) and _SHORT_CODE_RE.match(symbol) is not None
 
 
 @dataclass(frozen=True)
@@ -136,8 +153,8 @@ class AltDataFetchConfig:
             if len(self.universe_symbols) == 0:
                 raise ValueError("universe_symbols must be non-empty")
             for sym in self.universe_symbols:
-                if not isinstance(sym, str) or len(sym) != 6 or not sym.isdigit():
-                    raise ValueError(f"universe_symbols entry '{sym}' must be 6-digit string")
+                if not is_krx_short_code(sym):
+                    raise ValueError(f"universe_symbols entry '{sym}' must be a KRX 6-character short code")
 
 
 def dart_pool_for(cfg: AltDataFetchConfig) -> DartKeyPool:
