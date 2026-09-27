@@ -441,5 +441,9 @@
   },
   "src/utils/file_lock.py": {
     "testing": "tests/unit/utils/test_file_lock.py"
+  },
+  "deploy/systemd/kca-collect.service": {
+    "architecture": "docs/architecture/system-design.md",
+    "testing": "tests/unit/deploy/test_systemd_units.py"
   }
 }

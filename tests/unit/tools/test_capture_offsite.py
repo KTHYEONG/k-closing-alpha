@@ -1253,3 +1253,300 @@ def test_sealed_segment_upload_is_immutable(tmp_path: Path, monkeypatch) -> None
     copytos = [c for c in calls if c[1] == "copyto"]
     assert copytos
     assert all("--immutable" in c for c in copytos)
+
+
+def test_sealed_prune_dry_run_verifies_but_keeps(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    day = "2026-08-01"
+    rel = _raw_rel(day, "a", "b.json")
+    _write_member(tmp_path, rel, b"sealed-payload")
+    size = (tmp_path / rel).stat().st_size
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    _write_prune_ledger(tmp_path, "raw", day, [rel], archive_md5=md5)
+    calls: list = []
+
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, calls), config=_config(), dry_run=True
+    )
+
+    assert report.removed == ("raw/2026-08-01",)
+    assert report.bytes_removed == size
+    assert (tmp_path / "raw" / day).exists()
+    assert len(calls) == 1
+
+
+def _write_verify_ledger(root: Path, tier: str, day: str, seg: str, md5: str) -> str:
+    from src.tools.capture_offsite import LedgerEntry, SegmentMember, _append_ledger_entry, _ledger_path
+
+    rel = f"{tier}/{day}/m-{seg}.bin"
+    _write_member(root, rel, b"x")
+    size = (root / rel).stat().st_size
+    entry = LedgerEntry(
+        tier=tier,
+        trading_date=day,
+        segment_name=seg,
+        remote_path=f"gdrive:test/{tier}/{day[:7]}/{day}/{seg}.tar.zst",
+        members=(SegmentMember(path=rel, size=size, sha256="0" * 64),),
+        archive_bytes=10,
+        archive_md5=md5,
+        committed_at="2026-09-15T00:00:00+00:00",
+    )
+    _append_ledger_entry(_ledger_path(root, tier, day), entry)
+    return entry.remote_path
+
+
+def _verify_run_fn(listings, calls, fail_dirs=None):
+    fail = fail_dirs or set()
+
+    def run_fn(cmd, **kwargs):
+        calls.append(list(cmd))
+        assert cmd[1] == "md5sum"
+        tier, month = cmd[2].split("/")[-2:]
+        if (tier, month) in fail:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+        lines = [f"{md5}  {name}\n" for md5, name in listings.get((tier, month), [])]
+        return subprocess.CompletedProcess(cmd, 0, stdout="\n" + "".join(lines), stderr="")
+
+    return run_fn
+
+
+def test_verify_remote_segments_reports_ok_when_listing_matches_ledger(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import verify_remote_segments
+
+    md5a, md5b = "a" * 32, "B" * 32
+    _write_verify_ledger(tmp_path, "raw", "2026-09-10", "seg-aaa", md5a)
+    _write_verify_ledger(tmp_path, "raw", "2026-09-10", "seg-bbb", md5b)
+    (tmp_path / "offsite" / "ledger" / "raw" / "notes.jsonl").write_text("stray\n", encoding="utf-8")
+    calls: list = []
+    listings = {("raw", "2026-09"): [(md5a, "2026-09-10/seg-aaa.tar.zst"), (md5b.lower(), "2026-09-10/seg-bbb.tar.zst")]}
+
+    report = verify_remote_segments(tmp_path, run_fn=_verify_run_fn(listings, calls), config=_config())
+
+    assert report.checked == 2
+    assert report.missing == () and report.mismatched == ()
+    assert len(calls) == 1
+    assert calls[0][2] == "gdrive:test/raw/2026-09"
+
+
+def test_verify_remote_segments_reports_missing_and_mismatched(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import verify_remote_segments
+
+    remote_a = _write_verify_ledger(tmp_path, "raw", "2026-09-10", "seg-aaa", "a" * 32)
+    remote_b = _write_verify_ledger(tmp_path, "raw", "2026-09-10", "seg-bbb", "b" * 32)
+    calls: list = []
+    listings = {("raw", "2026-09"): [("f" * 32, "2026-09-10/seg-bbb.tar.zst")]}
+
+    report = verify_remote_segments(tmp_path, run_fn=_verify_run_fn(listings, calls), config=_config())
+
+    assert report.checked == 2
+    assert report.missing == (remote_a,)
+    assert report.mismatched == (remote_b,)
+
+
+def test_verify_remote_segments_uses_one_call_per_tier_month(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import verify_remote_segments
+
+    pairs = (("raw", "2026-08-01"), ("raw", "2026-09-01"), ("normalized", "2026-08-02"), ("normalized", "2026-09-02"))
+    listings: dict = {}
+    for tier, day in pairs:
+        _write_verify_ledger(tmp_path, tier, day, f"seg-{day}", "d" * 32)
+        listings.setdefault((tier, day[:7]), []).append(("d" * 32, f"{day}/seg-{day}.tar.zst"))
+    calls: list = []
+
+    report = verify_remote_segments(tmp_path, run_fn=_verify_run_fn(listings, calls), config=_config())
+
+    assert report.checked == 4
+    assert report.missing == () and report.mismatched == ()
+    assert len(calls) == 4
+
+
+def test_verify_remote_segments_listing_failure_raises(tmp_path: Path) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import verify_remote_segments
+
+    _write_verify_ledger(tmp_path, "raw", "2026-09-10", "seg-aaa", "a" * 32)
+
+    with pytest.raises(RuntimeError, match="listing failed"):
+        verify_remote_segments(
+            tmp_path, run_fn=_verify_run_fn({}, [], fail_dirs={("raw", "2026-09")}), config=_config()
+        )
+
+
+def test_verify_remote_segments_ignores_orphans(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import verify_remote_segments
+
+    _write_verify_ledger(tmp_path, "raw", "2026-09-10", "seg-aaa", "a" * 32)
+    calls: list = []
+    listings = {
+        ("raw", "2026-09"): [("a" * 32, "2026-09-10/seg-aaa.tar.zst"), ("e" * 32, "2026-09-10/seg-orphan.tar.zst")]
+    }
+
+    report = verify_remote_segments(tmp_path, run_fn=_verify_run_fn(listings, calls), config=_config())
+
+    assert report.checked == 1
+    assert report.missing == () and report.mismatched == ()
+
+
+def test_select_drill_dates_rotates_and_skips_recent(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import select_drill_dates
+
+    olds = ["2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04", "2026-08-05"]
+    for day in olds:
+        _write_verify_ledger(tmp_path, "raw", day, f"seg-{day}", "d" * 32)
+    _write_verify_ledger(tmp_path, "raw", "2026-09-30", "seg-recent", "e" * 32)
+    _write_verify_ledger(tmp_path, "normalized", "2026-09-30", "seg-recent", "e" * 32)
+
+    first = select_drill_dates(tmp_path, today=date(2026, 9, 24), config=_config())
+    second = select_drill_dates(tmp_path, today=date(2026, 10, 1), config=_config())
+
+    assert set(first) == {"raw"}
+    assert first["raw"] in olds
+    assert first["raw"] == sorted(olds)[date(2026, 9, 24).isocalendar().week % len(olds)]
+    assert second["raw"] in olds
+    assert second["raw"] != first["raw"]
+
+
+def _seal_single_member(tmp_path: Path, monkeypatch, day: str = "2026-09-10"):
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"alpha")
+    remote_dir = tmp_path / "remote"
+    seal_fn, _ = _make_fake(remote_dir, "gdrive:test")
+    seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=seal_fn, now_fn=_utcnow, config=_config())
+    return remote_dir
+
+
+def test_run_restore_drill_uses_scratch_and_cleans_up(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import run_restore_drill
+
+    day = "2026-09-10"
+    rel = _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin")
+    remote_dir = _seal_single_member(tmp_path, monkeypatch, day)
+    before = (tmp_path / rel).read_bytes()
+    drill_fn, _ = _make_fake(remote_dir, "gdrive:test")
+
+    reports = run_restore_drill(tmp_path, today=date(2026, 9, 24), run_fn=drill_fn, config=_config())
+
+    assert len(reports) == 1
+    assert reports[0].tier == "raw" and reports[0].trading_date == day
+    assert reports[0].members_verified == 1
+    assert list((tmp_path / "staging" / "offsite").glob("drill-*")) == []
+    assert (tmp_path / rel).read_bytes() == before
+    assert (tmp_path / "raw" / day).exists()
+
+
+def test_run_restore_drill_cleans_up_on_corruption(tmp_path: Path, monkeypatch) -> None:
+    import json
+
+    import pytest
+
+    from src.tools.capture_offsite import run_restore_drill
+
+    day = "2026-09-10"
+    remote_dir = _seal_single_member(tmp_path, monkeypatch, day)
+    ledger_path = tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl"
+    entry = json.loads(ledger_path.read_text(encoding="utf-8").splitlines()[0])
+    entry["archive_md5"] = "0" * 32
+    ledger_path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    drill_fn, _ = _make_fake(remote_dir, "gdrive:test")
+
+    with pytest.raises(ValueError, match="archive MD5 mismatch"):
+        run_restore_drill(tmp_path, today=date(2026, 9, 24), run_fn=drill_fn, config=_config())
+    assert list((tmp_path / "staging" / "offsite").glob("drill-*")) == []
+
+
+def test_run_restore_drill_returns_empty_without_candidates(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import run_restore_drill
+
+    _write_verify_ledger(tmp_path, "raw", "2026-09-23", "seg-recent", "e" * 32)
+
+    def _boom(cmd, **kwargs):
+        raise AssertionError("no rclone call expected without candidates")
+
+    assert run_restore_drill(tmp_path, today=date(2026, 9, 24), run_fn=_boom, config=_config()) == []
+
+
+def test_main_verify_reports_ok(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    import src.tools.capture_offsite as module
+
+    monkeypatch.setattr(module, "_capture_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        module, "verify_remote_segments", lambda root: module.RemoteVerifyReport(checked=2, missing=(), mismatched=())
+    )
+    monkeypatch.setattr(
+        module,
+        "run_restore_drill",
+        lambda root, *, today: [module.RestoreDrillReport(tier="raw", trading_date="2026-09-10", members_verified=1)],
+    )
+
+    with caplog.at_level(logging.INFO, logger=module.logger.name):
+        assert module.main(["verify"]) == 0
+    assert any("stage=offsite_verify" in rec.message and "checked=2" in rec.message for rec in caplog.records)
+
+
+def test_main_verify_returns_one_on_findings(tmp_path: Path, monkeypatch) -> None:
+    import src.tools.capture_offsite as module
+
+    monkeypatch.setattr(module, "_capture_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        module,
+        "verify_remote_segments",
+        lambda root: module.RemoteVerifyReport(
+            checked=2, missing=("gdrive:x/seg-a.tar.zst",), mismatched=("gdrive:x/seg-b.tar.zst",)
+        ),
+    )
+    monkeypatch.setattr(module, "run_restore_drill", lambda root, *, today: [])
+
+    assert module.main(["verify"]) == 1
+
+
+def test_main_verify_returns_one_on_drill_failure(tmp_path: Path, monkeypatch) -> None:
+    import src.tools.capture_offsite as module
+
+    monkeypatch.setattr(module, "_capture_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        module, "verify_remote_segments", lambda root: module.RemoteVerifyReport(checked=1, missing=(), mismatched=())
+    )
+
+    def _boom(root, *, today):
+        raise ValueError("corrupt")
+
+    monkeypatch.setattr(module, "run_restore_drill", _boom)
+
+    assert module.main(["verify"]) == 1
+
+
+def test_main_restore_writes_outside_live_tiers(tmp_path: Path, monkeypatch) -> None:
+    import src.tools.capture_offsite as module
+
+    monkeypatch.setattr(module, "_capture_root", lambda: tmp_path)
+    seen: dict = {}
+
+    def _fake_restore(root, tier, trading_date, dest, **kwargs):
+        seen.update({"tier": tier, "trading_date": trading_date, "dest": dest})
+        return ["raw/2026-09-10/a"]
+
+    monkeypatch.setattr(module, "restore_date", _fake_restore)
+    dest = tmp_path / "scratch" / "out"
+
+    assert module.main(["restore", "--tier", "raw", "--date", "2026-09-10", "--dest", str(dest)]) == 0
+    assert seen == {"tier": "raw", "trading_date": "2026-09-10", "dest": dest}
+
+
+def test_main_restore_rejects_dest_inside_live_tiers(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    import src.tools.capture_offsite as module
+
+    monkeypatch.setattr(module, "_capture_root", lambda: tmp_path)
+
+    with pytest.raises(ValueError, match="live tier"):
+        module.main(["restore", "--tier", "raw", "--date", "2026-09-10", "--dest", str(tmp_path / "raw" / "x")])
+    assert not (tmp_path / "raw" / "x").exists()
+    assert not (tmp_path / "staging").exists()

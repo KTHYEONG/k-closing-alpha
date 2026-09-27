@@ -66,6 +66,10 @@ jobs:
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: deploy-oracle
+      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -92,12 +96,22 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           SSH_OPTS="-i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
+          # 같은 main에 쌓인 푸시 중 가장 최신 커밋만 배포한다 -- 오래된 대기 run이
+          # 최신 run을 구버전으로 되돌리는 것을 막는다(아래 heredoc 안에서 비교).
+          LATEST_MAIN_SHA="$(git ls-remote https://github.com/kthyeong/k-closing-alpha refs/heads/main | cut -f1)"
 
           ssh $SSH_OPTS "$REMOTE_USER@$HOST" bash -s <<EOF
           set -e
           echo '$GHCR_PAT' | docker login ghcr.io -u '$GHCR_USER' --password-stdin
           docker pull ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA
           docker run --rm -v ~/k-closing-alpha/artifacts:/app/artifacts:ro ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA uv run python -m src.tools.deploy_preflight
+          # VPS 수렴(태그+체크아웃)은 장중 의사결정과 겹치지 않을 때만 수행한다 --
+          # 새 이미지의 코드로 실행하므로 윈도우 정의가 커밋과 함께 배송된다.
+          docker run --rm -e TZ=Asia/Seoul ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA uv run python -m src.tools.deploy_window --wait
+          if [ "$LATEST_MAIN_SHA" != "$COMMIT_SHA" ]; then
+            echo "SKIP: superseded by $LATEST_MAIN_SHA"
+            exit 0
+          fi
           docker tag ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA ghcr.io/kthyeong/k-closing-alpha:latest
           docker image prune -f
           # 이 커밋은 위 test job이 이미 pytest 전체스위트로 검증했으므로, 호스트 체크아웃과

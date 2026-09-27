@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import logging
+import os
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
@@ -66,6 +69,7 @@ from src.data.trading_calendar import (
 from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import dispatch_digest, drain_alert_outbox
+from src.tools.expiry_notices import CALENDAR_EXPIRY_NAME, CALENDAR_RENEW_HINT, evaluate_expiries
 from src.tools.offsite_backup import REPORT_RELPATH, backup_staleness_issues
 from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes
 from src.utils.cli_logging import configure_cli_logging
@@ -662,6 +666,13 @@ def audit_intraday_partitions(
     return tuple(issues)
 
 
+def _expiry_hint_lines(items: Sequence[str]) -> list[str]:
+    """KRX 달력 수평선 자체가 만료 예정일 때 표시하는 고정 갱신 안내."""
+    if any(item.startswith(f"{CALENDAR_EXPIRY_NAME}:") for item in items):
+        return [f"• 달력 갱신: {CALENDAR_RENEW_HINT}"]
+    return []
+
+
 def build_digest(
     snapshot_date: str,
     day_kind: str,
@@ -673,6 +684,8 @@ def build_digest(
     backup_issues: Sequence[str] = (),
     session_kind: str = "UNKNOWN",
     undelivered_alerts: int = 0,
+    expiry_notices: Sequence[str] = (),
+    expiry_warnings: Sequence[str] = (),
 ) -> tuple[str, str]:
     """일일 요약의 (제목, 본문)을 만든다.
 
@@ -685,6 +698,8 @@ def build_digest(
         collection_issues: Independently assessed raw-data and schedule gaps.
         session_kind: Resolved SessionKind value for the date.
         undelivered_alerts: Outbox에 적체된 미전송 알림 수. 0보다 크면 경고.
+        expiry_notices: D-30 이내 만료 예정 항목. 정상 요약을 경고로 바꾸지 않는다.
+        expiry_warnings: D-7 이내(지난 항목 포함) 만료 항목. backup_issues처럼 경고로 격상한다.
 
     Returns:
         (제목, 본문) 튜플.
@@ -707,8 +722,41 @@ def build_digest(
     lines.append(f"collection_issues={','.join(collection_issues) if collection_issues else 'none'}")
     lines.append(f"backup_issues={','.join(backup_issues) if backup_issues else 'none'}")
     lines.append(f"undelivered_alerts={undelivered_alerts}")
+    lines.append(f"expiry_notices={','.join(expiry_notices) if expiry_notices else 'none'}")
+    lines.append(f"expiry_warnings={','.join(expiry_warnings) if expiry_warnings else 'none'}")
 
     if day_kind == DAY_HOLIDAY:
+        holiday_problems: list[str] = []
+        if session_kind == SessionKind.STANDARD.value:
+            holiday_problems.append("calendar_disagreement")
+        if failed_units:
+            holiday_problems.append(f"실패유닛 {','.join(failed_units)}")
+        if backup_issues:
+            holiday_problems.append(f"백업이상 {','.join(backup_issues)}")
+        if undelivered_alerts:
+            holiday_problems.append(f"미전송알림 {undelivered_alerts}건")
+        if expiry_warnings:
+            holiday_problems.append(f"만료임박 {','.join(expiry_warnings)}")
+        if holiday_problems:
+            summary_lines = [
+                "==================================================",
+                f"🚨 K-Closing Alpha 장애/누락 알림 ({snapshot_date})",
+                "==================================================",
+            ]
+            if session_kind == SessionKind.STANDARD.value:
+                summary_lines.append("• 달력 불일치: 정적 달력은 개장(STANDARD)이나 KIS 오라클이 휴일로 응답 (fail-closed, 무결정)")
+            if failed_units:
+                summary_lines.append(f"• 실패 유닛: {', '.join(failed_units)}")
+            if backup_issues:
+                summary_lines.append(f"• 백업 이상: {', '.join(backup_issues)}")
+            if undelivered_alerts:
+                summary_lines.append(f"• 미전송 알림: {undelivered_alerts}건 (outbox 적체)")
+            if expiry_warnings:
+                summary_lines.append(f"• 만료 임박: {', '.join(expiry_warnings)}")
+            summary_lines.extend(_expiry_hint_lines((*expiry_notices, *expiry_warnings)))
+            summary_lines.append("• 조치 안내: or-vps 서버 상태 점검 요망")
+            body = "\n".join(summary_lines) + "\n\n[상세 내역]\n" + "\n".join(lines)
+            return f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(holiday_problems)}", body
         label = "휴장일 SKIP"
         header = (
             "==================================================\n"
@@ -723,7 +771,7 @@ def build_digest(
         iss for iss in collection_issues
         if not any(iss.endswith(suffix) for suffix in ignored_reasons)
     ]
-    is_warning = bool(missing or failed_units or stale_kis_tokens or critical_collection or backup_issues or undelivered_alerts)
+    is_warning = bool(missing or failed_units or stale_kis_tokens or critical_collection or backup_issues or undelivered_alerts or expiry_warnings)
 
     if not is_warning:
         nav_str, entry_str = _extract_paper_summary(snapshot_date)
@@ -738,6 +786,10 @@ def build_digest(
             f"• 진입: 🎯 {entry_str}",
             f"• 데이터: 📦 1분봉 {bars_str} / 체결 틱 {ticks_str} 적재 완료",
         ]
+        if expiry_notices:
+            summary_block.append(f"🔑 갱신 필요: {', '.join(expiry_notices)}")
+            subject += f" · 🔑갱신필요 {len(expiry_notices)}건"
+        summary_block.extend(_expiry_hint_lines(expiry_notices))
         body = "\n".join(summary_block) + "\n\n[상세 내역]\n" + "\n".join(lines)
         return subject, body
 
@@ -762,9 +814,15 @@ def build_digest(
     if backup_issues:
         problems.append(f"백업이상 {','.join(backup_issues)}")
         summary_lines.append(f"• 백업 이상: {', '.join(backup_issues)}")
+    if expiry_warnings:
+        problems.append(f"만료임박 {','.join(expiry_warnings)}")
+        summary_lines.append(f"• 만료 임박: {', '.join(expiry_warnings)}")
     if undelivered_alerts:
         problems.append(f"미전송알림 {undelivered_alerts}건")
         summary_lines.append(f"• 미전송 알림: {undelivered_alerts}건 (outbox 적체)")
+    if expiry_notices:
+        summary_lines.append(f"🔑 갱신 필요: {', '.join(expiry_notices)}")
+    summary_lines.extend(_expiry_hint_lines((*expiry_notices, *expiry_warnings)))
     summary_lines.append("• 조치 안내: or-vps 서버 상태 점검 요망")
     body = "\n".join(summary_lines) + "\n\n[상세 내역]\n" + "\n".join(lines)
     return f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(problems)}", body
@@ -798,6 +856,61 @@ def resolve_snapshot_date(now: pd.Timestamp, *, catchup_cutoff_hour: int = _SNAP
 
 def _default_backup_issues(audit_at: datetime) -> list[str]:
     return backup_staleness_issues(_capture_root() / REPORT_RELPATH, audit_at)
+
+
+AUDIT_HEARTBEAT_RELPATH: str = "logs/heartbeat/daily_audit.json"
+
+
+def write_audit_heartbeat(
+    snapshot_date: str,
+    *,
+    day_kind: str,
+    subject: str | None,
+    undelivered_alerts: int,
+    finished_at: datetime,
+    path: Path | None = None,
+) -> Path:
+    """Persist proof that the weekday audit ran to completion.
+
+    The external watchdog reads this file over SSH; its absence or staleness is
+    the only signal that survives a dead alert channel or a stopped host, so it
+    is written on every weekday run including holidays (where no digest is sent).
+
+    Args:
+        snapshot_date: Audited KST date (YYYY-MM-DD).
+        day_kind: classify_day result for the date.
+        subject: Digest subject that was built (None only for weekends).
+        undelivered_alerts: Outbox backlog observed by this run.
+        finished_at: Timezone-aware completion time.
+        path: Override target (tests); default DATA_DIR / AUDIT_HEARTBEAT_RELPATH.
+
+    Returns:
+        Path written.
+
+    Raises:
+        OSError: The heartbeat could not be persisted (the audit unit must fail
+            so OnFailure fires; a silently missing heartbeat would page falsely
+            the next morning without a cause).
+    """
+    target = Path(path) if path is not None else Path(settings.DATA_DIR) / AUDIT_HEARTBEAT_RELPATH
+    payload = {
+        "snapshot_date": snapshot_date,
+        "day_kind": day_kind,
+        "subject": subject,
+        "undelivered_alerts": undelivered_alerts,
+        "finished_at": finished_at.isoformat(),
+    }
+    tmp = target.parent / f"{target.name}.tmp"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, target)
+        os.chmod(target, 0o644)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    return target
 
 
 def run_daily_audit(
@@ -861,12 +974,15 @@ def run_daily_audit(
     except Exception as exc:
         logger.warning("[DATA] stage=daily_audit alert_drain=FAILED reason=%s", type(exc).__name__)
         undelivered_alerts = 0
+    report = evaluate_expiries(trading_date)
     subject, body = build_digest(
         snapshot_date, day_kind, result, failed_units_fn(), stale_tokens_fn(snapshot_date),
         collection_issues=collection_issues,
         backup_issues=backup_issues_fn(audit_at),
         session_kind=session_day.kind.value,
         undelivered_alerts=undelivered_alerts,
+        expiry_notices=report.notices,
+        expiry_warnings=report.warnings,
     )
     has_warning = "경고:" in subject or "🚨" in subject
     if has_warning:
@@ -877,6 +993,13 @@ def run_daily_audit(
     else:
         logger.info("[DATA] stage=daily_audit day=%s status=OK subject=%s", day_kind, subject)
         dispatch_fn(subject, body)
+    write_audit_heartbeat(
+        snapshot_date,
+        day_kind=day_kind,
+        subject=subject,
+        undelivered_alerts=undelivered_alerts,
+        finished_at=datetime.now(SEOUL),
+    )
     return subject
 
 

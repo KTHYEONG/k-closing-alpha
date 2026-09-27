@@ -15,7 +15,7 @@ import pandas as pd
 
 from src import settings
 from src.api.kis.key_pool import resolve_research_credentials
-from src.backfill.altdata.config import AltDataFetchConfig
+from src.backfill.altdata.config import AltDataFetchConfig, is_krx_short_code
 from src.backfill.altdata.dart_keys import resolve_dart_key_pool
 from src.backfill.altdata.runner import run_altdata_backfill
 from src.config.collection import CollectionSettings
@@ -65,18 +65,25 @@ def _krx_listed_universe(window_end: pd.Timestamp, cfg: AltDataFetchConfig) -> f
     None only after exhausting the lookback (e.g. a multi-day holiday cluster),
     leaving the caller's symbol-scoped panels to skip that date.
 
-    ETN/ELW/non-6-digit codes are dropped: AltDataFetchConfig.universe_symbols
-    requires plain 6-digit tickers, and these alt-data endpoints are scoped to
-    common stock, not derivative/ETN listings.
+    ETN/ELW/non-short-code forms are dropped: only KRX 6-character short
+    codes (numeric "005930" and alphanumeric new listings "0013V0" alike)
+    pass AltDataFetchConfig.universe_symbols validation. Prefixed ("A005930"),
+    5/7-character and ETN "Q..." codes are still rejected; these alt-data
+    endpoints are scoped to common stock, not derivative/ETN listings.
     """
+    dropped_total = 0
     for offset in range(_UNIVERSE_LOOKBACK_DAYS):
         candidate = window_end - pd.Timedelta(days=offset)
         frame = fetch_krx_daily(candidate, cfg)
         if frame.empty:
             continue
-        symbols = {s for s in frame["symbol"].astype(str).str.strip().tolist() if len(s) == 6 and s.isdigit()}
+        stripped = [s.strip() for s in frame["symbol"].astype(str).tolist()]
+        symbols = {s for s in stripped if is_krx_short_code(s)}
+        dropped_total += sum(1 for s in stripped if s not in symbols)
         if symbols:
+            logger.debug("[DATA] stage=altdata_universe dropped=%d", dropped_total)
             return frozenset(symbols)
+    logger.debug("[DATA] stage=altdata_universe dropped=%d", dropped_total)
     return None
 
 

@@ -13,7 +13,7 @@ import pandas as pd
 from src import settings
 from src.config.base import RANK_POOL_PARQUET_NAME, TOPK_DECISIONS_PARQUET_NAME
 from src.data.capture_store import resolve_capture_root as _capture_root
-from src.data.io_utils import atomic_write_parquet
+from src.data.io_utils import ExistingStoreUnreadableError, atomic_write_parquet, read_existing_parquet
 from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day, trading_session_gate
 from src.data.trading_calendar import DAY_HOLIDAY, DAY_WEEKEND, classify_day
 from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, RUN_OUTCOME_OK, record_run_outcome
@@ -271,12 +271,15 @@ def persist_topk_decision(decision_date: pd.Timestamp, sleeve_df: pd.DataFrame) 
     out["decided_at"] = pd.Timestamp.now(tz="Asia/Seoul")
     out["bundle_dir"] = str(TOPK_RANKER_BUNDLE_DIR)
     target = settings.PARQUET_DIR / TOPK_DECISIONS_PARQUET_NAME
-    if target.exists():
-        try:
-            existing = pd.read_parquet(target)
-        except Exception as exc:
-            logger.warning("topk_decisions 기존 기록 읽기 실패, 신규로 저장합니다: %s", exc)
-            existing = pd.DataFrame()
+    try:
+        existing = read_existing_parquet(target)
+    except ExistingStoreUnreadableError:
+        logger.error(
+            "[PORTFOLIO] stage=topk_persist status=ABORT reason=history_unreadable path=%s",
+            target,
+        )
+        raise
+    if not existing.empty:
         union_cols = sorted(set(existing.columns.tolist()) | set(out.columns.tolist()))
         merged = pd.concat(
             [existing.reindex(columns=union_cols), out.reindex(columns=union_cols)],

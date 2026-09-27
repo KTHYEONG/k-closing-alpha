@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import tarfile
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -24,6 +25,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
+from src.data.capture_store import resolve_capture_root as _capture_root
 from src.tools.offsite_common import (
     DATED_DIR_RE as _DATE_RE,
 )
@@ -36,6 +38,7 @@ from src.tools.offsite_common import (
 from src.tools.offsite_common import (
     sha256_file as _sha256_file,
 )
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -646,6 +649,7 @@ def prune_local_sealed_capture(
     retention_days: int = LOCAL_SEALED_RETENTION_DAYS,
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     config: OffsiteConfig = OffsiteConfig(),  # noqa: B008
+    dry_run: bool = False,
 ) -> LocalRetentionReport:
     """Remove local capture date directories whose every file is sealed offsite and verified.
 
@@ -772,6 +776,10 @@ def prune_local_sealed_capture(
             if not verified:
                 kept.append((label, "remote_unverified"))
                 continue
+            if dry_run:
+                removed.append(label)
+                bytes_removed += regular_sizes
+                continue
             shutil.rmtree(child)
             removed.append(label)
             bytes_removed += regular_sizes
@@ -883,3 +891,212 @@ def restore_date(
                 with contextlib.suppress(OSError):
                     tmp_path.unlink(missing_ok=True)
     return sorted(restored)
+
+
+@dataclass(frozen=True)
+class RemoteVerifyReport:
+    """Remote integrity of every ledgered segment.
+
+    Attributes:
+        checked: Number of ledger entries compared.
+        missing: Remote paths listed in a ledger but absent on the remote.
+        mismatched: Remote paths whose MD5 differs from the ledger archive_md5.
+    """
+
+    checked: int
+    missing: tuple[str, ...]
+    mismatched: tuple[str, ...]
+
+
+def verify_remote_segments(
+    capture_root: Path,
+    *,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    config: OffsiteConfig = OffsiteConfig(),  # noqa: B008
+) -> RemoteVerifyReport:
+    """Compare every local ledger entry with the remote MD5 listing.
+
+    The ledger (capture_root/offsite/ledger) outlives local date directories, so it
+    is the authority for what must exist remotely. One `rclone md5sum` call per
+    (tier, YYYY-MM) directory keeps the cost proportional to months, not segments.
+
+    Raises:
+        RuntimeError: An rclone listing call failed (unverifiable is not healthy).
+    """
+    capture_root = Path(capture_root)
+    rclone = _resolve_rclone_bin()
+    grouped: dict[tuple[str, str], list[LedgerEntry]] = {}
+    for tier in config.tiers:
+        ledger_dir = capture_root / "offsite" / "ledger" / tier
+        if not ledger_dir.is_dir() or ledger_dir.is_symlink():
+            continue
+        for ledger_path in sorted(ledger_dir.glob("*.jsonl")):
+            if not _is_valid_date(ledger_path.stem):
+                continue
+            for entry in read_ledger(capture_root, tier, ledger_path.stem):
+                grouped.setdefault((tier, ledger_path.stem[:7]), []).append(entry)
+    checked = 0
+    missing: list[str] = []
+    mismatched: list[str] = []
+    for tier, month in sorted(grouped):
+        remote_dir = f"{config.remote_root}/{tier}/{month}"
+        result = run_fn(
+            [rclone, "md5sum", remote_dir],
+            capture_output=True,
+            text=True,
+            timeout=config.rclone_timeout_sec,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"offsite verify listing failed: {remote_dir}")
+        listed: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            listed[parts[1].lower()] = parts[0].lower()
+        for entry in grouped[(tier, month)]:
+            checked += 1
+            actual = listed.get(f"{entry.trading_date}/{entry.segment_name}.tar.zst".lower())
+            if actual is None:
+                missing.append(entry.remote_path)
+            elif actual != entry.archive_md5.lower():
+                mismatched.append(entry.remote_path)
+    return RemoteVerifyReport(checked=checked, missing=tuple(sorted(missing)), mismatched=tuple(sorted(mismatched)))
+
+
+@dataclass(frozen=True)
+class RestoreDrillReport:
+    """Result of one end-to-end restore rehearsal.
+
+    Attributes:
+        tier: Capture tier drilled.
+        trading_date: Date restored.
+        members_verified: Member files restored and sha256-verified.
+    """
+
+    tier: str
+    trading_date: str
+    members_verified: int
+
+
+def select_drill_dates(
+    capture_root: Path, *, today: date, config: OffsiteConfig = OffsiteConfig()  # noqa: B008
+) -> dict[str, str]:
+    """Pick one ledgered date per tier to rehearse, rotating deterministically.
+
+    Candidates are ledger dates older than today - config.recent_window_days
+    (still-appending dates are excluded). The pick is candidates[iso_week(today) % len],
+    so successive weeks walk the whole history without persisted state.
+
+    Returns:
+        {tier: trading_date}; tiers without candidates are omitted.
+    """
+    capture_root = Path(capture_root)
+    cutoff = today - timedelta(days=config.recent_window_days)
+    picks: dict[str, str] = {}
+    for tier in config.tiers:
+        ledger_dir = capture_root / "offsite" / "ledger" / tier
+        if not ledger_dir.is_dir() or ledger_dir.is_symlink():
+            continue
+        candidates = sorted(
+            ledger_path.stem
+            for ledger_path in ledger_dir.glob("*.jsonl")
+            if _is_valid_date(ledger_path.stem) and date.fromisoformat(ledger_path.stem) < cutoff
+        )
+        if not candidates:
+            continue
+        picks[tier] = candidates[today.isocalendar().week % len(candidates)]
+    return picks
+
+
+def run_restore_drill(
+    capture_root: Path,
+    *,
+    today: date,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    config: OffsiteConfig = OffsiteConfig(),  # noqa: B008
+) -> list[RestoreDrillReport]:
+    """Restore the selected dates into a throwaway directory and discard it.
+
+    Reuses restore_date (which enforces archive MD5 and member sha256) with
+    dest_root under capture_root/staging/offsite/drill-<uuid>, removed in all
+    outcomes. Never writes into the live capture tiers.
+
+    Raises:
+        ValueError, subprocess.CalledProcessError: propagated from restore_date.
+    """
+    capture_root = Path(capture_root)
+    picks = select_drill_dates(capture_root, today=today, config=config)
+    reports: list[RestoreDrillReport] = []
+    for tier in sorted(picks):
+        trading_date = picks[tier]
+        drill_dir = capture_root / "staging" / "offsite" / f"drill-{uuid.uuid4().hex}"
+        try:
+            restored = restore_date(capture_root, tier, trading_date, drill_dir, run_fn=run_fn, config=config)
+        except Exception:  # noqa: BLE001 - drill failure is reported then re-raised to the unit
+            logger.info("[SYS] stage=restore_drill tier=%s date=%s members=0 status=FAILED", tier, trading_date)
+            raise
+        else:
+            reports.append(RestoreDrillReport(tier=tier, trading_date=trading_date, members_verified=len(restored)))
+            logger.info(
+                "[SYS] stage=restore_drill tier=%s date=%s members=%d status=OK", tier, trading_date, len(restored)
+            )
+        finally:
+            shutil.rmtree(drill_dir, ignore_errors=True)
+    return reports
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI.
+
+    `verify` : verify_remote_segments + run_restore_drill; exit 1 on any missing,
+               mismatched, or drill failure (after logging every finding).
+    `restore --tier {raw,normalized} --date YYYY-MM-DD --dest PATH` : disaster
+               recovery into PATH (must not be inside the live capture tiers).
+    """
+    import argparse
+    from datetime import datetime as _datetime
+    from zoneinfo import ZoneInfo as _ZoneInfo
+
+    parser = argparse.ArgumentParser(description="Offsite verification and disaster recovery")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("verify", help="re-verify remote MD5s and rehearse a rotating restore")
+    restore_cmd = sub.add_parser("restore", help="restore one tier date into PATH")
+    restore_cmd.add_argument("--tier", required=True, choices=list(OffsiteConfig().tiers))
+    restore_cmd.add_argument("--date", required=True)
+    restore_cmd.add_argument("--dest", required=True)
+    args = parser.parse_args(argv)
+    capture_root = _capture_root()
+    if args.command == "restore":
+        dest = Path(args.dest)
+        resolved = dest.resolve()
+        for tier in OffsiteConfig().tiers:
+            tier_root = (capture_root / tier).resolve()
+            if resolved == tier_root or tier_root in resolved.parents:
+                raise ValueError(f"restore dest must not be inside live tier: {dest}")
+        restored = restore_date(capture_root, args.tier, args.date, dest)
+        logger.info("[SYS] stage=restore tier=%s date=%s members=%d dest=%s", args.tier, args.date, len(restored), dest)
+        return 0
+    report = verify_remote_segments(capture_root)
+    logger.info(
+        "[SYS] stage=offsite_verify checked=%d missing=%d mismatched=%d",
+        report.checked,
+        len(report.missing),
+        len(report.mismatched),
+    )
+    for remote_path in sorted(report.missing):
+        logger.info("[SYS] stage=offsite_verify finding=missing remote_path=%s", remote_path)
+    for remote_path in sorted(report.mismatched):
+        logger.info("[SYS] stage=offsite_verify finding=mismatched remote_path=%s", remote_path)
+    today = _datetime.now(_ZoneInfo("Asia/Seoul")).date()
+    try:
+        run_restore_drill(capture_root, today=today)
+    except Exception:  # noqa: BLE001 - drill failure already logged per tier; unit still exits 1
+        return 1
+    return 1 if (report.missing or report.mismatched) else 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    configure_cli_logging()
+    raise SystemExit(main())

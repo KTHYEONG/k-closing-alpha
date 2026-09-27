@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_OPS_HARDENING",
+      "date": "2026-09-27",
+      "adr_id": "ADR_20260927_OPS_HARDENING",
+      "domain": "ops",
+      "title": "kca or-vps 운영 견고성 10종 강화",
+      "why": "장중 배포 무가드·유닛 무타임아웃(감시자까지 hang)·email 단일알림채널·휴장오판 비대칭·fail-open 이력덮어쓰기·영문코드 신규상장 누락·백업 함정을 /probe(2026-09-27)로 실증",
+      "resolution": "배포 블랙아웃+직렬화, 유닛별 실측 타임아웃+컨테이너 reaper, GitHub Actions 외부 워치독+GHCR PAT 만료 확인, collect/audit 휴장 대칭 판정, 자격증명·달력 만료 D-30/D-7 메일, topk_decisions/altdata/orderbook fail-closed 읽기, KRX 영문 단축코드 허용, core_panels 승인식 예외+prune dry-run/단계분리, 주간 원격 재검증+복원드릴+restore CLI, KIS 토큰락 읽기전용 폴백",
+      "impact": "조용히 지나가던 장애(장중 코드혼용, hang, 알림채널 사망, 휴장 오판, 이력손실, 대체데이터 편향, 백업 영구실패, 복원 미검증)가 감지·fail-closed로 전환됨",
+      "caveat": "Oracle PAYG(유휴회수 비해당) 확인됨; KIS 앱키 등 만료일 레지스트리는 빈 상태로 배포—사용자가 실제 만료일 입력 필요; kca-offsite-verify.timer는 VPS에서 install_systemd.sh 재실행 또는 수동 enable 필요"
+    },
+    {
       "task_id": "REFACTOR_W1",
       "date": "2026-09-25",
       "adr_id": "ADR_20260925_REFACTOR_W1",
@@ -1017,16 +1028,6 @@
       "why": "리랭커가 top-1·journaled 후보로만 학습되어 top-3+비용인지 파이프라인 부재 한계 확인됨",
       "resolution": "src/ml/topk_ranker_research.py 신설: DEFAULT_UNIVERSE 학습/COST_AWARE_UNIVERSE 선택 이중풀 + PIT tick_cost_bp 라벨 + CPCV(8,2) fold별 top-k, retrain.py --ranker-topk-research 배선",
       "impact": "post-reform 878일 top-3 리랭커 29.72bp t=4.81 DSR0.974 vs 모델프리 비용정렬 18.75bp t=3.08, CPCV 경로승률 25/28=0.893(K=1은 0.464)"
-    },
-    {
-      "task_id": "COSTAWARE_ML_TRAINING",
-      "date": "2026-09-08",
-      "adr_id": "ADR_20260908_COSTAWARE_ML_TRAINING",
-      "domain": "ml",
-      "title": "COST_AWARE 스크린 ML 학습 경로 개방",
-      "why": "ScreenConfig에 tick-cost cap 필드가 없어 검증된 COST_AWARE_UNIVERSE로 ML 리랭커 학습이 불가능했음",
-      "resolution": "ScreenConfig.max_tick_cost_bp 추가, build_universe_panel의 raw tv/mc NaN(18%) 버그를 tv_clean/mc_clean 우선으로 수정, COST_AWARE_SCREEN을 SCREEN_REGISTRY 밖에 격리해 journaled-population 오사용 구조적 차단",
-      "impact": "886 passed/1 failed(기존 R19)/9 skipped, ruff·mypy clean; build_universe_panel이 select_universe와 실측 row-for-row 일치(11819/879) 확인"
     }
   ]
 }

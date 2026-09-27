@@ -170,16 +170,19 @@ def test_core_snapshot_collects_paper_and_bundle_panels(tmp_path: Path) -> None:
     from src.tools.core_snapshot import collect_core_stats, core_panel_paths
 
     _write_parquet(tmp_path / "data/paper/fills.parquet", 3, "2026-09-20")
-    bundle_file = tmp_path / "artifacts/models/topk_ranker/bundle.json"
+    bundle_file = tmp_path / "artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib"
     bundle_file.parent.mkdir(parents=True, exist_ok=True)
-    bundle_file.write_text("{}", encoding="utf-8")
+    bundle_file.write_bytes(b"bundle-bytes")
+    registry_file = tmp_path / "artifacts/models/topk_ranker/retrain_registry.jsonl"
+    registry_file.write_text("{}\n", encoding="utf-8")
     paths = core_panel_paths(tmp_path)
     rels = [p.relative_to(tmp_path).as_posix() for p in paths]
     assert "data/paper/fills.parquet" in rels
-    assert "artifacts/models/topk_ranker/bundle.json" in rels
+    assert "artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib" in rels
+    assert "artifacts/models/topk_ranker/retrain_registry.jsonl" in rels
     stats = {s.relpath: s for s in collect_core_stats(tmp_path)}
     assert stats["data/paper/fills.parquet"].rows == 3
-    assert stats["artifacts/models/topk_ranker/bundle.json"].rows is None
+    assert stats["artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib"].rows is None
 
 
 def test_core_snapshot_reads_decision_date_and_empty_frame(tmp_path: Path) -> None:
@@ -338,10 +341,117 @@ def test_core_snapshot_skips_symlinked_members(tmp_path: Path) -> None:
     (paper_dir / "link.parquet").symlink_to(real)
     bundle_dir = tmp_path / "artifacts/models/topk_ranker"
     bundle_dir.mkdir(parents=True, exist_ok=True)
-    bundle_real = bundle_dir / "bundle.json"
-    bundle_real.write_text("{}", encoding="utf-8")
+    bundle_real = bundle_dir / "sizing_pipeline_bundle.joblib"
+    bundle_real.write_bytes(b"bundle-bytes")
+    (bundle_dir / "sizing_pipeline_bundle.joblib.bak").write_bytes(b"scratch")
     (bundle_dir / "bundle_link.json").symlink_to(bundle_real)
     rels = [p.relative_to(tmp_path).as_posix() for p in core_panel_paths(tmp_path)]
     assert "data/paper/real.parquet" in rels
     assert "data/paper/link.parquet" not in rels
     assert "artifacts/models/topk_ranker/bundle_link.json" not in rels
+
+
+def test_core_snapshot_bundle_scratch_files_are_untracked(tmp_path: Path) -> None:
+    from src.tools.core_snapshot import collect_core_stats, core_panel_paths, is_tracked_core_relpath
+
+    bundle_dir = tmp_path / "artifacts/models/topk_ranker"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    (bundle_dir / "sizing_pipeline_bundle.joblib").write_bytes(b"bundle-bytes")
+    (bundle_dir / "retrain_registry.jsonl").write_text("{}\n", encoding="utf-8")
+    (bundle_dir / "sizing_pipeline_bundle.joblib.bak").write_bytes(b"scratch")
+    rels = [p.relative_to(tmp_path).as_posix() for p in core_panel_paths(tmp_path)]
+    assert "artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib" in rels
+    assert "artifacts/models/topk_ranker/retrain_registry.jsonl" in rels
+    assert "artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib.bak" not in rels
+    assert is_tracked_core_relpath("artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib.bak") is False
+    assert is_tracked_core_relpath("artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib") is True
+    assert is_tracked_core_relpath("data/history/other.parquet") is False
+    stats = {s.relpath for s in collect_core_stats(tmp_path)}
+    assert "artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib.bak" not in stats
+
+
+def test_core_snapshot_untracked_previous_entry_reports_no_missing() -> None:
+    from src.tools.core_snapshot import validate_core_panels
+
+    prev = [_stat("artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib.bak", 0, "")]  # type: ignore[list-item]
+    assert validate_core_panels([], prev) == []  # type: ignore[arg-type]
+
+
+def test_core_snapshot_deleted_paper_ledger_reports_missing() -> None:
+    from src.tools.core_snapshot import validate_core_panels
+
+    prev = [_stat("data/paper/x.parquet", 5, "2026-09-20")]  # type: ignore[list-item]
+    assert validate_core_panels([], prev) == ["core_panel:data/paper/x.parquet:missing"]  # type: ignore[arg-type]
+
+
+def test_core_snapshot_accepted_missing_suppresses_only_missing(caplog) -> None:
+    import logging
+
+    from src.tools.core_snapshot import validate_core_panels
+
+    prev = [
+        _stat("data/paper/x.parquet", 5, "2026-09-20"),  # type: ignore[list-item]
+        _stat("data/history/price_history.parquet", 1000, "2026-09-23"),  # type: ignore[list-item]
+    ]
+    current = [_stat("data/history/price_history.parquet", 900, "2026-09-23")]  # type: ignore[list-item]
+    with caplog.at_level(logging.WARNING, logger="src.tools.core_snapshot"):
+        issues = validate_core_panels(current, prev, accepted_missing=frozenset({"data/paper/x.parquet"}))  # type: ignore[arg-type]
+    assert issues == ["core_panel:data/history/price_history.parquet:rows_shrank"]
+
+
+def test_core_snapshot_accepted_missing_present_is_noop_warning(caplog) -> None:
+    import logging
+
+    from src.tools.core_snapshot import validate_core_panels
+
+    current = [_stat("data/paper/x.parquet", 5, "2026-09-20")]  # type: ignore[list-item]
+    prev = [_stat("data/paper/x.parquet", 5, "2026-09-20")]  # type: ignore[list-item]
+    with caplog.at_level(logging.WARNING, logger="src.tools.core_snapshot"):
+        issues = validate_core_panels(current, prev, accepted_missing=frozenset({"data/paper/x.parquet"}))  # type: ignore[arg-type]
+    assert issues == []
+    assert any("accepted_missing_noop" in rec.message for rec in caplog.records)
+
+
+def test_core_snapshot_accepted_missing_releases_latch(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+    from datetime import date
+
+    from src.tools.core_snapshot import run_core_snapshot, validate_core_panels
+
+    monkeypatch.setattr("src.tools.core_snapshot._resolve_rclone_bin", lambda: "rclone")
+    _write_parquet(tmp_path / "data/history/price_history.parquet", 10, "2026-09-23")
+    prev = [
+        _stat("data/history/price_history.parquet", 10, "2026-09-23"),
+        _stat("data/paper/x.parquet", 5, "2026-09-20"),
+    ]
+    captured: dict[str, object] = {}
+
+    def _run(cmd, **kwargs):
+        if cmd[1] == "lsf":
+            return subprocess.CompletedProcess(cmd, 0, stdout="2026-09-01/\n", stderr="")
+        if cmd[1] == "cat":
+            return subprocess.CompletedProcess(cmd, 0, stdout=_manifest_json(prev), stderr="")
+        if cmd[1] == "copy":
+            manifest = json.loads((Path(cmd[2]) / "manifest.json").read_text(encoding="utf-8"))
+            captured["manifest"] = manifest
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1] == "purge":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected call: {cmd}")
+
+    pruned = run_core_snapshot(
+        tmp_path, today=date(2026, 9, 28), run_fn=_run, accepted_missing=frozenset({"data/paper/x.parquet"})
+    )
+    assert pruned == []
+    manifest = captured["manifest"]
+    assert isinstance(manifest, list)
+    by_rel = {item["relpath"]: item for item in manifest}
+    assert "data/paper/x.parquet" not in by_rel
+    import dataclasses
+
+    from src.tools.core_snapshot import CorePanelStat
+
+    uploaded = [CorePanelStat(**item) for item in manifest]  # type: ignore[arg-type]
+    current = [e for e in uploaded if e.relpath == "data/history/price_history.parquet"]
+    assert validate_core_panels(current, uploaded) == []
+    assert dataclasses.is_dataclass(uploaded[0])

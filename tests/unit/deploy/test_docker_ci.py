@@ -77,6 +77,63 @@ def test_deploy_validates_commit_image_before_moving_latest() -> None:
     assert "docker pull ghcr.io/kthyeong/k-closing-alpha:latest" not in workflow
 
 
+def test_deploy_waits_for_blackout_before_moving_latest() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    preflight = "src.tools.deploy_preflight"
+    wait = "src.tools.deploy_window --wait"
+    tag = "docker tag ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA ghcr.io/kthyeong/k-closing-alpha:latest"
+    reset = "git reset --hard $COMMIT_SHA"
+
+    positions = [workflow.index(line) for line in (preflight, wait, tag, reset)]
+    assert positions == sorted(positions)
+
+
+def test_deploy_job_serialized_and_bounded() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+    deploy_job = workflow.split("build-and-push", 1)[1]
+
+    assert "concurrency:" in deploy_job
+    assert "cancel-in-progress: false" in deploy_job
+    assert "timeout-minutes:" in deploy_job
+
+
+def test_deploy_skips_superseded_commit() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+    tag = "docker tag ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA ghcr.io/kthyeong/k-closing-alpha:latest"
+
+    assert "LATEST_MAIN_SHA" in workflow
+    assert "git ls-remote" in workflow
+    assert workflow.index("LATEST_MAIN_SHA") < workflow.index(tag)
+    assert "SKIP: superseded by" in workflow
+
+
+def test_watchdog_workflow_schedule_and_probe() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/watchdog.yml").read_text(encoding="utf-8")
+
+    assert 'cron: "40 22 * * 1-5"' in workflow
+    assert "src.tools.watchdog_probe" in workflow
+    assert "uv run --no-sync" in workflow
+    assert "tailscale/github-action" in workflow
+    assert "timeout-minutes:" in workflow
+
+
+def test_watchdog_checks_ghcr_pat_expiry() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/watchdog.yml").read_text(encoding="utf-8")
+
+    assert "github-authentication-token-expiration" in workflow
+
+
 def test_deploy_workflow_builds_native_arm64_and_tags_commit_sha() -> None:
     from pathlib import Path
 

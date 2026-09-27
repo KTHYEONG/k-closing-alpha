@@ -2927,3 +2927,111 @@ def test_full_coverage_publishes_complete_entry() -> None:
     )
     assert entry.status is CaptureStatus.COMPLETE
     assert entry.reason == "decision-input"
+
+
+class _DownstreamReachedError(Exception):
+    """Probe that collect.main proceeded past the trading-day oracle."""
+
+
+class _FakeKisClient:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    async def ensure_token(self, session) -> None:
+        return None
+
+    async def get_market_index_rate(self, session, code):
+        raise _DownstreamReachedError()
+
+
+def _stub_collect_main(monkeypatch, *, kis_trading_day: bool):
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+    from zoneinfo import ZoneInfo
+
+    from src.daily import collect
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 29, 15, 21, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    kwargs = {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"}
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(collect, "kis_data_client_kwargs", lambda: dict(kwargs))
+    monkeypatch.setattr(collect, "kis_decision_shard_client_kwargs", lambda: [dict(kwargs)])
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "is_kis_trading_day", AsyncMock(return_value=kis_trading_day))
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
+    recorded: list = []
+    monkeypatch.setattr(
+        collect, "record_run_outcome", lambda job, outcome, **kw: recorded.append((job, outcome, kw))
+    )
+    downstream = AsyncMock()
+    monkeypatch.setattr(collect, "resolve_daily_candidates", downstream)
+    return recorded, downstream
+
+
+def test_collect_disagreement_records_no_decision_and_skips(monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.daily import collect
+    from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION
+
+    recorded, downstream = _stub_collect_main(monkeypatch, kis_trading_day=False)
+
+    with caplog.at_level(logging.INFO):
+        assert asyncio.run(collect.main()) is None
+
+    assert recorded == [
+        (
+            "collect",
+            RUN_OUTCOME_NO_DECISION,
+            {
+                "run_date": "2026-09-29",
+                "reason": "calendar_disagreement",
+                "metrics": {"session": "STANDARD", "kis": "holiday"},
+            },
+        )
+    ]
+    assert any("reason=calendar_disagreement" in rec.message for rec in caplog.records)
+    downstream.assert_not_awaited()
+
+
+def test_collect_agreed_holiday_stays_quiet(monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.daily import collect
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    def _closed(trading_day, **_kwargs):
+        return SessionDay(trading_date=trading_day, kind=SessionKind.CLOSED, clock=None, provenance="test")
+
+    monkeypatch.setattr(collect, "resolve_session_day", _closed)
+    recorded, downstream = _stub_collect_main(monkeypatch, kis_trading_day=False)
+
+    with caplog.at_level(logging.INFO):
+        assert asyncio.run(collect.main()) is None
+
+    assert recorded == []
+    assert any("reason=non_trading_day" in rec.message for rec in caplog.records)
+    downstream.assert_not_awaited()
+
+
+def test_collect_force_bypasses_oracle(monkeypatch) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.daily import collect
+
+    recorded, _downstream = _stub_collect_main(monkeypatch, kis_trading_day=False)
+
+    with pytest.raises(_DownstreamReachedError):
+        asyncio.run(collect.main(force=True))
+
+    assert recorded == []

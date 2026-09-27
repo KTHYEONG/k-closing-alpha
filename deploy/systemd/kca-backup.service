@@ -8,6 +8,7 @@ Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
+# 장시간 오프사이트 백업 상한 4시간 (기존 유지)
 TimeoutStartSec=4h
 ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts
 ExecStart=/usr/bin/flock -w 7200 %t/quant-gdrive.lock %h/.local/bin/uv run python -m src.tools.offsite_backup

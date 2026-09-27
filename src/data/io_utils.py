@@ -5,11 +5,45 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+class ExistingStoreUnreadableError(OSError):
+    """An existing history file could not be read; it must not be overwritten."""
+
+
+def read_existing_parquet(path: Path, *, columns: Sequence[str] | None = None) -> pd.DataFrame:
+    """Read an append-only store for a read-modify-write merge.
+
+    Absence is the only legitimate "empty history". Any failure to read a file
+    that exists means the history is unknown, and replacing it with today's rows
+    would destroy data that exists only here and in the offsite copy.
+
+    Args:
+        path: Parquet file path.
+        columns: Optional column projection.
+
+    Returns:
+        The stored frame, or an empty DataFrame when the path does not exist.
+
+    Raises:
+        ExistingStoreUnreadableError: The path exists but reading failed; the
+            original exception is chained as __cause__ and the path is in the message.
+    """
+    target = Path(path)
+    if not target.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_parquet(target, columns=columns)
+    except Exception as exc:
+        raise ExistingStoreUnreadableError(
+            f"existing history at {target} could not be read; refusing to overwrite"
+        ) from exc
 
 
 def atomic_write_parquet(

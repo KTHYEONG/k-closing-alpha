@@ -384,21 +384,13 @@ def test_containerized_units_have_no_docker_pull_before_run() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    containerized = (
-        "kca-archive-intraday.service",
-        "kca-archive-intraday-regular.service",
-        "kca-collect.service",
-        "kca-finalize-close.service",
-        "kca-kis-token-warmup.service",
-        "kca-paper-entry.service",
-        "kca-paper-exit.service",
-        "kca-predict.service",
-        "kca-price-ingest.service",
-    )
-    for name in containerized:
-        assert "docker pull" not in (root / name).read_text(encoding="utf-8"), name
+    offenders = [
+        p.name
+        for p in sorted(root.glob("kca-*.service"))
+        if "docker pull" in p.read_text(encoding="utf-8")
+    ]
 
-    assert "docker pull" in (root / "kca-retrain.service").read_text(encoding="utf-8")
+    assert offenders == []
 
 
 def test_containerized_units_have_no_unmeasured_resource_caps() -> None:
@@ -808,9 +800,13 @@ def test_warmup_retry_budget_finishes_before_first_consumer() -> None:
 
     burst = int(re.search(r"StartLimitBurst=(\d+)", service).group(1))  # type: ignore[union-attr]
     restart_min = int(re.search(r"RestartSec=(\d+)min", service).group(1))  # type: ignore[union-attr]
+    attempt_min = _parse_systemd_duration(
+        next(line for line in service.splitlines() if line.startswith("TimeoutStartSec=")).split("=", 1)[1]
+    ) // 60
     start = datetime.strptime(re.search(r"OnCalendar=\S+ (\d{2}:\d{2}:\d{2})", timer).group(1), "%H:%M:%S")  # type: ignore[union-attr]
 
-    end_minute = start.hour * 60 + start.minute + (burst - 1) * restart_min
+    # 매 시도는 TimeoutStartSec 안에 끝나거나 실패하므로 전체 예산은 시도 상한과 재시도 간격의 합이다
+    end_minute = start.hour * 60 + start.minute + burst * attempt_min + (burst - 1) * restart_min
     assert end_minute < 8 * 60
 
 
@@ -890,3 +886,175 @@ def test_altdata_timer_fires_on_weekdays_only() -> None:
     lines = (root / "kca-altdata-capture.timer").read_text(encoding="utf-8").splitlines()
     assert "OnCalendar=Mon..Fri 21:35:00 Asia/Seoul" in lines
     assert "Persistent=false" in lines
+
+
+def _parse_systemd_duration(raw: str) -> int:
+    """Parse a systemd TimeoutStartSec value into seconds (bare numbers are seconds)."""
+    import re
+
+    value = raw.strip()
+    if value.isdigit():
+        return int(value)
+    match = re.fullmatch(r"(\d+)(h|min|s)", value)
+    if match is None:
+        raise ValueError(f"non-finite or unsupported duration: {value!r}")
+    amount, unit = int(match.group(1)), match.group(2)
+    return amount * {"h": 3600, "min": 60, "s": 1}[unit]
+
+
+def _service_timeout_seconds(root, name: str) -> int:
+    text = (root / name).read_text(encoding="utf-8")
+    lines = [line for line in text.splitlines() if line.startswith("TimeoutStartSec=")]
+    assert len(lines) == 1, name
+    return _parse_systemd_duration(lines[0].split("=", 1)[1])
+
+
+def _timer_first_seconds(root, name: str) -> int:
+    import re
+
+    text = (root / name).read_text(encoding="utf-8")
+    match = re.search(r"OnCalendar=.*?(\d{2}):(\d{2}):(\d{2})", text)
+    assert match is not None, name
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + int(match.group(3))
+
+
+def test_every_kca_service_has_finite_start_timeout() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    services = sorted(root.glob("kca-*.service"))
+
+    assert services
+    for svc in services:
+        text = svc.read_text(encoding="utf-8")
+        lines = [line for line in text.splitlines() if line.startswith("TimeoutStartSec=")]
+
+        assert len(lines) == 1, svc.name
+        assert _parse_systemd_duration(lines[0].split("=", 1)[1]) > 0, svc.name
+
+
+def test_decision_chain_timeouts_end_before_next_stage() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+
+    collect_end = _timer_first_seconds(root, "kca-collect.timer") + _service_timeout_seconds(root, "kca-collect.service")
+    assert collect_end < _timer_first_seconds(root, "kca-finalize-close.timer")
+
+    predict_end = _timer_first_seconds(root, "kca-predict.timer") + _service_timeout_seconds(root, "kca-predict.service")
+    assert predict_end < 15 * 3600 + 30 * 60
+
+
+def test_archive_regular_timeout_ends_before_aftermarket_archive() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+
+    regular_end = _timer_first_seconds(root, "kca-archive-intraday-regular.timer") + _service_timeout_seconds(
+        root, "kca-archive-intraday-regular.service"
+    )
+
+    assert regular_end <= _timer_first_seconds(root, "kca-archive-intraday.timer")
+
+
+def test_containerized_units_have_unique_names_and_reaper() -> None:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    names: dict[str, str] = {}
+    checked = 0
+    for svc in sorted(root.glob("kca-*.service")):
+        lines = svc.read_text(encoding="utf-8").splitlines()
+        exec_lines = [line for line in lines if line.startswith("ExecStart=") and "docker run" in line]
+        if not exec_lines:
+            continue
+        stem = svc.name.removeprefix("kca-").removesuffix(".service")
+        match = re.search(r"--name (\S+)", exec_lines[0])
+
+        assert match is not None, svc.name
+        assert match.group(1) == f"kca-{stem}", svc.name
+        assert f"ExecStopPost=-/usr/bin/docker rm -f kca-{stem}" in lines, svc.name
+        assert match.group(1) not in names, svc.name
+        names[match.group(1)] = svc.name
+        checked += 1
+
+    assert checked > 0
+
+
+def test_finalize_close_reaper_precedes_paper_entry_handoff() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    lines = (root / "kca-finalize-close.service").read_text(encoding="utf-8").splitlines()
+
+    reaper_idx = lines.index("ExecStopPost=-/usr/bin/docker rm -f kca-finalize-close")
+    handoff_idx = lines.index("ExecStopPost=/usr/bin/systemctl --user start --no-block kca-paper-entry.service")
+
+    assert reaper_idx < handoff_idx
+
+
+def test_budget_lines_are_commented() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    budgeted = (
+        "kca-collect.service",
+        "kca-predict.service",
+        "kca-auction-close.service",
+        "kca-finalize-close.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-auction-open.service",
+        "kca-archive-intraday-regular.service",
+        "kca-archive-intraday.service",
+        "kca-price-ingest.service",
+        "kca-kis-token-warmup.service",
+        "kca-daily-audit.service",
+        "kca-retrain.service",
+        "kca-altdata-capture.service",
+        "kca-backup.service",
+        "kca-backup-prune.service",
+        "kca-core-snapshot.service",
+    )
+    for name in budgeted:
+        lines = (root / name).read_text(encoding="utf-8").splitlines()
+        idx = next(i for i, line in enumerate(lines) if line.startswith("TimeoutStartSec="))
+
+        assert lines[idx - 1].startswith("#"), name
+
+
+def test_offsite_verify_unit_holds_drive_lock_and_alerts() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-offsite-verify.service").read_text(encoding="utf-8")
+
+    assert "/usr/bin/flock -w 7200 %t/quant-gdrive.lock" in text
+    assert "src.tools.capture_offsite verify" in text
+    assert "OnFailure=kca-alert@%n.service" in text
+    assert "TimeoutStartSec=2h" in text
+    assert "docker run" not in text
+
+
+def test_offsite_verify_timer_runs_after_core_snapshot() -> None:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+
+    def _sunday_seconds(name: str) -> int:
+        text = (root / name).read_text(encoding="utf-8")
+        assert "OnCalendar=Sun" in text, name
+        match = re.search(r"OnCalendar=.*?(\d{2}):(\d{2}):(\d{2})", text)
+        assert match is not None, name
+        return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + int(match.group(3))
+
+    timer = (root / "kca-offsite-verify.timer").read_text(encoding="utf-8")
+    assert "OnCalendar=Sun 11:00:00 Asia/Seoul" in timer
+    assert "Persistent=true" in timer
+    assert "Unit=kca-offsite-verify.service" in timer
+    assert _sunday_seconds("kca-offsite-verify.timer") > _sunday_seconds("kca-core-snapshot.timer")
+
+    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+    assert "kca-offsite-verify.timer" in (base / "install_systemd.sh").read_text(encoding="utf-8")
