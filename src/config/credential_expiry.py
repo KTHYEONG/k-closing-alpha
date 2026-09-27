@@ -61,6 +61,8 @@ CREDENTIAL_EXPIRIES: tuple[CredentialExpiry, ...] = (
     CredentialExpiry(name="KIS_DATA_4", expires_on=date(2027, 9, 15), renew_hint=_KIS_RENEW_HINT),
     CredentialExpiry(name="KIS_DATA_5", expires_on=date(2027, 9, 15), renew_hint=_KIS_RENEW_HINT),
     CredentialExpiry(name="KRX_OPENAPI_KEY", expires_on=date(2027, 1, 18), renew_hint="공공데이터포털 KRX Open API 활용신청 연장"),
+    CredentialExpiry(name="KIWOOM_APP_KEY", expires_on=date(2027, 9, 7), renew_hint="키움증권 OpenAPI 서비스 연장 (선택 경로: 종가스캔 후보 보조 소스)"),
+    CredentialExpiry(name="TOSS_APP_KEY", expires_on=date(2027, 9, 11), renew_hint="토스증권 OpenAPI 서비스 연장 (선택 경로: 종가스캔 후보 보조 소스)"),
 )
 
 validate_credential_expiries(CREDENTIAL_EXPIRIES)
