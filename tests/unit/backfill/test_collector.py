@@ -165,6 +165,8 @@ class _KiwoomTicks:
         if self._fail:
             raise RuntimeError("kiwoom unreachable")
         payload = self._batches.pop(0) if self._batches else {"rows": [], "truncated": False, "terminal": "exhausted"}
+        if isinstance(payload, BaseException):
+            raise payload
         if on_page is not None:
             start, received = _aware_page_clocks()
             on_page({"stk_tic_chart_qry": payload["rows"]}, {"cont-yn": "N"}, start, received, 0, 0)
@@ -410,7 +412,7 @@ def test_collect_ticks_failed_and_empty_symbols_stay_visible(tmp_path) -> None:
     assert delivered["035420"][1].status.value == "UNKNOWN"
 
 
-def test_collect_bars_nxt_kiwoom_complete_and_empty_unknown(tmp_path) -> None:
+def test_collect_bars_nxt_kiwoom_complete_and_empty_not_applicable(tmp_path) -> None:
     import asyncio
 
     from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
@@ -438,7 +440,10 @@ def test_collect_bars_nxt_kiwoom_complete_and_empty_unknown(tmp_path) -> None:
 
     assert delivered["005930"][1].status.value == "COMPLETE"
     assert len(delivered["005930"][0]) == 1
-    assert delivered["000660"][1].status.value == "UNKNOWN"
+    # 키움·KIS NX 모두 빈 응답 = NXT 미상장 증거(원시 응답 보존) -> NOT_APPLICABLE
+    assert delivered["000660"][1].status.value == "NOT_APPLICABLE"
+    assert delivered["000660"][1].reason == "nxt_empty"
+    assert delivered["000660"][1].raw_refs
 
 
 def test_collect_krx_aftermarket_capture_before_launch_and_kis_complete(tmp_path) -> None:
@@ -750,7 +755,9 @@ def test_collect_extended_branches_and_premarket(tmp_path) -> None:
             on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
         )
     )
-    assert delivered["005930"][1].status.value == "UNKNOWN"
+    # 키움 장애 시 KIS NX 폴백은 시장구분코드로 NXT venue가 인증된다
+    assert delivered["005930"][1].status.value == "COMPLETE"
+    assert delivered["005930"][1].venue == "NXT"
 
     class _BadKw:
         async def get_nxt_minute_chart(self, *args, **kwargs):
@@ -1341,3 +1348,356 @@ def test_collect_ticks_explicit_page_limit_still_overrides(tmp_path) -> None:
         )
     )
     assert kiwoom.seen == [3]
+
+
+def _aftermarket_profile(tmp_path):
+    from src.config.collection import CollectionSettings
+
+    return CollectionSettings(
+        COLLECTION_ROOT=tmp_path / "capture",
+        COLLECTION_VERIFIED_CHART_ROUTES={"kiwoom:ka10079": "KRX", "kiwoom:ka10079-nx": "NXT"},
+    )
+
+
+def _today() -> tuple[str, str]:
+    import datetime
+
+    today = datetime.datetime.now().date().isoformat()
+    return today, today.replace("-", "")
+
+
+class _AftermarketKiwoom:
+    def __init__(self, batches):
+        self._batches = list(batches)
+        self.calls: list[dict] = []
+
+    async def get_tick_chart(self, session, code, snapshot_date, max_pages=None, budget=None, on_page=None, **kwargs):
+        self.calls.append({"code": code, "venue": kwargs.get("venue"), "floor_hms": kwargs.get("floor_hms"), "budget": budget})
+        payload = self._batches.pop(0) if self._batches else {"rows": [], "truncated": False, "terminal": "exhausted"}
+        if isinstance(payload, BaseException):
+            raise payload
+        if on_page is not None:
+            start, received = _aware_page_clocks()
+            on_page({"stk_tic_chart_qry": payload["rows"]}, {"cont-yn": "N"}, start, received, 0, 0)
+        return {
+            "rt_cd": "0", "output2": payload["rows"], "vendor": "kiwoom",
+            "truncated": payload["truncated"], "termination_reason": payload["terminal"],
+            "pages_fetched": 1, "continuation": {},
+        }
+
+
+def test_aftermarket_ticks_keep_only_window_and_stage_out_of_window() -> None:
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        today, ymd = _today()
+        store = _capture_store(tmp_path)
+        profile = _aftermarket_profile(tmp_path)
+        kiwoom = _AftermarketKiwoom([{"rows": [
+            _kw_tick_row(f"{ymd}153023"), _kw_tick_row(f"{ymd}160001"), _kw_tick_row(f"{ymd}195958"),
+        ], "truncated": False, "terminal": "crossed_time_floor"}])
+        delivered = {}
+        asyncio.run(
+            collect_aftermarket_trade_ticks(
+                kiwoom, None, ["005930"], today, venue="KRX",
+                profile=profile, capture_store=store, run_id="run-am-krx",
+                on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+            )
+        )
+        frame, entry = delivered["005930"]
+        assert entry.status.value == "COMPLETE"
+        assert entry.venue == "KRX"
+        assert entry.session == "krx_aftermarket"
+        assert len(frame) == 2
+        assert (frame["ts_hms"] >= 160000).all()
+        assert kiwoom.calls[0]["floor_hms"] == "160000"
+
+
+def test_aftermarket_ticks_quiet_symbol_certified_no_trades() -> None:
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        today, _ = _today()
+        store = _capture_store(tmp_path)
+        profile = _aftermarket_profile(tmp_path)
+        kiwoom = _AftermarketKiwoom([{"rows": [], "truncated": False, "terminal": "crossed_time_floor"}])
+        delivered = {}
+        asyncio.run(
+            collect_aftermarket_trade_ticks(
+                kiwoom, None, ["005930"], today, venue="KRX",
+                profile=profile, capture_store=store, run_id="run-am-quiet",
+                on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+            )
+        )
+        frame, entry = delivered["005930"]
+        assert entry.status.value == "NO_TRADES"
+        assert entry.reason == "no_trades_in_window"
+        assert len(entry.raw_refs) > 0
+        assert frame.empty
+
+
+def test_aftermarket_ticks_truncated_after_repair_stays_partial() -> None:
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        today, ymd = _today()
+        store = _capture_store(tmp_path)
+        profile = _aftermarket_profile(tmp_path)
+        rows = [_kw_tick_row(f"{ymd}170000")]
+        kiwoom = _AftermarketKiwoom([
+            {"rows": rows, "truncated": True, "terminal": "page_budget"},
+            {"rows": rows, "truncated": True, "terminal": "page_budget"},
+        ])
+        delivered = {}
+        asyncio.run(
+            collect_aftermarket_trade_ticks(
+                kiwoom, None, ["005930"], today, venue="KRX",
+                profile=profile, capture_store=store, run_id="run-am-partial",
+                on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+            )
+        )
+        _, entry = delivered["005930"]
+        assert entry.status.value == "PARTIAL"
+        assert len(entry.raw_refs) > 0
+        assert len(kiwoom.calls) == 2
+
+
+def test_aftermarket_ticks_missing_client_is_explicit() -> None:
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        today, _ = _today()
+        store = _capture_store(tmp_path)
+        profile = _aftermarket_profile(tmp_path)
+        delivered = {}
+        asyncio.run(
+            collect_aftermarket_trade_ticks(
+                None, None, ["005930", "000660"], today, venue="NXT",
+                profile=profile, capture_store=store, run_id="run-am-noclient",
+                on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+            )
+        )
+        assert set(delivered) == {"005930", "000660"}
+        for _, entry in delivered.values():
+            assert entry.status.value == "UNKNOWN"
+            assert entry.reason == "kiwoom_unavailable"
+
+
+def test_aftermarket_ticks_past_date_refused() -> None:
+    import asyncio
+    import datetime
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        yesterday = (datetime.datetime.now().date() - datetime.timedelta(days=1)).isoformat()
+        store = _capture_store(tmp_path)
+        profile = _aftermarket_profile(tmp_path)
+        with pytest.raises(ValueError, match="current-day only"):
+            asyncio.run(
+                collect_aftermarket_trade_ticks(
+                    _AftermarketKiwoom([]), None, ["005930"], yesterday, venue="KRX",
+                    profile=profile, capture_store=store, run_id="run-am-past",
+                )
+            )
+
+
+def test_regular_ticks_behaviour_unchanged() -> None:
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        today, ymd = _today()
+        store = _capture_store(tmp_path)
+        profile = _aftermarket_profile(tmp_path)
+        kiwoom = _KiwoomTicks([{"rows": [_kw_tick_row(f"{ymd}093000")], "truncated": False, "terminal": "crossed_target_date"}])
+        delivered = {}
+        asyncio.run(
+            collect_intraday_trade_ticks(
+                _KisBars([]), None, ["005930"], today, kiwoom_client=kiwoom,
+                profile=profile, capture_store=store, run_id="run-regular-unchanged",
+                on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+            )
+        )
+        frame, entry = delivered["005930"]
+        assert entry.session == "regular"
+        assert entry.status.value == "COMPLETE"
+        assert len(frame) == 1
+
+
+def _run_aftermarket_ticks(kiwoom, run_id, venue="KRX"):
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        today, _ = _today()
+        delivered = {}
+        asyncio.run(
+            collect_aftermarket_trade_ticks(
+                kiwoom, None, ["005930"], today, venue=venue,
+                profile=_aftermarket_profile(tmp_path), capture_store=_capture_store(tmp_path), run_id=run_id,
+                on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+            )
+        )
+        return delivered["005930"]
+
+
+def test_aftermarket_ticks_repair_completes_truncated_first_attempt() -> None:
+    _, ymd = _today()
+    rows = [_kw_tick_row(f"{ymd}170000")]
+    kiwoom = _AftermarketKiwoom([
+        {"rows": rows, "truncated": True, "terminal": "page_budget"},
+        {"rows": rows, "truncated": False, "terminal": "crossed_time_floor"},
+    ])
+    frame, entry = _run_aftermarket_ticks(kiwoom, "run-am-repair-ok", venue="NXT")
+    assert entry.status.value == "COMPLETE"
+    assert entry.venue == "NXT"
+    assert entry.session == "nxt_aftermarket"
+    assert len(frame) == 1
+    assert kiwoom.calls[1]["budget"] is not None
+    assert kiwoom.calls[1]["venue"] == "NXT"
+
+
+def test_aftermarket_ticks_transport_failure_is_failed() -> None:
+    kiwoom = _AftermarketKiwoom([RuntimeError("kw down")])
+    frame, entry = _run_aftermarket_ticks(kiwoom, "run-am-transport")
+    assert entry.status.value == "FAILED"
+    assert entry.reason.startswith("transport:")
+    assert frame.empty
+
+
+def test_aftermarket_ticks_repair_transport_failure_is_failed() -> None:
+    _, ymd = _today()
+    kiwoom = _AftermarketKiwoom([
+        {"rows": [_kw_tick_row(f"{ymd}170000")], "truncated": True, "terminal": "page_budget"},
+        RuntimeError("kw down on repair"),
+    ])
+    frame, entry = _run_aftermarket_ticks(kiwoom, "run-am-repair-fail")
+    assert entry.status.value == "FAILED"
+    assert len(entry.raw_refs) > 0
+    assert frame.empty
+
+
+def test_aftermarket_ticks_unknown_venue_refused() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="venue"):
+        _run_aftermarket_ticks(_AftermarketKiwoom([]), "run-am-badvenue", venue="AL")
+
+
+def test_zero_price_nx_rows_classify_as_not_listed(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    store = _capture_store(tmp_path)
+    kis = _KisBars([_kis_bar_row("160000", close="0", vol="0", cum="0"), _kis_bar_row("160100", close="0", vol="0", cum="0")])
+    delivered = {}
+    asyncio.run(
+        collect_nxt_aftermarket_bars(
+            kis, None, ["255220"], "2026-09-04", 1, kiwoom_client=None,
+            profile=_capture_profile(tmp_path), capture_store=store, run_id="r-nx-zero",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["255220"]
+    assert entry.status.value == "NOT_APPLICABLE"
+    assert entry.reason == "nxt_not_listed"
+    assert entry.venue == "NXT"
+    assert entry.raw_refs
+    assert frame.empty
+
+
+def test_extended_backfill_rejects_today_unknown_session_and_pre_start_krx(tmp_path) -> None:
+    import asyncio
+    import datetime
+
+    import pytest
+
+    from src.backfill.intraday.collector import backfill_extended_session_bars
+
+    today = datetime.datetime.now().date().isoformat()
+    kw = {"profile": _capture_profile(tmp_path), "capture_store": _capture_store(tmp_path)}
+    with pytest.raises(ValueError, match="past date"):
+        asyncio.run(backfill_extended_session_bars(_KisBars([]), None, ["005930"], today, session_tag="nxt_aftermarket", **kw))
+    with pytest.raises(ValueError, match="Unknown session_tag"):
+        asyncio.run(backfill_extended_session_bars(_KisBars([]), None, ["005930"], "2026-09-15", session_tag="regular", **kw))
+    with pytest.raises(ValueError, match="krx_aftermarket starts"):
+        asyncio.run(backfill_extended_session_bars(_KisBars([]), None, ["005930"], "2026-09-01", session_tag="krx_aftermarket", **kw))
+    with pytest.raises(ValueError, match="bar_interval_minutes"):
+        asyncio.run(backfill_extended_session_bars(_KisBars([]), None, ["005930"], "2026-09-15", session_tag="nxt_premarket", bar_interval_minutes=0, **kw))
+
+
+def test_extended_backfill_krx_zero_rows_are_no_trades(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import backfill_extended_session_bars
+
+    delivered = {}
+    kis = _KisBars([])
+    asyncio.run(
+        backfill_extended_session_bars(
+            kis, None, ["005930"], "2026-09-15", session_tag="krx_aftermarket",
+            profile=_capture_profile(tmp_path), capture_store=_capture_store(tmp_path), run_id="r-krx-quiet",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    _, entry = delivered["005930"]
+    assert entry.status.value == "NO_TRADES"
+    assert entry.reason == "krx_after_no_trades"
+    assert entry.raw_refs
+    assert kis.historical_calls == [("005930", "20260915")]
+
+
+def test_extended_backfill_nx_traded_window_completes(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import backfill_extended_session_bars
+
+    delivered = {}
+    asyncio.run(
+        backfill_extended_session_bars(
+            _KisBars([_kis_bar_row("080100", close="1000", vol="10", cum="10000")]), None, ["005930"], "2026-03-17",
+            session_tag="nxt_premarket",
+            profile=_capture_profile(tmp_path), capture_store=_capture_store(tmp_path), run_id="r-nx-pre",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "COMPLETE"
+    assert entry.venue == "NXT"
+    assert entry.session == "nxt_premarket"
+    assert frame["value_krw"].tolist() == [10000]

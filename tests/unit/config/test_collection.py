@@ -199,3 +199,54 @@ def test_slot_env_spellings_parse_identically(monkeypatch) -> None:
     monkeypatch.setenv("COLLECTION_RESEARCH_SLOTS", "DATA_5")
     with pytest.raises(ValueError, match="decimal"):
         CollectionSettings(_env_file=None)
+
+
+def test_aftermarket_book_defaults_support_evening_capture() -> None:
+    """Aftermarket book defaults describe the evening capture contract."""
+    profile = CollectionSettings(_env_file=None)
+
+    assert profile.COLLECTION_AFTERMARKET_BOOK_ENABLED is False
+    assert profile.COLLECTION_AFTERMARKET_BOOK_SLOTS == ()
+    assert profile.COLLECTION_AFTERMARKET_BOOK_DENSE_SECONDS == 60
+    assert profile.COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS == 15
+    assert profile.COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES == (
+        "154500",
+        "160500",
+        "163000",
+        "170000",
+        "173000",
+        "180000",
+        "183000",
+        "190000",
+        "193000",
+        "195000",
+        "195800",
+    )
+
+
+def test_aftermarket_book_slots_parse_like_research_slots(monkeypatch) -> None:
+    """Aftermarket slots accept the comma spelling shared by every env loader."""
+    import pytest
+
+    from src.config.collection import CollectionSettings
+
+    monkeypatch.setenv("COLLECTION_AFTERMARKET_BOOK_SLOTS", "2,3")
+    assert CollectionSettings(_env_file=None).COLLECTION_AFTERMARKET_BOOK_SLOTS == ("2", "3")
+
+    monkeypatch.setenv("COLLECTION_AFTERMARKET_BOOK_SLOTS", "2,2")
+    with pytest.raises(ValueError, match="unique"):
+        CollectionSettings(_env_file=None)
+
+
+def test_aftermarket_sparse_times_reject_bad_spellings() -> None:
+    """Sparse sweep instants must be increasing HHMMSS times inside the NXT evening."""
+    with pytest.raises(ValueError, match="HHMMSS"):
+        CollectionSettings(COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES=("1545",), _env_file=None)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        CollectionSettings(COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES=("160000", "160000"), _env_file=None)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        CollectionSettings(COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES=("170000", "160000"), _env_file=None)
+    with pytest.raises(ValueError, match="NXT aftermarket"):
+        CollectionSettings(COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES=("120000",), _env_file=None)
+    with pytest.raises(ValueError, match="NXT aftermarket"):
+        CollectionSettings(COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES=("200000",), _env_file=None)

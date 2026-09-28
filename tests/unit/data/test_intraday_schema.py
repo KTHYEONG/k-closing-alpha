@@ -31,7 +31,7 @@ def test_normalize_bar_frame_ls_value_is_scaled_to_krw_per_bar() -> None:
     assert out["snapshot_date"].tolist() == ["2026-09-04", "2026-09-04"]
 
 
-def test_normalize_bar_frame_kis_cumulative_value_becomes_per_bar_diff() -> None:
+def test_normalize_bar_frame_kis_keeps_only_bar_consistent_cumulative_diffs() -> None:
     import pandas as pd
 
     from src.data.intraday_schema import normalize_bar_frame
@@ -52,11 +52,12 @@ def test_normalize_bar_frame_kis_cumulative_value_becomes_per_bar_diff() -> None
     # When
     out = normalize_bar_frame(raw, "kis", "2026-09-03", "004710")
 
-    # Then: 시각 오름차순 정렬 후 1차 차분, 첫 봉은 누적값 그대로
+    # Then: 시각 오름차순 정렬 후 1차 차분. 09:00(장전 누적분 유입)·09:01(분 경계 오귀속) 차분은
+    # 봉의 [저가*거래량, 고가*거래량] 밖이라 종가*거래량으로, 09:03 차분은 범위 안이라 그대로 유지된다
     assert out["ts_hms"].tolist() == [90000, 90100, 90300]
     assert out["value_krw"].tolist() == [
-        738_988_315,
-        1_481_173_175 - 738_988_315,
+        8120 * 90667,
+        8410 * 89523,
         2_629_666_630 - 1_481_173_175,
     ]
     assert out["vendor"].tolist() == ["kis", "kis", "kis"]
@@ -151,7 +152,7 @@ def test_normalize_tick_frame_empty_input_returns_canonical_empty_frame() -> Non
     assert len(out) == 0
 
 
-def test_normalize_bar_frame_clamps_negative_kis_cumulative_diff_to_zero() -> None:
+def test_normalize_bar_frame_replaces_inconsistent_kis_cumulative_values() -> None:
     import pandas as pd
 
     from src.data.intraday_schema import normalize_bar_frame
@@ -171,7 +172,8 @@ def test_normalize_bar_frame_clamps_negative_kis_cumulative_diff_to_zero() -> No
 
     out = normalize_bar_frame(raw, "kis", "2026-09-03", "005930")
 
-    assert out["value_krw"].tolist() == [1_000_000, 0]
+    # 첫 봉 누적(1,000,000)은 8000*100 범위 밖, 역행 차분은 음수 -> 둘 다 종가*거래량
+    assert out["value_krw"].tolist() == [800_000, 800_000]
 
 
 def test_normalize_tick_frame_kis_falls_back_to_cntg_vol_and_missing_optional_fields() -> None:
@@ -409,15 +411,15 @@ def test_normalize_bar_frame_gates_stale_business_date_before_cumulative_diff() 
         "stck_lwpr": ["995", "9999", "1005"],
         "stck_prpr": ["1005", "9999", "1015"],
         "cntg_vol": ["100", "777", "200"],
-        "acml_tr_pbmn": ["100000", "50000000", "300000"],
+        "acml_tr_pbmn": ["100000", "50000000", "303000"],
     })
 
     out = normalize_bar_frame(df, "kis", "2026-05-01", "005930")
 
     assert len(out) == 2
     assert out["ts_hms"].tolist() == [90100, 90200]
-    # 차분이 요청일 행만으로 계산됨: 100000, 300000-100000
-    assert out["value_krw"].tolist() == [100000, 200000]
+    # 차분이 요청일 행만으로 계산됨: 100000, 303000-100000 (둘 다 봉 VWAP 범위 안이라 차분 유지)
+    assert out["value_krw"].tolist() == [100000, 203000]
     assert out["close"].tolist() == [1005, 1015]
 
 

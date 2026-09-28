@@ -2452,3 +2452,248 @@ def test_holiday_with_only_notices_stays_quiet() -> None:
     )
 
     assert subject == "[kca] ⏸️ 2026-09-24 휴장일 SKIP"
+
+
+def test_audit_aftermarket_ticks_missing_partition_reported() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars = pd.DataFrame({"symbol": ["005930"], "volume": [100]})
+    issues = daily_audit.audit_aftermarket_ticks(
+        date(2026, 9, 30),
+        read_ticks=lambda session: None,
+        read_bars=lambda session: bars if session == "krx_aftermarket" else None,
+    )
+    assert issues == ("intraday:krx_aftermarket_ticks:1:missing_partition",)
+
+
+def test_audit_aftermarket_ticks_volume_mismatch_counts_symbols() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars = pd.DataFrame({"symbol": ["005930", "000660"], "volume": [100, 50]})
+    ticks = pd.DataFrame({
+        "symbol": ["005930", "005930", "000660"],
+        "ts_hms": [160100, 160200, 160100],
+        "volume": [60, 40, 10],
+    })
+    issues = daily_audit.audit_aftermarket_ticks(
+        date(2026, 9, 30),
+        read_ticks=lambda session: ticks if session == "krx_aftermarket" else None,
+        read_bars=lambda session: bars if session == "krx_aftermarket" else None,
+    )
+    assert issues == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
+
+
+def test_audit_aftermarket_ticks_before_start_date_requires_nothing() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    assert daily_audit.audit_aftermarket_ticks(date(2026, 9, 28)) == ()
+
+
+def _aftermarket_profile(tmp_path):
+    from src.config.collection import CollectionSettings
+
+    return CollectionSettings(
+        COLLECTION_ROOT=tmp_path / "capture",
+        COLLECTION_AFTERMARKET_BOOK_ENABLED=True,
+        _env_file=None,
+    )
+
+
+def _publish_aftermarket_book(store, day, run_id, symbols, *, status=None, session="krx_aftermarket"):
+    from datetime import datetime
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus, CoverageEntry
+
+    moment = datetime.fromisoformat(f"{day}T20:00:00+09:00")
+    entries = [
+        CoverageEntry(
+            symbol=symbol,
+            dataset=CaptureDataset.ORDERBOOK,
+            venue="KRX",
+            session=session,
+            scheduled_at=None,
+            status=status or CaptureStatus.COMPLETE,
+            rows=1,
+            first_event_time=moment,
+            last_event_time=moment,
+            reason="aftermarket-book",
+            raw_refs=(),
+        )
+        for symbol in symbols
+    ]
+    manifest_status = (
+        CaptureStatus.COMPLETE if all(e.status == CaptureStatus.COMPLETE for e in entries) else CaptureStatus.PARTIAL
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, run_id, CaptureDataset.ORDERBOOK, "aftermarket-book", session=session),
+        cohort=None,
+        completed_at=moment,
+        entries=tuple(entries),
+        artifacts=(),
+        status=manifest_status,
+    )
+    return store.publish_manifest(manifest)
+
+
+def test_audit_reports_missing_aftermarket_book_manifests(tmp_path) -> None:
+    """Missing book manifests are reported when enabled."""
+    from src.data.capture_store import CaptureStore
+
+    store = CaptureStore(tmp_path / "capture")
+    day = "2026-09-29"
+    _publish_cohort_decision(store, day, ["000001", "000002"])
+    issues = _audit(store, day, _aftermarket_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    assert "collection:aftermarket_book:0:missing" in issues
+
+
+def test_audit_counts_incomplete_aftermarket_book_entries(tmp_path) -> None:
+    """Incomplete book entries are counted."""
+    from src.data.capture_contracts import CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    store = CaptureStore(tmp_path / "capture")
+    day = "2026-09-29"
+    _publish_aftermarket_book(store, day, "book-1", ["000001", "000002", "000003"], status=CaptureStatus.PARTIAL)
+    issues = _audit(store, day, _aftermarket_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    assert "collection:aftermarket_book:3:incomplete" in issues
+
+
+def test_audit_accepts_complete_aftermarket_book_manifests(tmp_path) -> None:
+    """Complete book manifests raise no aftermarket issue."""
+    from src.data.capture_store import CaptureStore
+
+    store = CaptureStore(tmp_path / "capture")
+    day = "2026-09-29"
+    _publish_aftermarket_book(store, day, "book-1", ["000001", "000002"])
+    issues = _audit(store, day, _aftermarket_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    assert not [issue for issue in issues if issue.startswith("collection:aftermarket_book")]
+
+
+def _value_frame(rows):
+    import pandas as pd
+
+    return pd.DataFrame(rows, columns=["vendor", "volume", "value_krw", "low", "high"])
+
+
+def test_bar_value_audit_reports_carried_in_value() -> None:
+    from datetime import date
+
+    from src.tools.daily_audit import audit_bar_value_consistency
+
+    frames = {"krx_aftermarket": _value_frame([
+        ("kis", 3, 128_866_376_000, 1_466_000, 1_471_000),
+        ("kis", 2, 2_932_000, 1_466_000, 1_466_000),
+    ])}
+    issues = audit_bar_value_consistency(date(2026, 9, 22), sessions=("krx_aftermarket",), read_partition=frames.get)
+    assert issues == ("intraday:krx_aftermarket:1:value_out_of_range",)
+
+
+def test_bar_value_audit_exempts_ls_vendor_noise() -> None:
+    from datetime import date
+
+    from src.tools.daily_audit import audit_bar_value_consistency
+
+    frames = {"regular": _value_frame([("ls", 100, 1_000_000, 8000, 8000)])}
+    assert audit_bar_value_consistency(date(2026, 9, 22), sessions=("regular",), read_partition=frames.get) == ()
+
+
+def test_bar_value_audit_clean_and_absent_partitions_are_silent() -> None:
+    from datetime import date
+
+    from src.tools.daily_audit import audit_bar_value_consistency
+
+    frames = {
+        "regular": _value_frame([("kis", 10, 10_000, 1000, 1000), ("kis", 0, 0, 1000, 1000)]),
+        "nxt_aftermarket": _value_frame([("kiwoom", 4, 2_000, 500, 500)]),
+    }
+    issues = audit_bar_value_consistency(
+        date(2026, 9, 22), sessions=("regular", "nxt_aftermarket", "krx_aftermarket"), read_partition=frames.get
+    )
+    assert issues == ()
+
+
+def test_bar_value_audit_counts_zero_volume_with_value() -> None:
+    from datetime import date
+
+    from src.tools.daily_audit import audit_bar_value_consistency
+
+    frames = {"krx_aftermarket": _value_frame([("kis", 0, 5_000, 1000, 1000)])}
+    issues = audit_bar_value_consistency(date(2026, 9, 22), sessions=("krx_aftermarket",), read_partition=frames.get)
+    assert issues == ("intraday:krx_aftermarket:1:value_out_of_range",)
+
+
+def test_bar_value_audit_default_reader_uses_stored_partitions(tmp_path, monkeypatch) -> None:
+    from datetime import date
+
+    import pandas as pd
+
+    from src.data import intraday_store
+    from src.data.intraday_schema import normalize_bar_frame
+    from src.tools.daily_audit import audit_bar_value_consistency
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
+    raw = pd.DataFrame([{"stck_bsop_date": "20260922", "stck_cntg_hour": "160000", "stck_oprc": "1000", "stck_hgpr": "1000",
+                         "stck_lwpr": "1000", "stck_prpr": "1000", "cntg_vol": "10", "acml_tr_pbmn": "10000"}])
+    frame = normalize_bar_frame(raw, "kis", "2026-09-22", "000660")
+    frame.loc[0, "value_krw"] = 99_999_999
+    target = intraday_store.intraday_partition_path(1, "2026-09-22", "krx_aftermarket")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(target, index=False)
+    issues = audit_bar_value_consistency(date(2026, 9, 22), sessions=("krx_aftermarket", "regular"))
+    assert issues == ("intraday:krx_aftermarket:1:value_out_of_range",)
+
+
+def test_aftermarket_tick_audit_default_readers_use_stored_partitions(tmp_path, monkeypatch) -> None:
+    from datetime import date
+
+    import pandas as pd
+
+    from src.data import intraday_store
+    from src.data.intraday_schema import normalize_bar_frame
+    from src.tools.daily_audit import audit_aftermarket_ticks
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
+    day = "2026-09-29"
+    raw = pd.DataFrame([{"stck_bsop_date": "20260929", "stck_cntg_hour": "160100", "stck_oprc": "1000", "stck_hgpr": "1000",
+                         "stck_lwpr": "1000", "stck_prpr": "1000", "cntg_vol": "10", "acml_tr_pbmn": "10000"}])
+    bars = normalize_bar_frame(raw, "kis", day, "000660")
+    target = intraday_store.intraday_partition_path(1, day, "krx_aftermarket")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    bars.to_parquet(target, index=False)
+    issues = audit_aftermarket_ticks(date(2026, 9, 29))
+    # KRX 봉은 있는데 틱 파티션이 없음 -> missing_partition; NXT는 봉·틱 모두 없어 조용함
+    assert issues == ("intraday:krx_aftermarket_ticks:1:missing_partition",)
+
+
+def test_aftermarket_tick_audit_default_reader_matches_stored_volumes(tmp_path, monkeypatch) -> None:
+    from datetime import date
+
+    import pandas as pd
+
+    from src.data import intraday_store
+    from src.data.intraday_schema import normalize_bar_frame
+    from src.tools.daily_audit import audit_aftermarket_ticks
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
+    day = "2026-09-29"
+    raw = pd.DataFrame([{"stck_bsop_date": "20260929", "stck_cntg_hour": "160100", "stck_oprc": "1000", "stck_hgpr": "1000",
+                         "stck_lwpr": "1000", "stck_prpr": "1000", "cntg_vol": "10", "acml_tr_pbmn": "10000"}])
+    bar_target = intraday_store.intraday_partition_path(1, day, "krx_aftermarket")
+    bar_target.parent.mkdir(parents=True, exist_ok=True)
+    normalize_bar_frame(raw, "kis", day, "000660").to_parquet(bar_target, index=False)
+    tick_target = intraday_store.tick_partition_path(day, "krx_aftermarket")
+    tick_target.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"symbol": ["000660", "000660"], "ts_hms": [160005, 160050], "volume": [4, 6]}).to_parquet(tick_target, index=False)
+    assert audit_aftermarket_ticks(date(2026, 9, 29)) == ()

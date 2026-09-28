@@ -190,7 +190,26 @@ def filter_to_business_date(df: pd.DataFrame, vendor: str, snapshot_date: str, s
 
 
 def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbol: str) -> pd.DataFrame:
-    """벤더 원천 분봉 프레임을 정규 바 스키마로 변환한다."""
+    """Convert a vendor minute-bar frame into the canonical bar schema.
+
+    KIS exposes only a cumulative traded value. A diff of that cumulative is kept as the bar's value only
+    when it is consistent with the bar itself (zero for a zero-volume bar, otherwise inside
+    [low * volume, high * volume]); any other diff contains trades outside the bar (pre-open or
+    closing-price sessions, previous-session carry-in at an aftermarket window start, or minute-boundary
+    attribution lag) and is replaced by close * volume, the same estimator used for Kiwoom and Toss.
+
+    Args:
+        df: Raw vendor rows for one symbol and one business date.
+        vendor: One of "kis", "ls", "kiwoom", "toss".
+        snapshot_date: Requested market date (YYYY-MM-DD).
+        symbol: Six-character symbol code.
+
+    Returns:
+        Canonical bar frame (CANONICAL_BAR_COLUMNS) sorted by ts_hms; empty frame for empty input.
+
+    Raises:
+        ValueError: Unknown vendor or missing required vendor columns.
+    """
     if vendor not in ("kis", "ls", "kiwoom", "toss"):
         raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls', 'kiwoom', 'toss')")
     if df is None or len(df) == 0:
@@ -224,7 +243,18 @@ def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbo
                 n_negative,
                 code,
             )
-        value_krw = diff.clip(lower=0)
+        candidate = diff.clip(lower=0)
+        volume = work["volume"]
+        low = work["low"]
+        high = work["high"]
+        close = work["close"]
+        zero_ok = (volume == 0) & (candidate == 0)
+        band_ok = (volume > 0) & (low * volume <= candidate) & (candidate <= high * volume)
+        accept = zero_ok | band_ok
+        n_replaced = int((~accept).sum())
+        if n_replaced:
+            logger.debug("[DATA] KIS bar value replaced count=%d symbol=%s", n_replaced, code)
+        value_krw = candidate.where(accept, close * volume)
     elif vendor == "ls":
         _require_columns(df, _LS_BAR_REQUIRED, vendor)
         work = pd.DataFrame(

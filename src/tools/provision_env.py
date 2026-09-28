@@ -79,6 +79,8 @@ RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
 #   DATA_3  kca 장 개시·마감 연구 캡처(08:39~09:03, 15:21~15:30)
 #   DATA_4  kca 배치 역할(가격·아카이브·대체데이터 기본키) + 연구 캡처 보조
 #   DATA_5  kca 결정창 샤드 2번(15:20), krx 예비
+#   DATA_2·3: 23:05~06:50 야간 확장세션 분봉 소급(krx/kca 모두 KIS REST 미사용 시간대)
+#   DATA_2·3: 15:40~20:00 애프터마켓 호가 REST(krx 스냅샷 15:39 종료, 경매 캡처 15:30 종료 이후)
 # krx 애프터마켓 웹소켓 샤드(15:30~20:00)는 REST 유량을 쓰지 않아 위 배정과 충돌하지 않는다.
 #   KIS_DECISION_SHARD_SLOTS: 결정 역할 선두(1)로 시작해야 하며 15:20 벌크를 절반으로 줄인다.
 #   COLLECTION_RESEARCH_SLOTS: 샤드와 겹치면 안 되고(코드 검증), krx 스냅샷(2)과 경매 시각이 같아 2도 제외.
@@ -89,6 +91,9 @@ VPS_SELECTORS: tuple[tuple[str, str], ...] = (
     ("COLLECTION_ALTDATA_ENABLED", "true"),
     ("COLLECTION_RESEARCH_SLOTS", "3,4"),
     ("COLLECTION_ALTDATA_EXTRA_SLOTS", "2,3"),
+    ("COLLECTION_BACKFILL_SLOTS", "2,3"),
+    ("COLLECTION_AFTERMARKET_BOOK_ENABLED", "true"),
+    ("COLLECTION_AFTERMARKET_BOOK_SLOTS", "2,3"),
 )
 
 # krx-alpha docker-compose의 KRX_ALPHA_SNAPSHOT_KIS_DATA_SLOT과 같아야 한다(장중 배타 슬롯).
