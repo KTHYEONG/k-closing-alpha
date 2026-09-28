@@ -4,6 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 from src.backfill.intraday.collector import collect_intraday_bars
+from src.data.capture_contracts import SEOUL as _KST
 
 
 def _kis_bar(hour: str, prpr: str, vol: str, cum: str) -> dict:
@@ -1308,7 +1309,7 @@ def test_collect_ticks_default_page_limit_follows_profile_chart_budget(tmp_path)
             self.seen.append(max_pages)
             return {"rt_cd": "0", "output2": [], "vendor": "kiwoom", "truncated": False}
 
-    today = datetime.datetime.now().date().isoformat()
+    today = datetime.datetime.now(_KST).date().isoformat()
     store = CaptureStore(tmp_path / "capture")
     profile = CollectionSettings(COLLECTION_ROOT=tmp_path / "capture", COLLECTION_CHART_MAX_PAGES=7)
     kiwoom = _RecordingKiwoom()
@@ -1337,7 +1338,7 @@ def test_collect_ticks_explicit_page_limit_still_overrides(tmp_path) -> None:
             self.seen.append(max_pages)
             return {"rt_cd": "0", "output2": [], "vendor": "kiwoom", "truncated": False}
 
-    today = datetime.datetime.now().date().isoformat()
+    today = datetime.datetime.now(_KST).date().isoformat()
     store = CaptureStore(tmp_path / "capture")
     profile = CollectionSettings(COLLECTION_ROOT=tmp_path / "capture", COLLECTION_CHART_MAX_PAGES=7)
     kiwoom = _RecordingKiwoom()
@@ -1362,7 +1363,7 @@ def _aftermarket_profile(tmp_path):
 def _today() -> tuple[str, str]:
     import datetime
 
-    today = datetime.datetime.now().date().isoformat()
+    today = datetime.datetime.now(_KST).date().isoformat()
     return today, today.replace("-", "")
 
 
@@ -1515,7 +1516,7 @@ def test_aftermarket_ticks_past_date_refused() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        yesterday = (datetime.datetime.now().date() - datetime.timedelta(days=1)).isoformat()
+        yesterday = (datetime.datetime.now(_KST).date() - datetime.timedelta(days=1)).isoformat()
         store = _capture_store(tmp_path)
         profile = _aftermarket_profile(tmp_path)
         with pytest.raises(ValueError, match="current-day only"):
@@ -1649,7 +1650,7 @@ def test_extended_backfill_rejects_today_unknown_session_and_pre_start_krx(tmp_p
 
     from src.backfill.intraday.collector import backfill_extended_session_bars
 
-    today = datetime.datetime.now().date().isoformat()
+    today = datetime.datetime.now(_KST).date().isoformat()
     kw = {"profile": _capture_profile(tmp_path), "capture_store": _capture_store(tmp_path)}
     with pytest.raises(ValueError, match="past date"):
         asyncio.run(backfill_extended_session_bars(_KisBars([]), None, ["005930"], today, session_tag="nxt_aftermarket", **kw))
