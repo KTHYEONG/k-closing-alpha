@@ -127,10 +127,19 @@ def _row(h: str, close: str, vol: str, cum: str, day: str) -> dict:
 class _FakeKis:
     """Historical-only KIS stand-in keyed by symbol."""
 
-    def __init__(self, day: str, traded: set[str], fail: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        day: str,
+        traded: set[str],
+        fail: set[str] | None = None,
+        bars: dict[str, tuple[str, str, str]] | None = None,
+        hms: str = "160000",
+    ) -> None:
         self._day = day
+        self._hms = hms
         self._traded = traded
         self._fail = fail or set()
+        self._bars = dict(bars) if bars else {}
         self.requested: list[str] = []
 
     async def get_historical_minute_chart(self, session, code, target_date, **kwargs):
@@ -138,8 +147,51 @@ class _FakeKis:
         if code in self._fail:
             raise RuntimeError("down")
         if code in self._traded:
-            return {"rt_cd": "0", "output2": [_row("160000", "1000", "10", "10000", self._day)]}
+            close, vol, cum = self._bars.get(code, ("1000", "10", "10000"))
+            return {"rt_cd": "0", "output2": [_row(self._hms, close, vol, cum, self._day)]}
         return {"rt_cd": "0", "output2": []}
+
+
+def _kw_row(day: str, hms: str, price: str, vol: str) -> dict:
+    return {"cntr_tm": day.replace("-", "") + hms, "cur_prc": price, "open_pric": price, "high_pric": price,
+            "low_pric": price, "trde_qty": vol}
+
+
+class _FakeKiwoom:
+    """Kiwoom raw-basis stand-in: per-symbol raw bars, or empty (symbol dropped from NXT)."""
+
+    def __init__(self, day: str, raw: dict[str, str], error: set[str] | None = None) -> None:
+        self._day = day
+        self._raw = dict(raw)
+        self._error = set(error or set())
+        self.calls: list[tuple[str, str]] = []
+
+    async def _chart(self, method: str, session, code: str, target_date: str) -> dict:
+        self.calls.append((method, code))
+        if code in self._error:
+            raise RuntimeError("kiwoom down")
+        if code not in self._raw:
+            return {"rt_cd": "0", "output2": [], "vendor": "kiwoom"}
+        hms = "160000" if method == "get_nxt_minute_chart" else "080500"
+        return {"rt_cd": "0", "output2": [_kw_row(self._day, hms, self._raw[code], "770")], "vendor": "kiwoom"}
+
+    async def get_nxt_minute_chart(self, session, code, target_date):
+        return await self._chart("get_nxt_minute_chart", session, code, target_date)
+
+    async def get_nxt_premarket_chart(self, session, code, target_date):
+        return await self._chart("get_nxt_premarket_chart", session, code, target_date)
+
+
+def _ref(rows: list[tuple[str, str, float, float]]):
+    from src.backfill.intraday.price_basis import PriceReference
+
+    return PriceReference.from_price_history(
+        pd.DataFrame(rows, columns=["date", "symbol", "close", "close_raw"])
+    )
+
+
+def _raw_ref(day: str, symbols: set[str] | list[str], raw: int = 1000) -> object:
+    return _ref([(day, symbol, float(raw), float(raw)) for symbol in symbols])
 
 
 @pytest.fixture
@@ -153,11 +205,11 @@ def env(tmp_path, monkeypatch):
     return profile, store, ledger
 
 
-def _run(profile, store, ledger, clients, tasks, now_fn=None, stop_at=None):
+def _run(profile, store, ledger, clients, tasks, price_reference, now_fn=None, stop_at=None, raw_client=None):
     stop = stop_at or datetime(2099, 1, 1, tzinfo=SEOUL)
     return asyncio.run(run_extended_session_backfill(
         as_of=AS_OF, stop_at=stop, profile=profile, clients=clients, store=store,
-        ledger=ledger, tasks=tasks, now_fn=now_fn,
+        ledger=ledger, tasks=tasks, price_reference=price_reference, now_fn=now_fn, raw_client=raw_client,
     ))
 
 
@@ -181,7 +233,8 @@ def test_ledger_terminal_and_stored_symbols_are_not_refetched(env) -> None:
     write_intraday_partition(stored, 1, day, "nxt_aftermarket")
     kis = _FakeKis(day, traded={"000003"})
     summary = _run(profile, store, ledger, [kis],
-                   [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002", "000003"))])
+                   [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002", "000003"))],
+                   _raw_ref(day, {"000003"}))
     assert kis.requested == ["000003"]
     assert summary.complete == 1 and summary.tasks_done == 1
 
@@ -192,7 +245,8 @@ def test_failed_symbols_are_retried_on_next_run(env) -> None:
     ledger.record(day, "nxt_aftermarket", [_entry("000003", CaptureStatus.FAILED)],
                   run_id="seed", attempted_at=datetime.now(SEOUL))
     kis = _FakeKis(day, traded={"000003"})
-    _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000003",))])
+    _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000003",))],
+         _raw_ref(day, {"000003"}))
     assert kis.requested == ["000003"]
     assert "000003" in ledger.terminal_symbols(day, "nxt_aftermarket")
 
@@ -206,7 +260,10 @@ def test_deadline_stops_before_next_task(env) -> None:
         ExtendedBackfillTask("2026-03-02", "nxt_aftermarket", ("000001",)),
         ExtendedBackfillTask("2026-03-03", "nxt_aftermarket", ("000001",)),
     ]
-    summary = _run(profile, store, ledger, [kis], tasks, now_fn=lambda: next(ticks), stop_at=stop)
+    summary = _run(profile, store, ledger, [kis], tasks, _ref([
+        ("2026-03-02", "000001", 1000.0, 1000.0),
+        ("2026-03-03", "000001", 1000.0, 1000.0),
+    ]), now_fn=lambda: next(ticks), stop_at=stop)
     assert summary.tasks_done == 1
     assert summary.tasks_remaining == 1
     assert summary.stopped_by_deadline is True
@@ -219,7 +276,7 @@ def test_unlisted_nxt_symbols_are_terminal_without_partition_rows(env) -> None:
     profile, store, ledger = env
     day = "2026-03-02"
     summary = _run(profile, store, ledger, [_FakeKis(day, traded=set())],
-                   [ExtendedBackfillTask(day, "nxt_aftermarket", ("000009",))])
+                   [ExtendedBackfillTask(day, "nxt_aftermarket", ("000009",))], _ref([]))
     assert summary.not_listed == 1
     assert "000009" in ledger.terminal_symbols(day, "nxt_aftermarket")
     assert not intraday_partition_path(1, day, "nxt_aftermarket").exists()
@@ -231,7 +288,8 @@ def test_symbols_spread_round_robin_over_clients(env) -> None:
     profile, store, ledger = env
     day = "2026-03-02"
     a, b = _FakeKis(day, traded={"000001", "000002"}), _FakeKis(day, traded={"000001", "000002"})
-    _run(profile, store, ledger, [a, b], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002"))])
+    _run(profile, store, ledger, [a, b], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002"))],
+         _raw_ref(day, {"000001", "000002"}))
     assert a.requested == ["000001"] and b.requested == ["000002"]
 
 
@@ -247,7 +305,8 @@ def test_persistence_failure_is_loud_and_non_terminal(env, monkeypatch) -> None:
     monkeypatch.setattr(mod, "write_intraday_partition", _boom)
     with pytest.raises(OSError, match="disk full"):
         _run(profile, store, ledger, [_FakeKis(day, traded={"000001"})],
-             [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))])
+             [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))],
+             _raw_ref(day, {"000001"}))
     assert "000001" not in ledger.terminal_symbols(day, "nxt_aftermarket")
 
 
@@ -255,10 +314,10 @@ def test_run_ids_are_unique_per_task_run(env) -> None:
     profile, store, ledger = env
     day = "2026-03-02"
     task = ExtendedBackfillTask(day, "nxt_aftermarket", ("000009",))
-    _run(profile, store, ledger, [_FakeKis(day, traded=set())], [task])
+    _run(profile, store, ledger, [_FakeKis(day, traded=set())], [task], _ref([]))
     ledger_path = ledger.path
     ledger_path.unlink()
-    _run(profile, store, ledger, [_FakeKis(day, traded=set())], [task])
+    _run(profile, store, ledger, [_FakeKis(day, traded=set())], [task], _ref([]))
     run_ids = {m.context.run_id for m in store.read_manifests(day) if m.context.capture_reason == "extended-backfill"}
     assert len(run_ids) == 2
 
@@ -266,11 +325,11 @@ def test_run_ids_are_unique_per_task_run(env) -> None:
 def test_runner_rejects_empty_clients_and_naive_stop(env) -> None:
     profile, store, ledger = env
     with pytest.raises(ValueError, match="clients must be nonempty"):
-        _run(profile, store, ledger, [], [])
+        _run(profile, store, ledger, [], [], _ref([]))
     with pytest.raises(ValueError, match="timezone-aware"):
         asyncio.run(run_extended_session_backfill(
             as_of=AS_OF, stop_at=datetime(2099, 1, 1), profile=profile, clients=[object()],
-            store=store, ledger=ledger, tasks=[],
+            store=store, ledger=ledger, tasks=[], price_reference=_ref([]),
         ))
 
 
@@ -307,7 +366,7 @@ def test_unreadable_stored_partition_fails_loud(env) -> None:
     target.write_bytes(b"not parquet")
     with pytest.raises(OSError, match="existing partition evidence"):
         _run(profile, store, ledger, [_FakeKis(day, traded=set())],
-             [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))])
+             [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))], _ref([]))
 
 
 class _SessionClient(_FakeKis):
@@ -338,8 +397,10 @@ def test_client_sessions_are_opened_from_async_and_plain_factories(env) -> None:
     async_client = _SessionClient(day, _AsyncCM())
     plain_client = _SessionClient(day, "plain-session")
     _run(profile, store, ledger, [async_client, plain_client],
-         [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002"))])
-    assert async_client.seen_sessions == ["entered-session"]
+         [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002"))],
+         _raw_ref(day, {"000001"}))
+    assert set(async_client.seen_sessions) == {"entered-session"}
+    assert async_client.seen_sessions.count("entered-session") == 1
     assert plain_client.seen_sessions == ["plain-session"]
 
 
@@ -352,7 +413,7 @@ def test_empty_stored_partition_does_not_block_fetch(env) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"symbol": pd.Series([], dtype="string")}).to_parquet(target, index=False)
     kis = _FakeKis(day, traded=set())
-    _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))])
+    _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))], _ref([]))
     assert kis.requested == ["000001"]
 
 
@@ -389,7 +450,258 @@ def test_ledger_vendor_is_recorded_but_not_part_of_the_key(tmp_path) -> None:
                   run_id="a", attempted_at=datetime.now(SEOUL))
     assert ledger.terminal_symbols("2026-03-02", "nxt_aftermarket") == frozenset()
     ledger.record("2026-03-02", "nxt_aftermarket", [_entry("000001", CaptureStatus.COMPLETE)],
-                  run_id="b", attempted_at=datetime.now(SEOUL), vendor="toss")
+                  run_id="b", attempted_at=datetime.now(SEOUL), vendor="kis")
     rows = pd.read_parquet(ledger.path)
-    assert len(rows) == 1 and rows.iloc[0]["vendor"] == "toss"
+    assert len(rows) == 1 and rows.iloc[0]["vendor"] == "kis"
     assert ledger.terminal_symbols("2026-03-02", "nxt_aftermarket") == frozenset({"000001"})
+
+
+def _adj_ref(day: str, symbol: str, adjusted: float = 358565.0, raw: float = 466000.0) -> object:
+    return _ref([(day, symbol, adjusted, raw)])
+
+
+def _ledger_row(ledger: ExtendedBackfillLedger, symbol: str) -> pd.Series:
+    rows = pd.read_parquet(ledger.path)
+    return rows[rows["symbol"] == symbol].iloc[0]
+
+
+def test_raw_panel_day_keeps_kis_bars_without_raw_source_call(env) -> None:
+    profile, store, ledger = env
+    day = "2026-03-02"
+    kiwoom = _FakeKiwoom(day, raw={"000001": "999"})
+    summary = _run(profile, store, ledger, [_FakeKis(day, traded={"000001"})],
+                   [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))],
+                   _raw_ref(day, {"000001"}), raw_client=kiwoom)
+    assert summary.complete == 1
+    assert kiwoom.calls == []
+    assert _ledger_row(ledger, "000001")["price_basis"] == "kis_raw"
+
+
+def test_adjusted_day_is_stored_from_kiwoom_raw_bars(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    day = "2025-09-29"
+    kis = _FakeKis(day, traded={"196170"}, bars={"196170": ("358565", "1000", "358565000")})
+    kiwoom = _FakeKiwoom(day, raw={"196170": "466000"})
+    summary = _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("196170",))],
+                   _adj_ref(day, "196170"), raw_client=kiwoom)
+    assert summary.complete == 1
+    stored = pd.read_parquet(intraday_partition_path(1, day, "nxt_aftermarket"))
+    assert stored["close"].tolist() == [466000]
+    assert stored["vendor"].tolist() == ["kiwoom"]
+    assert kiwoom.calls == [("get_nxt_minute_chart", "196170")]
+    row = _ledger_row(ledger, "196170")
+    assert row["status"] == "COMPLETE" and row["price_basis"] == "kiwoom_raw"
+
+
+def test_adjusted_premarket_day_uses_the_premarket_raw_chart(env) -> None:
+    profile, store, ledger = env
+    day = "2025-09-30"
+    kis = _FakeKis(day, traded={"196170"}, hms="080500")
+    kiwoom = _FakeKiwoom(day, raw={"196170": "466000"})
+    summary = _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_premarket", ("196170",))],
+                   _adj_ref(day, "196170"), raw_client=kiwoom)
+    assert summary.complete == 1
+    assert kiwoom.calls == [("get_nxt_premarket_chart", "196170")]
+
+
+def test_adjusted_day_without_kiwoom_bars_fails_closed(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    day = "2025-09-29"
+    summary = _run(profile, store, ledger, [_FakeKis(day, traded={"067310"})],
+                   [ExtendedBackfillTask(day, "nxt_aftermarket", ("067310",))],
+                   _adj_ref(day, "067310"), raw_client=_FakeKiwoom(day, raw={}))
+    assert summary.failed == 1 and summary.complete == 0
+    assert not intraday_partition_path(1, day, "nxt_aftermarket").exists()
+    row = _ledger_row(ledger, "067310")
+    assert row["reason"] == "price_basis_raw_basis_unavailable"
+    assert "067310" not in ledger.terminal_symbols(day, "nxt_aftermarket")
+
+
+def test_kiwoom_transport_error_fails_closed_with_reason(env) -> None:
+    profile, store, ledger = env
+    day = "2025-09-29"
+    _run(profile, store, ledger, [_FakeKis(day, traded={"196170"})],
+         [ExtendedBackfillTask(day, "nxt_aftermarket", ("196170",))],
+         _adj_ref(day, "196170"), raw_client=_FakeKiwoom(day, raw={}, error={"196170"}))
+    assert _ledger_row(ledger, "196170")["reason"].startswith("price_basis_raw_basis_transport:")
+
+
+def test_adjusted_day_without_raw_source_fails_closed(env) -> None:
+    profile, store, ledger = env
+    krx_day = "2026-09-20"
+    summary = _run(profile, store, ledger, [_FakeKis(krx_day, traded={"000001"})],
+                   [ExtendedBackfillTask(krx_day, "krx_aftermarket", ("000001",))],
+                   _adj_ref(krx_day, "000001", 5300.0, 1060.0), raw_client=_FakeKiwoom(krx_day, raw={"000001": "1060"}))
+    assert summary.failed == 1
+    assert _ledger_row(ledger, "000001")["reason"] == "price_basis_no_raw_source"
+    nxt_day = "2026-03-02"
+    _run(profile, store, ledger, [_FakeKis(nxt_day, traded={"000002"})],
+         [ExtendedBackfillTask(nxt_day, "nxt_aftermarket", ("000002",))],
+         _adj_ref(nxt_day, "000002", 5300.0, 1060.0), raw_client=None)
+    assert _ledger_row(ledger, "000002")["reason"] == "price_basis_no_raw_source"
+
+
+def test_unknown_panel_day_fails_closed(env) -> None:
+    profile, store, ledger = env
+    day = "2026-03-02"
+    kiwoom = _FakeKiwoom(day, raw={"000001": "1000"})
+    summary = _run(profile, store, ledger, [_FakeKis(day, traded={"000001"})],
+                   [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))], _ref([]), raw_client=kiwoom)
+    assert summary.failed == 1 and kiwoom.calls == []
+    assert _ledger_row(ledger, "000001")["reason"] == "price_basis_unknown"
+
+
+def test_not_listed_and_no_trade_symbols_make_no_raw_source_call(env) -> None:
+    profile, store, ledger = env
+    krx_day = "2026-09-20"
+    kiwoom = _FakeKiwoom(krx_day, raw={"000009": "1"})
+    summary = _run(profile, store, ledger, [_FakeKis(krx_day, traded=set())],
+                   [ExtendedBackfillTask(krx_day, "krx_aftermarket", ("000009",))], _ref([]), raw_client=kiwoom)
+    assert summary.no_trades == 1
+    nxt_day = "2026-03-02"
+    nxt_summary = _run(profile, store, ledger, [_FakeKis(nxt_day, traded=set())],
+                       [ExtendedBackfillTask(nxt_day, "nxt_aftermarket", ("000007",))], _ref([]), raw_client=kiwoom)
+    assert nxt_summary.not_listed == 1
+    assert kiwoom.calls == []
+
+
+def _seed_legacy_adjusted(ledger: ExtendedBackfillLedger, day: str, symbol: str) -> None:
+    from src.data.intraday_schema import normalize_bar_frame
+    from src.data.intraday_store import write_intraday_partition
+
+    adjusted = normalize_bar_frame(
+        pd.DataFrame([_row("160000", "358565", "1000", "358565000", day)]), "kis", day, symbol,
+    )
+    write_intraday_partition(adjusted, 1, day, "nxt_aftermarket")
+    ledger.record(day, "nxt_aftermarket", [_entry(symbol, CaptureStatus.COMPLETE)],
+                  run_id="old", attempted_at=datetime.now(SEOUL))
+
+
+def test_legacy_adjusted_rows_are_replaced_by_raw_bars(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    day = "2025-09-29"
+    _seed_legacy_adjusted(ledger, day, "196170")
+    assert ledger.unverified_complete_symbols(day, "nxt_aftermarket") == frozenset({"196170"})
+    kis = _FakeKis(day, traded={"196170"}, bars={"196170": ("358565", "1000", "358565000")})
+    _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("196170",))],
+         _adj_ref(day, "196170"), raw_client=_FakeKiwoom(day, raw={"196170": "466000"}))
+    assert kis.requested == ["196170"]
+    stored = pd.read_parquet(intraday_partition_path(1, day, "nxt_aftermarket"))
+    assert stored["close"].tolist() == [466000]
+    assert ledger.unverified_complete_symbols(day, "nxt_aftermarket") == frozenset()
+
+
+def test_failed_repair_removes_adjusted_rows_and_stays_pending(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    day = "2025-09-29"
+    _seed_legacy_adjusted(ledger, day, "067310")
+    task = [ExtendedBackfillTask(day, "nxt_aftermarket", ("067310",))]
+    _run(profile, store, ledger, [_FakeKis(day, traded={"067310"})], task,
+         _adj_ref(day, "067310"), raw_client=_FakeKiwoom(day, raw={}))
+    assert not intraday_partition_path(1, day, "nxt_aftermarket").exists()
+    assert "067310" not in ledger.terminal_symbols(day, "nxt_aftermarket")
+    retry = _FakeKis(day, traded={"067310"})
+    _run(profile, store, ledger, [retry], task, _adj_ref(day, "067310"), raw_client=_FakeKiwoom(day, raw={}))
+    assert retry.requested == ["067310"]
+
+
+def test_legacy_raw_day_rows_are_not_refetched(env) -> None:
+    from src.data.intraday_schema import normalize_bar_frame
+    from src.data.intraday_store import write_intraday_partition
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    stored = normalize_bar_frame(pd.DataFrame([_row("160000", "1000", "10", "10000", day)]), "kis", day, "000001")
+    write_intraday_partition(stored, 1, day, "nxt_aftermarket")
+    ledger.record(day, "nxt_aftermarket", [_entry("000001", CaptureStatus.COMPLETE)],
+                  run_id="old", attempted_at=datetime.now(SEOUL))
+    kis = _FakeKis(day, traded={"000001"})
+    _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))],
+         _raw_ref(day, {"000001"}))
+    assert kis.requested == []
+
+
+def test_legacy_ledger_without_basis_column_loads(tmp_path) -> None:
+    assert ExtendedBackfillLedger(tmp_path / "empty.parquet").unverified_complete_symbols(
+        "2026-03-02", "nxt_aftermarket") == frozenset()
+    path = tmp_path / "ledger.parquet"
+    pd.DataFrame([{
+        "snapshot_date": "2026-03-02", "session": "nxt_aftermarket", "symbol": "000001", "status": "COMPLETE",
+        "rows": 1, "reason": "seed", "run_id": "old", "attempted_at": "2026-03-02T23:00:00+09:00",
+    }]).to_parquet(path, index=False)
+    ledger = ExtendedBackfillLedger(path)
+    assert ledger.unverified_complete_symbols("2026-03-02", "nxt_aftermarket") == frozenset({"000001"})
+    ledger.record("2026-03-02", "nxt_aftermarket", [_entry("000002", CaptureStatus.COMPLETE)],
+                  run_id="new", attempted_at=datetime.now(SEOUL), price_bases={"000002": "kiwoom_raw"})
+    rows = pd.read_parquet(path).set_index("symbol")
+    assert rows.loc["000001", "price_basis"] == "" and rows.loc["000002", "price_basis"] == "kiwoom_raw"
+    assert ledger.unverified_complete_symbols("2026-03-02", "nxt_aftermarket") == frozenset({"000001"})
+    assert ledger.unverified_complete_symbols("2026-03-03", "nxt_aftermarket") == frozenset()
+
+
+def test_kiwoom_raw_helper_rejects_sessions_without_raw_source(env) -> None:
+    from src.backfill.intraday.collector import backfill_kiwoom_raw_bars
+
+    profile, store, _ledger = env
+    with pytest.raises(ValueError, match="No Kiwoom raw source"):
+        asyncio.run(backfill_kiwoom_raw_bars(
+            _FakeKiwoom("2026-09-20", raw={}), None, "000001", "2026-09-20",
+            session_tag="krx_aftermarket", profile=profile, capture_store=store, run_id="r",
+        ))
+
+
+def test_kiwoom_raw_helper_classifies_vendor_errors(env) -> None:
+    from src.backfill.intraday.collector import backfill_kiwoom_raw_bars
+
+    profile, store, _ledger = env
+
+    class _ErrKiwoom(_FakeKiwoom):
+        async def get_nxt_minute_chart(self, session, code, target_date):
+            return {"rt_cd": "1", "msg1": "x", "output2": []}
+
+    frame, entry = asyncio.run(backfill_kiwoom_raw_bars(
+        _ErrKiwoom("2025-09-29", raw={}), None, "000001", "2025-09-29",
+        session_tag="nxt_aftermarket", profile=profile, capture_store=store, run_id="r",
+    ))
+    assert frame.empty and entry.status is CaptureStatus.FAILED and entry.reason == "raw_basis_vendor_error"
+    assert len(entry.raw_refs) == 1
+
+
+def test_remove_intraday_symbols_keeps_other_symbols(env) -> None:
+    from src.data.intraday_schema import normalize_bar_frame
+    from src.data.intraday_store import intraday_partition_path, remove_intraday_symbols, write_intraday_partition
+
+    day = "2026-03-02"
+    frames = [normalize_bar_frame(pd.DataFrame([_row("160000", "1000", "10", "10000", day)]), "kis", day, s)
+              for s in ("000001", "000002")]
+    write_intraday_partition(pd.concat(frames, ignore_index=True), 1, day, "nxt_aftermarket")
+    assert remove_intraday_symbols(1, day, "nxt_aftermarket", set()) == 2
+    assert remove_intraday_symbols(1, day, "nxt_aftermarket", {"000001"}) == 1
+    assert pd.read_parquet(intraday_partition_path(1, day, "nxt_aftermarket"))["symbol"].tolist() == ["000002"]
+    assert remove_intraday_symbols(1, "2026-03-03", "nxt_aftermarket", {"000001"}) == 0
+
+
+def test_kiwoom_raw_helper_refuses_uncertified_venue_and_malformed_rows(env) -> None:
+    from src.backfill.intraday.collector import backfill_kiwoom_raw_bars
+
+    profile, store, _ledger = env
+    day = "2025-09-29"
+    uncertified = CollectionSettings(COLLECTION_ROOT=profile.COLLECTION_ROOT, COLLECTION_VERIFIED_CHART_ROUTES={"kiwoom:ka10080": "UNKNOWN"})
+    _frame, entry = asyncio.run(backfill_kiwoom_raw_bars(
+        _FakeKiwoom(day, raw={"000001": "1000"}), None, "000001", day,
+        session_tag="nxt_aftermarket", profile=uncertified, capture_store=store, run_id="r",
+    ))
+    assert entry.status is CaptureStatus.FAILED and entry.reason == "raw_basis_uncertified_venue"
+    _frame, entry = asyncio.run(backfill_kiwoom_raw_bars(
+        _FakeKiwoom(day, raw={"000001": "not-a-price"}), None, "000001", day,
+        session_tag="nxt_aftermarket", profile=profile, capture_store=store, run_id="r2",
+    ))
+    assert entry.status is CaptureStatus.FAILED and entry.reason.startswith("raw_basis_normalize:")

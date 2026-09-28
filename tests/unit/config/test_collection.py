@@ -252,33 +252,14 @@ def test_aftermarket_sparse_times_reject_bad_spellings() -> None:
         CollectionSettings(COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES=("200000",), _env_file=None)
 
 
-def test_toss_backfill_is_inert_by_default(monkeypatch) -> None:
-    from src.config.collection import CollectionSettings
-
-    for key in list(__import__("os").environ):
-        if key.startswith("COLLECTION_TOSS"):
-            monkeypatch.delenv(key, raising=False)
-    profile = CollectionSettings()
-    assert profile.COLLECTION_TOSS_BACKFILL_ENABLED is False
-    assert profile.COLLECTION_TOSS_BACKFILL_RATE == 12.0
-    assert profile.COLLECTION_TOSS_BACKFILL_CONCURRENCY == 6
-    assert profile.COLLECTION_TOSS_BACKFILL_MAX_DATES_PER_RUN == 50
-    assert profile.COLLECTION_TOSS_BACKFILL_MAX_CONSECUTIVE_ERRORS == 20
-    assert profile.COLLECTION_TOSS_CALIBRATION_DATES == 6
-    assert profile.COLLECTION_TOSS_CALIBRATION_SYMBOLS_PER_DATE == 2
-    assert profile.COLLECTION_TOSS_CALIBRATION_MIN_TRADED_MINUTES == 200
-    assert profile.COLLECTION_TOSS_CALIBRATION_MIN_EXACT_RATIO == 0.999
+def test_collection_settings_expose_no_toss_backfill_fields() -> None:
+    """Collection settings no longer expose Toss backfill fields."""
+    assert not [name for name in CollectionSettings.model_fields if name.startswith("COLLECTION_TOSS_")]
+    assert CollectionSettings(_env_file=None).COLLECTION_BACKFILL_SLOTS == ()
 
 
-def test_toss_backfill_limits_are_validated() -> None:
-    import pytest
-    from pydantic import ValidationError
-
-    from src.config.collection import CollectionSettings
-
-    with pytest.raises(ValidationError):
-        CollectionSettings(COLLECTION_TOSS_CALIBRATION_MIN_EXACT_RATIO=1.5)
-    with pytest.raises(ValidationError):
-        CollectionSettings(COLLECTION_TOSS_BACKFILL_CONCURRENCY=0)
-    with pytest.raises(ValidationError):
-        CollectionSettings(COLLECTION_TOSS_BACKFILL_RATE=0)
+def test_stale_toss_backfill_env_key_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale COLLECTION_TOSS_BACKFILL_ENABLED env value cannot break construction."""
+    monkeypatch.setenv("COLLECTION_TOSS_BACKFILL_ENABLED", "true")
+    profile = CollectionSettings(_env_file=None)
+    assert profile.COLLECTION_BACKFILL_SLOTS == ()

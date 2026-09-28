@@ -696,9 +696,12 @@ def test_merge_remote_env_drops_retired_keys_and_main_requires_consent(tmp_path,
         cli.main(["--source", str(tmp_path / "x")])
 
 
-def test_toss_backfill_selector_is_provisioned_and_foreign_keys_kept() -> None:
+def test_vps_selectors_omit_toss_backfill_flag() -> None:
     from src.tools.provision_env import VPS_SELECTORS, merge_remote_env
 
-    assert ("COLLECTION_TOSS_BACKFILL_ENABLED", "true") in VPS_SELECTORS
+    names = [name for name, _ in VPS_SELECTORS]
+    assert "COLLECTION_TOSS_BACKFILL_ENABLED" not in names
+    assert "COLLECTION_BACKFILL_SLOTS" in names
+    assert "COLLECTION_AFTERMARKET_BOOK_SLOTS" in names
     merged, _ = merge_remote_env("KIS_APP_KEY=abc\n", "FOREIGN_KEY=keepme\n")
     assert "FOREIGN_KEY=keepme" in merged

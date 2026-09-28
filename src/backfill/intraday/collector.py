@@ -1447,3 +1447,88 @@ async def backfill_extended_session_bars(client: Any, session: Any, stock_codes:
         session_tag=str(session_tag), store=store, run_id=resolved_run,
         acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
     )
+
+
+_KIWOOM_RAW_METHODS: dict[str, str] = {
+    INTRADAY_SESSION_NXT_AFTERMARKET: "get_nxt_minute_chart",
+    INTRADAY_SESSION_NXT_PREMARKET: "get_nxt_premarket_chart",
+}
+
+
+async def backfill_kiwoom_raw_bars(
+    kiwoom_client: Any,
+    session: Any,
+    code: str,
+    snapshot_date: str,
+    *,
+    session_tag: str,
+    profile: CollectionSettings | None = None,
+    capture_store: CaptureStore | None = None,
+    run_id: str,
+) -> tuple[pd.DataFrame, CoverageEntry]:
+    """Fetch one past NXT symbol-day on the raw (unadjusted) price basis from Kiwoom ka10080.
+
+    KIS historical minute charts are corporate-action adjusted with no raw option, and the adjustment is
+    not invertible exactly, so an adjusted symbol-day is taken from Kiwoom (``upd_stkpc_tp=0``) instead.
+    Kiwoom keeps NXT history only for symbols still listed on NXT, so an empty answer is FAILED (source
+    unavailable), never NOT_APPLICABLE.
+
+    Args:
+        kiwoom_client: Kiwoom client exposing the NXT minute/premarket chart methods.
+        session: Open HTTP session.
+        code: Six-digit symbol.
+        snapshot_date: Past market date (YYYY-MM-DD).
+        session_tag: nxt_aftermarket or nxt_premarket.
+        profile: Collection limits and routes.
+        capture_store: Raw evidence store.
+        run_id: Acquisition identity of the owning backfill task.
+
+    Returns:
+        (frame, entry): COMPLETE with canonical raw bars, or FAILED with an empty frame.
+
+    Raises:
+        ValueError: session_tag without a Kiwoom raw source.
+    """
+    method = _KIWOOM_RAW_METHODS.get(str(session_tag))
+    if method is None:
+        raise ValueError(f"No Kiwoom raw source for session: {session_tag!r}")
+    prof = _resolve_profile(profile)
+    store = _resolve_store(capture_store, prof)
+    trading_day = _parse_snapshot_date(str(snapshot_date))
+    ymd = trading_day.isoformat().replace("-", "")
+    floor, ceil, _market = _EXTENDED_BACKFILL_WINDOWS[str(session_tag)]
+    venue = _venue_for(vendor="kiwoom", endpoint="ka10080", market_div_code=None, profile=prof)
+    context = _capture_context(
+        trading_day=trading_day, run_id=run_id, dataset=CaptureDataset.MINUTE_BARS, vendor="kiwoom",
+        endpoint="ka10080", symbol=code, venue=venue, session=str(session_tag),
+    )
+    refs: list[Any] = []
+
+    def _failed(reason: str) -> tuple[pd.DataFrame, CoverageEntry]:
+        return _empty_bar_frame(str(snapshot_date)), _terminal_entry(
+            symbol=code, dataset=CaptureDataset.MINUTE_BARS, venue=venue, session=str(session_tag),
+            status=CaptureStatus.FAILED, rows=0, reason=reason, refs=refs,
+        )
+
+    started = _seoul_now()
+    try:
+        payload = await getattr(kiwoom_client, method)(session, code, str(snapshot_date))
+    except Exception as e:
+        return _failed(f"raw_basis_transport:{_redacted_error(e)}")
+    refs.append(store.append_response(_page_response(context, payload, started, _seoul_now(), 0)))
+    if venue == "UNKNOWN":
+        return _failed("raw_basis_uncertified_venue")
+    if not isinstance(payload, dict) or payload.get("rt_cd") != "0":
+        return _failed("raw_basis_vendor_error")
+    rows = [dict(r) for r in (payload.get("output2") or []) if isinstance(r, dict)]
+    in_window, _ = _split_session_window(rows, ymd, floor, ceil, "kiwoom")
+    try:
+        frame = normalize_bar_frame(pd.DataFrame(in_window), "kiwoom", str(snapshot_date), code)
+    except Exception as e:
+        return _failed(f"raw_basis_normalize:{_redacted_error(e)}")
+    if frame.empty:
+        return _failed("raw_basis_unavailable")
+    return frame, _terminal_entry(
+        symbol=code, dataset=CaptureDataset.MINUTE_BARS, venue=venue, session=str(session_tag),
+        status=CaptureStatus.COMPLETE, rows=len(frame), reason=f"raw_basis_kiwoom:{len(frame)}", refs=refs,
+    )

@@ -13,7 +13,7 @@ import asyncio
 import logging
 import os
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -24,7 +24,8 @@ import numpy as np
 import pandas as pd
 
 from src import settings
-from src.backfill.intraday.collector import backfill_extended_session_bars
+from src.backfill.intraday.collector import backfill_extended_session_bars, backfill_kiwoom_raw_bars
+from src.backfill.intraday.price_basis import PriceReference
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
     INTRADAY_SESSION_KRX_AFTERMARKET,
@@ -43,7 +44,7 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
-from src.data.intraday_store import intraday_partition_path, write_intraday_partition
+from src.data.intraday_store import intraday_partition_path, remove_intraday_symbols, write_intraday_partition
 from src.data.io_utils import atomic_write_parquet, read_existing_parquet
 from src.utils.cli_logging import configure_cli_logging
 from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
@@ -60,9 +61,12 @@ _LEDGER_COLUMNS: tuple[str, ...] = (
     "run_id",
     "attempted_at",
     "vendor",
+    "price_basis",
 )
 _LEDGER_KEYS: tuple[str, ...] = ("snapshot_date", "session", "symbol")
 _TERMINAL_LEDGER_STATES: frozenset[str] = frozenset({"COMPLETE", "NO_TRADES", "NOT_APPLICABLE"})
+# 원주가 소스(Kiwoom ka10080 _NX)가 있는 세션. KRX 애프터는 Kiwoom 과거 원주가 경로가 없어 fail-closed.
+_RAW_SOURCE_SESSIONS: frozenset[str] = frozenset({INTRADAY_SESSION_NXT_AFTERMARKET, INTRADAY_SESSION_NXT_PREMARKET})
 
 
 def default_ledger_path() -> Path:
@@ -184,6 +188,18 @@ def enumerate_extended_session_tasks(
     return tasks
 
 
+def _with_legacy_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Fill columns added after the first ledger files were written (vendor, price_basis)."""
+    out = frame
+    if "vendor" not in out.columns:
+        out = out.copy()
+        out["vendor"] = "kis"
+    if "price_basis" not in out.columns:
+        out = out.copy()
+        out["price_basis"] = ""
+    return out
+
+
 class ExtendedBackfillLedger:
     """Durable per-symbol outcome log; the latest record per key wins."""
 
@@ -218,6 +234,31 @@ class ExtendedBackfillLedger:
             ].tolist()
         )
 
+    def unverified_complete_symbols(self, snapshot_date: str, session: str) -> frozenset[str]:
+        """Symbols whose latest record is a COMPLETE KIS fetch with no recorded price basis.
+
+        Rows written before price-basis routing may hold adjusted bars; the runner refetches the ones whose
+        panel day is adjusted. An empty price_basis on a COMPLETE KIS row is the only marker.
+        """
+        frame = self._read_all()
+        if frame.empty:
+            return frozenset()
+        frame = _with_legacy_columns(frame)
+        sub = frame[
+            (frame["snapshot_date"].astype(str) == str(snapshot_date))
+            & (frame["session"].astype(str) == str(session))
+        ]
+        if sub.empty:
+            return frozenset()
+        latest = sub.drop_duplicates(subset=["symbol"], keep="last")
+        basis = latest["price_basis"].fillna("").astype(str)
+        mask = (
+            (latest["status"].astype(str) == "COMPLETE")
+            & (latest["vendor"].astype(str) == "kis")
+            & (basis == "")
+        )
+        return frozenset(str(item) for item in latest.loc[mask, "symbol"].tolist())
+
     def record(
         self,
         snapshot_date: str,
@@ -227,6 +268,7 @@ class ExtendedBackfillLedger:
         run_id: str,
         attempted_at: datetime,
         vendor: str = "kis",
+        price_bases: Mapping[str, str] | None = None,
     ) -> None:
         """Append per-symbol outcomes; failures stay non-terminal for the next run.
 
@@ -236,8 +278,10 @@ class ExtendedBackfillLedger:
             entries: Coverage outcomes to append.
             run_id: Acquisition identity for these rows.
             attempted_at: Aware attempt instant.
-            vendor: Data source of these entries ("kis" or "toss") for audit; it never changes terminal semantics.
+            vendor: Data source of these entries for audit; it never changes terminal semantics.
+            price_bases: Raw-basis source per COMPLETE symbol ("kis_raw" or "kiwoom_raw"); others empty.
         """
+        bases = dict(price_bases) if price_bases is not None else {}
         rows = [
             {
                 "snapshot_date": str(snapshot_date),
@@ -249,6 +293,7 @@ class ExtendedBackfillLedger:
                 "run_id": str(run_id),
                 "attempted_at": attempted_at.isoformat(),
                 "vendor": str(vendor),
+                "price_basis": str(bases.get(str(entry.symbol), "")),
             }
             for entry in entries
             if entry.symbol is not None
@@ -262,9 +307,8 @@ class ExtendedBackfillLedger:
             purpose="backfill-ledger",
         ):
             existing = self._read_all()
-            if not existing.empty and "vendor" not in existing.columns:
-                existing = existing.copy()
-                existing["vendor"] = "kis"
+            if not existing.empty:
+                existing = _with_legacy_columns(existing)
             combined = (
                 pd.concat([existing, incoming], ignore_index=True)
                 if not existing.empty
@@ -324,14 +368,20 @@ async def run_extended_session_backfill(
     store: CaptureStore,
     ledger: ExtendedBackfillLedger,
     tasks: Sequence[ExtendedBackfillTask],
+    price_reference: PriceReference,
+    raw_client: Any | None = None,
     now_fn: Callable[[], datetime] | None = None,
 ) -> ExtendedBackfillSummary:
     """Execute backfill tasks oldest-first until done or the stop time, resumable across nights.
 
     Pending symbols of a task exclude ledger-terminal symbols and symbols already present in the stored
-    partition (live archive output is never re-fetched or overwritten). Symbols are spread round-robin
-    over the backfill credentials; each task publishes certified symbols, a task manifest and ledger rows
-    before the next task starts, so an interruption loses at most the in-flight task.
+    partition (live archive output is never re-fetched or overwritten), plus repair symbols whose
+    basis-less COMPLETE row covers an adjusted panel day. The store is raw-basis only: a KIS fetch is kept
+    only when the panel shows no later corporate action; an adjusted symbol-day is replaced by Kiwoom raw
+    bars, and without a raw source it fails closed (a repair symbol's stored adjusted rows are removed).
+    Symbols are spread round-robin over the backfill credentials; each task publishes certified symbols,
+    a task manifest and ledger rows before the next task starts, so an interruption loses at most the
+    in-flight task.
 
     Args:
         as_of: KST run date (used for logging and run ids).
@@ -341,6 +391,8 @@ async def run_extended_session_backfill(
         store: Capture store for raw evidence and manifests.
         ledger: Durable per-symbol outcome ledger.
         tasks: Output of enumerate_extended_session_tasks.
+        price_reference: Panel adjustment state deciding whether a KIS historical fetch is raw.
+        raw_client: Kiwoom client supplying raw bars for adjusted NXT symbol-days; None fails them closed.
         now_fn: Aware clock; None uses Asia/Seoul now.
 
     Returns:
@@ -372,9 +424,20 @@ async def run_extended_session_backfill(
             started = clock()
             terminal = ledger.terminal_symbols(task.snapshot_date, task.session)
             stored = _stored_partition_symbols(task.snapshot_date, task.session)
-            pending = [symbol for symbol in task.symbols if symbol not in terminal and symbol not in stored]
+            repair_candidates = {
+                symbol
+                for symbol in ledger.unverified_complete_symbols(task.snapshot_date, task.session)
+                if symbol in task.symbols and price_reference.is_adjusted(task.snapshot_date, symbol)
+            }
+            pending = [
+                symbol
+                for symbol in task.symbols
+                if (symbol not in terminal and symbol not in stored) or symbol in repair_candidates
+            ]
+            repaired = sum(1 for symbol in pending if symbol in repair_candidates)
             run_id = f"extended-backfill-{task.snapshot_date}-{task.session}-{uuid.uuid4().hex[:8]}"
             collected: dict[str, tuple[pd.DataFrame, CoverageEntry]] = {}
+            symbol_routes: dict[str, tuple[Any, Any]] = {}
 
             async def _fetch_bucket(
                 client: Any, http_session: Any, symbols: list[str]
@@ -402,6 +465,9 @@ async def run_extended_session_backfill(
                 buckets: list[list[str]] = [[] for _ in clients]
                 for index, symbol in enumerate(pending):
                     buckets[index % len(clients)].append(symbol)
+                for client, http_session, bucket in zip(clients, http_sessions, buckets):
+                    for symbol in bucket:
+                        symbol_routes[symbol] = (client, http_session)
                 fetched = await asyncio.gather(
                     *(
                         _fetch_bucket(client, http_session, bucket)
@@ -411,7 +477,60 @@ async def run_extended_session_backfill(
                 )
                 for bucket_result in fetched:
                     collected.update(bucket_result)
+
+            def _basis_failed_entry(entry: CoverageEntry, reason: str, refs: tuple = ()) -> CoverageEntry:
+                return CoverageEntry(
+                    symbol=entry.symbol,
+                    dataset=entry.dataset,
+                    venue=entry.venue,
+                    session=entry.session,
+                    scheduled_at=entry.scheduled_at,
+                    status=CaptureStatus.FAILED,
+                    rows=0,
+                    first_event_time=None,
+                    last_event_time=None,
+                    reason=reason,
+                    raw_refs=tuple(entry.raw_refs) + tuple(refs),
+                )
+
+            raw_sem = asyncio.Semaphore(max(int(profile.COLLECTION_CONCURRENCY_PER_KEY), 1))
+            price_bases: dict[str, str] = {}
+
+            async def _raw_one(symbol: str) -> tuple[str, pd.DataFrame, CoverageEntry, str | None]:
+                frame, entry = collected[symbol]
+                if not price_reference.is_known(task.snapshot_date, symbol):
+                    return symbol, frame.iloc[0:0], _basis_failed_entry(entry, "price_basis_unknown"), None
+                if not price_reference.is_adjusted(task.snapshot_date, symbol):
+                    return symbol, frame, entry, "kis_raw"
+                if raw_client is None or task.session not in _RAW_SOURCE_SESSIONS:
+                    return symbol, frame.iloc[0:0], _basis_failed_entry(entry, "price_basis_no_raw_source"), None
+                _client, http_session = symbol_routes[symbol]
+                async with raw_sem:
+                    raw_frame, raw_entry = await backfill_kiwoom_raw_bars(
+                        raw_client, http_session, symbol, task.snapshot_date,
+                        session_tag=task.session, profile=profile, capture_store=store, run_id=run_id,
+                    )
+                if raw_entry.status == CaptureStatus.COMPLETE:
+                    return symbol, raw_frame, raw_entry, "kiwoom_raw"
+                return symbol, frame.iloc[0:0], _basis_failed_entry(
+                    entry, f"price_basis_{raw_entry.reason}", raw_entry.raw_refs
+                ), None
+
+            basis_targets = [
+                symbol
+                for symbol in pending
+                if symbol in collected
+                and collected[symbol][1].status == CaptureStatus.COMPLETE
+                and not collected[symbol][0].empty
+            ]
+            if basis_targets:
+                for symbol, frame, entry, basis in await asyncio.gather(*(_raw_one(s) for s in basis_targets)):
+                    collected[symbol] = (frame, entry)
+                    if basis is not None:
+                        price_bases[symbol] = basis
+            adjusted = sum(1 for basis in price_bases.values() if basis == "kiwoom_raw")
             entries = [collected[symbol][1] for symbol in pending]
+            basis_failed = sum(1 for entry in entries if str(entry.reason).startswith("price_basis_"))
             good = [entry for entry in entries if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES)]
             comp_chunks = [
                 (collected[str(entry.symbol)][0], entry)
@@ -428,6 +547,13 @@ async def run_extended_session_backfill(
                 write_intraday_partition(
                     chunk_frame, 1, task.snapshot_date, task.session, coverage=chunk_coverage
                 )
+            stale = {
+                symbol
+                for symbol in pending
+                if symbol in repair_candidates and collected[symbol][1].status != CaptureStatus.COMPLETE
+            }
+            if stale:
+                remove_intraday_symbols(1, task.snapshot_date, task.session, stale)
             manifest_status = (
                 CaptureStatus.COMPLETE
                 if all(entry.status in GOOD_ENTRY_STATES for entry in entries)
@@ -457,7 +583,12 @@ async def run_extended_session_backfill(
             store.publish_manifest(manifest)
             if entries:
                 ledger.record(
-                    task.snapshot_date, task.session, entries, run_id=run_id, attempted_at=clock()
+                    task.snapshot_date,
+                    task.session,
+                    entries,
+                    run_id=run_id,
+                    attempted_at=clock(),
+                    price_bases=price_bases,
                 )
             task_complete = sum(1 for entry in entries if entry.status == CaptureStatus.COMPLETE)
             task_no_trades = sum(1 for entry in entries if entry.status == CaptureStatus.NO_TRADES)
@@ -470,7 +601,7 @@ async def run_extended_session_backfill(
             done += 1
             elapsed = (clock() - started).total_seconds()
             logger.info(
-                "[DATA] stage=extended_backfill date=%s session=%s pending=%d complete=%d no_trades=%d not_listed=%d failed=%d elapsed_s=%.1f",
+                "[DATA] stage=extended_backfill date=%s session=%s pending=%d complete=%d no_trades=%d not_listed=%d failed=%d repaired=%d adjusted=%d basis_failed=%d elapsed_s=%.1f",
                 task.snapshot_date,
                 task.session,
                 len(pending),
@@ -478,6 +609,9 @@ async def run_extended_session_backfill(
                 task_no_trades,
                 task_not_listed,
                 task_failed,
+                repaired,
+                adjusted,
+                basis_failed,
                 elapsed,
             )
     return ExtendedBackfillSummary(
@@ -524,24 +658,18 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
     if stop_at <= now:
         stop_at += timedelta(days=1)
     slots = tuple(profile.COLLECTION_BACKFILL_SLOTS)
-    toss_enabled = bool(profile.COLLECTION_TOSS_BACKFILL_ENABLED)
-    if not slots and not toss_enabled:
+    if not slots:
         logger.info("[DATA] stage=extended_backfill status=SKIP reason=disabled")
         return
     env = dict(os.environ)
-    creds = resolve_research_credentials(env, slots=slots) if slots else []
-    if not creds and not toss_enabled:
+    creds = resolve_research_credentials(env, slots=slots)
+    if not creds:
         raise ValueError("backfill slots resolved to no credentials")
 
-    async def _run() -> tuple[ExtendedBackfillSummary | None, Any | None]:
+    async def _run() -> ExtendedBackfillSummary:
         from src.api.kis.client import KisApiClient, token_cache_path
 
         from src import settings as app_settings
-        from src.backfill.intraday.toss_overnight_backfill import (
-            enumerate_toss_overnight_tasks,
-            run_overnight_backfill_phases,
-        )
-        from src.config.market_session import KRX_AFTERMARKET_START_DATE, NXT_START_DATE
 
         clients = [
             KisApiClient(
@@ -557,11 +685,10 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
         ledger = ExtendedBackfillLedger()
         retention = int(profile.COLLECTION_KIS_MINUTE_RETENTION_DAYS)
         earliest = (as_of - timedelta(days=retention)).isoformat()
-        window_start = earliest
-        load_start = min(earliest, NXT_START_DATE) if toss_enabled else earliest
+        load_start = earliest
         price_history = pd.read_parquet(
             app_settings.PRICE_HISTORY_PARQUET_PATH,
-            columns=["date", "symbol", "close", "prev_close"],
+            columns=["date", "symbol", "close", "prev_close", "close_raw"],
         )
         window_days = _normalize_day_column(price_history["date"])
         price_history = price_history[
@@ -590,74 +717,39 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
             price_history=price_history,
             candidate_pairs=candidate_pairs,
         )
-        toss_tasks = (
-            enumerate_toss_overnight_tasks(
-                as_of=as_of,
-                kis_retention_days=retention,
-                nxt_start_date=NXT_START_DATE,
-                krx_aftermarket_start_date=KRX_AFTERMARKET_START_DATE,
-                min_change_ratio=float(profile.COLLECTION_BACKFILL_MIN_CHANGE_RATIO),
-                price_history=price_history,
-                candidate_pairs=candidate_pairs,
-            )
-            if toss_enabled
-            else []
-        )
-        toss = None
-        toss_http = None
         if clients:
             async with clients[0].create_session() as broker_session:
                 for client in clients:
                     await client.ensure_token(broker_session)
-        if toss_enabled:
-            import aiohttp
+        price_reference = PriceReference.from_price_history(price_history)
+        from src.api.kiwoom.client import KiwoomApiClient
 
-            from src.api.toss.client import TossApiClient
-
-            app_key = app_settings.TOSS_APP_KEY
-            app_secret = app_settings.TOSS_APP_SECRET
-            if not app_key or not app_secret:
-                raise ValueError("Toss credentials are not configured")
-            toss = TossApiClient(rate_overrides={"MARKET_DATA_CHART": float(profile.COLLECTION_TOSS_BACKFILL_RATE)})
-            toss_http = aiohttp.ClientSession()
-            try:
-                return await run_overnight_backfill_phases(
-                    as_of=as_of, stop_at=stop_at, profile=profile, kis_clients=clients, toss=toss, http_session=toss_http,
-                    store=store, ledger=ledger, kis_tasks=kis_tasks, toss_tasks=toss_tasks, window_start=window_start,
-                )
-            finally:
-                await toss_http.close()
-        return await run_overnight_backfill_phases(
-            as_of=as_of, stop_at=stop_at, profile=profile, kis_clients=clients, toss=toss, http_session=toss_http,
-            store=store, ledger=ledger, kis_tasks=kis_tasks, toss_tasks=toss_tasks, window_start=window_start,
+        raw_client = KiwoomApiClient() if app_settings.KIWOOM_APP_KEY else None
+        if raw_client is None:
+            logger.warning("[DATA] stage=extended_backfill kiwoom=unconfigured adjusted_days=fail_closed")
+        return await run_extended_session_backfill(
+            as_of=as_of,
+            stop_at=stop_at,
+            profile=profile,
+            clients=clients,
+            store=store,
+            ledger=ledger,
+            tasks=kis_tasks,
+            price_reference=price_reference,
+            raw_client=raw_client,
         )
 
-    kis_summary, toss_summary = asyncio.run(_run())
-    if kis_summary is not None:
-        logger.info(
-            "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d stopped_by_deadline=%s",
-            kis_summary.tasks_done,
-            kis_summary.tasks_remaining,
-            kis_summary.complete,
-            kis_summary.no_trades,
-            kis_summary.not_listed,
-            kis_summary.failed,
-            kis_summary.stopped_by_deadline,
-        )
-    if toss_summary is not None:
-        logger.info(
-            "[DATA] stage=toss_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d calls=%d stopped_reason=%s",
-            toss_summary.tasks_done,
-            toss_summary.tasks_remaining,
-            toss_summary.complete,
-            toss_summary.no_trades,
-            toss_summary.not_listed,
-            toss_summary.failed,
-            toss_summary.calls,
-            toss_summary.stopped_reason,
-        )
-        if toss_summary.stopped_reason in ("circuit_open", "calibration_failed"):
-            raise SystemExit(3)
+    kis_summary = asyncio.run(_run())
+    logger.info(
+        "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d stopped_by_deadline=%s",
+        kis_summary.tasks_done,
+        kis_summary.tasks_remaining,
+        kis_summary.complete,
+        kis_summary.no_trades,
+        kis_summary.not_listed,
+        kis_summary.failed,
+        kis_summary.stopped_by_deadline,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
