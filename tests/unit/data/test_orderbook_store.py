@@ -208,3 +208,67 @@ def test_build_orderbook_rows_works_with_only_output2() -> None:
     empty = build_orderbook_rows({"rt_cd": "0"}, "005930", "J", "decision", ts)
     assert empty == []
 
+
+
+def test_orderbook_partition_path_supports_named_sessions(tmp_path, monkeypatch) -> None:
+    """Session-specific partition path."""
+    from src.data import orderbook_store
+
+    monkeypatch.setattr(orderbook_store.settings, "HISTORY_DIR", tmp_path)
+
+    assert orderbook_store.orderbook_partition_path("2026-09-29") == tmp_path / "orderbook" / "2026-09" / "2026-09-29.parquet"
+    assert orderbook_store.orderbook_partition_path("2026-09-29", session="aftermarket") == (
+        tmp_path / "orderbook" / "aftermarket" / "2026-09" / "2026-09-29.parquet"
+    )
+
+
+def test_orderbook_partition_path_rejects_unsafe_sessions(tmp_path, monkeypatch) -> None:
+    """Unsafe session names never escape the orderbook tree."""
+    import pytest
+
+    from src.data import orderbook_store
+
+    monkeypatch.setattr(orderbook_store.settings, "HISTORY_DIR", tmp_path)
+
+    for bad in ("", "../escape", "a/b", ".."):
+        with pytest.raises(ValueError, match="orderbook session"):
+            orderbook_store.orderbook_partition_path("2026-09-29", session=bad)
+
+
+def test_append_orderbook_snapshots_supports_named_sessions(tmp_path, monkeypatch) -> None:
+    """Named sessions merge into their own partition without touching the regular one."""
+    from datetime import datetime
+
+    import pandas as pd
+
+    from src.data import orderbook_store
+
+    monkeypatch.setattr(orderbook_store.settings, "HISTORY_DIR", tmp_path)
+
+    rows = [{"capture_ts": datetime(2026, 9, 29, 17, 0), "symbol": "005930", "venue": "NXT", "capture_reason": "aftermarket-sparse"}]
+    assert orderbook_store.append_orderbook_snapshots(rows, "2026-09-29", session="aftermarket") == 1
+    assert not orderbook_store.orderbook_partition_path("2026-09-29").exists()
+    stored = pd.read_parquet(orderbook_store.orderbook_partition_path("2026-09-29", session="aftermarket"))
+    assert len(stored) == 1
+
+
+def test_build_orderbook_rows_carries_optional_timing_columns() -> None:
+    """Optional timing columns."""
+    from datetime import datetime
+
+    from src.data.orderbook_store import build_orderbook_rows
+
+    res = {"rt_cd": "0", "output1": {"aspr_acpt_hour": "170001"}}
+    capture_ts = datetime(2026, 9, 29, 17, 0, 1)
+    scheduled_at = datetime(2026, 9, 29, 17, 0, 0)
+    started = datetime(2026, 9, 29, 17, 0, 0, 500000)
+
+    timed = build_orderbook_rows(
+        res, "005930", "NXT", "aftermarket-dense", capture_ts, scheduled_at=scheduled_at, request_started_at=started
+    )
+    assert timed[0]["scheduled_at"] == scheduled_at
+    assert timed[0]["request_started_at"] == started
+
+    plain = build_orderbook_rows(res, "005930", "NXT", "aftermarket-dense", capture_ts)
+    assert "scheduled_at" not in plain[0]
+    assert "request_started_at" not in plain[0]

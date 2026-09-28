@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA aftermarket order-book capture (Mon-Fri 15:40:00 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 15:40:00 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kca-aftermarket-book.service
+
+[Install]
+WantedBy=timers.target

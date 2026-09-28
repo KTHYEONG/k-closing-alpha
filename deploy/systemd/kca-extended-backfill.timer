@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA nightly extended-session 1m backfill (daily 23:05 KST)
+
+[Timer]
+OnCalendar=*-*-* 23:05 Asia/Seoul
+AccuracySec=1min
+Persistent=false
+Unit=kca-extended-backfill.service
+
+[Install]
+WantedBy=timers.target

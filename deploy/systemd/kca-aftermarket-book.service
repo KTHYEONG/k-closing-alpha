@@ -1,0 +1,15 @@
+[Unit]
+Description=KCA aftermarket order-book capture (research, no orders)
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
+EnvironmentFile=%h/quant-secrets/kis-data.env
+Environment=TZ=Asia/Seoul
+Environment=KIS_DATA_ROLE=batch
+# 15:40 시작 → 20:20 하드 스톱 (정상 종료 ≈20:00)
+TimeoutStartSec=4h40min
+ExecStart=/usr/bin/docker run --rm --name kca-aftermarket-book --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=batch ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.aftermarket_book
+ExecStopPost=-/usr/bin/docker rm -f kca-aftermarket-book

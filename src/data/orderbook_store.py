@@ -43,8 +43,26 @@ def _coerce_value(key: str, value: Any) -> Any:
     return value
 
 
+def _require_session(value: str) -> str:
+    """Require a path-safe orderbook session name (regular or a dated venue session)."""
+    if not isinstance(value, str) or not value.strip() or value.strip() != value:
+        raise ValueError("orderbook session must be nonempty")
+    if "/" in value or "\\" in value or "\x00" in value:
+        raise ValueError("orderbook session must be path-safe")
+    if value in (".", "..") or ".." in value:
+        raise ValueError("orderbook session must be path-safe")
+    return value
+
+
 def build_orderbook_rows(
-    res: dict, symbol: str, venue: str, capture_reason: str, capture_ts: datetime
+    res: dict,
+    symbol: str,
+    venue: str,
+    capture_reason: str,
+    capture_ts: datetime,
+    *,
+    scheduled_at: datetime | None = None,
+    request_started_at: datetime | None = None,
 ) -> list[dict]:
     """벤더 output1+output2 페이로드를 키 그대로 복사한 단일 행으로 만든다."""
     if not isinstance(res, dict) or str(res.get("rt_cd", "")) != "0":
@@ -59,6 +77,10 @@ def build_orderbook_rows(
         "venue": str(venue),
         "capture_reason": str(capture_reason),
     }
+    if scheduled_at is not None:
+        row["scheduled_at"] = scheduled_at
+    if request_started_at is not None:
+        row["request_started_at"] = request_started_at
     if isinstance(output1, dict):
         for key, value in output1.items():
             row[str(key)] = _coerce_value(str(key), value)
@@ -68,17 +90,19 @@ def build_orderbook_rows(
     return [row]
 
 
-def orderbook_partition_path(snapshot_date: str) -> Path:
+def orderbook_partition_path(snapshot_date: str, session: str = "regular") -> Path:
     """data/history/orderbook/{YYYY-MM}/{YYYY-MM-DD}.parquet 경로 산출."""
     month = str(snapshot_date)[:7]
-    return Path(settings.HISTORY_DIR) / "orderbook" / month / f"{snapshot_date}.parquet"
+    if _require_session(session) == "regular":
+        return Path(settings.HISTORY_DIR) / "orderbook" / month / f"{snapshot_date}.parquet"
+    return Path(settings.HISTORY_DIR) / "orderbook" / session / month / f"{snapshot_date}.parquet"
 
 
-def append_orderbook_snapshots(rows: list[dict], snapshot_date: str) -> int:
+def append_orderbook_snapshots(rows: list[dict], snapshot_date: str, *, session: str = "regular") -> int:
     """호가 스냅샷 행을 일자 파티션에 병합 추가한다. 빈 입력은 0 반환 no-op."""
     if not rows:
         return 0
-    target = orderbook_partition_path(snapshot_date)
+    target = orderbook_partition_path(snapshot_date, session)
     new_df = pd.DataFrame(rows)
     existing = read_existing_parquet(target)
     if len(existing) == 0:

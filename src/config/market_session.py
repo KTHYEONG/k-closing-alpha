@@ -2,8 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
+
 KRX_CLOSE_MARKET_DIV_CODE: str = "J"
 NXT_MARKET_DIV_CODE: str = "NX"
+# endpoint→venue은 고정된 벤더 계약이다; 빈 env 기본값은 레거시 경로 제거 이후 모든 Kiwoom/LS 시도를 조용히 비인증 처리했다.
+VERIFIED_CHART_ROUTES: Mapping[str, str] = MappingProxyType(
+    {
+        "kiwoom:ka10079": "KRX",
+        "kiwoom:ka10079-nx": "NXT",
+        "kiwoom:ka10080": "NXT",
+        "ls:t8411": "KRX",
+        "ls:t8412": "KRX",
+    }
+)
 DECISION_WINDOW_START_HHMMSS: str = "152000"
 DECISION_WINDOW_END_HHMMSS: str = "153000"
 # 정수형 비교용 파생값 (문자열과 드리프트 방지)
@@ -28,6 +41,8 @@ KRX_REGULAR_HOUR_CEIL: str = "153000"
 KRX_AFTERMARKET_HOUR_FLOOR: str = "160000"
 KRX_AFTERMARKET_HOUR_CEIL: str = "200000"
 KRX_AFTERMARKET_START_DATE: str = "2026-09-14"
+# 2026-09-29 이후 세션부터 애프터마켓 틱 매니페스트가 완결성 조건에 필요하다(이전 날짜에는 존재한 적이 없음)
+AFTERMARKET_TICKS_START_DATE: str = "2026-09-29"
 # 정규장 분봉·틱은 15:30 종가 확정 후 정산되므로 15:40 이후에만 당일분으로 아카이브한다(kca-archive-intraday-regular.timer와 동일)
 ARCHIVE_REGULAR_READY_HHMMSS: str = "154000"
 # NXT/KRX 애프터마켓은 20:00 종료 후 20:05 이후에만 당일분으로 아카이브한다(kca-archive-intraday.timer와 동일)

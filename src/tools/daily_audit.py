@@ -24,6 +24,7 @@ from src.api.kis.key_pool import load_kis_env, read_token_issued_date, resolve_h
 from src.config.base import TOPK_DECISIONS_PARQUET_NAME
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
+    AFTERMARKET_TICKS_START_DATE,
     DECISION_WINDOW_END_HHMMSS,
     DECISION_WINDOW_START_HHMMSS,
     INTRADAY_SESSION_KRX_AFTERMARKET,
@@ -410,6 +411,25 @@ def _audit_slow_data(
     return ()
 
 
+def _audit_aftermarket_book(manifests: Sequence[CaptureManifest]) -> list[str]:
+    """Audit evening aftermarket order-book manifests for presence and entry completeness.
+
+    Args:
+        manifests: Verified manifests of the audited date.
+
+    Returns:
+        Issue strings ``collection:aftermarket_book:<count>:<reason>`` with reasons
+        missing (no aftermarket-book manifest) or incomplete (PARTIAL/FAILED entries).
+    """
+    terminal = [m for m in manifests if m.context.capture_reason == "aftermarket-book"]
+    if not terminal:
+        return [_collection_issue("aftermarket_book", 0, "missing")]
+    bad = sum(1 for m in terminal for e in m.entries if e.status in (CaptureStatus.PARTIAL, CaptureStatus.FAILED))
+    if bad:
+        return [_collection_issue("aftermarket_book", bad, "incomplete")]
+    return []
+
+
 def audit_collection_manifests(
     trading_date: date,
     *,
@@ -477,6 +497,8 @@ def audit_collection_manifests(
         issues.extend(_audit_auction_sweeps(manifests, expected, profile, session_clock, audit_at))
     else:
         issues.append(_collection_issue("auction", 0, "disabled"))
+    if profile.COLLECTION_AFTERMARKET_BOOK_ENABLED and session_clock == SessionClock.standard(trading_date):
+        issues.extend(_audit_aftermarket_book(manifests))
     if altdata_enabled:
         issues.extend(_audit_slow_data(manifests, trading_date, audit_at))
     else:
@@ -663,6 +685,117 @@ def audit_intraday_partitions(
                 INTRADAY_SESSION_KRX_AFTERMARKET, frames[INTRADAY_SESSION_KRX_AFTERMARKET], expected_krx_aftermarket_stamps(), regular_symbols
             )
         )
+    return tuple(issues)
+
+
+def audit_bar_value_consistency(
+    trading_date: date,
+    *,
+    sessions: Sequence[str],
+    read_partition: Callable[[str], pd.DataFrame | None] | None = None,
+) -> tuple[str, ...]:
+    """Audit stored 1m bars for traded-value consistency with their own volume and price range.
+
+    Grid audits prove bars exist; this proves their values are physically possible. LS rows are exempt
+    because LS reports its own per-bar value in million-KRW units with occasional vendor attribution
+    noise; every other vendor's value is produced by our normalizer and must satisfy the bound exactly.
+
+    Args:
+        trading_date: Audited KST date.
+        sessions: Session partitions to check.
+        read_partition: session -> frame with vendor, volume, value_krw, low, high (None when absent);
+            None reads parquet with column pruning.
+
+    Returns:
+        Issue strings `intraday:<session>:<count>:value_out_of_range` (count = violating rows); empty when clean.
+    """
+    day_str = trading_date.isoformat()
+
+    def _default_reader(session: str) -> pd.DataFrame | None:
+        path = intraday_partition_path(1, day_str, session)
+        if not path.exists():
+            return None
+        return pd.read_parquet(path, columns=["vendor", "volume", "value_krw", "low", "high"])
+
+    reader = read_partition if read_partition is not None else _default_reader
+    issues: list[str] = []
+    for session in sessions:
+        frame = reader(session)
+        if frame is None or len(frame) == 0:
+            continue
+        non_ls = frame["vendor"].astype(str) != "ls"
+        volume = pd.to_numeric(frame["volume"], errors="coerce")
+        value = pd.to_numeric(frame["value_krw"], errors="coerce")
+        low = pd.to_numeric(frame["low"], errors="coerce")
+        high = pd.to_numeric(frame["high"], errors="coerce")
+        bad = non_ls & (
+            ((volume == 0) & (value != 0))
+            | ((volume > 0) & ((value < low * volume) | (value > high * volume)))
+        )
+        count = int(bad.sum())
+        if count:
+            issues.append(_intraday_issue(session, count, "value_out_of_range"))
+    return tuple(issues)
+
+
+def audit_aftermarket_ticks(
+    trading_date: date,
+    *,
+    read_ticks: Callable[[str], pd.DataFrame | None] | None = None,
+    read_bars: Callable[[str], pd.DataFrame | None] | None = None,
+) -> tuple[str, ...]:
+    """Audit same-day aftermarket tick partitions against the stored 1m bars of the same session.
+
+    Ticks cannot be re-fetched after the day ends, so their absence or inconsistency must surface in the
+    same evening's digest. Volume is compared per symbol over the whole session window, which is
+    independent of the bar labelling convention.
+
+    Args:
+        trading_date: Audited KST date (checked only from AFTERMARKET_TICKS_START_DATE on STANDARD days).
+        read_ticks: session -> frame with symbol, ts_hms, volume (None when absent).
+        read_bars: session -> frame with symbol, volume (None when absent).
+
+    Returns:
+        Issues `intraday:<session>_ticks:<count>:<reason>` with reasons missing_partition (bars exist but no
+        tick partition) and volume_mismatch (symbols whose tick volume sum differs from bar volume sum).
+    """
+    day_str = trading_date.isoformat()
+    if day_str < AFTERMARKET_TICKS_START_DATE:
+        return ()
+
+    def _default_ticks(session: str) -> pd.DataFrame | None:
+        path = tick_partition_path(day_str, session)
+        if not path.exists():
+            return None
+        return pd.read_parquet(path, columns=["symbol", "ts_hms", "volume"])
+
+    def _default_bars(session: str) -> pd.DataFrame | None:
+        path = intraday_partition_path(1, day_str, session)
+        if not path.exists():
+            return None
+        return pd.read_parquet(path, columns=["symbol", "volume"])
+
+    ticks_reader = read_ticks if read_ticks is not None else _default_ticks
+    bars_reader = read_bars if read_bars is not None else _default_bars
+    issues: list[str] = []
+    for session in (INTRADAY_SESSION_KRX_AFTERMARKET, INTRADAY_SESSION_NXT_AFTERMARKET):
+        bars = bars_reader(session)
+        ticks = ticks_reader(session)
+        if bars is None or len(bars) == 0:
+            continue
+        if ticks is None:
+            issues.append(f"intraday:{session}_ticks:1:missing_partition")
+            continue
+        bar_vol = pd.to_numeric(bars["volume"], errors="coerce").fillna(0)
+        tick_vol = pd.to_numeric(ticks["volume"], errors="coerce").fillna(0)
+        bar_sum = bar_vol.groupby(bars["symbol"].astype(str)).sum()
+        tick_sum = tick_vol.groupby(ticks["symbol"].astype(str)).sum()
+        mismatched = sum(
+            1 for symbol in set(bar_sum.index) | set(tick_sum.index)
+            if int(bar_sum.get(symbol, 0)) != int(tick_sum.get(symbol, 0))
+        )
+        if mismatched:
+            issues.append(f"intraday:{session}_ticks:{mismatched}:volume_mismatch")
     return tuple(issues)
 
 
@@ -961,6 +1094,14 @@ def run_daily_audit(
                 session_kind=session_day.kind,
                 cohort_symbols=tuple(cohort_symbols),
             )
+            value_sessions = [INTRADAY_SESSION_REGULAR, INTRADAY_SESSION_NXT_PREMARKET, INTRADAY_SESSION_NXT_AFTERMARKET]
+            if trading_date.isoformat() >= KRX_AFTERMARKET_START_DATE:
+                value_sessions.append(INTRADAY_SESSION_KRX_AFTERMARKET)
+            if session_day.kind is not SessionKind.STANDARD:
+                value_sessions = [INTRADAY_SESSION_REGULAR]
+            intraday_issues = (*intraday_issues, *audit_bar_value_consistency(trading_date, sessions=value_sessions))
+            if session_day.kind is SessionKind.STANDARD:
+                intraday_issues = (*intraday_issues, *audit_aftermarket_ticks(trading_date))
     except (OSError, ValueError) as exc:
         logger.warning("[DATA] stage=daily_audit collection_audit=UNAVAILABLE reason=%s", type(exc).__name__)
         collection_issues = (_collection_issue("audit", 1, "unavailable"),)
