@@ -85,6 +85,7 @@ RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
 #   KIS_DECISION_SHARD_SLOTS: 결정 역할 선두(1)로 시작해야 하며 15:20 벌크를 절반으로 줄인다.
 #   COLLECTION_RESEARCH_SLOTS: 샤드와 겹치면 안 되고(코드 검증), krx 스냅샷(2)과 경매 시각이 같아 2도 제외.
 #   COLLECTION_ALTDATA_EXTRA_SLOTS: 21:35에는 krx가 REST를 쓰지 않으므로 2·3을 빌려 3키로 분산한다.
+#   Toss 소급: krx·mt-etf와 키를 공유하므로 속도 상한(기본 12/s)으로 여유를 두고 23:05 야간 창에서 KIS 소급 뒤에 실행
 VPS_SELECTORS: tuple[tuple[str, str], ...] = (
     ("KIS_DECISION_SHARD_SLOTS", "1,5"),
     ("COLLECTION_AUCTION_ENABLED", "true"),
@@ -94,6 +95,7 @@ VPS_SELECTORS: tuple[tuple[str, str], ...] = (
     ("COLLECTION_BACKFILL_SLOTS", "2,3"),
     ("COLLECTION_AFTERMARKET_BOOK_ENABLED", "true"),
     ("COLLECTION_AFTERMARKET_BOOK_SLOTS", "2,3"),
+    ("COLLECTION_TOSS_BACKFILL_ENABLED", "true"),
 )
 
 # krx-alpha docker-compose의 KRX_ALPHA_SNAPSHOT_KIS_DATA_SLOT과 같아야 한다(장중 배타 슬롯).
