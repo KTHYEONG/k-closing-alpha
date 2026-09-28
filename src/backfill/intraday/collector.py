@@ -423,6 +423,12 @@ async def _kis_bar_attempt(
             status=CaptureStatus.FAILED, rows=0, reason=f"normalize:{_redacted_error(e)}", refs=refs,
         )
     if frame.empty:
+        if market_div_code == NXT_MARKET_DIV_CODE:
+            # 해당 일자에 NXT 봉이 없는 종목은 KIS가 직전 거래일 행을 돌려주고 영업일 게이트가 전부 걸러낸다
+            return _empty_bar_frame(snapshot_date), _terminal_entry(
+                symbol=code, dataset=dataset, venue=venue, session=session_tag,
+                status=CaptureStatus.NOT_APPLICABLE, rows=0, reason="nxt_empty", refs=refs,
+            )
         return _empty_bar_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
             status=CaptureStatus.UNKNOWN, rows=0, reason="empty_without_proof", refs=refs,

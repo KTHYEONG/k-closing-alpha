@@ -1701,3 +1701,25 @@ def test_extended_backfill_nx_traded_window_completes(tmp_path) -> None:
     assert entry.venue == "NXT"
     assert entry.session == "nxt_premarket"
     assert frame["value_krw"].tolist() == [10000]
+
+
+def test_nx_rows_from_other_business_date_are_not_applicable(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars
+
+    # KIS는 요청일에 NXT 체결이 없으면 직전 거래일 행을 돌려준다 -> 영업일 게이트 후 비어도 종료 상태여야 한다
+    stale = {**_kis_bar_row("175700"), "stck_bsop_date": "20260903"}
+    delivered = {}
+    asyncio.run(
+        collect_nxt_aftermarket_bars(
+            _KisBars([stale]), None, ["064400"], "2026-09-04", 1, kiwoom_client=None,
+            profile=_capture_profile(tmp_path), capture_store=_capture_store(tmp_path), run_id="r-nx-stale-date",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["064400"]
+    assert entry.status.value == "NOT_APPLICABLE"
+    assert entry.reason == "nxt_empty"
+    assert entry.raw_refs
+    assert frame.empty
