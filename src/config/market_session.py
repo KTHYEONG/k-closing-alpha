@@ -51,6 +51,8 @@ NXT_AFTERMARKET_HOUR_FLOOR: str = "154000"
 NXT_AFTERMARKET_HOUR_CEIL: str = "200000"
 NXT_PREMARKET_HOUR_FLOOR: str = "080000"
 NXT_PREMARKET_HOUR_CEIL: str = "085000"
+# NXT 개시일; 이전 날짜에는 NXT 봉이 존재하지 않는다.
+NXT_START_DATE: str = "2025-03-04"
 # 주문 결정 시각(결정창 시작, 룩어헤드 하한). 체결은 finalize_close 확정종가가 오라클이다.
 PAPER_ENTRY_HHMMSS: str = "152000"
 # D+1 청산은 모델 라벨(익일 시가)과 동일하게 KRX 시가단일가 체결가로 한다

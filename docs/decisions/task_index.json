@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "TOSS_NXT_OVERNIGHT_BACKFILL",
+      "date": "2026-09-28",
+      "adr_id": "ADR_20260928_TOSS_NXT_OVERNIGHT_BACKFILL",
+      "domain": "data",
+      "title": "Toss 기반 NXT 저녁·프리마켓 장기 소급 (KIS 창 이전 구간)",
+      "why": "KIS·Kiwoom은 NXT 과거를 약 1년만 보관해 NXT 개시(2025-03)부터 KIS 창 이전 약 143거래일이 복구 수단 없이 남아 있었다",
+      "resolution": "Toss 캔들을 (종목,진입일)당 2콜로 받아 무거래 분 제거·라벨 -1분 이동으로 정규화하고, KIS 소급 뒤 최신일부터 재개 가능하게 돌리며 저장 데이터 표본 교차검증을 통과해야만 쓰는 러너를 추가했다",
+      "impact": "야간 한 번(상한 약 2.6시간)에 NXT 시대 전체 저녁·프리마켓 분봉을 확보해 KIS 창이 매일 줄어도 손실이 없다",
+      "caveat": "Toss는 KRX+NXT 합산 시장이라 2026-09-14 이후 진입일은 거부하며, 2025-03 이후 Toss 정규장 소급의 NXT 혼입 여부는 별도 확인이 필요하다"
+    },
+    {
       "task_id": "AFTERMARKET_COLLECTION_EXPANSION",
       "date": "2026-09-28",
       "adr_id": "ADR_20260928_AFTERMARKET_COLLECTION_EXPANSION",
@@ -1019,16 +1030,6 @@
       "why": "collect.py가 5개 수동 HTS 조건검색식(대형급등/상한가 편향, 비용후 실측 열등)에 의존해 top-3 프로덕션 배선의 전제인 후보소싱 자동화가 필요했음",
       "resolution": "CANDIDATE_SOURCE_MODE 옵트인 플래그로 resolve_daily_candidates() 신설: automated시 HTS 조건검색 API 전혀 미호출, Stream C 랭킹스캔+apply_cost_aware_admission(등락률2~10%+틱비용≤7.5bp+상한가제외)로 대체; manual(기본값)은 기존 동작 byte-identical 보존; champion.py/predict.py 스코어링·사이징 무변경",
       "impact": "diff coverage 100%, 40/40 테스트 통과; 프로덕션 top-3 배선의 사전조건 완료, Phase 2(리랭커 번들 배포+사이징 통합)는 별도 probe 필요로 분리"
-    },
-    {
-      "task_id": "train_window_scope",
-      "date": "2026-09-09",
-      "adr_id": "ADR_20260909_train_window_scope",
-      "domain": "ml",
-      "title": "CPCV 인증구간 비닝 + 학습윈도우 명시화",
-      "why": "top-3 cost_aware 하네스 실행 시 FAIL(path_win 0.571) 발생, 원인이 학습윈도우가 아닌 CPCV path evidence의 개편전/후 풀링 버그로 판명",
-      "resolution": "split_regime_frames+cpcv_score_with_history 신설: CPCV 빈은 인증구간(2023-01-25~)에서만 구성, train_start는 학습행 증강 전용 노브; compute_path_evidence에 레짐경계 fail-closed 가드 및 폴드 스코어링 커버리지 게이트 추가, retrain.py --ranker-train-start 배선",
-      "impact": "실데이터 재실행 verdict FAIL->PASS_POST_REFORM, 28/28폴드 스코어(수정전 18/28), top-3 랭커 29.72bp t=4.81 DSR0.974 vs 컨트롤 19.02bp"
     }
   ]
 }

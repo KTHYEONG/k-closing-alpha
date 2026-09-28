@@ -354,3 +354,42 @@ def test_empty_stored_partition_does_not_block_fetch(env) -> None:
     kis = _FakeKis(day, traded=set())
     _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))])
     assert kis.requested == ["000001"]
+
+
+def test_universe_helper_preserves_kis_enumeration() -> None:
+    from src.backfill.intraday.extended_session_backfill import _entry_day_universes
+
+    ph = _ph([("2026-03-02", "000001", 103.0, 100.0), ("2026-03-03", "000002", 100.0, 100.0)])
+    calendar, universes = _entry_day_universes(ph, _pairs([("2026-03-03", "7")]), 0.02)
+    assert calendar == ["2026-03-02", "2026-03-03"]
+    assert universes == {"2026-03-02": {"000001"}, "2026-03-03": {"000007"}}
+    tasks = _by_key(_enum(ph, _pairs([("2026-03-03", "7")])))
+    assert tasks[("2026-03-02", "nxt_aftermarket")] == ("000001",)
+    assert tasks[("2026-03-03", "nxt_aftermarket")] == ("000007",)
+
+
+def test_legacy_ledger_without_vendor_still_works(tmp_path) -> None:
+    path = tmp_path / "ledger.parquet"
+    pd.DataFrame([{
+        "snapshot_date": "2026-03-02", "session": "nxt_aftermarket", "symbol": "000001", "status": "COMPLETE",
+        "rows": 1, "reason": "seed", "run_id": "old", "attempted_at": "2026-03-02T23:00:00+09:00",
+    }]).to_parquet(path, index=False)
+    ledger = ExtendedBackfillLedger(path)
+    ledger.record("2026-03-02", "nxt_aftermarket", [_entry("000002", CaptureStatus.COMPLETE)],
+                  run_id="new", attempted_at=datetime.now(SEOUL))
+    rows = pd.read_parquet(path)
+    assert set(rows["symbol"]) == {"000001", "000002"}
+    assert rows.set_index("symbol")["vendor"].to_dict() == {"000001": "kis", "000002": "kis"}
+    assert ledger.terminal_symbols("2026-03-02", "nxt_aftermarket") == frozenset({"000001", "000002"})
+
+
+def test_ledger_vendor_is_recorded_but_not_part_of_the_key(tmp_path) -> None:
+    ledger = ExtendedBackfillLedger(tmp_path / "ledger.parquet")
+    ledger.record("2026-03-02", "nxt_aftermarket", [_entry("000001", CaptureStatus.FAILED)],
+                  run_id="a", attempted_at=datetime.now(SEOUL))
+    assert ledger.terminal_symbols("2026-03-02", "nxt_aftermarket") == frozenset()
+    ledger.record("2026-03-02", "nxt_aftermarket", [_entry("000001", CaptureStatus.COMPLETE)],
+                  run_id="b", attempted_at=datetime.now(SEOUL), vendor="toss")
+    rows = pd.read_parquet(ledger.path)
+    assert len(rows) == 1 and rows.iloc[0]["vendor"] == "toss"
+    assert ledger.terminal_symbols("2026-03-02", "nxt_aftermarket") == frozenset({"000001"})

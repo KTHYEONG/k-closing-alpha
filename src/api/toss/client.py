@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
+from collections.abc import Mapping
 
 from src.api.kis.rate_limit import AsyncRateLimiter, get_shared_rate_limiter
 from src.config import settings
@@ -45,18 +47,46 @@ class TossResponseError(RuntimeError):
 
 
 class TossApiClient:
-    def __init__(self, app_key: str | None = None, app_secret: str | None = None, base_url: str | None = None) -> None:
+    def __init__(self, app_key: str | None = None, app_secret: str | None = None, base_url: str | None = None, *, rate_overrides: Mapping[str, float] | None = None) -> None:
+        """Create a Toss OpenAPI client.
+
+        Args:
+            app_key: OAuth client id; defaults to settings.
+            app_secret: OAuth client secret; defaults to settings.
+            base_url: API base URL; defaults to settings.
+            rate_overrides: Per-group request-rate caps below the documented limit. A long-running research job uses this to
+                leave headroom on a credential shared with other projects, whose limiters are independent processes.
+
+        Raises:
+            ValueError: An override names an unknown group, is not positive/finite, or exceeds the documented limit.
+        """
         self.app_key = app_key or settings.TOSS_APP_KEY
         self.app_secret = app_secret or settings.TOSS_APP_SECRET
         self.base_url = base_url or settings.TOSS_BASE_URL
         self.token: str | None = None
         self._token_lock: asyncio.Lock | None = None
+        self._rate_overrides: dict[str, float] = {}
+        if rate_overrides is not None:
+            for group, rate in dict(rate_overrides).items():
+                documented = TOSS_RATE_LIMIT_GROUPS.get(group)
+                if documented is None:
+                    raise ValueError(f"unknown Toss rate limit group: {group}")
+                try:
+                    value = float(rate)
+                except (TypeError, ValueError):
+                    raise ValueError(f"invalid rate override for {group}: {rate!r}") from None
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"invalid rate override for {group}: {rate!r}")
+                if value > documented:
+                    raise ValueError(f"rate override for {group} exceeds documented limit {documented}: {value}")
+                self._rate_overrides[group] = value
 
     def _limiter_for(self, group: str) -> AsyncRateLimiter:
         rate = TOSS_RATE_LIMIT_GROUPS.get(group)
         if rate is None:
             raise ValueError(f"unknown Toss rate limit group: {group}")
-        return get_shared_rate_limiter("toss", f"{self.app_key}:{group}", rate)
+        effective = self._rate_overrides.get(group, rate)
+        return get_shared_rate_limiter("toss", f"{self.app_key}:{group}:{effective}", effective)
 
     async def ensure_token(self, session) -> str:
         """OAuth2 client_credentials 토큰 발급 (단일비행, 메모리 캐시, 24h 유효)."""

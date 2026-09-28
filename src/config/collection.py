@@ -50,6 +50,15 @@ class CollectionSettings(EnvSettings):
         COLLECTION_AFTERMARKET_BOOK_DENSE_SECONDS: Dense aftermarket book spacing, default 60.
         COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES: Full-cohort sweep instants, default eleven evening times.
         COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS: Rounds buffered before a normalized flush, default 15.
+        COLLECTION_TOSS_BACKFILL_ENABLED: Enable the nightly Toss NXT overnight phase, default False.
+        COLLECTION_TOSS_BACKFILL_RATE: Requests/s cap for the Toss chart group, default 12.0.
+        COLLECTION_TOSS_BACKFILL_CONCURRENCY: Concurrent Toss pair fetches per chunk, default 6.
+        COLLECTION_TOSS_BACKFILL_MAX_DATES_PER_RUN: Entry days with pending work started per run, default 50.
+        COLLECTION_TOSS_BACKFILL_MAX_CONSECUTIVE_ERRORS: Consecutive failed symbols before the circuit opens, default 20.
+        COLLECTION_TOSS_CALIBRATION_DATES: Stored evening dates sampled by the calibration gate, default 6.
+        COLLECTION_TOSS_CALIBRATION_SYMBOLS_PER_DATE: Symbols sampled per calibration date, default 2.
+        COLLECTION_TOSS_CALIBRATION_MIN_TRADED_MINUTES: Minimum compared traded minutes for a verdict, default 200.
+        COLLECTION_TOSS_CALIBRATION_MIN_EXACT_RATIO: Minimum exact minute-match ratio for PASS, default 0.999.
 
     Raises:
         ValueError: Invalid limits, duplicate slots, or enabled auctions without
@@ -84,6 +93,15 @@ class CollectionSettings(EnvSettings):
         default=("154500", "160500", "163000", "170000", "173000", "180000", "183000", "190000", "193000", "195000", "195800")
     )
     COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS: int = Field(default=15, gt=0)
+    COLLECTION_TOSS_BACKFILL_ENABLED: bool = Field(default=False)
+    COLLECTION_TOSS_BACKFILL_RATE: float = Field(default=12.0, gt=0, allow_inf_nan=False)
+    COLLECTION_TOSS_BACKFILL_CONCURRENCY: int = Field(default=6, gt=0)
+    COLLECTION_TOSS_BACKFILL_MAX_DATES_PER_RUN: int = Field(default=50, gt=0)
+    COLLECTION_TOSS_BACKFILL_MAX_CONSECUTIVE_ERRORS: int = Field(default=20, gt=0)
+    COLLECTION_TOSS_CALIBRATION_DATES: int = Field(default=6, gt=0)
+    COLLECTION_TOSS_CALIBRATION_SYMBOLS_PER_DATE: int = Field(default=2, gt=0)
+    COLLECTION_TOSS_CALIBRATION_MIN_TRADED_MINUTES: int = Field(default=200, gt=0)
+    COLLECTION_TOSS_CALIBRATION_MIN_EXACT_RATIO: float = Field(default=0.999, gt=0, le=1, allow_inf_nan=False)
 
     @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", "COLLECTION_BACKFILL_SLOTS", "COLLECTION_AFTERMARKET_BOOK_SLOTS", mode="before")
     @classmethod

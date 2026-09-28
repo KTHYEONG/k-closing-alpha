@@ -253,3 +253,41 @@ def test_toss_client_explicit_credentials_win_over_instance(monkeypatch) -> None
     assert TossApiClient().base_url == "https://toss.example"
     assert TossApiClient(app_key="arg").app_key == "arg"
     assert TossApiClient(base_url="https://arg.example").base_url == "https://arg.example"
+
+
+def test_toss_client_rate_override_lowers_the_group_rate() -> None:
+    from src.api.toss.client import TossApiClient
+
+    capped = TossApiClient(app_key="k", app_secret="s", rate_overrides={"MARKET_DATA_CHART": 12.0})
+    default = TossApiClient(app_key="k", app_secret="s")
+    assert capped._limiter_for("MARKET_DATA_CHART").max_rate == 12.0
+    assert default._limiter_for("MARKET_DATA_CHART").max_rate == 20.0
+    assert capped._limiter_for("MARKET_DATA_CHART") is not default._limiter_for("MARKET_DATA_CHART")
+    assert capped._limiter_for("STOCK").max_rate == 5.0
+
+
+def test_toss_client_rate_override_cannot_exceed_documented_limit() -> None:
+    import pytest
+
+    from src.api.toss.client import TossApiClient
+
+    with pytest.raises(ValueError, match="exceeds documented limit"):
+        TossApiClient(app_key="k", app_secret="s", rate_overrides={"MARKET_DATA_CHART": 25.0})
+
+
+def test_toss_client_rate_override_rejects_unknown_group_and_bad_rates() -> None:
+    import pytest
+
+    from src.api.toss.client import TossApiClient
+
+    with pytest.raises(ValueError, match="unknown Toss rate limit group"):
+        TossApiClient(app_key="k", app_secret="s", rate_overrides={"NOPE": 5.0})
+    for bad in (0.0, -1.0, float("inf"), float("nan"), "fast"):
+        with pytest.raises(ValueError, match="invalid rate override"):
+            TossApiClient(app_key="k", app_secret="s", rate_overrides={"MARKET_DATA_CHART": bad})  # type: ignore[dict-item]
+
+
+def test_toss_client_without_override_keeps_documented_rate() -> None:
+    from src.api.toss.client import TossApiClient
+
+    assert TossApiClient(app_key="k", app_secret="s", rate_overrides=None)._limiter_for("MARKET_DATA_CHART").max_rate == 20.0
