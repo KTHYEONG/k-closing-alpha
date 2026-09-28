@@ -8,12 +8,15 @@ import re
 import uuid
 from collections.abc import Mapping
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
+    INTRADAY_SESSION_KRX_AFTERMARKET,
+    INTRADAY_SESSION_NXT_AFTERMARKET,
+    INTRADAY_SESSION_NXT_PREMARKET,
     INTRADAY_SESSION_REGULAR,
     KRX_AFTERMARKET_HOUR_CEIL,
     KRX_AFTERMARKET_HOUR_FLOOR,
@@ -46,7 +49,7 @@ from src.data.intraday_schema import normalize_bar_frame, normalize_tick_frame
 
 logger = logging.getLogger(__name__)
 
-_EXHAUSTED_TERMINALS = frozenset({"exhausted", "crossed_target_date"})
+_EXHAUSTED_TERMINALS = frozenset({"exhausted", "crossed_target_date", "crossed_time_floor"})
 _NONCERTIFIED = frozenset({CaptureStatus.PARTIAL, CaptureStatus.FAILED, CaptureStatus.UNKNOWN})
 _ERROR_RE = re.compile(r"[^A-Za-z0-9_]+")
 
@@ -129,6 +132,8 @@ def _venue_for(*, vendor: str, endpoint: str, market_div_code: str | None, profi
         return str(mapped)
     if vendor == "kis" and market_div_code == KRX_CLOSE_MARKET_DIV_CODE:
         return "KRX"
+    if vendor == "kis" and market_div_code == NXT_MARKET_DIV_CODE:
+        return "NXT"
     return "UNKNOWN"
 
 
@@ -401,6 +406,11 @@ async def _kis_bar_attempt(
                                frame=_canonical_kis_bars(other, snapshot_date, code), reason="out_of_window")
         refs.append(frag)
     if not regular:
+        if market_div_code == NXT_MARKET_DIV_CODE:
+            return _empty_bar_frame(snapshot_date), _terminal_entry(
+                symbol=code, dataset=dataset, venue=venue, session=session_tag,
+                status=CaptureStatus.NOT_APPLICABLE, rows=0, reason="nxt_empty", refs=refs,
+            )
         return _empty_bar_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
             status=CaptureStatus.UNKNOWN, rows=0, reason="empty_without_proof", refs=refs,
@@ -416,6 +426,18 @@ async def _kis_bar_attempt(
         return _empty_bar_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
             status=CaptureStatus.UNKNOWN, rows=0, reason="empty_without_proof", refs=refs,
+        )
+    if (
+        market_div_code == NXT_MARKET_DIV_CODE
+        and not frame.empty
+        and "close" in frame.columns
+        and "volume" in frame.columns
+        and bool((frame["close"].fillna(0) == 0).all())
+        and bool((frame["volume"].fillna(0) == 0).all())
+    ):
+        return _empty_bar_frame(snapshot_date), _terminal_entry(
+            symbol=code, dataset=dataset, venue="NXT", session=session_tag,
+            status=CaptureStatus.NOT_APPLICABLE, rows=0, reason="nxt_not_listed", refs=refs,
         )
     if venue == "UNKNOWN":
         frag = _stage_fragment(store, run_id=run_id, trading_day=trading_day, dataset=dataset,
@@ -614,12 +636,14 @@ async def _tick_source_attempt(
     profile: CollectionSettings,
     attempt: int,
     refs: list[Any],
+    session_tag: str = INTRADAY_SESSION_REGULAR,
+    allow_no_trades: bool = False,
 ) -> tuple[pd.DataFrame, CoverageEntry] | None:
     dataset = CaptureDataset.TRADE_TICKS
     venue = _venue_for(vendor=vendor, endpoint=endpoint, market_div_code=market_div_code, profile=profile)
     if not isinstance(payload, dict) or payload.get("rt_cd") != "0":
         return _empty_tick_frame(snapshot_date), _terminal_entry(
-            symbol=code, dataset=dataset, venue=venue, session=INTRADAY_SESSION_REGULAR,
+            symbol=code, dataset=dataset, venue=venue, session=session_tag,
             status=CaptureStatus.FAILED, rows=0, reason="vendor_failure", refs=refs,
         )
     terminal = str(payload.get("termination_reason", "") or "exhausted")
@@ -628,14 +652,14 @@ async def _tick_source_attempt(
     regular, other = _split_session_window(rows, ymd, floor, ceil, vendor)
     if other:
         frag = _stage_fragment(store, run_id=run_id, trading_day=trading_day, dataset=dataset,
-                               symbol=code, session=INTRADAY_SESSION_REGULAR,
+                               symbol=code, session=session_tag,
                                frame=_safe_normalize_ticks(vendor, other, snapshot_date, code, truncated),
                                reason="out_of_window")
         refs.append(frag)
     if truncated:
         if regular:
             frag = _stage_fragment(store, run_id=run_id, trading_day=trading_day, dataset=dataset,
-                                   symbol=code, session=INTRADAY_SESSION_REGULAR,
+                                   symbol=code, session=session_tag,
                                    frame=_safe_normalize_ticks(vendor, regular, snapshot_date, code, truncated),
                                    reason="truncated_partial")
             refs.append(frag)
@@ -643,22 +667,27 @@ async def _tick_source_attempt(
     if terminal not in _EXHAUSTED_TERMINALS or venue == "UNKNOWN":
         if regular:
             frag = _stage_fragment(store, run_id=run_id, trading_day=trading_day, dataset=dataset,
-                                   symbol=code, session=INTRADAY_SESSION_REGULAR,
+                                   symbol=code, session=session_tag,
                                    frame=_safe_normalize_ticks(vendor, regular, snapshot_date, code, truncated),
                                    reason=f"uncertified:{terminal}")
             refs.append(frag)
         return _empty_tick_frame(snapshot_date), _terminal_entry(
-            symbol=code, dataset=dataset, venue=venue, session=INTRADAY_SESSION_REGULAR,
+            symbol=code, dataset=dataset, venue=venue, session=session_tag,
             status=CaptureStatus.UNKNOWN, rows=0, reason=f"uncertified:{terminal}", refs=refs,
         )
     frame = _safe_normalize_ticks(vendor, regular, snapshot_date, code, truncated)
     if frame.empty:
+        if allow_no_trades and venue != "UNKNOWN" and not regular and len(refs) > 0:
+            return _empty_tick_frame(snapshot_date), _terminal_entry(
+                symbol=code, dataset=dataset, venue=venue, session=session_tag,
+                status=CaptureStatus.NO_TRADES, rows=0, reason="no_trades_in_window", refs=refs,
+            )
         return _empty_tick_frame(snapshot_date), _terminal_entry(
-            symbol=code, dataset=dataset, venue=venue, session=INTRADAY_SESSION_REGULAR,
+            symbol=code, dataset=dataset, venue=venue, session=session_tag,
             status=CaptureStatus.UNKNOWN, rows=0, reason="empty_without_proof", refs=refs,
         )
     return frame, _terminal_entry(
-        symbol=code, dataset=dataset, venue=venue, session=INTRADAY_SESSION_REGULAR,
+        symbol=code, dataset=dataset, venue=venue, session=session_tag,
         status=CaptureStatus.COMPLETE, rows=len(frame), reason=f"{terminal}:regular={len(regular)}", refs=refs,
     )
 
@@ -1129,6 +1158,131 @@ async def collect_intraday_trade_ticks(client: Any, session: Any, stock_codes: l
     )
 
 
+async def collect_aftermarket_trade_ticks(
+    kiwoom_client: Any | None,
+    session: Any,
+    stock_codes: list[str],
+    snapshot_date: str,
+    *,
+    venue: Literal["KRX", "NXT"],
+    profile: CollectionSettings | None = None,
+    capture_store: CaptureStore | None = None,
+    run_id: str | None = None,
+    on_symbol: SymbolObserver | None = None,
+) -> pd.DataFrame:
+    """Collect today's aftermarket trade ticks for one venue through Kiwoom ka10079.
+
+    KRX aftermarket runs 16:00-20:00 and NXT aftermarket 15:40-20:00 on separate order books; each tape is
+    fetched and certified separately (plain code vs "_NX"). Pagination stops at the window floor, so the
+    regular session is never re-downloaded. The source serves the current day only, so a missed evening
+    is recorded explicitly rather than retried later.
+
+    Args:
+        kiwoom_client: Kiwoom client, or None when no Kiwoom key is configured.
+        session: Open HTTP session.
+        stock_codes: Symbols to fetch (KRX: archive cohort; NXT: NXT-listed subset).
+        snapshot_date: Must equal today's KST date.
+        venue: "KRX" or "NXT".
+        profile: Collection limits and routes.
+        capture_store: Raw evidence store.
+        run_id: Acquisition identity.
+        on_symbol: Per-symbol observer receiving (symbol, frame, entry).
+
+    Returns:
+        Concatenated canonical tick frame when on_symbol is None, else an empty canonical frame.
+
+    Raises:
+        ValueError: snapshot_date is not today (KST) or venue is unknown.
+    """
+    if venue not in ("KRX", "NXT"):
+        raise ValueError(f"unknown aftermarket tick venue: {venue!r}")
+    trading_day = _parse_snapshot_date(str(snapshot_date))
+    if str(snapshot_date) != _seoul_now().date().isoformat():
+        raise ValueError(f"aftermarket ticks are current-day only: {snapshot_date!r}")
+    prof = _resolve_profile(profile)
+    ymd = trading_day.isoformat().replace("-", "")
+    store = _resolve_store(capture_store, prof)
+    resolved_run = _new_run_id(run_id, str(snapshot_date), CaptureDataset.TRADE_TICKS)
+    codes = [str(item) for item in (stock_codes or [])]
+    if venue == "KRX":
+        session_tag = INTRADAY_SESSION_KRX_AFTERMARKET
+        floor, ceil, endpoint = KRX_AFTERMARKET_HOUR_FLOOR, KRX_AFTERMARKET_HOUR_CEIL, "ka10079"
+    else:
+        session_tag = INTRADAY_SESSION_NXT_AFTERMARKET
+        floor, ceil, endpoint = NXT_AFTERMARKET_HOUR_FLOOR, NXT_AFTERMARKET_HOUR_CEIL, "ka10079-nx"
+    resolved_venue = _venue_for(vendor="kiwoom", endpoint=endpoint, market_div_code=None, profile=prof)
+
+    async def _acquire(code: str) -> tuple[pd.DataFrame, CoverageEntry]:
+        refs: list[Any] = []
+        if kiwoom_client is None:
+            return _empty_tick_frame(str(snapshot_date)), _terminal_entry(
+                symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue="UNKNOWN",
+                session=session_tag, status=CaptureStatus.UNKNOWN, rows=0,
+                reason="kiwoom_unavailable", refs=refs,
+            )
+        context = _capture_context(
+            trading_day=trading_day, run_id=resolved_run, dataset=CaptureDataset.TRADE_TICKS,
+            vendor="kiwoom", endpoint=endpoint, symbol=code, venue=resolved_venue, session=session_tag,
+        )
+        try:
+            payload: Any = await kiwoom_client.get_tick_chart(
+                session, code, str(snapshot_date), max_pages=int(prof.COLLECTION_CHART_MAX_PAGES),
+                floor_hms=floor, venue=venue,
+                on_page=_observe_pages(store, context, refs, 0),
+            )
+        except Exception as e:
+            logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=transport:%s", code, _redacted_error(e))
+            return _empty_tick_frame(str(snapshot_date)), _terminal_entry(
+                symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=resolved_venue,
+                session=session_tag, status=CaptureStatus.FAILED, rows=0,
+                reason=f"transport:{_redacted_error(e)}", refs=refs,
+            )
+        outcome = await _tick_source_attempt(
+            vendor="kiwoom", endpoint=endpoint, payload=payload, code=code,
+            snapshot_date=str(snapshot_date), trading_day=trading_day, ymd=ymd,
+            floor=floor, ceil=ceil, market_div_code=None, store=store, run_id=resolved_run,
+            profile=prof, attempt=0, refs=refs, session_tag=session_tag, allow_no_trades=True,
+        )
+        if outcome is not None:
+            return outcome
+        try:
+            repair_payload: Any = await kiwoom_client.get_tick_chart(
+                session, code, str(snapshot_date), budget=_repair_budget(prof),
+                floor_hms=floor, venue=venue,
+                on_page=_observe_pages(store, context, refs, 1),
+            )
+        except Exception as e:
+            logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=repair:%s", code, _redacted_error(e))
+            return _empty_tick_frame(str(snapshot_date)), _terminal_entry(
+                symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=resolved_venue,
+                session=session_tag, status=CaptureStatus.FAILED, rows=0,
+                reason=f"transport:{_redacted_error(e)}", refs=refs,
+            )
+        outcome = await _tick_source_attempt(
+            vendor="kiwoom", endpoint=endpoint, payload=repair_payload, code=code,
+            snapshot_date=str(snapshot_date), trading_day=trading_day, ymd=ymd,
+            floor=floor, ceil=ceil, market_div_code=None, store=store, run_id=resolved_run,
+            profile=prof, attempt=1, refs=refs, session_tag=session_tag, allow_no_trades=True,
+        )
+        if outcome is not None:
+            return outcome
+        staged = _stage_fragment(store, run_id=resolved_run, trading_day=trading_day,
+                                 dataset=CaptureDataset.TRADE_TICKS, symbol=code, session=session_tag,
+                                 frame=_empty_tick_frame(str(snapshot_date)), reason="unrepaired")
+        refs.append(staged)
+        return _empty_tick_frame(str(snapshot_date)), _terminal_entry(
+            symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=resolved_venue,
+            session=session_tag, status=CaptureStatus.PARTIAL, rows=0,
+            reason="unrepaired", refs=refs,
+        )
+
+    return await _collect_with_observer(
+        codes=codes, snapshot_date=str(snapshot_date), dataset=CaptureDataset.TRADE_TICKS,
+        session_tag=session_tag, store=store, run_id=resolved_run,
+        acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
+    )
+
+
 async def backfill_regular_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
     """특정 과거 날짜(snapshot_date, 'YYYY-MM-DD')의 정규세션 1분봉을 FHKST03010230으로 소급 수집."""
     return await _collect_bars(
@@ -1209,4 +1363,81 @@ async def backfill_krx_aftermarket_bars(client, session, stock_codes: list[str],
         client, session, stock_codes, snapshot_date, bar_interval_minutes,
         KRX_AFTERMARKET_HOUR_CEIL, KRX_AFTERMARKET_HOUR_FLOOR, KRX_CLOSE_MARKET_DIV_CODE,
         historical=True,
+    )
+
+
+_EXTENDED_BACKFILL_WINDOWS: dict[str, tuple[str, str, str]] = {
+    INTRADAY_SESSION_NXT_AFTERMARKET: (NXT_AFTERMARKET_HOUR_FLOOR, NXT_AFTERMARKET_HOUR_CEIL, NXT_MARKET_DIV_CODE),
+    INTRADAY_SESSION_NXT_PREMARKET: (NXT_PREMARKET_HOUR_FLOOR, NXT_PREMARKET_HOUR_CEIL, NXT_MARKET_DIV_CODE),
+    INTRADAY_SESSION_KRX_AFTERMARKET: (KRX_AFTERMARKET_HOUR_FLOOR, KRX_AFTERMARKET_HOUR_CEIL, KRX_CLOSE_MARKET_DIV_CODE),
+}
+
+
+async def backfill_extended_session_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, *, session_tag: str, bar_interval_minutes: int = 1, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
+    """Backfill one past date's extended-session 1m bars through the certified KIS historical route.
+
+    Every response is retained as raw evidence and classified per symbol exactly like the live path
+    (_kis_bar_attempt): unlisted NXT symbols become NOT_APPLICABLE, traded windows COMPLETE. Historical
+    KIS rows exist only for traded minutes, so backfilled partitions are sparse grids.
+
+    Args:
+        client: KIS client bound to one backfill credential.
+        session: Open HTTP session of that client.
+        stock_codes: Symbols to request for this date/session.
+        snapshot_date: Past market date (YYYY-MM-DD); must be before today (KST).
+        session_tag: One of nxt_aftermarket, nxt_premarket, krx_aftermarket.
+        bar_interval_minutes: Bar interval.
+        profile: Collection limits and routes.
+        capture_store: Raw evidence store.
+        run_id: Acquisition identity (must be new per run).
+        on_symbol: Per-symbol observer receiving (symbol, frame, entry).
+
+    Returns:
+        Concatenated canonical frame when on_symbol is None, else an empty canonical frame.
+
+    Raises:
+        ValueError: Unknown session_tag, non-past snapshot_date, or krx_aftermarket before KRX_AFTERMARKET_START_DATE.
+    """
+    if str(session_tag) not in _EXTENDED_BACKFILL_WINDOWS:
+        raise ValueError(f"Unknown session_tag: {session_tag!r}")
+    if int(bar_interval_minutes) <= 0:
+        raise ValueError(f"Invalid bar_interval_minutes: {bar_interval_minutes!r}")
+    if not _is_past_date(str(snapshot_date)):
+        raise ValueError(f"snapshot_date must be a past date: {snapshot_date!r}")
+    if str(session_tag) == INTRADAY_SESSION_KRX_AFTERMARKET and str(snapshot_date) < KRX_AFTERMARKET_START_DATE:
+        raise ValueError(f"krx_aftermarket starts at {KRX_AFTERMARKET_START_DATE}: {snapshot_date!r}")
+    prof = _resolve_profile(profile)
+    trading_day = _parse_snapshot_date(str(snapshot_date))
+    ymd = trading_day.isoformat().replace("-", "")
+    store = _resolve_store(capture_store, prof)
+    resolved_run = _new_run_id(run_id, str(snapshot_date), CaptureDataset.MINUTE_BARS)
+    floor, ceil, market_div_code = _EXTENDED_BACKFILL_WINDOWS[str(session_tag)]
+    codes = [str(item) for item in (stock_codes or [])]
+
+    async def _acquire(code: str) -> tuple[pd.DataFrame, CoverageEntry]:
+        frame, entry = await _kis_bar_attempt(
+            client=client, session=session, code=code, snapshot_date=str(snapshot_date),
+            trading_day=trading_day, ymd=ymd, bar_interval_minutes=int(bar_interval_minutes),
+            floor=floor, ceil=ceil, market_div_code=market_div_code, session_tag=str(session_tag),
+            dataset=CaptureDataset.MINUTE_BARS, store=store, run_id=resolved_run,
+            profile=prof, attempt=0,
+        )
+        if (
+            market_div_code == KRX_CLOSE_MARKET_DIV_CODE
+            and entry.status == CaptureStatus.UNKNOWN
+            and entry.reason == "empty_without_proof"
+            and len(entry.raw_refs) > 0
+        ):
+            entry = CoverageEntry(
+                symbol=entry.symbol, dataset=entry.dataset, venue=entry.venue, session=entry.session,
+                scheduled_at=entry.scheduled_at, status=CaptureStatus.NO_TRADES, rows=0,
+                first_event_time=entry.first_event_time, last_event_time=entry.last_event_time,
+                reason="krx_after_no_trades", raw_refs=entry.raw_refs,
+            )
+        return frame, entry
+
+    return await _collect_with_observer(
+        codes=codes, snapshot_date=str(snapshot_date), dataset=CaptureDataset.MINUTE_BARS,
+        session_tag=str(session_tag), store=store, run_id=resolved_run,
+        acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
     )

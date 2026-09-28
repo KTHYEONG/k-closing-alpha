@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "AFTERMARKET_COLLECTION_EXPANSION",
+      "date": "2026-09-28",
+      "adr_id": "ADR_20260928_AFTERMARKET_COLLECTION_EXPANSION",
+      "domain": "data",
+      "title": "애프터마켓 수집 확장: 시장 인증 복구·봉 거래대금 무결성·야간 소급·애프터 틱/호가",
+      "why": "리팩토링(92df100)으로 운영 venue 인증 설정이 비어 Kiwoom/LS 수집이 전부 거부되었고, KIS 누적 거래대금 차분이 봉 단위로 어긋났으며, 틱·호가는 당일 지나면 복구 불가·NXT 과거 분봉은 KIS에서 매일 소실되었다",
+      "resolution": "코드 기본 venue 라우트와 NXT 비상장 분류, 봉 VWAP 범위 규칙+저장 파티션 복구 도구, 야간 NXT/KRX 애프터 분봉 소급(원장·재개), 20:05 단계 KRX/NXT 애프터 틱, rank pool 60초·코호트 희소 애프터 호가 잡을 추가했다",
+      "impact": "저녁 청산 비용·경로 백테스트 데이터가 영구 손실 전에 확보되고 gdrive 객체 수 증가 없이 기존 백업에 자동 연동된다",
+      "caveat": "Kiwoom 틱은 당일 전용이라 배포 당일 24시 전 재수집이 필요하고 NX 호가 첫 응답이 비면 비상장으로 간주해 개장 직후 상장주를 놓칠 수 있다"
+    },
+    {
       "task_id": "TASK_OPS_HARDENING",
       "date": "2026-09-27",
       "adr_id": "ADR_20260927_OPS_HARDENING",
@@ -1018,16 +1029,6 @@
       "why": "top-3 cost_aware 하네스 실행 시 FAIL(path_win 0.571) 발생, 원인이 학습윈도우가 아닌 CPCV path evidence의 개편전/후 풀링 버그로 판명",
       "resolution": "split_regime_frames+cpcv_score_with_history 신설: CPCV 빈은 인증구간(2023-01-25~)에서만 구성, train_start는 학습행 증강 전용 노브; compute_path_evidence에 레짐경계 fail-closed 가드 및 폴드 스코어링 커버리지 게이트 추가, retrain.py --ranker-train-start 배선",
       "impact": "실데이터 재실행 verdict FAIL->PASS_POST_REFORM, 28/28폴드 스코어(수정전 18/28), top-3 랭커 29.72bp t=4.81 DSR0.974 vs 컨트롤 19.02bp"
-    },
-    {
-      "task_id": "topk_costaware_ml_harness",
-      "date": "2026-09-09",
-      "adr_id": "ADR_20260909_topk_costaware_ml_harness",
-      "domain": "ml",
-      "title": "Top-K Cost-Aware Ranker Research Harness",
-      "why": "리랭커가 top-1·journaled 후보로만 학습되어 top-3+비용인지 파이프라인 부재 한계 확인됨",
-      "resolution": "src/ml/topk_ranker_research.py 신설: DEFAULT_UNIVERSE 학습/COST_AWARE_UNIVERSE 선택 이중풀 + PIT tick_cost_bp 라벨 + CPCV(8,2) fold별 top-k, retrain.py --ranker-topk-research 배선",
-      "impact": "post-reform 878일 top-3 리랭커 29.72bp t=4.81 DSR0.974 vs 모델프리 비용정렬 18.75bp t=3.08, CPCV 경로승률 25/28=0.893(K=1은 0.464)"
     }
   ]
 }

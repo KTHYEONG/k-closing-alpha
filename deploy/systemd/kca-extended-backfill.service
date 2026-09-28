@@ -1,0 +1,15 @@
+[Unit]
+Description=KCA nightly extended-session 1m backfill (research, no orders)
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
+EnvironmentFile=%h/quant-secrets/kis-data.env
+Environment=TZ=Asia/Seoul
+Environment=KIS_DATA_ROLE=batch
+# 야간 소급은 23:05~06:50 창 안에서만 돌고 07:05 토큰 워밍업과 겹치지 않는다 → 최대 8시간
+TimeoutStartSec=8h
+ExecStart=/usr/bin/docker run --rm --name kca-extended-backfill --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=batch ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.backfill.intraday.extended_session_backfill
+ExecStopPost=-/usr/bin/docker rm -f kca-extended-backfill

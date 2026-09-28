@@ -17,6 +17,7 @@ from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.api.kiwoom.client import KiwoomApiClient
 from src.api.ls.client import LsApiClient
 from src.backfill.intraday.collector import (
+    collect_aftermarket_trade_ticks,
     collect_intraday_bars,
     collect_intraday_trade_ticks,
     collect_krx_aftermarket_bars,
@@ -25,6 +26,7 @@ from src.backfill.intraday.collector import (
 )
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
+    AFTERMARKET_TICKS_START_DATE,
     ARCHIVE_AFTERMARKET_READY_HHMMSS,
     ARCHIVE_REGULAR_READY_HHMMSS,
     DEFAULT_BAR_INTERVAL_MINUTES,
@@ -102,7 +104,8 @@ def archive_phase_complete(store: CaptureStore, target_date: str, phase: str) ->
         target_date: ISO date.
         phase: "regular" (regular MINUTE_BARS + TRADE_TICKS) or "aftermarket"
             (nxt_premarket, nxt_aftermarket and, from KRX_AFTERMARKET_START_DATE,
-            krx_aftermarket MINUTE_BARS); "all" requires both.
+            krx_aftermarket MINUTE_BARS, plus, from AFTERMARKET_TICKS_START_DATE,
+            krx_aftermarket and nxt_aftermarket TRADE_TICKS); "all" requires both.
 
     Returns:
         True only if, for each required (dataset, session), the latest
@@ -122,6 +125,9 @@ def archive_phase_complete(store: CaptureStore, target_date: str, phase: str) ->
         required.append((CaptureDataset.MINUTE_BARS, INTRADAY_SESSION_NXT_AFTERMARKET))
         if str(target_date) >= KRX_AFTERMARKET_START_DATE:
             required.append((CaptureDataset.MINUTE_BARS, INTRADAY_SESSION_KRX_AFTERMARKET))
+        if str(target_date) >= AFTERMARKET_TICKS_START_DATE:
+            required.append((CaptureDataset.TRADE_TICKS, INTRADAY_SESSION_KRX_AFTERMARKET))
+            required.append((CaptureDataset.TRADE_TICKS, INTRADAY_SESSION_NXT_AFTERMARKET))
     for dataset, session in required:
         candidates = [
             item
@@ -449,12 +455,28 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                 ),
                 batch_size,
             )
+            krx_after_ticks_publisher = _BatchedPartitionPublisher(
+                lambda df, coverage: write_tick_partition(
+                    df, str(snap_date), INTRADAY_SESSION_KRX_AFTERMARKET,
+                    coverage=coverage, batch_rows=batch_rows,
+                ),
+                batch_size,
+            )
+            nxt_after_ticks_publisher = _BatchedPartitionPublisher(
+                lambda df, coverage: write_tick_partition(
+                    df, str(snap_date), INTRADAY_SESSION_NXT_AFTERMARKET,
+                    coverage=coverage, batch_rows=batch_rows,
+                ),
+                batch_size,
+            )
             bar_entries: list[CoverageEntry] = []
             tick_entries: list[CoverageEntry] = []
             nxt_after_entries: list[CoverageEntry] = []
             nxt_pre_entries: list[CoverageEntry] = []
             krx_after_entries: list[CoverageEntry] = []
-            counts = {"bars": 0, "nxt_after": 0, "nxt_pre": 0, "krx_after": 0, "ticks": 0}
+            krx_after_tick_entries: list[CoverageEntry] = []
+            nxt_after_tick_entries: list[CoverageEntry] = []
+            counts = {"bars": 0, "nxt_after": 0, "nxt_pre": 0, "krx_after": 0, "ticks": 0, "krx_after_ticks": 0, "nxt_after_ticks": 0}
 
             def publish_bars(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 bar_entries.append(entry)
@@ -490,6 +512,22 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                     krx_after_publisher.add(symbol, frame, entry)
                     counts["krx_after"] += len(frame)
 
+            def publish_krx_after_ticks(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
+                krx_after_tick_entries.append(entry)
+                if entry.status == CaptureStatus.COMPLETE and not frame.empty:
+                    krx_after_ticks_publisher.add(symbol, frame, entry)
+                    counts["krx_after_ticks"] += len(frame)
+                elif not frame.empty:
+                    store.publish_frame(frame, context=_fragment_context(trading_day, symbol, CaptureDataset.TRADE_TICKS, INTRADAY_SESSION_KRX_AFTERMARKET))
+
+            def publish_nxt_after_ticks(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
+                nxt_after_tick_entries.append(entry)
+                if entry.status == CaptureStatus.COMPLETE and not frame.empty:
+                    nxt_after_ticks_publisher.add(symbol, frame, entry)
+                    counts["nxt_after_ticks"] += len(frame)
+                elif not frame.empty:
+                    store.publish_frame(frame, context=_fragment_context(trading_day, symbol, CaptureDataset.TRADE_TICKS, INTRADAY_SESSION_NXT_AFTERMARKET))
+
             # 같은 날 재시도(수동 재실행 또는 실패 후 재기동)가 이전 시도의 불변 매니페스트와
             # 충돌하지 않도록 시도별 고유 접미사를 붙인다(실측: 2026-09-18 수동 재실행이
             # 고정 run_id 때문에 "conflicting immutable artifact identity"로 즉시 실패).
@@ -499,6 +537,8 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
             pre_run = f"archive-{snap_date}-nxt-premarket-{attempt}"
             krx_run = f"archive-{snap_date}-krx-aftermarket-{attempt}"
             ticks_run = f"archive-{snap_date}-regular-ticks-{attempt}"
+            krx_ticks_run = f"archive-{snap_date}-krx-aftermarket-ticks-{attempt}"
+            nxt_ticks_run = f"archive-{snap_date}-nxt-aftermarket-ticks-{attempt}"
             if do_regular:
                 await collect_intraday_bars(client, session, codes, str(snap_date), interval, ls_client=ls_client,
                                             profile=prof, capture_store=store, run_id=bars_run, on_symbol=publish_bars)
@@ -514,6 +554,15 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                                                    profile=prof, capture_store=store, run_id=krx_run, on_symbol=publish_krx_after)
                 krx_after_publisher.flush()
                 logger.info("[DATA] stage=krx_aftermarket date=%s rows=%d", snap_date, counts["krx_after"])
+                await collect_aftermarket_trade_ticks(kiwoom_client, session, codes, str(snap_date), venue="KRX",
+                                                      profile=prof, capture_store=store, run_id=krx_ticks_run, on_symbol=publish_krx_after_ticks)
+                krx_after_ticks_publisher.flush()
+                nxt_tick_codes = sorted({e.symbol for e in nxt_after_entries
+                                         if e.symbol and e.venue == "NXT" and e.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES)})
+                await collect_aftermarket_trade_ticks(kiwoom_client, session, nxt_tick_codes, str(snap_date), venue="NXT",
+                                                      profile=prof, capture_store=store, run_id=nxt_ticks_run, on_symbol=publish_nxt_after_ticks)
+                nxt_after_ticks_publisher.flush()
+                logger.info("[DATA] stage=aftermarket_ticks date=%s krx_rows=%d nxt_rows=%d nxt_symbols=%d", snap_date, counts["krx_after_ticks"], counts["nxt_after_ticks"], len(nxt_tick_codes))
             if do_regular:
                 await collect_intraday_trade_ticks(client, session, codes, str(snap_date), ls_client=ls_client,
                                                    kiwoom_client=kiwoom_client, profile=prof, capture_store=store,
@@ -533,6 +582,12 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                 _publish_task_manifest(store, trading_day=trading_day, run_id=krx_run,
                                        dataset=CaptureDataset.MINUTE_BARS, vendor="kis",
                                        session=INTRADAY_SESSION_KRX_AFTERMARKET, entries=krx_after_entries)
+                _publish_task_manifest(store, trading_day=trading_day, run_id=krx_ticks_run,
+                                       dataset=CaptureDataset.TRADE_TICKS, vendor="kiwoom",
+                                       session=INTRADAY_SESSION_KRX_AFTERMARKET, entries=krx_after_tick_entries)
+                _publish_task_manifest(store, trading_day=trading_day, run_id=nxt_ticks_run,
+                                       dataset=CaptureDataset.TRADE_TICKS, vendor="kiwoom",
+                                       session=INTRADAY_SESSION_NXT_AFTERMARKET, entries=nxt_after_tick_entries)
             if do_regular:
                 _publish_task_manifest(store, trading_day=trading_day, run_id=ticks_run,
                                        dataset=CaptureDataset.TRADE_TICKS, vendor="kis",
@@ -545,6 +600,8 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                 collected_entries.extend(nxt_after_entries)
                 collected_entries.extend(nxt_pre_entries)
                 collected_entries.extend(krx_after_entries)
+                collected_entries.extend(krx_after_tick_entries)
+                collected_entries.extend(nxt_after_tick_entries)
             incomplete = prev_incomplete or any(
                 item.status not in GOOD_ENTRY_STATES
                 for item in collected_entries
@@ -564,10 +621,9 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
     return (n_bars, n_nxt, n_ticks)
 
 
-def _fragment_context(trading_day: date, symbol: str, dataset: CaptureDataset) -> CaptureContext:
+def _fragment_context(trading_day: date, symbol: str, dataset: CaptureDataset, session: str = INTRADAY_SESSION_REGULAR) -> CaptureContext:
     import uuid
 
-    session = INTRADAY_SESSION_REGULAR
     return CaptureContext(
         trading_date=trading_day,
         run_id=f"archive-{trading_day.isoformat()}-fragments-{uuid.uuid4().hex[:6]}",

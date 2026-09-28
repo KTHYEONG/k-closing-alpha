@@ -870,3 +870,71 @@ def test_kiwoom_tick_fallback_budget_equals_chart_budget(monkeypatch) -> None:
 
     assert state["calls"] == 2
     assert res["termination_reason"] == "page_budget"
+
+
+def test_kiwoom_tick_venue_nxt_sends_nx_code() -> None:
+    import asyncio
+
+    client = _kiwoom_client()
+    seen: list[dict] = []
+
+    async def fake_post_tr(session, api_id, path, body, cont_yn="N", next_key="", max_retries=3):
+        seen.append(dict(body))
+        return ({"return_code": 0, "stk_tic_chart_qry": []}, {"cont-yn": "N", "next-key": ""})
+
+    client._post_tr = fake_post_tr
+    asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=2, venue="NXT"))
+    assert seen[0]["stk_cd"] == "005930_NX"
+
+    client2 = _kiwoom_client()
+    seen2: list[dict] = []
+
+    async def fake_post_tr2(session, api_id, path, body, cont_yn="N", next_key="", max_retries=3):
+        seen2.append(dict(body))
+        return ({"return_code": 0, "stk_tic_chart_qry": []}, {"cont-yn": "N", "next-key": ""})
+
+    client2._post_tr = fake_post_tr2
+    asyncio.run(client2.get_tick_chart(object(), "005930", "2026-09-04", max_pages=2, venue="KRX"))
+    assert seen2[0]["stk_cd"] == "005930"
+    assert seen2[0] == {"stk_cd": "005930", "tic_scope": "1", "upd_stkpc_tp": "1", "base_dt": "20260904"}
+
+
+def test_kiwoom_tick_floor_stops_pagination_without_truncation() -> None:
+    import asyncio
+
+    client = _kiwoom_client()
+    fake, state = _tick_pages(
+        [
+            _tick_page([{"cur_prc": "1", "trde_qty": "1", "cntr_tm": "20260904170000"}], "Y", "k1"),
+            _tick_page([{"cur_prc": "1", "trde_qty": "1", "cntr_tm": "20260904153023"}], "Y", "k2"),
+        ]
+    )
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=5, floor_hms="160000"))
+    assert state["calls"] == 2
+    assert res["termination_reason"] == "crossed_time_floor"
+    assert res["truncated"] is False
+
+
+def test_kiwoom_tick_floor_ignored_on_other_dates() -> None:
+    import asyncio
+
+    client = _kiwoom_client()
+    fake, _ = _tick_pages(
+        [_tick_page([{"cur_prc": "1", "trde_qty": "1", "cntr_tm": "20260903153023"}], "Y", "k1")],
+    )
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=5, floor_hms="160000"))
+    assert res["termination_reason"] == "crossed_target_date"
+
+
+def test_kiwoom_tick_rejects_unknown_venue_and_malformed_floor() -> None:
+    import asyncio
+
+    import pytest
+
+    client = _kiwoom_client()
+    with pytest.raises(ValueError, match="venue"):
+        asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=1, venue="AL"))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="floor_hms"):
+        asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=1, floor_hms="1600"))

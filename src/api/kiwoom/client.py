@@ -7,7 +7,7 @@ import inspect
 import logging
 import re
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from zoneinfo import ZoneInfo
 
 from src.api.kis.rate_limit import AsyncRateLimiter, get_shared_rate_limiter
@@ -250,6 +250,8 @@ class KiwoomApiClient:
         *,
         budget: ChartBudget | None = None,
         on_page: PageObserver | None = None,
+        venue: Literal["KRX", "NXT"] = "KRX",
+        floor_hms: str | None = None,
     ) -> BrokerPayload:
         """Expose incomplete successful tick responses as bounded repairable tasks.
 
@@ -260,6 +262,11 @@ class KiwoomApiClient:
             max_pages: Compatible legacy page limit.
             budget: Page/deadline/timeout limits.
             on_page: Observer of unfiltered raw responses and continuation metadata.
+            venue: "KRX" sends the plain code (KRX tape); "NXT" sends "{code}_NX" (NXT tape). The two tapes are
+                distinct venues and must never be merged.
+            floor_hms: Optional HHMMSS lower bound. Pagination stops with termination "crossed_time_floor" once the
+                oldest row of a page is on the target date and earlier than floor_hms, proving the window above
+                the floor was fully traversed without paging through the regular session.
 
         Returns:
             Existing rt_cd/output2/vendor/truncated keys plus termination metadata.
@@ -269,6 +276,10 @@ class KiwoomApiClient:
             OSError: Mandatory capture fails.
         """
         ymd = _validate_target_ymd(target_date)
+        if venue not in ("KRX", "NXT"):
+            raise ValueError(f"unknown tick venue: {venue!r}")
+        if floor_hms is not None and (len(str(floor_hms)) != 6 or not str(floor_hms).isdigit()):
+            raise ValueError(f"invalid floor_hms: {floor_hms!r}")
         if max_pages is not None and budget is not None and int(max_pages) != int(budget.max_pages):
             raise ValueError("conflicting tick acquisition limits")
         if max_pages is not None and int(max_pages) <= 0:
@@ -289,6 +300,7 @@ class KiwoomApiClient:
         prev_identity: tuple[Any, ...] | None = None
         stalls = 0
         in_observer = False
+        request_code = str(code) if venue == "KRX" else f"{str(code).split('_')[0]}_NX"
         try:
             for page_index in range(max(1, int(page_budget))):
                 remaining = _deadline_remaining(deadline)
@@ -299,7 +311,7 @@ class KiwoomApiClient:
                 started = _now_seoul()
                 call = self._post_tr(
                     session, "ka10079", "/api/dostk/chart",
-                    {"stk_cd": str(code), "tic_scope": "1", "upd_stkpc_tp": "1", "base_dt": ymd},
+                    {"stk_cd": request_code, "tic_scope": "1", "upd_stkpc_tp": "1", "base_dt": ymd},
                     cont_yn=cont_yn, next_key=next_key,
                 )
                 if remaining is None:
@@ -347,6 +359,14 @@ class KiwoomApiClient:
                 oldest = str(rows[-1].get("cntr_tm", "") or "") if rows else ""
                 if _CNTR_TM_RE.fullmatch(oldest) and oldest[:8] < ymd:
                     termination = "crossed_target_date"
+                    break
+                if (
+                    floor_hms is not None
+                    and _CNTR_TM_RE.fullmatch(oldest)
+                    and oldest[:8] == ymd
+                    and oldest[8:14] < str(floor_hms)
+                ):
+                    termination = "crossed_time_floor"
                     break
                 cont_yn, next_key = header_cont, header_key
             else:

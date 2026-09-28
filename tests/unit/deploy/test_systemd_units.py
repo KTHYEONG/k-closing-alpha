@@ -31,6 +31,8 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
         "kca-altdata-capture.service",
         "kca-auction-close.service",
         "kca-auction-open.service",
+        "kca-extended-backfill.service",
+        "kca-aftermarket-book.service",
     }
 
     for svc in sorted(root.glob("kca-*.service")):
@@ -220,6 +222,8 @@ def test_containerized_units_use_shared_image_and_new_env_file() -> None:
         "kca-paper-exit.service",
         "kca-predict.service",
         "kca-price-ingest.service",
+        "kca-extended-backfill.service",
+        "kca-aftermarket-book.service",
     )
     for name in containerized:
         text = (root / name).read_text(encoding="utf-8")
@@ -305,6 +309,8 @@ def test_kis_cache_mounted_only_for_units_using_kis_client() -> None:
         "kca-paper-exit.service",
         "kca-predict.service",
         "kca-price-ingest.service",
+        "kca-extended-backfill.service",
+        "kca-aftermarket-book.service",
     )
     mount = "-v %h/.cache/kis:/app/.cache/kis"
     for name in needs_kis_cache:
@@ -330,6 +336,8 @@ def test_kis_using_containerized_units_forward_key_pool_env_and_cache() -> None:
         "kca-paper-exit.service",
         "kca-predict.service",
         "kca-price-ingest.service",
+        "kca-extended-backfill.service",
+        "kca-aftermarket-book.service",
     )
 
     for name in kis_units:
@@ -373,6 +381,8 @@ def test_containerized_units_preserve_data_and_artifacts_mounts() -> None:
         "kca-paper-exit.service",
         "kca-predict.service",
         "kca-price-ingest.service",
+        "kca-extended-backfill.service",
+        "kca-aftermarket-book.service",
     )
     for name in containerized:
         text = (root / name).read_text(encoding="utf-8")
@@ -407,6 +417,8 @@ def test_containerized_units_have_no_unmeasured_resource_caps() -> None:
         "kca-paper-exit.service",
         "kca-predict.service",
         "kca-price-ingest.service",
+        "kca-extended-backfill.service",
+        "kca-aftermarket-book.service",
     )
     for name in containerized:
         text = (root / name).read_text(encoding="utf-8")
@@ -854,6 +866,8 @@ def test_kis_cache_mount_follows_non_root_home() -> None:
         "kca-paper-exit.service",
         "kca-predict.service",
         "kca-price-ingest.service",
+        "kca-extended-backfill.service",
+        "kca-aftermarket-book.service",
     )
     for name in needs_kis_cache:
         text = (root / name).read_text(encoding="utf-8")
@@ -895,11 +909,14 @@ def _parse_systemd_duration(raw: str) -> int:
     value = raw.strip()
     if value.isdigit():
         return int(value)
-    match = re.fullmatch(r"(\d+)(h|min|s)", value)
-    if match is None:
+    if re.fullmatch(r"(?:\d+(?:h|min|s))+", value) is None:
         raise ValueError(f"non-finite or unsupported duration: {value!r}")
-    amount, unit = int(match.group(1)), match.group(2)
-    return amount * {"h": 3600, "min": 60, "s": 1}[unit]
+    total = 0
+    for amount, unit in re.findall(r"(\d+)(h|min|s)", value):
+        total += int(amount) * {"h": 3600, "min": 60, "s": 1}[unit]
+    if total <= 0:
+        raise ValueError(f"non-finite or unsupported duration: {value!r}")
+    return total
 
 
 def _service_timeout_seconds(root, name: str) -> int:
@@ -1016,6 +1033,8 @@ def test_budget_lines_are_commented() -> None:
         "kca-backup.service",
         "kca-backup-prune.service",
         "kca-core-snapshot.service",
+        "kca-extended-backfill.service",
+        "kca-aftermarket-book.service",
     )
     for name in budgeted:
         lines = (root / name).read_text(encoding="utf-8").splitlines()
@@ -1058,3 +1077,47 @@ def test_offsite_verify_timer_runs_after_core_snapshot() -> None:
 
     base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
     assert "kca-offsite-verify.timer" in (base / "install_systemd.sh").read_text(encoding="utf-8")
+
+
+def test_aftermarket_book_unit_is_bounded_alerting_and_ordered() -> None:
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+    root = base / "systemd"
+    service = (root / "kca-aftermarket-book.service").read_text(encoding="utf-8")
+    timer = (root / "kca-aftermarket-book.timer").read_text(encoding="utf-8")
+    install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
+
+    # Then: 장시간 저녁 수집에 맞는 상한, 실패 알림, 15:40 KST 1초 정밀 발화
+    assert "TimeoutStartSec=4h40min" in service.splitlines()
+    assert "OnFailure=kca-alert@%n.service" in service
+    assert "OnCalendar=Mon..Fri 15:40:00 Asia/Seoul" in timer.splitlines()
+    assert "AccuracySec=1s" in timer.splitlines()
+    assert "Persistent=false" in timer.splitlines()
+
+    # And: 감사·백업이 저녁 수집을 기다리고 설치 스크립트가 타이머를 활성화
+    for name in ("kca-daily-audit.service", "kca-backup.service"):
+        after_line = next(
+            line for line in (root / name).read_text(encoding="utf-8").splitlines() if line.startswith("After=")
+        )
+        assert "kca-aftermarket-book.service" in after_line, name
+    assert "kca-aftermarket-book.timer" in install_text
+
+
+def test_aftermarket_book_service_keeps_shared_container_contract() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    text = (root / "kca-aftermarket-book.service").read_text(encoding="utf-8")
+    exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
+
+    # Then: 공유 이미지·env 파일·KIS 캐시·데이터/아티팩트 마운트, 리소스 상한 없음
+    assert "ghcr.io/kthyeong/k-closing-alpha:latest" in exec_line
+    assert "--env-file %h/quant-secrets/k-closing-alpha.env" in exec_line
+    assert "--env-file %h/quant-secrets/kis-data.env" in exec_line
+    assert "-v %h/.cache/kis:/app/.cache/kis" in exec_line
+    assert "-v %h/k-closing-alpha/data:/app/data" in exec_line
+    assert "-v %h/k-closing-alpha/artifacts:/app/artifacts" in exec_line
+    assert "src.daily.aftermarket_book" in exec_line
+    assert "--memory=" not in text
+    assert "--cpus=" not in text
