@@ -750,3 +750,15 @@ def test_main_logs_final_summary(tmp_path: Path, monkeypatch: Any) -> None:
 
     monkeypatch.setattr(book, "_run_async", _empty)
     book.main(["--date", "2026-09-29"])
+
+
+def test_nxt_listing_requires_both_empty_acceptance_and_zero_price() -> None:
+    from src.daily.aftermarket_book import _is_nxt_listed
+
+    # 실측 비상장 응답: 접수시각·현재가 모두 비어 있음
+    assert _is_nxt_listed({"rt_cd": "0", "output1": {"aspr_acpt_hour": None}, "output2": {"stck_prpr": "0"}}) is False
+    assert _is_nxt_listed({"rt_cd": "0", "output1": None, "output2": None}) is False
+    # 개장 직후 호가가 잠시 비어도 직전가가 있으면 상장으로 유지
+    assert _is_nxt_listed({"rt_cd": "0", "output1": {"aspr_acpt_hour": ""}, "output2": {"stck_prpr": "8,390"}}) is True
+    assert _is_nxt_listed({"rt_cd": "0", "output1": {"aspr_acpt_hour": "154100"}, "output2": {"stck_prpr": "0"}}) is True
+    assert _is_nxt_listed({"rt_cd": "0", "output1": {"aspr_acpt_hour": None}, "output2": {"stck_prpr": "n/a"}}) is False
