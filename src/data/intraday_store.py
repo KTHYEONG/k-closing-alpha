@@ -22,7 +22,7 @@ from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_loc
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["intraday_partition_path", "log_session_coverage_outliers", "tick_partition_path", "write_intraday_partition", "write_tick_partition"]
+__all__ = ["intraday_partition_path", "log_session_coverage_outliers", "remove_intraday_symbols", "tick_partition_path", "write_intraday_partition", "write_tick_partition"]
 
 _LOCK_TIMEOUT_SECONDS = DEFAULT_LOCK_TIMEOUT_SECONDS
 
@@ -381,6 +381,28 @@ def _bounded_symbol_replace(
             if staging.exists():
                 staging.unlink()
         return before_count
+
+
+def remove_intraday_symbols(bar_interval_minutes: int, snapshot_date: str, session: str, symbols: set[str]) -> int:
+    """Drop every bar of the given symbols from one partition (backup retained like any replace).
+
+    Used when stored bars are known to be unusable (e.g. adjusted-basis backfill) and no certified
+    replacement exists, so the symbol reverts to "not stored" and is fetched again later.
+
+    Returns:
+        Rows remaining in the partition.
+
+    Raises:
+        OSError: Existing evidence or staging/publication fails.
+    """
+    target = intraday_partition_path(bar_interval_minutes, snapshot_date, session)
+    if not symbols or not target.exists():
+        return _partition_row_count(target)
+    empty = pd.DataFrame({c: pd.Series(dtype="object") for c in CANONICAL_BAR_COLUMNS})
+    return _bounded_symbol_replace(
+        target, empty, {str(s) for s in symbols}, _batch_rows_or_default(None), str(snapshot_date), str(session),
+        sort_output=True,
+    )
 
 
 def write_intraday_partition(
