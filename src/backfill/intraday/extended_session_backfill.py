@@ -59,6 +59,7 @@ _LEDGER_COLUMNS: tuple[str, ...] = (
     "reason",
     "run_id",
     "attempted_at",
+    "vendor",
 )
 _LEDGER_KEYS: tuple[str, ...] = ("snapshot_date", "session", "symbol")
 _TERMINAL_LEDGER_STATES: frozenset[str] = frozenset({"COMPLETE", "NO_TRADES", "NOT_APPLICABLE"})
@@ -80,6 +81,51 @@ class ExtendedBackfillTask:
 
 def _normalize_day_column(values: pd.Series) -> pd.Series:
     return pd.to_datetime(values, errors="coerce").dt.strftime("%Y-%m-%d")
+
+
+def _entry_day_universes(
+    price_history: pd.DataFrame,
+    candidate_pairs: pd.DataFrame,
+    min_change_ratio: float,
+) -> tuple[list[str], dict[str, set[str]]]:
+    """Return the ascending trading-day calendar and per-day screen/recorded universes."""
+    if price_history is None or len(price_history) == 0:
+        calendar: list[str] = []
+        screen: dict[str, set[str]] = {}
+    else:
+        dated = price_history.copy()
+        dated["_day"] = _normalize_day_column(dated["date"])
+        dated = dated[dated["_day"].notna()]
+        dated["_sym"] = dated["symbol"].astype(str).str.zfill(6)
+        close = pd.to_numeric(dated["close"], errors="coerce").to_numpy(dtype="float64")
+        prev = pd.to_numeric(dated["prev_close"], errors="coerce").to_numpy(dtype="float64")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = close / prev - 1.0
+        dated["_pass"] = (prev > 0) & np.isfinite(ratio) & (ratio >= float(min_change_ratio))
+        calendar = sorted(set(dated["_day"].astype(str).tolist()))
+        screen = (
+            dated.loc[dated["_pass"]]
+            .groupby("_day")["_sym"]
+            .agg(lambda items: set(str(item) for item in items.tolist()))
+            .to_dict()
+        )
+    recorded: dict[str, set[str]] = {}
+    if candidate_pairs is not None and len(candidate_pairs) > 0:
+        pairs = candidate_pairs.copy()
+        pairs["_day"] = _normalize_day_column(pairs["snapshot_date"])
+        pairs = pairs[pairs["_day"].notna()]
+        pairs["_sym"] = pairs["symbol"].astype(str).str.zfill(6)
+        recorded = (
+            pairs.groupby("_day")["_sym"]
+            .agg(lambda items: set(str(item) for item in items.tolist()))
+            .to_dict()
+        )
+    universes: dict[str, set[str]] = {}
+    for day in set(calendar) | set(recorded):
+        universe = set(screen.get(day, set())) | set(recorded.get(day, set()))
+        if universe:
+            universes[str(day)] = universe
+    return calendar, universes
 
 
 def enumerate_extended_session_tasks(
@@ -113,42 +159,12 @@ def enumerate_extended_session_tasks(
     def _in_bounds(day: str) -> bool:
         return earliest <= day < as_of_str
 
-    if price_history is None or len(price_history) == 0:
-        calendar: list[str] = []
-        screen: dict[str, set[str]] = {}
-    else:
-        dated = price_history.copy()
-        dated["_day"] = _normalize_day_column(dated["date"])
-        dated = dated[dated["_day"].notna()]
-        dated["_sym"] = dated["symbol"].astype(str).str.zfill(6)
-        close = pd.to_numeric(dated["close"], errors="coerce").to_numpy(dtype="float64")
-        prev = pd.to_numeric(dated["prev_close"], errors="coerce").to_numpy(dtype="float64")
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ratio = close / prev - 1.0
-        dated["_pass"] = (prev > 0) & np.isfinite(ratio) & (ratio >= float(min_change_ratio))
-        calendar = sorted(set(dated["_day"].astype(str).tolist()))
-        screen = (
-            dated.loc[dated["_pass"]]
-            .groupby("_day")["_sym"]
-            .agg(lambda items: set(str(item) for item in items.tolist()))
-            .to_dict()
-        )
-    recorded: dict[str, set[str]] = {}
-    if candidate_pairs is not None and len(candidate_pairs) > 0:
-        pairs = candidate_pairs.copy()
-        pairs["_day"] = _normalize_day_column(pairs["snapshot_date"])
-        pairs = pairs[pairs["_day"].notna()]
-        pairs["_sym"] = pairs["symbol"].astype(str).str.zfill(6)
-        recorded = (
-            pairs.groupby("_day")["_sym"]
-            .agg(lambda items: set(str(item) for item in items.tolist()))
-            .to_dict()
-        )
-    entry_days = sorted({day for day in list(calendar) + list(recorded) if _in_bounds(str(day))})
+    calendar, universes = _entry_day_universes(price_history, candidate_pairs, float(min_change_ratio))
+    entry_days = sorted(day for day in universes if _in_bounds(str(day)))
     cal_index = {day: pos for pos, day in enumerate(calendar)}
     merged: dict[tuple[str, str], set[str]] = {}
     for entry_day in entry_days:
-        universe = set(screen.get(entry_day, set())) | set(recorded.get(entry_day, set()))
+        universe = set(universes.get(entry_day, set()))
         if not universe:
             continue
         merged.setdefault((entry_day, INTRADAY_SESSION_NXT_AFTERMARKET), set()).update(universe)
@@ -210,8 +226,18 @@ class ExtendedBackfillLedger:
         *,
         run_id: str,
         attempted_at: datetime,
+        vendor: str = "kis",
     ) -> None:
-        """Append per-symbol outcomes; failures stay non-terminal for the next run."""
+        """Append per-symbol outcomes; failures stay non-terminal for the next run.
+
+        Args:
+            snapshot_date: Trading date of the session partition.
+            session: Session tag of the entries.
+            entries: Coverage outcomes to append.
+            run_id: Acquisition identity for these rows.
+            attempted_at: Aware attempt instant.
+            vendor: Data source of these entries ("kis" or "toss") for audit; it never changes terminal semantics.
+        """
         rows = [
             {
                 "snapshot_date": str(snapshot_date),
@@ -222,6 +248,7 @@ class ExtendedBackfillLedger:
                 "reason": str(entry.reason),
                 "run_id": str(run_id),
                 "attempted_at": attempted_at.isoformat(),
+                "vendor": str(vendor),
             }
             for entry in entries
             if entry.symbol is not None
@@ -235,6 +262,9 @@ class ExtendedBackfillLedger:
             purpose="backfill-ledger",
         ):
             existing = self._read_all()
+            if not existing.empty and "vendor" not in existing.columns:
+                existing = existing.copy()
+                existing["vendor"] = "kis"
             combined = (
                 pd.concat([existing, incoming], ignore_index=True)
                 if not existing.empty
@@ -494,18 +524,24 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
     if stop_at <= now:
         stop_at += timedelta(days=1)
     slots = tuple(profile.COLLECTION_BACKFILL_SLOTS)
-    if not slots:
+    toss_enabled = bool(profile.COLLECTION_TOSS_BACKFILL_ENABLED)
+    if not slots and not toss_enabled:
         logger.info("[DATA] stage=extended_backfill status=SKIP reason=disabled")
         return
     env = dict(os.environ)
-    creds = resolve_research_credentials(env, slots=slots)
-    if not creds:
+    creds = resolve_research_credentials(env, slots=slots) if slots else []
+    if not creds and not toss_enabled:
         raise ValueError("backfill slots resolved to no credentials")
 
-    async def _run() -> ExtendedBackfillSummary:
+    async def _run() -> tuple[ExtendedBackfillSummary | None, Any | None]:
         from src.api.kis.client import KisApiClient, token_cache_path
 
         from src import settings as app_settings
+        from src.backfill.intraday.toss_overnight_backfill import (
+            enumerate_toss_overnight_tasks,
+            run_overnight_backfill_phases,
+        )
+        from src.config.market_session import KRX_AFTERMARKET_START_DATE, NXT_START_DATE
 
         clients = [
             KisApiClient(
@@ -521,13 +557,15 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
         ledger = ExtendedBackfillLedger()
         retention = int(profile.COLLECTION_KIS_MINUTE_RETENTION_DAYS)
         earliest = (as_of - timedelta(days=retention)).isoformat()
+        window_start = earliest
+        load_start = min(earliest, NXT_START_DATE) if toss_enabled else earliest
         price_history = pd.read_parquet(
             app_settings.PRICE_HISTORY_PARQUET_PATH,
             columns=["date", "symbol", "close", "prev_close"],
         )
         window_days = _normalize_day_column(price_history["date"])
         price_history = price_history[
-            (window_days >= earliest) & (window_days <= as_of.isoformat())
+            (window_days >= load_start) & (window_days <= as_of.isoformat())
         ].copy()
         pair_frames: list[pd.DataFrame] = []
         for source in backfill_minute_history._load_condition_history_sources():
@@ -545,36 +583,81 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
             if pair_frames
             else pd.DataFrame(columns=["snapshot_date", "symbol"])
         )
-        async with clients[0].create_session() as broker_session:
-            for client in clients:
-                await client.ensure_token(broker_session)
-        return await run_extended_session_backfill(
+        kis_tasks = enumerate_extended_session_tasks(
             as_of=as_of,
-            stop_at=stop_at,
-            profile=profile,
-            clients=clients,
-            store=store,
-            ledger=ledger,
-            tasks=enumerate_extended_session_tasks(
+            retention_days=retention,
+            min_change_ratio=float(profile.COLLECTION_BACKFILL_MIN_CHANGE_RATIO),
+            price_history=price_history,
+            candidate_pairs=candidate_pairs,
+        )
+        toss_tasks = (
+            enumerate_toss_overnight_tasks(
                 as_of=as_of,
-                retention_days=retention,
+                kis_retention_days=retention,
+                nxt_start_date=NXT_START_DATE,
+                krx_aftermarket_start_date=KRX_AFTERMARKET_START_DATE,
                 min_change_ratio=float(profile.COLLECTION_BACKFILL_MIN_CHANGE_RATIO),
                 price_history=price_history,
                 candidate_pairs=candidate_pairs,
-            ),
+            )
+            if toss_enabled
+            else []
+        )
+        toss = None
+        toss_http = None
+        if clients:
+            async with clients[0].create_session() as broker_session:
+                for client in clients:
+                    await client.ensure_token(broker_session)
+        if toss_enabled:
+            import aiohttp
+
+            from src.api.toss.client import TossApiClient
+
+            app_key = app_settings.TOSS_APP_KEY
+            app_secret = app_settings.TOSS_APP_SECRET
+            if not app_key or not app_secret:
+                raise ValueError("Toss credentials are not configured")
+            toss = TossApiClient(rate_overrides={"MARKET_DATA_CHART": float(profile.COLLECTION_TOSS_BACKFILL_RATE)})
+            toss_http = aiohttp.ClientSession()
+            try:
+                return await run_overnight_backfill_phases(
+                    as_of=as_of, stop_at=stop_at, profile=profile, kis_clients=clients, toss=toss, http_session=toss_http,
+                    store=store, ledger=ledger, kis_tasks=kis_tasks, toss_tasks=toss_tasks, window_start=window_start,
+                )
+            finally:
+                await toss_http.close()
+        return await run_overnight_backfill_phases(
+            as_of=as_of, stop_at=stop_at, profile=profile, kis_clients=clients, toss=toss, http_session=toss_http,
+            store=store, ledger=ledger, kis_tasks=kis_tasks, toss_tasks=toss_tasks, window_start=window_start,
         )
 
-    summary = asyncio.run(_run())
-    logger.info(
-        "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d stopped_by_deadline=%s",
-        summary.tasks_done,
-        summary.tasks_remaining,
-        summary.complete,
-        summary.no_trades,
-        summary.not_listed,
-        summary.failed,
-        summary.stopped_by_deadline,
-    )
+    kis_summary, toss_summary = asyncio.run(_run())
+    if kis_summary is not None:
+        logger.info(
+            "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d stopped_by_deadline=%s",
+            kis_summary.tasks_done,
+            kis_summary.tasks_remaining,
+            kis_summary.complete,
+            kis_summary.no_trades,
+            kis_summary.not_listed,
+            kis_summary.failed,
+            kis_summary.stopped_by_deadline,
+        )
+    if toss_summary is not None:
+        logger.info(
+            "[DATA] stage=toss_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d calls=%d stopped_reason=%s",
+            toss_summary.tasks_done,
+            toss_summary.tasks_remaining,
+            toss_summary.complete,
+            toss_summary.no_trades,
+            toss_summary.not_listed,
+            toss_summary.failed,
+            toss_summary.calls,
+            toss_summary.stopped_reason,
+        )
+        if toss_summary.stopped_reason in ("circuit_open", "calibration_failed"):
+            raise SystemExit(3)
 
 
 if __name__ == "__main__":  # pragma: no cover

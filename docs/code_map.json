@@ -448,5 +448,8 @@
   },
   "src/daily/aftermarket_book.py": {
     "testing": "tests/unit/backfill/test_extended_session_backfill.py"
+  },
+  "src/backfill/intraday/toss_overnight_backfill.py": {
+    "testing": "tests/unit/backfill/test_toss_overnight_backfill.py"
   }
 }

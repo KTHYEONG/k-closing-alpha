@@ -694,3 +694,11 @@ def test_merge_remote_env_drops_retired_keys_and_main_requires_consent(tmp_path,
     monkeypatch.setattr(cli, "install_runtime_fragment", lambda host, text: pytest.fail("must not install"))
     with pytest.raises(cli.ProvisioningError, match="KIWOM_APP_KEY"):
         cli.main(["--source", str(tmp_path / "x")])
+
+
+def test_toss_backfill_selector_is_provisioned_and_foreign_keys_kept() -> None:
+    from src.tools.provision_env import VPS_SELECTORS, merge_remote_env
+
+    assert ("COLLECTION_TOSS_BACKFILL_ENABLED", "true") in VPS_SELECTORS
+    merged, _ = merge_remote_env("KIS_APP_KEY=abc\n", "FOREIGN_KEY=keepme\n")
+    assert "FOREIGN_KEY=keepme" in merged
