@@ -193,11 +193,21 @@ async def _wait_until_scheduled(
 
 
 def _is_nxt_listed(payload: dict[str, Any]) -> bool:
-    """Return True when an NX book response carries a live exchange acceptance time."""
+    """Return False only when an NX book response shows no acceptance time and no last price.
+
+    Unlisted symbols return both empty (measured 2026-09-28: 30/30 unlisted, 0/50 listed incl. the
+    thinnest). A listed symbol whose book is momentarily empty right after the 15:40 open still carries
+    its last price, so requiring both signals keeps it from being dropped for the whole evening.
+    """
     output1 = payload.get("output1")
-    if not isinstance(output1, dict):
-        return False
-    return bool(str(output1.get("aspr_acpt_hour") or "").strip())
+    output2 = payload.get("output2")
+    has_acceptance = isinstance(output1, dict) and bool(str(output1.get("aspr_acpt_hour") or "").strip())
+    last_price = str(output2.get("stck_prpr") or "0").replace(",", "").strip() if isinstance(output2, dict) else "0"
+    try:
+        has_price = float(last_price or "0") > 0
+    except ValueError:
+        has_price = False
+    return has_acceptance or has_price
 
 
 async def run_aftermarket_book_capture(
