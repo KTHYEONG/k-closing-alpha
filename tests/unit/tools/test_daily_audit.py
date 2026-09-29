@@ -1963,6 +1963,28 @@ def test_audit_intraday_partitions_flags_nxt_stamp_out_of_window() -> None:
     assert issues == ("intraday:nxt_aftermarket:1:out_of_window",)
 
 
+def test_audit_intraday_partitions_accepts_nxt_stamps_at_window_edges() -> None:
+    """A bar stamped exactly at the session ceil covers the session's last minute and is in-window."""
+    from datetime import date
+
+    from src.data.session_calendar import SessionKind
+    from src.tools import daily_audit
+
+    symbols = ("005930", "000660")
+    regular_frame = _stamp_frame(symbols, _standard_grid())
+    krx_frame = _stamp_frame(symbols, daily_audit.expected_krx_aftermarket_stamps())
+
+    issues = daily_audit.audit_intraday_partitions(
+        date(2026, 9, 23),
+        clock=_session_clock("2026-09-23"),
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=symbols,
+        read_partition=_clean_nxt_reader(regular_frame, krx_frame, after_stamps=(154000, 200000)),
+    )
+
+    assert issues == ()
+
+
 def test_audit_intraday_partitions_flags_cohort_symbol_absent_from_regular() -> None:
     from datetime import date
 
