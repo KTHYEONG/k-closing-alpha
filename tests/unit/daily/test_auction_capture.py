@@ -447,6 +447,41 @@ def test_delayed_open_resolves_within_deadline(tmp_path, monkeypatch) -> None:
     assert client.n >= 2
 
 
+def test_late_open_symbol_does_not_starve_later_symbols(tmp_path, monkeypatch) -> None:
+    """A never-forming open on one symbol must not block polling of the rest of the roster."""
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-16", ["000001", "000002", "000003"])
+    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=180)
+    clock = _clock("2026-09-17")
+    state = {"now": _seoul(2026, 9, 17, 8, 30)}
+
+    async def _sleep(seconds: float) -> None:
+        state["now"] += dt.timedelta(seconds=seconds)
+
+    class _StuckFirstClient(_FakeClient):
+        async def get_current_price(self, session: Any, code: str, market_div_code: str | None = None) -> dict[str, Any]:
+            self.calls.append(("price", code))
+            state["now"] += dt.timedelta(seconds=0.1)
+            price = "0" if code == "000001" else "72000"
+            return {"rt_cd": "0", "output": {"stck_oprc": price}}
+
+    client = _StuckFirstClient(calls=[])
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17", phase="open", profile=profile, store=store, clients=[client],
+            session_clock=clock, now_fn=lambda: state["now"], sleep_fn=_sleep,
+        )
+    )
+    by_symbol = {e.symbol: e for e in manifest.entries if e.dataset == CaptureDataset.PRICE}
+    assert by_symbol["000001"].status == CaptureStatus.PARTIAL and by_symbol["000001"].reason == "open_unresolved"
+    assert by_symbol["000002"].status == CaptureStatus.COMPLETE and by_symbol["000003"].status == CaptureStatus.COMPLETE
+    assert manifest.status == CaptureStatus.PARTIAL
+
+
 def test_unresolved_open_stays_partial(tmp_path, monkeypatch) -> None:
     """Never-appearing open retains explicit unresolved state."""
     from src.daily import auction_capture

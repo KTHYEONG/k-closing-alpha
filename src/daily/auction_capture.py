@@ -545,16 +545,24 @@ async def run_auction_capture(
         else:
             floor = session_clock.open_at + timedelta(seconds=_OPEN_TRUST_FLOOR_SECONDS)
             confirm_end = session_clock.open_at + timedelta(seconds=int(profile.COLLECTION_OPEN_CONFIRM_SECONDS))
-            for position, symbol in enumerate(roster):
-                client = clients[position % len(clients)]
-                wait = (floor - now_clock()).total_seconds()
-                if wait > 0:
-                    await sleeper(wait)
-                observed: dict[str, Any] | None = None
-                observed_at: datetime | None = None
-                poll_started = now_clock()
-                attempt = 0
-                while now_clock() <= confirm_end:
+            # 종목별 순차 폴링은 시초가가 늦게 형성되는 종목 하나가 확인 예산을 독점해 뒤 종목이 시도조차
+            # 못 하게 한다(실측 2026-09-29: 0010S0 131.7초 → 542종목 중 494개 미시도). 전 종목을 한 패스씩
+            # 돌고 미형성 종목만 예산 안에서 재패스해 종목 간 간섭을 없앤다.
+            wait = (floor - now_clock()).total_seconds()
+            if wait > 0:
+                await sleeper(wait)
+            pending = list(enumerate(roster))
+            poll_started: dict[str, datetime] = {}
+            last_seen: dict[str, tuple[Any, datetime]] = {}
+            attempt = 0
+            while pending and now_clock() <= confirm_end:
+                unresolved: list[tuple[int, str]] = []
+                for position, symbol in pending:
+                    if now_clock() > confirm_end:
+                        unresolved.append((position, symbol))
+                        continue
+                    client = clients[position % len(clients)]
+                    started_at = poll_started.setdefault(symbol, now_clock())
                     async with sem:
                         payload = await client.get_current_price(broker_session, symbol, market_div_code="J")
                     received = now_clock()
@@ -577,7 +585,7 @@ async def run_auction_capture(
                         ref = store.append_response(
                             CapturedResponse(
                                 context=context,
-                                request_started_at=poll_started,
+                                request_started_at=started_at,
                                 received_at=received,
                                 payload=body,
                                 status=CaptureStatus.COMPLETE if price > 0 else CaptureStatus.FAILED,
@@ -600,23 +608,19 @@ async def run_auction_capture(
                                 scheduled_at=floor,
                                 status=CaptureStatus.FAILED,
                                 rows=0,
-                                first_event_time=poll_started,
+                                first_event_time=started_at,
                                 last_event_time=received,
                                 reason="persistence",
                                 raw_refs=(),
                             )
                         )
-                        observed = None
-                        observed_at = None
-                        break
+                        continue
                     try:
                         frame_context = context.model_copy(update={"run_id": f"{run_id}-o{position}-{attempt}"})
                         store.publish_frame(_fragment_frame(symbol, floor, received, body), context=frame_context)
                     except OSError:
                         incomplete = True
                     if price > 0:
-                        observed = body
-                        observed_at = received
                         entries.append(
                             CoverageEntry(
                                 symbol=symbol,
@@ -626,55 +630,38 @@ async def run_auction_capture(
                                 scheduled_at=floor,
                                 status=CaptureStatus.COMPLETE,
                                 rows=1,
-                                first_event_time=poll_started,
+                                first_event_time=started_at,
                                 last_event_time=received,
                                 reason=reason_tag,
                                 raw_refs=(ref,),
                             )
                         )
-                        break
-                    if received >= confirm_end:
-                        incomplete = True
-                        entries.append(
-                            CoverageEntry(
-                                symbol=symbol,
-                                dataset=CaptureDataset.PRICE,
-                                venue="KRX",
-                                session="regular",
-                                scheduled_at=floor,
-                                status=CaptureStatus.PARTIAL,
-                                rows=0,
-                                first_event_time=poll_started,
-                                last_event_time=received,
-                                reason="open_unresolved",
-                                raw_refs=(ref,),
-                            )
-                        )
-                        observed = None
-                        observed_at = None
-                        break
+                        continue
+                    last_seen[symbol] = (ref, received)
+                    unresolved.append((position, symbol))
+                pending = unresolved
+                if pending:
                     attempt += 1
                     await sleeper(1.0)
-                if observed is None and observed_at is None and not any(
-                    item.symbol == symbol and item.dataset == CaptureDataset.PRICE for item in entries
-                ):
-                    incomplete = True
-                    moment = now_clock()
-                    entries.append(
-                        CoverageEntry(
-                            symbol=symbol,
-                            dataset=CaptureDataset.PRICE,
-                            venue="KRX",
-                            session="regular",
-                            scheduled_at=floor,
-                            status=CaptureStatus.PARTIAL,
-                            rows=0,
-                            first_event_time=poll_started,
-                            last_event_time=moment,
-                            reason="open_unresolved",
-                            raw_refs=(),
-                        )
+            for _, symbol in pending:
+                incomplete = True
+                seen = last_seen.get(symbol)
+                moment = seen[1] if seen is not None else now_clock()
+                entries.append(
+                    CoverageEntry(
+                        symbol=symbol,
+                        dataset=CaptureDataset.PRICE,
+                        venue="KRX",
+                        session="regular",
+                        scheduled_at=floor,
+                        status=CaptureStatus.PARTIAL,
+                        rows=0,
+                        first_event_time=poll_started.get(symbol, moment),
+                        last_event_time=moment,
+                        reason="open_unresolved",
+                        raw_refs=(seen[0],) if seen is not None else (),
                     )
+                )
     status = CaptureStatus.COMPLETE
     for item in entries:
         if item.status not in GOOD_ENTRY_STATES:
