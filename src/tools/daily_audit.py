@@ -612,10 +612,11 @@ def _audit_sparse_partition(
     floor = int(floor_hhmmss)
     ceil = int(ceil_hhmmss)
     by_symbol = _stamps_by_symbol(frame)
-    bad_symbols = sorted(symbol for symbol, stamps in by_symbol.items() if any(stamp < floor or stamp >= ceil for stamp in stamps))
+    # 분봉 시각은 해당 분의 끝으로 표기되므로 ceil 시각 봉(예: 20:00:00 = 19:59~20:00)은 세션 안이다 -- 수집기 창([floor, ceil])과 동일
+    bad_symbols = sorted(symbol for symbol, stamps in by_symbol.items() if any(stamp < floor or stamp > ceil for stamp in stamps))
     if not bad_symbols:
         return []
-    window_breaks = sorted({stamp for symbol in bad_symbols for stamp in by_symbol[symbol] if stamp < floor or stamp >= ceil})[:5]
+    window_breaks = sorted({stamp for symbol in bad_symbols for stamp in by_symbol[symbol] if stamp < floor or stamp > ceil})[:5]
     logger.debug(
         "[DATA] stage=daily_audit step=intraday_complete session=%s status=FAIL reasons=out_of_window symbols=%d first_missing=%s",
         session,
