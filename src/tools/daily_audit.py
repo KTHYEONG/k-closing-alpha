@@ -294,6 +294,13 @@ def _outside_regular_session(entry: CoverageEntry, session_clock: SessionClock) 
     return entry.last_event_time is not None and entry.last_event_time > session_clock.close_at
 
 
+def _regular_entry_settled(dataset: CaptureDataset, entry: CoverageEntry) -> bool:
+    # 거래정지 등 정규장 무거래 종목은 벤더 증명(no_trades_in_window)이 있는 틱 항목만 완료로 인정한다
+    if entry.status == CaptureStatus.COMPLETE:
+        return True
+    return dataset is CaptureDataset.TRADE_TICKS and entry.status == CaptureStatus.NO_TRADES and entry.reason == "no_trades_in_window"
+
+
 def _audit_regular_bars(
     manifests: tuple[CaptureManifest, ...],
     expected: tuple[str, ...],
@@ -314,7 +321,7 @@ def _audit_regular_bars(
         incomplete = sum(
             1
             for symbol in expected
-            if by_symbol.get(symbol) and not any(e.status == CaptureStatus.COMPLETE for e in by_symbol[symbol])
+            if by_symbol.get(symbol) and not any(_regular_entry_settled(dataset, e) for e in by_symbol[symbol])
         )
         unproven = 0
         violations = 0
