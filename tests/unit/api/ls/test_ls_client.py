@@ -91,6 +91,30 @@ def test_ls_minute_chart_acquires_morning_and_late_pages() -> None:
     assert res["continuation"] == {"cts_date": "", "cts_time": "", "tr_cont": "N", "tr_cont_key": "k1"}
 
 
+def test_ls_minute_chart_continuation_cursor_does_not_drop_boundary_bar() -> None:
+    """The server returns strictly older rows than the cursor and reports a cursor one minute before the page's oldest row."""
+    minutes = [f"{h:02d}{m:02d}00" for h in range(9, 19) for m in range(60) if "090100" <= f"{h:02d}{m:02d}00" <= "181900"]
+    client = _ls_client()
+
+    async def fake_post_tr(session: Any, tr_cd: str, tr_key: str, body: dict, tr_cont: str = "N", tr_cont_key: str = "", max_retries: int = 3) -> tuple[dict, dict]:
+        cursor = body["t8412InBlock"]["cts_time"]
+        eligible = [t for t in minutes if not cursor or t < cursor]
+        page = eligible[-3:]
+        rest = eligible[:-3]
+        rows = [{"date": _YMD, "time": t, "close": 1} for t in page]
+        if not rest:
+            return _minute_page(rows, "", "", "N")
+        one_before = f"{int(page[0][:4]) - 1:04d}00"
+        return _minute_page(rows, _YMD, one_before, "Y", "k")
+
+    client._post_tr = fake_post_tr  # type: ignore[method-assign]
+    res = asyncio.run(client.get_minute_chart(object(), "005930", "2026-09-04", budget=_budget(max_pages=1000)))
+
+    got = sorted(r["time"] for r in res["output2"])
+    assert res["termination_reason"] == "exhausted"
+    assert got == minutes
+
+
 def test_ls_minute_chart_preserves_out_of_window_evidence() -> None:
     client, _ = _paging_client(
         [_minute_page([{"date": _YMD, "time": "200000", "close": 1010}], "", "", "N", "")],
