@@ -644,6 +644,7 @@ async def _tick_source_attempt(
     refs: list[Any],
     session_tag: str = INTRADAY_SESSION_REGULAR,
     allow_no_trades: bool = False,
+    crossed_date_no_trades: bool = False,
 ) -> tuple[pd.DataFrame, CoverageEntry] | None:
     dataset = CaptureDataset.TRADE_TICKS
     venue = _venue_for(vendor=vendor, endpoint=endpoint, market_div_code=market_div_code, profile=profile)
@@ -683,7 +684,10 @@ async def _tick_source_attempt(
         )
     frame = _safe_normalize_ticks(vendor, regular, snapshot_date, code, truncated)
     if frame.empty:
-        if allow_no_trades and venue != "UNKNOWN" and not regular and len(refs) > 0:
+        # 정규장 무거래(거래정지 등): 빈 응답 자체는 증거가 아니지만, 벤더가 오늘 틱을 모두 지나 이전 날짜 행까지
+        # 페이징했는데 정규 구간 행이 없다면 "오늘 정규장 체결 없음"이 벤더 응답으로 증명된다.
+        crossed_proof = crossed_date_no_trades and terminal == "crossed_target_date" and bool(other)
+        if (allow_no_trades or crossed_proof) and venue != "UNKNOWN" and not regular and len(refs) > 0:
             return _empty_tick_frame(snapshot_date), _terminal_entry(
                 symbol=code, dataset=dataset, venue=venue, session=session_tag,
                 status=CaptureStatus.NO_TRADES, rows=0, reason="no_trades_in_window", refs=refs,
@@ -737,6 +741,7 @@ async def _acquire_ticks_symbol(
                 vendor="kiwoom", endpoint="ka10079", payload=payload, code=code, snapshot_date=snapshot_date,
                 trading_day=trading_day, ymd=ymd, floor=KRX_REGULAR_HOUR_FLOOR, ceil=KRX_REGULAR_HOUR_CEIL,
                 market_div_code=None, store=store, run_id=run_id, profile=profile, attempt=0, refs=refs,
+                crossed_date_no_trades=True,
             )
             if outcome is not None:
                 return outcome
@@ -754,6 +759,7 @@ async def _acquire_ticks_symbol(
                     vendor="kiwoom", endpoint="ka10079", payload=repair_payload, code=code, snapshot_date=snapshot_date,
                     trading_day=trading_day, ymd=ymd, floor=KRX_REGULAR_HOUR_FLOOR, ceil=KRX_REGULAR_HOUR_CEIL,
                     market_div_code=None, store=store, run_id=run_id, profile=profile, attempt=1, refs=refs,
+                    crossed_date_no_trades=True,
                 )
                 if outcome is not None:
                     return outcome
