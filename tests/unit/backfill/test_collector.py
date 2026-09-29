@@ -1555,6 +1555,52 @@ def test_regular_ticks_behaviour_unchanged() -> None:
         assert len(frame) == 1
 
 
+def _run_regular_ticks(kiwoom, run_id):
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        today, ymd = _today()
+        delivered = {}
+        asyncio.run(
+            collect_intraday_trade_ticks(
+                _KisBars([]), None, ["044380"], today, kiwoom_client=kiwoom,
+                profile=_aftermarket_profile(tmp_path), capture_store=_capture_store(tmp_path), run_id=run_id,
+                on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+            )
+        )
+        return delivered["044380"], ymd
+
+
+def test_regular_ticks_halted_symbol_proven_no_trades_by_crossed_date() -> None:
+    """Vendor paged past today into an earlier date with no regular-window row: proven no trades."""
+    _, ymd = _today()
+    prior = str(int(ymd) - 1)
+    kiwoom = _KiwoomTicks([{"rows": [_kw_tick_row(f"{prior}153000")], "truncated": False, "terminal": "crossed_target_date"}])
+
+    (frame, entry), _ = _run_regular_ticks(kiwoom, "run-regular-halted")
+
+    assert entry.status.value == "NO_TRADES"
+    assert entry.reason == "no_trades_in_window"
+    assert len(entry.raw_refs) > 0
+    assert frame.empty
+
+
+def test_regular_ticks_empty_response_without_paging_proof_stays_unknown() -> None:
+    """An empty vendor answer alone is not evidence of a halt."""
+    kiwoom = _KiwoomTicks([{"rows": [], "truncated": False, "terminal": "exhausted"}])
+
+    (frame, entry), _ = _run_regular_ticks(kiwoom, "run-regular-empty")
+
+    assert entry.status.value == "UNKNOWN"
+    assert entry.reason == "empty_without_proof"
+    assert frame.empty
+
+
 def _run_aftermarket_ticks(kiwoom, run_id, venue="KRX"):
     import asyncio
     import tempfile

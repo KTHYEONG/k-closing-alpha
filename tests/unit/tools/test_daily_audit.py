@@ -100,6 +100,29 @@ def _publish_cohort_decision(store, day, eligible, *, run_id="run-decision", adm
     return cohort
 
 
+def _evidence_ref(store, day):
+    from datetime import datetime
+
+    from src.data.capture_contracts import CaptureDataset, CapturedResponse, CaptureStatus
+
+    stamp = datetime.fromisoformat(f"{day}T16:00:00+09:00")
+    return store.append_response(
+        CapturedResponse(
+            context=_capture_context(day, "run-evidence", CaptureDataset.TRADE_TICKS, "evidence"),
+            request_started_at=stamp,
+            received_at=stamp,
+            payload={"rt_cd": "0", "output2": []},
+            status=CaptureStatus.COMPLETE,
+            source_timestamp=None,
+            source_published_at=None,
+            page_index=0,
+            attempt_index=0,
+            continuation={},
+            error_type=None,
+        )
+    )
+
+
 def _publish_chart_manifest(
     store,
     day,
@@ -111,6 +134,7 @@ def _publish_chart_manifest(
     reason="exhausted:regular=10",
     first_time="09:00:00",
     last_time="15:30:00",
+    raw_refs=(),
 ):
     from datetime import datetime
 
@@ -130,7 +154,7 @@ def _publish_chart_manifest(
             first_event_time=first,
             last_event_time=last,
             reason=reason,
-            raw_refs=(),
+            raw_refs=raw_refs,
         )
         for symbol in symbols
     ]
@@ -806,6 +830,34 @@ def test_audit_collection_reports_partial_chart_as_incomplete(tmp_path) -> None:
     # Then: 파일 존재가 아니라 터미널 상태로 판정한다
     assert "collection:charts:1:incomplete_entries" in issues
     assert not any("terminal_proof_missing" in issue for issue in issues)
+
+
+def test_audit_collection_accepts_proven_no_trade_ticks_only(tmp_path) -> None:
+    """A halted symbol with vendor-proven no trades settles ticks; unproven NO_TRADES does not."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    _publish_chart_manifest(
+        store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"],
+        status=CaptureStatus.NO_TRADES, reason="no_trades_in_window", raw_refs=(_evidence_ref(store, day),),
+    )
+
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+    assert not any("collection:ticks" in issue for issue in issues)
+
+    other = CaptureStore(tmp_path / "capture2")
+    _publish_cohort_decision(other, day, ["005930"])
+    _publish_chart_manifest(other, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    _publish_chart_manifest(
+        other, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"],
+        status=CaptureStatus.NO_TRADES, reason="krx_after_no_trades", raw_refs=(_evidence_ref(other, day),),
+    )
+    issues = _audit(other, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+    assert "collection:ticks:1:incomplete_entries" in issues
 
 
 def test_audit_collection_accepts_duplicate_tick_events(tmp_path) -> None:
