@@ -1577,10 +1577,8 @@ def _run_regular_ticks(kiwoom, run_id):
 
 
 def test_regular_ticks_halted_symbol_proven_no_trades_by_crossed_date() -> None:
-    """Vendor paged past today into an earlier date with no regular-window row: proven no trades."""
-    _, ymd = _today()
-    prior = str(int(ymd) - 1)
-    kiwoom = _KiwoomTicks([{"rows": [_kw_tick_row(f"{prior}153000")], "truncated": False, "terminal": "crossed_target_date"}])
+    """Vendor paged past today into an earlier date; the client drops prior-date rows, so rows is empty."""
+    kiwoom = _KiwoomTicks([{"rows": [], "truncated": False, "terminal": "crossed_target_date"}])
 
     (frame, entry), _ = _run_regular_ticks(kiwoom, "run-regular-halted")
 
