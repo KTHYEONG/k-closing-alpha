@@ -85,6 +85,7 @@ configs/chart_pass_cache.json
 
 # AI Experimentation & Scratch directories
 scratch/
+docs/specs/
 tmp/
 
 # Serena AI Assistant
