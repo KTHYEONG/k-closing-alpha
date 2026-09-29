@@ -278,7 +278,12 @@ class LsApiClient:
                     termination = "cursor_unknown"
                     truncated = True
                     break
-                cts_date, cts_time = body_cts_date, body_cts_time
+                # 서버가 준 cts_time은 이번 페이지에서 가장 오래된 봉보다 1분 이르지만, 이를 그대로 되보내면 서버는 그 시각
+                # "미만"만 돌려줘 경계 봉이 통째로 유실된다(실측 2026-09-29: 하루치가 한 페이지를 넘는 시점부터
+                # 종목당 1봉 누락). 가장 오래된 봉 시각을 커서로 쓰면 그 미만(= 미수신 구간)만 정확히 이어 받는다.
+                page_times = [str(r.get("time", "") or "") for r in rows if isinstance(r, dict) and str(r.get("date", "") or "").strip() == body_cts_date]
+                oldest_time = min((t for t in page_times if t), default="")
+                cts_date, cts_time = body_cts_date, oldest_time or body_cts_time
                 tr_cont, tr_cont_key = header_cont, header_key
             else:
                 termination = "page_budget"
