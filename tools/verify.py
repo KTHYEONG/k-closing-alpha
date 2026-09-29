@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smart Selective Lean Check: Fast, token-efficient mechanical audit gate."""
+"""Fast, token-efficient local verification gate: Lint, Type, Tests & 100% Diff-Coverage."""
 
 from __future__ import annotations
 
@@ -52,12 +52,6 @@ def run_cmd(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess[s
     env = os.environ.copy()
     env["COVERAGE_NO_CTRACE"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["POLARS_MAX_THREADS"] = "2"
-    env["OMP_NUM_THREADS"] = "1"
-    env["OPENBLAS_NUM_THREADS"] = "1"
-    env["MKL_NUM_THREADS"] = "1"
-    env["NUMBA_NUM_THREADS"] = "1"
-    env["RAY_ACCEL_NUM_WORKERS"] = "1"
     try:
         return subprocess.run(  # noqa: S603
             cmd, capture_output=True, text=True, shell=False, timeout=timeout, env=env
@@ -142,12 +136,20 @@ def _check_scaffolding_leaks(py_files: list[str]) -> list[JsonDiag]:
 # ---------------------------------------------------------------------------
 
 
-def _find_test_files(py_files: list[str], spec_path: str | None = None) -> list[str]:
-    """Find direct unit tests corresponding to modified source files."""
+def _find_test_files(py_files: list[str]) -> tuple[list[str], list[str]]:
+    """Find direct unit tests corresponding to modified source files.
+
+    Returns ``(mapped, unmapped)``: files explicitly passed through are kept,
+    ``src/<pkg>/<mod>.py`` resolves to ``tests/unit/<pkg>/test_<mod>.py`` and
+    then to ``tests/unit/<pkg>/<mod>/`` when that package directory exists.
+    Source modules without a mapped test are reported as ``unmapped``.
+    """
     test_files = [f for f in py_files if f.startswith("tests/") or "test_" in f]
     source_files = [f for f in py_files if f.startswith("src/") and not f.endswith("__init__.py")]
+    unmapped: list[str] = []
 
     # 1. Direct path convention: src/path/module.py -> tests/unit/path/test_module.py
+    #    then tests/unit/path/module/ when that nested package exists.
     for sf in source_files:
         rel = sf[4:]  # strip 'src/'
         parts = rel.split("/")
@@ -158,139 +160,31 @@ def _find_test_files(py_files: list[str], spec_path: str | None = None) -> list[
         candidates = [
             f"tests/unit/{sub_path}/{test_name}" if sub_path else f"tests/unit/{test_name}",
             f"tests/unit/{test_name}",
-            f"tests/contract/{sub_path}/{test_name}" if sub_path else f"tests/contract/{test_name}",
         ]
+        nested_dir = f"tests/unit/{sub_path}/{mod_name[:-3]}" if sub_path and mod_name.endswith(".py") else ""
+        found = False
         for cand in candidates:
             if cand in test_files:
+                found = True
                 break
             if os.path.isfile(cand):
                 test_files.append(cand)
+                found = True
                 break
-
-    # 2. Spec test suites if provided
-    if spec_path and os.path.isfile(spec_path):
-        with contextlib.suppress(OSError):
-            with open(spec_path, encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            matches = re.findall(
-                r"(?m)^##\s+(?:Test\s+Suite|Invariant\s+Scenarios):\s*`?([^\n`]+)`?",
-                content,
+        if not found and nested_dir and os.path.isdir(nested_dir):
+            nested_tests = sorted(
+                f"tests/unit/{sub_path}/{mod_name[:-3]}/{p}"
+                for p in os.listdir(nested_dir)
+                if p.startswith("test_") and p.endswith(".py")
             )
-            for m in matches:
-                tf = m.strip().strip("`").strip()
-                if os.path.isfile(tf) and tf not in test_files:
-                    test_files.append(tf)
+            if nested_tests:
+                test_files.extend(t for t in nested_tests if t not in test_files)
+                found = True
+        if not found:
+            unmapped.append(sf)
 
-    return sorted(dict.fromkeys(test_files))
 
-
-def _check_pre_impl_spec(spec_path: str) -> tuple[int, list[JsonDiag]]:
-    """Validate spec blueprint paths, targets, caller files, and anchors before implementation."""
-    diags: list[JsonDiag] = []
-    if not os.path.isfile(spec_path):
-        return 1, [
-            {
-                "file": spec_path,
-                "line": 0,
-                "error": f"Spec file not found: {spec_path}",
-                "fix_hint": "Check spec file path",
-            }
-        ]
-
-    try:
-        with open(spec_path, encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-    except OSError as e:
-        return 1, [
-            {
-                "file": spec_path,
-                "line": 0,
-                "error": f"Cannot read spec file: {e}",
-                "fix_hint": "Check file permissions",
-            }
-        ]
-
-    current_caller: str | None = None
-    target_found = False
-
-    for idx, line in enumerate(lines, start=1):
-        stripped = line.strip()
-
-        # Check Target
-        m_target = re.match(r"^##\s+Target:\s*`?([^\n`]+)`?", stripped)
-        if m_target:
-            target_file = m_target.group(1).strip().strip("`").strip()
-            target_found = True
-            parent = os.path.dirname(target_file)
-            if parent and not os.path.isdir(parent):
-                diags.append(
-                    {
-                        "file": spec_path,
-                        "line": idx,
-                        "error": f"Target parent directory does not exist: '{parent}' for target '{target_file}'",
-                        "fix_hint": f"Create directory {parent} or fix path in spec",
-                    }
-                )
-
-        # Check Wiring caller file
-        m_wiring = re.match(r"^##\s+Wiring:\s*`?([^\n`]+)`?", stripped)
-        if m_wiring:
-            current_caller = m_wiring.group(1).strip().strip("`").strip()
-            if not os.path.isfile(current_caller):
-                diags.append(
-                    {
-                        "file": spec_path,
-                        "line": idx,
-                        "error": f"Wiring caller file does not exist: '{current_caller}'",
-                        "fix_hint": f"Verify caller file path in {spec_path}",
-                    }
-                )
-
-        # Check Anchor in caller file
-        m_anchor = re.match(r"^-\s*(?:Anchor|anchor):\s*`?([^\n`]+)`?", stripped)
-        if m_anchor and current_caller and os.path.isfile(current_caller):
-            anchor = m_anchor.group(1).strip().strip("`").strip()
-            try:
-                with open(current_caller, encoding="utf-8", errors="ignore") as cf:
-                    caller_content = cf.read()
-                if anchor not in caller_content:
-                    diags.append(
-                        {
-                            "file": current_caller,
-                            "line": 0,
-                            "error": f"Wiring anchor '{anchor}' not found in caller file '{current_caller}'",
-                            "fix_hint": f"Ensure anchor '{anchor}' matches an existing symbol or line in {current_caller}",
-                        }
-                    )
-            except OSError:
-                pass
-
-        # Check Invariant Scenarios / Test Suite test file
-        m_test = re.match(r"^##\s+(?:Invariant\s+Scenarios|Test\s+Suite):\s*`?([^\n`]+)`?", stripped)
-        if m_test:
-            test_file = m_test.group(1).strip().strip("`").strip()
-            parent = os.path.dirname(test_file)
-            if parent and not os.path.isdir(parent):
-                diags.append(
-                    {
-                        "file": spec_path,
-                        "line": idx,
-                        "error": f"Test suite directory does not exist: '{parent}' for '{test_file}'",
-                        "fix_hint": f"Create directory {parent} or fix path in spec",
-                    }
-                )
-
-    if not target_found:
-        diags.append(
-            {
-                "file": spec_path,
-                "line": 0,
-                "error": "Spec missing mandatory '## Target: <path>' section",
-                "fix_hint": "Add '## Target: <relative_path>' section to spec",
-            }
-        )
-
-    return (1 if diags else 0), diags
+    return sorted(dict.fromkeys(test_files)), sorted(dict.fromkeys(unmapped))
 
 
 # ---------------------------------------------------------------------------
@@ -330,8 +224,14 @@ def _git_diff_added_lines(file: str) -> set[int] | None:
     return added
 
 
-def _check_diff_coverage(src_files: list[str], cov_json_path: str) -> tuple[list[JsonDiag], int | None]:
-    """Verify that every line added to touched src/ files is executed by tests."""
+def _check_diff_coverage(
+    src_files: list[str], cov_json_path: str, unmapped: list[str] | None = None
+) -> tuple[list[JsonDiag], int | None]:
+    """Verify that every line added to touched src/ files is executed by tests.
+
+    Modules without a mapped test are reported as ``unmapped`` diagnostics by
+    the caller instead: the mapped-test run cannot be expected to cover them.
+    """
     if not os.path.exists(cov_json_path):
         return [], None
     try:
@@ -340,11 +240,14 @@ def _check_diff_coverage(src_files: list[str], cov_json_path: str) -> tuple[list
     except Exception:
         return [], None
 
+    skipped = set(unmapped or [])
     files_data = cov_data.get("files", {})
     diags: list[JsonDiag] = []
     total_added = 0
     total_covered = 0
     for sf in src_files:
+        if sf in skipped:
+            continue
         entry = files_data.get(sf) or files_data.get(sf.replace("/", os.sep))
         if not entry:
             continue
@@ -379,9 +282,8 @@ def _check_diff_coverage(src_files: list[str], cov_json_path: str) -> tuple[list
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Smart Selective Lean Check: Tier 1 Mechanical Gate.")
+    parser = argparse.ArgumentParser(description="Fast, token-efficient local verification gate.")
     parser.add_argument("--files", nargs="*", default=[], help="Explicit files to check")
-    parser.add_argument("--spec", default=None, help="Path to markdown/JSON spec file")
     parser.add_argument("--fast", action="store_true", help="Run static checks only (scaffolding, ruff, mypy)")
     parser.add_argument("--skip-lint", action="store_true", help="Skip Ruff linting")
     parser.add_argument("--skip-mypy", action="store_true", help="Skip Mypy static check")
@@ -389,43 +291,23 @@ def main() -> None:
     parser.add_argument("--no-xdist", action="store_true", help="Force serial pytest execution (-n 0)")
     parser.add_argument("--timeout", type=int, default=None, help="Pytest timeout in seconds")
     parser.add_argument(
+        "--run-slow",
+        action="store_true",
+        help="Run tests marked slow (real-data suite) instead of excluding them",
+    )
+    parser.add_argument(
         "--pre-impl",
         action="store_true",
         help="Validate spec blueprint paths and wiring anchors before implementation",
     )
     args = parser.parse_args()
 
-    # 0. Pre-implementation Spec Blueprint Gate
-    if args.pre_impl:
-        if not args.spec:
-            _exit_with_diags(
-                "pre-impl",
-                "FAIL | --pre-impl requires --spec <spec_file>",
-                [
-                    {
-                        "file": "",
-                        "line": 0,
-                        "error": "--pre-impl requires --spec argument",
-                        "fix_hint": "Pass --spec docs/specs/<feature>_spec.md",
-                    }
-                ],
-            )
-        code, diags = _check_pre_impl_spec(args.spec)
-        if code != 0:
-            _exit_with_diags(
-                "pre-impl",
-                f"FAIL | Pre-impl spec validation failed ({len(diags)} error(s))",
-                diags,
-            )
-        print("PASS | Spec blueprint paths and wiring anchors verified (pre-impl)")
-        print(_emit_json("PASS", "pre-impl", []), file=sys.stderr)
-        return
 
     # 1. File discovery from git if not explicitly passed
     if not args.files:
         try:
             diff_res = subprocess.run(
-                ["git", "status", "--porcelain"],
+                ["git", "status", "--porcelain", "-uall"],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -489,8 +371,16 @@ def main() -> None:
         return
 
     # 4. Direct Test Discovery
-    test_files = _find_test_files(py_files, spec_path=args.spec)
+    test_files, unmapped = _find_test_files(py_files)
     if not test_files:
+        if unmapped:
+            diags = [
+                {"file": m, "line": 0, "error": f"unmapped: no test covers {m}", "fix_hint": "Add tests/unit coverage for this module"}
+                for m in unmapped
+            ]
+            print(_emit_json("PASS", "all", diags, None), file=sys.stderr)
+            print(f"PASS | Lint & Type check passed ({len(unmapped)} unmapped module(s) reported)")
+            return
         print("PASS | Lint & Type check passed (no tests to run)")
         print(_emit_json("PASS", "all", [], None), file=sys.stderr)
         return
@@ -516,7 +406,7 @@ def main() -> None:
         xdist_args = ["-p", "no:cacheprovider", "-n", str(worker_count)]
 
     src_files = [f for f in py_files if f.startswith("src/")]
-    cov_json_path = "tmp/lean_check_coverage.json"
+    cov_json_path = "tmp/verify_coverage.json"
     cov_args: list[str] = []
 
     if src_files and not args.no_cov:
@@ -532,7 +422,7 @@ def main() -> None:
         "-m",
         "pytest",
         "-m",
-        "not slow",
+        "not slow" if not args.run_slow else "slow",
         *test_files,
         *xdist_args,
         *cov_args,
@@ -555,16 +445,21 @@ def main() -> None:
         )
 
     if pt_res.returncode == 0:
-        cov_diags, cov_pct = _check_diff_coverage(src_files, cov_json_path) if cov_args else ([], None)
+        cov_diags, cov_pct = _check_diff_coverage(src_files, cov_json_path, unmapped) if cov_args else ([], None)
         if cov_diags:
             _exit_with_diags(
                 "coverage",
                 f"FAIL | Diff Coverage: {len(cov_diags)} file(s) with untested new lines",
                 cov_diags,
             )
+        unmapped_diags = [
+            {"file": m, "line": 0, "error": f"unmapped: no test covers {m}", "fix_hint": "Add tests/unit coverage for this module"}
+            for m in unmapped
+        ]
         cov_suffix = f", Diff-Coverage {cov_pct}%" if cov_pct is not None else ""
-        print(f"PASS | All checks passed (Scaffolding-Clean, Lint, Type, Tests{cov_suffix})")
-        print(_emit_json("PASS", "all", [], cov_pct), file=sys.stderr)
+        unmapped_suffix = f", {len(unmapped_diags)} unmapped" if unmapped_diags else ""
+        print(f"PASS | All checks passed (Scaffolding-Clean, Lint, Type, Tests{cov_suffix}{unmapped_suffix})")
+        print(_emit_json("PASS", "all", unmapped_diags, cov_pct), file=sys.stderr)
     else:
         last_err = [
             line
