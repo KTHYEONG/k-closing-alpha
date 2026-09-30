@@ -756,7 +756,8 @@ def audit_aftermarket_ticks(
 
     Ticks cannot be re-fetched after the day ends, so their absence or inconsistency must surface in the
     same evening's digest. Volume is compared per symbol over the whole session window, which is
-    independent of the bar labelling convention.
+    independent of the bar labelling convention. KRX aftermarket bars are start-labelled, so the bar stamped at the session
+    ceiling opens after the tick window closes; it is excluded from the bar side of the comparison.
 
     Args:
         trading_date: Audited KST date (checked only from AFTERMARKET_TICKS_START_DATE on STANDARD days).
@@ -781,11 +782,12 @@ def audit_aftermarket_ticks(
         path = intraday_partition_path(1, day_str, session)
         if not path.exists():
             return None
-        return pd.read_parquet(path, columns=["symbol", "volume"])
+        return pd.read_parquet(path, columns=["symbol", "ts_hms", "volume"])
 
     ticks_reader = read_ticks if read_ticks is not None else _default_ticks
     bars_reader = read_bars if read_bars is not None else _default_bars
     issues: list[str] = []
+    ceil = int(KRX_AFTERMARKET_HOUR_CEIL)
     for session in (INTRADAY_SESSION_KRX_AFTERMARKET, INTRADAY_SESSION_NXT_AFTERMARKET):
         bars = bars_reader(session)
         ticks = ticks_reader(session)
@@ -794,6 +796,9 @@ def audit_aftermarket_ticks(
         if ticks is None:
             issues.append(f"intraday:{session}_ticks:1:missing_partition")
             continue
+        if session == INTRADAY_SESSION_KRX_AFTERMARKET and "ts_hms" in bars.columns:
+            stamps = pd.to_numeric(bars["ts_hms"], errors="coerce")
+            bars = bars.loc[stamps.isna() | (stamps < ceil)]
         bar_vol = pd.to_numeric(bars["volume"], errors="coerce").fillna(0)
         tick_vol = pd.to_numeric(ticks["volume"], errors="coerce").fillna(0)
         bar_sum = bar_vol.groupby(bars["symbol"].astype(str)).sum()

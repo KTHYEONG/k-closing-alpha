@@ -2771,3 +2771,111 @@ def test_aftermarket_tick_audit_default_reader_matches_stored_volumes(tmp_path, 
     tick_target.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"symbol": ["000660", "000660"], "ts_hms": [160005, 160050], "volume": [4, 6]}).to_parquet(tick_target, index=False)
     assert audit_aftermarket_ticks(date(2026, 9, 29)) == ()
+
+
+def _tick_audit_frames(bars, ticks):
+    def _read_bars(session):
+        return bars if session == "krx_aftermarket" else None
+
+    def _read_ticks(session):
+        return ticks if session == "krx_aftermarket" else None
+
+    return _read_bars, _read_ticks
+
+
+def _nxt_tick_audit_frames(bars, ticks):
+    def _read_bars(session):
+        return bars if session == "nxt_aftermarket" else None
+
+    def _read_ticks(session):
+        return ticks if session == "nxt_aftermarket" else None
+
+    return _read_bars, _read_ticks
+
+
+def test_aftermarket_tick_audit_excludes_krx_ceiling_bar() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160100, 200000], "volume": [100, 7]})
+    ticks = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160105, 160205], "volume": [60, 40]})
+    read_bars, read_ticks = _tick_audit_frames(bars, ticks)
+    assert daily_audit.audit_aftermarket_ticks(date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars) == ()
+
+
+def test_aftermarket_tick_audit_flags_real_mismatch_despite_ceiling_bar() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160100, 200000], "volume": [100, 7]})
+    ticks = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160105, 160205], "volume": [60, 30]})
+    read_bars, read_ticks = _tick_audit_frames(bars, ticks)
+    assert daily_audit.audit_aftermarket_ticks(
+        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
+    ) == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
+
+
+def test_aftermarket_tick_audit_keeps_nxt_ceiling_bar() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160100, 200000], "volume": [100, 7]})
+    ticks = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160105, 160205], "volume": [60, 40]})
+    read_bars, read_ticks = _nxt_tick_audit_frames(bars, ticks)
+    assert daily_audit.audit_aftermarket_ticks(
+        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
+    ) == ("intraday:nxt_aftermarket_ticks:1:volume_mismatch",)
+
+
+def test_aftermarket_tick_audit_legacy_bars_without_ts_hms_unchanged() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars = pd.DataFrame({"symbol": ["005930"], "volume": [107]})
+    ticks = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160105, 160205], "volume": [60, 40]})
+    read_bars, read_ticks = _tick_audit_frames(bars, ticks)
+    assert daily_audit.audit_aftermarket_ticks(
+        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
+    ) == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
+
+
+def test_aftermarket_tick_audit_ceiling_only_partition_still_requires_ticks() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars = pd.DataFrame({"symbol": ["005930"], "ts_hms": [200000], "volume": [7]})
+    read_bars, read_ticks = _tick_audit_frames(bars, None)
+    assert daily_audit.audit_aftermarket_ticks(
+        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
+    ) == ("intraday:krx_aftermarket_ticks:1:missing_partition",)
+
+
+def test_aftermarket_tick_audit_ceiling_only_symbol_volume_rules() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars = pd.DataFrame({"symbol": ["005930"], "ts_hms": [200000], "volume": [7]})
+    empty_ticks = pd.DataFrame({"symbol": pd.Series([], dtype=str), "ts_hms": pd.Series([], dtype=float),
+                                "volume": pd.Series([], dtype=float)})
+    read_bars, read_ticks = _tick_audit_frames(bars, empty_ticks)
+    assert daily_audit.audit_aftermarket_ticks(
+        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
+    ) == ()
+
+    ticks = pd.DataFrame({"symbol": ["005930"], "ts_hms": [160105], "volume": [5]})
+    read_bars, read_ticks = _tick_audit_frames(bars, ticks)
+    assert daily_audit.audit_aftermarket_ticks(
+        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
+    ) == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
