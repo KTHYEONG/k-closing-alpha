@@ -2437,3 +2437,28 @@ def test_run_paper_session_exit_silently_skips_confirmed_holiday(tmp_path, monke
     assert n == 0
     assert len(ledger.load_open_positions()) == 1
     assert outcomes == []
+
+
+def test_load_open_lot_marks_uses_last_close_before_the_snapshot_and_skips_same_day_lots(tmp_path) -> None:
+    import pandas as pd
+
+    from src.daily.paper_trade import load_open_lot_marks
+
+    panel = pd.DataFrame({
+        "symbol": ["005930", "005930", "005930", "000660"],
+        "date": pd.to_datetime(["2026-09-28", "2026-09-29", "2026-09-30", "2026-09-29"]),
+        "close": [69_000.0, 70_000.0, 65_000.0, 100_000.0],
+    })
+    path = tmp_path / "price_history.parquet"
+    panel.to_parquet(path)
+    lots = pd.DataFrame({
+        "symbol": ["005930", "000660"],
+        "decision_date": ["2026-09-29", "2026-09-30"],
+    })
+
+    marks = load_open_lot_marks(lots, "2026-09-30", path=path)
+
+    # 당일(2026-09-30) 종가는 관측 불가이므로 직전 종가를 쓰고, 당일 진입 로트는 평가가가 필요 없다
+    assert marks == {"005930": 70_000}
+    assert load_open_lot_marks(lots.iloc[0:0], "2026-09-30", path=path) == {}
+    assert load_open_lot_marks(lots, "2026-09-30", path=tmp_path / "missing.parquet") == {}

@@ -399,6 +399,87 @@ def test_build_nav_snapshot_reconciles_accounting_identity() -> None:
     assert int(empty["n_open_positions"]) == 0
 
 
+def test_carry_days_counts_only_trading_sessions_past_the_first_exit_session() -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import carry_days
+
+    kst = "Asia/Seoul"
+
+    def at(day: str) -> pd.Timestamp:
+        return pd.Timestamp(f"{day} 15:30:35", tz=kst)
+
+    # 다음 거래일 청산, 주말 통과, 대체공휴일(2026-10-05) 통과는 이월이 아니다
+    assert carry_days(at("2026-09-28"), pd.Timestamp("2026-09-29 09:00", tz=kst)) == 0
+    assert carry_days(at("2026-10-02"), pd.Timestamp("2026-10-06 09:00", tz=kst)) == 0
+    # 거래일 하루/이틀 밀린 청산
+    assert carry_days(at("2026-09-28"), pd.Timestamp("2026-09-30 09:00", tz=kst)) == 1
+    assert carry_days(at("2026-09-28"), pd.Timestamp("2026-10-01 09:00", tz=kst)) == 2
+    # 검증 범위(2026-09-25~) 밖의 날짜는 거래일로 세어 이월을 과소평가하지 않는다
+    assert carry_days(at("2026-09-23"), pd.Timestamp("2026-09-28 09:00", tz=kst)) == 1
+
+
+def test_build_round_trips_records_carry_days_for_a_slipped_exit() -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import build_round_trips
+
+    kst = "Asia/Seoul"
+    fills = pd.DataFrame([
+        {"order_id": "2026-09-28:005930:entry", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
+         "filled_at": pd.Timestamp("2026-09-28 15:30:20", tz=kst), "decision_date": "2026-09-28", "trigger": "auction_close",
+         "entry_order_id": None},
+        {"order_id": "2026-09-28:005930:entry:exit:2026-09-30", "symbol": "005930", "side": "sell", "qty": 10, "fill_price": 69_000,
+         "filled_at": pd.Timestamp("2026-09-30 09:00:00", tz=kst), "decision_date": "2026-09-30", "trigger": "auction_open",
+         "entry_order_id": "2026-09-28:005930:entry"},
+    ])
+
+    trips = build_round_trips(fills)
+
+    assert int(trips.iloc[0]["carry_days"]) == 1
+
+
+def _open_lot_fills():
+    import pandas as pd
+
+    kst = "Asia/Seoul"
+    return pd.DataFrame([
+        {"order_id": "2026-09-29:005930:entry", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
+         "filled_at": pd.Timestamp("2026-09-29 15:30:20", tz=kst), "decision_date": "2026-09-29", "trigger": "auction_close",
+         "entry_order_id": None},
+        {"order_id": "2026-09-29:000660:entry", "symbol": "000660", "side": "buy", "qty": 5, "fill_price": 100_000,
+         "filled_at": pd.Timestamp("2026-09-29 15:30:20", tz=kst), "decision_date": "2026-09-29", "trigger": "auction_close",
+         "entry_order_id": None},
+    ])
+
+
+def test_nav_mtm_values_carried_lots_at_marks_and_keeps_cost_nav_unchanged() -> None:
+    from src.execution.paper_broker import build_nav_snapshot
+
+    fills = _open_lot_fills()
+
+    marked = build_nav_snapshot(fills, 10_000_000, "2026-09-30", marks={"005930": 63_000, "000660": 104_000}).iloc[0]
+    unmarked = build_nav_snapshot(fills, 10_000_000, "2026-09-30", marks=None).iloc[0]
+
+    # 원가 NAV는 가격과 무관, 평가 NAV는 (63,000-70,000)*10 + (104,000-100,000)*5 = -50,000 만큼 다르다
+    assert int(marked["nav"]) == int(unmarked["nav"])
+    assert int(marked["open_market_value"]) == 63_000 * 10 + 104_000 * 5
+    assert int(marked["nav_mtm"]) == int(marked["nav"]) - 50_000
+    assert int(marked["n_open_unmarked"]) == 0
+    # 평가가가 없으면 원가로 두되 결측을 숨기지 않는다
+    assert int(unmarked["nav_mtm"]) == int(unmarked["nav"])
+    assert int(unmarked["n_open_unmarked"]) == 2
+
+
+def test_nav_mtm_treats_lots_filled_on_the_snapshot_date_as_marked_at_entry() -> None:
+    from src.execution.paper_broker import build_nav_snapshot
+
+    row = build_nav_snapshot(_open_lot_fills(), 10_000_000, "2026-09-29", marks=None).iloc[0]
+
+    assert int(row["n_open_unmarked"]) == 0
+    assert int(row["nav_mtm"]) == int(row["nav"])
+
+
 def test_refresh_trade_ledgers_writes_trades_and_nav_idempotently(tmp_path) -> None:
     import pandas as pd
     import pytest
