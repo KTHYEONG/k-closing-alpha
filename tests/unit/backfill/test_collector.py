@@ -2052,3 +2052,194 @@ def test_tick_transport_settings_validation() -> None:
         CollectionSettings(COLLECTION_TRANSPORT_BACKOFF_SECONDS=float("inf"))
     with pytest.raises(ValueError, match="TRANSPORT_BACKOFF"):
         CollectionSettings(COLLECTION_TRANSPORT_BACKOFF_SECONDS=float("nan"))
+
+
+class _TapeCursor:
+    def __init__(self, served: int) -> None:
+        self.served = served
+
+
+class _TapeKiwoom:
+    """Newest-first tick vendor with a vendor-reported remaining count and resumable cursors."""
+
+    def __init__(self, total: int, *, page_rows: int, start_hms: int, drop_on_resume: int = 0) -> None:
+        self.total = total
+        self.page_rows = page_rows
+        self.start_hms = start_hms
+        self.drop_on_resume = drop_on_resume
+        self.calls: list[dict] = []
+        self.pages_served = 0
+
+    def _row(self, index: int, ymd: str) -> dict:
+        seconds = self.start_hms + index
+        hms = f"{seconds // 10000:02d}{(seconds // 100) % 100:02d}{seconds % 100:02d}"
+        return {"cntr_tm": f"{ymd}{hms}", "cur_prc": "+70000", "trde_qty": "1"}
+
+    async def get_tick_chart(self, session, code, snapshot_date, max_pages=None, budget=None, on_page=None, resume=None, **kwargs):
+        self.calls.append({"budget": budget, "resume": resume, "max_pages": max_pages})
+        ymd = str(snapshot_date).replace("-", "")
+        limit = int(budget.max_pages) if budget is not None else int(max_pages)
+        served = resume.served if resume is not None else 0
+        first_served = served
+        rows: list[dict] = []
+        for page_index in range(limit):
+            if served >= self.total:
+                break
+            take = min(self.page_rows, self.total - served)
+            page = [self._row(self.total - 1 - served - k, ymd) for k in range(take)]
+            served += take
+            self.pages_served += 1
+            rows.extend(page)
+            if on_page is not None:
+                start, received = _aware_page_clocks()
+                on_page({"stk_tic_chart_qry": page}, {"cont-yn": "Y" if served < self.total else "N"}, start, received, page_index, 0)
+        finished = served >= self.total
+        if resume is not None and self.drop_on_resume:
+            rows = rows[self.drop_on_resume:]
+        return {
+            "rt_cd": "0", "output2": rows, "vendor": "kiwoom", "truncated": not finished,
+            "termination_reason": "exhausted" if finished else "page_budget", "pages_fetched": 1,
+            "continuation": {}, "cursor": None if finished else _TapeCursor(served),
+            "vendor_total_ticks": self.total, "rows_received": served, "complete_by_total": finished,
+        }
+
+
+def _tape_profile(tmp_path, **updates):
+    return _aftermarket_profile(tmp_path).model_copy(
+        update={"COLLECTION_CHART_MAX_PAGES": 2, "COLLECTION_TICK_REPAIR_MAX_PAGES": 4,
+                "COLLECTION_TICK_ROWS_PER_PAGE": 10, "COLLECTION_TICK_RESUME_MARGIN_PAGES": 1, **updates}
+    )
+
+
+def _run_tape_aftermarket(tmp_path, kiwoom, run_id, profile):
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    today, _ = _today()
+    delivered = {}
+    asyncio.run(
+        collect_aftermarket_trade_ticks(
+            kiwoom, None, ["005930"], today, venue="KRX", profile=profile, capture_store=_capture_store(tmp_path),
+            run_id=run_id, on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    return delivered["005930"]
+
+
+def test_tick_resume_is_sized_from_vendor_remaining_and_completes_heavy_symbol(tmp_path) -> None:
+    kiwoom = _TapeKiwoom(95, page_rows=10, start_hms=160000)
+    profile = _tape_profile(tmp_path, COLLECTION_TICK_REPAIR_MAX_PAGES=20)
+    frame, entry = _run_tape_aftermarket(tmp_path, kiwoom, "run-tape-heavy", profile)
+    assert entry.status.value == "COMPLETE"
+    assert len(frame) == 95
+    assert entry.reason.endswith(":vendor_total=95")
+    assert len(kiwoom.calls) == 2
+    assert kiwoom.calls[1]["resume"].served == 20
+    assert kiwoom.calls[1]["budget"].max_pages == 9  # ceil(75 / 10) + margin 1
+    assert kiwoom.pages_served == 10  # the first pass is not re-downloaded
+    assert _ref_attempt_slots(entry) >= {0, 1}
+
+
+def test_tick_resume_guard_exhaustion_is_partial_never_complete(tmp_path) -> None:
+    kiwoom = _TapeKiwoom(95, page_rows=10, start_hms=160000)
+    frame, entry = _run_tape_aftermarket(tmp_path, kiwoom, "run-tape-guard", _tape_profile(tmp_path))
+    assert entry.status.value == "PARTIAL"
+    assert entry.reason == "page_budget:remaining=35"
+    assert frame.empty
+    assert len(entry.raw_refs) > 0
+
+
+def test_tick_resume_total_mismatch_is_partial(tmp_path) -> None:
+    kiwoom = _TapeKiwoom(95, page_rows=10, start_hms=160000, drop_on_resume=3)
+    profile = _tape_profile(tmp_path, COLLECTION_TICK_REPAIR_MAX_PAGES=20)
+    frame, entry = _run_tape_aftermarket(tmp_path, kiwoom, "run-tape-mismatch", profile)
+    assert entry.status.value == "PARTIAL"
+    assert entry.reason.startswith("total_mismatch:vendor_total=95:delivered=92")
+    assert frame.empty
+
+
+def test_tick_restart_without_cursor_replaces_first_pass_rows(tmp_path) -> None:
+    _, ymd = _today()
+    first = [_kw_tick_row(f"{ymd}170000")]
+    kiwoom = _AftermarketKiwoom([
+        {"rows": first, "truncated": True, "terminal": "page_budget"},
+        {"rows": [*first, _kw_tick_row(f"{ymd}170100")], "truncated": False, "terminal": "exhausted"},
+    ])
+    frame, entry = _run_aftermarket_ticks(kiwoom, "run-restart")
+    assert entry.status.value == "COMPLETE"
+    assert frame["ts_hms"].tolist() == [170000, 170100]
+    assert kiwoom.calls[1]["budget"] is not None
+
+
+def test_regular_tick_heavy_symbol_resumes_kiwoom_without_consulting_kis(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    today, _ = _today()
+
+    class _KisMustNotRun:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_intraday_trade_ticks(self, *args, **kwargs):
+            self.calls += 1
+            return {"rt_cd": "0", "output2": []}
+
+    kis = _KisMustNotRun()
+    kiwoom = _TapeKiwoom(95, page_rows=10, start_hms=90000)
+    profile = _tape_profile(tmp_path, COLLECTION_TICK_REPAIR_MAX_PAGES=20, COLLECTION_VERIFIED_CHART_ROUTES={"kiwoom:ka10079": "KRX"})
+    delivered = {}
+    asyncio.run(
+        collect_intraday_trade_ticks(
+            kis, None, ["005930"], today, kiwoom_client=kiwoom, profile=profile,
+            capture_store=_capture_store(tmp_path), run_id="run-regular-heavy",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "COMPLETE"
+    assert len(frame) == 95
+    assert kis.calls == 0
+    assert kiwoom.calls[1]["resume"] is not None
+
+
+def test_regular_tick_guard_exhaustion_falls_to_kis_and_stays_uncertified(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    today, _ = _today()
+
+    class _KisShortOfFloor:
+        async def get_intraday_trade_ticks(self, *args, **kwargs):
+            return {"rt_cd": "0", "output2": [_kis_tick_row("130010")], "floor_reached": False}
+
+    kiwoom = _TapeKiwoom(95, page_rows=10, start_hms=90000)
+    profile = _tape_profile(tmp_path, COLLECTION_VERIFIED_CHART_ROUTES={"kiwoom:ka10079": "KRX"})
+    delivered = {}
+    asyncio.run(
+        collect_intraday_trade_ticks(
+            _KisShortOfFloor(), None, ["005930"], today, kiwoom_client=kiwoom, profile=profile,
+            capture_store=_capture_store(tmp_path), run_id="run-regular-guard",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "PARTIAL"
+    assert entry.reason == "kis_floor_not_reached"
+    assert frame.empty
+
+
+def test_resume_budget_uses_runaway_guard_when_remaining_unknown_and_bounds_known_remaining() -> None:
+    from src.backfill.intraday.collector import _resume_budget
+    from src.config.collection import CollectionSettings
+
+    profile = CollectionSettings(
+        _env_file=None, COLLECTION_TICK_REPAIR_MAX_PAGES=50, COLLECTION_TICK_ROWS_PER_PAGE=10, COLLECTION_TICK_RESUME_MARGIN_PAGES=2,
+    )
+    assert _resume_budget(None, profile).max_pages == 50
+    assert _resume_budget(95, profile).max_pages == 12
+    assert _resume_budget(0, profile).max_pages == 2
+    assert _resume_budget(10_000, profile).max_pages == 50

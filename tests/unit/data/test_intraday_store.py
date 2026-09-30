@@ -418,6 +418,27 @@ def test_write_tick_partition_conserves_unaffected_symbols(tmp_path: Path, monke
     assert len(stored.query("symbol == '005930'")) == 2
 
 
+def test_write_tick_partition_repairs_symbol_into_all_null_legacy_column(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A legacy partition whose optional column is all-null must accept a repaired symbol carrying concrete values."""
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    legacy = pd.concat(
+        [_tick_rows("005930", date, [("090300", 70000, 10)]), _tick_rows("000660", date, [("090300", 50000, 7)])],
+        ignore_index=True,
+    )
+    legacy["trade_strength"] = None
+    path = intraday_store.tick_partition_path(date, "regular")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    legacy.to_parquet(path, index=False)
+    repaired = _tick_rows("005930", date, [("090400", 70100, 3), ("090500", 70200, 4)])
+    repaired["trade_strength"] = [101.5, 99.0]
+    total = intraday_store.write_tick_partition(repaired, date, "regular", coverage={"005930": _tick_entry("005930")})  # type: ignore[arg-type]
+    assert total == 3
+    stored = pd.read_parquet(path)
+    assert sorted(stored.loc[stored["symbol"] == "005930", "trade_strength"].tolist()) == [99.0, 101.5]
+    assert stored.loc[stored["symbol"] == "000660", "trade_strength"].isna().all()
+
+
 def test_write_tick_partition_rejects_partial_replacement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
     date = "2026-09-03"

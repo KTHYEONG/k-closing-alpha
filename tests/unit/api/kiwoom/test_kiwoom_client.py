@@ -938,3 +938,114 @@ def test_kiwoom_tick_rejects_unknown_venue_and_malformed_floor() -> None:
         asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=1, venue="AL"))  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="floor_hms"):
         asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=1, floor_hms="1600"))
+
+
+def _remaining_key(remaining: int, code: str = "005930", ymd: str = _YMD) -> str:
+    return f"A{code}{ymd}{remaining:08d}"
+
+
+def _tick_rows(count: int) -> list[dict]:
+    return [{"cur_prc": "270000", "trde_qty": "1", "cntr_tm": f"{_YMD}{140000 + i:06d}"} for i in range(count)]
+
+
+def test_kiwoom_tick_total_is_parsed_from_remaining_count_and_certifies_exhaustion() -> None:
+    client = _kiwoom_client()
+    fake, _ = _tick_pages(
+        [
+            _tick_page(_tick_rows(3), "Y", _remaining_key(4)),
+            _tick_page(_tick_rows(3), "Y", _remaining_key(1)),
+            _tick_page(_tick_rows(1), "N", _remaining_key(0)),
+        ]
+    )
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=5))
+    assert res["vendor_total_ticks"] == 7
+    assert res["rows_received"] == 7
+    assert res["termination_reason"] == "exhausted"
+    assert res["complete_by_total"] is True
+    assert res["cursor"] is None
+
+
+def test_kiwoom_tick_unparseable_key_gives_no_total_and_no_certificate() -> None:
+    client = _kiwoom_client()
+    fake, _ = _tick_pages([_tick_page(_tick_rows(2), "Y", "opaque-key"), _tick_page(_tick_rows(2), "N", "")])
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=5))
+    assert res["vendor_total_ticks"] is None
+    assert res["complete_by_total"] is False
+
+
+def test_kiwoom_tick_key_for_other_code_or_date_is_not_parsed() -> None:
+    client = _kiwoom_client()
+    fake, _ = _tick_pages(
+        [_tick_page(_tick_rows(2), "Y", _remaining_key(5, code="000660")), _tick_page(_tick_rows(2), "N", "")]
+    )
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=5))
+    assert res["vendor_total_ticks"] is None
+
+
+def test_kiwoom_tick_inconsistent_cursor_stops_uncertified() -> None:
+    client = _kiwoom_client()
+    fake, state = _tick_pages(
+        [
+            _tick_page(_tick_rows(3), "Y", _remaining_key(4)),
+            _tick_page(_tick_rows(3), "Y", _remaining_key(3)),
+            _tick_page(_tick_rows(1), "N", _remaining_key(0)),
+        ]
+    )
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=5))
+    assert state["calls"] == 2
+    assert res["termination_reason"] == "cursor_inconsistent"
+    assert res["truncated"] is True
+    assert res["complete_by_total"] is False
+    assert res["cursor"] is None
+
+
+def test_kiwoom_tick_budget_exhaustion_returns_resumable_cursor_and_resume_continues_totals() -> None:
+    client = _kiwoom_client()
+    seen: list[tuple[str, str]] = []
+    pages = [
+        _tick_page(_tick_rows(3), "Y", _remaining_key(4)),
+        _tick_page(_tick_rows(3), "Y", _remaining_key(1)),
+        _tick_page(_tick_rows(1), "N", _remaining_key(0)),
+    ]
+    fake, _ = _tick_pages(pages)
+
+    async def recording(session: Any, api_id: str, path: str, body: dict, cont_yn: str = "N", next_key: str = "", max_retries: int = 3) -> tuple[dict, dict]:
+        seen.append((cont_yn, next_key))
+        return await fake(session, api_id, path, body, cont_yn, next_key, max_retries)
+
+    client._post_tr = recording
+    first = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=1))
+    assert first["truncated"] is True and first["termination_reason"] == "page_budget"
+    cursor = first["cursor"]
+    assert cursor.next_key == _remaining_key(4)
+    assert cursor.rows_received == 3 and cursor.total_ticks == 7
+    resumed = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=5, resume=cursor))
+    assert seen[1] == ("Y", _remaining_key(4))
+    assert len(resumed["output2"]) == 4
+    assert resumed["vendor_total_ticks"] == 7 and resumed["rows_received"] == 7
+    assert resumed["complete_by_total"] is True and resumed["cursor"] is None
+
+
+def test_kiwoom_tick_resume_with_stale_cursor_is_rejected_by_invariant() -> None:
+    from src.api.kiwoom.client import TickCursor
+
+    client = _kiwoom_client()
+    fake, _ = _tick_pages([_tick_page(_tick_rows(3), "Y", _remaining_key(9))])
+    client._post_tr = fake
+    stale = TickCursor(next_key=_remaining_key(10), rows_received=3, total_ticks=7)
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=5, resume=stale))
+    assert res["termination_reason"] == "cursor_inconsistent"
+    assert res["complete_by_total"] is False
+
+
+def test_kiwoom_tick_remaining_parser_rejects_non_numeric_tail_and_empty_key() -> None:
+    from src.api.kiwoom.client import _parse_tick_remaining
+
+    assert _parse_tick_remaining(_remaining_key(12), "005930", _YMD) == 12
+    assert _parse_tick_remaining(f"A005930{_YMD}12x", "005930", _YMD) is None
+    assert _parse_tick_remaining(f"A005930{_YMD}", "005930", _YMD) is None
+    assert _parse_tick_remaining("", "005930", _YMD) is None
