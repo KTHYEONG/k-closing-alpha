@@ -1768,3 +1768,256 @@ def test_nx_rows_from_other_business_date_are_not_applicable(tmp_path) -> None:
     assert entry.reason == "nxt_empty"
     assert entry.raw_refs
     assert frame.empty
+
+
+def _retry_profile(tmp_path, *, retries=2):
+    from src.config.collection import CollectionSettings
+
+    return CollectionSettings(
+        COLLECTION_ROOT=tmp_path / "capture",
+        COLLECTION_VERIFIED_CHART_ROUTES={"kiwoom:ka10079": "KRX", "kiwoom:ka10079-nx": "NXT"},
+        COLLECTION_TRANSPORT_RETRIES=retries,
+        COLLECTION_TRANSPORT_BACKOFF_SECONDS=0.0,
+    )
+
+
+def _ref_attempt_slots(entry):
+    import re
+
+    slots = set()
+    for ref in entry.raw_refs:
+        match = re.search(r"-a(\d+)\.", str(ref.path))
+        if match:
+            slots.add(int(match.group(1)))
+    return slots
+
+
+class _RetryKiwoom:
+    """Scripted Kiwoom stub: each item is ("ok", batch), ("raise", exc) or ("page_then_raise", (batch, exc))."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls = []
+
+    async def get_tick_chart(self, session, code, snapshot_date, max_pages=None, budget=None, on_page=None, **kwargs):
+        self.calls.append({"code": code, "budget": budget})
+        kind, payload = self._script.pop(0)
+        if kind == "raise":
+            raise payload
+        if kind == "page_then_raise":
+            batch, exc = payload
+            start, received = _aware_page_clocks()
+            on_page({"stk_tic_chart_qry": batch["rows"]}, {"cont-yn": "Y"}, start, received, 0, 0)
+            raise exc
+        assert kind == "ok"
+        if on_page is not None:
+            start, received = _aware_page_clocks()
+            on_page({"stk_tic_chart_qry": payload["rows"]}, {"cont-yn": "N"}, start, received, 0, 0)
+        return {
+            "rt_cd": "0", "output2": payload["rows"], "vendor": "kiwoom",
+            "truncated": payload["truncated"], "termination_reason": payload["terminal"],
+            "pages_fetched": 1, "continuation": {},
+        }
+
+
+def _ok_batch(rows, *, truncated=False, terminal="crossed_time_floor"):
+    return {"rows": rows, "truncated": truncated, "terminal": terminal}
+
+
+def _run_retry_aftermarket_ticks(tmp_path, kiwoom, run_id, *, retries=2, venue="KRX"):
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    today, _ = _today()
+    delivered = {}
+    asyncio.run(
+        collect_aftermarket_trade_ticks(
+            kiwoom, None, ["005930"], today, venue=venue,
+            profile=_retry_profile(tmp_path, retries=retries), capture_store=_capture_store(tmp_path), run_id=run_id,
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    return delivered["005930"]
+
+
+def test_tick_transport_transient_error_recovered(tmp_path) -> None:
+    import aiohttp
+
+    _, ymd = _today()
+    first_rows = [_kw_tick_row(f"{ymd}160000")]
+    second_rows = [_kw_tick_row(f"{ymd}170000")]
+    kiwoom = _RetryKiwoom([
+        ("page_then_raise", (_ok_batch(first_rows), aiohttp.ClientConnectionError("drop"))),
+        ("ok", _ok_batch(second_rows)),
+    ])
+    frame, entry = _run_retry_aftermarket_ticks(tmp_path, kiwoom, "run-retry-recovered")
+
+    assert entry.status.value == "COMPLETE"
+    assert not frame.empty
+    assert len(kiwoom.calls) == 2
+    assert _ref_attempt_slots(entry) == {0, 1}
+    assert frame["ts_hms"].tolist() == [170000]
+
+
+def test_tick_transport_retries_exhausted(tmp_path) -> None:
+    import aiohttp
+
+    kiwoom = _RetryKiwoom([("raise", aiohttp.ClientConnectionError("drop"))] * 3)
+    frame, entry = _run_retry_aftermarket_ticks(tmp_path, kiwoom, "run-retry-exhausted")
+
+    assert len(kiwoom.calls) == 3
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "transport:ClientConnectionError"
+    assert frame.empty
+
+
+def test_tick_transport_non_transient_not_retried(tmp_path) -> None:
+    kiwoom = _RetryKiwoom([("raise", RuntimeError("kw down"))])
+    frame, entry = _run_retry_aftermarket_ticks(tmp_path, kiwoom, "run-retry-nontransient")
+
+    assert len(kiwoom.calls) == 1
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "transport:RuntimeError"
+    assert frame.empty
+
+
+def test_tick_transport_retry_disabled(tmp_path) -> None:
+    import aiohttp
+
+    kiwoom = _RetryKiwoom([("raise", aiohttp.ClientConnectionError("drop"))])
+    frame, entry = _run_retry_aftermarket_ticks(tmp_path, kiwoom, "run-retry-disabled", retries=0)
+
+    assert len(kiwoom.calls) == 1
+    assert entry.status.value == "FAILED"
+    assert frame.empty
+
+
+def test_tick_transport_backoff_schedule(monkeypatch) -> None:
+    import asyncio
+
+    import aiohttp
+
+    from src.backfill.intraday.collector import _call_with_transport_retry
+    from src.config.collection import CollectionSettings
+
+    sleeps: list[float] = []
+
+    async def _recorder(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _recorder)
+    slots: list[int] = []
+
+    async def _invoke(slot):
+        slots.append(slot)
+        if len(slots) < 3:
+            raise aiohttp.ClientConnectionError("drop")
+        return {"ok": True}
+
+    profile = CollectionSettings(COLLECTION_TRANSPORT_RETRIES=2, COLLECTION_TRANSPORT_BACKOFF_SECONDS=3.0)
+    payload, next_slot = asyncio.run(
+        _call_with_transport_retry(_invoke, first_attempt=5, profile=profile, code="005930")
+    )
+
+    assert payload == {"ok": True}
+    assert slots == [5, 6, 7]
+    assert next_slot == 8
+    assert sleeps == [3.0, 6.0]
+
+
+def test_tick_transport_repair_retried_with_fresh_slot(tmp_path) -> None:
+    import aiohttp
+
+    _, ymd = _today()
+    first_rows = [_kw_tick_row(f"{ymd}160000")]
+    repair_rows = [_kw_tick_row(f"{ymd}170000")]
+    kiwoom = _RetryKiwoom([
+        ("ok", _ok_batch(first_rows, truncated=True, terminal="page_budget")),
+        ("page_then_raise", (_ok_batch(repair_rows), aiohttp.ClientConnectionError("drop"))),
+        ("ok", _ok_batch(repair_rows)),
+    ])
+    frame, entry = _run_retry_aftermarket_ticks(tmp_path, kiwoom, "run-retry-repair")
+
+    assert entry.status.value == "COMPLETE"
+    assert len(kiwoom.calls) == 3
+    assert _ref_attempt_slots(entry) == {0, 1, 2}
+    assert frame["ts_hms"].tolist() == [170000]
+
+
+def test_tick_transport_vendor_failure_not_retried(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    class _VendorFailKiwoom:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_tick_chart(self, session, code, snapshot_date, **kwargs):
+            self.calls += 1
+            return {"rt_cd": "1", "msg1": "busy", "output2": []}
+
+    today, _ = _today()
+    kiwoom = _VendorFailKiwoom()
+    delivered = {}
+    asyncio.run(
+        collect_aftermarket_trade_ticks(
+            kiwoom, None, ["005930"], today, venue="KRX",
+            profile=_retry_profile(tmp_path), capture_store=_capture_store(tmp_path), run_id="run-retry-vendorfail",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    _, entry = delivered["005930"]
+
+    assert kiwoom.calls == 1
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "vendor_failure"
+
+
+def test_tick_transport_exhaustion_falls_through_to_ls(tmp_path) -> None:
+    import asyncio
+
+    import aiohttp
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+    from src.config.collection import CollectionSettings
+
+    today, ymd = _today()
+    kiwoom = _KiwoomTicks([aiohttp.ClientConnectionError("drop")] * 3)
+    ls = _LsTicks([_ls_tick_row("093000", day=ymd)])
+    profile = CollectionSettings(
+        COLLECTION_ROOT=tmp_path / "capture",
+        COLLECTION_VERIFIED_CHART_ROUTES={"ls:t8411": "KRX"},
+        COLLECTION_TRANSPORT_RETRIES=2,
+        COLLECTION_TRANSPORT_BACKOFF_SECONDS=0.0,
+    )
+    delivered = {}
+    asyncio.run(
+        collect_intraday_trade_ticks(
+            _KisBars([]), None, ["005930"], today, ls_client=ls, kiwoom_client=kiwoom,
+            profile=profile, capture_store=_capture_store(tmp_path), run_id="run-retry-ls-fallback",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+
+    assert len(kiwoom.calls) == 3
+    assert entry.status.value == "COMPLETE"
+    assert entry.venue == "KRX"
+    assert not frame.empty
+
+
+def test_tick_transport_settings_validation() -> None:
+    import pytest
+
+    from src.config.collection import CollectionSettings
+
+    with pytest.raises(ValueError, match="TRANSPORT_RETRIES"):
+        CollectionSettings(COLLECTION_TRANSPORT_RETRIES=-1)
+    with pytest.raises(ValueError, match="TRANSPORT_BACKOFF"):
+        CollectionSettings(COLLECTION_TRANSPORT_BACKOFF_SECONDS=-1.0)
+    with pytest.raises(ValueError, match="TRANSPORT_BACKOFF"):
+        CollectionSettings(COLLECTION_TRANSPORT_BACKOFF_SECONDS=float("inf"))
+    with pytest.raises(ValueError, match="TRANSPORT_BACKOFF"):
+        CollectionSettings(COLLECTION_TRANSPORT_BACKOFF_SECONDS=float("nan"))

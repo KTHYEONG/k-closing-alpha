@@ -50,6 +50,8 @@ class CollectionSettings(EnvSettings):
         COLLECTION_AFTERMARKET_BOOK_DENSE_SECONDS: Dense aftermarket book spacing, default 60.
         COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES: Full-cohort sweep instants, default eleven evening times.
         COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS: Rounds buffered before a normalized flush, default 15.
+        COLLECTION_TRANSPORT_RETRIES: Extra tries after a transient transport error, default 2.
+        COLLECTION_TRANSPORT_BACKOFF_SECONDS: Delay before the first retry, doubled per retry, default 3.0.
 
     Raises:
         ValueError: Invalid limits, duplicate slots, or enabled auctions without
@@ -84,6 +86,8 @@ class CollectionSettings(EnvSettings):
         default=("154500", "160500", "163000", "170000", "173000", "180000", "183000", "190000", "193000", "195000", "195800")
     )
     COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS: int = Field(default=15, gt=0)
+    COLLECTION_TRANSPORT_RETRIES: int = Field(default=2, ge=0)
+    COLLECTION_TRANSPORT_BACKOFF_SECONDS: float = Field(default=3.0, ge=0, allow_inf_nan=False)
 
     @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", "COLLECTION_BACKFILL_SLOTS", "COLLECTION_AFTERMARKET_BOOK_SLOTS", mode="before")
     @classmethod
