@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -250,6 +251,41 @@ class DatedOpenQuote:
     symbol: str
     business_date: str
     open_price: int
+
+
+def load_open_lot_marks(open_positions: pd.DataFrame, as_of_date: str, path: Path | None = None) -> dict[str, int]:
+    """Latest daily close before `as_of_date` for symbols with lots carried from earlier sessions.
+
+    Lots entered on `as_of_date` need no mark (their entry fill is the close). A missing panel or symbol
+    yields no mark, which the NAV snapshot surfaces as `n_open_unmarked` instead of a silent zero loss.
+
+    Args:
+        open_positions: Open lots with symbol and decision_date columns.
+        as_of_date: Snapshot date (YYYY-MM-DD, KST).
+        path: Price panel parquet; None reads the configured price_history panel.
+
+    Returns:
+        Symbol to close in KRW.
+    """
+    if open_positions is None or len(open_positions) == 0:
+        return {}
+    carried = open_positions[open_positions["decision_date"].astype(str) < as_of_date]
+    symbols = sorted({str(code) for code in carried["symbol"]})
+    if not symbols:
+        return {}
+    try:
+        panel = pd.read_parquet(
+            settings.PRICE_HISTORY_PARQUET_PATH if path is None else path,
+            columns=["symbol", "date", "close"],
+            filters=[("symbol", "in", symbols)],
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning("[PORTFOLIO] stage=paper_marks status=UNAVAILABLE symbols=%d error=%s", len(symbols), exc)
+        return {}
+    panel["date"] = pd.to_datetime(panel["date"])
+    panel = panel[panel["date"] < pd.Timestamp(as_of_date)].sort_values("date")
+    last = panel.groupby(panel["symbol"].astype(str))["close"].last()
+    return {code: int(close) for code, close in last.items() if pd.notna(close) and float(close) > 0}
 
 
 async def fetch_krx_dated_open_quote(client: Any, session: Any, code: str, decision_date: str) -> DatedOpenQuote:
@@ -568,7 +604,12 @@ async def run_paper_session(
                 ledger.record(fills, kind="fills")
             if order_rows:
                 ledger.record(order_rows, kind="orders")
-            refresh_trade_ledgers(ledger, settings.PAPER_SEED_CAPITAL, date_str)
+            refresh_trade_ledgers(
+                ledger,
+                settings.PAPER_SEED_CAPITAL,
+                date_str,
+                marks=load_open_lot_marks(ledger.load_open_positions(), date_str),
+            )
             return len(fills)
     placed_at = _placed_at(date_str, PAPER_EXIT_OPEN_AUCTION_HHMMSS)
     owned_session: aiohttp.ClientSession | None = None
@@ -738,7 +779,12 @@ async def run_paper_session(
                 logger.warning(
                     "[EXEC] stage=paper_exit status=OPEN_UNAVAILABLE date=%s symbols=%s", date_str, unfilled_symbols
                 )
-            refresh_trade_ledgers(ledger, settings.PAPER_SEED_CAPITAL, date_str)
+            refresh_trade_ledgers(
+                ledger,
+                settings.PAPER_SEED_CAPITAL,
+                date_str,
+                marks=load_open_lot_marks(ledger.load_open_positions(), date_str),
+            )
             return len(fills)
     finally:
         if owned_session is not None:

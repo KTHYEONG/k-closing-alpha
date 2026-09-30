@@ -13,7 +13,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +23,7 @@ import pandas as pd
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet
+from src.data.session_calendar import SessionKind, resolve_session_day
 from src.execution.cost_model import BROKERAGE_SIDE_BP, statutory_bp_asof
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,7 @@ ROUND_TRIP_COLUMNS: tuple[str, ...] = (
     "net_pnl",
     "gross_ret",
     "net_ret",
+    "carry_days",
 )
 
 NAV_COLUMNS: tuple[str, ...] = (
@@ -95,6 +97,9 @@ NAV_COLUMNS: tuple[str, ...] = (
     "nav",
     "n_open_positions",
     "n_closed_trades",
+    "open_market_value",
+    "nav_mtm",
+    "n_open_unmarked",
     "recorded_at",
 )
 
@@ -304,6 +309,29 @@ def order_record(order: PaperOrder, status: str) -> dict[str, Any]:
     }
 
 
+def carry_days(entry_filled_at: Any, exit_filled_at: Any) -> int:
+    """Trading days an exit slipped past the first session after entry.
+
+    Args:
+        entry_filled_at: Entry fill timestamp (KST).
+        exit_filled_at: Exit fill timestamp (KST).
+
+    Returns:
+        0 when the exit filled on the first trading day after entry (weekends and closed sessions
+        do not count as slippage); otherwise the number of additional trading days held. Dates the
+        verified calendar cannot resolve are counted as trading days, so the value never understates
+        a carry.
+    """
+    day = pd.Timestamp(entry_filled_at).date()
+    end = pd.Timestamp(exit_filled_at).date()
+    sessions = 0
+    while day < end:
+        day = day + pd.Timedelta(days=1)
+        if resolve_session_day(day).kind is not SessionKind.CLOSED:
+            sessions += 1
+    return max(0, sessions - 1)
+
+
 def build_round_trips(fills: pd.DataFrame) -> pd.DataFrame:
     """Pair buy/sell fills into entry-linked round trips with explicit costs.
 
@@ -379,6 +407,7 @@ def build_round_trips(fills: pd.DataFrame) -> pd.DataFrame:
                     "net_pnl": net_pnl,
                     "gross_ret": exit_price / entry_price - 1.0,
                     "net_ret": net_pnl / entry_notional,
+                    "carry_days": carry_days(buy.get("filled_at"), sell_filled_at),
                 }
             )
         else:
@@ -388,13 +417,24 @@ def build_round_trips(fills: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=list(ROUND_TRIP_COLUMNS))
 
 
-def build_nav_snapshot(fills: pd.DataFrame, seed_capital: int, as_of_date: str) -> pd.DataFrame:
+def build_nav_snapshot(
+    fills: pd.DataFrame,
+    seed_capital: int,
+    as_of_date: str,
+    marks: Mapping[str, int] | None = None,
+) -> pd.DataFrame:
     """Build a single-row NAV snapshot from the fill ledger.
+
+    `nav` values open lots at cost and never changes with prices. `nav_mtm` values each open lot
+    at its mark instead: lots filled on `as_of_date` are at their entry price by construction, older
+    lots use `marks[symbol]`, and a lot without a positive mark stays at cost and is counted in
+    `n_open_unmarked` so a missing price can never be mistaken for zero loss.
 
     Args:
         fills: Fill ledger rows.
         seed_capital: Starting capital in KRW.
         as_of_date: Snapshot date string.
+        marks: Latest known close per symbol observable before the snapshot; None when unavailable.
 
     Returns:
         One-row frame with NAV_COLUMNS schema.
@@ -413,6 +453,9 @@ def build_nav_snapshot(fills: pd.DataFrame, seed_capital: int, as_of_date: str) 
                     "nav": int(seed_capital),
                     "n_open_positions": 0,
                     "n_closed_trades": 0,
+                    "open_market_value": 0,
+                    "nav_mtm": int(seed_capital),
+                    "n_open_unmarked": 0,
                     "recorded_at": pd.Timestamp.now(tz="Asia/Seoul"),
                 }
             ],
@@ -431,7 +474,9 @@ def build_nav_snapshot(fills: pd.DataFrame, seed_capital: int, as_of_date: str) 
     closed_ids = set(trips["entry_order_id"].tolist()) if not trips.empty else set()
     open_cost_basis = 0
     open_buy_fees = 0
+    open_market_value = 0
     n_open = 0
+    n_unmarked = 0
     for rec in records:
         if str(rec.get("side")) == "buy" and rec.get("order_id") not in closed_ids:
             notional = int(rec.get("fill_price")) * int(rec.get("qty"))
@@ -439,6 +484,14 @@ def build_nav_snapshot(fills: pd.DataFrame, seed_capital: int, as_of_date: str) 
             open_cost_basis += notional
             open_buy_fees += fee
             n_open += 1
+            mark = int((marks or {}).get(str(rec.get("symbol")), 0))
+            if pd.Timestamp(rec.get("filled_at")).strftime("%Y-%m-%d") == as_of_date:
+                open_market_value += notional
+            elif mark > 0:
+                open_market_value += mark * int(rec.get("qty"))
+            else:
+                open_market_value += notional
+                n_unmarked += 1
     exit_inflow = 0
     realized_net_pnl = 0
     sell_costs = 0
@@ -463,6 +516,9 @@ def build_nav_snapshot(fills: pd.DataFrame, seed_capital: int, as_of_date: str) 
                 "nav": int(nav),
                 "n_open_positions": int(n_open),
                 "n_closed_trades": len(trips),
+                "open_market_value": int(open_market_value),
+                "nav_mtm": int(cash + open_market_value),
+                "n_open_unmarked": int(n_unmarked),
                 "recorded_at": pd.Timestamp.now(tz="Asia/Seoul"),
             }
         ],
@@ -470,13 +526,19 @@ def build_nav_snapshot(fills: pd.DataFrame, seed_capital: int, as_of_date: str) 
     )
 
 
-def refresh_trade_ledgers(ledger: PaperLedger, seed_capital: int, as_of_date: str) -> int:
+def refresh_trade_ledgers(
+    ledger: PaperLedger,
+    seed_capital: int,
+    as_of_date: str,
+    marks: Mapping[str, int] | None = None,
+) -> int:
     """Refresh derived trade and NAV ledgers from effective fills.
 
     Args:
         ledger: Paper ledger to read fills from and write to.
         seed_capital: Starting capital in KRW.
         as_of_date: Snapshot date string.
+        marks: Latest known close per symbol for open lots carried from earlier sessions.
 
     Returns:
         Number of closed round trips.
@@ -486,7 +548,7 @@ def refresh_trade_ledgers(ledger: PaperLedger, seed_capital: int, as_of_date: st
     if trips.empty:
         trips = pd.DataFrame(columns=list(ROUND_TRIP_COLUMNS))
     ledger.rewrite_derived(trips, "trades")
-    nav_df = build_nav_snapshot(fills, seed_capital, as_of_date)
+    nav_df = build_nav_snapshot(fills, seed_capital, as_of_date, marks)
     ledger.record(nav_df.to_dict("records"), kind="nav")
     nav_row = nav_df.iloc[0]
     logger.info(
