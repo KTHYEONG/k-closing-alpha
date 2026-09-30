@@ -33,10 +33,10 @@ class CollectionSettings(EnvSettings):
         COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE: Symbols buffered before an intraday partition flush,
             default 25.
         COLLECTION_CHART_MAX_PAGES: Normal page budget, default 30.
-        COLLECTION_TICK_REPAIR_MAX_PAGES: Explicit total repair budget, default 400.
-            Measured worst case is ~180 pages for the most active symbol; the budget
-            must cover a full session with headroom, otherwise the truncation falls
-            through to weaker sources.
+        COLLECTION_TICK_REPAIR_MAX_PAGES: Explicit total repair budget, default 1000.
+            Measured worst case is ~390 pages (a ~350k-tick symbol on 2026-09-30) and
+            the tail is unbounded, so this is a runaway guard with ~2.5x headroom; an
+            exhausted budget is recorded as PARTIAL and surfaced by the tick audit.
         COLLECTION_ARROW_BATCH_ROWS: Bounded rewrite batch size, default 65536.
         COLLECTION_MAX_RSS_MIB: Measured batch-worker acceptance ceiling, default 1024.
         COLLECTION_ALTDATA_LOOKBACK_DAYS: Rolling re-observation window, default 30.
@@ -71,7 +71,9 @@ class CollectionSettings(EnvSettings):
     COLLECTION_CONCURRENCY_PER_KEY: int = Field(default=8, gt=0)
     COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE: int = Field(default=25, gt=0)
     COLLECTION_CHART_MAX_PAGES: int = Field(default=30, gt=0)
-    COLLECTION_TICK_REPAIR_MAX_PAGES: int = Field(default=400, gt=0)
+    COLLECTION_TICK_REPAIR_MAX_PAGES: int = Field(default=1000, gt=0)
+    COLLECTION_TICK_ROWS_PER_PAGE: int = Field(default=900, gt=0)
+    COLLECTION_TICK_RESUME_MARGIN_PAGES: int = Field(default=5, ge=0)
     COLLECTION_ARROW_BATCH_ROWS: int = Field(default=65536, gt=0)
     COLLECTION_MAX_RSS_MIB: int = Field(default=1024, gt=0)
     COLLECTION_ALTDATA_LOOKBACK_DAYS: int = Field(default=30, gt=0)

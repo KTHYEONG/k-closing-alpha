@@ -34,7 +34,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--end", required=True, help="Inclusive repair end (YYYY-MM-DD).")
     parser.add_argument("--dataset", action="append", default=[], help="Repeatable dataset in {regular_bars, regular_ticks}.")
     parser.add_argument("--symbol", action="append", default=[], help="Repeatable symbol filter.")
-    parser.add_argument("--max-pages", type=int, default=None, help="Bounded page budget per attempt.")
+    parser.add_argument("--max-pages", type=int, default=None, help="Bounded first-pass page budget per attempt (overrides COLLECTION_CHART_MAX_PAGES only; the resume pass is sized from the cursor remaining count plus margin, so it stays cheap).")
     parser.add_argument("--deadline", default=None, help="Aware ISO timestamp bounding repair work.")
     parser.add_argument("--apply", action="store_true", help="Apply certified attempts through partition writers.")
     return parser.parse_args(argv)

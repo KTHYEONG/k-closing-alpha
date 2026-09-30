@@ -293,6 +293,23 @@ def _check_legacy_unchanged(target: Path, incoming: pd.DataFrame, symbols: set[s
             raise ValueError(f"Changed uncertified attempt requires certification: {symbol!r}")
 
 
+def _promote_null_fields(existing: pa.Schema, incoming: pa.Schema | None) -> pa.Schema:
+    """Give all-null legacy columns the incoming concrete type so repaired symbols can be rewritten into them.
+
+    A legacy partition whose optional column was entirely null is stored with the null type, which cannot
+    hold the concrete values of a certified re-collection; the column keeps every existing null unchanged.
+    """
+    if incoming is None:
+        return existing
+    fields = []
+    for field in existing:
+        position = incoming.get_field_index(field.name)
+        if pa.types.is_null(field.type) and position >= 0 and not pa.types.is_null(incoming.field(position).type):
+            field = field.with_type(incoming.field(position).type)
+        fields.append(field)
+    return pa.schema(fields, metadata=existing.metadata)
+
+
 def _bounded_symbol_replace(
     target: Path,
     incoming: pd.DataFrame,
@@ -317,6 +334,12 @@ def _bounded_symbol_replace(
         kept_rows = 0
         writer: pq.ParquetWriter | None = None
         schema: pa.Schema | None = None
+        incoming_table: pa.Table | None = None
+        if len(incoming) > 0:
+            ordered_incoming = incoming
+            if sort_output:
+                ordered_incoming = incoming.sort_values(["symbol", "ts_hms"], kind="stable").reset_index(drop=True)
+            incoming_table = pa.Table.from_pandas(ordered_incoming, preserve_index=False)
         try:
             if target.exists():
                 handle = pq.ParquetFile(target)
@@ -329,18 +352,15 @@ def _bounded_symbol_replace(
                         continue
                     table = pa.Table.from_pandas(keep, preserve_index=False)
                     if writer is None:
-                        schema = table.schema
+                        schema = _promote_null_fields(table.schema, incoming_table.schema if incoming_table is not None else None)
                         staging.parent.mkdir(parents=True, exist_ok=True)
                         writer = pq.ParquetWriter(
                             staging, schema, compression=INTRADAY_COMPRESSION, compression_level=PARQUET_COMPRESSION_LEVEL
                         )
                     kept_rows += len(keep)
                     writer.write_table(table.cast(schema))
-            if len(incoming) > 0:
-                ordered = incoming
-                if sort_output:
-                    ordered = incoming.sort_values(["symbol", "ts_hms"], kind="stable").reset_index(drop=True)
-                table = pa.Table.from_pandas(ordered, preserve_index=False)
+            if incoming_table is not None:
+                table = incoming_table
                 if schema is None:
                     schema = table.schema
                 if writer is None:

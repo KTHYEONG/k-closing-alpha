@@ -56,6 +56,13 @@ def test_repair_and_normal_limits_agree() -> None:
     assert ok.COLLECTION_TICK_REPAIR_MAX_PAGES >= ok.COLLECTION_CHART_MAX_PAGES
 
 
+def test_default_repair_budget_covers_measured_worst_case_session(monkeypatch) -> None:
+    """The default repair budget must exceed the heaviest measured session (~390 pages) with headroom."""
+    monkeypatch.delenv("COLLECTION_TICK_REPAIR_MAX_PAGES", raising=False)
+    settings = CollectionSettings(_env_file=None)
+    assert settings.COLLECTION_TICK_REPAIR_MAX_PAGES >= 2 * 390
+
+
 def test_existing_exports_remain_stable() -> None:
     """Existing exports remain stable."""
     from src import settings as settings_module

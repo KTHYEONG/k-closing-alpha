@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 from zoneinfo import ZoneInfo
@@ -32,6 +33,33 @@ _KIWOOM_USER_AGENT = "curl/8.5.0"
 
 _SEOUL = ZoneInfo("Asia/Seoul")
 _CNTR_TM_RE = re.compile(r"^\d{14}$")
+
+
+@dataclass(frozen=True)
+class TickCursor:
+    """Opaque continuation of a newest-first ka10079 pagination.
+
+    Attributes:
+        next_key: Vendor cursor header value for the next page.
+        rows_received: Rows already consumed before this cursor (all pages of the pagination so far).
+        total_ticks: Vendor-implied total (rows_received + remaining) when it could be parsed, else None.
+    """
+
+    next_key: str
+    rows_received: int
+    total_ticks: int | None
+
+
+def _parse_tick_remaining(next_key: str, base_code: str, ymd: str) -> int | None:
+    """Parse the vendor remaining count from a ``next-key`` header.
+
+    The documented form is ``A<code><YYYYMMDD><remaining>``; anything else
+    yields ``None`` (fail closed: no certificate, never a guess).
+    """
+    prefix = f"A{base_code}{ymd}"
+    key = str(next_key or "")
+    tail = key[len(prefix):] if key.startswith(prefix) else ""
+    return int(tail) if tail.isdigit() else None
 
 
 def _now_seoul() -> datetime:
@@ -252,6 +280,7 @@ class KiwoomApiClient:
         on_page: PageObserver | None = None,
         venue: Literal["KRX", "NXT"] = "KRX",
         floor_hms: str | None = None,
+        resume: TickCursor | None = None,
     ) -> BrokerPayload:
         """Expose incomplete successful tick responses as bounded repairable tasks.
 
@@ -267,9 +296,14 @@ class KiwoomApiClient:
             floor_hms: Optional HHMMSS lower bound. Pagination stops with termination "crossed_time_floor" once the
                 oldest row of a page is on the target date and earlier than floor_hms, proving the window above
                 the floor was fully traversed without paging through the regular session.
+            resume: Opaque continuation from a previous truncated pagination. The first request sends
+                ``cont-yn=Y`` with ``resume.next_key``; totals continue from the cursor so the
+                ``rows_received + remaining == total`` invariant spans both calls. Rows of the resumed
+                call are returned WITHOUT the earlier prefix; the caller owns concatenation.
 
         Returns:
-            Existing rt_cd/output2/vendor/truncated keys plus termination metadata.
+            Existing rt_cd/output2/vendor/truncated keys plus termination metadata, ``cursor``,
+            ``vendor_total_ticks``, ``rows_received`` and ``complete_by_total``.
 
         Raises:
             ValueError: Invalid or conflicting bounds.
@@ -290,7 +324,15 @@ class KiwoomApiClient:
             page_budget, deadline = max(1, int(max_pages)), None
         else:
             page_budget, deadline = _resolve_chart_budget(None, int(settings.COLLECTION_CHART_MAX_PAGES))
-        cont_yn, next_key = "N", ""
+        base_code = str(code).split("_")[0]
+        if resume is not None:
+            cont_yn, next_key = "Y", str(resume.next_key)
+            rows_received = int(resume.rows_received)
+            vendor_total: int | None = resume.total_ticks
+        else:
+            cont_yn, next_key = "N", ""
+            rows_received = 0
+            vendor_total = None
         all_rows: list[dict[str, Any]] = []
         metadata: dict[str, str] = {}
         termination = "exhausted"
@@ -300,11 +342,13 @@ class KiwoomApiClient:
         prev_identity: tuple[Any, ...] | None = None
         stalls = 0
         in_observer = False
+        last_header_cont = "N"
+        last_header_key = ""
         request_code = str(code) if venue == "KRX" else f"{str(code).split('_')[0]}_NX"
         try:
             for page_index in range(max(1, int(page_budget))):
-                remaining = _deadline_remaining(deadline)
-                if remaining is not None and remaining <= 0:
+                deadline_left = _deadline_remaining(deadline)
+                if deadline_left is not None and deadline_left <= 0:
                     termination = "deadline"
                     truncated = True
                     break
@@ -314,14 +358,15 @@ class KiwoomApiClient:
                     {"stk_cd": request_code, "tic_scope": "1", "upd_stkpc_tp": "1", "base_dt": ymd},
                     cont_yn=cont_yn, next_key=next_key,
                 )
-                if remaining is None:
+                if deadline_left is None:
                     data, resp_headers = await call
                 else:
-                    data, resp_headers = await asyncio.wait_for(call, timeout=remaining)
+                    data, resp_headers = await asyncio.wait_for(call, timeout=deadline_left)
                 received = _now_seoul()
                 header_cont = str(resp_headers.get("cont-yn", "N") or "N")
                 header_key = str(resp_headers.get("next-key", "") or "")
                 metadata = {"cont-yn": header_cont, "next-key": header_key}
+                last_header_cont, last_header_key = header_cont, header_key
                 in_observer = True
                 if on_page is not None:
                     on_page(dict(data), metadata, started, received, page_index, 0)
@@ -333,8 +378,20 @@ class KiwoomApiClient:
                     failure_msg = str(data.get("return_msg", ""))
                     break
                 rows = data.get("stk_tic_chart_qry") or []
-                if rows:
-                    all_rows.extend(dict(r) for r in rows if isinstance(r, dict))
+                dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
+                rows_before = rows_received
+                if dict_rows:
+                    all_rows.extend(dict_rows)
+                rows_received += len(dict_rows)
+                parsed = _parse_tick_remaining(header_key, base_code, ymd)
+                if parsed is not None:
+                    candidate = rows_before + len(dict_rows) + parsed
+                    if vendor_total is None:
+                        vendor_total = candidate
+                    elif candidate != vendor_total:
+                        termination = "cursor_inconsistent"
+                        truncated = True
+                        break
                 identity = (
                     header_cont,
                     header_key,
@@ -349,6 +406,9 @@ class KiwoomApiClient:
                     termination = "nonprogress"
                     truncated = True
                     break
+                if parsed is not None and parsed == 0:
+                    termination = "exhausted"
+                    break
                 if header_cont != "Y":
                     termination = "exhausted"
                     break
@@ -356,7 +416,7 @@ class KiwoomApiClient:
                     termination = "cursor_unknown"
                     truncated = True
                     break
-                oldest = str(rows[-1].get("cntr_tm", "") or "") if rows else ""
+                oldest = str(dict_rows[-1].get("cntr_tm", "") or "") if dict_rows else ""
                 if _CNTR_TM_RE.fullmatch(oldest) and oldest[:8] < ymd:
                     termination = "crossed_target_date"
                     break
@@ -379,11 +439,15 @@ class KiwoomApiClient:
             if in_observer:
                 raise
             logger.warning("Kiwoom tick chart failed code=%s: %s", code, e)
-            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "kiwoom", "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": pages_fetched, "continuation": metadata}
+            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "kiwoom", "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": pages_fetched, "continuation": metadata, "cursor": None, "vendor_total_ticks": vendor_total, "rows_received": rows_received, "complete_by_total": False}
         if termination == "vendor_failure":
-            return {"rt_cd": "1", "msg1": failure_msg, "output2": [], "vendor": "kiwoom", "truncated": True, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata}
+            return {"rt_cd": "1", "msg1": failure_msg, "output2": [], "vendor": "kiwoom", "truncated": True, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "cursor": None, "vendor_total_ticks": vendor_total, "rows_received": rows_received, "complete_by_total": False}
         filtered = [dict(r) for r in all_rows if str(r.get("cntr_tm", "")).startswith(ymd)]
-        return {"rt_cd": "0", "output2": filtered, "vendor": "kiwoom", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata}
+        complete_by_total = termination == "exhausted" and vendor_total is not None
+        cursor: TickCursor | None = None
+        if truncated and last_header_cont == "Y" and last_header_key and termination in ("page_budget", "deadline", "crossed_time_floor"):
+            cursor = TickCursor(next_key=last_header_key, rows_received=rows_received, total_ticks=vendor_total)
+        return {"rt_cd": "0", "output2": filtered, "vendor": "kiwoom", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "cursor": cursor, "vendor_total_ticks": vendor_total, "rows_received": rows_received, "complete_by_total": complete_by_total}
 
     async def get_nxt_premarket_chart(self, session, code: str, target_date: str) -> dict:
         ymd = str(target_date).replace("-", "")
