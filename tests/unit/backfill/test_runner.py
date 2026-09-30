@@ -1,4 +1,4 @@
-"""Runner re-export gate for lean_check co-modification check."""
+"""Contract test: the altdata runner re-exports the collectors of the newer panels."""
 
 from __future__ import annotations
 
