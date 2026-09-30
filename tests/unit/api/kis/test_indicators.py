@@ -1,7 +1,7 @@
-"""Name-matched co-mod test for src/api/kis/indicators.py (lean_check gate).
+"""Name-matched contract test for src/api/kis/indicators.py.
 
-Mirrors the contract scenario test_indicators_kis_clients_use_data_key_kwargs
-verbatim; the canonical scenario lives in tests/unit/api/kis/test_kis_client_helpers.py.
+Mirrors the scenario test_indicators_kis_clients_use_data_key_kwargs verbatim; the canonical
+scenario lives in tests/unit/api/kis/test_kis_client_helpers.py.
 """
 
 from __future__ import annotations

@@ -71,9 +71,6 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106", "E402", "N803", "N806", "N813", "N814", "ARG", "I001", "RUF059", "F841", "F401", "F811", "PT018", "RUF012"]
-"tools/agent_skills/lean_check.py" = ["T20", "S607"]
-"tools/agent_skills/gen_code_map.py" = ["T20"]
-"tools/agent_skills/sync_task.py" = ["T20", "S607", "S110"]
 "src/settings.py" = ["N802", "N803"]
 "src/config/*.py" = ["N802", "N803"]
 "src/api/kis/*.py" = ["T20", "ASYNC230", "ASYNC240", "S110", "SIM108", "B006"]
