@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.11-slim AS base
+FROM python:3.11.16-slim-trixie AS base
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.20 /uv /uvx /bin/
 
 WORKDIR /app
 
