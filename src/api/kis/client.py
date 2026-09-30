@@ -675,7 +675,12 @@ class KisApiClient:
     async def get_intraday_trade_ticks(
         self, session, code: str, floor_hour: str = "090000", end_hour: str = "153000", market_div_code: str | None = None, max_pages: int = 2000
     ) -> dict:
-        """주식현재가 당일시간대별체결(FHPST01060000)을 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합."""
+        """주식현재가 당일시간대별체결(FHPST01060000)을 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합.
+
+        The payload carries `floor_reached`: True only when a fetched page contained
+        a tick at or before `floor_hour`. An empty page, a mid-pagination vendor error or the page cap end pagination without
+        proving the window was traversed, so those cases report False.
+        """
         normalized = self._normalize_market_div_code(market_div_code)
         if not normalized:
             raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
@@ -684,6 +689,7 @@ class KisApiClient:
         seen_vols: set[str] = set()
         cursor_hour = "" if end_hour == "153000" else end_hour
         session_get = getattr(session, "get", None)
+        floor_reached = False
         for _ in range(max_pages):
             params = {
                 "FID_COND_MRKT_DIV_CODE": normalized,
@@ -710,18 +716,20 @@ class KisApiClient:
             if not new_rows:
                 base = cursor_hour if cursor_hour else end_hour
                 if base <= floor_hour:
+                    floor_reached = True
                     break
                 cursor_hour = self._decrement_hour_one_second(base)
                 continue
             collected.extend(new_rows)
             earliest = min(self._intraday_row_hour(r) for r in new_rows)
             if earliest <= floor_hour:
+                floor_reached = True
                 break
             cursor_hour = earliest
         effective_end = "153059" if end_hour == "153000" else end_hour
         in_range = [r for r in collected if floor_hour <= self._intraday_row_hour(r) <= effective_end]
         in_range.sort(key=lambda r: int(str(r.get("acml_vol") or "0").strip() or "0"))
-        return {"rt_cd": "0", "output2": in_range}
+        return {"rt_cd": "0", "output2": in_range, "floor_reached": floor_reached}
 
     async def get_orderbook_snapshot(
         self, session, code: str, market_div_code: str | None = None

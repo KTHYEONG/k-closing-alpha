@@ -34,6 +34,7 @@ from src.config.market_session import (
     KRX_AFTERMARKET_HOUR_CEIL,
     KRX_AFTERMARKET_HOUR_FLOOR,
     KRX_AFTERMARKET_START_DATE,
+    KRX_REGULAR_HOUR_CEIL,
     NXT_AFTERMARKET_HOUR_CEIL,
     NXT_AFTERMARKET_HOUR_FLOOR,
     NXT_PREMARKET_HOUR_CEIL,
@@ -812,6 +813,86 @@ def audit_aftermarket_ticks(
     return tuple(issues)
 
 
+REGULAR_TICK_VOLUME_GAP_TOLERANCE: float = 0.01
+"""Relative bar-over-tick volume gap above which a symbol is flagged short of ticks."""
+
+REGULAR_TICKS_AUDIT_START_DATE: str = "2026-09-28"
+"""First date with the current archive path and certified LS/Kiwoom ticks; earlier dates predate the fix."""
+
+
+def audit_regular_ticks(
+    trading_date: date,
+    *,
+    read_ticks: Callable[[], pd.DataFrame | None] | None = None,
+    read_bars: Callable[[], pd.DataFrame | None] | None = None,
+) -> tuple[str, ...]:
+    """Compare same-day regular-session tick volume with the 1m bars per symbol.
+
+    The bar stamped at the regular close carries closing-auction volume that is outside the tick
+    window and is excluded. Ticks cover the exchange tape while bars are vendor-aggregated, so small
+    residuals are expected; only a relative gap above `REGULAR_TICK_VOLUME_GAP_TOLERANCE` marks a
+    symbol as short of ticks.
+
+    Args:
+        trading_date: Audited KST date (checked only from REGULAR_TICKS_AUDIT_START_DATE; the
+            caller gates STANDARD days).
+        read_ticks: No-arg callable returning a frame with symbol and volume (None when the
+            tick partition is absent). None reads the stored regular tick partition with
+            column pruning.
+        read_bars: No-arg callable returning a frame with symbol, volume and ts_hms (None when
+            absent). None reads the stored regular 1m partition with column pruning.
+
+    Returns:
+        Issues `intraday:regular_ticks:<count>:<reason>` with reasons missing_partition (bars
+        exist but no tick partition) and volume_gap (symbols short of ticks); empty when clean.
+    """
+    day_str = trading_date.isoformat()
+    if day_str < REGULAR_TICKS_AUDIT_START_DATE:
+        return ()
+
+    def _default_ticks() -> pd.DataFrame | None:
+        path = tick_partition_path(day_str, INTRADAY_SESSION_REGULAR)
+        if not path.exists():
+            return None
+        return pd.read_parquet(path, columns=["symbol", "volume"])
+
+    def _default_bars() -> pd.DataFrame | None:
+        path = intraday_partition_path(1, day_str, INTRADAY_SESSION_REGULAR)
+        if not path.exists():
+            return None
+        return pd.read_parquet(path, columns=["symbol", "ts_hms", "volume"])
+
+    ticks_reader = read_ticks if read_ticks is not None else _default_ticks
+    bars_reader = read_bars if read_bars is not None else _default_bars
+    bars = bars_reader()
+    ticks = ticks_reader()
+    if bars is None or len(bars) == 0:
+        return ()
+    if ticks is None:
+        return (_intraday_issue("regular_ticks", 1, "missing_partition"),)
+    ceil = int(KRX_REGULAR_HOUR_CEIL)
+    if "ts_hms" in bars.columns:
+        stamps = pd.to_numeric(bars["ts_hms"], errors="coerce")
+        bars = bars.loc[stamps.isna() | (stamps < ceil)]
+    bar_vol = pd.to_numeric(bars["volume"], errors="coerce").fillna(0)
+    tick_vol = pd.to_numeric(ticks["volume"], errors="coerce").fillna(0)
+    bar_sum = bar_vol.groupby(bars["symbol"].astype(str)).sum()
+    tick_sum = tick_vol.groupby(ticks["symbol"].astype(str)).sum()
+    short = 0
+    for symbol, bar_total in bar_sum.items():
+        bar_total = float(bar_total)
+        if bar_total == 0:
+            continue
+        tick_total = float(tick_sum.get(symbol, 0))
+        if tick_total >= bar_total:
+            continue
+        if (bar_total - tick_total) / bar_total > REGULAR_TICK_VOLUME_GAP_TOLERANCE:
+            short += 1
+    if short:
+        return (_intraday_issue("regular_ticks", short, "volume_gap"),)
+    return ()
+
+
 def _expiry_hint_lines(items: Sequence[str]) -> list[str]:
     """KRX 달력 수평선 자체가 만료 예정일 때 표시하는 고정 갱신 안내."""
     if any(item.startswith(f"{CALENDAR_EXPIRY_NAME}:") for item in items):
@@ -1114,6 +1195,7 @@ def run_daily_audit(
                 value_sessions = [INTRADAY_SESSION_REGULAR]
             intraday_issues = (*intraday_issues, *audit_bar_value_consistency(trading_date, sessions=value_sessions))
             if session_day.kind is SessionKind.STANDARD:
+                intraday_issues = (*intraday_issues, *audit_regular_ticks(trading_date))
                 intraday_issues = (*intraday_issues, *audit_aftermarket_ticks(trading_date))
     except (OSError, ValueError) as exc:
         logger.warning("[DATA] stage=daily_audit collection_audit=UNAVAILABLE reason=%s", type(exc).__name__)

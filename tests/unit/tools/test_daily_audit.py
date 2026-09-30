@@ -2571,6 +2571,147 @@ def test_audit_aftermarket_ticks_before_start_date_requires_nothing() -> None:
     assert daily_audit.audit_aftermarket_ticks(date(2026, 9, 28)) == ()
 
 
+def _regular_tick_frames(bar_rows, tick_rows, *, with_ts_hms=True):
+    import pandas as pd
+
+    bar_cols = {"symbol": [r[0] for r in bar_rows], "volume": [r[1] for r in bar_rows]}
+    if with_ts_hms:
+        bar_cols["ts_hms"] = [r[2] for r in bar_rows]
+    bars = pd.DataFrame(bar_cols)
+    ticks = pd.DataFrame({"symbol": [r[0] for r in tick_rows], "volume": [r[1] for r in tick_rows]})
+    return bars, ticks
+
+
+def test_audit_regular_ticks_excludes_close_auction_bar() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames(
+        [("005930", 100, 90100), ("005930", 50, 152900), ("005930", 900, 153000)],
+        [("005930", 100), ("005930", 50)],
+    )
+    issues = daily_audit.audit_regular_ticks(
+        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+    )
+    assert issues == ()
+
+
+def test_audit_regular_ticks_flags_truncated_ticks() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames(
+        [("005930", 100, 90100), ("005930", 50, 152900), ("005930", 900, 153000)],
+        [("005930", 60)],
+    )
+    issues = daily_audit.audit_regular_ticks(
+        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+    )
+    assert issues == ("intraday:regular_ticks:1:volume_gap",)
+
+
+def test_audit_regular_ticks_tolerates_small_residual() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames(
+        [("005930", 100000, 90100)],
+        [("005930", 99900)],
+    )
+    issues = daily_audit.audit_regular_ticks(
+        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+    )
+    assert issues == ()
+
+
+def test_audit_regular_ticks_ignores_ticks_above_bars() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames(
+        [("005930", 100, 90100)],
+        [("005930", 120)],
+    )
+    issues = daily_audit.audit_regular_ticks(
+        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+    )
+    assert issues == ()
+
+
+def test_audit_regular_ticks_missing_partition_reported() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, _ = _regular_tick_frames([("005930", 100, 90100)], [])
+    issues = daily_audit.audit_regular_ticks(
+        date(2026, 9, 30), read_ticks=lambda: None, read_bars=lambda: bars,
+    )
+    assert issues == ("intraday:regular_ticks:1:missing_partition",)
+
+
+def test_audit_regular_ticks_zero_volume_symbol_absent_from_ticks() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames(
+        [("005930", 0, 90100)],
+        [],
+    )
+    issues = daily_audit.audit_regular_ticks(
+        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+    )
+    assert issues == ()
+
+
+def test_audit_regular_ticks_before_start_date_requires_nothing() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames([("005930", 100, 90100)], [])
+    assert daily_audit.audit_regular_ticks(date(2026, 9, 27), read_ticks=lambda: ticks, read_bars=lambda: bars) == ()
+
+
+def test_audit_regular_ticks_counts_each_short_symbol_once() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames(
+        [("A", 100, 90100), ("B", 200, 90100), ("C", 300, 90100)],
+        [("A", 10), ("B", 20), ("C", 30)],
+    )
+    issues = daily_audit.audit_regular_ticks(
+        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+    )
+    assert issues == ("intraday:regular_ticks:3:volume_gap",)
+
+
+def test_audit_regular_ticks_default_readers_use_stored_partitions(monkeypatch, tmp_path) -> None:
+    from datetime import date
+    from pathlib import Path
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames(
+        [("005930", 100, 90100), ("005930", 50, 152900), ("005930", 900, 153000)],
+        [("005930", 100), ("005930", 50)],
+    )
+    bars_path = tmp_path / "bars.parquet"
+    ticks_path = tmp_path / "ticks.parquet"
+    bars.to_parquet(bars_path)
+    ticks.to_parquet(ticks_path)
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *args: Path(bars_path))
+    monkeypatch.setattr(daily_audit, "tick_partition_path", lambda *args: Path(ticks_path))
+    assert daily_audit.audit_regular_ticks(date(2026, 9, 30)) == ()
+
+
 def _aftermarket_profile(tmp_path):
     from src.config.collection import CollectionSettings
 
