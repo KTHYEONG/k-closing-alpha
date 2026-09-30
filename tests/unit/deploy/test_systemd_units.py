@@ -403,6 +403,22 @@ def test_containerized_units_have_no_docker_pull_before_run() -> None:
     assert offenders == []
 
 
+def test_containerized_units_bound_json_file_logs() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    checked = 0
+    for svc in sorted(root.glob("kca-*.service")):
+        lines = svc.read_text(encoding="utf-8").splitlines()
+        exec_lines = [line for line in lines if line.startswith("ExecStart=") and "docker run --rm" in line]
+        for exec_line in exec_lines:
+            assert "--log-opt max-size=10m" in exec_line, svc.name
+            assert "--log-opt max-file=3" in exec_line, svc.name
+            checked += 1
+
+    assert checked > 0
+
+
 def test_containerized_units_have_no_unmeasured_resource_caps() -> None:
     import pathlib
 

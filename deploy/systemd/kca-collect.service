@@ -10,5 +10,5 @@ Environment=TZ=Asia/Seoul
 Environment=KIS_DATA_ROLE=decision
 # 실측 최대 74초 → 9분 (15:30:30 finalize-close 발화 전에 실패해야 함)
 TimeoutStartSec=9min
-ExecStart=/usr/bin/docker run --rm --name kca-collect --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=decision ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.collect
+ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kca-collect --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=decision ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.collect
 ExecStopPost=-/usr/bin/docker rm -f kca-collect
