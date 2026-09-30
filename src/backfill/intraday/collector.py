@@ -7,6 +7,7 @@ import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Literal
 
@@ -394,6 +395,174 @@ async def _call_with_transport_retry(
             slot += 1
 
 
+def _resume_budget(remaining: int | None, profile: CollectionSettings) -> ChartBudget:
+    """Size a resume pass from the vendor-reported remaining tick count.
+
+    Args:
+        remaining: Ticks the vendor still has to serve, or None when it could not be derived.
+        profile: Supplies rows per page, safety margin and the runaway guard.
+
+    Returns:
+        Budget of ceil(remaining / rows_per_page) + margin pages bounded by the guard
+        (COLLECTION_TICK_REPAIR_MAX_PAGES); the full guard when remaining is unknown.
+    """
+    guard = int(profile.COLLECTION_TICK_REPAIR_MAX_PAGES)
+    if remaining is None:
+        pages = guard
+    else:
+        per_page = int(profile.COLLECTION_TICK_ROWS_PER_PAGE)
+        pages = min(guard, -(-max(0, int(remaining)) // per_page) + int(profile.COLLECTION_TICK_RESUME_MARGIN_PAGES))
+    return ChartBudget(
+        max_pages=max(1, pages),
+        deadline=None,
+        request_timeout_seconds=float(profile.COLLECTION_REQUEST_TIMEOUT_SECONDS),
+    )
+
+
+def _vendor_remaining(payload: Any) -> int | None:
+    total, received = payload.get("vendor_total_ticks"), payload.get("rows_received")
+    if isinstance(total, int) and isinstance(received, int):
+        return max(0, total - received)
+    return None
+
+
+@dataclass(frozen=True)
+class _KiwoomTickResult:
+    """Outcome of one symbol's Kiwoom tick acquisition.
+
+    Attributes:
+        outcome: Terminal (frame, entry) when a source attempt settled the symbol, else None.
+        pending_remaining: Ticks the vendor still held when the budget ran out, when known.
+        transport_error: Exception that ended acquisition (first or resume call), else None.
+    """
+
+    outcome: tuple[pd.DataFrame, CoverageEntry] | None
+    pending_remaining: int | None
+    transport_error: BaseException | None
+
+
+async def _acquire_kiwoom_ticks(
+    *,
+    fetch: Callable[[int, ChartBudget | None, Any | None], Awaitable[Any]],
+    endpoint: str,
+    code: str,
+    snapshot_date: str,
+    trading_day: date,
+    ymd: str,
+    floor: str,
+    ceil: str,
+    store: CaptureStore,
+    run_id: str,
+    profile: CollectionSettings,
+    refs: list[Any],
+    session_tag: str,
+    allow_no_trades: bool = False,
+    crossed_date_no_trades: bool = False,
+) -> _KiwoomTickResult:
+    """Acquire one symbol's Kiwoom ticks: first pass, then a cursor-sized resume (or a restart without a cursor).
+
+    Kiwoom serves ticks newest-first and reports the remaining tick count in its continuation key, so a
+    truncated first pass is continued from its cursor and the rows are concatenated; the vendor total then
+    certifies that nothing was lost. Without a cursor the only remedy is a full restart under the runaway guard,
+    whose result replaces the first pass.
+
+    Args:
+        fetch: Awaitable factory called with (attempt slot, budget or None for the first pass, resume cursor or None).
+        endpoint: Route name used for venue resolution and evidence.
+        code: Symbol for correlation.
+        snapshot_date: Requested market date.
+        trading_day: Parsed snapshot date.
+        ymd: Compact snapshot date.
+        floor: Inclusive HHMMSS lower window bound.
+        ceil: Upper window bound.
+        store: Evidence store.
+        run_id: Acquisition identity.
+        profile: Budgets, retry and sizing settings.
+        refs: Evidence references accumulated for the symbol.
+        session_tag: Session recorded on entries.
+        allow_no_trades: Accept an empty exhausted window as NO_TRADES.
+        crossed_date_no_trades: Accept an empty window that crossed into the prior date as NO_TRADES.
+
+    Returns:
+        Settled outcome, or the unresolved remainder and any transport error for the caller's fallback policy.
+    """
+    common: dict[str, Any] = {
+        "vendor": "kiwoom", "endpoint": endpoint, "code": code, "snapshot_date": snapshot_date,
+        "trading_day": trading_day, "ymd": ymd, "floor": floor, "ceil": ceil, "market_div_code": None,
+        "store": store, "run_id": run_id, "profile": profile, "refs": refs, "session_tag": session_tag,
+        "allow_no_trades": allow_no_trades, "crossed_date_no_trades": crossed_date_no_trades,
+    }
+    try:
+        payload, slot = await _call_with_transport_retry(
+            lambda s: fetch(s, None, None), first_attempt=0, profile=profile, code=code,
+        )
+    except Exception as e:
+        logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=transport:%s", code, _redacted_error(e))
+        return _KiwoomTickResult(None, None, e)
+    outcome = await _certified_kiwoom_attempt(payload=payload, attempt=slot - 1, first_rows=[], **common)
+    if outcome is not None:
+        return _KiwoomTickResult(outcome, None, None)
+    first_rows = [dict(r) for r in (payload.get("output2") or []) if isinstance(r, dict)]
+    cursor = payload.get("cursor")
+    remaining = _vendor_remaining(payload)
+    budget = _resume_budget(remaining, profile) if cursor is not None else _repair_budget(profile)
+    try:
+        repaired, slot = await _call_with_transport_retry(
+            lambda s: fetch(s, budget, cursor), first_attempt=slot, profile=profile, code=code,
+        )
+    except Exception as e:
+        logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=repair:%s", code, _redacted_error(e))
+        return _KiwoomTickResult(None, remaining, e)
+    outcome = await _certified_kiwoom_attempt(
+        payload=repaired, attempt=slot - 1, first_rows=first_rows if cursor is not None else [], **common,
+    )
+    if outcome is not None:
+        return _KiwoomTickResult(outcome, None, None)
+    pending = _vendor_remaining(repaired) if isinstance(repaired, dict) else None
+    return _KiwoomTickResult(None, pending if pending is not None else remaining, None)
+
+
+async def _certified_kiwoom_attempt(
+    *, payload: Any, attempt: int, first_rows: list[dict[str, Any]], **common: Any,
+) -> tuple[pd.DataFrame, CoverageEntry] | None:
+    """Settle one Kiwoom payload, prefixing resumed rows and checking the vendor total.
+
+    A resumed pass continues the same newest-first pagination, so its rows are appended to the first pass's rows;
+    when the vendor reports a total and the pagination ended at its true end, the concatenated row count must
+    equal that total or the symbol is PARTIAL (`total_mismatch`) rather than certified.
+    """
+    if isinstance(payload, dict) and payload.get("rt_cd") == "0" and first_rows:
+        payload = {**payload, "output2": [*first_rows, *(payload.get("output2") or [])]}
+    total = payload.get("vendor_total_ticks") if isinstance(payload, dict) else None
+    if (
+        isinstance(payload, dict) and payload.get("rt_cd") == "0" and not payload.get("truncated")
+        and payload.get("termination_reason") == "exhausted" and isinstance(total, int)
+        and len(payload.get("output2") or []) != total
+    ):
+        rows = [dict(r) for r in payload.get("output2") or [] if isinstance(r, dict)]
+        regular, _ = _split_session_window(rows, common["ymd"], common["floor"], common["ceil"], "kiwoom")
+        if regular:
+            refs = common["refs"]
+            refs.append(_stage_fragment(
+                common["store"], run_id=common["run_id"], trading_day=common["trading_day"],
+                dataset=CaptureDataset.TRADE_TICKS, symbol=common["code"], session=common["session_tag"],
+                frame=_safe_normalize_ticks("kiwoom", regular, common["snapshot_date"], common["code"], False),
+                reason="total_mismatch",
+            ))
+        return _empty_tick_frame(common["snapshot_date"]), _terminal_entry(
+            symbol=common["code"], dataset=CaptureDataset.TRADE_TICKS,
+            venue=_venue_for(vendor="kiwoom", endpoint=common["endpoint"], market_div_code=None, profile=common["profile"]),
+            session=common["session_tag"], status=CaptureStatus.PARTIAL, rows=0,
+            reason=f"total_mismatch:vendor_total={total}:delivered={len(payload.get('output2') or [])}",
+            refs=common["refs"],
+        )
+    outcome = await _tick_source_attempt(payload=payload, attempt=attempt, **common)
+    if outcome is not None and isinstance(total, int) and outcome[1].status == CaptureStatus.COMPLETE:
+        entry = outcome[1].model_copy(update={"reason": f"{outcome[1].reason}:vendor_total={total}"})
+        return outcome[0], entry
+    return outcome
+
+
 async def _kis_bar_attempt(
     *,
     client: Any,
@@ -767,7 +936,6 @@ async def _acquire_ticks_symbol(
     refs: list[Any] = []
     failed_transport = False
     today = not _is_past_date(snapshot_date)
-    next_slot = 0
     if kiwoom_client is not None and today:
         context = _capture_context(
             trading_day=trading_day, run_id=run_id, dataset=CaptureDataset.TRADE_TICKS, vendor="kiwoom",
@@ -775,48 +943,23 @@ async def _acquire_ticks_symbol(
             venue=_venue_for(vendor="kiwoom", endpoint="ka10079", market_div_code=None, profile=profile),
             session=INTRADAY_SESSION_REGULAR,
         )
-        try:
-            payload, next_slot = await _call_with_transport_retry(
-                lambda slot: kiwoom_client.get_tick_chart(
-                    session, code, snapshot_date, max_pages=int(ls_max_pages),
-                    on_page=_observe_pages(store, context, refs, slot),
-                ),
-                first_attempt=next_slot, profile=profile, code=code,
+        def _fetch_regular(slot: int, budget: ChartBudget | None, resume: Any | None) -> Awaitable[Any]:
+            limits: dict[str, Any] = {"max_pages": int(ls_max_pages)} if budget is None else {"budget": budget}
+            if resume is not None:
+                limits["resume"] = resume
+            return kiwoom_client.get_tick_chart(
+                session, code, snapshot_date, **limits, on_page=_observe_pages(store, context, refs, slot),
             )
-        except Exception as e:
-            logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=transport:%s", code, _redacted_error(e))
-            failed_transport = True
-            payload = None
-        if payload is not None:
-            outcome = await _tick_source_attempt(
-                vendor="kiwoom", endpoint="ka10079", payload=payload, code=code, snapshot_date=snapshot_date,
-                trading_day=trading_day, ymd=ymd, floor=KRX_REGULAR_HOUR_FLOOR, ceil=KRX_REGULAR_HOUR_CEIL,
-                market_div_code=None, store=store, run_id=run_id, profile=profile, attempt=next_slot - 1, refs=refs,
-                crossed_date_no_trades=True,
-            )
-            if outcome is not None:
-                return outcome
-            try:
-                repair_payload, next_slot = await _call_with_transport_retry(
-                    lambda slot: kiwoom_client.get_tick_chart(
-                        session, code, snapshot_date, budget=_repair_budget(profile),
-                        on_page=_observe_pages(store, context, refs, slot),
-                    ),
-                    first_attempt=next_slot, profile=profile, code=code,
-                )
-            except Exception as e:
-                logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=repair:%s", code, _redacted_error(e))
-                failed_transport = True
-                repair_payload = None
-            if repair_payload is not None:
-                outcome = await _tick_source_attempt(
-                    vendor="kiwoom", endpoint="ka10079", payload=repair_payload, code=code, snapshot_date=snapshot_date,
-                    trading_day=trading_day, ymd=ymd, floor=KRX_REGULAR_HOUR_FLOOR, ceil=KRX_REGULAR_HOUR_CEIL,
-                    market_div_code=None, store=store, run_id=run_id, profile=profile, attempt=next_slot - 1, refs=refs,
-                    crossed_date_no_trades=True,
-                )
-                if outcome is not None:
-                    return outcome
+
+        kiwoom = await _acquire_kiwoom_ticks(
+            fetch=_fetch_regular, endpoint="ka10079", code=code, snapshot_date=snapshot_date,
+            trading_day=trading_day, ymd=ymd, floor=KRX_REGULAR_HOUR_FLOOR, ceil=KRX_REGULAR_HOUR_CEIL,
+            store=store, run_id=run_id, profile=profile, refs=refs, session_tag=INTRADAY_SESSION_REGULAR,
+            crossed_date_no_trades=True,
+        )
+        if kiwoom.outcome is not None:
+            return kiwoom.outcome
+        failed_transport = kiwoom.transport_error is not None
     if ls_client is not None:
         context = _capture_context(
             trading_day=trading_day, run_id=run_id, dataset=CaptureDataset.TRADE_TICKS, vendor="ls",
@@ -1303,54 +1446,30 @@ async def collect_aftermarket_trade_ticks(
             trading_day=trading_day, run_id=resolved_run, dataset=CaptureDataset.TRADE_TICKS,
             vendor="kiwoom", endpoint=endpoint, symbol=code, venue=resolved_venue, session=session_tag,
         )
-        try:
-            payload, next_slot = await _call_with_transport_retry(
-                lambda slot: kiwoom_client.get_tick_chart(
-                    session, code, str(snapshot_date), max_pages=int(prof.COLLECTION_CHART_MAX_PAGES),
-                    floor_hms=floor, venue=venue,
-                    on_page=_observe_pages(store, context, refs, slot),
-                ),
-                first_attempt=0, profile=prof, code=code,
+        def _fetch_aftermarket(slot: int, budget: ChartBudget | None, resume: Any | None) -> Awaitable[Any]:
+            limits: dict[str, Any] = (
+                {"max_pages": int(prof.COLLECTION_CHART_MAX_PAGES)} if budget is None else {"budget": budget}
             )
-        except Exception as e:
-            logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=transport:%s", code, _redacted_error(e))
+            if resume is not None:
+                limits["resume"] = resume
+            return kiwoom_client.get_tick_chart(
+                session, code, str(snapshot_date), **limits, floor_hms=floor, venue=venue,
+                on_page=_observe_pages(store, context, refs, slot),
+            )
+
+        kiwoom = await _acquire_kiwoom_ticks(
+            fetch=_fetch_aftermarket, endpoint=endpoint, code=code, snapshot_date=str(snapshot_date),
+            trading_day=trading_day, ymd=ymd, floor=floor, ceil=ceil, store=store, run_id=resolved_run,
+            profile=prof, refs=refs, session_tag=session_tag, allow_no_trades=True,
+        )
+        if kiwoom.outcome is not None:
+            return kiwoom.outcome
+        if kiwoom.transport_error is not None:
             return _empty_tick_frame(str(snapshot_date)), _terminal_entry(
                 symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=resolved_venue,
                 session=session_tag, status=CaptureStatus.FAILED, rows=0,
-                reason=f"transport:{_redacted_error(e)}", refs=refs,
+                reason=f"transport:{_redacted_error(kiwoom.transport_error)}", refs=refs,
             )
-        outcome = await _tick_source_attempt(
-            vendor="kiwoom", endpoint=endpoint, payload=payload, code=code,
-            snapshot_date=str(snapshot_date), trading_day=trading_day, ymd=ymd,
-            floor=floor, ceil=ceil, market_div_code=None, store=store, run_id=resolved_run,
-            profile=prof, attempt=next_slot - 1, refs=refs, session_tag=session_tag, allow_no_trades=True,
-        )
-        if outcome is not None:
-            return outcome
-        try:
-            repair_payload, repair_next = await _call_with_transport_retry(
-                lambda slot: kiwoom_client.get_tick_chart(
-                    session, code, str(snapshot_date), budget=_repair_budget(prof),
-                    floor_hms=floor, venue=venue,
-                    on_page=_observe_pages(store, context, refs, slot),
-                ),
-                first_attempt=next_slot, profile=prof, code=code,
-            )
-        except Exception as e:
-            logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=repair:%s", code, _redacted_error(e))
-            return _empty_tick_frame(str(snapshot_date)), _terminal_entry(
-                symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=resolved_venue,
-                session=session_tag, status=CaptureStatus.FAILED, rows=0,
-                reason=f"transport:{_redacted_error(e)}", refs=refs,
-            )
-        outcome = await _tick_source_attempt(
-            vendor="kiwoom", endpoint=endpoint, payload=repair_payload, code=code,
-            snapshot_date=str(snapshot_date), trading_day=trading_day, ymd=ymd,
-            floor=floor, ceil=ceil, market_div_code=None, store=store, run_id=resolved_run,
-            profile=prof, attempt=repair_next - 1, refs=refs, session_tag=session_tag, allow_no_trades=True,
-        )
-        if outcome is not None:
-            return outcome
         staged = _stage_fragment(store, run_id=resolved_run, trading_day=trading_day,
                                  dataset=CaptureDataset.TRADE_TICKS, symbol=code, session=session_tag,
                                  frame=_empty_tick_frame(str(snapshot_date)), reason="unrepaired")
@@ -1358,7 +1477,8 @@ async def collect_aftermarket_trade_ticks(
         return _empty_tick_frame(str(snapshot_date)), _terminal_entry(
             symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=resolved_venue,
             session=session_tag, status=CaptureStatus.PARTIAL, rows=0,
-            reason="unrepaired", refs=refs,
+            reason="unrepaired" if kiwoom.pending_remaining is None else f"page_budget:remaining={kiwoom.pending_remaining}",
+            refs=refs,
         )
 
     return await _collect_with_observer(
