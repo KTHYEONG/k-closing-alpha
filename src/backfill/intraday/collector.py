@@ -6,11 +6,12 @@ import asyncio
 import logging
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import date, datetime
 from typing import Any, Literal
 
 import pandas as pd
+from aiohttp import ClientError
 
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
@@ -346,6 +347,51 @@ def _repair_budget(profile: CollectionSettings) -> ChartBudget:
         deadline=None,
         request_timeout_seconds=float(profile.COLLECTION_REQUEST_TIMEOUT_SECONDS),
     )
+
+
+_TRANSIENT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (ClientError, TimeoutError, ConnectionError)
+
+
+async def _call_with_transport_retry(
+    invoke: Callable[[int], Awaitable[Any]],
+    *,
+    first_attempt: int,
+    profile: CollectionSettings,
+    code: str,
+) -> tuple[Any, int]:
+    """Run a vendor call, retrying transient transport errors with exponential backoff.
+
+    Args:
+        invoke: Awaitable factory receiving the capture attempt slot for that try. Each try MUST use its own slot
+            because raw evidence is immutable per (symbol, page, attempt); reusing a slot after partial pages were
+            stored raises a conflicting-identity error.
+        first_attempt: Attempt slot for the first try.
+        profile: Supplies retry count and base backoff.
+        code: Symbol for log correlation.
+
+    Returns:
+        (payload, next_free_attempt) where next_free_attempt is one past the last slot consumed.
+
+    Raises:
+        Exception: The last transient error once retries are exhausted, or any non-transient error immediately.
+    """
+    max_tries = 1 + int(profile.COLLECTION_TRANSPORT_RETRIES)
+    total_retries = int(profile.COLLECTION_TRANSPORT_RETRIES)
+    slot = int(first_attempt)
+    for try_no in range(1, max_tries + 1):
+        try:
+            return await invoke(slot), slot + 1
+        except _TRANSIENT_TRANSPORT_ERRORS as exc:
+            if try_no >= max_tries:
+                raise
+            delay = float(profile.COLLECTION_TRANSPORT_BACKOFF_SECONDS) * (2 ** (try_no - 1))
+            logger.warning(
+                "[DATA] stage=ticks symbol=%s retry=%d/%d reason=%s",
+                code, try_no, total_retries, _redacted_error(exc),
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+            slot += 1
 
 
 async def _kis_bar_attempt(
@@ -721,6 +767,7 @@ async def _acquire_ticks_symbol(
     refs: list[Any] = []
     failed_transport = False
     today = not _is_past_date(snapshot_date)
+    next_slot = 0
     if kiwoom_client is not None and today:
         context = _capture_context(
             trading_day=trading_day, run_id=run_id, dataset=CaptureDataset.TRADE_TICKS, vendor="kiwoom",
@@ -729,9 +776,12 @@ async def _acquire_ticks_symbol(
             session=INTRADAY_SESSION_REGULAR,
         )
         try:
-            payload: Any = await kiwoom_client.get_tick_chart(
-                session, code, snapshot_date, max_pages=int(ls_max_pages),
-                on_page=_observe_pages(store, context, refs, 0),
+            payload, next_slot = await _call_with_transport_retry(
+                lambda slot: kiwoom_client.get_tick_chart(
+                    session, code, snapshot_date, max_pages=int(ls_max_pages),
+                    on_page=_observe_pages(store, context, refs, slot),
+                ),
+                first_attempt=next_slot, profile=profile, code=code,
             )
         except Exception as e:
             logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=transport:%s", code, _redacted_error(e))
@@ -741,15 +791,18 @@ async def _acquire_ticks_symbol(
             outcome = await _tick_source_attempt(
                 vendor="kiwoom", endpoint="ka10079", payload=payload, code=code, snapshot_date=snapshot_date,
                 trading_day=trading_day, ymd=ymd, floor=KRX_REGULAR_HOUR_FLOOR, ceil=KRX_REGULAR_HOUR_CEIL,
-                market_div_code=None, store=store, run_id=run_id, profile=profile, attempt=0, refs=refs,
+                market_div_code=None, store=store, run_id=run_id, profile=profile, attempt=next_slot - 1, refs=refs,
                 crossed_date_no_trades=True,
             )
             if outcome is not None:
                 return outcome
             try:
-                repair_payload: Any = await kiwoom_client.get_tick_chart(
-                    session, code, snapshot_date, budget=_repair_budget(profile),
-                    on_page=_observe_pages(store, context, refs, 1),
+                repair_payload, next_slot = await _call_with_transport_retry(
+                    lambda slot: kiwoom_client.get_tick_chart(
+                        session, code, snapshot_date, budget=_repair_budget(profile),
+                        on_page=_observe_pages(store, context, refs, slot),
+                    ),
+                    first_attempt=next_slot, profile=profile, code=code,
                 )
             except Exception as e:
                 logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=repair:%s", code, _redacted_error(e))
@@ -759,7 +812,7 @@ async def _acquire_ticks_symbol(
                 outcome = await _tick_source_attempt(
                     vendor="kiwoom", endpoint="ka10079", payload=repair_payload, code=code, snapshot_date=snapshot_date,
                     trading_day=trading_day, ymd=ymd, floor=KRX_REGULAR_HOUR_FLOOR, ceil=KRX_REGULAR_HOUR_CEIL,
-                    market_div_code=None, store=store, run_id=run_id, profile=profile, attempt=1, refs=refs,
+                    market_div_code=None, store=store, run_id=run_id, profile=profile, attempt=next_slot - 1, refs=refs,
                     crossed_date_no_trades=True,
                 )
                 if outcome is not None:
@@ -772,9 +825,12 @@ async def _acquire_ticks_symbol(
             session=INTRADAY_SESSION_REGULAR,
         )
         try:
-            payload = await ls_client.get_tick_chart(
-                session, code, snapshot_date, max_pages=int(ls_max_pages),
-                on_page=_observe_pages(store, context, refs, 0),
+            payload, _ = await _call_with_transport_retry(
+                lambda slot: ls_client.get_tick_chart(
+                    session, code, snapshot_date, max_pages=int(ls_max_pages),
+                    on_page=_observe_pages(store, context, refs, slot),
+                ),
+                first_attempt=0, profile=profile, code=code,
             )
         except Exception as e:
             logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=transport:%s", code, _redacted_error(e))
@@ -1238,10 +1294,13 @@ async def collect_aftermarket_trade_ticks(
             vendor="kiwoom", endpoint=endpoint, symbol=code, venue=resolved_venue, session=session_tag,
         )
         try:
-            payload: Any = await kiwoom_client.get_tick_chart(
-                session, code, str(snapshot_date), max_pages=int(prof.COLLECTION_CHART_MAX_PAGES),
-                floor_hms=floor, venue=venue,
-                on_page=_observe_pages(store, context, refs, 0),
+            payload, next_slot = await _call_with_transport_retry(
+                lambda slot: kiwoom_client.get_tick_chart(
+                    session, code, str(snapshot_date), max_pages=int(prof.COLLECTION_CHART_MAX_PAGES),
+                    floor_hms=floor, venue=venue,
+                    on_page=_observe_pages(store, context, refs, slot),
+                ),
+                first_attempt=0, profile=prof, code=code,
             )
         except Exception as e:
             logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=transport:%s", code, _redacted_error(e))
@@ -1254,15 +1313,18 @@ async def collect_aftermarket_trade_ticks(
             vendor="kiwoom", endpoint=endpoint, payload=payload, code=code,
             snapshot_date=str(snapshot_date), trading_day=trading_day, ymd=ymd,
             floor=floor, ceil=ceil, market_div_code=None, store=store, run_id=resolved_run,
-            profile=prof, attempt=0, refs=refs, session_tag=session_tag, allow_no_trades=True,
+            profile=prof, attempt=next_slot - 1, refs=refs, session_tag=session_tag, allow_no_trades=True,
         )
         if outcome is not None:
             return outcome
         try:
-            repair_payload: Any = await kiwoom_client.get_tick_chart(
-                session, code, str(snapshot_date), budget=_repair_budget(prof),
-                floor_hms=floor, venue=venue,
-                on_page=_observe_pages(store, context, refs, 1),
+            repair_payload, repair_next = await _call_with_transport_retry(
+                lambda slot: kiwoom_client.get_tick_chart(
+                    session, code, str(snapshot_date), budget=_repair_budget(prof),
+                    floor_hms=floor, venue=venue,
+                    on_page=_observe_pages(store, context, refs, slot),
+                ),
+                first_attempt=next_slot, profile=prof, code=code,
             )
         except Exception as e:
             logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=repair:%s", code, _redacted_error(e))
@@ -1275,7 +1337,7 @@ async def collect_aftermarket_trade_ticks(
             vendor="kiwoom", endpoint=endpoint, payload=repair_payload, code=code,
             snapshot_date=str(snapshot_date), trading_day=trading_day, ymd=ymd,
             floor=floor, ceil=ceil, market_div_code=None, store=store, run_id=resolved_run,
-            profile=prof, attempt=1, refs=refs, session_tag=session_tag, allow_no_trades=True,
+            profile=prof, attempt=repair_next - 1, refs=refs, session_tag=session_tag, allow_no_trades=True,
         )
         if outcome is not None:
             return outcome
