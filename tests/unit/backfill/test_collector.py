@@ -108,10 +108,11 @@ class _LsBars:
 
 
 class _KisBars:
-    def __init__(self, rows, rt="0", fail=False):
+    def __init__(self, rows, rt="0", fail=False, floor_reached=True):
         self._rows = rows
         self._rt = rt
         self._fail = fail
+        self._floor_reached = floor_reached
         self.historical_calls = []
         self.intraday_calls = []
 
@@ -131,7 +132,9 @@ class _KisBars:
         self.intraday_calls.append(code)
         if self._fail:
             raise RuntimeError("KIS unreachable")
-        return {"rt_cd": self._rt, "output2": self._rows if self._rt == "0" else []}
+        if self._rt != "0":
+            return {"rt_cd": self._rt, "output2": []}
+        return {"rt_cd": self._rt, "output2": self._rows, "floor_reached": self._floor_reached}
 
 
 class _LsTicks:
@@ -291,6 +294,34 @@ def test_collect_ticks_whole_source_fallback_avoids_union(tmp_path) -> None:
     assert entry.venue == "KRX"
     assert frame["price"].tolist() == [71000]
     assert frame["vendor"].tolist() == ["kis"]
+
+
+def test_collect_ticks_kis_without_floor_proof_is_partial(tmp_path) -> None:
+    import asyncio
+    import datetime as _dt
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+    from src.data.capture_contracts import SEOUL as _SEOUL
+
+    today = _dt.datetime.now(_SEOUL).date().isoformat()
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, {})
+    ls_client = _LsTicks([_ls_tick_row("093000", close=70000)], terminal="page_budget", truncated=True)
+    kis = _KisBars([_kis_tick_row("130000", vol="5", prpr="71000")], floor_reached=False)
+    delivered = {}
+
+    asyncio.run(
+        collect_intraday_trade_ticks(
+            kis, None, ["005930"], today, ls_client=ls_client,
+            profile=profile, capture_store=store, run_id="run-kis-noproof",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "PARTIAL"
+    assert entry.reason == "kis_floor_not_reached"
+    assert frame.empty
 
 
 def test_collect_bars_sparse_trading_not_synthetic_loss(tmp_path) -> None:

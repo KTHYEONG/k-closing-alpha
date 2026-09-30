@@ -120,6 +120,42 @@ def test_get_intraday_trade_ticks_dedupes_by_acml_vol_not_hour() -> None:
     assert acml_vols == {"1000", "990", "100"}
 
 
+def test_get_intraday_trade_ticks_floor_reached_proof() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+
+    async def _fetch(pages, max_pages=10, floor="090000", end="153000"):
+        handle = AsyncMock(side_effect=pages)
+        with patch.object(client, "_handle_request", handle):
+            return await client.get_intraday_trade_ticks(
+                _FakeSession(), "005930", floor_hour=floor, end_hour=end, market_div_code="J",
+                max_pages=max_pages,
+            )
+
+    reached = asyncio.run(_fetch([
+        {"rt_cd": "0", "output2": [{"stck_cntg_hour": "130000", "acml_vol": "500"}]},
+        {"rt_cd": "0", "output2": [{"stck_cntg_hour": "090000", "acml_vol": "100"}]},
+    ]))
+    assert reached["floor_reached"] is True
+
+    stalled_at_floor = asyncio.run(_fetch(
+        [{"rt_cd": "0", "output2": [{"stck_cntg_hour": "090000", "stck_prpr": "9500"}]}],
+        floor="090000", end="090000",
+    ))
+    assert stalled_at_floor["floor_reached"] is True
+
+    empty_end = asyncio.run(_fetch([
+        {"rt_cd": "0", "output2": [{"stck_cntg_hour": "130000", "acml_vol": "500"}]},
+        {"rt_cd": "0", "output2": []},
+    ]))
+    assert empty_end["floor_reached"] is False
+
+    capped = asyncio.run(_fetch(
+        [{"rt_cd": "0", "output2": [{"stck_cntg_hour": "130000", "acml_vol": "500"}]}],
+        max_pages=1,
+    ))
+    assert capped["floor_reached"] is False
+
+
 def test_get_daily_short_sale_history_requires_explicit_market_div_code() -> None:
     client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
 

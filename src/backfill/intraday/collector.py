@@ -880,6 +880,16 @@ async def _acquire_ticks_symbol(
                 session=INTRADAY_SESSION_REGULAR, status=CaptureStatus.UNKNOWN, rows=0,
                 reason="empty_without_proof", refs=refs,
             )
+        if not (isinstance(payload, dict) and payload.get("floor_reached") is True):
+            frag = _stage_fragment(store, run_id=run_id, trading_day=trading_day, dataset=CaptureDataset.TRADE_TICKS,
+                                   symbol=code, session=INTRADAY_SESSION_REGULAR,
+                                   frame=frame, reason="uncertified:kis_floor_not_reached")
+            refs.append(frag)
+            return _empty_tick_frame(snapshot_date), _terminal_entry(
+                symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=context.venue,
+                session=INTRADAY_SESSION_REGULAR, status=CaptureStatus.PARTIAL, rows=0,
+                reason="kis_floor_not_reached", refs=refs,
+            )
         return frame, _terminal_entry(
             symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=context.venue,
             session=INTRADAY_SESSION_REGULAR, status=CaptureStatus.COMPLETE, rows=len(frame),
