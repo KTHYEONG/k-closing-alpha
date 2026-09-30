@@ -23,9 +23,11 @@ def test_deploy_workflow_gates_build_on_tests_and_targets_arm64() -> None:
     text = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
 
     assert "uv run pytest -q" in text
-    assert "needs: test" in text
-    assert "needs: build-and-push" in text
     assert "platforms: linux/arm64" in text
+    build_block = text.split("build-and-push:", 1)[1].split("\n  deploy:", 1)[0]
+    assert "needs" not in build_block
+    deploy_block = text.split("\n  deploy:", 1)[1]
+    assert "needs: [test, build-and-push]" in deploy_block
 
 
 def test_dockerfile_and_dockerignore_and_workflow_content() -> None:
@@ -67,9 +69,9 @@ def test_deploy_validates_commit_image_before_moving_latest() -> None:
 
     workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
 
-    pull = "docker pull ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA"
+    pull = "vps_pull_verified ghcr.io/kthyeong/k-closing-alpha $COMMIT_SHA"
     run = "docker run --rm -v ~/k-closing-alpha/artifacts:/app/artifacts:ro ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA uv run python -m src.tools.deploy_preflight"
-    tag = "docker tag ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA ghcr.io/kthyeong/k-closing-alpha:latest"
+    tag = "vps_promote_latest ghcr.io/kthyeong/k-closing-alpha $COMMIT_SHA"
     reset = "git reset --hard $COMMIT_SHA"
 
     positions = [workflow.index(line) for line in (pull, run, tag, reset)]
@@ -84,7 +86,7 @@ def test_deploy_waits_for_blackout_before_moving_latest() -> None:
 
     preflight = "src.tools.deploy_preflight"
     wait = "src.tools.deploy_window --wait"
-    tag = "docker tag ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA ghcr.io/kthyeong/k-closing-alpha:latest"
+    tag = "vps_promote_latest ghcr.io/kthyeong/k-closing-alpha $COMMIT_SHA"
     reset = "git reset --hard $COMMIT_SHA"
 
     positions = [workflow.index(line) for line in (preflight, wait, tag, reset)]
@@ -106,7 +108,7 @@ def test_deploy_skips_superseded_commit() -> None:
     from pathlib import Path
 
     workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
-    tag = "docker tag ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA ghcr.io/kthyeong/k-closing-alpha:latest"
+    tag = "vps_promote_latest ghcr.io/kthyeong/k-closing-alpha $COMMIT_SHA"
 
     assert "LATEST_MAIN_SHA" in workflow
     assert "git ls-remote" in workflow
@@ -145,7 +147,89 @@ def test_deploy_workflow_builds_native_arm64_and_tags_commit_sha() -> None:
     assert "setup-qemu-action" not in workflow
     assert "sha-${{ github.sha }}" in workflow
     assert "${{ env.IMAGE }}:latest" in workflow
-    assert "needs: test" in workflow
-    assert "needs: build-and-push" in workflow
+    build_block = workflow.split("build-and-push:", 1)[1].split("\n  deploy:", 1)[0]
+    assert "needs" not in build_block
+    deploy_block = workflow.split("\n  deploy:", 1)[1]
+    assert "needs: [test, build-and-push]" in deploy_block
     assert "uv run pytest -q" in workflow
     assert "KCA_CODE_COMMIT=${{ github.sha }}" in workflow
+
+
+def test_build_runs_in_parallel_with_tests() -> None:
+    from pathlib import Path
+
+    text = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    build_block = text.split("build-and-push:", 1)[1].split("\n  deploy:", 1)[0]
+    assert "needs" not in build_block
+    deploy_block = text.split("\n  deploy:", 1)[1]
+    assert "needs: [test, build-and-push]" in deploy_block
+
+
+def test_deploy_verifies_commit_image_before_any_wait() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    markers = (
+        "vps_pull_verified ghcr.io/kthyeong/k-closing-alpha $COMMIT_SHA",
+        "src.tools.deploy_preflight",
+        "src.tools.deploy_window --wait",
+        'LATEST_MAIN_SHA" != ',
+        "vps_promote_latest ghcr.io/kthyeong/k-closing-alpha $COMMIT_SHA",
+        "git reset --hard $COMMIT_SHA",
+    )
+    positions = [workflow.index(marker) for marker in markers]
+    assert positions == sorted(positions)
+
+
+def test_deploy_never_prunes_images() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    assert "image prune" not in workflow
+
+
+def test_build_stamps_revision_label() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    assert "org.opencontainers.image.revision=${{ github.sha }}" in workflow
+
+
+def test_every_job_is_time_bounded_and_pinned() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    test_block = workflow.split("\n  test:", 1)[1].split("\n  build-and-push:", 1)[0]
+    build_block = workflow.split("\n  build-and-push:", 1)[1].split("\n  deploy:", 1)[0]
+    deploy_block = workflow.split("\n  deploy:", 1)[1]
+    for name, block in (("test", test_block), ("build-and-push", build_block), ("deploy", deploy_block)):
+        assert "timeout-minutes" in block, name
+    assert "ubuntu-latest" not in workflow
+    assert "actions/checkout@v4" not in workflow
+
+
+def test_vendored_kit_matches_contract() -> None:
+    from pathlib import Path
+
+    text = Path("deploy/vps-deploy-lib.sh").read_text(encoding="utf-8")
+
+    assert "VPS_DEPLOY_CONTRACT_VERSION=1" in text
+    assert ".local/state/vps-deploy" in text
+    assert "image.lock" in text
+
+
+def test_deploy_creates_lib_staging_dir_before_upload() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    # scp does not create missing parent directories on the host.
+    mkdir = 'mkdir -p ~/k-closing-alpha/.deploy"'
+    upload = "scp $SSH_OPTS deploy/vps-deploy-lib.sh"
+    assert mkdir in workflow
+    assert workflow.index(mkdir) < workflow.index(upload)

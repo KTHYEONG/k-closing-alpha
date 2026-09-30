@@ -87,6 +87,7 @@ configs/chart_pass_cache.json
 scratch/
 docs/specs/
 tmp/
+.deploy/
 
 # Serena AI Assistant
 .serena/
