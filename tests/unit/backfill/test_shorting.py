@@ -1,10 +1,7 @@
-"""src.backfill.altdata.shorting 모듈 직접 참조 테스트.
+"""Direct contract tests for src.backfill.altdata.shorting.
 
-기존 테스트가 전부 tests/unit/backfill/test_altdata_collectors.py에 묶여 있어
-lean_check의 test_<module> co-modification 게이트가 shorting.py를 인식하지
-못하던 갭을 해소하기 위해 신설. KIS 네이티브 공매도 일별추이(FHPST04830000)
-기반 collect_shorting의 핵심 계약(스키마 컬럼, universe_symbols 필수)을
-직접 검증한다.
+Covers the core contract of collect_shorting on the KIS native short-selling daily trend
+(FHPST04830000): schema columns and the required universe_symbols.
 """
 
 from __future__ import annotations
