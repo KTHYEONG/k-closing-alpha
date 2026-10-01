@@ -40,6 +40,7 @@ _PRODUCTION_BLACKOUTS = btt._DEFAULT_BLACKOUTS
 def _isolated_environment(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(btt, "_price_history_path", lambda: tmp_path / "price_history.parquet")
     monkeypatch.setattr(btt, "_DEFAULT_BLACKOUTS", ())
+    monkeypatch.setattr(btt, "_history_archive_path", lambda: tmp_path / "archive.parquet")
 
 
 def _profile(tmp_path) -> CollectionSettings:
@@ -974,3 +975,79 @@ def test_default_blackouts_cover_kiwoom_live_windows() -> None:
     for live in ("08:30", "11:30", "15:20", "15:21", "15:40", "16:25", "20:05", "21:02", "21:30", "23:05"):
         assert covered(live), live
     assert not covered("13:00")
+
+
+def _write_archive(tmp_path, rows: dict[str, list[str]]) -> None:
+    frame = pd.DataFrame(
+        [{"스냅샷_날짜": pd.Timestamp(day), "종목코드": code} for day, codes in rows.items() for code in codes]
+    )
+    frame.to_parquet(tmp_path / "archive.parquet", index=False)
+
+
+def _write_prices(tmp_path, day: str, rows: list[tuple[str, float, float, float]]) -> None:
+    frame = pd.DataFrame(
+        [
+            {"date": pd.Timestamp(day), "symbol": sym, "close": close, "prev_close": prev, "trade_value_100m": tv}
+            for sym, close, prev, tv in rows
+        ]
+    )
+    frame.to_parquet(tmp_path / "price_history.parquet", index=False)
+
+
+def test_pool_symbols_prefers_archive_pool_from_the_universe_start(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    _write_archive(tmp_path, {"2026-09-11": ["5930", "000660"], "2026-09-03": ["111111"]})
+    assert btt._pool_symbols(store, "2026-09-11") == (["005930", "000660"], "archive_pool")
+    assert btt._pool_symbols(store, "2026-09-03") == ([], "none")
+
+
+def test_pool_symbols_reconstructs_missing_day_from_band_and_top_trade_value(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    monkeypatch.setattr(btt, "RECONSTRUCTED_TOP_TRADE_VALUE", 1)
+    store = CaptureStore(tmp_path / "capture")
+    _write_prices(
+        tmp_path, "2026-09-14",
+        [("000001", 103.0, 100.0, 1.0), ("000002", 100.0, 100.0, 50.0), ("000003", 120.0, 100.0, 2.0), ("000004", 99.0, 100.0, 3.0)],
+    )
+    symbols, source = btt._pool_symbols(store, "2026-09-14")
+    assert source == "reconstructed"
+    assert symbols == ["000001", "000002"]
+
+
+def test_pool_symbols_does_not_reconstruct_before_universe_start_or_without_prices(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    _write_prices(tmp_path, "2026-09-14", [("000001", 103.0, 100.0, 1.0)])
+    assert btt._pool_symbols(store, "2026-09-10") == ([], "none")
+    assert btt._pool_symbols(store, "2026-09-15") == ([], "none")
+
+
+def test_day_universe_merges_own_and_previous_pool_with_provenance(tmp_path, monkeypatch, caplog) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    _write_archive(tmp_path, {"2026-09-11": ["000001"], "2026-09-15": ["000009"]})
+    _write_prices(tmp_path, "2026-09-14", [("000005", 103.0, 100.0, 1.0)])
+    with caplog.at_level("INFO"):
+        assert btt._day_universe("2026-09-14", store) == ["000005", "000001"]
+        assert btt._day_universe("2026-09-15", store) == ["000009", "000005"]
+        assert btt._day_universe("2026-09-11", store) == ["000001"]
+    assert "own=reconstructed:1 prev=2026-09-11:archive_pool" in caplog.text
+    assert "own=archive_pool:1 prev=2026-09-14:reconstructed" in caplog.text
+
+
+def test_unreadable_archive_and_price_history_degrade_to_no_pool(tmp_path, monkeypatch, caplog) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    (tmp_path / "archive.parquet").write_bytes(b"not parquet")
+    (tmp_path / "price_history.parquet").write_bytes(b"not parquet")
+    with caplog.at_level("WARNING"):
+        assert btt._pool_symbols(store, "2026-09-14") == ([], "none")
+    assert "archive_unreadable" in caplog.text and "price_history_unreadable" in caplog.text
+
+
+def test_history_archive_path_points_at_configured_archive(monkeypatch) -> None:
+    monkeypatch.undo()
+    from src import settings as _settings
+
+    assert btt._history_archive_path() == Path(_settings.HISTORY_PARQUET_PATH)

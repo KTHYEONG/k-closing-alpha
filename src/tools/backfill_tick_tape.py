@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import shutil
@@ -27,6 +28,7 @@ from src.data.capture_contracts import SEOUL, CaptureStatus
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_store import _partition_row_count, intraday_partition_path, tick_partition_path
+from src.strategy.contract import DEFAULT_UNIVERSE
 from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -214,20 +216,119 @@ def _is_trading_day(day: str, ingested: set[str]) -> bool:
     return day in ingested
 
 
+POOL_UNIVERSE_START: str = "2026-09-11"
+"""First day whose candidate pool follows the current universe definition (earlier archive pools are >=10% movers)."""
+
+RECONSTRUCTED_TOP_TRADE_VALUE: int = 100
+"""Top-N by trade value merged with the change band when a day's pool must be rebuilt from price_history."""
+
+_ARCHIVE_DAY_COLUMN = "스냅샷_날짜"
+_ARCHIVE_SYMBOL_COLUMN = "종목코드"
+
+
+def _history_archive_path() -> Path:
+    return Path(settings.HISTORY_PARQUET_PATH)
+
+
+@functools.lru_cache(maxsize=4)
+def _load_archive_pools(path: str, mtime_ns: int) -> dict[str, tuple[str, ...]]:
+    del mtime_ns  # cache key only: a rewritten archive must not serve stale pools
+    frame = pd.read_parquet(path, columns=[_ARCHIVE_DAY_COLUMN, _ARCHIVE_SYMBOL_COLUMN])
+    days = pd.to_datetime(frame[_ARCHIVE_DAY_COLUMN]).dt.strftime("%Y-%m-%d")
+    codes = frame[_ARCHIVE_SYMBOL_COLUMN].astype(str).str.zfill(6)
+    pools: dict[str, tuple[str, ...]] = {}
+    for day, group in codes.groupby(days):
+        pools[str(day)] = tuple(dict.fromkeys(group.tolist()))
+    return pools
+
+
+def _archive_pool(day: str) -> list[str]:
+    path = _history_archive_path()
+    try:
+        if not path.exists():
+            return []
+        pools = _load_archive_pools(str(path), path.stat().st_mtime_ns)
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning("[DATA] stage=tape_backfill status=DEGRADED reason=archive_unreadable error=%s", type(exc).__name__)
+        return []
+    return list(pools.get(day, ()))
+
+
+@functools.lru_cache(maxsize=4)
+def _load_price_rows(path: str, mtime_ns: int) -> pd.DataFrame:
+    del mtime_ns
+    frame = pd.read_parquet(
+        path,
+        columns=["date", "symbol", "close", "prev_close", "trade_value_100m"],
+        filters=[("date", ">=", pd.Timestamp(POOL_UNIVERSE_START))],
+    )
+    frame = frame.assign(day=pd.to_datetime(frame["date"]).dt.strftime("%Y-%m-%d"), symbol=frame["symbol"].astype(str))
+    return frame.drop(columns=["date"])
+
+
+def _reconstructed_pool(day: str) -> list[str]:
+    """Rebuild one day's candidate pool from end-of-day prices (tick-target selection only, never decision-time).
+
+    Applies the current universe's change band plus the top trade-value names; end-of-day inputs make the result
+    look-ahead relative to the live 15:20 scan, so it must never feed strategy evaluation.
+    """
+    path = _price_history_path()
+    try:
+        if not path.exists():
+            return []
+        rows = _load_price_rows(str(path), path.stat().st_mtime_ns)
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning("[DATA] stage=tape_backfill status=DEGRADED reason=price_history_unreadable error=%s", type(exc).__name__)
+        return []
+    today = rows[rows["day"] == day]
+    if today.empty:
+        return []
+    change = today["close"] / today["prev_close"] - 1.0
+    band = today[(change >= DEFAULT_UNIVERSE.chg_min) & (change < DEFAULT_UNIVERSE.chg_max)]["symbol"]
+    top = today.nlargest(RECONSTRUCTED_TOP_TRADE_VALUE, "trade_value_100m")["symbol"]
+    return sorted(set(band.tolist()) | set(top.tolist()))
+
+
+def _pool_symbols(store: CaptureStore, day: str) -> tuple[list[str], str]:
+    """One day's candidate pool and its provenance: cohort, archive_pool, reconstructed, or none.
+
+    Archive and reconstructed pools apply only from POOL_UNIVERSE_START; earlier archive rows follow a different
+    (>=10% mover) universe and are deliberately not used.
+    """
+    cohort = _read_cohort_symbols(store, day)
+    if cohort:
+        return cohort, "cohort"
+    if day >= POOL_UNIVERSE_START:
+        archived = _archive_pool(day)
+        if archived:
+            return archived, "archive_pool"
+        rebuilt = _reconstructed_pool(day)
+        if rebuilt:
+            return rebuilt, "reconstructed"
+    return [], "none"
+
+
 def _day_universe(day: str, store: CaptureStore) -> list[str]:
     codes: list[str] = []
-    for item in _read_cohort_symbols(store, day):
+    own, own_source = _pool_symbols(store, day)
+    for item in own:
         if item not in codes:
             codes.append(item)
     base = date.fromisoformat(day)
+    prev_source, prev_day = "none", ""
     for offset in range(1, 11):
         prev = (base - timedelta(days=offset)).isoformat()
-        prev_codes = _read_cohort_symbols(store, prev)
+        prev_codes, prev_source = _pool_symbols(store, prev)
         if prev_codes:
+            prev_day = prev
             for item in prev_codes:
                 if item not in codes:
                     codes.append(item)
             break
+    logger.info(
+        "[DATA] stage=tape_universe day=%s own=%s:%d prev=%s:%s total_pool=%d",
+        day, own_source, len(own), prev_day or "none", prev_source, len(codes),
+    )
     for session in _TICK_SESSIONS:
         for item in _read_symbols(tick_partition_path(day, session)):
             if item not in codes:
