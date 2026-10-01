@@ -32,6 +32,9 @@ _KIWOOM_TR_RATE_PER_SEC = 5.0
 # 통과 여부가 갈리므로, 브라우저/CLI 도구처럼 보이는 값으로 고정한다.
 _KIWOOM_USER_AGENT = "curl/8.5.0"
 
+KIWOOM_AUTH_EXPIRED_RETURN_CODE: int = 3
+KIWOOM_AUTH_EXPIRED_MSG_CODE: str = "8005"
+
 _SEOUL = ZoneInfo("Asia/Seoul")
 _CNTR_TM_RE = re.compile(r"^\d{14}$")
 
@@ -192,11 +195,25 @@ class KiwoomApiClient:
         next_key: str = "",
         max_retries: int = 3,
     ) -> tuple[dict, dict]:
+        """POST one Kiwoom TR and return (json body, response headers).
+
+        Kiwoom expires the shared per-key token 24h after issuance and hands the same live token to every issuer, so a
+        long run (or a run started seconds before expiry) can hold an expired token. An auth rejection
+        (`return_code == KIWOOM_AUTH_EXPIRED_RETURN_CODE` with `KIWOOM_AUTH_EXPIRED_MSG_CODE` in `return_msg`) drops the
+        cached token, issues a fresh one, and replays the same request exactly once.
+
+        Returns:
+            The vendor body and headers of the last attempt; a second consecutive auth rejection is returned as-is
+            (callers keep their existing vendor_failure handling).
+
+        Raises:
+            RuntimeError: Token issuance failed during the refresh (propagated from ensure_token).
+        """
         if not self.token:
             await self.ensure_token(session)
         limiter = self._limiter_for(api_id)
 
-        for attempt in range(max_retries):
+        async def _single_post() -> tuple[dict, dict, int]:
             await limiter.acquire()
             headers = {
                 "Content-Type": "application/json;charset=UTF-8",
@@ -222,6 +239,32 @@ class KiwoomApiClient:
                         resp_headers = {}
                 else:
                     resp_headers = {}
+            return data, resp_headers, status
+
+        def _is_auth_expired(data: dict) -> bool:
+            return data.get("return_code") == KIWOOM_AUTH_EXPIRED_RETURN_CODE and KIWOOM_AUTH_EXPIRED_MSG_CODE in str(
+                data.get("return_msg", "")
+            )
+
+        refreshed = False
+        data: dict = {}
+        resp_headers: dict = {}
+        for attempt in range(max_retries):
+            data, resp_headers, status = await _single_post()
+
+            if _is_auth_expired(data) and not refreshed:
+                refreshed = True
+                self.reset_token()
+                await self.ensure_token(session)
+                logger.warning("[EXEC] stage=kiwoom_token status=REFRESHED api_id=%s", api_id)
+                data, resp_headers, status = await _single_post()
+                if _is_auth_expired(data):
+                    return data, resp_headers
+                if status == 429 and attempt < max_retries - 1:
+                    logger.warning("Kiwoom rate limit hit (429) api_id=%s. Retrying in 1.2s... (attempt %d/%d)", api_id, attempt + 1, max_retries)
+                    await asyncio.sleep(1.2)
+                    continue
+                return data, resp_headers
 
             if status == 429 and attempt < max_retries - 1:
                 logger.warning("Kiwoom rate limit hit (429) api_id=%s. Retrying in 1.2s... (attempt %d/%d)", api_id, attempt + 1, max_retries)
@@ -529,6 +572,9 @@ class KiwoomApiClient:
         Returns:
             rt_cd/vendor/termination metadata plus `certificates` (every date seen, complete or not) and `pages_fetched`;
             no row payload (rows are delivered only through on_day_complete to keep memory bounded).
+            `termination_reason` is one of `tape_end` / `crossed_stop_day` / `tape_empty` / `page_budget` /
+            `deadline` / `nonprogress` / `cursor_inconsistent` / `vendor_failure`; `tape_empty` means the first
+            page carried no valid 14-digit `cntr_tm` row with no continuation.
 
         Raises:
             ValueError: Invalid or conflicting bounds.
@@ -641,6 +687,10 @@ class KiwoomApiClient:
                         received[ymd] = 0
                     buffers[ymd].append(r)
                     received[ymd] = int(received.get(ymd, 0)) + 1
+                if page_index == 0 and not valid_rows and header_cont != "Y":
+                    termination = "tape_empty"
+                    truncated = False
+                    break
                 if malformed:
                     termination = "cursor_inconsistent"
                     truncated = True

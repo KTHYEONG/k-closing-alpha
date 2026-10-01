@@ -58,6 +58,9 @@ class CollectionSettings(EnvSettings):
         COLLECTION_TAPE_FLUSH_ROWS: Tape publisher row bound before a partition flush, default 2000000.
         COLLECTION_TAPE_MIN_FREE_GIB: Free-disk floor (GiB) below which tape jobs stop starting walks, default 25.
         COLLECTION_TAPE_LOOKBACK_DAYS: Daily sweep re-check window in days, default 25 (below the ~30 day tape depth).
+        COLLECTION_TAPE_MAX_PAGES: Page guard for one tape walk (history backfill/sweep), default 12000. A walk cannot
+            seek, so reaching the oldest tape day of a heavy symbol needs ~22 days x its daily pages; same-day repair keeps
+            COLLECTION_TICK_REPAIR_MAX_PAGES.
 
     Raises:
         ValueError: Invalid limits, duplicate slots, or enabled auctions without
@@ -80,6 +83,7 @@ class CollectionSettings(EnvSettings):
     COLLECTION_TAPE_FLUSH_ROWS: int = Field(default=2_000_000, gt=0)
     COLLECTION_TAPE_MIN_FREE_GIB: int = Field(default=25, gt=0)
     COLLECTION_TAPE_LOOKBACK_DAYS: int = Field(default=25, gt=0, le=30)
+    COLLECTION_TAPE_MAX_PAGES: int = Field(default=12000, ge=1000, le=30000)
     COLLECTION_ARROW_BATCH_ROWS: int = Field(default=65536, gt=0)
     COLLECTION_MAX_RSS_MIB: int = Field(default=1024, gt=0)
     COLLECTION_ALTDATA_LOOKBACK_DAYS: int = Field(default=30, gt=0)
