@@ -1550,3 +1550,115 @@ def test_main_restore_rejects_dest_inside_live_tiers(tmp_path: Path, monkeypatch
         module.main(["restore", "--tier", "raw", "--date", "2026-09-10", "--dest", str(tmp_path / "raw" / "x")])
     assert not (tmp_path / "raw" / "x").exists()
     assert not (tmp_path / "staging").exists()
+
+
+def test_seal_deadline_defers_unstarted_dates_and_keeps_watermarks(tmp_path: Path, monkeypatch) -> None:
+    import json
+    from datetime import timedelta
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    for day in ("2026-09-08", "2026-09-09", "2026-09-10"):
+        _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.json.gz"), b"payload")
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    start = datetime(2026, 9, 11, 22, 0, tzinfo=UTC)
+    deadline = start + timedelta(minutes=60)
+    ticks = iter([start, start] + [deadline + timedelta(minutes=1)] * 20)
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=deadline,
+        run_fn=run_fn, now_fn=lambda: next(ticks), config=_config(),
+    )
+
+    assert report.segments_committed == 1 and report.deferred_dates == 2
+    state = json.loads((tmp_path / "offsite" / "scan_state.json").read_text(encoding="utf-8"))
+    assert "raw/2026-09-10" in state
+    assert "raw/2026-09-09" not in state and "raw/2026-09-08" not in state
+    assert (tmp_path / "offsite" / "ledger" / "raw" / "2026-09-10.jsonl").exists()
+    assert not (tmp_path / "offsite" / "ledger" / "raw" / "2026-09-09.jsonl").exists()
+
+
+def test_seal_processes_newest_dates_first(tmp_path: Path, monkeypatch) -> None:
+    from datetime import timedelta
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    _write_member(tmp_path, _raw_rel("2026-09-01", "kis", "PRICE", "price", "run-1", "a.json.gz"), b"old")
+    _write_member(tmp_path, _raw_rel("2026-09-11", "kis", "PRICE", "price", "run-1", "a.json.gz"), b"new")
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    start = datetime(2026, 9, 11, 22, 0, tzinfo=UTC)
+    ticks = iter([start, start] + [start + timedelta(hours=2)] * 10)
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=start + timedelta(minutes=60),
+        run_fn=run_fn, now_fn=lambda: next(ticks), config=_config(),
+    )
+
+    assert report.segments_committed == 1 and report.deferred_dates == 1
+    assert (tmp_path / "offsite" / "ledger" / "raw" / "2026-09-11.jsonl").exists()
+    assert not (tmp_path / "offsite" / "ledger" / "raw" / "2026-09-01.jsonl").exists()
+
+
+def test_seal_never_interrupts_an_in_flight_segment(tmp_path: Path, monkeypatch) -> None:
+    from datetime import timedelta
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    _write_member(tmp_path, _raw_rel("2026-09-10", "kis", "PRICE", "price", "run-1", "a.json.gz"), b"payload")
+    base_run, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    start = datetime(2026, 9, 11, 22, 0, tzinfo=UTC)
+    clock = {"now": start}
+
+    def _slow_upload(cmd, **kwargs):
+        if cmd[1] == "copyto":
+            clock["now"] = start + timedelta(hours=2)
+        return base_run(cmd, **kwargs)
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=start + timedelta(minutes=60),
+        run_fn=_slow_upload, now_fn=lambda: clock["now"], config=_config(),
+    )
+
+    assert report.segments_committed == 1 and report.deferred_dates == 0
+    assert (tmp_path / "offsite" / "ledger" / "raw" / "2026-09-10.jsonl").exists()
+
+
+def test_seal_rejects_naive_deadline(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=datetime(2026, 9, 11, 23, 0))
+
+
+def test_seal_without_deadline_commits_everything(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    for day in ("2026-09-09", "2026-09-10"):
+        _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.json.gz"), b"payload")
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=None,
+        run_fn=run_fn, now_fn=_utcnow, config=_config(),
+    )
+
+    assert report.segments_committed == 2 and report.deferred_dates == 0
+
+
+def test_manifest_retention_must_outlast_the_tape_window() -> None:
+    import pytest
+
+    from src.config.collection import CollectionSettings
+    from src.tools.capture_offsite import _validate_manifest_retention
+
+    lookback = int(CollectionSettings().COLLECTION_TAPE_LOOKBACK_DAYS)
+    _validate_manifest_retention(lookback + 2)
+    with pytest.raises(ValueError, match="COLLECTION_TAPE_LOOKBACK_DAYS"):
+        _validate_manifest_retention(lookback + 1)

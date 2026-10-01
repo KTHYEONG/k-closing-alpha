@@ -1,5 +1,6 @@
 [Unit]
 Description=KCA aftermarket order-book capture (research, no orders)
+After=kca-collect.service
 OnFailure=kca-alert@%n.service
 
 [Service]

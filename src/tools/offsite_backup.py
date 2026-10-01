@@ -9,7 +9,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -29,6 +29,7 @@ LOOSE_SUBTREES: tuple[str, ...] = ("data", "artifacts")
 LOOSE_EXCLUDES: tuple[str, ...] = (
     "/history/capture/raw/**",
     "/history/capture/normalized/**",
+    "/history/capture/manifests/**",
     "/history/capture/backups/**",
     "/history/capture/staging/**",
 )
@@ -36,7 +37,10 @@ LOOSE_RCLONE_FLAGS: tuple[str, ...] = ("--transfers", "4", "--checkers", "8")
 BACKUP_SLOT_KST: time = time(22, 15)
 BACKUP_SLOT_WEEKDAYS: frozenset[int] = frozenset({0, 1, 2, 3, 4})
 REPORT_RELPATH: str = "offsite/last_run.json"
-# systemd TimeoutStartSec(4h)와 동일한 상한 — 개별 복사가 유닛 전체 예산을 넘지 못하게 한다
+BACKUP_SEAL_BUDGET: timedelta = timedelta(minutes=90)
+BACKUP_TOTAL_BUDGET: timedelta = timedelta(minutes=150)
+RCLONE_DURATION_EXCEEDED_EXIT: int = 10
+# 개별 복사의 하드 서브프로세스 타임아웃 — 유닛 백스톱(TimeoutStartSec=3h)보다 길어 먼저 끊기지 않는다
 LOOSE_RCLONE_TIMEOUT_SEC: int = 4 * 3600
 
 
@@ -50,14 +54,16 @@ class BackupRunReport:
 
 
 def loose_copy_command(
-    rclone: str, project_root: Path, subtree: str, snapshot_day: str, extra_excludes: Sequence[str] = ()
+    rclone: str, project_root: Path, subtree: str, snapshot_day: str, extra_excludes: Sequence[str] = (),
+    max_duration_s: int | None = None,
 ) -> list[str]:
     """Build the loose-tier rclone copy for one project subtree.
 
     Copy (never sync) so local deletions never propagate; overwritten remote
     files move to _deleted/<subtree>/<snapshot_day> for backup_prune retention.
     Capture segment tiers and local-only snapshots are excluded (only the
-    "data" subtree carries excludes).
+    "data" subtree carries excludes). A max_duration_s bound stops the copy
+    softly at the shared-lock budget instead of failing it.
     """
     dest = f"{BACKUP_REMOTE_BASE}/{subtree}"
     cmd = [
@@ -75,6 +81,8 @@ def loose_copy_command(
     elif extra_excludes:
         for pattern in extra_excludes:
             cmd += ["--exclude", pattern]
+    if max_duration_s is not None:
+        cmd += ["--max-duration", f"{int(max_duration_s)}s", "--cutoff-mode", "soft"]
     return cmd
 
 
@@ -182,7 +190,7 @@ def run_offsite_backup(
         steps["core_panels"] = {"status": "ok", "issues": []}
 
     try:
-        report = seal_fn(capture_root, today=today, full_scan=full_scan)
+        report = seal_fn(capture_root, today=today, full_scan=full_scan, deadline=kst + BACKUP_SEAL_BUDGET)
         steps["capture_seal"] = {
             "status": "ok",
             "dates_scanned": report.dates_scanned,
@@ -190,12 +198,17 @@ def run_offsite_backup(
             "members_committed": report.members_committed,
             "archive_bytes": report.archive_bytes,
             "missing_sealed_members": report.missing_sealed_members,
+            "deferred_dates": report.deferred_dates,
         }
     except Exception as exc:
         steps["capture_seal"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
     for subtree in LOOSE_SUBTREES:
-        cmd = loose_copy_command(rclone, project_root, subtree, snapshot_day, _excludes_for_subtree(core_issues, subtree))
+        remaining_s = max(60, int(((kst + BACKUP_TOTAL_BUDGET) - datetime.now(KST)).total_seconds()))
+        cmd = loose_copy_command(
+            rclone, project_root, subtree, snapshot_day, _excludes_for_subtree(core_issues, subtree),
+            max_duration_s=remaining_s,
+        )
         try:
             result = run_fn(cmd, capture_output=True, text=True, timeout=LOOSE_RCLONE_TIMEOUT_SEC, check=False)
         except Exception as exc:
@@ -206,6 +219,8 @@ def run_offsite_backup(
                 steps[subtree] = {"status": "failed", "issues": core_issues}
             else:
                 steps[subtree] = {"status": "ok"}
+        elif result.returncode == RCLONE_DURATION_EXCEEDED_EXIT:
+            steps[subtree] = {"status": "deferred", "returncode": result.returncode}
         else:
             payload: dict[str, Any] = {
                 "status": "failed",
@@ -216,7 +231,7 @@ def run_offsite_backup(
                 payload["issues"] = core_issues
             steps[subtree] = payload
 
-    status = "ok" if all(step.get("status") == "ok" for step in steps.values()) else "failed"
+    status = "ok" if all(step.get("status") in ("ok", "deferred") for step in steps.values()) else "failed"
     finished_at = datetime.now(UTC).isoformat()
     if core_issues:
         persisted_panels = [{"relpath": e.relpath, "sha256": e.sha256, "bytes": e.bytes, "rows": e.rows, "max_date": e.max_date} for e in previous_stats] if raw_previous else None
@@ -258,6 +273,8 @@ def backup_staleness_issues(report_path: Path, audit_at: datetime) -> list[str]:
         [] when the report is ok and started at/after the expected slot;
         otherwise one of ["offsite_backup:missing"], ["offsite_backup:failed"],
         ["offsite_backup:stale"]. Unreadable report -> ["offsite_backup:unreadable"].
+        An ok, fresh report whose seal deferred dates or whose loose copy hit the
+        duration budget yields ["offsite_backup:deferred"] (digest warning, not failure).
     """
     path = Path(report_path)
     if not path.exists():
@@ -282,6 +299,17 @@ def backup_staleness_issues(report_path: Path, audit_at: datetime) -> list[str]:
         return ["offsite_backup:failed"]
     if started_at < expected_backup_slot(audit_at):
         return ["offsite_backup:stale"]
+    steps = raw.get("steps")
+    if isinstance(steps, dict):
+        seal = steps.get("capture_seal")
+        if isinstance(seal, dict):
+            deferred_dates = seal.get("deferred_dates", 0)
+            if isinstance(deferred_dates, int) and deferred_dates > 0:
+                return ["offsite_backup:deferred"]
+        for subtree in LOOSE_SUBTREES:
+            step = steps.get(subtree)
+            if isinstance(step, dict) and step.get("status") == "deferred":
+                return ["offsite_backup:deferred"]
     return []
 
 

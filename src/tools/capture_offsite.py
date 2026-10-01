@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
+from src.config.collection import CollectionSettings
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.tools.offsite_common import (
     DATED_DIR_RE as _DATE_RE,
@@ -42,7 +43,7 @@ from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
-RUN_DIR_DEPTH: Mapping[str, int] = {"raw": 5, "normalized": 2}
+RUN_DIR_DEPTH: Mapping[str, int] = {"raw": 5, "normalized": 2, "manifests": 2}
 
 _CHUNK = 1024 * 1024
 
@@ -68,7 +69,7 @@ class OffsiteConfig:
     """
 
     remote_root: str = OFFSITE_REMOTE_BASE + "/capture_sealed"
-    tiers: tuple[str, ...] = ("raw", "normalized")
+    tiers: tuple[str, ...] = ("raw", "normalized", "manifests")
     max_segment_member_bytes: int = 1_000_000_000
     recent_window_days: int = 3
     full_scan_weekday: int = 4
@@ -101,6 +102,7 @@ class SealReport:
     members_committed: int
     archive_bytes: int
     missing_sealed_members: int
+    deferred_dates: int = 0
 
 
 def _utcnow() -> datetime:
@@ -452,23 +454,30 @@ def seal_and_upload(
     *,
     today: date,
     full_scan: bool,
+    deadline: datetime | None = None,
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     now_fn: Callable[[], datetime] = _utcnow,
     config: OffsiteConfig = OffsiteConfig(),  # noqa: B008
 ) -> SealReport:
-    """Seal every pending capture member into verified offsite segments.
+    """Seal pending capture members into verified offsite segments, newest dates first, until the deadline.
+
+    The shared Drive lock is held by this run, so it must end in bounded time; work not started before `deadline`
+    is deferred to the next run. Deferred dates keep their previous scan watermark, so the next run re-selects them.
+    Dates are processed newest-first (the recent window before older backfill-touched dates) so a deferral never
+    delays today's evidence.
 
     Segments are uploaded before they are recorded, and recorded only after
     the remote MD5 equals the local archive MD5, so the ledger never claims an
     object that is absent or corrupt offsite.
 
     Raises:
-        ValueError: Unexpected layout (non-date directory under a tier) or an
-            immutability violation.
+        ValueError: deadline is naive, unexpected layout, or an immutability violation.
         RuntimeError: Another seal run holds the local seal lock.
         subprocess.CalledProcessError: rclone upload/hash failure.
         OSError: Staging or ledger write failure.
     """
+    if deadline is not None and (deadline.tzinfo is None or deadline.utcoffset() is None):
+        raise ValueError(f"deadline must be timezone-aware: {deadline!r}")
     capture_root = Path(capture_root)
     lock_path = capture_root / "offsite" / ".seal.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,7 +488,7 @@ def seal_and_upload(
         except OSError as exc:
             raise RuntimeError("another seal run holds the local seal lock") from exc
         try:
-            return _seal_locked(capture_root, today=today, full_scan=full_scan, run_fn=run_fn, now_fn=now_fn, config=config)
+            return _seal_locked(capture_root, today=today, full_scan=full_scan, deadline=deadline, run_fn=run_fn, now_fn=now_fn, config=config)
         finally:
             with contextlib.suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -492,6 +501,7 @@ def _seal_locked(
     *,
     today: date,
     full_scan: bool,
+    deadline: datetime | None,
     run_fn: Callable[..., subprocess.CompletedProcess[str]],
     now_fn: Callable[[], datetime],
     config: OffsiteConfig,
@@ -505,6 +515,8 @@ def _seal_locked(
     members_committed = 0
     archive_bytes_total = 0
     missing_sealed_members = 0
+    deferred_dates = 0
+    selected: list[tuple[str, str, int]] = []
     for tier in config.tiers:
         tier_root = capture_root / tier
         if not tier_root.exists():
@@ -522,106 +534,121 @@ def _seal_locked(
         for date_name in date_names:
             parsed = date.fromisoformat(date_name)
             if full_scan or (today - parsed).days <= config.recent_window_days:
-                selected = True
+                is_selected = True
             else:
                 key = f"{tier}/{date_name}"
                 stored = state.get(key)
                 if stored is None:
-                    selected = True
+                    is_selected = True
                 else:
                     current_peak = _structural_max_mtime_ns(tier_root, date_name, depth)
-                    selected = current_peak > stored
-            if not selected:
+                    is_selected = current_peak > stored
+            if not is_selected:
                 continue
             dates_scanned += 1
             # 계획 전에 워터마크를 잡아야 스캔 도중 생긴 run 디렉터리가 다음 실행에서 재탐지된다
             scan_peak = _structural_max_mtime_ns(tier_root, date_name, depth)
-            entries = read_ledger(capture_root, tier, date_name)
-            sealed: dict[str, int] = {}
-            for ledger_entry in entries:
-                for member in ledger_entry.members:
-                    sealed[member.path] = member.size
-            for sealed_path in sealed:
-                full = capture_root / sealed_path
-                if full.is_symlink() or not full.is_file():
-                    missing_sealed_members += 1
-            segments = plan_segments(capture_root, tier, date_name, sealed, config)
-            for seg_members in segments:
-                seg = segment_name(seg_members)
-                staging_path = staging_dir / f"{seg}.tar.zst"
-                try:
-                    _build_archive(capture_root, seg_members, staging_path)
-                    _verify_archive_members(staging_path, seg_members)
-                    local_md5 = _local_md5(staging_path)
-                    local_bytes = staging_path.stat().st_size
-                    remote = _remote_path(config, tier, date_name, seg)
-                    pre = run_fn(
+            selected.append((tier, date_name, scan_peak))
+    # 최신 날짜부터 처리해야 연기 시 오늘 증거가 밀리지 않는다 (동일 날짜는 config.tiers 순서)
+    selected.sort(key=lambda item: item[1], reverse=True)
+    for tier, date_name, scan_peak in selected:
+        entries = read_ledger(capture_root, tier, date_name)
+        sealed: dict[str, int] = {}
+        for ledger_entry in entries:
+            for member in ledger_entry.members:
+                sealed[member.path] = member.size
+        for sealed_path in sealed:
+            full = capture_root / sealed_path
+            if full.is_symlink() or not full.is_file():
+                missing_sealed_members += 1
+        segments = plan_segments(capture_root, tier, date_name, sealed, config)
+        if not segments:
+            state[f"{tier}/{date_name}"] = scan_peak
+            continue
+        date_complete = True
+        for seg_members in segments:
+            if deadline is not None and now_fn() >= deadline:
+                date_complete = False
+                break
+            seg = segment_name(seg_members)
+            staging_path = staging_dir / f"{seg}.tar.zst"
+            try:
+                _build_archive(capture_root, seg_members, staging_path)
+                _verify_archive_members(staging_path, seg_members)
+                local_md5 = _local_md5(staging_path)
+                local_bytes = staging_path.stat().st_size
+                remote = _remote_path(config, tier, date_name, seg)
+                pre = run_fn(
+                    [rclone, "md5sum", remote],
+                    capture_output=True,
+                    text=True,
+                    timeout=config.rclone_timeout_sec,
+                    check=False,
+                )
+                remote_pre = _parse_remote_md5(pre.stdout) if pre.returncode == 0 else None
+                if remote_pre != local_md5:
+                    uploaded = run_fn(
+                        [rclone, "copyto", str(staging_path), remote, "--immutable"],
+                        capture_output=True,
+                        text=True,
+                        timeout=config.rclone_timeout_sec,
+                        check=True,
+                    )
+                    if uploaded.returncode != 0:
+                        raise subprocess.CalledProcessError(
+                            uploaded.returncode, uploaded.args, uploaded.stdout, uploaded.stderr
+                        )
+                    post = run_fn(
                         [rclone, "md5sum", remote],
                         capture_output=True,
                         text=True,
                         timeout=config.rclone_timeout_sec,
-                        check=False,
+                        check=True,
                     )
-                    remote_pre = _parse_remote_md5(pre.stdout) if pre.returncode == 0 else None
-                    if remote_pre != local_md5:
-                        uploaded = run_fn(
-                            [rclone, "copyto", str(staging_path), remote, "--immutable"],
-                            capture_output=True,
-                            text=True,
-                            timeout=config.rclone_timeout_sec,
-                            check=True,
-                        )
-                        if uploaded.returncode != 0:
-                            raise subprocess.CalledProcessError(
-                                uploaded.returncode, uploaded.args, uploaded.stdout, uploaded.stderr
-                            )
-                        post = run_fn(
-                            [rclone, "md5sum", remote],
-                            capture_output=True,
-                            text=True,
-                            timeout=config.rclone_timeout_sec,
-                            check=True,
-                        )
-                        if post.returncode != 0:
-                            raise subprocess.CalledProcessError(post.returncode, post.args, post.stdout, post.stderr)
-                        remote_post = _parse_remote_md5(post.stdout)
-                        if remote_post != local_md5:
-                            raise ValueError(f"remote MD5 mismatch for {remote}")
-                    committed_at = now_fn().isoformat()
-                    ledger_entry = LedgerEntry(
-                        tier=tier,
-                        trading_date=date_name,
-                        segment_name=seg,
-                        remote_path=remote,
-                        members=tuple(seg_members),
-                        archive_bytes=local_bytes,
-                        archive_md5=local_md5,
-                        committed_at=committed_at,
-                    )
-                    _append_ledger_entry(_ledger_path(capture_root, tier, date_name), ledger_entry)
-                    segments_committed += 1
-                    members_committed += len(seg_members)
-                    archive_bytes_total += local_bytes
-                    logger.info(
-                        "[SYS] stage=capture_offsite tier=%s date=%s segment=%s.tar.zst members=%d bytes=%d",
-                        tier,
-                        date_name,
-                        seg,
-                        len(seg_members),
-                        local_bytes,
-                    )
-                finally:
-                    with contextlib.suppress(OSError):
-                        staging_path.unlink(missing_ok=True)
+                    if post.returncode != 0:
+                        raise subprocess.CalledProcessError(post.returncode, post.args, post.stdout, post.stderr)
+                    remote_post = _parse_remote_md5(post.stdout)
+                    if remote_post != local_md5:
+                        raise ValueError(f"remote MD5 mismatch for {remote}")
+                committed_at = now_fn().isoformat()
+                ledger_entry = LedgerEntry(
+                    tier=tier,
+                    trading_date=date_name,
+                    segment_name=seg,
+                    remote_path=remote,
+                    members=tuple(seg_members),
+                    archive_bytes=local_bytes,
+                    archive_md5=local_md5,
+                    committed_at=committed_at,
+                )
+                _append_ledger_entry(_ledger_path(capture_root, tier, date_name), ledger_entry)
+                segments_committed += 1
+                members_committed += len(seg_members)
+                archive_bytes_total += local_bytes
+                logger.info(
+                    "[SYS] stage=capture_offsite tier=%s date=%s segment=%s.tar.zst members=%d bytes=%d",
+                    tier,
+                    date_name,
+                    seg,
+                    len(seg_members),
+                    local_bytes,
+                )
+            finally:
+                with contextlib.suppress(OSError):
+                    staging_path.unlink(missing_ok=True)
+        if date_complete:
             state[f"{tier}/{date_name}"] = scan_peak
+        else:
+            deferred_dates += 1
     _save_scan_state(capture_root, state)
     logger.info(
-        "[SYS] stage=capture_offsite dates=%d segments=%d members=%d bytes=%d missing=%d",
+        "[SYS] stage=capture_offsite dates=%d segments=%d members=%d bytes=%d missing=%d deferred=%d",
         dates_scanned,
         segments_committed,
         members_committed,
         archive_bytes_total,
         missing_sealed_members,
+        deferred_dates,
     )
     return SealReport(
         dates_scanned=dates_scanned,
@@ -629,10 +656,30 @@ def _seal_locked(
         members_committed=members_committed,
         archive_bytes=archive_bytes_total,
         missing_sealed_members=missing_sealed_members,
+        deferred_dates=deferred_dates,
     )
 
 
 LOCAL_SEALED_RETENTION_DAYS: int = 30
+
+
+def _validate_manifest_retention(retention_days: int) -> None:
+    """Fail fast when local manifest retention cannot cover the tape reader horizon.
+
+    Manifest readers (`read_manifests` tape window) reach back
+    ``COLLECTION_TAPE_LOOKBACK_DAYS``; local sealed manifests must outlive that
+    window or a widened tape lookback would read dates already pruned locally.
+
+    Raises:
+        ValueError: retention_days <= tape lookback + 1.
+    """
+    lookback = int(CollectionSettings().COLLECTION_TAPE_LOOKBACK_DAYS)
+    if not retention_days > lookback + 1:
+        raise ValueError(
+            f"LOCAL_SEALED_RETENTION_DAYS={retention_days} must exceed "
+            f"COLLECTION_TAPE_LOOKBACK_DAYS={lookback} + 1"
+        )
+
 
 
 @dataclass(frozen=True)
@@ -653,11 +700,13 @@ def prune_local_sealed_capture(
 ) -> LocalRetentionReport:
     """Remove local capture date directories whose every file is sealed offsite and verified.
 
-    Raw and normalized capture tiers are append-only evidence whose durable copy is the
-    sealed tar.zst segment set (ledger + remote MD5). Past the retention window, the local
-    copy only costs disk and seal-scan time; production readers need at most the previous
-    trading day. A directory is removed whole or not at all, because the sealer counts
-    ledger members missing from a directory it still scans.
+    Raw, normalized, and manifests capture tiers are append-only evidence whose durable
+    copy is the sealed tar.zst segment set (ledger + remote MD5). Past the retention
+    window, the local copy only costs disk and seal-scan time; production readers need
+    at most the previous trading day (manifest readers need the tape lookback window,
+    which retention is validated to exceed). A directory is removed whole or not at
+    all, because the sealer counts ledger members missing from a directory it still
+    scans.
 
     Args:
         capture_root: Capture store root (holds the tiers and offsite/ledger).
@@ -671,13 +720,15 @@ def prune_local_sealed_capture(
 
     Raises:
         OSError: Deleting an eligible directory failed; partial removal is never silenced.
-        ValueError: Retention window shorter than the append window.
+        ValueError: Retention window shorter than the append window or the tape
+            reader horizon (COLLECTION_TAPE_LOOKBACK_DAYS + 1).
     """
     if retention_days < config.recent_window_days + 1:
         raise ValueError(
             f"retention_days={retention_days} shorter than append window "
             f"(recent_window_days={config.recent_window_days})"
         )
+    _validate_manifest_retention(retention_days)
     capture_root = Path(capture_root)
     cutoff = today - timedelta(days=retention_days)
     rclone: str | None = None
@@ -1052,7 +1103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     `verify` : verify_remote_segments + run_restore_drill; exit 1 on any missing,
                mismatched, or drill failure (after logging every finding).
-    `restore --tier {raw,normalized} --date YYYY-MM-DD --dest PATH` : disaster
+    `restore --tier {raw,normalized,manifests} --date YYYY-MM-DD --dest PATH` : disaster
                recovery into PATH (must not be inside the live capture tiers).
     """
     import argparse
