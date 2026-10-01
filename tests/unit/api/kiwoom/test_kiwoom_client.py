@@ -1197,3 +1197,115 @@ def test_kiwoom_tape_vendor_failure_logs_return_msg(caplog) -> None:
         res = asyncio.run(client.walk_tick_tape(object(), "005930", stop_before_day="2026-09-03", max_pages=3))
     assert res["termination_reason"] == "vendor_failure"
     assert "token invalid" in caplog.text
+
+
+class _FakeResp:
+    def __init__(self, body: dict, status: int = 200) -> None:
+        self._body = body
+        self.status = status
+        self.headers = {"cont-yn": "N", "next-key": ""}
+
+    async def json(self) -> dict:
+        return self._body
+
+    async def __aenter__(self) -> _FakeResp:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+class _FakeKiwoomSession:
+    """Scripted TR responses plus a token endpoint that issues tok-1, tok-2, ..."""
+
+    def __init__(self, tr_responses: list[tuple[dict, int]]) -> None:
+        self.tr_responses = list(tr_responses)
+        self.tr_calls: list[dict[str, Any]] = []
+        self.token_calls = 0
+
+    def post(self, url: str, headers: dict, json: dict) -> _FakeResp:
+        if url.endswith("/oauth2/token"):
+            self.token_calls += 1
+            return _FakeResp({"token": f"tok-{self.token_calls}", "return_code": 0})
+        self.tr_calls.append({"auth": headers["authorization"], "cont": headers["cont-yn"], "key": headers["next-key"], "body": dict(json)})
+        body, status = self.tr_responses.pop(0)
+        return _FakeResp(body, status)
+
+
+_EXPIRED = ({"return_code": 3, "return_msg": "인증에 실패했습니다[8005:Token이 유효하지 않습니다]"}, 200)
+_OK = ({"return_code": 0, "return_msg": "OK"}, 200)
+
+
+def test_kiwoom_post_tr_refreshes_expired_token_once_and_replays_same_request() -> None:
+    client = _kiwoom_client()
+    session = _FakeKiwoomSession([_EXPIRED, _OK])
+    data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {"stk_cd": "005930"}, cont_yn="Y", next_key="k9"))
+    assert data["return_code"] == 0
+    assert session.token_calls == 1
+    assert [c["auth"] for c in session.tr_calls] == ["Bearer tok", "Bearer tok-1"]
+    assert session.tr_calls[0]["body"] == session.tr_calls[1]["body"] == {"stk_cd": "005930"}
+    assert {(c["cont"], c["key"]) for c in session.tr_calls} == {("Y", "k9")}
+
+
+def test_kiwoom_post_tr_second_auth_rejection_is_returned_without_looping() -> None:
+    client = _kiwoom_client()
+    session = _FakeKiwoomSession([_EXPIRED, _EXPIRED, _OK])
+    data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+    assert data["return_code"] == 3
+    assert len(session.tr_calls) == 2
+    assert session.token_calls == 1
+
+
+def test_kiwoom_post_tr_non_auth_vendor_error_is_not_refreshed() -> None:
+    client = _kiwoom_client()
+    for body in ({"return_code": 3, "return_msg": "other auth problem"}, {"return_code": 5, "return_msg": "8005 lookalike"}):
+        session = _FakeKiwoomSession([(body, 200)])
+        data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+        assert data == body
+        assert len(session.tr_calls) == 1
+        assert session.token_calls == 0
+
+
+def test_kiwoom_post_tr_refresh_does_not_consume_rate_limit_retries(monkeypatch) -> None:
+    async def _no_sleep(_s: float) -> None:
+        return None
+
+    monkeypatch.setattr("src.api.kiwoom.client.asyncio.sleep", _no_sleep)
+    client = _kiwoom_client()
+    session = _FakeKiwoomSession([({}, 429), _EXPIRED, _OK])
+    data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}, max_retries=3))
+    assert data["return_code"] == 0
+    assert session.token_calls == 1
+
+
+def test_kiwoom_walk_classifies_empty_nx_tape() -> None:
+    client = _kiwoom_client()
+    fake, state = _tick_pages([_tick_page([{"cur_prc": "", "trde_qty": "", "cntr_tm": ""}], "N", "")])
+    client._post_tr = fake
+    seen: list[Any] = []
+    res = asyncio.run(client.walk_tick_tape(object(), "031980", venue="NXT", stop_before_day="2026-09-21", max_pages=5, on_page=lambda *a: seen.append(a)))
+    assert res["termination_reason"] == "tape_empty"
+    assert res["truncated"] is False
+    assert res["certificates"] == []
+    assert len(seen) == 1 and state["calls"] == 1
+
+
+def test_kiwoom_walk_malformed_later_page_stays_cursor_inconsistent() -> None:
+    client = _kiwoom_client()
+    fake, _ = _tick_pages(
+        [
+            _tick_page([{"cur_prc": "1", "trde_qty": "1", "cntr_tm": "20260930153000"}], "Y", "A005930_NX2026093010"),
+            _tick_page([{"cur_prc": "", "trde_qty": "", "cntr_tm": ""}], "N", ""),
+        ]
+    )
+    client._post_tr = fake
+    res = asyncio.run(client.walk_tick_tape(object(), "005930", stop_before_day="2026-09-21", max_pages=5))
+    assert res["termination_reason"] == "cursor_inconsistent"
+
+
+def test_kiwoom_walk_empty_first_page_with_continuation_stays_cursor_inconsistent() -> None:
+    client = _kiwoom_client()
+    fake, _ = _tick_pages([_tick_page([{"cur_prc": "", "trde_qty": "", "cntr_tm": ""}], "Y", "k1")])
+    client._post_tr = fake
+    res = asyncio.run(client.walk_tick_tape(object(), "005930", stop_before_day="2026-09-21", max_pages=1))
+    assert res["termination_reason"] == "cursor_inconsistent"

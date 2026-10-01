@@ -507,3 +507,72 @@ def test_walk_deadline_is_passed_to_the_client_budget(tmp_path) -> None:
         )
     )
     assert stub.seen["budget"].deadline == limit
+
+
+def _recent_day(days_ago: int) -> str:
+    from datetime import timedelta
+
+    return (datetime.now(_SEOUL).date() - timedelta(days=days_ago)).isoformat()
+
+
+_EMPTY_PAGE = ([{"cntr_tm": "", "cur_prc": "", "trde_qty": ""}], {"cont-yn": "N", "next-key": ""})
+
+
+def test_tape_walk_uses_the_tape_page_guard(tmp_path) -> None:
+    stub = _StubTape([], [], [], termination="crossed_stop_day")
+    profile = _profile(tmp_path, COLLECTION_TAPE_MAX_PAGES=5000, COLLECTION_TICK_REPAIR_MAX_PAGES=1000)
+    asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "005930", [_DAY], venue="KRX", sessions=_krx_sessions(),
+            store=CaptureStore(tmp_path / "capture"), run_id="tape-2020-01-04-030", profile=profile, on_result=lambda r: None,
+        )
+    )
+    assert stub.seen["budget"].max_pages == 5000
+
+
+def test_empty_tape_settles_recent_days_as_no_trades_with_evidence(tmp_path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    day = _recent_day(2)
+    stub = _StubTape([_EMPTY_PAGE], [], [], termination="tape_empty")
+    out: list[TapeDayResult] = []
+    res = asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "031980", [day], venue="NXT", sessions=list(TAPE_SESSIONS),
+            store=store, run_id="tape-2020-01-04-031", profile=_profile(tmp_path), on_result=out.append,
+        )
+    )
+    assert res.unresolved_days == ()
+    assert [r.session for r in out] == ["nxt_aftermarket"]
+    entry = out[0].entry
+    assert entry.status == CaptureStatus.NO_TRADES
+    assert entry.reason.startswith("tape_empty:")
+    assert entry.raw_refs and all((store.root / ref.path).exists() for ref in entry.raw_refs)
+
+
+def test_empty_tape_cannot_prove_days_beyond_its_depth(tmp_path) -> None:
+    profile = _profile(tmp_path)
+    old = _recent_day(int(profile.COLLECTION_TAPE_LOOKBACK_DAYS) + 1)
+    stub = _StubTape([_EMPTY_PAGE], [], [], termination="tape_empty")
+    out: list[TapeDayResult] = []
+    res = asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "031980", [old], venue="NXT", sessions=list(TAPE_SESSIONS),
+            store=CaptureStore(tmp_path / "capture"), run_id="tape-2020-01-04-032", profile=profile, on_result=out.append,
+        )
+    )
+    assert res.unresolved_days == (old,)
+    assert [(r.entry.status, r.entry.reason) for r in out] == [(CaptureStatus.UNKNOWN, "day_not_on_tape")]
+
+
+def test_empty_tape_with_uncertified_venue_stays_unknown(tmp_path) -> None:
+    profile = _profile(tmp_path, routes={})
+    stub = _StubTape([_EMPTY_PAGE], [], [], termination="tape_empty")
+    out: list[TapeDayResult] = []
+    asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "031980", [_recent_day(2)], venue="NXT", sessions=list(TAPE_SESSIONS),
+            store=CaptureStore(tmp_path / "capture"), run_id="tape-2020-01-04-033", profile=profile, on_result=out.append,
+        )
+    )
+    assert out and all(r.entry.status == CaptureStatus.UNKNOWN for r in out)
+    assert all(r.entry.reason == "uncertified_venue" for r in out)
