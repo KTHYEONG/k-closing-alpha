@@ -27,6 +27,7 @@ from src.data.capture_contracts import SEOUL, CaptureStatus
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_store import _partition_row_count, intraday_partition_path, tick_partition_path
+from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -547,6 +548,7 @@ def main(argv: list[str] | None = None) -> None:
     Raises:
         ValueError: Open-ended or oversized selection (span > 31 days), unknown venue, naive deadline.
     """
+    configure_cli_logging(CLI_LOG_FORMAT_TIMESTAMPED)
     args = _parse_args(argv)
     start = _parse_day(args.start, "--start")
     end = _parse_day(args.end, "--end")
