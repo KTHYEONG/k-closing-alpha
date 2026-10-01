@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
@@ -48,6 +49,53 @@ class TickCursor:
     next_key: str
     rows_received: int
     total_ticks: int | None
+
+
+@dataclass(frozen=True)
+class TapeDayCertificate:
+    """Completeness proof for one market date observed on a Kiwoom tick tape walk.
+
+    Attributes:
+        day: Market date YYYY-MM-DD.
+        received: Rows of that date received by the walk.
+        vendor_total: Vendor-implied total for that date (received-so-far + remaining), None when never observed.
+        complete: True only when the walk moved past the date and the date is proven whole, either by the vendor
+            total (received + 1 == vendor_total) or, when no key ever carried that date, by being bracketed by rows
+            of a newer date (or the closed tape head) and an older date inside one unbroken cursor chain.
+        basis: "vendor_total", "bracketed" or "none" (the proof used when complete).
+    """
+
+    day: str
+    received: int
+    vendor_total: int | None
+    complete: bool
+    basis: str = "none"
+
+
+def _parse_tape_key(next_key: str, base_code: str) -> tuple[str, int] | None:
+    """Parse a tape ``next-key`` into its (date, remaining) pair.
+
+    Expected form is ``A<request code><YYYYMMDD><remaining>`` where the request code carries the ``_NX`` suffix
+    on the NXT tape; anything else yields
+    ``None`` (fail closed: no certificate, never a guess).
+    """
+    key = str(next_key or "")
+    prefix = f"A{base_code}"
+    if not key.startswith(prefix):
+        return None
+    rest = key[len(prefix):]
+    if len(rest) < 9 or not rest[:8].isdigit() or not rest[8:].isdigit():
+        return None
+    ymd = rest[:8]
+    try:
+        datetime.strptime(ymd, "%Y%m%d")
+    except ValueError:
+        return None
+    return ymd, int(rest[8:])
+
+
+def _dash_day(ymd: str) -> str:
+    return f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
 
 
 def _parse_tick_remaining(next_key: str, base_code: str, ymd: str) -> int | None:
@@ -448,6 +496,222 @@ class KiwoomApiClient:
         if truncated and last_header_cont == "Y" and last_header_key and termination in ("page_budget", "deadline", "crossed_time_floor"):
             cursor = TickCursor(next_key=last_header_key, rows_received=rows_received, total_ticks=vendor_total)
         return {"rt_cd": "0", "output2": filtered, "vendor": "kiwoom", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "cursor": cursor, "vendor_total_ticks": vendor_total, "rows_received": rows_received, "complete_by_total": complete_by_total}
+
+    async def walk_tick_tape(
+        self,
+        session,
+        code: str,
+        *,
+        venue: Literal["KRX", "NXT"] = "KRX",
+        stop_before_day: str,
+        budget: ChartBudget | None = None,
+        max_pages: int | None = None,
+        on_page: PageObserver | None = None,
+        on_day_complete: Callable[[str, list[dict[str, Any]], TapeDayCertificate], None] | None = None,
+    ) -> BrokerPayload:
+        """Walk the newest-first tape back to a stop date, certifying every fully traversed date.
+
+        Args:
+            session: Existing HTTP session.
+            code: 6-digit symbol (the NXT tape is addressed internally via venue).
+            venue: Tape to walk.
+            stop_before_day: Oldest date that must be fully traversed (YYYY-MM-DD); the walk ends once a page's oldest row
+                belongs to an earlier date or the tape ends.
+            budget / max_pages: Page bound; mutually consistent like get_tick_chart.
+            on_page: Raw page observer called before filtering (evidence persistence).
+            on_day_complete: Called once per date, in newest-to-oldest order, as soon as the date is certified complete,
+                with that date's rows (unfiltered by session window) and its certificate. Rows are NOT retained afterwards.
+
+        Returns:
+            rt_cd/vendor/termination metadata plus `certificates` (every date seen, complete or not) and `pages_fetched`;
+            no row payload (rows are delivered only through on_day_complete to keep memory bounded).
+
+        Raises:
+            ValueError: Invalid or conflicting bounds.
+            OSError: Mandatory evidence persistence fails.
+        """
+        stop_ymd = _validate_target_ymd(stop_before_day)
+        if venue not in ("KRX", "NXT"):
+            raise ValueError(f"unknown tick venue: {venue!r}")
+        if max_pages is not None and budget is not None and int(max_pages) != int(budget.max_pages):
+            raise ValueError("conflicting tick acquisition limits")
+        if max_pages is not None and int(max_pages) <= 0:
+            raise ValueError("invalid tick acquisition limits")
+        if budget is not None:
+            page_budget, deadline = _resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
+        elif max_pages is not None:
+            page_budget, deadline = max(1, int(max_pages)), None
+        else:
+            page_budget, deadline = _resolve_chart_budget(None, int(settings.COLLECTION_CHART_MAX_PAGES))
+        base_code = str(code).split("_")[0]
+        request_code = str(code) if venue == "KRX" else f"{base_code}_NX"
+        cont_yn, next_key = "N", ""
+        metadata: dict[str, str] = {}
+        termination = "tape_end"
+        truncated = False
+        pages_fetched = 0
+        failure_msg = ""
+        prev_identity: tuple[Any, ...] | None = None
+        stalls = 0
+        in_observer = False
+        day_order: list[str] = []
+        received: dict[str, int] = {}
+        vendor_totals: dict[str, int] = {}
+        buffers: dict[str, list[dict[str, Any]]] = {}
+        certs: dict[str, TapeDayCertificate] = {}
+        certified_order: list[str] = []
+
+        today_ymd = _now_seoul().strftime("%Y%m%d")
+
+        def _certify(ymd: str, older_seen: bool) -> None:
+            total = vendor_totals.get(ymd)
+            count = int(received.get(ymd, 0))
+            if total is not None:
+                ok = count == total - 1
+                basis = "vendor_total" if ok else "none"
+            else:
+                position = day_order.index(ymd)
+                newer_seen = position > 0 or ymd < today_ymd
+                ok = newer_seen and older_seen
+                basis = "bracketed" if ok else "none"
+            cert = TapeDayCertificate(
+                day=_dash_day(ymd), received=count, vendor_total=total, complete=bool(ok), basis=basis,
+            )
+            certs[ymd] = cert
+            certified_order.append(ymd)
+            rows = buffers.pop(ymd, [])
+            if ok and on_day_complete is not None:
+                on_day_complete(cert.day, rows, cert)
+
+        try:
+            for page_index in range(max(1, int(page_budget))):
+                deadline_left = _deadline_remaining(deadline)
+                if deadline_left is not None and deadline_left <= 0:
+                    termination = "deadline"
+                    truncated = True
+                    break
+                started = _now_seoul()
+                call = self._post_tr(
+                    session,
+                    "ka10079",
+                    "/api/dostk/chart",
+                    {"stk_cd": request_code, "tic_scope": "1", "upd_stkpc_tp": "1", "base_dt": stop_ymd},
+                    cont_yn=cont_yn,
+                    next_key=next_key,
+                )
+                if deadline_left is None:
+                    data, resp_headers = await call
+                else:
+                    data, resp_headers = await asyncio.wait_for(call, timeout=deadline_left)
+                received_at = _now_seoul()
+                header_cont = str(resp_headers.get("cont-yn", "N") or "N")
+                header_key = str(resp_headers.get("next-key", "") or "")
+                metadata = {"cont-yn": header_cont, "next-key": header_key}
+                in_observer = True
+                if on_page is not None:
+                    on_page(dict(data), metadata, started, received_at, page_index, 0)
+                in_observer = False
+                pages_fetched += 1
+                if data.get("return_code") != 0:
+                    termination = "vendor_failure"
+                    truncated = True
+                    failure_msg = str(data.get("return_msg", ""))
+                    break
+                raw_rows = data.get("stk_tic_chart_qry") or []
+                valid_rows: list[dict[str, Any]] = []
+                malformed = False
+                for r in raw_rows:
+                    if not isinstance(r, dict):
+                        malformed = True
+                        continue
+                    cntr_tm = str(r.get("cntr_tm", "") or "")
+                    if not _CNTR_TM_RE.fullmatch(cntr_tm):
+                        malformed = True
+                        continue
+                    valid_rows.append(dict(r))
+                for r in valid_rows:
+                    ymd = str(r.get("cntr_tm", ""))[:8]
+                    if ymd not in buffers:
+                        buffers[ymd] = []
+                        day_order.append(ymd)
+                        received[ymd] = 0
+                    buffers[ymd].append(r)
+                    received[ymd] = int(received.get(ymd, 0)) + 1
+                if malformed:
+                    termination = "cursor_inconsistent"
+                    truncated = True
+                    break
+                parsed = _parse_tape_key(header_key, request_code) if header_key else None
+                if header_key and parsed is None:
+                    pass
+                elif parsed is not None:
+                    key_ymd, remaining = parsed
+                    candidate = int(received.get(key_ymd, 0)) + int(remaining)
+                    if key_ymd in vendor_totals:
+                        if candidate != vendor_totals[key_ymd]:
+                            termination = "cursor_inconsistent"
+                            truncated = True
+                            break
+                    else:
+                        vendor_totals[key_ymd] = candidate
+                identity = (
+                    header_cont,
+                    header_key,
+                    tuple(str(r.get("cntr_tm", "")) for r in valid_rows),
+                )
+                if identity == prev_identity:
+                    stalls += 1
+                else:
+                    stalls = 0
+                    prev_identity = identity
+                if stalls >= 2:
+                    termination = "nonprogress"
+                    truncated = True
+                    break
+                is_tape_end = header_cont != "Y"
+                if is_tape_end:
+                    unsettled = [d for d in day_order if d not in certs]
+                    for ymd in unsettled:
+                        _certify(ymd, older_seen=ymd != unsettled[-1])
+                    termination = "tape_end"
+                    truncated = False
+                    break
+                if not header_key:
+                    termination = "cursor_inconsistent"
+                    truncated = True
+                    break
+                pending = [d for d in day_order if d not in certs]
+                if len(pending) >= 2:
+                    for ymd in pending[:-1]:
+                        _certify(ymd, older_seen=True)
+                oldest_ymd: str | None = None
+                if valid_rows:
+                    oldest_ymd = str(valid_rows[-1].get("cntr_tm", ""))[:8]
+                if oldest_ymd is not None and oldest_ymd < stop_ymd:
+                    termination = "crossed_stop_day"
+                    truncated = False
+                    break
+                cont_yn, next_key = header_cont, header_key
+            else:
+                termination = "page_budget"
+                truncated = True
+        except TimeoutError:
+            termination = "deadline"
+            truncated = True
+        except Exception as e:
+            if in_observer:
+                raise
+            logger.warning("Kiwoom tape walk failed code=%s: %s", code, e)
+            pending_certs = [TapeDayCertificate(day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False) for d in day_order if d not in certs]
+            return {"rt_cd": "1", "msg1": str(e), "vendor": "kiwoom", "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": pages_fetched, "continuation": metadata, "certificates": [certs[d] for d in certified_order] + pending_certs}
+        if termination == "vendor_failure":
+            certificates: list[TapeDayCertificate] = [certs[d] for d in certified_order]
+            certificates.extend(TapeDayCertificate(day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False) for d in day_order if d not in certs)
+            payload: BrokerPayload = {"rt_cd": "1", "msg1": failure_msg, "vendor": "kiwoom", "truncated": True, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "certificates": certificates}
+            return payload
+        certificates = [certs[d] for d in certified_order]
+        certificates.extend(TapeDayCertificate(day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False) for d in day_order if d not in certs)
+        return {"rt_cd": "0", "vendor": "kiwoom", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "certificates": certificates}
 
     async def get_nxt_premarket_chart(self, session, code: str, target_date: str) -> dict:
         ymd = str(target_date).replace("-", "")

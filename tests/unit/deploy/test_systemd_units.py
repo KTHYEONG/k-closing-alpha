@@ -33,6 +33,7 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
         "kca-auction-open.service",
         "kca-extended-backfill.service",
         "kca-aftermarket-book.service",
+        "kca-tape-sweep.service",
     }
 
     for svc in sorted(root.glob("kca-*.service")):
@@ -1051,6 +1052,7 @@ def test_budget_lines_are_commented() -> None:
         "kca-core-snapshot.service",
         "kca-extended-backfill.service",
         "kca-aftermarket-book.service",
+        "kca-tape-sweep.service",
     )
     for name in budgeted:
         lines = (root / name).read_text(encoding="utf-8").splitlines()
@@ -1137,3 +1139,30 @@ def test_aftermarket_book_service_keeps_shared_container_contract() -> None:
     assert "src.daily.aftermarket_book" in exec_line
     assert "--memory=" not in text
     assert "--cpus=" not in text
+
+
+def test_tape_sweep_unit_runs_after_evening_archive_outside_archive_slots() -> None:
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+    root = base / "systemd"
+    service = (root / "kca-tape-sweep.service").read_text(encoding="utf-8")
+    timer = (root / "kca-tape-sweep.timer").read_text(encoding="utf-8")
+    install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
+
+    # Then: 20:05 아카이브·23:05 백필 슬롯 밖인 20:35 발화, 1시간 상한, 저녁 아카이브 이후 순서
+    assert "OnCalendar=Mon..Fri 20:35:00 Asia/Seoul" in timer.splitlines()
+    assert "Persistent=true" in timer.splitlines()
+    assert "Unit=kca-tape-sweep.service" in timer
+    assert "TimeoutStartSec=3600" in service.splitlines()
+    assert "Type=oneshot" in service
+    assert "OnFailure=kca-alert@%n.service" in service
+    assert "After=kca-archive-intraday.service" in service
+    assert "src.daily.tick_tape_sweep" in service
+
+    # And: Kiwoom-only 작업이라 KIS 키풀 env·캐시를 물지 않는다
+    assert "--env-file %h/quant-secrets/kis-data.env" not in service
+    assert "-v %h/.cache/kis:/app/.cache/kis" not in service
+
+    # And: 설치 스크립트가 타이머를 활성화하고 실패 스캔(kca-*)에 자동 포함된다
+    assert "kca-tape-sweep.timer" in install_text

@@ -1049,3 +1049,131 @@ def test_kiwoom_tick_remaining_parser_rejects_non_numeric_tail_and_empty_key() -
     assert _parse_tick_remaining(f"A005930{_YMD}12x", "005930", _YMD) is None
     assert _parse_tick_remaining(f"A005930{_YMD}", "005930", _YMD) is None
     assert _parse_tick_remaining("", "005930", _YMD) is None
+
+
+def _tape_row(ymd: str, hms: str) -> dict:
+    return {"cur_prc": "270000", "trde_qty": "1", "cntr_tm": f"{ymd}{hms}"}
+
+
+def _tape_key(ymd: str, remaining: int, code: str = "005930") -> str:
+    return f"A{code}{ymd}{remaining:08d}"
+
+
+def _walk(client: KiwoomApiClient, pages: list, **kwargs: Any) -> tuple[dict, list]:
+    fake, _ = _tick_pages(pages)
+    client._post_tr = fake
+    delivered: list = []
+    res = asyncio.run(
+        client.walk_tick_tape(object(), "005930", stop_before_day="2026-09-03", max_pages=10,
+                              on_day_complete=lambda day, rows, cert: delivered.append((day, len(rows), cert)), **kwargs)
+    )
+    return res, delivered
+
+
+def test_walk_tick_tape_certifies_dates_across_a_straddling_page() -> None:
+    # 09-04: 3 rows (all on page 1 and 2); 09-03: 3 rows; vendor total counts one extra boundary tick (received + 1).
+    pages = [
+        _tick_page([_tape_row("20260904", "150003"), _tape_row("20260904", "150002")], "Y", _tape_key("20260904", 2)),
+        _tick_page([_tape_row("20260904", "150001"), _tape_row("20260903", "150003")], "Y", _tape_key("20260903", 3)),
+        _tick_page([_tape_row("20260903", "150002"), _tape_row("20260903", "150001")], "Y", _tape_key("20260903", 1)),
+        _tick_page([_tape_row("20260902", "150001")], "N", ""),
+    ]
+    res, delivered = _walk(_kiwoom_client(), pages)
+    assert res["termination_reason"] == "crossed_stop_day" or res["termination_reason"] == "tape_end"
+    days = {d: (n, c.complete, c.vendor_total) for d, n, c in delivered}
+    assert days["2026-09-04"] == (3, True, 4)
+    assert days["2026-09-03"] == (3, True, 4)
+
+
+def test_walk_tick_tape_short_date_is_not_delivered() -> None:
+    pages = [
+        _tick_page([_tape_row("20260904", "150003"), _tape_row("20260904", "150002")], "Y", _tape_key("20260904", 5)),
+        _tick_page([_tape_row("20260903", "150001")], "Y", _tape_key("20260903", 0)),
+        _tick_page([_tape_row("20260902", "150001")], "N", ""),
+    ]
+    res, delivered = _walk(_kiwoom_client(), pages)
+    certs = {c.day: c for c in res["certificates"]}
+    assert certs["2026-09-04"].complete is False and certs["2026-09-04"].vendor_total == 7
+    assert all(day != "2026-09-04" for day, _, _ in delivered)
+
+
+def test_walk_tick_tape_nxt_keys_carry_the_nx_suffix_and_certify() -> None:
+    client = _kiwoom_client()
+    seen: list[str] = []
+    pages = [
+        _tick_page([_tape_row("20260904", "150002"), _tape_row("20260904", "150001")], "Y", _tape_key("20260904", 1, code="005930_NX")),
+        _tick_page([_tape_row("20260903", "150001")], "N", ""),
+    ]
+    fake, _ = _tick_pages(pages)
+
+    async def recording(session: Any, api_id: str, path: str, body: dict, cont_yn: str = "N", next_key: str = "", max_retries: int = 3) -> tuple[dict, dict]:
+        seen.append(body["stk_cd"])
+        return await fake(session, api_id, path, body, cont_yn, next_key, max_retries)
+
+    client._post_tr = recording
+    delivered: list = []
+    res = asyncio.run(
+        client.walk_tick_tape(object(), "005930", venue="NXT", stop_before_day="2026-09-04", max_pages=5,
+                              on_day_complete=lambda day, rows, cert: delivered.append((day, cert)))
+    )
+    assert seen[0] == "005930_NX"
+    certs = {c.day: c for c in res["certificates"]}
+    assert certs["2026-09-04"].complete is True and certs["2026-09-04"].vendor_total == 3
+
+
+def test_walk_tick_tape_inconsistent_remaining_stops_and_certifies_nothing_after() -> None:
+    pages = [
+        _tick_page([_tape_row("20260904", "150003"), _tape_row("20260904", "150002")], "Y", _tape_key("20260904", 3)),
+        _tick_page([_tape_row("20260904", "150001")], "Y", _tape_key("20260904", 9)),
+        _tick_page([_tape_row("20260903", "150001")], "N", ""),
+    ]
+    res, delivered = _walk(_kiwoom_client(), pages)
+    assert res["termination_reason"] == "cursor_inconsistent" and res["truncated"] is True
+    assert delivered == []
+
+
+def test_walk_tick_tape_certifies_a_low_volume_date_by_bracketing_when_no_key_carries_it() -> None:
+    # 09-05 and 09-04 never appear as a page's oldest-row date, so no vendor total exists for them;
+    # they are certified by being bracketed by an older date inside the unbroken cursor chain.
+    pages = [
+        _tick_page(
+            [_tape_row("20260905", "150002"), _tape_row("20260905", "150001"), _tape_row("20260904", "150001"), _tape_row("20260903", "150002")],
+            "Y", _tape_key("20260903", 2),
+        ),
+        _tick_page([_tape_row("20260903", "150001")], "Y", _tape_key("20260903", 1)),
+        _tick_page([_tape_row("20260902", "150001")], "N", ""),
+    ]
+    fake, _ = _tick_pages(pages)
+    client = _kiwoom_client()
+    client._post_tr = fake
+    delivered: list = []
+    res = asyncio.run(
+        client.walk_tick_tape(object(), "005930", stop_before_day="2026-09-03", max_pages=5,
+                              on_day_complete=lambda day, rows, cert: delivered.append((day, len(rows), cert.basis)))
+    )
+    by_day = {d: (n, basis) for d, n, basis in delivered}
+    assert by_day["2026-09-05"] == (2, "bracketed")
+    assert by_day["2026-09-04"] == (1, "bracketed")
+    assert by_day["2026-09-03"][1] == "vendor_total"
+    assert res["termination_reason"] == "tape_end"
+
+
+def test_walk_tick_tape_oldest_date_at_tape_end_needs_its_vendor_total() -> None:
+    # The oldest date on the tape may have been cut by vendor retention: bracketing from below is impossible,
+    # so without a vendor total it stays uncertified.
+    pages = [
+        _tick_page([_tape_row("20260905", "150002"), _tape_row("20260904", "150001")], "Y", _tape_key("20260904", 0)),
+        _tick_page([_tape_row("20260903", "150001")], "N", ""),
+    ]
+    fake, _ = _tick_pages(pages)
+    client = _kiwoom_client()
+    client._post_tr = fake
+    delivered: list = []
+    res = asyncio.run(
+        client.walk_tick_tape(object(), "005930", stop_before_day="2026-09-03", max_pages=5,
+                              on_day_complete=lambda day, rows, cert: delivered.append(day))
+    )
+    certs = {c.day: c for c in res["certificates"]}
+    assert certs["2026-09-03"].complete is False
+    assert "2026-09-03" not in delivered
+    assert "2026-09-05" in delivered
