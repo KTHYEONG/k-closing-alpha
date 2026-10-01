@@ -39,7 +39,10 @@ _VOLUME_GAP_TOLERANCE = 0.01
 _CLOSE_AUCTION_TS = 153000
 _REGULAR_READY_HHMMSS = "154000"
 _TICK_SESSIONS = ("regular", "krx_aftermarket", "nxt_aftermarket")
-_DEFAULT_BLACKOUTS = ("15:35-15:55", "20:00-20:30", "23:00-23:15")
+# Kiwoom issues one token per key, so any overlap with a live Kiwoom unit invalidates one side's token and shares the 5 req/s limit.
+# Windows cover collect/predict (15:20), regular archive (15:40-16:30), aftermarket archive (20:05-21:05), price-ingest, extended backfill.
+_DEFAULT_BLACKOUTS = ("08:25-08:45", "11:25-11:45", "15:15-17:00", "20:00-21:10", "21:25-21:45", "23:00-23:20")
+_MAX_VENDOR_FAILURE_STREAK = 3
 
 
 @dataclass(frozen=True)
@@ -495,7 +498,7 @@ async def _run_tasks(
     root = _capture_root(profile)
     expected: dict[tuple[str, str], int] = {}
     pending_ledger: list[dict[str, Any]] = []
-    pages = rows = unresolved = 0
+    pages = rows = unresolved = failure_streak = 0
     remaining: list[str] = []
     started = time.monotonic()
     stopped_reason = ""
@@ -555,6 +558,16 @@ async def _run_tasks(
         else:
             rows += sum(len(r.frame) for r in results if r.entry.status == CaptureStatus.COMPLETE)
         unresolved += len(outcome.unresolved_days)
+        if outcome.termination_reason == "vendor_failure":
+            failure_streak += 1
+            client.reset_token()
+            if failure_streak >= _MAX_VENDOR_FAILURE_STREAK:
+                remaining = [f"{t.symbol}/{t.venue}" for t in tasks[index + 1 :]]
+                stopped_reason = "vendor_failure"
+                logger.warning("[DATA] stage=tape_backfill status=VENDOR_FAILURE_STREAK streak=%d remaining=%d", failure_streak, len(remaining))
+                break
+        else:
+            failure_streak = 0
         done = index + 1
         if done % 50 == 0:
             _heartbeat(done, len(tasks), pages, rows, unresolved, started)

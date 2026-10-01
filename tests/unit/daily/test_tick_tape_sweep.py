@@ -28,8 +28,9 @@ _SEOUL = ZoneInfo("Asia/Seoul")
 _FIXED_NOW = datetime(2026, 10, 1, 20, 40, tzinfo=_SEOUL)
 
 @pytest.fixture(autouse=True)
-def _isolated_price_history(tmp_path, monkeypatch) -> None:
+def _isolated_environment(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(btt, "_price_history_path", lambda: tmp_path / "price_history.parquet")
+    monkeypatch.setattr(btt, "_DEFAULT_BLACKOUTS", ())
 
 _DAY = "2026-09-30"
 _OLD_DAY = "2026-09-03"
