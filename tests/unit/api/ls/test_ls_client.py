@@ -481,7 +481,7 @@ def test_ls_post_tr_releases_lock_before_network_roundtrip() -> None:
         async def __aenter__(self):
             state["in_flight"] += 1
             state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.3)  # in-flight window >> pacing interval so slow CI runners cannot serialize the overlap
             return self
 
         async def __aexit__(self, *a):
