@@ -36,9 +36,10 @@ def _standard_session(monkeypatch) -> None:
     monkeypatch.setattr(collect, "resolve_session_day", _resolve)
 
 
-def test_fetch_all_stock_data_persists_orderbook_and_survives_persist_failure(monkeypatch) -> None:
-    """호가 스냅샷을 일괄 영속화하고, 영속화 실패는 로깅만 하고 수집 결과에 영향 없다."""
+def test_fetch_all_stock_data_never_writes_orderbook_partition(tmp_path, monkeypatch) -> None:
+    """결정 경로는 호가 파티션을 만들지 않는다 -- 코호트 호가 증거는 auction-close가 제공한다."""
     import asyncio
+    from pathlib import Path
     from unittest.mock import AsyncMock
 
     from src.daily import collect
@@ -47,23 +48,17 @@ def test_fetch_all_stock_data_persists_orderbook_and_survives_persist_failure(mo
     client.get_current_price = AsyncMock(
         return_value={"rt_cd": "0", "output": {"stck_shrn_iscd": "005930", "stck_prpr": "70000", "stck_oprc": "69000", "stck_hgpr": "70500", "stck_lwpr": "68900", "acml_vol": "1000", "prdy_ctrt": "1.5", "lstn_stcn": "100", "hts_avls": "1000", "acml_tr_pbmn": "100000000", "rprs_mrkt_kor_name": "KOSPI"}}
     )
-    client.get_trade_strength = AsyncMock(return_value={"rt_cd": "0", "output": [{"tday_rltv": "120"}]})
     client.get_investor_trend_estimate = AsyncMock(return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]})
-    client.get_program_net_buy = AsyncMock(return_value={"rt_cd": "0", "output": [{"whol_smtn_ntby_tr_pbmn": "100"}]})
-    ladder = {f"askp{i}": str(70000 + i * 100) for i in range(1, 11)}
-    ladder.update({"bidp1": "69900", "total_askp_rsqn": "1200", "total_bidp_rsqn": "1500"})
-    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
-
-    def _raise(rows, snapshot_date):
-        raise RuntimeError("db unavailable")
-
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", _raise)
+    client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": {"askp1": "70100"}})
+    monkeypatch.setattr(collect.settings, "HISTORY_DIR", tmp_path / "history")
 
     stock_list = [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "1.5"}]
     results, failed_info = asyncio.run(collect.fetch_all_stock_data(stock_list, client, object()))
 
     assert len(results) == 1
     assert failed_info == []
+    assert client.get_orderbook_snapshot.await_count == 0
+    assert list(Path(tmp_path / "history").rglob("*.parquet")) == []
 
 
 def test_flag_cost_aware_admission_marks_rows_without_dropping() -> None:
@@ -93,15 +88,15 @@ def test_flag_cost_aware_admission_marks_rows_without_dropping() -> None:
     assert out["종목코드"].tolist() == ["S1", "S2", "S3", "S4", "S5"]
 
 
-def test_fetch_single_stock_calls_only_the_three_required_apis() -> None:
+def test_fetch_single_stock_calls_only_the_two_required_apis() -> None:
     import asyncio
     from unittest.mock import AsyncMock
 
     from src.daily import collect
 
     # Given: a client exposing every legacy endpoint, so the test proves the
-    # dropped ones (including NXT orderbook) are not merely unavailable but
-    # deliberately not called
+    # dropped ones (including the decision-time orderbook) are not merely
+    # unavailable but deliberately not called
     client = AsyncMock()
     client.get_current_price = AsyncMock(return_value={"rt_cd": "0", "output": {"stck_shrn_iscd": "005930", "stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100", "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100", "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI"}})
     client.get_investor_trend_estimate = AsyncMock(
@@ -114,20 +109,23 @@ def test_fetch_single_stock_calls_only_the_three_required_apis() -> None:
 
     # When
     sem = asyncio.Semaphore(1)
-    asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(
             0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"}, 1, sem, client, object()
         )
     )
 
-    # Then: KRX current price once, KRX orderbook once (NXT twin removed)
+    # Then: exactly the decision calls (price + investor estimate); the orderbook
+    # call it duplicates from auction-close's 15:21 round is never issued
+    assert collect.DECISION_CALLS_PER_SYMBOL == 2
     assert client.get_current_price.await_count == 1
-    assert client.get_orderbook_snapshot.await_count == 1
     assert client.get_investor_trend_estimate.await_count == 1
+    client.get_orderbook_snapshot.assert_not_awaited()
     client.get_trade_strength.assert_not_awaited()
     client.get_program_net_buy.assert_not_awaited()
+    assert failed == []
 
-    call_kwargs = client.get_orderbook_snapshot.call_args.kwargs
+    call_kwargs = client.get_current_price.call_args.kwargs
     assert call_kwargs.get("market_div_code") == "J"
 
 
@@ -147,7 +145,7 @@ def test_fetch_single_stock_returns_minimal_row_schema() -> None:
 
     # When
     sem = asyncio.Semaphore(1)
-    row, failed, orderbook_rows = asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(
             0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"}, 1, sem, client, object()
         )
@@ -162,10 +160,6 @@ def test_fetch_single_stock_returns_minimal_row_schema() -> None:
     assert row["수급_실패"] is False
     assert row["현재가_실패"] is False
     assert failed == []
-    # Then: a single KRX-venue partition row is still produced for the cost research store
-    assert len(orderbook_rows) == 1
-    assert {ob["capture_reason"] for ob in orderbook_rows} == {"decision"}
-    assert {ob["venue"] for ob in orderbook_rows} == {"J"}
 
 
 def test_fetch_single_stock_reports_failed_apis_for_kept_endpoints() -> None:
@@ -182,17 +176,16 @@ def test_fetch_single_stock_reports_failed_apis_for_kept_endpoints() -> None:
 
     # When
     sem = asyncio.Semaphore(1)
-    row, failed, orderbook_rows = asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(
             0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"}, 1, sem, client, object()
         )
     )
 
     # Then: failures are surfaced, not swallowed, and the row still returns
-    assert set(failed) == {"현재가", "투자자추정", "호가"}
+    assert set(failed) == {"현재가", "투자자추정"}
     assert row["종목코드"] == "005930"
     assert row["수급_실패"] is True
-    assert orderbook_rows == []
 
 
 def test_fetch_all_stock_data_does_not_prefetch_sma120(monkeypatch) -> None:
@@ -210,7 +203,6 @@ def test_fetch_all_stock_data_does_not_prefetch_sma120(monkeypatch) -> None:
         return_value={"rt_cd": "0", "output1": {"askp1": "18010", "bidp1": "17990"}}
     )
 
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: None)
 
     # Then: the bulk OHLCV prefetch stage is gone entirely -- not merely
     # unreached, but structurally absent from the module
@@ -369,7 +361,7 @@ def test_fetch_single_stock_marks_supply_flow_failure_and_nans_the_fields() -> N
     client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
 
     sem = asyncio.Semaphore(1)
-    row, failed, _orderbook_rows = asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(
             0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"}, 1, sem, client, object()
         )
@@ -469,7 +461,7 @@ def test_fetch_single_stock_records_decision_close_and_unconfirmed_flag() -> Non
             object(),
         )
 
-    row, failed_apis, _orderbook_rows = asyncio.run(_run())
+    row, failed_apis = asyncio.run(_run())
 
     assert failed_apis == []
     assert row["종가"] == 269250
@@ -509,7 +501,7 @@ def test_fetch_single_stock_takes_prev_close_from_vendor_field() -> None:
     sem = asyncio.Semaphore(1)
 
     # Given: 벤더가 전일종가(stck_sdpr)를 제공
-    row, failed, _ob = asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(0, stock, 1, sem, _client({**base_detail, "stck_sdpr": "1000"}), object())
     )
 
@@ -518,7 +510,7 @@ def test_fetch_single_stock_takes_prev_close_from_vendor_field() -> None:
     assert failed == []
 
     # And: 필드가 없을 때만 등락률 역산으로 폴백
-    row2, _f2, _o2 = asyncio.run(
+    row2, _f2 = asyncio.run(
         collect.fetch_single_stock(0, stock, 1, sem, _client(dict(base_detail)), object())
     )
     assert row2["전일종가"] == int(1100 / 1.10)
@@ -543,7 +535,7 @@ def test_fetch_single_stock_flags_quote_failure_without_zero_fill() -> None:
     stock = {"code": "005930", "name": "테스트", "price": "1100", "chgrate": "10.00"}
 
     # When
-    row, failed, _ob = asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(0, stock, 1, asyncio.Semaphore(1), client, object())
     )
 
@@ -568,7 +560,7 @@ def test_fetch_single_stock_flags_quote_failure_without_zero_fill() -> None:
             },
         }
     )
-    ok_row, ok_failed, _o = asyncio.run(
+    ok_row, ok_failed = asyncio.run(
         collect.fetch_single_stock(0, stock, 1, asyncio.Semaphore(1), client, object())
     )
     assert ok_row[QUOTE_FAILED_COL] is False
@@ -623,7 +615,7 @@ def test_fetch_single_stock_prev_close_equals_close_when_rate_is_zero() -> None:
     client.get_orderbook_snapshot = AsyncMock(return_value={'rt_cd': '0', 'output1': {}})
 
     stock = {'code': '005930', 'name': '테스트', 'price': '1100', 'chgrate': '0.00'}
-    row, failed, _ob = asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(0, stock, 1, asyncio.Semaphore(1), client, object())
     )
 
@@ -967,7 +959,7 @@ def test_fetch_single_stock_treats_vendor_unresolved_code_as_quote_failure() -> 
     stock = {"code": "500041", "name": "신한 인버스 2X 구리 선물 ETN", "price": "+35300", "chgrate": "+8.47"}
 
     # When
-    row, failed, orderbook_rows = asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(0, stock, 1, asyncio.Semaphore(1), client, object())
     )
 
@@ -976,7 +968,6 @@ def test_fetch_single_stock_treats_vendor_unresolved_code_as_quote_failure() -> 
     assert "현재가" in failed and collect.QUOTE_UNRESOLVED_API in failed
     assert math.isnan(float(row["고가"])) and math.isnan(float(row["거래량"]))
     assert row["종가"] == 35300
-    assert orderbook_rows == []
 
 
 def test_load_eligible_codes_returns_symbols_listed_on_previous_trading_day(tmp_path) -> None:
@@ -1632,7 +1623,6 @@ def test_fetch_all_stock_data_requotes_and_emits_no_carriage_return_off_tty(monk
         {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
         {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
     ]
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
 
     # When
     with caplog.at_level(logging.INFO, logger="src.daily.collect"):
@@ -1691,7 +1681,6 @@ def test_fetch_all_stock_data_writes_progress_bar_on_tty(monkeypatch) -> None:
     client.get_orderbook_snapshot = AsyncMock(
         return_value={"rt_cd": "0", "output1": {"askp1": "18010", "bidp1": "17990"}}
     )
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
 
     buf = io.StringIO()
     buf.isatty = lambda: True  # type: ignore[method-assign]
@@ -1794,7 +1783,6 @@ def test_fetch_all_stock_data_sharded_single_client_passthrough(monkeypatch) -> 
     ladder = {f"askp{i}": str(70000 + i * 100) for i in range(1, 11)}
     ladder.update({"bidp1": "69900", "total_askp_rsqn": "1200", "total_bidp_rsqn": "1500"})
     client.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: None)
 
     stock_list = [{"code": "005930", "name": "삼성전자", "price": "70000", "chgrate": "1.5"}]
     results, failed_info = asyncio.run(
@@ -1806,16 +1794,20 @@ def test_fetch_all_stock_data_sharded_single_client_passthrough(monkeypatch) -> 
     assert client.get_current_price.await_count == 1
 
 
-def test_fetch_all_stock_data_sharded_splits_across_clients_and_preserves_order(monkeypatch) -> None:
+def test_fetch_all_stock_data_sharded_shares_work_favouring_faster_key() -> None:
+    """공유 큐는 빠른 키에 더 많은 종목을 맡기고 입력 순서를 보존한다."""
     import asyncio
-    from unittest.mock import AsyncMock
 
     from src.daily import collect
 
-    def make_client():
-        c = AsyncMock()
+    class _ShardClient:
+        def __init__(self, latency: float) -> None:
+            self._latency = latency
+            self.processed: list[str] = []
 
-        async def _price(session, code, market_div_code=None, allow_market_div_fallback=True):
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            await asyncio.sleep(self._latency)
+            self.processed.append(code)
             return {
                 "rt_cd": "0",
                 "output": {
@@ -1826,32 +1818,25 @@ def test_fetch_all_stock_data_sharded_splits_across_clients_and_preserves_order(
                 },
             }
 
-        c.get_current_price = AsyncMock(side_effect=_price)
-        c.get_investor_trend_estimate = AsyncMock(
-            return_value={"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "0", "orgn_fake_ntby_qty": "0"}]}
-        )
-        ladder = {f"askp{i}": "1000" for i in range(1, 11)}
-        ladder.update({"bidp1": "999", "total_askp_rsqn": "1", "total_bidp_rsqn": "1"})
-        c.get_orderbook_snapshot = AsyncMock(return_value={"rt_cd": "0", "output1": ladder})
-        return c
+        async def get_investor_trend_estimate(self, session, code):
+            return {"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "0", "orgn_fake_ntby_qty": "0"}]}
 
-    client_a = make_client()
-    client_b = make_client()
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: None)
+    client_a = _ShardClient(0.01)
+    client_b = _ShardClient(0.10)
 
     stock_list = [
-        {"code": "AAA1", "name": "a1", "price": "1000", "chgrate": "0.0"},
-        {"code": "AAA2", "name": "a2", "price": "1000", "chgrate": "0.0"},
-        {"code": "AAA3", "name": "a3", "price": "1000", "chgrate": "0.0"},
+        {"code": f"S{i:04d}", "name": f"s{i}", "price": "1000", "chgrate": "0.0"}
+        for i in range(100)
     ]
     results, failed_info = asyncio.run(
         collect.fetch_all_stock_data_sharded(stock_list, [client_a, client_b], object())
     )
 
-    assert [r["종목코드"] for r in results] == ["AAA1", "AAA2", "AAA3"]
+    # Then: 빠른 키가 절반 초과를 처리하고 결과는 입력 순서 그대로다
+    assert [r["종목코드"] for r in results] == [s["code"] for s in stock_list]
     assert failed_info == []
-    assert client_a.get_current_price.await_count == 2
-    assert client_b.get_current_price.await_count == 1
+    assert len(client_a.processed) > 50
+    assert len(client_a.processed) + len(client_b.processed) == 100
 
 
 def test_fetch_all_stock_data_sharded_skips_empty_chunk_when_fewer_stocks_than_clients(monkeypatch) -> None:
@@ -1885,7 +1870,6 @@ def test_fetch_all_stock_data_sharded_skips_empty_chunk_when_fewer_stocks_than_c
 
     client_a = make_client()
     client_b = make_client()
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: None)
 
     stock_list = [{"code": "AAA1", "name": "a1", "price": "1000", "chgrate": "0.0"}]
     results, failed_info = asyncio.run(
@@ -1909,6 +1893,120 @@ def test_fetch_all_stock_data_sharded_returns_empty_when_no_pairs() -> None:
 
     assert results == []
     assert failed_info == []
+
+
+def test_requote_failed_quotes_replaces_only_the_failed_row_with_two_tuples() -> None:
+    """재조회는 실패 행만 교체하고 2-튜플 형태를 유지한다."""
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import collect
+    from src.processing.schema import QUOTE_FAILED_COL
+
+    class _Client:
+        def __init__(self):
+            self.calls: dict[str, int] = {}
+
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            n = self.calls.get(code, 0) + 1
+            self.calls[code] = n
+            if code == "000660" and n == 1:
+                return {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."}
+            return {"rt_cd": "0", "output": {
+                "stck_shrn_iscd": code, "stck_prpr": "18000", "stck_oprc": "17900", "stck_hgpr": "18100",
+                "stck_lwpr": "17800", "acml_vol": "1000000", "prdy_ctrt": "5.0", "lstn_stcn": "100",
+                "hts_avls": "3000", "acml_tr_pbmn": "50000000000", "rprs_mrkt_kor_name": "KOSPI",
+            }}
+
+        async def get_investor_trend_estimate(self, session, code):
+            return {"rt_cd": "0", "output2": [{"frgn_fake_ntby_qty": "1", "orgn_fake_ntby_qty": "2"}]}
+
+    client = _Client()
+    stock_list = [
+        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+    ]
+
+    async def _run():
+        sem = asyncio.Semaphore(4)
+        first = await asyncio.gather(*[
+            collect.fetch_single_stock(i, s, len(stock_list), sem, client, object()) for i, s in enumerate(stock_list)
+        ])
+        out = await collect.requote_failed_quotes(
+            stock_list, list(first), client, object(), sem,
+            now_fn=lambda: datetime(2026, 9, 14, 15, 21, 30, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+        return first, out
+
+    first, out = asyncio.run(_run())
+
+    # Then: 형태는 2-튜플로 일관되고, 실패 행만 교체된다
+    assert all(len(item) == 2 for item in out)
+    assert out[0] == first[0]
+    assert first[1][0][QUOTE_FAILED_COL] is True
+    assert out[1][0][QUOTE_FAILED_COL] is False
+    assert client.calls == {"005930": 1, "000660": 2}
+
+
+def test_main_derives_connector_limit_from_shard_count(monkeypatch) -> None:
+    """커넥터 상한은 하드코딩이 아니라 샤드 수와 호출 수에서 도출된다."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from src.daily import collect
+
+    seen: dict = {}
+
+    class _Connector:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _FakeKis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ensure_token(self, session):
+            return None
+
+        async def get_market_index_rate(self, session, code):
+            return {"rt_cd": "1"}
+
+    monkeypatch.setattr(collect.settings, "API_SEMAPHORE_LIMIT", 8)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(
+        collect,
+        "kis_decision_shard_client_kwargs",
+        lambda: [
+            {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+            {"app_key": "k5", "app_secret": "s5", "account_id": "", "hts_id": "h5", "token_file": "t5"},
+        ],
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
+    monkeypatch.setattr(collect.aiohttp, "TCPConnector", _Connector)
+    monkeypatch.setattr(collect.aiohttp, "ClientSession", lambda *_a, **_kw: _FakeSession())
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "resolve_daily_candidates", AsyncMock(return_value=[]))
+
+    # When: 스캔이 비어 조기 반환하는 경로로 main 구동
+    asyncio.run(collect.main(force=True))
+
+    # Then: 8 * 2샤드 * 2콜 = 32
+    assert collect.DECISION_CALLS_PER_SYMBOL == 2
+    assert seen["limit"] == 32
 
 
 def test_main_issues_shard_token_and_fans_out_to_sharded_collect(monkeypatch) -> None:
@@ -2070,12 +2168,11 @@ def test_fetch_single_stock_preserves_per_response_clocks(tmp_path, monkeypatch)
     from src.daily import collect
     from src.data.capture_store import CaptureStore
 
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
     store = CaptureStore(tmp_path / "capture")
     cohort = _capture_cohort()
     client = _DelayedCaptureClient()
 
-    row, failed, _ob = asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(
             0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"},
             1, asyncio.Semaphore(1), client, object(),
@@ -2085,7 +2182,7 @@ def test_fetch_single_stock_preserves_per_response_clocks(tmp_path, monkeypatch)
 
     assert failed == []
     envelopes = _raw_envelopes(tmp_path / "capture")
-    assert len(envelopes) == 3
+    assert len(envelopes) == 2
     received = sorted(e["received_at"] for _, e in envelopes)
     assert len(set(received)) >= 2
     import pandas as _pd
@@ -2102,7 +2199,6 @@ def test_fetch_single_stock_uses_scoped_observer_receipts(tmp_path, monkeypatch)
     from src.daily import collect
     from src.data.capture_store import CaptureStore
 
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
     kst = ZoneInfo("Asia/Seoul")
     base = datetime(2026, 9, 14, 15, 20, 0, tzinfo=kst)
 
@@ -2119,7 +2215,7 @@ def test_fetch_single_stock_uses_scoped_observer_receipts(tmp_path, monkeypatch)
             on_page({"rt_cd": "0"}, {"tr_id": "X"}, started, started + timedelta(seconds=self.calls), 0, 0)
 
     store = CaptureStore(tmp_path / "capture")
-    row, failed, _ob = asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(
             0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"},
             1, asyncio.Semaphore(1), _Scoped(), object(),
@@ -2129,7 +2225,7 @@ def test_fetch_single_stock_uses_scoped_observer_receipts(tmp_path, monkeypatch)
 
     assert failed == []
     import pandas as _pd2
-    assert _pd2.Timestamp(row["snapshot_timestamp"]) == _pd2.Timestamp(base + timedelta(seconds=33))
+    assert _pd2.Timestamp(row["snapshot_timestamp"]) == _pd2.Timestamp(base + timedelta(seconds=22))
 
 
 def test_scoped_observer_without_event_uses_call_clock_and_failure_metadata(tmp_path, monkeypatch) -> None:
@@ -2142,7 +2238,6 @@ def test_scoped_observer_without_event_uses_call_clock_and_failure_metadata(tmp_
     from src.daily import collect
     from src.data.capture_store import CaptureStore
 
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
 
     class _SilentScoped(_DelayedCaptureClient):
         @contextlib.contextmanager
@@ -2150,7 +2245,7 @@ def test_scoped_observer_without_event_uses_call_clock_and_failure_metadata(tmp_
             yield
 
     store = CaptureStore(tmp_path / "capture")
-    row, failed, _ = asyncio.run(
+    row, failed = asyncio.run(
         collect.fetch_single_stock(
             0, {"code": "005930", "name": "삼성전자", "price": "18000", "chgrate": "5.0"},
             1, asyncio.Semaphore(1), _SilentScoped(delays=(0.0, 0.0, 0.0)), object(),
@@ -2264,7 +2359,6 @@ def test_requote_keeps_failed_first_attempt_evidence(tmp_path, monkeypatch) -> N
     from src.data.capture_store import CaptureStore
     from src.processing.schema import QUOTE_FAILED_COL
 
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
     store = CaptureStore(tmp_path / "capture")
     cohort = _capture_cohort()
 
@@ -2300,10 +2394,9 @@ def test_missing_investor_estimate_is_unknown_not_zero(tmp_path, monkeypatch) ->
     from src.daily import collect
     from src.data.capture_store import CaptureStore
 
-    monkeypatch.setattr(collect, "append_orderbook_snapshots", lambda rows, snapshot_date: 0)
     store = CaptureStore(tmp_path / "capture")
     client = _DelayedCaptureClient(investor={"rt_cd": "0", "output2": []}, delays=(0.0, 0.0, 0.0))
-    row, _failed, _ob = asyncio.run(
+    row, _failed = asyncio.run(
         collect.fetch_single_stock(
             0, {"code": "005930", "name": "X", "price": "18000", "chgrate": "5.0"},
             1, asyncio.Semaphore(1), client, object(),

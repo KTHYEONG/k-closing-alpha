@@ -6,10 +6,12 @@ import asyncio
 import inspect
 import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
+from src.api.kis.rate_limit import HostPacedRateLimiter, get_host_rate_limiter, host_admission_state_path
+from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
 from src.config import settings
 
 if TYPE_CHECKING:
@@ -22,6 +24,10 @@ logger = logging.getLogger(__name__)
 _SEOUL = ZoneInfo("Asia/Seoul")
 _YMD_RE = re.compile(r"^\d{8}$")
 _HHMMSS_RE = re.compile(r"^\d{6}$")
+
+LS_AUTH_REJECTED_RSP_CODES: frozenset[str] = frozenset({"IGW00101", "IGW00102", "IGW00123"})
+
+_LS_TOKEN_EXPIRY_MARGIN_SECONDS: float = 300.0
 
 
 def _now_seoul() -> datetime:
@@ -53,10 +59,10 @@ class LsApiClient:
     def __init__(self, app_key: str | None = None, app_secret: str | None = None) -> None:
         """Bind credentials, origin and pacing from explicit arguments or the live Settings instance.
 
-        Pacing and 429 backoff come from ``LS_MIN_INTERVAL_SECONDS``,
-        ``LS_RATE_LIMIT_MAX_RETRIES`` and ``LS_RATE_LIMIT_BACKOFF_SECONDS`` so an
-        operator can tune them per host: the LS app key is shared with another
-        repository, so in-process pacing alone cannot guarantee the per-key limit.
+        Pacing is enforced host-wide through one file-backed bucket per app key
+        (shared with every LS REST consumer on the host, including krx-alpha);
+        per-instance spacing state was removed so the host bucket is the only
+        spacing authority.
 
         Args:
             app_key: Explicit app key; falls back to ``settings.LS_APP_KEY``.
@@ -66,38 +72,61 @@ class LsApiClient:
         self.app_secret = app_secret or settings.LS_APP_SECRET
         self.base_url = settings.LS_BASE_URL
         self.token: str | None = None
-        self._lock: asyncio.Lock | None = None
-        self._token_lock: asyncio.Lock | None = None
-        # LS_APP_KEY는 krx-alpha와 공유되어 프로세스 내부 페이싱만으로는 키 단위 한도를 보장할 수 없다.
         self._min_interval: float = float(settings.LS_MIN_INTERVAL_SECONDS)
         self._rate_limit_max_retries: int = int(settings.LS_RATE_LIMIT_MAX_RETRIES)
         self._rate_limit_backoff: float = float(settings.LS_RATE_LIMIT_BACKOFF_SECONDS)
-        self._last_call_time: float = 0.0
+
+    def _limiter(self) -> HostPacedRateLimiter:
+        interval = float(self._min_interval)
+        rate = 1.0 / interval if interval > 0 else 1_000_000_000.0
+        return get_host_rate_limiter(host_admission_state_path("ls", self.app_key or ""), rate)
+
+    def _token_store(self) -> SharedTokenStore:
+        return SharedTokenStore(
+            shared_token_path("ls", self.app_key or ""),
+            lock_timeout_seconds=float(settings.BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS),
+            expiry_margin_seconds=_LS_TOKEN_EXPIRY_MARGIN_SECONDS,
+            clock=lambda: datetime.now(UTC),
+        )
+
+    async def _issue_token(self, session) -> IssuedToken:
+        payload = {
+            "grant_type": "client_credentials",
+            "appkey": self.app_key,
+            "appsecretkey": self.app_secret,
+            "scope": "oob",
+        }
+        raw = session.post(f"{self.base_url}/oauth2/token", data=payload)
+        if inspect.isawaitable(raw):
+            raw = await raw
+        async with raw as resp:
+            body = await resp.json()
+        token = str(body.get("access_token", ""))
+        if not token:
+            raise RuntimeError(f"LS token issuance failed: {body}")
+        expires_raw = body.get("expires_in")
+        expires_in: float | None = None
+        if isinstance(expires_raw, bool):
+            expires_in = None
+        elif isinstance(expires_raw, (int, float)):
+            expires_in = float(expires_raw)
+        elif isinstance(expires_raw, str) and expires_raw.strip().lstrip("+-").replace(".", "", 1).isdigit():
+            try:
+                expires_in = float(expires_raw.strip())
+            except ValueError:
+                expires_in = None
+        return IssuedToken(access_token=token, expires_in_seconds=expires_in)
 
     async def ensure_token(self, session) -> str:
-        if self.token:
-            return self.token
-        if self._token_lock is None:
-            self._token_lock = asyncio.Lock()
-        async with self._token_lock:
-            if self.token:
-                return self.token
-            payload = {
-                "grant_type": "client_credentials",
-                "appkey": self.app_key,
-                "appsecretkey": self.app_secret,
-                "scope": "oob",
-            }
-            raw = session.post(f"{self.base_url}/oauth2/token", data=payload)
-            if inspect.isawaitable(raw):
-                raw = await raw
-            async with raw as resp:
-                body = await resp.json()
-            token = str(body.get("access_token", ""))
-            if not token:
-                raise RuntimeError(f"LS token issuance failed: {body}")
-            self.token = token
-            return token
+        record = await self._token_store().get_or_issue(lambda: self._issue_token(session))
+        self.token = record.access_token
+        return self.token
+
+    @staticmethod
+    def _is_auth_rejected(status: int, data: dict) -> bool:
+        if status == 401:
+            return True
+        return str(data.get("rsp_cd", "")) in LS_AUTH_REJECTED_RSP_CODES
 
     async def _post_tr(
         self,
@@ -111,19 +140,10 @@ class LsApiClient:
     ) -> tuple[dict, dict]:
         if not self.token:
             await self.ensure_token(session)
-        if self._lock is None:
-            self._lock = asyncio.Lock()
         limit = int(max_retries) if max_retries is not None else self._rate_limit_max_retries
 
-        for attempt in range(limit):
-            async with self._lock:
-                loop = asyncio.get_running_loop()
-                now = loop.time()
-                elapsed = now - self._last_call_time
-                if elapsed < self._min_interval:
-                    await asyncio.sleep(self._min_interval - elapsed)
-                self._last_call_time = loop.time()
-
+        async def _single_post() -> tuple[dict, dict, int]:
+            await self._limiter().acquire()
             headers = {
                 "content-type": "application/json; charset=utf-8",
                 "authorization": f"Bearer {self.token}",
@@ -136,6 +156,7 @@ class LsApiClient:
                 raw = await raw
             async with raw as resp:
                 data = await resp.json()
+                status = int(getattr(resp, "status", 200) or 200)
                 headers_raw = getattr(resp, "headers", None)
                 if isinstance(headers_raw, dict):
                     resp_headers = headers_raw
@@ -146,13 +167,36 @@ class LsApiClient:
                         resp_headers = {}
                 else:
                     resp_headers = {}
+            return data, resp_headers, status
+
+        refreshed = False
+        data: dict = {}
+        resp_headers: dict = {}
+        for attempt in range(limit):
+            data, resp_headers, status = await _single_post()
+            if self._is_auth_rejected(status, data) and not refreshed:
+                refreshed = True
+                record = await self._token_store().replace_rejected(
+                    self.token or "", lambda: self._issue_token(session)
+                )
+                self.token = record.access_token
+                data, resp_headers, status = await _single_post()
+                if self._is_auth_rejected(status, data):
+                    return data, resp_headers
+                if str(data.get("rsp_cd", "")) == "IGW00201" and attempt < limit - 1:
+                    wait = self._rate_limit_backoff * (2**attempt)
+                    logger.warning("LS rate limit hit (IGW00201). Retrying in %.1fs... (attempt %d/%d)", wait, attempt + 1, limit)
+                    await asyncio.sleep(wait)
+                    continue
+                if str(data.get("rsp_cd", "")) == "IGW00201":
+                    logger.warning("[DATA] stage=ls_tr tr_cd=%s status=RATE_LIMITED attempts=%d", tr_cd, limit)
+                return data, resp_headers
 
             rsp_cd = str(data.get("rsp_cd", ""))
             if rsp_cd == "IGW00201" and attempt < limit - 1:
                 wait = self._rate_limit_backoff * (2**attempt)
                 logger.warning("LS rate limit hit (IGW00201). Retrying in %.1fs... (attempt %d/%d)", wait, attempt + 1, limit)
                 await asyncio.sleep(wait)
-                self._last_call_time = asyncio.get_running_loop().time()
                 continue
             if rsp_cd == "IGW00201":
                 logger.warning("[DATA] stage=ls_tr tr_cd=%s status=RATE_LIMITED attempts=%d", tr_cd, limit)

@@ -37,6 +37,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=None, help="Bounded first-pass page budget per attempt (overrides COLLECTION_CHART_MAX_PAGES only; the resume pass is sized from the cursor remaining count plus margin, so it stays cheap).")
     parser.add_argument("--deadline", default=None, help="Aware ISO timestamp bounding repair work.")
     parser.add_argument("--apply", action="store_true", help="Apply certified attempts through partition writers.")
+    parser.add_argument("--allow-shrink-symbol", action="append", default=[], help="Repeatable symbol explicitly authorised to shrink stored rows.")
     return parser.parse_args(argv)
 
 
@@ -101,6 +102,7 @@ async def _repair_symbol(
     store: CaptureStore,
     run_id: str,
     apply: bool,
+    allow_shrink_symbols: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     from src.backfill.intraday.collector import collect_intraday_bars, collect_intraday_trade_ticks
     from src.data.intraday_store import write_intraday_partition, write_tick_partition
@@ -129,10 +131,12 @@ async def _repair_symbol(
         coverage = {code: entry}
         if kind == "regular_bars":
             total = write_intraday_partition(frame, 1, snapshot_date, INTRADAY_SESSION_REGULAR,
-                                             coverage=coverage, batch_rows=batch_rows)
+                                             coverage=coverage, batch_rows=batch_rows,
+                                             allow_shrink_symbols=frozenset(allow_shrink_symbols))
         else:
             total = write_tick_partition(frame, snapshot_date, INTRADAY_SESSION_REGULAR,
-                                         coverage=coverage, batch_rows=batch_rows)
+                                         coverage=coverage, batch_rows=batch_rows,
+                                         allow_shrink_symbols=frozenset(allow_shrink_symbols))
         if total < len(frame):
             raise RuntimeError(f"Repair publication verification failed symbol={code} date={snapshot_date}")
         applied_rows = len(frame)
@@ -210,6 +214,7 @@ def main(argv: list[str] | None = None) -> None:
                         kind=kind, client=client, session=session, ls_client=ls_client,
                         kiwoom_client=kiwoom_client, code=code, snapshot_date=day,
                         profile=profile, store=store, run_id=run_id, apply=bool(args.apply),
+                        allow_shrink_symbols=frozenset(args.allow_shrink_symbol),
                     )
                 except OSError as e:
                     raise RuntimeError(f"Repair publication failed symbol={code} date={day}: {e}") from e

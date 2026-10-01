@@ -259,3 +259,186 @@ def test_toss_client_documented_chart_rate_is_kept() -> None:
     from src.api.toss.client import TossApiClient
 
     assert TossApiClient(app_key="k", app_secret="s")._limiter_for("MARKET_DATA_CHART").max_rate == 20.0
+
+
+def _toss_session(get_bodies, token_bodies=None, headers_list=None):
+    from unittest.mock import AsyncMock
+
+    state = {"gets": 0, "posts": 0, "auths": []}
+
+    def _resp(body, status=200, headers=None):
+        mock_resp = AsyncMock()
+        mock_resp.status = status
+        mock_resp.json = AsyncMock(return_value=body)
+        mock_resp.headers = dict(headers or {})
+        return mock_resp
+
+    async def _fake_get(url, headers=None, params=None):
+        idx = state["gets"]
+        state["gets"] += 1
+        state["auths"].append((headers or {}).get("Authorization"))
+        bodies = get_bodies[idx]
+        if len(bodies) == 3:
+            body, status, headers = bodies
+        else:
+            body, status = bodies
+            headers = (headers_list[idx] if headers_list and idx < len(headers_list) else {})
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=_resp(body, status, headers))
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        return ctx
+
+    async def _fake_post(url, data=None, **kw):
+        state["posts"] += 1
+        fallbacks = token_bodies or [{"access_token": "new-tok", "expires_in": 86400}]
+        payload = fallbacks[min(state["posts"] - 1, len(fallbacks) - 1)]
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=_resp(payload, 200))
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        return ctx
+
+    from unittest.mock import AsyncMock as _AM
+
+    session = _AM()
+    session.get.side_effect = _fake_get
+    session.post.side_effect = _fake_post
+    return session, state
+
+
+def test_toss_invalid_token_recovers_once(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from src.api.toss.client import TossApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_DIR", tmp_path)
+    (tmp_path / ".host-admission").touch()
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_REQUIRE_SHARED", "always")
+
+    client = TossApiClient(app_key="k", app_secret="s")
+    session, state = _toss_session(
+        [({"error": {"code": "invalid-token"}}, 200), ({"result": {"ok": True}}, 200)],
+        [{"access_token": "tok-B", "expires_in": 86400}],
+    )
+
+    async def _seed():
+        await client.ensure_token(session)
+
+    asyncio.run(_seed())
+    from src.api.shared_token import SharedTokenStore
+
+    before = client._token_store().read()
+    assert before is not None and before.generation == 1
+
+    data = asyncio.run(client._get(session, "/api/v1/candles", "MARKET_DATA_CHART"))
+    assert data == {"result": {"ok": True}}
+    assert state["posts"] == 2
+    after = client._token_store().read()
+    assert after is not None and after.generation == before.generation + 1
+    assert state["auths"][-1] == f"Bearer {after.access_token}"
+
+
+def test_toss_rotation_by_peer_is_adopted(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from datetime import UTC, datetime
+
+    from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
+    from src.api.toss.client import TossApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_DIR", tmp_path)
+    (tmp_path / ".host-admission").touch()
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_REQUIRE_SHARED", "always")
+
+    async def _seed_store():
+        store = SharedTokenStore(
+            shared_token_path("toss", "k"),
+            lock_timeout_seconds=5.0,
+            expiry_margin_seconds=0.0,
+            clock=lambda: datetime.now(UTC),
+        )
+        await store.get_or_issue(lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-A", expires_in_seconds=86400)))
+        await store.replace_rejected("tok-A", lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-B", expires_in_seconds=86400)))
+
+    asyncio.run(_seed_store())
+
+    client = TossApiClient(app_key="k", app_secret="s")
+    client.token = "tok-A"
+    session, state = _toss_session([({"error": {"code": "invalid-token"}}, 200), ({"result": {"ok": True}}, 200)])
+    data = asyncio.run(client._get(session, "/api/v1/candles", "MARKET_DATA_CHART"))
+    assert data == {"result": {"ok": True}}
+    assert state["posts"] == 0
+    assert state["auths"] == ["Bearer tok-A", "Bearer tok-B"]
+
+
+def test_toss_second_rejection_surfaces(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from src.api.toss.client import TossApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_DIR", tmp_path)
+    (tmp_path / ".host-admission").touch()
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_REQUIRE_SHARED", "always")
+
+    client = TossApiClient(app_key="k", app_secret="s")
+    session, state = _toss_session(
+        [({"error": {"code": "invalid-token"}}, 200), ({"error": {"code": "invalid-token"}}, 200)],
+        [{"access_token": "tok-B", "expires_in": 86400}],
+    )
+    asyncio.run(client.ensure_token(session))
+    data = asyncio.run(client._get(session, "/api/v1/candles", "MARKET_DATA_CHART"))
+    assert data == {"error": {"code": "invalid-token"}}
+    assert state["posts"] == 2
+
+
+def test_toss_retry_after_honoured(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import src.api.toss.client as toss_client_mod
+    from src.api.toss.client import TossApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_DIR", tmp_path)
+    (tmp_path / ".host-admission").touch()
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_REQUIRE_SHARED", "always")
+
+    client = TossApiClient(app_key="k", app_secret="s")
+    client.token = "tok"
+    sleeps: list[float] = []
+
+    async def _fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(toss_client_mod.asyncio, "sleep", _fake_sleep)
+
+    async def _fake_acquire(self):
+        return None
+
+    monkeypatch.setattr(toss_client_mod.HostPacedRateLimiter, "acquire", _fake_acquire)
+
+    from unittest.mock import AsyncMock
+
+    def _resp(body, status=200, headers=None):
+        mock_resp = AsyncMock()
+        mock_resp.status = status
+        mock_resp.json = AsyncMock(return_value=body)
+        mock_resp.headers = dict(headers or {})
+        return mock_resp
+
+    r429 = _resp({"error": {"code": "rate-limit-exceeded"}}, 429, {"Retry-After": "2"})
+    r200 = _resp({"result": {"ok": True}}, 200)
+    session = AsyncMock()
+    session.get.return_value.__aenter__ = AsyncMock(side_effect=[r429, r200])
+    session.get.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    data = asyncio.run(client._get(session, "/api/v1/candles", "MARKET_DATA_CHART"))
+    assert data == {"result": {"ok": True}}
+    assert sleeps == [2.0]
+
+
+def test_toss_retry_after_capped_for_decision_window() -> None:
+    from src.api.toss.client import TOSS_RETRY_AFTER_MAX_SECONDS, TossApiClient
+
+    assert TossApiClient._retry_after_seconds({"Retry-After": "600"}) == TOSS_RETRY_AFTER_MAX_SECONDS
+    assert TossApiClient._retry_after_seconds({"retry-after": "1.5"}) == 1.5

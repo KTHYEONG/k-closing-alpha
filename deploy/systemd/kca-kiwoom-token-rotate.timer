@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA Kiwoom token phase rotation (Mon-Fri 07:10 KST, before first Kiwoom consumer)
+
+[Timer]
+OnCalendar=Mon..Fri 07:10:00 Asia/Seoul
+AccuracySec=1s
+Persistent=true
+Unit=kca-kiwoom-token-rotate.service
+
+[Install]
+WantedBy=timers.target

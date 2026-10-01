@@ -33,6 +33,8 @@ OPTIONAL_MANUAL_TIMERS: frozenset[str] = frozenset(
 )
 # 브로커 시크릿·Gmail 앱 비밀번호가 담긴 .env 는 소유자만 읽을 수 있어야 한다
 SECRET_FILE_MODE: int = 0o600
+# 토큰 캐시·admission 상태가 담긴 호스트 공유 디렉터리는 소유자 전용이어야 한다
+ADMISSION_DIR_MODE: int = 0o700
 
 
 @dataclass(frozen=True)
@@ -149,6 +151,36 @@ def ensure_secret_permissions(repo_dir: str) -> bool:
     return True
 
 
+def ensure_host_admission_marker(directory: Path | None = None) -> bool:
+    """Create the host-shared admission directory and its marker before units start.
+
+    Containers refuse to pace against an admission directory without the marker
+    (fail-closed), so a deploy that ships admission-aware images must guarantee the
+    marker on the host first; otherwise every broker unit fails at its first request.
+    Only this host-side deploy step (and install_systemd.sh) may create it.
+
+    Args:
+        directory: Host admission directory; None selects BROKER_ADMISSION_DIR, or
+            KIS_TOKEN_CACHE_DIR when that is unset (the directory mounted into containers).
+
+    Returns:
+        True when the marker was created, False when it already existed.
+    """
+    from src import settings
+    from src.api.kis.rate_limit import HOST_ADMISSION_MARKER
+
+    if directory is None:
+        configured = settings.BROKER_ADMISSION_DIR
+        directory = Path(configured) if configured is not None else Path(settings.KIS_TOKEN_CACHE_DIR)
+    directory.mkdir(mode=ADMISSION_DIR_MODE, parents=True, exist_ok=True)
+    marker = directory / HOST_ADMISSION_MARKER
+    if marker.is_file():
+        return False
+    marker.touch(mode=0o600)
+    logger.info("[SYS] code_sync stage=admission_marker status=CREATED dir=%s", directory)
+    return True
+
+
 def sync_units(
     repo_dir: str,
     *,
@@ -158,6 +190,7 @@ def sync_units(
     uv_sync_fn: Callable[[str], None] = _uv_sync,
     install_units_fn: Callable[[str], UnitInstallResult] = install_systemd_units,
     secure_fn: Callable[[str], bool] = ensure_secret_permissions,
+    marker_fn: Callable[[], bool] = ensure_host_admission_marker,
 ) -> UnitInstallResult:
     """Check out an exact, CI-validated commit and converge systemd units onto it.
 
@@ -169,6 +202,8 @@ def sync_units(
         uv_sync_fn: Injected dependency refresh.
         install_units_fn: Injected systemd unit convergence.
         secure_fn: Injected .env permission tightening.
+        marker_fn: Injected host admission marker guarantee; runs before units are
+            installed so no admission-aware unit can start without it.
 
     Returns:
         UnitInstallResult listing changed, removed and enabled unit names.
@@ -181,6 +216,7 @@ def sync_units(
     git_fn(["reset", "--hard", sha], repo_dir)
     uv_sync_fn(repo_dir)
     secure_fn(repo_dir)
+    marker_fn()
     return install_units_fn(repo_dir)
 
 

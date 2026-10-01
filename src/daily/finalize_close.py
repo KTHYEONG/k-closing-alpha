@@ -6,7 +6,7 @@ import argparse
 import asyncio
 import functools
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from src import settings as settings  # noqa: F401 - test seam: tests patch finalize_close.settings
-from src.api.kis.client import KisApiClient, kis_data_client_kwargs
+from src.api.kis.client import KisApiClient, kis_decision_shard_client_kwargs
 from src.config.market_session import (
     CLOSING_AUCTION_CONFIRM_EARLIEST_HHMMSS,
     CLOSING_AUCTION_CONFIRMED_MKOP_CODE,
@@ -40,8 +40,10 @@ logger = logging.getLogger(__name__)
 
 # 벤더 prdy_ctrt 소수 2자리(%) 반올림 오차(최대 5e-5)의 4배 여유
 CLOSE_RATE_CONSISTENCY_ATOL: float = 2e-4
-# 행당 2콜(현재가+호가). 데이터 계좌 앱키 리미터(초당 18콜)가 실제 상한이므로 4행(8콜) 동시면 리미터 안에서 순차 대비 처리량을 확보한다(collect는 15:30 이전 종료, After= 순서 보장).
-FINALIZE_CONCURRENCY: int = 4
+# 행당 2콜(현재가+호가). 슬라이딩 윈도우는 키당 FINALIZE_CONCURRENCY_PER_KEY 행을
+# 유지하고, 행 i는 clients[i % len(clients)] 키로 조회한다.
+FINALIZE_CONCURRENCY_PER_KEY: int = 4
+"""Rows in flight per data key; each row issues two quote requests under the key's host bucket."""
 
 
 def is_close_confirmed(
@@ -236,7 +238,7 @@ async def fetch_confirmed_quote(client: Any, session: Any, code: str, *, capture
 async def run_close_finalization(
     snapshot_date: str | None = None,
     *,
-    client: Any | None = None,
+    clients: Sequence[Any] | None = None,
     session: Any | None = None,
     now_fn: Callable[[], datetime] | None = None,
     sleep_fn: Callable[[float], Any] | None = None,
@@ -248,10 +250,16 @@ async def run_close_finalization(
     cohort_id: str | None = None,
     trading_day_fn: Callable[[str], Awaitable[bool]] | None = None,
 ) -> int:
-    """당일 아카이브 행을 확정값으로 in-place 갱신하고 확정 행 수를 반환한다 (우선순위, bounded concurrency, on_outcome)."""
+    """Finalize today's archive rows in place with confirmed closes and return the confirmed count.
+
+    Rows are polled in priority order (picks first) through a sliding window of
+    FINALIZE_CONCURRENCY_PER_KEY * len(clients) rows; row i uses clients[i % len(clients)].
+    """
     capture_on = not (capture_store is None and run_id is None and cohort_id is None)
     if capture_on and (capture_store is None or not run_id or not cohort_id):
         raise ValueError("inconsistent close-confirmation capture context")
+    if not clients:
+        raise ValueError("close finalization requires at least one data client")
     now_fn = now_fn or (lambda: datetime.now(ZoneInfo("Asia/Seoul")))
     sleep_fn = sleep_fn or asyncio.sleep
     snap = snapshot_date or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
@@ -264,6 +272,24 @@ async def run_close_finalization(
     n_finalized = 0
     unresolved: list[Any] = []
     poll_round = 0
+    window = asyncio.Semaphore(FINALIZE_CONCURRENCY_PER_KEY * len(clients))
+
+    async def _dispatch(position: int, idx: Any, round_index: int) -> tuple[Any, dict[str, Any], dict[str, Any], datetime, bool]:
+        async with window:
+            tick = now_fn()
+            if tick.strftime("%H%M%S") > CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS:
+                return (idx, {}, {}, tick, False)
+            price_output, book_output2 = await fetch_confirmed_quote(
+                clients[position % len(clients)],
+                session,
+                str(df.at[idx, "종목코드"]),
+                capture_store=capture_store,
+                run_id=run_id,
+                cohort_id=cohort_id,
+                poll_round=round_index,
+            )
+            return (idx, price_output, book_output2, tick, True)
+
     while True:
         now = now_fn()
         # 현재가 TR은 조회 시점 종가만 주므로 과거 스냅샷에 쓰면 다른 날 종가로 덮어쓴다
@@ -273,43 +299,34 @@ async def run_close_finalization(
             break
         confirmed: set[Any] = set()
         dropped: set[Any] = set()
-        for start in range(0, len(pending), FINALIZE_CONCURRENCY):
-            batch = pending[start : start + FINALIZE_CONCURRENCY]
-            tick = now_fn()
-            if tick.strftime("%H%M%S") > CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS:
-                break  # 행 단위 데드라인 — 데드라인 이후 배치는 시작하지 않는다
-            quotes = await asyncio.gather(
-                *(
-                    fetch_confirmed_quote(
-                        client, session, str(df.at[idx, "종목코드"]),
-                        capture_store=capture_store, run_id=run_id, cohort_id=cohort_id, poll_round=poll_round,
-                    )
-                    for idx in batch
+        dispatched = await asyncio.gather(
+            *(_dispatch(position, idx, poll_round) for position, idx in enumerate(pending))
+        )
+        for idx, price_output, book_output2, tick, sent in dispatched:
+            if not sent:
+                continue
+            code = str(df.at[idx, "종목코드"])
+            if is_quote_unresolved(price_output):
+                dropped.add(idx)
+                unresolved.append(idx)
+                logger.warning("[DATA] stage=close_finalization code=%s status=UNRESOLVED reason=vendor_unrecognized_code", code)
+                continue
+            if not is_close_confirmed(price_output, book_output2, tick):
+                continue
+            try:
+                update = build_finalized_row(df.loc[idx].to_dict(), price_output, tick)
+            except ValueError as exc:
+                # 불변식 위반 종목은 행을 건드리지 않고 미확정으로 남긴다 (동결가 승격 금지)
+                logger.warning(
+                    "[DATA] stage=close_finalization code=%s status=REJECTED reason=%s", code, exc
                 )
-            )
-            for idx, (price_output, book_output2) in zip(batch, quotes, strict=True):
-                code = str(df.at[idx, "종목코드"])
-                if is_quote_unresolved(price_output):
-                    dropped.add(idx)
-                    unresolved.append(idx)
-                    logger.warning("[DATA] stage=close_finalization code=%s status=UNRESOLVED reason=vendor_unrecognized_code", code)
-                    continue
-                if not is_close_confirmed(price_output, book_output2, tick):
-                    continue
-                try:
-                    update = build_finalized_row(df.loc[idx].to_dict(), price_output, tick)
-                except ValueError as exc:
-                    # 불변식 위반 종목은 행을 건드리지 않고 미확정으로 남긴다 (동결가 승격 금지)
-                    logger.warning(
-                        "[DATA] stage=close_finalization code=%s status=REJECTED reason=%s", code, exc
-                    )
-                    continue
-                for key, value in update.items():
-                    if key not in df.columns:
-                        df[key] = pd.NA
-                    df.at[idx, key] = value
-                confirmed.add(idx)
-                n_finalized += 1
+                continue
+            for key, value in update.items():
+                if key not in df.columns:
+                    df[key] = pd.NA
+                df.at[idx, key] = value
+            confirmed.add(idx)
+            n_finalized += 1
         pending = [i for i in pending if i not in confirmed and i not in dropped]
         if not pending:
             break
@@ -352,7 +369,7 @@ async def run_close_finalization(
             else:
                 from src.data.trading_calendar import is_kis_trading_day
 
-                is_trading_day = bool(await is_kis_trading_day(client, session, snap))
+                is_trading_day = bool(await is_kis_trading_day(clients[0], session, snap))
         except Exception:
             outcome, reason = RUN_OUTCOME_DEGRADED, "calendar_unavailable"
         else:
@@ -406,10 +423,11 @@ async def _amain(args) -> int:
         assert gate is not None
         record_run_outcome("finalize_close", RUN_OUTCOME_OK, run_date=snap, reason=gate)
         return 0
-    owned_client = KisApiClient(**kis_data_client_kwargs())
-    session = owned_client.create_session()
+    owned_clients = [KisApiClient(**kwargs) for kwargs in kis_decision_shard_client_kwargs()]
+    session = owned_clients[0].create_session()
     try:
-        await owned_client.ensure_token(session)
+        for owned_client in owned_clients:
+            await owned_client.ensure_token(session)
         capture_store = None
         run_id = None
         cohort_id = None
@@ -425,7 +443,7 @@ async def _amain(args) -> int:
             capture_store, run_id, cohort_id = None, None, None
         n = await run_close_finalization(
             snapshot_date=snap,
-            client=owned_client,
+            clients=owned_clients,
             session=session,
             retry_interval_seconds=args.retry_interval,
             pick_codes=load_pick_codes(snap),

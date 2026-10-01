@@ -7,6 +7,12 @@ from pathlib import Path
 import pytest
 
 EXPECTED_MODEL_FIELDS = (
+    "BROKER_ADMISSION_DIR",
+    "BROKER_ADMISSION_CLASS",
+    "BROKER_ADMISSION_STANDARD_MAX_LEAD_SECONDS",
+    "BROKER_ADMISSION_BULK_MAX_LEAD_SECONDS",
+    "BROKER_ADMISSION_REQUIRE_SHARED",
+    "BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS",
     "COLLECTION_ROOT",
     "COLLECTION_AUCTION_ENABLED",
     "COLLECTION_ALTDATA_ENABLED",
@@ -15,7 +21,7 @@ EXPECTED_MODEL_FIELDS = (
     "COLLECTION_AUCTION_INTERVAL_SECONDS",
     "COLLECTION_REQUEST_TIMEOUT_SECONDS",
     "COLLECTION_CONCURRENCY_PER_KEY",
-    "COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE",
+    "COLLECTION_ARCHIVE_PUBLISH_ROWS",
     "COLLECTION_CHART_MAX_PAGES",
     "COLLECTION_TICK_REPAIR_MAX_PAGES",
     "COLLECTION_TICK_ROWS_PER_PAGE",
@@ -54,6 +60,7 @@ EXPECTED_MODEL_FIELDS = (
     "KIWOOM_APP_KEY",
     "KIWOOM_SECRET_KEY",
     "KIWOOM_BASE_URL",
+    "KIWOOM_TOKEN_PROTECTED_WINDOWS",
     "OPENDART_API_KEY",
     "OPENDART_API_KEY_2",
     "DART_API_KEY",
@@ -90,6 +97,7 @@ def test_env_base_preserves_field_order() -> None:
 
 def test_env_base_preserves_config() -> None:
     from src.config import (
+        AdmissionSettings,
         AlertSettings,
         AltDataSettings,
         CollectionSettings,
@@ -105,6 +113,7 @@ def test_env_base_preserves_config() -> None:
 
     assert EnvSettings.model_fields == {}
     for cls in (
+        AdmissionSettings,
         PathSettings,
         KisSettings,
         LsSettings,
@@ -161,7 +170,7 @@ def test_previously_unexported_fields_reachable() -> None:
     from src import settings
 
     assert settings.LS_MIN_INTERVAL_SECONDS == settings.settings.LS_MIN_INTERVAL_SECONDS
-    assert settings.COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE == settings.settings.COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE
+    assert settings.COLLECTION_ARCHIVE_PUBLISH_ROWS == settings.settings.COLLECTION_ARCHIVE_PUBLISH_ROWS
 
 
 def test_unknown_name_fails_loudly() -> None:

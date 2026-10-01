@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -29,7 +29,6 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
-from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows, orderbook_partition_path
 from src.data.session_calendar import SessionKind, resolve_session_day, trading_session_gate
 from src.utils.display import Colors
 from src.daily import archive
@@ -182,6 +181,12 @@ def flag_cost_aware_admission(
 # 경로에 이식한 값이다 -- 두 파이프라인은 별개 흐름이라 상수도 분리해 둔다.
 REALTIME_MIN_QUOTE_COVERAGE: float = 0.99
 
+# 결정 스냅샷의 종목당 KIS 호출 수: 현재가와 투자자 추정치. 호가(FHKST01010200)는
+# 결정 입력의 feature 소비자가 없어 호출하지 않는다 -- 코호트의 결정시점 호가 증거는
+# auction-close 15:21 라운드가 제공한다.
+DECISION_CALLS_PER_SYMBOL: int = 2
+"""KIS requests per candidate in the decision snapshot: current price and investor estimate."""
+
 # fetch_single_stock의 failed_apis 태그: 벤더가 rt_cd=0으로 응답했지만 종목코드를 해석하지 못한 경우
 QUOTE_UNRESOLVED_API: str = "현재가_미해석"
 
@@ -302,7 +307,6 @@ def _persist_observed_market_page(
 _MARKET_LABEL_ROUTE: dict[str, tuple[CaptureDataset, str]] = {
     "price": (CaptureDataset.PRICE, "inquire-price"),
     "investor": (CaptureDataset.INVESTOR_ESTIMATE, "investor-trend-estimate"),
-    "orderbook": (CaptureDataset.ORDERBOOK, "inquire-asking-price"),
 }
 
 
@@ -534,8 +538,8 @@ async def fetch_single_stock(
     capture_store: CaptureStore | None = None,
     cohort: Cohort | None = None,
     run_id: str | None = None,
-) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
-    """Preserve independently timed quote, investor, and book evidence before parsing.
+) -> tuple[dict[str, Any], list[str]]:
+    """Preserve independently timed quote and investor evidence before parsing.
 
     Args:
         i: Existing progress index.
@@ -549,7 +553,7 @@ async def fetch_single_stock(
         run_id: Shared acquisition identity.
 
     Returns:
-        Compatible wide row, failed API tags, and legacy orderbook rows.
+        Compatible wide row and failed API tags.
 
     Raises:
         ValueError: Capture context is incomplete or inconsistent.
@@ -613,11 +617,9 @@ async def fetch_single_stock(
         (
             res_detail,
             res_investor,
-            res_ob_krx,
         ) = await asyncio.gather(
             _timed("price", client.get_current_price(session, code, market_div_code=_krx_div, allow_market_div_fallback=False)),
             _timed("investor", client.get_investor_trend_estimate(session, code)),
-            _timed("orderbook", client.get_orderbook_snapshot(session, code, market_div_code=_krx_div)),
         )
         row_receipt_max = max(r for _, r in marks.values()) if marks else datetime.now(ZoneInfo("Asia/Seoul"))
 
@@ -630,7 +632,6 @@ async def fetch_single_stock(
             finals: dict[str, Any] = {
                 "price": res_detail,
                 "investor": res_investor,
-                "orderbook": res_ob_krx,
             }
             for label, (dataset, endpoint) in _MARKET_LABEL_ROUTE.items():
                 context = _capture_context_for(trading_day, run_id, cohort_id, dataset, str(code), endpoint)
@@ -672,8 +673,6 @@ async def fetch_single_stock(
             failed_apis.append(QUOTE_UNRESOLVED_API)
         if res_investor.get("rt_cd") != "0":
             failed_apis.append("투자자추정")
-        if res_ob_krx.get("rt_cd") != "0":
-            failed_apis.append("호가")
 
         supply_failed = False
         frgn_qty, orgn_qty = 0, 0
@@ -718,11 +717,6 @@ async def fetch_single_stock(
             mkt_cap_eok = float("nan")
             trade_amt_eok = float("nan")
 
-        capture_ts = datetime.now(ZoneInfo("Asia/Seoul"))
-        orderbook_rows: list[dict] = []
-        if not quote_unresolved:
-            orderbook_rows.extend(build_orderbook_rows(res_ob_krx, code, _krx_div, "decision", capture_ts))
-
         if supply_failed:
             frgn_net_eok = float("nan")
             orgn_net_eok = float("nan")
@@ -752,10 +746,10 @@ async def fetch_single_stock(
         }
         if capture_on:
             row["snapshot_timestamp"] = row_receipt_max
-        return row, failed_apis, orderbook_rows
+        return row, failed_apis
 
 
-async def requote_failed_quotes(stock_list: list[dict], all_res: list[tuple[dict, list[str], list[dict]]], client: Any, session: Any, sem: asyncio.Semaphore, *, now_fn: Callable[[], datetime] | None = None, capture_store: CaptureStore | None = None, cohort: Cohort | None = None, run_id: str | None = None) -> list[tuple[dict, list[str], list[dict]]]:
+async def requote_failed_quotes(stock_list: list[dict], all_res: list[tuple[dict, list[str]]], client: Any, session: Any, sem: asyncio.Semaphore, *, now_fn: Callable[[], datetime] | None = None, capture_store: CaptureStore | None = None, cohort: Cohort | None = None, run_id: str | None = None) -> list[tuple[dict, list[str]]]:
     """Re-fetch transient quote failures once within the decision-window budget.
 
     Args:
@@ -772,7 +766,7 @@ async def requote_failed_quotes(stock_list: list[dict], all_res: list[tuple[dict
     Returns:
         Results with recovered rows replaced in place order.
     """
-    retry_idx = [i for i, (row, apis, _ob) in enumerate(all_res) if row.get(QUOTE_FAILED_COL) and QUOTE_UNRESOLVED_API not in apis]
+    retry_idx = [i for i, (row, apis) in enumerate(all_res) if row.get(QUOTE_FAILED_COL) and QUOTE_UNRESOLVED_API not in apis]
     if not retry_idx:
         return all_res
     now = now_fn() if now_fn is not None else datetime.now(ZoneInfo("Asia/Seoul"))
@@ -838,42 +832,17 @@ async def fetch_all_stock_data(
         sys.stdout.write("\n")
         sys.stdout.flush()
     all_res = await requote_failed_quotes(stock_list, list(all_res), client, session, sem, now_fn=now_fn, capture_store=capture_store, cohort=cohort, run_id=run_id)
-    logger.info("[DATA] stage=realtime_quote_batch n_rows=%d n_quote_failed=%d", total, sum(1 for r, _f, _o in all_res if r.get(QUOTE_FAILED_COL)))
+    logger.info("[DATA] stage=realtime_quote_batch n_rows=%d n_quote_failed=%d", total, sum(1 for r, _f in all_res if r.get(QUOTE_FAILED_COL)))
 
-    results = [r for r, _f, _o in all_res]
+    results = [r for r, _f in all_res]
     failed_info = [
         (stock_list[i]["name"], stock_list[i]["code"], f)
-        for i, (r, f, _o) in enumerate(all_res)
+        for i, (r, f) in enumerate(all_res)
         if f
     ]
-    orderbook_rows: list[dict] = []
-    for _r, _f, o in all_res:
-        if o:
-            orderbook_rows.extend(o)
-    snapshot_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
-    try:
-        append_orderbook_snapshots(orderbook_rows, snapshot_date)
-    except Exception as e:
-        logger.error(
-            "[DATA] stage=orderbook_persist status=FAILED reason=%s path=%s",
-            type(e).__name__,
-            orderbook_partition_path(snapshot_date),
-        )
 
     logger.info(f"{Colors.GREEN}✅ 데이터 수집 완료{Colors.RESET}")
     return results, failed_info
-
-
-def _split_stock_list_evenly(stock_list: list[dict], n: int) -> list[list[dict]]:
-    """원래 순서를 보존한 채 n개의 연속 구간으로 최대한 균등 분할한다."""
-    base, rem = divmod(len(stock_list), n)
-    chunks: list[list[dict]] = []
-    start = 0
-    for i in range(n):
-        size = base + (1 if i < rem else 0)
-        chunks.append(stock_list[start:start + size])
-        start += size
-    return chunks
 
 
 async def fetch_all_stock_data_sharded(
@@ -886,19 +855,50 @@ async def fetch_all_stock_data_sharded(
     cohort: Cohort | None = None,
     run_id: str | None = None,
 ) -> tuple[list[dict], list[tuple[str, str, list[str]]]]:
-    """여러 KIS 키로 분할 수집하고 원래 순서로 병합한다."""
+    """여러 KIS 키로 분할 수집하고 원래 순서로 병합한다.
+
+    정적 구간 분할 대신 하나의 공유 작업 큐를 키별 워커 풀이 소비한다: 빠른 키가
+    더 많은 종목을 가져가고, 키별 동시성은 API_SEMAPHORE_LIMIT으로 묶인다.
+    """
     if len(clients) <= 1:
         return await fetch_all_stock_data(stock_list, clients[0], session, now_fn=now_fn, capture_store=capture_store, cohort=cohort, run_id=run_id)
-    chunks = _split_stock_list_evenly(stock_list, len(clients))
-    pairs = [(chunk, client) for chunk, client in zip(chunks, clients) if chunk]
-    if not pairs:
-        return [], []
-    gathered = await asyncio.gather(*[fetch_all_stock_data(chunk, client, session, now_fn=now_fn, capture_store=capture_store, cohort=cohort, run_id=run_id) for chunk, client in pairs])
-    results: list[dict] = []
-    failed_info: list = []
-    for r, f in gathered:
-        results.extend(r)
-        failed_info.extend(f)
+    total = len(stock_list)
+    queue: asyncio.Queue[tuple[int, dict]] = asyncio.Queue()
+    for i, stock in enumerate(stock_list):
+        queue.put_nowait((i, stock))
+    ordered: list[tuple[dict, list[str]] | None] = [None] * total
+
+    async def _drain(client: Any, sem: asyncio.Semaphore) -> None:
+        while True:
+            try:
+                i, stock = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            ordered[i] = await fetch_single_stock(
+                i, stock, total, sem, client, session,
+                capture_store=capture_store, cohort=cohort, run_id=run_id,
+            )
+
+    drains: list[Any] = []
+    for client in clients:
+        sem = asyncio.Semaphore(settings.API_SEMAPHORE_LIMIT)
+        drains.extend(_drain(client, sem) for _ in range(int(settings.API_SEMAPHORE_LIMIT)))
+    # gather succeeds only after the queue is drained, so every slot is filled; never filter (it would shift indices).
+    await asyncio.gather(*drains)
+    all_res = cast("list[tuple[dict[str, Any], list[str]]]", ordered)
+    all_res = await requote_failed_quotes(
+        stock_list, all_res, clients[0], session,
+        asyncio.Semaphore(settings.API_SEMAPHORE_LIMIT),
+        now_fn=now_fn, capture_store=capture_store, cohort=cohort, run_id=run_id,
+    )
+    logger.info("[DATA] stage=realtime_quote_batch n_rows=%d n_quote_failed=%d", total, sum(1 for r, _f in all_res if r.get(QUOTE_FAILED_COL)))
+
+    results = [r for r, _f in all_res]
+    failed_info = [
+        (stock_list[i]["name"], stock_list[i]["code"], f)
+        for i, (r, f) in enumerate(all_res)
+        if f
+    ]
     return results, failed_info
 
 
@@ -942,8 +942,27 @@ async def main(force: bool = False):
         connect=10,  # 연결 타임아웃
         sock_read=30,  # 소켓 읽기 타임아웃
     )
+    decision_shard_clients = [
+        KisApiClient(
+            data_kwargs["app_key"],
+            data_kwargs["app_secret"],
+            data_kwargs["account_id"],
+            data_kwargs["hts_id"],
+            token_file=data_kwargs["token_file"],
+        )
+    ]
+    decision_shard_clients.extend(
+        KisApiClient(
+            shard_kwargs["app_key"],
+            shard_kwargs["app_secret"],
+            shard_kwargs["account_id"],
+            shard_kwargs["hts_id"],
+            token_file=shard_kwargs["token_file"],
+        )
+        for shard_kwargs in kis_decision_shard_client_kwargs()[1:]
+    )
     connector = aiohttp.TCPConnector(
-        limit=20,  # 최대 동시 연결 수
+        limit=settings.API_SEMAPHORE_LIMIT * len(decision_shard_clients) * DECISION_CALLS_PER_SYMBOL,
         ttl_dns_cache=300,  # DNS 캐시 TTL (5분)
         force_close=False,  # Keep-Alive 유지
         resolver=ThreadedResolver(),  # [Fix] Windows aiodns 이슈 방지용 표준 리졸버 사용
@@ -951,25 +970,9 @@ async def main(force: bool = False):
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         # 1. 클라이언트 초기화 및 토큰 확보
-        client = KisApiClient(
-            data_kwargs["app_key"],
-            data_kwargs["app_secret"],
-            data_kwargs["account_id"],
-            data_kwargs["hts_id"],
-            token_file=data_kwargs["token_file"],
-        )
-        await client.ensure_token(session)
-        decision_shard_clients = [client]
-        for shard_kwargs in kis_decision_shard_client_kwargs()[1:]:
-            shard_client = KisApiClient(
-                shard_kwargs["app_key"],
-                shard_kwargs["app_secret"],
-                shard_kwargs["account_id"],
-                shard_kwargs["hts_id"],
-                token_file=shard_kwargs["token_file"],
-            )
+        for shard_client in decision_shard_clients:
             await shard_client.ensure_token(session)
-            decision_shard_clients.append(shard_client)
+        client = decision_shard_clients[0]
 
         snapshot_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
         kiwoom_client = build_kiwoom_scan_client()

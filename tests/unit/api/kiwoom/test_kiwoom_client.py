@@ -252,7 +252,7 @@ def test_kiwoom_client_ensure_token() -> None:
 
     client = KiwoomApiClient(app_key="k", secret_key="s")
     mock_resp = AsyncMock()
-    mock_resp.json = AsyncMock(return_value={"token": "mock_tok", "return_code": 0})
+    mock_resp.json = AsyncMock(return_value={"token": "mock_tok", "return_code": 0, "expires_dt": "20261002151006"})
     session = AsyncMock()
     session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
     session.post.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -276,7 +276,7 @@ def test_kiwoom_client_ensure_token_concurrent_calls_lock_and_request_once() -> 
         call_count["n"] += 1
         await asyncio.sleep(0.01)
         mock_resp = AsyncMock()
-        mock_resp.json = AsyncMock(return_value={"token": "tok_123", "return_code": 0})
+        mock_resp.json = AsyncMock(return_value={"token": "tok_123", "return_code": 0, "expires_dt": "20261002151006"})
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=mock_resp)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -1226,7 +1226,7 @@ class _FakeKiwoomSession:
     def post(self, url: str, headers: dict, json: dict) -> _FakeResp:
         if url.endswith("/oauth2/token"):
             self.token_calls += 1
-            return _FakeResp({"token": f"tok-{self.token_calls}", "return_code": 0})
+            return _FakeResp({"token": f"tok-{self.token_calls}", "return_code": 0, "expires_dt": "20261002151006"})
         self.tr_calls.append({"auth": headers["authorization"], "cont": headers["cont-yn"], "key": headers["next-key"], "body": dict(json)})
         body, status = self.tr_responses.pop(0)
         return _FakeResp(body, status)
@@ -1309,3 +1309,144 @@ def test_kiwoom_walk_empty_first_page_with_continuation_stays_cursor_inconsisten
     client._post_tr = fake
     res = asyncio.run(client.walk_tick_tape(object(), "005930", stop_before_day="2026-09-21", max_pages=1))
     assert res["termination_reason"] == "cursor_inconsistent"
+
+
+def test_kiwoom_per_tr_host_bucket_shared_across_clients(tmp_path, monkeypatch) -> None:
+    from src.api.kis.rate_limit import host_admission_state_path
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_DIR", tmp_path)
+    (tmp_path / ".host-admission").touch()
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_REQUIRE_SHARED", "always")
+
+    from src.api.kiwoom.client import KiwoomApiClient
+
+    a = KiwoomApiClient(app_key="same-key", secret_key="s")
+    b = KiwoomApiClient(app_key="same-key", secret_key="s")
+    assert a._limiter_for("ka10079")._state_path == b._limiter_for("ka10079")._state_path
+    assert a._limiter_for("ka10079")._state_path == host_admission_state_path("kiwoom", "same-key", "ka10079")
+    assert a._limiter_for("ka10080")._state_path != a._limiter_for("ka10079")._state_path
+
+
+def _token_session(body: dict, seen: dict) -> Any:
+    class _Resp:
+        status = 200
+
+        async def json(self) -> dict:
+            return dict(body)
+
+        async def __aenter__(self) -> _Resp:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _Session:
+        def post(self, url: str, headers: dict, json: dict) -> _Resp:
+            seen["url"] = url
+            seen["headers"] = dict(headers)
+            seen["json"] = dict(json)
+            return _Resp()
+
+    return _Session()
+
+
+def test_kiwoom_issue_token_returns_vendor_expiry() -> None:
+    import asyncio
+
+    from src.api.kiwoom.client import KiwoomApiClient
+
+    seen: dict = {}
+    session = _token_session({"token": "live-tok", "return_code": 0, "expires_dt": "20261002151006"}, seen)
+    issued = asyncio.run(KiwoomApiClient(app_key="k", secret_key="s").issue_token(session))
+
+    assert issued.token == "live-tok"
+    assert issued.expires_at == datetime(2026, 10, 2, 15, 10, 6, tzinfo=_SEOUL)
+    assert seen["url"].endswith("/oauth2/token")
+    assert seen["headers"]["User-Agent"] == "curl/8.5.0"
+
+
+def test_kiwoom_issue_token_rejects_malformed_expiry() -> None:
+    import asyncio
+
+    import pytest
+
+    from src.api.kiwoom.client import KiwoomApiClient
+
+    for body in (
+        {"token": "t", "return_code": 0},
+        {"token": "t", "return_code": 0, "expires_dt": "2026-10-02"},
+        {"token": "t", "return_code": 0, "expires_dt": "20261301151006"},
+    ):
+        with pytest.raises(RuntimeError):
+            asyncio.run(KiwoomApiClient(app_key="k", secret_key="s").issue_token(_token_session(body, {})))
+
+
+def test_kiwoom_ensure_token_delegates_to_issue_token() -> None:
+    import asyncio
+
+    from src.api.kiwoom.client import KiwoomApiClient
+
+    client = KiwoomApiClient(app_key="k", secret_key="s")
+    session = _token_session({"token": "live-tok", "return_code": 0, "expires_dt": "20261002151006"}, {})
+    assert asyncio.run(client.ensure_token(session)) == "live-tok"
+    assert client.token == "live-tok"
+
+
+def _revoke_session(body: dict, status: int, seen: dict) -> Any:
+    class _Resp:
+        def __init__(self) -> None:
+            self.status = status
+
+        async def json(self) -> dict:
+            return dict(body)
+
+        async def __aenter__(self) -> _Resp:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _Session:
+        def post(self, url: str, headers: dict, json: dict) -> _Resp:
+            seen["url"] = url
+            seen["headers"] = dict(headers)
+            seen["json"] = dict(json)
+            return _Resp()
+
+    return _Session()
+
+
+def test_kiwoom_revoke_token_uses_au10002_contract() -> None:
+    import asyncio
+
+    from src.api.kiwoom.client import KIWOOM_REVOKE_PATH, KiwoomApiClient
+
+    seen: dict = {}
+    session = _revoke_session({"return_code": 0, "return_msg": "OK"}, 200, seen)
+    asyncio.run(KiwoomApiClient(app_key="k", secret_key="s").revoke_token(session, "live-tok"))
+
+    assert seen["url"].endswith(KIWOOM_REVOKE_PATH)
+    assert seen["json"] == {"appkey": "k", "secretkey": "s", "token": "live-tok"}
+    assert seen["headers"]["User-Agent"] == "curl/8.5.0"
+
+
+def test_kiwoom_revoke_token_failure_surfaces() -> None:
+    import asyncio
+
+    import pytest
+
+    from src.api.kiwoom.client import KiwoomApiClient
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            KiwoomApiClient(app_key="k", secret_key="s").revoke_token(
+                _revoke_session({"return_code": 1, "return_msg": "bad"}, 200, {}), "live-tok"
+            )
+        )
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            KiwoomApiClient(app_key="k", secret_key="s").revoke_token(
+                _revoke_session({"return_code": 0}, 500, {}), "live-tok"
+            )
+        )
