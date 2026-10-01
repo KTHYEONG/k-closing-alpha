@@ -32,7 +32,8 @@ def test_loose_copy_data_excludes_segment_tiers_and_local_snapshots() -> None:
     assert cmd[cmd.index("--backup-dir") + 1] == f"{BACKUP_REMOTE_BASE}/_deleted/data/2026-09-18"
     for pattern in LOOSE_EXCLUDES:
         assert pattern in cmd
-    assert len(LOOSE_EXCLUDES) == 4
+    assert len(LOOSE_EXCLUDES) == 5
+    assert "/history/capture/manifests/**" in LOOSE_EXCLUDES
     assert "--transfers" in cmd and "4" in cmd
     assert "sync" not in cmd
     assert "--fast-list" not in cmd
@@ -56,7 +57,7 @@ def test_run_executes_seal_before_loose_copies(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
     order: list[str] = []
 
-    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
         order.append("capture_seal")
         return SealReport(dates_scanned=1, segments_committed=2, members_committed=3, archive_bytes=4, missing_sealed_members=0)
 
@@ -86,7 +87,7 @@ def test_run_continues_after_seal_failure_and_raises_after_report(tmp_path: Path
     monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
     ran: list[str] = []
 
-    def _boom(capture_root: Path, *, today, full_scan):
+    def _boom(capture_root: Path, *, today, full_scan, deadline=None):
         raise RuntimeError("seal down")
 
     def _run(cmd, **kwargs):
@@ -109,7 +110,7 @@ def test_run_requests_full_scan_only_on_configured_weekday(tmp_path: Path, monke
     monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
     seen: dict[str, object] = {}
 
-    def _seal(capture_root: Path, *, today, full_scan):
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None):
         seen["today"] = today
         seen["full_scan"] = full_scan
         from src.tools.capture_offsite import SealReport
@@ -199,7 +200,7 @@ def test_run_handles_naive_now_and_loose_failures(tmp_path: Path, monkeypatch) -
 
     monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
 
-    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
         return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
 
     def _ok(cmd, **kwargs):
@@ -208,7 +209,7 @@ def test_run_handles_naive_now_and_loose_failures(tmp_path: Path, monkeypatch) -
     # Given naive now assumed KST Friday -> full scan path covered
     seen: dict[str, object] = {}
 
-    def _recording_seal(capture_root: Path, *, today, full_scan):
+    def _recording_seal(capture_root: Path, *, today, full_scan, deadline=None):
         seen["today"] = today
         seen["full_scan"] = full_scan
         return _seal(capture_root, today=today, full_scan=full_scan)
@@ -298,7 +299,7 @@ def test_corrupt_core_panel_excluded_from_nightly_copy(tmp_path: Path, monkeypat
         encoding="utf-8",
     )
 
-    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
         return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
 
     seen: list[list[str]] = []
@@ -329,7 +330,7 @@ def test_healthy_panels_leave_copy_unchanged(tmp_path: Path, monkeypatch) -> Non
     project = tmp_path / "proj"
     capture = tmp_path / "capture"
 
-    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
         return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
 
     seen: list[list[str]] = []
@@ -343,7 +344,8 @@ def test_healthy_panels_leave_copy_unchanged(tmp_path: Path, monkeypatch) -> Non
     data_cmds = [c for c in seen if len(c) > 2 and c[2].endswith("/data")]
     assert len(data_cmds) == 1
     expected = loose_copy_command("rclone", project, "data", "2026-09-18")
-    assert data_cmds[0] == expected
+    assert data_cmds[0][: len(expected)] == expected
+    assert "--max-duration" in data_cmds[0] and "--cutoff-mode" in data_cmds[0]
 
 
 def test_offsite_helpers_cover_error_branches(tmp_path: Path) -> None:
@@ -400,7 +402,7 @@ def test_offsite_failed_copy_keeps_core_issues(tmp_path: Path, monkeypatch) -> N
         encoding="utf-8",
     )
 
-    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
         return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
 
     def _run(cmd, **kwargs):
@@ -428,7 +430,7 @@ def test_offsite_first_run_unreadable_persists_current(tmp_path: Path, monkeypat
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(b"truncated")
 
-    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
         return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
 
     def _run(cmd, **kwargs):
@@ -481,7 +483,7 @@ def test_offsite_backup_accepted_missing_persists_current_baseline(tmp_path: Pat
         encoding="utf-8",
     )
 
-    def _seal(capture_root: Path, *, today, full_scan) -> SealReport:
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
         return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
 
     def _run(cmd, **kwargs):
@@ -496,3 +498,136 @@ def test_offsite_backup_accepted_missing_persists_current_baseline(tmp_path: Pat
     rels = {item["relpath"] for item in persisted["core_panels"]}
     assert "data/paper/x.parquet" not in rels
     assert "data/history/price_history.parquet" in rels
+
+
+def test_loose_copy_carries_remaining_total_budget(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+    from datetime import datetime as _datetime
+
+    from src.tools import offsite_backup as _ob
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    real_datetime = _datetime
+
+    class _FakeDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime(2026, 9, 18, 23, 55, tzinfo=KST)
+
+    monkeypatch.setattr(_ob, "datetime", _FakeDatetime)
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    seen: list[list[str]] = []
+
+    def _run(cmd, **kwargs):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    report = run_offsite_backup(tmp_path, tmp_path / "cbudget", now=_now_kst("2026-09-18", "22:15:00"), run_fn=_run, seal_fn=_seal)
+    assert report.status == "ok"
+    data_cmd = next(c for c in seen if len(c) > 2 and c[2].endswith("/data"))
+    assert "--max-duration" in data_cmd and "3000s" in data_cmd
+    assert "--cutoff-mode" in data_cmd and "soft" in data_cmd
+
+
+def test_seal_deadline_is_run_start_plus_seal_budget(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+    from datetime import timedelta
+
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import BACKUP_SEAL_BUDGET, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    seen: dict[str, object] = {}
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        seen["deadline"] = deadline
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    start = _now_kst("2026-09-18")
+    run_offsite_backup(tmp_path, tmp_path / "cdeadline", now=start, run_fn=_run, seal_fn=_seal)
+    assert seen["deadline"] == start + BACKUP_SEAL_BUDGET
+
+
+def test_duration_exceeded_loose_copy_is_deferred_not_failed(tmp_path: Path, monkeypatch) -> None:
+    import json
+    import subprocess
+
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import REPORT_RELPATH, RCLONE_DURATION_EXCEEDED_EXIT, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, RCLONE_DURATION_EXCEEDED_EXIT, stdout="", stderr="max duration exceeded")
+
+    report = run_offsite_backup(tmp_path, tmp_path / "cdefer", now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+    assert report.status == "ok"
+    assert report.steps["data"]["status"] == "deferred"
+    persisted = json.loads((tmp_path / "cdefer" / REPORT_RELPATH).read_text(encoding="utf-8"))
+    assert persisted["status"] == "ok"
+    assert persisted["steps"]["data"]["status"] == "deferred"
+
+
+def test_deferred_report_yields_deferred_staleness_issue(tmp_path: Path) -> None:
+    import json
+
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    audit_at = _now_kst("2026-09-21", "20:15:00")
+
+    deferred_seal = tmp_path / "deferred_seal.json"
+    deferred_seal.write_text(json.dumps({
+        "started_at": "2026-09-18T13:30:00+00:00", "finished_at": "2026-09-18T13:30:00+00:00",
+        "status": "ok",
+        "steps": {"capture_seal": {"status": "ok", "deferred_dates": 3}},
+    }), encoding="utf-8")
+    assert backup_staleness_issues(deferred_seal, audit_at) == ["offsite_backup:deferred"]
+
+    deferred_loose = tmp_path / "deferred_loose.json"
+    deferred_loose.write_text(json.dumps({
+        "started_at": "2026-09-18T13:30:00+00:00", "finished_at": "2026-09-18T13:30:00+00:00",
+        "status": "ok",
+        "steps": {
+            "capture_seal": {"status": "ok", "deferred_dates": 0},
+            "data": {"status": "deferred", "returncode": 10},
+        },
+    }), encoding="utf-8")
+    assert backup_staleness_issues(deferred_loose, audit_at) == ["offsite_backup:deferred"]
+
+
+def test_failure_dominates_deferral_in_report_and_staleness(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import backup_staleness_issues, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0,
+                          missing_sealed_members=0, deferred_dates=2)
+
+    def _run(cmd, **kwargs):
+        if cmd[2].endswith("/data"):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="drive down")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="offsite backup failed"):
+        run_offsite_backup(tmp_path, tmp_path / "cfaildef", now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+    from src.tools.offsite_backup import REPORT_RELPATH
+
+    persisted = tmp_path / "cfaildef" / REPORT_RELPATH
+    assert backup_staleness_issues(persisted, _now_kst("2026-09-21", "20:15:00")) == ["offsite_backup:failed"]

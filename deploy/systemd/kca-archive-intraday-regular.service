@@ -1,5 +1,6 @@
 [Unit]
 Description=KCA intraday archive - regular session bars+ticks (evening batch, early)
+After=kca-collect.service
 OnFailure=kca-alert@%n.service
 
 [Service]
