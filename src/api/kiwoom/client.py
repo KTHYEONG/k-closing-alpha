@@ -155,7 +155,7 @@ class KiwoomApiClient:
         return get_shared_rate_limiter("kiwoom", f"{self.app_key}:{api_id}", _KIWOOM_TR_RATE_PER_SEC)
 
     def reset_token(self) -> None:
-        """Drop the cached token so the next request issues a fresh one (the vendor invalidates older tokens)."""
+        """Drop the cached token so the next request fetches one; the vendor reuses a live token and expires it ~24h after issuance."""
         self.token = None
 
     async def ensure_token(self, session) -> str:
