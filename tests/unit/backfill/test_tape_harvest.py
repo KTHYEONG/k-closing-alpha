@@ -576,3 +576,49 @@ def test_empty_tape_with_uncertified_venue_stays_unknown(tmp_path) -> None:
     )
     assert out and all(r.entry.status == CaptureStatus.UNKNOWN for r in out)
     assert all(r.entry.reason == "uncertified_venue" for r in out)
+
+
+def _flush_one_certified_day(store, profile, namespace=None) -> None:
+    rows = [_tick("093000")]
+    pub = TickTapePublisher(store=store, profile=profile, flush_rows=10**9, publish_namespace=namespace)
+    pub.add(
+        TapeDayResult(
+            symbol="005930", day=_DAY, session="regular",
+            frame=th._safe_normalize_ticks("kiwoom", rows, _DAY, "005930", truncated=False),
+            entry=th.CoverageEntry(
+                symbol="005930", dataset=th.CaptureDataset.TRADE_TICKS, venue="KRX", session="regular",
+                scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1, first_event_time=None,
+                last_event_time=None, reason="tape_complete:regular=1:vendor_total=2", raw_refs=(),
+            ),
+        )
+    )
+    pub.flush()
+
+
+def test_restarted_publisher_does_not_collide_with_earlier_group_manifests(tmp_path, monkeypatch, caplog) -> None:
+    from src import settings as _settings
+
+    monkeypatch.setattr(_settings, "HISTORY_DIR", tmp_path, raising=False)
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    with caplog.at_level("WARNING"):
+        _flush_one_certified_day(store, profile)
+        _flush_one_certified_day(store, profile)
+    assert "manifest_conflict" not in caplog.text
+    runs = [p.name for p in (store.root / "manifests" / _DAY).iterdir() if "publish" in p.name]
+    assert len(runs) == 2 and len(set(runs)) == 2
+
+
+def test_publish_namespace_is_part_of_the_manifest_run_id_and_must_be_nonempty(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from src import settings as _settings
+
+    monkeypatch.setattr(_settings, "HISTORY_DIR", tmp_path, raising=False)
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    _flush_one_certified_day(store, profile, namespace="nsA")
+    names = [p.name for p in (store.root / "manifests" / _DAY).iterdir()]
+    assert f"tape-{_DAY}-regular-publish-nsA-0" in names
+    with pytest.raises(ValueError, match="publish_namespace"):
+        TickTapePublisher(store=store, profile=profile, flush_rows=1, publish_namespace=" ")
