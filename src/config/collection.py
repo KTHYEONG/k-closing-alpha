@@ -55,6 +55,9 @@ class CollectionSettings(EnvSettings):
         COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS: Rounds buffered before a normalized flush, default 15.
         COLLECTION_TRANSPORT_RETRIES: Extra tries after a transient transport error, default 2.
         COLLECTION_TRANSPORT_BACKOFF_SECONDS: Delay before the first retry, doubled per retry, default 3.0.
+        COLLECTION_TAPE_FLUSH_ROWS: Tape publisher row bound before a partition flush, default 2000000.
+        COLLECTION_TAPE_MIN_FREE_GIB: Free-disk floor (GiB) below which tape jobs stop starting walks, default 25.
+        COLLECTION_TAPE_LOOKBACK_DAYS: Daily sweep re-check window in days, default 25 (below the ~30 day tape depth).
 
     Raises:
         ValueError: Invalid limits, duplicate slots, or enabled auctions without
@@ -74,6 +77,9 @@ class CollectionSettings(EnvSettings):
     COLLECTION_TICK_REPAIR_MAX_PAGES: int = Field(default=1000, gt=0)
     COLLECTION_TICK_ROWS_PER_PAGE: int = Field(default=900, gt=0)
     COLLECTION_TICK_RESUME_MARGIN_PAGES: int = Field(default=5, ge=0)
+    COLLECTION_TAPE_FLUSH_ROWS: int = Field(default=2_000_000, gt=0)
+    COLLECTION_TAPE_MIN_FREE_GIB: int = Field(default=25, gt=0)
+    COLLECTION_TAPE_LOOKBACK_DAYS: int = Field(default=25, gt=0, le=30)
     COLLECTION_ARROW_BATCH_ROWS: int = Field(default=65536, gt=0)
     COLLECTION_MAX_RSS_MIB: int = Field(default=1024, gt=0)
     COLLECTION_ALTDATA_LOOKBACK_DAYS: int = Field(default=30, gt=0)
