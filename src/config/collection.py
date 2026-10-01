@@ -30,8 +30,8 @@ class CollectionSettings(EnvSettings):
         COLLECTION_AUCTION_INTERVAL_SECONDS: Closing sweep interval, default 60.
         COLLECTION_REQUEST_TIMEOUT_SECONDS: Total call timeout, default 5.0.
         COLLECTION_CONCURRENCY_PER_KEY: In-flight limit, default 8.
-        COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE: Symbols buffered before an intraday partition flush,
-            default 25.
+        COLLECTION_ARCHIVE_PUBLISH_ROWS: Buffered rows per archive publisher before a partition flush,
+            default 2000000.
         COLLECTION_CHART_MAX_PAGES: Normal page budget, default 30.
         COLLECTION_TICK_REPAIR_MAX_PAGES: Explicit total repair budget, default 1000.
             Measured worst case is ~390 pages (a ~350k-tick symbol on 2026-09-30) and
@@ -75,7 +75,13 @@ class CollectionSettings(EnvSettings):
     COLLECTION_AUCTION_INTERVAL_SECONDS: int = Field(default=60, gt=0)
     COLLECTION_REQUEST_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     COLLECTION_CONCURRENCY_PER_KEY: int = Field(default=8, gt=0)
-    COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE: int = Field(default=25, gt=0)
+    COLLECTION_ARCHIVE_PUBLISH_ROWS: int = Field(default=2_000_000, gt=0)
+    """Buffered rows per archive publisher before a partition flush.
+
+    Each flush streams and rewrites the whole day partition, so flushing by symbol count
+    made rewrites grow with symbols squared. A row bound keeps the rewrite count about
+    total_rows / bound and the buffered memory bounded.
+    """
     COLLECTION_CHART_MAX_PAGES: int = Field(default=30, gt=0)
     COLLECTION_TICK_REPAIR_MAX_PAGES: int = Field(default=1000, gt=0)
     COLLECTION_TICK_ROWS_PER_PAGE: int = Field(default=900, gt=0)

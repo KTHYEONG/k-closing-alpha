@@ -1121,3 +1121,326 @@ def test_daily_audit_imports_no_private_round_names() -> None:
         if isinstance(node, ast.ImportFrom) and node.module == "src.daily.auction_capture":
             private.extend(alias.name for alias in node.names if alias.name.startswith("_"))
     assert private == []
+
+
+def _surge_entry(symbol: str, status: Any, scheduled_at: Any) -> Any:
+    from src.data.capture_contracts import CaptureDataset, CoverageEntry
+
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.ORDERBOOK,
+        venue="KRX",
+        session="regular",
+        scheduled_at=scheduled_at,
+        status=status,
+        rows=1,
+        first_event_time=scheduled_at,
+        last_event_time=scheduled_at,
+        reason="auction-close",
+        raw_refs=(),
+    )
+
+
+def test_observe_roster_completes_round_at_concurrent_throughput() -> None:
+    """400-symbol round with 75 ms legs and 8-per-key concurrency finishes in ~25 waves."""
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    state = {"now": _seoul(2026, 9, 17, 15, 21, 0)}
+    roster = [f"{i:06d}" for i in range(400)]
+
+    class _LagClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_orderbook_snapshot(self, session: Any, code: str, market_div_code: str | None = None) -> dict[str, Any]:
+            self.calls += 1
+            start = state["now"]
+            await asyncio.sleep(0)
+            target = start + dt.timedelta(seconds=0.075)
+            if state["now"] < target:
+                state["now"] = target
+            return {"rt_cd": "0"}
+
+    clients = [_LagClient(), _LagClient()]
+    t0 = state["now"]
+
+    async def _observe(position: int, symbol: str, client: Any) -> Any:
+        await client.get_orderbook_snapshot(None, symbol)
+        return _surge_entry(symbol, CaptureStatus.COMPLETE, t0)
+
+    def _on_deadline(position: int, symbol: str) -> Any:
+        return _surge_entry(symbol, CaptureStatus.PARTIAL, t0)
+
+    entries = _run(
+        auction_capture._observe_roster(
+            roster=roster,
+            clients=clients,
+            semaphore=asyncio.Semaphore(8 * 2),
+            deadline=t0 + dt.timedelta(hours=1),
+            now_fn=lambda: state["now"],
+            observe=_observe,
+            on_deadline=_on_deadline,
+        )
+    )
+
+    # Then: every symbol completes at the account rate, not the serial latency rate
+    assert len(entries) == 400
+    assert all(e.status == CaptureStatus.COMPLETE for e in entries)
+    assert [e.symbol for e in entries] == roster
+    assert clients[0].calls + clients[1].calls == 400
+    elapsed = (state["now"] - t0).total_seconds()
+    assert elapsed <= 400 * 0.075 / 16 + 0.075
+
+
+def test_observe_roster_keeps_roster_order_under_random_delays() -> None:
+    """Completion order never leaks into the deterministic manifest order."""
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    now = _seoul(2026, 9, 17, 15, 21, 0)
+    roster = [f"{i:06d}" for i in range(50)]
+    delays = [((i * 37) % 11) * 0.0005 for i in range(len(roster))]
+
+    async def _observe(position: int, symbol: str, client: Any) -> Any:
+        await asyncio.sleep(delays[position])
+        return _surge_entry(symbol, CaptureStatus.COMPLETE, now)
+
+    def _on_deadline(position: int, symbol: str) -> Any:
+        return _surge_entry(symbol, CaptureStatus.PARTIAL, now)
+
+    entries = _run(
+        auction_capture._observe_roster(
+            roster=roster,
+            clients=[object()],
+            semaphore=asyncio.Semaphore(8),
+            deadline=now + dt.timedelta(hours=1),
+            now_fn=lambda: now,
+            observe=_observe,
+            on_deadline=_on_deadline,
+        )
+    )
+
+    assert [e.symbol for e in entries] == roster
+
+
+def test_observe_roster_marks_undispatched_tail_deadline_without_requests() -> None:
+    """Symbols dispatched at or after the cutoff never hit the vendor."""
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    state = {"now": _seoul(2026, 9, 17, 15, 21, 0)}
+    t0 = state["now"]
+    roster = [f"{i:06d}" for i in range(10)]
+    sent: list[str] = []
+
+    async def _observe(position: int, symbol: str, client: Any) -> Any:
+        sent.append(symbol)
+        state["now"] += dt.timedelta(seconds=0.1)
+        return _surge_entry(symbol, CaptureStatus.COMPLETE, t0)
+
+    def _on_deadline(position: int, symbol: str) -> Any:
+        entry = _surge_entry(symbol, CaptureStatus.PARTIAL, t0)
+        return entry.model_copy(
+            update={"reason": "deadline", "rows": 0, "first_event_time": None, "last_event_time": None}
+        )
+
+    entries = _run(
+        auction_capture._observe_roster(
+            roster=roster,
+            clients=[object()],
+            semaphore=asyncio.Semaphore(16),
+            deadline=t0 + dt.timedelta(seconds=0.25),
+            now_fn=lambda: state["now"],
+            observe=_observe,
+            on_deadline=_on_deadline,
+        )
+    )
+
+    # Then: three dispatches fit before the cutoff; the tail is PARTIAL without a request
+    assert sent == roster[:3]
+    assert len(entries) == len(roster)
+    assert [e.symbol for e in entries] == roster
+    tail = entries[3:]
+    assert all(e.status == CaptureStatus.PARTIAL and e.reason == "deadline" for e in tail)
+    assert all(e.first_event_time is None for e in tail)
+
+
+def test_program_deadline_entry_marks_undispatched_tail() -> None:
+    """확인 마감에 못 든 프로그램 심볼은 요청 없이 PARTIAL(deadline)이다."""
+    import functools
+
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    state = {"now": _seoul(2026, 9, 17, 15, 22, 0)}
+    t0 = state["now"]
+    roster = [f"{i:06d}" for i in range(6)]
+    sent: list[str] = []
+
+    async def _observe(position: int, symbol: str, client: Any) -> Any:
+        sent.append(symbol)
+        state["now"] += dt.timedelta(seconds=60)
+        return _surge_entry(symbol, CaptureStatus.COMPLETE, t0)
+
+    entries = _run(
+        auction_capture._observe_roster(
+            roster=roster,
+            clients=[object()],
+            semaphore=asyncio.Semaphore(16),
+            deadline=t0 + dt.timedelta(seconds=90),
+            now_fn=lambda: state["now"],
+            observe=_observe,
+            on_deadline=functools.partial(auction_capture._program_deadline_entry, scheduled_at=t0),
+        )
+    )
+
+    # Then: 두 디스패치만 마감 안에 들고 나머지는 요청 없이 PARTIAL이다
+    assert sent == roster[:2]
+    assert [e.symbol for e in entries] == roster
+    tail = entries[2:]
+    assert all(e.status == CaptureStatus.PARTIAL and e.reason == "deadline" for e in tail)
+    assert all(e.dataset == CaptureDataset.PROGRAM and e.first_event_time is None for e in tail)
+
+
+def test_open_deadline_entry_keeps_last_seen_evidence() -> None:
+    """확인 종료 후 디스패치는 최종 PARTIAL(open_unresolved)로 확정된다."""
+    import functools
+
+    from src.daily import auction_capture
+    from src.data.capture_contracts import ArtifactRef, CaptureDataset, CaptureStatus
+
+    now = _seoul(2026, 9, 17, 9, 1, 0)
+    floor = _seoul(2026, 9, 17, 9, 0, 30)
+    ref = ArtifactRef(path="r/0.json.gz", sha256="ab" * 32, bytes=10)
+    poll_started = {"000002": _seoul(2026, 9, 17, 9, 0, 35)}
+    last_seen = {"000002": (ref, _seoul(2026, 9, 17, 9, 0, 50))}
+    settled: set[int] = set()
+
+    async def _never(_position: int, _symbol: str, _client: Any) -> Any:
+        raise AssertionError("must not dispatch past confirmation end")
+
+    entries = _run(
+        auction_capture._observe_roster(
+            roster=["000001", "000002"],
+            clients=[object()],
+            semaphore=asyncio.Semaphore(8),
+            deadline=now,
+            now_fn=lambda: now,
+            observe=_never,
+            on_deadline=functools.partial(
+                auction_capture._open_deadline_entry,
+                floor=floor,
+                now_fn=lambda: now,
+                poll_started=poll_started,
+                last_seen=last_seen,
+                settled=settled,
+            ),
+        )
+    )
+
+    # Then: 두 심볼 모두 최종 확정되고 마지막 목격 증거가 보존된다
+    assert settled == {0, 1}
+    by_symbol = {e.symbol: e for e in entries}
+    assert by_symbol["000001"].reason == "open_unresolved"
+    assert by_symbol["000001"].first_event_time == now
+    assert by_symbol["000001"].raw_refs == ()
+    assert by_symbol["000002"].first_event_time == poll_started["000002"]
+    assert by_symbol["000002"].raw_refs == (ref,)
+    assert all(e.dataset == CaptureDataset.PRICE and e.status == CaptureStatus.PARTIAL for e in entries)
+
+
+def test_program_and_orderbook_rounds_share_one_bound(tmp_path) -> None:
+    """Concurrent program attribution never pushes in-flight requests past the semaphore."""
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", [f"{i:06d}" for i in range(6)])
+    profile = _profile(tmp_path)
+    clock = _clock("2026-09-17")
+    now = _seoul(2026, 9, 17, 15, 0)
+    state = {"inflight": 0, "max": 0}
+    orderbook_seen: list[str] = []
+    program_seen: list[str] = []
+
+    class _BoundedClient(_FakeClient):
+        async def _tracked(self, kind: str, code: str) -> dict[str, Any]:
+            state["inflight"] += 1
+            state["max"] = max(state["max"], state["inflight"])
+            await asyncio.sleep(0.01)
+            state["inflight"] -= 1
+            return {"rt_cd": "0", "output1": {}, "output2": []}
+
+        async def get_orderbook_snapshot(self, session: Any, code: str, market_div_code: str | None = None):
+            orderbook_seen.append(code)
+            return await self._tracked("orderbook", code)
+
+        async def get_program_net_buy(self, session: Any, code: str, market_div_code: str | None = None):
+            program_seen.append(code)
+            return await self._tracked("program", code)
+
+    clients = [_BoundedClient(calls=[]), _BoundedClient(calls=[])]
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=profile,
+            store=store,
+            clients=clients,
+            session_clock=clock,
+            now_fn=lambda: now,
+        )
+    )
+
+    # Then: both sweeps ran against the vendor under the shared 8-per-key bound
+    assert orderbook_seen and program_seen
+    assert state["max"] <= 8 * len(clients)
+    orderbook_entries = [e for e in manifest.entries if e.dataset == CaptureDataset.ORDERBOOK]
+    assert len(orderbook_entries) == len(auction_capture.close_rounds(clock, 60)) * 6
+
+
+def test_open_repass_observes_only_unresolved_symbols(tmp_path, monkeypatch) -> None:
+    """Pass 2 polls exactly the symbols still without an opening price."""
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    store = _store(tmp_path)
+    roster = ["000001", "000002", "000003", "000004", "000005"]
+    _publish_cohort(store, "2026-09-16", roster)
+    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=60)
+    clock = _clock("2026-09-17")
+    state = {"now": _seoul(2026, 9, 17, 8, 30)}
+
+    async def _sleep(seconds: float) -> None:
+        state["now"] += dt.timedelta(seconds=seconds)
+
+    client = _FakeClient(
+        calls=[],
+        price_seq={
+            "000001": [72000],
+            "000002": [72000],
+            "000003": [0, 72000],
+            "000004": [0, 72000],
+            "000005": [0, 72000],
+        },
+    )
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17", phase="open", profile=profile, store=store, clients=[client],
+            session_clock=clock, now_fn=lambda: state["now"], sleep_fn=_sleep,
+        )
+    )
+
+    # Then: pass 2 observes exactly the 3 symbols unresolved after pass 1, each once more
+    price_calls = [code for kind, code in client.calls if kind == "price"]
+    assert price_calls.count("000001") == 1
+    assert price_calls.count("000002") == 1
+    assert price_calls.count("000003") == 2
+    assert price_calls.count("000004") == 2
+    assert price_calls.count("000005") == 2
+    price_entries = [e for e in manifest.entries if e.dataset == CaptureDataset.PRICE]
+    assert len(price_entries) == 5
+    assert all(e.status == CaptureStatus.COMPLETE for e in price_entries)
+    assert manifest.status == CaptureStatus.COMPLETE

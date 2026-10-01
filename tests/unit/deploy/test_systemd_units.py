@@ -24,6 +24,7 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
+        "kca-kiwoom-token-rotate.service",
         "kca-paper-entry.service",
         "kca-paper-exit.service",
         "kca-predict.service",
@@ -219,6 +220,7 @@ def test_containerized_units_use_shared_image_and_new_env_file() -> None:
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
+        "kca-kiwoom-token-rotate.service",
         "kca-paper-entry.service",
         "kca-paper-exit.service",
         "kca-predict.service",
@@ -306,12 +308,17 @@ def test_kis_cache_mounted_only_for_units_using_kis_client() -> None:
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
+        "kca-kiwoom-token-rotate.service",
         "kca-paper-entry.service",
         "kca-paper-exit.service",
         "kca-predict.service",
         "kca-price-ingest.service",
         "kca-extended-backfill.service",
         "kca-aftermarket-book.service",
+        "kca-auction-open.service",
+        "kca-auction-close.service",
+        "kca-altdata-capture.service",
+        "kca-tape-sweep.service",
     )
     mount = "-v %h/.cache/kis:/app/.cache/kis"
     for name in needs_kis_cache:
@@ -378,6 +385,7 @@ def test_containerized_units_preserve_data_and_artifacts_mounts() -> None:
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
+        "kca-kiwoom-token-rotate.service",
         "kca-paper-entry.service",
         "kca-paper-exit.service",
         "kca-predict.service",
@@ -430,6 +438,7 @@ def test_containerized_units_have_no_unmeasured_resource_caps() -> None:
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
+        "kca-kiwoom-token-rotate.service",
         "kca-paper-entry.service",
         "kca-paper-exit.service",
         "kca-predict.service",
@@ -879,12 +888,17 @@ def test_kis_cache_mount_follows_non_root_home() -> None:
         "kca-collect.service",
         "kca-finalize-close.service",
         "kca-kis-token-warmup.service",
+        "kca-kiwoom-token-rotate.service",
         "kca-paper-entry.service",
         "kca-paper-exit.service",
         "kca-predict.service",
         "kca-price-ingest.service",
         "kca-extended-backfill.service",
         "kca-aftermarket-book.service",
+        "kca-auction-open.service",
+        "kca-auction-close.service",
+        "kca-altdata-capture.service",
+        "kca-tape-sweep.service",
     )
     for name in needs_kis_cache:
         text = (root / name).read_text(encoding="utf-8")
@@ -1044,6 +1058,7 @@ def test_budget_lines_are_commented() -> None:
         "kca-archive-intraday.service",
         "kca-price-ingest.service",
         "kca-kis-token-warmup.service",
+        "kca-kiwoom-token-rotate.service",
         "kca-daily-audit.service",
         "kca-retrain.service",
         "kca-altdata-capture.service",
@@ -1160,9 +1175,11 @@ def test_tape_sweep_unit_runs_after_evening_archive_outside_archive_slots() -> N
     assert "After=kca-archive-intraday.service" in service
     assert "src.daily.tick_tape_sweep" in service
 
-    # And: Kiwoom-only 작업이라 KIS 키풀 env·캐시를 물지 않는다
+    # And: Kiwoom-only 작업이라 KIS 키풀 env를 물지 않는다 (admission 공유 마운트는 유지)
     assert "--env-file %h/quant-secrets/kis-data.env" not in service
-    assert "-v %h/.cache/kis:/app/.cache/kis" not in service
+    assert "-v %h/.cache/kis:/app/.cache/kis" in service
+    assert "-e KIS_TOKEN_CACHE_DIR=/app/.cache/kis" in service
+    assert "-e BROKER_ADMISSION_CLASS=bulk" in service
 
     # And: 설치 스크립트가 타이머를 활성화하고 실패 스캔(kca-*)에 자동 포함된다
     assert "kca-tape-sweep.timer" in install_text
@@ -1177,3 +1194,103 @@ def test_backup_backstop_timeout_fits_shared_lock_window() -> None:
 
     # krx-host-backup이 최대 7200초 대기하므로 kca는 3시간 안에 락을 풀어야 한다
     assert _parse_systemd_duration(timeout) <= 3 * 3600
+
+
+def test_broker_units_mount_shared_admission_dir() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    broker_docker_units = (
+        "kca-collect.service",
+        "kca-predict.service",
+        "kca-auction-open.service",
+        "kca-auction-close.service",
+        "kca-finalize-close.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-kis-token-warmup.service",
+        "kca-kiwoom-token-rotate.service",
+        "kca-aftermarket-book.service",
+        "kca-archive-intraday-regular.service",
+        "kca-archive-intraday.service",
+        "kca-price-ingest.service",
+        "kca-altdata-capture.service",
+        "kca-extended-backfill.service",
+        "kca-tape-sweep.service",
+    )
+    for name in broker_docker_units:
+        text = (root / name).read_text(encoding="utf-8")
+        exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
+        assert "-v %h/.cache/kis:/app/.cache/kis" in exec_line, name
+        assert "-e KIS_TOKEN_CACHE_DIR=/app/.cache/kis" in exec_line, name
+
+
+def test_every_broker_unit_declares_its_admission_class() -> None:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    expected = {
+        "kca-collect.service": "critical",
+        "kca-predict.service": "critical",
+        "kca-auction-open.service": "critical",
+        "kca-auction-close.service": "critical",
+        "kca-finalize-close.service": "critical",
+        "kca-paper-entry.service": "critical",
+        "kca-paper-exit.service": "critical",
+        "kca-kis-token-warmup.service": "critical",
+        "kca-kiwoom-token-rotate.service": "critical",
+        "kca-aftermarket-book.service": "standard",
+        "kca-archive-intraday-regular.service": "standard",
+        "kca-archive-intraday.service": "standard",
+        "kca-price-ingest.service": "standard",
+        "kca-altdata-capture.service": "standard",
+        "kca-daily-audit.service": "standard",
+        "kca-extended-backfill.service": "bulk",
+        "kca-tape-sweep.service": "bulk",
+    }
+    for name, cls in expected.items():
+        text = (root / name).read_text(encoding="utf-8")
+        match = re.search(r"BROKER_ADMISSION_CLASS=([A-Za-z]+)", text)
+        assert match is not None, name
+        assert match.group(1) == cls, name
+
+
+def test_non_broker_units_stay_unmounted() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    for name in ("kca-retrain.service", "kca-backup.service", "kca-backup-prune.service", "kca-core-snapshot.service", "kca-offsite-verify.service"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "-v %h/.cache/kis:/app/.cache/kis" not in text, name
+        assert "BROKER_ADMISSION_CLASS=" not in text, name
+    assert "BROKER_ADMISSION_CLASS=" not in (root / "kca-alert@.service").read_text(encoding="utf-8")
+
+
+def test_install_script_creates_host_admission_marker() -> None:
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+    text = (base / "install_systemd.sh").read_text(encoding="utf-8")
+    assert "${HOME}/.cache/kis/.host-admission" in text
+    assert "${HOME}/.cache/kis" in text
+
+
+def test_kiwoom_token_rotate_unit_moves_expiry_out_of_decision_window() -> None:
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
+    root = base / "systemd"
+    timer = (root / "kca-kiwoom-token-rotate.timer").read_text(encoding="utf-8")
+    service = (root / "kca-kiwoom-token-rotate.service").read_text(encoding="utf-8")
+    install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
+
+    assert "OnCalendar=Mon..Fri 07:10:00 Asia/Seoul" in timer
+    assert "Persistent=true" in timer
+    assert "AccuracySec=1s" in timer
+    assert "Unit=kca-kiwoom-token-rotate.service" in timer
+    assert "src.tools.kiwoom_token_rotate" in service
+    assert "-v %h/.cache/kis:/app/.cache/kis" in service
+    assert "-e BROKER_ADMISSION_CLASS=critical" in service
+    assert "OnFailure=kca-alert@%n.service" in service
+    assert "kca-kiwoom-token-rotate.timer" in install_text

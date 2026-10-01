@@ -80,7 +80,7 @@ def _fake_client() -> SimpleNamespace:
     )
 
 
-async def _run_fetch_single_stock(client, **scenario_sets) -> tuple[dict, list[str], list[dict]]:
+async def _run_fetch_single_stock(client, **scenario_sets) -> tuple[dict, list[str]]:
     sem = asyncio.Semaphore(2)
     stock = {"code": "005930", "name": "삼성전자", "price": "10000", "chgrate": "1.0"}
     return await collect.fetch_single_stock(

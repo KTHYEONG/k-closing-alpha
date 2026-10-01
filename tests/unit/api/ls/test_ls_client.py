@@ -779,3 +779,97 @@ def test_ls_tick_fallback_budget_equals_chart_budget(monkeypatch) -> None:
 
     assert state["calls"] == 2
     assert res["termination_reason"] == "page_budget"
+
+
+def test_ls_spacing_enforced_across_instances(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from src.api.ls.client import LsApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_DIR", tmp_path)
+    (tmp_path / ".host-admission").touch()
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_REQUIRE_SHARED", "always")
+    monkeypatch.setattr(settings_instance, "LS_MIN_INTERVAL_SECONDS", 1.05)
+
+    send_times: list[float] = []
+
+    class _Resp:
+        status = 200
+        headers: dict = {}
+
+        async def json(self):
+            return {"rsp_cd": "00000", "t8412OutBlock": {}, "t8412OutBlock1": []}
+
+        async def __aenter__(self):
+            send_times.append(asyncio.get_running_loop().time())
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session:
+        def post(self, *a, **k):
+            return _Resp()
+
+    a = LsApiClient(app_key="k", app_secret="s")
+    b = LsApiClient(app_key="k", app_secret="s")
+    a.token = "t"
+    b.token = "t"
+
+    async def _run():
+        session = _Session()
+        await asyncio.gather(
+            a._post_tr(session, "t8412", "005930", {}),
+            b._post_tr(session, "t8412", "005930", {}),
+        )
+
+    asyncio.run(_run())
+    assert len(send_times) == 2
+    assert abs(send_times[1] - send_times[0]) >= 1.05 - 0.05
+
+
+def test_ls_shared_token_single_issuance(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from src.api.ls.client import LsApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_DIR", tmp_path)
+    (tmp_path / ".host-admission").touch()
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_REQUIRE_SHARED", "always")
+
+    calls = {"oauth": 0}
+
+    class _Resp:
+        status = 200
+        headers: dict = {}
+
+        def __init__(self, body):
+            self._b = body
+
+        async def json(self):
+            return self._b
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session:
+        def post(self, url, **kw):
+            if url.endswith("/oauth2/token"):
+                calls["oauth"] += 1
+                return _Resp({"access_token": "shared-tok", "expires_in": 86400})
+            return _Resp({"rsp_cd": "00000"})
+
+    a = LsApiClient(app_key="k", app_secret="s")
+    b = LsApiClient(app_key="k", app_secret="s")
+
+    async def _run():
+        session = _Session()
+        await asyncio.gather(a.ensure_token(session), b.ensure_token(session))
+
+    asyncio.run(_run())
+    assert calls["oauth"] == 1

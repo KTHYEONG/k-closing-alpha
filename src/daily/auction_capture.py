@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -155,6 +156,163 @@ async def _wait_until_scheduled(
     await sleeper(wait_seconds)
 
 
+async def _observe_roster(
+    *,
+    roster: Sequence[str],
+    clients: Sequence[Any],
+    semaphore: asyncio.Semaphore,
+    deadline: datetime,
+    now_fn: Callable[[], datetime],
+    observe: Callable[[int, str, Any], Awaitable[CoverageEntry]],
+    on_deadline: Callable[[int, str], CoverageEntry],
+) -> list[CoverageEntry]:
+    """Observe every roster symbol for one scheduled round with bounded concurrency.
+
+    A serial loop makes round duration proportional to roster size times round-trip
+    latency; with host-wide admission pacing the account, concurrency up to the per-key
+    bound lets a round finish at the account's documented rate instead.
+
+    Args:
+        roster: Ordered symbols; position selects the client (position % len(clients)).
+        clients: Research-slot data clients.
+        semaphore: Shared bound of COLLECTION_CONCURRENCY_PER_KEY * len(clients).
+        deadline: Dispatch cutoff for this round (next round start or phase end).
+        observe: Performs one symbol's request and persistence, returning its entry.
+        on_deadline: Builds the PARTIAL(reason="deadline") entry for an undispatched symbol.
+
+    Returns:
+        One entry per roster symbol, ordered by roster position.
+    """
+
+    async def _one(position: int, symbol: str) -> CoverageEntry:
+        async with semaphore:
+            if now_fn() >= deadline:
+                return on_deadline(position, symbol)
+            return await observe(position, symbol, clients[position % len(clients)])
+
+    return list(
+        await asyncio.gather(*(_one(position, symbol) for position, symbol in enumerate(roster)))
+    )
+
+
+def _program_deadline_entry(position: int, symbol: str, *, scheduled_at: datetime) -> CoverageEntry:
+    """PARTIAL deadline entry for a program symbol never dispatched in its round."""
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.PROGRAM,
+        venue="KRX",
+        session="regular",
+        scheduled_at=scheduled_at,
+        status=CaptureStatus.PARTIAL,
+        rows=0,
+        first_event_time=None,
+        last_event_time=None,
+        reason="deadline",
+        raw_refs=(),
+    )
+
+
+async def _observe_program_symbol(
+    position: int,
+    symbol: str,
+    client: Any,
+    *,
+    session: Any,
+    scheduled_at: datetime,
+    prog_index: int,
+    store: CaptureStore,
+    trading_day: date,
+    run_id: str,
+    cohort_id: str | None,
+    reason_tag: str,
+    now_fn: Callable[[], datetime],
+) -> CoverageEntry:
+    """Request and persist one symbol's program-trading snapshot for a scheduled round."""
+    started = now_fn()
+    try:
+        payload = await client.get_program_net_buy(session, symbol, market_div_code="J")
+    except Exception as exc:
+        received = now_fn()
+        return CoverageEntry(
+            symbol=symbol,
+            dataset=CaptureDataset.PROGRAM,
+            venue="KRX",
+            session="regular",
+            scheduled_at=scheduled_at,
+            status=CaptureStatus.FAILED,
+            rows=0,
+            first_event_time=started,
+            last_event_time=received,
+            reason=type(exc).__name__,
+            raw_refs=(),
+        )
+    received = now_fn()
+    body = dict(payload) if isinstance(payload, dict) else None
+    ok = isinstance(body, dict) and body.get("rt_cd") == "0"
+    context = CaptureContext(
+        trading_date=trading_day,
+        run_id=run_id,
+        dataset=CaptureDataset.PROGRAM,
+        vendor="kis",
+        endpoint="program-trade-by-stock",
+        symbol=symbol,
+        venue="KRX",
+        session="regular",
+        capture_reason=reason_tag,
+        cohort_id=cohort_id,
+        scheduled_at=scheduled_at,
+    )
+    try:
+        ref = store.append_response(
+            CapturedResponse(
+                context=context,
+                request_started_at=started,
+                received_at=received,
+                payload=body,
+                status=CaptureStatus.COMPLETE if ok else CaptureStatus.FAILED,
+                source_timestamp=None,
+                source_published_at=None,
+                page_index=1000 + prog_index,
+                attempt_index=0,
+                continuation={},
+                error_type=None if ok else "vendor_failure",
+            )
+        )
+    except OSError:
+        return CoverageEntry(
+            symbol=symbol,
+            dataset=CaptureDataset.PROGRAM,
+            venue="KRX",
+            session="regular",
+            scheduled_at=scheduled_at,
+            status=CaptureStatus.FAILED,
+            rows=0,
+            first_event_time=started,
+            last_event_time=received,
+            reason="persistence",
+            raw_refs=(),
+        )
+    frame_status = CaptureStatus.COMPLETE if ok else CaptureStatus.FAILED
+    try:
+        frame_context = context.model_copy(update={"run_id": f"{run_id}-g{prog_index}-{position}"})
+        store.publish_frame(_fragment_frame(symbol, scheduled_at, received, body), context=frame_context)
+    except OSError:
+        frame_status = CaptureStatus.PARTIAL
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.PROGRAM,
+        venue="KRX",
+        session="regular",
+        scheduled_at=scheduled_at,
+        status=frame_status,
+        rows=1 if ok else 0,
+        first_event_time=started,
+        last_event_time=received,
+        reason=reason_tag if frame_status == CaptureStatus.COMPLETE else ("persistence" if ok else "vendor_failure"),
+        raw_refs=(ref,),
+    )
+
+
 async def _capture_program_rounds(
     *,
     session: Any,
@@ -179,118 +337,296 @@ async def _capture_program_rounds(
             scheduled_at, now_fn=now_fn, sleeper=sleeper, injected_clock=injected_clock
         )
         deadline = rounds[prog_index + 1] if prog_index + 1 < len(rounds) else close_at
-        for position, symbol in enumerate(roster):
-            client = clients[position % len(clients)]
-            started = now_fn()
-            if started >= deadline:
-                entries.append(
-                    CoverageEntry(
-                        symbol=symbol,
-                        dataset=CaptureDataset.PROGRAM,
-                        venue="KRX",
-                        session="regular",
-                        scheduled_at=scheduled_at,
-                        status=CaptureStatus.PARTIAL,
-                        rows=0,
-                        first_event_time=None,
-                        last_event_time=None,
-                        reason="deadline",
-                        raw_refs=(),
-                    )
-                )
-                continue
-            async with semaphore:
-                try:
-                    payload = await client.get_program_net_buy(session, symbol, market_div_code="J")
-                except Exception as exc:
-                    received = now_fn()
-                    entries.append(
-                        CoverageEntry(
-                            symbol=symbol,
-                            dataset=CaptureDataset.PROGRAM,
-                            venue="KRX",
-                            session="regular",
-                            scheduled_at=scheduled_at,
-                            status=CaptureStatus.FAILED,
-                            rows=0,
-                            first_event_time=started,
-                            last_event_time=received,
-                            reason=type(exc).__name__,
-                            raw_refs=(),
-                        )
-                    )
-                    continue
-                received = now_fn()
-            body = dict(payload) if isinstance(payload, dict) else None
-            ok = isinstance(body, dict) and body.get("rt_cd") == "0"
-            context = CaptureContext(
-                trading_date=trading_day,
-                run_id=run_id,
-                dataset=CaptureDataset.PROGRAM,
-                vendor="kis",
-                endpoint="program-trade-by-stock",
-                symbol=symbol,
-                venue="KRX",
-                session="regular",
-                capture_reason=reason_tag,
-                cohort_id=cohort_id,
-                scheduled_at=scheduled_at,
-            )
-            try:
-                ref = store.append_response(
-                    CapturedResponse(
-                        context=context,
-                        request_started_at=started,
-                        received_at=received,
-                        payload=body,
-                        status=CaptureStatus.COMPLETE if ok else CaptureStatus.FAILED,
-                        source_timestamp=None,
-                        source_published_at=None,
-                        page_index=1000 + prog_index,
-                        attempt_index=0,
-                        continuation={},
-                        error_type=None if ok else "vendor_failure",
-                    )
-                )
-            except OSError:
-                entries.append(
-                    CoverageEntry(
-                        symbol=symbol,
-                        dataset=CaptureDataset.PROGRAM,
-                        venue="KRX",
-                        session="regular",
-                        scheduled_at=scheduled_at,
-                        status=CaptureStatus.FAILED,
-                        rows=0,
-                        first_event_time=started,
-                        last_event_time=received,
-                        reason="persistence",
-                        raw_refs=(),
-                    )
-                )
-                continue
-            frame_status = CaptureStatus.COMPLETE if ok else CaptureStatus.FAILED
-            try:
-                frame_context = context.model_copy(update={"run_id": f"{run_id}-g{prog_index}-{position}"})
-                store.publish_frame(_fragment_frame(symbol, scheduled_at, received, body), context=frame_context)
-            except OSError:
-                frame_status = CaptureStatus.PARTIAL
-            entries.append(
-                CoverageEntry(
-                    symbol=symbol,
-                    dataset=CaptureDataset.PROGRAM,
-                    venue="KRX",
-                    session="regular",
+        entries.extend(
+            await _observe_roster(
+                roster=roster,
+                clients=clients,
+                semaphore=semaphore,
+                deadline=deadline,
+                now_fn=now_fn,
+                observe=functools.partial(
+                    _observe_program_symbol,
+                    session=session,
                     scheduled_at=scheduled_at,
-                    status=frame_status,
-                    rows=1 if ok else 0,
-                    first_event_time=started,
-                    last_event_time=received,
-                    reason=reason_tag if frame_status == CaptureStatus.COMPLETE else ("persistence" if ok else "vendor_failure"),
-                    raw_refs=(ref,),
-                )
+                    prog_index=prog_index,
+                    store=store,
+                    trading_day=trading_day,
+                    run_id=run_id,
+                    cohort_id=cohort_id,
+                    reason_tag=reason_tag,
+                    now_fn=now_fn,
+                ),
+                on_deadline=functools.partial(_program_deadline_entry, scheduled_at=scheduled_at),
             )
+        )
     return entries
+
+
+def _orderbook_deadline_entry(position: int, symbol: str, *, scheduled_at: datetime) -> CoverageEntry:
+    """PARTIAL deadline entry for an orderbook symbol never dispatched in its round."""
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.ORDERBOOK,
+        venue="KRX",
+        session="regular",
+        scheduled_at=scheduled_at,
+        status=CaptureStatus.PARTIAL,
+        rows=0,
+        first_event_time=None,
+        last_event_time=None,
+        reason="deadline",
+        raw_refs=(),
+    )
+
+
+async def _observe_orderbook_symbol(
+    position: int,
+    symbol: str,
+    client: Any,
+    *,
+    session: Any,
+    scheduled_at: datetime,
+    page_index: int,
+    deadline: datetime,
+    store: CaptureStore,
+    trading_day: date,
+    run_id: str,
+    cohort_id: str | None,
+    reason_tag: str,
+    phase: str,
+    now_fn: Callable[[], datetime],
+    degraded: list[str],
+) -> CoverageEntry:
+    """Request and persist one symbol's orderbook snapshot for a scheduled round."""
+    started = now_fn()
+    try:
+        payload = await client.get_orderbook_snapshot(session, symbol, market_div_code="J")
+    except Exception as exc:
+        received = now_fn()
+        degraded.append(symbol)
+        return CoverageEntry(
+            symbol=symbol,
+            dataset=CaptureDataset.ORDERBOOK,
+            venue="KRX",
+            session="regular",
+            scheduled_at=scheduled_at,
+            status=CaptureStatus.FAILED,
+            rows=0,
+            first_event_time=started,
+            last_event_time=received,
+            reason=type(exc).__name__,
+            raw_refs=(),
+        )
+    received = now_fn()
+    body = dict(payload) if isinstance(payload, dict) else None
+    ok = isinstance(body, dict) and body.get("rt_cd") == "0"
+    context = CaptureContext(
+        trading_date=trading_day,
+        run_id=run_id,
+        dataset=CaptureDataset.ORDERBOOK,
+        vendor="kis",
+        endpoint="inquire-asking-price-exp-ccn",
+        symbol=symbol,
+        venue="KRX",
+        session="regular",
+        capture_reason=reason_tag,
+        cohort_id=cohort_id,
+        scheduled_at=scheduled_at,
+    )
+    try:
+        ref = store.append_response(
+            CapturedResponse(
+                context=context,
+                request_started_at=started,
+                received_at=received,
+                payload=body,
+                status=CaptureStatus.COMPLETE if ok else CaptureStatus.FAILED,
+                source_timestamp=None,
+                source_published_at=None,
+                page_index=page_index,
+                attempt_index=0,
+                continuation={},
+                error_type=None if ok else "vendor_failure",
+            )
+        )
+    except OSError:
+        degraded.append(symbol)
+        return CoverageEntry(
+            symbol=symbol,
+            dataset=CaptureDataset.ORDERBOOK,
+            venue="KRX",
+            session="regular",
+            scheduled_at=scheduled_at,
+            status=CaptureStatus.FAILED,
+            rows=0,
+            first_event_time=started,
+            last_event_time=received,
+            reason="persistence",
+            raw_refs=(),
+        )
+    late = received > deadline
+    if late:
+        degraded.append(symbol)
+        logger.warning(
+            "[DATA] stage=auction_capture status=LATE phase=%s symbol=%s scheduled=%s received=%s",
+            phase,
+            symbol,
+            scheduled_at.isoformat(),
+            received.isoformat(),
+        )
+    try:
+        frame_context = context.model_copy(update={"run_id": f"{run_id}-r{page_index}-{position}"})
+        store.publish_frame(_fragment_frame(symbol, scheduled_at, received, body), context=frame_context)
+    except OSError:
+        degraded.append(symbol)
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.ORDERBOOK,
+        venue="KRX",
+        session="regular",
+        scheduled_at=scheduled_at,
+        status=CaptureStatus.COMPLETE if ok and not late else CaptureStatus.PARTIAL,
+        rows=1 if ok else 0,
+        first_event_time=started,
+        last_event_time=received,
+        reason=reason_tag if ok and not late else ("deadline" if late else "vendor_failure"),
+        raw_refs=(ref,),
+    )
+
+
+async def _observe_open_symbol(
+    position: int,
+    symbol: str,
+    client: Any,
+    *,
+    session: Any,
+    floor: datetime,
+    store: CaptureStore,
+    trading_day: date,
+    run_id: str,
+    cohort_id: str | None,
+    reason_tag: str,
+    now_fn: Callable[[], datetime],
+    attempt: int,
+    poll_started: dict[str, datetime],
+    last_seen: dict[str, tuple[Any, datetime]],
+    settled: set[int],
+    degraded: list[str],
+) -> CoverageEntry:
+    """Poll one symbol's opening price; unresolved symbols return a provisional entry for re-pass."""
+    started_at = poll_started.setdefault(symbol, now_fn())
+    payload = await client.get_current_price(session, symbol, market_div_code="J")
+    received = now_fn()
+    body = dict(payload) if isinstance(payload, dict) else None
+    price = _extract_open_price(body)
+    context = CaptureContext(
+        trading_date=trading_day,
+        run_id=run_id,
+        dataset=CaptureDataset.PRICE,
+        vendor="kis",
+        endpoint="inquire-price",
+        symbol=symbol,
+        venue="KRX",
+        session="regular",
+        capture_reason=reason_tag,
+        cohort_id=cohort_id,
+        scheduled_at=floor,
+    )
+    try:
+        ref = store.append_response(
+            CapturedResponse(
+                context=context,
+                request_started_at=started_at,
+                received_at=received,
+                payload=body,
+                status=CaptureStatus.COMPLETE if price > 0 else CaptureStatus.FAILED,
+                source_timestamp=None,
+                source_published_at=None,
+                page_index=position,
+                attempt_index=attempt,
+                continuation={},
+                error_type=None if price > 0 else "open_unresolved",
+            )
+        )
+    except OSError:
+        degraded.append(symbol)
+        settled.add(position)
+        return CoverageEntry(
+            symbol=symbol,
+            dataset=CaptureDataset.PRICE,
+            venue="KRX",
+            session="regular",
+            scheduled_at=floor,
+            status=CaptureStatus.FAILED,
+            rows=0,
+            first_event_time=started_at,
+            last_event_time=received,
+            reason="persistence",
+            raw_refs=(),
+        )
+    try:
+        frame_context = context.model_copy(update={"run_id": f"{run_id}-o{position}-{attempt}"})
+        store.publish_frame(_fragment_frame(symbol, floor, received, body), context=frame_context)
+    except OSError:
+        degraded.append(symbol)
+    if price > 0:
+        settled.add(position)
+        return CoverageEntry(
+            symbol=symbol,
+            dataset=CaptureDataset.PRICE,
+            venue="KRX",
+            session="regular",
+            scheduled_at=floor,
+            status=CaptureStatus.COMPLETE,
+            rows=1,
+            first_event_time=started_at,
+            last_event_time=received,
+            reason=reason_tag,
+            raw_refs=(ref,),
+        )
+    last_seen[symbol] = (ref, received)
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.PRICE,
+        venue="KRX",
+        session="regular",
+        scheduled_at=floor,
+        status=CaptureStatus.PARTIAL,
+        rows=0,
+        first_event_time=started_at,
+        last_event_time=received,
+        reason="open_unresolved",
+        raw_refs=(ref,),
+    )
+
+
+def _open_deadline_entry(
+    position: int,
+    symbol: str,
+    *,
+    floor: datetime,
+    now_fn: Callable[[], datetime],
+    poll_started: dict[str, datetime],
+    last_seen: dict[str, tuple[Any, datetime]],
+    settled: set[int],
+) -> CoverageEntry:
+    """Final PARTIAL entry for an open symbol never dispatched before confirmation end."""
+    settled.add(position)
+    moment = last_seen.get(symbol)
+    seen_at = moment[1] if moment is not None else now_fn()
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.PRICE,
+        venue="KRX",
+        session="regular",
+        scheduled_at=floor,
+        status=CaptureStatus.PARTIAL,
+        rows=0,
+        first_event_time=poll_started.get(symbol, seen_at),
+        last_event_time=seen_at,
+        reason="open_unresolved",
+        raw_refs=(moment[0],) if moment is not None else (),
+    )
 
 
 async def run_auction_capture(
@@ -356,7 +692,7 @@ async def run_auction_capture(
         phase_end = session_clock.open_at + timedelta(seconds=int(profile.COLLECTION_OPEN_CONFIRM_SECONDS))
     run_id = f"auction-{phase}-{snapshot_date}-{uuid.uuid4().hex[:8]}"
     reason_tag = f"auction-{phase}"
-    sem = asyncio.Semaphore(int(profile.COLLECTION_CONCURRENCY_PER_KEY))
+    sem = asyncio.Semaphore(int(profile.COLLECTION_CONCURRENCY_PER_KEY) * len(clients))
     entries: list[CoverageEntry] = []
     incomplete = bool(cohort_incomplete)
     first_client: Any = clients[0]
@@ -412,130 +748,33 @@ async def run_auction_capture(
                     for symbol in roster
                 )
                 continue
-            for position, symbol in enumerate(roster):
-                client: Any = clients[position % len(clients)]
-                started = now_clock()
-                remaining = (deadline - started).total_seconds()
-                if remaining <= 0:
-                    incomplete = True
-                    entries.append(
-                        CoverageEntry(
-                            symbol=symbol,
-                            dataset=CaptureDataset.ORDERBOOK,
-                            venue="KRX",
-                            session="regular",
-                            scheduled_at=scheduled_at,
-                            status=CaptureStatus.PARTIAL,
-                            rows=0,
-                            first_event_time=None,
-                            last_event_time=None,
-                            reason="deadline",
-                            raw_refs=(),
-                        )
-                    )
-                    continue
-                async with sem:
-                    try:
-                        payload = await client.get_orderbook_snapshot(broker_session, symbol, market_div_code="J")
-                    except Exception as exc:
-                        received = now_clock()
-                        incomplete = True
-                        entries.append(
-                            CoverageEntry(
-                                symbol=symbol,
-                                dataset=CaptureDataset.ORDERBOOK,
-                                venue="KRX",
-                                session="regular",
-                                scheduled_at=scheduled_at,
-                                status=CaptureStatus.FAILED,
-                                rows=0,
-                                first_event_time=started,
-                                last_event_time=received,
-                                reason=type(exc).__name__,
-                                raw_refs=(),
-                            )
-                        )
-                        continue
-                    received = now_clock()
-                body = dict(payload) if isinstance(payload, dict) else None
-                ok = isinstance(body, dict) and body.get("rt_cd") == "0"
-                context = CaptureContext(
-                    trading_date=trading_day,
-                    run_id=run_id,
-                    dataset=CaptureDataset.ORDERBOOK,
-                    vendor="kis",
-                    endpoint="inquire-asking-price-exp-ccn",
-                    symbol=symbol,
-                    venue="KRX",
-                    session="regular",
-                    capture_reason=reason_tag,
-                    cohort_id=cohort_id,
+            degraded: list[str] = []
+            round_entries = await _observe_roster(
+                roster=roster,
+                clients=clients,
+                semaphore=sem,
+                deadline=deadline,
+                now_fn=now_clock,
+                observe=functools.partial(
+                    _observe_orderbook_symbol,
+                    session=broker_session,
                     scheduled_at=scheduled_at,
-                )
-                try:
-                    ref = store.append_response(
-                        CapturedResponse(
-                            context=context,
-                            request_started_at=started,
-                            received_at=received,
-                            payload=body,
-                            status=CaptureStatus.COMPLETE if ok else CaptureStatus.FAILED,
-                            source_timestamp=None,
-                            source_published_at=None,
-                            page_index=index,
-                            attempt_index=0,
-                            continuation={},
-                            error_type=None if ok else "vendor_failure",
-                        )
-                    )
-                except OSError:
-                    incomplete = True
-                    entries.append(
-                        CoverageEntry(
-                            symbol=symbol,
-                            dataset=CaptureDataset.ORDERBOOK,
-                            venue="KRX",
-                            session="regular",
-                            scheduled_at=scheduled_at,
-                            status=CaptureStatus.FAILED,
-                            rows=0,
-                            first_event_time=started,
-                            last_event_time=received,
-                            reason="persistence",
-                            raw_refs=(),
-                        )
-                    )
-                    continue
-                late = received > deadline
-                if late:
-                    incomplete = True
-                    logger.warning(
-                        "[DATA] stage=auction_capture status=LATE phase=%s symbol=%s scheduled=%s received=%s",
-                        phase,
-                        symbol,
-                        scheduled_at.isoformat(),
-                        received.isoformat(),
-                    )
-                try:
-                    frame_context = context.model_copy(update={"run_id": f"{run_id}-r{index}-{position}"})
-                    store.publish_frame(_fragment_frame(symbol, scheduled_at, received, body), context=frame_context)
-                except OSError:
-                    incomplete = True
-                entries.append(
-                    CoverageEntry(
-                        symbol=symbol,
-                        dataset=CaptureDataset.ORDERBOOK,
-                        venue="KRX",
-                        session="regular",
-                        scheduled_at=scheduled_at,
-                        status=CaptureStatus.COMPLETE if ok and not late else CaptureStatus.PARTIAL,
-                        rows=1 if ok else 0,
-                        first_event_time=started,
-                        last_event_time=received,
-                        reason=reason_tag if ok and not late else ("deadline" if late else "vendor_failure"),
-                        raw_refs=(ref,),
-                    )
-                )
+                    page_index=index,
+                    deadline=deadline,
+                    store=store,
+                    trading_day=trading_day,
+                    run_id=run_id,
+                    cohort_id=cohort_id,
+                    reason_tag=reason_tag,
+                    phase=phase,
+                    now_fn=now_clock,
+                    degraded=degraded,
+                ),
+                on_deadline=functools.partial(_orderbook_deadline_entry, scheduled_at=scheduled_at),
+            )
+            entries.extend(round_entries)
+            if degraded or any(entry.status is not CaptureStatus.COMPLETE for entry in round_entries):
+                incomplete = True
         if phase == "close":
             if program_task is not None:
                 program_entries = await program_task
@@ -556,90 +795,53 @@ async def run_auction_capture(
             last_seen: dict[str, tuple[Any, datetime]] = {}
             attempt = 0
             while pending and now_clock() <= confirm_end:
-                unresolved: list[tuple[int, str]] = []
-                for position, symbol in pending:
-                    if now_clock() > confirm_end:
-                        unresolved.append((position, symbol))
-                        continue
-                    client = clients[position % len(clients)]
-                    started_at = poll_started.setdefault(symbol, now_clock())
-                    async with sem:
-                        payload = await client.get_current_price(broker_session, symbol, market_div_code="J")
-                    received = now_clock()
-                    body = dict(payload) if isinstance(payload, dict) else None
-                    price = _extract_open_price(body)
-                    context = CaptureContext(
-                        trading_date=trading_day,
+                pass_symbols = [symbol for _, symbol in pending]
+                settled: set[int] = set()
+                pass_degraded: list[str] = []
+                round_entries = await _observe_roster(
+                    roster=pass_symbols,
+                    clients=clients,
+                    semaphore=sem,
+                    deadline=confirm_end,
+                    now_fn=now_clock,
+                    observe=functools.partial(
+                        _observe_open_symbol,
+                        session=broker_session,
+                        floor=floor,
+                        store=store,
+                        trading_day=trading_day,
                         run_id=run_id,
-                        dataset=CaptureDataset.PRICE,
-                        vendor="kis",
-                        endpoint="inquire-price",
-                        symbol=symbol,
-                        venue="KRX",
-                        session="regular",
-                        capture_reason=reason_tag,
                         cohort_id=cohort_id,
-                        scheduled_at=floor,
-                    )
-                    try:
-                        ref = store.append_response(
-                            CapturedResponse(
-                                context=context,
-                                request_started_at=started_at,
-                                received_at=received,
-                                payload=body,
-                                status=CaptureStatus.COMPLETE if price > 0 else CaptureStatus.FAILED,
-                                source_timestamp=None,
-                                source_published_at=None,
-                                page_index=position,
-                                attempt_index=attempt,
-                                continuation={},
-                                error_type=None if price > 0 else "open_unresolved",
-                            )
-                        )
-                    except OSError:
-                        incomplete = True
-                        entries.append(
-                            CoverageEntry(
-                                symbol=symbol,
-                                dataset=CaptureDataset.PRICE,
-                                venue="KRX",
-                                session="regular",
-                                scheduled_at=floor,
-                                status=CaptureStatus.FAILED,
-                                rows=0,
-                                first_event_time=started_at,
-                                last_event_time=received,
-                                reason="persistence",
-                                raw_refs=(),
-                            )
-                        )
-                        continue
-                    try:
-                        frame_context = context.model_copy(update={"run_id": f"{run_id}-o{position}-{attempt}"})
-                        store.publish_frame(_fragment_frame(symbol, floor, received, body), context=frame_context)
-                    except OSError:
-                        incomplete = True
-                    if price > 0:
-                        entries.append(
-                            CoverageEntry(
-                                symbol=symbol,
-                                dataset=CaptureDataset.PRICE,
-                                venue="KRX",
-                                session="regular",
-                                scheduled_at=floor,
-                                status=CaptureStatus.COMPLETE,
-                                rows=1,
-                                first_event_time=started_at,
-                                last_event_time=received,
-                                reason=reason_tag,
-                                raw_refs=(ref,),
-                            )
-                        )
-                        continue
-                    last_seen[symbol] = (ref, received)
-                    unresolved.append((position, symbol))
-                pending = unresolved
+                        reason_tag=reason_tag,
+                        now_fn=now_clock,
+                        attempt=attempt,
+                        poll_started=poll_started,
+                        last_seen=last_seen,
+                        settled=settled,
+                        degraded=pass_degraded,
+                    ),
+                    on_deadline=functools.partial(
+                        _open_deadline_entry,
+                        floor=floor,
+                        now_fn=now_clock,
+                        poll_started=poll_started,
+                        last_seen=last_seen,
+                        settled=settled,
+                    ),
+                )
+                next_pending: list[tuple[int, str]] = []
+                for pass_index, ((orig_position, symbol), entry) in enumerate(zip(pending, round_entries)):
+                    if pass_index in settled:
+                        entries.append(entry)
+                    else:
+                        next_pending.append((orig_position, symbol))
+                if pass_degraded or any(
+                    entry.status is not CaptureStatus.COMPLETE
+                    for pass_index, entry in enumerate(round_entries)
+                    if pass_index in settled
+                ):
+                    incomplete = True
+                pending = next_pending
                 if pending:
                     attempt += 1
                     await sleeper(1.0)

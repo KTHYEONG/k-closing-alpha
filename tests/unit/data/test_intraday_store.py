@@ -112,7 +112,7 @@ def test_log_session_coverage_outliers_flags_symbol_below_peer_ratio(caplog) -> 
     from src.data import intraday_store
 
     # Given: symbol A has 10 bars (peer max), symbol B has only 3 (30% of peer max, below default 0.8)
-    merged = pd.DataFrame({"symbol": ["A"] * 10 + ["B"] * 3})
+    merged = pd.DataFrame({"symbol": ["A"] * 10 + ["000002"] * 3})
 
     # When
     with caplog.at_level(logging.WARNING, logger=intraday_store.logger.name):
@@ -120,7 +120,7 @@ def test_log_session_coverage_outliers_flags_symbol_below_peer_ratio(caplog) -> 
 
     # Then
     assert report == {"n_symbols": 2, "n_low_coverage": 1, "n_truncated": 0}
-    assert any("session_coverage" in rec.message and "B" in rec.message for rec in caplog.records)
+    assert any("session_coverage" in rec.message and "000002" in rec.message for rec in caplog.records)
 
 
 def test_log_session_coverage_outliers_returns_zero_when_all_symbols_at_peer_level(caplog) -> None:
@@ -131,7 +131,7 @@ def test_log_session_coverage_outliers_returns_zero_when_all_symbols_at_peer_lev
     from src.data import intraday_store
 
     # Given: three symbols, all with identical bar counts (a healthy, fully-collected batch)
-    merged = pd.DataFrame({"symbol": ["A"] * 5 + ["B"] * 5 + ["C"] * 5})
+    merged = pd.DataFrame({"symbol": ["A"] * 5 + ["000002"] * 5 + ["C"] * 5})
 
     # When
     with caplog.at_level(logging.WARNING, logger=intraday_store.logger.name):
@@ -162,7 +162,7 @@ def test_log_session_coverage_outliers_respects_custom_min_peer_ratio_boundary()
 
     # Given: peer max = 10; B sits exactly at 80% (8, must NOT be flagged -- strict less-than),
     # C sits just below (7, MUST be flagged), under an explicit min_peer_ratio=0.8
-    merged = pd.DataFrame({"symbol": ["A"] * 10 + ["B"] * 8 + ["C"] * 7})
+    merged = pd.DataFrame({"symbol": ["A"] * 10 + ["000002"] * 8 + ["C"] * 7})
 
     # When
     report = intraday_store.log_session_coverage_outliers(merged, 1, "2026-09-11", "regular", min_peer_ratio=0.8)
@@ -221,7 +221,7 @@ def test_log_session_coverage_outliers_does_not_flag_full_range_scattered_gaps()
     # (below the 0.8 peer-ratio threshold) but its first and last bar still match A's
     # floor/ceiling -- scattered internal gaps only, not a truncated session
     merged = pd.DataFrame({
-        "symbol": ["A"] * 12 + ["B"] * 5,
+        "symbol": ["A"] * 12 + ["000002"] * 5,
         "ts_hms": (
             [90000, 90100, 90200, 90300, 100000, 110000, 120000, 130000, 140000, 150000, 152900, 153000]  # noqa: RUF005 - contract skeleton verbatim
             + [90000, 100000, 120000, 140000, 153000]
@@ -537,8 +537,13 @@ def test_write_tick_partition_empty_frame_preserves_trades(tmp_path: Path, monke
     assert total_none == 1
     stored = pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))
     assert len(stored) == 1
-    cleared = intraday_store.write_tick_partition(
+    rejected = intraday_store.write_tick_partition(
         pd.DataFrame(), date, "regular", coverage={"005930": _tick_entry("005930", status="NO_TRADES")}  # type: ignore[arg-type]
+    )
+    assert rejected == 1
+    cleared = intraday_store.write_tick_partition(
+        pd.DataFrame(), date, "regular", coverage={"005930": _tick_entry("005930", status="NO_TRADES")},  # type: ignore[arg-type]
+        allow_shrink_symbols=frozenset({"005930"}),
     )
     assert cleared == 0
     target = intraday_store.tick_partition_path(date, "regular")
@@ -722,12 +727,12 @@ def test_write_partitions_handle_storage_boundaries(tmp_path: Path, monkeypatch:
     intraday_store.write_tick_partition(old_with_b, date, "regular", coverage={"005930": _tick_entry("005930"), "000660": _tick_entry("000660")})  # type: ignore[arg-type]
     new_a_only = _tick_rows("005930", date, [("090320", 70200, 5)])
     mixed_cov = {"005930": _tick_entry("005930"), "000660": _tick_entry("000660", status="NO_TRADES")}
-    total = intraday_store.write_tick_partition(new_a_only, date, "regular", coverage=mixed_cov)  # type: ignore[arg-type]
+    total = intraday_store.write_tick_partition(new_a_only, date, "regular", coverage=mixed_cov, allow_shrink_symbols=frozenset({"000660"}))  # type: ignore[arg-type]
     assert total == 1
     assert pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))["symbol"].tolist() == ["005930"]
     assert intraday_store.write_intraday_partition(pd.DataFrame(), 1, "2026-09-21", "regular") == 0
     assert intraday_store.write_intraday_partition(pd.DataFrame(), 1, date, "regular", coverage={"005930": _bar_entry("005930")}) == 0  # type: ignore[arg-type]
-    bar_gone = intraday_store.write_intraday_partition(pd.DataFrame(), 1, "2026-09-22", "regular", coverage={"005930": _bar_entry("005930", status="NO_TRADES")})  # type: ignore[arg-type]
+    bar_gone = intraday_store.write_intraday_partition(pd.DataFrame(), 1, "2026-09-22", "regular", coverage={"005930": _bar_entry("005930", status="NO_TRADES")}, allow_shrink_symbols=frozenset({"005930"}))  # type: ignore[arg-type]
     assert bar_gone == 0
 
 
@@ -741,9 +746,213 @@ def test_tick_write_with_stale_sidecar_succeeds_and_leaves_no_lock(tmp_path: Pat
     more = _tick_rows("000660", date, [("090310", 50000, 1)])
     assert intraday_store.write_tick_partition(more, date, "regular", coverage={"000660": _tick_entry("000660")}) == 2  # type: ignore[arg-type]
     assert list(target.parent.glob("*.lock")) == []
-    vacated = intraday_store.write_tick_partition(pd.DataFrame(), date, "regular", coverage={"005930": _tick_entry("005930", status="NO_TRADES")})  # type: ignore[arg-type]
+    vacated = intraday_store.write_tick_partition(pd.DataFrame(), date, "regular", coverage={"005930": _tick_entry("005930", status="NO_TRADES")}, allow_shrink_symbols=frozenset({"005930"}))  # type: ignore[arg-type]
     assert vacated == 1
     assert list(target.parent.glob("*.lock")) == []
+
+
+def _tick_n_rows(symbol: str, snapshot_date: str, n: int, start_sec: int = 0) -> pd.DataFrame:
+    rows = []
+    for i in range(n):
+        total = start_sec + i
+        rows.append((f"09{(total // 60):02d}{(total % 60):02d}", 70000 + (i % 50), 10))
+    return _tick_rows(symbol, snapshot_date, rows)
+
+
+def _bar_n_rows(symbol: str, snapshot_date: str, n: int) -> pd.DataFrame:
+    import pandas as pd
+
+    parts = []
+    for i in range(n):
+        total = i
+        parts.append(_canon_bar_at(symbol, snapshot_date, f"09{(total // 60):02d}{(total % 60):02d}", 70000 + (i % 50)))
+    return pd.concat(parts, ignore_index=True)
+
+
+def _quarantine_files(tmp_path: Path):
+    return list((tmp_path / "capture" / "quarantine" / "shrink").rglob("*.parquet"))
+
+
+def test_certified_shrink_rejected_and_quarantined(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    import logging
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-14"
+    stored = _tick_n_rows("000001", date, 57)
+    intraday_store.write_tick_partition(stored, date, "regular", coverage={"000001": _tick_entry("000001")})  # type: ignore[arg-type]
+    assert len(__import__("pandas").read_parquet(intraday_store.tick_partition_path(date, "regular"))) == 57
+    before_q = set(_quarantine_files(tmp_path))
+    incoming = _tick_n_rows("000001", date, 56)
+    with caplog.at_level(logging.WARNING, logger=intraday_store.logger.name):
+        total = intraday_store.write_tick_partition(incoming, date, "regular", coverage={"000001": _tick_entry("000001")})  # type: ignore[arg-type]
+    assert total == 57
+    kept = __import__("pandas").read_parquet(intraday_store.tick_partition_path(date, "regular"))
+    assert len(kept) == 57
+    assert set(kept["symbol"].tolist()) == {"000001"}
+    assert any("SHRINK_REJECTED" in rec.message and "symbol=000001" in rec.message for rec in caplog.records)
+    after_q = [p for p in _quarantine_files(tmp_path) if p not in before_q]
+    assert len(after_q) == 1
+    assert len(__import__("pandas").read_parquet(after_q[0])) == 56
+
+
+def test_mixed_batch_replaces_only_safe_symbols(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import pandas as pd
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-14"
+    stored = pd.concat([_tick_n_rows("000001", date, 10), _tick_n_rows("000002", date, 5)], ignore_index=True)
+    intraday_store.write_tick_partition(
+        stored, date, "regular",
+        coverage={"000001": _tick_entry("000001"), "000002": _tick_entry("000002")},  # type: ignore[arg-type]
+    )
+    incoming = pd.concat([_tick_n_rows("000001", date, 8), _tick_n_rows("000002", date, 7)], ignore_index=True)
+    total = intraday_store.write_tick_partition(
+        incoming, date, "regular",
+        coverage={"000001": _tick_entry("000001"), "000002": _tick_entry("000002")},  # type: ignore[arg-type]
+    )
+    assert total == 10 + 7
+    kept = pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))
+    assert len(kept[kept["symbol"] == "000001"]) == 10
+    assert len(kept[kept["symbol"] == "000002"]) == 7
+
+
+def test_no_trades_deleting_real_rows_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    import logging
+    import pandas as pd
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-14"
+    stored = _tick_n_rows("000001", date, 10)
+    intraday_store.write_tick_partition(stored, date, "regular", coverage={"000001": _tick_entry("000001")})  # type: ignore[arg-type]
+    with caplog.at_level(logging.WARNING, logger=intraday_store.logger.name):
+        total = intraday_store.write_tick_partition(
+            pd.DataFrame(), date, "regular",
+            coverage={"000001": _tick_entry("000001", status="NO_TRADES")},  # type: ignore[arg-type]
+        )
+    assert total == 10
+    assert len(pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))) == 10
+    assert any("SHRINK_REJECTED" in rec.message for rec in caplog.records)
+
+
+def test_explicit_allowance_proceeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    import logging
+    import pandas as pd
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-14"
+    stored = _tick_n_rows("000001", date, 10)
+    intraday_store.write_tick_partition(stored, date, "regular", coverage={"000001": _tick_entry("000001")})  # type: ignore[arg-type]
+    incoming = _tick_n_rows("000001", date, 8)
+    with caplog.at_level(logging.INFO, logger=intraday_store.logger.name):
+        total = intraday_store.write_tick_partition(
+            incoming, date, "regular", coverage={"000001": _tick_entry("000001")},  # type: ignore[arg-type]
+            allow_shrink_symbols=frozenset({"000001"}),
+        )
+    assert total == 8
+    assert len(pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))) == 8
+    assert any("SHRINK_ALLOWED" in rec.message for rec in caplog.records)
+
+
+def test_all_rejected_leaves_file_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-14"
+    stored = _tick_n_rows("000001", date, 10)
+    intraday_store.write_tick_partition(stored, date, "regular", coverage={"000001": _tick_entry("000001")})  # type: ignore[arg-type]
+    target = intraday_store.tick_partition_path(date, "regular")
+    before_bytes = target.read_bytes()
+    before_mtime = target.stat().st_mtime_ns
+    backups_before = set((tmp_path / "capture" / "backups").rglob("*.parquet"))
+    incoming = _tick_n_rows("000001", date, 9)
+    total = intraday_store.write_tick_partition(incoming, date, "regular", coverage={"000001": _tick_entry("000001")})  # type: ignore[arg-type]
+    assert total == 10
+    assert target.read_bytes() == before_bytes
+    assert target.stat().st_mtime_ns == before_mtime
+    assert set((tmp_path / "capture" / "backups").rglob("*.parquet")) == backups_before
+
+
+def test_growth_path_unchanged_with_backup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import pandas as pd
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-14"
+    stored = _tick_n_rows("000001", date, 10)
+    intraday_store.write_tick_partition(stored, date, "regular", coverage={"000001": _tick_entry("000001")})  # type: ignore[arg-type]
+    backups_before = set((tmp_path / "capture" / "backups").rglob("*.parquet"))
+    incoming = _tick_n_rows("000001", date, 12)
+    total = intraday_store.write_tick_partition(incoming, date, "regular", coverage={"000001": _tick_entry("000001")})  # type: ignore[arg-type]
+    assert total == 12
+    assert len(pd.read_parquet(intraday_store.tick_partition_path(date, "regular"))) == 12
+    assert len(set((tmp_path / "capture" / "backups").rglob("*.parquet")) - backups_before) >= 1
+
+
+def test_bars_obey_same_shrink_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    import logging
+    import pandas as pd
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-14"
+    stored = _bar_n_rows("000001", date, 57)
+    intraday_store.write_intraday_partition(stored, 1, date, "regular", coverage={"000001": _bar_entry("000001")})  # type: ignore[arg-type]
+    incoming = _bar_n_rows("000001", date, 56)
+    with caplog.at_level(logging.WARNING, logger=intraday_store.logger.name):
+        total = intraday_store.write_intraday_partition(incoming, 1, date, "regular", coverage={"000001": _bar_entry("000001")})  # type: ignore[arg-type]
+    assert total == 57
+    assert len(pd.read_parquet(intraday_store.intraday_partition_path(1, date, "regular"))) == 57
+    assert any("SHRINK_REJECTED" in rec.message for rec in caplog.records)
+
+
+def test_remove_intraday_symbols_explicit_shrink_proceeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import pandas as pd
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-14"
+    stored = _tick_n_rows("000001", date, 3)
+    intraday_store.write_tick_partition(stored, date, "regular", coverage={"000001": _tick_entry("000001")})  # type: ignore[arg-type]
+    # Bars removal path carries an explicit operator allowance so a known-bad symbol is dropped.
+    bars = _bar_n_rows("000001", date, 3)
+    intraday_store.write_intraday_partition(bars, 1, date, "regular", coverage={"000001": _bar_entry("000001")})  # type: ignore[arg-type]
+    remaining = intraday_store.remove_intraday_symbols(1, date, "regular", {"000001"})
+    assert remaining == 0
+    assert intraday_store.remove_intraday_symbols(1, date, "regular", set()) == 0
+
+
+def test_bounded_replace_with_empty_replaced_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import pandas as pd
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    target = intraday_store.tick_partition_path("2026-09-14", "regular")
+    frame = _tick_n_rows("000001", "2026-09-14", 2)
+    assert intraday_store._bounded_symbol_replace(target, frame, set(), 16, "2026-09-14", "regular", sort_output=False) == 0
+    assert not target.exists()
+
+
+def test_stored_symbol_counts_storage_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import pandas as pd
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-14"
+    target = intraday_store.tick_partition_path(date, "regular")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("corrupt bytes")
+    with pytest.raises(OSError, match="Cannot read existing"):
+        intraday_store._stored_symbol_counts(target, {"000001"}, 16)
+    nosym = tmp_path / "nosym.parquet"
+    pd.DataFrame({"ts_hms": [90300]}).to_parquet(nosym, index=False)
+    with pytest.raises(ValueError, match="missing key columns"):
+        intraday_store._stored_symbol_counts(nosym, {"000001"}, 16)
+
+    class _BoomFile:
+        def __init__(self, *a, **k):
+            pass
+
+        def iter_batches(self, *a, **k):
+            raise RuntimeError("read boom")
+
+    monkeypatch.setattr(intraday_store.pq, "ParquetFile", _BoomFile)
+    good = tmp_path / "good.parquet"
+    pd.DataFrame({"symbol": ["000001"]}).to_parquet(good, index=False)
+    with pytest.raises(OSError, match="Cannot read existing"):
+        intraday_store._stored_symbol_counts(good, {"000001"}, 16)
 
 
 def test_backup_dir_keyed_by_retention_date(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

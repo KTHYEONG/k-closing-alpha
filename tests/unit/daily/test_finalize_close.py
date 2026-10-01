@@ -222,7 +222,7 @@ def test_run_close_finalization_updates_rows_in_place_without_new_snapshot_ident
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-10",
-            client=_Client(),
+            clients=[_Client()],
             session=object(),
             now_fn=lambda: datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
             sleep_fn=_no_sleep,
@@ -298,7 +298,7 @@ def test_run_close_finalization_leaves_unconfirmed_rows_untouched_until_deadline
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-10",
-            client=_NeverConfirms(),
+            clients=[_NeverConfirms()],
             session=object(),
             now_fn=lambda: next(clock),
             sleep_fn=_record_sleep,
@@ -359,7 +359,7 @@ def test_run_close_finalization_skips_already_confirmed_rows(monkeypatch) -> Non
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-10",
-            client=_Client(),
+            clients=[_Client()],
             session=object(),
             now_fn=lambda: datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
             sleep_fn=_no_sleep,
@@ -458,7 +458,7 @@ def test_run_close_finalization_rejects_invariant_violating_quote_without_touchi
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-10",
-            client=_RegressedVolumeClient(),
+            clients=[_RegressedVolumeClient()],
             session=object(),
             now_fn=lambda: next(clock),
             sleep_fn=_no_sleep,
@@ -615,7 +615,7 @@ def test_empty_archive_on_trading_day_is_degraded(monkeypatch) -> None:
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date=snap,
-            client=None,
+            clients=[object()],
             session=None,
             now_fn=lambda: datetime(2026, 9, 14, 15, 32, 0, tzinfo=kst),
             sleep_fn=lambda _s: asyncio.sleep(0),
@@ -646,7 +646,7 @@ def test_empty_archive_on_holiday_is_ok(monkeypatch) -> None:
     asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date=snap,
-            client=None,
+            clients=[object()],
             session=None,
             now_fn=lambda: datetime(2026, 9, 14, 15, 32, 0, tzinfo=kst),
             sleep_fn=lambda _s: asyncio.sleep(0),
@@ -676,7 +676,7 @@ def test_empty_archive_oracle_failure_never_reports_ok(monkeypatch) -> None:
     asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date=snap,
-            client=None,
+            clients=[object()],
             session=None,
             now_fn=lambda: datetime(2026, 9, 14, 15, 32, 0, tzinfo=kst),
             sleep_fn=lambda _s: asyncio.sleep(0),
@@ -707,7 +707,7 @@ def test_empty_archive_consults_kis_oracle_by_default(monkeypatch) -> None:
     asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date=snap,
-            client=None,
+            clients=[object()],
             session=None,
             now_fn=lambda: datetime(2026, 9, 14, 15, 32, 0, tzinfo=kst),
             sleep_fn=lambda _s: asyncio.sleep(0),
@@ -753,7 +753,7 @@ def test_run_close_finalization_fetches_picks_first_with_bounded_concurrency(mon
     monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", lambda df, snapshot_date=None: len(df))
 
     price_calls: list[str] = []
-    state = {"inflight": 0, "max": 0}
+    state = {"inflight": 0, "max": 0, "now": datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst)}
 
     class _Client:
         async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
@@ -767,41 +767,32 @@ def test_run_close_finalization_fetches_picks_first_with_bounded_concurrency(mon
         async def get_orderbook_snapshot(self, session, code, market_div_code=None):
             return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": "121", "stck_prpr": "10000"}}
 
-    clock = iter(
-        [
-            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 34, 0, tzinfo=kst),
-        ]
-    )
-
-    async def _no_sleep(_seconds):
-        return None
+    async def _sleep_then_expire(_seconds):
+        state["now"] = datetime(2026, 9, 10, 15, 34, 0, tzinfo=kst)
 
     # When
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-10",
-            client=_Client(),
+            clients=[_Client()],
             session=object(),
-            now_fn=lambda: next(clock),
-            sleep_fn=_no_sleep,
+            now_fn=lambda: state["now"],
+            sleep_fn=_sleep_then_expire,
             retry_interval_seconds=0.0,
             pick_codes=frozenset({"000005"}),
         )
     )
 
-    # Then
+    # Then: picks first in dispatch order, bounded to one key's window, nothing confirmed
     assert n == 0
-    assert finalize_close.FINALIZE_CONCURRENCY == 4
+    assert finalize_close.FINALIZE_CONCURRENCY_PER_KEY == 4
     assert price_calls == ["000005", "000003", "000001", "000002", "000004", "000006"]
-    assert state["max"] == finalize_close.FINALIZE_CONCURRENCY
+    assert state["max"] == finalize_close.FINALIZE_CONCURRENCY_PER_KEY
 
 
-def test_run_close_finalization_stops_batches_after_deadline(monkeypatch) -> None:
+def test_run_close_finalization_dispatches_nothing_after_deadline(monkeypatch) -> None:
     import asyncio
-    from datetime import datetime
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
     import pandas as pd
@@ -829,43 +820,200 @@ def test_run_close_finalization_stops_batches_after_deadline(monkeypatch) -> Non
     monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: snapshot.copy())
     monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", lambda df, snapshot_date=None: len(df))
 
-    price_calls: list[str] = []
+    state = {"now": datetime(2026, 9, 10, 15, 32, 50, tzinfo=kst)}
+    price_calls: list[tuple[str, datetime]] = []
 
     class _Client:
         async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
-            price_calls.append(code)
-            return {"rt_cd": "0", "output": {"stck_prpr": "10000"}}
+            price_calls.append((code, state["now"]))
+            state["now"] += timedelta(seconds=30)
+            return {"rt_cd": "0", "output": {"stck_shrn_iscd": code, "stck_prpr": "10000"}}
 
         async def get_orderbook_snapshot(self, session, code, market_div_code=None):
             return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": "121"}}
 
-    clock = iter(
-        [
-            datetime(2026, 9, 10, 15, 32, 59, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 32, 59, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 33, 1, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 33, 5, tzinfo=kst),
-        ]
-    )
-
     async def _no_sleep(_seconds):
         return None
+
+    outcomes: list = []
 
     # When
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-10",
-            client=_Client(),
+            clients=[_Client()],
             session=object(),
-            now_fn=lambda: next(clock),
+            now_fn=lambda: state["now"],
             sleep_fn=_no_sleep,
+            retry_interval_seconds=0.0,
+            on_outcome=lambda outcome, **kwargs: outcomes.append((outcome, kwargs)),
+        )
+    )
+
+    # Then: 첫 웨이브 4행만 디스패치되고, 데드라인 이후에는 어떤 행도 시작하지 않는다
+    assert n == 0
+    assert [code for code, _at in price_calls] == ["000001", "000002", "000003", "000004"]
+    assert outcomes and outcomes[0][1]["metrics"]["n_unconfirmed"] == 6
+
+
+def _surge_rows(codes):
+    import pandas as pd
+
+    from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
+
+    return pd.DataFrame(
+        {
+            "스냅샷_날짜": ["2026-09-10"] * len(codes),
+            "종목코드": codes,
+            "종가": [10000] * len(codes),
+            "전일종가": [10000] * len(codes),
+            "거래량": [100] * len(codes),
+            "등락률": [0.0] * len(codes),
+            "admitted": [True] * len(codes),
+            DECISION_CLOSE_COL: [10000] * len(codes),
+            CLOSE_CONFIRMED_COL: [False] * len(codes),
+        }
+    )
+
+
+class _ConfirmingSurgeClient:
+    def __init__(self, state):
+        self._state = state
+
+    async def _leg(self):
+        import asyncio
+        import datetime as dt
+
+        start = self._state["now"]
+        await asyncio.sleep(0)
+        target = start + dt.timedelta(seconds=0.075)
+        if self._state["now"] < target:
+            self._state["now"] = target
+        return {"rt_cd": "0"}
+
+    async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+        await self._leg()
+        return {
+            "rt_cd": "0",
+            "output": {
+                "stck_shrn_iscd": code, "stck_prpr": "10000", "stck_sdpr": "10000",
+                "stck_oprc": "10000", "stck_hgpr": "10000", "stck_lwpr": "10000",
+                "acml_vol": "100", "prdy_ctrt": "0.00", "acml_tr_pbmn": "100000000",
+            },
+        }
+
+    async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+        await self._leg()
+        return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": "112", "stck_prpr": "10000"}}
+
+
+def test_run_close_finalization_two_keys_double_throughput(monkeypatch) -> None:
+    """800행 확정에서 2키 슬라이딩 윈도우는 단일키 대비 절반 시간에 끝낸다."""
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import finalize_close
+
+    kst = ZoneInfo("Asia/Seoul")
+    codes = [f"{i:06d}" for i in range(800)]
+    monkeypatch.setattr(
+        finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: _surge_rows(codes).copy()
+    )
+    monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", lambda df, snapshot_date=None: len(df))
+
+    async def _no_sleep(_seconds):
+        return None
+
+    def _run(n_keys: int) -> float:
+        state = {"now": datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst)}
+        t0 = state["now"]
+        n = asyncio.run(
+            finalize_close.run_close_finalization(
+                snapshot_date="2026-09-10",
+                clients=[_ConfirmingSurgeClient(state) for _ in range(n_keys)],
+                session=object(),
+                now_fn=lambda: state["now"],
+                sleep_fn=_no_sleep,
+                retry_interval_seconds=0.0,
+            )
+        )
+        assert n == 800
+        return (state["now"] - t0).total_seconds()
+
+    # When
+    elapsed_two = _run(2)
+    elapsed_one = _run(1)
+
+    # Then: 2키 elapsed가 단일키의 절반 수준이다
+    assert elapsed_one >= 14.0
+    assert elapsed_two <= 8.0
+    assert elapsed_two <= elapsed_one * 0.6
+
+
+def test_run_close_finalization_assigns_rows_round_robin(monkeypatch) -> None:
+    """행 i의 두 조회는 clients[i % 2] 키로 간다."""
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import finalize_close
+
+    kst = ZoneInfo("Asia/Seoul")
+    codes = ["000001", "000002", "000003", "000004"]
+    monkeypatch.setattr(
+        finalize_close.archive, "fetch_archive_snapshot", lambda *a, **kw: _surge_rows(codes).copy()
+    )
+    monkeypatch.setattr(finalize_close.archive, "upsert_archive_snapshot", lambda df, snapshot_date=None: len(df))
+
+    seen: list[tuple[str, str]] = []
+
+    class _RecordingClient:
+        def __init__(self, name):
+            self._name = name
+
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            seen.append((self._name, code))
+            return {"rt_cd": "0", "output": {"stck_shrn_iscd": code, "stck_prpr": "10000"}}
+
+        async def get_orderbook_snapshot(self, session, code, market_div_code=None):
+            return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": "121"}}
+
+    async def _no_sleep(_seconds):
+        return None
+
+    state_now = {"now": datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst)}
+
+    async def _sleep_once(_seconds):
+        state_now["now"] = datetime(2026, 9, 10, 15, 34, 0, tzinfo=kst)
+
+    asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date="2026-09-10",
+            clients=[_RecordingClient("A"), _RecordingClient("B")],
+            session=object(),
+            now_fn=lambda: state_now["now"],
+            sleep_fn=_sleep_once,
             retry_interval_seconds=0.0,
         )
     )
 
-    # Then: 첫 배치(4행)만 조회, 데드라인 이후 배치는 시작하지 않음
-    assert n == 0
-    assert price_calls == ["000001", "000002", "000003", "000004"]
+    # Then
+    assert seen == [("A", "000001"), ("B", "000002"), ("A", "000003"), ("B", "000004")]
+
+
+def test_run_close_finalization_rejects_empty_clients() -> None:
+    """키가 없으면 시작 전에 실패한다."""
+    import asyncio
+
+    import pytest
+
+    from src.daily import finalize_close
+
+    with pytest.raises(ValueError, match="at least one data client"):
+        asyncio.run(finalize_close.run_close_finalization(snapshot_date="2026-09-10", clients=[]))
+    with pytest.raises(ValueError, match="at least one data client"):
+        asyncio.run(finalize_close.run_close_finalization(snapshot_date="2026-09-10", clients=None))
 
 
 def test_run_close_finalization_reports_degraded_outcome_for_unconfirmed_pick(monkeypatch) -> None:
@@ -915,26 +1063,20 @@ def test_run_close_finalization_reports_degraded_outcome_for_unconfirmed_pick(mo
             mkop = "121" if code == "000001" else "112"
             return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": mkop, "stck_prpr": "10100"}}
 
-    clock = iter(
-        [
-            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 34, 0, tzinfo=kst),
-        ]
-    )
+    clock = {"now": datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst)}
     outcomes: list[tuple] = []
 
-    async def _no_sleep(_seconds):
-        return None
+    async def _sleep_then_expire(_seconds):
+        clock["now"] = datetime(2026, 9, 10, 15, 34, 0, tzinfo=kst)
 
     # When
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-10",
-            client=_Client(),
+            clients=[_Client()],
             session=object(),
-            now_fn=lambda: next(clock),
-            sleep_fn=_no_sleep,
+            now_fn=lambda: clock["now"],
+            sleep_fn=_sleep_then_expire,
             retry_interval_seconds=0.0,
             pick_codes=frozenset({"000001"}),
             on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
@@ -1087,7 +1229,7 @@ def test_run_close_finalization_rejects_non_same_day_snapshot(monkeypatch) -> No
         asyncio.run(
             finalize_close.run_close_finalization(
                 snapshot_date="2026-09-10",
-                client=_Client(),
+                clients=[_Client()],
                 session=object(),
                 now_fn=lambda: datetime(2026, 9, 14, 15, 31, 0, tzinfo=kst),
                 sleep_fn=_no_sleep,
@@ -1137,28 +1279,25 @@ def test_run_close_finalization_drops_unresolved_rows_without_repolling(monkeypa
         async def get_orderbook_snapshot(self, session, code, market_div_code=None):
             return {"rt_cd": "0", "output2": {"antc_mkop_cls_code": "121", "stck_prpr": "10000"}}
 
-    clock = iter(
-        [
-            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 31, 0, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 31, 0, tzinfo=kst),
-            datetime(2026, 9, 10, 15, 34, 0, tzinfo=kst),
-        ]
-    )
+    clock = {"now": datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst)}
     outcomes: list[tuple] = []
+    sleeps = {"n": 0}
 
-    async def _no_sleep(_seconds):
-        return None
+    async def _sleep_twice(_seconds):
+        sleeps["n"] += 1
+        if sleeps["n"] == 1:
+            clock["now"] = datetime(2026, 9, 10, 15, 31, 0, tzinfo=kst)
+        else:
+            clock["now"] = datetime(2026, 9, 10, 15, 34, 0, tzinfo=kst)
 
     # When
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-10",
-            client=_Client(),
+            clients=[_Client()],
             session=object(),
-            now_fn=lambda: next(clock),
-            sleep_fn=_no_sleep,
+            now_fn=lambda: clock["now"],
+            sleep_fn=_sleep_twice,
             retry_interval_seconds=0.0,
             pick_codes=frozenset({"500041"}),
             on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
@@ -1205,10 +1344,19 @@ def test_finalize_close_amain_uses_data_account_client(monkeypatch) -> None:
     async def _fake_finalization(*_a, **_kw):
         return 0
 
-    data_kwargs = {"app_key": "DATA", "app_secret": "S", "account_id": "", "hts_id": None, "token_file": "t.json"}
+    shard_kwargs = [
+        {"app_key": "DATA_1", "app_secret": "S1", "account_id": "", "hts_id": None, "token_file": "t1.json"},
+        {"app_key": "DATA_5", "app_secret": "S5", "account_id": "", "hts_id": None, "token_file": "t5.json"},
+    ]
+    seen_clients: list = []
+
+    async def _capture_clients(*_a, **_kw):
+        seen_clients.append(_kw.get("clients"))
+        return 0
+
     monkeypatch.setattr(finalize_close, "KisApiClient", _FakeClient)
-    monkeypatch.setattr(finalize_close, "kis_data_client_kwargs", lambda: dict(data_kwargs))
-    monkeypatch.setattr(finalize_close, "run_close_finalization", _fake_finalization)
+    monkeypatch.setattr(finalize_close, "kis_decision_shard_client_kwargs", lambda: [dict(kw) for kw in shard_kwargs])
+    monkeypatch.setattr(finalize_close, "run_close_finalization", _capture_clients)
     monkeypatch.setattr(finalize_close, "load_pick_codes", lambda _d: frozenset())
     monkeypatch.setattr(finalize_close, "record_run_outcome", Mock())
     monkeypatch.setattr(sys, "argv", ["finalize_close", "--date", "2026-09-10"])
@@ -1216,8 +1364,9 @@ def test_finalize_close_amain_uses_data_account_client(monkeypatch) -> None:
     # When
     finalize_close.main()
 
-    # Then
-    assert built == [data_kwargs]
+    # Then: DATA_1 + DATA_5 샤드 클라이언트를 지어가며 확정 패스에 그대로 전달한다
+    assert built == shard_kwargs
+    assert seen_clients and len(seen_clients[0]) == 2
 
 
 def test_run_close_finalization_confirms_rows_from_float64_archive_flags(monkeypatch) -> None:
@@ -1285,7 +1434,7 @@ def test_run_close_finalization_confirms_rows_from_float64_archive_flags(monkeyp
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-15",
-            client=_Client(),
+            clients=[_Client()],
             session=object(),
             now_fn=lambda: datetime(2026, 9, 15, 15, 30, 30, tzinfo=kst),
             sleep_fn=_no_sleep,
@@ -1356,7 +1505,7 @@ def test_fetch_confirmed_quote_rejects_inconsistent_capture_context() -> None:
     with pytest.raises(ValueError, match="inconsistent"):
         asyncio.run(
             run_close_finalization(
-                snapshot_date="2026-09-10", client=object(), session=object(),
+                snapshot_date="2026-09-10", clients=[object()], session=object(),
                 capture_store=object(), run_id="r", cohort_id=None,
             )
         )
@@ -1521,7 +1670,7 @@ def test_close_outcomes_leave_decision_hash_unchanged(tmp_path, monkeypatch) -> 
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-10",
-            client=_confirming_client(),
+            clients=[_confirming_client()],
             session=object(),
             now_fn=lambda: datetime(2026, 9, 10, 15, 30, 30, tzinfo=kst),
             sleep_fn=_no_sleep,
@@ -1565,7 +1714,7 @@ def test_close_outcome_publication_failure_stays_degraded(tmp_path, monkeypatch)
     n = asyncio.run(
         finalize_close.run_close_finalization(
             snapshot_date="2026-09-10",
-            client=_confirming_client(),
+            clients=[_confirming_client()],
             session=object(),
             now_fn=lambda: datetime(2026, 9, 10, 15, 30, 30, tzinfo=ZoneInfo("Asia/Seoul")),
             sleep_fn=_no_sleep,

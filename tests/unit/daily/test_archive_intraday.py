@@ -1045,10 +1045,10 @@ def test_stale_panel_window_rejected(monkeypatch, tmp_path) -> None:
         archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
 
 
-def _batched_frame(symbol: str):
+def _batched_frame(symbol: str, nrows: int = 1):
     import pandas as pd
 
-    return pd.DataFrame([{"symbol": symbol}])
+    return pd.DataFrame([{"symbol": symbol}] * int(nrows))
 
 
 def test_batched_partition_publisher_defers_write_until_threshold() -> None:
@@ -1057,7 +1057,7 @@ def test_batched_partition_publisher_defers_write_until_threshold() -> None:
 
     calls: list = []
     publisher = _BatchedPartitionPublisher(
-        write_fn=lambda df, coverage: calls.append((df, coverage)) or 0, batch_size=3,
+        write_fn=lambda df, coverage: calls.append((df, coverage)) or 0, max_rows=3,
     )
     publisher.add("005930", _batched_frame("005930"),
                   _fake_entry("005930", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
@@ -1073,7 +1073,7 @@ def test_batched_partition_publisher_auto_flushes_at_threshold() -> None:
 
     calls: list = []
     publisher = _BatchedPartitionPublisher(
-        write_fn=lambda df, coverage: calls.append((df, coverage)) or len(df), batch_size=3,
+        write_fn=lambda df, coverage: calls.append((df, coverage)) or len(df), max_rows=3,
     )
     codes = ["005930", "000660", "035420"]
     for code in codes:
@@ -1098,7 +1098,7 @@ def test_batched_partition_publisher_flush_writes_partial_batch() -> None:
         calls.append((df, coverage))
         return 7
 
-    publisher = _BatchedPartitionPublisher(write_fn=_spy, batch_size=10)
+    publisher = _BatchedPartitionPublisher(write_fn=_spy, max_rows=10)
     for code in ("005930", "000660"):
         publisher.add(code, _batched_frame(code),
                       _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
@@ -1115,7 +1115,7 @@ def test_batched_partition_publisher_flush_without_buffer_is_noop() -> None:
 
     calls: list = []
     publisher = _BatchedPartitionPublisher(
-        write_fn=lambda df, coverage: calls.append((df, coverage)) or 0, batch_size=3,
+        write_fn=lambda df, coverage: calls.append((df, coverage)) or 0, max_rows=3,
     )
 
     assert publisher.flush() == 0
@@ -1131,7 +1131,7 @@ def test_batched_partition_publisher_write_failure_propagates() -> None:
     def _boom(df, coverage):
         raise ValueError("partition unavailable")
 
-    publisher = _BatchedPartitionPublisher(write_fn=_boom, batch_size=2)
+    publisher = _BatchedPartitionPublisher(write_fn=_boom, max_rows=2)
     publisher.add("005930", _batched_frame("005930"),
                   _fake_entry("005930", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
     with pytest.raises(ValueError, match="partition unavailable"):
@@ -1144,8 +1144,87 @@ def test_batched_partition_publisher_rejects_nonpositive_batch_size() -> None:
 
     from src.daily.archive_intraday import _BatchedPartitionPublisher
 
-    with pytest.raises(ValueError, match="batch_size"):
-        _BatchedPartitionPublisher(write_fn=lambda df, coverage: 0, batch_size=0)
+    with pytest.raises(ValueError, match="max_rows"):
+        _BatchedPartitionPublisher(write_fn=lambda df, coverage: 0, max_rows=0)
+
+
+def test_batched_partition_publisher_rewrite_count_bounded_by_rows() -> None:
+    from src.daily.archive_intraday import _BatchedPartitionPublisher
+    from src.data.capture_contracts import CaptureDataset
+
+    calls: list = []
+    publisher = _BatchedPartitionPublisher(
+        write_fn=lambda df, coverage: calls.append((len(df), set(coverage))) or len(df), max_rows=100_000,
+    )
+    for idx in range(300):
+        code = f"{idx:06d}"
+        publisher.add(code, _batched_frame(code, 1000),
+                      _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1000))
+    publisher.flush()
+
+    assert len(calls) == 3
+    assert sum(n for n, _ in calls) == 300_000
+
+
+def test_batched_partition_publisher_small_session_flushes_once() -> None:
+    from src.config.collection import CollectionSettings
+    from src.daily.archive_intraday import _BatchedPartitionPublisher
+    from src.data.capture_contracts import CaptureDataset
+
+    calls: list = []
+    publisher = _BatchedPartitionPublisher(
+        write_fn=lambda df, coverage: calls.append((len(df), set(coverage))) or len(df),
+        max_rows=int(CollectionSettings().COLLECTION_ARCHIVE_PUBLISH_ROWS),
+    )
+    for idx in range(300):
+        code = f"{idx:06d}"
+        publisher.add(code, _batched_frame(code, 400),
+                      _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=400))
+    publisher.flush()
+
+    assert len(calls) == 1
+    assert calls[0][0] == 120_000
+
+
+def test_batched_partition_publisher_preserves_zero_row_coverage() -> None:
+    import pandas as pd
+
+    from src.daily.archive_intraday import _BatchedPartitionPublisher
+    from src.data.capture_contracts import CaptureDataset
+
+    calls: list = []
+    publisher = _BatchedPartitionPublisher(
+        write_fn=lambda df, coverage: calls.append((df, coverage)) or 0, max_rows=1_000_000,
+    )
+    publisher.add("005930", _batched_frame("005930", 2),
+                  _fake_entry("005930", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=2))
+    from src.data.capture_contracts import ArtifactRef, CoverageEntry
+    empty_entry = CoverageEntry(
+        symbol="000000", dataset=CaptureDataset.MINUTE_BARS, venue="KRX", session="regular",
+        scheduled_at=None, status=__import__("src.data.capture_contracts", fromlist=["CaptureStatus"]).CaptureStatus.NO_TRADES,
+        rows=0, first_event_time=None, last_event_time=None, reason="verified empty with proof",
+        raw_refs=(ArtifactRef(path="raw/000000.json.gz", sha256="a" * 64, bytes=8, rows=0),),
+    )
+    publisher.add("000000", pd.DataFrame([{"symbol": "000000"}]).iloc[0:0], empty_entry)
+    publisher.flush()
+
+    assert len(calls) == 1
+    _, coverage = calls[0]
+    assert set(coverage) == {"005930", "000000"}
+
+
+def test_batched_partition_publisher_rejects_duplicate_symbol() -> None:
+    import pytest
+
+    from src.daily.archive_intraday import _BatchedPartitionPublisher
+    from src.data.capture_contracts import CaptureDataset
+
+    publisher = _BatchedPartitionPublisher(write_fn=lambda df, coverage: 0, max_rows=100)
+    publisher.add("005930", _batched_frame("005930"),
+                  _fake_entry("005930", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
+    with pytest.raises(ValueError, match="Duplicate"):
+        publisher.add("005930", _batched_frame("005930"),
+                      _fake_entry("005930", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE", rows=1))
 
 
 def test_run_archive_batches_bar_writes_across_symbols(monkeypatch, tmp_path) -> None:
@@ -1195,14 +1274,14 @@ def test_run_archive_batches_bar_writes_across_symbols(monkeypatch, tmp_path) ->
 
     writes: list = []
 
-    def _spy_write(df, interval, snap_date, session, *, coverage=None, batch_rows=None):
+    def _spy_write(df, interval, snap_date, session, *, coverage=None, batch_rows=None, **kwargs):
         writes.append((session, len(df), sorted(coverage or {})))
         return len(df)
 
     monkeypatch.setattr(archive_intraday, "write_intraday_partition", _spy_write)
     monkeypatch.setattr(archive_intraday, "write_tick_partition", lambda *a, **k: 0)
 
-    profile = CollectionSettings(COLLECTION_ROOT=tmp_path / "cap", COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE=2)
+    profile = CollectionSettings(COLLECTION_ROOT=tmp_path / "cap", COLLECTION_ARCHIVE_PUBLISH_ROWS=2)
     result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=profile)
 
     regular_writes = [item for item in writes if item[0] == INTRADAY_SESSION_REGULAR]
@@ -1213,20 +1292,20 @@ def test_run_archive_batches_bar_writes_across_symbols(monkeypatch, tmp_path) ->
     assert result == (3, 0, 0)
 
 
-def test_collection_archive_symbol_batch_size_defaults_to_25() -> None:
+def test_collection_archive_publish_rows_defaults_to_2m() -> None:
     from src.config.collection import CollectionSettings
 
-    assert CollectionSettings().COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE == 25
+    assert CollectionSettings().COLLECTION_ARCHIVE_PUBLISH_ROWS == 2_000_000
 
 
-def test_collection_archive_symbol_batch_size_rejects_nonpositive() -> None:
+def test_collection_archive_publish_rows_rejects_nonpositive() -> None:
     import pytest
     from pydantic import ValidationError
 
     from src.config.collection import CollectionSettings
 
     with pytest.raises(ValidationError):
-        CollectionSettings(COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE=0)
+        CollectionSettings(COLLECTION_ARCHIVE_PUBLISH_ROWS=0)
 
 
 def test_run_intraday_archive_flags_shifted_day_degraded(monkeypatch, tmp_path) -> None:

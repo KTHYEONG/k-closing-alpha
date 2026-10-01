@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 from zoneinfo import ZoneInfo
 
-from src.api.kis.rate_limit import AsyncRateLimiter, get_shared_rate_limiter
+from src.api.kis.rate_limit import HostPacedRateLimiter, get_host_rate_limiter, host_admission_state_path
 from src.config import settings
 from src.data.capture_contracts import RawCaptureError
 
@@ -34,6 +34,8 @@ _KIWOOM_USER_AGENT = "curl/8.5.0"
 
 KIWOOM_AUTH_EXPIRED_RETURN_CODE: int = 3
 KIWOOM_AUTH_EXPIRED_MSG_CODE: str = "8005"
+
+KIWOOM_REVOKE_PATH: str = "/oauth2/revoke"
 
 _SEOUL = ZoneInfo("Asia/Seoul")
 _CNTR_TM_RE = re.compile(r"^\d{14}$")
@@ -117,6 +119,30 @@ def _now_seoul() -> datetime:
     return datetime.now(_SEOUL)
 
 
+@dataclass(frozen=True)
+class KiwoomIssuedToken:
+    """Token value plus its vendor-declared expiry (Asia/Seoul, from expires_dt)."""
+
+    token: str
+    expires_at: datetime
+
+
+def _parse_kiwoom_expires_dt(raw: Any) -> datetime:
+    """Parse vendor expires_dt (YYYYMMDDHHMMSS) into an aware Asia/Seoul datetime.
+
+    Raises:
+        RuntimeError: Missing or malformed expires_dt.
+    """
+    text = str(raw or "")
+    if not re.fullmatch(r"\d{14}", text):
+        raise RuntimeError(f"Kiwoom token expiry unparsable: {text!r}")
+    try:
+        naive = datetime.strptime(text, "%Y%m%d%H%M%S")
+    except ValueError:
+        raise RuntimeError(f"Kiwoom token expiry unparsable: {text!r}") from None
+    return naive.replace(tzinfo=_SEOUL)
+
+
 def _validate_target_ymd(target_date: str) -> str:
     ymd = str(target_date).replace("-", "")
     try:
@@ -151,15 +177,58 @@ class KiwoomApiClient:
         self.secret_key = secret_key or settings.KIWOOM_SECRET_KEY
         self.base_url = base_url or settings.KIWOOM_BASE_URL
         self.token: str | None = None
-        self._rate_limiters: dict[str, AsyncRateLimiter] = {}
         self._token_lock: asyncio.Lock | None = None
 
-    def _limiter_for(self, api_id: str) -> AsyncRateLimiter:
-        return get_shared_rate_limiter("kiwoom", f"{self.app_key}:{api_id}", _KIWOOM_TR_RATE_PER_SEC)
+    def _limiter_for(self, api_id: str) -> HostPacedRateLimiter:
+        return get_host_rate_limiter(host_admission_state_path("kiwoom", self.app_key or "", api_id), _KIWOOM_TR_RATE_PER_SEC)
 
     def reset_token(self) -> None:
         """Drop the cached token so the next request fetches one; the vendor reuses a live token and expires it ~24h after issuance."""
         self.token = None
+
+    async def issue_token(self, session) -> KiwoomIssuedToken:
+        """Issue (or receive the live) token and return it with its vendor-declared expiry.
+
+        Raises:
+            RuntimeError: Missing token or unparsable expires_dt in the vendor response.
+        """
+        payload = {"grant_type": "client_credentials", "appkey": self.app_key, "secretkey": self.secret_key}
+        raw = session.post(
+            f"{self.base_url}/oauth2/token",
+            headers={"Content-Type": "application/json;charset=UTF-8", "User-Agent": _KIWOOM_USER_AGENT},
+            json=payload,
+        )
+        if inspect.isawaitable(raw):
+            raw = await raw
+        async with raw as resp:
+            body = await resp.json()
+        token = str(body.get("token", ""))
+        if not token:
+            raise RuntimeError(f"Kiwoom token issuance failed: {body}")
+        expires_at = _parse_kiwoom_expires_dt(body.get("expires_dt"))
+        self.token = token
+        return KiwoomIssuedToken(token=token, expires_at=expires_at)
+
+    async def revoke_token(self, session, token: str) -> None:
+        """Revoke the given token (Kiwoom au10002) so the next issuance starts a new 24h phase.
+
+        Raises:
+            RuntimeError: Vendor reports failure (non-zero return_code) or a non-200 status.
+        """
+        raw = session.post(
+            f"{self.base_url}{KIWOOM_REVOKE_PATH}",
+            headers={"Content-Type": "application/json;charset=UTF-8", "User-Agent": _KIWOOM_USER_AGENT},
+            json={"appkey": self.app_key, "secretkey": self.secret_key, "token": token},
+        )
+        if inspect.isawaitable(raw):
+            raw = await raw
+        async with raw as resp:
+            status = resp.status
+            body = await resp.json()
+        if status != 200:
+            raise RuntimeError(f"Kiwoom token revocation failed: status={status}")
+        if body.get("return_code") != 0:
+            raise RuntimeError(f"Kiwoom token revocation failed: {body.get('return_code')}")
 
     async def ensure_token(self, session) -> str:
         if self.token:
@@ -169,21 +238,8 @@ class KiwoomApiClient:
         async with self._token_lock:
             if self.token:
                 return self.token
-            payload = {"grant_type": "client_credentials", "appkey": self.app_key, "secretkey": self.secret_key}
-            raw = session.post(
-                f"{self.base_url}/oauth2/token",
-                headers={"Content-Type": "application/json;charset=UTF-8", "User-Agent": _KIWOOM_USER_AGENT},
-                json=payload,
-            )
-            if inspect.isawaitable(raw):
-                raw = await raw
-            async with raw as resp:
-                body = await resp.json()
-            token = str(body.get("token", ""))
-            if not token:
-                raise RuntimeError(f"Kiwoom token issuance failed: {body}")
-            self.token = token
-            return token
+            issued = await self.issue_token(session)
+            return issued.token
 
     async def _post_tr(
         self,
