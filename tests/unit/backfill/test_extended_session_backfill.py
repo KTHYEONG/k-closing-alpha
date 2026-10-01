@@ -705,3 +705,75 @@ def test_kiwoom_raw_helper_refuses_uncertified_venue_and_malformed_rows(env) -> 
         session_tag="nxt_aftermarket", profile=profile, capture_store=store, run_id="r2",
     ))
     assert entry.status is CaptureStatus.FAILED and entry.reason.startswith("raw_basis_normalize:")
+
+
+def _record(ledger: ExtendedBackfillLedger, symbol: str, status: CaptureStatus, day: str = "2026-03-02") -> None:
+    ledger.record(day, "nxt_aftermarket", [_entry(symbol, status)], run_id="r", attempted_at=datetime.now(SEOUL))
+
+
+def test_third_consecutive_failure_becomes_terminal(tmp_path) -> None:
+    from src.backfill.intraday.extended_session_backfill import EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
+
+    ledger = ExtendedBackfillLedger(tmp_path / "ledger.parquet")
+    for _ in range(EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS - 1):
+        _record(ledger, "000001", CaptureStatus.FAILED)
+    assert "000001" not in ledger.terminal_symbols("2026-03-02", "nxt_aftermarket")
+    _record(ledger, "000001", CaptureStatus.FAILED)
+    row = _ledger_row(ledger, "000001")
+    assert row["status"] == "EXHAUSTED"
+    assert int(row["attempts"]) == EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
+    assert row["reason"].startswith("exhausted:")
+    assert "000001" in ledger.terminal_symbols("2026-03-02", "nxt_aftermarket")
+
+
+def test_success_resets_the_attempt_count(tmp_path) -> None:
+    ledger = ExtendedBackfillLedger(tmp_path / "ledger.parquet")
+    _record(ledger, "000001", CaptureStatus.FAILED)
+    _record(ledger, "000001", CaptureStatus.FAILED)
+    _record(ledger, "000001", CaptureStatus.COMPLETE)
+    row = _ledger_row(ledger, "000001")
+    assert (row["status"], int(row["attempts"])) == ("COMPLETE", 0)
+    _record(ledger, "000001", CaptureStatus.FAILED)
+    row = _ledger_row(ledger, "000001")
+    assert (row["status"], int(row["attempts"])) == ("FAILED", 1)
+
+
+def test_attempts_are_scoped_per_date_and_session(tmp_path) -> None:
+    ledger = ExtendedBackfillLedger(tmp_path / "ledger.parquet")
+    _record(ledger, "000001", CaptureStatus.FAILED, day="2026-03-02")
+    _record(ledger, "000001", CaptureStatus.FAILED, day="2026-03-02")
+    _record(ledger, "000001", CaptureStatus.FAILED, day="2026-03-03")
+    rows = pd.read_parquet(ledger.path).set_index("snapshot_date")
+    assert int(rows.loc["2026-03-03", "attempts"]) == 1
+    assert rows.loc["2026-03-03", "status"] == "FAILED"
+
+
+def test_legacy_ledger_without_attempts_is_upgraded(tmp_path) -> None:
+    path = tmp_path / "ledger.parquet"
+    pd.DataFrame([{
+        "snapshot_date": "2026-03-02", "session": "nxt_aftermarket", "symbol": "000001", "status": "FAILED",
+        "rows": 0, "reason": "seed", "run_id": "old", "attempted_at": "2026-03-02T23:00:00+09:00",
+        "vendor": "kis", "price_basis": "",
+    }]).to_parquet(path, index=False)
+    ledger = ExtendedBackfillLedger(path)
+    _record(ledger, "000001", CaptureStatus.FAILED)
+    row = _ledger_row(ledger, "000001")
+    assert (row["status"], int(row["attempts"])) == ("FAILED", 2)
+
+
+def test_exhausted_keys_are_not_refetched_and_counted(env) -> None:
+    from src.backfill.intraday.extended_session_backfill import EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
+
+    profile, store, ledger = env
+    day = "2025-09-29"
+    tasks = [ExtendedBackfillTask(day, "nxt_aftermarket", ("067310",))]
+    summaries = [
+        _run(profile, store, ledger, [_FakeKis(day, traded={"067310"})], tasks,
+             _adj_ref(day, "067310"), raw_client=_FakeKiwoom(day, raw={}))
+        for _ in range(EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS)
+    ]
+    assert [s.exhausted for s in summaries] == [0] * (EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS - 1) + [1]
+    assert "067310" in ledger.terminal_symbols(day, "nxt_aftermarket")
+    kis = _FakeKis(day, traded={"067310"})
+    after = _run(profile, store, ledger, [kis], tasks, _adj_ref(day, "067310"), raw_client=_FakeKiwoom(day, raw={}))
+    assert after.failed == 0 and after.exhausted == 0

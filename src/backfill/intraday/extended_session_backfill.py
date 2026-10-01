@@ -62,9 +62,11 @@ _LEDGER_COLUMNS: tuple[str, ...] = (
     "attempted_at",
     "vendor",
     "price_basis",
+    "attempts",
 )
 _LEDGER_KEYS: tuple[str, ...] = ("snapshot_date", "session", "symbol")
-_TERMINAL_LEDGER_STATES: frozenset[str] = frozenset({"COMPLETE", "NO_TRADES", "NOT_APPLICABLE"})
+EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS: int = 3
+_TERMINAL_LEDGER_STATES: frozenset[str] = frozenset({"COMPLETE", "NO_TRADES", "NOT_APPLICABLE", "EXHAUSTED"})
 # 원주가 소스(Kiwoom ka10080 _NX)가 있는 세션. KRX 애프터는 Kiwoom 과거 원주가 경로가 없어 fail-closed.
 _RAW_SOURCE_SESSIONS: frozenset[str] = frozenset({INTRADAY_SESSION_NXT_AFTERMARKET, INTRADAY_SESSION_NXT_PREMARKET})
 
@@ -189,7 +191,7 @@ def enumerate_extended_session_tasks(
 
 
 def _with_legacy_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    """Fill columns added after the first ledger files were written (vendor, price_basis)."""
+    """Fill columns added after the first ledger files were written (vendor, price_basis, attempts)."""
     out = frame
     if "vendor" not in out.columns:
         out = out.copy()
@@ -197,7 +199,32 @@ def _with_legacy_columns(frame: pd.DataFrame) -> pd.DataFrame:
     if "price_basis" not in out.columns:
         out = out.copy()
         out["price_basis"] = ""
+    if "attempts" not in out.columns:
+        out = out.copy()
+        if "status" in out.columns and len(out):
+            out["attempts"] = np.where(out["status"].astype(str) == "FAILED", 1, 0)
+        else:
+            out["attempts"] = 0
     return out
+
+
+def _latest_attempts(frame: pd.DataFrame, snapshot_date: str, session: str) -> dict[str, tuple[str, int]]:
+    """Latest (status, attempts) per symbol for one date/session from a legacy-filled frame."""
+    sub = frame[
+        (frame["snapshot_date"].astype(str) == str(snapshot_date))
+        & (frame["session"].astype(str) == str(session))
+    ]
+    if sub.empty:
+        return {}
+    latest = sub.drop_duplicates(subset=["symbol"], keep="last")
+    return {
+        str(symbol): (str(status), int(attempts))
+        for symbol, status, attempts in zip(
+            latest["symbol"].astype(str),
+            latest["status"].astype(str),
+            latest["attempts"],
+        )
+    }
 
 
 class ExtendedBackfillLedger:
@@ -270,7 +297,11 @@ class ExtendedBackfillLedger:
         vendor: str = "kis",
         price_bases: Mapping[str, str] | None = None,
     ) -> None:
-        """Append per-symbol outcomes; failures stay non-terminal for the next run.
+        """Append per-symbol outcomes; failures stay retryable until the attempt cap.
+
+        A key that has failed EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS consecutive runs is recorded as EXHAUSTED (terminal):
+        vendor history for an old date does not reappear, and retrying it forever rewrites old evidence directories
+        nightly (unprunable locally, one offsite segment per date). Any non-FAILED outcome resets the count.
 
         Args:
             snapshot_date: Trading date of the session partition.
@@ -282,25 +313,27 @@ class ExtendedBackfillLedger:
             price_bases: Raw-basis source per COMPLETE symbol ("kis_raw" or "kiwoom_raw"); others empty.
         """
         bases = dict(price_bases) if price_bases is not None else {}
-        rows = [
-            {
-                "snapshot_date": str(snapshot_date),
-                "session": str(session),
-                "symbol": str(entry.symbol),
-                "status": entry.status.value,
-                "rows": int(entry.rows),
-                "reason": str(entry.reason),
-                "run_id": str(run_id),
-                "attempted_at": attempted_at.isoformat(),
-                "vendor": str(vendor),
-                "price_basis": str(bases.get(str(entry.symbol), "")),
-            }
+        pending = [
+            (
+                entry,
+                {
+                    "snapshot_date": str(snapshot_date),
+                    "session": str(session),
+                    "symbol": str(entry.symbol),
+                    "status": entry.status.value,
+                    "rows": int(entry.rows),
+                    "reason": str(entry.reason),
+                    "run_id": str(run_id),
+                    "attempted_at": attempted_at.isoformat(),
+                    "vendor": str(vendor),
+                    "price_basis": str(bases.get(str(entry.symbol), "")),
+                },
+            )
             for entry in entries
             if entry.symbol is not None
         ]
-        if not rows:
+        if not pending:
             return
-        incoming = pd.DataFrame(rows, columns=list(_LEDGER_COLUMNS))
         with exclusive_file_lock(
             sidecar_lock_path(self._path),
             timeout_seconds=DEFAULT_LOCK_TIMEOUT_SECONDS,
@@ -309,6 +342,22 @@ class ExtendedBackfillLedger:
             existing = self._read_all()
             if not existing.empty:
                 existing = _with_legacy_columns(existing)
+                prev = _latest_attempts(existing, str(snapshot_date), str(session))
+            else:
+                prev = {}
+            rows = []
+            for entry, row in pending:
+                if entry.status == CaptureStatus.FAILED:
+                    before = prev.get(str(entry.symbol))
+                    attempts = int(before[1]) + 1 if before is not None and before[0] == "FAILED" else 1
+                    if attempts >= EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS:
+                        row["status"] = "EXHAUSTED"
+                        row["reason"] = f"exhausted:{row['reason']}"
+                    row["attempts"] = attempts
+                else:
+                    row["attempts"] = 0
+                rows.append(row)
+            incoming = pd.DataFrame(rows, columns=list(_LEDGER_COLUMNS))
             combined = (
                 pd.concat([existing, incoming], ignore_index=True)
                 if not existing.empty
@@ -329,6 +378,7 @@ class ExtendedBackfillSummary:
     not_listed: int
     failed: int
     stopped_by_deadline: bool
+    exhausted: int = 0
 
 
 def _stored_partition_symbols(snapshot_date: str, session: str) -> set[str]:
@@ -414,6 +464,7 @@ async def run_extended_session_backfill(
     no_trades = 0
     not_listed = 0
     failed = 0
+    exhausted = 0
     stopped = False
     async with AsyncExitStack() as stack:
         http_sessions = [await stack.enter_async_context(_http_session(client)) for client in clients]
@@ -582,6 +633,14 @@ async def run_extended_session_backfill(
             )
             store.publish_manifest(manifest)
             if entries:
+                prev_frame = ledger._read_all()
+                prev_map = (
+                    _latest_attempts(
+                        _with_legacy_columns(prev_frame), task.snapshot_date, task.session
+                    )
+                    if not prev_frame.empty
+                    else {}
+                )
                 ledger.record(
                     task.snapshot_date,
                     task.session,
@@ -589,6 +648,14 @@ async def run_extended_session_backfill(
                     run_id=run_id,
                     attempted_at=clock(),
                     price_bases=price_bases,
+                )
+                exhausted += sum(
+                    1
+                    for entry in entries
+                    if entry.status == CaptureStatus.FAILED
+                    and (before := prev_map.get(str(entry.symbol))) is not None
+                    and before[0] == "FAILED"
+                    and int(before[1]) + 1 >= EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
                 )
             task_complete = sum(1 for entry in entries if entry.status == CaptureStatus.COMPLETE)
             task_no_trades = sum(1 for entry in entries if entry.status == CaptureStatus.NO_TRADES)
@@ -622,6 +689,7 @@ async def run_extended_session_backfill(
         not_listed=not_listed,
         failed=failed,
         stopped_by_deadline=stopped,
+        exhausted=exhausted,
     )
 
 
@@ -741,13 +809,14 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
 
     kis_summary = asyncio.run(_run())
     logger.info(
-        "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d stopped_by_deadline=%s",
+        "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d exhausted=%d stopped_by_deadline=%s",
         kis_summary.tasks_done,
         kis_summary.tasks_remaining,
         kis_summary.complete,
         kis_summary.no_trades,
         kis_summary.not_listed,
         kis_summary.failed,
+        kis_summary.exhausted,
         kis_summary.stopped_by_deadline,
     )
 
