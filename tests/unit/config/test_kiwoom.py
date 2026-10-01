@@ -59,3 +59,33 @@ def test_global_settings_expose_renamed_kiwoom_fields() -> None:
     assert config_mod.KIWOOM_APP_KEY == settings.KIWOOM_APP_KEY
     assert config_mod.KIWOOM_BASE_URL == "https://api.kiwoom.com"
     assert hasattr(config_mod, "KIWOM_APP_KEY") is False
+
+
+def test_kiwoom_token_protected_windows_default_covers_decision_window() -> None:
+    from src.config.kiwoom import KiwoomSettings
+
+    assert KiwoomSettings().KIWOOM_TOKEN_PROTECTED_WINDOWS == ("15:10-15:40",)
+
+
+def test_kiwoom_token_protected_windows_reject_invalid_entries() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from src.config.kiwoom import KiwoomSettings
+
+    for bad in ("15:40-15:10", "15:10", "25:00-26:00", "15:10-15:10", "9:00-10:00"):
+        with pytest.raises(ValidationError):
+            KiwoomSettings(KIWOOM_TOKEN_PROTECTED_WINDOWS=(bad,))
+
+
+def test_kiwoom_token_protected_windows_accept_env_string_spellings() -> None:
+    from src.config.kiwoom import KiwoomSettings
+
+    assert KiwoomSettings(KIWOOM_TOKEN_PROTECTED_WINDOWS="15:10-15:40").KIWOOM_TOKEN_PROTECTED_WINDOWS == ("15:10-15:40",)
+    assert KiwoomSettings(
+        KIWOOM_TOKEN_PROTECTED_WINDOWS="09:00-09:30, 15:10-15:40"
+    ).KIWOOM_TOKEN_PROTECTED_WINDOWS == ("09:00-09:30", "15:10-15:40")
+    assert KiwoomSettings(
+        KIWOOM_TOKEN_PROTECTED_WINDOWS='["09:00-09:30", "15:10-15:40"]'
+    ).KIWOOM_TOKEN_PROTECTED_WINDOWS == ("09:00-09:30", "15:10-15:40")
+    assert KiwoomSettings(KIWOOM_TOKEN_PROTECTED_WINDOWS="").KIWOOM_TOKEN_PROTECTED_WINDOWS == ()

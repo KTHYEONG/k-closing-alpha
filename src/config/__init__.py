@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.config.admission import AdmissionSettings
 from src.config.alerts import AlertSettings
 from src.config.altdata import AltDataSettings
 from src.config.base import PathSettings
@@ -15,7 +16,7 @@ from src.config.toss import TossSettings
 from src.config.trading import TradingSettings
 
 
-class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings, TossSettings, AlertSettings, CollectionSettings):
+class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings, TossSettings, AlertSettings, CollectionSettings, AdmissionSettings):
     """Combined application settings singleton."""
 
 
@@ -23,6 +24,7 @@ settings = Settings()
 
 
 __all__ = [
+    "AdmissionSettings",
     "AlertSettings",
     "AltDataSettings",
     "CollectionSettings",

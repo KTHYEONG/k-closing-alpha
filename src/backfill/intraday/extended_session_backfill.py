@@ -458,7 +458,7 @@ async def run_extended_session_backfill(
         raise ValueError("stop_at must be timezone-aware")
     clock = now_fn if now_fn is not None else (lambda: datetime.now(SEOUL))
     ordered = sorted(tasks, key=lambda task: (task.snapshot_date, task.session))
-    batch_size = int(profile.COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE)
+    max_rows = int(profile.COLLECTION_ARCHIVE_PUBLISH_ROWS)
     done = 0
     complete = 0
     no_trades = 0
@@ -591,13 +591,32 @@ async def run_extended_session_backfill(
                 and str(entry.symbol) in collected
                 and not collected[str(entry.symbol)][0].empty
             ]
-            for chunk_pos in range(0, len(comp_chunks), batch_size):
-                chunk = comp_chunks[chunk_pos : chunk_pos + batch_size]
-                chunk_frame = pd.concat([frame for frame, _ in chunk], ignore_index=True)
-                chunk_coverage = {str(entry.symbol): entry for _, entry in chunk}
+            buffer_frames: list[pd.DataFrame] = []
+            buffer_coverage: dict[str, CoverageEntry] = {}
+            buffered_rows = 0
+
+            def _flush_buffer() -> None:
+                nonlocal buffer_frames, buffer_coverage, buffered_rows
+                if not buffer_coverage:
+                    return
+                chunk_frame = pd.concat(buffer_frames, ignore_index=True)
                 write_intraday_partition(
-                    chunk_frame, 1, task.snapshot_date, task.session, coverage=chunk_coverage
+                    chunk_frame, 1, task.snapshot_date, task.session, coverage=dict(buffer_coverage)
                 )
+                buffer_frames = []
+                buffer_coverage = {}
+                buffered_rows = 0
+
+            for frame, entry in comp_chunks:
+                key = str(entry.symbol)
+                if key in buffer_coverage:
+                    raise ValueError(f"Duplicate symbol buffered: {key!r}")
+                buffer_coverage[key] = entry
+                buffer_frames.append(frame)
+                buffered_rows += int(len(frame))
+                if buffered_rows >= max_rows:
+                    _flush_buffer()
+            _flush_buffer()
             stale = {
                 symbol
                 for symbol in pending

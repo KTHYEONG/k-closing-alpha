@@ -6,6 +6,7 @@ from typing import Any
 
 import src.config as _config
 from src.config import (
+    AdmissionSettings,
     AlertSettings,
     AltDataSettings,
     CollectionSettings,
@@ -20,6 +21,7 @@ from src.config import (
 )
 
 __all__ = [
+    "AdmissionSettings",
     "AlertSettings",
     "AltDataSettings",
     "CollectionSettings",

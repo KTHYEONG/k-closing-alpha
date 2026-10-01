@@ -54,7 +54,8 @@ def _violation_mask(frame: pd.DataFrame) -> pd.Series:
 
 
 def repair_bar_value_partition(
-    snapshot_date: str, session: str, *, bar_interval_minutes: int = 1, apply: bool = False
+    snapshot_date: str, session: str, *, bar_interval_minutes: int = 1, apply: bool = False,
+    allow_shrink_symbols: frozenset[str] = frozenset(),
 ) -> BarValueRepairReport:
     """Re-apply the KIS per-bar value consistency rule to an already stored 1m partition.
 
@@ -112,7 +113,8 @@ def repair_bar_value_partition(
         for symbol in symbols
     }
     write_intraday_partition(
-        subset, int(bar_interval_minutes), str(snapshot_date), str(session), coverage=coverage
+        subset, int(bar_interval_minutes), str(snapshot_date), str(session), coverage=coverage,
+        allow_shrink_symbols=frozenset(allow_shrink_symbols),
     )
     return BarValueRepairReport(str(snapshot_date), str(session), symbols, rows, True)
 
@@ -124,6 +126,7 @@ def main() -> None:
     parser.add_argument("--from", dest="from_date", required=True, help="Inclusive repair start (YYYY-MM-DD).")
     parser.add_argument("--to", dest="to_date", required=True, help="Inclusive repair end (YYYY-MM-DD).")
     parser.add_argument("--apply", action="store_true", help="Rewrite affected symbols (default dry run).")
+    parser.add_argument("--allow-shrink-symbol", action="append", default=[], help="Repeatable symbol explicitly authorised to shrink stored rows.")
     args = parser.parse_args()
     try:
         start = date.fromisoformat(str(args.from_date))
@@ -136,7 +139,10 @@ def main() -> None:
     while day <= end:
         day_str = day.isoformat()
         try:
-            report = repair_bar_value_partition(day_str, str(args.session), apply=bool(args.apply))
+            report = repair_bar_value_partition(
+                day_str, str(args.session), apply=bool(args.apply),
+                allow_shrink_symbols=frozenset(args.allow_shrink_symbol),
+            )
         except FileNotFoundError:
             logger.info(
                 "[DATA] stage=bar_value_repair date=%s session=%s status=SKIP reason=missing_partition symbols=0 rows=0 written=False",

@@ -223,12 +223,13 @@ def test_sync_units_fetches_resets_and_converges_in_order(monkeypatch) -> None:
         "/repo", sha=sha, git_fn=fake_git,
         uv_sync_fn=lambda repo_dir: order.append("uv_sync"),
         secure_fn=lambda repo_dir: order.append("secure") or True,
+        marker_fn=lambda: order.append("marker") or True,
         install_units_fn=lambda repo_dir: order.append("install") or units,
     )
 
     # Then
     assert git_calls == [["fetch", "origin", sha, "--quiet"], ["reset", "--hard", sha]]
-    assert order == ["uv_sync", "secure", "install"]
+    assert order == ["uv_sync", "secure", "marker", "install"]
     assert result == units
 
 
@@ -249,7 +250,36 @@ def test_sync_units_propagates_git_failure(monkeypatch) -> None:
         sync_units(
             "/repo", sha="c" * 40, git_fn=failing_git,
             uv_sync_fn=fail_if_called, secure_fn=fail_if_called, install_units_fn=fail_if_called,
+            marker_fn=fail_if_called,
         )
+
+
+def test_ensure_host_admission_marker_creates_once_owner_only(tmp_path) -> None:
+    from src.api.kis.rate_limit import HOST_ADMISSION_MARKER
+    from src.tools.code_sync import ensure_host_admission_marker
+
+    target = tmp_path / "cache" / "kis"
+
+    # When / Then
+    assert ensure_host_admission_marker(target) is True
+    assert (target / HOST_ADMISSION_MARKER).is_file()
+    assert target.stat().st_mode & 0o777 == 0o700
+    assert ensure_host_admission_marker(target) is False
+
+
+def test_ensure_host_admission_marker_defaults_to_settings_dir(tmp_path, monkeypatch) -> None:
+    from src import settings
+    from src.api.kis.rate_limit import HOST_ADMISSION_MARKER
+    from src.tools.code_sync import ensure_host_admission_marker
+
+    monkeypatch.setattr(settings.settings, "BROKER_ADMISSION_DIR", None)
+    monkeypatch.setattr(settings.settings, "KIS_TOKEN_CACHE_DIR", tmp_path / "kis")
+    assert ensure_host_admission_marker() is True
+    assert (tmp_path / "kis" / HOST_ADMISSION_MARKER).is_file()
+
+    monkeypatch.setattr(settings.settings, "BROKER_ADMISSION_DIR", tmp_path / "shared")
+    assert ensure_host_admission_marker() is True
+    assert (tmp_path / "shared" / HOST_ADMISSION_MARKER).is_file()
 
 
 def test_code_sync_main_invokes_sync_units_with_settings_base_dir_and_sha(monkeypatch) -> None:

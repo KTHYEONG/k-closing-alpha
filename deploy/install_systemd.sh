@@ -6,6 +6,9 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/systemd" && pwd)"
 DEST_DIR="${HOME}/.config/systemd/user"
 
 mkdir -p "${DEST_DIR}"
+mkdir -p "${HOME}/.cache/kis"
+chmod 700 "${HOME}/.cache/kis"
+touch "${HOME}/.cache/kis/.host-admission"
 cp "${SRC_DIR}"/kca-*.timer "${SRC_DIR}"/kca-*.service "${DEST_DIR}/"
 
 systemctl --user daemon-reload
@@ -28,6 +31,7 @@ systemctl --user enable --now \
   kca-offsite-verify.timer \
   kca-retrain.timer \
   kca-kis-token-warmup.timer \
+  kca-kiwoom-token-rotate.timer \
   kca-extended-backfill.timer
 
 # Keep user timers alive without an active login session (WSL).

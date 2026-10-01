@@ -1,0 +1,19 @@
+[Unit]
+Description=KCA Kiwoom token phase rotation (shared token expiry out of decision window)
+OnFailure=kca-alert@%n.service
+StartLimitIntervalSec=2h
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+# RestartMode=direct는 중간 재시도에서 OnFailure를 억제하고 최종 실패에서만 알림한다
+Restart=on-failure
+RestartMode=direct
+RestartSec=5min
+WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
+Environment=TZ=Asia/Seoul
+# 단일 revoke + 재발급 왕복(실측 수초) → 5분 (재시도 전체 예산은 08:00 이전에 종료)
+TimeoutStartSec=5min
+ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kca-kiwoom-token-rotate --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e BROKER_ADMISSION_CLASS=critical -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.tools.kiwoom_token_rotate
+ExecStopPost=-/usr/bin/docker rm -f kca-kiwoom-token-rotate

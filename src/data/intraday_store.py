@@ -222,6 +222,94 @@ def _partition_row_count(target: Path) -> int:
     return int(handle.metadata.num_rows)
 
 
+def _stored_symbol_counts(target: Path, symbols: set[str], batch_rows: int) -> dict[str, int]:
+    counts: dict[str, int] = {str(item): 0 for item in symbols}
+    if not symbols or not target.exists():
+        return counts
+    try:
+        handle = pq.ParquetFile(target)
+    except Exception as e:
+        raise OSError(f"Cannot read existing partition evidence: {target}") from e
+    try:
+        for batch in handle.iter_batches(batch_size=batch_rows, columns=["symbol"]):
+            frame = batch.to_pandas()
+            if "symbol" not in frame.columns:
+                raise ValueError("Legacy partition missing key columns: ['symbol']")
+            for symbol, n in frame["symbol"].astype(str).value_counts().items():
+                key = str(symbol)
+                if key in counts:
+                    counts[key] += int(n)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise OSError(f"Cannot read existing partition evidence: {target}") from e
+    return counts
+
+
+def _quarantine_shrink_rows(frame: pd.DataFrame, snapshot_date: str, session: str, symbol: str) -> str:
+    if len(frame) == 0:
+        return "none"
+    root = _capture_root()
+    qdir = root / "quarantine" / "shrink" / str(snapshot_date) / str(session)
+    qdir.mkdir(parents=True, exist_ok=True)
+    qpath = qdir / f"{symbol}-{uuid.uuid4().hex}.parquet"
+    frame.to_parquet(qpath, index=False)
+    return str(qpath)
+
+
+def _apply_shrink_guard(
+    target: Path,
+    incoming: pd.DataFrame,
+    replaced: set[str],
+    batch_rows: int,
+    snapshot_date: str,
+    session: str,
+    allow_shrink_symbols: frozenset[str],
+) -> tuple[pd.DataFrame, set[str]]:
+    allowed = frozenset(str(item) for item in allow_shrink_symbols)
+    if not replaced:
+        return incoming, set()
+    stored_counts = _stored_symbol_counts(target, set(replaced), batch_rows)
+    incoming_counts: dict[str, int] = {str(item): 0 for item in replaced}
+    if len(incoming) > 0 and "symbol" in incoming.columns:
+        for symbol, n in incoming["symbol"].astype(str).value_counts().items():
+            key = str(symbol)
+            if key in incoming_counts:
+                incoming_counts[key] = int(n)
+    rejected: set[str] = set()
+    for symbol in replaced:
+        key = str(symbol)
+        before = int(stored_counts.get(key, 0))
+        after = int(incoming_counts.get(key, 0))
+        if after < before and key not in allowed:
+            rejected.add(key)
+    for symbol in sorted(rejected):
+        before = int(stored_counts.get(symbol, 0))
+        after = int(incoming_counts.get(symbol, 0))
+        if len(incoming) > 0 and "symbol" in incoming.columns:
+            rows = incoming[incoming["symbol"].astype(str) == symbol].copy()
+        else:
+            rows = incoming.iloc[0:0]
+        quarantine = _quarantine_shrink_rows(rows, snapshot_date, session, symbol)
+        logger.warning(
+            "[DATA] stage=intraday_replace status=SHRINK_REJECTED date=%s session=%s symbol=%s before=%d after=%d quarantine=%s",
+            snapshot_date, session, symbol, before, after, quarantine,
+        )
+    for symbol in sorted(replaced - rejected):
+        before = int(stored_counts.get(str(symbol), 0))
+        after = int(incoming_counts.get(str(symbol), 0))
+        if after < before and str(symbol) in allowed:
+            logger.info(
+                "[DATA] stage=intraday_replace status=SHRINK_ALLOWED date=%s session=%s symbol=%s before=%d after=%d",
+                snapshot_date, session, symbol, before, after,
+            )
+    if rejected:
+        replaced = {str(item) for item in replaced if str(item) not in rejected}
+        if len(incoming) > 0 and "symbol" in incoming.columns:
+            incoming = incoming[~incoming["symbol"].astype(str).isin(rejected)].copy()
+    return incoming, replaced
+
+
 def _retain_backup_ref(
     target: Path,
     snapshot_date: str,
@@ -319,6 +407,7 @@ def _bounded_symbol_replace(
     session: str,
     *,
     sort_output: bool,
+    allow_shrink_symbols: frozenset[str] = frozenset(),
 ) -> int:
     # 지연 임포트: parquet_codec -> panel_integrity -> cost_model -> intraday_store로
     # 되돌아오는 순환 임포트를 모듈 로드 시점에 막기 위해 호출 시점에만 가져온다.
@@ -326,6 +415,11 @@ def _bounded_symbol_replace(
 
     with exclusive_file_lock(sidecar_lock_path(target), timeout_seconds=_LOCK_TIMEOUT_SECONDS, purpose="partition"):
         before_count = _partition_row_count(target)
+        incoming, replaced = _apply_shrink_guard(
+            target, incoming, set(replaced), batch_rows, str(snapshot_date), str(session), frozenset(allow_shrink_symbols),
+        )
+        if not replaced:
+            return before_count
         before_symbols: set[str] = set()
         backup_ref = ""
         if target.exists():
@@ -419,9 +513,10 @@ def remove_intraday_symbols(bar_interval_minutes: int, snapshot_date: str, sessi
     if not symbols or not target.exists():
         return _partition_row_count(target)
     empty = pd.DataFrame({c: pd.Series(dtype="object") for c in CANONICAL_BAR_COLUMNS})
+    explicit = {str(s) for s in symbols}
     return _bounded_symbol_replace(
-        target, empty, {str(s) for s in symbols}, _batch_rows_or_default(None), str(snapshot_date), str(session),
-        sort_output=True,
+        target, empty, explicit, _batch_rows_or_default(None), str(snapshot_date), str(session),
+        sort_output=True, allow_shrink_symbols=frozenset(explicit),
     )
 
 
@@ -433,6 +528,7 @@ def write_intraday_partition(
     *,
     coverage: Mapping[str, CoverageEntry] | None = None,
     batch_rows: int | None = None,
+    allow_shrink_symbols: frozenset[str] = frozenset(),
 ) -> int:
     """Publish complete bar attempts without retaining contaminated earlier ranges.
 
@@ -443,6 +539,11 @@ def write_intraday_partition(
         session: Verified session partition.
         coverage: Expected membership and bounded task certification.
         batch_rows: Arrow rewrite batch bound.
+        allow_shrink_symbols: Symbols an operator explicitly authorises to end with fewer
+            stored rows than before. Every other replaced symbol whose incoming row count is
+            below its stored count is rejected: its stored rows are kept, its incoming rows are
+            quarantined, and a SHRINK_REJECTED event is logged. Certified evidence must never
+            lose observations through an automated path.
 
     Returns:
         Total published rows.
@@ -452,6 +553,7 @@ def write_intraday_partition(
         OSError: Existing evidence or staging/publication fails.
     """
     bound = _batch_rows_or_default(batch_rows)
+    allowed = frozenset(str(item) for item in allow_shrink_symbols)
     target = intraday_partition_path(bar_interval_minutes, snapshot_date, session)
     if df is None or len(df) == 0:
         if coverage is None:
@@ -466,19 +568,19 @@ def write_intraday_partition(
         }
         if not no_trades:
             return _partition_row_count(target)
-        return _bounded_symbol_replace(target, df, no_trades, bound, str(snapshot_date), str(session), sort_output=True)
+        return _bounded_symbol_replace(target, df, no_trades, bound, str(snapshot_date), str(session), sort_output=True, allow_shrink_symbols=allowed)
     symbols = _validate_bar_frame(df, str(snapshot_date), str(session), coverage)
     reconciled = _deduplicate_bars(df)
     if coverage is None:
         replaced = set(symbols)
         if target.exists():
             _check_legacy_unchanged(target, reconciled, replaced, bound)
-        total = _bounded_symbol_replace(target, reconciled, replaced, bound, str(snapshot_date), str(session), sort_output=True)
+        total = _bounded_symbol_replace(target, reconciled, replaced, bound, str(snapshot_date), str(session), sort_output=True, allow_shrink_symbols=allowed)
         log_session_coverage_outliers(reconciled, bar_interval_minutes, str(snapshot_date), str(session))
         logger.info("Wrote intraday partition %s (%d rows)", target, total)
         return total
     replaced = _require_certified(symbols, coverage, str(session))
-    total = _bounded_symbol_replace(target, reconciled, replaced, bound, str(snapshot_date), str(session), sort_output=True)
+    total = _bounded_symbol_replace(target, reconciled, replaced, bound, str(snapshot_date), str(session), sort_output=True, allow_shrink_symbols=allowed)
     log_session_coverage_outliers(reconciled, bar_interval_minutes, str(snapshot_date), str(session))
     logger.info("Wrote intraday partition %s (%d rows)", target, total)
     return total
@@ -491,6 +593,7 @@ def write_tick_partition(
     *,
     coverage: Mapping[str, CoverageEntry] | None = None,
     batch_rows: int | None = None,
+    allow_shrink_symbols: frozenset[str] = frozenset(),
 ) -> int:
     """Publish verified symbol attempts without inventing trade identities.
 
@@ -504,6 +607,11 @@ def write_tick_partition(
         session: Explicit verified session partition.
         coverage: Per-symbol acquisition and venue/session certification.
         batch_rows: Configured bounded Arrow rewrite batch size.
+        allow_shrink_symbols: Symbols an operator explicitly authorises to end with fewer
+            stored rows than before. Every other replaced symbol whose incoming row count is
+            below its stored count is rejected: its stored rows are kept, its incoming rows are
+            quarantined, and a SHRINK_REJECTED event is logged. Certified evidence must never
+            lose observations through an automated path.
 
     Returns:
         Total rows in the newly published partition.
@@ -513,6 +621,7 @@ def write_tick_partition(
         OSError: Existing evidence cannot be read or publication fails.
     """
     bound = _batch_rows_or_default(batch_rows)
+    allowed = frozenset(str(item) for item in allow_shrink_symbols)
     target = tick_partition_path(snapshot_date, session)
     if df is None or len(df) == 0:
         if coverage is None:
@@ -527,17 +636,17 @@ def write_tick_partition(
         }
         if not no_trades:
             return _partition_row_count(target)
-        return _bounded_symbol_replace(target, df, no_trades, bound, str(snapshot_date), str(session), sort_output=False)
+        return _bounded_symbol_replace(target, df, no_trades, bound, str(snapshot_date), str(session), sort_output=False, allow_shrink_symbols=allowed)
     symbols = _validate_tick_frame(df, str(snapshot_date), str(session), coverage)
     if coverage is None:
         replaced = set(symbols)
         if target.exists():
             _check_legacy_unchanged(target, df, replaced, bound)
-        total = _bounded_symbol_replace(target, df, replaced, bound, str(snapshot_date), str(session), sort_output=False)
+        total = _bounded_symbol_replace(target, df, replaced, bound, str(snapshot_date), str(session), sort_output=False, allow_shrink_symbols=allowed)
         logger.info("Wrote tick partition %s (%d rows)", target, total)
         return total
     replaced = _require_certified(symbols, coverage, str(session))
-    total = _bounded_symbol_replace(target, df, replaced, bound, str(snapshot_date), str(session), sort_output=False)
+    total = _bounded_symbol_replace(target, df, replaced, bound, str(snapshot_date), str(session), sort_output=False, allow_shrink_symbols=allowed)
     logger.info("Wrote tick partition %s (%d rows)", target, total)
     return total
 

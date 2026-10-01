@@ -26,14 +26,14 @@ from src.api.kis.key_pool import (
     select_data_credential,
     token_cache_path,
 )
-from src.api.kis.rate_limit import get_host_rate_limiter
+from src.api.kis.rate_limit import get_host_rate_limiter, resolve_admission_dir
 
 if TYPE_CHECKING:
     from src.data.capture_contracts import BrokerPayload, PageObserver
 
 logger = logging.getLogger(__name__)
 
-KIS_REST_TPS_PER_APP_KEY: float = 18.0  # KIS 서버 앱키당 초당 20건 한도의 여유분
+KIS_REST_TPS_PER_APP_KEY: float = 18.0  # Vendor-documented per-account live limit (KIS).
 KIS_DECISION_WINDOW_START = time(15, 15)
 KIS_DECISION_WINDOW_END = time(15, 35)
 _KST = ZoneInfo("Asia/Seoul")
@@ -84,7 +84,7 @@ class KisApiClient:
         self.token_file = str(token_file) if token_file else str(token_cache_path(self.app_key or "", settings.KIS_TOKEN_CACHE_DIR))
         self._market_div_cache = {}
         self._token_lock: asyncio.Lock | None = None
-        self.rate_limiter = get_host_rate_limiter(settings.KIS_TOKEN_CACHE_DIR / f"tps_{kis_key_id(self.app_key or '')}.state", KIS_REST_TPS_PER_APP_KEY)
+        self.rate_limiter = get_host_rate_limiter(resolve_admission_dir() / f"tps_{kis_key_id(self.app_key or '')}.state", KIS_REST_TPS_PER_APP_KEY)
 
     def create_session(self, *, timeout: aiohttp.ClientTimeout | None = None) -> aiohttp.ClientSession:
         """최적화된 커넥터와 bounded request timeout을 가진 세션을 생성합니다."""

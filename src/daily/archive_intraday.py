@@ -334,30 +334,39 @@ class _BatchedPartitionPublisher:
     """Buffer certified per-symbol results and flush them as one partition write."""
 
     def __init__(
-        self, write_fn: Callable[[pd.DataFrame, dict[str, CoverageEntry]], int], batch_size: int
+        self, write_fn: Callable[[pd.DataFrame, dict[str, CoverageEntry]], int], max_rows: int
     ) -> None:
-        if batch_size <= 0:
-            raise ValueError(f"Invalid batch_size: {batch_size!r}")
+        if max_rows <= 0:
+            raise ValueError(f"Invalid max_rows: {max_rows!r}")
         self._write_fn = write_fn
-        self._batch_size = batch_size
+        self._max_rows = max_rows
         self._frames: list[pd.DataFrame] = []
         self._coverage: dict[str, CoverageEntry] = {}
+        self._buffered_rows = 0
 
     def add(self, symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
-        """Buffer one write-eligible symbol; auto-flush once the batch fills."""
-        self._frames.append(frame)
+        """Buffer one write-eligible symbol; flush once buffered rows reach max_rows."""
+        if symbol in self._coverage:
+            raise ValueError(f"Duplicate symbol buffered: {symbol!r}")
         self._coverage[symbol] = entry
-        if len(self._coverage) >= self._batch_size:
+        if frame is not None and len(frame) > 0:
+            self._frames.append(frame)
+            self._buffered_rows += int(len(frame))
+        if self._buffered_rows >= self._max_rows:
             self.flush()
 
     def flush(self) -> int:
         """Write every buffered symbol in one call; no-op returning 0 when empty."""
         if not self._coverage:
             return 0
-        combined = pd.concat(self._frames, ignore_index=True)
+        if self._frames:
+            combined = pd.concat(self._frames, ignore_index=True)
+        else:
+            combined = pd.DataFrame()
         written = self._write_fn(combined, dict(self._coverage))
         self._frames = []
         self._coverage = {}
+        self._buffered_rows = 0
         return written
 
 
@@ -419,55 +428,55 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
             codes, prev_incomplete = _resolve_cohort_codes(str(snap_date), prof, store, previous_trading_day=prev_trading_day)
             interval = int(bar_interval_minutes)
             batch_rows = int(prof.COLLECTION_ARROW_BATCH_ROWS)
-            batch_size = int(prof.COLLECTION_ARCHIVE_SYMBOL_BATCH_SIZE)
+            max_rows = int(prof.COLLECTION_ARCHIVE_PUBLISH_ROWS)
             bars_publisher = _BatchedPartitionPublisher(
                 lambda df, coverage: write_intraday_partition(
                     df, interval, str(snap_date), INTRADAY_SESSION_REGULAR,
                     coverage=coverage, batch_rows=batch_rows,
                 ),
-                batch_size,
+                max_rows,
             )
             ticks_publisher = _BatchedPartitionPublisher(
                 lambda df, coverage: write_tick_partition(
                     df, str(snap_date), INTRADAY_SESSION_REGULAR,
                     coverage=coverage, batch_rows=batch_rows,
                 ),
-                batch_size,
+                max_rows,
             )
             nxt_after_publisher = _BatchedPartitionPublisher(
                 lambda df, coverage: write_intraday_partition(
                     df, interval, str(snap_date), INTRADAY_SESSION_NXT_AFTERMARKET,
                     coverage=coverage, batch_rows=batch_rows,
                 ),
-                batch_size,
+                max_rows,
             )
             nxt_pre_publisher = _BatchedPartitionPublisher(
                 lambda df, coverage: write_intraday_partition(
                     df, interval, str(snap_date), INTRADAY_SESSION_NXT_PREMARKET,
                     coverage=coverage, batch_rows=batch_rows,
                 ),
-                batch_size,
+                max_rows,
             )
             krx_after_publisher = _BatchedPartitionPublisher(
                 lambda df, coverage: write_intraday_partition(
                     df, interval, str(snap_date), INTRADAY_SESSION_KRX_AFTERMARKET,
                     coverage=coverage, batch_rows=batch_rows,
                 ),
-                batch_size,
+                max_rows,
             )
             krx_after_ticks_publisher = _BatchedPartitionPublisher(
                 lambda df, coverage: write_tick_partition(
                     df, str(snap_date), INTRADAY_SESSION_KRX_AFTERMARKET,
                     coverage=coverage, batch_rows=batch_rows,
                 ),
-                batch_size,
+                max_rows,
             )
             nxt_after_ticks_publisher = _BatchedPartitionPublisher(
                 lambda df, coverage: write_tick_partition(
                     df, str(snap_date), INTRADAY_SESSION_NXT_AFTERMARKET,
                     coverage=coverage, batch_rows=batch_rows,
                 ),
-                batch_size,
+                max_rows,
             )
             bar_entries: list[CoverageEntry] = []
             tick_entries: list[CoverageEntry] = []
@@ -480,7 +489,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
 
             def publish_bars(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 bar_entries.append(entry)
-                if entry.status == CaptureStatus.COMPLETE and not frame.empty:
+                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
                     bars_publisher.add(symbol, frame, entry)
                     counts["bars"] += len(frame)
                 elif not frame.empty:
@@ -488,7 +497,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
 
             def publish_ticks(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 tick_entries.append(entry)
-                if entry.status == CaptureStatus.COMPLETE and not frame.empty:
+                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
                     ticks_publisher.add(symbol, frame, entry)
                     counts["ticks"] += len(frame)
                 elif not frame.empty:
@@ -496,25 +505,25 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
 
             def publish_nxt_after(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 nxt_after_entries.append(entry)
-                if entry.status == CaptureStatus.COMPLETE and not frame.empty:
+                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
                     nxt_after_publisher.add(symbol, frame, entry)
                     counts["nxt_after"] += len(frame)
 
             def publish_nxt_pre(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 nxt_pre_entries.append(entry)
-                if entry.status == CaptureStatus.COMPLETE and not frame.empty:
+                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
                     nxt_pre_publisher.add(symbol, frame, entry)
                     counts["nxt_pre"] += len(frame)
 
             def publish_krx_after(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 krx_after_entries.append(entry)
-                if entry.status == CaptureStatus.COMPLETE and not frame.empty:
+                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
                     krx_after_publisher.add(symbol, frame, entry)
                     counts["krx_after"] += len(frame)
 
             def publish_krx_after_ticks(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 krx_after_tick_entries.append(entry)
-                if entry.status == CaptureStatus.COMPLETE and not frame.empty:
+                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
                     krx_after_ticks_publisher.add(symbol, frame, entry)
                     counts["krx_after_ticks"] += len(frame)
                 elif not frame.empty:
@@ -522,7 +531,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
 
             def publish_nxt_after_ticks(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
                 nxt_after_tick_entries.append(entry)
-                if entry.status == CaptureStatus.COMPLETE and not frame.empty:
+                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
                     nxt_after_ticks_publisher.add(symbol, frame, entry)
                     counts["nxt_after_ticks"] += len(frame)
                 elif not frame.empty:

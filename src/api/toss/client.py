@@ -11,13 +11,23 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from datetime import UTC, datetime
 
-from src.api.kis.rate_limit import AsyncRateLimiter, get_shared_rate_limiter
+from src.api.kis.rate_limit import HostPacedRateLimiter, get_host_rate_limiter, host_admission_state_path
+from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
 from src.config import settings
 
 logger = logging.getLogger(__name__)
 
 _OAUTH_PATH = "/oauth2/token"
+
+TOSS_INVALID_TOKEN_CODES: frozenset[str] = frozenset({"invalid-token"})
+
+_TOSS_TOKEN_EXPIRY_MARGIN_SECONDS: float = 300.0
+
+TOSS_RETRY_AFTER_MAX_SECONDS: float = 5.0
+"""Ceiling on a server-sent Retry-After wait; collect calls Toss inside the 15:20 decision window,
+so an unbounded vendor hint could stall the decision snapshot."""
 
 TOSS_RATE_LIMIT_GROUPS: dict[str, float] = {
     "AUTH": 5.0,
@@ -57,46 +67,81 @@ class TossApiClient:
         self.app_secret = app_secret or settings.TOSS_APP_SECRET
         self.base_url = base_url or settings.TOSS_BASE_URL
         self.token: str | None = None
-        self._token_lock: asyncio.Lock | None = None
 
-    def _limiter_for(self, group: str) -> AsyncRateLimiter:
+    def _limiter_for(self, group: str) -> HostPacedRateLimiter:
         rate = TOSS_RATE_LIMIT_GROUPS.get(group)
         if rate is None:
             raise ValueError(f"unknown Toss rate limit group: {group}")
-        return get_shared_rate_limiter("toss", f"{self.app_key}:{group}:{rate}", rate)
+        return get_host_rate_limiter(host_admission_state_path("toss", self.app_key or "", group), rate)
+
+    def _token_store(self) -> SharedTokenStore:
+        return SharedTokenStore(
+            shared_token_path("toss", self.app_key or ""),
+            lock_timeout_seconds=float(settings.BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS),
+            expiry_margin_seconds=_TOSS_TOKEN_EXPIRY_MARGIN_SECONDS,
+            clock=lambda: datetime.now(UTC),
+        )
+
+    async def _issue_token(self, session) -> IssuedToken:
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": self.app_key,
+            "client_secret": self.app_secret,
+        }
+        raw = session.post(f"{self.base_url}{_OAUTH_PATH}", data=payload)
+        if inspect.isawaitable(raw):
+            raw = await raw
+        async with raw as resp:
+            body = await resp.json()
+        token = str(body.get("access_token", ""))
+        if not token:
+            raise RuntimeError("Toss token issuance failed")
+        expires_raw = body.get("expires_in")
+        expires_in: float | None = None
+        if isinstance(expires_raw, bool):
+            expires_in = None
+        elif isinstance(expires_raw, (int, float)):
+            expires_in = float(expires_raw)
+        elif isinstance(expires_raw, str) and expires_raw.strip().lstrip("+-").replace(".", "", 1).isdigit():
+            try:
+                expires_in = float(expires_raw.strip())
+            except ValueError:
+                expires_in = None
+        return IssuedToken(access_token=token, expires_in_seconds=expires_in)
 
     async def ensure_token(self, session) -> str:
-        """OAuth2 client_credentials 토큰 발급 (단일비행, 메모리 캐시, 24h 유효)."""
-        if self.token:
-            return self.token
-        if self._token_lock is None:
-            self._token_lock = asyncio.Lock()
-        async with self._token_lock:
-            if self.token:
-                return self.token
-            payload = {
-                "grant_type": "client_credentials",
-                "client_id": self.app_key,
-                "client_secret": self.app_secret,
-            }
-            raw = session.post(f"{self.base_url}{_OAUTH_PATH}", data=payload)
-            if inspect.isawaitable(raw):
-                raw = await raw
-            async with raw as resp:
-                body = await resp.json()
-            token = str(body.get("access_token", ""))
-            if not token:
-                raise RuntimeError(f"Toss token issuance failed: {body}")
-            self.token = token
-            return token
+        record = await self._token_store().get_or_issue(lambda: self._issue_token(session))
+        self.token = record.access_token
+        return self.token
+
+    @staticmethod
+    def _is_invalid_token(status: int, data: dict) -> bool:
+        if status == 401:
+            return True
+        error = data.get("error")
+        if isinstance(error, dict):
+            return str(error.get("code", "")) in TOSS_INVALID_TOKEN_CODES
+        return False
+
+    @staticmethod
+    def _retry_after_seconds(resp_headers: dict) -> float | None:
+        for key, value in resp_headers.items():
+            if str(key).lower() == "retry-after":
+                try:
+                    parsed = float(str(value).strip().split(",")[0])
+                except (ValueError, TypeError):
+                    return None
+                if parsed > 0 and parsed != float("inf"):
+                    return min(parsed, TOSS_RETRY_AFTER_MAX_SECONDS)
+                return None
+        return None
 
     async def _get(self, session, path: str, group: str, params: dict | None = None, max_retries: int = 3) -> dict:
         if not self.token:
             await self.ensure_token(session)
         limiter = self._limiter_for(group)
 
-        data: dict = {}
-        for attempt in range(max_retries):
+        async def _single_get() -> tuple[dict, int, dict]:
             await limiter.acquire()
             headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
             raw = session.get(f"{self.base_url}{path}", headers=headers, params=params or {})
@@ -104,13 +149,48 @@ class TossApiClient:
                 raw = await raw
             async with raw as resp:
                 data = await resp.json()
-                status = resp.status
-            if status == 429 and attempt < max_retries - 1:
-                logger.warning(
-                    "Toss rate limit hit (429) group=%s path=%s. Retrying in 1.2s... (attempt %d/%d)",
-                    group, path, attempt + 1, max_retries,
+                status = int(getattr(resp, "status", 200) or 200)
+                headers_raw = getattr(resp, "headers", None)
+                if isinstance(headers_raw, dict):
+                    resp_headers = dict(headers_raw)
+                elif hasattr(headers_raw, "items") and not type(headers_raw).__name__.endswith("Mock"):
+                    try:
+                        resp_headers = dict(headers_raw)
+                    except Exception:
+                        resp_headers = {}
+                else:
+                    resp_headers = {}
+            return data, status, resp_headers
+
+        refreshed = False
+        data: dict = {}
+        for attempt in range(max_retries):
+            data, status, resp_headers = await _single_get()
+            if self._is_invalid_token(status, data) and not refreshed:
+                refreshed = True
+                record = await self._token_store().replace_rejected(
+                    self.token or "", lambda: self._issue_token(session)
                 )
-                await asyncio.sleep(1.2)
+                self.token = record.access_token
+                data, status, resp_headers = await _single_get()
+                if self._is_invalid_token(status, data):
+                    return data
+                if status == 429 and attempt < max_retries - 1:
+                    wait = self._retry_after_seconds(resp_headers) or 1.2
+                    logger.warning(
+                        "Toss rate limit hit (429) group=%s path=%s. Retrying in %.1fs... (attempt %d/%d)",
+                        group, path, wait, attempt + 1, max_retries,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                return data
+            if status == 429 and attempt < max_retries - 1:
+                wait = self._retry_after_seconds(resp_headers) or 1.2
+                logger.warning(
+                    "Toss rate limit hit (429) group=%s path=%s. Retrying in %.1fs... (attempt %d/%d)",
+                    group, path, wait, attempt + 1, max_retries,
+                )
+                await asyncio.sleep(wait)
                 continue
             return data
         return data
