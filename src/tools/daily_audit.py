@@ -948,6 +948,32 @@ def audit_tape_sweep(
     return tuple(issues)
 
 
+def audit_extended_exhausted(*, ledger_path: Path | None = None) -> tuple[str, ...]:
+    """Count EXHAUSTED extended-backfill ledger keys (informational only, never a warning).
+
+    Args:
+        ledger_path: Ledger parquet location; None uses the history-tree default.
+
+    Returns:
+        A single `intraday:extended_exhausted:<n>` line for the report body;
+        empty when the ledger is absent or unreadable.
+    """
+    from src.backfill.intraday.extended_session_backfill import ExtendedBackfillLedger
+
+    ledger = ExtendedBackfillLedger(ledger_path) if ledger_path is not None else ExtendedBackfillLedger()
+    try:
+        frame = ledger._read_all()
+    except (OSError, ValueError):
+        return ()
+    if frame.empty or "status" not in frame.columns:
+        return ()
+    latest = frame.drop_duplicates(
+        subset=["snapshot_date", "session", "symbol"], keep="last"
+    )
+    count = int((latest["status"].astype(str) == "EXHAUSTED").sum())
+    return (f"intraday:extended_exhausted:{count}",)
+
+
 def _expiry_hint_lines(items: Sequence[str]) -> list[str]:
     """KRX 달력 수평선 자체가 만료 예정일 때 표시하는 고정 갱신 안내."""
     if any(item.startswith(f"{CALENDAR_EXPIRY_NAME}:") for item in items):
@@ -968,6 +994,7 @@ def build_digest(
     undelivered_alerts: int = 0,
     expiry_notices: Sequence[str] = (),
     expiry_warnings: Sequence[str] = (),
+    info_lines: Sequence[str] = (),
 ) -> tuple[str, str]:
     """일일 요약의 (제목, 본문)을 만든다.
 
@@ -982,6 +1009,7 @@ def build_digest(
         undelivered_alerts: Outbox에 적체된 미전송 알림 수. 0보다 크면 경고.
         expiry_notices: D-30 이내 만료 예정 항목. 정상 요약을 경고로 바꾸지 않는다.
         expiry_warnings: D-7 이내(지난 항목 포함) 만료 항목. backup_issues처럼 경고로 격상한다.
+        info_lines: 경고로 격상하지 않는 정보성 본문 라인(예: extended-backfill 소진 수).
 
     Returns:
         (제목, 본문) 튜플.
@@ -993,6 +1021,7 @@ def build_digest(
     if day_kind not in (DAY_WEEKEND, DAY_HOLIDAY, DAY_TRADING, DAY_UNKNOWN):
         raise ValueError(f"unsupported day_kind={day_kind!r}")
     lines = [f"date={snapshot_date}", f"day={day_kind}", f"session={session_kind}"]
+    lines.extend(info_lines)
     missing: list[str] = []
     if day_kind != DAY_HOLIDAY:
         if result is None:
@@ -1257,6 +1286,12 @@ def run_daily_audit(
         logger.warning("[DATA] stage=daily_audit collection_audit=UNAVAILABLE reason=%s", type(exc).__name__)
         collection_issues = (_collection_issue("audit", 1, "unavailable"),)
         intraday_issues = ()
+    try:
+        extended_info = audit_extended_exhausted()
+    except (OSError, ValueError):
+        extended_info = ()
+    if extended_info:
+        logger.info("[DATA] stage=daily_audit %s", extended_info[0])
     if result is not None:
         result["intraday_complete"] = not intraday_issues
     if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
@@ -1275,6 +1310,7 @@ def run_daily_audit(
         undelivered_alerts=undelivered_alerts,
         expiry_notices=report.notices,
         expiry_warnings=report.warnings,
+        info_lines=extended_info,
     )
     has_warning = "경고:" in subject or "🚨" in subject
     if has_warning:

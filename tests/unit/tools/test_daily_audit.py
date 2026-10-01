@@ -3020,3 +3020,116 @@ def test_aftermarket_tick_audit_ceiling_only_symbol_volume_rules() -> None:
     assert daily_audit.audit_aftermarket_ticks(
         date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
     ) == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
+
+
+def test_audit_extended_exhausted_counts_terminal_keys(tmp_path) -> None:
+    """EXHAUSTED ledger keys are reported as an informational body line."""
+    from datetime import datetime
+
+    from src.backfill.intraday.extended_session_backfill import ExtendedBackfillLedger
+    from src.data.capture_contracts import SEOUL, CaptureDataset, CaptureStatus, CoverageEntry
+    from src.tools import daily_audit
+
+    assert daily_audit.audit_extended_exhausted(ledger_path=tmp_path / "missing.parquet") == ()
+    (tmp_path / "corrupt.parquet").write_bytes(b"not parquet")
+    assert daily_audit.audit_extended_exhausted(ledger_path=tmp_path / "corrupt.parquet") == ()
+
+    ledger = ExtendedBackfillLedger(tmp_path / "ledger.parquet")
+    now = datetime.now(SEOUL)
+    for run in ("r1", "r2", "r3"):
+        ledger.record(
+            "2025-10-01",
+            "nxt_aftermarket",
+            [CoverageEntry(
+                symbol="000009", dataset=CaptureDataset.MINUTE_BARS, venue="NXT",
+                session="nxt_aftermarket", scheduled_at=None, status=CaptureStatus.FAILED,
+                rows=0, first_event_time=None, last_event_time=None,
+                reason="price_basis_raw_basis_unavailable", raw_refs=(),
+            )],
+            run_id=run,
+            attempted_at=now,
+        )
+    assert daily_audit.audit_extended_exhausted(ledger_path=ledger.path) == ("intraday:extended_exhausted:1",)
+
+
+def test_extended_exhausted_line_never_warns() -> None:
+    """The exhausted count rides the digest body without flipping the subject."""
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    subject, body = daily_audit.build_digest(
+        "2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [],
+        info_lines=("intraday:extended_exhausted:2",),
+    )
+    assert "🟢" in subject
+    assert "intraday:extended_exhausted:2" in body
+
+
+def test_run_daily_audit_reports_extended_exhausted_informationally(monkeypatch, tmp_path, caplog) -> None:
+    """The nightly digest carries the exhausted count at INFO severity, never as a failure."""
+    from src.tools import daily_audit
+
+    profile = _collection_profile(tmp_path)
+    monkeypatch.setattr(daily_audit, "CollectionSettings", lambda *a, **k: profile)
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True))
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_tape_sweep", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_extended_exhausted", lambda **k: ("intraday:extended_exhausted:1",))
+    from src.data.capture_store import CaptureStore, resolve_capture_root
+
+    _publish_cohort_decision(CaptureStore(resolve_capture_root(profile)), "2026-09-14", ["005930"])
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    with caplog.at_level("INFO"):
+        subject = daily_audit.run_daily_audit(
+            "2026-09-14",
+            trading_day_fn=lambda _d: True,
+            failed_units_fn=list,
+            stale_tokens_fn=lambda _d: [],
+            dispatch_fn=_dispatch,
+            backup_issues_fn=lambda _at: [],
+        )
+    assert subject is not None and "🟢" in subject
+    assert len(sent) == 1 and "intraday:extended_exhausted:1" in sent[0][1]
+    assert "intraday:extended_exhausted:1" in caplog.text
+
+
+def test_run_daily_audit_survives_unreadable_exhausted_ledger(monkeypatch, tmp_path) -> None:
+    """An unreadable ledger degrades to no informational line, still without warning."""
+    from src.tools import daily_audit
+
+    profile = _collection_profile(tmp_path)
+    monkeypatch.setattr(daily_audit, "CollectionSettings", lambda *a, **k: profile)
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True))
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_tape_sweep", lambda *a, **k: ())
+
+    def _boom(**kwargs):
+        raise OSError("ledger locked")
+
+    monkeypatch.setattr(daily_audit, "audit_extended_exhausted", _boom)
+    from src.data.capture_store import CaptureStore, resolve_capture_root
+
+    _publish_cohort_decision(CaptureStore(resolve_capture_root(profile)), "2026-09-14", ["005930"])
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    subject = daily_audit.run_daily_audit(
+        "2026-09-14",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
+    )
+    assert subject is not None and "🟢" in subject
+    assert len(sent) == 1 and "extended_exhausted" not in sent[0][1]
