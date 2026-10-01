@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 import logging
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -404,9 +405,16 @@ class TickTapePublisher:
 
     Publishing writes one partition per (day, session) per flush through write_tick_partition with the certified
     entries of that flush, then one manifest per (day, session, flush).
+
+    Group manifests are immutable per run_id, and the flush sequence restarts at zero in every process, so each
+    publisher carries a unique namespace in the run_id; otherwise a restarted backfill collides with the manifests
+    an earlier process already published for the same (day, session, seq) and its evidence is silently dropped.
     """
 
-    def __init__(self, *, store: CaptureStore, profile: CollectionSettings, flush_rows: int, auto_flush: bool = True) -> None:
+    def __init__(
+        self, *, store: CaptureStore, profile: CollectionSettings, flush_rows: int, auto_flush: bool = True,
+        publish_namespace: str | None = None,
+    ) -> None:
         """Bind the evidence store, profile, and row bound.
 
         Args:
@@ -414,9 +422,11 @@ class TickTapePublisher:
             profile: Supplies Arrow batch bounds.
             flush_rows: Buffered-row bound triggering an automatic flush.
             auto_flush: False lets the caller own flush timing (ledger commits and disk checks around each flush).
+            publish_namespace: Token distinguishing this publisher's manifests from other processes'; defaults to a
+                fresh UTC-timestamp plus random suffix.
 
         Raises:
-            ValueError: Nonpositive flush bound.
+            ValueError: Nonpositive flush bound or empty namespace.
         """
         if int(flush_rows) <= 0:
             raise ValueError(f"invalid flush_rows: {flush_rows!r}")
@@ -427,6 +437,14 @@ class TickTapePublisher:
         self._buffer: list[TapeDayResult] = []
         self._buffered_rows = 0
         self._flush_seq = 0
+        namespace = (
+            publish_namespace
+            if publish_namespace is not None
+            else f"{datetime.now(_SEOUL):%Y%m%dT%H%M%S}{uuid.uuid4().hex[:6]}"
+        )
+        if not str(namespace).strip():
+            raise ValueError("publish_namespace must be nonempty")
+        self._namespace = str(namespace)
 
     def _guard(self, result: TapeDayResult) -> None:
         _reject_unclosed_day(result.day, result.session)
@@ -516,7 +534,7 @@ class TickTapePublisher:
         manifest = CaptureManifest(
             schema_version=1,
             context=CaptureContext(
-                trading_date=date.fromisoformat(day), run_id=f"tape-{day}-{session}-publish-{seq}",
+                trading_date=date.fromisoformat(day), run_id=f"tape-{day}-{session}-publish-{self._namespace}-{seq}",
                 dataset=CaptureDataset.TRADE_TICKS, vendor="kiwoom", endpoint="tape-publish",
                 symbol=None, venue="owner-local", session=session,
                 capture_reason="tape-publish", cohort_id=None, scheduled_at=None,
