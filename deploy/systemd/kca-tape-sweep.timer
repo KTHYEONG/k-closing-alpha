@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA daily tick tape sweep (Mon-Fri 20:35 KST, catch-up allowed)
+
+[Timer]
+OnCalendar=Mon..Fri 20:35:00 Asia/Seoul
+Persistent=true
+Unit=kca-tape-sweep.service
+
+[Install]
+WantedBy=timers.target

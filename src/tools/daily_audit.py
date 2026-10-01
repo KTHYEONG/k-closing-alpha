@@ -16,6 +16,7 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -24,7 +25,6 @@ from src.api.kis.key_pool import load_kis_env, read_token_issued_date, resolve_h
 from src.config.base import TOPK_DECISIONS_PARQUET_NAME
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
-    AFTERMARKET_TICKS_START_DATE,
     DECISION_WINDOW_END_HHMMSS,
     DECISION_WINDOW_START_HHMMSS,
     INTRADAY_SESSION_KRX_AFTERMARKET,
@@ -761,7 +761,7 @@ def audit_aftermarket_ticks(
     ceiling opens after the tick window closes; it is excluded from the bar side of the comparison.
 
     Args:
-        trading_date: Audited KST date (checked only from AFTERMARKET_TICKS_START_DATE on STANDARD days).
+        trading_date: Audited KST date (checked on STANDARD days).
         read_ticks: session -> frame with symbol, ts_hms, volume (None when absent).
         read_bars: session -> frame with symbol, volume (None when absent).
 
@@ -770,8 +770,6 @@ def audit_aftermarket_ticks(
         tick partition) and volume_mismatch (symbols whose tick volume sum differs from bar volume sum).
     """
     day_str = trading_date.isoformat()
-    if day_str < AFTERMARKET_TICKS_START_DATE:
-        return ()
 
     def _default_ticks(session: str) -> pd.DataFrame | None:
         path = tick_partition_path(day_str, session)
@@ -891,6 +889,63 @@ def audit_regular_ticks(
     if short:
         return (_intraday_issue("regular_ticks", short, "volume_gap"),)
     return ()
+
+
+TAPE_DEPTH_DAYS: int = 30
+"""Observed Kiwoom tape depth in days; needs older than this can never be recovered."""
+
+TAPE_EXPIRY_WARNING_DAYS: int = 3
+"""Needs within this many days of tape expiry are surfaced as digest warnings."""
+
+TAPE_REPORT_MAX_AGE_DAYS: int = 4
+"""A sweep report older than this (covers weekends and one holiday) is ignored by the digest."""
+
+
+def _read_tape_sweep_report(root: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads((root / "staging" / "tape_sweep" / "last_report.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def audit_tape_sweep(
+    trading_date: date,
+    *,
+    profile: CollectionSettings | None = None,
+    report: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Surface tape-sweep expiry and disk-guard states from the last sweep report.
+
+    The sweep already computed the needs against the stored partitions and the settled ledger, so the audit only reads
+    its report: recomputing 30 days of needs here would rescan every partition inside a unit that must stay fast.
+
+    Args:
+        trading_date: Audited KST date (checked on STANDARD days).
+        profile: Acquisition limits; None builds CollectionSettings().
+        report: Injected sweep report; None reads `staging/tape_sweep/last_report.json`. An absent or stale
+            (older than TAPE_REPORT_MAX_AGE_DAYS) report yields no issues, since no sweep has judged the window yet.
+
+    Returns:
+        `intraday:tape_expiring:<n>:expiring_need` when n symbol-days are within TAPE_EXPIRY_WARNING_DAYS of tape
+        expiry, plus `intraday:tape_sweep:1:disk_guard` when the sweep stopped on low disk.
+    """
+    resolved = profile if profile is not None else CollectionSettings()
+    data = dict(report) if report is not None else _read_tape_sweep_report(_capture_root(resolved))
+    run_date = str(data.get("run_date", ""))
+    try:
+        age = (trading_date - date.fromisoformat(run_date)).days
+    except ValueError:
+        return ()
+    if age < 0 or age > TAPE_REPORT_MAX_AGE_DAYS:
+        return ()
+    issues: list[str] = []
+    if bool(data.get("disk_guard", False)):
+        issues.append(_intraday_issue("tape_sweep", 1, "disk_guard"))
+    expiring = int(data.get("expiring_needs", 0) or 0)
+    if expiring > 0:
+        issues.append(_intraday_issue("tape_expiring", expiring, "expiring_need"))
+    return tuple(issues)
 
 
 def _expiry_hint_lines(items: Sequence[str]) -> list[str]:
@@ -1197,6 +1252,7 @@ def run_daily_audit(
             if session_day.kind is SessionKind.STANDARD:
                 intraday_issues = (*intraday_issues, *audit_regular_ticks(trading_date))
                 intraday_issues = (*intraday_issues, *audit_aftermarket_ticks(trading_date))
+                intraday_issues = (*intraday_issues, *audit_tape_sweep(trading_date, profile=profile))
     except (OSError, ValueError) as exc:
         logger.warning("[DATA] stage=daily_audit collection_audit=UNAVAILABLE reason=%s", type(exc).__name__)
         collection_issues = (_collection_issue("audit", 1, "unavailable"),)

@@ -1,0 +1,14 @@
+[Unit]
+Description=KCA daily tick tape sweep - recover recent needs from Kiwoom tapes (after evening archive)
+After=kca-archive-intraday.service
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
+Environment=TZ=Asia/Seoul
+# 일일 재검사(최대 25일분 needs) → 1시간 (archive·extended-backfill 슬롯과 겹치지 않는 20:35 발화)
+TimeoutStartSec=3600
+ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kca-tape-sweep --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.tick_tape_sweep
+ExecStopPost=-/usr/bin/docker rm -f kca-tape-sweep
