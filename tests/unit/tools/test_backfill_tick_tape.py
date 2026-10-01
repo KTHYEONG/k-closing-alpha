@@ -7,6 +7,7 @@ import json
 import sys
 import types
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -30,6 +31,11 @@ from src.data.intraday_store import tick_partition_path, write_intraday_partitio
 _SEOUL = ZoneInfo("Asia/Seoul")
 _DAY = "2026-09-02"
 _YMD = "20260902"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_price_history(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(btt, "_price_history_path", lambda: tmp_path / "price_history.parquet")
 
 
 def _profile(tmp_path) -> CollectionSettings:
@@ -859,3 +865,34 @@ def test_run_tasks_emits_a_heartbeat_every_fifty_walks(tmp_path, monkeypatch, ca
         )
     beats = [rec.message for rec in caplog.records if "stage=tape_backfill done=" in rec.message]
     assert any("done=50/50" in beat for beat in beats) and len(beats) == 2
+
+
+def test_collect_skips_weekends_and_ingested_holidays(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    monkeypatch.setattr(btt, "_day_universe", lambda day, store: ["005930"])
+    ingested = pd.DataFrame({"date": pd.to_datetime(["2026-09-23", "2026-09-28"]), "symbol": "005930"})
+    ingested.to_parquet(tmp_path / "price_history.parquet")
+    days = ["2026-09-23", "2026-09-24", "2026-09-26", "2026-09-28", "2026-09-30"]
+    needs = btt._collect_needs(days, ["KRX"], store, {}, False)
+    assert {n.day for n in needs} == {"2026-09-23", "2026-09-28", "2026-09-30"}
+
+
+def test_trading_day_falls_back_to_weekday_without_price_history() -> None:
+    assert btt._is_trading_day("2026-09-24", set()) is True
+    assert btt._is_trading_day("2026-09-26", set()) is False
+    assert btt._is_trading_day("2026-09-01", {"2026-09-23"}) is True
+
+
+def test_ingested_trading_days_tolerates_unreadable_file(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    assert btt._ingested_trading_days() == set()
+    (tmp_path / "price_history.parquet").write_bytes(b"not parquet")
+    assert btt._ingested_trading_days() == set()
+
+
+def test_price_history_path_points_at_configured_parquet(monkeypatch) -> None:
+    monkeypatch.undo()
+    from src import settings as _settings
+
+    assert btt._price_history_path() == Path(_settings.PRICE_HISTORY_PARQUET_PATH)
