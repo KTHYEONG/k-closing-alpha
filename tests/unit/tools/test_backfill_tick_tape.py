@@ -33,9 +33,13 @@ _DAY = "2026-09-02"
 _YMD = "20260902"
 
 
+_PRODUCTION_BLACKOUTS = btt._DEFAULT_BLACKOUTS
+
+
 @pytest.fixture(autouse=True)
-def _isolated_price_history(tmp_path, monkeypatch) -> None:
+def _isolated_environment(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(btt, "_price_history_path", lambda: tmp_path / "price_history.parquet")
+    monkeypatch.setattr(btt, "_DEFAULT_BLACKOUTS", ())
 
 
 def _profile(tmp_path) -> CollectionSettings:
@@ -189,7 +193,10 @@ def test_blackout_waits_before_walk(tmp_path, monkeypatch) -> None:
         btt, "_collect_needs",
         lambda *a, **k: [btt.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
     )
-    btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--apply", "--ledger", str(tmp_path / "l.jsonl")])
+    btt.main([
+        "--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--apply",
+        "--blackout", "20:00-20:30", "--ledger", str(tmp_path / "l.jsonl"),
+    ])
     assert len(slept) == 1 and slept[0] > 0
     assert len(calls) == 1
 
@@ -896,3 +903,74 @@ def test_price_history_path_points_at_configured_parquet(monkeypatch) -> None:
     from src import settings as _settings
 
     assert btt._price_history_path() == Path(_settings.PRICE_HISTORY_PARQUET_PATH)
+
+
+class _TokenClient:
+    def __init__(self) -> None:
+        self.resets = 0
+
+    def reset_token(self) -> None:
+        self.resets += 1
+
+
+def _failure_tasks(count: int) -> list[Any]:
+    sessions = tuple(s for s in btt.TAPE_SESSIONS if s.venue == "KRX")
+    return [btt.WalkTask(symbol=f"00000{i}", venue="KRX", days=(_DAY,), sessions=sessions) for i in range(count)]
+
+
+def test_vendor_failure_resets_token_and_a_single_failure_does_not_stop(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    outcomes = iter(
+        [
+            TapeWalkOutcome(termination_reason="vendor_failure", pages_fetched=1, unresolved_days=(_DAY,)),
+            TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=2, unresolved_days=()),
+        ]
+    )
+
+    async def _fake(*args: Any, **kwargs: Any) -> Any:
+        return next(outcomes)
+
+    monkeypatch.setattr(btt, "harvest_symbol_tape", _fake)
+    client = _TokenClient()
+    summary = asyncio.run(
+        btt._run_tasks(
+            _failure_tasks(2), client=client, http_session=object(), store=CaptureStore(tmp_path / "capture"),
+            profile=_profile(tmp_path), apply=False, ledger=tmp_path / "l.jsonl", deadline=None, blackouts=[], run_date="2026-09-20",
+        )
+    )
+    assert client.resets == 1
+    assert summary["stopped_reason"] == ""
+    assert summary["remaining"] == []
+
+
+def test_vendor_failure_streak_stops_run(tmp_path, monkeypatch, caplog) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+
+    async def _fake(*args: Any, **kwargs: Any) -> Any:
+        return TapeWalkOutcome(termination_reason="vendor_failure", pages_fetched=1, unresolved_days=(_DAY,))
+
+    monkeypatch.setattr(btt, "harvest_symbol_tape", _fake)
+    client = _TokenClient()
+    with caplog.at_level("WARNING"):
+        summary = asyncio.run(
+            btt._run_tasks(
+                _failure_tasks(6), client=client, http_session=object(), store=CaptureStore(tmp_path / "capture"),
+                profile=_profile(tmp_path), apply=False, ledger=tmp_path / "l.jsonl", deadline=None, blackouts=[], run_date="2026-09-20",
+            )
+        )
+    assert client.resets == btt._MAX_VENDOR_FAILURE_STREAK
+    assert summary["stopped_reason"] == "vendor_failure"
+    assert len(summary["remaining"]) == 6 - btt._MAX_VENDOR_FAILURE_STREAK
+    assert "VENDOR_FAILURE_STREAK" in caplog.text
+
+
+def test_default_blackouts_cover_kiwoom_live_windows() -> None:
+    windows = [btt._parse_blackout(spec) for spec in _PRODUCTION_BLACKOUTS]
+
+    def covered(hhmm: str) -> bool:
+        minute = int(hhmm[:2]) * 60 + int(hhmm[3:])
+        return any(btt._in_blackout(minute, window) for window in windows)
+
+    for live in ("08:30", "11:30", "15:20", "15:21", "15:40", "16:25", "20:05", "21:02", "21:30", "23:05"):
+        assert covered(live), live
+    assert not covered("13:00")
