@@ -143,7 +143,12 @@ def _settle_certified_day(
     on_result: Callable[[TapeDayResult], None],
 ) -> None:
     ymd = day.replace("-", "")
-    proof = "tape_complete" if basis == "vendor_total" else "tape_bracketed"
+    if basis == "vendor_total":
+        proof = "tape_complete"
+    elif basis == "tape_empty":
+        proof = "tape_empty"
+    else:
+        proof = "tape_bracketed"
     in_any: set[int] = set()
     windows: dict[str, list[dict[str, Any]]] = {}
     for spec in sessions:
@@ -242,7 +247,7 @@ async def harvest_symbol_tape(
         sessions: Stored sessions to carve (subset of TAPE_SESSIONS matching venue).
         store: Evidence store; every page is persisted via the shared page observer under distinct attempt slots.
         run_id: Acquisition identity (`tape-<run date>-<seq>`).
-        profile: Page guard (COLLECTION_TICK_REPAIR_MAX_PAGES), routes, flush bounds.
+        profile: Page guard (COLLECTION_TAPE_MAX_PAGES), routes, flush bounds.
         on_result: Receives each settled result as its date completes (newest first).
         walk_deadline: Optional aware instant after which the walk stops requesting pages (used to keep a long walk
             out of reserved vendor slots); days not reached are reported PARTIAL `walk_incomplete`, never not-on-tape.
@@ -263,7 +268,7 @@ async def harvest_symbol_tape(
     resolved_venue = _verified_venue(venue, profile)
     context_day = date.fromisoformat(oldest)
     budget = ChartBudget(
-        max_pages=int(profile.COLLECTION_TICK_REPAIR_MAX_PAGES),
+        max_pages=int(profile.COLLECTION_TAPE_MAX_PAGES),
         deadline=walk_deadline,
         request_timeout_seconds=float(profile.COLLECTION_REQUEST_TIMEOUT_SECONDS),
     )
@@ -285,7 +290,7 @@ async def harvest_symbol_tape(
             if payload is not None:
                 stamps = (str(r.get("cntr_tm", ""))[:8] for r in (payload.get("stk_tic_chart_qry") or []) if isinstance(r, Mapping))
                 page_days = frozenset(f"{x[:4]}-{x[4:6]}-{x[6:8]}" for x in stamps if len(x) == 8 and x.isdigit())
-                if not page_days & wanted_set:
+                if not page_days & wanted_set and not (page_index == 0 and not page_days):
                     return
             context = CaptureContext(
                 trading_date=context_day, run_id=str(run_id), dataset=CaptureDataset.TRADE_TICKS,
@@ -343,6 +348,9 @@ async def harvest_symbol_tape(
             store=store, run_id=str(run_id), refs=_refs_for(day), on_result=on_result,
         )
         settled.add(day)
+    empty_refs = [ref for ref, days in page_refs if not days]
+    today = datetime.now(_SEOUL).date()
+    lookback = int(profile.COLLECTION_TAPE_LOOKBACK_DAYS)
     for day in sorted(wanted_set - settled, reverse=True):
         cert = cert_by_day.get(day)
         if cert is not None:
@@ -351,6 +359,27 @@ async def harvest_symbol_tape(
                 reason=f"tape_total_mismatch:received={cert.received}:total={cert.vendor_total}",
                 sessions=matched, venue=resolved_venue, refs=_refs_for(day), on_result=on_result,
             )
+        elif str(payload.get("termination_reason", "")) == "tape_empty":
+            if resolved_venue == "UNKNOWN":
+                _settle_certified_day(
+                    code=str(code), day=day, rows=[], vendor_total=None, basis="tape_empty",
+                    sessions=matched, venue=resolved_venue, store=store, run_id=str(run_id),
+                    refs=[*_refs_for(day), *[r for r in empty_refs if r not in _refs_for(day)]],
+                    on_result=on_result,
+                )
+            elif (today - date.fromisoformat(day)).days <= lookback:
+                _settle_certified_day(
+                    code=str(code), day=day, rows=[], vendor_total=None, basis="tape_empty",
+                    sessions=matched, venue=resolved_venue, store=store, run_id=str(run_id),
+                    refs=[*_refs_for(day), *[r for r in empty_refs if r not in _refs_for(day)]],
+                    on_result=on_result,
+                )
+                settled.add(day)
+            else:
+                _settle_uncertified_day(
+                    code=str(code), day=day, status=CaptureStatus.UNKNOWN, reason="day_not_on_tape",
+                    sessions=matched, venue=resolved_venue, refs=[], on_result=on_result,
+                )
         elif str(payload.get("termination_reason", "")) in ("tape_end", "crossed_stop_day"):
             _settle_uncertified_day(
                 code=str(code), day=day, status=CaptureStatus.UNKNOWN, reason="day_not_on_tape",
