@@ -1166,3 +1166,14 @@ def test_tape_sweep_unit_runs_after_evening_archive_outside_archive_slots() -> N
 
     # And: 설치 스크립트가 타이머를 활성화하고 실패 스캔(kca-*)에 자동 포함된다
     assert "kca-tape-sweep.timer" in install_text
+
+
+def test_backup_backstop_timeout_fits_shared_lock_window() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    lines = (root / "kca-backup.service").read_text(encoding="utf-8").splitlines()
+    timeout = next(line for line in lines if line.startswith("TimeoutStartSec=")).split("=", 1)[1]
+
+    # krx-host-backup이 최대 7200초 대기하므로 kca는 3시간 안에 락을 풀어야 한다
+    assert _parse_systemd_duration(timeout) <= 3 * 3600
