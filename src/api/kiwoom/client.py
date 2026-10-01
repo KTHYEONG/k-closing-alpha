@@ -154,6 +154,10 @@ class KiwoomApiClient:
     def _limiter_for(self, api_id: str) -> AsyncRateLimiter:
         return get_shared_rate_limiter("kiwoom", f"{self.app_key}:{api_id}", _KIWOOM_TR_RATE_PER_SEC)
 
+    def reset_token(self) -> None:
+        """Drop the cached token so the next request issues a fresh one (the vendor invalidates older tokens)."""
+        self.token = None
+
     async def ensure_token(self, session) -> str:
         if self.token:
             return self.token
@@ -705,6 +709,7 @@ class KiwoomApiClient:
             pending_certs = [TapeDayCertificate(day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False) for d in day_order if d not in certs]
             return {"rt_cd": "1", "msg1": str(e), "vendor": "kiwoom", "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": pages_fetched, "continuation": metadata, "certificates": [certs[d] for d in certified_order] + pending_certs}
         if termination == "vendor_failure":
+            logger.warning("[DATA] stage=kiwoom_tape_walk status=VENDOR_FAILURE code=%s pages=%d return_msg=%s", code, pages_fetched, failure_msg)
             certificates: list[TapeDayCertificate] = [certs[d] for d in certified_order]
             certificates.extend(TapeDayCertificate(day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False) for d in day_order if d not in certs)
             payload: BrokerPayload = {"rt_cd": "1", "msg1": failure_msg, "vendor": "kiwoom", "truncated": True, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "certificates": certificates}

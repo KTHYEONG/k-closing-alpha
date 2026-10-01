@@ -1177,3 +1177,23 @@ def test_walk_tick_tape_oldest_date_at_tape_end_needs_its_vendor_total() -> None
     assert certs["2026-09-03"].complete is False
     assert "2026-09-03" not in delivered
     assert "2026-09-05" in delivered
+
+
+def test_kiwoom_reset_token_forces_reissue() -> None:
+    client = _kiwoom_client()
+    client.token = "stale"
+    client.reset_token()
+    assert client.token is None
+
+
+def test_kiwoom_tape_vendor_failure_logs_return_msg(caplog) -> None:
+    client = _kiwoom_client()
+
+    async def fake_post_tr(session: Any, api_id: str, path: str, body: dict, cont_yn: str = "N", next_key: str = "", max_retries: int = 3) -> tuple[dict, dict]:
+        return ({"return_code": 3, "return_msg": "token invalid"}, {"cont-yn": "N"})
+
+    client._post_tr = fake_post_tr
+    with caplog.at_level("WARNING"):
+        res = asyncio.run(client.walk_tick_tape(object(), "005930", stop_before_day="2026-09-03", max_pages=3))
+    assert res["termination_reason"] == "vendor_failure"
+    assert "token invalid" in caplog.text
