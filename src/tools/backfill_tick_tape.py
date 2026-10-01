@@ -186,6 +186,31 @@ def _read_cohort_symbols(store: CaptureStore, day: str) -> list[str]:
     return [str(item) for item in cohort.eligible_symbols]
 
 
+def _price_history_path() -> Path:
+    return Path(settings.PRICE_HISTORY_PARQUET_PATH)
+
+
+def _ingested_trading_days() -> set[str]:
+    path = _price_history_path()
+    try:
+        if not path.exists():
+            return set()
+        frame = pd.read_parquet(path, columns=["date"])
+    except (OSError, ValueError) as exc:
+        logger.warning("[DATA] stage=tape_backfill status=DEGRADED reason=price_history_unreadable error=%s", type(exc).__name__)
+        return set()
+    return {str(item) for item in pd.to_datetime(frame["date"]).dt.strftime("%Y-%m-%d").unique()}
+
+
+def _is_trading_day(day: str, ingested: set[str]) -> bool:
+    """Weekday check, tightened by price_history inside its ingested range (holidays carry no rows)."""
+    if date.fromisoformat(day).weekday() >= 5:
+        return False
+    if not ingested or day < min(ingested) or day > max(ingested):
+        return True
+    return day in ingested
+
+
 def _day_universe(day: str, store: CaptureStore) -> list[str]:
     codes: list[str] = []
     for item in _read_cohort_symbols(store, day):
@@ -329,7 +354,10 @@ def _collect_needs(
     now = _now()
     cache = index if index is not None else PartitionIndex()
     needs: list[Need] = []
+    ingested = _ingested_trading_days()
     for day in days:
+        if not _is_trading_day(day, ingested):
+            continue
         universe = _day_universe(day, store)
         for venue in venues:
             for spec in [s for s in TAPE_SESSIONS if s.venue == venue]:

@@ -26,6 +26,11 @@ from src.tools import backfill_tick_tape as btt
 
 _SEOUL = ZoneInfo("Asia/Seoul")
 _FIXED_NOW = datetime(2026, 10, 1, 20, 40, tzinfo=_SEOUL)
+
+@pytest.fixture(autouse=True)
+def _isolated_price_history(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(btt, "_price_history_path", lambda: tmp_path / "price_history.parquet")
+
 _DAY = "2026-09-30"
 _OLD_DAY = "2026-09-03"
 _BIG_FREE = 100 * 1024**3
@@ -169,17 +174,17 @@ def test_missed_day_is_recovered(tmp_path, monkeypatch) -> None:
 
 def test_lookback_bound_reports_expired_without_walks(tmp_path, monkeypatch) -> None:
     _patch_sweep(monkeypatch, tmp_path)
-    _patch_universe(monkeypatch, {"2026-09-20"})
+    _patch_universe(monkeypatch, {"2026-09-18"})
     monkeypatch.setattr(sweep, "_open_kiwoom", _refuse_kiwoom())
     monkeypatch.setattr(btt, "harvest_symbol_tape", _refuse_kiwoom())
-    _seed_bars("2026-09-20", "regular", "005930", ["090000"], "100")
+    _seed_bars("2026-09-18", "regular", "005930", ["090000"], "100")
 
     report = _run(_profile(tmp_path))
 
     assert report.expired == (
-        "005930/2026-09-20/krx_aftermarket",
-        "005930/2026-09-20/nxt_aftermarket",
-        "005930/2026-09-20/regular",
+        "005930/2026-09-18/krx_aftermarket",
+        "005930/2026-09-18/nxt_aftermarket",
+        "005930/2026-09-18/regular",
     )
     assert report.needs == 0
     assert report.recovered == ()
@@ -391,7 +396,7 @@ def test_audit_tape_sweep_disk_guard_and_clean() -> None:
 def test_audit_tape_sweep_ignores_stale_future_or_malformed_reports() -> None:
     from src.tools import daily_audit
 
-    stale = {"run_date": "2026-09-20", "expiring_needs": 5, "disk_guard": True}
+    stale = {"run_date": "2026-09-18", "expiring_needs": 5, "disk_guard": True}
     future = {"run_date": "2026-10-09", "expiring_needs": 5, "disk_guard": True}
     assert daily_audit.audit_tape_sweep(date(2026, 10, 1), report=stale) == ()
     assert daily_audit.audit_tape_sweep(date(2026, 10, 1), report=future) == ()
