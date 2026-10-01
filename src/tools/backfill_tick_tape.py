@@ -39,7 +39,7 @@ _VOLUME_GAP_TOLERANCE = 0.01
 _CLOSE_AUCTION_TS = 153000
 _REGULAR_READY_HHMMSS = "154000"
 _TICK_SESSIONS = ("regular", "krx_aftermarket", "nxt_aftermarket")
-# Kiwoom issues one token per key, so any overlap with a live Kiwoom unit invalidates one side's token and shares the 5 req/s limit.
+# Live Kiwoom units share this key's 5 req/s limit; a slowed 15:20 collect also delays auction-close, which needs its cohort.
 # Windows cover collect/predict (15:20), regular archive (15:40-16:30), aftermarket archive (20:05-21:05), price-ingest, extended backfill.
 _DEFAULT_BLACKOUTS = ("08:25-08:45", "11:25-11:45", "15:15-17:00", "20:00-21:10", "21:25-21:45", "23:00-23:20")
 _MAX_VENDOR_FAILURE_STREAK = 3
