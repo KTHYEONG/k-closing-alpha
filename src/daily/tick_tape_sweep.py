@@ -17,6 +17,7 @@ from src.data.capture_contracts import SEOUL
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.tools import backfill_tick_tape as btt
+from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +219,7 @@ def main(argv: list[str] | None = None) -> None:
         ValueError: Invalid lookback window or naive deadline.
         RuntimeError: Infrastructure failure; archive units are never affected.
     """
+    configure_cli_logging(CLI_LOG_FORMAT_TIMESTAMPED)
     parser = argparse.ArgumentParser(description="Daily Kiwoom tape sweep for recent tick needs.")
     parser.add_argument("--lookback-days", type=int, default=None, help="Re-check window in days.")
     parser.add_argument("--deadline", default=None, help="Aware ISO timestamp after which no new walk starts.")
