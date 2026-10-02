@@ -557,40 +557,116 @@ def _verify_archive_members(staging_path: Path, members: Sequence[SegmentMember]
         raise ValueError("archive round-trip member mismatch")
 
 
+@dataclass(frozen=True)
+class _VerifiedSegment:
+    index: int
+    local_bytes: int
+    local_md5: str
+
+
+@dataclass(frozen=True)
+class _GroupOutcome:
+    tier: str
+    trading_date: str
+    scan_peak: int
+    verified: tuple[_VerifiedSegment, ...]
+    complete: bool
+    failure: BaseException | None
+
+
+def _seal_group(
+    *,
+    capture_root: Path,
+    tier: str,
+    trading_date: str,
+    scan_peak: int,
+    segments: Sequence[tuple[SegmentMember, ...]],
+    staging_dir: Path,
+    rclone: str,
+    config: OffsiteConfig,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]],
+    deadline: datetime | None,
+    now_fn: Callable[[], datetime],
+) -> _GroupOutcome:
+    """Build, upload and remote-verify the planned segments of one (tier, date) group in plan order, on a worker thread.
+
+    One remote directory listing per group replaces a per-segment MD5 pre-check; only segment names already present remotely are
+    compared by MD5 before skipping their upload. The group is the unit of concurrency because the nightly load is mostly groups
+    with a single small segment, whose cost is network latency rather than bytes. The function never touches the ledger or scan
+    state: the coordinating thread commits `verified` after the fact so ledger writes stay single-threaded and ordered.
+
+    Args: as typed above; `segments` are the group's planned member sets in plan order.
+
+    Returns:
+        `_GroupOutcome` whose `verified` is the contiguous prefix of segments whose remote MD5 equals the local MD5 (uploaded
+        now or already present identically); `complete` is true only when every planned segment is verified; `failure` carries the
+        first exception raised while handling the group (the contiguous verified prefix before it is still returned).
+
+    The function does not raise for rclone, MD5 or archive failures; it reports them in `failure` so already-verified work is never lost.
+    """
+    try:
+        existing = _remote_existing_segments(rclone, config, tier, trading_date, run_fn=run_fn)
+    except BaseException as exc:
+        return _GroupOutcome(
+            tier=tier,
+            trading_date=trading_date,
+            scan_peak=scan_peak,
+            verified=(),
+            complete=False,
+            failure=exc,
+        )
+    verified: list[_VerifiedSegment] = []
+    for index, seg_members in enumerate(segments):
+        if deadline is not None and now_fn() >= deadline:
+            return _GroupOutcome(
+                tier=tier,
+                trading_date=trading_date,
+                scan_peak=scan_peak,
+                verified=tuple(verified),
+                complete=False,
+                failure=None,
+            )
+        seg = segment_name(tuple(seg_members))
+        staging_path = staging_dir / f"{tier}-{trading_date}-{index:04d}-{seg}.tar.zst"
+        try:
+            local_bytes, local_md5 = _seal_one_segment(
+                capture_root=capture_root,
+                tier=tier,
+                trading_date=trading_date,
+                seg_members=seg_members,
+                segment=seg,
+                staging_path=staging_path,
+                rclone=rclone,
+                config=config,
+                run_fn=run_fn,
+                already_remote=f"{seg}.tar.zst" in existing,
+            )
+        except BaseException as exc:
+            return _GroupOutcome(
+                tier=tier,
+                trading_date=trading_date,
+                scan_peak=scan_peak,
+                verified=tuple(verified),
+                complete=False,
+                failure=exc,
+            )
+        verified.append(_VerifiedSegment(index=index, local_bytes=local_bytes, local_md5=local_md5))
+    return _GroupOutcome(
+        tier=tier,
+        trading_date=trading_date,
+        scan_peak=scan_peak,
+        verified=tuple(verified),
+        complete=True,
+        failure=None,
+    )
+
+
 def _append_ledger_entry(ledger_path: Path, entry: LedgerEntry) -> None:
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     with open(ledger_path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(_entry_to_dict(entry), sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
-
-
-def _submit_segment(
-    pool: ThreadPoolExecutor,
-    capture_root: Path,
-    tier: str,
-    trading_date: str,
-    seg_members: tuple[SegmentMember, ...],
-    staging_dir: Path,
-    rclone: str,
-    config: OffsiteConfig,
-    run_fn: Callable[..., subprocess.CompletedProcess[str]],
-    known: frozenset[str],
-) -> Future[tuple[int, str]]:
-    seg = segment_name(seg_members)
-    return pool.submit(
-        _seal_one_segment,
-        capture_root=capture_root,
-        tier=tier,
-        trading_date=trading_date,
-        seg_members=seg_members,
-        segment=seg,
-        staging_path=staging_dir / f"{seg}.tar.zst",
-        rclone=rclone,
-        config=config,
-        run_fn=run_fn,
-        already_remote=f"{seg}.tar.zst" in known,
-    )
 
 
 def seal_and_upload(
@@ -694,7 +770,9 @@ def _seal_locked(
             scan_peak = _structural_max_mtime_ns(tier_root, date_name, depth)
             selected.append((tier, date_name, scan_peak))
     # 최신 날짜부터 처리해야 연기 시 오늘 증거가 밀리지 않는다 (동일 날짜는 config.tiers 순서)
-    selected.sort(key=lambda item: item[1], reverse=True)
+    tier_order = {name: pos for pos, name in enumerate(config.tiers)}
+    selected.sort(key=lambda item: (-date.fromisoformat(item[1]).toordinal(), tier_order.get(item[0], 0)))
+    jobs: list[tuple[str, str, int, list[tuple[SegmentMember, ...]]]] = []
     for tier, date_name, scan_peak in selected:
         entries = read_ledger(capture_root, tier, date_name)
         sealed: dict[str, int] = {}
@@ -709,113 +787,99 @@ def _seal_locked(
         if not segments:
             state[f"{tier}/{date_name}"] = scan_peak
             continue
-        if deadline is not None and now_fn() >= deadline:
-            deferred_dates += 1
-            continue
-        existing = _remote_existing_segments(rclone, config, tier, date_name, run_fn=run_fn)
+        jobs.append((tier, date_name, scan_peak, segments))
+    if jobs:
         workers = int(config.seal_workers)
-        date_complete = True
-        verified: dict[int, tuple[int, str]] = {}
-        failure: BaseException | None = None
-        failed_at: int | None = None
+        futures: list[Future[_GroupOutcome] | None] = [None] * len(jobs)
+        pending: set[Future[_GroupOutcome]] = set()
+        index_of: dict[Future[_GroupOutcome], int] = {}
+        outcomes: dict[int, _GroupOutcome] = {}
+        first_failure: BaseException | None = None
+        next_submit = 0
+        next_commit = 0
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="offsite-seal") as pool:
-            active: dict[Future[tuple[int, str]], int] = {}
-            next_index = 0
-
-            while next_index < len(segments) and len(active) < workers:
-                if deadline is not None and now_fn() >= deadline:
-                    date_complete = False
-                    next_index = len(segments)
-                    break
-                active[
-                    _submit_segment(
-                        pool,
-                        capture_root,
-                        tier,
-                        date_name,
-                        segments[next_index],
-                        staging_dir,
-                        rclone,
-                        config,
-                        run_fn,
-                        existing,
-                    )
-                ] = next_index
-                next_index += 1
-            while active and failure is None:
-                done, _ = wait(tuple(active), return_when=FIRST_COMPLETED)
-                for finished in done:
-                    index = active.pop(finished)
-                    try:
-                        verified[index] = finished.result()
-                    except BaseException as exc:
-                        if failure is None:
-                            failure = exc
-                            failed_at = index
-                if failure is not None:
-                    for pending_future in active:
-                        pending_future.cancel()
-                    break
-                while next_index < len(segments) and len(active) < workers:
+            def _fill() -> None:
+                nonlocal next_submit
+                while next_submit < len(jobs) and len(pending) < workers and first_failure is None:
                     if deadline is not None and now_fn() >= deadline:
-                        date_complete = False
-                        next_index = len(segments)
                         break
-                    active[
-                        _submit_segment(
-                            pool,
-                            capture_root,
-                            tier,
-                            date_name,
-                            segments[next_index],
-                            staging_dir,
-                            rclone,
-                            config,
-                            run_fn,
-                            existing,
-                        )
-                    ] = next_index
-                    next_index += 1
-        limit = failed_at if failed_at is not None else len(segments)
-        for index in range(len(segments)):
-            if index >= limit:
-                break
-            outcome = verified.get(index)
-            if outcome is None:
-                date_complete = False
-                break
-            local_bytes, local_md5 = outcome
-            seg_members = segments[index]
-            seg = segment_name(seg_members)
-            committed_at = now_fn().isoformat()
-            ledger_entry = LedgerEntry(
-                tier=tier,
-                trading_date=date_name,
-                segment_name=seg,
-                remote_path=_remote_path(config, tier, date_name, seg),
-                members=tuple(seg_members),
-                archive_bytes=local_bytes,
-                archive_md5=local_md5,
-                committed_at=committed_at,
-            )
-            _append_ledger_entry(_ledger_path(capture_root, tier, date_name), ledger_entry)
-            segments_committed += 1
-            members_committed += len(seg_members)
-            archive_bytes_total += local_bytes
-            logger.info(
-                "[SYS] stage=capture_offsite tier=%s date=%s segment=%s.tar.zst members=%d bytes=%d",
-                tier,
-                date_name,
-                seg,
-                len(seg_members),
-                local_bytes,
-            )
-        if failure is not None:
-            raise failure
-        if date_complete:
-            state[f"{tier}/{date_name}"] = scan_peak
-        else:
-            deferred_dates += 1
+                    tier_s, date_s, peak_s, segs_s = jobs[next_submit]
+                    future = pool.submit(
+                        _seal_group,
+                        capture_root=capture_root,
+                        tier=tier_s,
+                        trading_date=date_s,
+                        scan_peak=peak_s,
+                        segments=segs_s,
+                        staging_dir=staging_dir,
+                        rclone=rclone,
+                        config=config,
+                        run_fn=run_fn,
+                        deadline=deadline,
+                        now_fn=now_fn,
+                    )
+                    futures[next_submit] = future
+                    pending.add(future)
+                    index_of[future] = next_submit
+                    next_submit += 1
+
+            def _collect(future: Future[_GroupOutcome], job_index: int) -> None:
+                nonlocal first_failure
+                outcomes[job_index] = future.result()
+                if outcomes[job_index].failure is not None and first_failure is None:
+                    first_failure = outcomes[job_index].failure
+
+            _fill()
+            while next_commit < len(jobs):
+                if futures[next_commit] is None:
+                    for rest in range(next_commit, len(jobs)):
+                        if futures[rest] is None:
+                            deferred_dates += 1
+                    break
+                if next_commit not in outcomes:
+                    done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                    for finished in done:
+                        pending.discard(finished)
+                        _collect(finished, index_of[finished])
+                    _fill()
+                    if next_commit not in outcomes:
+                        continue
+                outcome = outcomes.pop(next_commit)
+                tier_c, date_c, peak_c, segs_c = jobs[next_commit]
+                for verified_seg in outcome.verified:
+                    seg_members = segs_c[verified_seg.index]
+                    seg = segment_name(seg_members)
+                    committed_at = now_fn().isoformat()
+                    ledger_entry = LedgerEntry(
+                        tier=tier_c,
+                        trading_date=date_c,
+                        segment_name=seg,
+                        remote_path=_remote_path(config, tier_c, date_c, seg),
+                        members=tuple(seg_members),
+                        archive_bytes=verified_seg.local_bytes,
+                        archive_md5=verified_seg.local_md5,
+                        committed_at=committed_at,
+                    )
+                    _append_ledger_entry(_ledger_path(capture_root, tier_c, date_c), ledger_entry)
+                    segments_committed += 1
+                    members_committed += len(seg_members)
+                    archive_bytes_total += verified_seg.local_bytes
+                    logger.info(
+                        "[SYS] stage=capture_offsite tier=%s date=%s segment=%s.tar.zst members=%d bytes=%d",
+                        tier_c,
+                        date_c,
+                        seg,
+                        len(seg_members),
+                        verified_seg.local_bytes,
+                    )
+                if outcome.complete and outcome.failure is None:
+                    state[f"{tier_c}/{date_c}"] = peak_c
+                else:
+                    deferred_dates += 1
+                next_commit += 1
+                _fill()
+        if first_failure is not None:
+            raise first_failure
     _save_scan_state(capture_root, state)
     logger.info(
         "[SYS] stage=capture_offsite dates=%d segments=%d members=%d bytes=%d missing=%d deferred=%d",
