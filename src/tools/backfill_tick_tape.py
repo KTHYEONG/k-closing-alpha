@@ -1,4 +1,9 @@
-"""One-shot recovery of missing tick days from the Kiwoom tapes."""
+"""One-shot recovery of missing tick days from the Kiwoom tapes.
+
+Tape needs share the tick-bar consistency contract: a session needs recovery only on tick
+shortfall. Aftermarket needs now include any tick shortfall (previously > 1%); sessions come
+from TAPE_SESSIONS, all of which have a policy.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ from src.data.capture_contracts import SEOUL, CaptureStatus
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_store import _partition_row_count, intraday_partition_path, tick_partition_path
+from src.data.tick_bar_consistency import TickBarRelation, classify_tick_bar_volume
 from src.strategy.contract import DEFAULT_UNIVERSE
 from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
@@ -37,7 +43,6 @@ _MAX_BACKFILL_SPAN_DAYS = 31
 _MIN_START_MARGIN_SECONDS = 180
 _EST_PAGES_PER_DAY = 30
 _EST_BYTES_PER_PAGE = 50_000
-_VOLUME_GAP_TOLERANCE = 0.01
 _CLOSE_AUCTION_TS = 153000
 _REGULAR_READY_HHMMSS = "154000"
 _TICK_SESSIONS = ("regular", "krx_aftermarket", "nxt_aftermarket")
@@ -422,12 +427,6 @@ class PartitionIndex:
         return {str(k): float(v) for k, v in volume.groupby(frame["symbol"].astype(str)).sum().items()}
 
 
-def _has_volume_gap(tick_volume: float, bar_volume: float) -> bool:
-    if bar_volume == 0 or tick_volume >= bar_volume:
-        return False
-    return (bar_volume - tick_volume) / bar_volume > _VOLUME_GAP_TOLERANCE
-
-
 def _session_need(symbol: str, day: str, spec: TapeSession, index: PartitionIndex) -> bool:
     stats = index.tick_stats(day, spec)
     if stats is None:
@@ -437,7 +436,7 @@ def _session_need(symbol: str, day: str, spec: TapeSession, index: PartitionInde
         return True
     bars = index.bar_volumes(day, spec.session)
     bar_volume = None if bars is None else bars.get(str(symbol))
-    return bar_volume is not None and _has_volume_gap(row.volume, bar_volume)
+    return bar_volume is not None and classify_tick_bar_volume(spec.session, bar_volume, row.volume) is TickBarRelation.TICK_SHORT
 
 
 def _session_closed(day: str, session: str, now: datetime) -> bool:

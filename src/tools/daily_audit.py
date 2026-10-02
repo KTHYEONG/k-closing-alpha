@@ -61,6 +61,7 @@ from src.data.capture_store import (
 )
 from src.data.intraday_store import intraday_partition_path, tick_partition_path
 from src.data.session_calendar import SessionKind, resolve_session_day
+from src.data.tick_bar_consistency import TickBarRelation, classify_tick_bar_volume
 from src.data.trading_calendar import (
     DAY_HOLIDAY,
     DAY_TRADING,
@@ -767,7 +768,7 @@ def audit_aftermarket_ticks(
 
     Returns:
         Issues `intraday:<session>_ticks:<count>:<reason>` with reasons missing_partition (bars exist but no
-        tick partition) and volume_mismatch (symbols whose tick volume sum differs from bar volume sum).
+        tick partition) and volume_mismatch (tick shortfall or surplus beyond the session policy, not exact inequality).
     """
     day_str = trading_date.isoformat()
 
@@ -804,15 +805,13 @@ def audit_aftermarket_ticks(
         tick_sum = tick_vol.groupby(ticks["symbol"].astype(str)).sum()
         mismatched = sum(
             1 for symbol in set(bar_sum.index) | set(tick_sum.index)
-            if int(bar_sum.get(symbol, 0)) != int(tick_sum.get(symbol, 0))
+            if classify_tick_bar_volume(session, float(bar_sum.get(symbol, 0)), float(tick_sum.get(symbol, 0)))
+            is not TickBarRelation.CONSISTENT
         )
         if mismatched:
             issues.append(f"intraday:{session}_ticks:{mismatched}:volume_mismatch")
     return tuple(issues)
 
-
-REGULAR_TICK_VOLUME_GAP_TOLERANCE: float = 0.01
-"""Relative bar-over-tick volume gap above which a symbol is flagged short of ticks."""
 
 REGULAR_TICKS_AUDIT_START_DATE: str = "2026-09-28"
 """First date with the current archive path and certified LS/Kiwoom ticks; earlier dates predate the fix."""
@@ -828,7 +827,7 @@ def audit_regular_ticks(
 
     The bar stamped at the regular close carries closing-auction volume that is outside the tick
     window and is excluded. Ticks cover the exchange tape while bars are vendor-aggregated, so small
-    residuals are expected; only a relative gap above `REGULAR_TICK_VOLUME_GAP_TOLERANCE` marks a
+    residuals are expected; only a tick shortfall beyond the shared tick-bar contract marks a
     symbol as short of ticks.
 
     Args:
@@ -882,9 +881,7 @@ def audit_regular_ticks(
         if bar_total == 0:
             continue
         tick_total = float(tick_sum.get(symbol, 0))
-        if tick_total >= bar_total:
-            continue
-        if (bar_total - tick_total) / bar_total > REGULAR_TICK_VOLUME_GAP_TOLERANCE:
+        if classify_tick_bar_volume(INTRADAY_SESSION_REGULAR, bar_total, tick_total) is TickBarRelation.TICK_SHORT:
             short += 1
     if short:
         return (_intraday_issue("regular_ticks", short, "volume_gap"),)
