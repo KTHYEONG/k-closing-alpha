@@ -304,6 +304,27 @@ def test_systemd_units_encode_persistence_and_timezone_policy() -> None:
     assert "Type=oneshot" in audit
 
 
+def test_daily_audit_runs_after_tape_sweep_and_before_price_ingest() -> None:
+    import re
+    from pathlib import Path
+
+    from src.config.market_session import PRICE_INGEST_EVENING_HHMMSS, TAPE_SWEEP_DEADLINE_HHMMSS
+
+    def _slot(unit: str) -> str:
+        text = Path(f"deploy/systemd/{unit}.timer").read_text(encoding="utf-8")
+        m = re.search(r"OnCalendar=Mon\.\.Fri (\d{2}):(\d{2}):(\d{2})", text)
+        assert m, f"no weekday OnCalendar in {unit}"
+        return "".join(m.groups())
+
+    audit_slot = _slot("kca-daily-audit")
+    # Then: 감사 슬롯은 스윕 발화·데드라인 이후, 저녁 가격수집 이전이다
+    assert _slot("kca-tape-sweep") < TAPE_SWEEP_DEADLINE_HHMMSS < audit_slot < PRICE_INGEST_EVENING_HHMMSS
+    # And: 같은 시각에 스윕이 아직 돌고 있으면 감사는 스윕 종료를 기다린다
+    unit_text = Path("deploy/systemd/kca-daily-audit.service").read_text(encoding="utf-8")
+    after = re.search(r"^After=(.*)$", unit_text, re.MULTILINE)
+    assert after and "kca-tape-sweep.service" in after.group(1).split()
+
+
 def test_systemd_timers_align_with_decision_and_finalize_gates() -> None:
     import re
     from pathlib import Path

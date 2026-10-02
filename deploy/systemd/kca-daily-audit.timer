@@ -1,8 +1,8 @@
 [Unit]
-Description=KCA daily audit (Mon-Fri 20:15 KST)
+Description=KCA daily audit (Mon-Fri 21:20 KST, after the 20:35 tape sweep)
 
 [Timer]
-OnCalendar=Mon..Fri 20:15:00 Asia/Seoul
+OnCalendar=Mon..Fri 21:20:00 Asia/Seoul
 Persistent=true
 Unit=kca-daily-audit.service
 
