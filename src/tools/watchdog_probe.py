@@ -38,7 +38,7 @@ class WatchdogVerdict:
 def expected_audit_date(now: datetime) -> str:
     """Most recent Mon-Fri KST date strictly before now's KST date.
 
-    The probe runs the next morning, so the previous weekday's 20:15 audit
+    The probe runs the next morning, so the previous weekday's 21:20 audit
     (bounded by 02's timeouts to finish before ~23:40) must have landed.
     """
     day = now.astimezone(SEOUL).date() - timedelta(days=WATCHDOG_HEARTBEAT_MAX_LAG_WEEKDAYS)

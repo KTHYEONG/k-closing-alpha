@@ -206,7 +206,7 @@ def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
     outcomes = load_run_outcomes(snapshot_date)
     try:
         open_positions = PaperLedger(root=Path(settings.PAPER_DIR)).load_open_positions()
-        # 감사(20:15)는 당일 09:00 청산 이후이므로 당일 이전 결정 로트가 남아 있으면 청산 누락이다
+        # 감사(21:20)는 당일 09:00 청산 이후이므로 당일 이전 결정 로트가 남아 있으면 청산 누락이다
         stale_exit = bool((open_positions["decision_date"].astype(str) < snapshot_date).any())
     except (KeyError, ValueError) as exc:
         # 스키마가 깨졌거나 로트 링크를 위반한 원장은 청산 상태를 보증할 수 없으므로 누락으로 보고한다
@@ -1140,13 +1140,13 @@ def build_digest(
 def resolve_snapshot_date(now: pd.Timestamp, *, catchup_cutoff_hour: int = _SNAPSHOT_CATCHUP_CUTOFF_HOUR) -> str:
     """실행 시각 기준으로 감사 대상 영업일(KST)을 결정한다.
 
-    daily_audit는 평일 20:15 KST 타이머로만 트리거되며(Mon..Fri 20:15:00 Asia/Seoul),
+    daily_audit는 평일 21:20 KST 타이머로만 트리거되며(Mon..Fri 21:20:00 Asia/Seoul),
     선행 아카이브 잡과의 After= 순서 의존성 때문에 실제 프로세스 시작이 자정을 넘길
     수 있다. 이때 wall-clock '오늘'을 그대로 쓰면 아직 파이프라인이 전혀 돌지 않은
     새 영업일을 감사하게 되어, 정작 검증해야 할 전일 점검이 영구 누락된다.
     자정~catchup_cutoff_hour 사이의 실행은 전일 파이프라인의 지연 실행으로 간주해
     전일자를 반환한다. daily-audit의 유일한 정상 트리거가 평일 저녁이므로
-    (다음 트리거는 최소 다음 평일 20:15), 이 창 안에서의 실행은 항상 '어제 저녁
+    (다음 트리거는 최소 다음 평일 21:20), 이 창 안에서의 실행은 항상 '어제 저녁
     사이클의 지연분'이지 '오늘 저녁 사이클의 조기 실행'일 수 없다 — 따라서
     거래일력(공휴일) 보정 없이 달력일 -1만으로 충분하다.
 

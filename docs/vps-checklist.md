@@ -109,8 +109,8 @@ ssh or-vps 'cd ~/k-closing-alpha && for f in deploy/systemd/kca-*; do \
 | 15:34 | kca-paper-entry | paper entry at confirmed close | paper ledger |
 | 15:40 | kca-archive-intraday-regular / kca-aftermarket-book | regular bars+ticks / aftermarket book | audit, backup |
 | 20:05 | kca-archive-intraday | NXT/KRX aftermarket bars | audit, backup |
-| 20:15 | kca-daily-audit | completeness audit + **one digest email per weekday** + heartbeat | watchdog |
-| 20:35 | kca-tape-sweep | recover tick gaps from Kiwoom tapes | intraday completeness |
+| 20:35 | kca-tape-sweep | recover tick gaps from Kiwoom tapes (default no-new-walk deadline 21:15) | intraday completeness |
+| 21:20 | kca-daily-audit | completeness audit (After= tape-sweep, so it sees the sweep result) + **one digest email per weekday** + heartbeat | watchdog |
 | 21:00 | kca-backup-prune | purge `_deleted` snapshots > 30 d on gdrive | — |
 | 21:35 | kca-altdata-capture (optional) | slow altdata panels | — |
 | 22:15 | kca-backup | sealed capture segments + loose `data/`,`artifacts/` → gdrive | offsite |
@@ -253,7 +253,7 @@ ssh or-vps 'cd ~/k-closing-alpha && cat data/logs/heartbeat/daily_audit.json; ec
 gh run list --workflow watchdog.yml --limit 5
 ```
 
-- [ ] Heartbeat `snapshot_date == D`, `undelivered_alerts == 0`, `finished_at` ≈ 20:15–20:45 KST on `D`.
+- [ ] Heartbeat `snapshot_date == D`, `undelivered_alerts == 0`, `finished_at` ≈ 21:20–21:45 KST on `D`.
 - [ ] Heartbeat `subject` read and every token in it explained: `누락 <step>` (missing step),
       `실패유닛 <unit>` (failed unit), `수집이상 <collector:...>` (collection anomaly). Each must map to a finding in
       §4–§8; unexplained digest warnings are findings themselves.
