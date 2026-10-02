@@ -1051,3 +1051,57 @@ def test_history_archive_path_points_at_configured_archive(monkeypatch) -> None:
     from src import settings as _settings
 
     assert btt._history_archive_path() == Path(_settings.HISTORY_PARQUET_PATH)
+
+
+def _volume_need(tmp_path, monkeypatch, session: str, bar_volume: float, tick_volume: float) -> bool:
+    import pandas as pd
+
+    from src.data.intraday_schema import normalize_bar_frame, normalize_tick_frame
+    from src.data.intraday_store import write_intraday_partition, write_tick_partition
+
+    day = "2026-09-30"
+    ymd = day.replace("-", "")
+    symbol = "005930"
+    spec = next(s for s in btt.TAPE_SESSIONS if s.session == session)
+    hms = "090000" if session == "regular" else "160000"
+    tick_rows = pd.DataFrame([{"cntr_tm": f"{ymd}{hms}", "cur_prc": "10000", "trde_qty": str(int(tick_volume))}])
+    bar_rows = pd.DataFrame([{
+        "cntr_tm": f"{ymd}{hms}", "cur_prc": "10000", "open_pric": "9900",
+        "high_pric": "10100", "low_pric": "9800", "trde_qty": str(int(bar_volume)),
+    }])
+    tick_frame = normalize_tick_frame(tick_rows, "kiwoom", day, symbol)
+    bar_frame = normalize_bar_frame(bar_rows, "kiwoom", day, symbol)
+    write_tick_partition(tick_frame, day, session, coverage={symbol: _complete_entry(symbol, session, len(tick_frame))})
+    write_intraday_partition(bar_frame, 1, day, session, coverage={symbol: _complete_entry(symbol, session, len(bar_frame))})
+    return btt._session_need(symbol, day, spec, btt.PartitionIndex())
+
+
+def test_aftermarket_need_on_any_shortfall(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    assert _volume_need(tmp_path, monkeypatch, "krx_aftermarket", 1_000, 999) is True
+    assert _volume_need(tmp_path, monkeypatch, "nxt_aftermarket", 1_000, 999) is True
+
+
+def test_aftermarket_surplus_is_not_a_need(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    assert _volume_need(tmp_path, monkeypatch, "krx_aftermarket", 1_000, 1_002) is False
+
+
+def test_regular_need_threshold_unchanged(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    assert _volume_need(tmp_path, monkeypatch, "regular", 10_000, 9_950) is False
+    assert _volume_need(tmp_path, monkeypatch, "regular", 10_000, 9_850) is True
+
+
+def test_session_need_existing_causes_still_hold(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    regular = next(s for s in btt.TAPE_SESSIONS if s.session == "regular")
+    # Missing tick partition is a need.
+    assert btt._session_need("005930", "2026-09-30", regular, btt.PartitionIndex()) is True
+    # Zero rows are a need regardless of volume.
+    index = btt.PartitionIndex()
+    index._ticks[("2026-09-30", "regular")] = {
+        "005930": btt._TickStats(rows=0, truncated=False, out_of_window=False, volume=10000.0)
+    }
+    index._bars[("2026-09-30", "regular")] = {"005930": 10000.0}
+    assert btt._session_need("005930", "2026-09-30", regular, index) is True

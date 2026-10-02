@@ -3133,3 +3133,77 @@ def test_run_daily_audit_survives_unreadable_exhausted_ledger(monkeypatch, tmp_p
     )
     assert subject is not None and "🟢" in subject
     assert len(sent) == 1 and "extended_exhausted" not in sent[0][1]
+
+
+def test_aftermarket_two_share_surplus_is_not_a_mismatch() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars = pd.DataFrame({"symbol": ["488280"], "ts_hms": [160100], "volume": [1_191_030]})
+    ticks = pd.DataFrame({"symbol": ["488280"], "ts_hms": [160105], "volume": [1_191_032]})
+    read_bars, read_ticks = _tick_audit_frames(bars, ticks)
+    assert daily_audit.audit_aftermarket_ticks(date(2026, 10, 2), read_ticks=read_ticks, read_bars=read_bars) == ()
+
+
+def test_aftermarket_material_surplus_flagged() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars = pd.DataFrame({"symbol": ["005930"], "ts_hms": [160100], "volume": [1_000]})
+    ticks = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160105, 160205], "volume": [500, 520]})
+    read_bars, read_ticks = _tick_audit_frames(bars, ticks)
+    assert daily_audit.audit_aftermarket_ticks(
+        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
+    ) == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
+
+
+def test_audit_sweep_agreement_on_shortfall() -> None:
+    import pandas as pd
+    from datetime import date
+
+    from src.data.tick_bar_consistency import SESSION_POLICIES, TickBarRelation, classify_tick_bar_volume
+    from src.tools import backfill_tick_tape as btt
+    from src.tools import daily_audit
+
+    cases = [
+        ("regular", 10_000, 9_900, False, False),
+        ("regular", 10_000, 9_899, True, True),
+        ("regular", 1_000, 5_000, False, False),
+        ("krx_aftermarket", 1_000_000, 999_999, True, True),
+        ("krx_aftermarket", 1_191_030, 1_191_032, False, False),
+        ("krx_aftermarket", 1_000, 1_011, True, False),
+        ("nxt_aftermarket", 1_000, 1_011, True, False),
+        ("krx_aftermarket", 100, 0, True, True),
+    ]
+    tape_specs = {s.session: s for s in btt.TAPE_SESSIONS}
+    for session, bar, tick, expect_audit, expect_sweep in cases:
+        relation = classify_tick_bar_volume(session, float(bar), float(tick))
+        assert (relation is TickBarRelation.TICK_SHORT) is expect_sweep
+        assert session in SESSION_POLICIES
+        assert session in tape_specs
+        if session == "regular":
+            bars = pd.DataFrame({"symbol": ["S"], "volume": [bar], "ts_hms": [90100]})
+            ticks = pd.DataFrame({"symbol": ["S"], "volume": [tick]})
+            audit_res = daily_audit.audit_regular_ticks(
+                date(2026, 9, 30), read_ticks=lambda ticks=ticks: ticks, read_bars=lambda bars=bars: bars,
+            )
+            audit_flags = audit_res == ("intraday:regular_ticks:1:volume_gap",)
+        elif session == "krx_aftermarket":
+            bars = pd.DataFrame({"symbol": ["S"], "volume": [bar], "ts_hms": [160100]})
+            ticks = pd.DataFrame({"symbol": ["S"], "ts_hms": [160105], "volume": [tick]})
+            read_bars, read_ticks = _tick_audit_frames(bars, ticks)
+            audit_flags = daily_audit.audit_aftermarket_ticks(
+                date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
+            ) == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
+        else:
+            bars = pd.DataFrame({"symbol": ["S"], "volume": [bar], "ts_hms": [160100]})
+            ticks = pd.DataFrame({"symbol": ["S"], "ts_hms": [160105], "volume": [tick]})
+            read_bars, read_ticks = _nxt_tick_audit_frames(bars, ticks)
+            audit_flags = daily_audit.audit_aftermarket_ticks(
+                date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
+            ) == ("intraday:nxt_aftermarket_ticks:1:volume_mismatch",)
+        assert audit_flags is expect_audit, (session, bar, tick)
