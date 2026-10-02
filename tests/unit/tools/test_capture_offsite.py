@@ -79,6 +79,14 @@ def _make_fake(remote_dir: Path, remote_root: str, *, corrupt_upload: bool = Fal
                 return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="not found")
             digest = hashlib.md5(local.read_bytes()).hexdigest()  # noqa: S324
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{digest}  {local.name}\n", stderr="")
+        if op == "lsf":
+            local = _local_for(cmd[2])
+            if not local.exists() or not local.is_dir():
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="directory not found")
+            lines = "".join(
+                f"{child.name}\n" for child in sorted(local.iterdir()) if child.is_file()
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=lines, stderr="")
         raise AssertionError(f"unexpected rclone op: {op}")
 
     return run_fn, calls
@@ -631,7 +639,9 @@ def test_seal_raises_on_rclone_failures(tmp_path: Path, monkeypatch) -> None:
     _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"data")
 
     def failing_upload(cmd, **kwargs):
-        assert cmd[1] in ("md5sum", "copyto")
+        assert cmd[1] in ("lsf", "md5sum", "copyto")
+        if cmd[1] == "lsf":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="directory not found")
         if cmd[1] == "md5sum":
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="missing")
         return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="boom")
@@ -640,6 +650,8 @@ def test_seal_raises_on_rclone_failures(tmp_path: Path, monkeypatch) -> None:
         seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=failing_upload, now_fn=_utcnow, config=_config())
 
     def failing_verify(cmd, **kwargs):
+        if cmd[1] == "lsf":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="directory not found")
         if cmd[1] == "copyto":
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         return subprocess.CompletedProcess(cmd, 3, stdout="", stderr="hash down")
@@ -1650,6 +1662,327 @@ def test_seal_without_deadline_commits_everything(tmp_path: Path, monkeypatch) -
     )
 
     assert report.segments_committed == 2 and report.deferred_dates == 0
+
+
+def test_seal_workers_must_stay_within_quota_bound() -> None:
+    import pytest
+
+    from src.tools.capture_offsite import OffsiteConfig
+
+    assert OffsiteConfig().seal_workers == 4
+    assert OffsiteConfig(seal_workers=1).seal_workers == 1
+    assert OffsiteConfig(seal_workers=8).seal_workers == 8
+    with pytest.raises(ValueError, match="seal_workers"):
+        OffsiteConfig(seal_workers=0)
+    with pytest.raises(ValueError, match="seal_workers"):
+        OffsiteConfig(seal_workers=9)
+
+
+def test_remote_listing_missing_dir_is_empty_and_other_failures_raise(monkeypatch) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import OffsiteConfig, _remote_existing_segments
+
+    _patch_rclone(monkeypatch)
+    cfg = OffsiteConfig(remote_root="gdrive:test")
+
+    def _missing(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="directory not found")
+
+    assert _remote_existing_segments("rclone", cfg, "raw", "2026-09-10", run_fn=_missing) == frozenset()
+
+    def _boom(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _remote_existing_segments("rclone", cfg, "raw", "2026-09-10", run_fn=_boom)
+
+    def _empty(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+    assert _remote_existing_segments("rclone", cfg, "raw", "2026-09-10", run_fn=_empty) == frozenset()
+
+    def _raise_missing(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd, "", "directory not found")
+
+    assert _remote_existing_segments("rclone", cfg, "raw", "2026-09-10", run_fn=_raise_missing) == frozenset()
+
+    def _raise_boom(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd, "", "boom")
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _remote_existing_segments("rclone", cfg, "raw", "2026-09-10", run_fn=_raise_boom)
+
+
+def _write_many(root: Path, day: str, count: int, size: int = 400) -> None:
+    for idx in range(count):
+        _write_member(root, _raw_rel(day, "kis", "PRICE", "price", "run-1", f"f{idx:02d}.bin"), b"x" * size)
+
+
+def test_seal_single_listing_replaces_per_segment_precheck(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_many(tmp_path, day, 5)
+    run_fn, calls = _make_fake(tmp_path / "remote", "gdrive:test")
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow,
+        config=_config(max_segment_member_bytes=100),
+    )
+
+    kinds = [cmd[1] for cmd in calls]
+    assert kinds.count("lsf") == 1
+    assert kinds.count("copyto") == 5
+    assert kinds.count("md5sum") == 5
+    assert report.segments_committed == 5
+
+
+def test_seal_skips_upload_for_identical_remote_segment(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import read_ledger, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"alpha")
+    remote_dir = tmp_path / "remote"
+    run_fn, _ = _make_fake(remote_dir, "gdrive:test")
+    cfg = _config()
+    seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=cfg)
+    (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").unlink()
+
+    run_fn2, calls2 = _make_fake(remote_dir, "gdrive:test")
+    report = seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn2, now_fn=_utcnow, config=cfg)
+
+    kinds = [cmd[1] for cmd in calls2]
+    assert kinds.count("lsf") == 1
+    assert "copyto" not in kinds
+    assert kinds.count("md5sum") == 1
+    assert len(read_ledger(tmp_path, "raw", day)) == 1
+    assert report.segments_committed == 1
+
+
+def test_seal_fails_closed_on_different_remote_segment(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import read_ledger, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"alpha")
+    remote_dir = tmp_path / "remote"
+    run_fn, _ = _make_fake(remote_dir, "gdrive:test")
+    cfg = _config()
+    seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=cfg)
+    entry = read_ledger(tmp_path, "raw", day)[0]
+    remote_file = remote_dir / f"raw/{day[:7]}/{day}/{entry.segment_name}.tar.zst"
+    remote_file.write_bytes(b"different-content")
+    frozen = remote_file.read_bytes()
+    (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").unlink()
+
+    run_fn2, calls2 = _make_fake(remote_dir, "gdrive:test")
+    with pytest.raises(ValueError, match="remote MD5 mismatch"):
+        seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn2, now_fn=_utcnow, config=cfg)
+
+    assert "copyto" not in [cmd[1] for cmd in calls2]
+    assert remote_file.read_bytes() == frozen
+    assert not (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").exists()
+
+
+def test_seal_respects_worker_bound(tmp_path: Path, monkeypatch) -> None:
+    import threading
+    import time
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_many(tmp_path, day, 6)
+    base_run, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    state = {"current": 0, "peak": 0}
+    guard = threading.Lock()
+
+    def run_fn(cmd, **kwargs):
+        if cmd[1] == "copyto":
+            with guard:
+                state["current"] += 1
+                state["peak"] = max(state["peak"], state["current"])
+            try:
+                time.sleep(0.2)
+                return base_run(cmd, **kwargs)
+            finally:
+                with guard:
+                    state["current"] -= 1
+        return base_run(cmd, **kwargs)
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow,
+        config=_config(max_segment_member_bytes=100, seal_workers=3),
+    )
+
+    assert report.segments_committed == 6
+    assert state["peak"] <= 3
+    assert state["peak"] > 1
+
+
+def test_seal_parallel_matches_sequential(tmp_path: Path, monkeypatch) -> None:
+    import shutil
+
+    from src.tools.capture_offsite import read_ledger, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    days = ("2026-09-08", "2026-09-09", "2026-09-10")
+    for day in days:
+        _write_many(tmp_path / "fixture", day, 4)
+    single = tmp_path / "single"
+    parallel = tmp_path / "parallel"
+    shutil.copytree(tmp_path / "fixture" / "raw", single / "raw")
+    shutil.copytree(tmp_path / "fixture" / "raw", parallel / "raw")
+    single_remote, parallel_remote = tmp_path / "remote-1", tmp_path / "remote-4"
+    single_run, _ = _make_fake(single_remote, "gdrive:test")
+    parallel_run, _ = _make_fake(parallel_remote, "gdrive:test")
+
+    single_report = seal_and_upload(
+        single, today=date(2026, 9, 11), full_scan=True, run_fn=single_run, now_fn=_utcnow,
+        config=_config(max_segment_member_bytes=100, seal_workers=1),
+    )
+    parallel_report = seal_and_upload(
+        parallel, today=date(2026, 9, 11), full_scan=True, run_fn=parallel_run, now_fn=_utcnow,
+        config=_config(max_segment_member_bytes=100, seal_workers=4),
+    )
+
+    assert parallel_report == single_report
+    for day in days:
+        single_entries = [(e.segment_name, e.remote_path, e.archive_md5, tuple(m.path for m in e.members)) for e in read_ledger(single, "raw", day)]
+        parallel_entries = [(e.segment_name, e.remote_path, e.archive_md5, tuple(m.path for m in e.members)) for e in read_ledger(parallel, "raw", day)]
+        assert parallel_entries == single_entries
+        assert len(parallel_entries) == 4
+
+
+def test_seal_deadline_commits_inflight_and_defers_rest(tmp_path: Path, monkeypatch) -> None:
+    import json
+    from datetime import timedelta
+
+    from src.tools.capture_offsite import plan_segments, read_ledger, seal_and_upload, segment_name
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_many(tmp_path, day, 4)
+    cfg = _config(max_segment_member_bytes=100, seal_workers=2)
+    expected = [segment_name(members) for members in plan_segments(tmp_path, "raw", day, {}, cfg)]
+    assert len(expected) == 4
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    start = datetime(2026, 9, 11, 22, 0, tzinfo=UTC)
+    expired = start + timedelta(hours=2)
+    ticks = iter([start] * 3 + [expired] * 20)
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=start + timedelta(minutes=60),
+        run_fn=run_fn, now_fn=lambda: next(ticks), config=cfg,
+    )
+
+    assert report.segments_committed == 2
+    assert report.deferred_dates == 1
+    assert [entry.segment_name for entry in read_ledger(tmp_path, "raw", day)] == expected[:2]
+    state = json.loads((tmp_path / "offsite" / "scan_state.json").read_text(encoding="utf-8"))
+    assert f"raw/{day}" not in state
+
+
+def test_seal_deadline_before_first_submit_defers_date(tmp_path: Path, monkeypatch) -> None:
+    import json
+    from datetime import timedelta
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"payload")
+    run_fn, calls = _make_fake(tmp_path / "remote", "gdrive:test")
+    start = datetime(2026, 9, 11, 22, 0, tzinfo=UTC)
+    expired = start + timedelta(hours=2)
+    ticks = iter([start, expired] + [expired] * 10)
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=start + timedelta(minutes=60),
+        run_fn=run_fn, now_fn=lambda: next(ticks), config=_config(),
+    )
+
+    assert report.segments_committed == 0 and report.deferred_dates == 1
+    assert [cmd[1] for cmd in calls] == ["lsf"]
+    assert not (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").exists()
+    state = json.loads((tmp_path / "offsite" / "scan_state.json").read_text(encoding="utf-8"))
+    assert f"raw/{day}" not in state
+
+
+def test_seal_precheck_failure_raises_without_commit(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import read_ledger, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"alpha")
+    remote_dir = tmp_path / "remote"
+    run_fn, _ = _make_fake(remote_dir, "gdrive:test")
+    cfg = _config()
+    seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=cfg)
+    assert len(read_ledger(tmp_path, "raw", day)) == 1
+    (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").unlink()
+    base_run, _ = _make_fake(remote_dir, "gdrive:test")
+
+    def run_fn2(cmd, **kwargs):
+        if cmd[1] == "md5sum":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="gone")
+        return base_run(cmd, **kwargs)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn2, now_fn=_utcnow, config=cfg)
+    assert not (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").exists()
+
+
+def test_seal_failure_with_inflight_cancels_and_commits_nothing(tmp_path: Path, monkeypatch) -> None:
+    import time
+
+    import pytest
+
+    from src.tools.capture_offsite import plan_segments, seal_and_upload, segment_name
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_many(tmp_path, day, 3)
+    cfg = _config(max_segment_member_bytes=100, seal_workers=2)
+    bad = segment_name(plan_segments(tmp_path, "raw", day, {}, cfg)[0])
+    remote_dir = tmp_path / "remote"
+    remote_root = "gdrive:test"
+
+    def run_fn(cmd, **kwargs):
+        assert cmd[0] == "rclone"
+        op = cmd[1]
+        if op == "lsf":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="directory not found")
+        if op == "copyto":
+            src, dst = cmd[2], cmd[3]
+            data = Path(src).read_bytes()
+            if bad in src:
+                data = b"corrupt:" + data
+            else:
+                time.sleep(2)
+            target = remote_dir / dst[len(remote_root):].lstrip("/")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if op == "md5sum":
+            local = remote_dir / cmd[2][len(remote_root):].lstrip("/")
+            if not local.exists():
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="not found")
+            digest = hashlib.md5(local.read_bytes()).hexdigest()  # noqa: S324
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{digest}  {local.name}\n", stderr="")
+        raise AssertionError(f"unexpected rclone op: {op}")
+
+    with pytest.raises(ValueError, match="remote MD5 mismatch"):
+        seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=cfg)
+    assert not (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").exists()
+    assert list((tmp_path / "staging" / "offsite").glob("*.tar.zst")) == []
 
 
 def test_manifest_retention_must_outlast_the_tape_window() -> None:
