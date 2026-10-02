@@ -1576,11 +1576,18 @@ def test_seal_deadline_defers_unstarted_dates_and_keeps_watermarks(tmp_path: Pat
     run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
     start = datetime(2026, 9, 11, 22, 0, tzinfo=UTC)
     deadline = start + timedelta(minutes=60)
-    ticks = iter([start, start] + [deadline + timedelta(minutes=1)] * 20)
+    import threading as _th
+
+    _ticks = iter([start, start] + [deadline + timedelta(minutes=1)] * 20)
+    _guard = _th.Lock()
+
+    def _now():
+        with _guard:
+            return next(_ticks)
 
     report = seal_and_upload(
         tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=deadline,
-        run_fn=run_fn, now_fn=lambda: next(ticks), config=_config(),
+        run_fn=run_fn, now_fn=_now, config=_config(seal_workers=1),
     )
 
     assert report.segments_committed == 1 and report.deferred_dates == 2
@@ -1601,11 +1608,18 @@ def test_seal_processes_newest_dates_first(tmp_path: Path, monkeypatch) -> None:
     _write_member(tmp_path, _raw_rel("2026-09-11", "kis", "PRICE", "price", "run-1", "a.json.gz"), b"new")
     run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
     start = datetime(2026, 9, 11, 22, 0, tzinfo=UTC)
-    ticks = iter([start, start] + [start + timedelta(hours=2)] * 10)
+    import threading as _th2
+
+    _ticks2 = iter([start, start] + [start + timedelta(hours=2)] * 10)
+    _guard2 = _th2.Lock()
+
+    def _now2():
+        with _guard2:
+            return next(_ticks2)
 
     report = seal_and_upload(
         tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=start + timedelta(minutes=60),
-        run_fn=run_fn, now_fn=lambda: next(ticks), config=_config(),
+        run_fn=run_fn, now_fn=_now2, config=_config(seal_workers=1),
     )
 
     assert report.segments_committed == 1 and report.deferred_dates == 1
@@ -1796,8 +1810,9 @@ def test_seal_respects_worker_bound(tmp_path: Path, monkeypatch) -> None:
     from src.tools.capture_offsite import seal_and_upload
 
     _patch_rclone(monkeypatch)
-    day = "2026-09-10"
-    _write_many(tmp_path, day, 6)
+    for idx in range(20):
+        day = f"2026-08-{idx + 1:02d}"
+        _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"x" * 50)
     base_run, _ = _make_fake(tmp_path / "remote", "gdrive:test")
     state = {"current": 0, "peak": 0}
     guard = threading.Lock()
@@ -1820,7 +1835,7 @@ def test_seal_respects_worker_bound(tmp_path: Path, monkeypatch) -> None:
         config=_config(max_segment_member_bytes=100, seal_workers=3),
     )
 
-    assert report.segments_committed == 6
+    assert report.segments_committed == 20
     assert state["peak"] <= 3
     assert state["peak"] > 1
 
@@ -1867,23 +1882,23 @@ def test_seal_deadline_commits_inflight_and_defers_rest(tmp_path: Path, monkeypa
 
     _patch_rclone(monkeypatch)
     day = "2026-09-10"
-    _write_many(tmp_path, day, 4)
+    _write_many(tmp_path, day, 8)
     cfg = _config(max_segment_member_bytes=100, seal_workers=2)
     expected = [segment_name(members) for members in plan_segments(tmp_path, "raw", day, {}, cfg)]
-    assert len(expected) == 4
+    assert len(expected) == 8
     run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
     start = datetime(2026, 9, 11, 22, 0, tzinfo=UTC)
     expired = start + timedelta(hours=2)
-    ticks = iter([start] * 3 + [expired] * 20)
+    ticks = iter([start] * 4 + [expired] * 20)
 
     report = seal_and_upload(
         tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=start + timedelta(minutes=60),
         run_fn=run_fn, now_fn=lambda: next(ticks), config=cfg,
     )
 
-    assert report.segments_committed == 2
+    assert report.segments_committed == 3
     assert report.deferred_dates == 1
-    assert [entry.segment_name for entry in read_ledger(tmp_path, "raw", day)] == expected[:2]
+    assert [entry.segment_name for entry in read_ledger(tmp_path, "raw", day)] == expected[:3]
     state = json.loads((tmp_path / "offsite" / "scan_state.json").read_text(encoding="utf-8"))
     assert f"raw/{day}" not in state
 
@@ -1995,3 +2010,366 @@ def test_manifest_retention_must_outlast_the_tape_window() -> None:
     _validate_manifest_retention(lookback + 2)
     with pytest.raises(ValueError, match="COLLECTION_TAPE_LOOKBACK_DAYS"):
         _validate_manifest_retention(lookback + 1)
+
+
+def test_seal_single_segment_groups_overlap(tmp_path: Path, monkeypatch) -> None:
+    import threading
+    import time
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    for idx in range(12):
+        day = f"2026-08-{idx + 1:02d}"
+        _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"x" * 50)
+    base_run, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    state = {"current": 0, "peak": 0}
+    guard = threading.Lock()
+    barrier = threading.Barrier(4, timeout=30)
+
+    def run_fn(cmd, **kwargs):
+        if cmd[1] == "copyto":
+            with guard:
+                state["current"] += 1
+                state["peak"] = max(state["peak"], state["current"])
+            try:
+                barrier.wait(timeout=30)
+                time.sleep(0.05)
+                return base_run(cmd, **kwargs)
+            finally:
+                with guard:
+                    state["current"] -= 1
+        return base_run(cmd, **kwargs)
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow,
+        config=_config(seal_workers=4),
+    )
+
+    assert report.segments_committed == 12
+    assert state["peak"] == 4
+
+
+def test_seal_commit_order_is_priority_order(tmp_path: Path, monkeypatch) -> None:
+    import threading
+    import time
+
+    import src.tools.capture_offsite as module
+    from src.tools.capture_offsite import plan_segments, seal_and_upload, segment_name
+
+    _patch_rclone(monkeypatch)
+    days = ("2026-09-08", "2026-09-09", "2026-09-10")
+    for day in days:
+        _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"x" * 50)
+    _write_member(tmp_path, _raw_rel("2026-09-10", "kis", "PRICE", "price", "run-1", "b.bin"), b"y" * 50)
+    cfg = _config(max_segment_member_bytes=60, seal_workers=3)
+    expected_newest = [segment_name(m) for m in plan_segments(tmp_path, "raw", "2026-09-10", {}, cfg)]
+    assert len(expected_newest) == 2
+    base_run, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    order: list[tuple[str, str]] = []
+    guard = threading.Lock()
+    real_append = module._append_ledger_entry
+
+    def recording_append(ledger_path, entry):
+        with guard:
+            order.append((entry.tier, entry.trading_date))
+        return real_append(ledger_path, entry)
+
+    monkeypatch.setattr(module, "_append_ledger_entry", recording_append)
+
+    def run_fn(cmd, **kwargs):
+        if cmd[1] == "copyto":
+            if "2026-09-10" in cmd[3]:
+                time.sleep(0.4)
+            elif "2026-09-09" in cmd[3]:
+                time.sleep(0.2)
+            return base_run(cmd, **kwargs)
+        return base_run(cmd, **kwargs)
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=cfg,
+    )
+
+    assert report.segments_committed == 4
+    assert order == [("raw", "2026-09-10"), ("raw", "2026-09-10"), ("raw", "2026-09-09"), ("raw", "2026-09-08")]
+    from src.tools.capture_offsite import read_ledger
+
+    assert [e.segment_name for e in read_ledger(tmp_path, "raw", "2026-09-10")] == expected_newest
+
+
+def test_seal_sequential_equivalence_includes_scan_state(tmp_path: Path, monkeypatch) -> None:
+    import json
+    import shutil
+
+    from src.tools.capture_offsite import read_ledger, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    days = ("2026-09-08", "2026-09-09", "2026-09-10")
+    for day in days:
+        _write_many(tmp_path / "fixture", day, 4)
+    single = tmp_path / "single"
+    parallel = tmp_path / "parallel"
+    shutil.copytree(tmp_path / "fixture" / "raw", single / "raw")
+    shutil.copytree(tmp_path / "fixture" / "raw", parallel / "raw")
+    single_run, _ = _make_fake(tmp_path / "remote-1", "gdrive:test")
+    parallel_run, _ = _make_fake(tmp_path / "remote-4", "gdrive:test")
+
+    single_report = seal_and_upload(
+        single, today=date(2026, 9, 11), full_scan=True, run_fn=single_run, now_fn=_utcnow,
+        config=_config(max_segment_member_bytes=100, seal_workers=1),
+    )
+    parallel_report = seal_and_upload(
+        parallel, today=date(2026, 9, 11), full_scan=True, run_fn=parallel_run, now_fn=_utcnow,
+        config=_config(max_segment_member_bytes=100, seal_workers=4),
+    )
+
+    assert parallel_report == single_report
+    single_state = json.loads((single / "offsite" / "scan_state.json").read_text(encoding="utf-8"))
+    parallel_state = json.loads((parallel / "offsite" / "scan_state.json").read_text(encoding="utf-8"))
+    assert parallel_state == single_state
+    for day in days:
+        s_entries = [(e.segment_name, e.remote_path, e.archive_md5, tuple(m.path for m in e.members)) for e in read_ledger(single, "raw", day)]
+        p_entries = [(e.segment_name, e.remote_path, e.archive_md5, tuple(m.path for m in e.members)) for e in read_ledger(parallel, "raw", day)]
+        assert p_entries == s_entries
+
+
+def test_seal_one_listing_per_group_no_precheck(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    for idx in range(6):
+        day = f"2026-08-{idx + 1:02d}"
+        for fidx in range((idx % 3) + 1):
+            _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", f"f{fidx}.bin"), b"x" * 400)
+    run_fn, calls = _make_fake(tmp_path / "remote", "gdrive:test")
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow,
+        config=_config(max_segment_member_bytes=100),
+    )
+
+    kinds = [cmd[1] for cmd in calls]
+    assert kinds.count("lsf") == 6
+    assert kinds.count("copyto") == 12
+    assert kinds.count("md5sum") == 12
+    assert report.segments_committed == 12
+
+
+def test_seal_ledger_written_only_by_coordinator(tmp_path: Path, monkeypatch) -> None:
+    import threading
+
+    import src.tools.capture_offsite as module
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    for idx in range(6):
+        day = f"2026-08-{idx + 1:02d}"
+        _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"x" * 50)
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    main_id = threading.get_ident()
+    seen: list[int] = []
+    guard = threading.Lock()
+    real_append = module._append_ledger_entry
+
+    def recording_append(ledger_path, entry):
+        with guard:
+            seen.append(threading.get_ident())
+        return real_append(ledger_path, entry)
+
+    monkeypatch.setattr(module, "_append_ledger_entry", recording_append)
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow,
+        config=_config(seal_workers=4),
+    )
+
+    assert report.segments_committed == 6
+    assert seen and all(tid == main_id for tid in seen)
+
+
+def test_seal_listing_failure_is_group_failure(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"data")
+
+    def boom(cmd, **kwargs):
+        if cmd[1] == "lsf":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+        raise AssertionError(f"unexpected op after failed listing: {cmd}")
+
+    with pytest.raises(subprocess.CalledProcessError):
+        seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=boom, now_fn=_utcnow, config=_config())
+    assert not (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").exists()
+    assert not (tmp_path / "offsite" / "scan_state.json").exists()
+    assert list((tmp_path / "staging" / "offsite").glob("*.tar.zst")) == []
+
+
+def test_seal_verification_failure_commits_only_verified_work(tmp_path: Path, monkeypatch) -> None:
+    import threading
+    import time
+
+    import pytest
+
+    from src.tools.capture_offsite import read_ledger, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    days = tuple(f"2026-08-{idx + 1:02d}" for idx in range(5))
+    for day in days:
+        _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"x" * 50)
+    priority = sorted(days, reverse=True)
+    failing_day = priority[2]
+    base_run, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    lsf_days: list[str] = []
+    guard = threading.Lock()
+
+    def run_fn(cmd, **kwargs):
+        if cmd[1] == "lsf":
+            with guard:
+                lsf_days.append(cmd[2])
+        if cmd[1] == "copyto" and failing_day not in cmd[3]:
+            time.sleep(0.5)
+            return base_run(cmd, **kwargs)
+        if cmd[1] == "md5sum" and failing_day in cmd[2]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="0" * 32 + "  seg.tar.zst\n", stderr="")
+        return base_run(cmd, **kwargs)
+
+    with pytest.raises(ValueError, match="remote MD5 mismatch"):
+        seal_and_upload(
+            tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow,
+            config=_config(seal_workers=4),
+        )
+
+    assert len(read_ledger(tmp_path, "raw", priority[0])) == 1
+    assert len(read_ledger(tmp_path, "raw", priority[1])) == 1
+    assert not (tmp_path / "offsite" / "ledger" / "raw" / f"{failing_day}.jsonl").exists()
+    assert all(priority[4] not in entry for entry in lsf_days)
+    assert not (tmp_path / "offsite" / "scan_state.json").exists()
+    assert list((tmp_path / "staging" / "offsite").glob("*.tar.zst")) == []
+
+
+def test_seal_failure_mid_group_keeps_verified_prefix(tmp_path: Path, monkeypatch) -> None:
+    import time
+
+    import pytest
+
+    from src.tools.capture_offsite import plan_segments, read_ledger, seal_and_upload, segment_name
+
+    _patch_rclone(monkeypatch)
+    target_day = "2026-09-09"
+    for day in ("2026-09-08", "2026-09-10"):
+        _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"x" * 50)
+    _write_many(tmp_path, target_day, 3)
+    cfg = _config(max_segment_member_bytes=100, seal_workers=3)
+    planned = [segment_name(m) for m in plan_segments(tmp_path, "raw", target_day, {}, cfg)]
+    assert len(planned) == 3
+    bad = planned[1]
+    base_run, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+
+    def run_fn(cmd, **kwargs):
+        if cmd[1] == "copyto" and target_day not in cmd[3]:
+            time.sleep(0.5)
+        if cmd[1] == "md5sum" and bad in cmd[2]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="f" * 32 + "  seg.tar.zst\n", stderr="")
+        return base_run(cmd, **kwargs)
+
+    with pytest.raises(ValueError, match="remote MD5 mismatch"):
+        seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=cfg)
+
+    kept = read_ledger(tmp_path, "raw", target_day)
+    assert [e.segment_name for e in kept] == planned[:1]
+    assert len(read_ledger(tmp_path, "raw", "2026-09-10")) == 1
+    assert list((tmp_path / "staging" / "offsite").glob("*.tar.zst")) == []
+
+
+def test_seal_deadline_defers_suffix(tmp_path: Path, monkeypatch) -> None:
+    import json
+    import threading
+    from datetime import timedelta
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    days = tuple(f"2026-08-{idx + 1:02d}" for idx in range(10))
+    for day in days:
+        _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"x" * 50)
+    base_run, calls = _make_fake(tmp_path / "remote", "gdrive:test")
+    start = datetime(2026, 9, 11, 22, 0, tzinfo=UTC)
+    deadline = start + timedelta(minutes=60)
+    expired = deadline + timedelta(minutes=1)
+    guard = threading.Lock()
+    clock = {"now": start, "uploads": 0}
+
+    def run_fn(cmd, **kwargs):
+        out = base_run(cmd, **kwargs)
+        if cmd[1] == "copyto":
+            with guard:
+                clock["uploads"] += 1
+                if clock["uploads"] >= 4:
+                    clock["now"] = expired
+        return out
+
+    def now_fn():
+        with guard:
+            return clock["now"]
+
+    report = seal_and_upload(
+        tmp_path, today=date(2026, 9, 11), full_scan=True, deadline=deadline,
+        run_fn=run_fn, now_fn=now_fn, config=_config(seal_workers=1),
+    )
+
+    assert report.segments_committed == 4 and report.deferred_dates == 6
+    priority = sorted(days, reverse=True)
+    for day in priority[:4]:
+        assert (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").exists()
+    for day in priority[4:]:
+        assert not (tmp_path / "offsite" / "ledger" / "raw" / f"{day}.jsonl").exists()
+    state = json.loads((tmp_path / "offsite" / "scan_state.json").read_text(encoding="utf-8"))
+    for day in priority[:4]:
+        assert f"raw/{day}" in state
+    for day in priority[4:]:
+        assert f"raw/{day}" not in state
+    listed = [cmd[2] for cmd in calls if cmd[1] == "lsf"]
+    assert len(listed) == 4
+
+
+def test_seal_staging_bounded_and_cleaned(tmp_path: Path, monkeypatch) -> None:
+    import threading
+    import time
+
+    import pytest
+
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    days = tuple(f"2026-08-{idx + 1:02d}" for idx in range(12))
+    for day in days:
+        _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.bin"), b"x" * 50)
+    priority = sorted(days, reverse=True)
+    failing_day = priority[5]
+    base_run, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    staging = tmp_path / "staging" / "offsite"
+    peak = {"n": 0}
+    guard = threading.Lock()
+
+    def run_fn(cmd, **kwargs):
+        if cmd[1] in ("copyto", "md5sum"):
+            with guard:
+                alive = len(list(staging.glob("*.tar.zst")))
+                peak["n"] = max(peak["n"], alive)
+            time.sleep(0.1)
+        if cmd[1] == "md5sum" and failing_day in cmd[2]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="0" * 32 + "  seg.tar.zst\n", stderr="")
+        return base_run(cmd, **kwargs)
+
+    with pytest.raises(ValueError, match="remote MD5 mismatch"):
+        seal_and_upload(
+            tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow,
+            config=_config(seal_workers=4),
+        )
+
+    assert peak["n"] <= 4
+    assert peak["n"] > 1
+    assert list(staging.glob("*.tar.zst")) == []
