@@ -158,6 +158,16 @@ class HostPacedRateLimiter:
         self._clock = clock
         self._sleep = sleep
         self._lock: asyncio.Lock | None = None
+        self._lock_loop: asyncio.AbstractEventLoop | None = None
+
+    def _loop_lock(self) -> asyncio.Lock:
+        # The limiter is a process singleton but callers may run several asyncio.run() loops in sequence;
+        # a contended asyncio.Lock stays bound to the loop it first waited on.
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock
 
     def _read_next_free_locked(self, fd: int) -> float:
         raw = os.read(fd, 64).decode("ascii", errors="replace").strip()
@@ -218,9 +228,7 @@ class HostPacedRateLimiter:
 
     async def _acquire_bounded(self) -> None:
         assert self._max_lead_seconds is not None
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        async with self._lock:
+        async with self._loop_lock():
             while True:
                 booked, wait = self._try_book_or_wait()
                 if booked:
@@ -234,9 +242,7 @@ class HostPacedRateLimiter:
         if self._max_lead_seconds is not None:
             await self._acquire_bounded()
             return
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        async with self._lock:
+        async with self._loop_lock():
             delay = self._book_unconditional()
         if delay > 0:
             await self._sleep(delay)
