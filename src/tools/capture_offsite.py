@@ -19,6 +19,7 @@ import subprocess
 import tarfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -66,6 +67,8 @@ class OffsiteConfig:
         full_scan_weekday: Weekday (Mon=0) on which every trading date is
             fully rescanned as a reconciliation safety net.
         rclone_timeout_sec: Per rclone subprocess timeout.
+        seal_workers: Concurrent segment uploads during sealing; bounded to
+            protect Drive API quota and host CPU/disk.
     """
 
     remote_root: str = OFFSITE_REMOTE_BASE + "/capture_sealed"
@@ -74,6 +77,11 @@ class OffsiteConfig:
     recent_window_days: int = 3
     full_scan_weekday: int = 4
     rclone_timeout_sec: int = 3600
+    seal_workers: int = 4
+
+    def __post_init__(self) -> None:
+        if not 1 <= int(self.seal_workers) <= 8:
+            raise ValueError(f"seal_workers must be within 1..8: {self.seal_workers!r}")
 
 
 @dataclass(frozen=True)
@@ -382,6 +390,114 @@ def _parse_remote_md5(stdout: str) -> str | None:
     return None
 
 
+def _is_missing_remote_dir(stderr: str | None) -> bool:
+    text = (stderr or "").lower()
+    if not text.strip():
+        return True
+    markers = (
+        "directory not found",
+        "not found",
+        "doesn't exist",
+        "does not exist",
+        "no such file or directory",
+        "not exist",
+        "couldn't find",
+        "could not find",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _remote_existing_segments(
+    rclone: str,
+    config: OffsiteConfig,
+    tier: str,
+    trading_date: str,
+    *,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]],
+) -> frozenset[str]:
+    """Names of segment objects already present in the remote date directory, from a single directory listing. Replaces one md5 pre-check per segment: only names found here need a pre-upload MD5 comparison."""
+    remote_dir = f"{config.remote_root}/{tier}/{trading_date[:7]}/{trading_date}"
+    try:
+        result = run_fn(
+            [rclone, "lsf", remote_dir],
+            capture_output=True,
+            text=True,
+            timeout=config.rclone_timeout_sec,
+            check=False,
+        )
+    except subprocess.CalledProcessError as exc:
+        if _is_missing_remote_dir(exc.stderr):
+            return frozenset()
+        raise
+    if result.returncode != 0:
+        if _is_missing_remote_dir(result.stderr):
+            return frozenset()
+        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+    names = {line.strip().split("/")[-1] for line in result.stdout.splitlines() if line.strip()}
+    names.discard("")
+    return frozenset(names)
+
+
+def _seal_one_segment(
+    *,
+    capture_root: Path,
+    tier: str,
+    trading_date: str,
+    seg_members: Sequence[SegmentMember],
+    segment: str,
+    staging_path: Path,
+    rclone: str,
+    config: OffsiteConfig,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]],
+    already_remote: bool,
+) -> tuple[int, str]:
+    try:
+        _build_archive(capture_root, seg_members, staging_path)
+        _verify_archive_members(staging_path, seg_members)
+        local_md5 = _local_md5(staging_path)
+        local_bytes = staging_path.stat().st_size
+        remote = _remote_path(config, tier, trading_date, segment)
+        if already_remote:
+            pre = run_fn(
+                [rclone, "md5sum", remote],
+                capture_output=True,
+                text=True,
+                timeout=config.rclone_timeout_sec,
+                check=False,
+            )
+            if pre.returncode != 0:
+                raise subprocess.CalledProcessError(pre.returncode, pre.args, pre.stdout, pre.stderr)
+            if _parse_remote_md5(pre.stdout) != local_md5:
+                raise ValueError(f"remote MD5 mismatch for {remote}")
+            return local_bytes, local_md5
+        uploaded = run_fn(
+            [rclone, "copyto", str(staging_path), remote, "--immutable"],
+            capture_output=True,
+            text=True,
+            timeout=config.rclone_timeout_sec,
+            check=True,
+        )
+        if uploaded.returncode != 0:
+            raise subprocess.CalledProcessError(
+                uploaded.returncode, uploaded.args, uploaded.stdout, uploaded.stderr
+            )
+        post = run_fn(
+            [rclone, "md5sum", remote],
+            capture_output=True,
+            text=True,
+            timeout=config.rclone_timeout_sec,
+            check=True,
+        )
+        if post.returncode != 0:
+            raise subprocess.CalledProcessError(post.returncode, post.args, post.stdout, post.stderr)
+        if _parse_remote_md5(post.stdout) != local_md5:
+            raise ValueError(f"remote MD5 mismatch for {remote}")
+        return local_bytes, local_md5
+    finally:
+        with contextlib.suppress(OSError):
+            staging_path.unlink(missing_ok=True)
+
+
 class _HashingReader:
     def __init__(self, path: Path) -> None:
         self._handle = open(path, "rb")  # noqa: SIM115 - handle lifetime managed by close()
@@ -447,6 +563,34 @@ def _append_ledger_entry(ledger_path: Path, entry: LedgerEntry) -> None:
         handle.write(json.dumps(_entry_to_dict(entry), sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _submit_segment(
+    pool: ThreadPoolExecutor,
+    capture_root: Path,
+    tier: str,
+    trading_date: str,
+    seg_members: tuple[SegmentMember, ...],
+    staging_dir: Path,
+    rclone: str,
+    config: OffsiteConfig,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]],
+    known: frozenset[str],
+) -> Future[tuple[int, str]]:
+    seg = segment_name(seg_members)
+    return pool.submit(
+        _seal_one_segment,
+        capture_root=capture_root,
+        tier=tier,
+        trading_date=trading_date,
+        seg_members=seg_members,
+        segment=seg,
+        staging_path=staging_dir / f"{seg}.tar.zst",
+        rclone=rclone,
+        config=config,
+        run_fn=run_fn,
+        already_remote=f"{seg}.tar.zst" in known,
+    )
 
 
 def seal_and_upload(
@@ -565,77 +709,109 @@ def _seal_locked(
         if not segments:
             state[f"{tier}/{date_name}"] = scan_peak
             continue
+        if deadline is not None and now_fn() >= deadline:
+            deferred_dates += 1
+            continue
+        existing = _remote_existing_segments(rclone, config, tier, date_name, run_fn=run_fn)
+        workers = int(config.seal_workers)
         date_complete = True
-        for seg_members in segments:
-            if deadline is not None and now_fn() >= deadline:
+        verified: dict[int, tuple[int, str]] = {}
+        failure: BaseException | None = None
+        failed_at: int | None = None
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="offsite-seal") as pool:
+            active: dict[Future[tuple[int, str]], int] = {}
+            next_index = 0
+
+            while next_index < len(segments) and len(active) < workers:
+                if deadline is not None and now_fn() >= deadline:
+                    date_complete = False
+                    next_index = len(segments)
+                    break
+                active[
+                    _submit_segment(
+                        pool,
+                        capture_root,
+                        tier,
+                        date_name,
+                        segments[next_index],
+                        staging_dir,
+                        rclone,
+                        config,
+                        run_fn,
+                        existing,
+                    )
+                ] = next_index
+                next_index += 1
+            while active and failure is None:
+                done, _ = wait(tuple(active), return_when=FIRST_COMPLETED)
+                for finished in done:
+                    index = active.pop(finished)
+                    try:
+                        verified[index] = finished.result()
+                    except BaseException as exc:
+                        if failure is None:
+                            failure = exc
+                            failed_at = index
+                if failure is not None:
+                    for pending_future in active:
+                        pending_future.cancel()
+                    break
+                while next_index < len(segments) and len(active) < workers:
+                    if deadline is not None and now_fn() >= deadline:
+                        date_complete = False
+                        next_index = len(segments)
+                        break
+                    active[
+                        _submit_segment(
+                            pool,
+                            capture_root,
+                            tier,
+                            date_name,
+                            segments[next_index],
+                            staging_dir,
+                            rclone,
+                            config,
+                            run_fn,
+                            existing,
+                        )
+                    ] = next_index
+                    next_index += 1
+        limit = failed_at if failed_at is not None else len(segments)
+        for index in range(len(segments)):
+            if index >= limit:
+                break
+            outcome = verified.get(index)
+            if outcome is None:
                 date_complete = False
                 break
+            local_bytes, local_md5 = outcome
+            seg_members = segments[index]
             seg = segment_name(seg_members)
-            staging_path = staging_dir / f"{seg}.tar.zst"
-            try:
-                _build_archive(capture_root, seg_members, staging_path)
-                _verify_archive_members(staging_path, seg_members)
-                local_md5 = _local_md5(staging_path)
-                local_bytes = staging_path.stat().st_size
-                remote = _remote_path(config, tier, date_name, seg)
-                pre = run_fn(
-                    [rclone, "md5sum", remote],
-                    capture_output=True,
-                    text=True,
-                    timeout=config.rclone_timeout_sec,
-                    check=False,
-                )
-                remote_pre = _parse_remote_md5(pre.stdout) if pre.returncode == 0 else None
-                if remote_pre != local_md5:
-                    uploaded = run_fn(
-                        [rclone, "copyto", str(staging_path), remote, "--immutable"],
-                        capture_output=True,
-                        text=True,
-                        timeout=config.rclone_timeout_sec,
-                        check=True,
-                    )
-                    if uploaded.returncode != 0:
-                        raise subprocess.CalledProcessError(
-                            uploaded.returncode, uploaded.args, uploaded.stdout, uploaded.stderr
-                        )
-                    post = run_fn(
-                        [rclone, "md5sum", remote],
-                        capture_output=True,
-                        text=True,
-                        timeout=config.rclone_timeout_sec,
-                        check=True,
-                    )
-                    if post.returncode != 0:
-                        raise subprocess.CalledProcessError(post.returncode, post.args, post.stdout, post.stderr)
-                    remote_post = _parse_remote_md5(post.stdout)
-                    if remote_post != local_md5:
-                        raise ValueError(f"remote MD5 mismatch for {remote}")
-                committed_at = now_fn().isoformat()
-                ledger_entry = LedgerEntry(
-                    tier=tier,
-                    trading_date=date_name,
-                    segment_name=seg,
-                    remote_path=remote,
-                    members=tuple(seg_members),
-                    archive_bytes=local_bytes,
-                    archive_md5=local_md5,
-                    committed_at=committed_at,
-                )
-                _append_ledger_entry(_ledger_path(capture_root, tier, date_name), ledger_entry)
-                segments_committed += 1
-                members_committed += len(seg_members)
-                archive_bytes_total += local_bytes
-                logger.info(
-                    "[SYS] stage=capture_offsite tier=%s date=%s segment=%s.tar.zst members=%d bytes=%d",
-                    tier,
-                    date_name,
-                    seg,
-                    len(seg_members),
-                    local_bytes,
-                )
-            finally:
-                with contextlib.suppress(OSError):
-                    staging_path.unlink(missing_ok=True)
+            committed_at = now_fn().isoformat()
+            ledger_entry = LedgerEntry(
+                tier=tier,
+                trading_date=date_name,
+                segment_name=seg,
+                remote_path=_remote_path(config, tier, date_name, seg),
+                members=tuple(seg_members),
+                archive_bytes=local_bytes,
+                archive_md5=local_md5,
+                committed_at=committed_at,
+            )
+            _append_ledger_entry(_ledger_path(capture_root, tier, date_name), ledger_entry)
+            segments_committed += 1
+            members_committed += len(seg_members)
+            archive_bytes_total += local_bytes
+            logger.info(
+                "[SYS] stage=capture_offsite tier=%s date=%s segment=%s.tar.zst members=%d bytes=%d",
+                tier,
+                date_name,
+                seg,
+                len(seg_members),
+                local_bytes,
+            )
+        if failure is not None:
+            raise failure
         if date_complete:
             state[f"{tier}/{date_name}"] = scan_peak
         else:
