@@ -239,6 +239,44 @@ def test_ledger_terminal_and_stored_symbols_are_not_refetched(env) -> None:
     assert summary.complete == 1 and summary.tasks_done == 1
 
 
+def _manifest_files(store) -> list[str]:
+    root = store.root / "manifests"
+    return sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()) if root.exists() else []
+
+
+def test_noop_task_publishes_no_manifest_and_leaves_store_untouched(env) -> None:
+    profile, store, ledger = env
+    day = "2026-03-02"
+    ledger.record(day, "nxt_aftermarket", [_entry("000001", CaptureStatus.COMPLETE)],
+                  run_id="seed", attempted_at=datetime.now(SEOUL))
+    ledger_before = ledger._read_all().copy()
+    kis = _FakeKis(day, traded=set())
+    task = ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))
+
+    first = _run(profile, store, ledger, [kis], [task], _raw_ref(day, {"000001"}))
+    second = _run(profile, store, ledger, [kis], [task], _raw_ref(day, {"000001"}))
+
+    assert kis.requested == []
+    assert _manifest_files(store) == []
+    assert ledger._read_all().equals(ledger_before)
+    assert first.tasks_done == 1 and second.tasks_done == 1
+    assert first.complete == 0 and first.failed == 0 and first.exhausted == 0
+
+
+def test_pending_task_publishes_exactly_one_manifest_even_when_all_fail(env) -> None:
+    profile, store, ledger = env
+    day = "2026-03-02"
+    kis = _FakeKis(day, traded={"000003"}, fail={"000003"})
+
+    summary = _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000003",))],
+                   _raw_ref(day, {"000003"}))
+
+    run_dirs = {name.rsplit("/", 1)[0] for name in _manifest_files(store)}
+    assert summary.failed == 1
+    assert len(run_dirs) == 1
+    assert any(name.endswith("manifest-partial.json") for name in _manifest_files(store))
+
+
 def test_failed_symbols_are_retried_on_next_run(env) -> None:
     profile, store, ledger = env
     day = "2026-03-02"

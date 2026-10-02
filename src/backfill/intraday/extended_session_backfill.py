@@ -448,6 +448,12 @@ async def run_extended_session_backfill(
     Returns:
         Summary counts and whether the deadline stopped the run.
 
+    Side effects:
+        A task with no pending symbols (every task symbol is terminal, already stored, and not a repair
+        candidate) is a no-op: it performs no network fetch, writes no partition, publishes no manifest,
+        creates no run directory and appends no ledger rows. A task with at least one pending symbol
+        publishes exactly one manifest covering its attempted entries, whatever their statuses.
+
     Raises:
         ValueError: Empty clients or naive stop_at.
         OSError: Partition, manifest or ledger persistence fails (fail loud; the task is not marked terminal).
@@ -624,58 +630,59 @@ async def run_extended_session_backfill(
             }
             if stale:
                 remove_intraday_symbols(1, task.snapshot_date, task.session, stale)
-            manifest_status = (
-                CaptureStatus.COMPLETE
-                if all(entry.status in GOOD_ENTRY_STATES for entry in entries)
-                else CaptureStatus.PARTIAL
-            )
-            manifest = CaptureManifest(
-                schema_version=1,
-                context=CaptureContext(
-                    trading_date=date.fromisoformat(task.snapshot_date),
-                    run_id=run_id,
-                    dataset=CaptureDataset.MINUTE_BARS,
-                    vendor="kis",
-                    endpoint="backfill-task",
-                    symbol=None,
-                    venue="owner-local",
-                    session=task.session,
-                    capture_reason="extended-backfill",
-                    cohort_id=None,
-                    scheduled_at=None,
-                ),
-                cohort=None,
-                completed_at=clock(),
-                entries=tuple(entries),
-                artifacts=tuple(dict.fromkeys(ref for entry in entries for ref in entry.raw_refs)),
-                status=manifest_status,
-            )
-            store.publish_manifest(manifest)
-            if entries:
-                prev_frame = ledger._read_all()
-                prev_map = (
-                    _latest_attempts(
-                        _with_legacy_columns(prev_frame), task.snapshot_date, task.session
+            if pending:
+                manifest_status = (
+                    CaptureStatus.COMPLETE
+                    if all(entry.status in GOOD_ENTRY_STATES for entry in entries)
+                    else CaptureStatus.PARTIAL
+                )
+                manifest = CaptureManifest(
+                    schema_version=1,
+                    context=CaptureContext(
+                        trading_date=date.fromisoformat(task.snapshot_date),
+                        run_id=run_id,
+                        dataset=CaptureDataset.MINUTE_BARS,
+                        vendor="kis",
+                        endpoint="backfill-task",
+                        symbol=None,
+                        venue="owner-local",
+                        session=task.session,
+                        capture_reason="extended-backfill",
+                        cohort_id=None,
+                        scheduled_at=None,
+                    ),
+                    cohort=None,
+                    completed_at=clock(),
+                    entries=tuple(entries),
+                    artifacts=tuple(dict.fromkeys(ref for entry in entries for ref in entry.raw_refs)),
+                    status=manifest_status,
+                )
+                store.publish_manifest(manifest)
+                if entries:
+                    prev_frame = ledger._read_all()
+                    prev_map = (
+                        _latest_attempts(
+                            _with_legacy_columns(prev_frame), task.snapshot_date, task.session
+                        )
+                        if not prev_frame.empty
+                        else {}
                     )
-                    if not prev_frame.empty
-                    else {}
-                )
-                ledger.record(
-                    task.snapshot_date,
-                    task.session,
-                    entries,
-                    run_id=run_id,
-                    attempted_at=clock(),
-                    price_bases=price_bases,
-                )
-                exhausted += sum(
-                    1
-                    for entry in entries
-                    if entry.status == CaptureStatus.FAILED
-                    and (before := prev_map.get(str(entry.symbol))) is not None
-                    and before[0] == "FAILED"
-                    and int(before[1]) + 1 >= EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
-                )
+                    ledger.record(
+                        task.snapshot_date,
+                        task.session,
+                        entries,
+                        run_id=run_id,
+                        attempted_at=clock(),
+                        price_bases=price_bases,
+                    )
+                    exhausted += sum(
+                        1
+                        for entry in entries
+                        if entry.status == CaptureStatus.FAILED
+                        and (before := prev_map.get(str(entry.symbol))) is not None
+                        and before[0] == "FAILED"
+                        and int(before[1]) + 1 >= EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
+                    )
             task_complete = sum(1 for entry in entries if entry.status == CaptureStatus.COMPLETE)
             task_no_trades = sum(1 for entry in entries if entry.status == CaptureStatus.NO_TRADES)
             task_not_listed = sum(1 for entry in entries if entry.status == CaptureStatus.NOT_APPLICABLE)
