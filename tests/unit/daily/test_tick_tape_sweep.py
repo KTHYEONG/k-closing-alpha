@@ -324,6 +324,17 @@ def test_report_write_failure_degrades_only(tmp_path, monkeypatch, caplog) -> No
     assert any("report_write_failed" in rec.message for rec in caplog.records)
 
 
+def test_default_deadline_before_and_after_cutoff(monkeypatch) -> None:
+    monkeypatch.setattr(sweep, "_now", lambda: datetime(2026, 10, 1, 20, 35, tzinfo=_SEOUL))
+    assert sweep._default_deadline() == datetime(2026, 10, 1, 21, 15, tzinfo=_SEOUL)
+
+    monkeypatch.setattr(sweep, "_now", lambda: datetime(2026, 10, 1, 21, 15, tzinfo=_SEOUL))
+    assert sweep._default_deadline() is None
+
+    monkeypatch.setattr(sweep, "_now", lambda: datetime(2026, 10, 1, 23, 0, tzinfo=_SEOUL))
+    assert sweep._default_deadline() is None
+
+
 def test_helpers_and_open_kiwoom_branches(tmp_path, monkeypatch) -> None:
     assert sweep._now().tzinfo is not None
     assert sweep._free_bytes(tmp_path) > 0
@@ -374,9 +385,15 @@ def test_main_parses_args(tmp_path, monkeypatch) -> None:
 
     captured.clear()
     monkeypatch.setattr(sweep, "CollectionSettings", lambda: _profile(tmp_path))
+    monkeypatch.setattr(sweep, "_now", lambda: datetime(2026, 10, 1, 22, 0, tzinfo=_SEOUL))
     sweep.main([])
     assert captured["lookback_days"] == 25
-    assert captured["deadline"] is None
+    assert captured["deadline"] is None  # past today's 21:15 default cutoff, so no artificial limit
+
+    captured.clear()
+    monkeypatch.setattr(sweep, "_now", lambda: datetime(2026, 10, 1, 20, 35, tzinfo=_SEOUL))
+    sweep.main([])
+    assert captured["deadline"] == datetime(2026, 10, 1, 21, 15, tzinfo=_SEOUL)
 
 
 def test_audit_tape_sweep_reads_expiring_count_from_report() -> None:

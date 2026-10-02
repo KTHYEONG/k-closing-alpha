@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from src.config import market_session as _session
 from src.config.collection import CollectionSettings
 from src.data.capture_contracts import SEOUL
 from src.data.capture_store import CaptureStore
@@ -45,6 +46,14 @@ class TapeSweepReport:
 
 def _now() -> datetime:
     return datetime.now(SEOUL)
+
+
+def _default_deadline() -> datetime | None:
+    """No-new-walk cutoff ahead of the evening price-ingest slot; None once that time has passed."""
+    now = _now()
+    hh, mm = int(_session.TAPE_SWEEP_DEADLINE_HHMMSS[0:2]), int(_session.TAPE_SWEEP_DEADLINE_HHMMSS[2:4])
+    candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return candidate if candidate > now else None
 
 
 def _free_bytes(path: Path) -> int:
@@ -226,7 +235,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     profile = CollectionSettings()
     lookback = int(args.lookback_days) if args.lookback_days is not None else int(profile.COLLECTION_TAPE_LOOKBACK_DAYS)
-    asyncio.run(run_tick_tape_sweep(lookback_days=lookback, profile=profile, deadline=btt._parse_deadline(args.deadline)))
+    deadline = btt._parse_deadline(args.deadline) if args.deadline else _default_deadline()
+    asyncio.run(run_tick_tape_sweep(lookback_days=lookback, profile=profile, deadline=deadline))
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry, exercised via run_tick_tape_sweep
