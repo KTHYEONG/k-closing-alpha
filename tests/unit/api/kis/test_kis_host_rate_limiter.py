@@ -298,3 +298,30 @@ def test_max_lead_and_singleton_class(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="positive"):
         _H(tmp_path / "z.state", 4.0, max_lead_seconds=0.0)
+
+
+def test_limiter_lock_survives_sequential_event_loops(tmp_path) -> None:
+    import asyncio
+
+    from src.api.kis.rate_limit import HostPacedRateLimiter
+
+    now = {"t": 1000.0}
+
+    async def _sleep(sec: float) -> None:
+        now["t"] += sec
+        await asyncio.sleep(0)
+
+    state = tmp_path / "tps.state"
+    limiter = HostPacedRateLimiter(state, max_rate=1.0, max_lead_seconds=1.0, clock=lambda: now["t"], sleep=_sleep)
+
+    async def _contended_round() -> None:
+        now["t"] = 1000.0
+        state.write_text("1010.0", encoding="ascii")
+        await asyncio.gather(limiter.acquire(), limiter.acquire())
+
+    # Given: two contended rounds, each in its own event loop (altdata runs one asyncio.run per panel)
+    asyncio.run(_contended_round())
+    asyncio.run(_contended_round())
+
+    # Then: no cross-loop lock error, and both rounds booked their slots
+    assert float(state.read_text(encoding="ascii")) > 1010.0
