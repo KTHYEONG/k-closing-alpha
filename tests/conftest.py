@@ -27,7 +27,11 @@ import pandas as pd
 import pytest
 
 from src.settings import Settings
-from tests.settings_isolation import drop_settings_shadows
+from tests.settings_isolation import ambient_env_names, drop_settings_shadows, scrub_ambient_env
+
+# A developer/production shell exports live keys and runtime toggles; the suite must be hermetic
+# regardless. Scrubbing at import also covers the lazily built settings singleton.
+scrub_ambient_env()
 
 
 @pytest.hookimpl(wrapper=True)
@@ -40,7 +44,15 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> 
 
 
 @pytest.fixture(autouse=True)
+def _scrub_ambient_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-apply the scrub per test so leaks from earlier in-process env writes cannot persist."""
+    for key in ambient_env_names():
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_production_data_dir(
+    _scrub_ambient_env: None,
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path_factory: pytest.TempPathFactory,
@@ -65,7 +77,9 @@ def _isolate_production_data_dir(
 
 
 @pytest.fixture(autouse=True)
-def _isolate_kis_token_state(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+def _isolate_kis_token_state(
+    _scrub_ambient_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
     from src import settings as live_settings
 
     monkeypatch.setattr(live_settings.settings, "KIS_TOKEN_CACHE_DIR", tmp_path_factory.mktemp("kis_cache"))
