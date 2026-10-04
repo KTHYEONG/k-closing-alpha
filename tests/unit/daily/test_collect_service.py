@@ -165,3 +165,22 @@ def test_build_kiwoom_scan_client_returns_none_without_credentials(monkeypatch) 
 
     monkeypatch.setattr(kiwoom_module, 'KiwoomApiClient', lambda *a, **k: SimpleNamespace(app_key=''))
     assert collect.build_kiwoom_scan_client() is None
+
+
+def test_collect_reexports_shared_helpers() -> None:
+    from src.daily import collect
+    from src.data import trading_calendar
+    from src.utils import numeric
+
+    # Then: 동일 객체 재노출
+    assert collect.safe_float is numeric.safe_float
+    assert collect.resolve_prev_trading_day_kis is trading_calendar.resolve_prev_trading_day_kis
+
+
+def test_safe_float_blank_and_grouped_values() -> None:
+    from src.daily import collect
+
+    # Given / Then: 공백은 기본값 그대로, int 기본값은 int 유지
+    assert collect.safe_float(" ", 7) == 7
+    assert type(collect.safe_float(" ", 7)) is int
+    assert collect.safe_float("1,234") == 1234.0

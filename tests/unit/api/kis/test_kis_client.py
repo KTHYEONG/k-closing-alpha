@@ -1,8 +1,4 @@
-"""Unit tests for KisApiClient — perf_v2 scenario tests.
-
-SCENARIO_RATE_LIMITER_NO_LOCK_WHILE_SLEEP:
-  acquire() 호출 시 Lock 외부에서 sleep 수행 — lock-while-sleeping 버그 수정 검증.
-"""
+"""Unit tests for KisApiClient — limiter sharing and retry slot behavior."""
 
 from __future__ import annotations
 
@@ -10,31 +6,6 @@ import asyncio
 import time
 
 from src.api.kis.client import KisApiClient
-from src.api.kis.rate_limit import AsyncRateLimiter
-
-
-def test_scenario_rate_limiter_no_lock_while_sleep() -> None:
-    """[SCENARIO_RATE_LIMITER_NO_LOCK_WHILE_SLEEP]
-    lock을 보유한 채 sleep하지 않아야 하므로, 동시 대기자가 sleep 동안 함께 진행된다.
-    window가 가득 찬 상태에서 2개의 동시 대기자는 lock 외부 sleep 시 ~1 window 내 함께
-    허용되고, lock-while-sleeping 버그(직렬화) 시에는 두 배의 시간이 걸린다.
-    """
-    async def _runner() -> None:
-        limiter = AsyncRateLimiter(max_rate=2.0, time_period=0.4)
-        await limiter.acquire()
-        await limiter.acquire()
-
-        async def _acquire() -> float:
-            start = time.monotonic()
-            await limiter.acquire()
-            return time.monotonic() - start
-
-        wait_b, wait_c = await asyncio.gather(_acquire(), _acquire())
-        # 직렬화 시 두 번째 대기자는 ~0.8s, lock 외부 sleep 시 ~0.4s 내 동시 완료
-        assert wait_b < 0.7
-        assert wait_c < 0.7
-
-    asyncio.run(_runner())
 
 
 def test_kis_client_instances_share_process_global_rate_limiter() -> None:
@@ -456,3 +427,182 @@ def test_host_token_lock_normal_path_unchanged(tmp_path, caplog) -> None:
     records = [rec for rec in caplog.records if rec.name == "src.api.kis.client"]
     assert not any("READONLY_FALLBACK" in rec.getMessage() or "UNOPENABLE" in rec.getMessage() for rec in records)
 
+
+def _hold_host_lock_exclusively(lock_path):
+    import fcntl
+    import os
+
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _release_host_lock(fd) -> None:
+    import fcntl
+    import os
+
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
+def test_host_token_lock_times_out_on_stuck_holder(tmp_path, monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+    import time
+
+    import pytest
+
+    from src.api.shared_token import TokenStoreLockTimeout
+
+    monkeypatch.setattr("src.config.settings.KIS_TOKEN_LOCK_TIMEOUT_SECONDS", 0.2)
+    client = _lock_client(tmp_path)
+    holder = _hold_host_lock_exclusively(tmp_path / "token.json.lock")
+    try:
+        session = _TokenIssueSession()
+        start = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="src.api.kis.client"), pytest.raises(TokenStoreLockTimeout):
+            asyncio.run(client.ensure_token(session))  # type: ignore[arg-type]
+        elapsed = time.monotonic() - start
+    finally:
+        _release_host_lock(holder)
+
+    assert elapsed >= 0.2
+    assert elapsed < 1.0
+    assert session.posts == 0
+    records = [rec for rec in caplog.records if rec.name == "src.api.kis.client"]
+    timeouts = [rec for rec in records if rec.levelno >= logging.ERROR and "stage=kis_token_lock status=TIMEOUT" in rec.getMessage()]
+    assert len(timeouts) == 1
+    assert all("KEY123456" not in rec.getMessage() and "SECRET999" not in rec.getMessage() and "TOKEN-ABC" not in rec.getMessage() for rec in records)
+
+
+def test_host_token_lock_releases_resources_after_timeout(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.api.shared_token import TokenStoreLockTimeout
+
+    monkeypatch.setattr("src.config.settings.KIS_TOKEN_LOCK_TIMEOUT_SECONDS", 0.2)
+    client = _lock_client(tmp_path)
+    holder = _hold_host_lock_exclusively(tmp_path / "token.json.lock")
+    try:
+        with pytest.raises(TokenStoreLockTimeout):
+            asyncio.run(client.ensure_token(_BoomSession()))  # type: ignore[arg-type]
+    finally:
+        _release_host_lock(holder)
+
+    session = _TokenIssueSession()
+    assert asyncio.run(client.ensure_token(session)) == "TOKEN-ABC"  # type: ignore[arg-type]
+    assert session.posts == 1
+
+
+def test_host_token_lock_wait_is_cancellable(tmp_path) -> None:
+    import asyncio
+    import os
+
+    client = _lock_client(tmp_path)
+    baseline = len(os.listdir("/proc/self/fd"))
+    holder = _hold_host_lock_exclusively(tmp_path / "token.json.lock")
+
+    async def _main() -> bool:
+        waiter = asyncio.create_task(client.ensure_token(_BoomSession()))  # type: ignore[arg-type]
+        await asyncio.sleep(0.2)
+        waiter.cancel()
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            return True
+        return False
+
+    try:
+        assert asyncio.run(_main()) is True
+    finally:
+        _release_host_lock(holder)
+
+    assert len(os.listdir("/proc/self/fd")) == baseline
+    assert asyncio.run(client.ensure_token(_TokenIssueSession())) == "TOKEN-ABC"  # type: ignore[arg-type]
+
+
+def test_ensure_token_waiters_share_one_lock_deadline(tmp_path, monkeypatch) -> None:
+    import asyncio
+    import time
+
+    from src.api.shared_token import TokenStoreLockTimeout
+
+    monkeypatch.setattr("src.config.settings.KIS_TOKEN_LOCK_TIMEOUT_SECONDS", 0.2)
+    client = _lock_client(tmp_path)
+    holder = _hold_host_lock_exclusively(tmp_path / "token.json.lock")
+
+    async def _main():
+        start = time.monotonic()
+        results = await asyncio.gather(*[
+            client.ensure_token(_BoomSession(), rejected_token="T")  # type: ignore[arg-type]
+            for _ in range(5)
+        ], return_exceptions=True)
+        return time.monotonic() - start, results
+
+    try:
+        elapsed, results = asyncio.run(_main())
+    finally:
+        _release_host_lock(holder)
+
+    assert all(isinstance(r, TokenStoreLockTimeout) for r in results)
+    assert elapsed < 0.4
+
+
+def test_issue_daily_token_times_out_on_stuck_host_lock(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.api.shared_token import TokenStoreLockTimeout
+
+    monkeypatch.setattr("src.config.settings.KIS_TOKEN_LOCK_TIMEOUT_SECONDS", 0.2)
+    client = _lock_client(tmp_path)
+    holder = _hold_host_lock_exclusively(tmp_path / "token.json.lock")
+    try:
+        session = _TokenIssueSession()
+        with pytest.raises(TokenStoreLockTimeout):
+            asyncio.run(client.issue_daily_token(session))
+    finally:
+        _release_host_lock(holder)
+
+    assert session.posts == 0
+
+
+def test_host_token_lock_propagates_non_contention_error(tmp_path, monkeypatch) -> None:
+    import asyncio
+    import errno
+    import fcntl
+
+    import pytest
+
+    calls = {"n": 0}
+
+    def _boom(fd, op):
+        calls["n"] += 1
+        raise OSError(errno.ENOLCK, "no record locks available")
+
+    monkeypatch.setattr(fcntl, "flock", _boom)
+    client = _lock_client(tmp_path)
+
+    async def _main() -> None:
+        async with client._host_token_lock():
+            raise AssertionError("must not acquire")
+
+    with pytest.raises(OSError, match="no record locks available"):
+        asyncio.run(_main())
+    assert calls["n"] == 1
+
+
+
+def test_kis_token_lock_timeout_exceeds_healthy_holder_issuance_budget() -> None:
+    from src.api.kis.client import KIS_TOKEN_ISSUE_ATTEMPTS, KIS_TOKEN_ISSUE_BACKOFF_SEC
+    from src.config.kis import KisSettings
+
+    # collect/auction sessions bound each issuance POST by a 60 s aiohttp total timeout.
+    session_total_seconds = 60.0
+    holder_budget = KIS_TOKEN_ISSUE_ATTEMPTS * session_total_seconds + sum(
+        KIS_TOKEN_ISSUE_BACKOFF_SEC * attempt for attempt in range(1, KIS_TOKEN_ISSUE_ATTEMPTS)
+    )
+    assert holder_budget < KisSettings().KIS_TOKEN_LOCK_TIMEOUT_SECONDS

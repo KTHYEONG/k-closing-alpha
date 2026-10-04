@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.ml.research.v3_engine import compute_derived_features
+from src.ml.topk_contract import compute_derived_features
 from src.strategy.contract import derive_chg_ratio, tick_cost_bp
 
 # Robust Z-Score ((x - median) / MAD) 횡단면 표준화 대상

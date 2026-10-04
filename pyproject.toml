@@ -80,6 +80,7 @@ ignore = [
 "src/sync/*.py" = ["T20", "ASYNC240", "ASYNC251", "N806", "B007", "B905", "B023", "S112"]
 "src/processing/*.py" = ["SIM102", "SIM108", "N806", "B905", "C416"]
 "src/utils/display.py" = ["T20", "N806", "B023"]
+"tools/verify.py" = ["T201", "S607"] # tools/verify.py is a developer CLI whose contract IS stdout/stderr text (PASS | ... line + JSON envelope), so print is the correct primitive; git is resolved via PATH by design, matching developer shells and CI.
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15
@@ -106,7 +107,7 @@ exclude = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["tests.*", "src.backfill.*", "src.daily.*", "src.sync.*", "src.api.*", "src.data.*", "src.processing.*", "src.utils.*", "src.ml.*"]
+module = ["tests.*"]
 ignore_errors = true
 
 
@@ -142,5 +143,6 @@ dev = [
     "mypy>=2.0.0",
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.15.12",
 ]

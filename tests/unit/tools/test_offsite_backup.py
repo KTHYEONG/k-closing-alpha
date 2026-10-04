@@ -79,6 +79,27 @@ def test_run_executes_seal_before_loose_copies(tmp_path: Path, monkeypatch) -> N
     assert persisted["steps"]["capture_seal"]["segments_committed"] == 2
 
 
+def test_report_written_without_temp(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import REPORT_RELPATH, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        return SealReport(dates_scanned=1, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    run_offsite_backup(tmp_path, tmp_path / "capture", now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+
+    report_path = tmp_path / "capture" / REPORT_RELPATH
+    assert json.loads(report_path.read_text(encoding="utf-8"))["status"] == "ok"
+    assert list(report_path.parent.glob("*.tmp")) == []
+
+
 def test_run_continues_after_seal_failure_and_raises_after_report(tmp_path: Path, monkeypatch) -> None:
     import pytest
 

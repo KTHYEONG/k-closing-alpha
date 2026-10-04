@@ -475,3 +475,23 @@ def test_research_credentials_reject_malformed_declarations() -> None:
     dup["KIS_DATA_1_APP_SECRET"] = "sec1"
     with pytest.raises(ValueError, match="duplicate app_key"):
         resolve_research_credentials(dup, slots=("5", "1"))
+
+
+def test_kis_credential_repr_hides_key_material() -> None:
+    from src.api.kis.key_pool import KisCredential
+
+    text = repr(KisCredential(slot="DATA_1", app_key="AK-0123456789", app_secret="SEC-abcdefghij", hts_id="hts"))
+    assert "DATA_1" in text
+    assert "hts" in text
+    assert "AK-0123456789" not in text
+    assert "SEC-abcdefghij" not in text
+
+
+def test_kis_credential_equality_preserved() -> None:
+    from src.api.kis.key_pool import KisCredential
+
+    a = KisCredential(slot="DATA_1", app_key="k", app_secret="s", hts_id="h")
+    b = KisCredential(slot="DATA_1", app_key="k", app_secret="s", hts_id="h")
+    assert a == b
+    assert hash(a) == hash(b)
+    assert a != KisCredential(slot="DATA_1", app_key="k", app_secret="other", hts_id="h")

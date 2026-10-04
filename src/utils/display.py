@@ -1,5 +1,6 @@
 import sys
 import unicodedata
+from typing import Any
 
 import pandas as pd
 
@@ -22,7 +23,7 @@ class Colors:
     GRAY = "\033[90m"
 
 
-def get_decision_color(decision):
+def get_decision_color(decision: object) -> str:
     """Decision 값에 따라 색상 코드를 반환"""
     d = str(decision).lower()
     if "strong" in d or "buy" in d:
@@ -44,7 +45,7 @@ def get_decision_color(decision):
     return Colors.RESET
 
 
-def get_display_width(s):
+def get_display_width(s: str) -> int:
     """한글/영문 혼합 문자열의 실제 화면 너비 계산"""
     width = 0
     for char in s:
@@ -55,7 +56,7 @@ def get_display_width(s):
     return width
 
 
-def pad_str(s, width, align="left"):
+def pad_str(s: object, width: int, align: str = "left") -> str:
     """화면 너비 기준으로 문자열 정렬(Padding)"""
     s = str(s)
     current_width = get_display_width(s)
@@ -71,7 +72,7 @@ def pad_str(s, width, align="left"):
         return s + " " * padding_size
 
 
-def print_table(results_list, title, minimal=False):
+def print_table(results_list: pd.DataFrame | list[dict[str, Any]] | None, title: str, minimal: bool = False) -> None:
     """결과 리스트 또는 DataFrame을 테이블 형태로 출력"""
     if results_list is None:
         return

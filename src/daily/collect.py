@@ -4,7 +4,8 @@ import logging
 import os
 import sys
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -33,9 +34,9 @@ from src.data.session_calendar import SessionKind, resolve_session_day, trading_
 from src.utils.display import Colors
 from src.daily import archive
 from src.daily.universe_scan import fetch_candidate_stock_list, fetch_trade_value_union
-from src.data.trading_calendar import is_kis_trading_day
+from src.data.trading_calendar import is_kis_trading_day, resolve_prev_trading_day_kis
 from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, record_run_outcome
-from src.ml.topk_history_features import MAX_PREV_TRADING_DAY_LOOKBACK
+from src.utils.numeric import safe_float
 from src.daily.universe_screen import build_screen_frame
 from src.daily.security_classification import load_security_classification
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, PRICE_ANOMALY_COL, QUOTE_FAILED_COL
@@ -70,7 +71,7 @@ def build_toss_scan_client() -> Any | None:
     return client
 
 
-async def _validate_trading_day(client, session, snapshot_date: str, *, force: bool = False) -> None:
+async def _validate_trading_day(client: KisApiClient, session: aiohttp.ClientSession, snapshot_date: str, *, force: bool = False) -> None:
     """휴장일 실행을 차단한다. --force가 유일한 우회 경로다."""
     if force:
         return
@@ -103,20 +104,10 @@ def _validate_decision_window(now: datetime, *, force: bool = False) -> None:
         )
 
 
-def safe_float(value, default=0.0):
-    """문자열이나 None 값을 안전하게 float로 변환"""
-    if value is None:
-        return default
-    try:
-        return float(str(value).replace(",", ""))
-    except (ValueError, TypeError):
-        return default
-
-
 # ---------------------------------------------------------
 # 헬퍼 함수: 시장 지수 등락률 파싱
 # ---------------------------------------------------------
-def parse_market_index_rate(data):
+def parse_market_index_rate(data: dict[str, Any] | None) -> float | None:
     if not data or data.get("rt_cd") != "0":
         return None
     out1 = data.get("output1")
@@ -134,6 +125,33 @@ def parse_market_index_rate(data):
     except Exception:
         pass
     return None
+
+
+def parse_market_index_level(data: Mapping[str, Any] | None) -> float | None:
+    """Return the live index level (output1.bstp_nmix_prpr) of an FHKUP03500100 response.
+
+    Returns:
+        The level when rt_cd == "0" and the field parses to a finite positive
+        float; None otherwise (missing response, failure code, missing output1,
+        missing/blank/non-numeric/zero/negative/non-finite level). Never 0.0.
+    """
+    import math
+
+    if not data or data.get("rt_cd") != "0":
+        return None
+    out1 = data.get("output1")
+    if not out1:
+        return None
+    raw = out1.get("bstp_nmix_prpr")
+    try:
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        level = float(str(raw).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+    if not math.isfinite(level) or level <= 0:
+        return None
+    return level
 
 
 # ---------------------------------------------------------
@@ -310,41 +328,6 @@ _MARKET_LABEL_ROUTE: dict[str, tuple[CaptureDataset, str]] = {
 }
 
 
-async def resolve_prev_trading_day_kis(client: Any, session: Any, decision_date: pd.Timestamp, *, krx_is_trading_day: Callable[[pd.Timestamp], bool] | None = None, max_lookback_days: int = MAX_PREV_TRADING_DAY_LOOKBACK) -> pd.Timestamp:
-    """Resolve the previous trading day via KIS first, KRX fallback per date.
-
-    Args:
-        client: KIS API client.
-        session: HTTP session.
-        decision_date: Decision date (time component ignored).
-        krx_is_trading_day: KRX oracle override (tests); None selects is_krx_trading_day.
-        max_lookback_days: Calendar-day search bound.
-
-    Returns:
-        The previous trading day, normalized to midnight.
-
-    Raises:
-        RuntimeError: When both oracles fail.
-        ValueError: When no trading day exists within the bound.
-    """
-    d = pd.Timestamp(decision_date).normalize()
-    for k in range(1, int(max_lookback_days) + 1):
-        cand = d - pd.Timedelta(days=k)
-        if cand.weekday() >= 5:
-            continue
-        try:
-            is_open = await is_kis_trading_day(client, session, cand)
-        except RuntimeError as exc:
-            logger.warning("[DATA] stage=prev_trading_day vendor=kis status=FAILED date=%s reason=%s fallback=krx", cand.date(), exc)
-            oracle = krx_is_trading_day
-            if oracle is None:
-                from src.data.trading_calendar import is_krx_trading_day as oracle
-            is_open = await asyncio.to_thread(oracle, cand)
-        if is_open:
-            return cand
-    raise ValueError(f"no trading day within {int(max_lookback_days)} days before {d.date()}")
-
-
 def load_eligible_codes(decision_date: pd.Timestamp, *, prev_trading_day: pd.Timestamp, path: str | os.PathLike[str] | None = None) -> frozenset[str]:
     """Return the symbols listed in price_history on the previous trading day.
 
@@ -383,7 +366,7 @@ async def resolve_eligible_codes(client: Any, session: Any, decision_date: pd.Ti
     return eligible
 
 
-def filter_eligible_candidates(stock_list: list[dict], eligible_codes: frozenset[str]) -> list[dict]:
+def filter_eligible_candidates(stock_list: list[dict[str, Any]], eligible_codes: frozenset[str]) -> list[dict[str, Any]]:
     """Drop scanned candidates that are not listed in the research panel.
 
     Args:
@@ -499,7 +482,125 @@ def check_realtime_collection_coverage(
     return report
 
 
-async def resolve_daily_candidates(client, session, *, kiwoom_client: Any | None = None, toss_client: Any | None = None, on_page: Any | None = None) -> list[dict]:
+@dataclass(frozen=True)
+class AssembledDecision:
+    """Enriched decision-input snapshot with its coverage verdict.
+
+    Attributes:
+        frame: Wide per-symbol snapshot with admission, market context, failure flags, anomaly flags and
+            feature_available_timestamp.
+        status: COMPLETE, or PARTIAL when degraded rows exceed REALTIME_MIN_QUOTE_COVERAGE.
+        reason: "" for COMPLETE, else "coverage_below_threshold:<coverage>".
+        coverage: {"n_raw", "n_degraded", "coverage"} report of evaluate_realtime_coverage.
+        completed_at: Aware KST instant enrichment finished; equals every frame row's
+            feature_available_timestamp and is the decision manifest's completed_at.
+    """
+
+    frame: pd.DataFrame
+    status: CaptureStatus
+    reason: str
+    coverage: dict[str, Any]
+    completed_at: datetime
+
+
+async def assemble_decision_frame(
+    rows: list[dict[str, Any]],
+    *,
+    snapshot_date: str,
+    kospi_rate: float | None,
+    kosdaq_rate: float | None,
+    kospi_level: float | None,
+    fetch_vkospi: Callable[[float | None], Awaitable[float]],
+    load_market_breadth: Callable[[str], float],
+    capture_ts: pd.Timestamp,
+    completion_clock: Callable[[], datetime],
+) -> AssembledDecision:
+    """Build the point-in-time decision snapshot from per-symbol quote rows and market context.
+
+    Every market-context failure is recorded as NaN plus a failure flag column instead of a default value, so
+    downstream readers can refuse degraded inputs; quote coverage is returned as data (not raised) because the
+    decision manifest must be published with its verdict before main fails closed on a PARTIAL status.
+
+    Args:
+        rows: Per-symbol wide rows from the realtime quote fetch, in cohort order.
+        snapshot_date: Decision date "YYYY-MM-DD" (point-in-time tick costing and breadth date).
+        kospi_rate: Parsed KOSPI change rate, or None when the index quote failed.
+        kosdaq_rate: Parsed KOSDAQ change rate, or None when the index quote failed.
+        kospi_level: Live KOSPI composite level parsed at decision time, or None when unparseable.
+        fetch_vkospi: Given kospi_level, returns the live V-KOSPI proxy under the training definition
+            (main binds src.daily.price_ingest.fetch_live_vkospi to its client, session and decision date);
+            any exception it raises is recorded as NaN plus 지수_실패, never propagated.
+        load_market_breadth: Returns the latest market breadth for snapshot_date from the price panel;
+            may raise or return NaN on failure.
+        capture_ts: Observation instant used for rows without their own snapshot_timestamp.
+        completion_clock: Aware KST wall clock, read exactly once after all enrichment.
+
+    Returns:
+        AssembledDecision for publication.
+
+    Raises:
+        ValueError: rows is empty ("... empty snapshot"), checked before any enrichment or injected call.
+    """
+    if not rows:
+        raise ValueError("assemble_decision_frame received an empty snapshot")
+    df = pd.DataFrame(rows)
+    if "snapshot_timestamp" in df.columns:
+        df["snapshot_timestamp"] = pd.to_datetime(df["snapshot_timestamp"]).fillna(capture_ts)
+    else:
+        df["snapshot_timestamp"] = capture_ts
+    df = flag_cost_aware_admission(df, decision_date=pd.Timestamp(snapshot_date))
+    index_failed = False
+    if kospi_rate is None:
+        df["kospi"] = float("nan")
+        index_failed = True
+    else:
+        df["kospi"] = kospi_rate
+    if kosdaq_rate is None:
+        df["kosdaq"] = float("nan")
+        index_failed = True
+    else:
+        df["kosdaq"] = kosdaq_rate
+
+    # V-KOSPI만 부착 (V-KOSDAQ 조회 제거)
+    try:
+        vkospi_val = await fetch_vkospi(kospi_level)
+    except Exception as exc:  # any failure is fail-closed: NaN + 지수_실패
+        vkospi_val = float("nan")
+        index_failed = True
+        logger.warning(
+            "[DATA] stage=index_vkospi status=FAILED date=%s reason=%s: %s",
+            snapshot_date,
+            type(exc).__name__,
+            exc,
+        )
+    else:
+        logger.info(
+            "[DATA] stage=index_vkospi status=OK date=%s v_kospi=%.6f live_level=%.2f",
+            snapshot_date,
+            float(vkospi_val),
+            float(kospi_level) if kospi_level is not None else float("nan"),
+        )
+    df["v_kospi"] = float(vkospi_val)
+    breadth_failed = False
+    try:
+        breadth_val = load_market_breadth(snapshot_date)
+        if breadth_val != breadth_val:
+            breadth_failed = True
+    except Exception:
+        breadth_val = float("nan")
+        breadth_failed = True
+    df["market_breadth"] = breadth_val
+    df["시장폭_실패"] = breadth_failed
+    df["지수_실패"] = index_failed
+
+    df[PRICE_ANOMALY_COL] = flag_price_anomaly(df).to_numpy()
+    completed_at = completion_clock()
+    df["feature_available_timestamp"] = completed_at
+    report, status, reason = evaluate_realtime_coverage(df)
+    return AssembledDecision(frame=df, status=status, reason=reason, coverage=report, completed_at=completed_at)
+
+
+async def resolve_daily_candidates(client: KisApiClient, session: aiohttp.ClientSession, *, kiwoom_client: Any | None = None, toss_client: Any | None = None, on_page: Any | None = None) -> list[dict[str, Any]]:
     """자동 비용축 스캔 결과를 그대로 반환합니다.
 
     Args:
@@ -653,7 +754,7 @@ async def fetch_single_stock(
                 )
 
         detail = res_detail.get("output") if res_detail.get("rt_cd") == "0" else None
-        quote_unresolved = bool(detail) and not str(detail.get("stck_shrn_iscd") or "").strip()
+        quote_unresolved = detail is not None and bool(detail) and not str(detail.get("stck_shrn_iscd") or "").strip()
         if quote_unresolved:
             detail = None
 
@@ -749,7 +850,7 @@ async def fetch_single_stock(
         return row, failed_apis
 
 
-async def requote_failed_quotes(stock_list: list[dict], all_res: list[tuple[dict, list[str]]], client: Any, session: Any, sem: asyncio.Semaphore, *, now_fn: Callable[[], datetime] | None = None, capture_store: CaptureStore | None = None, cohort: Cohort | None = None, run_id: str | None = None) -> list[tuple[dict, list[str]]]:
+async def requote_failed_quotes(stock_list: list[dict[str, Any]], all_res: list[tuple[dict[str, Any], list[str]]], client: Any, session: Any, sem: asyncio.Semaphore, *, now_fn: Callable[[], datetime] | None = None, capture_store: CaptureStore | None = None, cohort: Cohort | None = None, run_id: str | None = None) -> list[tuple[dict[str, Any], list[str]]]:
     """Re-fetch transient quote failures once within the decision-window budget.
 
     Args:
@@ -785,15 +886,15 @@ async def requote_failed_quotes(stock_list: list[dict], all_res: list[tuple[dict
 
 
 async def fetch_all_stock_data(
-    stock_list,
-    client,
-    session,
+    stock_list: list[dict[str, Any]],
+    client: KisApiClient,
+    session: aiohttp.ClientSession,
     *,
     now_fn: Callable[[], datetime] | None = None,
     capture_store: CaptureStore | None = None,
     cohort: Cohort | None = None,
     run_id: str | None = None,
-):
+) -> tuple[list[dict[str, Any]], list[tuple[str, str, list[str]]]]:
     """모든 종목의 상세 데이터를 수집합니다."""
     import sys
 
@@ -801,7 +902,7 @@ async def fetch_all_stock_data(
     total = len(stock_list)
     completed_count = 0
 
-    async def _track_task(i, stock):
+    async def _track_task(i: int, stock: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         nonlocal completed_count
         res = await fetch_single_stock(
             i,
@@ -846,15 +947,15 @@ async def fetch_all_stock_data(
 
 
 async def fetch_all_stock_data_sharded(
-    stock_list: list[dict],
-    clients: list,
-    session,
+    stock_list: list[dict[str, Any]],
+    clients: list[KisApiClient],
+    session: aiohttp.ClientSession,
     *,
     now_fn: Callable[[], datetime] | None = None,
     capture_store: CaptureStore | None = None,
     cohort: Cohort | None = None,
     run_id: str | None = None,
-) -> tuple[list[dict], list[tuple[str, str, list[str]]]]:
+) -> tuple[list[dict[str, Any]], list[tuple[str, str, list[str]]]]:
     """여러 KIS 키로 분할 수집하고 원래 순서로 병합한다.
 
     정적 구간 분할 대신 하나의 공유 작업 큐를 키별 워커 풀이 소비한다: 빠른 키가
@@ -863,10 +964,10 @@ async def fetch_all_stock_data_sharded(
     if len(clients) <= 1:
         return await fetch_all_stock_data(stock_list, clients[0], session, now_fn=now_fn, capture_store=capture_store, cohort=cohort, run_id=run_id)
     total = len(stock_list)
-    queue: asyncio.Queue[tuple[int, dict]] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
     for i, stock in enumerate(stock_list):
         queue.put_nowait((i, stock))
-    ordered: list[tuple[dict, list[str]] | None] = [None] * total
+    ordered: list[tuple[dict[str, Any], list[str]] | None] = [None] * total
 
     async def _drain(client: Any, sem: asyncio.Semaphore) -> None:
         while True:
@@ -917,15 +1018,16 @@ def persist_daily_snapshot(df: pd.DataFrame, snapshot_date: str) -> int:
     return archive.upsert_archive_snapshot(df, snapshot_date=snapshot_date)
 
 
-async def main(force: bool = False):
+async def main(force: bool = False) -> None:
     # auction_capture is a separate command; it loads this job's published cohort
     # through CaptureStore rather than being awaited inside initial collect.
     from aiohttp.resolver import ThreadedResolver
 
     data_kwargs = kis_data_client_kwargs()
     _validate_hts_id(data_kwargs["hts_id"])
-    _validate_decision_window(datetime.now(ZoneInfo("Asia/Seoul")), force=force)
-    session_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    run_now = datetime.now(ZoneInfo("Asia/Seoul"))
+    _validate_decision_window(run_now, force=force)
+    session_today = run_now.date()
     session_day = resolve_session_day(session_today)
     if not force:
         if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
@@ -974,7 +1076,7 @@ async def main(force: bool = False):
             await shard_client.ensure_token(session)
         client = decision_shard_clients[0]
 
-        snapshot_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+        snapshot_date = run_now.strftime("%Y-%m-%d")
         kiwoom_client = build_kiwoom_scan_client()
         toss_client = build_toss_scan_client()
         try:
@@ -1004,6 +1106,7 @@ async def main(force: bool = False):
 
         kospi_rate = parse_market_index_rate(res_kospi)
         kosdaq_rate = parse_market_index_rate(res_kosdaq)
+        kospi_level = parse_market_index_level(res_kospi)
 
         # 3. 후보 종목 리스트 확보 (자동 비용축 스캔 단일 경로, Toss 폴백 포함)
         store = CaptureStore(_capture_root())
@@ -1078,54 +1181,27 @@ async def main(force: bool = False):
         # 5. wide 단면 구성 후 PIT admitted 플래그 부여 및 저장소 직접 기록
         logger.info(f"\n{Colors.BOLD}📊 [3/3] 유니버스 적격성(Admission) 평가 및 저장{Colors.RESET}")
         capture_ts = pd.Timestamp.now(tz="Asia/Seoul")
-        df = pd.DataFrame(results)
-        if "snapshot_timestamp" in df.columns:
-            df["snapshot_timestamp"] = pd.to_datetime(df["snapshot_timestamp"]).fillna(capture_ts)
-        else:
-            df["snapshot_timestamp"] = capture_ts
-        df = flag_cost_aware_admission(df, decision_date=pd.Timestamp(snapshot_date))
-        index_failed = False
-        if kospi_rate is None:
-            df["kospi"] = float("nan")
-            index_failed = True
-        else:
-            df["kospi"] = kospi_rate
-        if kosdaq_rate is None:
-            df["kosdaq"] = float("nan")
-            index_failed = True
-        else:
-            df["kosdaq"] = kosdaq_rate
 
-        # V-KOSPI만 부착 (V-KOSDAQ 조회 제거)
-        try:
-            from src.api.kis.indicators import fetch_index_and_calculate_volatility
+        async def _fetch_vkospi(level: float | None) -> float:
+            from src.daily.price_ingest import fetch_live_vkospi
 
-            (vkospi_val, _vkospi_chg) = await fetch_index_and_calculate_volatility(
-                "1028", session=session
-            )
-        except Exception:
-            vkospi_val = float("nan")
-            index_failed = True
-        df["v_kospi"] = round(float(vkospi_val), 2)
-        breadth_failed = False
-        try:
+            return await fetch_live_vkospi(client, session, pd.Timestamp(snapshot_date), level)
+
+        def _load_breadth(as_of: str) -> float:
             from src.data.panel_integrity import compute_latest_market_breadth, load_price_panel
 
             panel, _prov = load_price_panel(settings.PRICE_HISTORY_PARQUET_PATH)
-            breadth_val = compute_latest_market_breadth(panel, snapshot_date)
-            if breadth_val != breadth_val:
-                breadth_failed = True
-        except Exception:
-            breadth_val = float("nan")
-            breadth_failed = True
-        df["market_breadth"] = breadth_val
-        df["시장폭_실패"] = breadth_failed
-        df["지수_실패"] = index_failed
+            return compute_latest_market_breadth(panel, as_of)
 
-        df[PRICE_ANOMALY_COL] = flag_price_anomaly(df).to_numpy()
-        enrichment_completed_at = datetime.now(ZoneInfo("Asia/Seoul"))
-        df["feature_available_timestamp"] = enrichment_completed_at
-        report, status, reason = evaluate_realtime_coverage(df)
+        def _completion_clock() -> datetime:
+            return datetime.now(ZoneInfo("Asia/Seoul"))
+
+        assembled = await assemble_decision_frame(results, snapshot_date=snapshot_date, kospi_rate=kospi_rate, kosdaq_rate=kosdaq_rate,
+            kospi_level=kospi_level, fetch_vkospi=_fetch_vkospi, load_market_breadth=_load_breadth, capture_ts=capture_ts, completion_clock=_completion_clock)
+        df = assembled.frame
+        report = assembled.coverage
+        status = assembled.status
+        reason = assembled.reason
         entries = (
             CoverageEntry(
                 symbol=None,
@@ -1141,7 +1217,7 @@ async def main(force: bool = False):
                 raw_refs=(),
             ),
         )
-        store.publish_decision(df, cohort=cohort, run_id=run_id, completed_at=enrichment_completed_at, entries=entries)
+        store.publish_decision(df, cohort=cohort, run_id=run_id, completed_at=assembled.completed_at, entries=entries)
         logger.info(
             "[DATA] stage=realtime_coverage n_raw=%d n_degraded=%d coverage=%.4f status=%s",
             report["n_raw"],

@@ -305,3 +305,39 @@ def test_persistent_inode_mismatch_times_out(tmp_path: Path, monkeypatch: pytest
     ):
         pass  # pragma: no cover
     assert time.monotonic() - started >= 0.1
+
+
+_requires_non_root = pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permission checks")
+
+
+@_requires_non_root
+def test_exclusive_file_lock_acquires_foreign_readonly_sidecar_and_still_excludes(tmp_path: Path) -> None:
+    import fcntl
+
+    path = tmp_path / "store.parquet.lock"
+    path.touch()
+    path.chmod(0o444)
+
+    with exclusive_file_lock(path, timeout_seconds=1.0, purpose="store"):
+        probe = os.open(path, os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+    assert not path.exists()
+
+
+@_requires_non_root
+def test_exclusive_file_lock_unopenable_sidecar_fails_closed_at_deadline(tmp_path: Path) -> None:
+    path = tmp_path / "store.parquet.lock"
+    path.touch()
+    path.chmod(0o000)
+    try:
+        with (
+            pytest.raises(TimeoutError, match="lock file not accessible"),
+            exclusive_file_lock(path, timeout_seconds=0.05, purpose="store"),
+        ):
+            pytest.fail("body must not run without the lock")
+    finally:
+        path.chmod(0o644)

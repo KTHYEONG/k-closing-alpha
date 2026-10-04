@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from zoneinfo import ZoneInfo
 
+from src.api._common import deadline_remaining, now_seoul, parse_expires_in, resolve_chart_budget, validate_target_ymd
+from src.api._transport import RetryPolicy, send_with_auth_retry
 from src.api.kis.rate_limit import HostPacedRateLimiter, get_host_rate_limiter, host_admission_state_path
 from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
 from src.config import settings
@@ -21,38 +21,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_SEOUL = ZoneInfo("Asia/Seoul")
 _YMD_RE = re.compile(r"^\d{8}$")
 _HHMMSS_RE = re.compile(r"^\d{6}$")
 
 LS_AUTH_REJECTED_RSP_CODES: frozenset[str] = frozenset({"IGW00101", "IGW00102", "IGW00123"})
 
 _LS_TOKEN_EXPIRY_MARGIN_SECONDS: float = 300.0
-
-
-def _now_seoul() -> datetime:
-    return datetime.now(_SEOUL)
-
-
-def _validate_target_ymd(target_date: str) -> str:
-    ymd = str(target_date).replace("-", "")
-    try:
-        datetime.strptime(ymd, "%Y%m%d")
-    except ValueError:
-        raise ValueError(f"invalid target date: {target_date!r}") from None
-    return ymd
-
-
-def _resolve_chart_budget(budget: ChartBudget | None, default_pages: int) -> tuple[int, datetime | None]:
-    if budget is None:
-        return max(1, int(default_pages)), None
-    return max(1, int(budget.max_pages)), budget.deadline
-
-
-def _deadline_remaining(deadline: datetime | None) -> float | None:
-    if deadline is None:
-        return None
-    return (deadline - _now_seoul()).total_seconds()
 
 
 class LsApiClient:
@@ -89,119 +63,108 @@ class LsApiClient:
             clock=lambda: datetime.now(UTC),
         )
 
-    async def _issue_token(self, session) -> IssuedToken:
+    async def _issue_token(self, session: aiohttp.ClientSession) -> IssuedToken:
         payload = {
             "grant_type": "client_credentials",
             "appkey": self.app_key,
             "appsecretkey": self.app_secret,
             "scope": "oob",
         }
-        raw = session.post(f"{self.base_url}/oauth2/token", data=payload)
-        if inspect.isawaitable(raw):
-            raw = await raw
-        async with raw as resp:
+        async with session.post(f"{self.base_url}/oauth2/token", data=payload) as resp:
             body = await resp.json()
         token = str(body.get("access_token", ""))
         if not token:
             raise RuntimeError(f"LS token issuance failed: {body}")
-        expires_raw = body.get("expires_in")
-        expires_in: float | None = None
-        if isinstance(expires_raw, bool):
-            expires_in = None
-        elif isinstance(expires_raw, (int, float)):
-            expires_in = float(expires_raw)
-        elif isinstance(expires_raw, str) and expires_raw.strip().lstrip("+-").replace(".", "", 1).isdigit():
-            try:
-                expires_in = float(expires_raw.strip())
-            except ValueError:
-                expires_in = None
+        expires_in = parse_expires_in(body.get("expires_in"))
         return IssuedToken(access_token=token, expires_in_seconds=expires_in)
 
-    async def ensure_token(self, session) -> str:
+    async def ensure_token(self, session: aiohttp.ClientSession) -> str:
         record = await self._token_store().get_or_issue(lambda: self._issue_token(session))
         self.token = record.access_token
         return self.token
 
     @staticmethod
-    def _is_auth_rejected(status: int, data: dict) -> bool:
+    def _is_auth_rejected(status: int, data: dict[str, Any]) -> bool:
         if status == 401:
             return True
         return str(data.get("rsp_cd", "")) in LS_AUTH_REJECTED_RSP_CODES
 
+    async def _refresh_rejected_token(self, session: aiohttp.ClientSession, rejected_token: str) -> None:
+        """Replace the rejected token through the host-shared store (compare-and-swap on the sent token).
+
+        ``SharedTokenStore.replace_rejected`` returns a peer-rotated usable token unchanged, and only issues when
+        the stored token is the one that was rejected. Passing the token that was sent, rather than ``self.token``
+        at handling time, prevents a second issuance when another task already rotated it.
+
+        Raises:
+            TokenStoreLockTimeout: Store lock not acquired within ``BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS``.
+            RuntimeError: Issuance returned no token.
+        """
+        record = await self._token_store().replace_rejected(rejected_token, lambda: self._issue_token(session))
+        self.token = record.access_token
+
     async def _post_tr(
         self,
-        session,
+        session: aiohttp.ClientSession,
         tr_cd: str,
         tr_key: str,
-        body: dict,
+        body: dict[str, Any],
         tr_cont: str = "N",
         tr_cont_key: str = "",
         max_retries: int | None = None,
-    ) -> tuple[dict, dict]:
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """POST one LS chart TR and return (json body, response headers).
+
+        LS signals throttling in the body (``rsp_cd == "IGW00201"``), not with HTTP 429. HTTP 429 is therefore not
+        retried here; it is returned to the caller. Throttled attempts back off exponentially
+        (``LS_RATE_LIMIT_BACKOFF_SECONDS * 2**attempt``). An auth rejection (HTTP 401 or ``rsp_cd`` in
+        ``LS_AUTH_REJECTED_RSP_CODES``) triggers one compare-and-swap refresh and an identical replay that does
+        not consume an attempt. Every send takes a host admission slot first.
+
+        Args:
+            session: Open HTTP session.
+            tr_cd: LS TR code (sent as header and injected into the JSON body).
+            tr_key: Caller correlation key (symbol); used only for log context.
+            body: TR input block.
+            tr_cont: Continuation flag header.
+            tr_cont_key: Continuation cursor header.
+            max_retries: Rate-limit attempts; None means ``LS_RATE_LIMIT_MAX_RETRIES`` captured at construction.
+
+        Returns:
+            The body and headers of the last HTTP call. A second consecutive auth rejection, or an exhausted
+            ``IGW00201``, is returned as-is.
+
+        Raises:
+            TokenStoreLockTimeout, RuntimeError: Refresh failed.
+            aiohttp.ClientError: Transport or non-JSON reply.
+            ValueError: ``max_retries < 1``.
+        """
         if not self.token:
             await self.ensure_token(session)
         limit = int(max_retries) if max_retries is not None else self._rate_limit_max_retries
+        backoff = self._rate_limit_backoff
 
-        async def _single_post() -> tuple[dict, dict, int]:
-            await self._limiter().acquire()
-            headers = {
-                "content-type": "application/json; charset=utf-8",
-                "authorization": f"Bearer {self.token}",
-                "tr_cd": tr_cd,
-                "tr_cont": tr_cont,
-                "tr_cont_key": tr_cont_key,
-            }
-            raw = session.post(f"{self.base_url}/stock/chart", json={**body, "tr_cd": tr_cd}, headers=headers)
-            if inspect.isawaitable(raw):
-                raw = await raw
-            async with raw as resp:
-                data = await resp.json()
-                status = int(getattr(resp, "status", 200) or 200)
-                headers_raw = getattr(resp, "headers", None)
-                if isinstance(headers_raw, dict):
-                    resp_headers = headers_raw
-                elif hasattr(headers_raw, "items") and not type(headers_raw).__name__.endswith("Mock"):
-                    try:
-                        resp_headers = dict(headers_raw)
-                    except Exception:
-                        resp_headers = {}
-                else:
-                    resp_headers = {}
-            return data, resp_headers, status
+        def open_request(token: str) -> Any:
+            return session.post(
+                f"{self.base_url}/stock/chart",
+                json={**body, "tr_cd": tr_cd},
+                headers={
+                    "content-type": "application/json; charset=utf-8",
+                    "authorization": f"Bearer {token}",
+                    "tr_cd": tr_cd,
+                    "tr_cont": tr_cont,
+                    "tr_cont_key": tr_cont_key,
+                },
+            )
 
-        refreshed = False
-        data: dict = {}
-        resp_headers: dict = {}
-        for attempt in range(limit):
-            data, resp_headers, status = await _single_post()
-            if self._is_auth_rejected(status, data) and not refreshed:
-                refreshed = True
-                record = await self._token_store().replace_rejected(
-                    self.token or "", lambda: self._issue_token(session)
-                )
-                self.token = record.access_token
-                data, resp_headers, status = await _single_post()
-                if self._is_auth_rejected(status, data):
-                    return data, resp_headers
-                if str(data.get("rsp_cd", "")) == "IGW00201" and attempt < limit - 1:
-                    wait = self._rate_limit_backoff * (2**attempt)
-                    logger.warning("LS rate limit hit (IGW00201). Retrying in %.1fs... (attempt %d/%d)", wait, attempt + 1, limit)
-                    await asyncio.sleep(wait)
-                    continue
-                if str(data.get("rsp_cd", "")) == "IGW00201":
-                    logger.warning("[DATA] stage=ls_tr tr_cd=%s status=RATE_LIMITED attempts=%d", tr_cd, limit)
-                return data, resp_headers
-
-            rsp_cd = str(data.get("rsp_cd", ""))
-            if rsp_cd == "IGW00201" and attempt < limit - 1:
-                wait = self._rate_limit_backoff * (2**attempt)
-                logger.warning("LS rate limit hit (IGW00201). Retrying in %.1fs... (attempt %d/%d)", wait, attempt + 1, limit)
-                await asyncio.sleep(wait)
-                continue
-            if rsp_cd == "IGW00201":
-                logger.warning("[DATA] stage=ls_tr tr_cd=%s status=RATE_LIMITED attempts=%d", tr_cd, limit)
-            return data, resp_headers
-        return data, resp_headers
+        policy = RetryPolicy(
+            max_attempts=limit,
+            rate_limit_wait=lambda attempt, response: backoff * (2**attempt)
+            if str(response.body.get("rsp_cd", "")) == "IGW00201"
+            else None,
+        )
+        response = await send_with_auth_retry(open_request, acquire=lambda: self._limiter().acquire(), current_token=lambda: self.token or "", is_auth_rejected=lambda r: self._is_auth_rejected(r.status, r.body), refresh=lambda sent: self._refresh_rejected_token(session, sent), policy=policy, log_stage="ls_tr", log_context=f"tr_cd={tr_cd} tr_key={tr_key}")
+        return response.body, response.headers
 
     async def get_minute_chart(
         self,
@@ -233,8 +196,8 @@ class LsApiClient:
             ValueError: Invalid budget or target date.
             OSError: Mandatory raw-page persistence fails.
         """
-        ymd = _validate_target_ymd(target_date)
-        max_pages, deadline = _resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
+        ymd = validate_target_ymd(target_date)
+        max_pages, deadline = resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
         cts_date, cts_time = "", ""
         tr_cont, tr_cont_key = "N", ""
         all_rows: list[dict[str, Any]] = []
@@ -248,12 +211,12 @@ class LsApiClient:
         in_observer = False
         try:
             for page_index in range(max_pages):
-                remaining = _deadline_remaining(deadline)
+                remaining = deadline_remaining(deadline)
                 if remaining is not None and remaining <= 0:
                     termination = "deadline"
                     truncated = True
                     break
-                started = _now_seoul()
+                started = now_seoul()
                 call = self._post_tr(
                     session,
                     "t8412",
@@ -266,7 +229,7 @@ class LsApiClient:
                     data, resp_headers = await call
                 else:
                     data, resp_headers = await asyncio.wait_for(call, timeout=remaining)
-                received = _now_seoul()
+                received = now_seoul()
                 out_block = data.get("t8412OutBlock") or {}
                 body_cts_date = str(out_block.get("cts_date", "") or "").strip()
                 body_cts_time = str(out_block.get("cts_time", "") or "").strip()
@@ -372,17 +335,17 @@ class LsApiClient:
             ValueError: Invalid or conflicting acquisition limits.
             OSError: Mandatory evidence persistence fails.
         """
-        ymd = _validate_target_ymd(target_date)
+        ymd = validate_target_ymd(target_date)
         if max_pages is not None and budget is not None and int(max_pages) != int(budget.max_pages):
             raise ValueError("conflicting tick acquisition limits")
         if max_pages is not None and int(max_pages) <= 0:
             raise ValueError("invalid tick acquisition limits")
         if budget is not None:
-            page_budget, deadline = _resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
+            page_budget, deadline = resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
         elif max_pages is not None:
             page_budget, deadline = max(1, int(max_pages)), None
         else:
-            page_budget, deadline = _resolve_chart_budget(None, int(settings.COLLECTION_CHART_MAX_PAGES))
+            page_budget, deadline = resolve_chart_budget(None, int(settings.COLLECTION_CHART_MAX_PAGES))
         cts_date, cts_time = "", ""
         tr_cont, tr_cont_key = "N", ""
         all_rows: list[dict[str, Any]] = []
@@ -396,12 +359,12 @@ class LsApiClient:
         in_observer = False
         try:
             for page_index in range(max(1, int(page_budget))):
-                remaining = _deadline_remaining(deadline)
+                remaining = deadline_remaining(deadline)
                 if remaining is not None and remaining <= 0:
                     termination = "deadline"
                     truncated = True
                     break
-                started = _now_seoul()
+                started = now_seoul()
                 call = self._post_tr(
                     session, "t8411", str(code),
                     {"t8411InBlock": {"shcode": str(code), "ncnt": 1, "qrycnt": 500, "nday": "0", "sdate": ymd, "stime": "090000", "edate": ymd, "etime": "153000", "cts_date": cts_date, "cts_time": cts_time, "comp_yn": "N"}},
@@ -412,7 +375,7 @@ class LsApiClient:
                     data, resp_headers = await call
                 else:
                     data, resp_headers = await asyncio.wait_for(call, timeout=remaining)
-                received = _now_seoul()
+                received = now_seoul()
                 out_block = data.get("t8411OutBlock") or {}
                 body_cts_date = str(out_block.get("cts_date", "") or "").strip()
                 body_cts_time = str(out_block.get("cts_time", "") or "").strip()

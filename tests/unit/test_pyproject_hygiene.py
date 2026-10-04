@@ -91,3 +91,28 @@ def test_setuptools_discovery_covers_every_src_package() -> None:
         if not any(fnmatch.fnmatchcase(pkg, pattern) for pattern in include)
     ]
     assert uncovered == [], f"packages not covered by setuptools include: {uncovered}"
+
+
+def test_mypy_ignore_override_only_shrinks() -> None:
+    """No ignore_errors pattern may start with src. (final allow-set is empty)."""
+    overrides = _pyproject()["tool"]["mypy"].get("overrides", [])
+    ignored = {
+        pattern
+        for override in overrides
+        if override.get("ignore_errors") is True
+        for pattern in override.get("module", [])
+        if pattern.startswith("src.")
+    }
+    assert ignored == set(), f"re-ignored src packages: {ignored}"
+
+
+def test_strict_typing_stays_enabled_globally() -> None:
+    """Strict mode stays on and typed packages are never re-ignored."""
+    config = _pyproject()["tool"]["mypy"]
+    assert config["strict"] is True
+    forbidden = {"src.data.*", "src.ml.*", "src.processing.*", "src.sync.*", "src.utils.*"}
+    for override in config.get("overrides", []):
+        if override.get("ignore_errors") is True:
+            assert not (set(override.get("module", [])) & forbidden), (
+                f"strict package re-ignored: {override.get('module', [])}"
+            )

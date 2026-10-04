@@ -13,12 +13,12 @@ import asyncio
 import logging
 import os
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -36,6 +36,7 @@ from src.config.market_session import (
 from src.data.capture_contracts import (
     SEOUL,
     GOOD_ENTRY_STATES,
+    ArtifactRef,
     CaptureContext,
     CaptureDataset,
     CaptureManifest,
@@ -48,6 +49,9 @@ from src.data.intraday_store import intraday_partition_path, remove_intraday_sym
 from src.data.io_utils import atomic_write_parquet, read_existing_parquet
 from src.utils.cli_logging import configure_cli_logging
 from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
+
+if TYPE_CHECKING:
+    import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -395,7 +399,7 @@ def _stored_partition_symbols(snapshot_date: str, session: str) -> set[str]:
 
 
 @asynccontextmanager
-async def _http_session(client: Any):
+async def _http_session(client: Any) -> AsyncIterator[aiohttp.ClientSession | None]:
     """Yield a request session for any client shape (real, session-factory, or bare fake)."""
     factory = getattr(client, "create_session", None)
     if factory is None:
@@ -535,7 +539,7 @@ async def run_extended_session_backfill(
                 for bucket_result in fetched:
                     collected.update(bucket_result)
 
-            def _basis_failed_entry(entry: CoverageEntry, reason: str, refs: tuple = ()) -> CoverageEntry:
+            def _basis_failed_entry(entry: CoverageEntry, reason: str, refs: tuple[ArtifactRef, ...] = ()) -> CoverageEntry:
                 return CoverageEntry(
                     symbol=entry.symbol,
                     dataset=entry.dataset,
@@ -761,7 +765,8 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
         raise ValueError("backfill slots resolved to no credentials")
 
     async def _run() -> ExtendedBackfillSummary:
-        from src.api.kis.client import KisApiClient, token_cache_path
+        from src.api.kis.client import KisApiClient
+        from src.api.kis.key_pool import token_cache_path
 
         from src import settings as app_settings
 

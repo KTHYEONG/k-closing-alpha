@@ -13,7 +13,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -26,9 +26,21 @@ _SLOT_RE = re.compile(r"^[1-9][0-9]*$")
 
 @dataclass(frozen=True)
 class KisCredential:
+    """One KIS app-key credential bound to a pool slot.
+
+    Attributes:
+        slot: Log-safe slot label (e.g. "DATA_1", "PRIMARY"); the only identifier
+            that may appear in logs, manifests and error messages.
+        app_key: Vendor app key; excluded from ``repr`` because the key alone
+            authenticates token issuance together with the secret.
+        app_secret: Vendor app secret; excluded from ``repr`` so tracebacks and
+            ``%r`` logging cannot leak it.
+        hts_id: HTS user id (non-secret routing identifier).
+    """
+
     slot: str
-    app_key: str
-    app_secret: str
+    app_key: str = field(repr=False)
+    app_secret: str = field(repr=False)
     hts_id: str
 
 

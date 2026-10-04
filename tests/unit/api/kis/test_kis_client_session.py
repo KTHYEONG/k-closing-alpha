@@ -366,3 +366,46 @@ def test_kis_ensure_token_raises_after_retries_and_never_retries_business_error(
     with pytest.raises(RuntimeError, match="토큰 발급 실패"):
         asyncio.run(biz.ensure_token(_BizSession()))
     assert posts["n"] == 1
+
+
+def test_kis_token_write_failure_leaves_no_temp(tmp_path, monkeypatch) -> None:
+    import os
+
+    import pytest
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "kis_token.json"
+    token_file.write_text("old", encoding="utf-8")
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+
+    def _boom(src, dst):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(os, "replace", _boom)
+
+    with pytest.raises(OSError, match="disk gone"):
+        client._write_token_file("TOK", "2030-01-01T00:00:00+09:00", "2026-10-01T00:00:00+09:00")
+
+    assert token_file.read_text(encoding="utf-8") == "old"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_kis_token_cache_bytes_unchanged(tmp_path) -> None:
+    import json
+    import stat
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "kis_token.json"
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+
+    client._write_token_file("TOK", "2030-01-01T00:00:00+09:00", "2026-10-01T00:00:00+09:00")
+
+    assert token_file.read_text(encoding="utf-8") == json.dumps({
+        "access_token": "TOK",
+        "expired_at": "2030-01-01T00:00:00+09:00",
+        "app_key": "k",
+        "issued_at": "2026-10-01T00:00:00+09:00",
+    })
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600

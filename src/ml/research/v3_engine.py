@@ -3,6 +3,7 @@
 Enforces zero lookahead leakage, strict calendar-aware walk-forward validation,
 point-in-time universe selection, realistic cost models, and discrete portfolio NAV.
 """
+
 from __future__ import annotations
 
 import logging
@@ -12,6 +13,8 @@ import numpy as np
 import pandas as pd
 
 from src.data.panel_integrity import prepare_price_panel
+from src.ml.topk_contract import FEATURE_COLS as FEATURE_COLS
+from src.ml.topk_contract import compute_derived_features as compute_derived_features
 from src.strategy.contract import (
     AA_COST,
     DEFAULT_UNIVERSE,
@@ -22,20 +25,6 @@ from src.strategy.contract import (
 )
 
 logger = logging.getLogger("research_v3_engine")
-
-FEATURE_COLS: list[str] = [
-    "chg_ratio",
-    "log_tv",
-    "log_mc",
-    "body_ratio",
-    "upper_shadow_ratio",
-    "intraday_range",
-    "kospi_pct",
-    "kosdaq_pct",
-    "v_kospi",
-    "tv_rank",
-    "chg_rank",
-]
 
 # 실측 왕복비용 상단 시나리오(bp). 라벨이 아니라 스트레스 시나리오 전용이므로 PIT 스케줄과 독립이다.
 STRESS_COST_BP: float = 46.0
@@ -86,7 +75,26 @@ def attach_forward_exit_paths(
     market_dates: np.ndarray,
     d_to_idx: dict[pd.Timestamp, int],
 ) -> pd.DataFrame:
-    """Attach forward exit prices with suspension tracking and carry rule."""
+    """Attach forward exit prices with suspension tracking and carry rule.
+
+    The exit is the first tradable D+k open (k = 1..20); a candidate that never resumes within 20
+    trading days exits at a 50% haircut of its close, dated D+20.
+
+    Args:
+        cands: Candidate rows with date, symbol, close and market columns.
+        ph: Prepared price-history panel used for the forward lookup.
+        market_dates: Full sorted trading calendar.
+        d_to_idx: Date-to-index lookup into market_dates.
+
+    Returns:
+        cands with d1_tradable, exit_price, exit_status, holding_days, exit_date, gross/net return and
+        cost columns. exit_date is the trading date whose open realizes the label
+        (market_dates[idx(date) + holding_days]); NaT when no D+1 bar exists or the D+20 horizon of an
+        unresolved exit runs past the calendar. Downstream CV uses it to purge label-overlapping rows.
+
+    Raises:
+        ValueError: When the market column is missing.
+    """
     logger.info("Attaching calendar-aware forward exit paths...")
     lookup = ph.set_index(["date", "symbol"])[["open", "high", "low", "close", "volume"]]
     n_market_dates = len(market_dates)
@@ -147,6 +155,13 @@ def attach_forward_exit_paths(
     cands["exit_price"] = exit_prices
     cands["exit_status"] = exit_status
     cands["holding_days"] = holding_days
+    # 라벨 실현일: 보유일수만큼 앞선 거래일의 시가가 라벨을 확정한다
+    exit_idx = date_indices.astype(np.int64) + holding_days.astype(np.int64)
+    calendar = pd.to_datetime(pd.Series(market_dates)).to_numpy(dtype="datetime64[ns]")
+    exit_dates = np.full(len(cands), np.datetime64("NaT"), dtype="datetime64[ns]")
+    in_range = valid_d1 & (exit_idx < n_market_dates)
+    exit_dates[in_range] = calendar[exit_idx[in_range]]
+    cands["exit_date"] = exit_dates
 
     # Calculate returns and costs
     entry_p = cands["close"].to_numpy(dtype=np.float64)
@@ -177,30 +192,8 @@ def attach_forward_exit_paths(
 def _level_close(frame: pd.DataFrame) -> np.ndarray:
     """Return the raw price level per row, falling back to close."""
     if "close_raw" in frame.columns:
-        return pd.to_numeric(frame["close_raw"], errors="coerce").fillna(frame["close"]).to_numpy(dtype=np.float64)
-    return frame["close"].to_numpy(dtype=np.float64)
-
-
-def compute_derived_features(cands: pd.DataFrame) -> pd.DataFrame:
-    """Compute 11 decision-time features strictly using decision candidate set."""
-    logger.info("Computing derived decision-time features and cross-sectional ranks...")
-    p_close = cands["close"].to_numpy(dtype=np.float64)
-    p_open = cands["open"].to_numpy(dtype=np.float64)
-    p_high = cands["high"].to_numpy(dtype=np.float64)
-    p_low = cands["low"].to_numpy(dtype=np.float64)
-
-    rg = np.maximum(p_high - p_low, 1.0)
-    cands["body_ratio"] = (p_close - p_open) / rg
-    cands["upper_shadow_ratio"] = (p_high - np.maximum(p_open, p_close)) / rg
-    cands["intraday_range"] = (p_high - p_low) / p_close
-    cands["log_tv"] = np.log1p(np.maximum(cands["tv_clean"].to_numpy(dtype=np.float64), 0.0))
-    cands["log_mc"] = np.log1p(np.maximum(cands["mc_clean"].to_numpy(dtype=np.float64), 0.0))
-
-    # Cross-sectional ranks across ALL valid candidates on date T
-    grouped_date = cands.groupby("date", sort=False)
-    cands["tv_rank"] = grouped_date["tv_clean"].rank(pct=True)
-    cands["chg_rank"] = grouped_date["chg_ratio"].rank(pct=True)
-
-    return cands
-
-
+        return np.asarray(
+            pd.to_numeric(frame["close_raw"], errors="coerce").fillna(frame["close"]).to_numpy(dtype=np.float64),
+            dtype=np.float64,
+        )
+    return np.asarray(frame["close"].to_numpy(dtype=np.float64), dtype=np.float64)

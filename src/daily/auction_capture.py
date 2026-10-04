@@ -16,6 +16,7 @@ import pandas as pd
 from src import settings
 from src.api.kis.key_pool import resolve_research_credentials, token_cache_path
 from src.config.collection import CollectionSettings
+from src.config.market_session import KRX_CLOSE_MARKET_DIV_CODE
 from src.data.capture_contracts import (
     GOOD_ENTRY_STATES,
     SEOUL,
@@ -30,7 +31,8 @@ from src.data.capture_contracts import (
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.session_calendar import SessionKind, resolve_session_day
-from src.data.trading_calendar import is_kis_trading_day
+from src.data.trading_calendar import is_kis_trading_day, resolve_prev_trading_day_kis
+from src.execution.paper_broker import load_held_roster
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -49,19 +51,6 @@ def _previous_trading_day(snapshot_date: str) -> str:
     while day.weekday() >= 5:
         day -= timedelta(days=1)
     return day.isoformat()
-
-
-def _open_position_symbols() -> list[str]:
-    try:
-        from src.execution.paper_broker import PaperLedger
-
-        frame = PaperLedger().load_open_positions()
-    except Exception as exc:
-        logger.warning("[DATA] stage=auction_cohort status=paper_unavailable reason=%s", type(exc).__name__)
-        return []
-    if frame is None or frame.empty or "symbol" not in frame.columns:
-        return []
-    return sorted({str(item) for item in frame["symbol"].astype(str).tolist() if str(item).strip()})
 
 
 def close_rounds(clock: SessionClock, interval_seconds: int) -> list[datetime]:
@@ -104,17 +93,29 @@ def _resolve_roster(
             raise RuntimeError(f"auction cohort cannot be verified: {snapshot_date!r}") from exc
         return [str(item) for item in cohort.eligible_symbols], cohort.cohort_id, False
     prev_day = previous_trading_day or _previous_trading_day(snapshot_date)
+    held = load_held_roster()
     try:
         prev_cohort = store.read_cohort(prev_day, available_by=now)
     except FileNotFoundError:
         logger.warning("[DATA] stage=auction_cohort status=INCOMPLETE reason=missing_previous date=%s prev=%s", snapshot_date, prev_day)
-        positions = _open_position_symbols()
-        return positions, None, True
+        if not held.ok:
+            logger.warning(
+                "[DATA] stage=auction_cohort status=INCOMPLETE reason=held_roster_unavailable error=%s date=%s",
+                held.failure_reason,
+                snapshot_date,
+            )
+        return list(held.symbols), None, True
     codes: list[str] = [str(item) for item in prev_cohort.eligible_symbols]
-    for item in _open_position_symbols():
+    for item in held.symbols:
         if item not in codes:
             codes.append(item)
-    return codes, prev_cohort.cohort_id, False
+    if not held.ok:
+        logger.warning(
+            "[DATA] stage=auction_cohort status=INCOMPLETE reason=held_roster_unavailable error=%s date=%s",
+            held.failure_reason,
+            snapshot_date,
+        )
+    return codes, prev_cohort.cohort_id, not held.ok
 
 
 def _extract_open_price(payload: dict[str, Any] | None) -> int:
@@ -230,7 +231,7 @@ async def _observe_program_symbol(
     """Request and persist one symbol's program-trading snapshot for a scheduled round."""
     started = now_fn()
     try:
-        payload = await client.get_program_net_buy(session, symbol, market_div_code="J")
+        payload = await client.get_program_net_buy(session, symbol, market_div_code=KRX_CLOSE_MARKET_DIV_CODE)
     except Exception as exc:
         received = now_fn()
         return CoverageEntry(
@@ -400,7 +401,7 @@ async def _observe_orderbook_symbol(
     """Request and persist one symbol's orderbook snapshot for a scheduled round."""
     started = now_fn()
     try:
-        payload = await client.get_orderbook_snapshot(session, symbol, market_div_code="J")
+        payload = await client.get_orderbook_snapshot(session, symbol, market_div_code=KRX_CLOSE_MARKET_DIV_CODE)
     except Exception as exc:
         received = now_fn()
         degraded.append(symbol)
@@ -515,7 +516,7 @@ async def _observe_open_symbol(
 ) -> CoverageEntry:
     """Poll one symbol's opening price; unresolved symbols return a provisional entry for re-pass."""
     started_at = poll_started.setdefault(symbol, now_fn())
-    payload = await client.get_current_price(session, symbol, market_div_code="J")
+    payload = await client.get_current_price(session, symbol, market_div_code=KRX_CLOSE_MARKET_DIV_CODE)
     received = now_fn()
     body = dict(payload) if isinstance(payload, dict) else None
     price = _extract_open_price(body)
@@ -933,8 +934,6 @@ async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings
         if not await is_kis_trading_day(clients[0], broker_session, snapshot_date):
             return None
         if phase == "open":
-            from src.daily.collect import resolve_prev_trading_day_kis
-
             # 연휴 직후 개장의 모집단은 직전 '실제' 거래일 코호트여야 한다(주말만 건너뛰면 휴장일을 가리킨다).
             prev = await resolve_prev_trading_day_kis(clients[0], broker_session, pd.Timestamp(snapshot_date))
             previous_trading_day = prev.strftime("%Y-%m-%d")

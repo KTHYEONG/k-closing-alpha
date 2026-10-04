@@ -233,3 +233,17 @@ def test_deploy_creates_lib_staging_dir_before_upload() -> None:
     upload = "scp $SSH_OPTS deploy/vps-deploy-lib.sh"
     assert mkdir in workflow
     assert workflow.index(mkdir) < workflow.index(upload)
+
+
+def test_deploy_workflow_runs_static_checks_before_pytest() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    test_block = workflow.split("\n  test:", 1)[1].split("\n  build-and-push:", 1)[0]
+    assert "uv run ruff check src tests tools" in test_block
+    assert "uv run mypy src" in test_block
+    assert test_block.index("uv sync --frozen") < test_block.index("uv run ruff check")
+    assert test_block.index("uv run ruff check") < test_block.index("uv run mypy src")
+    assert test_block.index("uv run mypy src") < test_block.index("uv run pytest -q")
+    assert "continue-on-error" not in test_block

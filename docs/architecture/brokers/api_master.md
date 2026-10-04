@@ -15,7 +15,7 @@ All 4 brokers operate natively on Linux 64-bit via standard HTTPS/OAuth2 protoco
 | **Auth Endpoint** | `POST /oauth2/tokenP` | `POST /oauth2/token` | `POST /oauth2/token` | `POST /oauth2/token` |
 | **Payload Format** | `application/json` | `application/x-www-form-urlencoded` | `application/json;charset=UTF-8` | `application/x-www-form-urlencoded` |
 | **Token Validity** | 24 hours (`86400`s), disk-cached | 24 hours (`86400`s), memory-cached | 24 hours (`86400`s), memory-cached | 24 hours (`86400`s), memory-cached JWT |
-| **Token Concurrency Lock** | asyncio.Lock (single-flight) + atomic 0600 write | Memory lock on refresh | `_token_lock = asyncio.Lock()` | `_token_lock = asyncio.Lock()` |
+| **Token Concurrency Lock** | asyncio.Lock (single-flight) + atomic 0600 write | host `SharedTokenStore` (file lock, generation CAS) | `_token_lock` single-flight + CAS refresh | host `SharedTokenStore` (file lock, generation CAS) |
 | **Global Rate Limit (TPS)** | **18.0 req/s** (process-global shared limiter) | **~0.95 req/s** (Strict 1.05s lock) | **5.0 req/s per TR** (dynamic buckets per TR) | **Group-based Limits**: `MARKET_DATA` 15/s, `CHART` 20/s, `ORDER` 10/s, `TREND` 10/s, `RANK` 5/s |
 | **Concurrency Model** | Shared limiter (call-site semaphores bound concurrency) | Concurrency = 1 (Single-flight `Lock`) | Dynamic per-TR limiters (Parallel across TRs) | Multi-group token buckets (Independent per group; headers: `X-RateLimit-*`) |
 | **Throttling Detection** | Body `"초당 거래건수"` / HTTP 429 | `rsp_cd: "IGW00201"` | HTTP 429 (`return_code: 5, 유량=5`) | HTTP 429 (`Retry-After` header, JSON error) |

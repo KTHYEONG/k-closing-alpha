@@ -55,7 +55,7 @@ def _require_session(value: str) -> str:
 
 
 def build_orderbook_rows(
-    res: dict,
+    res: dict[str, Any],
     symbol: str,
     venue: str,
     capture_reason: str,
@@ -63,7 +63,7 @@ def build_orderbook_rows(
     *,
     scheduled_at: datetime | None = None,
     request_started_at: datetime | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """벤더 output1+output2 페이로드를 키 그대로 복사한 단일 행으로 만든다."""
     if not isinstance(res, dict) or str(res.get("rt_cd", "")) != "0":
         return []
@@ -98,7 +98,7 @@ def orderbook_partition_path(snapshot_date: str, session: str = "regular") -> Pa
     return Path(settings.HISTORY_DIR) / "orderbook" / session / month / f"{snapshot_date}.parquet"
 
 
-def append_orderbook_snapshots(rows: list[dict], snapshot_date: str, *, session: str = "regular") -> int:
+def append_orderbook_snapshots(rows: list[dict[str, Any]], snapshot_date: str, *, session: str = "regular") -> int:
     """호가 스냅샷 행을 일자 파티션에 병합 추가한다. 빈 입력은 0 반환 no-op."""
     if not rows:
         return 0

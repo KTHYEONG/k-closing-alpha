@@ -9,14 +9,14 @@ import hashlib
 import json
 import logging
 import os
-import tempfile
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from src.api.kis.rate_limit import _NAME_RE, resolve_admission_dir
+from src.data.io_utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -26,13 +26,29 @@ _POLL_INTERVAL_SECONDS = 0.01
 
 @dataclass(frozen=True)
 class IssuedToken:
-    access_token: str
+    """A freshly issued vendor access token.
+
+    Attributes:
+        access_token: Bearer token; excluded from ``repr`` (a live token grants API access until expiry).
+        expires_in_seconds: Vendor-declared lifetime, or None when not reported.
+    """
+
+    access_token: str = field(repr=False)
     expires_in_seconds: float | None
 
 
 @dataclass(frozen=True)
 class TokenRecord:
-    access_token: str
+    """A token persisted in the shared per-credential token store.
+
+    Attributes:
+        access_token: Bearer token; excluded from ``repr``.
+        issued_at: Aware issuance instant.
+        expires_at: Aware expiry instant, or None when unknown.
+        generation: Monotonic store generation used for compare-and-swap refresh.
+    """
+
+    access_token: str = field(repr=False)
     issued_at: datetime
     expires_at: datetime | None
     generation: int
@@ -160,18 +176,7 @@ class SharedTokenStore:
             "expires_at": record.expires_at.isoformat() if record.expires_at is not None else None,
             "generation": record.generation,
         }
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=str(self._path.parent), prefix=".token_", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle)
-            os.chmod(tmp_name, 0o600)
-            os.replace(tmp_name, self._path)
-            os.chmod(self._path, 0o600)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_name)
-            raise
+        atomic_write_text(self._path, json.dumps(payload), mode=0o600)
         logger.info(
             "[SYS] stage=shared_token status=PUBLISHED path=%s generation=%d",
             self._path.name,

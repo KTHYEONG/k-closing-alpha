@@ -15,7 +15,7 @@ def aggregate_metrics(daily_returns: np.ndarray) -> dict[str, float]:
     returns = daily_returns[np.isfinite(daily_returns)]
     n = returns.size
     if n == 0:
-        return {key: float("nan") for key in _BASE_METRIC_KEYS}  # type: ignore[return-value]
+        return {key: float("nan") for key in _BASE_METRIC_KEYS}
     profits = returns[returns > 0.0]
     loss_mag = -returns[returns < 0.0]
     top_1_return = float(np.mean(returns))

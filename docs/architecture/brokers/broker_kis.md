@@ -46,8 +46,8 @@ custtype: P
 *(Inquire: `custtype: P`. Order TRs use exact live vs paper `tr_id` prefixes).*
 
 ### 1.4 Rate Limit & Concurrency Invariants
-* **Rate Limiter:** `AsyncRateLimiter(max_rate=18.0, time_period=1.0)` (18 req/s).
-* **Concurrency:** `asyncio.Semaphore(10)`.
+* **Rate Limiter:** host-shared `HostPacedRateLimiter` at `KIS_REST_TPS_PER_APP_KEY` (18 req/s) per app key (`src/api/kis/client.py:87`).
+* **Concurrency:** bounded by call-site semaphores; the client holds none (pinned by `test_kis_client_instances_share_process_global_rate_limiter`).
 * **Throttling Handling:** HTTP 429 or `msg1` containing `"초당 거래건수"` triggers exponential sleep `0.5 * (attempt + 1)`s.
 
 ### 1.5 Market Division Codes (`FID_COND_MRKT_DIV_CODE`)

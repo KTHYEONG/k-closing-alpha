@@ -83,7 +83,7 @@ def _open_clients() -> tuple[Any, Any, Any | None, Any | None]:
     from src.api.kiwoom.client import KiwoomApiClient
     from src.api.ls.client import LsApiClient
 
-    client = KisApiClient(**kis_data_client_kwargs())  # type: ignore[no-untyped-call]
+    client = KisApiClient(**kis_data_client_kwargs())
     ls_client = LsApiClient() if settings.LS_APP_KEY else None
     kiwoom_client = KiwoomApiClient() if settings.KIWOOM_APP_KEY else None
     return client, client.create_session(), ls_client, kiwoom_client

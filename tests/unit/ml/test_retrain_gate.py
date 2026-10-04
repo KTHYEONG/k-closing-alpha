@@ -207,6 +207,78 @@ def test_load_current_bundle_returns_none_until_published(tmp_path) -> None:
 
     # Then
     assert retrain_gate.load_current_bundle(export_dir) == {"feature_cols": ["f1"], "top_k": 3}
-    assert not (tmp_path / "topk_ranker" / "sizing_pipeline_bundle.joblib.tmp").exists()
+    assert [p.name for p in (tmp_path / "topk_ranker").iterdir()] == ["sizing_pipeline_bundle.joblib"]
     assert path.endswith("sizing_pipeline_bundle.joblib")
+
+
+def _gate_bundles(version_current, version_candidate):
+    import dataclasses
+
+    import numpy as np
+    import pandas as pd
+
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    class _ColumnModel:
+        def predict(self, features: pd.DataFrame) -> np.ndarray:
+            return features["f1"].to_numpy(dtype=np.float64)
+
+    def _bundle(model, version) -> dict:
+        bundle = {"feature_cols": ["f1", "f2"], "return_model": model,
+                  "select_universe": dataclasses.asdict(COST_AWARE_UNIVERSE)}
+        if version is not None:
+            bundle["feature_contract_version"] = version
+        return bundle
+
+    rng = np.random.default_rng(0)
+    dates = np.repeat(pd.bdate_range("2026-08-17", periods=20).to_numpy(), 10)
+    eval_frame = pd.DataFrame({"date": dates, "f1": rng.normal(size=200), "f2": rng.normal(size=200)})
+    current = None if version_current == "NONE" else _bundle(_ColumnModel(), version_current)
+    candidate = _bundle(_ColumnModel(), version_candidate)
+    return current, candidate, eval_frame
+
+
+def test_evaluate_retrain_promotion_blocks_feature_contract_version_change() -> None:
+    from src.ml import retrain_gate
+
+    current, candidate, eval_frame = _gate_bundles("0", "1")
+
+    verdict = retrain_gate.evaluate_retrain_promotion(candidate, current, eval_frame)
+
+    assert verdict.promote is False
+    assert any("feature contract changed" in r for r in verdict.reasons)
+    assert verdict.agreement is None
+
+
+def test_evaluate_retrain_promotion_treats_keyless_live_bundle_as_baseline() -> None:
+    from src.ml import retrain_gate
+
+    current, candidate, eval_frame = _gate_bundles(None, "1")
+
+    verdict = retrain_gate.evaluate_retrain_promotion(candidate, current, eval_frame)
+
+    assert verdict.promote is True
+
+
+def test_evaluate_retrain_promotion_rejects_mis_stamped_candidate() -> None:
+    from src.ml import retrain_gate
+
+    _current, candidate, eval_frame = _gate_bundles("NONE", "0")
+
+    verdict = retrain_gate.evaluate_retrain_promotion(candidate, None, eval_frame)
+
+    assert verdict.promote is False
+    assert any(r.startswith("candidate feature contract") for r in verdict.reasons)
+
+
+def test_evaluate_retrain_promotion_blocks_malformed_live_stamp_without_raising() -> None:
+    from src.ml import retrain_gate
+
+    current, candidate, eval_frame = _gate_bundles(1, "1")
+
+    verdict = retrain_gate.evaluate_retrain_promotion(candidate, current, eval_frame)
+
+    assert verdict.promote is False
+    assert any("feature contract" in r for r in verdict.reasons)
+    assert verdict.agreement is None
 

@@ -246,16 +246,15 @@ def test_kiwoom_tick_vendor_failure_reports_termination() -> None:
 
 def test_kiwoom_client_ensure_token() -> None:
     import asyncio
-    from unittest.mock import AsyncMock
 
     from src.api.kiwoom.client import KiwoomApiClient
+    from tests.broker_fakes import scripted_session
 
     client = KiwoomApiClient(app_key="k", secret_key="s")
-    mock_resp = AsyncMock()
-    mock_resp.json = AsyncMock(return_value={"token": "mock_tok", "return_code": 0, "expires_dt": "20261002151006"})
-    session = AsyncMock()
-    session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
-    session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+    session = scripted_session(
+        [],
+        token_bodies=[{"token": "mock_tok", "return_code": 0, "expires_dt": "20261002151006"}],
+    )
 
     token = asyncio.run(client.ensure_token(session))
 
@@ -265,48 +264,41 @@ def test_kiwoom_client_ensure_token() -> None:
 
 def test_kiwoom_client_ensure_token_concurrent_calls_lock_and_request_once() -> None:
     import asyncio
-    from unittest.mock import AsyncMock
 
     from src.api.kiwoom.client import KiwoomApiClient
+    from tests.broker_fakes import FakeBrokerResponse, scripted_session
 
     client = KiwoomApiClient(app_key="k", secret_key="s")
-    call_count = {"n": 0}
-
-    async def fake_post(*args, **kwargs):
-        call_count["n"] += 1
-        await asyncio.sleep(0.01)
-        mock_resp = AsyncMock()
-        mock_resp.json = AsyncMock(return_value={"token": "tok_123", "return_code": 0, "expires_dt": "20261002151006"})
-        ctx = AsyncMock()
-        ctx.__aenter__ = AsyncMock(return_value=mock_resp)
-        ctx.__aexit__ = AsyncMock(return_value=False)
-        return ctx
-
-    session = AsyncMock()
-    session.post = fake_post
+    session = scripted_session(
+        [],
+        token_bodies=[
+            FakeBrokerResponse(
+                body={"token": "tok_123", "return_code": 0, "expires_dt": "20261002151006"},
+                enter_delay=0.01,
+            )
+        ],
+    )
 
     async def runner():
         tokens = await asyncio.gather(*[client.ensure_token(session) for _ in range(10)])
         assert all(t == "tok_123" for t in tokens)
 
     asyncio.run(runner())
-    assert call_count["n"] == 1
+    assert len(session.requests_to("/oauth2/token")) == 1
 
 
 def test_kiwoom_client_ensure_token_raises_on_empty_token() -> None:
     import asyncio
-    from unittest.mock import AsyncMock
 
     import pytest
 
     from src.api.kiwoom.client import KiwoomApiClient
+    from tests.broker_fakes import scripted_session
 
     client = KiwoomApiClient(app_key="k", secret_key="s")
-    mock_resp = AsyncMock()
-    mock_resp.json = AsyncMock(return_value={"return_code": 3, "return_msg": "invalid appkey"})
-    session = AsyncMock()
-    session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
-    session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+    session = scripted_session(
+        [], token_bodies=[{"return_code": 3, "return_msg": "invalid appkey"}]
+    )
 
     with pytest.raises(RuntimeError, match="Kiwoom token issuance failed"):
         asyncio.run(client.ensure_token(session))
@@ -452,18 +444,12 @@ def test_kiwoom_client_get_tick_chart_exception_yields_soft_failure() -> None:
 
 def test_kiwoom_post_tr_retries_on_429_then_succeeds(monkeypatch) -> None:
     import asyncio
-    from unittest.mock import AsyncMock
 
-    from src.api.kis.rate_limit import AsyncRateLimiter
     import src.api.kiwoom.client as kiwoom_client_mod
+    from tests.broker_fakes import FakeBrokerResponse, scripted_session
 
     client = kiwoom_client_mod.KiwoomApiClient(app_key="k", secret_key="s")
     client.token = "tok"
-
-    async def _fast_acquire(self) -> None:
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr(AsyncRateLimiter, "acquire", _fast_acquire)
 
     _real_sleep = asyncio.sleep
 
@@ -472,23 +458,22 @@ def test_kiwoom_post_tr_retries_on_429_then_succeeds(monkeypatch) -> None:
 
     monkeypatch.setattr(kiwoom_client_mod.asyncio, "sleep", _fast_sleep)
 
-    mock_resp_429 = AsyncMock()
-    mock_resp_429.status = 429
-    mock_resp_429.json = AsyncMock(return_value={"return_code": 5, "return_msg": "허용된 API 요청 개수를 초과하였습니다. 유량=5"})
-    mock_resp_429.headers = {}
-    mock_resp_200 = AsyncMock()
-    mock_resp_200.status = 200
-    mock_resp_200.json = AsyncMock(return_value={"return_code": 0, "return_msg": "OK", "stk_tic_chart_qry": []})
-    mock_resp_200.headers = {}
-
-    session = AsyncMock()
-    session.post.return_value.__aenter__ = AsyncMock(side_effect=[mock_resp_429, mock_resp_200])
-    session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+    session = scripted_session(
+        [
+            FakeBrokerResponse(
+                body={"return_code": 5, "return_msg": "허용된 API 요청 개수를 초과하였습니다. 유량=5"},
+                status=429,
+            ),
+            FakeBrokerResponse(
+                body={"return_code": 0, "return_msg": "OK", "stk_tic_chart_qry": []}, status=200
+            ),
+        ]
+    )
 
     data, headers = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {"stk_cd": "005930"}))
 
     assert data.get("return_code") == 0
-    assert session.post.call_count == 2
+    assert len(session.requests) == 2
 
 
 def test_kiwoom_get_fluctuation_ranking_single_page() -> None:
@@ -1450,3 +1435,482 @@ def test_kiwoom_revoke_token_failure_surfaces() -> None:
                 _revoke_session({"return_code": 0}, 500, {}), "live-tok"
             )
         )
+
+
+def test_kiwoom_post_tr_converts_mapping_headers() -> None:
+    import asyncio
+    from typing import Any
+
+    from multidict import CIMultiDict, CIMultiDictProxy
+
+    from src.api.kiwoom.client import KiwoomApiClient
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.status = 200
+            self.headers = CIMultiDictProxy(CIMultiDict({"cont-yn": "Y", "next-key": "k1"}))
+
+        async def json(self) -> dict:
+            return {"return_code": 0, "return_msg": "OK"}
+
+        async def __aenter__(self) -> _Resp:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _Session:
+        def post(self, url: str, headers: dict, json: dict) -> _Resp:
+            return _Resp()
+
+    client = KiwoomApiClient(app_key="k", secret_key="s")
+    client.token = "tok"
+    data, headers = asyncio.run(client._post_tr(_Session(), "ka10079", "/api/dostk/chart", {"stk_cd": "005930"}))
+
+    assert type(headers) is dict
+    assert headers.get("cont-yn") == "Y"
+    assert headers.get("next-key") == "k1"
+    assert data["return_code"] == 0
+
+
+def test_kiwoom_post_tr_unconvertible_headers_become_empty() -> None:
+    import asyncio
+    from typing import Any
+
+    from src.api.kiwoom.client import KiwoomApiClient
+
+    body = {"return_code": 0, "return_msg": "OK"}
+
+    class _BadHeaders:
+        def items(self):  # noqa: ANN204 - presence of the attribute is the fixture
+            return [("a", "1")]
+
+        def __iter__(self):  # noqa: ANN204 - dict() must raise TypeError here
+            raise TypeError("not iterable")
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.status = 200
+            self.headers = _BadHeaders()
+
+        async def json(self) -> dict:
+            return dict(body)
+
+        async def __aenter__(self) -> _Resp:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _Session:
+        def post(self, url: str, headers: dict, json: dict) -> _Resp:
+            return _Resp()
+
+    client = KiwoomApiClient(app_key="k", secret_key="s")
+    client.token = "tok"
+    data, headers = asyncio.run(client._post_tr(_Session(), "ka10079", "/api/dostk/chart", {"stk_cd": "005930"}))
+
+    assert headers == {}
+    assert data == body
+
+
+_KIWOOM_TOKEN_BODY = {"token": "tok-1", "return_code": 0, "expires_dt": "20261002151006"}
+_KIWOOM_EXP_BODY = {"return_code": 3, "return_msg": "인증에 실패했습니다[8005:Token이 유효하지 않습니다]"}
+
+
+def _kiwoom_seeded_client():  # type: ignore[no-untyped-def]
+    from src.api.kiwoom.client import KiwoomApiClient
+
+    client = KiwoomApiClient(app_key="k", secret_key="s")
+    client.token = "tok"
+    return client
+
+
+def _kiwoom_tr_session(tr_replies, token_bodies=(_KIWOOM_TOKEN_BODY,)):  # type: ignore[no-untyped-def]
+    from tests.broker_fakes import scripted_session
+
+    return scripted_session(list(tr_replies), token_bodies=list(token_bodies))
+
+
+def _kiwoom_429():  # type: ignore[no-untyped-def]
+    from tests.broker_fakes import FakeBrokerResponse
+
+    return FakeBrokerResponse(
+        body={"return_code": 5, "return_msg": "허용된 API 요청 개수를 초과하였습니다. 유량=5"}, status=429
+    )
+
+
+def _kiwoom_ok():  # type: ignore[no-untyped-def]
+    from tests.broker_fakes import FakeBrokerResponse
+
+    return FakeBrokerResponse(body={"return_code": 0, "return_msg": "OK"}, status=200)
+
+
+def _kiwoom_exp():  # type: ignore[no-untyped-def]
+    from tests.broker_fakes import FakeBrokerResponse
+
+    return FakeBrokerResponse(body=dict(_KIWOOM_EXP_BODY), status=200)
+
+
+def _record_sleep(monkeypatch):  # type: ignore[no-untyped-def]
+    import asyncio
+
+    sleeps: list[float] = []
+
+    async def _record(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _record)
+    return sleeps
+
+
+def _count_acquires(monkeypatch):  # type: ignore[no-untyped-def]
+    import src.api.kiwoom.client as kiwoom_client_mod
+
+    calls = {"n": 0}
+
+    async def _count(self) -> None:
+        calls["n"] += 1
+
+    monkeypatch.setattr(kiwoom_client_mod.HostPacedRateLimiter, "acquire", _count)
+    return calls
+
+
+def _tr_auths(session) -> list[str]:  # type: ignore[no-untyped-def]
+    return [
+        request.headers.get("authorization", "")
+        for request in session.requests
+        if not request.url.endswith("/oauth2/token")
+    ]
+
+
+def test_kiwoom_tr_429_retried_then_succeeds(monkeypatch) -> None:
+    import asyncio
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([_kiwoom_429(), _kiwoom_429(), _kiwoom_ok()])
+    sleeps = _record_sleep(monkeypatch)
+
+    data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {"stk_cd": "005930"}))
+
+    assert data["return_code"] == 0
+    assert len(session.requests) == 3
+    assert sleeps == [1.2, 1.2]
+
+
+def test_kiwoom_tr_429_exhausted_returns_last_body(monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([_kiwoom_429(), _kiwoom_429(), _kiwoom_429()])
+    sleeps = _record_sleep(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="src.api._transport"):
+        data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {"stk_cd": "005930"}))
+
+    assert data["return_code"] == 5
+    assert len(session.requests) == 3
+    assert sleeps == [1.2, 1.2]
+    assert sum("RATE_LIMITED attempts=3" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_kiwoom_tr_expired_token_refreshes_once_and_replays(monkeypatch) -> None:
+    import asyncio
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([_kiwoom_exp(), _kiwoom_ok()])
+    sleeps = _record_sleep(monkeypatch)
+
+    data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {"stk_cd": "005930"}))
+
+    assert data["return_code"] == 0
+    assert len(session.requests_to("/api/dostk/chart")) == 2
+    assert len(session.requests_to("/oauth2/token")) == 1
+    assert _tr_auths(session) == ["Bearer tok", "Bearer tok-1"]
+    assert sleeps == []
+
+
+def test_kiwoom_tr_second_rejection_surfaces(monkeypatch) -> None:
+    import asyncio
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([_kiwoom_exp(), _kiwoom_exp(), _kiwoom_ok()])
+
+    data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+
+    assert data["return_code"] == 3
+    assert len(session.requests_to("/api/dostk/chart")) == 2
+    assert len(session.requests_to("/oauth2/token")) == 1
+
+
+def test_kiwoom_tr_call_cap_is_max_retries_plus_one(monkeypatch) -> None:
+    import asyncio
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([_kiwoom_429(), _kiwoom_429(), _kiwoom_exp(), _kiwoom_429()])
+    sleeps = _record_sleep(monkeypatch)
+
+    data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+
+    assert data["return_code"] == 5
+    assert len(session.requests_to("/api/dostk/chart")) == 4
+    assert sleeps == [1.2, 1.2]
+    assert len(session.requests_to("/oauth2/token")) == 1
+
+
+def test_kiwoom_tr_replay_rate_limit_continues_retry_budget(monkeypatch) -> None:
+    import asyncio
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([_kiwoom_exp(), _kiwoom_429(), _kiwoom_429(), _kiwoom_ok()])
+    sleeps = _record_sleep(monkeypatch)
+
+    data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+
+    assert data["return_code"] == 0
+    assert len(session.requests_to("/api/dostk/chart")) == 4
+    assert sleeps == [1.2, 1.2]
+
+
+def test_kiwoom_tr_http_401_is_not_auth_rejection() -> None:
+    import asyncio
+
+    from tests.broker_fakes import FakeBrokerResponse
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([FakeBrokerResponse(body={"return_code": 1}, status=401)])
+
+    data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+
+    assert data == {"return_code": 1}
+    assert len(session.requests_to("/api/dostk/chart")) == 1
+    assert session.requests_to("/oauth2/token") == []
+
+
+def test_kiwoom_tr_acquires_before_every_send(monkeypatch) -> None:
+    import asyncio
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([_kiwoom_429(), _kiwoom_exp(), _kiwoom_ok()])
+    acquires = _count_acquires(monkeypatch)
+    _record_sleep(monkeypatch)
+
+    asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+
+    assert acquires["n"] == len(session.requests_to("/api/dostk/chart")) == 3
+
+
+def test_kiwoom_tr_transport_error_propagates(monkeypatch) -> None:
+    import asyncio
+
+    import aiohttp
+
+    from tests.broker_fakes import FakeBrokerResponse
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([FakeBrokerResponse(enter_error=aiohttp.ClientConnectionError("boom"))])
+    sleeps = _record_sleep(monkeypatch)
+
+    with pytest.raises(aiohttp.ClientConnectionError):
+        asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+
+    assert len(session.requests_to("/api/dostk/chart")) == 1
+    assert sleeps == []
+
+
+def test_kiwoom_tr_html_429_raises_content_type_error(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import Mock
+
+    import aiohttp
+
+    from tests.broker_fakes import FakeBrokerResponse
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session(
+        [FakeBrokerResponse(status=429, json_error=aiohttp.ContentTypeError(Mock(), (), message="no json"))]
+    )
+    sleeps = _record_sleep(monkeypatch)
+
+    with pytest.raises(aiohttp.ContentTypeError):
+        asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+
+    assert len(session.requests_to("/api/dostk/chart")) == 1
+    assert sleeps == []
+
+
+def test_kiwoom_tr_retry_settings_honored(monkeypatch) -> None:
+    import asyncio
+
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "KIWOOM_RATE_LIMIT_MAX_RETRIES", 2)
+    monkeypatch.setattr(settings_instance, "KIWOOM_RATE_LIMIT_BACKOFF_SECONDS", 0.5)
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([_kiwoom_429(), _kiwoom_429(), _kiwoom_429()])
+    sleeps = _record_sleep(monkeypatch)
+
+    asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+
+    assert len(session.requests_to("/api/dostk/chart")) == 2
+    assert sleeps == [0.5]
+
+
+def test_kiwoom_tr_explicit_max_retries_wins(monkeypatch) -> None:
+    import asyncio
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([_kiwoom_429(), _kiwoom_ok()])
+    sleeps = _record_sleep(monkeypatch)
+
+    data, _ = asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}, max_retries=1))
+
+    assert data["return_code"] == 5
+    assert len(session.requests_to("/api/dostk/chart")) == 1
+    assert sleeps == []
+
+
+def test_kiwoom_tr_zero_max_retries_rejected() -> None:
+    import asyncio
+
+    client = _kiwoom_seeded_client()
+    session = _kiwoom_tr_session([_kiwoom_ok()])
+
+    with pytest.raises(ValueError, match="max_attempts"):
+        asyncio.run(client._post_tr(session, "ka10079", "/api/dostk/chart", {}, max_retries=0))
+
+    assert session.requests == []
+
+
+def test_kiwoom_tr_concurrent_rejections_issue_once(monkeypatch) -> None:
+    import asyncio
+
+    from tests.broker_fakes import FakeBrokerSession
+
+    client = _kiwoom_seeded_client()
+    _count_acquires(monkeypatch)
+
+    def _respond(request):  # type: ignore[no-untyped-def]
+        from tests.broker_fakes import FakeBrokerResponse
+
+        if request.url.endswith("/oauth2/token"):
+            return FakeBrokerResponse(body=dict(_KIWOOM_TOKEN_BODY))
+        if request.headers.get("authorization") != "Bearer tok":
+            return _kiwoom_ok()
+        return FakeBrokerResponse(body=dict(_KIWOOM_EXP_BODY), enter_delay=0.01)
+
+    session = FakeBrokerSession(_respond)
+
+    async def _main():  # type: ignore[no-untyped-def]
+        return await asyncio.gather(
+            client._post_tr(session, "ka10079", "/api/dostk/chart", {}),
+            client._post_tr(session, "ka10079", "/api/dostk/chart", {}),
+        )
+
+    (data_a, _), (data_b, _) = asyncio.run(_main())
+
+    assert data_a["return_code"] == 0
+    assert data_b["return_code"] == 0
+    assert len(session.requests_to("/oauth2/token")) == 1
+    assert sorted(_tr_auths(session)) == ["Bearer tok", "Bearer tok", "Bearer tok-1", "Bearer tok-1"]
+
+
+def test_kiwoom_tr_refresh_never_sends_bearer_none(monkeypatch) -> None:
+    import asyncio
+
+    from tests.broker_fakes import FakeBrokerResponse, FakeBrokerSession
+
+    client = _kiwoom_seeded_client()
+    _count_acquires(monkeypatch)
+    issuance_started = asyncio.Event()
+    release_issuance = asyncio.Event()
+
+    def _respond(request):  # type: ignore[no-untyped-def]
+        if request.url.endswith("/oauth2/token"):
+            issuance_started.set()
+            return FakeBrokerResponse(body=dict(_KIWOOM_TOKEN_BODY), enter_gate=release_issuance)
+        auth = request.headers.get("authorization", "")
+        if auth == "Bearer tok":
+            return _kiwoom_exp()
+        return _kiwoom_ok()
+
+    session = FakeBrokerSession(_respond)
+
+    async def _main():  # type: ignore[no-untyped-def]
+        task_a = asyncio.create_task(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+        await issuance_started.wait()
+        task_b = asyncio.create_task(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+        for _ in range(1000):
+            if len([r for r in session.requests if r.url.endswith("/api/dostk/chart")]) >= 2:
+                break
+            await asyncio.sleep(0.001)
+        in_flight_auths = _tr_auths(session)
+        assert "Bearer None" not in in_flight_auths
+        assert in_flight_auths == ["Bearer tok", "Bearer tok"]
+        release_issuance.set()
+        return await asyncio.gather(task_a, task_b)
+
+    (data_a, _), (data_b, _) = asyncio.run(_main())
+
+    assert data_a["return_code"] == 0
+    assert data_b["return_code"] == 0
+    assert _tr_auths(session) == ["Bearer tok", "Bearer tok", "Bearer tok-1", "Bearer tok-1"]
+
+
+def test_kiwoom_tr_cancelled_refresh_keeps_previous_token() -> None:
+    import asyncio
+
+    from tests.broker_fakes import FakeBrokerResponse, FakeBrokerSession
+
+    client = _kiwoom_seeded_client()
+    issuance_started = asyncio.Event()
+    release_issuance = asyncio.Event()
+
+    def _respond(request):  # type: ignore[no-untyped-def]
+        if request.url.endswith("/oauth2/token"):
+            issuance_started.set()
+            return FakeBrokerResponse(body=dict(_KIWOOM_TOKEN_BODY), enter_gate=release_issuance)
+        return _kiwoom_exp()
+
+    session = FakeBrokerSession(_respond)
+
+    async def _main() -> None:
+        task = asyncio.create_task(client._post_tr(session, "ka10079", "/api/dostk/chart", {}))
+        await issuance_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_main())
+    assert client.token == "tok"
+
+
+def test_kiwoom_nxt_chart_methods_keep_positional_session_code_date_order() -> None:
+    client = _kiwoom_client()
+    seen: list[tuple[str, str, dict]] = []
+
+    async def fake_post_tr(session: Any, api_id: str, path: str, body: dict, cont_yn: str = "N", next_key: str = "") -> tuple[dict, dict]:
+        seen.append((api_id, path, body))
+        return ({"return_code": 0, "return_msg": "OK", "stk_min_pole_chart_qry": []}, {})
+
+    client._post_tr = fake_post_tr  # type: ignore[method-assign]
+    minute = asyncio.run(client.get_nxt_minute_chart(object(), "005930", "20260105"))
+    premarket = asyncio.run(client.get_nxt_premarket_chart(object(), "005930", "20260105"))
+    assert minute["rt_cd"] == "0"
+    assert premarket["rt_cd"] == "0"
+    assert len(seen) == 2
+    for api_id, _path, body in seen:
+        assert api_id == "ka10080"
+        assert body["stk_cd"] == "005930_NX"
+        assert body["base_dt"] == "20260105"
+
+
+def test_kiwoom_issued_token_repr_hides_token() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.api.kiwoom.client import KiwoomIssuedToken
+
+    text = repr(KiwoomIssuedToken(token="kw-SECRET-0003", expires_at=datetime(2026, 10, 5, 9, tzinfo=ZoneInfo("Asia/Seoul"))))
+    assert "kw-SECRET-0003" not in text

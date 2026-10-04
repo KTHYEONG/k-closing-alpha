@@ -112,6 +112,17 @@ def _isolate_kis_token_state(
     monkeypatch.delenv("COLLECTION_ALTDATA_EXTRA_SLOTS", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_alert_credential_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Keep alert redaction from reading the host's real BASE_DIR/.env credential file."""
+    from src.tools import alerts
+
+    missing = Path(tmp_path_factory.mktemp("alert_env")) / ".env"
+    monkeypatch.setattr(alerts, "alert_credential_env_file", lambda: missing)
+
+
 @pytest.fixture
 def mock_settings(tmp_path: Path) -> Settings:
     """임시 디렉토리를 가리키는 Settings 인스턴스를 반환합니다."""

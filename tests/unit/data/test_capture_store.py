@@ -307,6 +307,19 @@ def test_interrupted_staging_unpublished(tmp_path: Path, monkeypatch: Any) -> No
     assert list((tmp_path / "capture" / "manifests").rglob("*.json")) == []
 
 
+def test_publish_failure_leaves_no_stage_temp(tmp_path: Path, monkeypatch: Any) -> None:
+    """Publish failure leaves no stage temp anywhere under the capture root."""
+    store = CaptureStore(tmp_path / "capture")
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("rename interrupted")
+
+    monkeypatch.setattr(os, "replace", _boom)
+    with pytest.raises(OSError, match="rename interrupted"):
+        store.append_response(_response())
+    assert list((tmp_path / "capture").rglob("stage-*.tmp")) == []
+
+
 def test_no_other_project_dependency(tmp_path: Path) -> None:
     """No other-project dependency."""
     store = CaptureStore(tmp_path / "capture")

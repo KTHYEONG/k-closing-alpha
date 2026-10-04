@@ -9,10 +9,16 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import pandas as pd
 from aiohttp import ClientError
+
+if TYPE_CHECKING:
+    import aiohttp
+
+    from src.api.kis.client import KisApiClient
+    from src.api.kiwoom.client import KiwoomApiClient
 
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
@@ -56,7 +62,7 @@ _NONCERTIFIED = frozenset({CaptureStatus.PARTIAL, CaptureStatus.FAILED, CaptureS
 _ERROR_RE = re.compile(r"[^A-Za-z0-9_]+")
 
 
-def _canonical_kis_bars(rows: list[dict], snapshot_date: str, code: str) -> pd.DataFrame:
+def _canonical_kis_bars(rows: list[dict[str, Any]], snapshot_date: str, code: str) -> pd.DataFrame:
     vendor = "kis"
     try:
         return normalize_bar_frame(pd.DataFrame(rows), vendor, snapshot_date, code)
@@ -65,7 +71,7 @@ def _canonical_kis_bars(rows: list[dict], snapshot_date: str, code: str) -> pd.D
         return pd.DataFrame()
 
 
-def _canonical_kis_ticks(rows: list[dict], snapshot_date: str, code: str) -> pd.DataFrame:
+def _canonical_kis_ticks(rows: list[dict[str, Any]], snapshot_date: str, code: str) -> pd.DataFrame:
     vendor = "kis"
     prepared = [dict(r) for r in rows]
     if prepared and not any(k in prepared[0] for k in ("cnqn", "cntg_vol")) and "acml_vol" in prepared[0]:
@@ -311,10 +317,10 @@ def _event_key(row: Mapping[str, Any], vendor: str) -> tuple[str, str]:
 
 
 def _split_session_window(
-    rows: list[dict], ymd: str, floor: str, ceil: str, vendor: str
-) -> tuple[list[dict], list[dict]]:
-    regular: list[dict] = []
-    other: list[dict] = []
+    rows: list[dict[str, Any]], ymd: str, floor: str, ceil: str, vendor: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    regular: list[dict[str, Any]] = []
+    other: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -393,6 +399,7 @@ async def _call_with_transport_retry(
             if delay > 0:
                 await asyncio.sleep(delay)
             slot += 1
+    raise ValueError(f"Invalid COLLECTION_TRANSPORT_RETRIES: {profile.COLLECTION_TRANSPORT_RETRIES!r}")
 
 
 def _resume_budget(remaining: int | None, profile: CollectionSettings) -> ChartBudget:
@@ -766,7 +773,7 @@ async def _ls_bar_attempt(
     )
 
 
-def _safe_normalize_bars(vendor: str, rows: list[dict], snapshot_date: str, code: str) -> pd.DataFrame:
+def _safe_normalize_bars(vendor: str, rows: list[dict[str, Any]], snapshot_date: str, code: str) -> pd.DataFrame:
     try:
         return normalize_bar_frame(pd.DataFrame(rows), vendor, snapshot_date, code)
     except Exception as e:
@@ -774,7 +781,7 @@ def _safe_normalize_bars(vendor: str, rows: list[dict], snapshot_date: str, code
         return _empty_bar_frame(snapshot_date)
 
 
-def _safe_normalize_ticks(vendor: str, rows: list[dict], snapshot_date: str, code: str, truncated: bool) -> pd.DataFrame:
+def _safe_normalize_ticks(vendor: str, rows: list[dict[str, Any]], snapshot_date: str, code: str, truncated: bool) -> pd.DataFrame:
     try:
         return normalize_tick_frame(pd.DataFrame(rows), vendor, snapshot_date, code, truncated=truncated)
     except Exception as e:
@@ -927,7 +934,7 @@ async def _acquire_ticks_symbol(
     trading_day: date,
     ymd: str,
     ls_client: Any | None,
-    kiwoom_client: Any | None,
+    kiwoom_client: KiwoomApiClient | None,
     ls_max_pages: int,
     profile: CollectionSettings,
     store: CaptureStore,
@@ -1101,8 +1108,8 @@ async def _collect_with_observer(
 
 
 async def _collect_bars(
-    client,
-    session,
+    client: KisApiClient,
+    session: aiohttp.ClientSession,
     stock_codes: list[str],
     snapshot_date: str,
     bar_interval_minutes: int,
@@ -1381,7 +1388,7 @@ async def collect_intraday_trade_ticks(client: Any, session: Any, stock_codes: l
 
 
 async def collect_aftermarket_trade_ticks(
-    kiwoom_client: Any | None,
+    kiwoom_client: KiwoomApiClient | None,
     session: Any,
     stock_codes: list[str],
     snapshot_date: str,
@@ -1488,7 +1495,7 @@ async def collect_aftermarket_trade_ticks(
     )
 
 
-async def backfill_regular_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
+async def backfill_regular_bars(client: KisApiClient, session: aiohttp.ClientSession, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
     """특정 과거 날짜(snapshot_date, 'YYYY-MM-DD')의 정규세션 1분봉을 FHKST03010230으로 소급 수집."""
     return await _collect_bars(
         client, session, stock_codes, snapshot_date, bar_interval_minutes,
@@ -1497,7 +1504,7 @@ async def backfill_regular_bars(client, session, stock_codes: list[str], snapsho
     )
 
 
-async def backfill_nxt_aftermarket_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
+async def backfill_nxt_aftermarket_bars(client: KisApiClient, session: aiohttp.ClientSession, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
     """특정 과거 날짜의 NXT 애프터마켓 1분봉을 FHKST03010230으로 소급 수집.
 
     FHKST03010230이 애프터마켓 시간대(15:40-20:00)를 실제로 보관하는지는 실측 미검증
@@ -1560,7 +1567,7 @@ async def collect_krx_aftermarket_bars(client: Any, session: Any, stock_codes: l
     )
 
 
-async def backfill_krx_aftermarket_bars(client, session, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
+async def backfill_krx_aftermarket_bars(client: KisApiClient, session: aiohttp.ClientSession, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1) -> pd.DataFrame:
     """과거 날짜의 KRX 애프터마켓 1분봉을 historical=True(FHKST03010230)로 소급 수집한다."""
     if str(snapshot_date) < KRX_AFTERMARKET_START_DATE:
         return pd.DataFrame()

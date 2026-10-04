@@ -1,15 +1,13 @@
-"""Unit test for KisApiClient AsyncRateLimiter (SCENARIO_KIS_RATE_LIMITER_01)."""
+"""KisApiClient._handle_request retry and rate-limit slot behavior."""
 
 from __future__ import annotations
 
 import asyncio
-import time
 from unittest.mock import Mock
 
 import aiohttp
 
 from src.api.kis.client import KisApiClient
-from src.api.kis.rate_limit import AsyncRateLimiter
 
 
 class _FakeResponse:
@@ -36,22 +34,6 @@ def _client() -> KisApiClient:
         hts_id="test-hts",
         base_url="http://localhost",
     )
-
-
-def test_scenario_kis_rate_limiter_01() -> None:
-    """[SCENARIO_KIS_RATE_LIMITER_01] Verify rate limiter throttles calls correctly within max TPS limit."""
-    async def _runner() -> None:
-        limiter = AsyncRateLimiter(max_rate=5.0, time_period=1.0)
-        start_time = time.monotonic()
-
-        # 6개 요청 획득시 max_rate가 5이므로 6번째 요청은 최소 1초 후 처리되어야 함
-        for _ in range(6):
-            await limiter.acquire()
-
-        elapsed = time.monotonic() - start_time
-        assert elapsed >= 0.9, f"Elapsed time should be at least ~1.0s, got {elapsed:.3f}s"
-
-    asyncio.run(_runner())
 
 
 def _run_handle_request(session_method) -> dict:
@@ -100,26 +82,3 @@ def test_handle_request_retries_on_tps_message() -> None:
 
     assert result["rt_cd"] == "0"
     assert session_method.call_count == 2
-
-
-def test_get_shared_rate_limiter_returns_one_bucket_per_vendor_credential() -> None:
-    from src.api.kis.rate_limit import AsyncRateLimiter, get_shared_rate_limiter
-
-    # Given / When: 동일 (vendor, credential, rate, period)
-    a = get_shared_rate_limiter("kis", "APPKEY_A", 18.0)
-    b = get_shared_rate_limiter("kis", "APPKEY_A", 18.0)
-
-    # Then: 프로세스 전역 단일 인스턴스
-    assert a is b
-    assert isinstance(a, AsyncRateLimiter)
-    assert a.max_rate == 18.0
-
-    # And: 자격증명이 다르면 별도 버킷
-    assert get_shared_rate_limiter("kis", "APPKEY_B", 18.0) is not a
-    # And: 벤더가 다르면 별도 버킷
-    assert get_shared_rate_limiter("kiwoom", "APPKEY_A", 18.0) is not a
-    # And: TR별 버킷도 분리된다
-    kw1 = get_shared_rate_limiter("kiwoom", "K:ka10027", 5.0)
-    kw2 = get_shared_rate_limiter("kiwoom", "K:ka10080", 5.0)
-    assert kw1 is not kw2
-    assert kw1.max_rate == 5.0

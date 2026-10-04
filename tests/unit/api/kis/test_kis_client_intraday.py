@@ -154,3 +154,26 @@ def test_get_intraday_trade_ticks_stops_without_decrement_when_base_at_floor() -
     assert res["rt_cd"] == "0"
     assert res["output2"] == []
     assert handle_request.await_count == 1
+
+
+def test_get_intraday_trade_ticks_forwards_missing_session_get_unchanged() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    from src.api.kis.client import KisApiClient
+
+    class _NoGetSession:
+        pass
+
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+    handle_request = AsyncMock(return_value={"rt_cd": "1"})
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            return await client.get_intraday_trade_ticks(
+                _NoGetSession(), "005930", market_div_code="J"
+            )
+
+    result = asyncio.run(_runner())
+
+    assert result == {"rt_cd": "1"}
+    assert handle_request.await_args_list[0].args[0] is None

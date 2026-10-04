@@ -122,7 +122,7 @@ def simulate_take_profit_exit(
     if fill_probability >= 1.0:
         touch_fills = np.ones(entry.shape[0], dtype=bool)
     else:
-        touch_fills = np.random.default_rng(seed).random(entry.shape[0]) < fill_probability
+        touch_fills = np.asarray(np.random.default_rng(seed).random(entry.shape[0]) < fill_probability, dtype=bool)
     touch_fill = (~gap_fill) & (hi >= tp) & touch_fills
     limit_price = tp * (1.0 - float(fill_haircut))
     fallback_price = cl if fallback == "moc" else op

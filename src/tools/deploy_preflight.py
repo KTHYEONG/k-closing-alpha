@@ -7,10 +7,11 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
-from src.ml.topk_ranker_research import (
+from src.ml.topk_contract import (
     RANKER_FEATURE_COLS,
     TOPK_RANKER_BUNDLE_DIR,
     assert_bundle_screen_parity,
+    feature_contract_issue,
 )
 from src.serving.realtime.artifacts import load_model_bundle
 from src.strategy.contract import MIN_TOP_K
@@ -32,7 +33,8 @@ def check_bundle_serving_compat(bundle: Mapping[str, Any]) -> list[str]:
     Returns:
         Human-readable issues; empty when compatible. Checks: screen parity with
         COST_AWARE_UNIVERSE, feature_cols non-empty and a subset of
-        RANKER_FEATURE_COLS, and bundle top_k equal to MIN_TOP_K.
+        RANKER_FEATURE_COLS, feature-contract version equal to TOPK_FEATURE_CONTRACT_VERSION
+        (keyless = legacy baseline), and bundle top_k equal to MIN_TOP_K.
     """
     issues: list[str] = []
     try:
@@ -46,6 +48,9 @@ def check_bundle_serving_compat(bundle: Mapping[str, Any]) -> list[str]:
         unknown = [col for col in feature_cols if col not in RANKER_FEATURE_COLS]
         if unknown:
             issues.append(f"bundle feature_cols unknown to serving contract: {unknown}")
+    contract_issue = feature_contract_issue(bundle)
+    if contract_issue is not None:
+        issues.append(f"feature contract: {contract_issue}")
     if bundle.get("top_k") != MIN_TOP_K:
         issues.append(f"bundle top_k {bundle.get('top_k')!r} is not the certified MIN_TOP_K {MIN_TOP_K}")
     return issues
