@@ -173,7 +173,7 @@ def test_aggregate_decision_bars_ignores_non_trade_rows() -> None:
 
 
 def test_aggregate_decision_bars_unknown_vendor_fails_closed() -> None:
-    bars = pd.DataFrame([_bar("005930", 90000, 70000, 70100, 69900, 70050, 100, "toss")])
+    bars = pd.DataFrame([_bar("005930", 90000, 70000, 70100, 69900, 70050, 100, "dummy")])
     agg, exc = aggregate_decision_bars(bars, config=Pit1520PanelConfig())
     assert len(agg) == 0
     assert exc.iloc[0]["reason"] == "unknown_bar_stamp"
@@ -920,6 +920,108 @@ def test_main_rejects_empty_price_history(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("src.settings.HISTORY_DIR", str(tmp_path))
     with pytest.raises(ValueError, match="no dates"):
         main(["--out-dir", str(tmp_path / "out")])
+
+
+def _toss_bar(symbol, ts, o, h, l, c, vol):
+    return {
+        "symbol": symbol,
+        "ts_hms": ts,
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "volume": vol,
+        "value_krw": int(c * vol),
+        "has_trade": vol > 0,
+        "vendor": "toss",
+    }
+
+
+def test_aggregate_rebuilds_toss_trade_value_from_typical_price() -> None:
+    bars = pd.DataFrame([
+        {**_toss_bar("005930", 90100, 10000, 10300, 9700, 10000, 1000), "value_krw": 10_000_000},
+        {**_toss_bar("005930", 90200, 10000, 10100, 9900, 10200, 500), "value_krw": 5_100_000},
+    ])
+    agg, _exc = aggregate_decision_bars(bars, config=Pit1520PanelConfig())
+    expected = (1000 * (10300 + 9700 + 10000) / 3 + 500 * (10100 + 9900 + 10200) / 3) / 1e8
+    assert float(agg.iloc[0]["trade_value_100m"]) == pytest.approx(expected)
+
+
+def test_aggregate_toss_end_stamp_cutoff_keeps_152000() -> None:
+    bars = pd.DataFrame([
+        _toss_bar("005930", 90100, 10000, 10050, 9950, 10010, 100),
+        _toss_bar("005930", 152000, 10100, 10150, 10050, 10110, 150),
+        _toss_bar("005930", 152100, 10200, 10250, 10150, 10210, 200),
+        _toss_bar("005930", 153000, 10300, 10350, 10250, 10310, 300),
+    ])
+    agg, _exc = aggregate_decision_bars(bars, config=Pit1520PanelConfig())
+    assert len(agg) == 1
+    assert str(agg.iloc[0]["last_bar_hms"]) == "152000"
+    assert float(agg.iloc[0]["close"]) == 10110.0
+    assert float(agg.iloc[0]["volume"]) == 250.0
+
+
+def test_build_panel_accepts_toss_head_label() -> None:
+    ph = _two_day_history(t_open=10000.0, t_close=10020.0, t_prev=9800.0)
+    bars = pd.DataFrame([
+        _toss_bar("005930", 90100, 10000, 10050, 9990, 10010, 100),
+        _toss_bar("005930", 152000, 10000, 10030, 9990, 10020, 150),
+    ])
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: bars,
+        live_loader=lambda _d: None, screen=_screen(),
+    )
+    assert len(result.panel) == 1
+    assert str(result.panel.iloc[0]["bars_vendor"]) == "toss"
+
+
+def test_build_panel_vendor_ablation_drops_toss_with_reason() -> None:
+    ph = pd.DataFrame([
+        _ph_row("2026-09-17", "005930", open=9900, close=9900, prev_close=9700, mc=1000.0, inst=5.0, foreign=6.0),
+        _ph_row("2026-09-18", "005930", open=10050, close=10050, prev_close=9800),
+        _ph_row("2026-09-17", "000660", open=49900, close=49900, prev_close=48900, mc=1000.0, inst=5.0, foreign=6.0),
+        _ph_row("2026-09-18", "000660", open=50050, close=50050, prev_close=49000),
+    ])
+    bars = pd.DataFrame([
+        _bar("005930", 90000, 10050, 10100, 10000, 10050, 100, "kis"),
+        _bar("005930", 151900, 10050, 10100, 10000, 10050, 150, "kis"),
+        _toss_bar("000660", 90100, 50050, 50100, 50000, 50050, 100),
+        _toss_bar("000660", 152000, 50050, 50100, 50000, 50050, 150),
+    ])
+    plain = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: bars,
+        live_loader=lambda _d: None, screen=_screen(),
+    )
+    assert set(plain.panel["symbol"]) == {"005930", "000660"}
+    ablated = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: bars,
+        live_loader=lambda _d: None, screen=_screen(),
+        config=Pit1520PanelConfig(excluded_bar_vendors=frozenset({"toss"})),
+    )
+    assert set(ablated.panel["symbol"]) == {"005930"}
+    by_symbol = {r["symbol"]: r["reason"] for _, r in ablated.exclusions.iterrows()}
+    assert by_symbol["000660"] == "vendor_excluded"
+    pd.testing.assert_frame_equal(
+        plain.panel[plain.panel["symbol"] == "005930"].reset_index(drop=True),
+        ablated.panel.reset_index(drop=True),
+    )
+
+
+def test_default_config_rebuilds_toss_and_keeps_kis_value() -> None:
+    config = Pit1520PanelConfig()
+    assert config.value_reconstructed_vendors == frozenset({"ls", "toss"})
+    assert config.excluded_bar_vendors == frozenset()
+    kis = pd.DataFrame([
+        {**_bar("005930", 90000, 10000, 10100, 9900, 10000, 1000, "kis"), "value_krw": 10_123_456},
+    ])
+    agg, _exc = aggregate_decision_bars(kis, config=config)
+    assert float(agg.iloc[0]["trade_value_100m"]) == pytest.approx(10_123_456 / 1e8)
+    ls = pd.DataFrame([
+        {**_bar("005930", 90100, 10000, 10100, 9900, 10000, 1000, "ls"), "value_krw": 9_000_000},
+    ])
+    agg_ls, _exc_ls = aggregate_decision_bars(ls, config=config)
+    expected_ls = (1000 * (10100 + 9900 + 10000) / 3) / 1e8
+    assert float(agg_ls.iloc[0]["trade_value_100m"]) == pytest.approx(expected_ls)
 
 
 def test_default_panel_paths_under_history_dir(monkeypatch, tmp_path) -> None:

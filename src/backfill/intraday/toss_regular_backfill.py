@@ -59,7 +59,7 @@ TOSS_REGULAR_LEDGER_FILENAME: str = "toss_regular.parquet"
 _STOCK_NOT_FOUND_REASON: str = "toss_stock_not_found"
 _CACHED_NOT_FOUND_REASON: str = "toss_stock_not_found_cached"
 _CONSOLIDATED_REASON: str = "toss_consolidated_tape"
-_OUTAGE_REASON_PREFIXES: tuple[str, ...] = ("transport:", "vendor_failure:")
+_OUTAGE_REASON_PREFIXES: tuple[str, ...] = ("transport:", "vendor_failure:", "toss_empty_without_proof", "toss_malformed_page")
 _TOSS_RAW_BASIS: str = "toss_raw"
 _HEARTBEAT_EVERY_DATES: int = 25
 _CALLS_PER_SYMBOL_DAY: int = 2
@@ -218,6 +218,7 @@ async def run_toss_regular_backfill(
     windows = parse_blackout_windows(tuple(profile.COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS))
     concurrency = max(int(profile.COLLECTION_TOSS_BACKFILL_CONCURRENCY), 1)
     outage_share = float(profile.COLLECTION_TOSS_OUTAGE_FAILURE_SHARE)
+    outage_min_sample = int(profile.COLLECTION_TOSS_OUTAGE_MIN_SAMPLE)
     dead = _delisted_symbols(ledger)
     done = 0
     complete = 0
@@ -301,7 +302,7 @@ async def run_toss_regular_backfill(
                     frames[str(symbol)] = frame
                 if entry.reason == _STOCK_NOT_FOUND_REASON:
                     dead.add(str(symbol))
-            is_outage = bool(attempted) and (
+            is_outage = len(attempted) >= outage_min_sample and (
                 sum(1 for entry in attempted if _is_outage_failure(entry.reason)) / len(attempted)
             ) >= outage_share
             kept = (
@@ -405,8 +406,9 @@ async def run_toss_regular_backfill(
                 for entry in kept
                 if entry.status in (CaptureStatus.FAILED, CaptureStatus.UNKNOWN)
             )
-            done += 1
-            symbol_days_done += len(task.symbols)
+            if not is_outage:
+                done += 1
+                symbol_days_done += len(task.symbols)
             elapsed = (clock() - started).total_seconds()
             logger.info(
                 "[DATA] stage=toss_regular_backfill date=%s pending=%d complete=%d consolidated=%d not_listed=%d failed=%d elapsed_s=%.1f",
@@ -549,12 +551,28 @@ def _load_inputs(as_of: date) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     return wide_history, prepared, calendar
 
 
+def effective_floor(probed: str | None, usable_from: str) -> str | None:
+    """Combine the vendor retention floor with the first date whose volumes are trusted.
+
+    Args:
+        probed: Earliest date Toss still serves, or None when the probe found the vendor empty (unknown).
+        usable_from: ``COLLECTION_TOSS_USABLE_FROM_DATE``.
+
+    Returns:
+        The later of the two dates; None when the retention floor is unknown, so callers can fail closed.
+    """
+    if probed is None:
+        return None
+    return max(str(probed), str(usable_from))
+
+
 async def _probe_floor(
-    client: Any, session: Any, *, calendar: Sequence[str], reference_symbol: str
+    client: Any, session: Any, *, calendar: Sequence[str], reference_symbol: str, usable_from: str
 ) -> str | None:
-    return await probe_toss_retention_floor(
+    probed = await probe_toss_retention_floor(
         client, session, trading_days=list(calendar), reference_symbol=str(reference_symbol)
     )
+    return effective_floor(probed, usable_from)
 
 
 def _open_toss_client() -> Any:
@@ -609,6 +627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             floor = await _probe_floor(
                 client, session, calendar=calendar,
                 reference_symbol=profile.COLLECTION_TOSS_RETENTION_REFERENCE_SYMBOL,
+                usable_from=profile.COLLECTION_TOSS_USABLE_FROM_DATE,
             )
         plan, _volumes = _build_plan(
             as_of=as_of, retention_floor=floor, retention_days=retention_days,
@@ -629,7 +648,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             floor = await _probe_floor(
                 client, session, calendar=calendar,
                 reference_symbol=profile.COLLECTION_TOSS_RETENTION_REFERENCE_SYMBOL,
+                usable_from=profile.COLLECTION_TOSS_USABLE_FROM_DATE,
             )
+            if floor is None:
+                logger.error("[DATA] stage=toss_regular_backfill status=ABORT reason=retention_floor_unknown")
+                return 1
             plan, eod_volumes = _build_plan(
                 as_of=as_of, retention_floor=floor, retention_days=retention_days,
                 prepared_panel=prepared, wide_history=wide_history, profile=profile,

@@ -68,9 +68,9 @@ def test_krx_aftermarket_session_constants_are_disjoint_from_regular() -> None:
 
 
 def test_market_session_bar_stamp_convention_is_verified_and_immutable() -> None:
-    assert dict(market_session.INTRADAY_BAR_STAMP_CONVENTION) == {"kis": "start", "kiwoom": "start", "ls": "end"}
+    assert dict(market_session.INTRADAY_BAR_STAMP_CONVENTION) == {"kis": "start", "kiwoom": "start", "ls": "end", "toss": "end"}
     assert set(market_session.INTRADAY_BAR_STAMP_CONVENTION.values()) <= {"start", "end"}
-    assert "toss" not in market_session.INTRADAY_BAR_STAMP_CONVENTION
+    assert market_session.INTRADAY_BAR_STAMP_CONVENTION["toss"] == "end"
     with pytest.raises(TypeError):
         market_session.INTRADAY_BAR_STAMP_CONVENTION["toss"] = "start"  # type: ignore[index]
     with pytest.raises(TypeError):
