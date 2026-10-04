@@ -260,10 +260,18 @@ def test_aftermarket_sparse_times_reject_bad_spellings() -> None:
         CollectionSettings(COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES=("200000",), _env_file=None)
 
 
-def test_collection_settings_expose_no_toss_backfill_fields() -> None:
-    """Collection settings no longer expose Toss backfill fields."""
-    assert not [name for name in CollectionSettings.model_fields if name.startswith("COLLECTION_TOSS_")]
-    assert CollectionSettings(_env_file=None).COLLECTION_BACKFILL_SLOTS == ()
+def test_collection_settings_expose_toss_backfill_fields() -> None:
+    """Toss backfill fields are declared with the Part 2 defaults."""
+    profile = CollectionSettings(_env_file=None)
+    assert (
+        profile.COLLECTION_TOSS_BACKFILL_CONCURRENCY,
+        profile.COLLECTION_TOSS_BASIS_VOLUME_RATIO_MIN,
+        profile.COLLECTION_TOSS_BASIS_VOLUME_TOLERANCE,
+        profile.COLLECTION_TOSS_RETENTION_REFERENCE_SYMBOL,
+        profile.COLLECTION_TOSS_OUTAGE_FAILURE_SHARE,
+        profile.COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS,
+    ) == (8, 0.90, 1e-9, "005930", 0.5, ("0850-0940", "1510-1550"))
+    assert profile.COLLECTION_BACKFILL_SLOTS == ()
 
 
 def test_stale_toss_backfill_env_key_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:

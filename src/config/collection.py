@@ -10,6 +10,7 @@ from typing import Annotated, Any, Self
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import NoDecode
 
+from src.backfill.intraday.blackout import parse_blackout_windows
 from src.config._env import EnvSettings
 from src.config.market_session import NXT_AFTERMARKET_HOUR_CEIL, NXT_AFTERMARKET_HOUR_FLOOR, VERIFIED_CHART_ROUTES
 from src.data.capture_contracts import SessionClock
@@ -72,6 +73,13 @@ class CollectionSettings(EnvSettings):
         COLLECTION_TAPE_MAX_PAGES: Page guard for one tape walk (history backfill/sweep), default 12000. A walk cannot
             seek, so reaching the oldest tape day of a heavy symbol needs ~22 days x its daily pages; same-day repair keeps
             COLLECTION_TICK_REPAIR_MAX_PAGES.
+        COLLECTION_TOSS_BACKFILL_CONCURRENCY: In-flight Toss symbol-days per date, default 8.
+        COLLECTION_TOSS_BASIS_VOLUME_RATIO_MIN: Lower gate bound on cumulative/EOD volume, default 0.90.
+        COLLECTION_TOSS_BASIS_VOLUME_TOLERANCE: Upper gate slack above 1.0, default 1e-9.
+        COLLECTION_TOSS_RETENTION_REFERENCE_SYMBOL: Liquid symbol used by the retention-floor probe, default 005930.
+        COLLECTION_TOSS_OUTAGE_FAILURE_SHARE: Per-date share of transport/vendor failures treated as an outage, default 0.5.
+        COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS: HHMM-HHMM KST weekday windows in which no new date starts,
+            default 0850-0940 and 1510-1550.
 
     Raises:
         ValueError: Invalid limits, duplicate slots, or enabled auctions without
@@ -126,6 +134,14 @@ class CollectionSettings(EnvSettings):
     COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS: int = Field(default=15, gt=0)
     COLLECTION_TRANSPORT_RETRIES: int = Field(default=2, ge=0)
     COLLECTION_TRANSPORT_BACKOFF_SECONDS: float = Field(default=3.0, ge=0, allow_inf_nan=False)
+    COLLECTION_TOSS_BACKFILL_CONCURRENCY: int = Field(default=8, gt=0)
+    COLLECTION_TOSS_BASIS_VOLUME_RATIO_MIN: float = Field(default=0.90, gt=0, lt=1, allow_inf_nan=False)
+    COLLECTION_TOSS_BASIS_VOLUME_TOLERANCE: float = Field(default=1e-9, ge=0, allow_inf_nan=False)
+    COLLECTION_TOSS_RETENTION_REFERENCE_SYMBOL: str = Field(default="005930", min_length=1)
+    COLLECTION_TOSS_OUTAGE_FAILURE_SHARE: float = Field(default=0.5, gt=0, le=1, allow_inf_nan=False)
+    COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("0850-0940", "1510-1550")
+    )
 
     @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", "COLLECTION_BACKFILL_SLOTS", "COLLECTION_AFTERMARKET_BOOK_SLOTS", mode="before")
     @classmethod
@@ -166,6 +182,22 @@ class CollectionSettings(EnvSettings):
             if not (NXT_AFTERMARKET_HOUR_FLOOR <= item < NXT_AFTERMARKET_HOUR_CEIL):
                 raise ValueError("sparse times must lie inside the NXT aftermarket window")
             prev = item
+        return v
+
+    @field_validator("COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS", mode="before")
+    @classmethod
+    def _parse_blackout_env(cls, v: Any) -> Any:
+        """Accept the comma spelling shared by every env loader, like the slot lists."""
+        if not isinstance(v, str):
+            return v
+        text = v.strip()
+        items = json.loads(text) if text.startswith("[") else text.split(",")
+        return tuple(str(item).strip() for item in items if str(item).strip())
+
+    @field_validator("COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS", mode="after")
+    @classmethod
+    def _check_blackout_windows(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        parse_blackout_windows(v)
         return v
 
     @field_validator("COLLECTION_VERIFIED_CHART_ROUTES", mode="after")
