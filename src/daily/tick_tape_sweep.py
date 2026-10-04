@@ -12,12 +12,12 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from src.backfill.intraday import tape_recovery as tr
 from src.config import market_session as _session
 from src.config.collection import CollectionSettings
 from src.data.capture_contracts import SEOUL
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
-from src.tools import backfill_tick_tape as btt
 from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -112,7 +112,9 @@ def _write_report(root: Path, run_date: str, report: TapeSweepReport) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(payload, sort_keys=True, ensure_ascii=True), encoding="utf-8")
     except OSError as exc:
-        logger.warning("[DATA] stage=tape_sweep status=DEGRADED reason=report_write_failed error=%s", type(exc).__name__)
+        logger.warning(
+            "[DATA] stage=tape_sweep status=DEGRADED reason=report_write_failed error=%s", type(exc).__name__
+        )
 
 
 async def run_tick_tape_sweep(
@@ -123,7 +125,7 @@ async def run_tick_tape_sweep(
 ) -> TapeSweepReport:
     """Recover tick needs of the last `lookback_days` closed sessions from the Kiwoom tapes.
 
-    Needs are computed with the same selection as backfill_tick_tape (volume-gap, missing, truncated, out-of-window);
+    Needs are computed by `collect_tape_needs` (the same selection as the manual CLI);
     recovery uses the same walk/publisher modules; the report lists recovered, still-unresolved and expired
     (older than tape depth) symbol-days.
 
@@ -149,14 +151,18 @@ async def run_tick_tape_sweep(
     scan = _scan_days(today)
     root = _capture_root(resolved)
     store = CaptureStore(root)
-    ledger = btt._ledger_path(None, resolved)
+    ledger = tr.tape_ledger_path(None, resolved)
     venues: list[Literal["KRX", "NXT"]] = ["KRX", "NXT"]
-    found = btt._collect_needs(scan, venues, store, btt._read_settled(ledger), False)
+    found = tr.collect_tape_needs(scan, venues, store, tr.read_settled_ledger(ledger), False)
     window_set = set(window)
     active = [item for item in found if item.day in window_set]
     expired = sorted({_need_key(item.symbol, item.day, item.session) for item in found if item.day not in window_set})
     active_keys = sorted({_need_key(item.symbol, item.day, item.session) for item in active})
-    near_expiry = [item for item in active if (today - date.fromisoformat(item.day)).days >= _TAPE_DEPTH_DAYS - _EXPIRY_WARNING_DAYS]
+    near_expiry = [
+        item
+        for item in active
+        if (today - date.fromisoformat(item.day)).days >= _TAPE_DEPTH_DAYS - _EXPIRY_WARNING_DAYS
+    ]
     expiring = sorted({item.day for item in near_expiry})
     expiring_needs = len({(item.symbol, item.day) for item in near_expiry})
     if expiring:
@@ -168,28 +174,52 @@ async def run_tick_tape_sweep(
     if free < int(resolved.COLLECTION_TAPE_MIN_FREE_GIB) * 1024**3:
         logger.warning("[DATA] stage=tape_sweep status=DISK_GUARD free=%d", free)
         report = TapeSweepReport(
-            days_checked=tuple(window), needs=len(active_keys), recovered=(), unresolved=tuple(active_keys),
-            expired=tuple(expired), expiring=tuple(expiring), remaining=tuple(active_keys),
-            disk_guard=True, pages=0, rows=0, expiring_needs=expiring_needs,
+            days_checked=tuple(window),
+            needs=len(active_keys),
+            recovered=(),
+            unresolved=tuple(active_keys),
+            expired=tuple(expired),
+            expiring=tuple(expiring),
+            remaining=tuple(active_keys),
+            disk_guard=True,
+            pages=0,
+            rows=0,
+            expiring_needs=expiring_needs,
         )
         _write_report(root, today.isoformat(), report)
         return report
-    tasks = btt._order_tasks(active)
+    tasks = tr.order_walk_tasks(active)
     if not tasks:
         logger.info("[DATA] stage=tape_sweep status=NOOP needs=0")
         report = TapeSweepReport(
-            days_checked=tuple(window), needs=0, recovered=(), unresolved=(), expired=tuple(expired),
-            expiring=tuple(expiring), remaining=(), disk_guard=False, pages=0, rows=0, expiring_needs=expiring_needs,
+            days_checked=tuple(window),
+            needs=0,
+            recovered=(),
+            unresolved=(),
+            expired=tuple(expired),
+            expiring=tuple(expiring),
+            remaining=(),
+            disk_guard=False,
+            pages=0,
+            rows=0,
+            expiring_needs=expiring_needs,
         )
         _write_report(root, today.isoformat(), report)
         return report
 
-    async def _run() -> dict[str, Any]:
+    async def _run() -> tr.TapeRunSummary:
         client, session_ctx = _open_kiwoom()
         async with session_ctx as http_session:
-            return await btt._run_tasks(
-                tasks, client=client, http_session=http_session, store=store, profile=resolved,
-                apply=True, ledger=ledger, deadline=deadline, blackouts=[],
+            return await tr.run_walk_tasks(
+                tasks,
+                client=client,
+                http_session=http_session,
+                store=store,
+                profile=resolved,
+                apply=True,
+                ledger=ledger,
+                deadline=deadline,
+                blackouts=[],
                 run_date=today.isoformat(),
             )
 
@@ -197,25 +227,37 @@ async def run_tick_tape_sweep(
         summary = await _run()
     except OSError as exc:
         raise RuntimeError(f"Tape sweep infrastructure failed: {exc}") from exc
-    settled_now = btt._read_settled(ledger)
+    settled_now = tr.read_settled_ledger(ledger)
     recovered = sorted(
         {
             _need_key(item.symbol, item.day, item.session)
             for item in active
-            if settled_now.get((item.symbol, item.day, item.session)) in ("COMPLETE", "NO_TRADES")
+            if settled_now.get((item.symbol, item.day, item.session)) in tr.SETTLED_TAPE_STATUSES
         }
     )
     still_keys = sorted(set(active_keys) - set(recovered))
     logger.info(
         "[DATA] stage=tape_sweep_report needs=%d pages=%d rows=%d recovered=%d unresolved=%d expired=%d remaining=%s",
-        len(active_keys), summary["pages"], summary["rows"], len(recovered), len(still_keys),
-        len(expired), summary["remaining"],
+        len(active_keys),
+        summary.pages,
+        summary.rows,
+        len(recovered),
+        len(still_keys),
+        len(expired),
+        summary.remaining,
     )
     report = TapeSweepReport(
-        days_checked=tuple(window), needs=len(active_keys), recovered=tuple(recovered),
-        unresolved=tuple(still_keys), expired=tuple(expired), expiring=tuple(expiring),
-        remaining=tuple(summary["remaining"]), disk_guard=summary.get("stopped_reason") == "disk_guard",
-        pages=int(summary["pages"]), rows=int(summary["rows"]), expiring_needs=expiring_needs,
+        days_checked=tuple(window),
+        needs=len(active_keys),
+        recovered=tuple(recovered),
+        unresolved=tuple(still_keys),
+        expired=tuple(expired),
+        expiring=tuple(expiring),
+        remaining=tuple(summary.remaining),
+        disk_guard=summary.stopped_reason == "disk_guard",
+        pages=int(summary.pages),
+        rows=int(summary.rows),
+        expiring_needs=expiring_needs,
     )
     _write_report(root, today.isoformat(), report)
     return report
@@ -235,7 +277,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     profile = CollectionSettings()
     lookback = int(args.lookback_days) if args.lookback_days is not None else int(profile.COLLECTION_TAPE_LOOKBACK_DAYS)
-    deadline = btt._parse_deadline(args.deadline) if args.deadline else _default_deadline()
+    deadline = tr.parse_walk_deadline(args.deadline) if args.deadline else _default_deadline()
     asyncio.run(run_tick_tape_sweep(lookback_days=lookback, profile=profile, deadline=deadline))
 
 

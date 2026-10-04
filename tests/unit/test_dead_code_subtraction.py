@@ -136,7 +136,7 @@ def test_pyproject_drops_unused_dependencies() -> None:
     # was the sole runtime importer of pkg_resources; the build backend still gets its own
     # setuptools from an isolated build environment via [build-system], not this list.
     removed = {
-        "python-dotenv", "tenacity", "psutil", "tqdm", "openpyxl", "gspread",
+        "tenacity", "psutil", "tqdm", "openpyxl", "gspread",
         "oauth2client", "xgboost", "catboost", "huggingface-hub", "optuna",
         "pykrx", "setuptools",
     }
@@ -146,7 +146,7 @@ def test_pyproject_drops_unused_dependencies() -> None:
     assert any("setuptools" in r for r in data["build-system"]["requires"])
 
     # And: dependencies actually in use are still declared.
-    for kept in ("numpy", "pandas", "pyarrow", "scipy", "lightgbm", "scikit-learn", "joblib"):
+    for kept in ("numpy", "pandas", "pyarrow", "scipy", "lightgbm", "scikit-learn", "joblib", "python-dotenv"):
         assert kept in names, f"{kept} must remain declared"
 
 
@@ -180,6 +180,30 @@ def test_backfill_price_facade_symbol_is_fully_deleted() -> None:
     assert not Path("src/backfill/backfill_price.py").exists()
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("src.backfill.backfill_price")
+
+
+def test_toss_oneoff_backfill_is_deleted() -> None:
+    import importlib
+    from pathlib import Path
+
+    import pytest
+
+    assert not Path("src/backfill/intraday/backfill_minute_history_toss.py").exists()
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("src.backfill.intraday.backfill_minute_history_toss")
+    survivor = importlib.import_module("src.backfill.intraday.backfill_minute_history")
+    assert callable(survivor.enumerate_backfill_targets)
+
+
+def test_kis_websocket_client_is_deleted() -> None:
+    import importlib
+    from pathlib import Path
+
+    import pytest
+
+    assert not Path("src/api/kis/ws_client.py").exists()
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("src.api.kis.ws_client")
 
 
 def test_synthetic_output_digests_unchanged_after_subtraction() -> None:

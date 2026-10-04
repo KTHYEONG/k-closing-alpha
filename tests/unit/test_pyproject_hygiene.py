@@ -116,3 +116,32 @@ def test_strict_typing_stays_enabled_globally() -> None:
             assert not (set(override.get("module", [])) & forbidden), (
                 f"strict package re-ignored: {override.get('module', [])}"
             )
+
+
+def test_every_third_party_import_in_src_is_declared() -> None:
+    """Every absolute third-party import in src/ maps to a declared dependency."""
+    import ast
+    import sys
+    from importlib.metadata import packages_distributions
+
+    declared = {
+        d.split(">")[0].split("<")[0].split("=")[0].split("[")[0].strip().lower().replace("_", "-")
+        for d in _pyproject()["project"]["dependencies"]
+    }
+    top_levels: set[str] = set()
+    for path in sorted((_ROOT / "src").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                top_levels.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and (node.level or 0) == 0 and node.module:
+                top_levels.add(node.module.split(".")[0])
+    third_party = [n for n in sorted(top_levels) if not n.startswith("src") and n not in sys.stdlib_module_names]
+    distributions = packages_distributions()
+    undeclared = [
+        name
+        for name in third_party
+        if (mapped := distributions.get(name))
+        and not ({d.lower().replace("_", "-") for d in mapped} & declared)
+    ]
+    assert undeclared == [], f"src imports with no declared dependency: {undeclared}"

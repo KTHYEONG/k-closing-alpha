@@ -113,8 +113,6 @@ KRW_PER_100M: float = 1e8
 # run and should fail immediately instead of queueing behind it. See OD-1.
 PRICE_HISTORY_LOCK_TIMEOUT_SECONDS: float = 0.0
 _ADJUSTED_PRICE_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "prev_close")
-_INVESTOR_PATH = "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
-_PROGRAM_PATH = "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
 _TOSS_PROGRAM_AMOUNT_KEYS: tuple[str, ...] = ("netBuyAmount", "netBuyAmt", "netBuyValue", "netBuyTradeAmount")
 
 
@@ -782,10 +780,9 @@ async def fetch_symbol_flows(
         Tuple of (frame with date, symbol and FLOW_COLUMNS; investor source tag among
         "kis"/"kiwoom"/"none"; program source tag among "kis"/"toss"/"none").
     """
-    base = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol, "FID_INPUT_DATE_1": anchor_ymd}
     inv_body, prg_body = await asyncio.gather(
-        kis._handle_request(session.get, f"{kis.base_url}{_INVESTOR_PATH}", headers=kis._get_headers("FHPTJ04160001"), params={**base, "FID_ORG_ADJ_PRC": "", "FID_ETC_CLS_CODE": ""}),
-        kis._handle_request(session.get, f"{kis.base_url}{_PROGRAM_PATH}", headers=kis._get_headers("FHPPG04650201"), params=base),
+        kis.get_investor_trade_daily_page(session, symbol, anchor_ymd, market_div_code="J"),
+        kis.get_program_trade_daily_page(session, symbol, anchor_ymd, market_div_code="J"),
     )
     source = "kis"
     try:
@@ -793,7 +790,7 @@ async def fetch_symbol_flows(
     except VendorResponseError as exc:
         inv, source = pd.DataFrame(columns=["date", "inst_netbuy", "foreign_netbuy"]), "none"
         if kiwoom is not None:
-            data, _ = await kiwoom._post_tr(session, "ka10059", "/api/dostk/stkinfo", {"dt": anchor_ymd, "stk_cd": symbol, "amt_qty_tp": "1", "trde_tp": "0", "unit_tp": "1000"})
+            data = await kiwoom.get_investor_institution_daily(session, symbol, anchor_ymd)
             try:
                 inv, source = parse_kiwoom_investor_rows(data), "kiwoom"
             except VendorResponseError:
@@ -1177,10 +1174,24 @@ async def run_price_ingest(
 def main() -> None:
     configure_cli_logging()
     report = asyncio.run(run_price_ingest(on_outcome=functools.partial(record_run_outcome, "price_ingest")))
-    if report.ingested_dates:
-        from src.daily.security_classification import run_security_classification_ingest
+    from src.daily.security_classification import classification_gap_dates, run_security_classification_ingest
 
-        run_security_classification_ingest([pd.Timestamp(d) for d in report.ingested_dates])
+    fresh = sorted({pd.Timestamp(d).normalize() for d in report.ingested_dates})
+    if fresh:
+        run_security_classification_ingest(fresh)
+    # Gap healing is best-effort: a date KRX never serves (or a missing panel) must not fail every nightly ingest.
+    gaps: list[pd.Timestamp] = []
+    try:
+        if settings.PRICE_HISTORY_PARQUET_PATH.exists():
+            calendar = pd.read_parquet(settings.PRICE_HISTORY_PARQUET_PATH, columns=["date"])["date"].unique()
+            gaps = [d for d in classification_gap_dates(list(calendar)) if d not in set(fresh)]
+        if gaps:
+            run_security_classification_ingest(gaps)
+    except (RuntimeError, OSError, ValueError) as exc:
+        logger.warning(
+            "[DATA] stage=security_classification_gap_repair status=DEFERRED n_gaps=%d reason=%s",
+            len(gaps), type(exc).__name__,
+        )
     from src.strategy.growth_shadow import run_growth_shadow
 
     run_growth_shadow()

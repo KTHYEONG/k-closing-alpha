@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -12,6 +12,7 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 import aiohttp
+import numpy as np
 import pandas as pd
 
 from src import settings
@@ -40,7 +41,7 @@ from src.utils.numeric import safe_float
 from src.daily.universe_screen import build_screen_frame
 from src.daily.security_classification import load_security_classification
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, PRICE_ANOMALY_COL, QUOTE_FAILED_COL
-from src.strategy.contract import COST_AWARE_UNIVERSE, UniverseSpec, select_universe
+from src.strategy.contract import PRODUCTION_STRATEGY, SCREENABLE_CLASS_COL, UniverseSpec, select_universe
 
 from src.utils.cli_logging import configure_cli_logging
 
@@ -160,9 +161,9 @@ def parse_market_index_level(data: Mapping[str, Any] | None) -> float | None:
 
 
 def flag_cost_aware_admission(
-    df: pd.DataFrame, *, decision_date: pd.Timestamp, screen: UniverseSpec = COST_AWARE_UNIVERSE
+    df: pd.DataFrame, *, decision_date: pd.Timestamp, screen: UniverseSpec = PRODUCTION_STRATEGY.universe
 ) -> pd.DataFrame:
-    """Flag every row of the daily snapshot with the COST_AWARE_UNIVERSE verdict.
+    """Flag every row of the daily snapshot with the PRODUCTION_STRATEGY.universe verdict.
 
     Args:
         df: Enriched Korean-column snapshot frame.
@@ -208,7 +209,7 @@ DECISION_CALLS_PER_SYMBOL: int = 2
 # fetch_single_stock의 failed_apis 태그: 벤더가 rt_cd=0으로 응답했지만 종목코드를 해석하지 못한 경우
 QUOTE_UNRESOLVED_API: str = "현재가_미해석"
 
-_DECISION_ELIGIBILITY_RULE_VERSION: str = "price_history_panel@v1"
+_DECISION_ELIGIBILITY_RULE_VERSION: str = "price_history_panel_class@v2"
 
 
 def _validate_capture_context(
@@ -356,14 +357,83 @@ def load_eligible_codes(decision_date: pd.Timestamp, *, prev_trading_day: pd.Tim
     return frozenset(rows["symbol"].astype(str))
 
 
-async def resolve_eligible_codes(client: Any, session: Any, decision_date: pd.Timestamp) -> frozenset[str]:
-    """Resolve eligibility through the async KIS calendar before quoting."""
+@dataclass(frozen=True)
+class EligibilityResolution:
+    """Point-in-time eligibility inputs of one decision date.
+
+    Attributes:
+        prev_trading_day: KIS-resolved previous trading day (the as-of date of both sets).
+        listed: Symbols present in price_history on prev_trading_day.
+        screenable: Symbols with a screenable classification on prev_trading_day.
+        eligible: Symbols the cohort may quote.
+    """
+
+    prev_trading_day: pd.Timestamp
+    listed: frozenset[str]
+    screenable: frozenset[str]
+    eligible: frozenset[str]
+
+
+async def resolve_eligible_codes(
+    client: Any,
+    session: Any,
+    decision_date: pd.Timestamp,
+    *,
+    screen: UniverseSpec = PRODUCTION_STRATEGY.universe,
+) -> EligibilityResolution:
+    """Resolve eligibility through the async KIS calendar before quoting.
+
+    The security-class filter is applied here, before any quote is fetched, only because the
+    universe contract says so (screen.exclude_non_screenable_class); the same field makes
+    select_universe require the verdict in training and admission, so the rule has one
+    switch for every population.
+
+    Args:
+        client: KIS client for the trading calendar.
+        session: HTTP session.
+        decision_date: Decision date.
+        screen: Live selection screen whose class flag decides the cohort filter.
+
+    Returns:
+        EligibilityResolution with eligible = listed & screenable when the flag is set,
+        else listed.
+
+    Raises:
+        FileNotFoundError: When price_history or the classification panel is missing.
+        ValueError: When either panel has no rows on the previous trading day.
+    """
     prev = await resolve_prev_trading_day_kis(client, session, decision_date)
     listed = load_eligible_codes(decision_date, prev_trading_day=prev)
     screenable = load_security_classification(decision_date, prev_trading_day=prev)
-    eligible = listed & screenable
+    eligible = listed & screenable if screen.exclude_non_screenable_class else listed
     logger.info("[DATA] stage=eligibility n_listed=%d n_screenable=%d n_eligible=%d", len(listed), len(screenable), len(eligible))
-    return eligible
+    return EligibilityResolution(
+        prev_trading_day=pd.Timestamp(prev).normalize(),
+        listed=listed,
+        screenable=screenable,
+        eligible=eligible,
+    )
+
+
+def eligibility_rejections(scanned_codes: Sequence[str], eligibility: EligibilityResolution) -> dict[str, str]:
+    """Explain every scanned but ineligible code for the cohort record.
+
+    Args:
+        scanned_codes: Codes observed by the scan, in scan order.
+        eligibility: Resolution of the same decision date.
+
+    Returns:
+        {code: "not_listed_in_panel"} for codes absent from listed and
+        {code: "non_screenable_class"} for listed codes removed by the class filter.
+    """
+    rejections: dict[str, str] = {}
+    for code in scanned_codes:
+        if code not in eligibility.eligible:
+            if code not in eligibility.listed:
+                rejections[code] = "not_listed_in_panel"
+            else:
+                rejections[code] = "non_screenable_class"
+    return rejections
 
 
 def filter_eligible_candidates(stock_list: list[dict[str, Any]], eligible_codes: frozenset[str]) -> list[dict[str, Any]]:
@@ -514,6 +584,7 @@ async def assemble_decision_frame(
     load_market_breadth: Callable[[str], float],
     capture_ts: pd.Timestamp,
     completion_clock: Callable[[], datetime],
+    screenable_codes: frozenset[str] | None = None,
 ) -> AssembledDecision:
     """Build the point-in-time decision snapshot from per-symbol quote rows and market context.
 
@@ -534,6 +605,11 @@ async def assemble_decision_frame(
             may raise or return NaN on failure.
         capture_ts: Observation instant used for rows without their own snapshot_timestamp.
         completion_clock: Aware KST wall clock, read exactly once after all enrichment.
+        screenable_codes: Symbols screenable on the previous trading day
+            (EligibilityResolution.screenable). When given, every row receives
+            SCREENABLE_CLASS_COL = 종목코드 in screenable_codes before admission is flagged,
+            so the decision frame records the class verdict the admission screen reads.
+            None leaves the column absent (a class-filtered screen then fails closed).
 
     Returns:
         AssembledDecision for publication.
@@ -548,6 +624,9 @@ async def assemble_decision_frame(
         df["snapshot_timestamp"] = pd.to_datetime(df["snapshot_timestamp"]).fillna(capture_ts)
     else:
         df["snapshot_timestamp"] = capture_ts
+    if screenable_codes is not None:
+        codes = df["종목코드"].astype(str).to_numpy() if "종목코드" in df.columns else []
+        df[SCREENABLE_CLASS_COL] = np.asarray([c in screenable_codes for c in codes], dtype=bool)
     df = flag_cost_aware_admission(df, decision_date=pd.Timestamp(snapshot_date))
     index_failed = False
     if kospi_rate is None:
@@ -1157,9 +1236,10 @@ async def main(force: bool = False) -> None:
             logger.info(f"{Colors.YELLOW}⚠ 자동 스캔 후보가 없습니다.{Colors.RESET}")
             return
         scanned_codes = [str(row["code"]) for row in stock_list]
-        eligible_codes = await resolve_eligible_codes(client, session, pd.Timestamp(snapshot_date))
+        eligibility = await resolve_eligible_codes(client, session, pd.Timestamp(snapshot_date))
+        eligible_codes = eligibility.eligible
         eligible_in_scan = [c for c in scanned_codes if c in eligible_codes]
-        rejections = {c: "not_listed_in_panel" for c in scanned_codes if c not in eligible_codes}
+        rejections = eligibility_rejections(scanned_codes, eligibility)
         cohort = build_cohort(
             trading_day,
             scanned_codes,
@@ -1197,7 +1277,7 @@ async def main(force: bool = False) -> None:
             return datetime.now(ZoneInfo("Asia/Seoul"))
 
         assembled = await assemble_decision_frame(results, snapshot_date=snapshot_date, kospi_rate=kospi_rate, kosdaq_rate=kosdaq_rate,
-            kospi_level=kospi_level, fetch_vkospi=_fetch_vkospi, load_market_breadth=_load_breadth, capture_ts=capture_ts, completion_clock=_completion_clock)
+            kospi_level=kospi_level, fetch_vkospi=_fetch_vkospi, load_market_breadth=_load_breadth, capture_ts=capture_ts, completion_clock=_completion_clock, screenable_codes=eligibility.screenable)
         df = assembled.frame
         report = assembled.coverage
         status = assembled.status

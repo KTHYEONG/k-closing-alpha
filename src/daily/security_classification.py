@@ -18,6 +18,7 @@ from src.backfill.altdata.krx_api import (
 )
 from src.data.capture_contracts import PageObserver
 from src.data.parquet_codec import write_altdata_panel_parquet
+from src.data.screenable_class import SECURITY_CLASSIFICATION_PARQUET_FILENAME
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,6 @@ SECURITY_CLASSIFICATION_COLUMNS: tuple[str, ...] = (
     "section_type",
     "is_screenable",
 )
-SECURITY_CLASSIFICATION_PARQUET_FILENAME: str = "security_classification.parquet"
 
 _SCREEN_EXCLUDE_SUBSTRINGS: tuple[str, ...] = ("관리종목", "SPAC", "투자주의환기")
 
@@ -198,6 +198,44 @@ def run_security_classification_ingest(
         counters["n_non_common"],
     )
     return counters
+
+
+CLASSIFICATION_GAP_REPAIR_MAX_DATES: int = 20
+"""Upper bound of past trading dates re-fetched per nightly run to heal classification gaps (2 KRX calls each)."""
+
+
+def classification_gap_dates(
+    trading_dates: Sequence[pd.Timestamp],
+    *,
+    path: str | os.PathLike[str] | None = None,
+    limit: int = CLASSIFICATION_GAP_REPAIR_MAX_DATES,
+) -> list[pd.Timestamp]:
+    """Return price-confirmed trading dates missing from the classification panel inside its coverage.
+
+    Training resolves every row's class verdict from the previous trading day and fails closed on a gap
+    inside the coverage, so a single missed nightly fetch (KRX outage) would block every weekly retrain
+    until repaired by hand. The nightly ingest re-fetches these dates, oldest first, a bounded number per run.
+
+    Args:
+        trading_dates: Trading calendar (price_history dates).
+        path: Panel parquet path; None selects ALTDATA_DIR/security_classification.parquet.
+        limit: Maximum dates returned.
+
+    Returns:
+        Up to ``limit`` ascending dates in [coverage start, last trading date] absent from the panel; empty when
+        the panel does not exist yet (coverage has not started).
+    """
+    out_path = Path(path) if path is not None else Path(settings.ALTDATA_DIR) / SECURITY_CLASSIFICATION_PARQUET_FILENAME
+    if not out_path.exists() or int(limit) <= 0:
+        return []
+    covered = pd.to_datetime(pd.read_parquet(out_path, columns=["date"])["date"]).dt.normalize()
+    if covered.empty:
+        return []
+    start = covered.min()
+    present = set(covered.unique())
+    calendar = sorted({pd.Timestamp(d).normalize() for d in trading_dates})
+    gaps = [d for d in calendar if d >= start and d not in present]
+    return gaps[: int(limit)]
 
 
 def load_security_classification(

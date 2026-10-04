@@ -42,6 +42,7 @@ from src.tools.offsite_common import (
     sha256_file as _sha256_file,
 )
 from src.utils.cli_logging import configure_cli_logging
+from src.utils.file_lock import open_lock_descriptor
 
 logger = logging.getLogger(__name__)
 
@@ -675,15 +676,6 @@ class SealLockUnavailableError(SealLockHeldError):
     """The local seal lock file exists but this uid can open it neither read-write nor read-only."""
 
 
-def _open_lock_fd(lock_path: Path) -> int:
-    # flock needs only an open descriptor, not write access: a 0644 lock file left by another uid
-    # (e.g. a root-run manual job) is still lockable read-only, so it must not fail the run.
-    try:
-        return os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    except PermissionError:
-        return os.open(lock_path, os.O_RDONLY)
-
-
 @contextlib.contextmanager
 def _hold_seal_lock(capture_root: Path) -> Iterator[None]:
     """Hold the local seal lock for one seal or prune pass (single non-blocking attempt).
@@ -701,7 +693,7 @@ def _hold_seal_lock(capture_root: Path) -> Iterator[None]:
     lock_path = Path(capture_root) / "offsite" / ".seal.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = _open_lock_fd(lock_path)
+        fd = open_lock_descriptor(lock_path)
     except PermissionError as exc:
         raise SealLockUnavailableError(f"local seal lock is not accessible to this uid: {lock_path.name}") from exc
     try:

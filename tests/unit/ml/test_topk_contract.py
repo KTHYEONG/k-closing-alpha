@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 
-def test_legacy_reexport_identity() -> None:
+def test_removed_shim_names_are_gone() -> None:
     import src.ml.topk_contract as contract
     import src.ml.topk_history_features as history_features
     import src.ml.topk_ranker_research as research
@@ -22,17 +22,14 @@ def test_legacy_reexport_identity() -> None:
 
     for name in (
         "TOPK_RANKER_BUNDLE_DIR",
-        "RANKER_FEATURE_COLS",
         "assert_bundle_screen_parity",
-        "select_topk_by_score",
         "save_production_bundle",
         "score_topk_candidates",
         "select_topk_equal_weight",
-        "compute_derived_features",
     ):
-        assert getattr(research, name) is getattr(contract, name)
+        assert not hasattr(research, name), name
     for name in ("FEATURE_COLS", "compute_derived_features"):
-        assert getattr(v3_engine, name) is getattr(contract, name)
+        assert not hasattr(v3_engine, name), name
     for name in (
         "TOPK_COST_FEATURE_COLS",
         "TOPK_FLOW_FEATURE_COLS",
@@ -40,6 +37,19 @@ def test_legacy_reexport_identity() -> None:
         "TOPK_FEATURE_COLS_V2",
     ):
         assert getattr(history_features, name) is getattr(contract, name)
+
+
+def test_research_module_keeps_the_contract_bindings_it_uses() -> None:
+    import src.ml.topk_contract as contract
+    import src.ml.topk_ranker_research as research
+
+    for name in (
+        "RANKER_FEATURE_COLS",
+        "compute_derived_features",
+        "select_topk_by_score",
+        "build_topk_feature_manifest",
+    ):
+        assert getattr(research, name) is getattr(contract, name), name
 
 
 def test_contract_module_is_a_leaf() -> None:
@@ -110,8 +120,7 @@ class _QuantileStub:
 
 def test_selection_behavior_unchanged_through_new_path() -> None:
     import src.ml.topk_contract as contract
-    import src.ml.topk_ranker_research as research
-    from src.strategy.contract import COST_AWARE_UNIVERSE, MIN_TOP_K
+    from src.strategy.contract import MIN_TOP_K, PRODUCTION_STRATEGY
 
     rows = [
         {
@@ -133,12 +142,10 @@ def test_selection_behavior_unchanged_through_new_path() -> None:
             "pred_q90": _QuantileStub(1.0),
         },
         "calibrators": {"p_good": 0.7, "p_bad": 0.3},
-        "select_universe": dataclasses.asdict(COST_AWARE_UNIVERSE),
+        "select_universe": dataclasses.asdict(PRODUCTION_STRATEGY.universe),
         "feature_cols": ["f1", "f2"],
     }
     new_picks = contract.select_topk_equal_weight(frame, bundle, top_k=MIN_TOP_K)
-    legacy_picks = research.select_topk_equal_weight(frame, bundle, top_k=MIN_TOP_K)
-    pd.testing.assert_frame_equal(new_picks, legacy_picks)
     assert len(new_picks) == 2 * MIN_TOP_K
     for _date, group in new_picks.groupby("date", sort=False):
         assert len(group) == MIN_TOP_K
@@ -371,3 +378,117 @@ def test_legacy_acceptance_is_logged(caplog) -> None:
             is None
         )
     assert [r for r in caplog.records if "legacy_assumed" in r.getMessage()] == []
+
+
+def _parity_bundle(screen: dict, strategy_id: str | None = "KCA-TOPK-COSTAWARE-001") -> dict:
+    bundle: dict = {"select_universe": dict(screen)}
+    if strategy_id is not None:
+        bundle["strategy_id"] = strategy_id
+    return bundle
+
+
+def test_production_certified_bundle_passes_parity_silently(caplog) -> None:
+    import dataclasses
+    import logging
+
+    import src.ml.topk_contract as contract
+    from src.strategy.contract import PRODUCTION_STRATEGY
+
+    bundle = _parity_bundle(
+        dataclasses.asdict(PRODUCTION_STRATEGY.universe), "KCA-TOPK-COSTAWARE-002")
+    with caplog.at_level(logging.WARNING):
+        assert contract.assert_bundle_screen_parity(bundle) is None
+    assert [r for r in caplog.records if "GRANDFATHERED" in r.getMessage()] == []
+
+
+def test_live_001_bundle_is_grandfathered(caplog) -> None:
+    import dataclasses
+    import logging
+
+    import src.ml.topk_contract as contract
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    bundle = _parity_bundle(dataclasses.asdict(COST_AWARE_UNIVERSE))
+    with caplog.at_level(logging.WARNING):
+        assert contract.assert_bundle_screen_parity(bundle) is None
+    records = [r for r in caplog.records if "GRANDFATHERED" in r.getMessage()]
+    assert len(records) == 1
+    assert "status=GRANDFATHERED" in records[0].getMessage()
+
+
+def test_keyless_001_bundle_is_grandfathered() -> None:
+    import dataclasses
+
+    import src.ml.topk_contract as contract
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    screen = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    screen.pop("exclude_non_screenable_class")
+    assert contract.assert_bundle_screen_parity(_parity_bundle(screen)) is None
+
+
+def test_grandfather_is_scoped_to_strategy_id() -> None:
+    import dataclasses
+
+    import pytest
+
+    import src.ml.topk_contract as contract
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    screen = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    with pytest.raises(ValueError, match="exclude_non_screenable_class"):
+        contract.assert_bundle_screen_parity(_parity_bundle(screen, None))
+    with pytest.raises(ValueError, match="exclude_non_screenable_class"):
+        contract.assert_bundle_screen_parity(_parity_bundle(screen, "KCA-TOPK-CAPFREE-001"))
+
+
+def test_grandfather_never_hides_other_drift() -> None:
+    import dataclasses
+
+    import pytest
+
+    import src.ml.topk_contract as contract
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    screen = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    screen["max_tick_cost_bp"] = 7.5
+    with pytest.raises(ValueError, match=r"max_tick_cost_bp.*exclude_non_screenable_class"):
+        contract.assert_bundle_screen_parity(_parity_bundle(screen))
+
+
+def test_parity_rejects_reverse_class_direction() -> None:
+    import dataclasses
+
+    import pytest
+
+    import src.ml.topk_contract as contract
+    from src.strategy.contract import COST_AWARE_UNIVERSE, PRODUCTION_STRATEGY
+
+    bundle = _parity_bundle(dataclasses.asdict(PRODUCTION_STRATEGY.universe))
+    with pytest.raises(ValueError, match="exclude_non_screenable_class"):
+        contract.assert_bundle_screen_parity(bundle, spec=COST_AWARE_UNIVERSE)
+
+
+def test_certified_screen_normalizes_omissions_and_numerics() -> None:
+    import dataclasses
+
+    import src.ml.topk_contract as contract
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    joblib_style = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    joblib_style["min_trade_value_100m"] = 100
+    joblib_style["min_market_cap_100m"] = 500
+    del joblib_style["exclude_non_screenable_class"]
+    assert contract.certified_screen({"select_universe": joblib_style}) == contract.certified_screen(
+        {"select_universe": dataclasses.asdict(COST_AWARE_UNIVERSE)})
+
+
+def test_certified_screen_rejects_non_dict_and_unknown_fields() -> None:
+    import pytest
+
+    import src.ml.topk_contract as contract
+
+    with pytest.raises(ValueError, match="not certified"):
+        contract.certified_screen({})
+    with pytest.raises(ValueError, match="unknown to live screen"):
+        contract.certified_screen({"select_universe": {"future_field": True}})

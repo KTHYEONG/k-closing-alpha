@@ -77,6 +77,7 @@ def test_flag_cost_aware_admission_marks_rows_without_dropping() -> None:
         "거래대금": [500.0, 500.0, 500.0, 10.0, 500.0],
         "시가총액": [3000.0, 3000.0, 3000.0, 3000.0, 3000.0],
         "시장구분": ["KOSPI"] * 5,
+        "is_screenable": [True] * 5,
     })
 
     # When
@@ -1406,7 +1407,7 @@ def test_resolve_eligible_codes_passes_kis_resolved_prev_day_to_panel_lookup(mon
     out = asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
 
     # Then
-    assert out == frozenset({"005930"})
+    assert out.eligible == frozenset({"005930"})
     assert calls == [(pd.Timestamp("2026-09-14"), pd.Timestamp("2026-09-11"))]
 
 
@@ -1774,7 +1775,8 @@ def test_resolve_eligible_codes_returns_all_listed_codes_without_history_filter(
     out = asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
 
     # Then
-    assert out == frozenset({"005930", "138930", "0220W0"})
+    assert out.eligible == frozenset({"005930", "138930", "0220W0"})
+    assert out.listed == frozenset({"005930", "138930", "0220W0"})
 
 
 def test_legacy_universe_guard_symbols_are_fully_deleted() -> None:
@@ -2496,7 +2498,7 @@ def _healthy_wide_row(code="005930", quote_failed=False):
     }
 
 
-def _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, eligible, *, with_snapshot=False, call_observer=False, index_rate=None, history_payload=None, history_calls=None):
+def _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, eligible, *, with_snapshot=False, call_observer=False, index_rate=None, history_payload=None, history_calls=None, listed=None, screenable=None):
     import asyncio
     from datetime import datetime
     from unittest.mock import AsyncMock
@@ -2564,7 +2566,16 @@ def _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, eligible, *, with
     monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(collect, "resolve_daily_candidates", _fake_scan)
-    monkeypatch.setattr(collect, "resolve_eligible_codes", AsyncMock(return_value=eligible))
+    import pandas as _pd
+
+    _codes = frozenset(eligible)
+    _listed = frozenset(eligible) if listed is None else frozenset(listed)
+    _screen = frozenset(eligible) if screenable is None else frozenset(screenable)
+    monkeypatch.setattr(
+        collect, "resolve_eligible_codes",
+        AsyncMock(return_value=collect.EligibilityResolution(
+            prev_trading_day=_pd.Timestamp("2026-09-11"),
+            listed=_listed, screenable=_screen, eligible=_listed & _screen)))
     monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _fake_sharded)
     monkeypatch.setattr(collect, "persist_daily_snapshot", lambda df, snapshot_date=None: len(df))
     monkeypatch.setattr(collect, "_capture_root", lambda: tmp_path / "capture")
@@ -2795,7 +2806,9 @@ def test_resolve_eligible_codes_narrows_to_screenable_subset(monkeypatch) -> Non
         collect, "load_security_classification", lambda decision_date, *, prev_trading_day, path=None: frozenset({"A", "C"})
     )
     out = asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
-    assert out == frozenset({"A", "C"})
+    assert out.eligible == frozenset({"A", "C"})
+    assert out.listed == frozenset({"A", "B", "C"})
+    assert out.screenable == frozenset({"A", "C"})
 
 
 def test_resolve_eligible_codes_fails_on_classification_coverage_gap(monkeypatch) -> None:
@@ -2953,7 +2966,9 @@ def _run_main_with_quote_failures(monkeypatch, tmp_path, n_degraded: int):
     monkeypatch.setattr(collect, "_validate_trading_day", AsyncMock(return_value=None))
     monkeypatch.setattr(collect, "resolve_daily_candidates", AsyncMock(return_value=list(stock_list)))
     monkeypatch.setattr(
-        collect, "resolve_eligible_codes", AsyncMock(return_value=frozenset(codes))
+        collect, "resolve_eligible_codes", AsyncMock(return_value=collect.EligibilityResolution(
+            prev_trading_day=pd.Timestamp("2026-09-11"),
+            listed=frozenset(codes), screenable=frozenset(codes), eligible=frozenset(codes)))
     )
 
     async def _fake_fetch(stock_list_arg, *a, **k):
@@ -3293,6 +3308,7 @@ def _assemble_kwargs(**overrides):
         "load_market_breadth": lambda _d: 0.42,
         "capture_ts": pd.Timestamp("2026-09-14 15:20:03", tz="Asia/Seoul"),
         "completion_clock": lambda: datetime(2026, 9, 14, 15, 21, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+        "screenable_codes": frozenset({"005930", "000660"}),
     }
     params.update(overrides)
     return params
@@ -3584,7 +3600,11 @@ def test_collect_main_reads_run_clock_once(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(collect, "resolve_daily_candidates", _fake_scan)
-    monkeypatch.setattr(collect, "resolve_eligible_codes", AsyncMock(return_value=frozenset({"005930", "000660"})))
+    monkeypatch.setattr(collect, "resolve_eligible_codes", AsyncMock(return_value=collect.EligibilityResolution(
+        prev_trading_day=pd.Timestamp("2026-09-11"),
+        listed=frozenset({"005930", "000660"}),
+        screenable=frozenset({"005930", "000660"}),
+        eligible=frozenset({"005930", "000660"}))))
     monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _fake_sharded)
     monkeypatch.setattr(collect, "persist_daily_snapshot", lambda df, snapshot_date=None: len(df))
     monkeypatch.setattr(collect, "_capture_root", lambda: tmp_path / "capture")
@@ -3680,7 +3700,11 @@ def test_collect_main_computes_market_breadth_from_panel(tmp_path, monkeypatch) 
     monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(collect, "resolve_daily_candidates", _fake_scan)
-    monkeypatch.setattr(collect, "resolve_eligible_codes", AsyncMock(return_value=frozenset({"005930", "000660"})))
+    monkeypatch.setattr(collect, "resolve_eligible_codes", AsyncMock(return_value=collect.EligibilityResolution(
+        prev_trading_day=pd.Timestamp("2026-09-11"),
+        listed=frozenset({"005930", "000660"}),
+        screenable=frozenset({"005930", "000660"}),
+        eligible=frozenset({"005930", "000660"}))))
     monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _fake_sharded)
     monkeypatch.setattr(collect, "persist_daily_snapshot", lambda df, snapshot_date=None: len(df))
     monkeypatch.setattr(collect, "_capture_root", lambda: tmp_path / "capture")
@@ -3718,3 +3742,150 @@ def test_parse_market_index_rate_fallback_chain() -> None:
     ) == 10.0
     assert parse_market_index_rate({"rt_cd": "1"}) is None
     assert parse_market_index_rate(None) is None
+
+
+def test_assemble_decision_frame_records_class_verdict() -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import collect
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    rows = [_healthy_wide_row("005930"), _healthy_wide_row("005935")]
+    flagged = asyncio.run(collect.assemble_decision_frame(rows, **_assemble_kwargs()))
+    assert flagged.frame["is_screenable"].tolist() == [True, False]
+    assert flagged.frame["admitted"].tolist() == [True, False]
+
+    cohort = [_healthy_wide_row("005930"), _healthy_wide_row("000660")]
+    prod = asyncio.run(collect.assemble_decision_frame(cohort, **_assemble_kwargs()))
+    assert prod.frame["is_screenable"].tolist() == [True, True]
+    legacy_admitted = collect.flag_cost_aware_admission(
+        prod.frame, decision_date=pd.Timestamp("2026-09-14"), screen=COST_AWARE_UNIVERSE)["admitted"]
+    assert prod.frame["admitted"].tolist() == legacy_admitted.tolist()
+
+
+def test_assemble_decision_frame_verdict_absent_without_screenable_codes() -> None:
+    import asyncio
+
+    import pytest
+
+    from src.daily import collect
+
+    # Without screenable codes the verdict column stays absent and the production
+    # admission screen fails closed on the missing verdict.
+    with pytest.raises(ValueError, match="is_screenable"):
+        asyncio.run(
+            collect.assemble_decision_frame(
+                [_healthy_wide_row("005930")], **_assemble_kwargs(screenable_codes=None)))
+
+
+def test_collect_main_wires_screenable_set(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+
+    import pandas as pd
+
+    codes = {"005930", "000660"}
+    rows = [_healthy_wide_row("005930"), _healthy_wide_row("000660")]
+    scanned = [
+        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+    ]
+    _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, frozenset(codes), with_snapshot=True)
+    stored = list(Path(tmp_path / "capture" / "decision").rglob("input.parquet"))
+    assert stored != []
+    frame = pd.read_parquet(stored[0])
+    assert frame["is_screenable"].tolist() == [True, True]
+
+
+def _mock_eligibility_panels(monkeypatch, *, listed, screenable) -> None:
+    from src.daily import collect
+
+    async def _kis(_client, _session, _date):
+        return True
+
+    _shared = _kis
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared)
+    monkeypatch.setattr(
+        collect, "load_eligible_codes",
+        lambda decision_date, *, prev_trading_day, path=None: frozenset(listed))
+    monkeypatch.setattr(
+        collect, "load_security_classification",
+        lambda decision_date, *, prev_trading_day, path=None: frozenset(screenable))
+
+
+def test_resolve_eligible_codes_class_flag_drives_cohort(monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import collect
+    from src.strategy.contract import COST_AWARE_SCREENABLE_UNIVERSE, COST_AWARE_UNIVERSE
+
+    _mock_eligibility_panels(monkeypatch, listed={"A", "B", "C"}, screenable={"A", "C", "D"})
+    filtered = asyncio.run(collect.resolve_eligible_codes(
+        object(), object(), pd.Timestamp("2026-09-14"), screen=COST_AWARE_SCREENABLE_UNIVERSE))
+    assert filtered.eligible == frozenset({"A", "C"})
+    assert filtered.screenable == frozenset({"A", "C", "D"})
+    unfiltered = asyncio.run(collect.resolve_eligible_codes(
+        object(), object(), pd.Timestamp("2026-09-14"), screen=COST_AWARE_UNIVERSE))
+    assert unfiltered.eligible == frozenset({"A", "B", "C"})
+    assert unfiltered.screenable == frozenset({"A", "C", "D"})
+
+
+def test_resolve_eligible_codes_production_default_keeps_cohort(monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    _mock_eligibility_panels(monkeypatch, listed={"A", "B", "C"}, screenable={"A", "C", "D"})
+    out = asyncio.run(collect.resolve_eligible_codes(object(), object(), pd.Timestamp("2026-09-14")))
+    assert out.eligible == frozenset({"A", "C"})
+
+
+def test_eligibility_rejections_explain_the_class_filter() -> None:
+    import pandas as pd
+
+    from src.daily.collect import EligibilityResolution, eligibility_rejections
+
+    eligibility = EligibilityResolution(
+        prev_trading_day=pd.Timestamp("2026-09-11"),
+        listed=frozenset({"A", "B"}),
+        screenable=frozenset({"A"}),
+        eligible=frozenset({"A"}),
+    )
+    assert eligibility_rejections(["A", "B", "E"], eligibility) == {
+        "B": "non_screenable_class", "E": "not_listed_in_panel"}
+
+
+def test_collect_main_records_rule_v2_and_class_rejections(tmp_path, monkeypatch) -> None:
+    from datetime import datetime
+    from pathlib import Path
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+
+    rows = [_healthy_wide_row("005930")]
+    scanned = [
+        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+        {"code": "000001", "name": "Z", "price": "18000", "chgrate": "5.0"},
+    ]
+    _run_main_with_mocks(
+        monkeypatch, tmp_path, rows, scanned, frozenset({"005930"}),
+        with_snapshot=True, listed={"005930", "000660"}, screenable={"005930"})
+    assert collect._DECISION_ELIGIBILITY_RULE_VERSION == "price_history_panel_class@v2"
+    store = CaptureStore(tmp_path / "capture")
+    cohort = store.read_cohort(
+        "2026-09-14", available_by=datetime(2026, 9, 15, tzinfo=ZoneInfo("Asia/Seoul")))
+    assert cohort.eligibility_rule_version == "price_history_panel_class@v2"
+    assert cohort.rejections == {"000660": "non_screenable_class", "000001": "not_listed_in_panel"}
+    stored = list(Path(tmp_path / "capture" / "decision").rglob("input.parquet"))
+    frame = pd.read_parquet(stored[0])
+    assert frame["is_screenable"].tolist() == [True]

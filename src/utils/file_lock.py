@@ -32,9 +32,22 @@ def sidecar_lock_path(target: Path) -> Path:
     return target.parent / (target.name + ".lock")
 
 
-def _open_sidecar(path: Path) -> int:
-    # flock needs only an open descriptor: a 0644 sidecar left by another uid (a crashed root-run
-    # manual job) stays lockable read-only, and unlinking it needs directory, not file, permission.
+def open_lock_descriptor(path: Path) -> int:
+    """Open a descriptor suitable for ``flock`` on ``path``, creating the file 0644 when absent.
+
+    flock needs only an open descriptor, not write access: a 0644 lock file left by another uid (a crashed root-run
+    manual job) stays lockable through a read-only descriptor, so it must not fail the caller.
+
+    Args:
+        path: Lock file; its parent directory must exist.
+
+    Returns:
+        An open file descriptor owned by the caller, who must close it.
+
+    Raises:
+        PermissionError: The file can be opened neither read-write nor read-only by this uid.
+        OSError: Any other ``open`` failure.
+    """
     try:
         return os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     except PermissionError:
@@ -87,7 +100,7 @@ def exclusive_file_lock(path: Path, *, timeout_seconds: float, purpose: str) -> 
     deadline = time.monotonic() + timeout_seconds
     while True:
         try:
-            fd = _open_sidecar(path)
+            fd = open_lock_descriptor(path)
         except PermissionError:
             # Neither writable nor readable by this uid (a foreign 0600 leftover or live holder):
             # exclusion cannot be proven, so wait like contention and fail closed at the deadline.

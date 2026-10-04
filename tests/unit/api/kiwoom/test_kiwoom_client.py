@@ -1914,3 +1914,53 @@ def test_kiwoom_issued_token_repr_hides_token() -> None:
 
     text = repr(KiwoomIssuedToken(token="kw-SECRET-0003", expires_at=datetime(2026, 10, 5, 9, tzinfo=ZoneInfo("Asia/Seoul"))))
     assert "kw-SECRET-0003" not in text
+
+
+def test_ka10059_request_identity() -> None:
+    client = _kiwoom_client()
+    seen: list[dict] = []
+    body = {"return_code": 0, "stk_invsr_orgn": []}
+    headers = {"cont-yn": "N"}
+
+    async def fake_post_tr(session, api_id, path, req_body, cont_yn="N", next_key="", max_retries=None):
+        seen.append({"api_id": api_id, "path": path, "body": req_body, "cont_yn": cont_yn, "next_key": next_key, "max_retries": max_retries})
+        return (body, headers)
+
+    client._post_tr = fake_post_tr  # type: ignore[method-assign]
+    out = asyncio.run(client.get_investor_institution_daily(object(), "005930", "20260910"))
+    assert len(seen) == 1
+    assert seen[0]["api_id"] == "ka10059"
+    assert seen[0]["path"] == "/api/dostk/stkinfo"
+    assert list(seen[0]["body"].items()) == [
+        ("dt", "20260910"),
+        ("stk_cd", "005930"),
+        ("amt_qty_tp", "1"),
+        ("trde_tp", "0"),
+        ("unit_tp", "1000"),
+    ]
+    assert seen[0]["cont_yn"] == "N" and seen[0]["next_key"] == "" and seen[0]["max_retries"] is None
+    assert out is body
+
+
+def test_ka10059_return_code_passthrough() -> None:
+    client = _kiwoom_client()
+    body = {"return_code": 1, "return_msg": "x"}
+
+    async def fake_post_tr(session, api_id, path, req_body, cont_yn="N", next_key="", max_retries=None):
+        return (body, {})
+
+    client._post_tr = fake_post_tr  # type: ignore[method-assign]
+    assert asyncio.run(client.get_investor_institution_daily(object(), "005930", "20260910")) is body
+
+
+def test_ka10059_exception_passthrough() -> None:
+    import aiohttp
+
+    client = _kiwoom_client()
+
+    async def fake_post_tr(session, api_id, path, req_body, cont_yn="N", next_key="", max_retries=None):
+        raise aiohttp.ClientError("down")
+
+    client._post_tr = fake_post_tr  # type: ignore[method-assign]
+    with pytest.raises(aiohttp.ClientError):
+        asyncio.run(client.get_investor_institution_daily(object(), "005930", "20260910"))

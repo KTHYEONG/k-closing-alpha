@@ -18,7 +18,6 @@ def test_v3_engine_survivors_remain_and_dead_pipelines_are_gone() -> None:
         "load_and_prepare_price_history",
         "build_candidate_universe",
         "attach_forward_exit_paths",
-        "compute_derived_features",
     ):
         assert callable(getattr(v3_engine, alive)), f"v3_engine.{alive} must remain"
 
@@ -28,7 +27,8 @@ def test_compute_derived_features_and_costs_use_close_raw() -> None:
     import pandas as pd
     import pytest
 
-    from src.ml.research.v3_engine import attach_forward_exit_paths, compute_derived_features
+    from src.ml.research.v3_engine import attach_forward_exit_paths
+    from src.ml.topk_contract import compute_derived_features
     from src.strategy.contract import AA_COST, round_trip_cost_bp
 
     d0, d1 = pd.Timestamp("2018-04-27"), pd.Timestamp("2018-04-30")

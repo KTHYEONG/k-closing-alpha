@@ -14,9 +14,9 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
+import src.backfill.intraday.tape_recovery as tr
 import src.tools.backfill_tick_tape as btt
-from src.backfill.intraday.tape_harvest import TapeDayResult
-from src.backfill.intraday.tape_harvest import TapeWalkOutcome
+from src.backfill.intraday.tape_harvest import TAPE_SESSIONS, TapeDayResult, TapeWalkOutcome
 from src.config.collection import CollectionSettings
 from src.data.capture_contracts import (
     ArtifactRef,
@@ -38,9 +38,9 @@ _PRODUCTION_BLACKOUTS = btt._DEFAULT_BLACKOUTS
 
 @pytest.fixture(autouse=True)
 def _isolated_environment(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(btt, "_price_history_path", lambda: tmp_path / "price_history.parquet")
+    monkeypatch.setattr(tr, "_price_history_path", lambda: tmp_path / "price_history.parquet")
     monkeypatch.setattr(btt, "_DEFAULT_BLACKOUTS", ())
-    monkeypatch.setattr(btt, "_history_archive_path", lambda: tmp_path / "archive.parquet")
+    monkeypatch.setattr(tr, "_history_archive_path", lambda: tmp_path / "archive.parquet")
 
 
 def _profile(tmp_path) -> CollectionSettings:
@@ -52,7 +52,9 @@ def _patch_roots(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(_settings, "HISTORY_DIR", tmp_path, raising=False)
     monkeypatch.setattr(btt, "_capture_root", lambda profile: tmp_path / "capture")
+    monkeypatch.setattr(tr, "_capture_root", lambda profile: tmp_path / "capture")
     monkeypatch.setattr(btt, "_free_bytes", lambda path: 100 * 1024**3)
+    monkeypatch.setattr(tr, "_free_bytes", lambda path: 100 * 1024**3)
 
 
 def _tick_rows(hms_list: list[str], qty: str = "100", day: str = _YMD) -> list[dict]:
@@ -62,8 +64,12 @@ def _tick_rows(hms_list: list[str], qty: str = "100", day: str = _YMD) -> list[d
 def _bar_rows(hms_list: list[str], qty: str = "100", day: str = _YMD) -> list[dict]:
     return [
         {
-            "cntr_tm": f"{day}{hms}", "cur_prc": "10000", "open_pric": "9900",
-            "high_pric": "10100", "low_pric": "9800", "trde_qty": qty,
+            "cntr_tm": f"{day}{hms}",
+            "cur_prc": "10000",
+            "open_pric": "9900",
+            "high_pric": "10100",
+            "low_pric": "9800",
+            "trde_qty": qty,
         }
         for hms in hms_list
     ]
@@ -71,9 +77,16 @@ def _bar_rows(hms_list: list[str], qty: str = "100", day: str = _YMD) -> list[di
 
 def _complete_entry(symbol: str, session: str, rows: int) -> CoverageEntry:
     return CoverageEntry(
-        symbol=symbol, dataset=CaptureDataset.TRADE_TICKS, venue="KRX", session=session,
-        scheduled_at=None, status=CaptureStatus.COMPLETE, rows=rows,
-        first_event_time=None, last_event_time=None, reason="seeded",
+        symbol=symbol,
+        dataset=CaptureDataset.TRADE_TICKS,
+        venue="KRX",
+        session=session,
+        scheduled_at=None,
+        status=CaptureStatus.COMPLETE,
+        rows=rows,
+        first_event_time=None,
+        last_event_time=None,
+        reason="seeded",
         raw_refs=(ArtifactRef(path="raw/seed", sha256="abc", bytes=1),),
     )
 
@@ -123,10 +136,12 @@ def _fake_harvest_factory(calls: list[dict[str, Any]], outcome: Any = None, emit
 def test_needs_exclude_healthy_symbol_days(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
-    monkeypatch.setattr(btt, "_day_universe", lambda day, store: ["005930", "000660"])
-    _seed_tick_day(_DAY, "regular", "005930", _tick_rows(["090000", "090100"], "100"), _bar_rows(["090000", "090100"], "100"))
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930", "000660"])
+    _seed_tick_day(
+        _DAY, "regular", "005930", _tick_rows(["090000", "090100"], "100"), _bar_rows(["090000", "090100"], "100")
+    )
     _seed_tick_day(_DAY, "regular", "000660", _tick_rows(["090000"], "10"), _bar_rows(["090000", "090100"], "1000"))
-    needs = btt._collect_needs([_DAY], ["KRX"], store, {}, False)
+    needs = tr.collect_tape_needs([_DAY], ["KRX"], store, {}, False)
     selected = {(n.symbol, n.session) for n in needs if n.day == _DAY}
     assert ("000660", "regular") in selected
     assert ("005930", "regular") not in selected
@@ -135,10 +150,11 @@ def test_needs_exclude_healthy_symbol_days(tmp_path, monkeypatch) -> None:
 def test_missing_day_selected(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
-    monkeypatch.setattr(btt, "_day_universe", lambda day, store: ["005930"])
-    needs = btt._collect_needs([_DAY], ["KRX"], store, {}, False)
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930"])
+    needs = tr.collect_tape_needs([_DAY], ["KRX"], store, {}, False)
     assert {(n.symbol, n.day, n.session) for n in needs} == {
-        ("005930", _DAY, "regular"), ("005930", _DAY, "krx_aftermarket"),
+        ("005930", _DAY, "regular"),
+        ("005930", _DAY, "krx_aftermarket"),
     }
 
 
@@ -153,17 +169,29 @@ def _run_main(tmp_path, monkeypatch, argv: list[str], StubCls: Any = _StubKiwoom
 def test_oldest_need_ordering_and_single_walk(tmp_path, monkeypatch) -> None:
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(btt, "_open_kiwoom", lambda: (object(), _SessionCtx()))
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _fake_harvest_factory(calls))
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake_harvest_factory(calls))
     _patch_roots(tmp_path, monkeypatch)
     canned = [
-        btt.Need(symbol="BBB", day="2026-09-02", session="regular", venue="KRX"),
-        btt.Need(symbol="AAA", day="2026-09-01", session="regular", venue="KRX"),
-        btt.Need(symbol="CCC", day="2026-09-15", session="regular", venue="KRX"),
-        btt.Need(symbol="BBB", day="2026-09-03", session="regular", venue="KRX"),
-        btt.Need(symbol="BBB", day="2026-09-04", session="regular", venue="KRX"),
+        tr.Need(symbol="BBB", day="2026-09-02", session="regular", venue="KRX"),
+        tr.Need(symbol="AAA", day="2026-09-01", session="regular", venue="KRX"),
+        tr.Need(symbol="CCC", day="2026-09-15", session="regular", venue="KRX"),
+        tr.Need(symbol="BBB", day="2026-09-03", session="regular", venue="KRX"),
+        tr.Need(symbol="BBB", day="2026-09-04", session="regular", venue="KRX"),
     ]
-    monkeypatch.setattr(btt, "_collect_needs", lambda *a, **k: list(canned))
-    btt.main(["--start", "2026-09-01", "--end", "2026-09-15", "--venue", "krx", "--apply", "--ledger", str(tmp_path / "ledger.jsonl")])
+    monkeypatch.setattr(tr, "collect_tape_needs", lambda *a, **k: list(canned))
+    btt.main(
+        [
+            "--start",
+            "2026-09-01",
+            "--end",
+            "2026-09-15",
+            "--venue",
+            "krx",
+            "--apply",
+            "--ledger",
+            str(tmp_path / "ledger.jsonl"),
+        ]
+    )
     assert [c["symbol"] for c in calls] == ["AAA", "BBB", "CCC"]
     bbb = next(c for c in calls if c["symbol"] == "BBB")
     assert sum(1 for c in calls if c["symbol"] == "BBB") == 1
@@ -184,20 +212,33 @@ def test_blackout_waits_before_walk(tmp_path, monkeypatch) -> None:
     async def _fake_sleep(seconds: float) -> None:
         slept.append(seconds)
 
+    monkeypatch.setattr(tr, "_now", _fake_now)
     monkeypatch.setattr(btt, "_now", _fake_now)
-    monkeypatch.setattr(btt, "_sleep", _fake_sleep)
+    monkeypatch.setattr(tr, "_sleep", _fake_sleep)
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(btt, "_open_kiwoom", lambda: (object(), _SessionCtx()))
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _fake_harvest_factory(calls))
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake_harvest_factory(calls))
     _patch_roots(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        btt, "_collect_needs",
-        lambda *a, **k: [btt.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
+        tr,
+        "collect_tape_needs",
+        lambda *a, **k: [tr.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
     )
-    btt.main([
-        "--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--apply",
-        "--blackout", "20:00-20:30", "--ledger", str(tmp_path / "l.jsonl"),
-    ])
+    btt.main(
+        [
+            "--start",
+            "2026-09-02",
+            "--end",
+            "2026-09-02",
+            "--venue",
+            "krx",
+            "--apply",
+            "--blackout",
+            "20:00-20:30",
+            "--ledger",
+            str(tmp_path / "l.jsonl"),
+        ]
+    )
     assert len(slept) == 1 and slept[0] > 0
     assert len(calls) == 1
 
@@ -205,17 +246,29 @@ def test_blackout_waits_before_walk(tmp_path, monkeypatch) -> None:
 def test_deadline_stops_new_walks(tmp_path, monkeypatch, caplog) -> None:
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(btt, "_open_kiwoom", lambda: (object(), _SessionCtx()))
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _fake_harvest_factory(calls))
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake_harvest_factory(calls))
     _patch_roots(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        btt, "_collect_needs",
-        lambda *a, **k: [btt.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
+        tr,
+        "collect_tape_needs",
+        lambda *a, **k: [tr.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
     )
     with caplog.at_level("INFO"):
-        btt.main([
-            "--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--apply",
-            "--deadline", "2020-01-01T00:00:00+09:00", "--ledger", str(tmp_path / "l.jsonl"),
-        ])
+        btt.main(
+            [
+                "--start",
+                "2026-09-02",
+                "--end",
+                "2026-09-02",
+                "--venue",
+                "krx",
+                "--apply",
+                "--deadline",
+                "2020-01-01T00:00:00+09:00",
+                "--ledger",
+                str(tmp_path / "l.jsonl"),
+            ]
+        )
     assert calls == []
     assert "remaining" in caplog.text
 
@@ -226,23 +279,23 @@ def test_resume_skips_settled(tmp_path, monkeypatch) -> None:
     ledger.parent.mkdir(parents=True, exist_ok=True)
     ledger.write_text(
         "".join(
-            json.dumps({"symbol": "A", "day": "2026-09-02", "session": s, "status": "COMPLETE", "run_id": "r"})
-            + "\n"
+            json.dumps({"symbol": "A", "day": "2026-09-02", "session": s, "status": "COMPLETE", "run_id": "r"}) + "\n"
             for s in ("regular", "krx_aftermarket")
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(btt, "_day_universe", lambda day, store: ["A", "B"])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["A", "B"])
     store = CaptureStore(tmp_path / "capture")
-    settled = btt._read_settled(ledger)
-    needs = btt._collect_needs(["2026-09-02"], ["KRX"], store, settled, False)
+    settled = tr.read_settled_ledger(ledger)
+    needs = tr.collect_tape_needs(["2026-09-02"], ["KRX"], store, settled, False)
     assert needs and all(n.symbol == "B" for n in needs)
     partial_ledger = tmp_path / "p.jsonl"
     partial_ledger.write_text(
-        json.dumps({"symbol": "B", "day": "2026-09-02", "session": "regular", "status": "PARTIAL", "run_id": "r"}) + "\n",
+        json.dumps({"symbol": "B", "day": "2026-09-02", "session": "regular", "status": "PARTIAL", "run_id": "r"})
+        + "\n",
         encoding="utf-8",
     )
-    needs2 = btt._collect_needs(["2026-09-02"], ["KRX"], store, btt._read_settled(partial_ledger), False)
+    needs2 = tr.collect_tape_needs(["2026-09-02"], ["KRX"], store, tr.read_settled_ledger(partial_ledger), False)
     assert any(n.symbol == "B" and n.session == "regular" for n in needs2)
 
 
@@ -257,10 +310,11 @@ def test_dry_run_writes_nothing(tmp_path, monkeypatch) -> None:
         return TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=2, unresolved_days=())
 
     monkeypatch.setattr(btt, "_open_kiwoom", lambda: (object(), _SessionCtx()))
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _dry_harvest)
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _dry_harvest)
     monkeypatch.setattr(
-        btt, "_collect_needs",
-        lambda *a, **k: [btt.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
+        tr,
+        "collect_tape_needs",
+        lambda *a, **k: [tr.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
     )
     btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--ledger", str(tmp_path / "l.jsonl")])
     assert len(calls) == 1
@@ -284,12 +338,22 @@ def test_guard_stop_reports_remaining(tmp_path, monkeypatch, caplog) -> None:
 
         return [
             TapeDayResult(
-                symbol=symbol, day=day, session="regular", frame=pd.DataFrame(),
+                symbol=symbol,
+                day=day,
+                session="regular",
+                frame=pd.DataFrame(),
                 entry=CoverageEntry(
-                    symbol=symbol, dataset=CaptureDataset.TRADE_TICKS, venue="KRX",
-                    session="regular", scheduled_at=None, status=CaptureStatus.PARTIAL,
-                    rows=0, first_event_time=None, last_event_time=None,
-                    reason="tape_total_mismatch:received=1:total=9", raw_refs=(),
+                    symbol=symbol,
+                    dataset=CaptureDataset.TRADE_TICKS,
+                    venue="KRX",
+                    session="regular",
+                    scheduled_at=None,
+                    status=CaptureStatus.PARTIAL,
+                    rows=0,
+                    first_event_time=None,
+                    last_event_time=None,
+                    reason="tape_total_mismatch:received=1:total=9",
+                    raw_refs=(),
                 ),
             )
             for day in days
@@ -301,13 +365,26 @@ def test_guard_stop_reports_remaining(tmp_path, monkeypatch, caplog) -> None:
         return TapeWalkOutcome(termination_reason="page_budget", pages_fetched=1000, unresolved_days=tuple(days))
 
     monkeypatch.setattr(btt, "_open_kiwoom", lambda: (object(), _SessionCtx()))
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _guarded)
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _guarded)
     monkeypatch.setattr(
-        btt, "_collect_needs",
-        lambda *a, **k: [btt.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
+        tr,
+        "collect_tape_needs",
+        lambda *a, **k: [tr.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
     )
     with caplog.at_level("INFO"):
-        btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--apply", "--ledger", str(tmp_path / "l.jsonl")])
+        btt.main(
+            [
+                "--start",
+                "2026-09-02",
+                "--end",
+                "2026-09-02",
+                "--venue",
+                "krx",
+                "--apply",
+                "--ledger",
+                str(tmp_path / "l.jsonl"),
+            ]
+        )
     assert "GUARD_STOP" in caplog.text
     assert not tick_partition_path("2026-09-02", "regular").exists()
 
@@ -323,25 +400,52 @@ def test_kiwoom_only(tmp_path, monkeypatch) -> None:
         monkeypatch.setitem(sys.modules, name, mod)
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(btt, "_open_kiwoom", lambda: (object(), _SessionCtx()))
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _fake_harvest_factory(calls))
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake_harvest_factory(calls))
     _patch_roots(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        btt, "_collect_needs",
-        lambda *a, **k: [btt.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
+        tr,
+        "collect_tape_needs",
+        lambda *a, **k: [tr.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
     )
-    btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--apply", "--ledger", str(tmp_path / "l.jsonl")])
+    btt.main(
+        [
+            "--start",
+            "2026-09-02",
+            "--end",
+            "2026-09-02",
+            "--venue",
+            "krx",
+            "--apply",
+            "--ledger",
+            str(tmp_path / "l.jsonl"),
+        ]
+    )
     assert len(calls) == 1
 
 
 def test_storage_refusal(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     monkeypatch.setattr(btt, "_free_bytes", lambda path: 0)
+    monkeypatch.setattr(tr, "_free_bytes", lambda path: 0)
     monkeypatch.setattr(
-        btt, "_collect_needs",
-        lambda *a, **k: [btt.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
+        tr,
+        "collect_tape_needs",
+        lambda *a, **k: [tr.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
     )
     with pytest.raises(RuntimeError, match="storage budget"):
-        btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--apply", "--ledger", str(tmp_path / "l.jsonl")])
+        btt.main(
+            [
+                "--start",
+                "2026-09-02",
+                "--end",
+                "2026-09-02",
+                "--venue",
+                "krx",
+                "--apply",
+                "--ledger",
+                str(tmp_path / "l.jsonl"),
+            ]
+        )
 
 
 def test_invalid_venue_and_naive_deadline(tmp_path, monkeypatch) -> None:
@@ -356,28 +460,28 @@ def test_parse_helpers_reject_bad_input() -> None:
     with pytest.raises(ValueError, match="--start"):
         btt._parse_day("not-a-date", "--start")
     with pytest.raises(ValueError, match="--deadline timestamp"):
-        btt._parse_deadline("not-a-time")
-    assert btt._parse_deadline(None) is None
+        tr.parse_walk_deadline("not-a-time")
+    assert tr.parse_walk_deadline(None) is None
     assert btt._parse_blackout("09:00-10:00") == (540, 600)
     with pytest.raises(ValueError, match="blackout"):
         btt._parse_blackout("bogus")
     with pytest.raises(ValueError, match="blackout"):
         btt._parse_blackout("25:00-26:00")
-    assert btt._in_blackout(30, (1380, 60)) is True
-    assert btt._in_blackout(120, (1380, 60)) is False
+    assert tr._in_blackout(30, (1380, 60)) is True
+    assert tr._in_blackout(120, (1380, 60)) is False
 
 
 def test_overnight_blackout_end() -> None:
     night = datetime(2026, 9, 10, 23, 30, tzinfo=_SEOUL)
-    end = btt._blackout_end(night, [(1380, 60)])
+    end = tr._blackout_end(night, [(1380, 60)])
     assert end is not None and (end.day, end.hour, end.minute) == (11, 1, 0)
-    assert btt._blackout_end(night, [(540, 600)]) is None
-    midnight = btt._blackout_end(night, [(1380, 1440)])
+    assert tr._blackout_end(night, [(540, 600)]) is None
+    midnight = tr._blackout_end(night, [(1380, 1440)])
     assert midnight is not None and (midnight.day, midnight.hour) == (11, 0)
     early = datetime(2026, 9, 11, 0, 30, tzinfo=_SEOUL)
-    same_day = btt._blackout_end(early, [(1380, 60)])
+    same_day = tr._blackout_end(early, [(1380, 60)])
     assert same_day is not None and (same_day.day, same_day.hour, same_day.minute) == (11, 1, 0)
-    asyncio.run(btt._sleep(0))
+    asyncio.run(tr._sleep(0))
 
 
 def test_open_kiwoom_guards_and_builds(tmp_path, monkeypatch) -> None:
@@ -404,15 +508,15 @@ def test_open_kiwoom_guards_and_builds(tmp_path, monkeypatch) -> None:
 
 def test_read_symbols_branches(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
-    assert btt._read_symbols(tmp_path / "absent.parquet") == []
+    assert tr._read_symbols(tmp_path / "absent.parquet") == []
     nosym = tmp_path / "nosym.parquet"
     pd.DataFrame({"a": [1]}).to_parquet(nosym)
-    assert btt._read_symbols(nosym) == []
-    monkeypatch.setattr(btt.pd, "read_parquet", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+    assert tr._read_symbols(nosym) == []
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
     try:
         garbage = tmp_path / "garbage.parquet"
         garbage.write_bytes(b"not a parquet file")
-        assert btt._read_symbols(garbage) == []
+        assert tr._read_symbols(garbage) == []
     finally:
         monkeypatch.undo()
 
@@ -431,36 +535,56 @@ def test_read_cohort_and_universe(tmp_path, monkeypatch) -> None:
         raise FileNotFoundError(day)
 
     monkeypatch.setattr(store, "read_cohort", _fake_read)
-    assert btt._read_cohort_symbols(store, "2026-09-05") == []
+    assert tr._read_cohort_symbols(store, "2026-09-05") == []
     _seed_tick_day("2026-09-03", "regular", "000003", _tick_rows(["090000"]), None)
-    assert btt._day_universe("2026-09-03", store) == ["A", "B", "000003"]
-    assert btt._day_universe("2026-09-05", store) == ["A"]
+    assert tr._day_universe("2026-09-03", store) == ["A", "B", "000003"]
+    assert tr._day_universe("2026-09-05", store) == ["A"]
     close_rows = [
         {
-            "cntr_tm": "20260920160000", "cur_prc": "10000", "open_pric": "9900",
-            "high_pric": "10100", "low_pric": "9800", "trde_qty": "100",
+            "cntr_tm": "20260920160000",
+            "cur_prc": "10000",
+            "open_pric": "9900",
+            "high_pric": "10100",
+            "low_pric": "9800",
+            "trde_qty": "100",
         }
     ]
     bars = normalize_bar_frame(pd.DataFrame(close_rows), "kiwoom", "2026-09-20", "000004")
-    write_intraday_partition(bars, 1, "2026-09-20", "nxt_aftermarket", coverage={"000004": _complete_entry("000004", "nxt_aftermarket", len(bars))})
-    assert btt._day_universe("2026-09-20", store) == ["000004"]
+    write_intraday_partition(
+        bars,
+        1,
+        "2026-09-20",
+        "nxt_aftermarket",
+        coverage={"000004": _complete_entry("000004", "nxt_aftermarket", len(bars))},
+    )
+    assert tr._day_universe("2026-09-20", store) == ["000004"]
 
 
 def test_bar_volumes_index_branches(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
-    index = btt.PartitionIndex()
+    index = tr.PartitionIndex()
     assert index.bar_volumes(_DAY, "regular") is None
     _seed_tick_day(_DAY, "regular", "005930", _tick_rows(["090000"]), _bar_rows(["090000"]))
-    fresh = btt.PartitionIndex()
+    fresh = tr.PartitionIndex()
     assert "OTHER" not in (fresh.bar_volumes(_DAY, "regular") or {})
     only_close_rows = [
         {
-            "cntr_tm": "20260906153000", "cur_prc": "10000", "open_pric": "9900",
-            "high_pric": "10100", "low_pric": "9800", "trde_qty": "100",
+            "cntr_tm": "20260906153000",
+            "cur_prc": "10000",
+            "open_pric": "9900",
+            "high_pric": "10100",
+            "low_pric": "9800",
+            "trde_qty": "100",
         }
     ]
     only_close = normalize_bar_frame(pd.DataFrame(only_close_rows), "kiwoom", "2026-09-06", "005930")
-    write_intraday_partition(only_close, 1, "2026-09-06", "regular", coverage={"005930": _complete_entry("005930", "regular", len(only_close))})
+    write_intraday_partition(
+        only_close,
+        1,
+        "2026-09-06",
+        "regular",
+        coverage={"005930": _complete_entry("005930", "regular", len(only_close))},
+    )
     assert (fresh.bar_volumes("2026-09-06", "regular") or {}).get("005930") is None
     assert fresh.bar_volumes(_DAY, "regular")["005930"] == pytest.approx(100.0)
 
@@ -468,73 +592,87 @@ def test_bar_volumes_index_branches(tmp_path, monkeypatch) -> None:
 def test_partition_index_reads_each_partition_once(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     _seed_tick_day(_DAY, "regular", "005930", _tick_rows(["090000"]), _bar_rows(["090000"]))
-    regular = next(s for s in btt.TAPE_SESSIONS if s.session == "regular")
+    regular = next(s for s in TAPE_SESSIONS if s.session == "regular")
     reads = {"n": 0}
-    real = btt.pd.read_parquet
+    real = pd.read_parquet
 
     def _counting(*args: Any, **kwargs: Any) -> Any:
         reads["n"] += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(btt.pd, "read_parquet", _counting)
-    index = btt.PartitionIndex()
+    monkeypatch.setattr(pd, "read_parquet", _counting)
+    index = tr.PartitionIndex()
     for symbol in ("005930", "000660", "035420", "051910"):
-        btt._session_need(symbol, _DAY, regular, index)
+        tr._session_need(symbol, _DAY, regular, index)
     assert reads["n"] == 2  # one tick partition + one bar partition, regardless of symbol count
 
 
 def test_session_need_flags(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
-    regular = next(s for s in btt.TAPE_SESSIONS if s.session == "regular")
+    regular = next(s for s in TAPE_SESSIONS if s.session == "regular")
     frame = normalize_tick_frame(pd.DataFrame(_tick_rows(["090000"])), "kiwoom", _DAY, "005930")
     frame["truncated"] = True
     write_tick_partition(frame, _DAY, "regular", coverage={"005930": _complete_entry("005930", "regular", len(frame))})
-    assert btt._session_need("005930", _DAY, regular, btt.PartitionIndex()) is True
-    frame2 = normalize_tick_frame(pd.DataFrame(_tick_rows(["085000"], day="20260907")), "kiwoom", "2026-09-07", "005930")
-    write_tick_partition(frame2, "2026-09-07", "regular", coverage={"005930": _complete_entry("005930", "regular", len(frame2))})
-    assert btt._session_need("005930", "2026-09-07", regular, btt.PartitionIndex()) is True
-    frame3 = normalize_tick_frame(pd.DataFrame(_tick_rows(["090000"], "10", day="20260908")), "kiwoom", "2026-09-08", "005930")
+    assert tr._session_need("005930", _DAY, regular, tr.PartitionIndex()) is True
+    frame2 = normalize_tick_frame(
+        pd.DataFrame(_tick_rows(["085000"], day="20260907")), "kiwoom", "2026-09-07", "005930"
+    )
+    write_tick_partition(
+        frame2, "2026-09-07", "regular", coverage={"005930": _complete_entry("005930", "regular", len(frame2))}
+    )
+    assert tr._session_need("005930", "2026-09-07", regular, tr.PartitionIndex()) is True
+    frame3 = normalize_tick_frame(
+        pd.DataFrame(_tick_rows(["090000"], "10", day="20260908")), "kiwoom", "2026-09-08", "005930"
+    )
     frame3["vendor"] = "ls"
-    write_tick_partition(frame3, "2026-09-08", "regular", coverage={"005930": _complete_entry("005930", "regular", len(frame3))})
-    bars = normalize_bar_frame(pd.DataFrame(_bar_rows(["090000"], "1000", day="20260908")), "kiwoom", "2026-09-08", "005930")
-    write_intraday_partition(bars, 1, "2026-09-08", "regular", coverage={"005930": _complete_entry("005930", "regular", len(bars))})
-    assert btt._session_need("005930", "2026-09-08", regular, btt.PartitionIndex()) is True
+    write_tick_partition(
+        frame3, "2026-09-08", "regular", coverage={"005930": _complete_entry("005930", "regular", len(frame3))}
+    )
+    bars = normalize_bar_frame(
+        pd.DataFrame(_bar_rows(["090000"], "1000", day="20260908")), "kiwoom", "2026-09-08", "005930"
+    )
+    write_intraday_partition(
+        bars, 1, "2026-09-08", "regular", coverage={"005930": _complete_entry("005930", "regular", len(bars))}
+    )
+    assert tr._session_need("005930", "2026-09-08", regular, tr.PartitionIndex()) is True
 
 
 def test_collect_skips_unclosed_and_session_closed_units(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
-    monkeypatch.setattr(btt, "_day_universe", lambda day, store: ["005930"])
-    assert btt._collect_needs(["2999-01-01"], ["KRX", "NXT"], store, {}, False) == []
-    assert btt._collect_needs(["2999-01-01"], ["KRX"], store, {}, True) == []
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930"])
+    assert tr.collect_tape_needs(["2999-01-01"], ["KRX", "NXT"], store, {}, False) == []
+    assert tr.collect_tape_needs(["2999-01-01"], ["KRX"], store, {}, True) == []
     morning = datetime(2026, 9, 10, 10, 0, tzinfo=_SEOUL)
     evening = datetime(2026, 9, 10, 16, 0, tzinfo=_SEOUL)
-    assert btt._session_closed("2026-09-10", "regular", morning) is False
-    assert btt._session_closed("2026-09-10", "regular", evening) is True
-    assert btt._session_closed("2026-09-10", "krx_aftermarket", evening) is False
-    assert btt._session_closed("2026-09-09", "krx_aftermarket", morning) is True
+    assert tr._session_closed("2026-09-10", "regular", morning) is False
+    assert tr._session_closed("2026-09-10", "regular", evening) is True
+    assert tr._session_closed("2026-09-10", "krx_aftermarket", evening) is False
+    assert tr._session_closed("2026-09-09", "krx_aftermarket", morning) is True
 
 
 def test_ledger_helpers(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     profile = _profile(tmp_path)
-    assert btt._ledger_path(None, profile) == tmp_path / "capture" / "staging" / "tape_backfill" / "ledger.jsonl"
-    assert btt._ledger_path(str(tmp_path / "x.jsonl"), profile) == tmp_path / "x.jsonl"
-    assert btt._read_settled(tmp_path / "absent.jsonl") == {}
+    assert tr.tape_ledger_path(None, profile) == tmp_path / "capture" / "staging" / "tape_backfill" / "ledger.jsonl"
+    assert tr.tape_ledger_path(str(tmp_path / "x.jsonl"), profile) == tmp_path / "x.jsonl"
+    assert tr.read_settled_ledger(tmp_path / "absent.jsonl") == {}
     ledger = tmp_path / "l.jsonl"
     ledger.write_text(
-        "\nnot-json\n" + json.dumps({"symbol": "A", "day": "2026-09-02", "session": "regular", "status": "COMPLETE"}) + "\n",
+        "\nnot-json\n"
+        + json.dumps({"symbol": "A", "day": "2026-09-02", "session": "regular", "status": "COMPLETE"})
+        + "\n",
         encoding="utf-8",
     )
-    assert btt._read_settled(ledger) == {("A", "2026-09-02", "regular"): "COMPLETE"}
+    assert tr.read_settled_ledger(ledger) == {("A", "2026-09-02", "regular"): "COMPLETE"}
     with pytest.raises(RuntimeError, match="unreadable"):
-        btt._read_settled(tmp_path)
-    btt._append_ledger(tmp_path / "noop.jsonl", [])
+        tr.read_settled_ledger(tmp_path)
+    tr._append_ledger(tmp_path / "noop.jsonl", [])
     assert not (tmp_path / "noop.jsonl").exists()
     blocker = tmp_path / "blocker"
     blocker.write_text("x", encoding="utf-8")
     with pytest.raises(RuntimeError, match="ledger write failed"):
-        btt._append_ledger(blocker / "l.jsonl", [{"symbol": "A"}])
+        tr._append_ledger(blocker / "l.jsonl", [{"symbol": "A"}])
 
 
 def test_free_bytes_real(tmp_path, monkeypatch) -> None:
@@ -546,21 +684,21 @@ def test_free_bytes_real(tmp_path, monkeypatch) -> None:
 def test_verify_groups(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     _seed_tick_day(_DAY, "regular", "005930", _tick_rows(["090000"]), None)
-    btt._verify_groups({(_DAY, "regular"): 1})
+    tr._verify_groups({(_DAY, "regular"): 1})
     with pytest.raises(RuntimeError, match="verification failed"):
-        btt._verify_groups({(_DAY, "regular"): 99})
+        tr._verify_groups({(_DAY, "regular"): 99})
     corrupt = tick_partition_path("2026-09-09", "regular")
     corrupt.parent.mkdir(parents=True, exist_ok=True)
     corrupt.write_bytes(b"garbage")
     with pytest.raises(RuntimeError, match="publication failed"):
-        btt._verify_groups({("2026-09-09", "regular"): 0})
+        tr._verify_groups({("2026-09-09", "regular"): 0})
 
 
 def test_session_need_missing_symbol_in_partition(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
-    regular = next(s for s in btt.TAPE_SESSIONS if s.session == "regular")
+    regular = next(s for s in TAPE_SESSIONS if s.session == "regular")
     _seed_tick_day(_DAY, "regular", "005930", _tick_rows(["090000"]), None)
-    assert btt._session_need("000660", _DAY, regular, btt.PartitionIndex()) is True
+    assert tr._session_need("000660", _DAY, regular, tr.PartitionIndex()) is True
 
 
 def test_apply_publishes_complete_results(tmp_path, monkeypatch) -> None:
@@ -577,10 +715,17 @@ def test_apply_publishes_complete_results(tmp_path, monkeypatch) -> None:
             frame = normalize_tick_frame(pd.DataFrame(day_rows), "kiwoom", day, symbol)
             ref = ArtifactRef(path="raw/seed", sha256="abc", bytes=1)
             entry = CoverageEntry(
-                symbol=symbol, dataset=CaptureDataset.TRADE_TICKS, venue="KRX",
-                session="regular", scheduled_at=None, status=CaptureStatus.COMPLETE,
-                rows=len(frame), first_event_time=None, last_event_time=None,
-                reason="tape_complete:regular=1:vendor_total=2", raw_refs=(ref,),
+                symbol=symbol,
+                dataset=CaptureDataset.TRADE_TICKS,
+                venue="KRX",
+                session="regular",
+                scheduled_at=None,
+                status=CaptureStatus.COMPLETE,
+                rows=len(frame),
+                first_event_time=None,
+                last_event_time=None,
+                reason="tape_complete:regular=1:vendor_total=2",
+                raw_refs=(ref,),
             )
             out.append(TapeDayResult(symbol=symbol, day=day, session="regular", frame=frame, entry=entry))
         return out
@@ -591,10 +736,11 @@ def test_apply_publishes_complete_results(tmp_path, monkeypatch) -> None:
         return TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=1, unresolved_days=())
 
     monkeypatch.setattr(btt, "_open_kiwoom", lambda: (object(), _SessionCtx()))
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _emitting)
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _emitting)
     monkeypatch.setattr(
-        btt, "_collect_needs",
-        lambda *a, **k: [btt.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
+        tr,
+        "collect_tape_needs",
+        lambda *a, **k: [tr.Need(symbol="005930", day="2026-09-02", session="regular", venue="KRX")],
     )
     ledger = tmp_path / "l.jsonl"
     btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--apply", "--ledger", str(ledger)])
@@ -613,13 +759,23 @@ def test_run_tasks_evidence_error(tmp_path, monkeypatch) -> None:
     async def _boom(*args: Any, **kwargs: Any) -> Any:
         raise OSError("evidence down")
 
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _boom)
-    task = btt.WalkTask(symbol="005930", venue="KRX", days=(_DAY,), sessions=tuple(s for s in btt.TAPE_SESSIONS if s.venue == "KRX"))
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _boom)
+    task = tr.WalkTask(
+        symbol="005930", venue="KRX", days=(_DAY,), sessions=tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    )
     with pytest.raises(RuntimeError, match="evidence failed"):
         asyncio.run(
-            btt._run_tasks(
-                [task], client=object(), http_session=object(), store=store, profile=profile,
-                apply=True, ledger=tmp_path / "l.jsonl", deadline=None, blackouts=[], run_date="2026-09-20",
+            tr.run_walk_tasks(
+                [task],
+                client=object(),
+                http_session=object(),
+                store=store,
+                profile=profile,
+                apply=True,
+                ledger=tmp_path / "l.jsonl",
+                deadline=None,
+                blackouts=[],
+                run_date="2026-09-20",
             )
         )
 
@@ -654,18 +810,26 @@ def test_run_tasks_flushes_by_row_bound_and_commits_ledger_only_after_flush(tmp_
         kwargs["on_result"](TapeDayResult(symbol=symbol, day=_DAY, session="regular", frame=frame, entry=entry))
         return TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=1, unresolved_days=())
 
-    monkeypatch.setattr(btt, "TickTapePublisher", _FakePublisher)
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _emit)
-    monkeypatch.setattr(btt, "_verify_groups", lambda expected: None)
-    sessions = tuple(s for s in btt.TAPE_SESSIONS if s.venue == "KRX")
-    tasks = [btt.WalkTask(symbol=f"{i:06d}", venue="KRX", days=(_DAY,), sessions=sessions) for i in range(3)]
+    monkeypatch.setattr(tr, "TickTapePublisher", _FakePublisher)
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _emit)
+    monkeypatch.setattr(tr, "_verify_groups", lambda expected: None)
+    sessions = tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    tasks = [tr.WalkTask(symbol=f"{i:06d}", venue="KRX", days=(_DAY,), sessions=sessions) for i in range(3)]
     summary = asyncio.run(
-        btt._run_tasks(
-            tasks, client=object(), http_session=object(), store=store, profile=profile,
-            apply=True, ledger=ledger, deadline=None, blackouts=[], run_date="2026-09-20",
+        tr.run_walk_tasks(
+            tasks,
+            client=object(),
+            http_session=object(),
+            store=store,
+            profile=profile,
+            apply=True,
+            ledger=ledger,
+            deadline=None,
+            blackouts=[],
+            run_date="2026-09-20",
         )
     )
-    assert summary["pages"] == 3
+    assert summary.pages == 3
     # rows reach the bound after 2 symbols (flush 1: no ledger yet); the 3rd symbol flushes at the end, by which time
     # only the first flush's records exist, so a record is never written before its own flush succeeded
     assert [e for e in events if e.startswith("flush")] == ["flush:ledger_exists=False", "flush:ledger_exists=True"]
@@ -681,21 +845,37 @@ def test_run_tasks_does_not_record_ledger_when_flush_fails(tmp_path, monkeypatch
 
     async def _emit(client: Any, session: Any, symbol: str, days: Any, **kwargs: Any) -> Any:
         frame = normalize_tick_frame(pd.DataFrame(_tick_rows(["090000"])), "kiwoom", _DAY, symbol)
-        kwargs["on_result"](TapeDayResult(symbol=symbol, day=_DAY, session="regular", frame=frame, entry=_complete_entry(symbol, "regular", len(frame))))
+        kwargs["on_result"](
+            TapeDayResult(
+                symbol=symbol,
+                day=_DAY,
+                session="regular",
+                frame=frame,
+                entry=_complete_entry(symbol, "regular", len(frame)),
+            )
+        )
         return TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=1, unresolved_days=())
 
     def _boom(self: Any) -> Any:
         raise OSError("disk full")
 
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _emit)
-    monkeypatch.setattr(btt.TickTapePublisher, "flush", _boom)
-    sessions = tuple(s for s in btt.TAPE_SESSIONS if s.venue == "KRX")
-    task = btt.WalkTask(symbol="005930", venue="KRX", days=(_DAY,), sessions=sessions)
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _emit)
+    monkeypatch.setattr(tr.TickTapePublisher, "flush", _boom)
+    sessions = tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    task = tr.WalkTask(symbol="005930", venue="KRX", days=(_DAY,), sessions=sessions)
     with pytest.raises(OSError, match="disk full"):
         asyncio.run(
-            btt._run_tasks(
-                [task], client=object(), http_session=object(), store=store, profile=profile,
-                apply=True, ledger=ledger, deadline=None, blackouts=[], run_date="2026-09-20",
+            tr.run_walk_tasks(
+                [task],
+                client=object(),
+                http_session=object(),
+                store=store,
+                profile=profile,
+                apply=True,
+                ledger=ledger,
+                deadline=None,
+                blackouts=[],
+                run_date="2026-09-20",
             )
         )
     assert not ledger.exists()
@@ -709,29 +889,60 @@ def test_main_branches(tmp_path, monkeypatch, caplog) -> None:
         btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--symbols-limit", "0"])
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(btt, "_open_kiwoom", lambda: (object(), _SessionCtx()))
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _fake_harvest_factory(calls))
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake_harvest_factory(calls))
     canned = [
-        btt.Need(symbol="AAA", day="2026-09-02", session="regular", venue="KRX"),
-        btt.Need(symbol="BBB", day="2026-09-02", session="regular", venue="KRX"),
-        btt.Need(symbol="CCC", day="2026-09-02", session="regular", venue="KRX"),
+        tr.Need(symbol="AAA", day="2026-09-02", session="regular", venue="KRX"),
+        tr.Need(symbol="BBB", day="2026-09-02", session="regular", venue="KRX"),
+        tr.Need(symbol="CCC", day="2026-09-02", session="regular", venue="KRX"),
     ]
-    monkeypatch.setattr(btt, "_collect_needs", lambda *a, **k: list(canned))
-    nxt_only = [btt.Need(symbol="AAA", day="2026-09-02", session="nxt_aftermarket", venue="NXT")]
-    monkeypatch.setattr(btt, "_collect_needs", lambda *a, **k: list(nxt_only))
-    btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "nxt", "--apply", "--ledger", str(tmp_path / "l.jsonl")])
+    monkeypatch.setattr(tr, "collect_tape_needs", lambda *a, **k: list(canned))
+    nxt_only = [tr.Need(symbol="AAA", day="2026-09-02", session="nxt_aftermarket", venue="NXT")]
+    monkeypatch.setattr(tr, "collect_tape_needs", lambda *a, **k: list(nxt_only))
+    btt.main(
+        [
+            "--start",
+            "2026-09-02",
+            "--end",
+            "2026-09-02",
+            "--venue",
+            "nxt",
+            "--apply",
+            "--ledger",
+            str(tmp_path / "l.jsonl"),
+        ]
+    )
     assert [c["venue"] for c in calls] == ["NXT"]
     calls.clear()
-    monkeypatch.setattr(btt, "_collect_needs", lambda *a, **k: list(canned))
-    btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--apply", "--symbols-limit", "2", "--ledger", str(tmp_path / "l2.jsonl")])
+    monkeypatch.setattr(tr, "collect_tape_needs", lambda *a, **k: list(canned))
+    btt.main(
+        [
+            "--start",
+            "2026-09-02",
+            "--end",
+            "2026-09-02",
+            "--venue",
+            "krx",
+            "--apply",
+            "--symbols-limit",
+            "2",
+            "--ledger",
+            str(tmp_path / "l2.jsonl"),
+        ]
+    )
     assert [c["symbol"] for c in calls] == ["AAA", "BBB"]
-    monkeypatch.setattr(btt, "_collect_needs", lambda *a, **k: [])
+    monkeypatch.setattr(tr, "collect_tape_needs", lambda *a, **k: [])
     with caplog.at_level("INFO"):
-        btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--ledger", str(tmp_path / "l3.jsonl")])
+        btt.main(
+            ["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--ledger", str(tmp_path / "l3.jsonl")]
+        )
     assert "NOOP" in caplog.text
-    monkeypatch.setattr(btt, "_collect_needs", lambda *a, **k: list(canned)[:1])
+    monkeypatch.setattr(tr, "collect_tape_needs", lambda *a, **k: list(canned)[:1])
     monkeypatch.setattr(btt, "_free_bytes", lambda path: (_ for _ in ()).throw(OSError("disk")))
+    monkeypatch.setattr(tr, "_free_bytes", lambda path: (_ for _ in ()).throw(OSError("disk")))
     with pytest.raises(RuntimeError, match="storage check failed"):
-        btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--ledger", str(tmp_path / "l4.jsonl")])
+        btt.main(
+            ["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--ledger", str(tmp_path / "l4.jsonl")]
+        )
     monkeypatch.setattr(btt, "_free_bytes", lambda path: 100 * 1024**3)
 
     def _raise_open() -> Any:
@@ -739,7 +950,19 @@ def test_main_branches(tmp_path, monkeypatch, caplog) -> None:
 
     monkeypatch.setattr(btt, "_open_kiwoom", _raise_open)
     with pytest.raises(RuntimeError, match="infrastructure failed"):
-        btt.main(["--start", "2026-09-02", "--end", "2026-09-02", "--venue", "krx", "--apply", "--ledger", str(tmp_path / "l5.jsonl")])
+        btt.main(
+            [
+                "--start",
+                "2026-09-02",
+                "--end",
+                "2026-09-02",
+                "--venue",
+                "krx",
+                "--apply",
+                "--ledger",
+                str(tmp_path / "l5.jsonl"),
+            ]
+        )
 
 
 def test_run_tasks_stops_cleanly_on_disk_guard(tmp_path, monkeypatch) -> None:
@@ -752,22 +975,31 @@ def test_run_tasks_stops_cleanly_on_disk_guard(tmp_path, monkeypatch) -> None:
         walked.append(symbol)
         return TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=1, unresolved_days=())
 
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _walk)
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _walk)
     monkeypatch.setattr(btt, "_free_bytes", lambda path: 0)
+    monkeypatch.setattr(tr, "_free_bytes", lambda path: 0)
     purged: list[Any] = []
     import src.tools.backup_prune as prune
 
     monkeypatch.setattr(prune, "prune_local_intraday_backups", lambda **kw: purged.append(kw) or [])
-    sessions = tuple(s for s in btt.TAPE_SESSIONS if s.venue == "KRX")
-    tasks = [btt.WalkTask(symbol="005930", venue="KRX", days=(_DAY,), sessions=sessions)]
+    sessions = tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    tasks = [tr.WalkTask(symbol="005930", venue="KRX", days=(_DAY,), sessions=sessions)]
     summary = asyncio.run(
-        btt._run_tasks(
-            tasks, client=object(), http_session=object(), store=store, profile=profile,
-            apply=True, ledger=tmp_path / "l.jsonl", deadline=None, blackouts=[], run_date="2026-09-20",
+        tr.run_walk_tasks(
+            tasks,
+            client=object(),
+            http_session=object(),
+            store=store,
+            profile=profile,
+            apply=True,
+            ledger=tmp_path / "l.jsonl",
+            deadline=None,
+            blackouts=[],
+            run_date="2026-09-20",
         )
     )
     assert walked == []
-    assert summary["stopped_reason"] == "disk_guard" and summary["remaining"] == ["005930/KRX"]
+    assert summary.stopped_reason == "disk_guard" and summary.remaining == ("005930/KRX",)
     assert len(purged) == 1  # exactly one expired-snapshot prune attempt before stopping
 
 
@@ -777,20 +1009,27 @@ def test_run_tasks_bounds_each_walk_by_the_next_blackout(tmp_path, monkeypatch) 
     profile = _profile(tmp_path)
     seen: dict[str, Any] = {}
     fixed = datetime(2026, 9, 20, 10, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-    monkeypatch.setattr(btt, "_now", lambda: fixed)
+    monkeypatch.setattr(tr, "_now", lambda: fixed)
 
     async def _walk(client: Any, session: Any, symbol: str, days: Any, **kwargs: Any) -> Any:
         seen["walk_deadline"] = kwargs.get("walk_deadline")
         return TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=1, unresolved_days=())
 
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _walk)
-    sessions = tuple(s for s in btt.TAPE_SESSIONS if s.venue == "KRX")
-    tasks = [btt.WalkTask(symbol="005930", venue="KRX", days=(_DAY,), sessions=sessions)]
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _walk)
+    sessions = tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    tasks = [tr.WalkTask(symbol="005930", venue="KRX", days=(_DAY,), sessions=sessions)]
     asyncio.run(
-        btt._run_tasks(
-            tasks, client=object(), http_session=object(), store=store, profile=profile,
-            apply=False, ledger=tmp_path / "l.jsonl", deadline=None,
-            blackouts=[btt._parse_blackout("15:35-15:55")], run_date="2026-09-20",
+        tr.run_walk_tasks(
+            tasks,
+            client=object(),
+            http_session=object(),
+            store=store,
+            profile=profile,
+            apply=False,
+            ledger=tmp_path / "l.jsonl",
+            deadline=None,
+            blackouts=[btt._parse_blackout("15:35-15:55")],
+            run_date="2026-09-20",
         )
     )
     assert seen["walk_deadline"] == fixed.replace(hour=15, minute=35)
@@ -799,28 +1038,28 @@ def test_run_tasks_bounds_each_walk_by_the_next_blackout(tmp_path, monkeypatch) 
 def test_next_blackout_start_and_session_need_unreadable_partition(tmp_path, monkeypatch) -> None:
     now = datetime(2026, 9, 20, 16, 0, tzinfo=ZoneInfo("Asia/Seoul"))
     windows = [btt._parse_blackout("15:35-15:55"), btt._parse_blackout("20:00-20:30")]
-    assert btt._next_blackout_start(now, windows) == now.replace(hour=20, minute=0)
-    assert btt._next_blackout_start(now.replace(hour=21), windows) is None
+    assert tr._next_blackout_start(now, windows) == now.replace(hour=20, minute=0)
+    assert tr._next_blackout_start(now.replace(hour=21), windows) is None
 
 
 def test_partition_index_degrades_on_unreadable_or_incomplete_partitions(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
-    regular = next(s for s in btt.TAPE_SESSIONS if s.session == "regular")
+    regular = next(s for s in TAPE_SESSIONS if s.session == "regular")
     tick_path = tick_partition_path(_DAY, "regular")
     tick_path.parent.mkdir(parents=True, exist_ok=True)
     tick_path.write_bytes(b"not a parquet file")
-    assert btt.PartitionIndex().tick_stats(_DAY, regular) is None
+    assert tr.PartitionIndex().tick_stats(_DAY, regular) is None
     pd.DataFrame({"price": [1]}).to_parquet(tick_path)
-    assert btt.PartitionIndex().tick_stats(_DAY, regular) is None
+    assert tr.PartitionIndex().tick_stats(_DAY, regular) is None
 
     from src.data.intraday_store import intraday_partition_path
 
     bar_path = intraday_partition_path(1, _DAY, "regular")
     bar_path.parent.mkdir(parents=True, exist_ok=True)
     bar_path.write_bytes(b"not a parquet file")
-    assert btt.PartitionIndex().bar_volumes(_DAY, "regular") is None
+    assert tr.PartitionIndex().bar_volumes(_DAY, "regular") is None
     pd.DataFrame({"symbol": ["005930"]}).to_parquet(bar_path)
-    assert btt.PartitionIndex().bar_volumes(_DAY, "regular") is None
+    assert tr.PartitionIndex().bar_volumes(_DAY, "regular") is None
 
 
 def test_run_tasks_waits_out_a_blackout_that_starts_within_the_margin(tmp_path, monkeypatch) -> None:
@@ -838,16 +1077,23 @@ def test_run_tasks_waits_out_a_blackout_that_starts_within_the_margin(tmp_path, 
         started_at.append(clock["now"])
         return TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=1, unresolved_days=())
 
-    monkeypatch.setattr(btt, "_now", lambda: clock["now"])
-    monkeypatch.setattr(btt, "_sleep", _advance)
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _walk)
-    sessions = tuple(s for s in btt.TAPE_SESSIONS if s.venue == "KRX")
-    tasks = [btt.WalkTask(symbol="005930", venue="KRX", days=(_DAY,), sessions=sessions)]
+    monkeypatch.setattr(tr, "_now", lambda: clock["now"])
+    monkeypatch.setattr(tr, "_sleep", _advance)
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _walk)
+    sessions = tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    tasks = [tr.WalkTask(symbol="005930", venue="KRX", days=(_DAY,), sessions=sessions)]
     asyncio.run(
-        btt._run_tasks(
-            tasks, client=object(), http_session=object(), store=store, profile=profile,
-            apply=False, ledger=tmp_path / "l.jsonl", deadline=None,
-            blackouts=[btt._parse_blackout("15:35-15:55")], run_date="2026-09-20",
+        tr.run_walk_tasks(
+            tasks,
+            client=object(),
+            http_session=object(),
+            store=store,
+            profile=profile,
+            apply=False,
+            ledger=tmp_path / "l.jsonl",
+            deadline=None,
+            blackouts=[btt._parse_blackout("15:35-15:55")],
+            run_date="2026-09-20",
         )
     )
     assert started_at and started_at[0] >= datetime(2026, 9, 20, 15, 55, tzinfo=ZoneInfo("Asia/Seoul"))
@@ -861,14 +1107,22 @@ def test_run_tasks_emits_a_heartbeat_every_fifty_walks(tmp_path, monkeypatch, ca
     async def _walk(client: Any, session: Any, symbol: str, days: Any, **kwargs: Any) -> Any:
         return TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=1, unresolved_days=())
 
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _walk)
-    sessions = tuple(s for s in btt.TAPE_SESSIONS if s.venue == "KRX")
-    tasks = [btt.WalkTask(symbol=f"{i:06d}", venue="KRX", days=(_DAY,), sessions=sessions) for i in range(50)]
-    with caplog.at_level("INFO", logger="src.tools.backfill_tick_tape"):
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _walk)
+    sessions = tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    tasks = [tr.WalkTask(symbol=f"{i:06d}", venue="KRX", days=(_DAY,), sessions=sessions) for i in range(50)]
+    with caplog.at_level("INFO", logger="src.backfill.intraday.tape_recovery"):
         asyncio.run(
-            btt._run_tasks(
-                tasks, client=object(), http_session=object(), store=store, profile=profile,
-                apply=False, ledger=tmp_path / "l.jsonl", deadline=None, blackouts=[], run_date="2026-09-20",
+            tr.run_walk_tasks(
+                tasks,
+                client=object(),
+                http_session=object(),
+                store=store,
+                profile=profile,
+                apply=False,
+                ledger=tmp_path / "l.jsonl",
+                deadline=None,
+                blackouts=[],
+                run_date="2026-09-20",
             )
         )
     beats = [rec.message for rec in caplog.records if "stage=tape_backfill done=" in rec.message]
@@ -878,32 +1132,32 @@ def test_run_tasks_emits_a_heartbeat_every_fifty_walks(tmp_path, monkeypatch, ca
 def test_collect_skips_weekends_and_ingested_holidays(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
-    monkeypatch.setattr(btt, "_day_universe", lambda day, store: ["005930"])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930"])
     ingested = pd.DataFrame({"date": pd.to_datetime(["2026-09-23", "2026-09-28"]), "symbol": "005930"})
     ingested.to_parquet(tmp_path / "price_history.parquet")
     days = ["2026-09-23", "2026-09-24", "2026-09-26", "2026-09-28", "2026-09-30"]
-    needs = btt._collect_needs(days, ["KRX"], store, {}, False)
+    needs = tr.collect_tape_needs(days, ["KRX"], store, {}, False)
     assert {n.day for n in needs} == {"2026-09-23", "2026-09-28", "2026-09-30"}
 
 
 def test_trading_day_falls_back_to_weekday_without_price_history() -> None:
-    assert btt._is_trading_day("2026-09-24", set()) is True
-    assert btt._is_trading_day("2026-09-26", set()) is False
-    assert btt._is_trading_day("2026-09-01", {"2026-09-23"}) is True
+    assert tr._is_trading_day("2026-09-24", set()) is True
+    assert tr._is_trading_day("2026-09-26", set()) is False
+    assert tr._is_trading_day("2026-09-01", {"2026-09-23"}) is True
 
 
 def test_ingested_trading_days_tolerates_unreadable_file(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
-    assert btt._ingested_trading_days() == set()
+    assert tr._ingested_trading_days() == set()
     (tmp_path / "price_history.parquet").write_bytes(b"not parquet")
-    assert btt._ingested_trading_days() == set()
+    assert tr._ingested_trading_days() == set()
 
 
 def test_price_history_path_points_at_configured_parquet(monkeypatch) -> None:
     monkeypatch.undo()
     from src import settings as _settings
 
-    assert btt._price_history_path() == Path(_settings.PRICE_HISTORY_PARQUET_PATH)
+    assert tr._price_history_path() == Path(_settings.PRICE_HISTORY_PARQUET_PATH)
 
 
 class _TokenClient:
@@ -915,8 +1169,8 @@ class _TokenClient:
 
 
 def _failure_tasks(count: int) -> list[Any]:
-    sessions = tuple(s for s in btt.TAPE_SESSIONS if s.venue == "KRX")
-    return [btt.WalkTask(symbol=f"00000{i}", venue="KRX", days=(_DAY,), sessions=sessions) for i in range(count)]
+    sessions = tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    return [tr.WalkTask(symbol=f"00000{i}", venue="KRX", days=(_DAY,), sessions=sessions) for i in range(count)]
 
 
 def test_vendor_failure_resets_token_and_a_single_failure_does_not_stop(tmp_path, monkeypatch) -> None:
@@ -931,17 +1185,25 @@ def test_vendor_failure_resets_token_and_a_single_failure_does_not_stop(tmp_path
     async def _fake(*args: Any, **kwargs: Any) -> Any:
         return next(outcomes)
 
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _fake)
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake)
     client = _TokenClient()
     summary = asyncio.run(
-        btt._run_tasks(
-            _failure_tasks(2), client=client, http_session=object(), store=CaptureStore(tmp_path / "capture"),
-            profile=_profile(tmp_path), apply=False, ledger=tmp_path / "l.jsonl", deadline=None, blackouts=[], run_date="2026-09-20",
+        tr.run_walk_tasks(
+            _failure_tasks(2),
+            client=client,
+            http_session=object(),
+            store=CaptureStore(tmp_path / "capture"),
+            profile=_profile(tmp_path),
+            apply=False,
+            ledger=tmp_path / "l.jsonl",
+            deadline=None,
+            blackouts=[],
+            run_date="2026-09-20",
         )
     )
     assert client.resets == 1
-    assert summary["stopped_reason"] == ""
-    assert summary["remaining"] == []
+    assert summary.stopped_reason == ""
+    assert summary.remaining == ()
 
 
 def test_vendor_failure_streak_stops_run(tmp_path, monkeypatch, caplog) -> None:
@@ -950,18 +1212,26 @@ def test_vendor_failure_streak_stops_run(tmp_path, monkeypatch, caplog) -> None:
     async def _fake(*args: Any, **kwargs: Any) -> Any:
         return TapeWalkOutcome(termination_reason="vendor_failure", pages_fetched=1, unresolved_days=(_DAY,))
 
-    monkeypatch.setattr(btt, "harvest_symbol_tape", _fake)
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake)
     client = _TokenClient()
     with caplog.at_level("WARNING"):
         summary = asyncio.run(
-            btt._run_tasks(
-                _failure_tasks(6), client=client, http_session=object(), store=CaptureStore(tmp_path / "capture"),
-                profile=_profile(tmp_path), apply=False, ledger=tmp_path / "l.jsonl", deadline=None, blackouts=[], run_date="2026-09-20",
+            tr.run_walk_tasks(
+                _failure_tasks(6),
+                client=client,
+                http_session=object(),
+                store=CaptureStore(tmp_path / "capture"),
+                profile=_profile(tmp_path),
+                apply=False,
+                ledger=tmp_path / "l.jsonl",
+                deadline=None,
+                blackouts=[],
+                run_date="2026-09-20",
             )
         )
-    assert client.resets == btt._MAX_VENDOR_FAILURE_STREAK
-    assert summary["stopped_reason"] == "vendor_failure"
-    assert len(summary["remaining"]) == 6 - btt._MAX_VENDOR_FAILURE_STREAK
+    assert client.resets == tr._MAX_VENDOR_FAILURE_STREAK
+    assert summary.stopped_reason == "vendor_failure"
+    assert len(summary.remaining) == 6 - tr._MAX_VENDOR_FAILURE_STREAK
     assert "VENDOR_FAILURE_STREAK" in caplog.text
 
 
@@ -970,7 +1240,7 @@ def test_default_blackouts_cover_kiwoom_live_windows() -> None:
 
     def covered(hhmm: str) -> bool:
         minute = int(hhmm[:2]) * 60 + int(hhmm[3:])
-        return any(btt._in_blackout(minute, window) for window in windows)
+        return any(tr._in_blackout(minute, window) for window in windows)
 
     for live in ("08:30", "11:30", "15:20", "15:21", "15:40", "16:25", "20:05", "21:02", "21:30", "23:05"):
         assert covered(live), live
@@ -998,19 +1268,25 @@ def test_pool_symbols_prefers_archive_pool_from_the_universe_start(tmp_path, mon
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
     _write_archive(tmp_path, {"2026-09-11": ["5930", "000660"], "2026-09-03": ["111111"]})
-    assert btt._pool_symbols(store, "2026-09-11") == (["005930", "000660"], "archive_pool")
-    assert btt._pool_symbols(store, "2026-09-03") == ([], "none")
+    assert tr._pool_symbols(store, "2026-09-11") == (["005930", "000660"], "archive_pool")
+    assert tr._pool_symbols(store, "2026-09-03") == ([], "none")
 
 
 def test_pool_symbols_reconstructs_missing_day_from_band_and_top_trade_value(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
-    monkeypatch.setattr(btt, "RECONSTRUCTED_TOP_TRADE_VALUE", 1)
+    monkeypatch.setattr(tr, "RECONSTRUCTED_TOP_TRADE_VALUE", 1)
     store = CaptureStore(tmp_path / "capture")
     _write_prices(
-        tmp_path, "2026-09-14",
-        [("000001", 103.0, 100.0, 1.0), ("000002", 100.0, 100.0, 50.0), ("000003", 120.0, 100.0, 2.0), ("000004", 99.0, 100.0, 3.0)],
+        tmp_path,
+        "2026-09-14",
+        [
+            ("000001", 103.0, 100.0, 1.0),
+            ("000002", 100.0, 100.0, 50.0),
+            ("000003", 120.0, 100.0, 2.0),
+            ("000004", 99.0, 100.0, 3.0),
+        ],
     )
-    symbols, source = btt._pool_symbols(store, "2026-09-14")
+    symbols, source = tr._pool_symbols(store, "2026-09-14")
     assert source == "reconstructed"
     assert symbols == ["000001", "000002"]
 
@@ -1019,8 +1295,8 @@ def test_pool_symbols_does_not_reconstruct_before_universe_start_or_without_pric
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
     _write_prices(tmp_path, "2026-09-14", [("000001", 103.0, 100.0, 1.0)])
-    assert btt._pool_symbols(store, "2026-09-10") == ([], "none")
-    assert btt._pool_symbols(store, "2026-09-15") == ([], "none")
+    assert tr._pool_symbols(store, "2026-09-10") == ([], "none")
+    assert tr._pool_symbols(store, "2026-09-15") == ([], "none")
 
 
 def test_day_universe_merges_own_and_previous_pool_with_provenance(tmp_path, monkeypatch, caplog) -> None:
@@ -1029,9 +1305,9 @@ def test_day_universe_merges_own_and_previous_pool_with_provenance(tmp_path, mon
     _write_archive(tmp_path, {"2026-09-11": ["000001"], "2026-09-15": ["000009"]})
     _write_prices(tmp_path, "2026-09-14", [("000005", 103.0, 100.0, 1.0)])
     with caplog.at_level("INFO"):
-        assert btt._day_universe("2026-09-14", store) == ["000005", "000001"]
-        assert btt._day_universe("2026-09-15", store) == ["000009", "000005"]
-        assert btt._day_universe("2026-09-11", store) == ["000001"]
+        assert tr._day_universe("2026-09-14", store) == ["000005", "000001"]
+        assert tr._day_universe("2026-09-15", store) == ["000009", "000005"]
+        assert tr._day_universe("2026-09-11", store) == ["000001"]
     assert "own=reconstructed:1 prev=2026-09-11:archive_pool" in caplog.text
     assert "own=archive_pool:1 prev=2026-09-14:reconstructed" in caplog.text
 
@@ -1042,7 +1318,7 @@ def test_unreadable_archive_and_price_history_degrade_to_no_pool(tmp_path, monke
     (tmp_path / "archive.parquet").write_bytes(b"not parquet")
     (tmp_path / "price_history.parquet").write_bytes(b"not parquet")
     with caplog.at_level("WARNING"):
-        assert btt._pool_symbols(store, "2026-09-14") == ([], "none")
+        assert tr._pool_symbols(store, "2026-09-14") == ([], "none")
     assert "archive_unreadable" in caplog.text and "price_history_unreadable" in caplog.text
 
 
@@ -1050,7 +1326,7 @@ def test_history_archive_path_points_at_configured_archive(monkeypatch) -> None:
     monkeypatch.undo()
     from src import settings as _settings
 
-    assert btt._history_archive_path() == Path(_settings.HISTORY_PARQUET_PATH)
+    assert tr._history_archive_path() == Path(_settings.HISTORY_PARQUET_PATH)
 
 
 def _volume_need(tmp_path, monkeypatch, session: str, bar_volume: float, tick_volume: float) -> bool:
@@ -1062,18 +1338,28 @@ def _volume_need(tmp_path, monkeypatch, session: str, bar_volume: float, tick_vo
     day = "2026-09-30"
     ymd = day.replace("-", "")
     symbol = "005930"
-    spec = next(s for s in btt.TAPE_SESSIONS if s.session == session)
+    spec = next(s for s in TAPE_SESSIONS if s.session == session)
     hms = "090000" if session == "regular" else "160000"
     tick_rows = pd.DataFrame([{"cntr_tm": f"{ymd}{hms}", "cur_prc": "10000", "trde_qty": str(int(tick_volume))}])
-    bar_rows = pd.DataFrame([{
-        "cntr_tm": f"{ymd}{hms}", "cur_prc": "10000", "open_pric": "9900",
-        "high_pric": "10100", "low_pric": "9800", "trde_qty": str(int(bar_volume)),
-    }])
+    bar_rows = pd.DataFrame(
+        [
+            {
+                "cntr_tm": f"{ymd}{hms}",
+                "cur_prc": "10000",
+                "open_pric": "9900",
+                "high_pric": "10100",
+                "low_pric": "9800",
+                "trde_qty": str(int(bar_volume)),
+            }
+        ]
+    )
     tick_frame = normalize_tick_frame(tick_rows, "kiwoom", day, symbol)
     bar_frame = normalize_bar_frame(bar_rows, "kiwoom", day, symbol)
     write_tick_partition(tick_frame, day, session, coverage={symbol: _complete_entry(symbol, session, len(tick_frame))})
-    write_intraday_partition(bar_frame, 1, day, session, coverage={symbol: _complete_entry(symbol, session, len(bar_frame))})
-    return btt._session_need(symbol, day, spec, btt.PartitionIndex())
+    write_intraday_partition(
+        bar_frame, 1, day, session, coverage={symbol: _complete_entry(symbol, session, len(bar_frame))}
+    )
+    return tr._session_need(symbol, day, spec, tr.PartitionIndex())
 
 
 def test_aftermarket_need_on_any_shortfall(tmp_path, monkeypatch) -> None:
@@ -1095,13 +1381,29 @@ def test_regular_need_threshold_unchanged(tmp_path, monkeypatch) -> None:
 
 def test_session_need_existing_causes_still_hold(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
-    regular = next(s for s in btt.TAPE_SESSIONS if s.session == "regular")
+    regular = next(s for s in TAPE_SESSIONS if s.session == "regular")
     # Missing tick partition is a need.
-    assert btt._session_need("005930", "2026-09-30", regular, btt.PartitionIndex()) is True
+    assert tr._session_need("005930", "2026-09-30", regular, tr.PartitionIndex()) is True
     # Zero rows are a need regardless of volume.
-    index = btt.PartitionIndex()
+    index = tr.PartitionIndex()
     index._ticks[("2026-09-30", "regular")] = {
-        "005930": btt._TickStats(rows=0, truncated=False, out_of_window=False, volume=10000.0)
+        "005930": tr._TickStats(rows=0, truncated=False, out_of_window=False, volume=10000.0)
     }
     index._bars[("2026-09-30", "regular")] = {"005930": 10000.0}
-    assert btt._session_need("005930", "2026-09-30", regular, index) is True
+    assert tr._session_need("005930", "2026-09-30", regular, index) is True
+
+
+def test_cli_exposes_no_engine_aliases() -> None:
+    for name in (
+        "_collect_needs",
+        "_order_tasks",
+        "_run_tasks",
+        "_read_settled",
+        "_ledger_path",
+        "_parse_deadline",
+        "PartitionIndex",
+        "_CLOSE_AUCTION_TS",
+        "_REGULAR_READY_HHMMSS",
+        "_TICK_SESSIONS",
+    ):
+        assert hasattr(btt, name) is False, name

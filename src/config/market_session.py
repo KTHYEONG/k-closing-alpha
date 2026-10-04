@@ -32,6 +32,13 @@ CLOSING_AUCTION_CONFIRM_EARLIEST_HHMMSS: str = DECISION_WINDOW_END_HHMMSS
 # 확정 재폴링 데드라인 (VI 임의연장 + 벤더 반영 지연 포괄)
 CLOSING_AUCTION_FINALIZE_DEADLINE_HHMMSS: str = "153300"
 DEFAULT_BAR_INTERVAL_MINUTES: int = 1
+BAR_STAMP_START: str = "start"
+BAR_STAMP_END: str = "end"
+# Measured on stored partitions (2026-10-04): KIS/Kiwoom stamp a 1m bar at its minute start (regular 090000..151900,
+# NXT 154000..), LS at its minute end (090100..152000). Unlisted vendors must fail closed, never default.
+INTRADAY_BAR_STAMP_CONVENTION: Mapping[str, str] = MappingProxyType(
+    {"kis": BAR_STAMP_START, "kiwoom": BAR_STAMP_START, "ls": BAR_STAMP_END}
+)
 INTRADAY_SESSION_REGULAR: str = "regular"
 INTRADAY_SESSION_NXT_AFTERMARKET: str = "nxt_aftermarket"
 INTRADAY_SESSION_NXT_PREMARKET: str = "nxt_premarket"

@@ -110,6 +110,108 @@ def test_realize_decision_returns_rejects_missing_columns():
         realize_decision_returns(_decisions("2026-09-01", [("000001", 0.03)]), ph.drop(columns=["open"]))
 
 
+def test_realize_decision_returns_keeps_legal_limit_moves_realized():
+    import numpy as np
+    import pytest
+    from src.strategy.growth_shadow import STATUS_REALIZED, realize_decision_returns
+
+    # Given: 결정일 종가 10,000, 익일 시가 상한 13,000 / 하한 7,000
+    decisions = _decisions("2026-09-01", [("000001", 0.03), ("000002", 0.02), ("000003", 0.01)])
+    ph = _ph([
+        ("2026-09-01", "000001", 10000, 10000), ("2026-09-01", "000002", 10000, 10000),
+        ("2026-09-01", "000003", 10000, 10000),
+        ("2026-09-02", "000001", 13000, 13000), ("2026-09-02", "000002", 7000, 7000),
+        ("2026-09-02", "000003", 10100, 10100),
+    ])
+    # When
+    out = realize_decision_returns(decisions, ph).set_index("symbol")
+    # Then: 법정 상·하한 이동은 실현 (부동소수점 0.30000000000000004 포함)
+    assert out.loc["000001", "status"] == STATUS_REALIZED
+    assert out.loc["000002", "status"] == STATUS_REALIZED
+    assert out.loc["000001", "gross_return"] == pytest.approx(0.30)
+    assert out.loc["000002", "gross_return"] == pytest.approx(-0.30)
+    assert np.isfinite(out.loc["000001", "net_return"])
+
+
+def test_realize_decision_returns_flags_unadjusted_split_day():
+    import numpy as np
+    from src.strategy.growth_shadow import STATUS_PRICE_DISCONTINUITY, STATUS_REALIZED, realize_decision_returns
+
+    # Given: 종가 10,000 → 익일 시가 5,000 (-50%, 미수정 가격의 액면분할 인공물)
+    decisions = _decisions("2026-09-01", [("000001", 0.03), ("000002", 0.02), ("000003", 0.01)])
+    ph = _ph([
+        ("2026-09-01", "000001", 10000, 10000), ("2026-09-01", "000002", 10000, 10000),
+        ("2026-09-01", "000003", 10000, 10000),
+        ("2026-09-02", "000001", 5000, 5000), ("2026-09-02", "000002", 10100, 10100),
+        ("2026-09-02", "000003", 9900, 9900),
+    ])
+    # When
+    out = realize_decision_returns(decisions, ph).set_index("symbol")
+    # Then: 불연속 행은 gross/net 모두 NaN, 나머지는 실현
+    assert out.loc["000001", "status"] == STATUS_PRICE_DISCONTINUITY
+    assert np.isnan(out.loc["000001", "gross_return"])
+    assert np.isnan(out.loc["000001", "net_return"])
+    assert out.loc["000002", "status"] == STATUS_REALIZED
+
+
+def test_build_shadow_ledger_discontinuity_voids_the_days_arms():
+    import numpy as np
+    import pandas as pd
+    from src.strategy.growth_shadow import build_shadow_ledger, realize_decision_returns
+
+    # Given: 2일치 3픽, 둘째 날 1픽이 불연속
+    decisions = pd.concat(
+        [
+            _decisions("2026-09-01", [("000001", 0.03), ("000002", 0.02), ("000003", 0.01)]),
+            _decisions("2026-09-02", [("000001", 0.03), ("000002", 0.02), ("000003", 0.01)]),
+        ],
+        ignore_index=True,
+    )
+    ph = _ph([
+        ("2026-09-01", "000001", 10000, 10000), ("2026-09-01", "000002", 10000, 10000),
+        ("2026-09-01", "000003", 10000, 10000),
+        ("2026-09-02", "000001", 10100, 10100), ("2026-09-02", "000002", 10100, 10100),
+        ("2026-09-02", "000003", 10100, 10100),
+        ("2026-09-03", "000001", 5000, 5000), ("2026-09-03", "000002", 10200, 10200),
+        ("2026-09-03", "000003", 10200, 10200),
+    ])
+    # When
+    ledger = build_shadow_ledger(realize_decision_returns(decisions, ph))
+    # Then: 불연속일(09-02 결정분)의 세 암은 NaN, 전일(09-01)은 그대로
+    row = ledger.set_index("decision_date")
+    assert np.isnan(row.loc["2026-09-02", "arm_k3_net"])
+    assert np.isnan(row.loc["2026-09-02", "arm_k2_net"])
+    assert np.isnan(row.loc["2026-09-02", "arm_k3_scoreprop_net"])
+    assert np.isfinite(row.loc["2026-09-01", "arm_k3_net"])
+
+
+def test_realize_decision_returns_pending_and_exit_unavailable_take_precedence():
+    from src.strategy.growth_shadow import (
+        STATUS_EXIT_UNAVAILABLE,
+        STATUS_PENDING,
+        realize_decision_returns,
+    )
+
+    # Given: 익일 자체가 없는 픽과 시가 0인 픽
+    decisions = _decisions("2026-09-02", [("000001", 0.03), ("000002", 0.02), ("000003", 0.01)])
+    ph = _ph([
+        ("2026-09-02", "000001", 10000, 10000), ("2026-09-02", "000002", 10000, 10000),
+        ("2026-09-02", "000003", 10000, 10000),
+    ])
+    out = realize_decision_returns(decisions, ph)
+    assert (out["status"] == STATUS_PENDING).all()
+
+    decisions = _decisions("2026-09-01", [("000001", 0.03), ("000002", 0.02), ("000003", 0.01)])
+    ph = _ph([
+        ("2026-09-01", "000001", 10000, 10000), ("2026-09-01", "000002", 10000, 10000),
+        ("2026-09-01", "000003", 10000, 10000),
+        ("2026-09-02", "000001", 0, 10000), ("2026-09-02", "000002", 0, 10000),
+        ("2026-09-02", "000003", 0, 10000),
+    ])
+    out = realize_decision_returns(decisions, ph)
+    assert (out["status"] == STATUS_EXIT_UNAVAILABLE).all()
+
+
 def test_build_shadow_ledger_k2_is_mean_of_top2_by_rank():
     import pytest
     from src.strategy.growth_shadow import build_shadow_ledger
@@ -349,3 +451,29 @@ def test_build_shadow_ledger_scoreprop_concentrates_toward_higher_pred_rank():
     expected = float((w * realized["net_return"].to_numpy()).sum())
     assert row["arm_k3_scoreprop_net"] == pytest.approx(expected)
     assert row["arm_k3_scoreprop_net"] > row["arm_k3_net"]
+
+
+def test_build_shadow_ledger_unrealized_day_does_not_reopen_closed_gate():
+    import numpy as np
+    import pandas as pd
+
+    from src.strategy.growth_shadow import STATUS_PRICE_DISCONTINUITY, STATUS_REALIZED, build_shadow_ledger
+
+    days = pd.bdate_range("2025-01-01", periods=300)
+    rows = []
+    for i, day in enumerate(days):
+        for rank in (1, 2, 3):
+            unrealized = i == 150 and rank == 1
+            rows.append({
+                "decision_date": day, "symbol": f"{rank:06d}", "pred": 1.0 / rank, "rank": rank,
+                "gross_return": np.nan if unrealized else -0.01,
+                "net_return": np.nan if unrealized else -0.012,
+                "status": STATUS_PRICE_DISCONTINUITY if unrealized else STATUS_REALIZED,
+            })
+
+    ledger = build_shadow_ledger(pd.DataFrame(rows))
+
+    after_warmup = ledger.iloc[121:]
+    assert not bool(after_warmup["trail_gate_open"].any())
+    assert bool((after_warmup["arm_k3_trail_net"] == 0.0).all())
+    assert bool(ledger.iloc[:120]["trail_gate_open"].all())

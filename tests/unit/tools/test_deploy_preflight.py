@@ -5,11 +5,11 @@ import dataclasses
 
 def _compatible_bundle() -> dict:
     from src.ml.costaware_topk import MIN_TOP_K
-    from src.ml.topk_ranker_research import RANKER_FEATURE_COLS
-    from src.strategy.contract import COST_AWARE_UNIVERSE
+    from src.ml.topk_contract import RANKER_FEATURE_COLS
+    from src.strategy.contract import PRODUCTION_STRATEGY
 
     return {
-        "select_universe": dataclasses.asdict(COST_AWARE_UNIVERSE),
+        "select_universe": dataclasses.asdict(PRODUCTION_STRATEGY.universe),
         "feature_cols": list(RANKER_FEATURE_COLS[:5]),
         "top_k": MIN_TOP_K,
     }
@@ -22,12 +22,12 @@ def test_check_bundle_serving_compat_accepts_compatible_bundle() -> None:
 
 
 def test_check_bundle_serving_compat_reports_screen_drift() -> None:
-    from src.strategy.contract import COST_AWARE_UNIVERSE
+    from src.strategy.contract import PRODUCTION_STRATEGY
     from src.tools.deploy_preflight import check_bundle_serving_compat
 
     bundle = _compatible_bundle()
     drifted = dict(bundle["select_universe"])
-    drifted["exclude_non_screenable_class"] = not COST_AWARE_UNIVERSE.exclude_non_screenable_class
+    drifted["exclude_non_screenable_class"] = not PRODUCTION_STRATEGY.universe.exclude_non_screenable_class
     bundle["select_universe"] = drifted
 
     issues = check_bundle_serving_compat(bundle)
@@ -61,12 +61,12 @@ def test_check_bundle_serving_compat_reports_empty_feature_cols() -> None:
 
 
 def test_check_bundle_serving_compat_reports_all_issues_together() -> None:
-    from src.strategy.contract import COST_AWARE_UNIVERSE
+    from src.strategy.contract import PRODUCTION_STRATEGY
     from src.tools.deploy_preflight import check_bundle_serving_compat
 
     bundle = _compatible_bundle()
     drifted = dict(bundle["select_universe"])
-    drifted["exclude_non_screenable_class"] = not COST_AWARE_UNIVERSE.exclude_non_screenable_class
+    drifted["exclude_non_screenable_class"] = not PRODUCTION_STRATEGY.universe.exclude_non_screenable_class
     bundle["select_universe"] = drifted
     bundle["feature_cols"] = [*bundle["feature_cols"], "f_future"]
     bundle["top_k"] = 5
@@ -140,3 +140,32 @@ def test_main_writes_nothing_and_reports_ok(tmp_path, caplog) -> None:
     assert [path.name for path in after] == [path.name for path in before]
     assert all(after[path].st_mtime_ns == before[path].st_mtime_ns for path in after)
     assert any("stage=deploy_preflight status=OK" in rec.message for rec in caplog.records)
+
+
+def test_check_bundle_serving_compat_accepts_serving_001_bundle() -> None:
+    import dataclasses
+
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+    from src.tools.deploy_preflight import check_bundle_serving_compat
+
+    bundle = _compatible_bundle()
+    bundle["strategy_id"] = "KCA-TOPK-COSTAWARE-001"
+    bundle["select_universe"] = dataclasses.asdict(COST_AWARE_UNIVERSE)
+
+    assert check_bundle_serving_compat(bundle) == []
+
+
+def test_check_bundle_serving_compat_rejects_uncertified_class_drift() -> None:
+    import dataclasses
+
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+    from src.tools.deploy_preflight import check_bundle_serving_compat
+
+    bundle = _compatible_bundle()
+    bundle["select_universe"] = dataclasses.asdict(COST_AWARE_UNIVERSE)
+
+    issues = check_bundle_serving_compat(bundle)
+
+    assert len(issues) == 1
+    assert "bundle screen drift" in issues[0]
+    assert "exclude_non_screenable_class" in issues[0]

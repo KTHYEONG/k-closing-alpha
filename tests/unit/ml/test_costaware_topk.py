@@ -153,7 +153,7 @@ def test_evaluate_verdict_passes_when_all_gates_met() -> None:
     post = RegimeMetrics(
         regime="post_reform", n_calendar_days=878, n_days_with_signal=878, n_days_feasible=866,
         feasible_day_fraction=0.986, coverage_status="OK", mean_net_bp=18.75, median_net_bp=5.79,
-        std_net_bp=180.0, win_rate=N, t_stat=N, sharpe=N, ci_low_bp=6.74, ci_high_bp=30.15, dsr=0.6,
+        std_net_bp=180.0, win_rate=0.518, t_stat=3.08, sharpe=1.65, ci_low_bp=6.74, ci_high_bp=30.15, dsr=0.6,
     )
     pre = RegimeMetrics(
         regime="pre_reform", n_calendar_days=1903, n_days_with_signal=0, n_days_feasible=1087,
@@ -164,13 +164,13 @@ def test_evaluate_verdict_passes_when_all_gates_met() -> None:
     full = RegimeMetrics(
         regime="full_history", n_calendar_days=2781, n_days_with_signal=878, n_days_feasible=1953,
         feasible_day_fraction=0.702, coverage_status="INSUFFICIENT_COVERAGE", mean_net_bp=18.75,
-        median_net_bp=5.79, std_net_bp=180.0, win_rate=N, t_stat=N, sharpe=N,
+        median_net_bp=5.79, std_net_bp=180.0, win_rate=0.518, t_stat=3.08, sharpe=1.65,
         ci_low_bp=6.74, ci_high_bp=30.15, dsr=0.6,
     )
     stress = [
-        CostStressPoint(regime="post_reform", round_trip_ticks=2.0, n_days=878, mean_net_bp=18.75, median_net_bp=5.79, t_stat=N, passes=True),
-        CostStressPoint(regime="post_reform", round_trip_ticks=3.0, n_days=878, mean_net_bp=13.41, median_net_bp=0.30, t_stat=N, passes=True),
-        CostStressPoint(regime="post_reform", round_trip_ticks=4.0, n_days=878, mean_net_bp=8.07, median_net_bp=-5.18, t_stat=N, passes=False),
+        CostStressPoint(regime="post_reform", round_trip_ticks=2.0, n_days=878, mean_net_bp=18.75, median_net_bp=5.79, t_stat=3.08, passes=True),
+        CostStressPoint(regime="post_reform", round_trip_ticks=3.0, n_days=878, mean_net_bp=13.41, median_net_bp=0.30, t_stat=2.20, passes=True),
+        CostStressPoint(regime="post_reform", round_trip_ticks=4.0, n_days=878, mean_net_bp=8.07, median_net_bp=-5.18, t_stat=1.33, passes=False),
     ]
 
     verdict, reasons = evaluate_verdict({"pre_reform": pre, "post_reform": post, "full_history": full}, stress)
@@ -185,17 +185,17 @@ def test_evaluate_verdict_fails_on_negative_median_despite_positive_mean() -> No
     post = RegimeMetrics(
         regime="post_reform", n_calendar_days=878, n_days_with_signal=878, n_days_feasible=866,
         feasible_day_fraction=0.986, coverage_status="OK", mean_net_bp=34.16, median_net_bp=-14.69,
-        std_net_bp=280.0, win_rate=N, t_stat=N, sharpe=N, ci_low_bp=15.34, ci_high_bp=52.95, dsr=0.6,
+        std_net_bp=280.0, win_rate=0.469, t_stat=3.60, sharpe=1.93, ci_low_bp=15.34, ci_high_bp=52.95, dsr=0.6,
     )
     full = RegimeMetrics(
         regime="full_history", n_calendar_days=2781, n_days_with_signal=878, n_days_feasible=1953,
         feasible_day_fraction=0.702, coverage_status="INSUFFICIENT_COVERAGE", mean_net_bp=34.16,
-        median_net_bp=-14.69, std_net_bp=280.0, win_rate=N, t_stat=N, sharpe=N,
+        median_net_bp=-14.69, std_net_bp=280.0, win_rate=0.469, t_stat=3.60, sharpe=1.93,
         ci_low_bp=15.34, ci_high_bp=52.95, dsr=0.6,
     )
     stress = [
-        CostStressPoint(regime="post_reform", round_trip_ticks=2.0, n_days=878, mean_net_bp=34.16, median_net_bp=-14.69, t_stat=N, passes=False),
-        CostStressPoint(regime="post_reform", round_trip_ticks=3.0, n_days=878, mean_net_bp=29.06, median_net_bp=-20.00, t_stat=N, passes=False),
+        CostStressPoint(regime="post_reform", round_trip_ticks=2.0, n_days=878, mean_net_bp=34.16, median_net_bp=-14.69, t_stat=3.60, passes=False),
+        CostStressPoint(regime="post_reform", round_trip_ticks=3.0, n_days=878, mean_net_bp=29.06, median_net_bp=-20.00, t_stat=3.06, passes=False),
     ]
 
     verdict, reasons = evaluate_verdict({"post_reform": post, "full_history": full}, stress)
@@ -209,13 +209,13 @@ def test_evaluate_verdict_insufficient_coverage_short_circuits_statistics() -> N
     post = RegimeMetrics(
         regime="post_reform", n_calendar_days=100, n_days_with_signal=40, n_days_feasible=40,
         feasible_day_fraction=0.40, coverage_status="INSUFFICIENT_COVERAGE", mean_net_bp=500.0,
-        median_net_bp=500.0, std_net_bp=10.0, win_rate=N, t_stat=N, sharpe=N,
+        median_net_bp=500.0, std_net_bp=10.0, win_rate=1.0, t_stat=99.0, sharpe=5.0,
         ci_low_bp=490.0, ci_high_bp=510.0, dsr=0.9,
     )
     full = RegimeMetrics(
         regime="full_history", n_calendar_days=200, n_days_with_signal=40, n_days_feasible=40,
         feasible_day_fraction=0.20, coverage_status="INSUFFICIENT_COVERAGE", mean_net_bp=500.0,
-        median_net_bp=500.0, std_net_bp=10.0, win_rate=N, t_stat=N, sharpe=N,
+        median_net_bp=500.0, std_net_bp=10.0, win_rate=1.0, t_stat=99.0, sharpe=5.0,
         ci_low_bp=490.0, ci_high_bp=510.0, dsr=0.9,
     )
 
@@ -286,6 +286,8 @@ def test_run_cost_aware_topk_backtest_end_to_end_produces_report() -> None:
             ph.loc[(ph["date"] == pd.Timestamp(exit_d)) & (ph["symbol"] == sym), "open"] = target_open
 
     prepared, _ = prepare_price_panel(ph)
+    prepared["is_screenable"] = True
+    prepared["screenable_source"] = "real"
     market_dates = np.array(sorted(prepared["date"].unique()))
     d_to_idx = {d: i for i, d in enumerate(market_dates)}
 
@@ -303,7 +305,7 @@ def test_run_cost_aware_topk_backtest_end_to_end_produces_report() -> None:
     assert post.feasible_day_fraction == 1.0
     # top-3 of {000001..4} by ascending tick_cost_bp excludes 000001 (highest tick cost).
     # Exact values confirmed against the real pipeline: mean_net_bp=168.43, median_net_bp=168.43,
-    # t_stat=N, win_rate=N; 3-tick stress mean_net_bp=163.02, median_net_bp=163.02.
+    # t_stat=2.92, win_rate=1.0; 3-tick stress mean_net_bp=163.02, median_net_bp=163.02.
     assert post.mean_net_bp == pytest.approx(168.43, abs=0.01)
     assert post.median_net_bp == pytest.approx(168.43, abs=0.01)
     assert post.win_rate == 1.0
@@ -321,9 +323,9 @@ def test_report_to_frame_flattens_regimes_and_cost_stress() -> None:
     rm = RegimeMetrics(
         regime="post_reform", n_calendar_days=3, n_days_with_signal=3, n_days_feasible=3,
         feasible_day_fraction=1.0, coverage_status="OK", mean_net_bp=169.16, median_net_bp=169.16,
-        std_net_bp=100.0, win_rate=N, t_stat=N, sharpe=N, ci_low_bp=100.0, ci_high_bp=240.0, dsr=0.5,
+        std_net_bp=100.0, win_rate=1.0, t_stat=2.93, sharpe=26.85, ci_low_bp=100.0, ci_high_bp=240.0, dsr=0.5,
     )
-    cs = CostStressPoint(regime="post_reform", round_trip_ticks=3.0, n_days=3, mean_net_bp=163.74, median_net_bp=163.74, t_stat=N, passes=True)
+    cs = CostStressPoint(regime="post_reform", round_trip_ticks=3.0, n_days=3, mean_net_bp=163.74, median_net_bp=163.74, t_stat=2.5, passes=True)
     report = CostAwareTopKReport(
         strategy_id="KCA-TOPK-COSTAWARE-001", top_k=3, universe={}, cost={}, date_min="2023-01-23",
         date_max="2023-01-30", regimes={"post_reform": rm}, cost_stress=[cs],
@@ -438,8 +440,8 @@ def test_evaluate_verdict_documents_regime_break_without_pooling() -> None:
         return RegimeMetrics(
             regime=regime, n_calendar_days=10, n_days_with_signal=10, n_days_feasible=10,
             feasible_day_fraction=1.0, coverage_status="OK", mean_net_bp=mean,
-            median_net_bp=median, std_net_bp=100.0, win_rate=N, t_stat=N,
-            sharpe=N, ci_low_bp=1.0, ci_high_bp=2.0, dsr=0.5,
+            median_net_bp=median, std_net_bp=100.0, win_rate=0.6, t_stat=3.0,
+            sharpe=1.0, ci_low_bp=1.0, ci_high_bp=2.0, dsr=0.5,
         )
 
     post = _rm("post_reform", 10.0, 5.0)
@@ -447,7 +449,7 @@ def test_evaluate_verdict_documents_regime_break_without_pooling() -> None:
     stress = [
         CostStressPoint(
             regime="post_reform", round_trip_ticks=3.0, n_days=10,
-            mean_net_bp=8.0, median_net_bp=4.0, t_stat=N, passes=True,
+            mean_net_bp=8.0, median_net_bp=4.0, t_stat=2.5, passes=True,
         ),
     ]
 
@@ -473,7 +475,7 @@ def test_main_writes_parquet_report_and_rejects_missing_price_history(tmp_path, 
     rm = RegimeMetrics(
         regime="post_reform", n_calendar_days=1, n_days_with_signal=1, n_days_feasible=1,
         feasible_day_fraction=1.0, coverage_status="OK", mean_net_bp=10.0, median_net_bp=5.0,
-        std_net_bp=1.0, win_rate=N, t_stat=N, sharpe=N, ci_low_bp=1.0, ci_high_bp=2.0, dsr=0.5,
+        std_net_bp=1.0, win_rate=1.0, t_stat=3.0, sharpe=1.0, ci_low_bp=1.0, ci_high_bp=2.0, dsr=0.5,
     )
     fake_report = CostAwareTopKReport(
         strategy_id="KCA-TOPK-COSTAWARE-001", top_k=5, universe={}, cost={},

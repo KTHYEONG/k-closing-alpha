@@ -291,3 +291,26 @@ def test_price_ingest_main_triggers_classification_capture(monkeypatch):
     monkeypatch.setattr("src.strategy.t1_attribution.run_t1_attribution", lambda: None)
     price_ingest.main()
     assert seen["dates"] == ["2026-09-18"]
+
+
+def test_classification_gap_dates_lists_missing_dates_inside_coverage(tmp_path) -> None:
+    from src.daily.security_classification import classification_gap_dates
+
+    path = tmp_path / "security_classification.parquet"
+    pd.DataFrame({"date": pd.to_datetime(["2026-09-08", "2026-09-10"]), "symbol": ["000001", "000001"]}).to_parquet(path)
+    calendar = pd.to_datetime(["2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11"])
+
+    gaps = classification_gap_dates(list(calendar), path=path, limit=5)
+
+    assert gaps == [pd.Timestamp("2026-09-09"), pd.Timestamp("2026-09-11")]
+    assert classification_gap_dates(list(calendar), path=path, limit=1) == [pd.Timestamp("2026-09-09")]
+    assert classification_gap_dates(list(calendar), path=tmp_path / "absent.parquet") == []
+
+
+def test_classification_gap_dates_empty_panel_has_no_gaps(tmp_path) -> None:
+    from src.daily.security_classification import classification_gap_dates
+
+    path = tmp_path / "security_classification.parquet"
+    pd.DataFrame({"date": pd.to_datetime([]), "symbol": pd.Series([], dtype=str)}).to_parquet(path)
+
+    assert classification_gap_dates([pd.Timestamp("2026-09-08")], path=path) == []
