@@ -146,7 +146,7 @@ def test_token_payload_is_excluded(monkeypatch: Any) -> None:
     client = _kis_client(monkeypatch)
     issued = {"n": 0}
 
-    async def _fake_issue(session: Any, force_refresh: bool = False) -> str:
+    async def _fake_issue(session: Any, force_refresh: bool = False, *, rejected_token: str | None = None) -> str:
         issued["n"] += 1
         client.token = "T2"
         return "T2"

@@ -28,7 +28,7 @@ _EXPIRY_RE = re.compile(r"(\d{6})")
 
 
 def _to_ymd(ts: pd.Timestamp) -> str:
-    return pd.Timestamp(ts).strftime("%Y%m%d")
+    return str(pd.Timestamp(ts).strftime("%Y%m%d"))
 
 
 def _krx_front_month_row(raw: pd.DataFrame, ymd: str) -> dict[str, float] | None:

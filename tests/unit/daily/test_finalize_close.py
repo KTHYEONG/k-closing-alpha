@@ -1871,3 +1871,61 @@ def test_amain_missing_cohort_degrades_to_uncaptured_finalization(tmp_path, monk
     assert seen["capture_store"] is None
     assert seen["run_id"] is None
     assert seen["cohort_id"] is None
+
+
+def test_zero_rows_with_missing_session_degrades(monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import finalize_close
+
+    snap = "2026-09-14"
+    kst = ZoneInfo("Asia/Seoul")
+    monkeypatch.setattr(finalize_close.archive, "fetch_archive_snapshot", lambda *a, **k: _empty_archive_frame().copy())
+
+    class _SessionNoneClient:
+        async def get_market_index_history(self, session, *args, **kwargs):
+            if session is None:
+                raise AttributeError("session is None")
+            raise AssertionError("unreachable")
+
+    outcomes: list = []
+    asyncio.run(
+        finalize_close.run_close_finalization(
+            snapshot_date=snap,
+            clients=[_SessionNoneClient()],
+            session=None,
+            now_fn=lambda: datetime(2026, 9, 14, 15, 32, 0, tzinfo=kst),
+            sleep_fn=lambda _s: asyncio.sleep(0),
+            on_outcome=lambda o, **k: outcomes.append((o, k)),
+        )
+    )
+    assert outcomes and outcomes[0][0] == "DEGRADED"
+    assert outcomes[0][1]["reason"] == "calendar_unavailable"
+
+
+def test_confirmed_quote_outputs_default_to_empty_dicts() -> None:
+    import asyncio
+
+    from src.daily.finalize_close import fetch_confirmed_quote
+
+    class _BadQuoteClient:
+        async def get_current_price(self, session, code, **kwargs):
+            return {"rt_cd": "1", "msg1": "busy"}
+
+        async def get_orderbook_snapshot(self, session, code, **kwargs):
+            return {"rt_cd": "0", "output2": [{"stck_bsop_date": "x"}]}
+
+    price_out, book_out2 = asyncio.run(fetch_confirmed_quote(_BadQuoteClient(), object(), "005930"))
+    assert (price_out, book_out2) == ({}, {})
+
+    class _ListOutputClient:
+        async def get_current_price(self, session, code, **kwargs):
+            return {"rt_cd": "0", "output": [{"stck_prpr": "1"}]}
+
+        async def get_orderbook_snapshot(self, session, code, **kwargs):
+            return {"rt_cd": "0", "output2": [{"a": 1}]}
+
+    price_out2, book_out2b = asyncio.run(fetch_confirmed_quote(_ListOutputClient(), object(), "005930"))
+    assert (price_out2, book_out2b) == ({}, {})

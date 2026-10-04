@@ -30,6 +30,7 @@ from src.daily.price_ingest import (
     fetch_index_closes,
     fetch_krx_daily,
 )
+from src.data.io_utils import store_write_lock
 from src.data.panel_integrity import heal_price_history_panel
 from src.data.parquet_codec import write_price_history_parquet
 
@@ -466,6 +467,9 @@ async def run_panel_rebuild(
 def swap_panel(rebuilt: Path, live: Path) -> Path:
     """Atomically replace the live panel with a rebuilt file via a timestamped backup.
 
+    Both renames run under the live panel's store write lock so a swap can never interleave with an
+    in-flight price ingest (which would otherwise overwrite the swapped panel with its own merge).
+
     Args:
         rebuilt: Validated rebuild parquet.
         live: Live panel path.
@@ -474,17 +478,19 @@ def swap_panel(rebuilt: Path, live: Path) -> Path:
         Backup path holding the previous live file.
 
     Raises:
-        FileNotFoundError: When the rebuilt file does not exist.
+        FileNotFoundError: When the rebuilt file does not exist (checked before locking).
+        StoreLockTimeoutError: The live panel lock was not acquired in time; neither file was moved.
     """
     rebuilt = Path(rebuilt)
     live = Path(live)
     if not rebuilt.exists():
         raise FileNotFoundError(f"rebuilt panel not found: {rebuilt}")
-    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    backup = live.with_name(f"{live.stem}.{stamp}.bak.parquet")
-    if live.exists():
-        os.replace(live, backup)
-    os.replace(rebuilt, live)
+    with store_write_lock(live, purpose="price-history"):
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        backup = live.with_name(f"{live.stem}.{stamp}.bak.parquet")
+        if live.exists():
+            os.replace(live, backup)
+        os.replace(rebuilt, live)
     logger.info("[DATA] stage=krx_panel_rebuild status=SWAPPED live=%s backup=%s", live, backup)
     return backup
 

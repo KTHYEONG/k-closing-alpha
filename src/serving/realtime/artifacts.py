@@ -7,10 +7,15 @@ trains, calibrates, evaluates, uploads, or overwrites model artifacts.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 from joblib import load
+
+from src.ml.topk_contract import assert_feature_contract
+
+logger = logging.getLogger(__name__)
 
 _BUNDLE_FILENAME = "sizing_pipeline_bundle.joblib"
 _MODEL_BUNDLE_KEYS = ("rank_model", "quantile_models", "calibrators")
@@ -23,6 +28,9 @@ def load_model_bundle(import_dir: str = "artifacts/models") -> dict[str, Any]:
     ``quantile_models`` / ``calibrators`` model keys. A missing directory or
     bundle file raises ``FileNotFoundError``; a malformed or schema-incompatible
     bundle raises ``ValueError``. This loader never retrains or writes artifacts.
+    Also fails closed (``ValueError``) when the bundle's feature-contract version
+    differs from this code's (``src.ml.topk_contract``). A bundle without the version key is accepted as
+    the legacy baseline with a WARNING only while the code version equals that baseline.
     """
     path = os.path.join(import_dir, _BUNDLE_FILENAME)
     if not os.path.isdir(import_dir) or not os.path.isfile(path):
@@ -38,4 +46,5 @@ def load_model_bundle(import_dir: str = "artifacts/models") -> dict[str, Any]:
         raise ValueError(
             f"bundle is missing required model keys: {missing}; refusing to serve inference"
         )
+    assert_feature_contract(bundle, source=path)
     return bundle

@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
-from zoneinfo import ZoneInfo
 
+from src.api._common import SEOUL_TZ, deadline_remaining, now_seoul, resolve_chart_budget, validate_target_ymd
+from src.api._transport import RetryPolicy, send_with_auth_retry
 from src.api.kis.rate_limit import HostPacedRateLimiter, get_host_rate_limiter, host_admission_state_path
 from src.config import settings
 from src.data.capture_contracts import RawCaptureError
@@ -37,7 +37,6 @@ KIWOOM_AUTH_EXPIRED_MSG_CODE: str = "8005"
 
 KIWOOM_REVOKE_PATH: str = "/oauth2/revoke"
 
-_SEOUL = ZoneInfo("Asia/Seoul")
 _CNTR_TM_RE = re.compile(r"^\d{14}$")
 
 
@@ -115,15 +114,16 @@ def _parse_tick_remaining(next_key: str, base_code: str, ymd: str) -> int | None
     return int(tail) if tail.isdigit() else None
 
 
-def _now_seoul() -> datetime:
-    return datetime.now(_SEOUL)
-
-
 @dataclass(frozen=True)
 class KiwoomIssuedToken:
-    """Token value plus its vendor-declared expiry (Asia/Seoul, from expires_dt)."""
+    """Token value plus its vendor-declared expiry (Asia/Seoul, from expires_dt).
 
-    token: str
+    Attributes:
+        token: Bearer token; excluded from ``repr``.
+        expires_at: Aware Asia/Seoul expiry.
+    """
+
+    token: str = field(repr=False)
     expires_at: datetime
 
 
@@ -140,33 +140,12 @@ def _parse_kiwoom_expires_dt(raw: Any) -> datetime:
         naive = datetime.strptime(text, "%Y%m%d%H%M%S")
     except ValueError:
         raise RuntimeError(f"Kiwoom token expiry unparsable: {text!r}") from None
-    return naive.replace(tzinfo=_SEOUL)
-
-
-def _validate_target_ymd(target_date: str) -> str:
-    ymd = str(target_date).replace("-", "")
-    try:
-        datetime.strptime(ymd, "%Y%m%d")
-    except ValueError:
-        raise ValueError(f"invalid target date: {target_date!r}") from None
-    return ymd
-
-
-def _resolve_chart_budget(budget: ChartBudget | None, default_pages: int) -> tuple[int, datetime | None]:
-    if budget is None:
-        return max(1, int(default_pages)), None
-    return max(1, int(budget.max_pages)), budget.deadline
-
-
-def _deadline_remaining(deadline: datetime | None) -> float | None:
-    if deadline is None:
-        return None
-    return (deadline - _now_seoul()).total_seconds()
+    return naive.replace(tzinfo=SEOUL_TZ)
 
 
 class KiwoomApiClient:
     def __init__(self, app_key: str | None = None, secret_key: str | None = None, base_url: str | None = None) -> None:
-        """Bind credentials, preferring explicit arguments over the live Settings instance.
+        """Bind credentials and retry policy, preferring explicit arguments over the live Settings instance.
 
         Args:
             app_key: Explicit app key; falls back to ``settings.KIWOOM_APP_KEY``.
@@ -178,6 +157,8 @@ class KiwoomApiClient:
         self.base_url = base_url or settings.KIWOOM_BASE_URL
         self.token: str | None = None
         self._token_lock: asyncio.Lock | None = None
+        self._rate_limit_max_retries: int = int(settings.KIWOOM_RATE_LIMIT_MAX_RETRIES)
+        self._rate_limit_backoff: float = float(settings.KIWOOM_RATE_LIMIT_BACKOFF_SECONDS)
 
     def _limiter_for(self, api_id: str) -> HostPacedRateLimiter:
         return get_host_rate_limiter(host_admission_state_path("kiwoom", self.app_key or "", api_id), _KIWOOM_TR_RATE_PER_SEC)
@@ -186,21 +167,18 @@ class KiwoomApiClient:
         """Drop the cached token so the next request fetches one; the vendor reuses a live token and expires it ~24h after issuance."""
         self.token = None
 
-    async def issue_token(self, session) -> KiwoomIssuedToken:
+    async def issue_token(self, session: aiohttp.ClientSession) -> KiwoomIssuedToken:
         """Issue (or receive the live) token and return it with its vendor-declared expiry.
 
         Raises:
             RuntimeError: Missing token or unparsable expires_dt in the vendor response.
         """
         payload = {"grant_type": "client_credentials", "appkey": self.app_key, "secretkey": self.secret_key}
-        raw = session.post(
+        async with session.post(
             f"{self.base_url}/oauth2/token",
             headers={"Content-Type": "application/json;charset=UTF-8", "User-Agent": _KIWOOM_USER_AGENT},
             json=payload,
-        )
-        if inspect.isawaitable(raw):
-            raw = await raw
-        async with raw as resp:
+        ) as resp:
             body = await resp.json()
         token = str(body.get("token", ""))
         if not token:
@@ -209,20 +187,17 @@ class KiwoomApiClient:
         self.token = token
         return KiwoomIssuedToken(token=token, expires_at=expires_at)
 
-    async def revoke_token(self, session, token: str) -> None:
+    async def revoke_token(self, session: aiohttp.ClientSession, token: str) -> None:
         """Revoke the given token (Kiwoom au10002) so the next issuance starts a new 24h phase.
 
         Raises:
             RuntimeError: Vendor reports failure (non-zero return_code) or a non-200 status.
         """
-        raw = session.post(
+        async with session.post(
             f"{self.base_url}{KIWOOM_REVOKE_PATH}",
             headers={"Content-Type": "application/json;charset=UTF-8", "User-Agent": _KIWOOM_USER_AGENT},
             json={"appkey": self.app_key, "secretkey": self.secret_key, "token": token},
-        )
-        if inspect.isawaitable(raw):
-            raw = await raw
-        async with raw as resp:
+        ) as resp:
             status = resp.status
             body = await resp.json()
         if status != 200:
@@ -230,7 +205,7 @@ class KiwoomApiClient:
         if body.get("return_code") != 0:
             raise RuntimeError(f"Kiwoom token revocation failed: {body.get('return_code')}")
 
-    async def ensure_token(self, session) -> str:
+    async def ensure_token(self, session: aiohttp.ClientSession) -> str:
         if self.token:
             return self.token
         if self._token_lock is None:
@@ -241,93 +216,95 @@ class KiwoomApiClient:
             issued = await self.issue_token(session)
             return issued.token
 
-    async def _post_tr(
-        self,
-        session,
-        api_id: str,
-        path: str,
-        body: dict,
-        cont_yn: str = "N",
-        next_key: str = "",
-        max_retries: int = 3,
-    ) -> tuple[dict, dict]:
-        """POST one Kiwoom TR and return (json body, response headers).
+    @staticmethod
+    def _is_auth_expired(data: Any) -> bool:
+        return data.get("return_code") == KIWOOM_AUTH_EXPIRED_RETURN_CODE and KIWOOM_AUTH_EXPIRED_MSG_CODE in str(
+            data.get("return_msg", "")
+        )
 
-        Kiwoom expires the shared per-key token 24h after issuance and hands the same live token to every issuer, so a
-        long run (or a run started seconds before expiry) can hold an expired token. An auth rejection
-        (`return_code == KIWOOM_AUTH_EXPIRED_RETURN_CODE` with `KIWOOM_AUTH_EXPIRED_MSG_CODE` in `return_msg`) drops the
-        cached token, issues a fresh one, and replays the same request exactly once.
+    async def _refresh_rejected_token(self, session: aiohttp.ClientSession, rejected_token: str) -> None:
+        """Replace a token the vendor rejected, at most once across concurrent callers (compare-and-swap).
 
-        Returns:
-            The vendor body and headers of the last attempt; a second consecutive auth rejection is returned as-is
-            (callers keep their existing vendor_failure handling).
+        Under the same ``_token_lock`` that ``ensure_token`` uses: if ``self.token`` is set and differs from
+        ``rejected_token``, a concurrent caller already rotated it, so it is adopted with no issuance. Otherwise a
+        token is issued through ``issue_token``. ``self.token`` is never cleared. Clearing it would make concurrent
+        requests send ``Bearer None`` and start a cascade of re-issuance. A cancellation mid-issuance leaves the
+        previous token in place.
 
         Raises:
-            RuntimeError: Token issuance failed during the refresh (propagated from ensure_token).
+            RuntimeError: Token issuance failed (propagated from ``issue_token``).
+        """
+        if self._token_lock is None:
+            self._token_lock = asyncio.Lock()
+        async with self._token_lock:
+            if self.token and self.token != rejected_token:
+                return
+            await self.issue_token(session)
+
+    async def _post_tr(
+        self,
+        session: aiohttp.ClientSession,
+        api_id: str,
+        path: str,
+        body: dict[str, Any],
+        cont_yn: str = "N",
+        next_key: str = "",
+        max_retries: int | None = None,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """POST one Kiwoom TR and return (json body, response headers).
+
+        Kiwoom expires the shared per-key token 24h after issuance and hands the same live token to every issuer,
+        so a long run can hold an expired token. An auth rejection (``return_code ==
+        KIWOOM_AUTH_EXPIRED_RETURN_CODE`` with ``KIWOOM_AUTH_EXPIRED_MSG_CODE`` in ``return_msg``; HTTP 401 alone is
+        not a rejection for this vendor) triggers one compare-and-swap refresh and an identical replay that does
+        not consume a rate-limit attempt. HTTP 429 is retried after ``KIWOOM_RATE_LIMIT_BACKOFF_SECONDS`` up to
+        ``max_retries`` attempts. Every send, including the replay, first takes a slot from the per-TR host bucket.
+
+        Args:
+            session: Open HTTP session.
+            api_id: Kiwoom TR id; it also selects the per-TR host admission bucket.
+            path: Endpoint path appended to ``base_url``.
+            body: JSON request body, sent identically on retries and the replay.
+            cont_yn: Continuation flag header.
+            next_key: Continuation cursor header.
+            max_retries: Rate-limit attempts; None means ``KIWOOM_RATE_LIMIT_MAX_RETRIES`` captured at construction.
+
+        Returns:
+            The vendor body and headers of the last HTTP call. A second consecutive auth rejection, or an
+            exhausted 429, is returned as-is so callers keep their vendor_failure handling.
+
+        Raises:
+            RuntimeError: Token issuance failed during the refresh.
+            aiohttp.ClientError: Transport or non-JSON reply (including an HTML 429); the collector owns
+                transport retries.
+            ValueError: ``max_retries < 1``.
         """
         if not self.token:
             await self.ensure_token(session)
         limiter = self._limiter_for(api_id)
+        attempts = int(max_retries) if max_retries is not None else self._rate_limit_max_retries
+        backoff = self._rate_limit_backoff
 
-        async def _single_post() -> tuple[dict, dict, int]:
-            await limiter.acquire()
-            headers = {
-                "Content-Type": "application/json;charset=UTF-8",
-                "User-Agent": _KIWOOM_USER_AGENT,
-                "authorization": f"Bearer {self.token}",
-                "api-id": api_id,
-                "cont-yn": cont_yn,
-                "next-key": next_key,
-            }
-            raw = session.post(f"{self.base_url}{path}", headers=headers, json=body)
-            if inspect.isawaitable(raw):
-                raw = await raw
-            async with raw as resp:
-                data = await resp.json()
-                status = resp.status
-                headers_raw = getattr(resp, "headers", None)
-                if isinstance(headers_raw, dict):
-                    resp_headers = headers_raw
-                elif hasattr(headers_raw, "items") and not type(headers_raw).__name__.endswith("Mock"):
-                    try:
-                        resp_headers = dict(headers_raw)
-                    except Exception:
-                        resp_headers = {}
-                else:
-                    resp_headers = {}
-            return data, resp_headers, status
-
-        def _is_auth_expired(data: dict) -> bool:
-            return data.get("return_code") == KIWOOM_AUTH_EXPIRED_RETURN_CODE and KIWOOM_AUTH_EXPIRED_MSG_CODE in str(
-                data.get("return_msg", "")
+        def open_request(token: str) -> Any:
+            return session.post(
+                f"{self.base_url}{path}",
+                headers={
+                    "Content-Type": "application/json;charset=UTF-8",
+                    "User-Agent": _KIWOOM_USER_AGENT,
+                    "authorization": f"Bearer {token}",
+                    "api-id": api_id,
+                    "cont-yn": cont_yn,
+                    "next-key": next_key,
+                },
+                json=body,
             )
 
-        refreshed = False
-        data: dict = {}
-        resp_headers: dict = {}
-        for attempt in range(max_retries):
-            data, resp_headers, status = await _single_post()
-
-            if _is_auth_expired(data) and not refreshed:
-                refreshed = True
-                self.reset_token()
-                await self.ensure_token(session)
-                logger.warning("[EXEC] stage=kiwoom_token status=REFRESHED api_id=%s", api_id)
-                data, resp_headers, status = await _single_post()
-                if _is_auth_expired(data):
-                    return data, resp_headers
-                if status == 429 and attempt < max_retries - 1:
-                    logger.warning("Kiwoom rate limit hit (429) api_id=%s. Retrying in 1.2s... (attempt %d/%d)", api_id, attempt + 1, max_retries)
-                    await asyncio.sleep(1.2)
-                    continue
-                return data, resp_headers
-
-            if status == 429 and attempt < max_retries - 1:
-                logger.warning("Kiwoom rate limit hit (429) api_id=%s. Retrying in 1.2s... (attempt %d/%d)", api_id, attempt + 1, max_retries)
-                await asyncio.sleep(1.2)
-                continue
-            return data, resp_headers
-        return data, resp_headers
+        policy = RetryPolicy(
+            max_attempts=attempts,
+            rate_limit_wait=lambda attempt, response: backoff if response.status == 429 else None,
+        )
+        response = await send_with_auth_retry(open_request, acquire=limiter.acquire, current_token=lambda: self.token or "", is_auth_rejected=lambda r: self._is_auth_expired(r.body), refresh=lambda sent: self._refresh_rejected_token(session, sent), policy=policy, log_stage="kiwoom_tr", log_context=f"api_id={api_id}")
+        return response.body, response.headers
 
     async def get_fluctuation_ranking(
         self,
@@ -356,11 +333,11 @@ class KiwoomApiClient:
             RawCaptureError: Source evidence persistence failed.
         """
         cont_yn, next_key = "N", ""
-        collected: list[dict] = []
+        collected: list[dict[str, Any]] = []
         in_observer = False
         try:
             for page_index in range(max(1, int(max_pages))):
-                started = _now_seoul()
+                started = now_seoul()
                 data, resp_headers = await self._post_tr(
                     session, "ka10027", "/api/dostk/rkinfo",
                     {
@@ -376,7 +353,7 @@ class KiwoomApiClient:
                     },
                     cont_yn=cont_yn, next_key=next_key,
                 )
-                received = _now_seoul()
+                received = now_seoul()
                 header_cont = str(resp_headers.get("cont-yn", "N") or "N")
                 header_key = str(resp_headers.get("next-key", "") or "")
                 metadata = {
@@ -460,7 +437,7 @@ class KiwoomApiClient:
             ValueError: Invalid or conflicting bounds.
             OSError: Mandatory capture fails.
         """
-        ymd = _validate_target_ymd(target_date)
+        ymd = validate_target_ymd(target_date)
         if venue not in ("KRX", "NXT"):
             raise ValueError(f"unknown tick venue: {venue!r}")
         if floor_hms is not None and (len(str(floor_hms)) != 6 or not str(floor_hms).isdigit()):
@@ -470,11 +447,11 @@ class KiwoomApiClient:
         if max_pages is not None and int(max_pages) <= 0:
             raise ValueError("invalid tick acquisition limits")
         if budget is not None:
-            page_budget, deadline = _resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
+            page_budget, deadline = resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
         elif max_pages is not None:
             page_budget, deadline = max(1, int(max_pages)), None
         else:
-            page_budget, deadline = _resolve_chart_budget(None, int(settings.COLLECTION_CHART_MAX_PAGES))
+            page_budget, deadline = resolve_chart_budget(None, int(settings.COLLECTION_CHART_MAX_PAGES))
         base_code = str(code).split("_")[0]
         if resume is not None:
             cont_yn, next_key = "Y", str(resume.next_key)
@@ -498,12 +475,12 @@ class KiwoomApiClient:
         request_code = str(code) if venue == "KRX" else f"{str(code).split('_')[0]}_NX"
         try:
             for page_index in range(max(1, int(page_budget))):
-                deadline_left = _deadline_remaining(deadline)
+                deadline_left = deadline_remaining(deadline)
                 if deadline_left is not None and deadline_left <= 0:
                     termination = "deadline"
                     truncated = True
                     break
-                started = _now_seoul()
+                started = now_seoul()
                 call = self._post_tr(
                     session, "ka10079", "/api/dostk/chart",
                     {"stk_cd": request_code, "tic_scope": "1", "upd_stkpc_tp": "1", "base_dt": ymd},
@@ -513,7 +490,7 @@ class KiwoomApiClient:
                     data, resp_headers = await call
                 else:
                     data, resp_headers = await asyncio.wait_for(call, timeout=deadline_left)
-                received = _now_seoul()
+                received = now_seoul()
                 header_cont = str(resp_headers.get("cont-yn", "N") or "N")
                 header_key = str(resp_headers.get("next-key", "") or "")
                 metadata = {"cont-yn": header_cont, "next-key": header_key}
@@ -602,7 +579,7 @@ class KiwoomApiClient:
 
     async def walk_tick_tape(
         self,
-        session,
+        session: aiohttp.ClientSession,
         code: str,
         *,
         venue: Literal["KRX", "NXT"] = "KRX",
@@ -636,7 +613,7 @@ class KiwoomApiClient:
             ValueError: Invalid or conflicting bounds.
             OSError: Mandatory evidence persistence fails.
         """
-        stop_ymd = _validate_target_ymd(stop_before_day)
+        stop_ymd = validate_target_ymd(stop_before_day)
         if venue not in ("KRX", "NXT"):
             raise ValueError(f"unknown tick venue: {venue!r}")
         if max_pages is not None and budget is not None and int(max_pages) != int(budget.max_pages):
@@ -644,11 +621,11 @@ class KiwoomApiClient:
         if max_pages is not None and int(max_pages) <= 0:
             raise ValueError("invalid tick acquisition limits")
         if budget is not None:
-            page_budget, deadline = _resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
+            page_budget, deadline = resolve_chart_budget(budget, int(settings.COLLECTION_CHART_MAX_PAGES))
         elif max_pages is not None:
             page_budget, deadline = max(1, int(max_pages)), None
         else:
-            page_budget, deadline = _resolve_chart_budget(None, int(settings.COLLECTION_CHART_MAX_PAGES))
+            page_budget, deadline = resolve_chart_budget(None, int(settings.COLLECTION_CHART_MAX_PAGES))
         base_code = str(code).split("_")[0]
         request_code = str(code) if venue == "KRX" else f"{base_code}_NX"
         cont_yn, next_key = "N", ""
@@ -667,7 +644,7 @@ class KiwoomApiClient:
         certs: dict[str, TapeDayCertificate] = {}
         certified_order: list[str] = []
 
-        today_ymd = _now_seoul().strftime("%Y%m%d")
+        today_ymd = now_seoul().strftime("%Y%m%d")
 
         def _certify(ymd: str, older_seen: bool) -> None:
             total = vendor_totals.get(ymd)
@@ -691,12 +668,12 @@ class KiwoomApiClient:
 
         try:
             for page_index in range(max(1, int(page_budget))):
-                deadline_left = _deadline_remaining(deadline)
+                deadline_left = deadline_remaining(deadline)
                 if deadline_left is not None and deadline_left <= 0:
                     termination = "deadline"
                     truncated = True
                     break
-                started = _now_seoul()
+                started = now_seoul()
                 call = self._post_tr(
                     session,
                     "ka10079",
@@ -709,7 +686,7 @@ class KiwoomApiClient:
                     data, resp_headers = await call
                 else:
                     data, resp_headers = await asyncio.wait_for(call, timeout=deadline_left)
-                received_at = _now_seoul()
+                received_at = now_seoul()
                 header_cont = str(resp_headers.get("cont-yn", "N") or "N")
                 header_key = str(resp_headers.get("next-key", "") or "")
                 metadata = {"cont-yn": header_cont, "next-key": header_key}
@@ -824,7 +801,7 @@ class KiwoomApiClient:
         certificates.extend(TapeDayCertificate(day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False) for d in day_order if d not in certs)
         return {"rt_cd": "0", "vendor": "kiwoom", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "certificates": certificates}
 
-    async def get_nxt_premarket_chart(self, session, code: str, target_date: str) -> dict:
+    async def get_nxt_premarket_chart(self, session: aiohttp.ClientSession, code: str, target_date: str) -> BrokerPayload:
         ymd = str(target_date).replace("-", "")
         nx_code = f"{str(code).split('_')[0].zfill(6)}_NX"
         try:
@@ -838,7 +815,7 @@ class KiwoomApiClient:
         if data.get("return_code") != 0:
             return {"rt_cd": "1", "msg1": str(data.get("return_msg", "")), "output2": [], "vendor": "kiwoom"}
         rows = data.get("stk_min_pole_chart_qry") or []
-        kept: list[dict] = []
+        kept: list[dict[str, Any]] = []
         for r in rows:
             cntr_tm = str(r.get("cntr_tm", ""))
             if not cntr_tm.startswith(ymd):
@@ -852,7 +829,7 @@ class KiwoomApiClient:
             kept.append(dict(r))
         return {"rt_cd": "0", "output2": kept, "vendor": "kiwoom"}
 
-    async def get_nxt_minute_chart(self, session, code: str, target_date: str) -> dict:
+    async def get_nxt_minute_chart(self, session: aiohttp.ClientSession, code: str, target_date: str) -> BrokerPayload:
         ymd = str(target_date).replace("-", "")
         nx_code = f"{str(code).split('_')[0].zfill(6)}_NX"
         try:
@@ -866,7 +843,7 @@ class KiwoomApiClient:
         if data.get("return_code") != 0:
             return {"rt_cd": "1", "msg1": str(data.get("return_msg", "")), "output2": [], "vendor": "kiwoom"}
         rows = data.get("stk_min_pole_chart_qry") or []
-        kept: list[dict] = []
+        kept: list[dict[str, Any]] = []
         for r in rows:
             cntr_tm = str(r.get("cntr_tm", ""))
             if not cntr_tm.startswith(ymd):

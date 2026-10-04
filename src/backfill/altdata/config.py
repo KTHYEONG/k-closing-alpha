@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -82,6 +82,10 @@ class AltDataFetchConfig:
             (CLI ``backfill_altdata`` keeps using it unchanged).
         page_count: 페이지 당 레코드 수.
         extra_client_kwargs: 병렬 호출용 추가 KIS 데이터 키.
+
+        dart_api_key / krx_api_key / extra_client_kwargs are excluded from ``repr``
+        and never interpolated into validation errors: a config object routinely
+        reaches tracebacks and ``%r`` logs, and these carry live credentials.
     """
 
     start: pd.Timestamp
@@ -94,11 +98,11 @@ class AltDataFetchConfig:
     krx_requests_per_sec: float = 4.0
     retries: int = 4
     retry_sleep_sec: float = 1.0
-    dart_api_key: str = ""
+    dart_api_key: str = field(default="", repr=False)
     dart_key_pool: DartKeyPool | None = None
-    krx_api_key: str = ""
+    krx_api_key: str = field(default="", repr=False)
     page_count: int = 100
-    extra_client_kwargs: tuple[tuple[str, str, str], ...] = ()
+    extra_client_kwargs: tuple[tuple[str, str, str], ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         # Coerce start/end via pd.Timestamp
@@ -138,12 +142,12 @@ class AltDataFetchConfig:
             raise ValueError("retry_sleep_sec must be >= 0")
         if not (1 <= int(self.page_count) <= 100):
             raise ValueError("page_count must be in [1, 100]")
-        for item in self.extra_client_kwargs:
+        for index, item in enumerate(self.extra_client_kwargs):
             if not isinstance(item, tuple) or len(item) != 3:
-                raise ValueError(f"extra_client_kwargs entry {item!r} must be a (app_key, app_secret, hts_id) tuple with non-empty app_key/app_secret")
+                raise ValueError(f"extra_client_kwargs entry #{index} must be a (app_key, app_secret, hts_id) tuple with non-empty app_key/app_secret")
             app_key, app_secret, _hts_id = item
             if not isinstance(app_key, str) or not app_key or not isinstance(app_secret, str) or not app_secret:
-                raise ValueError(f"extra_client_kwargs entry {item!r} must be a (app_key, app_secret, hts_id) tuple with non-empty app_key/app_secret")
+                raise ValueError(f"extra_client_kwargs entry #{index} must be a (app_key, app_secret, hts_id) tuple with non-empty app_key/app_secret")
         # Validate universe_symbols
         if self.universe_symbols is not None:
             if not isinstance(self.universe_symbols, frozenset):

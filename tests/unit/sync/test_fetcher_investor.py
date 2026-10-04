@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from src.sync.fetcher_investor import get_investor_trade_daily_async
+from src.sync.fetcher_investor import _prev_day_ymd, get_investor_trade_daily_async
 
 
 class _Client:
@@ -124,3 +124,10 @@ def test_get_investor_trade_daily_builds_client_from_data_account(monkeypatch) -
 
     assert captured["app_key"] == "data-key"
     assert out.empty
+
+
+def test_prev_day_ymd_returns_string_and_passes_through_invalid_input() -> None:
+    result = _prev_day_ymd("20260105", days=1)
+    assert result == "20260104"
+    assert isinstance(result, str)
+    assert _prev_day_ymd("2026XX05") == "2026XX05"

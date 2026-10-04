@@ -2462,3 +2462,309 @@ def test_load_open_lot_marks_uses_last_close_before_the_snapshot_and_skips_same_
     assert marks == {"005930": 70_000}
     assert load_open_lot_marks(lots.iloc[0:0], "2026-09-30", path=path) == {}
     assert load_open_lot_marks(lots, "2026-09-30", path=tmp_path / "missing.parquet") == {}
+
+
+def test_entry_order_id_format() -> None:
+    from src.daily.paper_trade import _entry_order_id
+
+    # Given / Then: 결정일·심볼·접미사 결합
+    assert _entry_order_id("2026-09-10", "005930") == "2026-09-10:005930:entry"
+    # And: int형 심볼도 f-string 렌더링과 동일
+    assert _entry_order_id("2026-09-10", 5930) == f"2026-09-10:{5930}:entry"
+
+
+def test_run_paper_session_entry_placeholder_ids_match_entry_order_id(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    # Given: 장 마감 후 결정 → missed-auction 경로의 zero-size 픽
+    date_str = "2026-09-10"
+    monkeypatch.setattr(paper_trade.settings, "PAPER_SEED_CAPITAL", 10_000_000)
+    monkeypatch.setattr(
+        paper_trade, "load_topk_decision",
+        lambda _d: pd.DataFrame({
+            "symbol": ["005930"], "allocation": [1.0], "close": [float("nan")],
+            "decided_at": [pd.Timestamp(f"{date_str} 15:35:00", tz="Asia/Seoul")],
+        }),
+    )
+    monkeypatch.setattr(
+        paper_trade, "fetch_archive_snapshot",
+        lambda _d: pd.DataFrame({
+            "종목코드": ["005930"], "종가": [70_500], "종가_확정": [True],
+            "execution_timestamp": [pd.Timestamp(f"{date_str} 15:30:20", tz="Asia/Seoul")],
+        }),
+    )
+    ledger = PaperLedger(root=tmp_path)
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp(date_str), phase="entry", ledger=ledger, session=None,
+            now_fn=lambda: pd.Timestamp(f"{date_str} 15:34:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then: MISSED_AUCTION 플레이스홀더가 진입 id를 공유한다
+    assert n == 0
+    orders = pd.read_parquet(tmp_path / "orders.parquet")
+    assert len(orders) == 1
+    assert orders.iloc[0]["order_id"] == paper_trade._entry_order_id(date_str, "005930")
+    assert int(orders.iloc[0]["qty"]) == 0
+    assert orders.iloc[0]["side"] == "buy"
+    assert orders.iloc[0]["reason"] == "entry"
+
+    # Given: 정상 결정시각이지만 decision price가 없는 픽 → ZERO_QTY 경로
+    date_str2 = "2026-09-11"
+    monkeypatch.setattr(
+        paper_trade, "load_topk_decision",
+        lambda _d: pd.DataFrame({
+            "symbol": ["000660"], "allocation": [1.0], "close": [float("nan")],
+            "decided_at": [pd.Timestamp(f"{date_str2} 15:23:02", tz="Asia/Seoul")],
+        }),
+    )
+    ledger2 = PaperLedger(root=tmp_path / "second")
+
+    # When
+    n2 = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp(date_str2), phase="entry", ledger=ledger2, session=None,
+            now_fn=lambda: pd.Timestamp(f"{date_str2} 15:34:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then
+    assert n2 == 0
+    orders2 = pd.read_parquet(tmp_path / "second" / "orders.parquet")
+    assert len(orders2) == 1
+    assert orders2.iloc[0]["order_id"] == paper_trade._entry_order_id(date_str2, "000660")
+    assert int(orders2.iloc[0]["qty"]) == 0
+    assert orders2.iloc[0]["side"] == "buy"
+    assert orders2.iloc[0]["reason"] == "entry"
+
+
+def test_entry_already_recorded_truth_table() -> None:
+    import pandas as pd
+
+    from src.daily.paper_trade import _entry_already_recorded
+
+    # Given / Then: 빈 프레임은 False
+    assert _entry_already_recorded(pd.DataFrame(), "2026-09-10") is False
+    # 다른 날짜 행만 있으면 False
+    other = pd.DataFrame({"decision_date": ["2026-09-09"], "reason": ["entry"]})
+    assert _entry_already_recorded(other, "2026-09-10") is False
+    # 같은 날짜라도 exit 행만 있으면 False
+    exits = pd.DataFrame({"decision_date": ["2026-09-10"], "reason": ["open_exit"]})
+    assert _entry_already_recorded(exits, "2026-09-10") is False
+    # 같은 날짜 entry 행은 상태와 무관하게 True (ZERO_QTY 포함)
+    recorded = pd.DataFrame({"decision_date": ["2026-09-10"], "reason": ["entry"]})
+    assert _entry_already_recorded(recorded, "2026-09-10") is True
+
+
+def test_fill_row_key_order_entry_and_exit() -> None:
+    import pandas as pd
+
+    from src.daily.paper_trade import _fill_row
+    from src.execution.paper_broker import PaperFill, PaperOrder
+
+    placed = pd.Timestamp("2026-09-10 15:19:00", tz="Asia/Seoul")
+    filled_at = pd.Timestamp("2026-09-10 15:30:20", tz="Asia/Seoul")
+    entry_order = PaperOrder(
+        order_id="2026-09-10:005930:entry", decision_date="2026-09-10", symbol="005930",
+        side="buy", qty=10, limit_price=None, placed_at=placed, reason="entry",
+    )
+    entry_fill = PaperFill(
+        order_id="2026-09-10:005930:entry", symbol="005930", side="buy", qty=10,
+        fill_price=70_500, filled_at=filled_at, trigger="auction_close",
+    )
+
+    # Given entry / Then: 8키 정확히 순서대로
+    row = _fill_row(entry_fill, entry_order)
+    assert list(row.keys()) == ["order_id", "symbol", "side", "qty", "fill_price", "filled_at", "decision_date", "trigger"]
+    assert "entry_order_id" not in row
+
+    # Given exit / Then: 같은 8키 뒤에 entry_order_id
+    exit_order = PaperOrder(
+        order_id="2026-09-10:005930:entry:exit:2026-09-11", decision_date="2026-09-11", symbol="005930",
+        side="sell", qty=10, limit_price=None, placed_at=placed, reason="open_exit",
+        entry_order_id="2026-09-10:005930:entry",
+    )
+    exit_fill = PaperFill(
+        order_id=exit_order.order_id, symbol="005930", side="sell", qty=10,
+        fill_price=71_000, filled_at=filled_at, trigger="auction_open",
+    )
+    exit_row = _fill_row(exit_fill, exit_order)
+    assert list(exit_row.keys()) == ["order_id", "symbol", "side", "qty", "fill_price", "filled_at", "decision_date", "trigger", "entry_order_id"]
+    assert exit_row["entry_order_id"] == "2026-09-10:005930:entry"
+
+
+def test_run_paper_session_entry_then_exit_fills_columns_unchanged(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    # Given: 단건 진입 픽과 확정 스냅샷
+    monkeypatch.setattr(paper_trade.settings, "PAPER_SEED_CAPITAL", 10_000_000)
+    monkeypatch.setattr(
+        paper_trade, "load_topk_decision",
+        lambda _d: pd.DataFrame({
+            "symbol": ["005930"], "allocation": [1.0], "close": [70_500],
+            "decided_at": [pd.Timestamp("2026-09-10 15:23:02", tz="Asia/Seoul")],
+        }),
+    )
+    monkeypatch.setattr(
+        paper_trade, "fetch_archive_snapshot",
+        lambda _d: pd.DataFrame({
+            "종목코드": ["005930"], "종가": [70_500], "종가_확정": [True],
+            "execution_timestamp": [pd.Timestamp("2026-09-10 15:30:20", tz="Asia/Seoul")],
+        }),
+    )
+    ledger = PaperLedger(root=tmp_path)
+
+    # When: 진입 세션
+    n_entry = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-10"), phase="entry", ledger=ledger, session=None,
+            now_fn=lambda: pd.Timestamp("2026-09-10 15:34:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then: fills 스키마는 8키 그대로
+    assert n_entry == 1
+    fills = pd.read_parquet(tmp_path / "fills.parquet")
+    assert list(fills.columns) == ["order_id", "symbol", "side", "qty", "fill_price", "filled_at", "decision_date", "trigger"]
+
+    async def _quote(code: str) -> paper_trade.DatedOpenQuote:
+        return paper_trade.DatedOpenQuote(symbol=code, business_date="2026-09-11", open_price=71_000)
+
+    # When: 청산 세션
+    n_exit = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, quote_fn=_quote, trading_day_fn=_open_day,
+            now_fn=lambda: pd.Timestamp("2026-09-11 09:01:00", tz="Asia/Seoul"),
+        )
+    )
+
+    # Then: exit 뒤 8키 + entry_order_id, 진입행 null·청산행은 진입 id
+    assert n_exit == 1
+    fills = pd.read_parquet(tmp_path / "fills.parquet")
+    assert set(fills.columns) == {"order_id", "symbol", "side", "qty", "fill_price", "filled_at", "decision_date", "trigger", "entry_order_id"}
+    entry_rows = fills[fills["side"] == "buy"]
+    exit_rows = fills[fills["side"] == "sell"]
+    assert len(entry_rows) == 1 and len(exit_rows) == 1
+    assert entry_rows.iloc[0]["entry_order_id"] is None or pd.isna(entry_rows.iloc[0]["entry_order_id"])
+    assert exit_rows.iloc[0]["entry_order_id"] == entry_rows.iloc[0]["order_id"]
+
+
+def test_fetch_krx_dated_open_quote_logs_failure_type_without_message(caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.daily.paper_trade import fetch_krx_dated_open_quote
+
+    class _RaisingInquire:
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            raise RuntimeError("transport down token=SECRET")
+
+        async def get_stock_ohlcv_history(self, session, code, start_date=None, end_date=None,
+                                          period_code=None, adj_price=None, market_div_code=None):
+            return {"rt_cd": "0", "output2": []}
+
+    class _RaisingChart:
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            return {"rt_cd": "0", "output": {"stck_oprc": "1000"}}
+
+        async def get_stock_ohlcv_history(self, session, code, start_date=None, end_date=None,
+                                          period_code=None, adj_price=None, market_div_code=None):
+            raise RuntimeError("transport down token=SECRET")
+
+    # When: inquire-price 실패
+    with caplog.at_level(logging.WARNING, logger="src.daily.paper_trade"):
+        caplog.clear()
+        quote = asyncio.run(fetch_krx_dated_open_quote(_RaisingInquire(), object(), "005930", "2026-09-25"))
+
+    # Then: fail-closed + 타입만 기록, 원문·비밀 없음
+    assert quote.open_price == 0
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "stage=paper_exit_quote" in warnings[0].message
+    assert "source=inquire_price" in warnings[0].message
+    assert "005930" in warnings[0].message
+    assert "error_type=RuntimeError" in warnings[0].message
+    assert not any("SECRET" in r.message or "transport down" in r.message for r in caplog.records)
+
+    # When: daily-chart 실패
+    with caplog.at_level(logging.WARNING, logger="src.daily.paper_trade"):
+        caplog.clear()
+        quote = asyncio.run(fetch_krx_dated_open_quote(_RaisingChart(), object(), "005930", "2026-09-25"))
+
+    # Then
+    assert quote.open_price == 0
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "stage=paper_exit_quote" in warnings[0].message
+    assert "source=daily_chart" in warnings[0].message
+    assert "error_type=RuntimeError" in warnings[0].message
+    assert not any("SECRET" in r.message or "transport down" in r.message for r in caplog.records)
+
+
+def test_fetch_krx_dated_open_quote_rt_cd_failure_emits_no_warning(caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.daily.paper_trade import fetch_krx_dated_open_quote
+
+    class _Client:
+        async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+            return {"rt_cd": "1", "output": {"stck_oprc": "1000"}}
+
+        async def get_stock_ohlcv_history(self, session, code, start_date=None, end_date=None,
+                                          period_code=None, adj_price=None, market_div_code=None):
+            return {"rt_cd": "1", "output2": [{"stck_bsop_date": "20260925", "stck_oprc": "1000"}]}
+
+    # When
+    with caplog.at_level(logging.WARNING, logger="src.daily.paper_trade"):
+        caplog.clear()
+        quote = asyncio.run(fetch_krx_dated_open_quote(_Client(), object(), "005930", "2026-09-25"))
+
+    # Then: open 0이지만 WARNING 없음
+    assert quote.open_price == 0
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_paper_ledger_lock_timeout_exceeds_exit_quote_sleep_budget() -> None:
+    from src.daily.paper_trade import PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS, PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS
+    from src.execution.paper_broker import PAPER_LEDGER_LOCK_TIMEOUT_SECONDS
+
+    # Given / Then: 락 타임아웃이 청산 시세 재시도 sleep 예산을 초과한다
+    sleep_budget = (PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS - 1) * PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS
+    assert sleep_budget < PAPER_LEDGER_LOCK_TIMEOUT_SECONDS
+
+
+def test_run_paper_session_unknown_phase_raises_before_ledger(monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+    import pytest
+
+    from src.daily import paper_trade
+
+    # Given: 원장 생성자가 호출되면 실패하도록 패치
+    called = {"n": 0}
+
+    def _raising_ledger(*args, **kwargs):
+        called["n"] += 1
+        raise AssertionError("ledger must not be constructed")
+
+    monkeypatch.setattr(paper_trade, "PaperLedger", _raising_ledger)
+
+    # When / Then: IO 전에 unknown phase로 거부
+    with pytest.raises(ValueError, match="unknown phase"):
+        asyncio.run(paper_trade.run_paper_session(pd.Timestamp("2026-09-10"), phase="bogus"))
+    assert called["n"] == 0

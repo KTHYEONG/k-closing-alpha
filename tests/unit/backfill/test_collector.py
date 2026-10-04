@@ -2243,3 +2243,46 @@ def test_resume_budget_uses_runaway_guard_when_remaining_unknown_and_bounds_know
     assert _resume_budget(95, profile).max_pages == 12
     assert _resume_budget(0, profile).max_pages == 2
     assert _resume_budget(10_000, profile).max_pages == 50
+
+
+def test_transport_retry_rejects_negative_retry_budget() -> None:
+    import asyncio
+
+    import pytest
+
+    from src.backfill.intraday.collector import _call_with_transport_retry
+    from src.config.collection import CollectionSettings
+
+    profile = CollectionSettings(
+        COLLECTION_TRANSPORT_RETRIES=0, COLLECTION_TRANSPORT_BACKOFF_SECONDS=0.0
+    )
+    profile.COLLECTION_TRANSPORT_RETRIES = -1
+
+    async def _invoke(slot: int) -> str:
+        raise AssertionError("invoke must never be awaited")
+
+    with pytest.raises(ValueError, match="COLLECTION_TRANSPORT_RETRIES"):
+        asyncio.run(_call_with_transport_retry(_invoke, first_attempt=0, profile=profile, code="005930"))
+
+
+def test_transport_retry_consumes_one_slot_per_try() -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import _call_with_transport_retry
+    from src.config.collection import CollectionSettings
+
+    slots: list[int] = []
+
+    async def _invoke(slot: int) -> str:
+        slots.append(slot)
+        if len(slots) < 3:
+            raise ConnectionError("transient")
+        return "ok"
+
+    profile = CollectionSettings(COLLECTION_TRANSPORT_RETRIES=2, COLLECTION_TRANSPORT_BACKOFF_SECONDS=0.0)
+    payload, next_slot = asyncio.run(
+        _call_with_transport_retry(_invoke, first_attempt=7, profile=profile, code="005930")
+    )
+    assert payload == "ok"
+    assert slots == [7, 8, 9]
+    assert next_slot == 10

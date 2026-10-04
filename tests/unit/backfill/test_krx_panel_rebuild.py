@@ -614,3 +614,35 @@ def test_run_panel_rebuild_does_not_write_when_referee_control_fails(tmp_path, m
     with pytest.raises(ValueError, match="control"):
         asyncio.run(mod.run_panel_rebuild(start=days[0], end=days[-1], checkpoint_dir=tmp_path / "cp", out_path=out_path, old_path=old_path, krx_cfg=object(), kis=kis))
     assert not out_path.exists()
+
+
+def test_swap_panel_refuses_while_panel_locked(tmp_path, monkeypatch) -> None:
+    import contextlib
+    import fcntl
+
+    import pytest
+
+    from src.backfill.krx_panel_rebuild import swap_panel
+    from src.data import io_utils
+    from src.utils.file_lock import sidecar_lock_path
+
+    monkeypatch.setattr(io_utils, "STORE_LOCK_TIMEOUT_SECONDS", 0.0)
+    live = tmp_path / "price_history.parquet"
+    live.write_bytes(b"old")
+    rebuilt = tmp_path / "price_history_rebuild.parquet"
+    rebuilt.write_bytes(b"new")
+
+    lock_path = sidecar_lock_path(live)
+    holder = open(lock_path, "w")  # noqa: PTH123, SIM115 - lock held across the swap
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(io_utils.StoreLockTimeoutError):
+            swap_panel(rebuilt, live)
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
+
+    assert live.read_bytes() == b"old"
+    assert rebuilt.exists() and rebuilt.read_bytes() == b"new"
+    assert list(tmp_path.glob("*.bak.parquet")) == []

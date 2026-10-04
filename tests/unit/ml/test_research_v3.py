@@ -165,6 +165,67 @@ def test_suspended_top1_is_not_dropped():
     assert res.iloc[0]["gross_return"] == pytest.approx(11000.0 / 10400.0 - 1.0)
 
 
+def test_exit_date_follows_holding_days():
+    market_dates = np.array([pd.Timestamp(d) for d in pd.bdate_range("2024-01-02", periods=30)])
+    d_to_idx = {d: i for i, d in enumerate(market_dates)}
+
+    rows = []
+    for sym in ("000001", "000002", "000003"):
+        for d in market_dates:
+            rows.append({"date": pd.Timestamp(d), "symbol": sym, "open": 10000.0,  # noqa: PERF401 - spec skeleton
+                         "high": 10100.0, "low": 9900.0, "close": 10000.0, "volume": 50000.0})
+    ph = pd.DataFrame(rows)
+    # 000002: zero-volume D+1 bar at index 6, resumes at index 7
+    ph.loc[(ph["symbol"] == "000002") & (ph["date"] == pd.Timestamp(market_dates[6])), ["open", "volume"]] = [0.0, 0.0]
+    # 000003: never trades again after index 2
+    ph.loc[(ph["symbol"] == "000003") & (pd.to_datetime(ph["date"]) > pd.Timestamp(market_dates[2])), ["open", "volume"]] = [0.0, 0.0]
+
+    cands = pd.DataFrame([
+        {"date": pd.Timestamp(market_dates[5]), "symbol": "000001", "close": 10000.0, "market": "KOSPI"},
+        {"date": pd.Timestamp(market_dates[5]), "symbol": "000002", "close": 10000.0, "market": "KOSPI"},
+        {"date": pd.Timestamp(market_dates[2]), "symbol": "000003", "close": 10000.0, "market": "KOSPI"},
+        {"date": pd.Timestamp(market_dates[25]), "symbol": "000003", "close": 10000.0, "market": "KOSPI"},
+        {"date": pd.Timestamp(market_dates[29]), "symbol": "000001", "close": 10000.0, "market": "KOSPI"},
+    ])
+
+    # When
+    res = attach_forward_exit_paths(cands, ph, market_dates, d_to_idx)
+
+    # Then
+    assert str(res["exit_date"].dtype) == "datetime64[ns]"
+    assert pd.Timestamp(res.iloc[0]["exit_date"]) == pd.Timestamp(market_dates[6])
+    assert pd.Timestamp(res.iloc[1]["exit_date"]) == pd.Timestamp(market_dates[7])
+    assert res.iloc[1]["holding_days"] == 2
+    assert pd.Timestamp(res.iloc[2]["exit_date"]) == pd.Timestamp(market_dates[22])
+    assert res.iloc[2]["holding_days"] == 20
+    assert pd.isna(res.iloc[3]["exit_date"])
+    assert pd.isna(res.iloc[4]["exit_date"])
+
+
+def test_exit_date_adds_no_other_change():
+    market_dates = np.array([pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03"), pd.Timestamp("2024-01-04")])
+    d_to_idx = {d: i for i, d in enumerate(market_dates)}
+
+    ph = pd.DataFrame([
+        {"date": pd.Timestamp("2024-01-02"), "symbol": "000001", "open": 10000.0, "high": 10500.0, "low": 9900.0, "close": 10400.0, "volume": 50000.0},
+        {"date": pd.Timestamp("2024-01-03"), "symbol": "000001", "open": 0.0, "high": 0.0, "low": 0.0, "close": 10400.0, "volume": 0.0},
+        {"date": pd.Timestamp("2024-01-04"), "symbol": "000001", "open": 11000.0, "high": 11200.0, "low": 10900.0, "close": 11100.0, "volume": 60000.0},
+    ])
+    cand_df = pd.DataFrame([
+        {"date": pd.Timestamp("2024-01-02"), "symbol": "000001", "close": 10400.0, "market": "KOSPI"}
+    ])
+
+    # When
+    res = attach_forward_exit_paths(cand_df, ph, market_dates, d_to_idx)
+
+    # Then: only exit_date is new
+    assert res.iloc[0]["exit_status"] == "EXIT_SUSPENDED"
+    assert res.iloc[0]["exit_price"] == 11000.0
+    assert res.iloc[0]["holding_days"] == 2
+    assert res.iloc[0]["gross_return"] == pytest.approx(11000.0 / 10400.0 - 1.0)
+    assert pd.Timestamp(res.iloc[0]["exit_date"]) == pd.Timestamp("2024-01-04")
+
+
 def test_walk_forward_train_precedes_validation(metrics_data: dict):
     """Test Section 31 & 69: All training folds strictly precede validation folds."""
     folds = metrics_data["walk_forward_folds"]

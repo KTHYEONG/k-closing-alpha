@@ -35,14 +35,45 @@ from src.ml.oof import _finite_nan
 from src.ml.research.v3_engine import (
     attach_forward_exit_paths,
     build_candidate_universe,
-    compute_derived_features,
     load_and_prepare_price_history,
 )
 from src.ml.research.v3_metrics import calculate_series_metrics
 from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict
-from src.ml.topk_history_features import TOPK_FEATURE_COLS_V2, attach_lagged_flow_features, attach_topk_features
+from src.ml.topk_contract import (
+    FEATURE_CONTRACT_VERSION_KEY as FEATURE_CONTRACT_VERSION_KEY,
+)
+from src.ml.topk_contract import (
+    RANKER_FEATURE_COLS as RANKER_FEATURE_COLS,
+)
+from src.ml.topk_contract import (
+    TOPK_FEATURE_CONTRACT_VERSION as TOPK_FEATURE_CONTRACT_VERSION,
+)
+from src.ml.topk_contract import (
+    TOPK_RANKER_BUNDLE_DIR as TOPK_RANKER_BUNDLE_DIR,
+)
+from src.ml.topk_contract import (
+    assert_bundle_screen_parity as assert_bundle_screen_parity,
+)
+from src.ml.topk_contract import (
+    build_topk_feature_manifest as build_topk_feature_manifest,
+)
+from src.ml.topk_contract import (
+    compute_derived_features as compute_derived_features,
+)
+from src.ml.topk_contract import (
+    save_production_bundle as save_production_bundle,
+)
+from src.ml.topk_contract import (
+    score_topk_candidates as score_topk_candidates,
+)
+from src.ml.topk_contract import (
+    select_topk_by_score as select_topk_by_score,
+)
+from src.ml.topk_contract import (
+    select_topk_equal_weight as select_topk_equal_weight,
+)
+from src.ml.topk_history_features import attach_lagged_flow_features, attach_topk_features
 from src.strategy.contract import (
-    COST_AWARE_UNIVERSE,
     DEFAULT_UNIVERSE,
     KCA_TOPK_CAPFREE_001,
     KCA_TOPK_COSTAWARE_001,
@@ -60,6 +91,10 @@ logger = logging.getLogger(__name__)
 TRAIN_POOL_MIN_ROWS: int = 2000
 CPCV_N_GROUPS: int = 8
 CPCV_K_TEST: int = 2
+# A history label realizing on or after this many pool dates before a fold's first test date is
+# purged (ADR-005 one-week embargo); see OD-1.
+HISTORY_SEAM_EMBARGO_DAYS: int = 5
+EXIT_DATE_COL: str = "exit_date"
 # 인증·서빙 공용 단일 설정: 인접 하이퍼파라미터 6점이 모두 동일 성능 고원에 있음을 CPCV로 확인한 값
 RANKER_MODEL_PARAMS: dict[str, Any] = {
     "n_estimators": 400,
@@ -73,7 +108,6 @@ RANKER_MODEL_PARAMS: dict[str, Any] = {
 }
 # subsample<1 이라 단일 시드 결과가 임의적 → 5시드 평균으로 분산 제거
 RANKER_SEEDS: tuple[int, ...] = (1, 2, 3, 4, 5)
-RANKER_FEATURE_COLS: list[str] = list(TOPK_FEATURE_COLS_V2)
 # top-3 는 매일 투자하므로 날짜 공통 드리프트는 선택과 무관 → 날짜내 차감 라벨
 LABEL_MODE: str = "date_demeaned"
 LABEL_CLIP: float = 0.10
@@ -81,7 +115,6 @@ CERT_REGIME_START: pd.Timestamp = pd.Timestamp(TICK_REFORM_DATE)
 MIN_SCORED_FOLD_FRACTION: float = 0.90
 # 개편전 반증 판정에 필요한 최소 신호일 수 (약 1년).
 MIN_FALSIFICATION_DAYS: int = 250
-TOPK_RANKER_BUNDLE_DIR: str = "artifacts/models/topk_ranker"
 
 
 @dataclass(frozen=True)
@@ -172,34 +205,6 @@ def assert_nested_universe_specs(train_spec: UniverseSpec, select_spec: Universe
     return None
 
 
-def _screen_value(value: Any) -> Any:
-    if isinstance(value, bool) or value is None:
-        return value
-    return float(value)
-
-
-def assert_bundle_screen_parity(bundle: dict[str, Any], spec: UniverseSpec = COST_AWARE_UNIVERSE) -> None:
-    screened = bundle.get("select_universe")
-    if not isinstance(screened, dict):
-        raise ValueError(f"bundle select_universe is not certified: got {screened!r}")
-    live = dataclasses.asdict(spec)
-    unknown = sorted(set(screened) - set(live))
-    if unknown:
-        raise ValueError(f"bundle select_universe carries fields unknown to live screen: {unknown}")
-    # 번들에 없는 키 = 필드 도입 이전 학습 → 기본값(도입 이전 동작)으로 학습된 것으로 간주
-    defaults = dataclasses.asdict(UniverseSpec())
-    certified = {k: screened.get(k, defaults[k]) for k in live}
-    differing = [k for k in live if _screen_value(certified[k]) != _screen_value(live[k])]
-    if differing:
-        bundle_vals = {k: certified[k] for k in differing}
-        live_vals = {k: live[k] for k in differing}
-        raise ValueError(
-            f"bundle select_universe differs from live screen in fields {differing}: "
-            f"bundle={bundle_vals} live={live_vals}"
-        )
-    return None
-
-
 def build_dual_pool(
     ph: pd.DataFrame,
     market_dates: np.ndarray,
@@ -234,9 +239,7 @@ def build_dual_pool(
     return pool, np.asarray(sel_mask, dtype=bool)
 
 
-def attach_pit_net_label(
-    cands: pd.DataFrame, *, cost: CostSpec, label_clip: float = LABEL_CLIP
-) -> pd.DataFrame:
+def attach_pit_net_label(cands: pd.DataFrame, *, cost: CostSpec, label_clip: float = LABEL_CLIP) -> pd.DataFrame:
     """Attach the PIT net return and the clipped training label.
 
     Args:
@@ -303,36 +306,7 @@ def demean_label_by_date(
     return out
 
 
-def select_topk_by_score(
-    cands: pd.DataFrame, k: int, *, score_col: str = "pred", date_col: str = "date"
-) -> pd.DataFrame:
-    """Select the k highest-scoring candidates per date in descending order.
-
-    Args:
-        cands: Candidate pool with date and score columns.
-        k: Number of names to keep per date.
-        score_col: Prediction score column name.
-        date_col: Date column name.
-
-    Returns:
-        Top-k picks per date in descending score order.
-
-    Raises:
-        ValueError: For k < 1 or a missing column.
-    """
-    if int(k) < 1:
-        raise ValueError(f"k must be >= 1, got {k!r}")
-    if score_col not in cands.columns:
-        raise ValueError(f"cands missing score_col {score_col!r}")
-    if date_col not in cands.columns:
-        raise ValueError(f"cands missing date_col {date_col!r}")
-    ranked = cands.sort_values([date_col, score_col], ascending=[True, False], kind="stable")
-    return ranked.groupby(date_col, sort=False).head(int(k)).reset_index(drop=True)
-
-
-def assert_unique_date_symbol(
-    df: pd.DataFrame, *, date_col: str = "date", symbol_col: str = "symbol"
-) -> None:
+def assert_unique_date_symbol(df: pd.DataFrame, *, date_col: str = "date", symbol_col: str = "symbol") -> None:
     """Fail closed when any (date, symbol) pair repeats.
 
     Args:
@@ -350,10 +324,7 @@ def assert_unique_date_symbol(
     counts = df.groupby([date_col, symbol_col], sort=False).size()
     dup = counts[counts > 1]
     if len(dup):
-        raise ValueError(
-            f"duplicate (date, symbol) pairs: {len(dup)} pairs, "
-            f"max multiplicity {int(dup.max())}"
-        )
+        raise ValueError(f"duplicate (date, symbol) pairs: {len(dup)} pairs, max multiplicity {int(dup.max())}")
     return None
 
 
@@ -417,15 +388,17 @@ def score_pool_cpcv(
     Raises:
         ValueError: When finite-target rows fall below min_train_rows.
     """
-    splitter = cv if cv is not None else CombinatorialPurgedCV(n_groups=CPCV_N_GROUPS, k_test=CPCV_K_TEST, purge_gap=1, embargo_gap=1)
+    splitter = (
+        cv
+        if cv is not None
+        else CombinatorialPurgedCV(n_groups=CPCV_N_GROUPS, k_test=CPCV_K_TEST, purge_gap=1, embargo_gap=1)
+    )
     params = dict(RANKER_MODEL_PARAMS) if model_params is None else dict(model_params)
     # 비유한 라벨 행 제거 후 CPCV 위임
     target = train_df[target_col].to_numpy(dtype=np.float64)
     work = train_df[np.isfinite(target)]
     if len(work) < int(min_train_rows):
-        raise ValueError(
-            f"finite-target rows {len(work)} below min_train_rows {min_train_rows}"
-        )
+        raise ValueError(f"finite-target rows {len(work)} below min_train_rows {min_train_rows}")
     return cpcv_oof_predict(
         work,
         list(feature_cols),
@@ -475,6 +448,71 @@ def split_regime_frames(
     return cert_df, hist_df
 
 
+def seam_embargo_start(
+    calendar: np.ndarray, test_start: pd.Timestamp, embargo_days: int
+) -> pd.Timestamp:
+    """Return the date from which history labels are embargoed before a test window.
+
+    The calendar is the set of pool dates, a subset of trading days; a missing trading day moves
+    the boundary earlier, which only widens the purge.
+
+    Args:
+        calendar: Sorted unique pool dates (datetime64) covering history and certification rows.
+        test_start: Earliest date of the fold's test rows.
+        embargo_days: Pool dates strictly before test_start to embargo; 0 returns test_start.
+
+    Returns:
+        The embargo_days-th distinct calendar date strictly before test_start, or the earliest
+        calendar date when fewer exist.
+
+    Raises:
+        ValueError: When embargo_days is negative or calendar is empty.
+    """
+    if int(embargo_days) < 0:
+        raise ValueError(f"embargo_days must be >= 0, got {embargo_days!r}")
+    uniq = pd.DatetimeIndex(pd.to_datetime(np.asarray(calendar))).normalize().unique().sort_values()
+    if len(uniq) == 0:
+        raise ValueError("calendar is empty; cannot locate the seam embargo start")
+    start = pd.Timestamp(pd.to_datetime(test_start).normalize())
+    if int(embargo_days) == 0:
+        return start
+    prior = uniq[uniq < start]
+    if len(prior) <= int(embargo_days):
+        return pd.Timestamp(uniq[0])
+    return pd.Timestamp(prior[len(prior) - int(embargo_days)])
+
+
+def purge_history_seam(
+    hist_df: pd.DataFrame, *, embargo_start: pd.Timestamp, exit_col: str = EXIT_DATE_COL
+) -> pd.DataFrame:
+    """Drop history rows whose label is realized inside a fold's embargo or test window.
+
+    History rows precede the certification regime and train every CPCV fold; a row whose exit
+    (label realization) lands at or after embargo_start would let the test window's prices into
+    training. Rows with an unknown exit date are dropped (fail-closed).
+
+    Args:
+        hist_df: Finite-label history rows carrying exit_col.
+        embargo_start: Output of seam_embargo_start for the fold.
+        exit_col: Label realization date column.
+
+    Returns:
+        The subset of hist_df with exit_col strictly before embargo_start, original index and
+        order preserved (a filtered view, no reindexing).
+
+    Raises:
+        ValueError: When hist_df is non-empty and lacks exit_col.
+    """
+    if len(hist_df) == 0:
+        return hist_df
+    if exit_col not in hist_df.columns:
+        raise ValueError(f"hist_df missing exit_col {exit_col!r}; cannot purge the certification seam")
+    bound = pd.Timestamp(pd.to_datetime(embargo_start).normalize())
+    exits = pd.to_datetime(hist_df[exit_col])
+    keep = exits.notna() & (exits.dt.normalize() < bound)
+    return hist_df[np.asarray(keep, dtype=bool)]
+
+
 def cpcv_score_with_history(
     cert_df: pd.DataFrame,
     hist_df: pd.DataFrame,
@@ -487,8 +525,12 @@ def cpcv_score_with_history(
     huber_delta: float = 0.9,
     min_train_rows: int = TRAIN_POOL_MIN_ROWS,
     seeds: tuple[int, ...] = RANKER_SEEDS,
+    seam_embargo_days: int = HISTORY_SEAM_EMBARGO_DAYS,
 ) -> pd.DataFrame:
     """Score certification rows with CPCV bins, fitting on history plus fold rows.
+
+    History rows whose exit_date is on or after the fold's embargo start are excluded from that
+    fold's training set; the in-cert bin purge is the splitter's.
 
     Args:
         cert_df: Certification-regime rows; bins are formed over this frame only.
@@ -501,6 +543,8 @@ def cpcv_score_with_history(
         huber_delta: Huber alpha for the ranker.
         min_train_rows: Fail-closed floor on per-fold training rows.
         seeds: LightGBM seeds averaged per fold (the serving bundle uses the same).
+        seam_embargo_days: Pool dates before each fold's first test date within which history labels
+            may not realize (label-horizon purge at the certification seam).
 
     Returns:
         Out-of-fold predictions covering cert_df rows only, carrying pred and
@@ -508,8 +552,13 @@ def cpcv_score_with_history(
 
     Raises:
         ValueError: When a fold's training rows fall below min_train_rows.
+        ValueError: When hist_df is non-empty and lacks the exit_date column.
     """
-    splitter = cv if cv is not None else CombinatorialPurgedCV(n_groups=CPCV_N_GROUPS, k_test=CPCV_K_TEST, purge_gap=1, embargo_gap=1)
+    splitter = (
+        cv
+        if cv is not None
+        else CombinatorialPurgedCV(n_groups=CPCV_N_GROUPS, k_test=CPCV_K_TEST, purge_gap=1, embargo_gap=1)
+    )
     params = dict(RANKER_MODEL_PARAMS) if model_params is None else dict(model_params)
     # 양쪽 프레임에서 비유한 라벨 제거, 인증 인덱스는 그대로 유지
     cert_target = cert_df[target_col].to_numpy(dtype=np.float64)
@@ -517,11 +566,36 @@ def cpcv_score_with_history(
     cert_work.attrs = {}
     hist_target = hist_df[target_col].to_numpy(dtype=np.float64) if len(hist_df) else np.empty(0, dtype=np.float64)
     hist_work = hist_df[np.isfinite(hist_target)] if len(hist_df) else hist_df
+    if len(hist_work) and EXIT_DATE_COL not in hist_work.columns:
+        raise ValueError(f"hist_df missing {EXIT_DATE_COL!r}; cannot purge the certification seam")
+    pool_calendar = (
+        pd.DatetimeIndex(
+            pd.to_datetime(pd.concat([hist_work[group_col], cert_work[group_col]])).dt.normalize()
+        )
+        .unique()
+        .sort_values()
+        .to_numpy()
+        if len(hist_work)
+        else np.empty(0, dtype="datetime64[ns]")
+    )
     parts: list[pd.DataFrame] = []
+    folds_affected = 0
+    max_excluded = 0
     for train_idx, test_idx, fold_id in splitter.split(cert_work[group_col]):
         train_cert = cert_work.iloc[train_idx]
         val = cert_work.iloc[test_idx]
-        train_full = pd.concat([hist_work, train_cert]) if len(hist_work) else train_cert
+        if len(hist_work):
+            embargo_start = seam_embargo_start(
+                pool_calendar, pd.Timestamp(val[group_col].min()), int(seam_embargo_days)
+            )
+            fold_hist = purge_history_seam(hist_work, embargo_start=embargo_start)
+            excluded = len(hist_work) - len(fold_hist)
+            if excluded:
+                folds_affected += 1
+                max_excluded = max(max_excluded, excluded)
+        else:
+            fold_hist = hist_work
+        train_full = pd.concat([fold_hist, train_cert]) if len(fold_hist) else train_cert
         if len(train_full) < int(min_train_rows):
             raise ValueError(
                 f"fold {int(fold_id)} training rows {len(train_full)} below min_train_rows {min_train_rows}"
@@ -533,6 +607,14 @@ def cpcv_score_with_history(
         fold_df["pred"] = np.asarray(reg.predict(val_f[list(feature_cols)]), dtype=np.float64)
         fold_df["cpcv_fold"] = int(fold_id)
         parts.append(fold_df)
+    if len(hist_work):
+        logger.info(
+            "[ALGO] stage=cpcv_seam_purge embargo_days=%d hist_rows=%d folds_affected=%d max_excluded=%d",
+            int(seam_embargo_days),
+            len(hist_work),
+            folds_affected,
+            max_excluded,
+        )
     return pd.concat(parts)
 
 
@@ -592,12 +674,8 @@ def compute_arm_metrics(
     daily_net = daily_mean_series(picks[finite], vals[finite])
     regimes = compute_regime_metrics(daily_net, feasibility_full)
     by_year = compute_yearly_stability(daily_net)
-    cost_stress = compute_cost_stress(
-        picks, regime="post_reform"
-    )
-    return ArmMetrics(
-        arm=arm, top_k=int(top_k), regimes=regimes, by_year=by_year, cost_stress=cost_stress
-    )
+    cost_stress = compute_cost_stress(picks, regime="post_reform")
+    return ArmMetrics(arm=arm, top_k=int(top_k), regimes=regimes, by_year=by_year, cost_stress=cost_stress)
 
 
 def compute_path_evidence(
@@ -709,9 +787,19 @@ def evaluate_falsification(
     # 개편전은 인증 표본이 아니라 역외 경제성 반증 시험이다.
     pre = arm.regimes["pre_reform"]
     if int(pre.n_days_with_signal) < int(min_days):
-        return ("INSUFFICIENT_PRE_REFORM_SAMPLE", [f"pre_reform n_days_with_signal={pre.n_days_with_signal} below min_days={min_days}; falsification not evaluated"])
+        return (
+            "INSUFFICIENT_PRE_REFORM_SAMPLE",
+            [
+                f"pre_reform n_days_with_signal={pre.n_days_with_signal} below min_days={min_days}; falsification not evaluated"
+            ],
+        )
     if pre.mean_net_bp > 0.0 and pre.t_stat >= float(min_t_stat):
-        return ("REFUTED", [f"pre_reform net is significantly positive under PIT cost: mean_net_bp={pre.mean_net_bp} t_stat={pre.t_stat}; a 46bp-cost regime cannot be profitable, so the cost model or the label is wrong"])
+        return (
+            "REFUTED",
+            [
+                f"pre_reform net is significantly positive under PIT cost: mean_net_bp={pre.mean_net_bp} t_stat={pre.t_stat}; a 46bp-cost regime cannot be profitable, so the cost model or the label is wrong"
+            ],
+        )
     return ("CONSISTENT", [])
 
 
@@ -731,7 +819,9 @@ def evaluate_ranker_verdict(
     """
     reasons: list[str] = []
     if falsification_status == "REFUTED":
-        reasons.append("falsification tier REFUTED: the selection rule certifies positive net return in the pre-reform cost regime")
+        reasons.append(
+            "falsification tier REFUTED: the selection rule certifies positive net return in the pre-reform cost regime"
+        )
         return ("REFUTED", reasons)
     post = ranker.regimes["post_reform"]
     # 커버리지 미달은 통계 판단 이전에 차단
@@ -742,11 +832,7 @@ def evaluate_ranker_verdict(
         )
         return ("INSUFFICIENT_COVERAGE", reasons)
     stress_at_3 = next(
-        (
-            p
-            for p in ranker.cost_stress
-            if p.regime == "post_reform" and math.isclose(p.round_trip_ticks, 3.0)
-        ),
+        (p for p in ranker.cost_stress if p.regime == "post_reform" and math.isclose(p.round_trip_ticks, 3.0)),
         None,
     )
     ctrl_post = control.regimes["post_reform"]
@@ -805,12 +891,14 @@ def run_topk_ranker_backtest(
         raise ValueError(f"top_k {spec.top_k} below the minimum investable K {MIN_TOP_K}")
     k = int(spec.top_k)
     # 기본 학습 시작은 패널 최소일. 비용이 PIT라 개편전도 올바르게 라벨링되며, 인증 경계는 split_regime_frames가 별도로 고정한다.
-    eff_train_start = pd.Timestamp(pd.to_datetime(ph["date"]).min()) if train_start is None else pd.Timestamp(train_start)
-    # 이중 풀 → PIT 라벨 → 인증구간 비닝+히스토리 증강 스코어 → 선택 마스크 제한 → 양 팔 평가
-    pool, sel_mask = build_dual_pool(
-        ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe
+    eff_train_start = (
+        pd.Timestamp(pd.to_datetime(ph["date"]).min()) if train_start is None else pd.Timestamp(train_start)
     )
-    constructible_regimes = ("pre_reform", "post_reform") if spec.universe.max_tick_cost_bp is None else ("post_reform",)
+    # 이중 풀 → PIT 라벨 → 인증구간 비닝+히스토리 증강 스코어 → 선택 마스크 제한 → 양 팔 평가
+    pool, sel_mask = build_dual_pool(ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe)
+    constructible_regimes = (
+        ("pre_reform", "post_reform") if spec.universe.max_tick_cost_bp is None else ("post_reform",)
+    )
     screen_day_fractions = assert_screen_constructible(pool.loc[sel_mask], top_k=k, regimes=constructible_regimes)
     labeled = demean_label_by_date(attach_pit_net_label(pool, cost=spec.cost))
     cert_df, hist_df = split_regime_frames(labeled, train_start=eff_train_start)
@@ -833,18 +921,16 @@ def run_topk_ranker_backtest(
     # 진입 가능 달력: D+1 봉 없는 종료일은 분모 제외
     calendar_all = pd.DatetimeIndex(pd.to_datetime(pd.Series(market_dates)).sort_values().unique())
     feasibility_full = day_level_feasibility(pool.loc[sel_mask], k, calendar_all[:-1].to_numpy())
-    ranker_arm = compute_arm_metrics(
-        ranker_picks, feasibility_full, arm="ranker", top_k=k, cost=spec.cost
-    )
-    control_arm = compute_arm_metrics(
-        control_picks, feasibility_full, arm="costsort", top_k=k, cost=spec.cost
-    )
+    ranker_arm = compute_arm_metrics(ranker_picks, feasibility_full, arm="ranker", top_k=k, cost=spec.cost)
+    control_arm = compute_arm_metrics(control_picks, feasibility_full, arm="costsort", top_k=k, cost=spec.cost)
     full_sel = labeled[sel_mask]
     control_full_arm = compute_arm_metrics(
         select_topk_by_tick_cost(full_sel, k), feasibility_full, arm="costsort_full", top_k=k, cost=spec.cost
     )
     falsification_status, falsification_reasons = evaluate_falsification(control_full_arm)
-    verdict, verdict_reasons = evaluate_ranker_verdict(ranker_arm, control_arm, evidence, falsification_status=falsification_status)
+    verdict, verdict_reasons = evaluate_ranker_verdict(
+        ranker_arm, control_arm, evidence, falsification_status=falsification_status
+    )
     dates_all = pd.to_datetime(ph["date"])
     date_min = str(dates_all.min().date()) if len(dates_all) else ""
     date_max = str(dates_all.max().date()) if len(dates_all) else ""
@@ -956,27 +1042,26 @@ def train_production_bundle(
         seeds: Seed ensemble for the return model, matching certification.
 
     Returns:
-        Extended bundle dict with audit provenance keys.
+        Extended bundle dict with audit provenance keys, the feature-contract version and
+        the declared feature manifest.
 
     Raises:
         ValueError: When spec.top_k is below MIN_TOP_K or finite rows are short.
     """
     if int(spec.top_k) < MIN_TOP_K:
         raise ValueError(f"top_k {spec.top_k} below the minimum investable K {MIN_TOP_K}")
-    eff_train_start = pd.Timestamp(pd.to_datetime(ph["date"]).min()) if train_start is None else pd.Timestamp(train_start)
-    # 인증구간 와이드 풀 조립 후 PIT 라벨 부착
-    pool, _sel_mask = build_dual_pool(
-        ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe
+    eff_train_start = (
+        pd.Timestamp(pd.to_datetime(ph["date"]).min()) if train_start is None else pd.Timestamp(train_start)
     )
+    # 인증구간 와이드 풀 조립 후 PIT 라벨 부착
+    pool, _sel_mask = build_dual_pool(ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe)
     labeled = demean_label_by_date(attach_pit_net_label(pool, cost=spec.cost))
     cert_df, hist_df = split_regime_frames(labeled, train_start=eff_train_start)
     train_df = pd.concat([hist_df, cert_df]) if len(hist_df) else cert_df
     labels = train_df["train_label"].to_numpy(dtype=np.float64)
     fit_df = train_df[np.isfinite(labels)]
     if len(fit_df) < int(min_train_rows):
-        raise ValueError(
-            f"finite train_label rows {len(fit_df)} below min_train_rows {min_train_rows}"
-        )
+        raise ValueError(f"finite train_label rows {len(fit_df)} below min_train_rows {min_train_rows}")
     # 인증 CPCV 와 동일 파라미터·시드로 학습 (서빙=인증 모델 정합)
     eff_params = dict(RANKER_MODEL_PARAMS) if model_params is None else dict(model_params)
     bundle = build_inline_bundle(
@@ -996,104 +1081,9 @@ def train_production_bundle(
     bundle["label_mode"] = LABEL_MODE
     bundle["model_params"] = eff_params
     bundle["seeds"] = list(seeds)
+    bundle[FEATURE_CONTRACT_VERSION_KEY] = TOPK_FEATURE_CONTRACT_VERSION
+    bundle["feature_manifest"] = build_topk_feature_manifest(bundle["feature_cols"])
     return bundle
-
-
-def save_production_bundle(bundle: dict[str, Any], export_dir: str = TOPK_RANKER_BUNDLE_DIR) -> str:
-    """Persist a production bundle under the reranker artifact directory.
-
-    Args:
-        bundle: Extended bundle dict from train_production_bundle.
-        export_dir: Destination directory, distinct from champion's directory.
-
-    Returns:
-        Saved joblib path as a string.
-    """
-    from joblib import dump
-
-    # 챔피언 번들과 파일명 충돌 방지용 별도 디렉터리
-    os.makedirs(export_dir, exist_ok=True)
-    path = os.path.join(export_dir, "sizing_pipeline_bundle.joblib")
-    tmp_path = f"{path}.tmp"
-    dump(bundle, tmp_path)
-    # 추론 쪽이 부분 기록된 번들을 읽지 않도록 같은 디렉터리에서 원자적으로 교체한다
-    os.replace(tmp_path, path)
-    return path
-
-
-def score_topk_candidates(df: pd.DataFrame, bundle: dict[str, Any]) -> pd.DataFrame:
-    """Score every snapshot row with the production bundle models.
-
-    Args:
-        df: Live snapshot with the bundle's feature columns.
-        bundle: Production bundle carrying return/quantile/calibrator models.
-
-    Returns:
-        Copy of df with pred, quantile and calibration score columns.
-
-    Raises:
-        ValueError: When feature_cols is empty or a declared feature column
-            is missing from the snapshot.
-    """
-    assert_bundle_screen_parity(bundle)
-    feature_cols = list(bundle.get("feature_cols", []))
-    if not feature_cols:
-        raise ValueError("bundle feature_cols is empty; refusing to select")
-    missing = [col for col in feature_cols if col not in df.columns]
-    if missing:
-        raise ValueError(f"snapshot is missing bundle feature columns: {missing}")
-    work = df.copy()
-    features = work[feature_cols]
-    work["pred"] = np.asarray(bundle["return_model"].predict(features), dtype=np.float64)
-    q_models = bundle["quantile_models"]
-    q10 = np.asarray(q_models["pred_q10"].predict(features), dtype=np.float64)
-    q50 = np.asarray(q_models["pred_q50"].predict(features), dtype=np.float64)
-    q90 = np.asarray(q_models["pred_q90"].predict(features), dtype=np.float64)
-    work["pred_q10"] = np.minimum(np.minimum(q10, q50), q90)
-    work["pred_q50"] = np.clip(q50, work["pred_q10"].to_numpy(dtype=np.float64), q90)
-    work["pred_q90"] = np.maximum(q90, work["pred_q50"].to_numpy(dtype=np.float64))
-    for name in ("p_good", "p_bad"):
-        calibrator = bundle["calibrators"][name]
-        if isinstance(calibrator, float):
-            work[name] = float(calibrator)
-        else:
-            proba = calibrator.predict_proba(features)
-            positive_idx = list(calibrator.classes_).index(True)
-            work[name] = proba[:, positive_idx]
-    return work
-
-
-def select_topk_equal_weight(
-    df: pd.DataFrame, bundle: dict[str, Any], *, top_k: int, date_col: str = "date", admitted_col: str = "admitted"
-) -> pd.DataFrame:
-    """Select the certified top-k by point-estimate rank with equal weights.
-
-    Args:
-        df: Live snapshot with the bundle's feature columns.
-        bundle: Production bundle carrying return/quantile/calibrator models.
-        top_k: Names to select; must equal the certified MIN_TOP_K.
-        date_col: Date column name for per-date selection.
-        admitted_col: Admission flag column; only flagged rows are selectable.
-
-    Returns:
-        Top-k picks with pred, diagnostic columns and uniform allocation.
-
-    Raises:
-        ValueError: When top_k is not MIN_TOP_K, feature_cols is empty, or a
-            declared feature column is missing from the snapshot.
-    """
-    if int(top_k) != MIN_TOP_K:
-        raise ValueError(f"top_k {top_k!r} is not the certified MIN_TOP_K {MIN_TOP_K}")
-    work = score_topk_candidates(df, bundle)
-    pool = work
-    if admitted_col in work.columns:
-        pool = work[np.asarray(work[admitted_col], dtype=bool)]
-    admitted_counts = pool.groupby(date_col, sort=False).size()
-    certified_dates = admitted_counts[admitted_counts >= int(top_k)].index
-    pool = pool[pool[date_col].isin(certified_dates)]
-    picks = select_topk_by_score(pool, int(top_k), score_col="pred", date_col=date_col)
-    picks["allocation"] = 1.0 / float(top_k)
-    return picks
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1111,8 +1101,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--price-history", default=str(settings.PRICE_HISTORY_PARQUET_PATH))
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--out", default="artifacts/research/topk_ranker_report.parquet")
-    parser.add_argument("--train-start", default=None, help="training-window start YYYY-MM-DD; augments training only and never moves the certification boundary (default: the panel minimum date)")
-    parser.add_argument("--capfree", action="store_true", help="select with the cap-free universe (KCA-TOPK-CAPFREE-001) instead of the tick-cost-capped one")
+    parser.add_argument(
+        "--train-start",
+        default=None,
+        help="training-window start YYYY-MM-DD; augments training only and never moves the certification boundary (default: the panel minimum date)",
+    )
+    parser.add_argument(
+        "--capfree",
+        action="store_true",
+        help="select with the cap-free universe (KCA-TOPK-CAPFREE-001) instead of the tick-cost-capped one",
+    )
     args = parser.parse_args(argv)
     configure_cli_logging(logging.BASIC_FORMAT)
     base_spec = KCA_TOPK_CAPFREE_001 if args.capfree else KCA_TOPK_COSTAWARE_001
@@ -1123,7 +1121,12 @@ def main(argv: list[str] | None = None) -> None:
     train_start = pd.Timestamp(args.train_start) if args.train_start else None
     report = run_topk_ranker_backtest(ph, market_dates, d_to_idx, spec=spec, train_start=train_start)
     atomic_write_parquet(topk_ranker_report_to_frame(report), Path(args.out))
-    logger.info("[EVAL] stage=topk_ranker verdict=%s falsification=%s reasons=%s", report.verdict, report.falsification_status, report.verdict_reasons)
+    logger.info(
+        "[EVAL] stage=topk_ranker verdict=%s falsification=%s reasons=%s",
+        report.verdict,
+        report.falsification_status,
+        report.verdict_reasons,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

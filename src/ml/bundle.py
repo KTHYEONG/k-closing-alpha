@@ -117,7 +117,7 @@ def fit_seed_ensemble(
         params = dict(model_params or {})
         params.setdefault("alpha", huber_delta)
         train_f = _finite_nan(train_df, feature_cols)
-        model = LGBMRegressor(objective="huber", random_state=seed, verbosity=-1, **params)  # type: ignore[arg-type]
+        model = LGBMRegressor(objective="huber", random_state=seed, verbosity=-1, **params)
         model.fit(train_f[feature_cols], train_f[target_col].to_numpy(dtype=np.float64), sample_weight=sample_weight)
         models.append(model)
     return SeedEnsembleModel(models, seeds)

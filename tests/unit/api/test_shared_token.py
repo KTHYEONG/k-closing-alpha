@@ -349,3 +349,22 @@ def test_publish_failure_cleans_tmp(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(OSError, match="disk full"):
         asyncio.run(store.get_or_issue(_issue))
     assert not path.exists()
+
+
+def test_issued_token_repr_hides_token() -> None:
+    from src.api.shared_token import IssuedToken
+
+    text = repr(IssuedToken(access_token="tok-SECRET-0001", expires_in_seconds=60.0))
+    assert "tok-SECRET-0001" not in text
+    assert "60.0" in text
+
+
+def test_token_record_repr_hides_token() -> None:
+    from datetime import UTC, datetime
+
+    from src.api.shared_token import TokenRecord
+
+    record = TokenRecord(access_token="tok-SECRET-0002", issued_at=datetime.now(UTC), expires_at=None, generation=7)
+    text = repr(record)
+    assert "tok-SECRET-0002" not in text
+    assert "generation=7" in text

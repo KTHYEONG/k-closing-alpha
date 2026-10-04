@@ -15,7 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src import settings
-from src.tools.alerts import dispatch_digest
+from src.tools.alerts import dispatch_digest, redact_for_egress
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,8 @@ def record_run_outcome(
         job: Job name (e.g. predict, finalize_close).
         outcome: One of RUN_OUTCOMES.
         run_date: Run date (YYYY-MM-DD).
-        reason: Short reason string (truncated to RUN_EVENT_REASON_MAX_CHARS).
+        reason: Short reason string; credential-masked, then truncated to
+            RUN_EVENT_REASON_MAX_CHARS, before it reaches the event log, logger or digest.
         metrics: Optional metrics mapping serialized with full float precision.
         path: Explicit event log path override (tests).
         alert_fn: Alert dispatcher override (tests).
@@ -67,7 +68,7 @@ def record_run_outcome(
         "job": job,
         "run_date": run_date,
         "outcome": outcome,
-        "reason": reason[:RUN_EVENT_REASON_MAX_CHARS],
+        "reason": redact_for_egress(reason)[:RUN_EVENT_REASON_MAX_CHARS] if reason else "",
         "metrics": dict(metrics or {}),
     }
     target = path if path is not None else run_events_path(run_date)

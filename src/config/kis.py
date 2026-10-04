@@ -13,7 +13,16 @@ from src.config._env import EnvSettings
 
 
 class KisSettings(EnvSettings):
-    """한투 KIS(한국투자증권) OpenAPI 접속 설정."""
+    """한투 KIS(한국투자증권) OpenAPI 접속 설정.
+
+    Attributes:
+        KIS_TOKEN_LOCK_TIMEOUT_SECONDS: Bound on waiting for the host-wide KIS token
+            lock. A healthy holder (another KCA unit or the external krx-alpha consumer)
+            keeps the lock for its whole issuance: up to 3 POST attempts under a 60 s
+            session total plus backoff (~183 s). The bound must exceed that so a slow but
+            healthy issuance is adopted from the cache instead of failing the waiter, and
+            stays finite so a hung holder fails closed instead of blocking forever.
+    """
 
     KIS_APP_KEY: str = Field(default="")
     KIS_APP_SECRET: str = Field(default="")
@@ -22,6 +31,7 @@ class KisSettings(EnvSettings):
     KIS_DATA_ROLE: str = Field(default="batch")
     KIS_TOKEN_CACHE_DIR: Path = Field(default_factory=lambda: Path.home() / ".cache" / "kis")
     KIS_BASE_URL: str = "https://openapi.koreainvestment.com:9443"
+    KIS_TOKEN_LOCK_TIMEOUT_SECONDS: float = Field(default=240.0, gt=0, allow_inf_nan=False)
 
     @computed_field  # type: ignore[prop-decorator]
     @property

@@ -82,7 +82,7 @@ async def warmup_host_tokens(
         key_id = kis_key_id(cred.app_key)
         try:
             token_file = token_cache_path(cred.app_key, settings.KIS_TOKEN_CACHE_DIR)
-            client = KisApiClient(  # type: ignore[no-untyped-call]
+            client = KisApiClient(
                 app_key=cred.app_key,
                 app_secret=cred.app_secret,
                 hts_id=cred.hts_id,

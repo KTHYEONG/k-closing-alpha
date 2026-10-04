@@ -224,6 +224,24 @@ def test_seal_uploads_then_commits_ledger_after_md5_match(tmp_path: Path, monkey
     assert report.segments_committed == 1 and report.members_committed == 1 and report.archive_bytes > 0
 
 
+def test_seal_run_saves_scan_state_without_temp(tmp_path: Path, monkeypatch) -> None:
+    from datetime import date
+
+    from src.tools.capture_offsite import _load_scan_state, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.json.gz"), b"payload-1")
+    remote_dir = tmp_path / "remote"
+    run_fn, _ = _make_fake(remote_dir, "gdrive:test")
+
+    seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=_config())
+
+    assert _load_scan_state(tmp_path) != {}
+    assert (tmp_path / "offsite" / "scan_state.json").exists()
+    assert list((tmp_path / "offsite").glob("*.tmp")) == []
+
+
 def test_seal_does_not_commit_ledger_when_remote_md5_mismatches(tmp_path: Path, monkeypatch) -> None:
     import pytest
 
@@ -2373,3 +2391,209 @@ def test_seal_staging_bounded_and_cleaned(tmp_path: Path, monkeypatch) -> None:
     assert peak["n"] <= 4
     assert peak["n"] > 1
     assert list(staging.glob("*.tar.zst")) == []
+
+
+def _hold_seal_lock(root: Path):
+    import contextlib
+    import fcntl
+
+    @contextlib.contextmanager
+    def _guard():
+        lock_path = root / "offsite" / ".seal.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = open(lock_path, "w")  # noqa: PTH123, SIM115 - lock held across the block
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+
+    return _guard()
+
+
+def _sealed_expired_dir(root: Path, day: str = "2026-08-01") -> tuple[str, int]:
+    rel = _raw_rel(day, "a", "b.json")
+    _write_member(root, rel, b"sealed-payload")
+    size = (root / rel).stat().st_size
+    _write_prune_ledger(root, "raw", day, [rel])
+    return rel, size
+
+
+def test_prune_skips_while_seal_lock_held(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    rel, size = _sealed_expired_dir(tmp_path)
+    before = (tmp_path / rel).read_bytes()
+
+    def _must_not_call(cmd, **kwargs):
+        raise AssertionError("no rclone call while seal lock is held")
+
+    with _hold_seal_lock(tmp_path):
+        report = prune_local_sealed_capture(
+            tmp_path, today=date(2026, 9, 24), run_fn=_must_not_call, config=_config(), dry_run=False
+        )
+
+    assert report.removed == ()
+    assert report.kept == ()
+    assert report.bytes_removed == 0
+    assert report.skipped_reason == "seal_lock_held"
+    assert (tmp_path / rel).read_bytes() == before
+
+
+def test_prune_dry_run_also_respects_seal_lock(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    _sealed_expired_dir(tmp_path)
+    calls: list = []
+
+    def _must_not_call(cmd, **kwargs):
+        calls.append(list(cmd))
+        raise AssertionError("no rclone call while seal lock is held")
+
+    with _hold_seal_lock(tmp_path):
+        report = prune_local_sealed_capture(
+            tmp_path, today=date(2026, 9, 24), run_fn=_must_not_call, config=_config(), dry_run=True
+        )
+
+    assert report.skipped_reason == "seal_lock_held"
+    assert calls == []
+
+
+def test_prune_releases_seal_lock(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    rel, _ = _sealed_expired_dir(tmp_path)
+    calls: list = []
+
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, calls), config=_config()
+    )
+    assert report.removed == ("raw/2026-08-01",)
+    assert not (tmp_path / rel).exists()
+
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    seal_and_upload(tmp_path, today=date(2026, 9, 25), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=_config())
+
+    assert (tmp_path / "offsite" / ".seal.lock").exists()
+
+
+def test_seal_lock_error_is_typed_runtime_error(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import SealLockHeldError, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    _write_member(tmp_path, _raw_rel("2026-09-10", "kis", "PRICE", "price", "run-1", "a.json.gz"), b"data")
+
+    with _hold_seal_lock(tmp_path):
+        run_fn, calls = _make_fake(tmp_path / "remote", "gdrive:test")
+        with pytest.raises(SealLockHeldError, match="holds the local seal lock") as exc_info:
+            seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=_config())
+
+    assert isinstance(exc_info.value, RuntimeError)
+    assert exc_info.value.__cause__ is not None
+    assert calls == []
+
+
+def test_prune_validation_precedes_lock(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+
+    with (
+        _hold_seal_lock(tmp_path),
+        pytest.raises(ValueError, match="append window"),
+    ):
+        prune_local_sealed_capture(tmp_path, today=date(2026, 9, 24), retention_days=2, run_fn=_md5_run_fn("x", []), config=_config())
+
+
+_requires_non_root = __import__("pytest").mark.skipif(
+    __import__("os").geteuid() == 0, reason="root bypasses file permission checks"
+)
+
+
+def test_seal_refused_while_prune_holds_lock(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import SealLockHeldError, prune_local_sealed_capture, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    _sealed_expired_dir(tmp_path)
+    md5_calls: list = []
+    inner = _md5_run_fn("d41d8cd98f00b204e9800998ecf8427e", md5_calls)
+    refused: list[bool] = []
+
+    def _run_fn_seal_mid_prune(cmd, **kwargs):
+        seal_run, seal_calls = _make_fake(tmp_path / "remote", "gdrive:test")
+        with pytest.raises(SealLockHeldError):
+            seal_and_upload(tmp_path, today=date(2026, 9, 24), full_scan=True, run_fn=seal_run, now_fn=_utcnow, config=_config())
+        refused.append(seal_calls == [])
+        return inner(cmd, **kwargs)
+
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_run_fn_seal_mid_prune, config=_config()
+    )
+
+    assert refused == [True]
+    assert report.removed == ("raw/2026-08-01",)
+
+
+@_requires_non_root
+def test_prune_runs_with_foreign_readonly_seal_lock_file(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    rel, _ = _sealed_expired_dir(tmp_path)
+    lock_path = tmp_path / "offsite" / ".seal.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.touch()
+    lock_path.chmod(0o444)
+
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("d41d8cd98f00b204e9800998ecf8427e", []), config=_config()
+    )
+
+    assert report.skipped_reason is None
+    assert report.removed == ("raw/2026-08-01",)
+    assert not (tmp_path / rel).exists()
+
+
+@_requires_non_root
+def test_prune_skips_when_seal_lock_file_unopenable(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    rel, _ = _sealed_expired_dir(tmp_path)
+    lock_path = tmp_path / "offsite" / ".seal.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.touch()
+    lock_path.chmod(0o000)
+    try:
+        report = prune_local_sealed_capture(
+            tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn("x", []), config=_config()
+        )
+    finally:
+        lock_path.chmod(0o644)
+
+    assert report.skipped_reason == "seal_lock_unavailable"
+    assert (tmp_path / rel).exists()
+
+
+def test_prune_missing_capture_root_creates_nothing(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    root = tmp_path / "unmounted"
+
+    report = prune_local_sealed_capture(root, today=date(2026, 9, 24), run_fn=_md5_run_fn("x", []), config=_config(), dry_run=True)
+
+    assert report.skipped_reason == "capture_root_missing"
+    assert not root.exists()

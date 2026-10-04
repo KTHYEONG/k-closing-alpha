@@ -45,8 +45,10 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
+from src.data.io_utils import store_write_lock
 from src.data.panel_integrity import heal_price_history_panel
 from src.data.parquet_codec import write_price_history_parquet
+from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day
 from src.strategy.contract import derive_chg_ratio
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
@@ -91,6 +93,8 @@ KIS_INDEX_KOSPI_CODE: str = "0001"
 KIS_INDEX_KOSDAQ_CODE: str = "1001"
 # FHKUP03500100 는 요청 구간의 최신 50행만 반환한다 (실측)
 KIS_INDEX_PAGE_ROWS: int = 50
+VKOSPI_WINDOW: int = 20
+VKOSPI_LIVE_LOOKBACK_DAYS: int = 45
 # 패널 시작(2016-01-04) 이전 20거래일 HV 워밍업을 덮는 지수 조회 시작일
 INDEX_HISTORY_START: pd.Timestamp = pd.Timestamp("2015-11-01")
 # FHPTJ04160001/FHPPG04650201 은 호출 1회에 30거래일을 반환한다 (실측)
@@ -105,6 +109,9 @@ MIN_DAILY_ROW_RATIO: float = 0.97
 # 전일 동일 OHLCV 비중 상한: 2020년 이후 최대 0.0013 (2026-09-22 or-vps 실측)
 MAX_STALE_SHARE: float = 0.05
 KRW_PER_100M: float = 1e8
+# Ingest holds the lock across the multi-minute vendor phase. A second ingest is a duplicate
+# run and should fail immediately instead of queueing behind it. See OD-1.
+PRICE_HISTORY_LOCK_TIMEOUT_SECONDS: float = 0.0
 _ADJUSTED_PRICE_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "prev_close")
 _INVESTOR_PATH = "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
 _PROGRAM_PATH = "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
@@ -442,8 +449,8 @@ async def fetch_index_closes(
 def compute_vkospi_proxy(
     index_close_df: pd.DataFrame,
     *,
-    window: int = 20,
-    min_periods: int = 20,
+    window: int = VKOSPI_WINDOW,
+    min_periods: int = VKOSPI_WINDOW,
     output_col: str = "v_kospi",
 ) -> pd.DataFrame:
     """Build V-KOSPI proxy (historical volatility) from index close prices."""
@@ -469,6 +476,131 @@ def compute_vkospi_proxy(
     ).std(ddof=0)
     out[output_col] = roll_std * np.sqrt(252.0) * 100.0
     return out[["date", output_col]]
+
+
+def compute_live_vkospi(
+    past_closes: pd.DataFrame,
+    live_level: float,
+    decision_date: pd.Timestamp,
+    *,
+    session_day_fn: Callable[[date], SessionDay] | None = None,
+) -> float:
+    """Return the decision-day V-KOSPI proxy under the exact training definition.
+
+    The training panel row dated T carries compute_vkospi_proxy evaluated on KIS
+    composite (0001) closes through T's EOD close. At the 15:20 decision the EOD
+    close is unobservable, so the live composite level stands in as the T
+    observation and every earlier observation is a strictly-past official close.
+    The value is produced by compute_vkospi_proxy itself so the window, ddof and
+    annualization cannot drift from training.
+
+    Args:
+        past_closes: KIS composite closes with columns date and close, every date
+            strictly before decision_date (output of fetch_index_closes).
+        live_level: Composite index level observed at decision time (KIS
+            FHKUP03500100 output1.bstp_nmix_prpr); must be finite and positive.
+        decision_date: Decision trading date T (time component ignored).
+        session_day_fn: Static session resolver for the freshness check; None
+            selects src.data.session_calendar.resolve_session_day (offline).
+
+    Returns:
+        Annualized percent volatility of the last VKOSPI_WINDOW log returns,
+        finite and positive.
+
+    Raises:
+        ValueError: live_level non-finite or non-positive; past_closes missing
+            columns, holding a date on/after decision_date, or holding a
+            non-finite/non-positive close; fewer than VKOSPI_WINDOW past closes;
+            a STANDARD/SHIFTED/UNKNOWN session date lies strictly between the last
+            past close and decision_date (stale history); or the computed value is
+            non-finite or non-positive.
+    """
+    try:
+        level = float(live_level)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"live_level invalid: {live_level!r}") from exc
+    if not np.isfinite(level) or level <= 0:
+        raise ValueError(f"live_level must be finite and positive: {live_level!r}")
+    if past_closes is None or not isinstance(past_closes, pd.DataFrame):
+        raise ValueError("past_closes must be a DataFrame with date and close columns")
+    if "date" not in past_closes.columns or "close" not in past_closes.columns:
+        raise ValueError("past_closes missing date/close columns")
+    if past_closes.empty:
+        raise ValueError(f"past_closes holds fewer than {VKOSPI_WINDOW} rows before decision_date")
+    decision_ts = pd.Timestamp(decision_date).normalize()
+    dates = pd.to_datetime(past_closes["date"], errors="coerce")
+    if dates.isna().any():
+        raise ValueError("past_closes holds an unparsable date")
+    norm_dates = dates.map(lambda d: pd.Timestamp(d).normalize())
+    if bool((norm_dates >= decision_ts).any()):
+        raise ValueError("past_closes holds a date on/after decision_date")
+    if bool(norm_dates.duplicated().any()):
+        raise ValueError("past_closes holds duplicated dates")
+    closes = pd.to_numeric(past_closes["close"], errors="coerce")
+    if closes.isna().any() or not bool(np.isfinite(closes.to_numpy(dtype=np.float64)).all()):
+        raise ValueError("past_closes holds a non-finite close")
+    if bool((closes.to_numpy(dtype=np.float64) <= 0).any()):
+        raise ValueError("past_closes holds a non-positive close")
+    if len(past_closes) < VKOSPI_WINDOW:
+        raise ValueError(f"past_closes holds fewer than {VKOSPI_WINDOW} rows before decision_date")
+    resolver = session_day_fn if session_day_fn is not None else resolve_session_day
+    last_past = norm_dates.max()
+    gap = pd.Timestamp(last_past) + pd.Timedelta(days=1)
+    while gap < decision_ts:
+        kind = resolver(gap.date()).kind
+        if kind is not SessionKind.CLOSED:
+            raise ValueError(f"stale history: {gap.date()} between last past close and decision_date is {kind}")
+        gap += pd.Timedelta(days=1)
+    series = pd.DataFrame({
+        "date": [*norm_dates, decision_ts],
+        "close": [float(v) for v in closes.to_numpy(dtype=np.float64)] + [level],
+    }).sort_values("date").reset_index(drop=True)
+    vol = compute_vkospi_proxy(series)
+    row = vol[pd.to_datetime(vol["date"]) == decision_ts]
+    value = float(row["v_kospi"].iloc[0])
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"computed v_kospi non-finite or non-positive: {value!r}")
+    return value
+
+
+async def fetch_live_vkospi(
+    client: Any,
+    session: Any,
+    decision_date: pd.Timestamp,
+    live_level: float | None,
+) -> float:
+    """Fetch strictly-past KIS composite closes and compute the live V-KOSPI proxy.
+
+    Uses the caller's authenticated client and session (one FHKUP03500100 page
+    under the shared rate limiter) instead of constructing a new client, so the
+    decision window never triggers an extra token issuance.
+
+    Args:
+        client: KisApiClient-compatible object exposing get_market_index_history.
+        session: aiohttp session.
+        decision_date: Decision trading date T.
+        live_level: Live composite level for T, or None when it could not be parsed.
+
+    Returns:
+        compute_live_vkospi result.
+
+    Raises:
+        ValueError: live_level is None (raised before any network call) or any
+            compute_live_vkospi validation failure.
+        RuntimeError: Propagated from fetch_index_closes on a non-zero rt_cd or
+            stalled paging.
+    """
+    if live_level is None:
+        raise ValueError("live_level missing: cannot compute live V-KOSPI")
+    decision_ts = pd.Timestamp(decision_date).normalize()
+    past = await fetch_index_closes(
+        client,
+        session,
+        KIS_INDEX_KOSPI_CODE,
+        decision_ts - pd.Timedelta(days=VKOSPI_LIVE_LOOKBACK_DAYS),
+        decision_ts - pd.Timedelta(days=1),
+    )
+    return compute_live_vkospi(past, float(live_level), decision_ts)
 
 
 def compute_index_columns(kospi: pd.DataFrame, kosdaq: pd.DataFrame) -> pd.DataFrame:
@@ -553,7 +685,7 @@ def select_tail_rows(krx_rows: pd.DataFrame, panel_last_dates: dict[str, pd.Time
     return krx_rows[keep.to_numpy()].reset_index(drop=True)
 
 
-def parse_kis_investor_rows(body: dict) -> pd.DataFrame:
+def parse_kis_investor_rows(body: dict[str, Any]) -> pd.DataFrame:
     """Parse FHPTJ04160001 into daily institutional/foreign net buy (KRW 1e6).
 
     Raises:
@@ -569,7 +701,7 @@ def parse_kis_investor_rows(body: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["date", "inst_netbuy", "foreign_netbuy"]).drop_duplicates("date")
 
 
-def parse_kis_program_rows(body: dict) -> pd.DataFrame:
+def parse_kis_program_rows(body: dict[str, Any]) -> pd.DataFrame:
     """Parse FHPPG04650201 into daily program net buy (KRW 1e6).
 
     Raises:
@@ -585,7 +717,7 @@ def parse_kis_program_rows(body: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["date", "program_netbuy"]).drop_duplicates("date")
 
 
-def parse_toss_program_rows(body: dict) -> pd.DataFrame:
+def parse_toss_program_rows(body: dict[str, Any]) -> pd.DataFrame:
     """Parse Toss program trades into daily program net buy in the KIS unit (KRW 1e6).
 
     Raises:
@@ -614,7 +746,7 @@ def parse_toss_program_rows(body: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["date", "program_netbuy"]).drop_duplicates("date")
 
 
-def parse_kiwoom_investor_rows(data: dict) -> pd.DataFrame:
+def parse_kiwoom_investor_rows(data: dict[str, Any]) -> pd.DataFrame:
     """Parse Kiwoom ka10059 (amount mode) into KIS-equivalent investor flows.
 
     KIS foreign net buy equals Kiwoom frgnr_invsr + natfor (other foreigners).
@@ -869,6 +1001,10 @@ async def run_price_ingest(
 ) -> IngestReport:
     """Ingest every newly published trading day plus stale tails, then rewrite index columns.
 
+    The panel read, vendor fetches that are planned from it, merge, and atomic rewrite run under the
+    price-history store lock: the plan (new dates, stale tails, flow repairs) is derived from the panel as
+    read, so a concurrent writer between read and write would be silently overwritten.
+
     Args:
         today: Run date; None selects today in Asia/Seoul.
         path: Panel parquet; None selects settings.PRICE_HISTORY_PARQUET_PATH.
@@ -883,6 +1019,8 @@ async def run_price_ingest(
 
     Raises:
         FileNotFoundError: When the panel parquet does not exist.
+        StoreLockTimeoutError: Another process holds the price-history lock (concurrent ingest or panel
+            swap); no vendor call is made and the panel is untouched.
         RuntimeError: Propagated vendor failures (KRX strict, KIS index).
         ValueError: Gap beyond the flow window or index history missing a panel date.
     """
@@ -905,89 +1043,90 @@ async def run_price_ingest(
         from src.api.toss.client import TossApiClient
 
         toss = TossApiClient()
-    panel = pd.read_parquet(out_path)
-    panel["symbol"] = panel["symbol"].astype(str)
-    panel["date"] = pd.to_datetime(panel["date"])
-    panel_last = panel.groupby("symbol")["date"].max().to_dict()
-    panel_max = pd.Timestamp(panel["date"].max())
-    async with aiohttp.ClientSession() as session:
-        await kis.ensure_token(session)
-        kospi = await fetch_index_closes(kis, session, KIS_INDEX_KOSPI_CODE, INDEX_HISTORY_START, run_day)
-        kosdaq = await fetch_index_closes(kis, session, KIS_INDEX_KOSDAQ_CODE, INDEX_HISTORY_START, run_day)
-        trading = sorted(pd.Timestamp(d) for d in kospi["date"])
-        fetched: dict[pd.Timestamp, pd.DataFrame] = {}
-        prior = panel[pd.to_datetime(panel["date"]).dt.normalize() == panel_max] if not panel.empty else panel
-        for d in plan_new_dates(panel_max, trading, run_day):
-            trade_date = d
-            krx_cfg = cfg
-            observer = _price_page_observer(store, pd.Timestamp(trade_date).normalize().date(), run_id)
-            krx_rows = fetch_krx_daily(trade_date, krx_cfg, on_page=observer)
-            rows = krx_rows
-            if rows.empty:
-                break  # 미게시: 이후 날짜는 연속성 때문에 시도하지 않는다
-            check_day_continuity(rows, prior)
-            fetched[d] = rows
-            prior = rows
-        anchor = max(fetched) if fetched else panel_max
-        window = [d for d in trading if d <= anchor][-FLOW_WINDOW_TRADING_DAYS:]
-        new_rows = pd.DataFrame()
-        sources: dict[str, dict[str, int]] = {}
-        tail = pd.DataFrame(columns=list(KRX_ROW_COLUMNS))
-        if fetched:
-            latest = anchor
-            listed = set(fetched[latest]["symbol"])
-            stale = [v for s, v in panel_last.items() if s in listed and window[0] <= v < panel_max]
-            for d in (d for d in trading if stale and min(stale) < d <= panel_max):
+    with store_write_lock(out_path, purpose="price-history", timeout_seconds=PRICE_HISTORY_LOCK_TIMEOUT_SECONDS):
+        panel = pd.read_parquet(out_path)
+        panel["symbol"] = panel["symbol"].astype(str)
+        panel["date"] = pd.to_datetime(panel["date"])
+        panel_last = panel.groupby("symbol")["date"].max().to_dict()
+        panel_max = pd.Timestamp(panel["date"].max())
+        async with aiohttp.ClientSession() as session:
+            await kis.ensure_token(session)
+            kospi = await fetch_index_closes(kis, session, KIS_INDEX_KOSPI_CODE, INDEX_HISTORY_START, run_day)
+            kosdaq = await fetch_index_closes(kis, session, KIS_INDEX_KOSDAQ_CODE, INDEX_HISTORY_START, run_day)
+            trading = sorted(pd.Timestamp(d) for d in kospi["date"])
+            fetched: dict[pd.Timestamp, pd.DataFrame] = {}
+            prior = panel[pd.to_datetime(panel["date"]).dt.normalize() == panel_max] if not panel.empty else panel
+            for d in plan_new_dates(panel_max, trading, run_day):
                 trade_date = d
                 krx_cfg = cfg
                 observer = _price_page_observer(store, pd.Timestamp(trade_date).normalize().date(), run_id)
                 krx_rows = fetch_krx_daily(trade_date, krx_cfg, on_page=observer)
                 rows = krx_rows
                 if rows.empty:
-                    raise RuntimeError(f"KRX returned no rows for past trading day {d.date()}")
+                    break  # 미게시: 이후 날짜는 연속성 때문에 시도하지 않는다
+                check_day_continuity(rows, prior)
                 fetched[d] = rows
-            tail = select_tail_rows(pd.concat(list(fetched.values()), ignore_index=True), panel_last)
-        repairs = plan_flow_repairs(panel, window[0])
-        symbols = sorted(set(tail["symbol"].astype(str)) | set(repairs))
-        flows = pd.DataFrame(columns=["date", "symbol", *FLOW_COLUMNS])
-        if symbols:
-            flows, sources = await fetch_all_flows(kis, kiwoom, session, symbols, anchor.strftime("%Y%m%d"), toss)
+                prior = rows
+            anchor = max(fetched) if fetched else panel_max
+            window = [d for d in trading if d <= anchor][-FLOW_WINDOW_TRADING_DAYS:]
+            new_rows = pd.DataFrame()
+            sources: dict[str, dict[str, int]] = {}
+            tail = pd.DataFrame(columns=list(KRX_ROW_COLUMNS))
+            if fetched:
+                latest = anchor
+                listed = set(fetched[latest]["symbol"])
+                stale = [v for s, v in panel_last.items() if s in listed and window[0] <= v < panel_max]
+                for d in (d for d in trading if stale and min(stale) < d <= panel_max):
+                    trade_date = d
+                    krx_cfg = cfg
+                    observer = _price_page_observer(store, pd.Timestamp(trade_date).normalize().date(), run_id)
+                    krx_rows = fetch_krx_daily(trade_date, krx_cfg, on_page=observer)
+                    rows = krx_rows
+                    if rows.empty:
+                        raise RuntimeError(f"KRX returned no rows for past trading day {d.date()}")
+                    fetched[d] = rows
+                tail = select_tail_rows(pd.concat(list(fetched.values()), ignore_index=True), panel_last)
+            repairs = plan_flow_repairs(panel, window[0])
+            symbols = sorted(set(tail["symbol"].astype(str)) | set(repairs))
+            flows = pd.DataFrame(columns=["date", "symbol", *FLOW_COLUMNS])
+            if symbols:
+                flows, sources = await fetch_all_flows(kis, kiwoom, session, symbols, anchor.strftime("%Y%m%d"), toss)
+            if not tail.empty:
+                new_rows = assemble_new_rows(tail, flows)
+            # 신규 행이 없어도 창 안 결측 수급을 재조회해 채운다 — 부분 기록이 영구 결측으로 굳지 않게.
+            panel, n_repaired = apply_flow_repairs(panel, flows)
         if not tail.empty:
-            new_rows = assemble_new_rows(tail, flows)
-        # 신규 행이 없어도 창 안 결측 수급을 재조회해 채운다 — 부분 기록이 영구 결측으로 굳지 않게.
-        panel, n_repaired = apply_flow_repairs(panel, flows)
-    if not tail.empty:
-        store.publish_frame(tail, context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-unadjusted", symbol="unadjusted"))
-    index_cols = compute_index_columns(kospi, kosdaq)
-    if new_rows.empty:
-        # 신규 행이 없으면 행 순서가 같으므로 위치 비교로 지수 컬럼 변경 여부만 본다
-        events = pd.DataFrame(columns=["symbol", "date", "factor"])
-        merged = attach_index_columns(panel, index_cols)
-        changed = n_repaired > 0 or any(
-            not np.allclose(pd.to_numeric(panel[c], errors="coerce").to_numpy(dtype=np.float64), merged[c].to_numpy(dtype=np.float64), rtol=1e-6, atol=1e-9, equal_nan=True)
-            for c in INDEX_COLUMNS
-        )
-    else:
-        merged, events, evidence_mask = merge_and_adjust(panel, new_rows, trading)
-        merged = attach_index_columns(merged, index_cols)
-        changed = True
-    window_rows = merged[pd.to_datetime(merged["date"]) >= window[0]]
-    coverage = compute_flow_coverage(window_rows, ("inst_netbuy", "foreign_netbuy"))
-    program_coverage = compute_flow_coverage(window_rows, ("program_netbuy",))
-    shortfall = {k: v for k, v in coverage.items() if v < MIN_FLOW_COVERAGE}
-    program_shortfall = {k: v for k, v in program_coverage.items() if v < MIN_FLOW_COVERAGE}
-    wrote = False
-    if changed:
-        write_price_history_parquet(heal_price_history_panel(merged), out_path)
-        wrote = True
-        if not new_rows.empty:
-            # merged는 수년치 전체 패널이라 그대로 발행하면 아티팩트 크기 상한을 넘는다
-            # (실측: 2026-09-21 240MB+ 패널이 64MB 상한을 초과해 크래시). 신규/소급조정
-            # 행만 evidence_mask로 골라 발행해도 "무엇이 바뀌었는지"는 완전히 보존된다.
-            store.publish_frame(
-                merged.loc[evidence_mask],
-                context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-adjusted", symbol="adjusted"),
+            store.publish_frame(tail, context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-unadjusted", symbol="unadjusted"))
+        index_cols = compute_index_columns(kospi, kosdaq)
+        if new_rows.empty:
+            # 신규 행이 없으면 행 순서가 같으므로 위치 비교로 지수 컬럼 변경 여부만 본다
+            events = pd.DataFrame(columns=["symbol", "date", "factor"])
+            merged = attach_index_columns(panel, index_cols)
+            changed = n_repaired > 0 or any(
+                not np.allclose(pd.to_numeric(panel[c], errors="coerce").to_numpy(dtype=np.float64), merged[c].to_numpy(dtype=np.float64), rtol=1e-6, atol=1e-9, equal_nan=True)
+                for c in INDEX_COLUMNS
             )
+        else:
+            merged, events, evidence_mask = merge_and_adjust(panel, new_rows, trading)
+            merged = attach_index_columns(merged, index_cols)
+            changed = True
+        window_rows = merged[pd.to_datetime(merged["date"]) >= window[0]]
+        coverage = compute_flow_coverage(window_rows, ("inst_netbuy", "foreign_netbuy"))
+        program_coverage = compute_flow_coverage(window_rows, ("program_netbuy",))
+        shortfall = {k: v for k, v in coverage.items() if v < MIN_FLOW_COVERAGE}
+        program_shortfall = {k: v for k, v in program_coverage.items() if v < MIN_FLOW_COVERAGE}
+        wrote = False
+        if changed:
+            write_price_history_parquet(heal_price_history_panel(merged), out_path)
+            wrote = True
+            if not new_rows.empty:
+                # merged는 수년치 전체 패널이라 그대로 발행하면 아티팩트 크기 상한을 넘는다
+                # (실측: 2026-09-21 240MB+ 패널이 64MB 상한을 초과해 크래시). 신규/소급조정
+                # 행만 evidence_mask로 골라 발행해도 "무엇이 바뀌었는지"는 완전히 보존된다.
+                store.publish_frame(
+                    merged.loc[evidence_mask],
+                    context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-adjusted", symbol="adjusted"),
+                )
     report = IngestReport(
         ingested_dates=[d.strftime("%Y-%m-%d") for d in sorted(fetched)],
         n_new_rows=len(new_rows),

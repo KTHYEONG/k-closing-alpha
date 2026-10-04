@@ -8,7 +8,7 @@ import functools
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -22,7 +22,6 @@ from src.config.market_session import (
     KRX_CLOSE_MARKET_DIV_CODE,
 )
 from src.daily import archive
-from src.daily.collect import safe_float
 from src.daily.predict import load_topk_decision
 from src.data.capture_contracts import (
     CaptureContext,
@@ -35,6 +34,10 @@ from src.data.session_calendar import SessionKind, resolve_session_day, trading_
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, record_run_outcome
 from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
+from src.utils.numeric import safe_float
+
+if TYPE_CHECKING:
+    import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -230,8 +233,16 @@ async def fetch_confirmed_quote(client: Any, session: Any, code: str, *, capture
             # 이 예외로 전체 확정 루프를 중단시켜 파이프 하위 paper-entry가 UNCONFIRMED로 넘어감.
             # 원본 증거 보존은 부가 기능이므로 실패해도 확정 로직 자체는 계속 진행한다.
             logger.warning("[DATA] stage=close_confirmation code=%s status=DEGRADED reason=%s", code, type(exc).__name__)
-    price_output = price_res.get("output") if isinstance(price_res, dict) and price_res.get("rt_cd") == "0" and isinstance(price_res.get("output"), dict) else {}
-    book_output2 = book_res.get("output2") if isinstance(book_res, dict) and book_res.get("rt_cd") == "0" and isinstance(book_res.get("output2"), dict) else {}
+    price_output: dict[str, Any] = {}
+    if isinstance(price_res, dict) and price_res.get("rt_cd") == "0":
+        _price_raw = price_res.get("output")
+        if isinstance(_price_raw, dict):
+            price_output = cast(dict[str, Any], _price_raw)
+    book_output2: dict[str, Any] = {}
+    if isinstance(book_res, dict) and book_res.get("rt_cd") == "0":
+        _book_raw = book_res.get("output2")
+        if isinstance(_book_raw, dict):
+            book_output2 = cast(dict[str, Any], _book_raw)
     return price_output, book_output2
 
 
@@ -369,7 +380,7 @@ async def run_close_finalization(
             else:
                 from src.data.trading_calendar import is_kis_trading_day
 
-                is_trading_day = bool(await is_kis_trading_day(clients[0], session, snap))
+                is_trading_day = bool(await is_kis_trading_day(clients[0], cast("aiohttp.ClientSession", session), snap))
         except Exception:
             outcome, reason = RUN_OUTCOME_DEGRADED, "calendar_unavailable"
         else:
@@ -414,7 +425,7 @@ def load_pick_codes(snapshot_date: str) -> frozenset[str]:
     return frozenset(picks["symbol"].astype(str).str.zfill(6))
 
 
-async def _amain(args) -> int:
+async def _amain(args: argparse.Namespace) -> int:
     """단일 이벤트 루프 안에서 세션 생성/토큰/확정/종료를 모두 수행한다. 종가 확정은 읽기 전용 시세 조회라 데이터 계좌 키로 수행하고 체결 계좌 키는 실주문 전용으로 둔다."""
     snap = args.date or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
     session_day = resolve_session_day(date.fromisoformat(snap))

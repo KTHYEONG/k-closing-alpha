@@ -1,3 +1,6 @@
+from src.tools.alerts import alert_credential_env_file as _real_alert_credential_env_file
+
+
 def test_post_webhook_alert_sends_json_and_skips_when_url_empty(monkeypatch) -> None:
     import requests
 
@@ -715,6 +718,7 @@ def test_drain_alert_outbox_keeps_corrupt_file(tmp_path, caplog) -> None:
 
 
 def test_enqueue_undelivered_is_atomic(monkeypatch, tmp_path) -> None:
+    import os
     import pytest
 
     from src.tools import alerts
@@ -724,7 +728,7 @@ def test_enqueue_undelivered_is_atomic(monkeypatch, tmp_path) -> None:
     def _crash(src, dst):
         raise OSError("disk gone")
 
-    monkeypatch.setattr(alerts.os, "replace", _crash)
+    monkeypatch.setattr(os, "replace", _crash)
 
     with pytest.raises(OSError, match="disk gone"):
         alerts.enqueue_undelivered("s", "b", kind="digest", outbox=box)
@@ -831,3 +835,176 @@ def test_alerts_main_survives_drain_failure(monkeypatch, caplog) -> None:
 
     assert captured == {"unit": "kca-collect.service"}
     assert any("DRAIN_FAILED" in rec.message for rec in caplog.records)
+
+
+def test_alert_redaction_degrades_when_secret_source_unreadable(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    from src.tools import alerts
+
+    monkeypatch.setattr(alerts.settings, "BASE_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(alerts.settings, "KIS_APP_SECRET", "kis-secret-0123456789", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", "https://hooks.example.com/x", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_ATTEMPTS", 1, raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_BACKOFF_SECONDS", 0.01, raising=False)
+
+    def _boom_env(path):
+        raise OSError("env gone")
+
+    monkeypatch.setattr(alerts, "load_kis_env", _boom_env)
+    captured: dict = {}
+
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    def _fake_post(url, json, timeout):
+        captured["text"] = json["text"]
+        return _FakeResponse()
+
+    monkeypatch.setattr(alerts.requests, "post", _fake_post)
+
+    with caplog.at_level(logging.WARNING, logger=alerts.logger.name):
+        results = alerts.dispatch_failure_alert(
+            "kca-collect.service", detail="boom kis-secret-0123456789"
+        )
+
+    assert results["webhook"] is True
+    assert "kis-secret-0123456789" not in captured["text"]
+    assert "***" in captured["text"]
+    assert any("stage=alert_redaction status=DEGRADED reason=OSError" in rec.message for rec in caplog.records)
+
+
+def test_sanitize_journal_tail_masks_secret_before_truncation() -> None:
+    from src.tools import alerts
+
+    secret = "Q" * 90 + "W" * 90
+    out = alerts.sanitize_journal_tail("x" * 250 + secret, secret_values={secret})
+    assert all(secret[i : i + 8] not in out for i in range(len(secret) - 7))
+    assert len(out) <= alerts.ALERT_LINE_MAX_CHARS + 1
+
+
+def test_sanitize_journal_tail_masks_pattern_without_configured_secrets() -> None:
+    from src.tools import alerts
+
+    raw = (
+        "requests.exceptions.HTTPError: 401 for url: "
+        "https://opendart.fss.or.kr/api/list.json?crtfc_key=ABCDEF0123456789&page_no=1"
+    )
+    out = alerts.sanitize_journal_tail(raw)
+    assert "ABCDEF0123456789" not in out
+    assert "page_no=1" in out
+
+
+def test_dispatch_failure_alert_masks_all_channels(monkeypatch) -> None:
+    from src.tools import alerts
+
+    _fast_retry(monkeypatch)
+    monkeypatch.setattr(alerts.settings, "KIS_APP_SECRET", "kis-secret-0123456789", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", "https://hooks.example.com/x", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "bot@example.com", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "pw", raising=False)
+    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "ops@example.com", raising=False)
+    captured: dict[str, str] = {}
+
+    def _webhook(url, *, unit, detail="", subject=None):
+        captured["webhook"] = f"{subject}\n{detail}"
+        return True
+
+    def _email(**kw):
+        captured["email"] = f"{kw.get('subject')}\n{kw['detail']}"
+        return True
+
+    monkeypatch.setattr(alerts, "post_webhook_alert", _webhook)
+    monkeypatch.setattr(alerts, "send_email_alert", _email)
+
+    results = alerts.dispatch_failure_alert(
+        "kca-collect.service", detail="boom kis-secret-0123456789 appkey=RAWKEY12345"
+    )
+
+    assert results == {"webhook": True, "email": True}
+    for text in captured.values():
+        assert "kis-secret-0123456789" not in text
+        assert "RAWKEY12345" not in text
+
+
+def test_dispatch_failure_alert_persists_undelivered_masked(monkeypatch, caplog) -> None:
+    import json
+    import logging
+
+    from src.tools import alerts
+
+    _empty_alert_creds(monkeypatch)
+    _fast_retry(monkeypatch)
+    monkeypatch.setenv("KIS_DATA_1_APP_SECRET", "pool-secret-value-001")
+
+    with caplog.at_level(logging.ERROR, logger=alerts.logger.name):
+        alerts.dispatch_failure_alert(
+            "kca-collect.service", subject="fail pool-secret-value-001", detail="detail pool-secret-value-001"
+        )
+
+    files = sorted(alerts.alert_outbox_dir().glob("*.json"))
+    assert len(files) == 1
+    stored = files[0].read_text(encoding="utf-8")
+    assert "pool-secret-value-001" not in stored
+    assert json.loads(stored)["kind"] == "failure"
+    undelivered = [rec.getMessage() for rec in caplog.records if "status=UNDELIVERED" in rec.getMessage()]
+    assert undelivered
+    assert all("pool-secret-value-001" not in msg for msg in undelivered)
+
+
+def test_dispatch_digest_masks_before_outbox(monkeypatch) -> None:
+    from src.tools import alerts
+
+    _empty_alert_creds(monkeypatch)
+    _fast_retry(monkeypatch)
+
+    alerts.dispatch_digest("[KCA] digest", "context Authorization: Bearer tok.abc.def")
+
+    files = sorted(alerts.alert_outbox_dir().glob("*.json"))
+    assert len(files) == 1
+    stored = files[0].read_text(encoding="utf-8")
+    assert "Bearer ***" in stored
+    assert "tok.abc.def" not in stored
+
+
+def test_drain_alert_outbox_masks_legacy_entries(monkeypatch, tmp_path) -> None:
+    import json
+
+    from src.tools import alerts
+
+    monkeypatch.setattr(alerts.settings, "KIS_APP_SECRET", "legacy-secret-0123456789", raising=False)
+    box = tmp_path / "outbox"
+    box.mkdir()
+    legacy = box / "20260901T000000000000_deadbeef.json"
+    legacy.write_text(
+        json.dumps({"subject": "s legacy-secret-0123456789", "body": "b legacy-secret-0123456789", "kind": "digest"}),
+        encoding="utf-8",
+    )
+    received: list[tuple[str, str]] = []
+
+    def _send(subject: str, body: str) -> dict[str, bool]:
+        received.append((subject, body))
+        return {"webhook": True, "email": False}
+
+    delivered, remaining = alerts.drain_alert_outbox(outbox=box, send_fn=_send)
+
+    assert (delivered, remaining) == (1, 0)
+    assert received
+    assert all("legacy-secret-0123456789" not in part for pair in received for part in pair)
+    assert not legacy.exists()
+
+
+def test_alert_secret_values_read_credential_env_file_under_base_dir(monkeypatch, tmp_path) -> None:
+    from src.tools import alerts
+
+    monkeypatch.setattr(alerts.settings, "BASE_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(alerts, "alert_credential_env_file", _real_alert_credential_env_file)
+    (tmp_path / ".env").write_text("KIS_DATA_3_APP_SECRET=file-pool-secret-0003\nKIS_DATA_SLOTS=3\n", encoding="utf-8")
+
+    assert alerts.alert_credential_env_file() == tmp_path / ".env"
+    assert "file-pool-secret-0003" in alerts._alert_secret_values()
+    assert "file-pool-secret-0003" not in alerts.redact_for_egress("boom file-pool-secret-0003")

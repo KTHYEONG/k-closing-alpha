@@ -375,15 +375,14 @@ def test_ls_tick_chart_reports_cursor_unknown_and_vendor_failure() -> None:
 
 def test_ls_client_ensure_token() -> None:
     import asyncio
-    from unittest.mock import AsyncMock, patch
+
     from src.api.ls.client import LsApiClient
+    from tests.broker_fakes import scripted_session
+
     client = LsApiClient(app_key="k", app_secret="s")
-    mock_resp = AsyncMock()
-    mock_resp.status = 200
-    mock_resp.json = AsyncMock(return_value={"access_token": "mock_tok", "token_type": "Bearer"})
-    session = AsyncMock()
-    session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
-    session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+    session = scripted_session(
+        [], token_bodies=[{"access_token": "mock_tok", "token_type": "Bearer"}]
+    )
     token = asyncio.run(client.ensure_token(session))
     assert token == "mock_tok"
     assert client.token == "mock_tok"
@@ -391,17 +390,16 @@ def test_ls_client_ensure_token() -> None:
 
 def test_ls_client_get_minute_chart_single_call() -> None:
     import asyncio
-    from unittest.mock import AsyncMock
+
     from src.api.ls.client import LsApiClient
+    from tests.broker_fakes import FakeBrokerResponse, scripted_session
+
     client = LsApiClient(app_key="k", app_secret="s")
     client.token = "mock_tok"
     mock_bars = [{"time": "090100", "close": 1000, "jdiff_vol": 50}, {"time": "153000", "close": 1050, "jdiff_vol": 200}]
-    mock_resp = AsyncMock()
-    mock_resp.status = 200
-    mock_resp.json = AsyncMock(return_value={"rsp_cd": "00000", "t8412OutBlock1": mock_bars})
-    session = AsyncMock()
-    session.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
-    session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+    session = scripted_session(
+        [FakeBrokerResponse(body={"rsp_cd": "00000", "t8412OutBlock1": mock_bars})]
+    )
     res = asyncio.run(client.get_minute_chart(session, "005930", "2026-09-04"))
     assert res["rt_cd"] == "0"
     assert res["vendor"] == "ls"
@@ -411,21 +409,15 @@ def test_ls_client_get_minute_chart_single_call() -> None:
 
 def test_ls_client_get_tick_chart_paginates_with_cts() -> None:
     import asyncio
-    from unittest.mock import AsyncMock
+
     from src.api.ls.client import LsApiClient
+    from tests.broker_fakes import FakeBrokerResponse, scripted_session
+
     client = LsApiClient(app_key="k", app_secret="s")
     client.token = "mock_tok"
     page1 = {"rsp_cd": "00000", "t8411OutBlock": {"cts_date": "20260904", "cts_time": "151500000"}, "t8411OutBlock1": [{"time": "153000", "close": 1000, "jdiff_vol": 100}]}
     page2 = {"rsp_cd": "00000", "t8411OutBlock": {"cts_date": "", "cts_time": ""}, "t8411OutBlock1": [{"time": "090000", "close": 950, "jdiff_vol": 50}]}
-    mock_resp1 = AsyncMock()
-    mock_resp1.status = 200
-    mock_resp1.json = AsyncMock(return_value=page1)
-    mock_resp2 = AsyncMock()
-    mock_resp2.status = 200
-    mock_resp2.json = AsyncMock(return_value=page2)
-    session = AsyncMock()
-    session.post.return_value.__aenter__ = AsyncMock(side_effect=[mock_resp1, mock_resp2])
-    session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+    session = scripted_session([FakeBrokerResponse(body=page1), FakeBrokerResponse(body=page2)])
     res = asyncio.run(client.get_tick_chart(session, "005930", "2026-09-04", max_pages=5))
     assert res["rt_cd"] == "0"
     assert res["vendor"] == "ls"
@@ -684,16 +676,21 @@ def test_ls_exhausted_retries_logged_distinctly(caplog) -> None:
         def post(self, *a, **k):
             return _Resp()
 
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
     async def _run():
         import unittest.mock as mock
 
-        with mock.patch("asyncio.sleep", return_value=asyncio.sleep(0)):
+        with mock.patch("asyncio.sleep", _no_sleep):
             return await client._post_tr(_Session(), "t8412", "005930", {})
 
-    with caplog.at_level(logging.WARNING, logger="src.api.ls.client"):
+    with caplog.at_level(logging.WARNING, logger="src.api._transport"):
         data, _ = asyncio.run(_run())
     assert data["rsp_cd"] == "IGW00201"
-    assert any("RATE_LIMITED" in r.getMessage() and "attempts=5" in r.getMessage() for r in caplog.records)
+    exhausted = [r.getMessage() for r in caplog.records if "status=RATE_LIMITED" in r.getMessage()]
+    assert exhausted == [exhausted[0]]
+    assert exhausted[0].startswith("[EXEC] stage=ls_tr status=RATE_LIMITED attempts=5")
 
 
 def test_ls_client_honors_pacing_overrides_from_settings_instance(monkeypatch) -> None:
@@ -726,41 +723,21 @@ def test_ls_client_explicit_credentials_win_over_instance(monkeypatch) -> None:
 
 def test_ls_client_requests_use_configured_origin(monkeypatch) -> None:
     import asyncio
-    from unittest.mock import AsyncMock
 
     from src.api.ls.client import LsApiClient
     from src.config import settings as settings_instance
+    from tests.broker_fakes import FakeBrokerResponse, scripted_session
 
     monkeypatch.setattr(settings_instance, "LS_BASE_URL", "https://ls.example:1")
     client = LsApiClient(app_key="k", app_secret="s")
-    posted: list[str] = []
-
-    def _resp(payload: dict) -> AsyncMock:
-        mock_resp = AsyncMock()
-        mock_resp.json = AsyncMock(return_value=payload)
-        return mock_resp
-
-    token_resp = _resp({"access_token": "t"})
-    chart_resp = _resp({"rsp_cd": "00000", "t8412OutBlock1": []})
-    session = AsyncMock()
-
-    async def _post(url: str, *args: Any, **kwargs: Any) -> Any:
-        posted.append(url)
-        body = token_resp if url.endswith("/oauth2/token") else chart_resp
-
-        class _Ctx:
-            async def __aenter__(self) -> AsyncMock:
-                return body
-
-            async def __aexit__(self, *exc: Any) -> bool:
-                return False
-
-        return _Ctx()
-
-    session.post.side_effect = _post
+    session = scripted_session(
+        [FakeBrokerResponse(body={"rsp_cd": "00000", "t8412OutBlock1": []})],
+        token_bodies=[{"access_token": "t"}],
+    )
     res = asyncio.run(client.get_minute_chart(session, "005930", "2026-09-04"))
 
     assert res["rt_cd"] == "0"
+    posted = [request.url for request in session.requests]
     assert posted[0] == "https://ls.example:1/oauth2/token"
     assert posted[1] == "https://ls.example:1/stock/chart"
 
@@ -873,3 +850,451 @@ def test_ls_shared_token_single_issuance(tmp_path, monkeypatch) -> None:
 
     asyncio.run(_run())
     assert calls["oauth"] == 1
+
+
+def _ls_auth_session(tr_responses: list, state: dict) -> Any:
+    """Plain fake session: scripted /stock/chart replies, token endpoint issuing tok-1, tok-2, ..."""
+
+    class _Resp:
+        def __init__(self, body: Any, status: int, headers: Any) -> None:
+            self._body = body
+            self.status = status
+            self.headers = headers
+
+        async def json(self) -> Any:
+            return self._body
+
+        async def __aenter__(self) -> _Resp:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _Session:
+        def post(self, url: str, **kw: Any) -> _Resp:
+            if url.endswith("/oauth2/token"):
+                state["token_calls"] += 1
+                return _Resp({"access_token": f"tok-{state['token_calls']}", "expires_in": 86400}, 200, {})
+            headers = dict(kw.get("headers") or {})
+            state["tr_calls"].append({
+                "auth": headers.get("authorization"), "cont": headers.get("tr_cont"),
+                "key": headers.get("tr_cont_key"), "body": dict(kw.get("json") or {}),
+            })
+            body, status = tr_responses.pop(0)
+            return _Resp(body, status, {})
+
+    return _Session()
+
+
+def _ls_seeded_client(tmp_path: Any, monkeypatch: Any) -> Any:
+    import asyncio
+
+    from src.api.ls.client import LsApiClient
+    from src.config import settings as settings_instance
+
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_DIR", tmp_path)
+    (tmp_path / ".host-admission").touch()
+    monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_REQUIRE_SHARED", "always")
+
+    client = LsApiClient(app_key="k", app_secret="s")
+    client._min_interval = 0.0
+    return client
+
+
+def test_ls_http_401_refreshes_once_and_replays(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    state: dict[str, Any] = {"token_calls": 0, "tr_calls": []}
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    session = _ls_auth_session([({"rsp_cd": "40100"}, 401), ({"rsp_cd": "00000"}, 200)], state)
+    asyncio.run(client.ensure_token(session))
+    assert state["token_calls"] == 1
+
+    data, _ = asyncio.run(client._post_tr(session, "t8412", "005930", {"t8412InBlock": {"shcode": "005930"}}))
+
+    assert data == {"rsp_cd": "00000"}
+    assert state["token_calls"] == 2
+    assert client._token_store().read() is not None
+    assert client._token_store().read().generation == 2  # type: ignore[union-attr]
+    assert [c["auth"] for c in state["tr_calls"]] == ["Bearer tok-1", "Bearer tok-2"]
+    assert client.token == "tok-2"
+
+
+def test_ls_igw001xx_body_codes_refresh_once(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from pathlib import Path
+
+    for code in ("IGW00101", "IGW00102", "IGW00123"):
+        admission_dir = Path(str(tmp_path)) / code
+        admission_dir.mkdir()
+        state: dict[str, Any] = {"token_calls": 0, "tr_calls": []}
+        client = _ls_seeded_client(admission_dir, monkeypatch)
+        session = _ls_auth_session([({"rsp_cd": code}, 200), ({"rsp_cd": "00000"}, 200)], state)
+        asyncio.run(client.ensure_token(session))
+
+        data, _ = asyncio.run(client._post_tr(session, "t8412", "005930", {"t8412InBlock": {"shcode": "005930"}}))
+
+        assert data == {"rsp_cd": "00000"}, code
+        assert state["token_calls"] == 2, code
+        assert [c["auth"] for c in state["tr_calls"]] == ["Bearer tok-1", "Bearer tok-2"], code
+
+
+def test_ls_replay_preserves_request(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    state: dict[str, Any] = {"token_calls": 0, "tr_calls": []}
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    session = _ls_auth_session([({"rsp_cd": "40100"}, 401), ({"rsp_cd": "00000"}, 200)], state)
+    asyncio.run(client.ensure_token(session))
+
+    body = {"t8412InBlock": {"shcode": "005930", "ncnt": 1}}
+    asyncio.run(client._post_tr(session, "t8412", "005930", body, tr_cont="Y", tr_cont_key="k9"))
+
+    assert len(state["tr_calls"]) == 2
+    first, second = state["tr_calls"]
+    assert first["body"] == second["body"] == {**body, "tr_cd": "t8412"}
+    assert (first["cont"], first["key"]) == (second["cont"], second["key"]) == ("Y", "k9")
+
+
+def test_ls_second_auth_rejection_surfaces(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    state: dict[str, Any] = {"token_calls": 0, "tr_calls": []}
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    session = _ls_auth_session(
+        [({"rsp_cd": "40100"}, 401), ({"rsp_cd": "IGW00121"}, 401), ({"rsp_cd": "00000"}, 200)], state
+    )
+    asyncio.run(client.ensure_token(session))
+
+    data, _ = asyncio.run(client._post_tr(session, "t8412", "005930", {}))
+
+    assert data == {"rsp_cd": "IGW00121"}
+    assert len(state["tr_calls"]) == 2
+    assert state["token_calls"] == 2
+
+
+def test_ls_peer_rotation_is_adopted(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from datetime import UTC, datetime
+
+    from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
+
+    state: dict[str, Any] = {"token_calls": 0, "tr_calls": []}
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+
+    async def _seed_store() -> None:
+        store = SharedTokenStore(
+            shared_token_path("ls", "k"),
+            lock_timeout_seconds=5.0,
+            expiry_margin_seconds=0.0,
+            clock=lambda: datetime.now(UTC),
+        )
+        await store.get_or_issue(lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-A", expires_in_seconds=86400)))
+        await store.replace_rejected("tok-A", lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-B", expires_in_seconds=86400)))
+
+    session = _ls_auth_session([({"rsp_cd": "40100"}, 401), ({"rsp_cd": "00000"}, 200)], state)
+    asyncio.run(_seed_store())
+    client.token = "tok-A"
+
+    data, _ = asyncio.run(client._post_tr(session, "t8412", "005930", {}))
+
+    assert data == {"rsp_cd": "00000"}
+    assert state["token_calls"] == 0
+    assert [c["auth"] for c in state["tr_calls"]] == ["Bearer tok-A", "Bearer tok-B"]
+
+
+def test_ls_refresh_does_not_consume_rate_limit_attempts(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    state: dict[str, Any] = {"token_calls": 0, "tr_calls": []}
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    session = _ls_auth_session(
+        [({"rsp_cd": "IGW00201"}, 200), ({"rsp_cd": "40100"}, 401), ({"rsp_cd": "00000"}, 200)], state
+    )
+    asyncio.run(client.ensure_token(session))
+
+    sleeps: list[float] = []
+
+    async def _record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _record_sleep)
+
+    data, _ = asyncio.run(client._post_tr(session, "t8412", "005930", {}, max_retries=2))
+
+    assert data == {"rsp_cd": "00000"}
+    assert len(state["tr_calls"]) == 3
+    assert state["token_calls"] == 2
+    assert sleeps == [1.2]
+
+
+def test_ls_non_auth_vendor_errors_are_not_refreshed(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from pathlib import Path
+
+    for idx, (body, status) in enumerate((({"rsp_cd": "IGW00215"}, 200), ({"rsp_cd": "99999"}, 500))):
+        admission_dir = Path(str(tmp_path)) / f"case{idx}"
+        admission_dir.mkdir()
+        state: dict[str, Any] = {"token_calls": 0, "tr_calls": []}
+        client = _ls_seeded_client(admission_dir, monkeypatch)
+        session = _ls_auth_session([(body, status)], state)
+        asyncio.run(client.ensure_token(session))
+
+        data, _ = asyncio.run(client._post_tr(session, "t8412", "005930", {}))
+
+        assert data == body
+        assert len(state["tr_calls"]) == 1
+        assert state["token_calls"] == 1
+
+
+def test_ls_post_tr_converts_mapping_headers(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from typing import Any
+
+    from multidict import CIMultiDict, CIMultiDictProxy
+
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.status = 200
+            self.headers = CIMultiDictProxy(CIMultiDict({"tr_cont": "Y", "tr_cont_key": "k1"}))
+
+        async def json(self) -> dict:
+            return {"rsp_cd": "00000"}
+
+        async def __aenter__(self) -> _Resp:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+    class _TokenResp(_Resp):
+        def __init__(self) -> None:
+            self.status = 200
+            self.headers = {}
+
+        async def json(self) -> dict:
+            return {"access_token": "tok-1", "expires_in": 86400}
+
+    class _Session:
+        def post(self, url: str, **kw: Any) -> Any:
+            if url.endswith("/oauth2/token"):
+                return _TokenResp()
+            return _Resp()
+
+    data, headers = asyncio.run(client._post_tr(_Session(), "t8412", "005930", {}))  # type: ignore[arg-type]
+
+    assert type(headers) is dict
+    assert headers.get("tr_cont") == "Y"
+    assert headers.get("tr_cont_key") == "k1"
+    assert data == {"rsp_cd": "00000"}
+
+
+_LS_RL_BODY = {"rsp_cd": "IGW00201"}
+_LS_OK_BODY = {"rsp_cd": "00000"}
+
+
+def _ls_tr_session(tr_replies, token_bodies=None):  # type: ignore[no-untyped-def]
+    from tests.broker_fakes import scripted_session
+
+    bodies = (
+        list(token_bodies)
+        if token_bodies is not None
+        else [{"access_token": "tok-1", "expires_in": 86400}, {"access_token": "tok-2", "expires_in": 86400}]
+    )
+    return scripted_session(list(tr_replies), token_bodies=bodies)
+
+
+def _ls_record_sleep(monkeypatch):  # type: ignore[no-untyped-def]
+    import asyncio
+
+    sleeps: list[float] = []
+
+    async def _record(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _record)
+    return sleeps
+
+
+def _ls_count_acquires(monkeypatch):  # type: ignore[no-untyped-def]
+    import src.api.ls.client as ls_client_mod
+
+    calls = {"n": 0}
+
+    async def _count(self) -> None:
+        calls["n"] += 1
+
+    monkeypatch.setattr(ls_client_mod.HostPacedRateLimiter, "acquire", _count)
+    return calls
+
+
+def _ls_tr_auths(session):  # type: ignore[no-untyped-def]
+    return [
+        request.headers.get("authorization", "")
+        for request in session.requests
+        if not request.url.endswith("/oauth2/token")
+    ]
+
+
+def test_ls_tr_http_429_is_not_retried(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from tests.broker_fakes import FakeBrokerResponse
+
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    session = _ls_tr_session([FakeBrokerResponse(body={"rsp_cd": "99999"}, status=429)])
+    sleeps = _ls_record_sleep(monkeypatch)
+    asyncio.run(client.ensure_token(session))
+
+    data, _ = asyncio.run(client._post_tr(session, "t8412", "005930", {}))
+
+    assert data == {"rsp_cd": "99999"}
+    assert len(session.requests_to("/stock/chart")) == 1
+    assert sleeps == []
+
+
+def test_ls_tr_backoff_exponent_uses_attempt_index_across_refresh(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from tests.broker_fakes import FakeBrokerResponse
+
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    session = _ls_tr_session(
+        [
+            FakeBrokerResponse(body=dict(_LS_RL_BODY)),
+            FakeBrokerResponse(body=dict(_LS_RL_BODY)),
+            FakeBrokerResponse(body={"rsp_cd": "40100"}, status=401),
+            FakeBrokerResponse(body=dict(_LS_RL_BODY)),
+            FakeBrokerResponse(body=dict(_LS_OK_BODY)),
+        ]
+    )
+    sleeps = _ls_record_sleep(monkeypatch)
+    asyncio.run(client.ensure_token(session))
+
+    data, _ = asyncio.run(client._post_tr(session, "t8412", "005930", {}))
+
+    assert data == _LS_OK_BODY
+    assert len(session.requests_to("/stock/chart")) == 5
+    assert sleeps == [1.2, 2.4, 4.8]
+    assert len(session.requests_to("/oauth2/token")) == 2
+
+
+def test_ls_tr_refresh_replay_rate_limit(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from tests.broker_fakes import FakeBrokerResponse
+
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    session = _ls_tr_session(
+        [
+            FakeBrokerResponse(body={"rsp_cd": "40100"}, status=401),
+            FakeBrokerResponse(body=dict(_LS_RL_BODY)),
+            FakeBrokerResponse(body=dict(_LS_OK_BODY)),
+        ]
+    )
+    sleeps = _ls_record_sleep(monkeypatch)
+    asyncio.run(client.ensure_token(session))
+
+    data, _ = asyncio.run(client._post_tr(session, "t8412", "005930", {}))
+
+    assert data == _LS_OK_BODY
+    assert len(session.requests_to("/stock/chart")) == 3
+    assert sleeps == [1.2]
+
+
+def test_ls_tr_acquires_before_every_send(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from tests.broker_fakes import FakeBrokerResponse
+
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    session = _ls_tr_session(
+        [
+            FakeBrokerResponse(body=dict(_LS_RL_BODY)),
+            FakeBrokerResponse(body={"rsp_cd": "40100"}, status=401),
+            FakeBrokerResponse(body=dict(_LS_OK_BODY)),
+        ]
+    )
+    acquires = _ls_count_acquires(monkeypatch)
+    _ls_record_sleep(monkeypatch)
+    asyncio.run(client.ensure_token(session))
+
+    asyncio.run(client._post_tr(session, "t8412", "005930", {}))
+
+    assert acquires["n"] == len(session.requests_to("/stock/chart")) == 3
+
+
+def test_ls_tr_concurrent_rejections_issue_once(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from tests.broker_fakes import FakeBrokerResponse
+
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    _ls_count_acquires(monkeypatch)
+    session = _ls_tr_session(
+        [
+            FakeBrokerResponse(body={"rsp_cd": "40100"}, status=401, enter_delay=0.01),
+            FakeBrokerResponse(body={"rsp_cd": "40100"}, status=401, enter_delay=0.01),
+            FakeBrokerResponse(body=dict(_LS_OK_BODY)),
+            FakeBrokerResponse(body=dict(_LS_OK_BODY)),
+        ],
+        token_bodies=[
+            {"access_token": "tok-1", "expires_in": 86400},
+            {"access_token": "tok-2", "expires_in": 86400},
+            {"access_token": "tok-3", "expires_in": 86400},
+        ],
+    )
+    asyncio.run(client.ensure_token(session))
+    assert client._token_store().read().generation == 1  # type: ignore[union-attr]
+
+    async def _main():  # type: ignore[no-untyped-def]
+        return await asyncio.gather(
+            client._post_tr(session, "t8412", "005930", {}),
+            client._post_tr(session, "t8412", "005930", {}),
+        )
+
+    (data_a, _), (data_b, _) = asyncio.run(_main())
+
+    assert data_a == _LS_OK_BODY
+    assert data_b == _LS_OK_BODY
+    assert len(session.requests_to("/oauth2/token")) == 2
+    assert client._token_store().read().generation == 2  # type: ignore[union-attr]
+    assert sorted(_ls_tr_auths(session)) == ["Bearer tok-1", "Bearer tok-1", "Bearer tok-2", "Bearer tok-2"]
+
+
+def test_ls_tr_transport_error_propagates(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import aiohttp
+
+    from tests.broker_fakes import FakeBrokerResponse
+
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    session = _ls_tr_session([FakeBrokerResponse(enter_error=aiohttp.ServerDisconnectedError("boom"))])
+    sleeps = _ls_record_sleep(monkeypatch)
+
+    with pytest.raises(aiohttp.ServerDisconnectedError):
+        asyncio.run(client._post_tr(session, "t8412", "005930", {}))
+
+    assert len(session.requests_to("/stock/chart")) == 1
+    assert sleeps == []
+
+
+def test_ls_tr_retry_settings_honored(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from src.config import settings as settings_instance
+    from tests.broker_fakes import FakeBrokerResponse
+
+    monkeypatch.setattr(settings_instance, "LS_RATE_LIMIT_MAX_RETRIES", 2)
+    monkeypatch.setattr(settings_instance, "LS_RATE_LIMIT_BACKOFF_SECONDS", 0.5)
+    client = _ls_seeded_client(tmp_path, monkeypatch)
+    session = _ls_tr_session([FakeBrokerResponse(body=dict(_LS_RL_BODY))] * 3)
+    sleeps = _ls_record_sleep(monkeypatch)
+
+    asyncio.run(client._post_tr(session, "t8412", "005930", {}))
+
+    assert len(session.requests_to("/stock/chart")) == 2
+    assert sleeps == [0.5]

@@ -5,6 +5,7 @@ import datetime as _dt
 import pytest
 
 from src.daily.archive_intraday import _resolve_previous_trading_day as _real_resolve_previous_trading_day
+from src.execution.paper_broker import HeldRoster
 
 
 @pytest.fixture(autouse=True)
@@ -620,7 +621,7 @@ def test_run_archive_non_trading_day_without_cohort_skips_cleanly(monkeypatch, t
         assert result == (0, 0, 0)
 
 
-def test_run_archive_full_complete_and_partial_fragments(monkeypatch, tmp_path) -> None:
+def test_run_archive_full_complete_and_partial_entries(monkeypatch, tmp_path) -> None:
     import pandas as pd
 
     from src.daily import archive_intraday
@@ -672,7 +673,7 @@ def test_run_archive_full_complete_and_partial_fragments(monkeypatch, tmp_path) 
                 frame = _canon_bar_frame(snap_date, code)
                 on_symbol(code, frame, _entry(code, CaptureDataset.MINUTE_BARS, "regular", CaptureStatus.COMPLETE, rows=len(frame), refs=[shared]))
             else:
-                on_symbol(code, _canon_bar_frame(snap_date, code),
+                on_symbol(code, _empty_bar_frame_for(snap_date),
                           _entry(code, CaptureDataset.MINUTE_BARS, "regular", CaptureStatus.PARTIAL, refs=[shared]))
         return pd.DataFrame()
 
@@ -693,7 +694,7 @@ def test_run_archive_full_complete_and_partial_fragments(monkeypatch, tmp_path) 
                 frame = _tick_frame(code)
                 on_symbol(code, frame, _entry(code, CaptureDataset.TRADE_TICKS, "regular", CaptureStatus.COMPLETE, rows=len(frame), refs=[shared]))
             else:
-                on_symbol(code, _tick_frame(code),
+                on_symbol(code, pd.DataFrame(),
                           _entry(code, CaptureDataset.TRADE_TICKS, "regular", CaptureStatus.PARTIAL, refs=[shared]))
         return pd.DataFrame()
 
@@ -727,12 +728,18 @@ def test_run_archive_full_complete_and_partial_fragments(monkeypatch, tmp_path) 
 
     assert result == (1, 4, 1)
     manifests = store.read_manifests("2026-09-07")
-    def _by_prefix(prefix: str):
-        return next(item for item in manifests if item.context.run_id.startswith(prefix))
 
-    assert _by_prefix("archive-2026-09-07-regular-bars-").status.value == "PARTIAL"
-    assert _by_prefix("archive-2026-09-07-regular-ticks-").status.value == "PARTIAL"
-    assert _by_prefix("archive-2026-09-07-nxt-aftermarket-").status.value == "COMPLETE"
+    def _by_stream(dataset, session: str):
+        return next(
+            item for item in manifests
+            if item.context.endpoint == "archive-task"
+            and item.context.dataset is dataset
+            and item.context.session == session
+        )
+
+    assert _by_stream(CaptureDataset.MINUTE_BARS, "regular").status.value == "PARTIAL"
+    assert _by_stream(CaptureDataset.TRADE_TICKS, "regular").status.value == "PARTIAL"
+    assert _by_stream(CaptureDataset.MINUTE_BARS, "nxt_aftermarket").status.value == "COMPLETE"
     stored_ticks = pd.read_parquet(intraday_store.tick_partition_path("2026-09-07", "regular"))
     assert len(stored_ticks) == 1
 
@@ -1856,7 +1863,7 @@ def test_archive_skips_holiday_for_previous_cohort(monkeypatch, tmp_path) -> Non
     assert result == (0, 0, 0)
     assert sorted(seen["codes"][0]) == ["005930", "009900"]
     codes, incomplete = archive_intraday._resolve_cohort_codes(
-        "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day="2026-09-23"
+        "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day="2026-09-23", held=HeldRoster((), True, None)
     )
     assert sorted(codes) == ["005930", "009900"]
     assert incomplete is False
@@ -1870,7 +1877,7 @@ def test_unresolved_previous_day_degrades_never_aborts(monkeypatch, tmp_path, ca
     async def _boom(client, session, snapshot_date):
         raise RuntimeError("oracle down")
 
-    monkeypatch.setattr("src.daily.collect.resolve_prev_trading_day_kis", _boom)
+    monkeypatch.setattr("src.daily.archive_intraday.resolve_prev_trading_day_kis", _boom)
 
     with caplog.at_level(logging.WARNING):
         resolved = __import__("asyncio").run(
@@ -1884,7 +1891,7 @@ def test_unresolved_previous_day_degrades_never_aborts(monkeypatch, tmp_path, ca
     _seed_panel(tmp_path, {"2026-09-25": ["005930"]})
 
     codes, incomplete = archive_intraday._resolve_cohort_codes(
-        "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day=None
+        "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day=None, held=HeldRoster((), True, None)
     )
     assert codes == ["005930"]
     assert incomplete is True
@@ -1901,7 +1908,7 @@ def test_resolved_but_missing_previous_cohort_keeps_signal(monkeypatch, tmp_path
 
     with caplog.at_level(logging.WARNING):
         codes, incomplete = archive_intraday._resolve_cohort_codes(
-            "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day="2026-09-23"
+            "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day="2026-09-23", held=HeldRoster((), True, None)
         )
     assert codes == ["005930"]
     assert incomplete is True
@@ -1916,7 +1923,7 @@ def test_resolve_previous_trading_day_returns_oracle_date(monkeypatch) -> None:
     async def _oracle(client, session, decision_date, **kwargs):
         return pd.Timestamp("2026-09-23")
 
-    monkeypatch.setattr("src.daily.collect.resolve_prev_trading_day_kis", _oracle)
+    monkeypatch.setattr("src.daily.archive_intraday.resolve_prev_trading_day_kis", _oracle)
 
     assert asyncio.run(_real_resolve_previous_trading_day(object(), object(), "2026-09-28")) == "2026-09-23"
 
@@ -1927,10 +1934,9 @@ def test_unresolved_previous_day_still_follows_paper_positions(monkeypatch, tmp_
     store = _archive_store(tmp_path)
     _publish_cohort(store, "2026-09-28", ["005930"])
     _seed_panel(tmp_path, {"2026-09-25": ["005930"]})
-    monkeypatch.setattr(archive_intraday, "_paper_follow_symbols", lambda: ["009900"])
 
     codes, incomplete = archive_intraday._resolve_cohort_codes(
-        "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day=None
+        "2026-09-28", _raw_profile(tmp_path), store, previous_trading_day=None, held=HeldRoster(("009900",), True, None)
     )
 
     assert sorted(codes) == ["005930", "009900"]
@@ -2082,13 +2088,12 @@ def test_phase_completeness_requires_tick_manifests_from_start_date(tmp_path) ->
             assert archive_intraday.archive_phase_complete(store, target_date, "aftermarket") is True
 
 
-def test_aftermarket_phase_stages_uncertified_tick_frames_without_publishing(monkeypatch, tmp_path) -> None:
+def test_run_archive_aftermarket_uncertified_ticks_recorded_not_written(monkeypatch, tmp_path) -> None:
     import pandas as pd
 
     from src.daily import archive_intraday
     from src.data import intraday_store
     from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry
-    from src.data.intraday_schema import normalize_tick_frame
 
     monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
     store = _archive_store(tmp_path)
@@ -2107,8 +2112,7 @@ def test_aftermarket_phase_stages_uncertified_tick_frames_without_publishing(mon
     async def _partial_after_ticks(client, session, codes, snap_date, **kwargs):
         session_tag = "krx_aftermarket" if kwargs.get("venue") == "KRX" else "nxt_aftermarket"
         for code in codes:
-            frame = normalize_tick_frame(pd.DataFrame({"time": ["170000"], "close": [71000], "jdiff_vol": [3]}), "ls", "2026-09-07", code)
-            kwargs["on_symbol"](code, frame, CoverageEntry(
+            kwargs["on_symbol"](code, pd.DataFrame(), CoverageEntry(
                 symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue="UNKNOWN", session=session_tag,
                 scheduled_at=None, status=CaptureStatus.PARTIAL, rows=0, first_event_time=None,
                 last_event_time=None, reason="unrepaired", raw_refs=(),
@@ -2135,13 +2139,1254 @@ def test_aftermarket_phase_stages_uncertified_tick_frames_without_publishing(mon
 
     archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="aftermarket")
 
-    # 비인증 틱은 권위 파티션에 쓰지 않고 스테이징 조각으로만 보존한다
     assert not intraday_store.tick_partition_path("2026-09-07", "krx_aftermarket").exists()
     assert not intraday_store.tick_partition_path("2026-09-07", "nxt_aftermarket").exists()
-    assert ("005930", "krx_aftermarket") in staged
-    assert ("005930", "nxt_aftermarket") in staged
+    assert staged == []
     tick_manifests = [
         item for item in store.read_manifests("2026-09-07")
         if item.context.dataset is CaptureDataset.TRADE_TICKS and item.context.endpoint == "archive-task"
     ]
+    assert len(tick_manifests) == 2
     assert {item.status for item in tick_manifests} == {CaptureStatus.PARTIAL}
+    for item in tick_manifests:
+        assert {entry.symbol for entry in item.entries} == {"005930"}
+        assert all(entry.status == CaptureStatus.PARTIAL for entry in item.entries)
+
+
+def test_cohort_codes_include_held_symbols(tmp_path) -> None:
+    """Held symbols are appended after cohort codes without forcing incompleteness."""
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-28", ["005930"])
+    _publish_cohort(store, "2026-09-23", ["005930"])
+    _seed_panel(tmp_path, {"2026-09-25": ["005930"], "2026-09-22": ["005930"]})
+
+    codes, incomplete = archive_intraday._resolve_cohort_codes(
+        "2026-09-28", _raw_profile(tmp_path), store,
+        previous_trading_day="2026-09-23", held=HeldRoster(("099999",), True, None),
+    )
+    assert codes == ["005930", "099999"]
+    assert incomplete is False
+
+
+def test_cohort_codes_not_ok_roster_is_incomplete(tmp_path, caplog) -> None:
+    """A not-ok roster makes the cohort incomplete with a held_roster_unavailable warning."""
+    import logging
+
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-28", ["005930"])
+    _publish_cohort(store, "2026-09-23", ["005930"])
+    _seed_panel(tmp_path, {"2026-09-25": ["005930"], "2026-09-22": ["005930"]})
+
+    with caplog.at_level(logging.WARNING, logger=archive_intraday.logger.name):
+        codes, incomplete = archive_intraday._resolve_cohort_codes(
+            "2026-09-28", _raw_profile(tmp_path), store,
+            previous_trading_day="2026-09-23", held=HeldRoster((), False, "OSError"),
+        )
+    assert codes == ["005930"]
+    assert incomplete is True
+    assert any("reason=held_roster_unavailable error=OSError" in rec.message for rec in caplog.records)
+
+
+def _healthy_empty_ledger(monkeypatch) -> None:
+    import pandas as pd
+
+    class _Ledger:
+        def load_open_positions(self):
+            return pd.DataFrame()
+
+    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", lambda *a, **k: _Ledger())
+
+
+def _complete_run_setup(monkeypatch, tmp_path):
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+    entries_map = {
+        "005930": (_empty_bar_frame_for("2026-09-07"), _fake_entry("005930", CaptureDataset.MINUTE_BARS, "regular", "COMPLETE")),
+    }
+    fake_collect, seen = _archive_fakes(entries_map)
+    _raw_archive_mocks(monkeypatch, tmp_path, fake_collect)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+    return store
+
+
+def test_archive_run_ledger_failure_publishes_partial_manifests(monkeypatch, tmp_path) -> None:
+    """A broken ledger never aborts the run but every task manifest is PARTIAL."""
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureStatus
+
+    store = _complete_run_setup(monkeypatch, tmp_path)
+
+    def _boom_ledger(*a, **k):
+        raise RuntimeError("ledger down")
+
+    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", _boom_ledger)
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="regular")
+
+    assert result == (0, 0, 0)
+    task_manifests = [
+        item for item in store.read_manifests("2026-09-07") if item.context.endpoint == "archive-task"
+    ]
+    assert task_manifests
+    assert all(item.status == CaptureStatus.PARTIAL for item in task_manifests)
+    assert archive_intraday.archive_phase_complete(store, "2026-09-07", "regular") is False
+
+
+def test_archive_run_healthy_ledger_publishes_complete_manifests(monkeypatch, tmp_path) -> None:
+    """A readable ledger keeps the all-COMPLETE run COMPLETE (regression guard)."""
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureStatus
+
+    store = _complete_run_setup(monkeypatch, tmp_path)
+    _healthy_empty_ledger(monkeypatch)
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="regular")
+
+    assert result == (0, 0, 0)
+    task_manifests = [
+        item for item in store.read_manifests("2026-09-07") if item.context.endpoint == "archive-task"
+    ]
+    assert task_manifests
+    assert all(item.status == CaptureStatus.COMPLETE for item in task_manifests)
+    assert archive_intraday.archive_phase_complete(store, "2026-09-07", "regular") is True
+
+
+def test_archive_run_reads_ledger_once(monkeypatch, tmp_path) -> None:
+    """The held roster is resolved exactly once per archive run."""
+    from src.daily import archive_intraday
+
+    store = _complete_run_setup(monkeypatch, tmp_path)
+    _healthy_empty_ledger(monkeypatch)
+    calls: list[int] = []
+    real_load = archive_intraday.load_held_roster
+
+    def _counting() -> HeldRoster:
+        calls.append(1)
+        return real_load()
+
+    monkeypatch.setattr(archive_intraday, "load_held_roster", _counting)
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="all")
+
+    assert len(calls) == 1
+
+
+def test_unresolved_previous_day_with_not_ok_roster_warns_roster(monkeypatch, tmp_path, caplog) -> None:
+    """Unresolved previous day plus a not-ok roster: incomplete with the roster warning."""
+    import logging
+
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-28", ["005930"])
+    _seed_panel(tmp_path, {"2026-09-25": ["005930"]})
+
+    with caplog.at_level(logging.WARNING, logger=archive_intraday.logger.name):
+        codes, incomplete = archive_intraday._resolve_cohort_codes(
+            "2026-09-28", _raw_profile(tmp_path), store,
+            previous_trading_day=None, held=HeldRoster((), False, "OSError"),
+        )
+    assert codes == ["005930"]
+    assert incomplete is True
+    assert any("reason=held_roster_unavailable error=OSError" in rec.message for rec in caplog.records)
+
+
+def test_admit_for_write_truth_table() -> None:
+    import pandas as pd
+
+    from src.daily.archive_intraday import _admit_for_write
+    from src.data.capture_contracts import ArtifactRef, CaptureDataset, CaptureStatus, CoverageEntry
+
+    ref = ArtifactRef(path="a/b.parquet", sha256="abc", bytes=10)
+
+    def _entry(status):
+        needs_evidence = status in (CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE)
+        return CoverageEntry(
+            symbol="005930", dataset=CaptureDataset.MINUTE_BARS, venue="KRX", session="regular",
+            scheduled_at=None, status=status, rows=0, first_event_time=None, last_event_time=None,
+            reason="test-evidence" if needs_evidence else "test",
+            raw_refs=(ref,) if needs_evidence else (),
+        )
+
+    one_row = _canon_bar_frame("2026-09-07", "005930")
+    zero_row = _empty_bar_frame_for("2026-09-07")
+    assert len(one_row) >= 1
+    assert len(zero_row) == 0
+    for status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
+        assert _admit_for_write("bars", "005930", one_row, _entry(status)) is True
+        assert _admit_for_write("bars", "005930", zero_row, _entry(status)) is True
+        assert _admit_for_write("bars", "005930", None, _entry(status)) is True
+    for status in (
+        CaptureStatus.UNKNOWN, CaptureStatus.FAILED, CaptureStatus.PARTIAL,
+        CaptureStatus.PENDING, CaptureStatus.NOT_APPLICABLE,
+    ):
+        assert _admit_for_write("bars", "005930", zero_row, _entry(status)) is False
+        assert _admit_for_write("bars", "005930", None, _entry(status)) is False
+        assert _admit_for_write("bars", "005930", pd.DataFrame(), _entry(status)) is False
+
+
+def test_admit_for_write_rejects_not_applicable_with_rows() -> None:
+    import pytest
+
+    from src.daily.archive_intraday import _admit_for_write
+    from src.data.capture_contracts import ArtifactRef, CaptureDataset, CaptureStatus, CoverageEntry
+
+    ref = ArtifactRef(path="a/b.parquet", sha256="abc", bytes=10)
+    entry = CoverageEntry(
+        symbol="005930", dataset=CaptureDataset.MINUTE_BARS, venue="NXT", session="nxt_aftermarket",
+        scheduled_at=None, status=CaptureStatus.NOT_APPLICABLE, rows=0, first_event_time=None,
+        last_event_time=None, reason="test-evidence", raw_refs=(ref,),
+    )
+    frame = _canon_bar_frame("2026-09-07", "005930")
+    with pytest.raises(ValueError, match="collector_contract_violation"):
+        _admit_for_write("nxt_after", "005930", frame, entry)
+
+
+def test_resolve_nxt_tick_targets_partitions_cohort() -> None:
+    from src.config.market_session import INTRADAY_SESSION_NXT_AFTERMARKET
+    from src.daily.archive_intraday import _resolve_nxt_tick_targets
+    from src.data.capture_contracts import ArtifactRef, CaptureDataset, CaptureStatus, CoverageEntry
+
+    ref = ArtifactRef(path="a/b.parquet", sha256="abc", bytes=10)
+
+    def _bar(symbol, status, venue, refs=()):
+        needs_evidence = status in (CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE)
+        return CoverageEntry(
+            symbol=symbol, dataset=CaptureDataset.MINUTE_BARS, venue=venue, session="nxt_aftermarket",
+            scheduled_at=None, status=status, rows=0, first_event_time=None, last_event_time=None,
+            reason="test-evidence" if needs_evidence else "test",
+            raw_refs=tuple(refs) if refs else ((ref,) if needs_evidence else ()),
+        )
+
+    cohort = ["000001", "000002", "000003", "000004", "000005", "000006"]
+    bars = [
+        _bar("000001", CaptureStatus.COMPLETE, "NXT"),
+        _bar("000002", CaptureStatus.NO_TRADES, "NXT"),
+        _bar("000003", CaptureStatus.NOT_APPLICABLE, "NXT"),
+        _bar("000004", CaptureStatus.UNKNOWN, "NXT"),
+        _bar("000005", CaptureStatus.COMPLETE, "KRX"),
+        CoverageEntry(
+            symbol=None, dataset=CaptureDataset.MINUTE_BARS, venue="NXT", session="nxt_aftermarket",
+            scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1, first_event_time=None,
+            last_event_time=None, reason="test-none", raw_refs=(),
+        ),
+        _bar("999999", CaptureStatus.COMPLETE, "NXT"),
+    ]
+    targets, skipped = _resolve_nxt_tick_targets(cohort, bars)
+    assert targets == ["000001", "000002"]
+    by_symbol = {entry.symbol: entry for entry in skipped}
+    assert set(by_symbol) == {"000003", "000004", "000005", "000006"}
+    assert by_symbol["000003"].status == CaptureStatus.NOT_APPLICABLE
+    assert by_symbol["000003"].reason == "skipped:nxt_bars_not_applicable"
+    assert by_symbol["000004"].status == CaptureStatus.UNKNOWN
+    assert by_symbol["000004"].reason == "skipped:nxt_bars_unresolved"
+    assert by_symbol["000005"].status == CaptureStatus.UNKNOWN
+    assert by_symbol["000005"].reason == "skipped:nxt_bars_unresolved"
+    assert by_symbol["000006"].status == CaptureStatus.UNKNOWN
+    assert by_symbol["000006"].reason == "skipped:nxt_bars_missing"
+    assert by_symbol["000006"].raw_refs == ()
+    assert set(targets) | set(by_symbol) == set(cohort)
+    assert not (set(targets) & set(by_symbol))
+    assert len(targets) + len(skipped) == len(cohort)
+    for entry in skipped:
+        assert entry.dataset is CaptureDataset.TRADE_TICKS
+        assert entry.session == INTRADAY_SESSION_NXT_AFTERMARKET
+        assert entry.rows == 0
+        assert entry.scheduled_at is None
+        assert entry.first_event_time is None
+        assert entry.last_event_time is None
+
+
+def test_resolve_nxt_tick_targets_rejects_duplicate_symbol() -> None:
+    import pytest
+
+    from src.daily.archive_intraday import _resolve_nxt_tick_targets
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry
+
+    def _bar(symbol):
+        return CoverageEntry(
+            symbol=symbol, dataset=CaptureDataset.MINUTE_BARS, venue="NXT", session="nxt_aftermarket",
+            scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1, first_event_time=None,
+            last_event_time=None, reason="test", raw_refs=(),
+        )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        _resolve_nxt_tick_targets(["000001"], [_bar("000001"), _bar("000001")])
+
+
+def test_publish_task_manifest_requires_expected_coverage(tmp_path, caplog) -> None:
+    import logging
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry
+
+    store = _archive_store(tmp_path)
+    import datetime as _dt
+
+    from src.data.capture_contracts import SEOUL as _SEOUL
+
+    trading_day = _dt.date(2026, 9, 7)
+
+    def _good(symbol):
+        return CoverageEntry(
+            symbol=symbol, dataset=CaptureDataset.MINUTE_BARS, venue="KRX", session="regular",
+            scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1, first_event_time=None,
+            last_event_time=None, reason="test", raw_refs=(),
+        )
+
+    def _bad(symbol):
+        return CoverageEntry(
+            symbol=symbol, dataset=CaptureDataset.MINUTE_BARS, venue="KRX", session="regular",
+            scheduled_at=None, status=CaptureStatus.PARTIAL, rows=0, first_event_time=None,
+            last_event_time=None, reason="test", raw_refs=(),
+        )
+
+    manifest = archive_intraday._publish_task_manifest(
+        store, trading_day=trading_day, run_id="run-a", dataset=CaptureDataset.MINUTE_BARS,
+        vendor="kis", session="regular", entries=[_good("005930"), _good("000660")],
+        expected_symbols=["005930", "000660"],
+    )
+    assert manifest.status == CaptureStatus.COMPLETE
+    with caplog.at_level(logging.WARNING, logger=archive_intraday.logger.name):
+        manifest = archive_intraday._publish_task_manifest(
+            store, trading_day=trading_day, run_id="run-b", dataset=CaptureDataset.MINUTE_BARS,
+            vendor="kis", session="regular", entries=[_good("005930")],
+            expected_symbols=["005930", "000660"],
+        )
+    assert manifest.status == CaptureStatus.PARTIAL
+    assert any("reason=missing_entries" in rec.getMessage() and "n_missing=1" in rec.getMessage() for rec in caplog.records)
+    manifest = archive_intraday._publish_task_manifest(
+        store, trading_day=trading_day, run_id="run-c", dataset=CaptureDataset.MINUTE_BARS,
+        vendor="kis", session="regular", entries=[], expected_symbols=[],
+    )
+    assert manifest.status == CaptureStatus.COMPLETE
+    manifest = archive_intraday._publish_task_manifest(
+        store, trading_day=trading_day, run_id="run-d", dataset=CaptureDataset.MINUTE_BARS,
+        vendor="kis", session="regular", entries=[_good("005930"), _bad("000660")],
+        expected_symbols=["005930", "000660"],
+    )
+    assert manifest.status == CaptureStatus.PARTIAL
+    manifest = archive_intraday._publish_task_manifest(
+        store, trading_day=trading_day, run_id="run-e", dataset=CaptureDataset.MINUTE_BARS,
+        vendor="kis", session="regular", entries=[_good("005930"), _good("000660")],
+        expected_symbols=["005930", "000660"], roster_incomplete=True,
+    )
+    assert manifest.status == CaptureStatus.PARTIAL
+
+
+def test_run_archive_extended_bars_non_complete_recorded_not_written(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.config.market_session import (
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+        INTRADAY_SESSION_NXT_PREMARKET,
+    )
+    from src.daily import archive_intraday
+    from src.data import intraday_store
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930", "000660"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+
+    async def _fake_unknown(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _empty_bar_frame_for(snap_date),
+                      _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    async def _fake_failed(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _empty_bar_frame_for(snap_date),
+                      _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "FAILED"))
+        return pd.DataFrame()
+
+    async def _fake_ticks(client, session, codes, snap_date, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, pd.DataFrame(),
+                      _fake_entry(code, CaptureDataset.TRADE_TICKS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    async def _noop(client, session, codes, snap_date, *args, **kwargs):
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _noop)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930", "000660"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _fake_unknown)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _fake_failed)
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _fake_unknown)
+    monkeypatch.setattr(archive_intraday, "collect_aftermarket_trade_ticks", _fake_ticks)
+
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="aftermarket")
+
+    assert result[1] == 0
+    assert not intraday_store.intraday_partition_path(1, "2026-09-07", INTRADAY_SESSION_NXT_AFTERMARKET).exists()
+    assert not intraday_store.intraday_partition_path(1, "2026-09-07", INTRADAY_SESSION_NXT_PREMARKET).exists()
+    assert not intraday_store.intraday_partition_path(1, "2026-09-07", INTRADAY_SESSION_KRX_AFTERMARKET).exists()
+    manifests = store.read_manifests("2026-09-07")
+    by_session = {
+        item.context.session: item for item in manifests
+        if item.context.endpoint == "archive-task" and item.context.dataset is CaptureDataset.MINUTE_BARS
+    }
+    for session in (INTRADAY_SESSION_NXT_AFTERMARKET, INTRADAY_SESSION_NXT_PREMARKET, INTRADAY_SESSION_KRX_AFTERMARKET):
+        assert by_session[session].status == CaptureStatus.PARTIAL
+        assert {entry.symbol for entry in by_session[session].entries} == {"005930", "000660"}
+
+
+def _nxt_tick_test_store(monkeypatch, tmp_path, nxt_status):
+    import datetime as _dt
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import (
+        SEOUL as _SEOUL,
+        CapturedResponse,
+        CaptureContext,
+        CaptureDataset,
+        CaptureStatus,
+        CoverageEntry,
+    )
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-30", ["005930", "000660"])
+    _publish_cohort(store, "2026-09-29", ["005930", "000660"])
+    seed_ctx = CaptureContext(
+        trading_date=_dt.date(2026, 9, 30), run_id="seed", dataset=CaptureDataset.SCAN,
+        vendor="owner-local", endpoint="seed", symbol=None, venue="NXT",
+        session="nxt_aftermarket", capture_reason="seed", cohort_id=None, scheduled_at=None,
+    )
+    now = _dt.datetime.now(_SEOUL)
+    shared = store.append_response(CapturedResponse(
+        context=seed_ctx, request_started_at=now, received_at=now, payload={"seed": True},
+        status=CaptureStatus.COMPLETE, source_timestamp=None, source_published_at=None,
+        page_index=0, attempt_index=0, continuation={}, error_type=None,
+    ))
+
+    async def _fake_nxt_bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        import pandas as pd
+
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _empty_bar_frame_for(snap_date), CoverageEntry(
+                symbol=code, dataset=CaptureDataset.MINUTE_BARS, venue="NXT",
+                session="nxt_aftermarket", scheduled_at=None, status=nxt_status, rows=0,
+                first_event_time=None, last_event_time=None, reason="test-nxt-bars",
+                raw_refs=(shared,),
+            ))
+        return pd.DataFrame()
+
+    async def _fake_complete_bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        import pandas as pd
+
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            frame = _canon_bar_frame(snap_date, code)
+            on_symbol(code, frame, CoverageEntry(
+                symbol=code, dataset=CaptureDataset.MINUTE_BARS, venue="KRX",
+                session="regular", scheduled_at=None, status=CaptureStatus.COMPLETE,
+                rows=len(frame), first_event_time=None, last_event_time=None,
+                reason="test-bars", raw_refs=(),
+            ))
+        return pd.DataFrame()
+
+    def _complete_bars_factory(session_tag, venue):
+        async def _fn(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+            import pandas as pd
+
+            on_symbol = kwargs.get("on_symbol")
+            for code in codes:
+                frame = _canon_bar_frame(snap_date, code)
+                on_symbol(code, frame, CoverageEntry(
+                    symbol=code, dataset=CaptureDataset.MINUTE_BARS, venue=venue,
+                    session=session_tag, scheduled_at=None, status=CaptureStatus.COMPLETE,
+                    rows=len(frame), first_event_time=None, last_event_time=None,
+                    reason="test-bars", raw_refs=(),
+                ))
+            return pd.DataFrame()
+        return _fn
+
+    async def _fake_complete_ticks(client, session, codes, snap_date, **kwargs):
+        import pandas as pd
+
+        from src.data.intraday_schema import normalize_tick_frame
+
+        venue = kwargs.get("venue", "KRX")
+        session_tag = "krx_aftermarket" if venue == "KRX" else "nxt_aftermarket"
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            raw = pd.DataFrame({"time": ["160100"], "close": [71000], "jdiff_vol": [7]})
+            frame = normalize_tick_frame(raw, "ls", snap_date, code)
+            on_symbol(code, frame, CoverageEntry(
+                symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=venue,
+                session=session_tag, scheduled_at=None, status=CaptureStatus.COMPLETE,
+                rows=len(frame), first_event_time=None, last_event_time=None,
+                reason="test-ticks", raw_refs=(),
+            ))
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _fake_complete_bars)
+    _seed_panel(tmp_path, {"2026-09-29": ["005930", "000660"], "2026-09-28": ["005930", "000660"]})
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _fake_nxt_bars)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _complete_bars_factory("nxt_premarket", "NXT"))
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _complete_bars_factory("krx_aftermarket", "KRX"))
+    requested: list[list[str]] = []
+
+    async def _tracking_after_ticks(client, session, codes, snap_date, **kwargs):
+        requested.append(list(codes))
+        return await _fake_complete_ticks(client, session, codes, snap_date, **kwargs)
+
+    monkeypatch.setattr(archive_intraday, "collect_aftermarket_trade_ticks", _tracking_after_ticks)
+    return store, requested, shared
+
+
+def test_run_archive_nxt_ticks_partial_when_nxt_bars_unresolved(monkeypatch, tmp_path) -> None:
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    store, requested, _ = _nxt_tick_test_store(monkeypatch, tmp_path, CaptureStatus.UNKNOWN)
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-30", profile=_raw_profile(tmp_path), phase="aftermarket")
+    assert requested[-1] == []
+    manifests = store.read_manifests("2026-09-30")
+    nxt_ticks = next(
+        item for item in manifests
+        if item.context.endpoint == "archive-task"
+        and item.context.dataset is CaptureDataset.TRADE_TICKS
+        and item.context.session == "nxt_aftermarket"
+    )
+    assert nxt_ticks.status == CaptureStatus.PARTIAL
+    assert {entry.symbol for entry in nxt_ticks.entries} == {"005930", "000660"}
+    assert all(entry.status == CaptureStatus.UNKNOWN for entry in nxt_ticks.entries)
+    assert all(entry.reason == "skipped:nxt_bars_unresolved" for entry in nxt_ticks.entries)
+    assert archive_intraday.archive_phase_complete(store, "2026-09-30", "aftermarket") is False
+
+
+def test_run_archive_nxt_ticks_complete_when_no_symbol_nxt_listed(monkeypatch, tmp_path) -> None:
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    store, requested, shared = _nxt_tick_test_store(monkeypatch, tmp_path, CaptureStatus.NOT_APPLICABLE)
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-30", profile=_raw_profile(tmp_path), phase="aftermarket")
+    assert requested[-1] == []
+    manifests = store.read_manifests("2026-09-30")
+    nxt_ticks = next(
+        item for item in manifests
+        if item.context.endpoint == "archive-task"
+        and item.context.dataset is CaptureDataset.TRADE_TICKS
+        and item.context.session == "nxt_aftermarket"
+    )
+    assert nxt_ticks.status == CaptureStatus.COMPLETE
+    assert {entry.symbol for entry in nxt_ticks.entries} == {"005930", "000660"}
+    assert all(entry.status == CaptureStatus.NOT_APPLICABLE for entry in nxt_ticks.entries)
+    assert all(entry.reason == "skipped:nxt_bars_not_applicable" for entry in nxt_ticks.entries)
+    assert all(entry.raw_refs == (shared,) for entry in nxt_ticks.entries)
+    assert shared in nxt_ticks.artifacts
+
+
+@pytest.mark.parametrize(
+    "stream",
+    ["bars", "ticks", "nxt_after", "nxt_pre", "krx_after", "krx_after_ticks", "nxt_after_ticks"],
+)
+def test_run_archive_rejects_uncertified_frame_with_rows(monkeypatch, tmp_path, stream) -> None:
+    import pandas as pd
+    import pytest
+
+    from src.daily import archive_intraday
+    from src.data import intraday_store
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry
+    from src.data.intraday_schema import normalize_tick_frame
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+
+    def _bar_frame(code):
+        return _canon_bar_frame("2026-09-07", code)
+
+    def _tick_frame(code):
+        raw = pd.DataFrame({"time": ["090300"], "close": [71000], "jdiff_vol": [7]})
+        return normalize_tick_frame(raw, "ls", "2026-09-07", code)
+
+    def _good_bar(code, dataset, session, venue="KRX"):
+        frame = _bar_frame(code)
+        return frame, CoverageEntry(
+            symbol=code, dataset=dataset, venue=venue, session=session, scheduled_at=None,
+            status=CaptureStatus.COMPLETE, rows=len(frame), first_event_time=None,
+            last_event_time=None, reason="test-good", raw_refs=(),
+        )
+
+    def _good_tick(code, dataset, session, venue="KRX"):
+        frame = _tick_frame(code)
+        return frame, CoverageEntry(
+            symbol=code, dataset=dataset, venue=venue, session=session, scheduled_at=None,
+            status=CaptureStatus.COMPLETE, rows=len(frame), first_event_time=None,
+            last_event_time=None, reason="test-good", raw_refs=(),
+        )
+
+    def _bad_bar(code, dataset, session):
+        frame = _bar_frame(code)
+        return frame, CoverageEntry(
+            symbol=code, dataset=dataset, venue="UNKNOWN", session=session, scheduled_at=None,
+            status=CaptureStatus.PARTIAL, rows=len(frame), first_event_time=None,
+            last_event_time=None, reason="test-bad", raw_refs=(),
+        )
+
+    def _bad_tick(code, dataset, session):
+        frame = _tick_frame(code)
+        return frame, CoverageEntry(
+            symbol=code, dataset=dataset, venue="UNKNOWN", session=session, scheduled_at=None,
+            status=CaptureStatus.PARTIAL, rows=len(frame), first_event_time=None,
+            last_event_time=None, reason="test-bad", raw_refs=(),
+        )
+
+    target = stream
+
+    async def _fake_regular_bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            if target == "bars":
+                frame, entry = _bad_bar(code, CaptureDataset.MINUTE_BARS, "regular")
+            else:
+                frame, entry = _good_bar(code, CaptureDataset.MINUTE_BARS, "regular")
+            on_symbol(code, frame, entry)
+        return pd.DataFrame()
+
+    async def _fake_regular_ticks(client, session, codes, snap_date, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            if target == "ticks":
+                frame, entry = _bad_tick(code, CaptureDataset.TRADE_TICKS, "regular")
+            else:
+                frame, entry = _good_tick(code, CaptureDataset.TRADE_TICKS, "regular")
+            on_symbol(code, frame, entry)
+        return pd.DataFrame()
+
+    def _session_bars_factory(session_tag, key):
+        async def _fn(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+            on_symbol = kwargs.get("on_symbol")
+            for code in codes:
+                if target == key:
+                    frame, entry = _bad_bar(code, CaptureDataset.MINUTE_BARS, session_tag)
+                else:
+                    frame = _bar_frame(code)
+                    entry = CoverageEntry(
+                        symbol=code, dataset=CaptureDataset.MINUTE_BARS, venue="NXT" if "nxt" in session_tag else "KRX",
+                        session=session_tag, scheduled_at=None, status=CaptureStatus.COMPLETE,
+                        rows=len(frame), first_event_time=None, last_event_time=None,
+                        reason="test-good", raw_refs=(),
+                    )
+                on_symbol(code, frame, entry)
+            return pd.DataFrame()
+        return _fn
+
+    async def _fake_after_ticks(client, session, codes, snap_date, **kwargs):
+        venue = kwargs.get("venue")
+        session_tag = "krx_aftermarket" if venue == "KRX" else "nxt_aftermarket"
+        key = "krx_after_ticks" if venue == "KRX" else "nxt_after_ticks"
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            if target == key:
+                frame, entry = _bad_tick(code, CaptureDataset.TRADE_TICKS, session_tag)
+            else:
+                frame, entry = _good_tick(code, CaptureDataset.TRADE_TICKS, session_tag, venue=venue)
+            on_symbol(code, frame, entry)
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _fake_regular_bars)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _fake_regular_ticks)
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _session_bars_factory("nxt_aftermarket", "nxt_after"))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _session_bars_factory("nxt_premarket", "nxt_pre"))
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _session_bars_factory("krx_aftermarket", "krx_after"))
+    monkeypatch.setattr(archive_intraday, "collect_aftermarket_trade_ticks", _fake_after_ticks)
+
+    with pytest.raises(ValueError, match=f"collector_contract_violation stream={target} symbol=005930"):
+        archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="all")
+    task_manifests = [item for item in store.read_manifests("2026-09-07") if item.context.endpoint == "archive-task"]
+    assert task_manifests == []
+    normalized = tmp_path / "cap" / "normalized" / "2026-09-07"
+    assert not normalized.exists() or list(normalized.rglob("*.parquet")) == []
+
+
+def test_stream_table_is_well_formed() -> None:
+    from src.daily.archive_intraday import _STREAMS
+    from src.data.capture_contracts import CaptureDataset
+
+    assert len(_STREAMS) == 7
+    keys = [s.key for s in _STREAMS]
+    assert len(set(keys)) == 7
+    pairs = [(s.dataset, s.session) for s in _STREAMS]
+    assert len(set(pairs)) == 7
+    by_key = {s.key: s for s in _STREAMS}
+    assert by_key["nxt_after_ticks"].codes_from is not None
+    assert by_key["nxt_after_ticks"].codes_from.source == "nxt_after"
+    order = {s.key: idx for idx, s in enumerate(_STREAMS)}
+    for spec in _STREAMS:
+        if spec.codes_from is not None:
+            assert order[spec.codes_from.source] < order[spec.key]
+            assert by_key[spec.codes_from.source].phase == spec.phase
+        assert spec.return_slot in (0, 1, 2, None)
+    assert by_key["bars"].return_slot == 0
+    assert by_key["nxt_after"].return_slot == 1
+    assert by_key["nxt_pre"].return_slot == 1
+    assert by_key["ticks"].return_slot == 2
+    assert by_key["bars"].dataset is CaptureDataset.MINUTE_BARS
+    assert by_key["ticks"].dataset is CaptureDataset.TRADE_TICKS
+
+
+def test_stream_run_ids_are_prefix_free() -> None:
+    from src.daily.archive_intraday import _STREAMS, _stream_run_id
+
+    attempt = "abcd1234"
+    run_ids = [_stream_run_id("2026-09-07", spec, attempt) for spec in _STREAMS]
+    assert len(set(run_ids)) == 7
+    for idx, first in enumerate(run_ids):
+        for jdx, second in enumerate(run_ids):
+            if idx != jdx:
+                assert not second.startswith(first)
+    slugs = sorted(
+        run_id.removeprefix("archive-2026-09-07-").removesuffix(f"-{attempt}") for run_id in run_ids
+    )
+    assert slugs == sorted([
+        "regular-bars",
+        "nxt-aftermarket-bars",
+        "nxt-premarket-bars",
+        "krx-aftermarket-bars",
+        "krx-aftermarket-ticks",
+        "nxt-aftermarket-ticks",
+        "regular-ticks",
+    ])
+
+
+def _spec16_contract_fakes(session_tags):
+    import pandas as pd
+
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry
+
+    def _bar_entry(code, session_tag, venue="KRX"):
+        return CoverageEntry(
+            symbol=code, dataset=CaptureDataset.MINUTE_BARS, venue=venue, session=session_tag,
+            scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1,
+            first_event_time=None, last_event_time=None, reason="test-spec16", raw_refs=(),
+        )
+
+    def _tick_entry(code, session_tag, venue="KRX"):
+        return CoverageEntry(
+            symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=venue, session=session_tag,
+            scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1,
+            first_event_time=None, last_event_time=None, reason="test-spec16", raw_refs=(),
+        )
+
+    async def _bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            on_symbol(code, _canon_bar_frame(snap_date, code), _bar_entry(code, "regular"))
+        return pd.DataFrame()
+
+    def _session_bars_factory(session_tag, venue="KRX"):
+        async def _fn(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+            on_symbol = kwargs.get("on_symbol")
+            for code in codes:
+                on_symbol(code, _canon_bar_frame(snap_date, code), _bar_entry(code, session_tag, venue))
+            return pd.DataFrame()
+
+        return _fn
+
+    async def _ticks(client, session, codes, snap_date, **kwargs):
+        import pandas as pd
+
+        from src.data.intraday_schema import normalize_tick_frame
+
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            raw = pd.DataFrame({"time": ["090300"], "close": [71000], "jdiff_vol": [7]})
+            frame = normalize_tick_frame(raw, "ls", snap_date, code)
+            on_symbol(code, frame, _tick_entry(code, "regular"))
+        return pd.DataFrame()
+
+    async def _after_ticks(client, session, codes, snap_date, **kwargs):
+        import pandas as pd
+
+        from src.data.intraday_schema import normalize_tick_frame
+
+        venue = kwargs.get("venue")
+        session_tag = session_tags["KRX"] if venue == "KRX" else session_tags["NXT"]
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            raw = pd.DataFrame({"time": ["160100"], "close": [71000], "jdiff_vol": [7]})
+            frame = normalize_tick_frame(raw, "ls", snap_date, code)
+            on_symbol(code, frame, _tick_entry(code, session_tag, venue=venue))
+        return pd.DataFrame()
+
+    return _bars, _session_bars_factory, _ticks, _after_ticks
+
+
+def test_run_archive_phase_all_collection_order(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+    calls: list[str] = []
+
+    async def _rec(name, venue=None):
+        calls.append(f"{name}:{venue}" if venue else name)
+
+    async def _bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        await _rec("bars")
+        for code in codes:
+            kwargs["on_symbol"](code, _empty_bar_frame_for(snap_date),
+                                _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    def _session_bars_factory(name):
+        async def _fn(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+            await _rec(name)
+            for code in codes:
+                kwargs["on_symbol"](code, _empty_bar_frame_for(snap_date),
+                                    _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+            return pd.DataFrame()
+
+        return _fn
+
+    async def _after_ticks(client, session, codes, snap_date, **kwargs):
+        await _rec("after_ticks", kwargs.get("venue"))
+        for code in codes:
+            kwargs["on_symbol"](code, pd.DataFrame(),
+                                _fake_entry(code, CaptureDataset.TRADE_TICKS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    async def _ticks(client, session, codes, snap_date, **kwargs):
+        await _rec("ticks")
+        for code in codes:
+            kwargs["on_symbol"](code, pd.DataFrame(),
+                                _fake_entry(code, CaptureDataset.TRADE_TICKS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _bars)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _session_bars_factory("nxt_after"))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _session_bars_factory("nxt_pre"))
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _session_bars_factory("krx_after"))
+    monkeypatch.setattr(archive_intraday, "collect_aftermarket_trade_ticks", _after_ticks)
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _ticks)
+
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="all")
+
+    assert calls == ["bars", "nxt_after", "nxt_pre", "krx_after", "after_ticks:KRX", "after_ticks:NXT", "ticks"]
+
+
+def test_run_archive_publishes_one_manifest_per_stream_in_table_order(monkeypatch, tmp_path) -> None:
+    from src.config.market_session import (
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+    )
+    from src.daily import archive_intraday
+
+    store_probe: dict = {}
+    real_cls = archive_intraday.CaptureStore
+    spy: list = []
+
+    def _factory(root):
+        inst = real_cls(root)
+        store_probe["inst"] = inst
+        orig = inst.publish_manifest
+
+        def _wrapped(manifest):
+            if manifest.context.endpoint == "archive-task":
+                spy.append(manifest)
+            return orig(manifest)
+
+        inst.publish_manifest = _wrapped  # type: ignore[method-assign]
+        return inst
+
+    monkeypatch.setattr(archive_intraday, "CaptureStore", _factory)
+    tmp_store = _archive_store(tmp_path)
+    _publish_cohort(tmp_store, "2026-09-07", ["005930"])
+    _publish_cohort(tmp_store, "2026-09-04", ["005930"])
+    tags = {"KRX": INTRADAY_SESSION_KRX_AFTERMARKET, "NXT": INTRADAY_SESSION_NXT_AFTERMARKET}
+    _bars, _sess_factory, _ticks, _after = _spec16_contract_fakes(tags)
+    from src.config.market_session import (
+        INTRADAY_SESSION_NXT_PREMARKET,
+        INTRADAY_SESSION_REGULAR,
+    )
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _bars)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(
+        archive_intraday, "collect_nxt_aftermarket_bars",
+        _sess_factory(INTRADAY_SESSION_NXT_AFTERMARKET, "NXT"),
+    )
+    monkeypatch.setattr(
+        archive_intraday, "collect_nxt_premarket_bars",
+        _sess_factory(INTRADAY_SESSION_NXT_PREMARKET, "NXT"),
+    )
+    monkeypatch.setattr(
+        archive_intraday, "collect_krx_aftermarket_bars",
+        _sess_factory(INTRADAY_SESSION_KRX_AFTERMARKET, "KRX"),
+    )
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _ticks)
+    monkeypatch.setattr(archive_intraday, "collect_aftermarket_trade_ticks", _after)
+
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="all")
+
+    assert len(spy) == 7
+    expected_pairs = [(s.dataset, s.session) for s in archive_intraday._STREAMS]
+    assert [(m.context.dataset, m.context.session) for m in spy] == expected_pairs
+    expected_vendors = [s.manifest_vendor for s in archive_intraday._STREAMS]
+    assert [m.context.vendor for m in spy] == expected_vendors
+    assert all(m.context.vendor == "owner-local" for m in spy)
+    slug_by_pair = {
+        (s.dataset, s.session): f"{str(s.session).replace('_', '-')}-{'bars' if s.dataset.name == 'MINUTE_BARS' else 'ticks'}"
+        for s in archive_intraday._STREAMS
+    }
+    for manifest in spy:
+        slug = slug_by_pair[(manifest.context.dataset, manifest.context.session)]
+        assert manifest.context.run_id.startswith(f"archive-2026-09-07-{slug}-")
+    assert INTRADAY_SESSION_REGULAR is not None
+
+
+def test_run_archive_stream_adapters_pass_historical_arguments(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+    seen: dict = {}
+
+    def _recorder(name):
+        async def _fn(*args, **kwargs):
+            seen[name] = (tuple(args), dict(kwargs))
+            on_symbol = kwargs.get("on_symbol")
+            codes = args[2] if len(args) > 2 else []
+            snap_date = args[3] if len(args) > 3 else "2026-09-07"
+            for code in codes:
+                on_symbol(code, _empty_bar_frame_for(snap_date),
+                          _fake_entry(code, CaptureDataset.MINUTE_BARS, "regular", "UNKNOWN"))
+            return pd.DataFrame()
+
+        return _fn
+
+    async def _tick_recorder(*args, **kwargs):
+        seen["ticks"] = (tuple(args), dict(kwargs))
+        on_symbol = kwargs.get("on_symbol")
+        codes = args[2] if len(args) > 2 else []
+        snap_date = args[3] if len(args) > 3 else "2026-09-07"
+        for code in codes:
+            on_symbol(code, pd.DataFrame(),
+                      _fake_entry(code, CaptureDataset.TRADE_TICKS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    async def _after_recorder(*args, **kwargs):
+        venue = kwargs.get("venue")
+        seen[f"after_{venue}"] = (tuple(args), dict(kwargs))
+        on_symbol = kwargs.get("on_symbol")
+        codes = args[2] if len(args) > 2 else []
+        snap_date = args[3] if len(args) > 3 else "2026-09-07"
+        for code in codes:
+            on_symbol(code, pd.DataFrame(),
+                      _fake_entry(code, CaptureDataset.TRADE_TICKS, "regular", "UNKNOWN"))
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _recorder("bars"))
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _recorder("nxt_after"))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _recorder("nxt_pre"))
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _recorder("krx_after"))
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _tick_recorder)
+    monkeypatch.setattr(archive_intraday, "collect_aftermarket_trade_ticks", _after_recorder)
+
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="all")
+
+    bars_args, bars_kw = seen["bars"]
+    assert len(bars_args) == 5
+    assert set(bars_kw) == {"ls_client", "profile", "capture_store", "run_id", "on_symbol"}
+    for name in ("nxt_after", "nxt_pre"):
+        pos, kw = seen[name]
+        assert len(pos) == 5
+        assert set(kw) == {"kiwoom_client", "profile", "capture_store", "run_id", "on_symbol"}
+    pos, kw = seen["krx_after"]
+    assert len(pos) == 5
+    assert set(kw) == {"profile", "capture_store", "run_id", "on_symbol"}
+    pos, kw = seen["ticks"]
+    assert len(pos) == 4
+    assert set(kw) == {"ls_client", "kiwoom_client", "profile", "capture_store", "run_id", "on_symbol"}
+    for venue in ("KRX", "NXT"):
+        pos, kw = seen[f"after_{venue}"]
+        assert len(pos) == 4
+        assert set(kw) == {"venue", "profile", "capture_store", "run_id", "on_symbol"}
+        assert kw["venue"] == venue
+
+
+def test_run_archive_routes_rows_to_dataset_writer(monkeypatch, tmp_path) -> None:
+    from src.config.market_session import (
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+        INTRADAY_SESSION_NXT_PREMARKET,
+        INTRADAY_SESSION_REGULAR,
+    )
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930", "000660"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+    tags = {"KRX": INTRADAY_SESSION_KRX_AFTERMARKET, "NXT": INTRADAY_SESSION_NXT_AFTERMARKET}
+    _bars, _sess_factory, _ticks, _after = _spec16_contract_fakes(tags)
+    _raw_archive_mocks(monkeypatch, tmp_path, _bars)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930", "000660"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(
+        archive_intraday, "collect_nxt_aftermarket_bars",
+        _sess_factory(INTRADAY_SESSION_NXT_AFTERMARKET, "NXT"),
+    )
+    monkeypatch.setattr(
+        archive_intraday, "collect_nxt_premarket_bars",
+        _sess_factory(INTRADAY_SESSION_NXT_PREMARKET, "NXT"),
+    )
+    monkeypatch.setattr(
+        archive_intraday, "collect_krx_aftermarket_bars",
+        _sess_factory(INTRADAY_SESSION_KRX_AFTERMARKET, "KRX"),
+    )
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _ticks)
+    monkeypatch.setattr(archive_intraday, "collect_aftermarket_trade_ticks", _after)
+
+    bar_writes: list = []
+    tick_writes: list = []
+
+    def _spy_bar(df, interval, snap_date, session, *, coverage=None, batch_rows=None, **kwargs):
+        bar_writes.append({"interval": interval, "session": session, "codes": sorted(coverage or {}), "rows": len(df)})
+        return len(df)
+
+    def _spy_tick(df, snap_date, session, *, coverage=None, batch_rows=None, **kwargs):
+        tick_writes.append({"session": session, "codes": sorted(coverage or {}), "rows": len(df)})
+        return len(df)
+
+    monkeypatch.setattr(archive_intraday, "write_intraday_partition", _spy_bar)
+    monkeypatch.setattr(archive_intraday, "write_tick_partition", _spy_tick)
+
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="all")
+
+    assert {w["session"] for w in bar_writes} == {
+        INTRADAY_SESSION_REGULAR,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+        INTRADAY_SESSION_NXT_PREMARKET,
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+    }
+    assert {w["session"] for w in tick_writes} == {
+        INTRADAY_SESSION_REGULAR,
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+    }
+    assert {w["interval"] for w in bar_writes} == {1}
+    for write in [*bar_writes, *tick_writes]:
+        assert write["rows"] >= 1
+        assert write["codes"] != []
+
+
+def _spec16_counting_fakes(counts):
+    import pandas as pd
+
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry
+
+    def _frame(n, snap_date, code, tick=False):
+        if tick:
+            from src.data.intraday_schema import normalize_tick_frame
+
+            base = normalize_tick_frame(
+                pd.DataFrame({"time": ["090300"], "close": [71000], "jdiff_vol": [7]}),
+                "ls", snap_date, code,
+            )
+        else:
+            base = _canon_bar_frame(snap_date, code)
+        return pd.concat([base] * n, ignore_index=True) if n > 1 else base
+
+    def _entry(code, dataset, session, venue, n):
+        return CoverageEntry(
+            symbol=code, dataset=dataset, venue=venue, session=session, scheduled_at=None,
+            status=CaptureStatus.COMPLETE, rows=n, first_event_time=None,
+            last_event_time=None, reason="test-count", raw_refs=(),
+        )
+
+    async def _bars(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            frame = _frame(counts["bars"], snap_date, code)
+            on_symbol(code, frame, _entry(code, CaptureDataset.MINUTE_BARS, "regular", "KRX", len(frame)))
+        return pd.DataFrame()
+
+    def _sess_factory(session_tag, key, venue="KRX"):
+        async def _fn(client, session, codes, snap_date, bar_interval_minutes=1, **kwargs):
+            on_symbol = kwargs.get("on_symbol")
+            for code in codes:
+                frame = _frame(counts[key], snap_date, code)
+                on_symbol(code, frame, _entry(code, CaptureDataset.MINUTE_BARS, session_tag, venue, len(frame)))
+            return pd.DataFrame()
+
+        return _fn
+
+    async def _ticks(client, session, codes, snap_date, **kwargs):
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            frame = _frame(counts["ticks"], snap_date, code, tick=True)
+            on_symbol(code, frame, _entry(code, CaptureDataset.TRADE_TICKS, "regular", "KRX", len(frame)))
+        return pd.DataFrame()
+
+    async def _after(client, session, codes, snap_date, **kwargs):
+        from src.config.market_session import (
+            INTRADAY_SESSION_KRX_AFTERMARKET,
+            INTRADAY_SESSION_NXT_AFTERMARKET,
+        )
+
+        venue = kwargs.get("venue")
+        tag = INTRADAY_SESSION_KRX_AFTERMARKET if venue == "KRX" else INTRADAY_SESSION_NXT_AFTERMARKET
+        key = "krx_after_ticks" if venue == "KRX" else "nxt_after_ticks"
+        on_symbol = kwargs.get("on_symbol")
+        for code in codes:
+            frame = _frame(counts[key], snap_date, code, tick=True)
+            on_symbol(code, frame, _entry(code, CaptureDataset.TRADE_TICKS, tag, venue, len(frame)))
+        return pd.DataFrame()
+
+    return _bars, _sess_factory, _ticks, _after
+
+
+def test_run_archive_return_tuple_counts_reported_streams_only(monkeypatch, tmp_path) -> None:
+    from src.config.market_session import (
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+        INTRADAY_SESSION_NXT_PREMARKET,
+    )
+    from src.daily import archive_intraday
+
+    counts = {
+        "bars": 1, "nxt_after": 2, "nxt_pre": 3, "krx_after": 4,
+        "krx_after_ticks": 5, "nxt_after_ticks": 6, "ticks": 7,
+    }
+
+    def _run_once(phase):
+        fresh = tmp_path / f"cap-{phase}"
+        fresh.mkdir(exist_ok=True)
+        from src.config.collection import CollectionSettings
+
+        profile = CollectionSettings(COLLECTION_ROOT=fresh)
+        store = _archive_store.__wrapped__ if hasattr(_archive_store, "__wrapped__") else None
+        from src.data.capture_store import CaptureStore
+
+        real_store = CaptureStore(fresh)
+        _publish_cohort(real_store, "2026-09-07", ["005930"])
+        _publish_cohort(real_store, "2026-09-04", ["005930"])
+        _bars, _sess_factory, _ticks, _after = _spec16_counting_fakes(counts)
+        _raw_archive_mocks(monkeypatch, tmp_path, _bars)
+        _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+        monkeypatch.setattr(
+            archive_intraday, "collect_nxt_aftermarket_bars",
+            _sess_factory(INTRADAY_SESSION_NXT_AFTERMARKET, "nxt_after", "NXT"),
+        )
+        monkeypatch.setattr(
+            archive_intraday, "collect_nxt_premarket_bars",
+            _sess_factory(INTRADAY_SESSION_NXT_PREMARKET, "nxt_pre", "NXT"),
+        )
+        monkeypatch.setattr(
+            archive_intraday, "collect_krx_aftermarket_bars",
+            _sess_factory(INTRADAY_SESSION_KRX_AFTERMARKET, "krx_after", "KRX"),
+        )
+        monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _ticks)
+        monkeypatch.setattr(archive_intraday, "collect_aftermarket_trade_ticks", _after)
+        monkeypatch.setattr(archive_intraday.settings, "HISTORY_DIR", tmp_path, raising=False)
+        monkeypatch.setattr(archive_intraday.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "price_history.parquet", raising=False)
+        return archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=profile, phase=phase)
+
+    assert _run_once("all") == (1, 5, 7)
+    assert _run_once("regular") == (1, 0, 7)
+    assert _run_once("aftermarket") == (0, 5, 0)
+
+
+def test_run_archive_logs_one_line_per_executed_stream(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    from src.config.market_session import (
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+        INTRADAY_SESSION_NXT_PREMARKET,
+    )
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+    tags = {"KRX": INTRADAY_SESSION_KRX_AFTERMARKET, "NXT": INTRADAY_SESSION_NXT_AFTERMARKET}
+    _bars, _sess_factory, _ticks, _after = _spec16_contract_fakes(tags)
+    _raw_archive_mocks(monkeypatch, tmp_path, _bars)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(
+        archive_intraday, "collect_nxt_aftermarket_bars",
+        _sess_factory(INTRADAY_SESSION_NXT_AFTERMARKET, "NXT"),
+    )
+    monkeypatch.setattr(
+        archive_intraday, "collect_nxt_premarket_bars",
+        _sess_factory(INTRADAY_SESSION_NXT_PREMARKET, "NXT"),
+    )
+    monkeypatch.setattr(
+        archive_intraday, "collect_krx_aftermarket_bars",
+        _sess_factory(INTRADAY_SESSION_KRX_AFTERMARKET, "KRX"),
+    )
+    monkeypatch.setattr(archive_intraday, "collect_aftermarket_trade_ticks", _after)
+
+    with caplog.at_level(logging.INFO, logger=archive_intraday.logger.name):
+        archive_intraday.run_intraday_archive(
+            snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="aftermarket"
+        )
+
+    stream_records = [rec for rec in caplog.records if "stage=intraday_archive_stream" in rec.getMessage()]
+    assert len(stream_records) == 5
+    keys = {rec.getMessage().split("stream=")[1].split()[0] for rec in stream_records}
+    assert keys == {"nxt_after", "nxt_pre", "krx_after", "krx_after_ticks", "nxt_after_ticks"}
+    for rec in stream_records:
+        message = rec.getMessage()
+        for field in ("status=", "targets=", "entries=", "rows="):
+            assert field in message
+    assert not any("stage=krx_aftermarket" in rec.getMessage() for rec in caplog.records)
+    assert not any("stage=aftermarket_ticks" in rec.getMessage() for rec in caplog.records)
+
+
+def test_archive_phase_complete_matches_stream_table(tmp_path) -> None:
+    import datetime as _dt
+
+    from src.daily import archive_intraday
+    from src.data.capture_contracts import CaptureDataset
+
+    for target_date in ("2026-09-10", "2026-09-20", "2026-10-01"):
+        for phase in ("regular", "aftermarket", "all"):
+            phases = {"regular", "aftermarket"} if phase == "all" else {phase}
+            required = [
+                (s.dataset, s.session)
+                for s in archive_intraday._STREAMS
+                if s.phase in phases
+                and (s.required_from is None or str(target_date) >= s.required_from)
+            ]
+            assert required != []
+            store = _archive_store(tmp_path / f"cap-{target_date}-{phase}")
+            for idx, (dataset, session) in enumerate(required):
+                _publish_evening_manifest(store, target_date, dataset, session, "COMPLETE", f"s{idx}")
+            assert archive_intraday.archive_phase_complete(store, target_date, phase) is True
+            for drop_idx in range(len(required)):
+                pruned = _archive_store(tmp_path / f"cap-{target_date}-{phase}-drop{drop_idx}-{_dt.datetime.now().microsecond}")
+                for idx, (dataset, session) in enumerate(required):
+                    if idx == drop_idx:
+                        continue
+                    _publish_evening_manifest(pruned, target_date, dataset, session, "COMPLETE", f"s{idx}")
+                assert archive_intraday.archive_phase_complete(pruned, target_date, phase) is False
+

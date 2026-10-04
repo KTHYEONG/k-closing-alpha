@@ -432,24 +432,28 @@ def test_stale_env_names_ignored(monkeypatch) -> None:
     assert not hasattr(settings, "CONFIGS_DIR")
 
 
-def test_indicators_module_uses_data_key_client_once() -> None:
-    import ast
+def test_live_vkospi_path_uses_composite_code_without_legacy_index_module() -> None:
     from pathlib import Path
 
-    tree = ast.parse(Path("src/api/kis/indicators.py").read_text(encoding="utf-8"))
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "KisApiClient"
-    ]
-    assert len(calls) == 1
-    (call,) = calls
-    assert call.args == []
-    assert len(call.keywords) == 1
-    (kw,) = call.keywords
-    assert kw.arg is None
-    assert isinstance(kw.value, ast.Call)
-    assert isinstance(kw.value.func, ast.Name)
-    assert kw.value.func.id == "kis_data_client_kwargs"
+    legacy = Path("src") / "api" / "kis" / "indicators.py"
+    assert not legacy.exists()
+
+
+def test_broker_transport_dead_symbols_are_absent_but_live_siblings_remain() -> None:
+    import importlib
+
+    rate_limit = importlib.import_module("src.api.kis.rate_limit")
+    for name in ("AsyncRateLimiter", "get_shared_rate_limiter", "_SHARED_RATE_LIMITERS"):
+        assert not hasattr(rate_limit, name), f"src.api.kis.rate_limit.{name} should be deleted"
+
+    toss_client = importlib.import_module("src.api.toss.client")
+    assert not hasattr(toss_client, "TossResponseError"), "TossResponseError should be deleted"
+
+    assert importlib.import_module("src.backfill.kis_flow_backfill").AsyncRateLimiter is not None
+    assert rate_limit.HostPacedRateLimiter is not None
+    assert importlib.import_module("src.api._common").parse_expires_in is not None
+
+    for mod_name in ("src.api.kiwoom.client", "src.api.ls.client"):
+        mod = importlib.import_module(mod_name)
+        for name in ("_deadline_remaining", "_validate_target_ymd"):
+            assert not hasattr(mod, name), f"{mod_name}.{name} should live only in src.api._common"

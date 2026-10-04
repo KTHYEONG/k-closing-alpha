@@ -1,4 +1,8 @@
-"""Feature manifest deterministic port."""
+"""Name-heuristic feature manifest for the legacy champion dataset (src.ml.dataset).
+
+Units follow engineer_features semantics (e.g. intraday_range in percent of prev_close). Not
+authoritative for the top-k ranker: its bundles carry src.ml.topk_contract.build_topk_feature_manifest.
+"""
 from __future__ import annotations
 
 from collections.abc import Mapping

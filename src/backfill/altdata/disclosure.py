@@ -14,8 +14,9 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
+from typing import Any, cast
 
 import pandas as pd
 import requests
@@ -69,7 +70,7 @@ _OUT_COLS: list[str] = (
 )
 
 
-def _dart_get_json(url: str, params: dict[str, object], cfg: AltDataFetchConfig, *, credential: DartCredential | None = None, on_page: PageObserver | None = None, page_index: int = 0, attempt_index: int = 0) -> dict[str, object]:
+def _dart_get_json(url: str, params: dict[str, str | int], cfg: AltDataFetchConfig, *, credential: DartCredential | None = None, on_page: PageObserver | None = None, page_index: int = 0, attempt_index: int = 0) -> dict[str, Any]:
     """Observe decoded DART list pages before status validation and count aggregation.
 
     Args:
@@ -117,7 +118,7 @@ def _dart_get_json(url: str, params: dict[str, object], cfg: AltDataFetchConfig,
             if status in _DART_REJECTED_STATUS:
                 raise _DartKeyStatusError(status)
             raise RuntimeError(msg)
-    return data  # type: ignore[return-value]
+    return cast(dict[str, Any], data)
 
 
 def _extract_error_status(content: bytes) -> str | None:
@@ -193,7 +194,7 @@ def _iter_windows(start: pd.Timestamp, end: pd.Timestamp) -> list[tuple[str, str
 
 
 def _parse_items(
-    lst: list[object], corp_to_stock: dict[str, str]
+    lst: Sequence[object], corp_to_stock: dict[str, str]
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for item in lst:
@@ -219,7 +220,7 @@ _MAX_PAGES_PER_BUCKET = 10_001
 
 def _fetch_list_page(
     cfg: AltDataFetchConfig,
-    base_params: dict[str, object],
+    base_params: dict[str, str | int],
     page_no: int,
     *,
     on_page: PageObserver | None = None,
@@ -230,7 +231,7 @@ def _fetch_list_page(
     params = {**base_params, "page_no": page_no}
     state = {"attempt": 0}
 
-    def _call() -> dict[str, object]:
+    def _call() -> dict[str, Any]:
         while True:
             credential = pool.current()
             attempt = state["attempt"]
@@ -256,7 +257,7 @@ def _fetch_list_page(
         tp = int(data["total_page"]) if data.get("total_page") is not None else None
     except (TypeError, ValueError, KeyError):
         tp = None
-    return lst, tp  # type: ignore[return-value]
+    return lst, tp
 
 
 def _fetch_disclosure_window(
@@ -272,7 +273,7 @@ def _fetch_disclosure_window(
     """단일 (공시유형, ≤3개월 창) 목록을 1페이지 조회 후 나머지 페이지를 병렬 수집합니다."""
     from concurrent.futures import ThreadPoolExecutor
 
-    base_params: dict[str, object] = {
+    base_params: dict[str, str | int] = {
         "bgn_de": start_ymd,
         "end_de": end_ymd,
         "pblntf_ty": pblntf_ty,

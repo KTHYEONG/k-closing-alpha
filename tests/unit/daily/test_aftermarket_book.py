@@ -7,6 +7,8 @@ import datetime as dt
 from pathlib import Path
 from typing import Any
 
+from src.execution.paper_broker import HeldRoster, load_held_roster
+
 
 def _seoul(year: int, month: int, day: int, hour: int, minute: int, second: int = 0) -> dt.datetime:
     from src.data.capture_contracts import SEOUL
@@ -214,7 +216,7 @@ def test_dense_universe_combines_rank_pool_and_positions(tmp_path: Path, monkeyp
     _publish_cohort(store, "2026-09-29", ["000005"])
     now = _seoul(2026, 9, 29, 15, 35)
 
-    dense, sparse = resolve_book_universes("2026-09-29", store=store, now=now, rank_pool_path=pool_path)
+    dense, sparse = resolve_book_universes("2026-09-29", store=store, now=now, held=load_held_roster(), rank_pool_path=pool_path)
 
     assert dense == ("000001", "000002", "000004")
     assert sparse == ("000001", "000002", "000004", "000005")
@@ -232,7 +234,7 @@ def test_missing_rank_pool_falls_back_to_positions_with_warning(tmp_path: Path, 
 
     with caplog.at_level(logging.WARNING, logger="src.daily.aftermarket_book"):
         dense, sparse = resolve_book_universes(
-            "2026-09-29", store=store, now=now, rank_pool_path=tmp_path / "absent.parquet"
+            "2026-09-29", store=store, now=now, rank_pool_path=tmp_path / "absent.parquet", held=load_held_roster()
         )
 
     assert dense == ("000004",)
@@ -253,42 +255,46 @@ def test_empty_or_malformed_rank_pool_falls_back_to_positions(tmp_path: Path, mo
 
     empty_path = tmp_path / "empty.parquet"
     pd.DataFrame([{"symbol": "000001"}]).iloc[0:0].to_parquet(empty_path, index=False)
-    dense, _ = resolve_book_universes("2026-09-29", store=store, now=now, rank_pool_path=empty_path)
+    dense, _ = resolve_book_universes("2026-09-29", store=store, now=now, held=load_held_roster(), rank_pool_path=empty_path)
     assert dense == ("000004",)
 
     drifted_path = tmp_path / "drifted.parquet"
     pd.DataFrame([{"weird": 1}]).to_parquet(drifted_path, index=False)
-    dense, _ = resolve_book_universes("2026-09-29", store=store, now=now, rank_pool_path=drifted_path)
+    dense, _ = resolve_book_universes("2026-09-29", store=store, now=now, held=load_held_roster(), rank_pool_path=drifted_path)
     assert dense == ("000004",)
 
     stale_path = tmp_path / "stale.parquet"
     _write_rank_pool(stale_path, [{"symbol": "000001", "decision_date": "2026-09-28", "pred": 0.5}])
-    dense, _ = resolve_book_universes("2026-09-29", store=store, now=now, rank_pool_path=stale_path)
+    dense, _ = resolve_book_universes("2026-09-29", store=store, now=now, held=load_held_roster(), rank_pool_path=stale_path)
     assert dense == ("000004",)
 
     blank_path = tmp_path / "blank.parquet"
     _write_rank_pool(blank_path, [{"symbol": "", "decision_date": "2026-09-29", "pred": 0.5}])
-    dense, _ = resolve_book_universes("2026-09-29", store=store, now=now, rank_pool_path=blank_path)
+    dense, _ = resolve_book_universes("2026-09-29", store=store, now=now, held=load_held_roster(), rank_pool_path=blank_path)
     assert dense == ("000004",)
 
 
-def test_positions_unavailable_yields_empty_dense(tmp_path: Path, monkeypatch: Any) -> None:
-    """Unreadable ledgers degrade to an empty dense universe."""
+def test_positions_unavailable_yields_empty_dense(tmp_path: Path, caplog: Any) -> None:
+    """Unreadable ledgers degrade to an empty dense universe with an INCOMPLETE warning."""
+    import logging
 
-    class _BrokenLedger:
-        def load_open_positions(self) -> Any:
-            raise OSError("locked")
-
-    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", _BrokenLedger)
     store = _store(tmp_path)
     now = _seoul(2026, 9, 29, 15, 35)
 
     from src.daily.aftermarket_book import resolve_book_universes
 
-    dense, sparse = resolve_book_universes("2026-09-29", store=store, now=now, rank_pool_path=tmp_path / "absent.parquet")
+    with caplog.at_level(logging.WARNING, logger="src.daily.aftermarket_book"):
+        dense, sparse = resolve_book_universes(
+            "2026-09-29",
+            store=store,
+            now=now,
+            rank_pool_path=tmp_path / "absent.parquet",
+            held=HeldRoster((), False, "OSError"),
+        )
 
     assert dense == ()
     assert sparse == ()
+    assert "status=INCOMPLETE reason=held_roster_unavailable error=OSError" in caplog.text
 
 
 def _unlisted_handler(div: str | None, code: str) -> dict[str, Any]:
@@ -762,3 +768,101 @@ def test_nxt_listing_requires_both_empty_acceptance_and_zero_price() -> None:
     assert _is_nxt_listed({"rt_cd": "0", "output1": {"aspr_acpt_hour": ""}, "output2": {"stck_prpr": "8,390"}}) is True
     assert _is_nxt_listed({"rt_cd": "0", "output1": {"aspr_acpt_hour": "154100"}, "output2": {"stck_prpr": "0"}}) is True
     assert _is_nxt_listed({"rt_cd": "0", "output1": {"aspr_acpt_hour": None}, "output2": {"stck_prpr": "n/a"}}) is False
+
+
+def test_roster_incomplete_forces_partial_manifests(tmp_path: Path) -> None:
+    """A not-ok roster forces every manifest PARTIAL while entries stay untouched."""
+    from src.daily.aftermarket_book import run_aftermarket_book_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    profile = _profile(tmp_path)
+    store = _store(tmp_path)
+    client = _StubClient()
+    now = [_seoul(2026, 9, 29, 15, 30)]
+    symbols = ("000001",)
+
+    manifests = _run(
+        run_aftermarket_book_capture(
+            "2026-09-29",
+            profile=profile,
+            store=store,
+            clients=[client],
+            dense_symbols=symbols,
+            sparse_symbols=symbols,
+            roster_incomplete=True,
+            now_fn=lambda: now[0],
+        )
+    )
+
+    assert manifests
+    assert all(m.status == CaptureStatus.PARTIAL for m in manifests)
+    entries = [e for m in manifests for e in m.entries]
+    assert entries and all(e.status == CaptureStatus.COMPLETE for e in entries)
+
+
+def test_roster_complete_keeps_entry_rule(tmp_path: Path) -> None:
+    """A fully known roster leaves the entry-driven COMPLETE rule intact."""
+    from src.daily.aftermarket_book import run_aftermarket_book_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    profile = _profile(tmp_path)
+    store = _store(tmp_path)
+    client = _StubClient()
+    now = [_seoul(2026, 9, 29, 15, 30)]
+    symbols = ("000001",)
+
+    manifests = _run(
+        run_aftermarket_book_capture(
+            "2026-09-29",
+            profile=profile,
+            store=store,
+            clients=[client],
+            dense_symbols=symbols,
+            sparse_symbols=symbols,
+            roster_incomplete=False,
+            now_fn=lambda: now[0],
+        )
+    )
+
+    assert manifests
+    assert all(m.status == CaptureStatus.COMPLETE for m in manifests)
+
+
+def test_run_async_propagates_ledger_failure(tmp_path: Path, monkeypatch: Any, caplog: Any) -> None:
+    """_run_async with a broken ledger still publishes, but every manifest is PARTIAL."""
+    import logging
+
+    import src.daily.aftermarket_book as book
+    from src.data.capture_contracts import CaptureStatus
+
+    profile = _profile(tmp_path, COLLECTION_AFTERMARKET_BOOK_SLOTS=("2", "3"))
+    monkeypatch.setattr("src.api.kis.client.KisApiClient", _StubClient)
+    monkeypatch.setenv("KIS_DATA_SLOTS", "2,3")
+    monkeypatch.setenv("KIS_DATA_2_APP_KEY", "key-2")
+    monkeypatch.setenv("KIS_DATA_2_APP_SECRET", "secret-2")
+    monkeypatch.setenv("KIS_DATA_3_APP_KEY", "key-3")
+    monkeypatch.setenv("KIS_DATA_3_APP_SECRET", "secret-3")
+
+    async def _trading_day(client: Any, session: Any, snapshot_date: str) -> bool:
+        return True
+
+    monkeypatch.setattr(book, "is_kis_trading_day", _trading_day)
+    monkeypatch.setattr(book.settings, "PARQUET_DIR", tmp_path / "parquet")
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-23", ["000001"])
+    pool_path = tmp_path / "parquet" / "rank_pool_predictions.parquet"
+    pool_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_rank_pool(pool_path, [{"symbol": "000001", "decision_date": "2026-09-23", "pred": 0.9}])
+
+    def _boom_ledger(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("locked")
+
+    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", _boom_ledger)
+
+    with caplog.at_level(logging.WARNING, logger="src.daily.aftermarket_book"):
+        manifests = _run(book._run_async("2026-09-23", profile))
+
+    assert manifests
+    assert all(m.status == CaptureStatus.PARTIAL for m in manifests)
+    assert "reason=held_roster_unavailable" in caplog.text

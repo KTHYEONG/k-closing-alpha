@@ -8,10 +8,8 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import logging
-import os
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
@@ -60,6 +58,7 @@ from src.data.capture_store import (
     resolve_capture_root as _capture_root,
 )
 from src.data.intraday_store import intraday_partition_path, tick_partition_path
+from src.data.io_utils import atomic_write_text
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.tick_bar_consistency import TickBarRelation, classify_tick_bar_volume
 from src.data.trading_calendar import (
@@ -1208,16 +1207,7 @@ def write_audit_heartbeat(
         "undelivered_alerts": undelivered_alerts,
         "finished_at": finished_at.isoformat(),
     }
-    tmp = target.parent / f"{target.name}.tmp"
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, target)
-        os.chmod(target, 0o644)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+    atomic_write_text(target, json.dumps(payload, ensure_ascii=False), mode=0o644)
     return target
 
 

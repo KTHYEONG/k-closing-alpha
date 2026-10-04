@@ -78,6 +78,29 @@ def test_kiwoom_token_protected_windows_reject_invalid_entries() -> None:
             KiwoomSettings(KIWOOM_TOKEN_PROTECTED_WINDOWS=(bad,))
 
 
+def test_kiwoom_retry_settings_defaults(monkeypatch) -> None:
+    from src.config.kiwoom import KiwoomSettings
+
+    _hermetic_env(monkeypatch)
+
+    settings = KiwoomSettings()
+
+    assert settings.KIWOOM_RATE_LIMIT_MAX_RETRIES == 3
+    assert settings.KIWOOM_RATE_LIMIT_BACKOFF_SECONDS == 1.2
+
+
+def test_kiwoom_retry_settings_validate_bounds() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from src.config.kiwoom import KiwoomSettings
+
+    with pytest.raises(ValidationError):
+        KiwoomSettings(KIWOOM_RATE_LIMIT_MAX_RETRIES=0)
+    with pytest.raises(ValidationError):
+        KiwoomSettings(KIWOOM_RATE_LIMIT_BACKOFF_SECONDS=0)
+
+
 def test_kiwoom_token_protected_windows_accept_env_string_spellings() -> None:
     from src.config.kiwoom import KiwoomSettings
 

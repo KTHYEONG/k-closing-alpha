@@ -366,8 +366,20 @@ def test_core_snapshot_bundle_scratch_files_are_untracked(tmp_path: Path) -> Non
     assert is_tracked_core_relpath("artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib.bak") is False
     assert is_tracked_core_relpath("artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib") is True
     assert is_tracked_core_relpath("data/history/other.parquet") is False
-    stats = {s.relpath for s in collect_core_stats(tmp_path)}
-    assert "artifacts/models/topk_ranker/sizing_pipeline_bundle.joblib.bak" not in stats
+
+
+def test_core_snapshot_atomic_temp_is_not_a_core_path(tmp_path: Path) -> None:
+    import uuid
+
+    from src.tools.core_snapshot import core_panel_paths, is_tracked_core_relpath
+
+    staged = tmp_path / f"data/paper/stage-ledger.parquet.{uuid.uuid4().hex}.tmp"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(b"in-flight")
+
+    rels = [p.relative_to(tmp_path).as_posix() for p in core_panel_paths(tmp_path)]
+    assert staged.relative_to(tmp_path).as_posix() not in rels
+    assert is_tracked_core_relpath(staged.relative_to(tmp_path).as_posix()) is False
 
 
 def test_core_snapshot_untracked_previous_entry_reports_no_missing() -> None:

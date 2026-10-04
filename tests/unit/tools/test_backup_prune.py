@@ -338,3 +338,33 @@ def test_backup_prune_max_purge_override_is_forwarded(monkeypatch) -> None:
     backup_prune.main(["--dry-run"])
     assert seen["dry_run"] is True
     assert seen["sealed_dry_run"] is True
+
+
+def test_skipped_sealed_prune_is_not_a_failure(monkeypatch, caplog) -> None:
+    import logging
+
+    from src.tools import backup_prune
+
+    def _fake_remote(*, today, **kwargs):
+        return []
+
+    def _fake_local(*, today, **kwargs):
+        return []
+
+    import src.tools.capture_offsite as capture_offsite
+
+    def _fake_sealed(capture_root, *, today, **kwargs):
+        return capture_offsite.LocalRetentionReport(
+            removed=(), kept=(), bytes_removed=0, skipped_reason="seal_lock_held"
+        )
+
+    monkeypatch.setattr(backup_prune, "prune_backups", _fake_remote)
+    monkeypatch.setattr(backup_prune, "prune_local_intraday_backups", _fake_local)
+    monkeypatch.setattr(backup_prune, "prune_local_sealed_capture", _fake_sealed)
+
+    with caplog.at_level(logging.INFO, logger="src.tools.backup_prune"):
+        backup_prune.main([])
+
+    summary = [r for r in caplog.records if "stage=backup_prune" in r.getMessage() and "dry_run=" in r.getMessage()]
+    assert len(summary) == 1
+    assert "sealed_skipped=seal_lock_held" in summary[0].getMessage()

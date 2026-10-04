@@ -584,7 +584,9 @@ def test_validate_trading_day_blocks_non_trading_day_and_honours_force(monkeypat
         return _fn
 
     # Given: 비거래일
-    monkeypatch.setattr(collect, "is_kis_trading_day", _oracle(False))
+    _shared_oracle = _oracle(False)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     with pytest.raises(collect.NonTradingDayError):
         asyncio.run(collect._validate_trading_day(object(), object(), "2026-09-05"))
     assert calls["n"] == 1
@@ -594,7 +596,9 @@ def test_validate_trading_day_blocks_non_trading_day_and_honours_force(monkeypat
     assert calls["n"] == 1
 
     # And: 거래일은 통과
-    monkeypatch.setattr(collect, "is_kis_trading_day", _oracle(True))
+    _shared_oracle = _oracle(True)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     asyncio.run(collect._validate_trading_day(object(), object(), "2026-09-10"))
     assert calls["n"] == 2
 
@@ -843,7 +847,9 @@ def test_main_skips_cleanly_on_non_trading_day(monkeypatch) -> None:
     monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
-    monkeypatch.setattr(collect, "is_kis_trading_day", _holiday)
+    _shared_oracle = _holiday
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     never_called = AsyncMock()
     monkeypatch.setattr(collect, "resolve_daily_candidates", never_called)
 
@@ -1105,7 +1111,9 @@ def test_main_filters_candidates_by_eligibility_before_quoting(monkeypatch) -> N
     monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
-    monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
+    _shared_oracle = _trading_day
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(collect, "resolve_daily_candidates", AsyncMock(return_value=scanned))
     monkeypatch.setattr(collect, "load_eligible_codes", _eligible)
     monkeypatch.setattr(collect, "load_security_classification", lambda *a, **k: frozenset({"005930", "138930", "0220W0", "000660", "500041"}))
@@ -1161,7 +1169,9 @@ def test_main_fails_closed_when_eligibility_panel_is_stale(monkeypatch) -> None:
     monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
-    monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
+    _shared_oracle = _trading_day
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(
         collect,
         "resolve_daily_candidates",
@@ -1272,7 +1282,9 @@ def test_resolve_prev_trading_day_kis_skips_weekend_and_kis_holiday(monkeypatch)
         asked.append(pd.Timestamp(date))
         return pd.Timestamp(date) != pd.Timestamp("2026-09-11")
 
-    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+    _shared_oracle = _kis
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
 
     # When: 월요일 결정, 금요일(9/11) 휴장
     prev = asyncio.run(collect.resolve_prev_trading_day_kis(object(), object(), pd.Timestamp("2026-09-14")))
@@ -1299,7 +1311,9 @@ def test_resolve_prev_trading_day_kis_falls_back_to_krx_when_kis_oracle_fails(mo
         krx_asked.append(pd.Timestamp(date))
         return True
 
-    monkeypatch.setattr(collect, "is_kis_trading_day", _kis_down)
+    _shared_oracle = _kis_down
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
 
     # When
     with caplog.at_level(logging.WARNING, logger="src.daily.collect"):
@@ -1328,7 +1342,9 @@ def test_resolve_prev_trading_day_kis_fails_closed_when_both_oracles_fail_or_no_
     def _krx_down(_date):
         raise RuntimeError("krx down")
 
-    monkeypatch.setattr(collect, "is_kis_trading_day", _kis_down)
+    _shared_oracle = _kis_down
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
 
     # When / Then: 두 오라클 모두 실패
     with pytest.raises(RuntimeError, match="krx down"):
@@ -1339,7 +1355,9 @@ def test_resolve_prev_trading_day_kis_fails_closed_when_both_oracles_fail_or_no_
     async def _always_closed(_client, _session, _date):
         return False
 
-    monkeypatch.setattr(collect, "is_kis_trading_day", _always_closed)
+    _shared_oracle = _always_closed
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
 
     # When / Then: 조회 한도 내 거래일 없음
     with pytest.raises(ValueError, match="no trading day"):
@@ -1378,7 +1396,9 @@ def test_resolve_eligible_codes_passes_kis_resolved_prev_day_to_panel_lookup(mon
         calls.append((decision_date, prev_trading_day))
         return frozenset({"005930"})
 
-    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+    _shared_oracle = _kis
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(collect, "load_eligible_codes", _load)
     monkeypatch.setattr(collect, "load_security_classification", lambda *a, **k: frozenset({"005930", "138930", "0220W0", "000660", "500041"}))
 
@@ -1443,7 +1463,9 @@ def test_main_resolves_previous_trading_day_through_kis_before_eligibility(monke
     monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
-    monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
+    _shared_oracle = _trading_day
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(
         collect,
         "resolve_daily_candidates",
@@ -1653,7 +1675,9 @@ def test_resolve_prev_trading_day_kis_uses_default_krx_oracle_on_kis_failure(mon
     async def _kis_down(_client, _session, _date):
         raise RuntimeError("KIS trading-day oracle failed rt_cd=9")
 
-    monkeypatch.setattr(collect, "is_kis_trading_day", _kis_down)
+    _shared_oracle = _kis_down
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(trading_calendar, "is_krx_trading_day", lambda _date: True)
 
     # When: krx_is_trading_day 미지정
@@ -1736,7 +1760,9 @@ def test_resolve_eligible_codes_returns_all_listed_codes_without_history_filter(
     async def _kis(_client, _session, _date):
         return True
 
-    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+    _shared_oracle = _kis
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(
         collect, "load_eligible_codes", lambda decision_date, *, prev_trading_day, path=None: frozenset({"005930", "138930", "0220W0"})
     )
@@ -2069,7 +2095,9 @@ def test_main_issues_shard_token_and_fans_out_to_sharded_collect(monkeypatch) ->
     monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
-    monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
+    _shared_oracle = _trading_day
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(
         collect,
         "resolve_daily_candidates",
@@ -2468,7 +2496,7 @@ def _healthy_wide_row(code="005930", quote_failed=False):
     }
 
 
-def _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, eligible, *, with_snapshot=False, call_observer=False):
+def _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, eligible, *, with_snapshot=False, call_observer=False, index_rate=None, history_payload=None, history_calls=None):
     import asyncio
     from datetime import datetime
     from unittest.mock import AsyncMock
@@ -2481,6 +2509,8 @@ def _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, eligible, *, with
         def now(cls, tz=None):
             return datetime(2026, 9, 14, 15, 20, 5, tzinfo=tz)
 
+    _history_log = history_calls if history_calls is not None else []
+
     class _FakeKis:
         def __init__(self, *args, **kwargs):
             pass
@@ -2489,7 +2519,15 @@ def _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, eligible, *, with
             return None
 
         async def get_market_index_rate(self, session, code):
+            if index_rate is not None:
+                return dict(index_rate)
             return {"rt_cd": "1"}
+
+        async def get_market_index_history(self, session, code, start, end):
+            _history_log.append((code, start, end))
+            if history_payload is not None:
+                return history_payload
+            return {"rt_cd": "0", "output2": []}
 
     async def _trading_day(_client, _session, _date):
         return True
@@ -2522,18 +2560,14 @@ def _run_main_with_mocks(monkeypatch, tmp_path, rows, scanned, eligible, *, with
     monkeypatch.setattr(collect, "kis_decision_shard_client_kwargs", lambda: [{}])
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
-    monkeypatch.setattr(collect, "is_kis_trading_day", _trading_day)
+    _shared_oracle = _trading_day
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(collect, "resolve_daily_candidates", _fake_scan)
     monkeypatch.setattr(collect, "resolve_eligible_codes", AsyncMock(return_value=eligible))
     monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _fake_sharded)
     monkeypatch.setattr(collect, "persist_daily_snapshot", lambda df, snapshot_date=None: len(df))
     monkeypatch.setattr(collect, "_capture_root", lambda: tmp_path / "capture")
-    import src.api.kis.indicators as indicators_mod
-
-    async def _no_vol(*args, **kwargs):
-        raise RuntimeError("no vol")
-
-    monkeypatch.setattr(indicators_mod, "fetch_index_and_calculate_volatility", _no_vol)
     import src.data.panel_integrity as panel_mod
 
     def _no_panel(*args, **kwargs):
@@ -2751,7 +2785,9 @@ def test_resolve_eligible_codes_narrows_to_screenable_subset(monkeypatch) -> Non
     async def _kis(_client, _session, _date):
         return True
 
-    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+    _shared_oracle = _kis
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(
         collect, "load_eligible_codes", lambda decision_date, *, prev_trading_day, path=None: frozenset({"A", "B", "C"})
     )
@@ -2776,7 +2812,9 @@ def test_resolve_eligible_codes_fails_on_classification_coverage_gap(monkeypatch
     def _stale(decision_date, *, prev_trading_day, path=None):
         raise ValueError("stale security_classification: no rows on prev_trading_day=2026-09-11")
 
-    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+    _shared_oracle = _kis
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(
         collect, "load_eligible_codes", lambda decision_date, *, prev_trading_day, path=None: frozenset({"A"})
     )
@@ -2799,7 +2837,9 @@ def test_resolve_eligible_codes_fails_on_missing_classification_panel(monkeypatc
     def _missing(decision_date, *, prev_trading_day, path=None):
         raise FileNotFoundError("security_classification not found")
 
-    monkeypatch.setattr(collect, "is_kis_trading_day", _kis)
+    _shared_oracle = _kis
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(
         collect, "load_eligible_codes", lambda decision_date, *, prev_trading_day, path=None: frozenset({"A"})
     )
@@ -3056,7 +3096,9 @@ def _stub_collect_main(monkeypatch, *, kis_trading_day: bool):
     monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
     monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
     monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
-    monkeypatch.setattr(collect, "is_kis_trading_day", AsyncMock(return_value=kis_trading_day))
+    _shared_oracle = AsyncMock(return_value=kis_trading_day)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
     monkeypatch.setattr(collect, "KisApiClient", _FakeKisClient)
     recorded: list = []
     monkeypatch.setattr(
@@ -3128,3 +3170,551 @@ def test_collect_force_bypasses_oracle(monkeypatch) -> None:
         asyncio.run(collect.main(force=True))
 
     assert recorded == []
+
+
+def test_parse_market_index_level_fails_closed() -> None:
+    from src.daily.collect import parse_market_index_level
+
+    assert parse_market_index_level({"rt_cd": "0", "output1": {"bstp_nmix_prpr": "2,800.50"}}) == 2800.50
+    assert parse_market_index_level({"rt_cd": "1", "output1": {"bstp_nmix_prpr": "2800.50"}}) is None
+    assert parse_market_index_level({"rt_cd": "0"}) is None
+    assert parse_market_index_level({"rt_cd": "0", "output1": {}}) is None
+    assert parse_market_index_level({"rt_cd": "0", "output1": {"bstp_nmix_prpr": ""}}) is None
+    assert parse_market_index_level({"rt_cd": "0", "output1": {"bstp_nmix_prpr": "   "}}) is None
+    assert parse_market_index_level({"rt_cd": "0", "output1": {"bstp_nmix_prpr": "0"}}) is None
+    assert parse_market_index_level({"rt_cd": "0", "output1": {"bstp_nmix_prpr": "-12.5"}}) is None
+    assert parse_market_index_level({"rt_cd": "0", "output1": {"bstp_nmix_prpr": "abc"}}) is None
+    assert parse_market_index_level({"rt_cd": "0", "output1": {"bstp_nmix_prpr": "nan"}}) is None
+    assert parse_market_index_level({"rt_cd": "0", "output1": {"bstp_nmix_prpr": "inf"}}) is None
+    assert parse_market_index_level(None) is None
+    assert parse_market_index_level({"rt_cd": "0", "output1": {"bstp_nmix_prpr": "0.0"}}) is None
+
+
+def test_main_marks_index_failed_when_live_level_missing(tmp_path, monkeypatch, caplog) -> None:
+    """Index failure reaches the sleeve as NaN + 지수_실패 without a history call."""
+    import logging
+    import math
+    from pathlib import Path
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    rows = [_healthy_wide_row("005930"), _healthy_wide_row("000660")]
+    scanned = [
+        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+    ]
+    history_calls: list = []
+    with caplog.at_level(logging.WARNING, logger=collect.logger.name):
+        _run_main_with_mocks(
+            monkeypatch, tmp_path, rows, scanned, frozenset({"005930", "000660"}),
+            with_snapshot=True,
+            history_calls=history_calls,
+        )
+    stored = list(Path(tmp_path / "capture" / "decision").rglob("input.parquet"))
+    assert stored != []
+    frame = pd.read_parquet(stored[0])
+    assert all(math.isnan(v) for v in frame["v_kospi"].tolist())
+    assert frame["지수_실패"].tolist() == [True] * len(frame)
+    assert history_calls == []
+    assert any(
+        rec.levelno >= logging.WARNING and "stage=index_vkospi" in rec.getMessage() and "status=FAILED" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_main_attaches_training_definition_vkospi(tmp_path, monkeypatch) -> None:
+    """Healthy path publishes the training-definition value unrounded."""
+    from pathlib import Path
+
+    import numpy as np
+    import pandas as pd
+
+    from src.daily.price_ingest import compute_live_vkospi
+
+    days = pd.bdate_range(end="2026-09-11", periods=30)
+    closes = [round(float(v), 2) for v in 2600.0 * np.cumprod(1 + 0.001 * np.sin(np.arange(30)))]
+    live_level = round(closes[-1] * 1.004, 2)
+    history_payload = {
+        "rt_cd": "0",
+        "output2": [
+            {"stck_bsop_date": d.strftime("%Y%m%d"), "bstp_nmix_prpr": f"{c:.2f}"}
+            for d, c in zip(reversed(days), reversed(closes), strict=True)
+        ],
+    }
+    index_rate = {"rt_cd": "0", "output1": {"bstp_nmix_prpr": f"{live_level:.2f}", "bstp_nmix_prdy_ctrt": "0.40"}}
+    rows = [_healthy_wide_row("005930"), _healthy_wide_row("000660")]
+    scanned = [
+        {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+        {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+    ]
+    history_calls: list = []
+    _run_main_with_mocks(
+        monkeypatch, tmp_path, rows, scanned, frozenset({"005930", "000660"}),
+        with_snapshot=True,
+        index_rate=index_rate,
+        history_payload=history_payload,
+        history_calls=history_calls,
+    )
+    stored = list(Path(tmp_path / "capture" / "decision").rglob("input.parquet"))
+    assert stored != []
+    frame = pd.read_parquet(stored[0])
+    past = pd.DataFrame({"date": days, "close": closes})
+    expected = compute_live_vkospi(past, live_level, pd.Timestamp("2026-09-14"))
+    assert frame["v_kospi"].tolist() == [expected] * len(frame)
+    assert frame["v_kospi"].iloc[0] == pd.Series([expected]).iloc[0]
+    assert abs(frame["v_kospi"].iloc[0] - expected) / expected < 1e-12
+    assert frame["지수_실패"].tolist() == [False] * len(frame)
+    assert len(history_calls) == 1
+    assert history_calls[0][0] == "0001"
+    assert history_calls[0][2] == "20260913"
+
+
+def _constant_vkospi(value):
+    async def _fetch(_level):
+        return value
+
+    return _fetch
+
+
+def _assemble_kwargs(**overrides):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    params = {
+        "snapshot_date": "2026-09-14",
+        "kospi_rate": 0.5,
+        "kosdaq_rate": 0.3,
+        "kospi_level": 2650.5,
+        "fetch_vkospi": _constant_vkospi(17.5),
+        "load_market_breadth": lambda _d: 0.42,
+        "capture_ts": pd.Timestamp("2026-09-14 15:20:03", tz="Asia/Seoul"),
+        "completion_clock": lambda: datetime(2026, 9, 14, 15, 21, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+    }
+    params.update(overrides)
+    return params
+
+
+def test_assemble_decision_frame_flags_failed_market_context() -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    # Given: 지수 실패 + 폭 로더 장애
+    def _raising(_d):
+        raise RuntimeError("no panel")
+
+    rows = [_healthy_wide_row("005930"), _healthy_wide_row("000660")]
+
+    # When
+    assembled = asyncio.run(
+        collect.assemble_decision_frame(rows, **_assemble_kwargs(kospi_rate=None, load_market_breadth=_raising))
+    )
+
+    # Then: NaN + 실패 플래그, 행은 유지
+    assert len(assembled.frame) == 2
+    assert assembled.frame["kospi"].isna().all()
+    assert assembled.frame["지수_실패"].tolist() == [True, True]
+    assert assembled.frame["market_breadth"].isna().all()
+    assert assembled.frame["시장폭_실패"].tolist() == [True, True]
+    assert assembled.status is not None
+
+
+def test_assemble_decision_frame_nan_breadth_sets_flag() -> None:
+    import asyncio
+
+    from src.daily import collect
+
+    # Given: NaN 폭
+    nan_run = asyncio.run(
+        collect.assemble_decision_frame(
+            [_healthy_wide_row("005930")], **_assemble_kwargs(load_market_breadth=lambda _d: float("nan"))
+        )
+    )
+
+    # Then: 실패 플래그
+    assert nan_run.frame["시장폭_실패"].tolist() == [True]
+
+    # Given: 정상 폭
+    ok_run = asyncio.run(collect.assemble_decision_frame([_healthy_wide_row("005930")], **_assemble_kwargs()))
+
+    # Then: 값 유지, 플래그 False
+    assert ok_run.frame["market_breadth"].tolist() == [0.42]
+    assert ok_run.frame["시장폭_실패"].tolist() == [False]
+
+
+def test_assemble_decision_frame_vkospi_failure_sets_index_flag(caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.daily import collect
+
+    # Given: V-KOSPI 조회 실패
+    async def _failing(_level):
+        raise ValueError("vkospi down")
+
+    # When
+    with caplog.at_level(logging.WARNING, logger="src.daily.collect"):
+        assembled = asyncio.run(
+            collect.assemble_decision_frame(
+                [_healthy_wide_row("005930")], **_assemble_kwargs(fetch_vkospi=_failing)
+            )
+        )
+
+    # Then: fail-closed, 예외 없음
+    assert assembled.frame["v_kospi"].isna().all()
+    assert assembled.frame["지수_실패"].tolist() == [True]
+    assert any("stage=index_vkospi" in r.message and "status=FAILED" in r.message for r in caplog.records)
+
+
+def test_assemble_decision_frame_vkospi_success_unrounded(caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.daily import collect
+
+    # Given: 레벨을 기록하는 조회기
+    seen: list = []
+
+    async def _recording(level):
+        seen.append(level)
+        return 17.123456789
+
+    # When
+    with caplog.at_level(logging.INFO, logger="src.daily.collect"):
+        assembled = asyncio.run(
+            collect.assemble_decision_frame(
+                [_healthy_wide_row("005930")],
+                **_assemble_kwargs(kospi_level=2650.5, fetch_vkospi=_recording),
+            )
+        )
+
+    # Then: 레벨 전달 1회, 무반올림, 성공 로그
+    assert seen == [2650.5]
+    assert assembled.frame["v_kospi"].tolist() == [17.123456789]
+    assert assembled.frame["지수_실패"].tolist() == [False]
+    assert any("stage=index_vkospi" in r.message and "status=OK" in r.message for r in caplog.records)
+
+
+def test_assemble_decision_frame_fills_missing_snapshot_timestamp() -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    # Given: 한 행만 snapshot_timestamp 보유
+    present = pd.Timestamp("2026-09-14 15:20:01", tz="Asia/Seoul")
+    with_ts = _healthy_wide_row("005930") | {"snapshot_timestamp": present}
+    rows = [with_ts, _healthy_wide_row("000660")]
+    capture_ts = pd.Timestamp("2026-09-14 15:20:03", tz="Asia/Seoul")
+
+    # When
+    assembled = asyncio.run(collect.assemble_decision_frame(rows, **_assemble_kwargs(capture_ts=capture_ts)))
+
+    # Then: 결측만 capture_ts로, 기존 값 유지
+    stamps = assembled.frame.set_index("종목코드")["snapshot_timestamp"]
+    assert pd.Timestamp(stamps.loc["000660"]) == capture_ts
+    assert pd.Timestamp(stamps.loc["005930"]) == present
+
+
+def test_assemble_decision_frame_reads_completion_clock_once() -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    # Given: 계수 시계
+    calls = {"n": 0}
+    completed = datetime(2026, 9, 14, 15, 21, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    def _counting():
+        calls["n"] += 1
+        return completed
+
+    capture_ts = pd.Timestamp("2026-09-14 15:20:03", tz="Asia/Seoul")
+    rows = [_healthy_wide_row("005930"), _healthy_wide_row("000660")]
+
+    # When
+    assembled = asyncio.run(collect.assemble_decision_frame(rows, **_assemble_kwargs(capture_ts=capture_ts, completion_clock=_counting)))
+
+    # Then: 1회 판독, 전 행 공유, capture 이후
+    assert calls["n"] == 1
+    assert assembled.completed_at == completed
+    assert assembled.frame["feature_available_timestamp"].tolist() == [completed, completed]
+    assert assembled.completed_at >= capture_ts
+
+
+def test_assemble_decision_frame_returns_partial_without_raising() -> None:
+    import asyncio
+
+    from src.daily import collect
+    from src.data.capture_contracts import CaptureStatus
+
+    # Given: 100행 중 2행 시세 실패
+    rows = [_healthy_wide_row(f"{i:06d}", quote_failed=i <= 2) for i in range(1, 101)]
+
+    # When
+    assembled = asyncio.run(collect.assemble_decision_frame(rows, **_assemble_kwargs()))
+
+    # Then: 커버리지는 데이터, 예외 없음
+    assert assembled.status is CaptureStatus.PARTIAL
+    assert assembled.reason.startswith("coverage_below_threshold:")
+    assert assembled.coverage == {"n_raw": 100, "n_degraded": 2, "coverage": 0.98}
+
+
+def test_assemble_decision_frame_rejects_empty_rows() -> None:
+    import asyncio
+
+    import pytest
+
+    from src.daily import collect
+
+    # Given: 기록 호출기
+    calls: list = []
+
+    async def _fetch(_level):
+        calls.append("vkospi")
+        return 17.5
+
+    def _breadth(_d):
+        calls.append("breadth")
+        return 0.42
+
+    def _clock():
+        calls.append("clock")
+        raise AssertionError("must not be read")
+
+    # When / Then: 주입 호출 전 거부
+    with pytest.raises(ValueError, match="empty snapshot"):
+        asyncio.run(
+            collect.assemble_decision_frame([], **_assemble_kwargs(fetch_vkospi=_fetch, load_market_breadth=_breadth, completion_clock=_clock))
+        )
+    assert calls == []
+
+
+def test_assemble_decision_frame_column_order() -> None:
+    import asyncio
+
+    from src.daily import collect
+    from src.processing.schema import PRICE_ANOMALY_COL
+
+    # Given: 전 시장 맥락 정상
+    rows = [_healthy_wide_row("005930"), _healthy_wide_row("000660")]
+
+    # When
+    assembled = asyncio.run(collect.assemble_decision_frame(rows, **_assemble_kwargs()))
+
+    # Then: 후행 부착 컬럼 순서 고정
+    assert list(assembled.frame.columns[-8:]) == [
+        "kospi", "kosdaq", "v_kospi", "market_breadth", "시장폭_실패", "지수_실패",
+        PRICE_ANOMALY_COL, "feature_available_timestamp",
+    ]
+
+
+def test_collect_main_reads_run_clock_once(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from datetime import date, datetime
+    from unittest.mock import AsyncMock
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import collect
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    calls = {"n": 0}
+
+    class _CountingDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            calls["n"] += 1
+            return datetime(2026, 9, 14, 15, 20, 5, tzinfo=tz)
+
+    class _FakeKis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ensure_token(self, session):
+            return None
+
+        async def get_market_index_rate(self, session, code):
+            return {"rt_cd": "1"}
+
+        async def get_market_index_history(self, session, code, start, end):
+            return {"rt_cd": "0", "output2": []}
+
+    async def _open(_client, _session, _day):
+        return True
+
+    async def _fake_scan(client_arg, session_arg, **kwargs):
+        return [
+            {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+            {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+        ]
+
+    async def _fake_sharded(stock_list, clients, session, **kwargs):
+        return [
+            _healthy_wide_row(s["code"]) | {"snapshot_timestamp": pd.Timestamp("2026-09-14 15:20:01", tz="Asia/Seoul")}
+            for s in stock_list
+        ], []
+
+    # Given: 해피 패스 목 스택과 계수 시계
+    _shared_oracle = _open
+    monkeypatch.setattr(collect, "datetime", _CountingDatetime)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
+    monkeypatch.setattr(collect, "kis_decision_shard_client_kwargs", lambda: [{}])
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr(collect, "resolve_daily_candidates", _fake_scan)
+    monkeypatch.setattr(collect, "resolve_eligible_codes", AsyncMock(return_value=frozenset({"005930", "000660"})))
+    monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _fake_sharded)
+    monkeypatch.setattr(collect, "persist_daily_snapshot", lambda df, snapshot_date=None: len(df))
+    monkeypatch.setattr(collect, "_capture_root", lambda: tmp_path / "capture")
+    import src.data.panel_integrity as panel_mod
+
+    def _no_panel(*args, **kwargs):
+        raise RuntimeError("no panel")
+
+    monkeypatch.setattr(panel_mod, "load_price_panel", _no_panel)
+
+    # When
+    asyncio.run(collect.main(force=False))
+
+    # Then: run 시작 1회 + enrichment 완료 1회
+    assert calls["n"] == 2
+
+    # Given: SHIFTED 세션 조기 스킵
+    calls["n"] = 0
+    target = date(2026, 9, 14)
+    day = SessionDay(trading_date=target, kind=SessionKind.SHIFTED, clock=SessionClock.standard(target), provenance="test")
+    monkeypatch.setattr(collect, "resolve_session_day", lambda _d, **_k: day)
+
+    # When
+    assert asyncio.run(collect.main(force=False)) is None
+
+    # Then: run 시작 판독 1회뿐
+    assert calls["n"] == 1
+
+
+def test_collect_main_computes_market_breadth_from_panel(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.daily import collect
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 14, 15, 20, 5, tzinfo=tz)
+
+    class _FakeKis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ensure_token(self, session):
+            return None
+
+        async def get_market_index_rate(self, session, code):
+            return {"rt_cd": "1"}
+
+        async def get_market_index_history(self, session, code, start, end):
+            return {"rt_cd": "0", "output2": []}
+
+    async def _open(_client, _session, _day):
+        return True
+
+    # Given: 사전일 3상승 1하락 폭 패널
+    panel = pd.DataFrame({
+        "date": pd.to_datetime(["2026-09-11"] * 4),
+        "symbol": ["005930", "000660", "000001", "000002"],
+        "daily_change_pct": [1.0, 2.0, 0.5, -1.0],
+    })
+
+    async def _fake_scan(client_arg, session_arg, **kwargs):
+        return [
+            {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+            {"code": "000660", "name": "B", "price": "18000", "chgrate": "5.0"},
+        ]
+
+    async def _fake_sharded(stock_list, clients, session, **kwargs):
+        return [
+            _healthy_wide_row(s["code"]) | {"snapshot_timestamp": pd.Timestamp("2026-09-14 15:20:01", tz="Asia/Seoul")}
+            for s in stock_list
+        ], []
+
+    _shared_oracle = _open
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
+    monkeypatch.setattr(collect, "kis_decision_shard_client_kwargs", lambda: [{}])
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _shared_oracle)
+    monkeypatch.setattr(collect, "resolve_daily_candidates", _fake_scan)
+    monkeypatch.setattr(collect, "resolve_eligible_codes", AsyncMock(return_value=frozenset({"005930", "000660"})))
+    monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _fake_sharded)
+    monkeypatch.setattr(collect, "persist_daily_snapshot", lambda df, snapshot_date=None: len(df))
+    monkeypatch.setattr(collect, "_capture_root", lambda: tmp_path / "capture")
+    import src.data.panel_integrity as panel_mod
+
+    monkeypatch.setattr(panel_mod, "load_price_panel", lambda path: (panel, None))
+
+    # When
+    asyncio.run(collect.main(force=False))
+
+    # Then: 폭 0.5 기록, 실패 플래그 False
+    stored = list(Path(tmp_path / "capture" / "decision").rglob("input.parquet"))
+    assert stored != []
+    frame = pd.read_parquet(stored[0])
+    assert frame["market_breadth"].tolist() == [0.5, 0.5]
+    assert frame["시장폭_실패"].tolist() == [False, False]
+
+
+def test_safe_float_coerces_and_defaults() -> None:
+    from src.daily.collect import safe_float
+
+    assert safe_float(None) == 0.0
+    assert safe_float("1,234.5") == 1234.5
+    assert safe_float("abc") == 0.0
+    assert safe_float(7) == 7.0
+    assert safe_float(None, 0) == 0
+
+
+def test_parse_market_index_rate_fallback_chain() -> None:
+    from src.daily.collect import parse_market_index_rate
+
+    assert parse_market_index_rate({"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "1.25"}}) == 1.25
+    assert parse_market_index_rate(
+        {"rt_cd": "0", "output1": {"bstp_nmix_prdy_ctrt": "0", "bstp_nmix_prpr": "110", "bstp_nmix_prdy_vrss": "10"}}
+    ) == 10.0
+    assert parse_market_index_rate({"rt_cd": "1"}) is None
+    assert parse_market_index_rate(None) is None

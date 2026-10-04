@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import json
 import os
 import re
@@ -78,6 +79,57 @@ def _available_memory_gb() -> float:
         return (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")) / (1024**3)
     except (ValueError, OSError, AttributeError):
         return 8.0
+
+
+_MIN_PARALLEL_MEMORY_GB: float = 2.0
+
+
+def pytest_worker_args(
+    *,
+    force_serial: bool,
+    env_workers: str | None,
+    available_memory_gb: float,
+    test_file_count: int,
+    cpu_count: int | None,
+    xdist_available: bool,
+) -> list[str]:
+    """Build the pytest process-isolation and worker-count arguments for the gate.
+
+    Serial execution is the default because several agents and developer terminals
+    share one host; parallel workers are opt-in via LEAN_CHECK_WORKERS and only when
+    enough RAM is free. The ``-n`` flag is owned by the pytest-xdist plugin, so it is
+    emitted only when that plugin is importable by the interpreter that will run
+    pytest; otherwise the gate degrades to plain serial pytest instead of failing on
+    an unrecognized argument.
+
+    Args:
+        force_serial: True when ``--no-xdist`` was passed.
+        env_workers: Raw ``LEAN_CHECK_WORKERS`` value, or None when unset.
+        available_memory_gb: Currently available host RAM in GiB.
+        test_file_count: Number of selected test files (upper bound on useful workers).
+        cpu_count: ``os.cpu_count()`` result; None when undeterminable.
+        xdist_available: Whether the ``xdist`` module is importable.
+
+    Returns:
+        Arguments to splice into the pytest argv. Always starts with
+        ``["-p", "no:cacheprovider"]``.
+    """
+    base = ["-p", "no:cacheprovider"]
+    if not xdist_available:
+        return base
+    parallel = (
+        not force_serial
+        and env_workers is not None
+        and env_workers != ""
+        and env_workers.isdigit()
+        and int(env_workers) >= 2
+        and available_memory_gb >= _MIN_PARALLEL_MEMORY_GB
+    )
+    if parallel:
+        assert env_workers is not None
+        worker_count = min(int(env_workers), cpu_count or 2, test_file_count)
+        return [*base, "-n", str(worker_count)]
+    return [*base, "-n", "0"]
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +340,7 @@ def main() -> None:
     parser.add_argument("--skip-lint", action="store_true", help="Skip Ruff linting")
     parser.add_argument("--skip-mypy", action="store_true", help="Skip Mypy static check")
     parser.add_argument("--no-cov", action="store_true", help="Disable diff-coverage gate")
-    parser.add_argument("--no-xdist", action="store_true", help="Force serial pytest execution (-n 0)")
+    parser.add_argument("--no-xdist", action="store_true", help="Force serial pytest execution")
     parser.add_argument("--timeout", type=int, default=None, help="Pytest timeout in seconds")
     parser.add_argument(
         "--run-slow",
@@ -386,24 +438,7 @@ def main() -> None:
         return
 
     # 5. Smart Pytest Execution (Resource Safety Guard)
-    # 5. Smart Pytest Execution (Resource Safety Guard: Serial Execution Default)
-    # 다중 프로젝트 및 로컬 동시성 환경 안정성을 위해 기본값은 항상 단일 프로세스(-n 0)로 고정.
-    # CI 등에서 명시적으로 LEAN_CHECK_WORKERS 환경변수가 2 이상으로 지정된 경우에만 제한적 병렬 허용.
-    env_workers = os.environ.get("LEAN_CHECK_WORKERS")
-    avail_mem_gb = _available_memory_gb()
-
-    if (
-        args.no_xdist
-        or not env_workers
-        or not env_workers.isdigit()
-        or int(env_workers) <= 1
-        or avail_mem_gb < 2.0
-    ):
-        xdist_args = ["-p", "no:cacheprovider", "-n", "0"]
-    else:
-        target_workers = int(env_workers)
-        worker_count = min(target_workers, os.cpu_count() or 2, len(test_files))
-        xdist_args = ["-p", "no:cacheprovider", "-n", str(worker_count)]
+    worker_args = pytest_worker_args(force_serial=args.no_xdist, env_workers=os.environ.get("LEAN_CHECK_WORKERS"), available_memory_gb=_available_memory_gb(), test_file_count=len(test_files), cpu_count=os.cpu_count(), xdist_available=importlib.util.find_spec("xdist") is not None)
 
     src_files = [f for f in py_files if f.startswith("src/")]
     cov_json_path = "tmp/verify_coverage.json"
@@ -424,7 +459,7 @@ def main() -> None:
         "-m",
         "not slow" if not args.run_slow else "slow",
         *test_files,
-        *xdist_args,
+        *worker_args,
         *cov_args,
         "-q",
         "--tb=line",

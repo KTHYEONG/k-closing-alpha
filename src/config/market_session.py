@@ -72,3 +72,5 @@ PAPER_EXIT_MAX_PRESTART_WAIT_SECONDS: int = 600
 PAPER_ENTRY_EARLIEST_HHMMSS: str = DECISION_WINDOW_END_HHMMSS
 # 다음 달력일 이 시각 이후 진입 기록은 거부한다 — 다음 시가 청산(최조 08:50:30 기동)보다 앞서야 로트가 청산 대상에 포함된다
 PAPER_ENTRY_CATCHUP_DEADLINE_HHMMSS: str = "083000"
+# Calendar-day bound for previous-trading-day search, spanning the longest Seollal/Chuseok closures.
+MAX_PREV_TRADING_DAY_LOOKBACK: int = 15

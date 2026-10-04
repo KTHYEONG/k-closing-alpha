@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
 from src.backfill.altdata.client_pool import fan_out_symbol_calls
 from src.backfill.altdata.config import AltDataFetchConfig
+
+if TYPE_CHECKING:
+    import aiohttp
+
+    from src.api.kis.client import KisApiClient
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +33,7 @@ _SCHEMA_COLS = [
 
 
 def _to_ymd(ts: pd.Timestamp) -> str:
-    return pd.Timestamp(ts).strftime("%Y%m%d")
+    return str(pd.Timestamp(ts).strftime("%Y%m%d"))
 
 
 def _empty_panel() -> pd.DataFrame:
@@ -52,18 +58,18 @@ def collect_shorting(cfg: AltDataFetchConfig, business_days: list[pd.Timestamp])
     start_ymd = _to_ymd(min(days))
     end_ymd = _to_ymd(max(days))
 
-    async def _run() -> list[tuple[str, dict]]:
-        async def _call(client, session, code):
+    async def _run() -> list[tuple[str, dict[str, Any]]]:
+        async def _call(client: KisApiClient, session: aiohttp.ClientSession, code: str) -> dict[str, Any]:
             return await client.get_daily_short_sale_history(session, code, start_ymd, end_ymd, market_div_code="J")
 
-        def _on_error(code, exc):
+        def _on_error(code: str, exc: Exception) -> dict[str, Any]:
             logger.warning("Daily short sale history failed code=%s: %s", code, exc)
             return {"rt_cd": "9", "output2": []}
 
         return await fan_out_symbol_calls(cfg, symbols, _call, _on_error)
 
     fetched = asyncio.run(_run())
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     for code, res in fetched:
         for row in (res.get("output2") or []):
             day = str(row.get("stck_bsop_date") or "").strip()

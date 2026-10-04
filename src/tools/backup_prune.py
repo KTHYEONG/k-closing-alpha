@@ -201,9 +201,9 @@ def main(argv: list[str] | None = None) -> None:
             logger.exception("[SYS] stage=backup_prune step=%s status=failed", name)
             failures.append(name)
     logger.info(
-        "[SYS] stage=backup_prune dry_run=%s purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d",
+        "[SYS] stage=backup_prune dry_run=%s purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d sealed_skipped=%s",
         args.dry_run, len(purged), purged, len(local_purged), local_purged,
-        len(sealed_report.removed), sealed_report.bytes_removed, len(sealed_report.kept),
+        len(sealed_report.removed), sealed_report.bytes_removed, len(sealed_report.kept), sealed_report.skipped_reason,
     )
     logger.debug("[SYS] stage=backup_prune sealed_kept=%s", sealed_report.kept)
     if failures:

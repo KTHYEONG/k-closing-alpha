@@ -88,3 +88,14 @@ def test_mean_group_rank_ic_empty_frame_returns_nan() -> None:
 
     empty = pd.DataFrame({"g": [], "score": [], "target": []})
     assert np.isnan(mean_group_rank_ic(empty, ["g"], "score", "target", min_group_size=2))
+
+
+def test_aggregate_metrics_empty_or_all_nan_input_returns_nan_dict() -> None:
+    import numpy as np
+
+    from src.ml.metrics import aggregate_metrics
+
+    for daily_returns in (np.array([]), np.array([np.nan, np.nan])):
+        got = aggregate_metrics(daily_returns)
+        assert set(got) == {"top_1_return", "win_rate", "profit_factor", "mean_win", "mean_loss", "sharpe"}
+        assert all(np.isnan(v) for v in got.values())

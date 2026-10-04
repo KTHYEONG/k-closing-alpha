@@ -136,3 +136,27 @@ def test_load_run_outcomes_last_wins_and_skips_corrupt_lines(tmp_path) -> None:
     assert run_outcome.load_run_outcomes("2026-09-14", path=tmp_path / "missing.jsonl") == {}
 
 
+
+
+def test_record_run_outcome_masks_reason_before_truncation(tmp_path, monkeypatch, caplog) -> None:
+    import json
+    import logging
+
+    from src.tools import alerts, run_outcome
+
+    secret = "S" * 60 + "T" * 60
+    monkeypatch.setattr(alerts.settings, "KIS_APP_SECRET", secret, raising=False)
+    path = tmp_path / "events.jsonl"
+    sent: list[str] = []
+    reason = "x" * (run_outcome.RUN_EVENT_REASON_MAX_CHARS - 20) + secret + " url?crtfc_key=RAWDARTKEY99"
+
+    with caplog.at_level(logging.WARNING, logger=run_outcome.logger.name):
+        record = run_outcome.record_run_outcome(
+            "predict", run_outcome.RUN_OUTCOME_DEGRADED, run_date="2026-10-02", reason=reason,
+            path=path, alert_fn=lambda subject, body: sent.append(body) or {},
+        )
+
+    stored = json.loads(path.read_text(encoding="utf-8").splitlines()[0])["reason"]
+    for text in (record["reason"], stored, *sent, *(rec.getMessage() for rec in caplog.records)):
+        assert all(secret[i : i + 8] not in text for i in range(len(secret) - 7))
+    assert len(stored) <= run_outcome.RUN_EVENT_REASON_MAX_CHARS
