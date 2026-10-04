@@ -77,7 +77,13 @@ class CollectionSettings(EnvSettings):
         COLLECTION_TOSS_BASIS_VOLUME_RATIO_MIN: Lower gate bound on cumulative/EOD volume, default 0.90.
         COLLECTION_TOSS_BASIS_VOLUME_TOLERANCE: Upper gate slack above 1.0, default 1e-9.
         COLLECTION_TOSS_RETENTION_REFERENCE_SYMBOL: Liquid symbol used by the retention-floor probe, default 005930.
-        COLLECTION_TOSS_OUTAGE_FAILURE_SHARE: Per-date share of transport/vendor failures treated as an outage, default 0.5.
+        COLLECTION_TOSS_OUTAGE_FAILURE_SHARE: Per-date share of transport/vendor/empty-page failures treated as an outage, default 0.5.
+        COLLECTION_TOSS_OUTAGE_MIN_SAMPLE: Minimum attempted symbols of a date before the outage share applies, default 5
+            (a tiny resumed date must not wedge the run on one deterministic per-symbol failure).
+        COLLECTION_TOSS_USABLE_FROM_DATE: First trading date whose Toss volumes are trusted, default 2023-01-02. Measured
+            2026-10-04: before 2022-12 Toss 1m volumes are unrelated to EOD (005930 cumulative/EOD 0.005-0.03, 035420
+            0.6-6.5); from 2022-12-14 on they match (0.94-1.00). The volume gate rejects most such days but an accidental
+            ratio inside the gate window would be accepted, so the era is excluded by date.
         COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS: HHMM-HHMM KST weekday windows in which no new date starts,
             default 0850-0940 and 1510-1550.
 
@@ -139,6 +145,8 @@ class CollectionSettings(EnvSettings):
     COLLECTION_TOSS_BASIS_VOLUME_TOLERANCE: float = Field(default=1e-9, ge=0, allow_inf_nan=False)
     COLLECTION_TOSS_RETENTION_REFERENCE_SYMBOL: str = Field(default="005930", min_length=1)
     COLLECTION_TOSS_OUTAGE_FAILURE_SHARE: float = Field(default=0.5, gt=0, le=1, allow_inf_nan=False)
+    COLLECTION_TOSS_OUTAGE_MIN_SAMPLE: int = Field(default=5, gt=0)
+    COLLECTION_TOSS_USABLE_FROM_DATE: str = Field(default="2023-01-02", pattern=r"^\d{4}-\d{2}-\d{2}$")
     COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS: Annotated[tuple[str, ...], NoDecode] = Field(
         default=("0850-0940", "1510-1550")
     )

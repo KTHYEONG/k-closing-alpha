@@ -133,6 +133,7 @@ def env(tmp_path, monkeypatch):
     profile = CollectionSettings(
         COLLECTION_ROOT=tmp_path / "capture",
         COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS=(),
+        COLLECTION_TOSS_OUTAGE_MIN_SAMPLE=1,
         _env_file=None,
     )
     store = CaptureStore(tmp_path / "capture")
@@ -378,7 +379,7 @@ def test_outage_does_not_burn_the_cap(env) -> None:
     summary = _run(profile, store, ledger, client, tasks, _eod([_DAY1, _DAY2], ["000011", "000012", "000013", "000014"]))
     assert summary.outage_aborted is True
     assert client.calls == ["000011", "000012", "000013"]
-    assert (summary.tasks_done, summary.tasks_remaining) == (1, 1)
+    assert (summary.tasks_done, summary.tasks_remaining) == (0, 2)  # an outage-aborted date is not done
     assert ledger._read_all().empty
     client.calls.clear()
     again = _run(profile, store, ledger, client, tasks, _eod([_DAY1, _DAY2], ["000011", "000012", "000013", "000014"]))
@@ -404,6 +405,40 @@ def test_partial_outage_keeps_good_symbols(env) -> None:
     assert sorted(frame["symbol"].unique().tolist()) == ["000024", "000025"]
     assert (frame["vendor"] == "toss").all()
     assert (frame[frame["status"] == "COMPLETE"]["price_basis"] == "toss_raw").all()
+
+
+def test_empty_pages_count_toward_outage(env) -> None:
+    """A 200 answer with no candles for every symbol is an outage, not three burnt attempts per symbol-day."""
+    profile, store, ledger = env
+    symbols = ["000041", "000042", "000043"]
+    client = _FakeToss({})
+    summary = _run(profile, store, ledger, client, [_task(_DAY1, tuple(symbols))], _eod([_DAY1], symbols))
+    assert summary.outage_aborted is True and summary.failed == 0
+    assert ledger._read_all().empty
+
+
+def test_small_sample_below_min_is_recorded_not_aborted(tmp_path, monkeypatch) -> None:
+    """Fewer attempted symbols than the minimum sample never trigger the outage abort (no permanent wedge)."""
+    from src.data import intraday_store
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
+    profile = CollectionSettings(
+        COLLECTION_ROOT=tmp_path / "capture", COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS=(),
+        COLLECTION_TOSS_OUTAGE_MIN_SAMPLE=5, _env_file=None,
+    )
+    store = CaptureStore(tmp_path / "capture")
+    ledger = ExtendedBackfillLedger(tmp_path / "ledger.parquet")
+    client = _FakeToss(errors={"000051": {"error": {"code": "overloaded"}}})
+    summary = _run(profile, store, ledger, client, [_task(_DAY1, ("000051",))], _eod([_DAY1], ["000051"]))
+    assert summary.outage_aborted is False and summary.failed == 1
+    assert ledger._read_all()["status"].tolist() == ["FAILED"]
+
+
+def test_effective_floor_is_the_later_date_and_unknown_stays_unknown() -> None:
+    """The usable-from date can only raise the floor; an unknown vendor floor is never replaced by it."""
+    assert trb.effective_floor("2021-12-20", "2023-01-02") == "2023-01-02"
+    assert trb.effective_floor("2024-05-01", "2023-01-02") == "2024-05-01"
+    assert trb.effective_floor(None, "2023-01-02") is None
 
 
 def test_vendor_failures_count_toward_outage(env) -> None:
@@ -686,10 +721,11 @@ def cli_env(tmp_path, monkeypatch):
     monkeypatch.setattr(app_settings, "TOSS_APP_KEY", "dummy", raising=False)
     monkeypatch.setattr(app_settings, "TOSS_APP_SECRET", "dummy", raising=False)
     monkeypatch.setenv("COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS", "")
+    monkeypatch.setenv("COLLECTION_TOSS_OUTAGE_MIN_SAMPLE", "1")
     monkeypatch.setattr("src.api.toss.client.TossApiClient", _CliTossClient)
     _CliTossClient.grids = {
-        symbol: list(reversed(_regular_grid(day)))
-        for day in (_DAY1, _DAY2) for symbol in ("000001", "000002")
+        symbol: [c for day in sorted((_DAY1, _DAY2), reverse=True) for c in reversed(_regular_grid(day))]
+        for symbol in ("000001", "000002")
     }
     _CliTossClient.errors = {}
     _CliTossClient.raises = frozenset()
@@ -735,6 +771,19 @@ def test_cli_outage_returns_nonzero_and_keeps_retryable(cli_env) -> None:
     assert trb.main(["--as-of", "2026-03-10"]) == 1
     ledger_path = history_dir / "intraday" / "backfill_ledger" / "toss_regular.parquet"
     assert not ledger_path.exists()
+
+
+def test_cli_unknown_retention_floor_aborts_without_planning(cli_env, monkeypatch) -> None:
+    """An empty vendor (floor unknown) must not plan every pre-retention date and burn attempts."""
+    _, history_dir = cli_env
+
+    async def _unknown(client, session, *, trading_days, reference_symbol):
+        return None
+
+    monkeypatch.setattr(trb, "probe_toss_retention_floor", _unknown)
+    assert trb.main(["--as-of", "2026-03-10"]) == 1
+    assert not (history_dir / "intraday" / "backfill_ledger" / "toss_regular.parquet").exists()
+    assert _CliTossClient.calls == []
 
 
 def test_cli_single_instance(cli_env) -> None:
