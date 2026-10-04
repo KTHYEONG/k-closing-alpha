@@ -201,6 +201,42 @@ def enumerate_extended_session_tasks(
     return tasks
 
 
+def regular_superset_symbols_by_day(
+    *,
+    as_of: date,
+    earliest: str,
+    prepared_panel: pd.DataFrame,
+    screen: EodSupersetScreen,
+) -> dict[str, tuple[str, ...]]:
+    """Zero-padded, de-duplicated EOD fetch-superset symbols per trading date in `[earliest, as_of)`.
+
+    This is a fetch filter only (T's EOD is final at backfill time) and is never a training or decision screen.
+    """
+    as_of_str = as_of.isoformat()
+    if prepared_panel is None or len(prepared_panel) == 0:
+        eod_superset_mask(prepared_panel if prepared_panel is not None else pd.DataFrame(), screen)
+        return {}
+    if "date" not in prepared_panel.columns:
+        eod_superset_mask(prepared_panel, screen)
+        return {}
+    days = _normalize_day_column(prepared_panel["date"])
+    in_bounds = (days >= str(earliest)) & (days < as_of_str)
+    scoped = prepared_panel.loc[in_bounds].copy()
+    if len(scoped) == 0:
+        return {}
+    mask = eod_superset_mask(scoped, screen)
+    scoped = scoped.copy()
+    scoped["_day"] = _normalize_day_column(scoped["date"]).astype(str).tolist()
+    scoped["_pass"] = np.asarray(mask, dtype=bool)
+    passing = scoped.loc[scoped["_pass"]]
+    grouped: dict[str, set[str]] = {}
+    if len(passing):
+        syms = passing["symbol"].astype(str).str.zfill(6).tolist()
+        for day, symbol in zip(passing["_day"].astype(str).tolist(), syms):
+            grouped.setdefault(str(day), set()).add(str(symbol))
+    return {day: tuple(sorted(symbols)) for day, symbols in grouped.items()}
+
+
 @dataclass(frozen=True)
 class RegularBackfillPlan:
     """Regular-session tasks plus the symbol-days deliberately not fetched.
@@ -249,29 +285,10 @@ def enumerate_regular_session_tasks(
     """
     if int(retention_days) < 1:
         raise ValueError(f"retention_days must be >= 1, got {retention_days!r}")
-    as_of_str = as_of.isoformat()
     earliest = (as_of - timedelta(days=int(retention_days))).isoformat()
-    if prepared_panel is None or len(prepared_panel) == 0:
-        eod_superset_mask(prepared_panel if prepared_panel is not None else pd.DataFrame(), screen)
-        return RegularBackfillPlan(tasks=(), skipped_adjusted=0, skipped_unknown_basis=0)
-    if "date" not in prepared_panel.columns:
-        eod_superset_mask(prepared_panel, screen)
-        return RegularBackfillPlan(tasks=(), skipped_adjusted=0, skipped_unknown_basis=0)
-    days = _normalize_day_column(prepared_panel["date"])
-    in_bounds = (days >= earliest) & (days < as_of_str)
-    scoped = prepared_panel.loc[in_bounds].copy()
-    if len(scoped) == 0:
-        return RegularBackfillPlan(tasks=(), skipped_adjusted=0, skipped_unknown_basis=0)
-    mask = eod_superset_mask(scoped, screen)
-    scoped = scoped.copy()
-    scoped["_day"] = _normalize_day_column(scoped["date"]).astype(str).tolist()
-    scoped["_pass"] = np.asarray(mask, dtype=bool)
-    passing = scoped.loc[scoped["_pass"]]
-    symbols_by_day: dict[str, list[str]] = {}
-    if len(passing):
-        syms = passing["symbol"].astype(str).str.zfill(6).tolist()
-        for day, symbol in zip(passing["_day"].astype(str).tolist(), syms):
-            symbols_by_day.setdefault(str(day), []).append(str(symbol))
+    symbols_by_day = regular_superset_symbols_by_day(
+        as_of=as_of, earliest=earliest, prepared_panel=prepared_panel, screen=screen
+    )
     tasks: list[ExtendedBackfillTask] = []
     skipped_adjusted = 0
     skipped_unknown_basis = 0
@@ -467,6 +484,60 @@ class ExtendedBackfillLedger:
                 else:
                     row["attempts"] = 0
                 rows.append(row)
+            incoming = pd.DataFrame(rows, columns=list(_LEDGER_COLUMNS))
+            combined = (
+                pd.concat([existing, incoming], ignore_index=True)
+                if not existing.empty
+                else incoming
+            )
+            combined = combined.drop_duplicates(subset=list(_LEDGER_KEYS), keep="last")
+            atomic_write_parquet(combined[list(_LEDGER_COLUMNS)], self._path)
+
+    def record_cached_absent(
+        self,
+        snapshot_date: str,
+        session: str,
+        symbols: Sequence[str],
+        *,
+        reason: str,
+        run_id: str,
+        attempted_at: datetime,
+        vendor: str = "toss",
+    ) -> None:
+        """Append symbol-level cached absences without new evidence or requests.
+
+        A symbol proven unavailable at symbol level (e.g. Toss `stock-not-found`, which never
+        varies by date) stays absent for every remaining date without another vendor call; the
+        proving response lives under the original run's manifest and is cited through `reason`.
+        Rows are NOT_APPLICABLE and therefore terminal, like any other rejection.
+        """
+        names = sorted({str(symbol) for symbol in symbols if str(symbol)})
+        if not names:
+            return
+        if not str(reason).strip():
+            raise ValueError("cached absence requires a nonempty reason")
+        with exclusive_file_lock(
+            sidecar_lock_path(self._path),
+            timeout_seconds=DEFAULT_LOCK_TIMEOUT_SECONDS,
+            purpose="backfill-ledger",
+        ):
+            existing = self._read_all()
+            rows = [
+                {
+                    "snapshot_date": str(snapshot_date),
+                    "session": str(session),
+                    "symbol": name,
+                    "status": "NOT_APPLICABLE",
+                    "rows": 0,
+                    "reason": str(reason),
+                    "run_id": str(run_id),
+                    "attempted_at": attempted_at.isoformat(),
+                    "vendor": str(vendor),
+                    "price_basis": "",
+                    "attempts": 0,
+                }
+                for name in names
+            ]
             incoming = pd.DataFrame(rows, columns=list(_LEDGER_COLUMNS))
             combined = (
                 pd.concat([existing, incoming], ignore_index=True)

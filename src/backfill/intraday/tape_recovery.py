@@ -19,6 +19,7 @@ from typing import Any, Literal
 import pandas as pd
 
 from src import settings
+from src.backfill.intraday import blackout as _blackout
 from src.backfill.intraday.tape_harvest import (
     TAPE_SESSIONS,
     TapeSession,
@@ -105,37 +106,15 @@ async def _sleep(seconds: float) -> None:
 
 
 def _in_blackout(now_minute: int, window: tuple[int, int]) -> bool:
-    start, end = window
-    if end <= start:
-        return now_minute >= start or now_minute < end
-    return start <= now_minute < end
+    return _blackout._minute_in_window(int(now_minute), window)
 
 
 def _blackout_end(now: datetime, windows: list[tuple[int, int]]) -> datetime | None:
-    now_minute = now.hour * 60 + now.minute
-    ends: list[datetime] = []
-    for start, end in windows:
-        if not _in_blackout(now_minute, (start, end)):
-            continue
-        if end <= start:
-            target = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-            target += timedelta(minutes=end)
-            if now_minute < end:
-                target = now.replace(hour=end // 60, minute=end % 60, second=0, microsecond=0)
-        elif end >= 24 * 60:
-            target = now.replace(hour=23, minute=59, second=59, microsecond=0) + timedelta(seconds=1)
-        else:
-            target = now.replace(hour=end // 60, minute=end % 60, second=0, microsecond=0)
-        ends.append(target)
-    return max(ends) if ends else None
+    return _blackout.blackout_end(now, windows, weekdays_only=False)
 
 
 async def _wait_for_blackout(windows: list[tuple[int, int]]) -> None:
-    while True:
-        end = _blackout_end(_now(), windows)
-        if end is None:
-            return
-        await _sleep((end - _now()).total_seconds())
+    await _blackout.wait_for_blackout(windows, now_fn=_now, sleep_fn=_sleep, weekdays_only=False)
 
 
 def _read_symbols(path: Path) -> list[str]:
