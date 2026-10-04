@@ -46,6 +46,17 @@ class CollectionSettings(EnvSettings):
         COLLECTION_BACKFILL_MIN_CHANGE_RATIO: Entry-day reconstruction threshold, default 0.02.
         COLLECTION_KIS_MINUTE_RETENTION_DAYS: KIS minute history window, default 365.
         COLLECTION_BACKFILL_STOP_HHMMSS: KST wall time after which no new task starts, default 065000.
+        COLLECTION_PIT_BACKFILL_ENABLED: Run the regular-session (decision-time) backfill stream, default True.
+        COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO: Lower EOD chg bound of the fetch superset, default 0.01
+            (training chg_min 0.02 minus a 1% auction-move band; measured 5-95% auction move ~ +-0.9%).
+        COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO: Exclusive upper EOD chg bound of the fetch superset, default 0.12
+            (training chg_max 0.10 plus 2%; near-limit names carry larger auction moves).
+        COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M: EOD trade-value floor in 100M KRW, default 100.0; cumulative
+            value is monotone to the close, so EOD >= floor is necessary for 15:20 >= floor (no margin).
+        COLLECTION_PIT_BACKFILL_MIN_MARKET_CAP_100M: EOD market-cap floor in 100M KRW, default 495.0 (training 500
+            scaled by the same 1% band).
+        COLLECTION_PIT_BACKFILL_COMMON_STOCK_ONLY: Restrict the fetch superset to common-stock codes (last char '0',
+            not starting '9'), default False because the training screens admit other classes (~2% of U0 rows).
         COLLECTION_OPEN_CONFIRM_SECONDS: Opening confirmation budget, default 180.
         COLLECTION_SESSION_OVERRIDES: Operator emergency session clocks resolved by src.data.session_calendar.resolve_session_day; not a second calendar.
         COLLECTION_AFTERMARKET_BOOK_ENABLED: Enable evening aftermarket order-book capture, default False.
@@ -98,6 +109,12 @@ class CollectionSettings(EnvSettings):
     COLLECTION_BACKFILL_MIN_CHANGE_RATIO: float = Field(default=0.02, ge=0.0, allow_inf_nan=False)
     COLLECTION_KIS_MINUTE_RETENTION_DAYS: int = Field(default=365, gt=0)
     COLLECTION_BACKFILL_STOP_HHMMSS: str = Field(default="065000", pattern=r"^\d{6}$")
+    COLLECTION_PIT_BACKFILL_ENABLED: bool = Field(default=True)
+    COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO: float = Field(default=0.01, ge=-1.0, le=1.0, allow_inf_nan=False)
+    COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO: float = Field(default=0.12, ge=-1.0, le=1.0, allow_inf_nan=False)
+    COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M: float = Field(default=100.0, ge=0.0, allow_inf_nan=False)
+    COLLECTION_PIT_BACKFILL_MIN_MARKET_CAP_100M: float = Field(default=495.0, ge=0.0, allow_inf_nan=False)
+    COLLECTION_PIT_BACKFILL_COMMON_STOCK_ONLY: bool = Field(default=False)
     COLLECTION_OPEN_CONFIRM_SECONDS: int = Field(default=180, gt=30)
     COLLECTION_SESSION_OVERRIDES: dict[str, SessionClock] = Field(default_factory=dict)
     COLLECTION_AFTERMARKET_BOOK_ENABLED: bool = Field(default=False)
@@ -163,6 +180,8 @@ class CollectionSettings(EnvSettings):
     def _check_profile(self) -> Self:
         if self.COLLECTION_TICK_REPAIR_MAX_PAGES < self.COLLECTION_CHART_MAX_PAGES:
             raise ValueError("repair budget must be at least the normal page budget")
+        if not self.COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO < self.COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO:
+            raise ValueError("pit backfill change band must be non-empty")
         if self.COLLECTION_AUCTION_ENABLED and len(self.COLLECTION_RESEARCH_SLOTS) == 0:
             raise ValueError("enabled auctions require declared research credentials")
         for key, clock in self.COLLECTION_SESSION_OVERRIDES.items():

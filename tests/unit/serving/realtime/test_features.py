@@ -78,7 +78,7 @@ def test_build_topk_ranker_features_maps_korean_snapshot_to_feature_cols() -> No
     import pandas as pd
     import pytest
 
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from src.serving.realtime.features import build_topk_ranker_features
 
     # Given: a live Korean-column daily snapshot (matches collect.py's saved shape)

@@ -28,8 +28,6 @@ def _krx_raw(rows: list[dict], market: str = "KOSPI", bas_dd: str = "20260910") 
 
 
 class FakeKis:
-    base_url = "https://kis.test"
-
     def __init__(self, calendar=CAL, fail_investor=(), fail_program=(), index_rt="0"):
         self.calendar = list(calendar)
         self.fail_investor = set(fail_investor)
@@ -39,9 +37,6 @@ class FakeKis:
 
     async def ensure_token(self, session):
         return "token"
-
-    def _get_headers(self, tr):
-        return {"tr_id": tr}
 
     def _close(self, code, d):
         base = 2000.0 if code == "0001" else 800.0
@@ -55,15 +50,17 @@ class FakeKis:
         days = [d for d in self.calendar if s <= d <= e][-50:]
         return {"rt_cd": "0", "output2": [{"stck_bsop_date": d.strftime("%Y%m%d"), "bstp_nmix_prpr": f"{self._close(code, d):.2f}"} for d in reversed(days)]}
 
-    async def _handle_request(self, method, url, headers=None, params=None):
-        tr, sym = headers["tr_id"], params["FID_INPUT_ISCD"]
-        anchor = pd.Timestamp(params["FID_INPUT_DATE_1"])
+    async def get_investor_trade_daily_page(self, session, code, cursor_ymd, *, market_div_code="J"):
+        anchor = pd.Timestamp(cursor_ymd)
         days = [d for d in self.calendar if d <= anchor][-30:]
-        if tr == "FHPTJ04160001":
-            if sym in self.fail_investor:
-                return {"rt_cd": "2", "msg1": "TIME LIMIT 00:00 ~ 15:40"}
-            return {"rt_cd": "0", "output1": {}, "output2": [{"stck_bsop_date": d.strftime("%Y%m%d"), "orgn_ntby_tr_pbmn": "100", "frgn_ntby_tr_pbmn": "-50"} for d in reversed(days)]}
-        if sym in self.fail_program:
+        if code in self.fail_investor:
+            return {"rt_cd": "2", "msg1": "TIME LIMIT 00:00 ~ 15:40"}
+        return {"rt_cd": "0", "output1": {}, "output2": [{"stck_bsop_date": d.strftime("%Y%m%d"), "orgn_ntby_tr_pbmn": "100", "frgn_ntby_tr_pbmn": "-50"} for d in reversed(days)]}
+
+    async def get_program_trade_daily_page(self, session, code, cursor_ymd, *, market_div_code="J"):
+        anchor = pd.Timestamp(cursor_ymd)
+        days = [d for d in self.calendar if d <= anchor][-30:]
+        if code in self.fail_program:
             return {"rt_cd": "1", "msg1": "program fail"}
         return {"rt_cd": "0", "output": [{"stck_bsop_date": d.strftime("%Y%m%d"), "whol_smtn_ntby_tr_pbmn": "7"} for d in reversed(days)]}
 
@@ -73,13 +70,13 @@ class FakeKiwoom:
         self.fail = set(fail)
         self.calls = []
 
-    async def _post_tr(self, session, api_id, path, body, cont_yn="N", next_key=""):
-        self.calls.append((api_id, body["stk_cd"]))
-        if body["stk_cd"] in self.fail:
-            return {"return_code": 1, "return_msg": "kiwoom fail"}, {}
-        anchor = pd.Timestamp(body["dt"])
+    async def get_investor_institution_daily(self, session, code, base_ymd):
+        self.calls.append(("ka10059", code))
+        if code in self.fail:
+            return {"return_code": 1, "return_msg": "kiwoom fail"}
+        anchor = pd.Timestamp(base_ymd)
         days = [d for d in CAL if d <= anchor][-100:]
-        return {"return_code": 0, "stk_invsr_orgn": [{"dt": d.strftime("%Y%m%d"), "orgn": "+30", "frgnr_invsr": "-20", "natfor": "--1"} for d in reversed(days)]}, {}
+        return {"return_code": 0, "stk_invsr_orgn": [{"dt": d.strftime("%Y%m%d"), "orgn": "+30", "frgnr_invsr": "-20", "natfor": "--1"} for d in reversed(days)]}
 
 
 class FakeToss:
@@ -1661,3 +1658,140 @@ def test_run_price_ingest_holds_lock_through_write(monkeypatch, tmp_path) -> Non
     finally:
         os.close(probe)
         sidecar_lock_path(path).unlink(missing_ok=True)
+
+
+def test_fetch_symbol_flows_page_arguments_pinned() -> None:
+    from src.daily.price_ingest import fetch_symbol_flows
+
+    class _RecordingKis(FakeKis):
+        def __init__(self):
+            super().__init__(fail_investor={"000002"})
+            self.investor_calls: list[tuple] = []
+            self.program_calls: list[tuple] = []
+
+        async def get_investor_trade_daily_page(self, session, code, cursor_ymd, *, market_div_code="J"):
+            self.investor_calls.append((code, cursor_ymd, market_div_code))
+            return await super().get_investor_trade_daily_page(session, code, cursor_ymd, market_div_code=market_div_code)
+
+        async def get_program_trade_daily_page(self, session, code, cursor_ymd, *, market_div_code="J"):
+            self.program_calls.append((code, cursor_ymd, market_div_code))
+            return await super().get_program_trade_daily_page(session, code, cursor_ymd, market_div_code=market_div_code)
+
+    class _RecordingKiwoom(FakeKiwoom):
+        def __init__(self):
+            super().__init__()
+            self.seen: list[tuple] = []
+
+        async def get_investor_institution_daily(self, session, code, base_ymd):
+            self.seen.append((code, base_ymd))
+            return await super().get_investor_institution_daily(session, code, base_ymd)
+
+    kis, kiwoom = _RecordingKis(), _RecordingKiwoom()
+    asyncio.run(fetch_symbol_flows(kis, kiwoom, _Session(), "000002", "20260910"))
+    assert kis.investor_calls == [("000002", "20260910", "J")]
+    assert kis.program_calls == [("000002", "20260910", "J")]
+    assert kiwoom.seen == [("000002", "20260910")]
+
+
+def test_fetch_symbol_flows_rt_cd_9_triggers_fallback() -> None:
+    from src.daily.price_ingest import fetch_symbol_flows
+
+    class _Rt9Kis:
+        async def get_investor_trade_daily_page(self, session, code, cursor_ymd, *, market_div_code="J"):
+            return {"rt_cd": "9", "msg1": "네트워크 연결 실패: x"}
+
+        async def get_program_trade_daily_page(self, session, code, cursor_ymd, *, market_div_code="J"):
+            return {"rt_cd": "9", "msg1": "네트워크 연결 실패: x"}
+
+    flows, inv_src, prg_src = asyncio.run(
+        fetch_symbol_flows(_Rt9Kis(), FakeKiwoom(), _Session(), "000001", "20260910", FakeToss())
+    )
+    assert (inv_src, prg_src) == ("kiwoom", "toss")
+    assert not flows.empty
+
+
+def test_fetch_symbol_flows_kis_pair_fetched_concurrently() -> None:
+    import asyncio as _asyncio
+
+    from src.daily.price_ingest import fetch_symbol_flows
+
+    release = _asyncio.Event()
+
+    class _GatedKis(FakeKis):
+        async def get_investor_trade_daily_page(self, session, code, cursor_ymd, *, market_div_code="J"):
+            await _asyncio.wait_for(release.wait(), timeout=1.0)
+            return await super().get_investor_trade_daily_page(session, code, cursor_ymd, market_div_code=market_div_code)
+
+        async def get_program_trade_daily_page(self, session, code, cursor_ymd, *, market_div_code="J"):
+            release.set()
+            return await super().get_program_trade_daily_page(session, code, cursor_ymd, market_div_code=market_div_code)
+
+    flows, inv_src, prg_src = _asyncio.run(
+        _asyncio.wait_for(fetch_symbol_flows(_GatedKis(), FakeKiwoom(), _Session(), "000001", "20260910"), timeout=1.0)
+    )
+    assert (inv_src, prg_src) == ("kis", "kis")
+    assert not flows.empty
+
+
+def test_fetch_symbol_flows_kis_exception_propagates() -> None:
+    from src.daily.price_ingest import fetch_symbol_flows
+
+    class _BoomKis(FakeKis):
+        async def get_program_trade_daily_page(self, session, code, cursor_ymd, *, market_div_code="J"):
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(fetch_symbol_flows(_BoomKis(), FakeKiwoom(), _Session(), "000001", "20260910"))
+
+
+def _patch_main_side_jobs(monkeypatch, mod, ingested):
+    import src.strategy.growth_shadow as growth_shadow
+    import src.strategy.t1_attribution as t1_attribution
+
+    async def _fake(**kwargs):
+        return mod.IngestReport(ingested_dates=list(ingested), n_new_rows=0, n_corporate_events=0)
+
+    monkeypatch.setattr(mod, "run_price_ingest", _fake)
+    monkeypatch.setattr(mod, "record_run_outcome", lambda *a, **k: {})
+    monkeypatch.setattr(growth_shadow, "run_growth_shadow", lambda: 0)
+    monkeypatch.setattr(t1_attribution, "run_t1_attribution", lambda: 0)
+
+
+def test_main_heals_classification_gaps_after_fresh_dates(monkeypatch, tmp_path) -> None:
+    import src.daily.price_ingest as mod
+    import src.daily.security_classification as sc
+
+    ph_path = tmp_path / "price_history.parquet"
+    pd.DataFrame({"date": pd.to_datetime(["2026-09-08", "2026-09-09", "2026-09-10"])}).to_parquet(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _patch_main_side_jobs(monkeypatch, mod, ["2026-09-10"])
+    monkeypatch.setattr(sc, "classification_gap_dates", lambda calendar: [pd.Timestamp("2026-09-09"), pd.Timestamp("2026-09-10")])
+    calls: list[list[pd.Timestamp]] = []
+    monkeypatch.setattr(sc, "run_security_classification_ingest", lambda dates: calls.append(list(dates)) or {})
+
+    mod.main()
+
+    assert calls == [[pd.Timestamp("2026-09-10")], [pd.Timestamp("2026-09-09")]]
+
+
+def test_main_gap_repair_failure_is_deferred_not_raised(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    import src.daily.price_ingest as mod
+    import src.daily.security_classification as sc
+
+    ph_path = tmp_path / "price_history.parquet"
+    pd.DataFrame({"date": pd.to_datetime(["2026-09-08", "2026-09-09"])}).to_parquet(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _patch_main_side_jobs(monkeypatch, mod, [])
+    monkeypatch.setattr(sc, "classification_gap_dates", lambda calendar: [pd.Timestamp("2026-09-09")])
+
+    def _boom(dates):
+        raise RuntimeError("KRX classification missing for price-confirmed date")
+
+    monkeypatch.setattr(sc, "run_security_classification_ingest", _boom)
+
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        mod.main()
+
+    assert any("status=DEFERRED" in r.getMessage() for r in caplog.records)

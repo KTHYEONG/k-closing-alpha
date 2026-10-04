@@ -224,3 +224,9 @@ next-key: <CONTINUATION_KEY>
 * **Headers:** `api-id: "ka10016"`
 * **Body:** `{"stk_cd": "005930"}`
 * **Output:** 당일 차익, 비차익, 전체 매도/매수 수량 및 순매수금액.
+
+### 5.4 `ka10059` — 종목별 투자자/기관 일별 순매수 금액 (Investor/Institution Daily)
+* **Path:** `POST /api/dostk/stkinfo`
+* **Headers:** `api-id: "ka10059"`
+* **Body:** `dt`, `stk_cd`, `amt_qty_tp`=1 (금액), `trde_tp`=0 (순매수), `unit_tp`=1000
+* **Output:** 일자별 행 (`dt`, `orgn`, `frgnr_invsr`, `natfor`); KIS 외국인 순매수 = `frgnr_invsr + natfor`.

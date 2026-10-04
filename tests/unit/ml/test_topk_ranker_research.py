@@ -35,6 +35,8 @@ def _synthetic_prepared_panel() -> tuple[pd.DataFrame, np.ndarray, dict]:
                 "v_kospi": 18.0, "v_kosdaq": 22.0,
             })
     ph, _prov = prepare_price_panel(pd.DataFrame(rows))
+    ph["is_screenable"] = True
+    ph["screenable_source"] = "real"
     market_dates = np.array(sorted(ph["date"].unique()))
     return ph, market_dates, {d: i for i, d in enumerate(market_dates)}
 
@@ -65,7 +67,7 @@ def test_select_topk_by_score_ranks_descending_and_validates_inputs() -> None:
     import pandas as pd
     import pytest
 
-    from src.ml.topk_ranker_research import select_topk_by_score
+    from src.ml.topk_contract import select_topk_by_score
 
     # Given: 4 same-day candidates with distinct scores
     cands = pd.DataFrame({
@@ -322,7 +324,7 @@ def test_build_dual_pool_returns_wide_pool_with_cost_capped_subset_mask() -> Non
     import numpy as np
     import pytest
 
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from src.ml.topk_ranker_research import build_dual_pool
     from src.strategy.contract import COST_AWARE_UNIVERSE, DEFAULT_UNIVERSE
 
@@ -567,6 +569,8 @@ def _two_regime_prepared_panel() -> tuple[pd.DataFrame, np.ndarray, dict]:
                 "v_kospi": 18.0, "v_kosdaq": 22.0,
             })
     ph, _prov = prepare_price_panel(pd.DataFrame(rows))
+    ph["is_screenable"] = True
+    ph["screenable_source"] = "real"
     market_dates = np.array(sorted(ph["date"].unique()))
     return ph, market_dates, {d: i for i, d in enumerate(market_dates)}
 
@@ -976,7 +980,7 @@ def _synthetic_bundle_and_fixture() -> tuple[dict, "pd.DataFrame"]:  # noqa: UP0
     import dataclasses
 
     from src.ml.bundle import build_inline_bundle
-    from src.strategy.contract import COST_AWARE_UNIVERSE
+    from src.strategy.contract import PRODUCTION_STRATEGY
 
     rng = np.random.default_rng(3)
     dates = pd.bdate_range("2023-02-01", periods=30)
@@ -992,7 +996,7 @@ def _synthetic_bundle_and_fixture() -> tuple[dict, "pd.DataFrame"]:  # noqa: UP0
     df = pd.DataFrame(rows)
     bundle = build_inline_bundle(df, ["chg_ratio", "log_tv"], "train_label", "date")
     bundle["feature_cols"] = ["chg_ratio", "log_tv"]
-    bundle["select_universe"] = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    bundle["select_universe"] = dataclasses.asdict(PRODUCTION_STRATEGY.universe)
 
     snapshot = pd.DataFrame({
         "date": pd.Timestamp("2023-03-15"),
@@ -1061,7 +1065,8 @@ def test_train_production_bundle_fails_closed_below_min_train_rows() -> None:
 
 def test_save_production_bundle_writes_joblib_loadable_by_load_model_bundle(tmp_path) -> None:
     from src.serving.realtime.artifacts import load_model_bundle
-    from src.ml.topk_ranker_research import CERT_REGIME_START, save_production_bundle, train_production_bundle
+    from src.ml.topk_contract import save_production_bundle
+    from src.ml.topk_ranker_research import CERT_REGIME_START, train_production_bundle
 
     ph, market_dates, d_to_idx = _synthetic_prepared_panel()
     bundle = train_production_bundle(ph, market_dates, d_to_idx, min_train_rows=10, train_start=CERT_REGIME_START)
@@ -1080,7 +1085,7 @@ def test_select_topk_equal_weight_selects_by_rank_score_and_allocates_equally() 
     import numpy as np
 
     from src.ml.costaware_topk import MIN_TOP_K
-    from src.ml.topk_ranker_research import select_topk_equal_weight
+    from src.ml.topk_contract import select_topk_equal_weight
 
     bundle, snapshot = _synthetic_bundle_and_fixture()
 
@@ -1103,7 +1108,7 @@ def test_select_topk_equal_weight_selects_by_rank_score_and_allocates_equally() 
 def test_select_topk_equal_weight_rejects_non_certified_top_k() -> None:
     import pytest
 
-    from src.ml.topk_ranker_research import select_topk_equal_weight
+    from src.ml.topk_contract import select_topk_equal_weight
 
     bundle, snapshot = _synthetic_bundle_and_fixture()
 
@@ -1114,7 +1119,7 @@ def test_select_topk_equal_weight_rejects_missing_feature_columns() -> None:
     import pytest
 
     from src.ml.costaware_topk import MIN_TOP_K
-    from src.ml.topk_ranker_research import select_topk_equal_weight
+    from src.ml.topk_contract import select_topk_equal_weight
 
     # Given: the live snapshot is missing one of the bundle's declared features
     bundle, snapshot = _synthetic_bundle_and_fixture()
@@ -1129,7 +1134,7 @@ def test_select_topk_equal_weight_selects_only_admitted_rows() -> None:
     import pandas as pd
 
     from src.ml.costaware_topk import MIN_TOP_K
-    from src.ml.topk_ranker_research import select_topk_equal_weight
+    from src.ml.topk_contract import select_topk_equal_weight
 
     # Given: a wide 5-row cross-section where only 3 rows cleared admission
     bundle, _ = _synthetic_bundle_and_fixture()
@@ -1153,7 +1158,7 @@ def test_select_topk_equal_weight_excludes_dates_below_min_admitted() -> None:
     import pandas as pd
 
     from src.ml.costaware_topk import MIN_TOP_K
-    from src.ml.topk_ranker_research import select_topk_equal_weight
+    from src.ml.topk_contract import select_topk_equal_weight
 
     # Given: D1 has 3 admitted names, D2 has only 2 (below the certified K)
     bundle, _ = _synthetic_bundle_and_fixture()
@@ -1194,7 +1199,7 @@ def test_select_topk_equal_weight_rejects_empty_feature_cols() -> None:
     import pytest
 
     from src.ml.costaware_topk import MIN_TOP_K
-    from src.ml.topk_ranker_research import select_topk_equal_weight
+    from src.ml.topk_contract import select_topk_equal_weight
 
     bundle, snapshot = _synthetic_bundle_and_fixture()
     bundle["feature_cols"] = []
@@ -1209,8 +1214,8 @@ def test_select_topk_equal_weight_uses_float_fallback_for_degenerate_calibrator(
 
     from src.ml.bundle import build_inline_bundle
     from src.ml.costaware_topk import MIN_TOP_K
-    from src.ml.topk_ranker_research import select_topk_equal_weight
-    from src.strategy.contract import COST_AWARE_UNIVERSE
+    from src.ml.topk_contract import select_topk_equal_weight
+    from src.strategy.contract import PRODUCTION_STRATEGY
 
     # Given: every training label sits below the p_good threshold (0.01) and
     # above the p_bad threshold (-0.02) -- both calibrators degenerate to a
@@ -1224,7 +1229,7 @@ def test_select_topk_equal_weight_uses_float_fallback_for_degenerate_calibrator(
     df = pd.DataFrame(rows)
     bundle = build_inline_bundle(df, ["chg_ratio", "log_tv"], "train_label", "date")
     bundle["feature_cols"] = ["chg_ratio", "log_tv"]
-    bundle["select_universe"] = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    bundle["select_universe"] = dataclasses.asdict(PRODUCTION_STRATEGY.universe)
     assert isinstance(bundle["calibrators"]["p_good"], float)
     assert isinstance(bundle["calibrators"]["p_bad"], float)
 
@@ -1530,7 +1535,12 @@ def test_topk_ranker_main_selects_the_capfree_arm_and_logs_falsification(
     import pandas as pd
 
     import src.ml.topk_ranker_research as mod
-    from src.strategy.contract import KCA_TOPK_CAPFREE_001, KCA_TOPK_COSTAWARE_001
+    from src.strategy.contract import (
+        CERTIFIED_STRATEGIES,
+        KCA_TOPK_CAPFREE_001,
+        KCA_TOPK_COSTAWARE_001,
+        KCA_TOPK_COSTAWARE_002,
+    )
 
     # Given: a stubbed backtest that records the spec the CLI chose
     seen: dict[str, object] = {}
@@ -1586,10 +1596,23 @@ def test_topk_ranker_main_selects_the_capfree_arm_and_logs_falsification(
     assert "falsification=CONSISTENT" in caplog.text
     assert out.exists()
 
-    # And: without the flag the shipped capped arm is still the default
+    # And: without the flag the production strategy is the default
     caplog.clear()
     mod.main(["--price-history", str(ph_path), "--out", str(tmp_path / "r2.parquet")])
+    assert seen["strategy_id"] == KCA_TOPK_COSTAWARE_002.strategy_id
+
+    # And: a named certification is reproduced through --strategy-id
+    mod.main(["--price-history", str(ph_path), "--strategy-id", "KCA-TOPK-COSTAWARE-001",
+              "--out", str(tmp_path / "r3.parquet")])
     assert seen["strategy_id"] == KCA_TOPK_COSTAWARE_001.strategy_id
+    assert CERTIFIED_STRATEGIES["KCA-TOPK-COSTAWARE-001"] is KCA_TOPK_COSTAWARE_001
+
+    # And: --capfree and --strategy-id are mutually exclusive
+    import pytest
+
+    with pytest.raises(SystemExit):
+        mod.main(["--price-history", str(ph_path), "--capfree",
+                  "--strategy-id", "KCA-TOPK-COSTAWARE-001", "--out", str(tmp_path / "r4.parquet")])
 
 
 def test_train_production_bundle_matches_research_training_window() -> None:
@@ -1639,7 +1662,7 @@ def test_demean_label_by_date_centres_net_within_date_and_clips() -> None:
 
 def test_ranker_configuration_is_single_certified_source() -> None:
     import src.ml.topk_ranker_research as mod
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from src.ml.topk_history_features import TOPK_FEATURE_COLS_V2
 
     # Then: one constant set drives both CPCV certification and the production bundle
@@ -1713,10 +1736,10 @@ def test_cpcv_score_with_history_averages_seed_ensemble() -> None:
 
 def test_train_production_bundle_uses_certified_params_seeds_and_demeaned_label() -> None:
     from src.ml.bundle import SeedEnsembleModel
+    from src.ml.topk_contract import RANKER_FEATURE_COLS
     from src.ml.topk_ranker_research import (
         CERT_REGIME_START,
         LABEL_MODE,
-        RANKER_FEATURE_COLS,
         RANKER_MODEL_PARAMS,
         RANKER_SEEDS,
         train_production_bundle,
@@ -1777,17 +1800,17 @@ def test_run_topk_ranker_backtest_trains_on_demeaned_label_and_v2_features(monke
 def test_assert_bundle_screen_parity_accepts_certified_bundle() -> None:
     import dataclasses
 
-    from src.ml.topk_ranker_research import assert_bundle_screen_parity
-    from src.strategy.contract import COST_AWARE_UNIVERSE
+    from src.ml.topk_contract import assert_bundle_screen_parity
+    from src.strategy.contract import PRODUCTION_STRATEGY
 
     # Given: 라이브 스크린과 동일하게 스탬프된 번들
-    bundle = {"select_universe": dataclasses.asdict(COST_AWARE_UNIVERSE)}
+    bundle = {"select_universe": dataclasses.asdict(PRODUCTION_STRATEGY.universe)}
 
     # When / Then: 통과하고 None 을 반환
     assert assert_bundle_screen_parity(bundle) is None
 
     # And: joblib 왕복으로 정수화된 값도 동일 스크린으로 인정
-    coerced = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    coerced = dataclasses.asdict(PRODUCTION_STRATEGY.universe)
     coerced["min_trade_value_100m"] = 100
     coerced["min_market_cap_100m"] = 500
     assert assert_bundle_screen_parity({"select_universe": coerced}) is None
@@ -1798,11 +1821,11 @@ def test_assert_bundle_screen_parity_rejects_stale_tick_cap() -> None:
 
     import pytest
 
-    from src.ml.topk_ranker_research import assert_bundle_screen_parity
-    from src.strategy.contract import COST_AWARE_UNIVERSE
+    from src.ml.topk_contract import assert_bundle_screen_parity
+    from src.strategy.contract import PRODUCTION_STRATEGY
 
     # Given: 완화 전 상한(7.5bp)으로 인증된 구 번들
-    stale = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    stale = dataclasses.asdict(PRODUCTION_STRATEGY.universe)
     stale["max_tick_cost_bp"] = 7.5
 
     # When / Then: 재인증 없이는 fail-closed
@@ -1810,7 +1833,7 @@ def test_assert_bundle_screen_parity_rejects_stale_tick_cap() -> None:
         assert_bundle_screen_parity({"select_universe": stale})
 
     # And: 등락률 밴드가 어긋난 번들도 같은 경로로 차단
-    skewed = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    skewed = dataclasses.asdict(PRODUCTION_STRATEGY.universe)
     skewed["chg_max"] = 0.30
     with pytest.raises(ValueError, match="chg_max"):
         assert_bundle_screen_parity({"select_universe": skewed})
@@ -1819,7 +1842,7 @@ def test_assert_bundle_screen_parity_rejects_stale_tick_cap() -> None:
 def test_assert_bundle_screen_parity_rejects_missing_select_universe() -> None:
     import pytest
 
-    from src.ml.topk_ranker_research import assert_bundle_screen_parity
+    from src.ml.topk_contract import assert_bundle_screen_parity
 
     # Given / When / Then: 키 부재는 미인증 번들로 간주해 즉시 중단
     with pytest.raises(ValueError, match="select_universe"):
@@ -1835,7 +1858,7 @@ def test_select_topk_equal_weight_rejects_stale_screen_bundle() -> None:
     import pytest
 
     from src.ml.costaware_topk import MIN_TOP_K
-    from src.ml.topk_ranker_research import select_topk_equal_weight
+    from src.ml.topk_contract import select_topk_equal_weight
 
     # Given: 완화 전 상한으로 인증된 번들 + 정상 스냅샷
     bundle, snapshot = _synthetic_bundle_and_fixture()
@@ -1863,7 +1886,7 @@ def test_score_topk_candidates_scores_every_row_including_non_admitted() -> None
     import pytest
 
     from src.ml.costaware_topk import MIN_TOP_K
-    from src.ml.topk_ranker_research import score_topk_candidates, select_topk_equal_weight
+    from src.ml.topk_contract import score_topk_candidates, select_topk_equal_weight
 
     # Given: 5행 단면 중 3행만 admitted
     bundle, _ = _synthetic_bundle_and_fixture()
@@ -1927,22 +1950,227 @@ def test_assert_bundle_screen_parity_reads_missing_field_as_default() -> None:
 
     import pytest
 
-    from src.ml.topk_ranker_research import assert_bundle_screen_parity
-    from src.strategy.contract import COST_AWARE_UNIVERSE
+    from src.ml.topk_contract import assert_bundle_screen_parity
+    from src.strategy.contract import COST_AWARE_UNIVERSE, PRODUCTION_STRATEGY
 
     # Given: 필드 도입 이전에 인증되어 키가 없는 구 번들
-    legacy = dataclasses.asdict(COST_AWARE_UNIVERSE)
+    legacy = dataclasses.asdict(PRODUCTION_STRATEGY.universe)
     legacy.pop("exclude_non_screenable_class")
 
-    # When / Then: 라이브가 기본값이면 통과
-    assert assert_bundle_screen_parity({"select_universe": legacy}) is None
+    # When / Then: 생략된 키는 도입 이전 기본값(False)으로 읽힌다 — 클래스 필터가 없는
+    # 라이브 스크린에서는 통과한다
+    assert assert_bundle_screen_parity({"select_universe": legacy}, COST_AWARE_UNIVERSE) is None
 
-    # And: 라이브가 기본값에서 벗어나면 재인증 전까지 차단
-    live = dataclasses.replace(COST_AWARE_UNIVERSE, exclude_non_screenable_class=True)
+    # And: 클래스 필터가 켜진 라이브 스크린에서는 strategy_id 없는 번들은 차단된다
     with pytest.raises(ValueError, match="exclude_non_screenable_class"):
-        assert_bundle_screen_parity({"select_universe": legacy}, live)
+        assert_bundle_screen_parity({"select_universe": legacy})
 
     # And: 라이브가 모르는 필드를 가진 번들도 fail-closed
-    extra = {**dataclasses.asdict(COST_AWARE_UNIVERSE), "future_field": True}
+    extra = {**dataclasses.asdict(PRODUCTION_STRATEGY.universe), "future_field": True}
     with pytest.raises(ValueError, match="future_field"):
         assert_bundle_screen_parity({"select_universe": extra})
+
+
+def test_train_production_bundle_is_stamped_with_the_production_strategy(caplog) -> None:
+    import logging
+
+    from src.ml.topk_contract import assert_bundle_screen_parity
+    from src.ml.topk_ranker_research import CERT_REGIME_START, train_production_bundle
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    bundle = train_production_bundle(
+        ph, market_dates, d_to_idx, min_train_rows=10, train_start=CERT_REGIME_START)
+
+    assert bundle["strategy_id"] == "KCA-TOPK-COSTAWARE-002"
+    assert bundle["select_universe"]["exclude_non_screenable_class"] is True
+    with caplog.at_level(logging.WARNING):
+        assert assert_bundle_screen_parity(bundle) is None
+    assert [r for r in caplog.records if "GRANDFATHERED" in r.getMessage()] == []
+
+
+def test_non_screenable_rows_never_enter_the_production_pools() -> None:
+    import numpy as np
+
+    from src.ml.topk_ranker_research import build_dual_pool
+    from src.strategy.contract import PRODUCTION_STRATEGY, training_universe
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    ph.loc[ph["symbol"] == "000000", "is_screenable"] = False
+
+    pool, sel_mask = build_dual_pool(
+        ph, market_dates, d_to_idx,
+        train_spec=training_universe(PRODUCTION_STRATEGY.universe),
+        select_spec=PRODUCTION_STRATEGY.universe,
+    )
+    assert "000000" not in set(pool["symbol"].unique())
+    assert not np.asarray(sel_mask)[pool["symbol"].to_numpy() == "000000"].any()
+
+
+def test_training_without_the_verdict_fails_closed() -> None:
+    import pytest
+
+    from src.ml.topk_ranker_research import CERT_REGIME_START, train_production_bundle
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    verdict_free = ph.drop(columns=["is_screenable"])
+
+    with pytest.raises(ValueError, match="is_screenable"):
+        train_production_bundle(
+            verdict_free, market_dates, d_to_idx, min_train_rows=10, train_start=CERT_REGIME_START)
+
+
+def test_explicit_001_run_matches_the_derived_train_screen() -> None:
+    import dataclasses
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import CERT_REGIME_START, run_topk_ranker_backtest
+    from src.strategy.contract import DEFAULT_UNIVERSE, KCA_TOPK_COSTAWARE_001, training_universe
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    cv = CombinatorialPurgedCV(n_groups=4, k_test=2, purge_gap=0, embargo_gap=0)
+
+    derived = run_topk_ranker_backtest(
+        ph, market_dates, d_to_idx, spec=KCA_TOPK_COSTAWARE_001,
+        cv=cv, min_train_rows=1, train_start=CERT_REGIME_START)
+    explicit = run_topk_ranker_backtest(
+        ph, market_dates, d_to_idx, spec=KCA_TOPK_COSTAWARE_001, train_spec=DEFAULT_UNIVERSE,
+        cv=cv, min_train_rows=1, train_start=CERT_REGIME_START)
+
+    assert dataclasses.asdict(training_universe(KCA_TOPK_COSTAWARE_001.universe)) == dataclasses.asdict(DEFAULT_UNIVERSE)
+    assert derived.train_universe == explicit.train_universe == dataclasses.asdict(DEFAULT_UNIVERSE)
+    assert (derived.n_train_rows, derived.n_select_rows, derived.verdict) == (
+        explicit.n_train_rows, explicit.n_select_rows, explicit.verdict)
+
+
+def test_backtest_report_records_the_derived_train_screen() -> None:
+    import dataclasses
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import CERT_REGIME_START, run_topk_ranker_backtest
+    from src.strategy.contract import COST_AWARE_SCREENABLE_UNIVERSE, training_universe
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+    report = run_topk_ranker_backtest(
+        ph, market_dates, d_to_idx,
+        cv=CombinatorialPurgedCV(n_groups=4, k_test=2, purge_gap=0, embargo_gap=0),
+        min_train_rows=1, train_start=CERT_REGIME_START,
+    )
+
+    assert report.strategy_id == "KCA-TOPK-COSTAWARE-002"
+    assert report.train_universe == dataclasses.asdict(training_universe(COST_AWARE_SCREENABLE_UNIVERSE))
+
+
+def _hook_frames() -> tuple:
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(5)
+    cert = pd.DataFrame([
+        {"date": d, "symbol": f"{s:06d}", "f1": float(rng.normal()),
+         "f2": float(rng.normal()), "train_label": float(rng.normal()) * 0.01,
+         "exit_date": pd.Timestamp(d) + pd.tseries.offsets.BDay(1)}
+        for d in pd.bdate_range("2023-02-01", periods=8)
+        for s in range(4)
+    ])
+    hist = pd.DataFrame([
+        {"date": d, "symbol": f"{s:06d}", "f1": float(rng.normal()),
+         "f2": float(rng.normal()), "train_label": float(rng.normal()) * 0.01,
+         "exit_date": pd.Timestamp(d) + pd.tseries.offsets.BDay(1)}
+        for d in pd.bdate_range("2022-06-01", periods=8)
+        for s in range(4)
+    ])
+    return cert, hist
+
+
+def test_cpcv_score_with_history_hooks_none_is_identity() -> None:
+    import pandas as pd
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import cpcv_score_with_history
+
+    cert, hist = _hook_frames()
+    cv = CombinatorialPurgedCV(n_groups=4, k_test=2, purge_gap=0, embargo_gap=0)
+
+    base = cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=5,
+                                   model_params=dict(_TINY_MODEL_PARAMS), seeds=(1,))
+    hooked = cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=5,
+                                     model_params=dict(_TINY_MODEL_PARAMS), seeds=(1,),
+                                     fold_train_transform=None, fold_observer=None)
+
+    pd.testing.assert_frame_equal(hooked, base)
+
+
+def test_cpcv_score_with_history_observer_called_per_fold() -> None:
+    import pandas as pd
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import cpcv_score_with_history
+
+    cert, hist = _hook_frames()
+    cv = CombinatorialPurgedCV(n_groups=4, k_test=2, purge_gap=0, embargo_gap=0)
+    seen: list = []
+
+    def _obs(fold_id, test_rows, model):
+        seen.append((fold_id, sorted(pd.to_datetime(test_rows["date"]).unique().tolist()), model))
+
+    oof = cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=5,
+                                  model_params=dict(_TINY_MODEL_PARAMS), seeds=(1,),
+                                  fold_observer=_obs)
+
+    assert len(seen) == 6
+    assert {f for f, _, _ in seen} == set(oof["cpcv_fold"].unique().tolist())
+    cert_work = cert.sort_values("date")
+    splits = {fid: (set(cert_work.iloc[tr]["date"].tolist()), set(cert_work.iloc[te]["date"].tolist()))
+              for tr, te, fid in cv.split(cert_work["date"])}
+    for fold_id, test_dates, _model in seen:
+        train_dates, fold_test = splits[fold_id]
+        assert set(test_dates) == {pd.Timestamp(d) for d in fold_test}
+        assert set(test_dates).isdisjoint(train_dates)
+
+
+def test_cpcv_score_with_history_transform_applies_to_training_only() -> None:
+    import pandas as pd
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import cpcv_score_with_history
+
+    cert, hist = _hook_frames()
+    cv = CombinatorialPurgedCV(n_groups=4, k_test=2, purge_gap=0, embargo_gap=0)
+    calls: list = []
+
+    def _const(fold_id, train):
+        calls.append((fold_id, sorted(pd.to_datetime(train["date"]).unique().tolist())))
+        out = train.copy()
+        out["f1"] = 0.0
+        return out
+
+    base = cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=5,
+                                   model_params=dict(_TINY_MODEL_PARAMS), seeds=(1,))
+    shifted = cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=5,
+                                      model_params=dict(_TINY_MODEL_PARAMS), seeds=(1,),
+                                      fold_train_transform=_const)
+
+    assert len(calls) == 6
+    assert not base["pred"].equals(shifted["pred"])
+    cert_work = cert.sort_values("date")
+    test_by_fold = {fid: set(cert_work.iloc[te]["date"].tolist()) for _, te, fid in cv.split(cert_work["date"])}
+    for fold_id, train_dates in calls:
+        assert set(train_dates).isdisjoint(set(test_by_fold[fold_id]))
+
+
+def test_cpcv_score_with_history_rejects_index_changing_transform() -> None:
+    import pytest
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import cpcv_score_with_history
+
+    cert, hist = _hook_frames()
+    cv = CombinatorialPurgedCV(n_groups=4, k_test=2, purge_gap=0, embargo_gap=0)
+
+    def _drop(fold_id, train):
+        return train.iloc[1:]
+
+    with pytest.raises(ValueError, match="fold 0"):
+        cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=5,
+                                model_params=dict(_TINY_MODEL_PARAMS), seeds=(1,),
+                                fold_train_transform=_drop)

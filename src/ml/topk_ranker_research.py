@@ -7,6 +7,7 @@ import dataclasses
 import logging
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from scipy.stats import ttest_rel
 from src import settings
 from src.data.io_utils import atomic_write_parquet
 from src.execution.cost_model import TICK_REFORM_DATE
-from src.ml.bundle import build_inline_bundle, fit_seed_ensemble
+from src.ml.bundle import SeedEnsembleModel, build_inline_bundle, fit_seed_ensemble
 from src.ml.costaware_topk import (
     MIN_POST_REFORM_T_STAT,
     CostStressPoint,
@@ -40,49 +41,25 @@ from src.ml.research.v3_engine import (
 from src.ml.research.v3_metrics import calculate_series_metrics
 from src.ml.robust_eval import CombinatorialPurgedCV, cpcv_oof_predict
 from src.ml.topk_contract import (
-    FEATURE_CONTRACT_VERSION_KEY as FEATURE_CONTRACT_VERSION_KEY,
-)
-from src.ml.topk_contract import (
-    RANKER_FEATURE_COLS as RANKER_FEATURE_COLS,
-)
-from src.ml.topk_contract import (
-    TOPK_FEATURE_CONTRACT_VERSION as TOPK_FEATURE_CONTRACT_VERSION,
-)
-from src.ml.topk_contract import (
-    TOPK_RANKER_BUNDLE_DIR as TOPK_RANKER_BUNDLE_DIR,
-)
-from src.ml.topk_contract import (
-    assert_bundle_screen_parity as assert_bundle_screen_parity,
-)
-from src.ml.topk_contract import (
-    build_topk_feature_manifest as build_topk_feature_manifest,
-)
-from src.ml.topk_contract import (
-    compute_derived_features as compute_derived_features,
-)
-from src.ml.topk_contract import (
-    save_production_bundle as save_production_bundle,
-)
-from src.ml.topk_contract import (
-    score_topk_candidates as score_topk_candidates,
-)
-from src.ml.topk_contract import (
-    select_topk_by_score as select_topk_by_score,
-)
-from src.ml.topk_contract import (
-    select_topk_equal_weight as select_topk_equal_weight,
+    FEATURE_CONTRACT_VERSION_KEY,
+    RANKER_FEATURE_COLS,
+    TOPK_FEATURE_CONTRACT_VERSION,
+    build_topk_feature_manifest,
+    compute_derived_features,
+    select_topk_by_score,
 )
 from src.ml.topk_history_features import attach_lagged_flow_features, attach_topk_features
 from src.strategy.contract import (
-    DEFAULT_UNIVERSE,
+    CERTIFIED_STRATEGIES,
     KCA_TOPK_CAPFREE_001,
-    KCA_TOPK_COSTAWARE_001,
     MIN_PATH_WIN_RATE,
     MIN_TOP_K,
+    PRODUCTION_STRATEGY,
     CostSpec,
     StrategySpec,
     UniverseSpec,
     select_universe,
+    training_universe,
 )
 from src.utils.cli_logging import configure_cli_logging
 
@@ -526,6 +503,8 @@ def cpcv_score_with_history(
     min_train_rows: int = TRAIN_POOL_MIN_ROWS,
     seeds: tuple[int, ...] = RANKER_SEEDS,
     seam_embargo_days: int = HISTORY_SEAM_EMBARGO_DAYS,
+    fold_train_transform: Callable[[int, pd.DataFrame], pd.DataFrame] | None = None,
+    fold_observer: Callable[[int, pd.DataFrame, SeedEnsembleModel], None] | None = None,
 ) -> pd.DataFrame:
     """Score certification rows with CPCV bins, fitting on history plus fold rows.
 
@@ -545,14 +524,22 @@ def cpcv_score_with_history(
         seeds: LightGBM seeds averaged per fold (the serving bundle uses the same).
         seam_embargo_days: Pool dates before each fold's first test date within which history labels
             may not realize (label-horizon purge at the certification seam).
+        fold_train_transform: Optional (fold_id, train_frame) -> train_frame applied to each fold's
+            assembled training rows before fitting. It must return the same index (same rows, same
+            order); it exists so experiments can alter training features per fold using only that fold's
+            training information. None fits on the rows unchanged.
+        fold_observer: Optional (fold_id, test_rows, fitted_model) callback invoked once per fold after
+            the fold's own predictions; it lets callers score alternative feature frames for the fold's
+            test dates with the fold model, which is out-of-sample for exactly those dates. None skips it.
 
     Returns:
-        Out-of-fold predictions covering cert_df rows only, carrying pred and
-        cpcv_fold with the original index preserved.
+        Out-of-fold predictions covering cert_df rows only, carrying pred and cpcv_fold with the
+        original index preserved (unchanged by either hook).
 
     Raises:
         ValueError: When a fold's training rows fall below min_train_rows.
         ValueError: When hist_df is non-empty and lacks the exit_date column.
+        ValueError: When fold_train_transform changes the training index.
     """
     splitter = (
         cv
@@ -596,6 +583,14 @@ def cpcv_score_with_history(
         else:
             fold_hist = hist_work
         train_full = pd.concat([fold_hist, train_cert]) if len(fold_hist) else train_cert
+        if fold_train_transform is not None:
+            transformed = fold_train_transform(int(fold_id), train_full)
+            if not transformed.index.equals(train_full.index):
+                raise ValueError(
+                    f"fold {int(fold_id)} fold_train_transform changed the training index "
+                    f"({len(train_full)} rows -> {len(transformed)} rows)"
+                )
+            train_full = transformed
         if len(train_full) < int(min_train_rows):
             raise ValueError(
                 f"fold {int(fold_id)} training rows {len(train_full)} below min_train_rows {min_train_rows}"
@@ -607,6 +602,8 @@ def cpcv_score_with_history(
         fold_df["pred"] = np.asarray(reg.predict(val_f[list(feature_cols)]), dtype=np.float64)
         fold_df["cpcv_fold"] = int(fold_id)
         parts.append(fold_df)
+        if fold_observer is not None:
+            fold_observer(int(fold_id), cert_work.iloc[test_idx], reg)
     if len(hist_work):
         logger.info(
             "[ALGO] stage=cpcv_seam_purge embargo_days=%d hist_rows=%d folds_affected=%d max_excluded=%d",
@@ -856,8 +853,8 @@ def run_topk_ranker_backtest(
     market_dates: np.ndarray,
     d_to_idx: dict[pd.Timestamp, int],
     *,
-    spec: StrategySpec = KCA_TOPK_COSTAWARE_001,
-    train_spec: UniverseSpec = DEFAULT_UNIVERSE,
+    spec: StrategySpec = PRODUCTION_STRATEGY,
+    train_spec: UniverseSpec | None = None,
     cv: CombinatorialPurgedCV | None = None,
     model_params: dict[str, Any] | None = None,
     huber_delta: float = 0.9,
@@ -872,7 +869,7 @@ def run_topk_ranker_backtest(
         market_dates: Full trading calendar.
         d_to_idx: Date-to-index lookup for forward exits.
         spec: Strategy specification carrying top_k, select universe and cost.
-        train_spec: Wide training screen without the cost cap.
+        train_spec: Wide training screen; None derives training_universe(spec.universe).
         cv: CPCV splitter override.
         model_params: LightGBM params override.
         huber_delta: Huber alpha for the ranker.
@@ -890,12 +887,13 @@ def run_topk_ranker_backtest(
     if int(spec.top_k) < MIN_TOP_K:
         raise ValueError(f"top_k {spec.top_k} below the minimum investable K {MIN_TOP_K}")
     k = int(spec.top_k)
+    eff_train_spec = training_universe(spec.universe) if train_spec is None else train_spec
     # 기본 학습 시작은 패널 최소일. 비용이 PIT라 개편전도 올바르게 라벨링되며, 인증 경계는 split_regime_frames가 별도로 고정한다.
     eff_train_start = (
         pd.Timestamp(pd.to_datetime(ph["date"]).min()) if train_start is None else pd.Timestamp(train_start)
     )
     # 이중 풀 → PIT 라벨 → 인증구간 비닝+히스토리 증강 스코어 → 선택 마스크 제한 → 양 팔 평가
-    pool, sel_mask = build_dual_pool(ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe)
+    pool, sel_mask = build_dual_pool(ph, market_dates, d_to_idx, train_spec=eff_train_spec, select_spec=spec.universe)
     constructible_regimes = (
         ("pre_reform", "post_reform") if spec.universe.max_tick_cost_bp is None else ("post_reform",)
     )
@@ -937,7 +935,7 @@ def run_topk_ranker_backtest(
     return TopKRankerReport(
         strategy_id=spec.strategy_id,
         top_k=k,
-        train_universe=dataclasses.asdict(train_spec),
+        train_universe=dataclasses.asdict(eff_train_spec),
         select_universe=dataclasses.asdict(spec.universe),
         cost=dataclasses.asdict(spec.cost),
         date_min=date_min,
@@ -1018,8 +1016,8 @@ def train_production_bundle(
     market_dates: np.ndarray,
     d_to_idx: dict[pd.Timestamp, int],
     *,
-    spec: StrategySpec = KCA_TOPK_COSTAWARE_001,
-    train_spec: UniverseSpec = DEFAULT_UNIVERSE,
+    spec: StrategySpec = PRODUCTION_STRATEGY,
+    train_spec: UniverseSpec | None = None,
     train_start: pd.Timestamp | None = None,
     model_params: dict[str, Any] | None = None,
     huber_delta: float = 0.9,
@@ -1033,7 +1031,7 @@ def train_production_bundle(
         market_dates: Full trading calendar.
         d_to_idx: Date-to-index lookup for forward exits.
         spec: Strategy specification carrying top_k, select universe and cost.
-        train_spec: Wide training screen without the cost cap.
+        train_spec: Wide training screen; None derives training_universe(spec.universe).
         train_start: Training-window start; None selects the panel minimum date.
         model_params: LightGBM params forwarded to build_inline_bundle; None
             selects RANKER_MODEL_PARAMS, the configuration CPCV certifies.
@@ -1050,11 +1048,12 @@ def train_production_bundle(
     """
     if int(spec.top_k) < MIN_TOP_K:
         raise ValueError(f"top_k {spec.top_k} below the minimum investable K {MIN_TOP_K}")
+    eff_train_spec = training_universe(spec.universe) if train_spec is None else train_spec
     eff_train_start = (
         pd.Timestamp(pd.to_datetime(ph["date"]).min()) if train_start is None else pd.Timestamp(train_start)
     )
     # 인증구간 와이드 풀 조립 후 PIT 라벨 부착
-    pool, _sel_mask = build_dual_pool(ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe)
+    pool, _sel_mask = build_dual_pool(ph, market_dates, d_to_idx, train_spec=eff_train_spec, select_spec=spec.universe)
     labeled = demean_label_by_date(attach_pit_net_label(pool, cost=spec.cost))
     cert_df, hist_df = split_regime_frames(labeled, train_start=eff_train_start)
     train_df = pd.concat([hist_df, cert_df]) if len(hist_df) else cert_df
@@ -1106,14 +1105,21 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="training-window start YYYY-MM-DD; augments training only and never moves the certification boundary (default: the panel minimum date)",
     )
-    parser.add_argument(
+    strategy_group = parser.add_mutually_exclusive_group()
+    strategy_group.add_argument(
         "--capfree",
         action="store_true",
         help="select with the cap-free universe (KCA-TOPK-CAPFREE-001) instead of the tick-cost-capped one",
     )
+    strategy_group.add_argument(
+        "--strategy-id",
+        choices=sorted(CERTIFIED_STRATEGIES),
+        default=PRODUCTION_STRATEGY.strategy_id,
+        help="certified strategy to reproduce (default: the production strategy)",
+    )
     args = parser.parse_args(argv)
     configure_cli_logging(logging.BASIC_FORMAT)
-    base_spec = KCA_TOPK_CAPFREE_001 if args.capfree else KCA_TOPK_COSTAWARE_001
+    base_spec = KCA_TOPK_CAPFREE_001 if args.capfree else CERTIFIED_STRATEGIES[args.strategy_id]
     spec = _dataclasses.replace(base_spec, top_k=int(args.top_k)) if args.top_k is not None else base_spec
     if not os.path.exists(args.price_history):
         raise ValueError(f"price_history not found: {args.price_history}")

@@ -919,6 +919,9 @@ class KisApiClient:
         target_date는 KIS 표준 YYYYMMDD 형식 문자열을 그대로 FID_INPUT_DATE_1에 전달한다.
         호출부가 YYYYMMDD 변환 책임을 진다. market_div_code는 호출부가 항상 명시한다.
         KIS 서버 보관 한도(~1년) 밖의 날짜는 rt_cd != '0' 응답이 정상이며 그대로 반환한다.
+        A page that fails after earlier pages succeeded returns that failure, not the rows collected so far:
+        a silently head-truncated session would otherwise be certified COMPLETE and never re-fetched before
+        the rolling retention expires it.
         """
         normalized = self._normalize_market_div_code(market_div_code)
         if not normalized:
@@ -941,9 +944,12 @@ class KisApiClient:
                 session.get, url, headers=self._get_headers("FHKST03010230"), params=params
             )
             if res.get("rt_cd") != "0":
-                if not collected:
-                    return res
-                break
+                if collected:
+                    logger.warning(
+                        "[DATA] stage=historical_minute_chart status=PAGE_FAILED code=%s date=%s cursor=%s rows_discarded=%d msg_cd=%s",
+                        code, target_date, cursor_hour, len(collected), res.get("msg_cd", ""),
+                    )
+                return res
             rows = res.get("output2") or []
             if not rows:
                 break
@@ -1017,6 +1023,90 @@ class KisApiClient:
         in_range.sort(key=lambda r: str(r.get("deal_date") or ""))
         return {"rt_cd": "0", "output": in_range}
 
+    async def get_investor_trade_daily_page(
+        self,
+        session: aiohttp.ClientSession,
+        code: str,
+        cursor_ymd: str,
+        *,
+        market_div_code: str,
+    ) -> dict[str, Any]:
+        """Fetch one page of per-stock daily investor flow (TR FHPTJ04160001).
+
+        GET /uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily. The vendor returns
+        the trading days ending at cursor_ymd; older history is reached only by re-calling with an
+        earlier cursor (no tr_cont continuation). One call is one _handle_request, so the host rate
+        limiter is acquired once per HTTP attempt.
+
+        Args:
+            session: Open aiohttp session; its bound ``get`` is used so a token rejection can refresh.
+            code: Stock code sent verbatim as FID_INPUT_ISCD (callers own zero-padding).
+            cursor_ymd: Latest date to cover (YYYYMMDD), sent verbatim as FID_INPUT_DATE_1.
+            market_div_code: Market division (J, NX or UN; case-insensitive).
+
+        Returns:
+            The vendor JSON body unchanged, including non-"0" rt_cd bodies and the synthetic
+            rt_cd "9" dict returned after transport or TPS retry exhaustion.
+
+        Raises:
+            ValueError: market_div_code is not J, NX or UN.
+        """
+        normalized = self._normalize_market_div_code(market_div_code)
+        if not normalized:
+            raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": normalized,
+            "FID_INPUT_ISCD": code,
+            "FID_INPUT_DATE_1": cursor_ymd,
+            "FID_ORG_ADJ_PRC": "",
+            "FID_ETC_CLS_CODE": "",
+        }
+        return await self._handle_request(
+            session.get, url, headers=self._get_headers("FHPTJ04160001"), params=params
+        )
+
+    async def get_program_trade_daily_page(
+        self,
+        session: aiohttp.ClientSession,
+        code: str,
+        cursor_ymd: str,
+        *,
+        market_div_code: str,
+    ) -> dict[str, Any]:
+        """Fetch one page of per-stock daily program-trading flow (TR FHPPG04650201).
+
+        GET /uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily. The vendor returns
+        the trading days ending at cursor_ymd; older history is reached only by re-calling with an
+        earlier cursor (no tr_cont continuation). One call is one _handle_request, so the host rate
+        limiter is acquired once per HTTP attempt.
+
+        Args:
+            session: Open aiohttp session; its bound ``get`` is used so a token rejection can refresh.
+            code: Stock code sent verbatim as FID_INPUT_ISCD (callers own zero-padding).
+            cursor_ymd: Latest date to cover (YYYYMMDD), sent verbatim as FID_INPUT_DATE_1.
+            market_div_code: Market division (J, NX or UN; case-insensitive).
+
+        Returns:
+            The vendor JSON body unchanged (rows under ``output``), including non-"0" rt_cd bodies
+            and the synthetic rt_cd "9" dict returned after transport or TPS retry exhaustion.
+
+        Raises:
+            ValueError: market_div_code is not J, NX or UN.
+        """
+        normalized = self._normalize_market_div_code(market_div_code)
+        if not normalized:
+            raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": normalized,
+            "FID_INPUT_ISCD": code,
+            "FID_INPUT_DATE_1": cursor_ymd,
+        }
+        return await self._handle_request(
+            session.get, url, headers=self._get_headers("FHPPG04650201"), params=params
+        )
+
     async def get_program_trade_daily_history(
         self, session: aiohttp.ClientSession, code: str, start_date: str, end_date: str, market_div_code: str | None = None
     ) -> dict[str, Any]:
@@ -1024,19 +1114,11 @@ class KisApiClient:
         normalized = self._normalize_market_div_code(market_div_code)
         if not normalized:
             raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
         collected: list[dict[str, Any]] = []
         seen_dates: set[str] = set()
         cursor = end_date
         for _ in range(120):
-            params = {
-                "FID_COND_MRKT_DIV_CODE": normalized,
-                "FID_INPUT_ISCD": code,
-                "FID_INPUT_DATE_1": cursor,
-            }
-            res = await self._handle_request(
-                session.get, url, headers=self._get_headers("FHPPG04650201"), params=params
-            )
+            res = await self.get_program_trade_daily_page(session, code, cursor, market_div_code=normalized)
             if res.get("rt_cd") != "0":
                 if not collected:
                     return res

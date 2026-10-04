@@ -856,3 +856,35 @@ class KiwoomApiClient:
                 continue
             kept.append(dict(r))
         return {"rt_cd": "0", "output2": kept, "vendor": "kiwoom"}
+
+    async def get_investor_institution_daily(
+        self,
+        session: aiohttp.ClientSession,
+        code: str,
+        base_ymd: str,
+    ) -> BrokerPayload:
+        """Fetch one page of per-stock daily investor/institution net-buy amounts (TR ka10059).
+
+        POST /api/dostk/stkinfo in amount mode (amt_qty_tp=1), net-buy (trde_tp=0), unit_tp=1000,
+        as a single page (cont-yn N, empty next-key). Admission, the auth-rejection replay and 429
+        retries are those of _post_tr; the response headers are discarded.
+
+        Args:
+            session: Open aiohttp session.
+            code: Stock code sent verbatim as stk_cd.
+            base_ymd: Latest date to cover (YYYYMMDD), sent verbatim as dt.
+
+        Returns:
+            The vendor JSON body unchanged, including non-zero return_code bodies.
+
+        Raises:
+            RuntimeError: Token issuance failed during an auth refresh.
+            aiohttp.ClientError: Transport failure or non-JSON reply.
+        """
+        data, _headers = await self._post_tr(
+            session,
+            "ka10059",
+            "/api/dostk/stkinfo",
+            {"dt": base_ymd, "stk_cd": code, "amt_qty_tp": "1", "trde_tp": "0", "unit_tp": "1000"},
+        )
+        return data

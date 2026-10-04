@@ -77,6 +77,25 @@ def test_get_historical_minute_chart_returns_raw_failure_outside_retention() -> 
     handle_request.assert_awaited_once()
 
 
+def test_get_historical_minute_chart_returns_failure_when_later_page_fails() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+    page1 = {"rt_cd": "0", "output2": [{"stck_cntg_hour": "153000"}, {"stck_cntg_hour": "133100"}]}
+    failure = {"rt_cd": "9", "msg1": "최대 재시도 횟수 초과 (TPS 제한)"}
+    handle_request = AsyncMock(side_effect=[page1, failure])
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            return await client.get_historical_minute_chart(
+                _FakeSession(), "005930", "20250815",
+                end_hour="153000", floor_hour="090000", market_div_code="J",
+            )
+
+    result = asyncio.run(_runner())
+
+    assert result["rt_cd"] == "9"
+    assert "output2" not in result
+
+
 def test_decrement_hour_one_second() -> None:
     from src.api.kis.client import KisApiClient
     client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")

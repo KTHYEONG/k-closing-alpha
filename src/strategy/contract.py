@@ -20,12 +20,15 @@ __all__ = [
     "APPROXIMATE_SPEARMAN_THRESHOLD",
     "CAPFREE_UNIVERSE",
     "CEILING_CHG_THRESHOLD",
+    "CERTIFIED_STRATEGIES",
+    "COST_AWARE_SCREENABLE_UNIVERSE",
     "COST_AWARE_UNIVERSE",
     "DEFAULT_REALIZED_VOL",
     "DEFAULT_UNIVERSE",
     "KCA_TOP3_SHADOW_001",
     "KCA_TOPK_CAPFREE_001",
     "KCA_TOPK_COSTAWARE_001",
+    "KCA_TOPK_COSTAWARE_002",
     "KRX_DAILY_LIMIT_RATIO",
     "LABEL_BAD_THRESHOLD",
     "LABEL_GOOD_THRESHOLD",
@@ -34,6 +37,8 @@ __all__ = [
     "MIN_ROUND_TRIP_TICKS",
     "MIN_TOP_K",
     "PA_COST",
+    "PRODUCTION_STRATEGY",
+    "SCREENABLE_CLASS_COL",
     "CostSpec",
     "ExecutionMode",
     "FeatureContractRow",
@@ -49,6 +54,7 @@ __all__ = [
     "select_universe",
     "statutory_bp_asof",
     "tick_cost_bp",
+    "training_universe",
 ]
 
 
@@ -74,8 +80,17 @@ LABEL_GOOD_THRESHOLD: float = 0.01
 LABEL_BAD_THRESHOLD: float = -0.02
 
 KRX_DAILY_LIMIT_RATIO: float = 0.31
+# Maximum |close/prev_close - 1| of a legal KRX session (+-30% limit) plus a 1pp margin for tick rounding and float error; larger moves on unadjusted prices imply a corporate action.
 
 APPROXIMATE_SPEARMAN_THRESHOLD: float = 0.99
+
+SCREENABLE_CLASS_COL: str = "is_screenable"
+"""Column carrying the point-in-time security-class verdict consumed by select_universe.
+
+Producers (src.data.screenable_class.attach_screenable_class for training panels and the
+decision frame written by src.daily.collect for serving) must use this name so that
+UniverseSpec.exclude_non_screenable_class reads one column in every environment.
+"""
 
 # 비용인식 랭커가 인증받은 최소 투자 바스켓 크기로 모든 StrategySpec.top_k의 유일한 수치 원천이다.
 MIN_TOP_K: int = 3
@@ -102,7 +117,8 @@ class UniverseSpec:
 
     New fields must default to the behavior that predates them: bundles certified
     before a field existed omit its key, and screen parity reads the omission as
-    the default.
+    the default. A certified screen that needs a new behavior gets a new constant
+    and strategy id; field defaults are never flipped.
     """
 
     chg_min: float = 0.02
@@ -174,6 +190,55 @@ KCA_TOPK_CAPFREE_001: StrategySpec = StrategySpec(
     strategy_id="KCA-TOPK-CAPFREE-001", top_k=MIN_TOP_K, universe=CAPFREE_UNIVERSE, cost=AA_COST
 )
 
+COST_AWARE_SCREENABLE_UNIVERSE: UniverseSpec = UniverseSpec(
+    chg_min=0.02,
+    chg_max=0.10,
+    min_trade_value_100m=100.0,
+    min_market_cap_100m=500.0,
+    exclude_ceiling=True,
+    max_tick_cost_bp=MAX_TICK_COST_BP,
+    exclude_non_screenable_class=True,
+)
+
+KCA_TOPK_COSTAWARE_002: StrategySpec = StrategySpec(
+    strategy_id="KCA-TOPK-COSTAWARE-002", top_k=MIN_TOP_K, universe=COST_AWARE_SCREENABLE_UNIVERSE, cost=AA_COST
+)
+
+PRODUCTION_STRATEGY: StrategySpec = KCA_TOPK_COSTAWARE_002
+"""The certified strategy the live system serves and the retrain certifies.
+
+Single binding for every live default (cohort class filter, admission, rank pool, bundle
+screen parity) and every certification default (ranker CPCV, production bundle, retrain
+gate). Changing it is a certification event: the retrain gate refuses to promote across a
+strategy change and requires manual certification.
+"""
+
+CERTIFIED_STRATEGIES: dict[str, StrategySpec] = {
+    "KCA-TOPK-COSTAWARE-001": KCA_TOPK_COSTAWARE_001,
+    "KCA-TOPK-CAPFREE-001": KCA_TOPK_CAPFREE_001,
+    "KCA-TOPK-COSTAWARE-002": KCA_TOPK_COSTAWARE_002,
+}
+"""Certified strategies by strategy_id (KCA-TOPK-COSTAWARE-001, KCA-TOPK-CAPFREE-001,
+KCA-TOPK-COSTAWARE-002) for research CLIs that reproduce a named certification."""
+
+
+def training_universe(select: UniverseSpec) -> UniverseSpec:
+    """Return the wide training screen nested around a selection screen.
+
+    Training reflects execution cost only through the PIT net label, so the training pool
+    drops the per-tick cost cap and keeps every other admission field — including the
+    security-class filter — identical to the selection screen. This is exactly the pair
+    assert_nested_universe_specs certifies, derived instead of hand-maintained so the class
+    rule cannot diverge between the train and select pools.
+
+    Args:
+        select: Selection screen of a certified strategy.
+
+    Returns:
+        A UniverseSpec equal to select with max_tick_cost_bp=None.
+    """
+    return dataclasses.replace(select, max_tick_cost_bp=None)
+
 
 def derive_chg_ratio(close: np.ndarray, prev_close: np.ndarray, *, limit: float = KRX_DAILY_LIMIT_RATIO) -> np.ndarray:
     """Deterministic close/prev_close - 1; bad prev_close and limit violations yield NaN."""
@@ -243,7 +308,7 @@ def select_universe(df: pd.DataFrame, spec: UniverseSpec = DEFAULT_UNIVERSE) -> 
     if spec.max_tick_cost_bp is not None:
         required = [*required, "tick_cost_bp"]
     if spec.exclude_non_screenable_class:
-        required = [*required, "is_screenable"]
+        required = [*required, SCREENABLE_CLASS_COL]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"select_universe missing required columns: {missing}")
@@ -267,7 +332,7 @@ def select_universe(df: pd.DataFrame, spec: UniverseSpec = DEFAULT_UNIVERSE) -> 
         tick_bp = df["tick_cost_bp"].to_numpy(dtype=np.float64)
         mask = mask & (tick_bp <= float(spec.max_tick_cost_bp))
     if spec.exclude_non_screenable_class:
-        screenable = df["is_screenable"].to_numpy(dtype=bool)
+        screenable = df[SCREENABLE_CLASS_COL].to_numpy(dtype=bool)
         mask = mask & screenable
     return np.asarray(mask, dtype=bool)
 

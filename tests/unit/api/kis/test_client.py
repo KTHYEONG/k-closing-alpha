@@ -615,3 +615,249 @@ def test_issue_daily_token_issues_when_cache_absent(tmp_path) -> None:
 
     assert asyncio.run(client.issue_daily_token(_issuing_session("TOK"))) is True
     assert client.token == "TOK"
+
+
+def _flow_client() -> KisApiClient:
+    return KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+
+
+def test_investor_page_request_identity() -> None:
+    client = _flow_client()
+    handle_request = AsyncMock(return_value={"rt_cd": "0", "output2": []})
+    sess = _FakeSession()
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            return await client.get_investor_trade_daily_page(
+                sess, "005930", "20260910", market_div_code="J",
+            )
+
+    asyncio.run(_runner())
+
+    assert handle_request.await_count == 1
+    call = handle_request.await_args
+    assert getattr(call.args[0], "__self__", None) is sess
+    assert call.args[1] == f"{client.base_url}/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
+    assert call.kwargs["headers"] == client._get_headers("FHPTJ04160001")
+    assert "tr_cont" not in call.kwargs["headers"]
+    assert list(call.kwargs["params"].items()) == [
+        ("FID_COND_MRKT_DIV_CODE", "J"),
+        ("FID_INPUT_ISCD", "005930"),
+        ("FID_INPUT_DATE_1", "20260910"),
+        ("FID_ORG_ADJ_PRC", ""),
+        ("FID_ETC_CLS_CODE", ""),
+    ]
+
+
+def test_program_page_request_identity() -> None:
+    client = _flow_client()
+    handle_request = AsyncMock(return_value={"rt_cd": "0", "output": []})
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            return await client.get_program_trade_daily_page(
+                _FakeSession(), "005930", "20260910", market_div_code="J",
+            )
+
+    asyncio.run(_runner())
+
+    assert handle_request.await_count == 1
+    call = handle_request.await_args
+    assert call.args[1].endswith("/program-trade-by-stock-daily")
+    assert call.kwargs["headers"] == client._get_headers("FHPPG04650201")
+    assert list(call.kwargs["params"].items()) == [
+        ("FID_COND_MRKT_DIV_CODE", "J"),
+        ("FID_INPUT_ISCD", "005930"),
+        ("FID_INPUT_DATE_1", "20260910"),
+    ]
+
+
+async def _run_flow_page(method: str, code: str, cursor: str, market_div_code: str, response: dict | BaseException) -> tuple[dict, AsyncMock]:
+    client = _flow_client()
+    if isinstance(response, BaseException):
+        handle_request = AsyncMock(side_effect=response)
+    else:
+        handle_request = AsyncMock(return_value=response)
+    with patch.object(client, "_handle_request", handle_request):
+        out = await getattr(client, method)(_FakeSession(), code, cursor, market_div_code=market_div_code)
+    return out, handle_request
+
+
+def test_flow_pages_send_code_and_cursor_verbatim() -> None:
+    for method in ("get_investor_trade_daily_page", "get_program_trade_daily_page"):
+        _, handle_request = asyncio.run(
+            _run_flow_page(method, "5930", "20260910", "J", {"rt_cd": "0", "output": [], "output2": []})
+        )
+        params = handle_request.await_args.kwargs["params"]
+        assert params["FID_INPUT_ISCD"] == "5930"
+        assert params["FID_INPUT_DATE_1"] == "20260910"
+
+
+def test_flow_pages_normalize_market_div() -> None:
+    for method in ("get_investor_trade_daily_page", "get_program_trade_daily_page"):
+        _, handle_request = asyncio.run(
+            _run_flow_page(method, "005930", "20260910", "j", {"rt_cd": "0", "output": [], "output2": []})
+        )
+        assert handle_request.await_args.kwargs["params"]["FID_COND_MRKT_DIV_CODE"] == "J"
+
+
+def test_flow_pages_fail_closed_without_request() -> None:
+    cases = [
+        (method, bad)
+        for method in ("get_investor_trade_daily_page", "get_program_trade_daily_page")
+        for bad in ("", "X")
+    ]
+
+    async def _run_one(method: str, bad: str) -> tuple[int, int]:
+        client = _flow_client()
+        handle_request = AsyncMock(return_value={"rt_cd": "0"})
+
+        class _Counting:
+            def __init__(self):
+                self.n = 0
+
+            async def acquire(self):
+                self.n += 1
+
+        limiter = _Counting()
+        client.rate_limiter = limiter
+        with patch.object(client, "_handle_request", handle_request), pytest.raises(ValueError, match="market_div_code"):
+            await getattr(client, method)(_FakeSession(), "005930", "20260910", market_div_code=bad)
+        return handle_request.await_count, limiter.n
+
+    for method, bad in cases:
+        await_count, acquisitions = asyncio.run(_run_one(method, bad))
+        assert await_count == 0
+        assert acquisitions == 0
+
+
+def test_flow_pages_pass_vendor_error_body_through() -> None:
+    for body in ({"rt_cd": "1", "msg1": "TIME LIMIT"}, {"rt_cd": "9", "msg1": "네트워크 연결 실패: x"}):
+        for method in ("get_investor_trade_daily_page", "get_program_trade_daily_page"):
+            out, _ = asyncio.run(_run_flow_page(method, "005930", "20260910", "J", body))
+            assert out is body
+
+
+def test_flow_pages_propagate_exceptions() -> None:
+    for method in ("get_investor_trade_daily_page", "get_program_trade_daily_page"):
+        with pytest.raises(ValueError, match="bad json"):
+            asyncio.run(_run_flow_page(method, "005930", "20260910", "J", ValueError("bad json")))
+
+
+def _ok_session(payload: dict):
+    class _Resp:
+        status = 200
+
+        async def json(self):
+            return payload
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Sess:
+        def __init__(self):
+            self.get_calls = 0
+
+        def get(self, _url, **_kw):
+            self.get_calls += 1
+            return _Ctx()
+
+    return _Sess()
+
+
+def test_flow_pages_acquire_limiter_once_per_page() -> None:
+    import aiohttp
+
+    for method, payload in (
+        ("get_program_trade_daily_page", {"rt_cd": "0", "output": []}),
+        ("get_investor_trade_daily_page", {"rt_cd": "0", "output2": []}),
+    ):
+        client = _flow_client()
+        client.token = "T"
+        session = _ok_session(payload)
+
+        class _Counting:
+            def __init__(self):
+                self.n = 0
+
+            async def acquire(self):
+                self.n += 1
+
+        limiter = _Counting()
+        client.rate_limiter = limiter
+        out = asyncio.run(getattr(client, method)(session, "005930", "20260910", market_div_code="J"))
+        assert out["rt_cd"] == "0"
+        assert limiter.n == 1
+        assert session.get_calls == 1
+
+
+def test_flow_page_transport_exhaustion_yields_rt_cd_9(monkeypatch) -> None:
+    import aiohttp
+
+    client = _flow_client()
+    client.token = "T"
+
+    class _Counting:
+        def __init__(self):
+            self.n = 0
+
+        async def acquire(self):
+            self.n += 1
+
+    limiter = _Counting()
+    client.rate_limiter = limiter
+
+    class _Failing:
+        def get(self, _url, **_kw):
+            raise aiohttp.ClientError("down")
+
+    async def _no_sleep(_d):
+        return None
+
+    monkeypatch.setattr("src.api.kis.client.asyncio.sleep", _no_sleep)
+    out = asyncio.run(client.get_program_trade_daily_page(_Failing(), "005930", "20260910", market_div_code="J"))
+    assert out["rt_cd"] == "9"
+    assert limiter.n == 5
+
+
+def test_program_history_delegates_to_page() -> None:
+    client = _flow_client()
+    page = AsyncMock(return_value={"rt_cd": "0", "output": [{"stck_bsop_date": "20240105"}, {"stck_bsop_date": "20240104"}]})
+
+    async def _runner():
+        with patch.object(client, "get_program_trade_daily_page", page):
+            return await client.get_program_trade_daily_history(
+                _FakeSession(), "005930", "20240101", "20240110", market_div_code="J",
+            )
+
+    res = asyncio.run(_runner())
+    assert page.await_count == 1
+    call = page.await_args
+    assert call.args[1] == "005930" and call.args[2] == "20240110"
+    assert call.kwargs.get("market_div_code") == "J"
+    assert [r["stck_bsop_date"] for r in res["output"]] == ["20240104", "20240105"]
+
+
+def test_program_history_request_identity_unchanged() -> None:
+    client = _flow_client()
+    handle_request = AsyncMock(return_value={"rt_cd": "0", "output": [{"stck_bsop_date": "20240110"}]})
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            return await client.get_program_trade_daily_history(
+                _FakeSession(), "005930", "20240101", "20240110", market_div_code="J",
+            )
+
+    asyncio.run(_runner())
+    call = handle_request.await_args
+    assert call.args[1] == f"{client.base_url}/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
+    assert call.kwargs["headers"] == client._get_headers("FHPPG04650201")
+    assert list(call.kwargs["params"].items()) == [
+        ("FID_COND_MRKT_DIV_CODE", "J"),
+        ("FID_INPUT_ISCD", "005930"),
+        ("FID_INPUT_DATE_1", "20240110"),
+    ]

@@ -22,7 +22,7 @@ from src import settings
 from src.config.base import TOPK_DECISIONS_PARQUET_NAME
 from src.data.io_utils import atomic_write_parquet
 from src.ml.costaware_topk import compute_net_return
-from src.strategy.contract import AA_COST, MIN_TOP_K
+from src.strategy.contract import AA_COST, KRX_DAILY_LIMIT_RATIO, MIN_TOP_K
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ SCORE_PROP_EPSILON: float = 1e-3
 STATUS_REALIZED: str = "REALIZED"
 STATUS_PENDING: str = "PENDING"
 STATUS_EXIT_UNAVAILABLE: str = "EXIT_UNAVAILABLE"
+STATUS_PRICE_DISCONTINUITY: str = "PRICE_DISCONTINUITY"
 GROWTH_SHADOW_PARQUET_NAME: str = "growth_shadow.parquet"
 LEDGER_COLUMNS: tuple[str, ...] = (
     "decision_date",
@@ -55,7 +56,11 @@ def realize_decision_returns(decisions: pd.DataFrame, price_history: pd.DataFram
 
     Returns:
         Per-pick frame with decision_date, symbol, pred, rank, gross_return,
-        net_return and status columns.
+        net_return and status columns. status is PRICE_DISCONTINUITY when the
+        realized gross return exceeds KRX_DAILY_LIMIT_RATIO in magnitude:
+        price_history is unadjusted, so such a move is a corporate-action
+        artifact, not a return any holder earned; gross and net returns are
+        NaN for those picks.
 
     Raises:
         ValueError: When a required column is missing on either frame.
@@ -107,6 +112,10 @@ def realize_decision_returns(decisions: pd.DataFrame, price_history: pd.DataFram
     gross = np.full(dec_day.shape[0], np.nan, dtype=np.float64)
     is_realized = status == STATUS_REALIZED
     gross[is_realized] = exit_open[is_realized] / entry_close[is_realized] - 1.0
+    # 불연속 스크린: 실현 예정분의 익일 수익률이 일일 상한을 초과하면 미수정 가격의 기업액션 인공물 → NaN
+    disc = is_realized & (np.abs(gross) > KRX_DAILY_LIMIT_RATIO)
+    status[disc] = STATUS_PRICE_DISCONTINUITY
+    gross[disc] = np.nan
     net = compute_net_return(
         pd.DataFrame(
             {
@@ -234,11 +243,17 @@ def build_shadow_ledger(realized: pd.DataFrame) -> pd.DataFrame:
         }
     )
     # 인과적 게이트: D-1 결정분은 D 09:00에 끝나므로 shift(1)만 당일 결정에 사용 가능
+    # 미실현(NaN) 결정일은 창에서 건너뛰고 직전 값으로 이어간다: NaN이 창에 섞여 120일간 게이트가
+    # 강제 개방되는 fail-open을 막고, 개방은 유효 관측 120개가 쌓이기 전 웜업에만 허용한다.
+    prior = ledger["arm_k3_net"].shift(1)
+    observed = prior.dropna()
     trail = (
-        ledger["arm_k3_net"].shift(1).rolling(TRAIL_GATE_WINDOW_DAYS, min_periods=TRAIL_GATE_WINDOW_DAYS).mean()
+        observed.rolling(TRAIL_GATE_WINDOW_DAYS, min_periods=TRAIL_GATE_WINDOW_DAYS).mean()
+        .reindex(prior.index)
+        .ffill()
     )
     gate_open = trail.isna() | (trail > 0.0)
-    # 웜업 120일은 게이트 개방, 음수 구간은 현금 0.0
+    # 웜업(유효 관측 120개 미만)은 게이트 개방, 음수 구간은 현금 0.0
     ledger["trail_mean_k3"] = trail.to_numpy(dtype=np.float64)
     ledger["trail_gate_open"] = gate_open.to_numpy(dtype=bool)
     ledger["arm_k3_trail_net"] = np.where(

@@ -6,13 +6,8 @@ from src.sync.fetcher_program import get_program_history_async
 
 
 class _Client:
-    base_url = "https://example.test"
-
-    async def _handle_request(self, *args, **kwargs):
+    async def get_program_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
         return {"rt_cd": "0", "output": [{"stck_bsop_date": "20200102", "whol_smtn_ntby_tr_pbmn": "1234"}]}
-
-    def _get_headers(self, tr_id):
-        return {}
 
 
 class _Session:
@@ -21,12 +16,12 @@ class _Session:
 
 
 class _FailingClient(_Client):
-    async def _handle_request(self, *args, **kwargs):
+    async def get_program_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
         return {"rt_cd": "1", "msg1": "temporary failure"}
 
 
 class _RaisingClient(_Client):
-    async def _handle_request(self, *args, **kwargs):
+    async def get_program_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
         raise RuntimeError("connection reset")
 
 
@@ -46,6 +41,41 @@ def test_program_async_uses_rate_slot() -> None:
     assert out == {"20200102": 1234.0}
 
 
+def test_program_async_page_arguments_pinned() -> None:
+    seen: list[tuple] = []
+
+    class _Recording(_Client):
+        async def get_program_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
+            seen.append((code, cursor, market_div_code))
+            return await super().get_program_trade_daily_page(session, code, cursor, market_div_code=market_div_code)
+
+    asyncio.run(
+        get_program_history_async(
+            _Session(), _Recording(), "5930", "20200102", "20200102",
+        )
+    )
+    assert seen[0] == ("005930", "20200102", "J")
+
+
+def test_program_async_slot_precedes_page() -> None:
+    events: list[str] = []
+
+    async def slot() -> None:
+        events.append("slot")
+
+    class _Recording(_Client):
+        async def get_program_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
+            events.append("page")
+            return await super().get_program_trade_daily_page(session, code, cursor, market_div_code=market_div_code)
+
+    asyncio.run(
+        get_program_history_async(
+            _Session(), _Recording(), "005930", "20200102", "20200102", request_slot=slot
+        )
+    )
+    assert events == ["slot", "page"]
+
+
 def test_program_async_stops_after_consecutive_failures() -> None:
     calls = 0
 
@@ -61,6 +91,40 @@ def test_program_async_stops_after_consecutive_failures() -> None:
     )
     assert out == {}
     assert calls == 2
+
+
+def test_program_async_consecutive_failures_use_descending_cursors() -> None:
+    cursors: list[str] = []
+
+    class _RecordingFail(_FailingClient):
+        async def get_program_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
+            cursors.append(cursor)
+            return await super().get_program_trade_daily_page(session, code, cursor, market_div_code=market_div_code)
+
+    asyncio.run(
+        get_program_history_async(
+            _Session(), _RecordingFail(), "005930", "20200102", "20200110",
+            max_consecutive_failures=2,
+        )
+    )
+    assert cursors == ["20200110", "20200109"]
+
+
+def test_program_async_empty_page_jumps_30_days() -> None:
+    cursors: list[str] = []
+
+    class _Empty(_Client):
+        async def get_program_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
+            cursors.append(cursor)
+            return {"rt_cd": "0", "output": []}
+
+    out = asyncio.run(
+        get_program_history_async(
+            _Session(), _Empty(), "005930", "20200101", "20200301",
+        )
+    )
+    assert out == {}
+    assert cursors == ["20200301", "20200131", "20200101"]
 
 
 def test_program_async_stops_after_request_errors() -> None:

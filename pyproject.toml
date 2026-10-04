@@ -15,6 +15,7 @@ dependencies = [
     "requests>=2.31.0",
     "scikit-learn>=1.5.0",
     "lightgbm>=4.3.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [build-system]
@@ -131,7 +132,7 @@ python_files = ["test_*.py"]
 addopts = "-ra -q"
 pythonpath = ["."]
 markers = [
-    "slow: tests that read real parquet files (~0.3s each)",
+    "slow: heavy tests (real parquet reads or multi-second model fits); excluded from tools/verify.py by default, run in CI",
 ]
 filterwarnings = [
     "ignore::RuntimeWarning:numpy.*",

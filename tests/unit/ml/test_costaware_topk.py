@@ -286,6 +286,8 @@ def test_run_cost_aware_topk_backtest_end_to_end_produces_report() -> None:
             ph.loc[(ph["date"] == pd.Timestamp(exit_d)) & (ph["symbol"] == sym), "open"] = target_open
 
     prepared, _ = prepare_price_panel(ph)
+    prepared["is_screenable"] = True
+    prepared["screenable_source"] = "real"
     market_dates = np.array(sorted(prepared["date"].unique()))
     d_to_idx = {d: i for i, d in enumerate(market_dates)}
 

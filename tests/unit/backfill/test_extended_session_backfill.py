@@ -11,8 +11,12 @@ import pytest
 from src.backfill.intraday.extended_session_backfill import (
     ExtendedBackfillLedger,
     ExtendedBackfillTask,
+    RegularBackfillPlan,
+    _select_backfill_tasks,
     enumerate_extended_session_tasks,
+    enumerate_regular_session_tasks,
     run_extended_session_backfill,
+    summarize_regular_backfill_coverage,
 )
 from src.config.collection import CollectionSettings
 from src.config.market_session import KRX_AFTERMARKET_START_DATE
@@ -815,3 +819,287 @@ def test_exhausted_keys_are_not_refetched_and_counted(env) -> None:
     kis = _FakeKis(day, traded={"067310"})
     after = _run(profile, store, ledger, [kis], tasks, _adj_ref(day, "067310"), raw_client=_FakeKiwoom(day, raw={}))
     assert after.failed == 0 and after.exhausted == 0
+
+
+# ---------------------------------------------------------------- regular stream
+
+
+def _prepared(rows: list[tuple[str, str, float, float, float, float]]) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=["date", "symbol", "chg_ratio", "tv_clean", "mc_clean", "volume"])
+
+
+def _superset_screen():
+    from src.data.eod_superset import EodSupersetScreen
+
+    return EodSupersetScreen(
+        min_change_ratio=0.01,
+        max_change_ratio=0.12,
+        min_trade_value_100m=100.0,
+        min_market_cap_100m=495.0,
+        common_stock_only=False,
+    )
+
+
+def _regular_plan(panel: pd.DataFrame, ref, as_of: date | None = None, retention_days: int = 365):
+    return enumerate_regular_session_tasks(
+        as_of=as_of or date(2026, 3, 3),
+        retention_days=retention_days,
+        prepared_panel=panel,
+        screen=_superset_screen(),
+        price_reference=ref,
+    )
+
+
+def test_regular_tasks_use_eod_superset_universe() -> None:
+    day = "2026-03-02"
+    panel = _prepared([
+        (day, "000001", 0.015, 150.0, 600.0, 100.0),
+        (day, "000002", 0.005, 500.0, 900.0, 100.0),
+        (day, "000003", 0.11, 99.0, 900.0, 100.0),
+    ])
+    plan = _regular_plan(panel, _raw_ref(day, {"000001", "000002", "000003"}))
+    assert plan.tasks == (ExtendedBackfillTask(day, "regular", ("000001",)),)
+
+
+def test_regular_tasks_respect_retention_and_as_of() -> None:
+    retention = 10
+    earliest = (AS_OF - timedelta(days=retention)).isoformat()
+    before = (AS_OF - timedelta(days=retention + 1)).isoformat()
+    panel = _prepared([
+        (AS_OF.isoformat(), "000001", 0.05, 500.0, 900.0, 100.0),
+        (earliest, "000001", 0.05, 500.0, 900.0, 100.0),
+        (before, "000001", 0.05, 500.0, 900.0, 100.0),
+    ])
+    ref = _ref([
+        (AS_OF.isoformat(), "000001", 1000.0, 1000.0),
+        (earliest, "000001", 1000.0, 1000.0),
+        (before, "000001", 1000.0, 1000.0),
+    ])
+    plan = _regular_plan(panel, ref, as_of=AS_OF, retention_days=retention)
+    assert [task.snapshot_date for task in plan.tasks] == [earliest]
+
+
+def test_regular_adjusted_symbol_days_are_skipped_without_fetch(env) -> None:
+    profile, store, ledger = env
+    day = "2026-03-02"
+    panel = _prepared([(day, "000001", 0.05, 500.0, 900.0, 100.0)])
+    ref = _ref([(day, "000001", 900.0, 1000.0)])
+    plan = _regular_plan(panel, ref)
+    assert plan.tasks == ()
+    assert (plan.skipped_adjusted, plan.skipped_unknown_basis) == (1, 0)
+    kis = _FakeKis(day, traded={"000001"}, hms="090000")
+    summary = _run(profile, store, ledger, [kis], list(plan.tasks), ref)
+    assert kis.requested == []
+    assert summary.tasks_done == 0
+
+
+def test_regular_unknown_basis_is_skipped() -> None:
+    day = "2026-03-02"
+    panel = _prepared([(day, "000001", 0.05, 500.0, 900.0, 100.0)])
+    plan = _regular_plan(panel, _ref([]))
+    assert plan.tasks == ()
+    assert (plan.skipped_adjusted, plan.skipped_unknown_basis) == (0, 1)
+
+
+def test_regular_universe_ignores_future_rows() -> None:
+    day, nxt = "2026-03-02", "2026-03-03"
+    base = _prepared([
+        (day, "000001", 0.05, 500.0, 900.0, 100.0),
+        (nxt, "000002", 0.05, 500.0, 900.0, 100.0),
+    ])
+    varied = _prepared([
+        (day, "000001", 0.05, 500.0, 900.0, 100.0),
+        (nxt, "000001", 0.50, 5.0, 10.0, 0.0),
+        (nxt, "000009", 0.50, 5.0, 10.0, 0.0),
+    ])
+    ref = _ref([
+        (day, "000001", 1000.0, 1000.0),
+        (nxt, "000001", 1000.0, 1000.0),
+        (nxt, "000002", 1000.0, 1000.0),
+        (nxt, "000009", 1000.0, 1000.0),
+    ])
+    # as_of after T+1 keeps the T+1 rows inside the planning window, so only the per-day mask can exclude them.
+    later = date(2026, 3, 5)
+    first = [task for task in _regular_plan(base, ref, as_of=later).tasks if task.snapshot_date == day]
+    second = [task for task in _regular_plan(varied, ref, as_of=later).tasks if task.snapshot_date == day]
+    assert first == second == [ExtendedBackfillTask(day, "regular", ("000001",))]
+
+
+def test_regular_stored_symbols_are_not_refetched_or_overwritten(env) -> None:
+    from src.data.intraday_schema import normalize_bar_frame
+    from src.data.intraday_store import intraday_partition_path, write_intraday_partition
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    stored_a = normalize_bar_frame(
+        pd.DataFrame([_row("090000", "1000", "10", "10000", day)]), "kis", day, "000001"
+    )
+    write_intraday_partition(stored_a, 1, day, "regular")
+    before = pd.read_parquet(intraday_partition_path(1, day, "regular"))
+    kis = _FakeKis(day, traded={"000001", "000002"}, hms="090000")
+    summary = _run(
+        profile, store, ledger, [kis],
+        [ExtendedBackfillTask(day, "regular", ("000001", "000002"))],
+        _raw_ref(day, {"000001", "000002"}),
+    )
+    assert kis.requested == ["000002"]
+    assert summary.complete == 1
+    after = pd.read_parquet(intraday_partition_path(1, day, "regular"))
+    before_a = before[before["symbol"] == "000001"].reset_index(drop=True)
+    after_a = after[after["symbol"] == "000001"].reset_index(drop=True)
+    assert after_a.equals(before_a)
+    assert after[after["symbol"] == "000002"]["vendor"].tolist() == ["kis"]
+
+
+def test_unreadable_partition_fails_loud_after_finishing_readable_tasks(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    bad_day, good_day = "2026-03-02", "2026-03-03"
+    corrupt = intraday_partition_path(1, bad_day, "regular")
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_bytes(b"not a parquet file")
+    kis = _FakeKis(good_day, traded={"000002"}, hms="090000")
+
+    with pytest.raises(OSError, match=f"existing partition evidence.*{bad_day}/regular"):
+        _run(
+            profile, store, ledger, [kis],
+            [
+                ExtendedBackfillTask(bad_day, "regular", ("000001",)),
+                ExtendedBackfillTask(good_day, "regular", ("000002",)),
+            ],
+            _ref([(bad_day, "000001", 1000.0, 1000.0), (good_day, "000002", 1000.0, 1000.0)]),
+        )
+
+    assert kis.requested == ["000002"]
+    assert ledger.terminal_symbols(good_day, "regular") == frozenset({"000002"})
+
+
+def test_regular_backfill_resumes_from_ledger(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    day1, day2 = "2026-03-02", "2026-03-03"
+    ledger.record(
+        day1, "regular", [_entry("000002", CaptureStatus.COMPLETE, session="regular")],
+        run_id="seed", attempted_at=datetime.now(SEOUL),
+    )
+    tasks = [
+        ExtendedBackfillTask(day1, "regular", ("000001", "000002")),
+        ExtendedBackfillTask(day2, "regular", ("000003",)),
+    ]
+    ref = _ref([
+        (day1, "000001", 1000.0, 1000.0),
+        (day1, "000002", 1000.0, 1000.0),
+        (day2, "000003", 1000.0, 1000.0),
+    ])
+    stop = datetime(2026, 9, 29, 6, 50, tzinfo=SEOUL)
+    ticks = iter([stop - timedelta(minutes=1)] * 4 + [stop] * 30)
+    kis1 = _FakeKis(day1, traded={"000001", "000003"}, hms="090000")
+    first = _run(profile, store, ledger, [kis1], tasks, ref, now_fn=lambda: next(ticks), stop_at=stop)
+    assert first.tasks_done == 1 and first.stopped_by_deadline is True
+    assert kis1.requested == ["000001"]
+    part1_before = pd.read_parquet(intraday_partition_path(1, day1, "regular"))
+    kis2 = _FakeKis(day2, traded={"000001", "000003"}, hms="090000")
+    _run(profile, store, ledger, [kis2], tasks, ref)
+    assert kis2.requested == ["000003"]
+    assert pd.read_parquet(intraday_partition_path(1, day1, "regular")).equals(part1_before)
+    assert ledger.terminal_symbols(day1, "regular") == frozenset({"000001", "000002"})
+
+
+def test_unified_order_puts_oldest_regular_first(env) -> None:
+    profile, store, ledger = env
+    old, new = "2026-03-02", "2026-03-10"
+    tasks = [
+        ExtendedBackfillTask(new, "nxt_aftermarket", ("000002",)),
+        ExtendedBackfillTask(old, "regular", ("000001",)),
+    ]
+    ref = _ref([(old, "000001", 1000.0, 1000.0), (new, "000002", 1000.0, 1000.0)])
+    stop = datetime(2026, 9, 29, 6, 50, tzinfo=SEOUL)
+    ticks = iter([stop - timedelta(minutes=1)] * 4 + [stop] * 30)
+    kis = _FakeKis(old, traded={"000001", "000002"}, hms="090000")
+    summary = _run(profile, store, ledger, [kis], tasks, ref, now_fn=lambda: next(ticks), stop_at=stop)
+    assert summary.tasks_done == 1
+    assert kis.requested == ["000001"]
+
+
+def test_extended_only_task_list_is_unchanged() -> None:
+    ph = _ph([("2026-03-02", "000001", 110.0, 100.0)])
+    kis_tasks = enumerate_extended_session_tasks(
+        as_of=AS_OF, retention_days=365, min_change_ratio=0.02,
+        price_history=ph, candidate_pairs=_pairs([]),
+    )
+    regular_plan = RegularBackfillPlan(
+        tasks=(ExtendedBackfillTask("2026-03-02", "regular", ("000001",)),),
+        skipped_adjusted=0,
+        skipped_unknown_basis=0,
+    )
+    assert _select_backfill_tasks(kis_tasks, regular_plan, run_extended=True, run_regular=False) == kis_tasks
+    assert _select_backfill_tasks(kis_tasks, None, run_extended=True, run_regular=False) == kis_tasks
+
+
+def test_regular_coverage_summary_counts_resolved_and_expiry(env) -> None:
+    from src.data.intraday_schema import normalize_bar_frame
+    from src.data.intraday_store import write_intraday_partition
+
+    profile, store, ledger = env
+    day1, day2 = "2026-03-02", "2026-03-03"
+    plan = RegularBackfillPlan(
+        tasks=(
+            ExtendedBackfillTask(day1, "regular", ("000001", "000002")),
+            ExtendedBackfillTask(day2, "regular", ("000003", "000004")),
+        ),
+        skipped_adjusted=0,
+        skipped_unknown_basis=0,
+    )
+    ledger.record(
+        day1, "regular", [_entry("000001", CaptureStatus.COMPLETE, session="regular")],
+        run_id="seed", attempted_at=datetime.now(SEOUL),
+    )
+    stored = normalize_bar_frame(
+        pd.DataFrame([_row("090000", "1000", "10", "10000", day2)]), "kis", day2, "000003"
+    )
+    write_intraday_partition(stored, 1, day2, "regular")
+    coverage = summarize_regular_backfill_coverage(plan, ledger, as_of=AS_OF, retention_days=365)
+    assert (coverage.symbol_days_total, coverage.symbol_days_resolved, coverage.symbol_days_pending) == (4, 2, 2)
+    assert (coverage.days_total, coverage.days_resolved) == (2, 0)
+    assert coverage.oldest_pending_date == day1
+    assert coverage.oldest_pending_expiry_days == 365 - (AS_OF - date.fromisoformat(day1)).days
+
+
+def test_regular_coverage_summary_propagates_unreadable_partition(env) -> None:
+    profile, store, ledger = env
+    plan = RegularBackfillPlan(
+        tasks=(ExtendedBackfillTask("2026-03-02", "regular", ("000001",)),),
+        skipped_adjusted=0,
+        skipped_unknown_basis=0,
+    )
+
+    def _boom(snapshot_date: str, session: str) -> set[str]:
+        raise OSError("unreadable evidence")
+
+    with pytest.raises(OSError, match="unreadable evidence"):
+        summarize_regular_backfill_coverage(
+            plan, ledger, as_of=AS_OF, retention_days=365, stored_symbols=_boom
+        )
+
+
+def test_regular_empty_answers_exhaust_after_attempt_cap(env) -> None:
+    from src.backfill.intraday.extended_session_backfill import EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    tasks = [ExtendedBackfillTask(day, "regular", ("000009",))]
+    ref = _raw_ref(day, {"000009"})
+    statuses: list[str] = []
+    for _ in range(EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS):
+        _run(profile, store, ledger, [_FakeKis(day, traded=set())], tasks, ref)
+        rows = pd.read_parquet(ledger.path)
+        statuses.append(str(rows[rows["symbol"] == "000009"].iloc[-1]["status"]))
+    assert statuses == ["FAILED"] * (EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS - 1) + ["EXHAUSTED"]
+    assert "000009" in ledger.terminal_symbols(day, "regular")
+    target = intraday_partition_path(1, day, "regular")
+    assert not target.exists() or "000009" not in pd.read_parquet(
+        target, columns=["symbol"]
+    )["symbol"].tolist()

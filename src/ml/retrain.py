@@ -12,7 +12,18 @@ from src import settings
 from src.data.io_utils import atomic_write_parquet
 from src.data.panel_integrity import load_price_panel
 from src.ml.costaware_topk import report_to_frame, run_cost_aware_topk_backtest
-from src.ml.retrain_gate import build_gate_eval_frame, evaluate_retrain_promotion, load_current_bundle
+from src.ml.pit_report import (
+    PIT_CERTIFICATION_BUNDLE_KEY,
+    load_pit_haircut_report,
+    pit_certification_metadata,
+)
+from src.ml.retrain_gate import (
+    PitGateConfig,
+    PitGateMode,
+    build_gate_eval_frame,
+    evaluate_retrain_promotion,
+    load_current_bundle,
+)
 from src.ml.retrain_registry import (
     RETRAIN_OUTCOME_PROMOTED,
     RETRAIN_OUTCOME_PROMOTED_UNGATED,
@@ -28,7 +39,6 @@ from src.ml.topk_ranker_research import (
     topk_ranker_report_to_frame,
     train_production_bundle,
 )
-from src.ml.universe_research import DEFAULT_RESEARCH_SCREENS, run_universe_screen_grid
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -42,11 +52,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--oos-reserve-start", default=None)
     parser.add_argument("--universe-research", action="store_true", help="reconstruct full-market panels for a ScreenConfig family, train the ranker on each, print/save the model-free-vs-ranked-vs-CPCV comparison")
     parser.add_argument("--cost-aware-backtest", action="store_true", help="run the model-free COST_AWARE top-k regime-gated backtest against full price_history")
-    parser.add_argument("--skip-promotion-gate", action="store_true", help="publish the retrained bundle without the weekly promotion gate (use only after manually certifying a feature-contract change)")
+    parser.add_argument("--skip-promotion-gate", action="store_true", help="publish the retrained bundle without the weekly promotion gate (use only after manually certifying a feature-contract, strategy or screen change)")
     parser.add_argument("--train-ranker-bundle", action="store_true", help="train and persist the certified top-3 cost-aware production bundle (build_inline_bundle on the certification-regime population via train_production_bundle)")
     parser.add_argument("--ranker-topk-research", action="store_true", help="train the ranker on the wide screen pool, select top-k from the cost-capped pool, and score it against the model-free cost-sort control on the post-reform regime")
     parser.add_argument("--ranker-train-start", default=None, help="widen the ranker training window to this YYYY-MM-DD start; augments training only and never moves the certification boundary (default: the certification regime start)")
     parser.add_argument("--exit-grid-revalidation", action="store_true", help="re-validate the TP5%%+MOC next-day exit-timing lever (src/ml/exit_policy.py) under the certified ranker's own CPCV(8,2) OOF pipeline and real PIT cost, without touching run_topk_ranker_backtest itself")
+    parser.add_argument("--pit-certification", action="store_true", help="re-score the certified CPCV fold models on the decision-time (15:20) panel and write the pit_haircut report next to the live bundle")
+    parser.add_argument("--pit-panel-dir", default=str(settings.HISTORY_DIR), help="directory holding the Part 2 decision-time panel files (pit1520_panel.parquet, pit1520_panel_days.parquet)")
+    parser.add_argument("--pit-augment", action="store_true", help="also run the report-only auction-noise augmentation experiment (15:20 panel only)")
+    parser.add_argument("--pit-gate-mode", choices=("off", "advisory", "enforce"), default="advisory", help="PIT criterion mode for --train-ranker-bundle (advisory never blocks)")
     return parser
 
 
@@ -57,6 +71,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.universe_research:
+        from src.ml.universe_research import DEFAULT_RESEARCH_SCREENS, run_universe_screen_grid
+
         if not os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH):
             raise ValueError(f"price_history not found: {settings.PRICE_HISTORY_PARQUET_PATH}")
         price_history_df, panel_prov = load_price_panel(settings.PRICE_HISTORY_PARQUET_PATH)
@@ -98,12 +114,25 @@ def main(argv: list[str] | None = None) -> None:
         live_dir = os.path.join(args.export_dir, "topk_ranker")
         registry_path = Path(live_dir) / RETRAIN_REGISTRY_FILENAME
         if not args.skip_promotion_gate:
+            pit_mode = PitGateMode(args.pit_gate_mode)
+            pit_report = None
+            if pit_mode != PitGateMode.OFF:
+                try:
+                    pit_report = load_pit_haircut_report(Path(live_dir))
+                except ValueError as exc:
+                    # Unreadable report evaluates as MISSING: blocks under ENFORCE, advisory-only otherwise.
+                    logger.warning("[EVAL] stage=pit_gate status=REPORT_UNREADABLE reason=%s", type(exc).__name__)
             verdict = evaluate_retrain_promotion(
-                bundle, load_current_bundle(live_dir), build_gate_eval_frame(ph, market_dates, d_to_idx)
+                bundle, load_current_bundle(live_dir), build_gate_eval_frame(ph, market_dates, d_to_idx),
+                pit_report=pit_report, pit_gate=PitGateConfig(mode=pit_mode),
+            )
+            bundle[PIT_CERTIFICATION_BUNDLE_KEY] = pit_certification_metadata(
+                pit_report, gate_mode=args.pit_gate_mode, gate_status=verdict.pit_status,
+                gate_reasons=verdict.pit_reasons,
             )
             logger.info(
-                "[EVAL] stage=retrain_promotion_gate promote=%s agreement=%s reasons=%s",
-                verdict.promote, verdict.agreement, list(verdict.reasons),
+                "[EVAL] stage=retrain_promotion_gate promote=%s agreement=%s reasons=%s pit_status=%s pit_reasons=%s",
+                verdict.promote, verdict.agreement, list(verdict.reasons), verdict.pit_status, list(verdict.pit_reasons),
             )
             if not verdict.promote:
                 rejected_path = save_production_bundle(bundle, export_dir=os.path.join(live_dir, "rejected"))
@@ -117,6 +146,9 @@ def main(argv: list[str] | None = None) -> None:
         else:
             outcome = RETRAIN_OUTCOME_PROMOTED_UNGATED
             agreement = None
+            bundle[PIT_CERTIFICATION_BUNDLE_KEY] = pit_certification_metadata(
+                None, gate_mode=args.pit_gate_mode, gate_status="UNGATED", gate_reasons=(),
+            )
         path = save_production_bundle(bundle, export_dir=live_dir)
         append_retrain_record(registry_path, build_retrain_record(outcome=outcome, bundle=bundle, bundle_path=path, agreement=agreement, reasons=(), attempted_at=attempted_at, code_commit=resolve_code_commit_env()))
         logger.info("[EVAL] stage=train_ranker_bundle path=%s top_k=%s train_start=%s trained_at=%s outcome=%s", path, bundle.get("top_k"), bundle.get("train_start"), bundle.get("trained_at"), outcome)
@@ -147,7 +179,18 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    raise ValueError("no action flag given; choose one of --universe-research/--cost-aware-backtest/--train-ranker-bundle/--ranker-topk-research/--exit-grid-revalidation")
+    if args.pit_certification:
+        from src.ml.research.pit_certification import main_pit_certification
+
+        main_pit_certification(
+            export_dir=args.export_dir,
+            panel_dir=Path(args.pit_panel_dir),
+            augment=args.pit_augment,
+            train_start=pd.Timestamp(args.ranker_train_start) if args.ranker_train_start else None,
+        )
+        return
+
+    raise ValueError("no action flag given; choose one of --universe-research/--cost-aware-backtest/--train-ranker-bundle/--ranker-topk-research/--exit-grid-revalidation/--pit-certification")
 
 
 if __name__ == "__main__":

@@ -14,12 +14,11 @@ import pandas as pd
 import pytest
 
 from src.ml.research.v3_engine import (
-    FEATURE_COLS,
     attach_forward_exit_paths,
     build_candidate_universe,
-    compute_derived_features,
     load_and_prepare_price_history,
 )
+from src.ml.topk_contract import FEATURE_COLS, compute_derived_features
 from src.ml.research.v3_metrics import (
     calculate_geometric_cagr,
     calculate_series_metrics,
@@ -326,6 +325,17 @@ def test_future_mutation_test():
         assert feats1.iloc[0][col] == pytest.approx(feats2.iloc[0][col])
 
 
+def _proxy_only_classification(tmp_path: Path, after: str) -> Path:
+    cls = pd.DataFrame({
+        "date": pd.to_datetime([after]),
+        "symbol": ["005930"],
+        "is_screenable": [True],
+    })
+    path = tmp_path / "security_classification.parquet"
+    cls.to_parquet(path)
+    return path
+
+
 def test_load_and_prepare_price_history_marks_ceiling_via_contract(tmp_path: Path) -> None:
     # Given: a minimal on-disk parquet with one limit-up close among two normal rows
     raw = pd.DataFrame(
@@ -347,7 +357,8 @@ def test_load_and_prepare_price_history_marks_ceiling_via_contract(tmp_path: Pat
     raw.to_parquet(path)
 
     # When
-    ph, market_dates, d_to_idx = load_and_prepare_price_history(path)
+    cls_path = _proxy_only_classification(tmp_path, "2026-02-01")
+    ph, market_dates, d_to_idx = load_and_prepare_price_history(path, classification_path=cls_path)
 
     # Then: ceiling flag comes from src.strategy.contract.mark_ceiling (chg>=29% and close>=high)
     ph = ph.sort_values(["symbol", "date"]).reset_index(drop=True)
@@ -356,6 +367,7 @@ def test_load_and_prepare_price_history_marks_ceiling_via_contract(tmp_path: Pat
     assert ph["chg_ratio"].to_numpy() == pytest.approx([0.05, 0.04, 0.30])
     assert len(market_dates) == 2
     assert d_to_idx[market_dates[0]] == 0
+    assert (ph["screenable_source"] == "proxy").all()
 
 
 def test_v3_universe_matches_strategy_contract_selection() -> None:
@@ -447,7 +459,8 @@ def test_v3_load_and_prepare_repairs_mixed_unit_and_attaches_tick_cost(tmp_path:
     raw.to_parquet(path)
 
     # When
-    ph, _, _ = load_and_prepare_price_history(path)
+    cls_path = _proxy_only_classification(tmp_path, "2026-02-01")
+    ph, _, _ = load_and_prepare_price_history(path, classification_path=cls_path)
     ph = ph.sort_values(["symbol", "date"]).reset_index(drop=True)
 
     # Then: 오염 행은 close/prev_close-1 로 교정(0.02, -0.01), 정상 행은 그대로(0.02)
@@ -558,7 +571,8 @@ def test_load_and_prepare_price_history_delegates_to_prepare_price_panel(tmp_pat
     ph.to_parquet(path)
 
     # When
-    prepared, market_dates, d_to_idx = load_and_prepare_price_history(path)
+    cls_path = _proxy_only_classification(tmp_path, "2023-03-01")
+    prepared, market_dates, d_to_idx = load_and_prepare_price_history(path, classification_path=cls_path)
 
     # Then: the calendar contract is unchanged and the integrity columns are present
     assert len(prepared) == 4
@@ -636,3 +650,44 @@ def test_attach_forward_exit_paths_costs_are_point_in_time() -> None:
         attach_forward_exit_paths(
             cands.drop(columns=["market"]), ph, market_dates, d_to_idx
         )
+
+
+def _screenable_price_history() -> pd.DataFrame:
+    return pd.DataFrame({
+        "date": ["2026-01-02", "2026-01-02", "2026-01-05", "2026-01-05", "2026-01-06", "2026-01-06"],
+        "symbol": ["005930", "005935", "005930", "005935", "005930", "005935"],
+        "open": [1000.0] * 6, "high": [1010.0] * 6, "low": [990.0] * 6,
+        "close": [1005.0] * 6, "prev_close": [1000.0] * 6, "volume": [100] * 6,
+        "market_cap_100m": [1000.0] * 6, "trade_value_100m": [300.0] * 6,
+        "market": ["KOSPI"] * 6,
+    })
+
+
+def _screenable_classification() -> pd.DataFrame:
+    return pd.DataFrame({
+        "date": pd.to_datetime(["2026-01-05", "2026-01-05", "2026-01-06", "2026-01-06"]),
+        "symbol": ["005930", "005935", "005930", "005935"],
+        "is_screenable": [False, False, True, True],
+    })
+
+
+def test_loaded_panel_carries_class_verdict(tmp_path: Path) -> None:
+    ph_path = tmp_path / "price_history.parquet"
+    _screenable_price_history().to_parquet(ph_path)
+    cls_path = tmp_path / "classification.parquet"
+    _screenable_classification().to_parquet(cls_path)
+
+    ph, _, _ = load_and_prepare_price_history(ph_path, classification_path=cls_path)
+    by_key = {(str(r["date"].date()), r["symbol"]): r for r in ph.to_dict("records")}
+    assert by_key[("2026-01-02", "005930")]["screenable_source"] == "proxy"
+    assert by_key[("2026-01-05", "005930")]["screenable_source"] == "proxy"
+    assert by_key[("2026-01-06", "005930")]["screenable_source"] == "real"
+    assert bool(by_key[("2026-01-06", "005930")]["is_screenable"]) is False
+    assert ph["is_screenable"].dtype == bool
+
+
+def test_missing_classification_panel_fails_closed(tmp_path: Path) -> None:
+    ph_path = tmp_path / "price_history.parquet"
+    _screenable_price_history().to_parquet(ph_path)
+    with pytest.raises(FileNotFoundError):
+        load_and_prepare_price_history(ph_path, classification_path=tmp_path / "missing.parquet")

@@ -140,8 +140,12 @@ custtype: P
 * **실시간 당일추이:** `FHPPG04650101` (`/uapi/domestic-stock/v1/quotations/program-trade-by-stock`)
   * Output: 시간대별 차익/비차익 매수/매도 수량 및 순매수금액.
 * **일별 추이:** `FHPPG04650201` (`/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily`)
-  * Params: `FID_INPUT_DATE_1` (커서일자)
+  * Params: `FID_COND_MRKT_DIV_CODE`, `FID_INPUT_ISCD`, `FID_INPUT_DATE_1` (커서일자)
   * Output: 일별 차익/비차익/전체 순매수 거래량 및 거래대금.
+* **종목별 투자자 일별 (`FHPTJ04160001`):** `GET /uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily`
+  * Params: `FID_COND_MRKT_DIV_CODE`, `FID_INPUT_ISCD`, `FID_INPUT_DATE_1` 커서, `FID_ORG_ADJ_PRC`="", `FID_ETC_CLS_CODE`=""
+  * Output (`output2`): `stck_bsop_date`, `frgn_ntby_tr_pbmn`, `orgn_ntby_tr_pbmn`.
+* 두 일별 수급 TR은 모두 `FID_INPUT_DATE_1` 커서로만 페이징한다 (`tr_cont` 없음).
 
 ### 4.4 `FHPST04830000` — 국내주식 공매도 일별추이 (Daily Short Selling)
 * **Path:** `GET /uapi/domestic-stock/v1/quotations/daily-short-sale`

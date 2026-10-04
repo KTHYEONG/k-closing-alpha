@@ -16,7 +16,7 @@ import pandas as pd
 from lightgbm import LGBMRegressor
 
 from src.serving.realtime.inference import _QUANTILE_ALPHAS, _QUANTILE_COLS
-from src.strategy.contract import COST_AWARE_UNIVERSE
+from src.strategy.contract import PRODUCTION_STRATEGY
 
 _QUANTILE_ALPHAS = _QUANTILE_ALPHAS
 _QUANTILE_COLS = _QUANTILE_COLS
@@ -52,7 +52,7 @@ def build_fixed_serving_bundle(
         "rank_model": return_model,
         "quantile_models": quantile_models,
         "calibrators": {"p_good": 0.5, "p_bad": 0.1},
-        "select_universe": dataclasses.asdict(COST_AWARE_UNIVERSE),
+        "select_universe": dataclasses.asdict(PRODUCTION_STRATEGY.universe),
     }
 
 

@@ -128,7 +128,7 @@ def test_run_topk_ranker_sleeve_uses_stored_admitted_without_recompute(monkeypat
     import pandas as pd
 
     import src.daily.predict as predict_mod
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
 
     # Given: a 4-name wide snapshot where the store already marked one rejected
@@ -150,6 +150,7 @@ def test_run_topk_ranker_sleeve_uses_stored_admitted_without_recompute(monkeypat
         "kosdaq": [-0.31] * 4,
         "v_kospi": [15.2] * 4,
         "지수_실패": [False] * 4,
+        "is_screenable": True,
         "admitted": [True, True, True, False],
     })
     bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
@@ -180,6 +181,7 @@ def test_run_topk_ranker_sleeve_warns_when_bundle_missing(monkeypatch, caplog) -
         "고가": [18100.0], "저가": [17800.0], "시가": [17900.0], "거래량": [1_000_000],
         "거래대금": [500.0], "시가총액": [3000.0], "기관_순매수": [10.0], "외국인_순매수": [5.0],
         "시장구분": ["KOSPI"], "kospi": [0.52], "kosdaq": [-0.31], "v_kospi": [15.2],
+        "is_screenable": True,
         "admitted": [True],
     })
     monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
@@ -320,6 +322,7 @@ def _sleeve_wide_and_history():
         "kosdaq": [-0.31] * 4,
         "v_kospi": [15.2] * 4,
         "지수_실패": [False] * 4,
+        "is_screenable": True,
         "admitted": [True, True, True, False],
     })
     decision = pd.Timestamp("2026-09-09")
@@ -392,7 +395,7 @@ def test_run_topk_ranker_sleeve_stale_history_yields_no_decision(monkeypatch, ca
 def test_run_topk_ranker_sleeve_skips_history_for_v1_bundle(monkeypatch) -> None:
     import src.daily.predict as predict_mod
     import src.ml.topk_history_features as thf
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
 
     wide, _hist, decision = _sleeve_wide_and_history()
@@ -467,7 +470,7 @@ def test_run_topk_ranker_sleeve_ranks_within_training_pool(monkeypatch) -> None:
 
     import src.daily.predict as predict_mod
     import src.serving.realtime.features as features_mod
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
 
     # Given: 학습 풀 4행 + 풀 밖 음수 등락 대형 거래대금 행
@@ -544,6 +547,34 @@ def test_restrict_to_rank_pool_raises_when_no_row_passes_training_screen() -> No
     # When / Then
     with pytest.raises(ValueError, match="rank pool is empty"):
         predict_mod.restrict_to_rank_pool(wide, decision)
+
+
+def test_restrict_to_rank_pool_fails_closed_without_class_verdict() -> None:
+    import pytest
+
+    import src.daily.predict as predict_mod
+
+    wide, _hist, decision = _sleeve_wide_and_history()
+    verdict_free = wide.drop(columns=["is_screenable"])
+
+    with pytest.raises(ValueError, match="is_screenable"):
+        predict_mod.restrict_to_rank_pool(verdict_free, decision)
+
+
+def test_run_topk_ranker_sleeve_returns_empty_without_class_verdict(monkeypatch) -> None:
+    import src.daily.predict as predict_mod
+
+    wide, _hist, decision = _sleeve_wide_and_history()
+    monkeypatch.setattr(
+        predict_mod, "load_daily_snapshot",
+        lambda _d, **_kw: wide.drop(columns=["is_screenable"]))
+
+    failures: list = []
+    out = predict_mod.run_topk_ranker_sleeve(decision, on_failure=failures.append)
+
+    assert out.empty
+    assert len(failures) == 1 and isinstance(failures[0], ValueError)
+
 
 
 def test_run_topk_ranker_sleeve_reports_failure_to_callback(monkeypatch, caplog) -> None:
@@ -806,7 +837,7 @@ def test_run_topk_ranker_sleeve_emits_scored_rank_pool_to_callback(monkeypatch) 
     import pandas as pd
 
     import src.daily.predict as predict_mod
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
 
     # Given: 4행 랭크풀 중 000004만 비적격
@@ -828,6 +859,7 @@ def test_run_topk_ranker_sleeve_emits_scored_rank_pool_to_callback(monkeypatch) 
         "kosdaq": [-0.31] * 4,
         "v_kospi": [15.2] * 4,
         "지수_실패": [False] * 4,
+        "is_screenable": True,
         "admitted": [True, True, True, False],
     })
     bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
@@ -920,7 +952,7 @@ def test_run_automated_topk_decision_persists_rank_pool_with_code_commit(monkeyp
 def test_run_topk_ranker_sleeve_loads_history_for_flow_only_bundle(monkeypatch) -> None:
     import src.daily.predict as predict_mod
     import src.ml.topk_history_features as thf
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
 
     # Given: a bundle needs inst_density/inst_rank but no f_* history feature
@@ -1062,7 +1094,7 @@ def test_sleeve_binds_inference_cutoff_and_provenance(monkeypatch) -> None:
     import pandas as pd
 
     import src.daily.predict as predict_mod
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
 
     wide = pd.DataFrame({
@@ -1081,6 +1113,7 @@ def test_sleeve_binds_inference_cutoff_and_provenance(monkeypatch) -> None:
         "시장구분": ["KOSPI"] * 4,
         "kospi": [0.52] * 4, "kosdaq": [-0.31] * 4, "v_kospi": [15.2] * 4,
         "지수_실패": [False] * 4,
+        "is_screenable": True,
         "admitted": [True, True, True, False],
         "capture_run_id": ["run-early"] * 4,
         "cohort_id": ["cohort-x"] * 4,
@@ -1358,7 +1391,7 @@ def test_run_topk_ranker_sleeve_no_decision_on_index_failure(monkeypatch, caplog
     import logging
 
     import src.daily.predict as predict_mod
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
 
     wide, _hist, decision = _sleeve_wide_and_history()
@@ -1383,7 +1416,7 @@ def test_run_topk_ranker_sleeve_no_decision_on_invalid_vkospi(monkeypatch, caplo
     import numpy as np
 
     import src.daily.predict as predict_mod
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
 
     bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
@@ -1405,7 +1438,7 @@ def test_run_topk_ranker_sleeve_no_decision_without_index_flag(monkeypatch, capl
     import logging
 
     import src.daily.predict as predict_mod
-    from src.ml.research.v3_engine import FEATURE_COLS
+    from src.ml.topk_contract import FEATURE_COLS
     from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
 
     wide, _hist, decision = _sleeve_wide_and_history()

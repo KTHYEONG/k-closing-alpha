@@ -1,9 +1,12 @@
-"""Nightly extended-session 1m backfill (NXT aftermarket/premarket, KRX aftermarket).
+"""Nightly extended-session and regular-session 1m backfill (NXT aftermarket/premarket, KRX aftermarket, KRX regular).
 
 KIS keeps minute history for a rolling ~1 year, so one trading day of NXT evening
 history is lost permanently every trading day. This job replays the retained window
 overnight (23:05-06:50 KST, when no KIS REST user is active) through the certified
 KIS historical route, resumable across nights via a durable per-symbol ledger.
+The regular stream retains full KRX regular-session 1m bars (09:00-15:30, closing-auction
+print included) for past symbol-days in the EOD fetch superset, so a 15:20 decision-time
+panel can be reconstructed before KIS minute-history expiry.
 """
 
 from __future__ import annotations
@@ -31,8 +34,12 @@ from src.config.market_session import (
     INTRADAY_SESSION_KRX_AFTERMARKET,
     INTRADAY_SESSION_NXT_AFTERMARKET,
     INTRADAY_SESSION_NXT_PREMARKET,
+    INTRADAY_SESSION_REGULAR,
     KRX_AFTERMARKET_START_DATE,
+    MAX_PREV_TRADING_DAY_LOOKBACK,
 )
+from src.data.eod_superset import EodSupersetScreen, eod_superset_mask
+from src.data.panel_integrity import REQUIRED_SOURCE_COLUMNS, prepare_price_panel
 from src.data.capture_contracts import (
     SEOUL,
     GOOD_ENTRY_STATES,
@@ -192,6 +199,105 @@ def enumerate_extended_session_tasks(
     ]
     tasks.sort(key=lambda task: (task.snapshot_date, task.session))
     return tasks
+
+
+@dataclass(frozen=True)
+class RegularBackfillPlan:
+    """Regular-session tasks plus the symbol-days deliberately not fetched.
+
+    Attributes:
+        tasks: One task per past trading date with a non-empty fetchable universe, ascending by date.
+        skipped_adjusted: Superset symbol-days whose panel close differs from close_raw (no raw-basis
+            regular source exists; KIS history is adjusted).
+        skipped_unknown_basis: Superset symbol-days without a decidable price basis.
+    """
+
+    tasks: tuple[ExtendedBackfillTask, ...]
+    skipped_adjusted: int
+    skipped_unknown_basis: int
+
+
+def enumerate_regular_session_tasks(
+    *,
+    as_of: date,
+    retention_days: int,
+    prepared_panel: pd.DataFrame,
+    screen: EodSupersetScreen,
+    price_reference: PriceReference,
+) -> RegularBackfillPlan:
+    """Enumerate regular-session backfill tasks for KIS-retained past dates from the EOD superset.
+
+    Day T's universe is every symbol whose EOD row on T passes the fetch superset. T's EOD values are
+    final at backfill time (T < as_of), so selecting with them is not lookahead for acquisition; the
+    superset is a fetch filter only and is never consumed as a training or decision screen. Stored and
+    ledger-terminal symbols are filtered later by the runner (live-archive output is never refetched).
+
+    Args:
+        as_of: KST run date; only dates strictly before it are emitted (the live archive owns as_of).
+        retention_days: KIS minute retention in calendar days; dates before as_of - retention_days are
+            never emitted.
+        prepared_panel: prepare_price_panel output covering the retention window (date, symbol, chg_ratio,
+            tv_clean, mc_clean, volume).
+        screen: EOD fetch superset.
+        price_reference: Raw/adjusted state per symbol-day; adjusted or unknown symbol-days are skipped.
+
+    Returns:
+        Plan with tasks ordered by ascending snapshot_date (closest to expiry first) and skip counts.
+
+    Raises:
+        ValueError: retention_days < 1, or propagated from eod_superset_mask on missing columns.
+    """
+    if int(retention_days) < 1:
+        raise ValueError(f"retention_days must be >= 1, got {retention_days!r}")
+    as_of_str = as_of.isoformat()
+    earliest = (as_of - timedelta(days=int(retention_days))).isoformat()
+    if prepared_panel is None or len(prepared_panel) == 0:
+        eod_superset_mask(prepared_panel if prepared_panel is not None else pd.DataFrame(), screen)
+        return RegularBackfillPlan(tasks=(), skipped_adjusted=0, skipped_unknown_basis=0)
+    if "date" not in prepared_panel.columns:
+        eod_superset_mask(prepared_panel, screen)
+        return RegularBackfillPlan(tasks=(), skipped_adjusted=0, skipped_unknown_basis=0)
+    days = _normalize_day_column(prepared_panel["date"])
+    in_bounds = (days >= earliest) & (days < as_of_str)
+    scoped = prepared_panel.loc[in_bounds].copy()
+    if len(scoped) == 0:
+        return RegularBackfillPlan(tasks=(), skipped_adjusted=0, skipped_unknown_basis=0)
+    mask = eod_superset_mask(scoped, screen)
+    scoped = scoped.copy()
+    scoped["_day"] = _normalize_day_column(scoped["date"]).astype(str).tolist()
+    scoped["_pass"] = np.asarray(mask, dtype=bool)
+    passing = scoped.loc[scoped["_pass"]]
+    symbols_by_day: dict[str, list[str]] = {}
+    if len(passing):
+        syms = passing["symbol"].astype(str).str.zfill(6).tolist()
+        for day, symbol in zip(passing["_day"].astype(str).tolist(), syms):
+            symbols_by_day.setdefault(str(day), []).append(str(symbol))
+    tasks: list[ExtendedBackfillTask] = []
+    skipped_adjusted = 0
+    skipped_unknown_basis = 0
+    for day in sorted(symbols_by_day):
+        fetchable: list[str] = []
+        for symbol in symbols_by_day[day]:
+            if price_reference.is_adjusted(day, symbol):
+                skipped_adjusted += 1
+            elif not price_reference.is_known(day, symbol):
+                skipped_unknown_basis += 1
+            else:
+                fetchable.append(symbol)
+        if fetchable:
+            tasks.append(
+                ExtendedBackfillTask(
+                    snapshot_date=str(day),
+                    session=INTRADAY_SESSION_REGULAR,
+                    symbols=tuple(sorted(set(fetchable))),
+                )
+            )
+    tasks.sort(key=lambda task: task.snapshot_date)
+    return RegularBackfillPlan(
+        tasks=tuple(tasks),
+        skipped_adjusted=int(skipped_adjusted),
+        skipped_unknown_basis=int(skipped_unknown_basis),
+    )
 
 
 def _with_legacy_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -398,6 +504,103 @@ def _stored_partition_symbols(snapshot_date: str, session: str) -> set[str]:
     return {str(item) for item in existing["symbol"].astype(str).tolist()}
 
 
+@dataclass(frozen=True)
+class RegularBackfillCoverage:
+    """Resolution state of the regular stream over its planned symbol-days."""
+
+    days_total: int
+    days_resolved: int
+    symbol_days_total: int
+    symbol_days_resolved: int
+    symbol_days_pending: int
+    oldest_pending_date: str
+    oldest_pending_expiry_days: int
+
+
+def summarize_regular_backfill_coverage(
+    plan: RegularBackfillPlan,
+    ledger: ExtendedBackfillLedger,
+    *,
+    as_of: date,
+    retention_days: int,
+    stored_symbols: Callable[[str, str], set[str]] = _stored_partition_symbols,
+) -> RegularBackfillCoverage:
+    """Count planned regular symbol-days already resolved (ledger-terminal or stored) and the expiry horizon.
+
+    Args:
+        plan: Output of enumerate_regular_session_tasks.
+        ledger: Durable outcome ledger.
+        as_of: KST run date.
+        retention_days: KIS minute retention in calendar days.
+        stored_symbols: Stored partition symbols per (snapshot_date, session); injectable for tests.
+
+    Returns:
+        Coverage counts; oldest_pending_date is "" and oldest_pending_expiry_days is -1 when nothing is pending.
+
+    Raises:
+        OSError: A stored partition is unreadable (propagated; never treated as empty).
+    """
+    days_total = len(plan.tasks)
+    symbol_days_total = sum(len(task.symbols) for task in plan.tasks)
+    symbol_days_resolved = 0
+    days_resolved = 0
+    oldest_pending = ""
+    for task in plan.tasks:
+        terminal = ledger.terminal_symbols(task.snapshot_date, INTRADAY_SESSION_REGULAR)
+        stored = stored_symbols(task.snapshot_date, INTRADAY_SESSION_REGULAR)
+        resolved = {symbol for symbol in task.symbols if symbol in terminal or symbol in stored}
+        symbol_days_resolved += len(resolved)
+        if len(resolved) == len(task.symbols):
+            days_resolved += 1
+        elif not oldest_pending or task.snapshot_date < oldest_pending:
+            oldest_pending = str(task.snapshot_date)
+    symbol_days_pending = int(symbol_days_total - symbol_days_resolved)
+    if not oldest_pending:
+        return RegularBackfillCoverage(
+            days_total=int(days_total),
+            days_resolved=int(days_resolved),
+            symbol_days_total=int(symbol_days_total),
+            symbol_days_resolved=int(symbol_days_resolved),
+            symbol_days_pending=int(symbol_days_pending),
+            oldest_pending_date="",
+            oldest_pending_expiry_days=-1,
+        )
+    expiry = int(retention_days) - (as_of - date.fromisoformat(oldest_pending)).days
+    return RegularBackfillCoverage(
+        days_total=int(days_total),
+        days_resolved=int(days_resolved),
+        symbol_days_total=int(symbol_days_total),
+        symbol_days_resolved=int(symbol_days_resolved),
+        symbol_days_pending=int(symbol_days_pending),
+        oldest_pending_date=str(oldest_pending),
+        oldest_pending_expiry_days=int(expiry),
+    )
+
+
+def _select_backfill_tasks(
+    kis_tasks: Sequence[ExtendedBackfillTask],
+    regular_plan: RegularBackfillPlan | None,
+    *,
+    run_extended: bool,
+    run_regular: bool,
+) -> list[ExtendedBackfillTask]:
+    """Concatenate the enabled streams; the runner orders the union oldest-first.
+
+    Args:
+        kis_tasks: Extended-stream tasks.
+        regular_plan: Regular-stream plan, or None when the stream is skipped.
+        run_extended: Include the extended stream.
+        run_regular: Include the regular stream.
+
+    Returns:
+        Task list with extended tasks first; the runner sorts by (snapshot_date, session).
+    """
+    selected = list(kis_tasks) if run_extended else []
+    if run_regular and regular_plan is not None:
+        selected.extend(regular_plan.tasks)
+    return selected
+
+
 @asynccontextmanager
 async def _http_session(client: Any) -> AsyncIterator[aiohttp.ClientSession | None]:
     """Yield a request session for any client shape (real, session-factory, or bare fake)."""
@@ -476,6 +679,7 @@ async def run_extended_session_backfill(
     failed = 0
     exhausted = 0
     stopped = False
+    unreadable: list[str] = []
     async with AsyncExitStack() as stack:
         http_sessions = [await stack.enter_async_context(_http_session(client)) for client in clients]
         for task in ordered:
@@ -484,7 +688,17 @@ async def run_extended_session_backfill(
                 break
             started = clock()
             terminal = ledger.terminal_symbols(task.snapshot_date, task.session)
-            stored = _stored_partition_symbols(task.snapshot_date, task.session)
+            try:
+                stored = _stored_partition_symbols(task.snapshot_date, task.session)
+            except OSError as exc:
+                # One unreadable partition must not starve every later task of the night (oldest-first order
+                # would hit it first each run): finish the readable tasks, then fail loud below.
+                logger.error(
+                    "[DATA] stage=extended_backfill status=TASK_SKIPPED reason=unreadable_partition date=%s session=%s error=%s",
+                    task.snapshot_date, task.session, type(exc).__name__,
+                )
+                unreadable.append(f"{task.snapshot_date}/{task.session}")
+                continue
             repair_candidates = {
                 symbol
                 for symbol in ledger.unverified_complete_symbols(task.snapshot_date, task.session)
@@ -711,6 +925,8 @@ async def run_extended_session_backfill(
                 basis_failed,
                 elapsed,
             )
+    if unreadable:
+        raise OSError(f"Cannot read existing partition evidence for tasks {unreadable}")
     return ExtendedBackfillSummary(
         tasks_done=done,
         tasks_remaining=len(ordered) - done,
@@ -721,6 +937,19 @@ async def run_extended_session_backfill(
         stopped_by_deadline=stopped,
         exhausted=exhausted,
     )
+
+
+def _coverage_or_none(
+    plan: RegularBackfillPlan | None, ledger: ExtendedBackfillLedger, *, as_of: date, retention_days: int
+) -> RegularBackfillCoverage | None:
+    """Coverage telemetry that never blocks the run; an unreadable partition is reported by the runner instead."""
+    if plan is None:
+        return None
+    try:
+        return summarize_regular_backfill_coverage(plan, ledger, as_of=as_of, retention_days=retention_days)
+    except OSError as exc:
+        logger.error("[DATA] stage=regular_backfill_coverage status=UNAVAILABLE error=%s", type(exc).__name__)
+        return None
 
 
 def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, logic covered via run_extended_session_backfill scenarios
@@ -737,6 +966,7 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
         default=None,
         help="HHMMSS KST after which no new task starts (default COLLECTION_BACKFILL_STOP_HHMMSS).",
     )
+    parser.add_argument("--sessions", choices=("all", "extended", "regular"), default="all", help="Backfill streams to run.")
     args = parser.parse_args()
     profile = CollectionSettings()
     now = datetime.now(SEOUL)
@@ -816,6 +1046,42 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
             price_history=price_history,
             candidate_pairs=candidate_pairs,
         )
+        run_extended = str(args.sessions) in ("all", "extended")
+        run_regular = str(args.sessions) in ("all", "regular")
+        regular_plan: RegularBackfillPlan | None = None
+        if not profile.COLLECTION_PIT_BACKFILL_ENABLED:
+            logger.info("[DATA] stage=regular_backfill status=SKIP reason=disabled")
+            run_regular = False
+        if run_regular:
+            wide_columns = sorted(REQUIRED_SOURCE_COLUMNS | {"close_raw", "market"})
+            wide_start = (as_of - timedelta(days=retention + int(MAX_PREV_TRADING_DAY_LOOKBACK))).isoformat()
+            wide_history = pd.read_parquet(
+                app_settings.PRICE_HISTORY_PARQUET_PATH,
+                columns=wide_columns,
+            )
+            wide_days = _normalize_day_column(wide_history["date"])
+            wide_history = wide_history[
+                (wide_days >= wide_start) & (wide_days <= as_of.isoformat())
+            ].copy()
+            prepared, _provenance = prepare_price_panel(wide_history)
+            price_reference = PriceReference.from_price_history(wide_history)
+            regular_plan = enumerate_regular_session_tasks(
+                as_of=as_of,
+                retention_days=retention,
+                prepared_panel=prepared,
+                screen=EodSupersetScreen.from_profile(profile),
+                price_reference=price_reference,
+            )
+            plan_days = [task.snapshot_date for task in regular_plan.tasks]
+            logger.info(
+                "[DATA] stage=regular_backfill_plan days=%d symbol_days=%d skipped_adjusted=%d skipped_unknown_basis=%d oldest=%s newest=%s",
+                len(regular_plan.tasks),
+                sum(len(task.symbols) for task in regular_plan.tasks),
+                regular_plan.skipped_adjusted,
+                regular_plan.skipped_unknown_basis,
+                plan_days[0] if plan_days else "",
+                plan_days[-1] if plan_days else "",
+            )
         if clients:
             async with clients[0].create_session() as broker_session:
                 for client in clients:
@@ -826,17 +1092,45 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
         raw_client = KiwoomApiClient() if app_settings.KIWOOM_APP_KEY else None
         if raw_client is None:
             logger.warning("[DATA] stage=extended_backfill kiwoom=unconfigured adjusted_days=fail_closed")
-        return await run_extended_session_backfill(
+        tasks = _select_backfill_tasks(kis_tasks, regular_plan, run_extended=run_extended, run_regular=run_regular)
+        start_coverage = _coverage_or_none(regular_plan, ledger, as_of=as_of, retention_days=retention)
+        if start_coverage is not None:
+            logger.info(
+                "[DATA] stage=regular_backfill_coverage phase=%s days_total=%d days_resolved=%d symbol_days_total=%d symbol_days_resolved=%d symbol_days_pending=%d oldest_pending=%s oldest_pending_expiry_days=%d",
+                "start",
+                start_coverage.days_total,
+                start_coverage.days_resolved,
+                start_coverage.symbol_days_total,
+                start_coverage.symbol_days_resolved,
+                start_coverage.symbol_days_pending,
+                start_coverage.oldest_pending_date,
+                start_coverage.oldest_pending_expiry_days,
+            )
+        summary = await run_extended_session_backfill(
             as_of=as_of,
             stop_at=stop_at,
             profile=profile,
             clients=clients,
             store=store,
             ledger=ledger,
-            tasks=kis_tasks,
+            tasks=tasks,
             price_reference=price_reference,
             raw_client=raw_client,
         )
+        end_coverage = _coverage_or_none(regular_plan, ledger, as_of=as_of, retention_days=retention)
+        if end_coverage is not None:
+            logger.info(
+                "[DATA] stage=regular_backfill_coverage phase=%s days_total=%d days_resolved=%d symbol_days_total=%d symbol_days_resolved=%d symbol_days_pending=%d oldest_pending=%s oldest_pending_expiry_days=%d",
+                "end",
+                end_coverage.days_total,
+                end_coverage.days_resolved,
+                end_coverage.symbol_days_total,
+                end_coverage.symbol_days_resolved,
+                end_coverage.symbol_days_pending,
+                end_coverage.oldest_pending_date,
+                end_coverage.oldest_pending_expiry_days,
+            )
+        return summary
 
     kis_summary = asyncio.run(_run())
     logger.info(

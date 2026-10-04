@@ -78,7 +78,8 @@ def test_realize_pool_exit_arms_flags_price_discontinuity_and_missing_bars() -> 
         "close": [10_000.0] * 5 + [10_100.0, 9_900.0, 10_000.0, 9_800.0, 9_700.0],
     })
 
-    from src.strategy.t1_attribution import STATUS_PRICE_DISCONTINUITY, realize_pool_exit_arms
+    from src.strategy.growth_shadow import STATUS_PRICE_DISCONTINUITY
+    from src.strategy.t1_attribution import realize_pool_exit_arms
 
     # Given: 000004 익일 시가 +50%(액면분할 등 비수정 가격), 000005 익일 봉 누락
     ph = price_history.copy()
@@ -94,6 +95,65 @@ def test_realize_pool_exit_arms_flags_price_discontinuity_and_missing_bars() -> 
     assert out.loc["000005", "status"] == "EXIT_UNAVAILABLE"
     assert out.loc[["000005"], ["open_net", "tp_net"]].isna().all().all()
     assert out.loc["000001", "status"] == "REALIZED"
+
+
+def _single_pick_pool(open_, high, close):
+    import pandas as pd
+
+    pool = pd.DataFrame({
+        "decision_date": ["2026-09-10"],
+        "symbol": ["000001"],
+        "pred": [0.05],
+        "tick_cost_bp": [0.0],
+        "admitted": [True],
+        "selected": [True],
+        "model_version": ["KCA-TOPK-COSTAWARE-001@2026-09-04 00:00:00@UNKNOWN"],
+    })
+    price_history = pd.DataFrame({
+        "date": ["2026-09-10", "2026-09-11"],
+        "symbol": ["000001", "000001"],
+        "open": [10_000.0, open_],
+        "high": [10_000.0, high],
+        "close": [10_000.0, close],
+    })
+    return pool, price_history
+
+
+def test_realize_pool_exit_arms_keeps_exact_limit_up_open_realized() -> None:
+    import pytest
+
+    from src.strategy.t1_attribution import realize_pool_exit_arms
+
+    # Given: 종가 10,000 → 익일 시·고·종가 13,000 (법정 상한, 13000/10000-1 == 0.30000000000000004)
+    pool, price_history = _single_pick_pool(13_000.0, 13_000.0, 13_000.0)
+
+    # When
+    out = realize_pool_exit_arms(pool, price_history)
+
+    # Then
+    assert out.loc[0, "status"] == "REALIZED"
+    assert out.loc[0, "open_gross"] == pytest.approx(0.30)
+
+
+def test_realize_pool_exit_arms_flags_take_profit_leg_discontinuity() -> None:
+    from src.strategy.growth_shadow import STATUS_PRICE_DISCONTINUITY
+    from src.strategy.t1_attribution import realize_pool_exit_arms
+
+    # Given: 익일 시가 +1%(정상), 고가 +2%(TP 5% 미도달), 종가 -50% → MOC 폴백 tp_gross = -0.5
+    pool, price_history = _single_pick_pool(10_100.0, 10_200.0, 5_000.0)
+
+    # When
+    out = realize_pool_exit_arms(pool, price_history)
+
+    # Then
+    assert out.loc[0, "status"] == STATUS_PRICE_DISCONTINUITY
+    assert out.loc[[0], ["open_gross", "open_net", "tp_gross", "tp_net"]].isna().all().all()
+
+
+def test_t1_attribution_uses_the_single_limit_constant() -> None:
+    import src.strategy.t1_attribution as module
+
+    assert not hasattr(module, "KRX_DAILY_PRICE_LIMIT_RATIO")
 
 
 def test_realize_pool_exit_arms_fails_closed_on_schema_and_duplicates() -> None:

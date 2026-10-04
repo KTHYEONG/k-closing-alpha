@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from src.sync.fetcher_investor import _prev_day_ymd, get_investor_trade_daily_async
 
 
 class _Client:
-    base_url = "https://example.test"
-
-    async def _handle_request(self, *args, **kwargs):
+    async def get_investor_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
         return {
             "rt_cd": "0",
             "output2": [
@@ -22,9 +21,6 @@ class _Client:
             ],
         }
 
-    def _get_headers(self, tr_id):
-        return {}
-
 
 class _Session:
     def get(self, *args, **kwargs):
@@ -32,12 +28,12 @@ class _Session:
 
 
 class _FailingClient(_Client):
-    async def _handle_request(self, *args, **kwargs):
+    async def get_investor_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
         return {"rt_cd": "1", "msg1": "temporary failure"}
 
 
 class _RaisingClient(_Client):
-    async def _handle_request(self, *args, **kwargs):
+    async def get_investor_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
         raise RuntimeError("connection reset")
 
 
@@ -58,6 +54,41 @@ def test_investor_async_uses_amount_and_rate_slot() -> None:
     assert out.loc[0, "inst_netbuy"] == -2000.0
 
 
+def test_investor_async_page_arguments_pinned() -> None:
+    seen: list[tuple] = []
+
+    class _Recording(_Client):
+        async def get_investor_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
+            seen.append((code, cursor, market_div_code))
+            return await super().get_investor_trade_daily_page(session, code, cursor, market_div_code=market_div_code)
+
+    asyncio.run(
+        get_investor_trade_daily_async(
+            _Session(), _Recording(), "5930", "20200102", "20200102",
+        )
+    )
+    assert seen[0] == ("005930", "20200102", "J")
+
+
+def test_investor_async_slot_precedes_page() -> None:
+    events: list[str] = []
+
+    async def slot() -> None:
+        events.append("slot")
+
+    class _Recording(_Client):
+        async def get_investor_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
+            events.append("page")
+            return await super().get_investor_trade_daily_page(session, code, cursor, market_div_code=market_div_code)
+
+    asyncio.run(
+        get_investor_trade_daily_async(
+            _Session(), _Recording(), "005930", "20200102", "20200102", request_slot=slot
+        )
+    )
+    assert events == ["slot", "page"]
+
+
 def test_investor_async_stops_after_consecutive_failures() -> None:
     calls = 0
 
@@ -75,6 +106,44 @@ def test_investor_async_stops_after_consecutive_failures() -> None:
     assert calls == 2
 
 
+def test_investor_async_consecutive_failures_use_descending_cursors() -> None:
+    cursors: list[str] = []
+
+    class _RecordingFail(_FailingClient):
+        async def get_investor_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
+            cursors.append(cursor)
+            return await super().get_investor_trade_daily_page(session, code, cursor, market_div_code=market_div_code)
+
+    asyncio.run(
+        get_investor_trade_daily_async(
+            _Session(), _RecordingFail(), "005930", "20200102", "20200110",
+            max_consecutive_failures=2,
+        )
+    )
+    assert cursors == ["20200110", "20200109"]
+
+
+def test_investor_async_rt_cd_9_counted_as_api_failure(caplog) -> None:
+    pages = 0
+
+    class _Rt9:
+        async def get_investor_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
+            nonlocal pages
+            pages += 1
+            return {"rt_cd": "9", "msg1": "최대 재시도 횟수 초과 (TPS 제한)"}
+
+    with caplog.at_level(logging.WARNING):
+        out = asyncio.run(
+            get_investor_trade_daily_async(
+                _Session(), _Rt9(), "005930", "20200102", "20200110",
+                max_consecutive_failures=1,
+            )
+        )
+    assert out.empty
+    assert pages == 1
+    assert any("status=API_FAIL" in r.message for r in caplog.records)
+
+
 def test_investor_async_stops_after_request_errors() -> None:
     out = asyncio.run(
         get_investor_trade_daily_async(
@@ -83,6 +152,30 @@ def test_investor_async_stops_after_request_errors() -> None:
         )
     )
     assert out.empty
+
+
+def test_investor_async_slot_failure_is_request_failure(caplog) -> None:
+    called = False
+
+    class _NeverCalled(_Client):
+        async def get_investor_trade_daily_page(self, session, code, cursor, *, market_div_code="J"):
+            nonlocal called
+            called = True
+            raise AssertionError("page must not be called")
+
+    async def bad_slot() -> None:
+        raise RuntimeError("slot boom")
+
+    with caplog.at_level(logging.WARNING):
+        out = asyncio.run(
+            get_investor_trade_daily_async(
+                _Session(), _NeverCalled(), "005930", "20200102", "20200102",
+                request_slot=bad_slot, max_consecutive_failures=1,
+            )
+        )
+    assert out.empty
+    assert called is False
+    assert any("status=REQUEST_FAIL" in r.message for r in caplog.records)
 
 
 def test_get_investor_trade_daily_builds_client_from_data_account(monkeypatch) -> None:

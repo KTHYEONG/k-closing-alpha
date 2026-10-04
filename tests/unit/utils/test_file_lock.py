@@ -341,3 +341,50 @@ def test_exclusive_file_lock_unopenable_sidecar_fails_closed_at_deadline(tmp_pat
             pytest.fail("body must not run without the lock")
     finally:
         path.chmod(0o644)
+
+
+def test_open_lock_descriptor_creates_0644_lock_file(tmp_path: Path) -> None:
+    import stat
+
+    from src.utils.file_lock import open_lock_descriptor
+
+    path = tmp_path / "job.lock"
+    fd = open_lock_descriptor(path)
+    try:
+        assert path.exists()
+        assert stat.S_IMODE(path.stat().st_mode) & 0o777 == 0o644
+        os.write(fd, b"x")
+    finally:
+        os.close(fd)
+
+
+@_requires_non_root
+def test_open_lock_descriptor_falls_back_to_read_only(tmp_path: Path) -> None:
+    import fcntl
+
+    from src.utils.file_lock import open_lock_descriptor
+
+    path = tmp_path / "foreign.lock"
+    path.touch()
+    path.chmod(0o444)
+    fd = open_lock_descriptor(path)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+
+
+@_requires_non_root
+def test_open_lock_descriptor_raises_when_unreadable(tmp_path: Path) -> None:
+    import pytest
+
+    from src.utils.file_lock import open_lock_descriptor
+
+    path = tmp_path / "dark.lock"
+    path.touch()
+    path.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError):
+            open_lock_descriptor(path)
+    finally:
+        path.chmod(0o644)

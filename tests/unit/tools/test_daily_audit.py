@@ -77,9 +77,7 @@ def _publish_cohort_decision(store, day, eligible, *, run_id="run-decision", adm
 
     trading_day = date.fromisoformat(day)
     rejected = {} if "999999" in eligible else {"999999": "out_of_band"}
-    cohort = build_cohort(
-        trading_day, [*eligible, *rejected], list(eligible), rejected, eligibility_rule_version="v1"
-    )
+    cohort = build_cohort(trading_day, [*eligible, *rejected], list(eligible), rejected, eligibility_rule_version="v1")
     flags = list(admitted) if admitted is not None else [True] * len(eligible)
     stamp = datetime.fromisoformat(f"{day}T15:19:00+09:00")
     frame = pd.DataFrame(
@@ -159,9 +157,7 @@ def _publish_chart_manifest(
         for symbol in symbols
     ]
     manifest_status = (
-        CaptureStatus.COMPLETE
-        if all(e.status == CaptureStatus.COMPLETE for e in entries)
-        else CaptureStatus.PARTIAL
+        CaptureStatus.COMPLETE if all(e.status == CaptureStatus.COMPLETE for e in entries) else CaptureStatus.PARTIAL
     )
     manifest = CaptureManifest(
         schema_version=1,
@@ -253,9 +249,7 @@ def _publish_auction_open(store, day, run_id, symbols, *, clock, status=None):
         for symbol in symbols
     ]
     manifest_status = (
-        CaptureStatus.COMPLETE
-        if all(e.status == CaptureStatus.COMPLETE for e in entries)
-        else CaptureStatus.PARTIAL
+        CaptureStatus.COMPLETE if all(e.status == CaptureStatus.COMPLETE for e in entries) else CaptureStatus.PARTIAL
     )
     manifest = CaptureManifest(
         schema_version=1,
@@ -363,10 +357,18 @@ def test_audit_daily_completeness_reports_all_steps_from_topk_log_and_fills(monk
     paper_dir.mkdir()
     monkeypatch.setattr(daily_audit.settings, "PARQUET_DIR", parquet_dir, raising=False)
     monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", paper_dir, raising=False)
-    pd.DataFrame({"decision_date": ["2026-09-14"], "symbol": ["005930"]}).to_parquet(parquet_dir / "topk_decisions.parquet")
+    pd.DataFrame({"decision_date": ["2026-09-14"], "symbol": ["005930"]}).to_parquet(
+        parquet_dir / "topk_decisions.parquet"
+    )
     pd.DataFrame(
-        {"order_id": ["2026-09-14:005930:entry"], "symbol": ["005930"], "side": ["buy"], "qty": [10],
-         "fill_price": [70_000], "decision_date": ["2026-09-14"]}
+        {
+            "order_id": ["2026-09-14:005930:entry"],
+            "symbol": ["005930"],
+            "side": ["buy"],
+            "qty": [10],
+            "fill_price": [70_000],
+            "decision_date": ["2026-09-14"],
+        }
     ).to_parquet(paper_dir / "fills.parquet")
     price_history = tmp_path / "price_history.parquet"
     pd.DataFrame({"date": pd.to_datetime(["2026-09-11"])}).to_parquet(price_history)
@@ -376,7 +378,9 @@ def test_audit_daily_completeness_reports_all_steps_from_topk_log_and_fills(monk
     monkeypatch.setattr(
         daily_audit,
         "fetch_archive_snapshot",
-        lambda snapshot_date=None, **kw: pd.DataFrame({"종목코드": ["005930"], daily_audit.CLOSE_CONFIRMED_COL: [True]}),
+        lambda snapshot_date=None, **kw: pd.DataFrame(
+            {"종목코드": ["005930"], daily_audit.CLOSE_CONFIRMED_COL: [True]}
+        ),
     )
     monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: "2026-09-11")
     monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: bars)
@@ -598,22 +602,25 @@ def test_build_digest_ok_warning_and_holiday_subjects() -> None:
     all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
 
     # When/Then: 정상
-    subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
+    digest = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
+    subject, body = digest.subject, digest.body
     assert subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
     assert "failed_units=none" in body
     assert "stale_kis_tokens=none" in body
 
     # And: 누락 + 실패유닛 + KIS 토큰 누락
     partial = dict(all_ok, paper_entry=False)
-    subject, body = daily_audit.build_digest(
+    digest = daily_audit.build_digest(
         "2026-09-14", daily_audit.DAY_TRADING, partial, ["kca-backup.service"], ["DATA_3"]
     )
+    subject, body = digest.subject, digest.body
     assert "경고" in subject and "paper_entry" in subject and "kca-backup.service" in subject and "DATA_3" in subject
     assert "paper_entry=MISSING" in body
     assert "stale_kis_tokens=DATA_3" in body
 
     # And: 휴장일
-    subject, _ = daily_audit.build_digest("2026-09-24", daily_audit.DAY_HOLIDAY, None, [], [])
+    digest = daily_audit.build_digest("2026-09-24", daily_audit.DAY_HOLIDAY, None, [], [])
+    subject = digest.subject
     assert subject == "[kca] ⏸️ 2026-09-24 휴장일 SKIP"
 
     # And: 거래일인데 감사 결과가 없으면 거부
@@ -660,14 +667,17 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch, tmp_p
         return {"webhook": False, "email": True}
 
     # When/Then: 주말은 아무것도 보내지 않는다
-    assert daily_audit.run_daily_audit(
-        "2026-09-13",
-        trading_day_fn=lambda _d: True,
-        failed_units_fn=list,
-        stale_tokens_fn=lambda _d: [],
-        dispatch_fn=_dispatch,
-        backup_issues_fn=lambda _at: [],
-    ) is None
+    assert (
+        daily_audit.run_daily_audit(
+            "2026-09-13",
+            trading_day_fn=lambda _d: True,
+            failed_units_fn=list,
+            stale_tokens_fn=lambda _d: [],
+            dispatch_fn=_dispatch,
+            backup_issues_fn=lambda _at: [],
+        )
+        is None
+    )
     assert sent == [] and audited == []
 
     # And: 휴장일 + 정적 개장 세션 = 달력 불일치 경고 발송
@@ -771,7 +781,9 @@ def test_audit_daily_completeness_flags_stale_open_position(monkeypatch, tmp_pat
     paper_dir.mkdir()
     monkeypatch.setattr(daily_audit.settings, "PARQUET_DIR", parquet_dir, raising=False)
     monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", paper_dir, raising=False)
-    pd.DataFrame({"decision_date": ["2026-09-14"], "symbol": ["005930"]}).to_parquet(parquet_dir / "topk_decisions.parquet")
+    pd.DataFrame({"decision_date": ["2026-09-14"], "symbol": ["005930"]}).to_parquet(
+        parquet_dir / "topk_decisions.parquet"
+    )
     price_history = tmp_path / "price_history.parquet"
     pd.DataFrame({"date": pd.to_datetime(["2026-09-11"])}).to_parquet(price_history)
     bars = tmp_path / "bars.parquet"
@@ -780,7 +792,9 @@ def test_audit_daily_completeness_flags_stale_open_position(monkeypatch, tmp_pat
     monkeypatch.setattr(
         daily_audit,
         "fetch_archive_snapshot",
-        lambda snapshot_date=None, **kw: pd.DataFrame({"종목코드": ["005930"], daily_audit.CLOSE_CONFIRMED_COL: [True]}),
+        lambda snapshot_date=None, **kw: pd.DataFrame(
+            {"종목코드": ["005930"], daily_audit.CLOSE_CONFIRMED_COL: [True]}
+        ),
     )
     monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: "2026-09-11")
     monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: bars)
@@ -789,12 +803,33 @@ def test_audit_daily_completeness_flags_stale_open_position(monkeypatch, tmp_pat
     def _write_fills(rows: list[dict]) -> None:
         pd.DataFrame(rows).to_parquet(paper_dir / "fills.parquet")
 
-    today_buy = {"order_id": "2026-09-14:005930:entry", "symbol": "005930", "side": "buy", "qty": 10,
-                 "fill_price": 70_000, "decision_date": "2026-09-14", "entry_order_id": None}
-    old_buy = {"order_id": "2026-09-11:000660:entry", "symbol": "000660", "side": "buy", "qty": 5,
-               "fill_price": 200_000, "decision_date": "2026-09-11", "entry_order_id": None}
-    old_sell = {"order_id": "2026-09-11:000660:entry:exit:2026-09-14", "symbol": "000660", "side": "sell", "qty": 5,
-                "fill_price": 210_000, "decision_date": "2026-09-14", "entry_order_id": "2026-09-11:000660:entry"}
+    today_buy = {
+        "order_id": "2026-09-14:005930:entry",
+        "symbol": "005930",
+        "side": "buy",
+        "qty": 10,
+        "fill_price": 70_000,
+        "decision_date": "2026-09-14",
+        "entry_order_id": None,
+    }
+    old_buy = {
+        "order_id": "2026-09-11:000660:entry",
+        "symbol": "000660",
+        "side": "buy",
+        "qty": 5,
+        "fill_price": 200_000,
+        "decision_date": "2026-09-11",
+        "entry_order_id": None,
+    }
+    old_sell = {
+        "order_id": "2026-09-11:000660:entry:exit:2026-09-14",
+        "symbol": "000660",
+        "side": "sell",
+        "qty": 5,
+        "fill_price": 210_000,
+        "decision_date": "2026-09-14",
+        "entry_order_id": "2026-09-11:000660:entry",
+    }
 
     # When: 직전 결정일 로트가 오늘 청산되지 않고 남아 있다
     _write_fills([today_buy, old_buy])
@@ -841,8 +876,13 @@ def test_audit_collection_reports_partial_chart_as_incomplete(tmp_path) -> None:
     store = CaptureStore(tmp_path / "capture")
     _publish_cohort_decision(store, day, ["005930"])
     _publish_chart_manifest(
-        store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"],
-        status=CaptureStatus.PARTIAL, reason="incomplete:capped",
+        store,
+        day,
+        "run-bars",
+        CaptureDataset.MINUTE_BARS,
+        ["005930"],
+        status=CaptureStatus.PARTIAL,
+        reason="incomplete:capped",
     )
 
     # When
@@ -863,8 +903,14 @@ def test_audit_collection_accepts_proven_no_trade_ticks_only(tmp_path) -> None:
     _publish_cohort_decision(store, day, ["005930"])
     _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
     _publish_chart_manifest(
-        store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"],
-        status=CaptureStatus.NO_TRADES, reason="no_trades_in_window", raw_refs=(_evidence_ref(store, day),),
+        store,
+        day,
+        "run-ticks",
+        CaptureDataset.TRADE_TICKS,
+        ["005930"],
+        status=CaptureStatus.NO_TRADES,
+        reason="no_trades_in_window",
+        raw_refs=(_evidence_ref(store, day),),
     )
 
     issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
@@ -874,8 +920,14 @@ def test_audit_collection_accepts_proven_no_trade_ticks_only(tmp_path) -> None:
     _publish_cohort_decision(other, day, ["005930"])
     _publish_chart_manifest(other, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
     _publish_chart_manifest(
-        other, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"],
-        status=CaptureStatus.NO_TRADES, reason="krx_after_no_trades", raw_refs=(_evidence_ref(other, day),),
+        other,
+        day,
+        "run-ticks",
+        CaptureDataset.TRADE_TICKS,
+        ["005930"],
+        status=CaptureStatus.NO_TRADES,
+        reason="krx_after_no_trades",
+        raw_refs=(_evidence_ref(other, day),),
     )
     issues = _audit(other, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
     assert "collection:ticks:1:incomplete_entries" in issues
@@ -919,9 +971,7 @@ def test_audit_collection_exposes_wrong_session_event(tmp_path) -> None:
     store = CaptureStore(tmp_path / "capture")
     _publish_cohort_decision(store, day, ["005930", "000660"])
     _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930", "000660"])
-    _publish_chart_manifest(
-        store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"], last_time="20:00:00"
-    )
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"], last_time="20:00:00")
     _publish_chart_manifest(
         store, day, "run-ticks-early", CaptureDataset.TRADE_TICKS, ["000660"], first_time="08:00:00"
     )
@@ -941,9 +991,7 @@ def test_audit_collection_requires_chart_terminal_proof(tmp_path) -> None:
     day = "2026-09-18"
     store = CaptureStore(tmp_path / "capture")
     _publish_cohort_decision(store, day, ["005930"])
-    _publish_chart_manifest(
-        store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"], reason="capped:regular=5"
-    )
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"], reason="capped:regular=5")
     _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"])
 
     # When
@@ -983,9 +1031,7 @@ def test_audit_collection_keeps_future_slow_data_pending(tmp_path) -> None:
     _publish_cohort_decision(store, day, ["005930"])
 
     # When: 20:15 감사는 21:35 슬로우데이터를 실패로 단정하지 않는다
-    issues = _audit(
-        store, day, _collection_profile(tmp_path, altdata=True), _session_clock(day), _audit_moment(day)
-    )
+    issues = _audit(store, day, _collection_profile(tmp_path, altdata=True), _session_clock(day), _audit_moment(day))
 
     # Then
     assert not any(issue.startswith("collection:slow_data") for issue in issues)
@@ -1193,8 +1239,13 @@ def test_audit_collection_omits_secrets_from_issues(tmp_path) -> None:
     store = CaptureStore(tmp_path / "capture")
     _publish_cohort_decision(store, day, ["005930"])
     _publish_chart_manifest(
-        store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"],
-        status=CaptureStatus.FAILED, reason="auth:appkey=SECRET app_secret=XYZ",
+        store,
+        day,
+        "run-bars",
+        CaptureDataset.MINUTE_BARS,
+        ["005930"],
+        status=CaptureStatus.FAILED,
+        reason="auth:appkey=SECRET app_secret=XYZ",
     )
     _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"])
 
@@ -1359,14 +1410,15 @@ def test_build_digest_includes_collection_issues_compatibly() -> None:
     all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
 
     # Given: 기존 위치 인자 호출
-    subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
+    digest = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
+    subject, body = digest.subject, digest.body
 
     # Then: 기존 형식 그대로
     assert subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
     assert "collection_issues=none" in body
 
     # When: 수집 이상이 함께 보고된다
-    subject, body = daily_audit.build_digest(
+    digest = daily_audit.build_digest(
         "2026-09-14",
         daily_audit.DAY_TRADING,
         all_ok,
@@ -1374,6 +1426,7 @@ def test_build_digest_includes_collection_issues_compatibly() -> None:
         [],
         collection_issues=("collection:charts:2:missing_entries",),
     )
+    subject, body = digest.subject, digest.body
 
     # Then
     assert "경고" in subject and "collection:charts:2:missing_entries" in subject
@@ -1584,9 +1637,10 @@ def test_digest_warns_on_backup_issue() -> None:
     all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
 
     # Given all steps OK and one backup issue
-    subject, body = daily_audit.build_digest(
+    digest = daily_audit.build_digest(
         "2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [], backup_issues=["offsite_backup:stale"]
     )
+    subject, body = digest.subject, digest.body
 
     # Then warning subject with backup problem and detail line
     assert "🚨" in subject and "백업이상" in subject
@@ -1600,7 +1654,8 @@ def test_digest_ok_when_no_backup_issue() -> None:
     all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
 
     # Given all OK and no backup issues
-    subject, body = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
+    digest = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
+    subject, body = digest.subject, digest.body
 
     # Then green subject and none detail
     assert "🟢" in subject
@@ -1618,7 +1673,14 @@ def test_default_backup_issues_reads_report_under_capture_root(tmp_path, monkeyp
     report_path = capture_root / "offsite" / "last_run.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
-        json.dumps({"started_at": "2026-09-18T13:30:00+00:00", "finished_at": "2026-09-18T13:31:00+00:00", "status": "ok", "steps": {}}),
+        json.dumps(
+            {
+                "started_at": "2026-09-18T13:30:00+00:00",
+                "finished_at": "2026-09-18T13:31:00+00:00",
+                "status": "ok",
+                "steps": {},
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(daily_audit, "_capture_root", lambda: capture_root)
@@ -1742,9 +1804,7 @@ def test_audit_collection_holiday_raises_no_slow_data_issue(tmp_path) -> None:
     assert daily_audit.classify_day(day, lambda _d: False) == daily_audit.DAY_HOLIDAY
     store = CaptureStore(tmp_path / "capture")
     _publish_cohort_decision(store, day, ["005930"])
-    issues = _audit(
-        store, day, _collection_profile(tmp_path, altdata=True), _session_clock(day), _audit_moment(day)
-    )
+    issues = _audit(store, day, _collection_profile(tmp_path, altdata=True), _session_clock(day), _audit_moment(day))
     assert not any(issue.startswith("collection:slow_data") for issue in issues)
 
 
@@ -1780,15 +1840,17 @@ def test_run_daily_audit_uses_resolved_clock_and_surfaces_shifted_session(monkey
         provenance="csat_delayed_open",
     )
     monkeypatch.setattr(
-        daily_audit, "resolve_session_day",
-        lambda _d, **_k: SessionDay(trading_date=target, kind=SessionKind.SHIFTED, clock=clock, provenance="krx_calendar"),
+        daily_audit,
+        "resolve_session_day",
+        lambda _d, **_k: SessionDay(
+            trading_date=target, kind=SessionKind.SHIFTED, clock=clock, provenance="krx_calendar"
+        ),
     )
-    monkeypatch.setattr(
-        daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True)
-    )
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True))
     seen: dict = {}
     monkeypatch.setattr(
-        daily_audit, "audit_collection_manifests",
+        daily_audit,
+        "audit_collection_manifests",
         lambda *a, **k: seen.update(k) or (),
     )
     sent: list[tuple[str, str]] = []
@@ -2125,9 +2187,9 @@ def test_read_stored_partition_prunes_columns_and_reports_absence(monkeypatch, t
 
     path = intraday_partition_path(1, "2026-09-23", "regular")
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        {"symbol": ["005930"], "ts_hms": [90100], "close": [70000], "volume": [10]}
-    ).to_parquet(path, index=False)
+    pd.DataFrame({"symbol": ["005930"], "ts_hms": [90100], "close": [70000], "volume": [10]}).to_parquet(
+        path, index=False
+    )
 
     frame = daily_audit._read_stored_partition("2026-09-23", "regular")
 
@@ -2141,7 +2203,8 @@ def test_build_digest_warns_when_intraday_incomplete() -> None:
     result = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
     result["intraday_complete"] = False
 
-    subject, body = daily_audit.build_digest("2026-09-23", daily_audit.DAY_TRADING, result, [], [])
+    digest = daily_audit.build_digest("2026-09-23", daily_audit.DAY_TRADING, result, [], [])
+    subject, body = digest.subject, digest.body
 
     assert "경고" in subject
     assert "intraday_complete=MISSING" in body
@@ -2316,9 +2379,7 @@ def test_heartbeat_written_on_trading_and_holiday_runs(monkeypatch, tmp_path) ->
 def test_heartbeat_not_written_on_weekend(monkeypatch, tmp_path) -> None:
     from src.tools import daily_audit
 
-    stubs = _stub_weekday_audit(
-        monkeypatch, tmp_path, lambda subject, body: {"webhook": False, "email": True}
-    )
+    stubs = _stub_weekday_audit(monkeypatch, tmp_path, lambda subject, body: {"webhook": False, "email": True})
 
     assert daily_audit.run_daily_audit("2026-09-27", trading_day_fn=lambda _d: True, **stubs) is None
     assert not (tmp_path / "logs" / "heartbeat" / "daily_audit.json").exists()
@@ -2327,9 +2388,7 @@ def test_heartbeat_not_written_on_weekend(monkeypatch, tmp_path) -> None:
 def test_heartbeat_written_even_when_dispatch_fails(monkeypatch, tmp_path) -> None:
     from src.tools import daily_audit
 
-    stubs = _stub_weekday_audit(
-        monkeypatch, tmp_path, lambda subject, body: {"webhook": False, "email": False}
-    )
+    stubs = _stub_weekday_audit(monkeypatch, tmp_path, lambda subject, body: {"webhook": False, "email": False})
 
     daily_audit.run_daily_audit("2026-09-29", trading_day_fn=lambda _d: True, **stubs)
 
@@ -2392,9 +2451,8 @@ def test_heartbeat_write_failure_raises_oserror(tmp_path) -> None:
 def test_holiday_with_standard_session_warns_calendar_disagreement() -> None:
     from src.tools import daily_audit
 
-    subject, body = daily_audit.build_digest(
-        "2026-09-25", daily_audit.DAY_HOLIDAY, None, [], [], session_kind="STANDARD"
-    )
+    digest = daily_audit.build_digest("2026-09-25", daily_audit.DAY_HOLIDAY, None, [], [], session_kind="STANDARD")
+    subject, body = digest.subject, digest.body
 
     assert "🚨" in subject and "calendar_disagreement" in subject
     assert "session=STANDARD" in body
@@ -2403,7 +2461,7 @@ def test_holiday_with_standard_session_warns_calendar_disagreement() -> None:
 def test_holiday_surfaces_failed_units_and_backup_issues() -> None:
     from src.tools import daily_audit
 
-    subject, body = daily_audit.build_digest(
+    digest = daily_audit.build_digest(
         "2026-09-24",
         daily_audit.DAY_HOLIDAY,
         None,
@@ -2413,6 +2471,7 @@ def test_holiday_surfaces_failed_units_and_backup_issues() -> None:
         session_kind="CLOSED",
         undelivered_alerts=3,
     )
+    subject, body = digest.subject, digest.body
 
     assert "🚨" in subject and "kca-backup.service" in subject
     assert "미전송알림 3건" in subject
@@ -2441,7 +2500,7 @@ def test_notice_keeps_healthy_digest_green() -> None:
     from src.tools import daily_audit
 
     result = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
-    subject, body = daily_audit.build_digest(
+    digest = daily_audit.build_digest(
         "2026-09-29",
         daily_audit.DAY_TRADING,
         result,
@@ -2450,6 +2509,7 @@ def test_notice_keeps_healthy_digest_green() -> None:
         session_kind="STANDARD",
         expiry_notices=("KIS_DATA_1:d20:2026-10-19",),
     )
+    subject, body = digest.subject, digest.body
 
     assert "🟢" in subject and "🔑갱신필요 1건" in subject
     assert "expiry_notices=KIS_DATA_1:d20:2026-10-19" in body
@@ -2460,7 +2520,7 @@ def test_expiry_warning_escalates_digest() -> None:
     from src.tools import daily_audit
 
     result = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
-    subject, body = daily_audit.build_digest(
+    digest = daily_audit.build_digest(
         "2026-09-29",
         daily_audit.DAY_TRADING,
         result,
@@ -2470,6 +2530,7 @@ def test_expiry_warning_escalates_digest() -> None:
         expiry_notices=("KIS_DATA_9:d20:2026-10-19",),
         expiry_warnings=("KIS_DATA_1:d3:2026-10-02",),
     )
+    subject, body = digest.subject, digest.body
 
     assert "🚨" in subject and "만료임박" in subject
     assert "🔑 갱신 필요: KIS_DATA_9:d20:2026-10-19" in body
@@ -2502,7 +2563,7 @@ def test_calendar_expiry_renders_renew_hint() -> None:
     from src.tools import daily_audit
 
     result = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
-    subject, body = daily_audit.build_digest(
+    digest = daily_audit.build_digest(
         "2026-12-11",
         daily_audit.DAY_TRADING,
         result,
@@ -2511,6 +2572,7 @@ def test_calendar_expiry_renders_renew_hint() -> None:
         session_kind="STANDARD",
         expiry_notices=("krx_calendar:d20:2026-12-31",),
     )
+    subject, body = digest.subject, digest.body
 
     assert "🔑갱신필요 1건" in subject
     assert "• 달력 갱신: KRX 다음 해 휴장일·개장시간 공지 반영" in body
@@ -2519,7 +2581,7 @@ def test_calendar_expiry_renders_renew_hint() -> None:
 def test_holiday_expiry_warning_dispatches() -> None:
     from src.tools import daily_audit
 
-    subject, body = daily_audit.build_digest(
+    digest = daily_audit.build_digest(
         "2026-09-24",
         daily_audit.DAY_HOLIDAY,
         None,
@@ -2528,6 +2590,7 @@ def test_holiday_expiry_warning_dispatches() -> None:
         session_kind="CLOSED",
         expiry_warnings=("KIS_DATA_1:d3:2026-09-27",),
     )
+    subject, body = digest.subject, digest.body
 
     assert "🚨" in subject and "만료임박" in subject
     assert "• 만료 임박: KIS_DATA_1:d3:2026-09-27" in body
@@ -2536,7 +2599,7 @@ def test_holiday_expiry_warning_dispatches() -> None:
 def test_holiday_with_only_notices_stays_quiet() -> None:
     from src.tools import daily_audit
 
-    subject, _ = daily_audit.build_digest(
+    digest = daily_audit.build_digest(
         "2026-09-24",
         daily_audit.DAY_HOLIDAY,
         None,
@@ -2545,6 +2608,7 @@ def test_holiday_with_only_notices_stays_quiet() -> None:
         session_kind="CLOSED",
         expiry_notices=("KIS_DATA_1:d20:2026-10-14",),
     )
+    subject = digest.subject
 
     assert subject == "[kca] ⏸️ 2026-09-24 휴장일 SKIP"
 
@@ -2571,11 +2635,13 @@ def test_audit_aftermarket_ticks_volume_mismatch_counts_symbols() -> None:
     from src.tools import daily_audit
 
     bars = pd.DataFrame({"symbol": ["005930", "000660"], "volume": [100, 50]})
-    ticks = pd.DataFrame({
-        "symbol": ["005930", "005930", "000660"],
-        "ts_hms": [160100, 160200, 160100],
-        "volume": [60, 40, 10],
-    })
+    ticks = pd.DataFrame(
+        {
+            "symbol": ["005930", "005930", "000660"],
+            "ts_hms": [160100, 160200, 160100],
+            "volume": [60, 40, 10],
+        }
+    )
     issues = daily_audit.audit_aftermarket_ticks(
         date(2026, 9, 30),
         read_ticks=lambda session: ticks if session == "krx_aftermarket" else None,
@@ -2613,7 +2679,9 @@ def test_audit_regular_ticks_excludes_close_auction_bar() -> None:
         [("005930", 100), ("005930", 50)],
     )
     issues = daily_audit.audit_regular_ticks(
-        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+        date(2026, 9, 30),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
     )
     assert issues == ()
 
@@ -2628,7 +2696,9 @@ def test_audit_regular_ticks_flags_truncated_ticks() -> None:
         [("005930", 60)],
     )
     issues = daily_audit.audit_regular_ticks(
-        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+        date(2026, 9, 30),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
     )
     assert issues == ("intraday:regular_ticks:1:volume_gap",)
 
@@ -2643,7 +2713,9 @@ def test_audit_regular_ticks_tolerates_small_residual() -> None:
         [("005930", 99900)],
     )
     issues = daily_audit.audit_regular_ticks(
-        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+        date(2026, 9, 30),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
     )
     assert issues == ()
 
@@ -2658,7 +2730,9 @@ def test_audit_regular_ticks_ignores_ticks_above_bars() -> None:
         [("005930", 120)],
     )
     issues = daily_audit.audit_regular_ticks(
-        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+        date(2026, 9, 30),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
     )
     assert issues == ()
 
@@ -2670,7 +2744,9 @@ def test_audit_regular_ticks_missing_partition_reported() -> None:
 
     bars, _ = _regular_tick_frames([("005930", 100, 90100)], [])
     issues = daily_audit.audit_regular_ticks(
-        date(2026, 9, 30), read_ticks=lambda: None, read_bars=lambda: bars,
+        date(2026, 9, 30),
+        read_ticks=lambda: None,
+        read_bars=lambda: bars,
     )
     assert issues == ("intraday:regular_ticks:1:missing_partition",)
 
@@ -2685,7 +2761,9 @@ def test_audit_regular_ticks_zero_volume_symbol_absent_from_ticks() -> None:
         [],
     )
     issues = daily_audit.audit_regular_ticks(
-        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+        date(2026, 9, 30),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
     )
     assert issues == ()
 
@@ -2709,7 +2787,9 @@ def test_audit_regular_ticks_counts_each_short_symbol_once() -> None:
         [("A", 10), ("B", 20), ("C", 30)],
     )
     issues = daily_audit.audit_regular_ticks(
-        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars,
+        date(2026, 9, 30),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
     )
     assert issues == ("intraday:regular_ticks:3:volume_gap",)
 
@@ -2828,10 +2908,14 @@ def test_bar_value_audit_reports_carried_in_value() -> None:
 
     from src.tools.daily_audit import audit_bar_value_consistency
 
-    frames = {"krx_aftermarket": _value_frame([
-        ("kis", 3, 128_866_376_000, 1_466_000, 1_471_000),
-        ("kis", 2, 2_932_000, 1_466_000, 1_466_000),
-    ])}
+    frames = {
+        "krx_aftermarket": _value_frame(
+            [
+                ("kis", 3, 128_866_376_000, 1_466_000, 1_471_000),
+                ("kis", 2, 2_932_000, 1_466_000, 1_466_000),
+            ]
+        )
+    }
     issues = audit_bar_value_consistency(date(2026, 9, 22), sessions=("krx_aftermarket",), read_partition=frames.get)
     assert issues == ("intraday:krx_aftermarket:1:value_out_of_range",)
 
@@ -2880,8 +2964,20 @@ def test_bar_value_audit_default_reader_uses_stored_partitions(tmp_path, monkeyp
     from src.tools.daily_audit import audit_bar_value_consistency
 
     monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
-    raw = pd.DataFrame([{"stck_bsop_date": "20260922", "stck_cntg_hour": "160000", "stck_oprc": "1000", "stck_hgpr": "1000",
-                         "stck_lwpr": "1000", "stck_prpr": "1000", "cntg_vol": "10", "acml_tr_pbmn": "10000"}])
+    raw = pd.DataFrame(
+        [
+            {
+                "stck_bsop_date": "20260922",
+                "stck_cntg_hour": "160000",
+                "stck_oprc": "1000",
+                "stck_hgpr": "1000",
+                "stck_lwpr": "1000",
+                "stck_prpr": "1000",
+                "cntg_vol": "10",
+                "acml_tr_pbmn": "10000",
+            }
+        ]
+    )
     frame = normalize_bar_frame(raw, "kis", "2026-09-22", "000660")
     frame.loc[0, "value_krw"] = 99_999_999
     target = intraday_store.intraday_partition_path(1, "2026-09-22", "krx_aftermarket")
@@ -2902,8 +2998,20 @@ def test_aftermarket_tick_audit_default_readers_use_stored_partitions(tmp_path, 
 
     monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
     day = "2026-09-29"
-    raw = pd.DataFrame([{"stck_bsop_date": "20260929", "stck_cntg_hour": "160100", "stck_oprc": "1000", "stck_hgpr": "1000",
-                         "stck_lwpr": "1000", "stck_prpr": "1000", "cntg_vol": "10", "acml_tr_pbmn": "10000"}])
+    raw = pd.DataFrame(
+        [
+            {
+                "stck_bsop_date": "20260929",
+                "stck_cntg_hour": "160100",
+                "stck_oprc": "1000",
+                "stck_hgpr": "1000",
+                "stck_lwpr": "1000",
+                "stck_prpr": "1000",
+                "cntg_vol": "10",
+                "acml_tr_pbmn": "10000",
+            }
+        ]
+    )
     bars = normalize_bar_frame(raw, "kis", day, "000660")
     target = intraday_store.intraday_partition_path(1, day, "krx_aftermarket")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -2924,14 +3032,28 @@ def test_aftermarket_tick_audit_default_reader_matches_stored_volumes(tmp_path, 
 
     monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
     day = "2026-09-29"
-    raw = pd.DataFrame([{"stck_bsop_date": "20260929", "stck_cntg_hour": "160100", "stck_oprc": "1000", "stck_hgpr": "1000",
-                         "stck_lwpr": "1000", "stck_prpr": "1000", "cntg_vol": "10", "acml_tr_pbmn": "10000"}])
+    raw = pd.DataFrame(
+        [
+            {
+                "stck_bsop_date": "20260929",
+                "stck_cntg_hour": "160100",
+                "stck_oprc": "1000",
+                "stck_hgpr": "1000",
+                "stck_lwpr": "1000",
+                "stck_prpr": "1000",
+                "cntg_vol": "10",
+                "acml_tr_pbmn": "10000",
+            }
+        ]
+    )
     bar_target = intraday_store.intraday_partition_path(1, day, "krx_aftermarket")
     bar_target.parent.mkdir(parents=True, exist_ok=True)
     normalize_bar_frame(raw, "kis", day, "000660").to_parquet(bar_target, index=False)
     tick_target = intraday_store.tick_partition_path(day, "krx_aftermarket")
     tick_target.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({"symbol": ["000660", "000660"], "ts_hms": [160005, 160050], "volume": [4, 6]}).to_parquet(tick_target, index=False)
+    pd.DataFrame({"symbol": ["000660", "000660"], "ts_hms": [160005, 160050], "volume": [4, 6]}).to_parquet(
+        tick_target, index=False
+    )
     assert audit_aftermarket_ticks(date(2026, 9, 29)) == ()
 
 
@@ -2976,9 +3098,9 @@ def test_aftermarket_tick_audit_flags_real_mismatch_despite_ceiling_bar() -> Non
     bars = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160100, 200000], "volume": [100, 7]})
     ticks = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160105, 160205], "volume": [60, 30]})
     read_bars, read_ticks = _tick_audit_frames(bars, ticks)
-    assert daily_audit.audit_aftermarket_ticks(
-        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
-    ) == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
+    assert daily_audit.audit_aftermarket_ticks(date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars) == (
+        "intraday:krx_aftermarket_ticks:1:volume_mismatch",
+    )
 
 
 def test_aftermarket_tick_audit_keeps_nxt_ceiling_bar() -> None:
@@ -2990,9 +3112,9 @@ def test_aftermarket_tick_audit_keeps_nxt_ceiling_bar() -> None:
     bars = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160100, 200000], "volume": [100, 7]})
     ticks = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160105, 160205], "volume": [60, 40]})
     read_bars, read_ticks = _nxt_tick_audit_frames(bars, ticks)
-    assert daily_audit.audit_aftermarket_ticks(
-        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
-    ) == ("intraday:nxt_aftermarket_ticks:1:volume_mismatch",)
+    assert daily_audit.audit_aftermarket_ticks(date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars) == (
+        "intraday:nxt_aftermarket_ticks:1:volume_mismatch",
+    )
 
 
 def test_aftermarket_tick_audit_legacy_bars_without_ts_hms_unchanged() -> None:
@@ -3004,9 +3126,9 @@ def test_aftermarket_tick_audit_legacy_bars_without_ts_hms_unchanged() -> None:
     bars = pd.DataFrame({"symbol": ["005930"], "volume": [107]})
     ticks = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160105, 160205], "volume": [60, 40]})
     read_bars, read_ticks = _tick_audit_frames(bars, ticks)
-    assert daily_audit.audit_aftermarket_ticks(
-        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
-    ) == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
+    assert daily_audit.audit_aftermarket_ticks(date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars) == (
+        "intraday:krx_aftermarket_ticks:1:volume_mismatch",
+    )
 
 
 def test_aftermarket_tick_audit_ceiling_only_partition_still_requires_ticks() -> None:
@@ -3017,9 +3139,9 @@ def test_aftermarket_tick_audit_ceiling_only_partition_still_requires_ticks() ->
 
     bars = pd.DataFrame({"symbol": ["005930"], "ts_hms": [200000], "volume": [7]})
     read_bars, read_ticks = _tick_audit_frames(bars, None)
-    assert daily_audit.audit_aftermarket_ticks(
-        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
-    ) == ("intraday:krx_aftermarket_ticks:1:missing_partition",)
+    assert daily_audit.audit_aftermarket_ticks(date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars) == (
+        "intraday:krx_aftermarket_ticks:1:missing_partition",
+    )
 
 
 def test_aftermarket_tick_audit_ceiling_only_symbol_volume_rules() -> None:
@@ -3029,18 +3151,17 @@ def test_aftermarket_tick_audit_ceiling_only_symbol_volume_rules() -> None:
     from src.tools import daily_audit
 
     bars = pd.DataFrame({"symbol": ["005930"], "ts_hms": [200000], "volume": [7]})
-    empty_ticks = pd.DataFrame({"symbol": pd.Series([], dtype=str), "ts_hms": pd.Series([], dtype=float),
-                                "volume": pd.Series([], dtype=float)})
+    empty_ticks = pd.DataFrame(
+        {"symbol": pd.Series([], dtype=str), "ts_hms": pd.Series([], dtype=float), "volume": pd.Series([], dtype=float)}
+    )
     read_bars, read_ticks = _tick_audit_frames(bars, empty_ticks)
-    assert daily_audit.audit_aftermarket_ticks(
-        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
-    ) == ()
+    assert daily_audit.audit_aftermarket_ticks(date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars) == ()
 
     ticks = pd.DataFrame({"symbol": ["005930"], "ts_hms": [160105], "volume": [5]})
     read_bars, read_ticks = _tick_audit_frames(bars, ticks)
-    assert daily_audit.audit_aftermarket_ticks(
-        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
-    ) == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
+    assert daily_audit.audit_aftermarket_ticks(date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars) == (
+        "intraday:krx_aftermarket_ticks:1:volume_mismatch",
+    )
 
 
 def test_audit_extended_exhausted_counts_terminal_keys(tmp_path) -> None:
@@ -3061,12 +3182,21 @@ def test_audit_extended_exhausted_counts_terminal_keys(tmp_path) -> None:
         ledger.record(
             "2025-10-01",
             "nxt_aftermarket",
-            [CoverageEntry(
-                symbol="000009", dataset=CaptureDataset.MINUTE_BARS, venue="NXT",
-                session="nxt_aftermarket", scheduled_at=None, status=CaptureStatus.FAILED,
-                rows=0, first_event_time=None, last_event_time=None,
-                reason="price_basis_raw_basis_unavailable", raw_refs=(),
-            )],
+            [
+                CoverageEntry(
+                    symbol="000009",
+                    dataset=CaptureDataset.MINUTE_BARS,
+                    venue="NXT",
+                    session="nxt_aftermarket",
+                    scheduled_at=None,
+                    status=CaptureStatus.FAILED,
+                    rows=0,
+                    first_event_time=None,
+                    last_event_time=None,
+                    reason="price_basis_raw_basis_unavailable",
+                    raw_refs=(),
+                )
+            ],
             run_id=run,
             attempted_at=now,
         )
@@ -3078,10 +3208,15 @@ def test_extended_exhausted_line_never_warns() -> None:
     from src.tools import daily_audit
 
     all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
-    subject, body = daily_audit.build_digest(
-        "2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [],
+    digest = daily_audit.build_digest(
+        "2026-09-14",
+        daily_audit.DAY_TRADING,
+        all_ok,
+        [],
+        [],
         info_lines=("intraday:extended_exhausted:2",),
     )
+    subject, body = digest.subject, digest.body
     assert "🟢" in subject
     assert "intraday:extended_exhausted:2" in body
 
@@ -3177,17 +3312,17 @@ def test_aftermarket_material_surplus_flagged() -> None:
     bars = pd.DataFrame({"symbol": ["005930"], "ts_hms": [160100], "volume": [1_000]})
     ticks = pd.DataFrame({"symbol": ["005930", "005930"], "ts_hms": [160105, 160205], "volume": [500, 520]})
     read_bars, read_ticks = _tick_audit_frames(bars, ticks)
-    assert daily_audit.audit_aftermarket_ticks(
-        date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
-    ) == ("intraday:krx_aftermarket_ticks:1:volume_mismatch",)
+    assert daily_audit.audit_aftermarket_ticks(date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars) == (
+        "intraday:krx_aftermarket_ticks:1:volume_mismatch",
+    )
 
 
 def test_audit_sweep_agreement_on_shortfall() -> None:
     import pandas as pd
     from datetime import date
 
+    from src.backfill.intraday.tape_harvest import TAPE_SESSIONS
     from src.data.tick_bar_consistency import SESSION_POLICIES, TickBarRelation, classify_tick_bar_volume
-    from src.tools import backfill_tick_tape as btt
     from src.tools import daily_audit
 
     cases = [
@@ -3200,7 +3335,7 @@ def test_audit_sweep_agreement_on_shortfall() -> None:
         ("nxt_aftermarket", 1_000, 1_011, True, False),
         ("krx_aftermarket", 100, 0, True, True),
     ]
-    tape_specs = {s.session: s for s in btt.TAPE_SESSIONS}
+    tape_specs = {s.session: s for s in TAPE_SESSIONS}
     for session, bar, tick, expect_audit, expect_sweep in cases:
         relation = classify_tick_bar_volume(session, float(bar), float(tick))
         assert (relation is TickBarRelation.TICK_SHORT) is expect_sweep
@@ -3210,7 +3345,9 @@ def test_audit_sweep_agreement_on_shortfall() -> None:
             bars = pd.DataFrame({"symbol": ["S"], "volume": [bar], "ts_hms": [90100]})
             ticks = pd.DataFrame({"symbol": ["S"], "volume": [tick]})
             audit_res = daily_audit.audit_regular_ticks(
-                date(2026, 9, 30), read_ticks=lambda ticks=ticks: ticks, read_bars=lambda bars=bars: bars,
+                date(2026, 9, 30),
+                read_ticks=lambda ticks=ticks: ticks,
+                read_bars=lambda bars=bars: bars,
             )
             audit_flags = audit_res == ("intraday:regular_ticks:1:volume_gap",)
         elif session == "krx_aftermarket":
@@ -3228,3 +3365,329 @@ def test_audit_sweep_agreement_on_shortfall() -> None:
                 date(2026, 9, 30), read_ticks=read_ticks, read_bars=read_bars
             ) == ("intraday:nxt_aftermarket_ticks:1:volume_mismatch",)
         assert audit_flags is expect_audit, (session, bar, tick)
+
+
+def test_digest_clean_trading_day_is_ok() -> None:
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    digest = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
+
+    assert digest.severity is daily_audit.DigestSeverity.OK
+    assert digest.subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
+    assert "intraday_issues=none" in digest.body
+
+
+def test_digest_clean_holiday_is_holiday_skip() -> None:
+    from src.tools import daily_audit
+
+    digest = daily_audit.build_digest("2026-09-24", daily_audit.DAY_HOLIDAY, None, [], [])
+
+    assert digest.severity is daily_audit.DigestSeverity.HOLIDAY_SKIP
+    assert digest.subject == "[kca] ⏸️ 2026-09-24 휴장일 SKIP"
+    assert "intraday_issues=" not in digest.body
+
+
+def test_digest_holiday_with_failed_unit_is_warning() -> None:
+    from src.tools import daily_audit
+
+    digest = daily_audit.build_digest("2026-09-24", daily_audit.DAY_HOLIDAY, None, ["kca-backup.service"], [])
+
+    assert digest.severity is daily_audit.DigestSeverity.WARNING
+    assert "🚨" in digest.subject
+
+
+def test_digest_severity_matches_legacy_subject_predicate() -> None:
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    missing_step = dict(all_ok, paper_entry=False)
+    rows = [
+        (daily_audit.DAY_TRADING, missing_step, {}, True),
+        (daily_audit.DAY_TRADING, all_ok, {"failed_units": ["kca-backup.service"]}, True),
+        (daily_audit.DAY_TRADING, all_ok, {"stale": ["DATA_3"]}, True),
+        (
+            daily_audit.DAY_TRADING,
+            all_ok,
+            {"collection_issues": ("collection:charts:2:missing_entries",)},
+            True,
+        ),
+        (
+            daily_audit.DAY_TRADING,
+            all_ok,
+            {"collection_issues": ("collection:charts:2:incomplete_entries",)},
+            False,
+        ),
+        (
+            daily_audit.DAY_TRADING,
+            all_ok,
+            {"backup_issues": ["offsite_backup:stale"]},
+            True,
+        ),
+        (daily_audit.DAY_TRADING, all_ok, {"undelivered_alerts": 2}, True),
+        (
+            daily_audit.DAY_TRADING,
+            all_ok,
+            {"expiry_warnings": ("KIS_DATA_1:d3:2026-10-02",)},
+            True,
+        ),
+        (
+            daily_audit.DAY_TRADING,
+            all_ok,
+            {"expiry_notices": ("KIS_DATA_1:d20:2026-10-19",)},
+            False,
+        ),
+        (daily_audit.DAY_HOLIDAY, None, {"session_kind": "STANDARD"}, True),
+        (daily_audit.DAY_HOLIDAY, None, {}, False),
+        (daily_audit.DAY_TRADING, all_ok, {}, False),
+    ]
+    for day_kind, result, kwargs, _ in rows:
+        failed = kwargs.get("failed_units", [])
+        stale = kwargs.get("stale", [])
+        digest = daily_audit.build_digest(
+            "2026-09-14" if day_kind != daily_audit.DAY_HOLIDAY else "2026-09-24",
+            day_kind,
+            result,
+            failed,
+            stale,
+            collection_issues=kwargs.get("collection_issues", ()),
+            backup_issues=kwargs.get("backup_issues", []),
+            session_kind=kwargs.get("session_kind", "CLOSED"),
+            undelivered_alerts=kwargs.get("undelivered_alerts", 0),
+            expiry_notices=kwargs.get("expiry_notices", ()),
+            expiry_warnings=kwargs.get("expiry_warnings", ()),
+        )
+        legacy_warning = "경고:" in digest.subject or "🚨" in digest.subject
+        assert (digest.severity is daily_audit.DigestSeverity.WARNING) == legacy_warning, kwargs
+
+
+def test_digest_lists_intraday_issues_in_detail_and_summary() -> None:
+    from src.tools import daily_audit
+
+    result = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    result["intraday_complete"] = False
+    issues = ("intraday:regular:3:missing_bars", "intraday:krx_aftermarket_ticks:2:volume_mismatch")
+    digest = daily_audit.build_digest("2026-09-23", daily_audit.DAY_TRADING, result, [], [], intraday_issues=issues)
+    plain = daily_audit.build_digest("2026-09-23", daily_audit.DAY_TRADING, result, [], [])
+
+    assert digest.severity is daily_audit.DigestSeverity.WARNING
+    assert digest.subject == plain.subject
+    detail = "intraday_issues=intraday:regular:3:missing_bars,intraday:krx_aftermarket_ticks:2:volume_mismatch"
+    assert detail in digest.body
+    assert digest.body.index("collection_issues=") < digest.body.index(detail) < digest.body.index("backup_issues=")
+    assert (
+        "• 장중 이상: intraday:regular:3:missing_bars, intraday:krx_aftermarket_ticks:2:volume_mismatch" in digest.body
+    )
+    assert "• 백업 이상:" not in digest.body or digest.body.index("• 장중 이상:") < digest.body.index("• 백업 이상:")
+    ordered = daily_audit.build_digest(
+        "2026-09-23",
+        daily_audit.DAY_TRADING,
+        result,
+        [],
+        [],
+        collection_issues=("collection:charts:2:missing_entries",),
+        intraday_issues=issues,
+        backup_issues=["offsite_backup:stale"],
+    )
+    assert ordered.body.index("• 수집 이상:") < ordered.body.index("• 장중 이상:") < ordered.body.index("• 백업 이상:")
+
+
+def test_digest_summary_bullet_is_bounded() -> None:
+    from src.tools import daily_audit
+
+    result = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    issues = tuple(f"intraday:regular:{i}:missing_bars" for i in range(13))
+    digest = daily_audit.build_digest("2026-09-23", daily_audit.DAY_TRADING, result, [], [], intraday_issues=issues)
+
+    expected_bullet = "• 장중 이상: " + ", ".join(issues[:10]) + " 외 3건"
+    assert expected_bullet in digest.body
+    assert f"intraday_issues={','.join(issues)}" in digest.body
+
+
+def test_digest_intraday_issues_alone_warn() -> None:
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    digest = daily_audit.build_digest(
+        "2026-09-23",
+        daily_audit.DAY_TRADING,
+        all_ok,
+        [],
+        [],
+        intraday_issues=("intraday:regular:1:missing_bars",),
+    )
+
+    assert digest.severity is daily_audit.DigestSeverity.WARNING
+    assert "경고" in digest.subject
+
+
+def test_digest_holiday_rejects_intraday_issues() -> None:
+    import pytest
+
+    from src.tools import daily_audit
+
+    with pytest.raises(ValueError, match="intraday_issues must be empty"):
+        daily_audit.build_digest(
+            "2026-09-24",
+            daily_audit.DAY_HOLIDAY,
+            None,
+            [],
+            [],
+            intraday_issues=("intraday:regular:1:missing_bars",),
+        )
+
+
+def test_digest_preserves_existing_body_lines() -> None:
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    digest = daily_audit.build_digest("2026-09-14", daily_audit.DAY_TRADING, all_ok, [], [])
+
+    stripped = "\n".join(line for line in digest.body.splitlines() if not line.startswith("intraday_issues="))
+    assert stripped.splitlines() == [
+        "==================================================",
+        "📊 K-Closing Alpha 일일 운영 요약 (2026-09-14)",
+        "==================================================",
+        "• 상태: 🟢 전 단계 정상 완료 (누락 0 / 실패 0)",
+        f"• 자산: 💼 NAV {digest.body.splitlines()[4].split('NAV ', 1)[1]}",
+        f"• 진입: 🎯 {digest.body.splitlines()[5].split('🎯 ', 1)[1]}",
+        f"• 데이터: 📦 {digest.body.splitlines()[6].split('📦 ', 1)[1]}",
+        "",
+        "[상세 내역]",
+        "date=2026-09-14",
+        "day=trading",
+        "session=UNKNOWN",
+        *[f"{step}=OK" for step in daily_audit.AUDIT_STEPS],
+        "failed_units=none",
+        "stale_kis_tokens=none",
+        "collection_issues=none",
+        "backup_issues=none",
+        "undelivered_alerts=0",
+        "expiry_notices=none",
+        "expiry_warnings=none",
+    ]
+
+
+def test_run_daily_audit_dispatches_on_severity_not_subject_text(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    from src.tools import daily_audit
+
+    sent: list[tuple[str, str]] = []
+    stubs = _stub_weekday_audit(monkeypatch, tmp_path, lambda s, b: sent.append((s, b)) or {"ok": True})
+    monkeypatch.setattr(
+        daily_audit,
+        "build_digest",
+        lambda *a, **k: daily_audit.AuditDigest(
+            subject="[kca] 🚨 경고: text only", body="b", severity=daily_audit.DigestSeverity.OK
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        subject = daily_audit.run_daily_audit("2026-09-14", trading_day_fn=lambda _d: True, **stubs)
+
+    assert subject == "[kca] 🚨 경고: text only"
+    assert len(sent) == 1
+    assert "status=OK" in caplog.text and "status=WARNING" not in caplog.text
+
+
+def test_run_daily_audit_holiday_skip_never_dispatches(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+
+    sent: list[tuple[str, str]] = []
+    stubs = _stub_weekday_audit(monkeypatch, tmp_path, lambda s, b: sent.append((s, b)) or {"ok": True})
+    monkeypatch.setattr(
+        daily_audit,
+        "build_digest",
+        lambda *a, **k: daily_audit.AuditDigest(
+            subject="[kca] ⏸️ 2026-09-25 휴장일 SKIP",
+            body="b",
+            severity=daily_audit.DigestSeverity.HOLIDAY_SKIP,
+        ),
+    )
+
+    subject = daily_audit.run_daily_audit("2026-09-25", trading_day_fn=lambda _d: False, **stubs)
+
+    assert subject is not None
+    assert sent == []
+
+
+def test_run_daily_audit_surfaces_intraday_details(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    from src.tools import daily_audit
+
+    profile = _collection_profile(tmp_path)
+    monkeypatch.setattr(daily_audit, "CollectionSettings", lambda *a, **k: profile)
+    monkeypatch.setattr(
+        daily_audit,
+        "audit_daily_completeness",
+        lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True),
+    )
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_bar_value_consistency", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_regular_ticks", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_aftermarket_ticks", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_tape_sweep", lambda *a, **k: ())
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    with caplog.at_level(logging.INFO):
+        subject = daily_audit.run_daily_audit(
+            "2026-09-23",
+            trading_day_fn=lambda _d: True,
+            failed_units_fn=list,
+            stale_tokens_fn=lambda _d: [],
+            dispatch_fn=_dispatch,
+            backup_issues_fn=lambda _at: [],
+        )
+
+    assert subject is not None and "경고" in subject
+    assert len(sent) == 1
+    assert "intraday:regular:0:missing_cohort" in sent[0][1]
+    fail_records = [r for r in caplog.records if "step=intraday_complete status=FAIL" in r.getMessage()]
+    assert len(fail_records) == 1
+    assert "issues=1" in fail_records[0].getMessage() and "date=2026-09-23" in fail_records[0].getMessage()
+
+
+def test_run_daily_audit_emits_no_intraday_log_when_clean(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    from src.tools import daily_audit
+
+    profile = _collection_profile(tmp_path)
+    monkeypatch.setattr(daily_audit, "CollectionSettings", lambda *a, **k: profile)
+    monkeypatch.setattr(
+        daily_audit,
+        "audit_daily_completeness",
+        lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True),
+    )
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_bar_value_consistency", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_regular_ticks", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_aftermarket_ticks", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_tape_sweep", lambda *a, **k: ())
+    from src.data.capture_store import CaptureStore, resolve_capture_root
+
+    _publish_cohort_decision(CaptureStore(resolve_capture_root(profile)), "2026-09-14", ["005930"])
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    with caplog.at_level(logging.INFO):
+        daily_audit.run_daily_audit(
+            "2026-09-14",
+            trading_day_fn=lambda _d: True,
+            failed_units_fn=list,
+            stale_tokens_fn=lambda _d: [],
+            dispatch_fn=_dispatch,
+            backup_issues_fn=lambda _at: [],
+        )
+
+    assert not [r for r in caplog.records if "step=intraday_complete status=FAIL" in r.getMessage()]

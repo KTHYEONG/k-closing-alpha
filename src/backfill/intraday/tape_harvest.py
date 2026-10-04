@@ -21,6 +21,7 @@ from src.backfill.intraday.collector import (
 )
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
+    ARCHIVE_REGULAR_READY_HHMMSS,
     INTRADAY_SESSION_KRX_AFTERMARKET,
     INTRADAY_SESSION_NXT_AFTERMARKET,
     INTRADAY_SESSION_REGULAR,
@@ -49,7 +50,6 @@ from src.data.intraday_store import tick_partition_path, write_tick_partition
 logger = logging.getLogger(__name__)
 
 _SEOUL = ZoneInfo("Asia/Seoul")
-_REGULAR_READY_HHMMSS = "154000"
 
 
 @dataclass(frozen=True)
@@ -123,7 +123,7 @@ def _reject_unclosed_day(day: str, session: str) -> None:
     now = datetime.now(_SEOUL)
     today = now.date().isoformat()
     if session == INTRADAY_SESSION_REGULAR:
-        if day > today or (day == today and now.strftime("%H%M%S") < _REGULAR_READY_HHMMSS):
+        if day > today or (day == today and now.strftime("%H%M%S") < ARCHIVE_REGULAR_READY_HHMMSS):
             raise ValueError(f"regular session not closed for day: {day!r}")
     elif day >= today:
         raise ValueError(f"aftermarket session not closed for day: {day!r}")

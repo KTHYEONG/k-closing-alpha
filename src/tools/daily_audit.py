@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import argparse
+import enum
 import json
 import logging
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -32,7 +34,6 @@ from src.config.market_session import (
     KRX_AFTERMARKET_HOUR_CEIL,
     KRX_AFTERMARKET_HOUR_FLOOR,
     KRX_AFTERMARKET_START_DATE,
-    KRX_REGULAR_HOUR_CEIL,
     NXT_AFTERMARKET_HOUR_CEIL,
     NXT_AFTERMARKET_HOUR_FLOOR,
     NXT_PREMARKET_HOUR_CEIL,
@@ -60,7 +61,12 @@ from src.data.capture_store import (
 from src.data.intraday_store import intraday_partition_path, tick_partition_path
 from src.data.io_utils import atomic_write_text
 from src.data.session_calendar import SessionKind, resolve_session_day
-from src.data.tick_bar_consistency import TickBarRelation, classify_tick_bar_volume
+from src.data.tick_bar_consistency import (
+    TickBarRelation,
+    classify_tick_bar_volume,
+    comparable_bar_volumes,
+    summed_tick_volumes,
+)
 from src.data.trading_calendar import (
     DAY_HOLIDAY,
     DAY_TRADING,
@@ -130,6 +136,7 @@ def _extract_intraday_summary(snapshot_date: str) -> tuple[str, str]:
     except Exception as exc:
         logger.debug("[SYS] stage=daily_audit extract_intraday failed: %s", exc)
     return bars_str, ticks_str
+
 
 _CHART_DATASETS: tuple[CaptureDataset, CaptureDataset] = (CaptureDataset.MINUTE_BARS, CaptureDataset.TRADE_TICKS)
 _TERMINAL_REASONS: frozenset[str] = frozenset({"exhausted", "crossed_target_date"})
@@ -209,7 +216,9 @@ def audit_daily_completeness(snapshot_date: str) -> dict[str, bool]:
         stale_exit = bool((open_positions["decision_date"].astype(str) < snapshot_date).any())
     except (KeyError, ValueError) as exc:
         # 스키마가 깨졌거나 로트 링크를 위반한 원장은 청산 상태를 보증할 수 없으므로 누락으로 보고한다
-        logger.warning("[DATA] stage=daily_audit step=paper_exit status=LEDGER_INVALID reason=%s: %s", type(exc).__name__, exc)
+        logger.warning(
+            "[DATA] stage=daily_audit step=paper_exit status=LEDGER_INVALID reason=%s: %s", type(exc).__name__, exc
+        )
         stale_exit = True
     return {
         "archive": bool(archive_ok),
@@ -275,9 +284,7 @@ def list_stale_kis_tokens(
     except ValueError as exc:
         return [f"<kis host key config invalid: {exc}>"]
     return sorted(
-        cred.slot
-        for cred in creds
-        if read_token_issued_date(token_cache_path(cred.app_key, cache)) != snapshot_date
+        cred.slot for cred in creds if read_token_issued_date(token_cache_path(cred.app_key, cache)) != snapshot_date
     )
 
 
@@ -299,7 +306,11 @@ def _regular_entry_settled(dataset: CaptureDataset, entry: CoverageEntry) -> boo
     # 거래정지 등 정규장 무거래 종목은 벤더 증명(no_trades_in_window)이 있는 틱 항목만 완료로 인정한다
     if entry.status == CaptureStatus.COMPLETE:
         return True
-    return dataset is CaptureDataset.TRADE_TICKS and entry.status == CaptureStatus.NO_TRADES and entry.reason == "no_trades_in_window"
+    return (
+        dataset is CaptureDataset.TRADE_TICKS
+        and entry.status == CaptureStatus.NO_TRADES
+        and entry.reason == "no_trades_in_window"
+    )
 
 
 def _audit_regular_bars(
@@ -380,9 +391,7 @@ def _audit_auction_sweeps(
     open_due_at = session_clock.open_at + timedelta(seconds=int(profile.COLLECTION_OPEN_CONFIRM_SECONDS))
     if audit_at >= open_due_at:
         terminal = [
-            m
-            for m in manifests
-            if m.context.capture_reason == "auction-open" and m.status != CaptureStatus.PENDING
+            m for m in manifests if m.context.capture_reason == "auction-open" and m.status != CaptureStatus.PENDING
         ]
         if not terminal:
             issues.append(_collection_issue("auction_open", 1, "missing_manifest"))
@@ -487,9 +496,7 @@ def audit_collection_manifests(
         tampered = False
         for manifest in decision_manifests:
             try:
-                store.read_decision(
-                    trading_date.isoformat(), available_by=audit_at, run_id=manifest.context.run_id
-                )
+                store.read_decision(trading_date.isoformat(), available_by=audit_at, run_id=manifest.context.run_id)
                 qualified = True
             except FileNotFoundError:
                 continue
@@ -614,10 +621,14 @@ def _audit_sparse_partition(
     ceil = int(ceil_hhmmss)
     by_symbol = _stamps_by_symbol(frame)
     # 분봉 시각은 해당 분의 끝으로 표기되므로 ceil 시각 봉(예: 20:00:00 = 19:59~20:00)은 세션 안이다 -- 수집기 창([floor, ceil])과 동일
-    bad_symbols = sorted(symbol for symbol, stamps in by_symbol.items() if any(stamp < floor or stamp > ceil for stamp in stamps))
+    bad_symbols = sorted(
+        symbol for symbol, stamps in by_symbol.items() if any(stamp < floor or stamp > ceil for stamp in stamps)
+    )
     if not bad_symbols:
         return []
-    window_breaks = sorted({stamp for symbol in bad_symbols for stamp in by_symbol[symbol] if stamp < floor or stamp > ceil})[:5]
+    window_breaks = sorted(
+        {stamp for symbol in bad_symbols for stamp in by_symbol[symbol] if stamp < floor or stamp > ceil}
+    )[:5]
     logger.debug(
         "[DATA] stage=daily_audit step=intraday_complete session=%s status=FAIL reasons=out_of_window symbols=%d first_missing=%s",
         session,
@@ -661,12 +672,17 @@ def audit_intraday_partitions(
     sessions = [INTRADAY_SESSION_REGULAR, INTRADAY_SESSION_NXT_PREMARKET, INTRADAY_SESSION_NXT_AFTERMARKET]
     if day_str >= KRX_AFTERMARKET_START_DATE:
         sessions.append(INTRADAY_SESSION_KRX_AFTERMARKET)
-    reader = read_partition if read_partition is not None else (lambda session: _read_stored_partition(day_str, session))
+    reader = (
+        read_partition if read_partition is not None else (lambda session: _read_stored_partition(day_str, session))
+    )
     frames = {session: reader(session) for session in sessions}
     issues: list[str] = []
     issues.extend(
         _audit_dense_partition(
-            INTRADAY_SESSION_REGULAR, frames[INTRADAY_SESSION_REGULAR], expected_regular_stamps(clock), tuple(cohort_symbols)
+            INTRADAY_SESSION_REGULAR,
+            frames[INTRADAY_SESSION_REGULAR],
+            expected_regular_stamps(clock),
+            tuple(cohort_symbols),
         )
     )
     if session_kind is not SessionKind.STANDARD:
@@ -674,12 +690,18 @@ def audit_intraday_partitions(
         return tuple(issues)
     issues.extend(
         _audit_sparse_partition(
-            INTRADAY_SESSION_NXT_PREMARKET, frames[INTRADAY_SESSION_NXT_PREMARKET], NXT_PREMARKET_HOUR_FLOOR, NXT_PREMARKET_HOUR_CEIL
+            INTRADAY_SESSION_NXT_PREMARKET,
+            frames[INTRADAY_SESSION_NXT_PREMARKET],
+            NXT_PREMARKET_HOUR_FLOOR,
+            NXT_PREMARKET_HOUR_CEIL,
         )
     )
     issues.extend(
         _audit_sparse_partition(
-            INTRADAY_SESSION_NXT_AFTERMARKET, frames[INTRADAY_SESSION_NXT_AFTERMARKET], NXT_AFTERMARKET_HOUR_FLOOR, NXT_AFTERMARKET_HOUR_CEIL
+            INTRADAY_SESSION_NXT_AFTERMARKET,
+            frames[INTRADAY_SESSION_NXT_AFTERMARKET],
+            NXT_AFTERMARKET_HOUR_FLOOR,
+            NXT_AFTERMARKET_HOUR_CEIL,
         )
     )
     if INTRADAY_SESSION_KRX_AFTERMARKET in frames:
@@ -691,7 +713,10 @@ def audit_intraday_partitions(
         )
         issues.extend(
             _audit_dense_partition(
-                INTRADAY_SESSION_KRX_AFTERMARKET, frames[INTRADAY_SESSION_KRX_AFTERMARKET], expected_krx_aftermarket_stamps(), regular_symbols
+                INTRADAY_SESSION_KRX_AFTERMARKET,
+                frames[INTRADAY_SESSION_KRX_AFTERMARKET],
+                expected_krx_aftermarket_stamps(),
+                regular_symbols,
             )
         )
     return tuple(issues)
@@ -738,8 +763,7 @@ def audit_bar_value_consistency(
         low = pd.to_numeric(frame["low"], errors="coerce")
         high = pd.to_numeric(frame["high"], errors="coerce")
         bad = non_ls & (
-            ((volume == 0) & (value != 0))
-            | ((volume > 0) & ((value < low * volume) | (value > high * volume)))
+            ((volume == 0) & (value != 0)) | ((volume > 0) & ((value < low * volume) | (value > high * volume)))
         )
         count = int(bad.sum())
         if count:
@@ -758,7 +782,7 @@ def audit_aftermarket_ticks(
     Ticks cannot be re-fetched after the day ends, so their absence or inconsistency must surface in the
     same evening's digest. Volume is compared per symbol over the whole session window, which is
     independent of the bar labelling convention. KRX aftermarket bars are start-labelled, so the bar stamped at the session
-    ceiling opens after the tick window closes; it is excluded from the bar side of the comparison.
+    ceiling opens after the tick window closes; it is excluded via `BAR_VOLUME_CUTOFF_HMS`.
 
     Args:
         trading_date: Audited KST date (checked on STANDARD days).
@@ -786,7 +810,6 @@ def audit_aftermarket_ticks(
     ticks_reader = read_ticks if read_ticks is not None else _default_ticks
     bars_reader = read_bars if read_bars is not None else _default_bars
     issues: list[str] = []
-    ceil = int(KRX_AFTERMARKET_HOUR_CEIL)
     for session in (INTRADAY_SESSION_KRX_AFTERMARKET, INTRADAY_SESSION_NXT_AFTERMARKET):
         bars = bars_reader(session)
         ticks = ticks_reader(session)
@@ -795,15 +818,11 @@ def audit_aftermarket_ticks(
         if ticks is None:
             issues.append(f"intraday:{session}_ticks:1:missing_partition")
             continue
-        if session == INTRADAY_SESSION_KRX_AFTERMARKET and "ts_hms" in bars.columns:
-            stamps = pd.to_numeric(bars["ts_hms"], errors="coerce")
-            bars = bars.loc[stamps.isna() | (stamps < ceil)]
-        bar_vol = pd.to_numeric(bars["volume"], errors="coerce").fillna(0)
-        tick_vol = pd.to_numeric(ticks["volume"], errors="coerce").fillna(0)
-        bar_sum = bar_vol.groupby(bars["symbol"].astype(str)).sum()
-        tick_sum = tick_vol.groupby(ticks["symbol"].astype(str)).sum()
+        bar_sum = comparable_bar_volumes(session, bars)
+        tick_sum = summed_tick_volumes(ticks)
         mismatched = sum(
-            1 for symbol in set(bar_sum.index) | set(tick_sum.index)
+            1
+            for symbol in set(bar_sum) | set(tick_sum)
             if classify_tick_bar_volume(session, float(bar_sum.get(symbol, 0)), float(tick_sum.get(symbol, 0)))
             is not TickBarRelation.CONSISTENT
         )
@@ -825,7 +844,7 @@ def audit_regular_ticks(
     """Compare same-day regular-session tick volume with the 1m bars per symbol.
 
     The bar stamped at the regular close carries closing-auction volume that is outside the tick
-    window and is excluded. Ticks cover the exchange tape while bars are vendor-aggregated, so small
+    window and is excluded via `BAR_VOLUME_CUTOFF_HMS`. Ticks cover the exchange tape while bars are vendor-aggregated, so small
     residuals are expected; only a tick shortfall beyond the shared tick-bar contract marks a
     symbol as short of ticks.
 
@@ -866,14 +885,8 @@ def audit_regular_ticks(
         return ()
     if ticks is None:
         return (_intraday_issue("regular_ticks", 1, "missing_partition"),)
-    ceil = int(KRX_REGULAR_HOUR_CEIL)
-    if "ts_hms" in bars.columns:
-        stamps = pd.to_numeric(bars["ts_hms"], errors="coerce")
-        bars = bars.loc[stamps.isna() | (stamps < ceil)]
-    bar_vol = pd.to_numeric(bars["volume"], errors="coerce").fillna(0)
-    tick_vol = pd.to_numeric(ticks["volume"], errors="coerce").fillna(0)
-    bar_sum = bar_vol.groupby(bars["symbol"].astype(str)).sum()
-    tick_sum = tick_vol.groupby(ticks["symbol"].astype(str)).sum()
+    bar_sum = comparable_bar_volumes(INTRADAY_SESSION_REGULAR, bars)
+    tick_sum = summed_tick_volumes(ticks)
     short = 0
     for symbol, bar_total in bar_sum.items():
         bar_total = float(bar_total)
@@ -963,9 +976,7 @@ def audit_extended_exhausted(*, ledger_path: Path | None = None) -> tuple[str, .
         return ()
     if frame.empty or "status" not in frame.columns:
         return ()
-    latest = frame.drop_duplicates(
-        subset=["snapshot_date", "session", "symbol"], keep="last"
-    )
+    latest = frame.drop_duplicates(subset=["snapshot_date", "session", "symbol"], keep="last")
     count = int((latest["status"].astype(str) == "EXHAUSTED").sum())
     return (f"intraday:extended_exhausted:{count}",)
 
@@ -977,6 +988,41 @@ def _expiry_hint_lines(items: Sequence[str]) -> list[str]:
     return []
 
 
+class DigestSeverity(enum.StrEnum):
+    """Dispatch class of one daily digest.
+
+    The digest subject is presentation text (emoji, Korean labels) and must never be parsed to route alerts;
+    severity is decided together with the subject and is the only input to dispatch.
+    """
+
+    OK = "ok"
+    WARNING = "warning"
+    HOLIDAY_SKIP = "holiday_skip"
+
+
+@dataclass(frozen=True)
+class AuditDigest:
+    """Rendered daily digest and its dispatch severity."""
+
+    subject: str
+    body: str
+    severity: DigestSeverity
+
+
+DIGEST_ISSUE_DISPLAY_LIMIT: int = 10
+"""Maximum issue strings shown in a digest summary bullet or a summary log line; the remainder is reported as a count."""
+
+
+def _format_bounded_issues(issues: Sequence[str]) -> str:
+    """Join at most DIGEST_ISSUE_DISPLAY_LIMIT issues, appending an omitted count."""
+    shown = list(issues[:DIGEST_ISSUE_DISPLAY_LIMIT])
+    omitted = len(issues) - len(shown)
+    text = ", ".join(shown)
+    if omitted > 0:
+        text += f" 외 {omitted}건"
+    return text
+
+
 def build_digest(
     snapshot_date: str,
     day_kind: str,
@@ -985,14 +1031,17 @@ def build_digest(
     stale_kis_tokens: list[str],
     *,
     collection_issues: Sequence[str] = (),
+    intraday_issues: Sequence[str] = (),
     backup_issues: Sequence[str] = (),
     session_kind: str = "UNKNOWN",
     undelivered_alerts: int = 0,
     expiry_notices: Sequence[str] = (),
     expiry_warnings: Sequence[str] = (),
     info_lines: Sequence[str] = (),
-) -> tuple[str, str]:
-    """일일 요약의 (제목, 본문)을 만든다.
+) -> AuditDigest:
+    """일일 요약의 제목·본문과 발송 심각도를 만든다.
+
+    Severity is decided by the same conditions that choose the subject, so routing never depends on subject text.
 
     Args:
         snapshot_date: 점검 대상일.
@@ -1001,6 +1050,9 @@ def build_digest(
         failed_units: list_failed_kca_units 결과.
         stale_kis_tokens: list_stale_kis_tokens 결과.
         collection_issues: Independently assessed raw-data and schedule gaps.
+        intraday_issues: Stored-partition audit issues `intraday:<session>:<count>:<reason>`; listed in full in the detail
+            section and, bounded by DIGEST_ISSUE_DISPLAY_LIMIT, in the warning summary. Must be empty on holidays.
+        backup_issues: Offsite backup staleness issues.
         session_kind: Resolved SessionKind value for the date.
         undelivered_alerts: Outbox에 적체된 미전송 알림 수. 0보다 크면 경고.
         expiry_notices: D-30 이내 만료 예정 항목. 정상 요약을 경고로 바꾸지 않는다.
@@ -1008,14 +1060,16 @@ def build_digest(
         info_lines: 경고로 격상하지 않는 정보성 본문 라인(예: extended-backfill 소진 수).
 
     Returns:
-        (제목, 본문) 튜플.
+        AuditDigest with severity WARNING for any warning digest (trading or holiday), HOLIDAY_SKIP for a clean
+        holiday, OK otherwise.
 
     Raises:
-        ValueError: 휴장일이 아닌데 result가 None인 경우.
-        ValueError: Existing unsupported date/day-kind combinations.
+        ValueError: unsupported day_kind; result None on a non-holiday; non-empty intraday_issues on a holiday.
     """
     if day_kind not in (DAY_WEEKEND, DAY_HOLIDAY, DAY_TRADING, DAY_UNKNOWN):
         raise ValueError(f"unsupported day_kind={day_kind!r}")
+    if day_kind == DAY_HOLIDAY and intraday_issues:
+        raise ValueError("intraday_issues must be empty on a holiday")
     lines = [f"date={snapshot_date}", f"day={day_kind}", f"session={session_kind}"]
     lines.extend(info_lines)
     missing: list[str] = []
@@ -1027,6 +1081,8 @@ def build_digest(
     lines.append(f"failed_units={','.join(failed_units) if failed_units else 'none'}")
     lines.append(f"stale_kis_tokens={','.join(stale_kis_tokens) if stale_kis_tokens else 'none'}")
     lines.append(f"collection_issues={','.join(collection_issues) if collection_issues else 'none'}")
+    if day_kind != DAY_HOLIDAY:
+        lines.append(f"intraday_issues={','.join(intraday_issues) if intraday_issues else 'none'}")
     lines.append(f"backup_issues={','.join(backup_issues) if backup_issues else 'none'}")
     lines.append(f"undelivered_alerts={undelivered_alerts}")
     lines.append(f"expiry_notices={','.join(expiry_notices) if expiry_notices else 'none'}")
@@ -1051,7 +1107,9 @@ def build_digest(
                 "==================================================",
             ]
             if session_kind == SessionKind.STANDARD.value:
-                summary_lines.append("• 달력 불일치: 정적 달력은 개장(STANDARD)이나 KIS 오라클이 휴일로 응답 (fail-closed, 무결정)")
+                summary_lines.append(
+                    "• 달력 불일치: 정적 달력은 개장(STANDARD)이나 KIS 오라클이 휴일로 응답 (fail-closed, 무결정)"
+                )
             if failed_units:
                 summary_lines.append(f"• 실패 유닛: {', '.join(failed_units)}")
             if backup_issues:
@@ -1063,7 +1121,11 @@ def build_digest(
             summary_lines.extend(_expiry_hint_lines((*expiry_notices, *expiry_warnings)))
             summary_lines.append("• 조치 안내: or-vps 서버 상태 점검 요망")
             body = "\n".join(summary_lines) + "\n\n[상세 내역]\n" + "\n".join(lines)
-            return f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(holiday_problems)}", body
+            return AuditDigest(
+                subject=f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(holiday_problems)}",
+                body=body,
+                severity=DigestSeverity.WARNING,
+            )
         label = "휴장일 SKIP"
         header = (
             "==================================================\n"
@@ -1071,14 +1133,26 @@ def build_digest(
             "==================================================\n"
             "• 상태: ⏸️ 거래소 휴장일 (배치 스킵)\n\n"
         )
-        return f"[kca] ⏸️ {snapshot_date} {label}", header + "[상세 내역]\n" + "\n".join(lines)
+        return AuditDigest(
+            subject=f"[kca] ⏸️ {snapshot_date} {label}",
+            body=header + "[상세 내역]\n" + "\n".join(lines),
+            severity=DigestSeverity.HOLIDAY_SKIP,
+        )
 
     ignored_reasons = (":incomplete_entries", ":disabled", ":raw_disabled")
     critical_collection = [
-        iss for iss in collection_issues
-        if not any(iss.endswith(suffix) for suffix in ignored_reasons)
+        iss for iss in collection_issues if not any(iss.endswith(suffix) for suffix in ignored_reasons)
     ]
-    is_warning = bool(missing or failed_units or stale_kis_tokens or critical_collection or backup_issues or undelivered_alerts or expiry_warnings)
+    is_warning = bool(
+        missing
+        or failed_units
+        or stale_kis_tokens
+        or critical_collection
+        or backup_issues
+        or undelivered_alerts
+        or expiry_warnings
+        or intraday_issues
+    )
 
     if not is_warning:
         nav_str, entry_str = _extract_paper_summary(snapshot_date)
@@ -1098,7 +1172,7 @@ def build_digest(
             subject += f" · 🔑갱신필요 {len(expiry_notices)}건"
         summary_block.extend(_expiry_hint_lines(expiry_notices))
         body = "\n".join(summary_block) + "\n\n[상세 내역]\n" + "\n".join(lines)
-        return subject, body
+        return AuditDigest(subject=subject, body=body, severity=DigestSeverity.OK)
 
     problems = []
     summary_lines = [
@@ -1118,6 +1192,8 @@ def build_digest(
     if critical_collection:
         problems.append(f"수집이상 {','.join(critical_collection)}")
         summary_lines.append(f"• 수집 이상: {', '.join(critical_collection)}")
+    if intraday_issues:
+        summary_lines.append(f"• 장중 이상: {_format_bounded_issues(intraday_issues)}")
     if backup_issues:
         problems.append(f"백업이상 {','.join(backup_issues)}")
         summary_lines.append(f"• 백업 이상: {', '.join(backup_issues)}")
@@ -1132,8 +1208,11 @@ def build_digest(
     summary_lines.extend(_expiry_hint_lines((*expiry_notices, *expiry_warnings)))
     summary_lines.append("• 조치 안내: or-vps 서버 상태 점검 요망")
     body = "\n".join(summary_lines) + "\n\n[상세 내역]\n" + "\n".join(lines)
-    return f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(problems)}", body
-
+    return AuditDigest(
+        subject=f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(problems)}",
+        body=body,
+        severity=DigestSeverity.WARNING,
+    )
 
 
 def resolve_snapshot_date(now: pd.Timestamp, *, catchup_cutoff_hour: int = _SNAPSHOT_CATCHUP_CUTOFF_HOUR) -> str:
@@ -1259,7 +1338,11 @@ def run_daily_audit(
                 session_kind=session_day.kind,
                 cohort_symbols=tuple(cohort_symbols),
             )
-            value_sessions = [INTRADAY_SESSION_REGULAR, INTRADAY_SESSION_NXT_PREMARKET, INTRADAY_SESSION_NXT_AFTERMARKET]
+            value_sessions = [
+                INTRADAY_SESSION_REGULAR,
+                INTRADAY_SESSION_NXT_PREMARKET,
+                INTRADAY_SESSION_NXT_AFTERMARKET,
+            ]
             if trading_date.isoformat() >= KRX_AFTERMARKET_START_DATE:
                 value_sessions.append(INTRADAY_SESSION_KRX_AFTERMARKET)
             if session_day.kind is not SessionKind.STANDARD:
@@ -1281,6 +1364,15 @@ def run_daily_audit(
         logger.info("[DATA] stage=daily_audit %s", extended_info[0])
     if result is not None:
         result["intraday_complete"] = not intraday_issues
+    if result is not None and intraday_issues:
+        omitted = max(0, len(intraday_issues) - DIGEST_ISSUE_DISPLAY_LIMIT)
+        logger.warning(
+            "[DATA] stage=daily_audit step=intraday_complete status=FAIL date=%s issues=%d shown=%s omitted=%d",
+            snapshot_date,
+            len(intraday_issues),
+            _format_bounded_issues(intraday_issues),
+            omitted,
+        )
     if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
         collection_issues = (*collection_issues, _collection_issue("session", 0, session_day.kind.value.lower()))
     try:
@@ -1289,9 +1381,14 @@ def run_daily_audit(
         logger.warning("[DATA] stage=daily_audit alert_drain=FAILED reason=%s", type(exc).__name__)
         undelivered_alerts = 0
     report = evaluate_expiries(trading_date)
-    subject, body = build_digest(
-        snapshot_date, day_kind, result, failed_units_fn(), stale_tokens_fn(snapshot_date),
+    digest = build_digest(
+        snapshot_date,
+        day_kind,
+        result,
+        failed_units_fn(),
+        stale_tokens_fn(snapshot_date),
         collection_issues=collection_issues,
+        intraday_issues=() if day_kind == DAY_HOLIDAY else intraday_issues,
         backup_issues=backup_issues_fn(audit_at),
         session_kind=session_day.kind.value,
         undelivered_alerts=undelivered_alerts,
@@ -1299,24 +1396,26 @@ def run_daily_audit(
         expiry_warnings=report.warnings,
         info_lines=extended_info,
     )
-    has_warning = "경고:" in subject or "🚨" in subject
-    if has_warning:
-        logger.warning("[DATA] stage=daily_audit day=%s status=WARNING subject=%s", day_kind, subject)
-        dispatch_fn(subject, body)
-    elif day_kind == DAY_HOLIDAY:
-        logger.info("[DATA] stage=daily_audit day=%s status=SKIP subject=%s (holiday dispatch skipped)", day_kind, subject)
+    if digest.severity is DigestSeverity.WARNING:
+        logger.warning("[DATA] stage=daily_audit day=%s status=WARNING subject=%s", day_kind, digest.subject)
+        dispatch_fn(digest.subject, digest.body)
+    elif digest.severity is DigestSeverity.HOLIDAY_SKIP:
+        logger.info(
+            "[DATA] stage=daily_audit day=%s status=SKIP subject=%s (holiday dispatch skipped)",
+            day_kind,
+            digest.subject,
+        )
     else:
-        logger.info("[DATA] stage=daily_audit day=%s status=OK subject=%s", day_kind, subject)
-        dispatch_fn(subject, body)
+        logger.info("[DATA] stage=daily_audit day=%s status=OK subject=%s", day_kind, digest.subject)
+        dispatch_fn(digest.subject, digest.body)
     write_audit_heartbeat(
         snapshot_date,
         day_kind=day_kind,
-        subject=subject,
+        subject=digest.subject,
         undelivered_alerts=undelivered_alerts,
         finished_at=datetime.now(SEOUL),
     )
-    return subject
-
+    return digest.subject
 
 
 def main() -> None:  # pragma: no cover - CLI entry; logic covered via run_daily_audit scenarios

@@ -271,3 +271,41 @@ def test_stale_toss_backfill_env_key_is_ignored(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("COLLECTION_TOSS_BACKFILL_ENABLED", "true")
     profile = CollectionSettings(_env_file=None)
     assert profile.COLLECTION_BACKFILL_SLOTS == ()
+
+
+def test_collection_pit_backfill_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default PIT backfill stream values load without error."""
+    for key in (
+        "COLLECTION_PIT_BACKFILL_ENABLED",
+        "COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO",
+        "COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO",
+        "COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M",
+        "COLLECTION_PIT_BACKFILL_MIN_MARKET_CAP_100M",
+        "COLLECTION_PIT_BACKFILL_COMMON_STOCK_ONLY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    profile = CollectionSettings(_env_file=None)
+    assert (
+        profile.COLLECTION_PIT_BACKFILL_ENABLED,
+        profile.COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO,
+        profile.COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO,
+        profile.COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M,
+        profile.COLLECTION_PIT_BACKFILL_MIN_MARKET_CAP_100M,
+        profile.COLLECTION_PIT_BACKFILL_COMMON_STOCK_ONLY,
+    ) == (True, 0.01, 0.12, 100.0, 495.0, False)
+
+
+def test_collection_pit_backfill_rejects_empty_band() -> None:
+    """An empty PIT change band is rejected."""
+    with pytest.raises(ValueError, match="change band"):
+        CollectionSettings(
+            COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO=0.05,
+            COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO=0.05,
+            _env_file=None,
+        )
+
+
+def test_collection_pit_backfill_rejects_nan_threshold() -> None:
+    """Non-finite PIT thresholds are rejected."""
+    with pytest.raises(ValueError, match="finite"):
+        CollectionSettings(COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M=float("nan"), _env_file=None)

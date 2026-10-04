@@ -13,8 +13,7 @@ import numpy as np
 import pandas as pd
 
 from src.data.panel_integrity import prepare_price_panel
-from src.ml.topk_contract import FEATURE_COLS as FEATURE_COLS
-from src.ml.topk_contract import compute_derived_features as compute_derived_features
+from src.data.screenable_class import attach_screenable_class, load_classification_panel
 from src.strategy.contract import (
     AA_COST,
     DEFAULT_UNIVERSE,
@@ -30,8 +29,26 @@ logger = logging.getLogger("research_v3_engine")
 STRESS_COST_BP: float = 46.0
 
 
-def load_and_prepare_price_history(path: Path | str) -> tuple[pd.DataFrame, np.ndarray, dict[pd.Timestamp, int]]:
-    """Load price history and construct trading calendar index."""
+def load_and_prepare_price_history(
+    path: Path | str,
+    *,
+    classification_path: Path | str | None = None,
+) -> tuple[pd.DataFrame, np.ndarray, dict[pd.Timestamp, int]]:
+    """Load price history, attach the PIT security-class verdict and index the calendar.
+
+    Args:
+        path: price_history parquet.
+        classification_path: Classification panel parquet; None selects
+            settings.ALTDATA_DIR / SECURITY_CLASSIFICATION_PARQUET_FILENAME.
+
+    Returns:
+        (prepared panel carrying SCREENABLE_CLASS_COL and SCREENABLE_SOURCE_COL,
+        sorted trading calendar, date-to-index lookup).
+
+    Raises:
+        FileNotFoundError: When the classification panel does not exist.
+        ValueError: Propagated from attach_screenable_class (coverage gap) or the loader.
+    """
     logger.info("Loading price history from %s...", path)
     ph, prov = prepare_price_panel(pd.read_parquet(path))
     logger.info("[DATA] stage=panel_integrity %s", prov.to_log_kv())
@@ -39,6 +56,10 @@ def load_and_prepare_price_history(path: Path | str) -> tuple[pd.DataFrame, np.n
     # Baseline trading calendar
     market_dates = np.array(sorted(ph["date"].unique()))
     d_to_idx = {d: i for i, d in enumerate(market_dates)}
+
+    classification = load_classification_panel(classification_path)
+    ph, class_prov = attach_screenable_class(ph, classification, market_dates=market_dates)
+    logger.info("[DATA] stage=screenable_class %s", class_prov.to_log_kv())
 
     return ph, market_dates, d_to_idx
 

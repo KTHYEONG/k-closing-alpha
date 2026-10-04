@@ -23,7 +23,7 @@ from src.ml.research.v3_engine import (
     load_and_prepare_price_history,
 )
 from src.ml.research.v3_metrics import calculate_series_metrics
-from src.strategy.contract import KCA_TOPK_COSTAWARE_001, MIN_TOP_K, StrategySpec
+from src.strategy.contract import MIN_TOP_K, PRODUCTION_STRATEGY, StrategySpec
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -419,7 +419,7 @@ def run_cost_aware_topk_backtest(
     market_dates: np.ndarray,
     d_to_idx: dict[pd.Timestamp, int],
     *,
-    spec: StrategySpec = KCA_TOPK_COSTAWARE_001,
+    spec: StrategySpec = PRODUCTION_STRATEGY,
 ) -> CostAwareTopKReport:
     """Run the model-free cost-aware top-k backtest over the full panel.
 
@@ -512,9 +512,9 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     configure_cli_logging(logging.BASIC_FORMAT)
     if args.top_k is not None:
-        spec = _dataclasses.replace(KCA_TOPK_COSTAWARE_001, top_k=int(args.top_k))
+        spec = _dataclasses.replace(PRODUCTION_STRATEGY, top_k=int(args.top_k))
     else:
-        spec = KCA_TOPK_COSTAWARE_001
+        spec = PRODUCTION_STRATEGY
     if not os.path.exists(args.price_history):
         raise ValueError(f"price_history not found: {args.price_history}")
     ph, market_dates, d_to_idx = load_and_prepare_price_history(args.price_history)
