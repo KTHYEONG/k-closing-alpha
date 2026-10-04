@@ -1240,3 +1240,18 @@ def test_held_roster_rejects_inconsistent_flags() -> None:
         HeldRoster(symbols=(), ok=True, failure_reason="X")
     with pytest.raises(ValueError, match="ok xor failure_reason"):
         HeldRoster(symbols=(), ok=False, failure_reason=None)
+
+
+def test_no_src_module_references_order_transmission_trs() -> None:
+    from pathlib import Path
+
+    # Given: 실주문 전송 TR 목록 (relocated from the deleted ws_client guard)
+    order_trs = ("TTTC0802U", "TTTC0801U", "TTTC0803U")
+
+    # When / Then: src/ 전체에서 어떤 모듈도 주문 TR을 참조하지 않는다
+    offenders = [
+        str(path)
+        for path in sorted(Path("src").rglob("*.py"))
+        if any(tr in path.read_text(encoding="utf-8") for tr in order_trs)
+    ]
+    assert offenders == [], f"order TR references must not exist in src/: {offenders}"

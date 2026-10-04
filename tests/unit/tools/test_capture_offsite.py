@@ -383,6 +383,41 @@ def test_seal_refuses_concurrent_run(tmp_path: Path, monkeypatch) -> None:
         holder.close()
 
 
+def test_seal_unopenable_lock_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    import os
+
+    import pytest
+
+    from src.tools.capture_offsite import SealLockUnavailableError, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    _write_member(tmp_path, _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.json.gz"), b"data")
+    lock_path = tmp_path / "offsite" / ".seal.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.touch()
+    lock_path.chmod(0o000)
+    try:
+        run_fn, calls = _make_fake(tmp_path / "remote", "gdrive:test")
+
+        # When the seal lock file cannot be opened at all (skip as root)
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses file permission checks")
+        with pytest.raises(SealLockUnavailableError):
+            seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=_config())
+
+        # Then no remote writes happened
+        assert calls == []
+    finally:
+        lock_path.chmod(0o644)
+
+
+def test_capture_offsite_has_no_private_opener() -> None:
+    import src.tools.capture_offsite as capture_offsite
+
+    assert not hasattr(capture_offsite, "_open_lock_fd")
+
+
 def test_restore_roundtrips_members_byte_identical(tmp_path: Path, monkeypatch) -> None:
     from src.tools.capture_offsite import read_ledger, restore_date, seal_and_upload
 

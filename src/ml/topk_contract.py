@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.strategy.contract import COST_AWARE_UNIVERSE, MIN_TOP_K, UniverseSpec
+from src.strategy.contract import MIN_TOP_K, PRODUCTION_STRATEGY, UniverseSpec
 
 logger = logging.getLogger(__name__)
 
@@ -291,21 +291,58 @@ def _screen_value(value: Any) -> Any:
     return float(value)
 
 
-def assert_bundle_screen_parity(bundle: dict[str, Any], spec: UniverseSpec = COST_AWARE_UNIVERSE) -> None:
+SCREEN_PARITY_CLASS_FILTER_GRANDFATHERED_STRATEGY_IDS: frozenset[str] = frozenset({"KCA-TOPK-COSTAWARE-001"})
+"""Strategies whose bundles may serve a class-filtered live screen although certified without it.
+
+Since 87e3eab the live cohort excludes non-screenable security classes regardless of the
+bundle, so serving these bundles on a class-filtered pool is the pre-existing live state.
+The allowance covers only exclude_non_screenable_class moving False -> True; every other
+field stays strict.
+"""
+
+
+def certified_screen(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the bundle's certified universe with omitted fields read as UniverseSpec defaults.
+
+    Args:
+        bundle: Production bundle carrying ``select_universe``.
+
+    Returns:
+        Dict over every UniverseSpec field with numeric values normalized as parity compares
+        them (bool/None kept, numbers as float).
+
+    Raises:
+        ValueError: When select_universe is not a dict or carries fields unknown to UniverseSpec.
+    """
+    screened = bundle.get("select_universe")
+    if not isinstance(screened, dict):
+        raise ValueError(f"bundle select_universe is not certified: got {screened!r}")
+    live = dataclasses.asdict(PRODUCTION_STRATEGY.universe)
+    unknown = sorted(set(screened) - set(live))
+    if unknown:
+        raise ValueError(f"bundle select_universe carries fields unknown to live screen: {unknown}")
+    defaults = dataclasses.asdict(UniverseSpec())
+    return {k: _screen_value(screened.get(k, defaults[k])) for k in live}
+
+
+def assert_bundle_screen_parity(bundle: dict[str, Any], spec: UniverseSpec = PRODUCTION_STRATEGY.universe) -> None:
     """Fail closed unless the bundle was certified under the live selection screen.
 
     Args:
-        bundle: Production bundle carrying ``select_universe`` (asdict of the certified UniverseSpec).
-        spec: Live selection screen; defaults to COST_AWARE_UNIVERSE.
+        bundle: Production bundle carrying ``select_universe`` (asdict of the certified
+            UniverseSpec) and ``strategy_id``.
+        spec: Live selection screen; defaults to PRODUCTION_STRATEGY.universe.
 
     Returns:
-        None when every live screen field matches. A field absent from the bundle is read as the
-        UniverseSpec default, i.e. the bundle predates that field and was trained under its
-        pre-introduction behavior.
+        None when every live screen field matches. A field absent from the bundle is read as
+        the UniverseSpec default (the bundle predates that field). A bundle whose strategy_id
+        is in SCREEN_PARITY_CLASS_FILTER_GRANDFATHERED_STRATEGY_IDS also passes when the only
+        difference is exclude_non_screenable_class certified False while live is True; that
+        acceptance is logged at WARNING.
 
     Raises:
-        ValueError: When select_universe is not a dict, carries fields unknown to the live screen,
-            or any field differs from the live value.
+        ValueError: When select_universe is not a dict, carries fields unknown to the live
+            screen, or any field differs from the live value outside the grandfather rule.
     """
     screened = bundle.get("select_universe")
     if not isinstance(screened, dict):
@@ -318,6 +355,19 @@ def assert_bundle_screen_parity(bundle: dict[str, Any], spec: UniverseSpec = COS
     defaults = dataclasses.asdict(UniverseSpec())
     certified = {k: screened.get(k, defaults[k]) for k in live}
     differing = [k for k in live if _screen_value(certified[k]) != _screen_value(live[k])]
+    if differing == ["exclude_non_screenable_class"]:
+        strategy_id = bundle.get("strategy_id")
+        if (
+            strategy_id in SCREEN_PARITY_CLASS_FILTER_GRANDFATHERED_STRATEGY_IDS
+            and _screen_value(certified["exclude_non_screenable_class"]) is False
+            and _screen_value(live["exclude_non_screenable_class"]) is True
+        ):
+            logger.warning(
+                "[RISK] stage=screen_parity status=GRANDFATHERED strategy_id=%s "
+                "field=exclude_non_screenable_class certified=False live=True",
+                strategy_id,
+            )
+            return None
     if differing:
         bundle_vals = {k: certified[k] for k in differing}
         live_vals = {k: live[k] for k in differing}

@@ -20,15 +20,18 @@ from src.data.io_utils import atomic_write_parquet
 from src.ml.costaware_topk import compute_net_return
 from src.ml.exit_policy import simulate_take_profit_exit
 from src.ml.retrain_gate import MIN_NAMES_PER_EVAL_DAY
-from src.strategy.contract import AA_COST
-from src.strategy.growth_shadow import STATUS_PENDING, STATUS_REALIZED, realize_decision_returns
+from src.strategy.contract import AA_COST, KRX_DAILY_LIMIT_RATIO
+from src.strategy.growth_shadow import (
+    STATUS_PENDING,
+    STATUS_PRICE_DISCONTINUITY,
+    STATUS_REALIZED,
+    realize_decision_returns,
+)
 
 logger = logging.getLogger(__name__)
 
 T1_ATTRIBUTION_PARQUET_NAME: str = "t1_attribution.parquet"
 TP_COUNTERFACTUAL_RATIO: float = 0.05
-KRX_DAILY_PRICE_LIMIT_RATIO: float = 0.30
-STATUS_PRICE_DISCONTINUITY: str = "PRICE_DISCONTINUITY"
 DAY_STATUS_SETTLED: str = "SETTLED"
 DAY_STATUS_PENDING: str = "PENDING"
 POOL_REQUIRED_COLUMNS: tuple[str, ...] = ("decision_date", "symbol", "pred", "tick_cost_bp", "admitted", "selected", "model_version")
@@ -101,8 +104,8 @@ def realize_pool_exit_arms(pool: pd.DataFrame, price_history: pd.DataFrame) -> p
     tp_net = compute_net_return(pd.DataFrame({"gross_return": tp_gross, "tick_cost_bp": work["tick_cost_bp"].to_numpy(dtype=np.float64), "date": pd.to_datetime(day)}), round_trip_ticks=float(AA_COST.round_trip_ticks))
     tp_net = np.asarray(tp_net, dtype=np.float64)
     realized = status == STATUS_REALIZED
-    # 비수정 가격(액면분할 등) 규칙: ±30% 초과 실현 수익은 PRICE_DISCONTINUITY
-    disc = realized & ((np.abs(open_gross) > KRX_DAILY_PRICE_LIMIT_RATIO) | (np.abs(np.nan_to_num(tp_gross)) > KRX_DAILY_PRICE_LIMIT_RATIO))
+    # 비수정 가격(액면분할 등) 규칙: KRX_DAILY_LIMIT_RATIO 초과 실현 수익은 PRICE_DISCONTINUITY
+    disc = realized & ((np.abs(open_gross) > KRX_DAILY_LIMIT_RATIO) | (np.abs(np.nan_to_num(tp_gross)) > KRX_DAILY_LIMIT_RATIO))
     status[disc] = STATUS_PRICE_DISCONTINUITY
     not_realized = status != STATUS_REALIZED
     for arr in (open_gross, open_net, tp_gross, tp_net):

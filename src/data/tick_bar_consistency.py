@@ -8,10 +8,14 @@ from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
 
+import pandas as pd
+
 from src.config.market_session import (
     INTRADAY_SESSION_KRX_AFTERMARKET,
     INTRADAY_SESSION_NXT_AFTERMARKET,
     INTRADAY_SESSION_REGULAR,
+    KRX_AFTERMARKET_HOUR_CEIL,
+    KRX_REGULAR_HOUR_CEIL,
 )
 
 
@@ -40,6 +44,77 @@ SESSION_POLICIES: Mapping[str, TickBarPolicy] = MappingProxyType(
         INTRADAY_SESSION_NXT_AFTERMARKET: AFTERMARKET_POLICY,
     }
 )
+
+# The regular 15:30 bar is the end-labelled closing-auction print outside the continuous tick window.
+# The KRX-aftermarket ceiling bar is start-labelled and carries the aftermarket close print, not on the tick tape.
+# NXT aftermarket bars are start-labelled and end at 19:59 (measured 2026-10: no 20:00 bar), so no cutoff applies.
+BAR_VOLUME_CUTOFF_HMS: Mapping[str, int | None] = MappingProxyType(
+    {
+        INTRADAY_SESSION_REGULAR: int(KRX_REGULAR_HOUR_CEIL),
+        INTRADAY_SESSION_KRX_AFTERMARKET: int(KRX_AFTERMARKET_HOUR_CEIL),
+        INTRADAY_SESSION_NXT_AFTERMARKET: None,
+    }
+)
+
+
+def comparable_bar_volumes(session: str, bars: pd.DataFrame) -> dict[str, float]:
+    """Sum stored 1m-bar volume per symbol over the part of the session that ticks can cover.
+
+    Ticks and bars are compared over the same window only: bars stamped at or after the session's cutoff
+    (`BAR_VOLUME_CUTOFF_HMS`) hold auction/close prints that never appear on the tick tape, so counting them
+    turns every symbol into a false tick shortfall. Every consumer of the tick-bar contract (daily audit,
+    tape sweep) must aggregate bars through this function so they agree on identical partitions.
+
+    Args:
+        session: One of the keys of `SESSION_POLICIES`.
+        bars: Stored 1m bars with columns `symbol` and `volume`; `ts_hms` (HHMMSS int) is optional.
+            Rows whose `ts_hms` is not numeric are kept; without a `ts_hms` column no cutoff applies.
+
+    Returns:
+        Mapping symbol (str) -> summed bar volume (float, >= 0 for non-negative inputs); non-numeric
+        volumes count as 0. Empty mapping for an empty frame.
+
+    Raises:
+        ValueError: Unknown session, or `bars` lacks `symbol` or `volume`.
+    """
+    if session not in SESSION_POLICIES:
+        raise ValueError(f"Unknown session: {session!r}")
+    if "symbol" not in bars.columns or "volume" not in bars.columns:
+        raise ValueError("bars must carry symbol and volume columns")
+    if len(bars) == 0:
+        return {}
+    frame = bars.loc[:, ["symbol", "volume"] + (["ts_hms"] if "ts_hms" in bars.columns else [])].copy()
+    cutoff = BAR_VOLUME_CUTOFF_HMS[session]
+    if cutoff is not None and "ts_hms" in frame.columns:
+        stamps = pd.to_numeric(frame["ts_hms"], errors="coerce")
+        frame = frame.loc[stamps.isna() | (stamps < cutoff)]
+        if len(frame) == 0:
+            return {}
+    volume = pd.to_numeric(frame["volume"], errors="coerce").fillna(0)
+    return {str(k): float(v) for k, v in volume.groupby(frame["symbol"].astype(str)).sum().items()}
+
+
+def summed_tick_volumes(ticks: pd.DataFrame) -> dict[str, float]:
+    """Sum stored tick volume per symbol over every stored row.
+
+    The tick side is never window-filtered here: out-of-window rows are a separate completeness defect that the
+    sweep flags on its own, and the audit has always compared the full stored tape.
+
+    Args:
+        ticks: Stored ticks with columns `symbol` and `volume`.
+
+    Returns:
+        Mapping symbol (str) -> summed tick volume (float); non-numeric volumes count as 0.
+
+    Raises:
+        ValueError: `ticks` lacks `symbol` or `volume`.
+    """
+    if "symbol" not in ticks.columns or "volume" not in ticks.columns:
+        raise ValueError("ticks must carry symbol and volume columns")
+    if len(ticks) == 0:
+        return {}
+    volume = pd.to_numeric(ticks["volume"], errors="coerce").fillna(0)
+    return {str(k): float(v) for k, v in volume.groupby(ticks["symbol"].astype(str)).sum().items()}
 
 
 def classify_tick_bar_volume(session: str, bar_volume: float, tick_volume: float) -> TickBarRelation:

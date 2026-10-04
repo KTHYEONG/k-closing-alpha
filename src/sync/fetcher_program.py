@@ -38,8 +38,6 @@ async def get_program_history_async(
     max_consecutive_failures: int = 3,
 ) -> dict[str, float]:
     """비동기 버전: 종목별 프로그램 매매 추이(일별)를 조회합니다."""
-    url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
-
     prog_map: dict[str, float] = {}
     s = pd.to_datetime(str(start_date).strip(), format="%Y%m%d", errors="coerce")
     e = pd.to_datetime(str(end_date).strip(), format="%Y%m%d", errors="coerce")
@@ -62,18 +60,10 @@ async def get_program_history_async(
         if cursor < start:
             break
 
-        params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD": code,
-            "FID_INPUT_DATE_1": cursor,
-        }
-
         try:
             if request_slot is not None:
                 await request_slot()
-            data = await client._handle_request(
-                session.get, url, headers=client._get_headers("FHPPG04650201"), params=params
-            )
+            data = await client.get_program_trade_daily_page(session, code, cursor, market_div_code="J")
         except Exception as exc:
             failures += 1
             logger.warning(

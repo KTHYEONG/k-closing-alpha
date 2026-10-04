@@ -61,6 +61,30 @@ def _price_history_file(path) -> None:
     }).to_parquet(path)
 
 
+def _classification_panel_for(dates, symbols) -> None:
+    """Stage an all-screenable classification panel in the isolated ALTDATA_DIR."""
+    from pathlib import Path
+
+    import pandas as pd
+
+    from src import settings
+
+    out = Path(settings.ALTDATA_DIR) / "security_classification.parquet"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "date": [d for d in dates for _ in symbols],
+        "symbol": [s for _ in dates for s in symbols],
+        "is_screenable": True,
+    }).to_parquet(out)
+
+
+def _stage_classification_all_screenable() -> None:
+    import pandas as pd
+
+    dates = pd.bdate_range("2023-01-02", periods=60)
+    _classification_panel_for(dates, ["000001", "000002"])
+
+
 def test_retrain_universe_research_mode_dispatches(tmp_path, monkeypatch) -> None:
     import pandas as pd
 
@@ -70,6 +94,7 @@ def test_retrain_universe_research_mode_dispatches(tmp_path, monkeypatch) -> Non
     ph_path = tmp_path / "price_history.parquet"
     _price_history_file(ph_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
     seen: dict[str, object] = {}
 
     def _fake_grid(price_history_df, screens, **kwargs):
@@ -77,7 +102,7 @@ def test_retrain_universe_research_mode_dispatches(tmp_path, monkeypatch) -> Non
         seen["rows"] = len(price_history_df)
         return pd.DataFrame([{"screen_name": "operator_legacy", "ranked_top1_net_bp": -10.0}])
 
-    monkeypatch.setattr(mod, "run_universe_screen_grid", _fake_grid)
+    monkeypatch.setattr("src.ml.universe_research.run_universe_screen_grid", _fake_grid)
 
     main(["--universe-research", "--export-dir", str(tmp_path)])
 
@@ -132,7 +157,7 @@ def test_retrain_universe_research_prepares_price_panel(tmp_path, monkeypatch) -
         seen["rows"] = len(price_history_df)
         return pd.DataFrame([{"screen_name": "operator_legacy", "ranked_top1_net_bp": -10.0}])
 
-    monkeypatch.setattr(mod, "run_universe_screen_grid", _fake_grid)
+    monkeypatch.setattr("src.ml.universe_research.run_universe_screen_grid", _fake_grid)
 
     main(["--universe-research", "--export-dir", str(tmp_path)])
 
@@ -141,6 +166,59 @@ def test_retrain_universe_research_prepares_price_panel(tmp_path, monkeypatch) -
     assert seen["has_chg_ratio"] is True
     assert float(seen["max_abs_chg"]) < 1.0
     assert np.isclose(float(seen["max_abs_chg"]), 0.08)
+
+
+def test_retrain_import_excludes_universe_research() -> None:
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[3]
+    code = "import sys, src.ml.retrain; print(sorted(sys.modules))"
+    proc = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(repo_root)},
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "src.ml.universe_research" not in proc.stdout
+
+
+def test_retrain_bundle_path_never_imports_universe_research(tmp_path, monkeypatch) -> None:
+    import os
+    import sys
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
+
+    def _fake_train(ph, market_dates, d_to_idx, **kwargs):
+        return {
+            "strategy_id": "KCA-TOPK-COSTAWARE-001", "training_cutoff": "2026-09-18 00:00:00",
+            "train_start": "2016-01-04", "feature_cols": ["f1"], "top_k": 3,
+        }
+
+    def _fake_save(bundle, export_dir):
+        os.makedirs(export_dir, exist_ok=True)
+        path = os.path.join(export_dir, "sizing_pipeline_bundle.joblib")
+        with open(path, "wb") as fh:
+            fh.write(repr(sorted(bundle)).encode())
+        return path
+
+    monkeypatch.setattr(mod, "train_production_bundle", _fake_train)
+    monkeypatch.setattr(mod, "save_production_bundle", _fake_save)
+    monkeypatch.delitem(sys.modules, "src.ml.universe_research", raising=False)
+
+    main(["--train-ranker-bundle", "--skip-promotion-gate", "--export-dir", str(tmp_path)])
+
+    assert "src.ml.universe_research" not in sys.modules
 
 
 def test_retrain_cost_aware_backtest_mode_dispatches(tmp_path, monkeypatch) -> None:
@@ -155,6 +233,7 @@ def test_retrain_cost_aware_backtest_mode_dispatches(tmp_path, monkeypatch) -> N
         "market_cap_100m": [900.0], "trade_value_100m": [300.0], "market": ["KOSPI"],
     }).to_parquet(ph_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _classification_panel_for(pd.to_datetime(["2023-02-01"]), ["000001"])
 
     seen: dict[str, object] = {}
 
@@ -196,6 +275,7 @@ def test_retrain_ranker_topk_research_dispatches(tmp_path, monkeypatch) -> None:
     ph_path = tmp_path / "price_history.parquet"
     _price_history_file(ph_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
     seen: dict[str, object] = {}
 
     class _Ev:
@@ -251,6 +331,7 @@ def test_retrain_ranker_topk_research_passes_explicit_train_start(tmp_path, monk
     ph_path = tmp_path / "price_history.parquet"
     _price_history_file(ph_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
     seen: dict[str, object] = {}
 
     class _Ev:
@@ -311,6 +392,7 @@ def test_retrain_exit_grid_revalidation_dispatches(tmp_path, monkeypatch) -> Non
     ph_path = tmp_path / "price_history.parquet"
     _price_history_file(ph_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
     seen: dict[str, object] = {}
 
     def _fake_run(*, export_dir=None, **kwargs):
@@ -372,6 +454,7 @@ def test_retrain_train_ranker_bundle_dispatches(tmp_path, monkeypatch) -> None:
     ph_path = tmp_path / "price_history.parquet"
     _price_history_file(ph_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
     monkeypatch.setenv("KCA_CODE_COMMIT", "abc123")
     saved: list[str] = []
     trained: list[dict] = []
@@ -400,7 +483,7 @@ def test_retrain_train_ranker_bundle_dispatches(tmp_path, monkeypatch) -> None:
 
     seen: dict = {}
 
-    def _approve(candidate, current, eval_frame):
+    def _approve(candidate, current, eval_frame, **kwargs):
         seen["eval_frame"] = eval_frame
         seen["current"] = current
         return PromotionVerdict(promote=True, reasons=(), agreement=0.99)
@@ -437,6 +520,7 @@ def test_retrain_train_ranker_bundle_rejected_by_gate_keeps_live_bundle(tmp_path
     ph_path = tmp_path / "price_history.parquet"
     _price_history_file(ph_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
     monkeypatch.setenv("KCA_CODE_COMMIT", "abc123")
     saved: list[str] = []
     trained: list[dict] = []
@@ -466,7 +550,7 @@ def test_retrain_train_ranker_bundle_rejected_by_gate_keeps_live_bundle(tmp_path
     monkeypatch.setattr(
         mod,
         "evaluate_retrain_promotion",
-        lambda candidate, current, eval_frame: PromotionVerdict(promote=False, reasons=("prediction agreement 0.810 below 0.950",), agreement=0.81),
+        lambda candidate, current, eval_frame, **kwargs: PromotionVerdict(promote=False, reasons=("prediction agreement 0.810 below 0.950",), agreement=0.81),
     )
 
     # When / Then
@@ -494,6 +578,7 @@ def test_retrain_skip_promotion_gate_publishes_without_evaluating(tmp_path, monk
     ph_path = tmp_path / "price_history.parquet"
     _price_history_file(ph_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
     monkeypatch.setenv("KCA_CODE_COMMIT", "abc123")
     saved: list[str] = []
     trained: list[dict] = []
@@ -534,3 +619,399 @@ def test_retrain_skip_promotion_gate_publishes_without_evaluating(tmp_path, monk
     rows = [json.loads(line) for line in registry.read_text(encoding="utf-8").splitlines()]
     assert [r["outcome"] for r in rows] == ["PROMOTED_UNGATED"]
     assert rows[0]["agreement"] is None
+
+
+def _cutover_live_bundle(live_dir) -> dict:
+    import dataclasses
+
+    from joblib import dump
+
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    bundle = {"strategy_id": "KCA-TOPK-COSTAWARE-001", "training_cutoff": "2026-09-18 00:00:00",
+              "train_start": "2016-01-04", "feature_cols": ["f1"], "rank_model": None,
+              "quantile_models": {}, "calibrators": {}, "top_k": 3,
+              "select_universe": dataclasses.asdict(COST_AWARE_UNIVERSE),
+              "feature_contract_version": "1"}
+    live_dir.mkdir(parents=True, exist_ok=True)
+    dump(bundle, live_dir / "sizing_pipeline_bundle.joblib")
+    return bundle
+
+
+def _cutover_candidate_bundle() -> dict:
+    import dataclasses
+
+    from src.strategy.contract import PRODUCTION_STRATEGY
+
+    return {"strategy_id": "KCA-TOPK-COSTAWARE-002", "training_cutoff": "2026-09-18 00:00:00",
+            "train_start": "2016-01-04", "feature_cols": ["f1"], "rank_model": None,
+            "quantile_models": {}, "calibrators": {}, "top_k": 3,
+            "select_universe": dataclasses.asdict(PRODUCTION_STRATEGY.universe),
+            "feature_contract_version": "1"}
+
+
+def test_retrain_cutover_rejects_002_candidate_and_keeps_live_bundle(tmp_path, monkeypatch) -> None:
+    import json
+    import os
+
+    import pandas as pd
+    import pytest
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
+    monkeypatch.setenv("KCA_CODE_COMMIT", "abc123")
+
+    live_dir = tmp_path / "topk_ranker"
+    _cutover_live_bundle(live_dir)
+    before = (live_dir / "sizing_pipeline_bundle.joblib").read_bytes()
+
+    candidate = _cutover_candidate_bundle()
+    monkeypatch.setattr(mod, "train_production_bundle", lambda ph, market_dates, d_to_idx, **kw: dict(candidate))
+    frame = pd.DataFrame({"date": pd.to_datetime(["2026-09-01"] * 5), "f1": [1.0, 2.0, 3.0, 4.0, 5.0]})
+    monkeypatch.setattr(mod, "build_gate_eval_frame", lambda ph, market_dates, d_to_idx: frame)
+
+    saved: list[str] = []
+
+    def _fake_save(bundle, export_dir):
+        saved.append(export_dir)
+        os.makedirs(export_dir, exist_ok=True)
+        path = os.path.join(export_dir, "sizing_pipeline_bundle.joblib")
+        with open(path, "wb") as fh:
+            fh.write(repr(sorted(bundle)).encode())
+        return path
+
+    monkeypatch.setattr(mod, "save_production_bundle", _fake_save)
+
+    with pytest.raises(RuntimeError, match="promotion gate rejected"):
+        main(["--train-ranker-bundle", "--export-dir", str(tmp_path)])
+
+    assert (live_dir / "sizing_pipeline_bundle.joblib").read_bytes() == before
+    assert saved == [str(live_dir / "rejected")]
+    rows = [json.loads(line) for line in (live_dir / "retrain_registry.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [r["outcome"] for r in rows] == ["REJECTED"]
+    assert any("strategy or screen changed" in r for r in rows[0]["reasons"])
+
+
+def test_retrain_cutover_manual_promotion_publishes_002_bundle(tmp_path, monkeypatch) -> None:
+    import json
+
+    from joblib import load
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
+    monkeypatch.setenv("KCA_CODE_COMMIT", "abc123")
+
+    live_dir = tmp_path / "topk_ranker"
+    _cutover_live_bundle(live_dir)
+
+    candidate = _cutover_candidate_bundle()
+    monkeypatch.setattr(mod, "train_production_bundle", lambda ph, market_dates, d_to_idx, **kw: dict(candidate))
+
+    def _never(*args, **kwargs):
+        raise AssertionError("gate must not run with --skip-promotion-gate")
+
+    monkeypatch.setattr(mod, "evaluate_retrain_promotion", _never)
+    monkeypatch.setattr(mod, "build_gate_eval_frame", _never)
+
+    main(["--train-ranker-bundle", "--skip-promotion-gate", "--export-dir", str(tmp_path)])
+
+    rows = [json.loads(line) for line in (live_dir / "retrain_registry.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [r["outcome"] for r in rows] == ["PROMOTED_UNGATED"]
+    assert rows[0]["agreement"] is None
+    assert load(live_dir / "sizing_pipeline_bundle.joblib")["strategy_id"] == "KCA-TOPK-COSTAWARE-002"
+
+
+def test_retrain_pit_flags_defaults() -> None:
+    from src import settings
+    from src.ml.retrain import build_arg_parser
+
+    args = build_arg_parser().parse_args([])
+
+    assert args.pit_certification is False
+    assert args.pit_augment is False
+    assert args.pit_gate_mode == "advisory"
+    assert args.pit_panel_dir == str(settings.HISTORY_DIR)
+
+
+def test_retrain_pit_certification_dispatches(tmp_path, monkeypatch) -> None:
+    import src.ml.research.pit_certification as pit_mod
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    seen: dict = {}
+
+    def _fake_main(*, export_dir, panel_dir, augment, train_start):
+        seen.update(export_dir=export_dir, panel_dir=panel_dir, augment=augment, train_start=train_start)
+        from src.ml.pit_report import PitHaircutReport
+
+        return PitHaircutReport()
+
+    monkeypatch.setattr(pit_mod, "main_pit_certification", _fake_main)
+
+    def _never(*args, **kwargs):
+        raise AssertionError("no bundle training may happen for --pit-certification")
+
+    monkeypatch.setattr(mod, "train_production_bundle", _never)
+
+    main(["--pit-certification", "--pit-augment", "--export-dir", str(tmp_path),
+          "--pit-panel-dir", str(tmp_path / "panel"), "--ranker-train-start", "2023-01-25"])
+
+    assert seen["augment"] is True
+    assert seen["export_dir"] == str(tmp_path)
+    assert str(seen["panel_dir"]) == str(tmp_path / "panel")
+    assert seen["train_start"] is not None
+
+
+class _PitColumnModel:
+    def predict(self, features):
+        import numpy as np
+
+        return features["f1"].to_numpy(dtype=np.float64)
+
+
+def _pit_live_bundle(**overrides) -> dict:
+    import dataclasses
+
+    from src.strategy.contract import PRODUCTION_STRATEGY
+
+    bundle = {
+        "strategy_id": "KCA-TOPK-COSTAWARE-002",
+        "training_cutoff": "2026-09-18 00:00:00",
+        "train_start": "2023-01-25",
+        "feature_cols": ["f1", "f2"],
+        "rank_model": object(),
+        "quantile_models": {},
+        "calibrators": {},
+        "top_k": 3,
+        "select_universe": dataclasses.asdict(PRODUCTION_STRATEGY.universe),
+        "feature_contract_version": "1",
+        "model_params": {"n_estimators": 10},
+        "seeds": [1],
+        "return_model": _PitColumnModel(),
+    }
+    bundle.update(overrides)
+    return bundle
+
+
+def _write_pit_report(live_dir, native_mean=5.0, native_ic=0.02) -> None:
+    import dataclasses
+    from datetime import datetime
+    from pathlib import Path
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    from src.ml.pit_report import PairedDelta, PitHaircutReport, PitReportStatus, save_pit_haircut_report
+    from src.strategy.contract import PRODUCTION_STRATEGY
+
+    report = PitHaircutReport(
+        generated_at=datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+        strategy_id="KCA-TOPK-COSTAWARE-002",
+        strategy_fingerprint="fp",
+        top_k=3,
+        select_universe=dataclasses.asdict(PRODUCTION_STRATEGY.universe),
+        feature_contract_version="1",
+        model_params={"n_estimators": 10},
+        seeds=(1,),
+        status=PitReportStatus.OK,
+        panel_date_min="2026-06-01",
+        panel_date_max="2026-09-01",
+        n_usable_days=60,
+        n_paired_days=60,
+        n_live_days=60,
+        n_eod_index_days=0,
+        mean_net_bp={"eod_full": 8.0, "eod_matched": 8.0, "pit_feature": 6.0, "pit_native": native_mean},
+        haircut=PairedDelta(delta=8.0 - native_mean, ci_low=0.0, ci_high=5.0, p_value=0.1, n_days=60),
+        coverage_component=PairedDelta(delta=0.0, ci_low=0.0, ci_high=0.0, p_value=1.0, n_days=60),
+        feature_component=PairedDelta(delta=1.0, ci_low=0.0, ci_high=2.0, p_value=0.2, n_days=60),
+        selection_component=PairedDelta(delta=1.0, ci_low=0.0, ci_high=2.0, p_value=0.2, n_days=60),
+        pit_native_vs_zero=PairedDelta(delta=native_mean, ci_low=0.0, ci_high=9.0, p_value=0.01, n_days=60),
+        rank_ic_mean={"eod_full": 0.03, "eod_matched": 0.03, "pit_feature": 0.02, "pit_native": native_ic},
+        rank_ic_haircut=PairedDelta(delta=0.01, ci_low=0.0, ci_high=0.02, p_value=0.2, n_days=60),
+        pick_overlap_mean={"pit_feature": 0.9, "pit_native": 0.8},
+        haircut_by_index_basis={"live_1520": 2.0, "eod_fallback": float("nan")},
+        augmentation=None,
+    )
+    daily = pd.DataFrame({
+        "date": pd.to_datetime(["2026-09-01"]), "arm": ["eod_full"], "topk_net_bp": [8.0],
+        "rank_ic": [0.03], "n_pool": [20], "overlap_vs_eod": [1.0], "index_basis": ["live_1520"],
+    })
+    save_pit_haircut_report(report, daily, out_dir=Path(live_dir))
+
+
+def _pit_eval_frame():
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(0)
+    dates = np.repeat(pd.bdate_range("2026-08-17", periods=20).to_numpy(), 10)
+    return pd.DataFrame({"date": dates, "f1": rng.normal(size=200), "f2": rng.normal(size=200)})
+
+
+def test_retrain_train_bundle_stamps_pit_metadata(tmp_path, monkeypatch) -> None:
+    import os
+
+    from joblib import load
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
+    monkeypatch.setenv("KCA_CODE_COMMIT", "abc123")
+    live_dir = tmp_path / "topk_ranker"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    _write_pit_report(live_dir)
+
+    candidate = _pit_live_bundle()
+    monkeypatch.setattr(mod, "train_production_bundle", lambda ph, market_dates, d_to_idx, **kw: dict(candidate))
+    monkeypatch.setattr(mod, "build_gate_eval_frame", lambda ph, market_dates, d_to_idx: _pit_eval_frame())
+
+    saved: list[str] = []
+
+    def _fake_save(bundle, export_dir):
+        saved.append(export_dir)
+        os.makedirs(export_dir, exist_ok=True)
+        path = os.path.join(export_dir, "sizing_pipeline_bundle.joblib")
+        from joblib import dump
+
+        dump(bundle, path)
+        return path
+
+    monkeypatch.setattr(mod, "save_production_bundle", _fake_save)
+
+    main(["--train-ranker-bundle", "--export-dir", str(tmp_path)])
+
+    stored = load(live_dir / "sizing_pipeline_bundle.joblib")
+    assert stored["pit_certification"]["gate_mode"] == "advisory"
+    assert stored["pit_certification"]["gate_status"] == "PASS"
+    assert stored["pit_certification"]["status"] == "OK"
+    assert saved == [str(live_dir)]
+
+
+def test_retrain_enforce_pit_gate_rejects_and_stamps(tmp_path, monkeypatch) -> None:
+    import os
+
+    import pytest
+    from joblib import load
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
+    monkeypatch.setenv("KCA_CODE_COMMIT", "abc123")
+    live_dir = tmp_path / "topk_ranker"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    _write_pit_report(live_dir, native_mean=-5.0, native_ic=-0.01)
+
+    candidate = _pit_live_bundle()
+    monkeypatch.setattr(mod, "train_production_bundle", lambda ph, market_dates, d_to_idx, **kw: dict(candidate))
+    monkeypatch.setattr(mod, "build_gate_eval_frame", lambda ph, market_dates, d_to_idx: _pit_eval_frame())
+
+    def _fake_save(bundle, export_dir):
+        os.makedirs(export_dir, exist_ok=True)
+        path = os.path.join(export_dir, "sizing_pipeline_bundle.joblib")
+        from joblib import dump
+
+        dump(bundle, path)
+        return path
+
+    monkeypatch.setattr(mod, "save_production_bundle", _fake_save)
+
+    with pytest.raises(RuntimeError, match="promotion gate rejected"):
+        main(["--train-ranker-bundle", "--pit-gate-mode", "enforce", "--export-dir", str(tmp_path)])
+
+    rejected = load(live_dir / "rejected" / "sizing_pipeline_bundle.joblib")
+    assert rejected["pit_certification"]["gate_status"] == "FAIL"
+
+
+def test_retrain_skip_gate_records_ungated_pit_status(tmp_path, monkeypatch) -> None:
+    import os
+
+    from joblib import load
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
+    monkeypatch.setenv("KCA_CODE_COMMIT", "abc123")
+
+    candidate = _pit_live_bundle()
+    monkeypatch.setattr(mod, "train_production_bundle", lambda ph, market_dates, d_to_idx, **kw: dict(candidate))
+
+    def _never(*args, **kwargs):
+        raise AssertionError("gate must not run with --skip-promotion-gate")
+
+    monkeypatch.setattr(mod, "evaluate_retrain_promotion", _never)
+    monkeypatch.setattr(mod, "build_gate_eval_frame", _never)
+
+    def _fake_save(bundle, export_dir):
+        os.makedirs(export_dir, exist_ok=True)
+        path = os.path.join(export_dir, "sizing_pipeline_bundle.joblib")
+        from joblib import dump
+
+        dump(bundle, path)
+        return path
+
+    monkeypatch.setattr(mod, "save_production_bundle", _fake_save)
+
+    main(["--train-ranker-bundle", "--skip-promotion-gate", "--export-dir", str(tmp_path)])
+
+    stored = load(tmp_path / "topk_ranker" / "sizing_pipeline_bundle.joblib")
+    assert stored["pit_certification"]["gate_status"] == "UNGATED"
+
+
+def test_retrain_corrupt_pit_report_evaluates_as_missing_without_crashing(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    import pytest
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
+    live_dir = tmp_path / "topk_ranker"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    (live_dir / "pit_haircut_report.json").write_text('{"schema_version": 1,', encoding="utf-8")
+    seen: dict = {}
+
+    class _StopError(Exception):
+        pass
+
+    def _capture(bundle, current, eval_frame, *, pit_report, pit_gate, **kw):
+        seen["pit_report"] = pit_report
+        seen["mode"] = pit_gate.mode
+        raise _StopError
+
+    monkeypatch.setattr(mod, "train_production_bundle", lambda ph, market_dates, d_to_idx, **kw: {"a": 1})
+    monkeypatch.setattr(mod, "build_gate_eval_frame", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "evaluate_retrain_promotion", _capture)
+
+    for mode in ("advisory", "enforce"):
+        with caplog.at_level(logging.WARNING, logger=mod.logger.name), pytest.raises(_StopError):
+            main(["--train-ranker-bundle", "--export-dir", str(tmp_path), "--pit-gate-mode", mode])
+        assert seen["pit_report"] is None
+        assert seen["mode"].value == mode
+        assert any("status=REPORT_UNREADABLE" in r.getMessage() for r in caplog.records)
+        caplog.clear()

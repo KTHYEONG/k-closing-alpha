@@ -26,6 +26,8 @@ def _synthetic_panel(n_days: int = 45):
                 "v_kospi": 18.0, "v_kosdaq": 22.0,
             })
     ph, _prov = prepare_price_panel(pd.DataFrame(rows))
+    ph["is_screenable"] = True
+    ph["screenable_source"] = "real"
     market_dates = np.array(sorted(ph["date"].unique()))
     return ph, market_dates, {d: i for i, d in enumerate(market_dates)}
 

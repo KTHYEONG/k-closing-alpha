@@ -29,8 +29,18 @@ class _AllListed(frozenset):
 
 @pytest.fixture(autouse=True)
 def _eligible_everything(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.daily.collect import EligibilityResolution
+
     async def _all_listed(_client, _session, _decision_date):
-        return _AllListed()
+        codes = _AllListed()
+        return EligibilityResolution(
+            prev_trading_day=pd.Timestamp("2026-09-11"),
+            listed=codes,
+            screenable=codes,
+            eligible=codes,
+        )
     monkeypatch.setattr(collect, "resolve_eligible_codes", _all_listed)
 
 

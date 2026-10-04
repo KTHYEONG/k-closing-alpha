@@ -24,10 +24,10 @@ from src.ml.costaware_topk import assert_screen_constructible
 from src.ml.exit_policy import DEFAULT_TAKE_PROFIT_GRID, evaluate_exit_grid, summarize_exit_grid
 from src.ml.research.v3_engine import load_and_prepare_price_history
 from src.ml.robust_eval import CombinatorialPurgedCV
+from src.ml.topk_contract import RANKER_FEATURE_COLS
 from src.ml.topk_ranker_research import (
     CPCV_K_TEST,
     CPCV_N_GROUPS,
-    RANKER_FEATURE_COLS,
     RANKER_SEEDS,
     TRAIN_POOL_MIN_ROWS,
     assert_unique_date_symbol,
@@ -38,7 +38,7 @@ from src.ml.topk_ranker_research import (
     demean_label_by_date,
     split_regime_frames,
 )
-from src.strategy.contract import DEFAULT_UNIVERSE, KCA_TOPK_COSTAWARE_001, MIN_TOP_K, StrategySpec, UniverseSpec
+from src.strategy.contract import MIN_TOP_K, PRODUCTION_STRATEGY, StrategySpec, UniverseSpec, training_universe
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -49,8 +49,8 @@ def build_exit_grid_oof(
     market_dates: np.ndarray,
     d_to_idx: dict[pd.Timestamp, int],
     *,
-    spec: StrategySpec = KCA_TOPK_COSTAWARE_001,
-    train_spec: UniverseSpec = DEFAULT_UNIVERSE,
+    spec: StrategySpec = PRODUCTION_STRATEGY,
+    train_spec: UniverseSpec | None = None,
     cv: CombinatorialPurgedCV | None = None,
     model_params: dict[str, Any] | None = None,
     huber_delta: float = 0.9,
@@ -65,7 +65,7 @@ def build_exit_grid_oof(
         market_dates: Full trading calendar.
         d_to_idx: Date-to-index lookup for forward exits.
         spec: Strategy specification carrying top_k, select universe and cost.
-        train_spec: Wide training screen without the cost cap.
+        train_spec: Wide training screen; None derives training_universe(spec.universe).
         cv: CPCV splitter override; None lets cpcv_score_with_history default to (8, 2).
         model_params: LightGBM params override.
         huber_delta: Huber alpha for the ranker.
@@ -88,7 +88,8 @@ def build_exit_grid_oof(
     if int(spec.top_k) < MIN_TOP_K:
         raise ValueError(f"top_k {spec.top_k} below the minimum investable K {MIN_TOP_K}")
     eff_train_start = pd.Timestamp(pd.to_datetime(ph["date"]).min()) if train_start is None else pd.Timestamp(train_start)
-    pool, sel_mask = build_dual_pool(ph, market_dates, d_to_idx, train_spec=train_spec, select_spec=spec.universe)
+    eff_train_spec = training_universe(spec.universe) if train_spec is None else train_spec
+    pool, sel_mask = build_dual_pool(ph, market_dates, d_to_idx, train_spec=eff_train_spec, select_spec=spec.universe)
     constructible_regimes = ("pre_reform", "post_reform") if spec.universe.max_tick_cost_bp is None else ("post_reform",)
     assert_screen_constructible(pool.loc[sel_mask], top_k=int(spec.top_k), regimes=constructible_regimes)
     labeled = demean_label_by_date(attach_pit_net_label(pool, cost=spec.cost))
@@ -112,8 +113,8 @@ def run_exit_grid_revalidation(
     market_dates: np.ndarray | None = None,
     d_to_idx: dict[pd.Timestamp, int] | None = None,
     export_dir: str | None = None,
-    spec: StrategySpec = KCA_TOPK_COSTAWARE_001,
-    train_spec: UniverseSpec = DEFAULT_UNIVERSE,
+    spec: StrategySpec = PRODUCTION_STRATEGY,
+    train_spec: UniverseSpec | None = None,
     train_start: pd.Timestamp | None = None,
     min_train_rows: int = TRAIN_POOL_MIN_ROWS,
     take_profit_grid: tuple[float, ...] = DEFAULT_TAKE_PROFIT_GRID,
@@ -128,7 +129,7 @@ def run_exit_grid_revalidation(
         export_dir: When given, writes the per-take-profit grid to
             <export_dir>/exit_grid_revalidation_report.parquet.
         spec: Strategy specification carrying top_k, select universe and cost.
-        train_spec: Wide training screen without the cost cap.
+        train_spec: Wide training screen; None derives training_universe(spec.universe).
         train_start: Training-window start; None selects the panel minimum date.
         min_train_rows: Fail-closed floor on per-fold training rows (passed through to build_exit_grid_oof).
         take_profit_grid: Take-profit levels to score.

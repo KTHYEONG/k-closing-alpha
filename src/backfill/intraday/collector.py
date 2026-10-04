@@ -1582,22 +1582,30 @@ _EXTENDED_BACKFILL_WINDOWS: dict[str, tuple[str, str, str]] = {
     INTRADAY_SESSION_NXT_AFTERMARKET: (NXT_AFTERMARKET_HOUR_FLOOR, NXT_AFTERMARKET_HOUR_CEIL, NXT_MARKET_DIV_CODE),
     INTRADAY_SESSION_NXT_PREMARKET: (NXT_PREMARKET_HOUR_FLOOR, NXT_PREMARKET_HOUR_CEIL, NXT_MARKET_DIV_CODE),
     INTRADAY_SESSION_KRX_AFTERMARKET: (KRX_AFTERMARKET_HOUR_FLOOR, KRX_AFTERMARKET_HOUR_CEIL, KRX_CLOSE_MARKET_DIV_CODE),
+    INTRADAY_SESSION_REGULAR: (KRX_REGULAR_HOUR_FLOOR, KRX_REGULAR_HOUR_CEIL, KRX_CLOSE_MARKET_DIV_CODE),
 }
 
 
 async def backfill_extended_session_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, *, session_tag: str, bar_interval_minutes: int = 1, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
-    """Backfill one past date's extended-session 1m bars through the certified KIS historical route.
+    """Backfill one past date's session 1m bars through the certified KIS historical route.
 
     Every response is retained as raw evidence and classified per symbol exactly like the live path
     (_kis_bar_attempt): unlisted NXT symbols become NOT_APPLICABLE, traded windows COMPLETE. Historical
-    KIS rows exist only for traded minutes, so backfilled partitions are sparse grids.
+    KIS rows exist only for traded minutes, so backfilled partitions are sparse grids whose bars are
+    stamped at the minute START (a 15:19 bar covers 15:19:00-15:19:59), unlike LS live-archive bars which
+    are end-stamped; consumers must resolve the stamp per vendor.
+
+    The regular window is the whole KRX session [09:00:00, 15:30:00] so one fetch retains both the 15:20
+    decision-time state and the closing-auction print (the 15:30:00 bar). An empty regular answer is FAILED
+    (regular_empty_without_proof), never NO_TRADES: callers only request symbol-days with positive EOD volume,
+    so silence contradicts EOD evidence and must stay retryable up to the ledger attempt cap.
 
     Args:
         client: KIS client bound to one backfill credential.
         session: Open HTTP session of that client.
         stock_codes: Symbols to request for this date/session.
         snapshot_date: Past market date (YYYY-MM-DD); must be before today (KST).
-        session_tag: One of nxt_aftermarket, nxt_premarket, krx_aftermarket.
+        session_tag: One of nxt_aftermarket, nxt_premarket, krx_aftermarket, regular.
         bar_interval_minutes: Bar interval.
         profile: Collection limits and routes.
         capture_store: Raw evidence store.
@@ -1640,12 +1648,20 @@ async def backfill_extended_session_bars(client: Any, session: Any, stock_codes:
             and entry.reason == "empty_without_proof"
             and len(entry.raw_refs) > 0
         ):
-            entry = CoverageEntry(
-                symbol=entry.symbol, dataset=entry.dataset, venue=entry.venue, session=entry.session,
-                scheduled_at=entry.scheduled_at, status=CaptureStatus.NO_TRADES, rows=0,
-                first_event_time=entry.first_event_time, last_event_time=entry.last_event_time,
-                reason="krx_after_no_trades", raw_refs=entry.raw_refs,
-            )
+            if str(session_tag) == INTRADAY_SESSION_REGULAR:
+                entry = CoverageEntry(
+                    symbol=entry.symbol, dataset=entry.dataset, venue=entry.venue, session=entry.session,
+                    scheduled_at=entry.scheduled_at, status=CaptureStatus.FAILED, rows=0,
+                    first_event_time=entry.first_event_time, last_event_time=entry.last_event_time,
+                    reason="regular_empty_without_proof", raw_refs=entry.raw_refs,
+                )
+            else:
+                entry = CoverageEntry(
+                    symbol=entry.symbol, dataset=entry.dataset, venue=entry.venue, session=entry.session,
+                    scheduled_at=entry.scheduled_at, status=CaptureStatus.NO_TRADES, rows=0,
+                    first_event_time=entry.first_event_time, last_event_time=entry.last_event_time,
+                    reason="krx_after_no_trades", raw_refs=entry.raw_refs,
+                )
         return frame, entry
 
     return await _collect_with_observer(

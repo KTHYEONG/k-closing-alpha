@@ -682,3 +682,56 @@ def test_strategy_specs_derive_top_k_from_min_top_k() -> None:
     assert KCA_TOPK_COSTAWARE_001.top_k == MIN_TOP_K
     assert KCA_TOPK_CAPFREE_001.top_k == MIN_TOP_K
     assert KCA_TOPK_COSTAWARE_001.fingerprint() == "5946152fe2df5d60b570635191fb4957595f7d06196134797b6f82d47c42cdb9"
+
+
+def test_costaware_002_differs_from_001_only_in_the_class_filter() -> None:
+    import dataclasses
+
+    from src.strategy.contract import COST_AWARE_SCREENABLE_UNIVERSE, COST_AWARE_UNIVERSE
+
+    diff = [k for k in dataclasses.asdict(COST_AWARE_UNIVERSE) if dataclasses.asdict(COST_AWARE_UNIVERSE)[k] != dataclasses.asdict(COST_AWARE_SCREENABLE_UNIVERSE)[k]]
+    assert diff == ["exclude_non_screenable_class"]
+    assert COST_AWARE_UNIVERSE.exclude_non_screenable_class is False
+    assert COST_AWARE_SCREENABLE_UNIVERSE.exclude_non_screenable_class is True
+
+
+def test_production_strategy_binding() -> None:
+    from src.strategy.contract import AA_COST, KCA_TOPK_COSTAWARE_001, KCA_TOPK_COSTAWARE_002, MIN_TOP_K, PRODUCTION_STRATEGY
+
+    assert PRODUCTION_STRATEGY is KCA_TOPK_COSTAWARE_002
+    assert PRODUCTION_STRATEGY.strategy_id == "KCA-TOPK-COSTAWARE-002"
+    assert PRODUCTION_STRATEGY.top_k == MIN_TOP_K
+    assert PRODUCTION_STRATEGY.cost == AA_COST
+    assert PRODUCTION_STRATEGY.fingerprint() != KCA_TOPK_COSTAWARE_001.fingerprint()
+
+
+def test_training_universe_preserves_legacy_pairs() -> None:
+    from src.strategy.contract import CAPFREE_UNIVERSE, COST_AWARE_UNIVERSE, DEFAULT_UNIVERSE, training_universe
+
+    assert training_universe(COST_AWARE_UNIVERSE) == DEFAULT_UNIVERSE
+    assert training_universe(CAPFREE_UNIVERSE) == DEFAULT_UNIVERSE
+
+
+def test_training_universe_keeps_the_class_filter() -> None:
+    from src.strategy.contract import COST_AWARE_SCREENABLE_UNIVERSE, training_universe
+
+    train = training_universe(COST_AWARE_SCREENABLE_UNIVERSE)
+    assert train.max_tick_cost_bp is None
+    assert train.exclude_non_screenable_class is True
+    assert (train.chg_min, train.chg_max, train.min_trade_value_100m, train.min_market_cap_100m, train.exclude_ceiling) == (
+        COST_AWARE_SCREENABLE_UNIVERSE.chg_min, COST_AWARE_SCREENABLE_UNIVERSE.chg_max,
+        COST_AWARE_SCREENABLE_UNIVERSE.min_trade_value_100m,
+        COST_AWARE_SCREENABLE_UNIVERSE.min_market_cap_100m,
+        COST_AWARE_SCREENABLE_UNIVERSE.exclude_ceiling,
+    )
+
+
+def test_certified_strategies_keyed_by_strategy_id() -> None:
+    from src.strategy.contract import CERTIFIED_STRATEGIES, PRODUCTION_STRATEGY
+
+    assert set(CERTIFIED_STRATEGIES) == {
+        "KCA-TOPK-COSTAWARE-001", "KCA-TOPK-CAPFREE-001", "KCA-TOPK-COSTAWARE-002",
+    }
+    for key, spec in CERTIFIED_STRATEGIES.items():
+        assert key == spec.strategy_id
+    assert PRODUCTION_STRATEGY.strategy_id in CERTIFIED_STRATEGIES

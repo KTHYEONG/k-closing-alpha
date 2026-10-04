@@ -1730,7 +1730,7 @@ def test_extended_backfill_rejects_today_unknown_session_and_pre_start_krx(tmp_p
     with pytest.raises(ValueError, match="past date"):
         asyncio.run(backfill_extended_session_bars(_KisBars([]), None, ["005930"], today, session_tag="nxt_aftermarket", **kw))
     with pytest.raises(ValueError, match="Unknown session_tag"):
-        asyncio.run(backfill_extended_session_bars(_KisBars([]), None, ["005930"], "2026-09-15", session_tag="regular", **kw))
+        asyncio.run(backfill_extended_session_bars(_KisBars([]), None, ["005930"], "2026-09-15", session_tag="bogus", **kw))
     with pytest.raises(ValueError, match="krx_aftermarket starts"):
         asyncio.run(backfill_extended_session_bars(_KisBars([]), None, ["005930"], "2026-09-01", session_tag="krx_aftermarket", **kw))
     with pytest.raises(ValueError, match="bar_interval_minutes"):
@@ -2286,3 +2286,64 @@ def test_transport_retry_consumes_one_slot_per_try() -> None:
     assert payload == "ok"
     assert slots == [7, 8, 9]
     assert next_slot == 10
+
+
+def test_extended_backfill_regular_session_retains_auction_bar(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import backfill_extended_session_bars
+
+    delivered = {}
+    rows = [
+        _kis_bar_row("090000", close="1000", vol="10", cum="10000"),
+        _kis_bar_row("151900", close="1010", vol="11", cum="21000"),
+        _kis_bar_row("153000", close="1005", vol="5", cum="26000"),
+    ]
+    asyncio.run(
+        backfill_extended_session_bars(
+            _KisBars(rows), None, ["005930"], "2026-09-15", session_tag="regular",
+            profile=_capture_profile(tmp_path), capture_store=_capture_store(tmp_path), run_id="r-reg-auction",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "COMPLETE"
+    assert entry.session == "regular"
+    assert entry.venue == "KRX"
+    assert sorted(frame["ts_hms"].tolist()) == [90000, 151900, 153000]
+    assert entry.raw_refs
+
+
+def test_extended_backfill_regular_empty_is_failed_not_no_trades(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import backfill_extended_session_bars
+
+    delivered = {}
+    asyncio.run(
+        backfill_extended_session_bars(
+            _KisBars([]), None, ["005930"], "2026-09-15", session_tag="regular",
+            profile=_capture_profile(tmp_path), capture_store=_capture_store(tmp_path), run_id="r-reg-empty",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "regular_empty_without_proof"
+    assert entry.raw_refs
+    assert frame.empty
+
+
+def test_kiwoom_raw_helper_rejects_regular_session(tmp_path) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.backfill.intraday.collector import backfill_kiwoom_raw_bars
+
+    with pytest.raises(ValueError, match="No Kiwoom raw source"):
+        asyncio.run(backfill_kiwoom_raw_bars(
+            _KisBars([]), None, "005930", "2026-09-15",
+            session_tag="regular", profile=_capture_profile(tmp_path),
+            capture_store=_capture_store(tmp_path), run_id="r-reg-raw",
+        ))

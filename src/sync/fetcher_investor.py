@@ -43,30 +43,6 @@ def _prev_day_ymd(ymd: str, days: int = 1) -> str:
     return str((dt - pd.Timedelta(days=max(1, int(days)))).strftime("%Y%m%d"))
 
 
-async def _request_investor_daily_async(
-    session: aiohttp.ClientSession,
-    code: str,
-    trade_date: str,
-    client: KisApiClient,
-    request_slot: Callable[[], Awaitable[None]] | None = None,
-) -> dict[str, Any]:
-    """비동기 KIS API 호출 헬퍼"""
-    url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
-    params = {
-        "FID_COND_MRKT_DIV_CODE": "J",
-        "FID_INPUT_ISCD": str(code).strip().zfill(6),
-        "FID_INPUT_DATE_1": str(trade_date).strip(),
-        "FID_ORG_ADJ_PRC": "",
-        "FID_ETC_CLS_CODE": "",
-    }
-    # KisApiClient의 공통 요청 핸들러 사용
-    if request_slot is not None:
-        await request_slot()
-    return await client._handle_request(
-        session.get, url, headers=client._get_headers("FHPTJ04160001"), params=params
-    )
-
-
 async def get_investor_trade_daily_async(
     session: aiohttp.ClientSession,
     client: KisApiClient,
@@ -102,7 +78,9 @@ async def get_investor_trade_daily_async(
         if cursor < start:
             break
         try:
-            body = await _request_investor_daily_async(session, code, cursor, client, request_slot)
+            if request_slot is not None:
+                await request_slot()
+            body = await client.get_investor_trade_daily_page(session, code, cursor, market_div_code="J")
         except Exception as exc:
             failures += 1
             logger.warning(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from src.config import market_session
 
 
@@ -63,3 +65,13 @@ def test_krx_aftermarket_session_constants_are_disjoint_from_regular() -> None:
     assert KRX_AFTERMARKET_HOUR_FLOOR > KRX_REGULAR_HOUR_CEIL
     assert KRX_AFTERMARKET_START_DATE == "2026-09-14"
     assert INTRADAY_SESSION_KRX_AFTERMARKET not in (INTRADAY_SESSION_REGULAR, INTRADAY_SESSION_NXT_AFTERMARKET)
+
+
+def test_market_session_bar_stamp_convention_is_verified_and_immutable() -> None:
+    assert dict(market_session.INTRADAY_BAR_STAMP_CONVENTION) == {"kis": "start", "kiwoom": "start", "ls": "end"}
+    assert set(market_session.INTRADAY_BAR_STAMP_CONVENTION.values()) <= {"start", "end"}
+    assert "toss" not in market_session.INTRADAY_BAR_STAMP_CONVENTION
+    with pytest.raises(TypeError):
+        market_session.INTRADAY_BAR_STAMP_CONVENTION["toss"] = "start"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        market_session.INTRADAY_BAR_STAMP_CONVENTION["kis"] = "end"  # type: ignore[index]

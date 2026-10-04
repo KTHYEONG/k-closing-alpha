@@ -32,7 +32,8 @@ def check_bundle_serving_compat(bundle: Mapping[str, Any]) -> list[str]:
 
     Returns:
         Human-readable issues; empty when compatible. Checks: screen parity with
-        COST_AWARE_UNIVERSE, feature_cols non-empty and a subset of
+        PRODUCTION_STRATEGY.universe (001 bundles grandfathered for the class filter only),
+        feature_cols non-empty and a subset of
         RANKER_FEATURE_COLS, feature-contract version equal to TOPK_FEATURE_CONTRACT_VERSION
         (keyless = legacy baseline), and bundle top_k equal to MIN_TOP_K.
     """
