@@ -192,6 +192,7 @@ class PanelExclusionReason(enum.StrEnum):
     NO_BARS_BEFORE_CUTOFF = "no_bars_before_cutoff"
     UNKNOWN_BAR_STAMP = "unknown_bar_stamp"
     MIXED_VENDOR = "mixed_vendor"
+    VENDOR_EXCLUDED = "vendor_excluded"
     HEAD_TRUNCATED = "head_truncated"
     VENDOR_MINUTE_GAP = "vendor_minute_gap"
     INVALID_PRICE = "invalid_price"
@@ -210,10 +211,8 @@ class Pit1520PanelConfig:
         stamp_conventions: Vendor -> bar timestamp convention (start/end).
         max_open_mismatch_ticks: Head-truncation guard tolerance, in KRX ticks, around the price range traded
             in the head window.
-        value_reconstructed_vendors: Vendors whose per-bar traded value is quantized at the source (LS reports it
-            in KRW millions per minute, so day sums run ~15% low at p5). Their bar value is rebuilt as
-            volume x (high + low + close) / 3, which matches the live 15:20 거래대금 as closely as KIS's exact value
-            (measured 2026-09: p5 0.997, 97% within 1%).
+        value_reconstructed_vendors: Vendors whose per-bar traded value is not a trustworthy per-minute figure at the source and is rebuilt as volume x typical price ((high+low+close)/3). LS reports it in KRW millions per minute, so day sums run ~15% low at p5 (measured 2026-09: p5 0.997, 97% within 1% after rebuild). Toss exposes no value field at all; the schema's close x volume approximation is biased by the intra-minute range, so it is rebuilt the same way as LS.
+        excluded_bar_vendors: Vendors whose bar symbol-days are dropped from the panel with reason `vendor_excluded`. It exists for ablation (panel with and without a vendor) and rollback, not as a quality filter.
         minute_gap_min_symbols: A day is checked for vendor-wide missing minutes only when at least this many
             symbols traded (small samples have legitimately empty minutes).
         minute_gap_min_share: A minute between the open and the cutoff is a vendor gap when fewer symbols traded
@@ -233,7 +232,8 @@ class Pit1520PanelConfig:
     )
     max_open_mismatch_ticks: int = 1
     head_window_minutes: int = 5
-    value_reconstructed_vendors: frozenset[str] = frozenset({"ls"})
+    value_reconstructed_vendors: frozenset[str] = frozenset({"ls", "toss"})
+    excluded_bar_vendors: frozenset[str] = frozenset()
     minute_gap_min_symbols: int = 30
     minute_gap_min_share: float = 0.2
     live_available_by_hhmmss: str = DECISION_WINDOW_END_HHMMSS
@@ -395,6 +395,13 @@ def aggregate_decision_bars(
         symbol = str(key)
         pos = group.index.to_numpy()
         group_vendors = sorted({str(vendors_all[i]) for i in pos})
+        if set(group_vendors) & set(config.excluded_bar_vendors):
+            excluded.append({
+                "symbol": symbol,
+                "reason": PanelExclusionReason.VENDOR_EXCLUDED.value,
+                "detail": f"vendors={group_vendors}",
+            })
+            continue
         unknown = [v for v in group_vendors if conventions.get(v) not in (BAR_STAMP_START, BAR_STAMP_END)]
         if unknown:
             excluded.append({
@@ -477,7 +484,8 @@ def aggregate_decision_bars(
             "head_low": head_low,
             "head_high": head_high,
         })
-    gaps = vendor_minute_gaps(bars, config=config)
+    gap_bars = bars[~bars["vendor"].astype(str).isin(config.excluded_bar_vendors)] if config.excluded_bar_vendors else bars
+    gaps = vendor_minute_gaps(gap_bars, config=config)
     if gaps:
         detail = f"vendor gap minutes={gaps[:5]} n={len(gaps)}"
         excluded.extend(
@@ -1040,6 +1048,7 @@ def main(argv: list[str] | None = None) -> None:
         --start YYYY-MM-DD (default: earliest date with a regular 1m partition)
         --end YYYY-MM-DD (default: latest price_history date)
         --source-policy {prefer_live,bars_only} (default prefer_live)
+        --exclude-bar-vendor VENDOR (repeatable; drops that vendor's bar symbol-days as vendor_excluded)
         --out-dir PATH (default settings.HISTORY_DIR)
     """
     from src import settings
@@ -1051,9 +1060,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)
     parser.add_argument("--source-policy", choices=("prefer_live", "bars_only"), default="prefer_live")
+    parser.add_argument("--exclude-bar-vendor", action="append", default=[], dest="exclude_bar_vendor")
     parser.add_argument("--out-dir", default=None)
     args = parser.parse_args(argv)
-    config = Pit1520PanelConfig()
+    config = Pit1520PanelConfig(excluded_bar_vendors=frozenset(args.exclude_bar_vendor))
     price_history, _prov = load_price_panel(settings.PRICE_HISTORY_PARQUET_PATH)
     calendar = sorted(pd.to_datetime(price_history["date"]).dt.normalize().unique().tolist())
     if not calendar:

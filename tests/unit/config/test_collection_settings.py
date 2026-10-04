@@ -15,6 +15,8 @@ def test_toss_backfill_defaults() -> None:
     assert profile.COLLECTION_TOSS_BASIS_VOLUME_TOLERANCE == 1e-9
     assert profile.COLLECTION_TOSS_RETENTION_REFERENCE_SYMBOL == "005930"
     assert profile.COLLECTION_TOSS_OUTAGE_FAILURE_SHARE == 0.5
+    assert profile.COLLECTION_TOSS_OUTAGE_MIN_SAMPLE == 5
+    assert profile.COLLECTION_TOSS_USABLE_FROM_DATE == "2023-01-02"
     assert profile.COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS == ("0850-0940", "1510-1550")
 
 

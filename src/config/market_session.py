@@ -8,6 +8,7 @@ from types import MappingProxyType
 KRX_CLOSE_MARKET_DIV_CODE: str = "J"
 NXT_MARKET_DIV_CODE: str = "NX"
 # endpoint→venue은 고정된 벤더 계약이다; 빈 env 기본값은 레거시 경로 제거 이후 모든 Kiwoom/LS 시도를 조용히 비인증 처리했다.
+# "toss:toss-candles"→KRX mapping is valid only for bars accepted by the basis gate (toss_basis_verdict).
 VERIFIED_CHART_ROUTES: Mapping[str, str] = MappingProxyType(
     {
         "kiwoom:ka10079": "KRX",
@@ -15,6 +16,7 @@ VERIFIED_CHART_ROUTES: Mapping[str, str] = MappingProxyType(
         "kiwoom:ka10080": "NXT",
         "ls:t8411": "KRX",
         "ls:t8412": "KRX",
+        "toss:toss-candles": "KRX",
     }
 )
 DECISION_WINDOW_START_HHMMSS: str = "152000"
@@ -35,9 +37,10 @@ DEFAULT_BAR_INTERVAL_MINUTES: int = 1
 BAR_STAMP_START: str = "start"
 BAR_STAMP_END: str = "end"
 # Measured on stored partitions (2026-10-04): KIS/Kiwoom stamp a 1m bar at its minute start (regular 090000..151900,
-# NXT 154000..), LS at its minute end (090100..152000). Unlisted vendors must fail closed, never default.
+# NXT 154000..), LS at its minute end (090100..152000). Measured 2026-10-04: Toss 09:01 equals the KIS 09:00 bar
+# (END-stamped, 090100..153000); OHLC/volume matched KIS on 29/40 sampled symbol-days. Unlisted vendors must fail closed, never default.
 INTRADAY_BAR_STAMP_CONVENTION: Mapping[str, str] = MappingProxyType(
-    {"kis": BAR_STAMP_START, "kiwoom": BAR_STAMP_START, "ls": BAR_STAMP_END}
+    {"kis": BAR_STAMP_START, "kiwoom": BAR_STAMP_START, "ls": BAR_STAMP_END, "toss": BAR_STAMP_END}
 )
 INTRADAY_SESSION_REGULAR: str = "regular"
 INTRADAY_SESSION_NXT_AFTERMARKET: str = "nxt_aftermarket"
