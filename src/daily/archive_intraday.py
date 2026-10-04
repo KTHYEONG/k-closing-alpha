@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -46,12 +47,14 @@ from src.data.capture_contracts import (
     CaptureStatus,
     Cohort,
     CoverageEntry,
+    SymbolObserver,
 )
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_store import write_intraday_partition, write_tick_partition
 from src.data.session_calendar import SessionKind, resolve_session_day
-from src.data.trading_calendar import is_kis_trading_day
+from src.data.trading_calendar import is_kis_trading_day, resolve_prev_trading_day_kis
+from src.execution.paper_broker import HeldRoster, load_held_roster
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, record_run_outcome
 from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
@@ -116,18 +119,12 @@ def archive_phase_complete(store: CaptureStore, target_date: str, phase: str) ->
         manifests = store.read_manifests(str(target_date))
     except (ValueError, OSError):
         return False
-    required: list[tuple[CaptureDataset, str]] = []
-    if phase in ("regular", "all"):
-        required.append((CaptureDataset.MINUTE_BARS, INTRADAY_SESSION_REGULAR))
-        required.append((CaptureDataset.TRADE_TICKS, INTRADAY_SESSION_REGULAR))
-    if phase in ("aftermarket", "all"):
-        required.append((CaptureDataset.MINUTE_BARS, INTRADAY_SESSION_NXT_PREMARKET))
-        required.append((CaptureDataset.MINUTE_BARS, INTRADAY_SESSION_NXT_AFTERMARKET))
-        if str(target_date) >= KRX_AFTERMARKET_START_DATE:
-            required.append((CaptureDataset.MINUTE_BARS, INTRADAY_SESSION_KRX_AFTERMARKET))
-        if str(target_date) >= AFTERMARKET_TICKS_START_DATE:
-            required.append((CaptureDataset.TRADE_TICKS, INTRADAY_SESSION_KRX_AFTERMARKET))
-            required.append((CaptureDataset.TRADE_TICKS, INTRADAY_SESSION_NXT_AFTERMARKET))
+    phases = {"regular", "aftermarket"} if phase == "all" else {phase}
+    required: list[tuple[CaptureDataset, str]] = [
+        (s.dataset, s.session)
+        for s in _STREAMS
+        if s.phase in phases and (s.required_from is None or str(target_date) >= s.required_from)
+    ]
     for dataset, session in required:
         candidates = [
             item
@@ -173,8 +170,6 @@ async def _resolve_previous_trading_day(client: Any, session: Any, snapshot_date
     Returns:
         Previous trading day `YYYY-MM-DD`, or None when unresolved.
     """
-    from src.daily.collect import resolve_prev_trading_day_kis
-
     try:
         prev = await resolve_prev_trading_day_kis(client, session, pd.Timestamp(snapshot_date))
     except (RuntimeError, ValueError) as exc:
@@ -184,20 +179,7 @@ async def _resolve_previous_trading_day(client: Any, session: Any, snapshot_date
             type(exc).__name__,
         )
         return None
-    return prev.strftime("%Y-%m-%d")
-
-
-def _paper_follow_symbols() -> list[str]:
-    try:
-        from src.execution.paper_broker import PaperLedger
-
-        open_positions = PaperLedger().load_open_positions()
-    except Exception as e:
-        logger.warning("[DATA] stage=cohort status=paper_unavailable reason=%s", type(e).__name__)
-        return []
-    if open_positions is None or open_positions.empty or "symbol" not in open_positions.columns:
-        return []
-    return sorted({str(item) for item in open_positions["symbol"].astype(str).tolist() if str(item).strip()})
+    return str(prev.strftime("%Y-%m-%d"))
 
 
 def _panel_listed_before(cohort_date: str) -> frozenset[str]:
@@ -237,6 +219,7 @@ def _resolve_cohort_codes(
     store: CaptureStore,
     *,
     previous_trading_day: str | None,
+    held: HeldRoster,
 ) -> tuple[list[str], bool]:
     """Resolve the archive cohort as today's verified codes plus the prior session's carryover.
 
@@ -248,19 +231,28 @@ def _resolve_cohort_codes(
         profile: Bounded acquisition profile (unused; kept for call-site symmetry).
         store: Capture store holding verified cohorts.
         previous_trading_day: Oracle-resolved prior session; None degrades to today's cohort.
+        held: Open-lot roster read once by the caller; its symbols are appended and a
+            not-ok roster makes the result incomplete.
 
     Returns:
         (codes, incomplete) with today's eligible codes plus the previous cohort's eligible
-        codes and paper-follow symbols; incomplete True when any prior coverage is missing.
+        codes and held symbols; incomplete True when any prior coverage is missing or the
+        held roster is not ok.
     """
     now = datetime.now(SEOUL)
     today_cohort = store.read_cohort(str(snapshot_date), available_by=now)
     _verify_cohort_against_panel(today_cohort)
     codes: list[str] = [str(item) for item in today_cohort.eligible_symbols]
     if previous_trading_day is None:
-        for item in _paper_follow_symbols():
+        for item in held.symbols:
             if item not in codes:
                 codes.append(item)
+        if not held.ok:
+            logger.warning(
+                "[DATA] stage=cohort status=INCOMPLETE reason=held_roster_unavailable error=%s date=%s",
+                held.failure_reason,
+                snapshot_date,
+            )
         logger.info(
             "[DATA] stage=cohort status=VERIFIED date=%s n_today=%d n_prev=%d",
             snapshot_date, len(today_cohort.eligible_symbols), 0,
@@ -278,9 +270,16 @@ def _resolve_cohort_codes(
         for item in prev_cohort.eligible_symbols:
             if str(item) not in codes:
                 codes.append(str(item))
-    for item in _paper_follow_symbols():
+    for item in held.symbols:
         if item not in codes:
             codes.append(item)
+    if not held.ok:
+        logger.warning(
+            "[DATA] stage=cohort status=INCOMPLETE reason=held_roster_unavailable error=%s date=%s",
+            held.failure_reason,
+            snapshot_date,
+        )
+        incomplete = True
     n_prev = len(prev_cohort.eligible_symbols) if prev_cohort is not None else 0
     logger.info(
         "[DATA] stage=cohort status=VERIFIED date=%s n_today=%d n_prev=%d",
@@ -298,13 +297,55 @@ def _publish_task_manifest(
     vendor: str,
     session: str,
     entries: list[CoverageEntry],
+    expected_symbols: Sequence[str],
+    roster_incomplete: bool = False,
 ) -> CaptureManifest:
+    """Publish one evening-archive task manifest for a (dataset, session) stream.
+
+    A stream is certified only when the whole expected cohort is covered by GOOD entries and the held roster
+    was fully known: entries alone cannot prove completeness because a stream that delivered nothing would
+    otherwise be vacuously COMPLETE, and a cohort that silently skipped held lots would be certified.
+
+    Args:
+        store: Capture store receiving the manifest.
+        trading_day: Archived session date.
+        run_id: Attempt-unique task identity.
+        dataset: MINUTE_BARS or TRADE_TICKS.
+        vendor: Task-level vendor label.
+        session: Intraday session tag.
+        entries: Per-symbol coverage in delivery order.
+        expected_symbols: Archive cohort codes this stream is accountable for; may be empty only when the
+            archive cohort is empty.
+        roster_incomplete: True when the held-lot roster could not be read (spec 06); forces PARTIAL.
+
+    Returns:
+        The published manifest. status is COMPLETE iff roster_incomplete is False, every entry status is in
+        GOOD_ENTRY_STATES, and every expected symbol has at least one entry; otherwise PARTIAL. artifacts are the de-duplicated raw_refs
+        of all entries in first-seen order (unchanged).
+
+    Raises:
+        ValueError: The store rejects the manifest (e.g. conflicting immutable identity).
+        OSError: Manifest publication fails.
+    """
     refs: list[Any] = []
     for entry in entries:
         for ref in entry.raw_refs:
             if ref not in refs:
                 refs.append(ref)
-    status = CaptureStatus.COMPLETE if all(item.status in GOOD_ENTRY_STATES for item in entries) else CaptureStatus.PARTIAL
+    if roster_incomplete or not all(item.status in GOOD_ENTRY_STATES for item in entries):
+        status = CaptureStatus.PARTIAL
+    else:
+        present = {item.symbol for item in entries if item.symbol is not None}
+        missing = [code for code in expected_symbols if code not in present]
+        if missing:
+            logger.warning(
+                "[DATA] stage=intraday_archive_manifest status=PARTIAL reason=missing_entries run_id=%s n_missing=%d",
+                run_id,
+                len(missing),
+            )
+            status = CaptureStatus.PARTIAL
+        else:
+            status = CaptureStatus.COMPLETE
     manifest = CaptureManifest(
         schema_version=1,
         context=CaptureContext(
@@ -328,6 +369,141 @@ def _publish_task_manifest(
     )
     store.publish_manifest(manifest)
     return manifest
+
+
+def _admit_for_write(stream: str, symbol: str, frame: pd.DataFrame | None, entry: CoverageEntry) -> bool:
+    """Decide whether one per-symbol collector result may enter the authoritative partition.
+
+    The collector contract (src/backfill/intraday/collector.py) delivers rows only for COMPLETE results and
+    stages every uncertified frame itself, recording the staged ref in entry.raw_refs so the task manifest
+    references it. A non-certified result that still carries rows therefore means the contract was broken;
+    discarding or re-staging those rows here would leave unreferenced evidence and hide the defect, so the
+    archive run aborts instead (fail-closed: no task manifest of the run is published).
+
+    Args:
+        stream: Archive stream key ("bars", "ticks", "nxt_after", "nxt_pre", "krx_after",
+            "krx_after_ticks", "nxt_after_ticks"); used only for the error message.
+        symbol: Symbol the collector reported the result for.
+        frame: Canonical rows delivered with the result; None is treated as zero rows.
+        entry: Coverage entry delivered with the result.
+
+    Returns:
+        True when entry.status is COMPLETE or NO_TRADES (write-eligible); False when the status is anything
+        else and the frame has zero rows.
+
+    Raises:
+        ValueError: entry.status is not COMPLETE/NO_TRADES and the frame has at least one row. The message
+            starts with "collector_contract_violation" and names stream, symbol, status and row count.
+    """
+    if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
+        return True
+    n_rows = 0 if frame is None else int(len(frame))
+    if n_rows > 0:
+        status = entry.status.value if isinstance(entry.status, CaptureStatus) else str(entry.status)
+        raise ValueError(
+            f"collector_contract_violation stream={stream} symbol={symbol} status={status} rows={n_rows}"
+        )
+    return False
+
+
+def _resolve_nxt_tick_targets(
+    cohort_codes: Sequence[str], nxt_bar_entries: Sequence[CoverageEntry]
+) -> tuple[list[str], list[CoverageEntry]]:
+    """Split the archive cohort into NXT aftermarket tick targets and pre-resolved skip entries.
+
+    The NXT tick tape (Kiwoom ka10079 "_NX") exists only for NXT-listed symbols; this run's NXT aftermarket
+    bar results are the evidence of listing. Every cohort symbol must leave an entry in the NXT tick manifest
+    so that an empty target list can never certify the stream: vendor-evidenced non-listing is a GOOD
+    NOT_APPLICABLE entry, an unresolved or missing bar result is an UNKNOWN entry.
+
+    Args:
+        cohort_codes: Archive cohort in run order (today's verified cohort, previous-session carryover,
+            paper-follow symbols); unique codes.
+        nxt_bar_entries: Coverage entries delivered by this run's NXT aftermarket bars stream.
+
+    Returns:
+        (targets, skipped): targets are cohort codes whose NXT bar entry is COMPLETE or NO_TRADES at venue
+        "NXT", sorted ascending; skipped holds one TRADE_TICKS / INTRADAY_SESSION_NXT_AFTERMARKET entry per
+        remaining cohort code, in cohort order, with rows=0, scheduled_at/first/last event time None:
+        - bar entry NOT_APPLICABLE -> status NOT_APPLICABLE, venue copied from the bar entry,
+          reason "skipped:nxt_bars_not_applicable", raw_refs copied from the bar entry;
+        - bar entry present otherwise -> status UNKNOWN, venue "UNKNOWN",
+          reason "skipped:nxt_bars_unresolved", raw_refs copied from the bar entry;
+        - no bar entry for the code -> status UNKNOWN, venue "UNKNOWN", reason "skipped:nxt_bars_missing",
+          raw_refs empty.
+
+    Raises:
+        ValueError: two bar entries carry the same non-None symbol.
+    """
+    seen: set[str] = set()
+    by_symbol: dict[str, CoverageEntry] = {}
+    for bar_entry in nxt_bar_entries:
+        symbol = bar_entry.symbol
+        if symbol is None:
+            continue
+        if symbol in seen:
+            raise ValueError(f"duplicate_nxt_bar_entry symbol={symbol}")
+        seen.add(symbol)
+        if symbol not in by_symbol:
+            by_symbol[symbol] = bar_entry
+    targets: list[str] = []
+    skipped: list[CoverageEntry] = []
+    for code in cohort_codes:
+        found = by_symbol.get(code)
+        if found is None:
+            skipped.append(
+                CoverageEntry(
+                    symbol=code,
+                    dataset=CaptureDataset.TRADE_TICKS,
+                    venue="UNKNOWN",
+                    session=INTRADAY_SESSION_NXT_AFTERMARKET,
+                    scheduled_at=None,
+                    status=CaptureStatus.UNKNOWN,
+                    rows=0,
+                    first_event_time=None,
+                    last_event_time=None,
+                    reason="skipped:nxt_bars_missing",
+                    raw_refs=(),
+                )
+            )
+            continue
+        if found.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES) and found.venue == "NXT":
+            targets.append(code)
+            continue
+        if found.status == CaptureStatus.NOT_APPLICABLE:
+            skipped.append(
+                CoverageEntry(
+                    symbol=code,
+                    dataset=CaptureDataset.TRADE_TICKS,
+                    venue=found.venue,
+                    session=INTRADAY_SESSION_NXT_AFTERMARKET,
+                    scheduled_at=None,
+                    status=CaptureStatus.NOT_APPLICABLE,
+                    rows=0,
+                    first_event_time=None,
+                    last_event_time=None,
+                    reason="skipped:nxt_bars_not_applicable",
+                    raw_refs=tuple(found.raw_refs),
+                )
+            )
+            continue
+        skipped.append(
+            CoverageEntry(
+                symbol=code,
+                dataset=CaptureDataset.TRADE_TICKS,
+                venue="UNKNOWN",
+                session=INTRADAY_SESSION_NXT_AFTERMARKET,
+                scheduled_at=None,
+                status=CaptureStatus.UNKNOWN,
+                rows=0,
+                first_event_time=None,
+                last_event_time=None,
+                reason="skipped:nxt_bars_unresolved",
+                raw_refs=tuple(found.raw_refs),
+            )
+        )
+    targets.sort()
+    return targets, skipped
 
 
 class _BatchedPartitionPublisher:
@@ -370,31 +546,328 @@ class _BatchedPartitionPublisher:
         return written
 
 
+@dataclass(frozen=True)
+class _ArchiveRun:
+    """Per-attempt invocation context shared by every archive stream collector.
+
+    Attributes:
+        client: Authenticated KIS data client.
+        session: Open HTTP session of that client.
+        ls_client: LS client, or None without an LS key.
+        kiwoom_client: Kiwoom client, or None without a Kiwoom key.
+        snap_date: Archived session date, ISO `YYYY-MM-DD`.
+        interval: Bar interval in minutes (> 0).
+        profile: Validated acquisition profile.
+        store: Capture store receiving raw evidence and manifests.
+    """
+
+    client: Any
+    session: Any
+    ls_client: Any | None
+    kiwoom_client: Any | None
+    snap_date: str
+    interval: int
+    profile: CollectionSettings
+    store: CaptureStore
+
+
+_StreamCollector = Callable[[_ArchiveRun, list[str], str, SymbolObserver], Awaitable[object]]
+"""(run, target codes, run_id, on_symbol) -> collector result (ignored; rows arrive through on_symbol)."""
+
+_TargetResolver = Callable[[Sequence[str], Sequence[CoverageEntry]], tuple[list[str], list[CoverageEntry]]]
+"""(archive cohort, source stream entries) -> (collector targets, pre-resolved skip entries)."""
+
+
+@dataclass(frozen=True)
+class _CodesFrom:
+    """Derives a stream's targets from an earlier stream of the same attempt.
+
+    Attributes:
+        source: Key of the stream whose entries prove eligibility; must precede the dependent stream in
+            _STREAMS and belong to the same phase.
+        resolve: Pure resolver returning (targets, skipped entries); skipped entries cover every cohort code
+            that is not a target.
+    """
+
+    source: str
+    resolve: _TargetResolver
+
+
+@dataclass(frozen=True)
+class _StreamSpec:
+    """Declarative definition of one evening-archive stream (one task manifest per attempt).
+
+    Attributes:
+        key: Stream key used in logs and error messages.
+        phase: "regular" or "aftermarket"; phase "all" runs both.
+        dataset: MINUTE_BARS (written by write_intraday_partition with the run interval) or TRADE_TICKS
+            (written by write_tick_partition).
+        session: Intraday session tag of the partition and the manifest.
+        collect: Adapter invoking the stream's collector with its exact historical call shape.
+        manifest_vendor: Task-manifest vendor label.
+        return_slot: Index of run_intraday_archive's return tuple this stream's admitted rows add to, or
+            None when the stream is not reported.
+        required_from: First ISO session date whose phase completeness requires this manifest; None means
+            always required within its phase.
+        codes_from: Target derivation from an earlier stream; None means the whole archive cohort.
+    """
+
+    key: str
+    phase: str
+    dataset: CaptureDataset
+    session: str
+    collect: _StreamCollector
+    manifest_vendor: str
+    return_slot: int | None
+    required_from: str | None
+    codes_from: _CodesFrom | None
+
+
+async def _collect_regular_bars(
+    run: _ArchiveRun, codes: list[str], run_id: str, on_symbol: SymbolObserver
+) -> object:
+    return await collect_intraday_bars(
+        run.client,
+        run.session,
+        codes,
+        run.snap_date,
+        run.interval,
+        ls_client=run.ls_client,
+        profile=run.profile,
+        capture_store=run.store,
+        run_id=run_id,
+        on_symbol=on_symbol,
+    )
+
+
+async def _collect_nxt_aftermarket_bars(
+    run: _ArchiveRun, codes: list[str], run_id: str, on_symbol: SymbolObserver
+) -> object:
+    return await collect_nxt_aftermarket_bars(
+        run.client,
+        run.session,
+        codes,
+        run.snap_date,
+        run.interval,
+        kiwoom_client=run.kiwoom_client,
+        profile=run.profile,
+        capture_store=run.store,
+        run_id=run_id,
+        on_symbol=on_symbol,
+    )
+
+
+async def _collect_nxt_premarket_bars(
+    run: _ArchiveRun, codes: list[str], run_id: str, on_symbol: SymbolObserver
+) -> object:
+    return await collect_nxt_premarket_bars(
+        run.client,
+        run.session,
+        codes,
+        run.snap_date,
+        run.interval,
+        kiwoom_client=run.kiwoom_client,
+        profile=run.profile,
+        capture_store=run.store,
+        run_id=run_id,
+        on_symbol=on_symbol,
+    )
+
+
+async def _collect_krx_aftermarket_bars(
+    run: _ArchiveRun, codes: list[str], run_id: str, on_symbol: SymbolObserver
+) -> object:
+    return await collect_krx_aftermarket_bars(
+        run.client,
+        run.session,
+        codes,
+        run.snap_date,
+        run.interval,
+        profile=run.profile,
+        capture_store=run.store,
+        run_id=run_id,
+        on_symbol=on_symbol,
+    )
+
+
+async def _collect_krx_aftermarket_ticks(
+    run: _ArchiveRun, codes: list[str], run_id: str, on_symbol: SymbolObserver
+) -> object:
+    return await collect_aftermarket_trade_ticks(
+        run.kiwoom_client,
+        run.session,
+        codes,
+        run.snap_date,
+        venue="KRX",
+        profile=run.profile,
+        capture_store=run.store,
+        run_id=run_id,
+        on_symbol=on_symbol,
+    )
+
+
+async def _collect_nxt_aftermarket_ticks(
+    run: _ArchiveRun, codes: list[str], run_id: str, on_symbol: SymbolObserver
+) -> object:
+    return await collect_aftermarket_trade_ticks(
+        run.kiwoom_client,
+        run.session,
+        codes,
+        run.snap_date,
+        venue="NXT",
+        profile=run.profile,
+        capture_store=run.store,
+        run_id=run_id,
+        on_symbol=on_symbol,
+    )
+
+
+async def _collect_regular_ticks(
+    run: _ArchiveRun, codes: list[str], run_id: str, on_symbol: SymbolObserver
+) -> object:
+    return await collect_intraday_trade_ticks(
+        run.client,
+        run.session,
+        codes,
+        run.snap_date,
+        ls_client=run.ls_client,
+        kiwoom_client=run.kiwoom_client,
+        profile=run.profile,
+        capture_store=run.store,
+        run_id=run_id,
+        on_symbol=on_symbol,
+    )
+
+
+_STREAMS: tuple[_StreamSpec, ...] = (
+    _StreamSpec(
+        key="bars",
+        phase="regular",
+        dataset=CaptureDataset.MINUTE_BARS,
+        session=INTRADAY_SESSION_REGULAR,
+        collect=_collect_regular_bars,
+        manifest_vendor="owner-local",
+        return_slot=0,
+        required_from=None,
+        codes_from=None,
+    ),
+    _StreamSpec(
+        key="nxt_after",
+        phase="aftermarket",
+        dataset=CaptureDataset.MINUTE_BARS,
+        session=INTRADAY_SESSION_NXT_AFTERMARKET,
+        collect=_collect_nxt_aftermarket_bars,
+        manifest_vendor="owner-local",
+        return_slot=1,
+        required_from=None,
+        codes_from=None,
+    ),
+    _StreamSpec(
+        key="nxt_pre",
+        phase="aftermarket",
+        dataset=CaptureDataset.MINUTE_BARS,
+        session=INTRADAY_SESSION_NXT_PREMARKET,
+        collect=_collect_nxt_premarket_bars,
+        manifest_vendor="owner-local",
+        return_slot=1,
+        required_from=None,
+        codes_from=None,
+    ),
+    _StreamSpec(
+        key="krx_after",
+        phase="aftermarket",
+        dataset=CaptureDataset.MINUTE_BARS,
+        session=INTRADAY_SESSION_KRX_AFTERMARKET,
+        collect=_collect_krx_aftermarket_bars,
+        manifest_vendor="owner-local",
+        return_slot=None,
+        required_from=KRX_AFTERMARKET_START_DATE,
+        codes_from=None,
+    ),
+    _StreamSpec(
+        key="krx_after_ticks",
+        phase="aftermarket",
+        dataset=CaptureDataset.TRADE_TICKS,
+        session=INTRADAY_SESSION_KRX_AFTERMARKET,
+        collect=_collect_krx_aftermarket_ticks,
+        manifest_vendor="owner-local",
+        return_slot=None,
+        required_from=AFTERMARKET_TICKS_START_DATE,
+        codes_from=None,
+    ),
+    _StreamSpec(
+        key="nxt_after_ticks",
+        phase="aftermarket",
+        dataset=CaptureDataset.TRADE_TICKS,
+        session=INTRADAY_SESSION_NXT_AFTERMARKET,
+        collect=_collect_nxt_aftermarket_ticks,
+        manifest_vendor="owner-local",
+        return_slot=None,
+        required_from=AFTERMARKET_TICKS_START_DATE,
+        codes_from=_CodesFrom("nxt_after", _resolve_nxt_tick_targets),
+    ),
+    _StreamSpec(
+        key="ticks",
+        phase="regular",
+        dataset=CaptureDataset.TRADE_TICKS,
+        session=INTRADAY_SESSION_REGULAR,
+        collect=_collect_regular_ticks,
+        manifest_vendor="owner-local",
+        return_slot=2,
+        required_from=None,
+        codes_from=None,
+    ),
+)
+"""Evening-archive streams in execution and manifest-publication order.
+
+Order is load-bearing (D7): with phase "all" regular ticks run after the aftermarket block, and the NXT tick
+stream must follow the NXT aftermarket bars stream it derives targets from.
+"""
+
+
+def _stream_run_id(snap_date: str, spec: _StreamSpec, attempt: str) -> str:
+    """Build the attempt-unique task run_id of one stream.
+
+    The slug is derived as "<session with '_' -> '-'>-<bars|ticks>" so that, followed by "-<attempt>", no
+    run_id of one attempt is a string prefix of another (the previous hand-written slugs made
+    "nxt-aftermarket" a prefix of "nxt-aftermarket-ticks").
+
+    Returns:
+        "archive-<snap_date>-<slug>-<attempt>".
+    """
+    suffix = "bars" if spec.dataset is CaptureDataset.MINUTE_BARS else "ticks"
+    slug = f"{str(spec.session).replace('_', '-')}-{suffix}"
+    return f"archive-{snap_date}-{slug}-{attempt}"
+
+
 def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes: int = DEFAULT_BAR_INTERVAL_MINUTES, *, profile: CollectionSettings | None = None, phase: str = "all") -> tuple[int, int, int]:
     """Archive the project's dated candidate cohort independently of other collectors.
 
+    Every stream in _STREAMS whose phase is selected runs in table order: its collector delivers per-symbol
+    results, certified rows are buffered and flushed to the stream's partition right after the collector
+    returns, and after all selected streams finished one evening-archive task manifest per stream is
+    published in table order. A manifest is COMPLETE only when the whole archive cohort is covered by GOOD
+    entries.
+
     Args:
         snapshot_date: Exact trading date, default current Asia/Seoul date.
-        bar_interval_minutes: Existing bar interval.
-        profile: Validated bounded acquisition profile; None loads CollectionSettings()
-            from the environment. Capture evidence is always written.
-        phase: Which session group to collect. "regular" acquires KIS/LS/Kiwoom
-            regular-session (09:00-15:30) 1m bars and trade ticks only -- both are
-            fully settled by 15:30 KST close, so this phase is meant to run right
-            after close (e.g. 15:40 KST) independently of the aftermarket phase.
-            "aftermarket" acquires NXT premarket, NXT aftermarket, and KRX
-            aftermarket 1m bars only -- these sessions do not close until 20:00
-            KST, so this phase cannot run meaningfully before then. "all" (the
-            default) runs every session, preserving the pre-split behavior for
-            ad-hoc backfills and existing callers that pass no phase.
+        bar_interval_minutes: Bar interval in minutes (> 0).
+        profile: Validated bounded acquisition profile; None loads CollectionSettings() from the environment.
+        phase: "regular" archives regular-session 1m bars and trade ticks (settled at the 15:30 close).
+            "aftermarket" archives NXT premarket/aftermarket bars, KRX aftermarket bars, and KRX/NXT
+            aftermarket trade ticks (sessions close at 20:00; aftermarket tick tapes are current-day only).
+            "all" runs both, regular bars first and regular ticks last.
 
     Returns:
-        (regular-bar rows, NXT-bar rows, regular-tick rows) written this call.
-        A count is exactly 0 for any session group `phase` did not collect.
+        (regular-bar rows, NXT premarket+aftermarket bar rows, regular-tick rows) admitted for publication by
+        this call, i.e. summed frame lengths of COMPLETE/NO_TRADES results. Partition totals may differ
+        because writers merge with existing partitions. KRX aftermarket bars and aftermarket ticks are
+        archived but not counted. A count is 0 for every stream the phase did not run.
 
     Raises:
         FileNotFoundError: Expected owner-local cohort evidence is absent.
-        ValueError: Invalid date, certification, profile, or unrecognized phase.
+        ValueError: Invalid date, certification, profile, unrecognized phase, or a collector delivered rows for
+            a result that is not COMPLETE/NO_TRADES (no task manifest of the run is published).
         OSError: Acquisition evidence or verified publication fails.
     """
     prof = profile if profile is not None else CollectionSettings()
@@ -411,8 +884,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
         logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
         return (0, 0, 0)
     store = CaptureStore(_capture_root(prof))
-    do_regular = phase in ("regular", "all")
-    do_aftermarket = phase in ("aftermarket", "all")
+    active_phases = {"regular", "aftermarket"} if phase == "all" else {phase}
 
     async def _run() -> tuple[int, int, int]:
         client = KisApiClient(**kis_data_client_kwargs())
@@ -425,202 +897,115 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                 return (0, 0, 0)
             # 휴장일엔 collect가 코호트를 발행하지 않으므로, 코호트 조회는 거래일 판정 뒤에 해야 오탐 실패가 없다.
             prev_trading_day = await _resolve_previous_trading_day(client, session, str(snap_date))
-            codes, prev_incomplete = _resolve_cohort_codes(str(snap_date), prof, store, previous_trading_day=prev_trading_day)
+            held = load_held_roster()
+            codes, prev_incomplete = _resolve_cohort_codes(str(snap_date), prof, store, previous_trading_day=prev_trading_day, held=held)
             interval = int(bar_interval_minutes)
             batch_rows = int(prof.COLLECTION_ARROW_BATCH_ROWS)
             max_rows = int(prof.COLLECTION_ARCHIVE_PUBLISH_ROWS)
-            bars_publisher = _BatchedPartitionPublisher(
-                lambda df, coverage: write_intraday_partition(
-                    df, interval, str(snap_date), INTRADAY_SESSION_REGULAR,
-                    coverage=coverage, batch_rows=batch_rows,
-                ),
-                max_rows,
+            archive_run = _ArchiveRun(
+                client=client,
+                session=session,
+                ls_client=ls_client,
+                kiwoom_client=kiwoom_client,
+                snap_date=str(snap_date),
+                interval=interval,
+                profile=prof,
+                store=store,
             )
-            ticks_publisher = _BatchedPartitionPublisher(
-                lambda df, coverage: write_tick_partition(
-                    df, str(snap_date), INTRADAY_SESSION_REGULAR,
-                    coverage=coverage, batch_rows=batch_rows,
-                ),
-                max_rows,
-            )
-            nxt_after_publisher = _BatchedPartitionPublisher(
-                lambda df, coverage: write_intraday_partition(
-                    df, interval, str(snap_date), INTRADAY_SESSION_NXT_AFTERMARKET,
-                    coverage=coverage, batch_rows=batch_rows,
-                ),
-                max_rows,
-            )
-            nxt_pre_publisher = _BatchedPartitionPublisher(
-                lambda df, coverage: write_intraday_partition(
-                    df, interval, str(snap_date), INTRADAY_SESSION_NXT_PREMARKET,
-                    coverage=coverage, batch_rows=batch_rows,
-                ),
-                max_rows,
-            )
-            krx_after_publisher = _BatchedPartitionPublisher(
-                lambda df, coverage: write_intraday_partition(
-                    df, interval, str(snap_date), INTRADAY_SESSION_KRX_AFTERMARKET,
-                    coverage=coverage, batch_rows=batch_rows,
-                ),
-                max_rows,
-            )
-            krx_after_ticks_publisher = _BatchedPartitionPublisher(
-                lambda df, coverage: write_tick_partition(
-                    df, str(snap_date), INTRADAY_SESSION_KRX_AFTERMARKET,
-                    coverage=coverage, batch_rows=batch_rows,
-                ),
-                max_rows,
-            )
-            nxt_after_ticks_publisher = _BatchedPartitionPublisher(
-                lambda df, coverage: write_tick_partition(
-                    df, str(snap_date), INTRADAY_SESSION_NXT_AFTERMARKET,
-                    coverage=coverage, batch_rows=batch_rows,
-                ),
-                max_rows,
-            )
-            bar_entries: list[CoverageEntry] = []
-            tick_entries: list[CoverageEntry] = []
-            nxt_after_entries: list[CoverageEntry] = []
-            nxt_pre_entries: list[CoverageEntry] = []
-            krx_after_entries: list[CoverageEntry] = []
-            krx_after_tick_entries: list[CoverageEntry] = []
-            nxt_after_tick_entries: list[CoverageEntry] = []
-            counts = {"bars": 0, "nxt_after": 0, "nxt_pre": 0, "krx_after": 0, "ticks": 0, "krx_after_ticks": 0, "nxt_after_ticks": 0}
-
-            def publish_bars(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
-                bar_entries.append(entry)
-                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
-                    bars_publisher.add(symbol, frame, entry)
-                    counts["bars"] += len(frame)
-                elif not frame.empty:
-                    store.publish_frame(frame, context=_fragment_context(trading_day, symbol, CaptureDataset.MINUTE_BARS))
-
-            def publish_ticks(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
-                tick_entries.append(entry)
-                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
-                    ticks_publisher.add(symbol, frame, entry)
-                    counts["ticks"] += len(frame)
-                elif not frame.empty:
-                    store.publish_frame(frame, context=_fragment_context(trading_day, symbol, CaptureDataset.TRADE_TICKS))
-
-            def publish_nxt_after(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
-                nxt_after_entries.append(entry)
-                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
-                    nxt_after_publisher.add(symbol, frame, entry)
-                    counts["nxt_after"] += len(frame)
-
-            def publish_nxt_pre(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
-                nxt_pre_entries.append(entry)
-                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
-                    nxt_pre_publisher.add(symbol, frame, entry)
-                    counts["nxt_pre"] += len(frame)
-
-            def publish_krx_after(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
-                krx_after_entries.append(entry)
-                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
-                    krx_after_publisher.add(symbol, frame, entry)
-                    counts["krx_after"] += len(frame)
-
-            def publish_krx_after_ticks(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
-                krx_after_tick_entries.append(entry)
-                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
-                    krx_after_ticks_publisher.add(symbol, frame, entry)
-                    counts["krx_after_ticks"] += len(frame)
-                elif not frame.empty:
-                    store.publish_frame(frame, context=_fragment_context(trading_day, symbol, CaptureDataset.TRADE_TICKS, INTRADAY_SESSION_KRX_AFTERMARKET))
-
-            def publish_nxt_after_ticks(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
-                nxt_after_tick_entries.append(entry)
-                if entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES):
-                    nxt_after_ticks_publisher.add(symbol, frame, entry)
-                    counts["nxt_after_ticks"] += len(frame)
-                elif not frame.empty:
-                    store.publish_frame(frame, context=_fragment_context(trading_day, symbol, CaptureDataset.TRADE_TICKS, INTRADAY_SESSION_NXT_AFTERMARKET))
-
-            # 같은 날 재시도(수동 재실행 또는 실패 후 재기동)가 이전 시도의 불변 매니페스트와
-            # 충돌하지 않도록 시도별 고유 접미사를 붙인다(실측: 2026-09-18 수동 재실행이
-            # 고정 run_id 때문에 "conflicting immutable artifact identity"로 즉시 실패).
+            # Same-day retry must not collide with prior attempt's immutable manifests.
             attempt = uuid.uuid4().hex[:8]
-            bars_run = f"archive-{snap_date}-regular-bars-{attempt}"
-            after_run = f"archive-{snap_date}-nxt-aftermarket-{attempt}"
-            pre_run = f"archive-{snap_date}-nxt-premarket-{attempt}"
-            krx_run = f"archive-{snap_date}-krx-aftermarket-{attempt}"
-            ticks_run = f"archive-{snap_date}-regular-ticks-{attempt}"
-            krx_ticks_run = f"archive-{snap_date}-krx-aftermarket-ticks-{attempt}"
-            nxt_ticks_run = f"archive-{snap_date}-nxt-aftermarket-ticks-{attempt}"
-            if do_regular:
-                await collect_intraday_bars(client, session, codes, str(snap_date), interval, ls_client=ls_client,
-                                            profile=prof, capture_store=store, run_id=bars_run, on_symbol=publish_bars)
-                bars_publisher.flush()
-            if do_aftermarket:
-                await collect_nxt_aftermarket_bars(client, session, codes, str(snap_date), interval, kiwoom_client=kiwoom_client,
-                                                   profile=prof, capture_store=store, run_id=after_run, on_symbol=publish_nxt_after)
-                nxt_after_publisher.flush()
-                await collect_nxt_premarket_bars(client, session, codes, str(snap_date), interval, kiwoom_client=kiwoom_client,
-                                                 profile=prof, capture_store=store, run_id=pre_run, on_symbol=publish_nxt_pre)
-                nxt_pre_publisher.flush()
-                await collect_krx_aftermarket_bars(client, session, codes, str(snap_date), interval,
-                                                   profile=prof, capture_store=store, run_id=krx_run, on_symbol=publish_krx_after)
-                krx_after_publisher.flush()
-                logger.info("[DATA] stage=krx_aftermarket date=%s rows=%d", snap_date, counts["krx_after"])
-                await collect_aftermarket_trade_ticks(kiwoom_client, session, codes, str(snap_date), venue="KRX",
-                                                      profile=prof, capture_store=store, run_id=krx_ticks_run, on_symbol=publish_krx_after_ticks)
-                krx_after_ticks_publisher.flush()
-                nxt_tick_codes = sorted({e.symbol for e in nxt_after_entries
-                                         if e.symbol and e.venue == "NXT" and e.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES)})
-                await collect_aftermarket_trade_ticks(kiwoom_client, session, nxt_tick_codes, str(snap_date), venue="NXT",
-                                                      profile=prof, capture_store=store, run_id=nxt_ticks_run, on_symbol=publish_nxt_after_ticks)
-                nxt_after_ticks_publisher.flush()
-                logger.info("[DATA] stage=aftermarket_ticks date=%s krx_rows=%d nxt_rows=%d nxt_symbols=%d", snap_date, counts["krx_after_ticks"], counts["nxt_after_ticks"], len(nxt_tick_codes))
-            if do_regular:
-                await collect_intraday_trade_ticks(client, session, codes, str(snap_date), ls_client=ls_client,
-                                                   kiwoom_client=kiwoom_client, profile=prof, capture_store=store,
-                                                   run_id=ticks_run, on_symbol=publish_ticks)
-                ticks_publisher.flush()
-            if do_regular:
-                _publish_task_manifest(store, trading_day=trading_day, run_id=bars_run,
-                                       dataset=CaptureDataset.MINUTE_BARS, vendor="kis",
-                                       session=INTRADAY_SESSION_REGULAR, entries=bar_entries)
-            if do_aftermarket:
-                _publish_task_manifest(store, trading_day=trading_day, run_id=after_run,
-                                       dataset=CaptureDataset.MINUTE_BARS, vendor="kiwoom",
-                                       session=INTRADAY_SESSION_NXT_AFTERMARKET, entries=nxt_after_entries)
-                _publish_task_manifest(store, trading_day=trading_day, run_id=pre_run,
-                                       dataset=CaptureDataset.MINUTE_BARS, vendor="kiwoom",
-                                       session=INTRADAY_SESSION_NXT_PREMARKET, entries=nxt_pre_entries)
-                _publish_task_manifest(store, trading_day=trading_day, run_id=krx_run,
-                                       dataset=CaptureDataset.MINUTE_BARS, vendor="kis",
-                                       session=INTRADAY_SESSION_KRX_AFTERMARKET, entries=krx_after_entries)
-                _publish_task_manifest(store, trading_day=trading_day, run_id=krx_ticks_run,
-                                       dataset=CaptureDataset.TRADE_TICKS, vendor="kiwoom",
-                                       session=INTRADAY_SESSION_KRX_AFTERMARKET, entries=krx_after_tick_entries)
-                _publish_task_manifest(store, trading_day=trading_day, run_id=nxt_ticks_run,
-                                       dataset=CaptureDataset.TRADE_TICKS, vendor="kiwoom",
-                                       session=INTRADAY_SESSION_NXT_AFTERMARKET, entries=nxt_after_tick_entries)
-            if do_regular:
-                _publish_task_manifest(store, trading_day=trading_day, run_id=ticks_run,
-                                       dataset=CaptureDataset.TRADE_TICKS, vendor="kis",
-                                       session=INTRADAY_SESSION_REGULAR, entries=tick_entries)
+            active_specs = [spec for spec in _STREAMS if spec.phase in active_phases]
+            entries_by_key: dict[str, list[CoverageEntry]] = {}
+            publishers: dict[str, _BatchedPartitionPublisher] = {}
+            counts: dict[str, int] = {}
+            run_ids: dict[str, str] = {}
+            targets_by_key: dict[str, list[str]] = {}
+            for spec in active_specs:
+                stream_run_id = _stream_run_id(str(snap_date), spec, attempt)
+                run_ids[spec.key] = stream_run_id
+                if spec.codes_from is None:
+                    targets = list(codes)
+                    entries: list[CoverageEntry] = []
+                else:
+                    source_entries = entries_by_key[spec.codes_from.source]
+                    targets, skipped = spec.codes_from.resolve(codes, source_entries)
+                    entries = list(skipped)
+                entries_by_key[spec.key] = entries
+                targets_by_key[spec.key] = list(targets)
+                counts[spec.key] = 0
+                if spec.dataset is CaptureDataset.MINUTE_BARS:
+                    def _write_bars(df: pd.DataFrame, coverage: dict[str, CoverageEntry], _interval: int = interval, _date: str = str(snap_date), _session: str = spec.session, _batch: int = batch_rows) -> int:
+                        return write_intraday_partition(
+                            df, _interval, _date, _session, coverage=coverage, batch_rows=_batch,
+                        )
+
+                    publishers[spec.key] = _BatchedPartitionPublisher(
+                        _write_bars,
+                        max_rows,
+                    )
+                else:
+                    def _write_ticks(df: pd.DataFrame, coverage: dict[str, CoverageEntry], _date: str = str(snap_date), _session: str = spec.session, _batch: int = batch_rows) -> int:
+                        return write_tick_partition(
+                            df, _date, _session, coverage=coverage, batch_rows=_batch,
+                        )
+
+                    publishers[spec.key] = _BatchedPartitionPublisher(
+                        _write_ticks,
+                        max_rows,
+                    )
+
+                def _make_observer(
+                    _key: str = spec.key,
+                    _entries: list[CoverageEntry] = entries,
+                    _publisher_key: str = spec.key,
+                ) -> Callable[[str, pd.DataFrame, CoverageEntry], None]:
+                    def _on_symbol(symbol: str, frame: pd.DataFrame, entry: CoverageEntry) -> None:
+                        _entries.append(entry)
+                        if _admit_for_write(_key, symbol, frame, entry):
+                            publishers[_publisher_key].add(symbol, frame, entry)
+                            counts[_publisher_key] += 0 if frame is None else len(frame)
+
+                    return _on_symbol
+
+                on_symbol = _make_observer()
+                await spec.collect(archive_run, list(targets), stream_run_id, on_symbol)
+                publishers[spec.key].flush()
+            for spec in active_specs:
+                manifest = _publish_task_manifest(
+                    store,
+                    trading_day=trading_day,
+                    run_id=run_ids[spec.key],
+                    dataset=spec.dataset,
+                    vendor=spec.manifest_vendor,
+                    session=spec.session,
+                    entries=entries_by_key[spec.key],
+                    expected_symbols=codes,
+                    roster_incomplete=not held.ok,
+                )
+                status = manifest.status.value if isinstance(manifest.status, CaptureStatus) else str(manifest.status)
+                logger.info(
+                    "[DATA] stage=intraday_archive_stream stream=%s date=%s status=%s targets=%d entries=%d rows=%d",
+                    spec.key,
+                    snap_date,
+                    status,
+                    len(targets_by_key[spec.key]),
+                    len(entries_by_key[spec.key]),
+                    counts[spec.key],
+                )
             collected_entries: list[CoverageEntry] = []
-            if do_regular:
-                collected_entries.extend(bar_entries)
-                collected_entries.extend(tick_entries)
-            if do_aftermarket:
-                collected_entries.extend(nxt_after_entries)
-                collected_entries.extend(nxt_pre_entries)
-                collected_entries.extend(krx_after_entries)
-                collected_entries.extend(krx_after_tick_entries)
-                collected_entries.extend(nxt_after_tick_entries)
+            for spec in active_specs:
+                collected_entries.extend(entries_by_key[spec.key])
             incomplete = prev_incomplete or any(
                 item.status not in GOOD_ENTRY_STATES
                 for item in collected_entries
             )
             if incomplete:
                 logger.warning("[DATA] stage=intraday_archive status=DEGRADED date=%s", snap_date)
-            n_bars = counts["bars"] if do_regular else 0
-            n_nxt = (counts["nxt_after"] + counts["nxt_pre"]) if do_aftermarket else 0
-            n_ticks = counts["ticks"] if do_regular else 0
-            return (n_bars, n_nxt, n_ticks)
+            slots = [0, 0, 0]
+            for spec in active_specs:
+                if spec.return_slot is not None:
+                    slots[spec.return_slot] += counts[spec.key]
+            return (slots[0], slots[1], slots[2])
 
     n_bars, n_nxt, n_ticks = asyncio.run(_run())
     if session_day.kind is SessionKind.SHIFTED:
@@ -628,24 +1013,6 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
             "archive_intraday", RUN_OUTCOME_DEGRADED, run_date=str(snap_date), reason="shifted_session_standard_window"
         )
     return (n_bars, n_nxt, n_ticks)
-
-
-def _fragment_context(trading_day: date, symbol: str, dataset: CaptureDataset, session: str = INTRADAY_SESSION_REGULAR) -> CaptureContext:
-    import uuid
-
-    return CaptureContext(
-        trading_date=trading_day,
-        run_id=f"archive-{trading_day.isoformat()}-fragments-{uuid.uuid4().hex[:6]}",
-        dataset=dataset,
-        vendor="owner-local",
-        endpoint="staged-fragment",
-        symbol=symbol,
-        venue="UNKNOWN",
-        session=session,
-        capture_reason="evening-archive",
-        cohort_id=None,
-        scheduled_at=None,
-    )
 
 
 def main() -> None:

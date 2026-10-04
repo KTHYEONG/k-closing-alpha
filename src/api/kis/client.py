@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import fcntl
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextvars import ContextVar
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from time import monotonic
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -27,6 +29,7 @@ from src.api.kis.key_pool import (
     token_cache_path,
 )
 from src.api.kis.rate_limit import get_host_rate_limiter, resolve_admission_dir
+from src.api.shared_token import TokenStoreLockTimeout
 
 if TYPE_CHECKING:
     from src.data.capture_contracts import BrokerPayload, PageObserver
@@ -47,6 +50,7 @@ def _now_kst() -> datetime:
 # 토큰 발급 단발 POST의 일시 전송 오류가 모든 KIS 잡을 중단시키지 않도록 전송 오류만 재시도한다(업무 오류 재시도는 EGW00133 1분 1회 발급 제한을 두드림).
 KIS_TOKEN_ISSUE_ATTEMPTS: int = 3
 KIS_TOKEN_ISSUE_BACKOFF_SEC: float = 1.0
+KIS_TOKEN_LOCK_POLL_SECONDS: float = 0.05
 
 
 def _format_rate(pct: float) -> str:
@@ -68,21 +72,21 @@ _RANKING_PARAM_DEFAULTS_UNVERIFIED: dict[str, str] = {
 class KisApiClient:
     def __init__(
         self,
-        app_key=None,
-        app_secret=None,
-        account_id=None,
-        hts_id=None,
-        base_url=None,
-        token_file=None,
-    ):
+        app_key: str | None = None,
+        app_secret: str | None = None,
+        account_id: str | None = None,
+        hts_id: str | None = None,
+        base_url: str | None = None,
+        token_file: str | os.PathLike[str] | None = None,
+    ) -> None:
         self.app_key = app_key or settings.KIS_API_CONFIG.get("app_key")
         self.app_secret = app_secret or settings.KIS_API_CONFIG.get("app_secret")
         self.account_id = account_id or settings.KIS_API_CONFIG.get("account_id")
         self.hts_id = hts_id or settings.KIS_API_CONFIG.get("hts_id")
         self.base_url = base_url or settings.KIS_BASE_URL
-        self.token = None
+        self.token: str | None = None
         self.token_file = str(token_file) if token_file else str(token_cache_path(self.app_key or "", settings.KIS_TOKEN_CACHE_DIR))
-        self._market_div_cache = {}
+        self._market_div_cache: dict[str, str] = {}
         self._token_lock: asyncio.Lock | None = None
         self.rate_limiter = get_host_rate_limiter(resolve_admission_dir() / f"tps_{kis_key_id(self.app_key or '')}.state", KIS_REST_TPS_PER_APP_KEY)
 
@@ -100,15 +104,15 @@ class KisApiClient:
         return aiohttp.ClientSession(timeout=request_timeout, connector=connector)
 
     @staticmethod
-    def _normalize_market_div_code(market_div_code):
+    def _normalize_market_div_code(market_div_code: object) -> str:
         if market_div_code is None:
             return ""
         code = str(market_div_code).strip().upper()
         return code if code in {"J", "NX", "UN"} else ""
 
-    def _market_div_candidates(self, preferred_market_div_code=None):
+    def _market_div_candidates(self, preferred_market_div_code: object = None) -> list[str]:
         preferred = self._normalize_market_div_code(preferred_market_div_code)
-        candidates = []
+        candidates: list[str] = []
         if preferred:
             candidates.append(preferred)
         for code in ("UN", "J", "NX"):
@@ -118,15 +122,15 @@ class KisApiClient:
 
     async def _request_with_market_div_fallback(
         self,
-        session,
-        url,
-        tr_id,
-        params,
-        market_div_param_key,
-        preferred_market_div_code=None,
-        require_non_empty_output2=False,
-    ):
-        last_res = {"rt_cd": "9", "msg1": "market_div fallback failed"}
+        session: aiohttp.ClientSession,
+        url: str,
+        tr_id: str,
+        params: dict[str, str],
+        market_div_param_key: str,
+        preferred_market_div_code: object = None,
+        require_non_empty_output2: bool = False,
+    ) -> tuple[dict[str, Any], str | None]:
+        last_res: dict[str, Any] = {"rt_cd": "9", "msg1": "market_div fallback failed"}
         for market_div_code in self._market_div_candidates(preferred_market_div_code):
             req_params = dict(params)
             req_params[market_div_param_key] = market_div_code
@@ -148,18 +152,29 @@ class KisApiClient:
         return last_res, None
 
     @contextlib.asynccontextmanager
-    async def _host_token_lock(self) -> AsyncIterator[None]:
-        """Serialize token issuance across processes sharing the host token cache.
+    async def _host_token_lock(self, deadline: float | None = None) -> AsyncIterator[None]:
+        """Serialize token issuance across processes sharing the host token cache, with a bounded wait.
 
         The cache directory is shared with other projects' containers that may run
         as a different uid and pre-create the sidecar lock file. flock only needs an
         open descriptor, so a lock file that exists but is not writable is opened
-        read-only instead of failing authentication.
+        read-only instead of failing authentication. Acquisition polls a
+        non-blocking flock on the event loop so a stuck foreign holder can neither
+        block decision-window authentication indefinitely nor pin an uncancellable
+        worker thread.
+
+        Args:
+            deadline: time.monotonic() instant after which waiting stops; None means
+                now + settings.KIS_TOKEN_LOCK_TIMEOUT_SECONDS. Callers that also
+                wait on the in-process token lock pass the deadline fixed at their
+                entry so queued coroutines share one bound.
 
         Raises:
-            OSError: The lock file can be neither opened read-write nor
-                read-only (e.g. mode 0600 owned by another uid, or a directory); logged with
-                `[SYS] stage=kis_token_lock status=UNOPENABLE` before raising.
+            OSError: The lock file can be neither opened read-write nor read-only;
+                logged with `[SYS] stage=kis_token_lock status=UNOPENABLE` before raising.
+                Also any flock error other than EWOULDBLOCK/EAGAIN.
+            TokenStoreLockTimeout: The lock was not obtained by the deadline; logged at
+                ERROR with `[SYS] stage=kis_token_lock status=TIMEOUT key_id=<id> timeout_s=<bound>`.
         """
         lock_path = self.token_file + ".lock"
         os.makedirs(os.path.dirname(os.path.abspath(self.token_file)), exist_ok=True)
@@ -179,8 +194,26 @@ class KisApiClient:
         except OSError:
             logger.warning("[SYS] stage=kis_token_lock status=UNOPENABLE key_id=%s", kis_key_id(self.app_key or ""))
             raise
+        key_id = kis_key_id(self.app_key or "")
+        timeout_s = settings.KIS_TOKEN_LOCK_TIMEOUT_SECONDS
+        if deadline is None:
+            deadline = monotonic() + timeout_s
         try:
-            await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                        raise
+                    if monotonic() >= deadline:
+                        logger.error(
+                            "[SYS] stage=kis_token_lock status=TIMEOUT key_id=%s timeout_s=%s",
+                            key_id,
+                            timeout_s,
+                        )
+                        raise TokenStoreLockTimeout(f"token lock not acquired within {timeout_s}s: key_id={key_id}") from None
+                    await asyncio.sleep(KIS_TOKEN_LOCK_POLL_SECONDS)
             try:
                 yield
             finally:
@@ -190,26 +223,22 @@ class KisApiClient:
 
     def _write_token_file(self, access_token: str, expired_at: str, issued_at: str = "") -> None:
         """토큰 캐시를 동일 디렉터리 임시 파일 + os.replace 원자적 교체로 기록한다 (0600)."""
-        import tempfile
+        from src.data.io_utils import atomic_write_text
 
-        dir_name = os.path.dirname(os.path.abspath(self.token_file))
-        os.makedirs(dir_name, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".kis_token_", suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(
+        atomic_write_text(
+            self.token_file,
+            json.dumps(
                 {
                     "access_token": access_token,
                     "expired_at": expired_at,
                     "app_key": self.app_key,
                     "issued_at": issued_at,
-                },
-                f,
-            )
-        os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, self.token_file)
-        os.chmod(self.token_file, 0o600)
+                }
+            ),
+            mode=0o600,
+        )
 
-    def _read_cache_payload(self) -> dict | None:
+    def _read_cache_payload(self) -> dict[str, Any] | None:
         if not os.path.exists(self.token_file):
             return None
         try:
@@ -219,7 +248,7 @@ class KisApiClient:
                 return None
             if saved_data.get("app_key") != self.app_key:
                 return None
-            return saved_data
+            return cast(dict[str, Any], saved_data)
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             logger.warning("[SYS] stage=kis_token_cache status=UNREADABLE reason=%s", type(exc).__name__)
             return None
@@ -256,7 +285,7 @@ class KisApiClient:
             "appsecret": self.app_secret,
         }
 
-        data: dict = {}
+        data: dict[str, Any] = {}
         for attempt in range(1, KIS_TOKEN_ISSUE_ATTEMPTS + 1):
             try:
                 async with session.post(url, headers=headers, json=body) as resp:
@@ -275,7 +304,8 @@ class KisApiClient:
                     return False
             raise RuntimeError(f"토큰 발급 실패: {data}")
 
-        self.token = data["access_token"]
+        issued: str = data["access_token"]
+        self.token = issued
         expires_in = data.get("expires_in", 86400)
         now = _now_kst()
         # expired_at/issued_at 모두 동일한 aware KST 시각(now)에서 파생시킨다 --
@@ -296,7 +326,7 @@ class KisApiClient:
                 kis_key_id(self.app_key or ""),
                 now.isoformat(timespec="seconds"),
             )
-        self._write_token_file(self.token, expired_at_str, issued_at=now.isoformat(timespec="seconds"))
+        self._write_token_file(issued, expired_at_str, issued_at=now.isoformat(timespec="seconds"))
         logger.info(
             "[SYS] stage=kis_token status=ISSUED key_id=%s expired_at=%s",
             kis_key_id(self.app_key or ""),
@@ -304,19 +334,64 @@ class KisApiClient:
         )
         return True
 
-    async def ensure_token(self, session: aiohttp.ClientSession, force_refresh: bool = False):
-        """토큰 유효성을 확인하고 필요시 갱신합니다 (단일비행 + 원자적 0600 쓰기)."""
-        if not force_refresh:
+    async def ensure_token(
+        self,
+        session: aiohttp.ClientSession,
+        force_refresh: bool = False,
+        *,
+        rejected_token: str | None = None,
+    ) -> str | None:
+        """Return a usable access token, issuing at most once per rotation host-wide.
+
+        Refresh after a vendor auth rejection is a compare-and-swap: a new token is
+        issued only when the cache still holds the token that was rejected. Any other
+        usable cached token means a sibling coroutine or another process already
+        rotated it, so it is adopted without a POST (KIS allows one issuance per
+        minute and every decision-window issuance is an operational incident).
+
+        Args:
+            session: aiohttp session used only if issuance is required.
+            force_refresh: Legacy alias for a rejection refresh where the rejected
+                token is this client's token as of the call (captured before any lock
+                wait); "" when the client holds none.
+            rejected_token: The exact token sent with the rejected request ("" when
+                none was sent). Takes precedence over force_refresh.
+
+        Returns:
+            The token now held in self.token.
+
+        Raises:
+            TokenStoreLockTimeout: Host lock not obtained within the bound fixed at entry.
+            OSError: Lock file unopenable.
+            RuntimeError: Issuance failed without a usable fallback (from _issue_token).
+            aiohttp.ClientError | TimeoutError: Transport failure after issuance retries.
+        """
+        if rejected_token is not None:
+            refresh_token: str | None = rejected_token
+        elif force_refresh:
+            refresh_token = self.token if isinstance(self.token, str) else ""
+        else:
+            refresh_token = None
+        if self._token_lock is None:
+            self._token_lock = asyncio.Lock()
+        deadline = monotonic() + settings.KIS_TOKEN_LOCK_TIMEOUT_SECONDS
+        if refresh_token is None:
             cached = self._read_cached_token()
             if cached is not None:
                 self.token = cached
                 return self.token
-        if self._token_lock is None:
-            self._token_lock = asyncio.Lock()
-        async with self._token_lock, self._host_token_lock():
+            async with self._token_lock, self._host_token_lock(deadline):
+                cached = self._read_cached_token()
+                if cached is not None:
+                    self.token = cached
+                    return self.token
+                await self._issue_token(session)
+                return self.token
+        async with self._token_lock, self._host_token_lock(deadline):
             cached = self._read_cached_token()
-            if cached is not None and (not force_refresh or cached != self.token):
+            if cached is not None and cached != refresh_token:
                 self.token = cached
+                logger.info("[SYS] stage=kis_token status=ADOPTED_ROTATED key_id=%s", kis_key_id(self.app_key or ""))
                 return self.token
             await self._issue_token(session)
             return self.token
@@ -324,7 +399,8 @@ class KisApiClient:
     async def issue_daily_token(self, session: aiohttp.ClientSession) -> bool:
         if self._token_lock is None:
             self._token_lock = asyncio.Lock()
-        async with self._token_lock, self._host_token_lock():
+        deadline = monotonic() + settings.KIS_TOKEN_LOCK_TIMEOUT_SECONDS
+        async with self._token_lock, self._host_token_lock(deadline):
             payload = self._read_cache_payload()
             cached = self._read_cached_token()
             if (
@@ -336,7 +412,7 @@ class KisApiClient:
                 return False
             return await self._issue_token(session)
 
-    def _get_headers(self, tr_id):
+    def _get_headers(self, tr_id: str) -> dict[str, Any]:
         """공통 헤더 생성"""
         return {
             "content-type": "application/json",
@@ -347,7 +423,7 @@ class KisApiClient:
             "custtype": "P",
         }
 
-    async def _handle_request(self, session_method, url, **kwargs):
+    async def _handle_request(self, session_method: Callable[..., Any], url: str, **kwargs: Any) -> dict[str, Any]:
         """재시도 로직을 포함한 공통 요청 처리 (네트워크 및 토큰 재발급 에러 처리 강화)"""
         import aiohttp
 
@@ -358,6 +434,8 @@ class KisApiClient:
             await self.rate_limiter.acquire()
             try:
                 # 최신 토큰으로 headers의 authorization 동기화
+                sent = self.token
+                sent_token = sent if isinstance(sent, str) else ""
                 if "headers" in kwargs and isinstance(kwargs["headers"], dict):
                     kwargs["headers"]["authorization"] = f"Bearer {self.token}"
 
@@ -390,8 +468,13 @@ class KisApiClient:
                         and session
                         and attempt < 2
                     ):
-                        logger.warning("유효하지 않은 토큰 감지 (%s). 토큰 강제 재발급 진행...", msg_cd or msg1)
-                        await self.ensure_token(session, force_refresh=True)
+                        logger.warning(
+                            "[SYS] stage=kis_token status=AUTH_REJECTED key_id=%s msg_cd=%s attempt=%d",
+                            kis_key_id(self.app_key or ""),
+                            msg_cd,
+                            attempt,
+                        )
+                        await self.ensure_token(session, rejected_token=sent_token)
                         await asyncio.sleep(0.2)
                         continue
 
@@ -399,7 +482,7 @@ class KisApiClient:
                     if data.get("rt_cd") != "0" and "초당 거래건수" in msg1:
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
-                    return data
+                    return cast(dict[str, Any], data)
             # aiohttp 세션 total 타임아웃은 ClientError가 아닌 TimeoutError로 올라와, 잡지 않으면 단일 지연 요청이 배치 전체를 중단시킨다
             except (aiohttp.ClientError, TimeoutError) as e:
                 received = _now_kst()
@@ -451,7 +534,9 @@ class KisApiClient:
         finally:
             _SCOPED_MARKET_OBSERVER.reset(token)
 
-    async def get_current_price(self, session, code, market_div_code=None, allow_market_div_fallback=True):
+    async def get_current_price(
+        self, session: aiohttp.ClientSession, code: str, market_div_code: str | None = None, allow_market_div_fallback: bool = True
+    ) -> dict[str, Any]:
         """주식 현재가 시세 조회 (FHKST01010100)"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
         if not allow_market_div_fallback:
@@ -478,7 +563,9 @@ class KisApiClient:
             self._market_div_cache[code] = used_market_div
         return res
 
-    async def get_program_net_buy(self, session, code, market_div_code=None):
+    async def get_program_net_buy(
+        self, session: aiohttp.ClientSession, code: str, market_div_code: str | None = None
+    ) -> dict[str, Any]:
         """종목별 프로그램 매매 추이 (FHPPG04650101)"""
         url = (
             f"{self.base_url}/uapi/domestic-stock/v1/quotations/program-trade-by-stock"
@@ -497,7 +584,9 @@ class KisApiClient:
             self._market_div_cache[code] = used_market_div
         return res
 
-    async def get_market_index_rate(self, session, market_code):
+    async def get_market_index_rate(
+        self, session: aiohttp.ClientSession, market_code: str
+    ) -> dict[str, Any]:
         """시장 지수 등락률 조회 (FHKUP03500100) - 최근 5일"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice"
         now = datetime.now()
@@ -516,8 +605,8 @@ class KisApiClient:
         )
 
     async def get_market_index_history(
-        self, session, market_code, start_date, end_date, period_code="D"
-    ):
+        self, session: aiohttp.ClientSession, market_code: str, start_date: str, end_date: str, period_code: str = "D"
+    ) -> dict[str, Any]:
         """시장 지수/업종 기간별 시세 조회 (FHKUP03500100) - 기간 지정 가능
         market_code: 업종/지수 코드 (KOSPI: 0001, KOSDAQ: 1001, V-KOSPI: 200 등)
         start_date: YYYYMMDD
@@ -537,7 +626,9 @@ class KisApiClient:
             session.get, url, headers=self._get_headers("FHKUP03500100"), params=params
         )
 
-    async def get_investor_trend_estimate(self, session, code):
+    async def get_investor_trend_estimate(
+        self, session: aiohttp.ClientSession, code: str
+    ) -> dict[str, Any]:
         """외인/기관 추정가집계 (HHPTJ04160200)"""
         url = (
             f"{self.base_url}/uapi/domestic-stock/v1/quotations/investor-trend-estimate"
@@ -549,14 +640,14 @@ class KisApiClient:
 
     async def get_stock_ohlcv_history(
         self,
-        session,
-        stock_code,
-        start_date,
-        end_date,
-        period_code="D",
-        adj_price="0",
-        market_div_code=None,
-    ):
+        session: aiohttp.ClientSession,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        period_code: str = "D",
+        adj_price: str = "0",
+        market_div_code: str | None = None,
+    ) -> dict[str, Any]:
         """국내주식 기간별 시세 조회 (FHKST03010100)
         
         Args:
@@ -610,7 +701,7 @@ class KisApiClient:
             return s
 
     @staticmethod
-    def _intraday_row_hour(row: dict) -> str:
+    def _intraday_row_hour(row: dict[str, Any]) -> str:
         val = row.get("stck_cntg_hour")
         if val is None:
             for key in ("cntg_hour", "stck_cntg_hour_tm", "bsop_hour", "hour"):
@@ -621,19 +712,19 @@ class KisApiClient:
 
     async def get_intraday_minute_chart(
         self,
-        session,
+        session: aiohttp.ClientSession,
         code: str,
         bar_interval_minutes: int = 1,
         end_hour: str = "153000",
         floor_hour: str = "090000",
         market_div_code: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """주식당일분봉조회(FHKST03010200)를 30건/호출 제한 하 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합."""
         normalized = self._normalize_market_div_code(market_div_code)
         if not normalized:
             raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
-        collected: list[dict] = []
+        collected: list[dict[str, Any]] = []
         seen_hours: set[str] = set()
         cursor_hour = end_hour
         for _ in range(20):
@@ -655,7 +746,7 @@ class KisApiClient:
             rows = res.get("output2") or []
             if not rows:
                 break
-            new_rows: list[dict] = []
+            new_rows: list[dict[str, Any]] = []
             for row in rows:
                 hour = self._intraday_row_hour(row)
                 if hour and hour not in seen_hours:
@@ -673,8 +764,14 @@ class KisApiClient:
         return {"rt_cd": "0", "output2": in_range}
 
     async def get_intraday_trade_ticks(
-        self, session, code: str, floor_hour: str = "090000", end_hour: str = "153000", market_div_code: str | None = None, max_pages: int = 2000
-    ) -> dict:
+        self,
+        session: aiohttp.ClientSession,
+        code: str,
+        floor_hour: str = "090000",
+        end_hour: str = "153000",
+        market_div_code: str | None = None,
+        max_pages: int = 2000,
+    ) -> dict[str, Any]:
         """주식현재가 당일시간대별체결(FHPST01060000)을 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합.
 
         The payload carries `floor_reached`: True only when a fetched page contained
@@ -685,10 +782,10 @@ class KisApiClient:
         if not normalized:
             raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemconclusion"
-        collected: list[dict] = []
+        collected: list[dict[str, Any]] = []
         seen_vols: set[str] = set()
         cursor_hour = "" if end_hour == "153000" else end_hour
-        session_get = getattr(session, "get", None)
+        session_get = cast(Callable[..., Any], getattr(session, "get", None))
         floor_reached = False
         for _ in range(max_pages):
             params = {
@@ -707,7 +804,7 @@ class KisApiClient:
             rows = res.get("output2") or []
             if not rows:
                 break
-            new_rows: list[dict] = []
+            new_rows: list[dict[str, Any]] = []
             for row in rows:
                 vol_key = str(row.get("acml_vol") or "").strip()
                 if vol_key and vol_key not in seen_vols:
@@ -732,8 +829,8 @@ class KisApiClient:
         return {"rt_cd": "0", "output2": in_range, "floor_reached": floor_reached}
 
     async def get_orderbook_snapshot(
-        self, session, code: str, market_div_code: str | None = None
-    ) -> dict:
+        self, session: aiohttp.ClientSession, code: str, market_div_code: str | None = None
+    ) -> dict[str, Any]:
         """주식현재가 호가/예상체결(FHKST01010200) 조회."""
         normalized = self._normalize_market_div_code(market_div_code)
         if not normalized:
@@ -748,8 +845,8 @@ class KisApiClient:
         )
 
     async def get_daily_short_sale_history(
-        self, session, code: str, start_date: str, end_date: str, market_div_code: str | None = None
-    ) -> dict:
+        self, session: aiohttp.ClientSession, code: str, start_date: str, end_date: str, market_div_code: str | None = None
+    ) -> dict[str, Any]:
         """국내주식 공매도 일별추이(FHPST04830000)를 [start_date, end_date](YYYYMMDD) 구간 역순 페이지네이션으로 취합.
 
         KIS 자체 보관이며 2020-01-10까지 5년+ 정상 조회됨(2026-09-04 라이브 프로브, rt_cd=0).
@@ -762,7 +859,7 @@ class KisApiClient:
         if not normalized:
             raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/daily-short-sale"
-        collected: list[dict] = []
+        collected: list[dict[str, Any]] = []
         seen_dates: set[str] = set()
         cursor_end = end_date
         for _ in range(60):
@@ -782,7 +879,7 @@ class KisApiClient:
             rows = res.get("output2") or []
             if not rows:
                 break
-            new_rows: list[dict] = []
+            new_rows: list[dict[str, Any]] = []
             for row in rows:
                 day = str(row.get("stck_bsop_date") or "").strip()
                 if day and day not in seen_dates:
@@ -809,14 +906,14 @@ class KisApiClient:
 
     async def get_historical_minute_chart(
         self,
-        session,
+        session: aiohttp.ClientSession,
         code: str,
         target_date: str,
         bar_interval_minutes: int = 1,
         end_hour: str = "153000",
         floor_hour: str = "090000",
         market_div_code: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """주식일별분봉조회(FHKST03010230)를 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합.
 
         target_date는 KIS 표준 YYYYMMDD 형식 문자열을 그대로 FID_INPUT_DATE_1에 전달한다.
@@ -827,7 +924,7 @@ class KisApiClient:
         if not normalized:
             raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice"
-        collected: list[dict] = []
+        collected: list[dict[str, Any]] = []
         seen_hours: set[str] = set()
         cursor_hour = end_hour
         for _ in range(20):
@@ -850,7 +947,7 @@ class KisApiClient:
             rows = res.get("output2") or []
             if not rows:
                 break
-            new_rows: list[dict] = []
+            new_rows: list[dict[str, Any]] = []
             for row in rows:
                 hour = self._intraday_row_hour(row)
                 if hour and hour not in seen_hours:
@@ -868,14 +965,14 @@ class KisApiClient:
         return {"rt_cd": "0", "output2": in_range}
 
     async def get_daily_credit_balance_history(
-        self, session, code: str, start_date: str, end_date: str, market_div_code: str | None = None
-    ) -> dict:
+        self, session: aiohttp.ClientSession, code: str, start_date: str, end_date: str, market_div_code: str | None = None
+    ) -> dict[str, Any]:
         """국내주식 신용잔고 일별추이(FHPST04760000)를 [start_date, end_date] 구간 역순 페이지네이션으로 취합."""
         normalized = self._normalize_market_div_code(market_div_code)
         if not normalized:
             raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/daily-credit-balance"
-        collected: list[dict] = []
+        collected: list[dict[str, Any]] = []
         seen_dates: set[str] = set()
         cursor = end_date
         for _ in range(120):
@@ -895,7 +992,7 @@ class KisApiClient:
             rows = res.get("output") or res.get("output2") or []
             if not rows:
                 break
-            new_rows: list[dict] = []
+            new_rows: list[dict[str, Any]] = []
             for row in rows:
                 day = str(row.get("deal_date") or "").strip()
                 if day and day not in seen_dates:
@@ -921,14 +1018,14 @@ class KisApiClient:
         return {"rt_cd": "0", "output": in_range}
 
     async def get_program_trade_daily_history(
-        self, session, code: str, start_date: str, end_date: str, market_div_code: str | None = None
-    ) -> dict:
+        self, session: aiohttp.ClientSession, code: str, start_date: str, end_date: str, market_div_code: str | None = None
+    ) -> dict[str, Any]:
         """종목별 프로그램매매추이(일별)(FHPPG04650201)를 [start_date, end_date] 구간 역순 페이지네이션으로 취합."""
         normalized = self._normalize_market_div_code(market_div_code)
         if not normalized:
             raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily"
-        collected: list[dict] = []
+        collected: list[dict[str, Any]] = []
         seen_dates: set[str] = set()
         cursor = end_date
         for _ in range(120):
@@ -947,7 +1044,7 @@ class KisApiClient:
             rows = res.get("output") or res.get("output2") or []
             if not rows:
                 break
-            new_rows: list[dict] = []
+            new_rows: list[dict[str, Any]] = []
             for row in rows:
                 day = str(row.get("stck_bsop_date") or "").strip()
                 if day and day not in seen_dates:
@@ -973,8 +1070,14 @@ class KisApiClient:
         return {"rt_cd": "0", "output": in_range}
 
     async def get_fluctuation_ranking(
-        self, session, *, rate_min_pct: float, rate_max_pct: float, market_div_code: str | None = None, input_cnt: str = "100"
-    ) -> dict:
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        rate_min_pct: float,
+        rate_max_pct: float,
+        market_div_code: str | None = None,
+        input_cnt: str = "100",
+    ) -> dict[str, Any]:
         normalized = self._normalize_market_div_code(market_div_code)
         if not normalized:
             raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")

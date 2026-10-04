@@ -149,6 +149,7 @@ def test_run_topk_ranker_sleeve_uses_stored_admitted_without_recompute(monkeypat
         "kospi": [0.52] * 4,
         "kosdaq": [-0.31] * 4,
         "v_kospi": [15.2] * 4,
+        "지수_실패": [False] * 4,
         "admitted": [True, True, True, False],
     })
     bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
@@ -318,6 +319,7 @@ def _sleeve_wide_and_history():
         "kospi": [0.52] * 4,
         "kosdaq": [-0.31] * 4,
         "v_kospi": [15.2] * 4,
+        "지수_실패": [False] * 4,
         "admitted": [True, True, True, False],
     })
     decision = pd.Timestamp("2026-09-09")
@@ -825,6 +827,7 @@ def test_run_topk_ranker_sleeve_emits_scored_rank_pool_to_callback(monkeypatch) 
         "kospi": [0.52] * 4,
         "kosdaq": [-0.31] * 4,
         "v_kospi": [15.2] * 4,
+        "지수_실패": [False] * 4,
         "admitted": [True, True, True, False],
     })
     bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
@@ -1077,6 +1080,7 @@ def test_sleeve_binds_inference_cutoff_and_provenance(monkeypatch) -> None:
         "외국인_순매수": [5.0, 12.0, -3.0, 6.0],
         "시장구분": ["KOSPI"] * 4,
         "kospi": [0.52] * 4, "kosdaq": [-0.31] * 4, "v_kospi": [15.2] * 4,
+        "지수_실패": [False] * 4,
         "admitted": [True, True, True, False],
         "capture_run_id": ["run-early"] * 4,
         "cohort_id": ["cohort-x"] * 4,
@@ -1348,3 +1352,258 @@ def test_persist_topk_decision_merges_readable_history(tmp_path, monkeypatch) ->
     saved = pd.read_parquet(tmp_path / "topk_decisions.parquet")
     assert set(saved["decision_date"].astype(str).unique()) == {"2026-09-09", "2026-09-10"}
     assert saved.loc[saved["symbol"] == "000001", "name"].iloc[-1] == "AAA-new"
+
+
+def test_run_topk_ranker_sleeve_no_decision_on_index_failure(monkeypatch, caplog) -> None:
+    import logging
+
+    import src.daily.predict as predict_mod
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    wide, _hist, decision = _sleeve_wide_and_history()
+    wide["지수_실패"] = True
+    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+    failures: list[Exception] = []
+
+    with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
+        out = predict_mod.run_topk_ranker_sleeve(decision, on_failure=failures.append)
+
+    assert out.empty
+    assert len(failures) == 1 and isinstance(failures[0], ValueError)
+    messages = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any("stage=topk_sleeve" in m and "status=NO_DECISION" in m for m in messages)
+
+
+def test_run_topk_ranker_sleeve_no_decision_on_invalid_vkospi(monkeypatch, caplog) -> None:
+    import logging
+
+    import numpy as np
+
+    import src.daily.predict as predict_mod
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+    for bad in (float("nan"), 0.0):
+        wide, _hist, decision = _sleeve_wide_and_history()
+        wide["v_kospi"] = np.full(len(wide), bad)
+        monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, _w=wide, **_kw: _w)
+        failures: list[Exception] = []
+        with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
+            out = predict_mod.run_topk_ranker_sleeve(decision, on_failure=failures.append)
+        assert out.empty
+        assert len(failures) == 1 and isinstance(failures[0], ValueError)
+    messages = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any("stage=topk_sleeve" in m and "status=NO_DECISION" in m for m in messages)
+
+
+def test_run_topk_ranker_sleeve_no_decision_without_index_flag(monkeypatch, caplog) -> None:
+    import logging
+
+    import src.daily.predict as predict_mod
+    from src.ml.research.v3_engine import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    wide, _hist, decision = _sleeve_wide_and_history()
+    wide = wide.drop(columns=["지수_실패"])
+    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+    failures: list[Exception] = []
+
+    with caplog.at_level(logging.WARNING, logger=predict_mod.logger.name):
+        out = predict_mod.run_topk_ranker_sleeve(decision, on_failure=failures.append)
+
+    assert out.empty
+    assert len(failures) == 1 and isinstance(failures[0], ValueError)
+    messages = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any("stage=topk_sleeve" in m and "status=NO_DECISION" in m for m in messages)
+
+
+def test_validate_index_inputs_contract() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    import src.daily.predict as predict_mod
+
+    def _frame(flag_values, v_values):
+        return pd.DataFrame({"지수_실패": list(flag_values), "v_kospi": list(v_values)})
+
+    ok = _frame([False, np.bool_(False)], [15.2, 20.0])
+    before = ok.copy(deep=True)
+    predict_mod.validate_index_inputs(ok)
+    pd.testing.assert_frame_equal(ok, before)
+
+    empty = pd.DataFrame({"지수_실패": pd.Series([], dtype=bool), "v_kospi": pd.Series([], dtype=float)})
+    predict_mod.validate_index_inputs(empty)
+
+    with pytest.raises(ValueError, match="지수_실패"):
+        predict_mod.validate_index_inputs(_frame([True, False], [15.2, 15.2]))
+    with pytest.raises(ValueError, match="지수_실패"):
+        predict_mod.validate_index_inputs(_frame([None, False], [15.2, 15.2]))
+    with pytest.raises(ValueError, match="지수_실패"):
+        predict_mod.validate_index_inputs(_frame([np.nan, False], [15.2, 15.2]))
+    with pytest.raises(ValueError, match="v_kospi"):
+        predict_mod.validate_index_inputs(_frame([False, False], [float("nan"), 15.2]))
+    with pytest.raises(ValueError, match="v_kospi"):
+        predict_mod.validate_index_inputs(_frame([False, False], [0.0, 15.2]))
+    with pytest.raises(ValueError, match="지수_실패"):
+        predict_mod.validate_index_inputs(pd.DataFrame({"v_kospi": [15.2]}))
+    with pytest.raises(ValueError, match="v_kospi"):
+        predict_mod.validate_index_inputs(pd.DataFrame({"지수_실패": [False]}))
+
+
+def _hold_predict_sidecar(target, monkeypatch) -> object:
+    import contextlib
+    import fcntl
+
+    from src.data import io_utils
+    from src.utils.file_lock import sidecar_lock_path
+
+    monkeypatch.setattr(io_utils, "STORE_LOCK_TIMEOUT_SECONDS", 0.0)
+
+    @contextlib.contextmanager
+    def _guard():
+        lock_path = sidecar_lock_path(target)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = open(lock_path, "w")  # noqa: PTH123, SIM115 - lock held across the block
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+
+    return _guard()
+
+
+def _sleeve_frame(symbols: list[str]) -> pd.DataFrame:
+    import pandas as pd
+
+    return pd.DataFrame({
+        "symbol": symbols,
+        "name": [f"N-{s}" for s in symbols],
+        "pred": [0.02] * len(symbols),
+        "allocation": [1.0 / len(symbols)] * len(symbols),
+    })
+
+
+def _pool_frame(symbols: list[str]) -> pd.DataFrame:
+    import pandas as pd
+
+    return pd.DataFrame({
+        "symbol": symbols,
+        "pred": [0.02] * len(symbols),
+        "rank": list(range(1, len(symbols) + 1)),
+        "selected": [True] * len(symbols),
+        "model_version": ["S@C"] * len(symbols),
+    })
+
+
+def _interleaved_persist(monkeypatch, persist_fn, run_b, wrap_attr: str) -> dict:
+    import threading
+    import time
+
+    import src.daily.predict as predict_mod
+
+    real_write = getattr(predict_mod, wrap_attr)
+    state: dict = {"calls": 0}
+
+    def _wrapping(merged, target):
+        if state["calls"] == 0:
+            state["calls"] += 1
+
+            def _run() -> None:
+                try:
+                    run_b()
+                except BaseException as exc:  # noqa: BLE001 - surfaced to the main thread
+                    state["error"] = exc
+
+            worker = threading.Thread(target=_run)
+            state["worker"] = worker
+            worker.start()
+            time.sleep(0.5)
+            state["blocked"] = worker.is_alive()
+        return real_write(merged, target)
+
+    monkeypatch.setattr(predict_mod, wrap_attr, _wrapping)
+    persist_fn()
+    worker = state["worker"]
+    worker.join(timeout=30)
+    state["joined"] = not worker.is_alive()
+    return state
+
+
+def test_interleaved_topk_persists_both_survive(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+    d1, d2 = pd.Timestamp("2026-09-10"), pd.Timestamp("2026-09-11")
+
+    state = _interleaved_persist(
+        monkeypatch,
+        lambda: predict_mod.persist_topk_decision(d1, _sleeve_frame(["000001"])),
+        lambda: predict_mod.persist_topk_decision(d2, _sleeve_frame(["000002"])),
+        "atomic_write_parquet",
+    )
+
+    assert state.get("error") is None
+    assert state["blocked"] is True
+    assert state["joined"] is True
+    saved = pd.read_parquet(tmp_path / "topk_decisions.parquet")
+    assert set(saved["decision_date"]) == {"2026-09-10", "2026-09-11"}
+
+
+def test_interleaved_rank_pool_persists_both_survive(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.daily.predict as predict_mod
+
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+    d1, d2 = pd.Timestamp("2026-09-10"), pd.Timestamp("2026-09-11")
+
+    state = _interleaved_persist(
+        monkeypatch,
+        lambda: predict_mod.persist_rank_pool_predictions(d1, _pool_frame(["000001"]), code_commit="aaa"),
+        lambda: predict_mod.persist_rank_pool_predictions(d2, _pool_frame(["000002"]), code_commit="bbb"),
+        "atomic_write_parquet",
+    )
+
+    assert state.get("error") is None
+    assert state["blocked"] is True
+    assert state["joined"] is True
+    saved = pd.read_parquet(tmp_path / "rank_pool_predictions.parquet")
+    assert set(saved["decision_date"]) == {"2026-09-10", "2026-09-11"}
+
+
+def test_topk_persist_lock_timeout_fails_closed(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    import pytest
+
+    import src.daily.predict as predict_mod
+    from src.data.io_utils import StoreLockTimeoutError
+
+    monkeypatch.setattr(predict_mod.settings, "PARQUET_DIR", tmp_path)
+    target = tmp_path / "topk_decisions.parquet"
+    before = None
+    if target.exists():
+        before = target.read_bytes()
+
+    with (
+        _hold_predict_sidecar(target, monkeypatch),
+        pytest.raises(StoreLockTimeoutError),
+    ):
+        predict_mod.persist_topk_decision(pd.Timestamp("2026-09-10"), _sleeve_frame(["000001"]))
+
+    if before is None:
+        assert not target.exists()
+    else:
+        assert target.read_bytes() == before

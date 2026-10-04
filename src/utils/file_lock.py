@@ -32,6 +32,15 @@ def sidecar_lock_path(target: Path) -> Path:
     return target.parent / (target.name + ".lock")
 
 
+def _open_sidecar(path: Path) -> int:
+    # flock needs only an open descriptor: a 0644 sidecar left by another uid (a crashed root-run
+    # manual job) stays lockable read-only, and unlinking it needs directory, not file, permission.
+    try:
+        return os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except PermissionError:
+        return os.open(path, os.O_RDONLY)
+
+
 @contextlib.contextmanager
 def exclusive_file_lock(path: Path, *, timeout_seconds: float, purpose: str) -> Iterator[None]:
     """Hold a crash-safe, cross-process exclusive lock on ``path`` for the block.
@@ -61,9 +70,12 @@ def exclusive_file_lock(path: Path, *, timeout_seconds: float, purpose: str) -> 
     Yields:
         None, while the lock is held.
 
+    A sidecar owned by another uid is opened read-only; one this uid cannot open at all is
+    treated as held until the deadline.
+
     Raises:
         TimeoutError: The lock was not acquired within ``timeout_seconds``.
-            The message is ``"timed out acquiring {purpose} lock: {path}"``.
+            The message starts with ``"timed out acquiring {purpose} lock"``.
         OSError: Unexpected ``open``/``flock`` failure (any errno other than
             contention), propagated unchanged.
     """
@@ -74,7 +86,15 @@ def exclusive_file_lock(path: Path, *, timeout_seconds: float, purpose: str) -> 
     path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout_seconds
     while True:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fd = _open_sidecar(path)
+        except PermissionError:
+            # Neither writable nor readable by this uid (a foreign 0600 leftover or live holder):
+            # exclusion cannot be proven, so wait like contention and fail closed at the deadline.
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out acquiring {purpose} lock (lock file not accessible): {path}") from None
+            time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+            continue
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:

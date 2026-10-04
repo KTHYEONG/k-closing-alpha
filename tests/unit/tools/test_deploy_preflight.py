@@ -76,6 +76,18 @@ def test_check_bundle_serving_compat_reports_all_issues_together() -> None:
     assert len(issues) == 3
 
 
+def test_check_bundle_serving_compat_reports_feature_contract_drift() -> None:
+    from src.tools.deploy_preflight import check_bundle_serving_compat
+
+    bundle = _compatible_bundle()
+    bundle["feature_contract_version"] = "0"
+
+    issues = check_bundle_serving_compat(bundle)
+
+    assert len(issues) == 1
+    assert issues[0].startswith("feature contract:")
+
+
 def test_main_fails_when_bundle_missing(tmp_path) -> None:
     import pytest
 

@@ -20,8 +20,10 @@ from src.config.market_session import (
     INTRADAY_SESSION_KRX_AFTERMARKET,
     INTRADAY_SESSION_NXT_AFTERMARKET,
     KRX_AFTERMARKET_HOUR_FLOOR,
+    KRX_CLOSE_MARKET_DIV_CODE,
     NXT_AFTERMARKET_HOUR_CEIL,
     NXT_AFTERMARKET_HOUR_FLOOR,
+    NXT_MARKET_DIV_CODE,
 )
 from src.data.capture_contracts import (
     GOOD_ENTRY_STATES,
@@ -38,12 +40,13 @@ from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day
+from src.execution.paper_broker import HeldRoster, load_held_roster
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
 _VENUE_SESSION: dict[str, str] = {"KRX": INTRADAY_SESSION_KRX_AFTERMARKET, "NXT": INTRADAY_SESSION_NXT_AFTERMARKET}
-_VENUE_DIV_CODE: dict[str, str] = {"KRX": "J", "NXT": "NX"}
+_VENUE_DIV_CODE: dict[str, str] = {"KRX": KRX_CLOSE_MARKET_DIV_CODE, "NXT": NXT_MARKET_DIV_CODE}
 _DENSE_REASON = "aftermarket-dense"
 _SPARSE_REASON = "aftermarket-sparse"
 
@@ -136,21 +139,13 @@ def _rank_pool_symbols(snapshot_date: str, rank_pool_path: Path | None) -> tuple
     return tuple(codes) if codes else None
 
 
-def _position_symbols() -> tuple[str, ...]:
-    try:
-        from src.execution.paper_broker import PaperLedger
-
-        frame = PaperLedger().load_open_positions()
-    except Exception as exc:
-        logger.warning("[DATA] stage=aftermarket_book status=paper_unavailable reason=%s", type(exc).__name__)
-        return ()
-    if frame is None or frame.empty or "symbol" not in frame.columns:
-        return ()
-    return tuple(sorted({str(item).strip().zfill(6) for item in frame["symbol"].astype(str).tolist() if str(item).strip()}))
-
-
 def resolve_book_universes(
-    snapshot_date: str, *, store: CaptureStore, now: datetime, rank_pool_path: Path | None = None
+    snapshot_date: str,
+    *,
+    store: CaptureStore,
+    now: datetime,
+    held: HeldRoster,
+    rank_pool_path: Path | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Resolve the dense (rank pool plus positions) and sparse (cohort plus dense) universes.
 
@@ -158,12 +153,20 @@ def resolve_book_universes(
         snapshot_date: KST trading date being observed.
         store: Capture store holding the day's declared cohort.
         now: Aware point-in-time cutoff for cohort visibility.
+        held: Open-lot roster read once by the caller; a not-ok roster is logged here and
+            must be propagated by the caller as ``roster_incomplete``.
         rank_pool_path: Rank-pool parquet override (tests); None uses the production path.
 
     Returns:
         Sorted unique ``(dense_symbols, sparse_symbols)`` 6-char code tuples.
     """
-    positions = _position_symbols()
+    positions = held.symbols
+    if not held.ok:
+        logger.warning(
+            "[DATA] stage=aftermarket_book status=INCOMPLETE reason=held_roster_unavailable error=%s date=%s",
+            held.failure_reason,
+            snapshot_date,
+        )
     pool = _rank_pool_symbols(snapshot_date, rank_pool_path)
     if pool is None:
         logger.warning("[DATA] stage=aftermarket_book rank_pool=MISSING date=%s", snapshot_date)
@@ -218,6 +221,7 @@ async def run_aftermarket_book_capture(
     clients: Sequence[Any],
     dense_symbols: Sequence[str],
     sparse_symbols: Sequence[str],
+    roster_incomplete: bool = False,
     now_fn: Callable[[], datetime] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] | None = None,
 ) -> tuple[CaptureManifest, ...]:
@@ -236,6 +240,9 @@ async def run_aftermarket_book_capture(
         clients: Token-ready KIS clients bound to the aftermarket book slots.
         dense_symbols: Dense universe (rank pool and open positions).
         sparse_symbols: Sparse universe (full cohort and dense universe).
+        roster_incomplete: True when the held-position roster could not be fully read;
+            every published manifest is then PARTIAL because the dense universe may be
+            missing held lots.
         now_fn: Aware clock; None uses Asia/Seoul now.
         sleep_fn: Wait primitive; None uses asyncio.sleep.
 
@@ -269,7 +276,7 @@ async def run_aftermarket_book_capture(
     nx_unlisted: set[str] = set()
     nx_listing_evidence: dict[str, tuple[Any, datetime | None, datetime | None]] = {}
     manifests: list[CaptureManifest] = []
-    buffer: list[dict] = []
+    buffer: list[dict[str, Any]] = []
     rows_total = 0
     sem = asyncio.Semaphore(int(profile.COLLECTION_CONCURRENCY_PER_KEY) * len(clients))
 
@@ -283,7 +290,7 @@ async def run_aftermarket_book_capture(
         deadline: datetime,
         round_index: int,
         run_id: str,
-    ) -> tuple[CoverageEntry, list[dict]]:
+    ) -> tuple[CoverageEntry, list[dict[str, Any]]]:
         started = now_clock()
         if symbol in nx_unlisted and venue == "NXT":
             ref, first, last = nx_listing_evidence[symbol]
@@ -336,9 +343,9 @@ async def run_aftermarket_book_capture(
                     raw_refs=(),
                 ), []
             received = now_clock()
-        body = dict(payload) if isinstance(payload, dict) else None
+        body: dict[str, Any] | None = dict(payload) if isinstance(payload, dict) else None
         ok = isinstance(body, dict) and body.get("rt_cd") == "0"
-        if ok and venue == "NXT" and not _is_nxt_listed(body):
+        if ok and body is not None and venue == "NXT" and not _is_nxt_listed(body):
             nx_unlisted.add(symbol)
         context = CaptureContext(
             trading_date=trading_day,
@@ -442,8 +449,8 @@ async def run_aftermarket_book_capture(
                     deadline = rounds[block_start + len(block_rounds)].scheduled_at
                 else:
                     deadline = ceil
-                coros: list[Awaitable[tuple[CoverageEntry, list[dict]]]] = []
-                keys: list[tuple[str, str]] = []
+                coros: list[Awaitable[tuple[CoverageEntry, list[dict[str, Any]]]]] = []
+                keys: list[tuple[Literal["KRX", "NXT"], str]] = []
                 position = 0
                 for venue in venues:
                     for symbol in universe:
@@ -501,9 +508,9 @@ async def run_aftermarket_book_capture(
                     else:
                         failed += 1
                 status = (
-                    CaptureStatus.COMPLETE
-                    if all(item.status in GOOD_ENTRY_STATES for item in entries)
-                    else CaptureStatus.PARTIAL
+                    CaptureStatus.PARTIAL
+                    if roster_incomplete or not all(item.status in GOOD_ENTRY_STATES for item in entries)
+                    else CaptureStatus.COMPLETE
                 )
                 manifest = CaptureManifest(
                     schema_version=1,
@@ -594,7 +601,8 @@ async def _run_async(snapshot_date: str, profile: CollectionSettings) -> tuple[C
             await client.ensure_token(broker_session)
         if not await is_kis_trading_day(clients[0], broker_session, snapshot_date):
             return None
-    dense_symbols, sparse_symbols = resolve_book_universes(snapshot_date, store=store, now=datetime.now(SEOUL))
+    held = load_held_roster()
+    dense_symbols, sparse_symbols = resolve_book_universes(snapshot_date, store=store, now=datetime.now(SEOUL), held=held)
     return await run_aftermarket_book_capture(
         snapshot_date,
         profile=profile,
@@ -602,6 +610,7 @@ async def _run_async(snapshot_date: str, profile: CollectionSettings) -> tuple[C
         clients=clients,
         dense_symbols=dense_symbols,
         sparse_symbols=sparse_symbols,
+        roster_incomplete=not held.ok,
     )
 
 

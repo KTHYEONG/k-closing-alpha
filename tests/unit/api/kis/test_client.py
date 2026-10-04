@@ -211,6 +211,31 @@ def test_get_daily_credit_balance_history_includes_fixed_screen_div_code() -> No
     assert params.get("FID_COND_SCR_DIV_CODE") == "20476"
 
 
+def test_get_daily_credit_balance_history_collects_rows_in_range() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+    page = {
+        "rt_cd": "0",
+        "output": [
+            {"deal_date": "20240110", "whol_loan_rdmp_stcn": "50"},
+            {"deal_date": "20240102", "whol_loan_rdmp_stcn": "40"},
+            {"deal_date": "20231231", "whol_loan_rdmp_stcn": "30"},
+        ],
+    }
+    handle_request = AsyncMock(return_value=page)
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            return await client.get_daily_credit_balance_history(
+                _FakeSession(), "005930", "20240101", "20240110", market_div_code="J",
+            )
+
+    result = asyncio.run(_runner())
+
+    assert result["rt_cd"] == "0"
+    assert [row["deal_date"] for row in result["output"]] == ["20240102", "20240110"]
+    assert handle_request.await_count == 1
+
+
 def test_get_program_trade_daily_history_requires_explicit_market_div_code() -> None:
     client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
 
@@ -300,3 +325,293 @@ def test_get_fluctuation_ranking_propagates_error_response_unchanged() -> None:
 
     res = asyncio.run(_runner())
     assert res == {"rt_cd": "1", "msg1": "조회 실패"}
+
+
+def test_write_token_file_publishes_exact_cache_bytes(tmp_path) -> None:
+    import json
+    import stat
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "kis_token.json"
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+
+    client._write_token_file("TOK", "2030-01-01T00:00:00+09:00", "2026-10-01T00:00:00+09:00")
+
+    assert token_file.read_text(encoding="utf-8") == json.dumps({
+        "access_token": "TOK",
+        "expired_at": "2030-01-01T00:00:00+09:00",
+        "app_key": "k",
+        "issued_at": "2026-10-01T00:00:00+09:00",
+    })
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_write_token_file_failure_leaves_no_temp(tmp_path, monkeypatch) -> None:
+    import os
+
+    import pytest
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "kis_token.json"
+    token_file.write_text("old", encoding="utf-8")
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+
+    def _boom(src, dst):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(os, "replace", _boom)
+
+    with pytest.raises(OSError, match="disk gone"):
+        client._write_token_file("TOK", "2030-01-01T00:00:00+09:00", "2026-10-01T00:00:00+09:00")
+
+    assert token_file.read_text(encoding="utf-8") == "old"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_host_token_lock_acquires_and_releases(tmp_path) -> None:
+    import asyncio
+    import os
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "kis_token.json"
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+
+    async def _run() -> None:
+        async with client._host_token_lock():
+            assert os.path.isfile(str(token_file) + ".lock")  # noqa: ASYNC240 - existence probe of the just-created lock file
+
+    asyncio.run(_run())
+
+
+def test_host_token_lock_times_out_when_held(tmp_path, caplog) -> None:
+    import asyncio
+    import fcntl
+    import logging
+    import os
+    from time import monotonic
+
+    import pytest
+
+    from src.api.kis.client import KisApiClient
+    from src.api.shared_token import TokenStoreLockTimeout
+
+    token_file = tmp_path / "kis_token.json"
+    lock_path = str(token_file) + ".lock"
+    holder = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        import fcntl as _fcntl
+
+        _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+
+        async def _run() -> None:
+            async with client._host_token_lock(deadline=monotonic() + 0.2):
+                pass
+
+        with caplog.at_level(logging.ERROR), pytest.raises(TokenStoreLockTimeout, match="token lock not acquired"):
+            asyncio.run(_run())
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+
+    assert any("stage=kis_token_lock status=TIMEOUT" in rec.message for rec in caplog.records)
+
+
+def test_host_token_lock_reraises_unexpected_flock_error(tmp_path, monkeypatch) -> None:
+    import asyncio
+    import errno
+    import fcntl
+
+    import pytest
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "kis_token.json"
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+
+    def _boom(fd, op):
+        raise OSError(errno.EACCES, "nope")
+
+    monkeypatch.setattr(fcntl, "flock", _boom)
+
+    async def _run() -> None:
+        async with client._host_token_lock():
+            pass
+
+    with pytest.raises(OSError, match="nope"):
+        asyncio.run(_run())
+
+
+def test_ensure_token_adopts_rotated_cache_without_issuance(tmp_path, caplog) -> None:
+    import asyncio
+    import logging
+    from datetime import UTC, datetime, timedelta
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "kis_token.json"
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+    now = datetime.now(UTC)
+    client._write_token_file(
+        "NEW",
+        (now + timedelta(days=1)).isoformat(),
+        (now - timedelta(hours=1)).isoformat(),
+    )
+
+    async def _run() -> str:
+        return await client.ensure_token(None, rejected_token="OLD")
+
+    with caplog.at_level(logging.INFO):
+        assert asyncio.run(_run()) == "NEW"
+
+    assert client.token == "NEW"
+    assert any("status=ADOPTED_ROTATED" in rec.message for rec in caplog.records)
+
+
+def test_handle_request_rotates_token_on_auth_rejection(tmp_path, monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "kis_token.json"
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+    client.token = "OLD"
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status = 200
+
+        async def json(self):
+            return self._payload
+
+    class _Ctx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *_a):
+            return False
+
+    calls = {"n": 0}
+
+    class _FakeSession:
+        def get(self, _url, **_kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _Ctx(_Resp({"rt_cd": "1", "msg_cd": "EGW00121", "msg1": "token expired"}))
+            return _Ctx(_Resp({"rt_cd": "0", "msg_cd": "MCA00000", "output": []}))
+
+        def post(self, _url, **_kw):
+            return _Ctx(_Resp({"access_token": "NEW", "expires_in": 86400}))
+
+    class _Limiter:
+        async def acquire(self):
+            return None
+
+    monkeypatch.setattr(client, "rate_limiter", _Limiter())
+    monkeypatch.setattr("src.api.kis.client.asyncio.sleep", _no_sleep)
+
+    async def _run():
+        session = _FakeSession()
+        return await client._handle_request(session.get, "https://x", headers={"tr_id": "T", "authorization": "Bearer OLD"})
+
+    with caplog.at_level(logging.WARNING):
+        out = asyncio.run(_run())
+
+    assert out["rt_cd"] == "0"
+    assert client.token == "NEW"
+    assert any("status=AUTH_REJECTED" in rec.message for rec in caplog.records)
+
+
+async def _no_sleep(_delay):
+    return None
+
+
+def _issuing_session(token: str):
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status = 200
+
+        async def json(self):
+            return self._payload
+
+    class _Ctx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session:
+        def __init__(self):
+            self.posts = 0
+
+        def post(self, _url, **_kw):
+            self.posts += 1
+            return _Ctx(_Resp({"access_token": token, "expires_in": 86400}))
+
+    return _Session()
+
+
+def test_ensure_token_issues_fresh_then_reuses_cache(tmp_path) -> None:
+    import asyncio
+
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "kis_token.json"))
+    session = _issuing_session("TOK")
+
+    assert asyncio.run(client.ensure_token(session)) == "TOK"
+    assert session.posts == 1
+    assert asyncio.run(client.ensure_token(session)) == "TOK"
+    assert session.posts == 1
+
+
+def test_ensure_token_force_refresh_reissues(tmp_path) -> None:
+    import asyncio
+
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "kis_token.json"))
+    client.token = "OLD"
+    session = _issuing_session("NEW")
+
+    assert asyncio.run(client.ensure_token(session, force_refresh=True)) == "NEW"
+    assert session.posts == 1
+
+
+def test_ensure_token_adopts_sibling_issued_cache(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "kis_token.json"))
+    session = _issuing_session("NEW")
+    reads = iter([None, "SIBLING"])
+    monkeypatch.setattr(client, "_read_cached_token", lambda *a, **k: next(reads))
+
+    assert asyncio.run(client.ensure_token(session)) == "SIBLING"
+    assert session.posts == 0
+
+
+def test_issue_daily_token_issues_when_cache_absent(tmp_path) -> None:
+    import asyncio
+
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "kis_token.json"))
+
+    assert asyncio.run(client.issue_daily_token(_issuing_session("TOK"))) is True
+    assert client.token == "TOK"

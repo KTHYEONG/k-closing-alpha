@@ -3,10 +3,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
+from src.config.market_session import KRX_CLOSE_MARKET_DIV_CODE
 from src.strategy.contract import DEFAULT_UNIVERSE, UniverseSpec
+
+if TYPE_CHECKING:
+    import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +53,7 @@ def _to_float(value: object) -> float:
         return float("nan")
 
 
-def map_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
+def map_ranking_rows_to_stock_list(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Map KIS fluctuation-ranking rows to collect.py stock_list shape.
 
     Args:
@@ -59,7 +63,7 @@ def map_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
         List of {code, name, price, chgrate} dicts; codeless rows skipped.
         ETN Q prefix is normalized to the bare 6-digit code.
     """
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for row in rows:
         code_raw = str(row.get("stck_shrn_iscd") or row.get("mksc_shrn_iscd") or "").strip()
         if not code_raw:
@@ -78,7 +82,7 @@ def map_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
     return out
 
 
-def map_kiwoom_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
+def map_kiwoom_ranking_rows_to_stock_list(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Map Kiwoom ka10027 ranking rows to collect.py stock_list shape.
 
     Args:
@@ -87,7 +91,7 @@ def map_kiwoom_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
     Returns:
         List of {code, name, price, chgrate} dicts; codeless rows skipped.
     """
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for row in rows:
         code_raw = str(row.get("stk_cd", "") or "").split("_")[0].strip()
         if not code_raw:
@@ -103,7 +107,7 @@ def map_kiwoom_ranking_rows_to_stock_list(rows: list[dict]) -> list[dict]:
     return out
 
 
-def map_toss_ranking_rows_to_stock_list(rows: list[dict], universe: UniverseSpec = DEFAULT_UNIVERSE) -> list[dict]:
+def map_toss_ranking_rows_to_stock_list(rows: list[dict[str, Any]], universe: UniverseSpec = DEFAULT_UNIVERSE) -> list[dict[str, Any]]:
     """Map Toss `/api/v1/rankings` TOP_GAINERS rows to collect.py stock_list shape.
 
     Toss rankings carry no company-name field (unlike KIS/Kiwoom); name is
@@ -119,7 +123,7 @@ def map_toss_ranking_rows_to_stock_list(rows: list[dict], universe: UniverseSpec
     Returns:
         List of {code, name, price, chgrate} dicts; codeless or out-of-band rows skipped.
     """
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for row in rows:
         code_raw = str(row.get("symbol", "") or "").strip()
         if not code_raw:
@@ -139,8 +143,8 @@ def map_toss_ranking_rows_to_stock_list(rows: list[dict], universe: UniverseSpec
     return out
 
 
-def map_toss_trade_value_rows_to_stock_list(rows: list[dict]) -> list[dict]:
-    out: list[dict] = []
+def map_toss_trade_value_rows_to_stock_list(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     for row in rows:
         code_raw = str(row.get("symbol", "") or "").strip()
         if not code_raw:
@@ -173,7 +177,7 @@ def _emit_scan_page(
     on_page(body, metadata, started, received, int(page_index), int(attempt_index))
 
 
-async def fetch_trade_value_union(session, *, toss_client: Any | None = None, count: int = 100, on_page: Any | None = None) -> list[dict]:
+async def fetch_trade_value_union(session: aiohttp.ClientSession, *, toss_client: Any | None = None, count: int = 100, on_page: Any | None = None) -> list[dict[str, Any]]:
     if toss_client is None:
         return []
     started = datetime.now(ZoneInfo("Asia/Seoul"))
@@ -204,7 +208,7 @@ async def fetch_trade_value_union(session, *, toss_client: Any | None = None, co
 
 async def fetch_kis_band_ranking(
     client: Any, session: Any, *, rate_min_pct: float, rate_max_pct: float, max_calls: int = KIS_RANKING_MAX_CALLS, on_page: Any | None = None
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Fetch full KIS band coverage despite the 30-row cap via adaptive bisection.
 
     The KIS fluctuation ranking returns at most 30 rows per call with no
@@ -228,7 +232,7 @@ async def fetch_kis_band_ranking(
     """
     lo_bp = int(round(rate_min_pct * 100))
     hi_bp = int(round(rate_max_pct * 100))
-    rows_by_code: dict[str, dict] = {}
+    rows_by_code: dict[str, dict[str, Any]] = {}
     n_calls = 0
     stack: list[tuple[int, int]] = [(lo_bp, hi_bp)]
     while stack:
@@ -238,7 +242,7 @@ async def fetch_kis_band_ranking(
         n_calls += 1
         started = datetime.now(ZoneInfo("Asia/Seoul"))
         res = await client.get_fluctuation_ranking(
-            session, rate_min_pct=a / 100.0, rate_max_pct=b / 100.0, market_div_code="J"
+            session, rate_min_pct=a / 100.0, rate_max_pct=b / 100.0, market_div_code=KRX_CLOSE_MARKET_DIV_CODE
         )
         received = datetime.now(ZoneInfo("Asia/Seoul"))
         _emit_scan_page(
@@ -278,8 +282,8 @@ async def fetch_kis_band_ranking(
 
 
 async def fetch_candidate_stock_list(
-    client, session, *, universe: UniverseSpec = DEFAULT_UNIVERSE, kiwoom_client: Any | None = None, toss_client: Any | None = None, kis_band_fallback: bool = False, on_page: Any | None = None
-) -> list[dict]:
+    client: Any, session: aiohttp.ClientSession, *, universe: UniverseSpec = DEFAULT_UNIVERSE, kiwoom_client: Any | None = None, toss_client: Any | None = None, kis_band_fallback: bool = False, on_page: Any | None = None
+) -> list[dict[str, Any]]:
     """Retain scan evidence independently of the candidate selection outcome.
 
     Args:

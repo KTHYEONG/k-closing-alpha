@@ -305,3 +305,261 @@ def test_read_cache_payload_rejects_non_dict_payload(tmp_path) -> None:
         assert client._read_cache_payload() is None
         assert client._read_cached_token() is None
 
+
+def _seed_valid_cache(token_file, access_token: str) -> None:
+    import json
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    valid = (datetime.now(ZoneInfo("Asia/Seoul")) + timedelta(hours=20)).isoformat(timespec="seconds")
+    token_file.write_text(
+        json.dumps({"access_token": access_token, "expired_at": valid, "app_key": "k", "issued_at": "2026-09-15T07:05:00+09:00"}),
+        encoding="utf-8",
+    )
+
+
+class _IssueCountingSession:
+    """Fake session whose POST issues one fixed token and counts issuance."""
+
+    def __init__(self, issued: str = "NEW"):
+        self.posts = 0
+        self._issued = issued
+
+    def post(self, _url, **_kw):
+        session = self
+
+        class _Resp:
+            async def json(self):
+                return {"access_token": session._issued, "expires_in": 86400}
+
+        class _Ctx:
+            async def __aenter__(self):
+                session.posts += 1
+                return _Resp()
+
+            async def __aexit__(self, *_a):
+                return False
+
+        return _Ctx()
+
+
+def test_handle_request_concurrent_rejects_issue_single_token(tmp_path, monkeypatch) -> None:
+    import asyncio
+    import json
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "tok.json"
+    _seed_valid_cache(token_file, "T1")
+    real_sleep = asyncio.sleep
+
+    class _Resp:
+        def __init__(self, body):
+            self.status = 200
+            self._body = body
+
+        async def json(self):
+            return self._body
+
+    class _Ctx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            # Yield at the network boundary so every request is rejected with T1 before any refresh runs.
+            await real_sleep(0)
+            return self._resp
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session(_IssueCountingSession):
+        def __init__(self):
+            super().__init__(issued="T2")
+
+        def get(self, _url, **kw):
+            if (kw.get("headers") or {}).get("authorization", "") == "Bearer T1":
+                return _Ctx(_Resp({"rt_cd": "1", "msg_cd": "EGW00121", "msg1": "token expired"}))
+            return _Ctx(_Resp({"rt_cd": "0", "output": {"ok": True}}))
+
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+    client.token = "T1"
+
+    async def _free_acquire() -> None:
+        return None
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(client.rate_limiter, "acquire", _free_acquire)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    async def _main():
+        session = _Session()
+        results = await asyncio.gather(*[
+            client._handle_request(session.get, "http://x", headers={"tr_id": "T"}) for _ in range(4)
+        ])
+        return session, results
+
+    session, results = asyncio.run(_main())
+
+    assert session.posts == 1
+    assert [r["rt_cd"] for r in results] == ["0"] * 4
+    assert json.loads(token_file.read_text(encoding="utf-8"))["access_token"] == "T2"
+
+
+def test_ensure_token_rejected_token_adopts_rotated_cache(tmp_path, caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "tok.json"
+    _seed_valid_cache(token_file, "T2")
+    session = _IssueCountingSession()
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+    client.token = "T1"
+
+    with caplog.at_level(logging.INFO, logger="src.api.kis.client"):
+        out = asyncio.run(client.ensure_token(session, rejected_token="T1"))
+
+    assert out == "T2"
+    assert client.token == "T2"
+    assert session.posts == 0
+    assert any("status=ADOPTED_ROTATED" in r.getMessage() for r in caplog.records)
+
+
+def test_ensure_token_rejected_token_issues_and_keeps_cache_schema(tmp_path) -> None:
+    import asyncio
+    import json
+    from datetime import datetime
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "tok.json"
+    _seed_valid_cache(token_file, "T1")
+    session = _IssueCountingSession()
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+    client.token = "T1"
+
+    out = asyncio.run(client.ensure_token(session, rejected_token="T1"))
+
+    assert out == "NEW"
+    assert session.posts == 1
+    saved = json.loads(token_file.read_text(encoding="utf-8"))
+    assert set(saved) == {"access_token", "expired_at", "app_key", "issued_at"}
+    assert saved["access_token"] == "NEW"
+    assert datetime.fromisoformat(saved["expired_at"]).tzinfo is not None
+    assert datetime.fromisoformat(saved["issued_at"]).tzinfo is not None
+
+
+def test_handle_request_passes_sent_token_as_rejected(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "tok.json"))
+    client.token = "T1"
+
+    async def _free_acquire() -> None:
+        return None
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(client.rate_limiter, "acquire", _free_acquire)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    seen: dict = {}
+
+    async def _spy(session, *args, **kwargs):
+        seen.update(kwargs)
+        return "T2"
+
+    client.ensure_token = _spy  # type: ignore[method-assign]
+    calls = {"n": 0}
+
+    class _Resp:
+        status = 200
+
+        async def json(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                client.token = "T2"
+                return {"rt_cd": "1", "msg_cd": "EGW00121", "msg1": "expired"}
+            return {"rt_cd": "0", "output": {}}
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session:
+        def get(self, _url, **_kw):
+            return _Ctx()
+
+    out = asyncio.run(client._handle_request(_Session().get, "http://x", headers={"tr_id": "T"}))
+
+    assert out["rt_cd"] == "0"
+    assert seen == {"rejected_token": "T1"}
+
+
+def test_handle_request_without_token_adopts_cache(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from src.api.kis.client import KisApiClient
+
+    token_file = tmp_path / "tok.json"
+    _seed_valid_cache(token_file, "T2")
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+    client.token = None
+
+    async def _free_acquire() -> None:
+        return None
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(client.rate_limiter, "acquire", _free_acquire)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    seen: dict = {}
+    real_ensure = client.ensure_token
+
+    async def _spy(wrapped_session, *args, **kwargs):
+        seen.update(kwargs)
+        return await real_ensure(wrapped_session, *args, **kwargs)
+
+    client.ensure_token = _spy  # type: ignore[method-assign]
+    calls = {"n": 0}
+
+    class _Resp:
+        status = 200
+
+        async def json(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"rt_cd": "1", "msg_cd": "EGW00121", "msg1": "token expired"}
+            return {"rt_cd": "0", "output": {}}
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session(_IssueCountingSession):
+        def get(self, _url, **_kw):
+            return _Ctx()
+
+    get_session = _Session()
+    out = asyncio.run(client._handle_request(get_session.get, "http://x", headers={"tr_id": "T"}))
+
+    assert out["rt_cd"] == "0"
+    assert seen == {"rejected_token": ""}
+    assert get_session.posts == 0
+    assert client.token == "T2"
+

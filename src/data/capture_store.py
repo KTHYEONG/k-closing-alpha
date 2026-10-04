@@ -29,6 +29,7 @@ from src.data.capture_contracts import (
     CoverageEntry,
     RawCaptureError,
 )
+from src.data.io_utils import atomic_write_bytes
 from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
 
 __all__ = ["CaptureStore", "resolve_capture_root"]
@@ -121,13 +122,7 @@ class CaptureStore:
                 if existing == data:
                     return ArtifactRef(path=rel, sha256=_sha256(existing), bytes=len(existing), rows=rows)
                 raise ValueError(f"conflicting immutable artifact identity: {rel!r}")
-            tmp_path = target.parent / f"stage-{uuid.uuid4().hex}.tmp"
-            try:
-                tmp_path.write_bytes(data)
-                os.replace(tmp_path, target)
-            finally:
-                if tmp_path.exists():
-                    tmp_path.unlink()
+            atomic_write_bytes(target, data, mode=None)
             return ArtifactRef(path=rel, sha256=_sha256(data), bytes=len(data), rows=rows)
 
     def _check_ref(self, ref: ArtifactRef) -> bytes:

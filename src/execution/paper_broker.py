@@ -595,8 +595,11 @@ class PaperLedger:
         if self._lock_fd is not None:
             raise RuntimeError("PaperLedger.exclusive is not re-entrant")
         self._root.mkdir(parents=True, exist_ok=True)
-        # 가장 오래 합법적으로 잡는 쪽은 exit 시가 조회 루프(6회 x 10초 + lot당 TR 2회)로
-        # 300초에 한참 못 미친다. 그 이상 대기는 wedged 홀더이므로 줄 세우지 말고 크게 실패한다.
+        # The longest legitimate holder is the exit open-quote loop. Its sleep budget is
+        # (PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS - 1) * PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS
+        # (pinned below this timeout by test_paper_ledger_lock_timeout_exceeds_exit_quote_sleep_budget).
+        # TR latency adds an amount bounded only by HTTP timeouts, so a wait beyond this
+        # timeout is treated as a wedged holder and fails loudly instead of queueing.
         lock_path = self._lock_path()
         fd = os.open(str(lock_path), os.O_RDONLY | os.O_CREAT, 0o666)
         start = time.monotonic()
@@ -889,3 +892,78 @@ class PaperLedger:
         out = frame.copy() if frame is not None else pd.DataFrame(columns=list(ROUND_TRIP_COLUMNS))
         atomic_write_parquet(out, target)
         return len(out)
+
+
+HELD_ROSTER_UNIDENTIFIED_SYMBOL: str = "unidentified_symbol"
+"""failure_reason when an open lot has a null or blank symbol (cannot be followed)."""
+
+HELD_ROSTER_MISSING_SYMBOL_COLUMN: str = "missing_symbol_column"
+"""failure_reason when a non-empty open-position frame lacks the ``symbol`` column."""
+
+
+@dataclass(frozen=True)
+class HeldRoster:
+    """Symbols of open paper lots that observation jobs must keep following.
+
+    A failed ledger read must never look like "no open lots": capture jobs that follow
+    held positions would otherwise publish COMPLETE evidence while silently skipping
+    the very symbols whose exits depend on it.
+
+    Attributes:
+        symbols: Sorted, de-duplicated, stripped, 6-character zero-filled codes of the open
+            lots that could be identified (possibly partial when ``ok`` is False).
+        ok: True only when the ledger was read and every open lot had an identifiable symbol.
+        failure_reason: None when ``ok``; otherwise the exception type name, or one of
+            HELD_ROSTER_UNIDENTIFIED_SYMBOL / HELD_ROSTER_MISSING_SYMBOL_COLUMN. Never the
+            exception message (may carry paths or payloads).
+
+    Raises:
+        ValueError: ``ok`` is True with a failure_reason, or False without one.
+    """
+
+    symbols: tuple[str, ...]
+    ok: bool
+    failure_reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.ok == (self.failure_reason is not None):
+            raise ValueError("HeldRoster requires ok xor failure_reason")
+
+
+def load_held_roster(ledger: PaperLedger | None = None) -> HeldRoster:
+    """Read the open paper lots as a followable roster without raising.
+
+    Args:
+        ledger: Ledger to read; None constructs ``PaperLedger()`` on the configured
+            PAPER_DIR (construction happens inside the guarded region).
+
+    Returns:
+        HeldRoster. A ledger that is absent on disk yields ``ok=True`` with no symbols
+        (no fills means no open lots). Any exception while constructing the ledger or
+        loading open positions yields ``ok=False``, empty symbols and the exception type
+        name. Identifiable symbols are still returned when some lots are unidentifiable.
+    """
+    try:
+        source = ledger if ledger is not None else PaperLedger()
+        frame = source.load_open_positions()
+    except Exception as exc:
+        return HeldRoster(symbols=(), ok=False, failure_reason=type(exc).__name__)
+    if frame.empty:
+        return HeldRoster(symbols=(), ok=True, failure_reason=None)
+    if "symbol" not in frame.columns:
+        return HeldRoster(symbols=(), ok=False, failure_reason=HELD_ROSTER_MISSING_SYMBOL_COLUMN)
+    raw = frame["symbol"]
+    codes: set[str] = set()
+    unidentified = 0
+    for item in raw.tolist():
+        if item is None or bool(pd.isna(item)):
+            unidentified += 1
+            continue
+        text = str(item).strip()
+        if not text:
+            unidentified += 1
+            continue
+        codes.add(text.zfill(6))
+    if unidentified:
+        return HeldRoster(symbols=tuple(sorted(codes)), ok=False, failure_reason=HELD_ROSTER_UNIDENTIFIED_SYMBOL)
+    return HeldRoster(symbols=tuple(sorted(codes)), ok=True, failure_reason=None)

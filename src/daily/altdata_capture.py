@@ -178,18 +178,19 @@ def main(argv: Sequence[str] | None = None, *, trading_day_fn: Callable[[str], b
             return 0
     window_start, window_end = _rolling_bounds(trading_day, int(profile.COLLECTION_ALTDATA_LOOKBACK_DAYS))
     end_ts = window_end if window_end > window_start else window_start + pd.Timedelta(hours=12)
+    dart_pool = resolve_dart_key_pool(
+        primary=settings.OPENDART_API_KEY,
+        secondary=settings.OPENDART_API_KEY_2,
+        legacy=settings.DART_API_KEY,
+    )
     cfg = AltDataFetchConfig(
         start=window_start,
         end=end_ts,
         out_dir=Path(settings.ALTDATA_DIR),
-        dart_key_pool=resolve_dart_key_pool(
-            primary=settings.OPENDART_API_KEY,
-            secondary=settings.OPENDART_API_KEY_2,
-            legacy=settings.DART_API_KEY,
-        ),
+        dart_key_pool=dart_pool,
         krx_api_key=settings.KRX_OPENAPI_KEY,
     )
-    logger.info("[DATA] stage=dart_key_pool labels=%s n=%d", ",".join(cfg.dart_key_pool.labels), len(cfg.dart_key_pool.labels))
+    logger.info("[DATA] stage=dart_key_pool labels=%s n=%d", ",".join(dart_pool.labels), len(dart_pool.labels))
     store = CaptureStore(_capture_root(profile))
     manifest = run_altdata_capture(trading_day, profile=profile, store=store, cfg=cfg)
     verdict = altdata_verdict(manifest)

@@ -68,7 +68,7 @@ def build_scenario_action_panel(
 
     if reject_rows:
         rejects_df = pd.concat(reject_rows, axis=0)
-        rejects: list[dict[str, Any]] = rejects_df.to_dict(orient="records")  # type: ignore[return-value]
+        rejects: list[dict[str, Any]] = rejects_df.to_dict(orient="records")
     else:
         rejects = []
 

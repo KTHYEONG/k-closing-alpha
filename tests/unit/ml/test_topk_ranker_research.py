@@ -624,7 +624,8 @@ def test_cpcv_score_with_history_bins_on_certification_rows_only() -> None:
             for s in range(4):
                 out.append({"date": d, "symbol": f"{s:06d}",  # noqa: PERF401 - spec skeleton
                             "f1": float(rng.normal()), "f2": float(rng.normal()),
-                            "train_label": float(rng.normal()) * 0.01})
+                            "train_label": float(rng.normal()) * 0.01,
+                            "exit_date": pd.Timestamp(d) + pd.tseries.offsets.BDay(1)})
         return pd.DataFrame(out)
 
     cert = _rows(pd.bdate_range("2023-02-01", periods=10))
@@ -647,6 +648,225 @@ def test_cpcv_score_with_history_bins_on_certification_rows_only() -> None:
     # Then: a starved training pool fails closed rather than training on noise
     with pytest.raises(ValueError, match="min_train_rows"):
         cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=100_000)
+
+def test_seam_embargo_start_counts_pool_dates() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.topk_ranker_research import seam_embargo_start
+
+    calendar = pd.bdate_range("2023-01-02", periods=10).to_numpy()
+    test_start = pd.Timestamp(calendar[5])
+
+    assert seam_embargo_start(calendar, test_start, 0) == test_start
+    assert seam_embargo_start(calendar, test_start, 2) == pd.Timestamp(calendar[3])
+    assert seam_embargo_start(calendar, test_start, 50) == pd.Timestamp(calendar[0])
+
+    with pytest.raises(ValueError, match="embargo_days"):
+        seam_embargo_start(calendar, test_start, -1)
+    with pytest.raises(ValueError, match="empty"):
+        seam_embargo_start(np.array([], dtype="datetime64[ns]"), test_start, 1)
+
+def test_seam_purge_drops_labels_realizing_in_window() -> None:
+    import pandas as pd
+
+    from src.ml.topk_ranker_research import purge_history_seam
+
+    embargo_start = pd.Timestamp("2023-02-01")
+    hist = pd.DataFrame(
+        {
+            "exit_date": [
+                embargo_start - pd.Timedelta(days=1),
+                embargo_start,
+                embargo_start + pd.Timedelta(days=3),
+                pd.NaT,
+            ],
+            "v": [1.0, 2.0, 3.0, 4.0],
+        },
+        index=[101, 102, 103, 104],
+    )
+
+    out = purge_history_seam(hist, embargo_start=embargo_start)
+
+    assert out.index.tolist() == [101]
+    assert out["v"].tolist() == [1.0]
+    pd.testing.assert_frame_equal(purge_history_seam(hist.iloc[0:0], embargo_start=embargo_start), hist.iloc[0:0])
+
+def test_seam_purge_requires_exit_date() -> None:
+    import numpy as np
+    import pandas as pd
+    import pytest
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+    from src.ml.topk_ranker_research import cpcv_score_with_history, purge_history_seam
+
+    with pytest.raises(ValueError, match="exit_date"):
+        purge_history_seam(pd.DataFrame({"v": [1.0]}), embargo_start=pd.Timestamp("2023-02-01"))
+
+    rng = np.random.default_rng(5)
+    cert = pd.DataFrame([
+        {"date": d, "symbol": f"{s:06d}", "f1": float(rng.normal()),
+         "f2": float(rng.normal()), "train_label": float(rng.normal()) * 0.01}
+        for d in pd.bdate_range("2023-02-01", periods=10)
+        for s in range(2)
+    ])
+    hist = pd.DataFrame([
+        {"date": d, "symbol": f"{s:06d}", "f1": float(rng.normal()),
+         "f2": float(rng.normal()), "train_label": float(rng.normal()) * 0.01}
+        for d in pd.bdate_range("2022-06-01", periods=5)
+        for s in range(2)
+    ])
+    cv = CombinatorialPurgedCV(n_groups=8, k_test=2, purge_gap=1, embargo_gap=0)
+    tiny = {"n_estimators": 5, "num_leaves": 7, "min_child_samples": 5,
+            "learning_rate": 0.1, "subsample": 1.0, "colsample_bytree": 1.0, "reg_lambda": 1.0}
+
+    with pytest.raises(ValueError, match="exit_date"):
+        cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=1,
+                                model_params=tiny, seeds=(1,))
+
+    oof = cpcv_score_with_history(cert, hist.iloc[0:0], ["f1", "f2"], cv=cv, min_train_rows=1,
+                                  model_params=tiny, seeds=(1,))
+    assert oof["cpcv_fold"].nunique() == 28
+
+def _seam_purge_frames() -> tuple:
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.robust_eval import CombinatorialPurgedCV
+
+    rng = np.random.default_rng(9)
+    cert_start = pd.Timestamp("2023-02-01")
+    cert_dates = pd.bdate_range(cert_start, periods=40)
+    hist_dates = pd.bdate_range(end=cert_start - pd.tseries.offsets.BDay(1), periods=20)
+    last_hist = pd.Timestamp(hist_dates[-1])
+
+    def _rows(dates, exit_fn):
+        out = []
+        for d in dates:
+            for s in range(4):
+                out.append({"date": pd.Timestamp(d), "symbol": f"{s:06d}",  # noqa: PERF401 - spec skeleton
+                            "f1": float(rng.normal()), "f2": float(rng.normal()),
+                            "train_label": float(rng.normal()) * 0.01,
+                            "exit_date": exit_fn(pd.Timestamp(d), s)})
+        return pd.DataFrame(out)
+
+    cert = _rows(cert_dates, lambda d, s: d + pd.tseries.offsets.BDay(1))
+    hist = _rows(hist_dates, lambda d, s: d + pd.tseries.offsets.BDay(1))
+    row_a = hist[(hist["date"] == last_hist) & (hist["symbol"] == "000000")].index[0]
+    hist.loc[row_a, "exit_date"] = cert_start
+    row_b_date = cert_start - pd.tseries.offsets.BDay(15)
+    row_b = hist[(hist["date"] == row_b_date) & (hist["symbol"] == "000000")].index[0]
+    hist.index = hist.index + 10_000
+    row_a = row_a + 10_000
+    row_b = row_b + 10_000
+    cv = CombinatorialPurgedCV(n_groups=8, k_test=2, purge_gap=1, embargo_gap=0)
+    return cert, hist, row_a, row_b, last_hist, cv
+
+def _spy_fits(monkeypatch):
+    from src.ml.bundle import fit_seed_ensemble as real_fit
+    import src.ml.topk_ranker_research as research
+
+    calls: list = []
+
+    def _spy(train_df, feature_cols, target_col, seeds, params, huber_delta, *args, **kwargs):
+        calls.append(train_df.index)
+        return real_fit(train_df, feature_cols, target_col, seeds, params, huber_delta, *args, **kwargs)
+
+    monkeypatch.setattr(research, "fit_seed_ensemble", _spy)
+    return calls
+
+_TINY_MODEL_PARAMS = {"n_estimators": 5, "num_leaves": 7, "min_child_samples": 5,
+                      "learning_rate": 0.1, "subsample": 1.0, "colsample_bytree": 1.0,
+                      "reg_lambda": 1.0}
+
+def test_bin_zero_folds_exclude_overlapping_history(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.ml.topk_ranker_research import cpcv_score_with_history
+
+    cert, hist, row_a, row_b, last_hist, cv = _seam_purge_frames()
+    calls = _spy_fits(monkeypatch)
+
+    cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=10,
+                            model_params=dict(_TINY_MODEL_PARAMS), seeds=(1,),
+                            seam_embargo_days=1)
+
+    assert len(calls) == 28
+    late = set(hist[pd.to_datetime(hist["exit_date"]) >= last_hist].index)
+    assert row_a in late
+    assert row_b not in late
+    for i in range(7):
+        seen = set(calls[i])
+        assert row_a not in seen
+        assert row_b in seen
+        assert not (late & seen)
+    for i in range(7, 28):
+        assert set(hist.index) <= set(calls[i])
+
+def test_non_bin_zero_folds_unchanged_with_zero_embargo(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.ml.topk_ranker_research import cpcv_score_with_history
+
+    cert, hist, _row_a, _row_b, _last_hist, cv = _seam_purge_frames()
+    calls = _spy_fits(monkeypatch)
+
+    cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=10,
+                            model_params=dict(_TINY_MODEL_PARAMS), seeds=(1,),
+                            seam_embargo_days=0)
+
+    assert len(calls) == 28
+    cert_work = cert.sort_values("date")
+    splits = list(cv.split(cert_work["date"]))
+    for k in range(7, 28):
+        train_idx, _test_idx, _fold_id = splits[k]
+        expected = set(hist.index) | set(cert_work.iloc[train_idx].index)
+        assert set(calls[k]) == expected
+
+def test_default_seam_embargo_excludes_suspension_carry_across_seam(monkeypatch) -> None:
+    import pandas as pd
+
+    from src.ml.topk_ranker_research import HISTORY_SEAM_EMBARGO_DAYS, cpcv_score_with_history
+
+    cert, hist, _row_a, _row_b, _last_hist, cv = _seam_purge_frames()
+    hist_dates = sorted(pd.to_datetime(hist["date"]).unique())
+    embargo_start = pd.Timestamp(hist_dates[-HISTORY_SEAM_EMBARGO_DAYS])
+    cert_start = pd.Timestamp(pd.to_datetime(cert["date"]).min())
+
+    def _pick(day_offset: int, symbol: str) -> int:
+        day = pd.Timestamp(hist_dates[day_offset])
+        return int(hist[(hist["date"] == day) & (hist["symbol"] == symbol)].index[0])
+
+    carry = _pick(0, "000001")
+    hist.loc[carry, "exit_date"] = cert_start + pd.tseries.offsets.BDay(3)
+    at_bound = _pick(1, "000001")
+    hist.loc[at_bound, "exit_date"] = embargo_start
+    before_bound = _pick(2, "000001")
+    hist.loc[before_bound, "exit_date"] = embargo_start - pd.tseries.offsets.BDay(1)
+    calls = _spy_fits(monkeypatch)
+
+    cpcv_score_with_history(cert, hist, ["f1", "f2"], cv=cv, min_train_rows=10,
+                            model_params=dict(_TINY_MODEL_PARAMS), seeds=(1,))
+
+    assert len(calls) == 28
+    for i in range(7):
+        seen = set(calls[i])
+        assert carry not in seen
+        assert at_bound not in seen
+        assert before_bound in seen
+        assert all(pd.Timestamp(hist.loc[j, "exit_date"]) < embargo_start for j in seen if j in hist.index)
+
+def test_production_bundle_training_ignores_seam_purge() -> None:
+    from src.ml.topk_contract import RANKER_FEATURE_COLS
+    from src.ml.topk_ranker_research import train_production_bundle
+
+    ph, market_dates, d_to_idx = _two_regime_prepared_panel()
+
+    bundle = train_production_bundle(ph, market_dates, d_to_idx, min_train_rows=10)
+
+    assert list(bundle["feature_cols"]) == list(RANKER_FEATURE_COLS)
+    assert "exit_date" not in bundle["feature_cols"]
 
 def test_compute_path_evidence_rejects_pre_certification_regime_rows() -> None:
     import pandas as pd
@@ -800,6 +1020,34 @@ def test_train_production_bundle_trains_on_certification_regime_wide_pool() -> N
     assert bundle["certification_regime_start"] == str(CERT_REGIME_START.date())
     assert bundle["top_k"] == 3
     assert bundle["select_universe"]["max_tick_cost_bp"] is not None
+
+def test_train_production_bundle_stamps_feature_contract() -> None:
+    import pandas as pd
+
+    from src.ml.topk_contract import (
+        TOPK_FEATURE_CONTRACT_VERSION,
+        build_topk_feature_manifest,
+        feature_contract_issue,
+    )
+    from src.ml.topk_ranker_research import CERT_REGIME_START, train_production_bundle
+
+    ph, market_dates, d_to_idx = _synthetic_prepared_panel()
+
+    bundle = train_production_bundle(
+        ph, market_dates, d_to_idx, min_train_rows=10, train_start=CERT_REGIME_START
+    )
+
+    assert bundle["feature_contract_version"] == TOPK_FEATURE_CONTRACT_VERSION
+    assert feature_contract_issue(bundle) is None
+    pd.testing.assert_frame_equal(
+        bundle["feature_manifest"], build_topk_feature_manifest(bundle["feature_cols"])
+    )
+    assert (
+        bundle["feature_manifest"]
+        .set_index("feature_name")
+        .loc["f_tick_cost", "unit"]
+        == "basis_points"
+    )
 
 def test_train_production_bundle_fails_closed_below_min_train_rows() -> None:
     import pytest

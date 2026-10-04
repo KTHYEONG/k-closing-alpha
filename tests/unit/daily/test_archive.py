@@ -442,3 +442,125 @@ def test_archive_upsert_preserves_finalization_columns_round_trip(monkeypatch, t
     assert pd.Timestamp(back.loc[0, "snapshot_timestamp"]) == pd.Timestamp("2026-09-10 15:20:18", tz="Asia/Seoul")
 
 
+def _write_theme_map(theme_path: Path, rows: list[tuple[str, str]]) -> None:
+    pd.DataFrame({"종목코드": [c for c, _ in rows], "테마": [t for _, t in rows]}).to_parquet(theme_path)
+
+
+def _unmapped_row(code: str, name: str, rank: int) -> dict:
+    row = _candidate_row(code, name, rank)
+    row["테마_섹터"] = None
+    return row
+
+
+def test_upsert_leaves_unmapped_theme_as_nan_not_placeholder(tmp_archive: Path, monkeypatch) -> None:
+    theme_path = tmp_archive / "theme.parquet"
+    _write_theme_map(theme_path, [("005930", "반도체")])
+    monkeypatch.setattr(archive.settings, "THEME_PARQUET_PATH", theme_path)
+
+    df = pd.DataFrame([_unmapped_row("005930", "삼성전자", 1), _unmapped_row("000660", "SK하이닉스", 2)])
+    assert archive.upsert_archive_snapshot(df, snapshot_date="2026-08-04") == 2
+
+    stored = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    by_code = {str(c): t for c, t in zip(stored["종목코드"], stored["테마_섹터"], strict=False)}
+    assert by_code["005930"] == "반도체"
+    assert pd.isna(by_code["000660"])
+    assert not (stored["테마_섹터"] == "테마 없음").any()
+
+
+def test_upsert_degrades_to_nan_with_warning_on_corrupt_theme(tmp_archive: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    theme_path = tmp_archive / "theme.parquet"
+    theme_path.write_bytes(b"not a parquet file")
+    monkeypatch.setattr(archive.settings, "THEME_PARQUET_PATH", theme_path)
+
+    df = pd.DataFrame([_unmapped_row("005930", "삼성전자", 1)])
+    with caplog.at_level(logging.WARNING, logger="src.daily.archive"):
+        assert archive.upsert_archive_snapshot(df, snapshot_date="2026-08-04") == 1
+
+    stored = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    assert stored["테마_섹터"].isna().all()
+    assert any("stage=archive_theme status=THEME_UNAVAILABLE" in rec.message for rec in caplog.records)
+
+
+def test_upsert_degrades_with_schema_reason_on_theme_missing_columns(tmp_archive: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    theme_path = tmp_archive / "theme.parquet"
+    pd.DataFrame({"종목코드": ["005930"], "업종": ["반도체"]}).to_parquet(theme_path)
+    monkeypatch.setattr(archive.settings, "THEME_PARQUET_PATH", theme_path)
+
+    df = pd.DataFrame([_unmapped_row("005930", "삼성전자", 1)])
+    with caplog.at_level(logging.WARNING, logger="src.daily.archive"):
+        assert archive.upsert_archive_snapshot(df, snapshot_date="2026-08-04") == 1
+
+    assert any("reason=schema" in rec.message for rec in caplog.records)
+
+
+def test_fetch_degrades_on_corrupt_theme(tmp_archive: Path, monkeypatch) -> None:
+    theme_path = tmp_archive / "theme.parquet"
+    _write_theme_map(theme_path, [("005930", "반도체")])
+    monkeypatch.setattr(archive.settings, "THEME_PARQUET_PATH", theme_path)
+    df = pd.DataFrame([_unmapped_row("005930", "삼성전자", 1), _unmapped_row("000660", "SK하이닉스", 2)])
+    archive.upsert_archive_snapshot(df, snapshot_date="2026-08-04")
+
+    theme_path.write_bytes(b"not a parquet file")
+    fetched = archive.fetch_archive_snapshot(snapshot_date="2026-08-04")
+
+    assert len(fetched) == 2
+    assert fetched.set_index("종목코드").loc["005930", "테마_섹터"] == "반도체"
+
+
+def test_fetch_reads_legacy_placeholder_as_missing_and_refills(tmp_archive: Path, monkeypatch) -> None:
+    theme_path = tmp_archive / "theme.parquet"
+    _write_theme_map(theme_path, [("005930", "반도체")])
+    monkeypatch.setattr(archive.settings, "THEME_PARQUET_PATH", theme_path)
+    row = _candidate_row("005930", "삼성전자", 1)
+    row["테마_섹터"] = "테마 없음"
+    pd.DataFrame([row]).to_parquet(archive.settings.HISTORY_PARQUET_PATH)
+
+    assert archive.fetch_archive_snapshot(snapshot_date="2026-08-04").loc[:, "테마_섹터"].iloc[0] == "반도체"
+
+    monkeypatch.setattr(archive.settings, "THEME_PARQUET_PATH", tmp_archive / "no_theme.parquet")
+    refetched = archive.fetch_archive_snapshot(snapshot_date="2026-08-04")
+    assert pd.isna(refetched.loc[:, "테마_섹터"].iloc[0])
+
+
+def test_standardize_preserves_existing_theme_and_copies_legacy_column(tmp_archive: Path, monkeypatch) -> None:
+    theme_path = tmp_archive / "theme.parquet"
+    _write_theme_map(theme_path, [("005930", "화학")])
+    monkeypatch.setattr(archive.settings, "THEME_PARQUET_PATH", theme_path)
+
+    df = pd.DataFrame([_candidate_row("005930", "삼성전자", 1)])
+    assert archive.upsert_archive_snapshot(df, snapshot_date="2026-08-04") == 1
+    stored = pd.read_parquet(archive.settings.HISTORY_PARQUET_PATH)
+    assert stored.loc[:, "테마_섹터"].iloc[0] == "반도체"
+
+    legacy = pd.DataFrame({"종목코드": ["000660"], "테마": ["바이오"]})
+    standardized = archive._standardize_archive_df(legacy)
+    assert standardized.loc[:, "테마_섹터"].iloc[0] == "바이오"
+
+
+def test_theme_map_not_resolved_when_nothing_missing(tmp_archive: Path, monkeypatch) -> None:
+    def _boom() -> dict:
+        raise AssertionError("resolver must not be called")
+
+    monkeypatch.setattr(archive, "_resolve_archive_theme_map", _boom)
+
+    df = pd.DataFrame([_candidate_row("005930", "삼성전자", 1)])
+    assert archive.upsert_archive_snapshot(df, snapshot_date="2026-08-04") == 1
+
+
+def test_non_theme_errors_propagate_from_upsert(tmp_archive: Path, monkeypatch) -> None:
+    import pytest
+
+    def _boom() -> dict:
+        raise OSError("theme store down")
+
+    monkeypatch.setattr(archive, "load_theme", _boom)
+
+    df = pd.DataFrame([_unmapped_row("005930", "삼성전자", 1)])
+    with pytest.raises(OSError, match="theme store down"):
+        archive.upsert_archive_snapshot(df, snapshot_date="2026-08-04")
+
+

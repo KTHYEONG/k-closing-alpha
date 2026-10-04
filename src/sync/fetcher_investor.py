@@ -25,8 +25,8 @@ def _clean_num(v: Any) -> float | None:
         return None
 
 
-def _collect_rows(body: dict) -> list[dict]:
-    rows: list[dict] = []
+def _collect_rows(body: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     for key in ["output2", "output1", "output"]:
         val = body.get(key)
         if isinstance(val, list):
@@ -40,7 +40,7 @@ def _prev_day_ymd(ymd: str, days: int = 1) -> str:
     dt = pd.to_datetime(ymd, format="%Y%m%d", errors="coerce")
     if pd.isna(dt):
         return ymd
-    return (dt - pd.Timedelta(days=max(1, int(days)))).strftime("%Y%m%d")
+    return str((dt - pd.Timedelta(days=max(1, int(days)))).strftime("%Y%m%d"))
 
 
 async def _request_investor_daily_async(
@@ -49,7 +49,7 @@ async def _request_investor_daily_async(
     trade_date: str,
     client: KisApiClient,
     request_slot: Callable[[], Awaitable[None]] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """비동기 KIS API 호출 헬퍼"""
     url = f"{client.base_url}/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily"
     params = {
@@ -92,7 +92,7 @@ async def get_investor_trade_daily_async(
 
     wanted = {d for d in (target_dates or []) if start <= d <= end}
 
-    all_rows: list[dict] = []
+    all_rows: list[dict[str, Any]] = []
     seen_days = set()
     cursor = end
     no_progress = 0

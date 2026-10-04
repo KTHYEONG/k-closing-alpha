@@ -125,3 +125,45 @@ def test_config_rejects_malformed_universe_symbol() -> None:
             out_dir=Path("x"),
             universe_symbols=frozenset({"12345"}),
         )
+
+
+def _altdata_cfg(**kw):
+    return AltDataFetchConfig(start=pd.Timestamp("2026-01-02"), end=pd.Timestamp("2026-01-05"), out_dir=Path("altdata-out"), **kw)
+
+
+def test_altdata_config_invalid_extra_entry_message_is_index_only() -> None:
+    with pytest.raises(ValueError, match="extra_client_kwargs") as excinfo:
+        _altdata_cfg(extra_client_kwargs=(("k1", "s1", "h1"), ("", "SUPER-SECRET-VALUE", "h2")))
+    message = str(excinfo.value)
+    assert "#1" in message
+    assert "extra_client_kwargs" in message
+    assert "non-empty app_key" in message
+    for leaked in ("SUPER-SECRET-VALUE", "h2", "k1"):
+        assert leaked not in message
+
+
+def test_altdata_config_wrong_arity_message_is_index_only() -> None:
+    with pytest.raises(ValueError, match="extra_client_kwargs") as excinfo:
+        _altdata_cfg(extra_client_kwargs=(("KEY-ONLY-VALUE", "SECRET-ONLY-VALUE"),))
+    message = str(excinfo.value)
+    assert "#0" in message
+    assert "KEY-ONLY-VALUE" not in message
+    assert "SECRET-ONLY-VALUE" not in message
+
+
+def test_altdata_config_repr_hides_credentials() -> None:
+    import dataclasses
+
+    cfg = _altdata_cfg(
+        dart_api_key="DART-SECRET-KEY-1",
+        krx_api_key="KRX-SECRET-KEY-1",
+        extra_client_kwargs=(("AK-EXTRA-1", "AS-EXTRA-1", "hts"),),
+    )
+    text = repr(cfg)
+    for leaked in ("DART-SECRET-KEY-1", "KRX-SECRET-KEY-1", "AK-EXTRA-1", "AS-EXTRA-1"):
+        assert leaked not in text
+    assert "altdata-out" in text
+    replaced = dataclasses.replace(cfg, page_count=50)
+    assert replaced.dart_api_key == "DART-SECRET-KEY-1"
+    assert replaced.krx_api_key == "KRX-SECRET-KEY-1"
+    assert replaced.extra_client_kwargs == (("AK-EXTRA-1", "AS-EXTRA-1", "hts"),)

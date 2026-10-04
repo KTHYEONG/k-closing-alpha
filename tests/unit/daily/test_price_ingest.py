@@ -1337,3 +1337,327 @@ def test_parse_toss_program_skips_dateless_and_rejects_bad_legs() -> None:
         parse_toss_program_rows({"result": {"records": [
             {"date": "2026-09-10", "arbitrage": {"netBuyAmount": "bad"}, "nonArbitrage": {"netBuyAmount": "1"}},
         ]}})
+
+
+def _closed_session_fn():
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    def _resolve(trading_day):
+        return SessionDay(trading_date=trading_day, kind=SessionKind.CLOSED, clock=None, provenance="test")
+
+    return _resolve
+
+
+def _synthetic_composite(periods=60, seed=7):
+    rng = np.random.default_rng(seed)
+    days = pd.bdate_range("2026-01-02", periods=periods)
+    closes = 2500.0 * np.cumprod(1 + 0.004 * rng.standard_normal(periods))
+    return days, [round(float(c), 2) for c in closes]
+
+
+def test_compute_live_vkospi_matches_training_definition() -> None:
+    from src.daily.price_ingest import compute_index_columns, compute_live_vkospi
+
+    days, closes = _synthetic_composite()
+    decision = days[44]
+    kospi = pd.DataFrame({"date": days, "close": closes})
+    kosdaq = pd.DataFrame({"date": days, "close": [800.0 + i for i in range(len(days))]})
+    train_val = compute_index_columns(kospi, kosdaq).set_index("date").loc[decision, "v_kospi"]
+    past = pd.DataFrame({"date": days[:44], "close": closes[:44]})
+    live_val = compute_live_vkospi(past, closes[44], decision, session_day_fn=_closed_session_fn())
+    assert live_val == pytest.approx(train_val, rel=1e-12)
+
+
+def test_compute_live_vkospi_ignores_future_closes() -> None:
+    from src.daily.price_ingest import compute_index_columns, compute_live_vkospi
+
+    days, closes = _synthetic_composite()
+    decision = days[44]
+    rng = np.random.default_rng(99)
+    shocked = list(closes)
+    for i in range(45, len(shocked)):
+        shocked[i] = round(shocked[i] * float(1 + 0.05 * rng.standard_normal()), 2)
+    kospi = pd.DataFrame({"date": days, "close": shocked})
+    kosdaq = pd.DataFrame({"date": days, "close": [800.0 + i for i in range(len(days))]})
+    train_val = compute_index_columns(kospi, kosdaq).set_index("date").loc[decision, "v_kospi"]
+    past = pd.DataFrame({"date": days[:44], "close": closes[:44]})
+    live_val = compute_live_vkospi(past, closes[44], decision, session_day_fn=_closed_session_fn())
+    assert train_val == pytest.approx(live_val, rel=1e-12)
+
+
+def test_compute_live_vkospi_uses_population_std_over_window() -> None:
+    from src.daily.price_ingest import compute_live_vkospi
+
+    rets = np.array([0.012, -0.008, 0.005, -0.015, 0.02, -0.003, 0.009, -0.011, 0.004, 0.007,
+                     -0.006, 0.013, -0.009, 0.002, -0.004, 0.011, -0.014, 0.006, 0.008, -0.002])
+    closes = [100.0]
+    for r in rets:
+        closes.append(closes[-1] * float(np.exp(r)))
+    days = pd.bdate_range("2026-03-02", periods=21)
+    past = pd.DataFrame({"date": days[:20], "close": closes[:20]})
+    got = compute_live_vkospi(past, closes[20], days[20], session_day_fn=_closed_session_fn())
+    assert got == pytest.approx(float(np.std(rets, ddof=0) * np.sqrt(252.0) * 100.0), rel=1e-9)
+    assert abs(got - float(np.std(rets, ddof=1) * np.sqrt(252.0) * 100.0)) > 1e-6
+
+
+def test_compute_live_vkospi_rejects_non_past_rows() -> None:
+    import pytest
+
+    from src.daily.price_ingest import compute_live_vkospi
+
+    days, closes = _synthetic_composite()
+    decision = days[44]
+    bad = pd.DataFrame({"date": [*list(days[:44]), decision], "close": closes[:45]})
+    with pytest.raises(ValueError, match="on/after decision_date"):
+        compute_live_vkospi(bad, closes[44], decision, session_day_fn=_closed_session_fn())
+    future = pd.DataFrame({"date": [*list(days[:44]), decision + pd.Timedelta(days=1)], "close": closes[:45]})
+    with pytest.raises(ValueError, match="on/after decision_date"):
+        compute_live_vkospi(future, closes[44], decision, session_day_fn=_closed_session_fn())
+
+
+def test_compute_live_vkospi_window_boundary() -> None:
+    import pytest
+
+    from src.daily.price_ingest import VKOSPI_WINDOW, compute_live_vkospi
+
+    days, closes = _synthetic_composite()
+    decision = days[VKOSPI_WINDOW]
+    short = pd.DataFrame({"date": days[1:VKOSPI_WINDOW], "close": closes[1:VKOSPI_WINDOW]})
+    assert len(short) == VKOSPI_WINDOW - 1
+    with pytest.raises(ValueError, match="fewer than"):
+        compute_live_vkospi(short, closes[VKOSPI_WINDOW], decision, session_day_fn=_closed_session_fn())
+    exact = pd.DataFrame({"date": days[:VKOSPI_WINDOW], "close": closes[:VKOSPI_WINDOW]})
+    got = compute_live_vkospi(exact, closes[VKOSPI_WINDOW], decision, session_day_fn=_closed_session_fn())
+    assert np.isfinite(got) and got > 0
+
+
+def test_compute_live_vkospi_rejects_invalid_live_level() -> None:
+    import pytest
+
+    from src.daily.price_ingest import compute_live_vkospi
+
+    days, closes = _synthetic_composite()
+    past = pd.DataFrame({"date": days[:44], "close": closes[:44]})
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="live_level"):
+            compute_live_vkospi(past, bad, days[44], session_day_fn=_closed_session_fn())
+
+
+def test_compute_live_vkospi_rejects_invalid_past_closes() -> None:
+    import pytest
+
+    from src.daily.price_ingest import compute_live_vkospi
+
+    days, closes = _synthetic_composite()
+    decision = days[44]
+    nan_close = pd.DataFrame({"date": days[:44], "close": [float("nan"), *closes[1:44]]})
+    with pytest.raises(ValueError, match="non-finite close"):
+        compute_live_vkospi(nan_close, closes[44], decision, session_day_fn=_closed_session_fn())
+    zero_close = pd.DataFrame({"date": days[:44], "close": [0.0, *closes[1:44]]})
+    with pytest.raises(ValueError, match="non-positive close"):
+        compute_live_vkospi(zero_close, closes[44], decision, session_day_fn=_closed_session_fn())
+    dup = pd.DataFrame({"date": [*list(days[:43]), days[42]], "close": closes[:44]})
+    with pytest.raises(ValueError, match="duplicated dates"):
+        compute_live_vkospi(dup, closes[44], decision, session_day_fn=_closed_session_fn())
+
+
+def test_compute_live_vkospi_rejects_stale_history() -> None:
+    import pytest
+
+    from src.data.session_calendar import SessionDay, SessionKind
+    from src.daily.price_ingest import compute_live_vkospi
+
+    days = pd.bdate_range(end="2026-09-07", periods=25)
+    closes = [round(float(c), 2) for c in 2600.0 * np.cumprod(1 + 0.003 * np.sin(np.arange(25)))]
+    past = pd.DataFrame({"date": days, "close": closes})
+    decision = pd.Timestamp("2026-09-09")
+    live = closes[-1] * 1.001
+
+    def _kinded(kind):
+        def _resolve(trading_day):
+            if trading_day.isoformat() == "2026-09-08":
+                return SessionDay(trading_date=trading_day, kind=kind, clock=None, provenance="test")
+            return SessionDay(trading_date=trading_day, kind=SessionKind.CLOSED, clock=None, provenance="test")
+
+        return _resolve
+
+    for stale in (SessionKind.STANDARD, SessionKind.SHIFTED, SessionKind.UNKNOWN):
+        with pytest.raises(ValueError, match="stale history"):
+            compute_live_vkospi(past, live, decision, session_day_fn=_kinded(stale))
+    got = compute_live_vkospi(past, live, decision, session_day_fn=_kinded(SessionKind.CLOSED))
+    assert np.isfinite(got) and got > 0
+
+
+def test_fetch_live_vkospi_requests_past_composite_closes() -> None:
+    from src.daily.price_ingest import compute_live_vkospi, fetch_live_vkospi
+
+    decision = pd.Timestamp("2026-09-04")
+    fake = FakeKis()
+    calls: list[tuple] = []
+    real = fake.get_market_index_history
+
+    async def _spy(session, code, start, end):
+        calls.append((code, start, end))
+        return await real(session, code, start, end)
+
+    fake.get_market_index_history = _spy
+    level = round(fake._close("0001", decision) * 1.002, 2)
+    got = asyncio.run(fetch_live_vkospi(fake, _Session(), decision, level))
+    assert len(calls) == 1
+    assert calls[0][0] == "0001"
+    assert calls[0][2] == "20260903"
+    start, end = pd.Timestamp(calls[0][1]), pd.Timestamp(calls[0][2])
+    expected_past = pd.DataFrame({
+        "date": [d for d in fake.calendar if start <= d <= end],
+        "close": [fake._close("0001", d) for d in fake.calendar if start <= d <= end],
+    })
+    assert got == pytest.approx(compute_live_vkospi(expected_past, level, decision), rel=1e-12)
+
+
+def test_fetch_live_vkospi_without_level_makes_no_vendor_call() -> None:
+    import pytest
+
+    from src.daily.price_ingest import fetch_live_vkospi
+
+    fake = FakeKis()
+    with pytest.raises(ValueError, match="live_level"):
+        asyncio.run(fetch_live_vkospi(fake, _Session(), pd.Timestamp("2026-09-04"), None))
+    assert fake.index_calls == 0
+
+
+def test_fetch_live_vkospi_propagates_vendor_failure() -> None:
+    import pytest
+
+    from src.daily.price_ingest import fetch_live_vkospi
+
+    fake = FakeKis(index_rt="1")
+    with pytest.raises(RuntimeError, match="rt_cd"):
+        asyncio.run(fetch_live_vkospi(fake, _Session(), pd.Timestamp("2026-09-04"), 2600.0))
+
+
+def test_compute_live_vkospi_rejects_malformed_inputs() -> None:
+    import pytest
+
+    from src.daily.price_ingest import compute_live_vkospi
+
+    days, closes = _synthetic_composite()
+    decision = days[44]
+    past = pd.DataFrame({"date": days[:44], "close": closes[:44]})
+    for bad_level in ("not-a-number", None, object()):
+        with pytest.raises(ValueError, match="live_level"):
+            compute_live_vkospi(past, bad_level, decision, session_day_fn=_closed_session_fn())
+    with pytest.raises(ValueError, match="past_closes"):
+        compute_live_vkospi(None, closes[44], decision, session_day_fn=_closed_session_fn())
+    with pytest.raises(ValueError, match="past_closes"):
+        compute_live_vkospi([1.0, 2.0], closes[44], decision, session_day_fn=_closed_session_fn())
+    with pytest.raises(ValueError, match="missing date/close"):
+        compute_live_vkospi(pd.DataFrame({"date": days[:44]}), closes[44], decision, session_day_fn=_closed_session_fn())
+    with pytest.raises(ValueError, match="fewer than"):
+        compute_live_vkospi(
+            pd.DataFrame(columns=["date", "close"]), closes[44], decision, session_day_fn=_closed_session_fn()
+        )
+    dateless = pd.DataFrame({"date": [*list(days[:43]), None], "close": closes[:44]})
+    with pytest.raises(ValueError, match="unparsable date"):
+        compute_live_vkospi(dateless, closes[44], decision, session_day_fn=_closed_session_fn())
+
+
+def test_compute_live_vkospi_rejects_degenerate_flat_history() -> None:
+    import pytest
+
+    from src.daily.price_ingest import compute_live_vkospi
+
+    days = pd.bdate_range("2026-04-01", periods=25)
+    flat = pd.DataFrame({"date": days[:24], "close": [2500.0] * 24})
+    with pytest.raises(ValueError, match="non-finite or non-positive"):
+        compute_live_vkospi(flat, 2500.0, days[24], session_day_fn=_closed_session_fn())
+
+
+def _hold_price_sidecar(path):
+    import contextlib
+    import fcntl
+
+    from src.utils.file_lock import sidecar_lock_path
+
+    @contextlib.contextmanager
+    def _guard():
+        lock_path = sidecar_lock_path(path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = open(lock_path, "w")  # noqa: PTH123, SIM115 - lock held across the block
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+
+    return _guard()
+
+
+def test_run_price_ingest_refuses_when_price_history_locked(monkeypatch, tmp_path) -> None:
+    import pytest
+
+    mod, days, calls = _orchestrate_fakes(monkeypatch, {"2026-09-08", "2026-09-09", "2026-09-10"})
+    path = tmp_path / "ph.parquet"
+    _write_panel(path, _panel_rows("000001", [days["2026-09-07"], days["2026-09-08"], days["2026-09-09"]], [10000.0] * 3))
+    before = path.read_bytes()
+
+    from src.data.io_utils import StoreLockTimeoutError
+
+    with (
+        _hold_price_sidecar(path),
+        pytest.raises(StoreLockTimeoutError),
+    ):
+        asyncio.run(mod.run_price_ingest(today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(), kis=FakeKis(), kiwoom=FakeKiwoom()))
+
+    assert calls == []
+    assert path.read_bytes() == before
+
+
+def test_run_price_ingest_holds_lock_through_write(monkeypatch, tmp_path) -> None:
+    import errno
+    import fcntl
+    import os
+    from pathlib import Path
+
+    import src.daily.price_ingest as mod
+    from src.utils.file_lock import sidecar_lock_path
+
+    mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-08", "2026-09-09", "2026-09-10"})
+    path = tmp_path / "ph.parquet"
+    _write_panel(path, _panel_rows("000001", [days["2026-09-07"], days["2026-09-08"], days["2026-09-09"]], [10000.0] * 3)
+                 + _panel_rows("000002", [days["2026-09-03"], days["2026-09-04"], days["2026-09-07"]], [20000.0] * 3, volume=100.0))
+    real_write = mod.write_price_history_parquet
+    state: dict = {}
+
+    def _probing_write(df, target, *args, **kwargs):
+        lock_path = sidecar_lock_path(Path(target))
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    raise
+                state["contended"] = True
+            else:
+                state["contended"] = False
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        return real_write(df, target, *args, **kwargs)
+
+    monkeypatch.setattr(mod, "write_price_history_parquet", _probing_write)
+
+    report = asyncio.run(mod.run_price_ingest(today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(), kis=FakeKis(), kiwoom=FakeKiwoom()))
+
+    assert report.wrote is True
+    assert state.get("contended") is True
+    assert not sidecar_lock_path(path).exists()
+    probe = os.open(sidecar_lock_path(path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe, fcntl.LOCK_UN)
+    finally:
+        os.close(probe)
+        sidecar_lock_path(path).unlink(missing_ok=True)

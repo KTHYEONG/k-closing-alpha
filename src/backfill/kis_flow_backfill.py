@@ -8,12 +8,15 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
 from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.api.toss.client import TossApiClient
+
+if TYPE_CHECKING:
+    import aiohttp
 from src.daily.price_ingest import VendorResponseError, parse_toss_program_rows
 from src.sync.fetcher_investor import get_investor_trade_daily_async
 from src.sync.fetcher_program import get_program_history_async
@@ -114,7 +117,7 @@ def _read_checkpoints(checkpoint_dir: Path) -> pd.DataFrame:
     return pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
 
 
-async def fetch_toss_program_history(session: object, toss: TossApiClient, symbol: str, dates: list[str], *, max_calls: int = 30) -> dict[str, float]:
+async def fetch_toss_program_history(session: aiohttp.ClientSession, toss: TossApiClient, symbol: str, dates: list[str], *, max_calls: int = 30) -> dict[str, float]:
     if not dates:
         return {}
     floor = pd.Timestamp(min(dates))
@@ -135,7 +138,7 @@ async def fetch_toss_program_history(session: object, toss: TossApiClient, symbo
 
 
 async def _fetch_symbol(
-    session: object,
+    session: aiohttp.ClientSession,
     client: KisApiClient,
     limiter: AsyncRateLimiter,
     symbol: str,
@@ -177,7 +180,7 @@ async def _fetch_symbol(
 
 
 async def _fetch_symbol_guarded(
-    session: object,
+    session: aiohttp.ClientSession,
     client: KisApiClient,
     limiter: AsyncRateLimiter,
     semaphore: asyncio.Semaphore,

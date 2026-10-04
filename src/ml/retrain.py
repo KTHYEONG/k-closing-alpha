@@ -22,9 +22,9 @@ from src.ml.retrain_registry import (
     build_retrain_record,
     resolve_code_commit_env,
 )
+from src.ml.topk_contract import save_production_bundle
 from src.ml.topk_ranker_research import (
     run_topk_ranker_backtest,
-    save_production_bundle,
     topk_ranker_report_to_frame,
     train_production_bundle,
 )
@@ -129,9 +129,9 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError(f"price_history not found: {settings.PRICE_HISTORY_PARQUET_PATH}")
         ph, market_dates, d_to_idx = load_and_prepare_price_history(settings.PRICE_HISTORY_PARQUET_PATH)
         train_start = pd.Timestamp(args.ranker_train_start) if args.ranker_train_start else None
-        report = run_topk_ranker_backtest(ph, market_dates, d_to_idx, train_start=train_start)
-        atomic_write_parquet(topk_ranker_report_to_frame(report), Path(args.export_dir) / "topk_ranker_report.parquet")
-        logger.info("[EVAL] stage=topk_ranker verdict=%s reasons=%s", report.verdict, report.verdict_reasons)
+        ranker_report = run_topk_ranker_backtest(ph, market_dates, d_to_idx, train_start=train_start)
+        atomic_write_parquet(topk_ranker_report_to_frame(ranker_report), Path(args.export_dir) / "topk_ranker_report.parquet")
+        logger.info("[EVAL] stage=topk_ranker verdict=%s reasons=%s", ranker_report.verdict, ranker_report.verdict_reasons)
         return
 
     if args.exit_grid_revalidation:

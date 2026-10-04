@@ -7,6 +7,8 @@ import datetime as dt
 from pathlib import Path
 from typing import Any
 
+from src.execution.paper_broker import HeldRoster
+
 
 def _seoul(year: int, month: int, day: int, hour: int, minute: int, second: int = 0) -> dt.datetime:
     from src.data.capture_contracts import SEOUL
@@ -228,7 +230,7 @@ def test_opening_follows_previous_cohort(tmp_path, monkeypatch) -> None:
 
     store = _store(tmp_path)
     _publish_cohort(store, "2026-09-16", ["000001", "000002"])
-    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
     profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=600)
     clock = _clock("2026-09-17")
     state = {"now": _seoul(2026, 9, 17, 8, 30)}
@@ -263,7 +265,7 @@ def test_absent_prior_cohort_keeps_known_position(tmp_path, monkeypatch) -> None
     from src.data.capture_contracts import CaptureStatus
 
     store = _store(tmp_path)
-    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: ["000003"])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster(("000003",), True, None))
     profile = _profile(tmp_path)
     clock = _clock("2026-09-17")
     now = _seoul(2026, 9, 17, 9, 5)
@@ -407,7 +409,7 @@ def test_delayed_open_resolves_within_deadline(tmp_path, monkeypatch) -> None:
 
     store = _store(tmp_path)
     _publish_cohort(store, "2026-09-16", ["000001"])
-    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
     profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=600)
     clock = _clock("2026-09-17")
     state = {"now": _seoul(2026, 9, 17, 8, 30)}
@@ -454,7 +456,7 @@ def test_late_open_symbol_does_not_starve_later_symbols(tmp_path, monkeypatch) -
 
     store = _store(tmp_path)
     _publish_cohort(store, "2026-09-16", ["000001", "000002", "000003"])
-    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
     profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=180)
     clock = _clock("2026-09-17")
     state = {"now": _seoul(2026, 9, 17, 8, 30)}
@@ -489,7 +491,7 @@ def test_unresolved_open_stays_partial(tmp_path, monkeypatch) -> None:
 
     store = _store(tmp_path)
     _publish_cohort(store, "2026-09-16", ["000001"])
-    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
     profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=31)
     clock = _clock("2026-09-17")
     state = {"now": _seoul(2026, 9, 17, 8, 30)}
@@ -628,7 +630,7 @@ def test_open_roster_merges_positions_with_previous(tmp_path, monkeypatch) -> No
 
     store = _store(tmp_path)
     _publish_cohort(store, "2026-09-16", ["000001"])
-    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: ["000002"])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster(("000002",), True, None))
     profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=600)
     clock = _clock("2026-09-17")
     state = {"now": _seoul(2026, 9, 17, 8, 30)}
@@ -689,7 +691,7 @@ def test_open_persistence_faults_stay_partial(tmp_path, monkeypatch) -> None:
 
     store = _store(tmp_path)
     _publish_cohort(store, "2026-09-16", ["000001"])
-    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
     profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=600)
     clock = _clock("2026-09-17")
     state = {"now": _seoul(2026, 9, 17, 8, 30)}
@@ -718,7 +720,7 @@ def test_open_frame_fault_keeps_partial(tmp_path, monkeypatch) -> None:
 
     store = _store(tmp_path)
     _publish_cohort(store, "2026-09-16", ["000001"])
-    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
     profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=600)
     clock = _clock("2026-09-17")
     state = {"now": _seoul(2026, 9, 17, 8, 30)}
@@ -744,9 +746,7 @@ def test_open_frame_fault_keeps_partial(tmp_path, monkeypatch) -> None:
 
 
 def test_capture_root_and_positions_helpers(tmp_path, monkeypatch) -> None:
-    """Root override and position reader fallbacks behave."""
-    import pandas as pd
-
+    """Root override and capture helpers behave."""
     from src import settings as app_settings
     from src.daily import auction_capture
 
@@ -755,22 +755,6 @@ def test_capture_root_and_positions_helpers(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(app_settings, "HISTORY_DIR", tmp_path, raising=False)
     implicit = _profile(tmp_path, COLLECTION_ROOT=None)
     assert auction_capture._capture_root(implicit) == tmp_path / "capture"
-    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
-    assert auction_capture._open_position_symbols() == []
-
-    class _Ledger:
-        def load_open_positions(self) -> Any:
-            return pd.DataFrame({"symbol": ["000001", " ", "000001"]})
-
-    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", lambda *a, **k: _Ledger())
-    assert auction_capture._open_position_symbols() == ["000001"]
-
-    class _EmptyLedger:
-        def load_open_positions(self) -> Any:
-            return pd.DataFrame()
-
-    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", lambda *a, **k: _EmptyLedger())
-    assert auction_capture._open_position_symbols() == []
     assert auction_capture._extract_open_price(None) == 0
     assert auction_capture._extract_open_price({"output": None}) == 0
     assert auction_capture._extract_open_price({"output": {"stck_oprc": "bad"}}) == 0
@@ -939,7 +923,7 @@ def test_run_async_open_uses_actual_previous_trading_day(tmp_path, monkeypatch) 
     """Opening after a holiday run uses the real previous trading day, not the previous weekday."""
     import pandas as pd
 
-    from src.daily import auction_capture, collect
+    from src.daily import auction_capture
 
     _stub_research_clients(monkeypatch)
 
@@ -956,7 +940,7 @@ def test_run_async_open_uses_actual_previous_trading_day(tmp_path, monkeypatch) 
         return "ok"
 
     monkeypatch.setattr(auction_capture, "is_kis_trading_day", _open)
-    monkeypatch.setattr(collect, "resolve_prev_trading_day_kis", _prev)
+    monkeypatch.setattr(auction_capture, "resolve_prev_trading_day_kis", _prev)
     monkeypatch.setattr(auction_capture, "run_auction_capture", _capture)
     assert asyncio.run(auction_capture._run_async("2026-09-28", "open", _profile(tmp_path))) == "ok"
     assert seen["previous_trading_day"] == "2026-09-23"
@@ -973,7 +957,7 @@ def test_resolve_roster_prefers_supplied_previous_trading_day(tmp_path, monkeypa
             requested.append(day)
             raise FileNotFoundError(day)
 
-    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
     from datetime import datetime
 
     auction_capture._resolve_roster("2026-09-28", "open", _Store(), datetime(2026, 9, 28, 8, 0), "2026-09-23")  # type: ignore[arg-type]
@@ -1408,7 +1392,7 @@ def test_open_repass_observes_only_unresolved_symbols(tmp_path, monkeypatch) -> 
     store = _store(tmp_path)
     roster = ["000001", "000002", "000003", "000004", "000005"]
     _publish_cohort(store, "2026-09-16", roster)
-    monkeypatch.setattr(auction_capture, "_open_position_symbols", lambda: [])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
     profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=60)
     clock = _clock("2026-09-17")
     state = {"now": _seoul(2026, 9, 17, 8, 30)}
@@ -1444,3 +1428,124 @@ def test_open_repass_observes_only_unresolved_symbols(tmp_path, monkeypatch) -> 
     assert len(price_entries) == 5
     assert all(e.status == CaptureStatus.COMPLETE for e in price_entries)
     assert manifest.status == CaptureStatus.COMPLETE
+
+
+def test_open_roster_ledger_failure_marks_manifest_partial(tmp_path, monkeypatch, caplog) -> None:
+    """A not-ok held roster forces PARTIAL even when every observed entry is COMPLETE."""
+    import logging
+
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-16", ["000001", "000002"])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), False, "OSError"))
+    profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=600)
+    clock = _clock("2026-09-17")
+    state = {"now": _seoul(2026, 9, 17, 8, 30)}
+
+    async def _sleep(seconds: float) -> None:
+        state["now"] += dt.timedelta(seconds=seconds)
+
+    def _advance() -> None:
+        state["now"] += dt.timedelta(seconds=20)
+
+    client = _FakeClient(price_seq={"000001": [100], "000002": [200]}, calls=[], advance=_advance)
+    with caplog.at_level(logging.WARNING, logger=auction_capture.logger.name):
+        manifest = _run(
+            auction_capture.run_auction_capture(
+                "2026-09-17",
+                phase="open",
+                profile=profile,
+                store=store,
+                clients=[client],
+                session_clock=clock,
+                now_fn=lambda: state["now"],
+                sleep_fn=_sleep,
+            )
+        )
+    assert manifest.status == CaptureStatus.PARTIAL
+    assert any("reason=held_roster_unavailable error=OSError" in r.message for r in caplog.records)
+
+
+def test_open_roster_happy_path_stays_complete(tmp_path, monkeypatch) -> None:
+    """Held symbols join the roster after cohort codes without forcing PARTIAL."""
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-16", ["000001"])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster(("000009",), True, None))
+    profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=600)
+    clock = _clock("2026-09-17")
+    state = {"now": _seoul(2026, 9, 17, 8, 30)}
+
+    async def _sleep(seconds: float) -> None:
+        state["now"] += dt.timedelta(seconds=seconds)
+
+    def _advance() -> None:
+        state["now"] += dt.timedelta(seconds=20)
+
+    client = _FakeClient(price_seq={"000001": [100], "000009": [200]}, calls=[], advance=_advance)
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="open",
+            profile=profile,
+            store=store,
+            clients=[client],
+            session_clock=clock,
+            now_fn=lambda: state["now"],
+            sleep_fn=_sleep,
+        )
+    )
+    symbols = [e.symbol for e in manifest.entries]
+    assert symbols.index("000001") < symbols.index("000009")
+    assert manifest.status == CaptureStatus.COMPLETE
+
+
+def test_open_roster_missing_previous_uses_held_symbols(tmp_path, monkeypatch) -> None:
+    """No previous cohort: the roster is exactly the held symbols, still incomplete."""
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster(("000003",), True, None))
+    roster, cohort_id, incomplete = auction_capture._resolve_roster(  # type: ignore[arg-type]
+        "2026-09-17", "open", store, _seoul(2026, 9, 17, 9, 5), "2026-09-16",
+    )
+    assert (roster, cohort_id, incomplete) == (["000003"], None, True)
+
+
+def test_close_roster_never_reads_ledger(tmp_path, monkeypatch) -> None:
+    """Close phase resolves without touching the ledger."""
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", ["000001"])
+
+    def _boom() -> HeldRoster:
+        raise AssertionError("ledger must not be read")
+
+    monkeypatch.setattr(auction_capture, "load_held_roster", _boom)
+    roster, _, incomplete = auction_capture._resolve_roster(  # type: ignore[arg-type]
+        "2026-09-17", "close", store, _seoul(2026, 9, 17, 15, 0),
+    )
+    assert roster == ["000001"]
+    assert incomplete is False
+
+
+def test_open_roster_missing_previous_and_ledger_failure_warns_both(tmp_path, monkeypatch, caplog) -> None:
+    """No previous cohort plus a not-ok roster: empty roster, still incomplete, both warnings."""
+    import logging
+
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), False, "OSError"))
+    with caplog.at_level(logging.WARNING, logger=auction_capture.logger.name):
+        roster, cohort_id, incomplete = auction_capture._resolve_roster(  # type: ignore[arg-type]
+            "2026-09-17", "open", store, _seoul(2026, 9, 17, 9, 5), "2026-09-16",
+        )
+    assert (roster, cohort_id, incomplete) == ([], None, True)
+    assert any("reason=missing_previous" in r.message for r in caplog.records)
+    assert any("reason=held_roster_unavailable error=OSError" in r.message for r in caplog.records)

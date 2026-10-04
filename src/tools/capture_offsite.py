@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import tarfile
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -28,6 +28,7 @@ import pyarrow as pa
 
 from src.config.collection import CollectionSettings
 from src.data.capture_store import resolve_capture_root as _capture_root
+from src.data.io_utils import atomic_write_text
 from src.tools.offsite_common import (
     DATED_DIR_RE as _DATE_RE,
 )
@@ -371,10 +372,7 @@ def _load_scan_state(capture_root: Path) -> dict[str, int]:
 
 def _save_scan_state(capture_root: Path, state: Mapping[str, int]) -> None:
     path = capture_root / "offsite" / "scan_state.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(dict(state), sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_text(path, json.dumps(dict(state), sort_keys=True), mode=None)
 
 
 def _remote_path(config: OffsiteConfig, tier: str, trading_date: str, seg: str) -> str:
@@ -669,6 +667,57 @@ def _append_ledger_entry(ledger_path: Path, entry: LedgerEntry) -> None:
         os.fsync(handle.fileno())
 
 
+class SealLockHeldError(RuntimeError):
+    """Another process holds the local seal lock (capture_root/offsite/.seal.lock)."""
+
+
+class SealLockUnavailableError(SealLockHeldError):
+    """The local seal lock file exists but this uid can open it neither read-write nor read-only."""
+
+
+def _open_lock_fd(lock_path: Path) -> int:
+    # flock needs only an open descriptor, not write access: a 0644 lock file left by another uid
+    # (e.g. a root-run manual job) is still lockable read-only, so it must not fail the run.
+    try:
+        return os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    except PermissionError:
+        return os.open(lock_path, os.O_RDONLY)
+
+
+@contextlib.contextmanager
+def _hold_seal_lock(capture_root: Path) -> Iterator[None]:
+    """Hold the local seal lock for one seal or prune pass (single non-blocking attempt).
+
+    The lock file is created 0644 under ``capture_root/offsite/`` and never unlinked. Any flock failure
+    is treated as "held" and fails fast, because both holders are long batch jobs that must not queue.
+    A lock file owned by another uid is opened read-only (flock does not need write access).
+
+    Raises:
+        SealLockHeldError: The lock is held elsewhere; message ``"another seal run holds the local seal
+            lock"``, chained from the flock ``OSError``.
+        SealLockUnavailableError: The lock file cannot be opened at all (foreign uid, mode without read
+            permission); mutual exclusion cannot be established, so the pass must not run.
+    """
+    lock_path = Path(capture_root) / "offsite" / ".seal.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = _open_lock_fd(lock_path)
+    except PermissionError as exc:
+        raise SealLockUnavailableError(f"local seal lock is not accessible to this uid: {lock_path.name}") from exc
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise SealLockHeldError("another seal run holds the local seal lock") from exc
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def seal_and_upload(
     capture_root: Path,
     *,
@@ -699,21 +748,8 @@ def seal_and_upload(
     if deadline is not None and (deadline.tzinfo is None or deadline.utcoffset() is None):
         raise ValueError(f"deadline must be timezone-aware: {deadline!r}")
     capture_root = Path(capture_root)
-    lock_path = capture_root / "offsite" / ".seal.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            raise RuntimeError("another seal run holds the local seal lock") from exc
-        try:
-            return _seal_locked(capture_root, today=today, full_scan=full_scan, deadline=deadline, run_fn=run_fn, now_fn=now_fn, config=config)
-        finally:
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+    with _hold_seal_lock(capture_root):
+        return _seal_locked(capture_root, today=today, full_scan=full_scan, deadline=deadline, run_fn=run_fn, now_fn=now_fn, config=config)
 
 
 def _seal_locked(
@@ -924,9 +960,21 @@ def _validate_manifest_retention(retention_days: int) -> None:
 
 @dataclass(frozen=True)
 class LocalRetentionReport:
+    """Outcome of one local sealed-capture prune pass.
+
+    Attributes:
+        removed: Date directories removed (or that would be, in dry-run).
+        kept: Expired date directories kept, with the reason.
+        bytes_removed: Bytes reclaimed (or reclaimable, in dry-run).
+        skipped_reason: None for a completed pass; otherwise why the pass did not run (removed/kept are
+            then empty): ``"seal_lock_held"`` (a seal holds the lock), ``"seal_lock_unavailable"`` (the lock
+            file is not openable by this uid) or ``"capture_root_missing"`` (nothing to prune).
+    """
+
     removed: tuple[str, ...]
     kept: tuple[tuple[str, str], ...]
     bytes_removed: int
+    skipped_reason: str | None = None
 
 
 def prune_local_sealed_capture(
@@ -948,15 +996,21 @@ def prune_local_sealed_capture(
     all, because the sealer counts ledger members missing from a directory it still
     scans.
 
+    The whole scan-verify-delete pass holds the local seal lock, the same lock seal_and_upload holds.
+    A seal scanning a directory that disappears mid-walk fails or miscounts missing sealed members.
+    systemd serializes the scheduled units through the shared Drive lock, but a manual prune does not.
+
     Args:
         capture_root: Capture store root (holds the tiers and offsite/ledger).
         today: KST calendar date of the run.
         retention_days: Date directories strictly older than today - retention_days are candidates.
         run_fn: Subprocess runner for ``rclone md5sum`` (test injection).
         config: Offsite contract (tiers, remote_root, rclone timeout).
+        dry_run: List targets without deleting (still holds the seal lock).
 
     Returns:
-        Removed directories, expired directories kept with a reason, and bytes reclaimed.
+        Removed directories, expired directories kept with a reason, and bytes reclaimed; or an empty
+        report with ``skipped_reason`` set when the pass could not run (see LocalRetentionReport).
 
     Raises:
         OSError: Deleting an eligible directory failed; partial removal is never silenced.
@@ -969,114 +1023,126 @@ def prune_local_sealed_capture(
             f"(recent_window_days={config.recent_window_days})"
         )
     _validate_manifest_retention(retention_days)
-    capture_root = Path(capture_root)
-    cutoff = today - timedelta(days=retention_days)
-    rclone: str | None = None
-    removed: list[str] = []
-    kept: list[tuple[str, str]] = []
-    bytes_removed = 0
-    for tier in sorted(config.tiers):
-        tier_root = capture_root / tier
-        if not tier_root.exists():
-            continue
-        if tier_root.is_symlink() or not tier_root.is_dir():
-            continue
-        for child in sorted(tier_root.iterdir(), key=lambda entry: entry.name):
-            name = child.name
-            if not _is_valid_date(name):
-                continue
-            parsed = date.fromisoformat(name)
-            if parsed >= cutoff:
-                continue
-            label = f"{tier}/{name}"
-            if child.is_symlink():
-                kept.append((label, "symlink"))
-                continue
-            if not child.is_dir():
-                continue
-            try:
-                entries = read_ledger(capture_root, tier, name)
-            except ValueError:
-                kept.append((label, "ledger_invalid"))
-                continue
-            if not entries:
-                kept.append((label, "no_ledger"))
-                continue
-            sealed_sizes: dict[str, int] = {}
-            for ledger_entry in entries:
-                for member in ledger_entry.members:
-                    sealed_sizes[member.path] = member.size
-            found_inflight = False
-            found_unsealed = False
-            found_size_mismatch = False
-            found_symlink = False
-            regular_sizes = 0
-            for root, dirs, files in os.walk(child):
-                for dirname in dirs:
-                    if (Path(root) / dirname).is_symlink():
-                        found_symlink = True
-                for filename in files:
-                    if _is_inflight(filename):
-                        found_inflight = True
-                    full = Path(root) / filename
-                    if full.is_symlink():
-                        found_symlink = True
+    if not Path(capture_root).is_dir():
+        # Nothing to prune; taking the lock would create offsite/ under a missing (unmounted) root.
+        logger.warning("[SYS] stage=capture_prune status=SKIPPED reason=capture_root_missing")
+        return LocalRetentionReport(removed=(), kept=(), bytes_removed=0, skipped_reason="capture_root_missing")
+    try:
+        with _hold_seal_lock(capture_root):
+            capture_root = Path(capture_root)
+            cutoff = today - timedelta(days=retention_days)
+            rclone: str | None = None
+            removed: list[str] = []
+            kept: list[tuple[str, str]] = []
+            bytes_removed = 0
+            for tier in sorted(config.tiers):
+                tier_root = capture_root / tier
+                if not tier_root.exists():
+                    continue
+                if tier_root.is_symlink() or not tier_root.is_dir():
+                    continue
+                for child in sorted(tier_root.iterdir(), key=lambda entry: entry.name):
+                    name = child.name
+                    if not _is_valid_date(name):
                         continue
-                    if not full.is_file():
+                    parsed = date.fromisoformat(name)
+                    if parsed >= cutoff:
                         continue
-                    rel = full.relative_to(capture_root).as_posix()
-                    recorded = sealed_sizes.get(rel)
-                    if recorded is None:
-                        found_unsealed = True
-                    elif full.stat().st_size != recorded:
-                        found_size_mismatch = True
-                    regular_sizes += full.stat().st_size
-            if found_inflight:
-                kept.append((label, "inflight"))
-                continue
-            if found_unsealed:
-                kept.append((label, "unsealed_file"))
-                continue
-            if found_size_mismatch:
-                kept.append((label, "size_mismatch"))
-                continue
-            if found_symlink:
-                kept.append((label, "symlink_member"))
-                continue
-            if rclone is None:
-                rclone = _resolve_rclone_bin()
-            verified = True
-            for ledger_entry in entries:
-                try:
-                    result = run_fn(
-                        [rclone, "md5sum", ledger_entry.remote_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=config.rclone_timeout_sec,
-                        check=False,
-                    )
-                except Exception:  # noqa: BLE001 - any runner failure keeps the directory
-                    verified = False
-                    break
-                if result.returncode != 0:
-                    verified = False
-                    break
-                if _parse_remote_md5(result.stdout) != ledger_entry.archive_md5:
-                    verified = False
-                    break
-            if not verified:
-                kept.append((label, "remote_unverified"))
-                continue
-            if dry_run:
-                removed.append(label)
-                bytes_removed += regular_sizes
-                continue
-            shutil.rmtree(child)
-            removed.append(label)
-            bytes_removed += regular_sizes
-    removed_sorted = tuple(sorted(removed))
-    kept_sorted = tuple(sorted(kept))
-    return LocalRetentionReport(removed=removed_sorted, kept=kept_sorted, bytes_removed=bytes_removed)
+                    label = f"{tier}/{name}"
+                    if child.is_symlink():
+                        kept.append((label, "symlink"))
+                        continue
+                    if not child.is_dir():
+                        continue
+                    try:
+                        entries = read_ledger(capture_root, tier, name)
+                    except ValueError:
+                        kept.append((label, "ledger_invalid"))
+                        continue
+                    if not entries:
+                        kept.append((label, "no_ledger"))
+                        continue
+                    sealed_sizes: dict[str, int] = {}
+                    for ledger_entry in entries:
+                        for member in ledger_entry.members:
+                            sealed_sizes[member.path] = member.size
+                    found_inflight = False
+                    found_unsealed = False
+                    found_size_mismatch = False
+                    found_symlink = False
+                    regular_sizes = 0
+                    for root, dirs, files in os.walk(child):
+                        for dirname in dirs:
+                            if (Path(root) / dirname).is_symlink():
+                                found_symlink = True
+                        for filename in files:
+                            if _is_inflight(filename):
+                                found_inflight = True
+                            full = Path(root) / filename
+                            if full.is_symlink():
+                                found_symlink = True
+                                continue
+                            if not full.is_file():
+                                continue
+                            rel = full.relative_to(capture_root).as_posix()
+                            recorded = sealed_sizes.get(rel)
+                            if recorded is None:
+                                found_unsealed = True
+                            elif full.stat().st_size != recorded:
+                                found_size_mismatch = True
+                            regular_sizes += full.stat().st_size
+                    if found_inflight:
+                        kept.append((label, "inflight"))
+                        continue
+                    if found_unsealed:
+                        kept.append((label, "unsealed_file"))
+                        continue
+                    if found_size_mismatch:
+                        kept.append((label, "size_mismatch"))
+                        continue
+                    if found_symlink:
+                        kept.append((label, "symlink_member"))
+                        continue
+                    if rclone is None:
+                        rclone = _resolve_rclone_bin()
+                    verified = True
+                    for ledger_entry in entries:
+                        try:
+                            result = run_fn(
+                                [rclone, "md5sum", ledger_entry.remote_path],
+                                capture_output=True,
+                                text=True,
+                                timeout=config.rclone_timeout_sec,
+                                check=False,
+                            )
+                        except Exception:  # noqa: BLE001 - any runner failure keeps the directory
+                            verified = False
+                            break
+                        if result.returncode != 0:
+                            verified = False
+                            break
+                        if _parse_remote_md5(result.stdout) != ledger_entry.archive_md5:
+                            verified = False
+                            break
+                    if not verified:
+                        kept.append((label, "remote_unverified"))
+                        continue
+                    if dry_run:
+                        removed.append(label)
+                        bytes_removed += regular_sizes
+                        continue
+                    shutil.rmtree(child)
+                    removed.append(label)
+                    bytes_removed += regular_sizes
+            removed_sorted = tuple(sorted(removed))
+            kept_sorted = tuple(sorted(kept))
+            return LocalRetentionReport(removed=removed_sorted, kept=kept_sorted, bytes_removed=bytes_removed)
+    except SealLockUnavailableError:
+        logger.error("[SYS] stage=capture_prune status=SKIPPED reason=seal_lock_unavailable")
+        return LocalRetentionReport(removed=(), kept=(), bytes_removed=0, skipped_reason="seal_lock_unavailable")
+    except SealLockHeldError:
+        logger.warning("[SYS] stage=capture_prune status=SKIPPED reason=seal_lock_held")
+        return LocalRetentionReport(removed=(), kept=(), bytes_removed=0, skipped_reason="seal_lock_held")
 
 
 def restore_date(

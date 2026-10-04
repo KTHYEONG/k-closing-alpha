@@ -27,6 +27,10 @@ class KiwoomSettings(EnvSettings):
     KIWOOM_BASE_URL: str = Field(default="https://api.kiwoom.com", validation_alias=AliasChoices("KIWOOM_BASE_URL", "KIWOM_BASE_URL"))
     KIWOOM_TOKEN_PROTECTED_WINDOWS: tuple[str, ...] = Field(default=("15:10-15:40",))
     """KST HH:MM-HH:MM windows in which the shared Kiwoom token must not expire (decision capture)."""
+    KIWOOM_RATE_LIMIT_MAX_RETRIES: int = Field(default=3, ge=1)
+    """Rate-limit attempts per TR call (HTTP 429). An auth-refresh replay does not consume one."""
+    KIWOOM_RATE_LIMIT_BACKOFF_SECONDS: float = Field(default=1.2, gt=0.0)
+    """Fixed wait after a Kiwoom HTTP 429 before the next attempt (the per-TR bucket is 5 req/s)."""
 
     @field_validator("KIWOOM_TOKEN_PROTECTED_WINDOWS", mode="before")
     @classmethod

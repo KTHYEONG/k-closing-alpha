@@ -1133,3 +1133,110 @@ def test_ledger_conservation_matches_golden_values() -> None:
     assert nav["cumulative_cost"] == 2312
     assert nav["nav"] == 10_097_688
     assert (nav["n_open_positions"], nav["n_closed_trades"]) == (1, 1)
+
+
+def _open_frame(symbols):
+    import pandas as pd
+
+    n = len(symbols)
+    return pd.DataFrame(
+        {
+            "entry_order_id": [f"o{i}" for i in range(n)],
+            "symbol": list(symbols),
+            "qty": [1] * n,
+            "entry_price": [1000] * n,
+            "decision_date": ["2026-09-29"] * n,
+        }
+    )
+
+
+def test_held_roster_reads_open_lots_normalized() -> None:
+    from src.execution.paper_broker import load_held_roster
+
+    class _Ledger:
+        def load_open_positions(self):
+            return _open_frame(["000660", "5930", "000660"])
+
+    roster = load_held_roster(_Ledger())  # type: ignore[arg-type]
+
+    assert roster.symbols == ("000660", "005930")
+    assert roster.ok is True
+    assert roster.failure_reason is None
+
+
+def test_held_roster_ledger_failure_is_not_ok(monkeypatch) -> None:
+    from src.execution.paper_broker import load_held_roster
+
+    def _boom(self):
+        raise OSError("locked")
+
+    monkeypatch.setattr("src.execution.paper_broker.PaperLedger.load_open_positions", _boom)
+
+    roster = load_held_roster()
+
+    assert roster.ok is False
+    assert roster.failure_reason == "OSError"
+    assert roster.symbols == ()
+
+
+def test_held_roster_construction_failure_is_not_ok(monkeypatch) -> None:
+    from src.execution.paper_broker import load_held_roster
+
+    def _boom_factory(*args, **kwargs):
+        raise RuntimeError("no ledger")
+
+    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", _boom_factory)
+
+    roster = load_held_roster()
+
+    assert roster.ok is False
+    assert roster.failure_reason == "RuntimeError"
+
+
+def test_held_roster_empty_ledger_is_ok(tmp_path) -> None:
+    from src.execution.paper_broker import PaperLedger, load_held_roster
+
+    roster = load_held_roster(PaperLedger(tmp_path / "ledger"))
+
+    assert roster.ok is True
+    assert roster.symbols == ()
+
+
+def test_held_roster_unidentified_symbol_fails_closed() -> None:
+    from src.execution.paper_broker import HELD_ROSTER_UNIDENTIFIED_SYMBOL, load_held_roster
+
+    class _Ledger:
+        def load_open_positions(self):
+            return _open_frame(["000001", " ", None])
+
+    roster = load_held_roster(_Ledger())  # type: ignore[arg-type]
+
+    assert roster.symbols == ("000001",)
+    assert roster.ok is False
+    assert roster.failure_reason == HELD_ROSTER_UNIDENTIFIED_SYMBOL
+
+
+def test_held_roster_missing_symbol_column_fails_closed() -> None:
+    import pandas as pd
+
+    from src.execution.paper_broker import HELD_ROSTER_MISSING_SYMBOL_COLUMN, load_held_roster
+
+    class _Ledger:
+        def load_open_positions(self):
+            return pd.DataFrame({"entry_order_id": ["o1"], "qty": [1]})
+
+    roster = load_held_roster(_Ledger())  # type: ignore[arg-type]
+
+    assert roster.ok is False
+    assert roster.failure_reason == HELD_ROSTER_MISSING_SYMBOL_COLUMN
+
+
+def test_held_roster_rejects_inconsistent_flags() -> None:
+    import pytest
+
+    from src.execution.paper_broker import HeldRoster
+
+    with pytest.raises(ValueError, match="ok xor failure_reason"):
+        HeldRoster(symbols=(), ok=True, failure_reason="X")
+    with pytest.raises(ValueError, match="ok xor failure_reason"):
+        HeldRoster(symbols=(), ok=False, failure_reason=None)

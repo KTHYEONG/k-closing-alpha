@@ -638,3 +638,16 @@ def test_download_corp_code_map_transport_and_http_errors(monkeypatch) -> None:
     monkeypatch.setattr(disclosure.requests, "get", lambda *a, **k: _Bad())
     with pytest.raises(RuntimeError, match="500"):
         disclosure.download_corp_code_map(cfg)
+
+
+def test_fetch_list_page_tolerates_malformed_total_page(monkeypatch) -> None:
+    monkeypatch.setattr(
+        disclosure,
+        "_dart_get_json",
+        lambda *a, **k: {"status": "000", "list": [{"rcept_no": "1"}], "total_page": "x"},
+    )
+    rows, total = disclosure._fetch_list_page(
+        _dart_cfg(), {"crtfc_key": "k", "page_no": 1}, 1
+    )
+    assert rows == [{"rcept_no": "1"}]
+    assert total is None

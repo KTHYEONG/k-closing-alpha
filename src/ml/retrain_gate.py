@@ -16,7 +16,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.ml.topk_ranker_research import assert_bundle_screen_parity, build_dual_pool
+from src.ml.topk_contract import assert_bundle_screen_parity, bundle_feature_contract_version, feature_contract_issue
+from src.ml.topk_ranker_research import build_dual_pool
 from src.strategy.contract import DEFAULT_UNIVERSE, KCA_TOPK_COSTAWARE_001
 
 RETRAIN_GATE_EVAL_DAYS: int = 20
@@ -88,6 +89,13 @@ def build_gate_eval_frame(
     return selected[dates.isin(recent)].reset_index(drop=True)
 
 
+def _resolved_contract(bundle: dict[str, Any]) -> str | None:
+    try:
+        return bundle_feature_contract_version(bundle)
+    except ValueError:
+        return None
+
+
 def _mean_daily_rank_agreement(dates: np.ndarray, first: np.ndarray, second: np.ndarray) -> float | None:
     frame = pd.DataFrame({"date": dates, "first": first, "second": second})
     per_day = [
@@ -132,6 +140,9 @@ def evaluate_retrain_promotion(
         reasons.append(f"gate eval frame is missing features {missing}")
     if eval_frame.empty:
         reasons.append("gate eval frame is empty")
+    candidate_issue = feature_contract_issue(candidate)
+    if candidate_issue is not None:
+        reasons.append(f"candidate feature contract: {candidate_issue}")
     if reasons:
         return PromotionVerdict(promote=False, reasons=tuple(reasons), agreement=None)
 
@@ -147,7 +158,7 @@ def evaluate_retrain_promotion(
             reasons.append("candidate predictions are constant within an eval day")
     if current is None:
         return PromotionVerdict(promote=not reasons, reasons=tuple(reasons), agreement=None)
-    if list(current.get("feature_cols", [])) != feature_cols:
+    if list(current.get("feature_cols", [])) != feature_cols or _resolved_contract(current) != _resolved_contract(candidate):
         reasons.append("feature contract changed vs live bundle; certify manually and rerun with --skip-promotion-gate")
         return PromotionVerdict(promote=False, reasons=tuple(reasons), agreement=None)
     current_pred = np.asarray(current["return_model"].predict(features), dtype=np.float64)

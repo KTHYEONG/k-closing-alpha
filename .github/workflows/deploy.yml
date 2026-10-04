@@ -29,6 +29,12 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Lint (ruff)
+        run: uv run ruff check src tests tools
+
+      - name: Type check (mypy)
+        run: uv run mypy src
+
       - name: Run test suite (fail-closed deploy gate)
         run: uv run pytest -q
 

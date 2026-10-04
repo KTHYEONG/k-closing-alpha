@@ -39,7 +39,7 @@ class TossCandleFetchError(RuntimeError):
     """
 
 
-def _raise_if_toss_error(page: dict, code: str, snapshot_date: str, page_label: str) -> None:
+def _raise_if_toss_error(page: dict[str, Any], code: str, snapshot_date: str, page_label: str) -> None:
     """page가 Toss 에러 봉투({'error': {...}})면 TossCandleFetchError를 raise한다."""
     if isinstance(page, dict) and "error" in page:
         err = page["error"]

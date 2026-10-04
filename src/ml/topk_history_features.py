@@ -15,28 +15,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.config.market_session import MAX_PREV_TRADING_DAY_LOOKBACK
 from src.ml.history_features import _group_rolling
-from src.ml.research.v3_engine import FEATURE_COLS
+from src.ml.topk_contract import TOPK_COST_FEATURE_COLS as TOPK_COST_FEATURE_COLS
+from src.ml.topk_contract import TOPK_FEATURE_COLS_V2 as TOPK_FEATURE_COLS_V2
+from src.ml.topk_contract import TOPK_FLOW_FEATURE_COLS as TOPK_FLOW_FEATURE_COLS
+from src.ml.topk_contract import TOPK_HISTORY_FEATURE_COLS as TOPK_HISTORY_FEATURE_COLS
 from src.strategy.contract import DEFAULT_UNIVERSE, derive_chg_ratio
 
-TOPK_COST_FEATURE_COLS: tuple[str, ...] = ("f_tick_cost", "f_log_close")
-TOPK_FLOW_FEATURE_COLS: tuple[str, ...] = ("inst_density", "inst_rank")
-TOPK_HISTORY_FEATURE_COLS: tuple[str, ...] = (
-    "f_ret5",
-    "f_ret20",
-    "f_ret60",
-    "f_dist_high60",
-    "f_upcount20",
-    "f_on_mean20",
-    "f_on_mean60",
-    "f_upnext_on60",
-    "f_gap",
-    "f_id_mean20",
-    "f_inst_cum5",
-    "f_foreign_cum5",
-)
-# 순서 고정: colsample_bytree 가 열 순서에 의존하므로 인증 순서를 그대로 유지한다.
-TOPK_FEATURE_COLS_V2: list[str] = [*FEATURE_COLS, *TOPK_FLOW_FEATURE_COLS, *TOPK_COST_FEATURE_COLS, *TOPK_HISTORY_FEATURE_COLS]
 HISTORY_REQUIRED_COLUMNS: tuple[str, ...] = (
     "date",
     "symbol",
@@ -53,8 +39,6 @@ UP_DAY_THRESHOLD: float = DEFAULT_UNIVERSE.chg_min
 MIN_CONDITIONAL_OBS: int = 3
 # 60거래일 창 + 1일 시프트를 달력일로 덮는 서빙 조회 폭 (약 135거래일)
 HISTORY_LOOKBACK_CALENDAR_DAYS: int = 200
-# 설·추석 연휴를 넘는 직전 거래일 탐색 한도 (달력일)
-MAX_PREV_TRADING_DAY_LOOKBACK: int = 15
 _LIVE_REQUIRED_COLUMNS: tuple[str, ...] = tuple(c for c in HISTORY_REQUIRED_COLUMNS if c != "date")
 
 
@@ -101,7 +85,9 @@ def attach_lagged_flow_features(cands: pd.DataFrame, panel: pd.DataFrame) -> pd.
     dup = int(p.duplicated(["date", "symbol"]).sum())
     if dup:
         raise ValueError(f"panel carries {dup} duplicate (date, symbol) rows")
-    level = pd.to_numeric(p["close_raw"], errors="coerce").fillna(p["close"]) if "close_raw" in p.columns else p["close"]
+    level = (
+        pd.to_numeric(p["close_raw"], errors="coerce").fillna(p["close"]) if "close_raw" in p.columns else p["close"]
+    )
     p["val_krw"] = level.astype("float64") * pd.to_numeric(p["volume"], errors="coerce").astype("float64")
     p = p[["date", "symbol", "inst_netbuy", "val_krw"]].sort_values(["date", "symbol"], kind="stable")
 
@@ -160,7 +146,11 @@ def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
     id_ok = np.isfinite(op) & np.isfinite(cl) & (op > 0) & (cl > 0)
     idr = pd.Series(np.where(id_ok, cl / np.where(op > 0, op, 1.0) - 1.0, np.nan), index=p.index)
     # 순매수 금액 분모는 당시 실거래 금액이므로 원가격을 쓰고, 라이브 행(close_raw 없음)은 원가격 그대로인 close 로 폴백한다.
-    level = pd.to_numeric(p["close_raw"], errors="coerce").astype("float64").fillna(p["close"]) if "close_raw" in p.columns else p["close"]
+    level = (
+        pd.to_numeric(p["close_raw"], errors="coerce").astype("float64").fillna(p["close"])
+        if "close_raw" in p.columns
+        else p["close"]
+    )
     val = level * p["volume"]
 
     def _g(s: pd.Series) -> pd.core.groupby.SeriesGroupBy:
@@ -229,7 +219,9 @@ def attach_topk_features(cands: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFra
     return merged
 
 
-def stitch_live_panel(price_history: pd.DataFrame, live_rows: pd.DataFrame, decision_date: pd.Timestamp) -> pd.DataFrame:
+def stitch_live_panel(
+    price_history: pd.DataFrame, live_rows: pd.DataFrame, decision_date: pd.Timestamp
+) -> pd.DataFrame:
     """Append the decision-day live rows to strictly-past price history.
 
     Args:
@@ -346,7 +338,9 @@ def load_serving_price_history(
     if not src_path.exists():
         raise FileNotFoundError(f"price_history not found: {src_path}")
     if is_trading_day is None:
-        from src.data.trading_calendar import is_krx_trading_day as is_trading_day
+        from src.data.trading_calendar import is_krx_trading_day
+
+        is_trading_day = is_krx_trading_day
     d = pd.Timestamp(decision_date).normalize()
     start = d - pd.Timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)
     # 열 가지치기 + 날짜 조건 푸시다운으로 546만행 전체 적재 회피

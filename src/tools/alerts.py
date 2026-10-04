@@ -7,25 +7,28 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import logging
-import os
 import re
 import smtplib
 import subprocess
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 import requests
 
 from src import settings
+from src.api.kis.key_pool import load_kis_env
+from src.config.secret_fields import configured_secret_values
+from src.data.io_utils import atomic_write_text
 from src.utils.cli_logging import configure_cli_logging
+from src.utils.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -122,14 +125,7 @@ def enqueue_undelivered(subject: str, body: str, *, kind: str, outbox: Path | No
     name = f"{now.strftime('%Y%m%dT%H%M%S%f')}_{uuid.uuid4().hex[:8]}.json"
     payload = {"subject": subject, "body": body, "kind": kind, "enqueued_at": now.isoformat()}
     target = box / name
-    tmp = box / f"{name}.tmp"
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.replace(tmp, target)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+    atomic_write_text(target, json.dumps(payload, ensure_ascii=False), mode=None)
     return target
 
 
@@ -162,6 +158,38 @@ def _persist_undelivered(subject: str, body: str, *, kind: str) -> None:
     logger.error("[SYS] stage=alert_delivery status=UNDELIVERED subject=%s outbox=%s", subject, stored)
 
 
+def alert_credential_env_file() -> Path:
+    """Credential env file whose values are exact-masked in alert egress (BASE_DIR/.env)."""
+    return Path(settings.BASE_DIR) / ".env"
+
+
+def _alert_secret_values(env: Mapping[str, str] | None = None) -> frozenset[str]:
+    """Resolve configured credential values for alert redaction.
+
+    Reads the live settings singleton plus the credential env (``load_kis_env`` of
+    ``alert_credential_env_file()``, which also merges ``os.environ`` — on the VPS the
+    alert unit's EnvironmentFile places every pool key there). A read failure degrades
+    to settings-only values and is logged by exception type name only (OD-3).
+    """
+    if env is None:
+        try:
+            env = load_kis_env(alert_credential_env_file())
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            logger.warning("[SYS] stage=alert_redaction status=DEGRADED reason=%s", type(exc).__name__)
+            env = {}
+    cfg: Any = settings
+    return configured_secret_values(cfg, env)
+
+
+def redact_for_egress(text: str) -> str:
+    """Mask configured credential values and credential-shaped pairs in operator-facing text.
+
+    Callers that truncate or persist free text outside the alert dispatchers (event logs,
+    run-outcome reasons) must mask first, so a cut can never leave an unmatched secret prefix.
+    """
+    return redact_secrets(text, _alert_secret_values())
+
+
 def drain_alert_outbox(
     *, max_items: int | None = None, outbox: Path | None = None, send_fn: Callable[[str, str], dict[str, bool]] | None = None
 ) -> tuple[int, int]:
@@ -176,6 +204,7 @@ def drain_alert_outbox(
     box = Path(outbox) if outbox is not None else alert_outbox_dir()
     if not box.is_dir():
         return (0, 0)
+    secrets = _alert_secret_values()
     files = sorted(box.glob("*.json"))
     if max_items is not None:
         files = files[:max_items]
@@ -190,8 +219,10 @@ def drain_alert_outbox(
         if not isinstance(payload, dict) or not isinstance(payload.get("subject"), str) or not isinstance(payload.get("body"), str):
             logger.warning("[SYS] stage=alert_delivery status=CORRUPT_OUTBOX path=%s", path.name)
             break
-        redelivered_subject = f"{_REDELIVERY_SUBJECT_PREFIX}{payload['subject']}"
-        redelivered_body = f"{payload['body']}\noriginal_enqueued_at={payload.get('enqueued_at', '')}"
+        masked_subject = redact_secrets(payload["subject"], secrets)
+        masked_body = redact_secrets(payload["body"], secrets)
+        redelivered_subject = f"{_REDELIVERY_SUBJECT_PREFIX}{masked_subject}"
+        redelivered_body = f"{masked_body}\noriginal_enqueued_at={payload.get('enqueued_at', '')}"
         results = sender(redelivered_subject, redelivered_body)
         if not any(results.values()):
             break
@@ -263,6 +294,9 @@ def dispatch_digest(subject: str, body: str) -> dict[str, bool]:
     Returns:
         {"webhook": bool, "email": bool}.
     """
+    secrets = _alert_secret_values()
+    subject = redact_secrets(subject, secrets)
+    body = redact_secrets(body, secrets)
     results = _deliver_now(subject, body)
     if not any(results.values()):
         _persist_undelivered(subject, body, kind="digest")
@@ -341,11 +375,14 @@ def dispatch_failure_alert(unit: str, *, detail: str = "", subject: str | None =
     Returns:
         {"webhook": bool, "email": bool}.
     """
-    title = subject if subject is not None else f"[KCA][실패] systemd unit failed: {unit}"
-    email_body = detail or f"unit={unit} failed with no further detail"
+    secrets = _alert_secret_values()
+    redacted_subject = redact_secrets(subject, secrets) if subject is not None else None
+    redacted_detail = redact_secrets(detail, secrets)
+    title = redacted_subject if redacted_subject is not None else f"[KCA][실패] systemd unit failed: {unit}"
+    email_body = redacted_detail or f"unit={unit} failed with no further detail"
     results = {
         "webhook": _deliver_channel(
-            lambda: post_webhook_alert(settings.ALERT_WEBHOOK_URL, unit=unit, detail=detail, subject=subject),
+            lambda: post_webhook_alert(settings.ALERT_WEBHOOK_URL, unit=unit, detail=redacted_detail, subject=redacted_subject),
             channel="webhook",
         ),
         "email": _deliver_channel(
@@ -354,8 +391,8 @@ def dispatch_failure_alert(unit: str, *, detail: str = "", subject: str | None =
                 gmail_app_password=settings.ALERT_GMAIL_APP_PASSWORD,
                 to_addr=settings.ALERT_GMAIL_TO,
                 unit=unit,
-                detail=detail,
-                subject=subject,
+                detail=redacted_detail,
+                subject=redacted_subject,
             ),
             channel="email",
         ),
@@ -365,13 +402,26 @@ def dispatch_failure_alert(unit: str, *, detail: str = "", subject: str | None =
     return results
 
 
-def sanitize_journal_tail(text: str) -> str:
-    """Strip ANSI escapes and carriage-return segments, drop blanks, cap line length."""
+def sanitize_journal_tail(text: str, *, secret_values: Collection[str] = ()) -> str:
+    """Strip ANSI escapes and carriage-return segments, mask credentials, drop blanks, cap line length.
+
+    Masking runs per line before the length cap: truncating first could split a long
+    secret (KIS app secrets are ~180 chars) and leave an unmasked prefix that exact
+    matching no longer recognizes.
+
+    Args:
+        text: Raw journal output.
+        secret_values: Configured credential values to exact-mask (see redact_secrets).
+
+    Returns:
+        Sanitized newline-joined lines, each at most ALERT_LINE_MAX_CHARS plus the ellipsis.
+    """
     lines = []
     for raw in text.split("\n"):
         line = _ANSI_ESCAPE_RE.sub("", raw).split("\r")[-1].rstrip()
         if not line:
             continue
+        line = redact_secrets(line, secret_values)
         if len(line) > ALERT_LINE_MAX_CHARS:
             line = line[:ALERT_LINE_MAX_CHARS] + "…"
         lines.append(line)
@@ -578,6 +628,7 @@ def collect_unit_diagnostics(
 
     inv_id = unit_status.get("InvocationID", "")
     journal_text = ""
+    secrets = _alert_secret_values()
     if inv_id:
         try:
             journal = run(
@@ -587,7 +638,7 @@ def collect_unit_diagnostics(
                 timeout=ALERT_COMMAND_TIMEOUT_SEC,
                 check=True,
             )
-            journal_text = sanitize_journal_tail(journal.stdout)
+            journal_text = sanitize_journal_tail(journal.stdout, secret_values=secrets)
         except (OSError, subprocess.SubprocessError):
             journal_text = ""
 
@@ -600,7 +651,7 @@ def collect_unit_diagnostics(
                 timeout=ALERT_COMMAND_TIMEOUT_SEC,
                 check=True,
             )
-            journal_text = sanitize_journal_tail(journal.stdout)
+            journal_text = sanitize_journal_tail(journal.stdout, secret_values=secrets)
         except (OSError, subprocess.SubprocessError) as exc:
             journal_text = f"journal unavailable: {type(exc).__name__}"
 

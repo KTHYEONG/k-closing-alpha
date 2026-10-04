@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -15,6 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.data.capture_store import resolve_capture_root as _capture_root
+from src.data.io_utils import atomic_write_text
 from src.tools.capture_offsite import OffsiteConfig, SealReport, seal_and_upload
 from src.tools.offsite_common import OFFSITE_REMOTE_BASE
 from src.tools.offsite_common import resolve_rclone_bin as _resolve_rclone_bin
@@ -123,8 +123,6 @@ def _kst_now(now: datetime) -> datetime:
 
 def _write_report(capture_root: Path, report: BackupRunReport) -> None:
     path = capture_root / REPORT_RELPATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
     payload: dict[str, Any] = {
         "started_at": report.started_at,
         "finished_at": report.finished_at,
@@ -133,11 +131,7 @@ def _write_report(capture_root: Path, report: BackupRunReport) -> None:
     }
     if report.core_panels is not None:
         payload["core_panels"] = report.core_panels
-    tmp.write_text(
-        json.dumps(payload, sort_keys=True),
-        encoding="utf-8",
-    )
-    os.replace(tmp, path)
+    atomic_write_text(path, json.dumps(payload, sort_keys=True), mode=None)
 
 
 def run_offsite_backup(

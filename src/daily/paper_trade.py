@@ -35,7 +35,6 @@ from src.config.market_session import (
     PAPER_EXIT_WINDOW_END_HHMMSS,
 )
 from src.daily.archive import fetch_archive_snapshot
-from src.daily.collect import safe_float
 from src.daily.predict import load_topk_decision
 from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day, trading_session_gate
 from src.data.trading_calendar import is_kis_trading_day
@@ -47,6 +46,7 @@ from src.execution.paper_broker import (
     ORDER_STATUS_UNCONFIRMED,
     ORDER_STATUS_UNFILLED,
     ORDER_STATUS_ZERO_QTY,
+    PaperFill,
     PaperLedger,
     PaperOrder,
     build_auction_fill,
@@ -61,6 +61,7 @@ from src.execution.paper_broker import (
 )
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_NO_DECISION, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
+from src.utils.numeric import safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +198,7 @@ def build_entry_orders(
             continue
         orders.append(
             PaperOrder(
-                order_id=f"{decision_date}:{row['symbol']}:entry",
+                order_id=_entry_order_id(decision_date, row["symbol"]),
                 decision_date=decision_date,
                 symbol=str(row["symbol"]),
                 side="buy",
@@ -306,7 +307,8 @@ async def fetch_krx_dated_open_quote(client: Any, session: Any, code: str, decis
 
     Returns:
         DatedOpenQuote; open_price is 0 when either TR failed, the chart row is
-        missing, or the two opens differ.
+        missing, or the two opens differ. Each swallowed vendor or parse failure
+        is logged at WARNING with the exception type only.
     """
     try:
         res = await client.get_current_price(
@@ -314,7 +316,13 @@ async def fetch_krx_dated_open_quote(client: Any, session: Any, code: str, decis
         )
         output = res.get("output") if isinstance(res, dict) and res.get("rt_cd") == "0" else None
         inquire_open = int(safe_float(output.get("stck_oprc"), 0.0)) if isinstance(output, dict) else 0
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "[EXEC] stage=paper_exit_quote status=DEGRADED source=inquire_price symbol=%s date=%s error_type=%s",
+            code,
+            decision_date,
+            type(exc).__name__,
+        )
         inquire_open = 0
     start = (pd.Timestamp(decision_date) - timedelta(days=PAPER_EXIT_DATED_QUOTE_LOOKBACK_DAYS)).strftime("%Y%m%d")
     end = pd.Timestamp(decision_date).strftime("%Y%m%d")
@@ -343,7 +351,13 @@ async def fetch_krx_dated_open_quote(client: Any, session: Any, code: str, decis
                     chart_open = row_open
             if best_date:
                 business_date = f"{best_date[:4]}-{best_date[4:6]}-{best_date[6:8]}"
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "[EXEC] stage=paper_exit_quote status=DEGRADED source=daily_chart symbol=%s date=%s error_type=%s",
+            code,
+            decision_date,
+            type(exc).__name__,
+        )
         business_date = ""
         chart_open = 0
     logger.debug(
@@ -358,259 +372,322 @@ async def fetch_krx_dated_open_quote(client: Any, session: Any, code: str, decis
     return DatedOpenQuote(symbol=code, business_date=business_date, open_price=0)
 
 
-async def run_paper_session(
+def _read_clock(now_fn: Callable[[], pd.Timestamp] | None) -> pd.Timestamp:
+    """Read the session wall clock: the injected clock when given, else the aware KST system clock."""
+    return now_fn() if now_fn is not None else pd.Timestamp.now(tz="Asia/Seoul")
+
+
+def _entry_order_id(decision_date: str, symbol: object) -> str:
+    """Return the deterministic entry order id "<decision_date>:<symbol>:entry".
+
+    The id is the idempotency key of an entry decision in the append-only orders/fills ledgers and the parent
+    key that exit order ids ("<entry_order_id>:exit:<date>") extend, so every entry path must build it here.
+    symbol is formatted with str(), which equals the f-string formatting used historically.
+    """
+    return f"{decision_date}:{symbol}:entry"
+
+
+def _zero_qty_entry_order(decision_date: str, symbol: str, placed_at: pd.Timestamp) -> PaperOrder:
+    """Build the audit placeholder for a pick that produced no sized order.
+
+    Recorded with ORDER_STATUS_MISSED_AUCTION or ORDER_STATUS_ZERO_QTY so that every pick of the decision leaves
+    exactly one orders row, which is also what makes a second entry trigger idempotent.
+
+    Returns:
+        PaperOrder(order_id=_entry_order_id(decision_date, symbol), decision_date=decision_date, symbol=symbol,
+        side="buy", qty=0, limit_price=None, placed_at=placed_at, reason="entry").
+    """
+    return PaperOrder(
+        order_id=_entry_order_id(decision_date, symbol),
+        decision_date=decision_date,
+        symbol=symbol,
+        side="buy",
+        qty=0,
+        limit_price=None,
+        placed_at=placed_at,
+        reason="entry",
+    )
+
+
+def _entry_already_recorded(orders: pd.DataFrame, decision_date: str) -> bool:
+    """Return True when the orders ledger already holds an entry row for decision_date.
+
+    Entry runs are triggered twice per day (finalize-close ExecStopPost chain and a backstop timer); any entry
+    row, whatever its status, marks the decision as booked.
+
+    Args:
+        orders: Orders ledger as loaded by PaperLedger.load("orders"); may be empty.
+        decision_date: Decision date "YYYY-MM-DD".
+
+    Returns:
+        False for an empty frame; otherwise whether any row has decision_date == decision_date and
+        reason == "entry", compared exactly as stored (no dtype normalization).
+    """
+    if orders.empty:
+        return False
+    return bool(((orders["decision_date"] == decision_date) & (orders["reason"] == "entry")).any())
+
+
+def _fill_row(fill: PaperFill, order: PaperOrder) -> dict[str, Any]:
+    """Build one fills-ledger row from a fill and the order it executed.
+
+    Returns:
+        Keys in this exact order: order_id, symbol, side, qty, fill_price, filled_at (from fill),
+        decision_date (from order), trigger (from fill), and entry_order_id (from order) appended last only when
+        order.entry_order_id is not None (exit orders). Key order is preserved because a fresh ledger file takes
+        its column order from the first batch.
+    """
+    row: dict[str, Any] = {
+        "order_id": fill.order_id,
+        "symbol": fill.symbol,
+        "side": fill.side,
+        "qty": fill.qty,
+        "fill_price": fill.fill_price,
+        "filled_at": fill.filled_at,
+        "decision_date": order.decision_date,
+        "trigger": fill.trigger,
+    }
+    if order.entry_order_id is not None:
+        row["entry_order_id"] = order.entry_order_id
+    return row
+
+
+async def _run_entry(
     decision_date: pd.Timestamp,
-    phase: str,
-    ledger: PaperLedger | None = None,
-    quote_fn: Callable[[str], Awaitable[DatedOpenQuote]] | None = None,
-    session: aiohttp.ClientSession | None = None,
-    now_fn: Callable[[], pd.Timestamp] | None = None,
-    sleep_fn: Callable[[float], Awaitable[None]] | None = None,
-    trading_day_fn: Callable[[str], Awaitable[bool]] | None = None,
-    record_fn: Callable[..., Any] | None = None,
-    session_day_fn: Callable[[date], SessionDay] | None = None,
+    date_str: str,
+    now: pd.Timestamp,
+    *,
+    ledger: PaperLedger,
+    trading_day_fn: Callable[[str], Awaitable[bool]] | None,
+    record_fn: Callable[..., Any] | None,
+    session_day_fn: Callable[[date], SessionDay] | None,
 ) -> int:
-    """페이퍼 세션을 실행하고 체결 건수를 반환한다. 체결은 원장에 즉시 flush한다. 청산은 미청산 포지션을 D+1 KRX 시가단일가로 시장가 청산한다.
+    """Book the entry of decision_date's persisted top-k picks at the confirmed closing auction.
 
-    Exit on a KRX holiday records nothing and keeps every lot open, so the lots
-    exit at the next real open auction. ``trading_day_fn`` defaults to the KIS
-    trading-day oracle on the data account.
+    Body moved verbatim from run_paper_session's entry branch (paper_trade.py:396-613 at spec time),
+    including its rationale comments (window [D 15:30, D+1 08:30), idempotency under double triggering,
+    host-wide lock across sizing and recording).
 
-    Exit fills only lots whose open quote is attested to decision_date's
-    session; the calendar oracle is a pre-filter, not the proof. When every lot
-    returns a quote dated before decision_date the session did not open today:
-    nothing is recorded and a DEGRADED outcome ("session_not_opened") is emitted
-    through record_fn.
+    Returns:
+        Number of entry fills recorded (0 on every skip path).
 
     Raises:
-        ValueError: unknown phase or non-same-day exit.
-        RuntimeError: the trading-day oracle fails (fail-closed, no fills).
+        TimeoutError: The ledger lock was not acquired.
+        RuntimeError: The default trading-day oracle fails.
     """
-    if phase not in ("entry", "exit"):
-        raise ValueError(f"unknown phase {phase!r}")
-    ledger = ledger or PaperLedger()
-    date_str = decision_date.strftime("%Y-%m-%d")
-    sleep_fn = sleep_fn or asyncio.sleep
-    now = now_fn() if now_fn is not None else pd.Timestamp.now(tz="Asia/Seoul")
-    if phase == "entry":
-        # kca-paper-entry는 kca-finalize-close의 ExecStopPost 체인과 독립 백스톱
-        # 타이머(15:34 KST) 양쪽에서 매일 트리거된다. 이미 오늘자 entry를 기록한
-        # 뒤 재실행되면 cash가 첫 실행분만큼 줄어든 상태로 재사이징해 포지션이
-        # 실제보다 작게 재체결되고 orders 감사기록도 덮어써진다(실측: 2026-09-21
-        # 017900이 301주에서 50주로 축소, 402340/009150 orders가 ZERO_QTY로
-        # 오기록). 오늘자 entry 시도 흔적이 있으면 두 번째 트리거는 조용히 스킵한다.
-        # entry와 exit는 바인드 마운트를 공유하는 별도 컨테이너에서 동시에 fire할 수
-        # 있으므로 사이징-기록 전 구간을 호스트 전역 락 안에서 수행한다.
-        # 진입 기록은 [당일 15:30, 익일 08:30) 창 안에서만 허용된다. 창 이전 기동은
-        # 대기하지 않고 스킵하고, 마감 이후 기동은 미기록 알림 후 종료한다.
-        state = entry_window_state(decision_date, now)
-        if state is WindowState.WAIT:
-            logger.info("[DATA] stage=paper_entry status=SKIP reason=before_window date=%s", date_str)
-            return 0
-        if state is WindowState.EXPIRED:
-            logger.info("[DATA] stage=paper_entry status=SKIP reason=entry_window_expired date=%s", date_str)
-            if record_fn is not None:
-                expired_picks = load_topk_decision(decision_date)
-                if not expired_picks.empty:
-                    recorded = ledger.load("orders")
-                    if recorded.empty or not (
-                        (recorded["decision_date"] == date_str) & (recorded["reason"] == "entry")
-                    ).any():
-                        record_fn(
-                            RUN_OUTCOME_NO_DECISION,
-                            run_date=date_str,
-                            reason="entry_window_expired",
-                            metrics={"n_picks": len(expired_picks)},
-                        )
-            return 0
-        session_day = _resolve_session_day(decision_date, session_day_fn)
-        session_gate = trading_session_gate(session_day)
-        if session_day.kind is SessionKind.CLOSED:
-            logger.info("[DATA] stage=paper_entry status=SKIP reason=non_trading_day date=%s", date_str)
-            return 0
-        with ledger.exclusive():
-            existing_orders = ledger.load("orders")
-            if not existing_orders.empty and (
-                (existing_orders["decision_date"] == date_str) & (existing_orders["reason"] == "entry")
-            ).any():
-                logger.info("[DATA] stage=paper_entry status=SKIP reason=already_recorded date=%s", date_str)
-                return 0
-            picks = load_topk_decision(decision_date)
-            if picks.empty:
-                if trading_day_fn is None:
-                    async with aiohttp.ClientSession() as entry_session:
-                        entry_client = KisApiClient(**kis_data_client_kwargs())
-                        trading_open = await is_kis_trading_day(entry_client, entry_session, date_str)
-                else:
-                    trading_open = await trading_day_fn(date_str)
-                if not trading_open:
-                    logger.info("[DATA] stage=paper_entry status=SKIP reason=non_trading_day date=%s", date_str)
-                    return 0
-                ledger.record_no_decision(date_str, reason="no_persisted_decision")
-                return 0
-            snap = fetch_archive_snapshot(date_str)
-            picks = picks.copy()
-            buffer_bp = float(settings.PAPER_ENTRY_SIZING_BUFFER_BP)
-            sizing_prices: list[int] = []
-            for _, sizing_row in picks.iterrows():
-                raw_close = sizing_row.get("close", float("nan"))
-                try:
-                    decision_price = int(raw_close) if pd.notna(raw_close) else 0
-                except (TypeError, ValueError):
-                    decision_price = 0
-                if decision_price <= 0:
-                    sizing_prices.append(0)
-                else:
-                    sizing_prices.append(sizing_price(decision_price, buffer_bp))
-            picks["price"] = sizing_prices
-            auction_close = _placed_at(date_str, DECISION_WINDOW_END_HHMMSS)
-            missed_auction = False
-            if "decided_at" in picks.columns:
-                for raw_ts in picks["decided_at"].tolist():
-                    try:
-                        decided = pd.Timestamp(raw_ts)
-                    except (TypeError, ValueError):
-                        missed_auction = True
-                        break
-                    if pd.isna(decided) or decided.tzinfo is None or decided >= auction_close:
-                        missed_auction = True
-                        break
-            else:
-                missed_auction = True
-            if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
-                missed_auction = True
-            placed_at = _placed_at(date_str, PAPER_ENTRY_HHMMSS)
-            cash = int(build_nav_snapshot(ledger.load_effective_fills(), settings.PAPER_SEED_CAPITAL, date_str).iloc[0]["cash"])
-            capital = investable_capital(cash, settings.PAPER_SEED_CAPITAL)
-            if missed_auction:
-                missed_orders = build_entry_orders(picks, date_str, seed_capital=capital, placed_at=placed_at)
-                missed_rows: list[dict] = [
-                    order_record(o, ORDER_STATUS_MISSED_AUCTION) for o in missed_orders
-                ]
-                missed_symbols = {o.symbol for o in missed_orders}
-                for _, pick_row in picks.iterrows():
-                    sym = str(pick_row["symbol"])
-                    if sym not in missed_symbols:
-                        missed_rows.append(
-                            order_record(
-                                PaperOrder(
-                                    order_id=f"{date_str}:{sym}:entry",
-                                    decision_date=date_str,
-                                    symbol=sym,
-                                    side="buy",
-                                    qty=0,
-                                    limit_price=None,
-                                    placed_at=placed_at,
-                                    reason="entry",
-                                ),
-                                ORDER_STATUS_MISSED_AUCTION,
-                            )
-                        )
-                if missed_rows:
-                    ledger.record(missed_rows, kind="orders")
-                if record_fn is not None:
+    # kca-paper-entry는 kca-finalize-close의 ExecStopPost 체인과 독립 백스톱
+    # 타이머(15:34 KST) 양쪽에서 매일 트리거된다. 이미 오늘자 entry를 기록한
+    # 뒤 재실행되면 cash가 첫 실행분만큼 줄어든 상태로 재사이징해 포지션이
+    # 실제보다 작게 재체결되고 orders 감사기록도 덮어써진다(실측: 2026-09-21
+    # 017900이 301주에서 50주로 축소, 402340/009150 orders가 ZERO_QTY로
+    # 오기록). 오늘자 entry 시도 흔적이 있으면 두 번째 트리거는 조용히 스킵한다.
+    # entry와 exit는 바인드 마운트를 공유하는 별도 컨테이너에서 동시에 fire할 수
+    # 있으므로 사이징-기록 전 구간을 호스트 전역 락 안에서 수행한다.
+    # 진입 기록은 [당일 15:30, 익일 08:30) 창 안에서만 허용된다. 창 이전 기동은
+    # 대기하지 않고 스킵하고, 마감 이후 기동은 미기록 알림 후 종료한다.
+    state = entry_window_state(decision_date, now)
+    if state is WindowState.WAIT:
+        logger.info("[DATA] stage=paper_entry status=SKIP reason=before_window date=%s", date_str)
+        return 0
+    if state is WindowState.EXPIRED:
+        logger.info("[DATA] stage=paper_entry status=SKIP reason=entry_window_expired date=%s", date_str)
+        if record_fn is not None:
+            expired_picks = load_topk_decision(decision_date)
+            if not expired_picks.empty:
+                recorded = ledger.load("orders")
+                if not _entry_already_recorded(recorded, date_str):
                     record_fn(
                         RUN_OUTCOME_NO_DECISION,
                         run_date=date_str,
-                        reason=session_gate or "decided_after_auction_close",
+                        reason="entry_window_expired",
+                        metrics={"n_picks": len(expired_picks)},
                     )
+        return 0
+    session_day = _resolve_session_day(decision_date, session_day_fn)
+    session_gate = trading_session_gate(session_day)
+    if session_day.kind is SessionKind.CLOSED:
+        logger.info("[DATA] stage=paper_entry status=SKIP reason=non_trading_day date=%s", date_str)
+        return 0
+    with ledger.exclusive():
+        existing_orders = ledger.load("orders")
+        if _entry_already_recorded(existing_orders, date_str):
+            logger.info("[DATA] stage=paper_entry status=SKIP reason=already_recorded date=%s", date_str)
+            return 0
+        picks = load_topk_decision(decision_date)
+        if picks.empty:
+            if trading_day_fn is None:
+                async with aiohttp.ClientSession() as entry_session:
+                    entry_client = KisApiClient(**kis_data_client_kwargs())
+                    trading_open = await is_kis_trading_day(entry_client, entry_session, date_str)
+            else:
+                trading_open = await trading_day_fn(date_str)
+            if not trading_open:
+                logger.info("[DATA] stage=paper_entry status=SKIP reason=non_trading_day date=%s", date_str)
                 return 0
-            orders = build_entry_orders(
-                picks, date_str, seed_capital=capital, placed_at=placed_at
-            )
-            order_rows: list[dict] = []
-            order_symbols = {o.symbol for o in orders}
+            ledger.record_no_decision(date_str, reason="no_persisted_decision")
+            return 0
+        snap = fetch_archive_snapshot(date_str)
+        picks = picks.copy()
+        buffer_bp = float(settings.PAPER_ENTRY_SIZING_BUFFER_BP)
+        sizing_prices: list[int] = []
+        for _, sizing_row in picks.iterrows():
+            raw_close = sizing_row.get("close", float("nan"))
+            try:
+                decision_price = int(raw_close) if pd.notna(raw_close) else 0
+            except (TypeError, ValueError):
+                decision_price = 0
+            if decision_price <= 0:
+                sizing_prices.append(0)
+            else:
+                sizing_prices.append(sizing_price(decision_price, buffer_bp))
+        picks["price"] = sizing_prices
+        auction_close = _placed_at(date_str, DECISION_WINDOW_END_HHMMSS)
+        missed_auction = False
+        if "decided_at" in picks.columns:
+            for raw_ts in picks["decided_at"].tolist():
+                try:
+                    decided = pd.Timestamp(raw_ts)
+                except (TypeError, ValueError):
+                    missed_auction = True
+                    break
+                if pd.isna(decided) or decided.tzinfo is None or decided >= auction_close:
+                    missed_auction = True
+                    break
+        else:
+            missed_auction = True
+        if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
+            missed_auction = True
+        placed_at = _placed_at(date_str, PAPER_ENTRY_HHMMSS)
+        cash = int(build_nav_snapshot(ledger.load_effective_fills(), settings.PAPER_SEED_CAPITAL, date_str).iloc[0]["cash"])
+        capital = investable_capital(cash, settings.PAPER_SEED_CAPITAL)
+        if missed_auction:
+            missed_orders = build_entry_orders(picks, date_str, seed_capital=capital, placed_at=placed_at)
+            missed_rows: list[dict[str, Any]] = [
+                order_record(o, ORDER_STATUS_MISSED_AUCTION) for o in missed_orders
+            ]
+            missed_symbols = {o.symbol for o in missed_orders}
             for _, pick_row in picks.iterrows():
                 sym = str(pick_row["symbol"])
-                if sym not in order_symbols:
-                    if int(pick_row["price"]) == 0:
-                        logger.warning(
-                            "[DATA] stage=paper_entry status=ZERO_QTY reason=no_decision_price symbol=%s",
-                            sym,
-                        )
-                    order_rows.append(
+                if sym not in missed_symbols:
+                    missed_rows.append(
                         order_record(
-                            PaperOrder(
-                                order_id=f"{date_str}:{sym}:entry",
-                                decision_date=date_str,
-                                symbol=sym,
-                                side="buy",
-                                qty=0,
-                                limit_price=None,
-                                placed_at=placed_at,
-                                reason="entry",
-                            ),
-                            ORDER_STATUS_ZERO_QTY,
+                            _zero_qty_entry_order(date_str, sym, placed_at),
+                            ORDER_STATUS_MISSED_AUCTION,
                         )
                     )
-            pred_by_symbol: dict[str, float] = {}
-            if "pred" in picks.columns:
-                for _, pred_row in picks.iterrows():
-                    sym = str(pred_row["symbol"])
-                    try:
-                        pred_value = float(pred_row["pred"])
-                    except (TypeError, ValueError):
-                        pred_value = float("-inf")
-                    if pd.isna(pred_value):
-                        pred_value = float("-inf")
-                    pred_by_symbol[sym] = pred_value
-            ranked_orders = sorted(
-                orders, key=lambda o: (-pred_by_symbol.get(o.symbol, float("-inf")), o.symbol)
-            )
-            by_code = snap.set_index("종목코드").to_dict("index") if not snap.empty else {}
-            fills: list[dict] = []
-            remaining_cash = cash
-            n_insufficient = 0
-            for order in ranked_orders:
-                row = by_code.get(order.symbol)
-                if row is None:
-                    logger.warning("[DATA] stage=paper_entry symbol=%s status=NO_SNAPSHOT_ROW", order.symbol)
-                    order_rows.append(order_record(order, ORDER_STATUS_NO_SNAPSHOT_ROW))
-                    continue
-                fill = build_auction_fill(order, row)
-                if fill is None:
-                    logger.warning("[DATA] stage=paper_entry symbol=%s status=UNCONFIRMED", order.symbol)
-                    order_rows.append(order_record(order, ORDER_STATUS_UNCONFIRMED))
-                    continue
-                notional = fill.fill_price * fill.qty
-                fill_cost = notional + side_fee_krw(notional)
-                if fill_cost > remaining_cash:
-                    logger.warning("[DATA] stage=paper_entry symbol=%s status=INSUFFICIENT_CASH", order.symbol)
-                    order_rows.append(order_record(order, ORDER_STATUS_INSUFFICIENT_CASH))
-                    n_insufficient += 1
-                    continue
-                remaining_cash -= fill_cost
-                fills.append(
-                    {
-                        "order_id": fill.order_id,
-                        "symbol": fill.symbol,
-                        "side": fill.side,
-                        "qty": fill.qty,
-                        "fill_price": fill.fill_price,
-                        "filled_at": fill.filled_at,
-                        "decision_date": order.decision_date,
-                        "trigger": fill.trigger,
-                    }
+            if missed_rows:
+                ledger.record(missed_rows, kind="orders")
+            if record_fn is not None:
+                record_fn(
+                    RUN_OUTCOME_NO_DECISION,
+                    run_date=date_str,
+                    reason=session_gate or "decided_after_auction_close",
                 )
-                order_rows.append(order_record(order, ORDER_STATUS_FILLED))
-            logger.info(
-                "[PORTFOLIO] stage=paper_entry_sizing date=%s n_orders=%d sizing_buffer_bp=%s n_insufficient=%d",
-                date_str,
-                len(orders),
-                buffer_bp,
-                n_insufficient,
-            )
-            if fills:
-                ledger.record(fills, kind="fills")
-            if order_rows:
-                ledger.record(order_rows, kind="orders")
-            refresh_trade_ledgers(
-                ledger,
-                settings.PAPER_SEED_CAPITAL,
-                date_str,
-                marks=load_open_lot_marks(ledger.load_open_positions(), date_str),
-            )
-            return len(fills)
+            return 0
+        orders = build_entry_orders(
+            picks, date_str, seed_capital=capital, placed_at=placed_at
+        )
+        order_rows: list[dict[str, Any]] = []
+        order_symbols = {o.symbol for o in orders}
+        for _, pick_row in picks.iterrows():
+            sym = str(pick_row["symbol"])
+            if sym not in order_symbols:
+                if int(pick_row["price"]) == 0:
+                    logger.warning(
+                        "[DATA] stage=paper_entry status=ZERO_QTY reason=no_decision_price symbol=%s",
+                        sym,
+                    )
+                order_rows.append(
+                    order_record(
+                        _zero_qty_entry_order(date_str, sym, placed_at),
+                        ORDER_STATUS_ZERO_QTY,
+                    )
+                )
+        pred_by_symbol: dict[str, float] = {}
+        if "pred" in picks.columns:
+            for _, pred_row in picks.iterrows():
+                sym = str(pred_row["symbol"])
+                try:
+                    pred_value = float(pred_row["pred"])
+                except (TypeError, ValueError):
+                    pred_value = float("-inf")
+                if pd.isna(pred_value):
+                    pred_value = float("-inf")
+                pred_by_symbol[sym] = pred_value
+        ranked_orders = sorted(
+            orders, key=lambda o: (-pred_by_symbol.get(o.symbol, float("-inf")), o.symbol)
+        )
+        by_code = snap.set_index("종목코드").to_dict("index") if not snap.empty else {}
+        fills: list[dict[str, Any]] = []
+        remaining_cash = cash
+        n_insufficient = 0
+        for order in ranked_orders:
+            row = by_code.get(order.symbol)
+            if row is None:
+                logger.warning("[DATA] stage=paper_entry symbol=%s status=NO_SNAPSHOT_ROW", order.symbol)
+                order_rows.append(order_record(order, ORDER_STATUS_NO_SNAPSHOT_ROW))
+                continue
+            fill = build_auction_fill(order, row)
+            if fill is None:
+                logger.warning("[DATA] stage=paper_entry symbol=%s status=UNCONFIRMED", order.symbol)
+                order_rows.append(order_record(order, ORDER_STATUS_UNCONFIRMED))
+                continue
+            notional = fill.fill_price * fill.qty
+            fill_cost = notional + side_fee_krw(notional)
+            if fill_cost > remaining_cash:
+                logger.warning("[DATA] stage=paper_entry symbol=%s status=INSUFFICIENT_CASH", order.symbol)
+                order_rows.append(order_record(order, ORDER_STATUS_INSUFFICIENT_CASH))
+                n_insufficient += 1
+                continue
+            remaining_cash -= fill_cost
+            fills.append(_fill_row(fill, order))
+            order_rows.append(order_record(order, ORDER_STATUS_FILLED))
+        logger.info(
+            "[PORTFOLIO] stage=paper_entry_sizing date=%s n_orders=%d sizing_buffer_bp=%s n_insufficient=%d",
+            date_str,
+            len(orders),
+            buffer_bp,
+            n_insufficient,
+        )
+        if fills:
+            ledger.record(fills, kind="fills")
+        if order_rows:
+            ledger.record(order_rows, kind="orders")
+        refresh_trade_ledgers(
+            ledger,
+            settings.PAPER_SEED_CAPITAL,
+            date_str,
+            marks=load_open_lot_marks(ledger.load_open_positions(), date_str),
+        )
+        return len(fills)
+
+async def _run_exit(
+    decision_date: pd.Timestamp,
+    date_str: str,
+    now: pd.Timestamp,
+    *,
+    ledger: PaperLedger,
+    quote_fn: Callable[[str], Awaitable[DatedOpenQuote]] | None,
+    session: aiohttp.ClientSession | None,
+    now_fn: Callable[[], pd.Timestamp] | None,
+    sleep_fn: Callable[[float], Awaitable[None]],
+    trading_day_fn: Callable[[str], Awaitable[bool]] | None,
+    record_fn: Callable[..., Any] | None,
+    session_day_fn: Callable[[date], SessionDay] | None,
+) -> int:
+    """Exit every open lot at decision_date's KRX open auction, attested to that session.
+
+    Body moved verbatim from run_paper_session's exit branch (paper_trade.py:614-791 at spec time), including
+    the owned-session try/finally and its rationale comments (holiday quotes, lock-free pre-checks, wait before
+    the open quote is trusted).
+
+    Returns:
+        Number of exit fills recorded (0 on every skip/hold path).
+
+    Raises:
+        ValueError: now is not on decision_date (exit_window_state).
+        TimeoutError: The ledger lock was not acquired.
+    """
     placed_at = _placed_at(date_str, PAPER_EXIT_OPEN_AUCTION_HHMMSS)
     owned_session: aiohttp.ClientSession | None = None
     try:
@@ -703,7 +780,7 @@ async def run_paper_session(
         observed_at = max(now, earliest)
         if exit_state is WindowState.WAIT:
             await sleep_fn((earliest - now).total_seconds())
-            now = now_fn() if now_fn is not None else pd.Timestamp.now(tz="Asia/Seoul")
+            now = _read_clock(now_fn)
             exit_state = exit_window_state(decision_date, now)
             if exit_state is WindowState.EXPIRED:
                 return _skip_expired()
@@ -729,26 +806,14 @@ async def run_paper_session(
             fills = []
             filled_ids: set[str] = set()
             window_end = _placed_at(date_str, PAPER_EXIT_WINDOW_END_HHMMSS)
-            late_now = now_fn() if now_fn is not None else pd.Timestamp.now(tz="Asia/Seoul")
+            late_now = _read_clock(now_fn)
             if late_now > window_end:
                 open_prices = {}
             for order in orders:
                 fill = build_open_auction_fill(order, open_prices.get(order.symbol, 0), observed_at)
                 if fill is not None:
                     filled_ids.add(order.order_id)
-                    fills.append(
-                        {
-                            "order_id": fill.order_id,
-                            "symbol": fill.symbol,
-                            "side": fill.side,
-                            "qty": fill.qty,
-                            "fill_price": fill.fill_price,
-                            "filled_at": fill.filled_at,
-                            "decision_date": order.decision_date,
-                            "trigger": fill.trigger,
-                            "entry_order_id": order.entry_order_id,
-                        }
-                    )
+                    fills.append(_fill_row(fill, order))
             if not filled_ids and seen_quotes and all(
                 q.business_date and q.business_date < date_str for q in seen_quotes.values()
             ):
@@ -789,6 +854,44 @@ async def run_paper_session(
     finally:
         if owned_session is not None:
             await owned_session.close()  # pragma: no cover - live KIS boundary
+
+async def run_paper_session(
+    decision_date: pd.Timestamp,
+    phase: str,
+    ledger: PaperLedger | None = None,
+    quote_fn: Callable[[str], Awaitable[DatedOpenQuote]] | None = None,
+    session: aiohttp.ClientSession | None = None,
+    now_fn: Callable[[], pd.Timestamp] | None = None,
+    sleep_fn: Callable[[float], Awaitable[None]] | None = None,
+    trading_day_fn: Callable[[str], Awaitable[bool]] | None = None,
+    record_fn: Callable[..., Any] | None = None,
+    session_day_fn: Callable[[date], SessionDay] | None = None,
+) -> int:
+    """페이퍼 세션을 실행하고 체결 건수를 반환한다. 체결은 원장에 즉시 flush한다. 청산은 미청산 포지션을 D+1 KRX 시가단일가로 시장가 청산한다.
+
+    Exit on a KRX holiday records nothing and keeps every lot open, so the lots
+    exit at the next real open auction. ``trading_day_fn`` defaults to the KIS
+    trading-day oracle on the data account.
+
+    Exit fills only lots whose open quote is attested to decision_date's
+    session; the calendar oracle is a pre-filter, not the proof. When every lot
+    returns a quote dated before decision_date the session did not open today:
+    nothing is recorded and a DEGRADED outcome ("session_not_opened") is emitted
+    through record_fn.
+
+    Raises:
+        ValueError: unknown phase or non-same-day exit.
+        RuntimeError: the trading-day oracle fails (fail-closed, no fills).
+    """
+    if phase not in ("entry", "exit"):
+        raise ValueError(f"unknown phase {phase!r}")
+    ledger = ledger or PaperLedger()
+    date_str = decision_date.strftime("%Y-%m-%d")
+    sleep_fn = sleep_fn or asyncio.sleep
+    now = _read_clock(now_fn)
+    if phase == "entry":
+        return await _run_entry(decision_date, date_str, now, ledger=ledger, trading_day_fn=trading_day_fn, record_fn=record_fn, session_day_fn=session_day_fn)
+    return await _run_exit(decision_date, date_str, now, ledger=ledger, quote_fn=quote_fn, session=session, now_fn=now_fn, sleep_fn=sleep_fn, trading_day_fn=trading_day_fn, record_fn=record_fn, session_day_fn=session_day_fn)
 
 
 def main() -> None:  # pragma: no cover - CLI entry; logic covered via run_paper_session scenarios

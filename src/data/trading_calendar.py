@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, Protocol
 
 import aiohttp
 import pandas as pd
@@ -15,6 +17,7 @@ from src.backfill.altdata.krx_api import (
     KRX_ENDPOINT_KOSPI_INDEX_DAILY,
     fetch_krx_openapi_day_strict,
 )
+from src.config.market_session import MAX_PREV_TRADING_DAY_LOOKBACK
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +63,20 @@ def is_krx_trading_day(date: pd.Timestamp | str, cfg: AltDataFetchConfig | None 
     return result
 
 
-async def is_kis_trading_day(client, session, date: pd.Timestamp | str) -> bool:
+class _IndexHistorySource(Protocol):
+    """Structural view of the KIS client capability this oracle needs.
+
+    Typed as a Protocol rather than ``KisApiClient`` so the module keeps importing
+    the KIS client lazily (inside ``is_kis_trading_day_sync``) and so callers may pass
+    any client exposing the index-history query (tests use fakes).
+    """
+
+    async def get_market_index_history(
+        self, session: aiohttp.ClientSession, market_code: str, start_date: str, end_date: str
+    ) -> dict[str, Any]: ...
+
+
+async def is_kis_trading_day(client: _IndexHistorySource, session: aiohttp.ClientSession, date: pd.Timestamp | str) -> bool:
     """KIS 지수 일별시세(0001) 응답에 요청일이 존재하면 거래일로 판정한다.
 
     rt_cd != "0"인 장애 응답은 휴장일로 강제하지 않고 RuntimeError로 전파한다.
@@ -71,6 +87,41 @@ async def is_kis_trading_day(client, session, date: pd.Timestamp | str) -> bool:
         raise RuntimeError(f"KIS trading-day oracle failed rt_cd={res.get('rt_cd')} msg={res.get('msg1', '')}")
     rows = res.get("output2") or []
     return any(str(r.get("stck_bsop_date", "")).strip() == ymd for r in rows)
+
+
+async def resolve_prev_trading_day_kis(client: Any, session: Any, decision_date: pd.Timestamp, *, krx_is_trading_day: Callable[[pd.Timestamp], bool] | None = None, max_lookback_days: int = MAX_PREV_TRADING_DAY_LOOKBACK) -> pd.Timestamp:
+    """Resolve the previous trading day via KIS first, KRX fallback per date.
+
+    Args:
+        client: KIS API client.
+        session: HTTP session.
+        decision_date: Decision date (time component ignored).
+        krx_is_trading_day: KRX oracle override (tests); None selects is_krx_trading_day.
+        max_lookback_days: Calendar-day search bound.
+
+    Returns:
+        The previous trading day, normalized to midnight.
+
+    Raises:
+        RuntimeError: When both oracles fail.
+        ValueError: When no trading day exists within the bound.
+    """
+    d = pd.Timestamp(decision_date).normalize()
+    for k in range(1, int(max_lookback_days) + 1):
+        cand = d - pd.Timedelta(days=k)
+        if cand.weekday() >= 5:
+            continue
+        try:
+            is_open = await is_kis_trading_day(client, session, cand)
+        except RuntimeError as exc:
+            logger.warning("[DATA] stage=prev_trading_day vendor=kis status=FAILED date=%s reason=%s fallback=krx", cand.date(), exc)
+            oracle = krx_is_trading_day
+            if oracle is None:
+                oracle = is_krx_trading_day
+            is_open = await asyncio.to_thread(oracle, cand)
+        if is_open:
+            return cand
+    raise ValueError(f"no trading day within {int(max_lookback_days)} days before {d.date()}")
 
 
 def is_kis_trading_day_sync(snapshot_date: str) -> bool:  # pragma: no cover - live KIS boundary
@@ -94,7 +145,7 @@ def is_kis_trading_day_sync(snapshot_date: str) -> bool:  # pragma: no cover - l
     from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 
     async def _run() -> bool:
-        client = KisApiClient(**kis_data_client_kwargs())  # type: ignore[no-untyped-call]
+        client = KisApiClient(**kis_data_client_kwargs())
         async with client.create_session() as session:
             await client.ensure_token(session)
             return await is_kis_trading_day(client, session, snapshot_date)
