@@ -327,16 +327,24 @@ def _retain_backup_ref(
 
 
 def _deduplicate_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse exact duplicate bar rows and reject contradictory slots.
+
+    One pass over the frame (not one pandas call per bar slot): a full-session partition holds tens of thousands
+    of slots, and a per-slot loop made the commit of a 100-symbol day take ~30 s. Rows with a missing symbol or
+    timestamp key carry no slot identity and are dropped, as the former group-by did.
+
+    Raises:
+        ValueError: Two different rows share one (symbol, ts_hms) slot; the earliest such slot is named.
+    """
     key_cols = ["symbol", "ts_hms"]
-    grouped = df.groupby(key_cols, sort=False)
-    rows: list[pd.DataFrame] = []
-    for _, group in grouped:
-        distinct = group.drop_duplicates(ignore_index=True)
-        if len(distinct) > 1:
-            raise ValueError(f"Contradictory bar slot for {group.iloc[0]['symbol']!r} ts={group.iloc[0]['ts_hms']!r}")
-        rows.append(distinct.iloc[[0]])
-    reconciled = pd.concat(rows, ignore_index=True) if rows else df.copy()
-    reconciled = reconciled.sort_values(["symbol", "ts_hms"], kind="stable").reset_index(drop=True)
+    keyed = df.dropna(subset=key_cols)
+    distinct = keyed.drop_duplicates(ignore_index=True)
+    contradictory = distinct.duplicated(subset=key_cols, keep=False)
+    if bool(contradictory.any()):
+        first = distinct.loc[contradictory].iloc[0]
+        raise ValueError(f"Contradictory bar slot for {first['symbol']!r} ts={first['ts_hms']!r}")
+    reconciled = distinct if len(distinct) else df.copy()
+    reconciled = reconciled.sort_values(key_cols, kind="stable").reset_index(drop=True)
     return reconciled[list(CANONICAL_BAR_COLUMNS)]
 
 

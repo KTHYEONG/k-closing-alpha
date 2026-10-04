@@ -977,3 +977,42 @@ def test_backup_dir_keyed_by_retention_date(tmp_path: Path, monkeypatch: pytest.
 
 
 
+
+
+def _bar_row(symbol, ts, close=100, volume=1) -> dict:
+    return {
+        "snapshot_date": "2026-03-02", "symbol": symbol, "ts_hms": ts, "open": close, "high": close, "low": close,
+        "close": close, "volume": volume, "value_krw": close * volume, "has_trade": True, "vendor": "toss",
+    }
+
+
+def test_deduplicate_bars_collapses_exact_duplicates_and_sorts_by_slot() -> None:
+    """Exact duplicate rows collapse to one; the result is ordered by (symbol, ts_hms)."""
+    from src.data.intraday_store import _deduplicate_bars
+
+    frame = pd.DataFrame([
+        _bar_row("000002", 90100), _bar_row("000001", 90200), _bar_row("000001", 90100), _bar_row("000001", 90100),
+    ])
+    out = _deduplicate_bars(frame)
+    assert list(zip(out["symbol"], out["ts_hms"], strict=True)) == [("000001", 90100), ("000001", 90200), ("000002", 90100)]
+
+
+def test_deduplicate_bars_rejects_contradictory_slot_naming_the_earliest() -> None:
+    """Two different rows in one slot raise, naming the contradictory slot that appears first."""
+    from src.data.intraday_store import _deduplicate_bars
+
+    frame = pd.DataFrame([
+        _bar_row("000009", 90100), _bar_row("000003", 90100, close=100), _bar_row("000005", 90100, close=7),
+        _bar_row("000005", 90100, close=8), _bar_row("000003", 90100, close=101),
+    ])
+    with pytest.raises(ValueError, match="'000003'"):
+        _deduplicate_bars(frame)
+
+
+def test_deduplicate_bars_drops_rows_without_slot_identity() -> None:
+    """A row with a missing symbol or timestamp has no slot and is dropped, as the former group-by did."""
+    from src.data.intraday_store import _deduplicate_bars
+
+    frame = pd.DataFrame([_bar_row("000001", 90100), _bar_row(None, 90100), _bar_row("000001", None)])
+    out = _deduplicate_bars(frame)
+    assert out["symbol"].tolist() == ["000001"] and out["ts_hms"].tolist() == [90100]
