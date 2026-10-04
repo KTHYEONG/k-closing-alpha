@@ -31,6 +31,7 @@ from src.backfill.intraday.toss_regular import (
     acquire_toss_regular_bars,
     toss_basis_verdict,
 )
+from src.backfill.intraday.price_basis import PriceReference
 from src.config.collection import CollectionSettings
 from src.config.market_session import INTRADAY_SESSION_REGULAR
 from src.data.capture_contracts import SEOUL, CaptureStatus
@@ -44,6 +45,7 @@ _CALLS_PER_SAMPLE: int = 2
 
 _KIS_FULL_SESSION_FIRST_HHMMSS: int = 90000
 _KIS_FULL_SESSION_LAST_HHMMSS: int = 151900
+_KIS_LAST_ALIGNED_START_HHMMSS: int = 152900  # KIS 15:30 start-stamped bar is the closing-auction print; its end label (15:31) is outside the Toss window
 
 
 @dataclass(frozen=True)
@@ -107,7 +109,7 @@ def compare_toss_to_kis(
     kis_bars: pd.DataFrame, toss_bars: pd.DataFrame, *, verdict: TossBasisVerdict
 ) -> EquivalenceMetrics:
     """Compare one symbol-day of Toss bars with the stored KIS bars of the same day after aligning the END-stamped Toss label to the KIS start stamp (label minus one minute). Bars present only in Toss are zero-volume carry minutes and are reported, not penalized; bars present only in KIS are a defect of the Toss series and are reported separately."""
-    kis_labels = _labels(kis_bars)
+    kis_labels = [v for v in _labels(kis_bars) if int(v) <= _KIS_LAST_ALIGNED_START_HHMMSS]
     toss_labels = _labels(toss_bars)
     toss_as_start = [_shift_minutes(int(v), -1) for v in toss_labels]
     kis_set = set(kis_labels)
@@ -119,17 +121,7 @@ def compare_toss_to_kis(
         fallback_day, fallback_symbol = _identity(toss_bars)
         day = day or fallback_day
         symbol = symbol or fallback_symbol
-    kis_vol = (
-        float(pd.to_numeric(kis_bars["volume"], errors="coerce").fillna(0).sum())
-        if kis_bars is not None and not kis_bars.empty and "volume" in kis_bars.columns
-        else 0.0
-    )
-    toss_vol = (
-        float(pd.to_numeric(toss_bars["volume"], errors="coerce").fillna(0).sum())
-        if toss_bars is not None and not toss_bars.empty and "volume" in toss_bars.columns
-        else 0.0
-    )
-    volume_ratio = (toss_vol / kis_vol) if kis_vol > 0 else None
+    volume_ratio = verdict.volume_ratio
     if not aligned:
         return EquivalenceMetrics(
             snapshot_date=day,
@@ -201,8 +193,13 @@ def sample_kis_symbol_days(
     seed: int,
     stored_loader: Callable[[str], pd.DataFrame],
     calendar: Sequence[str],
+    is_raw_basis: Callable[[str, str], bool] | None = None,
 ) -> list[tuple[str, str]]:
     """Draw a seeded sample of stored vendor-`kis` full-session symbol-days.
+
+    `is_raw_basis` excludes symbol-days whose KIS history is corporate-action adjusted or of unknown basis:
+    measured 2026-10, stored KIS bars of such days disagree with the raw Toss tape while Toss matches the raw
+    EOD close and volume, so they would be counted as Toss defects.
 
     Only symbol-days whose stored bars are all vendor `kis` and span the full
     regular session are eligible. Sampling uses a seeded generator, so the same
@@ -220,6 +217,8 @@ def sample_kis_symbol_days(
         for symbol, group in frame.groupby(frame["symbol"].astype(str)):
             vendors = {str(v) for v in group["vendor"].astype(str).tolist()}
             if vendors != {"kis"}:
+                continue
+            if is_raw_basis is not None and not is_raw_basis(day, str(symbol)):
                 continue
             stamps = pd.to_numeric(group["ts_hms"], errors="coerce").dropna()
             if stamps.empty:
@@ -402,6 +401,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     end = min(str(args.end), last_past) if args.end else last_past
     date.fromisoformat(start)
     date.fromisoformat(end)
+    price_reference = PriceReference.from_price_history(wide_history)
     volumes = pd.to_numeric(prepared["volume"], errors="coerce")
     days = pd.to_datetime(prepared["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     symbols = prepared["symbol"].astype(str).str.zfill(6)
@@ -426,6 +426,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     samples = sample_kis_symbol_days(
         start=start, end=end, n=int(args.n), seed=int(args.seed),
         stored_loader=_stored_loader, calendar=calendar,
+        is_raw_basis=lambda day, symbol: price_reference.is_known(day, symbol) and not price_reference.is_adjusted(day, symbol),
     )
     logger.info(
         "[DATA] stage=toss_equivalence_audit status=START samples=%d estimated_calls=%d",

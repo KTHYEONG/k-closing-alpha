@@ -350,3 +350,37 @@ def test_audit_without_any_accepted_day_fails_closed(tmp_path) -> None:
     empty, _e, _c = _audit([], _GridToss({}), tmp_path, {})
     assert empty.n_symbol_days == 0
     assert _exit_code_for_report(empty, threshold=1.0) == 1
+
+
+def test_kis_closing_auction_bar_is_not_a_toss_defect() -> None:
+    """The KIS 15:30 start-stamped auction print has no Toss counterpart and must not count as kis_only."""
+    kis = _kis_frame([
+        (152900, 70000, 70100, 69900, 70050, 100),
+        (153000, 70050, 70050, 70050, 70050, 5000),
+    ])
+    toss = _toss_frame([(153000, 70000, 70100, 69900, 70050, 100)])
+    metrics = compare_toss_to_kis(kis, toss, verdict=_accept(0.995))
+    assert metrics.kis_only_bars == 0
+    assert metrics.kis_bars == 1
+    assert metrics.ohlc_exact_share == 1.0
+
+
+def test_reported_volume_ratio_is_the_gate_ratio_against_eod() -> None:
+    """The ratio reported per symbol-day is the gate's Toss/EOD ratio, not a Toss/KIS ratio."""
+    kis = _kis_frame([(90000, 70000, 70100, 69900, 70050, 100)])
+    toss = _toss_frame([(90100, 70000, 70100, 69900, 70050, 100)])
+    assert compare_toss_to_kis(kis, toss, verdict=_accept(0.987)).volume_ratio == 0.987
+    empty = compare_toss_to_kis(kis, _toss_frame([]), verdict=TossBasisVerdict(False, "toss_basis_unverifiable", None))
+    assert empty.volume_ratio is None
+
+
+def test_sampling_skips_adjusted_or_unknown_basis_symbol_days() -> None:
+    """Corporate-action adjusted KIS history is not comparable with the raw Toss tape and is never sampled."""
+    days = {"2024-02-26": pd.concat(
+        [_full_kis_day("005930", "2024-02-26"), _full_kis_day("000660", "2024-02-26")], ignore_index=True
+    )}
+    picked = sample_kis_symbol_days(
+        start="2024-02-26", end="2024-02-26", n=10, seed=7, stored_loader=_stored(days),
+        calendar=["2024-02-26"], is_raw_basis=lambda day, symbol: symbol == "005930",
+    )
+    assert picked == [("2024-02-26", "005930")]
