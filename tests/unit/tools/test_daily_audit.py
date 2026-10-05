@@ -3691,3 +3691,81 @@ def test_run_daily_audit_emits_no_intraday_log_when_clean(monkeypatch, tmp_path,
         )
 
     assert not [r for r in caplog.records if "step=intraday_complete status=FAIL" in r.getMessage()]
+
+
+def test_digest_treats_running_backup_as_provisional() -> None:
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    digest = daily_audit.build_digest(
+        "2026-10-02", daily_audit.DAY_TRADING, all_ok, [], [], backup_issues=["offsite_backup:running"]
+    )
+    assert digest.severity is daily_audit.DigestSeverity.OK
+    assert "경고" not in digest.subject
+    assert digest.subject == "[kca] 🟢 2026-10-02 일일점검 완료 (정상)"
+    assert digest.provisional_reasons == ("offsite_backup:running",)
+    assert "백업 진행 중: 완료 후 자동 재확인됩니다" in digest.body
+    assert "backup_issues=offsite_backup:running" in digest.body
+
+
+def test_digest_interrupted_backup_still_warns() -> None:
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    digest = daily_audit.build_digest(
+        "2026-10-02", daily_audit.DAY_TRADING, all_ok, [], [], backup_issues=["offsite_backup:interrupted"]
+    )
+    assert digest.severity is daily_audit.DigestSeverity.WARNING
+    assert "경고" in digest.subject and "offsite_backup:interrupted" in digest.subject
+    assert digest.provisional_reasons == ()
+
+
+def test_digest_warning_with_running_keeps_provisional_line() -> None:
+    from src.tools import daily_audit
+
+    all_ok = dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    digest = daily_audit.build_digest(
+        "2026-10-02",
+        daily_audit.DAY_TRADING,
+        all_ok,
+        ["kca-backup.service"],
+        [],
+        backup_issues=["offsite_backup:running"],
+    )
+    assert digest.severity is daily_audit.DigestSeverity.WARNING
+    assert "kca-backup.service" in digest.subject
+    assert "offsite_backup:running" not in digest.subject
+    assert digest.provisional_reasons == ("offsite_backup:running",)
+    assert "백업 진행 중: 완료 후 자동 재확인됩니다" in digest.body
+    assert "backup_issues=offsite_backup:running" in digest.body
+
+
+def test_digest_holiday_warning_with_running_keeps_provisional_line() -> None:
+    from src.tools import daily_audit
+
+    digest = daily_audit.build_digest(
+        "2026-10-03",
+        daily_audit.DAY_HOLIDAY,
+        None,
+        ["kca-backup.service"],
+        [],
+        backup_issues=["offsite_backup:running"],
+    )
+    assert digest.severity is daily_audit.DigestSeverity.WARNING
+    assert "offsite_backup:running" not in digest.subject
+    assert digest.provisional_reasons == ("offsite_backup:running",)
+    assert "백업 진행 중: 완료 후 자동 재확인됩니다" in digest.body
+
+
+def test_digest_clean_holiday_with_running_stays_skip() -> None:
+    from src.tools import daily_audit
+
+    digest = daily_audit.build_digest(
+        "2026-10-03", daily_audit.DAY_HOLIDAY, None, [], [], backup_issues=["offsite_backup:running"]
+    )
+    assert digest.severity is daily_audit.DigestSeverity.HOLIDAY_SKIP
+    assert digest.subject == "[kca] ⏸️ 2026-10-03 휴장일 SKIP"
+    assert digest.provisional_reasons == ("offsite_backup:running",)
+    summary, detail = digest.body.split("[상세 내역]")
+    assert summary.count("• 백업 진행 중: 완료 후 자동 재확인됩니다") == 1
+    assert "backup_issues=offsite_backup:running" in detail
