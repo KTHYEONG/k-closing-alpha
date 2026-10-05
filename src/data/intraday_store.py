@@ -15,6 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src import settings
+from src.config.market_session import INTRADAY_SESSION_REGULAR_CONSOLIDATED, INTRADAY_VERIFIED_SESSIONS
 from src.data.capture_contracts import CaptureStatus, CoverageEntry
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, assert_canonical_bars, assert_canonical_ticks
@@ -26,9 +27,20 @@ __all__ = ["intraday_partition_path", "log_session_coverage_outliers", "remove_i
 
 _LOCK_TIMEOUT_SECONDS = DEFAULT_LOCK_TIMEOUT_SECONDS
 
+# Mirrors the Toss basis gate verdict; the consolidated partition holds only these rows.
+_CONSOLIDATED_TAPE_REASON: str = "toss_consolidated_tape"
+
+
+def _require_known_session(session: str) -> str:
+    name = str(session)
+    if name not in INTRADAY_VERIFIED_SESSIONS:
+        raise ValueError(f"Unknown intraday session: {session!r}")
+    return name
+
 
 def intraday_partition_path(bar_interval_minutes: int, snapshot_date: str, session: str) -> Path:
     """data/history/intraday/{interval}m/{session}/{YYYY-MM}/{YYYY-MM-DD}.parquet 경로 산출."""
+    _require_known_session(session)
     month = str(snapshot_date)[:7]
     return (
         Path(settings.HISTORY_DIR)
@@ -184,6 +196,12 @@ def _require_certified(symbols: list[str], coverage: Mapping[str, CoverageEntry]
         entry = coverage[symbol]
         if entry.venue == "UNKNOWN":
             raise ValueError(f"UNKNOWN venue cannot certify {symbol!r}")
+        if str(session) == INTRADAY_SESSION_REGULAR_CONSOLIDATED:
+            if entry.status == CaptureStatus.NOT_APPLICABLE and str(entry.reason) == _CONSOLIDATED_TAPE_REASON:
+                replaced.add(symbol)
+                continue
+            _preserve_staged_attempt(symbol, entry)
+            raise ValueError(f"Only consolidated-tape attempts belong in the consolidated partition: {symbol!r} status={entry.status.value}")
         if entry.status in (CaptureStatus.PARTIAL, CaptureStatus.FAILED, CaptureStatus.UNKNOWN):
             _preserve_staged_attempt(symbol, entry)
             raise ValueError(f"Non-certified attempt cannot replace authoritative partition: {symbol!r} status={entry.status.value}")
@@ -661,6 +679,7 @@ def write_tick_partition(
 
 def tick_partition_path(snapshot_date: str, session: str = "regular") -> Path:
     """data/history/intraday/ticks/{session}/{YYYY-MM}/{YYYY-MM-DD}.parquet 경로 산출."""
+    _require_known_session(session)
     month = str(snapshot_date)[:7]
     return (
         Path(settings.HISTORY_DIR)

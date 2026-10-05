@@ -34,7 +34,7 @@ from src.backfill.intraday.extended_session_backfill import (
 from src.backfill.intraday.price_basis import PriceReference
 from src.backfill.intraday.toss_regular import acquire_toss_regular_bars, probe_toss_retention_floor
 from src.config.collection import CollectionSettings
-from src.config.market_session import INTRADAY_SESSION_REGULAR
+from src.config.market_session import INTRADAY_SESSION_REGULAR, INTRADAY_SESSION_REGULAR_CONSOLIDATED
 from src.data.capture_contracts import (
     SEOUL,
     GOOD_ENTRY_STATES,
@@ -136,6 +136,47 @@ def enumerate_toss_regular_tasks(
         below_floor_symbol_days=int(below_floor),
         kis_window_symbol_days=int(in_window),
     )
+
+
+def enumerate_toss_consolidated_tasks(*, ledger: ExtendedBackfillLedger) -> TossBackfillPlan:
+    """Plan consolidated-tape tasks from the regular ledger, oldest date first.
+
+    A symbol-day is eligible when its latest `regular` ledger row is NOT_APPLICABLE
+    `toss_consolidated_tape` and no `regular_consolidated` ledger row exists for it, so the
+    already-rejected days are picked up without any new EOD screening. The gate itself is not
+    relaxed: eligibility is the recorded gate verdict, re-verified on fetch.
+    """
+    frame = ledger._read_all()
+    if frame.empty or not {"snapshot_date", "session", "symbol", "status", "reason"} <= set(frame.columns):
+        return TossBackfillPlan(tasks=(), retention_floor=None, below_floor_symbol_days=0, kis_window_symbol_days=0)
+    regular = frame[frame["session"].astype(str) == INTRADAY_SESSION_REGULAR]
+    if regular.empty:
+        return TossBackfillPlan(tasks=(), retention_floor=None, below_floor_symbol_days=0, kis_window_symbol_days=0)
+    consolidated = frame[frame["session"].astype(str) == INTRADAY_SESSION_REGULAR_CONSOLIDATED]
+    done_keys = (
+        set(zip(consolidated["snapshot_date"].astype(str).tolist(), consolidated["symbol"].astype(str).tolist()))
+        if not consolidated.empty
+        else set()
+    )
+    latest = regular.drop_duplicates(subset=["snapshot_date", "symbol"], keep="last")
+    eligible = latest[
+        (latest["status"].astype(str) == CaptureStatus.NOT_APPLICABLE.value)
+        & (latest["reason"].astype(str) == _CONSOLIDATED_REASON)
+    ]
+    by_day: dict[str, set[str]] = {}
+    for day, symbol in zip(eligible["snapshot_date"].astype(str).tolist(), eligible["symbol"].astype(str).tolist()):
+        if (str(day), str(symbol)) in done_keys:
+            continue
+        by_day.setdefault(str(day), set()).add(str(symbol))
+    tasks = tuple(
+        ExtendedBackfillTask(
+            snapshot_date=day,
+            session=INTRADAY_SESSION_REGULAR_CONSOLIDATED,
+            symbols=tuple(sorted(symbols)),
+        )
+        for day, symbols in sorted(by_day.items())
+    )
+    return TossBackfillPlan(tasks=tasks, retention_floor=None, below_floor_symbol_days=0, kis_window_symbol_days=0)
 
 
 @dataclass(frozen=True)
@@ -463,6 +504,304 @@ async def run_toss_regular_backfill(
     )
 
 
+def _consolidated_entry(entry: CoverageEntry) -> CoverageEntry:
+    """Re-key one acquisition outcome to the consolidated session without touching its verdict."""
+    return CoverageEntry(
+        symbol=entry.symbol,
+        dataset=entry.dataset,
+        venue=entry.venue,
+        session=INTRADAY_SESSION_REGULAR_CONSOLIDATED,
+        scheduled_at=entry.scheduled_at,
+        status=entry.status,
+        rows=entry.rows,
+        first_event_time=entry.first_event_time,
+        last_event_time=entry.last_event_time,
+        reason=entry.reason,
+        raw_refs=entry.raw_refs,
+    )
+
+
+async def run_toss_consolidated_backfill(
+    *,
+    as_of: date,
+    stop_at: datetime | None,
+    profile: CollectionSettings,
+    client: Any,
+    store: CaptureStore,
+    ledger: ExtendedBackfillLedger,
+    tasks: Sequence[ExtendedBackfillTask],
+    eod_volumes: Mapping[tuple[str, str], float],
+    now_fn: Callable[[], datetime] | None = None,
+) -> TossBackfillSummary:
+    """Persist consolidated-tape days into the `regular_consolidated` partition, resumable via the same Toss ledger file under session `regular_consolidated`, so keys never collide with the `regular` rows. Only gate-rejected consolidated frames are written there; a gate-accepted day is recorded but never stored in the consolidated partition, and nothing is ever written to `regular`.
+
+    Side effects: consolidated partitions, manifest, raw page evidence and consolidated ledger rows; a date with no pending symbols performs no network call and writes nothing.
+
+    Raises:
+        ValueError: for an empty/naive-deadline contract violation; `OSError` when partition, manifest or ledger persistence fails (the date is not marked terminal), and once all readable dates are done when any stored partition was unreadable.
+    """
+    if client is None:
+        raise ValueError("toss client must be provided")
+    if stop_at is not None and (stop_at.tzinfo is None or stop_at.utcoffset() is None):
+        raise ValueError("stop_at must be timezone-aware")
+    clock = now_fn if now_fn is not None else (lambda: datetime.now(SEOUL))
+    ordered = sorted(tasks, key=lambda task: (task.snapshot_date, task.session))
+    windows = parse_blackout_windows(tuple(profile.COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS))
+    concurrency = max(int(profile.COLLECTION_TOSS_BACKFILL_CONCURRENCY), 1)
+    outage_share = float(profile.COLLECTION_TOSS_OUTAGE_FAILURE_SHARE)
+    outage_min_sample = int(profile.COLLECTION_TOSS_OUTAGE_MIN_SAMPLE)
+    dead = _delisted_symbols(ledger)
+    done = 0
+    complete = 0
+    consolidated = 0
+    not_listed = 0
+    failed = 0
+    exhausted = 0
+    stopped = False
+    outage_aborted = False
+    unreadable: list[str] = []
+    symbol_days_total = sum(len(task.symbols) for task in ordered)
+    symbol_days_done = 0
+    started_all = clock() if (stop_at is not None or windows) else None
+    async with AsyncExitStack() as stack:
+        http_session = await stack.enter_async_context(_http_session(client))
+        for index, task in enumerate(ordered):
+            if stop_at is not None and clock() >= stop_at:
+                stopped = True
+                break
+            if windows:
+                end = blackout_end(clock(), windows, weekdays_only=True)
+                if end is not None:
+                    if stop_at is not None and end > stop_at:
+                        stopped = True
+                        break
+                    await wait_for_blackout(windows, now_fn=clock, weekdays_only=True)
+                    if stop_at is not None and clock() >= stop_at:
+                        stopped = True
+                        break
+            started = clock()
+            terminal = ledger.terminal_symbols(task.snapshot_date, INTRADAY_SESSION_REGULAR_CONSOLIDATED)
+            try:
+                stored = _stored_partition_symbols(task.snapshot_date, INTRADAY_SESSION_REGULAR_CONSOLIDATED)
+            except OSError:
+                logger.error(
+                    "[DATA] stage=toss_consolidated_backfill status=TASK_SKIPPED reason=unreadable_partition date=%s",
+                    task.snapshot_date,
+                )
+                unreadable.append(f"{task.snapshot_date}/{INTRADAY_SESSION_REGULAR_CONSOLIDATED}")
+                continue
+            fetchable = [
+                symbol
+                for symbol in task.symbols
+                if symbol not in terminal and symbol not in stored and symbol not in dead
+            ]
+            cached = [
+                symbol
+                for symbol in task.symbols
+                if symbol not in terminal and symbol not in stored and symbol in dead
+            ]
+            if not fetchable and not cached:
+                done += 1
+                symbol_days_done += len(task.symbols)
+                continue
+            run_id = f"toss-consolidated-{task.snapshot_date}-{uuid.uuid4().hex[:8]}"
+            semaphore = asyncio.Semaphore(concurrency)
+
+            async def _one(symbol: str) -> tuple[pd.DataFrame, CoverageEntry]:
+                async with semaphore:
+                    return await acquire_toss_regular_bars(
+                        client,
+                        http_session,
+                        symbol,
+                        task.snapshot_date,
+                        eod_volume=eod_volumes.get((task.snapshot_date, symbol)),
+                        profile=profile,
+                        capture_store=store,
+                        run_id=run_id,
+                    )
+
+            fetched = await asyncio.gather(*(_one(symbol) for symbol in fetchable)) if fetchable else []
+            frames: dict[str, pd.DataFrame] = {}
+            attempted = []
+            for symbol, (frame, entry) in zip(fetchable, fetched):
+                entry = _consolidated_entry(entry)
+                attempted.append(entry)
+                if (
+                    entry.reason == _CONSOLIDATED_REASON
+                    and frame is not None
+                    and not frame.empty
+                ):
+                    frames[str(symbol)] = frame
+                if entry.reason == _STOCK_NOT_FOUND_REASON:
+                    dead.add(str(symbol))
+            accepted_now = [entry for entry in attempted if entry.status == CaptureStatus.COMPLETE]
+            if accepted_now:
+                logger.warning(
+                    "[DATA] stage=toss_consolidated_backfill status=GATE_ACCEPTED_DROPPED date=%s symbols=%s",
+                    task.snapshot_date,
+                    sorted(str(entry.symbol) for entry in accepted_now),
+                )
+            is_outage = len(attempted) >= outage_min_sample and (
+                sum(1 for entry in attempted if _is_outage_failure(entry.reason)) / len(attempted)
+            ) >= outage_share
+            kept = (
+                [entry for entry in attempted if not _is_outage_failure(entry.reason)]
+                if is_outage
+                else list(attempted)
+            )
+            price_bases = {
+                str(entry.symbol): _TOSS_RAW_BASIS
+                for entry in kept
+                if entry.status == CaptureStatus.COMPLETE and entry.symbol is not None
+            }
+            if frames:
+                chunk = pd.concat([frames[name] for name in sorted(frames)], ignore_index=True)
+                coverage = {
+                    str(entry.symbol): entry
+                    for entry in kept
+                    if entry.symbol is not None and str(entry.symbol) in frames
+                }
+                write_intraday_partition(
+                    chunk, 1, task.snapshot_date, INTRADAY_SESSION_REGULAR_CONSOLIDATED, coverage=coverage
+                )
+            if kept:
+                manifest_status = (
+                    CaptureStatus.COMPLETE
+                    if all(entry.status in GOOD_ENTRY_STATES for entry in kept)
+                    else CaptureStatus.PARTIAL
+                )
+                manifest = CaptureManifest(
+                    schema_version=1,
+                    context=CaptureContext(
+                        trading_date=date.fromisoformat(task.snapshot_date),
+                        run_id=run_id,
+                        dataset=CaptureDataset.MINUTE_BARS,
+                        vendor="toss",
+                        endpoint="backfill-task",
+                        symbol=None,
+                        venue="owner-local",
+                        session=INTRADAY_SESSION_REGULAR_CONSOLIDATED,
+                        capture_reason="toss-consolidated-backfill",
+                        cohort_id=None,
+                        scheduled_at=None,
+                    ),
+                    cohort=None,
+                    completed_at=clock(),
+                    entries=tuple(kept),
+                    artifacts=tuple(dict.fromkeys(ref for entry in kept for ref in entry.raw_refs)),
+                    status=manifest_status,
+                )
+                store.publish_manifest(manifest)
+                ledger.record(
+                    task.snapshot_date,
+                    INTRADAY_SESSION_REGULAR_CONSOLIDATED,
+                    kept,
+                    run_id=run_id,
+                    attempted_at=clock(),
+                    vendor="toss",
+                    price_bases=price_bases,
+                )
+                latest = ledger._read_all()
+                if not latest.empty:
+                    sub = latest[
+                        (latest["snapshot_date"].astype(str) == str(task.snapshot_date))
+                        & (latest["session"].astype(str) == INTRADAY_SESSION_REGULAR_CONSOLIDATED)
+                    ]
+                    if not sub.empty:
+                        final = sub.drop_duplicates(subset=["symbol"], keep="last")
+                        exhausted_now = {
+                            str(item)
+                            for item in final.loc[
+                                final["status"].astype(str) == "EXHAUSTED",
+                                "symbol",
+                            ].tolist()
+                        }
+                        exhausted += sum(
+                            1
+                            for entry in kept
+                            if entry.status == CaptureStatus.FAILED
+                            and entry.symbol is not None
+                            and str(entry.symbol) in exhausted_now
+                        )
+            if cached:
+                ledger.record_cached_absent(
+                    task.snapshot_date,
+                    INTRADAY_SESSION_REGULAR_CONSOLIDATED,
+                    cached,
+                    reason=_CACHED_NOT_FOUND_REASON,
+                    run_id=run_id,
+                    attempted_at=clock(),
+                    vendor="toss",
+                )
+            complete += sum(1 for entry in kept if entry.status == CaptureStatus.COMPLETE)
+            consolidated += sum(
+                1 for entry in kept if entry.reason == _CONSOLIDATED_REASON
+            )
+            not_listed += sum(
+                1 for entry in kept if entry.reason == _STOCK_NOT_FOUND_REASON
+            ) + len(cached)
+            failed += sum(
+                1
+                for entry in kept
+                if entry.status in (CaptureStatus.FAILED, CaptureStatus.UNKNOWN)
+            )
+            if not is_outage:
+                done += 1
+                symbol_days_done += len(task.symbols)
+            elapsed = (clock() - started).total_seconds()
+            logger.info(
+                "[DATA] stage=toss_consolidated_backfill date=%s pending=%d consolidated=%d complete=%d not_listed=%d failed=%d elapsed_s=%.1f",
+                task.snapshot_date,
+                len(fetchable),
+                sum(1 for entry in kept if entry.reason == _CONSOLIDATED_REASON),
+                sum(1 for entry in kept if entry.status == CaptureStatus.COMPLETE),
+                sum(1 for entry in kept if entry.reason == _STOCK_NOT_FOUND_REASON) + len(cached),
+                sum(
+                    1
+                    for entry in kept
+                    if entry.status in (CaptureStatus.FAILED, CaptureStatus.UNKNOWN)
+                ),
+                elapsed,
+            )
+            if (index + 1) % _HEARTBEAT_EVERY_DATES == 0 or index + 1 == len(ordered):
+                elapsed_all = (clock() - started_all).total_seconds() if started_all is not None else 0.0
+                eta_min = (
+                    elapsed_all / max(symbol_days_done, 1) * (symbol_days_total - symbol_days_done) / 60.0
+                    if symbol_days_total > symbol_days_done
+                    else 0.0
+                )
+                logger.info(
+                    "[DATA] stage=toss_consolidated_backfill progress=dates %d/%d symbol_days=%d/%d eta_min=%.1f",
+                    done,
+                    len(ordered),
+                    symbol_days_done,
+                    symbol_days_total,
+                    eta_min,
+                )
+            if is_outage:
+                logger.error(
+                    "[DATA] stage=toss_consolidated_backfill status=OUTAGE_ABORT date=%s outage_failures=%d attempted=%d",
+                    task.snapshot_date,
+                    sum(1 for entry in attempted if _is_outage_failure(entry.reason)),
+                    len(attempted),
+                )
+                outage_aborted = True
+                break
+    if unreadable:
+        raise OSError(f"Cannot read existing partition evidence for toss tasks {unreadable}")
+    return TossBackfillSummary(
+        tasks_done=done,
+        tasks_remaining=len(ordered) - done,
+        complete=complete,
+        consolidated=consolidated,
+        not_listed=not_listed,
+        failed=failed,
+        exhausted=exhausted,
+        stopped_by_deadline=stopped,
+        outage_aborted=outage_aborted,
+    )
+
+
 def _load_history_frame(as_of: date) -> pd.DataFrame:
     from src import settings as app_settings
 
@@ -470,6 +809,17 @@ def _load_history_frame(as_of: date) -> pd.DataFrame:
     history = pd.read_parquet(app_settings.PRICE_HISTORY_PARQUET_PATH, columns=wide_columns)
     days = pd.to_datetime(history["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     return history[(days <= as_of.isoformat())].copy()
+
+
+def _eod_volumes_for(prepared_panel: pd.DataFrame) -> dict[tuple[str, str], float]:
+    """EOD KRX volumes keyed by (date, symbol) for the basis gate."""
+    volumes = pd.to_numeric(prepared_panel["volume"], errors="coerce")
+    days = pd.to_datetime(prepared_panel["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    symbols = prepared_panel["symbol"].astype(str).str.zfill(6)
+    return {
+        (str(day), str(symbol)): float(volume)
+        for day, symbol, volume in zip(days.tolist(), symbols.tolist(), volumes.tolist())
+    }
 
 
 def _build_plan(
@@ -492,14 +842,7 @@ def _build_plan(
         screen=screen,
         price_reference=price_reference,
     )
-    volumes = pd.to_numeric(prepared_panel["volume"], errors="coerce")
-    days = pd.to_datetime(prepared_panel["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    symbols = prepared_panel["symbol"].astype(str).str.zfill(6)
-    eod_volumes = {
-        (str(day), str(symbol)): float(volume)
-        for day, symbol, volume in zip(days.tolist(), symbols.tolist(), volumes.tolist())
-    }
-    return plan, eod_volumes
+    return plan, _eod_volumes_for(prepared_panel)
 
 
 def _apply_plan_filters(
@@ -595,6 +938,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--stop-at", default=None, help="HHMMSS KST after which no new date starts (default none).")
     parser.add_argument("--max-dates", default=None, type=int, help="Oldest-first cap on planned dates.")
     parser.add_argument("--plan-only", action="store_true", help="Print the plan estimate without writing anything.")
+    parser.add_argument(
+        "--consolidated",
+        action="store_true",
+        help="Backfill gate-rejected consolidated-tape days into the regular_consolidated partition from the regular ledger.",
+    )
     args = parser.parse_args(argv)
     profile = CollectionSettings()
     now = datetime.now(SEOUL)
@@ -621,6 +969,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     async def _plan_only() -> int:
         wide_history, prepared, calendar = _load_inputs(as_of)
+        if args.consolidated:
+            ledger = ExtendedBackfillLedger(default_toss_ledger_path())
+            plan = _apply_plan_filters(
+                enumerate_toss_consolidated_tasks(ledger=ledger),
+                start=args.start, end=args.end, max_dates=args.max_dates,
+            )
+            _print_plan_estimate(plan)
+            return 0
         client = _open_toss_client()
         async with aiohttp.ClientSession() as session:
             await client.ensure_token(session)
@@ -643,6 +999,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     async def _run_locked() -> int:
         wide_history, prepared, calendar = _load_inputs(as_of)
         client = _open_toss_client()
+        if args.consolidated:
+            eod_volumes = _eod_volumes_for(prepared)
+            store = CaptureStore(_capture_root(profile))
+            ledger = ExtendedBackfillLedger(default_toss_ledger_path())
+            plan = _apply_plan_filters(
+                enumerate_toss_consolidated_tasks(ledger=ledger),
+                start=args.start, end=args.end, max_dates=args.max_dates,
+            )
+            summary = await run_toss_consolidated_backfill(
+                as_of=as_of, stop_at=stop_at, profile=profile, client=client,
+                store=store, ledger=ledger, tasks=list(plan.tasks), eod_volumes=eod_volumes,
+            )
+            logger.info(
+                "[DATA] stage=toss_consolidated_backfill status=%s tasks_done=%d tasks_remaining=%d complete=%d consolidated=%d not_listed=%d failed=%d exhausted=%d stopped_by_deadline=%s outage_aborted=%s",
+                "OUTAGE_ABORT" if summary.outage_aborted else "DONE",
+                summary.tasks_done, summary.tasks_remaining, summary.complete,
+                summary.consolidated, summary.not_listed, summary.failed,
+                summary.exhausted, summary.stopped_by_deadline, summary.outage_aborted,
+            )
+            if summary.outage_aborted:
+                return 1
+            return 0
         async with aiohttp.ClientSession() as session:
             await client.ensure_token(session)
             floor = await _probe_floor(

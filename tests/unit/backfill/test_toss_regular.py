@@ -248,9 +248,46 @@ def test_consolidated_tape_rejected(tmp_path) -> None:
     total = 390 * 150
     frame, entry = _run(acquire_toss_regular_bars(client, object(), "005930", _DAY, eod_volume=float(total) / 1.5,
                                                   profile=_profile(tmp_path), capture_store=_store(tmp_path), run_id="run-cons"))
-    assert frame.empty
+    assert not frame.empty
+    assert (frame["vendor"] == "toss").all()
     assert entry.status == CaptureStatus.NOT_APPLICABLE
     assert entry.reason == "toss_consolidated_tape"
+
+
+def test_consolidated_frame_is_canonical_and_sorted(tmp_path) -> None:
+    """A toss_consolidated_tape rejection returns its canonical vendor-toss frame for the consolidated partition."""
+    grid = _regular_grid(_DAY, volume=150)
+    client = _GridToss(list(reversed(grid)))
+    total = 390 * 150
+    frame, entry = _run(acquire_toss_regular_bars(client, object(), "005930", _DAY, eod_volume=float(total) / 1.5,
+                                                  profile=_profile(tmp_path), capture_store=_store(tmp_path), run_id="run-cons-frame"))
+    assert entry.status == CaptureStatus.NOT_APPLICABLE and entry.reason == "toss_consolidated_tape"
+    assert len(frame) == 390
+    assert (frame["vendor"] == "toss").all()
+    assert (frame["snapshot_date"] == _DAY).all()
+    labels = frame["ts_hms"].astype(int).tolist()
+    assert labels == sorted(labels)
+    assert labels[0] == 90100 and labels[-1] == 153000
+
+
+def test_other_rejections_stay_empty(tmp_path) -> None:
+    """Shortfall, unverifiable, malformed and not-found rejections carry no frame."""
+    short = _GridToss(list(reversed(_regular_grid(_DAY, volume=50))))
+    frame, entry = _run(acquire_toss_regular_bars(short, object(), "005930", _DAY, eod_volume=39000.0,
+                                                  profile=_profile(tmp_path), capture_store=_store(tmp_path), run_id="run-o-short"))
+    assert frame.empty and entry.reason == "toss_volume_shortfall"
+    unverifiable = _GridToss(list(reversed(_regular_grid(_DAY))))
+    frame, entry = _run(acquire_toss_regular_bars(unverifiable, object(), "005930", _DAY, eod_volume=None,
+                                                 profile=_profile(tmp_path), capture_store=_store(tmp_path), run_id="run-o-unv"))
+    assert frame.empty and entry.reason == "toss_basis_unverifiable"
+    malformed = _GridToss([{"timestamp": "not-a-time", "volume": "1"}])
+    frame, entry = _run(acquire_toss_regular_bars(malformed, object(), "005930", _DAY, eod_volume=100.0,
+                                                  profile=_profile(tmp_path), capture_store=_store(tmp_path), run_id="run-o-mal"))
+    assert frame.empty and entry.reason == "toss_malformed_page"
+    missing = _GridToss([], error={"error": {"code": "stock-not-found", "message": "gone"}})
+    frame, entry = _run(acquire_toss_regular_bars(missing, object(), "000000", _DAY, eod_volume=100.0,
+                                                  profile=_profile(tmp_path), capture_store=_store(tmp_path), run_id="run-o-miss"))
+    assert frame.empty and entry.reason == "toss_stock_not_found"
 
 
 def test_volume_shortfall_retryable(tmp_path) -> None:

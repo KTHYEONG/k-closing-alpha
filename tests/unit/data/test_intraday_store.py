@@ -1016,3 +1016,67 @@ def test_deduplicate_bars_drops_rows_without_slot_identity() -> None:
     frame = pd.DataFrame([_bar_row("000001", 90100), _bar_row(None, 90100), _bar_row("000001", None)])
     out = _deduplicate_bars(frame)
     assert out["symbol"].tolist() == ["000001"] and out["ts_hms"].tolist() == [90100]
+
+
+def _consolidated_entry(symbol: str, session: str, status: str = "NOT_APPLICABLE", reason: str = "toss_consolidated_tape"):
+    from src.data.capture_contracts import ArtifactRef, CaptureDataset, CaptureStatus, CoverageEntry
+
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.MINUTE_BARS,
+        venue="KRX",
+        session=session,
+        scheduled_at=None,
+        status=CaptureStatus(status),
+        rows=2,
+        first_event_time=None,
+        last_event_time=None,
+        reason=reason,
+        raw_refs=(ArtifactRef(path=f"raw/{symbol}.json.gz", sha256="a" * 64, bytes=8, rows=0),),
+    )
+
+
+def _consolidated_frame(symbol: str, date: str) -> pd.DataFrame:
+    return pd.DataFrame([
+        {**_bar_row(symbol, 90100), "snapshot_date": date},
+        {**_bar_row(symbol, 90200), "snapshot_date": date},
+    ])
+
+
+def test_consolidated_session_is_a_verified_partition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The consolidated tag gets its own path with replace and shrink protection identical to regular."""
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    target = intraday_store.intraday_partition_path(1, date, "regular_consolidated")
+    assert target != intraday_store.intraday_partition_path(1, date, "regular")
+    assert "regular_consolidated" in str(target)
+
+    first = _consolidated_frame("005930", date)
+    cov = {"005930": _consolidated_entry("005930", "regular_consolidated")}
+    assert intraday_store.write_intraday_partition(first, 1, date, "regular_consolidated", coverage=cov) == 2  # type: ignore[arg-type]
+    second = _consolidated_frame("000660", date)
+    cov2 = {"000660": _consolidated_entry("000660", "regular_consolidated")}
+    assert intraday_store.write_intraday_partition(second, 1, date, "regular_consolidated", coverage=cov2) == 4  # type: ignore[arg-type]
+    shrink = pd.DataFrame([{**_bar_row("005930", 90100), "snapshot_date": date}])
+    total = intraday_store.write_intraday_partition(shrink, 1, date, "regular_consolidated", coverage={"005930": _consolidated_entry("005930", "regular_consolidated")})  # type: ignore[arg-type]
+    assert total == 4
+    stored = pd.read_parquet(target)
+    assert len(stored[stored["symbol"] == "005930"]) == 2
+
+
+def test_consolidated_session_rejects_non_consolidated_and_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """COMPLETE rows cannot land in the consolidated partition; unknown tags raise."""
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    frame = _consolidated_frame("005930", date)
+    with pytest.raises(ValueError, match="Unknown intraday session"):
+        intraday_store.write_intraday_partition(frame, 1, date, "nope", coverage={"005930": _bar_entry("005930")})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unknown intraday session"):
+        intraday_store.intraday_partition_path(1, date, "nope")
+    with pytest.raises(ValueError, match="Unknown intraday session"):
+        intraday_store.tick_partition_path(date, "nope")
+    with pytest.raises(ValueError, match="Only consolidated-tape attempts"):
+        intraday_store.write_intraday_partition(frame, 1, date, "regular_consolidated", coverage={"005930": _bar_entry("005930", session="regular_consolidated")})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Non-certified"):
+        intraday_store.write_intraday_partition(frame, 1, date, "regular", coverage={"005930": _consolidated_entry("005930", "regular")})  # type: ignore[arg-type]
+    assert not intraday_store.intraday_partition_path(1, date, "regular_consolidated").exists()
