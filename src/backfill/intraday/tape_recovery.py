@@ -25,13 +25,14 @@ from src.backfill.intraday.tape_harvest import (
     TapeSession,
     TickTapePublisher,
     harvest_symbol_tape,
+    is_session_closed,
 )
 from src.config.collection import CollectionSettings
-from src.config.market_session import ARCHIVE_REGULAR_READY_HHMMSS
 from src.data.capture_contracts import SEOUL, CaptureStatus
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_store import _partition_row_count, intraday_partition_path, tick_partition_path
+from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.tick_bar_consistency import (
     TickBarRelation,
     classify_tick_bar_volume,
@@ -66,6 +67,7 @@ class WalkTask:
     venue: Literal["KRX", "NXT"]
     days: tuple[str, ...]
     sessions: tuple[TapeSession, ...]
+    pairs: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,7 @@ class TapeRunSummary:
     remaining: tuple[str, ...]
     stopped: bool
     stopped_reason: str
+    skipped_unclosed: int = 0
 
 
 def parse_walk_deadline(value: str | None) -> datetime | None:
@@ -165,12 +168,24 @@ def _ingested_trading_days() -> set[str]:
 
 
 def _is_trading_day(day: str, ingested: set[str]) -> bool:
-    """Weekday check, tightened by price_history inside its ingested range (holidays carry no rows)."""
-    if date.fromisoformat(day).weekday() >= 5:
+    """Whether a KST day is a candidate for tape recovery.
+
+    The verified session calendar is authoritative; price history only excludes
+    in-range holidays. Never calls the network; invalid ISO dates raise ValueError.
+    """
+    moment = date.fromisoformat(day)
+    if moment.weekday() >= 5:
         return False
-    if not ingested or day < min(ingested) or day > max(ingested):
+    kind = resolve_session_day(moment).kind
+    if kind is SessionKind.CLOSED:
+        return False
+    if kind is SessionKind.UNKNOWN:
+        return day in ingested
+    if not ingested:
         return True
-    return day in ingested
+    if min(ingested) <= day <= max(ingested):
+        return day in ingested
+    return True
 
 
 POOL_UNIVERSE_START: str = "2026-09-11"
@@ -422,10 +437,7 @@ def _session_need(symbol: str, day: str, spec: TapeSession, index: PartitionInde
 
 
 def _session_closed(day: str, session: str, now: datetime) -> bool:
-    today = now.date().isoformat()
-    if session == "regular":
-        return day < today or (day == today and now.strftime("%H%M%S") >= ARCHIVE_REGULAR_READY_HHMMSS)
-    return day < today
+    return is_session_closed(day, session, now)
 
 
 def collect_tape_needs(
@@ -478,14 +490,23 @@ def order_walk_tasks(needs: list[Need]) -> list[WalkTask]:
     grouped: dict[tuple[str, Literal["KRX", "NXT"]], dict[str, Any]] = {}
     for need in needs:
         key = (need.symbol, need.venue)
-        slot = grouped.setdefault(key, {"days": set(), "sessions": set()})
+        slot = grouped.setdefault(key, {"days": set(), "sessions": set(), "pairs": set()})
         slot["days"].add(need.day)
         slot["sessions"].add(need.session)
+        slot["pairs"].add((need.day, need.session))
     tasks: list[WalkTask] = []
     for (symbol, venue), slot in grouped.items():
         by_name = {s.session: s for s in TAPE_SESSIONS if s.venue == venue}
         sessions = tuple(by_name[name] for name in sorted(slot["sessions"]) if name in by_name)
-        tasks.append(WalkTask(symbol=symbol, venue=venue, days=tuple(sorted(slot["days"])), sessions=sessions))
+        tasks.append(
+            WalkTask(
+                symbol=symbol,
+                venue=venue,
+                days=tuple(sorted(slot["days"])),
+                sessions=sessions,
+                pairs=tuple(sorted(slot["pairs"])),
+            )
+        )
     tasks.sort(key=lambda t: (min(t.days), t.symbol, t.venue))
     return tasks
 
@@ -621,7 +642,7 @@ async def run_walk_tasks(
     root = _capture_root(profile)
     expected: dict[tuple[str, str], int] = {}
     pending_ledger: list[dict[str, Any]] = []
-    pages = rows = unresolved = failure_streak = 0
+    pages = rows = unresolved = skipped_unclosed = failure_streak = 0
     remaining: list[str] = []
     started = time.monotonic()
     stopped_reason = ""
@@ -665,10 +686,12 @@ async def run_walk_tasks(
                 profile=profile,
                 on_result=results.append,
                 walk_deadline=upcoming,
+                needed=task.pairs,
             )
         except OSError as exc:
             raise RuntimeError(f"Tape backfill evidence failed symbol={task.symbol}: {exc}") from exc
         pages += int(outcome.pages_fetched)
+        skipped_unclosed += len(outcome.skipped_unclosed)
         if outcome.unresolved_days:
             logger.info(
                 "[DATA] stage=tape_backfill symbol=%s venue=%s status=GUARD_STOP remaining_days=%d",
@@ -679,7 +702,13 @@ async def run_walk_tasks(
         if apply:
             assert publisher is not None
             for result in results:
-                publisher.add(result)
+                try:
+                    publisher.add(result)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{exc} task={index} symbol={result.symbol!r} day={result.day!r}"
+                        f" session={result.session!r}"
+                    ) from exc
                 if result.entry.status == CaptureStatus.COMPLETE:
                     key = (result.day, result.session)
                     expected[key] = expected.get(key, 0) + len(result.frame)
@@ -724,4 +753,5 @@ async def run_walk_tasks(
         remaining=tuple(remaining),
         stopped=bool(remaining),
         stopped_reason=stopped_reason,
+        skipped_unclosed=skipped_unclosed,
     )

@@ -237,7 +237,7 @@ async def run_tick_tape_sweep(
     )
     still_keys = sorted(set(active_keys) - set(recovered))
     logger.info(
-        "[DATA] stage=tape_sweep_report needs=%d pages=%d rows=%d recovered=%d unresolved=%d expired=%d remaining=%s",
+        "[DATA] stage=tape_sweep_report needs=%d pages=%d rows=%d recovered=%d unresolved=%d expired=%d remaining=%s skipped_unclosed=%d",
         len(active_keys),
         summary.pages,
         summary.rows,
@@ -245,6 +245,7 @@ async def run_tick_tape_sweep(
         len(still_keys),
         len(expired),
         summary.remaining,
+        int(summary.skipped_unclosed),
     )
     report = TapeSweepReport(
         days_checked=tuple(window),
