@@ -812,3 +812,134 @@ def test_cli_rejects_bad_args_and_missing_creds(cli_env, monkeypatch) -> None:
     monkeypatch.setattr(app_settings, "TOSS_APP_KEY", "", raising=False)
     with pytest.raises(RuntimeError, match="credentials"):
         trb.main(["--as-of", "2026-03-10", "--plan-only"])
+
+
+# ---------------------------------------------------------------- consolidated
+
+
+def _consolidated_task(day: str, symbols: tuple[str, ...]) -> ExtendedBackfillTask:
+    return ExtendedBackfillTask(snapshot_date=day, session="regular_consolidated", symbols=symbols)
+
+
+def _run_consolidated(profile, store, ledger, client, tasks, eod_volumes, now_fn=None, stop_at=None):
+    return asyncio.run(
+        trb.run_toss_consolidated_backfill(
+            as_of=_AS_OF, stop_at=stop_at if stop_at is not None else _FAR_FUTURE,
+            profile=profile, client=client, store=store, ledger=ledger,
+            tasks=tasks, eod_volumes=eod_volumes,
+            now_fn=now_fn if now_fn is not None else (lambda: _FIXED_NOW),
+        )
+    )
+
+
+def _seed_regular_consolidated_ledger(ledger, day: str, symbols: tuple[str, ...]) -> None:
+    from src.data.capture_contracts import ArtifactRef, CoverageEntry
+
+    entries = [
+        CoverageEntry(
+            symbol=symbol, dataset=CaptureDataset.MINUTE_BARS, venue="KRX", session="regular",
+            scheduled_at=None, status=CaptureStatus.NOT_APPLICABLE, rows=390,
+            first_event_time=None, last_event_time=None, reason="toss_consolidated_tape",
+            raw_refs=(ArtifactRef(path=f"raw/{symbol}.json.gz", sha256="b" * 64, bytes=8, rows=0),),
+        )
+        for symbol in symbols
+    ]
+    ledger.record(day, "regular", entries, run_id="seed", attempted_at=_FIXED_NOW, vendor="toss")
+
+
+def test_consolidated_day_lands_in_its_own_session(env) -> None:
+    """A consolidated day is stored only in regular_consolidated with a same-session ledger row."""
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    _seed_regular_consolidated_ledger(ledger, _DAY1, ("000005",))
+    plan = trb.enumerate_toss_consolidated_tasks(ledger=ledger)
+    assert [t.snapshot_date for t in plan.tasks] == [_DAY1]
+    assert plan.tasks[0].session == "regular_consolidated"
+    client = _complete_client(["000005"], _DAY1, volume=150)
+    summary = _run_consolidated(
+        profile, store, ledger, client, list(plan.tasks), _eod([_DAY1], ["000005"], volume=39000.0)
+    )
+    assert summary.consolidated == 1 and summary.failed == 0
+    target = intraday_partition_path(1, _DAY1, "regular_consolidated")
+    stored = pd.read_parquet(target)
+    assert sorted(stored["symbol"].unique().tolist()) == ["000005"]
+    assert (stored["vendor"] == "toss").all()
+    assert not intraday_partition_path(1, _DAY1, "regular").exists()
+    frame = ledger._read_all()
+    cons_rows = frame[frame["session"] == "regular_consolidated"]
+    assert len(cons_rows) == 1 and cons_rows.iloc[0]["reason"] == "toss_consolidated_tape"
+
+
+def test_consolidated_reopen_from_existing_ledger(env) -> None:
+    """Planning reads the regular ledger verdicts; a rerun after completion plans zero tasks."""
+    profile, store, ledger = env
+    _seed_regular_consolidated_ledger(ledger, _DAY1, ("000005", "000006"))
+    _seed_regular_consolidated_ledger(ledger, _DAY2, ("000007",))
+    plan = trb.enumerate_toss_consolidated_tasks(ledger=ledger)
+    by_day = {task.snapshot_date: task.symbols for task in plan.tasks}
+    assert by_day == {_DAY1: ("000005", "000006"), _DAY2: ("000007",)}
+    grids = {s: list(reversed(_regular_grid(_DAY1 if s != "000007" else _DAY2, 150))) for s in ("000005", "000006", "000007")}
+    client = _FakeToss(grids)
+    summary = _run_consolidated(
+        profile, store, ledger, client, list(plan.tasks),
+        _eod([_DAY1, _DAY2], ["000005", "000006", "000007"], volume=39000.0),
+    )
+    assert summary.consolidated == 3
+    assert trb.enumerate_toss_consolidated_tasks(ledger=ledger).tasks == ()
+
+
+def test_consolidated_no_cross_contamination(env) -> None:
+    """An accepted day and a consolidated day on one date each land only in their own partition."""
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    accepted_client = _complete_client(["000001"], _DAY1)
+    accepted = _run(profile, store, ledger, accepted_client, [_task(_DAY1, ("000001",))], _eod([_DAY1], ["000001"]))
+    assert accepted.complete == 1
+    _seed_regular_consolidated_ledger(ledger, _DAY1, ("000005",))
+    cons_client = _complete_client(["000005"], _DAY1, volume=150)
+    summary = _run_consolidated(
+        profile, store, ledger, cons_client,
+        [_consolidated_task(_DAY1, ("000005",))], _eod([_DAY1], ["000005"], volume=39000.0),
+    )
+    assert summary.consolidated == 1
+    regular_rows = pd.read_parquet(intraday_partition_path(1, _DAY1, "regular"))
+    assert sorted(regular_rows["symbol"].unique().tolist()) == ["000001"]
+    cons_rows = pd.read_parquet(intraday_partition_path(1, _DAY1, "regular_consolidated"))
+    assert sorted(cons_rows["symbol"].unique().tolist()) == ["000005"]
+
+
+def test_consolidated_outage_guard_applies(env) -> None:
+    """Transport failures record nothing and abort the consolidated run like the regular runner."""
+    profile, store, ledger = env
+    _seed_regular_consolidated_ledger(ledger, _DAY1, ("000011", "000012", "000013"))
+    client = _FakeToss(raises={"000011", "000012", "000013"})
+    summary = _run_consolidated(
+        profile, store, ledger, client,
+        [_consolidated_task(_DAY1, ("000011", "000012", "000013"))],
+        _eod([_DAY1], ["000011", "000012", "000013"]),
+    )
+    assert summary.outage_aborted is True
+    assert ledger.terminal_symbols(_DAY1, "regular_consolidated") == frozenset()
+
+
+def test_consolidated_plan_only_counts_and_estimates(cli_env, capsys) -> None:
+    """--consolidated --plan-only prints the ledger-derived count without any vendor call."""
+    from src.backfill.intraday.extended_session_backfill import ExtendedBackfillLedger
+
+    _, history_dir = cli_env
+    ledger = ExtendedBackfillLedger(history_dir / "intraday" / "backfill_ledger" / "toss_regular.parquet")
+    _seed_regular_consolidated_ledger(ledger, _DAY1, ("000001", "000002"))
+    assert trb.main(["--as-of", "2026-03-10", "--consolidated", "--plan-only"]) == 0
+    out = capsys.readouterr().out
+    assert "planned_symbol_days=2" in out
+    assert "estimated_calls=4" in out
+    assert _CliTossClient.calls == []
+    _CliTossClient.grids = {
+        symbol: list(reversed(_regular_grid(_DAY1, 150))) for symbol in ("000001", "000002")
+    }
+    assert trb.main(["--as-of", "2026-03-10", "--consolidated"]) == 0
+    assert trb.main(["--as-of", "2026-03-10", "--consolidated", "--plan-only"]) == 0
+    out = capsys.readouterr().out
+    assert "planned_symbol_days=0" in out

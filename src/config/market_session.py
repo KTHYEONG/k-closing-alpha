@@ -43,9 +43,20 @@ INTRADAY_BAR_STAMP_CONVENTION: Mapping[str, str] = MappingProxyType(
     {"kis": BAR_STAMP_START, "kiwoom": BAR_STAMP_START, "ls": BAR_STAMP_END, "toss": BAR_STAMP_END}
 )
 INTRADAY_SESSION_REGULAR: str = "regular"
+INTRADAY_SESSION_REGULAR_CONSOLIDATED: str = "regular_consolidated"
 INTRADAY_SESSION_NXT_AFTERMARKET: str = "nxt_aftermarket"
 INTRADAY_SESSION_NXT_PREMARKET: str = "nxt_premarket"
 INTRADAY_SESSION_KRX_AFTERMARKET: str = "krx_aftermarket"
+# Every partition session the store verifies; unknown tags fail closed at write/path time.
+INTRADAY_VERIFIED_SESSIONS: frozenset[str] = frozenset(
+    {
+        INTRADAY_SESSION_REGULAR,
+        INTRADAY_SESSION_REGULAR_CONSOLIDATED,
+        INTRADAY_SESSION_NXT_PREMARKET,
+        INTRADAY_SESSION_NXT_AFTERMARKET,
+        INTRADAY_SESSION_KRX_AFTERMARKET,
+    }
+)
 KRX_REGULAR_HOUR_FLOOR: str = "090000"
 KRX_REGULAR_HOUR_CEIL: str = "153000"
 KRX_AFTERMARKET_HOUR_FLOOR: str = "160000"
