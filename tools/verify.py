@@ -442,11 +442,11 @@ def main() -> None:
     worker_args = pytest_worker_args(force_serial=args.no_xdist, env_workers=os.environ.get("LEAN_CHECK_WORKERS"), available_memory_gb=_available_memory_gb(), test_file_count=len(test_files), cpu_count=os.cpu_count(), xdist_available=importlib.util.find_spec("xdist") is not None)
 
     src_files = [f for f in py_files if f.startswith("src/")]
-    cov_json_path = "tmp/verify_coverage.json"
+    cov_json_path = "scratch/verify_coverage.json"
     cov_args: list[str] = []
 
     if src_files and not args.no_cov:
-        os.makedirs("tmp", exist_ok=True)
+        os.makedirs("scratch", exist_ok=True)
         with contextlib.suppress(OSError):
             os.remove(cov_json_path)
         pkgs = {f.split("/")[1] for f in src_files if len(f.split("/")) >= 2}
