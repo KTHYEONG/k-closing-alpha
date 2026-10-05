@@ -1043,6 +1043,9 @@ def _recon_decomp_config(**overrides):
         "volume_rel_err_p90": 0.144,
         "close_bp_err_p90": 11.9,
         "calibrated_through": "2026-09-30",
+        "fit_start": "2026-09-01",
+        "holdout_start": "2026-08-25",
+        "holdout_end": "2026-08-31",
     }
     base.update(overrides)
     return DecompositionConfig(**base)
