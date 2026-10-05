@@ -1044,33 +1044,60 @@ def test_retrain_train_bundle_scores_adopted_arm2_report(tmp_path, monkeypatch) 
     monkeypatch.setattr(mod, "build_gate_eval_frame", lambda *a, **k: None)
     monkeypatch.setattr(mod, "evaluate_retrain_promotion", _capture)
 
+    import hashlib
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
     import pytest
 
     from src.ml.pit_report import (
         RECON_ARM_DIRNAME,
         CalibrationStability,
+        CertificationBindings,
         PairedDelta,
         ReconstructionCertification,
         save_reconstruction_certification,
     )
 
+    config_path = tmp_path / "nxt_decomposition_config.json"
+    config_path.write_bytes(b'{"ewma_alpha": 0.5}')
+    monkeypatch.setattr(
+        "src.data.pit1520_panel.default_decomposition_config_path", lambda: config_path)
+    arm_dir = live_dir / RECON_ARM_DIRNAME
+    arm_dir.mkdir(exist_ok=True)
+    _write_pit_report(arm_dir, native_mean=9.0)
+    arm2_sha = hashlib.sha256((arm_dir / "pit_haircut_report.json").read_bytes()).hexdigest()
+    config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
     cert = ReconstructionCertification(
-        generated_at="2026-10-05T00:00:00+09:00",
+        generated_at=datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
         exact_dir="exact",
         recon_dir="recon",
         paired_days=("2026-03-02",),
         dropped_days=(),
         coverage_improvement=PairedDelta(delta=4.0, ci_low=2.0, ci_high=6.0, p_value=0.001, n_days=60),
         reconstruction_feature=PairedDelta(delta=0.2, ci_low=-1.0, ci_high=1.4, p_value=0.6, n_days=60),
-        stability=CalibrationStability(passed=True, median_rel_err=0.03, n_scored=40, detail=""),
+        stability=CalibrationStability(
+            passed=True, rel_err_p90=0.10, coverage=0.80, bias_drift=0.01,
+            alpha_at_boundary=False, n_holdout_rows=40, detail="",
+        ),
         coverage_by_year_and_basis={},
+        bindings=CertificationBindings(
+            decomposition_config_sha256=config_sha,
+            calibration_table_sha256="b" * 64,
+            exact_report_sha256="c" * 64,
+            recon_report_sha256=arm2_sha,
+        ),
+        fidelity={
+            "chg_rank_correlation": 0.99, "tv_rank_correlation": 0.98, "top_k_overlap": 0.97,
+            "n_paired_days": 60.0, "n_symbol_days": 600.0, "n_no_share": 2.0,
+        },
+        holdout_start="2026-08-25",
+        holdout_end="2026-08-31",
+        gate_config={"feature_margin_bp": 5.0},
         gate_verdict="ADOPT",
         gate_reasons=(),
     )
     save_reconstruction_certification(cert, out_path=live_dir / "reconstruction_certification.json")
-    arm_dir = live_dir / RECON_ARM_DIRNAME
-    arm_dir.mkdir(exist_ok=True)
-    _write_pit_report(arm_dir, native_mean=9.0)
 
     with pytest.raises(_StopError):
         main(["--train-ranker-bundle", "--export-dir", str(tmp_path)])
@@ -1079,3 +1106,31 @@ def test_retrain_train_bundle_scores_adopted_arm2_report(tmp_path, monkeypatch) 
     assert seen["recon_report"] is not None
     assert float(seen["recon_report"].mean_net_bp["pit_native"]) == 9.0
     assert seen["pit_report"] is not None
+
+    import dataclasses
+    from pathlib import Path
+
+    from joblib import dump, load
+
+    from src.ml.retrain_gate import evaluate_retrain_promotion
+
+    monkeypatch.setattr(mod, "evaluate_retrain_promotion", evaluate_retrain_promotion)
+    monkeypatch.setattr(mod, "train_production_bundle", lambda *args, **kwargs: _pit_live_bundle())
+    monkeypatch.setattr(mod, "build_gate_eval_frame", lambda *args, **kwargs: _pit_eval_frame())
+    monkeypatch.setenv("KCA_CODE_COMMIT", "audit-regression")
+
+    def save_bundle(bundle, export_dir):
+        target = Path(export_dir) / "sizing_pipeline_bundle.joblib"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        dump(bundle, target)
+        return str(target)
+
+    monkeypatch.setattr(mod, "save_production_bundle", save_bundle)
+    for cert_verdict, expected_arm, expected_mean in (("ADOPT", "arm2", 9.0), ("REJECT", "arm1", 5.0)):
+        save_reconstruction_certification(dataclasses.replace(cert, gate_verdict=cert_verdict),
+                                         out_path=live_dir / "reconstruction_certification.json")
+        main(["--train-ranker-bundle", "--export-dir", str(tmp_path)])
+        metadata = load(live_dir / "sizing_pipeline_bundle.joblib")["pit_certification"]
+        assert metadata["arm"] == expected_arm
+        assert metadata["mean_net_bp"]["pit_native"] == expected_mean
+        assert metadata["gate_status"] == "PASS"

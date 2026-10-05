@@ -115,7 +115,10 @@ def main(argv: list[str] | None = None) -> None:
         live_dir = os.path.join(args.export_dir, "topk_ranker")
         registry_path = Path(live_dir) / RETRAIN_REGISTRY_FILENAME
         if not args.skip_promotion_gate:
+            from src.data.pit1520_panel import default_decomposition_config_path
+
             pit_mode = PitGateMode(args.pit_gate_mode)
+            pit_gate = PitGateConfig(mode=pit_mode)
             pit_report = None
             if pit_mode != PitGateMode.OFF:
                 try:
@@ -123,16 +126,23 @@ def main(argv: list[str] | None = None) -> None:
                 except ValueError as exc:
                     # Unreadable report evaluates as MISSING: blocks under ENFORCE, advisory-only otherwise.
                     logger.warning("[EVAL] stage=pit_gate status=REPORT_UNREADABLE reason=%s", type(exc).__name__)
-            pit_recon_report, pit_recon_adopted, pit_recon_detail = load_recon_pit_selection(Path(live_dir))
+            pit_recon_report, pit_recon_adopted, pit_recon_detail = load_recon_pit_selection(
+                Path(live_dir),
+                arm1_report=pit_report,
+                decomposition_config_path=default_decomposition_config_path(),
+                now=attempted_at,
+                max_age_days=pit_gate.max_report_age_days,
+            )
             verdict = evaluate_retrain_promotion(
                 bundle, load_current_bundle(live_dir), build_gate_eval_frame(ph, market_dates, d_to_idx),
-                pit_report=pit_report, pit_gate=PitGateConfig(mode=pit_mode),
+                pit_report=pit_report, pit_gate=pit_gate,
                 pit_recon_report=pit_recon_report, pit_recon_adopted=pit_recon_adopted,
                 pit_recon_detail=pit_recon_detail,
             )
+            verdict_selected_report = pit_recon_report if verdict.pit_arm == "arm2" else pit_report
             bundle[PIT_CERTIFICATION_BUNDLE_KEY] = pit_certification_metadata(
-                pit_report, gate_mode=args.pit_gate_mode, gate_status=verdict.pit_status,
-                gate_reasons=verdict.pit_reasons,
+                verdict_selected_report, gate_mode=args.pit_gate_mode, gate_status=verdict.pit_status,
+                gate_reasons=verdict.pit_reasons, arm=verdict.pit_arm,
             )
             logger.info(
                 "[EVAL] stage=retrain_promotion_gate promote=%s agreement=%s reasons=%s pit_status=%s pit_reasons=%s",
