@@ -160,3 +160,43 @@ def test_record_run_outcome_masks_reason_before_truncation(tmp_path, monkeypatch
     for text in (record["reason"], stored, *sent, *(rec.getMessage() for rec in caplog.records)):
         assert all(secret[i : i + 8] not in text for i in range(len(secret) - 7))
     assert len(stored) <= run_outcome.RUN_EVENT_REASON_MAX_CHARS
+
+
+def test_skipped_is_recorded_without_alert_and_loads_back(tmp_path) -> None:
+    import json
+
+    from src.tools import run_outcome
+
+    path = tmp_path / "2026-10-05.jsonl"
+    sent: list[tuple[str, str]] = []
+
+    record = run_outcome.record_run_outcome(
+        "collect",
+        run_outcome.RUN_OUTCOME_SKIPPED,
+        run_date="2026-10-05",
+        reason="non_trading_day",
+        metrics={"session": "CLOSED"},
+        path=path,
+        alert_fn=lambda s, b: sent.append((s, b)) or {},
+    )
+
+    assert record["outcome"] == "SKIPPED"
+    assert sent == []
+    stored = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert stored["outcome"] == "SKIPPED"
+    assert stored["reason"] == "non_trading_day"
+    assert run_outcome.load_run_outcomes("2026-10-05", path=path) == {"collect": "SKIPPED"}
+
+
+def test_skipped_requires_non_blank_reason(tmp_path) -> None:
+    import pytest
+
+    from src.tools import run_outcome
+
+    path = tmp_path / "2026-10-05.jsonl"
+    for bad in ("", "   "):
+        with pytest.raises(ValueError, match="non-blank reason"):
+            run_outcome.record_run_outcome(
+                "predict", run_outcome.RUN_OUTCOME_SKIPPED, run_date="2026-10-05", reason=bad, path=path,
+            )
+    assert not path.exists()

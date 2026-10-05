@@ -33,6 +33,7 @@ from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day, resolve_prev_trading_day_kis
 from src.execution.paper_broker import load_held_roster
+from src.tools.run_outcome import RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -905,6 +906,13 @@ async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings
     trading_day = date.fromisoformat(snapshot_date)
     session_day = resolve_session_day(trading_day, overrides=profile.COLLECTION_SESSION_OVERRIDES)
     if session_day.kind is SessionKind.CLOSED:
+        record_run_outcome(
+            "auction_capture",
+            RUN_OUTCOME_SKIPPED,
+            run_date=snapshot_date,
+            reason="non_trading_day",
+            metrics={"session": "CLOSED"},
+        )
         logger.info("[DATA] stage=auction_capture status=SKIP reason=non_trading_day date=%s", snapshot_date)
         return None
     import os
@@ -977,6 +985,13 @@ def main(argv: list[str] | None = None) -> None:
     manifest = asyncio.run(_run_async(snapshot_date, args.phase, profile))
     if manifest is None:
         # 휴장일은 장애가 아니다: 정상 종료해 OnFailure 오탐 알림과 무의미한 캡처를 막는다.
+        record_run_outcome(
+            "auction_capture",
+            RUN_OUTCOME_SKIPPED,
+            run_date=snapshot_date,
+            reason="non_trading_day",
+            metrics={"session": "CLOSED"},
+        )
         logger.info("[DATA] stage=auction_capture status=SKIP reason=non_trading_day date=%s", snapshot_date)
         return
     logger.info(

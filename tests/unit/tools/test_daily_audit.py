@@ -770,6 +770,30 @@ def test_audit_decision_requires_topk_or_predict_ok_outcome(monkeypatch, tmp_pat
     assert normal["decision"] is True
 
 
+def test_audit_decision_skipped_predict_is_missing(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.tools import daily_audit
+
+    parquet_dir = tmp_path / "parquet"
+    paper_dir = tmp_path / "paper"
+    parquet_dir.mkdir()
+    paper_dir.mkdir()
+    monkeypatch.setattr(daily_audit.settings, "PARQUET_DIR", parquet_dir, raising=False)
+    monkeypatch.setattr(daily_audit.settings, "PAPER_DIR", paper_dir, raising=False)
+    pd.DataFrame({"decision_date": ["2026-09-14"], "symbol": [""], "reason": ["no_persisted_decision"]}).to_parquet(
+        paper_dir / "decisions.parquet"
+    )
+    monkeypatch.setattr(daily_audit, "fetch_archive_snapshot", lambda snapshot_date=None, **kw: pd.DataFrame())
+    monkeypatch.setattr(daily_audit, "resolve_previous_archive_date", lambda _d: None)
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *_a: tmp_path / "missing.parquet")
+    monkeypatch.setattr(daily_audit, "load_run_outcomes", lambda _d: {"predict": "SKIPPED"})
+
+    result = daily_audit.audit_daily_completeness("2026-09-14")
+
+    assert result["decision"] is False
+
+
 def test_audit_daily_completeness_flags_stale_open_position(monkeypatch, tmp_path) -> None:
     import pandas as pd
 

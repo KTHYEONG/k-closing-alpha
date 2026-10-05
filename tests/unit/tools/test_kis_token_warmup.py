@@ -340,6 +340,10 @@ def test_warmup_main_skips_on_verified_closure(monkeypatch, tmp_path, caplog) ->
 
     monkeypatch.setattr(settings, "BASE_DIR", tmp_path)
     monkeypatch.setattr(kis_token_warmup, "should_skip_warmup", lambda _today: True)
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        kis_token_warmup, "record_run_outcome", lambda job, outcome, **kw: recorded.append((job, outcome, kw))
+    )
 
     def _boom(*_a, **_k):
         raise AssertionError("no client on closed day")
@@ -350,6 +354,13 @@ def test_warmup_main_skips_on_verified_closure(monkeypatch, tmp_path, caplog) ->
         assert kis_token_warmup.main() is None
 
     assert any("status=SKIP" in rec.message for rec in caplog.records)
+    assert len(recorded) == 1
+    job, outcome, kw = recorded[0]
+    assert job == "kis_token_warmup"
+    assert outcome == "SKIPPED"
+    assert kw["reason"] == "non_trading_day"
+    assert kw["metrics"] == {"session": "CLOSED"}
+    assert len(kw["run_date"]) == 10 and kw["run_date"][4] == "-" and kw["run_date"][7] == "-"
 
 
 def test_should_skip_warmup_only_on_closed() -> None:

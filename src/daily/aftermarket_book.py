@@ -41,6 +41,7 @@ from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day
 from src.execution.paper_broker import HeldRoster, load_held_roster
+from src.tools.run_outcome import RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -581,6 +582,13 @@ async def _run_async(snapshot_date: str, profile: CollectionSettings) -> tuple[C
     trading_day = date.fromisoformat(snapshot_date)
     session_day = resolve_session_day(trading_day, overrides=profile.COLLECTION_SESSION_OVERRIDES)
     if session_day.kind is SessionKind.CLOSED:
+        record_run_outcome(
+            "aftermarket_book",
+            RUN_OUTCOME_SKIPPED,
+            run_date=snapshot_date,
+            reason="non_trading_day",
+            metrics={"session": "CLOSED"},
+        )
         logger.info("[DATA] stage=aftermarket_book status=SKIP reason=non_trading_day date=%s", snapshot_date)
         return None
     env = dict(os.environ)
@@ -641,6 +649,13 @@ def main(argv: list[str] | None = None) -> None:
         return
     session_day = resolve_session_day(trading_day, overrides=profile.COLLECTION_SESSION_OVERRIDES)
     if session_day.kind is SessionKind.CLOSED:
+        record_run_outcome(
+            "aftermarket_book",
+            RUN_OUTCOME_SKIPPED,
+            run_date=snapshot_date,
+            reason="non_trading_day",
+            metrics={"session": "CLOSED"},
+        )
         logger.info("[DATA] stage=aftermarket_book status=SKIP reason=non_trading_day date=%s", snapshot_date)
         return
     if session_day.kind is not SessionKind.STANDARD:
@@ -648,6 +663,13 @@ def main(argv: list[str] | None = None) -> None:
         return
     manifests = asyncio.run(_run_async(snapshot_date, profile))
     if manifests is None:
+        record_run_outcome(
+            "aftermarket_book",
+            RUN_OUTCOME_SKIPPED,
+            run_date=snapshot_date,
+            reason="non_trading_day",
+            metrics={"session": "CLOSED"},
+        )
         logger.info("[DATA] stage=aftermarket_book status=SKIP reason=non_trading_day date=%s", snapshot_date)
         return
     logger.info(

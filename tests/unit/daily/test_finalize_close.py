@@ -568,7 +568,7 @@ def test_classify_finalize_outcome_cases() -> None:
     # 거래일 빈 아카이브: 15:20 실패가 outcome 로그에 노출된다
     assert classify_finalize_outcome(0, 0, 0, [], is_trading_day=True) == ("DEGRADED", "empty_archive")
     # 휴장일 빈 아카이브: 정상 휴일
-    assert classify_finalize_outcome(0, 0, 0, [], is_trading_day=False) == ("OK", "non_trading_day")
+    assert classify_finalize_outcome(0, 0, 0, [], is_trading_day=False) == ("SKIPPED", "non_trading_day")
     # 픽 미확정은 부분 확정이어도 DEGRADED
     assert classify_finalize_outcome(10, 9, 1, ["005930"], is_trading_day=True) == ("DEGRADED", "picks_unconfirmed")
     # 확정 0건(미확정 행 존재)
@@ -654,7 +654,7 @@ def test_empty_archive_on_holiday_is_ok(monkeypatch) -> None:
             trading_day_fn=_holiday,
         )
     )
-    assert outcomes and outcomes[0][0] == "OK"
+    assert outcomes and outcomes[0][0] == "SKIPPED"
     assert outcomes[0][1]["reason"] == "non_trading_day"
 
 
@@ -1826,6 +1826,35 @@ def test_finalize_amain_skips_quoting_on_shifted_session(monkeypatch) -> None:
 
     assert asyncio.run(finalize_close._amain(SimpleNamespace(date="2026-11-19", retry_interval=30.0))) == 0
     recorder.assert_called_once_with("finalize_close", "OK", run_date="2026-11-19", reason="session_shifted")
+
+
+def test_finalize_amain_records_skipped_on_closed_day(monkeypatch) -> None:
+    import asyncio
+    from datetime import date
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from src.daily import finalize_close
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    target = date(2026, 10, 9)
+    monkeypatch.setattr(
+        finalize_close, "resolve_session_day", lambda _d, **_k: SessionDay(
+            trading_date=target, kind=SessionKind.CLOSED, clock=None, provenance="krx_calendar"
+        ),
+    )
+
+    def _raising_client(*args, **kwargs):
+        raise AssertionError("session-gated SKIP must not construct clients")
+
+    monkeypatch.setattr(finalize_close, "KisApiClient", _raising_client)
+    recorder = Mock()
+    monkeypatch.setattr(finalize_close, "record_run_outcome", recorder)
+
+    assert asyncio.run(finalize_close._amain(SimpleNamespace(date="2026-10-09", retry_interval=30.0))) == 0
+    recorder.assert_called_once_with(
+        "finalize_close", "SKIPPED", run_date="2026-10-09", reason="non_trading_day", metrics={"session": "CLOSED"}
+    )
 
 
 def test_amain_missing_cohort_degrades_to_uncaptured_finalization(tmp_path, monkeypatch) -> None:

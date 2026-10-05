@@ -1795,3 +1795,74 @@ def test_main_gap_repair_failure_is_deferred_not_raised(monkeypatch, tmp_path, c
         mod.main()
 
     assert any("status=DEFERRED" in r.getMessage() for r in caplog.records)
+
+
+def _closed_session_day(trading_date, **_kw):
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    return SessionDay(trading_date=trading_date, kind=SessionKind.CLOSED, clock=None, provenance="test")
+
+
+def _standard_session_day(trading_date, **_kw):
+    from datetime import datetime
+
+    from src.data.session_calendar import SessionDay, SessionKind
+    from src.data.capture_contracts import SessionClock
+    from zoneinfo import ZoneInfo
+
+    day = trading_date if hasattr(trading_date, "year") else datetime.fromisoformat(str(trading_date)).date()
+    return SessionDay(trading_date=day, kind=SessionKind.STANDARD, clock=SessionClock.standard(day), provenance="test")
+
+
+def test_run_price_ingest_holiday_zero_rows_is_skipped(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "ph.parquet"
+    mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-08", "2026-09-09", "2026-09-10"})
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"], days["2026-09-10"]], [10000.0] * 3))
+    monkeypatch.setattr(mod, "resolve_session_day", _closed_session_day)
+    outcomes: list[tuple] = []
+
+    report = asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+        on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+    ))
+
+    assert report.n_new_rows == 0
+    assert report.flow_shortfall == {} and report.program_flow_shortfall == {}
+    assert len(outcomes) == 1 and outcomes[0][0] == "SKIPPED"
+    assert outcomes[0][1]["reason"] == "non_trading_day"
+    assert outcomes[0][1]["metrics"]["n_new_rows"] == 0
+
+
+def test_run_price_ingest_trading_zero_rows_stays_ok(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "ph.parquet"
+    mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-08", "2026-09-09", "2026-09-10"})
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"], days["2026-09-10"]], [10000.0] * 3))
+    monkeypatch.setattr(mod, "resolve_session_day", _standard_session_day)
+    outcomes: list[tuple] = []
+
+    report = asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+        on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+    ))
+
+    assert report.n_new_rows == 0
+    assert len(outcomes) == 1 and outcomes[0][0] == "OK"
+
+
+def test_run_price_ingest_holiday_with_rows_stays_ok(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "ph.parquet"
+    mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-08", "2026-09-09", "2026-09-10"})
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    monkeypatch.setattr(mod, "resolve_session_day", _closed_session_day)
+    outcomes: list[tuple] = []
+
+    report = asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+        on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+    ))
+
+    assert report.n_new_rows > 0
+    assert len(outcomes) == 1 and outcomes[0][0] == "OK"

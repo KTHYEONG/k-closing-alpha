@@ -659,7 +659,7 @@ def test_run_automated_topk_decision_treats_holiday_failure_as_ok(monkeypatch) -
 
     # Then
     args, kwargs = recorder.call_args
-    assert args == ("OK",)
+    assert args == ("SKIPPED",)
     assert kwargs["reason"] == "non_trading_day"
     assert kwargs["metrics"] == {"n_picks": 0, "day": "holiday"}
 
@@ -1332,7 +1332,7 @@ def test_run_automated_topk_decision_treats_confirmed_closure_as_holiday(monkeyp
 
     recorder.assert_called_once()
     args, kwargs = recorder.call_args
-    assert args == ("OK",)
+    assert args == ("SKIPPED",)
     assert kwargs["reason"] == "non_trading_day"
     assert kwargs["metrics"] == {"n_picks": 0, "day": "holiday", "session": "CLOSED"}
 

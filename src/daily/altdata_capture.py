@@ -26,6 +26,7 @@ from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day_sync
+from src.tools.run_outcome import RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -162,6 +163,13 @@ def main(argv: Sequence[str] | None = None, *, trading_day_fn: Callable[[str], b
         logger.info("[DATA] stage=altdata_capture status=SKIP reason=weekend date=%s", trading_day.isoformat())
         return 0
     if resolve_session_day(trading_day).kind is SessionKind.CLOSED:
+        record_run_outcome(
+            "altdata_capture",
+            RUN_OUTCOME_SKIPPED,
+            run_date=trading_day.isoformat(),
+            reason="non_trading_day",
+            metrics={"session": "CLOSED"},
+        )
         logger.info("[DATA] stage=altdata_capture status=SKIP reason=non_trading_day date=%s", trading_day.isoformat())
         return 0
     oracle = trading_day_fn if trading_day_fn is not None else is_kis_trading_day_sync
@@ -171,6 +179,13 @@ def main(argv: Sequence[str] | None = None, *, trading_day_fn: Callable[[str], b
         logger.warning("[DATA] stage=altdata_capture calendar_lookup=FAIL reason=%s proceed=true", type(exc).__name__)
     else:
         if not is_trading:
+            record_run_outcome(
+                "altdata_capture",
+                RUN_OUTCOME_SKIPPED,
+                run_date=trading_day.isoformat(),
+                reason="non_trading_day",
+                metrics={"session": "CLOSED"},
+            )
             logger.info(
                 "[DATA] stage=altdata_capture status=SKIP reason=non_trading_day date=%s",
                 trading_day.isoformat(),
