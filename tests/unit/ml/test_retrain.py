@@ -1015,3 +1015,67 @@ def test_retrain_corrupt_pit_report_evaluates_as_missing_without_crashing(tmp_pa
         assert seen["mode"].value == mode
         assert any("status=REPORT_UNREADABLE" in r.getMessage() for r in caplog.records)
         caplog.clear()
+
+
+def test_retrain_train_bundle_scores_adopted_arm2_report(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    _stage_classification_all_screenable()
+    live_dir = tmp_path / "topk_ranker"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    _write_pit_report(live_dir)
+    seen: dict = {}
+
+    class _StopError(Exception):
+        pass
+
+    def _capture(bundle, current, eval_frame, *, pit_report, pit_gate, **kw):
+        seen.update(pit_report=pit_report, recon_adopted=kw["pit_recon_adopted"],
+                    recon_detail=kw["pit_recon_detail"], recon_report=kw["pit_recon_report"])
+        raise _StopError
+
+    monkeypatch.setattr(mod, "train_production_bundle", lambda ph, market_dates, d_to_idx, **kw: {"a": 1})
+    monkeypatch.setattr(mod, "build_gate_eval_frame", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "evaluate_retrain_promotion", _capture)
+
+    import pytest
+
+    from src.ml.pit_report import (
+        RECON_ARM_DIRNAME,
+        CalibrationStability,
+        PairedDelta,
+        ReconstructionCertification,
+        save_reconstruction_certification,
+    )
+
+    cert = ReconstructionCertification(
+        generated_at="2026-10-05T00:00:00+09:00",
+        exact_dir="exact",
+        recon_dir="recon",
+        paired_days=("2026-03-02",),
+        dropped_days=(),
+        coverage_improvement=PairedDelta(delta=4.0, ci_low=2.0, ci_high=6.0, p_value=0.001, n_days=60),
+        reconstruction_feature=PairedDelta(delta=0.2, ci_low=-1.0, ci_high=1.4, p_value=0.6, n_days=60),
+        stability=CalibrationStability(passed=True, median_rel_err=0.03, n_scored=40, detail=""),
+        coverage_by_year_and_basis={},
+        gate_verdict="ADOPT",
+        gate_reasons=(),
+    )
+    save_reconstruction_certification(cert, out_path=live_dir / "reconstruction_certification.json")
+    arm_dir = live_dir / RECON_ARM_DIRNAME
+    arm_dir.mkdir(exist_ok=True)
+    _write_pit_report(arm_dir, native_mean=9.0)
+
+    with pytest.raises(_StopError):
+        main(["--train-ranker-bundle", "--export-dir", str(tmp_path)])
+
+    assert seen["recon_adopted"] is True
+    assert seen["recon_report"] is not None
+    assert float(seen["recon_report"].mean_net_bp["pit_native"]) == 9.0
+    assert seen["pit_report"] is not None

@@ -31,10 +31,21 @@ from src.config.market_session import (
     DEFAULT_BAR_INTERVAL_MINUTES,
     INTRADAY_BAR_STAMP_CONVENTION,
     INTRADAY_SESSION_REGULAR,
+    INTRADAY_SESSION_REGULAR_CONSOLIDATED,
     KRX_REGULAR_HOUR_FLOOR,
 )
+from src.data.capture_contracts import CaptureStatus
 from src.data.capture_store import CaptureStore
 from src.data.eod_superset import EodSupersetScreen, eod_superset_mask
+from src.data.nxt_decomposition import (
+    BASIS_KRX_RECONSTRUCTED,
+    DECOMPOSITION_CONFIG_FILENAME,
+    DecompositionConfig,
+    load_decomposition_config,
+    predict_share,
+    reconstruct_krx_bars,
+    share_proxy_history,
+)
 from src.strategy.contract import SCREENABLE_CLASS_COL
 
 logger = logging.getLogger(__name__)
@@ -99,8 +110,28 @@ PANEL_STRING_COLUMNS: tuple[str, ...] = (
     "capture_run_id",
 )
 
+RECON_TOSS_VENDOR: str = "toss_cons"
+BASIS_EXACT: str = "exact"
+BASIS_RECONSTRUCTED: str = BASIS_KRX_RECONSTRUCTED
+
+PIT1520_RECON_COLUMNS: tuple[str, ...] = (
+    *PIT1520_PANEL_COLUMNS,
+    "basis",
+    "recon_volume_rel_err_p90",
+    "recon_close_bp_err_p90",
+)
+
+RECON_FLOAT_COLUMNS: tuple[str, ...] = (
+    "recon_volume_rel_err_p90",
+    "recon_close_bp_err_p90",
+)
+
 INDEX_BASIS_LIVE: str = "live_1520"
 INDEX_BASIS_EOD_FALLBACK: str = "eod_fallback"
+
+_TOSS_LEDGER_FILENAME: str = "toss_regular.parquet"
+# Part 1 basis-gate verdict marking a symbol-day as consolidated tape.
+_KNOWN_CONSOLIDATED_REASON: str = "toss_consolidated_tape"
 
 _BAR_REQUIRED_COLUMNS: tuple[str, ...] = (
     "symbol",
@@ -199,6 +230,8 @@ class PanelExclusionReason(enum.StrEnum):
     NOT_IN_PRICE_HISTORY = "not_in_price_history"
     PREV_CLOSE_UNAVAILABLE = "prev_close_unavailable"
     PREV_MARKET_CAP_UNAVAILABLE = "prev_market_cap_unavailable"
+    SHARE_UNAVAILABLE = "share_unavailable"
+    CONSOLIDATED_MISSING = "consolidated_missing"
 
 
 @dataclass(frozen=True)
@@ -223,6 +256,11 @@ class Pit1520PanelConfig:
             low-high range. The range, not the first bar's open, is compared because a vendor may fold a
             pre-open off-hours print (at the previous close) into the first minute of a gap day.
         live_available_by_hhmmss: A live decision input qualifies only if completed at or before T at this time.
+        reconstruct_consolidated: Reconstruct KRX-only bars for superset symbol-days with no exact bars but
+            with `regular_consolidated` bars (Part 2 estimator). Off by default; the production panel is
+            unchanged until the adoption gate passes.
+        decomposition_config_path: Fitted decomposition config location (informational; the builder takes
+            the loaded config object, the CLI resolves this path through settings).
     """
 
     cutoff_hhmmss: str = DECISION_WINDOW_START_HHMMSS
@@ -237,6 +275,8 @@ class Pit1520PanelConfig:
     minute_gap_min_symbols: int = 30
     minute_gap_min_share: float = 0.2
     live_available_by_hhmmss: str = DECISION_WINDOW_END_HHMMSS
+    reconstruct_consolidated: bool = False
+    decomposition_config_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -602,9 +642,10 @@ def panel_to_decision_input(panel_day: pd.DataFrame) -> pd.DataFrame:
     return snapshot.reset_index(drop=True)
 
 
-def _empty_panel() -> pd.DataFrame:
-    out = pd.DataFrame({c: pd.Series(dtype="object") for c in PIT1520_PANEL_COLUMNS})
-    return _cast_panel_dtypes(out)
+def _empty_panel(*, columns: Sequence[str] | None = None) -> pd.DataFrame:
+    cols = list(columns) if columns is not None else list(PIT1520_PANEL_COLUMNS)
+    out = pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+    return _cast_panel_dtypes(out, columns=cols)
 
 
 def _empty_day_exclusions() -> pd.DataFrame:
@@ -624,16 +665,22 @@ def _empty_days() -> pd.DataFrame:
     })
 
 
-def _cast_panel_dtypes(panel: pd.DataFrame) -> pd.DataFrame:
+def _cast_panel_dtypes(panel: pd.DataFrame, *, columns: Sequence[str] | None = None) -> pd.DataFrame:
     out = panel.copy()
+    cols = list(columns) if columns is not None else list(PIT1520_PANEL_COLUMNS)
     out["date"] = pd.to_datetime(out["date"], errors="coerce").astype("datetime64[ns]")
     out["symbol"] = out["symbol"].astype(str)
     for col in PANEL_FLOAT_COLUMNS:
         out[col] = _coerce_float(out[col])
     for col in PANEL_STRING_COLUMNS:
         out[col] = out[col].astype(str)
+    if "basis" in out.columns:
+        out["basis"] = out["basis"].astype(str)
+    for col in RECON_FLOAT_COLUMNS:
+        if col in out.columns:
+            out[col] = _coerce_float(out[col])
     out["n_bars"] = pd.to_numeric(out["n_bars"], errors="coerce").fillna(0).astype(np.int64)
-    return out[list(PIT1520_PANEL_COLUMNS)]
+    return out[cols]
 
 
 def _prepare_price_history_work(price_history: pd.DataFrame) -> pd.DataFrame:
@@ -775,6 +822,9 @@ def build_pit1520_panel(
     screen: EodSupersetScreen,
     config: Pit1520PanelConfig = Pit1520PanelConfig(),  # noqa: B008
     source_policy: PanelSourcePolicy = PanelSourcePolicy.PREFER_LIVE,
+    consolidated_loader: Callable[[str], pd.DataFrame] | None = None,
+    decomposition_config: DecompositionConfig | None = None,
+    consolidated_symbol_days: frozenset[tuple[str, str]] | None = None,
 ) -> Pit1520PanelResult:
     """Build the decision-time panel for the given dates.
 
@@ -788,14 +838,22 @@ def build_pit1520_panel(
         screen: EOD fetch superset used for day coverage and NOT_FETCHED attribution only.
         config: Construction parameters.
         source_policy: PREFER_LIVE (production) or BARS_ONLY (validation of the bar path on live days).
+        consolidated_loader: Returns one date's consolidated-tape 1m bars; required only when
+            config.reconstruct_consolidated is set.
+        decomposition_config: Fitted Part 2 estimator; required only when config.reconstruct_consolidated
+            is set. With the flag off the panel carries PIT1520_PANEL_COLUMNS exactly; with the flag on
+            it carries PIT1520_RECON_COLUMNS (basis provenance plus calibrated error quantiles).
+        consolidated_symbol_days: (date, symbol) pairs the Part 1 ledger verdicts as consolidated tape;
+            only those may attribute `consolidated_missing`.
 
     Returns:
-        Panel (PIT1520_PANEL_COLUMNS, sorted by date then symbol, unique (date, symbol)), exclusions
+        Panel (sorted by date then symbol, unique (date, symbol)), exclusions
         (date, symbol, reason, detail) and days (date, source, n_rows, n_excluded, n_superset,
         n_superset_present, superset_coverage, index_basis).
 
     Raises:
-        ValueError: A requested date absent from price_history, or duplicate (date, symbol) in inputs.
+        ValueError: A requested date absent from price_history, duplicate (date, symbol) in inputs, or
+            reconstruction enabled without its loader and fitted config.
     """
     work = _prepare_price_history_work(price_history)
     calendar = sorted(work["date"].dropna().unique().tolist())
@@ -804,6 +862,16 @@ def build_pit1520_panel(
     for day_label in ordered_days:
         if day_label not in available:
             raise ValueError(f"build_pit1520_panel date absent from price_history: {day_label!r}")
+    recon_on = bool(config.reconstruct_consolidated)
+    decomp = decomposition_config
+    cons_loader = consolidated_loader
+    if recon_on and decomp is None:
+        raise ValueError("build_pit1520_panel reconstruct_consolidated requires decomposition_config")
+    if recon_on and cons_loader is None:
+        raise ValueError("build_pit1520_panel reconstruct_consolidated requires consolidated_loader")
+    known_consolidated = consolidated_symbol_days if consolidated_symbol_days is not None else frozenset()
+    cons_cache: dict[str, pd.DataFrame] = {}
+    out_columns = list(PIT1520_RECON_COLUMNS) if recon_on else list(PIT1520_PANEL_COLUMNS)
 
     panel_frames: list[pd.DataFrame] = []
     exclusion_frames: list[pd.DataFrame] = []
@@ -826,18 +894,61 @@ def build_pit1520_panel(
                 day_panel["inst_netbuy_prev"] = day_panel["symbol"].map(inst_map).astype(np.float64)
                 day_panel["foreign_netbuy_prev"] = day_panel["symbol"].map(foreign_map).astype(np.float64)
             day_panel = _cast_panel_dtypes(day_panel)
+            if recon_on:
+                assert decomp is not None
+                day_panel = _cast_panel_dtypes(
+                    _stamp_recon_basis(day_panel, recon_symbols=set(), decomposition_config=decomp),
+                    columns=out_columns,
+                )
             day_exclusions = _empty_day_exclusions()
             source = PanelSource.LIVE_DECISION.value
             index_basis = INDEX_BASIS_LIVE
         else:
             bars = bars_loader(day_label)
             aggregates, bar_exclusions = aggregate_decision_bars(bars, config=config)
+            recon_symbols: set[str] = set()
+            if recon_on:
+                assert decomp is not None
+                assert cons_loader is not None
+                exact_symbols = set(bars["symbol"].astype(str).tolist()) if len(bars) else set()
+                recon_aggregates, recon_bar_exclusions, recon_symbols, recon_extra = _reconstruct_consolidated_day(
+                    day_label,
+                    day,
+                    superset=superset,
+                    exact_symbols=exact_symbols,
+                    work=work,
+                    cons_cache=cons_cache,
+                    consolidated_loader=cons_loader,
+                    decomposition_config=decomp,
+                    config=config,
+                    known_consolidated=known_consolidated,
+                )
+                if len(recon_aggregates):
+                    aggregates = (
+                        pd.concat([aggregates, recon_aggregates], ignore_index=True)
+                        if len(aggregates)
+                        else recon_aggregates
+                    )
+                if len(recon_bar_exclusions):
+                    bar_exclusions = (
+                        pd.concat([bar_exclusions, recon_bar_exclusions], ignore_index=True)
+                        if len(bar_exclusions)
+                        else recon_bar_exclusions
+                    )
             bar_rows, join_excluded = _build_bar_day_rows(day_label, day, aggregates, day_ph, prev_ph, config=config)
+            if recon_on:
+                join_excluded = [*join_excluded, *recon_extra]
             day_panel = (
                 _cast_panel_dtypes(pd.DataFrame(bar_rows, columns=list(PIT1520_PANEL_COLUMNS)))
                 if bar_rows
                 else _empty_panel()
             )
+            if recon_on:
+                assert decomp is not None
+                day_panel = _cast_panel_dtypes(
+                    _stamp_recon_basis(day_panel, recon_symbols=recon_symbols, decomposition_config=decomp),
+                    columns=out_columns,
+                )
             excluded_symbols = {str(s) for s in bar_exclusions["symbol"].tolist()} if len(bar_exclusions) else set()
             excluded_symbols |= {str(e["symbol"]) for e in join_excluded}
             panel_symbols = set(day_panel["symbol"].astype(str).tolist()) if len(day_panel) else set()
@@ -894,11 +1005,11 @@ def build_pit1520_panel(
             total,
         )
     panel = (
-        _cast_panel_dtypes(pd.concat(panel_frames, ignore_index=True)).sort_values(
+        _cast_panel_dtypes(pd.concat(panel_frames, ignore_index=True), columns=out_columns).sort_values(
             ["date", "symbol"], kind="stable"
         ).reset_index(drop=True)
         if panel_frames
-        else _empty_panel()
+        else _empty_panel(columns=out_columns)
     )
     assert not bool(panel.duplicated(["date", "symbol"]).any()), "duplicate (date, symbol) rows"
     exclusions = (
@@ -967,6 +1078,262 @@ def load_regular_bars(snapshot_date: str, *, config: Pit1520PanelConfig = Pit152
     ts = pd.to_numeric(frame["ts_hms"], errors="coerce")
     keep = ((ts >= floor) & (ts <= ceil)).to_numpy()
     return frame.loc[keep].reset_index(drop=True)
+
+
+def default_decomposition_config_path() -> Path:
+    """Fitted decomposition config location under settings.HISTORY_DIR."""
+    from src import settings
+
+    return Path(settings.HISTORY_DIR) / DECOMPOSITION_CONFIG_FILENAME
+
+
+def default_toss_ledger_path() -> Path:
+    """Toss backfill ledger location holding the Part 1 consolidated-tape verdicts."""
+    from src import settings
+
+    return Path(settings.HISTORY_DIR) / "intraday" / "backfill_ledger" / _TOSS_LEDGER_FILENAME
+
+
+def load_consolidated_bars(snapshot_date: str, *, config: Pit1520PanelConfig = Pit1520PanelConfig()) -> pd.DataFrame:  # noqa: B008
+    """Read one date's consolidated-tape 1m partition, column-pruned like the regular loader.
+
+    Returns:
+        Canonical bar rows with floor <= ts_hms <= cutoff + one minute; an empty canonical frame
+        when the partition does not exist.
+
+    Raises:
+        OSError: The partition exists but is unreadable (fail loud; never treated as empty).
+    """
+    from src.data.intraday_store import intraday_partition_path
+
+    target = intraday_partition_path(
+        int(DEFAULT_BAR_INTERVAL_MINUTES), str(snapshot_date), str(INTRADAY_SESSION_REGULAR_CONSOLIDATED)
+    )
+    empty = pd.DataFrame({c: pd.Series(dtype="object") for c in _BAR_REQUIRED_COLUMNS})
+    if not target.exists():
+        return empty
+    floor = int(config.floor_hhmmss)
+    ceil = _shift_minutes(int(config.cutoff_hhmmss), 1)
+    try:
+        try:
+            frame = pd.read_parquet(
+                target,
+                columns=list(_BAR_REQUIRED_COLUMNS),
+                filters=[("ts_hms", ">=", floor), ("ts_hms", "<=", ceil)],
+            )
+        except Exception:
+            frame = pd.read_parquet(target, columns=list(_BAR_REQUIRED_COLUMNS))
+    except Exception as exc:
+        raise OSError(f"Cannot read intraday partition evidence: {target}") from exc
+    if frame is None or len(frame) == 0:
+        return empty
+    ts = pd.to_numeric(frame["ts_hms"], errors="coerce")
+    keep = ((ts >= floor) & (ts <= ceil)).to_numpy()
+    return frame.loc[keep].reset_index(drop=True)
+
+
+def known_consolidated_symbol_days(ledger_path: Path | str | None = None) -> frozenset[tuple[str, str]]:
+    """Symbol-days the Toss ledger verdicts as consolidated tape (the Part 1 basis gate).
+
+    Tolerant reader for panel wiring: a missing or unreadable ledger means no symbol-day is claimed
+    consolidated, so `consolidated_missing` never fires and attribution stays `not_fetched`.
+    """
+    path = Path(ledger_path) if ledger_path is not None else default_toss_ledger_path()
+    if not path.exists():
+        return frozenset()
+    try:
+        frame = pd.read_parquet(path, columns=["snapshot_date", "session", "symbol", "status", "reason"])
+    except Exception as exc:
+        logger.warning(
+            "[DATA] stage=pit1520_panel status=CONSOLIDATED_KNOWN_UNREADABLE path=%s error=%s",
+            path,
+            type(exc).__name__,
+        )
+        return frozenset()
+    hits = frame[
+        (frame["session"].astype(str) == INTRADAY_SESSION_REGULAR)
+        & (frame["status"].astype(str) == CaptureStatus.NOT_APPLICABLE.value)
+        & (frame["reason"].astype(str) == _KNOWN_CONSOLIDATED_REASON)
+    ]
+    if hits.empty:
+        return frozenset()
+    latest = hits.drop_duplicates(subset=["snapshot_date", "symbol"], keep="last")
+    days = pd.to_datetime(latest["snapshot_date"], errors="coerce", format="mixed")
+    ok = ~days.isna()
+    return frozenset(
+        (pd.Timestamp(d).strftime("%Y-%m-%d"), str(s).zfill(6))
+        for d, s, keep in zip(days.tolist(), latest["symbol"].tolist(), ok.tolist(), strict=True)
+        if bool(keep)
+    )
+
+
+def _stamp_recon_basis(
+    day_panel: pd.DataFrame, *, recon_symbols: set[str], decomposition_config: DecompositionConfig
+) -> pd.DataFrame:
+    """Stamp every row's provenance: reconstructed rows carry the calibrated error quantiles."""
+    out = day_panel.copy()
+    is_recon = out["symbol"].astype(str).isin(recon_symbols).to_numpy(dtype=bool) if len(out) else np.zeros(0, dtype=bool)
+    out["basis"] = np.where(is_recon, BASIS_RECONSTRUCTED, BASIS_EXACT)
+    out["recon_volume_rel_err_p90"] = np.where(is_recon, float(decomposition_config.volume_rel_err_p90), np.nan)
+    out["recon_close_bp_err_p90"] = np.where(is_recon, float(decomposition_config.close_bp_err_p90), np.nan)
+    return out
+
+
+def _predict_consolidated_share(
+    *,
+    day_label: str,
+    day: pd.Timestamp,
+    symbol: str,
+    work: pd.DataFrame,
+    cons_cache: dict[str, pd.DataFrame],
+    consolidated_loader: Callable[[str], pd.DataFrame],
+    decomposition_config: DecompositionConfig,
+) -> float | None:
+    """Predict the KRX share for one consolidated symbol-day from strictly earlier history.
+
+    History bars come from earlier consolidated partitions and EOD volumes from price_history; the
+    decision day's EOD volume is never consulted, so randomizing it cannot move the prediction.
+    """
+    gap = int(decomposition_config.max_gap_days)
+    start = day - pd.Timedelta(days=gap)
+    earlier = work[
+        (work["date"] < day) & (work["date"] >= start) & (work["symbol"] == symbol)
+    ].sort_values("date", kind="stable")
+    if earlier.empty:
+        return None
+    eod_volumes = pd.to_numeric(earlier["volume"], errors="coerce").tolist()
+    cons_map: dict[str, pd.DataFrame] = {}
+    eod_map: dict[str, float] = {}
+    for row_day, eod in zip(
+        pd.to_datetime(earlier["date"], errors="coerce").dt.strftime("%Y-%m-%d").tolist(),
+        eod_volumes,
+        strict=True,
+    ):
+        if row_day in cons_map or not np.isfinite(float(eod)) or float(eod) <= 0.0:
+            continue
+        frame = cons_cache.get(row_day)
+        if frame is None:
+            frame = consolidated_loader(row_day)
+            cons_cache[row_day] = frame
+        if frame.empty:
+            continue
+        sym_rows = frame[frame["symbol"].astype(str) == symbol]
+        if sym_rows.empty:
+            continue
+        cons_map[row_day] = sym_rows
+        eod_map[row_day] = float(eod)
+    if not cons_map:
+        return None
+    history = share_proxy_history(cons_map, eod_map, config=decomposition_config)
+    return predict_share(history, day_label, config=decomposition_config)
+
+
+def _reconstruct_consolidated_day(
+    day_label: str,
+    day: pd.Timestamp,
+    *,
+    superset: set[str],
+    exact_symbols: set[str],
+    work: pd.DataFrame,
+    cons_cache: dict[str, pd.DataFrame],
+    consolidated_loader: Callable[[str], pd.DataFrame],
+    decomposition_config: DecompositionConfig,
+    config: Pit1520PanelConfig,
+    known_consolidated: frozenset[tuple[str, str]],
+) -> tuple[pd.DataFrame, pd.DataFrame, set[str], list[dict[str, object]]]:
+    """Reconstruct KRX-only bars for superset symbol-days that carry no exact bars.
+
+    Symbol-days with any exact bar row stay on the exact path (exact wins); only symbols wholly
+    absent from the regular bars are candidates. Returns (aggregates, exclusions, reconstructed
+    symbols, symbol-day exclusions for history failures).
+    """
+    cutoff = float(int(config.cutoff_hhmmss))
+    window_start = day - pd.Timedelta(days=int(decomposition_config.max_gap_days))
+    # One window/symbol slice per decision day instead of one full-history scan per symbol.
+    work = work[(work["date"] < day) & (work["date"] >= window_start) & work["symbol"].isin(superset - exact_symbols)]
+    cons_day = cons_cache.get(day_label)
+    if cons_day is None:
+        cons_day = consolidated_loader(day_label)
+        cons_cache[day_label] = cons_day
+    recon_frames: list[pd.DataFrame] = []
+    extra_excluded: list[dict[str, object]] = []
+    for symbol in sorted(superset - exact_symbols):
+        rows = cons_day[cons_day["symbol"].astype(str) == symbol] if len(cons_day) else cons_day
+        if rows.empty:
+            if (day_label, symbol) in known_consolidated:
+                extra_excluded.append({
+                    "date": day,
+                    "symbol": symbol,
+                    "reason": PanelExclusionReason.CONSOLIDATED_MISSING.value,
+                    "detail": "known consolidated symbol-day without consolidated bars",
+                })
+            continue
+        stamps = pd.to_numeric(rows["ts_hms"], errors="coerce")
+        observable = rows[stamps <= cutoff]
+        if observable.empty:
+            if (day_label, symbol) in known_consolidated:
+                extra_excluded.append({
+                    "date": day,
+                    "symbol": symbol,
+                    "reason": PanelExclusionReason.CONSOLIDATED_MISSING.value,
+                    "detail": "known consolidated symbol-day without observable consolidated bars",
+                })
+            continue
+        stored_vendors = {str(v) for v in observable["vendor"].astype(str).tolist()}
+        if stored_vendors != {"toss"}:
+            extra_excluded.append({
+                "date": day,
+                "symbol": symbol,
+                "reason": PanelExclusionReason.MIXED_VENDOR.value,
+                "detail": f"consolidated bars carry vendors={sorted(stored_vendors)}",
+            })
+            continue
+        if stored_vendors & set(config.excluded_bar_vendors) or RECON_TOSS_VENDOR in config.excluded_bar_vendors:
+            extra_excluded.append({
+                "date": day,
+                "symbol": symbol,
+                "reason": PanelExclusionReason.VENDOR_EXCLUDED.value,
+                "detail": "consolidated toss bars excluded by vendor",
+            })
+            continue
+        share = _predict_consolidated_share(
+            day_label=day_label,
+            day=day,
+            symbol=symbol,
+            work=work,
+            cons_cache=cons_cache,
+            consolidated_loader=consolidated_loader,
+            decomposition_config=decomposition_config,
+        )
+        if share is None:
+            extra_excluded.append({
+                "date": day,
+                "symbol": symbol,
+                "reason": PanelExclusionReason.SHARE_UNAVAILABLE.value,
+                "detail": f"insufficient share history before {day_label}",
+            })
+            continue
+        frame = observable.copy()
+        frame["vendor"] = RECON_TOSS_VENDOR
+        try:
+            recon_frames.append(reconstruct_krx_bars(frame, share=share, config=decomposition_config))
+        except ValueError as exc:
+            extra_excluded.append({
+                "date": day,
+                "symbol": symbol,
+                "reason": PanelExclusionReason.INVALID_PRICE.value,
+                "detail": f"reconstruction rejected consolidated bars: {exc}",
+            })
+    if not recon_frames:
+        return _empty_aggregates(), _empty_exclusions(), set(), extra_excluded
+    merged = pd.concat(recon_frames, ignore_index=True)
+    recon_config = dataclasses.replace(
+        config,
+        stamp_conventions={**dict(config.stamp_conventions), RECON_TOSS_VENDOR: BAR_STAMP_END},
+    )
+    recon_aggregates, recon_exclusions = aggregate_decision_bars(merged, config=recon_config)
+    recon_symbols = set(recon_aggregates["symbol"].astype(str).tolist()) if len(recon_aggregates) else set()
+    return recon_aggregates, recon_exclusions, recon_symbols, extra_excluded
 
 
 def load_live_decision_input(
@@ -1049,6 +1416,8 @@ def main(argv: list[str] | None = None) -> None:
         --end YYYY-MM-DD (default: latest price_history date)
         --source-policy {prefer_live,bars_only} (default prefer_live)
         --exclude-bar-vendor VENDOR (repeatable; drops that vendor's bar symbol-days as vendor_excluded)
+        --reconstruct-consolidated (rebuild KRX-only bars for consolidated symbol-days via Part 2)
+        --decomposition-config PATH (fitted config; default settings.HISTORY_DIR/nxt_decomposition_config.json)
         --out-dir PATH (default settings.HISTORY_DIR)
     """
     from src import settings
@@ -1061,9 +1430,26 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--end", default=None)
     parser.add_argument("--source-policy", choices=("prefer_live", "bars_only"), default="prefer_live")
     parser.add_argument("--exclude-bar-vendor", action="append", default=[], dest="exclude_bar_vendor")
+    parser.add_argument("--reconstruct-consolidated", action="store_true")
+    parser.add_argument("--decomposition-config", default=None)
     parser.add_argument("--out-dir", default=None)
     args = parser.parse_args(argv)
-    config = Pit1520PanelConfig(excluded_bar_vendors=frozenset(args.exclude_bar_vendor))
+    config = Pit1520PanelConfig(
+        excluded_bar_vendors=frozenset(args.exclude_bar_vendor),
+        reconstruct_consolidated=bool(args.reconstruct_consolidated),
+    )
+    decomp: DecompositionConfig | None = None
+    cons_loader: Callable[[str], pd.DataFrame] | None = None
+    known: frozenset[tuple[str, str]] | None = None
+    if args.reconstruct_consolidated:
+        cfg_path = Path(args.decomposition_config) if args.decomposition_config else default_decomposition_config_path()
+        decomp = load_decomposition_config(cfg_path)
+
+        def _load_cons(day: str) -> pd.DataFrame:
+            return load_consolidated_bars(day, config=config)
+
+        cons_loader = _load_cons
+        known = known_consolidated_symbol_days()
     price_history, _prov = load_price_panel(settings.PRICE_HISTORY_PARQUET_PATH)
     calendar = sorted(pd.to_datetime(price_history["date"]).dt.normalize().unique().tolist())
     if not calendar:
@@ -1094,6 +1480,9 @@ def main(argv: list[str] | None = None) -> None:
         screen=screen,
         config=config,
         source_policy=policy,
+        consolidated_loader=cons_loader,
+        decomposition_config=decomp,
+        consolidated_symbol_days=known,
     )
     out_dir = Path(args.out_dir) if args.out_dir else Path(settings.HISTORY_DIR)
     paths = (
@@ -1108,6 +1497,8 @@ def main(argv: list[str] | None = None) -> None:
     med_cov = float(np.median(finite)) if len(finite) else float("nan")
     live_days = int((result.days["source"] == PanelSource.LIVE_DECISION.value).sum()) if len(result.days) else 0
     bar_days = int((result.days["source"] == PanelSource.BARS.value).sum()) if len(result.days) else 0
+    n_recon = int((result.panel["basis"] == BASIS_RECONSTRUCTED).sum()) if "basis" in result.panel.columns and len(result.panel) else 0
+    n_share_missing = int((result.exclusions["reason"] == PanelExclusionReason.SHARE_UNAVAILABLE.value).sum()) if len(result.exclusions) else 0
     logger.info(
         "[DATA] stage=pit1520_panel status=DONE dates=%d rows=%d excluded=%d live_days=%d bar_days=%d min_coverage=%.4f median_coverage=%.4f",
         len(wanted),
@@ -1118,6 +1509,12 @@ def main(argv: list[str] | None = None) -> None:
         min_cov,
         med_cov,
     )
+    if args.reconstruct_consolidated:
+        logger.info(
+            "[DATA] stage=pit1520_panel status=RECONSTRUCTED recon_rows=%d share_unavailable=%d",
+            n_recon,
+            n_share_missing,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -19,6 +19,10 @@ PIT_HAIRCUT_DAILY_FILENAME: str = "pit_haircut_daily.parquet"
 PIT_REPORT_SCHEMA_VERSION: int = 1
 PIT_CERTIFICATION_BUNDLE_KEY: str = "pit_certification"
 
+RECONSTRUCTION_CERTIFICATION_FILENAME: str = "reconstruction_certification.json"
+RECON_ARM_DIRNAME: str = "topk_ranker_recon"
+RECON_CERTIFICATION_SCHEMA_VERSION: int = 1
+
 
 class PitReportStatus(enum.StrEnum):
     """Whether a report carries usable paired evidence."""
@@ -383,3 +387,178 @@ def bundle_pit_certification(bundle: Mapping[str, Any]) -> Mapping[str, Any] | N
             f"bundle {PIT_CERTIFICATION_BUNDLE_KEY!r} must be a mapping, got {type(value).__name__}"
         )
     return value
+
+
+@dataclass(frozen=True)
+class CalibrationStability:
+    """Outcome of fitting the decomposition on the first half of the KIS window and scoring the second."""
+
+    passed: bool
+    median_rel_err: float
+    n_scored: int
+    detail: str
+
+
+@dataclass(frozen=True)
+class ReconstructionCertification:
+    """Three-arm adoption evidence for the consolidated-tape reconstruction.
+
+    Attributes:
+        schema_version: RECON_CERTIFICATION_SCHEMA_VERSION at write time.
+        generated_at: Aware ISO-8601 KST timestamp of the run.
+        exact_dir, recon_dir: Certified panel report directories of arm 1 (exact) and arm 2 (exact +
+            reconstructed).
+        paired_days: Date intersection scored by every arm (YYYY-MM-DD).
+        dropped_days: Dates present in only one arm, excluded from paired statistics.
+        coverage_improvement: Arm-1 minus arm-2 coverage loss in bp (positive shrinks the haircut).
+        reconstruction_feature: Arm-3 in-the-loop rule return, reconstructed minus exact, in bp.
+        stability: First-half fit / second-half score outcome on the calibration window.
+        coverage_by_year_and_basis: Arm -> year -> index basis -> mean superset coverage (report-only).
+        gate_verdict: "ADOPT" or "REJECT", evaluated by the report from these fields.
+        gate_reasons: Failing criteria (empty on ADOPT).
+    """
+
+    schema_version: int = RECON_CERTIFICATION_SCHEMA_VERSION
+    generated_at: str = ""
+    exact_dir: str = ""
+    recon_dir: str = ""
+    paired_days: tuple[str, ...] = ()
+    dropped_days: tuple[str, ...] = ()
+    coverage_improvement: PairedDelta | None = None
+    reconstruction_feature: PairedDelta | None = None
+    stability: CalibrationStability | None = None
+    coverage_by_year_and_basis: dict[str, Any] = None  # type: ignore[assignment]
+    gate_verdict: str = "REJECT"
+    gate_reasons: tuple[str, ...] = ()
+
+
+_CERT_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(ReconstructionCertification))
+
+
+def _dump_stability(stability: CalibrationStability) -> dict[str, Any]:
+    return {
+        "passed": bool(stability.passed),
+        "median_rel_err": _dump_float(stability.median_rel_err),
+        "n_scored": int(stability.n_scored),
+        "detail": str(stability.detail),
+    }
+
+
+def _load_stability(payload: Any) -> CalibrationStability | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise ValueError("reconstruction certification field 'stability' must be a mapping or null")
+    unknown = set(payload) - {"passed", "median_rel_err", "n_scored", "detail"}
+    if unknown:
+        raise ValueError(f"reconstruction certification field 'stability' carries unknown keys: {sorted(unknown)}")
+    passed = payload.get("passed", False)
+    if not isinstance(passed, bool):
+        raise ValueError("reconstruction certification field 'stability.passed' must be a boolean")
+    return CalibrationStability(
+        passed=passed,
+        median_rel_err=_load_float(payload.get("median_rel_err"), field_name="stability.median_rel_err"),
+        n_scored=int(payload.get("n_scored", 0)),
+        detail=str(payload.get("detail", "")),
+    )
+
+
+def _cert_to_payload(cert: ReconstructionCertification) -> dict[str, Any]:
+    improvement = cert.coverage_improvement
+    feature = cert.reconstruction_feature
+    stability = cert.stability
+    coverage = cert.coverage_by_year_and_basis
+    if improvement is None or feature is None or stability is None:
+        raise ValueError("reconstruction certification has unpopulated required fields; refusing to persist a partial artifact")
+    if coverage is None:
+        raise ValueError("reconstruction certification has unpopulated required fields; refusing to persist a partial artifact")
+    return {
+        "schema_version": int(cert.schema_version),
+        "generated_at": str(cert.generated_at),
+        "exact_dir": str(cert.exact_dir),
+        "recon_dir": str(cert.recon_dir),
+        "paired_days": [str(d) for d in cert.paired_days],
+        "dropped_days": [str(d) for d in cert.dropped_days],
+        "coverage_improvement": _dump_delta(improvement),
+        "reconstruction_feature": _dump_delta(feature),
+        "stability": _dump_stability(stability),
+        "coverage_by_year_and_basis": json.loads(json.dumps(dict(coverage))),
+        "gate_verdict": str(cert.gate_verdict),
+        "gate_reasons": [str(r) for r in cert.gate_reasons],
+    }
+
+
+def _load_str_tuple(payload_value: Any, *, field_name: str) -> tuple[str, ...]:
+    if not isinstance(payload_value, Sequence) or isinstance(payload_value, str):
+        raise ValueError(f"reconstruction certification field {field_name!r} must be a sequence")
+    return tuple(str(d) for d in payload_value)
+
+
+def _cert_from_payload(payload: Mapping[str, Any]) -> ReconstructionCertification:
+    unknown = set(payload) - set(_CERT_FIELDS)
+    if unknown:
+        raise ValueError(f"reconstruction certification carries unknown keys: {sorted(unknown)}")
+    version = payload.get("schema_version")
+    if version != RECON_CERTIFICATION_SCHEMA_VERSION:
+        raise ValueError(
+            f"reconstruction certification schema_version {version!r} != supported {RECON_CERTIFICATION_SCHEMA_VERSION}"
+        )
+    missing = [name for name in _CERT_FIELDS if name not in payload]
+    if missing:
+        raise ValueError(f"reconstruction certification is missing keys: {missing}")
+    paired = _load_str_tuple(payload.get("paired_days"), field_name="paired_days")
+    dropped = _load_str_tuple(payload.get("dropped_days"), field_name="dropped_days")
+    reasons = _load_str_tuple(payload.get("gate_reasons"), field_name="gate_reasons")
+    coverage = payload.get("coverage_by_year_and_basis")
+    if not isinstance(coverage, Mapping):
+        raise ValueError("reconstruction certification field 'coverage_by_year_and_basis' must be a mapping")
+    verdict = str(payload.get("gate_verdict", ""))
+    if verdict not in ("ADOPT", "REJECT"):
+        raise ValueError(f"reconstruction certification gate_verdict {verdict!r} is unknown")
+    return ReconstructionCertification(
+        schema_version=int(version),
+        generated_at=str(payload.get("generated_at", "")),
+        exact_dir=str(payload.get("exact_dir", "")),
+        recon_dir=str(payload.get("recon_dir", "")),
+        paired_days=paired,
+        dropped_days=dropped,
+        coverage_improvement=_load_delta(payload.get("coverage_improvement"), field_name="coverage_improvement"),
+        reconstruction_feature=_load_delta(payload.get("reconstruction_feature"), field_name="reconstruction_feature"),
+        stability=_load_stability(payload.get("stability")),
+        coverage_by_year_and_basis=dict(coverage),
+        gate_verdict=verdict,
+        gate_reasons=reasons,
+    )
+
+
+def save_reconstruction_certification(cert: ReconstructionCertification, *, out_path: Path) -> Path:
+    """Atomically write the three-arm adoption artifact as JSON.
+
+    Raises:
+        OSError: Persistence fails (nothing partial is visible).
+    """
+    payload = _cert_to_payload(cert)
+    atomic_write_text(Path(out_path), json.dumps(payload, indent=2, sort_keys=True), mode=None)
+    return Path(out_path)
+
+
+def load_reconstruction_certification(path: Path) -> ReconstructionCertification:
+    """Load the adoption artifact written by `save_reconstruction_certification`.
+
+    Raises:
+        FileNotFoundError: No artifact exists at the path.
+        ValueError: The file exists but is malformed or has an unknown schema_version (fail closed).
+    """
+    target = Path(path)
+    if not target.exists():
+        raise FileNotFoundError(f"reconstruction certification not found: {target}")
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"reconstruction certification at {target} is malformed: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"reconstruction certification at {target} must hold a JSON object")
+    try:
+        return _cert_from_payload(payload)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ValueError(f"reconstruction certification at {target} is malformed: {exc}") from exc

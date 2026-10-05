@@ -23,6 +23,7 @@ from src.ml.retrain_gate import (
     build_gate_eval_frame,
     evaluate_retrain_promotion,
     load_current_bundle,
+    load_recon_pit_selection,
 )
 from src.ml.retrain_registry import (
     RETRAIN_OUTCOME_PROMOTED,
@@ -122,9 +123,12 @@ def main(argv: list[str] | None = None) -> None:
                 except ValueError as exc:
                     # Unreadable report evaluates as MISSING: blocks under ENFORCE, advisory-only otherwise.
                     logger.warning("[EVAL] stage=pit_gate status=REPORT_UNREADABLE reason=%s", type(exc).__name__)
+            pit_recon_report, pit_recon_adopted, pit_recon_detail = load_recon_pit_selection(Path(live_dir))
             verdict = evaluate_retrain_promotion(
                 bundle, load_current_bundle(live_dir), build_gate_eval_frame(ph, market_dates, d_to_idx),
                 pit_report=pit_report, pit_gate=PitGateConfig(mode=pit_mode),
+                pit_recon_report=pit_recon_report, pit_recon_adopted=pit_recon_adopted,
+                pit_recon_detail=pit_recon_detail,
             )
             bundle[PIT_CERTIFICATION_BUNDLE_KEY] = pit_certification_metadata(
                 pit_report, gate_mode=args.pit_gate_mode, gate_status=verdict.pit_status,
