@@ -78,7 +78,7 @@ from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import dispatch_digest, drain_alert_outbox
 from src.tools.expiry_notices import CALENDAR_EXPIRY_NAME, CALENDAR_RENEW_HINT, evaluate_expiries
-from src.tools.offsite_backup import REPORT_RELPATH, backup_staleness_issues
+from src.tools.offsite_backup import BACKUP_INFO_ISSUES, REPORT_RELPATH, backup_staleness_issues
 from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes
 from src.utils.cli_logging import configure_cli_logging
 
@@ -1007,6 +1007,7 @@ class AuditDigest:
     subject: str
     body: str
     severity: DigestSeverity
+    provisional_reasons: tuple[str, ...] = ()
 
 
 DIGEST_ISSUE_DISPLAY_LIMIT: int = 10
@@ -1087,6 +1088,9 @@ def build_digest(
     lines.append(f"undelivered_alerts={undelivered_alerts}")
     lines.append(f"expiry_notices={','.join(expiry_notices) if expiry_notices else 'none'}")
     lines.append(f"expiry_warnings={','.join(expiry_warnings) if expiry_warnings else 'none'}")
+    backup_infos = tuple(issue for issue in backup_issues if issue in BACKUP_INFO_ISSUES)
+    backup_warnings = tuple(issue for issue in backup_issues if issue not in BACKUP_INFO_ISSUES)
+    running_line = "• 백업 진행 중: 완료 후 자동 재확인됩니다"
 
     if day_kind == DAY_HOLIDAY:
         holiday_problems: list[str] = []
@@ -1094,8 +1098,8 @@ def build_digest(
             holiday_problems.append("calendar_disagreement")
         if failed_units:
             holiday_problems.append(f"실패유닛 {','.join(failed_units)}")
-        if backup_issues:
-            holiday_problems.append(f"백업이상 {','.join(backup_issues)}")
+        if backup_warnings:
+            holiday_problems.append(f"백업이상 {','.join(backup_warnings)}")
         if undelivered_alerts:
             holiday_problems.append(f"미전송알림 {undelivered_alerts}건")
         if expiry_warnings:
@@ -1112,8 +1116,10 @@ def build_digest(
                 )
             if failed_units:
                 summary_lines.append(f"• 실패 유닛: {', '.join(failed_units)}")
-            if backup_issues:
-                summary_lines.append(f"• 백업 이상: {', '.join(backup_issues)}")
+            if backup_warnings:
+                summary_lines.append(f"• 백업 이상: {', '.join(backup_warnings)}")
+            if backup_infos:
+                summary_lines.append(running_line)
             if undelivered_alerts:
                 summary_lines.append(f"• 미전송 알림: {undelivered_alerts}건 (outbox 적체)")
             if expiry_warnings:
@@ -1125,6 +1131,7 @@ def build_digest(
                 subject=f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(holiday_problems)}",
                 body=body,
                 severity=DigestSeverity.WARNING,
+                provisional_reasons=backup_infos,
             )
         label = "휴장일 SKIP"
         header = (
@@ -1133,10 +1140,13 @@ def build_digest(
             "==================================================\n"
             "• 상태: ⏸️ 거래소 휴장일 (배치 스킵)\n\n"
         )
+        if backup_infos:
+            header = header.rstrip("\n") + "\n" + running_line + "\n\n"
         return AuditDigest(
             subject=f"[kca] ⏸️ {snapshot_date} {label}",
             body=header + "[상세 내역]\n" + "\n".join(lines),
             severity=DigestSeverity.HOLIDAY_SKIP,
+            provisional_reasons=backup_infos,
         )
 
     ignored_reasons = (":incomplete_entries", ":disabled", ":raw_disabled")
@@ -1148,7 +1158,7 @@ def build_digest(
         or failed_units
         or stale_kis_tokens
         or critical_collection
-        or backup_issues
+        or backup_warnings
         or undelivered_alerts
         or expiry_warnings
         or intraday_issues
@@ -1167,12 +1177,14 @@ def build_digest(
             f"• 진입: 🎯 {entry_str}",
             f"• 데이터: 📦 1분봉 {bars_str} / 체결 틱 {ticks_str} 적재 완료",
         ]
+        if backup_infos:
+            summary_block.append(running_line)
         if expiry_notices:
             summary_block.append(f"🔑 갱신 필요: {', '.join(expiry_notices)}")
             subject += f" · 🔑갱신필요 {len(expiry_notices)}건"
         summary_block.extend(_expiry_hint_lines(expiry_notices))
         body = "\n".join(summary_block) + "\n\n[상세 내역]\n" + "\n".join(lines)
-        return AuditDigest(subject=subject, body=body, severity=DigestSeverity.OK)
+        return AuditDigest(subject=subject, body=body, severity=DigestSeverity.OK, provisional_reasons=backup_infos)
 
     problems = []
     summary_lines = [
@@ -1194,9 +1206,11 @@ def build_digest(
         summary_lines.append(f"• 수집 이상: {', '.join(critical_collection)}")
     if intraday_issues:
         summary_lines.append(f"• 장중 이상: {_format_bounded_issues(intraday_issues)}")
-    if backup_issues:
-        problems.append(f"백업이상 {','.join(backup_issues)}")
-        summary_lines.append(f"• 백업 이상: {', '.join(backup_issues)}")
+    if backup_warnings:
+        problems.append(f"백업이상 {','.join(backup_warnings)}")
+        summary_lines.append(f"• 백업 이상: {', '.join(backup_warnings)}")
+    if backup_infos:
+        summary_lines.append(running_line)
     if expiry_warnings:
         problems.append(f"만료임박 {','.join(expiry_warnings)}")
         summary_lines.append(f"• 만료 임박: {', '.join(expiry_warnings)}")
@@ -1212,6 +1226,7 @@ def build_digest(
         subject=f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(problems)}",
         body=body,
         severity=DigestSeverity.WARNING,
+        provisional_reasons=backup_infos,
     )
 
 

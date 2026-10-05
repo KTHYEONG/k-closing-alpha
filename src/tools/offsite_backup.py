@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import socket
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -37,8 +40,11 @@ LOOSE_RCLONE_FLAGS: tuple[str, ...] = ("--transfers", "4", "--checkers", "8")
 BACKUP_SLOT_KST: time = time(22, 15)
 BACKUP_SLOT_WEEKDAYS: frozenset[int] = frozenset({0, 1, 2, 3, 4})
 REPORT_RELPATH: str = "offsite/last_run.json"
+BACKUP_PROGRESS_RELPATH: str = "offsite/in_progress.json"
 BACKUP_SEAL_BUDGET: timedelta = timedelta(minutes=90)
 BACKUP_TOTAL_BUDGET: timedelta = timedelta(minutes=150)
+BACKUP_PROGRESS_GRACE: timedelta = timedelta(minutes=30)
+BACKUP_INFO_ISSUES: frozenset[str] = frozenset({"offsite_backup:running"})
 RCLONE_DURATION_EXCEEDED_EXIT: int = 10
 # 개별 복사의 하드 서브프로세스 타임아웃 — 유닛 백스톱(TimeoutStartSec=3h)보다 길어 먼저 끊기지 않는다
 LOOSE_RCLONE_TIMEOUT_SEC: int = 4 * 3600
@@ -51,6 +57,61 @@ class BackupRunReport:
     status: str
     steps: dict[str, dict[str, Any]]
     core_panels: list[dict[str, Any]] | None = None
+
+
+@dataclass(frozen=True)
+class BackupProgress:
+    started_at: str
+    deadline_at: str
+    pid: int
+    host: str
+
+
+def write_backup_progress(capture_root: Path, progress: BackupProgress) -> Path:
+    """Atomically publish the in-flight backup marker."""
+    path = Path(capture_root) / BACKUP_PROGRESS_RELPATH
+    payload = {
+        "started_at": progress.started_at,
+        "deadline_at": progress.deadline_at,
+        "pid": progress.pid,
+        "host": progress.host,
+    }
+    atomic_write_text(path, json.dumps(payload, sort_keys=True), mode=None)
+    return path
+
+
+def read_backup_progress(path: Path) -> BackupProgress | None:
+    """Return the in-flight marker, or None when it must not mask staleness."""
+    try:
+        raw: object = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    started_raw = raw.get("started_at")
+    deadline_raw = raw.get("deadline_at")
+    pid_raw = raw.get("pid")
+    host_raw = raw.get("host")
+    if not isinstance(started_raw, str) or not isinstance(deadline_raw, str):
+        return None
+    if not isinstance(pid_raw, int) or isinstance(pid_raw, bool) or not isinstance(host_raw, str):
+        return None
+    try:
+        started_at = datetime.fromisoformat(started_raw)
+        deadline_at = datetime.fromisoformat(deadline_raw)
+    except ValueError:
+        return None
+    if started_at.tzinfo is None or started_at.utcoffset() is None:
+        return None
+    if deadline_at.tzinfo is None or deadline_at.utcoffset() is None:
+        return None
+    return BackupProgress(started_at=started_raw, deadline_at=deadline_raw, pid=pid_raw, host=host_raw)
+
+
+def clear_backup_progress(capture_root: Path) -> None:
+    """Remove the in-flight marker; absent file is not an error."""
+    with contextlib.suppress(FileNotFoundError):
+        (Path(capture_root) / BACKUP_PROGRESS_RELPATH).unlink()
 
 
 def loose_copy_command(
@@ -159,6 +220,67 @@ def run_offsite_backup(
     snapshot_day = today.isoformat()
     full_scan = kst.weekday() == OffsiteConfig().full_scan_weekday
     started_at = kst.astimezone(UTC).isoformat()
+    try:
+        progress = BackupProgress(
+            started_at=started_at,
+            deadline_at=(kst + BACKUP_TOTAL_BUDGET + BACKUP_PROGRESS_GRACE).astimezone(UTC).isoformat(),
+            pid=os.getpid(),
+            host=socket.gethostname(),
+        )
+        write_backup_progress(capture_root, progress)
+    except OSError as exc:
+        logger.warning("[SYS] stage=offsite_backup progress_marker=UNWRITABLE reason=%s: %s", type(exc).__name__, exc)
+    report_written = False
+    try:
+        try:
+            run_report = _run_offsite_backup_inner(
+                project_root,
+                capture_root,
+                kst=kst,
+                today=today,
+                snapshot_day=snapshot_day,
+                full_scan=full_scan,
+                started_at=started_at,
+                run_fn=run_fn,
+                seal_fn=seal_fn,
+                accepted_missing=accepted_missing,
+            )
+        except Exception as exc:
+            run_report = BackupRunReport(
+                started_at=started_at,
+                finished_at=datetime.now(UTC).isoformat(),
+                status="failed",
+                steps={"backup_run": {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}},
+                core_panels=_load_previous_core_panels(capture_root) or None,
+            )
+        _write_report(capture_root, run_report)
+        report_written = True
+        if run_report.status != "ok":
+            failed = sorted(name for name, step in run_report.steps.items() if step.get("status") == "failed")
+            raise RuntimeError(f"offsite backup failed: {','.join(failed)}")
+        return run_report
+    finally:
+        # Preserve interruption evidence if report publication failed or the process was interrupted.
+        if report_written:
+            try:
+                clear_backup_progress(capture_root)
+            except OSError as exc:
+                logger.warning("[SYS] stage=offsite_backup progress_marker=UNCLEARABLE reason=%s: %s", type(exc).__name__, exc)
+
+
+def _run_offsite_backup_inner(
+    project_root: Path,
+    capture_root: Path,
+    *,
+    kst: datetime,
+    today: date,
+    snapshot_day: str,
+    full_scan: bool,
+    started_at: str,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]],
+    seal_fn: Callable[..., SealReport],
+    accepted_missing: frozenset[str],
+) -> BackupRunReport:
     rclone = _resolve_rclone_bin()
     steps: dict[str, dict[str, Any]] = {}
 
@@ -242,10 +364,6 @@ def run_offsite_backup(
     run_report = BackupRunReport(
         started_at=started_at, finished_at=finished_at, status=status, steps=steps, core_panels=persisted_panels
     )
-    _write_report(capture_root, run_report)
-    if status != "ok":
-        failed = sorted(name for name, step in steps.items() if step.get("status") != "ok")
-        raise RuntimeError(f"offsite backup failed: {','.join(failed)}")
     return run_report
 
 
@@ -260,7 +378,7 @@ def expected_backup_slot(audit_at: datetime) -> datetime:
         day = day.fromordinal(day.toordinal() - 1)
 
 
-def backup_staleness_issues(report_path: Path, audit_at: datetime) -> list[str]:
+def backup_staleness_issues(report_path: Path, audit_at: datetime, *, progress_path: Path | None = None) -> list[str]:
     """Classify the last offsite run against the latest scheduled slot.
 
     Returns:
@@ -269,10 +387,31 @@ def backup_staleness_issues(report_path: Path, audit_at: datetime) -> list[str]:
         ["offsite_backup:stale"]. Unreadable report -> ["offsite_backup:unreadable"].
         An ok, fresh report whose seal deferred dates or whose loose copy hit the
         duration budget yields ["offsite_backup:deferred"] (digest warning, not failure).
+        A missing or stale report covered by a fresh in-flight marker yields
+        ["offsite_backup:running"] before its deadline (informational, in
+        BACKUP_INFO_ISSUES) or ["offsite_backup:interrupted"] after it (warning).
+        A failed report is never downgraded to running.
     """
     path = Path(report_path)
+    marker_path = Path(progress_path) if progress_path is not None else path.parent / Path(BACKUP_PROGRESS_RELPATH).name
+    expected_slot = expected_backup_slot(audit_at)
+    # Writers publish the report before clearing the marker; read in the opposite order.
+    progress = read_backup_progress(marker_path)
+
+    def _fresh_marker_outcome() -> list[str] | None:
+        if progress is None:
+            return None
+        marker_started = datetime.fromisoformat(progress.started_at)
+        marker_deadline = datetime.fromisoformat(progress.deadline_at)
+        if marker_started < expected_slot:
+            return None
+        at = _kst_now(audit_at)
+        if at < marker_deadline:
+            return ["offsite_backup:running"]
+        return ["offsite_backup:interrupted"]
+
     if not path.exists():
-        return ["offsite_backup:missing"]
+        return _fresh_marker_outcome() or ["offsite_backup:missing"]
     try:
         raw: object = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -291,8 +430,8 @@ def backup_staleness_issues(report_path: Path, audit_at: datetime) -> list[str]:
         started_at = started_at.replace(tzinfo=UTC)
     if status != "ok":
         return ["offsite_backup:failed"]
-    if started_at < expected_backup_slot(audit_at):
-        return ["offsite_backup:stale"]
+    if started_at < expected_slot:
+        return _fresh_marker_outcome() or ["offsite_backup:stale"]
     steps = raw.get("steps")
     if isinstance(steps, dict):
         seal = steps.get("capture_seal")

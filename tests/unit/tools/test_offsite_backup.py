@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 KST = ZoneInfo("Asia/Seoul")
 UTC = ZoneInfo("UTC")
 
@@ -652,3 +654,361 @@ def test_failure_dominates_deferral_in_report_and_staleness(tmp_path: Path, monk
 
     persisted = tmp_path / "cfaildef" / REPORT_RELPATH
     assert backup_staleness_issues(persisted, _now_kst("2026-09-21", "20:15:00")) == ["offsite_backup:failed"]
+
+
+def _write_old_ok_report(path: Path) -> None:
+    _write_report(path, status="ok", started_at="2026-10-01T13:15:00+00:00")
+
+
+def _write_marker(path: Path, *, started_at: str, deadline_at: str) -> None:
+    import json as _json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        _json.dumps({"started_at": started_at, "deadline_at": deadline_at, "pid": 1234, "host": "test-host"}),
+        encoding="utf-8",
+    )
+
+
+def test_running_backup_is_not_stale(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_old_ok_report(report)
+    marker = tmp_path / "offsite" / "in_progress.json"
+    _write_marker(marker, started_at="2026-10-02T13:20:00+00:00", deadline_at="2026-10-02T16:20:00+00:00")
+    audit_at = datetime.fromisoformat("2026-10-02T23:39:00+09:00")
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:running"]
+
+
+def test_interrupted_backup_is_warning(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_old_ok_report(report)
+    marker = tmp_path / "offsite" / "in_progress.json"
+    _write_marker(marker, started_at="2026-10-02T13:20:00+00:00", deadline_at="2026-10-02T16:20:00+00:00")
+    audit_at = datetime.fromisoformat("2026-10-03T02:00:00+09:00")
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:interrupted"]
+
+
+def test_marker_deadline_boundary_with_explicit_path(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "last_run.json"
+    _write_old_ok_report(report)
+    marker = tmp_path / "custom_progress.json"
+    deadline = datetime.fromisoformat("2026-10-02T16:20:00+00:00")
+    _write_marker(marker, started_at="2026-10-02T13:15:00+00:00", deadline_at=deadline.isoformat())
+    assert backup_staleness_issues(report, deadline - timedelta(microseconds=1), progress_path=marker) == [
+        "offsite_backup:running"
+    ]
+    assert backup_staleness_issues(report, deadline, progress_path=marker) == ["offsite_backup:interrupted"]
+
+
+def test_old_marker_cannot_mask_staleness(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_old_ok_report(report)
+    marker = tmp_path / "offsite" / "in_progress.json"
+    _write_marker(marker, started_at="2026-09-30T13:15:00+00:00", deadline_at="2026-09-30T16:15:00+00:00")
+    audit_at = datetime.fromisoformat("2026-10-02T23:39:00+09:00")
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:stale"]
+
+
+def test_corrupt_or_naive_marker_is_ignored(tmp_path: Path) -> None:
+    import json as _json
+
+    from src.tools.offsite_backup import backup_staleness_issues, read_backup_progress
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_old_ok_report(report)
+    audit_at = datetime.fromisoformat("2026-10-02T23:39:00+09:00")
+    corrupt = tmp_path / "offsite" / "in_progress.json"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_text("{not json", encoding="utf-8")
+    assert read_backup_progress(corrupt) is None
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:stale"]
+    _write_marker(corrupt, started_at="2026-10-02T22:20:00", deadline_at="2026-10-03T01:20:00")
+    assert read_backup_progress(corrupt) is None
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:stale"]
+    for bad in (
+        "[1, 2]",
+        "{}",
+        _json.dumps({"started_at": 1, "deadline_at": "2026-10-02T16:20:00+00:00", "pid": 1, "host": "h"}),
+        _json.dumps({"started_at": "2026-10-02T13:20:00+00:00", "deadline_at": "2026-10-02T16:20:00+00:00", "pid": True, "host": "h"}),
+        _json.dumps({"started_at": "not-a-date", "deadline_at": "2026-10-02T16:20:00+00:00", "pid": 1, "host": "h"}),
+        _json.dumps({"started_at": "2026-10-02T13:20:00+00:00", "deadline_at": "2026-10-02T16:20:00", "pid": 1, "host": "h"}),
+    ):
+        corrupt.write_text(bad, encoding="utf-8")
+        assert read_backup_progress(corrupt) is None
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:stale"]
+
+
+def test_fresh_report_wins_over_marker(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_report(report, status="ok", started_at="2026-10-02T13:30:00+00:00")
+    marker = tmp_path / "offsite" / "in_progress.json"
+    _write_marker(marker, started_at="2026-10-02T13:20:00+00:00", deadline_at="2026-10-02T16:20:00+00:00")
+    audit_at = datetime.fromisoformat("2026-10-02T23:39:00+09:00")
+    assert backup_staleness_issues(report, audit_at) == []
+
+
+def test_failed_report_not_hidden_by_marker(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_report(report, status="failed", started_at="2026-10-02T13:30:00+00:00")
+    marker = tmp_path / "offsite" / "in_progress.json"
+    _write_marker(marker, started_at="2026-10-02T13:20:00+00:00", deadline_at="2026-10-02T16:20:00+00:00")
+    audit_at = datetime.fromisoformat("2026-10-02T23:39:00+09:00")
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:failed"]
+
+
+def test_missing_report_with_marker_is_running(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    marker = tmp_path / "offsite" / "in_progress.json"
+    _write_marker(marker, started_at="2026-10-02T13:20:00+00:00", deadline_at="2026-10-02T16:20:00+00:00")
+    audit_at = datetime.fromisoformat("2026-10-02T23:39:00+09:00")
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:running"]
+
+
+def test_marker_lifecycle_success_and_failure(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+
+    import pytest
+
+    from src.tools import offsite_backup as _ob
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import BACKUP_PROGRESS_RELPATH, REPORT_RELPATH, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    seen_during: dict[str, bool] = {}
+    cleared_with_report: dict[str, bool] = {}
+    real_clear = _ob.clear_backup_progress
+
+    def _checked_clear(capture_root: Path) -> None:
+        cleared_with_report["report_exists"] = (Path(capture_root) / REPORT_RELPATH).exists()
+        real_clear(capture_root)
+
+    monkeypatch.setattr(_ob, "clear_backup_progress", _checked_clear)
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        seen_during["marker_exists"] = (Path(capture_root) / BACKUP_PROGRESS_RELPATH).exists()
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    capture = tmp_path / "cap_ok"
+    run_offsite_backup(tmp_path, capture, now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+    assert seen_during["marker_exists"] is True
+    assert cleared_with_report["report_exists"] is True
+    assert not (capture / BACKUP_PROGRESS_RELPATH).exists()
+    assert (capture / REPORT_RELPATH).exists()
+
+    def _failing(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="down")
+
+    capture2 = tmp_path / "cap_fail"
+    with pytest.raises(RuntimeError, match="offsite backup failed"):
+        run_offsite_backup(tmp_path, capture2, now=_now_kst("2026-09-18"), run_fn=_failing, seal_fn=_seal)
+    assert not (capture2 / BACKUP_PROGRESS_RELPATH).exists()
+    assert (capture2 / REPORT_RELPATH).exists()
+
+
+def test_marker_write_failure_does_not_stop_backup(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+    import subprocess
+
+    from src.tools import offsite_backup as _ob
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+
+    def _boom(capture_root: Path, progress) -> Path:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(_ob, "write_backup_progress", _boom)
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with caplog.at_level(logging.WARNING):
+        report = run_offsite_backup(tmp_path, tmp_path / "cap_unwritable", now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+    assert report.status == "ok"
+    assert any("progress_marker=UNWRITABLE" in rec.message for rec in caplog.records)
+
+
+def test_marker_clear_failure_does_not_mask_report(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+    import subprocess
+
+    from src.tools import offsite_backup as _ob
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import REPORT_RELPATH, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+
+    def _unclearable(capture_root: Path) -> None:
+        raise OSError("lock busy")
+
+    monkeypatch.setattr(_ob, "clear_backup_progress", _unclearable)
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    capture = tmp_path / "cap_unclearable"
+    with caplog.at_level(logging.WARNING):
+        report = run_offsite_backup(tmp_path, capture, now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+    assert report.status == "ok"
+    assert (capture / REPORT_RELPATH).exists()
+    assert any("progress_marker=UNCLEARABLE" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.parametrize("target", [
+    "src.tools.offsite_backup._resolve_rclone_bin",
+    "src.tools.core_snapshot.collect_core_stats",
+    "src.tools.core_snapshot.validate_core_panels",
+])
+def test_initial_failure_publishes_report_before_clearing_marker(tmp_path: Path, monkeypatch, target: str) -> None:
+    from src.tools import offsite_backup as ob
+
+    capture = tmp_path / "capture"
+    report_path = capture / ob.REPORT_RELPATH
+    _write_old_ok_report(report_path)
+    old = json.loads(report_path.read_text())
+    baseline = [{"relpath": "data/history/price_history.parquet", "sha256": "a", "bytes": 1, "rows": 1}]
+    old["core_panels"] = baseline
+    report_path.write_text(json.dumps(old))
+    monkeypatch.setattr(ob, "_resolve_rclone_bin", lambda: "rclone")
+    real_clear = ob.clear_backup_progress
+    start = _now_kst("2026-10-02", "22:20:00")
+
+    def fail(*args, **kwargs):
+        assert (capture / ob.BACKUP_PROGRESS_RELPATH).exists()
+        raise ValueError("initialization failed")
+
+    def checked_clear(root: Path) -> None:
+        persisted = json.loads(report_path.read_text())
+        assert persisted["started_at"] == start.astimezone(UTC).isoformat()
+        assert persisted["status"] == "failed"
+        assert persisted["core_panels"] == baseline
+        real_clear(root)
+
+    monkeypatch.setattr(target, fail)
+    monkeypatch.setattr(ob, "clear_backup_progress", checked_clear)
+    with pytest.raises(RuntimeError, match="offsite backup failed: backup_run"):
+        ob.run_offsite_backup(tmp_path, capture, now=start)
+    assert not (capture / ob.BACKUP_PROGRESS_RELPATH).exists()
+    assert "ValueError: initialization failed" in report_path.read_text()
+
+
+@pytest.mark.parametrize("failed_run", [False, True])
+def test_report_publication_failure_preserves_marker(tmp_path: Path, monkeypatch, failed_run: bool) -> None:
+    from datetime import timedelta
+
+    from src.tools import offsite_backup as ob
+    from src.tools.capture_offsite import SealReport
+
+    capture = tmp_path / "capture"
+    report_path = capture / ob.REPORT_RELPATH
+    _write_old_ok_report(report_path)
+    previous = report_path.read_bytes()
+    monkeypatch.setattr(ob, "_resolve_rclone_bin", lambda: "rclone")
+
+    def seal(*args, **kwargs):
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, int(failed_run), stdout="", stderr="copy failed")
+
+    def fail_write(root, report):
+        assert report.status == ("failed" if failed_run else "ok")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ob, "_write_report", fail_write)
+    start = _now_kst("2026-10-02", "22:20:00")
+    with pytest.raises(OSError, match="disk full"):
+        ob.run_offsite_backup(tmp_path, capture, now=start, seal_fn=seal, run_fn=run)
+    progress = ob.read_backup_progress(capture / ob.BACKUP_PROGRESS_RELPATH)
+    assert progress is not None
+    assert progress.started_at == start.astimezone(UTC).isoformat()
+    assert report_path.read_bytes() == previous
+    deadline = start + ob.BACKUP_TOTAL_BUDGET + ob.BACKUP_PROGRESS_GRACE
+    assert ob.backup_staleness_issues(report_path, deadline + timedelta(seconds=1)) == ["offsite_backup:interrupted"]
+
+
+def test_process_interruption_preserves_marker(tmp_path: Path, monkeypatch) -> None:
+    from src.tools import offsite_backup as ob
+
+    capture = tmp_path / "capture"
+    monkeypatch.setattr(ob, "_resolve_rclone_bin", lambda: "rclone")
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("src.tools.core_snapshot.collect_core_stats", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        ob.run_offsite_backup(tmp_path, capture, now=_now_kst("2026-10-02", "22:20:00"))
+    assert ob.read_backup_progress(capture / ob.BACKUP_PROGRESS_RELPATH) is not None
+    assert not (capture / ob.REPORT_RELPATH).exists()
+
+
+@pytest.mark.parametrize("previous_report", [False, True])
+@pytest.mark.parametrize("completion_phase", ["before_marker_read", "after_marker_read", "after_report_read"])
+def test_audit_during_completion_never_reports_stale_or_missing(
+    tmp_path: Path, monkeypatch, previous_report: bool, completion_phase: str,
+) -> None:
+    from src.tools import offsite_backup as ob
+
+    capture = tmp_path / "capture"
+    report_path = capture / ob.REPORT_RELPATH
+    marker_path = capture / ob.BACKUP_PROGRESS_RELPATH
+    if previous_report:
+        _write_old_ok_report(report_path)
+    progress = ob.BackupProgress("2026-10-02T13:20:00+00:00", "2026-10-02T16:20:00+00:00", 1234, "host")
+    ob.write_backup_progress(capture, progress)
+    real_read = Path.read_text
+    real_exists = Path.exists
+
+    def complete() -> None:
+        ob._write_report(capture, ob.BackupRunReport(progress.started_at, "2026-10-02T14:39:00+00:00", "ok", {}))
+        ob.clear_backup_progress(capture)
+
+    def concurrent_read(path: Path, *args, **kwargs):
+        if path == marker_path and completion_phase == "before_marker_read":
+            complete()
+        contents = real_read(path, *args, **kwargs)
+        if (path == marker_path and completion_phase == "after_marker_read") or (
+            path == report_path and completion_phase == "after_report_read"
+        ):
+            complete()
+        return contents
+
+    def concurrent_exists(path: Path) -> bool:
+        exists = real_exists(path)
+        if path == report_path and not exists and completion_phase == "after_report_read":
+            complete()
+        return exists
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "read_text", concurrent_read)
+        scoped.setattr(Path, "exists", concurrent_exists)
+        result = ob.backup_staleness_issues(report_path, _now_kst("2026-10-02", "23:39:00"))
+    assert result == (["offsite_backup:running"] if completion_phase == "after_report_read" else [])
+    assert ob.backup_staleness_issues(report_path, _now_kst("2026-10-02", "23:39:00")) == []
