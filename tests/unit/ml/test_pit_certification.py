@@ -639,7 +639,8 @@ def test_calibration_to_loop_frames_derive_both_arms() -> None:
     config = DecompositionConfig(
         ewma_alpha=0.5, min_prior_days=1, max_gap_days=30, auction_fraction_mean=0.0365,
         bias_correction=1.0, volume_rel_err_p90=0.144, close_bp_err_p90=11.9,
-        calibrated_through="2026-09-30",
+        calibrated_through="2026-09-30", fit_start="2026-09-01",
+        holdout_start="2026-08-25", holdout_end="2026-08-31",
     )
     days = pd.bdate_range("2026-03-02", periods=5).strftime("%Y-%m-%d").tolist()
     rows = [
@@ -663,7 +664,8 @@ def test_calibration_to_loop_frames_derive_both_arms() -> None:
     bad_config = DecompositionConfig(
         ewma_alpha=0.5, min_prior_days=1, max_gap_days=30, auction_fraction_mean=float("nan"),
         bias_correction=1.0, volume_rel_err_p90=0.144, close_bp_err_p90=11.9,
-        calibrated_through="2026-09-30",
+        calibrated_through="2026-09-30", fit_start="2026-09-01",
+        holdout_start="2026-08-25", holdout_end="2026-08-31",
     )
     with pytest.raises(ValueError, match="auction fraction"):
         calibration_to_loop_frames(calibration, config=bad_config, prev_closes=prev_closes)
@@ -805,6 +807,22 @@ def _calibration_row(day, symbol, share, v_cons=10000.0):
     }
 
 
+def test_stability_refuses_unscorable_first_half() -> None:
+    from src.ml.research.pit_certification import check_calibration_stability
+
+    days = pd.bdate_range("2026-01-05", periods=8).strftime("%Y-%m-%d").tolist()
+    calibration = pd.DataFrame([
+        _calibration_row(day, f"{i:06d}", 0.68) for i, day in enumerate(days)
+    ])
+    result = check_calibration_stability(
+        calibration, alphas=[0.3, 0.5, 0.7], min_prior_days=1, max_gap_days=30,
+        identity_tolerance=0.05, max_median_rel_err=0.5,
+    )
+    assert result.passed is False
+    assert result.n_scored == 0
+    assert "cannot score any candidate" in result.detail
+
+
 def _gate_inputs(**overrides):
     from src.ml.pit_report import PairedDelta
 
@@ -905,7 +923,8 @@ def test_main_reconstruction_certification_reads_report_dirs(tmp_path, monkeypat
     decomp = DecompositionConfig(
         ewma_alpha=0.5, min_prior_days=1, max_gap_days=30, auction_fraction_mean=0.0365,
         bias_correction=1.0, volume_rel_err_p90=0.144, close_bp_err_p90=11.9,
-        calibrated_through="2026-03-31",
+        calibrated_through="2026-03-31", fit_start="2026-03-01",
+        holdout_start="2026-02-20", holdout_end="2026-02-28",
     )
     config_path = tmp_path / "nxt_decomposition_config.json"
     save_decomposition_config(decomp, config_path)

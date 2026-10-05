@@ -26,7 +26,9 @@ from scipy.stats import spearmanr
 from src.daily.universe_screen import build_screen_frame
 from src.data.nxt_decomposition import (
     DecompositionConfig,
-    fit_decomposition_config,
+    _build_history,
+    _eligible_frame,
+    _score_candidates,
     load_decomposition_config,
     predict_share,
 )
@@ -1693,6 +1695,73 @@ def reconstruction_in_the_loop(
     )
 
 
+def _fit_first_half_parameters(
+    first_half: pd.DataFrame,
+    *,
+    alphas: Sequence[float],
+    min_prior_days: int,
+    max_gap_days: int,
+    identity_tolerance: float,
+) -> DecompositionConfig:
+    """Select the estimator parameters on first-half rows via proxy-based walk-forward scoring.
+
+    Uses the shared production-predictor selection definition from nxt_decomposition: proxies
+    over eligible first-half rows only, scored on the later half of the first-half dates. The
+    returned config is a transient scoring vehicle (its error quantiles are neutral zeros and
+    it is never persisted); the verdict ceiling applies on the second-half median downstream.
+    """
+    candidates = [float(a) for a in alphas]
+    if not candidates or any(not np.isfinite(a) or a <= 0.0 or a > 1.0 for a in candidates):
+        raise ValueError("first-half alphas must be a nonempty sequence within (0, 1]")
+    try:
+        min_prior = int(min_prior_days)
+        max_gap = int(max_gap_days)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"first-half structure is not integer: {exc}") from exc
+    if min_prior < 1:
+        raise ValueError("first-half min_prior_days must be >= 1")
+    if max_gap < 0:
+        raise ValueError("first-half max_gap_days must be >= 0")
+    eligible = _eligible_frame(first_half, float(identity_tolerance), caller="check_calibration_stability")
+    if len(eligible) < max(min_prior, 2) or int(eligible["symbol"].nunique()) < 2:
+        raise ValueError(
+            f"first-half keeps {len(eligible)} symbol-days "
+            f"over {int(eligible['symbol'].nunique()) if len(eligible) else 0} symbols after identity filtering"
+        )
+    abar = float(np.mean((eligible["auction_volume"] / eligible["eod_volume"]).to_numpy(dtype=np.float64)))
+    history = _build_history(eligible, abar)
+    first_dates = sorted(eligible["day"].unique().tolist())
+    scope_days = set(first_dates[max(1, len(first_dates) // 2):])
+    scope = [
+        (str(symbol), int(ordinal), float(true))
+        for symbol, ordinal, day, true in zip(
+            eligible["symbol"].tolist(),
+            eligible["ordinal"].tolist(),
+            eligible["day"].tolist(),
+            eligible["true_share"].tolist(),
+            strict=True,
+        )
+        if day in scope_days
+    ]
+    ranked = _score_candidates(history, scope, alphas=candidates, structures=[(min_prior, max_gap)])
+    best = ranked[0]
+    if not np.isfinite(best.bias) or best.bias <= 0.0 or not np.isfinite(best.rel_err_p90):
+        raise ValueError("first-half cannot score any candidate")
+    return DecompositionConfig(
+        ewma_alpha=float(best.ewma_alpha),
+        min_prior_days=min_prior,
+        max_gap_days=max_gap,
+        auction_fraction_mean=abar,
+        bias_correction=float(best.bias),
+        volume_rel_err_p90=0.0,
+        close_bp_err_p90=0.0,
+        calibrated_through=str(max(first_dates)),
+        fit_start=str(min(first_dates)),
+        holdout_start=str(min(first_dates)),
+        holdout_end=str(max(first_dates)),
+    )
+
+
 def check_calibration_stability(
     calibration: pd.DataFrame,
     *,
@@ -1717,7 +1786,7 @@ def check_calibration_stability(
     first, second = set(days[:cut]), set(days[cut:])
     day_of = pd.to_datetime(work["date"], errors="coerce", format="mixed").dt.strftime("%Y-%m-%d")
     try:
-        fitted = fit_decomposition_config(
+        fitted = _fit_first_half_parameters(
             work[day_of.isin(first)],
             alphas=list(alphas),
             min_prior_days=int(min_prior_days),
