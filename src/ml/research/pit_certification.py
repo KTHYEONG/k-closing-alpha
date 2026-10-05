@@ -38,12 +38,14 @@ from src.data.pit1520_panel import (
     INDEX_BASIS_LIVE,
     PIT1520_PANEL_COLUMNS,
     PanelSource,
+    load_panel_provenance,
     panel_to_decision_input,
 )
 from src.ml.oof import _finite_nan
 from src.ml.pit_report import (
     PIT_HAIRCUT_DAILY_FILENAME,
     PIT_HAIRCUT_REPORT_FILENAME,
+    RECON_ARM_DIRNAME,
     RECONSTRUCTION_CERTIFICATION_FILENAME,
     AugmentationSummary,
     CalibrationStability,
@@ -1316,9 +1318,14 @@ def _log_headline(report: PitHaircutReport) -> None:
 
 
 def main_pit_certification(
-    *, export_dir: str, panel_dir: Path, augment: bool, train_start: pd.Timestamp | None
+    *, export_dir: str, panel_dir: Path, augment: bool, train_start: pd.Timestamp | None,
+    arm_dirname: str = "topk_ranker",
 ) -> PitHaircutReport:
     """CLI body used by src.ml.retrain --pit-certification: load inputs, run, persist, log.
+
+    Arm 1 and arm 2 of the reconstruction certification are produced by two calls
+    differing only in `panel_dir` and `arm_dirname`, with identical seeds, train
+    start and models.
 
     Raises:
         FileNotFoundError: price_history or panel files missing.
@@ -1351,8 +1358,96 @@ def main_pit_certification(
         train_start=train_start,
         config=cfg,
     )
-    save_pit_haircut_report(report, daily, out_dir=Path(export_dir) / "topk_ranker")
+    save_pit_haircut_report(report, daily, out_dir=Path(export_dir) / str(arm_dirname))
     return report
+
+
+def main_recon_certification_run(
+    *,
+    export_dir: str,
+    exact_panel_dir: Path,
+    recon_panel_dir: Path,
+    decomposition_config_path: Path,
+    calibration_table_path: Path,
+    train_start: pd.Timestamp | None,
+    gate_config: ReconstructionGateConfig | None = None,
+) -> ReconstructionCertification:
+    """Run arm 1 (`topk_ranker`), arm 2 (`topk_ranker_recon`) and the bound certificate.
+
+    Both arms run the standard pit certification with identical seeds, train start and
+    models; only the panel differs. The certificate lands beside arm 1
+    (`<export_dir>/topk_ranker/reconstruction_certification.json`).
+
+    An existing certificate is removed before the run starts, so an interrupted run can
+    only produce "no certificate", which the loader treats as not adopted; a failure
+    after arm 1 leaves arm 1 as written and writes no certificate.
+
+    Raises:
+        FileNotFoundError: Either panel's files, the decomposition config or the
+            calibration table is missing.
+        ValueError: A panel sidecar records the wrong mode or a config digest that
+            differs from `decomposition_config_path` (checked before any scoring).
+    """
+    from src import settings as _app_settings
+
+    exact_dir = Path(exact_panel_dir)
+    recon_dir = Path(recon_panel_dir)
+    config_path = Path(decomposition_config_path)
+    table_path = Path(calibration_table_path)
+    for label, path in (
+        ("exact panel", exact_dir / "pit1520_panel.parquet"),
+        ("exact panel days", exact_dir / "pit1520_panel_days.parquet"),
+        ("recon panel", recon_dir / "pit1520_panel.parquet"),
+        ("recon panel days", recon_dir / "pit1520_panel_days.parquet"),
+        ("decomposition config", config_path),
+        ("calibration table", table_path),
+    ):
+        if not Path(path).exists():
+            raise FileNotFoundError(f"reconstruction certification {label} not found: {path}")
+    exact_prov = load_panel_provenance(exact_dir)
+    recon_prov = load_panel_provenance(recon_dir)
+    if bool(exact_prov["reconstruct_consolidated"]):
+        raise ValueError(
+            f"reconstruction certification exact panel {exact_dir} was built with reconstruction enabled"
+        )
+    if not bool(recon_prov["reconstruct_consolidated"]):
+        raise ValueError(
+            f"reconstruction certification recon panel {recon_dir} was not built with reconstruction enabled"
+        )
+    config_digest = _sha256_file_bytes(config_path)
+    if str(recon_prov["decomposition_config_sha256"]).lower() != config_digest.lower():
+        raise ValueError(
+            f"reconstruction certification recon panel {recon_dir} digest does not match {config_path}"
+        )
+    arm1_dir = Path(export_dir) / "topk_ranker"
+    arm2_dir = Path(export_dir) / RECON_ARM_DIRNAME
+    cert_path = arm1_dir / RECONSTRUCTION_CERTIFICATION_FILENAME
+    if cert_path.exists():
+        cert_path.unlink()
+    main_pit_certification(
+        export_dir=str(export_dir),
+        panel_dir=exact_dir,
+        augment=False,
+        train_start=train_start,
+    )
+    main_pit_certification(
+        export_dir=str(export_dir),
+        panel_dir=recon_dir,
+        augment=False,
+        train_start=train_start,
+        arm_dirname=RECON_ARM_DIRNAME,
+    )
+    return main_reconstruction_certification(
+        exact_dir=arm1_dir,
+        recon_dir=arm2_dir,
+        out_dir=arm1_dir,
+        calibration_path=table_path,
+        config_path=config_path,
+        price_history_path=Path(_app_settings.PRICE_HISTORY_PARQUET_PATH),
+        exact_days_path=exact_dir / "pit1520_panel_days.parquet",
+        recon_days_path=recon_dir / "pit1520_panel_days.parquet",
+        gate_config=gate_config,
+    )
 
 
 # ---------------------------------------------------------------------------

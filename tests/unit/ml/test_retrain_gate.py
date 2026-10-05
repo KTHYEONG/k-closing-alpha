@@ -810,7 +810,7 @@ def _stage_recon_selection(
 
         generated_at = (datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(seconds=1)).isoformat()
     eff_arm2 = arm2_report if arm2_report is not None else _pit_report(native_mean=9.0)
-    arm_dir = live_dir / RECON_ARM_DIRNAME
+    arm_dir = live_dir.parent / RECON_ARM_DIRNAME
     if arm2:
         arm_dir.mkdir(exist_ok=True)
         if corrupt == "arm2":
@@ -908,7 +908,7 @@ def test_recon_selection_never_improves_on_reject_or_damage(tmp_path) -> None:
     assert (report, adopted) == (None, False)
     assert "unreadable" in detail
 
-    no_arm2 = tmp_path / "no_arm2"
+    no_arm2 = tmp_path / "no_arm2" / "topk_ranker"
     _stage_recon_selection(no_arm2, config_path=cfg, arm2=False)
     report, adopted, detail = retrain_gate.load_recon_pit_selection(
         no_arm2, **_loader_kwargs(no_arm2, cfg, arm1))

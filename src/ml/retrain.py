@@ -60,6 +60,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exit-grid-revalidation", action="store_true", help="re-validate the TP5%%+MOC next-day exit-timing lever (src/ml/exit_policy.py) under the certified ranker's own CPCV(8,2) OOF pipeline and real PIT cost, without touching run_topk_ranker_backtest itself")
     parser.add_argument("--pit-certification", action="store_true", help="re-score the certified CPCV fold models on the decision-time (15:20) panel and write the pit_haircut report next to the live bundle")
     parser.add_argument("--pit-panel-dir", default=str(settings.HISTORY_DIR), help="directory holding the Part 2 decision-time panel files (pit1520_panel.parquet, pit1520_panel_days.parquet)")
+    parser.add_argument("--recon-certification", action="store_true", help="run the exact arm, the reconstructed arm and the bound reconstruction certificate (operator-run, not scheduled)")
+    parser.add_argument("--recon-panel-dir", default=None, help="directory holding the reconstructed decision-time panel files")
+    parser.add_argument("--decomposition-config", default=None, help="fitted decomposition config (default settings.HISTORY_DIR/nxt_decomposition_config.json)")
+    parser.add_argument("--calibration-table", default=None, help="calibration table (default settings.HISTORY_DIR/nxt_calibration_table.parquet)")
     parser.add_argument("--pit-augment", action="store_true", help="also run the report-only auction-noise augmentation experiment (15:20 panel only)")
     parser.add_argument("--pit-gate-mode", choices=("off", "advisory", "enforce"), default="advisory", help="PIT criterion mode for --train-ranker-bundle (advisory never blocks)")
     return parser
@@ -204,7 +208,24 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    raise ValueError("no action flag given; choose one of --universe-research/--cost-aware-backtest/--train-ranker-bundle/--ranker-topk-research/--exit-grid-revalidation/--pit-certification")
+    if args.recon_certification:
+        from src.backfill.intraday.nxt_calibration_run import default_calibration_table_path
+        from src.data.pit1520_panel import default_decomposition_config_path
+        from src.ml.research.pit_certification import main_recon_certification_run
+
+        if args.recon_panel_dir is None:
+            raise ValueError("--recon-certification requires --recon-panel-dir")
+        main_recon_certification_run(
+            export_dir=args.export_dir,
+            exact_panel_dir=Path(args.pit_panel_dir),
+            recon_panel_dir=Path(args.recon_panel_dir),
+            decomposition_config_path=Path(args.decomposition_config) if args.decomposition_config else default_decomposition_config_path(),
+            calibration_table_path=Path(args.calibration_table) if args.calibration_table else default_calibration_table_path(),
+            train_start=pd.Timestamp(args.ranker_train_start) if args.ranker_train_start else None,
+        )
+        return
+
+    raise ValueError("no action flag given; choose one of --universe-research/--cost-aware-backtest/--train-ranker-bundle/--ranker-topk-research/--exit-grid-revalidation/--pit-certification/--recon-certification")
 
 
 if __name__ == "__main__":
