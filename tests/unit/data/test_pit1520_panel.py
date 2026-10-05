@@ -10,13 +10,20 @@ import pytest
 
 from src.data.eod_superset import EodSupersetScreen
 from src.data.pit1520_panel import (
+    BASIS_EXACT,
+    BASIS_RECONSTRUCTED,
     PIT1520_PANEL_COLUMNS,
+    PIT1520_RECON_COLUMNS,
+    RECON_TOSS_VENDOR,
     Pit1520PanelConfig,
     Pit1520PanelResult,
     aggregate_decision_bars,
     build_pit1520_panel,
+    default_decomposition_config_path,
     default_panel_paths,
+    known_consolidated_symbol_days,
     live_input_to_panel_rows,
+    load_consolidated_bars,
     load_live_decision_input,
     load_regular_bars,
     panel_to_decision_input,
@@ -1024,9 +1031,464 @@ def test_default_config_rebuilds_toss_and_keeps_kis_value() -> None:
     assert float(agg_ls.iloc[0]["trade_value_100m"]) == pytest.approx(expected_ls)
 
 
+def _recon_decomp_config(**overrides):
+    from src.data.nxt_decomposition import DecompositionConfig
+
+    base = {
+        "ewma_alpha": 0.5,
+        "min_prior_days": 2,
+        "max_gap_days": 30,
+        "auction_fraction_mean": 0.0365,
+        "bias_correction": 1.0,
+        "volume_rel_err_p90": 0.144,
+        "close_bp_err_p90": 11.9,
+        "calibrated_through": "2026-09-30",
+    }
+    base.update(overrides)
+    return DecompositionConfig(**base)
+
+
+def _cons_bar(symbol, ts, o, h, l, c, vol, trade=True):
+    return {
+        "symbol": symbol,
+        "ts_hms": ts,
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "volume": vol,
+        "value_krw": int(c * vol),
+        "has_trade": trade,
+        "vendor": "toss",
+    }
+
+
+def _recon_history(symbol="005930", *, open=10000.0, prev=None, volume=12000.0, tv=1200.0,
+                   d1="2026-09-16", d2="2026-09-17", t="2026-09-18"):
+    base_prev = open * 0.98 if prev is None else prev
+    rows = []
+    for day, day_open, day_close, day_prev in (
+        (d1, open - 100.0, open - 80.0, base_prev - 100.0),
+        (d2, open - 100.0, open - 80.0, open - 80.0),
+        (t, open, open + 20.0, base_prev),
+    ):
+        rows.append(_ph_row(day, symbol, open=day_open, close=day_close, prev_close=day_prev,
+                            mc=1000.0, inst=5.0, foreign=6.0, volume=volume, tv=tv))
+    return pd.DataFrame(rows)
+
+
+def _recon_cons_day(symbol, day_open, *, volumes=(6000.0, 6000.0)):
+    return pd.DataFrame([
+        _cons_bar(symbol, 90100, day_open, day_open + 50, day_open - 50, day_open + 10, volumes[0]),
+        _cons_bar(symbol, 152000, day_open + 20, day_open + 70, day_open - 30, day_open + 30, volumes[1]),
+    ])
+
+
+def _recon_inputs(*, symbols=("005930",), opens=(10000.0,)):
+    ph = pd.concat([
+        _recon_history(symbol, open=price) for symbol, price in zip(symbols, opens, strict=True)
+    ], ignore_index=True)
+    cons = {
+        day: pd.concat([
+            _recon_cons_day(symbol, price - (100.0 if day < "2026-09-18" else 0.0))
+            for symbol, price in zip(symbols, opens, strict=True)
+        ], ignore_index=True)
+        for day in ("2026-09-16", "2026-09-17", "2026-09-18")
+    }
+    return ph, cons
+
+
+def _empty_bars() -> pd.DataFrame:
+    return pd.DataFrame({
+        c: pd.Series(dtype="object")
+        for c in ("symbol", "ts_hms", "open", "high", "low", "close", "volume",
+                  "value_krw", "has_trade", "vendor")
+    })
+
+
+def test_recon_flag_off_ignores_consolidated_loader() -> None:
+    ph, cons = _recon_inputs()
+    seen: list[str] = []
+
+    def _loader(day: str) -> pd.DataFrame:
+        seen.append(day)
+        return cons[day]
+
+    plain = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+        live_loader=lambda _d: None, screen=_screen(),
+    )
+    flagged_off = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+        live_loader=lambda _d: None, screen=_screen(),
+        consolidated_loader=_loader, decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(),
+    )
+    assert seen == []
+    assert list(flagged_off.panel.columns) == list(PIT1520_PANEL_COLUMNS)
+    pd.testing.assert_frame_equal(flagged_off.panel, plain.panel)
+    pd.testing.assert_frame_equal(flagged_off.exclusions, plain.exclusions)
+    pd.testing.assert_frame_equal(flagged_off.days, plain.days)
+
+
+def test_recon_requires_loader_and_config() -> None:
+    ph, cons = _recon_inputs()
+    with pytest.raises(ValueError, match="decomposition_config"):
+        build_pit1520_panel(
+            price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+            live_loader=lambda _d: None, screen=_screen(),
+            consolidated_loader=lambda d: cons[d],
+            config=Pit1520PanelConfig(reconstruct_consolidated=True),
+        )
+    with pytest.raises(ValueError, match="consolidated_loader"):
+        build_pit1520_panel(
+            price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+            live_loader=lambda _d: None, screen=_screen(),
+            decomposition_config=_recon_decomp_config(),
+            config=Pit1520PanelConfig(reconstruct_consolidated=True),
+        )
+
+
+def test_recon_marks_provenance_for_mixed_exact_and_reconstructed_days() -> None:
+    ph, cons = _recon_inputs(symbols=("005930", "000660"), opens=(10000.0, 50000.0))
+    exact = _kis_session("005930", 10030.0, 10040.0)
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: exact,
+        live_loader=lambda _d: None, screen=_screen(),
+        consolidated_loader=lambda d: cons[d], decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(reconstruct_consolidated=True),
+    )
+    assert list(result.panel.columns) == list(PIT1520_RECON_COLUMNS)
+    assert set(result.panel["symbol"]) == {"005930", "000660"}
+    exact_row = result.panel[result.panel["symbol"] == "005930"].iloc[0]
+    assert str(exact_row["bars_vendor"]) == "kis"
+    assert str(exact_row["basis"]) == BASIS_EXACT
+    assert np.isnan(float(exact_row["recon_volume_rel_err_p90"]))
+    assert np.isnan(float(exact_row["recon_close_bp_err_p90"]))
+    recon_row = result.panel[result.panel["symbol"] == "000660"].iloc[0]
+    assert str(recon_row["bars_vendor"]) == RECON_TOSS_VENDOR
+    assert str(recon_row["basis"]) == BASIS_RECONSTRUCTED
+    assert float(recon_row["recon_volume_rel_err_p90"]) == pytest.approx(0.144)
+    assert float(recon_row["recon_close_bp_err_p90"]) == pytest.approx(11.9)
+    expected_share = 12000.0 * (1.0 - 0.0365) / 12000.0
+    assert float(recon_row["volume"]) == pytest.approx(12000.0 * expected_share)
+
+
+def test_recon_exact_bars_win_without_invoking_reconstruction(monkeypatch) -> None:
+    import src.data.pit1520_panel as panel_mod
+
+    ph, cons = _recon_inputs(symbols=("005930", "000660"), opens=(10000.0, 50000.0))
+    exact = pd.concat([
+        _kis_session("005930", 10030.0, 10040.0),
+        _kis_session("000660", 50030.0, 50040.0),
+    ], ignore_index=True)
+    real_reconstruct = panel_mod.reconstruct_krx_bars
+    called: list[str] = []
+
+    def _spy(frame, *, share, config):
+        called.append(str(frame["symbol"].iloc[0]))
+        return real_reconstruct(frame, share=share, config=config)
+
+    monkeypatch.setattr(panel_mod, "reconstruct_krx_bars", _spy)
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: exact,
+        live_loader=lambda _d: None, screen=_screen(),
+        consolidated_loader=lambda d: cons[d], decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(reconstruct_consolidated=True),
+    )
+    assert called == []
+    assert set(result.panel["symbol"]) == {"005930", "000660"}
+    assert set(result.panel["bars_vendor"]) == {"kis"}
+    assert set(result.panel["basis"]) == {BASIS_EXACT}
+
+
+def test_recon_uses_no_same_day_eod_volume() -> None:
+    ph, cons = _recon_inputs(symbols=("000660",), opens=(50000.0,))
+    kwargs = {
+        "dates": ["2026-09-18"],
+        "bars_loader": lambda _d: _empty_bars(),
+        "live_loader": lambda _d: None,
+        "screen": _screen(),
+        "consolidated_loader": lambda d: cons[d],
+        "decomposition_config": _recon_decomp_config(),
+        "config": Pit1520PanelConfig(reconstruct_consolidated=True),
+    }
+    first = build_pit1520_panel(price_history=ph, **kwargs)
+    perturbed = ph.copy()
+    perturbed.loc[perturbed["date"] == "2026-09-18", "volume"] = 45.0
+    second = build_pit1520_panel(price_history=perturbed, **kwargs)
+    assert len(first.panel) == 1 and len(second.panel) == 1
+    for col in ("volume", "trade_value_100m", "close", "open"):
+        assert float(first.panel.iloc[0][col]) == pytest.approx(float(second.panel.iloc[0][col]))
+
+
+def test_recon_fails_closed_without_share_history() -> None:
+    ph = pd.DataFrame([
+        _ph_row("2026-09-15", "005930", open=9800, close=9820, prev_close=9600,
+                mc=1000.0, inst=5.0, foreign=6.0),
+        _ph_row("2026-09-16", "005930", open=9900, close=9900, prev_close=9700, mc=1000.0,
+                inst=5.0, foreign=6.0, volume=12000.0),
+        _ph_row("2026-09-17", "005930", open=9900, close=9900, prev_close=9700, mc=1000.0,
+                inst=5.0, foreign=6.0, volume=0.0),
+        _ph_row("2026-09-18", "005930", open=10000, close=10020, prev_close=9800,
+                mc=1000.0, inst=5.0, foreign=6.0),
+        _ph_row("2026-09-18", "000660", open=50000, close=50020, prev_close=49000,
+                mc=5000.0, inst=5.0, foreign=6.0),
+        _ph_row("2026-09-17", "000660", open=49900, close=49900, prev_close=48900, mc=5000.0,
+                inst=5.0, foreign=6.0),
+    ])
+    other_symbol_day = pd.DataFrame([
+        _cons_bar("000660", 90100, 49900, 49950, 49850, 49910, 1500.0),
+        _cons_bar("000660", 152000, 49900, 49950, 49850, 49910, 1500.0),
+    ])
+    cons = {
+        "2026-09-15": other_symbol_day,
+        "2026-09-18": _recon_cons_day("005930", 10000.0),
+    }
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+        live_loader=lambda _d: None, screen=_screen(),
+        consolidated_loader=lambda d: cons.get(d, pd.DataFrame()),
+        decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(reconstruct_consolidated=True),
+        consolidated_symbol_days=frozenset({("2026-09-18", "005930")}),
+    )
+    assert len(result.panel) == 0
+    by_symbol = {r["symbol"]: r["reason"] for _, r in result.exclusions.iterrows()}
+    assert by_symbol["005930"] == "share_unavailable"
+    assert by_symbol["000660"] == "not_fetched"
+
+
+def test_recon_marks_known_consolidated_without_bars() -> None:
+    ph = pd.DataFrame([
+        _ph_row("2026-09-18", "005930", open=10000, close=10020, prev_close=9800,
+                mc=1000.0, inst=5.0, foreign=6.0),
+        _ph_row("2026-09-17", "005930", open=9900, close=9900, prev_close=9700, mc=1000.0,
+                inst=5.0, foreign=6.0),
+    ])
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+        live_loader=lambda _d: None, screen=_screen(),
+        consolidated_loader=lambda _d: pd.DataFrame(),
+        decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(reconstruct_consolidated=True),
+        consolidated_symbol_days=frozenset({("2026-09-18", "005930")}),
+    )
+    assert len(result.panel) == 0
+    assert result.exclusions.iloc[0]["reason"] == "consolidated_missing"
+
+
+def test_recon_rejects_unobservable_and_untradable_consolidated_days() -> None:
+    ph, cons = _recon_inputs()
+    late_only = pd.DataFrame([
+        _cons_bar("005930", 153000, 10000, 10050, 9950, 10010, 500),
+    ])
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+        live_loader=lambda _d: None, screen=_screen(),
+        consolidated_loader=lambda d: late_only if d == "2026-09-18" else cons[d],
+        decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(reconstruct_consolidated=True),
+    )
+    assert len(result.panel) == 0
+    assert result.exclusions.iloc[0]["reason"] == "not_fetched"
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+        live_loader=lambda _d: None, screen=_screen(),
+        consolidated_loader=lambda d: late_only if d == "2026-09-18" else cons[d],
+        decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(reconstruct_consolidated=True),
+        consolidated_symbol_days=frozenset({("2026-09-18", "005930")}),
+    )
+    assert len(result.panel) == 0
+    assert result.exclusions.iloc[0]["reason"] == "consolidated_missing"
+
+    phantom = pd.DataFrame([
+        {**_cons_bar("005930", 90100, 10000, 10050, 9950, 10010, 0, trade=False)},
+        {**_cons_bar("005930", 152000, 10000, 10050, 9950, 10010, 0, trade=False)},
+    ])
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+        live_loader=lambda _d: None, screen=_screen(),
+        consolidated_loader=lambda d: phantom if d == "2026-09-18" else cons[d],
+        decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(reconstruct_consolidated=True),
+    )
+    assert len(result.panel) == 0
+    assert result.exclusions.iloc[0]["reason"] == "no_bars_before_cutoff"
+
+    corrupt = _recon_cons_day("005930", 10000.0).astype({"close": object})
+    corrupt.loc[:, "close"] = float("nan")
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+        live_loader=lambda _d: None, screen=_screen(),
+        consolidated_loader=lambda d: corrupt if d == "2026-09-18" else cons[d],
+        decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(reconstruct_consolidated=True),
+    )
+    assert len(result.panel) == 0
+    assert result.exclusions.iloc[0]["reason"] == "invalid_price"
+
+
+def test_recon_merges_exact_and_reconstructed_exclusions() -> None:
+    ph, cons = _recon_inputs(symbols=("005930", "000660"), opens=(10000.0, 50000.0))
+    exact = pd.DataFrame([_bar("005930", 90000, 10030, 10080, 9980, 10040, 100, "dummy")])
+    phantom = pd.DataFrame([
+        {**_cons_bar("000660", 90100, 50000, 50050, 49950, 50010, 0, trade=False)},
+        {**_cons_bar("000660", 152000, 50000, 50050, 49950, 50010, 0, trade=False)},
+    ])
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: exact,
+        live_loader=lambda _d: None, screen=_screen(),
+        consolidated_loader=lambda d: phantom if d == "2026-09-18" else cons[d],
+        decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(reconstruct_consolidated=True),
+    )
+    assert len(result.panel) == 0
+    by_symbol = {r["symbol"]: r["reason"] for _, r in result.exclusions.iterrows()}
+    assert by_symbol["005930"] == "unknown_bar_stamp"
+    assert by_symbol["000660"] == "no_bars_before_cutoff"
+
+
+def test_recon_stamps_live_days_as_exact() -> None:
+    ph, cons = _recon_inputs()
+    live = pd.DataFrame([_live_row("005930", o=10000, h=10100, l=9900, c=10020, prev=9800)])
+    result = build_pit1520_panel(
+        price_history=ph, dates=["2026-09-18"], bars_loader=lambda _d: _empty_bars(),
+        live_loader=lambda _d: (live, "run-1"), screen=_screen(),
+        consolidated_loader=lambda d: cons[d], decomposition_config=_recon_decomp_config(),
+        config=Pit1520PanelConfig(reconstruct_consolidated=True),
+    )
+    assert list(result.panel.columns) == list(PIT1520_RECON_COLUMNS)
+    assert str(result.panel.iloc[0]["basis"]) == BASIS_EXACT
+
+
+def test_load_consolidated_bars_missing_vs_unreadable(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("src.settings.HISTORY_DIR", str(tmp_path))
+    from src.data.intraday_store import intraday_partition_path
+
+    target = intraday_partition_path(1, "2026-09-18", "regular_consolidated")
+    empty = load_consolidated_bars("2026-09-18")
+    assert len(empty) == 0
+    assert list(empty.columns) == ["symbol", "ts_hms", "open", "high", "low", "close", "volume",
+                                   "value_krw", "has_trade", "vendor"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"not a parquet file")
+    with pytest.raises(OSError, match="Cannot read intraday partition evidence"):
+        load_consolidated_bars("2026-09-18")
+
+
+def test_load_consolidated_bars_reads_partition_with_pushdown(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("src.settings.HISTORY_DIR", str(tmp_path))
+    from src.data.intraday_store import intraday_partition_path
+
+    target = intraday_partition_path(1, "2026-09-18", "regular_consolidated")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([
+        _cons_bar("005930", 90100, 10000, 10050, 9950, 10010, 100),
+        _cons_bar("005930", 152000, 10000, 10050, 9950, 10010, 150),
+        _cons_bar("005930", 153000, 10000, 10050, 9950, 10010, 500),
+    ]).to_parquet(target, index=False)
+    loaded = load_consolidated_bars("2026-09-18")
+    assert set(loaded["ts_hms"].tolist()) == {90100, 152000}
+    empty_part = target.parent / "2026-09-19.parquet"
+    pd.DataFrame([{
+        "symbol": "005930", "ts_hms": 90000, "open": 1.0, "high": 1.0, "low": 1.0,
+        "close": 1.0, "volume": 0.0, "value_krw": 0.0, "has_trade": False, "vendor": "toss",
+    }]).iloc[0:0].to_parquet(empty_part, index=False)
+    assert len(load_consolidated_bars("2026-09-19")) == 0
+
+
+def test_known_consolidated_symbol_days_tolerant_reader(monkeypatch, tmp_path) -> None:
+    from src.data.capture_contracts import CaptureStatus
+
+    assert known_consolidated_symbol_days(tmp_path / "absent.parquet") == frozenset()
+    broken = tmp_path / "broken.parquet"
+    broken.write_bytes(b"not a parquet file")
+    assert known_consolidated_symbol_days(broken) == frozenset()
+    wrong_cols = tmp_path / "wrong.parquet"
+    pd.DataFrame([{"a": 1}]).to_parquet(wrong_cols, index=False)
+    assert known_consolidated_symbol_days(wrong_cols) == frozenset()
+    no_hits = tmp_path / "no_hits.parquet"
+    pd.DataFrame([
+        {"snapshot_date": "2026-09-18", "session": "regular", "symbol": "005930",
+         "status": "OK", "reason": ""},
+    ]).to_parquet(no_hits, index=False)
+    assert known_consolidated_symbol_days(no_hits) == frozenset()
+    ledger = tmp_path / "toss_regular.parquet"
+    pd.DataFrame([
+        {"snapshot_date": "2026-09-18", "session": "regular", "symbol": "5930",
+         "status": CaptureStatus.NOT_APPLICABLE.value, "reason": "toss_consolidated_tape"},
+        {"snapshot_date": "2026-09-18", "session": "regular", "symbol": "005930",
+         "status": "OK", "reason": ""},
+        {"snapshot_date": "2026-09-18", "session": "regular_consolidated", "symbol": "000660",
+         "status": CaptureStatus.NOT_APPLICABLE.value, "reason": "toss_consolidated_tape"},
+        {"snapshot_date": "not-a-date", "session": "regular", "symbol": "000660",
+         "status": CaptureStatus.NOT_APPLICABLE.value, "reason": "toss_consolidated_tape"},
+    ]).to_parquet(ledger, index=False)
+    assert known_consolidated_symbol_days(ledger) == frozenset({("2026-09-18", "005930")})
+    monkeypatch.setattr("src.settings.HISTORY_DIR", str(tmp_path))
+    assert default_decomposition_config_path() == Path(str(tmp_path)) / "nxt_decomposition_config.json"
+
+
+def test_main_builds_reconstructed_panel_to_out_dir(monkeypatch, tmp_path) -> None:
+    from src.data.nxt_decomposition import save_decomposition_config
+    from src.data.pit1520_panel import main
+
+    ph_path = tmp_path / "price_history.parquet"
+    _raw_price_history_frame().to_parquet(ph_path, index=False)
+    monkeypatch.setattr("src.settings.PRICE_HISTORY_PARQUET_PATH", ph_path)
+    monkeypatch.setattr("src.settings.HISTORY_DIR", str(tmp_path))
+    for day in ("2026-09-17", "2026-09-18"):
+        part = tmp_path / "intraday" / "1m" / "regular_consolidated" / "2026-09" / f"{day}.parquet"
+        part.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([
+            _cons_bar("005930", 90100, 10050, 10100, 10000, 10050, 600.0),
+            _cons_bar("005930", 152000, 10050, 10100, 10000, 10050, 600.0),
+        ]).to_parquet(part, index=False)
+    cfg_path = tmp_path / "nxt_decomposition_config.json"
+    save_decomposition_config(_recon_decomp_config(min_prior_days=1), cfg_path)
+    out = tmp_path / "out"
+    main(["--reconstruct-consolidated", "--decomposition-config", str(cfg_path), "--out-dir", str(out)])
+    got = pd.read_parquet(out / "pit1520_panel.parquet")
+    assert list(got.columns) == list(PIT1520_RECON_COLUMNS)
+    assert len(got) == 1
+    assert str(got.iloc[0]["symbol"]) == "005930"
+    assert str(got.iloc[0]["bars_vendor"]) == RECON_TOSS_VENDOR
+    assert str(got.iloc[0]["basis"]) == BASIS_RECONSTRUCTED
+    by_key = {(str(r["date"])[:10], str(r["symbol"])): r["reason"] for _, r in
+              pd.read_parquet(out / "pit1520_panel_exclusions.parquet").iterrows()}
+    assert by_key[("2026-09-17", "005930")] == "share_unavailable"
+
+
 def test_default_panel_paths_under_history_dir(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("src.settings.HISTORY_DIR", str(tmp_path))
     panel, exclusions, days = default_panel_paths()
     assert panel == Path(str(tmp_path)) / "pit1520_panel.parquet"
     assert exclusions == Path(str(tmp_path)) / "pit1520_panel_exclusions.parquet"
     assert days == Path(str(tmp_path)) / "pit1520_panel_days.parquet"
+
+
+def test_recon_rejects_mixed_vendor_consolidated_bars_and_honours_vendor_exclusion() -> None:
+    """Consolidated bars with a foreign vendor tag are never relabelled; excluding toss drops reconstructed rows."""
+    ph, cons = _recon_inputs(symbols=("000660",), opens=(50000.0,))
+    mixed = {day: frame.copy() for day, frame in cons.items()}
+    day = "2026-09-18"
+    mixed[day].loc[mixed[day].index[:1], "vendor"] = "ls"
+
+    def _build(cons_by_day, **config_kwargs):
+        return build_pit1520_panel(
+            price_history=ph, dates=[day], bars_loader=lambda _d: _empty_bars(),
+            live_loader=lambda _d: None, screen=_screen(),
+            consolidated_loader=lambda d: cons_by_day[d], decomposition_config=_recon_decomp_config(),
+            config=Pit1520PanelConfig(reconstruct_consolidated=True, **config_kwargs),
+        )
+
+    result = _build(mixed)
+    assert "000660" not in set(result.panel["symbol"])
+    reasons = dict(zip(result.exclusions["symbol"], result.exclusions["reason"], strict=True))
+    assert reasons["000660"] == "mixed_vendor"
+    assert "000660" in set(_build(cons).panel["symbol"])
+    excluded = _build(cons, excluded_bar_vendors=frozenset({"toss"}))
+    assert "000660" not in set(excluded.panel["symbol"])
+    assert dict(zip(excluded.exclusions["symbol"], excluded.exclusions["reason"], strict=True))["000660"] == "vendor_excluded"

@@ -235,3 +235,108 @@ def test_pit_report_refuses_partial_persistence(tmp_path) -> None:
     object.__setattr__(partial2, "rank_ic_mean", None)
     with pytest.raises(ValueError, match="unpopulated"):
         save_pit_haircut_report(partial2, _daily(), out_dir=tmp_path)
+
+
+def _recon_cert(**overrides):
+    from src.ml.pit_report import CalibrationStability, ReconstructionCertification
+
+    base: dict = {
+        "generated_at": "2026-10-05T00:00:00+09:00",
+        "exact_dir": "exact",
+        "recon_dir": "recon",
+        "paired_days": ("2026-03-02", "2026-03-03"),
+        "dropped_days": ("2026-03-04",),
+        "coverage_improvement": PairedDelta(delta=4.0, ci_low=2.0, ci_high=6.0, p_value=0.001, n_days=60),
+        "reconstruction_feature": PairedDelta(delta=0.2, ci_low=-1.0, ci_high=1.4, p_value=0.6, n_days=60),
+        "stability": CalibrationStability(passed=True, median_rel_err=0.03, n_scored=40, detail=""),
+        "coverage_by_year_and_basis": {"exact": {"2026": {"live_1520": 0.95}}},
+        "gate_verdict": "ADOPT",
+        "gate_reasons": (),
+    }
+    base.update(overrides)
+    return ReconstructionCertification(**base)
+
+
+def test_reconstruction_certification_round_trip(tmp_path) -> None:
+    import pytest
+
+    from src.ml.pit_report import (
+        RECONSTRUCTION_CERTIFICATION_FILENAME,
+        load_reconstruction_certification,
+        save_reconstruction_certification,
+    )
+
+    cert = _recon_cert()
+    path = save_reconstruction_certification(cert, out_path=tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    assert path.exists()
+    loaded = load_reconstruction_certification(path)
+    assert loaded == cert
+    assert loaded.stability is not None and loaded.stability.passed is True
+
+    with pytest.raises(FileNotFoundError, match="not found"):
+        load_reconstruction_certification(tmp_path / "absent.json")
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        load_reconstruction_certification(bad)
+    bad.write_text("[1, 2]", encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON object"):
+        load_reconstruction_certification(bad)
+
+
+def test_reconstruction_certification_rejects_malformed_payloads(tmp_path) -> None:
+    import dataclasses
+    import json as json_lib
+
+    import pytest
+
+    from src.ml.pit_report import (
+        RECONSTRUCTION_CERTIFICATION_FILENAME,
+        load_reconstruction_certification,
+        save_reconstruction_certification,
+    )
+
+    def _write(payload) -> None:
+        (tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME).write_text(
+            json_lib.dumps(payload), encoding="utf-8")
+
+    def _payload(cert) -> dict:
+        save_reconstruction_certification(cert, out_path=tmp_path / "ok.json")
+        return json_lib.loads((tmp_path / "ok.json").read_text(encoding="utf-8"))
+
+    base = _payload(_recon_cert())
+    _write(dict(base, extra=1))
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, schema_version=99))
+    with pytest.raises(ValueError, match="schema_version"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    slim = {k: v for k, v in base.items() if k != "gate_verdict"}
+    _write(slim)
+    with pytest.raises(ValueError, match="missing keys"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, paired_days="2026-03-02"))
+    with pytest.raises(ValueError, match="must be a sequence"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, coverage_by_year_and_basis=[]))
+    with pytest.raises(ValueError, match="must be a mapping"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, gate_verdict="MAYBE"))
+    with pytest.raises(ValueError, match="gate_verdict"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, stability={"passed": True, "bogus": 1}))
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, stability="yes"))
+    with pytest.raises(ValueError, match="mapping or null"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    nulled = dict(base, stability=None)
+    _write(nulled)
+    assert load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME).stability is None
+
+    with pytest.raises(ValueError, match="unpopulated"):
+        save_reconstruction_certification(
+            dataclasses.replace(_recon_cert(), coverage_improvement=None), out_path=tmp_path / "x.json")
+    with pytest.raises(ValueError, match="unpopulated"):
+        save_reconstruction_certification(
+            dataclasses.replace(_recon_cert(), coverage_by_year_and_basis=None), out_path=tmp_path / "y.json")

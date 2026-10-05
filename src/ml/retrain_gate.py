@@ -10,17 +10,25 @@ it does not re-certify alpha (that remains the manual CPCV certification).
 from __future__ import annotations
 
 import enum
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
-from src.ml.pit_report import PitHaircutReport
+from src.ml.pit_report import (
+    RECON_ARM_DIRNAME,
+    RECONSTRUCTION_CERTIFICATION_FILENAME,
+    PitHaircutReport,
+    load_pit_haircut_report,
+    load_reconstruction_certification,
+)
 from src.ml.topk_contract import (
     assert_bundle_screen_parity,
     bundle_feature_contract_version,
@@ -39,6 +47,8 @@ MIN_NAMES_PER_EVAL_DAY: int = 4
 BUNDLE_FILENAME: str = "sizing_pipeline_bundle.joblib"
 
 _KST = ZoneInfo("Asia/Seoul")
+
+logger = logging.getLogger(__name__)
 
 
 class PitGateMode(enum.StrEnum):
@@ -162,12 +172,18 @@ def evaluate_pit_gate(
     *,
     config: PitGateConfig,
     now: datetime,
+    recon_report: PitHaircutReport | None = None,
+    recon_adopted: bool = False,
+    recon_detail: str = "",
 ) -> tuple[str, tuple[str, ...]]:
     """Judge whether the decision-time evidence supports the candidate's configuration.
 
     The report certifies CPCV fold models, not the weekly candidate itself (scoring the candidate on panel
     days would be in-sample); it is therefore accepted only when it was produced recently for the same
     strategy, screen, feature contract, model parameters and seeds as the candidate.
+
+    The arm-2 reconstruction report is consumed only when the three-arm certification adopted it;
+    otherwise the arm-1 report is scored and the fallback is named in the reasons.
 
     Returns:
         (status, reasons): OFF when config.mode is OFF; MISSING without a report; MALFORMED when generated_at
@@ -176,6 +192,97 @@ def evaluate_pit_gate(
         select_universe, feature contract version, model_params, seeds); INSUFFICIENT when the report status
         is not OK; FAIL naming each violated threshold; PASS otherwise.
     """
+    selected, note = select_pit_report(
+        report, recon_report=recon_report, recon_adopted=recon_adopted, recon_detail=recon_detail
+    )
+    status, reasons = _evaluate_selected_pit_gate(selected, candidate, config=config, now=now)
+    if note and status != "OFF":
+        reasons = (note, *reasons)
+    return status, reasons
+
+
+def select_pit_report(
+    report_arm1: PitHaircutReport | None,
+    *,
+    recon_report: PitHaircutReport | None = None,
+    recon_adopted: bool = False,
+    recon_detail: str = "",
+) -> tuple[PitHaircutReport | None, str]:
+    """Choose the arm the PIT criterion scores, naming the selection for the reasons.
+
+    The arm-2 report scores only when the reconstruction verdict is ADOPT and the report itself is
+    usable; a missing, malformed or REJECT reconstruction report falls back to arm 1, so it can never
+    improve a candidate's PIT status beyond the arm-1 evidence.
+
+    Returns:
+        (report, note): The report to score and the selection note (empty when no reconstruction
+        evidence was offered).
+    """
+    detail = str(recon_detail or "").strip()
+    if bool(recon_adopted):
+        if isinstance(recon_report, PitHaircutReport) and str(recon_report.status) == "OK":
+            suffix = f": {detail}" if detail else ""
+            return recon_report, f"pit report arm-2 adopted for scoring{suffix}"
+        why = detail or "arm-2 report missing or unusable"
+        return report_arm1, f"pit report arm-1 fallback ({why})"
+    if recon_report is not None or detail:
+        why = detail or "reconstruction verdict not ADOPT"
+        return report_arm1, f"pit report arm-1 fallback ({why})"
+    return report_arm1, ""
+
+
+def load_recon_pit_selection(live_dir: Path | str) -> tuple[PitHaircutReport | None, bool, str]:
+    """Load the reconstruction adoption evidence beside the live bundle, tolerantly.
+
+    Returns:
+        (arm-2 report or None, adopted, detail). Absent files yield (None, False, ""); an unreadable
+        certification or arm-2 report yields (None, False, reason) so the gate falls back to arm 1.
+    """
+    base = Path(live_dir)
+    cert_path = base / RECONSTRUCTION_CERTIFICATION_FILENAME
+    if not cert_path.exists():
+        return None, False, ""
+    try:
+        cert = load_reconstruction_certification(cert_path)
+    except Exception as exc:  # noqa: BLE001 - any parse failure must fall back to arm 1, never stop the weekly retrain
+        logger.warning(
+            "[EVAL] stage=pit_gate status=RECON_CERTIFICATION_UNREADABLE reason=%s", type(exc).__name__
+        )
+        return None, False, f"reconstruction certification unreadable ({type(exc).__name__})"
+    improvement = cert.coverage_improvement
+    stability = cert.stability
+    consistent = (
+        not cert.gate_reasons
+        and stability is not None
+        and stability.passed is True
+        and improvement is not None
+        and bool(np.isfinite(improvement.ci_low))
+        and improvement.ci_low > 0.0
+    )
+    adopted = str(cert.gate_verdict) == "ADOPT"
+    if adopted and not consistent:
+        return None, False, "reconstruction certification ADOPT contradicts its own evidence"
+    detail = "; ".join(cert.gate_reasons) if cert.gate_reasons else f"verdict {cert.gate_verdict}"
+    if not adopted:
+        return None, False, detail
+    try:
+        arm2 = load_pit_haircut_report(base / RECON_ARM_DIRNAME)
+    except ValueError as exc:
+        logger.warning("[EVAL] stage=pit_gate status=RECON_REPORT_UNREADABLE reason=%s", type(exc).__name__)
+        return None, False, f"arm-2 report unreadable ({type(exc).__name__})"
+    if arm2 is None:
+        return None, False, "arm-2 report missing"
+    return arm2, True, detail
+
+
+def _evaluate_selected_pit_gate(
+    report: PitHaircutReport | None,
+    candidate: Mapping[str, Any],
+    *,
+    config: PitGateConfig,
+    now: datetime,
+) -> tuple[str, tuple[str, ...]]:
+    """Score one selected arm report against the candidate (no arm selection here)."""
     if config.mode == PitGateMode.OFF:
         return "OFF", ()
     if now.tzinfo is None:
@@ -257,6 +364,9 @@ def evaluate_retrain_promotion(
     date_col: str = "date",
     pit_report: PitHaircutReport | None = None,
     pit_gate: PitGateConfig = PitGateConfig(),  # noqa: B008
+    pit_recon_report: PitHaircutReport | None = None,
+    pit_recon_adopted: bool = False,
+    pit_recon_detail: str = "",
     now: datetime | None = None,
 ) -> PromotionVerdict:
     """Decide whether a retrained candidate may replace the live bundle.
@@ -273,13 +383,24 @@ def evaluate_retrain_promotion(
         date_col: Date column in eval_frame.
         pit_report: Latest pit_haircut report, or None.
         pit_gate: PIT criterion configuration; the default (OFF) reproduces the legacy verdict exactly.
+        pit_recon_report: Arm-2 reconstruction report; scored only when pit_recon_adopted is True.
+        pit_recon_adopted: Three-arm adoption verdict for the reconstruction.
+        pit_recon_detail: Verdict detail named in the reasons on fallback.
         now: Aware clock for report staleness; None uses Asia/Seoul now.
 
     Returns:
         PromotionVerdict with the blocking reasons, if any.
     """
     eff_now = now if now is not None else datetime.now(_KST)
-    pit_status, pit_reasons = evaluate_pit_gate(pit_report, candidate, config=pit_gate, now=eff_now)
+    pit_status, pit_reasons = evaluate_pit_gate(
+        pit_report,
+        candidate,
+        config=pit_gate,
+        now=eff_now,
+        recon_report=pit_recon_report,
+        recon_adopted=pit_recon_adopted,
+        recon_detail=pit_recon_detail,
+    )
 
     def _verdict(promote: bool, reasons: tuple[str, ...], agreement: float | None) -> PromotionVerdict:
         if pit_gate.mode == PitGateMode.ENFORCE and pit_status != "PASS":

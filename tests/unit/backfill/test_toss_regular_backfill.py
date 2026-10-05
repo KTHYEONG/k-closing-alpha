@@ -943,3 +943,24 @@ def test_consolidated_plan_only_counts_and_estimates(cli_env, capsys) -> None:
     assert trb.main(["--as-of", "2026-03-10", "--consolidated", "--plan-only"]) == 0
     out = capsys.readouterr().out
     assert "planned_symbol_days=0" in out
+
+
+def test_consolidated_replan_retries_failed_rows_but_not_terminal_ones(env) -> None:
+    """A non-terminal FAILED consolidated row is replanned; a terminal row is never replanned."""
+    _profile, _store, ledger = env
+    _seed_regular_consolidated_ledger(ledger, _DAY1, ("000005", "000006"))
+    ledger.record(
+        _DAY1, "regular_consolidated",
+        [_failed_entry("000005", "transport:boom")], run_id="r1", attempted_at=_FIXED_NOW, vendor="toss",
+    )
+    from src.data.capture_contracts import ArtifactRef, CoverageEntry
+
+    done = CoverageEntry(
+        symbol="000006", dataset=CaptureDataset.MINUTE_BARS, venue="KRX", session="regular_consolidated",
+        scheduled_at=None, status=CaptureStatus.NOT_APPLICABLE, rows=0,
+        first_event_time=None, last_event_time=None, reason="toss_consolidated_tape",
+        raw_refs=(ArtifactRef(path="raw/000006.json.gz", sha256="c" * 64, bytes=8, rows=0),),
+    )
+    ledger.record(_DAY1, "regular_consolidated", [done], run_id="r2", attempted_at=_FIXED_NOW, vendor="toss")
+    plan = trb.enumerate_toss_consolidated_tasks(ledger=ledger)
+    assert {t.snapshot_date: t.symbols for t in plan.tasks} == {_DAY1: ("000005",)}
