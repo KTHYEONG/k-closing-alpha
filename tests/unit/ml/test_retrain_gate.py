@@ -748,40 +748,105 @@ def test_pit_gate_max_haircut_ceiling() -> None:
     assert under.promote is True
 
 
-def _recon_cert_payload(*, verdict="ADOPT", reasons=()):
+def _recon_cert_payload(*, verdict="ADOPT", reasons=(), bindings=None, generated_at="2026-10-05T00:00:00+09:00", **overrides):
     from src.ml.pit_report import CalibrationStability, PairedDelta, ReconstructionCertification
 
-    return ReconstructionCertification(
-        generated_at="2026-10-05T00:00:00+09:00",
-        exact_dir="exact",
-        recon_dir="recon",
-        paired_days=("2026-03-02",),
-        dropped_days=(),
-        coverage_improvement=PairedDelta(delta=4.0, ci_low=2.0, ci_high=6.0, p_value=0.001, n_days=60),
-        reconstruction_feature=PairedDelta(delta=0.2, ci_low=-1.0, ci_high=1.4, p_value=0.6, n_days=60),
-        stability=CalibrationStability(passed=True, median_rel_err=0.03, n_scored=40, detail=""),
-        coverage_by_year_and_basis={},
-        gate_verdict=verdict,
-        gate_reasons=tuple(reasons),
-    )
+    base: dict = {
+        "generated_at": generated_at,
+        "exact_dir": "exact",
+        "recon_dir": "recon",
+        "paired_days": ("2026-03-02",),
+        "dropped_days": (),
+        "coverage_improvement": PairedDelta(delta=4.0, ci_low=2.0, ci_high=6.0, p_value=0.001, n_days=60),
+        "reconstruction_feature": PairedDelta(delta=0.2, ci_low=-1.0, ci_high=1.4, p_value=0.6, n_days=60),
+        "stability": CalibrationStability(
+            passed=True, rel_err_p90=0.10, coverage=0.80, bias_drift=0.01,
+            alpha_at_boundary=False, n_holdout_rows=40, detail="",
+        ),
+        "coverage_by_year_and_basis": {},
+        "bindings": bindings,
+        "fidelity": {
+            "chg_rank_correlation": 0.99,
+            "tv_rank_correlation": 0.98,
+            "top_k_overlap": 0.97,
+            "n_paired_days": 60.0,
+            "n_symbol_days": 600.0,
+            "n_no_share": 2.0,
+        },
+        "holdout_start": "2026-08-25",
+        "holdout_end": "2026-08-31",
+        "gate_config": {"feature_margin_bp": 5.0},
+        "gate_verdict": verdict,
+        "gate_reasons": tuple(reasons),
+    }
+    base.update(overrides)
+    return ReconstructionCertification(**base)
 
 
-def _stage_recon_selection(live_dir, *, verdict="ADOPT", reasons=(), arm2=True, corrupt=None):
+def _write_config_file(path, content=b'{"ewma_alpha": 0.5}'):
+    path.write_bytes(content)
+    return path
+
+
+def _stage_recon_selection(
+    live_dir, *, config_path, arm1_report=None, arm2_report=None, verdict="ADOPT", reasons=(),
+    arm2=True, corrupt=None, generated_at=None,
+):
+    import hashlib
+
     import pandas as pd
 
-    from src.ml.pit_report import RECON_ARM_DIRNAME, save_pit_haircut_report, save_reconstruction_certification
+    from src.ml.pit_report import (
+        RECON_ARM_DIRNAME,
+        CertificationBindings,
+        save_pit_haircut_report,
+        save_reconstruction_certification,
+    )
 
     live_dir.mkdir(parents=True, exist_ok=True)
-    save_reconstruction_certification(_recon_cert_payload(verdict=verdict, reasons=reasons), out_path=live_dir / "reconstruction_certification.json")
-    if corrupt == "cert":
-        (live_dir / "reconstruction_certification.json").write_text("{bad", encoding="utf-8")
+    if generated_at is None:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        generated_at = (datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(seconds=1)).isoformat()
+    eff_arm2 = arm2_report if arm2_report is not None else _pit_report(native_mean=9.0)
+    arm_dir = live_dir / RECON_ARM_DIRNAME
     if arm2:
-        arm_dir = live_dir / RECON_ARM_DIRNAME
         arm_dir.mkdir(exist_ok=True)
         if corrupt == "arm2":
             (arm_dir / "pit_haircut_report.json").write_text("{bad", encoding="utf-8")
+            arm2_sha = "e" * 64
         else:
-            save_pit_haircut_report(_pit_report(native_mean=9.0), pd.DataFrame({"date": []}), out_dir=arm_dir)
+            save_pit_haircut_report(eff_arm2, pd.DataFrame({"date": []}), out_dir=arm_dir)
+            arm2_sha = hashlib.sha256((arm_dir / "pit_haircut_report.json").read_bytes()).hexdigest()
+    else:
+        arm2_sha = "e" * 64
+    config_sha = hashlib.sha256(bytes(config_path.read_bytes())).hexdigest() if config_path.exists() else "a" * 64
+    bindings = CertificationBindings(
+        decomposition_config_sha256=config_sha,
+        calibration_table_sha256="b" * 64,
+        exact_report_sha256="c" * 64,
+        recon_report_sha256=arm2_sha,
+    )
+    save_reconstruction_certification(
+        _recon_cert_payload(verdict=verdict, reasons=reasons, bindings=bindings, generated_at=generated_at),
+        out_path=live_dir / "reconstruction_certification.json",
+    )
+    if corrupt == "cert":
+        (live_dir / "reconstruction_certification.json").write_text("{bad", encoding="utf-8")
+    return bindings
+
+
+def _loader_kwargs(live_dir, config_path, arm1_report, max_age_days=14):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    return {
+        "arm1_report": arm1_report,
+        "decomposition_config_path": config_path,
+        "now": datetime.now(ZoneInfo("Asia/Seoul")),
+        "max_age_days": max_age_days,
+    }
 
 
 def test_select_pit_report_consumes_arm2_only_on_adopt() -> None:
@@ -790,64 +855,77 @@ def test_select_pit_report_consumes_arm2_only_on_adopt() -> None:
     arm1 = _pit_report(native_mean=-5.0, native_ic=-0.01)
     arm2 = _pit_report(native_mean=9.0, native_ic=0.05)
 
-    selected, note = retrain_gate.select_pit_report(arm1)
-    assert selected is arm1 and note == ""
+    selected, note, pit_arm = retrain_gate.select_pit_report(arm1)
+    assert selected is arm1 and note == "" and pit_arm == "arm1"
 
-    selected, note = retrain_gate.select_pit_report(
+    selected, note, pit_arm = retrain_gate.select_pit_report(
         arm1, recon_report=arm2, recon_adopted=True, recon_detail="verdict ADOPT")
-    assert selected is arm2 and "arm-2" in note
+    assert selected is arm2 and "arm-2" in note and pit_arm == "arm2"
 
-    selected, note = retrain_gate.select_pit_report(arm1, recon_report=None, recon_adopted=True)
-    assert selected is arm1 and "fallback" in note
+    selected, note, pit_arm = retrain_gate.select_pit_report(arm1, recon_report=None, recon_adopted=True)
+    assert selected is arm1 and "fallback" in note and pit_arm == "arm1"
 
-    selected, note = retrain_gate.select_pit_report(
+    selected, note, pit_arm = retrain_gate.select_pit_report(
         arm1, recon_report={"not": "a report"}, recon_adopted=True)  # type: ignore[arg-type]
-    assert selected is arm1 and "fallback" in note
+    assert selected is arm1 and "fallback" in note and pit_arm == "arm1"
 
     weak = _pit_report(native_mean=9.0, status="INSUFFICIENT_DAYS")
-    selected, note = retrain_gate.select_pit_report(arm1, recon_report=weak, recon_adopted=True)
-    assert selected is arm1 and "fallback" in note
+    selected, note, pit_arm = retrain_gate.select_pit_report(arm1, recon_report=weak, recon_adopted=True)
+    assert selected is arm1 and "fallback" in note and pit_arm == "arm1"
 
-    selected, note = retrain_gate.select_pit_report(
+    selected, note, pit_arm = retrain_gate.select_pit_report(
         arm1, recon_report=arm2, recon_adopted=False, recon_detail="REJECT: feature")
-    assert selected is arm1 and "fallback" in note and "REJECT" in note
+    assert selected is arm1 and "fallback" in note and "REJECT" in note and pit_arm == "arm1"
 
-    selected, note = retrain_gate.select_pit_report(arm1, recon_report=arm2, recon_adopted=False)
-    assert selected is arm1 and "fallback" in note
+    selected, note, pit_arm = retrain_gate.select_pit_report(arm1, recon_report=arm2, recon_adopted=False)
+    assert selected is arm1 and "fallback" in note and pit_arm == "arm1"
+
+    selected, note, pit_arm = retrain_gate.select_pit_report(None)
+    assert selected is None and pit_arm == "none"
 
 
 def test_recon_selection_never_improves_on_reject_or_damage(tmp_path) -> None:
     from src.ml import retrain_gate
 
-    assert retrain_gate.load_recon_pit_selection(tmp_path / "absent") == (None, False, "")
+    arm1 = _pit_report(native_mean=9.0, native_ic=0.05)
+    cfg = tmp_path / "decomp.json"
+    _write_config_file(cfg)
+    assert retrain_gate.load_recon_pit_selection(
+        tmp_path / "absent", **_loader_kwargs(tmp_path / "absent", cfg, arm1)
+    ) == (None, False, "")
 
     live = tmp_path / "live"
-    _stage_recon_selection(live, verdict="REJECT", reasons=("feature significant",))
-    report, adopted, detail = retrain_gate.load_recon_pit_selection(live)
+    _stage_recon_selection(live, config_path=cfg, verdict="REJECT", reasons=("feature significant",))
+    report, adopted, detail = retrain_gate.load_recon_pit_selection(
+        live, **_loader_kwargs(live, cfg, arm1))
     assert (report, adopted) == (None, False)
     assert "feature significant" in detail
 
     damaged = tmp_path / "damaged"
-    _stage_recon_selection(damaged, corrupt="cert")
-    report, adopted, detail = retrain_gate.load_recon_pit_selection(damaged)
+    _stage_recon_selection(damaged, config_path=cfg, corrupt="cert")
+    report, adopted, detail = retrain_gate.load_recon_pit_selection(
+        damaged, **_loader_kwargs(damaged, cfg, arm1))
     assert (report, adopted) == (None, False)
     assert "unreadable" in detail
 
     no_arm2 = tmp_path / "no_arm2"
-    _stage_recon_selection(no_arm2, arm2=False)
-    report, adopted, detail = retrain_gate.load_recon_pit_selection(no_arm2)
+    _stage_recon_selection(no_arm2, config_path=cfg, arm2=False)
+    report, adopted, detail = retrain_gate.load_recon_pit_selection(
+        no_arm2, **_loader_kwargs(no_arm2, cfg, arm1))
     assert (report, adopted) == (None, False)
     assert "missing" in detail
 
     bad_arm2 = tmp_path / "bad_arm2"
-    _stage_recon_selection(bad_arm2, corrupt="arm2")
-    report, adopted, detail = retrain_gate.load_recon_pit_selection(bad_arm2)
+    _stage_recon_selection(bad_arm2, config_path=cfg, corrupt="arm2")
+    report, adopted, detail = retrain_gate.load_recon_pit_selection(
+        bad_arm2, **_loader_kwargs(bad_arm2, cfg, arm1))
     assert (report, adopted) == (None, False)
-    assert "unreadable" in detail
+    assert "binding mismatch" in detail or "unreadable" in detail or "missing" in detail
 
     good = tmp_path / "good"
-    _stage_recon_selection(good)
-    report, adopted, detail = retrain_gate.load_recon_pit_selection(good)
+    _stage_recon_selection(good, config_path=cfg, arm2_report=_pit_report(native_mean=9.0, native_ic=0.05))
+    report, adopted, detail = retrain_gate.load_recon_pit_selection(
+        good, **_loader_kwargs(good, cfg, _pit_report(native_mean=9.0, native_ic=0.05)))
     assert adopted is True and report is not None
     assert float(report.mean_net_bp["pit_native"]) == 9.0
 
@@ -893,11 +971,24 @@ def test_adopt_verdict_contradicting_its_own_evidence_is_not_trusted(tmp_path) -
     from src.ml import retrain_gate
     from src.ml.pit_report import CalibrationStability, PairedDelta, save_reconstruction_certification
 
-    base = _recon_cert_payload()
+    from src.ml.pit_report import CertificationBindings
+
+    cfg = tmp_path / "decomp.json"
+    _write_config_file(cfg)
+    arm1 = _pit_report(native_mean=9.0, native_ic=0.05)
+    dummy = CertificationBindings(
+        decomposition_config_sha256="a" * 64, calibration_table_sha256="b" * 64,
+        exact_report_sha256="c" * 64, recon_report_sha256="d" * 64,
+    )
+    base = _recon_cert_payload(bindings=dummy)
     variants = {
         "reasons": dataclasses.replace(base, gate_reasons=("coverage not improved",)),
         "stability": dataclasses.replace(
-            base, stability=CalibrationStability(passed=False, median_rel_err=0.3, n_scored=40, detail="")
+            base,
+            stability=CalibrationStability(
+                passed=False, rel_err_p90=0.3, coverage=0.8, bias_drift=0.01,
+                alpha_at_boundary=False, n_holdout_rows=40, detail="",
+            ),
         ),
         "ci_zero": dataclasses.replace(
             base, coverage_improvement=PairedDelta(delta=4.0, ci_low=0.0, ci_high=6.0, p_value=0.2, n_days=60)
@@ -908,22 +999,172 @@ def test_adopt_verdict_contradicting_its_own_evidence_is_not_trusted(tmp_path) -
     }
     for name, cert in variants.items():
         live = tmp_path / name
-        _stage_recon_selection(live)
+        _stage_recon_selection(live, config_path=cfg)
         save_reconstruction_certification(cert, out_path=live / "reconstruction_certification.json")
-        report, adopted, detail = retrain_gate.load_recon_pit_selection(live)
+        report, adopted, detail = retrain_gate.load_recon_pit_selection(
+            live, **_loader_kwargs(live, cfg, arm1))
         assert (report, adopted) == (None, False), name
         assert detail, name
     overflow = tmp_path / "overflow"
-    _stage_recon_selection(overflow)
+    _stage_recon_selection(overflow, config_path=cfg)
     path = overflow / "reconstruction_certification.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["stability"]["n_scored"] = 1e999
+    payload["stability"]["n_holdout_rows"] = 1e999
     path.write_text(json.dumps(payload), encoding="utf-8")
-    assert retrain_gate.load_recon_pit_selection(overflow)[:2] == (None, False)
+    assert retrain_gate.load_recon_pit_selection(
+        overflow, **_loader_kwargs(overflow, cfg, arm1))[:2] == (None, False)
     stringy = tmp_path / "stringy"
-    _stage_recon_selection(stringy)
+    _stage_recon_selection(stringy, config_path=cfg)
     path = stringy / "reconstruction_certification.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["stability"]["passed"] = "false"
     path.write_text(json.dumps(payload), encoding="utf-8")
-    assert retrain_gate.load_recon_pit_selection(stringy)[:2] == (None, False)
+    assert retrain_gate.load_recon_pit_selection(
+        stringy, **_loader_kwargs(stringy, cfg, arm1))[:2] == (None, False)
+
+
+def test_recon_selection_binding_mismatches_fail_closed(tmp_path) -> None:
+    from src.ml import retrain_gate
+
+    cfg = tmp_path / "decomp.json"
+    _write_config_file(cfg, b'{"v": 1}')
+    arm1 = _pit_report(native_mean=9.0, native_ic=0.05)
+    live = tmp_path / "bound"
+    _stage_recon_selection(live, config_path=cfg, arm2_report=arm1)
+    good_kwargs = _loader_kwargs(live, cfg, arm1)
+    assert retrain_gate.load_recon_pit_selection(live, **good_kwargs)[1] is True
+
+    _write_config_file(cfg, b'{"v": 2}')
+    report, adopted, detail = retrain_gate.load_recon_pit_selection(live, **_loader_kwargs(live, cfg, arm1))
+    assert adopted is False and "binding mismatch" in detail
+
+    _write_config_file(cfg, b'{"v": 1}')
+    other_arm1 = _pit_report(native_mean=9.0, native_ic=0.05, model_params={"n_estimators": 11})
+    report, adopted, detail = retrain_gate.load_recon_pit_selection(live, **_loader_kwargs(live, cfg, other_arm1))
+    assert adopted is False and "identity" in detail
+
+    report, adopted, detail = retrain_gate.load_recon_pit_selection(live, **_loader_kwargs(live, cfg, None))
+    assert adopted is False and "arm-1" in detail
+
+    from datetime import timedelta
+
+    stale_kwargs = dict(_loader_kwargs(live, cfg, arm1))
+    stale_kwargs["now"] = stale_kwargs["now"] + timedelta(days=30)
+    report, adopted, detail = retrain_gate.load_recon_pit_selection(live, **stale_kwargs)
+    assert adopted is False and "stale" in detail
+
+
+def test_recon_adopt_is_recomputed_not_trusted(tmp_path) -> None:
+    import dataclasses
+
+    from src.ml import retrain_gate
+
+    cfg = tmp_path / "decomp.json"
+    _write_config_file(cfg)
+    arm1 = _pit_report(native_mean=9.0, native_ic=0.05)
+    live = tmp_path / "recomputed"
+    _stage_recon_selection(live, config_path=cfg, arm2_report=arm1)
+    from src.ml.pit_report import load_reconstruction_certification
+
+    stored = load_reconstruction_certification(live / "reconstruction_certification.json")
+    weak_fidelity = dict(stored.fidelity or {})
+    weak_fidelity["top_k_overlap"] = 0.50
+    weak = dataclasses.replace(stored, fidelity=weak_fidelity)
+    from src.ml.pit_report import save_reconstruction_certification
+
+    save_reconstruction_certification(weak, out_path=live / "reconstruction_certification.json")
+    report, adopted, detail = retrain_gate.load_recon_pit_selection(
+        live, **_loader_kwargs(live, cfg, arm1))
+    assert adopted is False and "top_k_overlap" in detail
+
+
+def test_recon_selection_loader_fail_closed_branches(tmp_path) -> None:
+    from datetime import datetime
+
+    from src.ml import retrain_gate
+
+    cfg = tmp_path / "decomp.json"
+    _write_config_file(cfg)
+    arm1 = _pit_report(native_mean=9.0, native_ic=0.05)
+    live = tmp_path / "branches"
+    _stage_recon_selection(live, config_path=cfg, arm2_report=arm1)
+    kwargs = _loader_kwargs(live, cfg, arm1)
+    import json as json_lib
+
+    path = live / "reconstruction_certification.json"
+    payload = json_lib.loads(path.read_text(encoding="utf-8"))
+    payload["stability"] = None
+    path.write_text(json_lib.dumps(payload), encoding="utf-8")
+    assert "incomplete" in retrain_gate.load_recon_pit_selection(live, **kwargs)[2]
+
+    _stage_recon_selection(live, config_path=cfg, arm2_report=arm1)
+    path = live / "reconstruction_certification.json"
+    payload = json_lib.loads(path.read_text(encoding="utf-8"))
+    payload["fidelity"]["tv_rank_correlation"] = "bad"
+    path.write_text(json_lib.dumps(payload), encoding="utf-8")
+    assert retrain_gate.load_recon_pit_selection(live, **kwargs)[1] is False
+
+    _stage_recon_selection(live, config_path=cfg, arm2_report=arm1)
+    payload = json_lib.loads(path.read_text(encoding="utf-8"))
+    payload["generated_at"] = "not-a-date"
+    path.write_text(json_lib.dumps(payload), encoding="utf-8")
+    assert "ISO-8601" in retrain_gate.load_recon_pit_selection(live, **kwargs)[2]
+
+    _stage_recon_selection(live, config_path=cfg, arm2_report=arm1)
+    payload = json_lib.loads(path.read_text(encoding="utf-8"))
+    payload["generated_at"] = "2026-10-05T00:00:00"
+    path.write_text(json_lib.dumps(payload), encoding="utf-8")
+    assert "timezone-aware" in retrain_gate.load_recon_pit_selection(live, **kwargs)[2]
+
+    _stage_recon_selection(live, config_path=cfg, arm2_report=arm1)
+    naive_kwargs = dict(kwargs, now=datetime(2026, 10, 5))
+    assert "timezone-aware" in retrain_gate.load_recon_pit_selection(live, **naive_kwargs)[2]
+
+    _stage_recon_selection(live, config_path=cfg, arm2_report=arm1)
+    payload = json_lib.loads(path.read_text(encoding="utf-8"))
+    del payload["bindings"]
+    path.write_text(json_lib.dumps(payload), encoding="utf-8")
+    assert "unreadable" in retrain_gate.load_recon_pit_selection(live, **kwargs)[2]
+
+    _stage_recon_selection(live, config_path=cfg, arm2_report=arm1)
+    missing_cfg = tmp_path / "absent.json"
+    missing_kwargs = dict(kwargs, decomposition_config_path=missing_cfg)
+    assert "unreadable" in retrain_gate.load_recon_pit_selection(live, **missing_kwargs)[2]
+
+    weak_arm2 = _pit_report(native_mean=9.0, status="INSUFFICIENT_DAYS")
+    _stage_recon_selection(live, config_path=cfg, arm2_report=weak_arm2)
+    assert "no usable paired evidence" in retrain_gate.load_recon_pit_selection(live, **kwargs)[2]
+
+    _stage_recon_selection(live, config_path=cfg, arm2_report=arm1, generated_at="2099-01-01T00:00:00+00:00")
+    assert "future" in retrain_gate.load_recon_pit_selection(live, **kwargs)[2]
+
+    for metric, value in (("rel_err_p90", None), ("coverage", 0.1), ("bias_drift", 0.9),
+                          ("alpha_at_boundary", True), ("n_holdout_rows", 0)):
+        _stage_recon_selection(live, config_path=cfg, arm2_report=arm1)
+        payload = json_lib.loads(path.read_text(encoding="utf-8"))
+        payload["stability"][metric] = value
+        path.write_text(json_lib.dumps(payload), encoding="utf-8")
+        assert retrain_gate.load_recon_pit_selection(live, **kwargs)[1] is False
+
+
+def test_promotion_verdict_names_scored_arm() -> None:
+    from src.ml import retrain_gate
+
+    candidate = _pit_candidate()
+    arm1 = _pit_report(native_mean=-5.0, native_ic=-0.01)
+    arm2 = _pit_report(native_mean=9.0, native_ic=0.05)
+    gate = _pit_gate("enforce")
+    fallback = retrain_gate.evaluate_retrain_promotion(
+        candidate, None, _pit_eval_frame(), pit_report=arm1, pit_gate=gate,
+        pit_recon_report=arm2, pit_recon_adopted=False, pit_recon_detail="REJECT",
+    )
+    assert fallback.pit_arm == "arm1"
+    adopted = retrain_gate.evaluate_retrain_promotion(
+        candidate, None, _pit_eval_frame(), pit_report=arm1, pit_gate=gate,
+        pit_recon_report=arm2, pit_recon_adopted=True, pit_recon_detail="verdict ADOPT",
+    )
+    assert adopted.pit_arm == "arm2"
+    assert adopted.pit_status == "PASS"
+    missing = retrain_gate.evaluate_retrain_promotion(
+        candidate, None, _pit_eval_frame(), pit_report=None, pit_gate=gate)
+    assert missing.pit_arm == "none"

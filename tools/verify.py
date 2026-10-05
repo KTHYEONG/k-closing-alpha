@@ -211,6 +211,7 @@ def _find_test_files(py_files: list[str]) -> tuple[list[str], list[str]]:
 
         candidates = [
             f"tests/unit/{sub_path}/{test_name}" if sub_path else f"tests/unit/{test_name}",
+            f"tests/unit/{'/'.join(parts[:-2])}/{test_name}" if len(parts) > 2 else f"tests/unit/{test_name}",
             f"tests/unit/{test_name}",
         ]
         nested_dir = f"tests/unit/{sub_path}/{mod_name[:-3]}" if sub_path and mod_name.endswith(".py") else ""

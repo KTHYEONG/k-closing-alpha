@@ -10,11 +10,12 @@ it does not re-certify alpha (that remains the manual CPCV certification).
 from __future__ import annotations
 
 import enum
+import hashlib
 import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -23,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from src.ml.pit_report import (
+    PIT_HAIRCUT_REPORT_FILENAME,
     RECON_ARM_DIRNAME,
     RECONSTRUCTION_CERTIFICATION_FILENAME,
     PitHaircutReport,
@@ -88,6 +90,7 @@ class PromotionVerdict:
         agreement: Mean daily rank agreement with the live bundle; None when not measured.
         pit_status: OFF, MISSING, MALFORMED, STALE, MISMATCH, INSUFFICIENT, PASS or FAIL.
         pit_reasons: Human-readable PIT findings (blocking only in ENFORCE mode).
+        pit_arm: Arm actually scored ("arm1", "arm2" or "none").
     """
 
     promote: bool
@@ -95,6 +98,7 @@ class PromotionVerdict:
     agreement: float | None
     pit_status: str = "OFF"
     pit_reasons: tuple[str, ...] = ()
+    pit_arm: str = "none"
 
 
 def load_current_bundle(export_dir: str) -> dict[str, Any] | None:
@@ -175,7 +179,7 @@ def evaluate_pit_gate(
     recon_report: PitHaircutReport | None = None,
     recon_adopted: bool = False,
     recon_detail: str = "",
-) -> tuple[str, tuple[str, ...]]:
+) -> tuple[str, tuple[str, ...], str]:
     """Judge whether the decision-time evidence supports the candidate's configuration.
 
     The report certifies CPCV fold models, not the weekly candidate itself (scoring the candidate on panel
@@ -186,19 +190,19 @@ def evaluate_pit_gate(
     otherwise the arm-1 report is scored and the fallback is named in the reasons.
 
     Returns:
-        (status, reasons): OFF when config.mode is OFF; MISSING without a report; MALFORMED when generated_at
+        (status, reasons, pit_arm): OFF when config.mode is OFF; MISSING without a report; MALFORMED when generated_at
         is not an aware ISO-8601 timestamp; STALE when older than
         max_report_age_days at now; MISMATCH naming each differing identity field (strategy_id, top_k,
         select_universe, feature contract version, model_params, seeds); INSUFFICIENT when the report status
-        is not OK; FAIL naming each violated threshold; PASS otherwise.
+        is not OK; FAIL naming each violated threshold; PASS otherwise. pit_arm names the scored arm.
     """
-    selected, note = select_pit_report(
+    selected, note, pit_arm = select_pit_report(
         report, recon_report=recon_report, recon_adopted=recon_adopted, recon_detail=recon_detail
     )
     status, reasons = _evaluate_selected_pit_gate(selected, candidate, config=config, now=now)
     if note and status != "OFF":
         reasons = (note, *reasons)
-    return status, reasons
+    return status, reasons, pit_arm
 
 
 def select_pit_report(
@@ -207,7 +211,7 @@ def select_pit_report(
     recon_report: PitHaircutReport | None = None,
     recon_adopted: bool = False,
     recon_detail: str = "",
-) -> tuple[PitHaircutReport | None, str]:
+) -> tuple[PitHaircutReport | None, str, str]:
     """Choose the arm the PIT criterion scores, naming the selection for the reasons.
 
     The arm-2 report scores only when the reconstruction verdict is ADOPT and the report itself is
@@ -215,29 +219,62 @@ def select_pit_report(
     improve a candidate's PIT status beyond the arm-1 evidence.
 
     Returns:
-        (report, note): The report to score and the selection note (empty when no reconstruction
-        evidence was offered).
+        (report, note, pit_arm): The report to score, the selection note (empty when no reconstruction
+        evidence was offered), and the scored arm ("arm2", "arm1" or "none").
     """
     detail = str(recon_detail or "").strip()
     if bool(recon_adopted):
         if isinstance(recon_report, PitHaircutReport) and str(recon_report.status) == "OK":
             suffix = f": {detail}" if detail else ""
-            return recon_report, f"pit report arm-2 adopted for scoring{suffix}"
+            return recon_report, f"pit report arm-2 adopted for scoring{suffix}", "arm2"
         why = detail or "arm-2 report missing or unusable"
-        return report_arm1, f"pit report arm-1 fallback ({why})"
+        arm = "arm1" if report_arm1 is not None else "none"
+        return report_arm1, f"pit report arm-1 fallback ({why})", arm
     if recon_report is not None or detail:
         why = detail or "reconstruction verdict not ADOPT"
-        return report_arm1, f"pit report arm-1 fallback ({why})"
-    return report_arm1, ""
+        arm = "arm1" if report_arm1 is not None else "none"
+        return report_arm1, f"pit report arm-1 fallback ({why})", arm
+    if report_arm1 is None:
+        return None, "", "none"
+    return report_arm1, "", "arm1"
 
 
-def load_recon_pit_selection(live_dir: Path | str) -> tuple[PitHaircutReport | None, bool, str]:
-    """Load the reconstruction adoption evidence beside the live bundle, tolerantly.
+def _sha256_bytes(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _report_identity(report: PitHaircutReport) -> dict[str, Any]:
+    return {
+        "strategy_id": str(report.strategy_id),
+        "top_k": int(report.top_k),
+        "select_universe": dict(report.select_universe),
+        "feature_contract_version": str(report.feature_contract_version),
+        "model_params": dict(report.model_params),
+        "seeds": tuple(report.seeds),
+    }
+
+
+def load_recon_pit_selection(
+    live_dir: Path | str,
+    *,
+    arm1_report: PitHaircutReport | None,
+    decomposition_config_path: Path | str,
+    now: datetime,
+    max_age_days: int,
+) -> tuple[PitHaircutReport | None, bool, str]:
+    """Load the reconstruction adoption evidence beside the live bundle, trusting nothing asserted.
 
     Returns:
-        (arm-2 report or None, adopted, detail). Absent files yield (None, False, ""); an unreadable
-        certification or arm-2 report yields (None, False, reason) so the gate falls back to arm 1.
+        (arm-2 report or None, adopted, detail). Absent certification yields (None, False, "");
+        an unreadable certification yields (None, False, reason). ADOPT is honoured only when the
+        stored evidence re-passes the current gate, the certificate is fresh, content bindings
+        match, and the arm-2 identity equals the live arm-1 report.
     """
+    from src.ml.research.pit_certification import (
+        ReconstructionGateConfig,
+        evaluate_reconstruction_gate,
+    )
+
     base = Path(live_dir)
     cert_path = base / RECONSTRUCTION_CERTIFICATION_FILENAME
     if not cert_path.exists():
@@ -249,22 +286,51 @@ def load_recon_pit_selection(live_dir: Path | str) -> tuple[PitHaircutReport | N
             "[EVAL] stage=pit_gate status=RECON_CERTIFICATION_UNREADABLE reason=%s", type(exc).__name__
         )
         return None, False, f"reconstruction certification unreadable ({type(exc).__name__})"
-    improvement = cert.coverage_improvement
-    stability = cert.stability
-    consistent = (
-        not cert.gate_reasons
-        and stability is not None
-        and stability.passed is True
-        and improvement is not None
-        and bool(np.isfinite(improvement.ci_low))
-        and improvement.ci_low > 0.0
-    )
-    adopted = str(cert.gate_verdict) == "ADOPT"
-    if adopted and not consistent:
-        return None, False, "reconstruction certification ADOPT contradicts its own evidence"
-    detail = "; ".join(cert.gate_reasons) if cert.gate_reasons else f"verdict {cert.gate_verdict}"
-    if not adopted:
+    if str(cert.gate_verdict) != "ADOPT":
+        detail = "; ".join(cert.gate_reasons) if cert.gate_reasons else "verdict REJECT"
         return None, False, detail
+    if cert.coverage_improvement is None or cert.reconstruction_feature is None or cert.stability is None:
+        return None, False, "reconstruction certification evidence is incomplete"
+    assert cert.bindings is not None
+    fidelity = dict(cert.fidelity or {})
+    tv_corr = float(fidelity.get("tv_rank_correlation", float("nan")))
+    overlap = float(fidelity.get("top_k_overlap", float("nan")))
+    recheck = evaluate_reconstruction_gate(
+        coverage_improvement=cert.coverage_improvement,
+        reconstruction_feature=cert.reconstruction_feature,
+        stability=cert.stability,
+        tv_rank_correlation=tv_corr,
+        top_k_overlap=overlap,
+        config=ReconstructionGateConfig(),
+    )
+    if recheck.verdict != "ADOPT":
+        return None, False, f"reconstruction evidence fails the current gate: {'; '.join(recheck.reasons)}"
+    try:
+        generated = datetime.fromisoformat(str(cert.generated_at))
+    except ValueError:
+        return None, False, f"reconstruction certification generated_at {cert.generated_at!r} is not ISO-8601"
+    if generated.tzinfo is None:
+        return None, False, f"reconstruction certification generated_at {cert.generated_at!r} is not timezone-aware"
+    if now.tzinfo is None:
+        return None, False, "reconstruction loader now must be timezone-aware"
+    age = now - generated
+    if age < timedelta(0):
+        return None, False, "reconstruction certification generated_at is in the future"
+    if age > timedelta(days=int(max_age_days)):
+        return None, False, f"reconstruction certification is stale (max {int(max_age_days)} days)"
+    try:
+        config_sha = _sha256_bytes(Path(decomposition_config_path))
+    except OSError as exc:
+        return None, False, f"decomposition config unreadable ({exc})"
+    if config_sha.lower() != str(cert.bindings.decomposition_config_sha256).lower():
+        return None, False, "decomposition config binding mismatch"
+    arm2_path = base / RECON_ARM_DIRNAME / PIT_HAIRCUT_REPORT_FILENAME
+    try:
+        arm2_sha = _sha256_bytes(arm2_path)
+    except OSError:
+        return None, False, "arm-2 report missing"
+    if arm2_sha.lower() != str(cert.bindings.recon_report_sha256).lower():
+        return None, False, "arm-2 report binding mismatch"
     try:
         arm2 = load_pit_haircut_report(base / RECON_ARM_DIRNAME)
     except ValueError as exc:
@@ -272,6 +338,16 @@ def load_recon_pit_selection(live_dir: Path | str) -> tuple[PitHaircutReport | N
         return None, False, f"arm-2 report unreadable ({type(exc).__name__})"
     if arm2 is None:
         return None, False, "arm-2 report missing"
+    if str(arm2.status) != "OK":
+        return None, False, f"arm-2 report status is {arm2.status}, no usable paired evidence"
+    if arm1_report is None:
+        return None, False, "live arm-1 report is missing, arm-2 identity cannot be confirmed"
+    left = _report_identity(arm1_report)
+    right = _report_identity(arm2)
+    diffs = sorted(k for k in left if left[k] != right[k])
+    if diffs:
+        return None, False, f"arm-2 identity differs from live arm-1: {', '.join(diffs)}"
+    detail = "; ".join(cert.gate_reasons) if cert.gate_reasons else f"verdict {cert.gate_verdict}"
     return arm2, True, detail
 
 
@@ -392,7 +468,7 @@ def evaluate_retrain_promotion(
         PromotionVerdict with the blocking reasons, if any.
     """
     eff_now = now if now is not None else datetime.now(_KST)
-    pit_status, pit_reasons = evaluate_pit_gate(
+    pit_status, pit_reasons, pit_arm = evaluate_pit_gate(
         pit_report,
         candidate,
         config=pit_gate,
@@ -413,9 +489,15 @@ def evaluate_retrain_promotion(
                 agreement=agreement,
                 pit_status=pit_status,
                 pit_reasons=pit_reasons,
+                pit_arm=pit_arm,
             )
         return PromotionVerdict(
-            promote=promote, reasons=reasons, agreement=agreement, pit_status=pit_status, pit_reasons=pit_reasons
+            promote=promote,
+            reasons=reasons,
+            agreement=agreement,
+            pit_status=pit_status,
+            pit_reasons=pit_reasons,
+            pit_arm=pit_arm,
         )
 
     reasons: list[str] = []

@@ -21,7 +21,7 @@ PIT_CERTIFICATION_BUNDLE_KEY: str = "pit_certification"
 
 RECONSTRUCTION_CERTIFICATION_FILENAME: str = "reconstruction_certification.json"
 RECON_ARM_DIRNAME: str = "topk_ranker_recon"
-RECON_CERTIFICATION_SCHEMA_VERSION: int = 1
+RECON_CERTIFICATION_SCHEMA_VERSION: int = 2
 
 
 class PitReportStatus(enum.StrEnum):
@@ -327,14 +327,19 @@ def load_pit_haircut_report(out_dir: Path) -> PitHaircutReport | None:
 
 
 def pit_certification_metadata(
-    report: PitHaircutReport | None, *, gate_mode: str, gate_status: str, gate_reasons: Sequence[str]
+    report: PitHaircutReport | None,
+    *,
+    gate_mode: str,
+    gate_status: str,
+    gate_reasons: Sequence[str],
+    arm: str = "none",
 ) -> dict[str, Any]:
     """Render the bundle-metadata view of a report plus the gate outcome.
 
     Returns:
         JSON-serializable dict: status ("MISSING" when report is None), generated_at, panel_date_min/max,
         n_paired_days, mean_net_bp, haircut (delta/ci_low/ci_high/p_value), rank_ic_mean, pick_overlap_mean,
-        gate_mode, gate_status, gate_reasons (list).
+        gate_mode, gate_status, gate_reasons (list), arm (the scored arm: "arm1", "arm2" or "none").
     """
     if report is None:
         return {
@@ -350,6 +355,7 @@ def pit_certification_metadata(
             "gate_mode": str(gate_mode),
             "gate_status": str(gate_status),
             "gate_reasons": [str(r) for r in gate_reasons],
+            "arm": str(arm),
         }
     haircut = report.haircut
     return {
@@ -370,6 +376,7 @@ def pit_certification_metadata(
         "gate_mode": str(gate_mode),
         "gate_status": str(gate_status),
         "gate_reasons": [str(r) for r in gate_reasons],
+        "arm": str(arm),
     }
 
 
@@ -390,12 +397,25 @@ def bundle_pit_certification(bundle: Mapping[str, Any]) -> Mapping[str, Any] | N
 
 
 @dataclass(frozen=True)
+class CertificationBindings:
+    """Content hashes binding a reconstruction certificate to the exact evidence it saw."""
+
+    decomposition_config_sha256: str
+    calibration_table_sha256: str
+    exact_report_sha256: str
+    recon_report_sha256: str
+
+
+@dataclass(frozen=True)
 class CalibrationStability:
-    """Outcome of fitting the decomposition on the first half of the KIS window and scoring the second."""
+    """Backcast transfer of the holdout-excluded fit onto the isolated holdout window."""
 
     passed: bool
-    median_rel_err: float
-    n_scored: int
+    rel_err_p90: float
+    coverage: float
+    bias_drift: float
+    alpha_at_boundary: bool
+    n_holdout_rows: int
     detail: str
 
 
@@ -412,8 +432,13 @@ class ReconstructionCertification:
         dropped_days: Dates present in only one arm, excluded from paired statistics.
         coverage_improvement: Arm-1 minus arm-2 coverage loss in bp (positive shrinks the haircut).
         reconstruction_feature: Arm-3 in-the-loop rule return, reconstructed minus exact, in bp.
-        stability: First-half fit / second-half score outcome on the calibration window.
+        stability: Holdout transfer outcome of the holdout-excluded fit.
         coverage_by_year_and_basis: Arm -> year -> index basis -> mean superset coverage (report-only).
+        bindings: Content hashes of the certified config, table and both arm reports.
+        fidelity: Decision-feature fidelity (chg/tv rank correlation, top-k overlap, paired/symbol-day
+            counts, n_no_share).
+        holdout_start, holdout_end: Certified holdout window (inclusive YYYY-MM-DD).
+        gate_config: Thresholds in force at certification (informational).
         gate_verdict: "ADOPT" or "REJECT", evaluated by the report from these fields.
         gate_reasons: Failing criteria (empty on ADOPT).
     """
@@ -428,6 +453,11 @@ class ReconstructionCertification:
     reconstruction_feature: PairedDelta | None = None
     stability: CalibrationStability | None = None
     coverage_by_year_and_basis: dict[str, Any] = None  # type: ignore[assignment]
+    bindings: CertificationBindings | None = None
+    fidelity: dict[str, float] = None  # type: ignore[assignment]
+    holdout_start: str = ""
+    holdout_end: str = ""
+    gate_config: dict[str, float] = None  # type: ignore[assignment]
     gate_verdict: str = "REJECT"
     gate_reasons: tuple[str, ...] = ()
 
@@ -435,11 +465,64 @@ class ReconstructionCertification:
 _CERT_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(ReconstructionCertification))
 
 
+_BINDING_FIELDS: tuple[str, ...] = (
+    "decomposition_config_sha256",
+    "calibration_table_sha256",
+    "exact_report_sha256",
+    "recon_report_sha256",
+)
+
+_HEX64 = __import__("re").compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _load_binding_digest(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str) or not _HEX64.match(value):
+        raise ValueError(f"reconstruction certification field {field_name!r} must be a sha256 hex digest")
+    return value.lower()
+
+
+def _dump_bindings(bindings: CertificationBindings) -> dict[str, Any]:
+    return {
+        "decomposition_config_sha256": str(bindings.decomposition_config_sha256),
+        "calibration_table_sha256": str(bindings.calibration_table_sha256),
+        "exact_report_sha256": str(bindings.exact_report_sha256),
+        "recon_report_sha256": str(bindings.recon_report_sha256),
+    }
+
+
+def _load_bindings(payload: Any) -> CertificationBindings:
+    if not isinstance(payload, Mapping):
+        raise ValueError("reconstruction certification field 'bindings' must be a mapping")
+    unknown = set(payload) - set(_BINDING_FIELDS)
+    if unknown:
+        raise ValueError(f"reconstruction certification field 'bindings' carries unknown keys: {sorted(unknown)}")
+    missing = [name for name in _BINDING_FIELDS if name not in payload]
+    if missing:
+        raise ValueError(f"reconstruction certification field 'bindings' is missing keys: {missing}")
+    return CertificationBindings(
+        decomposition_config_sha256=_load_binding_digest(
+            payload.get("decomposition_config_sha256"), field_name="bindings.decomposition_config_sha256"
+        ),
+        calibration_table_sha256=_load_binding_digest(
+            payload.get("calibration_table_sha256"), field_name="bindings.calibration_table_sha256"
+        ),
+        exact_report_sha256=_load_binding_digest(
+            payload.get("exact_report_sha256"), field_name="bindings.exact_report_sha256"
+        ),
+        recon_report_sha256=_load_binding_digest(
+            payload.get("recon_report_sha256"), field_name="bindings.recon_report_sha256"
+        ),
+    )
+
+
 def _dump_stability(stability: CalibrationStability) -> dict[str, Any]:
     return {
         "passed": bool(stability.passed),
-        "median_rel_err": _dump_float(stability.median_rel_err),
-        "n_scored": int(stability.n_scored),
+        "rel_err_p90": _dump_float(stability.rel_err_p90),
+        "coverage": _dump_float(stability.coverage),
+        "bias_drift": _dump_float(stability.bias_drift),
+        "alpha_at_boundary": bool(stability.alpha_at_boundary),
+        "n_holdout_rows": int(stability.n_holdout_rows),
         "detail": str(stability.detail),
     }
 
@@ -449,16 +532,34 @@ def _load_stability(payload: Any) -> CalibrationStability | None:
         return None
     if not isinstance(payload, Mapping):
         raise ValueError("reconstruction certification field 'stability' must be a mapping or null")
-    unknown = set(payload) - {"passed", "median_rel_err", "n_scored", "detail"}
+    unknown = set(payload) - {
+        "passed",
+        "rel_err_p90",
+        "coverage",
+        "bias_drift",
+        "alpha_at_boundary",
+        "n_holdout_rows",
+        "detail",
+    }
     if unknown:
         raise ValueError(f"reconstruction certification field 'stability' carries unknown keys: {sorted(unknown)}")
     passed = payload.get("passed", False)
     if not isinstance(passed, bool):
         raise ValueError("reconstruction certification field 'stability.passed' must be a boolean")
+    boundary = payload.get("alpha_at_boundary", False)
+    if not isinstance(boundary, bool):
+        raise ValueError("reconstruction certification field 'stability.alpha_at_boundary' must be a boolean")
+    try:
+        n_holdout_rows = int(payload.get("n_holdout_rows", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("reconstruction certification field 'stability.n_holdout_rows' must be an int") from exc
     return CalibrationStability(
         passed=passed,
-        median_rel_err=_load_float(payload.get("median_rel_err"), field_name="stability.median_rel_err"),
-        n_scored=int(payload.get("n_scored", 0)),
+        rel_err_p90=_load_float(payload.get("rel_err_p90"), field_name="stability.rel_err_p90"),
+        coverage=_load_float(payload.get("coverage"), field_name="stability.coverage"),
+        bias_drift=_load_float(payload.get("bias_drift"), field_name="stability.bias_drift"),
+        alpha_at_boundary=boundary,
+        n_holdout_rows=n_holdout_rows,
         detail=str(payload.get("detail", "")),
     )
 
@@ -470,7 +571,7 @@ def _cert_to_payload(cert: ReconstructionCertification) -> dict[str, Any]:
     coverage = cert.coverage_by_year_and_basis
     if improvement is None or feature is None or stability is None:
         raise ValueError("reconstruction certification has unpopulated required fields; refusing to persist a partial artifact")
-    if coverage is None:
+    if coverage is None or cert.bindings is None or cert.fidelity is None or cert.gate_config is None:
         raise ValueError("reconstruction certification has unpopulated required fields; refusing to persist a partial artifact")
     return {
         "schema_version": int(cert.schema_version),
@@ -483,6 +584,11 @@ def _cert_to_payload(cert: ReconstructionCertification) -> dict[str, Any]:
         "reconstruction_feature": _dump_delta(feature),
         "stability": _dump_stability(stability),
         "coverage_by_year_and_basis": json.loads(json.dumps(dict(coverage))),
+        "bindings": _dump_bindings(cert.bindings),
+        "fidelity": _dump_float_map(cert.fidelity),
+        "holdout_start": str(cert.holdout_start),
+        "holdout_end": str(cert.holdout_end),
+        "gate_config": _dump_float_map(cert.gate_config),
         "gate_verdict": str(cert.gate_verdict),
         "gate_reasons": [str(r) for r in cert.gate_reasons],
     }
@@ -526,6 +632,11 @@ def _cert_from_payload(payload: Mapping[str, Any]) -> ReconstructionCertificatio
         reconstruction_feature=_load_delta(payload.get("reconstruction_feature"), field_name="reconstruction_feature"),
         stability=_load_stability(payload.get("stability")),
         coverage_by_year_and_basis=dict(coverage),
+        bindings=_load_bindings(payload.get("bindings")),
+        fidelity=_load_float_map(payload.get("fidelity"), field_name="fidelity"),
+        holdout_start=str(payload.get("holdout_start", "")),
+        holdout_end=str(payload.get("holdout_end", "")),
+        gate_config=_load_float_map(payload.get("gate_config"), field_name="gate_config"),
         gate_verdict=verdict,
         gate_reasons=reasons,
     )
