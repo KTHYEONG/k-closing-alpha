@@ -198,7 +198,7 @@ def test_regular_readiness_follows_market_session() -> None:
 def test_settled_statuses_end_recovery(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
-    day = "2026-09-08"
+    day = "2026-10-02"
     _seed(day, "regular", "000001", [("090000", "10")], [("090000", "1000")])
     _seed(day, "regular", "000002", [("090000", "10")], [("090000", "1000")])
     _seed(day, "regular", "000003", [("090000", "10")], [("090000", "1000")])

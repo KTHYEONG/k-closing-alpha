@@ -29,8 +29,8 @@ from src.data.intraday_schema import normalize_bar_frame, normalize_tick_frame
 from src.data.intraday_store import tick_partition_path, write_intraday_partition, write_tick_partition
 
 _SEOUL = ZoneInfo("Asia/Seoul")
-_DAY = "2026-09-02"
-_YMD = "20260902"
+_DAY = "2026-10-02"
+_YMD = "20261002"
 
 
 _PRODUCTION_BLACKOUTS = btt._DEFAULT_BLACKOUTS
@@ -279,7 +279,7 @@ def test_resume_skips_settled(tmp_path, monkeypatch) -> None:
     ledger.parent.mkdir(parents=True, exist_ok=True)
     ledger.write_text(
         "".join(
-            json.dumps({"symbol": "A", "day": "2026-09-02", "session": s, "status": "COMPLETE", "run_id": "r"}) + "\n"
+            json.dumps({"symbol": "A", "day": "2026-10-02", "session": s, "status": "COMPLETE", "run_id": "r"}) + "\n"
             for s in ("regular", "krx_aftermarket")
         ),
         encoding="utf-8",
@@ -287,15 +287,15 @@ def test_resume_skips_settled(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["A", "B"])
     store = CaptureStore(tmp_path / "capture")
     settled = tr.read_settled_ledger(ledger)
-    needs = tr.collect_tape_needs(["2026-09-02"], ["KRX"], store, settled, False)
+    needs = tr.collect_tape_needs(["2026-10-02"], ["KRX"], store, settled, False)
     assert needs and all(n.symbol == "B" for n in needs)
     partial_ledger = tmp_path / "p.jsonl"
     partial_ledger.write_text(
-        json.dumps({"symbol": "B", "day": "2026-09-02", "session": "regular", "status": "PARTIAL", "run_id": "r"})
+        json.dumps({"symbol": "B", "day": "2026-10-02", "session": "regular", "status": "PARTIAL", "run_id": "r"})
         + "\n",
         encoding="utf-8",
     )
-    needs2 = tr.collect_tape_needs(["2026-09-02"], ["KRX"], store, tr.read_settled_ledger(partial_ledger), False)
+    needs2 = tr.collect_tape_needs(["2026-10-02"], ["KRX"], store, tr.read_settled_ledger(partial_ledger), False)
     assert any(n.symbol == "B" and n.session == "regular" for n in needs2)
 
 
@@ -1141,9 +1141,9 @@ def test_collect_skips_weekends_and_ingested_holidays(tmp_path, monkeypatch) -> 
 
 
 def test_trading_day_falls_back_to_weekday_without_price_history() -> None:
-    assert tr._is_trading_day("2026-09-24", set()) is True
+    assert tr._is_trading_day("2026-10-02", set()) is True
     assert tr._is_trading_day("2026-09-26", set()) is False
-    assert tr._is_trading_day("2026-09-01", {"2026-09-23"}) is True
+    assert tr._is_trading_day("2026-09-24", set()) is False
 
 
 def test_ingested_trading_days_tolerates_unreadable_file(tmp_path, monkeypatch) -> None:
@@ -1407,3 +1407,185 @@ def test_cli_exposes_no_engine_aliases() -> None:
         "_TICK_SESSIONS",
     ):
         assert hasattr(btt, name) is False, name
+
+
+def _write_ingested_days(tmp_path, days: list[str]) -> None:
+    pd.DataFrame({"date": pd.to_datetime(days), "symbol": "005930"}).to_parquet(
+        tmp_path / "price_history.parquet"
+    )
+
+
+def test_holiday_after_newest_ingested_is_not_trading(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    _write_ingested_days(tmp_path, ["2026-09-30", "2026-10-01", "2026-10-02"])
+    ingested = tr._ingested_trading_days()
+    assert max(ingested) == "2026-10-02"
+    assert tr._is_trading_day("2026-10-05", ingested) is False
+    store = CaptureStore(tmp_path / "capture")
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930"])
+    assert tr.collect_tape_needs(["2026-10-05"], ["KRX", "NXT"], store, {}, False) == []
+
+
+def test_weekday_after_newest_ingested_is_trading_when_standard(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    _write_ingested_days(tmp_path, ["2026-09-30", "2026-10-01", "2026-10-02"])
+    ingested = tr._ingested_trading_days()
+    assert tr._is_trading_day("2026-10-06", ingested) is True
+
+
+def test_calendar_unknown_requires_ingested_evidence() -> None:
+    assert tr._is_trading_day("2026-09-24", set()) is False
+    assert tr._is_trading_day("2026-09-24", {"2026-09-24"}) is True
+
+
+def test_price_history_still_excludes_in_range_holidays() -> None:
+    ingested = {"2026-10-01", "2026-10-06"}
+    assert tr._is_trading_day("2026-10-02", ingested) is False
+
+
+def test_calendar_closed_beats_price_history() -> None:
+    assert tr._is_trading_day("2026-10-05", {"2026-10-02", "2026-10-05"}) is False
+    with pytest.raises(ValueError, match="isoformat"):
+        tr._is_trading_day("not-a-date", set())
+
+
+def test_task_pairs_partition_the_needs() -> None:
+    needs = [
+        tr.Need(symbol="A", day="2026-10-01", session="regular", venue="KRX"),
+        tr.Need(symbol="A", day="2026-09-30", session="krx_aftermarket", venue="KRX"),
+        tr.Need(symbol="A", day="2026-10-01", session="regular", venue="KRX"),
+        tr.Need(symbol="B", day="2026-10-01", session="nxt_aftermarket", venue="NXT"),
+        tr.Need(symbol="B", day="2026-10-01", session="regular", venue="KRX"),
+    ]
+    tasks = tr.order_walk_tasks(needs)
+    union: set[tuple[str, str, str, str]] = set()
+    for task in tasks:
+        assert task.pairs == tuple(sorted(set(task.pairs)))
+        assert len(task.pairs) == len(set(task.pairs))
+        for pair in task.pairs:
+            key = (task.symbol, task.venue, *pair)
+            assert key not in union
+            union.add(key)
+    assert union == {(n.symbol, n.venue, n.day, n.session) for n in needs}
+    by_key = {(t.symbol, t.venue): t for t in tasks}
+    assert by_key[("A", "KRX")].pairs == (("2026-09-30", "krx_aftermarket"), ("2026-10-01", "regular"))
+    assert by_key[("A", "KRX")].days == ("2026-09-30", "2026-10-01")
+
+
+def test_publisher_guard_names_symbol_day_session(tmp_path, monkeypatch) -> None:
+    from src.backfill.intraday.tape_harvest import TickTapePublisher
+
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    today = datetime.now(_SEOUL).date().isoformat()
+    bad = TapeDayResult(
+        symbol="005930",
+        day=today,
+        session="krx_aftermarket",
+        frame=pd.DataFrame(),
+        entry=CoverageEntry(
+            symbol="005930",
+            dataset=CaptureDataset.TRADE_TICKS,
+            venue="KRX",
+            session="krx_aftermarket",
+            scheduled_at=None,
+            status=CaptureStatus.NO_TRADES,
+            rows=0,
+            first_event_time=None,
+            last_event_time=None,
+            reason="tape_complete:krx_aftermarket=0:vendor_total=1",
+            raw_refs=(ArtifactRef(path="raw/seed", sha256="abc", bytes=1),),
+        ),
+    )
+    pub = TickTapePublisher(store=store, profile=profile, flush_rows=10**9)
+    with pytest.raises(ValueError, match="not closed") as excinfo:
+        pub.add(bad)
+    message = str(excinfo.value)
+    assert "005930" in message and today in message and "krx_aftermarket" in message
+
+
+def test_run_walk_tasks_passes_pairs_and_survives_holiday_shape(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    holiday = datetime(2026, 10, 5, 21, 0, tzinfo=_SEOUL)
+    monkeypatch.setattr(tr, "_now", lambda: holiday)
+    _write_ingested_days(tmp_path, ["2026-09-30", "2026-10-01", "2026-10-02"])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930"] if day == "2026-09-30" else [])
+    needs = tr.collect_tape_needs(["2026-09-30", "2026-10-05"], ["KRX"], store, {}, False)
+    assert needs and all(n.day == "2026-09-30" for n in needs)
+    tasks = tr.order_walk_tasks(needs)
+    assert tasks and all(t.pairs for t in tasks)
+    seen: list[dict[str, Any]] = []
+
+    async def _fake(client: Any, session: Any, symbol: str, days: Any, **kwargs: Any) -> Any:
+        seen.append({"needed": kwargs.get("needed")})
+        return TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=0, unresolved_days=())
+
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake)
+    summary = asyncio.run(
+        tr.run_walk_tasks(
+            tasks,
+            client=object(),
+            http_session=object(),
+            store=store,
+            profile=profile,
+            apply=False,
+            ledger=tmp_path / "l.jsonl",
+            deadline=None,
+            blackouts=[],
+            run_date="2026-10-05",
+        )
+    )
+    assert summary.stopped is False
+    assert seen and all(item["needed"] for item in seen)
+    flat = {pair for item in seen for pair in item["needed"]}
+    assert ("2026-10-05", "krx_aftermarket") not in flat
+    assert ("2026-10-05", "regular") not in flat
+
+
+def test_run_walk_tasks_wraps_unclosed_publication_with_task_index(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    today = datetime.now(_SEOUL).date().isoformat()
+
+    async def _emit_unclosed(client: Any, session: Any, symbol: str, days: Any, **kwargs: Any) -> Any:
+        frame = normalize_tick_frame(
+            pd.DataFrame(_tick_rows(["090000"])), "kiwoom", today, symbol
+        )
+        kwargs["on_result"](
+            TapeDayResult(
+                symbol=symbol,
+                day=today,
+                session="krx_aftermarket",
+                frame=frame,
+                entry=_complete_entry(symbol, "krx_aftermarket", len(frame)),
+            )
+        )
+        return TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=1, unresolved_days=())
+
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _emit_unclosed)
+    task = tr.WalkTask(
+        symbol="005930",
+        venue="KRX",
+        days=(today,),
+        sessions=tuple(s for s in TAPE_SESSIONS if s.venue == "KRX"),
+        pairs=((today, "krx_aftermarket"),),
+    )
+    with pytest.raises(ValueError, match="task=0"):
+        asyncio.run(
+            tr.run_walk_tasks(
+                [task],
+                client=object(),
+                http_session=object(),
+                store=store,
+                profile=profile,
+                apply=True,
+                ledger=tmp_path / "l.jsonl",
+                deadline=None,
+                blackouts=[],
+                run_date="2026-10-05",
+            )
+        )

@@ -622,3 +622,224 @@ def test_publish_namespace_is_part_of_the_manifest_run_id_and_must_be_nonempty(t
     assert f"tape-{_DAY}-regular-publish-nsA-0" in names
     with pytest.raises(ValueError, match="publish_namespace"):
         TickTapePublisher(store=store, profile=profile, flush_rows=1, publish_namespace=" ")
+
+
+def test_needed_settles_only_requested_pairs_without_cross_product(tmp_path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    old, today = "2020-01-02", "2020-01-03"
+    rows_old = [_tick_on(old, "170000")]
+    rows_today = [_tick_on(today, "093000")]
+    stub = _StubTape(
+        [(rows_old, {"cont-yn": "Y", "next-key": "a"}), (rows_today, {"cont-yn": "Y", "next-key": "b"})],
+        [(today, rows_today, _cert(today, 1, 2, True)), (old, rows_old, _cert(old, 1, 2, True))],
+        [_cert(today, 1, 2, True), _cert(old, 1, 2, True)],
+    )
+    out: list[TapeDayResult] = []
+    res = asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "005930", [old, today], venue="KRX", sessions=_krx_sessions(),
+            store=store, run_id="tape-2020-01-04-pair", profile=profile, on_result=out.append,
+            needed=[(today, "regular"), (old, "krx_aftermarket")],
+        )
+    )
+    assert res.skipped_unclosed == ()
+    assert res.unresolved_days == ()
+    assert {(r.day, r.session) for r in out} == {(today, "regular"), (old, "krx_aftermarket")}
+
+
+def test_unclosed_needed_pair_is_skipped_not_fatal(tmp_path) -> None:
+    from datetime import timedelta
+
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    today = datetime.now(_SEOUL).date().isoformat()
+    old = (datetime.now(_SEOUL).date() - timedelta(days=30)).isoformat()
+    rows_old = [_tick_on(old, "093000")]
+    stub = _StubTape(
+        [(rows_old, {"cont-yn": "Y", "next-key": "a"})],
+        [(old, rows_old, _cert(old, 1, 2, True))],
+        [_cert(old, 1, 2, True)],
+    )
+    out: list[TapeDayResult] = []
+    res = asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "005930", [old, today], venue="KRX", sessions=_krx_sessions(),
+            store=store, run_id="tape-2020-01-04-skip", profile=profile, on_result=out.append,
+            needed=[(old, "regular"), (today, "krx_aftermarket")],
+        )
+    )
+    assert (today, "krx_aftermarket") in res.skipped_unclosed
+    assert {(r.day, r.session) for r in out} == {(old, "regular")}
+    assert today not in res.unresolved_days
+
+
+def test_normal_day_single_session_matches_legacy_shape(tmp_path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    rows = [_tick("093000")]
+    regular_only = [s for s in _krx_sessions() if s.session == "regular"]
+
+    def _run(**kwargs: Any) -> tuple[list[TapeDayResult], Any]:
+        stub = _StubTape(
+            [(rows, {"cont-yn": "Y", "next-key": "k"})],
+            [(_DAY, rows, _cert(_DAY, 1, 2, True))],
+            [_cert(_DAY, 1, 2, True)],
+        )
+        out: list[TapeDayResult] = []
+        res = asyncio.run(
+            harvest_symbol_tape(
+                stub, object(), "005930", [_DAY], venue="KRX", sessions=regular_only,
+                store=store, run_id="tape-2020-01-04-legacy", profile=profile,
+                on_result=out.append, **kwargs,
+            )
+        )
+        return out, res
+
+    legacy_out, _ = _run()
+    needed_out, needed_res = _run(needed=[(_DAY, "regular")])
+    assert {(r.day, r.session) for r in needed_out} == {(r.day, r.session) for r in legacy_out}
+    assert len(needed_out) == 1 and needed_out[0].entry.status == CaptureStatus.COMPLETE
+    assert needed_res.skipped_unclosed == () and needed_res.unresolved_days == ()
+
+
+def test_regular_guard_rejects_future_day(tmp_path) -> None:
+    import pytest
+    from datetime import timedelta
+
+    from src.data.capture_contracts import ArtifactRef, CaptureDataset, CoverageEntry
+
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    tomorrow = (datetime.now(_SEOUL).date() + timedelta(days=1)).isoformat()
+    bad = TapeDayResult(
+        symbol="005930", day=tomorrow, session="regular", frame=pd.DataFrame(),
+        entry=CoverageEntry(
+            symbol="005930", dataset=CaptureDataset.TRADE_TICKS, venue="KRX", session="regular",
+            scheduled_at=None, status=CaptureStatus.NO_TRADES, rows=0, first_event_time=None,
+            last_event_time=None, reason="tape_complete:regular=0:vendor_total=1",
+            raw_refs=(ArtifactRef(path="raw/seed", sha256="abc", bytes=1),),
+        ),
+    )
+    pub = TickTapePublisher(store=store, profile=profile, flush_rows=10**9)
+    with pytest.raises(ValueError, match="regular session not closed"):
+        pub.add(bad)
+
+
+def test_needed_rejects_invalid_day(tmp_path) -> None:
+    import pytest
+
+    store = CaptureStore(tmp_path / "capture")
+    with pytest.raises(ValueError, match="invalid needed day"):
+        asyncio.run(
+            harvest_symbol_tape(
+                _StubTape([], [], []), object(), "005930", [_DAY], venue="KRX",
+                sessions=_krx_sessions(), store=store, run_id="tape-2020-01-04-bad",
+                profile=_profile(tmp_path), on_result=lambda r: None,
+                needed=[("not-a-date", "regular")],
+            )
+        )
+
+
+def test_empty_needed_settles_nothing(tmp_path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    res = asyncio.run(
+        harvest_symbol_tape(
+            _StubTape([], [], []), object(), "005930", [_DAY], venue="KRX",
+            sessions=_krx_sessions(), store=store, run_id="tape-2020-01-04-empty",
+            profile=_profile(tmp_path), on_result=lambda r: None, needed=[],
+        )
+    )
+    assert res.unresolved_days == () and res.skipped_unclosed == ()
+
+
+def test_certified_day_without_needed_session_is_ignored(tmp_path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    other = [_tick_on("2020-01-03", "170000")]
+    wanted_rows = [_tick("093000")]
+    stub = _StubTape(
+        [(other, {"cont-yn": "Y", "next-key": "a"}), (wanted_rows, {"cont-yn": "Y", "next-key": "b"})],
+        [("2020-01-03", other, _cert("2020-01-03", 1, 2, True)), (_DAY, wanted_rows, _cert(_DAY, 1, 2, True))],
+        [_cert("2020-01-03", 1, 2, True), _cert(_DAY, 1, 2, True)],
+    )
+    out: list[TapeDayResult] = []
+    res = asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "005930", [_DAY, "2020-01-03"], venue="KRX", sessions=_krx_sessions(),
+            store=store, run_id="tape-2020-01-04-ignore", profile=profile, on_result=out.append,
+            needed=[(_DAY, "regular"), ("2020-01-03", "nxt_aftermarket")],
+        )
+    )
+    assert {(r.day, r.session) for r in out} == {(_DAY, "regular")}
+    assert res.unresolved_days == ()
+
+
+def test_explicit_needed_does_not_require_days(tmp_path) -> None:
+    stub = _StubTape([], [], [], termination="deadline")
+    out: list[TapeDayResult] = []
+    result = asyncio.run(harvest_symbol_tape(
+        stub, object(), "005930", [], sessions=_krx_sessions(),
+        store=CaptureStore(tmp_path / "capture"), run_id="needed-only",
+        profile=_profile(tmp_path), on_result=out.append, needed=[(_DAY, "regular")],
+    ))
+    assert result.unresolved_days == (_DAY,)
+    assert [(r.day, r.session) for r in out] == [(_DAY, "regular")]
+
+
+def test_empty_or_unclosed_request_never_calls_vendor(tmp_path) -> None:
+    today = datetime.now(_SEOUL).date().isoformat()
+
+    class Unavailable:
+        async def walk_tick_tape(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("no closable request must not call vendor")
+
+    for sessions, needed, skipped in (
+        ([], [], ()),
+        (_krx_sessions(), [(today, "krx_aftermarket")], ((today, "krx_aftermarket"),)),
+        ([], [(_DAY, "regular")], ()),
+    ):
+        out: list[TapeDayResult] = []
+        result = asyncio.run(harvest_symbol_tape(
+            Unavailable(), object(), "005930", [], sessions=sessions,
+            store=CaptureStore(tmp_path / "capture"), run_id="no-query",
+            profile=_profile(tmp_path), on_result=out.append, needed=needed,
+        ))
+        assert result.pages_fetched == 0 and result.unresolved_days == ()
+        assert result.skipped_unclosed == skipped
+        assert out == []
+
+
+def test_pair_selection_is_preserved_through_publication_and_ledger(tmp_path, monkeypatch) -> None:
+    from src import settings
+    from src.backfill.intraday import tape_recovery as tr
+
+    monkeypatch.setattr(settings, "HISTORY_DIR", tmp_path)
+    monkeypatch.setattr(tr, "_disk_ok", lambda root, profile: True)
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    old_rows = [_tick_on(_DAY, "170000")]
+    new_rows = [_tick_on(_DAY2, "093000")]
+    stub = _StubTape(
+        [(new_rows + old_rows, {"cont-yn": "N", "next-key": ""})],
+        [(_DAY2, new_rows, _cert(_DAY2, 1, 2, True)), (_DAY, old_rows, _cert(_DAY, 1, 2, True))],
+        [_cert(_DAY2, 1, 2, True), _cert(_DAY, 1, 2, True)],
+    )
+    tasks = tr.order_walk_tasks([
+        tr.Need("005930", _DAY2, "regular", "KRX"),
+        tr.Need("005930", _DAY, "krx_aftermarket", "KRX"),
+    ])
+    ledger = tmp_path / "ledger.jsonl"
+    summary = asyncio.run(tr.run_walk_tasks(
+        tasks, client=stub, http_session=object(), store=store, profile=profile,
+        apply=True, ledger=ledger, deadline=None, blackouts=[], run_date="2026-10-05",
+    ))
+    assert summary.unresolved == 0
+    assert set(tr.read_settled_ledger(ledger)) == {
+        ("005930", _DAY2, "regular"), ("005930", _DAY, "krx_aftermarket"),
+    }
+    for day, session in ((_DAY2, "regular"), (_DAY, "krx_aftermarket")):
+        assert len(pd.read_parquet(th.tick_partition_path(day, session))) == 1
+        assert store.read_manifests(day)
+    assert not th.tick_partition_path(_DAY, "regular").exists()
+    assert not th.tick_partition_path(_DAY2, "krx_aftermarket").exists()
