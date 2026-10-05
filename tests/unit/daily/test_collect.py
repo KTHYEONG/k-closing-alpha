@@ -3157,6 +3157,7 @@ def test_collect_agreed_holiday_stays_quiet(monkeypatch, caplog) -> None:
 
     from src.daily import collect
     from src.data.session_calendar import SessionDay, SessionKind
+    from src.tools.run_outcome import RUN_OUTCOME_SKIPPED
 
     def _closed(trading_day, **_kwargs):
         return SessionDay(trading_date=trading_day, kind=SessionKind.CLOSED, clock=None, provenance="test")
@@ -3167,7 +3168,17 @@ def test_collect_agreed_holiday_stays_quiet(monkeypatch, caplog) -> None:
     with caplog.at_level(logging.INFO):
         assert asyncio.run(collect.main()) is None
 
-    assert recorded == []
+    assert recorded == [
+        (
+            "collect",
+            RUN_OUTCOME_SKIPPED,
+            {
+                "run_date": "2026-09-29",
+                "reason": "non_trading_day",
+                "metrics": {"session": "CLOSED"},
+            },
+        )
+    ]
     assert any("reason=non_trading_day" in rec.message for rec in caplog.records)
     downstream.assert_not_awaited()
 

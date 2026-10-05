@@ -27,6 +27,7 @@ from src.api.kis.key_pool import (
     token_cache_path,
 )
 from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day
+from src.tools.run_outcome import RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,13 @@ def main() -> None:
     configure_cli_logging(CLI_LOG_FORMAT_TIMESTAMPED)
     today = datetime.now(ZoneInfo("Asia/Seoul")).date()
     if should_skip_warmup(today):
+        record_run_outcome(
+            "kis_token_warmup",
+            RUN_OUTCOME_SKIPPED,
+            run_date=today.isoformat(),
+            reason="non_trading_day",
+            metrics={"session": "CLOSED"},
+        )
         logger.info("[SYS] stage=kis_token_warmup status=SKIP reason=non_trading_day date=%s", today.isoformat())
         return
     env = load_kis_env(Path(settings.BASE_DIR) / ".env")

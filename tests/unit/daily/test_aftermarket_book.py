@@ -646,8 +646,12 @@ def test_run_async_skips_non_trading_days(tmp_path: Path, monkeypatch: Any) -> N
 
     monkeypatch.setattr(book, "is_kis_trading_day", _holiday)
     monkeypatch.setattr(book.settings, "PARQUET_DIR", tmp_path / "parquet")
+    recorded: list[tuple] = []
+    monkeypatch.setattr(book, "record_run_outcome", lambda job, outcome, **kw: recorded.append((job, outcome, kw)))
 
     assert _run(book._run_async("2026-09-23", profile)) is None
+    # KIS-oracle skips record nothing at the inner level; main() owns the SKIPPED record.
+    assert recorded == []
 
 
 def test_main_skips_cleanly(tmp_path: Path, monkeypatch: Any) -> None:

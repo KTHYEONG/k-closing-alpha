@@ -32,7 +32,7 @@ from src.data.capture_contracts import (
 from src.data.capture_store import CaptureStore
 from src.data.session_calendar import SessionKind, resolve_session_day, trading_session_gate
 from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL
-from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, record_run_outcome
+from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 from src.utils.numeric import safe_float
 
@@ -142,13 +142,13 @@ def classify_finalize_outcome(
 
     Returns:
         (outcome, reason) using the RUN_OUTCOME vocabulary; empty archive yields
-        (DEGRADED, "empty_archive") on a trading day and (OK, "non_trading_day")
+        (DEGRADED, "empty_archive") on a trading day and (SKIPPED, "non_trading_day")
         otherwise.
     """
     if n_rows == 0:
         if is_trading_day:
             return RUN_OUTCOME_DEGRADED, "empty_archive"
-        return RUN_OUTCOME_OK, "non_trading_day"
+        return RUN_OUTCOME_SKIPPED, "non_trading_day"
     if unconfirmed_picks:
         return RUN_OUTCOME_DEGRADED, "picks_unconfirmed"
     if n_finalized == 0 and n_unconfirmed > 0:
@@ -429,10 +429,19 @@ async def _amain(args: argparse.Namespace) -> int:
     """단일 이벤트 루프 안에서 세션 생성/토큰/확정/종료를 모두 수행한다. 종가 확정은 읽기 전용 시세 조회라 데이터 계좌 키로 수행하고 체결 계좌 키는 실주문 전용으로 둔다."""
     snap = args.date or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
     session_day = resolve_session_day(date.fromisoformat(snap))
-    if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
+    if session_day.kind in (SessionKind.CLOSED, SessionKind.SHIFTED, SessionKind.UNKNOWN):
         gate = trading_session_gate(session_day)
         assert gate is not None
-        record_run_outcome("finalize_close", RUN_OUTCOME_OK, run_date=snap, reason=gate)
+        if gate == "non_trading_day":
+            record_run_outcome(
+                "finalize_close",
+                RUN_OUTCOME_SKIPPED,
+                run_date=snap,
+                reason=gate,
+                metrics={"session": session_day.kind.value},
+            )
+        else:
+            record_run_outcome("finalize_close", RUN_OUTCOME_OK, run_date=snap, reason=gate)
         return 0
     owned_clients = [KisApiClient(**kwargs) for kwargs in kis_decision_shard_client_kwargs()]
     session = owned_clients[0].create_session()

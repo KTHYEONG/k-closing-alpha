@@ -594,10 +594,21 @@ def test_run_archive_non_trading_day_skips_in_raw_mode(monkeypatch, tmp_path) ->
         return False
 
     monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _not_trading)
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        archive_intraday, "record_run_outcome", lambda job, outcome, **kw: recorded.append((job, outcome, kw))
+    )
 
     result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path))
 
     assert result == (0, 0, 0)
+    assert recorded == [
+        (
+            "archive_intraday",
+            "SKIPPED",
+            {"run_date": "2026-09-07", "reason": "non_trading_day", "metrics": {"session": "CLOSED"}},
+        )
+    ]
 
 
 def test_run_archive_non_trading_day_without_cohort_skips_cleanly(monkeypatch, tmp_path) -> None:
@@ -615,10 +626,52 @@ def test_run_archive_non_trading_day_without_cohort_skips_cleanly(monkeypatch, t
         return False
 
     monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _not_trading)
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        archive_intraday, "record_run_outcome", lambda job, outcome, **kw: recorded.append((job, outcome, kw))
+    )
 
     for phase in ("regular", "aftermarket"):
         result = archive_intraday.run_intraday_archive(snapshot_date="2026-09-24", profile=_raw_profile(tmp_path), phase=phase)
         assert result == (0, 0, 0)
+    assert len(recorded) == 2
+    assert all(r[0] == "archive_intraday" and r[1] == "SKIPPED" for r in recorded)
+
+
+def test_run_archive_closed_session_skips_before_kis_oracle(monkeypatch, tmp_path) -> None:
+    from datetime import date
+
+    from src.daily import archive_intraday
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    _archive_store(tmp_path)
+
+    async def _never(*args, **kwargs):
+        raise AssertionError("must not collect on non-trading day")
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _never)
+    monkeypatch.setattr(
+        archive_intraday, "resolve_session_day",
+        lambda _d, **_k: SessionDay(trading_date=date(2026, 10, 9), kind=SessionKind.CLOSED, clock=None, provenance="test"),
+    )
+
+    async def _boom_oracle(*args, **kwargs):
+        raise AssertionError("CLOSED gate must skip before the KIS oracle")
+
+    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _boom_oracle)
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        archive_intraday, "record_run_outcome", lambda job, outcome, **kw: recorded.append((job, outcome, kw))
+    )
+
+    assert archive_intraday.run_intraday_archive(snapshot_date="2026-10-09", profile=_raw_profile(tmp_path)) == (0, 0, 0)
+    assert recorded == [
+        (
+            "archive_intraday",
+            "SKIPPED",
+            {"run_date": "2026-10-09", "reason": "non_trading_day", "metrics": {"session": "CLOSED"}},
+        )
+    ]
 
 
 def test_run_archive_full_complete_and_partial_entries(monkeypatch, tmp_path) -> None:

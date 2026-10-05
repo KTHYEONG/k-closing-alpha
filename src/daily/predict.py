@@ -21,7 +21,7 @@ from src.data.io_utils import (
 )
 from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day, trading_session_gate
 from src.data.trading_calendar import DAY_HOLIDAY, DAY_WEEKEND, classify_day
-from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, RUN_OUTCOME_OK, record_run_outcome
+from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, RUN_OUTCOME_OK, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -403,7 +403,7 @@ def run_automated_topk_decision(
         if day.kind is SessionKind.CLOSED:
             trading_day = classify_day(date_str, trading_day_fn)
             if trading_day in (DAY_WEEKEND, DAY_HOLIDAY):
-                outcome, reason = RUN_OUTCOME_OK, "non_trading_day"
+                outcome, reason = RUN_OUTCOME_SKIPPED, "non_trading_day"
             else:
                 outcome, reason = RUN_OUTCOME_NO_DECISION, "calendar_disagreement"
             metrics: dict[str, Any] = {"n_picks": 0, "day": trading_day, "session": day.kind.value}
@@ -420,7 +420,7 @@ def run_automated_topk_decision(
     if failures:
         trading_day = classify_day(date_str, trading_day_fn)
         if trading_day in (DAY_WEEKEND, DAY_HOLIDAY):
-            outcome, reason = RUN_OUTCOME_OK, "non_trading_day"
+            outcome, reason = RUN_OUTCOME_SKIPPED, "non_trading_day"
         else:
             outcome, reason = RUN_OUTCOME_NO_DECISION, f"{type(failures[0]).__name__}: {failures[0]}"
         logger.warning("오늘 자동 유니버스 기준 진입 후보 없음(미참여)")

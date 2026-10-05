@@ -974,9 +974,20 @@ def test_main_logs_non_trading_day_skip(tmp_path, monkeypatch, caplog) -> None:
 
     monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path))
     monkeypatch.setattr(auction_capture, "_run_async", _holiday)
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        auction_capture, "record_run_outcome", lambda job, outcome, **kw: recorded.append((job, outcome, kw))
+    )
     with caplog.at_level(logging.INFO, logger=auction_capture.logger.name):
         auction_capture.main(["--phase", "close", "--date", "2026-09-24"])
     assert any("reason=non_trading_day" in r.message for r in caplog.records)
+    assert recorded == [
+        (
+            "auction_capture",
+            "SKIPPED",
+            {"run_date": "2026-09-24", "reason": "non_trading_day", "metrics": {"session": "CLOSED"}},
+        )
+    ]
 
 
 def _shifted_close_clock(trading_day):
