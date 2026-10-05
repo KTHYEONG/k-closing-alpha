@@ -25,6 +25,7 @@ systemctl --user enable --now \
   kca-price-ingest.timer \
   kca-aftermarket-book.timer \
   kca-daily-audit.timer \
+  kca-audit-reconcile.timer \
   kca-backup.timer \
   kca-backup-prune.timer \
   kca-core-snapshot.timer \

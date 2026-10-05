@@ -1,7 +1,7 @@
 [Unit]
-Description=KCA daily audit (visualizes missing steps)
+Description=KCA audit reconcile (re-measure self-healing conditions)
 OnFailure=kca-alert@%n.service
-After=network.target kca-archive-intraday.service kca-archive-intraday-regular.service kca-aftermarket-book.service kca-tape-sweep.service
+After=network.target
 
 [Service]
 Type=oneshot
@@ -10,7 +10,6 @@ EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 EnvironmentFile=%h/quant-secrets/kis-data.env
 Environment=TZ=Asia/Seoul
 Environment=BROKER_ADMISSION_CLASS=standard
-# 실측 최대 75초 → 30분
-TimeoutStartSec=30min
+TimeoutStartSec=15min
 ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts %h/.cache/kis
-ExecStart=/usr/bin/flock -w 600 %t/kca-audit.lock %h/.local/bin/uv run python -m src.tools.daily_audit
+ExecStart=/usr/bin/flock -w 600 %t/kca-audit.lock %h/.local/bin/uv run python -m src.tools.audit_reconcile
