@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 RUN_OUTCOME_OK: str = "OK"
 RUN_OUTCOME_DEGRADED: str = "DEGRADED"
 RUN_OUTCOME_NO_DECISION: str = "NO_DECISION"
-RUN_OUTCOMES: tuple[str, ...] = (RUN_OUTCOME_OK, RUN_OUTCOME_DEGRADED, RUN_OUTCOME_NO_DECISION)
+RUN_OUTCOME_SKIPPED: str = "SKIPPED"
+RUN_OUTCOMES: tuple[str, ...] = (RUN_OUTCOME_OK, RUN_OUTCOME_DEGRADED, RUN_OUTCOME_NO_DECISION, RUN_OUTCOME_SKIPPED)
 RUN_OUTCOMES_ALERTED: frozenset[str] = frozenset({RUN_OUTCOME_DEGRADED, RUN_OUTCOME_NO_DECISION})
 # 알림/로그 한 줄 길이 상한(예외 메시지 전체 덤프 방지).
 RUN_EVENT_REASON_MAX_CHARS: int = 300
@@ -47,10 +48,13 @@ def record_run_outcome(
 
     Args:
         job: Job name (e.g. predict, finalize_close).
-        outcome: One of RUN_OUTCOMES.
+        outcome: One of RUN_OUTCOMES. SKIPPED is a deliberate no-op (e.g.
+            non_trading_day, session_closed); it is never alerted and never
+            counts as success -- consumers needing output compare to OK.
         run_date: Run date (YYYY-MM-DD).
         reason: Short reason string; credential-masked, then truncated to
             RUN_EVENT_REASON_MAX_CHARS, before it reaches the event log, logger or digest.
+            Required (non-blank) for SKIPPED so the cause stays machine-readable.
         metrics: Optional metrics mapping serialized with full float precision.
         path: Explicit event log path override (tests).
         alert_fn: Alert dispatcher override (tests).
@@ -59,10 +63,13 @@ def record_run_outcome(
         The recorded event dict.
 
     Raises:
-        ValueError: When outcome is not in RUN_OUTCOMES.
+        ValueError: When outcome is not in RUN_OUTCOMES, or when SKIPPED
+            has an empty or whitespace-only reason.
     """
     if outcome not in RUN_OUTCOMES:
         raise ValueError(f"unknown run outcome {outcome!r}; expected one of {RUN_OUTCOMES}")
+    if outcome == RUN_OUTCOME_SKIPPED and not reason.strip():
+        raise ValueError("SKIPPED run outcome requires a non-blank reason")
     record = {
         "ts": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(timespec="seconds"),
         "job": job,
@@ -84,7 +91,7 @@ def record_run_outcome(
             type(exc).__name__,
         )
     logger.log(
-        logging.INFO if outcome == RUN_OUTCOME_OK else logging.WARNING,
+        logging.INFO if outcome in (RUN_OUTCOME_OK, RUN_OUTCOME_SKIPPED) else logging.WARNING,
         "[SYS] stage=run_outcome job=%s run_date=%s outcome=%s reason=%s",
         job,
         run_date,

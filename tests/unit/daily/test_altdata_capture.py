@@ -513,10 +513,21 @@ def test_main_weekday_holiday_skips(tmp_path, monkeypatch, caplog) -> None:
 
     monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path))
     monkeypatch.setattr(altdata_capture, "run_altdata_capture", _boom_run)
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        altdata_capture, "record_run_outcome", lambda job, outcome, **kw: recorded.append((job, outcome, kw))
+    )
     with caplog.at_level(logging.INFO, logger=altdata_capture.logger.name):
         rc = altdata_capture.main(["--date", "2026-09-24"], trading_day_fn=lambda _d: False)
     assert rc == 0
     assert "reason=non_trading_day" in caplog.text
+    assert recorded == [
+        (
+            "altdata_capture",
+            "SKIPPED",
+            {"run_date": "2026-09-24", "reason": "non_trading_day", "metrics": {"session": "CLOSED"}},
+        )
+    ]
 
 
 def test_main_calendar_closure_skips_without_oracle(tmp_path, monkeypatch, caplog) -> None:
@@ -536,10 +547,21 @@ def test_main_calendar_closure_skips_without_oracle(tmp_path, monkeypatch, caplo
         ),
     )
     monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path))
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        altdata_capture, "record_run_outcome", lambda job, outcome, **kw: recorded.append((job, outcome, kw))
+    )
     with caplog.at_level(logging.INFO, logger=altdata_capture.logger.name):
         rc = altdata_capture.main(["--date", "2026-10-09"], trading_day_fn=_boom_oracle)
     assert rc == 0
     assert "reason=non_trading_day" in caplog.text
+    assert recorded == [
+        (
+            "altdata_capture",
+            "SKIPPED",
+            {"run_date": "2026-10-09", "reason": "non_trading_day", "metrics": {"session": "CLOSED"}},
+        )
+    ]
 
 
 def test_main_trading_day_runs(tmp_path, monkeypatch) -> None:

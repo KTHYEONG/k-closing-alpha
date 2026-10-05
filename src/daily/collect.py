@@ -36,7 +36,7 @@ from src.utils.display import Colors
 from src.daily import archive
 from src.daily.universe_scan import fetch_candidate_stock_list, fetch_trade_value_union
 from src.data.trading_calendar import is_kis_trading_day, resolve_prev_trading_day_kis
-from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, record_run_outcome
+from src.tools.run_outcome import RUN_OUTCOME_NO_DECISION, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.numeric import safe_float
 from src.daily.universe_screen import build_screen_frame
 from src.daily.security_classification import load_security_classification
@@ -1174,6 +1174,13 @@ async def main(force: bool = False) -> None:
                 logger.info("[DATA] stage=collect status=SKIP reason=calendar_disagreement date=%s", snapshot_date)
                 return
             # 휴장일은 장애가 아니다: 정상 종료해 OnFailure 오탐 알림과 하위 단계 오류를 막는다
+            record_run_outcome(
+                "collect",
+                RUN_OUTCOME_SKIPPED,
+                run_date=snapshot_date,
+                reason="non_trading_day",
+                metrics={"session": "CLOSED"},
+            )
             logger.info("[DATA] stage=collect status=SKIP reason=non_trading_day date=%s", snapshot_date)
             return
 

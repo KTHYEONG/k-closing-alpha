@@ -59,7 +59,7 @@ from src.execution.paper_broker import (
     size_order_qty,
     sizing_price,
 )
-from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_NO_DECISION, record_run_outcome
+from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_NO_DECISION, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 from src.utils.numeric import safe_float
 
@@ -506,6 +506,13 @@ async def _run_entry(
     session_day = _resolve_session_day(decision_date, session_day_fn)
     session_gate = trading_session_gate(session_day)
     if session_day.kind is SessionKind.CLOSED:
+        if record_fn is not None:
+            record_fn(
+                RUN_OUTCOME_SKIPPED,
+                run_date=date_str,
+                reason="non_trading_day",
+                metrics={"session": "CLOSED"},
+            )
         logger.info("[DATA] stage=paper_entry status=SKIP reason=non_trading_day date=%s", date_str)
         return 0
     with ledger.exclusive():
@@ -522,6 +529,13 @@ async def _run_entry(
             else:
                 trading_open = await trading_day_fn(date_str)
             if not trading_open:
+                if record_fn is not None:
+                    record_fn(
+                        RUN_OUTCOME_SKIPPED,
+                        run_date=date_str,
+                        reason="non_trading_day",
+                        metrics={"session": "CLOSED"},
+                    )
                 logger.info("[DATA] stage=paper_entry status=SKIP reason=non_trading_day date=%s", date_str)
                 return 0
             ledger.record_no_decision(date_str, reason="no_persisted_decision")
@@ -766,6 +780,13 @@ async def _run_exit(
                     )
                 return 0
             logger.info("[EXEC] stage=paper_exit status=SKIP reason=non_trading_day date=%s", date_str)
+            if record_fn is not None:
+                record_fn(
+                    RUN_OUTCOME_SKIPPED,
+                    run_date=date_str,
+                    reason="non_trading_day",
+                    metrics={"session": "CLOSED"},
+                )
             return 0
         if session_day.kind is SessionKind.CLOSED:
             if record_fn is not None:

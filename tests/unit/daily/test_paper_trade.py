@@ -1748,17 +1748,20 @@ def test_run_paper_session_entry_on_holiday_writes_no_no_decision_row(tmp_path, 
     ledger = PaperLedger(root=tmp_path)
 
     # When
+    outcomes: list[tuple] = []
     n = asyncio.run(
         paper_trade.run_paper_session(
             pd.Timestamp("2026-09-24"), phase="entry", ledger=ledger, session=None,
             now_fn=lambda: pd.Timestamp("2026-09-24 15:34:00", tz="Asia/Seoul"),
             trading_day_fn=_holiday,
+            record_fn=lambda *a, **k: outcomes.append((a, k)),
         )
     )
 
     # Then: decisions 원장 그대로(침묵의 무기록 금지 행을 휴장에 남기지 않는다)
     assert n == 0
     assert not (tmp_path / "decisions.parquet").exists()
+    assert outcomes == [(("SKIPPED",), {"run_date": "2026-09-24", "reason": "non_trading_day", "metrics": {"session": "CLOSED"}})]
 
 
 def test_run_paper_session_entry_default_oracle_skips_holiday_quietly(tmp_path, monkeypatch) -> None:
@@ -2355,17 +2358,20 @@ def test_run_paper_session_entry_writes_nothing_on_closed_day(tmp_path, monkeypa
     date_str = "2026-10-09"
     _entry_picks(monkeypatch, paper_trade, pd, date_str)
     ledger = PaperLedger(root=tmp_path)
+    outcomes: list[tuple] = []
     n = asyncio.run(
         paper_trade.run_paper_session(
             pd.Timestamp(date_str), phase="entry", ledger=ledger, session=None,
             now_fn=lambda: pd.Timestamp(f"{date_str} 15:34:00", tz="Asia/Seoul"),
             session_day_fn=lambda d: _session_day_for(SessionKind.CLOSED, d),
+            record_fn=lambda *a, **k: outcomes.append((a, k)),
         )
     )
 
     assert n == 0
     assert not (tmp_path / "orders.parquet").exists()
     assert not (tmp_path / "fills.parquet").exists()
+    assert outcomes == [(("SKIPPED",), {"run_date": date_str, "reason": "non_trading_day", "metrics": {"session": "CLOSED"}})]
 
 
 def _open_lot_ledger(tmp_path, pd, decision_date: str, fill_date: str):
@@ -2436,7 +2442,7 @@ def test_run_paper_session_exit_silently_skips_confirmed_holiday(tmp_path, monke
 
     assert n == 0
     assert len(ledger.load_open_positions()) == 1
-    assert outcomes == []
+    assert outcomes == [(("SKIPPED",), {"run_date": "2026-10-09", "reason": "non_trading_day", "metrics": {"session": "CLOSED"}})]
 
 
 def test_load_open_lot_marks_uses_last_close_before_the_snapshot_and_skips_same_day_lots(tmp_path) -> None:

@@ -55,7 +55,7 @@ from src.data.intraday_store import write_intraday_partition, write_tick_partiti
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day, resolve_prev_trading_day_kis
 from src.execution.paper_broker import HeldRoster, load_held_roster
-from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, record_run_outcome
+from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -881,6 +881,13 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
     _validate_phase(phase)
     session_day = resolve_session_day(trading_day)
     if session_day.kind is SessionKind.CLOSED:
+        record_run_outcome(
+            "archive_intraday",
+            RUN_OUTCOME_SKIPPED,
+            run_date=str(snap_date),
+            reason="non_trading_day",
+            metrics={"session": "CLOSED"},
+        )
         logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
         return (0, 0, 0)
     store = CaptureStore(_capture_root(prof))
@@ -893,6 +900,13 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
         async with client.create_session() as session:
             await client.ensure_token(session)
             if not await is_kis_trading_day(client, session, str(snap_date)):
+                record_run_outcome(
+                    "archive_intraday",
+                    RUN_OUTCOME_SKIPPED,
+                    run_date=str(snap_date),
+                    reason="non_trading_day",
+                    metrics={"session": "CLOSED"},
+                )
                 logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
                 return (0, 0, 0)
             # 휴장일엔 collect가 코호트를 발행하지 않으므로, 코호트 조회는 거래일 판정 뒤에 해야 오탐 실패가 없다.

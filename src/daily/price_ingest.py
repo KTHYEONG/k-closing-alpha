@@ -50,7 +50,7 @@ from src.data.panel_integrity import heal_price_history_panel
 from src.data.parquet_codec import write_price_history_parquet
 from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day
 from src.strategy.contract import derive_chg_ratio
-from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, record_run_outcome
+from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -1156,10 +1156,17 @@ async def run_price_ingest(
             program_shortfall,
         )
     if on_outcome is not None:
+        run_date_str = run_day.strftime("%Y-%m-%d")
+        if shortfall or program_shortfall:
+            outcome, reason = RUN_OUTCOME_DEGRADED, "flow_coverage_below_min"
+        elif len(new_rows) == 0 and resolve_session_day(run_day.date()).kind is SessionKind.CLOSED:
+            outcome, reason = RUN_OUTCOME_SKIPPED, "non_trading_day"
+        else:
+            outcome, reason = RUN_OUTCOME_OK, ""
         on_outcome(
-            RUN_OUTCOME_DEGRADED if shortfall or program_shortfall else RUN_OUTCOME_OK,
-            run_date=run_day.strftime("%Y-%m-%d"),
-            reason="flow_coverage_below_min" if shortfall or program_shortfall else "",
+            outcome,
+            run_date=run_date_str,
+            reason=reason,
             metrics={
                 "ingested_dates": report.ingested_dates,
                 "n_new_rows": report.n_new_rows,
