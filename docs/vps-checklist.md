@@ -39,7 +39,9 @@ Recommended unattended schedule: **W** at 07:20, 08:45 (light), 15:23 and 15:36,
   Heavy probes use `nice -n 10 timeout 300` and run outside blackouts and outside 22:15–00:15 when avoidable (backup,
   extended backfill 23:05, Drive lock).
 - **Secrets:** never print `~/quant-secrets/*.env`, `env`, token caches, `rclone config show`. Report key *names* and modes.
-- **Timezones:** host clock and `journalctl --since/--until` are **UTC**; every timer `OnCalendar` is **Asia/Seoul**
+- **Timezones:** host clock and `journalctl --since/--until` are **UTC**; convert KST with
+  `k(){ date -u -d "TZ=\"Asia/Seoul\" $1" +"%F %T"; }` then `k "2026-10-02 15:00"` -> `2026-10-02 06:00:00`
+  (do **not** use `TZ=Asia/Seoul date -d ... -u`: `-u` re-reads the input as UTC and returns it unchanged); every timer `OnCalendar` is **Asia/Seoul**
   (KST = UTC+9). Convert before judging "late/missing". Pass `TZ=Asia/Seoul` to Python. Date columns inside parquet are KST dates.
 - **Evidence or it did not happen:** every PASS cites the command/line it rests on. Ambiguous → `WARN`, never silent PASS.
   Things you could not check go in the report's `NOT VERIFIED` list with the reason.
@@ -112,6 +114,12 @@ For each window run mode **W** about 2 minutes after the slot. Inside blackouts 
 | 07:30 / 12:30 / after backup | `kca-audit-reconcile` | runs every day; heartbeat `reconciled_at` advances only when state exists | P2 |
 | 07:40 Tue–Sat (GHA) | `watchdog.yml` | succeeded | P1 dead-man |
 
+Normal evidence (observed on trading day 2026-10-02) so you can recognise health: `collect` finished 15:20:46 (`realtime_coverage ... coverage=1.0000 status=COMPLETE`);
+`predict` outcome `OK n_picks=3` at 15:21:16 (before 15:30:00); `finalize-close` `close_finalization n_finalized == archive rows, n_unconfirmed=0` at ~15:31:04;
+`paper-entry` at 15:34 logs `SKIP reason=already_recorded` — healthy, because `finalize-close` already recorded the entry and the 15:34 unit is the idempotent
+backstop (a missing entry is only a finding if no fill/NO_DECISION row exists, §8). Token units: warmup `status=ISSUED` on trading days and
+`SKIP reason=non_trading_day` on `CLOSED`; Kiwoom rotate `ROTATED` or `UNCHANGED` (both healthy); neither is a data load.
+
 Derive the live schedule instead of trusting this table (it drifts when timers change):
 
 ```bash
@@ -134,7 +142,8 @@ ssh or-vps 'cd ~/k-closing-alpha && for t in deploy/systemd/*.timer; do n=$(base
   systemctl --user list-units --failed --no-legend; systemctl --user list-timers "kca-*" --all --no-pager | tail -5'
 ```
 
-- [ ] **DEP-01** VPS HEAD == `origin/main` (or the newest commit whose deploy succeeded; a gap inside a blackout is expected).
+- [ ] **DEP-01** VPS HEAD == `origin/main`. A gap is explained only if `gh run list` shows that commit's deploy `in_progress`
+      (wait/re-check, not drift), or a deploy deferred by a blackout. A gap with a failed or absent run is a finding.
 - [ ] **DEP-02** VPS `git status --porcelain` empty; `latest` image ID == `sha-<HEAD>` image ID; last 5 deploys green or explained.
 - [ ] **SCH-01** Every repo timer is `enabled` except `OPTIONAL_MANUAL_TIMERS` (`src/tools/code_sync.py`: auction-open,
       auction-close, altdata-capture — report their state). A disabled non-optional timer is **P1**.
@@ -143,7 +152,9 @@ ssh or-vps 'cd ~/k-closing-alpha && for t in deploy/systemd/*.timer; do n=$(base
 - [ ] **SCH-04** Each `--failed` unit: get the cause (`journalctl --user -u <unit> --since "<D-1 UTC> 12:00" --no-pager | tail -60`),
       classify transient/precondition/code bug, and say whether a newer deploy already fixed it (failed state persists until the next run).
 
-Per-unit run evidence for every unit due on `D` (use UTC in `--since`; oneshot containers are `--rm`, so `docker logs` is empty
+Per-unit run evidence for every unit due on `D` (build `--since/--until` with the `k` helper of §1;
+`systemctl show ... ExecMain*Timestamp` and `Result` describe only the **latest** run, so for `D` use the journal window and the
+run-outcome log, never `show`; oneshot containers are `--rm`, so `docker logs` is empty
 afterwards — the journal is the only record):
 
 ```bash
@@ -171,8 +182,11 @@ ssh or-vps 'df -h / ; df -i / | tail -1; free -h | sed -n 2p; docker system df; 
 - [ ] **HOST-01** disk < 80 %, inodes < 80 %; record free GB and the change since the last report (capture grows daily; project
       the days until 80 %).
 - [ ] **HOST-02** memory `available` > 2 GiB at rest (retrain uses `--memory=6g`; the host is shared).
-- [ ] **HOST-03** no lingering `kca-*` containers outside a job window (stuck container = hung unit); neighbours' containers are listed, not judged.
-- [ ] **HOST-04** old `sha-*` images and journal size reported with trend (no auto-prune by this repo).
+- [ ] **HOST-03** `Up` `kca-*` containers only inside a job window (else a hung unit). An `Exited` `kca-*` container is a leftover
+      of a hand-run `docker run` without `--rm` (P2 hygiene: name it, say who likely created it, ask before removal). Neighbours' containers are listed, not judged.
+- [ ] **HOST-04** `ghcr.io/kthyeong/k-closing-alpha` images: `latest` plus at most the 2 previous `sha-*` tags (rollback set); older tags are
+      cleanup candidates (report; remove only with operator authorization, never touch neighbours' images). Journal size reported with trend
+      (no auto-prune by this repo).
 
 ## 7. Data Integrity — four levels (presence is not correctness)
 
@@ -254,7 +268,7 @@ ssh or-vps 'R=~/.local/bin/rclone; $R about gdrive: 2>&1 | head -4; $R lsd gdriv
 ```
 
 - [ ] **BAK-01** last run `status=ok`, every `steps.*` ok (`deferred` is a WARN: budget exhausted — track whether it drains),
-      started at/after the last Mon–Fri 22:15 KST slot. While a run is active `in_progress.json` exists and `now < deadline_at`
+      started at/after the last Mon–Fri 22:15 KST slot. The marker's `started_at` is written after the unit's pre-steps, normally 0–2 min after the slot. While a run is active `in_progress.json` exists and `now < deadline_at`
       (else interrupted = P1). Outside the run window no marker may exist.
 - [ ] **BAK-02** `core_panels` row counts never shrink (`CORE_ROW_SHRINK_TOLERANCE = 0`); a shrink is **P0**.
 - [ ] **BAK-03** duration baseline: steady state is minutes (50 s – 6 min observed with ≤ 6 segments); hours are expected only while
@@ -302,7 +316,8 @@ for p in s["projects"]:
 EOF'
 ```
 
-- [ ] **ALR-01** heartbeat `snapshot_date == D`, `finished_at` ≈ 21:20–21:45 KST (weekday), `undelivered_alerts == 0`, `schema_version == 2`.
+- [ ] **ALR-01** heartbeat `snapshot_date` is the latest **weekday** audited (it can be later than `D`, e.g. a weekday holiday has `day_kind=holiday`);
+      its `finished_at` is ≈ 21:20–21:45 KST of that weekday or a later `reconciled_at`; `undelivered_alerts == 0`; `schema_version == 2`.
 - [ ] **ALR-02** every `open_issues[*]` maps to a finding in this report; `provisional_reasons` non-empty only while the backup runs.
       A WARN subject with `open_issues == []`, or `open_issues` that no longer reproduce, means reconcile did not clear it (P2 — name the stale source).
 - [ ] **ALR-03** each failed unit in the window produced a `kca-alert@<unit>` instance that **delivered**; a failed alert = P1 blind spot.
