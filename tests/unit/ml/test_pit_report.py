@@ -112,6 +112,18 @@ def test_pit_certification_metadata_missing_report() -> None:
     json.dumps(meta)
 
 
+def test_pit_certification_metadata_records_scored_arm() -> None:
+    meta1 = pit_certification_metadata(
+        _full_report(), gate_mode="advisory", gate_status="PASS", gate_reasons=(), arm="arm1")
+    assert meta1["arm"] == "arm1"
+    assert meta1["mean_net_bp"]["pit_native"] == 7.0
+    meta2 = pit_certification_metadata(
+        _full_report(), gate_mode="advisory", gate_status="PASS", gate_reasons=(), arm="arm2")
+    assert meta2["arm"] == "arm2"
+    missing = pit_certification_metadata(None, gate_mode="advisory", gate_status="MISSING", gate_reasons=())
+    assert missing["arm"] == "none"
+
+
 def test_bundle_pit_certification_backward_compatible() -> None:
     import pytest
 
@@ -237,8 +249,37 @@ def test_pit_report_refuses_partial_persistence(tmp_path) -> None:
         save_pit_haircut_report(partial2, _daily(), out_dir=tmp_path)
 
 
+def _recon_bindings(**overrides):
+    from src.ml.pit_report import CertificationBindings
+
+    base = {
+        "decomposition_config_sha256": "a" * 64,
+        "calibration_table_sha256": "b" * 64,
+        "exact_report_sha256": "c" * 64,
+        "recon_report_sha256": "d" * 64,
+    }
+    base.update(overrides)
+    return CertificationBindings(**base)
+
+
+def _recon_stability(**overrides):
+    from src.ml.pit_report import CalibrationStability
+
+    base: dict = {
+        "passed": True,
+        "rel_err_p90": 0.10,
+        "coverage": 0.80,
+        "bias_drift": 0.01,
+        "alpha_at_boundary": False,
+        "n_holdout_rows": 40,
+        "detail": "",
+    }
+    base.update(overrides)
+    return CalibrationStability(**base)
+
+
 def _recon_cert(**overrides):
-    from src.ml.pit_report import CalibrationStability, ReconstructionCertification
+    from src.ml.pit_report import ReconstructionCertification
 
     base: dict = {
         "generated_at": "2026-10-05T00:00:00+09:00",
@@ -248,8 +289,20 @@ def _recon_cert(**overrides):
         "dropped_days": ("2026-03-04",),
         "coverage_improvement": PairedDelta(delta=4.0, ci_low=2.0, ci_high=6.0, p_value=0.001, n_days=60),
         "reconstruction_feature": PairedDelta(delta=0.2, ci_low=-1.0, ci_high=1.4, p_value=0.6, n_days=60),
-        "stability": CalibrationStability(passed=True, median_rel_err=0.03, n_scored=40, detail=""),
+        "stability": _recon_stability(),
         "coverage_by_year_and_basis": {"exact": {"2026": {"live_1520": 0.95}}},
+        "bindings": _recon_bindings(),
+        "fidelity": {
+            "chg_rank_correlation": 0.99,
+            "tv_rank_correlation": 0.98,
+            "top_k_overlap": 0.97,
+            "n_paired_days": 60.0,
+            "n_symbol_days": 600.0,
+            "n_no_share": 5.0,
+        },
+        "holdout_start": "2026-08-25",
+        "holdout_end": "2026-08-31",
+        "gate_config": {"feature_margin_bp": 5.0, "min_tv_rank_correlation": 0.95},
         "gate_verdict": "ADOPT",
         "gate_reasons": (),
     }
@@ -333,6 +386,28 @@ def test_reconstruction_certification_rejects_malformed_payloads(tmp_path) -> No
     nulled = dict(base, stability=None)
     _write(nulled)
     assert load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME).stability is None
+    _write(dict(base, schema_version=1))
+    with pytest.raises(ValueError, match="schema_version"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, bindings={**base["bindings"], "extra": "x"}))
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    slim_bindings = {k: v for k, v in base["bindings"].items() if k != "exact_report_sha256"}
+    _write(dict(base, bindings=slim_bindings))
+    with pytest.raises(ValueError, match="missing keys"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, bindings={**base["bindings"], "exact_report_sha256": "not-hex"}))
+    with pytest.raises(ValueError, match="hex digest"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, bindings="yes"))
+    with pytest.raises(ValueError, match="must be a mapping"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, stability={**base["stability"], "alpha_at_boundary": "false"}))
+    with pytest.raises(ValueError, match="alpha_at_boundary"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    _write(dict(base, stability={**base["stability"], "n_holdout_rows": "x"}))
+    with pytest.raises(ValueError, match="n_holdout_rows"):
+        load_reconstruction_certification(tmp_path / RECONSTRUCTION_CERTIFICATION_FILENAME)
 
     with pytest.raises(ValueError, match="unpopulated"):
         save_reconstruction_certification(
@@ -340,3 +415,6 @@ def test_reconstruction_certification_rejects_malformed_payloads(tmp_path) -> No
     with pytest.raises(ValueError, match="unpopulated"):
         save_reconstruction_certification(
             dataclasses.replace(_recon_cert(), coverage_by_year_and_basis=None), out_path=tmp_path / "y.json")
+    with pytest.raises(ValueError, match="unpopulated"):
+        save_reconstruction_certification(
+            dataclasses.replace(_recon_cert(), bindings=None), out_path=tmp_path / "z.json")

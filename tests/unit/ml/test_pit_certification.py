@@ -632,17 +632,20 @@ def test_coverage_by_year_and_basis_reports_means() -> None:
         coverage_by_year_and_basis(frame.drop(columns=["superset_coverage"]))
 
 
-def test_calibration_to_loop_frames_derive_both_arms() -> None:
+def _loop_config(**overrides):
     from src.data.nxt_decomposition import DecompositionConfig
-    from src.ml.research.pit_certification import calibration_to_loop_frames
 
-    config = DecompositionConfig(
-        ewma_alpha=0.5, min_prior_days=1, max_gap_days=30, auction_fraction_mean=0.0365,
-        bias_correction=1.0, volume_rel_err_p90=0.144, close_bp_err_p90=11.9,
-        calibrated_through="2026-09-30", fit_start="2026-09-01",
-        holdout_start="2026-08-25", holdout_end="2026-08-31",
-    )
-    days = pd.bdate_range("2026-03-02", periods=5).strftime("%Y-%m-%d").tolist()
+    base = {
+        "ewma_alpha": 0.5, "min_prior_days": 1, "max_gap_days": 30, "auction_fraction_mean": 0.0365,
+        "bias_correction": 1.0, "volume_rel_err_p90": 0.144, "close_bp_err_p90": 11.9,
+        "calibrated_through": "2026-09-30", "fit_start": "2026-09-01",
+        "holdout_start": "2026-08-25", "holdout_end": "2026-08-31",
+    }
+    base.update(overrides)
+    return DecompositionConfig(**base)
+
+
+def _loop_table(days, symbols=("000001", "000002")):
     rows = [
         {
             "date": day, "symbol": symbol, "v_krx_1520": 6800.0, "v_cons_1520": 10000.0,
@@ -650,33 +653,94 @@ def test_calibration_to_loop_frames_derive_both_arms() -> None:
             "close_krx_1519": 50000.0, "close_cons_1519": 50050.0,
         }
         for day in days
-        for symbol in ("000001", "000002")
+        for symbol in symbols
     ]
-    calibration = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+
+def test_calibration_to_loop_frames_derive_both_arms() -> None:
+    from src.ml.research.pit_certification import calibration_to_loop_frames
+
+    config = _loop_config()
+    days = pd.bdate_range("2026-03-02", periods=5).strftime("%Y-%m-%d").tolist()
+    calibration = _loop_table(days)
     prev_closes = {(day, symbol): 49000.0 for day in days for symbol in ("000001", "000002")}
-    frames = calibration_to_loop_frames(calibration, config=config, prev_closes=prev_closes)
-    assert len(frames.exact) == 10
+    frames = calibration_to_loop_frames(
+        calibration, config=config, prev_closes=prev_closes, score_start=days[0], score_end=days[-1])
+    assert len(frames.exact) == 8
     assert len(frames.recon) == 8
+    assert frames.exact[["date", "symbol"]].apply(tuple, axis=1).tolist() == \
+        frames.recon[["date", "symbol"]].apply(tuple, axis=1).tolist()
     assert frames.n_no_share == 2
     assert set(frames.recon["date"]) == set(days[1:])
     with pytest.raises(ValueError, match="eod_volume"):
-        calibration_to_loop_frames(calibration.drop(columns=["eod_volume"]), config=config, prev_closes=prev_closes)
-    bad_config = DecompositionConfig(
-        ewma_alpha=0.5, min_prior_days=1, max_gap_days=30, auction_fraction_mean=float("nan"),
-        bias_correction=1.0, volume_rel_err_p90=0.144, close_bp_err_p90=11.9,
-        calibrated_through="2026-09-30", fit_start="2026-09-01",
-        holdout_start="2026-08-25", holdout_end="2026-08-31",
-    )
+        calibration_to_loop_frames(
+            calibration.drop(columns=["eod_volume"]), config=config, prev_closes=prev_closes,
+            score_start=days[0], score_end=days[-1])
+    bad_config = _loop_config(auction_fraction_mean=float("nan"))
     with pytest.raises(ValueError, match="auction fraction"):
-        calibration_to_loop_frames(calibration, config=bad_config, prev_closes=prev_closes)
+        calibration_to_loop_frames(
+            calibration, config=bad_config, prev_closes=prev_closes,
+            score_start=days[0], score_end=days[-1])
     broken_dates = calibration.copy()
     broken_dates.loc[0, "date"] = "not-a-date"
     with pytest.raises(ValueError, match="unparseable"):
-        calibration_to_loop_frames(broken_dates, config=config, prev_closes=prev_closes)
+        calibration_to_loop_frames(
+            broken_dates, config=config, prev_closes=prev_closes,
+            score_start=days[0], score_end=days[-1])
+    with pytest.raises(ValueError, match="score_start"):
+        calibration_to_loop_frames(
+            calibration, config=config, prev_closes=prev_closes,
+            score_start=days[-1], score_end=days[0])
+    for start in ("not-a-date", "NaT"):
+        with pytest.raises(ValueError, match="unparseable score window"):
+            calibration_to_loop_frames(calibration, config=config, prev_closes=prev_closes,
+                                       score_start=start, score_end=days[-1])
     odd_prev = dict(prev_closes)
-    odd_prev[(days[0], "000001")] = None
-    odd = calibration_to_loop_frames(calibration, config=config, prev_closes=odd_prev)
-    assert len(odd.exact) == 9
+    odd_prev[(days[1], "000001")] = None
+    odd = calibration_to_loop_frames(
+        calibration, config=config, prev_closes=odd_prev, score_start=days[0], score_end=days[-1])
+    assert len(odd.exact) == 7 and len(odd.recon) == 7
+
+
+def test_loop_frames_are_holdout_scoped_and_causal() -> None:
+    from src.ml.research.pit_certification import calibration_to_loop_frames
+
+    config = _loop_config()
+    fit_days = pd.bdate_range("2026-09-01", periods=4).strftime("%Y-%m-%d").tolist()
+    holdout_days = pd.bdate_range("2026-08-25", periods=4).strftime("%Y-%m-%d").tolist()
+    all_days = sorted(holdout_days + fit_days)
+    calibration = _loop_table(all_days)
+    prev_closes = {(day, s): 49000.0 for day in all_days for s in ("000001", "000002")}
+    base = calibration_to_loop_frames(
+        calibration, config=config, prev_closes=prev_closes,
+        score_start=holdout_days[0], score_end=holdout_days[-1])
+    mutated = calibration.copy()
+    mask = mutated["date"].isin(fit_days)
+    mutated.loc[mask, "eod_volume"] = mutated.loc[mask, "eod_volume"] * 3.7
+    mutated.loc[mask, "v_cons_1520"] = mutated.loc[mask, "v_cons_1520"] * 2.3
+    again = calibration_to_loop_frames(
+        mutated, config=config, prev_closes=prev_closes,
+        score_start=holdout_days[0], score_end=holdout_days[-1])
+    pd.testing.assert_frame_equal(base.exact, again.exact)
+    pd.testing.assert_frame_equal(base.recon, again.recon)
+    assert base.n_no_share == again.n_no_share
+    assert not set(base.exact["date"]).intersection(fit_days)
+    assert not set(base.recon["date"]).intersection(fit_days)
+
+
+def test_loop_frames_count_unreconstructable_days() -> None:
+    from src.ml.research.pit_certification import calibration_to_loop_frames
+
+    config = _loop_config(min_prior_days=2)
+    days = pd.bdate_range("2026-03-02", periods=3).strftime("%Y-%m-%d").tolist()
+    calibration = _loop_table(days, symbols=("000001",))
+    prev_closes = {(day, "000001"): 49000.0 for day in days}
+    frames = calibration_to_loop_frames(
+        calibration, config=config, prev_closes=prev_closes, score_start=days[0], score_end=days[-1])
+    assert frames.n_no_share == 2
+    assert len(frames.exact) == 1 and len(frames.recon) == 1
+    assert set(frames.exact["date"]) == {days[-1]}
 
 
 def test_reconstruction_in_the_loop_uses_hidden_truth_only() -> None:
@@ -731,73 +795,6 @@ def test_reconstruction_in_the_loop_skips_degenerate_days() -> None:
     assert np.isnan(result.feature_component.ci_low)
 
 
-def test_check_calibration_stability_first_half_fit_second_half_score() -> None:
-    from src.ml.research.pit_certification import check_calibration_stability
-
-    def _calibration(shares_early, shares_late):
-        early = pd.bdate_range("2026-01-05", periods=len(shares_early)).strftime("%Y-%m-%d").tolist()
-        late = pd.bdate_range("2026-03-02", periods=len(shares_late)).strftime("%Y-%m-%d").tolist()
-        rows = []
-        for i, day in enumerate(early):
-            for symbol in ("000001", "000002"):
-                share = shares_early[i]
-                rows.append(_calibration_row(day, symbol, share))
-        for i, day in enumerate(late):
-            for symbol in ("000001", "000002"):
-                share = shares_late[i]
-                rows.append(_calibration_row(day, symbol, share))
-        return pd.DataFrame(rows)
-
-    fit_kwargs = {
-        "alphas": [0.3, 0.5],
-        "min_prior_days": 1,
-        "max_gap_days": 90,
-        "identity_tolerance": 0.05,
-        "max_median_rel_err": 0.5,
-    }
-    stable = check_calibration_stability(_calibration([0.68] * 4, [0.68] * 4), **fit_kwargs)
-    assert stable.passed is True
-    assert stable.median_rel_err == pytest.approx(0.0)
-    assert stable.n_scored == 8
-    dirty = _calibration([0.68] * 4, [0.68] * 4)
-    dirty.loc[len(dirty)] = {**_calibration_row("2026-01-06", "000001", 0.68), "eod_volume": "bogus"}
-    dirty.loc[len(dirty)] = {**_calibration_row("2026-03-03", "000001", 0.68), "v_krx_1520": "bogus"}
-    dirty_stable = check_calibration_stability(dirty, **fit_kwargs)
-    assert dirty_stable.passed is True
-    assert dirty_stable.n_scored == 8
-    guarded = _calibration([0.68] * 4, [0.68] * 4)
-    guarded.loc[len(guarded)] = {**_calibration_row("2026-01-06", "000001", 0.68), "eod_volume": 0.0}
-    guarded.loc[len(guarded)] = {**_calibration_row("2026-03-03", "000001", 0.68), "eod_volume": 999999.0}
-    guarded_stable = check_calibration_stability(guarded, **fit_kwargs)
-    assert guarded_stable.passed is True
-    assert guarded_stable.n_scored == 8
-    stale = check_calibration_stability(
-        _calibration([0.68] * 4, [0.68] * 4), **{**fit_kwargs, "max_gap_days": 1}
-    )
-    assert stale.passed is False and "no second-half row predictable" in stale.detail
-    broken = check_calibration_stability(
-        _calibration([0.5, 0.9, 0.5, 0.9], [0.30] * 4), **{**fit_kwargs, "max_median_rel_err": 0.05}
-    )
-    assert broken.passed is False
-    assert "above ceiling" in broken.detail
-    empty = check_calibration_stability(pd.DataFrame(), **fit_kwargs)
-    assert empty.passed is False and empty.n_scored == 0
-    single = check_calibration_stability(_calibration([0.68], []), **fit_kwargs)
-    assert single.passed is False and "two calibration dates" in single.detail
-    thin_first = check_calibration_stability(
-        pd.DataFrame([_calibration_row("2026-01-05", "000001", 0.68),
-                      _calibration_row("2026-03-02", "000001", 0.68)]),
-        **fit_kwargs,
-    )
-    assert thin_first.passed is False and "first-half fit refused" in thin_first.detail
-    early_days = pd.bdate_range("2026-01-05", periods=2).strftime("%Y-%m-%d").tolist()
-    late_days = pd.bdate_range("2026-03-02", periods=2).strftime("%Y-%m-%d").tolist()
-    disjoint_rows = [_calibration_row(day, symbol, 0.68) for day in early_days for symbol in ("000001", "000002")]
-    disjoint_rows += [_calibration_row(day, symbol, 0.68) for day in late_days for symbol in ("000003", "000004")]
-    unscored = check_calibration_stability(pd.DataFrame(disjoint_rows), **fit_kwargs)
-    assert unscored.passed is False and "no second-half row predictable" in unscored.detail
-
-
 def _calibration_row(day, symbol, share, v_cons=10000.0):
     v_krx = share * v_cons
     return {
@@ -807,20 +804,63 @@ def _calibration_row(day, symbol, share, v_cons=10000.0):
     }
 
 
-def test_stability_refuses_unscorable_first_half() -> None:
-    from src.ml.research.pit_certification import check_calibration_stability
+def _fit_diagnostics(**overrides):
+    from src.data.nxt_decomposition import FitDiagnostics, FrontierPoint
 
-    days = pd.bdate_range("2026-01-05", periods=8).strftime("%Y-%m-%d").tolist()
-    calibration = pd.DataFrame([
-        _calibration_row(day, f"{i:06d}", 0.68) for i, day in enumerate(days)
-    ])
-    result = check_calibration_stability(
-        calibration, alphas=[0.3, 0.5, 0.7], min_prior_days=1, max_gap_days=30,
-        identity_tolerance=0.05, max_median_rel_err=0.5,
-    )
-    assert result.passed is False
-    assert result.n_scored == 0
-    assert "cannot score any candidate" in result.detail
+    base: dict = {
+        "fit_start": "2026-09-01",
+        "fit_end": "2026-09-30",
+        "holdout_start": "2026-08-25",
+        "holdout_end": "2026-08-31",
+        "n_fit_rows": 100,
+        "n_holdout_rows": 40,
+        "n_symbols": 10,
+        "holdout_rel_err_p50": 0.08,
+        "holdout_rel_err_p90": 0.12,
+        "holdout_rel_err_p99": 0.20,
+        "holdout_coverage": 0.80,
+        "abar_fit": 0.036,
+        "abar_holdout": 0.036,
+        "bias_fit": 1.00,
+        "bias_holdout": 1.01,
+        "alpha_at_boundary": False,
+        "frontier": (FrontierPoint(
+            ewma_alpha=0.5, min_prior_days=1, max_gap_days=30, coverage=0.8,
+            rel_err_p50=0.08, rel_err_p90=0.12, rel_err_p99=0.20),),
+        "table_sha256": "t" * 64,
+    }
+    base.update(overrides)
+    return FitDiagnostics(**base)
+
+
+def test_evaluate_backcast_transfer_names_each_cause() -> None:
+    from src.ml.research.pit_certification import evaluate_backcast_transfer
+
+    config = _recon_gate_config()
+    clean = evaluate_backcast_transfer(_fit_diagnostics(), config=config)
+    assert clean.passed is True
+    assert clean.rel_err_p90 == pytest.approx(0.12)
+    assert clean.coverage == pytest.approx(0.80)
+    assert clean.n_holdout_rows == 40
+
+    p90 = evaluate_backcast_transfer(_fit_diagnostics(holdout_rel_err_p90=0.18), config=config)
+    assert p90.passed is False and "p90" in p90.detail
+
+    coverage = evaluate_backcast_transfer(_fit_diagnostics(holdout_coverage=0.30), config=config)
+    assert coverage.passed is False and "coverage" in coverage.detail
+
+    drift = evaluate_backcast_transfer(_fit_diagnostics(bias_holdout=1.05), config=config)
+    assert drift.passed is False and "bias drift" in drift.detail
+
+    boundary = evaluate_backcast_transfer(_fit_diagnostics(alpha_at_boundary=True), config=config)
+    assert boundary.passed is False and "alpha_at_boundary" in boundary.detail
+
+    weak = evaluate_backcast_transfer(_fit_diagnostics(holdout_rel_err_p90=float("nan")), config=config)
+    assert weak.passed is False
+    for field in ("abar_fit", "abar_holdout"):
+        assert not evaluate_backcast_transfer(_fit_diagnostics(**{field: float("nan")}), config=config).passed
+    assert not evaluate_backcast_transfer(_fit_diagnostics(bias_fit=0.0), config=config).passed
+    assert not evaluate_backcast_transfer(_fit_diagnostics(holdout_coverage=None), config=config).passed
 
 
 def _gate_inputs(**overrides):
@@ -830,12 +870,17 @@ def _gate_inputs(**overrides):
         "coverage_improvement": PairedDelta(delta=4.0, ci_low=2.0, ci_high=6.0, p_value=0.001, n_days=60),
         "reconstruction_feature": PairedDelta(delta=0.2, ci_low=-1.0, ci_high=1.4, p_value=0.6, n_days=60),
         "stability": None,
+        "tv_rank_correlation": 0.98,
+        "top_k_overlap": 0.97,
     }
     values.update(overrides)
     if values["stability"] is None:
         from src.ml.pit_report import CalibrationStability
 
-        values["stability"] = CalibrationStability(passed=True, median_rel_err=0.03, n_scored=40, detail="")
+        values["stability"] = CalibrationStability(
+            passed=True, rel_err_p90=0.10, coverage=0.80, bias_drift=0.01,
+            alpha_at_boundary=False, n_holdout_rows=40, detail="",
+        )
     return values
 
 
@@ -854,10 +899,13 @@ def test_reconstruction_gate_adopts_only_on_all_criteria() -> None:
         ({"coverage_improvement": PairedDelta(delta=float("nan"), ci_low=float("nan"), ci_high=float("nan"), p_value=float("nan"), n_days=60)}, "not estimable", {}),
         ({"coverage_improvement": PairedDelta(delta=0.5, ci_low=0.2, ci_high=0.8, p_value=0.01, n_days=60)}, "at or below the minimum", {"min_coverage_improvement_bp": 1.0}),
         ({"coverage_improvement": PairedDelta(delta=4.0, ci_low=2.0, ci_high=6.0, p_value=0.001, n_days=10)}, "only 10 paired days", {}),
-        ({"reconstruction_feature": PairedDelta(delta=-3.0, ci_low=-5.0, ci_high=-1.0, p_value=0.01, n_days=60)}, "significant", {}),
-        ({"reconstruction_feature": PairedDelta(delta=0.2, ci_low=-1.0, ci_high=1.4, p_value=float("nan"), n_days=60)}, "not established", {}),
+        ({"reconstruction_feature": PairedDelta(delta=-3.0, ci_low=-6.0, ci_high=1.0, p_value=0.4, n_days=60)}, "worse than margin", {}),
+        ({"reconstruction_feature": PairedDelta(delta=0.2, ci_low=float("nan"), ci_high=1.4, p_value=0.6, n_days=60)}, "not estimable", {}),
         ({"reconstruction_feature": PairedDelta(delta=0.2, ci_low=-1.0, ci_high=1.4, p_value=0.6, n_days=5)}, "only 5 paired days", {}),
-        ({"stability": CalibrationStability(passed=False, median_rel_err=0.4, n_scored=10, detail="ceiling")}, "stability failed", {}),
+        ({"tv_rank_correlation": 0.90}, "tv_rank_correlation", {}),
+        ({"top_k_overlap": 0.85}, "top_k_overlap", {}),
+        ({"tv_rank_correlation": float("nan")}, "tv_rank_correlation", {}),
+        ({"stability": CalibrationStability(passed=False, rel_err_p90=0.4, coverage=0.3, bias_drift=0.05, alpha_at_boundary=True, n_holdout_rows=10, detail="ceiling")}, "stability failed", {}),
     ]
     for overrides, needle, cfg_overrides in cases:
         verdict = evaluate_reconstruction_gate(
@@ -867,18 +915,79 @@ def test_reconstruction_gate_adopts_only_on_all_criteria() -> None:
         assert any(needle in reason for reason in verdict.reasons), (needle, verdict.reasons)
 
 
+def test_non_inferiority_passes_for_slightly_worse_and_better() -> None:
+    from src.ml.pit_report import PairedDelta
+    from src.ml.research.pit_certification import evaluate_reconstruction_gate
+
+    config = _recon_gate_config()
+    resolvable = _gate_inputs(
+        reconstruction_feature=PairedDelta(delta=-1.0, ci_low=-3.0, ci_high=1.0, p_value=0.5, n_days=60))
+    assert evaluate_reconstruction_gate(**resolvable, config=config).verdict == "ADOPT"
+    better = _gate_inputs(
+        reconstruction_feature=PairedDelta(delta=5.0, ci_low=2.0, ci_high=9.0, p_value=0.001, n_days=60))
+    assert evaluate_reconstruction_gate(**better, config=config).verdict == "ADOPT"
+    worse = _gate_inputs(
+        reconstruction_feature=PairedDelta(delta=-4.0, ci_low=-6.0, ci_high=1.0, p_value=0.3, n_days=60))
+    verdict = evaluate_reconstruction_gate(**worse, config=config)
+    assert verdict.verdict == "REJECT" and any("margin" in r for r in verdict.reasons)
+    thin = _gate_inputs(
+        reconstruction_feature=PairedDelta(delta=0.0, ci_low=float("nan"), ci_high=1.0, p_value=0.5, n_days=5))
+    assert evaluate_reconstruction_gate(**thin, config=config).verdict == "REJECT"
+    for metric in ("tv_rank_correlation", "top_k_overlap"):
+        assert evaluate_reconstruction_gate(**_gate_inputs(**{metric: None}), config=config).verdict == "REJECT"
+    assert evaluate_reconstruction_gate(**_gate_inputs(), config=_recon_gate_config(feature_margin_bp=float("nan"))).verdict == "REJECT"
+
+
+def test_prev_close_map_requires_raw_basis_and_skips_gaps() -> None:
+    from src.ml.research.pit_certification import _prev_close_map
+
+    with pytest.raises(ValueError, match="close_raw"):
+        _prev_close_map(pd.DataFrame([{"date": "2026-03-02", "symbol": "000001", "close": 1.0}]))
+    frame = pd.DataFrame({
+        "date": pd.to_datetime(
+            ["2026-03-02", "2026-03-03", "2026-03-04"] * 3),
+        "symbol": pd.Categorical(["000001"] * 3 + ["000002"] * 3 + ["000003"] * 3),
+        "close_raw": pd.array(
+            [100.0, 101.0, 102.0, 200.0, None, 202.0, 300.0, -5.0, 302.0],
+            dtype="Float64"),
+    })
+    got = _prev_close_map(frame)
+    assert ("2026-03-02", "000001") not in got
+    assert got[("2026-03-03", "000001")] == pytest.approx(100.0)
+    assert got[("2026-03-04", "000001")] == pytest.approx(101.0)
+    assert ("2026-03-03", "000002") not in got
+    assert ("2026-03-04", "000002") not in got
+    assert ("2026-03-03", "000003") not in got
+    assert ("2026-03-04", "000003") not in got
+    with pytest.raises(ValueError, match="missing columns"):
+        _prev_close_map(frame.drop(columns=["symbol"]))
+    invalid_date = frame.copy()
+    invalid_date.loc[0, "date"] = pd.NaT
+    assert ("NaT", "000001") not in _prev_close_map(invalid_date)
+
+
 def test_run_reconstruction_certification_combines_three_arms() -> None:
-    from src.ml.pit_report import CalibrationStability
-    from src.ml.research.pit_certification import run_reconstruction_certification
+    from src.ml.pit_report import CertificationBindings
+    from src.ml.research.pit_certification import (
+        reconstruction_in_the_loop,
+        run_reconstruction_certification,
+    )
 
     exact_daily, recon_daily = _adoptable_dailies()
     loop_exact, loop_recon, loop_labels = _adoptable_loop()
-    stability = CalibrationStability(passed=True, median_rel_err=0.03, n_scored=40, detail="")
+    loop = reconstruction_in_the_loop(
+        exact=loop_exact, recon=loop_recon, labels=loop_labels, top_k=2, config=_recon_gate_config())
+    bindings = CertificationBindings(
+        decomposition_config_sha256="a" * 64, calibration_table_sha256="b" * 64,
+        exact_report_sha256="c" * 64, recon_report_sha256="d" * 64,
+    )
+    diagnostics = _fit_diagnostics()
     coverage = {"exact": {"2026": {"live_1520": 0.95}}, "with_reconstruction": {"2026": {"live_1520": 0.99}}}
     cert = run_reconstruction_certification(
-        daily_exact=exact_daily, daily_recon=recon_daily, loop_exact=loop_exact,
-        loop_recon=loop_recon, labels=loop_labels, stability=stability, coverage=coverage,
-        top_k=2, config=_recon_gate_config(), exact_dir="exact", recon_dir="recon",
+        daily_exact=exact_daily, daily_recon=recon_daily, loop=loop, n_no_share=2,
+        fit_diagnostics=diagnostics, bindings=bindings,
+        arm_identity_equal=True, arm_identity_detail="",
+        coverage=coverage, config=_recon_gate_config(), exact_dir="exact", recon_dir="recon",
         generated_at="2026-10-05T00:00:00+09:00",
     )
     assert cert.gate_verdict == "ADOPT"
@@ -886,19 +995,31 @@ def test_run_reconstruction_certification_combines_three_arms() -> None:
     assert len(cert.paired_days) == 34
     assert len(cert.dropped_days) == 2
     assert cert.coverage_by_year_and_basis == coverage
+    assert cert.bindings == bindings
+    assert cert.fidelity["tv_rank_correlation"] == pytest.approx(loop.tv_rank_correlation)
+    assert cert.holdout_start == "2026-08-25" and cert.holdout_end == "2026-08-31"
+    mismatch = run_reconstruction_certification(
+        daily_exact=exact_daily, daily_recon=recon_daily, loop=loop, n_no_share=2,
+        fit_diagnostics=diagnostics, bindings=bindings,
+        arm_identity_equal=False, arm_identity_detail="seeds",
+        coverage=coverage, config=_recon_gate_config(),
+    )
+    assert mismatch.gate_verdict == "REJECT"
+    assert any("different configurations" in r and "seeds" in r for r in mismatch.gate_reasons)
     again = run_reconstruction_certification(
-        daily_exact=exact_daily, daily_recon=recon_daily, loop_exact=loop_exact,
-        loop_recon=loop_recon, labels=loop_labels, stability=stability, coverage=coverage,
-        top_k=2, config=_recon_gate_config(),
+        daily_exact=exact_daily, daily_recon=recon_daily, loop=loop, n_no_share=2,
+        fit_diagnostics=diagnostics, bindings=bindings,
+        arm_identity_equal=True, coverage=coverage, config=_recon_gate_config(),
     )
     assert again.gate_verdict == "ADOPT"
     assert again.generated_at != ""
 
 
 def test_main_reconstruction_certification_reads_report_dirs(tmp_path, monkeypatch) -> None:
+    import hashlib
     import json
 
-    from src.data.nxt_decomposition import DecompositionConfig, save_decomposition_config
+    from src.data.nxt_decomposition import DecompositionConfig, save_decomposition_config, save_fit_diagnostics
     from src.ml.pit_report import save_pit_haircut_report
     from src.ml.research.pit_certification import (
         ReconstructionGateConfig,
@@ -912,7 +1033,7 @@ def test_main_reconstruction_certification_reads_report_dirs(tmp_path, monkeypat
         arm_dir.mkdir()
         report = _cert_report_stub()
         save_pit_haircut_report(report, daily, out_dir=arm_dir)
-    days = pd.bdate_range("2026-03-02", periods=5).strftime("%Y-%m-%d").tolist()
+    days = pd.bdate_range("2026-03-02", periods=6).strftime("%Y-%m-%d").tolist()
     cal_rows = [
         {**_calibration_row(day, symbol, 0.68), "close_cons_1519": 50050.0}
         for day in days
@@ -923,14 +1044,19 @@ def test_main_reconstruction_certification_reads_report_dirs(tmp_path, monkeypat
     decomp = DecompositionConfig(
         ewma_alpha=0.5, min_prior_days=1, max_gap_days=30, auction_fraction_mean=0.0365,
         bias_correction=1.0, volume_rel_err_p90=0.144, close_bp_err_p90=11.9,
-        calibrated_through="2026-03-31", fit_start="2026-03-01",
-        holdout_start="2026-02-20", holdout_end="2026-02-28",
+        calibrated_through="2026-03-31", fit_start="2026-03-09",
+        holdout_start="2026-03-03", holdout_end="2026-03-05",
     )
     config_path = tmp_path / "nxt_decomposition_config.json"
     save_decomposition_config(decomp, config_path)
+    table_sha = hashlib.sha256(calibration_path.read_bytes()).hexdigest()
+    diagnostics = _fit_diagnostics(
+        fit_start="2026-03-09", fit_end="2026-03-31",
+        holdout_start="2026-03-03", holdout_end="2026-03-05", table_sha256=table_sha)
+    save_fit_diagnostics(diagnostics, tmp_path / "nxt_decomposition_fit_report.json")
 
     raw_rows = []
-    for day in pd.bdate_range("2026-03-02", periods=6):
+    for day in pd.bdate_range("2026-03-02", periods=7):
         for i, symbol in enumerate(("000001", "000002")):
             base = 50000.0 + i * 100.0
             raw_rows.append({
@@ -952,6 +1078,8 @@ def test_main_reconstruction_certification_reads_report_dirs(tmp_path, monkeypat
         return ph, market_dates, d_to_idx
 
     monkeypatch.setattr("src.ml.research.v3_engine.load_and_prepare_price_history", _fake_loader)
+    price_history_path = tmp_path / "price_history.parquet"
+    price_history_path.write_bytes(b"dummy")
     days_exact = tmp_path / "exact_days.parquet"
     pd.DataFrame([
         {"date": "2026-03-02", "index_basis": "live_1520", "superset_coverage": 0.9},
@@ -965,23 +1093,64 @@ def test_main_reconstruction_certification_reads_report_dirs(tmp_path, monkeypat
     cert = main_reconstruction_certification(
         exact_dir=tmp_path / "exact", recon_dir=tmp_path / "recon", out_dir=out_dir,
         calibration_path=calibration_path, config_path=config_path,
-        price_history_path=tmp_path / "price_history.parquet",
+        price_history_path=price_history_path,
         top_k=2, exact_days_path=days_exact, recon_days_path=days_recon,
         gate_config=ReconstructionGateConfig(bootstrap_n_boot=50),
     )
     assert cert.paired_days != []
-    assert cert.gate_verdict == "REJECT"
+    assert cert.holdout_start == "2026-03-03" and cert.holdout_end == "2026-03-05"
+    assert cert.bindings is not None and len(cert.bindings.decomposition_config_sha256) == 64
+    assert cert.fidelity["n_no_share"] >= 0.0
     payload = json.loads((out_dir / "reconstruction_certification.json").read_text(encoding="utf-8"))
     assert payload["gate_verdict"] == cert.gate_verdict
     assert payload["coverage_by_year_and_basis"]["exact"]["2026"]["live_1520"] == pytest.approx(0.9)
     assert payload["coverage_by_year_and_basis"]["with_reconstruction"]["2026"]["live_1520"] == pytest.approx(0.95)
+    import dataclasses
+
+    call_args = {"exact_dir": tmp_path / "exact", "recon_dir": tmp_path / "recon", "out_dir": out_dir,
+                 "calibration_path": calibration_path, "config_path": config_path,
+                 "price_history_path": price_history_path, "top_k": 2}
+    save_decomposition_config(dataclasses.replace(decomp, holdout_end="2026-03-06"), config_path)
+    with pytest.raises(ValueError, match="window mismatch"):
+        main_reconstruction_certification(**call_args)
+    overlapping = dataclasses.replace(decomp, fit_start="2026-03-04")
+    save_decomposition_config(overlapping, config_path)
+    save_fit_diagnostics(dataclasses.replace(diagnostics, fit_start="2026-03-04"),
+                         tmp_path / "nxt_decomposition_fit_report.json")
+    with pytest.raises(ValueError, match="temporally separated"):
+        main_reconstruction_certification(**call_args)
+    save_decomposition_config(decomp, config_path)
+    save_fit_diagnostics(diagnostics, tmp_path / "nxt_decomposition_fit_report.json")
+    from src.ml.research.pit_certification import _arm_identity_detail, _read_cert_daily
+
+    assert "seeds" in _arm_identity_detail(_cert_report_stub(), dataclasses.replace(_cert_report_stub(), seeds=(2,)))
     with pytest.raises(FileNotFoundError, match="daily evidence"):
+        _read_cert_daily(tmp_path / "missing_daily")
+    with monkeypatch.context() as context:
+        context.setattr("src.ml.research.pit_certification.load_pit_haircut_report", lambda path: None)
+        with pytest.raises(FileNotFoundError, match="arm report"):
+            main_reconstruction_certification(**call_args)
+    from pathlib import Path
+
+    real_exists = Path.exists
+    with monkeypatch.context() as context:
+        context.setattr(Path, "exists", lambda path: False if path.name == "nxt_decomposition_fit_report.json" else real_exists(path))
+        with pytest.raises(FileNotFoundError, match="fit diagnostics"):
+            main_reconstruction_certification(**call_args)
+    with pytest.raises(FileNotFoundError):
         main_reconstruction_certification(
             exact_dir=tmp_path / "exact", recon_dir=tmp_path / "missing", out_dir=out_dir,
             calibration_path=calibration_path, config_path=config_path,
-            price_history_path=tmp_path / "price_history.parquet", top_k=2,
+            price_history_path=price_history_path, top_k=2,
         )
-    with pytest.raises(ValueError, match="close"):
+    calibration_path.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="not fitted on this calibration table"):
+        main_reconstruction_certification(
+            exact_dir=tmp_path / "exact", recon_dir=tmp_path / "recon", out_dir=out_dir,
+            calibration_path=calibration_path, config_path=config_path,
+            price_history_path=price_history_path, top_k=2,
+        )
+    with pytest.raises(ValueError, match="close_raw"):
         _prev_close_map(pd.DataFrame([{"date": "2026-03-02", "symbol": "000001"}]))
 
 
