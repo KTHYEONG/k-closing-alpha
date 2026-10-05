@@ -119,6 +119,12 @@ def _seed_bars(day: str, session: str, symbol: str, hms_list: list[str], qty: st
     )
 
 
+def _write_ingested(tmp_path, days: list[str]) -> None:
+    pd.DataFrame({"date": pd.to_datetime(days), "symbol": "005930"}).to_parquet(
+        tmp_path / "price_history.parquet"
+    )
+
+
 def _seed_ticks(day: str, session: str, symbol: str, hms_list: list[str], qty: str = "100") -> None:
     from src.data.intraday_store import write_tick_partition
 
@@ -198,6 +204,7 @@ def test_missed_day_is_recovered(tmp_path, monkeypatch) -> None:
 def test_lookback_bound_reports_expired_without_walks(tmp_path, monkeypatch) -> None:
     _patch_sweep(monkeypatch, tmp_path)
     _patch_universe(monkeypatch, {"2026-09-18"})
+    _write_ingested(tmp_path, ["2026-09-18"])
     monkeypatch.setattr(sweep, "_open_kiwoom", _refuse_kiwoom())
     monkeypatch.setattr(tr, "harvest_symbol_tape", _refuse_kiwoom())
     _seed_bars("2026-09-18", "regular", "005930", ["090000"], "100")
@@ -218,6 +225,7 @@ def test_expiry_warning_and_audit_issue(tmp_path, monkeypatch, caplog) -> None:
     profile = _profile(tmp_path, COLLECTION_TAPE_LOOKBACK_DAYS=30)
     _patch_sweep(monkeypatch, tmp_path)
     _patch_universe(monkeypatch, {_OLD_DAY})
+    _write_ingested(tmp_path, [_OLD_DAY])
     monkeypatch.setattr(sweep, "_open_kiwoom", lambda: _stub_kiwoom())
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(tr, "harvest_symbol_tape", _fake_harvest_ok(calls))

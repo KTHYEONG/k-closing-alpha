@@ -87,6 +87,7 @@ class TapeWalkOutcome:
     termination_reason: str
     pages_fetched: int
     unresolved_days: tuple[str, ...]
+    skipped_unclosed: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -119,14 +120,26 @@ def _parse_days(days: Collection[str]) -> list[str]:
     return unique
 
 
-def _reject_unclosed_day(day: str, session: str) -> None:
-    now = datetime.now(_SEOUL)
+def is_session_closed(day: str, session: str, now: datetime) -> bool:
+    """True when a (day, session) is certifiably closed at `now`.
+
+    Shared definition with tape_recovery._session_closed: regular closes at
+    ARCHIVE_REGULAR_READY_HHMMSS on the day itself, aftermarket closes at the
+    next day boundary.
+    """
     today = now.date().isoformat()
     if session == INTRADAY_SESSION_REGULAR:
-        if day > today or (day == today and now.strftime("%H%M%S") < ARCHIVE_REGULAR_READY_HHMMSS):
-            raise ValueError(f"regular session not closed for day: {day!r}")
-    elif day >= today:
-        raise ValueError(f"aftermarket session not closed for day: {day!r}")
+        return day < today or (day == today and now.strftime("%H%M%S") >= ARCHIVE_REGULAR_READY_HHMMSS)
+    return day < today
+
+
+def _reject_unclosed_day(day: str, session: str, symbol: str = "") -> None:
+    now = datetime.now(_SEOUL)
+    if is_session_closed(day, session, now):
+        return
+    if session == INTRADAY_SESSION_REGULAR:
+        raise ValueError(f"regular session not closed for day: {day!r} symbol={symbol!r} session={session!r}")
+    raise ValueError(f"aftermarket session not closed for day: {day!r} symbol={symbol!r} session={session!r}")
 
 
 def _settle_certified_day(
@@ -236,14 +249,16 @@ async def harvest_symbol_tape(
     profile: CollectionSettings,
     on_result: Callable[[TapeDayResult], None],
     walk_deadline: datetime | None = None,
+    needed: Collection[tuple[str, str]] | None = None,
 ) -> TapeWalkOutcome:
-    """Walk one tape for one symbol and emit a settled result per requested (day, session).
+    """Walk one tape for one symbol and emit a settled result per needed (day, session).
 
     Args:
         client: Kiwoom client exposing walk_tick_tape.
         http_session: Existing HTTP session.
         code: Symbol.
         days: Market dates that must be settled (YYYY-MM-DD); the walk stops once the oldest is passed.
+            When `needed` is given, the wanted days are derived from it.
         venue: Tape to walk; sessions of the other venue are ignored.
         sessions: Stored sessions to carve (subset of TAPE_SESSIONS matching venue).
         store: Evidence store; every page is persisted via the shared page observer under distinct attempt slots.
@@ -252,18 +267,45 @@ async def harvest_symbol_tape(
         on_result: Receives each settled result as its date completes (newest first).
         walk_deadline: Optional aware instant after which the walk stops requesting pages (used to keep a long walk
             out of reserved vendor slots); days not reached are reported PARTIAL `walk_incomplete`, never not-on-tape.
+        needed: Exact (day, session) keys to settle; None keeps the old
+            days-x-sessions semantics restricted to CLOSED pairs. A needed pair
+            that is not closed is never emitted, settled or ledgered; it is
+            reported in `skipped_unclosed`.
 
     Returns:
-        TapeWalkOutcome(termination_reason, pages_fetched, unresolved_days).
+        TapeWalkOutcome(termination_reason, pages_fetched, unresolved_days, skipped_unclosed);
+        `unresolved_days` covers closed pairs only.
     """
     if venue not in ("KRX", "NXT"):
         raise ValueError(f"unknown tape venue: {venue!r}")
     if not str(run_id).strip():
         raise ValueError("run_id must be nonempty")
-    wanted = _parse_days(days)
     matched = [s for s in sessions if s.venue == venue]
-    if not matched:
-        return TapeWalkOutcome(termination_reason="tape_end", pages_fetched=0, unresolved_days=tuple(wanted))
+    closed_now = datetime.now(_SEOUL)
+    matched_names = {s.session for s in matched}
+    if needed is None:
+        wanted = _parse_days(days)
+        full = {(day, spec.session) for day in wanted for spec in matched}
+        needed_set = {(day, session) for day, session in full if is_session_closed(day, session, closed_now)}
+        skipped_unclosed = tuple(sorted(full - needed_set))
+    else:
+        normalized = sorted({(str(day), str(session)) for day, session in needed})
+        for day, _session in normalized:
+            try:
+                date.fromisoformat(day)
+            except ValueError:
+                raise ValueError(f"invalid needed day: {day!r}") from None
+        matched_needed = [(day, session) for day, session in normalized if session in matched_names]
+        needed_set = {
+            (day, session) for day, session in matched_needed if is_session_closed(day, session, closed_now)
+        }
+        skipped_unclosed = tuple(sorted(set(matched_needed) - needed_set))
+        wanted = sorted({day for day, _session in normalized})
+    if not needed_set:
+        return TapeWalkOutcome(
+            termination_reason="tape_end", pages_fetched=0, unresolved_days=(),
+            skipped_unclosed=skipped_unclosed,
+        )
     oldest = min(wanted)
     endpoint = _tape_endpoint(venue)
     resolved_venue = _verified_venue(venue, profile)
@@ -342,10 +384,17 @@ async def harvest_symbol_tape(
     payload, _ = await _call_with_transport_retry(_invoke, first_attempt=0, profile=profile, code=str(code))
     cert_by_day: dict[str, Any] = {str(c.day): c for c in (payload.get("certificates") or []) if hasattr(c, "day")}
     settled: set[str] = set()
+
+    def _day_sessions(day: str) -> list[TapeSession]:
+        return [spec for spec in matched if (day, spec.session) in needed_set]
+
     for day, rows, cert in attempt_buffer.get("latest", []):
+        day_sessions = _day_sessions(day)
+        if not day_sessions:
+            continue
         _settle_certified_day(
             code=str(code), day=day, rows=rows, vendor_total=getattr(cert, "vendor_total", None),
-            basis=str(getattr(cert, "basis", "vendor_total")), sessions=matched, venue=resolved_venue,
+            basis=str(getattr(cert, "basis", "vendor_total")), sessions=day_sessions, venue=resolved_venue,
             store=store, run_id=str(run_id), refs=_refs_for(day), on_result=on_result,
         )
         settled.add(day)
@@ -353,25 +402,28 @@ async def harvest_symbol_tape(
     today = datetime.now(_SEOUL).date()
     lookback = int(profile.COLLECTION_TAPE_LOOKBACK_DAYS)
     for day in sorted(wanted_set - settled, reverse=True):
+        day_sessions = _day_sessions(day)
+        if not day_sessions:
+            continue
         cert = cert_by_day.get(day)
         if cert is not None:
             _settle_uncertified_day(
                 code=str(code), day=day, status=CaptureStatus.PARTIAL,
                 reason=f"tape_total_mismatch:received={cert.received}:total={cert.vendor_total}",
-                sessions=matched, venue=resolved_venue, refs=_refs_for(day), on_result=on_result,
+                sessions=day_sessions, venue=resolved_venue, refs=_refs_for(day), on_result=on_result,
             )
         elif str(payload.get("termination_reason", "")) == "tape_empty":
             if resolved_venue == "UNKNOWN":
                 _settle_certified_day(
                     code=str(code), day=day, rows=[], vendor_total=None, basis="tape_empty",
-                    sessions=matched, venue=resolved_venue, store=store, run_id=str(run_id),
+                    sessions=day_sessions, venue=resolved_venue, store=store, run_id=str(run_id),
                     refs=[*_refs_for(day), *[r for r in empty_refs if r not in _refs_for(day)]],
                     on_result=on_result,
                 )
             elif (today - date.fromisoformat(day)).days <= lookback:
                 _settle_certified_day(
                     code=str(code), day=day, rows=[], vendor_total=None, basis="tape_empty",
-                    sessions=matched, venue=resolved_venue, store=store, run_id=str(run_id),
+                    sessions=day_sessions, venue=resolved_venue, store=store, run_id=str(run_id),
                     refs=[*_refs_for(day), *[r for r in empty_refs if r not in _refs_for(day)]],
                     on_result=on_result,
                 )
@@ -379,24 +431,25 @@ async def harvest_symbol_tape(
             else:
                 _settle_uncertified_day(
                     code=str(code), day=day, status=CaptureStatus.UNKNOWN, reason="day_not_on_tape",
-                    sessions=matched, venue=resolved_venue, refs=[], on_result=on_result,
+                    sessions=day_sessions, venue=resolved_venue, refs=[], on_result=on_result,
                 )
         elif str(payload.get("termination_reason", "")) in ("tape_end", "crossed_stop_day"):
             _settle_uncertified_day(
                 code=str(code), day=day, status=CaptureStatus.UNKNOWN, reason="day_not_on_tape",
-                sessions=matched, venue=resolved_venue, refs=[], on_result=on_result,
+                sessions=day_sessions, venue=resolved_venue, refs=[], on_result=on_result,
             )
         else:
             _settle_uncertified_day(
                 code=str(code), day=day, status=CaptureStatus.PARTIAL,
                 reason=f"walk_incomplete:{payload.get('termination_reason', '')}",
-                sessions=matched, venue=resolved_venue, refs=[], on_result=on_result,
+                sessions=day_sessions, venue=resolved_venue, refs=[], on_result=on_result,
             )
-    unresolved = tuple(sorted(d for d in wanted if d not in settled))
+    unresolved = tuple(sorted(d for d in wanted if d not in settled and _day_sessions(d)))
     return TapeWalkOutcome(
         termination_reason=str(payload.get("termination_reason", "")),
         pages_fetched=int(payload.get("pages_fetched", 0)),
         unresolved_days=unresolved,
+        skipped_unclosed=skipped_unclosed,
     )
 
 
@@ -447,7 +500,7 @@ class TickTapePublisher:
         self._namespace = str(namespace)
 
     def _guard(self, result: TapeDayResult) -> None:
-        _reject_unclosed_day(result.day, result.session)
+        _reject_unclosed_day(result.day, result.session, result.symbol)
 
     def add(self, result: TapeDayResult) -> None:
         """Buffer one settled result, auto-flushing once the row bound fills."""
