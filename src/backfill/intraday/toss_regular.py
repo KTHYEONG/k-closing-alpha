@@ -198,7 +198,7 @@ async def acquire_toss_regular_bars(
 ) -> tuple[pd.DataFrame, CoverageEntry]:
     """Fetch one past symbol-day of KRX regular-session 1m bars (labels 09:01..15:30) from Toss on the RAW price basis, with raw page evidence retained. Past dates only. The two-page walk requests the newest page first and continues strictly older until the first label is reached.
 
-    Returns `(frame, entry)`: COMPLETE with canonical bars (vendor `toss`, END-stamped) when the basis gate accepts; otherwise an empty frame and a non-COMPLETE entry whose reason names the cause.
+    Returns `(frame, entry)`: COMPLETE with canonical bars (vendor `toss`, END-stamped) when the basis gate accepts; a NOT_APPLICABLE `toss_consolidated_tape` rejection also carries its canonical frame so the consolidated-tape partition can persist it without refetching; every other rejection returns an empty frame with a non-COMPLETE entry whose reason names the cause. The frame is never written to any partition by this function.
     """
     if not str(run_id).strip():
         raise ValueError("run_id must be nonempty")
@@ -381,10 +381,11 @@ async def acquire_toss_regular_bars(
     verdict = toss_basis_verdict(frame, eod_volume, ratio_min=ratio_min, ratio_tolerance=ratio_tolerance)
     if not verdict.accepted:
         if verdict.reason == "toss_consolidated_tape":
+            consolidated = frame.sort_values("ts_hms", kind="stable").reset_index(drop=True)
             _log(code, snapshot_date, "NOT_APPLICABLE", verdict.reason)
-            return _empty_frame(snapshot_date, code), _terminal_entry(
+            return consolidated, _terminal_entry(
                 symbol=code, venue=venue, status=CaptureStatus.NOT_APPLICABLE,
-                rows=0, reason=verdict.reason, refs=refs,
+                rows=len(consolidated), reason=verdict.reason, refs=refs,
             )
         _log(code, snapshot_date, "FAILED", verdict.reason)
         return _empty_frame(snapshot_date, code), _terminal_entry(

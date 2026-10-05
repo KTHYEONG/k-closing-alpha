@@ -14,6 +14,7 @@ from src.config.market_session import (
     INTRADAY_SESSION_NXT_AFTERMARKET,
     INTRADAY_SESSION_NXT_PREMARKET,
     INTRADAY_SESSION_REGULAR,
+    INTRADAY_SESSION_REGULAR_CONSOLIDATED,
 )
 from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry
 from src.data.intraday_schema import assert_canonical_bars
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 _SESSIONS: tuple[str, ...] = (
     INTRADAY_SESSION_REGULAR,
+    INTRADAY_SESSION_REGULAR_CONSOLIDATED,
     INTRADAY_SESSION_NXT_PREMARKET,
     INTRADAY_SESSION_NXT_AFTERMARKET,
     INTRADAY_SESSION_KRX_AFTERMARKET,
@@ -94,7 +96,7 @@ def repair_bar_value_partition(
     close = pd.to_numeric(frame["close"], errors="coerce")
     volume = pd.to_numeric(frame["volume"], errors="coerce")
     repaired.loc[bad, "value_krw"] = (close.loc[bad] * volume.loc[bad]).astype("int64").tolist()
-    venue = "KRX" if str(session) in (INTRADAY_SESSION_REGULAR, INTRADAY_SESSION_KRX_AFTERMARKET) else "NXT"
+    venue = "KRX" if str(session) in (INTRADAY_SESSION_REGULAR, INTRADAY_SESSION_REGULAR_CONSOLIDATED, INTRADAY_SESSION_KRX_AFTERMARKET) else "NXT"
     subset = repaired[repaired["symbol"].astype(str).isin(symbols)].copy()
     coverage = {
         symbol: CoverageEntry(
