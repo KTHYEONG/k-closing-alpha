@@ -261,6 +261,7 @@ def list_stale_kis_tokens(
     *,
     env: Mapping[str, str] | None = None,
     cache_dir: Path | None = None,
+    allow_newer: bool = False,
 ) -> list[str]:
     """이 호스트가 발급 책임을 지는 KIS 키 중 당일(snapshot_date, KST) 토큰이 없는 것을 반환한다.
 
@@ -272,6 +273,7 @@ def list_stale_kis_tokens(
         snapshot_date: 점검 대상일(YYYY-MM-DD, KST).
         env: KIS 자격증명 env(테스트 주입용). None이면 호스트 .env를 읽는다.
         cache_dir: 토큰 캐시 디렉터리(테스트 주입용). None이면 settings.KIS_TOKEN_CACHE_DIR.
+        allow_newer: Accept a later issuance when reconciling historical audit coverage.
 
     Returns:
         당일 발급 기록이 없는 슬롯 이름(예: "DATA_3", "PRIMARY") 목록, 정렬됨.
@@ -283,9 +285,12 @@ def list_stale_kis_tokens(
         creds = resolve_host_issued_credentials(source)
     except ValueError as exc:
         return [f"<kis host key config invalid: {exc}>"]
-    return sorted(
-        cred.slot for cred in creds if read_token_issued_date(token_cache_path(cred.app_key, cache)) != snapshot_date
-    )
+    stale = []
+    for cred in creds:
+        issued = read_token_issued_date(token_cache_path(cred.app_key, cache))
+        if issued != snapshot_date and not (allow_newer and issued is not None and issued > snapshot_date):
+            stale.append(cred.slot)
+    return sorted(stale)
 
 
 def _collection_issue(dataset: str, count: int, reason: str) -> str:
@@ -1001,6 +1006,26 @@ class DigestSeverity(enum.StrEnum):
 
 
 @dataclass(frozen=True)
+class AuditIssue:
+    """Stable warning-level audit finding with self-healing flag."""
+
+    key: str
+    transient: bool
+    text: str
+
+
+def is_transient_issue_key(key: str) -> bool:
+    """Classify whether re-measurement alone can clear an issue key.
+
+    Transient conditions heal without human repair; persistent ones are facts
+    about the audited date that only a later full audit can retire.
+    """
+    if key == "undelivered_alerts":
+        return True
+    return key.startswith(("offsite_backup:", "failed_unit:", "stale_kis_token:"))
+
+
+@dataclass(frozen=True)
 class AuditDigest:
     """Rendered daily digest and its dispatch severity."""
 
@@ -1008,6 +1033,12 @@ class AuditDigest:
     body: str
     severity: DigestSeverity
     provisional_reasons: tuple[str, ...] = ()
+    issues: tuple[AuditIssue, ...] = ()
+
+
+AUDIT_ALERT_STATE_RELPATH: str = "logs/heartbeat/audit_alert_state.json"
+AUDIT_ALERT_STATE_SCHEMA_VERSION: int = 1
+AUDIT_HEARTBEAT_SCHEMA_VERSION: int = 2
 
 
 DIGEST_ISSUE_DISPLAY_LIMIT: int = 10
@@ -1022,6 +1053,58 @@ def _format_bounded_issues(issues: Sequence[str]) -> str:
     if omitted > 0:
         text += f" 외 {omitted}건"
     return text
+
+
+_IGNORED_COLLECTION_SUFFIXES: tuple[str, ...] = (":incomplete_entries", ":disabled", ":raw_disabled")
+
+
+def _critical_collection_issues(collection_issues: Sequence[str]) -> list[str]:
+    return [iss for iss in collection_issues if not any(iss.endswith(suffix) for suffix in _IGNORED_COLLECTION_SUFFIXES)]
+
+
+def collect_audit_issues(
+    *,
+    day_kind: str,
+    missing_steps: Sequence[str],
+    failed_units: Sequence[str],
+    stale_kis_tokens: Sequence[str],
+    critical_collection: Sequence[str],
+    intraday_issues: Sequence[str],
+    backup_warnings: Sequence[str],
+    undelivered_alerts: int,
+    expiry_warnings: Sequence[str],
+    calendar_disagreement: bool,
+) -> tuple[AuditIssue, ...]:
+    """Build the warning-level issue set backing a digest subject."""
+    issues: list[AuditIssue] = []
+    issues.extend(AuditIssue(key=f"missing:{step}", transient=False, text=f"누락 단계: {step}") for step in missing_steps)
+    issues.extend(
+        AuditIssue(key=f"failed_unit:{unit}", transient=True, text=f"실패 유닛: {unit}") for unit in failed_units
+    )
+    issues.extend(
+        AuditIssue(key=f"stale_kis_token:{token}", transient=True, text=f"KIS 토큰 누락: {token}")
+        for token in stale_kis_tokens
+    )
+    if day_kind != DAY_HOLIDAY:
+        issues.extend(AuditIssue(key=raw, transient=False, text=f"수집 이상: {raw}") for raw in critical_collection)
+        issues.extend(AuditIssue(key=raw, transient=False, text=f"장중 이상: {raw}") for raw in intraday_issues)
+    issues.extend(AuditIssue(key=raw, transient=True, text=f"백업 이상: {raw}") for raw in backup_warnings)
+    if undelivered_alerts:
+        issues.append(
+            AuditIssue(key="undelivered_alerts", transient=True, text=f"미전송 알림: {undelivered_alerts}건 (outbox 적체)")
+        )
+    issues.extend(
+        AuditIssue(key=f"expiry:{warn}", transient=False, text=f"만료 임박: {warn}") for warn in expiry_warnings
+    )
+    if calendar_disagreement:
+        issues.append(
+            AuditIssue(
+                key="calendar_disagreement",
+                transient=False,
+                text="달력 불일치: 정적 달력은 개장(STANDARD)이나 KIS 오라클이 휴일로 응답",
+            )
+        )
+    return tuple(issues)
 
 
 def build_digest(
@@ -1073,11 +1156,9 @@ def build_digest(
         raise ValueError("intraday_issues must be empty on a holiday")
     lines = [f"date={snapshot_date}", f"day={day_kind}", f"session={session_kind}"]
     lines.extend(info_lines)
-    missing: list[str] = []
     if day_kind != DAY_HOLIDAY:
         if result is None:
             raise ValueError(f"audit result required for day_kind={day_kind!r}")
-        missing = [step for step in AUDIT_STEPS if not result.get(step, False)]
         lines += [f"{step}={'OK' if result.get(step, False) else 'MISSING'}" for step in AUDIT_STEPS]
     lines.append(f"failed_units={','.join(failed_units) if failed_units else 'none'}")
     lines.append(f"stale_kis_tokens={','.join(stale_kis_tokens) if stale_kis_tokens else 'none'}")
@@ -1091,19 +1172,45 @@ def build_digest(
     backup_infos = tuple(issue for issue in backup_issues if issue in BACKUP_INFO_ISSUES)
     backup_warnings = tuple(issue for issue in backup_issues if issue not in BACKUP_INFO_ISSUES)
     running_line = "• 백업 진행 중: 완료 후 자동 재확인됩니다"
+    critical_collection = _critical_collection_issues(collection_issues)
+    _missing_steps: list[str] = []
+    if day_kind != DAY_HOLIDAY:
+        _missing_steps = [step for step in AUDIT_STEPS if not result.get(step, False)] if result is not None else []
+    _calendar_disagreement = day_kind == DAY_HOLIDAY and session_kind == SessionKind.STANDARD.value
+    issues = collect_audit_issues(
+        day_kind=day_kind,
+        missing_steps=_missing_steps,
+        failed_units=list(failed_units),
+        stale_kis_tokens=[] if day_kind == DAY_HOLIDAY else list(stale_kis_tokens),
+        critical_collection=[] if day_kind == DAY_HOLIDAY else list(critical_collection),
+        intraday_issues=() if day_kind == DAY_HOLIDAY else tuple(intraday_issues),
+        backup_warnings=list(backup_warnings),
+        undelivered_alerts=int(undelivered_alerts),
+        expiry_warnings=list(expiry_warnings),
+        calendar_disagreement=_calendar_disagreement,
+    )
+    _backup_warning_set = set(backup_warnings)
+    issue_missing = [issue.key.split(":", 1)[1] for issue in issues if issue.key.startswith("missing:")]
+    issue_failed = [issue.key.split(":", 1)[1] for issue in issues if issue.key.startswith("failed_unit:")]
+    issue_stale = [issue.key.split(":", 1)[1] for issue in issues if issue.key.startswith("stale_kis_token:")]
+    issue_critical = [issue.key for issue in issues if issue.key.startswith("collection:")]
+    issue_intraday = [issue.key for issue in issues if issue.key.startswith("intraday:")]
+    issue_backup = [issue.key for issue in issues if issue.key in _backup_warning_set]
+    issue_expiry = [issue.key[len("expiry:") :] for issue in issues if issue.key.startswith("expiry:")]
+    issue_undelivered = any(issue.key == "undelivered_alerts" for issue in issues)
 
     if day_kind == DAY_HOLIDAY:
         holiday_problems: list[str] = []
-        if session_kind == SessionKind.STANDARD.value:
+        if _calendar_disagreement:
             holiday_problems.append("calendar_disagreement")
-        if failed_units:
-            holiday_problems.append(f"실패유닛 {','.join(failed_units)}")
-        if backup_warnings:
-            holiday_problems.append(f"백업이상 {','.join(backup_warnings)}")
-        if undelivered_alerts:
+        if issue_failed:
+            holiday_problems.append(f"실패유닛 {','.join(issue_failed)}")
+        if issue_backup:
+            holiday_problems.append(f"백업이상 {','.join(issue_backup)}")
+        if issue_undelivered:
             holiday_problems.append(f"미전송알림 {undelivered_alerts}건")
-        if expiry_warnings:
-            holiday_problems.append(f"만료임박 {','.join(expiry_warnings)}")
+        if issue_expiry:
+            holiday_problems.append(f"만료임박 {','.join(issue_expiry)}")
         if holiday_problems:
             summary_lines = [
                 "==================================================",
@@ -1114,16 +1221,16 @@ def build_digest(
                 summary_lines.append(
                     "• 달력 불일치: 정적 달력은 개장(STANDARD)이나 KIS 오라클이 휴일로 응답 (fail-closed, 무결정)"
                 )
-            if failed_units:
-                summary_lines.append(f"• 실패 유닛: {', '.join(failed_units)}")
-            if backup_warnings:
-                summary_lines.append(f"• 백업 이상: {', '.join(backup_warnings)}")
+            if issue_failed:
+                summary_lines.append(f"• 실패 유닛: {', '.join(issue_failed)}")
+            if issue_backup:
+                summary_lines.append(f"• 백업 이상: {', '.join(issue_backup)}")
             if backup_infos:
                 summary_lines.append(running_line)
-            if undelivered_alerts:
+            if issue_undelivered:
                 summary_lines.append(f"• 미전송 알림: {undelivered_alerts}건 (outbox 적체)")
-            if expiry_warnings:
-                summary_lines.append(f"• 만료 임박: {', '.join(expiry_warnings)}")
+            if issue_expiry:
+                summary_lines.append(f"• 만료 임박: {', '.join(issue_expiry)}")
             summary_lines.extend(_expiry_hint_lines((*expiry_notices, *expiry_warnings)))
             summary_lines.append("• 조치 안내: or-vps 서버 상태 점검 요망")
             body = "\n".join(summary_lines) + "\n\n[상세 내역]\n" + "\n".join(lines)
@@ -1132,6 +1239,7 @@ def build_digest(
                 body=body,
                 severity=DigestSeverity.WARNING,
                 provisional_reasons=backup_infos,
+                issues=issues,
             )
         label = "휴장일 SKIP"
         header = (
@@ -1147,22 +1255,10 @@ def build_digest(
             body=header + "[상세 내역]\n" + "\n".join(lines),
             severity=DigestSeverity.HOLIDAY_SKIP,
             provisional_reasons=backup_infos,
+            issues=issues,
         )
 
-    ignored_reasons = (":incomplete_entries", ":disabled", ":raw_disabled")
-    critical_collection = [
-        iss for iss in collection_issues if not any(iss.endswith(suffix) for suffix in ignored_reasons)
-    ]
-    is_warning = bool(
-        missing
-        or failed_units
-        or stale_kis_tokens
-        or critical_collection
-        or backup_warnings
-        or undelivered_alerts
-        or expiry_warnings
-        or intraday_issues
-    )
+    is_warning = bool(issues)
 
     if not is_warning:
         nav_str, entry_str = _extract_paper_summary(snapshot_date)
@@ -1184,7 +1280,9 @@ def build_digest(
             subject += f" · 🔑갱신필요 {len(expiry_notices)}건"
         summary_block.extend(_expiry_hint_lines(expiry_notices))
         body = "\n".join(summary_block) + "\n\n[상세 내역]\n" + "\n".join(lines)
-        return AuditDigest(subject=subject, body=body, severity=DigestSeverity.OK, provisional_reasons=backup_infos)
+        return AuditDigest(
+            subject=subject, body=body, severity=DigestSeverity.OK, provisional_reasons=backup_infos, issues=issues
+        )
 
     problems = []
     summary_lines = [
@@ -1192,29 +1290,29 @@ def build_digest(
         f"🚨 K-Closing Alpha 장애/누락 알림 ({snapshot_date})",
         "==================================================",
     ]
-    if missing:
-        problems.append(f"누락 {','.join(missing)}")
-        summary_lines.append(f"• 누락 단계: {', '.join(missing)}")
-    if failed_units:
-        problems.append(f"실패유닛 {','.join(failed_units)}")
-        summary_lines.append(f"• 실패 유닛: {', '.join(failed_units)}")
-    if stale_kis_tokens:
-        problems.append(f"KIS토큰누락 {','.join(stale_kis_tokens)}")
-        summary_lines.append(f"• KIS 토큰 누락: {', '.join(stale_kis_tokens)}")
-    if critical_collection:
-        problems.append(f"수집이상 {','.join(critical_collection)}")
-        summary_lines.append(f"• 수집 이상: {', '.join(critical_collection)}")
-    if intraday_issues:
-        summary_lines.append(f"• 장중 이상: {_format_bounded_issues(intraday_issues)}")
-    if backup_warnings:
-        problems.append(f"백업이상 {','.join(backup_warnings)}")
-        summary_lines.append(f"• 백업 이상: {', '.join(backup_warnings)}")
+    if issue_missing:
+        problems.append(f"누락 {','.join(issue_missing)}")
+        summary_lines.append(f"• 누락 단계: {', '.join(issue_missing)}")
+    if issue_failed:
+        problems.append(f"실패유닛 {','.join(issue_failed)}")
+        summary_lines.append(f"• 실패 유닛: {', '.join(issue_failed)}")
+    if issue_stale:
+        problems.append(f"KIS토큰누락 {','.join(issue_stale)}")
+        summary_lines.append(f"• KIS 토큰 누락: {', '.join(issue_stale)}")
+    if issue_critical:
+        problems.append(f"수집이상 {','.join(issue_critical)}")
+        summary_lines.append(f"• 수집 이상: {', '.join(issue_critical)}")
+    if issue_intraday:
+        summary_lines.append(f"• 장중 이상: {_format_bounded_issues(issue_intraday)}")
+    if issue_backup:
+        problems.append(f"백업이상 {','.join(issue_backup)}")
+        summary_lines.append(f"• 백업 이상: {', '.join(issue_backup)}")
     if backup_infos:
         summary_lines.append(running_line)
-    if expiry_warnings:
-        problems.append(f"만료임박 {','.join(expiry_warnings)}")
-        summary_lines.append(f"• 만료 임박: {', '.join(expiry_warnings)}")
-    if undelivered_alerts:
+    if issue_expiry:
+        problems.append(f"만료임박 {','.join(issue_expiry)}")
+        summary_lines.append(f"• 만료 임박: {', '.join(issue_expiry)}")
+    if issue_undelivered:
         problems.append(f"미전송알림 {undelivered_alerts}건")
         summary_lines.append(f"• 미전송 알림: {undelivered_alerts}건 (outbox 적체)")
     if expiry_notices:
@@ -1227,6 +1325,7 @@ def build_digest(
         body=body,
         severity=DigestSeverity.WARNING,
         provisional_reasons=backup_infos,
+        issues=issues,
     )
 
 
@@ -1262,6 +1361,28 @@ def _default_backup_issues(audit_at: datetime) -> list[str]:
 AUDIT_HEARTBEAT_RELPATH: str = "logs/heartbeat/daily_audit.json"
 
 
+def _infer_heartbeat_severity(subject: str | None, day_kind: str) -> str:
+    if subject is not None and "경고" in subject:
+        return "WARNING"
+    if subject is not None and ("휴장일" in subject or "SKIP" in subject or "⏸" in subject):
+        return "HOLIDAY_SKIP"
+    if day_kind == DAY_HOLIDAY:
+        return "HOLIDAY_SKIP"
+    return "OK"
+
+
+def _serialize_open_issues(open_issues: Sequence[AuditIssue | Mapping[str, Any]]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for item in open_issues:
+        if isinstance(item, AuditIssue):
+            serialized.append({"key": item.key, "transient": item.transient, "text": item.text})
+        else:
+            serialized.append(
+                {"key": str(item["key"]), "transient": bool(item["transient"]), "text": str(item["text"])}
+            )
+    return serialized
+
+
 def write_audit_heartbeat(
     snapshot_date: str,
     *,
@@ -1270,12 +1391,20 @@ def write_audit_heartbeat(
     undelivered_alerts: int,
     finished_at: datetime,
     path: Path | None = None,
+    severity: str | None = None,
+    open_issues: Sequence[AuditIssue | Mapping[str, Any]] = (),
+    provisional_reasons: Sequence[str] = (),
+    audit_kind: str = "scheduled",
+    reconciled_at: datetime | None = None,
 ) -> Path:
     """Persist proof that the weekday audit ran to completion.
 
     The external watchdog reads this file over SSH; its absence or staleness is
     the only signal that survives a dead alert channel or a stopped host, so it
     is written on every weekday run including holidays (where no digest is sent).
+
+    Heartbeat schema v2 is additive: legacy keys keep their meaning so the
+    current dashboard adapter keeps working.
 
     Args:
         snapshot_date: Audited KST date (YYYY-MM-DD).
@@ -1284,6 +1413,11 @@ def write_audit_heartbeat(
         undelivered_alerts: Outbox backlog observed by this run.
         finished_at: Timezone-aware completion time.
         path: Override target (tests); default DATA_DIR / AUDIT_HEARTBEAT_RELPATH.
+        severity: OK, WARNING or HOLIDAY_SKIP; inferred from the subject when None.
+        open_issues: Machine-readable issue list backing the subject.
+        provisional_reasons: Informational running markers (never warnings).
+        audit_kind: scheduled for full audits, reconcile for re-measurements.
+        reconciled_at: Re-measurement time; None for scheduled audits.
 
     Returns:
         Path written.
@@ -1300,9 +1434,110 @@ def write_audit_heartbeat(
         "subject": subject,
         "undelivered_alerts": undelivered_alerts,
         "finished_at": finished_at.isoformat(),
+        "schema_version": AUDIT_HEARTBEAT_SCHEMA_VERSION,
+        "severity": severity if severity is not None else _infer_heartbeat_severity(subject, day_kind),
+        "open_issues": _serialize_open_issues(open_issues),
+        "provisional_reasons": list(provisional_reasons),
+        "audit_kind": audit_kind,
+        "reconciled_at": reconciled_at.isoformat() if reconciled_at is not None else None,
     }
     atomic_write_text(target, json.dumps(payload, ensure_ascii=False), mode=0o644)
     return target
+
+
+def read_audit_heartbeat(path: Path | None = None) -> dict[str, Any] | None:
+    """Read the last heartbeat; return None only when absent, fail on unreadable evidence."""
+    target = Path(path) if path is not None else Path(settings.DATA_DIR) / AUDIT_HEARTBEAT_RELPATH
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise OSError("Unreadable audit heartbeat") from exc
+    if not isinstance(raw, dict):
+        raise OSError("Invalid audit heartbeat")
+    return raw
+
+
+def _alert_state_path(path: Path | None = None) -> Path:
+    return Path(path) if path is not None else Path(settings.DATA_DIR) / AUDIT_ALERT_STATE_RELPATH
+
+
+def load_audit_alert_state(path: Path | None = None) -> dict[str, Any] | None:
+    """Load alert state; return None when absent and raise OSError for invalid evidence."""
+    target = _alert_state_path(path)
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise OSError("Unreadable audit alert state") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get("open"), dict):
+        raise OSError("Invalid audit alert state")
+    if any(not isinstance(entry, dict) for entry in raw["open"].values()):
+        raise OSError("Invalid audit alert state entry")
+    return raw
+
+
+def write_audit_alert_state(
+    *,
+    snapshot_date: str,
+    updated_at: datetime,
+    open_entries: Mapping[str, Mapping[str, Any]],
+    path: Path | None = None,
+    pending_resolutions: Mapping[str, Mapping[str, Any]] | None = None,
+) -> Path:
+    """Atomically persist the alert state for reconcile runs to re-measure."""
+    target = _alert_state_path(path)
+    payload = {
+        "schema_version": AUDIT_ALERT_STATE_SCHEMA_VERSION,
+        "snapshot_date": snapshot_date,
+        "updated_at": updated_at.isoformat(),
+        "open": {
+            key: {
+                "transient": bool(entry["transient"]),
+                "text": str(entry["text"]),
+                "first_seen": str(entry["first_seen"]),
+                "last_notified": str(entry["last_notified"]),
+            }
+            for key, entry in open_entries.items()
+        },
+    }
+    if pending_resolutions:
+        payload["pending_resolutions"] = dict(pending_resolutions)
+    atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2), mode=0o644)
+    return target
+
+
+def sync_audit_alert_state_from_digest(
+    digest: AuditDigest,
+    snapshot_date: str,
+    *,
+    now: datetime,
+    path: Path | None = None,
+) -> Path:
+    """Replace the alert state with a full audit evaluation, retaining history."""
+    previous = load_audit_alert_state(path) or {}
+    prev_open = previous.get("open", {})
+    stamp = now.isoformat()
+    entries: dict[str, dict[str, Any]] = {}
+    for issue in digest.issues:
+        prev = prev_open.get(issue.key)
+        if isinstance(prev, dict) and "first_seen" in prev and "last_notified" in prev:
+            entries[issue.key] = {
+                "transient": issue.transient,
+                "text": issue.text,
+                "first_seen": str(prev["first_seen"]),
+                "last_notified": str(prev["last_notified"]),
+            }
+        else:
+            entries[issue.key] = {
+                "transient": issue.transient,
+                "text": issue.text,
+                "first_seen": stamp,
+                "last_notified": stamp,
+            }
+    return write_audit_alert_state(snapshot_date=snapshot_date, updated_at=now, open_entries=entries, path=path)
 
 
 def run_daily_audit(
@@ -1423,12 +1658,26 @@ def run_daily_audit(
     else:
         logger.info("[DATA] stage=daily_audit day=%s status=OK subject=%s", day_kind, digest.subject)
         dispatch_fn(digest.subject, digest.body)
+    finished_at = datetime.now(SEOUL)
+    sync_audit_alert_state_from_digest(digest, snapshot_date, now=finished_at)
+    severity = (
+        "WARNING"
+        if digest.severity is DigestSeverity.WARNING
+        else "HOLIDAY_SKIP"
+        if digest.severity is DigestSeverity.HOLIDAY_SKIP
+        else "OK"
+    )
     write_audit_heartbeat(
         snapshot_date,
         day_kind=day_kind,
         subject=digest.subject,
         undelivered_alerts=undelivered_alerts,
-        finished_at=datetime.now(SEOUL),
+        finished_at=finished_at,
+        severity=severity,
+        open_issues=digest.issues,
+        provisional_reasons=digest.provisional_reasons,
+        audit_kind="scheduled",
+        reconciled_at=None,
     )
     return digest.subject
 
