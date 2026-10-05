@@ -1188,3 +1188,299 @@ def _cert_report_stub():
         haircut_by_index_basis={"live_1520": 2.0, "eod_fallback": float("nan")},
         augmentation=None,
     )
+
+
+def _recon_orchestrator_dirs(tmp_path):
+    import hashlib
+    from pathlib import Path
+
+    import pandas as pd
+
+    from src.data.pit1520_panel import write_panel_provenance
+
+    exact = tmp_path / "exact"
+    recon = tmp_path / "recon"
+    exact.mkdir()
+    recon.mkdir()
+    config_path = tmp_path / "decomp.json"
+    config_path.write_bytes(b'{"alpha": 0.5}')
+    digest = hashlib.sha256(b'{"alpha": 0.5}').hexdigest()
+    table_path = tmp_path / "calib.parquet"
+    pd.DataFrame({"date": [], "symbol": []}).to_parquet(table_path)
+    for directory in (exact, recon):
+        pd.DataFrame({"date": [], "symbol": []}).to_parquet(directory / "pit1520_panel.parquet")
+        pd.DataFrame({"date": []}).to_parquet(directory / "pit1520_panel_days.parquet")
+    write_panel_provenance(
+        exact, reconstruct_consolidated=False, decomposition_config_sha256="",
+        start="2025-03-04", end="2025-03-10",
+    )
+    write_panel_provenance(
+        recon, reconstruct_consolidated=True, decomposition_config_sha256=digest,
+        start="2025-03-04", end="2025-03-10",
+    )
+    export_dir = tmp_path / "export"
+    return exact, recon, config_path, table_path, export_dir
+
+
+def _mock_arms(monkeypatch, *, fail_arm2=False):
+    import src.ml.research.pit_certification as cert_mod
+    from src.ml.pit_report import RECONSTRUCTION_CERTIFICATION_FILENAME
+
+    calls = []
+
+    def _fake_pit(*, export_dir, panel_dir, augment, train_start, arm_dirname="topk_ranker"):
+        from pathlib import Path
+
+        calls.append({
+            "export_dir": export_dir, "panel_dir": Path(panel_dir),
+            "augment": augment, "train_start": train_start, "arm_dirname": arm_dirname,
+        })
+        if fail_arm2 and arm_dirname != "topk_ranker":
+            raise RuntimeError("arm-2 scoring failed")
+        arm_dir = Path(export_dir) / arm_dirname
+        arm_dir.mkdir(parents=True, exist_ok=True)
+        (arm_dir / "pit_haircut_report.json").write_text("{}", encoding="utf-8")
+        return f"report-{arm_dirname}"
+
+    cert_calls = []
+
+    def _fake_recon(**kwargs):
+        cert_calls.append(kwargs)
+        out_dir = kwargs["out_dir"]
+        (out_dir / RECONSTRUCTION_CERTIFICATION_FILENAME).write_text("{}", encoding="utf-8")
+        return "CERT"
+
+    monkeypatch.setattr(cert_mod, "main_pit_certification", _fake_pit)
+    monkeypatch.setattr(cert_mod, "main_reconstruction_certification", _fake_recon)
+    return calls, cert_calls
+
+
+def test_recon_orchestrator_rejects_mismatched_panel(tmp_path, monkeypatch) -> None:
+    """An arm-2 panel built from another config is refused before any scoring."""
+    import hashlib
+
+    import src.ml.research.pit_certification as cert_mod
+    from src.data.pit1520_panel import write_panel_provenance
+
+    exact, recon, config_path, table_path, export_dir = _recon_orchestrator_dirs(tmp_path)
+    write_panel_provenance(
+        recon, reconstruct_consolidated=True,
+        decomposition_config_sha256=hashlib.sha256(b"other").hexdigest(),
+        start="2025-03-04", end="2025-03-10",
+    )
+    calls, cert_calls = _mock_arms(monkeypatch)
+    with pytest.raises(ValueError, match="digest"):
+        cert_mod.main_recon_certification_run(
+            export_dir=str(export_dir), exact_panel_dir=exact, recon_panel_dir=recon,
+            decomposition_config_path=config_path, calibration_table_path=table_path,
+            train_start=None,
+        )
+    assert calls == []
+    assert cert_calls == []
+
+
+def test_recon_orchestrator_rejects_wrong_mode(tmp_path, monkeypatch) -> None:
+    """Exact panels built with reconstruction (or recon panels without) are refused."""
+    import src.ml.research.pit_certification as cert_mod
+    from src.data.pit1520_panel import write_panel_provenance
+
+    exact, recon, config_path, table_path, export_dir = _recon_orchestrator_dirs(tmp_path)
+    calls, _ = _mock_arms(monkeypatch)
+    write_panel_provenance(
+        exact, reconstruct_consolidated=True,
+        decomposition_config_sha256="ab" * 32, start="2025-03-04", end="2025-03-10",
+    )
+    with pytest.raises(ValueError, match="exact panel"):
+        cert_mod.main_recon_certification_run(
+            export_dir=str(export_dir), exact_panel_dir=exact, recon_panel_dir=recon,
+            decomposition_config_path=config_path, calibration_table_path=table_path,
+            train_start=None,
+        )
+    write_panel_provenance(
+        exact, reconstruct_consolidated=False, decomposition_config_sha256="",
+        start="2025-03-04", end="2025-03-10",
+    )
+    write_panel_provenance(
+        recon, reconstruct_consolidated=False, decomposition_config_sha256="",
+        start="2025-03-04", end="2025-03-10",
+    )
+    with pytest.raises(ValueError, match="recon panel"):
+        cert_mod.main_recon_certification_run(
+            export_dir=str(export_dir), exact_panel_dir=exact, recon_panel_dir=recon,
+            decomposition_config_path=config_path, calibration_table_path=table_path,
+            train_start=None,
+        )
+    assert calls == []
+
+
+def test_recon_orchestrator_missing_panel_files_raise(tmp_path, monkeypatch) -> None:
+    """Absent panel files refuse the run before any scoring."""
+    import src.ml.research.pit_certification as cert_mod
+
+    exact, recon, config_path, table_path, export_dir = _recon_orchestrator_dirs(tmp_path)
+    (recon / "pit1520_panel.parquet").unlink()
+    calls, _ = _mock_arms(monkeypatch)
+    with pytest.raises(FileNotFoundError, match="recon panel"):
+        cert_mod.main_recon_certification_run(
+            export_dir=str(export_dir), exact_panel_dir=exact, recon_panel_dir=recon,
+            decomposition_config_path=config_path, calibration_table_path=table_path,
+            train_start=None,
+        )
+    assert calls == []
+
+
+def test_recon_orchestrator_never_leaves_a_stale_certificate(tmp_path, monkeypatch) -> None:
+    """An arm-2 failure after arm 1 leaves arm 1 intact and no certificate behind."""
+    import src.ml.research.pit_certification as cert_mod
+    from src.ml.pit_report import RECONSTRUCTION_CERTIFICATION_FILENAME
+
+    exact, recon, config_path, table_path, export_dir = _recon_orchestrator_dirs(tmp_path)
+    stale = export_dir / "topk_ranker" / RECONSTRUCTION_CERTIFICATION_FILENAME
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("stale", encoding="utf-8")
+    calls, _ = _mock_arms(monkeypatch, fail_arm2=True)
+    with pytest.raises(RuntimeError, match="arm-2"):
+        cert_mod.main_recon_certification_run(
+            export_dir=str(export_dir), exact_panel_dir=exact, recon_panel_dir=recon,
+            decomposition_config_path=config_path, calibration_table_path=table_path,
+            train_start=None,
+        )
+    assert not stale.exists()
+    assert (export_dir / "topk_ranker" / "pit_haircut_report.json").exists()
+    assert len(calls) == 2
+
+
+def test_recon_orchestrator_arms_share_identity(tmp_path, monkeypatch) -> None:
+    """Both arms run the same certification except panel dir and arm dirname."""
+    import pandas as pd
+
+    import src.ml.research.pit_certification as cert_mod
+
+    exact, recon, config_path, table_path, export_dir = _recon_orchestrator_dirs(tmp_path)
+    train_start = pd.Timestamp("2024-01-02")
+    calls, cert_calls = _mock_arms(monkeypatch)
+    result = cert_mod.main_recon_certification_run(
+        export_dir=str(export_dir), exact_panel_dir=exact, recon_panel_dir=recon,
+        decomposition_config_path=config_path, calibration_table_path=table_path,
+        train_start=train_start,
+    )
+    assert result == "CERT"
+    assert len(calls) == 2
+    arm1, arm2 = calls
+    assert arm1["arm_dirname"] == "topk_ranker"
+    assert arm2["arm_dirname"] == "topk_ranker_recon"
+    for key in ("augment", "train_start", "export_dir"):
+        assert arm1[key] == arm2[key]
+    assert arm1["panel_dir"] != arm2["panel_dir"]
+    assert cert_calls and cert_calls[0]["exact_dir"].name == "topk_ranker"
+    assert cert_calls[0]["recon_dir"].name == "topk_ranker_recon"
+
+
+def test_pit_certification_arm_dirname_routes_output(tmp_path, monkeypatch) -> None:
+    """main_pit_certification writes the report under the requested arm directory."""
+    import pandas as pd
+
+    import src.ml.research.pit_certification as cert_mod
+
+    panel_dir = tmp_path / "panel"
+    panel_dir.mkdir()
+    (tmp_path / "price_history.parquet").write_bytes(b"")
+    (panel_dir / "pit1520_panel.parquet").write_bytes(b"")
+    (panel_dir / "pit1520_panel_days.parquet").write_bytes(b"")
+    monkeypatch.setattr(
+        "src.ml.research.v3_engine.load_and_prepare_price_history",
+        lambda _path: ("ph", "dates", "idx"),
+    )
+    monkeypatch.setattr(pd, "read_parquet", lambda _path, **kw: pd.DataFrame())
+    saved = {}
+
+    def _fake_run(*args, **kwargs):
+        return "REPORT", "DAILY"
+
+    def _fake_save(report, daily, *, out_dir):
+        saved["out_dir"] = out_dir
+        return out_dir, out_dir
+
+    monkeypatch.setattr(cert_mod, "run_pit_certification", _fake_run)
+    monkeypatch.setattr(cert_mod, "save_pit_haircut_report", _fake_save)
+    monkeypatch.setattr("src.settings.PRICE_HISTORY_PARQUET_PATH", tmp_path / "price_history.parquet")
+    try:
+        cert_mod.main_pit_certification(
+            export_dir=str(tmp_path / "export"), panel_dir=panel_dir,
+            augment=False, train_start=None, arm_dirname="topk_ranker_recon",
+        )
+    finally:
+        from tests.settings_isolation import drop_settings_shadows
+
+        drop_settings_shadows()
+    assert saved["out_dir"].name == "topk_ranker_recon"
+
+
+def test_orchestrator_outputs_are_adopted_by_weekly_loader(tmp_path, monkeypatch) -> None:
+    import hashlib
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.data.nxt_decomposition import DecompositionConfig, save_decomposition_config, save_fit_diagnostics
+    from src.data.pit1520_panel import write_panel_provenance
+    from src.ml import retrain_gate
+    from src.ml.pit_report import load_pit_haircut_report
+    from src.ml.research import pit_certification as mod
+    from tests.unit.ml.test_retrain_gate import _pit_report
+
+    ph, calendar, indices, panel, panel_days, _ = _synth_inputs(n_days=75, n_symbols=4, start="2026-01-01")
+    price_path = tmp_path / "price_history.parquet"
+    ph.to_parquet(price_path)
+    monkeypatch.setattr("src.settings.PRICE_HISTORY_PARQUET_PATH", price_path)
+    monkeypatch.setattr("src.ml.research.v3_engine.load_and_prepare_price_history", lambda _: (ph, calendar, indices))
+    days = pd.bdate_range("2026-01-01", periods=40).strftime("%Y-%m-%d").tolist()
+    table_path = tmp_path / "calibration.parquet"
+    pd.DataFrame([_calibration_row(day, f"{i:06d}", 0.68, v_cons=10000.0 + 1000 * i)
+                  for day in days for i in range(4)]).to_parquet(table_path)
+    config = DecompositionConfig(
+        ewma_alpha=0.5, min_prior_days=2, max_gap_days=30, auction_fraction_mean=0.0365,
+        bias_correction=1.0, volume_rel_err_p90=0.12, close_bp_err_p90=0.0,
+        calibrated_through=days[-1], fit_start=days[35], holdout_start=days[0], holdout_end=days[34],
+    )
+    config_path = tmp_path / "decomp.json"
+    save_decomposition_config(config, config_path)
+    save_fit_diagnostics(_fit_diagnostics(
+        fit_start=config.fit_start, fit_end=config.calibrated_through,
+        holdout_start=config.holdout_start, holdout_end=config.holdout_end,
+        table_sha256=hashlib.sha256(table_path.read_bytes()).hexdigest(),
+    ), tmp_path / "nxt_decomposition_fit_report.json")
+    exact, recon = tmp_path / "exact", tmp_path / "recon"
+    for directory, mode in ((exact, False), (recon, True)):
+        directory.mkdir()
+        panel.to_parquet(directory / "pit1520_panel.parquet")
+        panel_days.to_parquet(directory / "pit1520_panel_days.parquet")
+        write_panel_provenance(directory, reconstruct_consolidated=mode,
+                               decomposition_config_sha256=hashlib.sha256(config_path.read_bytes()).hexdigest() if mode else "",
+                               start=days[0], end=days[-1])
+    exact_daily, recon_daily = _adoptable_dailies()
+    calls = []
+
+    def score(*args, **kwargs):
+        calls.append(kwargs)
+        return _pit_report(native_mean=9.0), exact_daily if len(calls) == 1 else recon_daily
+
+    monkeypatch.setattr(mod, "run_pit_certification", score)
+    export = tmp_path / "models"
+    cert = mod.main_recon_certification_run(
+        export_dir=str(export), exact_panel_dir=exact, recon_panel_dir=recon,
+        decomposition_config_path=config_path, calibration_table_path=table_path,
+        train_start=pd.Timestamp("2024-01-02"),
+    )
+    assert cert.gate_verdict == "ADOPT", cert.gate_reasons
+    arm1 = load_pit_haircut_report(export / "topk_ranker")
+    arm2 = load_pit_haircut_report(export / "topk_ranker_recon")
+    assert mod._arm_identity_detail(arm1, arm2) == ""
+    selected, adopted, detail = retrain_gate.load_recon_pit_selection(
+        export / "topk_ranker", arm1_report=arm1, decomposition_config_path=config_path,
+        now=datetime.now(ZoneInfo("Asia/Seoul")), max_age_days=14,
+    )
+    assert adopted is True, detail
+    assert mod._arm_identity_detail(selected, arm2) == ""
+    assert selected.mean_net_bp == arm2.mean_net_bp
+    assert calls[0]["train_start"] == calls[1]["train_start"]
+    assert calls[0]["config"] == calls[1]["config"]

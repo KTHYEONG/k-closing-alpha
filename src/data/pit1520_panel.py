@@ -13,11 +13,14 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import enum
+import hashlib
+import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -130,6 +133,15 @@ INDEX_BASIS_LIVE: str = "live_1520"
 INDEX_BASIS_EOD_FALLBACK: str = "eod_fallback"
 
 _TOSS_LEDGER_FILENAME: str = "toss_regular.parquet"
+# Provenance sidecar written atomically beside the panel files by the CLI main.
+PIT1520_PANEL_PROVENANCE_FILENAME: str = "pit1520_panel_provenance.json"
+_PROVENANCE_KEYS: frozenset[str] = frozenset({
+    "reconstruct_consolidated",
+    "decomposition_config_sha256",
+    "built_at",
+    "start",
+    "end",
+})
 # Part 1 basis-gate verdict marking a symbol-day as consolidated tape.
 _KNOWN_CONSOLIDATED_REASON: str = "toss_consolidated_tape"
 
@@ -1094,6 +1106,105 @@ def default_toss_ledger_path() -> Path:
     return Path(settings.HISTORY_DIR) / "intraday" / "backfill_ledger" / _TOSS_LEDGER_FILENAME
 
 
+def _check_provenance_payload(payload: Mapping[str, Any], *, label: str) -> dict[str, Any]:
+    """Validate a provenance mapping, returning it as a plain dict.
+
+    Raises:
+        ValueError: Unknown or missing keys, a mistyped mode flag, a non-hex digest,
+            or unparseable timestamps.
+    """
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{label} must hold a JSON object")
+    unknown = set(payload) - set(_PROVENANCE_KEYS)
+    if unknown:
+        raise ValueError(f"{label} carries unknown keys: {sorted(unknown)}")
+    missing = [key for key in sorted(_PROVENANCE_KEYS) if key not in payload]
+    if missing:
+        raise ValueError(f"{label} is missing keys: {missing}")
+    mode = payload["reconstruct_consolidated"]
+    if not isinstance(mode, bool):
+        raise ValueError(f"{label} carries a mistyped reconstruct_consolidated: {mode!r}")
+    digest = payload["decomposition_config_sha256"]
+    if not isinstance(digest, str):
+        raise ValueError(f"{label} carries a mistyped digest: {digest!r}")
+    if bool(mode):
+        if len(digest) != 64 or any(c not in "0123456789abcdefABCDEF" for c in digest):
+            raise ValueError(f"{label} carries a non-hex digest")
+    elif digest != "":
+        raise ValueError(f"{label} carries a digest without reconstruction")
+    for key in ("built_at", "start", "end"):
+        if not isinstance(payload[key], str) or not payload[key].strip():
+            raise ValueError(f"{label} carries a mistyped {key}: {payload[key]!r}")
+    try:
+        built_at = datetime.fromisoformat(str(payload["built_at"]))
+    except ValueError as exc:
+        raise ValueError(f"{label} carries an unparseable built_at") from exc
+    if built_at.tzinfo is None or built_at.utcoffset() is None:
+        raise ValueError(f"{label} built_at is not timezone-aware")
+    for key in ("start", "end"):
+        try:
+            datetime.strptime(str(payload[key]), "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError(f"{label} carries an unparseable {key}") from exc
+    return dict(payload)
+
+
+def load_panel_provenance(panel_dir: Path | str) -> dict[str, Any]:
+    """Load the panel provenance sidecar written by the CLI build.
+
+    Returns:
+        Mapping with `reconstruct_consolidated` (bool), `decomposition_config_sha256`
+        (64-char hex when reconstructing, "" otherwise), `built_at` (aware ISO-8601 KST),
+        `start` and `end` (YYYY-MM-DD).
+
+    Raises:
+        FileNotFoundError: No sidecar exists beside the panel files.
+        ValueError: Unknown or missing keys, a mistyped mode flag, a non-hex digest,
+            or unparseable timestamps.
+    """
+    path = Path(panel_dir) / PIT1520_PANEL_PROVENANCE_FILENAME
+    if not path.exists():
+        raise FileNotFoundError(f"panel provenance not found: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"panel provenance at {path} is malformed: {exc}") from exc
+    return _check_provenance_payload(payload, label=f"panel provenance at {path}")
+
+
+def write_panel_provenance(
+    panel_dir: Path | str,
+    *,
+    reconstruct_consolidated: bool,
+    decomposition_config_sha256: str,
+    start: str,
+    end: str,
+    built_at: str | None = None,
+) -> Path:
+    """Atomically publish the provenance sidecar beside a complete panel build.
+
+    Raises:
+        OSError: Persistence fails (no partial file is ever visible).
+        ValueError: The digest/mode combination is inconsistent.
+    """
+    from src.data.io_utils import atomic_write_text
+
+    stamp = str(built_at) if built_at is not None else datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
+    payload = _check_provenance_payload(
+        {
+            "reconstruct_consolidated": bool(reconstruct_consolidated),
+            "decomposition_config_sha256": str(decomposition_config_sha256),
+            "built_at": stamp,
+            "start": str(start),
+            "end": str(end),
+        },
+        label="panel provenance payload",
+    )
+    target = Path(panel_dir) / PIT1520_PANEL_PROVENANCE_FILENAME
+    atomic_write_text(target, json.dumps(payload, indent=2, sort_keys=True), mode=None)
+    return target
+
+
 def load_consolidated_bars(snapshot_date: str, *, config: Pit1520PanelConfig = Pit1520PanelConfig()) -> pd.DataFrame:  # noqa: B008
     """Read one date's consolidated-tape 1m partition, column-pruned like the regular loader.
 
@@ -1385,12 +1496,55 @@ def write_pit1520_panel(result: Pit1520PanelResult, *, paths: tuple[Path, Path, 
         elif len(frame):
             merged = frame.copy()
         else:
-            merged = kept.copy()
+            merged = kept.copy() if len(kept) else frame.copy()
         if len(merged):
             merged = merged.copy()
             merged["date"] = pd.to_datetime(merged["date"], errors="coerce")
             merged = merged.sort_values(keys, kind="stable").reset_index(drop=True)
         atomic_write_parquet(merged, Path(path))
+
+
+def _publish_panel_build(
+    result: Pit1520PanelResult,
+    *,
+    paths: tuple[Path, Path, Path],
+    replace_dates: Sequence[str],
+    reconstruct_consolidated: bool,
+    config_digest: str,
+) -> None:
+    """Preserve compatible dates only; publish provenance for the entire resulting panel.
+
+    Raises:
+        ValueError: Retained dates have unknown or incompatible reconstruction provenance.
+        OSError: Panel persistence fails; the previous sidecar is invalidated before publication.
+    """
+    from src.data.io_utils import read_existing_parquet, store_write_lock
+
+    wanted = {pd.Timestamp(day).strftime("%Y-%m-%d") for day in replace_dates}
+    with store_write_lock(paths[0], purpose="pit1520-panel-build"):
+        retained: set[str] = set()
+        for path in paths:
+            existing = read_existing_parquet(path, columns=["date"])
+            if len(existing):
+                retained.update(pd.to_datetime(existing["date"]).dt.strftime("%Y-%m-%d"))
+        retained -= wanted
+        if retained:
+            provenance = load_panel_provenance(paths[0].parent)
+            if (
+                provenance["reconstruct_consolidated"] != reconstruct_consolidated
+                or provenance["decomposition_config_sha256"].lower() != config_digest.lower()
+            ):
+                raise ValueError("Partial panel rebuild has incompatible provenance; rebuild all existing dates")
+        days = wanted | retained
+        (paths[0].parent / PIT1520_PANEL_PROVENANCE_FILENAME).unlink(missing_ok=True)
+        write_pit1520_panel(result, paths=paths, replace_dates=replace_dates)
+        write_panel_provenance(
+            paths[0].parent,
+            reconstruct_consolidated=reconstruct_consolidated,
+            decomposition_config_sha256=config_digest,
+            start=min(days),
+            end=max(days),
+        )
 
 
 def _earliest_regular_partition_date() -> str | None:
@@ -1441,9 +1595,11 @@ def main(argv: list[str] | None = None) -> None:
     decomp: DecompositionConfig | None = None
     cons_loader: Callable[[str], pd.DataFrame] | None = None
     known: frozenset[tuple[str, str]] | None = None
+    config_digest = ""
     if args.reconstruct_consolidated:
         cfg_path = Path(args.decomposition_config) if args.decomposition_config else default_decomposition_config_path()
         decomp = load_decomposition_config(cfg_path)
+        config_digest = hashlib.sha256(cfg_path.read_bytes()).hexdigest()
 
         def _load_cons(day: str) -> pd.DataFrame:
             return load_consolidated_bars(day, config=config)
@@ -1490,7 +1646,13 @@ def main(argv: list[str] | None = None) -> None:
         out_dir / "pit1520_panel_exclusions.parquet",
         out_dir / "pit1520_panel_days.parquet",
     )
-    write_pit1520_panel(result, paths=paths, replace_dates=wanted)
+    _publish_panel_build(
+        result,
+        paths=paths,
+        replace_dates=wanted,
+        reconstruct_consolidated=bool(args.reconstruct_consolidated),
+        config_digest=config_digest,
+    )
     coverage = pd.to_numeric(result.days["superset_coverage"], errors="coerce").to_numpy(dtype=np.float64)
     finite = coverage[np.isfinite(coverage)]
     min_cov = float(np.min(finite)) if len(finite) else float("nan")
