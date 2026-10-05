@@ -2422,6 +2422,12 @@ def test_heartbeat_write_is_atomic(tmp_path) -> None:
         "subject",
         "undelivered_alerts",
         "finished_at",
+        "schema_version",
+        "severity",
+        "open_issues",
+        "provisional_reasons",
+        "audit_kind",
+        "reconciled_at",
     }
     assert (target.stat().st_mode & 0o777) == 0o644
 
