@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +24,12 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 from src.daily.universe_screen import build_screen_frame
+from src.data.nxt_decomposition import (
+    DecompositionConfig,
+    fit_decomposition_config,
+    load_decomposition_config,
+    predict_share,
+)
 from src.data.pit1520_panel import (
     INDEX_BASIS_EOD_FALLBACK,
     INDEX_BASIS_LIVE,
@@ -33,11 +39,16 @@ from src.data.pit1520_panel import (
 )
 from src.ml.oof import _finite_nan
 from src.ml.pit_report import (
+    PIT_HAIRCUT_DAILY_FILENAME,
+    RECONSTRUCTION_CERTIFICATION_FILENAME,
     AugmentationSummary,
+    CalibrationStability,
     PairedDelta,
     PitHaircutReport,
     PitReportStatus,
+    ReconstructionCertification,
     save_pit_haircut_report,
+    save_reconstruction_certification,
 )
 from src.ml.research.v3_engine import attach_forward_exit_paths
 from src.ml.retrain_gate import MIN_NAMES_PER_EVAL_DAY
@@ -1336,3 +1347,612 @@ def main_pit_certification(
     )
     save_pit_haircut_report(report, daily, out_dir=Path(export_dir) / "topk_ranker")
     return report
+
+
+# ---------------------------------------------------------------------------
+# NXT reconstruction three-arm certification (Part 3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReconstructionGateConfig:
+    """Adoption thresholds for the consolidated-tape reconstruction.
+
+    Attributes:
+        alpha: Significance level for the arm-3 feature-neutrality test.
+        min_coverage_improvement_bp: Minimum arm-1 minus arm-2 coverage-loss improvement.
+        max_stability_median_rel_err: Ceiling on the second-half median share error.
+        min_paired_days: Minimum paired days for an estimable paired delta.
+        bootstrap_block_days, bootstrap_n_boot, bootstrap_seed: Day-block bootstrap of paired deltas.
+    """
+
+    alpha: float = 0.05
+    min_coverage_improvement_bp: float = 0.0
+    max_stability_median_rel_err: float = 0.10
+    min_paired_days: int = 30
+    bootstrap_block_days: int = 10
+    bootstrap_n_boot: int = 5000
+    bootstrap_seed: int = 0
+
+
+@dataclass(frozen=True)
+class ReconstructionGateVerdict:
+    """Adoption outcome evaluated by the report: ADOPT only when every criterion holds."""
+
+    verdict: str
+    reasons: tuple[str, ...]
+    coverage_improvement: PairedDelta
+    reconstruction_feature: PairedDelta
+    stability_passed: bool
+
+
+@dataclass(frozen=True)
+class InTheLoopResult:
+    """Decision-feature fidelity of reconstructed versus hidden-exact symbol-days."""
+
+    n_symbol_days: int
+    n_paired_days: int
+    chg_rank_correlation: float
+    tv_rank_correlation: float
+    top_k_overlap: float
+    feature_component: PairedDelta
+
+
+@dataclass(frozen=True)
+class LoopFrames:
+    """In-the-loop decision inputs derived from the calibration window."""
+
+    exact: pd.DataFrame
+    recon: pd.DataFrame
+    n_no_share: int
+
+
+def _bootstrap_view(config: ReconstructionGateConfig) -> PitCertificationConfig:
+    return PitCertificationConfig(
+        bootstrap_block_days=int(config.bootstrap_block_days),
+        bootstrap_n_boot=int(config.bootstrap_n_boot),
+        bootstrap_seed=int(config.bootstrap_seed),
+    )
+
+
+def pair_certification_days(
+    daily_exact: pd.DataFrame, daily_recon: pd.DataFrame
+) -> tuple[list[str], list[str]]:
+    """Intersect arm dates; days present in one arm only are reported and dropped from paired statistics.
+
+    Raises:
+        ValueError: Either daily frame lacks the date column.
+    """
+    for label, frame in (("exact", daily_exact), ("recon", daily_recon)):
+        if "date" not in frame.columns:
+            raise ValueError(f"pair_certification_days {label} daily missing required column 'date'")
+
+    def _day_set(frame: pd.DataFrame) -> set[pd.Timestamp]:
+        parsed = pd.to_datetime(frame["date"], errors="coerce")
+        return {pd.Timestamp(d).normalize() for d in parsed.tolist() if pd.notna(d)}
+
+    exact_days = _day_set(daily_exact)
+    recon_days = _day_set(daily_recon)
+    paired = sorted(exact_days & recon_days)
+    dropped = sorted(exact_days ^ recon_days)
+    return [d.strftime("%Y-%m-%d") for d in paired], [d.strftime("%Y-%m-%d") for d in dropped]
+
+
+def paired_coverage_improvement(
+    daily_exact: pd.DataFrame, daily_recon: pd.DataFrame, *, config: ReconstructionGateConfig
+) -> PairedDelta:
+    """Arm-1 minus arm-2 daily coverage loss (eod_full minus eod_matched top-k net bp) on paired days.
+
+    Raises:
+        ValueError: Either daily frame lacks date, arm or topk_net_bp columns.
+    """
+    for label, frame in (("exact", daily_exact), ("recon", daily_recon)):
+        missing = [c for c in ("date", "arm", "topk_net_bp") if c not in frame.columns]
+        if missing:
+            raise ValueError(f"paired_coverage_improvement {label} daily missing columns: {missing}")
+    paired, _dropped = pair_certification_days(daily_exact, daily_recon)
+
+    def _daily_loss(frame: pd.DataFrame) -> dict[str, float]:
+        work = frame.copy()
+        work["day"] = pd.to_datetime(work["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        out: dict[str, float] = {}
+        for day, group in work.groupby("day"):
+            full = pd.to_numeric(group[group["arm"] == _EOD_FULL]["topk_net_bp"], errors="coerce").to_numpy(dtype=np.float64)
+            matched = pd.to_numeric(group[group["arm"] == _EOD_MATCHED]["topk_net_bp"], errors="coerce").to_numpy(dtype=np.float64)
+            if len(full) and len(matched) and np.isfinite(full[0]) and np.isfinite(matched[0]):
+                out[str(day)] = float(full[0] - matched[0])
+        return out
+
+    loss_exact = _daily_loss(daily_exact)
+    loss_recon = _daily_loss(daily_recon)
+    improvements = [loss_exact[d] - loss_recon[d] for d in paired if d in loss_exact and d in loss_recon]
+    if not improvements:
+        return _nan_delta(0)
+    return _paired_delta(
+        np.asarray(improvements, dtype=np.float64),
+        np.zeros(len(improvements), dtype=np.float64),
+        config=_bootstrap_view(config),
+    )
+
+
+def coverage_by_year_and_basis(panel_days: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Mean superset coverage by calendar year and index basis (report-only context).
+
+    Raises:
+        ValueError: Missing date, index_basis or superset_coverage columns.
+    """
+    missing = [c for c in ("date", "index_basis", "superset_coverage") if c not in panel_days.columns]
+    if missing:
+        raise ValueError(f"coverage_by_year_and_basis panel_days missing columns: {missing}")
+    work = panel_days.copy()
+    work["year"] = pd.to_datetime(work["date"], errors="coerce").dt.strftime("%Y")
+    work["coverage"] = pd.to_numeric(work["superset_coverage"], errors="coerce")
+    out: dict[str, dict[str, float]] = {}
+    for (year, basis), group in work.groupby(["year", "index_basis"]):
+        finite = group["coverage"].to_numpy(dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        out.setdefault(str(year), {})[str(basis)] = float(np.mean(finite)) if len(finite) else float("nan")
+    return out
+
+
+_LOOP_FRAME_COLUMNS: tuple[str, ...] = ("date", "symbol", "trade_value", "chg")
+_LOOP_CALIBRATION_COLUMNS: tuple[str, ...] = (
+    "date",
+    "symbol",
+    "v_krx_1520",
+    "v_cons_1520",
+    "eod_volume",
+    "close_krx_1519",
+    "close_cons_1519",
+)
+
+
+def calibration_to_loop_frames(
+    calibration: pd.DataFrame,
+    *,
+    config: DecompositionConfig,
+    prev_closes: Mapping[tuple[str, str], float],
+) -> LoopFrames:
+    """Derive hidden-truth versus reconstructed decision inputs from the calibration window.
+
+    The exact arm uses KRX volumes and closes; the reconstruction arm predicts each day's share from
+    strictly earlier proxies and scales the consolidated volume. Symbol-days whose share cannot be
+    predicted fail closed and are counted in n_no_share.
+
+    Raises:
+        ValueError: Missing calibration columns or a non-finite auction fraction in the config.
+    """
+    missing = [c for c in _LOOP_CALIBRATION_COLUMNS if c not in calibration.columns]
+    if missing:
+        raise ValueError(f"calibration_to_loop_frames calibration missing columns: {missing}")
+    auction_mean = float(config.auction_fraction_mean)
+    if not np.isfinite(auction_mean) or auction_mean < 0.0 or auction_mean >= 1.0:
+        raise ValueError(f"calibration_to_loop_frames config carries an unusable auction fraction {auction_mean!r}")
+    work = calibration.copy()
+    work["day"] = pd.to_datetime(work["date"], errors="coerce", format="mixed").dt.strftime("%Y-%m-%d")
+    if bool(work["day"].isna().any()):
+        raise ValueError("calibration_to_loop_frames calibration carries unparseable dates")
+    for column in ("v_krx_1520", "v_cons_1520", "eod_volume", "close_krx_1519", "close_cons_1519"):
+        work[column] = pd.to_numeric(work[column], errors="coerce").astype(np.float64)
+    work["symbol"] = work["symbol"].astype(str)
+    exact_rows: list[dict[str, object]] = []
+    recon_rows: list[dict[str, object]] = []
+    n_no_share = 0
+    for symbol, group in work.groupby("symbol", sort=True):
+        ordered = group.sort_values("day", kind="stable").reset_index(drop=True)
+        proxies: list[tuple[str, float]] = []
+        for row in ordered.to_dict(orient="records"):
+            day = str(row["day"])
+            v_krx = float(row["v_krx_1520"])
+            v_cons = float(row["v_cons_1520"])
+            eod = float(row["eod_volume"])
+            close_krx = float(row["close_krx_1519"])
+            close_cons = float(row["close_cons_1519"])
+            try:
+                prev = float(prev_closes.get((day, str(symbol)), float("nan")))
+            except (TypeError, ValueError):
+                prev = float("nan")
+            exact_ok = (
+                np.isfinite(v_krx) and v_krx > 0.0
+                and np.isfinite(close_krx) and close_krx > 0.0
+                and np.isfinite(prev) and prev > 0.0
+            )
+            if exact_ok:
+                exact_rows.append({
+                    "date": day,
+                    "symbol": str(symbol),
+                    "trade_value": float(v_krx * close_krx),
+                    "chg": float(close_krx / prev - 1.0),
+                })
+            share: float | None = None
+            if proxies:
+                history = pd.Series(
+                    [p for _, p in proxies],
+                    index=pd.Index([d for d, _ in proxies], dtype=object),
+                    dtype=np.float64,
+                )
+                share = predict_share(history, day, config=config)
+            if share is not None and np.isfinite(v_cons) and v_cons > 0.0 and np.isfinite(close_cons) and close_cons > 0.0 and np.isfinite(prev) and prev > 0.0:
+                recon_rows.append({
+                    "date": day,
+                    "symbol": str(symbol),
+                    "trade_value": float(share * v_cons * close_cons),
+                    "chg": float(close_cons / prev - 1.0),
+                })
+            elif exact_ok:
+                n_no_share += 1
+            if np.isfinite(eod) and eod > 0.0 and np.isfinite(v_cons) and v_cons > 0.0:
+                proxies.append((day, float(eod * (1.0 - auction_mean) / v_cons)))
+    exact = pd.DataFrame(exact_rows, columns=list(_LOOP_FRAME_COLUMNS))
+    recon = pd.DataFrame(recon_rows, columns=list(_LOOP_FRAME_COLUMNS))
+    return LoopFrames(exact=exact, recon=recon, n_no_share=int(n_no_share))
+
+
+def reconstruction_in_the_loop(
+    *,
+    exact: pd.DataFrame,
+    recon: pd.DataFrame,
+    labels: pd.DataFrame,
+    top_k: int,
+    config: ReconstructionGateConfig,
+) -> InTheLoopResult:
+    """Compare reconstructed versus hidden-exact decision features on KRX-truth symbol-days only.
+
+    Per paired day: Spearman correlation of chg ranks and tv ranks, top-K (by trade value) overlap,
+    and the top-K rule net bp under each feature set. The feature component is the paired delta of
+    reconstructed minus exact rule returns.
+
+    Raises:
+        ValueError: Missing columns, top_k below one, or duplicate (date, symbol) keys.
+    """
+    for label, frame in (("exact", exact), ("recon", recon)):
+        missing = [c for c in _LOOP_FRAME_COLUMNS if c not in frame.columns]
+        if missing:
+            raise ValueError(f"reconstruction_in_the_loop {label} missing columns: {missing}")
+    missing_labels = [c for c in ("date", "symbol", "net_return") if c not in labels.columns]
+    if missing_labels:
+        raise ValueError(f"reconstruction_in_the_loop labels missing columns: {missing_labels}")
+    if int(top_k) < 1:
+        raise ValueError(f"reconstruction_in_the_loop top_k must be >= 1, got {top_k!r}")
+
+    def _keyed(frame: pd.DataFrame, label: str) -> dict[tuple[str, str], dict[str, float]]:
+        work = frame.copy()
+        work["day"] = pd.to_datetime(work["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        work["symbol"] = work["symbol"].astype(str)
+        if bool(work.duplicated(["day", "symbol"]).any()):
+            raise ValueError(f"reconstruction_in_the_loop {label} carries duplicate (date, symbol) rows")
+        out: dict[tuple[str, str], dict[str, float]] = {}
+        for row in work.to_dict(orient="records"):
+            out[(str(row["day"]), str(row["symbol"]))] = {
+                "trade_value": float(row["trade_value"]),
+                "chg": float(row["chg"]),
+            }
+        return out
+
+    exact_map = _keyed(exact, "exact")
+    recon_map = _keyed(recon, "recon")
+    label_work = labels.copy()
+    label_work["day"] = pd.to_datetime(label_work["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    label_work["symbol"] = label_work["symbol"].astype(str)
+    label_map = {
+        (str(day), str(symbol)): float(net)
+        for day, symbol, net in zip(
+            label_work["day"].tolist(),
+            label_work["symbol"].tolist(),
+            pd.to_numeric(label_work["net_return"], errors="coerce").tolist(),
+            strict=True,
+        )
+        if np.isfinite(float(net))
+    }
+    paired_keys = [k for k in set(exact_map) & set(recon_map) if k in label_map]
+    by_day: dict[str, list[tuple[str, str]]] = {}
+    for day, symbol in paired_keys:
+        by_day.setdefault(day, []).append((day, symbol))
+    chg_ics: list[float] = []
+    tv_ics: list[float] = []
+    overlaps: list[float] = []
+    recon_bp: list[float] = []
+    exact_bp: list[float] = []
+    n_days = 0
+    for day in sorted(by_day):
+        keys = by_day[day]
+        if len(keys) < int(top_k):
+            continue
+        tv_exact = np.asarray([exact_map[k]["trade_value"] for k in keys], dtype=np.float64)
+        tv_recon = np.asarray([recon_map[k]["trade_value"] for k in keys], dtype=np.float64)
+        chg_exact = np.asarray([exact_map[k]["chg"] for k in keys], dtype=np.float64)
+        chg_recon = np.asarray([recon_map[k]["chg"] for k in keys], dtype=np.float64)
+        if not (np.isfinite(tv_exact).all() and np.isfinite(tv_recon).all() and np.isfinite(chg_exact).all() and np.isfinite(chg_recon).all()):
+            continue
+        chg_ics.append(_spearman(chg_exact, chg_recon))
+        tv_ics.append(_spearman(tv_exact, tv_recon))
+        order_exact = np.argsort(-tv_exact, kind="stable")[: int(top_k)]
+        order_recon = np.argsort(-tv_recon, kind="stable")[: int(top_k)]
+        picks_exact = {keys[i] for i in order_exact.tolist()}
+        picks_recon = {keys[i] for i in order_recon.tolist()}
+        overlaps.append(len(picks_exact & picks_recon) / float(top_k))
+        exact_bp.append(float(np.mean([label_map[k] for k in picks_exact]) * 1e4))
+        recon_bp.append(float(np.mean([label_map[k] for k in picks_recon]) * 1e4))
+        n_days += 1
+    feature = (
+        _paired_delta(
+            np.asarray(recon_bp, dtype=np.float64),
+            np.asarray(exact_bp, dtype=np.float64),
+            config=_bootstrap_view(config),
+        )
+        if recon_bp
+        else _nan_delta(0)
+    )
+    return InTheLoopResult(
+        n_symbol_days=len(paired_keys),
+        n_paired_days=int(n_days),
+        chg_rank_correlation=float(np.nanmean(chg_ics)) if chg_ics else float("nan"),
+        tv_rank_correlation=float(np.nanmean(tv_ics)) if tv_ics else float("nan"),
+        top_k_overlap=float(np.mean(overlaps)) if overlaps else float("nan"),
+        feature_component=feature,
+    )
+
+
+def check_calibration_stability(
+    calibration: pd.DataFrame,
+    *,
+    alphas: Sequence[float],
+    min_prior_days: int,
+    max_gap_days: int,
+    identity_tolerance: float,
+    max_median_rel_err: float,
+) -> CalibrationStability:
+    """Fit the decomposition on the first half of the KIS window and score it on the second.
+
+    Shares for second-half rows are predicted from first-half proxies only, with the fitted EWMA
+    coefficient and bias. Never raises on thin data: unscorable windows report a failed outcome.
+    """
+    work = calibration.copy() if calibration is not None else pd.DataFrame()
+    if work.empty or "date" not in work.columns:
+        return CalibrationStability(passed=False, median_rel_err=float("nan"), n_scored=0, detail="no calibration rows")
+    days = sorted(pd.to_datetime(work["date"], errors="coerce", format="mixed").dt.strftime("%Y-%m-%d").dropna().unique().tolist())
+    if len(days) < 2:
+        return CalibrationStability(passed=False, median_rel_err=float("nan"), n_scored=0, detail="fewer than two calibration dates")
+    cut = max(1, len(days) // 2)
+    first, second = set(days[:cut]), set(days[cut:])
+    day_of = pd.to_datetime(work["date"], errors="coerce", format="mixed").dt.strftime("%Y-%m-%d")
+    try:
+        fitted = fit_decomposition_config(
+            work[day_of.isin(first)],
+            alphas=list(alphas),
+            min_prior_days=int(min_prior_days),
+            max_gap_days=int(max_gap_days),
+            identity_tolerance=float(identity_tolerance),
+        )
+    except ValueError as exc:
+        return CalibrationStability(passed=False, median_rel_err=float("nan"), n_scored=0, detail=f"first-half fit refused: {exc}")
+    scale = 1.0 - float(fitted.auction_fraction_mean)
+    history: dict[str, list[tuple[str, float, float]]] = {}
+    for row in work[day_of.isin(first)].to_dict(orient="records"):
+        try:
+            symbol = str(row["symbol"])
+            eod = float(row["eod_volume"])
+            v_cons = float(row["v_cons_1520"])
+            v_krx = float(row["v_krx_1520"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not (np.isfinite(eod) and eod > 0.0 and np.isfinite(v_cons) and v_cons > 0.0 and np.isfinite(v_krx) and v_krx > 0.0):
+            continue
+        history.setdefault(symbol, []).append((str(row["date"]), float(eod * scale / v_cons), float(v_krx / v_cons)))
+    errors: list[float] = []
+    for row in work[day_of.isin(second)].to_dict(orient="records"):
+        try:
+            symbol = str(row["symbol"])
+            eod = float(row["eod_volume"])
+            auction = float(row.get("auction_volume", 0.0))
+            v_cons = float(row["v_cons_1520"])
+            v_krx = float(row["v_krx_1520"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        residual = abs(eod - (v_krx + auction)) / eod if np.isfinite(eod) and eod > 0.0 else np.inf
+        if not (np.isfinite(v_cons) and v_cons > 0.0 and np.isfinite(v_krx) and v_krx > 0.0 and np.isfinite(residual) and residual <= float(identity_tolerance)):
+            continue
+        prior = [proxy for _, proxy, _ in sorted(history.get(symbol, []))]
+        if not prior:
+            continue
+        series = pd.Series(prior, index=pd.Index([d for d, _, _ in sorted(history.get(symbol, []))], dtype=object), dtype=np.float64)
+        share = predict_share(series, pd.Timestamp(row["date"]).strftime("%Y-%m-%d"), config=fitted)
+        if share is None:
+            continue
+        true_share = float(v_krx / v_cons)
+        errors.append(abs(share - true_share) / true_share)
+    if not errors:
+        return CalibrationStability(passed=False, median_rel_err=float("nan"), n_scored=0, detail="no second-half row predictable from the first half")
+    median = float(np.median(errors))
+    if np.isfinite(median) and median <= float(max_median_rel_err):
+        return CalibrationStability(passed=True, median_rel_err=median, n_scored=len(errors), detail="")
+    return CalibrationStability(
+        passed=False,
+        median_rel_err=median,
+        n_scored=len(errors),
+        detail=f"median relative error {median:.4f} above ceiling {float(max_median_rel_err):.4f}",
+    )
+
+
+def evaluate_reconstruction_gate(
+    *,
+    coverage_improvement: PairedDelta,
+    reconstruction_feature: PairedDelta,
+    stability: CalibrationStability,
+    config: ReconstructionGateConfig,
+) -> ReconstructionGateVerdict:
+    """Evaluate adoption: ADOPT only when coverage improves with a CI excluding zero, the arm-3
+    feature component is neutral at the declared level, and the stability check passes."""
+    reasons: list[str] = []
+    horizon = int(config.min_paired_days)
+    improvement = coverage_improvement
+    if improvement.n_days < horizon:
+        reasons.append(f"coverage improvement covers only {improvement.n_days} paired days (minimum {horizon})")
+    elif not (np.isfinite(improvement.delta) and np.isfinite(improvement.ci_low) and np.isfinite(improvement.ci_high)):
+        reasons.append("coverage improvement is not estimable")
+    elif improvement.ci_low <= 0.0:
+        reasons.append(
+            f"coverage improvement CI [{improvement.ci_low:.2f}, {improvement.ci_high:.2f}] includes zero"
+        )
+    elif improvement.delta <= float(config.min_coverage_improvement_bp):
+        reasons.append(
+            f"coverage improvement {improvement.delta:.2f}bp at or below the minimum {float(config.min_coverage_improvement_bp):.2f}bp"
+        )
+    feature = reconstruction_feature
+    if feature.n_days < horizon:
+        reasons.append(f"arm-3 feature covers only {feature.n_days} paired days (minimum {horizon})")
+    elif not np.isfinite(feature.p_value):
+        reasons.append("arm-3 feature neutrality is not established")
+    elif feature.p_value < float(config.alpha):
+        reasons.append(f"arm-3 feature component is significant (p={feature.p_value:.4f} < {float(config.alpha):.4f})")
+    if not bool(stability.passed):
+        reasons.append(f"stability failed: {stability.detail or 'no detail'}")
+    return ReconstructionGateVerdict(
+        verdict="ADOPT" if not reasons else "REJECT",
+        reasons=tuple(reasons),
+        coverage_improvement=improvement,
+        reconstruction_feature=feature,
+        stability_passed=bool(stability.passed),
+    )
+
+
+def run_reconstruction_certification(
+    *,
+    daily_exact: pd.DataFrame,
+    daily_recon: pd.DataFrame,
+    loop_exact: pd.DataFrame,
+    loop_recon: pd.DataFrame,
+    labels: pd.DataFrame,
+    stability: CalibrationStability,
+    coverage: dict[str, dict[str, dict[str, float]]],
+    top_k: int,
+    config: ReconstructionGateConfig | None = None,
+    exact_dir: str = "",
+    recon_dir: str = "",
+    generated_at: str = "",
+) -> ReconstructionCertification:
+    """Combine the three arms into one adoption artifact on identical (paired) dates."""
+    gate = config if config is not None else ReconstructionGateConfig()
+    paired, dropped = pair_certification_days(daily_exact, daily_recon)
+    improvement = paired_coverage_improvement(daily_exact, daily_recon, config=gate)
+    loop = reconstruction_in_the_loop(exact=loop_exact, recon=loop_recon, labels=labels, top_k=top_k, config=gate)
+    verdict = evaluate_reconstruction_gate(
+        coverage_improvement=improvement,
+        reconstruction_feature=loop.feature_component,
+        stability=stability,
+        config=gate,
+    )
+    stamp = generated_at or datetime.now(_KST).isoformat()
+    return ReconstructionCertification(
+        generated_at=str(stamp),
+        exact_dir=str(exact_dir),
+        recon_dir=str(recon_dir),
+        paired_days=tuple(paired),
+        dropped_days=tuple(dropped),
+        coverage_improvement=improvement,
+        reconstruction_feature=loop.feature_component,
+        stability=stability,
+        coverage_by_year_and_basis=dict(coverage),
+        gate_verdict=verdict.verdict,
+        gate_reasons=tuple(verdict.reasons),
+    )
+
+
+def _read_cert_daily(report_dir: Path) -> pd.DataFrame:
+    path = Path(report_dir) / PIT_HAIRCUT_DAILY_FILENAME
+    if not path.exists():
+        raise FileNotFoundError(f"certification daily evidence not found: {path}")
+    return pd.read_parquet(path)
+
+
+def _prev_close_map(price_history: pd.DataFrame) -> dict[tuple[str, str], float]:
+    missing = [c for c in ("date", "symbol", "close") if c not in price_history.columns]
+    if missing:
+        raise ValueError(f"_prev_close_map price_history missing columns: {missing}")
+    work = price_history.copy()
+    work["day"] = pd.to_datetime(work["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    work["symbol"] = work["symbol"].astype(str)
+    work["close"] = pd.to_numeric(work["close"], errors="coerce")
+    ordered = work.sort_values(["symbol", "day"], kind="stable")
+    prev = ordered.groupby("symbol")["close"].shift(1)
+    return {
+        (str(day), str(symbol)): float(close)
+        for day, symbol, close in zip(ordered["day"].tolist(), ordered["symbol"].tolist(), prev.tolist(), strict=True)
+        if pd.notna(day) and np.isfinite(float(close))
+    }
+
+
+def main_reconstruction_certification(
+    *,
+    exact_dir: str | Path,
+    recon_dir: str | Path,
+    out_dir: str | Path,
+    calibration_path: str | Path,
+    config_path: str | Path,
+    price_history_path: str | Path,
+    top_k: int | None = None,
+    exact_days_path: str | Path | None = None,
+    recon_days_path: str | Path | None = None,
+    stability_alphas: Sequence[float] = (0.3, 0.5),
+    identity_tolerance: float = 0.05,
+    gate_config: ReconstructionGateConfig | None = None,
+) -> ReconstructionCertification:
+    """Certification entry for a panel pair: exact arm plus exact-with-reconstruction arm.
+
+    Each report directory holds one arm's pit_haircut report and daily evidence, produced by two
+    standard --pit-certification runs (exact panel, then the reconstructed panel). The KIS-window
+    in-the-loop arm and the calibration stability check derive from the calibration table, the
+    fitted decomposition config and forward labels attached from price_history here.
+
+    Raises:
+        FileNotFoundError: An arm's daily evidence is absent.
+    """
+    from src.ml.research.v3_engine import load_and_prepare_price_history
+
+    gate = gate_config if gate_config is not None else ReconstructionGateConfig()
+    daily_exact = _read_cert_daily(Path(exact_dir))
+    daily_recon = _read_cert_daily(Path(recon_dir))
+    calibration = pd.read_parquet(calibration_path)
+    decomp = load_decomposition_config(config_path)
+    ph, market_dates, d_to_idx = load_and_prepare_price_history(price_history_path)
+    prev_closes = _prev_close_map(ph)
+    frames = calibration_to_loop_frames(calibration, config=decomp, prev_closes=prev_closes)
+    loop_keys = frames.exact[["date", "symbol"]].drop_duplicates().reset_index(drop=True)
+    labeled = attach_eod_labels(loop_keys, ph, market_dates, d_to_idx, cost=PRODUCTION_STRATEGY.cost)
+    loop_labels = labeled[["date", "symbol", "net_pit"]].rename(columns={"net_pit": "net_return"})
+    stability = check_calibration_stability(
+        calibration,
+        alphas=list(stability_alphas),
+        min_prior_days=decomp.min_prior_days,
+        max_gap_days=decomp.max_gap_days,
+        identity_tolerance=float(identity_tolerance),
+        max_median_rel_err=gate.max_stability_median_rel_err,
+    )
+    coverage: dict[str, dict[str, dict[str, float]]] = {}
+    if exact_days_path is not None:
+        coverage["exact"] = coverage_by_year_and_basis(pd.read_parquet(exact_days_path))
+    if recon_days_path is not None:
+        coverage["with_reconstruction"] = coverage_by_year_and_basis(pd.read_parquet(recon_days_path))
+    cert = run_reconstruction_certification(
+        daily_exact=daily_exact,
+        daily_recon=daily_recon,
+        loop_exact=frames.exact,
+        loop_recon=frames.recon,
+        labels=loop_labels,
+        stability=stability,
+        coverage=coverage,
+        top_k=int(top_k) if top_k is not None else int(PRODUCTION_STRATEGY.top_k),
+        config=gate,
+        exact_dir=str(exact_dir),
+        recon_dir=str(recon_dir),
+    )
+    save_reconstruction_certification(cert, out_path=Path(out_dir) / RECONSTRUCTION_CERTIFICATION_FILENAME)
+    logger.info(
+        "[ALGO] stage=reconstruction_certification verdict=%s paired_days=%d dropped_days=%d n_no_share=%d reasons=%s",
+        cert.gate_verdict,
+        len(cert.paired_days),
+        len(cert.dropped_days),
+        int(frames.n_no_share),
+        list(cert.gate_reasons),
+    )
+    return cert

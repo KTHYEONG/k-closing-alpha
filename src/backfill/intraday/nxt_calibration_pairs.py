@@ -29,11 +29,11 @@ logger = logging.getLogger(__name__)
 _CONSOLIDATED_REASON: str = "toss_consolidated_tape"
 
 # KIS start-stamp cutoffs: the continuous session ends at 15:20 and the 15:30 print is the auction.
-_KRX_CONTINUOUS_CUTOFF_HHMMSS: int = 152000
+_KRX_CONTINUOUS_CUTOFF_HHMMSS: int = 151900
 _KRX_AUCTION_TS_HHMMSS: int = 153000
 _KRX_CLOSE_REF_HHMMSS: int = 151900
-# Toss end-stamps lag KIS start-stamps by one minute; 15:20:00+ bars are auction-period prints.
-_CONS_CONTINUOUS_CUTOFF_HHMMSS: int = 152100
+# Toss end-stamps lag KIS start-stamps by one minute: label 15:20:00 is the last continuous minute, the decision-time cutoff.
+_CONS_CONTINUOUS_CUTOFF_HHMMSS: int = 152000
 _CONS_CLOSE_REF_HHMMSS: int = 152000
 
 # Relative bound on |EOD - (V_krx + A)|; measured median EOD/(V+A) is 1.0001 (p95 1.016).

@@ -28,6 +28,7 @@ from src.backfill.intraday.blackout import blackout_end, parse_blackout_windows,
 from src.backfill.intraday.extended_session_backfill import (
     ExtendedBackfillLedger,
     ExtendedBackfillTask,
+    _TERMINAL_LEDGER_STATES,
     _stored_partition_symbols,
     regular_superset_symbols_by_day,
 )
@@ -153,6 +154,8 @@ def enumerate_toss_consolidated_tasks(*, ledger: ExtendedBackfillLedger) -> Toss
     if regular.empty:
         return TossBackfillPlan(tasks=(), retention_floor=None, below_floor_symbol_days=0, kis_window_symbol_days=0)
     consolidated = frame[frame["session"].astype(str) == INTRADAY_SESSION_REGULAR_CONSOLIDATED]
+    consolidated = consolidated.drop_duplicates(subset=["snapshot_date", "symbol"], keep="last")
+    consolidated = consolidated[consolidated["status"].astype(str).isin(_TERMINAL_LEDGER_STATES)]
     done_keys = (
         set(zip(consolidated["snapshot_date"].astype(str).tolist(), consolidated["symbol"].astype(str).tolist()))
         if not consolidated.empty

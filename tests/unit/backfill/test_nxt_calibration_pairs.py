@@ -177,3 +177,17 @@ def test_no_production_side_effects(tmp_path, monkeypatch) -> None:
     assert any(evidence_dir.rglob("*"))
     shutil.rmtree(evidence_dir, ignore_errors=True)
     assert not evidence_dir.exists()
+
+
+def test_cutoffs_exclude_the_post_decision_minute_on_both_sides() -> None:
+    """Toss label 15:21 and the KIS 15:20 start-stamped bar start after the 15:20 decision cutoff."""
+    from src.backfill.intraday.nxt_calibration_pairs import (
+        _CONS_CONTINUOUS_CUTOFF_HHMMSS,
+        _KRX_CONTINUOUS_CUTOFF_HHMMSS,
+        _volumes_at_or_below,
+    )
+
+    toss = pd.DataFrame({"ts_hms": [151900, 152000, 152100], "volume": [1, 2, 4]})
+    kis = pd.DataFrame({"ts_hms": [151800, 151900, 152000], "volume": [1, 2, 4]})
+    assert _volumes_at_or_below(toss, _CONS_CONTINUOUS_CUTOFF_HHMMSS) == 3
+    assert _volumes_at_or_below(kis, _KRX_CONTINUOUS_CUTOFF_HHMMSS) == 3
