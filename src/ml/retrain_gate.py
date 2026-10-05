@@ -324,7 +324,8 @@ def load_recon_pit_selection(
         return None, False, f"decomposition config unreadable ({exc})"
     if config_sha.lower() != str(cert.bindings.decomposition_config_sha256).lower():
         return None, False, "decomposition config binding mismatch"
-    arm2_path = base / RECON_ARM_DIRNAME / PIT_HAIRCUT_REPORT_FILENAME
+    arm2_dir = base.parent / RECON_ARM_DIRNAME
+    arm2_path = arm2_dir / PIT_HAIRCUT_REPORT_FILENAME
     try:
         arm2_sha = _sha256_bytes(arm2_path)
     except OSError:
@@ -332,7 +333,7 @@ def load_recon_pit_selection(
     if arm2_sha.lower() != str(cert.bindings.recon_report_sha256).lower():
         return None, False, "arm-2 report binding mismatch"
     try:
-        arm2 = load_pit_haircut_report(base / RECON_ARM_DIRNAME)
+        arm2 = load_pit_haircut_report(arm2_dir)
     except ValueError as exc:
         logger.warning("[EVAL] stage=pit_gate status=RECON_REPORT_UNREADABLE reason=%s", type(exc).__name__)
         return None, False, f"arm-2 report unreadable ({type(exc).__name__})"

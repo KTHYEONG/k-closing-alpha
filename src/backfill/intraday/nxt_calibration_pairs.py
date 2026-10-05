@@ -9,6 +9,7 @@ or the production ledger: Toss evidence goes to the explicit `evidence_store`.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -190,6 +191,43 @@ async def collect_calibration_pairs(
     return pd.DataFrame(rows, columns=["date", "symbol", "kis_bars", "toss_bars", "eod_volume"])
 
 
+def calibration_row_from_pair(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive ONE calibration-table row from one collected pair.
+
+    Pure function of the pair's bars: per-side volumes at the 15:20 observability
+    boundary, the 15:30 auction print, 15:19 reference closes, full-session high/low
+    of both sides, EOD volume and the identity residual `EOD - (V_krx + A)`.
+    The identity exclusion itself stays with the table builder; this function never
+    filters.
+
+    Raises:
+        KeyError: The pair lacks `kis_bars`, `toss_bars`, `eod_volume`, `date` or `symbol`.
+    """
+    kis = row["kis_bars"]
+    toss = row["toss_bars"]
+    eod = float(row["eod_volume"])
+    v_krx = _volumes_at_or_below(kis, _KRX_CONTINUOUS_CUTOFF_HHMMSS)
+    auction = _volume_at(kis, _KRX_AUCTION_TS_HHMMSS)
+    high_krx, low_krx = _side_range(kis)
+    high_cons, low_cons = _side_range(toss)
+    return {
+        "date": str(row["date"]),
+        "symbol": str(row["symbol"]),
+        "v_krx_1520": v_krx,
+        "auction_volume": auction,
+        "v_cons_1520": _volumes_at_or_below(toss, _CONS_CONTINUOUS_CUTOFF_HHMMSS),
+        "v_cons_full": _total_volume(toss),
+        "close_krx_1519": _close_at(kis, _KRX_CLOSE_REF_HHMMSS),
+        "close_cons_1519": _close_at(toss, _CONS_CLOSE_REF_HHMMSS),
+        "high_krx": high_krx,
+        "low_krx": low_krx,
+        "high_cons": high_cons,
+        "low_cons": low_cons,
+        "eod_volume": eod,
+        "identity_residual": eod - (v_krx + auction),
+    }
+
+
 def build_calibration_table(pairs: pd.DataFrame) -> pd.DataFrame:
     """Derive the per-symbol-day calibration table from collected pairs.
 
@@ -208,31 +246,7 @@ def build_calibration_table(pairs: pd.DataFrame) -> pd.DataFrame:
         return table
     derived: list[dict[str, Any]] = []
     for _, row in pairs.iterrows():
-        kis = row["kis_bars"]
-        toss = row["toss_bars"]
-        eod = float(row["eod_volume"])
-        v_krx = _volumes_at_or_below(kis, _KRX_CONTINUOUS_CUTOFF_HHMMSS)
-        auction = _volume_at(kis, _KRX_AUCTION_TS_HHMMSS)
-        high_krx, low_krx = _side_range(kis)
-        high_cons, low_cons = _side_range(toss)
-        derived.append(
-            {
-                "date": str(row["date"]),
-                "symbol": str(row["symbol"]),
-                "v_krx_1520": v_krx,
-                "auction_volume": auction,
-                "v_cons_1520": _volumes_at_or_below(toss, _CONS_CONTINUOUS_CUTOFF_HHMMSS),
-                "v_cons_full": _total_volume(toss),
-                "close_krx_1519": _close_at(kis, _KRX_CLOSE_REF_HHMMSS),
-                "close_cons_1519": _close_at(toss, _CONS_CLOSE_REF_HHMMSS),
-                "high_krx": high_krx,
-                "low_krx": low_krx,
-                "high_cons": high_cons,
-                "low_cons": low_cons,
-                "eod_volume": eod,
-                "identity_residual": eod - (v_krx + auction),
-            }
-        )
+        derived.append(calibration_row_from_pair(row))
     table = pd.DataFrame(derived, columns=list(CALIBRATION_TABLE_COLUMNS))
     denom = pd.to_numeric(table["eod_volume"], errors="coerce").to_numpy(dtype=float)
     residual = pd.to_numeric(table["identity_residual"], errors="coerce").to_numpy(dtype=float)

@@ -1495,3 +1495,252 @@ def test_recon_rejects_mixed_vendor_consolidated_bars_and_honours_vendor_exclusi
     excluded = _build(cons, excluded_bar_vendors=frozenset({"toss"}))
     assert "000660" not in set(excluded.panel["symbol"])
     assert dict(zip(excluded.exclusions["symbol"], excluded.exclusions["reason"], strict=True))["000660"] == "vendor_excluded"
+
+
+def test_panel_provenance_round_trip_records_mode_and_digest(tmp_path) -> None:
+    """The sidecar records the reconstruction mode and the config digest."""
+    from src.data.pit1520_panel import (
+        PIT1520_PANEL_PROVENANCE_FILENAME,
+        load_panel_provenance,
+        write_panel_provenance,
+    )
+
+    digest = "ab" * 32
+    path = write_panel_provenance(
+        tmp_path, reconstruct_consolidated=True,
+        decomposition_config_sha256=digest, start="2025-03-04", end="2025-03-10",
+    )
+    assert path == tmp_path / PIT1520_PANEL_PROVENANCE_FILENAME
+    assert path.exists()
+    payload = load_panel_provenance(tmp_path)
+    assert payload["reconstruct_consolidated"] is True
+    assert payload["decomposition_config_sha256"] == digest
+    assert payload["start"] == "2025-03-04"
+    assert payload["end"] == "2025-03-10"
+
+
+def test_panel_provenance_exact_mode_carries_empty_digest(tmp_path) -> None:
+    """Exact panels carry an empty digest; a digest without reconstruction is rejected."""
+    from src.data.pit1520_panel import load_panel_provenance, write_panel_provenance
+
+    write_panel_provenance(
+        tmp_path, reconstruct_consolidated=False,
+        decomposition_config_sha256="", start="2025-03-04", end="2025-03-04",
+    )
+    assert load_panel_provenance(tmp_path)["decomposition_config_sha256"] == ""
+    with pytest.raises(ValueError, match="digest"):
+        write_panel_provenance(
+            tmp_path, reconstruct_consolidated=False,
+            decomposition_config_sha256="ab" * 32, start="2025-03-04", end="2025-03-04",
+        )
+
+
+def test_panel_provenance_is_fail_closed(tmp_path) -> None:
+    """Absent sidecars raise FileNotFoundError; unknown keys and non-hex digests raise ValueError."""
+    import json
+
+    from src.data.pit1520_panel import (
+        PIT1520_PANEL_PROVENANCE_FILENAME,
+        load_panel_provenance,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        load_panel_provenance(tmp_path / "absent")
+    (tmp_path / PIT1520_PANEL_PROVENANCE_FILENAME).write_text(
+        json.dumps({
+            "reconstruct_consolidated": True, "decomposition_config_sha256": "not-hex",
+            "built_at": "2026-10-05T12:00:00+09:00", "start": "2025-03-04", "end": "2025-03-10",
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="non-hex digest"):
+        load_panel_provenance(tmp_path)
+    (tmp_path / PIT1520_PANEL_PROVENANCE_FILENAME).write_text(
+        json.dumps({
+            "reconstruct_consolidated": True, "decomposition_config_sha256": "ab" * 32,
+            "built_at": "2026-10-05T12:00:00+09:00", "start": "2025-03-04", "end": "2025-03-10",
+            "surprise": 1,
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_panel_provenance(tmp_path)
+
+
+def _panel_main_result():
+    import pandas as pd
+
+    from src.data.pit1520_panel import Pit1520PanelResult
+
+    return Pit1520PanelResult(
+        panel=pd.DataFrame({"date": pd.to_datetime(["2025-03-04"]), "symbol": ["000001"]}),
+        exclusions=pd.DataFrame({"date": [], "symbol": [], "reason": [], "detail": []}),
+        days=pd.DataFrame({
+            "date": pd.to_datetime(["2025-03-04"]),
+            "source": ["bars"],
+            "superset_coverage": [1.0],
+        }),
+    )
+
+
+def test_panel_main_writes_sidecar_after_panel_files(tmp_path, monkeypatch) -> None:
+    """A successful build leaves panel files plus a fresh sidecar recording the window."""
+    import pandas as pd
+
+    import src.data.pit1520_panel as panel_mod
+
+    monkeypatch.setattr(
+        "src.data.panel_integrity.load_price_panel",
+        lambda _path: (pd.DataFrame({"date": ["2025-03-04"]}), object()),
+    )
+    monkeypatch.setattr(panel_mod, "build_pit1520_panel", lambda **kw: _panel_main_result())
+    panel_mod.main(["--start", "2025-03-04", "--end", "2025-03-04", "--out-dir", str(tmp_path)])
+    assert (tmp_path / "pit1520_panel.parquet").exists()
+    assert (tmp_path / "pit1520_panel_days.parquet").exists()
+    from src.data.pit1520_panel import load_panel_provenance
+
+    payload = load_panel_provenance(tmp_path)
+    assert payload["reconstruct_consolidated"] is False
+    assert payload["decomposition_config_sha256"] == ""
+    assert (payload["start"], payload["end"]) == ("2025-03-04", "2025-03-04")
+
+
+def test_panel_main_failed_rebuild_leaves_no_sidecar(tmp_path, monkeypatch) -> None:
+    """A rebuild failing midway removes the previous sidecar, so no stale proof remains."""
+    import pandas as pd
+
+    import src.data.pit1520_panel as panel_mod
+    from src.data.pit1520_panel import PIT1520_PANEL_PROVENANCE_FILENAME, write_panel_provenance
+
+    write_panel_provenance(
+        tmp_path, reconstruct_consolidated=False, decomposition_config_sha256="",
+        start="2025-03-04", end="2025-03-04",
+    )
+    monkeypatch.setattr(
+        "src.data.panel_integrity.load_price_panel",
+        lambda _path: (pd.DataFrame({"date": ["2025-03-04"]}), object()),
+    )
+    monkeypatch.setattr(panel_mod, "build_pit1520_panel", lambda **kw: _panel_main_result())
+
+    def _boom(*args, **kwargs):
+        raise OSError("partition unwritable")
+
+    monkeypatch.setattr(panel_mod, "write_pit1520_panel", _boom)
+    with pytest.raises(OSError, match="unwritable"):
+        panel_mod.main(["--start", "2025-03-04", "--end", "2025-03-04", "--out-dir", str(tmp_path)])
+    assert not (tmp_path / PIT1520_PANEL_PROVENANCE_FILENAME).exists()
+
+
+@pytest.mark.parametrize("payload", [
+    ["not", "a", "mapping"],
+    {"reconstruct_consolidated": True, "decomposition_config_sha256": "ab" * 32,
+     "built_at": "2026-10-05T12:00:00+09:00", "start": "2025-03-04"},
+    {"reconstruct_consolidated": 1, "decomposition_config_sha256": "",
+     "built_at": "2026-10-05T12:00:00+09:00", "start": "2025-03-04", "end": "2025-03-10"},
+    {"reconstruct_consolidated": False, "decomposition_config_sha256": 123,
+     "built_at": "2026-10-05T12:00:00+09:00", "start": "2025-03-04", "end": "2025-03-10"},
+    {"reconstruct_consolidated": False, "decomposition_config_sha256": "ab" * 32,
+     "built_at": "2026-10-05T12:00:00+09:00", "start": "2025-03-04", "end": "2025-03-10"},
+    {"reconstruct_consolidated": False, "decomposition_config_sha256": "",
+     "built_at": "bogus", "start": "2025-03-04", "end": "2025-03-10"},
+    {"reconstruct_consolidated": False, "decomposition_config_sha256": "",
+     "built_at": "2026-10-05T12:00:00", "start": "2025-03-04", "end": "2025-03-10"},
+    {"reconstruct_consolidated": False, "decomposition_config_sha256": "",
+     "built_at": "2026-10-05T12:00:00+09:00", "start": "2026-13-99", "end": "2025-03-10"},
+])
+def test_panel_provenance_rejects_every_malformed_shape(tmp_path, payload) -> None:
+    """Every malformed sidecar shape fails closed with ValueError."""
+    import json
+
+    from src.data.pit1520_panel import (
+        PIT1520_PANEL_PROVENANCE_FILENAME,
+        load_panel_provenance,
+    )
+
+    (tmp_path / PIT1520_PANEL_PROVENANCE_FILENAME).write_text(
+        json.dumps(payload), encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="panel provenance"):
+        load_panel_provenance(tmp_path)
+
+
+def test_panel_provenance_rejects_malformed_file_and_mistyped_timestamps(tmp_path) -> None:
+    """Unparseable files and non-string timestamps fail closed."""
+    from src.data.pit1520_panel import (
+        PIT1520_PANEL_PROVENANCE_FILENAME,
+        load_panel_provenance,
+    )
+
+    (tmp_path / PIT1520_PANEL_PROVENANCE_FILENAME).write_text("not json{{", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        load_panel_provenance(tmp_path)
+    import json
+
+    (tmp_path / PIT1520_PANEL_PROVENANCE_FILENAME).write_text(
+        json.dumps({
+            "reconstruct_consolidated": False, "decomposition_config_sha256": "",
+            "built_at": 123, "start": "2025-03-04", "end": "2025-03-10",
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="mistyped built_at"):
+        load_panel_provenance(tmp_path)
+
+
+@pytest.mark.parametrize(("old_mode", "old_digest", "new_mode", "new_digest"), [
+    (True, "ab" * 32, False, ""),
+    (False, "", True, "ab" * 32),
+    (True, "ab" * 32, True, "cd" * 32),
+])
+def test_partial_rebuild_cannot_relabel_retained_dates(tmp_path, old_mode, old_digest, new_mode, new_digest) -> None:
+    from src.data import pit1520_panel as mod
+
+    paths = tuple(tmp_path / name for name in (
+        "pit1520_panel.parquet", "pit1520_panel_exclusions.parquet", "pit1520_panel_days.parquet",
+    ))
+    old = _panel_main_result()
+    old.panel["date"] = pd.to_datetime(["2025-03-03"])
+    old.days["date"] = pd.to_datetime(["2025-03-03"])
+    mod._publish_panel_build(old, paths=paths, replace_dates=["2025-03-03"],
+                            reconstruct_consolidated=old_mode, config_digest=old_digest)
+    sidecar = tmp_path / mod.PIT1520_PANEL_PROVENANCE_FILENAME
+    before = [path.read_bytes() for path in (*paths, sidecar)]
+    with pytest.raises(ValueError, match="incompatible provenance"):
+        mod._publish_panel_build(_panel_main_result(), paths=paths, replace_dates=["2025-03-04"],
+                                reconstruct_consolidated=new_mode, config_digest=new_digest)
+    assert [path.read_bytes() for path in (*paths, sidecar)] == before
+
+
+def test_compatible_partial_rebuild_keeps_complete_provenance_window(tmp_path) -> None:
+    from src.data import pit1520_panel as mod
+
+    paths = tuple(tmp_path / name for name in (
+        "pit1520_panel.parquet", "pit1520_panel_exclusions.parquet", "pit1520_panel_days.parquet",
+    ))
+    old = _panel_main_result()
+    old.panel["date"] = pd.to_datetime(["2025-03-03"])
+    old.days["date"] = pd.to_datetime(["2025-03-03"])
+    for result, dates in ((old, ["2025-03-03"]), (_panel_main_result(), ["2025-03-04"])):
+        mod._publish_panel_build(result, paths=paths, replace_dates=dates,
+                                reconstruct_consolidated=True, config_digest="ab" * 32)
+    provenance = mod.load_panel_provenance(tmp_path)
+    assert (provenance["start"], provenance["end"]) == ("2025-03-03", "2025-03-04")
+    assert len(pd.read_parquet(paths[0])) == 2
+    combined = mod.Pit1520PanelResult(*(pd.read_parquet(path) for path in paths))
+    mod._publish_panel_build(combined, paths=paths, replace_dates=["2025-03-03", "2025-03-04"],
+                            reconstruct_consolidated=False, config_digest="")
+    assert mod.load_panel_provenance(tmp_path)["reconstruct_consolidated"] is False
+
+
+def test_partial_rebuild_without_provenance_is_refused(tmp_path) -> None:
+    from src.data import pit1520_panel as mod
+
+    paths = tuple(tmp_path / name for name in (
+        "pit1520_panel.parquet", "pit1520_panel_exclusions.parquet", "pit1520_panel_days.parquet",
+    ))
+    mod.write_pit1520_panel(_panel_main_result(), paths=paths, replace_dates=["2025-03-04"])
+    before = [path.read_bytes() for path in paths]
+    with pytest.raises(FileNotFoundError, match="provenance"):
+        mod._publish_panel_build(_panel_main_result(), paths=paths, replace_dates=["2025-03-05"],
+                                reconstruct_consolidated=False, config_digest="")
+    assert [path.read_bytes() for path in paths] == before

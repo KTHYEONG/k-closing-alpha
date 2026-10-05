@@ -1063,7 +1063,7 @@ def test_retrain_train_bundle_scores_adopted_arm2_report(tmp_path, monkeypatch) 
     config_path.write_bytes(b'{"ewma_alpha": 0.5}')
     monkeypatch.setattr(
         "src.data.pit1520_panel.default_decomposition_config_path", lambda: config_path)
-    arm_dir = live_dir / RECON_ARM_DIRNAME
+    arm_dir = live_dir.parent / RECON_ARM_DIRNAME
     arm_dir.mkdir(exist_ok=True)
     _write_pit_report(arm_dir, native_mean=9.0)
     arm2_sha = hashlib.sha256((arm_dir / "pit_haircut_report.json").read_bytes()).hexdigest()
@@ -1134,3 +1134,51 @@ def test_retrain_train_bundle_scores_adopted_arm2_report(tmp_path, monkeypatch) 
         assert metadata["arm"] == expected_arm
         assert metadata["mean_net_bp"]["pit_native"] == expected_mean
         assert metadata["gate_status"] == "PASS"
+
+
+def test_retrain_recon_certification_flags_exist_with_history_defaults() -> None:
+    from src.ml.retrain import build_arg_parser
+
+    parser = build_arg_parser()
+    dests = {action.dest for action in parser._actions}
+    assert {"recon_certification", "recon_panel_dir", "decomposition_config", "calibration_table"} <= dests
+    args = parser.parse_args([])
+    assert args.recon_panel_dir is None
+    assert args.decomposition_config is None
+    assert args.calibration_table is None
+
+
+def test_retrain_recon_certification_requires_recon_panel_dir() -> None:
+    import pytest
+
+    from src.ml.retrain import main
+
+    with pytest.raises(ValueError, match="--recon-panel-dir"):
+        main(["--recon-certification"])
+
+
+def test_retrain_recon_certification_dispatches(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    calls = []
+
+    def _fake_run(**kwargs):
+        calls.append(kwargs)
+        return "CERT"
+
+    monkeypatch.setattr(
+        "src.ml.research.pit_certification.main_recon_certification_run", _fake_run,
+    )
+    main([
+        "--recon-certification", "--export-dir", str(tmp_path),
+        "--pit-panel-dir", str(tmp_path / "exact"),
+        "--recon-panel-dir", str(tmp_path / "recon"),
+        "--ranker-train-start", "2024-01-02",
+    ])
+    assert len(calls) == 1
+    assert calls[0]["export_dir"] == str(tmp_path)
+    assert str(calls[0]["recon_panel_dir"]).endswith("recon")
+    assert calls[0]["train_start"] == pd.Timestamp("2024-01-02")
