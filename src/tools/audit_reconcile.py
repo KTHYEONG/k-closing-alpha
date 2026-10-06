@@ -79,7 +79,7 @@ def _measure_transient(
     stale_tokens_fn: Callable[[str], list[str]],
     backup_issues_fn: Callable[[datetime], list[str]],
     outbox_fn: Callable[[], int],
-) -> tuple[dict[str, dict[str, Any]], list[str]]:
+) -> tuple[dict[str, dict[str, Any]], list[str], bool]:
     """Re-measure transient classes; a failing class keeps its previous keys."""
     measured: dict[str, dict[str, Any]] = {}
 
@@ -114,14 +114,16 @@ def _measure_transient(
             measured[key] = {"transient": True, "text": f"KIS 토큰 누락: {token}"}
 
     provisional: list[str] = []
+    draining = False
     try:
         backup_raw = backup_issues_fn(now)
     except Exception as exc:
         logger.warning("[SYS] stage=audit_reconcile measure=backup status=KEEP_PREVIOUS reason=%s", type(exc).__name__)
         measured.update(_prev_keys("offsite_backup:"))
     else:
+        draining = "offsite_backup:draining" in backup_raw
         running = [item for item in backup_raw if item in ("offsite_backup:running",)]
-        warnings = [item for item in backup_raw if item not in ("offsite_backup:running",)]
+        warnings = [item for item in backup_raw if item not in ("offsite_backup:running", "offsite_backup:draining")]
         if running:
             provisional = list(running)
         else:
@@ -144,7 +146,7 @@ def _measure_transient(
                 "text": f"미전송 알림: {int(pending)}건 (outbox 적체)",
             }
 
-    return measured, provisional
+    return measured, provisional, draining
 
 
 def _warning_subject(snapshot_date: str, keys: Sequence[str]) -> str:
@@ -212,7 +214,7 @@ def run_audit_reconcile(
         if not transient:
             persistent[key] = {"transient": False, "text": str(entry.get("text", key))}
 
-    measured, provisional = _measure_transient(
+    measured, provisional, draining = _measure_transient(
         now=now,
         snapshot_date=snapshot_date,
         prev_open=prev_open,
@@ -256,6 +258,8 @@ def run_audit_reconcile(
             {"key": key, "transient": new_open[key]["transient"], "text": new_open[key]["text"]}
             for key in sorted(new_keys)
         ]
+        prev_notes = prev_hb.get("info_notes", [])
+        info_notes = list(prev_notes) if isinstance(prev_notes, list) else []
         write_audit_heartbeat(
             snapshot_date,
             day_kind=day_kind,
@@ -268,6 +272,7 @@ def run_audit_reconcile(
             provisional_reasons=provisional,
             audit_kind="reconcile",
             reconciled_at=now,
+            info_notes=info_notes,
         )
 
     def _persist_state(notified_keys: set[str], reminder: bool) -> None:
@@ -342,13 +347,20 @@ def run_audit_reconcile(
         _refresh_heartbeat(subject, "WARNING", _current_outbox())
         return ReconcileResult(action=ACTION_REMINDED, still_open=still_open, notified=True)
 
+    def _display_resolved(keys: Sequence[str]) -> list[str]:
+        labels = list(keys)
+        if draining and "offsite_backup:deferred" in labels:
+            labels = ["offsite_backup:deferred -> draining" if key == "offsite_backup:deferred" else key for key in labels]
+        return labels
+
     if resolved and not new_keys:
-        subject = _resolution_subject(snapshot_date, list(resolved))
+        display = _display_resolved(list(resolved))
+        subject = _resolution_subject(snapshot_date, display)
         lines = [
             "==================================================",
             f"✅ K-Closing Alpha 점검 정상화 ({snapshot_date})",
             "==================================================",
-            f"• 해소: {', '.join(resolved)}",
+            f"• 해소: {', '.join(display)}",
             "• 상태: 🟢 전 항목 정상 (재확인 완료)",
         ]
         body = "\n".join(lines)
@@ -380,8 +392,9 @@ def run_audit_reconcile(
         _refresh_heartbeat(subject, "WARNING", _current_outbox())
         return ReconcileResult(action=ACTION_OPENED, opened=opened, still_open=still_open, notified=True)
 
+    display_changed = _display_resolved(list(resolved))
     subject = (
-        f"[kca] 🚨 {snapshot_date} 일일점검 경고: 정상화 {', '.join(resolved)}"
+        f"[kca] 🚨 {snapshot_date} 일일점검 경고: 정상화 {', '.join(display_changed)}"
         + (f" / 신규 {', '.join(opened)}" if opened else "")
         + f" / 잔여 {', '.join(sorted(new_keys))}"
     )
@@ -389,7 +402,7 @@ def run_audit_reconcile(
         "==================================================",
         f"🚨 K-Closing Alpha 점검 변동 알림 ({snapshot_date})",
         "==================================================",
-        f"• 해소: {', '.join(resolved)}",
+        f"• 해소: {', '.join(display_changed)}",
         *[f"• 신규: {new_open[key]['text']}" for key in opened],
         f"• 잔여: {', '.join(sorted(new_keys))}",
         "• 조치 안내: or-vps 서버 상태 점검 요망",
