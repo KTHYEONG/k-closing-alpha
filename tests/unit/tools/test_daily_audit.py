@@ -1025,6 +1025,31 @@ def test_audit_collection_requires_chart_terminal_proof(tmp_path) -> None:
     assert "collection:charts:1:terminal_proof_missing" in issues
 
 
+def test_audit_collection_accepts_tape_certified_ticks_as_terminal(tmp_path) -> None:
+    """Tape-recovered ticks certified by the vendor total are terminal proof, uncertified reasons still are not."""
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    _publish_chart_manifest(
+        store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"], reason="tape_complete:regular=1879:vendor_total=1982"
+    )
+
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    assert not any("terminal_proof_missing" in issue for issue in issues)
+
+    other = CaptureStore(tmp_path / "capture2")
+    _publish_cohort_decision(other, day, ["005930"])
+    _publish_chart_manifest(other, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    _publish_chart_manifest(other, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"], reason="capped:regular=5")
+    uncertified = _audit(other, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+    assert "collection:ticks:1:terminal_proof_missing" in uncertified
+
+
 def test_audit_collection_reports_tampered_decision_evidence(tmp_path) -> None:
     """Integrity failure is reported."""
     from src.data.capture_store import CaptureStore
