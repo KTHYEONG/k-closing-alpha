@@ -476,12 +476,16 @@ else:
 ph = pd.read_parquet(ROOT / "history/price_history.parquet", columns=["date", "symbol", "high", "low", "close", "close_raw", "prev_close", "volume", "daily_change_pct", "kospi_pct"])
 ph["day"] = ph["date"].astype(str).str[:10]
 mx = ph["day"].max()
-emit("DI-PH-01", level(mx < D), f"max_date={mx} audit_date={D}")
+arch_days = sorted(a["day"].unique())
+prev_arch = max([x for x in arch_days if x < D], default=None)
+PHD = D if mx >= D else mx  # price_history for D arrives with the next 08:30 ingest; compare D-1 on the evening of D
+lag_ok = mx >= D or (prev_arch is not None and mx >= prev_arch)
+emit("DI-PH-01", level(not lag_ok), f"max_date={mx} audit_date={D} compared_day={PHD} (D itself lands at the next 08:30 ingest)")
 pcnt = ph.groupby("day").size()
-last, before = pcnt.get(D, 0), pcnt[pcnt.index < D].tail(5)
+last, before = pcnt.get(PHD, 0), pcnt[pcnt.index < PHD].tail(5)
 r = last / float(before.median()) if len(before) else float("nan")
-emit("DI-PH-02", level(last == 0, not (0.97 <= r <= 1.03)), f"rows_D={last} prev5_median={before.median():.0f} ratio={r:.3f}")
-dd = ph[ph["day"] == D]
+emit("DI-PH-02", level(last == 0, not (0.97 <= r <= 1.03)), f"rows_{PHD}={last} prev5_median={before.median():.0f} ratio={r:.3f}")
+dd = ph[ph["day"] == PHD]
 emit("DI-PH-03", level(int(dd.duplicated(["symbol"]).sum()) > 0), f"dup_symbols_D={int(dd.duplicated(['symbol']).sum())}")
 bad = int(((dd["high"] < dd["low"]) | (dd["close_raw"].astype(float) <= 0) | (dd["volume"] < 0)).sum())
 emit("DI-PH-04", level(bad > 0), f"ohlcv_invalid_D={bad}")
@@ -509,14 +513,15 @@ else:
         p = pp.set_index(pp["symbol"].astype(str))["volume"]
         rr = (v / p[p > 0]).dropna()
         return float(rr.median()), float((rr < 0.9).mean()), len(rr)
-    hist_days = sorted(pcnt[pcnt.index < D].tail(4).index)
+    hist_days = sorted(pcnt[pcnt.index < PHD].tail(4).index)
     base = [vol_ratio(x) for x in hist_days if (ROOT / f"history/intraday/1m/regular/{x[:7]}/{x}.parquet").exists()]
-    cur = vol_ratio(D)
+    cur = vol_ratio(PHD)
     bmed = float(np.median([b[0] for b in base])) if base else float("nan")
     bsh = float(np.median([b[1] for b in base])) if base else float("nan")
     drift = abs(cur[0] - bmed) > 0.02 or abs(cur[1] - bsh) > 0.05
     emit("DI-1M-04", level(cur[0] > 1.01, drift), f"vol_ratio_vs_eod median={cur[0]:.4f} share_below_0.9={cur[1]:.3f} n={cur[2]} baseline_median={bmed:.4f} baseline_share={bsh:.3f}")
-    ordered = m.sort_values(["symbol", "ts_hms"])
+    mp = m if PHD == D else pd.read_parquet(ROOT / f"history/intraday/1m/regular/{PHD[:7]}/{PHD}.parquet")
+    ordered = mp.sort_values(["symbol", "ts_hms"])
     lastbar = ordered.groupby(ordered["symbol"].astype(str)).tail(1).set_index(ordered.groupby(ordered["symbol"].astype(str)).tail(1)["symbol"].astype(str))["close"]
     cr = dd.set_index(dd["symbol"].astype(str))["close_raw"].astype(float)
     k = pd.concat([lastbar.rename("b"), cr.rename("c")], axis=1).dropna()
