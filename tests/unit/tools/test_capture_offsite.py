@@ -984,6 +984,54 @@ def test_prune_removes_fully_sealed_expired_date_whole(tmp_path: Path, monkeypat
     assert len(calls) == 1
 
 
+def test_prune_stops_at_deadline_and_leaves_remaining_dates(tmp_path: Path, monkeypatch) -> None:
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    for day in ("2026-07-01", "2026-07-02"):
+        rel = _raw_rel(day, "a.bin")
+        _write_member(tmp_path, rel, b"x")
+        _write_prune_ledger(tmp_path, "raw", day, [rel], archive_md5=md5)
+    norm = _norm_rel("2026-07-01", "n.bin")
+    _write_member(tmp_path, norm, b"y")
+    _write_prune_ledger(tmp_path, "normalized", "2026-07-01", [norm], archive_md5=md5)
+    calls: list = []
+    past = datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(seconds=1)
+
+    # When the time budget is already exhausted
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, calls), config=_config(), deadline=past
+    )
+
+    # Then no directory is started, nothing is removed, and the pass says why
+    assert report.stopped_by_deadline is True
+    assert report.removed == ()
+    assert calls == []
+    assert (tmp_path / "raw" / "2026-07-01").exists() and (tmp_path / "raw" / "2026-07-02").exists()
+    assert (tmp_path / "normalized" / "2026-07-01").exists()
+
+
+def test_prune_without_deadline_is_unchanged(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    rel = _raw_rel("2026-07-01", "a.bin")
+    _write_member(tmp_path, rel, b"x")
+    _write_prune_ledger(tmp_path, "raw", "2026-07-01", [rel], archive_md5=md5)
+
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, []), config=_config()
+    )
+
+    assert report.stopped_by_deadline is False
+    assert report.removed == ("raw/2026-07-01",)
+
+
 def test_prune_keeps_cutoff_and_window_dates_untouched(tmp_path: Path, monkeypatch) -> None:
     from src.tools.capture_offsite import prune_local_sealed_capture
 

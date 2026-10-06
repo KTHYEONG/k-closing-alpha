@@ -13,7 +13,9 @@ import logging
 import shutil
 import subprocess
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -24,10 +26,14 @@ from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
+_KST = ZoneInfo("Asia/Seoul")
+
 BACKUP_REMOTE_ROOT: str = OFFSITE_REMOTE_BASE + "/_deleted"
 BACKUP_SUBTREES: tuple[str, ...] = ("data", "artifacts")
 BACKUP_RETENTION_DAYS: int = 30
 BACKUP_MAX_PURGE_DIRS_PER_SUBTREE: int = 7
+# The sealed-capture prune holds the shared Drive lock; bounded so a backlog cannot starve the nightly backup or neighbours.
+SEALED_PRUNE_BUDGET: timedelta = timedelta(minutes=40)
 LOCAL_INTRADAY_BACKUP_RETENTION_DAYS: int = 3
 RCLONE_TIMEOUT_SEC: int = 600
 # rclone 문서화된 종료코드: 3 = directory not found (아직 한 번도 옮겨진 파일이 없는 하위 트리)
@@ -191,7 +197,12 @@ def main(argv: list[str] | None = None) -> None:
 
     def _run_sealed() -> None:
         nonlocal sealed_report
-        sealed_report = prune_local_sealed_capture(_capture_root(), today=today.date(), dry_run=args.dry_run)
+        sealed_report = prune_local_sealed_capture(
+            _capture_root(),
+            today=today.date(),
+            dry_run=args.dry_run,
+            deadline=datetime.now(_KST) + SEALED_PRUNE_BUDGET,
+        )
 
     steps = [("remote", _run_remote), ("local_intraday", _run_local), ("local_sealed", _run_sealed)]
     for name, fn in steps:
