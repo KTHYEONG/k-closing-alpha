@@ -82,6 +82,7 @@ from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import dispatch_digest, drain_alert_outbox
 from src.tools.expiry_notices import CALENDAR_EXPIRY_NAME, CALENDAR_RENEW_HINT, evaluate_expiries
 from src.tools.offsite_backup import BACKUP_INFO_ISSUES, REPORT_RELPATH, backup_staleness_issues
+from src.tools.offsite_backup import backup_backlog_info as _backup_backlog_info
 from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 
@@ -1088,6 +1089,73 @@ def audit_tape_sweep(
     return tuple(issues)
 
 
+def _tape_unresolved_count(data: Mapping[str, Any]) -> int:
+    unresolved = data.get("unresolved", 0)
+    if isinstance(unresolved, (list, tuple)):
+        return len(unresolved)
+    try:
+        return int(unresolved or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _tape_oldest_key_date(data: Mapping[str, Any]) -> str:
+    candidates: list[str] = []
+    for field in ("unresolved", "remaining", "needs"):
+        items = data.get(field)
+        if isinstance(items, (list, tuple)):
+            for key in items:
+                parts = str(key).split("/")
+                for part in parts:
+                    if len(part) == 10 and part[4] == "-" and part[7] == "-":
+                        try:
+                            date.fromisoformat(part)
+                        except ValueError:
+                            continue
+                        candidates.append(part)
+                        break
+    if candidates:
+        return min(candidates)
+    run_date = str(data.get("run_date", ""))
+    try:
+        date.fromisoformat(run_date)
+        return run_date
+    except ValueError:
+        return ""
+
+
+def tape_sweep_residual_line(
+    trading_date: date,
+    *,
+    profile: CollectionSettings | None = None,
+    report: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Render the informational tape-sweep residual line, or None when no fresh report.
+
+    Never raises an issue; `expiring_needs > 0` and `disk_guard` stay warnings
+    via `audit_tape_sweep`. A report older than TAPE_REPORT_MAX_AGE_DAYS is
+    omitted, like the sweep audit itself.
+    """
+    resolved = profile if profile is not None else CollectionSettings()
+    data = dict(report) if report is not None else _read_tape_sweep_report(_capture_root(resolved))
+    if not data:
+        return None
+    run_date = str(data.get("run_date", ""))
+    try:
+        age = (trading_date - date.fromisoformat(run_date)).days
+    except ValueError:
+        return None
+    if age < 0 or age > TAPE_REPORT_MAX_AGE_DAYS:
+        return None
+    unresolved = _tape_unresolved_count(data)
+    try:
+        expiring = int(data.get("expiring_needs", 0) or 0)
+    except (TypeError, ValueError):
+        expiring = 0
+    oldest = _tape_oldest_key_date(data)
+    return f"tape_sweep_residual={unresolved} expiring={expiring} oldest={oldest}"
+
+
 def audit_extended_exhausted(*, ledger_path: Path | None = None) -> tuple[str, ...]:
     """Count EXHAUSTED extended-backfill ledger keys (informational only, never a warning).
 
@@ -1298,6 +1366,12 @@ def build_digest(
     backup_infos = tuple(issue for issue in backup_issues if issue in BACKUP_INFO_ISSUES)
     backup_warnings = tuple(issue for issue in backup_issues if issue not in BACKUP_INFO_ISSUES)
     running_line = "• 백업 진행 중: 완료 후 자동 재확인됩니다"
+    draining_line = "• backup backlog draining"
+    draining_present = "offsite_backup:draining" in backup_infos
+    running_present = "offsite_backup:running" in backup_infos
+    provisional = tuple(issue for issue in backup_infos if issue != "offsite_backup:draining")
+    if draining_present and not any("backup backlog draining" in line for line in info_lines):
+        lines.append("backup backlog draining")
     critical_collection = _critical_collection_issues(collection_issues)
     _missing_steps: list[str] = []
     if day_kind != DAY_HOLIDAY:
@@ -1351,8 +1425,10 @@ def build_digest(
                 summary_lines.append(f"• 실패 유닛: {', '.join(issue_failed)}")
             if issue_backup:
                 summary_lines.append(f"• 백업 이상: {', '.join(issue_backup)}")
-            if backup_infos:
+            if running_present:
                 summary_lines.append(running_line)
+            if draining_present:
+                summary_lines.append(draining_line)
             if issue_undelivered:
                 summary_lines.append(f"• 미전송 알림: {undelivered_alerts}건 (outbox 적체)")
             if issue_expiry:
@@ -1364,7 +1440,7 @@ def build_digest(
                 subject=f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(holiday_problems)}",
                 body=body,
                 severity=DigestSeverity.WARNING,
-                provisional_reasons=backup_infos,
+                provisional_reasons=provisional,
                 issues=issues,
             )
         label = "휴장일 SKIP"
@@ -1375,12 +1451,14 @@ def build_digest(
             "• 상태: ⏸️ 거래소 휴장일 (배치 스킵)\n\n"
         )
         if backup_infos:
-            header = header.rstrip("\n") + "\n" + running_line + "\n\n"
+            header = header.rstrip("\n") + "\n" + running_line + "\n\n" if running_present else header
+            if draining_present:
+                header = header.rstrip("\n") + "\n" + draining_line + "\n\n"
         return AuditDigest(
             subject=f"[kca] ⏸️ {snapshot_date} {label}",
             body=header + "[상세 내역]\n" + "\n".join(lines),
             severity=DigestSeverity.HOLIDAY_SKIP,
-            provisional_reasons=backup_infos,
+            provisional_reasons=provisional,
             issues=issues,
         )
 
@@ -1399,15 +1477,17 @@ def build_digest(
             f"• 진입: 🎯 {entry_str}",
             f"• 데이터: 📦 1분봉 {bars_str} / 체결 틱 {ticks_str} 적재 완료",
         ]
-        if backup_infos:
+        if running_present:
             summary_block.append(running_line)
+        if draining_present:
+            summary_block.append(draining_line)
         if expiry_notices:
             summary_block.append(f"🔑 갱신 필요: {', '.join(expiry_notices)}")
             subject += f" · 🔑갱신필요 {len(expiry_notices)}건"
         summary_block.extend(_expiry_hint_lines(expiry_notices))
         body = "\n".join(summary_block) + "\n\n[상세 내역]\n" + "\n".join(lines)
         return AuditDigest(
-            subject=subject, body=body, severity=DigestSeverity.OK, provisional_reasons=backup_infos, issues=issues
+            subject=subject, body=body, severity=DigestSeverity.OK, provisional_reasons=provisional, issues=issues
         )
 
     problems = []
@@ -1433,8 +1513,10 @@ def build_digest(
     if issue_backup:
         problems.append(f"백업이상 {','.join(issue_backup)}")
         summary_lines.append(f"• 백업 이상: {', '.join(issue_backup)}")
-    if backup_infos:
+    if running_present:
         summary_lines.append(running_line)
+    if draining_present:
+        summary_lines.append(draining_line)
     if issue_expiry:
         problems.append(f"만료임박 {','.join(issue_expiry)}")
         summary_lines.append(f"• 만료 임박: {', '.join(issue_expiry)}")
@@ -1450,7 +1532,7 @@ def build_digest(
         subject=f"[kca] 🚨 {snapshot_date} 일일점검 경고: {' / '.join(problems)}",
         body=body,
         severity=DigestSeverity.WARNING,
-        provisional_reasons=backup_infos,
+        provisional_reasons=provisional,
         issues=issues,
     )
 
@@ -1522,6 +1604,7 @@ def write_audit_heartbeat(
     provisional_reasons: Sequence[str] = (),
     audit_kind: str = "scheduled",
     reconciled_at: datetime | None = None,
+    info_notes: Sequence[str] = (),
 ) -> Path:
     """Persist proof that the weekday audit ran to completion.
 
@@ -1544,6 +1627,7 @@ def write_audit_heartbeat(
         provisional_reasons: Informational running markers (never warnings).
         audit_kind: scheduled for full audits, reconcile for re-measurements.
         reconciled_at: Re-measurement time; None for scheduled audits.
+        info_notes: Informational digest lines persisted for trend (additive v2 field).
 
     Returns:
         Path written.
@@ -1566,6 +1650,7 @@ def write_audit_heartbeat(
         "provisional_reasons": list(provisional_reasons),
         "audit_kind": audit_kind,
         "reconciled_at": reconciled_at.isoformat() if reconciled_at is not None else None,
+        "info_notes": list(info_notes),
     }
     atomic_write_text(target, json.dumps(payload, ensure_ascii=False), mode=0o644)
     return target
@@ -1763,6 +1848,20 @@ def run_daily_audit(
             )
         except Exception as exc:
             logger.warning("[SYS] stage=daily_audit tick_source_diff_record=FAILED reason=%s", type(exc).__name__)
+    try:
+        residual = tape_sweep_residual_line(trading_date)
+    except Exception as exc:
+        logger.warning("[SYS] stage=daily_audit tape_residual=FAILED reason=%s", type(exc).__name__)
+        residual = None
+    if residual is not None:
+        info_lines = (*info_lines, residual)
+    try:
+        backlog_line = _backup_backlog_info(_capture_root() / REPORT_RELPATH, audit_at)
+    except Exception as exc:
+        logger.warning("[SYS] stage=daily_audit backup_backlog=FAILED reason=%s", type(exc).__name__)
+        backlog_line = None
+    if backlog_line is not None:
+        info_lines = (*info_lines, backlog_line)
     if result is not None:
         result["intraday_complete"] = not intraday_issues
     if result is not None and intraday_issues:
@@ -1829,6 +1928,7 @@ def run_daily_audit(
         provisional_reasons=digest.provisional_reasons,
         audit_kind="scheduled",
         reconciled_at=None,
+        info_notes=info_lines,
     )
     return digest.subject
 

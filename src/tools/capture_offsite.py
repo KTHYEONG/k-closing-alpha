@@ -113,6 +113,7 @@ class SealReport:
     archive_bytes: int
     missing_sealed_members: int
     deferred_dates: int = 0
+    oldest_deferred_date: str = ""
 
 
 def _utcnow() -> datetime:
@@ -764,6 +765,7 @@ def _seal_locked(
     archive_bytes_total = 0
     missing_sealed_members = 0
     deferred_dates = 0
+    deferred_names: list[str] = []
     selected: list[tuple[str, str, int]] = []
     for tier in config.tiers:
         tier_root = capture_root / tier
@@ -863,6 +865,7 @@ def _seal_locked(
                     for rest in range(next_commit, len(jobs)):
                         if futures[rest] is None:
                             deferred_dates += 1
+                            deferred_names.append(jobs[rest][1])
                     break
                 if next_commit not in outcomes:
                     done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
@@ -904,6 +907,7 @@ def _seal_locked(
                     state[f"{tier_c}/{date_c}"] = peak_c
                 else:
                     deferred_dates += 1
+                    deferred_names.append(date_c)
                 next_commit += 1
                 _fill()
         if first_failure is not None:
@@ -925,6 +929,7 @@ def _seal_locked(
         archive_bytes=archive_bytes_total,
         missing_sealed_members=missing_sealed_members,
         deferred_dates=deferred_dates,
+        oldest_deferred_date=min(deferred_names) if deferred_names else "",
     )
 
 

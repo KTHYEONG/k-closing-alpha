@@ -905,3 +905,49 @@ def test_newer_token_issuance_heals_historical_warning(tmp_path) -> None:
     result = _review_run(sp, hp, sent, tokens_fn=lambda d: list_stale_kis_tokens(d, env=env, cache_dir=tmp_path, allow_newer=True))
     assert result.action == "RESOLVED" and len(sent) == 1
     assert json.loads(hp.read_text())["open_issues"] == []
+
+
+def test_reconcile_ignores_draining_without_notify(tmp_path: Path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    dispatches: list[tuple[str, str]] = []
+    state_path, hb_path = _seed(tmp_path, snapshot="2026-10-05", open_keys={})
+    result = run_audit_reconcile(
+        now=_now(),
+        failed_units_fn=lambda: [],
+        stale_tokens_fn=lambda _s: [],
+        backup_issues_fn=lambda _n: ["offsite_backup:draining"],
+        outbox_fn=lambda: 0,
+        dispatch_fn=lambda s, b: dispatches.append((s, b)) or {"mail": True},
+        state_path=state_path,
+        heartbeat_path=hb_path,
+    )
+    assert result.action == "NOOP"
+    assert result.opened == () and result.resolved == ()
+    assert dispatches == []
+
+
+def test_reconcile_resolves_deferred_into_draining(tmp_path: Path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    dispatches: list[tuple[str, str]] = []
+    state_path, hb_path = _seed(
+        tmp_path,
+        snapshot="2026-10-05",
+        open_keys={"offsite_backup:deferred": {"transient": True, "text": "백업 이상: offsite_backup:deferred"}},
+    )
+    result = run_audit_reconcile(
+        now=_now(),
+        failed_units_fn=lambda: [],
+        stale_tokens_fn=lambda _s: [],
+        backup_issues_fn=lambda _n: ["offsite_backup:draining"],
+        outbox_fn=lambda: 0,
+        dispatch_fn=lambda s, b: dispatches.append((s, b)) or {"mail": True},
+        state_path=state_path,
+        heartbeat_path=hb_path,
+    )
+    assert result.action == "RESOLVED"
+    assert result.resolved == ("offsite_backup:deferred",)
+    assert result.still_open == ()
+    assert len(dispatches) == 1
+    assert "offsite_backup:deferred -> draining" in dispatches[0][0]

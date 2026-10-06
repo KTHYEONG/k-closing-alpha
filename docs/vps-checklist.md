@@ -88,6 +88,7 @@ EOF'
   | `daily_audit.json` heartbeat | each audit (Mon–Fri 21:20) and each reconcile (07:30, 12:30, after backup success) | v2 fields: `severity`, `open_issues`, `provisional_reasons`, `audit_kind`, `reconciled_at`; the dashboard card is derived from it |
   | `audit_alert_state.json` | audit/reconcile | opened issues notify once; resolution and 24 h reminders are the only repeats |
   | `offsite/last_run.json` | **end** of a backup | during a run it still shows the previous night; use `offsite/in_progress.json` (exists only while running; stale after its `deadline_at`) |
+ | `offsite/deferred_history.json` | **end** of every backup (rolling 14 runs) | `offsite_backup:draining` (informational) while the deferred date count falls vs `deferred` (warning) after 3 stalled runs or an oldest deferred date older than 21 days; a missing/corrupt history reads as first observation (draining), never as stalled |
   | `logs/events/<YYYY-MM>/<D>.jsonl` run outcomes | each job | `OK`, `DEGRADED`, `NO_DECISION`, `SKIPPED` (no-op on closed days) — `SKIPPED` is not success |
   | tape sweep `last_report.json` | each sweep | absent = never ran; the audit does not warn about absence |
   | dashboard `~/quant-dashboard/public/status.json` | every minute | mirrors the above; a card that disagrees with ground truth is itself a finding |
@@ -270,9 +271,12 @@ ssh or-vps 'journalctl --user -u kca-offsite-verify.service --since "-8d" --no-p
 ssh or-vps 'R=~/.local/bin/rclone; $R about gdrive: 2>&1 | head -4; $R lsd gdrive:quant-lake/live/k-closing-alpha; $R lsf gdrive:quant-lake/live/k-closing-alpha/snapshots --max-depth 1 | tail -5; $R lsf gdrive:quant-lake/live/k-closing-alpha/_deleted/data --max-depth 1 | sort | sed -n "1p;\$p"'
 ```
 
-- [ ] **BAK-01** last run `status=ok`, every `steps.*` ok (`deferred` is a WARN: budget exhausted — track whether it drains),
-      started at/after the last Mon–Fri 22:15 KST slot. The marker's `started_at` is written after the unit's pre-steps, normally 0–2 min after the slot. While a run is active `in_progress.json` exists and `now < deadline_at`
-      (else interrupted = P1). Outside the run window no marker may exist.
+- [ ] **BAK-01** last run `status=ok`, every `steps.*` ok (`deferred` is a WARN only when stalled/aged — track whether it drains),
+      started at/after the last Mon–Fri 22:15 KST slot. `offsite_backup:draining` is informational (backlog shrinking:
+      digest info line `backup backlog draining: <previous> -> <current> dates`); `offsite_backup:deferred` warns only when
+      the deferred date count stalls (3 consecutive non-decreasing runs, new captures can briefly outpace sealing so 1–2 are grace)
+      or the oldest deferred date is older than 21 days (approaching local sealed-retention). The marker's `started_at` is written after the unit's pre-steps, normally 0–2 min after the slot. While a run is active `in_progress.json` exists and `now < deadline_at`
+      (else interrupted = P1). Outside the run window no marker may exist. `DI-BAK-01` prints the deferred-history trend.
 - [ ] **BAK-02** `core_panels` row counts never shrink (`CORE_ROW_SHRINK_TOLERANCE = 0`); a shrink is **P0**.
 - [ ] **BAK-03** duration baseline: steady state is minutes (50 s – 6 min observed with ≤ 6 segments); hours are expected only while
       draining a backlog (≈ 20–26 s per sealed segment regardless of size — Drive per-file latency). Report `duration_s`,
@@ -321,8 +325,11 @@ EOF'
 
 - [ ] **ALR-01** heartbeat `snapshot_date` is the latest **weekday** audited (it can be later than `D`, e.g. a weekday holiday has `day_kind=holiday`);
       its `finished_at` is ≈ 21:20–21:45 KST of that weekday or a later `reconciled_at`; `undelivered_alerts == 0`; `schema_version == 2`.
-- [ ] **ALR-02** every `open_issues[*]` maps to a finding in this report; `provisional_reasons` non-empty only while the backup runs.
+      `info_notes` carries the digest info lines for trend (tape residual, draining backlog, source diffs); `draining` never sets `provisional_reasons`.
+- [ ] **ALR-02** every `open_issues[*]` maps to a finding in this report; `provisional_reasons` non-empty only while the backup runs
+      (`offsite_backup:running` — `draining` is settled-slow, not provisional).
       A WARN subject with `open_issues == []`, or `open_issues` that no longer reproduce, means reconcile did not clear it (P2 — name the stale source).
+      A `deferred`-open state that now reads `draining` resolves with `offsite_backup:deferred -> draining` (no new issue, no notify).
 - [ ] **ALR-03** each failed unit in the window produced a `kca-alert@<unit>` instance that **delivered**; a failed alert = P1 blind spot.
 - [ ] **ALR-04** `watchdog.yml` last 5 scheduled runs succeeded; GHCR PAT expiry > 30 days.
 - [ ] **ALR-05** dashboard cards vs ground truth: any non-OK card must correspond to a current finding; any ground-truth finding with an
@@ -614,6 +621,30 @@ fl = pd.read_parquet(P / "fills.parquet")
 emit("DI-PAPER-05", level(int(fl.duplicated(["order_id"]).sum()) > 0), f"duplicate_order_fills={int(fl.duplicated(['order_id']).sum())}")
 net = (tr["gross_pnl"].astype(float) - tr["cost"].astype(float) - tr["net_pnl"].astype(float)).abs().max()
 emit("DI-PAPER-06", level(float(net) > 1.0), f"max|gross-cost-net|={float(net):.2f}")
+
+# ---- offsite backup deferred-history trend (DI-BAK-01) ----
+import json as _bjson
+_hp = ROOT / "history/capture/offsite/deferred_history.json"
+_hist = []
+_herr = None
+if _hp.exists():
+    try:
+        _raw = _bjson.loads(_hp.read_text())
+        _hist = _raw[-5:] if isinstance(_raw, list) else []
+        if not isinstance(_raw, list):
+            _herr = "malformed"
+    except ValueError:
+        _herr = "malformed"
+_trend = [(str(_e.get("run_started_at", ""))[:10], int(_e.get("deferred_dates", -1))) for _e in _hist if isinstance(_e, dict)]
+_stall = len(_trend) >= 3 and all(_trend[-k][1] >= _trend[-k - 1][1] for k in (1, 2))
+_aged = False
+if _hist and isinstance(_hist[-1], dict) and _hist[-1].get("oldest_deferred_date"):
+    try:
+        from datetime import date as _bdate
+        _aged = (_bdate.fromisoformat(D) - _bdate.fromisoformat(str(_hist[-1]["oldest_deferred_date"]))).days > 21
+    except ValueError:
+        pass
+emit("DI-BAK-01", level(_stall or _aged), f"trend={_trend or 'empty(first observation drains)'} stalled={_stall} aged={_aged} err={_herr}")
 ```
 
 ```python probe=research

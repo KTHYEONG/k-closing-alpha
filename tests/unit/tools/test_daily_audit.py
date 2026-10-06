@@ -2478,6 +2478,7 @@ def test_heartbeat_write_is_atomic(tmp_path) -> None:
         "provisional_reasons",
         "audit_kind",
         "reconciled_at",
+        "info_notes",
     }
     assert (target.stat().st_mode & 0o777) == 0o644
 
@@ -4223,3 +4224,232 @@ def test_source_diff_checklist_probe_uses_date_scoped_evidence(tmp_path, heartbe
     assert "source_diff n=2 max=2.5% symbols=A,B" in detail
     if heartbeat_day != day:
         assert "heartbeat_verified=False gap_warning=False" in detail
+
+
+def _all_ok_result():
+    from src.tools import daily_audit
+
+    return dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+
+
+def test_digest_treats_draining_as_info() -> None:
+    from src.tools import daily_audit
+
+    digest = daily_audit.build_digest(
+        "2026-10-06", daily_audit.DAY_TRADING, _all_ok_result(), [], [],
+        backup_issues=["offsite_backup:draining"],
+    )
+    assert digest.severity is daily_audit.DigestSeverity.OK
+    assert "경고" not in digest.subject
+    assert "backup backlog draining" in digest.body
+    assert digest.provisional_reasons == ()
+
+
+def test_digest_draining_with_warning_keeps_warning_but_no_provisional() -> None:
+    from src.tools import daily_audit
+
+    digest = daily_audit.build_digest(
+        "2026-10-06", daily_audit.DAY_TRADING, _all_ok_result(),
+        ["kca-backup.service"], [],
+        backup_issues=["offsite_backup:draining"],
+    )
+    assert digest.severity is daily_audit.DigestSeverity.WARNING
+    assert "kca-backup.service" in digest.subject
+    assert "offsite_backup:draining" not in digest.subject
+    assert digest.provisional_reasons == ()
+    assert "backup backlog draining" in digest.body
+
+
+def test_tape_residual_line_is_informational() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    report = {
+        "run_date": "2026-10-06",
+        "unresolved": [f"SYM{i}/2026-09-20/regular" for i in range(30)],
+        "expiring_needs": 0,
+        "disk_guard": False,
+    }
+    line = daily_audit.tape_sweep_residual_line(date(2026, 10, 6), report=report)
+    assert line is not None and "tape_sweep_residual=30" in line and "expiring=0" in line
+    assert daily_audit.audit_tape_sweep(date(2026, 10, 6), report=report) == ()
+
+    expiring_report = dict(report, expiring_needs=2)
+    assert daily_audit.audit_tape_sweep(date(2026, 10, 6), report=expiring_report) == (
+        "intraday:tape_expiring:2:expiring_need",
+    )
+
+
+def test_stale_sweep_report_yields_no_residual_line() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    report = {"run_date": "2026-10-01", "unresolved": ["S/2026-09-20/regular"], "expiring_needs": 0}
+    assert daily_audit.tape_sweep_residual_line(date(2026, 10, 6), report=report) is None
+    assert daily_audit.audit_tape_sweep(date(2026, 10, 6), report=report) == ()
+
+
+def test_heartbeat_carries_info_notes(tmp_path) -> None:
+    import json
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.tools.daily_audit import write_audit_heartbeat
+
+    target = tmp_path / "hb.json"
+    write_audit_heartbeat(
+        "2026-10-06",
+        day_kind="trading",
+        subject="[kca] test",
+        undelivered_alerts=0,
+        finished_at=datetime(2026, 10, 6, 21, 20, tzinfo=ZoneInfo("Asia/Seoul")),
+        path=target,
+        info_notes=["tape_sweep_residual=30 expiring=0 oldest=2026-09-20"],
+    )
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert payload["info_notes"] == ["tape_sweep_residual=30 expiring=0 oldest=2026-09-20"]
+
+
+def test_tape_residual_line_edge_branches() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    day = date(2026, 10, 6)
+    int_report = {"run_date": "2026-10-06", "unresolved": 30, "expiring_needs": 0}
+    line = daily_audit.tape_sweep_residual_line(day, report=int_report)
+    assert line is not None and "tape_sweep_residual=30" in line and "oldest=2026-10-06" in line
+
+    garbage_report = {"run_date": "2026-10-06", "unresolved": {"bad": "type"}, "expiring_needs": "many"}
+    line = daily_audit.tape_sweep_residual_line(day, report=garbage_report)
+    assert line is not None and "tape_sweep_residual=0" in line
+
+    bad_key_report = {"run_date": "2026-10-06", "unresolved": ["SYM/2026-13-99/regular"], "expiring_needs": 0}
+    line = daily_audit.tape_sweep_residual_line(day, report=bad_key_report)
+    assert line is not None and "oldest=2026-10-06" in line
+
+    nodate_report = {"unresolved": []}
+    line = daily_audit.tape_sweep_residual_line(day, report=nodate_report)
+    assert line is None
+
+
+def test_digest_holiday_with_draining_lines() -> None:
+    from src.tools import daily_audit
+
+    warned = daily_audit.build_digest(
+        "2026-10-06", daily_audit.DAY_HOLIDAY, None, ["kca-backup.service"], [],
+        backup_issues=["offsite_backup:draining"],
+    )
+    assert warned.severity is daily_audit.DigestSeverity.WARNING
+    assert warned.provisional_reasons == ()
+    assert "backup backlog draining" in warned.body
+
+    skipped = daily_audit.build_digest(
+        "2026-10-06", daily_audit.DAY_HOLIDAY, None, [], [],
+        backup_issues=["offsite_backup:draining"],
+    )
+    assert skipped.severity is daily_audit.DigestSeverity.HOLIDAY_SKIP
+    assert skipped.provisional_reasons == ()
+    assert "backup backlog draining" in skipped.body
+
+
+def test_tape_oldest_key_date_falls_back_to_empty() -> None:
+    from src.tools import daily_audit
+
+    assert daily_audit._tape_oldest_key_date({"unresolved": []}) == ""
+    assert daily_audit._tape_oldest_key_date({"unresolved": ["S/2026-09-20/regular"]}) == "2026-09-20"
+
+
+def test_run_daily_audit_persists_info_lines(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+    from src.tools import daily_audit
+
+    def _standard(trading_day, **_kwargs):
+        return SessionDay(
+            trading_date=trading_day,
+            kind=SessionKind.STANDARD,
+            clock=SessionClock.standard(trading_day),
+            provenance="standard",
+        )
+
+    monkeypatch.setattr(daily_audit, "resolve_session_day", _standard)
+    monkeypatch.setattr(daily_audit.settings, "DATA_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(
+        daily_audit.CaptureStore,
+        "read_cohort",
+        lambda self, *args, **kwargs: SimpleNamespace(eligible_symbols=()),
+    )
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *args, **kwargs: ())
+    monkeypatch.setattr(
+        daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    )
+    monkeypatch.setattr(
+        daily_audit, "tape_sweep_residual_line", lambda *args, **kwargs: "tape_sweep_residual=30 expiring=0 oldest=2026-09-20"
+    )
+    monkeypatch.setattr(
+        daily_audit, "_backup_backlog_info", lambda *args, **kwargs: "backup backlog draining: 653 -> 400 dates"
+    )
+    sent: list[tuple[str, str]] = []
+    subject = daily_audit.run_daily_audit(
+        "2026-10-06",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=lambda: [],
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=lambda s, b: sent.append((s, b)) or {"email": True},
+        backup_issues_fn=lambda _at: ["offsite_backup:draining"],
+    )
+    assert subject is not None and "경고" not in subject
+    assert any("tape_sweep_residual=30" in body for _, body in sent)
+    assert any("backup backlog draining: 653 -> 400 dates" in body for _, body in sent)
+    import json as _json
+
+    heartbeat = _json.loads((tmp_path / "logs" / "heartbeat" / "daily_audit.json").read_text(encoding="utf-8"))
+    assert "tape_sweep_residual=30 expiring=0 oldest=2026-09-20" in heartbeat["info_notes"]
+    assert "backup backlog draining: 653 -> 400 dates" in heartbeat["info_notes"]
+
+
+def test_run_daily_audit_survives_info_line_failures(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+    from src.tools import daily_audit
+
+    def _standard(trading_day, **_kwargs):
+        return SessionDay(
+            trading_date=trading_day,
+            kind=SessionKind.STANDARD,
+            clock=SessionClock.standard(trading_day),
+            provenance="standard",
+        )
+
+    def _boom(*args, **kwargs):
+        raise OSError("store down")
+
+    monkeypatch.setattr(daily_audit, "resolve_session_day", _standard)
+    monkeypatch.setattr(daily_audit.settings, "DATA_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(
+        daily_audit.CaptureStore,
+        "read_cohort",
+        lambda self, *args, **kwargs: SimpleNamespace(eligible_symbols=()),
+    )
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *args, **kwargs: ())
+    monkeypatch.setattr(
+        daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True)
+    )
+    monkeypatch.setattr(daily_audit, "tape_sweep_residual_line", _boom)
+    monkeypatch.setattr(daily_audit, "_backup_backlog_info", _boom)
+    subject = daily_audit.run_daily_audit(
+        "2026-10-06",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=lambda: [],
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=lambda s, b: {"email": True},
+        backup_issues_fn=lambda _at: [],
+    )
+    assert subject is not None

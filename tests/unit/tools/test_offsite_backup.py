@@ -615,7 +615,7 @@ def test_deferred_report_yields_deferred_staleness_issue(tmp_path: Path) -> None
         "status": "ok",
         "steps": {"capture_seal": {"status": "ok", "deferred_dates": 3}},
     }), encoding="utf-8")
-    assert backup_staleness_issues(deferred_seal, audit_at) == ["offsite_backup:deferred"]
+    assert backup_staleness_issues(deferred_seal, audit_at) == ["offsite_backup:draining"]
 
     deferred_loose = tmp_path / "deferred_loose.json"
     deferred_loose.write_text(json.dumps({
@@ -626,7 +626,7 @@ def test_deferred_report_yields_deferred_staleness_issue(tmp_path: Path) -> None
             "data": {"status": "deferred", "returncode": 10},
         },
     }), encoding="utf-8")
-    assert backup_staleness_issues(deferred_loose, audit_at) == ["offsite_backup:deferred"]
+    assert backup_staleness_issues(deferred_loose, audit_at) == ["offsite_backup:draining"]
 
 
 def test_failure_dominates_deferral_in_report_and_staleness(tmp_path: Path, monkeypatch) -> None:
@@ -1012,3 +1012,314 @@ def test_audit_during_completion_never_reports_stale_or_missing(
         result = ob.backup_staleness_issues(report_path, _now_kst("2026-10-02", "23:39:00"))
     assert result == (["offsite_backup:running"] if completion_phase == "after_report_read" else [])
     assert ob.backup_staleness_issues(report_path, _now_kst("2026-10-02", "23:39:00")) == []
+
+
+def _write_deferred_report(path: Path, *, started_at: str, count: int, oldest: str = "", loose: tuple[str, ...] = ()) -> None:
+    import json as _json
+
+    steps: dict = {"capture_seal": {"status": "ok", "deferred_dates": count, "oldest_deferred_date": oldest}}
+    for subtree in loose:
+        steps[subtree] = {"status": "deferred", "returncode": 10}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps({
+        "started_at": started_at, "finished_at": started_at, "status": "ok", "steps": steps,
+    }), encoding="utf-8")
+
+
+def _write_history(path: Path, entries: list[tuple[str, int, tuple[str, ...], str]]) -> None:
+    import json as _json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps([
+        {"run_started_at": started, "deferred_dates": count, "deferred_loose": list(loose), "oldest_deferred_date": oldest}
+        for started, count, loose, oldest in entries
+    ]), encoding="utf-8")
+
+
+def test_first_deferred_run_is_draining(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_deferred_report(report, started_at="2026-10-05T13:15:00+00:00", count=653)
+    assert backup_staleness_issues(report, _now_kst("2026-10-06", "20:15:00")) == ["offsite_backup:draining"]
+
+
+def test_shrinking_backlog_stays_informational(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_backlog_info, backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_deferred_report(report, started_at="2026-10-06T13:15:00+00:00", count=400)
+    _write_history(report.parent / "deferred_history.json", [
+        ("2026-10-05T13:15:00+00:00", 653, (), ""),
+    ])
+    audit_at = _now_kst("2026-10-06", "20:15:00")
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:draining"]
+    assert backup_backlog_info(report, audit_at) == "backup backlog draining: 653 -> 400 dates"
+
+
+def test_stalled_backlog_warns_with_counts_in_detail(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_backlog_info, backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_deferred_report(report, started_at="2026-10-05T13:15:00+00:00", count=650)
+    history = report.parent / "deferred_history.json"
+    _write_history(history, [
+        ("2026-10-03T13:15:00+00:00", 600, (), ""),
+        ("2026-10-04T13:15:00+00:00", 620, (), ""),
+        ("2026-10-05T13:15:00+00:00", 650, (), ""),
+    ])
+    audit_at = _now_kst("2026-10-06", "20:15:00")
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:deferred"]
+    detail = backup_backlog_info(report, audit_at)
+    assert detail is not None and "650" in detail
+
+
+def test_aged_backlog_warns_while_shrinking(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_deferred_report(report, started_at="2026-10-05T13:15:00+00:00", count=400, oldest="2026-09-01")
+    _write_history(report.parent / "deferred_history.json", [
+        ("2026-10-04T13:15:00+00:00", 653, (), "2026-09-01"),
+    ])
+    assert backup_staleness_issues(report, _now_kst("2026-10-06", "20:15:00")) == ["offsite_backup:deferred"]
+
+
+def test_growth_step_has_grace_but_three_stalls_warn(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_deferred_report(report, started_at="2026-10-05T13:15:00+00:00", count=650)
+    _write_history(report.parent / "deferred_history.json", [
+        ("2026-10-04T13:15:00+00:00", 400, (), ""),
+    ])
+    assert backup_staleness_issues(report, _now_kst("2026-10-06", "20:15:00")) == ["offsite_backup:draining"]
+
+    report2 = tmp_path / "offsite2" / "last_run.json"
+    _write_deferred_report(report2, started_at="2026-10-05T13:15:00+00:00", count=660)
+    _write_history(report2.parent / "deferred_history.json", [
+        ("2026-10-03T13:15:00+00:00", 600, (), ""),
+        ("2026-10-04T13:15:00+00:00", 640, (), ""),
+        ("2026-10-05T13:15:00+00:00", 660, (), ""),
+    ])
+    assert backup_staleness_issues(report2, _now_kst("2026-10-06", "20:15:00")) == ["offsite_backup:deferred"]
+
+
+def test_loose_deferral_follows_same_rule(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    once = tmp_path / "once" / "last_run.json"
+    _write_deferred_report(once, started_at="2026-10-05T13:15:00+00:00", count=0, loose=("data",))
+    assert backup_staleness_issues(once, _now_kst("2026-10-06", "20:15:00")) == ["offsite_backup:draining"]
+
+    stalled = tmp_path / "stalled" / "last_run.json"
+    _write_deferred_report(stalled, started_at="2026-10-05T13:15:00+00:00", count=0, loose=("data",))
+    _write_history(stalled.parent / "deferred_history.json", [
+        ("2026-10-03T13:15:00+00:00", 0, ("data",), ""),
+        ("2026-10-04T13:15:00+00:00", 0, ("data",), ""),
+        ("2026-10-05T13:15:00+00:00", 0, ("data",), ""),
+    ])
+    assert backup_staleness_issues(stalled, _now_kst("2026-10-06", "20:15:00")) == ["offsite_backup:deferred"]
+
+
+def test_history_write_failure_never_fails_backup(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+    import subprocess
+
+    from src.tools import offsite_backup as _ob
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    monkeypatch.setattr(_ob, "append_deferred_progress", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("read-only")))
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with caplog.at_level(logging.WARNING):
+        report = run_offsite_backup(tmp_path, tmp_path / "cap_hist_fail", now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal)
+    assert report.status == "ok"
+    assert any("deferred_history=UNWRITABLE" in rec.message for rec in caplog.records)
+
+
+def test_malformed_history_is_ignored(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues, read_deferred_progress
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_deferred_report(report, started_at="2026-10-05T13:15:00+00:00", count=100)
+    history = report.parent / "deferred_history.json"
+    history.parent.mkdir(parents=True, exist_ok=True)
+    history.write_text("{corrupt", encoding="utf-8")
+    assert read_deferred_progress(history) == ()
+    assert backup_staleness_issues(report, _now_kst("2026-10-06", "20:15:00")) == ["offsite_backup:draining"]
+
+
+def test_failed_stale_interrupted_unchanged_with_deferred_history(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    audit_at = _now_kst("2026-10-06", "20:15:00")
+    _write_history(tmp_path / "offsite" / "deferred_history.json", [
+        ("2026-10-03T13:15:00+00:00", 600, (), ""),
+        ("2026-10-04T13:15:00+00:00", 620, (), ""),
+        ("2026-10-05T13:15:00+00:00", 650, (), ""),
+    ])
+    failed = tmp_path / "offsite" / "failed.json"
+    _write_report(failed, status="failed", started_at="2026-10-05T13:15:00+00:00")
+    assert backup_staleness_issues(failed, audit_at, history_path=tmp_path / "offsite" / "deferred_history.json") == [
+        "offsite_backup:failed"
+    ]
+    stale = tmp_path / "offsite" / "stale.json"
+    _write_report(stale, status="ok", started_at="2026-10-01T13:15:00+00:00")
+    assert backup_staleness_issues(stale, audit_at, history_path=tmp_path / "offsite" / "deferred_history.json") == [
+        "offsite_backup:stale"
+    ]
+    interrupted = tmp_path / "offsite" / "interrupted.json"
+    _write_report(interrupted, status="ok", started_at="2026-10-01T13:15:00+00:00")
+    marker = tmp_path / "offsite" / "in_progress.json"
+    _write_marker(marker, started_at="2026-10-05T13:20:00+00:00", deadline_at="2026-10-05T16:20:00+00:00")
+    assert backup_staleness_issues(
+        interrupted, audit_at, history_path=tmp_path / "offsite" / "deferred_history.json"
+    ) == ["offsite_backup:interrupted"]
+
+
+def test_backup_run_appends_deferred_history(tmp_path: Path, monkeypatch) -> None:
+    import json as _json
+    import subprocess
+
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import BACKUP_DEFERRED_HISTORY_RELPATH, REPORT_RELPATH, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        return SealReport(dates_scanned=1, segments_committed=0, members_committed=0, archive_bytes=0,
+                          missing_sealed_members=0, deferred_dates=7, oldest_deferred_date="2026-10-01")
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    capture = tmp_path / "cap_hist"
+    run_offsite_backup(tmp_path, capture, now=_now_kst("2026-10-06"), run_fn=_run, seal_fn=_seal)
+    history = _json.loads((capture / BACKUP_DEFERRED_HISTORY_RELPATH).read_text(encoding="utf-8"))
+    assert history[-1]["deferred_dates"] == 7
+    assert history[-1]["oldest_deferred_date"] == "2026-10-01"
+    assert (capture / REPORT_RELPATH).exists()
+
+
+def test_deferred_history_edge_branches(tmp_path: Path) -> None:
+    import json as _json
+
+    from src.tools.offsite_backup import (
+        DeferredProgress,
+        append_deferred_progress,
+        backup_staleness_issues,
+        read_deferred_progress,
+    )
+
+    hist = tmp_path / "hist.json"
+    entry = DeferredProgress("2026-10-05T13:15:00+00:00", 5, ("data",), "")
+    append_deferred_progress(tmp_path, entry)
+    append_deferred_progress(tmp_path, entry, keep=1)
+    kept = _json.loads((tmp_path / "offsite" / "deferred_history.json").read_text(encoding="utf-8"))
+    assert len(kept) == 1 and kept[0]["deferred_dates"] == 5
+
+    hist.write_text('"not-a-list"', encoding="utf-8")
+    assert read_deferred_progress(hist) == ()
+    hist.write_text('[1]', encoding="utf-8")
+    assert read_deferred_progress(hist) == ()
+    hist.write_text('[{"run_started_at": 1, "deferred_dates": 2}]', encoding="utf-8")
+    assert read_deferred_progress(hist) == ()
+    hist.write_text('[{"run_started_at": "2026-10-05T13:15:00+00:00", "deferred_dates": 2, "deferred_loose": "data"}]', encoding="utf-8")
+    assert read_deferred_progress(hist) == ()
+    hist.write_text('[{"run_started_at": "2026-10-05T13:15:00+00:00", "deferred_dates": 2, "oldest_deferred_date": 7}]', encoding="utf-8")
+    assert read_deferred_progress(hist) == ()
+    hist.write_text('[{"run_started_at": "bad-date", "deferred_dates": 2}]', encoding="utf-8")
+    assert read_deferred_progress(hist) == ()
+    hist.write_text('[{"run_started_at": "2026-10-05T13:15:00+00:00", "deferred_dates": true}]', encoding="utf-8")
+    assert read_deferred_progress(hist) == ()
+
+    report = tmp_path / "garbage_oldest.json"
+    _write_deferred_report(report, started_at="2026-10-05T13:15:00+00:00", count=9, oldest="not-a-date")
+    assert backup_staleness_issues(report, _now_kst("2026-10-06", "20:15:00")) == ["offsite_backup:draining"]
+
+
+def test_classify_loose_stall_with_falling_counts(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_backlog_info, backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_deferred_report(report, started_at="2026-10-05T13:15:00+00:00", count=500, loose=("data",))
+    _write_history(report.parent / "deferred_history.json", [
+        ("2026-10-03T13:15:00+00:00", 700, ("data",), ""),
+        ("2026-10-04T13:15:00+00:00", 600, ("data",), ""),
+        ("2026-10-05T13:15:00+00:00", 500, ("data",), ""),
+    ])
+    audit_at = _now_kst("2026-10-06", "20:15:00")
+    assert backup_staleness_issues(report, audit_at) == ["offsite_backup:deferred"]
+    assert "500" in (backup_backlog_info(report, audit_at) or "")
+
+
+def test_loose_rotation_without_stall_stays_draining(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_deferred_report(report, started_at="2026-10-05T13:15:00+00:00", count=500, loose=("artifacts",))
+    _write_history(report.parent / "deferred_history.json", [
+        ("2026-10-03T13:15:00+00:00", 700, (), ""),
+        ("2026-10-04T13:15:00+00:00", 600, ("data",), ""),
+    ])
+    assert backup_staleness_issues(report, _now_kst("2026-10-06", "20:15:00")) == ["offsite_backup:draining"]
+
+
+def test_garbage_oldest_with_history_skips_age_rule(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_staleness_issues
+
+    report = tmp_path / "offsite" / "last_run.json"
+    _write_deferred_report(report, started_at="2026-10-05T13:15:00+00:00", count=100, oldest="not-a-date")
+    _write_history(report.parent / "deferred_history.json", [
+        ("2026-10-04T13:15:00+00:00", 400, (), ""),
+    ])
+    assert backup_staleness_issues(report, _now_kst("2026-10-06", "20:15:00")) == ["offsite_backup:draining"]
+
+
+def test_backlog_info_returns_none_when_not_deferred(tmp_path: Path) -> None:
+    import json as _json
+
+    from src.tools.offsite_backup import backup_backlog_info
+
+    failed = tmp_path / "failed.json"
+    failed.write_text(_json.dumps({"status": "failed", "started_at": "2026-10-05T13:15:00+00:00", "steps": {}}), encoding="utf-8")
+    assert backup_backlog_info(failed, _now_kst("2026-10-06", "20:15:00")) is None
+    nosteps = tmp_path / "nosteps.json"
+    nosteps.write_text(_json.dumps({"status": "ok", "started_at": "2026-10-05T13:15:00+00:00"}), encoding="utf-8")
+    assert backup_backlog_info(nosteps, _now_kst("2026-10-06", "20:15:00")) is None
+    fresh = tmp_path / "fresh.json"
+    _write_deferred_report(fresh, started_at="2026-10-05T13:15:00+00:00", count=7)
+    assert backup_backlog_info(fresh, _now_kst("2026-10-06", "20:15:00")) == "backup backlog draining: 7 -> 7 dates"
+
+
+def test_backlog_info_missing_report_returns_none(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import backup_backlog_info
+
+    assert backup_backlog_info(tmp_path / "no-such.json", _now_kst("2026-10-06", "20:15:00")) is None
+
+
+def test_backlog_info_none_when_ok_report_has_nothing_deferred(tmp_path: Path) -> None:
+    import json as _json
+
+    from src.tools.offsite_backup import backup_backlog_info
+
+    report = tmp_path / "ok.json"
+    report.write_text(
+        _json.dumps(
+            {
+                "status": "ok",
+                "started_at": "2026-10-05T13:15:00+00:00",
+                "steps": {"capture_seal": {"status": "ok", "deferred_dates": 0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert backup_backlog_info(report, _now_kst("2026-10-06", "20:15:00")) is None
