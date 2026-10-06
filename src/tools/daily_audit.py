@@ -62,7 +62,10 @@ from src.data.intraday_store import intraday_partition_path, tick_partition_path
 from src.data.io_utils import atomic_write_text
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.tick_bar_consistency import (
+    CERTIFIED_SOURCE_DIFF_MAX_SHARE,
+    CertifiedTickShortfall,
     TickBarRelation,
+    classify_certified_tick_shortfall,
     classify_tick_bar_volume,
     comparable_bar_volumes,
     summed_tick_volumes,
@@ -79,7 +82,7 @@ from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import dispatch_digest, drain_alert_outbox
 from src.tools.expiry_notices import CALENDAR_EXPIRY_NAME, CALENDAR_RENEW_HINT, evaluate_expiries
 from src.tools.offsite_backup import BACKUP_INFO_ISSUES, REPORT_RELPATH, backup_staleness_issues
-from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes
+from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -844,35 +847,87 @@ REGULAR_TICKS_AUDIT_START_DATE: str = "2026-09-28"
 """First date with the current archive path and certified LS/Kiwoom ticks; earlier dates predate the fix."""
 
 
-def audit_regular_ticks(
-    trading_date: date,
-    *,
-    read_ticks: Callable[[], pd.DataFrame | None] | None = None,
-    read_bars: Callable[[], pd.DataFrame | None] | None = None,
-) -> tuple[str, ...]:
-    """Compare same-day regular-session tick volume with the 1m bars per symbol.
+def certified_tick_symbols(store: CaptureStore, trading_date: date, *, session: str = "regular") -> frozenset[str]:
+    """Symbols whose stored ticks for the day are certified complete by the tape's vendor total.
 
-    The bar stamped at the regular close carries closing-auction volume that is outside the tick
-    window and is excluded via `BAR_VOLUME_CUTOFF_HMS`. Ticks cover the exchange tape while bars are vendor-aggregated, so small
-    residuals are expected; only a tick shortfall beyond the shared tick-bar contract marks a
-    symbol as short of ticks.
+    A symbol is certified when it has a `TRADE_TICKS` entry for `session` with status `COMPLETE`
+    and `reason` prefix (text before the first `:`) exactly `tape_complete`. The latest manifest
+    wins when entries conflict for a symbol; a later non-certified `COMPLETE` entry
+    (live re-collection) un-certifies it. `tape_bracketed` and `tape_empty` never certify.
 
     Args:
-        trading_date: Audited KST date (checked only from REGULAR_TICKS_AUDIT_START_DATE; the
-            caller gates STANDARD days).
-        read_ticks: No-arg callable returning a frame with symbol and volume (None when the
-            tick partition is absent). None reads the stored regular tick partition with
-            column pruning.
-        read_bars: No-arg callable returning a frame with symbol, volume and ts_hms (None when
-            absent). None reads the stored regular 1m partition with column pruning.
+        store: Immutable artifacts and coverage manifests.
+        trading_date: Audited KST date.
+        session: Session label to certify (regular ticks only in practice).
 
     Returns:
-        Issues `intraday:regular_ticks:<count>:<reason>` with reasons missing_partition (bars
-        exist but no tick partition) and volume_gap (symbols short of ticks); empty when clean.
+        Certified symbols; empty when manifests are missing or the store is unreadable
+        (everything stays `lost`; fail closed toward warning). Never raises for absent days.
+    """
+    try:
+        manifests = store.read_manifests(trading_date.isoformat())
+    except (OSError, ValueError):
+        return frozenset()
+    certified: dict[str, bool] = {}
+    for manifest in manifests:
+        if manifest.status == CaptureStatus.PENDING:
+            continue
+        for entry in manifest.entries:
+            if entry.dataset is not CaptureDataset.TRADE_TICKS or entry.session != session:
+                continue
+            if entry.symbol is None or entry.status != CaptureStatus.COMPLETE:
+                continue
+            certified[str(entry.symbol)] = entry.reason.split(":")[0] == "tape_complete"
+    return frozenset(symbol for symbol, ok in certified.items() if ok)
+
+
+@dataclass(frozen=True)
+class TickSourceDiff:
+    """One tape-certified regular-session shortfall attributed to vendor aggregation."""
+
+    symbol: str
+    bar_volume: float
+    tick_volume: float
+    relative_shortfall: float
+
+
+@dataclass(frozen=True)
+class TickAuditResult:
+    """Classified regular-tick audit: warning issues plus informational source diffs."""
+
+    issues: tuple[str, ...]
+    source_diffs: tuple[TickSourceDiff, ...]
+    compared: int
+
+
+def classify_regular_ticks(
+    trading_date: date,
+    *,
+    certified: frozenset[str] = frozenset(),
+    read_ticks: Callable[[], pd.DataFrame | None] | None = None,
+    read_bars: Callable[[], pd.DataFrame | None] | None = None,
+) -> TickAuditResult:
+    """Classify same-day regular-session tick volume against the 1m bars per symbol.
+
+    Tape-certified shortfalls within tolerance are vendor disagreement (informational only);
+    uncertified shortfalls stay actionable warnings the sweep targets.
+
+    Args:
+        trading_date: Audited KST date (checked only from REGULAR_TICKS_AUDIT_START_DATE).
+        certified: Symbols certified complete by the tape vendor total.
+        read_ticks: No-arg callable returning a frame with symbol and volume (None when the
+            tick partition is absent). None reads the stored regular tick partition.
+        read_bars: No-arg callable returning a frame with symbol, volume and ts_hms (None when
+            absent). None reads the stored regular 1m partition.
+
+    Returns:
+        TickAuditResult with warning issues (`missing_partition`, `volume_gap` for lost only,
+        `certified_gap`, `source_diff_systemic`), informational `source_diffs` sorted by
+        relative shortfall descending, and `compared` (symbols with positive bar volume).
     """
     day_str = trading_date.isoformat()
     if day_str < REGULAR_TICKS_AUDIT_START_DATE:
-        return ()
+        return TickAuditResult(issues=(), source_diffs=(), compared=0)
 
     def _default_ticks() -> pd.DataFrame | None:
         path = tick_partition_path(day_str, INTRADAY_SESSION_REGULAR)
@@ -891,22 +946,89 @@ def audit_regular_ticks(
     bars = bars_reader()
     ticks = ticks_reader()
     if bars is None or len(bars) == 0:
-        return ()
-    if ticks is None:
-        return (_intraday_issue("regular_ticks", 1, "missing_partition"),)
+        return TickAuditResult(issues=(), source_diffs=(), compared=0)
     bar_sum = comparable_bar_volumes(INTRADAY_SESSION_REGULAR, bars)
+    compared = sum(1 for total in bar_sum.values() if float(total) > 0)
+    if ticks is None:
+        return TickAuditResult(
+            issues=(_intraday_issue("regular_ticks", 1, "missing_partition"),),
+            source_diffs=(),
+            compared=compared,
+        )
     tick_sum = summed_tick_volumes(ticks)
-    short = 0
+    lost = 0
+    excess = 0
+    diffs: list[TickSourceDiff] = []
     for symbol, bar_total in bar_sum.items():
         bar_total = float(bar_total)
         if bar_total == 0:
             continue
         tick_total = float(tick_sum.get(symbol, 0))
-        if classify_tick_bar_volume(INTRADAY_SESSION_REGULAR, bar_total, tick_total) is TickBarRelation.TICK_SHORT:
-            short += 1
-    if short:
-        return (_intraday_issue("regular_ticks", short, "volume_gap"),)
-    return ()
+        if (
+            classify_tick_bar_volume(INTRADAY_SESSION_REGULAR, bar_total, tick_total)
+            is not TickBarRelation.TICK_SHORT
+        ):
+            continue
+        verdict = classify_certified_tick_shortfall(
+            INTRADAY_SESSION_REGULAR, bar_total, tick_total, tape_certified=symbol in certified
+        )
+        if verdict is CertifiedTickShortfall.SOURCE_DIFF:
+            diffs.append(
+                TickSourceDiff(
+                    symbol=symbol,
+                    bar_volume=bar_total,
+                    tick_volume=tick_total,
+                    relative_shortfall=(bar_total - tick_total) / bar_total if bar_total > 0 else 0.0,
+                )
+            )
+        elif verdict is CertifiedTickShortfall.SOURCE_DIFF_EXCESS:
+            excess += 1
+        else:
+            lost += 1
+    diffs.sort(key=lambda d: (-d.relative_shortfall, d.symbol))
+    issues: list[str] = []
+    if lost:
+        issues.append(_intraday_issue("regular_ticks", lost, "volume_gap"))
+    if excess:
+        issues.append(_intraday_issue("regular_ticks", excess, "certified_gap"))
+    if diffs and compared > 0 and len(diffs) / compared > CERTIFIED_SOURCE_DIFF_MAX_SHARE:
+        issues.append(_intraday_issue("regular_ticks", len(diffs), "source_diff_systemic"))
+    return TickAuditResult(issues=tuple(issues), source_diffs=tuple(diffs), compared=compared)
+
+
+def audit_regular_ticks(
+    trading_date: date,
+    *,
+    certified: frozenset[str] = frozenset(),
+    read_ticks: Callable[[], pd.DataFrame | None] | None = None,
+    read_bars: Callable[[], pd.DataFrame | None] | None = None,
+) -> tuple[str, ...]:
+    """Compare same-day regular-session tick volume with the 1m bars per symbol.
+
+    The bar stamped at the regular close carries closing-auction volume that is outside the tick
+    window and is excluded via `BAR_VOLUME_CUTOFF_HMS`. Ticks cover the exchange tape while bars are vendor-aggregated, so small
+    residuals are expected; only a tick shortfall beyond the shared tick-bar contract marks a
+    symbol as short of ticks. Tape-certified shortfalls within tolerance are informational only.
+
+    Args:
+        trading_date: Audited KST date (checked only from REGULAR_TICKS_AUDIT_START_DATE; the
+            caller gates STANDARD days).
+        certified: Symbols certified complete by the tape vendor total.
+        read_ticks: No-arg callable returning a frame with symbol and volume (None when the
+            tick partition is absent). None reads the stored regular tick partition with
+            column pruning.
+        read_bars: No-arg callable returning a frame with symbol, volume and ts_hms (None when
+            absent). None reads the stored regular 1m partition with column pruning.
+
+    Returns:
+        Issues `intraday:regular_ticks:<count>:<reason>` with reasons missing_partition (bars
+        exist but no tick partition), volume_gap (uncertified symbols short of ticks),
+        certified_gap and source_diff_systemic; empty when clean. Equals
+        `classify_regular_ticks(...).issues`.
+    """
+    return classify_regular_ticks(
+        trading_date, certified=certified, read_ticks=read_ticks, read_bars=read_bars
+    ).issues
 
 
 TAPE_DEPTH_DAYS: int = 30
@@ -1574,6 +1696,7 @@ def run_daily_audit(
     trading_date = date.fromisoformat(snapshot_date)
     audit_at = datetime.now(SEOUL)
     session_day = resolve_session_day(trading_date)
+    tick_source_diffs: tuple[TickSourceDiff, ...] = ()
     try:
         profile = CollectionSettings()
         session_clock = session_day.clock if session_day.clock is not None else SessionClock.standard(trading_date)
@@ -1603,7 +1726,10 @@ def run_daily_audit(
                 value_sessions = [INTRADAY_SESSION_REGULAR]
             intraday_issues = (*intraday_issues, *audit_bar_value_consistency(trading_date, sessions=value_sessions))
             if session_day.kind is SessionKind.STANDARD:
-                intraday_issues = (*intraday_issues, *audit_regular_ticks(trading_date))
+                certified = certified_tick_symbols(store, trading_date)
+                tick_audit = classify_regular_ticks(trading_date, certified=certified)
+                intraday_issues = (*intraday_issues, *tick_audit.issues)
+                tick_source_diffs = tick_audit.source_diffs
                 intraday_issues = (*intraday_issues, *audit_aftermarket_ticks(trading_date))
                 intraday_issues = (*intraday_issues, *audit_tape_sweep(trading_date, profile=profile))
     except (OSError, ValueError) as exc:
@@ -1616,6 +1742,27 @@ def run_daily_audit(
         extended_info = ()
     if extended_info:
         logger.info("[DATA] stage=daily_audit %s", extended_info[0])
+    info_lines: tuple[str, ...] = tuple(extended_info)
+    if tick_source_diffs:
+        peak = max(diff.relative_shortfall for diff in tick_source_diffs)
+        shown = ",".join(diff.symbol for diff in tick_source_diffs[:10])
+        info_lines = (
+            *info_lines,
+            f"regular_ticks_source_diff={len(tick_source_diffs)} max={peak * 100:.1f}% symbols={shown}",
+        )
+        try:
+            record_run_outcome(
+                "tick_source_diff",
+                RUN_OUTCOME_OK,
+                run_date=trading_date.isoformat(),
+                metrics={
+                    "n": len(tick_source_diffs),
+                    "max_relative_shortfall": peak,
+                    "symbols": [diff.symbol for diff in tick_source_diffs[:20]],
+                },
+            )
+        except Exception as exc:
+            logger.warning("[SYS] stage=daily_audit tick_source_diff_record=FAILED reason=%s", type(exc).__name__)
     if result is not None:
         result["intraday_complete"] = not intraday_issues
     if result is not None and intraday_issues:
@@ -1648,7 +1795,7 @@ def run_daily_audit(
         undelivered_alerts=undelivered_alerts,
         expiry_notices=report.notices,
         expiry_warnings=report.warnings,
-        info_lines=extended_info,
+        info_lines=info_lines,
     )
     if digest.severity is DigestSeverity.WARNING:
         logger.warning("[DATA] stage=daily_audit day=%s status=WARNING subject=%s", day_kind, digest.subject)

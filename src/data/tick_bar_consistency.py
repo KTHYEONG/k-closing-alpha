@@ -37,6 +37,29 @@ class TickBarPolicy:
 
 REGULAR_POLICY = TickBarPolicy(shortfall_tolerance=0.01, surplus_tolerance=None)
 AFTERMARKET_POLICY = TickBarPolicy(shortfall_tolerance=0.0, surplus_tolerance=0.01)
+
+CERTIFIED_SOURCE_DIFF_TOLERANCE: float = 0.05
+"""Largest relative shortfall still attributed to LS-vs-Kiwoom aggregation when the tape total is certified.
+
+Observed 1.4-2.4 % on 2026-10-06; chosen with ~2x margin. Certified shortfalls beyond this are abnormal even for a
+vendor disagreement and stay warnings.
+"""
+
+CERTIFIED_SOURCE_DIFF_MAX_SHARE: float = 0.05
+"""Max share of compared symbols that may be certified source diffs before the class is treated as systemic.
+
+Beyond this share the pattern indicates a vendor aggregation change, not per-symbol noise.
+"""
+
+
+class CertifiedTickShortfall(str, Enum):  # noqa: UP042 - public contract like TickBarRelation
+    """One TICK_SHORT symbol's certified-source classification."""
+
+    LOST = "lost"
+    SOURCE_DIFF = "source_diff"
+    SOURCE_DIFF_EXCESS = "source_diff_excess"
+
+
 SESSION_POLICIES: Mapping[str, TickBarPolicy] = MappingProxyType(
     {
         INTRADAY_SESSION_REGULAR: REGULAR_POLICY,
@@ -155,6 +178,7 @@ def classify_tick_bar_volume(session: str, bar_volume: float, tick_volume: float
         if policy.surplus_tolerance is None:
             return TickBarRelation.CONSISTENT
         return TickBarRelation.TICK_SURPLUS
+
     if tick < bar:
         if (bar - tick) > policy.shortfall_tolerance * bar:
             return TickBarRelation.TICK_SHORT
@@ -166,3 +190,31 @@ def classify_tick_bar_volume(session: str, bar_volume: float, tick_volume: float
             return TickBarRelation.TICK_SURPLUS
         return TickBarRelation.CONSISTENT
     return TickBarRelation.CONSISTENT
+
+
+def classify_certified_tick_shortfall(
+    session: str, bar_volume: float, tick_volume: float, *, tape_certified: bool
+) -> CertifiedTickShortfall | None:
+    """Classify a symbol that `classify_tick_bar_volume` rates TICK_SHORT.
+
+    Why: a shortfall that the Kiwoom tape's own vendor total certifies as complete cannot be repaired; reporting it as lost ticks
+    makes the audit warn forever. Uncertified shortfalls stay actionable.
+
+    Returns:
+        None when the symbol is not TICK_SHORT for the session policy; LOST when not tape-certified; SOURCE_DIFF when certified and
+        (bar - tick) / bar <= CERTIFIED_SOURCE_DIFF_TOLERANCE; SOURCE_DIFF_EXCESS otherwise.
+
+    Raises:
+        ValueError: Unknown session, a negative or non-finite volume (same contract as classify_tick_bar_volume).
+    """
+    relation = classify_tick_bar_volume(session, bar_volume, tick_volume)
+    if relation is not TickBarRelation.TICK_SHORT:
+        return None
+    if session != INTRADAY_SESSION_REGULAR or not tape_certified:
+        return CertifiedTickShortfall.LOST
+    bar = float(bar_volume)
+    tick = float(tick_volume)
+    relative_shortfall = (bar - tick) / bar if bar > 0 else 0.0
+    if relative_shortfall <= CERTIFIED_SOURCE_DIFF_TOLERANCE:
+        return CertifiedTickShortfall.SOURCE_DIFF
+    return CertifiedTickShortfall.SOURCE_DIFF_EXCESS
