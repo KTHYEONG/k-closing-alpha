@@ -966,12 +966,15 @@ class LocalRetentionReport:
         skipped_reason: None for a completed pass; otherwise why the pass did not run (removed/kept are
             then empty): ``"seal_lock_held"`` (a seal holds the lock), ``"seal_lock_unavailable"`` (the lock
             file is not openable by this uid) or ``"capture_root_missing"`` (nothing to prune).
+        stopped_by_deadline: True when the pass stopped early at its time budget; the remaining expired
+            directories are picked up by the next run.
     """
 
     removed: tuple[str, ...]
     kept: tuple[tuple[str, str], ...]
     bytes_removed: int
     skipped_reason: str | None = None
+    stopped_by_deadline: bool = False
 
 
 def prune_local_sealed_capture(
@@ -982,6 +985,7 @@ def prune_local_sealed_capture(
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     config: OffsiteConfig = OffsiteConfig(),  # noqa: B008
     dry_run: bool = False,
+    deadline: datetime | None = None,
 ) -> LocalRetentionReport:
     """Remove local capture date directories whose every file is sealed offsite and verified.
 
@@ -1004,6 +1008,9 @@ def prune_local_sealed_capture(
         run_fn: Subprocess runner for ``rclone md5sum`` (test injection).
         config: Offsite contract (tiers, remote_root, rclone timeout).
         dry_run: List targets without deleting (still holds the seal lock).
+        deadline: Aware instant after which no further directory is started. The pass holds the shared Drive
+            lock for its whole duration, so a large backlog (one remote MD5 per segment) would otherwise starve
+            every other Drive writer on the host; directories not reached are handled by the next run.
 
     Returns:
         Removed directories, expired directories kept with a reason, and bytes reclaimed; or an empty
@@ -1032,13 +1039,19 @@ def prune_local_sealed_capture(
             removed: list[str] = []
             kept: list[tuple[str, str]] = []
             bytes_removed = 0
+            stopped = False
             for tier in sorted(config.tiers):
+                if stopped:
+                    break
                 tier_root = capture_root / tier
                 if not tier_root.exists():
                     continue
                 if tier_root.is_symlink() or not tier_root.is_dir():
                     continue
                 for child in sorted(tier_root.iterdir(), key=lambda entry: entry.name):
+                    if deadline is not None and datetime.now(deadline.tzinfo) >= deadline:
+                        stopped = True
+                        break
                     name = child.name
                     if not _is_valid_date(name):
                         continue
@@ -1133,7 +1146,11 @@ def prune_local_sealed_capture(
                     bytes_removed += regular_sizes
             removed_sorted = tuple(sorted(removed))
             kept_sorted = tuple(sorted(kept))
-            return LocalRetentionReport(removed=removed_sorted, kept=kept_sorted, bytes_removed=bytes_removed)
+            if stopped:
+                logger.info("[SYS] stage=capture_prune status=DEADLINE removed=%d", len(removed_sorted))
+            return LocalRetentionReport(
+                removed=removed_sorted, kept=kept_sorted, bytes_removed=bytes_removed, stopped_by_deadline=stopped
+            )
     except SealLockUnavailableError:
         logger.error("[SYS] stage=capture_prune status=SKIPPED reason=seal_lock_unavailable")
         return LocalRetentionReport(removed=(), kept=(), bytes_removed=0, skipped_reason="seal_lock_unavailable")
