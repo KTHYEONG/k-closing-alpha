@@ -139,7 +139,11 @@ def _extract_intraday_summary(snapshot_date: str) -> tuple[str, str]:
 
 
 _CHART_DATASETS: tuple[CaptureDataset, CaptureDataset] = (CaptureDataset.MINUTE_BARS, CaptureDataset.TRADE_TICKS)
-_TERMINAL_REASONS: frozenset[str] = frozenset({"exhausted", "crossed_target_date"})
+# Live pagination proofs plus the tape sweep's vendor-certified completion proofs: a tape-recovered entry
+# (`tape_complete`, `tape_bracketed`) is as terminal as a live walk that exhausted its pages.
+_TERMINAL_REASONS: frozenset[str] = frozenset(
+    {"exhausted", "crossed_target_date", "tape_complete", "tape_bracketed"}
+)
 _SLOW_DATA_DUE_HHMMSS: str = "213500"
 _SNAPSHOT_CATCHUP_CUTOFF_HOUR: int = 12
 AUDIT_STEPS: tuple[str, ...] = (
