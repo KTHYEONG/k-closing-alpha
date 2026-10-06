@@ -15,10 +15,14 @@ from src.config.market_session import (
 from src.data.tick_bar_consistency import (
     AFTERMARKET_POLICY,
     BAR_VOLUME_CUTOFF_HMS,
+    CERTIFIED_SOURCE_DIFF_MAX_SHARE,
+    CERTIFIED_SOURCE_DIFF_TOLERANCE,
     REGULAR_POLICY,
     SESSION_POLICIES,
+    CertifiedTickShortfall,
     TickBarPolicy,
     TickBarRelation,
+    classify_certified_tick_shortfall,
     classify_tick_bar_volume,
     comparable_bar_volumes,
     summed_tick_volumes,
@@ -178,6 +182,55 @@ def test_tick_sums_are_not_window_filtered() -> None:
         ]
     )
     assert summed_tick_volumes(ticks) == {"A": 7.0}
+
+
+def test_certified_shortfall_within_tolerance_is_source_diff() -> None:
+    assert CERTIFIED_SOURCE_DIFF_TOLERANCE == 0.05
+    assert CERTIFIED_SOURCE_DIFF_MAX_SHARE == 0.05
+    verdict = classify_certified_tick_shortfall(INTRADAY_SESSION_REGULAR, 163_185, 159_553, tape_certified=True)
+    assert verdict is CertifiedTickShortfall.SOURCE_DIFF
+
+
+def test_uncertified_shortfall_stays_lost() -> None:
+    verdict = classify_certified_tick_shortfall(INTRADAY_SESSION_REGULAR, 163_185, 159_553, tape_certified=False)
+    assert verdict is CertifiedTickShortfall.LOST
+
+
+def test_certified_excessive_shortfall_is_excess() -> None:
+    verdict = classify_certified_tick_shortfall(INTRADAY_SESSION_REGULAR, 10_000, 9_300, tape_certified=True)
+    assert verdict is CertifiedTickShortfall.SOURCE_DIFF_EXCESS
+
+
+@pytest.mark.parametrize(
+    ("tick_volume", "expected"),
+    [(9_500, CertifiedTickShortfall.SOURCE_DIFF), (9_499, CertifiedTickShortfall.SOURCE_DIFF_EXCESS)],
+)
+def test_certified_source_diff_tolerance_boundary(tick_volume: float, expected: CertifiedTickShortfall) -> None:
+    assert classify_certified_tick_shortfall(
+        INTRADAY_SESSION_REGULAR, 10_000, tick_volume, tape_certified=True
+    ) is expected
+
+
+def test_within_policy_shortfall_is_not_classified() -> None:
+    assert classify_certified_tick_shortfall(INTRADAY_SESSION_REGULAR, 10_000, 9_950, tape_certified=True) is None
+    assert classify_certified_tick_shortfall(INTRADAY_SESSION_REGULAR, 10_000, 9_950, tape_certified=False) is None
+
+
+def test_aftermarket_certified_shortfall_never_qualifies() -> None:
+    for session in (INTRADAY_SESSION_KRX_AFTERMARKET, INTRADAY_SESSION_NXT_AFTERMARKET):
+        assert (
+            classify_certified_tick_shortfall(session, 1_000_000, 999_999, tape_certified=True)
+            is CertifiedTickShortfall.LOST
+        )
+
+
+def test_certified_classification_rejects_bad_input() -> None:
+    with pytest.raises(ValueError, match="Unknown session"):
+        classify_certified_tick_shortfall("bogus", 100, 90, tape_certified=True)
+    with pytest.raises(ValueError, match="bar_volume"):
+        classify_certified_tick_shortfall(INTRADAY_SESSION_REGULAR, -1, 0, tape_certified=True)
+    with pytest.raises(ValueError, match="finite"):
+        classify_certified_tick_shortfall(INTRADAY_SESSION_REGULAR, math.nan, 0, tape_certified=True)
 
 
 def test_input_frames_are_not_mutated() -> None:

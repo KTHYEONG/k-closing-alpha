@@ -133,6 +133,7 @@ def _publish_chart_manifest(
     first_time="09:00:00",
     last_time="15:30:00",
     raw_refs=(),
+    completed_time="19:00:00",
 ):
     from datetime import datetime
 
@@ -163,7 +164,7 @@ def _publish_chart_manifest(
         schema_version=1,
         context=_capture_context(day, run_id, dataset, f"intraday-{dataset.value.lower()}"),
         cohort=None,
-        completed_at=datetime.fromisoformat(f"{day}T19:00:00+09:00"),
+        completed_at=datetime.fromisoformat(f"{day}T{completed_time}+09:00"),
         entries=tuple(entries),
         artifacts=(),
         status=manifest_status,
@@ -3824,3 +3825,401 @@ def test_digest_clean_holiday_with_running_stays_skip() -> None:
     summary, detail = digest.body.split("[상세 내역]")
     assert summary.count("• 백업 진행 중: 완료 후 자동 재확인됩니다") == 1
     assert "backup_issues=offsite_backup:running" in detail
+
+
+def test_certified_tick_symbols_accepts_only_vendor_total_proof(tmp_path) -> None:
+    from datetime import date
+
+    from src.data.capture_store import CaptureStore
+    from src.tools import daily_audit
+
+    day = "2026-09-30"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["A", "B", "C"])
+    from src.data.capture_contracts import CaptureDataset
+
+    _publish_chart_manifest(
+        store,
+        day,
+        "run-tape",
+        CaptureDataset.TRADE_TICKS,
+        ["A"],
+        reason="tape_complete:regular=1879:vendor_total=1982",
+    )
+    _publish_chart_manifest(
+        store, day, "run-bracket", CaptureDataset.TRADE_TICKS, ["B"], reason="tape_bracketed:regular=10"
+    )
+    _publish_chart_manifest(
+        store, day, "run-empty", CaptureDataset.TRADE_TICKS, ["C"], reason="tape_empty:regular=0"
+    )
+
+    assert daily_audit.certified_tick_symbols(store, date.fromisoformat(day)) == frozenset({"A"})
+
+
+def test_certified_tick_symbols_later_live_entry_uncertifies(tmp_path) -> None:
+    from datetime import date
+
+    from src.data.capture_store import CaptureStore
+    from src.tools import daily_audit
+
+    day = "2026-09-30"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    from src.data.capture_contracts import CaptureDataset
+
+    _publish_chart_manifest(
+        store,
+        day,
+        "run-zzz-tape",
+        CaptureDataset.TRADE_TICKS,
+        ["005930"],
+        reason="tape_complete:regular=1879:vendor_total=1982",
+        completed_time="18:00:00",
+    )
+    _publish_chart_manifest(
+        store, day, "run-aaa-live", CaptureDataset.TRADE_TICKS, ["005930"], reason="exhausted:regular=10"
+    )
+
+    assert daily_audit.certified_tick_symbols(store, date.fromisoformat(day)) == frozenset()
+
+
+def test_certified_tick_symbols_store_failure_fails_toward_warning(tmp_path) -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    class _Boom:
+        def read_manifests(self, _day):
+            raise OSError("locked")
+
+    assert daily_audit.certified_tick_symbols(_Boom(), date(2026, 9, 30)) == frozenset()
+    from src.data.capture_store import CaptureStore
+
+    assert daily_audit.certified_tick_symbols(CaptureStore(tmp_path / "absent"), date(2026, 9, 30)) == frozenset()
+
+
+def test_certified_tick_symbols_skips_pending_and_incomplete(tmp_path) -> None:
+    from datetime import date
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus
+    from src.data.capture_store import CaptureStore
+    from src.tools import daily_audit
+
+    day = "2026-09-30"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930", "000660"])
+    _publish_chart_manifest(
+        store,
+        day,
+        "run-tape",
+        CaptureDataset.TRADE_TICKS,
+        ["005930"],
+        reason="tape_complete:regular=1879:vendor_total=1982",
+    )
+    # Given: a PENDING manifest carrying a conflicting non-certified entry
+    pending = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, "run-zzz-pending", CaptureDataset.TRADE_TICKS, "intraday-trade_ticks"),
+        cohort=None,
+        completed_at=_audit_moment(day, "19:00:00"),
+        entries=(),
+        artifacts=(),
+        status=CaptureStatus.PENDING,
+    )
+    store.publish_manifest(pending)
+    # And: a PARTIAL manifest whose tape proof must not certify
+    _publish_chart_manifest(
+        store,
+        day,
+        "run-partial",
+        CaptureDataset.TRADE_TICKS,
+        ["000660"],
+        status=CaptureStatus.PARTIAL,
+        reason="tape_complete:regular=5:vendor_total=6",
+    )
+
+    # Then: pending is skipped, the partial proof does not certify
+    assert daily_audit.certified_tick_symbols(store, date.fromisoformat(day)) == frozenset({"005930"})
+
+
+def test_classify_regular_ticks_certified_within_tolerance_is_info_only() -> None:
+    import pytest
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    steady = [(f"C{i:04d}", 10_000, 90100) for i in range(30)]
+    steady_ticks = [(f"C{i:04d}", 10_000) for i in range(30)]
+    bars, ticks = _regular_tick_frames(
+        [("005930", 163185, 90100), *steady],
+        [("005930", 159553), *steady_ticks],
+    )
+    result = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30),
+        certified=frozenset({"005930"}),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
+    )
+    assert result.issues == ()
+    assert result.compared == 31
+    assert len(result.source_diffs) == 1
+    assert result.source_diffs[0].symbol == "005930"
+    assert result.source_diffs[0].relative_shortfall == pytest.approx((163185 - 159553) / 163185)
+    # And: uncertified stays a warning
+    lost = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30), certified=frozenset(), read_ticks=lambda: ticks, read_bars=lambda: bars
+    )
+    assert lost.issues == ("intraday:regular_ticks:1:volume_gap",)
+    assert lost.source_diffs == ()
+
+
+def test_classify_regular_ticks_certified_excess_warns() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames([("005930", 10_000, 90100)], [("005930", 9_300)])
+    result = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30),
+        certified=frozenset({"005930"}),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
+    )
+    assert result.issues == ("intraday:regular_ticks:1:certified_gap",)
+
+
+def test_classify_regular_ticks_systemic_guard() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    symbols = [f"S{i:04d}" for i in range(100)]
+    bars, ticks = _regular_tick_frames(
+        [(s, 10_000, 90100) for s in symbols],
+        [(s, 9_800) for s in symbols],
+    )
+    certified = frozenset(symbols)
+    result = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30), certified=certified, read_ticks=lambda: ticks, read_bars=lambda: bars
+    )
+    assert len(result.source_diffs) == 100
+    assert result.issues == ("intraday:regular_ticks:100:source_diff_systemic",)
+    shorts = [d.relative_shortfall for d in result.source_diffs]
+    assert shorts == sorted(shorts, reverse=True)
+
+
+def test_audit_regular_ticks_backward_compatible_without_certified() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames([("A", 100, 90100), ("B", 200, 90100)], [("A", 10), ("B", 20)])
+    assert daily_audit.audit_regular_ticks(
+        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars
+    ) == ("intraday:regular_ticks:2:volume_gap",)
+    result = daily_audit.classify_regular_ticks(date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars)
+    assert daily_audit.audit_regular_ticks(
+        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars
+    ) == result.issues
+
+
+@pytest.mark.parametrize("short_count", [5, 6])
+def test_source_diff_systemic_share_boundary(short_count) -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    symbols = [f"S{i:04d}" for i in range(100)]
+    bars, ticks = _regular_tick_frames(
+        [(s, 10_000, 90100) for s in symbols] + [("ZERO", 0, 90100), ("AUCTION", 500, 153000)],
+        [(s, 9_800 if i < short_count else 10_000) for i, s in enumerate(symbols)] + [("TICK_ONLY", 500)],
+    )
+    result = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30), certified=frozenset(symbols), read_ticks=lambda: ticks, read_bars=lambda: bars
+    )
+    assert result.compared == 100
+    assert len(result.source_diffs) == short_count
+    assert result.issues == (() if short_count == 5 else ("intraday:regular_ticks:6:source_diff_systemic",))
+
+
+def test_source_diffs_are_deterministic_with_unequal_shortfalls_and_ties() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames(
+        [("B", 10_000, 90100), ("C", 10_000, 90100), ("A", 10_000, 90100)],
+        [("B", 9_800), ("C", 9_600), ("A", 9_800)],
+    )
+    first = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30), certified=frozenset({"A", "B", "C"}), read_ticks=lambda: ticks, read_bars=lambda: bars
+    )
+    second = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30), certified=frozenset({"A", "B", "C"}),
+        read_ticks=lambda: ticks.iloc[::-1], read_bars=lambda: bars.iloc[::-1],
+    )
+    assert first == second
+    assert [d.symbol for d in first.source_diffs] == ["C", "A", "B"]
+    assert [d.relative_shortfall for d in first.source_diffs] == pytest.approx([0.04, 0.02, 0.02])
+
+
+def test_run_daily_audit_source_diff_is_info_only(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+
+    profile = _collection_profile(tmp_path)
+    monkeypatch.setattr(daily_audit, "CollectionSettings", lambda *a, **k: profile)
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True))
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_bar_value_consistency", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_aftermarket_ticks", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_tape_sweep", lambda *a, **k: ())
+    from src.data.capture_store import CaptureStore, resolve_capture_root
+
+    from src.data.capture_contracts import CaptureDataset
+
+    store = CaptureStore(resolve_capture_root(profile))
+    _publish_cohort_decision(store, "2026-09-30", ["005930"])
+    _publish_chart_manifest(
+        store, "2026-09-30", "run-tape", CaptureDataset.TRADE_TICKS, ["005930"],
+        reason="tape_complete:regular=1879:vendor_total=1982",
+    )
+    bars, ticks = _regular_tick_frames(
+        [("005930", 163185, 90100), *[(f"C{i:04d}", 10000, 90100) for i in range(19)]],
+        [("005930", 159553), *[(f"C{i:04d}", 10000) for i in range(19)]],
+    )
+    bars_path, ticks_path = tmp_path / "bars.parquet", tmp_path / "ticks.parquet"
+    bars.to_parquet(bars_path)
+    ticks.to_parquet(ticks_path)
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *a: bars_path)
+    monkeypatch.setattr(daily_audit, "tick_partition_path", lambda *a: ticks_path)
+    recorded: list = []
+    monkeypatch.setattr(
+        daily_audit, "record_run_outcome", lambda job, outcome, **k: recorded.append((job, outcome, k)) or {}
+    )
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    subject = daily_audit.run_daily_audit(
+        "2026-09-30",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
+    )
+
+    assert subject is not None and "🟢" in subject
+    assert "regular_ticks_source_diff=1 max=2.2% symbols=005930" in sent[0][1]
+    assert recorded and recorded[0][0] == "tick_source_diff" and recorded[0][1] == "OK"
+    assert recorded[0][2]["metrics"]["n"] == 1
+    assert len(recorded) == 1
+    assert recorded[0][2]["run_date"] == "2026-09-30"
+    assert recorded[0][2]["metrics"]["max_relative_shortfall"] == pytest.approx((163185 - 159553) / 163185)
+    assert recorded[0][2]["metrics"]["symbols"] == ["005930"]
+    assert "intraday_complete=OK" in sent[0][1]
+    assert "intraday_issues=none" in sent[0][1]
+
+
+def test_run_daily_audit_survives_source_diff_record_failure(monkeypatch, tmp_path, caplog) -> None:
+    from src.tools import daily_audit
+
+    profile = _collection_profile(tmp_path)
+    monkeypatch.setattr(daily_audit, "CollectionSettings", lambda *a, **k: profile)
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True))
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_bar_value_consistency", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_aftermarket_ticks", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_tape_sweep", lambda *a, **k: ())
+    from src.data.capture_store import CaptureStore, resolve_capture_root
+
+    _publish_cohort_decision(CaptureStore(resolve_capture_root(profile)), "2026-09-30", ["005930"])
+    diff = daily_audit.TickSourceDiff(
+        symbol="005930", bar_volume=163185.0, tick_volume=159553.0, relative_shortfall=0.022
+    )
+    monkeypatch.setattr(daily_audit, "certified_tick_symbols", lambda *a, **k: frozenset({"005930"}))
+    monkeypatch.setattr(
+        daily_audit,
+        "classify_regular_ticks",
+        lambda *a, **k: daily_audit.TickAuditResult(issues=(), source_diffs=(diff,), compared=31),
+    )
+
+    def _boom(*args, **kwargs):
+        raise OSError("event log locked")
+
+    monkeypatch.setattr(daily_audit, "record_run_outcome", _boom)
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    subject = daily_audit.run_daily_audit(
+        "2026-09-30",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
+    )
+
+    assert subject is not None and "🟢" in subject
+    assert len(sent) == 1 and "regular_ticks_source_diff=1" in sent[0][1]
+    assert "tick_source_diff_record=FAILED reason=OSError" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_day", "issues", "corrupt", "expected"),
+    [
+        ("2026-09-30", [], False, "PASS"),
+        ("2026-09-30", ["intraday:regular_ticks:6:source_diff_systemic"], False, "WARN"),
+        ("2026-09-30", ["intraday:regular_ticks:1:certified_gap"], False, "WARN"),
+        ("2026-10-01", ["intraday:regular_ticks:1:certified_gap"], False, "WARN"),
+        ("2026-10-01", [], False, "WARN"),
+        ("2026-09-30", [], True, "WARN"),
+        (None, [], False, "WARN"),
+    ],
+)
+def test_source_diff_checklist_probe_uses_date_scoped_evidence(tmp_path, heartbeat_day, issues, corrupt, expected) -> None:
+    import json
+    import textwrap
+    from pathlib import Path
+
+    import numpy as np
+
+    day = "2026-09-30"
+    event_path = tmp_path / "logs" / "events" / day[:7] / f"{day}.jsonl"
+    event_path.parent.mkdir(parents=True)
+    event_path.write_text(json.dumps({
+        "job": "tick_source_diff", "run_date": day,
+        "metrics": {"n": 2, "max_relative_shortfall": 0.025, "symbols": ["A", "B"]},
+    }) + "\n" + json.dumps({
+        "job": "tick_source_diff", "run_date": "2026-10-01",
+        "metrics": {"n": 99, "max_relative_shortfall": 0.04, "symbols": ["OTHER"]},
+    }))
+    if heartbeat_day is not None:
+        heartbeat_path = tmp_path / "logs" / "heartbeat" / "daily_audit.json"
+        heartbeat_path.parent.mkdir(parents=True)
+        heartbeat_path.write_text("invalid JSON" if corrupt else json.dumps({
+            "snapshot_date": heartbeat_day, "open_issues": [{"key": issue} for issue in issues],
+        }))
+    text = Path("docs/vps-checklist.md").read_text()
+    probe = textwrap.dedent(text.split("    # ---- regular tick vs bar vendor disagreement (DI-1M-06) ----\n", 1)[1]
+                            .split("\n# ---- top-k decision + causality ----", 1)[0])
+    emitted = []
+    namespace = {
+        "ROOT": tmp_path, "D": day, "np": np,
+        "emit": lambda *args: emitted.append(args),
+        "level": lambda fail, warn=False: "FAIL" if fail else "WARN" if warn else "PASS",
+    }
+    exec(compile(probe, "DI-1M-06", "exec"), namespace)  # noqa: S102 - execute the trusted repository probe
+    assert len(emitted) == 1
+    cid, status, detail = emitted[0]
+    assert cid == "DI-1M-06" and status == expected
+    assert "source_diff n=2 max=2.5% symbols=A,B" in detail
+    if heartbeat_day != day:
+        assert "heartbeat_verified=False gap_warning=False" in detail

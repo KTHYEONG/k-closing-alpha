@@ -207,6 +207,9 @@ Interpretation rules (learned from live data):
   baseline is the signal, not the level. Baseline fields are printed so you can judge.
 - `archive.parquet` `등락률` is computed on the **final** close (`종가`), not on `결정_종가` (the 15:20 print) — compare accordingly;
   `결정_종가` vs `종가` gap p99 ≲ 3 % is normal.
+- tick vs bar gap with a `tape_complete` proof = vendor difference, informational: the daily audit reports it as
+  `regular_ticks_source_diff` (an info line plus a `tick_source_diff` run-outcome record, never `intraday_complete`);
+  only `certified_gap` or `source_diff_systemic` warns (see `DI-1M-06`).
 - Row counts of `archive` vary with the market (observed 257–771 per day); only a ratio outside 0.5–2× of the trailing median warns.
 - Never call a data problem "fixed" because a file exists; quote the probe line.
 
@@ -527,6 +530,53 @@ else:
     k = pd.concat([lastbar.rename("b"), cr.rename("c")], axis=1).dropna()
     match = float(((k["b"] - k["c"]).abs() / k["c"] < 0.001).mean())
     emit("DI-1M-05", level(match < 0.9, match < 0.98), f"last_bar_close_matches_eod share={match:.3f} n={len(k)}")
+    # ---- regular tick vs bar vendor disagreement (DI-1M-06) ----
+    import json as _json
+    evp = ROOT / f"logs/events/{D[:7]}/{D}.jsonl"
+    src_n, src_max, src_syms = 0, 0.0, []
+    evidence_error = False
+    if evp.exists():
+        for _line in evp.read_text().splitlines():
+            try:
+                _rec = _json.loads(_line)
+            except ValueError:
+                evidence_error = True
+                continue
+            if isinstance(_rec, dict) and _rec.get("job") == "tick_source_diff" and _rec.get("run_date") == D:
+                try:
+                    _m = _rec["metrics"]
+                    src_n = int(_m["n"])
+                    src_max = float(_m["max_relative_shortfall"])
+                    src_syms = _m["symbols"][:10]
+                    if src_n < 0 or not np.isfinite(src_max) or not 0 <= src_max <= 1:
+                        raise ValueError("invalid source-diff metrics")
+                    if not isinstance(src_syms, list) or not all(isinstance(s, str) for s in src_syms):
+                        raise ValueError("invalid source-diff symbols")
+                except (KeyError, TypeError, ValueError):
+                    evidence_error = True
+    hbp = ROOT / "logs/heartbeat/daily_audit.json"
+    gap_warning = False
+    heartbeat_verified = False
+    if hbp.exists():
+        try:
+            _hb = _json.loads(hbp.read_text())
+            if isinstance(_hb, dict) and _hb.get("snapshot_date") == D:
+                _open = _hb["open_issues"]
+                if not isinstance(_open, list):
+                    raise ValueError("invalid heartbeat issues")
+                _keys = [_e["key"] for _e in _open]
+                if not all(isinstance(_k, str) for _k in _keys):
+                    raise ValueError("invalid heartbeat issue key")
+                gap_warning = any(
+                    _k.startswith("intraday:regular_ticks:") and _k.endswith((":source_diff_systemic", ":certified_gap"))
+                    for _k in _keys
+                )
+                heartbeat_verified = True
+        except (KeyError, TypeError, ValueError):
+            evidence_error = True
+    probe_warning = gap_warning or evidence_error or not heartbeat_verified
+    symbols_text = ','.join(src_syms) if isinstance(src_syms, list) and all(isinstance(s, str) for s in src_syms) else 'unreadable'
+    emit("DI-1M-06", level(False, probe_warning), f"source_diff n={src_n} max={src_max * 100:.1f}% symbols={symbols_text or 'none'} heartbeat_verified={heartbeat_verified} gap_warning={gap_warning} evidence_error={evidence_error}")
 
 # ---- top-k decision + causality ----
 t = pd.read_parquet(ROOT / "parquet/topk_decisions.parquet")
