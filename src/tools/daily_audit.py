@@ -81,6 +81,16 @@ from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import dispatch_digest, drain_alert_outbox
 from src.tools.expiry_notices import CALENDAR_EXPIRY_NAME, CALENDAR_RENEW_HINT, evaluate_expiries
+from src.tools.issue_registry import (
+    ADVISORY_ESCALATION_AUDITS,
+    AdvisoryStreak,
+    IssueTier,
+    classify_issue_tier,
+    issue_class,
+    load_advisory_streaks,
+    update_advisory_streaks,
+    write_advisory_streaks,
+)
 from src.tools.offsite_backup import BACKUP_INFO_ISSUES, REPORT_RELPATH, backup_staleness_issues
 from src.tools.offsite_backup import backup_backlog_info as _backup_backlog_info
 from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes, record_run_outcome
@@ -1308,6 +1318,40 @@ def _critical_collection_issues(collection_issues: Sequence[str]) -> list[str]:
     return [iss for iss in collection_issues if not any(iss.endswith(suffix) for suffix in _IGNORED_COLLECTION_SUFFIXES)]
 
 
+def split_intraday_issues(intraday_issues: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Partition raw intraday issues into (blocking, advisory) by `classify_issue_tier`; order preserved."""
+    blocking: list[str] = []
+    advisory: list[str] = []
+    for key in intraday_issues:
+        if classify_issue_tier(key) is IssueTier.RESEARCH_DEGRADED:
+            advisory.append(key)
+        else:
+            blocking.append(key)
+    return tuple(blocking), tuple(advisory)
+
+
+def explain_incomplete_entries(manifests: Sequence[CaptureManifest], capture_reason: str) -> tuple[str, ...]:
+    """Group non-COMPLETE entries of manifests with the given capture reason by (dataset, status, reason) and render `collection_note=<label> <dataset>/<status>/<reason> n=<count> symbols=<first 10>`. Returns an empty tuple when all entries are COMPLETE. Symbols are market codes only."""
+    groups: dict[tuple[str, str, str], list[str]] = {}
+    for manifest in manifests:
+        if manifest.context.capture_reason != capture_reason or manifest.status == CaptureStatus.PENDING:
+            continue
+        for entry in manifest.entries:
+            if entry.status == CaptureStatus.COMPLETE or entry.symbol is None:
+                continue
+            dataset = entry.dataset.value if isinstance(entry.dataset, CaptureDataset) else str(entry.dataset)
+            status = entry.status.value if isinstance(entry.status, CaptureStatus) else str(entry.status)
+            key = (dataset, status, str(entry.reason))
+            groups.setdefault(key, []).append(str(entry.symbol))
+    lines: list[str] = []
+    for (dataset, status, reason) in sorted(groups):
+        symbols = sorted(set(groups[(dataset, status, reason)]))[:10]
+        lines.append(
+            f"collection_note={capture_reason} {dataset}/{status}/{reason} n={len(set(groups[(dataset, status, reason)]))} symbols={','.join(symbols)}"
+        )
+    return tuple(lines)
+
+
 def collect_audit_issues(
     *,
     day_kind: str,
@@ -1320,8 +1364,10 @@ def collect_audit_issues(
     undelivered_alerts: int,
     expiry_warnings: Sequence[str],
     calendar_disagreement: bool,
+    issue_annotations: Mapping[str, str] | None = None,
 ) -> tuple[AuditIssue, ...]:
-    """Build the warning-level issue set backing a digest subject."""
+    """Build the warning-level issue set backing a digest subject; `issue_annotations` suffixes display text only, never keys."""
+    annotations = issue_annotations or {}
     issues: list[AuditIssue] = []
     issues.extend(AuditIssue(key=f"missing:{step}", transient=False, text=f"누락 단계: {step}") for step in missing_steps)
     issues.extend(
@@ -1333,7 +1379,15 @@ def collect_audit_issues(
     )
     if day_kind != DAY_HOLIDAY:
         issues.extend(AuditIssue(key=raw, transient=False, text=f"수집 이상: {raw}") for raw in critical_collection)
-        issues.extend(AuditIssue(key=raw, transient=False, text=f"장중 이상: {raw}") for raw in intraday_issues)
+        issues.extend(
+            AuditIssue(
+                key=raw,
+                transient=False,
+                text=(f"감사 상태 이상: {raw}" if raw.startswith("audit:") else f"장중 이상: {raw}")
+                + annotations.get(raw, ""),
+            )
+            for raw in intraday_issues
+        )
     issues.extend(AuditIssue(key=raw, transient=True, text=f"백업 이상: {raw}") for raw in backup_warnings)
     if undelivered_alerts:
         issues.append(
@@ -1368,6 +1422,7 @@ def build_digest(
     expiry_notices: Sequence[str] = (),
     expiry_warnings: Sequence[str] = (),
     info_lines: Sequence[str] = (),
+    issue_annotations: Mapping[str, str] | None = None,
 ) -> AuditDigest:
     """일일 요약의 제목·본문과 발송 심각도를 만든다.
 
@@ -1388,6 +1443,7 @@ def build_digest(
         expiry_notices: D-30 이내 만료 예정 항목. 정상 요약을 경고로 바꾸지 않는다.
         expiry_warnings: D-7 이내(지난 항목 포함) 만료 항목. backup_issues처럼 경고로 격상한다.
         info_lines: 경고로 격상하지 않는 정보성 본문 라인(예: extended-backfill 소진 수).
+        issue_annotations: Display-only suffix per intraday issue key (e.g. advisory escalation streak); keys stay stable.
 
     Returns:
         AuditDigest with severity WARNING for any warning digest (trading or holiday), HOLIDAY_SKIP for a clean
@@ -1440,6 +1496,7 @@ def build_digest(
         undelivered_alerts=int(undelivered_alerts),
         expiry_warnings=list(expiry_warnings),
         calendar_disagreement=_calendar_disagreement,
+        issue_annotations=issue_annotations,
     )
     _backup_warning_set = set(backup_warnings)
     issue_missing = [issue.key.split(":", 1)[1] for issue in issues if issue.key.startswith("missing:")]
@@ -1447,6 +1504,7 @@ def build_digest(
     issue_stale = [issue.key.split(":", 1)[1] for issue in issues if issue.key.startswith("stale_kis_token:")]
     issue_critical = [issue.key for issue in issues if issue.key.startswith("collection:")]
     issue_intraday = [issue.key for issue in issues if issue.key.startswith("intraday:")]
+    issue_audit_state = [issue.key for issue in issues if issue.key.startswith("audit:")]
     issue_backup = [issue.key for issue in issues if issue.key in _backup_warning_set]
     issue_expiry = [issue.key[len("expiry:") :] for issue in issues if issue.key.startswith("expiry:")]
     issue_undelivered = any(issue.key == "undelivered_alerts" for issue in issues)
@@ -1520,6 +1578,9 @@ def build_digest(
         nav_str, entry_str = _extract_paper_summary(snapshot_date)
         bars_str, ticks_str = _extract_intraday_summary(snapshot_date)
         subject = f"[kca] 🟢 {snapshot_date} 일일점검 완료 (정상)"
+        degraded_count = sum(1 for line in info_lines if str(line).startswith("degraded:"))
+        if degraded_count:
+            subject += f" (참고 {degraded_count}건)"
         summary_block = [
             "==================================================",
             f"📊 K-Closing Alpha 일일 운영 요약 ({snapshot_date})",
@@ -1561,7 +1622,13 @@ def build_digest(
         problems.append(f"수집이상 {','.join(issue_critical)}")
         summary_lines.append(f"• 수집 이상: {', '.join(issue_critical)}")
     if issue_intraday:
-        summary_lines.append(f"• 장중 이상: {_format_bounded_issues(issue_intraday)}")
+        _annotations = issue_annotations or {}
+        summary_lines.append(
+            f"• 장중 이상: {_format_bounded_issues([key + _annotations.get(key, '') for key in issue_intraday])}"
+        )
+    if issue_audit_state:
+        problems.append(f"감사상태이상 {','.join(issue_audit_state)}")
+        summary_lines.append(f"• 감사 상태 이상: {', '.join(issue_audit_state)}")
     if issue_backup:
         problems.append(f"백업이상 {','.join(issue_backup)}")
         summary_lines.append(f"• 백업 이상: {', '.join(issue_backup)}")
@@ -1835,6 +1902,7 @@ def run_daily_audit(
     session_day = resolve_session_day(trading_date)
     tick_source_diffs: tuple[TickSourceDiff, ...] = ()
     tick_unverifiable: tuple[TickSourceDiff, ...] = ()
+    store: CaptureStore | None = None
     try:
         profile = CollectionSettings()
         session_clock = session_day.clock if session_day.clock is not None else SessionClock.standard(trading_date)
@@ -1937,15 +2005,60 @@ def run_daily_audit(
         backlog_line = None
     if backlog_line is not None:
         info_lines = (*info_lines, backlog_line)
+    blocking_intraday, advisory_intraday = split_intraday_issues(intraday_issues)
+    intraday_annotations: dict[str, str] = {}
+    if store is not None:
+        try:
+            capture_manifests = store.read_manifests(snapshot_date)
+            info_lines = (
+                *info_lines,
+                *explain_incomplete_entries(capture_manifests, "auction-open"),
+                *explain_incomplete_entries(capture_manifests, "auction-close"),
+            )
+        except Exception as exc:
+            logger.warning("[DATA] stage=daily_audit collection_note=FAILED reason=%s", type(exc).__name__)
+    if day_kind != DAY_HOLIDAY and result is not None:
+        new_streaks: dict[str, AdvisoryStreak] = {}
+        escalated: tuple[str, ...] = ()
+        try:
+            previous_streaks = load_advisory_streaks()
+            previous_audit_date = max((streak.last_date for streak in previous_streaks.values()), default=None)
+            new_streaks, escalated = update_advisory_streaks(
+                previous_streaks,
+                [issue_class(key) for key in advisory_intraday],
+                audit_date=snapshot_date,
+                previous_audit_date=previous_audit_date,
+            )
+        except Exception as exc:
+            logger.warning("[SYS] stage=daily_audit advisory_streaks=FAILED reason=%s", type(exc).__name__)
+        else:
+            try:
+                write_advisory_streaks(new_streaks)
+            except Exception as exc:
+                logger.warning("[SYS] stage=daily_audit advisory_streaks=FAILED reason=%s", type(exc).__name__)
+                escalated = ()
+                blocking_intraday = (*blocking_intraday, "audit:advisory_state:1:unwritable")
+        escalated_set = set(escalated)
+        degraded_notes: list[str] = []
+        for key in advisory_intraday:
+            cls = issue_class(key)
+            if cls in escalated_set:
+                blocking_intraday = (*blocking_intraday, key)
+                intraday_annotations[key] = f" (연속 {new_streaks[cls].consecutive_audits}회)"
+            else:
+                degraded_notes.append(
+                    f"degraded:{key} 연구용 데이터 저하(조치 불필요, {ADVISORY_ESCALATION_AUDITS}회 연속 시 경고)"
+                )
+        info_lines = (*info_lines, *degraded_notes)
     if result is not None:
-        result["intraday_complete"] = not intraday_issues
-    if result is not None and intraday_issues:
-        omitted = max(0, len(intraday_issues) - DIGEST_ISSUE_DISPLAY_LIMIT)
+        result["intraday_complete"] = not blocking_intraday
+    if result is not None and blocking_intraday:
+        omitted = max(0, len(blocking_intraday) - DIGEST_ISSUE_DISPLAY_LIMIT)
         logger.warning(
             "[DATA] stage=daily_audit step=intraday_complete status=FAIL date=%s issues=%d shown=%s omitted=%d",
             snapshot_date,
-            len(intraday_issues),
-            _format_bounded_issues(intraday_issues),
+            len(blocking_intraday),
+            _format_bounded_issues(blocking_intraday),
             omitted,
         )
     if session_day.kind in (SessionKind.SHIFTED, SessionKind.UNKNOWN):
@@ -1963,13 +2076,14 @@ def run_daily_audit(
         failed_units_fn(),
         stale_tokens_fn(snapshot_date),
         collection_issues=collection_issues,
-        intraday_issues=() if day_kind == DAY_HOLIDAY else intraday_issues,
+        intraday_issues=() if day_kind == DAY_HOLIDAY else blocking_intraday,
         backup_issues=backup_issues_fn(audit_at),
         session_kind=session_day.kind.value,
         undelivered_alerts=undelivered_alerts,
         expiry_notices=report.notices,
         expiry_warnings=report.warnings,
         info_lines=info_lines,
+        issue_annotations=intraday_annotations,
     )
     if digest.severity is DigestSeverity.WARNING:
         logger.warning("[DATA] stage=daily_audit day=%s status=WARNING subject=%s", day_kind, digest.subject)
