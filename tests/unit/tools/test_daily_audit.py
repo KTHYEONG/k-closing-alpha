@@ -21,6 +21,14 @@ def _standard_session(monkeypatch) -> None:
     monkeypatch.setattr(daily_audit, "resolve_session_day", _resolve)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ops_measurement(monkeypatch) -> None:
+    """Full-audit scenarios isolate from host systemd; ops measurement is covered by dedicated p5 tests."""
+    import src.tools.ops_sentinel as _sentinel
+
+    monkeypatch.setattr(_sentinel, "measure_ops", lambda _at, **_kwargs: ())
+
+
 def _collection_profile(tmp_path, *, auction=False, altdata=False):
     from src.config.collection import CollectionSettings
 
@@ -2394,6 +2402,7 @@ def _stub_weekday_audit(monkeypatch, tmp_path, dispatch_fn):
         "stale_tokens_fn": lambda _d: [],
         "dispatch_fn": dispatch_fn,
         "backup_issues_fn": lambda _at: [],
+        "ops_issues_fn": lambda _at: [],
     }
 
 
@@ -3616,6 +3625,7 @@ def test_digest_preserves_existing_body_lines() -> None:
         "session=UNKNOWN",
         *[f"{step}=OK" for step in daily_audit.AUDIT_STEPS],
         "failed_units=none",
+        "ops_issues=none",
         "stale_kis_tokens=none",
         "collection_issues=none",
         "backup_issues=none",
@@ -4778,6 +4788,7 @@ def _run_audit_isolated(
     load_override=None,
     update_override=None,
     explain_override=None,
+    ops_override: object = None,
 ):
     from src.tools import daily_audit
     from src.tools.daily_audit import TickAuditResult
@@ -4839,6 +4850,7 @@ def _run_audit_isolated(
         stale_tokens_fn=lambda _d: [],
         dispatch_fn=_dispatch,
         backup_issues_fn=lambda _at: [],
+        ops_issues_fn=ops_override if ops_override is not None else (lambda _at: []),  # type: ignore[arg-type]
     )
     import json
 
@@ -5105,3 +5117,170 @@ def test_escalated_issue_key_stays_stable(monkeypatch, tmp_path) -> None:
     issues = {item["key"]: item["text"] for item in hb["open_issues"]}
     assert key in issues
     assert issues[key].endswith("(연속 4회)")
+
+
+def test_p5_transient_classification_for_ops_prefixes() -> None:
+    from src.tools import daily_audit
+
+    for key in (
+        "job_late:kca-tape-sweep.service",
+        "job_overrun:kca-backup.service",
+        "timer_inactive:kca-backup.timer",
+        "host_disk_low:8",
+        "ops_measure_unavailable:audit",
+    ):
+        assert daily_audit.is_transient_issue_key(key), key
+    assert not daily_audit.is_transient_issue_key("intraday:regular:1:missing_partition")
+    assert not daily_audit.is_transient_issue_key("missing:archive")
+
+
+def test_p5_ops_issue_after_failed_units_in_headline() -> None:
+    from src.tools import daily_audit
+    from src.tools.ops_sentinel import MeasuredIssue
+
+    digest = daily_audit.build_digest(
+        "2026-10-06", daily_audit.DAY_TRADING, _all_ok_result(), ["kca-x.service"], [],
+        ops_issues=(MeasuredIssue(key="job_late:kca-tape-sweep.service", text="missed"),),
+    )
+    keys = [issue.key for issue in digest.issues]
+    assert keys.index("job_late:kca-tape-sweep.service") > keys.index("failed_unit:kca-x.service")
+    assert digest.severity is daily_audit.DigestSeverity.WARNING
+
+
+def test_p5_ops_issue_survives_audit_state_sync(tmp_path) -> None:
+    import json
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.tools import daily_audit
+    from src.tools.audit_reconcile import run_audit_reconcile
+    from src.tools.ops_sentinel import MeasuredIssue
+
+    now = datetime(2026, 10, 6, 21, 20, tzinfo=ZoneInfo("Asia/Seoul"))
+    state_path = tmp_path / "alert_state.json"
+    digest = daily_audit.build_digest(
+        "2026-10-06", daily_audit.DAY_TRADING, _all_ok_result(), [], [],
+        ops_issues=(MeasuredIssue(key="job_late:kca-tape-sweep.service", text="missed"),),
+    )
+    daily_audit.sync_audit_alert_state_from_digest(digest, "2026-10-06", now=now, path=state_path)
+    first_seen = json.loads(state_path.read_text(encoding="utf-8"))["open"]["job_late:kca-tape-sweep.service"]["first_seen"]
+    later = datetime(2026, 10, 6, 21, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+    digest2 = daily_audit.build_digest(
+        "2026-10-06", daily_audit.DAY_TRADING, _all_ok_result(), [], [],
+        ops_issues=(MeasuredIssue(key="job_late:kca-tape-sweep.service", text="missed"),),
+    )
+    daily_audit.sync_audit_alert_state_from_digest(digest2, "2026-10-06", now=later, path=state_path)
+    kept = json.loads(state_path.read_text(encoding="utf-8"))["open"]["job_late:kca-tape-sweep.service"]
+    assert kept["first_seen"] == first_seen
+
+    hb_path = tmp_path / "heartbeat.json"
+    hb_path.write_text(
+        json.dumps({"snapshot_date": "2026-10-06", "day_kind": "trading", "subject": digest.subject,
+                    "undelivered_alerts": 0, "finished_at": now.isoformat(), "schema_version": 2,
+                    "severity": "WARNING", "open_issues": [], "provisional_reasons": [],
+                    "audit_kind": "scheduled", "reconciled_at": None}),
+        encoding="utf-8",
+    )
+    sent: list = []
+    result = run_audit_reconcile(
+        now=datetime(2026, 10, 6, 21, 40, tzinfo=ZoneInfo("Asia/Seoul")),
+        failed_units_fn=lambda: [], stale_tokens_fn=lambda _s: [],
+        backup_issues_fn=lambda _n: [], outbox_fn=lambda: 0,
+        dispatch_fn=lambda s, b: sent.append((s, b)) or {"mail": True},
+        state_path=state_path, heartbeat_path=hb_path,
+    )
+    assert result.opened == ()
+    assert not any("경고" in subject for subject, _body in sent)
+
+
+def test_p5_ops_issue_cleared_by_audit_measurement(tmp_path) -> None:
+    import json
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.tools import daily_audit
+
+    now = datetime(2026, 10, 6, 21, 20, tzinfo=ZoneInfo("Asia/Seoul"))
+    state_path = tmp_path / "alert_state.json"
+    digest = daily_audit.build_digest(
+        "2026-10-06", daily_audit.DAY_TRADING, _all_ok_result(), [], [],
+        ops_issues=(__import__("src.tools.ops_sentinel", fromlist=["MeasuredIssue"]).MeasuredIssue(
+            key="job_late:kca-tape-sweep.service", text="missed"),),
+    )
+    daily_audit.sync_audit_alert_state_from_digest(digest, "2026-10-06", now=now, path=state_path)
+    clean = daily_audit.build_digest("2026-10-06", daily_audit.DAY_TRADING, _all_ok_result(), [], [])
+    daily_audit.sync_audit_alert_state_from_digest(clean, "2026-10-06", now=now, path=state_path)
+    assert "job_late:kca-tape-sweep.service" not in json.loads(state_path.read_text(encoding="utf-8"))["open"]
+    assert clean.issues == ()
+
+
+def test_p5_audit_measurement_failure_is_loud() -> None:
+    from src.tools import daily_audit
+
+    seen: list = []
+
+    def _boom(_at):
+        raise OSError("gone")
+
+    import inspect
+    sig = inspect.signature(daily_audit.run_daily_audit)
+    assert "ops_issues_fn" in sig.parameters
+    digest = daily_audit.build_digest(
+        "2026-10-06", daily_audit.DAY_TRADING, _all_ok_result(), [], [],
+        ops_issues=(daily_audit.AuditIssue(key="ops_measure_unavailable:audit", transient=True, text="x"),),
+    )
+    assert any(i.key == "ops_measure_unavailable:audit" for i in digest.issues)
+
+
+def test_p5_holiday_reports_ops_issues(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+    from src.tools.ops_sentinel import MeasuredIssue
+
+    digest = daily_audit.build_digest(
+        "2026-09-24", daily_audit.DAY_HOLIDAY, None, ["kca-x.service"], [],
+        ops_issues=(MeasuredIssue(key="job_late:kca-tape-sweep.service", text="missed"),),
+    )
+    assert digest.severity is daily_audit.DigestSeverity.WARNING
+    assert "운영감시" in digest.subject
+    assert "• 운영감시: job_late:kca-tape-sweep.service" in digest.body
+
+
+def test_p5_audit_ops_measurement_failure_is_loud(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    def _boom(_at):
+        raise OSError("gone")
+
+    with caplog.at_level(logging.WARNING):
+        subject, sent, _hb = _run_audit_isolated(
+            monkeypatch, tmp_path, "2026-10-06", intraday=(), streaks={}, ops_override=_boom,
+        )
+    assert "ops_measure_unavailable:audit" in subject
+    assert any("ops_measure=FAILED" in rec.message for rec in caplog.records)
+
+
+def test_p5_dispatched_digest_stamps_held_key(tmp_path) -> None:
+    import json
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.tools import daily_audit
+    from src.tools.ops_sentinel import MeasuredIssue
+
+    key = "job_late:kca-tape-sweep.service"
+    state_path = tmp_path / "alert_state.json"
+    daily_audit.write_audit_alert_state(
+        snapshot_date="2026-10-05",
+        updated_at=datetime(2026, 10, 6, 21, 10, tzinfo=ZoneInfo("Asia/Seoul")),
+        open_entries={key: {"transient": True, "text": "missed", "first_seen": "2026-10-06T21:10:00+09:00"}},
+        path=state_path,
+    )
+    now = datetime(2026, 10, 6, 21, 20, tzinfo=ZoneInfo("Asia/Seoul"))
+    digest = daily_audit.build_digest(
+        "2026-10-06", daily_audit.DAY_TRADING, _all_ok_result(), [], [],
+        ops_issues=(MeasuredIssue(key=key, text="missed"),),
+    )
+    daily_audit.sync_audit_alert_state_from_digest(digest, "2026-10-06", now=now, path=state_path)
+    entry = json.loads(state_path.read_text(encoding="utf-8"))["open"][key]
+    assert entry["first_seen"] == "2026-10-06T21:10:00+09:00"
+    assert entry["last_notified"] == now.isoformat()

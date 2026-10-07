@@ -373,7 +373,8 @@ def test_lock_serialization_documented() -> None:
     daily = Path("deploy/systemd/kca-daily-audit.service").read_text(encoding="utf-8")
     reconcile = Path("deploy/systemd/kca-audit-reconcile.service").read_text(encoding="utf-8")
     assert "flock -w 600 %t/kca-audit.lock" in daily
-    assert "flock -w 600 %t/kca-audit.lock" in reconcile
+    assert "flock -w 30 -E 75 %t/kca-audit.lock" in reconcile
+    assert "SuccessExitStatus=75" in reconcile.splitlines()
 
 
 def test_transient_key_classification() -> None:
@@ -975,3 +976,480 @@ def test_reconcile_preserves_advisory_notes(tmp_path: Path) -> None:
     hb = json.loads(hp.read_text(encoding="utf-8"))
     assert hb["info_notes"] == notes
     assert hb["open_issues"] == []
+
+
+def _p5_helpers():
+    from src.tools.audit_reconcile import Remediation
+    from src.tools.auto_remediation import (
+        RemediationAction,
+        RemediationOutcome,
+        RemediationRecord,
+        execute_remediation,
+        plan_remediation,
+        read_remediation_ledger,
+        settle_remediation,
+    )
+    from src.tools.ops_sentinel import MeasuredIssue
+    return Remediation, RemediationAction, RemediationOutcome, RemediationRecord, execute_remediation, plan_remediation, read_remediation_ledger, settle_remediation, MeasuredIssue
+
+
+def _p5_remediation(tmp_path, *, busy=(), run_ok=True):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    Remediation, _, _, _, execute_remediation, plan_remediation, read_remediation_ledger, settle_remediation, _ = _p5_helpers()
+    ledger = tmp_path / "ledger.jsonl"
+
+    def history_fn():
+        return read_remediation_ledger(ledger)
+
+    def settle_fn(keys, at, hist):
+        return settle_remediation(keys, now=at, history=hist, path=ledger)
+
+    def plan_fn(keys, at, hist):
+        return tuple(
+            rec
+            for rec, _rule in plan_remediation(
+                keys, now=at, history=hist, unit_busy=lambda u: u in busy, blackout_fn=lambda _t: timedelta(0)
+            )
+        )
+
+    def execute_fn(planned):
+        def _run(_cmd, **_kw):
+            if run_ok:
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+            return SimpleNamespace(returncode=1, stderr="boom", stdout="")
+
+        return execute_remediation(planned, run_fn=_run, path=ledger)
+
+    return Remediation(plan_fn=plan_fn, execute_fn=execute_fn, settle_fn=settle_fn, history_fn=history_fn), ledger
+
+
+def _p5_issue(key, text=None):
+    _, _, _, _, _, _, _, _, MeasuredIssue = _p5_helpers()
+    return MeasuredIssue(key=key, text=text or key)
+
+
+def test_p5_remediation_disabled_by_default(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={"offsite_backup:stale": {"transient": True, "text": "백업 이상"}})
+    f, t, b, o = _clean_fns(backup=[])
+    sent: list = []
+    result = run_audit_reconcile(
+        now=_now("2026-10-05"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True},
+        state_path=sp, heartbeat_path=hp, remediation=None, ops_issues_fn=None,
+    )
+    assert result.action == "RESOLVED" and result.held == () and result.remediated == ()
+    assert len(sent) == 1
+
+
+def test_p5_ops_issue_opens_and_is_held(tmp_path) -> None:
+    import json
+
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    remediation, ledger = _p5_remediation(tmp_path)
+    sent: list = []
+    f, t, b, o = _clean_fns()
+    result = run_audit_reconcile(
+        now=_now("2026-10-05"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True},
+        state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")],
+        remediation=remediation,
+    )
+    assert sent == []
+    assert result.held == ("job_late:kca-tape-sweep.service",)
+    assert ledger.exists() and "started" in ledger.read_text(encoding="utf-8")
+    state = json.loads(sp.read_text(encoding="utf-8"))
+    assert "job_late:kca-tape-sweep.service" in state["open"]
+    assert "last_notified" not in state["open"]["job_late:kca-tape-sweep.service"]
+    hb = json.loads(hp.read_text(encoding="utf-8"))
+    assert any(i["key"] == "job_late:kca-tape-sweep.service" for i in hb["open_issues"])
+
+
+def test_p5_self_resolved_while_held_is_silent(tmp_path) -> None:
+    import json
+
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    remediation, _ledger = _p5_remediation(tmp_path)
+    f, t, b, o = _clean_fns()
+    first = run_audit_reconcile(
+        now=_now("2026-10-05", "12:30:00"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")], remediation=remediation,
+    )
+    assert first.held == ("job_late:kca-tape-sweep.service",)
+    sent: list = []
+    second = run_audit_reconcile(
+        now=_now("2026-10-05", "12:40:00"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [], remediation=remediation,
+    )
+    assert sent == []
+    assert second.action == "RESOLVED" and second.notified is False
+    hb = json.loads(hp.read_text(encoding="utf-8"))
+    assert hb["severity"] == "OK"
+    assert any(n.startswith("auto_remediated=job_late:kca-tape-sweep.service:") for n in hb["info_notes"])
+
+
+def test_p5_persistent_after_grace_notifies_with_ops_label(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    old = "2026-10-05T11:30:00+09:00"
+    sp, hp = _seed(
+        tmp_path,
+        open_keys={"job_late:kca-tape-sweep.service": {"transient": True, "text": "x", "first_seen": old}},
+    )
+    sp_text = sp.read_text(encoding="utf-8")
+    import json as _json
+
+    raw = _json.loads(sp_text)
+    del raw["open"]["job_late:kca-tape-sweep.service"]["last_notified"]
+    sp.write_text(_json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    remediation, _ledger = _p5_remediation(tmp_path)
+    f, t, b, o = _clean_fns()
+    sent: list = []
+    result = run_audit_reconcile(
+        now=_now("2026-10-05", "12:30:00"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")], remediation=remediation,
+    )
+    assert len(sent) == 1
+    assert "운영감시" in sent[0][0] and "2026-10-05" in sent[0][0] and "일일점검" not in sent[0][0]
+    assert result.notified is True
+
+
+def test_p5_no_rule_means_immediate_mail(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    remediation, _ledger = _p5_remediation(tmp_path)
+    f, t, b, o = _clean_fns()
+    sent: list = []
+    result = run_audit_reconcile(
+        now=_now("2026-10-05"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-paper-exit.service")], remediation=remediation,
+    )
+    assert len(sent) == 1 and result.held == () and result.notified is True
+
+
+def test_p5_mixed_label_keeps_audit_label(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    remediation, _ledger = _p5_remediation(tmp_path)
+    f, t, b, o = _clean_fns()
+    sent: list = []
+    run_audit_reconcile(
+        now=_now("2026-10-05"), failed_units_fn=lambda: ["kca-x.service"], stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")], remediation=remediation,
+    )
+    assert len(sent) == 1 and "일일점검" in sent[0][0] and "운영감시" not in sent[0][0]
+
+
+def test_p5_ops_measurement_failure_keeps_previous_keys(tmp_path, caplog) -> None:
+    import logging
+
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    stamp = "2026-10-05T12:00:00+09:00"
+    sp, hp = _seed(
+        tmp_path,
+        open_keys={"job_late:kca-tape-sweep.service": {"transient": True, "text": "늦음", "first_seen": stamp, "last_notified": stamp}},
+    )
+    remediation, _ledger = _p5_remediation(tmp_path)
+    f, t, b, o = _clean_fns()
+
+    def _boom(_n):
+        raise OSError("gone")
+
+    with caplog.at_level(logging.WARNING):
+        result = run_audit_reconcile(
+            now=_now("2026-10-05", "12:30:00"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+            dispatch_fn=lambda s, body: {"mail": True}, state_path=sp, heartbeat_path=hp,
+            ops_issues_fn=_boom, remediation=remediation,
+        )
+    assert "job_late:kca-tape-sweep.service" in result.still_open
+    assert result.resolved == ()
+    assert any("KEEP_PREVIOUS" in r.message for r in caplog.records)
+
+
+def test_p5_dry_run_is_read_only(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    before_state, before_hb = sp.read_text(encoding="utf-8"), hp.read_text(encoding="utf-8")
+    remediation, ledger = _p5_remediation(tmp_path)
+    _f, t, b, o = _clean_fns()
+    sent: list = []
+    result = run_audit_reconcile(
+        now=_now("2026-10-05"), failed_units_fn=lambda: ["kca-tape-sweep.service"], stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")], remediation=remediation, dry_run=True,
+    )
+    assert sent == [] and not ledger.exists()
+    assert sp.read_text(encoding="utf-8") == before_state and hp.read_text(encoding="utf-8") == before_hb
+    assert result.held == ("failed_unit:kca-tape-sweep.service",)
+
+
+def test_p5_ledger_failure_releases_hold(tmp_path, caplog) -> None:
+    import logging
+
+    from src.tools.audit_reconcile import Remediation, run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    f, t, b, o = _clean_fns()
+
+    def _history_boom():
+        raise OSError("ledger gone")
+
+    remediation = Remediation(
+        plan_fn=lambda keys, at, hist: (),
+        execute_fn=lambda planned: (),
+        settle_fn=lambda keys, at, hist: (),
+        history_fn=_history_boom,
+    )
+    sent: list = []
+    with caplog.at_level(logging.WARNING):
+        result = run_audit_reconcile(
+            now=_now("2026-10-05"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+            dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+            ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")], remediation=remediation,
+        )
+    assert len(sent) == 1 and result.held == ()
+    assert any("remediation=FAILED" in r.message for r in caplog.records)
+
+
+def test_p5_reminder_unchanged(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    stamp = "2026-10-04T11:00:00+09:00"
+    sp, hp = _seed(
+        tmp_path,
+        open_keys={"offsite_backup:stale": {"transient": True, "text": "백업 이상", "first_seen": stamp, "last_notified": stamp}},
+    )
+    f, t, b, o = _clean_fns(backup=["offsite_backup:stale"])
+    sent: list = []
+    result = run_audit_reconcile(
+        now=_now("2026-10-05", "12:30:00"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+    )
+    assert result.action == "REMINDED" and result.notified is True and len(sent) == 1
+
+
+def test_p5_info_note_bounded_to_last_10(tmp_path) -> None:
+    import json
+
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    remediation, _ledger = _p5_remediation(tmp_path)
+    f, t, b, o = _clean_fns()
+    keys = ["job_late:kca-tape-sweep.service"] + [f"job_late:kca-extra-{i}.service" for i in range(11)]
+    for key in keys:
+        raw = json.loads(sp.read_text(encoding="utf-8"))
+        stamp = "2026-10-05T12:30:00+09:00"
+        raw["open"][key] = {"transient": True, "text": key, "first_seen": stamp}
+        sp.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    run_audit_reconcile(
+        now=_now("2026-10-05", "12:40:00"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [], remediation=remediation,
+    )
+    hb = json.loads(hp.read_text(encoding="utf-8"))
+    auto = [n for n in hb["info_notes"] if n.startswith("auto_remediated=")]
+    assert len(auto) == 10
+
+
+def test_p5_ops_subject_helpers_and_tape_expiring_remediable(tmp_path) -> None:
+    from src.tools.audit_reconcile import (
+        _is_remediation_excluded,
+        _pick_resolution_subject,
+        run_audit_reconcile,
+    )
+
+    now = _now("2026-10-05")
+    assert _pick_resolution_subject("2026-10-02", now, ["job_late:kca-x.service"]).startswith("[kca] ✅")
+    assert "운영감시" in _pick_resolution_subject("2026-10-02", now, ["job_late:kca-x.service"])
+    mixed = _pick_resolution_subject("2026-10-02", now, ["missing:archive"])
+    assert "운영감시" not in mixed and "2026-10-02" in mixed
+    assert _is_remediation_excluded("intraday:tape_expiring:2:expiring_need") is False
+    assert _is_remediation_excluded("missing:archive") is True
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    remediation, _ledger = _p5_remediation(tmp_path)
+    f, t, _b, o = _clean_fns()
+    sent: list = []
+    result = run_audit_reconcile(
+        now=now, failed_units_fn=f, stale_tokens_fn=t,
+        backup_issues_fn=lambda _n: ["intraday:tape_expiring:2:expiring_need"], outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+        remediation=remediation,
+    )
+    assert sent == [] and result.held == ("intraday:tape_expiring:2:expiring_need",)
+
+
+def test_p5_settle_failure_releases_hold_and_notifies(tmp_path, caplog) -> None:
+    import logging
+
+    from src.tools.audit_reconcile import Remediation, run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    f, t, b, o = _clean_fns()
+
+    def _settle_boom(_keys, _at, _hist):
+        raise OSError("ledger locked")
+
+    remediation = Remediation(
+        plan_fn=lambda keys, at, hist: (),
+        execute_fn=lambda planned: (),
+        settle_fn=_settle_boom,
+        history_fn=lambda: (),
+    )
+    sent: list = []
+    with caplog.at_level(logging.WARNING):
+        result = run_audit_reconcile(
+            now=_now("2026-10-05"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+            dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+            ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")], remediation=remediation,
+        )
+    assert len(sent) == 1 and result.held == ()
+    assert any("remediation=FAILED" in r.message for r in caplog.records)
+
+
+def test_p5_corrupt_history_entry_releases_hold(tmp_path) -> None:
+    from src.tools.audit_reconcile import Remediation, run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    f, t, b, o = _clean_fns()
+    remediation = Remediation(
+        plan_fn=lambda keys, at, hist: (),
+        execute_fn=lambda planned: (),
+        settle_fn=lambda keys, at, hist: (),
+        history_fn=lambda: (object(),),
+    )
+    sent: list = []
+    result = run_audit_reconcile(
+        now=_now("2026-10-05"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")], remediation=remediation,
+    )
+    assert len(sent) == 1 and result.held == ()
+
+
+def test_p5_dry_run_noop_still_open(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    stamp = "2026-10-05T12:00:00+09:00"
+    sp, hp = _seed(
+        tmp_path,
+        open_keys={"offsite_backup:stale": {"transient": True, "text": "x", "first_seen": stamp, "last_notified": stamp}},
+    )
+    before_state, before_hb = sp.read_text(encoding="utf-8"), hp.read_text(encoding="utf-8")
+    remediation, ledger = _p5_remediation(tmp_path)
+    f, t, b, o = _clean_fns(backup=["offsite_backup:stale"])
+    result = run_audit_reconcile(
+        now=_now("2026-10-05", "12:30:00"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: {"mail": True}, state_path=sp, heartbeat_path=hp,
+        remediation=remediation, dry_run=True,
+    )
+    assert result.action == "NOOP" and result.still_open == ("offsite_backup:stale",)
+    assert not ledger.exists()
+    assert sp.read_text(encoding="utf-8") == before_state and hp.read_text(encoding="utf-8") == before_hb
+
+
+def test_p5_ops_reminder_uses_ops_label(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    stamp = "2026-10-04T11:00:00+09:00"
+    sp, hp = _seed(
+        tmp_path,
+        open_keys={"job_late:kca-tape-sweep.service": {"transient": True, "text": "x", "first_seen": stamp, "last_notified": stamp}},
+    )
+    remediation, _ledger = _p5_remediation(tmp_path)
+    f, t, b, o = _clean_fns()
+    sent: list = []
+    result = run_audit_reconcile(
+        now=_now("2026-10-05", "12:30:00"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")], remediation=remediation,
+    )
+    assert result.action == "REMINDED" and len(sent) == 1
+    assert "운영감시" in sent[0][0] and "(재알림)" in sent[0][0]
+
+
+def test_p5_changed_all_ops_uses_ops_label(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    stamp = "2026-10-05T11:00:00+09:00"
+    sp, hp = _seed(
+        tmp_path,
+        open_keys={"ops_measure_unavailable:disk": {"transient": True, "text": "x", "first_seen": stamp, "last_notified": stamp}},
+    )
+    remediation, _ledger = _p5_remediation(tmp_path)
+    f, t, b, o = _clean_fns()
+    sent: list = []
+    result = run_audit_reconcile(
+        now=_now("2026-10-05", "12:30:00"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: sent.append((s, body)) or {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("timer_inactive:kca-backup.timer")], remediation=remediation,
+    )
+    assert result.action == "CHANGED" and len(sent) == 1
+    assert "운영감시" in sent[0][0] and "일일점검" not in sent[0][0]
+
+
+def test_p5_skipped_plans_are_ledgered(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    remediation, ledger = _p5_remediation(tmp_path, busy=("kca-tape-sweep.service",))
+    f, t, b, o = _clean_fns()
+    result = run_audit_reconcile(
+        now=_now("2026-10-05"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")], remediation=remediation,
+    )
+    assert result.remediated == ()
+    assert "skipped_busy" in ledger.read_text(encoding="utf-8")
+
+
+def test_p5_failed_start_is_not_reported_as_remediated(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, open_keys={})
+    remediation, ledger = _p5_remediation(tmp_path, run_ok=False)
+    f, t, b, o = _clean_fns()
+    result = run_audit_reconcile(
+        now=_now("2026-10-05"), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b, outbox_fn=o,
+        dispatch_fn=lambda s, body: {"mail": True}, state_path=sp, heartbeat_path=hp,
+        ops_issues_fn=lambda _n: [_p5_issue("job_late:kca-tape-sweep.service")], remediation=remediation,
+    )
+    assert result.remediated == ()
+    assert "failed" in ledger.read_text(encoding="utf-8")
+
+
+def test_p5_unit_busy_reads_active_state(monkeypatch) -> None:
+    import subprocess
+    from types import SimpleNamespace
+
+    import src.tools.audit_reconcile as rec
+
+    replies = {"idle": SimpleNamespace(returncode=0, stdout="inactive\n"), "run": SimpleNamespace(returncode=0, stdout="active\n")}
+    monkeypatch.setattr(rec.subprocess, "run", lambda cmd, **_k: replies[cmd[-1]] if cmd[-1] in replies else SimpleNamespace(returncode=1, stdout=""))
+    assert rec._unit_busy("idle") is False
+    assert rec._unit_busy("run") is True
+    assert rec._unit_busy("unknown") is True
+
+    def _boom(*_a, **_k):
+        raise subprocess.TimeoutExpired("systemctl", 1)
+
+    monkeypatch.setattr(rec.subprocess, "run", _boom)
+    assert rec._unit_busy("idle") is True

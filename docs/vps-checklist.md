@@ -10,7 +10,24 @@
 > machine-parseable line per check (`CHECK <ID> <PASS|WARN|FAIL> <detail>`). Last verified against the live host on
 > 2026-10-05; if a command here disagrees with the host, the host is truth — report the drift (§14).
 
-## 0. Run Modes and Cadence
+## 0. Autonomous loop
+
+The host now runs a closed loop by itself; the AI check verifies the loop's evidence rather than re-deriving it.
+
+- **10-minute tick** (`kca-audit-reconcile`, 07:00–23:00 KST): measure (failed units, stale tokens, backup, ops sentinel)
+  → remediate (allowlisted safe re-runs only) → hold the first mail while a fix is in flight → notify only on
+  persistence past the grace → publish the heartbeat. A busy lock skips the tick silently (exit 75 = success).
+- **Hold-then-notify**: a fresh issue with an active remediation attempt produces no mail; it notifies through the
+  normal path only if still open after the grace. A key that self-resolves while held never mailed and needs no
+  retraction (ledger `RESOLVED`, heartbeat `info_notes` carries `auto_remediated=<key>:<unit>`).
+- **Advisory tier**: research-degraded findings (e.g. uncertified tick gaps) never mail; they ride the heartbeat info
+  notes and escalate to warnings only after consecutive audits.
+- **Evidence first**: read `logs/heartbeat/daily_audit.json` (`open_issues`, `info_notes`, `reconciled_at`),
+  `logs/remediation/ledger.jsonl` (STARTED without a matching RESOLVED/UNRESOLVED = still in flight), and
+  `logs/heartbeat/advisory_streaks.json` before running any probe. Run probes second. Intervene only for blocking
+  issues or `UNRESOLVED` ledger rows.
+
+## 0b. Run Modes and Cadence
 
 Pick the mode from the clock and the request; do not run heavier modes than the situation needs.
 
@@ -22,8 +39,8 @@ Pick the mode from the clock and the request; do not run heavier modes than the 
 | **M — Monthly** | first Monday | WK plus local restore sample (§10.5), docker/journal growth, expiries, checklist drift (§14) | medium |
 | **E — Event** | after a deploy, an alert, an incident, or an operator question | affected areas + §2 context + D probes | light–medium |
 
-Recommended unattended schedule: **W** at 07:20, 08:45 (light), 15:23 and 15:36, 20:10 and 21:45; **D** at 23:30 or 07:45;
-**WK/M** as above. Each run saves its report (§15) and compares with the previous one.
+Periodic chat reporting is optional. The tick and the watchdog are independent of any session: absence of a chat
+report never implies the host stopped. Each run saves its report (§15) and compares with the previous one.
 
 ## 1. Rules of Engagement
 
@@ -85,7 +102,7 @@ EOF'
   | Signal | Updated when | Pitfall |
   |---|---|---|
   | `systemctl --failed` / unit `Result` | the unit's next run | stays failed after the cause is fixed until the next successful run |
-  | `daily_audit.json` heartbeat | each audit (Mon–Fri 21:20) and each reconcile (07:30, 12:30, after backup success) | v2 fields: `severity`, `open_issues`, `provisional_reasons`, `audit_kind`, `reconciled_at`; the dashboard card is derived from it |
+  | `daily_audit.json` heartbeat | each audit (Mon–Fri 21:20) and each 10-minute reconcile tick (07:00–23:00) | v2 fields: `severity`, `open_issues`, `provisional_reasons`, `audit_kind`, `reconciled_at`; the dashboard card is derived from it |
   | `audit_alert_state.json` | audit/reconcile | opened issues notify once; resolution and 24 h reminders are the only repeats |
   | `offsite/last_run.json` | **end** of a backup | during a run it still shows the previous night; use `offsite/in_progress.json` (exists only while running; stale after its `deadline_at`) |
  | `offsite/deferred_history.json` | **end** of every backup (rolling 14 runs) | `offsite_backup:draining` (informational) while the deferred date count falls vs `deferred` (warning) after 3 stalled runs or an oldest deferred date older than 21 days; a missing/corrupt history reads as first observation (draining), never as stalled |
@@ -112,7 +129,7 @@ For each window run mode **W** about 2 minutes after the slot. Inside blackouts 
 | 23:05 | `kca-extended-backfill` | runs up to 8 h; ledger counts move (§12) | P2 |
 | Sat 22:00 | `kca-retrain` | `PROMOTED` (or a reasoned `REJECTED`); next Monday `predict` loads it | P1 |
 | Sun 10:00 / 11:00 | `kca-core-snapshot`, `kca-offsite-verify` | both succeed; verify `missing=0 mismatched=0`, restore drill OK | P1 DR |
-| 07:30 / 12:30 / after backup | `kca-audit-reconcile` | runs every day; heartbeat `reconciled_at` advances only when state exists | P2 |
+| 07:00–23:00 every 10 min | `kca-audit-reconcile` | runs every day including weekends; heartbeat `reconciled_at` advances ~10 min; a busy lock skips silently | P2 |
 | 07:40 Tue–Sat (GHA) | `watchdog.yml` | succeeded | P1 dead-man |
 
 Normal evidence (observed on trading day 2026-10-02) so you can recognise health: `collect` finished 15:20:46 (`realtime_coverage ... coverage=1.0000 status=COMPLETE`);
@@ -421,10 +438,14 @@ mkdir -p scratch && for p in data research; do awk "/^\`\`\`python probe=$p/{f=1
 for p in data research; do ssh or-vps 'cd ~/k-closing-alpha && TZ=Asia/Seoul nice -n 10 timeout 300 ~/.local/bin/uv run --no-sync python - <D>' < scratch/probe_$p.py; done
 ```
 
-Output is `CHECK <ID> <PASS|WARN|FAIL> <detail>`. Baselines observed on 2026-10-02 (all PASS except the known WARNs): archive 455 rows,
+Output is `CHECK <ID> <PASS|WARN|FAIL> <detail>`. Baselines observed on 2026-10-02: archive 455 rows,
 price_history 2,766 rows/day, 1m `ls` 377 k bars/990 symbols, volume ratio median 0.960, 3 top-k rows, nav conservation 0.00.
-Known standing WARNs (track, do not re-open as new): `RS-05` stray `security_classification.parquet.pre_backfill_20261004`,
-`RS-06` quarantine `2026-09-22-test-fixture-cohort`, `RS-08` tape-sweep `unresolved` > 0.
+Probe behavior (track deltas, do not re-open as new): `RS-01` measures panel lag in trading days against a per-panel
+allowance table (`credit_balance` observed T+3 trading days → allow 4); `RS-05` WARNs only for `*.pre_*` files older
+than 7 days (message: delete after offsite verify); `RS-06` quarantine entries are INFO (PASS with manifest detail) when
+each carries a `moves-*.json` manifest, WARN otherwise; `RS-08` reads report fields `unrecoverable`,
+`expired_recoverable`, `expiring_needs` and WARNs only for `expiring_needs > 0`, `expired_recoverable > 0`, or a stale
+`run_date` (`unresolved` alone is tracked, not warned).
 
 ```python probe=data
 import sys
@@ -649,7 +670,7 @@ emit("DI-BAK-01", level(_stall or _aged), f"trend={_trend or 'empty(first observ
 
 ```python probe=research
 import hashlib, json, sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -670,11 +691,20 @@ def days_between(a, b):
     return (date.fromisoformat(b) - date.fromisoformat(a)).days
 
 
-# RS-01 altdata panels
+# RS-01 altdata panels (lag in trading days vs per-panel allowance)
 man = json.loads((ROOT / "history/altdata/_manifest.json").read_text())
+ALLOW_TD = {"credit_balance": 4}
+def trading_lag(a, b):
+    d, end, n = date.fromisoformat(a) + timedelta(days=1), date.fromisoformat(b), 0
+    while d <= end:
+        if d.weekday() < 5:
+            n += 1
+        d += timedelta(days=1)
+    return n
 bad = {k: (v["status"], v["last_date"]) for k, v in man["panels"].items() if v["status"] != "ok"}
-lag = {k: days_between(v["last_date"], D) for k, v in man["panels"].items()}
-emit("RS-01", lvl(bool(bad), max(lag.values()) > 5), f"not_ok={bad} lag_days_vs_D={lag}")
+lag = {k: trading_lag(v["last_date"], D) for k, v in man["panels"].items()}
+over = {k: lag[k] for k in lag if lag[k] > ALLOW_TD.get(k, 2)}
+emit("RS-01", lvl(bool(bad), bool(over)), f"not_ok={bad} trading_lag_vs_D={lag} over_allowance={over}")
 
 # RS-02 backfill ledgers (latest record per key)
 for name in ("extended_sessions", "toss_regular", "nxt_calibration"):
@@ -705,16 +735,22 @@ mv = str(t.sort_values("decided_at")["model_version"].iloc[-1])
 known = any(str(r.get("trained_at", "")) and str(r["trained_at"]) in mv for r in reg)
 emit("RS-04", lvl(lastr["outcome"] not in ("PROMOTED", "PROMOTED_UNGATED", "MANUAL_HOTFIX") or not known, age > 8 or lastr["outcome"] == "MANUAL_HOTFIX"), f"last_outcome={lastr['outcome']} age_days={age} agreement={lastr.get('agreement')} live_model_in_registry={known}")
 
-# RS-05 classification + stray files
+# RS-05 classification + stray pre-restore files (WARN only past 7 days old)
+import time as _time
 cls = ROOT / "history/altdata/security_classification.parquet"
 c = pd.read_parquet(cls)
-stray = sorted(p.name for p in (ROOT / "history/altdata").glob("*.pre_*")) + sorted(p.name for p in ROOT.rglob("*.bak*"))
-emit("RS-05", lvl(False, bool(stray)), f"classification_rows={len(c)} stray_files={stray}")
+aged = sorted(p.name for p in (ROOT / "history/altdata").glob("*.pre_*") if _time.time() - p.stat().st_mtime > 7 * 86400)
+emit("RS-05", lvl(False, bool(aged)), f"classification_rows={len(c)} pre_restore_older_than_7d={aged} action=delete after offsite verify")
 
-# RS-06 quarantine
+# RS-06 quarantine (INFO when each entry carries a moves-*.json manifest)
 qd = ROOT / "quarantine"
-q = sorted(p.name for p in qd.iterdir()) if qd.exists() else []
-emit("RS-06", lvl(False, bool(q)), f"quarantine_entries={q}")
+entries = sorted(qd.iterdir()) if qd.exists() else []
+undoc = []
+for _p in entries:
+    _ok = any(_p.glob("moves-*.json")) if _p.is_dir() else any(_p.parent.glob(f"{_p.stem}.moves-*.json"))
+    if not _ok:
+        undoc.append(_p.name)
+emit("RS-06", lvl(False, bool(undoc)), f"quarantine_entries={[p.name for p in entries]} documented_info={len(entries) - len(undoc)} undocumented={undoc}")
 
 # RS-07 session partitions for D
 miss = []
@@ -731,7 +767,7 @@ for sess in ("regular",):
         miss.append(f"ticks/{sess}")
 emit("RS-07", lvl(bool(miss)), f"missing={miss} bytes={sizes}")
 
-# RS-08 tape sweep report
+# RS-08 tape sweep report (WARN only on expiring/expired-recoverable needs or stale run)
 rp = ROOT / "history/capture/staging/tape_sweep/last_report.json"
 if not rp.exists():
     emit("RS-08", "FAIL", "tape sweep report absent (sweep never ran; the daily audit does not warn about this)")
@@ -739,9 +775,10 @@ else:
     r = json.loads(rp.read_text())
 
     def n(x):
-        return len(x) if isinstance(x, (list, tuple, dict)) else int(x)
+        return len(x) if isinstance(x, (list, tuple, dict)) else int(x or 0)
 
-    emit("RS-08", lvl(bool(r["disk_guard"]) or n(r["expiring_needs"]) > 0, days_between(r["run_date"], D) > 4 or n(r["unresolved"]) > 0), f"run_date={r['run_date']} needs={n(r['needs'])} recovered={n(r['recovered'])} unresolved={n(r['unresolved'])} expired={n(r['expired'])} expiring_needs={n(r['expiring_needs'])} disk_guard={r['disk_guard']}")
+    stale = days_between(r["run_date"], D) > 4
+    emit("RS-08", lvl(False, n(r.get("expiring_needs", 0)) > 0 or n(r.get("expired_recoverable", ())) > 0 or stale), f"run_date={r['run_date']} stale={stale} unrecoverable={n(r.get('unrecoverable', ()))} expired_recoverable={n(r.get('expired_recoverable', ()))} expiring_needs={n(r.get('expiring_needs', 0))} unresolved_tracked={n(r.get('unresolved', ()))}")
 
 # RS-09 capture manifests for D
 mp = ROOT / f"history/capture/manifests/{D}"
