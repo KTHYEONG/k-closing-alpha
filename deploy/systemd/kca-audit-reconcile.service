@@ -10,6 +10,9 @@ EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 EnvironmentFile=%h/quant-secrets/kis-data.env
 Environment=TZ=Asia/Seoul
 Environment=BROKER_ADMISSION_CLASS=standard
-TimeoutStartSec=15min
-ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts %h/.cache/kis
-ExecStart=/usr/bin/flock -w 600 %t/kca-audit.lock %h/.local/bin/uv run python -m src.tools.audit_reconcile
+# Runtime budget: one tick must finish inside the 10-minute cadence so ticks never stack.
+TimeoutStartSec=9min
+SuccessExitStatus=75
+# Only the paths a tick reads or writes: a full data/ walk (~1M inodes) every 10 minutes would load the host in trading hours.
+ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data/logs %h/k-closing-alpha/data/history/capture/offsite %h/.cache/kis
+ExecStart=/usr/bin/flock -w 30 -E 75 %t/kca-audit.lock %h/.local/bin/uv run python -m src.tools.audit_reconcile

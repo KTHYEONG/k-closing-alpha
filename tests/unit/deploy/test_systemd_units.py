@@ -1294,3 +1294,48 @@ def test_kiwoom_token_rotate_unit_moves_expiry_out_of_decision_window() -> None:
     assert "-e BROKER_ADMISSION_CLASS=critical" in service
     assert "OnFailure=kca-alert@%n.service" in service
     assert "kca-kiwoom-token-rotate.timer" in install_text
+
+
+def test_p5_reconcile_unit_tolerates_busy_lock() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    service = (root / "kca-audit-reconcile.service").read_text(encoding="utf-8")
+    timer = (root / "kca-audit-reconcile.timer").read_text(encoding="utf-8")
+
+    assert "flock -w 30 -E 75 %t/kca-audit.lock" in service
+    assert "SuccessExitStatus=75" in service.splitlines()
+
+    def _svc_seconds() -> int:
+        line = next(line for line in service.splitlines() if line.startswith("TimeoutStartSec="))
+        return _parse_systemd_duration(line.split("=", 1)[1])
+
+    assert _svc_seconds() == 9 * 60
+
+    cals = [line for line in timer.splitlines() if line.startswith("OnCalendar=")]
+    assert len(cals) > 2
+    assert "Persistent=true" not in timer.splitlines()
+    assert "OnFailure=kca-alert@%n.service" in service
+
+
+def test_p5_all_repository_timers_parse_for_sentinel() -> None:
+    import pathlib
+
+    from src.tools.ops_sentinel import load_job_schedules
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    schedules = load_job_schedules(root)
+    by_unit = {s.unit: s for s in schedules}
+    assert "kca-audit-reconcile.service" in by_unit
+    assert len(by_unit["kca-audit-reconcile.service"].slots) > 2
+
+
+def test_p5_reconcile_tick_chowns_only_its_paths() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    lines = (root / "kca-audit-reconcile.service").read_text(encoding="utf-8").splitlines()
+    chown = next(line for line in lines if "/usr/bin/chown" in line)
+    targets = chown.split("ubuntu:ubuntu", 1)[1].split()
+    assert "%h/k-closing-alpha/data" not in targets
+    assert all(t.startswith(("%h/k-closing-alpha/data/", "%h/.cache/kis")) for t in targets), targets

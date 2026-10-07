@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
@@ -96,6 +96,8 @@ from src.tools.offsite_backup import backup_backlog_info as _backup_backlog_info
 from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 
+if TYPE_CHECKING:
+    from src.tools.ops_sentinel import MeasuredIssue
 logger = logging.getLogger(__name__)
 
 
@@ -1278,7 +1280,18 @@ def is_transient_issue_key(key: str) -> bool:
     """
     if key == "undelivered_alerts":
         return True
-    return key.startswith(("offsite_backup:", "failed_unit:", "stale_kis_token:"))
+    return key.startswith(
+        (
+            "offsite_backup:",
+            "failed_unit:",
+            "stale_kis_token:",
+            "job_late:",
+            "job_overrun:",
+            "timer_inactive:",
+            "host_disk_low:",
+            "ops_measure_unavailable:",
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -1365,6 +1378,7 @@ def collect_audit_issues(
     expiry_warnings: Sequence[str],
     calendar_disagreement: bool,
     issue_annotations: Mapping[str, str] | None = None,
+    ops_issues: Sequence[MeasuredIssue | AuditIssue] = (),
 ) -> tuple[AuditIssue, ...]:
     """Build the warning-level issue set backing a digest subject; `issue_annotations` suffixes display text only, never keys."""
     annotations = issue_annotations or {}
@@ -1373,6 +1387,7 @@ def collect_audit_issues(
     issues.extend(
         AuditIssue(key=f"failed_unit:{unit}", transient=True, text=f"실패 유닛: {unit}") for unit in failed_units
     )
+    issues.extend(AuditIssue(key=str(item.key), transient=True, text=str(item.text)) for item in ops_issues)
     issues.extend(
         AuditIssue(key=f"stale_kis_token:{token}", transient=True, text=f"KIS 토큰 누락: {token}")
         for token in stale_kis_tokens
@@ -1423,6 +1438,7 @@ def build_digest(
     expiry_warnings: Sequence[str] = (),
     info_lines: Sequence[str] = (),
     issue_annotations: Mapping[str, str] | None = None,
+    ops_issues: Sequence[MeasuredIssue | AuditIssue] = (),
 ) -> AuditDigest:
     """일일 요약의 제목·본문과 발송 심각도를 만든다.
 
@@ -1463,6 +1479,8 @@ def build_digest(
             raise ValueError(f"audit result required for day_kind={day_kind!r}")
         lines += [f"{step}={'OK' if result.get(step, False) else 'MISSING'}" for step in AUDIT_STEPS]
     lines.append(f"failed_units={','.join(failed_units) if failed_units else 'none'}")
+    ops_keys = [str(item.key) for item in ops_issues]
+    lines.append(f"ops_issues={','.join(ops_keys) if ops_keys else 'none'}")
     lines.append(f"stale_kis_tokens={','.join(stale_kis_tokens) if stale_kis_tokens else 'none'}")
     lines.append(f"collection_issues={','.join(collection_issues) if collection_issues else 'none'}")
     if day_kind != DAY_HOLIDAY:
@@ -1497,10 +1515,12 @@ def build_digest(
         expiry_warnings=list(expiry_warnings),
         calendar_disagreement=_calendar_disagreement,
         issue_annotations=issue_annotations,
+        ops_issues=tuple(ops_issues),
     )
     _backup_warning_set = set(backup_warnings)
     issue_missing = [issue.key.split(":", 1)[1] for issue in issues if issue.key.startswith("missing:")]
     issue_failed = [issue.key.split(":", 1)[1] for issue in issues if issue.key.startswith("failed_unit:")]
+    issue_ops = [issue.key for issue in issues if is_transient_issue_key(issue.key) and issue.key.split(":")[0] in ("job_late", "job_overrun", "timer_inactive", "host_disk_low", "ops_measure_unavailable")]
     issue_stale = [issue.key.split(":", 1)[1] for issue in issues if issue.key.startswith("stale_kis_token:")]
     issue_critical = [issue.key for issue in issues if issue.key.startswith("collection:")]
     issue_intraday = [issue.key for issue in issues if issue.key.startswith("intraday:")]
@@ -1515,6 +1535,8 @@ def build_digest(
             holiday_problems.append("calendar_disagreement")
         if issue_failed:
             holiday_problems.append(f"실패유닛 {','.join(issue_failed)}")
+        if issue_ops:
+            holiday_problems.append(f"운영감시 {','.join(issue_ops)}")
         if issue_backup:
             holiday_problems.append(f"백업이상 {','.join(issue_backup)}")
         if issue_undelivered:
@@ -1533,6 +1555,8 @@ def build_digest(
                 )
             if issue_failed:
                 summary_lines.append(f"• 실패 유닛: {', '.join(issue_failed)}")
+            if issue_ops:
+                summary_lines.append(f"• 운영감시: {', '.join(issue_ops)}")
             if issue_backup:
                 summary_lines.append(f"• 백업 이상: {', '.join(issue_backup)}")
             if running_present:
@@ -1615,6 +1639,9 @@ def build_digest(
     if issue_failed:
         problems.append(f"실패유닛 {','.join(issue_failed)}")
         summary_lines.append(f"• 실패 유닛: {', '.join(issue_failed)}")
+    if issue_ops:
+        problems.append(f"운영감시 {','.join(issue_ops)}")
+        summary_lines.append(f"• 운영감시: {', '.join(issue_ops)}")
     if issue_stale:
         problems.append(f"KIS토큰누락 {','.join(issue_stale)}")
         summary_lines.append(f"• KIS 토큰 누락: {', '.join(issue_stale)}")
@@ -1819,19 +1846,21 @@ def write_audit_alert_state(
 ) -> Path:
     """Atomically persist the alert state for reconcile runs to re-measure."""
     target = _alert_state_path(path)
+    serialised: dict[str, dict[str, Any]] = {}
+    for key, entry in open_entries.items():
+        record: dict[str, Any] = {
+            "transient": bool(entry["transient"]),
+            "text": str(entry["text"]),
+            "first_seen": str(entry["first_seen"]),
+        }
+        if "last_notified" in entry:
+            record["last_notified"] = str(entry["last_notified"])
+        serialised[key] = record
     payload = {
         "schema_version": AUDIT_ALERT_STATE_SCHEMA_VERSION,
         "snapshot_date": snapshot_date,
         "updated_at": updated_at.isoformat(),
-        "open": {
-            key: {
-                "transient": bool(entry["transient"]),
-                "text": str(entry["text"]),
-                "first_seen": str(entry["first_seen"]),
-                "last_notified": str(entry["last_notified"]),
-            }
-            for key, entry in open_entries.items()
-        },
+        "open": serialised,
     }
     if pending_resolutions:
         payload["pending_resolutions"] = dict(pending_resolutions)
@@ -1853,13 +1882,19 @@ def sync_audit_alert_state_from_digest(
     entries: dict[str, dict[str, Any]] = {}
     for issue in digest.issues:
         prev = prev_open.get(issue.key)
-        if isinstance(prev, dict) and "first_seen" in prev and "last_notified" in prev:
-            entries[issue.key] = {
+        if isinstance(prev, dict) and "first_seen" in prev:
+            record = {
                 "transient": issue.transient,
                 "text": issue.text,
                 "first_seen": str(prev["first_seen"]),
-                "last_notified": str(prev["last_notified"]),
             }
+            if "last_notified" in prev:
+                record["last_notified"] = str(prev["last_notified"])
+            elif digest.severity is not DigestSeverity.HOLIDAY_SKIP:
+                # A key held by remediation is announced by this dispatched digest; without the stamp the next reconcile
+                # tick would release it and mail it a second time.
+                record["last_notified"] = stamp
+            entries[issue.key] = record
         else:
             entries[issue.key] = {
                 "transient": issue.transient,
@@ -1878,6 +1913,7 @@ def run_daily_audit(
     stale_tokens_fn: Callable[[str], list[str]] = list_stale_kis_tokens,
     dispatch_fn: Callable[[str, str], dict[str, bool]] = dispatch_digest,
     backup_issues_fn: Callable[[datetime], list[str]] = _default_backup_issues,
+    ops_issues_fn: Callable[[datetime], Sequence[MeasuredIssue]] | None = None,
 ) -> str | None:
     """평일 1회 점검 후 요약을 발송한다. 주말이면 아무것도 보내지 않는다.
 
@@ -2069,6 +2105,15 @@ def run_daily_audit(
         logger.warning("[DATA] stage=daily_audit alert_drain=FAILED reason=%s", type(exc).__name__)
         undelivered_alerts = 0
     report = evaluate_expiries(trading_date)
+    if ops_issues_fn is None:
+        from src.tools.ops_sentinel import measure_ops as _default_measure_ops
+
+        ops_issues_fn = _default_measure_ops
+    try:
+        ops_measured: tuple[MeasuredIssue | AuditIssue, ...] = tuple(ops_issues_fn(audit_at))
+    except Exception as exc:
+        logger.warning("[SYS] stage=daily_audit ops_measure=FAILED reason=%s", type(exc).__name__)
+        ops_measured = (AuditIssue(key="ops_measure_unavailable:audit", transient=True, text="운영감시 측정 실패"),)
     digest = build_digest(
         snapshot_date,
         day_kind,
@@ -2084,6 +2129,7 @@ def run_daily_audit(
         expiry_warnings=report.warnings,
         info_lines=info_lines,
         issue_annotations=intraday_annotations,
+        ops_issues=ops_measured,
     )
     if digest.severity is DigestSeverity.WARNING:
         logger.warning("[DATA] stage=daily_audit day=%s status=WARNING subject=%s", day_kind, digest.subject)
