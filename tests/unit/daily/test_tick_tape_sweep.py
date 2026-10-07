@@ -531,6 +531,168 @@ def test_open_kiwoom_oserror_wrapped_as_infrastructure(tmp_path, monkeypatch) ->
         _run(_profile(tmp_path))
 
 
+def _fake_harvest_unknown(calls: list[dict[str, Any]], reason: str = "day_not_on_tape") -> Any:
+    from src.data.capture_contracts import CaptureStatus as _Status
+
+    async def _fake_unknown(client: Any, http_session: Any, code: str, days: Any, **kwargs: Any) -> Any:
+        calls.append({"symbol": code, "venue": kwargs.get("venue"), "days": sorted(days)})
+        for day in sorted(days):
+            for spec in kwargs.get("sessions", ()):
+                kwargs["on_result"](
+                    TapeDayResult(
+                        symbol=code,
+                        day=day,
+                        session=spec.session,
+                        frame=pd.DataFrame(),
+                        entry=CoverageEntry(
+                            symbol=code,
+                            dataset=CaptureDataset.TRADE_TICKS,
+                            venue=kwargs.get("venue", "KRX"),
+                            session=spec.session,
+                            scheduled_at=None,
+                            status=_Status.UNKNOWN,
+                            rows=0,
+                            first_event_time=None,
+                            last_event_time=None,
+                            reason=reason,
+                            raw_refs=(),
+                        ),
+                    )
+                )
+        return TapeWalkOutcome(termination_reason="tape_end", pages_fetched=1, unresolved_days=())
+
+    return _fake_unknown
+
+
+def test_unrecoverable_keys_leave_unresolved(tmp_path, monkeypatch) -> None:
+    profile = _profile(
+        tmp_path, COLLECTION_TAPE_LOOKBACK_DAYS=30, COLLECTION_TAPE_TERMINALIZE_MAX_SHARE=1.0
+    )
+    _patch_sweep(monkeypatch, tmp_path)
+    _patch_universe(monkeypatch, {_OLD_DAY})
+    _write_ingested(tmp_path, [_OLD_DAY])
+    monkeypatch.setattr(sweep, "_open_kiwoom", lambda: _stub_kiwoom())
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake_harvest_unknown(calls))
+    _seed_bars(_OLD_DAY, "regular", "005930", ["090000"], "100")
+    ledger = tr.tape_ledger_path(None, profile)
+    tr._append_ledger(
+        ledger,
+        [
+            {
+                "symbol": "005930",
+                "day": _OLD_DAY,
+                "session": session,
+                "status": "UNKNOWN",
+                "reason": "day_not_on_tape",
+                "run_id": f"tape-seed-{session}-{i}",
+                "run_date": f"2026-09-{27 + i:02d}",
+            }
+            for session in ("regular", "krx_aftermarket", "nxt_aftermarket")
+            for i in range(2)
+        ],
+    )
+
+    report = _run(profile, lookback_days=30)
+
+    key = f"005930/{_OLD_DAY}/regular"
+    assert key in report.unrecoverable
+    assert key not in report.unresolved
+    assert report.expiring_needs == 0
+    assert report.lookback_days == 30
+
+
+def test_expiry_warning_fires_inside_lookback_window(tmp_path, monkeypatch) -> None:
+    profile = _profile(tmp_path)
+    _patch_sweep(monkeypatch, tmp_path)
+    aged = "2026-09-09"
+    _patch_universe(monkeypatch, {aged})
+    _write_ingested(tmp_path, [aged])
+    monkeypatch.setattr(sweep, "_open_kiwoom", lambda: _stub_kiwoom())
+
+    async def _counting(client: Any, session: Any, code: str, days: Any, **kwargs: Any) -> Any:
+        return TapeWalkOutcome(termination_reason="tape_end", pages_fetched=0, unresolved_days=())
+
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _counting)
+    _seed_bars(aged, "regular", "005930", ["090000"], "100")
+
+    report = _run(profile, lookback_days=25)
+
+    assert report.lookback_days == 25
+    assert report.expiring_needs >= 1
+    assert aged in report.expiring
+
+
+def test_expired_recoverable_surfaces_with_log(tmp_path, monkeypatch, caplog) -> None:
+    _patch_sweep(monkeypatch, tmp_path)
+    _patch_universe(monkeypatch, {"2026-09-18"})
+    _write_ingested(tmp_path, ["2026-09-18"])
+    monkeypatch.setattr(sweep, "_open_kiwoom", _refuse_kiwoom())
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _refuse_kiwoom())
+    _seed_bars("2026-09-18", "regular", "005930", ["090000"], "100")
+
+    with caplog.at_level("INFO", logger="src.daily.tick_tape_sweep"):
+        report = _run(_profile(tmp_path))
+
+    assert "005930/2026-09-18/regular" in report.expired_recoverable
+    assert any("EXPIRED_RECOVERABLE" in rec.message for rec in caplog.records)
+
+
+def test_old_report_schema_readable() -> None:
+    from src.tools import daily_audit
+
+    old = {"run_date": "2026-10-01", "unresolved": ["S/2026-09-20/regular"], "expiring_needs": 0}
+    line = daily_audit.tape_sweep_residual_line(date(2026, 10, 1), report=old)
+    assert line is not None and "unrecoverable=0" in line
+    assert daily_audit.audit_tape_sweep(date(2026, 10, 1), report=old) == ()
+
+
+def test_split_need_key_and_unrecoverable_expiry_filter() -> None:
+    assert sweep._split_need_key("A/2026-09-30/regular") == ("A", "2026-09-30", "regular")
+    assert sweep._split_need_key("malformed") is None
+    settled = {("A", "2026-09-01", "regular"): tr.UNRECOVERABLE_STATUS}
+    out = sweep._expired_recoverable(
+        ["A/2026-09-01/regular", "B/2026-09-01/regular", "malformed"], settled
+    )
+    assert out == ["B/2026-09-01/regular", "malformed"]
+
+
+def test_disk_guard_reports_expired_recoverable(tmp_path, monkeypatch, caplog) -> None:
+    _patch_sweep(monkeypatch, tmp_path, free=0)
+    _patch_universe(monkeypatch, {"2026-09-18"})
+    _write_ingested(tmp_path, ["2026-09-18"])
+    monkeypatch.setattr(sweep, "_open_kiwoom", _refuse_kiwoom())
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _refuse_kiwoom())
+    _seed_bars("2026-09-18", "regular", "005930", ["090000"], "100")
+
+    with caplog.at_level("INFO", logger="src.daily.tick_tape_sweep"):
+        report = _run(_profile(tmp_path))
+
+    assert report.disk_guard is True
+    assert "005930/2026-09-18/regular" in report.expired_recoverable
+    assert any("EXPIRED_RECOVERABLE" in rec.message for rec in caplog.records)
+
+
+def test_walk_path_reports_expired_recoverable(tmp_path, monkeypatch, caplog) -> None:
+    _patch_sweep(monkeypatch, tmp_path)
+    _patch_universe(monkeypatch, {_DAY, "2026-09-18"})
+    _write_ingested(tmp_path, [_DAY, "2026-09-18"])
+    monkeypatch.setattr(sweep, "_open_kiwoom", lambda: _stub_kiwoom())
+
+    async def _counting(client: Any, session: Any, code: str, days: Any, **kwargs: Any) -> Any:
+        return TapeWalkOutcome(termination_reason="tape_end", pages_fetched=0, unresolved_days=())
+
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _counting)
+    _seed_bars(_DAY, "regular", "005930", ["090000"], "100")
+    _seed_bars("2026-09-18", "regular", "005930", ["090000"], "100")
+
+    with caplog.at_level("INFO", logger="src.daily.tick_tape_sweep"):
+        report = _run(_profile(tmp_path))
+
+    assert "005930/2026-09-18/regular" in report.expired_recoverable
+    assert any("EXPIRED_RECOVERABLE" in rec.message for rec in caplog.records)
+
+
 def test_sweep_imports_no_cli_internals() -> None:
     import ast
     from pathlib import Path

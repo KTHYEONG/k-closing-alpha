@@ -253,6 +253,259 @@ def test_deadline_parsing_fails_closed() -> None:
     assert aware is not None and aware.tzinfo is not None
 
 
+def _ledger_lines(path) -> list[dict]:
+    import json
+
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_ledger_records_carry_reason_and_run_date(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.backfill.intraday.tape_harvest import TapeDayResult, TapeWalkOutcome
+
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    sessions = tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    tasks = [tr.WalkTask(symbol="000001", venue="KRX", days=(_DAY,), sessions=sessions)]
+
+    async def _fake(client, http_session, code, days, **kwargs):
+        for day in sorted(days):
+            for spec in kwargs.get("sessions", ()):
+                kwargs["on_result"](
+                    TapeDayResult(
+                        symbol=code,
+                        day=day,
+                        session=spec.session,
+                        frame=pd.DataFrame(),
+                        entry=CoverageEntry(
+                            symbol=code,
+                            dataset=CaptureDataset.TRADE_TICKS,
+                            venue="KRX",
+                            session=spec.session,
+                            scheduled_at=None,
+                            status=CaptureStatus.UNKNOWN,
+                            rows=0,
+                            first_event_time=None,
+                            last_event_time=None,
+                            reason="day_not_on_tape",
+                            raw_refs=(),
+                        ),
+                    )
+                )
+        return TapeWalkOutcome(termination_reason="tape_end", pages_fetched=0, unresolved_days=())
+
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake)
+    ledger = tmp_path / "ledger.jsonl"
+    asyncio.run(
+        tr.run_walk_tasks(
+            tasks,
+            client=object(),
+            http_session=object(),
+            store=store,
+            profile=profile,
+            apply=True,
+            ledger=ledger,
+            deadline=None,
+            blackouts=[],
+            run_date="2026-09-20",
+        )
+    )
+    records = _ledger_lines(ledger)
+    assert records, "expected ledger records"
+    assert all(r.get("reason") == "day_not_on_tape" for r in records)
+    assert all(r.get("run_date") == "2026-09-20" for r in records)
+
+
+def test_legacy_unknown_counts_as_day_not_on_tape(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    tr._append_ledger(
+        ledger,
+        [
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "UNKNOWN", "run_id": f"r{i}"}
+            for i in range(3)
+        ],
+    )
+    history = tr.read_tape_attempts(ledger)
+    entry = history[("A", "2026-09-01", "regular")]
+    assert entry.attempts == 3
+    assert entry.latest_reason == "day_not_on_tape"
+
+
+def test_legacy_run_id_dates_dedupe_same_day_retries(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    run_ids = ["tape-2026-10-01-0001", "tape-2026-10-01-0002", "tape-2026-10-02-0001"]
+    tr._append_ledger(
+        ledger,
+        [
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "UNKNOWN", "run_id": run_id}
+            for run_id in run_ids
+        ],
+    )
+    assert tr.read_tape_attempts(ledger)[("A", "2026-09-01", "regular")].attempts == 2
+
+
+def test_legacy_partial_without_reason_stays_retryable(tmp_path) -> None:
+    from src.backfill.intraday.tape_disposition import TapeDisposition, decide_tape_disposition
+
+    ledger = tmp_path / "ledger.jsonl"
+    tr._append_ledger(
+        ledger,
+        [
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "PARTIAL", "run_id": f"r{i}"}
+            for i in range(5)
+        ],
+    )
+    entry = tr.read_tape_attempts(ledger)[("A", "2026-09-01", "regular")]
+    assert entry.latest_reason == ""
+    assert decide_tape_disposition(attempts=entry.attempts, latest_reason=entry.latest_reason, min_attempts=3) is TapeDisposition.RETRYABLE
+
+
+def test_same_day_duplicates_count_once(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    tr._append_ledger(
+        ledger,
+        [
+            {
+                "symbol": "A",
+                "day": "2026-09-01",
+                "session": "regular",
+                "status": "UNKNOWN",
+                "reason": "day_not_on_tape",
+                "run_id": f"r{i}",
+                "run_date": "2026-09-20",
+            }
+            for i in range(3)
+        ],
+    )
+    assert tr.read_tape_attempts(ledger)[("A", "2026-09-01", "regular")].attempts == 1
+
+
+def test_settled_record_resets_attempts(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    tr._append_ledger(
+        ledger,
+        [
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "UNKNOWN",
+             "reason": "day_not_on_tape", "run_id": "r0", "run_date": "2026-09-18"},
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "UNKNOWN",
+             "reason": "day_not_on_tape", "run_id": "r1", "run_date": "2026-09-19"},
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "COMPLETE",
+             "reason": "tape_complete", "run_id": "r2", "run_date": "2026-09-20"},
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "UNKNOWN",
+             "reason": "day_not_on_tape", "run_id": "r3", "run_date": "2026-09-21"},
+        ],
+    )
+    assert tr.read_tape_attempts(ledger)[("A", "2026-09-01", "regular")].attempts == 1
+
+
+def test_malformed_ledger_lines_are_skipped(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text(
+        "\n".join(
+            [
+                "",
+                "not json",
+                '{"symbol": "A"}',
+                '{"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "UNKNOWN",'
+                ' "reason": "day_not_on_tape", "run_id": "r0", "run_date": "2026-09-18"}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    history = tr.read_tape_attempts(ledger)
+    assert history[("A", "2026-09-01", "regular")].attempts == 1
+
+
+def test_unreadable_ledger_raises(tmp_path) -> None:
+    ledger = tmp_path / "ledger_dir"
+    ledger.mkdir()
+    with pytest.raises(RuntimeError, match="unreadable"):
+        tr.read_tape_attempts(ledger)
+
+
+def test_terminalize_writes_append_only_record(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    tr._append_ledger(
+        ledger,
+        [
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "UNKNOWN",
+             "reason": "day_not_on_tape", "run_id": f"r{i}", "run_date": f"2026-09-{18 + i:02d}"}
+            for i in range(3)
+        ],
+    )
+    before = _ledger_lines(ledger)
+    history = tr.read_tape_attempts(ledger)
+    key = ("A", "2026-09-01", "regular")
+    out = tr.terminalize_unrecoverable(
+        (key,), history=history, attempted=10, min_attempts=3, max_share=0.10,
+        ledger=ledger, run_id="tape-test", run_date="2026-09-21",
+    )
+    assert out == (key,)
+    after = _ledger_lines(ledger)
+    assert after[: len(before)] == before
+    assert len(after) == len(before) + 1
+    assert after[-1]["status"] == tr.UNRECOVERABLE_STATUS
+    assert after[-1]["run_date"] == "2026-09-21"
+
+
+def test_share_guard_blocks_mass_terminalization(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    keys = []
+    for n in range(4):
+        key = (f"S{n:06d}", "2026-09-01", "regular")
+        keys.append(key)
+        tr._append_ledger(
+            ledger,
+            [
+                {"symbol": key[0], "day": key[1], "session": key[2], "status": "UNKNOWN",
+                 "reason": "day_not_on_tape", "run_id": f"r{n}-{i}", "run_date": f"2026-09-{18 + i:02d}"}
+                for i in range(3)
+            ],
+        )
+    before = _ledger_lines(ledger)
+    history = tr.read_tape_attempts(ledger)
+    out = tr.terminalize_unrecoverable(
+        tuple(keys), history=history, attempted=4, min_attempts=3, max_share=0.10,
+        ledger=ledger, run_id="tape-test", run_date="2026-09-21",
+    )
+    assert out == ()
+    assert _ledger_lines(ledger) == before
+
+
+def test_terminal_keys_are_not_needs(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    day = "2026-10-02"
+    _seed(day, "regular", "000001", [("090000", "10")], [("090000", "1000")])
+    monkeypatch.setattr(tr, "_day_universe", lambda d, s: ["000001"] if d == day else [])
+    monkeypatch.setattr(tr, "_session_closed", lambda d, s, n: True)
+    settled = {("000001", day, "regular"): tr.UNRECOVERABLE_STATUS}
+    needs = tr.collect_tape_needs([day], ["KRX"], store, settled, False)
+    assert all(n.symbol != "000001" or n.session != "regular" for n in needs)
+    forced = tr.collect_tape_needs([day], ["KRX"], store, settled, True)
+    assert {n.symbol for n in forced if n.session == "regular"} >= {"000001"}
+
+
+def test_recovery_supersedes_terminal(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    tr._append_ledger(
+        ledger,
+        [
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "UNKNOWN",
+             "reason": "day_not_on_tape", "run_id": "r0", "run_date": "2026-09-18"},
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": tr.UNRECOVERABLE_STATUS,
+             "reason": "day_not_on_tape", "run_id": "r1", "run_date": "2026-09-19"},
+            {"symbol": "A", "day": "2026-09-01", "session": "regular", "status": "COMPLETE",
+             "reason": "tape_complete", "run_id": "r2", "run_date": "2026-09-20"},
+        ],
+    )
+    settled = tr.read_settled_ledger(ledger)
+    assert settled[("A", "2026-09-01", "regular")] == "COMPLETE"
+
+
 def test_engine_has_no_cli_or_daily_dependency() -> None:
     code = (
         "import src.backfill.intraday.tape_recovery as m, sys; "

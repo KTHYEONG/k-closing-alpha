@@ -8,9 +8,10 @@ import asyncio
 import functools
 import json
 import logging
+import re
 import shutil
 import time
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -20,6 +21,7 @@ import pandas as pd
 
 from src import settings
 from src.backfill.intraday import blackout as _blackout
+from src.backfill.intraday.tape_disposition import TapeDisposition, decide_tape_disposition
 from src.backfill.intraday.tape_harvest import (
     TAPE_SESSIONS,
     TapeSession,
@@ -47,6 +49,18 @@ _MIN_START_MARGIN_SECONDS = 180
 _MAX_VENDOR_FAILURE_STREAK = 3
 
 SETTLED_TAPE_STATUSES: frozenset[str] = frozenset({CaptureStatus.COMPLETE.value, CaptureStatus.NO_TRADES.value})
+
+UNRECOVERABLE_STATUS: str = "UNRECOVERABLE"
+TERMINAL_TAPE_STATUSES: frozenset[str] = SETTLED_TAPE_STATUSES | {UNRECOVERABLE_STATUS}
+
+
+@dataclass(frozen=True)
+class TapeAttemptHistory:
+    """Consecutive trailing non-settled ledger outcomes for one tape key."""
+
+    attempts: int
+    latest_reason: str
+    latest_status: str
 
 
 @dataclass(frozen=True)
@@ -478,7 +492,7 @@ def collect_tape_needs(
                 if not _session_closed(day, spec.session, now):
                     continue
                 for symbol in universe:
-                    if not force and settled.get((symbol, day, spec.session)) in SETTLED_TAPE_STATUSES:
+                    if not force and settled.get((symbol, day, spec.session)) in TERMINAL_TAPE_STATUSES:
                         continue
                     if force or _session_need(symbol, day, spec, cache):
                         needs.append(Need(symbol=symbol, day=day, session=spec.session, venue=venue))
@@ -540,6 +554,105 @@ def read_settled_ledger(path: Path) -> dict[tuple[str, str, str], str]:
             continue
         settled[(str(record["symbol"]), str(record["day"]), str(record["session"]))] = str(record.get("status", ""))
     return settled
+
+
+_LEGACY_RUN_ID = re.compile(r"^tape-(\d{4}-\d{2}-\d{2})-\d+$")
+
+
+def _legacy_run_date(run_id: str) -> str:
+    match = _LEGACY_RUN_ID.match(run_id)
+    return match.group(1) if match else ""
+
+
+def read_tape_attempts(path: Path) -> dict[tuple[str, str, str], TapeAttemptHistory]:
+    """Per (symbol, day, session): count of consecutive trailing non-settled records on distinct `run_date`s and the latest reason/status. Legacy UNKNOWN records without a reason are interpreted as reason `day_not_on_tape` (the only UNKNOWN producer when the venue is certified; the share guard in `terminalize_unrecoverable` protects against venue-wide misconfiguration). Legacy PARTIAL records without a reason stay retryable. Raises RuntimeError when the ledger exists but is unreadable."""
+    try:
+        if not path.exists():
+            return {}
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Tape backfill ledger unreadable: {path}: {exc}") from exc
+    ordered: dict[tuple[str, str, str], list[tuple[str, str, str]]] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        try:
+            key = (str(record["symbol"]), str(record["day"]), str(record["session"]))
+        except KeyError:
+            continue
+        status = str(record.get("status", ""))
+        reason = str(record.get("reason", "") or "")
+        if not reason and status == CaptureStatus.UNKNOWN.value:
+            reason = "day_not_on_tape"
+        run_date = str(record.get("run_date", "") or "") or _legacy_run_date(str(record.get("run_id", "")))
+        ordered.setdefault(key, []).append((status, reason, run_date))
+    history: dict[tuple[str, str, str], TapeAttemptHistory] = {}
+    for key, records in ordered.items():
+        latest_status = records[-1][0]
+        latest_reason = records[-1][1]
+        seen_dates: set[str] = set()
+        for index, (status, _reason, run_date) in enumerate(reversed(records)):
+            if status in SETTLED_TAPE_STATUSES:
+                break
+            marker = run_date if run_date else f"#legacy-{len(records) - 1 - index}"
+            seen_dates.add(marker)
+        history[key] = TapeAttemptHistory(
+            attempts=len(seen_dates), latest_reason=latest_reason, latest_status=latest_status
+        )
+    return history
+
+
+def terminalize_unrecoverable(
+    keys: Collection[tuple[str, str, str]],
+    *,
+    history: Mapping[tuple[str, str, str], TapeAttemptHistory],
+    attempted: int,
+    min_attempts: int,
+    max_share: float,
+    ledger: Path,
+    run_id: str,
+    run_date: str,
+) -> tuple[tuple[str, str, str], ...]:
+    """Appends one `UNRECOVERABLE` ledger record (with reason, attempts, run_id, run_date) per key whose history decides UNRECOVERABLE, unless the terminal share of `attempted` exceeds `max_share`, in which case nothing is written and a warning `[DATA] stage=tape_sweep status=TERMINALIZE_BLOCKED` is logged. Returns the keys terminalized."""
+    ordered = list(keys)
+    candidates = [
+        key
+        for key in ordered
+        if (entry := history.get(key)) is not None
+        and entry.latest_status not in TERMINAL_TAPE_STATUSES
+        and decide_tape_disposition(
+            attempts=entry.attempts, latest_reason=entry.latest_reason, min_attempts=min_attempts
+        )
+        is TapeDisposition.UNRECOVERABLE
+    ]
+    if not candidates:
+        return ()
+    if int(attempted) > 0 and len(candidates) / int(attempted) > float(max_share):
+        logger.warning(
+            "[DATA] stage=tape_sweep status=TERMINALIZE_BLOCKED candidates=%d attempted=%d",
+            len(candidates),
+            int(attempted),
+        )
+        return ()
+    records = [
+        {
+            "symbol": key[0],
+            "day": key[1],
+            "session": key[2],
+            "status": UNRECOVERABLE_STATUS,
+            "reason": history[key].latest_reason,
+            "attempts": history[key].attempts,
+            "run_id": run_id,
+            "run_date": run_date,
+        }
+        for key in candidates
+    ]
+    _append_ledger(ledger, records)
+    return tuple(candidates)
 
 
 def _append_ledger(path: Path, records: list[dict[str, Any]]) -> None:
@@ -718,7 +831,9 @@ async def run_walk_tasks(
                         "day": result.day,
                         "session": result.session,
                         "status": result.entry.status.value,
+                        "reason": result.entry.reason,
                         "run_id": run_id,
+                        "run_date": run_date,
                     }
                 )
             if publisher.should_flush():

@@ -847,6 +847,9 @@ def audit_aftermarket_ticks(
 REGULAR_TICKS_AUDIT_START_DATE: str = "2026-09-28"
 """First date with the current archive path and certified LS/Kiwoom ticks; earlier dates predate the fix."""
 
+UNVERIFIABLE_MAX_SHARE: float = 0.05
+"""Max share of compared symbols that may be unverifiable before the class is treated as systemic."""
+
 
 def certified_tick_symbols(store: CaptureStore, trading_date: date, *, session: str = "regular") -> frozenset[str]:
     """Symbols whose stored ticks for the day are certified complete by the tape's vendor total.
@@ -892,6 +895,27 @@ class TickSourceDiff:
     relative_shortfall: float
 
 
+def uncertifiable_tick_symbols(store: CaptureStore, trading_date: date, *, session: str = "regular") -> frozenset[str]:
+    """Symbols whose latest regular-session TRADE_TICKS manifest entry for the date carries an uncertifiable tape reason (`is_uncertifiable_reason`). The latest manifest wins, like `certified_tick_symbols`; a later live re-collection that completes un-flags the symbol."""
+    from src.backfill.intraday.tape_disposition import is_uncertifiable_reason
+
+    try:
+        manifests = store.read_manifests(trading_date.isoformat())
+    except (OSError, ValueError):
+        return frozenset()
+    flagged: dict[str, bool] = {}
+    for manifest in manifests:
+        if manifest.status == CaptureStatus.PENDING:
+            continue
+        for entry in manifest.entries:
+            if entry.dataset is not CaptureDataset.TRADE_TICKS or entry.session != session:
+                continue
+            if entry.symbol is None:
+                continue
+            flagged[str(entry.symbol)] = is_uncertifiable_reason(entry.reason)
+    return frozenset(symbol for symbol, ok in flagged.items() if ok)
+
+
 @dataclass(frozen=True)
 class TickAuditResult:
     """Classified regular-tick audit: warning issues plus informational source diffs."""
@@ -899,12 +923,14 @@ class TickAuditResult:
     issues: tuple[str, ...]
     source_diffs: tuple[TickSourceDiff, ...]
     compared: int
+    unverifiable: tuple[TickSourceDiff, ...] = ()
 
 
 def classify_regular_ticks(
     trading_date: date,
     *,
     certified: frozenset[str] = frozenset(),
+    uncertifiable: frozenset[str] = frozenset(),
     read_ticks: Callable[[], pd.DataFrame | None] | None = None,
     read_bars: Callable[[], pd.DataFrame | None] | None = None,
 ) -> TickAuditResult:
@@ -916,6 +942,7 @@ def classify_regular_ticks(
     Args:
         trading_date: Audited KST date (checked only from REGULAR_TICKS_AUDIT_START_DATE).
         certified: Symbols certified complete by the tape vendor total.
+        uncertifiable: Symbols the tape attempted but could not certify.
         read_ticks: No-arg callable returning a frame with symbol and volume (None when the
             tick partition is absent). None reads the stored regular tick partition.
         read_bars: No-arg callable returning a frame with symbol, volume and ts_hms (None when
@@ -925,6 +952,7 @@ def classify_regular_ticks(
         TickAuditResult with warning issues (`missing_partition`, `volume_gap` for lost only,
         `certified_gap`, `source_diff_systemic`), informational `source_diffs` sorted by
         relative shortfall descending, and `compared` (symbols with positive bar volume).
+        `unverifiable`: tick shortfalls beyond tolerance for symbols the tape attempted but could not certify. They carry no `lost` warning because no further collection can resolve them; they are informational and reported via `regular_ticks_unverifiable`.
     """
     day_str = trading_date.isoformat()
     if day_str < REGULAR_TICKS_AUDIT_START_DATE:
@@ -960,6 +988,7 @@ def classify_regular_ticks(
     lost = 0
     excess = 0
     diffs: list[TickSourceDiff] = []
+    unverifiable: list[TickSourceDiff] = []
     for symbol, bar_total in bar_sum.items():
         bar_total = float(bar_total)
         if bar_total == 0:
@@ -984,9 +1013,19 @@ def classify_regular_ticks(
             )
         elif verdict is CertifiedTickShortfall.SOURCE_DIFF_EXCESS:
             excess += 1
+        elif symbol in uncertifiable:
+            unverifiable.append(
+                TickSourceDiff(
+                    symbol=symbol,
+                    bar_volume=bar_total,
+                    tick_volume=tick_total,
+                    relative_shortfall=(bar_total - tick_total) / bar_total if bar_total > 0 else 0.0,
+                )
+            )
         else:
             lost += 1
     diffs.sort(key=lambda d: (-d.relative_shortfall, d.symbol))
+    unverifiable.sort(key=lambda d: (-d.relative_shortfall, d.symbol))
     issues: list[str] = []
     if lost:
         issues.append(_intraday_issue("regular_ticks", lost, "volume_gap"))
@@ -994,13 +1033,18 @@ def classify_regular_ticks(
         issues.append(_intraday_issue("regular_ticks", excess, "certified_gap"))
     if diffs and compared > 0 and len(diffs) / compared > CERTIFIED_SOURCE_DIFF_MAX_SHARE:
         issues.append(_intraday_issue("regular_ticks", len(diffs), "source_diff_systemic"))
-    return TickAuditResult(issues=tuple(issues), source_diffs=tuple(diffs), compared=compared)
+    if unverifiable and compared > 0 and len(unverifiable) / compared > UNVERIFIABLE_MAX_SHARE:
+        issues.append(_intraday_issue("regular_ticks", len(unverifiable), "unverifiable_systemic"))
+    return TickAuditResult(
+        issues=tuple(issues), source_diffs=tuple(diffs), compared=compared, unverifiable=tuple(unverifiable)
+    )
 
 
 def audit_regular_ticks(
     trading_date: date,
     *,
     certified: frozenset[str] = frozenset(),
+    uncertifiable: frozenset[str] = frozenset(),
     read_ticks: Callable[[], pd.DataFrame | None] | None = None,
     read_bars: Callable[[], pd.DataFrame | None] | None = None,
 ) -> tuple[str, ...]:
@@ -1028,7 +1072,7 @@ def audit_regular_ticks(
         `classify_regular_ticks(...).issues`.
     """
     return classify_regular_ticks(
-        trading_date, certified=certified, read_ticks=read_ticks, read_bars=read_bars
+        trading_date, certified=certified, uncertifiable=uncertifiable, read_ticks=read_ticks, read_bars=read_bars
     ).issues
 
 
@@ -1153,7 +1197,15 @@ def tape_sweep_residual_line(
     except (TypeError, ValueError):
         expiring = 0
     oldest = _tape_oldest_key_date(data)
-    return f"tape_sweep_residual={unresolved} expiring={expiring} oldest={oldest}"
+    raw_unrecoverable = data.get("unrecoverable", 0)
+    if isinstance(raw_unrecoverable, (list, tuple)):
+        unrecoverable = len(raw_unrecoverable)
+    else:
+        try:
+            unrecoverable = int(raw_unrecoverable or 0)
+        except (TypeError, ValueError):
+            unrecoverable = 0
+    return f"tape_sweep_residual={unresolved} expiring={expiring} oldest={oldest} unrecoverable={unrecoverable}"
 
 
 def audit_extended_exhausted(*, ledger_path: Path | None = None) -> tuple[str, ...]:
@@ -1782,6 +1834,7 @@ def run_daily_audit(
     audit_at = datetime.now(SEOUL)
     session_day = resolve_session_day(trading_date)
     tick_source_diffs: tuple[TickSourceDiff, ...] = ()
+    tick_unverifiable: tuple[TickSourceDiff, ...] = ()
     try:
         profile = CollectionSettings()
         session_clock = session_day.clock if session_day.clock is not None else SessionClock.standard(trading_date)
@@ -1812,9 +1865,11 @@ def run_daily_audit(
             intraday_issues = (*intraday_issues, *audit_bar_value_consistency(trading_date, sessions=value_sessions))
             if session_day.kind is SessionKind.STANDARD:
                 certified = certified_tick_symbols(store, trading_date)
-                tick_audit = classify_regular_ticks(trading_date, certified=certified)
+                uncertifiable = uncertifiable_tick_symbols(store, trading_date)
+                tick_audit = classify_regular_ticks(trading_date, certified=certified, uncertifiable=uncertifiable)
                 intraday_issues = (*intraday_issues, *tick_audit.issues)
                 tick_source_diffs = tick_audit.source_diffs
+                tick_unverifiable = tick_audit.unverifiable
                 intraday_issues = (*intraday_issues, *audit_aftermarket_ticks(trading_date))
                 intraday_issues = (*intraday_issues, *audit_tape_sweep(trading_date, profile=profile))
     except (OSError, ValueError) as exc:
@@ -1848,6 +1903,26 @@ def run_daily_audit(
             )
         except Exception as exc:
             logger.warning("[SYS] stage=daily_audit tick_source_diff_record=FAILED reason=%s", type(exc).__name__)
+    if tick_unverifiable:
+        peak_unverifiable = max(diff.relative_shortfall for diff in tick_unverifiable)
+        shown_unverifiable = ",".join(diff.symbol for diff in tick_unverifiable[:10])
+        info_lines = (
+            *info_lines,
+            f"regular_ticks_unverifiable={len(tick_unverifiable)} max={peak_unverifiable * 100:.1f}% symbols={shown_unverifiable}",
+        )
+        try:
+            record_run_outcome(
+                "tick_unverifiable",
+                RUN_OUTCOME_OK,
+                run_date=trading_date.isoformat(),
+                metrics={
+                    "n": len(tick_unverifiable),
+                    "max_relative_shortfall": peak_unverifiable,
+                    "symbols": [diff.symbol for diff in tick_unverifiable[:20]],
+                },
+            )
+        except Exception as exc:
+            logger.warning("[SYS] stage=daily_audit tick_unverifiable_record=FAILED reason=%s", type(exc).__name__)
     try:
         residual = tape_sweep_residual_line(trading_date)
     except Exception as exc:

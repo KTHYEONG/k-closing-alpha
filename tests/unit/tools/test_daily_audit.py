@@ -4453,3 +4453,315 @@ def test_run_daily_audit_survives_info_line_failures(monkeypatch, tmp_path) -> N
         backup_issues_fn=lambda _at: [],
     )
     assert subject is not None
+
+
+def test_unverifiable_shortfall_is_informational() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    steady_bars = [(f"C{i:04d}", 10_000, 90100) for i in range(30)]
+    steady_ticks = [(f"C{i:04d}", 10_000) for i in range(30)]
+    bars, ticks = _regular_tick_frames(
+        [("005930", 10_000, 90100), *steady_bars],
+        [("005930", 5_000), *steady_ticks],
+    )
+    result = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30),
+        certified=frozenset(),
+        uncertifiable=frozenset({"005930"}),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
+    )
+    assert result.issues == ()
+    assert [d.symbol for d in result.unverifiable] == ["005930"]
+
+
+def test_not_attempted_stays_lost() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames([("005930", 10_000, 90100)], [("005930", 5_000)])
+    result = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30), read_ticks=lambda: ticks, read_bars=lambda: bars
+    )
+    assert result.issues == ("intraday:regular_ticks:1:volume_gap",)
+    assert result.unverifiable == ()
+
+
+def test_certified_wins_over_uncertifiable() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    bars, ticks = _regular_tick_frames([("005930", 10_000, 90100)], [("005930", 9_800)])
+    result = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30),
+        certified=frozenset({"005930"}),
+        uncertifiable=frozenset({"005930"}),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
+    )
+    assert len(result.source_diffs) == 1
+    assert result.unverifiable == ()
+
+
+def test_systemic_unverifiable_escalates() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    symbols = [f"U{i:04d}" for i in range(100)]
+    bars, ticks = _regular_tick_frames(
+        [(s, 10_000, 90100) for s in symbols],
+        [(s, 5_000) for s in symbols],
+    )
+    result = daily_audit.classify_regular_ticks(
+        date(2026, 9, 30),
+        uncertifiable=frozenset(symbols),
+        read_ticks=lambda: ticks,
+        read_bars=lambda: bars,
+    )
+    assert result.issues == ("intraday:regular_ticks:100:unverifiable_systemic",)
+
+
+def test_residual_line_shows_unrecoverable() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    report = {
+        "run_date": "2026-10-06",
+        "unresolved": ["S/2026-09-20/regular"],
+        "unrecoverable": [f"SYM{i}/2026-09-20/regular" for i in range(4)],
+        "expiring_needs": 0,
+    }
+    line = daily_audit.tape_sweep_residual_line(date(2026, 10, 6), report=report)
+    assert line is not None and "unrecoverable=4" in line
+    absent = {"run_date": "2026-10-06", "unresolved": [], "expiring_needs": 0}
+    line = daily_audit.tape_sweep_residual_line(date(2026, 10, 6), report=absent)
+    assert line is not None and "unrecoverable=0" in line
+
+
+def test_manifest_latest_wins_for_uncertifiable(tmp_path) -> None:
+    from datetime import date
+
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+    from src.tools import daily_audit
+
+    day = "2026-09-30"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(
+        store, day, "run-tape", CaptureDataset.TRADE_TICKS, ["005930"], reason="day_not_on_tape"
+    )
+    assert daily_audit.uncertifiable_tick_symbols(store, date.fromisoformat(day)) == frozenset({"005930"})
+    _publish_chart_manifest(
+        store,
+        day,
+        "run-zzz-live",
+        CaptureDataset.TRADE_TICKS,
+        ["005930"],
+        reason="tape_complete:regular=100:vendor_total=100",
+        completed_time="20:00:00",
+    )
+    assert daily_audit.uncertifiable_tick_symbols(store, date.fromisoformat(day)) == frozenset()
+
+
+def test_uncertifiable_tick_symbols_store_failure_fails_closed(tmp_path) -> None:
+    from datetime import date
+
+    from src.data.capture_store import CaptureStore
+    from src.tools import daily_audit
+
+    class _Boom:
+        def read_manifests(self, _day):
+            raise OSError("locked")
+
+    assert daily_audit.uncertifiable_tick_symbols(_Boom(), date(2026, 9, 30)) == frozenset()
+    assert (
+        daily_audit.uncertifiable_tick_symbols(CaptureStore(tmp_path / "absent"), date(2026, 9, 30))
+        == frozenset()
+    )
+
+
+def test_uncertifiable_tick_symbols_skips_pending_and_symbol_none(tmp_path) -> None:
+    from datetime import date
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus, CoverageEntry
+    from src.data.capture_store import CaptureStore
+    from src.tools import daily_audit
+
+    day = "2026-09-30"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    pending = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, "run-zzz-pending", CaptureDataset.TRADE_TICKS, "intraday-trade_ticks"),
+        cohort=None,
+        completed_at=_audit_moment(day, "19:00:00"),
+        entries=(
+            CoverageEntry(
+                symbol="005930",
+                dataset=CaptureDataset.TRADE_TICKS,
+                venue="KRX",
+                session="regular",
+                scheduled_at=None,
+                status=CaptureStatus.UNKNOWN,
+                rows=0,
+                first_event_time=None,
+                last_event_time=None,
+                reason="day_not_on_tape",
+                raw_refs=(),
+            ),
+        ),
+        artifacts=(),
+        status=CaptureStatus.PENDING,
+    )
+    store.publish_manifest(pending)
+    nameless = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, "run-zzz-nameless", CaptureDataset.TRADE_TICKS, "intraday-trade_ticks"),
+        cohort=None,
+        completed_at=_audit_moment(day, "20:00:00"),
+        entries=(
+            CoverageEntry(
+                symbol=None,
+                dataset=CaptureDataset.TRADE_TICKS,
+                venue="KRX",
+                session="regular",
+                scheduled_at=None,
+                status=CaptureStatus.UNKNOWN,
+                rows=0,
+                first_event_time=None,
+                last_event_time=None,
+                reason="day_not_on_tape",
+                raw_refs=(),
+            ),
+        ),
+        artifacts=(),
+        status=CaptureStatus.PARTIAL,
+    )
+    store.publish_manifest(nameless)
+
+    assert daily_audit.uncertifiable_tick_symbols(store, date.fromisoformat(day)) == frozenset()
+
+
+def test_residual_line_garbage_unrecoverable_reads_zero() -> None:
+    from datetime import date
+
+    from src.tools import daily_audit
+
+    report = {"run_date": "2026-10-06", "unresolved": [], "expiring_needs": 0, "unrecoverable": {"bad": "type"}}
+    line = daily_audit.tape_sweep_residual_line(date(2026, 10, 6), report=report)
+    assert line is not None and "unrecoverable=0" in line
+
+
+def test_run_daily_audit_unverifiable_is_info_only(monkeypatch, tmp_path) -> None:
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore, resolve_capture_root
+    from src.tools import daily_audit
+
+    profile = _collection_profile(tmp_path)
+    monkeypatch.setattr(daily_audit, "CollectionSettings", lambda *a, **k: profile)
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True))
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_bar_value_consistency", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_aftermarket_ticks", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_tape_sweep", lambda *a, **k: ())
+
+    store = CaptureStore(resolve_capture_root(profile))
+    _publish_cohort_decision(store, "2026-09-30", ["005930"])
+    _publish_chart_manifest(
+        store, "2026-09-30", "run-tape", CaptureDataset.TRADE_TICKS, ["005930"],
+        reason="day_not_on_tape",
+    )
+    bars, ticks = _regular_tick_frames(
+        [("005930", 10000, 90100), *[(f"C{i:04d}", 10000, 90100) for i in range(30)]],
+        [("005930", 5000), *[(f"C{i:04d}", 10000) for i in range(30)]],
+    )
+    bars_path, ticks_path = tmp_path / "bars.parquet", tmp_path / "ticks.parquet"
+    bars.to_parquet(bars_path)
+    ticks.to_parquet(ticks_path)
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *a: bars_path)
+    monkeypatch.setattr(daily_audit, "tick_partition_path", lambda *a: ticks_path)
+    recorded: list = []
+    monkeypatch.setattr(
+        daily_audit, "record_run_outcome", lambda job, outcome, **k: recorded.append((job, outcome, k)) or {}
+    )
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    subject = daily_audit.run_daily_audit(
+        "2026-09-30",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
+    )
+
+    assert subject is not None and "🟢" in subject
+    assert "regular_ticks_unverifiable=1 max=50.0% symbols=005930" in sent[0][1]
+    assert recorded and recorded[0][0] == "tick_unverifiable" and recorded[0][1] == "OK"
+
+
+def test_run_daily_audit_survives_unverifiable_record_failure(monkeypatch, tmp_path, caplog) -> None:
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore, resolve_capture_root
+    from src.tools import daily_audit
+
+    profile = _collection_profile(tmp_path)
+    monkeypatch.setattr(daily_audit, "CollectionSettings", lambda *a, **k: profile)
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True))
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_bar_value_consistency", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_aftermarket_ticks", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_tape_sweep", lambda *a, **k: ())
+
+    store = CaptureStore(resolve_capture_root(profile))
+    _publish_cohort_decision(store, "2026-09-30", ["005930"])
+    _publish_chart_manifest(
+        store, "2026-09-30", "run-tape", CaptureDataset.TRADE_TICKS, ["005930"],
+        reason="day_not_on_tape",
+    )
+    bars, ticks = _regular_tick_frames(
+        [("005930", 10000, 90100), *[(f"C{i:04d}", 10000, 90100) for i in range(30)]],
+        [("005930", 5000), *[(f"C{i:04d}", 10000) for i in range(30)]],
+    )
+    bars_path, ticks_path = tmp_path / "bars.parquet", tmp_path / "ticks.parquet"
+    bars.to_parquet(bars_path)
+    ticks.to_parquet(ticks_path)
+    monkeypatch.setattr(daily_audit, "intraday_partition_path", lambda *a: bars_path)
+    monkeypatch.setattr(daily_audit, "tick_partition_path", lambda *a: ticks_path)
+
+    def _boom(*args, **kwargs):
+        raise OSError("event log locked")
+
+    monkeypatch.setattr(daily_audit, "record_run_outcome", _boom)
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    with caplog.at_level("WARNING", logger="src.tools.daily_audit"):
+        subject = daily_audit.run_daily_audit(
+            "2026-09-30",
+            trading_day_fn=lambda _d: True,
+            failed_units_fn=list,
+            stale_tokens_fn=lambda _d: [],
+            dispatch_fn=_dispatch,
+            backup_issues_fn=lambda _at: [],
+        )
+
+    assert subject is not None and "🟢" in subject
+    assert "regular_ticks_unverifiable=1" in sent[0][1]
+    assert "tick_unverifiable_record=FAILED reason=OSError" in caplog.text
