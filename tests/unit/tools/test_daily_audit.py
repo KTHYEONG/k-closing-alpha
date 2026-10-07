@@ -4765,3 +4765,343 @@ def test_run_daily_audit_survives_unverifiable_record_failure(monkeypatch, tmp_p
     assert subject is not None and "🟢" in subject
     assert "regular_ticks_unverifiable=1" in sent[0][1]
     assert "tick_unverifiable_record=FAILED reason=OSError" in caplog.text
+
+
+def _run_audit_isolated(
+    monkeypatch,
+    tmp_path,
+    day,
+    *,
+    intraday,
+    streaks=None,
+    write_boom=False,
+    load_override=None,
+    update_override=None,
+    explain_override=None,
+):
+    from src.tools import daily_audit
+    from src.tools.daily_audit import TickAuditResult
+
+    monkeypatch.setattr(daily_audit.settings, "DATA_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(daily_audit, "audit_daily_completeness", lambda d: dict.fromkeys(daily_audit.AUDIT_STEPS, True))
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
+    from types import SimpleNamespace as _NS
+
+    monkeypatch.setattr(
+        daily_audit.CaptureStore, "read_cohort", lambda self, *a, **k: _NS(eligible_symbols=("005930",))
+    )
+    monkeypatch.setattr(daily_audit.CaptureStore, "read_manifests", lambda self, *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_intraday_partitions", lambda *a, **k: tuple(intraday))
+    monkeypatch.setattr(daily_audit, "audit_bar_value_consistency", lambda *a, **k: ())
+    monkeypatch.setattr(
+        daily_audit, "classify_regular_ticks", lambda *a, **k: TickAuditResult(issues=(), source_diffs=(), compared=0)
+    )
+    monkeypatch.setattr(daily_audit, "audit_aftermarket_ticks", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_tape_sweep", lambda *a, **k: ())
+    monkeypatch.setattr(daily_audit, "audit_extended_exhausted", lambda **k: ())
+    monkeypatch.setattr(daily_audit, "tape_sweep_residual_line", lambda *a, **k: None)
+    monkeypatch.setattr(daily_audit, "_backup_backlog_info", lambda *a, **k: None)
+    monkeypatch.setattr(daily_audit, "drain_alert_outbox", lambda **k: (None, 0))
+    monkeypatch.setattr(
+        daily_audit,
+        "explain_incomplete_entries",
+        explain_override if explain_override is not None else (lambda *a, **k: ()),
+    )
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(daily_audit, "evaluate_expiries", lambda *a, **k: SimpleNamespace(notices=(), warnings=()))
+    if streaks is not None:
+        monkeypatch.setattr(
+            daily_audit,
+            "load_advisory_streaks",
+            load_override if load_override is not None else (lambda path=None: dict(streaks)),
+        )
+        captured = {}
+
+        def _write(new, path=None):
+            if write_boom:
+                raise OSError("locked")
+            captured["streaks"] = dict(new)
+
+        monkeypatch.setattr(daily_audit, "write_advisory_streaks", _write)
+    if update_override is not None:
+        monkeypatch.setattr(daily_audit, "update_advisory_streaks", update_override)
+    sent = []
+
+    def _dispatch(subject, body):
+        sent.append((subject, body))
+        return {"mail": True}
+
+    subject = daily_audit.run_daily_audit(
+        day,
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
+    )
+    import json
+
+    hb_path = tmp_path / "logs" / "heartbeat" / "daily_audit.json"
+    hb = json.loads(hb_path.read_text(encoding="utf-8")) if hb_path.exists() else {}
+    return subject, sent, hb
+
+
+def test_advisory_only_day_is_ok(monkeypatch, tmp_path) -> None:
+    subject, sent, hb = _run_audit_isolated(
+        monkeypatch, tmp_path, "2026-10-06", intraday=("intraday:regular_ticks:2:volume_gap",), streaks={}
+    )
+    assert "일일점검 완료 (정상)" in subject and "(참고 1건)" in subject
+    assert "missing:intraday_complete" not in subject
+    assert any(str(n).startswith("degraded:") for n in hb.get("info_notes", []))
+    assert "경고" not in sent[0][0]
+
+
+def test_blocking_intraday_issue_still_warns(monkeypatch, tmp_path) -> None:
+    subject, sent, hb = _run_audit_isolated(
+        monkeypatch, tmp_path, "2026-10-06", intraday=("intraday:regular:3:missing_stamps",), streaks={}
+    )
+    assert "경고" in subject
+    assert "intraday_complete" in subject
+
+
+def test_mixed_day(monkeypatch, tmp_path) -> None:
+    subject, sent, hb = _run_audit_isolated(
+        monkeypatch,
+        tmp_path,
+        "2026-10-06",
+        intraday=("intraday:regular_ticks:2:volume_gap", "intraday:regular:3:missing_stamps"),
+        streaks={},
+    )
+    assert "경고" in subject
+    notes = [str(n) for n in hb.get("info_notes", [])]
+    assert any("volume_gap" in n and n.startswith("degraded:") for n in notes)
+    assert "missing_stamps" in sent[0][1]
+
+
+def test_third_consecutive_advisory_day_escalates(monkeypatch, tmp_path) -> None:
+    from src.tools.issue_registry import AdvisoryStreak, issue_class
+
+    cls = issue_class("intraday:regular_ticks:2:volume_gap")
+    streaks = {cls: AdvisoryStreak(first_date="2026-10-02", last_date="2026-10-03", consecutive_audits=2)}
+    subject, sent, hb = _run_audit_isolated(
+        monkeypatch, tmp_path, "2026-10-06", intraday=("intraday:regular_ticks:2:volume_gap",), streaks=streaks
+    )
+    assert "경고" in subject
+    assert "(연속 3회)" in subject or "(연속 3회)" in sent[0][1]
+
+
+def test_unwritable_streak_state_is_loud(monkeypatch, tmp_path) -> None:
+    subject, sent, hb = _run_audit_isolated(
+        monkeypatch,
+        tmp_path,
+        "2026-10-06",
+        intraday=("intraday:regular_ticks:2:volume_gap",),
+        streaks={},
+        write_boom=True,
+    )
+    assert "audit:advisory_state" in subject
+
+
+def test_incomplete_entries_explained(monkeypatch) -> None:
+    from datetime import datetime
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus, CoverageEntry
+    from src.tools import daily_audit
+
+    stamp = datetime.fromisoformat("2026-10-06T09:05:00+09:00")
+
+    def _ctx(reason):
+        from datetime import date
+
+        from src.data.capture_contracts import CaptureContext
+
+        return CaptureContext(
+            trading_date=date.fromisoformat("2026-10-06"),
+            run_id="run-open",
+            dataset=CaptureDataset.PRICE,
+            vendor="kis",
+            endpoint="e",
+            symbol=None,
+            venue="KRX",
+            session="regular",
+            capture_reason=reason,
+            cohort_id=None,
+            scheduled_at=None,
+        )
+
+    entries = tuple(
+        CoverageEntry(
+            symbol=symbol,
+            dataset=CaptureDataset.PRICE,
+            venue="KRX",
+            session="regular",
+            scheduled_at=stamp,
+            status=CaptureStatus.PARTIAL,
+            rows=1,
+            first_event_time=stamp,
+            last_event_time=stamp,
+            reason="open_unresolved",
+            raw_refs=(),
+        )
+        for symbol in ("005930", "000660")
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_ctx("auction-open"),
+        cohort=None,
+        completed_at=stamp,
+        entries=entries,
+        artifacts=(),
+        status=CaptureStatus.PARTIAL,
+    )
+    lines = daily_audit.explain_incomplete_entries((manifest,), "auction-open")
+    assert len(lines) == 1
+    assert "collection_note=" in lines[0]
+    assert "PRICE/PARTIAL/open_unresolved n=2 symbols=" in lines[0]
+    assert "005930" in lines[0] and "000660" in lines[0]
+
+
+def test_holiday_bypass(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+
+    monkeypatch.setattr(daily_audit.settings, "DATA_DIR", tmp_path, raising=False)
+    touched = []
+    monkeypatch.setattr(daily_audit, "load_advisory_streaks", lambda path=None: touched.append("read") or {})
+    monkeypatch.setattr(daily_audit, "write_advisory_streaks", lambda *a, **k: touched.append("write"))
+    sent = []
+    subject = daily_audit.run_daily_audit(
+        "2026-10-06",
+        trading_day_fn=lambda _d: False,
+        failed_units_fn=list,
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=lambda s, b: sent.append((s, b)) or {"mail": True},
+        backup_issues_fn=lambda _at: [],
+    )
+    assert touched == []
+    assert subject is not None
+
+
+def test_explain_incomplete_entries_all_complete_is_empty() -> None:
+    from datetime import datetime
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus, CoverageEntry
+    from src.tools import daily_audit
+
+    stamp = datetime.fromisoformat("2026-10-06T09:05:00+09:00")
+
+    def _ctx(reason):
+        from datetime import date
+
+        from src.data.capture_contracts import CaptureContext
+
+        return CaptureContext(
+            trading_date=date.fromisoformat("2026-10-06"),
+            run_id="run-open",
+            dataset=CaptureDataset.PRICE,
+            vendor="kis",
+            endpoint="e",
+            symbol=None,
+            venue="KRX",
+            session="regular",
+            capture_reason=reason,
+            cohort_id=None,
+            scheduled_at=None,
+        )
+
+    entry = CoverageEntry(
+        symbol="005930",
+        dataset=CaptureDataset.PRICE,
+        venue="KRX",
+        session="regular",
+        scheduled_at=stamp,
+        status=CaptureStatus.COMPLETE,
+        rows=1,
+        first_event_time=stamp,
+        last_event_time=stamp,
+        reason="auction-open",
+        raw_refs=(),
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_ctx("auction-open"),
+        cohort=None,
+        completed_at=stamp,
+        entries=(entry,),
+        artifacts=(),
+        status=CaptureStatus.COMPLETE,
+    )
+    assert daily_audit.explain_incomplete_entries((manifest,), "auction-open") == ()
+    assert daily_audit.explain_incomplete_entries((manifest,), "auction-close") == ()
+
+
+def test_streak_load_failure_degrades_gracefully(monkeypatch, tmp_path) -> None:
+    def _boom(path=None):
+        raise OSError("locked")
+
+    subject, sent, hb = _run_audit_isolated(
+        monkeypatch,
+        tmp_path,
+        "2026-10-06",
+        intraday=("intraday:regular_ticks:2:volume_gap",),
+        streaks={},
+        load_override=_boom,
+    )
+    assert "일일점검 완료 (정상)" in subject
+    assert any(str(n).startswith("degraded:") for n in hb.get("info_notes", []))
+
+
+def test_streak_update_failure_degrades_gracefully(monkeypatch, tmp_path) -> None:
+    def _boom(*a, **k):
+        raise RuntimeError("bad state")
+
+    subject, sent, hb = _run_audit_isolated(
+        monkeypatch,
+        tmp_path,
+        "2026-10-06",
+        intraday=("intraday:regular_ticks:2:volume_gap",),
+        streaks={},
+        update_override=_boom,
+    )
+    assert "일일점검 완료 (정상)" in subject
+
+
+def test_explain_failure_never_fails_audit(monkeypatch, tmp_path) -> None:
+    def _boom(*a, **k):
+        raise RuntimeError("bad manifest")
+
+    subject, sent, hb = _run_audit_isolated(
+        monkeypatch,
+        tmp_path,
+        "2026-10-06",
+        intraday=("intraday:regular:3:missing_stamps",),
+        streaks={},
+        explain_override=_boom,
+    )
+    assert "경고" in subject
+
+
+def test_clean_audit_day_breaks_advisory_streak(monkeypatch, tmp_path) -> None:
+    from src.tools.issue_registry import AdvisoryStreak, issue_class, load_advisory_streaks, write_advisory_streaks
+
+    key = "intraday:regular_ticks:2:volume_gap"
+    path = tmp_path / "logs" / "heartbeat" / "advisory_streaks.json"
+    write_advisory_streaks(
+        {issue_class(key): AdvisoryStreak(first_date="2026-10-01", last_date="2026-10-02", consecutive_audits=2)}, path
+    )
+    _run_audit_isolated(monkeypatch, tmp_path, "2026-10-05", intraday=())
+    assert load_advisory_streaks(path) == {}
+    subject, _sent, hb = _run_audit_isolated(monkeypatch, tmp_path, "2026-10-06", intraday=(key,))
+    assert "경고" not in subject
+    assert load_advisory_streaks(path)[issue_class(key)].consecutive_audits == 1
+
+
+def test_escalated_issue_key_stays_stable(monkeypatch, tmp_path) -> None:
+    from src.tools.issue_registry import AdvisoryStreak, issue_class
+
+    key = "intraday:regular_ticks:2:volume_gap"
+    streaks = {issue_class(key): AdvisoryStreak(first_date="2026-10-01", last_date="2026-10-05", consecutive_audits=3)}
+    _subject, _sent, hb = _run_audit_isolated(monkeypatch, tmp_path, "2026-10-06", intraday=(key,), streaks=streaks)
+    issues = {item["key"]: item["text"] for item in hb["open_issues"]}
+    assert key in issues
+    assert issues[key].endswith("(연속 4회)")

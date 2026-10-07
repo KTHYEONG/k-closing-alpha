@@ -951,3 +951,27 @@ def test_reconcile_resolves_deferred_into_draining(tmp_path: Path) -> None:
     assert result.still_open == ()
     assert len(dispatches) == 1
     assert "offsite_backup:deferred -> draining" in dispatches[0][0]
+
+
+def test_reconcile_preserves_advisory_notes(tmp_path: Path) -> None:
+    import json
+
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    notes = ["degraded:intraday:regular_ticks:2:volume_gap 연구용 데이터 저하(조치 불필요, 3회 연속 시 경고)"]
+    sp, hp = _seed(tmp_path, snapshot="2026-10-06", open_keys={}, heartbeat_extra={"info_notes": notes})
+    f, t, b, o = _clean_fns()
+    result = run_audit_reconcile(
+        now=_now("2026-10-07"),
+        failed_units_fn=f,
+        stale_tokens_fn=t,
+        backup_issues_fn=b,
+        outbox_fn=o,
+        dispatch_fn=lambda s, body: {"mail": True},
+        state_path=sp,
+        heartbeat_path=hp,
+    )
+    assert result.action == "NOOP"
+    hb = json.loads(hp.read_text(encoding="utf-8"))
+    assert hb["info_notes"] == notes
+    assert hb["open_issues"] == []
