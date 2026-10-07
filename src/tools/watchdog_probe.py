@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 WATCHDOG_HEARTBEAT_MAX_LAG_WEEKDAYS: int = 1
 
+RECONCILE_WINDOW_START_MIN: int = 7 * 60 + 30
+RECONCILE_WINDOW_END_MIN: int = 23 * 60 + 50
+
 
 @dataclass(frozen=True)
 class WatchdogVerdict:
@@ -54,6 +57,7 @@ def evaluate_watchdog(
     outbox_dir: Path,
     failed_units: Sequence[str],
     inactive_timers: Sequence[str],
+    reconcile_max_age: timedelta = timedelta(hours=2),
 ) -> WatchdogVerdict:
     """Classify host liveness from persisted evidence only.
 
@@ -63,11 +67,15 @@ def evaluate_watchdog(
         outbox_dir: Alert outbox directory (undelivered alerts).
         failed_units: `systemctl --user list-units --failed kca-*` names.
         inactive_timers: kca timers declared in deploy/systemd that are not active.
+        reconcile_max_age: Maximum age of `reconciled_at` (fallback `finished_at`)
+            inside the 07:30-23:50 KST operating window before `reconcile_stale`
+            is reported.
 
     Returns:
         WatchdogVerdict with problems among: heartbeat_missing,
         heartbeat_unreadable, heartbeat_stale:<date>, alert_outbox:<n>,
-        failed_units:<comma list>, timers_inactive:<comma list>.
+        failed_units:<comma list>, timers_inactive:<comma list>,
+        reconcile_stale:<minutes>.
     """
     expected = expected_audit_date(now)
     problems: list[str] = []
@@ -85,6 +93,29 @@ def evaluate_watchdog(
             problems.append("heartbeat_unreadable")
         elif snapshot < expected:
             problems.append(f"heartbeat_stale:{snapshot}")
+    if payload is not None and isinstance(payload, dict):
+        current = now.astimezone(SEOUL) if now.tzinfo is not None else now.replace(tzinfo=SEOUL)
+        minute_of_day = current.hour * 60 + current.minute
+        if RECONCILE_WINDOW_START_MIN <= minute_of_day <= RECONCILE_WINDOW_END_MIN:
+            stamp: datetime | None = None
+            for field in ("reconciled_at", "finished_at"):
+                raw = payload.get(field)
+                if not isinstance(raw, str) or not raw:
+                    continue
+                try:
+                    parsed = datetime.fromisoformat(raw)
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=SEOUL)
+                stamp = parsed
+                break
+            if stamp is None:
+                if "heartbeat_unreadable" not in problems:
+                    problems.append("heartbeat_unreadable")
+            elif current - stamp > reconcile_max_age:
+                minutes = int((current - stamp).total_seconds() // 60)
+                problems.append(f"reconcile_stale:{minutes}")
     pending = len(list(outbox_dir.glob("*.json"))) if outbox_dir.is_dir() else 0
     if pending > 0:
         problems.append(f"alert_outbox:{pending}")
