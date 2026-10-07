@@ -86,6 +86,10 @@ class CollectionSettings(EnvSettings):
             ratio inside the gate window would be accepted, so the era is excluded by date.
         COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS: HHMM-HHMM KST weekday windows in which no new date starts,
             default 0850-0940 and 1510-1550.
+        COLLECTION_TAPE_UNRECOVERABLE_MIN_ATTEMPTS: Consecutive uncertifiable tape outcomes on distinct run dates
+            before a need is terminal, default 3.
+        COLLECTION_TAPE_TERMINALIZE_MAX_SHARE: Max share of one sweep's attempted needs that may become terminal
+            in a run, default 0.10.
 
     Raises:
         ValueError: Invalid limits, duplicate slots, or enabled auctions without
@@ -114,6 +118,8 @@ class CollectionSettings(EnvSettings):
     COLLECTION_TAPE_FLUSH_ROWS: int = Field(default=2_000_000, gt=0)
     COLLECTION_TAPE_MIN_FREE_GIB: int = Field(default=25, gt=0)
     COLLECTION_TAPE_LOOKBACK_DAYS: int = Field(default=25, gt=0, le=30)
+    COLLECTION_TAPE_UNRECOVERABLE_MIN_ATTEMPTS: int = Field(default=3, ge=2)
+    COLLECTION_TAPE_TERMINALIZE_MAX_SHARE: float = Field(default=0.10, gt=0, le=1, allow_inf_nan=False)
     COLLECTION_TAPE_MAX_PAGES: int = Field(default=12000, ge=1000, le=30000)
     COLLECTION_ARROW_BATCH_ROWS: int = Field(default=65536, gt=0)
     COLLECTION_MAX_RSS_MIB: int = Field(default=1024, gt=0)

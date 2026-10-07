@@ -42,6 +42,9 @@ class TapeSweepReport:
     pages: int
     rows: int
     expiring_needs: int = 0
+    unrecoverable: tuple[str, ...] = ()
+    lookback_days: int = 0
+    expired_recoverable: tuple[str, ...] = ()
 
 
 def _now() -> datetime:
@@ -87,6 +90,22 @@ def _need_key(symbol: str, day: str, session: str) -> str:
     return f"{symbol}/{day}/{session}"
 
 
+def _split_need_key(key: str) -> tuple[str, str, str] | None:
+    parts = str(key).split("/")
+    if len(parts) != 3:
+        return None
+    return (parts[0], parts[1], parts[2])
+
+
+def _expired_recoverable(expired: list[str], settled: dict[tuple[str, str, str], str]) -> list[str]:
+    recoverable = []
+    for key in expired:
+        parsed = _split_need_key(key)
+        if parsed is None or settled.get(parsed) != tr.UNRECOVERABLE_STATUS:
+            recoverable.append(key)
+    return sorted(recoverable)
+
+
 def _check_deadline(deadline: datetime | None) -> None:
     if deadline is not None and (deadline.tzinfo is None or deadline.utcoffset() is None):
         raise ValueError(f"deadline must be timezone-aware: {deadline!r}")
@@ -106,6 +125,9 @@ def _write_report(root: Path, run_date: str, report: TapeSweepReport) -> None:
         "pages": report.pages,
         "rows": report.rows,
         "expiring_needs": report.expiring_needs,
+        "unrecoverable": list(report.unrecoverable),
+        "lookback_days": report.lookback_days,
+        "expired_recoverable": list(report.expired_recoverable),
     }
     try:
         target = _report_path(root)
@@ -161,7 +183,7 @@ async def run_tick_tape_sweep(
     near_expiry = [
         item
         for item in active
-        if (today - date.fromisoformat(item.day)).days >= _TAPE_DEPTH_DAYS - _EXPIRY_WARNING_DAYS
+        if (today - date.fromisoformat(item.day)).days >= int(lookback_days) - _EXPIRY_WARNING_DAYS
     ]
     expiring = sorted({item.day for item in near_expiry})
     expiring_needs = len({(item.symbol, item.day) for item in near_expiry})
@@ -173,6 +195,9 @@ async def run_tick_tape_sweep(
         raise RuntimeError(f"Tape sweep storage check failed: {exc}") from exc
     if free < int(resolved.COLLECTION_TAPE_MIN_FREE_GIB) * 1024**3:
         logger.warning("[DATA] stage=tape_sweep status=DISK_GUARD free=%d", free)
+        guarded_recoverable = _expired_recoverable(expired, tr.read_settled_ledger(ledger))
+        if guarded_recoverable:
+            logger.info("[DATA] stage=tape_sweep status=EXPIRED_RECOVERABLE n=%d", len(guarded_recoverable))
         report = TapeSweepReport(
             days_checked=tuple(window),
             needs=len(active_keys),
@@ -185,12 +210,17 @@ async def run_tick_tape_sweep(
             pages=0,
             rows=0,
             expiring_needs=expiring_needs,
+            lookback_days=int(lookback_days),
+            expired_recoverable=tuple(guarded_recoverable),
         )
         _write_report(root, today.isoformat(), report)
         return report
     tasks = tr.order_walk_tasks(active)
     if not tasks:
         logger.info("[DATA] stage=tape_sweep status=NOOP needs=0")
+        noop_recoverable = _expired_recoverable(expired, tr.read_settled_ledger(ledger))
+        if noop_recoverable:
+            logger.info("[DATA] stage=tape_sweep status=EXPIRED_RECOVERABLE n=%d", len(noop_recoverable))
         report = TapeSweepReport(
             days_checked=tuple(window),
             needs=0,
@@ -203,6 +233,8 @@ async def run_tick_tape_sweep(
             pages=0,
             rows=0,
             expiring_needs=expiring_needs,
+            lookback_days=int(lookback_days),
+            expired_recoverable=tuple(noop_recoverable),
         )
         _write_report(root, today.isoformat(), report)
         return report
@@ -236,6 +268,35 @@ async def run_tick_tape_sweep(
         }
     )
     still_keys = sorted(set(active_keys) - set(recovered))
+    still_set = set(still_keys)
+    still_tuples = tuple(
+        (item.symbol, item.day, item.session) for item in active if _need_key(item.symbol, item.day, item.session) in still_set
+    )
+    history = tr.read_tape_attempts(ledger)
+    terminalized = tr.terminalize_unrecoverable(
+        still_tuples,
+        history=history,
+        attempted=len(active_keys),
+        min_attempts=int(resolved.COLLECTION_TAPE_UNRECOVERABLE_MIN_ATTEMPTS),
+        max_share=float(resolved.COLLECTION_TAPE_TERMINALIZE_MAX_SHARE),
+        ledger=ledger,
+        run_id=f"tape-sweep-{today.isoformat()}",
+        run_date=today.isoformat(),
+    )
+    terminalized_keys = sorted({_need_key(*key) for key in terminalized})
+    still_keys = sorted(set(still_keys) - set(terminalized_keys))
+    if terminalized:
+        settled_now = tr.read_settled_ledger(ledger)
+    terminalized_set = set(terminalized_keys)
+    expiring_needs = len(
+        {(item.symbol, item.day) for item in near_expiry if _need_key(item.symbol, item.day, item.session) not in terminalized_set}
+    )
+    expiring = sorted(
+        {item.day for item in near_expiry if _need_key(item.symbol, item.day, item.session) not in terminalized_set}
+    )
+    expired_recoverable = _expired_recoverable(expired, settled_now)
+    if expired_recoverable:
+        logger.info("[DATA] stage=tape_sweep status=EXPIRED_RECOVERABLE n=%d", len(expired_recoverable))
     logger.info(
         "[DATA] stage=tape_sweep_report needs=%d pages=%d rows=%d recovered=%d unresolved=%d expired=%d remaining=%s skipped_unclosed=%d",
         len(active_keys),
@@ -259,6 +320,9 @@ async def run_tick_tape_sweep(
         pages=int(summary.pages),
         rows=int(summary.rows),
         expiring_needs=expiring_needs,
+        unrecoverable=tuple(terminalized_keys),
+        lookback_days=int(lookback_days),
+        expired_recoverable=tuple(expired_recoverable),
     )
     _write_report(root, today.isoformat(), report)
     return report
