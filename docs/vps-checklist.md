@@ -657,7 +657,7 @@ if _hp.exists():
     except ValueError:
         _herr = "malformed"
 _trend = [(str(_e.get("run_started_at", ""))[:10], int(_e.get("deferred_dates", -1))) for _e in _hist if isinstance(_e, dict)]
-_stall = len(_trend) >= 3 and all(_trend[-k][1] >= _trend[-k - 1][1] for k in (1, 2))
+_stall = len(_trend) >= 3 and _trend[-1][1] > 0 and all(_trend[-k][1] >= _trend[-k - 1][1] for k in (1, 2))
 _aged = False
 if _hist and isinstance(_hist[-1], dict) and _hist[-1].get("oldest_deferred_date"):
     try:
