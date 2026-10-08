@@ -1,4 +1,4 @@
-"""Invariant guards for the incremental NXT calibration collection (Part 3)."""
+"""Invariant guards for the incremental NXT calibration collection."""
 
 from __future__ import annotations
 

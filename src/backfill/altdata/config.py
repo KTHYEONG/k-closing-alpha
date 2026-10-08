@@ -151,8 +151,6 @@ class AltDataFetchConfig:
         # Validate universe_symbols
         if self.universe_symbols is not None:
             if not isinstance(self.universe_symbols, frozenset):
-                # allow set input but coerce? spec says must be frozenset
-                # we keep as-is for validation, but require frozenset
                 raise ValueError("universe_symbols must be a frozenset")
             if len(self.universe_symbols) == 0:
                 raise ValueError("universe_symbols must be non-empty")

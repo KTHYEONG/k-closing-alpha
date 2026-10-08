@@ -257,9 +257,7 @@ def attach_sector_features(
     for col in SECTOR_FEATURE_COLUMNS:
         result[col] = result[col].replace([np.inf, -np.inf], np.nan).astype(np.float64)
 
-    # Preserve original index and column order: original columns first, then sector columns
-    # But spec says preserve index/order; just return with same index and new columns appended
-    # Ensure we return in same row order as input (which left merge preserves)
+    # Preserve original row index and ordering.
     result = result.copy()
     result.index = origin_index
     return result

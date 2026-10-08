@@ -21,7 +21,7 @@ def _has_exact_total_none(reason: str) -> bool:
 
 
 def is_uncertifiable_reason(reason: str) -> bool:
-    """True when a tape outcome reason proves the vendor cannot certify the day however often it is retried: `day_not_on_tape`, or `tape_total_mismatch` whose `total=None` (no vendor total to compare). A `tape_total_mismatch` with a numeric total, `uncertified_venue`, empty or unknown reasons are retryable (transient page loss or configuration)."""
+    """Check if a tape failure reason indicates an uncertifiable day."""
     if not reason or not reason.strip():
         return False
     prefix = _reason_prefix(reason)
@@ -33,7 +33,7 @@ def is_uncertifiable_reason(reason: str) -> bool:
 
 
 def decide_tape_disposition(*, attempts: int, latest_reason: str, min_attempts: int) -> TapeDisposition:
-    """UNRECOVERABLE only when `attempts >= min_attempts` and the latest reason is uncertifiable. `attempts` counts consecutive trailing non-settled ledger records for the key. Raises ValueError for `min_attempts < 1`."""
+    """Decide whether tape failure is RETRYABLE or UNRECOVERABLE based on retry count and reason."""
     if int(min_attempts) < 1:
         raise ValueError(f"min_attempts must be >= 1: {min_attempts!r}")
     if int(attempts) >= int(min_attempts) and is_uncertifiable_reason(latest_reason):

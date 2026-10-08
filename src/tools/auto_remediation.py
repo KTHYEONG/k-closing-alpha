@@ -2,7 +2,7 @@
 
 The host fixes itself (restart the unit, re-warm the token, re-run the sweep)
 for allowlisted non-trading conditions; the human is notified only when the
-fix did not hold. Wiring into the reconcile loop is Part 5.
+fix did not hold.
 """
 
 from __future__ import annotations

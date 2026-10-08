@@ -53,7 +53,7 @@ class TossBasisVerdict:
 def toss_basis_verdict(
     frame: pd.DataFrame, eod_volume: float | None, *, ratio_min: float, ratio_tolerance: float
 ) -> TossBasisVerdict:
-    """Decide whether one symbol-day of Toss bars is a KRX-only tape comparable with the live decision panel and EOD history. EOD `volume` is KRX-only, so a KRX-only full-session cumulative volume cannot exceed it, while a KRX+NXT consolidated tape (NXT-listed symbols from `NXT_START_DATE`) exceeds it by the NXT share. The ratio is therefore a necessary, empirically sharp discriminator, not a proof of venue; the residual (NXT share smaller than the auction share) is bounded by the audit in Part 3.
+    """Decide whether Toss bars represent KRX-only tape via EOD volume ratio comparison.
 
     Args:
         frame: canonical Toss bars covering the full regular session.

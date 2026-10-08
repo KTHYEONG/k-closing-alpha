@@ -113,7 +113,7 @@ def _selection_days(fit_start: str, fit_end: str, frame: pd.DataFrame) -> set[st
 
 
 # ---------------------------------------------------------------------------
-# Part 1 invariant scenarios
+# Decomposition invariant scenarios
 # ---------------------------------------------------------------------------
 
 

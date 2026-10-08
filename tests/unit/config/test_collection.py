@@ -261,7 +261,7 @@ def test_aftermarket_sparse_times_reject_bad_spellings() -> None:
 
 
 def test_collection_settings_expose_toss_backfill_fields() -> None:
-    """Toss backfill fields are declared with the Part 2 defaults."""
+    """Toss backfill fields are declared with expected defaults."""
     profile = CollectionSettings(_env_file=None)
     assert (
         profile.COLLECTION_TOSS_BACKFILL_CONCURRENCY,

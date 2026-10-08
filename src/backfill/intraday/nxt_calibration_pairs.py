@@ -1,7 +1,7 @@
 """NXT consolidated-tape calibration pairs: KRX truth vs consolidated Toss bars.
 
 For stored vendor-`kis` (KRX-only) symbol-days of NXT-listed symbols, pair the KIS bars
-with the consolidated Toss bars of the same day, so the Part 2 decomposition can be
+with the consolidated Toss bars of the same day, so the volume decomposition model can be
 calibrated and validated against ground truth. Writes nothing to production partitions
 or the production ledger: Toss evidence goes to the explicit `evidence_store`.
 """
