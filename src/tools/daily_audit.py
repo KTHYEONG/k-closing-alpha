@@ -1875,7 +1875,7 @@ def sync_audit_alert_state_from_digest(
     now: datetime,
     path: Path | None = None,
 ) -> Path:
-    """Replace the alert state with a full audit evaluation, retaining history."""
+    """Replace the alert state with a full audit evaluation, retaining first_seen history."""
     previous = load_audit_alert_state(path) or {}
     prev_open = previous.get("open", {})
     stamp = now.isoformat()
@@ -1888,12 +1888,13 @@ def sync_audit_alert_state_from_digest(
                 "text": issue.text,
                 "first_seen": str(prev["first_seen"]),
             }
-            if "last_notified" in prev:
-                record["last_notified"] = str(prev["last_notified"])
-            elif digest.severity is not DigestSeverity.HOLIDAY_SKIP:
-                # A key held by remediation is announced by this dispatched digest; without the stamp the next reconcile
-                # tick would release it and mail it a second time.
+            if digest.severity is not DigestSeverity.HOLIDAY_SKIP:
+                # The dispatched digest announces every issue it lists, including keys held by remediation and keys
+                # carried over from the previous day; keeping an older stamp would mail a redundant reminder an hour
+                # after the audit.
                 record["last_notified"] = stamp
+            elif "last_notified" in prev:
+                record["last_notified"] = str(prev["last_notified"])
             entries[issue.key] = record
         else:
             entries[issue.key] = {
