@@ -21,6 +21,7 @@ from src.backfill.intraday.collector import (
 )
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
+    ARCHIVE_AFTERMARKET_READY_HHMMSS,
     ARCHIVE_REGULAR_READY_HHMMSS,
     INTRADAY_SESSION_KRX_AFTERMARKET,
     INTRADAY_SESSION_NXT_AFTERMARKET,
@@ -123,14 +124,18 @@ def _parse_days(days: Collection[str]) -> list[str]:
 def is_session_closed(day: str, session: str, now: datetime) -> bool:
     """True when a (day, session) is certifiably closed at `now`.
 
-    Shared definition with tape_recovery._session_closed: regular closes at
-    ARCHIVE_REGULAR_READY_HHMMSS on the day itself, aftermarket closes at the
-    next day boundary.
+    Regular closes at ARCHIVE_REGULAR_READY_HHMMSS on the day itself;
+    any other session closes at ARCHIVE_AFTERMARKET_READY_HHMMSS on the day itself.
     """
-    today = now.date().isoformat()
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    kst = now.astimezone(_SEOUL)
+    today = kst.date().isoformat()
+    if day > today:
+        return False
     if session == INTRADAY_SESSION_REGULAR:
-        return day < today or (day == today and now.strftime("%H%M%S") >= ARCHIVE_REGULAR_READY_HHMMSS)
-    return day < today
+        return day < today or (day == today and kst.strftime("%H%M%S") >= ARCHIVE_REGULAR_READY_HHMMSS)
+    return day < today or (day == today and kst.strftime("%H%M%S") >= ARCHIVE_AFTERMARKET_READY_HHMMSS)
 
 
 def _reject_unclosed_day(day: str, session: str, symbol: str = "") -> None:
@@ -413,7 +418,21 @@ async def harvest_symbol_tape(
                 sessions=day_sessions, venue=resolved_venue, refs=_refs_for(day), on_result=on_result,
             )
         elif str(payload.get("termination_reason", "")) == "tape_empty":
-            if resolved_venue == "UNKNOWN":
+            if day == today.isoformat() and any(spec.session != INTRADAY_SESSION_REGULAR for spec in day_sessions):
+                _settle_uncertified_day(
+                    code=str(code), day=day, status=CaptureStatus.PARTIAL,
+                    reason="tape_total_mismatch:received=0:total=None",
+                    sessions=[spec for spec in day_sessions if spec.session != INTRADAY_SESSION_REGULAR],
+                    venue=resolved_venue, refs=empty_refs, on_result=on_result,
+                )
+                regular_sessions = [spec for spec in day_sessions if spec.session == INTRADAY_SESSION_REGULAR]
+                if regular_sessions:
+                    _settle_certified_day(
+                        code=str(code), day=day, rows=[], vendor_total=None, basis="tape_empty",
+                        sessions=regular_sessions, venue=resolved_venue, store=store, run_id=str(run_id),
+                        refs=empty_refs, on_result=on_result,
+                    )
+            elif resolved_venue == "UNKNOWN":
                 _settle_certified_day(
                     code=str(code), day=day, rows=[], vendor_total=None, basis="tape_empty",
                     sessions=day_sessions, venue=resolved_venue, store=store, run_id=str(run_id),

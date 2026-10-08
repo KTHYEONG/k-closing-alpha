@@ -341,7 +341,9 @@ def test_replay_same_run_id_is_idempotent(tmp_path, monkeypatch) -> None:
 
 
 def test_closed_day_guard_rejects_open_aftermarket(tmp_path) -> None:
-    today = datetime.now(_SEOUL).date().isoformat()
+    from datetime import timedelta
+
+    tomorrow = (datetime.now(_SEOUL).date() + timedelta(days=1)).isoformat()
     store = CaptureStore(tmp_path / "capture")
     profile = _profile(tmp_path)
     pub = TickTapePublisher(store=store, profile=profile, flush_rows=10**9)
@@ -350,7 +352,7 @@ def test_closed_day_guard_rejects_open_aftermarket(tmp_path) -> None:
     from src.data.capture_contracts import CaptureDataset
 
     bad = TapeDayResult(
-        symbol="005930", day=today, session="krx_aftermarket",
+        symbol="005930", day=tomorrow, session="krx_aftermarket",
         frame=pd.DataFrame(),
         entry=CoverageEntry(
             symbol="005930", dataset=CaptureDataset.TRADE_TICKS, venue="KRX",
@@ -653,7 +655,7 @@ def test_unclosed_needed_pair_is_skipped_not_fatal(tmp_path) -> None:
 
     store = CaptureStore(tmp_path / "capture")
     profile = _profile(tmp_path)
-    today = datetime.now(_SEOUL).date().isoformat()
+    tomorrow = (datetime.now(_SEOUL).date() + timedelta(days=1)).isoformat()
     old = (datetime.now(_SEOUL).date() - timedelta(days=30)).isoformat()
     rows_old = [_tick_on(old, "093000")]
     stub = _StubTape(
@@ -664,14 +666,14 @@ def test_unclosed_needed_pair_is_skipped_not_fatal(tmp_path) -> None:
     out: list[TapeDayResult] = []
     res = asyncio.run(
         harvest_symbol_tape(
-            stub, object(), "005930", [old, today], venue="KRX", sessions=_krx_sessions(),
+            stub, object(), "005930", [old, tomorrow], venue="KRX", sessions=_krx_sessions(),
             store=store, run_id="tape-2020-01-04-skip", profile=profile, on_result=out.append,
-            needed=[(old, "regular"), (today, "krx_aftermarket")],
+            needed=[(old, "regular"), (tomorrow, "krx_aftermarket")],
         )
     )
-    assert (today, "krx_aftermarket") in res.skipped_unclosed
+    assert (tomorrow, "krx_aftermarket") in res.skipped_unclosed
     assert {(r.day, r.session) for r in out} == {(old, "regular")}
-    assert today not in res.unresolved_days
+    assert tomorrow not in res.unresolved_days
 
 
 def test_normal_day_single_session_matches_legacy_shape(tmp_path) -> None:
@@ -788,7 +790,9 @@ def test_explicit_needed_does_not_require_days(tmp_path) -> None:
 
 
 def test_empty_or_unclosed_request_never_calls_vendor(tmp_path) -> None:
-    today = datetime.now(_SEOUL).date().isoformat()
+    from datetime import timedelta
+
+    tomorrow = (datetime.now(_SEOUL).date() + timedelta(days=1)).isoformat()
 
     class Unavailable:
         async def walk_tick_tape(self, *args: Any, **kwargs: Any) -> Any:
@@ -796,7 +800,7 @@ def test_empty_or_unclosed_request_never_calls_vendor(tmp_path) -> None:
 
     for sessions, needed, skipped in (
         ([], [], ()),
-        (_krx_sessions(), [(today, "krx_aftermarket")], ((today, "krx_aftermarket"),)),
+        (_krx_sessions(), [(tomorrow, "krx_aftermarket")], ((tomorrow, "krx_aftermarket"),)),
         ([], [(_DAY, "regular")], ()),
     ):
         out: list[TapeDayResult] = []

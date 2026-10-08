@@ -598,6 +598,8 @@ def read_tape_attempts(path: Path) -> dict[tuple[str, str, str], TapeAttemptHist
         for index, (status, _reason, run_date) in enumerate(reversed(records)):
             if status in SETTLED_TAPE_STATUSES:
                 break
+            if run_date and run_date == key[1]:
+                continue
             marker = run_date if run_date else f"#legacy-{len(records) - 1 - index}"
             seen_dates.add(marker)
         history[key] = TapeAttemptHistory(
