@@ -59,7 +59,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ranker-train-start", default=None, help="widen the ranker training window to this YYYY-MM-DD start; augments training only and never moves the certification boundary (default: the certification regime start)")
     parser.add_argument("--exit-grid-revalidation", action="store_true", help="re-validate the TP5%%+MOC next-day exit-timing lever (src/ml/exit_policy.py) under the certified ranker's own CPCV(8,2) OOF pipeline and real PIT cost, without touching run_topk_ranker_backtest itself")
     parser.add_argument("--pit-certification", action="store_true", help="re-score the certified CPCV fold models on the decision-time (15:20) panel and write the pit_haircut report next to the live bundle")
-    parser.add_argument("--pit-panel-dir", default=str(settings.HISTORY_DIR), help="directory holding the Part 2 decision-time panel files (pit1520_panel.parquet, pit1520_panel_days.parquet)")
+    parser.add_argument("--pit-panel-dir", default=str(settings.HISTORY_DIR), help="directory holding decision-time panel files (pit1520_panel.parquet, pit1520_panel_days.parquet)")
     parser.add_argument("--recon-certification", action="store_true", help="run the exact arm, the reconstructed arm and the bound reconstruction certificate (operator-run, not scheduled)")
     parser.add_argument("--recon-panel-dir", default=None, help="directory holding the reconstructed decision-time panel files")
     parser.add_argument("--decomposition-config", default=None, help="fitted decomposition config (default settings.HISTORY_DIR/nxt_decomposition_config.json)")

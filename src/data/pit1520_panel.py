@@ -142,7 +142,7 @@ _PROVENANCE_KEYS: frozenset[str] = frozenset({
     "start",
     "end",
 })
-# Part 1 basis-gate verdict marking a symbol-day as consolidated tape.
+# Basis-gate verdict marking a symbol-day as consolidated tape.
 _KNOWN_CONSOLIDATED_REASON: str = "toss_consolidated_tape"
 
 _BAR_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -269,7 +269,7 @@ class Pit1520PanelConfig:
             pre-open off-hours print (at the previous close) into the first minute of a gap day.
         live_available_by_hhmmss: A live decision input qualifies only if completed at or before T at this time.
         reconstruct_consolidated: Reconstruct KRX-only bars for superset symbol-days with no exact bars but
-            with `regular_consolidated` bars (Part 2 estimator). Off by default; the production panel is
+            with `regular_consolidated` bars (volume decomposition estimator). Off by default; the production panel is
             unchanged until the adoption gate passes.
         decomposition_config_path: Fitted decomposition config location (informational; the builder takes
             the loaded config object, the CLI resolves this path through settings).
@@ -852,10 +852,10 @@ def build_pit1520_panel(
         source_policy: PREFER_LIVE (production) or BARS_ONLY (validation of the bar path on live days).
         consolidated_loader: Returns one date's consolidated-tape 1m bars; required only when
             config.reconstruct_consolidated is set.
-        decomposition_config: Fitted Part 2 estimator; required only when config.reconstruct_consolidated
+        decomposition_config: Fitted decomposition estimator; required only when config.reconstruct_consolidated
             is set. With the flag off the panel carries PIT1520_PANEL_COLUMNS exactly; with the flag on
             it carries PIT1520_RECON_COLUMNS (basis provenance plus calibrated error quantiles).
-        consolidated_symbol_days: (date, symbol) pairs the Part 1 ledger verdicts as consolidated tape;
+        consolidated_symbol_days: (date, symbol) pairs the tape basis ledger verdicts as consolidated tape;
             only those may attribute `consolidated_missing`.
 
     Returns:
@@ -1100,7 +1100,7 @@ def default_decomposition_config_path() -> Path:
 
 
 def default_toss_ledger_path() -> Path:
-    """Toss backfill ledger location holding the Part 1 consolidated-tape verdicts."""
+    """Toss backfill ledger location holding consolidated-tape verdicts."""
     from src import settings
 
     return Path(settings.HISTORY_DIR) / "intraday" / "backfill_ledger" / _TOSS_LEDGER_FILENAME
@@ -1244,7 +1244,7 @@ def load_consolidated_bars(snapshot_date: str, *, config: Pit1520PanelConfig = P
 
 
 def known_consolidated_symbol_days(ledger_path: Path | str | None = None) -> frozenset[tuple[str, str]]:
-    """Symbol-days the Toss ledger verdicts as consolidated tape (the Part 1 basis gate).
+    """Symbol-days the Toss ledger verdicts as consolidated tape.
 
     Tolerant reader for panel wiring: a missing or unreadable ledger means no symbol-day is claimed
     consolidated, so `consolidated_missing` never fires and attribution stays `not_fetched`.
@@ -1570,7 +1570,7 @@ def main(argv: list[str] | None = None) -> None:
         --end YYYY-MM-DD (default: latest price_history date)
         --source-policy {prefer_live,bars_only} (default prefer_live)
         --exclude-bar-vendor VENDOR (repeatable; drops that vendor's bar symbol-days as vendor_excluded)
-        --reconstruct-consolidated (rebuild KRX-only bars for consolidated symbol-days via Part 2)
+        --reconstruct-consolidated (rebuild KRX-only bars for consolidated symbol-days via decomposition)
         --decomposition-config PATH (fitted config; default settings.HISTORY_DIR/nxt_decomposition_config.json)
         --out-dir PATH (default settings.HISTORY_DIR)
     """

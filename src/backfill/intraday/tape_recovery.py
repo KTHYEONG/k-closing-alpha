@@ -565,7 +565,7 @@ def _legacy_run_date(run_id: str) -> str:
 
 
 def read_tape_attempts(path: Path) -> dict[tuple[str, str, str], TapeAttemptHistory]:
-    """Per (symbol, day, session): count of consecutive trailing non-settled records on distinct `run_date`s and the latest reason/status. Legacy UNKNOWN records without a reason are interpreted as reason `day_not_on_tape` (the only UNKNOWN producer when the venue is certified; the share guard in `terminalize_unrecoverable` protects against venue-wide misconfiguration). Legacy PARTIAL records without a reason stay retryable. Raises RuntimeError when the ledger exists but is unreadable."""
+    """Return consecutive trailing non-settled attempt history per (symbol, day, session)."""
     try:
         if not path.exists():
             return {}
@@ -619,7 +619,7 @@ def terminalize_unrecoverable(
     run_id: str,
     run_date: str,
 ) -> tuple[tuple[str, str, str], ...]:
-    """Appends one `UNRECOVERABLE` ledger record (with reason, attempts, run_id, run_date) per key whose history decides UNRECOVERABLE, unless the terminal share of `attempted` exceeds `max_share`, in which case nothing is written and a warning `[DATA] stage=tape_sweep status=TERMINALIZE_BLOCKED` is logged. Returns the keys terminalized."""
+    """Append UNRECOVERABLE ledger records subject to terminal share safety bound."""
     ordered = list(keys)
     candidates = [
         key

@@ -1451,7 +1451,7 @@ def main_recon_certification_run(
 
 
 # ---------------------------------------------------------------------------
-# NXT reconstruction three-arm certification (Part 3)
+# NXT reconstruction three-arm certification
 # ---------------------------------------------------------------------------
 
 
