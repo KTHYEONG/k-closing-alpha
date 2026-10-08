@@ -62,8 +62,7 @@ _RESEARCH_DEGRADED_CLASSES: frozenset[str] = frozenset(
     {
         "intraday:regular_ticks:volume_gap",
         "intraday:regular_ticks:certified_gap",
-        # Same-evening aftermarket tick shortfalls are recovered by the next sweep (session closes at the day boundary);
-        # unrecovered ones resurface through tape expiry warnings.
+        # Aftermarket tick mismatches stay advisory; unrecovered ones surface through sweep residual and expiry signals.
         "intraday:krx_aftermarket_ticks:volume_mismatch",
         "intraday:nxt_aftermarket_ticks:volume_mismatch",
     }
