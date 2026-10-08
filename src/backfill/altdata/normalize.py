@@ -67,11 +67,7 @@ def normalize_panel(df: pd.DataFrame, panel: str, cfg: AltDataFetchConfig) -> pd
             work[c] = pd.to_numeric(work[c], errors="coerce")
         # Drop rows with NaT date or blank symbol
         work = work.dropna(subset=["date"])
-        # Blank symbol after zfill would be "000000" if originally "" -> treat as blank
-        # Original blank "" becomes "000000" after zfill(6)?? Actually "".zfill(6)=="000000"
-        # So we need to detect original blank before zfill? But spec says drop blank symbol.
-        # We consider "000000" as blank if originally empty.
-        # Instead we drop where symbol is "000000" or "" or "nan"
+        # Filter out blank, placeholder ('000000'), or invalid symbols.
         work = work[work["symbol"] != "000000"]
         work = work[work["symbol"].str.strip() != ""]
         work = work[work["symbol"].str.lower() != "nan"]

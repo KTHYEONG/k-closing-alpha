@@ -1,4 +1,4 @@
-"""NXT reconstruction settings defaults and fail-closed validation (Part 3)."""
+"""NXT reconstruction settings defaults and fail-closed validation."""
 
 from __future__ import annotations
 

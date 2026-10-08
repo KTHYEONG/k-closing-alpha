@@ -1,4 +1,4 @@
-"""Invariant guards for NXT consolidated-tape calibration pairs (Part 1)."""
+"""Invariant guards for NXT consolidated-tape calibration pairs."""
 
 from __future__ import annotations
 

@@ -50,11 +50,7 @@ def fit_chrono_calibrator(
     if np.unique(y_fit).size < 2 or int(np.min(np.bincount(y_fit))) < 3:
         return float(np.mean(y_fit))
     if calib_idx.size < _MIN_CALIB_ROWS:
-        # still train base and return raw scores? But spec says return bare float prior when fit slice degenerate OR calib slice small. Actually when calib <5 return raw? For fit_chrono_calibrator we return Platt? Let's follow spec: returns float prior when fit slice has <2 classes or calib <5 or calib <2 classes.
-        # But for fit_chrono_calibrator spec: fail-closed float when calib <5 or <2 classes. For small calib we return prior? Let's interpret: if calib <5 -> float prior? Wait spec says: Returns bare float prior when fit slice has <2 classes or minority count <3, or calib slice has <5 rows or <2 classes.
-        # So if calib small we return float prior, not raw score.
-        # However legacy _fit_predict_calibrated returns raw score when calib small. But spec explicitly says float prior for calib <5.
-        # We'll follow spec.
+        # Return float prior when calibration slice is too small to fit safely.
         return float(np.mean(y_fit))
     y_calib = y[calib_idx]
     if np.unique(y_calib).size < 2:
