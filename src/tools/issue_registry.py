@@ -62,6 +62,10 @@ _RESEARCH_DEGRADED_CLASSES: frozenset[str] = frozenset(
     {
         "intraday:regular_ticks:volume_gap",
         "intraday:regular_ticks:certified_gap",
+        # Same-evening aftermarket tick shortfalls are recovered by the next sweep (session closes at the day boundary);
+        # unrecovered ones resurface through tape expiry warnings.
+        "intraday:krx_aftermarket_ticks:volume_mismatch",
+        "intraday:nxt_aftermarket_ticks:volume_mismatch",
     }
 )
 
@@ -75,7 +79,7 @@ def issue_class(key: str) -> str:
 
 
 def classify_issue_tier(key: str) -> IssueTier:
-    """Map a stable issue key to its tier by explicit rule table. Unknown keys are DATA_INTEGRITY (fail loud): a new warning must be consciously downgraded in the rule table. `missing:<trading-chain step>` and `failed_unit:*` map to TRADING_CHAIN when the unit/step is part of the decision-to-fill chain, otherwise DATA_INTEGRITY. Only `intraday:regular_ticks:<n>:volume_gap` and `:certified_gap` are RESEARCH_DEGRADED."""
+    """Map a stable issue key to its tier by explicit rule table. Unknown keys are DATA_INTEGRITY (fail loud): a new warning must be consciously downgraded in the rule table. `missing:<trading-chain step>` and `failed_unit:*` map to TRADING_CHAIN when the unit/step is part of the decision-to-fill chain, otherwise DATA_INTEGRITY. Only regular tick `volume_gap`/`certified_gap` and aftermarket tick `volume_mismatch` are RESEARCH_DEGRADED."""
     cls = issue_class(key)
     if cls in _RESEARCH_DEGRADED_CLASSES:
         return IssueTier.RESEARCH_DEGRADED

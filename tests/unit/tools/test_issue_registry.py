@@ -13,6 +13,9 @@ def test_only_tick_gaps_are_research_degraded() -> None:
 
     assert classify_issue_tier("intraday:regular_ticks:2:volume_gap") is IssueTier.RESEARCH_DEGRADED
     assert classify_issue_tier("intraday:regular_ticks:2:certified_gap") is IssueTier.RESEARCH_DEGRADED
+    assert classify_issue_tier("intraday:krx_aftermarket_ticks:2:volume_mismatch") is IssueTier.RESEARCH_DEGRADED
+    assert classify_issue_tier("intraday:nxt_aftermarket_ticks:1:volume_mismatch") is IssueTier.RESEARCH_DEGRADED
+    assert classify_issue_tier("intraday:krx_aftermarket_ticks:1:missing_partition") is IssueTier.DATA_INTEGRITY
     assert classify_issue_tier("intraday:regular_ticks:2:missing_partition") is IssueTier.DATA_INTEGRITY
     assert classify_issue_tier("intraday:regular:3:missing_stamps") is IssueTier.DATA_INTEGRITY
 
