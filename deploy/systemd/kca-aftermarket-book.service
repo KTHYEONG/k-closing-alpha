@@ -12,5 +12,7 @@ Environment=TZ=Asia/Seoul
 Environment=KIS_DATA_ROLE=batch
 # 15:40 시작 → 20:20 하드 스톱 (정상 종료 ≈20:00)
 TimeoutStartSec=4h40min
+# 14-day max 15545.990s (or-vps, 2026-10-08); fixed-session exception: 16200s below the 4h40min kill timeout.
+X-ExpectedRuntimeSec=16200
 ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kca-aftermarket-book --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e BROKER_ADMISSION_CLASS=standard -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=batch ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.aftermarket_book
 ExecStopPost=-/usr/bin/docker rm -f kca-aftermarket-book

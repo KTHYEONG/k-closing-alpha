@@ -10,5 +10,7 @@ EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 # 실측 최대 6904초 → 3시간 (20:05 애프터마켓 적재 전에 종료)
 TimeoutStartSec=3h
+# 14-day max 4385.129s (or-vps, 2026-10-08); 1.5x rounded up to 5min -> 6600s.
+X-ExpectedRuntimeSec=6600
 ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kca-archive-intraday-regular --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e BROKER_ADMISSION_CLASS=standard -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.archive_intraday --phase regular
 ExecStopPost=-/usr/bin/docker rm -f kca-archive-intraday-regular

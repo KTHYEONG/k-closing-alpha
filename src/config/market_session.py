@@ -73,6 +73,10 @@ PRICE_INGEST_EVENING_HHMMSS: str = "213000"
 # 테이프 스윕(kca-tape-sweep.timer, 20:35 발화)은 이 시각 이후 새 Kiwoom 워크를 열지 않는다 — 21:30 가격 수집과
 # 겹치지 않도록 15분 여유를 둔다. TimeoutStartSec=3600이 20:35 발화 기준 외곽 안전판(21:35)으로 남는다.
 TAPE_SWEEP_DEADLINE_HHMMSS: str = "211500"
+# Kiwoom 틱 테이프의 관측 깊이(달력일 기준).
+KIWOOM_TAPE_DEPTH_DAYS: int = 30
+# 스윕 윈도우 경계 이전에 아직 미해결 needs를 만료 예정으로 보고하는 여유(일).
+TAPE_EXPIRY_WARNING_DAYS: int = 3
 NXT_AFTERMARKET_HOUR_FLOOR: str = "154000"
 NXT_AFTERMARKET_HOUR_CEIL: str = "200000"
 NXT_PREMARKET_HOUR_FLOOR: str = "080000"
