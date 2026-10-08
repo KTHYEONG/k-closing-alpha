@@ -804,8 +804,7 @@ def audit_aftermarket_ticks(
 ) -> tuple[str, ...]:
     """Audit same-day aftermarket tick partitions against the stored 1m bars of the same session.
 
-    The aftermarket session closes at the day boundary, so a shortfall is first recoverable by the next evening's
-    tape sweep; it still surfaces in the same evening's digest (advisory tier, escalating if it persists). Volume is compared per symbol over the whole session window, which is
+    A shortfall is recoverable by the same evening's sweep (20:35, before the 21:20 audit); a remaining mismatch means the sweep could not certify it and the next sweep retries. Volume is compared per symbol over the whole session window, which is
     independent of the bar labelling convention. KRX aftermarket bars are start-labelled, so the bar stamped at the session
     ceiling opens after the tick window closes; it is excluded via `BAR_VOLUME_CUTOFF_HMS`.
 

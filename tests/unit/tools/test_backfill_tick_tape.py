@@ -649,6 +649,9 @@ def test_collect_skips_unclosed_and_session_closed_units(tmp_path, monkeypatch) 
     assert tr._session_closed("2026-09-10", "regular", evening) is True
     assert tr._session_closed("2026-09-10", "krx_aftermarket", evening) is False
     assert tr._session_closed("2026-09-09", "krx_aftermarket", morning) is True
+    assert tr._session_closed("2026-09-10", "krx_aftermarket", datetime(2026, 9, 10, 20, 4, 59, tzinfo=_SEOUL)) is False
+    assert tr._session_closed("2026-09-10", "krx_aftermarket", datetime(2026, 9, 10, 20, 5, 0, tzinfo=_SEOUL)) is True
+    assert tr._session_closed("2026-09-10", "nxt_aftermarket", datetime(2026, 9, 10, 20, 5, 0, tzinfo=_SEOUL)) is True
 
 
 def test_ledger_helpers(tmp_path, monkeypatch) -> None:
@@ -1478,10 +1481,12 @@ def test_publisher_guard_names_symbol_day_session(tmp_path, monkeypatch) -> None
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
     profile = _profile(tmp_path)
-    today = datetime.now(_SEOUL).date().isoformat()
+    from datetime import timedelta
+
+    tomorrow = (datetime.now(_SEOUL).date() + timedelta(days=1)).isoformat()
     bad = TapeDayResult(
         symbol="005930",
-        day=today,
+        day=tomorrow,
         session="krx_aftermarket",
         frame=pd.DataFrame(),
         entry=CoverageEntry(
@@ -1502,7 +1507,7 @@ def test_publisher_guard_names_symbol_day_session(tmp_path, monkeypatch) -> None
     with pytest.raises(ValueError, match="not closed") as excinfo:
         pub.add(bad)
     message = str(excinfo.value)
-    assert "005930" in message and today in message and "krx_aftermarket" in message
+    assert "005930" in message and tomorrow in message and "krx_aftermarket" in message
 
 
 def test_run_walk_tasks_passes_pairs_and_survives_holiday_shape(tmp_path, monkeypatch) -> None:
@@ -1549,16 +1554,18 @@ def test_run_walk_tasks_wraps_unclosed_publication_with_task_index(tmp_path, mon
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
     profile = _profile(tmp_path)
-    today = datetime.now(_SEOUL).date().isoformat()
+    from datetime import timedelta
+
+    tomorrow = (datetime.now(_SEOUL).date() + timedelta(days=1)).isoformat()
 
     async def _emit_unclosed(client: Any, session: Any, symbol: str, days: Any, **kwargs: Any) -> Any:
         frame = normalize_tick_frame(
-            pd.DataFrame(_tick_rows(["090000"])), "kiwoom", today, symbol
+            pd.DataFrame(_tick_rows(["090000"])), "kiwoom", tomorrow, symbol
         )
         kwargs["on_result"](
             TapeDayResult(
                 symbol=symbol,
-                day=today,
+                day=tomorrow,
                 session="krx_aftermarket",
                 frame=frame,
                 entry=_complete_entry(symbol, "krx_aftermarket", len(frame)),
@@ -1570,9 +1577,9 @@ def test_run_walk_tasks_wraps_unclosed_publication_with_task_index(tmp_path, mon
     task = tr.WalkTask(
         symbol="005930",
         venue="KRX",
-        days=(today,),
+        days=(tomorrow,),
         sessions=tuple(s for s in TAPE_SESSIONS if s.venue == "KRX"),
-        pairs=((today, "krx_aftermarket"),),
+        pairs=((tomorrow, "krx_aftermarket"),),
     )
     with pytest.raises(ValueError, match="task=0"):
         asyncio.run(
@@ -1589,3 +1596,130 @@ def test_run_walk_tasks_wraps_unclosed_publication_with_task_index(tmp_path, mon
                 run_date="2026-10-05",
             )
         )
+
+
+def test_collect_includes_today_aftermarket_only_after_ready(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    day = "2026-10-02"
+    _seed_tick_day(day, "krx_aftermarket", "000660", _tick_rows(["170000"]), None)
+    monkeypatch.setattr(tr, "_day_universe", lambda d, s: ["005930", "000660"] if d == day else [])
+    monkeypatch.setattr(tr, "_is_trading_day", lambda d, ing: True)
+    monkeypatch.setattr(tr, "_now", lambda: datetime(2026, 10, 2, 20, 0, tzinfo=_SEOUL))
+    assert not [n for n in tr.collect_tape_needs([day], ["KRX"], store, {}, False) if n.session == "krx_aftermarket"]
+    monkeypatch.setattr(tr, "_now", lambda: datetime(2026, 10, 2, 20, 36, tzinfo=_SEOUL))
+    assert ("005930", day, "krx_aftermarket") in {(n.symbol, n.day, n.session) for n in tr.collect_tape_needs([day], ["KRX"], store, {}, False)}
+    assert not any(n.symbol == "000660" and n.session == "krx_aftermarket" for n in tr.collect_tape_needs([day], ["KRX"], store, {}, False))
+
+
+@pytest.mark.parametrize("explicit_needed", [False, True])
+def test_harvest_accepts_today_aftermarket_only_after_ready(tmp_path, monkeypatch, explicit_needed) -> None:
+    import datetime as _dt
+
+    import src.backfill.intraday.tape_harvest as th
+
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    day = "2026-10-02"
+    rows = [{"cntr_tm": f"{day.replace('-', '')}170000", "cur_prc": "10000", "trde_qty": "10"}]
+    real_dt = _dt.datetime
+
+    def _run_at(hour: int, minute: int) -> Any:
+        fixed = real_dt(2026, 10, 2, hour, minute, tzinfo=_SEOUL)
+
+        class _FakeDT(real_dt):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                return fixed.astimezone(tz) if tz is not None else fixed.replace(tzinfo=None)
+
+        monkeypatch.setattr(th, "datetime", _FakeDT)
+
+        class _Stub:
+            async def walk_tick_tape(self, *a: Any, **k: Any) -> Any:
+                for cb in (k.get("on_day_complete"),):
+                    if cb is not None:
+                        from src.api.kiwoom.client import TapeDayCertificate
+
+                        cb(day, rows, TapeDayCertificate(day=day, received=1, vendor_total=2, complete=True, basis="vendor_total"))
+                return {"termination_reason": "crossed_stop_day", "pages_fetched": 1, "certificates": []}
+
+        out: list[TapeDayResult] = []
+        res = asyncio.run(
+            th.harvest_symbol_tape(
+                _Stub(), object(), "005930", [day], venue="KRX",
+                sessions=tuple(s for s in th.TAPE_SESSIONS if s.session == "krx_aftermarket"),
+                store=store, run_id="tape-test", profile=profile, on_result=out.append,
+                needed=[(day, "krx_aftermarket")] if explicit_needed else None,
+            )
+        )
+        return out, res
+
+    out_early, res_early = _run_at(19, 59)
+    assert ((day, "krx_aftermarket") in res_early.skipped_unclosed) and not out_early
+    out_late, res_late = _run_at(20, 36)
+    assert res_late.skipped_unclosed == () and {(r.day, r.session) for r in out_late} == {(day, "krx_aftermarket")}
+    assert out_late[0].entry.reason.startswith("tape_complete:")
+
+
+@pytest.mark.parametrize(("empty", "include_regular"), [(False, False), (True, False), (True, True)])
+def test_incomplete_same_day_tape_stays_partial(tmp_path, monkeypatch, empty, include_regular) -> None:
+    import datetime as _dt
+
+    import src.backfill.intraday.tape_harvest as th
+
+    store = CaptureStore(tmp_path / "capture")
+    profile = _profile(tmp_path)
+    day = "2026-10-02"
+    _patch_roots(tmp_path, monkeypatch)
+    real_dt = _dt.datetime
+    fixed = real_dt(2026, 10, 2, 20, 36, tzinfo=_SEOUL)
+
+    class _FakeDT(real_dt):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return fixed.astimezone(tz) if tz is not None else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(th, "datetime", _FakeDT)
+
+    from src.api.kiwoom.client import TapeDayCertificate
+
+    class _MismatchStub:
+        async def walk_tick_tape(self, *a: Any, **k: Any) -> Any:
+            k["on_page"]({"stk_tic_chart_qry": []}, {}, fixed, fixed, 0, 0)
+            return {
+                "termination_reason": "tape_empty" if empty else "crossed_stop_day",
+                "pages_fetched": 1,
+                "certificates": [] if empty else [TapeDayCertificate(day=day, received=1, vendor_total=5, complete=False)],
+            }
+
+    out: list[TapeDayResult] = []
+    res = asyncio.run(
+        th.harvest_symbol_tape(
+            _MismatchStub(), object(), "005930", [day], venue="KRX",
+            sessions=tuple(s for s in th.TAPE_SESSIONS if s.venue == "KRX"),
+            store=store, run_id="tape-test", profile=profile, on_result=out.append,
+            needed=[(day, "krx_aftermarket"), (day, "regular")] if include_regular else [(day, "krx_aftermarket")],
+        )
+    )
+    assert res.skipped_unclosed == ()
+    assert out[0].session == "krx_aftermarket" and out[0].entry.status.value == "PARTIAL"
+    if include_regular:
+        assert len(out) == 2 and out[1].entry.status == CaptureStatus.NO_TRADES
+    else:
+        assert len(out) == 1
+    assert "tape_total_mismatch" in out[0].entry.reason
+    assert res.unresolved_days == (day,)
+    publisher = th.TickTapePublisher(store=store, profile=profile, flush_rows=100)
+    publisher.add(out[0])
+    assert publisher.flush().partitions_written == 0
+    assert not tick_partition_path(day, "krx_aftermarket").exists()
+    ledger = tmp_path / "ledger.jsonl"
+    tr._append_ledger(ledger, [{
+        "symbol": "005930", "day": day, "session": "krx_aftermarket",
+        "status": out[0].entry.status.value, "reason": out[0].entry.reason, "run_date": day,
+    }])
+    monkeypatch.setattr(tr, "_now", lambda: fixed.replace(day=3))
+    monkeypatch.setattr(tr, "_day_universe", lambda d, s: ["005930"])
+    monkeypatch.setattr(tr, "_is_trading_day", lambda d, ing: True)
+    needs = tr.collect_tape_needs([day], ["KRX"], store, tr.read_settled_ledger(ledger), False)
+    assert any(n.symbol == "005930" and n.session == "krx_aftermarket" for n in needs)

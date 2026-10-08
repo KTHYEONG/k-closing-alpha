@@ -515,3 +515,87 @@ def test_engine_has_no_cli_or_daily_dependency() -> None:
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=".")  # noqa: S603
     assert out.returncode == 0, out.stderr
     assert "no-tools" in out.stdout and "no-daily" in out.stdout
+
+
+def test_aftermarket_same_evening_close_rule() -> None:
+    from src.backfill.intraday.tape_harvest import is_session_closed
+
+    day = "2026-10-02"
+    assert is_session_closed(day, "krx_aftermarket", datetime(2026, 10, 2, 20, 4, 59, tzinfo=_SEOUL)) is False
+    assert is_session_closed(day, "nxt_aftermarket", datetime(2026, 10, 2, 20, 4, 59, tzinfo=_SEOUL)) is False
+    assert is_session_closed(day, "krx_aftermarket", datetime(2026, 10, 2, 20, 5, 0, tzinfo=_SEOUL)) is True
+    assert is_session_closed(day, "nxt_aftermarket", datetime(2026, 10, 2, 20, 5, 0, tzinfo=_SEOUL)) is True
+    assert is_session_closed("2026-10-01", "krx_aftermarket", datetime(2026, 10, 2, 8, 0, tzinfo=_SEOUL)) is True
+    assert is_session_closed("2026-10-04", "krx_aftermarket", datetime(2026, 10, 3, 23, 59, tzinfo=_SEOUL)) is False
+    assert is_session_closed("2026-10-04", "regular", datetime(2026, 10, 3, 23, 59, tzinfo=_SEOUL)) is False
+    assert is_session_closed(day, "regular", datetime(2026, 10, 2, 15, 39, 59, tzinfo=_SEOUL)) is False
+    assert is_session_closed(day, "regular", datetime(2026, 10, 2, 15, 40, 0, tzinfo=_SEOUL)) is True
+    assert is_session_closed(day, "nxt_aftermarket", datetime(2026, 10, 2, 11, 5, tzinfo=ZoneInfo("UTC"))) is True
+    assert is_session_closed(day, "future_aftermarket", datetime(2026, 10, 2, 20, 5, tzinfo=_SEOUL)) is True
+    with pytest.raises(ValueError, match="timezone-aware"):
+        is_session_closed(day, "krx_aftermarket", datetime(2026, 10, 2, 20, 5))
+
+
+def test_aftermarket_close_uses_single_shared_constant(monkeypatch) -> None:
+    import src.backfill.intraday.tape_harvest as th
+
+    monkeypatch.setattr(th, "ARCHIVE_AFTERMARKET_READY_HHMMSS", "201000")
+    assert th.is_session_closed("2026-10-02", "krx_aftermarket", datetime(2026, 10, 2, 20, 5, tzinfo=_SEOUL)) is False
+    assert th.is_session_closed("2026-10-02", "krx_aftermarket", datetime(2026, 10, 2, 20, 10, tzinfo=_SEOUL)) is True
+
+
+def test_same_day_attempts_never_terminalize(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    tr._append_ledger(
+        ledger,
+        [
+            {"symbol": "A", "day": "2026-10-02", "session": "krx_aftermarket", "status": "PARTIAL",
+             "reason": "tape_total_mismatch:received=1:total=2", "run_id": f"r{i}", "run_date": "2026-10-02"}
+            for i in range(3)
+        ],
+    )
+    history = tr.read_tape_attempts(ledger)
+    assert history[("A", "2026-10-02", "krx_aftermarket")].attempts == 0
+    assert history[("A", "2026-10-02", "krx_aftermarket")].latest_reason == "tape_total_mismatch:received=1:total=2"
+    assert history[("A", "2026-10-02", "krx_aftermarket")].latest_status == "PARTIAL"
+    before = ledger.read_bytes()
+    out = tr.terminalize_unrecoverable(
+        (("A", "2026-10-02", "krx_aftermarket"),), history=history, attempted=1, min_attempts=3,
+        max_share=1.0, ledger=ledger, run_id="tape-test", run_date="2026-10-02",
+    )
+    assert out == ()
+    assert ledger.read_bytes() == before
+
+
+def test_next_day_attempts_count_and_terminalize(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    tr._append_ledger(
+        ledger,
+        [
+            {"symbol": "A", "day": "2026-10-02", "session": "krx_aftermarket", "status": "PARTIAL",
+             "reason": "day_not_on_tape", "run_id": "r0", "run_date": "2026-10-02"},
+            *[
+                {"symbol": "A", "day": "2026-10-02", "session": "krx_aftermarket", "status": "UNKNOWN",
+                 "reason": "day_not_on_tape", "run_id": f"r{i}", "run_date": f"2026-10-{2 + i:02d}"}
+                for i in range(1, 4)
+            ],
+        ],
+    )
+    history = tr.read_tape_attempts(ledger)
+    assert history[("A", "2026-10-02", "krx_aftermarket")].attempts == 3
+    key = ("A", "2026-10-02", "krx_aftermarket")
+    assert tr.terminalize_unrecoverable(
+        (key,), history=history, attempted=1, min_attempts=3, max_share=1.0,
+        ledger=ledger, run_id="tape-test", run_date="2026-10-05",
+    ) == (key,)
+    assert tr.read_settled_ledger(ledger)[key] == tr.UNRECOVERABLE_STATUS
+
+
+def test_legacy_same_day_marker_excluded(tmp_path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    tr._append_ledger(
+        ledger,
+        [{"symbol": "A", "day": "2026-10-02", "session": "krx_aftermarket", "status": "UNKNOWN",
+          "run_id": "tape-2026-10-02-0001"}],
+    )
+    assert tr.read_tape_attempts(ledger)[("A", "2026-10-02", "krx_aftermarket")].attempts == 0
