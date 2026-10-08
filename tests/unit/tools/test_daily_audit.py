@@ -5284,3 +5284,26 @@ def test_p5_dispatched_digest_stamps_held_key(tmp_path) -> None:
     entry = json.loads(state_path.read_text(encoding="utf-8"))["open"][key]
     assert entry["first_seen"] == "2026-10-06T21:10:00+09:00"
     assert entry["last_notified"] == now.isoformat()
+
+
+def test_audit_sync_keeps_last_notified_when_holiday_digest_is_not_dispatched(tmp_path) -> None:
+    import json
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.tools import daily_audit
+
+    state_path = tmp_path / "alert_state.json"
+    first = datetime(2026, 10, 7, 21, 20, tzinfo=ZoneInfo("Asia/Seoul"))
+    holiday = datetime(2026, 10, 9, 21, 20, tzinfo=ZoneInfo("Asia/Seoul"))
+    issue = daily_audit.AuditIssue(key="failed_unit:kca-x", transient=True, text="x")
+    warning = daily_audit.AuditDigest(
+        subject="s", body="b", severity=daily_audit.DigestSeverity.WARNING, issues=(issue,)
+    )
+    skipped = daily_audit.AuditDigest(
+        subject="s", body="b", severity=daily_audit.DigestSeverity.HOLIDAY_SKIP, issues=(issue,)
+    )
+    daily_audit.sync_audit_alert_state_from_digest(warning, "2026-10-07", now=first, path=state_path)
+    daily_audit.sync_audit_alert_state_from_digest(skipped, "2026-10-09", now=holiday, path=state_path)
+    entry = json.loads(state_path.read_text(encoding="utf-8"))["open"]["failed_unit:kca-x"]
+    assert entry["last_notified"] == first.isoformat()
