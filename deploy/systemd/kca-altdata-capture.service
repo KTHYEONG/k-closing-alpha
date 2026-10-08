@@ -6,6 +6,8 @@ OnFailure=kca-alert@%n.service
 Type=oneshot
 # 실측 최대 245초 → 1800초 (기존 유지)
 TimeoutStartSec=1800
+# 14-day max 287.133s (or-vps, 2026-10-08); 1.5x rounded up to 5min -> 600s.
+X-ExpectedRuntimeSec=600
 WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 EnvironmentFile=%h/quant-secrets/kis-data.env
