@@ -15,6 +15,7 @@ from typing import Any, Literal
 from src.backfill.intraday import tape_recovery as tr
 from src.config import market_session as _session
 from src.config.collection import CollectionSettings
+from src.config.market_session import KIWOOM_TAPE_DEPTH_DAYS, TAPE_EXPIRY_WARNING_DAYS
 from src.data.capture_contracts import SEOUL
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
@@ -22,8 +23,6 @@ from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logg
 
 logger = logging.getLogger(__name__)
 
-_TAPE_DEPTH_DAYS = 30
-_EXPIRY_WARNING_DAYS = 3
 _STAGING_DIRNAME = "tape_sweep"
 
 
@@ -83,7 +82,7 @@ def _window_days(lookback_days: int, today: date) -> list[str]:
 
 
 def _scan_days(today: date) -> list[str]:
-    return [(today - timedelta(days=offset)).isoformat() for offset in range(_TAPE_DEPTH_DAYS - 1, -1, -1)]
+    return [(today - timedelta(days=offset)).isoformat() for offset in range(KIWOOM_TAPE_DEPTH_DAYS - 1, -1, -1)]
 
 
 def _need_key(symbol: str, day: str, session: str) -> str:
@@ -183,7 +182,7 @@ async def run_tick_tape_sweep(
     near_expiry = [
         item
         for item in active
-        if (today - date.fromisoformat(item.day)).days >= int(lookback_days) - _EXPIRY_WARNING_DAYS
+        if (today - date.fromisoformat(item.day)).days >= int(lookback_days) - TAPE_EXPIRY_WARNING_DAYS
     ]
     expiring = sorted({item.day for item in near_expiry})
     expiring_needs = len({(item.symbol, item.day) for item in near_expiry})

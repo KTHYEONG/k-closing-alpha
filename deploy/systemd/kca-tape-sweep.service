@@ -10,5 +10,7 @@ EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 # 일일 재검사(최대 25일분 needs) → 1시간 (archive·extended-backfill 슬롯과 겹치지 않는 20:35 발화)
 TimeoutStartSec=3600
+# 14-day max 1608.074s (or-vps, 2026-10-08); 1.5x rounded up to 5min -> 2700s.
+X-ExpectedRuntimeSec=2700
 ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kca-tape-sweep --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e BROKER_ADMISSION_CLASS=bulk -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.tick_tape_sweep
 ExecStopPost=-/usr/bin/docker rm -f kca-tape-sweep

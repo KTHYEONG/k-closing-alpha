@@ -9,5 +9,7 @@ EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 # 실측 최대 139초 → 2시간
 TimeoutStartSec=2h
+# 14-day max 164.795s (or-vps, 2026-10-08); max(1800s baseline, 1.5x rounded up to 5min with 5min floor).
+X-ExpectedRuntimeSec=1800
 ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kca-retrain --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --memory=6g --cpus=1.8 --memory-swap=8g --env-file %h/quant-secrets/k-closing-alpha.env -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.ml.retrain --train-ranker-bundle
 ExecStopPost=-/usr/bin/docker rm -f kca-retrain

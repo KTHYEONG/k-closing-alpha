@@ -12,7 +12,12 @@ from pydantic_settings import NoDecode
 
 from src.backfill.intraday.blackout import parse_blackout_windows
 from src.config._env import EnvSettings
-from src.config.market_session import NXT_AFTERMARKET_HOUR_CEIL, NXT_AFTERMARKET_HOUR_FLOOR, VERIFIED_CHART_ROUTES
+from src.config.market_session import (
+    KIWOOM_TAPE_DEPTH_DAYS,
+    NXT_AFTERMARKET_HOUR_CEIL,
+    NXT_AFTERMARKET_HOUR_FLOOR,
+    VERIFIED_CHART_ROUTES,
+)
 from src.data.capture_contracts import SessionClock
 
 
@@ -69,7 +74,7 @@ class CollectionSettings(EnvSettings):
         COLLECTION_TRANSPORT_BACKOFF_SECONDS: Delay before the first retry, doubled per retry, default 3.0.
         COLLECTION_TAPE_FLUSH_ROWS: Tape publisher row bound before a partition flush, default 2000000.
         COLLECTION_TAPE_MIN_FREE_GIB: Free-disk floor (GiB) below which tape jobs stop starting walks, default 25.
-        COLLECTION_TAPE_LOOKBACK_DAYS: Daily sweep re-check window in days, default 25 (below the ~30 day tape depth).
+        COLLECTION_TAPE_LOOKBACK_DAYS: Daily sweep re-check window in days, default 25 (below KIWOOM_TAPE_DEPTH_DAYS).
         COLLECTION_TAPE_MAX_PAGES: Page guard for one tape walk (history backfill/sweep), default 12000. A walk cannot
             seek, so reaching the oldest tape day of a heavy symbol needs ~22 days x its daily pages; same-day repair keeps
             COLLECTION_TICK_REPAIR_MAX_PAGES.
@@ -117,7 +122,7 @@ class CollectionSettings(EnvSettings):
     COLLECTION_TICK_RESUME_MARGIN_PAGES: int = Field(default=5, ge=0)
     COLLECTION_TAPE_FLUSH_ROWS: int = Field(default=2_000_000, gt=0)
     COLLECTION_TAPE_MIN_FREE_GIB: int = Field(default=25, gt=0)
-    COLLECTION_TAPE_LOOKBACK_DAYS: int = Field(default=25, gt=0, le=30)
+    COLLECTION_TAPE_LOOKBACK_DAYS: int = Field(default=25, gt=0, le=KIWOOM_TAPE_DEPTH_DAYS)
     COLLECTION_TAPE_UNRECOVERABLE_MIN_ATTEMPTS: int = Field(default=3, ge=2)
     COLLECTION_TAPE_TERMINALIZE_MAX_SHARE: float = Field(default=0.10, gt=0, le=1, allow_inf_nan=False)
     COLLECTION_TAPE_MAX_PAGES: int = Field(default=12000, ge=1000, le=30000)

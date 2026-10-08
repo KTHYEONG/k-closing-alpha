@@ -140,7 +140,10 @@ def _default_unit_dir() -> Path:
 
 
 def load_job_schedules(unit_dir: Path | None = None) -> tuple[JobSchedule, ...]:
-    """Build one JobSchedule per `kca-*.timer` in `unit_dir` (default: the repository's `deploy/systemd`). The service is the timer's `Unit=` or the same stem; `max_runtime` is the service's `TimeoutStartSec` when finite, else SENTINEL_DEFAULT_MAX_RUNTIME. Excludes `kca-alert@` templates. Raises ValueError on an unparsable timer, FileNotFoundError when a timer's service file is absent."""
+    """Load timer schedules with expected-runtime, timeout, or default runtime limits.
+
+    Raise ValueError for invalid schedules or runtimes and FileNotFoundError for absent services.
+    """
     directory = Path(unit_dir) if unit_dir is not None else _default_unit_dir()
     schedules: list[JobSchedule] = []
     for timer_path in sorted(directory.glob("kca-*.timer")):
@@ -159,11 +162,40 @@ def load_job_schedules(unit_dir: Path | None = None) -> tuple[JobSchedule, ...]:
         if not service_path.exists():
             raise FileNotFoundError(f"Service file absent for timer {timer_path.name}: {unit_name}")
         service_text = service_path.read_text(encoding="utf-8")
-        max_runtime = SENTINEL_DEFAULT_MAX_RUNTIME
+        timeout_raw: str | None = None
+        expected_raw: str | None = None
+        in_service = False
         for line in service_text.splitlines():
-            if line.strip().startswith("TimeoutStartSec="):
-                max_runtime = _parse_timeout_value(line.strip().split("=", 1)[1])
-                break
+            stripped = line.strip()
+            if stripped.startswith("["):
+                in_service = stripped == "[Service]"
+                continue
+            if not in_service:
+                continue
+            if stripped.startswith("TimeoutStartSec=") and timeout_raw is None:
+                timeout_raw = stripped.split("=", 1)[1]
+            elif stripped.startswith("X-ExpectedRuntimeSec=") and expected_raw is None:
+                expected_raw = stripped.split("=", 1)[1]
+        finite_timeout: timedelta | None = None
+        max_runtime = SENTINEL_DEFAULT_MAX_RUNTIME
+        if timeout_raw is not None and timeout_raw.strip() not in ("", "infinity"):
+            finite_timeout = _parse_timeout_value(timeout_raw)
+            max_runtime = finite_timeout
+        if expected_raw is not None:
+            raw = expected_raw.strip()
+            if re.fullmatch(r"[0-9]+", raw) is None:
+                raise ValueError(f"Unsupported X-ExpectedRuntimeSec in {service_path.name}: {expected_raw!r}")
+            try:
+                expected = timedelta(seconds=int(raw))
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Unsupported X-ExpectedRuntimeSec in {service_path.name}: {expected_raw!r}"
+                ) from exc
+            if expected < timedelta(seconds=60):
+                raise ValueError(f"Unsupported X-ExpectedRuntimeSec in {service_path.name}: {expected_raw!r}")
+            if finite_timeout is not None and expected > finite_timeout:
+                raise ValueError(f"Unsupported X-ExpectedRuntimeSec in {service_path.name}: {expected_raw!r}")
+            max_runtime = expected
         schedules.append(
             JobSchedule(unit=unit_name, timer=timer_path.name, slots=slots, max_runtime=max_runtime)
         )

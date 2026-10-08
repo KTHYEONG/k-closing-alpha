@@ -446,3 +446,147 @@ def test_empty_systemd_output_is_one_unavailable_issue(tmp_path) -> None:
         disk_fn=lambda: (50, 100),
     )
     assert [issue.key for issue in issues] == ["ops_measure_unavailable:units"]
+
+
+def _write_timer_service(tmp_path: Path, stem: str, service_body: str) -> None:
+    (tmp_path / f"{stem}.timer").write_text(
+        "OnCalendar=Mon..Fri 07:10:00 Asia/Seoul\nUnit=kca-x.service\n", encoding="utf-8"
+    )
+    (tmp_path / "kca-x.service").write_text(service_body, encoding="utf-8")
+
+
+def test_expected_runtime_preferred(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    from src.tools.ops_sentinel import load_job_schedules
+
+    _write_timer_service(
+        tmp_path,
+        "kca-a",
+        "[Service]\nType=oneshot\nTimeoutStartSec=3h\nX-ExpectedRuntimeSec=3300\n",
+    )
+    assert load_job_schedules(tmp_path)[0].max_runtime == timedelta(seconds=3300)
+
+
+def test_timeout_fallback_without_expected_key(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    from src.tools.ops_sentinel import load_job_schedules
+
+    _write_timer_service(tmp_path, "kca-a", "[Service]\nType=oneshot\nTimeoutStartSec=3h\n")
+    assert load_job_schedules(tmp_path)[0].max_runtime == timedelta(hours=3)
+
+
+def test_expected_above_timeout_rejected(tmp_path: Path) -> None:
+    from src.tools.ops_sentinel import load_job_schedules
+
+    _write_timer_service(
+        tmp_path,
+        "kca-a",
+        "[Service]\nType=oneshot\nTimeoutStartSec=3600\nX-ExpectedRuntimeSec=7200\n",
+    )
+    with pytest.raises(ValueError, match="kca-x"):
+        load_job_schedules(tmp_path)
+
+
+def test_expected_below_floor_rejected(tmp_path: Path) -> None:
+    from src.tools.ops_sentinel import load_job_schedules
+
+    _write_timer_service(
+        tmp_path,
+        "kca-a",
+        "[Service]\nType=oneshot\nTimeoutStartSec=3600\nX-ExpectedRuntimeSec=30\n",
+    )
+    with pytest.raises(ValueError, match="kca-x"):
+        load_job_schedules(tmp_path)
+
+
+@pytest.mark.parametrize("raw", ["55min", "", "0", "-60", "60.0", "\u00b2", "\uff16\uff10", "9" * 30, "9" * 5000])
+def test_non_integer_expected_rejected(tmp_path: Path, raw: str) -> None:
+    from src.tools.ops_sentinel import load_job_schedules
+
+    _write_timer_service(
+        tmp_path,
+        "kca-a",
+        f"[Service]\nType=oneshot\nTimeoutStartSec=3600\nX-ExpectedRuntimeSec={raw}\n",
+    )
+    with pytest.raises(ValueError, match="kca-x"):
+        load_job_schedules(tmp_path)
+
+
+@pytest.mark.parametrize("timeout", ["", "TimeoutStartSec=infinity\n", "TimeoutStartSec=60\n"])
+def test_expected_runtime_floor_and_optional_timeout(tmp_path: Path, timeout: str) -> None:
+    from src.tools.ops_sentinel import load_job_schedules
+
+    _write_timer_service(tmp_path, "kca-a", f"[Service]\n{timeout}X-ExpectedRuntimeSec=60\n")
+    assert load_job_schedules(tmp_path)[0].max_runtime == timedelta(seconds=60)
+
+
+def test_expected_runtime_ignored_outside_service(tmp_path: Path) -> None:
+    from src.tools.ops_sentinel import load_job_schedules
+
+    _write_timer_service(
+        tmp_path, "kca-a",
+        "[Unit]\nX-ExpectedRuntimeSec=bad\n[Service]\nTimeoutStartSec=3h\n[Install]\nX-ExpectedRuntimeSec=bad\n",
+    )
+    with (tmp_path / "kca-a.timer").open("a", encoding="utf-8") as timer:
+        timer.write("X-ExpectedRuntimeSec=bad\n")
+    assert load_job_schedules(tmp_path)[0].max_runtime == timedelta(hours=3)
+
+
+def test_repository_services_satisfy_expected_contract() -> None:
+    import re
+    from pathlib import Path as _Path
+
+    from src.tools.ops_sentinel import _parse_timeout_value, load_job_schedules
+
+    schedules = load_job_schedules()
+    by_unit = {s.unit: s for s in schedules}
+    fallback_units = (
+        "kca-backup.service",
+        "kca-backup-prune.service",
+        "kca-extended-backfill.service",
+        "kca-collect.service",
+        "kca-predict.service",
+        "kca-auction-open.service",
+        "kca-auction-close.service",
+        "kca-finalize-close.service",
+        "kca-paper-entry.service",
+        "kca-paper-exit.service",
+        "kca-kis-token-warmup.service",
+        "kca-kiwoom-token-rotate.service",
+        "kca-daily-audit.service",
+        "kca-audit-reconcile.service",
+    )
+    root = _Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    for unit in fallback_units:
+        text = (root / unit).read_text(encoding="utf-8")
+        assert "X-ExpectedRuntimeSec=" not in text, unit
+        raw = next(line for line in text.splitlines() if line.strip().startswith("TimeoutStartSec="))
+        assert by_unit[unit].max_runtime == _parse_timeout_value(raw.split("=", 1)[1])
+    expected_units = {
+        "kca-archive-intraday.service": 3300,
+        "kca-archive-intraday-regular.service": 6600,
+        "kca-tape-sweep.service": 2700,
+        "kca-price-ingest.service": 900,
+        "kca-altdata-capture.service": 600,
+        "kca-core-snapshot.service": 600,
+        "kca-offsite-verify.service": 900,
+        "kca-retrain.service": 1800,
+        "kca-aftermarket-book.service": 16200,
+    }
+    for unit, seconds in expected_units.items():
+        from datetime import timedelta as _td
+
+        assert by_unit[unit].max_runtime == _td(seconds=seconds), unit
+        assert re.search(f"X-ExpectedRuntimeSec={seconds}", (root / unit).read_text(encoding="utf-8"))
+
+
+def test_overrun_fires_at_expected_threshold() -> None:
+    from src.tools.ops_sentinel import JobVerdict, evaluate_job
+
+    schedule = _schedule(max_runtime=timedelta(seconds=3300))  # type: ignore[arg-type]
+    slot = _kst("2026-10-06", "20:05:00")
+    now = slot + timedelta(minutes=60)
+    state = _state(active="active", start=now - timedelta(minutes=60))
+    assert evaluate_job(schedule, state, now) == JobVerdict.OVERRUN  # type: ignore[arg-type]

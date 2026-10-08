@@ -1087,12 +1087,6 @@ def audit_regular_ticks(
     ).issues
 
 
-TAPE_DEPTH_DAYS: int = 30
-"""Observed Kiwoom tape depth in days; needs older than this can never be recovered."""
-
-TAPE_EXPIRY_WARNING_DAYS: int = 3
-"""Needs within this many days of tape expiry are surfaced as digest warnings."""
-
 TAPE_REPORT_MAX_AGE_DAYS: int = 4
 """A sweep report older than this (covers weekends and one holiday) is ignored by the digest."""
 
@@ -1114,7 +1108,7 @@ def audit_tape_sweep(
     """Surface tape-sweep expiry and disk-guard states from the last sweep report.
 
     The sweep already computed the needs against the stored partitions and the settled ledger, so the audit only reads
-    its report: recomputing 30 days of needs here would rescan every partition inside a unit that must stay fast.
+    its report: recomputing KIWOOM_TAPE_DEPTH_DAYS of needs here would rescan every partition inside a unit that must stay fast.
 
     Args:
         trading_date: Audited KST date (checked on STANDARD days).
@@ -1123,8 +1117,8 @@ def audit_tape_sweep(
             (older than TAPE_REPORT_MAX_AGE_DAYS) report yields no issues, since no sweep has judged the window yet.
 
     Returns:
-        `intraday:tape_expiring:<n>:expiring_need` when n symbol-days are within TAPE_EXPIRY_WARNING_DAYS of tape
-        expiry, plus `intraday:tape_sweep:1:disk_guard` when the sweep stopped on low disk.
+        `intraday:tape_expiring:<n>:expiring_need` when n symbol-days are within TAPE_EXPIRY_WARNING_DAYS
+        (market_session) of tape expiry, plus `intraday:tape_sweep:1:disk_guard` when the sweep stopped on low disk.
     """
     resolved = profile if profile is not None else CollectionSettings()
     data = dict(report) if report is not None else _read_tape_sweep_report(_capture_root(resolved))
