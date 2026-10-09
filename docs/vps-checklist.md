@@ -382,6 +382,7 @@ ssh or-vps 'stat -c "%a %U %n" ~/quant-secrets/*.env ~/.cache/kis; ls ~/.cache/k
   Report the *cause*, whether it is fixed in the deployed commit, and when the state will clear.
 - **Audit/backup race (fixed 2026-10-05).** `last_run.json` is written at the end; an audit during the 22:15–00:00 run used to read
   `offsite_backup:stale`. Now `running` is informational and `interrupted` is the warning.
+- **Holiday D-mode.** When `D` is a weekday holiday, the data/research probes (DI-ARCH, DI-1M, DI-TOPK, DI-PAPER, RS-07, RS-09) report FAIL/WARN by construction because nothing is produced; run them with `D` = the previous trading day and mark today's rows SKIP (reason: holiday). Verify instead that every unit recorded `SKIPPED non_trading_day`, that the audit heartbeat is `HOLIDAY_SKIP` for `D`, and that the tape sweep recovered the previous day's gaps.
 - **Holiday handling.** Weekday timers fire on holidays; units must `SKIP`/record `SKIPPED`. The tape sweep used to treat days after the newest
   `price_history` date as trading days and crash on holidays (fixed 2026-10-05) — a repeat means the calendar helper regressed.
 - **UTC vs KST.** `journalctl --since "2026-10-05 20:53"` on the host means 20:53 UTC. Convert.
