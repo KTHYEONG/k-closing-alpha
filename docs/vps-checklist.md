@@ -40,7 +40,7 @@ Pick the mode from the clock and the request; do not run heavier modes than the 
 | **E — Event** | after a deploy, an alert, an incident, or an operator question | affected areas + §2 context + D probes | light–medium |
 
 Periodic chat reporting is optional. The tick and the watchdog are independent of any session: absence of a chat
-report never implies the host stopped. Each run saves its report (§15) and compares with the previous one.
+report never implies the host stopped.
 
 ## 1. Rules of Engagement
 
@@ -90,7 +90,6 @@ EOF'
   or today after 23:00. Also note `D-1` (paper exit of `D-1` lots happens on `D`).
 - SSH failure is a P0 finding (retry once after 30 s, then report; the watchdog may also be firing).
 - Uptime shorter than the last check interval = a reboot; `Persistent=true` timers catch up, others may have been skipped.
-- Load the previous report (§15). If absent, say "no baseline" and treat trends as unknown, not as stable.
 
 ## 3. Check Catalog Conventions
 
@@ -235,7 +234,7 @@ Additional manual checks (sample, then escalate if wrong):
 
 - [ ] **DI-MAN-01** pick 2 symbols from `D`'s top-k and 1 random symbol: archive close, price_history `close_raw`, 1m last bar and
       `paper/fills` entry price all agree (entry == confirmed close; exit of `D-1` lots == `D` open-auction price).
-- [ ] **DI-MAN-02** `quarantine/` entries new since the last report (each is a rejected anomaly); no synthetic/test symbols or
+- [ ] **DI-MAN-02** `quarantine/` entries (each is a rejected anomaly); no synthetic/test symbols or
       cohort IDs in live stores (`2026-09-22-test-fixture-cohort` is a known historical entry — report as hygiene, not new).
 - [ ] **DI-MAN-03** capture manifests for `D` (`data/history/capture/manifests/<D>`): list collectors with `missing_entries`,
       `quota_exceeded`, `empty`.
@@ -394,22 +393,21 @@ ssh or-vps 'stat -c "%a %U %n" ~/quant-secrets/*.env ~/.cache/kis; ls ~/.cache/k
 - **Checklist drift.** When a timer/unit/data path is added, removed or renamed, update §4/§5 and Appendix A in the same change; the live
   schedule command in §4 and the probes are the authority, the tables are a convenience.
 
-## 15. Report Format and Persistence
+## 15. Report Format
 
-Write in Korean (keys/badges English). Save the full report as `scratch/vps_reports/<YYYY-MM-DD>-<mode>.md` plus a machine block
-`scratch/vps_reports/<YYYY-MM-DD>-<mode>.json`; the next run loads the newest JSON for deltas.
+Write in Korean (keys/badges English). The report is delivered in chat only; do not save report files.
 
 ```
-## VPS Audit — D=<D> (<mode>, checked <KST timestamp>, previous: <date or none>)
+## VPS Audit — D=<D> (<mode>, checked <KST timestamp>)
 Overall: PASS | WARN | FAIL            Next check due: <KST>
 
-| Area | Status | Evidence (1 line, with delta vs previous) |
+| Area | Status | Evidence (1 line) |
 |---|---|---|
 | Context (day kind, uptime) | | |
 | Deploy / scheduler parity | | |
 | Critical windows (07:05 · 09:01 · 15:20–15:35 · 20:35 · 22:15) | | |
 | Run evidence / outcomes | | |
-| Host resources | | disk 21% (150G free, −0.3 pt/day) |
+| Host resources | | disk 21% (150G free) |
 | Data integrity L1–L4 (probe CHECK lines) | | n PASS / n WARN / n FAIL |
 | Paper ledger | | |
 | Models / research data | | |
@@ -420,7 +418,7 @@ Overall: PASS | WARN | FAIL            Next check due: <KST>
 ### Findings (severity-ordered)
 - [P0|P1|P2] <ID> <title> — 근거: <command + key output>, 영향: <what breaks / since when>, 상태: <new | continuing since <date> | resolved>, 제안: <owner/next diagnostic>
 
-### Resolved since last report / Known and unchanged
+### Resolved this check / Known and unchanged
 ### NOT VERIFIED (what, why)
 ```
 
@@ -441,7 +439,7 @@ for p in data research; do ssh or-vps 'cd ~/k-closing-alpha && TZ=Asia/Seoul nic
 
 Output is `CHECK <ID> <PASS|WARN|FAIL> <detail>`. Baselines observed on 2026-10-02: archive 455 rows,
 price_history 2,766 rows/day, 1m `ls` 377 k bars/990 symbols, volume ratio median 0.960, 3 top-k rows, nav conservation 0.00.
-Probe behavior (track deltas, do not re-open as new): `RS-01` measures panel lag in trading days against a per-panel
+Probe behavior (known standing condition, do not re-open as new): `RS-01` measures panel lag in trading days against a per-panel
 allowance table (`credit_balance` observed T+3 trading days → allow 4); `RS-05` WARNs only for `*.pre_*` files older
 than 7 days (message: delete after offsite verify); `RS-06` quarantine entries are INFO (PASS with manifest detail) when
 each carries a `moves-*.json` manifest, WARN otherwise; `RS-08` reads report fields `unrecoverable`,
