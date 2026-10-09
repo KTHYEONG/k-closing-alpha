@@ -12,5 +12,6 @@ Environment=TZ=Asia/Seoul
 Environment=BROKER_ADMISSION_CLASS=standard
 # 실측 최대 75초 → 30분
 TimeoutStartSec=30min
-ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts %h/.cache/kis
+# prune may delete directories during the recursive chown; a vanished path must not fail the unit
+ExecStartPre=-/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts %h/.cache/kis
 ExecStart=/usr/bin/flock -w 600 %t/kca-audit.lock %h/.local/bin/uv run python -m src.tools.daily_audit

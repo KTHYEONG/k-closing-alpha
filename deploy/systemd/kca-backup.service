@@ -11,5 +11,6 @@ EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 # 공유 Drive 락(krx-host-backup 대기 상한 7200초) 안에 끝나도록 3시간 백스톱 — 내부 예산 150분보다 길다
 TimeoutStartSec=3h
-ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts
+# prune may delete directories during the recursive chown; a vanished path must not fail the unit
+ExecStartPre=-/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data %h/k-closing-alpha/artifacts
 ExecStart=/usr/bin/flock -w 7200 %t/quant-gdrive.lock %h/.local/bin/uv run python -m src.tools.offsite_backup

@@ -717,11 +717,11 @@ def test_daily_audit_and_backup_normalize_ownership_before_reading_container_wri
         # 없다 -- 실측: 컨테이너 안엔 systemctl이 없어 실패유닛 점검이
         # "<systemctl unavailable: FileNotFoundError>"로 조용히 무력화됐다.
         "kca-daily-audit.service": (
-            "ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu "
+            "ExecStartPre=-/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu "
             "%h/k-closing-alpha/data %h/k-closing-alpha/artifacts %h/.cache/kis"
         ),
         "kca-backup.service": (
-            "ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu "
+            "ExecStartPre=-/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu "
             "%h/k-closing-alpha/data %h/k-closing-alpha/artifacts"
         ),
     }

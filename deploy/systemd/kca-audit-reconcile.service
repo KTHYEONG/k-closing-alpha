@@ -14,5 +14,6 @@ Environment=BROKER_ADMISSION_CLASS=standard
 TimeoutStartSec=9min
 SuccessExitStatus=75
 # Only the paths a tick reads or writes: a full data/ walk (~1M inodes) every 10 minutes would load the host in trading hours.
-ExecStartPre=/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data/logs %h/k-closing-alpha/data/history/capture/offsite %h/.cache/kis
+# prune may delete directories during the recursive chown; a vanished path must not fail the unit
+ExecStartPre=-/usr/bin/sudo /usr/bin/chown -R ubuntu:ubuntu %h/k-closing-alpha/data/logs %h/k-closing-alpha/data/history/capture/offsite %h/.cache/kis
 ExecStart=/usr/bin/flock -w 30 -E 75 %t/kca-audit.lock %h/.local/bin/uv run python -m src.tools.audit_reconcile
