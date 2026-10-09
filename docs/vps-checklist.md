@@ -196,7 +196,7 @@ ssh or-vps 'df -h / ; df -i / | tail -1; free -h | sed -n 2p; docker system df; 
   journalctl --user --disk-usage; du -sh ~/k-closing-alpha/data/history/capture 2>/dev/null'   # du only outside blackout
 ```
 
-- [ ] **HOST-01** disk < 80 %, inodes < 80 %; record free GB and the change since the last report (capture grows daily; project
+- [ ] **HOST-01** disk < 80 %, inodes < 80 %; record free GB and its trend over the last few days (capture grows daily; project
       the days until 80 %).
 - [ ] **HOST-02** memory `available` > 2 GiB at rest (retrain uses `--memory=6g`; the host is shared).
 - [ ] **HOST-03** `Up` `kca-*` containers only inside a job window (else a hung unit). An `Exited` `kca-*` container is a leftover
