@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA order reconcile entry (Mon-Fri 15:30 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 15:30:40 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kca-order-reconcile-entry.service
+
+[Install]
+WantedBy=timers.target

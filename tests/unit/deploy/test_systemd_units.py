@@ -35,6 +35,10 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
         "kca-extended-backfill.service",
         "kca-aftermarket-book.service",
         "kca-tape-sweep.service",
+        "kca-order-entry.service",
+        "kca-order-exit.service",
+        "kca-order-reconcile-entry.service",
+        "kca-order-reconcile-exit.service",
     }
 
     for svc in sorted(root.glob("kca-*.service")):
@@ -160,7 +164,8 @@ def test_alert_template_service_and_critical_path_onfailure_hooks() -> None:
     assert "--unit %i" in template
 
     # And: 결정경로 5개 서비스 전부 OnFailure 훅 보유
-    for name in ("kca-collect", "kca-predict", "kca-finalize-close", "kca-paper-entry", "kca-paper-exit"):
+    for name in ("kca-collect", "kca-predict", "kca-finalize-close", "kca-paper-entry", "kca-paper-exit",
+                 "kca-order-entry", "kca-order-exit", "kca-order-reconcile-entry", "kca-order-reconcile-exit"):
         text = (root / f"{name}.service").read_text(encoding="utf-8")
         assert "OnFailure=kca-alert@%n.service" in text, name
 

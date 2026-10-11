@@ -53,6 +53,11 @@ RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
     RuntimeEnvKey(target="KIS_APP_SECRET", sources=("KIS_APP_SECRET",)),
     RuntimeEnvKey(target="KIS_ACCOUNT_ID", sources=("KIS_ACCOUNT_ID", "KIS_ACCOUNT_NO")),
     RuntimeEnvKey(target="KIS_HTS_ID", sources=("KIS_HTS_ID",)),
+    RuntimeEnvKey(target="KIS_ACCOUNT_PRODUCT_CODE", sources=("KIS_ACCOUNT_PRODUCT_CODE",), optional=True),
+    RuntimeEnvKey(target="KIS_MOCK_APP_KEY", sources=("KIS_MOCK_APP_KEY",), optional=True),
+    RuntimeEnvKey(target="KIS_MOCK_APP_SECRET", sources=("KIS_MOCK_APP_SECRET",), optional=True),
+    RuntimeEnvKey(target="KIS_MOCK_ACCOUNT_NO", sources=("KIS_MOCK_ACCOUNT_NO",), optional=True),
+    RuntimeEnvKey(target="KIS_LIVE_TRADING_CONFIRM", sources=("KIS_LIVE_TRADING_CONFIRM",), optional=True),
     RuntimeEnvKey(target="KIWOOM_APP_KEY", sources=("KIWOOM_APP_KEY", "KIWOM_APP_KEY")),
     RuntimeEnvKey(target="KIWOOM_SECRET_KEY", sources=("KIWOOM_SECRET_KEY", "KIWOM_SECRET_KEY")),
     RuntimeEnvKey(target="LS_APP_KEY", sources=("LS_APP_KEY",)),
@@ -86,6 +91,7 @@ RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
 #   COLLECTION_RESEARCH_SLOTS: 샤드와 겹치면 안 되고(코드 검증), krx 스냅샷(2)과 경매 시각이 같아 2도 제외.
 #   COLLECTION_ALTDATA_EXTRA_SLOTS: 21:35에는 krx가 REST를 쓰지 않으므로 2·3을 빌려 3키로 분산한다.
 VPS_SELECTORS: tuple[tuple[str, str], ...] = (
+    ("KIS_TRADING_ENV", "off"),
     ("KIS_DECISION_SHARD_SLOTS", "1,5"),
     ("COLLECTION_AUCTION_ENABLED", "true"),
     ("COLLECTION_ALTDATA_ENABLED", "true"),

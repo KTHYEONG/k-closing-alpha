@@ -45,8 +45,8 @@ def test_runtime_env_spec_excludes_legacy_data_single_key_fields() -> None:
     targets = [key.target for key in RUNTIME_ENV_SPEC]
     sources = [source for key in RUNTIME_ENV_SPEC for source in key.sources]
 
-    assert len(targets) == 16
-    assert len(set(targets)) == 16
+    assert len(targets) == 21
+    assert len(set(targets)) == 21
     for forbidden in ("KIS_DATA_APP_KEY", "KIS_DATA_APP_SECRET", "KIS_DATA_HTS_ID"):
         assert forbidden not in targets
         assert forbidden not in sources
@@ -58,8 +58,8 @@ def test_runtime_env_spec_excludes_shared_keypool_keys() -> None:
     targets = [key.target for key in RUNTIME_ENV_SPEC]
     sources = [source for key in RUNTIME_ENV_SPEC for source in key.sources]
 
-    assert len(targets) == 16
-    assert len(set(targets)) == 16
+    assert len(targets) == 21
+    assert len(set(targets)) == 21
     for forbidden in ("KIS_DATA_SLOTS", "KIS_HOST_DATA_SLOTS"):
         assert forbidden not in targets
         assert forbidden not in sources
@@ -705,3 +705,24 @@ def test_vps_selectors_omit_toss_backfill_flag() -> None:
     assert "COLLECTION_AFTERMARKET_BOOK_SLOTS" in names
     merged, _ = merge_remote_env("KIS_APP_KEY=abc\n", "FOREIGN_KEY=keepme\n")
     assert "FOREIGN_KEY=keepme" in merged
+
+
+def test_trading_selector_is_provisioned_as_off() -> None:
+    from src.tools.provision_env import RUNTIME_ENV_SPEC, VPS_SELECTORS
+
+    assert ("KIS_TRADING_ENV", "off") in VPS_SELECTORS
+    assert all(key.target != "KIS_TRADING_ENV" for key in RUNTIME_ENV_SPEC)
+
+
+def test_build_runtime_fragment_succeeds_without_mock_keys(tmp_path) -> None:
+    from src.tools.provision_env import build_runtime_fragment
+
+    source = tmp_path / ".quant.env"
+    source.write_text("\n".join(_full_source_lines(exclude={
+        "KIS_MOCK_APP_KEY", "KIS_MOCK_APP_SECRET", "KIS_MOCK_ACCOUNT_NO",
+        "KIS_ACCOUNT_PRODUCT_CODE", "KIS_LIVE_TRADING_CONFIRM",
+    })) + "\n", encoding="utf-8")
+
+    fragment = build_runtime_fragment(source)
+
+    assert "KIS_MOCK_" not in fragment

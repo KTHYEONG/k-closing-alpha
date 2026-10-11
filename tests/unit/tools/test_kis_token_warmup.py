@@ -374,3 +374,194 @@ def test_should_skip_warmup_only_on_closed() -> None:
     assert should_skip_warmup(day, session_day_fn=lambda _d: SessionDay(trading_date=day, kind=SessionKind.UNKNOWN, clock=None, provenance="test")) is False
     assert should_skip_warmup(day, session_day_fn=lambda _d: SessionDay(trading_date=day, kind=SessionKind.SHIFTED, clock=None, provenance="test")) is False
 
+
+def _trading_binding(*, env, app_key, base_url):
+    from src.api.kis.trading import TradingBinding
+
+    return TradingBinding(env=env, base_url=base_url, app_key=app_key, app_secret="trade-secret",
+                          account_no="12345678", product_code="01", hts_id="hts", rest_tps=1.0)
+
+
+def _install_trading_client_fake(monkeypatch, kis_token_warmup, tmp_path, *, day, urls):
+    import json
+    from pathlib import Path
+
+    from src import settings
+
+    monkeypatch.setattr(settings, "KIS_TOKEN_CACHE_DIR", tmp_path)
+
+    def _factory(binding, *, http_timeout_seconds):
+        class _FakeApi:
+            async def issue_daily_token(self, session):
+                from src.api.kis.key_pool import token_cache_path
+
+                urls.append(binding.base_url)
+                path = Path(token_cache_path(binding.app_key, tmp_path))
+                path.parent.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 - test fake cache write
+                path.write_text(json.dumps({  # noqa: ASYNC240 - test fake cache write
+                    "access_token": "tok", "expired_at": f"{day}T23:59:59+09:00",
+                    "app_key": binding.app_key, "issued_at": f"{day}T07:05:00+09:00",
+                }), encoding="utf-8")
+                return True
+
+        class _FakeClient:
+            def __init__(self):
+                self.api_client = _FakeApi()
+
+        return _FakeClient()
+
+    monkeypatch.setattr(kis_token_warmup, "KisTradingClient", _factory)
+
+
+def test_warmup_issues_mock_trading_token_on_mock_domain(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    from src.api.kis.trading import KIS_MOCK_HOST
+    from src.tools import kis_token_warmup
+
+    day = "2026-10-12"
+    env = _warmup_env_three_slots()
+    data_calls = _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day)
+    urls: list[str] = []
+    _install_trading_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day, urls=urls)
+    binding = _trading_binding(env="mock", app_key="mock-trade-key",
+                               base_url=f"https://{KIS_MOCK_HOST}:29443")
+    monkeypatch.setattr(kis_token_warmup, "resolve_trading_binding", lambda: binding)
+
+    class _Session:
+        pass
+
+    result = asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today=day))
+
+    assert "TRADING_MOCK" in result
+    assert result["TRADING_MOCK"] is True
+    assert urls == [f"https://{KIS_MOCK_HOST}:29443"]
+    assert KIS_MOCK_HOST in urls[0]
+    assert sorted(data_calls) == ["warm-key-1", "warm-key-2", "warm-primary"]
+
+
+def test_warmup_does_not_double_issue_live_trading_key(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    from src.tools import kis_token_warmup
+
+    day = "2026-10-12"
+    env = _warmup_env_three_slots()
+    data_calls = _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day)
+
+    def _boom(binding, **_kw):
+        raise AssertionError("live trading key must reuse the PRIMARY issuance")
+
+    monkeypatch.setattr(kis_token_warmup, "KisTradingClient", _boom)
+    binding = _trading_binding(env="live", app_key="warm-primary", base_url="https://openapi.koreainvestment.com:9443")
+    monkeypatch.setattr(kis_token_warmup, "resolve_trading_binding", lambda: binding)
+
+    class _Session:
+        pass
+
+    result = asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today=day))
+
+    assert "TRADING" not in result and "TRADING_MOCK" not in result
+    assert data_calls.count("warm-primary") == 1
+
+
+def test_warmup_unchanged_when_trading_is_off(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    from src.api.kis.trading import TradingDisabledError
+    from src.tools import kis_token_warmup
+
+    day = "2026-10-12"
+    env = _warmup_env_three_slots()
+    _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day)
+
+    def _disabled():
+        raise TradingDisabledError("KIS_TRADING_ENV is off")
+
+    monkeypatch.setattr(kis_token_warmup, "resolve_trading_binding", _disabled)
+    monkeypatch.setattr(kis_token_warmup, "KisTradingClient",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no trading client when off")))
+
+    class _Session:
+        pass
+
+    assert asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today=day)) == {
+        "DATA_1": True, "DATA_2": True, "PRIMARY": True}
+
+
+def test_warmup_misconfigured_trading_fails_without_leaking(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.api.kis.trading import TradingConfigError
+    from src.tools import kis_token_warmup
+
+    day = "2026-10-12"
+    env = _warmup_env_three_slots()
+    _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day)
+
+    def _misconfigured():
+        raise TradingConfigError("mock: KIS_MOCK_APP_SECRET must be non-blank")
+
+    monkeypatch.setattr(kis_token_warmup, "resolve_trading_binding", _misconfigured)
+
+    class _Session:
+        pass
+
+    with pytest.raises(RuntimeError, match="TRADING") as exc:
+        asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today=day))
+    assert "TradingConfigError" in str(exc.value)
+    assert "warm-sec-1" not in str(exc.value)
+    assert "warm-key-1" not in str(exc.value)
+
+
+def test_warmup_stale_trading_cache_joins_failure_list(monkeypatch, tmp_path) -> None:
+    import asyncio
+    import json
+    from pathlib import Path
+
+    import pytest
+
+    from src import settings
+    from src.api.kis.key_pool import kis_key_id
+    from src.api.kis.trading import KIS_MOCK_HOST
+    from src.tools import kis_token_warmup
+
+    day = "2026-10-12"
+    env = _warmup_env_three_slots()
+    _install_warmup_client_fake(monkeypatch, kis_token_warmup, tmp_path, day=day)
+    monkeypatch.setattr(settings, "KIS_TOKEN_CACHE_DIR", tmp_path)
+
+    def _factory(binding, *, http_timeout_seconds):
+        from src.api.kis.key_pool import token_cache_path
+
+        class _FakeApi:
+            async def issue_daily_token(self, session):
+                path = Path(token_cache_path(binding.app_key, tmp_path))
+                path.parent.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 - test fake cache write
+                path.write_text(json.dumps({  # noqa: ASYNC240 - test fake cache write
+                    "access_token": "tok", "expired_at": "2026-09-01T23:59:59+09:00",
+                    "app_key": binding.app_key, "issued_at": "2026-09-01T07:05:00+09:00",
+                }), encoding="utf-8")
+                return True
+
+        class _FakeClient:
+            def __init__(self):
+                self.api_client = _FakeApi()
+
+        return _FakeClient()
+
+    monkeypatch.setattr(kis_token_warmup, "KisTradingClient", _factory)
+    binding = _trading_binding(env="mock", app_key="mock-trade-key",
+                               base_url=f"https://{KIS_MOCK_HOST}:29443")
+    monkeypatch.setattr(kis_token_warmup, "resolve_trading_binding", lambda: binding)
+
+    class _Session:
+        pass
+
+    with pytest.raises(RuntimeError, match="TRADING_MOCK") as exc:
+        asyncio.run(kis_token_warmup.warmup_host_tokens(_Session(), env, today=day))
+    assert kis_key_id("mock-trade-key") in str(exc.value)
+    assert "mock-trade-key" not in str(exc.value)
+

@@ -26,6 +26,12 @@ from src.api.kis.key_pool import (
     resolve_host_issued_credentials,
     token_cache_path,
 )
+from src.api.kis.trading import (
+    KisTradingClient,
+    TradingConfigError,
+    TradingDisabledError,
+    resolve_trading_binding,
+)
 from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day
 from src.tools.run_outcome import RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
@@ -79,7 +85,9 @@ async def warmup_host_tokens(
     day = today or datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
     results: dict[str, bool] = {}
     failures: list[str] = []
+    issued_keys: set[str] = set()
     for cred in resolve_host_issued_credentials(env):
+        issued_keys.add(cred.app_key)
         key_id = kis_key_id(cred.app_key)
         try:
             token_file = token_cache_path(cred.app_key, settings.KIS_TOKEN_CACHE_DIR)
@@ -112,6 +120,41 @@ async def warmup_host_tokens(
             )
             results.pop(cred.slot, None)
             failures.append(f"{cred.slot}(key_id={key_id}, reason={reason})")
+    try:
+        binding = resolve_trading_binding()
+    except TradingDisabledError:
+        binding = None
+    except TradingConfigError as exc:
+        failures.append(f"TRADING(reason={type(exc).__name__})")
+        binding = None
+    if binding is not None and binding.app_key not in issued_keys:
+        slot = "TRADING_MOCK" if binding.env == "mock" else "TRADING"
+        key_id = kis_key_id(binding.app_key)
+        try:
+            trading_client = KisTradingClient(binding, http_timeout_seconds=settings.ORDER_HTTP_TIMEOUT_SECONDS)
+            issued = await trading_client.api_client.issue_daily_token(session)
+            results[slot] = issued
+            logger.info(
+                "[SYS] stage=kis_token_warmup slot=%s key_id=%s issued=%s",
+                slot,
+                key_id,
+                issued,
+            )
+            cached = read_token_issued_date(token_cache_path(binding.app_key, settings.KIS_TOKEN_CACHE_DIR))
+            if cached != day:
+                raise RuntimeError(
+                    f"token cache not refreshed slot={slot} key_id={key_id} cached={cached} expected={day}"
+                )
+        except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError) as exc:
+            reason = _warmup_failure_reason(exc)
+            logger.error(
+                "[SYS] stage=kis_token_warmup slot=%s key_id=%s status=FAILED reason=%s",
+                slot,
+                key_id,
+                reason,
+            )
+            results.pop(slot, None)
+            failures.append(f"{slot}(key_id={key_id}, reason={reason})")
     if failures:
         raise RuntimeError(f"kis_token_warmup failed slots: {'; '.join(failures)}")
     return results
