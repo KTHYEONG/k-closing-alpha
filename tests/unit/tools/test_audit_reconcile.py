@@ -1453,3 +1453,193 @@ def test_p5_unit_busy_reads_active_state(monkeypatch) -> None:
 
     monkeypatch.setattr(rec.subprocess, "run", _boom)
     assert rec._unit_busy("idle") is True
+
+
+def test_closed_snapshot_suppresses_stale_token(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, snapshot="2026-10-09", open_keys={})
+    sent: list = []
+    calls: list[str] = []
+    f, _t, b, o = _clean_fns()
+
+    def _tokens(snapshot: str):
+        calls.append(snapshot)
+        return ["PRIMARY"]
+
+    result = run_audit_reconcile(now=_now(), failed_units_fn=f, stale_tokens_fn=_tokens,
+                                 backup_issues_fn=b, outbox_fn=o,
+                                 dispatch_fn=lambda s, body: sent.append((s, body)) or {"webhook": True},
+                                 state_path=sp, heartbeat_path=hp,
+                                 snapshot_closed_fn=lambda _: True)
+    assert result.opened == ()
+    assert not [k for k in result.still_open if k.startswith("stale_kis_token:")]
+    assert calls == [] and sent == []
+
+
+def test_closed_snapshot_resolves_previously_open_token_key(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, snapshot="2026-10-09",
+                   open_keys={"stale_kis_token:PRIMARY": {"transient": True, "text": "KIS 토큰 누락: PRIMARY"}})
+    sent: list = []
+    f, _t, b, o = _clean_fns()
+    result = run_audit_reconcile(now=_now(), failed_units_fn=f,
+                                 stale_tokens_fn=lambda _s: (_ for _ in ()).throw(AssertionError("must not measure")),
+                                 backup_issues_fn=b, outbox_fn=o,
+                                 dispatch_fn=lambda s, body: sent.append((s, body)) or {"webhook": True},
+                                 state_path=sp, heartbeat_path=hp,
+                                 snapshot_closed_fn=lambda _: True)
+    assert "stale_kis_token:PRIMARY" in result.resolved
+    assert "stale_kis_token:PRIMARY" not in result.still_open
+    assert len(sent) == 1
+    assert "점검 정상화" in sent[0][0]
+    assert json.loads(sp.read_text(encoding="utf-8"))["open"] == {}
+    assert json.loads(hp.read_text(encoding="utf-8"))["open_issues"] == []
+
+
+def test_closed_snapshot_resolves_held_token_key_silently(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, snapshot="2026-10-09",
+                   open_keys={"stale_kis_token:PRIMARY": {"transient": True, "text": "KIS 토큰 누락: PRIMARY"}})
+    raw = json.loads(sp.read_text(encoding="utf-8"))
+    del raw["open"]["stale_kis_token:PRIMARY"]["last_notified"]
+    sp.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    sent: list = []
+    f, _t, b, o = _clean_fns()
+    result = run_audit_reconcile(now=_now(), failed_units_fn=f, stale_tokens_fn=lambda _s: ["PRIMARY"],
+                                 backup_issues_fn=b, outbox_fn=o,
+                                 dispatch_fn=lambda s, body: sent.append((s, body)) or {"webhook": True},
+                                 state_path=sp, heartbeat_path=hp,
+                                 snapshot_closed_fn=lambda _: True)
+    assert "stale_kis_token:PRIMARY" in result.resolved
+    assert "stale_kis_token:PRIMARY" not in result.still_open
+    assert sent == []
+    assert json.loads(sp.read_text(encoding="utf-8"))["open"] == {}
+
+
+def test_open_snapshot_still_flags_stale_token(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, snapshot="2026-10-09", open_keys={})
+    sent: list = []
+    f, _t, b, o = _clean_fns()
+    result = run_audit_reconcile(now=_now(), failed_units_fn=f, stale_tokens_fn=lambda _s: ["DATA_3"],
+                                 backup_issues_fn=b, outbox_fn=o,
+                                 dispatch_fn=lambda s, body: sent.append((s, body)) or {"webhook": True},
+                                 state_path=sp, heartbeat_path=hp,
+                                 snapshot_closed_fn=lambda _: False)
+    assert result.action == "OPENED" and result.opened == ("stale_kis_token:DATA_3",)
+
+
+def test_closed_check_failure_fails_closed(tmp_path, caplog) -> None:
+    import logging
+
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, snapshot="2026-10-09", open_keys={})
+    sent: list = []
+    f, _t, b, o = _clean_fns()
+
+    def _boom(_snapshot: str):
+        raise RuntimeError("calendar down")
+
+    with caplog.at_level(logging.WARNING):
+        result = run_audit_reconcile(now=_now(), failed_units_fn=f, stale_tokens_fn=lambda _s: ["PRIMARY"],
+                                     backup_issues_fn=b, outbox_fn=o,
+                                     dispatch_fn=lambda s, body: sent.append((s, body)) or {"webhook": True},
+                                     state_path=sp, heartbeat_path=hp,
+                                     snapshot_closed_fn=_boom)
+    assert result.opened == ("stale_kis_token:PRIMARY",)
+    assert any("closed_check=FAILED" in rec.message for rec in caplog.records)
+
+
+def test_closed_snapshot_keeps_other_classes(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, snapshot="2026-10-09", open_keys={})
+    sent: list = []
+    f, _t, b, o = _clean_fns(failed=["kca-retrain.service"])
+    result = run_audit_reconcile(now=_now(), failed_units_fn=f,
+                                 stale_tokens_fn=lambda _s: ["PRIMARY"],
+                                 backup_issues_fn=b, outbox_fn=o,
+                                 dispatch_fn=lambda s, body: sent.append((s, body)) or {"webhook": True},
+                                 state_path=sp, heartbeat_path=hp,
+                                 snapshot_closed_fn=lambda _: True)
+    assert "failed_unit:kca-retrain.service" in result.opened
+    assert not [k for k in result.still_open if k.startswith("stale_kis_token:")]
+
+
+def test_closed_snapshot_does_not_trigger_remediation(tmp_path) -> None:
+    from src.tools.audit_reconcile import Remediation, run_audit_reconcile
+
+    sp, hp = _seed(tmp_path, snapshot="2026-10-09", open_keys={})
+    f, _t, b, o = _clean_fns()
+    actual, ledger = _p5_remediation(tmp_path)
+    seen: list[tuple[str, ...]] = []
+
+    def _plan(keys, at, hist):
+        seen.append(tuple(keys))
+        return actual.plan_fn(keys, at, hist)
+
+    remediation = Remediation(
+        plan_fn=_plan,
+        execute_fn=actual.execute_fn,
+        settle_fn=actual.settle_fn,
+        history_fn=actual.history_fn,
+    )
+    result = run_audit_reconcile(now=_now(), failed_units_fn=f, stale_tokens_fn=lambda _s: ["PRIMARY"],
+                                 backup_issues_fn=b, outbox_fn=o,
+                                 dispatch_fn=lambda s, body: {"webhook": True},
+                                 state_path=sp, heartbeat_path=hp,
+                                 remediation=remediation,
+                                 snapshot_closed_fn=lambda _: True)
+    assert seen == [()]
+    assert result.remediated == ()
+    assert not ledger.exists()
+
+
+def test_default_exemption_uses_snapshot_date_instead_of_tick_date(tmp_path) -> None:
+    from src.tools.audit_reconcile import run_audit_reconcile
+
+    for snapshot, tick_day, expected in (
+        ("2026-10-09", "2026-10-12", ()),
+        ("2026-10-02", "2026-10-10", ("stale_kis_token:PRIMARY",)),
+    ):
+        sp, hp = _seed(tmp_path, snapshot=snapshot, open_keys={})
+        f, t, b, o = _clean_fns(tokens=["PRIMARY"])
+        result = run_audit_reconcile(
+            now=_now(tick_day), failed_units_fn=f, stale_tokens_fn=t,
+            backup_issues_fn=b, outbox_fn=o, dispatch_fn=lambda s, body: {"email": True},
+            state_path=sp, heartbeat_path=hp,
+        )
+        assert result.opened == expected
+        assert result.still_open == expected
+
+
+def test_default_predicate_matches_warmup_calendar() -> None:
+    from src.tools.audit_reconcile import _snapshot_session_closed
+
+    assert _snapshot_session_closed("2026-10-09") is True
+    assert _snapshot_session_closed("2026-10-10") is True
+    assert _snapshot_session_closed("2026-10-12") is False
+    assert _snapshot_session_closed("not-a-date") is False
+
+
+def test_default_predicate_resolver_error_is_not_closed(monkeypatch) -> None:
+    from src.tools import kis_token_warmup
+    from src.tools.audit_reconcile import _snapshot_session_closed
+
+    def _boom(_day):
+        raise ValueError("calendar down")
+
+    monkeypatch.setattr(kis_token_warmup, "should_skip_warmup", _boom)
+    assert _snapshot_session_closed("2026-10-12") is False
+
+
+def test_existing_snapshots_are_not_closed_by_default() -> None:
+    from src.tools.audit_reconcile import _snapshot_session_closed
+
+    assert _snapshot_session_closed("2026-10-01") is False
+    assert _snapshot_session_closed("2026-10-02") is False

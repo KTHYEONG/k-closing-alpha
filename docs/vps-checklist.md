@@ -100,7 +100,7 @@ EOF'
 - **Stateful signals — know what is fresh and what is stale** (most false alarms and most missed problems live here):
   | Signal | Updated when | Pitfall |
   |---|---|---|
-  | `systemctl --failed` / unit `Result` | the unit's next run | stays failed after the cause is fixed until the next successful run |
+   | `systemctl --failed` / unit `Result` | the unit's next run | stays failed after the cause is fixed until the next successful run; a unit failed by a governance rejection (e.g. `kca-retrain` after a strategy change) is excluded from auto-remediation, so after the manual remediation the operator-authorized `systemctl --user reset-failed <unit>` clears the lingering `failed_unit:` reminder |
   | `daily_audit.json` heartbeat | each audit (Mon–Fri 21:20) and each 10-minute reconcile tick (07:00–23:00) | v2 fields: `severity`, `open_issues`, `provisional_reasons`, `audit_kind`, `reconciled_at`; the dashboard card is derived from it |
   | `audit_alert_state.json` | audit/reconcile | opened issues notify once; resolution and 24 h reminders are the only repeats |
   | `offsite/last_run.json` | **end** of a backup | during a run it still shows the previous night; use `offsite/in_progress.json` (exists only while running; stale after its `deadline_at`) |
