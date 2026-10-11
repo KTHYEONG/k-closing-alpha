@@ -8,6 +8,7 @@ import errno
 import fcntl
 import json
 import logging
+import math
 import os
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextvars import ContextVar
@@ -78,6 +79,7 @@ class KisApiClient:
         hts_id: str | None = None,
         base_url: str | None = None,
         token_file: str | os.PathLike[str] | None = None,
+        rest_tps: float | None = None,
     ) -> None:
         self.app_key = app_key or settings.KIS_API_CONFIG.get("app_key")
         self.app_secret = app_secret or settings.KIS_API_CONFIG.get("app_secret")
@@ -88,7 +90,13 @@ class KisApiClient:
         self.token_file = str(token_file) if token_file else str(token_cache_path(self.app_key or "", settings.KIS_TOKEN_CACHE_DIR))
         self._market_div_cache: dict[str, str] = {}
         self._token_lock: asyncio.Lock | None = None
-        self.rate_limiter = get_host_rate_limiter(resolve_admission_dir() / f"tps_{kis_key_id(self.app_key or '')}.state", KIS_REST_TPS_PER_APP_KEY)
+        if rest_tps is None:
+            max_rate = KIS_REST_TPS_PER_APP_KEY
+        elif not math.isfinite(rest_tps) or rest_tps <= 0:
+            raise ValueError(f"rest_tps must be positive, got {rest_tps}")
+        else:
+            max_rate = float(rest_tps)
+        self.rate_limiter = get_host_rate_limiter(resolve_admission_dir() / f"tps_{kis_key_id(self.app_key or '')}.state", max_rate)
 
     def create_session(self, *, timeout: aiohttp.ClientTimeout | None = None) -> aiohttp.ClientSession:
         """최적화된 커넥터와 bounded request timeout을 가진 세션을 생성합니다."""
@@ -297,7 +305,7 @@ class KisApiClient:
                 logger.warning("[SYS] stage=kis_token status=RETRY attempt=%d max_attempts=%d reason=%s", attempt, KIS_TOKEN_ISSUE_ATTEMPTS, type(exc).__name__)
                 await asyncio.sleep(KIS_TOKEN_ISSUE_BACKOFF_SEC * attempt)
         if "access_token" not in data:
-            if data.get("msg_cd") == "EGW00133":
+            if data.get("msg_cd") == "EGW00133" or data.get("error_code") == "EGW00133":
                 fallback = self._read_cached_token(min_remaining_minutes=0)
                 if fallback is not None:
                     self.token = fallback
