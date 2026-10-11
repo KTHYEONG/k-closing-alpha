@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA order entry (Mon-Fri 15:21 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 15:21:15 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kca-order-entry.service
+
+[Install]
+WantedBy=timers.target

@@ -33,7 +33,11 @@ systemctl --user enable --now \
   kca-retrain.timer \
   kca-kis-token-warmup.timer \
   kca-kiwoom-token-rotate.timer \
-  kca-extended-backfill.timer
+  kca-extended-backfill.timer \
+  kca-order-exit.timer \
+  kca-order-reconcile-exit.timer \
+  kca-order-entry.timer \
+  kca-order-reconcile-entry.timer
 
 # Keep user timers alive without an active login session (WSL).
 loginctl enable-linger "${USER}"

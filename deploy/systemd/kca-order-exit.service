@@ -1,0 +1,13 @@
+[Unit]
+Description=KCA order exit — pre-open market sells
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
+Environment=TZ=Asia/Seoul
+# 08:40 발화 + 18분 상한 → 08:58 종료, 09:00 시가단일가 전 마감
+TimeoutStartSec=18min
+ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kca-order-exit --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e BROKER_ADMISSION_CLASS=critical -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.order_session --phase exit
+ExecStopPost=-/usr/bin/docker rm -f kca-order-exit

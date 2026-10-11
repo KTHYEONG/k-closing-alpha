@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA order exit (Mon-Fri 08:40 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 08:40:10 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kca-order-exit.service
+
+[Install]
+WantedBy=timers.target
