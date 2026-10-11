@@ -1245,13 +1245,44 @@ def test_held_roster_rejects_inconsistent_flags() -> None:
 def test_no_src_module_references_order_transmission_trs() -> None:
     from pathlib import Path
 
-    # Given: 실주문 전송 TR 목록 (relocated from the deleted ws_client guard)
-    order_trs = ("TTTC0802U", "TTTC0801U", "TTTC0803U")
+    from src.api.kis.trading import (
+        TR_SUFFIX_BALANCE,
+        TR_SUFFIX_BUY,
+        TR_SUFFIX_BUYING_POWER,
+        TR_SUFFIX_DAILY_ORDERS,
+        TR_SUFFIX_REVISE_CANCEL,
+        TR_SUFFIX_SELL,
+    )
 
-    # When / Then: src/ 전체에서 어떤 모듈도 주문 TR을 참조하지 않는다
+    # Given: 실주문 전송 경로의 문자열과 TR 접미사 (유일한 소유자는 trading.py)
+    order_markers = (
+        "order-cash",
+        "order-rvsecncl",
+        TR_SUFFIX_BUY,
+        TR_SUFFIX_SELL,
+        TR_SUFFIX_REVISE_CANCEL,
+        TR_SUFFIX_BALANCE,
+        TR_SUFFIX_DAILY_ORDERS,
+        TR_SUFFIX_BUYING_POWER,
+    )
+
+    # When / Then: src/ 전체에서 trading.py를 제외한 어떤 모듈도 주문 경로를 참조하지 않는다
     offenders = [
         str(path)
         for path in sorted(Path("src").rglob("*.py"))
-        if any(tr in path.read_text(encoding="utf-8") for tr in order_trs)
+        if path != Path("src/api/kis/trading.py")
+        and any(marker in path.read_text(encoding="utf-8") for marker in order_markers)
     ]
-    assert offenders == [], f"order TR references must not exist in src/: {offenders}"
+    assert offenders == [], f"order transmission references must live only in trading.py: {offenders}"
+
+    # And: 페이퍼 경로는 실주문 모듈을 어떤 형태로도 참조하지 않는다
+    forbidden = (
+        "src.api.kis.trading",
+        "src.execution.order_gateway",
+        "src.execution.order_journal",
+        "src.daily.order_session",
+    )
+    for name in ("src/execution/paper_broker.py", "src/daily/paper_trade.py"):
+        text = Path(name).read_text(encoding="utf-8")
+        for marker in forbidden:
+            assert marker not in text, f"{name} must not reference {marker}"

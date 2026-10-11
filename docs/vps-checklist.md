@@ -119,7 +119,11 @@ For each window run mode **W** about 2 minutes after the slot. Inside blackouts 
 | 08:30 | `kca-price-ingest` (also 11:30, 21:30) | outcome `OK` with `n_new_rows ≥ 0`; on `CLOSED` days `SKIPPED` | P1 features stale |
 | 08:39:55 (optional) | `kca-auction-open` | research only | P2 |
 | **09:01** | `kca-paper-exit` | every older open lot has a sell fill + `trigger` + trades row before 09:30 | P0 ledger (missed exit) |
+| 08:40:10 | `kca-order-exit` | outcome `OK` (or `SKIPPED trading_disabled` while the selector is `off`); journal at `data/orders/<env>/journal.jsonl` | P0 live position (missed sell) |
+| 09:00:40 | `kca-order-reconcile-exit` | exit fills bound; `DEGRADED` needs a matching alert | P1 fill visibility |
 | **15:20 → 15:35** | `collect` 15:20 → `predict` 15:21 → `auction-close` 15:21:05 → `finalize-close` 15:30:30 → `paper-entry` 15:34 | each finished inside its budget (collect 9, predict 7, finalize 12, entry 10 min); **`predict` decided before 15:30:00**; `finalize-close` before `paper-entry`; no `EGW00201`/rate-limit lines; outcomes `OK` (or `SKIPPED` on closed days) | **P0** decision chain; P1 quota |
+| 15:21:15 | `kca-order-entry` | outcome `OK` (or `SKIPPED trading_disabled` while the selector is `off`); a HALT file blocks sends (`SKIP(halted)`) | P0 live fills |
+| 15:30:40 | `kca-order-reconcile-entry` | entry fills bound and finalized; remainder state visible | P1 fill visibility |
 | 15:40 | `archive-intraday-regular`, `aftermarket-book` | `Finished`; regular partition for `D` appears | P1 audit/backup input |
 | 20:05 | `archive-intraday` | NXT/KRX aftermarket partitions for `D` | P1 |
 | 20:35 | `tape-sweep` | `Finished` (deadline 21:15); report refreshed; a holiday run must not crash | P1 |
@@ -188,6 +192,10 @@ ssh or-vps 'systemctl --user show kca-<name>.service -p ExecMainStartTimestamp -
       "ran normally" on a closed day with rows written is a calendar-disagreement finding.
 - [ ] **RUN-05** run outcomes `cat data/logs/events/<YYYY-MM>/<D>.jsonl`: every recording job `OK`; `DEGRADED/NO_DECISION` need
       a matching alert (§11); a trading-day `predict` of `SKIPPED` is a calendar disagreement (P1).
+- [ ] **RUN-06** order units (`kca-order-exit`, `kca-order-reconcile-exit`, `kca-order-entry`,
+      `kca-order-reconcile-entry`): while `KIS_TRADING_ENV=off` each records `SKIPPED trading_disabled`;
+      otherwise the journal `data/orders/<env>/journal.jsonl` holds the day's intents and a HALT file
+      stops sends without stopping `cancel`.
 
 ## 6. Host Resources
 

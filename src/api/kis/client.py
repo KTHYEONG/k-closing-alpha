@@ -1191,7 +1191,7 @@ class KisApiClient:
         return {"rt_cd": "0", "output": rows}
 
 
-def kis_data_client_kwargs(env: Mapping[str, str] | None = None) -> dict[str, str]:
+def kis_data_client_kwargs(env: Mapping[str, str] | None = None) -> dict[str, Any]:
     """데이터 조회용 KIS 자격증명을 역할에 따라 선택해 KisApiClient kwargs로 반환한다.
 
     KIS_DATA_ROLE(process env, decision/batch)에 따라 호스트에 배정된 슬롯을

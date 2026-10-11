@@ -205,7 +205,7 @@ custtype: P
 
 ### 6.1 `TTTC0012U` / `VTTC0012U` — 주식 현금 매수 주문 (Buy Order)
 > [!NOTE]
-> 2026-09-11 기준 공식 저장소(`koreainvestment/open-trading-api`) 재확인 결과 이 문서의 구 TR(`TTTC0802U` 등)은 최신 규격이 아니며, 실제 구현(`src/execution/kis_client.py`)은 `TTTC0012U`/`TTTC0011U`/`TTTC0013U`/`TTTC0081R`을 사용한다.
+> 2026-09-11 기준 공식 저장소(`koreainvestment/open-trading-api`) 재확인 결과 이 문서의 구 TR(`TTTC0802U` 등)은 최신 규격이 아니며, 실제 구현(`src/api/kis/trading.py`)은 `TTTC0012U`/`TTTC0011U`/`TTTC0013U`/`TTTC0081R`을 사용한다.
 * **Path:** `POST /uapi/domestic-stock/v1/trading/order-cash`
 * **Headers:** `tr_id: "TTTC0012U"` (실전) / `"VTTC0012U"` (모의투자), `custtype: "P"`
 * **Body:**
@@ -314,12 +314,18 @@ custtype: P
   * `CTX_AREA_NK100`: `""`
 * **Output (`output1`):** `odno` (주문번호), `orgn_odno` (원주문번호), `ord_tmd` (주문시각), `sll_buy_dvsn_cd_name` (매매구분), `pdno`, `ord_qty` (주문수량), `ord_unpr` (주문단가), `tot_ccld_qty` (총체결수량), `tot_ccld_amt` (총체결금액), `rmn_qty` (미체결잔량).
 
-### 6.6 `TTTC8408R` / `VTTC8408R` — 예수금 / 주문가능현금 조회 (Buying Power)
+### 6.6 `TTTC8908R` / `VTTC8908R` — 예수금 / 주문가능현금 조회 (Buying Power)
 * **Path:** `GET /uapi/domestic-stock/v1/trading/inquire-psbl-order`
-* **Headers:** `tr_id: "TTTC8408R"` (실전) / `"VTTC8408R"` (모의투자)
+* **Headers:** `tr_id: "TTTC8908R"` (실전) / `"VTTC8908R"` (모의투자)
 * **Query Params:** `CANO`, `ACNT_PRDT_CD`, `PDNO`, `ORD_UNPR`, `ORD_DVSN`, `CMA_EVLU_AMT_ICLD_YN`, `OVRS_ICLD_YN`.
 * **Output (`output`):**
   * `ord_psbl_cash`: 주문가능현금
   * `nrcv_buy_amt`: 미수없는매수금액
   * `max_buy_amt`: 최대매수금액
   * `dnca_tot_amt`: 예수금총금액 (D+2 예수금)
+
+> [!NOTE]
+> 주문/계좌 TR의 유일한 소유자는 `src/api/kis/trading.py`이며 (`KisTradingClient`), 다른 `src/` 모듈은 전송 경로 문자열
+> (`order-cash`, `order-rvsecncl`)과 TR 접미사를 참조하지 않는다 (`test_no_src_module_references_order_transmission_trs`).
+> 실측된 주문 거부 코드: `EGW02006` (주문 거부, `REJECTED`), `EGW00121`/`EGW00123` (토큰 무효, 재발급 후 1회 재시도),
+> `EGW00201` (초당 거래건수 초과 — 전송은 HTTP 500 본문의 `msg_cd`로 도착하므로 상태코드가 아닌 본문으로 판정한다).
