@@ -24,16 +24,16 @@ class KisSettings(EnvSettings):
             stays finite so a hung holder fails closed instead of blocking forever.
     """
 
-    KIS_APP_KEY: str = Field(default="")
-    KIS_APP_SECRET: str = Field(default="")
-    KIS_ACCOUNT_ID: str = Field(default="")
+    KIS_APP_KEY: str = Field(default="", repr=False)
+    KIS_APP_SECRET: str = Field(default="", repr=False)
+    KIS_ACCOUNT_ID: str = Field(default="", repr=False)
     KIS_HTS_ID: str = Field(default="")
     KIS_DATA_ROLE: str = Field(default="batch")
     KIS_TOKEN_CACHE_DIR: Path = Field(default_factory=lambda: Path.home() / ".cache" / "kis")
     KIS_BASE_URL: str = "https://openapi.koreainvestment.com:9443"
     KIS_TOKEN_LOCK_TIMEOUT_SECONDS: float = Field(default=240.0, gt=0, allow_inf_nan=False)
 
-    @computed_field  # type: ignore[prop-decorator]
+    @computed_field(repr=False)  # type: ignore[prop-decorator]
     @property
     def KIS_API_CONFIG(self) -> dict[str, str]:
         """KIS API 접속 정보 딕셔너리 (app_key/app_secret/account_id/hts_id)."""
