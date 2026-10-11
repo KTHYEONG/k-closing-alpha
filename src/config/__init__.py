@@ -10,6 +10,7 @@ from src.config.altdata import AltDataSettings
 from src.config.base import PathSettings
 from src.config.collection import CollectionSettings
 from src.config.kis import KisSettings
+from src.config.kis_trading import KisTradingSettings
 from src.config.kiwoom import KiwoomSettings
 from src.config.ls import LsSettings
 from src.config.nxt_reconstruction import NxtReconstructionSettings
@@ -17,7 +18,7 @@ from src.config.toss import TossSettings
 from src.config.trading import TradingSettings
 
 
-class Settings(PathSettings, KisSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings, TossSettings, AlertSettings, CollectionSettings, AdmissionSettings, NxtReconstructionSettings):
+class Settings(PathSettings, KisSettings, KisTradingSettings, LsSettings, TradingSettings, AltDataSettings, KiwoomSettings, TossSettings, AlertSettings, CollectionSettings, AdmissionSettings, NxtReconstructionSettings):
     """Combined application settings singleton."""
 
 
@@ -30,6 +31,7 @@ __all__ = [
     "AltDataSettings",
     "CollectionSettings",
     "KisSettings",
+    "KisTradingSettings",
     "KiwoomSettings",
     "LsSettings",
     "NxtReconstructionSettings",

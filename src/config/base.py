@@ -61,6 +61,11 @@ class PathSettings(EnvSettings):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def ORDER_JOURNAL_DIR(self) -> Path:
+        return self.DATA_DIR / "orders"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def ALTDATA_DIR(self) -> Path:
         return self.HISTORY_DIR / "altdata"
 

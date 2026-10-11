@@ -75,3 +75,20 @@ def test_market_session_bar_stamp_convention_is_verified_and_immutable() -> None
         market_session.INTRADAY_BAR_STAMP_CONVENTION["toss"] = "start"  # type: ignore[index]
     with pytest.raises(TypeError):
         market_session.INTRADAY_BAR_STAMP_CONVENTION["kis"] = "end"  # type: ignore[index]
+
+
+def test_order_windows_are_strictly_ordered() -> None:
+    entry = [
+        market_session.ORDER_ENTRY_EARLIEST_HHMMSS,
+        market_session.ORDER_ENTRY_DECISION_WAIT_DEADLINE_HHMMSS,
+        market_session.ORDER_ENTRY_SUBMIT_DEADLINE_HHMMSS,
+        market_session.DECISION_WINDOW_END_HHMMSS,
+    ]
+    assert [int(v) for v in entry] == sorted(int(v) for v in entry)
+    assert len(set(entry)) == len(entry)
+    assert int(market_session.ORDER_EXIT_EARLIEST_HHMMSS) < int(market_session.ORDER_EXIT_SUBMIT_DEADLINE_HHMMSS)
+    assert int(market_session.ORDER_EXIT_SUBMIT_DEADLINE_HHMMSS) < int(market_session.KRX_REGULAR_HOUR_FLOOR)
+
+
+def test_entry_deadline_precedes_auction_match() -> None:
+    assert int(market_session.ORDER_ENTRY_SUBMIT_DEADLINE_HHMMSS) < market_session.DECISION_WINDOW_END_HMS
