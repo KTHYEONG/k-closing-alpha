@@ -1209,7 +1209,7 @@ def kis_data_client_kwargs(env: Mapping[str, str] | None = None) -> dict[str, An
     }
 
 
-def kis_decision_shard_client_kwargs(env: Mapping[str, str] | None = None) -> list[dict[str, str]]:
+def kis_decision_shard_client_kwargs(env: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """결정창 벌크 수집용 KIS 자격증명 목록(1개 또는 N개)을 KisApiClient kwargs 리스트로 반환한다.
 
     `kis_data_client_kwargs`와 동일한 5개 키 dict를 `resolve_decision_shard_credentials`
