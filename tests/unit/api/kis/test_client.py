@@ -861,3 +861,87 @@ def test_program_history_request_identity_unchanged() -> None:
         ("FID_INPUT_ISCD", "005930"),
         ("FID_INPUT_DATE_1", "20240110"),
     ]
+
+
+def test_client_default_rest_rate_unchanged() -> None:
+    from src.api.kis.client import KIS_REST_TPS_PER_APP_KEY, KisApiClient
+
+    assert KisApiClient(app_key="RATE-DEFAULT", app_secret="s").rate_limiter.max_rate == KIS_REST_TPS_PER_APP_KEY
+
+
+def test_client_explicit_rest_rate_uses_same_state_file() -> None:
+    from src.api.kis.key_pool import kis_key_id
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="RATE-X", app_secret="s", rest_tps=1.0)
+    assert client.rate_limiter.max_rate == 1.0
+    assert client.rate_limiter._state_path.name == f"tps_{kis_key_id('RATE-X')}.state"
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, float("inf"), float("nan")])
+def test_client_non_positive_rest_rate_rejected(bad: float) -> None:
+    from src.api.kis.client import KisApiClient
+
+    with pytest.raises(ValueError, match="rest_tps"):
+        KisApiClient(app_key="RATE-BAD", app_secret="s", rest_tps=bad)
+
+
+def _token_post_session(body: dict) -> object:
+    class _Resp:
+        status = 200
+
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+
+        async def json(self) -> dict:
+            return self._payload
+
+    class _Ctx:
+        def __init__(self, resp: _Resp) -> None:
+            self._resp = resp
+
+        async def __aenter__(self) -> _Resp:
+            return self._resp
+
+        async def __aexit__(self, *_a: object) -> bool:
+            return False
+
+    class _Session:
+        def post(self, _url: str, **_kw: object) -> _Ctx:
+            return _Ctx(_Resp(body))
+
+    return _Session()
+
+
+def _write_usable_cache(tmp_path: object, app_key: str, token: str) -> None:
+    import json
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path
+
+    future = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    Path(str(tmp_path), "t.json").write_text(
+        json.dumps({"access_token": token, "expired_at": future, "app_key": app_key, "issued_at": future}),
+        encoding="utf-8",
+    )
+
+
+def test_issue_token_throttle_error_code_adopts_cache(tmp_path) -> None:
+    from src.api.kis.client import KisApiClient
+
+    _write_usable_cache(tmp_path, "k", "CACHED")
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "t.json"))
+    out = asyncio.run(
+        client._issue_token(_token_post_session({"error_code": "EGW00133", "error_description": "1/min"}))  # type: ignore[arg-type]
+    )
+    assert out is False
+    assert client.token == "CACHED"
+
+
+def test_issue_token_throttle_error_code_without_cache_fails(tmp_path) -> None:
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "t.json"))
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            client._issue_token(_token_post_session({"error_code": "EGW00133", "error_description": "1/min"}))  # type: ignore[arg-type]
+        )
