@@ -15,7 +15,7 @@ import subprocess
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +112,20 @@ def _default_outbox_count() -> int:
     return len(list(box.glob("*.json")))
 
 
+def _snapshot_session_closed(snapshot_date: str) -> bool:
+    """True only when snapshot_date (YYYY-MM-DD, KST) is verified CLOSED."""
+    try:
+        day = date.fromisoformat(snapshot_date)
+    except (ValueError, TypeError):
+        return False
+    try:
+        from src.tools.kis_token_warmup import should_skip_warmup
+
+        return bool(should_skip_warmup(day))
+    except Exception:
+        return False
+
+
 def _measure_transient(
     *,
     now: datetime,
@@ -122,6 +136,7 @@ def _measure_transient(
     backup_issues_fn: Callable[[datetime], list[str]],
     outbox_fn: Callable[[], int],
     ops_issues_fn: Callable[[datetime], Sequence[Any]] | None = None,
+    snapshot_closed_fn: Callable[[str], bool] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str], bool]:
     """Re-measure transient classes; a failing class keeps its previous keys."""
     measured: dict[str, dict[str, Any]] = {}
@@ -146,15 +161,24 @@ def _measure_transient(
             key = f"failed_unit:{unit}"
             measured[key] = {"transient": True, "text": f"실패 유닛: {unit}"}
 
+    closed_fn = snapshot_closed_fn if snapshot_closed_fn is not None else _snapshot_session_closed
     try:
-        tokens = stale_tokens_fn(snapshot_date)
+        snapshot_closed = bool(closed_fn(snapshot_date))
     except Exception as exc:
-        logger.warning("[SYS] stage=audit_reconcile measure=stale_tokens status=KEEP_PREVIOUS reason=%s", type(exc).__name__)
-        measured.update(_prev_keys("stale_kis_token:"))
+        logger.warning("[SYS] stage=audit_reconcile measure=stale_tokens closed_check=FAILED reason=%s", type(exc).__name__)
+        snapshot_closed = False
+    if snapshot_closed:
+        logger.debug("[SYS] stage=audit_reconcile measure=stale_tokens status=EXEMPT_CLOSED snapshot_date=%s", snapshot_date)
     else:
-        for token in tokens:
-            key = f"stale_kis_token:{token}"
-            measured[key] = {"transient": True, "text": f"KIS 토큰 누락: {token}"}
+        try:
+            tokens = stale_tokens_fn(snapshot_date)
+        except Exception as exc:
+            logger.warning("[SYS] stage=audit_reconcile measure=stale_tokens status=KEEP_PREVIOUS reason=%s", type(exc).__name__)
+            measured.update(_prev_keys("stale_kis_token:"))
+        else:
+            for token in tokens:
+                key = f"stale_kis_token:{token}"
+                measured[key] = {"transient": True, "text": f"KIS 토큰 누락: {token}"}
 
     provisional: list[str] = []
     draining = False
@@ -249,6 +273,7 @@ def run_audit_reconcile(
     dry_run: bool = False,
     ops_issues_fn: Callable[[datetime], Sequence[Any]] | None = None,
     remediation: Remediation | None = None,
+    snapshot_closed_fn: Callable[[str], bool] | None = None,
 ) -> ReconcileResult:
     """Re-measure the self-healing audit conditions and publish the state change, never the full audit.
 
@@ -302,6 +327,7 @@ def run_audit_reconcile(
         backup_issues_fn=backup_issues_fn,
         outbox_fn=outbox_fn,
         ops_issues_fn=None if dry_run or remediation is None else ops_issues_fn,
+        snapshot_closed_fn=snapshot_closed_fn,
     )
     new_open: dict[str, dict[str, Any]] = {**persistent, **measured}
     prev_keys = set(prev_open)
