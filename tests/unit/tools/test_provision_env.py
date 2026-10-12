@@ -707,10 +707,10 @@ def test_vps_selectors_omit_toss_backfill_flag() -> None:
     assert "FOREIGN_KEY=keepme" in merged
 
 
-def test_trading_selector_is_provisioned_as_off() -> None:
+def test_trading_selector_is_provisioned_as_mock() -> None:
     from src.tools.provision_env import RUNTIME_ENV_SPEC, VPS_SELECTORS
 
-    assert ("KIS_TRADING_ENV", "off") in VPS_SELECTORS
+    assert ("KIS_TRADING_ENV", "mock") in VPS_SELECTORS
     assert all(key.target != "KIS_TRADING_ENV" for key in RUNTIME_ENV_SPEC)
 
 
