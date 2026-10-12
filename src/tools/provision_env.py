@@ -91,7 +91,7 @@ RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
 #   COLLECTION_RESEARCH_SLOTS: 샤드와 겹치면 안 되고(코드 검증), krx 스냅샷(2)과 경매 시각이 같아 2도 제외.
 #   COLLECTION_ALTDATA_EXTRA_SLOTS: 21:35에는 krx가 REST를 쓰지 않으므로 2·3을 빌려 3키로 분산한다.
 VPS_SELECTORS: tuple[tuple[str, str], ...] = (
-    ("KIS_TRADING_ENV", "off"),
+    ("KIS_TRADING_ENV", "mock"),
     ("KIS_DECISION_SHARD_SLOTS", "1,5"),
     ("COLLECTION_AUCTION_ENABLED", "true"),
     ("COLLECTION_ALTDATA_ENABLED", "true"),
