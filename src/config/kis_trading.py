@@ -30,6 +30,7 @@ class KisTradingSettings(EnvSettings):
     ORDER_MAX_SENDS_PER_RUN: int = Field(default=10, gt=0)
     ORDER_SEND_MAX_ATTEMPTS: int = Field(default=3, ge=1)
     ORDER_HTTP_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    ORDER_MOCK_HTTP_TIMEOUT_SECONDS: float = Field(default=20.0, gt=0, allow_inf_nan=False)
     ORDER_UNKNOWN_RESOLVE_POLLS: int = Field(default=3, ge=1)
     ORDER_UNKNOWN_RESOLVE_INTERVAL_SECONDS: float = Field(default=2.0, gt=0, allow_inf_nan=False)
     ORDER_EXIT_RESEND_ON_AMBIGUOUS: bool = False
