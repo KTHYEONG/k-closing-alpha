@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal
@@ -388,7 +388,7 @@ class KisTradingClient:
                 raise BrokerReadError("daily orders: output1 is not a list")
             collected.extend(self._parse_order_row(row) for row in rows)
             if next((v for k, v in response.headers.items() if k.lower() == "tr_cont"), "") not in ("F", "M"):
-                return collected
+                return _fold_cancel_rows(collected)
             page_index += 1
             if page_index >= MAX_CONTINUATION_PAGES:
                 raise BrokerReadError("daily orders: continuation exceeded the page budget")
@@ -609,3 +609,16 @@ class KisTradingClient:
         if body.get("rt_cd") != "0":
             raise BrokerReadError(f"{stage}: vendor rejected the read")
         return body
+
+
+def _fold_cancel_rows(rows: list[BrokerOrder]) -> list[BrokerOrder]:
+    """Fold cancel child rows into their parents; the broker reports a cancel as a separate row (cncl_yn=Y, orgn_odno=parent)."""
+    def is_cancel_child(r: BrokerOrder) -> bool:
+        return r.cancelled and bool(r.orig_order_no) and r.orig_order_no != r.order_no
+
+    cancelled_parents = {r.orig_order_no for r in rows if is_cancel_child(r)}
+    return [
+        replace(r, cancelled=True) if r.order_no in cancelled_parents else r
+        for r in rows
+        if not is_cancel_child(r)
+    ]

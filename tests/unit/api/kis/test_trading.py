@@ -580,6 +580,20 @@ def test_order_rows_parsed_with_normalized_numbers(tmp_path) -> None:
     assert req.params["INQR_STRT_DT"] == "20260102" and req.params["INQR_END_DT"] == "20260102"
 
 
+def test_cancel_child_row_folds_into_parent_and_leaves_no_candidate(tmp_path) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path)
+    parent = _buy_row(odno="0000010567", orgn_odno="0000000000", ord_qty="2", tot_ccld_qty="0", tot_ccld_amt="0", rmn_qty="0")
+    child = _buy_row(odno="0000010596", orgn_odno="0000010567", ord_qty="2", tot_ccld_qty="0", tot_ccld_amt="0", rmn_qty="0", cncl_yn="Y")
+    session = scripted_session([_daily_page([child, parent])])
+
+    async def _run() -> list:
+        return await client.fetch_daily_orders(session, "2026-01-02")  # type: ignore[arg-type]
+
+    orders = asyncio.run(_run())
+    assert [o.order_no for o in orders] == ["10567"]
+    assert orders[0].cancelled is True and orders[0].filled_qty == 0
+
+
 def test_bad_trading_date_fails_closed(tmp_path) -> None:
     client, _, _ = _trading_client(_mock_binding(), tmp_path)
     with pytest.raises(BrokerReadError):

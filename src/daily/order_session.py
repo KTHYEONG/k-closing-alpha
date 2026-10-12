@@ -815,7 +815,8 @@ async def run_order_session(
                     phase, report.outcome, report.reason)
         return report
     active_broker: SessionBrokerPort = broker if broker is not None else KisTradingClient(
-        binding, http_timeout_seconds=settings.ORDER_HTTP_TIMEOUT_SECONDS)
+        binding, http_timeout_seconds=(
+            settings.ORDER_MOCK_HTTP_TIMEOUT_SECONDS if binding.env == "mock" else settings.ORDER_HTTP_TIMEOUT_SECONDS))
     active_journal = journal if journal is not None else OrderJournal(
         settings.ORDER_JOURNAL_DIR, binding.env,
         lock_timeout_seconds=settings.ORDER_JOURNAL_LOCK_TIMEOUT_SECONDS)
