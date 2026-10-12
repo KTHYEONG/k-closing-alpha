@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
@@ -57,6 +57,7 @@ class UnitRunState:
     result: str
     last_start: datetime | None
     last_exit: datetime | None
+    timer_active_since: datetime | None = None
 
 
 class JobVerdict(StrEnum):
@@ -244,21 +245,31 @@ def _systemctl_show(
 def read_unit_states(
     units: Sequence[str],
     *,
+    timers: Mapping[str, str] | None = None,
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, UnitRunState]:
     """One `systemctl --user show` call for all units with `TZ=UTC` environment, parsing `ActiveState`, `Result`, `ExecMainStartTimestamp`, `ExecMainExitTimestamp` (`%a %Y-%m-%d %H:%M:%S UTC`; empty means never). Returns aware UTC datetimes. A unit absent from systemd output maps to no entry. Raises OSError/TimeoutExpired from the runner unchanged (callers keep the previous measurement)."""
     names = list(units)
     if not names:
         return {}
+    timer_of = dict(timers or {})
+    blocks = _systemctl_show(
+        [*names, *sorted(set(timer_of.values()))],
+        "Id,ActiveState,Result,ExecMainStartTimestamp,ExecMainExitTimestamp,ActiveEnterTimestamp",
+        run_fn,
+    )
     states: dict[str, UnitRunState] = {}
-    for unit_id, fields in _systemctl_show(
-        names, "Id,ActiveState,Result,ExecMainStartTimestamp,ExecMainExitTimestamp", run_fn
-    ).items():
+    for unit_id in names:
+        fields = blocks.get(unit_id)
+        if fields is None:
+            continue
+        timer_fields = blocks.get(timer_of.get(unit_id, ""), {})
         states[unit_id] = UnitRunState(
             active_state=fields.get("ActiveState", ""),
             result=fields.get("Result", ""),
             last_start=_parse_systemd_timestamp(fields.get("ExecMainStartTimestamp", "")),
             last_exit=_parse_systemd_timestamp(fields.get("ExecMainExitTimestamp", "")),
+            timer_active_since=_parse_systemd_timestamp(timer_fields.get("ActiveEnterTimestamp", "")),
         )
     return states
 
@@ -301,7 +312,7 @@ def evaluate_job(
     *,
     grace: timedelta = SENTINEL_GRACE,
 ) -> JobVerdict:
-    """Judge the latest due slot: PENDING while `now < slot + grace`; RUNNING while the unit is active/activating within `max_runtime` of its last start; OVERRUN when active longer than `max_runtime`; OK when `last_start >= slot - 60s` and the unit is not active; otherwise LATE. A unit with no state (never started) is LATE once past the grace. A non-success `Result` with a start at or after the slot is OK for this function (failure is reported by the existing failed-unit measurement, not duplicated)."""
+    """Judge the latest due slot: PENDING while `now < slot + grace`; RUNNING while the unit is active/activating within `max_runtime` of its last start; OVERRUN when active longer than `max_runtime`; OK when `last_start >= slot - 60s` and the unit is not active; otherwise LATE. A never-started unit is LATE once past the grace, unless its timer became active after the slot (newly deployed unit: PENDING). A non-success `Result` with a start at or after the slot is OK for this function (failure is reported by the existing failed-unit measurement, not duplicated)."""
     current = _ensure_kst(now) if now.tzinfo is None else now
     slot = latest_due_slot(schedule, current)
     if slot is None:
@@ -310,6 +321,8 @@ def evaluate_job(
         return JobVerdict.PENDING
     if state is None:
         return JobVerdict.LATE
+    if state.last_start is None and state.timer_active_since is not None and state.timer_active_since > slot:
+        return JobVerdict.PENDING
     if state.active_state in ("active", "activating"):
         if state.last_start is not None and current - state.last_start > schedule.max_runtime:
             return JobVerdict.OVERRUN
@@ -365,7 +378,7 @@ def measure_ops(
     units_ok = True
     if states_fn is None:
         try:
-            states = read_unit_states([s.unit for s in jobs])
+            states = read_unit_states([s.unit for s in jobs], timers={s.unit: s.timer for s in jobs})
         except Exception as exc:  # noqa: BLE001 - one class failure must not silence others
             issues.append(MeasuredIssue(key="ops_measure_unavailable:units", text=f"unit states unavailable: {exc}"))
             units_ok = False
