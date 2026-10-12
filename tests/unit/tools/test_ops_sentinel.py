@@ -116,6 +116,18 @@ def test_late_when_never_started() -> None:
     assert verdict == JobVerdict.LATE
 
 
+def test_never_started_unit_with_timer_enabled_after_slot_is_pending() -> None:
+    from src.tools.ops_sentinel import JobVerdict, UnitRunState, evaluate_job
+
+    enabled_after_slot = _kst("2026-10-05", "07:11:00").astimezone(_UTC)
+    state = UnitRunState("inactive", "", None, None, timer_active_since=enabled_after_slot)
+    assert evaluate_job(_schedule(), state, _kst("2026-10-05", "07:20:00")) == JobVerdict.PENDING  # type: ignore[arg-type]
+
+    enabled_before_slot = _kst("2026-10-01", "07:00:00").astimezone(_UTC)
+    stale = UnitRunState("inactive", "", None, None, timer_active_since=enabled_before_slot)
+    assert evaluate_job(_schedule(), stale, _kst("2026-10-05", "07:20:00")) == JobVerdict.LATE  # type: ignore[arg-type]
+
+
 def test_within_grace_is_pending() -> None:
     from src.tools.ops_sentinel import JobVerdict, evaluate_job
 
