@@ -623,6 +623,20 @@ def test_entry_reconcile_stops_when_final(mock_binding, runner) -> None:
         ((701_000 + 200_000 + 69_930) / (10 * 70_000 + 4 * 50_000 + 7 * 9_990) - 1) * 1e4)
 
 
+def test_reconcile_and_cancel_phases_acquire_token_before_reads(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", DAY, 10, 70_000), "n1")
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=100, sellable_qty=100)]
+    broker.daily_script = [[_broker_row("n1", "005930", OrderSide.BUY, 10, 70_000, 10, 701_000)]]
+    runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    assert broker.ensure_calls >= 1
+
+    cancel_broker, cancel_journal = FakeBroker(), runner.journal()
+    _add_acked(cancel_journal, _entry_intent("000660", DAY, 4, 50_000), "work-1")
+    runner.run("cancel", DAY, broker=cancel_broker, journal=cancel_journal, clock=[ts("120000")] * 6)
+    assert cancel_broker.ensure_calls == 1
+
+
 def test_entry_reconcile_finalizes_dead_remainder(mock_binding, runner) -> None:
     broker, journal = FakeBroker(), runner.journal()
     _add_acked(journal, _entry_intent("005930", DAY, 10, 70_000), "n1")
