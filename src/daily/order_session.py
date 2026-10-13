@@ -702,6 +702,7 @@ async def _run_reconcile(
         past_deadline = backdated or _hhmmss(now) >= deadline_hhmmss
         finalize = backdated or (scope is OrderPhase.ENTRY and past_deadline)
         try:
+            await broker.ensure_token(sess)
             with journal.exclusive():
                 last_report = await gateway.reconcile(sess, date_str, finalize=finalize)
             last_failed = False
@@ -772,6 +773,7 @@ async def _run_cancel(
 ) -> OrderSessionReport:
     gateway = OrderGateway(broker, journal, _limits_from_settings(), run_id=run_id, now_fn=_gateway_now(now_fn),
                            sleep_fn=sleep_fn)
+    await broker.ensure_token(sess)
     with journal.exclusive():
         accepted = await gateway.cancel_working(sess, date_str)
         report = await gateway.reconcile(sess, date_str, finalize=False)
