@@ -3168,14 +3168,14 @@ def test_run_archive_stream_adapters_pass_historical_arguments(monkeypatch, tmp_
 
     bars_args, bars_kw = seen["bars"]
     assert len(bars_args) == 5
-    assert set(bars_kw) == {"ls_client", "profile", "capture_store", "run_id", "on_symbol"}
+    assert set(bars_kw) == {"ls_client", "dbsec_client", "profile", "capture_store", "run_id", "on_symbol"}
     for name in ("nxt_after", "nxt_pre"):
         pos, kw = seen[name]
         assert len(pos) == 5
         assert set(kw) == {"kiwoom_client", "profile", "capture_store", "run_id", "on_symbol"}
     pos, kw = seen["krx_after"]
     assert len(pos) == 5
-    assert set(kw) == {"profile", "capture_store", "run_id", "on_symbol"}
+    assert set(kw) == {"dbsec_client", "profile", "capture_store", "run_id", "on_symbol"}
     pos, kw = seen["ticks"]
     assert len(pos) == 4
     assert set(kw) == {"ls_client", "kiwoom_client", "profile", "capture_store", "run_id", "on_symbol"}
@@ -3442,4 +3442,77 @@ def test_archive_phase_complete_matches_stream_table(tmp_path) -> None:
                         continue
                     _publish_evening_manifest(pruned, target_date, dataset, session, "COMPLETE", f"s{idx}")
                 assert archive_intraday.archive_phase_complete(pruned, target_date, phase) is False
+
+
+def test_archive_builds_dbsec_client_only_with_key(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.daily import archive_intraday
+
+    store = _archive_store(tmp_path)
+    _publish_cohort(store, "2026-09-07", ["005930"])
+    _publish_cohort(store, "2026-09-04", ["005930"])
+
+    async def _noop(*a, **kw):
+        return pd.DataFrame()
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _noop)
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+
+    built: list = []
+
+    def _dbsec_factory(*a: object, **kw: object) -> object:
+        inst = object()
+        built.append(inst)
+        return inst
+
+    monkeypatch.setattr(archive_intraday, "DbsecApiClient", _dbsec_factory)
+    monkeypatch.setattr(archive_intraday.settings, "DB_APP_KEY", "k")
+    assert archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="regular") == (0, 0, 0)
+    assert len(built) == 1
+    assert isinstance(archive_intraday._ArchiveRun(
+        client=None, session=None, ls_client=None, kiwoom_client=None, dbsec_client=built[0],
+        snap_date="2026-09-07", interval=1, profile=_raw_profile(tmp_path), store=store,
+    ).dbsec_client, object)
+
+    built.clear()
+    monkeypatch.setattr(archive_intraday.settings, "DB_APP_KEY", "")
+    assert archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="regular") == (0, 0, 0)
+    assert built == []
+
+
+def test_archive_regular_and_krx_after_streams_receive_dbsec_client(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.daily import archive_intraday
+
+    _publish_cohort(_archive_store(tmp_path), "2026-09-07", ["005930"])
+    _publish_cohort(_archive_store(tmp_path), "2026-09-04", ["005930"])
+
+    seen: dict = {}
+    sentinel = object()
+
+    def _recorder(name: str):
+        async def _fn(*a, **kw):
+            seen[name] = kw.get("dbsec_client", "missing")
+            return pd.DataFrame()
+
+        return _fn
+
+    _raw_archive_mocks(monkeypatch, tmp_path, _recorder("bars"))
+    _seed_panel(tmp_path, {"2026-09-04": ["005930"], "2026-09-03": ["005930"]})
+    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _recorder("bars"))
+    monkeypatch.setattr(archive_intraday, "collect_krx_aftermarket_bars", _recorder("krx_after"))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_aftermarket_bars", _recorder("nxt_after"))
+    monkeypatch.setattr(archive_intraday, "collect_nxt_premarket_bars", _recorder("nxt_pre"))
+    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _recorder("ticks"))
+    monkeypatch.setattr(archive_intraday, "collect_aftermarket_trade_ticks", _recorder("after_ticks"))
+    monkeypatch.setattr(archive_intraday, "DbsecApiClient", lambda *a, **kw: sentinel)
+    monkeypatch.setattr(archive_intraday.settings, "DB_APP_KEY", "k")
+
+    archive_intraday.run_intraday_archive(snapshot_date="2026-09-07", profile=_raw_profile(tmp_path), phase="all")
+    assert seen["bars"] is sentinel
+    assert seen["krx_after"] is sentinel
+    assert seen["nxt_after"] == "missing"
+    assert seen["nxt_pre"] == "missing"
 

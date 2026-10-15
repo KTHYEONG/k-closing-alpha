@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 
 from src import settings
+from src.api.dbsec.client import DbsecApiClient
 from src.api.kis.client import KisApiClient, kis_data_client_kwargs
 from src.api.kiwoom.client import KiwoomApiClient
 from src.api.ls.client import LsApiClient
@@ -555,6 +556,7 @@ class _ArchiveRun:
         session: Open HTTP session of that client.
         ls_client: LS client, or None without an LS key.
         kiwoom_client: Kiwoom client, or None without a Kiwoom key.
+        dbsec_client: DB client, or None without a DB key.
         snap_date: Archived session date, ISO `YYYY-MM-DD`.
         interval: Bar interval in minutes (> 0).
         profile: Validated acquisition profile.
@@ -565,6 +567,7 @@ class _ArchiveRun:
     session: Any
     ls_client: Any | None
     kiwoom_client: Any | None
+    dbsec_client: Any | None
     snap_date: str
     interval: int
     profile: CollectionSettings
@@ -633,6 +636,7 @@ async def _collect_regular_bars(
         run.snap_date,
         run.interval,
         ls_client=run.ls_client,
+        dbsec_client=run.dbsec_client,
         profile=run.profile,
         capture_store=run.store,
         run_id=run_id,
@@ -683,6 +687,7 @@ async def _collect_krx_aftermarket_bars(
         codes,
         run.snap_date,
         run.interval,
+        dbsec_client=run.dbsec_client,
         profile=run.profile,
         capture_store=run.store,
         run_id=run_id,
@@ -897,6 +902,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
         client = KisApiClient(**kis_data_client_kwargs())
         ls_client = LsApiClient() if settings.LS_APP_KEY else None
         kiwoom_client = KiwoomApiClient() if settings.KIWOOM_APP_KEY else None
+        dbsec_client = DbsecApiClient() if settings.DB_APP_KEY else None
         async with client.create_session() as session:
             await client.ensure_token(session)
             if not await is_kis_trading_day(client, session, str(snap_date)):
@@ -921,6 +927,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                 session=session,
                 ls_client=ls_client,
                 kiwoom_client=kiwoom_client,
+                dbsec_client=dbsec_client,
                 snap_date=str(snap_date),
                 interval=interval,
                 profile=prof,
