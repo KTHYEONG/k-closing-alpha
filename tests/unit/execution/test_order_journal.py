@@ -600,3 +600,82 @@ def test_duplicate_refused_on_corrupt_journal(tmp_path: Path) -> None:
             handle.write('{"seq": 99, "broken\n')
         with pytest.raises(ValueError, match="duplicate"):
             journal.append(JournalEventKind.INTENT, intent.intent_id, intent_to_payload(intent), run_id="r")
+
+
+def test_baseline_earliest_carrying_send_wins() -> None:
+    intent = _entry()
+    base = intent_to_payload(intent)
+    events = [_ev(1, JournalEventKind.INTENT, intent.intent_id, base),
+              _ev(2, JournalEventKind.SEND, intent.intent_id, {"attempt": 1}),
+              _ev(3, JournalEventKind.SEND, intent.intent_id,
+                   {"attempt": 2, "baseline_order_nos": ["29285"]})]
+    assert derive_intent_state(events).baseline_order_nos == frozenset({"29285"})
+
+
+def test_baseline_first_carrying_send_kept() -> None:
+    intent = _entry()
+    base = intent_to_payload(intent)
+    events = [_ev(1, JournalEventKind.INTENT, intent.intent_id, base),
+              _ev(2, JournalEventKind.SEND, intent.intent_id,
+                   {"attempt": 1, "baseline_order_nos": ["00111"]}),
+              _ev(3, JournalEventKind.SEND, intent.intent_id,
+                   {"attempt": 2, "baseline_order_nos": ["00222"]})]
+    assert derive_intent_state(events).baseline_order_nos == frozenset({"111"})
+
+
+def test_baseline_legacy_missing_and_empty_distinct() -> None:
+    intent = _entry()
+    base = intent_to_payload(intent)
+    legacy = [_ev(1, JournalEventKind.INTENT, intent.intent_id, base),
+              _ev(2, JournalEventKind.SEND, intent.intent_id, {"attempt": 1})]
+    assert derive_intent_state(legacy).baseline_order_nos is None
+    empty = [_ev(1, JournalEventKind.INTENT, intent.intent_id, base),
+             _ev(2, JournalEventKind.SEND, intent.intent_id,
+                  {"attempt": 1, "baseline_order_nos": []})]
+    state = derive_intent_state(empty)
+    assert state.baseline_order_nos == frozenset()
+    assert state.baseline_order_nos is not None
+
+
+def test_baseline_malformed_fails_closed() -> None:
+    intent = _entry()
+    base = intent_to_payload(intent)
+    for bad in ("29285", [1], [""], ["000"], ["a", 2]):
+        events = [_ev(1, JournalEventKind.INTENT, intent.intent_id, base),
+                  _ev(2, JournalEventKind.SEND, intent.intent_id,
+                       {"attempt": 1, "baseline_order_nos": bad})]
+        with pytest.raises(JournalCorruptError):
+            derive_intent_state(events)
+
+
+@pytest.mark.parametrize("first", [[], ["11"]])
+def test_later_malformed_baseline_still_fails_closed(first: list[str]) -> None:
+    intent = _entry()
+    events = [_ev(1, JournalEventKind.INTENT, intent.intent_id, intent_to_payload(intent)),
+              _ev(2, JournalEventKind.SEND, intent.intent_id,
+                   {"attempt": 1, "baseline_order_nos": first}),
+              _ev(3, JournalEventKind.SEND, intent.intent_id,
+                   {"attempt": 2, "baseline_order_nos": "22"})]
+    with pytest.raises(JournalCorruptError, match="baseline_order_nos"):
+        derive_intent_state(events)
+
+
+def test_baseline_append_and_load_roundtrip(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    intent = _entry()
+    with journal.exclusive():
+        journal.append(JournalEventKind.INTENT, intent.intent_id, intent_to_payload(intent), run_id="r1")
+        journal.append(JournalEventKind.SEND, intent.intent_id,
+                       {"attempt": 1, "baseline_order_nos": ["29285"]}, run_id="r1")
+        state = journal.states()[intent.intent_id]
+        assert state.baseline_order_nos == frozenset({"29285"})
+        assert state.status is IntentStatus.UNKNOWN
+        assert state.n_sends == 1
+    assert journal.load()[1].payload["baseline_order_nos"] == ["29285"]
+    with journal.exclusive():
+        with pytest.raises(ValueError, match="JSON scalar"):
+            journal.append(JournalEventKind.SEND, intent.intent_id,
+                           {"attempt": 2, "baseline_order_nos": [1]}, run_id="r1")
+        with pytest.raises(ValueError, match="JSON scalar"):
+            journal.append(JournalEventKind.SEND, intent.intent_id,
+                           {"attempt": 2, "other": [1]}, run_id="r1")
