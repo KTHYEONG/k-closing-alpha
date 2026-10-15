@@ -2347,3 +2347,331 @@ def test_kiwoom_raw_helper_rejects_regular_session(tmp_path) -> None:
             session_tag="regular", profile=_capture_profile(tmp_path),
             capture_store=_capture_store(tmp_path), run_id="r-reg-raw",
         ))
+
+
+def _dbsec_bar_row(hour, close=70000, vol=100, day="20260904"):
+    return {"Date": day, "Hour": hour, "Oprc": close, "Hprc": close, "Lprc": close, "Prpr": close, "CntgVol": vol}
+
+
+class _DbsecBars:
+    def __init__(self, rows, terminal="exhausted", rt="0", pages=2):
+        self._rows = rows
+        self._terminal = terminal
+        self._rt = rt
+        self._pages = pages
+        self.calls = []
+
+    async def get_minute_chart(self, session, code, target_date, budget=None, on_page=None):
+        self.calls.append({"code": code, "target_date": target_date})
+        if on_page is not None:
+            start, received = _aware_page_clocks()
+            for idx in range(self._pages):
+                on_page({"CHARTMIN": self._rows}, {"cont_yn": "N"}, start, received, idx, 0)
+        done = self._terminal in ("exhausted", "crossed_target_date")
+        return {
+            "rt_cd": self._rt, "output2": self._rows if self._rt == "0" else [], "vendor": "dbsec",
+            "truncated": not done, "termination_reason": self._terminal,
+            "pages_fetched": self._pages, "continuation": {},
+        }
+
+
+def _dbsec_routes(tmp_path):
+    return _capture_profile(tmp_path, {"ls:t8412": "KRX", "dbsec:kr-chart/min": "KRX"})
+
+
+def test_regular_bars_use_dbsec_when_ls_incomplete(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_intraday_bars
+
+    store = _capture_store(tmp_path)
+    profile = _dbsec_routes(tmp_path)
+    ls = _LsBars([_ls_bar_row("090100")], terminal="page_budget")
+    db = _DbsecBars([_dbsec_bar_row("090000"), _dbsec_bar_row("153000")])
+    kis = _KisBars([_kis_bar_row("090100")])
+    delivered = {}
+    asyncio.run(
+        collect_intraday_bars(
+            kis, None, ["005930"], "2026-09-04", 1, ls_client=ls, dbsec_client=db,
+            profile=profile, capture_store=store, run_id="r-db-use",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "COMPLETE"
+    assert frame["vendor"].tolist() == ["dbsec", "dbsec"]
+    assert entry.venue == "KRX"
+    assert not kis.historical_calls and not kis.intraday_calls
+    assert len(entry.raw_refs) >= 3
+
+
+def test_regular_bars_fall_to_kis_when_dbsec_incomplete(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_intraday_bars
+
+    store = _capture_store(tmp_path)
+    profile = _dbsec_routes(tmp_path)
+    ls = _LsBars([_ls_bar_row("090100")], terminal="page_budget")
+    db = _DbsecBars([_dbsec_bar_row("090000")], terminal="page_budget")
+    kis = _KisBars([_kis_bar_row("090100")])
+    delivered = {}
+    asyncio.run(
+        collect_intraday_bars(
+            kis, None, ["005930"], "2026-09-04", 1, ls_client=ls, dbsec_client=db,
+            profile=profile, capture_store=store, run_id="r-db-fall",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "COMPLETE"
+    assert frame["vendor"].tolist() == ["kis"]
+    assert kis.historical_calls or kis.intraday_calls
+    assert len(entry.raw_refs) >= 4
+
+
+def test_regular_bars_dbsec_without_auction_bar_not_certified(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import _dbsec_bar_attempt, collect_intraday_bars
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    profile = _dbsec_routes(tmp_path)
+    db = _DbsecBars([_dbsec_bar_row("090000"), _dbsec_bar_row("151900")])
+    frame, entry = asyncio.run(
+        _dbsec_bar_attempt(
+            dbsec_client=db, session=None, code="005930", snapshot_date="2026-09-04",
+            trading_day=__import__("datetime").date(2026, 9, 4), ymd="20260904",
+            floor="090000", ceil="153000", session_tag="regular",
+            dataset=CaptureDataset.MINUTE_BARS, store=store, run_id="r-db-noauction", profile=profile,
+        )
+    )
+    assert entry.status.value == "PARTIAL"
+    assert entry.reason == "incomplete:missing_close_auction_bar"
+    assert frame.empty
+
+    ls = _LsBars([_ls_bar_row("090100")], terminal="page_budget")
+    kis = _KisBars([], rt="1")
+    delivered = {}
+    asyncio.run(
+        collect_intraday_bars(
+            kis, None, ["005930"], "2026-09-04", 1, ls_client=ls, dbsec_client=_DbsecBars(
+                [_dbsec_bar_row("090000"), _dbsec_bar_row("151900")]),
+            profile=profile, capture_store=store, run_id="r-db-noauction-col",
+            on_symbol=lambda symbol, f, e: delivered.update({symbol: (f, e)}),
+        )
+    )
+    assert kis.historical_calls or kis.intraday_calls
+    assert delivered["005930"][1].status.value == "PARTIAL"
+
+
+def test_regular_bars_dbsec_out_of_window_rows_staged(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import _dbsec_bar_attempt
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    profile = _dbsec_routes(tmp_path)
+    rows = [
+        _dbsec_bar_row("090000"), _dbsec_bar_row("153000"),
+        _dbsec_bar_row("154000"), _dbsec_bar_row("163000"),
+    ]
+    db = _DbsecBars(rows)
+    frame, entry = asyncio.run(
+        _dbsec_bar_attempt(
+            dbsec_client=db, session=None, code="005930", snapshot_date="2026-09-04",
+            trading_day=__import__("datetime").date(2026, 9, 4), ymd="20260904",
+            floor="090000", ceil="153000", session_tag="regular",
+            dataset=CaptureDataset.MINUTE_BARS, store=store, run_id="r-db-oow", profile=profile,
+        )
+    )
+    assert entry.status.value == "COMPLETE"
+    assert frame["ts_hms"].tolist() == [90000, 153000]
+    assert len(entry.raw_refs) >= 3
+
+
+def test_regular_bars_unchanged_without_dbsec_client(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_intraday_bars
+
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, {"ls:t8412": "KRX"})
+    ls = _LsBars([_ls_bar_row("090100")], terminal="page_budget")
+    kis = _KisBars([_kis_bar_row("090100")])
+    delivered = {}
+    asyncio.run(
+        collect_intraday_bars(
+            kis, None, ["005930"], "2026-09-04", 1, ls_client=ls,
+            profile=profile, capture_store=store, run_id="r-no-db",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "COMPLETE"
+    assert frame["vendor"].tolist() == ["kis"]
+    assert kis.historical_calls or kis.intraday_calls
+
+
+def test_krx_aftermarket_uses_dbsec_after_kis_failure(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_krx_aftermarket_bars
+
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, {"dbsec:kr-chart/min": "KRX"})
+    kis = _KisBars([], rt="1")
+    db = _DbsecBars([_dbsec_bar_row("160000", day="20260915"), _dbsec_bar_row("195900", day="20260915")])
+    delivered = {}
+    asyncio.run(
+        collect_krx_aftermarket_bars(
+            kis, None, ["005930"], "2026-09-15", 1, dbsec_client=db,
+            profile=profile, capture_store=store, run_id="r-krx-db",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "COMPLETE"
+    assert frame["vendor"].tolist() == ["dbsec", "dbsec"]
+    assert entry.session == "krx_aftermarket"
+    assert entry.venue == "KRX"
+    assert len(entry.raw_refs) >= 2
+
+
+def test_krx_aftermarket_pre_start_date_ignores_dbsec(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_krx_aftermarket_bars
+
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, {"dbsec:kr-chart/min": "KRX"})
+
+    class _BoomDb:
+        async def get_minute_chart(self, *args, **kwargs):
+            raise AssertionError("dbsec must not be called before start date")
+
+    delivered = {}
+    asyncio.run(
+        collect_krx_aftermarket_bars(
+            _KisBars([]), None, ["005930"], "2026-09-11", 1, dbsec_client=_BoomDb(),
+            profile=profile, capture_store=store, run_id="r-krx-pre",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    assert delivered["005930"][1].status.value == "UNKNOWN"
+
+
+def test_dbsec_bar_attempt_transport_and_vendor_failures(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import _dbsec_bar_attempt
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    profile = _dbsec_routes(tmp_path)
+    day = __import__("datetime").date(2026, 9, 4)
+
+    class _BoomDb:
+        async def get_minute_chart(self, *args, **kwargs):
+            raise RuntimeError("DB down")
+
+    frame, entry = asyncio.run(
+        _dbsec_bar_attempt(
+            dbsec_client=_BoomDb(), session=None, code="005930", snapshot_date="2026-09-04",
+            trading_day=day, ymd="20260904", floor="090000", ceil="153000", session_tag="regular",
+            dataset=CaptureDataset.MINUTE_BARS, store=store, run_id="r-db-boom", profile=profile,
+        )
+    )
+    assert entry.status.value == "FAILED"
+    assert entry.reason.startswith("transport:")
+    assert frame.empty
+
+    frame, entry = asyncio.run(
+        _dbsec_bar_attempt(
+            dbsec_client=_DbsecBars([], rt="1"), session=None, code="005930", snapshot_date="2026-09-04",
+            trading_day=day, ymd="20260904", floor="090000", ceil="153000", session_tag="regular",
+            dataset=CaptureDataset.MINUTE_BARS, store=store, run_id="r-db-vfail", profile=profile,
+        )
+    )
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "vendor_failure"
+
+
+def test_dbsec_bar_attempt_normalize_and_empty_frames(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import _dbsec_bar_attempt
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    profile = _dbsec_routes(tmp_path)
+    day = __import__("datetime").date(2026, 9, 4)
+
+    bad = _DbsecBars([{"Date": "20260904", "Hour": "090000"}])
+    frame, entry = asyncio.run(
+        _dbsec_bar_attempt(
+            dbsec_client=bad, session=None, code="005930", snapshot_date="2026-09-04",
+            trading_day=day, ymd="20260904", floor="090000", ceil="153000", session_tag="regular",
+            dataset=CaptureDataset.MINUTE_BARS, store=store, run_id="r-db-norm", profile=profile,
+        )
+    )
+    assert entry.status.value == "FAILED"
+    assert entry.reason.startswith("normalize:")
+
+    other_date = _DbsecBars([_dbsec_bar_row("090000", day="20260903")])
+    frame, entry = asyncio.run(
+        _dbsec_bar_attempt(
+            dbsec_client=other_date, session=None, code="005930", snapshot_date="2026-09-04",
+            trading_day=day, ymd="20260904", floor="090000", ceil="153000", session_tag="regular",
+            dataset=CaptureDataset.MINUTE_BARS, store=store, run_id="r-db-empty", profile=profile,
+        )
+    )
+    assert entry.status.value == "UNKNOWN"
+    assert entry.reason == "empty_without_proof"
+    assert frame.empty
+
+
+def test_krx_aftermarket_keeps_kis_entry_when_dbsec_incomplete(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_krx_aftermarket_bars
+
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, {"dbsec:kr-chart/min": "KRX"})
+    kis = _KisBars([], rt="1")
+    db = _DbsecBars([_dbsec_bar_row("160000", day="20260915")], terminal="page_budget")
+    delivered = {}
+    asyncio.run(
+        collect_krx_aftermarket_bars(
+            kis, None, ["005930"], "2026-09-15", 1, dbsec_client=db,
+            profile=profile, capture_store=store, run_id="r-krx-dbincomp",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "vendor_failure"
+    assert len(entry.raw_refs) >= 2
+
+
+def test_dbsec_unknown_venue_never_certified(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import _dbsec_bar_attempt
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, {})
+    db = _DbsecBars([_dbsec_bar_row("090000"), _dbsec_bar_row("153000")])
+    frame, entry = asyncio.run(
+        _dbsec_bar_attempt(
+            dbsec_client=db, session=None, code="005930", snapshot_date="2026-09-04",
+            trading_day=__import__("datetime").date(2026, 9, 4), ymd="20260904",
+            floor="090000", ceil="153000", session_tag="regular",
+            dataset=CaptureDataset.MINUTE_BARS, store=store, run_id="r-db-unknown", profile=profile,
+        )
+    )
+    assert entry.status.value != "COMPLETE"
+    assert frame.empty

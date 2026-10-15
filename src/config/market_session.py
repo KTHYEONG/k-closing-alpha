@@ -16,6 +16,7 @@ VERIFIED_CHART_ROUTES: Mapping[str, str] = MappingProxyType(
         "kiwoom:ka10080": "NXT",
         "ls:t8411": "KRX",
         "ls:t8412": "KRX",
+        "dbsec:kr-chart/min": "KRX",
         "toss:toss-candles": "KRX",
     }
 )
@@ -38,9 +39,10 @@ BAR_STAMP_START: str = "start"
 BAR_STAMP_END: str = "end"
 # Measured on stored partitions (2026-10-04): KIS/Kiwoom stamp a 1m bar at its minute start (regular 090000..151900,
 # NXT 154000..), LS at its minute end (090100..152000). Measured 2026-10-04: Toss 09:01 equals the KIS 09:00 bar
-# (END-stamped, 090100..153000); OHLC/volume matched KIS on 29/40 sampled symbol-days. Unlisted vendors must fail closed, never default.
+# (END-stamped, 090100..153000); OHLC/volume matched KIS on 29/40 sampled symbol-days. DB (2026-10-15): START-stamped,
+# 090000..151900 + 153000, after-market 160000... Unlisted vendors must fail closed, never default.
 INTRADAY_BAR_STAMP_CONVENTION: Mapping[str, str] = MappingProxyType(
-    {"kis": BAR_STAMP_START, "kiwoom": BAR_STAMP_START, "ls": BAR_STAMP_END, "toss": BAR_STAMP_END}
+    {"kis": BAR_STAMP_START, "kiwoom": BAR_STAMP_START, "ls": BAR_STAMP_END, "toss": BAR_STAMP_END, "dbsec": BAR_STAMP_START}
 )
 INTRADAY_SESSION_REGULAR: str = "regular"
 INTRADAY_SESSION_REGULAR_CONSOLIDATED: str = "regular_consolidated"
