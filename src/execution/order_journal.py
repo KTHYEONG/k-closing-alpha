@@ -56,6 +56,7 @@ class JournalEventKind(StrEnum):
     RESULT = "result"
     ADOPT = "adopt"
     NOT_FOUND = "not_found"
+    OPERATOR_RESOLVE = "operator_resolve"
     RESOLVE_CONFLICT = "resolve_conflict"
     BROKER_STATE = "broker_state"
     CANCEL_SEND = "cancel_send"
@@ -184,6 +185,26 @@ def _payload_baseline(payload: Mapping[str, Any], intent_id: str) -> frozenset[s
     return frozenset(out)
 
 
+def _validate_operator_payload(payload: Mapping[str, Any], intent_id: str) -> str:
+    resolution = payload.get("resolution")
+    if resolution not in ("adopt", "not_found"):
+        raise JournalCorruptError(f"intent {intent_id!r}: bad operator_resolve resolution")
+    operator = payload.get("operator")
+    if not isinstance(operator, str) or not operator.strip():
+        raise JournalCorruptError(f"intent {intent_id!r}: bad operator_resolve operator")
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise JournalCorruptError(f"intent {intent_id!r}: bad operator_resolve reason")
+    if resolution == "adopt":
+        order_no = payload.get("broker_order_no")
+        org_no = payload.get("broker_org_no")
+        if not isinstance(order_no, str) or not order_no.strip():
+            raise JournalCorruptError(f"intent {intent_id!r}: bad operator_resolve order number")
+        if not isinstance(org_no, str) or not org_no.strip():
+            raise JournalCorruptError(f"intent {intent_id!r}: bad operator_resolve order number")
+    return str(resolution)
+
+
 def derive_intent_state(events: Sequence[JournalEvent]) -> IntentState:
     """Fold one intent's events into its state."""
     if len(events) == 0:
@@ -200,6 +221,15 @@ def derive_intent_state(events: Sequence[JournalEvent]) -> IntentState:
     for ev in ordered:
         if ev.kind is JournalEventKind.INTENT:
             intent = intent_from_payload(ev.intent_id, ev.payload)
+    for index, ev in enumerate(ordered):
+        if ev.kind is not JournalEventKind.OPERATOR_RESOLVE:
+            continue
+        _validate_operator_payload(ev.payload, intent_id)
+        if index == 0:
+            raise JournalCorruptError(f"intent {intent_id!r}: operator_resolve without prior state")
+        prior = derive_intent_state(ordered[:index])
+        if prior.status not in (IntentStatus.UNKNOWN, IntentStatus.NOT_FOUND):
+            raise JournalCorruptError(f"intent {intent_id!r}: operator_resolve over {prior.status.value}")
     reason = ""
     for ev in ordered:
         if ev.kind is JournalEventKind.SKIP:
@@ -225,7 +255,9 @@ def derive_intent_state(events: Sequence[JournalEvent]) -> IntentState:
                 raw_org = ev.payload.get("broker_org_no")
                 broker_order_no = str(raw_no) if raw_no is not None else None
                 broker_org_no = str(raw_org) if raw_org is not None else None
-        elif ev.kind is JournalEventKind.ADOPT:
+        elif ev.kind is JournalEventKind.ADOPT or (
+            ev.kind is JournalEventKind.OPERATOR_RESOLVE and ev.payload.get("resolution") == "adopt"
+        ):
             raw_no = ev.payload.get("broker_order_no")
             raw_org = ev.payload.get("broker_org_no")
             broker_order_no = str(raw_no) if raw_no is not None else None
@@ -271,7 +303,15 @@ def derive_intent_state(events: Sequence[JournalEvent]) -> IntentState:
         return IntentState(intent, status, n_sends, broker_order_no, broker_org_no,
                            filled_qty, filled_amount, remaining_qty, True, reason, baseline)
     has_accepted = False
-    has_adopt = any(e.kind is JournalEventKind.ADOPT for e in ordered)
+    has_adopt = any(
+        e.kind is JournalEventKind.ADOPT
+        or (e.kind is JournalEventKind.OPERATOR_RESOLVE and e.payload.get("resolution") == "adopt")
+        for e in ordered
+    )
+    has_operator_not_found = any(
+        e.kind is JournalEventKind.OPERATOR_RESOLVE and e.payload.get("resolution") == "not_found"
+        for e in ordered
+    )
     for e in ordered:
         if e.kind is JournalEventKind.RESULT and SubmitVerdict(str(e.payload.get("verdict", ""))) is SubmitVerdict.ACCEPTED:
             has_accepted = True
@@ -291,6 +331,9 @@ def derive_intent_state(events: Sequence[JournalEvent]) -> IntentState:
         if max(e.seq for e in not_founds) > last_send_seq:
             return IntentState(intent, IntentStatus.NOT_FOUND, n_sends, broker_order_no, broker_org_no,
                                filled_qty, filled_amount, remaining_qty, False, reason, baseline)
+    if has_operator_not_found:
+        return IntentState(intent, IntentStatus.NOT_FOUND, n_sends, broker_order_no, broker_org_no,
+                           filled_qty, filled_amount, remaining_qty, False, reason, baseline)
     if sends:
         last_send_seq = max(e.seq for e in sends)
         later_results = [e for e in results if e.seq > last_send_seq]
