@@ -65,6 +65,8 @@ RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
     RuntimeEnvKey(target="KRX_OPENAPI_KEY", sources=("KRX_OPENAPI_KEY",)),
     RuntimeEnvKey(target="TOSS_APP_KEY", sources=("TOSS_APP_KEY",)),
     RuntimeEnvKey(target="TOSS_APP_SECRET", sources=("TOSS_APP_SECRET",)),
+    RuntimeEnvKey(target="DB_APP_KEY", sources=("DB_APP_KEY",), optional=True),
+    RuntimeEnvKey(target="DB_APP_SECRET", sources=("DB_APP_SECRET",), optional=True),
     RuntimeEnvKey(target="OPENDART_API_KEY", sources=("OPENDART_API_KEY",)),
     RuntimeEnvKey(target="OPENDART_API_KEY_2", sources=("OPENDART_API_KEY_2",), optional=True),
 )
@@ -100,6 +102,7 @@ VPS_SELECTORS: tuple[tuple[str, str], ...] = (
     ("COLLECTION_BACKFILL_SLOTS", "2,3"),
     ("COLLECTION_AFTERMARKET_BOOK_ENABLED", "true"),
     ("COLLECTION_AFTERMARKET_BOOK_SLOTS", "2,3"),
+    ("DB_AUCTION_PATH_ENABLED", "true"),
 )
 
 # krx-alpha docker-compose의 KRX_ALPHA_SNAPSHOT_KIS_DATA_SLOT과 같아야 한다(장중 배타 슬롯).

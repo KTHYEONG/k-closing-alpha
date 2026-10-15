@@ -45,8 +45,8 @@ def test_runtime_env_spec_excludes_legacy_data_single_key_fields() -> None:
     targets = [key.target for key in RUNTIME_ENV_SPEC]
     sources = [source for key in RUNTIME_ENV_SPEC for source in key.sources]
 
-    assert len(targets) == 21
-    assert len(set(targets)) == 21
+    assert len(targets) == 23
+    assert len(set(targets)) == 23
     for forbidden in ("KIS_DATA_APP_KEY", "KIS_DATA_APP_SECRET", "KIS_DATA_HTS_ID"):
         assert forbidden not in targets
         assert forbidden not in sources
@@ -58,8 +58,8 @@ def test_runtime_env_spec_excludes_shared_keypool_keys() -> None:
     targets = [key.target for key in RUNTIME_ENV_SPEC]
     sources = [source for key in RUNTIME_ENV_SPEC for source in key.sources]
 
-    assert len(targets) == 21
-    assert len(set(targets)) == 21
+    assert len(targets) == 23
+    assert len(set(targets)) == 23
     for forbidden in ("KIS_DATA_SLOTS", "KIS_HOST_DATA_SLOTS"):
         assert forbidden not in targets
         assert forbidden not in sources
