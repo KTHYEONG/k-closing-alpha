@@ -195,7 +195,9 @@ ssh or-vps 'systemctl --user show kca-<name>.service -p ExecMainStartTimestamp -
 - [ ] **RUN-06** order units (`kca-order-exit`, `kca-order-reconcile-exit`, `kca-order-entry`,
       `kca-order-reconcile-entry`): while `KIS_TRADING_ENV=off` each records `SKIPPED trading_disabled`;
       otherwise the journal `data/orders/<env>/journal.jsonl` holds the day's intents and a HALT file
-      stops sends without stopping `cancel`.
+      stops sends without stopping `cancel`. Manual only (no timer): a stuck `UNKNOWN` intent is resolved by
+      `uv run python -m src.daily.order_resolve --intent-id <id> (--order-no <no> | --not-found) --operator <name> --reason <evidence> [--apply]`
+      after verifying the broker daily order list / position screen; dry-run first, then `--apply` (add `--i-understand-live` on live).
 
 ## 6. Host Resources
 
