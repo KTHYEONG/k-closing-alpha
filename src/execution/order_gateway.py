@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from datetime import date as _date
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -61,6 +62,7 @@ class GatewayLimits:
     unknown_resolve_polls: int
     unknown_resolve_interval_seconds: float
     exit_resend_on_ambiguous: bool
+    carryover_lookback_days: int = 5
 
 
 @dataclass(frozen=True)
@@ -375,6 +377,91 @@ class OrderGateway:
             n_unknown_unresolved_total=n_unknown_unresolved_total,
             unknown_exposures=tuple(exposures),
         )
+
+    async def resolve_carryover(self, session: Any, as_of_date: str) -> int:
+        """Adopt broker orders for prior-date UNKNOWN intents; return how many were adopted."""
+        self._require_lock()
+        as_of = _date.fromisoformat(as_of_date)
+        lookback = self._limits.carryover_lookback_days
+        states = self._journal.states()
+        bound: set[str] = set()
+        for st in states.values():
+            if st.broker_order_no:
+                bound.add(normalize_order_no(st.broker_order_no))
+        targets: dict[str, list[str]] = {}
+        baselines: dict[str, frozenset[str] | None] = {}
+        intents: dict[str, OrderIntent] = {}
+        for intent_id, st in states.items():
+            if st.intent is None or st.status is not IntentStatus.UNKNOWN:
+                continue
+            intent_date = st.intent.trading_date
+            if not 1 <= (as_of - _date.fromisoformat(intent_date)).days <= lookback:
+                continue
+            targets.setdefault(intent_date, []).append(intent_id)
+            baselines[intent_id] = st.baseline_order_nos
+            intents[intent_id] = st.intent
+        if not targets:
+            return 0
+        for intent_ids in targets.values():
+            intent_ids.sort()
+        adopted: list[tuple[str, BrokerOrder]] = []
+        conflicted: set[str] = set()
+        for event in self._journal.load():
+            if event.kind is JournalEventKind.RESOLVE_CONFLICT:
+                conflicted.add(event.intent_id)
+        for intent_date in sorted(targets):
+            try:
+                snapshot = await self._broker.fetch_daily_orders(session, intent_date)
+            except BrokerReadError as exc:
+                logger.warning("[EXEC] stage=carryover trading_date=%s run_id=%s status=carryover_read_failed "
+                               "detail=%s", intent_date, self._run_id, exc)
+                continue
+            for intent_id in targets[intent_date]:
+                candidate = self._candidates(intents[intent_id], snapshot, bound,
+                                             baseline=baselines[intent_id])
+                if len(candidate) == 1:
+                    order = candidate[0]
+                    self._journal.append(JournalEventKind.ADOPT, intent_id,
+                                         {"broker_order_no": order.order_no, "broker_org_no": order.org_no},
+                                         run_id=self._run_id)
+                    logger.info("[EXEC] stage=carryover intent_id=%s run_id=%s kind=adopt order_no=%s",
+                                intent_id, self._run_id, order.order_no)
+                    bound.add(normalize_order_no(order.order_no))
+                    adopted.append((intent_id, order))
+                elif len(candidate) > 1:
+                    if intent_id in conflicted:
+                        continue
+                    self._journal.append(JournalEventKind.RESOLVE_CONFLICT, intent_id,
+                                         {"n_candidates": len(candidate)}, run_id=self._run_id)
+                    logger.info("[EXEC] stage=carryover intent_id=%s run_id=%s kind=resolve_conflict n=%s",
+                                intent_id, self._run_id, len(candidate))
+                    conflicted.add(intent_id)
+        if not adopted:
+            return 0
+        history: dict[str, list[JournalEvent]] = {}
+        for event in self._journal.load():
+            history.setdefault(event.intent_id, []).append(event)
+        contradictions: list[str] = []
+        for intent_id, found in adopted:
+            payload = {"order_qty": found.order_qty, "filled_qty": found.filled_qty,
+                       "filled_amount_krw": found.filled_amount_krw, "remaining_qty": found.remaining_qty,
+                       "cancelled": found.cancelled, "rejected_qty": found.rejected_qty, "final": True}
+            events = history[intent_id]
+            probe = JournalEvent(seq=events[-1].seq + 1, ts="", kind=JournalEventKind.BROKER_STATE,
+                                 intent_id=intent_id, run_id=self._run_id, payload=payload)
+            try:
+                derive_intent_state([*events, probe])
+            except JournalCorruptError as exc:
+                logger.error("[RISK] stage=carryover intent_id=%s run_id=%s refusal=broker_state_contradiction "
+                             "order_no=%s detail=%s", intent_id, self._run_id, found.order_no, exc)
+                contradictions.append(intent_id)
+                continue
+            self._journal.append(JournalEventKind.BROKER_STATE, intent_id, payload, run_id=self._run_id)
+            logger.info("[EXEC] stage=carryover intent_id=%s run_id=%s kind=broker_state filled=%s final=%s",
+                        intent_id, self._run_id, found.filled_qty, True)
+        if contradictions:
+            raise BrokerReadError(f"broker order state contradicts journal intents: {sorted(contradictions)}")
+        return len(adopted)
 
     async def cancel_working(self, session: Any, trading_date: str) -> int:
         """Cancel every acked, non-final order of trading_date."""

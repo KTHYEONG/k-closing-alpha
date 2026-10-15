@@ -1291,3 +1291,113 @@ def test_unknown_exposure_sell_side_never_listed(tmp_path: Path) -> None:
         report = asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
         assert report.n_unknown_unresolved_total == 1
         assert report.unknown_exposures == ()
+
+
+def _carryover_limits(**over: Any) -> GatewayLimits:
+    return _limits(carryover_lookback_days=5, **over)
+
+
+def _unknown_with_send(journal: OrderJournal, intent: OrderIntent,
+                       baseline: list[str] | None = None) -> None:
+    payload: dict[str, Any] = {"attempt": 1}
+    if baseline is not None:
+        payload["baseline_order_nos"] = list(baseline)
+    journal.append(JournalEventKind.INTENT, intent.intent_id, intent_to_payload(intent), run_id="r")
+    journal.append(JournalEventKind.SEND, intent.intent_id, payload, run_id="r")
+    journal.append(JournalEventKind.RESULT, intent.intent_id,
+                   {"attempt": 1, "verdict": "ambiguous", "broker_order_no": None,
+                    "broker_org_no": None, "http_status": None, "msg_cd": "",
+                    "msg": "", "latency_ms": 1.0}, run_id="r")
+
+
+def test_carryover_requires_lock(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, _ = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with pytest.raises(RuntimeError):
+        asyncio.run(gateway.resolve_carryover(object(), "2026-10-13"))
+
+
+def test_carryover_adopts_prior_unknown_final(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        _unknown_with_send(journal, _entry(date="2026-10-12"))
+        broker.daily_script = [[_broker_order("12345", qty=10, price=10000, filled=10)]]
+        n = asyncio.run(gateway.resolve_carryover(object(), "2026-10-13"))
+        assert n == 1
+        state = journal.states()[_entry().intent_id]
+        assert state.status is IntentStatus.FILLED
+        assert state.final is True
+        assert state.broker_order_no == "12345"
+        assert [(lot.symbol, lot.qty) for lot in journal.open_lots()] == [("005930", 10)]
+        before = len(journal.load())
+        broker.daily_script = [[_broker_order("12345", qty=10, price=10000, filled=10)]]
+        assert asyncio.run(gateway.resolve_carryover(object(), "2026-10-13")) == 0
+        assert len(journal.load()) == before
+
+
+def test_carryover_ignores_today_stale_absent_and_window(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        _unknown_with_send(journal, _entry("today-unknown", date="2026-10-13"))
+        _unknown_with_send(journal, _entry("2026-10-12:005930:entry", date="2026-10-12"),
+                           baseline=["60001"])
+        _unknown_with_send(journal, _entry("2026-10-11:000660:entry", qty=2, date="2026-10-11"))
+        _unknown_with_send(journal, _entry("2026-10-01:005930:entry", date="2026-10-01"))
+        broker.daily_script = [[_broker_order("60001", qty=10, price=10000),
+                                _broker_order("60002", qty=1, price=10000)]]
+        assert asyncio.run(gateway.resolve_carryover(object(), "2026-10-13")) == 0
+        assert broker.daily_calls == 2
+        kinds = [e.kind for e in journal.load() if e.intent_id == "2026-10-12:005930:entry"]
+        assert JournalEventKind.ADOPT not in kinds
+        assert JournalEventKind.NOT_FOUND not in [e.kind for e in journal.load()]
+        with pytest.raises(ValueError, match="isoformat"):
+            asyncio.run(gateway.resolve_carryover(object(), "not-a-date"))
+
+
+def test_carryover_conflict_stays_unknown_idempotent(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        _unknown_with_send(journal, _entry(date="2026-10-12"))
+        broker.daily_script = [[_broker_order("c1", qty=10, price=10000),
+                                _broker_order("c2", qty=10, price=10000)]]
+        assert asyncio.run(gateway.resolve_carryover(object(), "2026-10-13")) == 0
+        state = journal.states()[_entry().intent_id]
+        assert state.status is IntentStatus.UNKNOWN
+        assert JournalEventKind.RESOLVE_CONFLICT in [e.kind for e in journal.load()
+                                                     if e.intent_id == _entry().intent_id]
+        before = len(journal.load())
+        broker.daily_script = [[_broker_order("c1", qty=10, price=10000),
+                                _broker_order("c2", qty=10, price=10000)]]
+        assert asyncio.run(gateway.resolve_carryover(object(), "2026-10-13")) == 0
+        assert len(journal.load()) == before
+
+
+def test_carryover_read_failure_isolated(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        _unknown_with_send(journal, _entry("2026-10-10:005930:entry", date="2026-10-10"))
+        _unknown_with_send(journal, _entry("2026-10-12:005930:entry", date="2026-10-12"))
+        broker.daily_script = [BrokerReadError("down"),
+                               [_broker_order("99999", qty=10, price=10000, filled=10)]]
+        assert asyncio.run(gateway.resolve_carryover(object(), "2026-10-13")) == 1
+        assert journal.states()["2026-10-12:005930:entry"].status is IntentStatus.FILLED
+        assert journal.states()["2026-10-10:005930:entry"].status is IntentStatus.UNKNOWN
+    assert "carryover_read_failed" in caplog.text
+
+
+def test_carryover_contradiction_raises_after_processing(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        _unknown_with_send(journal, _entry(date="2026-10-12"))
+        overfilled = BrokerOrder(order_no="over", orig_order_no="", org_no="001", symbol="005930",
+                                 side=OrderSide.BUY, order_qty=10, order_price=10000, filled_qty=11,
+                                 filled_amount_krw=110000, remaining_qty=0, cancelled=False, rejected_qty=0)
+        broker.daily_script = [[overfilled]]
+        with pytest.raises(BrokerReadError, match="contradicts"):
+            asyncio.run(gateway.resolve_carryover(object(), "2026-10-13"))
+        assert journal.states()[_entry().intent_id].status is IntentStatus.ACKED
