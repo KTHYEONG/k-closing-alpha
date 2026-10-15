@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA closing-auction indicative path capture (Mon-Fri 15:45 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 15:45:00 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kca-auction-path.service
+
+[Install]
+WantedBy=timers.target

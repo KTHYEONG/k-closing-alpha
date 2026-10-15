@@ -23,3 +23,7 @@ class DbsecSettings(EnvSettings):
     DB_RATE_LIMIT_BACKOFF_SECONDS: float = Field(default=1.2, gt=0.0)
     # Declared by vendor, probed 2026-10-15: token 1/min.
     DB_TOKEN_ISSUE_MIN_INTERVAL_SECONDS: float = Field(default=61.0, ge=60.0)
+    DB_AUCTION_PATH_ENABLED: bool = Field(default=False)
+    DB_AUCTION_PATH_MAX_PAGES: int = Field(default=60, ge=1)
+    DB_AUCTION_PATH_DEADLINE_HHMMSS: str = Field(default="190000", pattern=r"^\d{6}$")
+    DB_AUCTION_PATH_CONCURRENCY: int = Field(default=2, ge=1)

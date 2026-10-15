@@ -68,6 +68,12 @@ def test_expiry_margin_fits_window() -> None:
     assert int(CollectionSettings().COLLECTION_TAPE_LOOKBACK_DAYS) > TAPE_EXPIRY_WARNING_DAYS
 
 
+def test_auction_path_timer_aligned_with_ready_constant() -> None:
+    from src.config.market_session import AUCTION_PATH_READY_HHMMSS
+
+    assert _oncalendar_hhmmss("kca-auction-path.timer") == AUCTION_PATH_READY_HHMMSS
+
+
 def test_no_literal_duplicates() -> None:
     import src.daily.tick_tape_sweep as sweep
     import src.tools.daily_audit as audit

@@ -62,6 +62,7 @@ class CaptureDataset(StrEnum):
     CREDIT_BALANCE = "CREDIT_BALANCE"
     DERIVATIVES_BASIS = "DERIVATIVES_BASIS"
     PROGRAM_DAILY = "PROGRAM_DAILY"
+    AUCTION_PATH = "AUCTION_PATH"
 
 
 def _ensure_aware(value: datetime, field: str) -> datetime:

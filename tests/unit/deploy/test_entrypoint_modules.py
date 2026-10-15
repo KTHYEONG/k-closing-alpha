@@ -35,6 +35,16 @@ def test_every_deployed_module_entrypoint_resolves() -> None:
     assert missing == [], f"deployed entrypoints do not resolve: {missing}"
 
 
+def test_auction_path_entrypoint_importable() -> None:
+    """The auction-path unit must reference an importable module exposing main."""
+    import importlib
+
+    modules = _scan_entrypoint_modules()
+    assert "src.daily.auction_path" in modules
+    module = importlib.import_module("src.daily.auction_path")
+    assert callable(module.main)
+
+
 def test_entrypoint_scan_is_not_vacuous() -> None:
     """The scan must match at least one src.daily.* and one src.tools.* module."""
     modules = _scan_entrypoint_modules()
