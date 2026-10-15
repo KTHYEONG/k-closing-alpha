@@ -103,6 +103,32 @@ def _notional(intent: OrderIntent) -> int:
     return int(intent.qty) * int(price or 0)
 
 
+def match_candidates(
+    intent: OrderIntent, snapshot: Sequence[BrokerOrder], bound: set[str],
+    *, baseline: frozenset[str] | None = None,
+) -> list[BrokerOrder]:
+    """Return unbound broker orders matching intent's symbol, side, qty and limit price, outside baseline."""
+    out: list[BrokerOrder] = []
+    for order in snapshot:
+        normalized_no = normalize_order_no(order.order_no)
+        if baseline is not None and (not normalized_no or normalized_no in baseline):
+            continue
+        if normalized_no in bound:
+            continue
+        if order.symbol != intent.symbol or order.side != intent.side:
+            continue
+        if order.order_qty != intent.qty:
+            continue
+        if (
+            intent.order_type.value == "limit"
+            and intent.limit_price is not None
+            and order.order_price != intent.limit_price
+        ):
+            continue
+        out.append(order)
+    return out
+
+
 class OrderGateway:
     """Durable gateway binding one broker, one journal and one run id."""
 
@@ -555,25 +581,7 @@ class OrderGateway:
         self, intent: OrderIntent, snapshot: Sequence[BrokerOrder], bound: set[str],
         *, baseline: frozenset[str] | None = None,
     ) -> list[BrokerOrder]:
-        out: list[BrokerOrder] = []
-        for order in snapshot:
-            normalized_no = normalize_order_no(order.order_no)
-            if baseline is not None and (not normalized_no or normalized_no in baseline):
-                continue
-            if normalized_no in bound:
-                continue
-            if order.symbol != intent.symbol or order.side != intent.side:
-                continue
-            if order.order_qty != intent.qty:
-                continue
-            if (
-                intent.order_type.value == "limit"
-                and intent.limit_price is not None
-                and order.order_price != intent.limit_price
-            ):
-                continue
-            out.append(order)
-        return out
+        return match_candidates(intent, snapshot, bound, baseline=baseline)
 
     async def _resolve_unknown(self, session: Any, intent: OrderIntent, deadline: datetime) -> IntentState:
         polls = self._limits.unknown_resolve_polls
