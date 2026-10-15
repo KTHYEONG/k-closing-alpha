@@ -32,6 +32,7 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
         "kca-altdata-capture.service",
         "kca-auction-close.service",
         "kca-auction-open.service",
+        "kca-auction-path.service",
         "kca-extended-backfill.service",
         "kca-aftermarket-book.service",
         "kca-tape-sweep.service",
@@ -1344,3 +1345,25 @@ def test_p5_reconcile_tick_chowns_only_its_paths() -> None:
     targets = chown.split("ubuntu:ubuntu", 1)[1].split()
     assert "%h/k-closing-alpha/data" not in targets
     assert all(t.startswith(("%h/k-closing-alpha/data/", "%h/.cache/kis")) for t in targets), targets
+
+
+def test_auction_path_unit_pair_declared() -> None:
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    timer = (root / "kca-auction-path.timer").read_text(encoding="utf-8")
+    service = (root / "kca-auction-path.service").read_text(encoding="utf-8")
+
+    assert "OnCalendar=Mon..Fri 15:45:00 Asia/Seoul" in timer.splitlines()
+    assert "AccuracySec=1s" in timer.splitlines()
+    assert "Persistent=false" in timer.splitlines()
+    assert "Unit=kca-auction-path.service" in timer
+    assert "src.daily.auction_path" in service
+    assert "-e BROKER_ADMISSION_CLASS=bulk" in service
+    assert "KIS_DATA_ROLE" not in service
+    assert "-v %h/.cache/kis:/app/.cache/kis" in service
+    close_mounts = (root / "kca-auction-close.service").read_text(encoding="utf-8")
+    for mount in re.findall(r"-v \S+", close_mounts):
+        if ".cache/kis" in mount or "/app/data" in mount or "/app/artifacts" in mount:
+            assert mount in service
