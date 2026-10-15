@@ -392,3 +392,23 @@ def test_good_entry_states_defined_once_in_capture_contracts() -> None:
                 if isinstance(target, ast.Name) and target.id in ("_GOOD_ENTRY_STATES", "GOOD_ENTRY_STATES"):
                     hits.append(str(path))
     assert hits == ["src/data/capture_contracts.py"]
+
+
+def test_capture_dataset_includes_auction_path() -> None:
+    assert CaptureDataset("AUCTION_PATH") is CaptureDataset.AUCTION_PATH
+    assert {item.value for item in CaptureDataset} >= {
+        "SCAN",
+        "PRICE",
+        "INVESTOR_ESTIMATE",
+        "ORDERBOOK",
+        "PROGRAM",
+        "MINUTE_BARS",
+        "TRADE_TICKS",
+        "DAILY_BARS",
+        "DISCLOSURE",
+        "SHORTING",
+        "CREDIT_BALANCE",
+        "DERIVATIVES_BASIS",
+        "PROGRAM_DAILY",
+        "AUCTION_PATH",
+    }
