@@ -469,3 +469,17 @@ def test_auction_path_branches(tmp_path, monkeypatch) -> None:
         slow.get_auction_path(object(), "005930", floor_hhmmss="152000", budget=_budget(deadline=tight))  # type: ignore[arg-type]
     )
     assert res2["termination_reason"] == "deadline"
+
+
+def test_token_throttle_propagates_from_paging_loops(tmp_path, monkeypatch) -> None:
+    _seed_admission(tmp_path, monkeypatch)
+
+    async def _throttled(session: Any, *a: Any, **k: Any) -> Any:
+        raise DbsecTokenThrottled("throttled")
+
+    client = _client()
+    client._post = _throttled  # type: ignore[method-assign]
+    with pytest.raises(DbsecTokenThrottled):
+        asyncio.run(client.get_auction_path(object(), "005930", floor_hhmmss="152000"))  # type: ignore[arg-type]
+    with pytest.raises(DbsecTokenThrottled):
+        asyncio.run(client.get_minute_chart(object(), "005930", _YMD))  # type: ignore[arg-type]
