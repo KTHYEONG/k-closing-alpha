@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -1258,3 +1259,26 @@ def test_entry_fill_metric_excludes_same_day_sell_proceeds(mock_binding, runner)
     ]]
     report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
     assert report.metrics["entry_fill_vs_decision_bp"] == pytest.approx((701_000 / 700_000 - 1) * 1e4)
+
+
+def test_reconcile_degrades_on_unknown_exposure(mock_binding, runner, caplog) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_unknown(journal, _entry_intent("005930", DAY, 3, 70_000))
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=3, sellable_qty=3)]
+    broker.daily_script = [[]]
+    with caplog.at_level(logging.WARNING):
+        report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("154100")] * 10)
+    assert (report.outcome, report.reason) == ("DEGRADED", "unknown_exposure")
+    assert report.metrics["n_unknown_unresolved_total"] == 1
+    assert report.metrics["unknown_exposures"] == [["005930", 3, 3]]
+    assert "kind=unknown_exposure" in caplog.text and "symbol=005930" in caplog.text
+
+
+def test_exit_still_sells_with_prior_unknown(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_unknown(journal, _entry_intent("005930", YESTERDAY, 3, 70_000))
+    _add_filled_entry(journal, entry_intent_id(YESTERDAY, "000660"), "000660", YESTERDAY, 4, 50_000)
+    broker.positions = [BrokerPosition(symbol="000660", holding_qty=4, sellable_qty=4)]
+    report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
+    assert len(broker.submit_calls) == 1
+    assert report.metrics["n_unknown_unresolved_total"] == 1

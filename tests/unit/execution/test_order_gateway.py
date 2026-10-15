@@ -1189,3 +1189,105 @@ def test_baseline_cancel_after_adoption(tmp_path: Path) -> None:
         broker.positions = []
         asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
         assert journal.states()[_entry().intent_id].status is IntentStatus.CANCELLED
+
+
+def _unknown_buy(
+    journal: OrderJournal,
+    intent_id: str = "2026-10-12:005930:entry",
+    qty: int = 3,
+    date: str = "2026-10-12",
+    symbol: str = "005930",
+) -> OrderIntent:
+    intent = OrderIntent(
+        intent_id=intent_id, trading_date=date, phase=OrderPhase.ENTRY,
+        symbol=symbol, side=OrderSide.BUY, order_type=OrderType.LIMIT,
+        qty=qty, limit_price=10000, decision_price=10000, parent_intent_id=None,
+    )
+    journal.append(JournalEventKind.INTENT, intent_id, intent_to_payload(intent), run_id="r")
+    journal.append(JournalEventKind.SEND, intent_id, {"attempt": 1}, run_id="r")
+    journal.append(JournalEventKind.RESULT, intent_id,
+                   {"attempt": 1, "verdict": "ambiguous", "broker_order_no": None,
+                    "broker_org_no": None, "http_status": None, "msg_cd": "",
+                    "msg": "", "latency_ms": 1.0}, run_id="r")
+    return intent
+
+
+def test_unknown_exposure_flagged(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        _unknown_buy(journal)
+        broker.daily_script = [[]]
+        broker.positions = [BrokerPosition(symbol="005930", holding_qty=3, sellable_qty=3)]
+        report = asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert report.unknown_exposures == (("005930", 3, 3),)
+        assert report.n_unknown_unresolved_total == 1
+
+
+def test_unknown_exposure_no_excess_no_row(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        _unknown_buy(journal)
+        broker.daily_script = [[]]
+        broker.positions = []
+        report = asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert report.unknown_exposures == ()
+        assert report.n_unknown_unresolved_total == 1
+
+
+def test_unknown_exposure_other_holdings_ignored(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        _unknown_buy(journal)
+        broker.daily_script = [[]]
+        broker.positions = [BrokerPosition(symbol="069500", holding_qty=5, sellable_qty=5)]
+        report = asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert report.unknown_exposures == ()
+        assert report.n_unknown_unresolved_total == 1
+
+
+def test_unknown_exposure_prior_date_counted(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        _unknown_buy(journal, intent_id="2026-10-11:005930:entry", date="2026-10-11")
+        broker.daily_script = [[]]
+        broker.positions = [BrokerPosition(symbol="005930", holding_qty=3, sellable_qty=3)]
+        report = asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert report.n_unknown_unresolved_total == 1
+        assert report.n_unknown == 0
+        assert report.unknown_exposures == (("005930", 3, 3),)
+
+
+def test_unknown_exposure_adopted_leaves_no_row(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        intent = _unknown_buy(journal, qty=10)
+        broker.daily_script = [[_broker_order("777", qty=10, price=10000, filled=10)]]
+        broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+        report = asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert report.unknown_exposures == ()
+        assert report.n_unknown_unresolved_total == 0
+        assert journal.states()[intent.intent_id].status is IntentStatus.FILLED
+        assert [(lot.symbol, lot.qty) for lot in journal.open_lots()] == [("005930", 10)]
+
+
+def test_unknown_exposure_sell_side_never_listed(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        sell = _exit("2026-10-12:005930:entry", qty=3, intent_id="2026-10-12:005930:exit")
+        journal.append(JournalEventKind.INTENT, sell.intent_id, intent_to_payload(sell), run_id="r")
+        journal.append(JournalEventKind.SEND, sell.intent_id, {"attempt": 1}, run_id="r")
+        journal.append(JournalEventKind.RESULT, sell.intent_id,
+                       {"attempt": 1, "verdict": "ambiguous", "broker_order_no": None,
+                        "broker_org_no": None, "http_status": None, "msg_cd": "",
+                        "msg": "", "latency_ms": 1.0}, run_id="r")
+        broker.daily_script = [[]]
+        broker.positions = [BrokerPosition(symbol="005930", holding_qty=3, sellable_qty=3)]
+        report = asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert report.n_unknown_unresolved_total == 1
+        assert report.unknown_exposures == ()
