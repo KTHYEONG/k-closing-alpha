@@ -34,6 +34,7 @@ class KisTradingSettings(EnvSettings):
     ORDER_UNKNOWN_RESOLVE_POLLS: int = Field(default=3, ge=1)
     ORDER_UNKNOWN_RESOLVE_INTERVAL_SECONDS: float = Field(default=2.0, gt=0, allow_inf_nan=False)
     ORDER_EXIT_RESEND_ON_AMBIGUOUS: bool = False
+    ORDER_UNKNOWN_CARRYOVER_LOOKBACK_DAYS: int = Field(default=5, ge=1)
     ORDER_JOURNAL_LOCK_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")

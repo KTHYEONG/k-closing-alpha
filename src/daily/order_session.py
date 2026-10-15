@@ -124,6 +124,7 @@ def _limits_from_settings() -> GatewayLimits:
         unknown_resolve_polls=settings.ORDER_UNKNOWN_RESOLVE_POLLS,
         unknown_resolve_interval_seconds=settings.ORDER_UNKNOWN_RESOLVE_INTERVAL_SECONDS,
         exit_resend_on_ambiguous=settings.ORDER_EXIT_RESEND_ON_AMBIGUOUS,
+        carryover_lookback_days=settings.ORDER_UNKNOWN_CARRYOVER_LOOKBACK_DAYS,
     )
 
 
@@ -483,6 +484,21 @@ def _finish_entry_report(
     return OrderSessionReport("entry", date_str, RUN_OUTCOME_DEGRADED, "entry_incomplete", metrics)
 
 
+async def _exit_carryover(
+    gateway: OrderGateway, broker: SessionBrokerPort, journal: OrderJournal, sess: Any, date_str: str, run_id: str,
+) -> int:
+    if not any(st.intent is not None and st.status is IntentStatus.UNKNOWN and st.intent.trading_date < date_str
+               for st in journal.states().values()):
+        return 0
+    # Carry-over is best effort: a token, read or contradiction failure must never block selling existing lots.
+    try:
+        await broker.ensure_token(sess)
+        return await gateway.resolve_carryover(sess, date_str)
+    except BrokerReadError as exc:
+        logger.warning("[EXEC] stage=carryover phase=exit run_id=%s status=failed detail=%s", run_id, exc)
+        return 0
+
+
 async def _run_exit(
     *,
     date_str: str,
@@ -494,9 +510,18 @@ async def _run_exit(
     env: str,
     run_id: str,
 ) -> OrderSessionReport:
+    gateway = OrderGateway(broker, journal, _limits_from_settings(), run_id=run_id, now_fn=_gateway_now(now_fn),
+                           sleep_fn=sleep_fn)
     lots = [lot for lot in journal.open_lots() if lot.trading_date < date_str]
+    n_carryover: int | None = None
     if not lots:
-        return OrderSessionReport("exit", date_str, RUN_OUTCOME_SKIPPED, "no_open_positions", {"env": env})
+        # A lost prior-day buy has no lot yet; adopting it first is the only way this run can sell it.
+        with journal.exclusive():
+            n_carryover = await _exit_carryover(gateway, broker, journal, sess, date_str, run_id)
+        lots = [lot for lot in journal.open_lots() if lot.trading_date < date_str]
+        if not lots:
+            return OrderSessionReport("exit", date_str, RUN_OUTCOME_SKIPPED, "no_open_positions",
+                                      {"env": env, "n_carryover_adopted": n_carryover})
     now = now_fn()
     if _hhmmss(now) < ORDER_EXIT_EARLIEST_HHMMSS:
         gap = (_kst_deadline(date_str, ORDER_EXIT_EARLIEST_HHMMSS) - now.to_pydatetime()).total_seconds()
@@ -507,15 +532,16 @@ async def _run_exit(
         now = now_fn()
         lots = [lot for lot in journal.open_lots() if lot.trading_date < date_str]
         if not lots:
-            return OrderSessionReport("exit", date_str, RUN_OUTCOME_SKIPPED, "no_open_positions", {"env": env})
+            return OrderSessionReport("exit", date_str, RUN_OUTCOME_SKIPPED, "no_open_positions",
+                                      {"env": env, "n_carryover_adopted": n_carryover or 0})
     if _hhmmss(now) >= ORDER_EXIT_SUBMIT_DEADLINE_HHMMSS:
         return OrderSessionReport(
             "exit", date_str, RUN_OUTCOME_DEGRADED, "exit_window_expired",
-            {"env": env, "n_lots": len(lots)})
-    gateway = OrderGateway(broker, journal, _limits_from_settings(), run_id=run_id, now_fn=_gateway_now(now_fn),
-                           sleep_fn=sleep_fn)
+            {"env": env, "n_lots": len(lots), "n_carryover_adopted": n_carryover or 0})
     deadline = _kst_deadline(date_str, ORDER_EXIT_SUBMIT_DEADLINE_HHMMSS)
     with journal.exclusive():
+        if n_carryover is None:
+            n_carryover = await _exit_carryover(gateway, broker, journal, sess, date_str, run_id)
         fresh_lots = sorted(
             (lot for lot in journal.open_lots() if lot.trading_date < date_str),
             key=lambda lot: (lot.trading_date, lot.entry_intent_id),
@@ -540,7 +566,8 @@ async def _run_exit(
             return _finish_exit_report(
                 journal=journal, lots=planned_lots, exit_ids=stored_ids,
                 n_skipped=_planned_skip_count(journal, date_str, OrderPhase.EXIT),
-                date_str=date_str, env=env, t_last=t_last, deadline=deadline, run_id=run_id)
+                date_str=date_str, env=env, t_last=t_last, deadline=deadline, run_id=run_id,
+                n_carryover_adopted=n_carryover)
         if journal.is_halted():
             halted = [PlannedSkip(
                 intent_id=exit_intent_id(lot.entry_intent_id, date_str), symbol=lot.symbol,
@@ -549,7 +576,8 @@ async def _run_exit(
             t_last = now_fn()
             return _finish_exit_report(
                 journal=journal, lots=fresh_lots, exit_ids=[], n_skipped=len(halted),
-                date_str=date_str, env=env, t_last=t_last, deadline=deadline, run_id=run_id)
+                date_str=date_str, env=env, t_last=t_last, deadline=deadline, run_id=run_id,
+                n_carryover_adopted=n_carryover)
         try:
             await broker.ensure_token(sess)
         except BrokerReadError:
@@ -593,7 +621,7 @@ async def _run_exit(
         report = _finish_exit_report(
             journal=journal, lots=fresh_lots, exit_ids=[i.intent_id for i in intents],
             n_skipped=len(skips), date_str=date_str, env=env, t_last=t_last,
-            deadline=deadline, run_id=run_id)
+            deadline=deadline, run_id=run_id, n_carryover_adopted=n_carryover)
         if post_send is not None:
             metrics = dict(report.metrics)
             metrics["post_send_reconcile"] = post_send
@@ -612,6 +640,7 @@ def _finish_exit_report(
     t_last: pd.Timestamp,
     deadline: datetime,
     run_id: str,
+    n_carryover_adopted: int = 0,
 ) -> OrderSessionReport:
     states = journal.states()
     sold_by_parent: dict[str, int] = {}
@@ -632,6 +661,7 @@ def _finish_exit_report(
         "n_rejected": counts["n_rejected"],
         "n_unknown": counts["n_unknown"],
         "n_skipped": n_skipped,
+        "n_carryover_adopted": n_carryover_adopted,
         "n_unknown_unresolved_total": _n_unknown_unresolved(states),
         "shortfall_qty": shortfall,
         "max_latency_ms": _max_latency_ms(journal, run_id),
@@ -703,6 +733,7 @@ async def _run_reconcile(
                                   {"env": env, "scope": scope.value})
     last_report: ReconcileReport | None = None
     last_failed = False
+    n_carryover = 0
     while True:
         now = now_fn()
         past_deadline = backdated or _hhmmss(now) >= deadline_hhmmss
@@ -710,6 +741,7 @@ async def _run_reconcile(
         try:
             await broker.ensure_token(sess)
             with journal.exclusive():
+                n_carryover += await gateway.resolve_carryover(sess, date_str)
                 last_report = await gateway.reconcile(sess, date_str, finalize=finalize)
             last_failed = False
         except BrokerReadError:
@@ -742,6 +774,7 @@ async def _run_reconcile(
         "filled_amount_krw": last_report.filled_amount_krw,
         "n_unknown_unresolved_total": last_report.n_unknown_unresolved_total,
         "unknown_exposures": [list(t) for t in last_report.unknown_exposures],
+        "n_carryover_adopted": n_carryover,
     }
     for symbol, qty, excess in last_report.unknown_exposures:
         logger.warning("[RISK] stage=reconcile phase=%s run_id=%s kind=unknown_exposure symbol=%s qty=%s excess=%s",

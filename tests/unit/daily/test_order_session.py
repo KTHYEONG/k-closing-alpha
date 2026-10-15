@@ -1282,3 +1282,49 @@ def test_exit_still_sells_with_prior_unknown(mock_binding, runner) -> None:
     report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
     assert len(broker.submit_calls) == 1
     assert report.metrics["n_unknown_unresolved_total"] == 1
+
+
+def test_exit_adopts_prior_unknown_then_sells(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_unknown(journal, _entry_intent("005930", YESTERDAY, 10, 70_000))
+    broker.daily_script = [[_broker_row("n1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)], []]
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+    report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
+    assert report.metrics["n_carryover_adopted"] == 1
+    assert len(broker.submit_calls) == 1
+    states = OrderJournal(runner.tmp_path, "mock", lock_timeout_seconds=5.0).states()
+    assert states[entry_intent_id(YESTERDAY, "005930")].status.value == "filled"
+
+
+def test_exit_without_carryover_targets_reads_nothing(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_filled_entry(journal, entry_intent_id(YESTERDAY, "005930"), "005930", YESTERDAY, 10, 70_000)
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+    report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
+    assert report.metrics["n_carryover_adopted"] == 0
+    assert broker.daily_calls == 2
+
+
+def test_reconcile_reports_carryover_adoptions(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_unknown(journal, _entry_intent("005930", YESTERDAY, 10, 70_000))
+    _add_acked(journal, _entry_intent("000660", DAY, 4, 50_000), "n2")
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10),
+                        BrokerPosition(symbol="000660", holding_qty=4, sellable_qty=4)]
+    broker.daily_script = [
+        [_broker_row("n1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)],
+        [_broker_row("n2", "000660", OrderSide.BUY, 4, 50_000, 4, 200_000)],
+    ]
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    assert report.metrics["n_carryover_adopted"] == 1
+
+
+def test_exit_sells_despite_carryover_contradiction(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_unknown(journal, _entry_intent("005930", YESTERDAY, 10, 70_000))
+    _add_filled_entry(journal, entry_intent_id(YESTERDAY, "000660"), "000660", YESTERDAY, 4, 50_000)
+    broker.daily_script = [[_broker_row("n1", "005930", OrderSide.BUY, 10, 70_000, 11, 770_000)], [], []]
+    broker.positions = [BrokerPosition(symbol="000660", holding_qty=4, sellable_qty=4)]
+    report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
+    assert report.metrics["n_carryover_adopted"] == 0
+    assert len(broker.submit_calls) == 1
