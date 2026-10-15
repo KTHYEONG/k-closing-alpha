@@ -89,6 +89,8 @@ class ReconcileReport:
     n_foreign_orders: int
     position_shortfalls: tuple[tuple[str, int, int], ...]
     filled_amount_krw: int
+    n_unknown_unresolved_total: int = 0
+    unknown_exposures: tuple[tuple[str, int, int], ...] = ()
 
 
 _SENDABLE: frozenset[IntentStatus] = frozenset({IntentStatus.RECORDED, IntentStatus.NOT_SENT})
@@ -337,6 +339,21 @@ class OrderGateway:
         states = self._journal.states()
         filled_amount = sum(st.filled_amount_krw for key, st in states.items()
                             if self._state_date(st) == trading_date)
+        n_unknown_unresolved_total = sum(
+            1 for st in states.values() if st.intent is not None and st.status is IntentStatus.UNKNOWN
+        )
+        unknown_buy: dict[str, int] = {}
+        for st in states.values():
+            if st.intent is None or st.status is not IntentStatus.UNKNOWN:
+                continue
+            if st.intent.side is not OrderSide.BUY:
+                continue
+            unknown_buy[st.intent.symbol] = unknown_buy.get(st.intent.symbol, 0) + st.intent.qty
+        exposures: list[tuple[str, int, int]] = []
+        for symbol in sorted(unknown_buy):
+            excess = holding.get(symbol, 0) - journal_qty.get(symbol, 0)
+            if excess > 0:
+                exposures.append((symbol, unknown_buy[symbol], excess))
         day_states = [states[k] for k in day_ids]
         n_missing = 0
         broker_nos = {normalize_order_no(o.order_no) for o in snapshot}
@@ -355,6 +372,8 @@ class OrderGateway:
             n_foreign_orders=n_foreign,
             position_shortfalls=tuple(shortfalls),
             filled_amount_krw=filled_amount,
+            n_unknown_unresolved_total=n_unknown_unresolved_total,
+            unknown_exposures=tuple(exposures),
         )
 
     async def cancel_working(self, session: Any, trading_date: str) -> int:

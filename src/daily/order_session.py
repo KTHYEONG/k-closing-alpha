@@ -50,7 +50,7 @@ from src.execution.order_contract import (
     size_entry_orders,
 )
 from src.execution.order_gateway import BrokerPort, GatewayLimits, OrderGateway, PlannedSkip, ReconcileReport
-from src.execution.order_journal import IntentStatus, OpenLot, OrderJournal
+from src.execution.order_journal import IntentState, IntentStatus, OpenLot, OrderJournal
 from src.tools.run_outcome import (
     RUN_OUTCOME_DEGRADED,
     RUN_OUTCOME_OK,
@@ -469,6 +469,7 @@ def _finish_entry_report(
         "n_unknown": counts["n_unknown"],
         "n_not_sent": counts["n_not_sent"],
         "n_skipped": n_skipped + counts["n_skipped"],
+        "n_unknown_unresolved_total": _n_unknown_unresolved(states),
         "capital_krw": capital,
         "planned_notional_krw": notional,
         "decided_to_first_send_s": (t_first - ready_at).total_seconds(),
@@ -631,6 +632,7 @@ def _finish_exit_report(
         "n_rejected": counts["n_rejected"],
         "n_unknown": counts["n_unknown"],
         "n_skipped": n_skipped,
+        "n_unknown_unresolved_total": _n_unknown_unresolved(states),
         "shortfall_qty": shortfall,
         "max_latency_ms": _max_latency_ms(journal, run_id),
         "last_send_seconds_before_deadline": (deadline - t_last.to_pydatetime()).total_seconds(),
@@ -638,6 +640,10 @@ def _finish_exit_report(
     if shortfall == 0 and counts["n_rejected"] == 0 and counts["n_unknown"] == 0 and counts["n_not_sent"] == 0:
         return OrderSessionReport("exit", date_str, RUN_OUTCOME_OK, "exit_complete", metrics)
     return OrderSessionReport("exit", date_str, RUN_OUTCOME_DEGRADED, "exit_incomplete", metrics)
+
+
+def _n_unknown_unresolved(states: Mapping[str, IntentState]) -> int:
+    return sum(1 for st in states.values() if st.intent is not None and st.status is IntentStatus.UNKNOWN)
 
 
 def _scope_intents(journal: OrderJournal, date_str: str, scope: OrderPhase) -> list[str]:
@@ -734,7 +740,12 @@ async def _run_reconcile(
         "n_foreign_orders": last_report.n_foreign_orders,
         "position_shortfalls": [list(t) for t in last_report.position_shortfalls],
         "filled_amount_krw": last_report.filled_amount_krw,
+        "n_unknown_unresolved_total": last_report.n_unknown_unresolved_total,
+        "unknown_exposures": [list(t) for t in last_report.unknown_exposures],
     }
+    for symbol, qty, excess in last_report.unknown_exposures:
+        logger.warning("[RISK] stage=reconcile phase=%s run_id=%s kind=unknown_exposure symbol=%s qty=%s excess=%s",
+                       phase, run_id, symbol, qty, excess)
     if scope is OrderPhase.ENTRY:
         filled_qty_total = sum(st.filled_qty for st in relevant)
         if filled_qty_total > 0:
@@ -744,10 +755,13 @@ async def _run_reconcile(
                 metrics["entry_fill_vs_decision_bp"] = (
                     sum(st.filled_amount_krw for st in relevant) / decision_basis - 1) * 1e4
     complete = (all(st.status is IntentStatus.FILLED for st in relevant) and last_report.n_unknown == 0
-                and last_report.n_missing_at_broker == 0 and not last_report.position_shortfalls)
+                and last_report.n_missing_at_broker == 0 and not last_report.position_shortfalls
+                and last_report.n_unknown_unresolved_total == 0)
     if complete:
         return OrderSessionReport(phase, date_str, RUN_OUTCOME_OK, "reconcile_complete", metrics)
-    if last_report.n_unknown > 0:
+    if last_report.unknown_exposures:
+        reason = "unknown_exposure"
+    elif last_report.n_unknown > 0:
         reason = "unknown_orders"
     elif last_report.n_missing_at_broker > 0:
         reason = "missing_at_broker"
