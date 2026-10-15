@@ -243,7 +243,7 @@ def test_not_sent_retried_and_rejected_terminal(tmp_path: Path) -> None:
 def test_ambiguous_adopt_and_not_found(tmp_path: Path) -> None:
     broker = FakeBroker()
     broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
-    broker.daily_script = [[_broker_order("12345", qty=10, price=10000)]]
+    broker.daily_script = [[], [_broker_order("12345", qty=10, price=10000)]]
     gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1), _now())
     with journal.exclusive():
         gateway.plan([_entry()], [])
@@ -254,7 +254,7 @@ def test_ambiguous_adopt_and_not_found(tmp_path: Path) -> None:
     assert len(broker.submit_calls) == 1
     broker2 = FakeBroker()
     broker2.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
-    broker2.daily_script = [[], []]
+    broker2.daily_script = [[], [], []]
     gateway2, journal2 = _gateway(tmp_path / "amb-b", broker2, _limits(unknown_resolve_polls=2), _now())
     iid = "2026-10-12:000660:entry"
     with journal2.exclusive():
@@ -269,7 +269,7 @@ def test_ambiguous_adopt_and_not_found(tmp_path: Path) -> None:
 def test_conflict_and_bound_excluded(tmp_path: Path) -> None:
     broker = FakeBroker()
     broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
-    broker.daily_script = [[_broker_order("1", qty=10, price=10000), _broker_order("2", qty=10, price=10000)]]
+    broker.daily_script = [[], [_broker_order("1", qty=10, price=10000), _broker_order("2", qty=10, price=10000)]]
     gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1), _now())
     with journal.exclusive():
         gateway.plan([_entry()], [])
@@ -285,7 +285,7 @@ def test_conflict_and_bound_excluded(tmp_path: Path) -> None:
         gateway2.plan([entry_fresh, other], [])
         asyncio.run(gateway2.submit(object(), other.intent_id, deadline=_now() + timedelta(hours=1)))
         broker2.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
-        broker2.daily_script = [[_broker_order("0000Bound", qty=10, price=10000)]]
+        broker2.daily_script = [[], [_broker_order("0000Bound", qty=10, price=10000)]]
         gateway2b, _ = _gateway(tmp_path / "conflict-b", broker2, _limits(unknown_resolve_polls=1), _now(), journal=journal2)
         state = asyncio.run(gateway2b.submit(object(), entry_fresh.intent_id,
                                              deadline=_now() + timedelta(hours=1)))
@@ -295,20 +295,20 @@ def test_conflict_and_bound_excluded(tmp_path: Path) -> None:
 def test_read_error_leaves_unknown(tmp_path: Path) -> None:
     broker = FakeBroker()
     broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
-    broker.daily_script = [BrokerReadError("down")]
+    broker.daily_script = [[], BrokerReadError("down")]
     gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=2), _now())
     with journal.exclusive():
         gateway.plan([_entry()], [])
         state = asyncio.run(gateway.submit(object(), _entry().intent_id,
                                            deadline=_now() + timedelta(hours=1)))
         assert state.status is IntentStatus.UNKNOWN
-        assert broker.daily_calls == 1
+        assert broker.daily_calls == 2
 
 
 def test_exit_resend_variants(tmp_path: Path) -> None:
     broker = FakeBroker()
     broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
-    broker.daily_script = [[], []]
+    broker.daily_script = [[], [], []]
     gateway, journal = _gateway(
         tmp_path, broker, _limits(unknown_resolve_polls=2, exit_resend_on_ambiguous=False), _now())
     entry = _entry()
@@ -334,7 +334,7 @@ def test_exit_resend_once_when_sellable(tmp_path: Path) -> None:
     for sellable, expect_two in ((10, True), (1, False)):
         broker = FakeBroker()
         broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS), _result(SubmitVerdict.ACCEPTED, "s2")]
-        broker.daily_script = [[], []]
+        broker.daily_script = [[], [], []]
         broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=sellable)]
         gateway, journal = _gateway(
             tmp_path, broker, _limits(unknown_resolve_polls=2, exit_resend_on_ambiguous=True), _now())
@@ -627,7 +627,7 @@ def test_buy_send_bounded_across_restarts(tmp_path: Path) -> None:
                      [SubmitVerdict.NOT_SENT, SubmitVerdict.THROTTLED]):
         broker = FakeBroker()
         broker.submit_script = [_result(v) for v in verdicts]
-        broker.daily_script = [[], []]
+        broker.daily_script = [[], [], []]
         journal = OrderJournal(tmp_path, "mock", lock_timeout_seconds=5.0)
         iid = f"2026-10-12:00593{len(verdicts)}:entry"
         with journal.exclusive():
@@ -658,7 +658,7 @@ def test_submit_exception_maps_ambiguous(tmp_path: Path) -> None:
             raise ConnectionError("boom")
 
     broker = _Boom()
-    broker.daily_script = [[]]
+    broker.daily_script = [[], []]
     gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1), _now())
     with journal.exclusive():
         gateway.plan([_entry()], [])
@@ -695,7 +695,7 @@ def test_reconcile_conflict_and_mismatch_filters(tmp_path: Path) -> None:
 def test_resolve_generic_error_and_positions_error(tmp_path: Path) -> None:
     broker = FakeBroker()
     broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
-    broker.daily_script = [RuntimeError("boom")]
+    broker.daily_script = [[], RuntimeError("boom")]
     gateway, journal = _gateway(tmp_path / "gen-err", broker, _limits(unknown_resolve_polls=2), _now())
     with journal.exclusive():
         gateway.plan([_entry()], [])
@@ -704,7 +704,7 @@ def test_resolve_generic_error_and_positions_error(tmp_path: Path) -> None:
         assert state.status is IntentStatus.UNKNOWN
     broker2 = FakeBroker()
     broker2.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
-    broker2.daily_script = [[], []]
+    broker2.daily_script = [[], [], []]
     broker2.positions_error = RuntimeError("pos down")
     gateway2, journal2 = _gateway(tmp_path / "pos-err", broker2,
                                   _limits(unknown_resolve_polls=2,
@@ -838,7 +838,7 @@ def test_zero_resolve_polls_never_claims_not_found(tmp_path: Path) -> None:
         kinds = [e.kind for e in journal.load() if e.intent_id == ex.intent_id]
     assert state.status is IntentStatus.UNKNOWN
     assert JournalEventKind.NOT_FOUND not in kinds
-    assert broker.daily_calls == 0
+    assert broker.daily_calls == 1
     assert len(broker.submit_calls) == 1
 
 
@@ -847,7 +847,8 @@ def test_halt_during_resolution_blocks_exit_resend(tmp_path: Path) -> None:
         halt_path: Path
 
         async def fetch_daily_orders(self, session: Any, trading_date: str) -> list[BrokerOrder]:
-            self.halt_path.touch()
+            if self.daily_calls:
+                self.halt_path.touch()
             return await super().fetch_daily_orders(session, trading_date)
 
     broker = HaltingBroker()
@@ -882,3 +883,309 @@ def test_reconcile_refuses_broker_state_that_would_corrupt_journal(tmp_path: Pat
     assert states[_entry().intent_id].status is IntentStatus.ACKED
     assert states[_entry().intent_id].filled_qty == 0
     assert states[other.intent_id].status is IntentStatus.FILLED
+
+
+def test_baseline_stale_orders_do_not_block_adoption(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    cancelled_stale = [
+        BrokerOrder(order_no="00011", orig_order_no="", org_no="001", symbol="005930",
+                    side=OrderSide.BUY, order_qty=10, order_price=10000, filled_qty=0,
+                    filled_amount_krw=0, remaining_qty=0, cancelled=True, rejected_qty=0),
+        BrokerOrder(order_no="00022", orig_order_no="", org_no="001", symbol="005930",
+                    side=OrderSide.BUY, order_qty=10, order_price=10000, filled_qty=0,
+                    filled_amount_krw=0, remaining_qty=0, cancelled=True, rejected_qty=0),
+    ]
+    broker.daily_script = [list(cancelled_stale),
+                           [*cancelled_stale, _broker_order("00033", qty=10, price=10000)]]
+    broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id,
+                                           deadline=_now() + timedelta(hours=1)))
+        assert state.status is IntentStatus.ACKED
+        assert state.broker_order_no == "00033"
+        kinds = [e.kind for e in journal.load() if e.intent_id == _entry().intent_id]
+        assert JournalEventKind.RESOLVE_CONFLICT not in kinds
+    assert len(broker.submit_calls) == 1
+
+
+def test_baseline_captured_before_send(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.daily_script = [[_broker_order("00077", qty=1, price=100)], []]
+    broker.submit_script = [_result(SubmitVerdict.ACCEPTED, "99999")]
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id,
+                                           deadline=_now() + timedelta(hours=1)))
+        assert state.status is IntentStatus.ACKED
+        sends = [e for e in journal.load()
+                 if e.intent_id == _entry().intent_id and e.kind is JournalEventKind.SEND]
+        assert sends[0].payload["baseline_order_nos"] == ["77"]
+        assert state.baseline_order_nos == frozenset({"77"})
+
+
+def test_baseline_genuine_duplicates_still_conflict(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.daily_script = [[], [_broker_order("90001", qty=10, price=10000),
+                               _broker_order("90002", qty=10, price=10000)]]
+    broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id,
+                                           deadline=_now() + timedelta(hours=1)))
+        assert state.status is IntentStatus.UNKNOWN
+        kinds = [e.kind for e in journal.load() if e.intent_id == _entry().intent_id]
+        assert JournalEventKind.RESOLVE_CONFLICT in kinds
+        assert state.broker_order_no is None
+
+
+def test_baseline_read_failure_keeps_sending(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    broker = FakeBroker()
+    broker.daily_script = [RuntimeError("boom"), [_broker_order("55555", qty=10, price=10000)]]
+    broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id,
+                                           deadline=_now() + timedelta(hours=1)))
+        assert state.status is IntentStatus.ACKED
+        sends = [e for e in journal.load()
+                 if e.intent_id == _entry().intent_id and e.kind is JournalEventKind.SEND]
+        assert "baseline_order_nos" not in sends[0].payload
+        assert state.baseline_order_nos is None
+    assert len(broker.submit_calls) == 1
+    failures = [record for record in caplog.records if "baseline_read_failed" in record.message]
+    assert len(failures) == 1
+    assert failures[0].exc_info is not None
+
+
+def test_baseline_latency_expiring_deadline_prevents_post(tmp_path: Path) -> None:
+    moment = _now()
+    deadline = moment + timedelta(seconds=1)
+
+    class SlowBroker(FakeBroker):
+        async def fetch_daily_orders(self, session: Any, trading_date: str) -> list[BrokerOrder]:
+            nonlocal moment
+            moment = deadline
+            return []
+
+    broker = SlowBroker()
+    journal = OrderJournal(tmp_path, "mock", lock_timeout_seconds=5.0)
+    gateway = OrderGateway(broker, journal, _limits(), run_id="r", now_fn=lambda: moment,
+                           sleep_fn=asyncio.sleep)
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id, deadline=deadline))
+    assert state.reason == "deadline_passed"
+    assert state.n_sends == 0
+    assert broker.submit_calls == []
+
+
+def test_baseline_is_fresh_and_precedes_each_post(tmp_path: Path) -> None:
+    rows = [_broker_order("00077"), _broker_order("000")]
+
+    class RecordingBroker(FakeBroker):
+        async def fetch_daily_orders(self, session: Any, trading_date: str) -> list[BrokerOrder]:
+            self.daily_calls += 1
+            return list(rows)
+
+        async def submit_order(self, session: Any, intent: OrderIntent) -> SubmitResult:
+            expected = {row.order_no.lstrip("0") for row in rows} - {""}
+            assert journal.states()[intent.intent_id].baseline_order_nos == frozenset(expected)
+            number = str(100 + len(self.submit_calls))
+            rows.append(_broker_order(number))
+            self.submit_calls.append(intent.intent_id)
+            return _result(SubmitVerdict.ACCEPTED, number)
+
+    broker = RecordingBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    intents = [_entry("first"), _entry("second")]
+    with journal.exclusive():
+        gateway.plan(intents, [])
+        for intent in intents:
+            asyncio.run(gateway.submit(object(), intent.intent_id, deadline=_now() + timedelta(hours=1)))
+        assert journal.states()["second"].baseline_order_nos == frozenset({"77", "100"})
+    assert broker.daily_calls == 2
+
+
+def test_baseline_legacy_reconcile_adopts(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        intent = _entry()
+        journal.append(JournalEventKind.INTENT, intent.intent_id, intent_to_payload(intent), run_id="r")
+        journal.append(JournalEventKind.SEND, intent.intent_id, {"attempt": 1}, run_id="r")
+        broker.daily_script = [[_broker_order("31337", qty=10, price=10000)]]
+        broker.positions = []
+        asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert journal.states()[intent.intent_id].status is IntentStatus.ACKED
+
+
+def test_baseline_reconcile_adopts_only_new(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        intent = _entry()
+        journal.append(JournalEventKind.INTENT, intent.intent_id, intent_to_payload(intent), run_id="r")
+        journal.append(JournalEventKind.SEND, intent.intent_id,
+                       {"attempt": 1, "baseline_order_nos": ["60001"]}, run_id="r")
+        old = _broker_order("60001", qty=10, price=10000)
+        new = _broker_order("60002", qty=10, price=10000)
+        broker.daily_script = [[old, new]]
+        broker.positions = []
+        asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert journal.states()[intent.intent_id].broker_order_no == "60002"
+    broker2 = FakeBroker()
+    gateway2, journal2 = _gateway(tmp_path / "rec-base-only", broker2, _limits(), _now())
+    with journal2.exclusive():
+        intent = _entry()
+        journal2.append(JournalEventKind.INTENT, intent.intent_id, intent_to_payload(intent), run_id="r")
+        journal2.append(JournalEventKind.SEND, intent.intent_id,
+                        {"attempt": 1, "baseline_order_nos": ["60001"]}, run_id="r")
+        broker2.daily_script = [[_broker_order("60001", qty=10, price=10000)]]
+        broker2.positions = []
+        asyncio.run(gateway2.reconcile(object(), "2026-10-12", finalize=False))
+        st = journal2.states()[intent.intent_id]
+        assert st.status is IntentStatus.UNKNOWN
+        kinds = [e.kind for e in journal2.load() if e.intent_id == intent.intent_id]
+        assert JournalEventKind.RESOLVE_CONFLICT not in kinds
+        assert JournalEventKind.ADOPT not in kinds
+
+
+def test_baseline_retry_reads_once(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.daily_script = [[], [], []]
+    broker.submit_script = [_result(SubmitVerdict.THROTTLED), _result(SubmitVerdict.ACCEPTED, "81818")]
+    gateway, journal = _gateway(tmp_path, broker, _limits(send_max_attempts=3), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id,
+                                           deadline=_now() + timedelta(hours=1)))
+        assert state.status is IntentStatus.ACKED
+        assert state.n_sends == 2
+        assert broker.daily_calls == 1
+        sends = [e for e in journal.load()
+                 if e.intent_id == _entry().intent_id and e.kind is JournalEventKind.SEND]
+        assert "baseline_order_nos" in sends[0].payload
+        assert "baseline_order_nos" not in sends[1].payload
+
+
+def test_baseline_refused_costs_no_read(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        (journal._dir / "HALT").touch()
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id,
+                                           deadline=_now() + timedelta(hours=1)))
+        assert state.status is IntentStatus.SKIPPED
+    assert broker.daily_calls == 0
+    (journal._dir / "HALT").unlink()
+    broker2 = FakeBroker()
+    gateway2, journal2 = _gateway(tmp_path / "ref-risk", broker2,
+                                  _limits(max_notional_per_order_krw=1), _now())
+    with journal2.exclusive():
+        gateway2.plan([_entry()], [])
+        state = asyncio.run(gateway2.submit(object(), _entry().intent_id,
+                                            deadline=_now() + timedelta(hours=1)))
+        assert state.status is IntentStatus.SKIPPED
+    assert broker2.daily_calls == 0
+
+
+def test_baseline_exit_resend_preserves_original_baseline(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    old = _broker_order("00071", side=OrderSide.SELL, qty=4)
+    broker.daily_script = [[old], [old]]
+    broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS), _result(SubmitVerdict.ACCEPTED, "ex99")]
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+    gateway, journal = _gateway(tmp_path, broker,
+                                _limits(unknown_resolve_polls=1, exit_resend_on_ambiguous=True), _now())
+    entry = _entry()
+    ex = _exit(entry.intent_id, qty=4, intent_id="exit-base")
+    with journal.exclusive():
+        journal.append(JournalEventKind.INTENT, entry.intent_id, intent_to_payload(entry), run_id="r")
+        journal.append(JournalEventKind.SEND, entry.intent_id, {"attempt": 1}, run_id="r")
+        journal.append(JournalEventKind.RESULT, entry.intent_id,
+                       {"attempt": 1, "verdict": "accepted", "broker_order_no": "e-base",
+                        "broker_org_no": "001", "http_status": 200, "msg_cd": "0",
+                        "msg": "", "latency_ms": 1.0}, run_id="r")
+        journal.append(JournalEventKind.BROKER_STATE, entry.intent_id,
+                       {"order_qty": 10, "filled_qty": 10, "filled_amount_krw": 100,
+                        "remaining_qty": 0, "cancelled": False, "rejected_qty": 0, "final": True},
+                       run_id="r")
+        journal.append(JournalEventKind.INTENT, ex.intent_id, intent_to_payload(ex), run_id="r")
+        state = asyncio.run(gateway.submit(object(), ex.intent_id,
+                                           deadline=_now() + timedelta(hours=1)))
+        assert state.status is IntentStatus.ACKED
+        assert state.baseline_order_nos == frozenset({"71"})
+        assert len(broker.submit_calls) == 2
+        sends = [e for e in journal.load()
+                 if e.intent_id == ex.intent_id and e.kind is JournalEventKind.SEND]
+        assert len(sends) == 2
+        assert "baseline_order_nos" in sends[0].payload
+        assert "baseline_order_nos" not in sends[1].payload
+
+
+def test_halt_during_baseline_prevents_post(tmp_path: Path) -> None:
+    class HaltingBroker(FakeBroker):
+        async def fetch_daily_orders(self, session: Any, trading_date: str) -> list[BrokerOrder]:
+            (journal.journal_path.parent / "HALT").touch()
+            return []
+
+    broker = HaltingBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id,
+                                           deadline=_now() + timedelta(hours=1)))
+    assert state.status is IntentStatus.SKIPPED
+    assert state.reason == "halted"
+    assert state.n_sends == 0
+    assert broker.submit_calls == []
+
+
+def test_baseline_candidates_empty_no_skipped_without_baseline(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    intent = _entry()
+    empty = BrokerOrder(order_no="   ", orig_order_no="", org_no="001", symbol="005930",
+                        side=OrderSide.BUY, order_qty=10, order_price=10000, filled_qty=0,
+                        filled_amount_krw=0, remaining_qty=10, cancelled=False, rejected_qty=0)
+    good = _broker_order("70001", qty=10, price=10000)
+    assert gateway._candidates(intent, [empty, good], set()) == [empty, good]
+    assert gateway._candidates(intent, [empty, good], set(), baseline=frozenset()) == [good]
+    assert gateway._candidates(intent, [good], set(), baseline=frozenset({"70001"})) == []
+
+
+def test_baseline_cancel_after_adoption(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    cancelled_stale = [
+        BrokerOrder(order_no="00011", orig_order_no="", org_no="001", symbol="005930",
+                    side=OrderSide.BUY, order_qty=10, order_price=10000, filled_qty=0,
+                    filled_amount_krw=0, remaining_qty=0, cancelled=True, rejected_qty=0),
+        BrokerOrder(order_no="00022", orig_order_no="", org_no="001", symbol="005930",
+                    side=OrderSide.BUY, order_qty=10, order_price=10000, filled_qty=0,
+                    filled_amount_krw=0, remaining_qty=0, cancelled=True, rejected_qty=0),
+    ]
+    adopted = _broker_order("00033", qty=10, price=10000)
+    broker.daily_script = [list(cancelled_stale), [*cancelled_stale, adopted]]
+    broker.submit_script = [_result(SubmitVerdict.AMBIGUOUS)]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id,
+                                           deadline=_now() + timedelta(hours=1)))
+        assert state.status is IntentStatus.ACKED
+        n = asyncio.run(gateway.cancel_working(object(), "2026-10-12"))
+        assert n == 1
+        assert broker.cancel_calls == ["00033"]
+        cancelled_row = BrokerOrder(order_no="00033", orig_order_no="", org_no="001", symbol="005930",
+                                    side=OrderSide.BUY, order_qty=10, order_price=10000, filled_qty=0,
+                                    filled_amount_krw=0, remaining_qty=0, cancelled=True, rejected_qty=0)
+        broker.daily_script = [[cancelled_row]]
+        broker.positions = []
+        asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert journal.states()[_entry().intent_id].status is IntentStatus.CANCELLED

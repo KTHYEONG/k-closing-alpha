@@ -15,7 +15,14 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from src.execution.order_contract import OrderIntent, OrderPhase, OrderSide, OrderType, SubmitVerdict
+from src.execution.order_contract import (
+    OrderIntent,
+    OrderPhase,
+    OrderSide,
+    OrderType,
+    SubmitVerdict,
+    normalize_order_no,
+)
 from src.utils.file_lock import exclusive_file_lock, sidecar_lock_path
 
 __all__ = [
@@ -95,6 +102,7 @@ class IntentState:
     remaining_qty: int
     final: bool
     reason: str
+    baseline_order_nos: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +167,23 @@ def _payload_int(payload: Mapping[str, Any], key: str) -> int:
     return value
 
 
+def _payload_baseline(payload: Mapping[str, Any], intent_id: str) -> frozenset[str] | None:
+    if "baseline_order_nos" not in payload:
+        return None
+    value = payload["baseline_order_nos"]
+    if not isinstance(value, list):
+        raise JournalCorruptError(f"intent {intent_id!r}: bad baseline_order_nos")
+    out: set[str] = set()
+    for element in value:
+        if type(element) is not str or not element:
+            raise JournalCorruptError(f"intent {intent_id!r}: bad baseline_order_nos")
+        normalized = normalize_order_no(element)
+        if not normalized:
+            raise JournalCorruptError(f"intent {intent_id!r}: bad baseline_order_nos")
+        out.add(normalized)
+    return frozenset(out)
+
+
 def derive_intent_state(events: Sequence[JournalEvent]) -> IntentState:
     """Fold one intent's events into its state."""
     if len(events) == 0:
@@ -181,6 +206,12 @@ def derive_intent_state(events: Sequence[JournalEvent]) -> IntentState:
             raw = ev.payload.get("reason", "")
             reason = str(raw) if isinstance(raw, str) else ""
     n_sends = sum(1 for e in ordered if e.kind is JournalEventKind.SEND)
+    baseline: frozenset[str] | None = None
+    for ev in ordered:
+        if ev.kind is JournalEventKind.SEND:
+            parsed = _payload_baseline(ev.payload, intent_id)
+            if baseline is None and parsed is not None:
+                baseline = parsed
     broker_order_no: str | None = None
     broker_org_no: str | None = None
     for ev in ordered:
@@ -238,7 +269,7 @@ def derive_intent_state(events: Sequence[JournalEvent]) -> IntentState:
         else:
             status = IntentStatus.UNFILLED
         return IntentState(intent, status, n_sends, broker_order_no, broker_org_no,
-                           filled_qty, filled_amount, remaining_qty, True, reason)
+                           filled_qty, filled_amount, remaining_qty, True, reason, baseline)
     has_accepted = False
     has_adopt = any(e.kind is JournalEventKind.ADOPT for e in ordered)
     for e in ordered:
@@ -246,11 +277,11 @@ def derive_intent_state(events: Sequence[JournalEvent]) -> IntentState:
             has_accepted = True
     if has_accepted or has_adopt:
         return IntentState(intent, IntentStatus.ACKED, n_sends, broker_order_no, broker_org_no,
-                           filled_qty, filled_amount, remaining_qty, False, reason)
+                           filled_qty, filled_amount, remaining_qty, False, reason, baseline)
     for e in ordered:
         if e.kind is JournalEventKind.RESULT and SubmitVerdict(str(e.payload.get("verdict", ""))) is SubmitVerdict.REJECTED:
             return IntentState(intent, IntentStatus.REJECTED, n_sends, broker_order_no, broker_org_no,
-                               filled_qty, filled_amount, remaining_qty, True, reason)
+                               filled_qty, filled_amount, remaining_qty, True, reason, baseline)
     sends = [e for e in ordered if e.kind is JournalEventKind.SEND]
     results = [e for e in ordered if e.kind is JournalEventKind.RESULT]
     not_founds = [e for e in ordered if e.kind is JournalEventKind.NOT_FOUND]
@@ -259,34 +290,34 @@ def derive_intent_state(events: Sequence[JournalEvent]) -> IntentState:
         last_send_seq = max(e.seq for e in sends)
         if max(e.seq for e in not_founds) > last_send_seq:
             return IntentState(intent, IntentStatus.NOT_FOUND, n_sends, broker_order_no, broker_org_no,
-                               filled_qty, filled_amount, remaining_qty, False, reason)
+                               filled_qty, filled_amount, remaining_qty, False, reason, baseline)
     if sends:
         last_send_seq = max(e.seq for e in sends)
         later_results = [e for e in results if e.seq > last_send_seq]
         later_conflicts = [e for e in conflicts if e.seq > last_send_seq]
         if not later_results or later_conflicts:
             return IntentState(intent, IntentStatus.UNKNOWN, n_sends, broker_order_no, broker_org_no,
-                               filled_qty, filled_amount, remaining_qty, False, reason)
+                               filled_qty, filled_amount, remaining_qty, False, reason, baseline)
         last_verdict = SubmitVerdict(str(later_results[-1].payload.get("verdict", "")))
         if last_verdict is SubmitVerdict.AMBIGUOUS:
             return IntentState(intent, IntentStatus.UNKNOWN, n_sends, broker_order_no, broker_org_no,
-                               filled_qty, filled_amount, remaining_qty, False, reason)
+                               filled_qty, filled_amount, remaining_qty, False, reason, baseline)
         if last_verdict in (SubmitVerdict.THROTTLED, SubmitVerdict.AUTH_REJECTED, SubmitVerdict.NOT_SENT):
             return IntentState(intent, IntentStatus.NOT_SENT, n_sends, broker_order_no, broker_org_no,
-                               filled_qty, filled_amount, remaining_qty, False, reason)
+                               filled_qty, filled_amount, remaining_qty, False, reason, baseline)
     if results:
         last_verdict = SubmitVerdict(str(results[-1].payload.get("verdict", "")))
         if last_verdict in (SubmitVerdict.THROTTLED, SubmitVerdict.AUTH_REJECTED, SubmitVerdict.NOT_SENT):
             return IntentState(intent, IntentStatus.NOT_SENT, n_sends, broker_order_no, broker_org_no,
-                               filled_qty, filled_amount, remaining_qty, False, reason)
+                               filled_qty, filled_amount, remaining_qty, False, reason, baseline)
         if last_verdict is SubmitVerdict.AMBIGUOUS:
             return IntentState(intent, IntentStatus.UNKNOWN, n_sends, broker_order_no, broker_org_no,
-                               filled_qty, filled_amount, remaining_qty, False, reason)
+                               filled_qty, filled_amount, remaining_qty, False, reason, baseline)
     if any(e.kind is JournalEventKind.SKIP for e in ordered):
         return IntentState(intent, IntentStatus.SKIPPED, n_sends, broker_order_no, broker_org_no,
-                           filled_qty, filled_amount, remaining_qty, True, reason)
+                           filled_qty, filled_amount, remaining_qty, True, reason, baseline)
     return IntentState(intent, IntentStatus.RECORDED, n_sends, broker_order_no, broker_org_no,
-                       filled_qty, filled_amount, remaining_qty, False, reason)
+                       filled_qty, filled_amount, remaining_qty, False, reason, baseline)
 
 
 class OrderJournal:
@@ -351,6 +382,10 @@ class OrderJournal:
         for key, value in clean.items():
             if not isinstance(key, str) or not key:
                 raise ValueError("payload keys must be non-empty strings")
+            if key == "baseline_order_nos" and isinstance(value, list) and all(
+                type(item) is str for item in value
+            ):
+                continue
             if not _is_scalar(value):
                 raise ValueError(f"payload[{key!r}] must be a JSON scalar")
         if kind is JournalEventKind.SKIP:
@@ -484,7 +519,11 @@ class OrderJournal:
                     kind = JournalEventKind(str(kind_raw))
                 except ValueError:
                     raise JournalCorruptError(f"line {lineno}: unknown kind {kind_raw!r}") from None
-                for value in payload.values():
+                for key, value in payload.items():
+                    if key == "baseline_order_nos" and isinstance(value, list) and all(
+                        type(item) is str for item in value
+                    ):
+                        continue
                     if not _is_scalar(value):
                         raise JournalCorruptError(f"line {lineno}: non-scalar payload value")
                 if kind is JournalEventKind.INTENT:

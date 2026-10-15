@@ -893,7 +893,7 @@ def test_zero_qty_pick_is_skipped(mock_binding, runner) -> None:
 
 def test_entry_post_send_reconcile_failure_is_recorded(mock_binding, runner) -> None:
     broker = FakeBroker()
-    broker.daily_script = [BrokerReadError("unreadable")]
+    broker.daily_script = [[], [], [], BrokerReadError("unreadable")]
     report = runner.run("entry", DAY, broker=broker, journal=runner.journal(),
                         clock=[ts("152700")] * 30, decisions=[three_picks()])
     assert report.outcome == "OK"
@@ -1013,7 +1013,7 @@ def test_exit_post_send_reconcile_failure_is_recorded(mock_binding, runner) -> N
     broker, journal = FakeBroker(), runner.journal()
     _add_filled_entry(journal, entry_intent_id(YESTERDAY, "005930"), "005930", YESTERDAY, 10, 70_000)
     broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
-    broker.daily_script = [BrokerReadError("unreadable")]
+    broker.daily_script = [[], BrokerReadError("unreadable")]
     report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
     assert report.outcome == "OK"
     assert report.metrics["post_send_reconcile"] == "unreadable"
