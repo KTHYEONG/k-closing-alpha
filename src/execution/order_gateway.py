@@ -125,6 +125,23 @@ class OrderGateway:
         if not self._journal.locked:
             raise RuntimeError("OrderGateway requires journal exclusive()")
 
+    async def _read_baseline(self, session: Any, trading_date: str) -> list[str] | None:
+        """Return normalized same-day broker order numbers, or None when the read fails."""
+        try:
+            snapshot = await self._broker.fetch_daily_orders(session, trading_date)
+        except Exception:
+            logger.exception(
+                "[EXEC] stage=submit trading_date=%s run_id=%s baseline_read_failed",
+                trading_date, self._run_id,
+            )
+            return None
+        out: list[str] = []
+        for order in snapshot:
+            normalized = normalize_order_no(order.order_no)
+            if normalized:
+                out.append(normalized)
+        return out
+
     def plan(self, intents: Sequence[OrderIntent], skips: Sequence[PlannedSkip]) -> None:
         """Durably record every intent and skip of a run before any send."""
         self._require_lock()
@@ -180,6 +197,17 @@ class OrderGateway:
                 logger.warning("[RISK] stage=submit intent_id=%s run_id=%s refusal=%s",
                                intent_id, self._run_id, refusal)
                 return self._journal.states()[intent_id]
+        baseline: list[str] | None = None
+        baseline_pending = False
+        if state.n_sends == 0:
+            baseline = await self._read_baseline(session, intent.trading_date)
+            baseline_pending = baseline is not None
+            if self._journal.is_halted():
+                self._journal.append(JournalEventKind.SKIP, intent_id, self._skip_payload(intent, "halted"),
+                                     run_id=self._run_id)
+                logger.warning("[RISK] stage=submit intent_id=%s run_id=%s refusal=halted",
+                               intent_id, self._run_id)
+                return self._journal.states()[intent_id]
         for _ in range(max(1, self._limits.send_max_attempts)):
             if self._now_fn() >= deadline:
                 fresh = self._journal.states()[intent_id]
@@ -191,7 +219,12 @@ class OrderGateway:
                     return self._journal.states()[intent_id]
                 return fresh
             attempt = self._journal.states()[intent_id].n_sends + 1
-            self._journal.append(JournalEventKind.SEND, intent_id, {"attempt": attempt}, run_id=self._run_id)
+            send_payload: dict[str, Any] = {"attempt": attempt}
+            if baseline_pending:
+                assert baseline is not None
+                send_payload["baseline_order_nos"] = list(baseline)
+                baseline_pending = False
+            self._journal.append(JournalEventKind.SEND, intent_id, send_payload, run_id=self._run_id)
             logger.info("[EXEC] stage=submit intent_id=%s run_id=%s kind=send attempt=%s",
                         intent_id, self._run_id, attempt)
             result = await self._safe_submit(session, intent)
@@ -229,7 +262,7 @@ class OrderGateway:
             st = self._journal.states()[intent_id]
             if st.status is not IntentStatus.UNKNOWN or st.intent is None:
                 continue
-            candidate = self._candidates(st.intent, snapshot, bound)
+            candidate = self._candidates(st.intent, snapshot, bound, baseline=st.baseline_order_nos)
             if len(candidate) == 1:
                 order = candidate[0]
                 self._journal.append(JournalEventKind.ADOPT, intent_id,
@@ -413,11 +446,15 @@ class OrderGateway:
                    for e in self._journal.load())
 
     def _candidates(
-        self, intent: OrderIntent, snapshot: Sequence[BrokerOrder], bound: set[str]
+        self, intent: OrderIntent, snapshot: Sequence[BrokerOrder], bound: set[str],
+        *, baseline: frozenset[str] | None = None,
     ) -> list[BrokerOrder]:
         out: list[BrokerOrder] = []
         for order in snapshot:
-            if normalize_order_no(order.order_no) in bound:
+            normalized_no = normalize_order_no(order.order_no)
+            if baseline is not None and (not normalized_no or normalized_no in baseline):
+                continue
+            if normalized_no in bound:
                 continue
             if order.symbol != intent.symbol or order.side != intent.side:
                 continue
@@ -452,7 +489,10 @@ class OrderGateway:
                                  intent.intent_id, self._run_id)
                 read_failed = True
                 break
-            candidates = self._candidates(intent, snapshot, bound)
+            candidates = self._candidates(
+                intent, snapshot, bound,
+                baseline=self._journal.states()[intent.intent_id].baseline_order_nos,
+            )
             if len(candidates) == 1:
                 order = candidates[0]
                 self._journal.append(JournalEventKind.ADOPT, intent.intent_id,
