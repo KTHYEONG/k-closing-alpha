@@ -334,6 +334,8 @@ class DbsecApiClient:
         except TimeoutError:
             termination = "deadline"
             truncated = True
+        except DbsecTokenThrottled:
+            raise
         except Exception as e:
             if in_observer:
                 raise
@@ -457,6 +459,8 @@ class DbsecApiClient:
         except TimeoutError:
             termination = "deadline"
             truncated = True
+        except DbsecTokenThrottled:
+            raise
         except Exception as e:
             if in_observer:
                 raise
