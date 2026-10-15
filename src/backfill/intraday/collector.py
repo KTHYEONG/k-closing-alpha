@@ -308,6 +308,8 @@ def _publish_pending_manifest(
 def _event_key(row: Mapping[str, Any], vendor: str) -> tuple[str, str]:
     if vendor == "ls":
         return (str(row.get("date", "") or ""), str(row.get("time", "") or ""))
+    if vendor == "dbsec":
+        return (str(row.get("Date", "") or ""), str(row.get("Hour", "") or ""))
     if vendor == "kiwoom":
         tm = str(row.get("cntr_tm", "") or "")
         if len(tm) >= 14:
@@ -773,6 +775,94 @@ async def _ls_bar_attempt(
     )
 
 
+async def _dbsec_bar_attempt(
+    *,
+    dbsec_client: Any,
+    session: Any,
+    code: str,
+    snapshot_date: str,
+    trading_day: date,
+    ymd: str,
+    floor: str,
+    ceil: str,
+    session_tag: str,
+    dataset: CaptureDataset,
+    store: CaptureStore,
+    run_id: str,
+    profile: CollectionSettings,
+) -> tuple[pd.DataFrame, CoverageEntry]:
+    """Acquire one symbol's DB minute bars and classify them inside ``[floor, ceil]`` with raw-page evidence."""
+    refs: list[Any] = []
+    venue = _venue_for(vendor="dbsec", endpoint="kr-chart/min", market_div_code=None, profile=profile)
+    context = _capture_context(
+        trading_day=trading_day, run_id=run_id, dataset=dataset, vendor="dbsec",
+        endpoint="kr-chart-min", symbol=code, venue=venue, session=session_tag,
+    )
+    try:
+        payload = await dbsec_client.get_minute_chart(
+            session, code, snapshot_date, budget=_chart_budget(profile),
+            on_page=_observe_pages(store, context, refs, 0),
+        )
+    except Exception as e:
+        logger.warning("[DATA] stage=bars symbol=%s status=FAILED reason=transport:%s", code, _redacted_error(e))
+        return _empty_bar_frame(snapshot_date), _terminal_entry(
+            symbol=code, dataset=dataset, venue=venue, session=session_tag,
+            status=CaptureStatus.FAILED, rows=0, reason=f"transport:{_redacted_error(e)}", refs=refs,
+        )
+    if not isinstance(payload, dict) or payload.get("rt_cd") != "0":
+        return _empty_bar_frame(snapshot_date), _terminal_entry(
+            symbol=code, dataset=dataset, venue=venue, session=session_tag,
+            status=CaptureStatus.FAILED, rows=0, reason="vendor_failure", refs=refs,
+        )
+    terminal = str(payload.get("termination_reason", "") or "")
+    rows = [dict(r) for r in (payload.get("output2") or []) if isinstance(r, dict)]
+    regular, other = _split_session_window(rows, ymd, floor, ceil, "dbsec")
+    if other:
+        frag = _stage_fragment(store, run_id=run_id, trading_day=trading_day, dataset=dataset,
+                               symbol=code, session=session_tag,
+                               frame=_safe_normalize_bars("dbsec", other, snapshot_date, code), reason="out_of_window")
+        refs.append(frag)
+    if terminal in _EXHAUSTED_TERMINALS and venue != "UNKNOWN":
+        try:
+            frame = normalize_bar_frame(pd.DataFrame(regular), "dbsec", snapshot_date, code)
+        except Exception as e:
+            return _empty_bar_frame(snapshot_date), _terminal_entry(
+                symbol=code, dataset=dataset, venue=venue, session=session_tag,
+                status=CaptureStatus.FAILED, rows=0, reason=f"normalize:{_redacted_error(e)}", refs=refs,
+            )
+        if frame.empty:
+            return _empty_bar_frame(snapshot_date), _terminal_entry(
+                symbol=code, dataset=dataset, venue=venue, session=session_tag,
+                status=CaptureStatus.UNKNOWN, rows=0, reason="empty_without_proof", refs=refs,
+            )
+        if session_tag == INTRADAY_SESSION_REGULAR:
+            stamps = {int(v) for v in frame["ts_hms"].tolist()}
+            if int(KRX_REGULAR_HOUR_CEIL) not in stamps:
+                frag = _stage_fragment(store, run_id=run_id, trading_day=trading_day, dataset=dataset,
+                                       symbol=code, session=session_tag,
+                                       frame=frame, reason="incomplete:missing_close_auction_bar")
+                refs.append(frag)
+                return _empty_bar_frame(snapshot_date), _terminal_entry(
+                    symbol=code, dataset=dataset, venue=venue, session=session_tag,
+                    status=CaptureStatus.PARTIAL, rows=0,
+                    reason="incomplete:missing_close_auction_bar", refs=refs,
+                )
+        return frame, _terminal_entry(
+            symbol=code, dataset=dataset, venue=venue, session=session_tag, status=CaptureStatus.COMPLETE,
+            rows=len(frame), reason=f"{terminal}:regular={len(regular)}", refs=refs,
+        )
+    if regular:
+        frag = _stage_fragment(store, run_id=run_id, trading_day=trading_day, dataset=dataset,
+                               symbol=code, session=session_tag,
+                               frame=_safe_normalize_bars("dbsec", regular, snapshot_date, code), reason=f"incomplete:{terminal}")
+        refs.append(frag)
+    return _empty_bar_frame(snapshot_date), _terminal_entry(
+        symbol=code, dataset=dataset, venue=venue, session=session_tag,
+        status=CaptureStatus.UNKNOWN if terminal in _EXHAUSTED_TERMINALS else CaptureStatus.PARTIAL,
+        rows=0, reason=f"incomplete:{terminal}", refs=refs,
+    )
+
+
 def _safe_normalize_bars(vendor: str, rows: list[dict[str, Any]], snapshot_date: str, code: str) -> pd.DataFrame:
     try:
         return normalize_bar_frame(pd.DataFrame(rows), vendor, snapshot_date, code)
@@ -805,7 +895,9 @@ async def _acquire_bars_symbol(
     profile: CollectionSettings,
     store: CaptureStore,
     run_id: str,
+    dbsec_client: Any | None = None,
 ) -> tuple[pd.DataFrame, CoverageEntry]:
+    priors: list[CoverageEntry] = []
     if ls_client is not None:
         frame, entry = await _ls_bar_attempt(
             ls_client=ls_client, session=session, code=code, snapshot_date=snapshot_date,
@@ -814,6 +906,20 @@ async def _acquire_bars_symbol(
         )
         if entry.status == CaptureStatus.COMPLETE:
             return frame, entry
+        priors.append(entry)
+    if dbsec_client is not None:
+        db_frame, db_entry = await _dbsec_bar_attempt(
+            dbsec_client=dbsec_client, session=session, code=code, snapshot_date=snapshot_date,
+            trading_day=trading_day, ymd=ymd, floor=floor, ceil=ceil, session_tag=INTRADAY_SESSION_REGULAR,
+            dataset=CaptureDataset.MINUTE_BARS, store=store, run_id=run_id, profile=profile,
+        )
+        if db_entry.status == CaptureStatus.COMPLETE:
+            chained = db_entry
+            for prior in priors:
+                chained = _with_refs(chained, prior)
+            return db_frame, chained
+        priors.append(db_entry)
+    if priors:
         repair_frame, repair_entry = await _kis_bar_attempt(
             client=client, session=session, code=code, snapshot_date=snapshot_date, trading_day=trading_day,
             ymd=ymd, bar_interval_minutes=bar_interval_minutes, floor=floor, ceil=ceil,
@@ -821,14 +927,20 @@ async def _acquire_bars_symbol(
             dataset=CaptureDataset.MINUTE_BARS, store=store, run_id=run_id, profile=profile, attempt=1,
         )
         if repair_entry.status == CaptureStatus.COMPLETE:
-            return repair_frame, _with_refs(repair_entry, entry)
+            chained = repair_entry
+            for prior in priors:
+                chained = _with_refs(chained, prior)
+            return repair_frame, chained
         staged = _stage_fragment(store, run_id=run_id, trading_day=trading_day, dataset=CaptureDataset.MINUTE_BARS,
                                  symbol=code, session=INTRADAY_SESSION_REGULAR, frame=repair_frame,
                                  reason="repair_incomplete")
+        prior_refs: list[Any] = []
+        for prior in priors:
+            prior_refs.extend(prior.raw_refs)
         return _empty_bar_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=CaptureDataset.MINUTE_BARS, venue=repair_entry.venue,
             session=INTRADAY_SESSION_REGULAR, status=CaptureStatus.PARTIAL, rows=0,
-            reason=f"unrepaired:{repair_entry.reason}", refs=[*entry.raw_refs, *repair_entry.raw_refs, staged],
+            reason=f"unrepaired:{repair_entry.reason}", refs=[*prior_refs, *repair_entry.raw_refs, staged],
         )
     return await _kis_bar_attempt(
         client=client, session=session, code=code, snapshot_date=snapshot_date, trading_day=trading_day,
@@ -1162,7 +1274,7 @@ async def _collect_bars(
     return pd.concat(frames, ignore_index=True)
 
 
-async def collect_intraday_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, ls_client: Any | None = None, *, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
+async def collect_intraday_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, ls_client: Any | None = None, *, dbsec_client: Any | None = None, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
     """Classify complete source attempts before publishing regular-session bars.
 
     Args:
@@ -1200,7 +1312,7 @@ async def collect_intraday_bars(client: Any, session: Any, stock_codes: list[str
             trading_day=trading_day, ymd=ymd, bar_interval_minutes=int(bar_interval_minutes),
             floor=KRX_REGULAR_HOUR_FLOOR, ceil=KRX_REGULAR_HOUR_CEIL,
             market_div_code=KRX_CLOSE_MARKET_DIV_CODE, ls_client=ls_client,
-            profile=prof, store=store, run_id=resolved_run,
+            profile=prof, store=store, run_id=resolved_run, dbsec_client=dbsec_client,
         )
 
     return await _collect_with_observer(
@@ -1518,7 +1630,7 @@ async def backfill_nxt_aftermarket_bars(client: KisApiClient, session: aiohttp.C
     )
 
 
-async def collect_krx_aftermarket_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, *, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
+async def collect_krx_aftermarket_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, bar_interval_minutes: int = 1, *, dbsec_client: Any | None = None, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
     """당일 KRX 애프터마켓(16:00-20:00) 1분봉을 KRX_CLOSE_MARKET_DIV_CODE('J')로 수집한다.
 
     Returns:
@@ -1552,12 +1664,25 @@ async def collect_krx_aftermarket_bars(client: Any, session: Any, stock_codes: l
     codes = [str(item) for item in (stock_codes or [])]
 
     async def _acquire(code: str) -> tuple[pd.DataFrame, CoverageEntry]:
-        return await _kis_bar_attempt(
+        kis_frame, kis_entry = await _kis_bar_attempt(
             client=client, session=session, code=code, snapshot_date=str(snapshot_date),
             trading_day=trading_day, ymd=ymd, bar_interval_minutes=int(bar_interval_minutes),
             floor=KRX_AFTERMARKET_HOUR_FLOOR, ceil=KRX_AFTERMARKET_HOUR_CEIL,
             market_div_code=KRX_CLOSE_MARKET_DIV_CODE, session_tag="krx_aftermarket",
             dataset=CaptureDataset.MINUTE_BARS, store=store, run_id=resolved_run, profile=prof, attempt=0,
+        )
+        if kis_entry.status == CaptureStatus.COMPLETE or dbsec_client is None:
+            return kis_frame, kis_entry
+        db_frame, db_entry = await _dbsec_bar_attempt(
+            dbsec_client=dbsec_client, session=session, code=code, snapshot_date=str(snapshot_date),
+            trading_day=trading_day, ymd=ymd, floor=KRX_AFTERMARKET_HOUR_FLOOR, ceil=KRX_AFTERMARKET_HOUR_CEIL,
+            session_tag="krx_aftermarket", dataset=CaptureDataset.MINUTE_BARS,
+            store=store, run_id=resolved_run, profile=prof,
+        )
+        if db_entry.status == CaptureStatus.COMPLETE:
+            return db_frame, _with_refs(db_entry, kis_entry)
+        return kis_frame, kis_entry.model_copy(
+            update={"raw_refs": (*kis_entry.raw_refs, *db_entry.raw_refs)}
         )
 
     return await _collect_with_observer(

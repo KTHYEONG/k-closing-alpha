@@ -496,3 +496,52 @@ def test_extract_vendor_business_dates_toss() -> None:
     toss = pd.DataFrame({"timestamp": ["2026-09-04T09:01:00.000+09:00"], "closePrice": ["1"]})
 
     assert extract_vendor_business_dates(toss, "toss").tolist() == ["20260904"]
+
+
+def test_normalize_dbsec_bars_maps_fields_and_estimates_value() -> None:
+    import pandas as pd
+
+    from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, normalize_bar_frame
+
+    raw = pd.DataFrame(
+        [
+            {"Date": "20260904", "Hour": "090100", "Oprc": "70000", "Hprc": "70100", "Lprc": "69900", "Prpr": "70050", "CntgVol": "10"},
+            {"Date": "20260904", "Hour": "090000", "Oprc": "69900", "Hprc": "70000", "Lprc": "69800", "Prpr": "69950", "CntgVol": "5"},
+        ]
+    )
+    out = normalize_bar_frame(raw, "dbsec", "2026-09-04", "005930")
+    assert list(out.columns) == list(CANONICAL_BAR_COLUMNS)
+    assert out["vendor"].tolist() == ["dbsec", "dbsec"]
+    assert out["ts_hms"].tolist() == [90000, 90100]
+    assert out["open"].tolist() == [69900, 70000]
+    assert out["close"].tolist() == [69950, 70050]
+    assert out["value_krw"].tolist() == [69950 * 5, 70050 * 10]
+
+
+def test_normalize_dbsec_drops_other_business_dates() -> None:
+    import pandas as pd
+
+    from src.data.intraday_schema import normalize_bar_frame
+
+    raw = pd.DataFrame(
+        [
+            {"Date": "20260904", "Hour": "090000", "Oprc": "1", "Hprc": "1", "Lprc": "1", "Prpr": "1", "CntgVol": "1"},
+            {"Date": "20260903", "Hour": "090000", "Oprc": "2", "Hprc": "2", "Lprc": "2", "Prpr": "2", "CntgVol": "2"},
+        ]
+    )
+    out = normalize_bar_frame(raw, "dbsec", "2026-09-04", "005930")
+    assert len(out) == 1
+    assert out["close"].tolist() == [1]
+
+
+def test_normalize_dbsec_missing_column_raises() -> None:
+    import pandas as pd
+    import pytest
+
+    from src.data.intraday_schema import normalize_bar_frame
+
+    raw = pd.DataFrame(
+        [{"Date": "20260904", "Hour": "090000", "Oprc": "1", "Hprc": "1", "Lprc": "1", "Prpr": "1"}]
+    )
+    with pytest.raises(ValueError, match="CntgVol"):
+        normalize_bar_frame(raw, "dbsec", "2026-09-04", "005930")

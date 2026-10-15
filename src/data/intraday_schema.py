@@ -41,9 +41,9 @@ CANONICAL_TICK_COLUMNS: tuple[str, ...] = (
     "vendor",
 )
 
-_BAR_VENDORS: tuple[str, ...] = ("kis", "ls", "kiwoom", "toss")
+_BAR_VENDORS: tuple[str, ...] = ("kis", "ls", "kiwoom", "toss", "dbsec")
 
-VENDOR_BUSINESS_DATE_FIELDS: dict[str, str] = {"kis": "stck_bsop_date", "ls": "date", "kiwoom": "cntr_tm", "toss": "timestamp"}
+VENDOR_BUSINESS_DATE_FIELDS: dict[str, str] = {"kis": "stck_bsop_date", "ls": "date", "kiwoom": "cntr_tm", "toss": "timestamp", "dbsec": "Date"}
 
 _KIS_BAR_REQUIRED: tuple[str, ...] = (
     "stck_cntg_hour",
@@ -82,6 +82,8 @@ _TOSS_BAR_REQUIRED: tuple[str, ...] = (
     "closePrice",
     "volume",
 )
+
+_DBSEC_BAR_REQUIRED: tuple[str, ...] = ("Date", "Hour", "Oprc", "Hprc", "Lprc", "Prpr", "CntgVol")
 
 
 _KIS_TICK_REQUIRED: tuple[str, ...] = (
@@ -155,7 +157,7 @@ def _require_columns(df: pd.DataFrame, required: tuple[str, ...], vendor: str) -
 def extract_vendor_business_dates(df: pd.DataFrame, vendor: str) -> pd.Series | None:
     """벤더 원천 프레임에서 YYYYMMDD 문자열 Series를 추출한다."""
     if vendor not in VENDOR_BUSINESS_DATE_FIELDS:
-        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls', 'kiwoom')")
+        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of {sorted(VENDOR_BUSINESS_DATE_FIELDS)})")
     field = VENDOR_BUSINESS_DATE_FIELDS[vendor]
     if field not in df.columns:
         return None
@@ -200,7 +202,7 @@ def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbo
 
     Args:
         df: Raw vendor rows for one symbol and one business date.
-        vendor: One of "kis", "ls", "kiwoom", "toss".
+        vendor: One of "kis", "ls", "kiwoom", "toss", "dbsec".
         snapshot_date: Requested market date (YYYY-MM-DD).
         symbol: Six-character symbol code.
 
@@ -210,8 +212,8 @@ def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbo
     Raises:
         ValueError: Unknown vendor or missing required vendor columns.
     """
-    if vendor not in ("kis", "ls", "kiwoom", "toss"):
-        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls', 'kiwoom', 'toss')")
+    if vendor not in ("kis", "ls", "kiwoom", "toss", "dbsec"):
+        raise ValueError(f"Unknown intraday vendor: {vendor!r} (expected one of 'kis', 'ls', 'kiwoom', 'toss', 'dbsec')")
     if df is None or len(df) == 0:
         return _empty_bar_frame()
     df = filter_to_business_date(df, vendor, snapshot_date, symbol)
@@ -296,6 +298,22 @@ def normalize_bar_frame(df: pd.DataFrame, vendor: str, snapshot_date: str, symbo
         )
         # Toss 캔들 응답엔 봉당 거래대금 필드가 없다 -- Kiwoom 분기와 동일하게 close*volume으로 근사한다.
         value_krw = work["close"] * work["volume"]
+    elif vendor == "dbsec":
+        _require_columns(df, _DBSEC_BAR_REQUIRED, vendor)
+        work = pd.DataFrame(
+            {
+                "ts_hms": pd.to_numeric(df["Hour"].astype(str), errors="coerce"),
+                "open": pd.to_numeric(df["Oprc"].astype(str), errors="coerce"),
+                "high": pd.to_numeric(df["Hprc"].astype(str), errors="coerce"),
+                "low": pd.to_numeric(df["Lprc"].astype(str), errors="coerce"),
+                "close": pd.to_numeric(df["Prpr"].astype(str), errors="coerce"),
+                "volume": pd.to_numeric(df["CntgVol"].astype(str), errors="coerce"),
+            }
+        )
+        value_krw = work["close"] * work["volume"]
+        order = work["ts_hms"].sort_values(kind="stable").index
+        work = work.loc[order].reset_index(drop=True)
+        value_krw = value_krw.loc[order].reset_index(drop=True)
 
     out = pd.DataFrame(
         {
