@@ -27,6 +27,8 @@ SECRET_SETTING_FIELDS: tuple[str, ...] = (
     "TOSS_APP_SECRET",
     "KIWOOM_APP_KEY",
     "KIWOOM_SECRET_KEY",
+    "DB_APP_KEY",
+    "DB_APP_SECRET",
     "OPENDART_API_KEY",
     "OPENDART_API_KEY_2",
     "DART_API_KEY",
