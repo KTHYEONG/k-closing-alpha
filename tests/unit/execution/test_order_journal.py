@@ -679,3 +679,87 @@ def test_baseline_append_and_load_roundtrip(tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="JSON scalar"):
             journal.append(JournalEventKind.SEND, intent.intent_id,
                            {"attempt": 2, "other": [1]}, run_id="r1")
+
+
+def _unknown_events(intent_id: str, base: dict) -> list[JournalEvent]:
+    return [
+        _ev(1, JournalEventKind.INTENT, intent_id, base),
+        _ev(2, JournalEventKind.SEND, intent_id, {"attempt": 1}),
+        _ev(3, JournalEventKind.RESULT, intent_id, {"attempt": 1, "verdict": "ambiguous"}),
+    ]
+
+
+def test_operator_adopt_binds_like_adopt() -> None:
+    intent = _entry()
+    events = [*_unknown_events(intent.intent_id, intent_to_payload(intent)),
+        _ev(4, JournalEventKind.OPERATOR_RESOLVE, intent.intent_id,
+            {"resolution": "adopt", "operator": "op", "reason": "verified",
+             "broker_order_no": "999", "broker_org_no": "001"})]
+    state = derive_intent_state(events)
+    assert state.status is IntentStatus.ACKED
+    assert state.broker_order_no == "999"
+    assert state.final is False
+
+
+def test_operator_not_found_terminal() -> None:
+    intent = _entry()
+    events = [*_unknown_events(intent.intent_id, intent_to_payload(intent)),
+        _ev(4, JournalEventKind.OPERATOR_RESOLVE, intent.intent_id,
+            {"resolution": "not_found", "operator": "op", "reason": "checked"})]
+    state = derive_intent_state(events)
+    assert state.status is IntentStatus.NOT_FOUND
+    assert state.final is False
+    assert state.filled_qty == 0
+
+
+def test_operator_malformed_fails_closed() -> None:
+    intent = _entry()
+    base = intent_to_payload(intent)
+    bad_payloads = [
+        {"operator": "op", "reason": "r"},
+        {"resolution": "bogus", "operator": "op", "reason": "r"},
+        {"resolution": "adopt", "operator": " ", "reason": "r",
+         "broker_order_no": "1", "broker_org_no": "001"},
+        {"resolution": "adopt", "operator": "op", "reason": "",
+         "broker_order_no": "1", "broker_org_no": "001"},
+        {"resolution": "adopt", "operator": "op", "reason": "r"},
+        {"resolution": "not_found", "operator": "op", "reason": " "},
+    ]
+    for bad in bad_payloads:
+        with pytest.raises(JournalCorruptError):
+            derive_intent_state([*_unknown_events(intent.intent_id, base),
+                _ev(4, JournalEventKind.OPERATOR_RESOLVE, intent.intent_id, bad)])
+
+
+def test_operator_over_filled_fails_closed() -> None:
+    intent = _entry()
+    base = intent_to_payload(intent)
+    events = [
+        _ev(1, JournalEventKind.INTENT, intent.intent_id, base),
+        _ev(2, JournalEventKind.SEND, intent.intent_id, {"attempt": 1}),
+        _ev(3, JournalEventKind.RESULT, intent.intent_id,
+            {"attempt": 1, "verdict": "accepted", "broker_order_no": "1", "broker_org_no": "001"}),
+        _ev(4, JournalEventKind.OPERATOR_RESOLVE, intent.intent_id,
+            {"resolution": "adopt", "operator": "op", "reason": "r",
+             "broker_order_no": "2", "broker_org_no": "001"}),
+    ]
+    with pytest.raises(JournalCorruptError):
+        derive_intent_state(events)
+
+
+def test_operator_blank_org_fails_closed() -> None:
+    intent = _entry()
+    base = intent_to_payload(intent)
+    with pytest.raises(JournalCorruptError):
+        derive_intent_state([*_unknown_events(intent.intent_id, base),
+            _ev(4, JournalEventKind.OPERATOR_RESOLVE, intent.intent_id,
+                {"resolution": "adopt", "operator": "op", "reason": "r",
+                 "broker_order_no": "2", "broker_org_no": " "})])
+
+
+def test_operator_first_event_fails_closed() -> None:
+    intent = _entry()
+    with pytest.raises(JournalCorruptError):
+        derive_intent_state([
+            _ev(1, JournalEventKind.OPERATOR_RESOLVE, intent.intent_id,
+                {"resolution": "not_found", "operator": "op", "reason": "r"})])
