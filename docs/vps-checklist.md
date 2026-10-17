@@ -51,7 +51,7 @@ report never implies the host stopped.
 - **Never run job entry points by hand** (`src.daily.*`, `src.tools.daily_audit`, `audit_reconcile`, `offsite_backup`,
   `backup_prune`, `capture_offsite verify`, `alerts`, `backfill_*`, `toss_*`, `nxt_*`): they write ledgers, consume broker
   quota, send mail, or take the Drive lock. Pure read helpers and the probes in this file are allowed.
-- **Trading blackout 08:50–09:40 and 15:10–15:50 KST on weekdays** (`src/tools/deploy_window.py`): only `systemctl`,
+- **Trading blackout 08:30–09:40 and 15:10–15:50 KST on weekdays** (`src/tools/deploy_window.py`): only `systemctl`,
   `journalctl`, `stat`, `ls`, `cat` of small files. No parquet scans, `du`, `find` over `data/`, `rclone check/size`.
   Heavy probes use `nice -n 10 timeout 300` and run outside blackouts and outside 22:15–00:15 when avoidable (backup,
   extended backfill 23:05, Drive lock).
