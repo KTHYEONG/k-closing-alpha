@@ -901,16 +901,18 @@ def test_collect_bars_kis_filtered_empty_unknown(tmp_path) -> None:
     assert delivered["005930"][0].empty
 
 
-def test_publish_pending_manifest_retry_does_not_raise(tmp_path) -> None:
+def test_publish_pending_manifest_retry_does_not_raise(tmp_path, caplog) -> None:
     """동일 run_id로 재실행 시 completed_at 차이로 인한 immutable identity 충돌을 흡수한다.
 
     실측: 2026-09-18 archive-intraday 재시도가 이 충돌(ValueError)로 전체 아카이브를
     실패시킴 -- PENDING 매니페스트는 진행 중 체크포인트일 뿐이라 발행 실패해도
     실제 수집은 계속돼야 한다.
     """
+    import logging
+
     from datetime import date
 
-    from src.backfill.intraday.collector import _publish_pending_manifest
+    from src.backfill.intraday.collector import publish_pending_manifest
     from src.data.capture_contracts import CaptureDataset
 
     store = _capture_store(tmp_path)
@@ -923,11 +925,91 @@ def test_publish_pending_manifest_retry_does_not_raise(tmp_path) -> None:
         "endpoint": "pending",
         "session": "regular",
         "symbols": ["005930"],
+        "stage": "extended_backfill",
     }
-    _publish_pending_manifest(**kwargs)
+    assert publish_pending_manifest(**kwargs) is True
     # 재실행: completed_at이 달라져 동일 경로에 다른 바이트를 쓰려는 충돌이 발생하지만
     # 예외가 밖으로 전파되지 않아야 한다.
-    _publish_pending_manifest(**kwargs)
+    with caplog.at_level(logging.WARNING):
+        assert publish_pending_manifest(**kwargs) is False
+    assert "stage=extended_backfill" in caplog.text
+    assert "stage=intraday_archive" not in caplog.text
+
+
+def test_backfill_extended_session_bars_skip_pending_writes_no_pending_manifest(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import backfill_extended_session_bars
+
+    store = _capture_store(tmp_path)
+    delivered = {}
+    asyncio.run(
+        backfill_extended_session_bars(
+            _KisBars([_kis_bar_row("160000", close="1000", vol="10", cum="10000")]), None, ["005930"],
+            "2026-09-15", session_tag="nxt_aftermarket",
+            profile=_capture_profile(tmp_path), capture_store=store, run_id="r-skip",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+            publish_pending=False,
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "COMPLETE"
+    assert entry.raw_refs
+    assert all(m.status.value != "PENDING" for m in store.read_manifests("2026-09-15"))
+
+
+def test_backfill_extended_session_bars_default_still_publishes_one_pending(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import backfill_extended_session_bars
+
+    store = _capture_store(tmp_path)
+    delivered = {}
+    asyncio.run(
+        backfill_extended_session_bars(
+            _KisBars([_kis_bar_row("160000", close="1000", vol="10", cum="10000")]), None, ["005930"],
+            "2026-09-15", session_tag="nxt_aftermarket",
+            profile=_capture_profile(tmp_path), capture_store=store, run_id="r-default",
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    pending = [m for m in store.read_manifests("2026-09-15") if m.status.value == "PENDING"]
+    assert len(pending) == 1
+    assert [e.symbol for e in pending[0].entries] == ["005930"]
+
+
+def test_collect_with_observer_default_stage_is_intraday_archive(tmp_path, caplog) -> None:
+    import asyncio
+    import logging
+
+    import pandas as pd
+
+    from datetime import date
+
+    from src.backfill.intraday.collector import _collect_with_observer, publish_pending_manifest
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    assert publish_pending_manifest(
+        store, trading_day=date(2026, 9, 15), run_id="r-live", dataset=CaptureDataset.MINUTE_BARS,
+        vendor="owner-local", endpoint="pending", session="regular", symbols=["000001"],
+        stage="intraday_archive",
+    ) is True
+
+    async def _acquire(code: str):
+        return pd.DataFrame([{"symbol": code}]), None
+
+    delivered = {}
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(
+            _collect_with_observer(
+                codes=["000002"], snapshot_date="2026-09-15", dataset=CaptureDataset.MINUTE_BARS,
+                session_tag="regular", store=store, run_id="r-live",
+                acquire=_acquire, on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+            )
+        )
+    assert "000002" in delivered
+    assert "stage=intraday_archive" in caplog.text
 
 
 def test_collect_with_observer_default_runs_sequentially(tmp_path) -> None:
