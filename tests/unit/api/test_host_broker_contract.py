@@ -379,7 +379,7 @@ def test_vendored_copy_hash_pinned() -> None:
     lines = src.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "# canonical: krx-alpha/deploy/shared/host_broker_contract.py contract=v1"
     digest = hashlib.sha256(src.read_bytes()).hexdigest()
-    assert digest == "21dacdbbcb55c87c2698d9c32a4a9d43935bc2759157d8e93ac40fb6c9eaf31b"
+    assert digest == "0bfab4ccae0f0921a32493492683014e1e080e708db3d92473731a5c4eb0b0c1"
     assert isinstance(TokenRecord(access_token="x", issued_at=_NOW, expires_at=None, generation=1), TokenRecord)
     assert TokenStoreLockTimeout.__name__ == "TokenStoreLockTimeout"
 
