@@ -12,9 +12,10 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from dotenv import dotenv_values
 
@@ -126,6 +127,35 @@ def _parse_slot_list(raw: str | None) -> list[str] | None:
     return tokens
 
 
+def _parse_slot_credentials(
+    env: Mapping[str, str],
+    tokens: Sequence[str],
+    *,
+    duplicate_label: Literal["slot", "decision shard slot"],
+    reject_trade_key_collision: bool,
+) -> tuple[KisCredential, ...]:
+    """Return DATA_<n> credentials in token order; raise ValueError on missing credentials, duplicate keys, or trade-key collision."""
+    creds: list[KisCredential] = []
+    for n in tokens:
+        app_key = (env.get(f"KIS_DATA_{n}_APP_KEY") or "").strip()
+        app_secret = (env.get(f"KIS_DATA_{n}_APP_SECRET") or "").strip()
+        hts_id = (env.get(f"KIS_DATA_{n}_HTS_ID", "") or "").strip()
+        if not app_key or not app_secret:
+            raise ValueError(f"missing credentials for slot DATA_{n}")
+        creds.append(KisCredential(slot=f"DATA_{n}", app_key=app_key, app_secret=app_secret, hts_id=hts_id))
+    seen: set[str] = set()
+    for c in creds:
+        if c.app_key in seen:
+            raise ValueError(f"duplicate app_key in {duplicate_label} {c.slot}")
+        seen.add(c.app_key)
+    if reject_trade_key_collision:
+        for trade_var in ("KIS_TRADE_APP_KEY", "KIS_APP_KEY"):
+            trade_key = (env.get(trade_var) or "").strip()
+            if trade_key and trade_key in seen:
+                raise ValueError(f"data slot app_key collides with {trade_var}")
+    return tuple(creds)
+
+
 def parse_host_data_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]:
     pool = _parse_slot_list(env.get("KIS_DATA_SLOTS"))
     if pool is None:
@@ -138,24 +168,7 @@ def parse_host_data_credentials(env: Mapping[str, str]) -> tuple[KisCredential, 
     for n in host:
         if n not in pool_set:
             raise ValueError(f"host slot DATA_{n} is not in KIS_DATA_SLOTS pool")
-    creds: list[KisCredential] = []
-    for n in host:
-        app_key = (env.get(f"KIS_DATA_{n}_APP_KEY") or "").strip()
-        app_secret = (env.get(f"KIS_DATA_{n}_APP_SECRET") or "").strip()
-        hts_id = (env.get(f"KIS_DATA_{n}_HTS_ID", "") or "").strip()
-        if not app_key or not app_secret:
-            raise ValueError(f"missing credentials for slot DATA_{n}")
-        creds.append(KisCredential(slot=f"DATA_{n}", app_key=app_key, app_secret=app_secret, hts_id=hts_id))
-    seen: set[str] = set()
-    for c in creds:
-        if c.app_key in seen:
-            raise ValueError(f"duplicate app_key in slot {c.slot}")
-        seen.add(c.app_key)
-    for trade_var in ("KIS_TRADE_APP_KEY", "KIS_APP_KEY"):
-        trade_key = (env.get(trade_var) or "").strip()
-        if trade_key and trade_key in seen:
-            raise ValueError(f"data slot app_key collides with {trade_var}")
-    return tuple(creds)
+    return _parse_slot_credentials(env, host, duplicate_label="slot", reject_trade_key_collision=True)
 
 
 def resolve_host_data_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]:
@@ -253,20 +266,7 @@ def parse_decision_shard_credentials(env: Mapping[str, str]) -> tuple[KisCredent
     for n in shards:
         if n not in pool_set:
             raise ValueError(f"decision shard slot DATA_{n} is not in KIS_DATA_SLOTS pool")
-    creds: list[KisCredential] = []
-    for n in shards:
-        app_key = (env.get(f"KIS_DATA_{n}_APP_KEY") or "").strip()
-        app_secret = (env.get(f"KIS_DATA_{n}_APP_SECRET") or "").strip()
-        hts_id = (env.get(f"KIS_DATA_{n}_HTS_ID", "") or "").strip()
-        if not app_key or not app_secret:
-            raise ValueError(f"missing credentials for slot DATA_{n}")
-        creds.append(KisCredential(slot=f"DATA_{n}", app_key=app_key, app_secret=app_secret, hts_id=hts_id))
-    seen: set[str] = set()
-    for c in creds:
-        if c.app_key in seen:
-            raise ValueError(f"duplicate app_key in decision shard slot {c.slot}")
-        seen.add(c.app_key)
-    return tuple(creds)
+    return _parse_slot_credentials(env, shards, duplicate_label="decision shard slot", reject_trade_key_collision=False)
 
 
 def resolve_decision_shard_credentials(env: Mapping[str, str]) -> tuple[KisCredential, ...]:
@@ -318,21 +318,4 @@ def resolve_research_credentials(env: Mapping[str, str], *, slots: tuple[str, ..
     for token in slots:
         if token in decision_shards:
             raise ValueError(f"research slot DATA_{token} overlaps KIS_DECISION_SHARD_SLOTS")
-    creds: list[KisCredential] = []
-    for token in slots:
-        app_key = (env.get(f"KIS_DATA_{token}_APP_KEY") or "").strip()
-        app_secret = (env.get(f"KIS_DATA_{token}_APP_SECRET") or "").strip()
-        hts_id = (env.get(f"KIS_DATA_{token}_HTS_ID", "") or "").strip()
-        if not app_key or not app_secret:
-            raise ValueError(f"missing credentials for slot DATA_{token}")
-        creds.append(KisCredential(slot=f"DATA_{token}", app_key=app_key, app_secret=app_secret, hts_id=hts_id))
-    seen: set[str] = set()
-    for cred in creds:
-        if cred.app_key in seen:
-            raise ValueError(f"duplicate app_key in slot {cred.slot}")
-        seen.add(cred.app_key)
-    for trade_var in ("KIS_TRADE_APP_KEY", "KIS_APP_KEY"):
-        trade_key = (env.get(trade_var) or "").strip()
-        if trade_key and trade_key in seen:
-            raise ValueError(f"data slot app_key collides with {trade_var}")
-    return tuple(creds)
+    return _parse_slot_credentials(env, slots, duplicate_label="slot", reject_trade_key_collision=True)
