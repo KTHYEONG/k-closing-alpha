@@ -10,9 +10,11 @@ import pytest
 
 from src.backfill.intraday.extended_session_backfill import (
     ExtendedBackfillLedger,
+    ExtendedBackfillSummary,
     ExtendedBackfillTask,
     RegularBackfillPlan,
     _select_backfill_tasks,
+    classify_extended_backfill_outcome,
     enumerate_extended_session_tasks,
     enumerate_regular_session_tasks,
     run_extended_session_backfill,
@@ -1199,3 +1201,75 @@ def test_pending_checkpoint_precedes_vendor_requests(env) -> None:
     _run(profile, store, ledger, [_OrderKis(day, traded=set(symbols))],
          [ExtendedBackfillTask(day, "nxt_aftermarket", symbols)], _raw_ref(day, set(symbols)))
     assert seen and all(seen)
+
+
+def _summary(**kw) -> ExtendedBackfillSummary:
+    base = {
+        "tasks_done": 1, "tasks_remaining": 0, "complete": 5, "no_trades": 2,
+        "not_listed": 1, "failed": 0, "stopped_by_deadline": False,
+        "exhausted": 0, "pending_conflicts": 0,
+    }
+    base.update(kw)
+    return ExtendedBackfillSummary(**base)
+
+
+def test_classify_clean_run_is_ok() -> None:
+    assert classify_extended_backfill_outcome(_summary()) == ("OK", "")
+
+
+def test_classify_failed_entries_degrade() -> None:
+    assert classify_extended_backfill_outcome(_summary(failed=2, complete=0)) == ("DEGRADED", "failed")
+
+
+def test_classify_exhausted_leads_reason() -> None:
+    assert classify_extended_backfill_outcome(_summary(failed=1, exhausted=1, complete=0)) == (
+        "DEGRADED", "exhausted,failed")
+
+
+def test_classify_pending_conflict_degrades() -> None:
+    assert classify_extended_backfill_outcome(_summary(pending_conflicts=1)) == (
+        "DEGRADED", "pending_manifest_conflict")
+
+
+def test_classify_all_tokens_fixed_order() -> None:
+    summary = _summary(failed=3, exhausted=1, pending_conflicts=2, complete=0)
+    assert classify_extended_backfill_outcome(summary) == (
+        "DEGRADED", "exhausted,failed,pending_manifest_conflict")
+
+
+def test_classify_deadline_stop_alone_is_ok() -> None:
+    summary = _summary(stopped_by_deadline=True, tasks_remaining=4)
+    assert classify_extended_backfill_outcome(summary) == ("OK", "")
+
+
+def test_runner_counts_pending_conflict_without_aborting_task(env) -> None:
+    from src.data.capture_contracts import CaptureStatus
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    real_publish = store.publish_manifest
+
+    def _conflict(manifest) -> None:
+        if manifest.status is CaptureStatus.PENDING:
+            raise ValueError("conflicting immutable artifact identity")
+        real_publish(manifest)
+
+    store.publish_manifest = _conflict  # type: ignore[method-assign]
+    summary = _run(profile, store, ledger, [_FakeKis(day, traded={"000001"})],
+                   [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))],
+                   _raw_ref(day, {"000001"}))
+    assert summary.pending_conflicts == 1
+    assert summary.complete == 1
+    assert any(m.status is CaptureStatus.COMPLETE for m in store.read_manifests(day))
+    assert "000001" in ledger.terminal_symbols(day, "nxt_aftermarket")
+
+
+def test_runner_without_conflict_reports_zero(env) -> None:
+    profile, store, ledger = env
+    day = "2026-03-02"
+    symbols = ("000001", "000002")
+    summary = _run(profile, store, ledger,
+                   [_FakeKis(day, traded=set(symbols)), _FakeKis(day, traded=set(symbols))],
+                   [ExtendedBackfillTask(day, "nxt_aftermarket", symbols)],
+                   _raw_ref(day, set(symbols)))
+    assert summary.pending_conflicts == 0
