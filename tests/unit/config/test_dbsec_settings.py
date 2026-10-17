@@ -14,9 +14,14 @@ def test_dbsec_settings_default_disabled_without_key(monkeypatch) -> None:
     assert settings.DB_APP_KEY == ""
 
 
-def test_dbsec_token_interval_rejects_below_one_minute() -> None:
-    with pytest.raises(ValidationError):
-        DbsecSettings(DB_TOKEN_ISSUE_MIN_INTERVAL_SECONDS=30)
+def test_dbsec_canonical_rates_own_pacing() -> None:
+    from src.api.host_broker_contract import DEFAULT_RATES, MIN_ISSUE_INTERVAL_S
+
+    assert DEFAULT_RATES[("dbsec", None)] == 20.0
+    assert DEFAULT_RATES[("dbsec", "chart")] == 4.0
+    assert DEFAULT_RATES[("dbsec", "quote")] == 3.0
+    assert MIN_ISSUE_INTERVAL_S["dbsec"] == 61.0
+    assert not hasattr(DbsecSettings(), "DB_TOKEN_ISSUE_MIN_INTERVAL_SECONDS")
 
 
 def test_dbsec_credentials_registered_as_secrets() -> None:

@@ -9,12 +9,15 @@ docs/architecture/broker_toss.md 1.4 레이트리밋 매트릭스를 그대로 �
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from src.api._common import parse_expires_in
 from src.api._transport import RetryPolicy, send_with_auth_retry
-from src.api.kis.rate_limit import HostPacedRateLimiter, get_host_rate_limiter, host_admission_state_path
+from src.api.host_broker_contract import DEFAULT_RATES
+from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
 from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
 from src.config import settings
 
@@ -35,25 +38,9 @@ TOSS_RETRY_AFTER_MAX_SECONDS: float = 5.0
 """Ceiling on a server-sent Retry-After wait; collect calls Toss inside the 15:20 decision window,
 so an unbounded vendor hint could stall the decision snapshot."""
 
-TOSS_RATE_LIMIT_GROUPS: dict[str, float] = {
-    "AUTH": 5.0,
-    "ACCOUNT": 1.0,
-    "ASSET": 5.0,
-    "STOCK": 5.0,
-    "STOCK_ALL": 1.0,
-    "STOCK_TRADING_TREND": 10.0,
-    "MARKET_INFO": 3.0,
-    "MARKET_DATA": 15.0,
-    "MARKET_DATA_CHART": 20.0,
-    "RANKING": 5.0,
-    "MARKET_INDICATOR": 10.0,
-    "MARKET_INDICATOR_CHART": 5.0,
-    "ORDER": 10.0,
-    "ORDER_HISTORY": 5.0,
-    "ORDER_INFO": 6.0,
-    "CONDITIONAL_ORDER": 5.0,
-    "CONDITIONAL_ORDER_HISTORY": 10.0,
-}
+TOSS_RATE_LIMIT_GROUPS: Mapping[str, float] = MappingProxyType(
+    {scope: rate for (vendor, scope), rate in DEFAULT_RATES.items() if vendor == "toss" and scope is not None}
+)
 
 
 class TossApiClient:
@@ -73,16 +60,17 @@ class TossApiClient:
         self._rate_limit_backoff: float = float(settings.TOSS_RATE_LIMIT_BACKOFF_SECONDS)
 
     def _limiter_for(self, group: str) -> HostPacedRateLimiter:
-        rate = TOSS_RATE_LIMIT_GROUPS.get(group)
-        if rate is None:
+        if group not in TOSS_RATE_LIMIT_GROUPS:
             raise ValueError(f"unknown Toss rate limit group: {group}")
-        return get_host_rate_limiter(host_admission_state_path("toss", self.app_key or "", group), rate)
+        return vendor_limiter("toss", self.app_key or "", group)
 
     def _token_store(self) -> SharedTokenStore:
         return SharedTokenStore(
             shared_token_path("toss", self.app_key or ""),
+            vendor="toss",
             lock_timeout_seconds=float(settings.BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS),
             expiry_margin_seconds=_TOSS_TOKEN_EXPIRY_MARGIN_SECONDS,
+            issue_throttle_policy="raise",
             clock=lambda: datetime.now(UTC),
         )
 
@@ -187,14 +175,25 @@ class TossApiClient:
 
         policy = RetryPolicy(
             max_attempts=attempts,
-            rate_limit_wait=lambda attempt, response: self._retry_after_seconds(response.headers) or backoff
-            if response.status == 429
-            else None,
+            rate_limit_wait=lambda attempt, response: (
+                self._retry_after_seconds(response.headers) or backoff if response.status == 429 else None
+            ),
         )
-        response = await send_with_auth_retry(open_request, acquire=limiter.acquire, current_token=lambda: self.token or "", is_auth_rejected=lambda r: self._is_invalid_token(r.status, r.body), refresh=lambda sent: self._refresh_rejected_token(session, sent), policy=policy, log_stage="toss_get", log_context=f"group={group} path={path}")
+        response = await send_with_auth_retry(
+            open_request,
+            acquire=limiter.acquire,
+            current_token=lambda: self.token or "",
+            is_auth_rejected=lambda r: self._is_invalid_token(r.status, r.body),
+            refresh=lambda sent: self._refresh_rejected_token(session, sent),
+            policy=policy,
+            log_stage="toss_get",
+            log_context=f"group={group} path={path}",
+        )
         return cast("BrokerPayload", response.body)
 
-    async def get_program_trades(self, session: aiohttp.ClientSession, symbol: str, count: int = 100, until: str | None = None) -> BrokerPayload:
+    async def get_program_trades(
+        self, session: aiohttp.ClientSession, symbol: str, count: int = 100, until: str | None = None
+    ) -> BrokerPayload:
         """일별 프로그램 매매동향 (`GET /api/v1/stocks/{symbol}/program-trades`)."""
         params: dict[str, str | int] = {"count": int(count)}
         if until:

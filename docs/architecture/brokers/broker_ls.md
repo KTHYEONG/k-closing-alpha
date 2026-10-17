@@ -51,7 +51,7 @@ tr_cont_key: <CONTINUATION_KEY>
 ### 1.4 Rate Limit & Single-Flight Invariants
 * **Strict Server Limit:** Exceeding ~1 req/s triggers error `rsp_cd: "IGW00201"` (*"요청 제한 건수를 초과하였습니다"*).
 * **Architecture Invariant (Host-Paced Admission):**
-  * Host-paced bucket at `LS_MIN_INTERVAL_SECONDS` (1.05 s) per app key.
+  * Host-paced bucket at `DEFAULT_RATES[("ls", None)]` (1/1.05 req/s, 1.05 s spacing) per app key.
   * `IGW00201` → wait `LS_RATE_LIMIT_BACKOFF_SECONDS·2^attempt`, up to `LS_RATE_LIMIT_MAX_RETRIES` (5) attempts.
   * HTTP 429 is not a throttle signal.
   * 401 / `IGW00101|IGW00102|IGW00123` → one CAS refresh via `SharedTokenStore`.

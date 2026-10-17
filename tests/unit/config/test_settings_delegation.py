@@ -80,12 +80,8 @@ EXPECTED_MODEL_FIELDS = (
     "DB_APP_KEY",
     "DB_APP_SECRET",
     "DB_BASE_URL",
-    "DB_APP_MAX_RATE",
-    "DB_CHART_MAX_RATE",
-    "DB_QUOTE_MAX_RATE",
     "DB_RATE_LIMIT_MAX_RETRIES",
     "DB_RATE_LIMIT_BACKOFF_SECONDS",
-    "DB_TOKEN_ISSUE_MIN_INTERVAL_SECONDS",
     "DB_AUCTION_PATH_ENABLED",
     "DB_AUCTION_PATH_MAX_PAGES",
     "DB_AUCTION_PATH_DEADLINE_HHMMSS",
@@ -114,7 +110,6 @@ EXPECTED_MODEL_FIELDS = (
     "LS_APP_KEY",
     "LS_APP_SECRET",
     "LS_BASE_URL",
-    "LS_MIN_INTERVAL_SECONDS",
     "LS_RATE_LIMIT_MAX_RETRIES",
     "LS_RATE_LIMIT_BACKOFF_SECONDS",
     "KIS_TRADING_ENV",
@@ -231,7 +226,7 @@ def test_computed_paths_follow_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_pat
 def test_previously_unexported_fields_reachable() -> None:
     from src import settings
 
-    assert settings.LS_MIN_INTERVAL_SECONDS == settings.settings.LS_MIN_INTERVAL_SECONDS
+    assert settings.LS_RATE_LIMIT_MAX_RETRIES == settings.settings.LS_RATE_LIMIT_MAX_RETRIES
     assert settings.COLLECTION_ARCHIVE_PUBLISH_ROWS == settings.settings.COLLECTION_ARCHIVE_PUBLISH_ROWS
 
 

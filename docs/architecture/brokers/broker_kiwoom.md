@@ -48,7 +48,7 @@ next-key: <CONTINUATION_KEY>
   * Strict limit of **5.0 req/sec per `api-id`**.
   * Server Throttle Error: HTTP 429 with `{"return_code": 5, "return_msg": "허용된 API 요청 개수를 초과하였습니다. 유량=5, API ID=<api_id>"}`.
 * **Architecture Invariant (Inter-TR Parallelism):**
-  * `KiwoomApiClient` dynamically assigns a host-shared `HostPacedRateLimiter` at 5.0 req/s per distinct `api-id` via `get_host_rate_limiter(host_admission_state_path("kiwoom", app_key, api_id), 5.0)`.
+  * `KiwoomApiClient` dynamically assigns a host-shared `HostPacedRateLimiter` at `DEFAULT_RATES[("kiwoom", "*")]` (5.0 req/s) per distinct `api-id` via `vendor_limiter("kiwoom", app_key, api_id)`.
   * Inquiries to different TRs (e.g. `ka10027` ranking alongside `ka10080` minute chart) run in parallel without cross-blocking.
   * On HTTP 429, wait `KIWOOM_RATE_LIMIT_BACKOFF_SECONDS` (1.2 s) and retry up to `KIWOOM_RATE_LIMIT_MAX_RETRIES` (3) attempts. The refresh replay does not consume an attempt. A non-JSON 429 raises a transport error, and the collector retries it.
 

@@ -20,7 +20,13 @@ from src.api.shared_token import (
 
 def _store(tmp_path: Path, **kw) -> SharedTokenStore:
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    args = {"lock_timeout_seconds": 5.0, "expiry_margin_seconds": 60.0, "clock": lambda: now}
+    args = {
+        "lock_timeout_seconds": 5.0,
+        "expiry_margin_seconds": 60.0,
+        "clock": lambda: now,
+        "vendor": "toss",
+        "issue_throttle_policy": "raise",
+    }
     args.update(kw)
     return SharedTokenStore(tmp_path / "token_toss_abc.json", **args)
 
@@ -63,8 +69,22 @@ def test_single_issuance_under_concurrency(tmp_path: Path) -> None:
         return IssuedToken(access_token="tok-new", expires_in_seconds=3600.0)
 
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    a = SharedTokenStore(tmp_path / "t.json", lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
-    b = SharedTokenStore(tmp_path / "t.json", lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    a = SharedTokenStore(
+        tmp_path / "t.json",
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
+    b = SharedTokenStore(
+        tmp_path / "t.json",
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
 
     async def _run():
         ra, rb = await asyncio.gather(a.get_or_issue(_issue), b.get_or_issue(_issue))
@@ -80,7 +100,14 @@ def test_rejection_after_rotation_adopts(tmp_path: Path) -> None:
     path = tmp_path / "t.json"
     _write(path, _valid_payload(tok="tok-b", gen=2))
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
     issued = {"n": 0}
 
     async def _issue() -> IssuedToken:
@@ -97,7 +124,14 @@ def test_rejection_does_not_adopt_expired_peer_token(tmp_path: Path) -> None:
     path = tmp_path / "t.json"
     _write(path, _valid_payload(tok="tok-b", gen=2, expires_in=30.0))
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
 
     async def _issue() -> IssuedToken:
         return IssuedToken(access_token="tok-c", expires_in_seconds=3600.0)
@@ -111,7 +145,14 @@ def test_rejection_of_current_rotates(tmp_path: Path) -> None:
     path = tmp_path / "t.json"
     _write(path, _valid_payload(tok="tok-a", gen=1))
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
 
     async def _issue() -> IssuedToken:
         return IssuedToken(access_token="tok-b", expires_in_seconds=3600.0)
@@ -126,7 +167,14 @@ def test_expired_token_reissued(tmp_path: Path) -> None:
     path = tmp_path / "t.json"
     _write(path, _valid_payload(tok="tok-old", gen=1, expires_in=-10.0))
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
     calls = {"n": 0}
 
     async def _issue() -> IssuedToken:
@@ -145,7 +193,14 @@ def test_failed_issuance_preserves_file(tmp_path: Path) -> None:
     _write(path, payload)
     before = path.read_bytes()
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
 
     async def _boom() -> IssuedToken:
         raise RuntimeError("vendor down")
@@ -171,7 +226,13 @@ def test_lock_timeout(tmp_path: Path) -> None:
             return None
 
         store = SharedTokenStore(
-            path, lock_timeout_seconds=0.05, expiry_margin_seconds=60.0, clock=lambda: now, sleep=_no_sleep
+            path,
+            lock_timeout_seconds=0.05,
+            expiry_margin_seconds=60.0,
+            clock=lambda: now,
+            sleep=_no_sleep,
+            vendor="toss",
+            issue_throttle_policy="raise",
         )
 
         async def _issue() -> IssuedToken:
@@ -188,7 +249,14 @@ def test_corrupt_file_treated_as_absent(tmp_path: Path) -> None:
     path = tmp_path / "t.json"
     path.write_text("not-json{{{", encoding="utf-8")
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
     assert store.read() is None
 
     async def _issue() -> IssuedToken:
@@ -202,7 +270,14 @@ def test_corrupt_file_treated_as_absent(tmp_path: Path) -> None:
 def test_no_secret_persisted_and_exact_keys(tmp_path: Path) -> None:
     path = tmp_path / "t.json"
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
 
     async def _issue() -> IssuedToken:
         return IssuedToken(access_token="tok-new", expires_in_seconds=3600.0)
@@ -217,7 +292,14 @@ def test_usable_token_returned_without_issuing(tmp_path: Path) -> None:
     path = tmp_path / "t.json"
     _write(path, _valid_payload(tok="tok-live", gen=3))
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
     calls = {"n": 0}
 
     async def _issue() -> IssuedToken:
@@ -232,7 +314,14 @@ def test_usable_token_returned_without_issuing(tmp_path: Path) -> None:
 def test_double_checked_read_after_lock(tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "t.json"
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
     live_rec = store._build_record(IssuedToken(access_token="tok-live", expires_in_seconds=3600.0), None)
     object.__setattr__(live_rec, "generation", 5)
     reads = {"n": 0}
@@ -276,13 +365,27 @@ def test_schema_invalid_variants_return_none(tmp_path: Path) -> None:
     for i, payload in enumerate(cases):
         path = tmp_path / f"bad{i}.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
-        store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+        store = SharedTokenStore(
+            path,
+            lock_timeout_seconds=5.0,
+            expiry_margin_seconds=60.0,
+            clock=lambda: now,
+            vendor="toss",
+            issue_throttle_policy="raise",
+        )
         assert store.read() is None, i
 
 
 def test_read_unreadable_logged(tmp_path: Path, monkeypatch) -> None:
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(tmp_path / "t.json", lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        tmp_path / "t.json",
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
 
     def _boom(*a, **k):
         raise PermissionError("denied")
@@ -294,7 +397,14 @@ def test_read_unreadable_logged(tmp_path: Path, monkeypatch) -> None:
 def test_no_expiry_token_is_usable_and_none_expiry_persisted(tmp_path: Path) -> None:
     path = tmp_path / "t.json"
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
 
     async def _issue() -> IssuedToken:
         return IssuedToken(access_token="tok-forever", expires_in_seconds=None)
@@ -317,7 +427,14 @@ def test_no_expiry_token_is_usable_and_none_expiry_persisted(tmp_path: Path) -> 
 def test_replace_rejected_when_absent_issues_gen1(tmp_path: Path) -> None:
     path = tmp_path / "t.json"
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
 
     async def _issue() -> IssuedToken:
         return IssuedToken(access_token="tok-first", expires_in_seconds=3600.0)
@@ -330,9 +447,23 @@ def test_replace_rejected_when_absent_issues_gen1(tmp_path: Path) -> None:
 def test_init_rejects_bad_bounds(tmp_path: Path) -> None:
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
     with pytest.raises(ValueError, match="lock_timeout"):
-        SharedTokenStore(tmp_path / "t.json", lock_timeout_seconds=0.0, expiry_margin_seconds=0.0, clock=lambda: now)
+        SharedTokenStore(
+            tmp_path / "t.json",
+            lock_timeout_seconds=0.0,
+            expiry_margin_seconds=0.0,
+            clock=lambda: now,
+            vendor="toss",
+            issue_throttle_policy="raise",
+        )
     with pytest.raises(ValueError, match="expiry_margin"):
-        SharedTokenStore(tmp_path / "t.json", lock_timeout_seconds=1.0, expiry_margin_seconds=-1.0, clock=lambda: now)
+        SharedTokenStore(
+            tmp_path / "t.json",
+            lock_timeout_seconds=1.0,
+            expiry_margin_seconds=-1.0,
+            clock=lambda: now,
+            vendor="toss",
+            issue_throttle_policy="raise",
+        )
 
 
 def test_publish_failure_cleans_tmp(tmp_path: Path, monkeypatch) -> None:
@@ -340,7 +471,14 @@ def test_publish_failure_cleans_tmp(tmp_path: Path, monkeypatch) -> None:
 
     path = tmp_path / "t.json"
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
-    store = SharedTokenStore(path, lock_timeout_seconds=5.0, expiry_margin_seconds=60.0, clock=lambda: now)
+    store = SharedTokenStore(
+        path,
+        lock_timeout_seconds=5.0,
+        expiry_margin_seconds=60.0,
+        clock=lambda: now,
+        vendor="toss",
+        issue_throttle_policy="raise",
+    )
     monkeypatch.setattr(_os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
 
     async def _issue() -> IssuedToken:

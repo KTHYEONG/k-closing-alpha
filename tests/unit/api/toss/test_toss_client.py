@@ -52,9 +52,7 @@ def test_toss_client_ensure_token_raises_on_empty_token() -> None:
     from tests.broker_fakes import scripted_session
 
     client = TossApiClient(app_key="k", app_secret="s")
-    session = scripted_session(
-        [], token_bodies=[{"error": {"code": "invalid-client", "message": "bad credentials"}}]
-    )
+    session = scripted_session([], token_bodies=[{"error": {"code": "invalid-client", "message": "bad credentials"}}])
 
     with pytest.raises(RuntimeError, match="Toss token issuance failed"):
         asyncio.run(client.ensure_token(session))
@@ -71,9 +69,21 @@ def test_toss_client_get_program_trades_parses_result_envelope() -> None:
     from tests.broker_fakes import FakeBrokerResponse, scripted_session
 
     session = scripted_session(
-        [FakeBrokerResponse(body={"result": {"records": [
-            {"date": "2026-09-10", "arbitrage": {"netBuyVolume": "3"}, "nonArbitrage": {"netBuyVolume": "4"}}
-        ]}})]
+        [
+            FakeBrokerResponse(
+                body={
+                    "result": {
+                        "records": [
+                            {
+                                "date": "2026-09-10",
+                                "arbitrage": {"netBuyVolume": "3"},
+                                "nonArbitrage": {"netBuyVolume": "4"},
+                            }
+                        ]
+                    }
+                }
+            )
+        ]
     )
 
     data = asyncio.run(client.get_program_trades(session, "005930", count=30, until="2026-09-10"))
@@ -102,7 +112,9 @@ def test_toss_client_get_program_trades_retries_on_429_then_succeeds(monkeypatch
 
     session = scripted_session(
         [
-            FakeBrokerResponse(body={"error": {"code": "rate-limit-exceeded", "message": "too many requests"}}, status=429),
+            FakeBrokerResponse(
+                body={"error": {"code": "rate-limit-exceeded", "message": "too many requests"}}, status=429
+            ),
             FakeBrokerResponse(body={"result": {"records": []}}),
         ]
     )
@@ -134,12 +146,29 @@ def test_toss_client_get_rankings_parses_result_envelope() -> None:
     client.token = "tok"
 
     session = scripted_session(
-        [FakeBrokerResponse(body={"result": {"rankedAt": "2026-09-11T19:59:46.466+09:00", "rankings": [
-            {"rank": 1, "symbol": "000660", "price": {"lastPrice": "1832000", "changeRate": "-0.0113"}, "tradingVolume": "79878", "tradingAmount": "145941219000"}
-        ]}})]
+        [
+            FakeBrokerResponse(
+                body={
+                    "result": {
+                        "rankedAt": "2026-09-11T19:59:46.466+09:00",
+                        "rankings": [
+                            {
+                                "rank": 1,
+                                "symbol": "000660",
+                                "price": {"lastPrice": "1832000", "changeRate": "-0.0113"},
+                                "tradingVolume": "79878",
+                                "tradingAmount": "145941219000",
+                            }
+                        ],
+                    }
+                }
+            )
+        ]
     )
 
-    data = asyncio.run(client.get_rankings(session, ranking_type="TOP_GAINERS", market_country="KR", duration="1d", count=100))
+    data = asyncio.run(
+        client.get_rankings(session, ranking_type="TOP_GAINERS", market_country="KR", duration="1d", count=100)
+    )
 
     assert data["result"]["rankings"][0]["symbol"] == "000660"
     (request,) = session.requests
@@ -177,17 +206,40 @@ def test_toss_client_get_candles_parses_result_envelope() -> None:
     from tests.broker_fakes import FakeBrokerResponse, scripted_session
 
     session = scripted_session(
-        [FakeBrokerResponse(body={"result": {"candles": [
-            {"timestamp": "2024-02-28T15:30:00.000+09:00", "openPrice": "70000", "highPrice": "70100", "lowPrice": "69900", "closePrice": "70000", "volume": "10", "currency": "KRW"}
-        ]}})]
+        [
+            FakeBrokerResponse(
+                body={
+                    "result": {
+                        "candles": [
+                            {
+                                "timestamp": "2024-02-28T15:30:00.000+09:00",
+                                "openPrice": "70000",
+                                "highPrice": "70100",
+                                "lowPrice": "69900",
+                                "closePrice": "70000",
+                                "volume": "10",
+                                "currency": "KRW",
+                            }
+                        ]
+                    }
+                }
+            )
+        ]
     )
 
-    data = asyncio.run(client.get_candles(session, "000250", interval="1m", count=200, before="2024-02-28T15:30:00.000+09:00"))
+    data = asyncio.run(
+        client.get_candles(session, "000250", interval="1m", count=200, before="2024-02-28T15:30:00.000+09:00")
+    )
 
     assert data["result"]["candles"][0]["closePrice"] == "70000"
     (request,) = session.requests
     assert request.url == "https://openapi.tossinvest.com/api/v1/candles"
-    assert request.params == {"symbol": "000250", "interval": "1m", "count": 200, "before": "2024-02-28T15:30:00.000+09:00"}
+    assert request.params == {
+        "symbol": "000250",
+        "interval": "1m",
+        "count": 200,
+        "before": "2024-02-28T15:30:00.000+09:00",
+    }
 
 
 def test_toss_client_get_candles_forwards_adjusted_flag_and_omits_before_when_absent() -> None:
@@ -285,12 +337,18 @@ def test_toss_rotation_by_peer_is_adopted(tmp_path, monkeypatch) -> None:
     async def _seed_store():
         store = SharedTokenStore(
             shared_token_path("toss", "k"),
+            vendor="toss",
             lock_timeout_seconds=5.0,
             expiry_margin_seconds=0.0,
+            issue_throttle_policy="raise",
             clock=lambda: datetime.now(UTC),
         )
-        await store.get_or_issue(lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-A", expires_in_seconds=86400)))
-        await store.replace_rejected("tok-A", lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-B", expires_in_seconds=86400)))
+        await store.get_or_issue(
+            lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-A", expires_in_seconds=86400))
+        )
+        await store.replace_rejected(
+            "tok-A", lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-B", expires_in_seconds=86400))
+        )
 
     asyncio.run(_seed_store())
 
@@ -363,7 +421,9 @@ def test_toss_retry_after_honoured(tmp_path, monkeypatch) -> None:
 
     session = scripted_session(
         [
-            FakeBrokerResponse(body={"error": {"code": "rate-limit-exceeded"}}, status=429, headers={"Retry-After": "2"}),
+            FakeBrokerResponse(
+                body={"error": {"code": "rate-limit-exceeded"}}, status=429, headers={"Retry-After": "2"}
+            ),
             FakeBrokerResponse(body={"result": {"ok": True}}),
         ]
     )
@@ -474,11 +534,7 @@ def _toss_count_acquires(monkeypatch):  # type: ignore[no-untyped-def]
 
 
 def _toss_get_auths(session):  # type: ignore[no-untyped-def]
-    return [
-        request.headers.get("Authorization", "")
-        for request in session.requests
-        if request.method == "GET"
-    ]
+    return [request.headers.get("Authorization", "") for request in session.requests if request.method == "GET"]
 
 
 def test_toss_get_429_without_retry_after_uses_fallback(tmp_path, monkeypatch) -> None:

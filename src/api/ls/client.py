@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from src.api._common import deadline_remaining, now_seoul, parse_expires_in, resolve_chart_budget, validate_target_ymd
 from src.api._transport import RetryPolicy, send_with_auth_retry
-from src.api.kis.rate_limit import HostPacedRateLimiter, get_host_rate_limiter, host_admission_state_path
+from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
 from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
 from src.config import settings
 
@@ -46,20 +46,19 @@ class LsApiClient:
         self.app_secret = app_secret or settings.LS_APP_SECRET
         self.base_url = settings.LS_BASE_URL
         self.token: str | None = None
-        self._min_interval: float = float(settings.LS_MIN_INTERVAL_SECONDS)
         self._rate_limit_max_retries: int = int(settings.LS_RATE_LIMIT_MAX_RETRIES)
         self._rate_limit_backoff: float = float(settings.LS_RATE_LIMIT_BACKOFF_SECONDS)
 
     def _limiter(self) -> HostPacedRateLimiter:
-        interval = float(self._min_interval)
-        rate = 1.0 / interval if interval > 0 else 1_000_000_000.0
-        return get_host_rate_limiter(host_admission_state_path("ls", self.app_key or ""), rate)
+        return vendor_limiter("ls", self.app_key or "")
 
     def _token_store(self) -> SharedTokenStore:
         return SharedTokenStore(
             shared_token_path("ls", self.app_key or ""),
+            vendor="ls",
             lock_timeout_seconds=float(settings.BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS),
             expiry_margin_seconds=_LS_TOKEN_EXPIRY_MARGIN_SECONDS,
+            issue_throttle_policy="raise",
             clock=lambda: datetime.now(UTC),
         )
 
@@ -159,11 +158,20 @@ class LsApiClient:
 
         policy = RetryPolicy(
             max_attempts=limit,
-            rate_limit_wait=lambda attempt, response: backoff * (2**attempt)
-            if str(response.body.get("rsp_cd", "")) == "IGW00201"
-            else None,
+            rate_limit_wait=lambda attempt, response: (
+                backoff * (2**attempt) if str(response.body.get("rsp_cd", "")) == "IGW00201" else None
+            ),
         )
-        response = await send_with_auth_retry(open_request, acquire=lambda: self._limiter().acquire(), current_token=lambda: self.token or "", is_auth_rejected=lambda r: self._is_auth_rejected(r.status, r.body), refresh=lambda sent: self._refresh_rejected_token(session, sent), policy=policy, log_stage="ls_tr", log_context=f"tr_cd={tr_cd} tr_key={tr_key}")
+        response = await send_with_auth_retry(
+            open_request,
+            acquire=lambda: self._limiter().acquire(),
+            current_token=lambda: self.token or "",
+            is_auth_rejected=lambda r: self._is_auth_rejected(r.status, r.body),
+            refresh=lambda sent: self._refresh_rejected_token(session, sent),
+            policy=policy,
+            log_stage="ls_tr",
+            log_context=f"tr_cd={tr_cd} tr_key={tr_key}",
+        )
         return response.body, response.headers
 
     async def get_minute_chart(
@@ -221,7 +229,21 @@ class LsApiClient:
                     session,
                     "t8412",
                     str(code),
-                    {"t8412InBlock": {"shcode": str(code), "ncnt": 1, "qrycnt": 500, "nday": "0", "sdate": ymd, "stime": "090000", "edate": ymd, "etime": "153000", "cts_date": cts_date, "cts_time": cts_time, "comp_yn": "N"}},
+                    {
+                        "t8412InBlock": {
+                            "shcode": str(code),
+                            "ncnt": 1,
+                            "qrycnt": 500,
+                            "nday": "0",
+                            "sdate": ymd,
+                            "stime": "090000",
+                            "edate": ymd,
+                            "etime": "153000",
+                            "cts_date": cts_date,
+                            "cts_time": cts_time,
+                            "comp_yn": "N",
+                        }
+                    },
                     tr_cont=tr_cont,
                     tr_cont_key=tr_cont_key,
                 )
@@ -288,7 +310,11 @@ class LsApiClient:
                 # 서버가 준 cts_time은 이번 페이지에서 가장 오래된 봉보다 1분 이르지만, 이를 그대로 되보내면 서버는 그 시각
                 # "미만"만 돌려줘 경계 봉이 통째로 유실된다(실측 2026-09-29: 하루치가 한 페이지를 넘는 시점부터
                 # 종목당 1봉 누락). 가장 오래된 봉 시각을 커서로 쓰면 그 미만(= 미수신 구간)만 정확히 이어 받는다.
-                page_times = [str(r.get("time", "") or "") for r in rows if isinstance(r, dict) and str(r.get("date", "") or "").strip() == body_cts_date]
+                page_times = [
+                    str(r.get("time", "") or "")
+                    for r in rows
+                    if isinstance(r, dict) and str(r.get("date", "") or "").strip() == body_cts_date
+                ]
                 oldest_time = min((t for t in page_times if t), default="")
                 cts_date, cts_time = body_cts_date, oldest_time or body_cts_time
                 tr_cont, tr_cont_key = header_cont, header_key
@@ -302,11 +328,37 @@ class LsApiClient:
             if in_observer:
                 raise
             logger.warning("LS t8412 failed code=%s: %s", code, e)
-            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "ls", "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": pages_fetched, "continuation": metadata}
+            return {
+                "rt_cd": "1",
+                "msg1": str(e),
+                "output2": [],
+                "vendor": "ls",
+                "truncated": True,
+                "termination_reason": "vendor_failure",
+                "pages_fetched": pages_fetched,
+                "continuation": metadata,
+            }
         if termination == "vendor_failure":
-            return {"rt_cd": "1", "msg1": failure_msg, "output2": [], "vendor": "ls", "truncated": True, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata}
+            return {
+                "rt_cd": "1",
+                "msg1": failure_msg,
+                "output2": [],
+                "vendor": "ls",
+                "truncated": True,
+                "termination_reason": termination,
+                "pages_fetched": pages_fetched,
+                "continuation": metadata,
+            }
         filtered = [dict(r) for r in all_rows if str(r.get("date", ymd)) == ymd]
-        return {"rt_cd": "0", "output2": filtered, "vendor": "ls", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata}
+        return {
+            "rt_cd": "0",
+            "output2": filtered,
+            "vendor": "ls",
+            "truncated": truncated,
+            "termination_reason": termination,
+            "pages_fetched": pages_fetched,
+            "continuation": metadata,
+        }
 
     async def get_tick_chart(
         self,
@@ -366,8 +418,24 @@ class LsApiClient:
                     break
                 started = now_seoul()
                 call = self._post_tr(
-                    session, "t8411", str(code),
-                    {"t8411InBlock": {"shcode": str(code), "ncnt": 1, "qrycnt": 500, "nday": "0", "sdate": ymd, "stime": "090000", "edate": ymd, "etime": "153000", "cts_date": cts_date, "cts_time": cts_time, "comp_yn": "N"}},
+                    session,
+                    "t8411",
+                    str(code),
+                    {
+                        "t8411InBlock": {
+                            "shcode": str(code),
+                            "ncnt": 1,
+                            "qrycnt": 500,
+                            "nday": "0",
+                            "sdate": ymd,
+                            "stime": "090000",
+                            "edate": ymd,
+                            "etime": "153000",
+                            "cts_date": cts_date,
+                            "cts_time": cts_time,
+                            "comp_yn": "N",
+                        }
+                    },
                     tr_cont=tr_cont,
                     tr_cont_key=tr_cont_key,
                 )
@@ -422,7 +490,12 @@ class LsApiClient:
                 if _YMD_RE.fullmatch(head_date) and head_date < ymd:
                     termination = "crossed_target_date"
                     break
-                if _YMD_RE.fullmatch(head_date) and head_date == ymd and _HHMMSS_RE.fullmatch(head_time) and head_time <= "090000":
+                if (
+                    _YMD_RE.fullmatch(head_date)
+                    and head_date == ymd
+                    and _HHMMSS_RE.fullmatch(head_time)
+                    and head_time <= "090000"
+                ):
                     termination = "crossed_target_date"
                     break
                 if header_cont != "Y" and not body_cts_date and not body_cts_time:
@@ -444,12 +517,40 @@ class LsApiClient:
             if in_observer:
                 raise
             logger.warning("LS t8411 failed code=%s: %s", code, e)
-            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "ls", "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": pages_fetched, "continuation": metadata}
+            return {
+                "rt_cd": "1",
+                "msg1": str(e),
+                "output2": [],
+                "vendor": "ls",
+                "truncated": True,
+                "termination_reason": "vendor_failure",
+                "pages_fetched": pages_fetched,
+                "continuation": metadata,
+            }
         if termination == "vendor_failure":
-            return {"rt_cd": "1", "msg1": failure_msg, "output2": [], "vendor": "ls", "truncated": True, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata}
+            return {
+                "rt_cd": "1",
+                "msg1": failure_msg,
+                "output2": [],
+                "vendor": "ls",
+                "truncated": True,
+                "termination_reason": termination,
+                "pages_fetched": pages_fetched,
+                "continuation": metadata,
+            }
         filtered = [
-            dict(r) for r in all_rows
-            if str(r.get("date", ymd)) == ymd and _HHMMSS_RE.fullmatch(str(r.get("time", ""))) and "090000" <= str(r.get("time", "")) <= "153059"
+            dict(r)
+            for r in all_rows
+            if str(r.get("date", ymd)) == ymd
+            and _HHMMSS_RE.fullmatch(str(r.get("time", "")))
+            and "090000" <= str(r.get("time", "")) <= "153059"
         ]
-        return {"rt_cd": "0", "output2": filtered, "vendor": "ls", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata}
-
+        return {
+            "rt_cd": "0",
+            "output2": filtered,
+            "vendor": "ls",
+            "truncated": truncated,
+            "termination_reason": termination,
+            "pages_fetched": pages_fetched,
+            "continuation": metadata,
+        }
