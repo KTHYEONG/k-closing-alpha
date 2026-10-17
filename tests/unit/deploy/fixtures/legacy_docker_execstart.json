@@ -1,5 +1,6 @@
 {
   "sha": "4ea5804c504a56941bb2dfac3848724d43176cb3",
+  "migration_sha": "76f6251f7ed20145962b2ec750ff773a6d1313c8",
   "execstart": {
     "kca-aftermarket-book.service": "/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kca-aftermarket-book --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e BROKER_ADMISSION_CLASS=standard -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=batch ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.aftermarket_book",
     "kca-altdata-capture.service": "/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kca-altdata-capture --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --env-file %h/quant-secrets/k-closing-alpha.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e BROKER_ADMISSION_CLASS=standard -v %h/k-closing-alpha/data:/app/data -v %h/k-closing-alpha/artifacts:/app/artifacts -e KIS_DATA_ROLE=batch ghcr.io/kthyeong/k-closing-alpha:latest uv run python -m src.daily.altdata_capture",
