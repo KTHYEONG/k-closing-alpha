@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Literal
@@ -271,7 +271,7 @@ def _stage_fragment(
     return ref
 
 
-def _publish_pending_manifest(
+def publish_pending_manifest(
     store: CaptureStore,
     *,
     trading_day: date,
@@ -280,8 +280,10 @@ def _publish_pending_manifest(
     vendor: str,
     endpoint: str,
     session: str,
-    symbols: list[str],
-) -> None:
+    symbols: Sequence[str],
+    stage: str,
+) -> bool:
+    """Publish the PENDING checkpoint manifest; return False (WARNING under `stage`) on an immutable-identity conflict instead of raising."""
     entries = tuple(_pending_entry(code, dataset, "UNKNOWN", session) for code in symbols)
     manifest = CaptureManifest(
         schema_version=1,
@@ -297,12 +299,14 @@ def _publish_pending_manifest(
     )
     try:
         store.publish_manifest(manifest)
+        return True
     except ValueError as exc:
         # PENDING 매니페스트는 completed_at이 매번 달라 재실행 시 동일 run_id 경로와
         # 내용이 반드시 어긋난다 -- 실측: 2026-09-18 재시도 실행이 immutable identity
         # 충돌로 아카이브 전체를 실패시킴. 완료 인증(COMPLETE/PARTIAL)이 아닌 진행 중
         # 체크포인트일 뿐이라 발행 실패해도 실제 수집 작업은 계속 진행한다.
-        logger.warning("[DATA] stage=intraday_archive status=DEGRADED reason=pending_manifest_conflict run_id=%s detail=%s", run_id, exc)
+        logger.warning("[DATA] stage=%s status=DEGRADED reason=pending_manifest_conflict run_id=%s detail=%s", stage, run_id, exc)
+        return False
 
 
 def _event_key(row: Mapping[str, Any], vendor: str) -> tuple[str, str]:
@@ -1191,14 +1195,18 @@ async def _collect_with_observer(
     acquire: Any,
     on_symbol: SymbolObserver | None,
     max_concurrency: int = 1,
+    pending_stage: str = "intraday_archive",
+    publish_pending: bool = True,
 ) -> pd.DataFrame:
     if max_concurrency <= 0:
         raise ValueError(f"Invalid max_concurrency: {max_concurrency!r}")
     trading_day = _parse_snapshot_date(snapshot_date)
-    _publish_pending_manifest(
-        store, trading_day=trading_day, run_id=run_id, dataset=dataset,
-        vendor="owner-local", endpoint="pending", session=session_tag, symbols=list(codes),
-    )
+    if publish_pending:
+        publish_pending_manifest(
+            store, trading_day=trading_day, run_id=run_id, dataset=dataset,
+            vendor="owner-local", endpoint="pending", session=session_tag, symbols=list(codes),
+            stage=pending_stage,
+        )
     sem = asyncio.Semaphore(max_concurrency)
 
     async def _run_one(code: str) -> tuple[str, tuple[pd.DataFrame, CoverageEntry]]:
@@ -1711,7 +1719,7 @@ _EXTENDED_BACKFILL_WINDOWS: dict[str, tuple[str, str, str]] = {
 }
 
 
-async def backfill_extended_session_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, *, session_tag: str, bar_interval_minutes: int = 1, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None) -> pd.DataFrame:
+async def backfill_extended_session_bars(client: Any, session: Any, stock_codes: list[str], snapshot_date: str, *, session_tag: str, bar_interval_minutes: int = 1, profile: CollectionSettings | None = None, capture_store: CaptureStore | None = None, run_id: str | None = None, on_symbol: SymbolObserver | None = None, publish_pending: bool = True) -> pd.DataFrame:
     """Backfill one past date's session 1m bars through the certified KIS historical route.
 
     Every response is retained as raw evidence and classified per symbol exactly like the live path
@@ -1736,6 +1744,7 @@ async def backfill_extended_session_bars(client: Any, session: Any, stock_codes:
         capture_store: Raw evidence store.
         run_id: Acquisition identity (must be new per run).
         on_symbol: Per-symbol observer receiving (symbol, frame, entry).
+        publish_pending: False when the caller already published the task's PENDING checkpoint under the same run_id.
 
     Returns:
         Concatenated canonical frame when on_symbol is None, else an empty canonical frame.
@@ -1793,6 +1802,7 @@ async def backfill_extended_session_bars(client: Any, session: Any, stock_codes:
         codes=codes, snapshot_date=str(snapshot_date), dataset=CaptureDataset.MINUTE_BARS,
         session_tag=str(session_tag), store=store, run_id=resolved_run,
         acquire=_acquire, on_symbol=on_symbol, max_concurrency=int(prof.COLLECTION_CONCURRENCY_PER_KEY),
+        pending_stage="extended_backfill", publish_pending=publish_pending,
     )
 
 

@@ -1103,3 +1103,99 @@ def test_regular_empty_answers_exhaust_after_attempt_cap(env) -> None:
     assert not target.exists() or "000009" not in pd.read_parquet(
         target, columns=["symbol"]
     )["symbol"].tolist()
+
+
+def _run_dir_pending(store, day: str) -> dict[str, list]:
+    from src.data.capture_contracts import CaptureStatus
+
+    out: dict[str, list] = {}
+    for manifest in store.read_manifests(day):
+        if manifest.status is not CaptureStatus.PENDING:
+            continue
+        key = manifest.context.run_id
+        out.setdefault(key, []).append(manifest)
+    return out
+
+
+def test_two_client_task_publishes_single_full_pending_checkpoint(env, caplog) -> None:
+    import logging
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    symbols = ("000001", "000002", "000003", "000004")
+    clients = [_FakeKis(day, traded=set(symbols)), _FakeKis(day, traded=set(symbols))]
+    with caplog.at_level(logging.WARNING):
+        _run(profile, store, ledger, clients, [ExtendedBackfillTask(day, "nxt_aftermarket", symbols)],
+             _raw_ref(day, set(symbols)))
+    pending = _run_dir_pending(store, day)
+    assert len(pending) == 1
+    manifest = next(iter(pending.values()))[0]
+    assert [e.symbol for e in manifest.entries] == list(symbols)
+    assert all(e.status is CaptureStatus.PENDING for e in manifest.entries)
+    assert "pending_manifest_conflict" not in caplog.text
+
+
+def test_pending_checkpoint_and_final_manifest_share_run_id(env) -> None:
+    profile, store, ledger = env
+    day = "2026-03-02"
+    symbols = ("000001", "000002", "000003", "000004")
+    clients = [_FakeKis(day, traded=set(symbols)), _FakeKis(day, traded=set(symbols))]
+    _run(profile, store, ledger, clients, [ExtendedBackfillTask(day, "nxt_aftermarket", symbols)],
+         _raw_ref(day, set(symbols)))
+    run_dirs = [d for d in (store.root / "manifests" / day).iterdir() if d.is_dir()]
+    assert len(run_dirs) == 1
+    names = sorted(p.name for p in run_dirs[0].iterdir())
+    assert names == ["manifest-complete.json", "manifest-pending.json"]
+    manifests = {m.status: m for m in store.read_manifests(day)}
+    assert manifests[CaptureStatus.PENDING].context.run_id == manifests[CaptureStatus.COMPLETE].context.run_id
+    assert {e.symbol for e in manifests[CaptureStatus.COMPLETE].entries} == set(symbols)
+
+
+def test_pending_checkpoint_lists_only_pending_symbols(env) -> None:
+    from src.data.intraday_schema import normalize_bar_frame
+    from src.data.intraday_store import write_intraday_partition
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    ledger.record(day, "nxt_aftermarket", [_entry("000001", CaptureStatus.COMPLETE)],
+                  run_id="seed", attempted_at=datetime.now(SEOUL))
+    stored = normalize_bar_frame(pd.DataFrame([_row("160000", "1000", "10", "10000", day)]), "kis", day, "000002")
+    write_intraday_partition(stored, 1, day, "nxt_aftermarket")
+    _run(profile, store, ledger, [_FakeKis(day, traded={"000003"})],
+         [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002", "000003"))],
+         _raw_ref(day, {"000003"}))
+    pending = _run_dir_pending(store, day)
+    assert len(pending) == 1
+    assert [e.symbol for e in next(iter(pending.values()))[0].entries] == ["000003"]
+
+
+def test_single_client_task_publishes_single_pending_checkpoint(env, caplog) -> None:
+    import logging
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    symbols = ("000001", "000002")
+    with caplog.at_level(logging.WARNING):
+        _run(profile, store, ledger, [_FakeKis(day, traded=set(symbols))],
+             [ExtendedBackfillTask(day, "nxt_aftermarket", symbols)], _raw_ref(day, set(symbols)))
+    pending = _run_dir_pending(store, day)
+    assert len(pending) == 1
+    assert [e.symbol for e in next(iter(pending.values()))[0].entries] == list(symbols)
+    assert "pending_manifest_conflict" not in caplog.text
+
+
+def test_pending_checkpoint_precedes_vendor_requests(env) -> None:
+    profile, store, ledger = env
+    day = "2026-03-02"
+    symbols = ("000001", "000002")
+    seen: list[bool] = []
+
+    class _OrderKis(_FakeKis):
+        async def get_historical_minute_chart(self, session, code, target_date, **kwargs):
+            run_dirs = list((store.root / "manifests" / day).glob("*/manifest-pending.json"))
+            seen.append(bool(run_dirs))
+            return await super().get_historical_minute_chart(session, code, target_date, **kwargs)
+
+    _run(profile, store, ledger, [_OrderKis(day, traded=set(symbols))],
+         [ExtendedBackfillTask(day, "nxt_aftermarket", symbols)], _raw_ref(day, set(symbols)))
+    assert seen and all(seen)
