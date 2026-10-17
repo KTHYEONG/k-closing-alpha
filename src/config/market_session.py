@@ -42,7 +42,13 @@ BAR_STAMP_END: str = "end"
 # (END-stamped, 090100..153000); OHLC/volume matched KIS on 29/40 sampled symbol-days. DB (2026-10-15): START-stamped,
 # 090000..151900 + 153000, after-market 160000... Unlisted vendors must fail closed, never default.
 INTRADAY_BAR_STAMP_CONVENTION: Mapping[str, str] = MappingProxyType(
-    {"kis": BAR_STAMP_START, "kiwoom": BAR_STAMP_START, "ls": BAR_STAMP_END, "toss": BAR_STAMP_END, "dbsec": BAR_STAMP_START}
+    {
+        "kis": BAR_STAMP_START,
+        "kiwoom": BAR_STAMP_START,
+        "ls": BAR_STAMP_END,
+        "toss": BAR_STAMP_END,
+        "dbsec": BAR_STAMP_START,
+    }
 )
 INTRADAY_SESSION_REGULAR: str = "regular"
 INTRADAY_SESSION_REGULAR_CONSOLIDATED: str = "regular_consolidated"
@@ -70,10 +76,10 @@ AFTERMARKET_TICKS_START_DATE: str = "2026-09-29"
 ARCHIVE_REGULAR_READY_HHMMSS: str = "154000"
 # NXT/KRX 애프터마켓은 20:00 종료 후 20:05 이후에만 당일분으로 아카이브한다(kca-archive-intraday.timer와 동일)
 ARCHIVE_AFTERMARKET_READY_HHMMSS: str = "200500"
-# kca-price-ingest.timer의 평일 저녁 슬롯(KIS flows/index); 테이프 스윕 기본 데드라인 산정의 기준점이다.
-PRICE_INGEST_EVENING_HHMMSS: str = "213000"
-# 테이프 스윕(kca-tape-sweep.timer, 20:35 발화)은 이 시각 이후 새 Kiwoom 워크를 열지 않는다 — 21:30 가격 수집과
-# 겹치지 않도록 15분 여유를 둔다. TimeoutStartSec=3600이 20:35 발화 기준 외곽 안전판(21:35)으로 남는다.
+# From this KST time on a trading day a panel missing the previous trading day is DEGRADED (stale_panel); earlier runs are retried by the 11:30 slot and only log.
+PRICE_INGEST_STALE_ALERT_FROM_HHMMSS: str = "110000"
+# 테이프 스윕(kca-tape-sweep.timer, 20:35 발화)은 이 시각 이후 새 Kiwoom 워크를 열지 않는다 — 일일 감사(21:20) 이전에
+# 끝나도록 여유를 둔다. TimeoutStartSec=3600이 20:35 발화 기준 외곽 안전판(21:35)으로 남는다.
 TAPE_SWEEP_DEADLINE_HHMMSS: str = "211500"
 # Kiwoom 틱 테이프의 관측 깊이(달력일 기준).
 KIWOOM_TAPE_DEPTH_DAYS: int = 30

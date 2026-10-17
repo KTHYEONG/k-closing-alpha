@@ -195,7 +195,7 @@ def _entry_fill_dates(path: Path) -> set[str]:
 
 
 def _price_history_fresh(snapshot_date: str) -> bool:
-    # 감사가 당일 야간 적재(21:30) 전에 돌 수 있으므로 직전 아카이브 영업일까지 적재됐는지로 판정한다
+    # 감사는 21:20에 돌아 D 당일 KRX 일봉이 아직 없으므로(다음 영업일 아침 게시) 직전 아카이브 영업일까지 적재됐는지로 판정한다
     previous = resolve_previous_archive_date(snapshot_date)
     if previous is None:
         return True

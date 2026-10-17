@@ -553,9 +553,9 @@ def test_kca_price_ingest_timer_slots_avoid_decision_and_flow_windows() -> None:
     with open("deploy/systemd/kca-price-ingest.timer", encoding="utf-8") as f:
         content = f.read()
     slots = [(int(h), int(m)) for h, m in re.findall(r"OnCalendar=Mon\.\.Fri (\d{2}):(\d{2}):\d{2} Asia/Seoul", content)]
-    # Then: an evening slot (same-day publication) plus morning catch-up slots, none in 15:00-15:45 or 08:55-09:10 (paper-exit)
-    assert len(slots) >= 3
-    assert any(h >= 18 for h, _ in slots) and any(h < 12 for h, _ in slots)
+    # Then: morning ingest (08:30 D-1) plus pre-collect safety net (11:30), none in 15:00-15:45 or 08:55-09:10 (paper-exit)
+    assert len(slots) == 2
+    assert all(h < 12 for h, _ in slots)
     for h, m in slots:
         t = h * 60 + m
         assert not (15 * 60 <= t <= 15 * 60 + 45)
@@ -1867,3 +1867,258 @@ def test_run_price_ingest_holiday_with_rows_stays_ok(monkeypatch, tmp_path) -> N
 
     assert report.n_new_rows > 0
     assert len(outcomes) == 1 and outcomes[0][0] == "OK"
+
+
+def _closed_unknown_session_day(closed: set[str], unknown: set[str]):
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    def _resolve(trading_date, **_kw):
+        key = pd.Timestamp(trading_date).strftime("%Y-%m-%d")
+        if key in unknown:
+            return SessionDay(trading_date=pd.Timestamp(trading_date).date(), kind=SessionKind.UNKNOWN, clock=None, provenance="test")
+        if key in closed:
+            return SessionDay(trading_date=pd.Timestamp(trading_date).date(), kind=SessionKind.CLOSED, clock=None, provenance="test")
+        return _standard_session_day(trading_date)
+
+    return _resolve
+
+
+def test_expected_panel_date_monday_returns_friday(monkeypatch) -> None:
+    import src.daily.price_ingest as mod
+
+    monkeypatch.setattr(mod, "resolve_session_day", _standard_session_day)
+    assert mod.expected_panel_date(pd.Timestamp("2026-09-14 08:30:00")) == pd.Timestamp("2026-09-11")
+
+
+def test_expected_panel_date_ignores_time_of_day(monkeypatch) -> None:
+    import src.daily.price_ingest as mod
+
+    monkeypatch.setattr(mod, "resolve_session_day", _standard_session_day)
+    assert mod.expected_panel_date(pd.Timestamp("2026-09-14 00:00")) == pd.Timestamp("2026-09-11")
+    assert mod.expected_panel_date(pd.Timestamp("2026-09-14 08:30")) == pd.Timestamp("2026-09-11")
+    assert mod.expected_panel_date(pd.Timestamp("2026-09-14 11:30")) == pd.Timestamp("2026-09-11")
+
+
+def test_expected_panel_date_skips_holidays(monkeypatch) -> None:
+    import src.daily.price_ingest as mod
+
+    monkeypatch.setattr(mod, "resolve_session_day", _closed_unknown_session_day({"2026-09-15"}, set()))
+    assert mod.expected_panel_date(pd.Timestamp("2026-09-16 11:30")) == pd.Timestamp("2026-09-14")
+
+
+def test_expected_panel_date_closed_run_day_is_none(monkeypatch) -> None:
+    import src.daily.price_ingest as mod
+
+    monkeypatch.setattr(mod, "resolve_session_day", _closed_unknown_session_day({"2026-09-15"}, set()))
+    assert mod.expected_panel_date(pd.Timestamp("2026-09-15 11:30")) is None
+
+
+def test_expected_panel_date_weekend_is_none() -> None:
+    import src.daily.price_ingest as mod
+
+    assert mod.expected_panel_date(pd.Timestamp("2026-09-12 11:30")) is None
+
+
+def test_expected_panel_date_unknown_in_walkback_is_none(monkeypatch) -> None:
+    import src.daily.price_ingest as mod
+
+    monkeypatch.setattr(mod, "resolve_session_day", _closed_unknown_session_day(set(), {"2026-09-10"}))
+    assert mod.expected_panel_date(pd.Timestamp("2026-09-11 11:30")) is None
+
+
+def test_expected_panel_date_never_returns_run_day(monkeypatch) -> None:
+    import src.daily.price_ingest as mod
+
+    monkeypatch.setattr(mod, "resolve_session_day", _standard_session_day)
+    result = mod.expected_panel_date(pd.Timestamp("2026-09-14 23:59:59"))
+    assert result is not None and result < pd.Timestamp("2026-09-14")
+
+
+def test_expected_panel_date_accepts_aware_kst(monkeypatch) -> None:
+    import src.daily.price_ingest as mod
+
+    monkeypatch.setattr(mod, "resolve_session_day", _standard_session_day)
+    naive = mod.expected_panel_date(pd.Timestamp("2026-09-14 08:30"))
+    aware = mod.expected_panel_date(pd.Timestamp("2026-09-14 08:30", tz="Asia/Seoul"))
+    assert aware == naive == pd.Timestamp("2026-09-11")
+
+
+def _stale_panel_setup(monkeypatch, tmp_path, *, published):
+    path = tmp_path / "ph.parquet"
+    mod, days, _ = _orchestrate_fakes(monkeypatch, published)
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    monkeypatch.setattr(mod, "resolve_session_day", _standard_session_day)
+    return mod, days, path
+
+
+def test_morning_stale_panel_is_ok_with_pending_retry_info(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    mod, _, path = _stale_panel_setup(monkeypatch, tmp_path, published=set())
+    outcomes: list[tuple] = []
+    with caplog.at_level(logging.INFO, logger=mod.logger.name):
+        report = asyncio.run(mod.run_price_ingest(
+            today=pd.Timestamp("2026-09-11 08:30"), path=path, krx_cfg=object(),
+            kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+            on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+        ))
+    assert len(outcomes) == 1 and outcomes[0][0] == "OK" and outcomes[0][1]["reason"] == ""
+    assert any("stale_panel_pending_retry" in r.getMessage() for r in caplog.records if r.levelno == logging.INFO)
+    assert not any("stale_panel" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert report.stale_panel is True
+    assert outcomes[0][1]["metrics"]["stale_panel"] is True
+
+
+def test_late_stale_panel_is_degraded(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    mod, _, path = _stale_panel_setup(monkeypatch, tmp_path, published=set())
+    outcomes: list[tuple] = []
+    with caplog.at_level(logging.INFO, logger=mod.logger.name):
+        report = asyncio.run(mod.run_price_ingest(
+            today=pd.Timestamp("2026-09-11 11:30"), path=path, krx_cfg=object(),
+            kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+            on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+        ))
+    assert len(outcomes) == 1 and outcomes[0][0] == "DEGRADED" and outcomes[0][1]["reason"] == "stale_panel"
+    assert outcomes[0][1]["metrics"]["panel_max_date"] == "2026-09-09"
+    assert outcomes[0][1]["metrics"]["expected_panel_date"] == "2026-09-10"
+    assert any("reason=stale_panel" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert report.panel_max_date == "2026-09-09" and report.stale_panel is True
+
+
+def test_alert_boundary_is_inclusive(monkeypatch, tmp_path) -> None:
+    from src.config.market_session import PRICE_INGEST_STALE_ALERT_FROM_HHMMSS
+
+    assert PRICE_INGEST_STALE_ALERT_FROM_HHMMSS == "110000"
+    mod, _, path = _stale_panel_setup(monkeypatch, tmp_path, published=set())
+    outcomes: list[tuple] = []
+    asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11 11:00:00"), path=path, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+        on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+    ))
+    assert outcomes[0][0] == "DEGRADED" and outcomes[0][1]["reason"] == "stale_panel"
+    mod2, _, path2 = _stale_panel_setup(monkeypatch, tmp_path, published=set())
+    before: list[tuple] = []
+    asyncio.run(mod2.run_price_ingest(
+        today=pd.Timestamp("2026-09-11 10:59:59"), path=path2, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+        on_outcome=lambda outcome, **kw: before.append((outcome, kw)),
+    ))
+    assert before[0][0] == "OK"
+
+
+def test_late_fresh_panel_is_ok(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    mod, days, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
+    path = tmp_path / "ph.parquet"
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    monkeypatch.setattr(mod, "resolve_session_day", _standard_session_day)
+    outcomes: list[tuple] = []
+    with caplog.at_level(logging.INFO, logger=mod.logger.name):
+        report = asyncio.run(mod.run_price_ingest(
+            today=pd.Timestamp("2026-09-11 11:30"), path=path, krx_cfg=object(),
+            kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+            on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+        ))
+    assert outcomes[0][0] == "OK"
+    assert report.panel_max_date == "2026-09-10" and report.stale_panel is False
+    assert not any("stale_panel" in r.getMessage() for r in caplog.records)
+
+
+def _shortfall_stale_setup(monkeypatch, tmp_path):
+    mod, days, _ = _orchestrate_fakes(monkeypatch, set())
+    path = tmp_path / "ph.parquet"
+    rows = _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2)
+    rows[-1]["inst_netbuy"] = float("nan")
+    rows[-1]["foreign_netbuy"] = float("nan")
+    _write_panel(path, rows)
+    monkeypatch.setattr(mod, "resolve_session_day", _standard_session_day)
+    return mod, days, path
+
+
+def test_late_stale_outranks_flow_shortfall(monkeypatch, tmp_path) -> None:
+    mod, _, path = _shortfall_stale_setup(monkeypatch, tmp_path)
+    outcomes: list[tuple] = []
+    asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11 11:30"), path=path, krx_cfg=object(),
+        kis=FakeKis(fail_investor={"000001"}), kiwoom=FakeKiwoom(fail={"000001"}), toss=FakeToss(),
+        on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+    ))
+    assert outcomes[0][0] == "DEGRADED" and outcomes[0][1]["reason"] == "stale_panel"
+    assert outcomes[0][1]["metrics"]["flow_shortfall"]
+
+
+def test_morning_stale_keeps_flow_shortfall_reason(monkeypatch, tmp_path) -> None:
+    mod, _, path = _shortfall_stale_setup(monkeypatch, tmp_path)
+    outcomes: list[tuple] = []
+    asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11 08:30"), path=path, krx_cfg=object(),
+        kis=FakeKis(fail_investor={"000001"}), kiwoom=FakeKiwoom(fail={"000001"}), toss=FakeToss(),
+        on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+    ))
+    assert outcomes[0][0] == "DEGRADED" and outcomes[0][1]["reason"] == "flow_coverage_below_min"
+
+
+def test_holiday_run_never_alerts_stale(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    mod, days, _ = _orchestrate_fakes(monkeypatch, set())
+    path = tmp_path / "ph.parquet"
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    monkeypatch.setattr(mod, "resolve_session_day", _closed_session_day)
+    with caplog.at_level(logging.INFO, logger=mod.logger.name):
+        outcomes: list[tuple] = []
+        asyncio.run(mod.run_price_ingest(
+            today=pd.Timestamp("2026-09-11 11:30"), path=path, krx_cfg=object(),
+            kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+            on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+        ))
+    assert outcomes[0][1]["reason"] != "stale_panel"
+    assert not any("stale_panel" in r.getMessage() for r in caplog.records)
+    assert outcomes[0][0] == "SKIPPED" and outcomes[0][1]["reason"] == "non_trading_day"
+    caplog.clear()
+    mod2, days2, _ = _orchestrate_fakes(monkeypatch, {"2026-09-10"})
+    path2 = tmp_path / "ph2.parquet"
+    _write_panel(path2, _panel_rows("000001", [days2["2026-09-08"], days2["2026-09-09"]], [10000.0] * 2))
+    monkeypatch.setattr(mod2, "resolve_session_day", _closed_session_day)
+    with caplog.at_level(logging.INFO, logger=mod2.logger.name):
+        outcomes2: list[tuple] = []
+        asyncio.run(mod2.run_price_ingest(
+            today=pd.Timestamp("2026-09-11 11:30"), path=path2, krx_cfg=object(),
+            kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+            on_outcome=lambda outcome, **kw: outcomes2.append((outcome, kw)),
+        ))
+    assert outcomes2[0][0] == "OK"
+    assert not any("stale_panel" in r.getMessage() for r in caplog.records)
+
+
+def test_midnight_today_never_alerts(monkeypatch, tmp_path) -> None:
+    mod, days, _ = _orchestrate_fakes(monkeypatch, set())
+    path = tmp_path / "ph.parquet"
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    monkeypatch.setattr(mod, "resolve_session_day", _standard_session_day)
+    outcomes: list[tuple] = []
+    asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11"), path=path, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+        on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+    ))
+    assert outcomes[0][0] == "OK"
+
+
+def test_run_price_ingest_accepts_aware_today(monkeypatch, tmp_path) -> None:
+    mod, days, _ = _orchestrate_fakes(monkeypatch, set())
+    path = tmp_path / "ph.parquet"
+    _write_panel(path, _panel_rows("000001", [days["2026-09-08"], days["2026-09-09"]], [10000.0] * 2))
+    monkeypatch.setattr(mod, "resolve_session_day", _standard_session_day)
+    outcomes: list[tuple] = []
+    report = asyncio.run(mod.run_price_ingest(
+        today=pd.Timestamp("2026-09-11 11:30", tz="Asia/Seoul"), path=path, krx_cfg=object(),
+        kis=FakeKis(), kiwoom=FakeKiwoom(), toss=FakeToss(),
+        on_outcome=lambda outcome, **kw: outcomes.append((outcome, kw)),
+    ))
+    assert outcomes[0][0] == "DEGRADED" and outcomes[0][1]["reason"] == "stale_panel"
+    assert report.stale_panel is True
