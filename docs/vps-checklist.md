@@ -91,7 +91,7 @@ Containerized units run `ExecStart=%h/.local/lib/kca/kca-run <job> [--kis-data] 
 | Mon–Fri 21:20 | `kca-daily-audit` (host) | `flock kca-audit.lock` | 30 min | 1.5–4.5 min incl. ~80 s `sudo chown -R` pre-step; subject `🟢 … 일일점검 완료` | P1 |
 | Mon–Fri 21:35 | `kca-altdata-capture` (optional) | kis-data, standard, batch | 30 min | 4–6 min | P2 |
 | Mon–Fri 22:15 | `kca-backup` (host) | `flock quant-gdrive.lock` | 3 h | 3–10 min incl. ~95 s chown pre-step; `offsite_backup status=ok` | P0 shrink / P1 fail |
-| daily 23:05 | `kca-extended-backfill` | kis-data, bulk, batch | 8 h | ~2.5 min (weekends too); `extended_backfill status=DONE` | P2 |
+| daily 23:05 | `kca-extended-backfill` | kis-data, bulk, batch | 8 h | ~2.5 min (weekends too); `extended_backfill status=DONE`; run_outcome job=extended_backfill outcome=OK | P2 |
 | Sat 22:00 | `kca-retrain` | `--memory=6g --cpus=1.8 --memory-swap=8g` | 2 h | registry row `PROMOTED`; a strategy change yields `REJECTED` + unit failure by design (§10) | P1 |
 | Sun 10:00 | `kca-core-snapshot` (host) | `flock quant-gdrive.lock` | 2 h | ~1 min | P1 |
 | Sun 11:00 | `kca-offsite-verify` (host) | `flock quant-gdrive.lock` | 2 h | ~6 min; `missing=0 mismatched=0`, 3 restore drills `OK` | P1 |

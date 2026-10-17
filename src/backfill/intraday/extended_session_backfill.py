@@ -18,7 +18,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -53,6 +53,7 @@ from src.data.capture_contracts import (
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_store import intraday_partition_path, remove_intraday_symbols, write_intraday_partition
+from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.data.io_utils import atomic_write_parquet, read_existing_parquet
 from src.utils.cli_logging import configure_cli_logging
 from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
@@ -560,6 +561,21 @@ class ExtendedBackfillSummary:
     failed: int
     stopped_by_deadline: bool
     exhausted: int = 0
+    pending_conflicts: int = 0
+
+
+def classify_extended_backfill_outcome(summary: ExtendedBackfillSummary) -> tuple[str, str]:
+    """Return (run outcome, reason) for a finished backfill: DEGRADED on failed/exhausted entries or PENDING conflicts, else OK."""
+    tokens: list[str] = []
+    if summary.exhausted > 0:
+        tokens.append("exhausted")
+    if summary.failed > 0:
+        tokens.append("failed")
+    if summary.pending_conflicts > 0:
+        tokens.append("pending_manifest_conflict")
+    if tokens:
+        return RUN_OUTCOME_DEGRADED, ",".join(tokens)
+    return RUN_OUTCOME_OK, ""
 
 
 def _stored_partition_symbols(snapshot_date: str, session: str) -> set[str]:
@@ -749,6 +765,7 @@ async def run_extended_session_backfill(
     not_listed = 0
     failed = 0
     exhausted = 0
+    pending_conflicts = 0
     stopped = False
     unreadable: list[str] = []
     async with AsyncExitStack() as stack:
@@ -782,6 +799,7 @@ async def run_extended_session_backfill(
             ]
             repaired = sum(1 for symbol in pending if symbol in repair_candidates)
             run_id = f"extended-backfill-{task.snapshot_date}-{task.session}-{uuid.uuid4().hex[:8]}"
+            pending_conflict = 0
             collected: dict[str, tuple[pd.DataFrame, CoverageEntry]] = {}
             symbol_routes: dict[str, tuple[Any, Any]] = {}
 
@@ -809,7 +827,8 @@ async def run_extended_session_backfill(
                 return bucket
 
             if pending:
-                publish_pending_manifest(store, trading_day=date.fromisoformat(task.snapshot_date), run_id=run_id, dataset=CaptureDataset.MINUTE_BARS, vendor="owner-local", endpoint="pending", session=task.session, symbols=pending, stage="extended_backfill")
+                pending_conflict = 0 if publish_pending_manifest(store, trading_day=date.fromisoformat(task.snapshot_date), run_id=run_id, dataset=CaptureDataset.MINUTE_BARS, vendor="owner-local", endpoint="pending", session=task.session, symbols=pending, stage="extended_backfill") else 1
+                pending_conflicts += pending_conflict
                 buckets: list[list[str]] = [[] for _ in clients]
                 for index, symbol in enumerate(pending):
                     buckets[index % len(clients)].append(symbol)
@@ -985,7 +1004,7 @@ async def run_extended_session_backfill(
             done += 1
             elapsed = (clock() - started).total_seconds()
             logger.info(
-                "[DATA] stage=extended_backfill date=%s session=%s pending=%d complete=%d no_trades=%d not_listed=%d failed=%d repaired=%d adjusted=%d basis_failed=%d elapsed_s=%.1f",
+                "[DATA] stage=extended_backfill date=%s session=%s pending=%d complete=%d no_trades=%d not_listed=%d failed=%d repaired=%d adjusted=%d basis_failed=%d pending_conflict=%d elapsed_s=%.1f",
                 task.snapshot_date,
                 task.session,
                 len(pending),
@@ -996,6 +1015,7 @@ async def run_extended_session_backfill(
                 repaired,
                 adjusted,
                 basis_failed,
+                pending_conflict,
                 elapsed,
             )
     if unreadable:
@@ -1009,6 +1029,7 @@ async def run_extended_session_backfill(
         failed=failed,
         stopped_by_deadline=stopped,
         exhausted=exhausted,
+        pending_conflicts=pending_conflicts,
     )
 
 
@@ -1061,6 +1082,7 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
     slots = tuple(profile.COLLECTION_BACKFILL_SLOTS)
     if not slots:
         logger.info("[DATA] stage=extended_backfill status=SKIP reason=disabled")
+        record_run_outcome("extended_backfill", RUN_OUTCOME_SKIPPED, run_date=as_of.isoformat(), reason="disabled")
         return
     env = dict(os.environ)
     creds = resolve_research_credentials(env, slots=slots)
@@ -1207,7 +1229,7 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
 
     kis_summary = asyncio.run(_run())
     logger.info(
-        "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d exhausted=%d stopped_by_deadline=%s",
+        "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d exhausted=%d pending_conflicts=%d stopped_by_deadline=%s",
         kis_summary.tasks_done,
         kis_summary.tasks_remaining,
         kis_summary.complete,
@@ -1215,8 +1237,11 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
         kis_summary.not_listed,
         kis_summary.failed,
         kis_summary.exhausted,
+        kis_summary.pending_conflicts,
         kis_summary.stopped_by_deadline,
     )
+    outcome, reason = classify_extended_backfill_outcome(kis_summary)
+    record_run_outcome("extended_backfill", outcome, run_date=as_of.isoformat(), reason=reason, metrics=asdict(kis_summary))
 
 
 if __name__ == "__main__":  # pragma: no cover
