@@ -495,3 +495,163 @@ def test_kis_credential_equality_preserved() -> None:
     assert a == b
     assert hash(a) == hash(b)
     assert a != KisCredential(slot="DATA_1", app_key="k", app_secret="other", hts_id="h")
+
+
+def _three_slot_env() -> dict[str, str]:
+    env = {
+        "KIS_DATA_SLOTS": "1,2,3",
+        "KIS_HOST_DATA_SLOTS": "1,2,3",
+        "KIS_DECISION_SHARD_SLOTS": "1,2,3",
+    }
+    for n in ("1", "2", "3"):
+        env[f"KIS_DATA_{n}_APP_KEY"] = f"key{n}"
+        env[f"KIS_DATA_{n}_APP_SECRET"] = f"sec{n}"
+    return env
+
+
+def _call_outcome(fn, env):
+    from src.api.kis.key_pool import resolve_research_credentials
+
+    try:
+        if fn is resolve_research_credentials:
+            env = {k: v for k, v in env.items() if k != "KIS_DECISION_SHARD_SLOTS"}
+            creds = fn(env, slots=("1", "2", "3"))
+        else:
+            creds = fn(env)
+    except ValueError as exc:
+        return ("err", str(exc))
+    return ("ok", [(c.slot, c.app_key, c.app_secret, c.hts_id) for c in creds])
+
+
+def test_slot_parser_parity_matrix() -> None:
+    from src.api.kis.key_pool import (
+        parse_decision_shard_credentials,
+        parse_host_data_credentials,
+        resolve_research_credentials,
+    )
+
+    # Given: 654fe1b에서 기록된 golden 결과 (HEAD와 바이트 동일함을 git diff로 확인)
+    ok3 = ("ok", [("DATA_1", "key1", "sec1", ""), ("DATA_2", "key2", "sec2", ""), ("DATA_3", "key3", "sec3", "")])
+    cases = {
+        "valid": (lambda e: e, None),
+        "missing_key_in_2nd_slot": (
+            lambda e: {k: v for k, v in e.items() if k != "KIS_DATA_2_APP_KEY"},
+            "missing credentials for slot DATA_2",
+        ),
+        "blank_secret": (
+            lambda e: {**e, "KIS_DATA_1_APP_SECRET": "  "},
+            "missing credentials for slot DATA_1",
+        ),
+        "duplicate_keys_in_slots_1_and_3": (
+            lambda e: {**e, "KIS_DATA_3_APP_KEY": "key1"},
+            "duplicate app_key in {label} DATA_3",
+        ),
+        "slot_key_equals_trade_app_key": (
+            lambda e: {**e, "KIS_TRADE_APP_KEY": "key2"},
+            "data slot app_key collides with KIS_TRADE_APP_KEY",
+        ),
+        "slot_key_equals_account_app_key": (
+            lambda e: {**e, "KIS_APP_KEY": "key2"},
+            "data slot app_key collides with KIS_APP_KEY",
+        ),
+        "missing_and_duplicate": (
+            lambda e: {**{k: v for k, v in e.items() if k != "KIS_DATA_2_APP_SECRET"}, "KIS_DATA_3_APP_KEY": "key1"},
+            "missing credentials for slot DATA_2",
+        ),
+    }
+    entries = {
+        "host": (parse_host_data_credentials, "slot", True),
+        "shard": (parse_decision_shard_credentials, "decision shard slot", False),
+        "research": (resolve_research_credentials, "slot", True),
+    }
+    # When/Then: 세 진입점 모두 golden과 동일한 튜플 또는 동일한 메시지를 낸다
+    for entry_name, (fn, label, rejects_trade) in entries.items():
+        for case_name, (mutate, golden_err) in cases.items():
+            env = mutate(_three_slot_env())
+            if golden_err is not None and "{label}" in golden_err:
+                golden = ("err", golden_err.format(label=label))
+            elif golden_err is not None and "collides" in golden_err and not rejects_trade:
+                golden = ok3
+            elif golden_err is not None:
+                golden = ("err", golden_err)
+            else:
+                golden = ok3
+            assert _call_outcome(fn, env) == golden, f"{entry_name}/{case_name}"
+
+
+def test_missing_precedes_duplicate() -> None:
+    import pytest
+
+    from src.api.kis.key_pool import parse_host_data_credentials
+
+    # Given: 슬롯 1·2 키 중복 + 슬롯 3 시크릿 누락
+    env = {
+        "KIS_DATA_SLOTS": "1,2,3",
+        "KIS_HOST_DATA_SLOTS": "1,2,3",
+        "KIS_DATA_1_APP_KEY": "dup", "KIS_DATA_1_APP_SECRET": "s1",
+        "KIS_DATA_2_APP_KEY": "dup", "KIS_DATA_2_APP_SECRET": "s2",
+        "KIS_DATA_3_APP_KEY": "key3",
+    }
+
+    # When/Then: 중복보다 누락이 먼저 보고된다
+    with pytest.raises(ValueError, match=r"^missing credentials for slot DATA_3$"):
+        parse_host_data_credentials(env)
+
+
+def test_shards_skip_trade_collision() -> None:
+    from src.api.kis.key_pool import parse_decision_shard_credentials
+
+    # Given: 샤드 슬롯 키가 KIS_APP_KEY와 동일
+    env = {
+        "KIS_DATA_SLOTS": "1,5",
+        "KIS_DECISION_SHARD_SLOTS": "1,5",
+        "KIS_DATA_1_APP_KEY": "key1", "KIS_DATA_1_APP_SECRET": "sec1",
+        "KIS_DATA_5_APP_KEY": "key5", "KIS_DATA_5_APP_SECRET": "sec5",
+        "KIS_APP_KEY": "key1",
+    }
+
+    # When/Then: 충돌 검사 없이 자격증명을 반환한다
+    assert [c.slot for c in parse_decision_shard_credentials(env)] == ["DATA_1", "DATA_5"]
+
+
+def test_whitespace_stripped() -> None:
+    from src.api.kis.key_pool import parse_host_data_credentials
+
+    # Given: 공백으로 감싼 키
+    env = {
+        "KIS_DATA_SLOTS": "1",
+        "KIS_HOST_DATA_SLOTS": "1",
+        "KIS_DATA_1_APP_KEY": " k ", "KIS_DATA_1_APP_SECRET": " s ",
+    }
+
+    # When/Then: 앞뒤 공백이 제거된다
+    (cred,) = parse_host_data_credentials(env)
+    assert cred.app_key == "k"
+    assert cred.app_secret == "s"
+
+
+def test_no_secret_in_errors() -> None:
+    import pytest
+
+    from src.api.kis.key_pool import parse_host_data_credentials
+
+    # Given: 식별 가능한 키 물질이 든 실패 env 모음
+    base = {
+        "KIS_DATA_SLOTS": "1,2",
+        "KIS_HOST_DATA_SLOTS": "1,2",
+        "KIS_DATA_1_APP_KEY": "AK-UNIQUE-KEY-1", "KIS_DATA_1_APP_SECRET": "SUPER-SECRET-1",
+        "KIS_DATA_2_APP_KEY": "AK-UNIQUE-KEY-2", "KIS_DATA_2_APP_SECRET": "SUPER-SECRET-2",
+    }
+    failing = [
+        ({**base, "KIS_DATA_1_APP_SECRET": ""}, "missing credentials"),
+        ({**base, "KIS_DATA_2_APP_KEY": "AK-UNIQUE-KEY-1"}, "duplicate app_key"),
+        ({**base, "KIS_APP_KEY": "AK-UNIQUE-KEY-2"}, "collides"),
+    ]
+
+    # When/Then: 어떤 실패의 str/repr에도 키 물질이 노출되지 않는다
+    secrets = ("AK-UNIQUE-KEY-1", "AK-UNIQUE-KEY-2", "SUPER-SECRET-1", "SUPER-SECRET-2")
+    for env, match in failing:
+        with pytest.raises(ValueError, match=match) as excinfo:
+            parse_host_data_credentials(env)
+        rendered = f"{excinfo.value!s}\n{excinfo.value!r}"
+        assert not any(s in rendered for s in secrets)

@@ -77,21 +77,7 @@ RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
 # 값은 쉼표 목록으로 쓴다: docker --env-file은 따옴표를 그대로 넘기고 systemd
 # EnvironmentFile은 벗기므로 JSON 표기는 로더마다 다르게 읽힌다.
 #
-# KIS 데이터 슬롯(앱키당 REST 20TPS)은 krx-alpha와 공유한다. 같은 키를 두 프로젝트가 동시에
-# 쓰면 합산 TPS가 한도를 넘는다(실측: krx 스냅샷이 DATA_1을 쓰던 09-22/23 15:20에 kca 결정창
-# EGW00201 44/77건). kca 프로세스끼리는 호스트 공유 버킷으로 키별 합산이 제한되므로, 배정은
-# "krx와 시간대가 겹치는 슬롯을 공유하지 않는다"만 지키면 된다.
-#   DATA_1  kca 결정 역할(15:20 수집 선두·15:30 종가확정·페이퍼) 전용 REST
-#   DATA_2  krx 스냅샷 REST 08:00~15:39 전용(krx docker-compose가 고정) -> kca는 장중 사용 금지
-#   DATA_3  kca 장 개시·마감 연구 캡처(08:39~09:03, 15:21~15:30)
-#   DATA_4  kca 배치 역할(가격·아카이브·대체데이터 기본키) + 연구 캡처 보조
-#   DATA_5  kca 결정창 샤드 2번(15:20), krx 예비
-#   DATA_2·3: 23:05~06:50 야간 확장세션 분봉 소급(krx/kca 모두 KIS REST 미사용 시간대)
-#   DATA_2·3: 15:40~20:00 애프터마켓 호가 REST(krx 스냅샷 15:39 종료, 경매 캡처 15:30 종료 이후)
-# krx 애프터마켓 웹소켓 샤드(15:30~20:00)는 REST 유량을 쓰지 않아 위 배정과 충돌하지 않는다.
-#   KIS_DECISION_SHARD_SLOTS: 결정 역할 선두(1)로 시작해야 하며 15:20 벌크를 절반으로 줄인다.
-#   COLLECTION_RESEARCH_SLOTS: 샤드와 겹치면 안 되고(코드 검증), krx 스냅샷(2)과 경매 시각이 같아 2도 제외.
-#   COLLECTION_ALTDATA_EXTRA_SLOTS: 21:35에는 krx가 REST를 쓰지 않으므로 2·3을 빌려 3키로 분산한다.
+# Slot assignment SSOT: deploy/shared/kis_slot_assignments.toml (vendored from krx-alpha); tests enforce parity.
 VPS_SELECTORS: tuple[tuple[str, str], ...] = (
     ("KIS_TRADING_ENV", "mock"),
     ("KIS_DECISION_SHARD_SLOTS", "1,5"),
@@ -105,7 +91,7 @@ VPS_SELECTORS: tuple[tuple[str, str], ...] = (
     ("DB_AUCTION_PATH_ENABLED", "true"),
 )
 
-# krx-alpha docker-compose의 KRX_ALPHA_SNAPSHOT_KIS_DATA_SLOT과 같아야 한다(장중 배타 슬롯).
+# Slot assignment SSOT: deploy/shared/kis_slot_assignments.toml (vendored from krx-alpha); tests enforce parity.
 KRX_SNAPSHOT_DATA_SLOT: str = "2"
 
 REMOTE_RUNTIME_ENV_PATH: str = "/home/ubuntu/quant-secrets/k-closing-alpha.env"
