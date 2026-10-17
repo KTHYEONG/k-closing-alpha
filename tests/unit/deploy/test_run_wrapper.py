@@ -76,16 +76,21 @@ def test_reaper_name_matches_wrapper_name() -> None:
 
 
 def test_only_execstart_changed() -> None:
+    # Pins the wrapper migration itself (pre-migration sha vs migration commit), so later
+    # intentional unit/timer edits do not masquerade as migration regressions.
     sha = _fixture()["sha"]
+    migrated = _fixture()["migration_sha"]
     for name in _fixture()["execstart"]:
         old = _git_show(f"{sha}:deploy/systemd/{name}").decode("utf-8")
-        new = (SYSTEMD / name).read_text(encoding="utf-8")
+        new = _git_show(f"{migrated}:deploy/systemd/{name}").decode("utf-8")
         old_body = [line for line in old.splitlines() if not line.startswith("ExecStart=")]
         new_body = [line for line in new.splitlines() if not line.startswith("ExecStart=")]
         assert old_body == new_body, name
-    for timer in sorted(SYSTEMD.glob("kca-*.timer")):
-        old = _git_show(f"{sha}:deploy/systemd/{timer.name}")
-        assert old == timer.read_bytes(), timer.name
+    timers = _git_show(f"{migrated}:deploy/systemd").decode("utf-8").split()
+    migrated_timers = sorted(name for name in timers if name.startswith("kca-") and name.endswith(".timer"))
+    assert migrated_timers
+    for timer in migrated_timers:
+        assert _git_show(f"{sha}:deploy/systemd/{timer}") == _git_show(f"{migrated}:deploy/systemd/{timer}"), timer
 
 
 def test_exec_replaces_shell() -> None:
