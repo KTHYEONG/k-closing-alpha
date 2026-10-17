@@ -39,6 +39,47 @@ def test_blackout_half_open_boundaries() -> None:
     assert blackout_remaining(_kst(0, 15, 43)) == timedelta(0)
 
 
+def test_preopen_window_starts_0830() -> None:
+    from src.tools.deploy_window import blackout_remaining
+
+    assert blackout_remaining(_kst(0, 8, 29, 59)) == timedelta(0)
+    assert blackout_remaining(_kst(0, 8, 30)) == timedelta(minutes=70)
+
+
+def test_order_exit_inside_blackout() -> None:
+    from src.tools.deploy_window import blackout_remaining
+
+    assert blackout_remaining(_kst(0, 8, 40, 10)) > timedelta(0)
+
+
+def test_weekend_no_blackout() -> None:
+    from src.tools.deploy_window import blackout_remaining
+
+    saturday = datetime(2026, 10, 3, 8, 45, tzinfo=_SEOUL)
+    assert saturday.weekday() == 5
+
+    assert blackout_remaining(saturday) == timedelta(0)
+
+
+def test_afternoon_window_unchanged() -> None:
+    from src.tools.deploy_window import blackout_remaining
+
+    assert blackout_remaining(_kst(0, 15, 9, 59)) == timedelta(0)
+    assert blackout_remaining(_kst(0, 15, 10)) == timedelta(minutes=33)
+    assert blackout_remaining(_kst(0, 15, 43)) == timedelta(0)
+
+
+def test_import_guard_rejects_late_start(monkeypatch) -> None:
+    import pytest
+
+    import src.tools.deploy_window as deploy_window
+
+    monkeypatch.setattr(deploy_window, "DEPLOY_BLACKOUT_PREOPEN_LEAD_MINUTES", 29)
+
+    with pytest.raises(ValueError, match="pre-open blackout start"):
+        deploy_window._build_windows()
+
+
 def test_blackout_ignores_weekends() -> None:
     from datetime import date
 
