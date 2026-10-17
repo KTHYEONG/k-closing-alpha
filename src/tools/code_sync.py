@@ -12,9 +12,13 @@ CI(.github/workflows/deploy.yml)의 test job이 이미 pytest 전체스위트를
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
+import os
 import shutil
+import stat
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +39,9 @@ OPTIONAL_MANUAL_TIMERS: frozenset[str] = frozenset(
 SECRET_FILE_MODE: int = 0o600
 # 토큰 캐시·admission 상태가 담긴 호스트 공유 디렉터리는 소유자 전용이어야 한다
 ADMISSION_DIR_MODE: int = 0o700
+# 컨테이너 실행 래퍼가 설치되는 호스트 디렉터리와 파일 권한
+KCA_RUN_DIR_MODE: int = 0o700
+KCA_RUN_FILE_MODE: int = 0o755
 
 
 @dataclass(frozen=True)
@@ -78,10 +85,53 @@ def _uv_sync(repo_dir: str) -> None:
     subprocess.run([_resolve_uv_bin(), "sync"], cwd=repo_dir, check=True, capture_output=True, text=True, timeout=UV_SYNC_TIMEOUT_SEC)  # noqa: S603, S607
 
 
+def _default_kca_run_lib_dir() -> Path:
+    """Return the host directory wrapper units reference via %h/.local/lib/kca."""
+    return Path.home() / ".local" / "lib" / "kca"
+
+
+def install_kca_run_wrapper(repo_dir: str, *, lib_dir: Path | None = None) -> bool:
+    """Atomically install deploy/host/kca-run before any unit referencing it.
+
+    Args:
+        repo_dir: Repository checkout containing deploy/host/kca-run.
+        lib_dir: Destination directory; None selects ~/.local/lib/kca.
+
+    Returns:
+        True when the wrapper was installed, False when unchanged or absent.
+    """
+    src = Path(repo_dir) / "deploy" / "host" / "kca-run"
+    if not src.is_file():
+        return False
+    dest_dir = Path(lib_dir) if lib_dir is not None else _default_kca_run_lib_dir()
+    dest_dir.mkdir(mode=KCA_RUN_DIR_MODE, parents=True, exist_ok=True)
+    os.chmod(dest_dir, KCA_RUN_DIR_MODE)
+    data = src.read_bytes()
+    target = dest_dir / "kca-run"
+    if (
+        target.is_file()
+        and target.read_bytes() == data
+        and stat.S_IMODE(target.stat().st_mode) == KCA_RUN_FILE_MODE
+    ):
+        return False
+    fd, tmp_name = tempfile.mkstemp(dir=str(dest_dir), prefix=".kca-run.")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.chmod(tmp_name, KCA_RUN_FILE_MODE)
+        os.replace(tmp_name, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+    return True
+
+
 def install_systemd_units(
     repo_dir: str,
     *,
     dest_dir: Path | None = None,
+    lib_dir: Path | None = None,
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> UnitInstallResult:
     """Converge the installed kca-* systemd user units onto deploy/systemd in the repo.
@@ -97,6 +147,7 @@ def install_systemd_units(
     Args:
         repo_dir: Repository checkout containing deploy/systemd.
         dest_dir: Installed unit directory; None selects ~/.config/systemd/user.
+        lib_dir: Wrapper install directory; None selects ~/.local/lib/kca.
         run_fn: subprocess.run-compatible runner (tests substitute a fake).
 
     Returns:
@@ -108,6 +159,7 @@ def install_systemd_units(
     """
     src_dir = Path(repo_dir) / "deploy" / "systemd"
     dest = dest_dir if dest_dir is not None else Path.home() / ".config" / "systemd" / "user"
+    install_kca_run_wrapper(repo_dir, lib_dir=lib_dir)
     dest.mkdir(parents=True, exist_ok=True)
     wanted = {path.name: path for pattern in SYSTEMD_UNIT_GLOBS for path in src_dir.glob(pattern)}
     installed = {path.name for pattern in SYSTEMD_UNIT_GLOBS for path in dest.glob(pattern)}
