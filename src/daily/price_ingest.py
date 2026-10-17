@@ -34,6 +34,7 @@ from src.backfill.altdata.krx_api import (
     KRX_ENDPOINT_STK_DAILY,
     fetch_krx_openapi_day_strict,
 )
+from src.config.market_session import MAX_PREV_TRADING_DAY_LOOKBACK, PRICE_INGEST_STALE_ALERT_FROM_HHMMSS
 from src.data.capture_contracts import (
     BrokerPayload,
     CaptureContext,
@@ -49,6 +50,7 @@ from src.data.io_utils import store_write_lock
 from src.data.panel_integrity import heal_price_history_panel
 from src.data.parquet_codec import write_price_history_parquet
 from src.data.session_calendar import SessionDay, SessionKind, resolve_session_day
+from src.ml.topk_history_features import resolve_prev_trading_day
 from src.strategy.contract import derive_chg_ratio
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
@@ -156,6 +158,8 @@ class IngestReport:
     flow_shortfall: dict[str, float] = field(default_factory=dict)
     program_flow_shortfall: dict[str, float] = field(default_factory=dict)
     n_flow_repaired: int = 0
+    panel_max_date: str = ""
+    stale_panel: bool = False
 
 
 def _to_num(s: pd.Series) -> pd.Series:
@@ -197,9 +201,7 @@ def validate_krx_daily_block(raw: pd.DataFrame, trade_date: pd.Timestamp) -> Non
 
     def _reject(check: str, idx: pd.Index) -> None:
         samples = raw["ISU_CD"].astype(str).iloc[list(idx[:5])].tolist()
-        raise KrxIntegrityError(
-            f"KRX block market={market} check={check} n_violating={len(idx)} samples={samples}"
-        )
+        raise KrxIntegrityError(f"KRX block market={market} check={check} n_violating={len(idx)} samples={samples}")
 
     bas = raw["BAS_DD"].astype(str).str.replace("-", "", regex=False).str.strip()
     bad = bas[bas != ymd].index
@@ -229,8 +231,12 @@ def validate_krx_daily_block(raw: pd.DataFrame, trade_date: pd.Timestamp) -> Non
         low_p = _to_num(block["TDD_LWPRC"])
         close_t = close.loc[traded]
         inconsistent = (
-            open_p.isna() | high_p.isna() | low_p.isna()
-            | (open_p <= 0) | (high_p <= 0) | (low_p <= 0)
+            open_p.isna()
+            | high_p.isna()
+            | low_p.isna()
+            | (open_p <= 0)
+            | (high_p <= 0)
+            | (low_p <= 0)
             | (low_p > pd.concat([open_p, close_t], axis=1).min(axis=1))
             | (pd.concat([open_p, close_t], axis=1).max(axis=1) > high_p)
         )
@@ -276,7 +282,7 @@ def check_day_continuity(new_rows: pd.DataFrame, prior_rows: pd.DataFrame) -> No
     prior_m = prior.drop_duplicates("symbol", keep="last").set_index("symbol")
     same = pd.Series(True, index=pd.Index(common))
     for col in cols:
-        same &= (new_m.loc[common, col].to_numpy() == prior_m.loc[common, col].to_numpy())
+        same &= new_m.loc[common, col].to_numpy() == prior_m.loc[common, col].to_numpy()
     n_stale = int(pd.Series(same).sum())
     share = n_stale / len(common)
     if share > MAX_STALE_SHARE:
@@ -308,26 +314,30 @@ def normalize_krx_daily(raw: pd.DataFrame, trade_date: pd.Timestamp) -> pd.DataF
         raise ValueError(f"KRX daily block missing columns: {missing}")
     validate_krx_daily_block(raw, trade_date)
     close = _to_num(raw["TDD_CLSPRC"])
-    out = pd.DataFrame({
-        "date": pd.Timestamp(trade_date).normalize(),
-        "symbol": raw["ISU_CD"].astype(str).str.strip().to_numpy(),
-        "open": _to_num(raw["TDD_OPNPRC"]).to_numpy(),
-        "high": _to_num(raw["TDD_HGPRC"]).to_numpy(),
-        "low": _to_num(raw["TDD_LWPRC"]).to_numpy(),
-        "close": close.to_numpy(),
-        "prev_close": (close - _to_num(raw["CMPPREVDD_PRC"])).to_numpy(),
-        "volume": _to_num(raw["ACC_TRDVOL"]).to_numpy(),
-        "trade_value_100m": (_to_num(raw["ACC_TRDVAL"]) / KRW_PER_100M).to_numpy(),
-        "market_cap_100m": (_to_num(raw["MKTCAP"]) / KRW_PER_100M).to_numpy(),
-        "market": raw["MKT_NM"].astype(str).str.strip().to_numpy(),
-    })
+    out = pd.DataFrame(
+        {
+            "date": pd.Timestamp(trade_date).normalize(),
+            "symbol": raw["ISU_CD"].astype(str).str.strip().to_numpy(),
+            "open": _to_num(raw["TDD_OPNPRC"]).to_numpy(),
+            "high": _to_num(raw["TDD_HGPRC"]).to_numpy(),
+            "low": _to_num(raw["TDD_LWPRC"]).to_numpy(),
+            "close": close.to_numpy(),
+            "prev_close": (close - _to_num(raw["CMPPREVDD_PRC"])).to_numpy(),
+            "volume": _to_num(raw["ACC_TRDVOL"]).to_numpy(),
+            "trade_value_100m": (_to_num(raw["ACC_TRDVAL"]) / KRW_PER_100M).to_numpy(),
+            "market_cap_100m": (_to_num(raw["MKTCAP"]) / KRW_PER_100M).to_numpy(),
+            "market": raw["MKT_NM"].astype(str).str.strip().to_numpy(),
+        }
+    )
     dup = int(out["symbol"].duplicated().sum())
     if dup:
         raise ValueError(f"KRX daily block repeats {dup} symbols on {pd.Timestamp(trade_date).date()}")
     return out
 
 
-def _price_capture_context(trading_day: date, run_id: str, endpoint: str, *, symbol: str | None = None) -> CaptureContext:
+def _price_capture_context(
+    trading_day: date, run_id: str, endpoint: str, *, symbol: str | None = None
+) -> CaptureContext:
     return CaptureContext(
         trading_date=trading_day,
         run_id=run_id,
@@ -379,7 +389,9 @@ def _price_page_observer(store: CaptureStore, trading_day: date, run_id: str) ->
     return _on_page
 
 
-def fetch_krx_daily(trade_date: pd.Timestamp, cfg: AltDataFetchConfig, *, on_page: PageObserver | None = None) -> pd.DataFrame:
+def fetch_krx_daily(
+    trade_date: pd.Timestamp, cfg: AltDataFetchConfig, *, on_page: PageObserver | None = None
+) -> pd.DataFrame:
     """Preserve daily source responses before normalization and price adjustment.
 
     Args:
@@ -393,7 +405,10 @@ def fetch_krx_daily(trade_date: pd.Timestamp, cfg: AltDataFetchConfig, *, on_pag
         RawCaptureError: Original response preservation failed.
     """
     ymd = pd.Timestamp(trade_date).strftime("%Y%m%d")
-    parts = [normalize_krx_daily(fetch_krx_openapi_day_strict(ep, ymd, cfg, on_page=on_page), trade_date) for ep, _ in KRX_DAILY_MARKETS]
+    parts = [
+        normalize_krx_daily(fetch_krx_openapi_day_strict(ep, ymd, cfg, on_page=on_page), trade_date)
+        for ep, _ in KRX_DAILY_MARKETS
+    ]
     sizes = [len(p) for p in parts]
     if all(n == 0 for n in sizes):
         return pd.DataFrame(columns=list(KRX_ROW_COLUMNS))
@@ -424,7 +439,9 @@ async def fetch_index_closes(
     rows: list[dict[str, Any]] = []
     prev_min: pd.Timestamp | None = None
     while cursor >= start_ts:
-        res = await client.get_market_index_history(session, code, start_ts.strftime("%Y%m%d"), cursor.strftime("%Y%m%d"))
+        res = await client.get_market_index_history(
+            session, code, start_ts.strftime("%Y%m%d"), cursor.strftime("%Y%m%d")
+        )
         if res.get("rt_cd") != "0":
             raise RuntimeError(f"KIS index {code} failed rt_cd={res.get('rt_cd')} msg={res.get('msg1', '')}")
         page = [r for r in (res.get("output2") or []) if r.get("stck_bsop_date")]
@@ -468,10 +485,14 @@ def compute_vkospi_proxy(
 
     close_ratio = pd.to_numeric(out["close"] / out["close"].shift(1), errors="coerce")
     log_ret = np.where(close_ratio > 0, np.log(close_ratio), np.nan)
-    roll_std = pd.Series(log_ret, index=out.index).rolling(
-        window=int(window),
-        min_periods=int(min_periods),
-    ).std(ddof=0)
+    roll_std = (
+        pd.Series(log_ret, index=out.index)
+        .rolling(
+            window=int(window),
+            min_periods=int(min_periods),
+        )
+        .std(ddof=0)
+    )
     out[output_col] = roll_std * np.sqrt(252.0) * 100.0
     return out[["date", output_col]]
 
@@ -549,10 +570,16 @@ def compute_live_vkospi(
         if kind is not SessionKind.CLOSED:
             raise ValueError(f"stale history: {gap.date()} between last past close and decision_date is {kind}")
         gap += pd.Timedelta(days=1)
-    series = pd.DataFrame({
-        "date": [*norm_dates, decision_ts],
-        "close": [float(v) for v in closes.to_numpy(dtype=np.float64)] + [level],
-    }).sort_values("date").reset_index(drop=True)
+    series = (
+        pd.DataFrame(
+            {
+                "date": [*norm_dates, decision_ts],
+                "close": [float(v) for v in closes.to_numpy(dtype=np.float64)] + [level],
+            }
+        )
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
     vol = compute_vkospi_proxy(series)
     row = vol[pd.to_datetime(vol["date"]) == decision_ts]
     value = float(row["v_kospi"].iloc[0])
@@ -645,7 +672,9 @@ def attach_index_columns(panel: pd.DataFrame, index_cols: pd.DataFrame) -> pd.Da
     return out
 
 
-def plan_new_dates(panel_max_date: pd.Timestamp, trading_days: list[pd.Timestamp], today: pd.Timestamp) -> list[pd.Timestamp]:
+def plan_new_dates(
+    panel_max_date: pd.Timestamp, trading_days: list[pd.Timestamp], today: pd.Timestamp
+) -> list[pd.Timestamp]:
     """Return trading days after the panel's last date up to today, ascending.
 
     Args:
@@ -663,8 +692,34 @@ def plan_new_dates(panel_max_date: pd.Timestamp, trading_days: list[pd.Timestamp
     last, bound = pd.Timestamp(panel_max_date).normalize(), pd.Timestamp(today).normalize()
     out = sorted(pd.Timestamp(d).normalize() for d in trading_days if last < pd.Timestamp(d).normalize() <= bound)
     if len(out) > FLOW_WINDOW_TRADING_DAYS:
-        raise ValueError(f"gap of {len(out)} trading days exceeds flow window {FLOW_WINDOW_TRADING_DAYS}; run a historical backfill")
+        raise ValueError(
+            f"gap of {len(out)} trading days exceeds flow window {FLOW_WINDOW_TRADING_DAYS}; run a historical backfill"
+        )
     return out
+
+
+def expected_panel_date(run_at: pd.Timestamp) -> pd.Timestamp | None:
+    """Return the previous trading day the panel must contain on `run_at`'s KST date, or None on a non-trading run day or an unresolvable calendar."""
+    ts = pd.Timestamp(run_at)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("Asia/Seoul").tz_localize(None)
+    run_day = ts.normalize()
+    if resolve_session_day(run_day.date()).kind not in (SessionKind.STANDARD, SessionKind.SHIFTED):
+        return None
+
+    def _is_trading_day(cand: pd.Timestamp) -> bool:
+        kind = resolve_session_day(pd.Timestamp(cand).normalize().date()).kind
+        if kind in (SessionKind.STANDARD, SessionKind.SHIFTED):
+            return True
+        if kind is SessionKind.CLOSED:
+            return False
+        raise LookupError(f"unresolvable session {kind} on {pd.Timestamp(cand).normalize().date()}")
+
+    try:
+        prev = resolve_prev_trading_day(run_day, _is_trading_day, max_lookback_days=MAX_PREV_TRADING_DAY_LOOKBACK)
+    except (LookupError, ValueError):
+        return None
+    return pd.Timestamp(prev).normalize()
 
 
 def select_tail_rows(krx_rows: pd.DataFrame, panel_last_dates: dict[str, pd.Timestamp]) -> pd.DataFrame:
@@ -692,7 +747,11 @@ def parse_kis_investor_rows(body: dict[str, Any]) -> pd.DataFrame:
     if body.get("rt_cd") != "0":
         raise VendorResponseError(f"KIS investor rt_cd={body.get('rt_cd')} msg={body.get('msg1', '')}")
     rows = [
-        {"date": pd.Timestamp(r["stck_bsop_date"]), "inst_netbuy": _signed_num(r.get("orgn_ntby_tr_pbmn")), "foreign_netbuy": _signed_num(r.get("frgn_ntby_tr_pbmn"))}
+        {
+            "date": pd.Timestamp(r["stck_bsop_date"]),
+            "inst_netbuy": _signed_num(r.get("orgn_ntby_tr_pbmn")),
+            "foreign_netbuy": _signed_num(r.get("frgn_ntby_tr_pbmn")),
+        }
         for r in (body.get("output2") or [])
         if r.get("stck_bsop_date")
     ]
@@ -753,10 +812,16 @@ def parse_kiwoom_investor_rows(data: dict[str, Any]) -> pd.DataFrame:
         VendorResponseError: On a non-zero return_code.
     """
     if data.get("return_code") != 0:
-        raise VendorResponseError(f"Kiwoom ka10059 return_code={data.get('return_code')} msg={data.get('return_msg', '')}")
+        raise VendorResponseError(
+            f"Kiwoom ka10059 return_code={data.get('return_code')} msg={data.get('return_msg', '')}"
+        )
     rows_raw = next((v for v in data.values() if isinstance(v, list)), [])
     rows = [
-        {"date": pd.Timestamp(str(r["dt"])), "inst_netbuy": _signed_num(r.get("orgn")), "foreign_netbuy": _signed_num(r.get("frgnr_invsr")) + _signed_num(r.get("natfor"))}
+        {
+            "date": pd.Timestamp(str(r["dt"])),
+            "inst_netbuy": _signed_num(r.get("orgn")),
+            "foreign_netbuy": _signed_num(r.get("frgnr_invsr")) + _signed_num(r.get("natfor")),
+        }
         for r in rows_raw
         if r.get("dt")
     ]
@@ -801,7 +866,9 @@ async def fetch_symbol_flows(
     except VendorResponseError as exc:
         prg, program_source = pd.DataFrame(columns=["date", "program_netbuy"]), "none"
         if toss is not None:
-            data = await toss.get_program_trades(session, symbol, count=FLOW_WINDOW_TRADING_DAYS, until=pd.Timestamp(anchor_ymd).strftime("%Y-%m-%d"))
+            data = await toss.get_program_trades(
+                session, symbol, count=FLOW_WINDOW_TRADING_DAYS, until=pd.Timestamp(anchor_ymd).strftime("%Y-%m-%d")
+            )
             try:
                 prg, program_source = parse_toss_program_rows(data), "toss"
             except VendorResponseError:
@@ -954,10 +1021,16 @@ def merge_and_adjust(
     if "close_raw" not in merged.columns:
         merged["close_raw"] = np.nan
     # 신규 행의 원가격은 조정 전 종가 자체다.
-    merged["close_raw"] = pd.to_numeric(merged["close_raw"], errors="coerce").fillna(pd.to_numeric(merged["close"], errors="coerce"))
+    merged["close_raw"] = pd.to_numeric(merged["close_raw"], errors="coerce").fillna(
+        pd.to_numeric(merged["close"], errors="coerce")
+    )
     merged["date"] = pd.to_datetime(merged["date"])
     merged["symbol"] = merged["symbol"].astype(str)
-    merged = merged.sort_values(["symbol", "date"], kind="stable").drop_duplicates(["symbol", "date"], keep="last").reset_index(drop=True)
+    merged = (
+        merged.sort_values(["symbol", "date"], kind="stable")
+        .drop_duplicates(["symbol", "date"], keep="last")
+        .reset_index(drop=True)
+    )
     # 저장 dtype(Int32/Int64 nullable)은 소급 배율 대입과 NA 마스크를 막으므로 float64로 통일 (쓰기 시 codec이 재다운캐스트)
     for col in (*_ADJUSTED_PRICE_COLUMNS, "volume"):
         merged[col] = pd.to_numeric(merged[col], errors="coerce").astype("float64")
@@ -970,9 +1043,13 @@ def merge_and_adjust(
     prev_trading = pd.Series(pd.NaT, index=merged.index, dtype="datetime64[ns]")
     has_prev = pos > 0
     prev_trading[has_prev] = cal[pos[has_prev] - 1]
-    is_new = pd.Series([(d, s) in new_keys for d, s in zip(merged["date"], merged["symbol"], strict=True)], index=merged.index)
+    is_new = pd.Series(
+        [(d, s) in new_keys for d, s in zip(merged["date"], merged["symbol"], strict=True)], index=merged.index
+    )
     base = pd.to_numeric(merged["prev_close"], errors="coerce").astype("float64")
-    event = is_new & (prior_date == prev_trading) & (prior_close > 0) & ((base - prior_close).abs() > PRICE_EVENT_TOLERANCE)
+    event = (
+        is_new & (prior_date == prev_trading) & (prior_close > 0) & ((base - prior_close).abs() > PRICE_EVENT_TOLERANCE)
+    )
     factor = pd.Series(1.0, index=merged.index)
     factor[event] = (base[event] / prior_close[event]).to_numpy()
     # 행 자신 이후(엄격히 뒤) 이벤트 계수의 누적곱 = 해당 행에 적용할 소급 계수
@@ -1003,7 +1080,7 @@ async def run_price_ingest(
     read, so a concurrent writer between read and write would be silently overwritten.
 
     Args:
-        today: Run date; None selects today in Asia/Seoul.
+        today: Naive KST run instant; its date is the run date and its time-of-day gates the stale alert; None selects now in Asia/Seoul.
         path: Panel parquet; None selects settings.PRICE_HISTORY_PARQUET_PATH.
         krx_cfg: KRX config; None builds one from settings.KRX_OPENAPI_KEY.
         kis: KIS client; None builds the configured KisApiClient.
@@ -1021,11 +1098,16 @@ async def run_price_ingest(
         RuntimeError: Propagated vendor failures (KRX strict, KIS index).
         ValueError: Gap beyond the flow window or index history missing a panel date.
     """
-    run_day = (pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None) if today is None else pd.Timestamp(today)).normalize()
+    run_at = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None) if today is None else pd.Timestamp(today)
+    if run_at.tzinfo is not None:
+        run_at = run_at.tz_convert("Asia/Seoul").tz_localize(None)
+    run_day = run_at.normalize()
     out_path = Path(settings.PRICE_HISTORY_PARQUET_PATH if path is None else path)
     if not out_path.exists():
         raise FileNotFoundError(f"price_history not found: {out_path}")
-    cfg = krx_cfg or AltDataFetchConfig(start=run_day, end=run_day + pd.Timedelta(days=1), out_dir=Path("."), krx_api_key=settings.KRX_OPENAPI_KEY)
+    cfg = krx_cfg or AltDataFetchConfig(
+        start=run_day, end=run_day + pd.Timedelta(days=1), out_dir=Path("."), krx_api_key=settings.KRX_OPENAPI_KEY
+    )
     store = CaptureStore(_capture_root())
     run_id = f"price-{run_day.strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
     if kis is None:
@@ -1093,25 +1175,58 @@ async def run_price_ingest(
             # 신규 행이 없어도 창 안 결측 수급을 재조회해 채운다 — 부분 기록이 영구 결측으로 굳지 않게.
             panel, n_repaired = apply_flow_repairs(panel, flows)
         if not tail.empty:
-            store.publish_frame(tail, context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-unadjusted", symbol="unadjusted"))
+            store.publish_frame(
+                tail,
+                context=_price_capture_context(
+                    pd.Timestamp(anchor).normalize().date(), run_id, "price-unadjusted", symbol="unadjusted"
+                ),
+            )
         index_cols = compute_index_columns(kospi, kosdaq)
         if new_rows.empty:
             # 신규 행이 없으면 행 순서가 같으므로 위치 비교로 지수 컬럼 변경 여부만 본다
             events = pd.DataFrame(columns=["symbol", "date", "factor"])
             merged = attach_index_columns(panel, index_cols)
             changed = n_repaired > 0 or any(
-                not np.allclose(pd.to_numeric(panel[c], errors="coerce").to_numpy(dtype=np.float64), merged[c].to_numpy(dtype=np.float64), rtol=1e-6, atol=1e-9, equal_nan=True)
+                not np.allclose(
+                    pd.to_numeric(panel[c], errors="coerce").to_numpy(dtype=np.float64),
+                    merged[c].to_numpy(dtype=np.float64),
+                    rtol=1e-6,
+                    atol=1e-9,
+                    equal_nan=True,
+                )
                 for c in INDEX_COLUMNS
             )
         else:
             merged, events, evidence_mask = merge_and_adjust(panel, new_rows, trading)
             merged = attach_index_columns(merged, index_cols)
             changed = True
-        window_rows = merged[pd.to_datetime(merged["date"]) >= window[0]]
+        window_rows = merged[pd.to_datetime(merged["date"]) >= window[0]] if not merged.empty else merged
         coverage = compute_flow_coverage(window_rows, ("inst_netbuy", "foreign_netbuy"))
         program_coverage = compute_flow_coverage(window_rows, ("program_netbuy",))
         shortfall = {k: v for k, v in coverage.items() if v < MIN_FLOW_COVERAGE}
         program_shortfall = {k: v for k, v in program_coverage.items() if v < MIN_FLOW_COVERAGE}
+        panel_max_after = pd.Timestamp(pd.to_datetime(merged["date"]).max()).normalize() if not merged.empty else None
+        expected = expected_panel_date(run_at)
+        is_stale = bool(expected is not None and (panel_max_after is None or panel_max_after < expected))
+        run_hhmmss = f"{run_at.hour:02d}{run_at.minute:02d}{run_at.second:02d}"
+        stale_alert = bool(is_stale and run_hhmmss >= PRICE_INGEST_STALE_ALERT_FROM_HHMMSS)
+        panel_max_str = panel_max_after.strftime("%Y-%m-%d") if panel_max_after is not None else ""
+        expected_str = expected.strftime("%Y-%m-%d") if expected is not None else None
+        run_at_str = run_at.strftime("%Y-%m-%d %H:%M:%S")
+        if stale_alert:
+            logger.warning(
+                "[DATA] stage=price_ingest status=DEGRADED reason=stale_panel panel_max_date=%s expected=%s run_at=%s",
+                panel_max_str,
+                expected_str,
+                run_at_str,
+            )
+        elif is_stale:
+            logger.info(
+                "[DATA] stage=price_ingest status=stale_panel_pending_retry panel_max_date=%s expected=%s run_at=%s",
+                panel_max_str,
+                expected_str,
+                run_at_str,
+            )
         wrote = False
         if changed:
             write_price_history_parquet(heal_price_history_panel(merged), out_path)
@@ -1122,7 +1237,9 @@ async def run_price_ingest(
                 # 행만 evidence_mask로 골라 발행해도 "무엇이 바뀌었는지"는 완전히 보존된다.
                 store.publish_frame(
                     merged.loc[evidence_mask],
-                    context=_price_capture_context(pd.Timestamp(anchor).normalize().date(), run_id, "price-adjusted", symbol="adjusted"),
+                    context=_price_capture_context(
+                        pd.Timestamp(anchor).normalize().date(), run_id, "price-adjusted", symbol="adjusted"
+                    ),
                 )
     report = IngestReport(
         ingested_dates=[d.strftime("%Y-%m-%d") for d in sorted(fetched)],
@@ -1136,6 +1253,8 @@ async def run_price_ingest(
         flow_shortfall=shortfall,
         program_flow_shortfall=program_shortfall,
         n_flow_repaired=n_repaired,
+        panel_max_date=panel_max_str,
+        stale_panel=is_stale,
     )
     logger.info(
         "[DATA] stage=price_ingest dates=%s rows=%d events=%d sources=%s wrote=%s path=%s repaired=%d shortfall=%s program_shortfall=%s",
@@ -1157,7 +1276,9 @@ async def run_price_ingest(
         )
     if on_outcome is not None:
         run_date_str = run_day.strftime("%Y-%m-%d")
-        if shortfall or program_shortfall:
+        if stale_alert:
+            outcome, reason = RUN_OUTCOME_DEGRADED, "stale_panel"
+        elif shortfall or program_shortfall:
             outcome, reason = RUN_OUTCOME_DEGRADED, "flow_coverage_below_min"
         elif len(new_rows) == 0 and resolve_session_day(run_day.date()).kind is SessionKind.CLOSED:
             outcome, reason = RUN_OUTCOME_SKIPPED, "non_trading_day"
@@ -1173,6 +1294,9 @@ async def run_price_ingest(
                 "n_flow_repaired": n_repaired,
                 "flow_shortfall": shortfall,
                 "program_flow_shortfall": program_shortfall,
+                "panel_max_date": panel_max_str,
+                "expected_panel_date": expected_str,
+                "stale_panel": is_stale,
             },
         )
     return report
@@ -1197,7 +1321,8 @@ def main() -> None:
     except (RuntimeError, OSError, ValueError) as exc:
         logger.warning(
             "[DATA] stage=security_classification_gap_repair status=DEFERRED n_gaps=%d reason=%s",
-            len(gaps), type(exc).__name__,
+            len(gaps),
+            type(exc).__name__,
         )
     from src.strategy.growth_shadow import run_growth_shadow
 

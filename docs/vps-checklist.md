@@ -70,7 +70,7 @@ Containerized units run `ExecStart=%h/.local/lib/kca/kca-run <job> [--kis-data] 
 | 07:00–23:00 /10 min, daily | `kca-audit-reconcile` (host) | `flock -E 75 kca-audit.lock` | 9 min | ~1–2 s; heartbeat `reconciled_at` advances; busy lock exits 75 = success | P2 |
 | Mon–Fri 07:05 | `kca-kis-token-warmup` | kis-data, critical | 5 min | ~6 s; `stage=kis_token_warmup slot=<DATA_1..5,PRIMARY,TRADING_MOCK> issued=True`; `CLOSED` → `SKIP reason=non_trading_day` | P1 |
 | Mon–Fri 07:10 | `kca-kiwoom-token-rotate` | critical | 5 min | ~5 s; `status=ROTATED` or `UNCHANGED` | P1 |
-| Mon–Fri 08:30 / 11:30 / 21:30 | `kca-price-ingest` | kis-data, standard | 45 min | 08:30 ~8 min, ingests `D-1` (~2,762 rows); 11:30/21:30 ~1 min, `n_new_rows=0` observed | P1 |
+| Mon–Fri 08:30 / 11:30 | `kca-price-ingest` | kis-data, standard | 45 min | 08:30 ~8 min, ingests `D-1` (~2,762 rows); 11:30 ~1 min, `n_new_rows=0` when 08:30 succeeded; 08:30 may log INFO `stale_panel_pending_retry` (healthy if 11:30 is OK); 11:30 DEGRADED `stale_panel` needs an alert | P1 |
 | Mon–Fri 08:39:55 | `kca-auction-open` (optional) | kis-data, critical, batch | 40 min | runs to ~09:03; `auction_capture status=COMPLETE phase=open` | P2 |
 | Mon–Fri 08:40:10 | `kca-order-exit` | critical | 18 min | ~20 s; outcome `OK`, or `SKIPPED no_open_positions`/`trading_disabled` | P0 |
 | Mon–Fri 09:00:40 | `kca-order-reconcile-exit` | critical | 32 min | ~5 s; outcome `OK`/`SKIPPED no_orders` | P1 |
@@ -161,7 +161,7 @@ EOF
 
 | ID | Check | Severity if not |
 |---|---|---|
-| RUN-01 | one `Finished` per due unit per day (paper-entry twice, price-ingest three times); `ExecMainStatus=0`. `show` describes only the latest run; use the journal window for `D` | P1 |
+| RUN-01 | one `Finished` per due unit per day (paper-entry twice, price-ingest twice); `ExecMainStatus=0`. `show` describes only the latest run; use the journal window for `D` | P1 |
 | RUN-02 | runtime inside §3 "normal"; > 70 % of `TimeoutStartSec` is WARN except aftermarket-book (by design) | P2 |
 | RUN-03 | run outcomes for `D`: decision jobs `OK`; `DEGRADED`/`NO_DECISION` need a matching alert (§11); a trading-day `predict` `SKIPPED` is a calendar disagreement | P1 |
 | RUN-04 | order units: journal `data/orders/<env>/journal.jsonl` holds the day's intents; current env from `[EXEC] stage=order_session env=…` (mock on 2026-10-16). A stuck `UNKNOWN` intent is operator-only (`src.daily.order_resolve`, dry-run first) | P0 |
@@ -334,7 +334,6 @@ gh run list --workflow watchdog.yml --limit 5 -R kthyeong/k-closing-alpha
 
 - **Failed state persists** until the unit's next run (e.g. retrain until next Saturday unless the operator runs `reset-failed`). Report cause, whether the deployed commit fixed it, and when it clears.
 - **Extended backfill `pending_manifest_conflict`**: fixed to publish one task-level PENDING checkpoint before fan-out; after this fix is deployed, any `pending_manifest_conflict` WARNING from the 23:05 run (now logged as `stage=extended_backfill`) is a regression (P2).
-- **`price-ingest` 21:30 "same-day" slot** ingested 0 rows (`dates=[]`) on every day 2026-10-13..16; `D` lands at 08:30 next morning. Standing P2.
 - **Stale KIS token on closed days**: 2026-10-09..11 reconcile flagged `stale_kis_token:*` on holidays/weekends and reran warmup, which skips on `CLOSED` days (budget exhausted). Not seen on 2026-10-17; a recurrence is a calendar-awareness regression (P2).
 - **Backup prune keeps old dates**: `raw/` and `manifests/2026-09-14` survived past 30 days (`sealed_kept=2`, reasons not logged at INFO).
 - **Holidays**: weekday timers fire; jobs must `SKIP`; the daily audit digest is `HOLIDAY_SKIP`. Run data probes against the previous trading day.
