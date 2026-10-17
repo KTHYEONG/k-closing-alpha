@@ -333,7 +333,7 @@ gh run list --workflow watchdog.yml --limit 5 -R kthyeong/k-closing-alpha
 ## 13. Known Standing Conditions and Pitfalls
 
 - **Failed state persists** until the unit's next run (e.g. retrain until next Saturday unless the operator runs `reset-failed`). Report cause, whether the deployed commit fixed it, and when it clears.
-- **Extended backfill `pending_manifest_conflict`**: every night since at least 2026-10-09 the 23:05 run logs `intraday_archive status=DEGRADED reason=pending_manifest_conflict` for all four sessions of `D-1`, while still writing the partitions and exiting 0. Track as a standing P2 until fixed; a change in pattern (other dates, FAILED, missing partitions) is new.
+- **Extended backfill `pending_manifest_conflict`**: fixed to publish one task-level PENDING checkpoint before fan-out; after this fix is deployed, any `pending_manifest_conflict` WARNING from the 23:05 run (now logged as `stage=extended_backfill`) is a regression (P2).
 - **`price-ingest` 21:30 "same-day" slot** ingested 0 rows (`dates=[]`) on every day 2026-10-13..16; `D` lands at 08:30 next morning. Standing P2.
 - **Stale KIS token on closed days**: 2026-10-09..11 reconcile flagged `stale_kis_token:*` on holidays/weekends and reran warmup, which skips on `CLOSED` days (budget exhausted). Not seen on 2026-10-17; a recurrence is a calendar-awareness regression (P2).
 - **Backup prune keeps old dates**: `raw/` and `manifests/2026-09-14` survived past 30 days (`sealed_kept=2`, reasons not logged at INFO).

@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 from src import settings
-from src.backfill.intraday.collector import backfill_extended_session_bars, backfill_kiwoom_raw_bars
+from src.backfill.intraday.collector import backfill_extended_session_bars, backfill_kiwoom_raw_bars, publish_pending_manifest
 from src.backfill.intraday.price_basis import PriceReference
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
@@ -730,7 +730,7 @@ async def run_extended_session_backfill(
         A task with no pending symbols (every task symbol is terminal, already stored, and not a repair
         candidate) is a no-op: it performs no network fetch, writes no partition, publishes no manifest,
         creates no run directory and appends no ledger rows. A task with at least one pending symbol
-        publishes exactly one manifest covering its attempted entries, whatever their statuses.
+        publishes one PENDING checkpoint listing every pending symbol before fetching, and exactly one final manifest covering its attempted entries.
 
     Raises:
         ValueError: Empty clients or naive stop_at.
@@ -804,10 +804,12 @@ async def run_extended_session_backfill(
                     capture_store=store,
                     run_id=run_id,
                     on_symbol=_observe,
+                    publish_pending=False,
                 )
                 return bucket
 
             if pending:
+                publish_pending_manifest(store, trading_day=date.fromisoformat(task.snapshot_date), run_id=run_id, dataset=CaptureDataset.MINUTE_BARS, vendor="owner-local", endpoint="pending", session=task.session, symbols=pending, stage="extended_backfill")
                 buckets: list[list[str]] = [[] for _ in clients]
                 for index, symbol in enumerate(pending):
                     buckets[index % len(clients)].append(symbol)
