@@ -33,16 +33,42 @@ def test_archive_ready_times_match_timers() -> None:
     assert _oncalendar_hhmmss("kca-archive-intraday-regular.timer") == ARCHIVE_REGULAR_READY_HHMMSS
 
 
-def test_sweep_deadline_sits_before_evening_price_ingest() -> None:
-    from src.config.market_session import PRICE_INGEST_EVENING_HHMMSS, TAPE_SWEEP_DEADLINE_HHMMSS
+def test_sweep_deadline_window_has_no_price_ingest() -> None:
+    from src.config.market_session import TAPE_SWEEP_DEADLINE_HHMMSS
 
-    assert _to_seconds(TAPE_SWEEP_DEADLINE_HHMMSS) == _to_seconds(PRICE_INGEST_EVENING_HHMMSS) - 15 * 60
     price_slots = parse_timer_schedule((_ROOT / "kca-price-ingest.timer").read_text(encoding="utf-8"))
-    evening = time.fromisoformat(
-        f"{PRICE_INGEST_EVENING_HHMMSS[:2]}:{PRICE_INGEST_EVENING_HHMMSS[2:4]}:{PRICE_INGEST_EVENING_HHMMSS[4:]}"
+    sweep_slot = _oncalendar_hhmmss("kca-tape-sweep.timer")
+    assert _to_seconds(sweep_slot) < _to_seconds(TAPE_SWEEP_DEADLINE_HHMMSS)
+    assert not any(
+        _to_seconds(sweep_slot) <= _to_seconds(slot.time_of_day.strftime("%H%M%S")) <= _to_seconds(TAPE_SWEEP_DEADLINE_HHMMSS)
+        for slot in price_slots
     )
-    assert evening == max(slot.time_of_day for slot in price_slots)
-    assert _to_seconds(_oncalendar_hhmmss("kca-tape-sweep.timer")) < _to_seconds(TAPE_SWEEP_DEADLINE_HHMMSS)
+
+
+def test_price_ingest_timer_has_only_morning_slots() -> None:
+    text = (_ROOT / "kca-price-ingest.timer").read_text(encoding="utf-8")
+    slots = parse_timer_schedule(text)
+    assert len(slots) == 2
+    assert {slot.time_of_day.strftime("%H:%M:%S") for slot in slots} == {"08:30:00", "11:30:00"}
+    assert all(slot.weekdays == frozenset({0, 1, 2, 3, 4}) for slot in slots)
+    assert "Persistent=true" in text
+
+
+def test_stale_alert_boundary_selects_last_pre_decision_slot() -> None:
+    from src.config.market_session import PRICE_INGEST_STALE_ALERT_FROM_HHMMSS
+
+    slots = parse_timer_schedule((_ROOT / "kca-price-ingest.timer").read_text(encoding="utf-8"))
+    boundary = time.fromisoformat(
+        f"{PRICE_INGEST_STALE_ALERT_FROM_HHMMSS[:2]}:{PRICE_INGEST_STALE_ALERT_FROM_HHMMSS[2:4]}:{PRICE_INGEST_STALE_ALERT_FROM_HHMMSS[4:]}"
+    )
+    assert min(slot.time_of_day for slot in slots) < boundary <= max(slot.time_of_day for slot in slots)
+    assert sum(1 for slot in slots if slot.time_of_day >= boundary) == 1
+
+
+def test_price_ingest_safety_net_precedes_collect() -> None:
+    slots = parse_timer_schedule((_ROOT / "kca-price-ingest.timer").read_text(encoding="utf-8"))
+    collect = parse_timer_schedule((_ROOT / "kca-collect.timer").read_text(encoding="utf-8"))
+    assert max(slot.time_of_day for slot in slots) < min(slot.time_of_day for slot in collect)
 
 
 def test_audit_follows_sweep_deadline() -> None:
