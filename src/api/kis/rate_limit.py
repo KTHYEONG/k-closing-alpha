@@ -33,7 +33,7 @@ def resolve_admission_dir() -> Path:
     from src import settings as _settings
 
     raw = _settings.BROKER_ADMISSION_DIR
-    configured: Path | None = Path(raw) if raw is not None else Path(_settings.KIS_TOKEN_CACHE_DIR)
+    configured: Path = Path(raw) if raw is not None else Path(_settings.KIS_TOKEN_CACHE_DIR)
     mode = str(_settings.BROKER_ADMISSION_REQUIRE_SHARED)
     if mode not in ("auto", "always", "never"):
         mode = "auto"
