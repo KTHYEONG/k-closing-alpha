@@ -14,10 +14,20 @@ _SEOUL = ZoneInfo("Asia/Seoul")
 _YMD = "20260904"
 
 
+class _NoopLimiter:
+    async def acquire(self) -> None:
+        return None
+
+
+def _disable_pacing(client: LsApiClient) -> LsApiClient:
+    client._limiter = lambda: _NoopLimiter()  # type: ignore[method-assign]
+    return client
+
+
 def _ls_client() -> LsApiClient:
     client = LsApiClient(app_key="k", app_secret="s")
     client.token = "t"
-    client._min_interval = 0.0
+    _disable_pacing(client)
     return client
 
 
@@ -32,7 +42,15 @@ def _paging_client(pages: list[tuple[dict, dict]]) -> tuple[LsApiClient, dict[st
     client = _ls_client()
     state: dict[str, Any] = {"calls": 0, "bodies": []}
 
-    async def fake_post_tr(session: Any, tr_cd: str, tr_key: str, body: dict, tr_cont: str = "N", tr_cont_key: str = "", max_retries: int = 3) -> tuple[dict, dict]:
+    async def fake_post_tr(
+        session: Any,
+        tr_cd: str,
+        tr_key: str,
+        body: dict,
+        tr_cont: str = "N",
+        tr_cont_key: str = "",
+        max_retries: int = 3,
+    ) -> tuple[dict, dict]:
         assert state["calls"] < len(pages), "unnecessary extra page requested"
         state["calls"] += 1
         state["bodies"].append(body)
@@ -42,14 +60,18 @@ def _paging_client(pages: list[tuple[dict, dict]]) -> tuple[LsApiClient, dict[st
     return client, state
 
 
-def _minute_page(rows: list[dict], cts_date: str, cts_time: str, tr_cont: str = "N", tr_cont_key: str = "") -> tuple[dict, dict]:
+def _minute_page(
+    rows: list[dict], cts_date: str, cts_time: str, tr_cont: str = "N", tr_cont_key: str = ""
+) -> tuple[dict, dict]:
     return (
         {"rsp_cd": "00000", "t8412OutBlock": {"cts_date": cts_date, "cts_time": cts_time}, "t8412OutBlock1": rows},
         {"tr_cont": tr_cont, "tr_cont_key": tr_cont_key},
     )
 
 
-def _tick_page(rows: list[dict], cts_date: str, cts_time: str, tr_cont: str = "N", tr_cont_key: str = "") -> tuple[dict, dict]:
+def _tick_page(
+    rows: list[dict], cts_date: str, cts_time: str, tr_cont: str = "N", tr_cont_key: str = ""
+) -> tuple[dict, dict]:
     return (
         {"rsp_cd": "00000", "t8411OutBlock": {"cts_date": cts_date, "cts_time": cts_time}, "t8411OutBlock1": rows},
         {"tr_cont": tr_cont, "tr_cont_key": tr_cont_key},
@@ -93,10 +115,20 @@ def test_ls_minute_chart_acquires_morning_and_late_pages() -> None:
 
 def test_ls_minute_chart_continuation_cursor_does_not_drop_boundary_bar() -> None:
     """The server returns strictly older rows than the cursor and reports a cursor one minute before the page's oldest row."""
-    minutes = [f"{h:02d}{m:02d}00" for h in range(9, 19) for m in range(60) if "090100" <= f"{h:02d}{m:02d}00" <= "181900"]
+    minutes = [
+        f"{h:02d}{m:02d}00" for h in range(9, 19) for m in range(60) if "090100" <= f"{h:02d}{m:02d}00" <= "181900"
+    ]
     client = _ls_client()
 
-    async def fake_post_tr(session: Any, tr_cd: str, tr_key: str, body: dict, tr_cont: str = "N", tr_cont_key: str = "", max_retries: int = 3) -> tuple[dict, dict]:
+    async def fake_post_tr(
+        session: Any,
+        tr_cd: str,
+        tr_key: str,
+        body: dict,
+        tr_cont: str = "N",
+        tr_cont_key: str = "",
+        max_retries: int = 3,
+    ) -> tuple[dict, dict]:
         cursor = body["t8412InBlock"]["cts_time"]
         eligible = [t for t in minutes if not cursor or t < cursor]
         page = eligible[-3:]
@@ -380,9 +412,7 @@ def test_ls_client_ensure_token() -> None:
     from tests.broker_fakes import scripted_session
 
     client = LsApiClient(app_key="k", app_secret="s")
-    session = scripted_session(
-        [], token_bodies=[{"access_token": "mock_tok", "token_type": "Bearer"}]
-    )
+    session = scripted_session([], token_bodies=[{"access_token": "mock_tok", "token_type": "Bearer"}])
     token = asyncio.run(client.ensure_token(session))
     assert token == "mock_tok"
     assert client.token == "mock_tok"
@@ -396,10 +426,11 @@ def test_ls_client_get_minute_chart_single_call() -> None:
 
     client = LsApiClient(app_key="k", app_secret="s")
     client.token = "mock_tok"
-    mock_bars = [{"time": "090100", "close": 1000, "jdiff_vol": 50}, {"time": "153000", "close": 1050, "jdiff_vol": 200}]
-    session = scripted_session(
-        [FakeBrokerResponse(body={"rsp_cd": "00000", "t8412OutBlock1": mock_bars})]
-    )
+    mock_bars = [
+        {"time": "090100", "close": 1000, "jdiff_vol": 50},
+        {"time": "153000", "close": 1050, "jdiff_vol": 200},
+    ]
+    session = scripted_session([FakeBrokerResponse(body={"rsp_cd": "00000", "t8412OutBlock1": mock_bars})])
     res = asyncio.run(client.get_minute_chart(session, "005930", "2026-09-04"))
     assert res["rt_cd"] == "0"
     assert res["vendor"] == "ls"
@@ -415,8 +446,16 @@ def test_ls_client_get_tick_chart_paginates_with_cts() -> None:
 
     client = LsApiClient(app_key="k", app_secret="s")
     client.token = "mock_tok"
-    page1 = {"rsp_cd": "00000", "t8411OutBlock": {"cts_date": "20260904", "cts_time": "151500000"}, "t8411OutBlock1": [{"time": "153000", "close": 1000, "jdiff_vol": 100}]}
-    page2 = {"rsp_cd": "00000", "t8411OutBlock": {"cts_date": "", "cts_time": ""}, "t8411OutBlock1": [{"time": "090000", "close": 950, "jdiff_vol": 50}]}
+    page1 = {
+        "rsp_cd": "00000",
+        "t8411OutBlock": {"cts_date": "20260904", "cts_time": "151500000"},
+        "t8411OutBlock1": [{"time": "153000", "close": 1000, "jdiff_vol": 100}],
+    }
+    page2 = {
+        "rsp_cd": "00000",
+        "t8411OutBlock": {"cts_date": "", "cts_time": ""},
+        "t8411OutBlock1": [{"time": "090000", "close": 950, "jdiff_vol": 50}],
+    }
     session = scripted_session([FakeBrokerResponse(body=page1), FakeBrokerResponse(body=page2)])
     res = asyncio.run(client.get_tick_chart(session, "005930", "2026-09-04", max_pages=5))
     assert res["rt_cd"] == "0"
@@ -426,6 +465,7 @@ def test_ls_client_get_tick_chart_paginates_with_cts() -> None:
     assert res["output2"][0]["time"] == "090000"
     assert res["output2"][1]["time"] == "153000"
 
+
 def test_ls_get_tick_chart_marks_truncated_when_page_budget_exhausted() -> None:
     import asyncio
 
@@ -433,7 +473,7 @@ def test_ls_get_tick_chart_marks_truncated_when_page_budget_exhausted() -> None:
 
     client = LsApiClient(app_key="k", app_secret="s")
     client.token = "t"
-    client._min_interval = 0.0
+    _disable_pacing(client)
 
     calls = {"n": 0}
 
@@ -441,7 +481,14 @@ def test_ls_get_tick_chart_marks_truncated_when_page_budget_exhausted() -> None:
         calls["n"] += 1
         # 항상 09:00 이전에 도달하지 못하는 응답 -- 페이지 예산 소진을 강제한다
         rows = [{"date": "20260904", "time": "143000", "close": 100, "jdiff_vol": 1}]
-        return ({"rsp_cd": "00000", "t8411OutBlock1": rows, "t8411OutBlock": {"cts_date": "20260904", "cts_time": "142959"}}, {"tr_cont": "Y", "tr_cont_key": "x"})
+        return (
+            {
+                "rsp_cd": "00000",
+                "t8411OutBlock1": rows,
+                "t8411OutBlock": {"cts_date": "20260904", "cts_time": "142959"},
+            },
+            {"tr_cont": "Y", "tr_cont_key": "x"},
+        )
 
     client._post_tr = fake_post_tr
 
@@ -460,7 +507,7 @@ def test_ls_post_tr_releases_lock_before_network_roundtrip() -> None:
 
     client = LsApiClient(app_key="k", app_secret="s")
     client.token = "t"
-    client._min_interval = 0.01
+    _disable_pacing(client)
 
     state = {"in_flight": 0, "max_in_flight": 0}
 
@@ -473,7 +520,9 @@ def test_ls_post_tr_releases_lock_before_network_roundtrip() -> None:
         async def __aenter__(self):
             state["in_flight"] += 1
             state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
-            await asyncio.sleep(0.3)  # in-flight window >> pacing interval so slow CI runners cannot serialize the overlap
+            await asyncio.sleep(
+                0.3
+            )  # in-flight window >> pacing interval so slow CI runners cannot serialize the overlap
             return self
 
         async def __aexit__(self, *a):
@@ -503,10 +552,21 @@ def test_ls_client_returns_vendor_native_rows_without_kis_aliases() -> None:
 
     client = LsApiClient(app_key="k", app_secret="s")
     client.token = "t"
-    client._min_interval = 0.0
+    _disable_pacing(client)
 
     async def fake_post_tr(session, tr_cd, tr_key, body, tr_cont="N", tr_cont_key="", max_retries=3):
-        rows = [{"date": "20260904", "time": "090300", "open": 9100, "high": 9100, "low": 9100, "close": 9100, "jdiff_vol": 55226, "value": 498}]
+        rows = [
+            {
+                "date": "20260904",
+                "time": "090300",
+                "open": 9100,
+                "high": 9100,
+                "low": 9100,
+                "close": 9100,
+                "jdiff_vol": 55226,
+                "value": 498,
+            }
+        ]
         return ({"rsp_cd": "00000", "t8412OutBlock1": rows}, {})
 
     client._post_tr = fake_post_tr
@@ -516,10 +576,19 @@ def test_ls_client_returns_vendor_native_rows_without_kis_aliases() -> None:
     assert res["rt_cd"] == "0"
     assert res["vendor"] == "ls"
     row = res["output2"][0]
-    for kis_alias in ("acml_tr_pbmn", "acml_vol", "stck_prpr", "stck_oprc", "stck_hgpr", "stck_lwpr", "cntg_vol", "cnqn", "stck_cntg_hour"):
+    for kis_alias in (
+        "acml_tr_pbmn",
+        "acml_vol",
+        "stck_prpr",
+        "stck_oprc",
+        "stck_hgpr",
+        "stck_lwpr",
+        "cntg_vol",
+        "cnqn",
+        "stck_cntg_hour",
+    ):
         assert kis_alias not in row
     assert row["value"] == 498
-
 
 
 def test_ls_ensure_token_single_flight_issues_once_under_concurrency() -> None:
@@ -571,7 +640,6 @@ def test_ls_ensure_token_single_flight_issues_once_under_concurrency() -> None:
     assert client.token == "T"
 
 
-
 def test_ls_ensure_token_raises_when_issuance_returns_no_token() -> None:
     import asyncio
 
@@ -579,7 +647,7 @@ def test_ls_ensure_token_raises_when_issuance_returns_no_token() -> None:
 
     from src.api.ls.client import LsApiClient
 
-    client = LsApiClient(app_key='k', app_secret='s')
+    client = LsApiClient(app_key="k", app_secret="s")
 
     class _Resp:
         status = 200
@@ -598,7 +666,7 @@ def test_ls_ensure_token_raises_when_issuance_returns_no_token() -> None:
         def post(self, _url, **_kw):
             return _Ctx()
 
-    with pytest.raises(RuntimeError, match='LS token issuance failed'):
+    with pytest.raises(RuntimeError, match="LS token issuance failed"):
         asyncio.run(client.ensure_token(_Session()))
 
 
@@ -609,7 +677,7 @@ def test_ls_rate_limit_retries_back_off_exponentially() -> None:
 
     client = LsApiClient(app_key="k", app_secret="s")
     client.token = "t"
-    client._min_interval = 0.0
+    _disable_pacing(client)
     calls = {"n": 0}
     sleeps: list[float] = []
     real_sleep = asyncio.sleep
@@ -658,7 +726,7 @@ def test_ls_exhausted_retries_logged_distinctly(caplog) -> None:
 
     client = LsApiClient(app_key="k", app_secret="s")
     client.token = "t"
-    client._min_interval = 0.0
+    _disable_pacing(client)
 
     class _Resp:
         headers: dict = {}
@@ -694,16 +762,19 @@ def test_ls_exhausted_retries_logged_distinctly(caplog) -> None:
 
 
 def test_ls_client_honors_pacing_overrides_from_settings_instance(monkeypatch) -> None:
+    from src.api.host_broker_contract import rate_for
+    from src.api.kis.rate_limit import host_admission_state_path
     from src.api.ls.client import LsApiClient
     from src.config import settings as settings_instance
 
-    monkeypatch.setattr(settings_instance, "LS_MIN_INTERVAL_SECONDS", 9.9)
     monkeypatch.setattr(settings_instance, "LS_RATE_LIMIT_MAX_RETRIES", 7)
     monkeypatch.setattr(settings_instance, "LS_RATE_LIMIT_BACKOFF_SECONDS", 2.5)
 
     client = LsApiClient(app_key="k", app_secret="s")
 
-    assert client._min_interval == 9.9
+    limiter = client._limiter()
+    assert limiter.max_rate == rate_for("ls", None)
+    assert limiter._state_path == host_admission_state_path("ls", "k")
     assert client._rate_limit_max_retries == 7
     assert client._rate_limit_backoff == 2.5
 
@@ -767,7 +838,6 @@ def test_ls_spacing_enforced_across_instances(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_DIR", tmp_path)
     (tmp_path / ".host-admission").touch()
     monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_REQUIRE_SHARED", "always")
-    monkeypatch.setattr(settings_instance, "LS_MIN_INTERVAL_SECONDS", 1.05)
 
     send_times: list[float] = []
 
@@ -876,10 +946,14 @@ def _ls_auth_session(tr_responses: list, state: dict) -> Any:
                 state["token_calls"] += 1
                 return _Resp({"access_token": f"tok-{state['token_calls']}", "expires_in": 86400}, 200, {})
             headers = dict(kw.get("headers") or {})
-            state["tr_calls"].append({
-                "auth": headers.get("authorization"), "cont": headers.get("tr_cont"),
-                "key": headers.get("tr_cont_key"), "body": dict(kw.get("json") or {}),
-            })
+            state["tr_calls"].append(
+                {
+                    "auth": headers.get("authorization"),
+                    "cont": headers.get("tr_cont"),
+                    "key": headers.get("tr_cont_key"),
+                    "body": dict(kw.get("json") or {}),
+                }
+            )
             body, status = tr_responses.pop(0)
             return _Resp(body, status, {})
 
@@ -897,7 +971,6 @@ def _ls_seeded_client(tmp_path: Any, monkeypatch: Any) -> Any:
     monkeypatch.setattr(settings_instance, "BROKER_ADMISSION_REQUIRE_SHARED", "always")
 
     client = LsApiClient(app_key="k", app_secret="s")
-    client._min_interval = 0.0
     return client
 
 
@@ -985,12 +1058,18 @@ def test_ls_peer_rotation_is_adopted(tmp_path, monkeypatch) -> None:
     async def _seed_store() -> None:
         store = SharedTokenStore(
             shared_token_path("ls", "k"),
+            vendor="ls",
             lock_timeout_seconds=5.0,
             expiry_margin_seconds=0.0,
+            issue_throttle_policy="raise",
             clock=lambda: datetime.now(UTC),
         )
-        await store.get_or_issue(lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-A", expires_in_seconds=86400)))
-        await store.replace_rejected("tok-A", lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-B", expires_in_seconds=86400)))
+        await store.get_or_issue(
+            lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-A", expires_in_seconds=86400))
+        )
+        await store.replace_rejected(
+            "tok-A", lambda: asyncio.sleep(0, result=IssuedToken(access_token="tok-B", expires_in_seconds=86400))
+        )
 
     session = _ls_auth_session([({"rsp_cd": "40100"}, 401), ({"rsp_cd": "00000"}, 200)], state)
     asyncio.run(_seed_store())

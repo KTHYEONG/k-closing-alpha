@@ -1,19 +1,21 @@
-"""Host-wide admission pacing for broker REST APIs (file-backed buckets shared by every process on the host)."""
+"""Host-wide admission pacing adapter (settings-aware thin wrapper over the canonical contract)."""
 
 from __future__ import annotations
 
-import asyncio
-import fcntl
-import hashlib
-import logging
-import os
-import re
-import time
-from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from src.api.host_broker_contract import (
+    HOST_ADMISSION_MARKER,
+    AsyncHostPacer,
+    HostBrokerDirNotSharedError,
+    admission_state_path,
+    rate_for,
+    resolve_host_broker_dir,
+)
+
+HostPacedRateLimiter = AsyncHostPacer
+AdmissionDirNotSharedError = HostBrokerDirNotSharedError
 
 
 class AdmissionClass(StrEnum):
@@ -22,57 +24,29 @@ class AdmissionClass(StrEnum):
     BULK = "bulk"
 
 
-HOST_ADMISSION_MARKER: str = ".host-admission"
-
-_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-
-
-class AdmissionDirNotSharedError(RuntimeError):
-    """The admission directory is not the host-shared one, so pacing would be process-private."""
-
-
 def _in_container() -> bool:
     return Path("/.dockerenv").exists()
 
 
 def resolve_admission_dir() -> Path:
-    """Return the host admission directory and enforce that it is host-shared when required.
-
-    Returns:
-        settings.BROKER_ADMISSION_DIR, or settings.KIS_TOKEN_CACHE_DIR when unset.
-
-    Raises:
-        AdmissionDirNotSharedError: Enforcement is active ("always", or "auto" inside a
-            container) and the marker file is absent. A container without the shared
-            mount would otherwise pace against a private directory and silently defeat
-            host-wide limits; refusing to start is the fail-closed outcome.
-    """
+    """Return settings.BROKER_ADMISSION_DIR or KIS_TOKEN_CACHE_DIR; raise AdmissionDirNotSharedError when enforced and unmarked."""
     from src import settings as _settings
 
-    configured = _settings.BROKER_ADMISSION_DIR
-    directory = Path(configured) if configured is not None else Path(_settings.KIS_TOKEN_CACHE_DIR)
+    raw = _settings.BROKER_ADMISSION_DIR
+    configured: Path | None = Path(raw) if raw is not None else Path(_settings.KIS_TOKEN_CACHE_DIR)
     mode = str(_settings.BROKER_ADMISSION_REQUIRE_SHARED)
-    enforced = mode == "always" or (mode == "auto" and _in_container())
-    if enforced and not (directory / HOST_ADMISSION_MARKER).is_file():
-        raise AdmissionDirNotSharedError(f"admission dir is not host-shared: {directory}")
-    return directory
+    if mode not in ("auto", "always", "never"):
+        mode = "auto"
+    return resolve_host_broker_dir(
+        configured,
+        require_shared=mode,  # type: ignore[arg-type]
+        in_container=_in_container(),
+    )
 
 
 def host_admission_state_path(vendor: str, credential: str, scope: str | None = None) -> Path:
-    """Return the protocol path admission_<vendor>_<sha12>[_<scope>].state under resolve_admission_dir().
-
-    Raises:
-        ValueError: vendor or scope violates [A-Za-z0-9_-]+, or credential is empty.
-    """
-    if not _NAME_RE.match(vendor):
-        raise ValueError(f"invalid vendor: {vendor!r}")
-    if not credential:
-        raise ValueError("credential must be non-empty")
-    if scope is not None and not _NAME_RE.match(scope):
-        raise ValueError(f"invalid scope: {scope!r}")
-    digest = hashlib.sha256(credential.encode("utf-8")).hexdigest()[:12]
-    name = f"admission_{vendor}_{digest}.state" if scope is None else f"admission_{vendor}_{digest}_{scope}.state"
-    return resolve_admission_dir() / name
+    """Return the canonical admission path under resolve_admission_dir(); raise ValueError on bad names."""
+    return admission_state_path(resolve_admission_dir(), vendor, credential, scope)
 
 
 def max_lead_for(admission_class: AdmissionClass) -> float | None:
@@ -92,123 +66,6 @@ def _resolve_class(admission_class: AdmissionClass | str | None) -> AdmissionCla
 
         return AdmissionClass(str(_settings.BROKER_ADMISSION_CLASS))
     return admission_class if isinstance(admission_class, AdmissionClass) else AdmissionClass(str(admission_class))
-
-
-class HostPacedRateLimiter:
-    """호스트 공유 파일 버킷으로 app_key당 합산 TPS를 제한한다."""
-
-    def __init__(
-        self,
-        state_path: Path,
-        max_rate: float,
-        time_period: float = 1.0,
-        *,
-        max_lead_seconds: float | None = None,
-        clock: Callable[[], float] = time.time,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    ) -> None:
-        if max_rate <= 0 or time_period <= 0:
-            raise ValueError("max_rate and time_period must be positive")
-        if max_lead_seconds is not None and max_lead_seconds <= 0:
-            raise ValueError("max_lead_seconds must be positive")
-        self.max_rate = float(max_rate)
-        self.time_period = float(time_period)
-        self._state_path = Path(state_path)
-        self._max_rate = float(max_rate)
-        self._time_period = float(time_period)
-        self._interval = self._time_period / self._max_rate
-        self._max_lead_seconds = max_lead_seconds
-        self._clock = clock
-        self._sleep = sleep
-        self._lock: asyncio.Lock | None = None
-        self._lock_loop: asyncio.AbstractEventLoop | None = None
-
-    def _loop_lock(self) -> asyncio.Lock:
-        # The limiter is a process singleton but callers may run several asyncio.run() loops in sequence;
-        # a contended asyncio.Lock stays bound to the loop it first waited on.
-        loop = asyncio.get_running_loop()
-        if self._lock is None or self._lock_loop is not loop:
-            self._lock = asyncio.Lock()
-            self._lock_loop = loop
-        return self._lock
-
-    def _read_next_free_locked(self, fd: int) -> float:
-        raw = os.read(fd, 64).decode("ascii", errors="replace").strip()
-        if not raw:
-            return 0.0
-        try:
-            return float(raw)
-        except ValueError:
-            logger.warning(
-                "[SYS] stage=kis_rate_limit status=STATE_RESET path=%s",
-                self._state_path,
-            )
-            return 0.0
-
-    def _book_unconditional(self) -> float:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._state_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                next_free = self._read_next_free_locked(fd)
-                now = self._clock()
-                slot = max(now, next_free)
-                os.lseek(fd, 0, os.SEEK_SET)
-                os.ftruncate(fd, 0)
-                os.write(fd, repr(slot + self._interval).encode("ascii"))
-                return slot - now
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
-
-    def _try_book_or_wait(self) -> tuple[bool, float]:
-        """Single file poll: book when within lead, else report lead-wait without writing."""
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._state_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                next_free = self._read_next_free_locked(fd)
-                now = self._clock()
-                lead = self._max_lead_seconds
-                assert lead is not None
-                slot = max(now, next_free)
-                if slot - now <= lead:
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    os.ftruncate(fd, 0)
-                    os.write(fd, repr(slot + self._interval).encode("ascii"))
-                    return True, slot - now
-                return False, max(slot - now - lead, self._interval)
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
-
-    def _reserve_slot(self) -> float:
-        return self._book_unconditional()
-
-    async def _acquire_bounded(self) -> None:
-        assert self._max_lead_seconds is not None
-        async with self._loop_lock():
-            while True:
-                booked, wait = self._try_book_or_wait()
-                if booked:
-                    if wait > 0:
-                        await self._sleep(wait)
-                    return
-                await self._sleep(wait)
-
-    async def acquire(self) -> None:
-        """Block until this process owns the next host-wide slot for the scope."""
-        if self._max_lead_seconds is not None:
-            await self._acquire_bounded()
-            return
-        async with self._loop_lock():
-            delay = self._book_unconditional()
-        if delay > 0:
-            await self._sleep(delay)
 
 
 _HOST_RATE_LIMITERS: dict[tuple[str, float, float, str], HostPacedRateLimiter] = {}
@@ -240,3 +97,27 @@ def get_host_rate_limiter(
         )
         _HOST_RATE_LIMITERS[key] = limiter
     return limiter
+
+
+def vendor_limiter(
+    vendor: str, credential: str, scope: str | None = None, *, admission_class: AdmissionClass | str | None = None
+) -> HostPacedRateLimiter:
+    """Return the process-singleton limiter for the canonical (vendor, scope) path and rate_for() rate."""
+    return get_host_rate_limiter(
+        host_admission_state_path(vendor, credential, scope),
+        rate_for(vendor, scope),
+        admission_class=admission_class,
+    )
+
+
+__all__ = [
+    "HOST_ADMISSION_MARKER",
+    "AdmissionClass",
+    "AdmissionDirNotSharedError",
+    "HostPacedRateLimiter",
+    "get_host_rate_limiter",
+    "host_admission_state_path",
+    "max_lead_for",
+    "resolve_admission_dir",
+    "vendor_limiter",
+]
