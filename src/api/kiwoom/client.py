@@ -12,6 +12,11 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from src.api._common import SEOUL_TZ, deadline_remaining, now_seoul, resolve_chart_budget, validate_target_ymd
 from src.api._transport import RetryPolicy, send_with_auth_retry
+from src.api.auth_rejection import (
+    AUTH_REJECTION_CODES,
+    KIWOOM_AUTH_EXPIRED_RETURN_CODE,  # noqa: F401 - re-exported for callers and tests
+    is_auth_rejected,
+)
 from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
 from src.config import settings
 from src.data.capture_contracts import RawCaptureError
@@ -32,8 +37,7 @@ logger = logging.getLogger(__name__)
 # 통과 여부가 갈리므로, 브라우저/CLI 도구처럼 보이는 값으로 고정한다.
 _KIWOOM_USER_AGENT = "curl/8.5.0"
 
-KIWOOM_AUTH_EXPIRED_RETURN_CODE: int = 3
-KIWOOM_AUTH_EXPIRED_MSG_CODE: str = "8005"
+KIWOOM_AUTH_EXPIRED_MSG_CODE: str = next(iter(AUTH_REJECTION_CODES["kiwoom"]))
 
 KIWOOM_REVOKE_PATH: str = "/oauth2/revoke"
 
@@ -218,9 +222,7 @@ class KiwoomApiClient:
 
     @staticmethod
     def _is_auth_expired(data: Any) -> bool:
-        return data.get("return_code") == KIWOOM_AUTH_EXPIRED_RETURN_CODE and KIWOOM_AUTH_EXPIRED_MSG_CODE in str(
-            data.get("return_msg", "")
-        )
+        return is_auth_rejected("kiwoom", 200, data)
 
     async def _refresh_rejected_token(self, session: aiohttp.ClientSession, rejected_token: str) -> None:
         """Replace a token the vendor rejected, at most once across concurrent callers (compare-and-swap).
