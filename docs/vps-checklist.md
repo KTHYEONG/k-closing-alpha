@@ -1,460 +1,394 @@
-# VPS Automation Health Checklist (or-vps) — v2
+# VPS Automation Audit Checklist (or-vps) — v3
 
-> **Audience:** an AI agent that audits and periodically reports on the production automation of `k-closing-alpha`
-> on host `or-vps`. **Goal:** prove with evidence — not assumptions — that every scheduled job ran on time, that the
-> data it produced is *correct* (not merely present), that paper trading is conserved and causal, that offsite
-> backup can restore it, and that the alert paths would have told a human. A green `systemctl` is not proof.
->
-> **Design contract of this file:** generic and durable. It describes *how to verify*, derives expectations from the
-> repo (timers, calendar, run-outcome log) instead of hard-coding them, and ships executable probes that print one
-> machine-parseable line per check (`CHECK <ID> <PASS|WARN|FAIL> <detail>`). Last verified against the live host on
-> 2026-10-05; if a command here disagrees with the host, the host is truth — report the drift (§14).
+> **Audience:** an AI agent auditing the production automation of `k-closing-alpha` (kca) on host `or-vps`
+> (hostname `trading-bot`, user `ubuntu`, 2 vCPU, 11 GiB RAM). **Goal:** prove with evidence that every scheduled
+> job ran on time, produced correct data, respected the host broker contract, and is backed up — a green
+> `systemctl` is not proof. Last verified against the live host on 2026-10-17 (HEAD `cd00451`). Every command in
+> this file was run read-only against production on that date. If the host disagrees with this file, the host is
+> truth: report the drift.
 
-## 0. Autonomous loop
+## 0. Rules of Engagement
 
-The host now runs a closed loop by itself; the AI check verifies the loop's evidence rather than re-deriving it.
+| Rule | Detail |
+|---|---|
+| Read-only | Never `systemctl start/stop/restart/enable/disable/reset-failed/daemon-reload`, `docker run/rm/pull/exec`, `rclone` write verbs (`copy sync move delete purge dedupe cleanup`), `git` writes, or edits under `~/k-closing-alpha`, `~/quant-secrets`, `~/.cache/kis`, `~/.config/systemd`. Allowed rclone: `about lsd lsf lsjson size check --one-way`. `kca-run --print-argv` is allowed (prints argv, runs nothing). Exceptions only for a named action the operator authorizes in the current conversation. |
+| No job entry points | Never run `src.daily.*`, `src.ml.*`, `src.backfill.*`, `src.tools.{audit_reconcile,daily_audit,alerts,offsite_backup,backup_prune,core_snapshot,capture_offsite,kis_token_warmup,kiwoom_token_rotate}` as `main`: they write ledgers, issue tokens, consume broker quota, send mail or take the Drive lock. Importing the pure read helpers of §2 and the Appendix A probes is allowed. |
+| No broker traffic | Never send a request to any broker/vendor API (KIS, LS, Toss, DB금융투자, Kiwoom, KRX). |
+| Secrets | Never print `~/quant-secrets/*.env`, `env`, token/state file contents in `~/.cache/kis`, `rclone config show`, or `docker inspect … Config.Env`. Names, modes, owners, sizes, mtimes only. |
+| Leave nothing behind | Do not create files anywhere (host or local): no report files, no evidence dumps, no scratch scripts. Pipe probes over ssh stdin (heredoc or `awk … docs/vps-checklist.md \| ssh …`). The report is the chat reply only. |
+| Deploy blackout | `src/tools/deploy_window.py`: **Mon–Fri 08:30–09:40 and 15:10–15:43 KST** (weekends none; weekday holidays still count). Inside: only `systemctl`, `journalctl`, `stat`, `ls`, small-file reads. No parquet probes, `du`, `find` over `data/`, `rclone`, `uv run`. Heavy probes use `nice -n 19 timeout 300` and avoid 22:15–00:15 (backup, Drive lock). |
+| Timezones | Host clock and `journalctl --since/--until` are **UTC**; every timer `OnCalendar` and every parquet date is **KST** (UTC+9). Convert with `k(){ date -u -d "TZ=\"Asia/Seoul\" $1" +"%F %T"; }; k "2026-10-16 15:20"` → `2026-10-16 06:20:00`. Pass `TZ=Asia/Seoul` to Python. |
+| Evidence | Every PASS cites the command and the line it rests on. Ambiguous → WARN. Unchecked items go to `NOT VERIFIED` with the reason. Diagnose, do not fix. Report in Korean (keys/badges English). |
+| Neighbours | The host also runs `krx-alpha` (container `krx-collector`, `krx-*` timers, `vps-image-gc`), `k-stock-engine` (`kse-*`), `crypto-pilot`, `mt-etf-*`, `quant-dashboard`. Report contention with them (§12); do not audit their logic. |
+| rclone path | Not on the non-interactive ssh PATH: use `~/.local/bin/rclone`. Host Python: `~/.local/bin/uv run --no-sync python` inside `~/k-closing-alpha`. |
 
-- **10-minute tick** (`kca-audit-reconcile`, 07:00–23:00 KST): measure (failed units, stale tokens, backup, ops sentinel)
-  → remediate (allowlisted safe re-runs only) → hold the first mail while a fix is in flight → notify only on
-  persistence past the grace → publish the heartbeat. A busy lock skips the tick silently (exit 75 = success).
-- **Hold-then-notify**: a fresh issue with an active remediation attempt produces no mail; it notifies through the
-  normal path only if still open after the grace. A key that self-resolves while held never mailed and needs no
-  retraction (ledger `RESOLVED`, heartbeat `info_notes` carries `auto_remediated=<key>:<unit>`).
-- **Advisory tier**: research-degraded findings (e.g. uncertified tick gaps) never mail; they ride the heartbeat info
-  notes and escalate to warnings only after consecutive audits.
-- **Evidence first**: read `logs/heartbeat/daily_audit.json` (`open_issues`, `info_notes`, `reconciled_at`),
-  `logs/remediation/ledger.jsonl` (STARTED without a matching RESOLVED/UNRESOLVED = still in flight), and
-  `logs/heartbeat/advisory_streaks.json` before running any probe. Run probes second. Intervene only for blocking
-  issues or `UNRESOLVED` ledger rows.
+## 1. Run Modes
 
-## 0b. Run Modes and Cadence
+| Mode | When (KST) | Scope |
+|---|---|---|
+| **W** window watch | ~2 min after a §3 slot | that slot's units + run outcome (light commands only inside blackouts) |
+| **D** daily | trading day ≥ 23:00, or next morning 07:30–08:20 | §2–§11 for audit date `D` |
+| **WK** weekly | Monday 07:30–08:20 | D + Sat retrain, Sun snapshot/verify, trends |
+| **E** event | after a deploy, alert, incident or operator question | affected areas + §4 |
 
-Pick the mode from the clock and the request; do not run heavier modes than the situation needs.
+`D` = most recent `STANDARD`/`SHIFTED` day whose evening chain finished. On a `CLOSED` weekday, run data probes with
+the previous trading day and expect `SKIPPED reason=non_trading_day` outcomes for that weekday.
 
-| Mode | When (KST) | Scope | Weight |
-|---|---|---|---|
-| **W — Window watch** | inside a critical window (§4); one pass ~2 min after the slot | only the slot's units + outcome + the one data check it feeds | light (journal/systemctl only inside blackouts) |
-| **D — Daily audit** | trading-day evening after 23:00 (backup running until ~00:00 is normal) **or** next morning 07:30–08:20 | §1–§12 for audit date `D` | medium (parquet probes) |
-| **WK — Weekly** | Monday 07:30–08:20 (covers Sat retrain, Sun snapshot/verify) | D plus §13 | medium |
-| **M — Monthly** | first Monday | WK plus local restore sample (§10.5), docker/journal growth, expiries, checklist drift (§14) | medium |
-| **E — Event** | after a deploy, an alert, an incident, or an operator question | affected areas + §2 context + D probes | light–medium |
-
-Periodic chat reporting is optional. The tick and the watchdog are independent of any session: absence of a chat
-report never implies the host stopped.
-
-## 1. Rules of Engagement
-
-- **Read-only on the host.** Never `start/stop/restart/enable/disable/reset-failed` units, never `docker run/rm/pull`, never
-  edit files under `~/k-closing-alpha`, `~/quant-secrets`, `~/.cache/kis`, never run `rclone` write verbs
-  (`copy/sync/move/delete/purge/dedupe/cleanup`). Allowed rclone: `lsf lsjson lsd size about cat check --one-way`.
-  Exception: only when the operator explicitly authorizes a named action in the current conversation.
-- **Never run job entry points by hand** (`src.daily.*`, `src.tools.daily_audit`, `audit_reconcile`, `offsite_backup`,
-  `backup_prune`, `capture_offsite verify`, `alerts`, `backfill_*`, `toss_*`, `nxt_*`): they write ledgers, consume broker
-  quota, send mail, or take the Drive lock. Pure read helpers and the probes in this file are allowed.
-- **Trading blackout 08:30–09:40 and 15:10–15:50 KST on weekdays** (`src/tools/deploy_window.py`): only `systemctl`,
-  `journalctl`, `stat`, `ls`, `cat` of small files. No parquet scans, `du`, `find` over `data/`, `rclone check/size`.
-  Heavy probes use `nice -n 10 timeout 300` and run outside blackouts and outside 22:15–00:15 when avoidable (backup,
-  extended backfill 23:05, Drive lock).
-- **Secrets:** never print `~/quant-secrets/*.env`, `env`, token caches, `rclone config show`. Report key *names* and modes.
-- **Timezones:** host clock and `journalctl --since/--until` are **UTC**; convert KST with
-  `k(){ date -u -d "TZ=\"Asia/Seoul\" $1" +"%F %T"; }` then `k "2026-10-02 15:00"` -> `2026-10-02 06:00:00`
-  (do **not** use `TZ=Asia/Seoul date -d ... -u`: `-u` re-reads the input as UTC and returns it unchanged); every timer `OnCalendar` is **Asia/Seoul**
-  (KST = UTC+9). Convert before judging "late/missing". Pass `TZ=Asia/Seoul` to Python. Date columns inside parquet are KST dates.
-- **Evidence or it did not happen:** every PASS cites the command/line it rests on. Ambiguous → `WARN`, never silent PASS.
-  Things you could not check go in the report's `NOT VERIFIED` list with the reason.
-- **Diagnose, do not fix.** Report to the operator in Korean (CLAUDE.md §4); scratch work goes under local `scratch/`.
-- **rclone is not on the non-interactive ssh PATH:** always call `~/.local/bin/rclone` (shown as `$R` below).
-- **Do not blame this repo for neighbours.** The host also runs `krx-alpha`, `crypto-pilot`, `mt-etf-king-2026`,
-  `quant-dashboard`. Shared resources are CPU/RAM (12 GiB), disk, the KIS quota, and `flock %t/quant-gdrive.lock`;
-  report contention, do not audit the neighbours' logic.
-
-## 2. Context Derivation (always first)
+## 2. Context (always first)
 
 ```bash
-ssh -o ConnectTimeout=15 or-vps 'hostname; date -u; TZ=Asia/Seoul date; uptime -p; whoami; loginctl show-user $USER -p Linger'
-ssh or-vps 'cd ~/k-closing-alpha && TZ=Asia/Seoul ~/.local/bin/uv run --no-sync python - <<"EOF"
-from datetime import datetime, date, timedelta
+ssh -o ConnectTimeout=15 or-vps 'hostname; date -u; TZ=Asia/Seoul date; uptime; loginctl show-user $USER -p Linger; free -h | sed -n 2,3p; df -h / | tail -1; df -i / | tail -1'
+ssh or-vps 'cd ~/k-closing-alpha && TZ=Asia/Seoul timeout 180 ~/.local/bin/uv run --no-sync python - <D>' <<'EOF'
+import sys
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from src.data.session_calendar import resolve_session_day
+from src.tools.daily_audit import audit_daily_completeness, list_failed_kca_units
+from src.tools.run_outcome import load_run_outcomes
 now = datetime.now(ZoneInfo("Asia/Seoul"))
-for k in range(0, 8):
-    d = now.date() - timedelta(days=k)
-    print(d.isoformat(), d.strftime("%a"), resolve_session_day(d).kind.value)
-EOF'
+print("days", [(str(now.date() - timedelta(days=k)), resolve_session_day(now.date() - timedelta(days=k)).kind.value) for k in range(8)])
+D = sys.argv[1]
+print("completeness", audit_daily_completeness(D))
+print("failed_units", list_failed_kca_units())
+print("outcomes", load_run_outcomes(D))
+EOF
 ```
 
-- **Day kind** per date: `STANDARD` (trading), `SHIFTED` (trading, shifted clock), `CLOSED` (weekend/holiday), `UNKNOWN`
-  (calendar not extended — itself a finding). Weekday timers (`Mon..Fri`) still fire on weekday holidays; the *job* must
-  then record `SKIPPED` (§5).
-- **Audit date `D`** = most recent `STANDARD/SHIFTED` date whose evening chain has finished (≥ 23:00 KST) — normally yesterday
-  or today after 23:00. Also note `D-1` (paper exit of `D-1` lots happens on `D`).
-- SSH failure is a P0 finding (retry once after 30 s, then report; the watchdog may also be firing).
-- Uptime shorter than the last check interval = a reboot; `Persistent=true` timers catch up, others may have been skipped.
+- Day kinds: `STANDARD`/`SHIFTED` trading, `CLOSED` weekend/holiday, `UNKNOWN` = calendar not extended (finding).
+- All completeness keys (`archive close_confirmed decision paper_entry paper_exit minute_bars price_history_fresh`) must be `True`.
+- SSH failure = P0 (retry once after 30 s). Uptime shorter than the last check = reboot: `Persistent=true` timers catch up, others are skipped.
 
-## 3. Check Catalog Conventions
+## 3. Schedule and Expected Evidence (28 timers, all KST)
 
-- IDs: `<AREA>-<NN>`. Status: `PASS | WARN | FAIL | SKIP` (SKIP = not applicable today, with the reason, e.g. holiday).
-- Severity if not PASS: **P0** data loss/corruption, ledger inconsistency, decision chain down, backup shrink, silent alert path
-  failure; **P1** a scheduled job silently not running or failing, causality violation, quota hit on the decision chain,
-  restore impossible; **P2** research capture gaps, trends, hygiene.
-- **Stateful signals — know what is fresh and what is stale** (most false alarms and most missed problems live here):
-  | Signal | Updated when | Pitfall |
-  |---|---|---|
-   | `systemctl --failed` / unit `Result` | the unit's next run | stays failed after the cause is fixed until the next successful run; a unit failed by a governance rejection (e.g. `kca-retrain` after a strategy change) is excluded from auto-remediation, so after the manual remediation the operator-authorized `systemctl --user reset-failed <unit>` clears the lingering `failed_unit:` reminder |
-  | `daily_audit.json` heartbeat | each audit (Mon–Fri 21:20) and each 10-minute reconcile tick (07:00–23:00) | v2 fields: `severity`, `open_issues`, `provisional_reasons`, `audit_kind`, `reconciled_at`; the dashboard card is derived from it |
-  | `audit_alert_state.json` | audit/reconcile | opened issues notify once; resolution and 24 h reminders are the only repeats |
-  | `offsite/last_run.json` | **end** of a backup | during a run it still shows the previous night; use `offsite/in_progress.json` (exists only while running; stale after its `deadline_at`) |
- | `offsite/deferred_history.json` | **end** of every backup (rolling 14 runs) | `offsite_backup:draining` (informational) while the deferred date count falls vs `deferred` (warning) after 3 stalled runs or an oldest deferred date older than 21 days; a missing/corrupt history reads as first observation (draining), never as stalled |
-  | `logs/events/<YYYY-MM>/<D>.jsonl` run outcomes | each job | `OK`, `DEGRADED`, `NO_DECISION`, `SKIPPED` (no-op on closed days) — `SKIPPED` is not success |
-  | tape sweep `last_report.json` | each sweep | absent = never ran; the audit does not warn about absence |
-  | dashboard `~/quant-dashboard/public/status.json` | every minute | mirrors the above; a card that disagrees with ground truth is itself a finding |
+Containerized units run `ExecStart=%h/.local/lib/kca/kca-run <job> [--kis-data] [--admission critical|standard|bulk] [--role decision|batch] [--resource …] -- uv run python -m <module>`
+(installed from `deploy/host/kca-run`; image `ghcr.io/kthyeong/k-closing-alpha:latest`; `--user 1001:1001`; `--kis-data` adds
+`kis-data.env`; `--admission` mounts `~/.cache/kis` and sets `BROKER_ADMISSION_CLASS`; `--role` sets `KIS_DATA_ROLE`). Host units
+(`flock … uv run`) are marked *host*. Normal runtimes observed 2026-10-12..16.
 
-## 4. Critical Moments (do not miss these)
+| KST | Unit | Flags | Timeout | Normal runtime / evidence | If not |
+|---|---|---|---|---|---|
+| 07:00–23:00 /10 min, daily | `kca-audit-reconcile` (host) | `flock -E 75 kca-audit.lock` | 9 min | ~1–2 s; heartbeat `reconciled_at` advances; busy lock exits 75 = success | P2 |
+| Mon–Fri 07:05 | `kca-kis-token-warmup` | kis-data, critical | 5 min | ~6 s; `stage=kis_token_warmup slot=<DATA_1..5,PRIMARY,TRADING_MOCK> issued=True`; `CLOSED` → `SKIP reason=non_trading_day` | P1 |
+| Mon–Fri 07:10 | `kca-kiwoom-token-rotate` | critical | 5 min | ~5 s; `status=ROTATED` or `UNCHANGED` | P1 |
+| Mon–Fri 08:30 / 11:30 / 21:30 | `kca-price-ingest` | kis-data, standard | 45 min | 08:30 ~8 min, ingests `D-1` (~2,762 rows); 11:30/21:30 ~1 min, `n_new_rows=0` observed | P1 |
+| Mon–Fri 08:39:55 | `kca-auction-open` (optional) | kis-data, critical, batch | 40 min | runs to ~09:03; `auction_capture status=COMPLETE phase=open` | P2 |
+| Mon–Fri 08:40:10 | `kca-order-exit` | critical | 18 min | ~20 s; outcome `OK`, or `SKIPPED no_open_positions`/`trading_disabled` | P0 |
+| Mon–Fri 09:00:40 | `kca-order-reconcile-exit` | critical | 32 min | ~5 s; outcome `OK`/`SKIPPED no_orders` | P1 |
+| Mon–Fri 09:01 | `kca-paper-exit` | kis-data, critical, decision | 15 min | ~5 s; every older open lot sold before 09:30 | P0 |
+| Mon–Fri 15:20:00 | `kca-collect` | kis-data, critical, decision | 9 min | 25–95 s (scales with `n_raw` 93–1,247); `realtime_coverage … coverage=1.0000 status=COMPLETE` | P0 |
+| Mon–Fri 15:21 | `kca-predict` | kis-data, critical | 7 min | starts when collect ends (`After=`); ~12 s; outcome `OK` **before 15:30:00** | P0 |
+| Mon–Fri 15:21:05 | `kca-auction-close` (optional) | kis-data, critical, batch | 15 min | starts after collect; ~8 min; research | P2 |
+| Mon–Fri 15:21:15 | `kca-order-entry` | critical | 8 min | ~45 s; waits for predict; `[EXEC] stage=order_session env=<mock\|live> phase=entry … outcome=OK` | P0 |
+| Mon–Fri 15:30:30 | `kca-finalize-close` | kis-data, critical, decision | 12 min | 10 s–2.5 min; ExecStopPost starts `kca-paper-entry` | P0 |
+| Mon–Fri 15:30:40 | `kca-order-reconcile-entry` | critical | 12 min | ~5 s; outcome `OK` (`DEGRADED broker_unreadable` needs an alert) | P1 |
+| Mon–Fri 15:34 | `kca-paper-entry` | kis-data, critical, decision | 10 min | runs twice (finalize trigger + timer); `SKIP reason=already_recorded` on the second is healthy | P0 |
+| Mon–Fri 15:40 | `kca-archive-intraday-regular` | kis-data, standard | 3 h | 28–57 min; regular 1m + ticks partitions for `D` | P1 |
+| Mon–Fri 15:40 | `kca-aftermarket-book` | kis-data, standard, batch | 4 h 40 min | runs to ~19:59 by design (≈92 % of timeout is normal) | P2 |
+| Mon–Fri 15:45 | `kca-auction-path` | kis-data, bulk | 3 h 20 min | ~9 min; outcome `auction_path OK` | P2 |
+| Mon–Fri 20:05 | `kca-archive-intraday` | kis-data, standard | 3 h | 9–33 min; nxt/krx aftermarket + nxt premarket partitions | P1 |
+| Mon–Fri 20:35 | `kca-tape-sweep` | bulk | 60 min | starts after archive-intraday ends; 24–31 min; `last_report.json` `run_date=D` | P1 |
+| Mon–Fri 21:00 | `kca-backup-prune` (host) | `flock quant-gdrive.lock` | 3 h | ~2 min; `stage=backup_prune … purged=… sealed_removed=…` | P2 |
+| Mon–Fri 21:20 | `kca-daily-audit` (host) | `flock kca-audit.lock` | 30 min | 1.5–4.5 min incl. ~80 s `sudo chown -R` pre-step; subject `🟢 … 일일점검 완료` | P1 |
+| Mon–Fri 21:35 | `kca-altdata-capture` (optional) | kis-data, standard, batch | 30 min | 4–6 min | P2 |
+| Mon–Fri 22:15 | `kca-backup` (host) | `flock quant-gdrive.lock` | 3 h | 3–10 min incl. ~95 s chown pre-step; `offsite_backup status=ok` | P0 shrink / P1 fail |
+| daily 23:05 | `kca-extended-backfill` | kis-data, bulk, batch | 8 h | ~2.5 min (weekends too); `extended_backfill status=DONE` | P2 |
+| Sat 22:00 | `kca-retrain` | `--memory=6g --cpus=1.8 --memory-swap=8g` | 2 h | registry row `PROMOTED`; a strategy change yields `REJECTED` + unit failure by design (§10) | P1 |
+| Sun 10:00 | `kca-core-snapshot` (host) | `flock quant-gdrive.lock` | 2 h | ~1 min | P1 |
+| Sun 11:00 | `kca-offsite-verify` (host) | `flock quant-gdrive.lock` | 2 h | ~6 min; `missing=0 mismatched=0`, 3 restore drills `OK` | P1 |
+| on failure | `kca-alert@<unit>` (host) | — | 5 min | delivers webhook + mail; also used by `krx-deferred-recreate`, `krx-host-backup` | P1 |
 
-For each window run mode **W** about 2 minutes after the slot. Inside blackouts use light commands only.
+Optional timers (`OPTIONAL_MANUAL_TIMERS` in `src/tools/code_sync.py`): auction-open, auction-close, altdata-capture —
+report their state; all three were enabled on 2026-10-17. Weekday timers fire on weekday holidays; jobs must record `SKIPPED`.
+GitHub `watchdog.yml` (cron `40 22 * * 1-5` UTC = 07:40 KST Tue–Sat) is the external dead-man; GitHub delays it 2–4.5 h.
 
-| KST | Unit(s) | What must be true | Fail meaning |
-|---|---|---|---|
-| 07:05 / 07:10 | `kca-kis-token-warmup`, `kca-kiwoom-token-rotate` | `Result=success`; every declared KIS host slot has a fresh token (no stale-token line in the next digest); Kiwoom expiry moved out of the 15:20 window. Warmup skips only on a verified `CLOSED` day | P1: every KIS call of the day degrades |
-| 08:30 | `kca-price-ingest` (also 11:30, 21:30) | outcome `OK` with `n_new_rows ≥ 0`; on `CLOSED` days `SKIPPED` | P1 features stale |
-| 08:39:55 (optional) | `kca-auction-open` | research only | P2 |
-| **09:01** | `kca-paper-exit` | every older open lot has a sell fill + `trigger` + trades row before 09:30 | P0 ledger (missed exit) |
-| 08:40:10 | `kca-order-exit` | outcome `OK` (or `SKIPPED trading_disabled` while the selector is `off`); journal at `data/orders/<env>/journal.jsonl` | P0 live position (missed sell) |
-| 09:00:40 | `kca-order-reconcile-exit` | exit fills bound; `DEGRADED` needs a matching alert | P1 fill visibility |
-| **15:20 → 15:35** | `collect` 15:20 → `predict` 15:21 → `auction-close` 15:21:05 → `finalize-close` 15:30:30 → `paper-entry` 15:34 | each finished inside its budget (collect 9, predict 7, finalize 12, entry 10 min); **`predict` decided before 15:30:00**; `finalize-close` before `paper-entry`; no `EGW00201`/rate-limit lines; outcomes `OK` (or `SKIPPED` on closed days) | **P0** decision chain; P1 quota |
-| 15:21:15 | `kca-order-entry` | outcome `OK` (or `SKIPPED trading_disabled` while the selector is `off`); a HALT file blocks sends (`SKIP(halted)`) | P0 live fills |
-| 15:30:40 | `kca-order-reconcile-entry` | entry fills bound and finalized; remainder state visible | P1 fill visibility |
-| 15:40 | `archive-intraday-regular`, `aftermarket-book` | `Finished`; regular partition for `D` appears | P1 audit/backup input |
-| 20:05 | `archive-intraday` | NXT/KRX aftermarket partitions for `D` | P1 |
-| 20:35 | `tape-sweep` | `Finished` (deadline 21:15); report refreshed; a holiday run must not crash | P1 |
-| 21:00 / 21:20 | `backup-prune`, `daily-audit` | audit heartbeat `finished_at` ≈ 21:20–21:45, digest delivered | P1 alert path |
-| 22:15 → ~00:00 | `kca-backup` | `in_progress.json` appears at start, disappears at end; `last_run.json` updated; duration follows §10 baselines | P0 if shrink, P1 if failed |
-| 23:05 | `kca-extended-backfill` | runs up to 8 h; ledger counts move (§12) | P2 |
-| Sat 22:00 | `kca-retrain` | `PROMOTED` (or a reasoned `REJECTED`); next Monday `predict` loads it | P1 |
-| Sun 10:00 / 11:00 | `kca-core-snapshot`, `kca-offsite-verify` | both succeed; verify `missing=0 mismatched=0`, restore drill OK | P1 DR |
-| 07:00–23:00 every 10 min | `kca-audit-reconcile` | runs every day including weekends; heartbeat `reconciled_at` advances ~10 min; a busy lock skips silently | P2 |
-| 07:40 Tue–Sat (GHA) | `watchdog.yml` | succeeded | P1 dead-man |
-
-Normal evidence (observed on trading day 2026-10-02) so you can recognise health: `collect` finished 15:20:46 (`realtime_coverage ... coverage=1.0000 status=COMPLETE`);
-`predict` outcome `OK n_picks=3` at 15:21:16 (before 15:30:00); `finalize-close` `close_finalization n_finalized == archive rows, n_unconfirmed=0` at ~15:31:04;
-`paper-entry` at 15:34 logs `SKIP reason=already_recorded` — healthy, because `finalize-close` already recorded the entry and the 15:34 unit is the idempotent
-backstop (a missing entry is only a finding if no fill/NO_DECISION row exists, §8). Token units: warmup `status=ISSUED` on trading days and
-`SKIP reason=non_trading_day` on `CLOSED`; Kiwoom rotate `ROTATED` or `UNCHANGED` (both healthy); neither is a data load.
-
-Derive the live schedule instead of trusting this table (it drifts when timers change):
-
-```bash
-ssh or-vps 'cd ~/k-closing-alpha && for t in deploy/systemd/kca-*.timer; do n=$(basename $t); \
-  printf "%-38s %s | last=%s | next=%s\n" "$n" "$(grep -E "^OnCalendar" $t | cut -d= -f2- | tr "\n" ";")" \
-  "$(systemctl --user show $n -p LastTriggerUSec --value)" "$(systemctl --user show $n -p NextElapseUSecRealtime --value)"; done'
-```
-
-## 5. Deploy, Scheduler and Unit Evidence
+## 4. Deploy and Scheduler Parity
 
 ```bash
 git -C /home/kth/k-closing-alpha fetch -q; git -C /home/kth/k-closing-alpha log -1 --format="%h %ci %s" origin/main
-gh run list --workflow deploy.yml --limit 5
-ssh or-vps 'cd ~/k-closing-alpha && git log -1 --format="%h %ci %s" && git status --porcelain | head && \
-  docker images ghcr.io/kthyeong/k-closing-alpha --format "{{.Tag}} {{.ID}} {{.CreatedSince}}" | head -3 && \
-  docker image inspect ghcr.io/kthyeong/k-closing-alpha:latest --format "{{.Id}}"'
-ssh or-vps 'cd ~/k-closing-alpha && for t in deploy/systemd/*.timer; do n=$(basename $t); \
-    echo "$n $(systemctl --user is-enabled $n 2>&1)"; done | grep -v " enabled$"; \
+gh run list --workflow deploy.yml --limit 3 -R kthyeong/k-closing-alpha
+ssh or-vps 'cd ~/k-closing-alpha && git log -1 --format="%h %ci %s" && git status --porcelain | head; \
+  docker images ghcr.io/kthyeong/k-closing-alpha --format "{{.Tag}} {{.ID}} {{.CreatedSince}}"; \
+  cmp -s deploy/host/kca-run ~/.local/lib/kca/kca-run && echo WRAPPER_MATCH || echo WRAPPER_DRIFT; \
   for f in deploy/systemd/kca-*; do cmp -s "$f" ~/.config/systemd/user/$(basename $f) || echo "DRIFT $(basename $f)"; done; \
-  systemctl --user list-units --failed --no-legend; systemctl --user list-timers "kca-*" --all --no-pager | tail -5'
+  ls ~/.config/systemd/user/ | grep "^kca-" | while read u; do [ -e deploy/systemd/$u ] || echo "NOT_IN_REPO $u"; done; \
+  for t in deploy/systemd/*.timer; do n=$(basename $t); echo "$n $(systemctl --user is-enabled $n 2>&1) $(systemctl --user is-active $n 2>&1)"; done | grep -v " enabled active$"; \
+  systemctl --user list-units --failed --no-legend; systemctl --user list-timers "kca-*" --all --no-pager'
+ssh or-vps bash -s <<'EOF'
+set -o pipefail
+for f in ~/.config/systemd/user/kca-*.service; do
+  line=$(grep -m1 '^ExecStart=%h/.local/lib/kca/kca-run ' "$f") || continue
+  out=$(eval "~/.local/lib/kca/kca-run --print-argv ${line#ExecStart=%h/.local/lib/kca/kca-run }" 2>&1 | tr '\0' ' '); rc=$?
+  printf '%-36s rc=%s user=%s kis-data=%s admission=%s role=%s\n' "$(basename "$f")" "$rc" \
+    "$(grep -oE -- '--user [0-9:]+' <<<"$out" | cut -d' ' -f2)" "$(grep -c 'kis-data.env' <<<"$out")" \
+    "$(grep -oE 'BROKER_ADMISSION_CLASS=[a-z]+' <<<"$out" | cut -d= -f2)" "$(grep -oE 'KIS_DATA_ROLE=[a-z]+' <<<"$out" | cut -d= -f2)"
+done
+EOF
+ssh or-vps 'cd ~/k-closing-alpha && TZ=Asia/Seoul timeout 60 ~/.local/bin/uv run --no-sync python -c "
+from datetime import datetime; from zoneinfo import ZoneInfo
+from src.tools.deploy_window import DEPLOY_BLACKOUT_WINDOWS, blackout_remaining
+print([(a.isoformat(), b.isoformat()) for a, b in DEPLOY_BLACKOUT_WINDOWS], blackout_remaining(datetime.now(ZoneInfo(\"Asia/Seoul\"))))"'
 ```
 
-- [ ] **DEP-01** VPS HEAD == `origin/main`. A gap is explained only if `gh run list` shows that commit's deploy `in_progress`
-      (wait/re-check, not drift), or a deploy deferred by a blackout. A gap with a failed or absent run is a finding.
-- [ ] **DEP-02** VPS `git status --porcelain` empty; `latest` image ID == `sha-<HEAD>` image ID; last 5 deploys green or explained.
-- [ ] **SCH-01** Every repo timer is `enabled` except `OPTIONAL_MANUAL_TIMERS` (`src/tools/code_sync.py`: auction-open,
-      auction-close, altdata-capture — report their state). A disabled non-optional timer is **P1**.
-- [ ] **SCH-02** Every enabled timer fired at its most recent slot (convert UTC→KST; `-` on an old enabled timer = finding).
-- [ ] **SCH-03** No `DRIFT` (installed unit == repo unit); `Linger=yes`.
-- [ ] **SCH-04** Each `--failed` unit: get the cause (`journalctl --user -u <unit> --since "<D-1 UTC> 12:00" --no-pager | tail -60`),
-      classify transient/precondition/code bug, and say whether a newer deploy already fixed it (failed state persists until the next run).
-
-Per-unit run evidence for every unit due on `D` (build `--since/--until` with the `k` helper of §1;
-`systemctl show ... ExecMain*Timestamp` and `Result` describe only the **latest** run, so for `D` use the journal window and the
-run-outcome log, never `show`; oneshot containers are `--rm`, so `docker logs` is empty
-afterwards — the journal is the only record):
-
-```bash
-ssh or-vps 'journalctl --user -u kca-<name>.service --since "<D-1 15:00 KST as UTC>" --until "<D+1 15:00 KST as UTC>" --no-pager -o short-iso \
-  | grep -E "Starting|Finished|Failed|status=|outcome=|\[(SYS|DATA|ALGO|PORTFOLIO|RISK|EXEC)\]" | tail -25'
-ssh or-vps 'systemctl --user show kca-<name>.service -p ExecMainStartTimestamp -p ExecMainExitTimestamp -p ExecMainStatus -p Result'
-```
-
-- [ ] **RUN-01** exactly one `Finished` per due unit on `D` (documented retries allowed), `Result=success`.
-- [ ] **RUN-02** runtime ≤ 70 % of `TimeoutStartSec` (else WARN: approaching a hang).
-- [ ] **RUN-03** grep journals for `DEGRADED NO_DECISION QUOTA EGW00 rate Traceback timeout DISK_GUARD LEDGER_INVALID TOKEN_REPLACED
-      AdmissionDirNotSharedError`. Exit 0 with `DEGRADED` is still a finding.
-- [ ] **RUN-04** closed day (§2): weekday timers must log `SKIP reason=non_trading_day` and record `SKIPPED`; a job that
-      "ran normally" on a closed day with rows written is a calendar-disagreement finding.
-- [ ] **RUN-05** run outcomes `cat data/logs/events/<YYYY-MM>/<D>.jsonl`: every recording job `OK`; `DEGRADED/NO_DECISION` need
-      a matching alert (§11); a trading-day `predict` of `SKIPPED` is a calendar disagreement (P1).
-- [ ] **RUN-06** order units (`kca-order-exit`, `kca-order-reconcile-exit`, `kca-order-entry`,
-      `kca-order-reconcile-entry`): while `KIS_TRADING_ENV=off` each records `SKIPPED trading_disabled`;
-      otherwise the journal `data/orders/<env>/journal.jsonl` holds the day's intents and a HALT file
-      stops sends without stopping `cancel`. Manual only (no timer): a stuck `UNKNOWN` intent is resolved by
-      `uv run python -m src.daily.order_resolve --intent-id <id> (--order-no <no> | --not-found) --operator <name> --reason <evidence> [--apply]`
-      after verifying the broker daily order list / position screen; dry-run first, then `--apply` (add `--i-understand-live` on live).
-
-## 6. Host Resources
-
-```bash
-ssh or-vps 'df -h / ; df -i / | tail -1; free -h | sed -n 2p; docker system df; docker ps -a --format "{{.Names}} {{.Status}}"; \
-  journalctl --user --disk-usage; du -sh ~/k-closing-alpha/data/history/capture 2>/dev/null'   # du only outside blackout
-```
-
-- [ ] **HOST-01** disk < 80 %, inodes < 80 %; record free GB and its trend over the last few days (capture grows daily; project
-      the days until 80 %).
-- [ ] **HOST-02** memory `available` > 2 GiB at rest (retrain uses `--memory=6g`; the host is shared).
-- [ ] **HOST-03** `Up` `kca-*` containers only inside a job window (else a hung unit). An `Exited` `kca-*` container is a leftover
-      of a hand-run `docker run` without `--rm` (P2 hygiene: name it, say who likely created it, ask before removal). Neighbours' containers are listed, not judged.
-- [ ] **HOST-04** `ghcr.io/kthyeong/k-closing-alpha` images: `latest` plus at most the 2 previous `sha-*` tags (rollback set); older tags are
-      cleanup candidates (report; remove only with operator authorization, never touch neighbours' images). Journal size reported with trend
-      (no auto-prune by this repo).
-
-## 7. Data Integrity — four levels (presence is not correctness)
-
-The 09-22 collection-integrity incident (a test fixture polluted the live store, presence checks were green) is the reason
-this section exists. Run the probes of Appendix A on every **D**; all emit `CHECK` lines.
-
-| Level | Question | Examples (probe IDs) |
+| ID | Check | Severity if not |
 |---|---|---|
-| L1 presence | does the artifact exist with plausible size/rows vs the trailing 5 days? | `DI-ARCH-01`, `DI-PH-02`, `DI-1M-01`, `RS-07`, `RS-09` |
-| L2 structure | schema, nulls, duplicates, ranges, monotone keys | `DI-ARCH-02/03/06`, `DI-PH-03/04/06`, `DI-1M-02/03` |
-| L3 cross-source semantics | do independent sources agree? | `DI-ARCH-07/08` (change ratio vs final close), `DI-1M-04/05` (1m volume vs EOD volume; last bar vs EOD close), top-k vs archive |
-| L4 causality / PIT | is time ordering respected? | `DI-ARCH-09`, `DI-TOPK-01` (snapshot ≤ feature_available ≤ inference ≤ decided < 15:30 ≤ execution) |
+| DEP-01 | VPS HEAD == `origin/main`, or the newer commit's deploy is in progress / waiting on the blackout (`deploy.yml` step `blackout_wait`) | P1 |
+| DEP-02 | `git status --porcelain` empty; `latest` image ID == `sha-<HEAD>` image ID | P1 |
+| DEP-03 | `WRAPPER_MATCH`; no `DRIFT`; `NOT_IN_REPO` only `kca-kis-token-warmup.service.d` (drop-in written by krx-alpha deploy, §12) | P1 |
+| DEP-04 | 22 wrapper units print `rc=0 user=1001:1001` with the flags of §3 (a `USAGE_ERROR` line = unit cannot start) | P1 |
+| SCH-01 | all 28 timers `enabled active`; `Linger=yes`; no `--failed` units | P1 |
+| SCH-02 | each timer's `LAST` equals its most recent slot (UTC→KST). Units started by `After=` ordering or by remediation do not move `LAST` | P1 |
+| SCH-03 | blackout windows print `[('08:30:00','09:40:00'), ('15:10:00','15:43:00')]` | P2 |
 
-Interpretation rules (learned from live data):
-
-- Thresholds that depend on vendor mix must be **compared with the trailing baseline**, not with an absolute number: stored 1m
-  volume is ~0.96 of EOD volume (median) with ~10 % of symbols below 0.9 *every* day for the `ls` vendor; a **drift** from that
-  baseline is the signal, not the level. Baseline fields are printed so you can judge.
-- `archive.parquet` `등락률` is computed on the **final** close (`종가`), not on `결정_종가` (the 15:20 print) — compare accordingly;
-  `결정_종가` vs `종가` gap p99 ≲ 3 % is normal.
-- tick vs bar gap with a `tape_complete` proof = vendor difference, informational: the daily audit reports it as
-  `regular_ticks_source_diff` (an info line plus a `tick_source_diff` run-outcome record, never `intraday_complete`);
-  only `certified_gap` or `source_diff_systemic` warns (see `DI-1M-06`).
-- Row counts of `archive` vary with the market (observed 257–771 per day); only a ratio outside 0.5–2× of the trailing median warns.
-- Never call a data problem "fixed" because a file exists; quote the probe line.
-
-Additional manual checks (sample, then escalate if wrong):
-
-- [ ] **DI-MAN-01** pick 2 symbols from `D`'s top-k and 1 random symbol: archive close, price_history `close_raw`, 1m last bar and
-      `paper/fills` entry price all agree (entry == confirmed close; exit of `D-1` lots == `D` open-auction price).
-- [ ] **DI-MAN-02** `quarantine/` entries (each is a rejected anomaly); no synthetic/test symbols or
-      cohort IDs in live stores (`2026-09-22-test-fixture-cohort` is a known historical entry — report as hygiene, not new).
-- [ ] **DI-MAN-03** capture manifests for `D` (`data/history/capture/manifests/<D>`): list collectors with `missing_entries`,
-      `quota_exceeded`, `empty`.
-- [ ] **DI-MAN-04** the audit's own helpers agree with the probes (no email, no writes):
+## 5. Run Evidence
 
 ```bash
-ssh or-vps 'cd ~/k-closing-alpha && TZ=Asia/Seoul timeout 180 ~/.local/bin/uv run --no-sync python - <<"EOF"
-from src.tools.daily_audit import audit_daily_completeness, list_failed_kca_units
-from src.tools.run_outcome import load_run_outcomes
-D = "<D>"
-print("completeness", audit_daily_completeness(D)); print("failed_units", list_failed_kca_units()); print("outcomes", load_run_outcomes(D))
-EOF'
+ssh or-vps 'for s in $(systemctl --user list-unit-files "kca-*.service" --no-legend | awk "{print \$1}" | grep -v "@"); do \
+  r=$(systemctl --user show $s -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp --value | tr "\n" "|"); \
+  j=$(journalctl --user -u $s --since "-8d" --no-pager -o cat | grep -cE "^Finished "); \
+  f=$(journalctl --user -u $s --since "-8d" --no-pager -o cat | grep -cE "Failed with result|Main process exited, code=exited, status=[1-9]"); \
+  printf "%-38s fin8d=%-4s fail8d=%-3s %s\n" $s $j $f "$r"; done'
+ssh or-vps 'journalctl --user -u kca-<name>.service --since "<UTC from k>" --until "<UTC from k>" --no-pager -o short-iso \
+  | grep -vE "pam_unix|COMMAND=" | grep -E "Starting|Finished|Failed|Consumed|stage=|outcome=" | cut -c1-250 | tail -30'
+ssh or-vps 'cd ~/k-closing-alpha/data/logs/events/<YYYY-MM> && python3 - <D>' <<'EOF'
+import collections, json, sys
+D = sys.argv[1]
+rows = [json.loads(l) for l in open(f"{D}.jsonl") if l.strip()]
+print(D, dict(collections.Counter(r.get("outcome") for r in rows)))
+for r in rows:
+    print(f"  {r['ts'][11:19]} {r['job']:<24} {r['outcome']:<11} {r.get('reason', '')}")
+EOF
 ```
 
-All completeness keys (`archive close_confirmed decision paper_entry paper_exit minute_bars price_history_fresh`) must be `True`.
+| ID | Check | Severity if not |
+|---|---|---|
+| RUN-01 | one `Finished` per due unit per day (paper-entry twice, price-ingest three times); `ExecMainStatus=0`. `show` describes only the latest run; use the journal window for `D` | P1 |
+| RUN-02 | runtime inside §3 "normal"; > 70 % of `TimeoutStartSec` is WARN except aftermarket-book (by design) | P2 |
+| RUN-03 | run outcomes for `D`: decision jobs `OK`; `DEGRADED`/`NO_DECISION` need a matching alert (§11); a trading-day `predict` `SKIPPED` is a calendar disagreement | P1 |
+| RUN-04 | order units: journal `data/orders/<env>/journal.jsonl` holds the day's intents; current env from `[EXEC] stage=order_session env=…` (mock on 2026-10-16). A stuck `UNKNOWN` intent is operator-only (`src.daily.order_resolve`, dry-run first) | P0 |
+| RUN-05 | `CLOSED` day: weekday units log `SKIP reason=non_trading_day` and record `SKIPPED`; rows written on a closed day = calendar bug | P1 |
+| RUN-06 | `Traceback` in a job that exited 0, or `status=DEGRADED` without an outcome/heartbeat entry, is a silent failure | P2 |
 
-## 8. Paper Trading Ledger (`data/paper/`)
+Containers are `--rm`: after a run `docker logs` is empty and the journal is the only record.
 
-Run probe IDs `DI-PAPER-*` (nav conservation, duplicates, cumulative cost monotone, friction on every closed trade, net = gross − cost)
-and verify manually:
+## 6. Shared Host Broker Directory (host broker contract v1)
 
-- [ ] **PAP-01** open lots belong only to decision date `D` after `D`'s entry; an older `decision_date` = missed exit (P0).
-- [ ] **PAP-02** for `D`: entry fills for the persisted top-k, or a `decisions.parquet` NO_DECISION row with a reason — never neither.
-- [ ] **PAP-03** every `D-1` lot has a sell fill with `trigger` and a `trades` row; orders without fills are explained by `reason`.
-- [ ] **PAP-04** `nav` one row per trading day since paper start (no gaps), `n_open_positions` equals the open-lot count,
-      `cash` delta equals Σ(sell − buy − fees − tax) of the day's fills.
-- [ ] **PAP-05** which model priced the day: `topk_decisions.model_version` matches a `PROMOTED`/`MANUAL_HOTFIX` registry row (`RS-04`).
+Contract: `src/api/host_broker_contract.py`, byte-identical to krx-alpha `deploy/shared/host_broker_contract.py`
+(sha256 `0bfab4cc…`). Shared by kca, krx-collector and kse. KIS slot ownership: `deploy/shared/kis_slot_assignments.toml`
+(canonical in krx-alpha). Valid names in `~/.cache/kis` (each may have a `<name>.lock` sibling):
 
-## 9. Models and Research Data
-
-Probes `RS-01` (altdata panels `status`/lag), `RS-02-*` (backfill ledgers), `RS-03` (NXT decomposition artifacts bound by digest),
-`RS-04` (retrain registry vs live model), `RS-05/06` (stray files, quarantine), `RS-07..09` (session partitions, tape sweep, manifests).
-
-- [ ] **ML-01** latest registry row: `PROMOTED` within the last 8 days; `agreement` with the live bundle ≳ 0.9 (observed 0.989); a
-      `REJECTED` or `MANUAL_HOTFIX` row is read in full (`reasons`), not just counted.
-- [ ] **ML-02** retrain journal (`kca-retrain`): `pit_status`/`pit_reasons` lines; PIT gate mode is `advisory` unless the operator
-      says otherwise; a missing reconstruction certification means arm-1 scoring (expected while ADOPT is not granted).
-- [ ] **ML-03** research artifacts consistent: `nxt_decomposition_fit_report.table_sha256` == sha256 of the table (`RS-03`);
-      ledger `FAILED` rows with ≥ 3 attempts = stuck (P2); `EXHAUSTED` growth reported.
-- [ ] **ML-04** a retrain bundle trained on EOD features is scored on the 15:20 panel; `pit_haircut` report age ≤ 14 days
-      when the gate is advisory/enforce (see `retrain_gate`).
-
-## 10. Offsite Backup (gdrive) — can we restore the research data?
+| Kind | Name pattern | Writer |
+|---|---|---|
+| marker | `.host-admission` | `deploy/install_systemd.sh` (touched every deploy) |
+| token (LS, Toss, DB) | `token_<ls\|toss\|dbsec>_<sha12>.json` | shared token store (Kiwoom has no token file; pacing only) |
+| DB issue guard | `token_issue_dbsec_<sha12>.state` | 61 s issue spacing |
+| pacing | `admission_<vendor>_<sha12>[_<scope>].state` (scope case-preserving, e.g. `_RANKING`, `_ka10079`, `_chart`) | host pacer |
+| legacy KIS | `token_<sha12>.json`, `tps_<sha12>.state` | KIS key pool (one per slot + PRIMARY + TRADING_MOCK) |
 
 ```bash
-ssh or-vps 'cd ~/k-closing-alpha && ls -la data/history/capture/offsite/; cat data/history/capture/offsite/in_progress.json 2>/dev/null; echo; \
-  python3 -m json.tool data/history/capture/offsite/last_run.json | head -60; \
-  journalctl --user -u kca-backup.service --since "-8d" --no-pager -o short-iso | grep -E "Starting kca-backup|offsite_backup status|Failed" | cut -c1-30,70-210'
-ssh or-vps 'journalctl --user -u kca-offsite-verify.service --since "-8d" --no-pager -o cat | grep -E "offsite_verify|restore_drill|mismatch" | tail -6'
-ssh or-vps 'R=~/.local/bin/rclone; $R about gdrive: 2>&1 | head -4; $R lsd gdrive:quant-lake/live/k-closing-alpha; $R lsf gdrive:quant-lake/live/k-closing-alpha/snapshots --max-depth 1 | tail -5; $R lsf gdrive:quant-lake/live/k-closing-alpha/_deleted/data --max-depth 1 | sort | sed -n "1p;\$p"'
+ssh or-vps python3 - <<'EOF'
+import os, re, time
+d = os.path.expanduser("~/.cache/kis")
+V, H = "(ls|toss|dbsec|kiwoom)", "[0-9a-f]{12}"
+ok = [r"\.host-admission", rf"token_{V}_{H}\.json", rf"token_issue_{V}_{H}\.state",
+      rf"admission_{V}_{H}(_[A-Za-z0-9_-]+)?\.state", rf"token_{H}\.json", rf"tps_{H}\.state"]
+st = os.stat(d)
+print(f"dir mode={oct(st.st_mode & 0o777)} marker={os.path.isfile(os.path.join(d, '.host-admission'))}")
+names, now = sorted(os.listdir(d)), time.time()
+for n in names:
+    base = n[:-5] if n.endswith(".lock") else n
+    s = os.stat(os.path.join(d, n))
+    if not any(re.fullmatch(r, base) for r in ok):
+        print(f"NONCONTRACT {n} size={s.st_size} age_d={(now - s.st_mtime) / 86400:.1f}")
+    elif n.endswith(".lock") and base not in names:
+        print(f"ORPHAN_LOCK {n} age_d={(now - s.st_mtime) / 86400:.1f}")
+    if s.st_uid != os.getuid():
+        print(f"FOREIGN_OWNER {n} uid={s.st_uid}")
+print(f"total={len(names)}")
+EOF
+ssh or-vps 'stat -c "%a %U:%G %n" ~/.cache/kis ~/quant-secrets ~/quant-secrets/*.env; ls -la ~/.cache/kis | awk "{print \$1, \$3, \$5, \$6, \$7, \$8, \$9}"'
+ssh or-vps 'journalctl --user -u "kca-*" -u "kse-*" --since "-8d" --no-pager -o cat | grep -oE "IGW00201|EGW00201|EGW00133|TokenIssueThrottled|HostBrokerDirNotSharedError|AdmissionDirNotSharedError|SCHEMA_INVALID|TokenStoreLockTimeout|TOKEN_REPLACED|http=429" | sort | uniq -c; \
+  timeout 60 docker logs --since 168h krx-collector 2>&1 | grep -oE "IGW00201|EGW00201|TokenIssueThrottled|HostBrokerDirNotSharedError|SCHEMA_INVALID" | sort | uniq -c; \
+  journalctl --user -u kca-kis-token-warmup.service -u kca-kiwoom-token-rotate.service --since "-2d" --no-pager -o cat | grep -E "stage=" | cut -c1-200 | tail -15'
 ```
 
-- [ ] **BAK-01** last run `status=ok`, every `steps.*` ok (`deferred` is a WARN only when stalled/aged — track whether it drains),
-      started at/after the last Mon–Fri 22:15 KST slot. `offsite_backup:draining` is informational (backlog shrinking:
-      digest info line `backup backlog draining: <previous> -> <current> dates`); `offsite_backup:deferred` warns only when
-      the deferred date count stalls (3 consecutive non-decreasing runs, new captures can briefly outpace sealing so 1–2 are grace)
-      or the oldest deferred date is older than 21 days (approaching local sealed-retention). The marker's `started_at` is written after the unit's pre-steps, normally 0–2 min after the slot. While a run is active `in_progress.json` exists and `now < deadline_at`
-      (else interrupted = P1). Outside the run window no marker may exist. `DI-BAK-01` prints the deferred-history trend.
-- [ ] **BAK-02** `core_panels` row counts never shrink (`CORE_ROW_SHRINK_TOLERANCE = 0`); a shrink is **P0**.
-- [ ] **BAK-03** duration baseline: steady state is minutes (50 s – 6 min observed with ≤ 6 segments); hours are expected only while
-      draining a backlog (≈ 20–26 s per sealed segment regardless of size — Drive per-file latency). Report `duration_s`,
-      `segments`, `archive_bytes` per night and flag a sustained > 60 min with few segments as a regression.
-- [ ] **BAK-04** weekly `kca-offsite-verify`: `missing=0 mismatched=0` and all restore drills `OK` (raw, normalized, manifests).
-- [ ] **BAK-05** `_deleted/<subtree>/<date>` oldest ≤ 30 days (prune works); `snapshots/` latest is last Sunday (≤ 8 weekly + ≤ 12 monthly);
-      gdrive free space ≥ 2× weekly growth.
-- [ ] **BAK-06** local-vs-remote parity of loose data (outside blackout and outside the backup window; read-only; ~1–3 min):
+| ID | Check | Severity if not |
+|---|---|---|
+| BRK-01 | dir mode `700`, owner `ubuntu`, `marker=True` (missing marker → every container job raises `HostBrokerDirNotSharedError`) | P0 |
+| BRK-02 | no `NONCONTRACT`, `ORPHAN_LOCK` or `FOREIGN_OWNER` lines (root-owned files come from the root `krx-collector` container and are re-owned by the reconcile `sudo chown`, every 10 min 07:00–23:00) | P2 |
+| BRK-03 | zero `IGW00201` (LS/DB throttle), `EGW00201` (KIS TPS), `EGW00133` (KIS token issue limit), `TokenIssueThrottled`, `HostBrokerDirNotSharedError`/`AdmissionDirNotSharedError`, `SCHEMA_INVALID` (corrupt shared token record). Any hit 15:20–15:31 KST | P1 (else P2) |
+| BRK-04 | warmup on the last trading day: one `issued=True` per slot (`DATA_1..5`, `PRIMARY`, `TRADING_MOCK`); legacy `token_<sha12>.json` mtimes = that 07:05 run | P1 |
+| BRK-05 | env files `600`, `~/quant-secrets` `700` | P1 |
+| BRK-06 | `docker logs --since` covers only the current krx-collector container lifetime; say so if it restarted | info |
+
+## 7. Host Resources and Storage
 
 ```bash
-ssh or-vps 'cd ~/k-closing-alpha && ~/.local/bin/rclone check data gdrive:quant-lake/live/k-closing-alpha/data --one-way --size-only \
-  --exclude "/history/capture/**" --combined - 2>/dev/null | awk "{c[\$1]++} \$1==\"+\"||\$1==\"*\"{print} END{for(k in c) print \"count\",k,c[k]}" | tail -40'
+ssh or-vps 'df -h /; df -i / | tail -1; free -h | sed -n 2,3p; docker system df; docker ps --format "{{.Names}} {{.Image}} {{.Status}}"; journalctl --user --disk-usage; \
+  cd ~/k-closing-alpha && nice -n 19 du -sh data artifacts; for d in data/history data/history/capture; do nice -n 19 du -sh $d/* | sort -h | tail -6; done'
+ssh or-vps 'cd ~/k-closing-alpha && nice -n 19 find data artifacts -maxdepth 4 \( -name "*.bak*" -o -name "*.pre_*" -o -name "*.stale*" \) -printf "%TY-%Tm-%Td %s %p\n"; ls ~/ops-scratch ~/k-closing-alpha/scratch 2>&1 | head'
 ```
 
-  Lines `+ path` (present locally, missing on gdrive) and `* path` (size differs) must all be files modified after `last_run.json.started_at`
-  (changes since the last night). Anything older is a backup gap (P1). Also detect remote duplicates:
-  `~/.local/bin/rclone lsf -R --files-only gdrive:quant-lake/live/k-closing-alpha/data --exclude "/history/capture/**" | sort | uniq -d`
-  (identical-content duplicates are P2 hygiene; differing sizes are P1).
-- [ ] **BAK-07** flock contention: a backup started much later than 22:15 → find who held `quant-gdrive.lock`; not a bug.
+| ID | Check | Severity if not |
+|---|---|---|
+| HOST-01 | disk < 80 %, inodes < 80 % (2026-10-17: 24 %, 143 GiB free; inodes 7 %). kca data 8.9 GiB, of which `capture/raw` ~250–460 MB per trading day, held 30 days locally | P1 |
+| HOST-02 | memory available > 2 GiB at rest; `kca-backup` peak 1–3.5 GiB, `kca-daily-audit` 1.4 GiB, retrain capped at 6 GiB | P2 |
+| HOST-03 | no `kca-*` container outside its §3 window (hung unit) and no exited `kca-*` leftovers | P1 |
+| HOST-04 | kca images: `latest` + newest 5 `sha-*` tags (pruned daily 05:30 KST by krx-alpha `vps-image-gc.timer`, `--keep 5`) | P2 |
+| HOST-05 | stray files: known on 2026-10-17 — `security_classification.parquet.pre_backfill_20261004`, `sizing_pipeline_bundle.joblib.{bak,pre_002_20261011}`, `~/ops-scratch/` (old audit scripts). Report new ones; list known ones once | P2 |
 
-### 10.5 Restore rehearsal for local ML research (monthly, from the operator's PC — rclone is `drive.readonly`)
+## 8. Data Integrity (presence is not correctness)
 
-1. `rclone copy gdrive:quant-lake/live/k-closing-alpha/data <scratch>/data --exclude "/history/capture/**"` (≈ 1.6 GiB).
-2. With `DATA_DIR=<scratch>/data` run the Appendix-A probes against the **latest backed-up** date; they must give the same
-   `CHECK` results as on the VPS.
-3. Compare `sha256` of `price_history.parquet`, `archive.parquet`, `paper/*.parquet` with the VPS (`sha256sum` over ssh) for files
-   not modified since the last backup.
-4. Capture evidence (raw tick pages) restores per date with `python -m src.tools.capture_offsite restore --tier <tier> --date <D> --dest <path>`;
-   do this only for one rotating date and delete the scratch copy afterwards.
-5. Delete the scratch copy; record time and size in the report.
+Run Appendix A on every `D` (outside blackout). Levels: L1 presence (`DI-ARCH-01`, `DI-PH-02`, `DI-1M-01`, `RS-07`, `RS-09`),
+L2 structure (`DI-ARCH-02/03/06`, `DI-PH-03/04/06`, `DI-1M-02/03`), L3 cross-source (`DI-ARCH-07/08`, `DI-1M-04/05/06`),
+L4 causality (`DI-ARCH-09`, `DI-TOPK-01`: snapshot ≤ feature_available ≤ inference ≤ decided < 15:30 ≤ execution).
 
-## 11. Alerting, Heartbeat and Dead-Man Paths
+- Archive rows follow the market screen (93–1,247 per day observed); `DI-ARCH-01` ratio WARN is informational unless `collect` coverage < 1.
+- `DI-ARCH-09` share of snapshots inside 15:20:xx drops when `n_raw` is large (0.694 at 1,247 rows on 10-16); causality violations must stay 0.
+- `price_history` for `D` lands at the next 08:30 ingest; the probe compares `D-1` on the evening of `D`.
+- Stored 1m volume ≈ 0.96 of EOD volume for vendor `ls`; judge drift vs the printed baseline, not the level.
+- `등락률` is computed on the final close (`종가`), not `결정_종가`; their gap p99 ≲ 3 % is normal.
+- Tick vs bar gaps with a `tape_complete` proof are vendor differences (`tick_source_diff` outcome, info note); only `certified_gap`/`source_diff_systemic` warn.
+- Manual spot check: 2 top-k symbols + 1 random symbol agree across archive close, `price_history.close_raw`, last 1m bar, paper entry fill.
+
+## 9. Paper Ledger and Orders
+
+| ID | Check | Severity if not |
+|---|---|---|
+| PAP-01 | open lots belong only to decision date `D` after `D`'s entry; an older `decision_date` = missed exit | P0 |
+| PAP-02 | `D` has entry fills for the persisted top-k or a `paper/decisions.parquet` NO_DECISION row | P0 |
+| PAP-03 | every `D-1` lot has a sell fill with `trigger` and a `trades` row | P0 |
+| PAP-04 | `DI-PAPER-01..06` PASS (nav = cash + open MV, no duplicate nav days/fills, cost monotone, friction on every trade, net = gross − cost) | P0 |
+| PAP-05 | order journal intents for `D` match the top-k (`n_picks == n_acked + n_rejected + n_not_sent`), no lingering `UNKNOWN` | P0 |
+
+## 10. Models
+
+| ID | Check | Severity if not |
+|---|---|---|
+| ML-01 | `RS-04`: last registry row `PROMOTED`/`PROMOTED_UNGATED`/`MANUAL_HOTFIX` within 8 days and the live `model_version` is in the registry | P1 |
+| ML-02 | Sat retrain journal: a `strategy or screen changed vs live bundle` rejection fails the unit by design; the operator certifies and reruns with `--skip-promotion-gate` (registry `PROMOTED_UNGATED`), then may `reset-failed`. Auto-remediation never reruns retrain (`skipped_forbidden`) | P1 |
+| ML-03 | `RS-03` table digest matches the fit report; `RS-02-*` no FAILED with ≥ 3 attempts | P2 |
+
+## 11. Offsite Backup, Alerts and Heartbeat
 
 ```bash
-ssh or-vps 'cd ~/k-closing-alpha/data/logs/heartbeat && cat daily_audit.json; echo; cat audit_alert_state.json'
-ssh or-vps 'journalctl --user -u "kca-alert@*" -u kca-audit-reconcile.service --since "-3d" --no-pager -o short-iso | grep -E "Starting|Finished|Failed|outcome|channel|reconcile" | tail -30 | cut -c1-220'
-gh run list --workflow watchdog.yml --limit 5
-ssh or-vps 'python3 - <<"EOF"
+ssh or-vps 'cd ~/k-closing-alpha/data/history/capture/offsite && ls in_progress.json 2>&1 | tail -1; python3 -c "
 import json
-s=json.load(open("/home/ubuntu/quant-dashboard/public/status.json")); print(s["generated_at"], s["level"], s["market_day"])
+r = json.load(open(\"last_run.json\")); print({k: r[k] for k in (\"status\", \"started_at\", \"finished_at\")})
+for k, v in r[\"steps\"].items(): print(\" step\", k, json.dumps(v)[:200])
+for p in r[\"core_panels\"]: print(\" core\", p[\"relpath\"], p[\"rows\"], p[\"max_date\"])
+print(\"deferred_tail\", json.load(open(\"deferred_history.json\"))[-3:])"'
+ssh or-vps 'journalctl --user -u kca-backup.service -u kca-backup-prune.service -u kca-offsite-verify.service --since "-8d" --no-pager -o cat \
+  | grep -E "offsite_backup status|stage=backup_prune|offsite_verify|restore_drill" | cut -c1-600 | tail -12'
+ssh or-vps 'R=~/.local/bin/rclone; timeout 120 $R about gdrive: | head -4; timeout 60 $R lsd gdrive:quant-lake/live/k-closing-alpha; \
+  timeout 60 $R lsf gdrive:quant-lake/live/k-closing-alpha/snapshots --max-depth 1 | tail -4; \
+  timeout 60 $R lsf gdrive:quant-lake/live/k-closing-alpha/_deleted/data --max-depth 1 | sort | sed -n "1p;\$p"'
+ssh or-vps 'cd ~/k-closing-alpha && nice -n 19 timeout 600 ~/.local/bin/rclone check data gdrive:quant-lake/live/k-closing-alpha/data --one-way --size-only \
+  --exclude "/history/capture/**" --combined - 2>/dev/null | awk "{c[\$1]++} \$1==\"+\"||\$1==\"*\"{print} END{for(k in c) print \"count\",k,c[k]}" | tail -20'
+ssh or-vps 'cd ~/k-closing-alpha/data/logs && python3 -c "
+import json; h = json.load(open(\"heartbeat/daily_audit.json\"))
+print({k: h.get(k) for k in (\"schema_version\", \"snapshot_date\", \"severity\", \"audit_kind\", \"day_kind\", \"finished_at\", \"reconciled_at\", \"undelivered_alerts\", \"provisional_reasons\")})
+print(\"open\", [i.get(\"key\") for i in h.get(\"open_issues\", [])]); print(\"info\", h.get(\"info_notes\"))"; \
+  cat heartbeat/audit_alert_state.json heartbeat/advisory_streaks.json; tail -n 5 remediation/ledger.jsonl | cut -c1-220'
+ssh or-vps 'journalctl --user -u "kca-alert@*" --since "-8d" --no-pager -o short-iso | grep -E "Starting|Finished|Failed" | cut -c1-200 | tail -8'
+ssh or-vps python3 - <<'EOF'
+import json
+s = json.load(open("/home/ubuntu/quant-dashboard/public/status.json"))
+print(s["generated_at"], s["level"], s.get("market_day"))
 for p in s["projects"]:
-    for c in p["checks"]:
-        if c["level"]!="OK": print(p["name"], c["id"], c["level"], c["detail"][:160])
-EOF'
+    print(p["name"], len(p["checks"]), [(c["id"], c["level"], c["detail"][:120]) for c in p["checks"] if c["level"] != "OK"])
+EOF
+gh run list --workflow watchdog.yml --limit 5 -R kthyeong/k-closing-alpha
 ```
 
-- [ ] **ALR-01** heartbeat `snapshot_date` is the latest **weekday** audited (it can be later than `D`, e.g. a weekday holiday has `day_kind=holiday`);
-      its `finished_at` is ≈ 21:20–21:45 KST of that weekday or a later `reconciled_at`; `undelivered_alerts == 0`; `schema_version == 2`.
-      `info_notes` carries the digest info lines for trend (tape residual, draining backlog, source diffs); `draining` never sets `provisional_reasons`.
-- [ ] **ALR-02** every `open_issues[*]` maps to a finding in this report; `provisional_reasons` non-empty only while the backup runs
-      (`offsite_backup:running` — `draining` is settled-slow, not provisional).
-      A WARN subject with `open_issues == []`, or `open_issues` that no longer reproduce, means reconcile did not clear it (P2 — name the stale source).
-      A `deferred`-open state that now reads `draining` resolves with `offsite_backup:deferred -> draining` (no new issue, no notify).
-- [ ] **ALR-03** each failed unit in the window produced a `kca-alert@<unit>` instance that **delivered**; a failed alert = P1 blind spot.
-- [ ] **ALR-04** `watchdog.yml` last 5 scheduled runs succeeded; GHCR PAT expiry > 30 days.
-- [ ] **ALR-05** dashboard cards vs ground truth: any non-OK card must correspond to a current finding; any ground-truth finding with an
-      OK card is a monitoring gap (P1). Ask the operator (do not assume) whether the digest email for `D` arrived.
-- [ ] **ALR-06** closed-day behaviour: weekday holiday digest is `HOLIDAY_SKIP` (no mail) unless a real problem exists.
+| ID | Check | Severity if not |
+|---|---|---|
+| BAK-01 | `last_run.json` `status=ok`, every step ok, `started_at` after the last Mon–Fri 22:15 slot (+0–2 min chown pre-step); `in_progress.json` exists only while a run is active and before its `deadline_at` | P1 |
+| BAK-02 | `core_panels` rows never shrink between nights | P0 |
+| BAK-03 | `deferred_dates` 0, or draining; stalled 3 runs or oldest deferred > 21 days = WARN | P2 |
+| BAK-04 | Sun verify `missing=0 mismatched=0`, restore drills `OK` for raw, normalized, manifests | P1 |
+| BAK-05 | `snapshots/` newest = last Sunday; `_deleted/data` oldest ≤ 30 days at the last weekday prune (weekends add up to 2 days) | P2 |
+| BAK-06 | `rclone check` `+`/`*` entries only for files modified after `last_run.started_at` (heartbeat, extended-backfill partitions, ledgers) | P1 |
+| BAK-07 | local sealed capture older than 30 days is removed by backup-prune; dates kept past that (`sealed_kept>0`) are named in the report | P2 |
+| ALR-01 | heartbeat `schema_version 2`, `snapshot_date` = latest weekday audited, `undelivered_alerts 0`, `reconciled_at` within 10 min during 07:00–23:00 | P1 |
+| ALR-02 | every `open_issues` key maps to a finding; ledger rows `started` without a later `resolved`/`unresolved` are in flight; `unresolved`/`skipped_budget` need the operator | P1 |
+| ALR-03 | every failed unit produced a `kca-alert@<unit>` that `Finished` | P1 |
+| ALR-04 | dashboard kca card non-OK ⇔ a current finding | P1 |
+| ALR-05 | `watchdog.yml` last 5 scheduled runs `success` | P1 |
 
-## 12. Credentials, Tokens, Expiries and Quotas
+## 12. Cross-Project Contention Map
 
-```bash
-ssh or-vps 'stat -c "%a %U %n" ~/quant-secrets/*.env ~/.cache/kis; ls ~/.cache/kis | sed "s/_[0-9a-f]\{8,\}.*//" | sort | uniq -c; \
-  journalctl --user -u kca-kis-token-warmup.service -u kca-kiwoom-token-rotate.service --since "-2d" --no-pager | grep -E "Finished|Failed|status=|slot|expire" | tail -12'
-```
+| KST | kca | Neighbour | Shared resource | Watch for |
+|---|---|---|---|---|
+| 07:05 | token warmup (7 KIS keys) | krx-collector relies on it (krx deploy enables the timer and adds the drop-in) | KIS tokens, issue limit | `EGW00133` |
+| 07:58–08:50 | — | krx premarket WS slot 5; `kse-morning` 08:32 (kse repo `config/providers.toml` `pool_slot = 5`, bulk) | KIS data slot 5 (kse not in the slot table) | `EGW00201` |
+| 08:30–09:03 | price-ingest, auction-open (slot 3), order-exit, paper-exit | `kse-auction-open` 08:39:30 (kis-data) | KIS data keys | `EGW00201`, late paper-exit |
+| 15:20–15:30 | collect/predict/finalize (slots 1, 5 decision) | krx snapshot REST slot 2 until 15:39 | KIS slots per slot table | `EGW00201` on the decision chain = P1 |
+| 15:40–20:00 | aftermarket-book, archive-regular (slots 2, 3), auction-path | krx aftermarket WS slots 1–4; krx-collector (same LS app key) | KIS keys (REST vs WS), LS key | `IGW00201` |
+| 20:35–21:10 | tape-sweep (Kiwoom) | `kse-collect-dbsec` 20:40 (DB) | different vendors; shared DB token | `TokenIssueThrottled` |
+| 21:00–02:30 | backup-prune, backup, core-snapshot, offsite-verify | `kse-backup` 02:30 | `flock %t/quant-gdrive.lock` | late backup start |
+| 23:05 | extended-backfill (slots 2, 3) | — | KIS slots | `EGW00201` |
+| every 10 min | audit-reconcile `sudo chown -R ~/.cache/kis` | krx-collector runs as root with `~/.cache/kis` mounted rw | file ownership | `FOREIGN_OWNER`, `PermissionError` |
+| on deploy | — | krx deploy writes `~/.config/systemd/user/kca-kis-token-warmup.service.d/10-kis-data-env.conf`; `krx-*` units use `OnFailure=kca-alert@` | kca unit namespace | drift invisible to kca `code_sync` |
 
-- [ ] **CRD-01** env files mode `600`, `~/.cache/kis` mode `700`, owner `ubuntu`.
-- [ ] **CRD-02** token warmup/rotate succeeded on `D`; the KIS admission directory is shared with the host mount (neighbours use it).
-- [ ] **CRD-03** no `EGW00201`/429 on the decision chain (15:20–15:31) — P1; the KIS quota is shared with `krx-alpha` etc.
-- [ ] **CRD-04** Toss token is shared between PC and VPS: `TOKEN_REPLACED` in logs means two hosts used it at once (coordinate backfills).
-- [ ] **CRD-05** expiry notices (`src/tools/expiry_notices.py`): credentials and KRX calendar horizon — report days left; the calendar
-      must contain next year's holidays before year-end.
-- [ ] **CRD-06** DART status `020` may come from the neighbour sharing the key; check before blaming this repo.
+## 13. Known Standing Conditions and Pitfalls
 
-## 13. Weekly and Monthly Items
+- **Failed state persists** until the unit's next run (e.g. retrain until next Saturday unless the operator runs `reset-failed`). Report cause, whether the deployed commit fixed it, and when it clears.
+- **Extended backfill `pending_manifest_conflict`**: every night since at least 2026-10-09 the 23:05 run logs `intraday_archive status=DEGRADED reason=pending_manifest_conflict` for all four sessions of `D-1`, while still writing the partitions and exiting 0. Track as a standing P2 until fixed; a change in pattern (other dates, FAILED, missing partitions) is new.
+- **`price-ingest` 21:30 "same-day" slot** ingested 0 rows (`dates=[]`) on every day 2026-10-13..16; `D` lands at 08:30 next morning. Standing P2.
+- **Stale KIS token on closed days**: 2026-10-09..11 reconcile flagged `stale_kis_token:*` on holidays/weekends and reran warmup, which skips on `CLOSED` days (budget exhausted). Not seen on 2026-10-17; a recurrence is a calendar-awareness regression (P2).
+- **Backup prune keeps old dates**: `raw/` and `manifests/2026-09-14` survived past 30 days (`sealed_kept=2`, reasons not logged at INFO).
+- **Holidays**: weekday timers fire; jobs must `SKIP`; the daily audit digest is `HOLIDAY_SKIP`. Run data probes against the previous trading day.
+- **`journalctl` times are UTC**; `docker logs` is empty for `--rm` units; the journal is the record.
+- **Shared resources** (`TOKEN_REPLACED` for the Toss token used from PC and VPS, Drive lock, KIS slots) are cross-project; attribute precisely.
+- **Checklist drift**: when a timer, unit, wrapper flag, data path or contract file name changes, update §3, §6 and Appendix A in the same change.
 
-- [ ] Sat retrain result and Monday `predict` bundle load (`NO_DECISION`/parity errors absent) — §9.
-- [ ] Sun core snapshot and offsite verify — §10.
-- [ ] Trends for the week: disk/gdrive growth, backup durations, archive/price rows, ledger `FAILED/EXHAUSTED` counts, quarantine, docker/journal size.
-- [ ] Hygiene: stray `*.bak*`, `*.pre_*`, scratch/leftover files on the host; unused old images; known entries are listed once and tracked, not re-reported as new.
-- [ ] Monthly: §10.5 restore rehearsal; calendar horizon; PAT/credential expiries; this file's drift check (§14).
-
-## 14. Known Pitfalls (each was a real incident or false alarm)
-
-- **Stale-looking warnings.** A failed unit stays failed until its next run; the heartbeat WARN persists until the next audit/reconcile.
-  Report the *cause*, whether it is fixed in the deployed commit, and when the state will clear.
-- **Audit/backup race (fixed 2026-10-05).** `last_run.json` is written at the end; an audit during the 22:15–00:00 run used to read
-  `offsite_backup:stale`. Now `running` is informational and `interrupted` is the warning.
-- **Holiday D-mode.** When `D` is a weekday holiday, the data/research probes (DI-ARCH, DI-1M, DI-TOPK, DI-PAPER, RS-07, RS-09) report FAIL/WARN by construction because nothing is produced; run them with `D` = the previous trading day and mark today's rows SKIP (reason: holiday). Verify instead that every unit recorded `SKIPPED non_trading_day`, that the audit heartbeat is `HOLIDAY_SKIP` for `D`, and that the tape sweep recovered the previous day's gaps.
-- **Holiday handling.** Weekday timers fire on holidays; units must `SKIP`/record `SKIPPED`. The tape sweep used to treat days after the newest
-  `price_history` date as trading days and crash on holidays (fixed 2026-10-05) — a repeat means the calendar helper regressed.
-- **UTC vs KST.** `journalctl --since "2026-10-05 20:53"` on the host means 20:53 UTC. Convert.
-- **`docker logs` is empty** for `--rm` oneshot units; use the journal.
-- **Value correctness vs presence.** A file with plausible size can hold wrong values (09-22). Always run the probes.
-- **Shared resources.** `TOKEN_REPLACED` (Toss token used from PC and VPS), `AdmissionDirNotSharedError` (admission dir not mounted), the
-  Drive lock, and KIS quota are cross-project; attribute precisely.
-- **Calendar `UNKNOWN`.** Outside the verified range the resolver cannot say; jobs fall back conservatively and the expiry notice should already have fired.
-- **Checklist drift.** When a timer/unit/data path is added, removed or renamed, update §4/§5 and Appendix A in the same change; the live
-  schedule command in §4 and the probes are the authority, the tables are a convenience.
-
-## 15. Report Format
-
-Write in Korean (keys/badges English). The report is delivered in chat only; do not save report files.
+## 14. Report Format (chat reply only — no files)
 
 ```
-## VPS Audit — D=<D> (<mode>, checked <KST timestamp>)
-Overall: PASS | WARN | FAIL            Next check due: <KST>
+## kca VPS Audit — D=<D> (<mode>, checked <KST>)
+Overall: PASS | WARN | FAIL
 
 | Area | Status | Evidence (1 line) |
 |---|---|---|
-| Context (day kind, uptime) | | |
-| Deploy / scheduler parity | | |
-| Critical windows (07:05 · 09:01 · 15:20–15:35 · 20:35 · 22:15) | | |
-| Run evidence / outcomes | | |
-| Host resources | | disk 21% (150G free) |
-| Data integrity L1–L4 (probe CHECK lines) | | n PASS / n WARN / n FAIL |
-| Paper ledger | | |
-| Models / research data | | |
-| Offsite backup + restore | | last ok <time>, <segments> segs, <duration_s> s |
-| Alerts / heartbeat / dashboard | | |
-| Credentials / quotas / expiries | | |
+| Context / day kind | | |
+| Deploy / scheduler parity (DEP, SCH) | | |
+| Run evidence / outcomes (RUN) | | |
+| Shared broker dir / contract (BRK) | | |
+| Host resources / storage (HOST) | | |
+| Data integrity (Appendix A) | | n PASS / n WARN / n FAIL |
+| Paper ledger / orders (PAP) | | |
+| Models (ML) | | |
+| Backup / alerts / heartbeat (BAK, ALR) | | |
+| Cross-project contention | | |
 
 ### Findings (severity-ordered)
-- [P0|P1|P2] <ID> <title> — 근거: <command + key output>, 영향: <what breaks / since when>, 상태: <new | continuing since <date> | resolved>, 제안: <owner/next diagnostic>
-
-### Resolved this check / Known and unchanged
+- [P0|P1|P2] <ID> <title> — 근거: <command + key output>; 영향: <what breaks>; 상태: new | continuing since <date> | resolved; 제안: <next step>
+### Known and unchanged
 ### NOT VERIFIED (what, why)
 ```
 
-Machine block keys (stable): `date`, `mode`, `overall`, `checks` (`id → status`), `metrics` (`disk_pct`, `mem_avail_gib`, `archive_rows_D`,
-`ph_rows_D`, `m1_rows_D`, `backup_duration_s`, `backup_segments`, `failed_units`, `open_issues`, `ledger_failed`, `tape_unresolved`,
-`nav_D`, `gdrive_free_gib`). A new finding that was `continuing` for > 3 reports is escalated one severity.
+Severity: **P0** data loss/corruption, ledger inconsistency, decision chain down, backup shrink, broker dir unshared;
+**P1** a scheduled job silently not running or failing, causality violation, throttling on the decision chain,
+restore impossible, alert path broken; **P2** research gaps, hygiene, trends, cross-project coupling.
 
 ---
 
 ## Appendix A — Executable Probes
 
-Extract the fenced blocks into scratch files and pipe them over ssh (read-only; outside blackout; `D` is the audit date):
+Run from the local repo root, outside blackouts; nothing is written on either side (`D` = audit date):
 
 ```bash
-mkdir -p scratch && for p in data research; do awk "/^\`\`\`python probe=$p/{f=1;next}/^\`\`\`/{f=0}f" docs/vps-checklist.md > scratch/probe_$p.py; done
-for p in data research; do ssh or-vps 'cd ~/k-closing-alpha && TZ=Asia/Seoul nice -n 10 timeout 300 ~/.local/bin/uv run --no-sync python - <D>' < scratch/probe_$p.py; done
+cd /home/kth/k-closing-alpha
+for p in data research; do awk "/^\`\`\`python probe=$p/{f=1;next}/^\`\`\`/{f=0}f" docs/vps-checklist.md \
+  | ssh or-vps "cd ~/k-closing-alpha && TZ=Asia/Seoul nice -n 19 timeout 300 ~/.local/bin/uv run --no-sync python - <D>"; done
 ```
 
-Output is `CHECK <ID> <PASS|WARN|FAIL> <detail>`. Baselines observed on 2026-10-02: archive 455 rows,
-price_history 2,766 rows/day, 1m `ls` 377 k bars/990 symbols, volume ratio median 0.960, 3 top-k rows, nav conservation 0.00.
-Probe behavior (known standing condition, do not re-open as new): `RS-01` measures panel lag in trading days against a per-panel
-allowance table (`credit_balance` observed T+3 trading days → allow 4); `RS-05` WARNs only for `*.pre_*` files older
-than 7 days (message: delete after offsite verify); `RS-06` quarantine entries are INFO (PASS with manifest detail) when
-each carries a `moves-*.json` manifest, WARN otherwise; `RS-08` reads report fields `unrecoverable`,
-`expired_recoverable`, `expiring_needs` and WARNs only for `expiring_needs > 0`, `expired_recoverable > 0`, or a stale
-`run_date` (`unresolved` alone is tracked, not warned).
+Output is `CHECK <ID> <PASS|WARN|FAIL> <detail>`. Baselines for `D=2026-10-16`: archive 1,247 rows (prev-5 median 197),
+`price_history` 2,762 rows/day, 1m regular 485 k bars / 1,273 symbols (`ls`), volume ratio median 0.959, 3 top-k rows,
+nav conservation 0.00; only `DI-ARCH-01`, `DI-ARCH-09` and `RS-05` WARN. Standing probe behaviour: `RS-01` allows
+`credit_balance` 4 trading days of lag; `RS-05` WARNs for `*.pre_*` older than 7 days; `RS-06` is PASS when each
+quarantine entry has a `moves-*.json` manifest (`2026-09-22-test-fixture-cohort` is known); `RS-08` WARNs only for
+`expiring_needs > 0`, `expired_recoverable > 0` or a stale `run_date`.
 
 ```python probe=data
 import sys
