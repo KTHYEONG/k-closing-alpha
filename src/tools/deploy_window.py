@@ -16,10 +16,13 @@ from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logg
 logger = logging.getLogger(__name__)
 
 DEPLOY_BLACKOUT_GUARD_MINUTES: int = 10
+DEPLOY_BLACKOUT_PREOPEN_LEAD_MINUTES: int = 30
 DEPLOY_WAIT_HEARTBEAT_SECONDS: int = 60
 
 _SEOUL = ZoneInfo("Asia/Seoul")
 _MINUTES_PER_DAY: int = 24 * 60
+# Earliest pre-open kca job start (kca-price-ingest 08:30); the pre-open blackout must begin no later.
+_EARLIEST_PREOPEN_JOB_START: clock_time = clock_time(8, 30)
 
 
 def _shift_hhmmss(hhmmss: str, *, delta_minutes: int) -> clock_time:
@@ -31,9 +34,18 @@ def _shift_hhmmss(hhmmss: str, *, delta_minutes: int) -> clock_time:
 
 def _build_windows() -> tuple[tuple[clock_time, clock_time], ...]:
     guard = DEPLOY_BLACKOUT_GUARD_MINUTES
+    preopen_start = _shift_hhmmss(
+        _session.KRX_REGULAR_HOUR_FLOOR,
+        delta_minutes=-DEPLOY_BLACKOUT_PREOPEN_LEAD_MINUTES,
+    )
+    if preopen_start > _EARLIEST_PREOPEN_JOB_START:
+        raise ValueError(
+            f"pre-open blackout start {preopen_start} is later than the earliest "
+            f"pre-open job start {_EARLIEST_PREOPEN_JOB_START}"
+        )
     return (
         (
-            _shift_hhmmss(_session.KRX_REGULAR_HOUR_FLOOR, delta_minutes=-guard),
+            preopen_start,
             _shift_hhmmss(_session.PAPER_EXIT_WINDOW_END_HHMMSS, delta_minutes=guard),
         ),
         (

@@ -102,7 +102,7 @@ flowchart TD
 
 Restore a capture tier with `uv run python -m src.tools.capture_offsite restore --tier <tier> --date <YYYY-MM-DD> --dest <path>` (dest must be outside the live capture tiers); weekly `kca-offsite-verify` (Sun 11:00 KST) re-verifies every ledgered segment's remote MD5 and rehearses a rotating date end-to-end.
 
-Deploys converge the VPS only outside the 08:50–09:40 and 15:10–15:43 KST weekday blackout; retrain uses the locally gated image.
+Deploys converge the VPS only outside the 08:30–09:40 and 15:10–15:43 KST weekday blackout; retrain uses the locally gated image.
 
 ---
 
