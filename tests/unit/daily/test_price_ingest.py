@@ -539,8 +539,9 @@ def test_main_runs_ingest_with_defaults(monkeypatch) -> None:
 
 
 def test_kca_price_ingest_service_runs_module() -> None:
-    with open("deploy/systemd/kca-price-ingest.service", encoding="utf-8") as f:
-        content = f.read()
+    from tests.unit.deploy._rendered_units import rendered_unit_text
+
+    content = rendered_unit_text("deploy/systemd/kca-price-ingest.service")
     assert "Type=oneshot" in content
     assert "docker run --rm" in content
     assert "src.daily.price_ingest" in content

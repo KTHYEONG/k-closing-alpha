@@ -1,6 +1,9 @@
 
 
 
+from tests.unit.deploy._rendered_units import rendered_unit_text
+
+
 def test_no_unit_hardcodes_home_kth_path() -> None:
     import pathlib
 
@@ -43,7 +46,7 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
     }
 
     for svc in sorted(root.glob("kca-*.service")):
-        text = svc.read_text(encoding="utf-8")
+        text = rendered_unit_text(svc)
         assert "WorkingDirectory=%h/k-closing-alpha" in text, svc.name
         if svc.name in containerized:
             assert "%h/k-closing-alpha/data" in text, svc.name
@@ -207,7 +210,7 @@ def test_retrain_service_runs_containerized_with_measured_resource_limits() -> N
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    text = (root / "kca-retrain.service").read_text(encoding="utf-8")
+    text = rendered_unit_text(root / "kca-retrain.service")
 
     assert "docker run --rm" in text
     assert "--memory=6g" in text
@@ -235,7 +238,7 @@ def test_containerized_units_use_shared_image_and_new_env_file() -> None:
         "kca-aftermarket-book.service",
     )
     for name in containerized:
-        text = (root / name).read_text(encoding="utf-8")
+        text = rendered_unit_text(root / name)
         assert "docker run --rm" in text, name
         assert "ghcr.io/kthyeong/k-closing-alpha:latest" in text, name
         assert "--env-file %h/quant-secrets/k-closing-alpha.env" in text, name
@@ -295,12 +298,12 @@ def test_decision_role_units_forward_env_into_container() -> None:
         "kca-paper-exit.service",
     )
     for name in decision:
-        text = (root / name).read_text(encoding="utf-8")
+        text = rendered_unit_text(root / name)
         assert "Environment=KIS_DATA_ROLE=decision" in text, name
         exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
         assert "-e KIS_DATA_ROLE=decision" in exec_line, name
 
-    predict_text = (root / "kca-predict.service").read_text(encoding="utf-8")
+    predict_text = rendered_unit_text(root / "kca-predict.service")
     assert "-e KIS_DATA_ROLE=decision" not in predict_text
 
 
@@ -328,9 +331,9 @@ def test_kis_cache_mounted_only_for_units_using_kis_client() -> None:
     )
     mount = "-v %h/.cache/kis:/app/.cache/kis"
     for name in needs_kis_cache:
-        assert mount in (root / name).read_text(encoding="utf-8"), name
+        assert mount in rendered_unit_text(root / name), name
 
-    assert mount not in (root / "kca-retrain.service").read_text(encoding="utf-8")
+    assert mount not in rendered_unit_text(root / "kca-retrain.service")
 
 
 def test_kis_using_containerized_units_forward_key_pool_env_and_cache() -> None:
@@ -355,7 +358,7 @@ def test_kis_using_containerized_units_forward_key_pool_env_and_cache() -> None:
     )
 
     for name in kis_units:
-        text = (root / name).read_text(encoding="utf-8")
+        text = rendered_unit_text(root / name)
         exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
         # 드롭인 EnvironmentFile은 docker 클라이언트에만 적용되므로 컨테이너엔 --env-file로 명시해야 한다
         assert pool_env in exec_line, name
@@ -363,7 +366,7 @@ def test_kis_using_containerized_units_forward_key_pool_env_and_cache() -> None:
         # 풀 키를 받고도 캐시를 못 보면 매 실행 재발급이 되어 1일1토큰 불변식이 깨진다
         assert mount in exec_line, name
 
-    retrain_text = (root / "kca-retrain.service").read_text(encoding="utf-8")
+    retrain_text = rendered_unit_text(root / "kca-retrain.service")
     assert pool_env not in retrain_text
     assert mount not in retrain_text
 
@@ -400,7 +403,7 @@ def test_containerized_units_preserve_data_and_artifacts_mounts() -> None:
         "kca-aftermarket-book.service",
     )
     for name in containerized:
-        text = (root / name).read_text(encoding="utf-8")
+        text = rendered_unit_text(root / name)
         assert "-v %h/k-closing-alpha/data:/app/data" in text, name
         assert "-v %h/k-closing-alpha/artifacts:/app/artifacts" in text, name
 
@@ -424,7 +427,7 @@ def test_containerized_units_bound_json_file_logs() -> None:
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     checked = 0
     for svc in sorted(root.glob("kca-*.service")):
-        lines = svc.read_text(encoding="utf-8").splitlines()
+        lines = rendered_unit_text(svc).splitlines()
         exec_lines = [line for line in lines if line.startswith("ExecStart=") and "docker run --rm" in line]
         for exec_line in exec_lines:
             assert "--log-opt max-size=10m" in exec_line, svc.name
@@ -453,11 +456,11 @@ def test_containerized_units_have_no_unmeasured_resource_caps() -> None:
         "kca-aftermarket-book.service",
     )
     for name in containerized:
-        text = (root / name).read_text(encoding="utf-8")
+        text = rendered_unit_text(root / name)
         assert "--memory=" not in text, name
         assert "--cpus=" not in text, name
 
-    retrain_text = (root / "kca-retrain.service").read_text(encoding="utf-8")
+    retrain_text = rendered_unit_text(root / "kca-retrain.service")
     assert "--memory=6g" in retrain_text
     assert "--cpus=1.8" in retrain_text
 
@@ -473,7 +476,7 @@ def test_host_bound_units_remain_bare_metal() -> None:
         "kca-alert@.service",
     )
     for name in host_bound:
-        text = (root / name).read_text(encoding="utf-8")
+        text = rendered_unit_text(root / name)
         assert "docker run" not in text, name
         assert "%h/.local/bin/" in text, name
 
@@ -482,7 +485,7 @@ def test_retrain_service_uses_shared_runtime_env_file_not_legacy_dotenv() -> Non
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    text = (root / "kca-retrain.service").read_text(encoding="utf-8")
+    text = rendered_unit_text(root / "kca-retrain.service")
 
     assert "--env-file %h/quant-secrets/k-closing-alpha.env" in text
     assert "%h/k-closing-alpha/.env" not in text
@@ -507,27 +510,27 @@ def test_after_ordering_preserved_across_containerization() -> None:
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
 
-    finalize_lines = (root / "kca-finalize-close.service").read_text(encoding="utf-8").splitlines()
+    finalize_lines = rendered_unit_text(root / "kca-finalize-close.service").splitlines()
     after_line = next(line for line in finalize_lines if line.startswith("After="))
     assert "kca-collect.service" in after_line
     assert "kca-predict.service" in after_line
     assert "ExecStopPost=/usr/bin/systemctl --user start --no-block kca-paper-entry.service" in finalize_lines
 
     audit_after = next(
-        line for line in (root / "kca-daily-audit.service").read_text(encoding="utf-8").splitlines()
+        line for line in rendered_unit_text(root / "kca-daily-audit.service").splitlines()
         if line.startswith("After=")
     )
     assert "kca-archive-intraday.service" in audit_after
 
     backup_after = next(
-        line for line in (root / "kca-backup.service").read_text(encoding="utf-8").splitlines()
+        line for line in rendered_unit_text(root / "kca-backup.service").splitlines()
         if line.startswith("After=")
     )
     assert "kca-archive-intraday.service" in backup_after
     assert "kca-daily-audit.service" in backup_after
     assert "kca-price-ingest.service" in backup_after
 
-    assert "After=kca-backup.service" in (root / "kca-backup-prune.service").read_text(encoding="utf-8")
+    assert "After=kca-backup.service" in rendered_unit_text(root / "kca-backup-prune.service")
 
 
 def test_backup_runs_after_evening_price_ingest() -> None:
@@ -644,7 +647,7 @@ def test_kis_token_warmup_timer_precedes_first_kis_job() -> None:
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     timer = (root / "kca-kis-token-warmup.timer").read_text(encoding="utf-8")
-    service = (root / "kca-kis-token-warmup.service").read_text(encoding="utf-8")
+    service = rendered_unit_text(root / "kca-kis-token-warmup.service")
 
     assert "OnCalendar=Mon..Fri 07:05:00 Asia/Seoul" in timer
     assert "Unit=kca-kis-token-warmup.service" in timer
@@ -660,7 +663,7 @@ def test_kis_token_warmup_forwards_shared_key_pool_env_into_container() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    service = (root / "kca-kis-token-warmup.service").read_text(encoding="utf-8")
+    service = rendered_unit_text(root / "kca-kis-token-warmup.service")
     exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
 
     # Then: 키풀 원본 자격증명(kis-data.env)은 systemd 드롭인이 아니라 docker run 자체에
@@ -685,7 +688,7 @@ def test_decision_window_services_pin_decision_data_role() -> None:
     }
 
     for svc in sorted(root.glob("kca-*.service")):
-        text = svc.read_text(encoding="utf-8")
+        text = rendered_unit_text(svc)
         assert ("Environment=KIS_DATA_ROLE=decision" in text) == (svc.name in decision), svc.name
 
 
@@ -820,7 +823,7 @@ def test_warmup_unit_retries_without_per_attempt_alerts() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    text = (root / "kca-kis-token-warmup.service").read_text(encoding="utf-8")
+    text = rendered_unit_text(root / "kca-kis-token-warmup.service")
     lines = text.splitlines()
 
     assert "Restart=on-failure" in lines
@@ -874,10 +877,10 @@ def test_containers_run_as_host_user_with_tmp_caches() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    services = [p for p in sorted(root.glob("kca-*.service")) if "docker run --rm" in p.read_text(encoding="utf-8")]
+    services = [p for p in sorted(root.glob("kca-*.service")) if "docker run --rm" in rendered_unit_text(p)]
     assert services
     for svc in services:
-        text = svc.read_text(encoding="utf-8")
+        text = rendered_unit_text(svc)
         exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
         assert "--user %U:%G" in exec_line, svc.name
         assert "-e HOME=/tmp" in exec_line, svc.name
@@ -907,7 +910,7 @@ def test_kis_cache_mount_follows_non_root_home() -> None:
         "kca-tape-sweep.service",
     )
     for name in needs_kis_cache:
-        text = (root / name).read_text(encoding="utf-8")
+        text = rendered_unit_text(root / name)
         assert "-v %h/.cache/kis:/app/.cache/kis" in text, name
         assert "-e KIS_TOKEN_CACHE_DIR=/app/.cache/kis" in text, name
     for svc in sorted(root.glob("kca-*.service")):
@@ -1019,7 +1022,7 @@ def test_containerized_units_have_unique_names_and_reaper() -> None:
     names: dict[str, str] = {}
     checked = 0
     for svc in sorted(root.glob("kca-*.service")):
-        lines = svc.read_text(encoding="utf-8").splitlines()
+        lines = rendered_unit_text(svc).splitlines()
         exec_lines = [line for line in lines if line.startswith("ExecStart=") and "docker run" in line]
         if not exec_lines:
             continue
@@ -1147,7 +1150,7 @@ def test_aftermarket_book_service_keeps_shared_container_contract() -> None:
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
-    text = (root / "kca-aftermarket-book.service").read_text(encoding="utf-8")
+    text = rendered_unit_text(root / "kca-aftermarket-book.service")
     exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
 
     # Then: 공유 이미지·env 파일·KIS 캐시·데이터/아티팩트 마운트, 리소스 상한 없음
@@ -1167,7 +1170,7 @@ def test_tape_sweep_unit_runs_after_evening_archive_outside_archive_slots() -> N
 
     base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
     root = base / "systemd"
-    service = (root / "kca-tape-sweep.service").read_text(encoding="utf-8")
+    service = rendered_unit_text(root / "kca-tape-sweep.service")
     timer = (root / "kca-tape-sweep.timer").read_text(encoding="utf-8")
     install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
 
@@ -1225,7 +1228,7 @@ def test_broker_units_mount_shared_admission_dir() -> None:
         "kca-tape-sweep.service",
     )
     for name in broker_docker_units:
-        text = (root / name).read_text(encoding="utf-8")
+        text = rendered_unit_text(root / name)
         exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart=") and "docker run" in line)
         assert "-v %h/.cache/kis:/app/.cache/kis" in exec_line, name
         assert "-e KIS_TOKEN_CACHE_DIR=/app/.cache/kis" in exec_line, name
@@ -1256,7 +1259,7 @@ def test_every_broker_unit_declares_its_admission_class() -> None:
         "kca-tape-sweep.service": "bulk",
     }
     for name, cls in expected.items():
-        text = (root / name).read_text(encoding="utf-8")
+        text = rendered_unit_text(root / name)
         match = re.search(r"BROKER_ADMISSION_CLASS=([A-Za-z]+)", text)
         assert match is not None, name
         assert match.group(1) == cls, name
@@ -1267,7 +1270,7 @@ def test_non_broker_units_stay_unmounted() -> None:
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     for name in ("kca-retrain.service", "kca-backup.service", "kca-backup-prune.service", "kca-core-snapshot.service", "kca-offsite-verify.service"):
-        text = (root / name).read_text(encoding="utf-8")
+        text = rendered_unit_text(root / name)
         assert "-v %h/.cache/kis:/app/.cache/kis" not in text, name
         assert "BROKER_ADMISSION_CLASS=" not in text, name
     assert "BROKER_ADMISSION_CLASS=" not in (root / "kca-alert@.service").read_text(encoding="utf-8")
@@ -1288,7 +1291,7 @@ def test_kiwoom_token_rotate_unit_moves_expiry_out_of_decision_window() -> None:
     base = pathlib.Path(__file__).resolve().parents[3] / "deploy"
     root = base / "systemd"
     timer = (root / "kca-kiwoom-token-rotate.timer").read_text(encoding="utf-8")
-    service = (root / "kca-kiwoom-token-rotate.service").read_text(encoding="utf-8")
+    service = rendered_unit_text(root / "kca-kiwoom-token-rotate.service")
     install_text = (base / "install_systemd.sh").read_text(encoding="utf-8")
 
     assert "OnCalendar=Mon..Fri 07:10:00 Asia/Seoul" in timer
@@ -1353,7 +1356,7 @@ def test_auction_path_unit_pair_declared() -> None:
 
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     timer = (root / "kca-auction-path.timer").read_text(encoding="utf-8")
-    service = (root / "kca-auction-path.service").read_text(encoding="utf-8")
+    service = rendered_unit_text(root / "kca-auction-path.service")
 
     assert "OnCalendar=Mon..Fri 15:45:00 Asia/Seoul" in timer.splitlines()
     assert "AccuracySec=1s" in timer.splitlines()
@@ -1363,7 +1366,7 @@ def test_auction_path_unit_pair_declared() -> None:
     assert "-e BROKER_ADMISSION_CLASS=bulk" in service
     assert "KIS_DATA_ROLE" not in service
     assert "-v %h/.cache/kis:/app/.cache/kis" in service
-    close_mounts = (root / "kca-auction-close.service").read_text(encoding="utf-8")
+    close_mounts = rendered_unit_text(root / "kca-auction-close.service")
     for mount in re.findall(r"-v \S+", close_mounts):
         if ".cache/kis" in mount or "/app/data" in mount or "/app/artifacts" in mount:
             assert mount in service
