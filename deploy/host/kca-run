@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# Single source of docker flags for kca units; argv parity pinned by tests/unit/deploy/test_run_wrapper.py.
+set -euo pipefail
+
+usage_error() {
+  printf '[SYS] stage=kca_run status=USAGE_ERROR reason=%s\n' "$1" >&2
+  exit 64
+}
+
+is_resource_flag() {
+  local value=$1
+  local rest=""
+  if [[ $value == --memory=* ]]; then
+    rest=${value#--memory=}
+    if [[ $rest == *[kmg] ]]; then
+      rest=${rest%?}
+    else
+      return 1
+    fi
+    if [[ $rest == "" ]]; then
+      return 1
+    fi
+    if [[ $rest == *[^0-9]* ]]; then
+      return 1
+    fi
+    return 0
+  fi
+  if [[ $value == --memory-swap=* ]]; then
+    rest=${value#--memory-swap=}
+    if [[ $rest == *[kmg] ]]; then
+      rest=${rest%?}
+    else
+      return 1
+    fi
+    if [[ $rest == "" ]]; then
+      return 1
+    fi
+    if [[ $rest == *[^0-9]* ]]; then
+      return 1
+    fi
+    return 0
+  fi
+  if [[ $value == --cpus=* ]]; then
+    rest=${value#--cpus=}
+    if [[ $rest == "" ]]; then
+      return 1
+    fi
+    if [[ $rest == *[^0-9.]* ]]; then
+      return 1
+    fi
+    if [[ $rest == .* ]]; then
+      return 1
+    fi
+    if [[ $rest == *. ]]; then
+      return 1
+    fi
+    if [[ $rest == *.*.* ]]; then
+      return 1
+    fi
+    return 0
+  fi
+  return 1
+}
+
+print_argv=0
+if [[ ${1-} == --print-argv ]]; then
+  print_argv=1
+  shift
+fi
+
+if [[ $# -lt 1 ]]; then
+  usage_error missing_job
+fi
+job=$1
+shift
+if [[ $job =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+  :
+else
+  usage_error bad_job
+fi
+
+kis_data=0
+seen_kis_data=0
+admission=""
+seen_admission=0
+role=""
+seen_role=0
+resources=()
+separator_found=0
+while [[ $# -gt 0 ]]; do
+  if [[ $1 == -- ]]; then
+    separator_found=1
+    shift
+    break
+  fi
+  flag=$1
+  shift
+  if [[ $flag == --kis-data ]]; then
+    if [[ $seen_kis_data == 1 ]]; then
+      usage_error duplicate_flag
+    fi
+    seen_kis_data=1
+    kis_data=1
+  elif [[ $flag == --admission ]]; then
+    if [[ $seen_admission == 1 ]]; then
+      usage_error duplicate_flag
+    fi
+    if [[ $# -lt 1 ]]; then
+      usage_error missing_value
+    fi
+    admission=$1
+    shift
+    seen_admission=1
+  elif [[ $flag == --role ]]; then
+    if [[ $seen_role == 1 ]]; then
+      usage_error duplicate_flag
+    fi
+    if [[ $# -lt 1 ]]; then
+      usage_error missing_value
+    fi
+    role=$1
+    shift
+    seen_role=1
+  elif [[ $flag == --resource ]]; then
+    if [[ $# -lt 1 ]]; then
+      usage_error missing_value
+    fi
+    resource_value=$1
+    shift
+    if is_resource_flag "$resource_value"; then
+      resources+=("$resource_value")
+    else
+      usage_error bad_resource
+    fi
+  else
+    usage_error unknown_flag
+  fi
+done
+if [[ $separator_found == 0 ]]; then
+  usage_error missing_separator
+fi
+if [[ $# -lt 1 ]]; then
+  usage_error empty_command
+fi
+
+if [[ $seen_admission == 1 ]]; then
+  if [[ $admission == critical ]]; then
+    :
+  elif [[ $admission == standard ]]; then
+    :
+  elif [[ $admission == bulk ]]; then
+    :
+  else
+    usage_error bad_admission
+  fi
+fi
+if [[ $seen_role == 1 ]]; then
+  if [[ $role == decision ]]; then
+    :
+  elif [[ $role == batch ]]; then
+    :
+  else
+    usage_error bad_role
+  fi
+fi
+if [[ $kis_data == 1 ]]; then
+  if [[ $seen_admission == 0 ]]; then
+    usage_error kis_data_without_admission
+  fi
+fi
+if [[ $seen_role == 1 ]]; then
+  if [[ $seen_kis_data == 0 ]]; then
+    usage_error role_without_kis_data
+  fi
+fi
+if [[ ${HOME-} == "" ]]; then
+  usage_error bad_home
+fi
+if [[ $HOME == /* ]]; then
+  :
+else
+  usage_error bad_home
+fi
+
+uid_text=$(id -u)
+gid_text=$(id -g)
+argv=(/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name "kca-${job}" --user "${uid_text}:${gid_text}" -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache)
+for resource_value in ${resources[@]+"${resources[@]}"}; do
+  argv+=("$resource_value")
+done
+argv+=(--env-file "${HOME}/quant-secrets/k-closing-alpha.env")
+if [[ $kis_data == 1 ]]; then
+  argv+=(--env-file "${HOME}/quant-secrets/kis-data.env")
+fi
+if [[ $seen_admission == 1 ]]; then
+  argv+=(-v "${HOME}/.cache/kis:/app/.cache/kis" -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e "BROKER_ADMISSION_CLASS=${admission}")
+fi
+argv+=(-v "${HOME}/k-closing-alpha/data:/app/data" -v "${HOME}/k-closing-alpha/artifacts:/app/artifacts")
+if [[ $seen_role == 1 ]]; then
+  argv+=(-e "KIS_DATA_ROLE=${role}")
+fi
+argv+=(ghcr.io/kthyeong/k-closing-alpha:latest)
+for token in "$@"; do
+  argv+=("$token")
+done
+if [[ $print_argv == 1 ]]; then
+  printf '%s\0' "${argv[@]}"
+  exit 0
+fi
+exec /usr/bin/docker "${argv[@]:1}"

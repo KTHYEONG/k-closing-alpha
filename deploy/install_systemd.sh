@@ -3,12 +3,18 @@
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/systemd" && pwd)"
+WRAPPER_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/host" && pwd)/kca-run"
+LIB_DIR="${HOME}/.local/lib/kca"
 DEST_DIR="${HOME}/.config/systemd/user"
 
 mkdir -p "${DEST_DIR}"
 mkdir -p "${HOME}/.cache/kis"
 chmod 700 "${HOME}/.cache/kis"
 touch "${HOME}/.cache/kis/.host-admission"
+install -d -m 700 "${LIB_DIR}"
+WRAPPER_TMP="$(mktemp "${LIB_DIR}/.kca-run.XXXXXX")"
+install -m 0755 "${WRAPPER_SRC}" "${WRAPPER_TMP}"
+mv -f "${WRAPPER_TMP}" "${LIB_DIR}/kca-run"
 cp "${SRC_DIR}"/kca-*.timer "${SRC_DIR}"/kca-*.service "${DEST_DIR}/"
 
 systemctl --user daemon-reload
