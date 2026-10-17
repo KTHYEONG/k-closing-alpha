@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from src import settings
+from src.api.auth_rejection import is_kis_data_auth_rejected
 from src.api.kis.key_pool import (
     kis_key_id,
     load_kis_env,
@@ -471,8 +472,7 @@ class KisApiClient:
                     msg_cd = data.get("msg_cd", "")
                     msg1 = data.get("msg1", "")
                     if (
-                        data.get("rt_cd") != "0"
-                        and (msg_cd in ("EGW00121", "EGW00123") or "token" in msg1.lower() or "토큰" in msg1)
+                        is_kis_data_auth_rejected(data)
                         and session
                         and attempt < 2
                     ):

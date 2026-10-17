@@ -223,6 +223,14 @@ def test_auth_rejected_verdict() -> None:
     assert classify_order_response(500, {"rt_cd": "1", "msg_cd": "EGW00123"}) is SubmitVerdict.AUTH_REJECTED
 
 
+def test_classify_order_auth_codes_from_registry() -> None:
+    from src.api.auth_rejection import AUTH_REJECTION_CODES
+
+    for code in AUTH_REJECTION_CODES["kis"]:
+        assert classify_order_response(200, {"rt_cd": "1", "msg_cd": code}) is SubmitVerdict.AUTH_REJECTED
+    assert classify_order_response(200, {"rt_cd": "1", "msg_cd": "EGW00201"}) is SubmitVerdict.THROTTLED
+
+
 def test_classifier_never_raises() -> None:
     class _Evil(dict):  # type: ignore[type-arg]
         def get(self, *args: object, **kwargs: object) -> object:
