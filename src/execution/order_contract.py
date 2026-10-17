@@ -12,6 +12,7 @@ from enum import StrEnum
 
 import numpy as np
 
+from src.api.auth_rejection import AUTH_REJECTION_CODES
 from src.execution.cost_model import krx_tick_size
 from src.execution.paper_broker import side_fee_krw
 
@@ -35,7 +36,6 @@ __all__ = [
 ]
 
 _SYMBOL_RE = re.compile(r"^\d{6}$")
-_AUTH_REJECTED_CODES = frozenset({"EGW00121", "EGW00123"})
 
 
 class OrderSide(StrEnum):
@@ -199,7 +199,7 @@ def classify_order_response(http_status: int, body: object) -> SubmitVerdict:
         msg_cd = str(body.get("msg_cd", ""))
         if msg_cd == "EGW00201":
             return SubmitVerdict.THROTTLED
-        if msg_cd in _AUTH_REJECTED_CODES:
+        if msg_cd in AUTH_REJECTION_CODES["kis"]:
             return SubmitVerdict.AUTH_REJECTED
         if msg_cd == "EGW02006":
             return SubmitVerdict.REJECTED

@@ -10,15 +10,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from src.api._common import parse_expires_in
+from src.api._token_client import SharedTokenClientMixin
 from src.api._transport import RetryPolicy, send_with_auth_retry
-from src.api.host_broker_contract import DEFAULT_RATES
+from src.api.auth_rejection import AUTH_REJECTION_CODES
+from src.api.host_broker_contract import DEFAULT_RATES, TokenIssueThrottled
 from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
-from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
+from src.api.shared_token import IssuedToken
 from src.config import settings
 
 if TYPE_CHECKING:
@@ -30,9 +31,7 @@ logger = logging.getLogger(__name__)
 
 _OAUTH_PATH = "/oauth2/token"
 
-TOSS_INVALID_TOKEN_CODES: frozenset[str] = frozenset({"invalid-token"})
-
-_TOSS_TOKEN_EXPIRY_MARGIN_SECONDS: float = 300.0
+TOSS_INVALID_TOKEN_CODES: frozenset[str] = AUTH_REJECTION_CODES["toss"]
 
 TOSS_RETRY_AFTER_MAX_SECONDS: float = 5.0
 """Ceiling on a server-sent Retry-After wait; collect calls Toss inside the 15:20 decision window,
@@ -43,7 +42,12 @@ TOSS_RATE_LIMIT_GROUPS: Mapping[str, float] = MappingProxyType(
 )
 
 
-class TossApiClient:
+class TossApiClient(SharedTokenClientMixin):
+    _TOKEN_VENDOR = "toss"  # noqa: S105 - vendor id, not a secret
+    _TOKEN_EXPIRY_MARGIN_SECONDS = 300.0
+    _TOKEN_ISSUE_THROTTLE_POLICY = "raise"  # noqa: S105 - policy label, not a secret
+    _TOKEN_THROTTLED_ERROR = TokenIssueThrottled
+
     def __init__(self, app_key: str | None = None, app_secret: str | None = None, base_url: str | None = None) -> None:
         """Create a Toss OpenAPI client.
 
@@ -64,16 +68,6 @@ class TossApiClient:
             raise ValueError(f"unknown Toss rate limit group: {group}")
         return vendor_limiter("toss", self.app_key or "", group)
 
-    def _token_store(self) -> SharedTokenStore:
-        return SharedTokenStore(
-            shared_token_path("toss", self.app_key or ""),
-            vendor="toss",
-            lock_timeout_seconds=float(settings.BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS),
-            expiry_margin_seconds=_TOSS_TOKEN_EXPIRY_MARGIN_SECONDS,
-            issue_throttle_policy="raise",
-            clock=lambda: datetime.now(UTC),
-        )
-
     async def _issue_token(self, session: aiohttp.ClientSession) -> IssuedToken:
         payload = {
             "grant_type": "client_credentials",
@@ -88,20 +82,6 @@ class TossApiClient:
         expires_in = parse_expires_in(body.get("expires_in"))
         return IssuedToken(access_token=token, expires_in_seconds=expires_in)
 
-    async def ensure_token(self, session: aiohttp.ClientSession) -> str:
-        record = await self._token_store().get_or_issue(lambda: self._issue_token(session))
-        self.token = record.access_token
-        return self.token
-
-    @staticmethod
-    def _is_invalid_token(status: int, data: dict[str, Any]) -> bool:
-        if status == 401:
-            return True
-        error = data.get("error")
-        if isinstance(error, dict):
-            return str(error.get("code", "")) in TOSS_INVALID_TOKEN_CODES
-        return False
-
     @staticmethod
     def _retry_after_seconds(resp_headers: dict[str, str]) -> float | None:
         for key, value in resp_headers.items():
@@ -114,20 +94,6 @@ class TossApiClient:
                     return min(parsed, TOSS_RETRY_AFTER_MAX_SECONDS)
                 return None
         return None
-
-    async def _refresh_rejected_token(self, session: aiohttp.ClientSession, rejected_token: str) -> None:
-        """Replace the rejected token through the host-shared store (compare-and-swap on the sent token).
-
-        Toss invalidates the previous token the moment a new one is issued. A redundant issuance would therefore
-        revoke the token a peer just obtained, so the token that was actually sent decides whether to adopt or
-        issue.
-
-        Raises:
-            TokenStoreLockTimeout: Store lock not acquired within the bound.
-            RuntimeError: Issuance returned no token.
-        """
-        record = await self._token_store().replace_rejected(rejected_token, lambda: self._issue_token(session))
-        self.token = record.access_token
 
     async def _get(
         self,
@@ -183,7 +149,7 @@ class TossApiClient:
             open_request,
             acquire=limiter.acquire,
             current_token=lambda: self.token or "",
-            is_auth_rejected=lambda r: self._is_invalid_token(r.status, r.body),
+            is_auth_rejected=self._auth_rejected,
             refresh=lambda sent: self._refresh_rejected_token(session, sent),
             policy=policy,
             log_stage="toss_get",

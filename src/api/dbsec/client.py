@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from src.api._common import (
@@ -15,10 +14,12 @@ from src.api._common import (
     resolve_chart_budget,
     validate_target_ymd,
 )
+from src.api._token_client import SharedTokenClientMixin
 from src.api._transport import RetryPolicy, send_with_auth_retry
+from src.api.auth_rejection import AUTH_REJECTION_CODES, is_auth_rejected
 from src.api.host_broker_contract import TokenIssueThrottled
 from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
-from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
+from src.api.shared_token import IssuedToken
 from src.config import settings
 
 if TYPE_CHECKING:
@@ -31,15 +32,13 @@ logger = logging.getLogger(__name__)
 _CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
 _HHMMSS_RE = re.compile(r"^\d{6}$")
 
-DB_AUTH_REJECTED_RSP_CODES: frozenset[str] = frozenset({"IGW00121", "IGW00123"})
+DB_AUTH_REJECTED_RSP_CODES: frozenset[str] = AUTH_REJECTION_CODES["dbsec"]
 DB_THROTTLE_RSP_CODE: str = "IGW00201"
 DB_AUCTION_PATH_HOUR_CLASS: str = "8"
 
 _CHARTMIN_PATH = "/api/v1/quote/kr-chart/min"
 _AUCTION_PATH = "/api/v1/quote/kr-stock/inquiry/daily-price"
 _OAUTH_PATH = "/oauth2/token"
-
-_DB_TOKEN_EXPIRY_MARGIN_SECONDS: float = 600.0
 
 
 class DbsecTokenThrottled(TokenIssueThrottled):  # noqa: N818 - spec-mandated protocol name
@@ -59,7 +58,13 @@ def _row_key(row: dict[str, Any]) -> tuple[str, ...]:
     return tuple(f"{k}={row.get(k, '')}" for k in ("Date", "Hour", "Prpr", "CntgVol", "ShnuCnqn", "SelnCnqn"))
 
 
-class DbsecApiClient:
+class DbsecApiClient(SharedTokenClientMixin):
+    _TOKEN_VENDOR = "dbsec"  # noqa: S105 - vendor id, not a secret
+    _TOKEN_EXPIRY_MARGIN_SECONDS = 600.0
+    _TOKEN_ISSUE_THROTTLE_POLICY = "raise"  # noqa: S105 - policy label, not a secret
+    _TOKEN_THROTTLED_ERROR = DbsecTokenThrottled
+    _TOKEN_THROTTLED_MESSAGE = "DB token issuance throttled (1/min)"  # noqa: S105 - diagnostic message, not a secret
+
     def __init__(self, app_key: str | None = None, app_secret: str | None = None) -> None:
         """Bind credentials, origin and pacing from explicit arguments or the live Settings instance."""
         self.app_key = app_key or settings.DB_APP_KEY
@@ -68,16 +73,6 @@ class DbsecApiClient:
         self.token: str | None = None
         self._rate_limit_max_retries: int = int(settings.DB_RATE_LIMIT_MAX_RETRIES)
         self._rate_limit_backoff: float = float(settings.DB_RATE_LIMIT_BACKOFF_SECONDS)
-
-    def _token_store(self) -> SharedTokenStore:
-        return SharedTokenStore(
-            shared_token_path("dbsec", self.app_key or ""),
-            vendor="dbsec",
-            lock_timeout_seconds=float(settings.BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS),
-            expiry_margin_seconds=_DB_TOKEN_EXPIRY_MARGIN_SECONDS,
-            issue_throttle_policy="raise",
-            clock=lambda: datetime.now(UTC),
-        )
 
     def _scope_limiter(self, scope: str) -> HostPacedRateLimiter:
         return vendor_limiter("dbsec", self.app_key or "", scope)
@@ -109,33 +104,9 @@ class DbsecApiClient:
         expires_in = parse_expires_in(body.get("expires_in") if isinstance(body, dict) else None)
         return IssuedToken(access_token=token, expires_in_seconds=expires_in)
 
-    async def ensure_token(self, session: aiohttp.ClientSession) -> str:
-        """Return a usable host-shared token, issuing at most once host-wide when none is usable."""
-        try:
-            record = await self._token_store().get_or_issue(lambda: self._issue_token(session))
-        except TokenIssueThrottled as exc:
-            if isinstance(exc, DbsecTokenThrottled):
-                raise
-            raise DbsecTokenThrottled("DB token issuance throttled (1/min)") from exc
-        self.token = record.access_token
-        return self.token
-
-    async def _refresh_rejected_token(self, session: aiohttp.ClientSession, rejected_token: str) -> None:
-        try:
-            record = await self._token_store().replace_rejected(rejected_token, lambda: self._issue_token(session))
-        except TokenIssueThrottled as exc:
-            if isinstance(exc, DbsecTokenThrottled):
-                raise
-            raise DbsecTokenThrottled("DB token issuance throttled (1/min)") from exc
-        self.token = record.access_token
-
     @staticmethod
     def _is_auth_rejected(status: int, data: dict[str, Any]) -> bool:
-        if status == 401:
-            return True
-        if not isinstance(data, dict):
-            return False
-        return str(data.get("rsp_cd", "")) in DB_AUTH_REJECTED_RSP_CODES
+        return is_auth_rejected("dbsec", status, data)
 
     async def _post(
         self,
@@ -181,7 +152,7 @@ class DbsecApiClient:
             open_request,
             acquire=_acquire,
             current_token=lambda: self.token or "",
-            is_auth_rejected=lambda r: self._is_auth_rejected(r.status, r.body if isinstance(r.body, dict) else {}),
+            is_auth_rejected=self._auth_rejected,
             refresh=lambda sent: self._refresh_rejected_token(session, sent),
             policy=policy,
             log_stage="dbsec_tr",

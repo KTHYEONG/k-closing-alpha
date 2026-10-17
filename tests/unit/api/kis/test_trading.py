@@ -479,6 +479,27 @@ def test_auth_rejection_refreshes_token_then_returns(tmp_path) -> None:
     assert len(session.requests_to("/uapi/domestic-stock/v1/trading/order-cash")) == 1
 
 
+def test_order_send_never_replays(tmp_path, monkeypatch) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path, bearer="OLD")
+    seen: list[str | None] = []
+    original = client.ensure_token
+
+    async def _spy(session, *, rejected_token=None):
+        seen.append(rejected_token)
+        await original(session, rejected_token=rejected_token)
+
+    monkeypatch.setattr(client, "ensure_token", _spy)
+    session = scripted_session(
+        [FakeBrokerResponse(body={"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "expired"}, status=200)],
+        token_bodies=[{"access_token": "NEW", "expires_in": 86400}],
+        token_path="/oauth2/tokenP",
+    )
+    result = asyncio.run(client.submit_order(session, _limit_buy()))  # type: ignore[arg-type]
+    assert result.verdict is SubmitVerdict.AUTH_REJECTED
+    assert len(session.requests_to("/uapi/domestic-stock/v1/trading/order-cash")) == 1
+    assert seen == ["OLD"]
+
+
 def test_auth_rejection_with_failed_refresh_still_returns(tmp_path, caplog) -> None:
     client, api, _ = _trading_client(_mock_binding(), tmp_path, bearer="OLD")
     session = scripted_session(

@@ -945,3 +945,61 @@ def test_issue_token_throttle_error_code_without_cache_fails(tmp_path) -> None:
         asyncio.run(
             client._issue_token(_token_post_session({"error_code": "EGW00133", "error_description": "1/min"}))  # type: ignore[arg-type]
         )
+
+
+def test_kis_data_refresh_budget_unchanged(tmp_path, monkeypatch) -> None:
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "t.json"))
+    client.token = "OLD"
+
+    class _Resp:
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+            self.status = 200
+
+        async def json(self) -> dict:
+            return self._payload
+
+    class _Ctx:
+        def __init__(self, resp: _Resp) -> None:
+            self._resp = resp
+
+        async def __aenter__(self) -> _Resp:
+            return self._resp
+
+        async def __aexit__(self, *_a: object) -> bool:
+            return False
+
+    rejection = {"rt_cd": "1", "msg_cd": "", "msg1": "token expired"}
+    calls = {"get": 0, "post": 0}
+
+    class _Session:
+        def get(self, _url: str, **_kw: object) -> _Ctx:
+            calls["get"] += 1
+            if calls["get"] <= 3:
+                return _Ctx(_Resp(dict(rejection)))
+            return _Ctx(_Resp({"rt_cd": "0", "msg_cd": "MCA00000", "output": []}))
+
+        def post(self, _url: str, **_kw: object) -> _Ctx:
+            calls["post"] += 1
+            return _Ctx(_Resp({"access_token": f"NEW{calls['post']}", "expires_in": 86400}))
+
+    class _Limiter:
+        async def acquire(self) -> None:
+            return None
+
+    monkeypatch.setattr(client, "rate_limiter", _Limiter())
+    monkeypatch.setattr("src.api.kis.client.asyncio.sleep", _no_sleep)
+
+    async def _run() -> dict:
+        session = _Session()
+        return await client._handle_request(
+            session.get, "https://x", headers={"tr_id": "T", "authorization": "Bearer OLD"}
+        )
+
+    out = asyncio.run(_run())
+    assert out == rejection
+    assert calls["get"] == 3
+    assert calls["post"] == 2
+    assert client.token == "NEW2"

@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from src.api._transport import RetryPolicy, TransportResponse, send_with_auth_retry
+from src.api.auth_rejection import is_auth_rejected
 from src.api.kis.client import KIS_REST_TPS_PER_APP_KEY, KisApiClient
 from src.api.kis.key_pool import token_cache_path
 from src.api.kis.rate_limit import HostPacedRateLimiter
@@ -58,7 +59,6 @@ _ALLOWED_SUFFIXES: frozenset[str] = frozenset(
         TR_SUFFIX_BUYING_POWER,
     }
 )
-_AUTH_REJECTED_CODES: frozenset[str] = frozenset({"EGW00121", "EGW00123"})
 _ACCOUNT_RE = re.compile(r"^\d{8}$")
 _PRODUCT_RE = re.compile(r"^\d{2}$")
 
@@ -573,8 +573,7 @@ class KisTradingClient:
             return token if isinstance(token, str) else ""
 
         def _is_auth_rejected(response: TransportResponse) -> bool:
-            body = response.body
-            return isinstance(body, dict) and str(body.get("msg_cd", "")) in _AUTH_REJECTED_CODES
+            return is_auth_rejected("kis", response.status, response.body)
 
         async def _refresh(sent: str) -> None:
             await self.ensure_token(session, rejected_token=sent)

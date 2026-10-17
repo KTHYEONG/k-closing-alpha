@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from src.api._common import deadline_remaining, now_seoul, parse_expires_in, resolve_chart_budget, validate_target_ymd
+from src.api._token_client import SharedTokenClientMixin
 from src.api._transport import RetryPolicy, send_with_auth_retry
+from src.api.auth_rejection import AUTH_REJECTION_CODES
+from src.api.host_broker_contract import TokenIssueThrottled
 from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
-from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
+from src.api.shared_token import IssuedToken
 from src.config import settings
 
 if TYPE_CHECKING:
@@ -24,12 +26,15 @@ logger = logging.getLogger(__name__)
 _YMD_RE = re.compile(r"^\d{8}$")
 _HHMMSS_RE = re.compile(r"^\d{6}$")
 
-LS_AUTH_REJECTED_RSP_CODES: frozenset[str] = frozenset({"IGW00101", "IGW00102", "IGW00123"})
-
-_LS_TOKEN_EXPIRY_MARGIN_SECONDS: float = 300.0
+LS_AUTH_REJECTED_RSP_CODES: frozenset[str] = AUTH_REJECTION_CODES["ls"]
 
 
-class LsApiClient:
+class LsApiClient(SharedTokenClientMixin):
+    _TOKEN_VENDOR = "ls"  # noqa: S105 - vendor id, not a secret
+    _TOKEN_EXPIRY_MARGIN_SECONDS = 300.0
+    _TOKEN_ISSUE_THROTTLE_POLICY = "raise"  # noqa: S105 - policy label, not a secret
+    _TOKEN_THROTTLED_ERROR = TokenIssueThrottled
+
     def __init__(self, app_key: str | None = None, app_secret: str | None = None) -> None:
         """Bind credentials, origin and pacing from explicit arguments or the live Settings instance.
 
@@ -52,16 +57,6 @@ class LsApiClient:
     def _limiter(self) -> HostPacedRateLimiter:
         return vendor_limiter("ls", self.app_key or "")
 
-    def _token_store(self) -> SharedTokenStore:
-        return SharedTokenStore(
-            shared_token_path("ls", self.app_key or ""),
-            vendor="ls",
-            lock_timeout_seconds=float(settings.BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS),
-            expiry_margin_seconds=_LS_TOKEN_EXPIRY_MARGIN_SECONDS,
-            issue_throttle_policy="raise",
-            clock=lambda: datetime.now(UTC),
-        )
-
     async def _issue_token(self, session: aiohttp.ClientSession) -> IssuedToken:
         payload = {
             "grant_type": "client_credentials",
@@ -76,31 +71,6 @@ class LsApiClient:
             raise RuntimeError(f"LS token issuance failed: {body}")
         expires_in = parse_expires_in(body.get("expires_in"))
         return IssuedToken(access_token=token, expires_in_seconds=expires_in)
-
-    async def ensure_token(self, session: aiohttp.ClientSession) -> str:
-        record = await self._token_store().get_or_issue(lambda: self._issue_token(session))
-        self.token = record.access_token
-        return self.token
-
-    @staticmethod
-    def _is_auth_rejected(status: int, data: dict[str, Any]) -> bool:
-        if status == 401:
-            return True
-        return str(data.get("rsp_cd", "")) in LS_AUTH_REJECTED_RSP_CODES
-
-    async def _refresh_rejected_token(self, session: aiohttp.ClientSession, rejected_token: str) -> None:
-        """Replace the rejected token through the host-shared store (compare-and-swap on the sent token).
-
-        ``SharedTokenStore.replace_rejected`` returns a peer-rotated usable token unchanged, and only issues when
-        the stored token is the one that was rejected. Passing the token that was sent, rather than ``self.token``
-        at handling time, prevents a second issuance when another task already rotated it.
-
-        Raises:
-            TokenStoreLockTimeout: Store lock not acquired within ``BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS``.
-            RuntimeError: Issuance returned no token.
-        """
-        record = await self._token_store().replace_rejected(rejected_token, lambda: self._issue_token(session))
-        self.token = record.access_token
 
     async def _post_tr(
         self,
@@ -166,7 +136,7 @@ class LsApiClient:
             open_request,
             acquire=lambda: self._limiter().acquire(),
             current_token=lambda: self.token or "",
-            is_auth_rejected=lambda r: self._is_auth_rejected(r.status, r.body),
+            is_auth_rejected=self._auth_rejected,
             refresh=lambda sent: self._refresh_rejected_token(session, sent),
             policy=policy,
             log_stage="ls_tr",
