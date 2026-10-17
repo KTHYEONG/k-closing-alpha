@@ -6,7 +6,8 @@ from typing import Any
 
 import pytest
 
-from src.api.dbsec.client import DbsecApiClient, DbsecTokenThrottled, _token_issue_state_path
+from src.api.dbsec.client import DbsecApiClient, DbsecTokenThrottled
+from src.api.host_broker_contract import issue_guard_path
 from src.data.capture_contracts import ChartBudget
 from tests.broker_fakes import FakeBrokerResponse, scripted_session
 
@@ -57,7 +58,7 @@ def _paging_client(pages: list[tuple[dict, dict]]) -> tuple[DbsecApiClient, dict
 def test_token_issue_throttle_raises_without_vendor_call(tmp_path, monkeypatch) -> None:
     _seed_admission(tmp_path, monkeypatch)
     client = DbsecApiClient(app_key="k", app_secret="s")
-    path = _token_issue_state_path("k")
+    path = issue_guard_path(tmp_path, "dbsec", "k")
     path.write_text(repr(time.time() - 10.0))
 
     posts = {"n": 0}
@@ -70,6 +71,33 @@ def test_token_issue_throttle_raises_without_vendor_call(tmp_path, monkeypatch) 
     with pytest.raises(DbsecTokenThrottled):
         asyncio.run(client.ensure_token(_Session()))  # type: ignore[arg-type]
     assert posts["n"] == 0
+
+
+def test_token_issue_throttle_on_refresh_maps_to_subclass(tmp_path, monkeypatch) -> None:
+    _seed_admission(tmp_path, monkeypatch)
+    client = DbsecApiClient(app_key="k", app_secret="s")
+    path = issue_guard_path(tmp_path, "dbsec", "k")
+    path.write_text(repr(time.time() - 10.0))
+
+    class _Session:
+        def post(self, *a: Any, **k: Any) -> Any:
+            raise AssertionError("vendor must not be contacted")
+
+    with pytest.raises(DbsecTokenThrottled):
+        asyncio.run(client._refresh_rejected_token(_Session(), "stale"))  # type: ignore[arg-type]
+
+
+def test_refresh_vendor_throttle_reraises_subclass(tmp_path, monkeypatch) -> None:
+    _seed_admission(tmp_path, monkeypatch)
+    client = DbsecApiClient(app_key="k", app_secret="s")
+    seed = scripted_session([], token_bodies=[{"access_token": "tok-1", "expires_in": 86400}])
+    assert asyncio.run(client.ensure_token(seed)) == "tok-1"
+    from src.api.host_broker_contract import issue_guard_path as _guard
+
+    _guard(tmp_path, "dbsec", "k").unlink(missing_ok=True)
+    throttled = scripted_session([], token_bodies=[{"error_code": "IGW00201"}])
+    with pytest.raises(DbsecTokenThrottled):
+        asyncio.run(client._refresh_rejected_token(throttled, "tok-1"))  # type: ignore[arg-type]
 
 
 def test_token_issue_vendor_throttle_maps_to_token_throttled(tmp_path, monkeypatch) -> None:
@@ -144,7 +172,7 @@ def test_every_send_takes_scope_and_app_admission(tmp_path, monkeypatch) -> None
     import src.api.dbsec.client as mod
 
     counts = {"chart": 0, "quote": 0, "app": 0}
-    real = mod.get_host_rate_limiter
+    real = mod.vendor_limiter
 
     class _Rec:
         def __init__(self, name: str) -> None:
@@ -153,15 +181,14 @@ def test_every_send_takes_scope_and_app_admission(tmp_path, monkeypatch) -> None
         async def acquire(self) -> None:
             counts[self._name] += 1
 
-    def _fake(path: Any, rate: float, *a: Any, **k: Any) -> Any:
-        name = str(path)
-        if name.endswith("_chart.state"):
+    def _fake(vendor: str, credential: str, scope: Any = None, *a: Any, **k: Any) -> Any:
+        if scope == "chart":
             return _Rec("chart")
-        if name.endswith("_quote.state"):
+        if scope == "quote":
             return _Rec("quote")
         return _Rec("app")
 
-    monkeypatch.setattr(mod, "get_host_rate_limiter", _fake)
+    monkeypatch.setattr(mod, "vendor_limiter", _fake)
     client = _client()
     pages = [
         _chart_page([{"Date": _YMD, "Hour": "150000"}], "Y", "k1"),
@@ -183,7 +210,7 @@ def test_every_send_takes_scope_and_app_admission(tmp_path, monkeypatch) -> None
     assert counts["chart"] == 2
     assert counts["app"] == 2
     assert counts["quote"] == 0
-    monkeypatch.setattr(mod, "get_host_rate_limiter", real)
+    monkeypatch.setattr(mod, "vendor_limiter", real)
 
 
 def test_minute_chart_pages_until_target_date_crossed() -> None:
@@ -267,21 +294,14 @@ def test_client_rejects_malformed_code_before_send() -> None:
 
 
 def test_token_pacing_helpers_edge_cases(tmp_path, monkeypatch) -> None:
-    import os as _os
-
-    from src.api.dbsec.client import _mark_attempt, _read_last_attempt, _token_issue_state_path
-
     _seed_admission(tmp_path, monkeypatch)
-    path = _token_issue_state_path("k")
+    path = issue_guard_path(tmp_path, "dbsec", "k")
     path.write_text("not-a-float")
-    assert _read_last_attempt(path) is None
+    client = DbsecApiClient(app_key="k", app_secret="s")
+    session = scripted_session([], token_bodies=[{"access_token": "good", "expires_in": 86400}])
+    assert asyncio.run(client.ensure_token(session)) == "good"
     path.write_text("")
-    assert _read_last_attempt(path) is None
-    monkeypatch.setattr(_os, "open", lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
-    assert _read_last_attempt(path) is None
-    monkeypatch.undo()
-    _mark_attempt(path, 123.0)
-    assert _read_last_attempt(path) == 123.0
+    assert asyncio.run(client.ensure_token(session)) == "good"
 
 
 def test_rows_of_dict_and_missing_out() -> None:

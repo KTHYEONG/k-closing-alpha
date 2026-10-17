@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from src.api._common import SEOUL_TZ, deadline_remaining, now_seoul, resolve_chart_budget, validate_target_ymd
 from src.api._transport import RetryPolicy, send_with_auth_retry
-from src.api.kis.rate_limit import HostPacedRateLimiter, get_host_rate_limiter, host_admission_state_path
+from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
 from src.config import settings
 from src.data.capture_contracts import RawCaptureError
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # 서버 실측 확인 (scratch/probe_kiwoom_rate_limit_concurrency.json): 초과 시 HTTP 429 +
 # 응답 바디에 "유량=5, API ID=<api_id>" 명시. api-id(TR)별로 독립된 버킷이 부과된다.
-_KIWOOM_TR_RATE_PER_SEC = 5.0
+# 버킷 레이트의 단일 진실 공급원은 host_broker_contract.DEFAULT_RATES[("kiwoom", "*")]이다.
 
 # 키움 API 앞단 WAF는 aiohttp 기본 User-Agent("Python/x.y aiohttp/x.y")를 자동화 도구로
 # 탐지해 요청을 차단한다(HTML "Request Blocked" 400). IP 등록 여부와 무관하게 UA만으로
@@ -87,7 +87,7 @@ def _parse_tape_key(next_key: str, base_code: str) -> tuple[str, int] | None:
     prefix = f"A{base_code}"
     if not key.startswith(prefix):
         return None
-    rest = key[len(prefix):]
+    rest = key[len(prefix) :]
     if len(rest) < 9 or not rest[:8].isdigit() or not rest[8:].isdigit():
         return None
     ymd = rest[:8]
@@ -110,7 +110,7 @@ def _parse_tick_remaining(next_key: str, base_code: str, ymd: str) -> int | None
     """
     prefix = f"A{base_code}{ymd}"
     key = str(next_key or "")
-    tail = key[len(prefix):] if key.startswith(prefix) else ""
+    tail = key[len(prefix) :] if key.startswith(prefix) else ""
     return int(tail) if tail.isdigit() else None
 
 
@@ -161,7 +161,7 @@ class KiwoomApiClient:
         self._rate_limit_backoff: float = float(settings.KIWOOM_RATE_LIMIT_BACKOFF_SECONDS)
 
     def _limiter_for(self, api_id: str) -> HostPacedRateLimiter:
-        return get_host_rate_limiter(host_admission_state_path("kiwoom", self.app_key or "", api_id), _KIWOOM_TR_RATE_PER_SEC)
+        return vendor_limiter("kiwoom", self.app_key or "", api_id)
 
     def reset_token(self) -> None:
         """Drop the cached token so the next request fetches one; the vendor reuses a live token and expires it ~24h after issuance."""
@@ -303,7 +303,16 @@ class KiwoomApiClient:
             max_attempts=attempts,
             rate_limit_wait=lambda attempt, response: backoff if response.status == 429 else None,
         )
-        response = await send_with_auth_retry(open_request, acquire=limiter.acquire, current_token=lambda: self.token or "", is_auth_rejected=lambda r: self._is_auth_expired(r.body), refresh=lambda sent: self._refresh_rejected_token(session, sent), policy=policy, log_stage="kiwoom_tr", log_context=f"api_id={api_id}")
+        response = await send_with_auth_retry(
+            open_request,
+            acquire=limiter.acquire,
+            current_token=lambda: self.token or "",
+            is_auth_rejected=lambda r: self._is_auth_expired(r.body),
+            refresh=lambda sent: self._refresh_rejected_token(session, sent),
+            policy=policy,
+            log_stage="kiwoom_tr",
+            log_context=f"api_id={api_id}",
+        )
         return response.body, response.headers
 
     async def get_fluctuation_ranking(
@@ -339,7 +348,9 @@ class KiwoomApiClient:
             for page_index in range(max(1, int(max_pages))):
                 started = now_seoul()
                 data, resp_headers = await self._post_tr(
-                    session, "ka10027", "/api/dostk/rkinfo",
+                    session,
+                    "ka10027",
+                    "/api/dostk/rkinfo",
                     {
                         "mrkt_tp": str(market_type),
                         "stex_tp": str(stex_tp),
@@ -351,7 +362,8 @@ class KiwoomApiClient:
                         "pric_cnd": "0",
                         "trde_prica_cnd": "0",
                     },
-                    cont_yn=cont_yn, next_key=next_key,
+                    cont_yn=cont_yn,
+                    next_key=next_key,
                 )
                 received = now_seoul()
                 header_cont = str(resp_headers.get("cont-yn", "N") or "N")
@@ -386,8 +398,18 @@ class KiwoomApiClient:
                 if page_rates and min(page_rates) < float(rate_min_pct):
                     break
             else:
-                logger.warning("[DATA] stage=universe_scan vendor=kiwoom status=TRUNCATED max_pages=%d n_rows=%d", int(max_pages), len(collected))
-                return {"rt_cd": "1", "msg1": f"ranking truncated at max_pages={int(max_pages)}", "output": collected, "vendor": "kiwoom", "truncated": True}
+                logger.warning(
+                    "[DATA] stage=universe_scan vendor=kiwoom status=TRUNCATED max_pages=%d n_rows=%d",
+                    int(max_pages),
+                    len(collected),
+                )
+                return {
+                    "rt_cd": "1",
+                    "msg1": f"ranking truncated at max_pages={int(max_pages)}",
+                    "output": collected,
+                    "vendor": "kiwoom",
+                    "truncated": True,
+                }
         except Exception as e:
             if in_observer:
                 if isinstance(e, RawCaptureError):
@@ -482,9 +504,12 @@ class KiwoomApiClient:
                     break
                 started = now_seoul()
                 call = self._post_tr(
-                    session, "ka10079", "/api/dostk/chart",
+                    session,
+                    "ka10079",
+                    "/api/dostk/chart",
                     {"stk_cd": request_code, "tic_scope": "1", "upd_stkpc_tp": "1", "base_dt": ymd},
-                    cont_yn=cont_yn, next_key=next_key,
+                    cont_yn=cont_yn,
+                    next_key=next_key,
                 )
                 if deadline_left is None:
                     data, resp_headers = await call
@@ -567,15 +592,58 @@ class KiwoomApiClient:
             if in_observer:
                 raise
             logger.warning("Kiwoom tick chart failed code=%s: %s", code, e)
-            return {"rt_cd": "1", "msg1": str(e), "output2": [], "vendor": "kiwoom", "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": pages_fetched, "continuation": metadata, "cursor": None, "vendor_total_ticks": vendor_total, "rows_received": rows_received, "complete_by_total": False}
+            return {
+                "rt_cd": "1",
+                "msg1": str(e),
+                "output2": [],
+                "vendor": "kiwoom",
+                "truncated": True,
+                "termination_reason": "vendor_failure",
+                "pages_fetched": pages_fetched,
+                "continuation": metadata,
+                "cursor": None,
+                "vendor_total_ticks": vendor_total,
+                "rows_received": rows_received,
+                "complete_by_total": False,
+            }
         if termination == "vendor_failure":
-            return {"rt_cd": "1", "msg1": failure_msg, "output2": [], "vendor": "kiwoom", "truncated": True, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "cursor": None, "vendor_total_ticks": vendor_total, "rows_received": rows_received, "complete_by_total": False}
+            return {
+                "rt_cd": "1",
+                "msg1": failure_msg,
+                "output2": [],
+                "vendor": "kiwoom",
+                "truncated": True,
+                "termination_reason": termination,
+                "pages_fetched": pages_fetched,
+                "continuation": metadata,
+                "cursor": None,
+                "vendor_total_ticks": vendor_total,
+                "rows_received": rows_received,
+                "complete_by_total": False,
+            }
         filtered = [dict(r) for r in all_rows if str(r.get("cntr_tm", "")).startswith(ymd)]
         complete_by_total = termination == "exhausted" and vendor_total is not None
         cursor: TickCursor | None = None
-        if truncated and last_header_cont == "Y" and last_header_key and termination in ("page_budget", "deadline", "crossed_time_floor"):
+        if (
+            truncated
+            and last_header_cont == "Y"
+            and last_header_key
+            and termination in ("page_budget", "deadline", "crossed_time_floor")
+        ):
             cursor = TickCursor(next_key=last_header_key, rows_received=rows_received, total_ticks=vendor_total)
-        return {"rt_cd": "0", "output2": filtered, "vendor": "kiwoom", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "cursor": cursor, "vendor_total_ticks": vendor_total, "rows_received": rows_received, "complete_by_total": complete_by_total}
+        return {
+            "rt_cd": "0",
+            "output2": filtered,
+            "vendor": "kiwoom",
+            "truncated": truncated,
+            "termination_reason": termination,
+            "pages_fetched": pages_fetched,
+            "continuation": metadata,
+            "cursor": cursor,
+            "vendor_total_ticks": vendor_total,
+            "rows_received": rows_received,
+            "complete_by_total": complete_by_total,
+        }
 
     async def walk_tick_tape(
         self,
@@ -658,7 +726,11 @@ class KiwoomApiClient:
                 ok = newer_seen and older_seen
                 basis = "bracketed" if ok else "none"
             cert = TapeDayCertificate(
-                day=_dash_day(ymd), received=count, vendor_total=total, complete=bool(ok), basis=basis,
+                day=_dash_day(ymd),
+                received=count,
+                vendor_total=total,
+                complete=bool(ok),
+                basis=basis,
             )
             certs[ymd] = cert
             certified_order.append(ymd)
@@ -789,24 +861,83 @@ class KiwoomApiClient:
             if in_observer:
                 raise
             logger.warning("Kiwoom tape walk failed code=%s: %s", code, e)
-            pending_certs = [TapeDayCertificate(day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False) for d in day_order if d not in certs]
-            return {"rt_cd": "1", "msg1": str(e), "vendor": "kiwoom", "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": pages_fetched, "continuation": metadata, "certificates": [certs[d] for d in certified_order] + pending_certs}
+            pending_certs = [
+                TapeDayCertificate(
+                    day=_dash_day(d),
+                    received=int(received.get(d, 0)),
+                    vendor_total=vendor_totals.get(d),
+                    complete=False,
+                )
+                for d in day_order
+                if d not in certs
+            ]
+            return {
+                "rt_cd": "1",
+                "msg1": str(e),
+                "vendor": "kiwoom",
+                "truncated": True,
+                "termination_reason": "vendor_failure",
+                "pages_fetched": pages_fetched,
+                "continuation": metadata,
+                "certificates": [certs[d] for d in certified_order] + pending_certs,
+            }
         if termination == "vendor_failure":
-            logger.warning("[DATA] stage=kiwoom_tape_walk status=VENDOR_FAILURE code=%s pages=%d return_msg=%s", code, pages_fetched, failure_msg)
+            logger.warning(
+                "[DATA] stage=kiwoom_tape_walk status=VENDOR_FAILURE code=%s pages=%d return_msg=%s",
+                code,
+                pages_fetched,
+                failure_msg,
+            )
             certificates: list[TapeDayCertificate] = [certs[d] for d in certified_order]
-            certificates.extend(TapeDayCertificate(day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False) for d in day_order if d not in certs)
-            payload: BrokerPayload = {"rt_cd": "1", "msg1": failure_msg, "vendor": "kiwoom", "truncated": True, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "certificates": certificates}
+            certificates.extend(
+                TapeDayCertificate(
+                    day=_dash_day(d),
+                    received=int(received.get(d, 0)),
+                    vendor_total=vendor_totals.get(d),
+                    complete=False,
+                )
+                for d in day_order
+                if d not in certs
+            )
+            payload: BrokerPayload = {
+                "rt_cd": "1",
+                "msg1": failure_msg,
+                "vendor": "kiwoom",
+                "truncated": True,
+                "termination_reason": termination,
+                "pages_fetched": pages_fetched,
+                "continuation": metadata,
+                "certificates": certificates,
+            }
             return payload
         certificates = [certs[d] for d in certified_order]
-        certificates.extend(TapeDayCertificate(day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False) for d in day_order if d not in certs)
-        return {"rt_cd": "0", "vendor": "kiwoom", "truncated": truncated, "termination_reason": termination, "pages_fetched": pages_fetched, "continuation": metadata, "certificates": certificates}
+        certificates.extend(
+            TapeDayCertificate(
+                day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False
+            )
+            for d in day_order
+            if d not in certs
+        )
+        return {
+            "rt_cd": "0",
+            "vendor": "kiwoom",
+            "truncated": truncated,
+            "termination_reason": termination,
+            "pages_fetched": pages_fetched,
+            "continuation": metadata,
+            "certificates": certificates,
+        }
 
-    async def get_nxt_premarket_chart(self, session: aiohttp.ClientSession, code: str, target_date: str) -> BrokerPayload:
+    async def get_nxt_premarket_chart(
+        self, session: aiohttp.ClientSession, code: str, target_date: str
+    ) -> BrokerPayload:
         ymd = str(target_date).replace("-", "")
         nx_code = f"{str(code).split('_')[0].zfill(6)}_NX"
         try:
             data, _headers = await self._post_tr(
-                session, "ka10080", "/api/dostk/chart",
+                session,
+                "ka10080",
+                "/api/dostk/chart",
                 {"stk_cd": nx_code, "base_dt": ymd, "tic_scope": "1", "upd_stkpc_tp": "0"},
             )
         except Exception as e:
@@ -834,7 +965,9 @@ class KiwoomApiClient:
         nx_code = f"{str(code).split('_')[0].zfill(6)}_NX"
         try:
             data, _headers = await self._post_tr(
-                session, "ka10080", "/api/dostk/chart",
+                session,
+                "ka10080",
+                "/api/dostk/chart",
                 {"stk_cd": nx_code, "base_dt": ymd, "tic_scope": "1", "upd_stkpc_tp": "0"},
             )
         except Exception as e:

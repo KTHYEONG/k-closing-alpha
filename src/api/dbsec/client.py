@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
-import hashlib
 import logging
-import os
 import re
-import time
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.api._common import (
@@ -21,12 +16,8 @@ from src.api._common import (
     validate_target_ymd,
 )
 from src.api._transport import RetryPolicy, send_with_auth_retry
-from src.api.kis.rate_limit import (
-    HostPacedRateLimiter,
-    get_host_rate_limiter,
-    host_admission_state_path,
-    resolve_admission_dir,
-)
+from src.api.host_broker_contract import TokenIssueThrottled
+from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
 from src.api.shared_token import IssuedToken, SharedTokenStore, shared_token_path
 from src.config import settings
 
@@ -51,49 +42,8 @@ _OAUTH_PATH = "/oauth2/token"
 _DB_TOKEN_EXPIRY_MARGIN_SECONDS: float = 600.0
 
 
-class DbsecTokenThrottled(RuntimeError):  # noqa: N818 - spec-mandated protocol name
-    """Token issuance was refused by the vendor's 1-per-minute limit."""
-
-
-def _token_issue_state_path(app_key: str) -> Path:
-    digest = hashlib.sha256((app_key or "").encode("utf-8")).hexdigest()[:12]
-    return resolve_admission_dir() / f"token_issue_dbsec_{digest}.state"
-
-
-def _read_last_attempt(path: Path) -> float | None:
-    try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_CREAT, 0o600)
-    except OSError:
-        return None
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH)
-        try:
-            raw = os.read(fd, 64).decode("ascii", errors="replace").strip()
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        if not raw:
-            return None
-        try:
-            return float(raw)
-        except ValueError:
-            return None
-    finally:
-        os.close(fd)
-
-
-def _mark_attempt(path: Path, now: float) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.ftruncate(fd, 0)
-            os.write(fd, repr(float(now)).encode("ascii"))
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+class DbsecTokenThrottled(TokenIssueThrottled):  # noqa: N818 - spec-mandated protocol name
+    """DB token issuance refused by the 61 s host guard or vendor IGW00201."""
 
 
 def _rows_of(data: Any) -> list[dict[str, Any]]:
@@ -122,28 +72,18 @@ class DbsecApiClient:
     def _token_store(self) -> SharedTokenStore:
         return SharedTokenStore(
             shared_token_path("dbsec", self.app_key or ""),
+            vendor="dbsec",
             lock_timeout_seconds=float(settings.BROKER_ADMISSION_LOCK_TIMEOUT_SECONDS),
             expiry_margin_seconds=_DB_TOKEN_EXPIRY_MARGIN_SECONDS,
+            issue_throttle_policy="raise",
             clock=lambda: datetime.now(UTC),
         )
 
     def _scope_limiter(self, scope: str) -> HostPacedRateLimiter:
-        rate = float(settings.DB_CHART_MAX_RATE) if scope == "chart" else float(settings.DB_QUOTE_MAX_RATE)
-        return get_host_rate_limiter(host_admission_state_path("dbsec", self.app_key or "", scope), rate)
+        return vendor_limiter("dbsec", self.app_key or "", scope)
 
     def _app_limiter(self) -> HostPacedRateLimiter:
-        return get_host_rate_limiter(
-            host_admission_state_path("dbsec", self.app_key or ""), float(settings.DB_APP_MAX_RATE)
-        )
-
-    def _check_issue_pacing(self) -> None:
-        interval = float(settings.DB_TOKEN_ISSUE_MIN_INTERVAL_SECONDS)
-        path = _token_issue_state_path(self.app_key or "")
-        last = _read_last_attempt(path)
-        now = time.time()
-        if last is not None and now - last < interval:
-            raise DbsecTokenThrottled("DB token issuance throttled (1/min)")
-        _mark_attempt(path, now)
+        return vendor_limiter("dbsec", self.app_key or "")
 
     async def _issue_token(self, session: aiohttp.ClientSession) -> IssuedToken:
         payload = {
@@ -169,18 +109,24 @@ class DbsecApiClient:
         expires_in = parse_expires_in(body.get("expires_in") if isinstance(body, dict) else None)
         return IssuedToken(access_token=token, expires_in_seconds=expires_in)
 
-    async def _guarded_issue(self, session: aiohttp.ClientSession) -> IssuedToken:
-        self._check_issue_pacing()
-        return await self._issue_token(session)
-
     async def ensure_token(self, session: aiohttp.ClientSession) -> str:
         """Return a usable host-shared token, issuing at most once host-wide when none is usable."""
-        record = await self._token_store().get_or_issue(lambda: self._guarded_issue(session))
+        try:
+            record = await self._token_store().get_or_issue(lambda: self._issue_token(session))
+        except TokenIssueThrottled as exc:
+            if isinstance(exc, DbsecTokenThrottled):
+                raise
+            raise DbsecTokenThrottled("DB token issuance throttled (1/min)") from exc
         self.token = record.access_token
         return self.token
 
     async def _refresh_rejected_token(self, session: aiohttp.ClientSession, rejected_token: str) -> None:
-        record = await self._token_store().replace_rejected(rejected_token, lambda: self._guarded_issue(session))
+        try:
+            record = await self._token_store().replace_rejected(rejected_token, lambda: self._issue_token(session))
+        except TokenIssueThrottled as exc:
+            if isinstance(exc, DbsecTokenThrottled):
+                raise
+            raise DbsecTokenThrottled("DB token issuance throttled (1/min)") from exc
         self.token = record.access_token
 
     @staticmethod
@@ -410,9 +356,7 @@ class DbsecApiClient:
                     truncated = True
                     break
                 started = now_seoul()
-                call = self._post(
-                    session, _AUCTION_PATH, dict(body), cont_key=cont_key, scope="quote", code=str(code)
-                )
+                call = self._post(session, _AUCTION_PATH, dict(body), cont_key=cont_key, scope="quote", code=str(code))
                 if remaining is None:
                     data, resp_headers = await call
                 else:
