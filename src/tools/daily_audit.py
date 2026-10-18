@@ -670,6 +670,7 @@ def audit_intraday_partitions(
     session_kind: SessionKind,
     cohort_symbols: tuple[str, ...],
     read_partition: Callable[[str], pd.DataFrame | None] | None = None,
+    krx_aftermarket_zero_row_symbols: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     """Audit stored 1m partitions for presence, cohort coverage and grid completeness.
 
@@ -687,6 +688,8 @@ def audit_intraday_partitions(
         read_partition: session -> frame with symbol and ts_hms, None when the
             partition file is absent (injectable for tests). None reads parquet
             with column pruning (symbol, ts_hms).
+        krx_aftermarket_zero_row_symbols: Symbols certified with zero krx_aftermarket
+            rows (NO_TRADES/NOT_APPLICABLE); excused from missing_symbols.
 
     Returns:
         Issue strings `intraday:<session>:<count>:<reason>` with reasons
@@ -732,7 +735,12 @@ def audit_intraday_partitions(
     if INTRADAY_SESSION_KRX_AFTERMARKET in frames:
         regular_frame = frames[INTRADAY_SESSION_REGULAR]
         regular_symbols = (
-            tuple(sorted({str(value) for value in regular_frame["symbol"].astype(str).tolist()}))
+            tuple(
+                sorted(
+                    {str(value) for value in regular_frame["symbol"].astype(str).tolist()}
+                    - krx_aftermarket_zero_row_symbols
+                )
+            )
             if regular_frame is not None
             else ()
         )
@@ -793,6 +801,45 @@ def audit_bar_value_consistency(
         count = int(bad.sum())
         if count:
             issues.append(_intraday_issue(session, count, "value_out_of_range"))
+    return tuple(issues)
+
+
+def audit_bar_price_positivity(
+    trading_date: date,
+    *,
+    sessions: Sequence[str],
+    read_partition: Callable[[str], pd.DataFrame | None] | None = None,
+) -> tuple[str, ...]:
+    """Return intraday:<session>:<rows>:nonpositive_price per session whose stored 1m bars hold a null or non-positive open/high/low/close; empty when clean."""
+    day_str = trading_date.isoformat()
+
+    def _default_reader(session: str) -> pd.DataFrame | None:
+        path = intraday_partition_path(1, day_str, session)
+        if not path.exists():
+            return None
+        return pd.read_parquet(path, columns=["symbol", "open", "high", "low", "close"])
+
+    reader = read_partition if read_partition is not None else _default_reader
+    issues: list[str] = []
+    for session in sessions:
+        frame = reader(session)
+        if frame is None or len(frame) == 0:
+            continue
+        prices = [pd.to_numeric(frame[col], errors="coerce") for col in ("open", "high", "low", "close")]
+        bad = prices[0].isna() | (prices[0] <= 0)
+        for p in prices[1:]:
+            bad = bad | p.isna() | (p <= 0)
+        count = int(bad.sum())
+        if count:
+            sorted_symbols = sorted({str(val) for val in frame.loc[bad, "symbol"].tolist()})
+            logger.debug(
+                "[DATA] stage=daily_audit step=price_positivity session=%s status=FAIL rows=%d symbols=%d samples=%s",
+                session,
+                count,
+                len(sorted_symbols),
+                sorted_symbols[:5],
+            )
+            issues.append(_intraday_issue(session, count, "nonpositive_price"))
     return tuple(issues)
 
 
@@ -893,6 +940,25 @@ def certified_tick_symbols(store: CaptureStore, trading_date: date, *, session: 
             if entry.symbol is None or entry.status != CaptureStatus.COMPLETE:
                 continue
             certified[str(entry.symbol)] = entry.reason.split(":")[0] == "tape_complete"
+    return frozenset(symbol for symbol, ok in certified.items() if ok)
+
+
+def certified_zero_row_bar_symbols(store: CaptureStore, trading_date: date, *, session: str) -> frozenset[str]:
+    """Symbols whose latest non-PENDING MINUTE_BARS entry for session is NO_TRADES or NOT_APPLICABLE; empty when manifests are unreadable."""
+    try:
+        manifests = store.read_manifests(trading_date.isoformat())
+    except (OSError, ValueError):
+        return frozenset()
+    certified: dict[str, bool] = {}
+    for manifest in manifests:
+        if manifest.status == CaptureStatus.PENDING:
+            continue
+        for entry in manifest.entries:
+            if entry.dataset is not CaptureDataset.MINUTE_BARS or entry.session != session:
+                continue
+            if entry.symbol is None:
+                continue
+            certified[str(entry.symbol)] = entry.status in {CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE}
     return frozenset(symbol for symbol, ok in certified.items() if ok)
 
 
@@ -1945,11 +2011,15 @@ def run_daily_audit(
         except FileNotFoundError:
             intraday_issues: tuple[str, ...] = (_intraday_issue("regular", 0, "missing_cohort"),)
         else:
+            zero_row_after = certified_zero_row_bar_symbols(
+                store, trading_date, session=INTRADAY_SESSION_KRX_AFTERMARKET
+            )
             intraday_issues = audit_intraday_partitions(
                 trading_date,
                 clock=session_clock,
                 session_kind=session_day.kind,
                 cohort_symbols=tuple(cohort_symbols),
+                krx_aftermarket_zero_row_symbols=zero_row_after,
             )
             value_sessions = [
                 INTRADAY_SESSION_REGULAR,
@@ -1961,6 +2031,14 @@ def run_daily_audit(
             if session_day.kind is not SessionKind.STANDARD:
                 value_sessions = [INTRADAY_SESSION_REGULAR]
             intraday_issues = (*intraday_issues, *audit_bar_value_consistency(trading_date, sessions=value_sessions))
+            price_sessions = [
+                INTRADAY_SESSION_REGULAR,
+                INTRADAY_SESSION_NXT_PREMARKET,
+                INTRADAY_SESSION_NXT_AFTERMARKET,
+            ]
+            if trading_date.isoformat() >= KRX_AFTERMARKET_START_DATE:
+                price_sessions.append(INTRADAY_SESSION_KRX_AFTERMARKET)
+            intraday_issues = (*intraday_issues, *audit_bar_price_positivity(trading_date, sessions=price_sessions))
             if session_day.kind is SessionKind.STANDARD:
                 certified = certified_tick_symbols(store, trading_date)
                 uncertifiable = uncertifiable_tick_symbols(store, trading_date)
