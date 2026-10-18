@@ -2726,7 +2726,14 @@ def test_audit_aftermarket_ticks_before_start_date_requires_nothing() -> None:
 def _regular_tick_frames(bar_rows, tick_rows, *, with_ts_hms=True):
     import pandas as pd
 
-    bar_cols = {"symbol": [r[0] for r in bar_rows], "volume": [r[1] for r in bar_rows]}
+    bar_cols = {
+        "symbol": [r[0] for r in bar_rows],
+        "volume": [r[1] for r in bar_rows],
+        "open": [1000] * len(bar_rows),
+        "high": [1000] * len(bar_rows),
+        "low": [1000] * len(bar_rows),
+        "close": [1000] * len(bar_rows),
+    }
     if with_ts_hms:
         bar_cols["ts_hms"] = [r[2] for r in bar_rows]
     bars = pd.DataFrame(bar_cols)
@@ -5306,3 +5313,417 @@ def test_audit_sync_keeps_last_notified_when_holiday_digest_is_not_dispatched(tm
     daily_audit.sync_audit_alert_state_from_digest(skipped, "2026-10-09", now=holiday, path=state_path)
     entry = json.loads(state_path.read_text(encoding="utf-8"))["open"]["failed_unit:kca-x"]
     assert entry["last_notified"] == first.isoformat()
+
+
+def test_audit_bar_price_positivity_priceless_aftermarket_symbol_flagged(caplog) -> None:
+    from datetime import date
+    import pandas as pd
+    from src.tools.daily_audit import audit_bar_price_positivity
+
+    rows_005110 = [{"symbol": "005110", "open": 0, "high": 0, "low": 0, "close": 0}] * 241
+    rows_005930 = [{"symbol": "005930", "open": 50000, "high": 50500, "low": 49800, "close": 50200}] * 241
+    frame = pd.DataFrame(rows_005110 + rows_005930)
+    frames = {"krx_aftermarket": frame}
+
+    with caplog.at_level("DEBUG", logger="src.tools.daily_audit"):
+        issues = audit_bar_price_positivity(date(2026, 10, 15), sessions=["krx_aftermarket"], read_partition=frames.get)
+
+    assert issues == ("intraday:krx_aftermarket:241:nonpositive_price",)
+    assert "[DATA] stage=daily_audit step=price_positivity session=krx_aftermarket status=FAIL rows=241 symbols=1 samples=['005110']" in caplog.text
+
+
+def test_audit_bar_price_positivity_halted_forward_fill_clean() -> None:
+    from datetime import date
+    import pandas as pd
+    from src.tools.daily_audit import audit_bar_price_positivity
+
+    frame = pd.DataFrame([
+        {"symbol": "005930", "open": 50000, "high": 50000, "low": 50000, "close": 50000, "volume": 0},
+    ])
+    assert audit_bar_price_positivity(date(2026, 10, 15), sessions=["regular"], read_partition=lambda s: frame) == ()
+
+
+def test_audit_bar_price_positivity_sessions_audited_independently() -> None:
+    from datetime import date
+    import pandas as pd
+    from src.tools.daily_audit import audit_bar_price_positivity
+
+    regular = pd.DataFrame([{"symbol": "005930", "open": 1000, "high": 1000, "low": 1000, "close": 1000}])
+    nxt = pd.DataFrame([{"symbol": "005930", "open": 1000, "high": 0, "low": 1000, "close": 1000}])
+    frames = {"regular": regular, "nxt_aftermarket": nxt}
+    issues = audit_bar_price_positivity(date(2026, 10, 15), sessions=["regular", "nxt_aftermarket"], read_partition=frames.get)
+    assert issues == ("intraday:nxt_aftermarket:1:nonpositive_price",)
+
+
+def test_audit_bar_price_positivity_each_price_column_and_null_counted() -> None:
+    from datetime import date
+    import pandas as pd
+    from src.tools.daily_audit import audit_bar_price_positivity
+
+    frame = pd.DataFrame([
+        {"symbol": "S1", "open": 0, "high": 100, "low": 100, "close": 100},
+        {"symbol": "S2", "open": 100, "high": 100, "low": -1, "close": 100},
+        {"symbol": "S3", "open": 100, "high": 100, "low": 100, "close": float("nan")},
+        {"symbol": "S4", "open": 100, "high": 100, "low": 100, "close": 100},
+    ])
+    issues = audit_bar_price_positivity(date(2026, 10, 15), sessions=["regular"], read_partition=lambda s: frame)
+    assert issues == ("intraday:regular:3:nonpositive_price",)
+
+
+def test_audit_bar_price_positivity_absent_or_empty_partition_skipped() -> None:
+    from datetime import date
+    import pandas as pd
+    from src.tools.daily_audit import audit_bar_price_positivity
+
+    frames = {"regular": None, "nxt_aftermarket": pd.DataFrame(columns=["symbol", "open", "high", "low", "close"])}
+    issues = audit_bar_price_positivity(date(2026, 10, 15), sessions=["regular", "nxt_aftermarket"], read_partition=frames.get)
+    assert issues == ()
+
+
+def test_audit_bar_price_positivity_default_reader_uses_stored_partition(tmp_path, monkeypatch) -> None:
+    from datetime import date
+    import pandas as pd
+    from src.data import intraday_store
+    from src.tools.daily_audit import audit_bar_price_positivity
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path, raising=False)
+    frame = pd.DataFrame([{"symbol": "005110", "open": 0, "high": 0, "low": 0, "close": 0}])
+    target = intraday_store.intraday_partition_path(1, "2026-10-15", "krx_aftermarket")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(target, index=False)
+    issues = audit_bar_price_positivity(date(2026, 10, 15), sessions=["krx_aftermarket", "regular"])
+    assert issues == ("intraday:krx_aftermarket:1:nonpositive_price",)
+
+
+def test_nonpositive_price_is_blocking_tier() -> None:
+    from src.tools.issue_registry import IssueTier, classify_issue_tier
+
+    assert classify_issue_tier("intraday:krx_aftermarket:241:nonpositive_price") is IssueTier.DATA_INTEGRITY
+
+
+def test_certified_zero_row_bar_symbols_latest_wins(tmp_path) -> None:
+    from datetime import date, datetime
+    from src.data.capture_contracts import (
+        ArtifactRef,
+        CaptureContext,
+        CaptureDataset,
+        CaptureManifest,
+        CaptureStatus,
+        CoverageEntry,
+    )
+    from src.data.capture_store import CaptureStore
+    from src.tools.daily_audit import certified_zero_row_bar_symbols
+
+    store = CaptureStore(tmp_path / "capture")
+    day = "2026-10-15"
+    trading_day = date.fromisoformat(day)
+    ref = store._publish_bytes("evidence/test.json", b"{}", rows=None)
+
+    def _make_manifest(run_id, status, session, entries_data):
+        entries = [
+            CoverageEntry(
+                symbol=sym,
+                dataset=CaptureDataset.MINUTE_BARS,
+                venue="KRX",
+                session=session,
+                scheduled_at=None,
+                status=st,
+                rows=0,
+                first_event_time=datetime.fromisoformat(f"{day}T16:00:00+09:00"),
+                last_event_time=datetime.fromisoformat(f"{day}T20:00:00+09:00"),
+                reason=reason,
+                raw_refs=(
+                    (ref,)
+                    if st in (CaptureStatus.NO_TRADES, CaptureStatus.NOT_APPLICABLE)
+                    else ()
+                ),
+            )
+            for sym, st, reason in entries_data
+        ]
+        return CaptureManifest(
+            schema_version=1,
+            context=CaptureContext(
+                trading_date=trading_day,
+                run_id=run_id,
+                dataset=CaptureDataset.MINUTE_BARS,
+                vendor="kis",
+                endpoint="test",
+                symbol=None,
+                venue="KRX",
+                session=session,
+                capture_reason="test",
+                cohort_id=None,
+                scheduled_at=None,
+            ),
+            cohort=None,
+            completed_at=datetime.fromisoformat(f"{day}T20:10:00+09:00"),
+            status=status,
+            entries=tuple(entries),
+            artifacts=(),
+        )
+
+    m1 = _make_manifest("run-1", CaptureStatus.COMPLETE, "krx_aftermarket", [
+        ("A", CaptureStatus.NOT_APPLICABLE, "krx_no_price"),
+        ("B", CaptureStatus.COMPLETE, "ok"),
+        (None, CaptureStatus.NOT_APPLICABLE, "krx_no_price"),
+    ])
+    store.publish_manifest(m1)
+
+    m2 = _make_manifest("run-2", CaptureStatus.COMPLETE, "krx_aftermarket", [
+        ("A", CaptureStatus.COMPLETE, "ok"),
+        ("B", CaptureStatus.NO_TRADES, "krx_no_trades"),
+    ])
+    store.publish_manifest(m2)
+
+    m_pending = _make_manifest("run-p", CaptureStatus.PENDING, "krx_aftermarket", [
+        ("C", CaptureStatus.NOT_APPLICABLE, "krx_no_price"),
+    ])
+    store.publish_manifest(m_pending)
+
+    m_reg = _make_manifest("run-reg", CaptureStatus.COMPLETE, "regular", [
+        ("D", CaptureStatus.NOT_APPLICABLE, "krx_no_price"),
+    ])
+    store.publish_manifest(m_reg)
+
+    res = certified_zero_row_bar_symbols(store, trading_day, session="krx_aftermarket")
+    assert res == frozenset({"B"})
+
+
+def test_certified_zero_row_bar_symbols_unreadable_store_fails_toward_reporting() -> None:
+    from datetime import date
+    from src.tools.daily_audit import certified_zero_row_bar_symbols
+
+    class _UnreadableStore:
+        def read_manifests(self, date_str):
+            raise OSError("disk corrupted")
+
+    assert certified_zero_row_bar_symbols(_UnreadableStore(), date(2026, 10, 15), session="krx_aftermarket") == frozenset()
+
+
+def test_certified_zero_row_bar_symbols_diverted_failed_not_excused(tmp_path) -> None:
+    from datetime import date, datetime
+    from src.data.capture_contracts import (
+        CaptureContext,
+        CaptureDataset,
+        CaptureManifest,
+        CaptureStatus,
+        CoverageEntry,
+    )
+    from src.data.capture_store import CaptureStore
+    from src.tools.daily_audit import certified_zero_row_bar_symbols
+
+    store = CaptureStore(tmp_path / "capture")
+    day = "2026-10-15"
+    trading_day = date.fromisoformat(day)
+
+    entry = CoverageEntry(
+        symbol="B",
+        dataset=CaptureDataset.MINUTE_BARS,
+        venue="KRX",
+        session="krx_aftermarket",
+        scheduled_at=None,
+        status=CaptureStatus.FAILED,
+        rows=0,
+        first_event_time=datetime.fromisoformat(f"{day}T16:00:00+09:00"),
+        last_event_time=datetime.fromisoformat(f"{day}T20:00:00+09:00"),
+        reason="nonpositive_price",
+        raw_refs=(),
+    )
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=CaptureContext(
+            trading_date=trading_day,
+            run_id="run-f",
+            dataset=CaptureDataset.MINUTE_BARS,
+            vendor="kis",
+            endpoint="test",
+            symbol=None,
+            venue="KRX",
+            session="krx_aftermarket",
+            capture_reason="test",
+            cohort_id=None,
+            scheduled_at=None,
+        ),
+        cohort=None,
+        completed_at=datetime.fromisoformat(f"{day}T20:10:00+09:00"),
+        status=CaptureStatus.PARTIAL,
+        entries=(entry,),
+        artifacts=(),
+    )
+    store.publish_manifest(manifest)
+
+    res = certified_zero_row_bar_symbols(store, trading_day, session="krx_aftermarket")
+    assert "B" not in res
+
+
+def test_dense_audit_excuses_certified_zero_row_symbol() -> None:
+    from datetime import date
+    import pandas as pd
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionKind
+    from src.tools.daily_audit import (
+        audit_intraday_partitions,
+        expected_krx_aftermarket_stamps,
+        expected_regular_stamps,
+    )
+
+    day = date(2026, 10, 15)
+    clock = SessionClock.standard(day)
+    reg_stamps = expected_regular_stamps(clock)
+    krx_stamps = expected_krx_aftermarket_stamps()
+
+    reg_frame = pd.DataFrame([
+        {"symbol": sym, "ts_hms": stamp}
+        for sym in ("A", "B")
+        for stamp in reg_stamps
+    ])
+    krx_frame = pd.DataFrame([
+        {"symbol": "A", "ts_hms": stamp}
+        for stamp in krx_stamps
+    ])
+    nxt_frame = pd.DataFrame(columns=["symbol", "ts_hms"])
+
+    frames = {
+        "regular": reg_frame,
+        "krx_aftermarket": krx_frame,
+        "nxt_premarket": nxt_frame,
+        "nxt_aftermarket": nxt_frame,
+    }
+
+    issues = audit_intraday_partitions(
+        day,
+        clock=clock,
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=("A", "B"),
+        read_partition=frames.get,
+        krx_aftermarket_zero_row_symbols=frozenset({"B"}),
+    )
+    assert not any(i.startswith("intraday:krx_aftermarket:") and i.endswith(":missing_symbols") for i in issues)
+
+
+def test_dense_audit_uncertified_zero_row_symbol_still_missing() -> None:
+    from datetime import date
+    import pandas as pd
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionKind
+    from src.tools.daily_audit import (
+        audit_intraday_partitions,
+        expected_krx_aftermarket_stamps,
+        expected_regular_stamps,
+    )
+
+    day = date(2026, 10, 15)
+    clock = SessionClock.standard(day)
+    reg_stamps = expected_regular_stamps(clock)
+    krx_stamps = expected_krx_aftermarket_stamps()
+
+    reg_frame = pd.DataFrame([
+        {"symbol": sym, "ts_hms": stamp}
+        for sym in ("A", "B")
+        for stamp in reg_stamps
+    ])
+    krx_frame = pd.DataFrame([
+        {"symbol": "A", "ts_hms": stamp}
+        for stamp in krx_stamps
+    ])
+    nxt_frame = pd.DataFrame(columns=["symbol", "ts_hms"])
+
+    frames = {
+        "regular": reg_frame,
+        "krx_aftermarket": krx_frame,
+        "nxt_premarket": nxt_frame,
+        "nxt_aftermarket": nxt_frame,
+    }
+
+    issues = audit_intraday_partitions(
+        day,
+        clock=clock,
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=("A", "B"),
+        read_partition=frames.get,
+        krx_aftermarket_zero_row_symbols=frozenset(),
+    )
+    assert "intraday:krx_aftermarket:1:missing_symbols" in issues
+
+
+def test_dense_audit_excused_symbol_with_rows_still_grid_checked() -> None:
+    from datetime import date
+    import pandas as pd
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionKind
+    from src.tools.daily_audit import (
+        audit_intraday_partitions,
+        expected_krx_aftermarket_stamps,
+        expected_regular_stamps,
+    )
+
+    day = date(2026, 10, 15)
+    clock = SessionClock.standard(day)
+    reg_stamps = expected_regular_stamps(clock)
+    krx_stamps = expected_krx_aftermarket_stamps()
+
+    reg_frame = pd.DataFrame([
+        {"symbol": sym, "ts_hms": stamp}
+        for sym in ("A", "B")
+        for stamp in reg_stamps
+    ])
+    krx_rows = [{"symbol": "A", "ts_hms": stamp} for stamp in krx_stamps]
+    krx_rows += [{"symbol": "B", "ts_hms": stamp} for stamp in krx_stamps[:10]]
+    krx_frame = pd.DataFrame(krx_rows)
+    nxt_frame = pd.DataFrame(columns=["symbol", "ts_hms"])
+
+    frames = {
+        "regular": reg_frame,
+        "krx_aftermarket": krx_frame,
+        "nxt_premarket": nxt_frame,
+        "nxt_aftermarket": nxt_frame,
+    }
+
+    issues = audit_intraday_partitions(
+        day,
+        clock=clock,
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=("A", "B"),
+        read_partition=frames.get,
+        krx_aftermarket_zero_row_symbols=frozenset({"B"}),
+    )
+    assert "intraday:krx_aftermarket:1:missing_bars" in issues
+
+
+def test_dense_audit_excuse_never_applies_to_regular() -> None:
+    from datetime import date
+    import pandas as pd
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionKind
+    from src.tools.daily_audit import (
+        audit_intraday_partitions,
+        expected_regular_stamps,
+    )
+
+    day = date(2026, 10, 15)
+    clock = SessionClock.standard(day)
+    reg_stamps = expected_regular_stamps(clock)
+
+    reg_frame = pd.DataFrame([
+        {"symbol": "A", "ts_hms": stamp}
+        for stamp in reg_stamps
+    ])
+    nxt_frame = pd.DataFrame(columns=["symbol", "ts_hms"])
+
+    frames = {
+        "regular": reg_frame,
+        "krx_aftermarket": pd.DataFrame(columns=["symbol", "ts_hms"]),
+        "nxt_premarket": nxt_frame,
+        "nxt_aftermarket": nxt_frame,
+    }
+
+    issues = audit_intraday_partitions(
+        day,
+        clock=clock,
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=("A", "B"),
+        read_partition=frames.get,
+        krx_aftermarket_zero_row_symbols=frozenset({"B"}),
+    )
+    assert "intraday:regular:1:missing_symbols" in issues
+
