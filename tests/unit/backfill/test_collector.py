@@ -2757,3 +2757,372 @@ def test_dbsec_unknown_venue_never_certified(tmp_path) -> None:
     )
     assert entry.status.value != "COMPLETE"
     assert frame.empty
+
+
+def test_krx_aftermarket_all_zero_is_not_applicable(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_krx_aftermarket_bars
+
+    store = _capture_store(tmp_path)
+    rows = [_kis_bar_row(str(h), close="0", vol="0", cum="0") for h in (160000, 160100, 200000)]
+    kis = _KisBars(rows)
+    delivered = {}
+    asyncio.run(
+        collect_krx_aftermarket_bars(
+            kis, None, ["005110"], "2026-10-15", 1, dbsec_client=None,
+            profile=_capture_profile(tmp_path), capture_store=store, run_id="r-krx-zero",
+            on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    frame, entry = delivered["005110"]
+    assert entry.status.value == "NOT_APPLICABLE"
+    assert entry.reason == "krx_no_price"
+    assert entry.venue == "KRX"
+    assert entry.rows == 0
+    assert len(entry.raw_refs) > 0
+    assert frame.empty
+
+
+def test_nxt_reason_regression(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_nxt_aftermarket_bars, collect_nxt_premarket_bars
+
+    store = _capture_store(tmp_path)
+    after_rows = [_kis_bar_row("160000", close="0", vol="0", cum="0"), _kis_bar_row("160100", close="0", vol="0", cum="0")]
+    pre_rows = [_kis_bar_row("080000", close="0", vol="0", cum="0"), _kis_bar_row("080100", close="0", vol="0", cum="0")]
+    delivered = {}
+    asyncio.run(
+        collect_nxt_aftermarket_bars(
+            _KisBars(after_rows), None, ["255220"], "2026-09-04", 1, kiwoom_client=None,
+            profile=_capture_profile(tmp_path), capture_store=store, run_id="r-nx-after-zero",
+            on_symbol=lambda s, f, e: delivered.update({f"{s}_after": (f, e)}),
+        )
+    )
+    asyncio.run(
+        collect_nxt_premarket_bars(
+            _KisBars(pre_rows), None, ["255220"], "2026-09-04", 1, kiwoom_client=None,
+            profile=_capture_profile(tmp_path), capture_store=store, run_id="r-nx-pre-zero",
+            on_symbol=lambda s, f, e: delivered.update({f"{s}_pre": (f, e)}),
+        )
+    )
+    for tag in ("255220_after", "255220_pre"):
+        frame, entry = delivered[tag]
+        assert entry.status.value == "NOT_APPLICABLE"
+        assert entry.reason == "nxt_not_listed"
+        assert entry.venue == "NXT"
+        assert entry.raw_refs
+        assert frame.empty
+
+
+def test_krx_aftermarket_halted_forward_fill_stays_complete(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_krx_aftermarket_bars
+
+    store = _capture_store(tmp_path)
+    rows = [_kis_bar_row("160000", close="70000", vol="0", cum="0"), _kis_bar_row("160100", close="70000", vol="0", cum="0")]
+    kis = _KisBars(rows)
+    delivered = {}
+    asyncio.run(
+        collect_krx_aftermarket_bars(
+            kis, None, ["005930"], "2026-10-15", 1, dbsec_client=None,
+            profile=_capture_profile(tmp_path), capture_store=store, run_id="r-krx-halted",
+            on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "COMPLETE"
+    assert entry.rows == len(frame) > 0
+    assert not frame["has_trade"].any()
+    for col in ("open", "high", "low", "close"):
+        assert (frame[col] > 0).all()
+
+
+def test_krx_aftermarket_partial_nonpositive_bar_fails_and_stages(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_krx_aftermarket_bars
+
+    store = _capture_store(tmp_path)
+    rows = [
+        _kis_bar_row("160000", close="70000", vol="10", cum="700000"),
+        _kis_bar_row("160100", close="0", vol="10", cum="700000"),
+    ]
+    kis = _KisBars(rows)
+    delivered = {}
+    asyncio.run(
+        collect_krx_aftermarket_bars(
+            kis, None, ["005930"], "2026-10-15", 1, dbsec_client=None,
+            profile=_capture_profile(tmp_path), capture_store=store, run_id="r-krx-partial",
+            on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "nonpositive_price"
+    assert frame.empty
+    assert len(entry.raw_refs) == 2
+
+
+def test_db_fallback_after_priceless_kis_keeps_kis_verdict(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_krx_aftermarket_bars
+
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, {"dbsec:kr-chart/min": "KRX"})
+    rows = [_kis_bar_row("160000", close="0", vol="0", cum="0")]
+    kis = _KisBars(rows)
+    db = _DbsecBars([], rt="1")
+    delivered = {}
+    asyncio.run(
+        collect_krx_aftermarket_bars(
+            kis, None, ["005110"], "2026-10-15", 1, dbsec_client=db,
+            profile=profile, capture_store=store, run_id="r-db-fallback-fail",
+            on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    frame, entry = delivered["005110"]
+    assert entry.status.value == "NOT_APPLICABLE"
+    assert entry.reason == "krx_no_price"
+    assert len(entry.raw_refs) >= 2
+    assert frame.empty
+
+
+def test_unknown_venue_precedence_over_all_zero(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_krx_aftermarket_bars
+
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, routes={"kis:kis-chart": "UNKNOWN"})
+    rows = [_kis_bar_row("160000", close="0", vol="0", cum="0")]
+    kis = _KisBars(rows)
+    delivered = {}
+    asyncio.run(
+        collect_krx_aftermarket_bars(
+            kis, None, ["005110"], "2026-10-15", 1, dbsec_client=None,
+            profile=profile, capture_store=store, run_id="r-unknown-venue",
+            on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    frame, entry = delivered["005110"]
+    assert entry.status.value == "UNKNOWN"
+    assert entry.reason == "uncertified_venue"
+    assert frame.empty
+
+
+def test_backfill_krx_aftermarket_priceless_is_terminal(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import backfill_extended_session_bars
+
+    store = _capture_store(tmp_path)
+    rows = [_kis_bar_row("160000", close="0", vol="0", cum="0")]
+    kis = _KisBars(rows)
+    delivered = {}
+    asyncio.run(
+        backfill_extended_session_bars(
+            kis, None, ["005110"], "2026-10-15", session_tag="krx_aftermarket",
+            profile=_capture_profile(tmp_path), capture_store=store, run_id="r-bf-am-zero",
+            on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    frame, entry = delivered["005110"]
+    assert entry.status.value == "NOT_APPLICABLE"
+    assert entry.reason == "krx_no_price"
+    assert frame.empty
+
+
+def test_backfill_regular_priceless_stays_retryable(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import backfill_extended_session_bars
+
+    store = _capture_store(tmp_path)
+    rows = [_kis_bar_row("090100", close="0", vol="0", cum="0")]
+    kis = _KisBars(rows)
+    delivered = {}
+    asyncio.run(
+        backfill_extended_session_bars(
+            kis, None, ["005110"], "2026-10-15", session_tag="regular",
+            profile=_capture_profile(tmp_path), capture_store=store, run_id="r-bf-reg-zero",
+            on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    frame, entry = delivered["005110"]
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "regular_no_price_without_proof"
+    assert entry.raw_refs
+    assert frame.empty
+
+
+def test_observer_net_diverts_any_vendor(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_intraday_bars
+
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, {"ls:t8412": "KRX"})
+
+    class _LsMulti:
+        async def get_minute_chart(self, session, code, target_date, budget=None, on_page=None):
+            if on_page is not None:
+                start, received = _aware_page_clocks()
+                on_page({"t8412OutBlock1": []}, {"tr_cont": "N"}, start, received, 0, 0)
+            if code == "005930":
+                rows = [_ls_bar_row("090100", close=70000, vol=10)]
+                rows[0]["low"] = 0
+            else:
+                rows = [_ls_bar_row("090100", close=80000, vol=20)]
+            return {
+                "rt_cd": "0", "output2": rows, "vendor": "ls",
+                "truncated": False, "termination_reason": "exhausted",
+                "pages_fetched": 1, "continuation": {},
+            }
+
+    delivered = {}
+    asyncio.run(
+        collect_intraday_bars(
+            _KisBars([]), None, ["005930", "000660"], "2026-09-04", 1, ls_client=_LsMulti(),
+            profile=profile, capture_store=store, run_id="r-observer-divert",
+            on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    frame_bad, entry_bad = delivered["005930"]
+    assert entry_bad.status.value == "FAILED"
+    assert entry_bad.reason == "nonpositive_price"
+    assert frame_bad.empty
+    assert len(entry_bad.raw_refs) >= 2
+
+    frame_good, entry_good = delivered["000660"]
+    assert entry_good.status.value == "COMPLETE"
+    assert not frame_good.empty
+    assert len(frame_good) == 1
+    assert entry_good.rows == 1
+
+
+def test_observer_net_diverts_ticks(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_intraday_trade_ticks
+
+    today, ymd = _today()
+    store = _capture_store(tmp_path)
+    profile = _aftermarket_profile(tmp_path)
+    kiwoom = _KiwoomTicks([{"rows": [_kw_tick_row(f"{ymd}093000", prc="0", qty="10")], "truncated": False, "terminal": "crossed_target_date"}])
+    delivered = {}
+    asyncio.run(
+        collect_intraday_trade_ticks(
+            _KisBars([]), None, ["005930"], today, kiwoom_client=kiwoom,
+            profile=profile, capture_store=store, run_id="run-tick-zero",
+            on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "nonpositive_price"
+    assert frame.empty
+
+
+def test_observer_net_leaves_non_complete_untouched(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import _collect_with_observer, _empty_bar_frame
+    from src.data.capture_contracts import ArtifactRef, CaptureDataset, CaptureStatus, CoverageEntry
+
+    store = _capture_store(tmp_path)
+    ref = ArtifactRef(path="evidence.json", sha256="abc", bytes=10)
+    no_trades_entry = CoverageEntry(
+        symbol="005930", dataset=CaptureDataset.MINUTE_BARS, venue="KRX", session="regular",
+        scheduled_at=None, status=CaptureStatus.NO_TRADES, rows=0, first_event_time=None,
+        last_event_time=None, reason="krx_after_no_trades", raw_refs=(ref,),
+    )
+    unknown_entry = CoverageEntry(
+        symbol="000660", dataset=CaptureDataset.MINUTE_BARS, venue="UNKNOWN", session="regular",
+        scheduled_at=None, status=CaptureStatus.UNKNOWN, rows=0, first_event_time=None,
+        last_event_time=None, reason="empty_without_proof", raw_refs=(),
+    )
+    entries = {"005930": no_trades_entry, "000660": unknown_entry}
+
+    async def _acquire(code: str):
+        return _empty_bar_frame("2026-09-04"), entries[code]
+
+    delivered = {}
+    asyncio.run(
+        _collect_with_observer(
+            codes=["005930", "000660"], snapshot_date="2026-09-04",
+            dataset=CaptureDataset.MINUTE_BARS, session_tag="regular",
+            store=store, run_id="r-untouched",
+            acquire=_acquire, on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    assert delivered["005930"][1] is no_trades_entry
+    assert delivered["000660"][1] is unknown_entry
+
+
+def test_kiwoom_raw_basis_diverts_zero_price(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import backfill_kiwoom_raw_bars
+
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, {"kiwoom:ka10080": "NXT"})
+
+    class _KwRaw:
+        async def get_nxt_minute_chart(self, session, code, target_date):
+            return {
+                "rt_cd": "0", "vendor": "kiwoom", "output2": [
+                    {"cntr_tm": "20260915160000", "cur_prc": "0", "open_pric": "0",
+                     "high_pric": "0", "low_pric": "0", "trde_qty": "10"},
+                ],
+            }
+
+    frame, entry = asyncio.run(
+        backfill_kiwoom_raw_bars(
+            _KwRaw(), None, "005930", "2026-09-15", session_tag="nxt_aftermarket",
+            profile=profile, capture_store=store, run_id="r-raw-zero",
+        )
+    )
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "nonpositive_price"
+    assert frame.empty
+    assert len(entry.raw_refs) == 2
+
+
+def test_live_regular_repair_does_not_certify_priceless_kis(tmp_path) -> None:
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_intraday_bars
+
+    store = _capture_store(tmp_path)
+    profile = _capture_profile(tmp_path, {"ls:t8412": "KRX", "kis:kis-chart": "KRX"})
+    ls = _LsBars([], rt="1")
+    kis = _KisBars([_kis_bar_row("090100", close="0", vol="0", cum="0")])
+    delivered = {}
+    asyncio.run(
+        collect_intraday_bars(
+            kis, None, ["005930"], "2026-09-04", 1, ls_client=ls,
+            profile=profile, capture_store=store, run_id="r-repair-priceless",
+            on_symbol=lambda s, f, e: delivered.update({s: (f, e)}),
+        )
+    )
+    frame, entry = delivered["005930"]
+    assert entry.status.value == "PARTIAL"
+    assert entry.reason == "unrepaired:krx_no_price"
+    assert frame.empty
+
+
+def test_price_helpers_edge_cases() -> None:
+    import pandas as pd
+
+    from src.backfill.intraday.collector import _has_nonpositive_price, _has_nonpositive_tick_price
+
+    assert not _has_nonpositive_price(pd.DataFrame())
+    assert _has_nonpositive_price(pd.DataFrame([{"open": 100}]))
+    assert not _has_nonpositive_tick_price(pd.DataFrame())
+    assert _has_nonpositive_tick_price(pd.DataFrame([{"volume": 10}]))
+
+

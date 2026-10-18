@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 import pandas as pd
 from aiohttp import ClientError
 
@@ -346,6 +347,89 @@ def _empty_tick_frame(snapshot_date: str) -> pd.DataFrame:
     return normalize_tick_frame(pd.DataFrame(), "ls", snapshot_date, "000000")
 
 
+def _is_all_zero_price_frame(frame: pd.DataFrame) -> bool:
+    return (
+        not frame.empty
+        and "close" in frame.columns
+        and "volume" in frame.columns
+        and bool((frame["close"].fillna(0) == 0).all())
+        and bool((frame["volume"].fillna(0) == 0).all())
+    )
+
+
+def _has_nonpositive_price(frame: pd.DataFrame) -> bool:
+    if frame.empty:
+        return False
+    bad_price_mask = np.zeros(len(frame), dtype=bool)
+    for col in ("open", "high", "low", "close"):
+        if col not in frame.columns:
+            return True
+        vals = pd.to_numeric(frame[col], errors="coerce").to_numpy(dtype=float)
+        bad_price_mask |= np.isnan(vals) | (vals <= 0)
+    return bool(bad_price_mask.any())
+
+
+def _has_nonpositive_tick_price(frame: pd.DataFrame) -> bool:
+    if frame.empty:
+        return False
+    if "price" not in frame.columns:
+        return True
+    prices = pd.to_numeric(frame["price"], errors="coerce").to_numpy(dtype=float)
+    return bool((np.isnan(prices) | (prices <= 0)).any())
+
+
+def _divert_nonpositive(
+    store: CaptureStore,
+    *,
+    run_id: str,
+    trading_day: date,
+    dataset: CaptureDataset,
+    session_tag: str,
+    symbol: str,
+    frame: pd.DataFrame,
+    entry: Any,
+) -> tuple[pd.DataFrame, Any]:
+    if (
+        entry is not None
+        and getattr(entry, "status", None) == CaptureStatus.COMPLETE
+        and not frame.empty
+        and (
+            (dataset == CaptureDataset.MINUTE_BARS and _has_nonpositive_price(frame))
+            or (dataset == CaptureDataset.TRADE_TICKS and _has_nonpositive_tick_price(frame))
+        )
+    ):
+        frag = _stage_fragment(
+            store,
+            run_id=run_id,
+            trading_day=trading_day,
+            dataset=dataset,
+            symbol=symbol,
+            session=str(session_tag),
+            frame=frame,
+            reason="nonpositive_price",
+        )
+        empty_frame = (
+            _empty_bar_frame(trading_day.isoformat())
+            if dataset == CaptureDataset.MINUTE_BARS
+            else _empty_tick_frame(trading_day.isoformat())
+        )
+        diverted_entry = CoverageEntry(
+            symbol=entry.symbol,
+            dataset=entry.dataset,
+            venue=entry.venue,
+            session=entry.session,
+            scheduled_at=entry.scheduled_at,
+            status=CaptureStatus.FAILED,
+            rows=0,
+            first_event_time=entry.first_event_time,
+            last_event_time=entry.last_event_time,
+            reason="nonpositive_price",
+            raw_refs=(*entry.raw_refs, frag),
+        )
+        return empty_frame, diverted_entry
+    return frame, entry
+
+
 def _chart_budget(profile: CollectionSettings) -> ChartBudget:
     return ChartBudget(
         max_pages=int(profile.COLLECTION_CHART_MAX_PAGES),
@@ -661,17 +745,15 @@ async def _kis_bar_attempt(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
             status=CaptureStatus.UNKNOWN, rows=0, reason="empty_without_proof", refs=refs,
         )
-    if (
-        market_div_code == NXT_MARKET_DIV_CODE
-        and not frame.empty
-        and "close" in frame.columns
-        and "volume" in frame.columns
-        and bool((frame["close"].fillna(0) == 0).all())
-        and bool((frame["volume"].fillna(0) == 0).all())
-    ):
+    if market_div_code == NXT_MARKET_DIV_CODE and _is_all_zero_price_frame(frame):
         return _empty_bar_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue="NXT", session=session_tag,
             status=CaptureStatus.NOT_APPLICABLE, rows=0, reason="nxt_not_listed", refs=refs,
+        )
+    if market_div_code != NXT_MARKET_DIV_CODE and _is_all_zero_price_frame(frame) and venue != "UNKNOWN":
+        return _empty_bar_frame(snapshot_date), _terminal_entry(
+            symbol=code, dataset=dataset, venue=venue, session=session_tag,
+            status=CaptureStatus.NOT_APPLICABLE, rows=0, reason="krx_no_price", refs=refs,
         )
     if venue == "UNKNOWN":
         frag = _stage_fragment(store, run_id=run_id, trading_day=trading_day, dataset=dataset,
@@ -680,6 +762,16 @@ async def _kis_bar_attempt(
         return _empty_bar_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
             status=CaptureStatus.UNKNOWN, rows=0, reason="uncertified_venue", refs=refs,
+        )
+    if _has_nonpositive_price(frame):
+        frag = _stage_fragment(
+            store, run_id=run_id, trading_day=trading_day, dataset=dataset,
+            symbol=code, session=session_tag, frame=frame, reason="nonpositive_price",
+        )
+        refs.append(frag)
+        return _empty_bar_frame(snapshot_date), _terminal_entry(
+            symbol=code, dataset=dataset, venue=venue, session=session_tag,
+            status=CaptureStatus.FAILED, rows=0, reason="nonpositive_price", refs=refs,
         )
     return frame, _terminal_entry(
         symbol=code, dataset=dataset, venue=venue, session=session_tag,
@@ -1216,6 +1308,16 @@ async def _collect_with_observer(
     results = await asyncio.gather(*[_run_one(code) for code in codes])
     collected: list[pd.DataFrame] = []
     for code, (frame, entry) in results:
+        frame, entry = _divert_nonpositive(
+            store,
+            run_id=run_id,
+            trading_day=trading_day,
+            dataset=dataset,
+            session_tag=session_tag,
+            symbol=code,
+            frame=frame,
+            entry=entry,
+        )
         if on_symbol is not None:
             on_symbol(code, frame, entry)
         elif not frame.empty:
@@ -1723,10 +1825,11 @@ async def backfill_extended_session_bars(client: Any, session: Any, stock_codes:
     """Backfill one past date's session 1m bars through the certified KIS historical route.
 
     Every response is retained as raw evidence and classified per symbol exactly like the live path
-    (_kis_bar_attempt): unlisted NXT symbols become NOT_APPLICABLE, traded windows COMPLETE. Historical
-    KIS rows exist only for traded minutes, so backfilled partitions are sparse grids whose bars are
-    stamped at the minute START (a 15:19 bar covers 15:19:00-15:19:59), unlike LS live-archive bars which
-    are end-stamped; consumers must resolve the stamp per vendor.
+    (_kis_bar_attempt): unlisted NXT symbols become NOT_APPLICABLE nxt_not_listed, all-zero KRX answers
+    NOT_APPLICABLE krx_no_price (FAILED regular_no_price_without_proof for the regular session), traded
+    windows COMPLETE. Historical KIS rows exist only for traded minutes, so backfilled partitions are
+    sparse grids whose bars are stamped at the minute START (a 15:19 bar covers 15:19:00-15:19:59), unlike
+    LS live-archive bars which are end-stamped; consumers must resolve the stamp per vendor.
 
     The regular window is the whole KRX session [09:00:00, 15:30:00] so one fetch retains both the 15:20
     decision-time state and the closing-auction print (the 15:30:00 bar). An empty regular answer is FAILED
@@ -1796,6 +1899,17 @@ async def backfill_extended_session_bars(client: Any, session: Any, stock_codes:
                     first_event_time=entry.first_event_time, last_event_time=entry.last_event_time,
                     reason="krx_after_no_trades", raw_refs=entry.raw_refs,
                 )
+        if (
+            str(session_tag) == INTRADAY_SESSION_REGULAR
+            and entry.status == CaptureStatus.NOT_APPLICABLE
+            and entry.reason == "krx_no_price"
+        ):
+            entry = CoverageEntry(
+                symbol=entry.symbol, dataset=entry.dataset, venue=entry.venue, session=entry.session,
+                scheduled_at=entry.scheduled_at, status=CaptureStatus.FAILED, rows=0,
+                first_event_time=entry.first_event_time, last_event_time=entry.last_event_time,
+                reason="regular_no_price_without_proof", raw_refs=entry.raw_refs,
+            )
         return frame, entry
 
     return await _collect_with_observer(
@@ -1885,6 +1999,19 @@ async def backfill_kiwoom_raw_bars(
         return _failed(f"raw_basis_normalize:{_redacted_error(e)}")
     if frame.empty:
         return _failed("raw_basis_unavailable")
+    if _has_nonpositive_price(frame):
+        frag = _stage_fragment(
+            store,
+            run_id=run_id,
+            trading_day=trading_day,
+            dataset=CaptureDataset.MINUTE_BARS,
+            symbol=code,
+            session=str(session_tag),
+            frame=frame,
+            reason="nonpositive_price",
+        )
+        refs.append(frag)
+        return _failed("nonpositive_price")
     return frame, _terminal_entry(
         symbol=code, dataset=CaptureDataset.MINUTE_BARS, venue=venue, session=str(session_tag),
         status=CaptureStatus.COMPLETE, rows=len(frame), reason=f"raw_basis_kiwoom:{len(frame)}", refs=refs,
