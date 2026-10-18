@@ -1080,3 +1080,185 @@ def test_consolidated_session_rejects_non_consolidated_and_unknown(tmp_path: Pat
     with pytest.raises(ValueError, match="Non-certified"):
         intraday_store.write_intraday_partition(frame, 1, date, "regular", coverage={"005930": _consolidated_entry("005930", "regular")})  # type: ignore[arg-type]
     assert not intraday_store.intraday_partition_path(1, date, "regular_consolidated").exists()
+
+
+def test_write_intraday_partition_rejects_all_zero_bar_symbol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    monkeypatch.setattr(intraday_store.settings, "COLLECTION_ROOT", tmp_path / "capture")
+    date = "2026-09-03"
+    raw = pd.DataFrame({
+        "stck_bsop_date": [date] * 3,
+        "stck_cntg_hour": ["160000", "160100", "160200"],
+        "stck_oprc": [0, 0, 0],
+        "stck_hgpr": [0, 0, 0],
+        "stck_lwpr": [0, 0, 0],
+        "stck_prpr": [0, 0, 0],
+        "cntg_vol": [0, 0, 0],
+        "acml_tr_pbmn": [0, 0, 0],
+    })
+    df = normalize_bar_frame(raw, "kis", date, "005110")
+    cov = {"005110": _bar_entry("005110", session="krx_aftermarket")}
+    with pytest.raises(intraday_store.NonPositivePriceError) as exc_info:
+        intraday_store.write_intraday_partition(df, 1, date, "krx_aftermarket", coverage=cov)  # type: ignore[arg-type]
+    err = exc_info.value
+    assert isinstance(err, ValueError)
+    assert err.symbols == ("005110",)
+    assert err.rows == 3
+    assert err.kind == "bars"
+    assert not intraday_store.intraday_partition_path(1, date, "krx_aftermarket").exists()
+    staged_dir = tmp_path / "capture" / "staging"
+    assert not staged_dir.exists() or not list(staged_dir.rglob("*.json"))
+
+
+def test_write_intraday_partition_mixed_frame_rejected_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    seed = pd.DataFrame([{**_bar_row("005930", 90100, close=70000, volume=10), "snapshot_date": date}])
+    cov_a = {"005930": _bar_entry("005930")}
+    intraday_store.write_intraday_partition(seed, 1, date, "regular", coverage=cov_a)  # type: ignore[arg-type]
+    target = intraday_store.intraday_partition_path(1, date, "regular")
+    before_bytes = target.read_bytes()
+
+    incoming_a = {**_bar_row("005930", 90200, close=70500, volume=20), "snapshot_date": date}
+    incoming_b = {**_bar_row("000660", 90100, close=100000, volume=10), "snapshot_date": date}
+    incoming_b["low"] = 0
+    mixed = pd.DataFrame([incoming_a, incoming_b])
+    cov_ab = {"005930": _bar_entry("005930"), "000660": _bar_entry("000660")}
+    with pytest.raises(intraday_store.NonPositivePriceError) as exc_info:
+        intraday_store.write_intraday_partition(mixed, 1, date, "regular", coverage=cov_ab)  # type: ignore[arg-type]
+    err = exc_info.value
+    assert err.symbols == ("000660",)
+    assert err.rows == 1
+    assert target.read_bytes() == before_bytes
+
+
+def test_write_intraday_partition_halted_forward_fill_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    row = {
+        "snapshot_date": date,
+        "symbol": "005930",
+        "ts_hms": 90100,
+        "open": 10000,
+        "high": 10000,
+        "low": 10000,
+        "close": 10000,
+        "volume": 0,
+        "value_krw": 0,
+        "has_trade": False,
+        "vendor": "kis",
+    }
+    df = pd.DataFrame([row, {**row, "ts_hms": 90200}])
+    cov = {"005930": _bar_entry("005930")}
+    written = intraday_store.write_intraday_partition(df, 1, date, "regular", coverage=cov)  # type: ignore[arg-type]
+    assert written == 2
+    target = intraday_store.intraday_partition_path(1, date, "regular")
+    assert len(pd.read_parquet(target)) == 2
+
+
+def test_write_intraday_partition_each_price_column_gates_independently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    cov = {"005930": _bar_entry("005930")}
+    for col in ("open", "high", "low", "close"):
+        base = {**_bar_row("005930", 90100, close=1000), "snapshot_date": date}
+        base[col] = 0
+        df = pd.DataFrame([base])
+        with pytest.raises(intraday_store.NonPositivePriceError) as exc_info:
+            intraday_store.write_intraday_partition(df, 1, date, "regular", coverage=cov)  # type: ignore[arg-type]
+        assert exc_info.value.rows == 1
+        assert exc_info.value.symbols == ("005930",)
+    neg_base = {**_bar_row("005930", 90100, close=1000), "snapshot_date": date}
+    neg_base["close"] = -500
+    df_neg = pd.DataFrame([neg_base])
+    with pytest.raises(intraday_store.NonPositivePriceError) as exc_info:
+        intraday_store.write_intraday_partition(df_neg, 1, date, "regular", coverage=cov)  # type: ignore[arg-type]
+    assert exc_info.value.rows == 1
+    assert exc_info.value.symbols == ("005930",)
+
+
+def test_write_intraday_partition_null_price_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    base = {**_bar_row("005930", 90100, close=1000), "snapshot_date": date}
+    base["close"] = float("nan")
+    df = pd.DataFrame([base])
+    cov = {"005930": _bar_entry("005930")}
+    with pytest.raises(intraday_store.NonPositivePriceError) as exc_info:
+        intraday_store.write_intraday_partition(df, 1, date, "regular", coverage=cov)  # type: ignore[arg-type]
+    assert exc_info.value.rows == 1
+    assert exc_info.value.symbols == ("005930",)
+
+
+def test_write_intraday_partition_uncertified_legacy_path_gated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    base = {**_bar_row("005930", 90100, close=0), "snapshot_date": date}
+    df = pd.DataFrame([base])
+    with pytest.raises(intraday_store.NonPositivePriceError) as exc_info:
+        intraday_store.write_intraday_partition(df, 1, date, "regular", coverage=None)
+    assert exc_info.value.symbols == ("005930",)
+    assert not intraday_store.intraday_partition_path(1, date, "regular").exists()
+
+
+def test_write_intraday_partition_error_message_structured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    rows = [
+        {**_bar_row(sym, ts, close=0), "snapshot_date": date}
+        for sym, times in (("C", (90100, 90200)), ("A", (90100, 90200, 90300)), ("B", (90100, 90200)))
+        for ts in times
+    ]
+    df = pd.DataFrame(rows)
+    with pytest.raises(intraday_store.NonPositivePriceError) as exc_info:
+        intraday_store.write_intraday_partition(df, 1, date, "regular", coverage=None)
+    err = exc_info.value
+    assert err.symbols == ("A", "B", "C")
+    assert str(err).startswith("nonpositive_price kind=bars session=")
+    assert "n_symbols=3 n_rows=7" in str(err)
+
+
+def test_write_tick_partition_rejects_non_positive_price(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    bad_df = _tick_rows("005930", date, [("090300", 70000, 1), ("090400", 0, 1)])
+    cov = {"005930": _tick_entry("005930")}
+    with pytest.raises(intraday_store.NonPositivePriceError) as exc_info:
+        intraday_store.write_tick_partition(bad_df, date, "regular", coverage=cov)  # type: ignore[arg-type]
+    err = exc_info.value
+    assert err.kind == "ticks"
+    assert err.symbols == ("005930",)
+    assert err.rows == 1
+
+    good_df = _tick_rows("005930", date, [("090300", 70000, 1), ("090400", 70100, 1)])
+    written = intraday_store.write_tick_partition(good_df, date, "regular", coverage=cov)  # type: ignore[arg-type]
+    assert written == 2
+
+
+def test_write_intraday_partition_empty_no_trades_unaffected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    cov = {"005930": _bar_entry("005930", status="NO_TRADES")}
+    written = intraday_store.write_intraday_partition(pd.DataFrame(), 1, date, "regular", coverage=cov)  # type: ignore[arg-type]
+    assert written == 0
+
+
+def test_remove_intraday_symbols_not_blocked_by_stored_zero_prices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    date = "2026-09-03"
+    target = intraday_store.intraday_partition_path(1, date, "krx_aftermarket")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    df_raw = pd.DataFrame([
+        {**_bar_row("X", 160100, close=0), "snapshot_date": date},
+        {**_bar_row("Y", 160100, close=50000), "snapshot_date": date},
+    ])
+    pq.write_table(pa.Table.from_pandas(df_raw), target)
+    remaining = intraday_store.remove_intraday_symbols(1, date, "krx_aftermarket", {"X"})
+    assert remaining == 1
+    stored = pd.read_parquet(target)
+    assert stored["symbol"].tolist() == ["Y"]
+    assert stored["close"].tolist() == [50000]
+

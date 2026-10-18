@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -23,12 +25,44 @@ from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_loc
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["intraday_partition_path", "log_session_coverage_outliers", "remove_intraday_symbols", "tick_partition_path", "write_intraday_partition", "write_tick_partition"]
+__all__ = [
+    "NonPositivePriceError",
+    "intraday_partition_path",
+    "log_session_coverage_outliers",
+    "remove_intraday_symbols",
+    "tick_partition_path",
+    "write_intraday_partition",
+    "write_tick_partition",
+]
 
 _LOCK_TIMEOUT_SECONDS = DEFAULT_LOCK_TIMEOUT_SECONDS
 
 # Mirrors the Toss basis gate verdict; the consolidated partition holds only these rows.
 _CONSOLIDATED_TAPE_REASON: str = "toss_consolidated_tape"
+
+
+class NonPositivePriceError(ValueError):
+    """Write rejected: canonical rows carry a null or non-positive price; names the offending symbols."""
+
+    def __init__(
+        self,
+        *,
+        kind: Literal["bars", "ticks"],
+        snapshot_date: str,
+        session: str,
+        symbols: tuple[str, ...] | Iterable[str],
+        rows: int,
+    ) -> None:
+        self.kind: Literal["bars", "ticks"] = kind
+        self.snapshot_date: str = str(snapshot_date)
+        self.session: str = str(session)
+        self.symbols: tuple[str, ...] = tuple(sorted({str(s) for s in symbols}))
+        self.rows: int = int(rows)
+        super().__init__(
+            f"nonpositive_price kind={self.kind} session={self.session} "
+            f"date={self.snapshot_date} n_symbols={len(self.symbols)} "
+            f"n_rows={self.rows} samples={list(self.symbols[:5])}"
+        )
 
 
 def _require_known_session(session: str) -> str:
@@ -150,6 +184,18 @@ def _validate_tick_frame(
     volumes = pd.to_numeric(df["volume"], errors="coerce")
     if bool(volumes.isna().any()) or bool((volumes < 0).any()):
         raise ValueError("Tick frame carries invalid negative volume")
+    prices = pd.to_numeric(df["price"], errors="coerce").to_numpy(dtype=float)
+    bad_price_mask = np.isnan(prices) | (prices <= 0)
+    if bool(bad_price_mask.any()):
+        symbols_arr = df["symbol"].astype(str).to_numpy()
+        offending_symbols = tuple(sorted(set(symbols_arr[bad_price_mask])))
+        raise NonPositivePriceError(
+            kind="ticks",
+            snapshot_date=str(snapshot_date),
+            session=str(session),
+            symbols=offending_symbols,
+            rows=int(bad_price_mask.sum()),
+        )
     symbols = sorted({str(item) for item in df["symbol"].astype(str).tolist()})
     if coverage is not None:
         missing = [item for item in symbols if item not in coverage]
@@ -178,6 +224,20 @@ def _validate_bar_frame(
     volumes = pd.to_numeric(df["volume"], errors="coerce")
     if bool(volumes.isna().any()) or bool((volumes < 0).any()):
         raise ValueError("Bar frame carries invalid negative volume")
+    bad_price_mask = np.zeros(len(df), dtype=bool)
+    for col in ("open", "high", "low", "close"):
+        vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+        bad_price_mask |= np.isnan(vals) | (vals <= 0)
+    if bool(bad_price_mask.any()):
+        symbols_arr = df["symbol"].astype(str).to_numpy()
+        offending_symbols = tuple(sorted(set(symbols_arr[bad_price_mask])))
+        raise NonPositivePriceError(
+            kind="bars",
+            snapshot_date=str(snapshot_date),
+            session=str(session),
+            symbols=offending_symbols,
+            rows=int(bad_price_mask.sum()),
+        )
     symbols = sorted({str(item) for item in df["symbol"].astype(str).tolist()})
     if coverage is not None:
         missing = [item for item in symbols if item not in coverage]
