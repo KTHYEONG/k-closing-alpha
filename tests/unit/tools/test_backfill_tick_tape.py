@@ -16,7 +16,7 @@ import pytest
 
 import src.backfill.intraday.tape_recovery as tr
 import src.tools.backfill_tick_tape as btt
-from src.backfill.intraday.tape_harvest import TAPE_SESSIONS, TapeDayResult, TapeWalkOutcome
+from src.backfill.intraday.tape_harvest import TAPE_SESSIONS, FlushReport, TapeDayResult, TapeWalkOutcome
 from src.config.collection import CollectionSettings
 from src.data.capture_contracts import (
     ArtifactRef,
@@ -805,7 +805,7 @@ def test_run_tasks_flushes_by_row_bound_and_commits_ledger_only_after_flush(tmp_
         def flush(self) -> Any:
             events.append(f"flush:ledger_exists={ledger.exists()}")
             self.rows = 0
-            return None
+            return FlushReport(partitions_written=0, rows_written=0, entries_by_status={})
 
     async def _emit(client: Any, session: Any, symbol: str, days: Any, **kwargs: Any) -> Any:
         frame = normalize_tick_frame(pd.DataFrame(_tick_rows(["090000"])), "kiwoom", _DAY, symbol)
