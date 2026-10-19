@@ -727,7 +727,11 @@ class KisApiClient:
         floor_hour: str = "090000",
         market_div_code: str | None = None,
     ) -> dict[str, Any]:
-        """주식당일분봉조회(FHKST03010200)를 30건/호출 제한 하 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합."""
+        """주식당일분봉조회(FHKST03010200)를 30건/호출 제한 하 [floor_hour, end_hour] 구간 역순 페이지네이션으로 취합.
+
+        A page that fails after earlier pages succeeded returns that failure, not the rows collected so far:
+        a head-truncated session must never be certified COMPLETE.
+        """
         normalized = self._normalize_market_div_code(market_div_code)
         if not normalized:
             raise ValueError("market_div_code must be explicitly provided (e.g. 'J' or 'NX')")
@@ -748,9 +752,12 @@ class KisApiClient:
                 session.get, url, headers=self._get_headers("FHKST03010200"), params=params
             )
             if res.get("rt_cd") != "0":
-                if not collected:
-                    return res
-                break
+                if collected:
+                    logger.warning(
+                        "[DATA] stage=intraday_minute_chart status=PAGE_FAILED code=%s cursor=%s rows_discarded=%d msg_cd=%s",
+                        code, cursor_hour, len(collected), res.get("msg_cd", ""),
+                    )
+                return res
             rows = res.get("output2") or []
             if not rows:
                 break

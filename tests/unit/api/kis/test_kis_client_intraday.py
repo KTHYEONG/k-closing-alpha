@@ -36,6 +36,25 @@ def test_get_intraday_minute_chart_paginates_within_floor_and_ceil() -> None:
         # 거부해 2026-09-18 archive-intraday가 정규세션 1분봉을 0행으로 받았다.
         assert params.get("FID_ETC_CLS_CODE") == ""
 
+def test_get_intraday_minute_chart_returns_failure_when_later_page_fails() -> None:
+    client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
+    page1 = {"rt_cd": "0", "output2": [{"stck_cntg_hour": "153000"}, {"stck_cntg_hour": "151200"}]}
+    failure = {"rt_cd": "9", "msg1": "최대 재시도 횟수 초과 (TPS 제한)"}
+    handle_request = AsyncMock(side_effect=[page1, failure])
+
+    async def _runner():
+        with patch.object(client, "_handle_request", handle_request):
+            return await client.get_intraday_minute_chart(
+                _FakeSession(), "005930",
+                end_hour="153000", floor_hour="090000", market_div_code="J",
+            )
+
+    result = asyncio.run(_runner())
+
+    assert result["rt_cd"] == "9"
+    assert "output2" not in result
+
+
 def test_get_historical_minute_chart_paginates_with_target_date() -> None:
     client = KisApiClient(app_key="k", app_secret="s", account_id="a", hts_id="h")
 
