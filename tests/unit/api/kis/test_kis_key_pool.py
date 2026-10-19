@@ -655,3 +655,42 @@ def test_no_secret_in_errors() -> None:
             parse_host_data_credentials(env)
         rendered = f"{excinfo.value!s}\n{excinfo.value!r}"
         assert not any(s in rendered for s in secrets)
+
+
+def _prewarm(clients: list, creds: list):
+    import asyncio
+
+    from src.api.kis.key_pool import prewarm_healthy_clients
+
+    return asyncio.run(prewarm_healthy_clients(clients, creds, object()))
+
+
+class _TokenClient:
+    def __init__(self, fail: bool) -> None:
+        self.fail = fail
+
+    async def ensure_token(self, session: object) -> None:
+        if self.fail:
+            raise RuntimeError("secret-bearing detail")
+
+
+def test_prewarm_healthy_clients_isolates_failed_slot() -> None:
+    from src.api.kis.key_pool import KisCredential
+
+    good, bad = _TokenClient(False), _TokenClient(True)
+    creds = [KisCredential(slot="DATA_1", app_key="k1", app_secret="s1", hts_id=""),
+             KisCredential(slot="DATA_2", app_key="k2", app_secret="s2", hts_id="")]
+
+    healthy, failed = _prewarm([bad, good], creds)
+
+    assert healthy == [good]
+    assert failed == ("DATA_1",)
+
+
+def test_prewarm_healthy_clients_fails_closed_when_no_slot_usable() -> None:
+    from src.api.kis.key_pool import KisCredential
+
+    creds = [KisCredential(slot="DATA_1", app_key="k1", app_secret="s1", hts_id="")]
+
+    with pytest.raises(RuntimeError, match="DATA_1"):
+        _prewarm([_TokenClient(True)], creds)

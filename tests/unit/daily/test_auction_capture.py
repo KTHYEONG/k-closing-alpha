@@ -842,6 +842,7 @@ def test_run_async_builds_clients(tmp_path, monkeypatch) -> None:
     seen: dict[str, Any] = {}
 
     class _Cred:
+        slot = "DATA_5"
         app_key = "key5"
         app_secret = "sec5"
         hts_id = "hts5"
@@ -884,6 +885,7 @@ def _stub_research_clients(monkeypatch: Any) -> None:
     from src.daily import auction_capture
 
     class _Cred:
+        slot = "DATA_5"
         app_key = "key5"
         app_secret = "sec5"
         hts_id = "hts5"
@@ -1560,3 +1562,69 @@ def test_open_roster_missing_previous_and_ledger_failure_warns_both(tmp_path, mo
     assert (roster, cohort_id, incomplete) == ([], None, True)
     assert any("reason=missing_previous" in r.message for r in caplog.records)
     assert any("reason=held_roster_unavailable error=OSError" in r.message for r in caplog.records)
+
+
+def test_run_async_continues_with_healthy_slots_when_one_token_fails(tmp_path, monkeypatch) -> None:
+    from src.daily import auction_capture
+
+    class _Cred:
+        def __init__(self, slot: str) -> None:
+            self.slot, self.app_key, self.app_secret, self.hts_id = slot, f"key-{slot}", "sec", "hts"
+
+    monkeypatch.setattr(
+        auction_capture, "resolve_research_credentials", lambda env, *, slots: (_Cred("DATA_1"), _Cred("DATA_2"))
+    )
+
+    class _Client:
+        def __init__(self, app_key: str, *args: Any, **kwargs: Any) -> None:
+            self.app_key = app_key
+
+        def create_session(self) -> _Session:
+            return _Session()
+
+        async def ensure_token(self, session: Any) -> None:
+            if self.app_key == "key-DATA_1":
+                raise RuntimeError("token issuance failed")
+
+    monkeypatch.setattr("src.api.kis.client.KisApiClient", _Client)
+    seen: dict[str, Any] = {}
+
+    async def _capture(*args: Any, **kwargs: Any) -> str:
+        seen.update(kwargs)
+        return "manifest-ok"
+
+    async def _open(client: Any, session: Any, date: Any) -> bool:
+        seen["probe_client"] = client.app_key
+        return True
+
+    monkeypatch.setattr(auction_capture, "run_auction_capture", _capture)
+    monkeypatch.setattr(auction_capture, "is_kis_trading_day", _open)
+
+    out = asyncio.run(auction_capture._run_async("2026-09-17", "close", _profile(tmp_path)))
+
+    assert out == "manifest-ok"
+    assert [c.app_key for c in seen["clients"]] == ["key-DATA_2"]
+    assert seen["degraded_slots"] == ("DATA_1",)
+    assert seen["probe_client"] == "key-DATA_2"
+
+
+def test_degraded_slot_marks_manifest_partial(tmp_path) -> None:
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", ["000001"])
+    now = _seoul(2026, 9, 17, 15, 0)
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_profile(tmp_path),
+            store=store,
+            clients=[_FakeClient(calls=[])],
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: now,
+            degraded_slots=("DATA_1",),
+        )
+    )
+    assert manifest.status == CaptureStatus.PARTIAL

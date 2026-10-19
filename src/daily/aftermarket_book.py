@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from src import settings
-from src.api.kis.key_pool import resolve_research_credentials, token_cache_path
+from src.api.kis.key_pool import prewarm_healthy_clients, resolve_research_credentials, token_cache_path
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
     INTRADAY_SESSION_KRX_AFTERMARKET,
@@ -223,6 +223,7 @@ async def run_aftermarket_book_capture(
     dense_symbols: Sequence[str],
     sparse_symbols: Sequence[str],
     roster_incomplete: bool = False,
+    degraded_slots: Sequence[str] = (),
     now_fn: Callable[[], datetime] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] | None = None,
 ) -> tuple[CaptureManifest, ...]:
@@ -244,6 +245,7 @@ async def run_aftermarket_book_capture(
         roster_incomplete: True when the held-position roster could not be fully read;
             every published manifest is then PARTIAL because the dense universe may be
             missing held lots.
+        degraded_slots: Slots whose token issuance failed before capture; any makes every manifest PARTIAL.
         now_fn: Aware clock; None uses Asia/Seoul now.
         sleep_fn: Wait primitive; None uses asyncio.sleep.
 
@@ -263,6 +265,11 @@ async def run_aftermarket_book_capture(
         raise ValueError(f"Invalid snapshot_date: {snapshot_date!r}") from None
     if not clients:
         raise ValueError("aftermarket book capture requires prewarmed data clients")
+    if degraded_slots:
+        logger.warning(
+            "[DATA] stage=aftermarket_book status=DEGRADED reason=slot_token_failed slots=%s healthy=%d",
+            ",".join(degraded_slots), len(clients),
+        )
     dense = tuple(sorted({str(item).strip().zfill(6) for item in dense_symbols if str(item).strip()}))
     sparse = tuple(sorted({str(item).strip().zfill(6) for item in sparse_symbols if str(item).strip()}))
     rounds = aftermarket_book_rounds(
@@ -510,7 +517,7 @@ async def run_aftermarket_book_capture(
                         failed += 1
                 status = (
                     CaptureStatus.PARTIAL
-                    if roster_incomplete or not all(item.status in GOOD_ENTRY_STATES for item in entries)
+                    if roster_incomplete or degraded_slots or not all(item.status in GOOD_ENTRY_STATES for item in entries)
                     else CaptureStatus.COMPLETE
                 )
                 manifest = CaptureManifest(
@@ -605,8 +612,7 @@ async def _run_async(snapshot_date: str, profile: CollectionSettings) -> tuple[C
     ]
     store = CaptureStore(_capture_root(profile))
     async with clients[0].create_session() as broker_session:
-        for client in clients:
-            await client.ensure_token(broker_session)
+        clients, degraded_slots = await prewarm_healthy_clients(clients, creds, broker_session)
         if not await is_kis_trading_day(clients[0], broker_session, snapshot_date):
             return None
     held = load_held_roster()
@@ -619,6 +625,7 @@ async def _run_async(snapshot_date: str, profile: CollectionSettings) -> tuple[C
         dense_symbols=dense_symbols,
         sparse_symbols=sparse_symbols,
         roster_incomplete=not held.ok,
+        degraded_slots=degraded_slots,
     )
 
 
