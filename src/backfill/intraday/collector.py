@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import numpy as np
 import pandas as pd
@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from src.api.kis.client import KisApiClient
     from src.api.kiwoom.client import KiwoomApiClient
 
+from src.api.auth_rejection import is_kis_data_auth_rejected
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
     INTRADAY_SESSION_KRX_AFTERMARKET,
@@ -61,6 +62,24 @@ logger = logging.getLogger(__name__)
 _EXHAUSTED_TERMINALS = frozenset({"exhausted", "crossed_target_date", "crossed_time_floor"})
 _NONCERTIFIED = frozenset({CaptureStatus.PARTIAL, CaptureStatus.FAILED, CaptureStatus.UNKNOWN})
 _ERROR_RE = re.compile(r"[^A-Za-z0-9_]+")
+
+VENDOR_FAILURE_TRANSIENT_PREFIX: Final[str] = "vendor_failure:transient:"
+VENDOR_FAILURE_REJECTED_PREFIX: Final[str] = "vendor_failure:rejected:"
+
+
+def _classify_kis_vendor_failure(payload: object) -> str:
+    """Return the FAILED reason for a non-"0" rt_cd KIS payload: transient:<tag>, rejected:<tag>, or bare vendor_failure for a non-dict payload."""
+    if not isinstance(payload, dict):
+        return "vendor_failure"
+    raw_tag = payload.get("msg_cd", "")
+    tag = _ERROR_RE.sub("-", str(raw_tag or "")).strip("-") or "none"
+    if is_kis_data_auth_rejected(payload):
+        return f"{VENDOR_FAILURE_TRANSIENT_PREFIX}{tag}"
+    if "초당 거래건수" in str(payload.get("msg1", "")):
+        return f"{VENDOR_FAILURE_TRANSIENT_PREFIX}{tag}"
+    if str(payload.get("rt_cd", "")) == "9" and not str(payload.get("msg_cd", "") or ""):
+        return f"{VENDOR_FAILURE_TRANSIENT_PREFIX}{tag}"
+    return f"{VENDOR_FAILURE_REJECTED_PREFIX}{tag}"
 
 
 def _canonical_kis_bars(rows: list[dict[str, Any]], snapshot_date: str, code: str) -> pd.DataFrame:
@@ -678,6 +697,7 @@ async def _kis_bar_attempt(
     run_id: str,
     profile: CollectionSettings,
     attempt: int,
+    classify_vendor_failure: bool = False,
 ) -> tuple[pd.DataFrame, CoverageEntry]:
     refs: list[Any] = []
     venue = _venue_for(vendor="kis", endpoint="kis-chart", market_div_code=market_div_code, profile=profile)
@@ -706,9 +726,10 @@ async def _kis_bar_attempt(
     received = _seoul_now()
     refs.append(store.append_response(_page_response(context, payload, started, received, attempt)))
     if not isinstance(payload, dict) or payload.get("rt_cd") != "0":
+        reason = _classify_kis_vendor_failure(payload) if classify_vendor_failure else "vendor_failure"
         return _empty_bar_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
-            status=CaptureStatus.FAILED, rows=0, reason="vendor_failure", refs=refs,
+            status=CaptureStatus.FAILED, rows=0, reason=reason, refs=refs,
         )
     rows = [dict(r) for r in (payload.get("output2") or []) if isinstance(r, dict)]
     regular, other = _split_session_window(rows, ymd, floor, ceil, "kis")
@@ -1877,7 +1898,7 @@ async def backfill_extended_session_bars(client: Any, session: Any, stock_codes:
             trading_day=trading_day, ymd=ymd, bar_interval_minutes=int(bar_interval_minutes),
             floor=floor, ceil=ceil, market_div_code=market_div_code, session_tag=str(session_tag),
             dataset=CaptureDataset.MINUTE_BARS, store=store, run_id=resolved_run,
-            profile=prof, attempt=0,
+            profile=prof, attempt=0, classify_vendor_failure=True,
         )
         if (
             market_div_code == KRX_CLOSE_MARKET_DIV_CODE
