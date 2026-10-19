@@ -27,7 +27,13 @@ import numpy as np
 import pandas as pd
 
 from src import settings
-from src.backfill.intraday.collector import backfill_extended_session_bars, backfill_kiwoom_raw_bars, publish_pending_manifest
+from src.backfill.intraday.collector import (
+    VENDOR_FAILURE_REJECTED_PREFIX,
+    VENDOR_FAILURE_TRANSIENT_PREFIX,
+    backfill_extended_session_bars,
+    backfill_kiwoom_raw_bars,
+    publish_pending_manifest,
+)
 from src.backfill.intraday.price_basis import PriceReference
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
@@ -81,6 +87,72 @@ EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS: int = 3
 _TERMINAL_LEDGER_STATES: frozenset[str] = frozenset({"COMPLETE", "NO_TRADES", "NOT_APPLICABLE", "EXHAUSTED"})
 # 원주가 소스(Kiwoom ka10080 _NX)가 있는 세션. KRX 애프터는 Kiwoom 과거 원주가 경로가 없어 fail-closed.
 _RAW_SOURCE_SESSIONS: frozenset[str] = frozenset({INTRADAY_SESSION_NXT_AFTERMARKET, INTRADAY_SESSION_NXT_PREMARKET})
+
+_DETERMINISTIC_FAILURE_REASONS: frozenset[str] = frozenset(
+    {
+        "raw_basis_unavailable",
+        "nonpositive_price",
+        "price_basis_raw_basis_unavailable",
+        "price_basis_no_raw_source",
+        "price_basis_unknown",
+        "price_basis_nonpositive_price",
+    }
+)
+
+
+def _strip_terminal_markers(reason: str) -> str:
+    stripped = str(reason)
+    while stripped.startswith("exhausted:") or stripped.startswith("reopened:"):
+        if stripped.startswith("exhausted:"):
+            stripped = stripped[len("exhausted:") :]
+        else:
+            stripped = stripped[len("reopened:") :]
+    return stripped
+
+
+def _normalized_failure_reason(reason: str) -> str:
+    stripped = _strip_terminal_markers(reason)
+    if stripped.startswith("price_basis_"):
+        stripped = stripped[len("price_basis_") :]
+    return stripped
+
+
+def is_transient_failure(reason: str) -> bool:
+    """True when a FAILED reason is a vendor/network outage that says nothing about the symbol-day."""
+    normalized = _normalized_failure_reason(reason)
+    if normalized.startswith("transport:"):
+        return True
+    if normalized.startswith("raw_basis_transport:"):
+        return True
+    if normalized == "raw_basis_vendor_error" or normalized.startswith("raw_basis_vendor_error:"):
+        return True
+    return normalized.startswith(VENDOR_FAILURE_TRANSIENT_PREFIX)
+
+
+def is_deterministic_failure(reason: str) -> bool:
+    """True when a reason is a known stable data gap."""
+    stripped = _strip_terminal_markers(reason)
+    if stripped in _DETERMINISTIC_FAILURE_REASONS:
+        return True
+    return stripped.startswith(VENDOR_FAILURE_REJECTED_PREFIX)
+
+
+def failure_reason_class(reason: str) -> str:
+    """Stable grouping key of a reason."""
+    stripped = _strip_terminal_markers(reason)
+    had_basis = stripped.startswith("price_basis_")
+    normalized = stripped[len("price_basis_") :] if had_basis else stripped
+    if normalized.startswith("vendor_failure:"):
+        grouped = ":".join(normalized.split(":")[:2])
+    elif not normalized:
+        return "empty"
+    else:
+        grouped = normalized.split(":")[0]
+    if not grouped:
+        return "empty"
+    if had_basis:
+        return f"price_basis_{grouped}"
+    return grouped
 
 
 def default_ledger_path() -> Path:
@@ -424,12 +496,12 @@ class ExtendedBackfillLedger:
         attempted_at: datetime,
         vendor: str = "kis",
         price_bases: Mapping[str, str] | None = None,
-    ) -> None:
-        """Append per-symbol outcomes; failures stay retryable until the attempt cap.
+        is_transient: Callable[[str], bool] | None = None,
+    ) -> int:
+        """Append per-symbol outcomes under the ledger lock and return how many keys this call turned EXHAUSTED.
 
-        A key that has failed EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS consecutive runs is recorded as EXHAUSTED (terminal):
-        vendor history for an old date does not reappear, and retrying it forever rewrites old evidence directories
-        nightly (unprunable locally, one offsite segment per date). Any non-FAILED outcome resets the count.
+        A key turns EXHAUSTED only after EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS non-transient FAILED outcomes;
+        a FAILED whose reason satisfies `is_transient` never consumes an attempt (None keeps every FAILED counting).
 
         Args:
             snapshot_date: Trading date of the session partition.
@@ -439,6 +511,7 @@ class ExtendedBackfillLedger:
             attempted_at: Aware attempt instant.
             vendor: Data source of these entries for audit; it never changes terminal semantics.
             price_bases: Raw-basis source per COMPLETE symbol ("kis_raw" or "kiwoom_raw"); others empty.
+            is_transient: Predicate over the raw FAILED reason; transient failures stay FAILED without consuming attempts.
         """
         bases = dict(price_bases) if price_bases is not None else {}
         pending = [
@@ -461,7 +534,7 @@ class ExtendedBackfillLedger:
             if entry.symbol is not None
         ]
         if not pending:
-            return
+            return 0
         with exclusive_file_lock(
             sidecar_lock_path(self._path),
             timeout_seconds=DEFAULT_LOCK_TIMEOUT_SECONDS,
@@ -474,14 +547,20 @@ class ExtendedBackfillLedger:
             else:
                 prev = {}
             rows = []
+            newly_exhausted = 0
             for entry, row in pending:
                 if entry.status == CaptureStatus.FAILED:
+                    transient = bool(is_transient(str(entry.reason))) if is_transient is not None else False
                     before = prev.get(str(entry.symbol))
-                    attempts = int(before[1]) + 1 if before is not None and before[0] == "FAILED" else 1
-                    if attempts >= EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS:
-                        row["status"] = "EXHAUSTED"
-                        row["reason"] = f"exhausted:{row['reason']}"
-                    row["attempts"] = attempts
+                    if transient:
+                        row["attempts"] = int(before[1]) if before is not None and before[0] == "FAILED" else 0
+                    else:
+                        attempts = int(before[1]) + 1 if before is not None and before[0] == "FAILED" else 1
+                        if attempts >= EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS:
+                            row["status"] = "EXHAUSTED"
+                            row["reason"] = f"exhausted:{row['reason']}"
+                            newly_exhausted += 1
+                        row["attempts"] = attempts
                 else:
                     row["attempts"] = 0
                 rows.append(row)
@@ -493,6 +572,7 @@ class ExtendedBackfillLedger:
             )
             combined = combined.drop_duplicates(subset=list(_LEDGER_KEYS), keep="last")
             atomic_write_parquet(combined[list(_LEDGER_COLUMNS)], self._path)
+            return newly_exhausted
 
     def record_cached_absent(
         self,
@@ -969,29 +1049,14 @@ async def run_extended_session_backfill(
                 )
                 store.publish_manifest(manifest)
                 if entries:
-                    prev_frame = ledger._read_all()
-                    prev_map = (
-                        _latest_attempts(
-                            _with_legacy_columns(prev_frame), task.snapshot_date, task.session
-                        )
-                        if not prev_frame.empty
-                        else {}
-                    )
-                    ledger.record(
+                    exhausted += ledger.record(
                         task.snapshot_date,
                         task.session,
                         entries,
                         run_id=run_id,
                         attempted_at=clock(),
                         price_bases=price_bases,
-                    )
-                    exhausted += sum(
-                        1
-                        for entry in entries
-                        if entry.status == CaptureStatus.FAILED
-                        and (before := prev_map.get(str(entry.symbol))) is not None
-                        and before[0] == "FAILED"
-                        and int(before[1]) + 1 >= EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
+                        is_transient=is_transient_failure,
                     )
             task_complete = sum(1 for entry in entries if entry.status == CaptureStatus.COMPLETE)
             task_no_trades = sum(1 for entry in entries if entry.status == CaptureStatus.NO_TRADES)

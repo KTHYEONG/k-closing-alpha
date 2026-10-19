@@ -227,6 +227,26 @@ def _entry(symbol: str, status: CaptureStatus, session: str = "nxt_aftermarket")
     )
 
 
+@pytest.mark.parametrize("raw_transport", [False, True])
+def test_transport_outages_remain_retryable_across_nights(env, raw_transport) -> None:
+    profile, store, ledger = env
+    day, symbol = "2026-03-02", "000001"
+    kis = _FakeKis(day, traded={symbol}, fail=set() if raw_transport else {symbol})
+    raw = _FakeKiwoom(day, raw={symbol: "1000"}, error={symbol}) if raw_transport else None
+    reference = _ref([(day, symbol, 500.0, 1000.0)]) if raw_transport else _raw_ref(day, {symbol})
+    task = ExtendedBackfillTask(day, "nxt_aftermarket", (symbol,))
+    for _ in range(4):
+        summary = _run(profile, store, ledger, [kis], [task], reference, raw_client=raw)
+        assert summary.failed == 1 and summary.exhausted == 0
+        assert classify_extended_backfill_outcome(summary)[0] == "DEGRADED"
+        row = ledger._read_all().iloc[0]
+        assert row["status"] == "FAILED" and row["attempts"] == 0
+        assert not ledger.terminal_symbols(day, task.session)
+    assert kis.requested == [symbol] * 4
+    if raw is not None:
+        assert len(raw.calls) == 4
+
+
 def test_ledger_terminal_and_stored_symbols_are_not_refetched(env) -> None:
     from src.data.intraday_schema import normalize_bar_frame
     from src.data.intraday_store import write_intraday_partition
