@@ -5759,3 +5759,87 @@ def test_dense_audit_excuse_never_applies_to_regular() -> None:
         krx_aftermarket_zero_row_symbols=frozenset({"B"}),
     )
     assert "intraday:regular:1:missing_symbols" in issues
+
+
+def _aftermarket_audit_issues(krx_rows: list[dict]) -> tuple[str, ...]:
+    from datetime import date
+
+    import pandas as pd
+
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionKind
+    from src.tools.daily_audit import (
+        audit_intraday_partitions,
+        expected_krx_aftermarket_stamps,
+        expected_regular_stamps,
+    )
+
+    day = date(2026, 10, 15)
+    clock = SessionClock.standard(day)
+    reg_frame = pd.DataFrame([{"symbol": "A", "ts_hms": stamp} for stamp in expected_regular_stamps(clock)])
+    dense = [
+        {"symbol": "A", "ts_hms": stamp, "vendor": "kis", "has_trade": stamp % 200 == 0}
+        for stamp in expected_krx_aftermarket_stamps()
+    ]
+    empty = pd.DataFrame(columns=["symbol", "ts_hms"])
+    frames = {
+        "regular": reg_frame,
+        "krx_aftermarket": pd.DataFrame([*dense, *krx_rows]),
+        "nxt_premarket": empty,
+        "nxt_aftermarket": empty,
+    }
+    return audit_intraday_partitions(
+        day,
+        clock=clock,
+        session_kind=SessionKind.STANDARD,
+        cohort_symbols=("A",),
+        read_partition=frames.get,
+    )
+
+
+def test_dense_audit_accepts_dbsec_trade_only_symbol() -> None:
+    sparse = [
+        {"symbol": "B", "ts_hms": stamp, "vendor": "dbsec", "has_trade": True} for stamp in (160500, 195800)
+    ]
+
+    issues = _aftermarket_audit_issues(sparse)
+
+    assert not any(issue.endswith(":missing_bars") for issue in issues)
+
+
+def test_dense_audit_flags_sparse_kis_symbol() -> None:
+    sparse = [{"symbol": "B", "ts_hms": stamp, "vendor": "kis", "has_trade": True} for stamp in (160500, 195800)]
+
+    issues = _aftermarket_audit_issues(sparse)
+
+    assert "intraday:krx_aftermarket:1:missing_bars" in issues
+
+
+def test_dense_audit_flags_dbsec_symbol_with_no_trade_rows_but_gaps() -> None:
+    sparse = [
+        {"symbol": "B", "ts_hms": 160500, "vendor": "dbsec", "has_trade": True},
+        {"symbol": "B", "ts_hms": 160600, "vendor": "dbsec", "has_trade": False},
+    ]
+
+    issues = _aftermarket_audit_issues(sparse)
+
+    assert "intraday:krx_aftermarket:1:missing_bars" in issues
+
+
+def test_read_stored_partition_keeps_vendor_and_has_trade_when_stored(monkeypatch, tmp_path) -> None:
+    import pandas as pd
+
+    from src.data.intraday_store import intraday_partition_path
+    from src.tools import daily_audit
+
+    monkeypatch.setattr(daily_audit.settings, "HISTORY_DIR", tmp_path, raising=False)
+    path = intraday_partition_path(1, "2026-09-23", "regular")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {"symbol": ["005930"], "ts_hms": [90100], "close": [70000], "vendor": ["kis"], "has_trade": [True]}
+    ).to_parquet(path, index=False)
+
+    frame = daily_audit._read_stored_partition("2026-09-23", "regular")
+
+    assert frame is not None
+    assert list(frame.columns) == ["symbol", "ts_hms", "vendor", "has_trade"]
