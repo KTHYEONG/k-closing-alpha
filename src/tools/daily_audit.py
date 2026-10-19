@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from src import settings
 from src.api.kis.key_pool import load_kis_env, read_token_issued_date, resolve_host_issued_credentials, token_cache_path
@@ -546,6 +547,9 @@ def audit_collection_manifests(
     return tuple(issues)
 
 
+_TRADE_ONLY_PROBE_COLUMNS = ("vendor", "has_trade")
+
+
 def _intraday_issue(session: str, count: int, reason: str) -> str:
     return f"intraday:{session}:{count}:{reason}"
 
@@ -584,7 +588,19 @@ def _read_stored_partition(snapshot_date: str, session: str) -> pd.DataFrame | N
     path = intraday_partition_path(1, snapshot_date, session)
     if not path.exists():
         return None
-    return pd.read_parquet(path, columns=["symbol", "ts_hms"])
+    stored = set(pq.read_schema(path).names)
+    columns = ["symbol", "ts_hms", *(name for name in _TRADE_ONLY_PROBE_COLUMNS if name in stored)]
+    return pd.read_parquet(path, columns=columns)
+
+
+def _trade_only_symbols(frame: pd.DataFrame) -> frozenset[str]:
+    """Symbols stored only as DBSEC fallback bars (vendor dbsec, every row has_trade): DBSEC omits no-trade minutes."""
+    if not set(_TRADE_ONLY_PROBE_COLUMNS) <= set(frame.columns):
+        return frozenset()
+    trade_only = frame.assign(
+        _db_trade=(frame["vendor"].astype(str) == "dbsec") & frame["has_trade"].fillna(False).astype(bool)
+    ).groupby(frame["symbol"].astype(str))["_db_trade"].all()
+    return frozenset(trade_only.index[trade_only])
 
 
 def _stamps_by_symbol(frame: pd.DataFrame) -> dict[str, set[int]]:
@@ -611,7 +627,10 @@ def _audit_dense_partition(
     missing_symbols = sorted(symbol for symbol in expected_symbols if symbol not in present)
     if missing_symbols:
         issues.append(_intraday_issue(session, len(missing_symbols), "missing_symbols"))
-    missing_bar_symbols = sorted(symbol for symbol in present if not expected_set.issubset(by_symbol[symbol]))
+    trade_only = _trade_only_symbols(frame)
+    missing_bar_symbols = sorted(
+        symbol for symbol in present - trade_only if not expected_set.issubset(by_symbol[symbol])
+    )
     first_missing: list[int] = []
     if missing_bar_symbols:
         issues.append(_intraday_issue(session, len(missing_bar_symbols), "missing_bars"))
@@ -685,9 +704,9 @@ def audit_intraday_partitions(
         session_kind: Resolved session status; aftermarket grid checks are
             skipped (with an explicit issue) on non-STANDARD days.
         cohort_symbols: Declared eligible symbols of the day.
-        read_partition: session -> frame with symbol and ts_hms, None when the
-            partition file is absent (injectable for tests). None reads parquet
-            with column pruning (symbol, ts_hms).
+        read_partition: session -> frame with symbol and ts_hms (plus vendor and
+            has_trade when stored), None when the partition file is absent
+            (injectable for tests). None reads parquet with column pruning.
         krx_aftermarket_zero_row_symbols: Symbols certified with zero krx_aftermarket
             rows (NO_TRADES/NOT_APPLICABLE); excused from missing_symbols.
 
