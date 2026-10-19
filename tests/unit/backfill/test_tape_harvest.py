@@ -379,7 +379,7 @@ def test_memory_bound_flushes_by_rows(tmp_path) -> None:
     for i in range(4):
         day = f"2020-01-{10 + i:02d}"
         rows = [_tick_on(day, f"0930{i:02d}") for _ in range(6)]
-        frame = th._safe_normalize_ticks("kiwoom", rows, day, "005930", truncated=False)
+        frame = th.normalize_tick_frame(pd.DataFrame(rows), "kiwoom", day, "005930", truncated=False)
         from src.data.capture_contracts import CoverageEntry
         from src.data.capture_contracts import CaptureDataset
 
@@ -586,7 +586,7 @@ def _flush_one_certified_day(store, profile, namespace=None) -> None:
     pub.add(
         TapeDayResult(
             symbol="005930", day=_DAY, session="regular",
-            frame=th._safe_normalize_ticks("kiwoom", rows, _DAY, "005930", truncated=False),
+            frame=th.normalize_tick_frame(pd.DataFrame(rows), "kiwoom", _DAY, "005930", truncated=False),
             entry=th.CoverageEntry(
                 symbol="005930", dataset=th.CaptureDataset.TRADE_TICKS, venue="KRX", session="regular",
                 scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1, first_event_time=None,
@@ -847,3 +847,130 @@ def test_pair_selection_is_preserved_through_publication_and_ledger(tmp_path, mo
         assert store.read_manifests(day)
     assert not th.tick_partition_path(_DAY, "regular").exists()
     assert not th.tick_partition_path(_DAY2, "krx_aftermarket").exists()
+
+
+def _harvest_one(tmp_path, rows: list[dict]) -> list[TapeDayResult]:
+    stub = _StubTape(
+        [(rows, {"cont-yn": "N", "next-key": ""})],
+        [(_DAY, rows, _cert(_DAY, len(rows), len(rows), True))],
+        [_cert(_DAY, len(rows), len(rows), True)],
+    )
+    out: list[TapeDayResult] = []
+    asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "005930", [_DAY], venue="KRX", sessions=_krx_sessions(),
+            store=CaptureStore(tmp_path / "capture"), run_id="tape-2020-01-04-009",
+            profile=_profile(tmp_path), on_result=out.append,
+        )
+    )
+    return out
+
+
+def test_normalize_failure_is_partial_never_no_trades(tmp_path) -> None:
+    out = _harvest_one(tmp_path, [_tick("093000", price=""), _tick("170000", price="")])
+
+    assert {r.entry.status for r in out} == {CaptureStatus.PARTIAL}
+    assert all(r.entry.reason.startswith("normalize_failure:") for r in out)
+    assert all(r.frame.empty and r.entry.rows == 0 for r in out)
+    assert all(len(r.entry.raw_refs) >= 1 for r in out)
+
+
+def test_nonpositive_price_tape_day_is_failed_with_raw_evidence(tmp_path) -> None:
+    out = _harvest_one(tmp_path, [_tick("093000", price="0"), _tick("170000")])
+    by_session = {r.session: r for r in out}
+
+    assert by_session["regular"].entry.status == CaptureStatus.FAILED
+    assert by_session["regular"].entry.reason == "nonpositive_price"
+    assert by_session["regular"].frame.empty
+    assert len(by_session["regular"].entry.raw_refs) >= 2
+    assert by_session["krx_aftermarket"].entry.status == CaptureStatus.COMPLETE
+
+
+def test_walk_with_poison_tape_row_commits_ledger_for_other_recoveries(tmp_path, monkeypatch) -> None:
+    from src import settings
+    from src.backfill.intraday import tape_recovery as tr
+
+    monkeypatch.setattr(settings, "HISTORY_DIR", tmp_path)
+    monkeypatch.setattr(tr, "_disk_ok", lambda root, profile: True)
+    bad_rows = [_tick_on(_DAY, "093000") | {"cur_prc": "0"}]
+    good_rows = [_tick_on(_DAY2, "093000")]
+    stub = _StubTape(
+        [(good_rows + bad_rows, {"cont-yn": "N", "next-key": ""})],
+        [(_DAY2, good_rows, _cert(_DAY2, 1, 1, True)), (_DAY, bad_rows, _cert(_DAY, 1, 1, True))],
+        [_cert(_DAY2, 1, 1, True), _cert(_DAY, 1, 1, True)],
+    )
+    tasks = tr.order_walk_tasks([
+        tr.Need("005930", _DAY2, "regular", "KRX"),
+        tr.Need("005930", _DAY, "regular", "KRX"),
+    ])
+    ledger = tmp_path / "ledger.jsonl"
+    asyncio.run(tr.run_walk_tasks(
+        tasks, client=stub, http_session=object(), store=CaptureStore(tmp_path / "capture"),
+        profile=_profile(tmp_path), apply=True, ledger=ledger, deadline=None, blackouts=[],
+        run_date="2026-10-05",
+    ))
+
+    settled = tr.read_settled_ledger(ledger)
+    assert settled[("005930", _DAY2, "regular")] == CaptureStatus.COMPLETE.value
+    assert settled[("005930", _DAY, "regular")] == CaptureStatus.FAILED.value
+    assert len(pd.read_parquet(th.tick_partition_path(_DAY2, "regular"))) == 1
+
+
+def test_publisher_isolates_rejected_symbol_and_reports_it(tmp_path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    pub = TickTapePublisher(store=store, profile=_profile(tmp_path), flush_rows=10**9)
+
+    def _result(symbol: str, price: str) -> TapeDayResult:
+        frame = th.normalize_tick_frame(
+            pd.DataFrame([_tick("093000", price=price)]), "kiwoom", _DAY, symbol, truncated=False
+        )
+        return TapeDayResult(
+            symbol=symbol, day=_DAY, session="regular", frame=frame,
+            entry=th.CoverageEntry(
+                symbol=symbol, dataset=th.CaptureDataset.TRADE_TICKS, venue="KRX", session="regular",
+                scheduled_at=None, status=CaptureStatus.COMPLETE, rows=1, first_event_time=None,
+                last_event_time=None, reason="tape_complete:regular=1:vendor_total=1", raw_refs=(),
+            ),
+        )
+
+    pub.add(_result("005930", "10000"))
+    pub.add(_result("000660", "0"))
+    report = pub.flush()
+
+    assert set(report.failed) == {("000660", _DAY, "regular")}
+    stored = pd.read_parquet(th.tick_partition_path(_DAY, "regular"))
+    assert set(stored["symbol"].astype(str)) == {"005930"}
+
+
+def test_publish_rejection_is_ledgered_failed_and_other_symbol_proceeds(tmp_path, monkeypatch) -> None:
+    from src import settings
+    from src.backfill.intraday import tape_recovery as tr
+
+    monkeypatch.setattr(settings, "HISTORY_DIR", tmp_path)
+    monkeypatch.setattr(tr, "_disk_ok", lambda root, profile: True)
+    real_write = th.write_tick_partition
+
+    def _reject_000660(df, day, session, **kwargs):
+        if "000660" in set(df["symbol"].astype(str)):
+            raise ValueError("synthetic rejection")
+        return real_write(df, day, session, **kwargs)
+
+    monkeypatch.setattr(th, "write_tick_partition", _reject_000660)
+    ledger = tmp_path / "ledger.jsonl"
+    store = CaptureStore(tmp_path / "capture")
+    for symbol in ("005930", "000660"):
+        rows = [_tick_on(_DAY, "093000")]
+        stub = _StubTape(
+            [(rows, {"cont-yn": "N", "next-key": ""})],
+            [(_DAY, rows, _cert(_DAY, 1, 1, True))],
+            [_cert(_DAY, 1, 1, True)],
+        )
+        asyncio.run(tr.run_walk_tasks(
+            tr.order_walk_tasks([tr.Need(symbol, _DAY, "regular", "KRX")]), client=stub,
+            http_session=object(), store=store, profile=_profile(tmp_path), apply=True,
+            ledger=ledger, deadline=None, blackouts=[], run_date="2026-10-05",
+        ))
+
+    settled = tr.read_settled_ledger(ledger)
+    assert settled[("005930", _DAY, "regular")] == CaptureStatus.COMPLETE.value
+    assert settled[("000660", _DAY, "regular")] == CaptureStatus.FAILED.value
