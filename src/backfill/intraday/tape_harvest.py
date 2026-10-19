@@ -6,7 +6,7 @@ import hashlib
 import uuid
 import logging
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -15,7 +15,8 @@ import pandas as pd
 
 from src.backfill.intraday.collector import (
     _call_with_transport_retry,
-    _safe_normalize_ticks,
+    _empty_tick_frame,
+    _has_nonpositive_tick_price,
     _split_session_window,
     _stage_fragment,
 )
@@ -46,6 +47,7 @@ from src.data.capture_contracts import (
     CoverageEntry,
 )
 from src.data.capture_store import CaptureStore
+from src.data.intraday_schema import normalize_tick_frame
 from src.data.intraday_store import tick_partition_path, write_tick_partition
 
 logger = logging.getLogger(__name__)
@@ -98,6 +100,7 @@ class FlushReport:
     partitions_written: int
     rows_written: int
     entries_by_status: dict[str, int]
+    failed: Mapping[tuple[str, str, str], str] = field(default_factory=dict)
 
 
 def _tape_endpoint(venue: str) -> str:
@@ -147,6 +150,13 @@ def _reject_unclosed_day(day: str, session: str, symbol: str = "") -> None:
     raise ValueError(f"aftermarket session not closed for day: {day!r} symbol={symbol!r} session={session!r}")
 
 
+def _strict_tape_frame(rows: list[dict[str, Any]], day: str, code: str) -> pd.DataFrame:
+    """Normalize Kiwoom tape rows without swallowing failures; raises on malformed rows."""
+    if not rows:
+        return _empty_tick_frame(day)
+    return normalize_tick_frame(pd.DataFrame(rows), "kiwoom", day, code, truncated=False)
+
+
 def _settle_certified_day(
     *,
     code: str,
@@ -177,43 +187,71 @@ def _settle_certified_day(
     stray = [r for r in rows if id(r) not in in_any]
     day_refs = list(refs)
     if stray:
-        frag = _stage_fragment(
-            store,
-            run_id=run_id,
-            trading_day=date.fromisoformat(day),
-            dataset=CaptureDataset.TRADE_TICKS,
-            symbol=code,
-            session=sessions[0].session,
-            frame=_safe_normalize_ticks("kiwoom", stray, day, code, truncated=False),
-            reason="out_of_window",
-        )
-        day_refs.append(frag)
-    for spec in sessions:
-        kept = windows[spec.session]
-        frame = _safe_normalize_ticks("kiwoom", kept, day, code, truncated=False)
-        if venue == "UNKNOWN":
-            entry = CoverageEntry(
-                symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=venue, session=spec.session,
-                scheduled_at=None, status=CaptureStatus.UNKNOWN, rows=0,
-                first_event_time=None, last_event_time=None,
-                reason="uncertified_venue", raw_refs=tuple(day_refs),
-            )
-        elif len(frame) > 0:
-            entry = CoverageEntry(
-                symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=venue, session=spec.session,
-                scheduled_at=None, status=CaptureStatus.COMPLETE, rows=len(frame),
-                first_event_time=None, last_event_time=None,
-                reason=f"{proof}:{spec.session}={len(kept)}:vendor_total={vendor_total}",
-                raw_refs=tuple(day_refs),
+        try:
+            stray_frame = _strict_tape_frame(stray, day, code)
+        except Exception as exc:
+            logger.warning(
+                "[DATA] stage=tape_harvest status=STRAY_UNNORMALIZABLE symbol=%s day=%s rows=%d error=%s",
+                code, day, len(stray), type(exc).__name__,
             )
         else:
-            entry = CoverageEntry(
-                symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=venue, session=spec.session,
-                scheduled_at=None, status=CaptureStatus.NO_TRADES, rows=0,
-                first_event_time=None, last_event_time=None,
-                reason=f"{proof}:{spec.session}=0:vendor_total={vendor_total}",
-                raw_refs=tuple(day_refs),
+            day_refs.append(
+                _stage_fragment(
+                    store,
+                    run_id=run_id,
+                    trading_day=date.fromisoformat(day),
+                    dataset=CaptureDataset.TRADE_TICKS,
+                    symbol=code,
+                    session=sessions[0].session,
+                    frame=stray_frame,
+                    reason="out_of_window",
+                )
             )
+    for spec in sessions:
+        kept = windows[spec.session]
+        frame = _empty_tick_frame(day)
+        status: CaptureStatus
+        reason: str
+        entry_refs = list(day_refs)
+        if venue == "UNKNOWN":
+            status, reason = CaptureStatus.UNKNOWN, "uncertified_venue"
+        else:
+            try:
+                normalized = _strict_tape_frame(kept, day, code)
+            except Exception as exc:
+                logger.warning(
+                    "[DATA] stage=tape_harvest status=NORMALIZE_FAILED symbol=%s day=%s session=%s rows=%d error=%s",
+                    code, day, spec.session, len(kept), type(exc).__name__,
+                )
+                status, reason = CaptureStatus.PARTIAL, f"normalize_failure:{type(exc).__name__}"
+            else:
+                if _has_nonpositive_tick_price(normalized):
+                    entry_refs.append(
+                        _stage_fragment(
+                            store,
+                            run_id=run_id,
+                            trading_day=date.fromisoformat(day),
+                            dataset=CaptureDataset.TRADE_TICKS,
+                            symbol=code,
+                            session=spec.session,
+                            frame=normalized,
+                            reason="nonpositive_price",
+                        )
+                    )
+                    status, reason = CaptureStatus.FAILED, "nonpositive_price"
+                elif len(normalized) > 0:
+                    frame = normalized
+                    status = CaptureStatus.COMPLETE
+                    reason = f"{proof}:{spec.session}={len(kept)}:vendor_total={vendor_total}"
+                else:
+                    status = CaptureStatus.NO_TRADES
+                    reason = f"{proof}:{spec.session}=0:vendor_total={vendor_total}"
+        entry = CoverageEntry(
+            symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=venue, session=spec.session,
+            scheduled_at=None, status=status, rows=len(frame),
+            first_event_time=None, last_event_time=None,
+            reason=reason, raw_refs=tuple(entry_refs),
+        )
         on_result(TapeDayResult(symbol=code, day=day, session=spec.session, frame=frame, entry=entry))
 
 
@@ -541,6 +579,7 @@ class TickTapePublisher:
         partitions_written = 0
         rows_written = 0
         entries_by_status: dict[str, int] = {}
+        failed: dict[tuple[str, str, str], str] = {}
         seq = self._flush_seq
         self._flush_seq += 1
         for (day, session), items in groups.items():
@@ -548,29 +587,56 @@ class TickTapePublisher:
                 self._guard(item)
                 entries_by_status[item.entry.status.value] = entries_by_status.get(item.entry.status.value, 0) + 1
             certified = [r for r in items if r.entry.status in (CaptureStatus.COMPLETE, CaptureStatus.NO_TRADES)]
+            published_entries = [r.entry for r in items]
             if certified:
-                coverage = {r.entry.symbol: r.entry for r in certified if r.entry.symbol}
-                frames = [r.frame for r in certified if r.entry.status == CaptureStatus.COMPLETE and len(r.frame) > 0]
-                if frames:
-                    combined = pd.concat(frames, ignore_index=True)
-                else:
-                    combined = certified[0].frame.iloc[0:0].copy()
                 stored = self._stored_counts(day, session)
                 for r in certified:
                     self._log_replace(day, session, r, stored)
-                write_tick_partition(
-                    combined, day, session, coverage=coverage,
-                    batch_rows=int(self._profile.COLLECTION_ARROW_BATCH_ROWS),
-                )
+                try:
+                    written = self._write_group(day, session, certified)
+                except ValueError as exc:
+                    written = 0
+                    group_failed: dict[tuple[str, str, str], str] = {}
+                    for r in certified:
+                        try:
+                            written += self._write_group(day, session, [r])
+                        except ValueError as item_exc:
+                            reason = f"publish_rejected:{type(item_exc).__name__}"
+                            failed[(r.symbol, day, session)] = reason
+                            group_failed[(r.symbol, day, session)] = reason
+                            logger.error(
+                                "[DATA] stage=tape_publish status=REJECTED symbol=%s day=%s session=%s error=%s",
+                                r.symbol, day, session, item_exc,
+                            )
+                    logger.warning(
+                        "[DATA] stage=tape_publish status=GROUP_ISOLATED day=%s session=%s rejected=%d group_error=%s",
+                        day, session, len(group_failed), type(exc).__name__,
+                    )
+                    published_entries = [
+                        r.entry.model_copy(update={"status": CaptureStatus.FAILED, "rows": 0,
+                                                   "reason": group_failed[(r.symbol, day, session)]})
+                        if (r.symbol, day, session) in group_failed else r.entry
+                        for r in items
+                    ]
                 partitions_written += 1
-                rows_written += sum(len(r.frame) for r in certified if r.entry.status == CaptureStatus.COMPLETE)
-            self._publish_group_manifest(day, session, seq, [r.entry for r in items])
+                rows_written += written
+            self._publish_group_manifest(day, session, seq, published_entries)
         self._buffer = []
         self._buffered_rows = 0
         return FlushReport(
             partitions_written=partitions_written, rows_written=rows_written,
-            entries_by_status=entries_by_status,
+            entries_by_status=entries_by_status, failed=failed,
         )
+
+    def _write_group(self, day: str, session: str, certified: list[TapeDayResult]) -> int:
+        coverage = {r.entry.symbol: r.entry for r in certified if r.entry.symbol}
+        frames = [r.frame for r in certified if r.entry.status == CaptureStatus.COMPLETE and len(r.frame) > 0]
+        combined = pd.concat(frames, ignore_index=True) if frames else certified[0].frame.iloc[0:0].copy()
+        write_tick_partition(
+            combined, day, session, coverage=coverage,
+            batch_rows=int(self._profile.COLLECTION_ARROW_BATCH_ROWS),
+        )
+        return sum(len(r.frame) for r in certified if r.entry.status == CaptureStatus.COMPLETE)
 
     @staticmethod
     def _stored_counts(day: str, session: str) -> dict[str, int]:

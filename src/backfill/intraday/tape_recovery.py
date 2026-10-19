@@ -755,7 +755,7 @@ async def run_walk_tasks(
         else None
     )
     root = _capture_root(profile)
-    expected: dict[tuple[str, str], int] = {}
+    expected: dict[tuple[str, str, str], int] = {}
     pending_ledger: list[dict[str, Any]] = []
     pages = rows = unresolved = skipped_unclosed = failure_streak = 0
     remaining: list[str] = []
@@ -764,8 +764,17 @@ async def run_walk_tasks(
 
     def _commit() -> None:
         assert publisher is not None
-        publisher.flush()
-        _verify_groups(expected)
+        flushed = publisher.flush()
+        group_expected: dict[tuple[str, str], int] = {}
+        for (symbol, day, session), count in expected.items():
+            if (symbol, day, session) not in flushed.failed:
+                group_expected[(day, session)] = group_expected.get((day, session), 0) + count
+        _verify_groups(group_expected)
+        for record in pending_ledger:
+            reason = flushed.failed.get((record["symbol"], record["day"], record["session"]))
+            if reason is not None:
+                record["status"] = CaptureStatus.FAILED.value
+                record["reason"] = reason
         _append_ledger(ledger, pending_ledger)
         expected.clear()
         pending_ledger.clear()
@@ -825,8 +834,9 @@ async def run_walk_tasks(
                         f" session={result.session!r}"
                     ) from exc
                 if result.entry.status == CaptureStatus.COMPLETE:
-                    key = (result.day, result.session)
-                    expected[key] = expected.get(key, 0) + len(result.frame)
+                    expected[(result.symbol, result.day, result.session)] = (
+                        expected.get((result.symbol, result.day, result.session), 0) + len(result.frame)
+                    )
                 pending_ledger.append(
                     {
                         "symbol": result.symbol,
