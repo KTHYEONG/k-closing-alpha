@@ -56,3 +56,31 @@ def test_blackout_windows_parse_comma_and_json_env(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS", "bogus")
     with pytest.raises(ValueError, match="blackout"):
         CollectionSettings(_env_file=None)
+
+
+def test_extended_exhausted_audit_defaults() -> None:
+    """Exhausted-audit thresholds load with documented defaults."""
+    profile = CollectionSettings(_env_file=None)
+    assert profile.COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX == 100
+    assert profile.COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS == "230000"
+
+
+def test_extended_exhausted_audit_rejects_bad_values() -> None:
+    """Negative thresholds and malformed cutoff times are rejected."""
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        CollectionSettings(COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX=-1, _env_file=None)
+    for bad in ("250000", "236000", "239900"):
+        with pytest.raises(ValueError, match="valid HHMMSS"):
+            CollectionSettings(COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS=bad, _env_file=None)
+    for bad in ("2300", "23:00:00"):
+        with pytest.raises(ValueError, match="pattern"):
+            CollectionSettings(COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS=bad, _env_file=None)
+    for bad in ("230500", "235959"):
+        with pytest.raises(ValueError, match="precede"):
+            CollectionSettings(COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS=bad, _env_file=None)
+
+
+def test_extended_exhausted_audit_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Env override replaces the daily-max threshold."""
+    monkeypatch.setenv("COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX", "5")
+    assert CollectionSettings(_env_file=None).COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX == 5
