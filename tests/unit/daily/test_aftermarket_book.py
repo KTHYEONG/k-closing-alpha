@@ -870,3 +870,70 @@ def test_run_async_propagates_ledger_failure(tmp_path: Path, monkeypatch: Any, c
     assert manifests
     assert all(m.status == CaptureStatus.PARTIAL for m in manifests)
     assert "reason=held_roster_unavailable" in caplog.text
+
+
+def test_run_async_continues_with_healthy_slots_when_one_token_fails(tmp_path: Path, monkeypatch: Any) -> None:
+    import src.daily.aftermarket_book as book
+
+    class _FlakyClient(_StubClient):
+        def __init__(self, app_key: str, *args: Any, **kwargs: Any) -> None:
+            super().__init__()
+            self.app_key = app_key
+
+        async def ensure_token(self, session: Any) -> None:
+            if self.app_key == "key-2":
+                raise RuntimeError("token issuance failed")
+
+    profile = _profile(tmp_path, COLLECTION_AFTERMARKET_BOOK_SLOTS=("2", "3"))
+    monkeypatch.setattr("src.api.kis.client.KisApiClient", _FlakyClient)
+    monkeypatch.setenv("KIS_DATA_SLOTS", "2,3")
+    for slot in ("2", "3"):
+        monkeypatch.setenv(f"KIS_DATA_{slot}_APP_KEY", f"key-{slot}")
+        monkeypatch.setenv(f"KIS_DATA_{slot}_APP_SECRET", f"secret-{slot}")
+
+    async def _trading_day(client: Any, session: Any, snapshot_date: str) -> bool:
+        return True
+
+    seen: dict[str, Any] = {}
+
+    async def _capture(snapshot_date: str, **kwargs: Any) -> tuple[()]:
+        seen.update(kwargs)
+        return ()
+
+    monkeypatch.setattr(book, "is_kis_trading_day", _trading_day)
+    monkeypatch.setattr(book, "run_aftermarket_book_capture", _capture)
+    monkeypatch.setattr(book.settings, "PARQUET_DIR", tmp_path / "parquet")
+
+    class _EmptyLedger:
+        def load_open_positions(self) -> Any:
+            import pandas as pd
+
+            return pd.DataFrame({"symbol": pd.Series(dtype="str")})
+
+    monkeypatch.setattr("src.execution.paper_broker.PaperLedger", _EmptyLedger)
+
+    _run(book._run_async("2026-09-23", profile))
+
+    assert [c.app_key for c in seen["clients"]] == ["key-3"]
+    assert seen["degraded_slots"] == ("DATA_2",)
+
+
+def test_degraded_slot_marks_every_manifest_partial(tmp_path: Path) -> None:
+    from src.daily.aftermarket_book import run_aftermarket_book_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    now = [_seoul(2026, 9, 29, 15, 30)]
+    manifests = _run(
+        run_aftermarket_book_capture(
+            "2026-09-29",
+            profile=_profile(tmp_path),
+            store=_store(tmp_path),
+            clients=[_StubClient()],
+            dense_symbols=("000001",),
+            sparse_symbols=("000001",),
+            degraded_slots=("DATA_2",),
+            now_fn=lambda: now[0],
+        )
+    )
+    assert manifests
+    assert {m.status for m in manifests} == {CaptureStatus.PARTIAL}
