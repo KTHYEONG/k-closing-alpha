@@ -10,17 +10,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from dotenv import dotenv_values
 
 KIS_DATA_ROLE_DECISION = "decision"
 KIS_DATA_ROLE_BATCH = "batch"
+
+logger = logging.getLogger(__name__)
 
 _SLOT_RE = re.compile(r"^[1-9][0-9]*$")
 
@@ -319,3 +322,38 @@ def resolve_research_credentials(env: Mapping[str, str], *, slots: tuple[str, ..
         if token in decision_shards:
             raise ValueError(f"research slot DATA_{token} overlaps KIS_DECISION_SHARD_SLOTS")
     return _parse_slot_credentials(env, slots, duplicate_label="slot", reject_trade_key_collision=True)
+
+
+async def prewarm_healthy_clients(
+    clients: Sequence[Any], credentials: Sequence[KisCredential], broker_session: Any
+) -> tuple[list[Any], tuple[str, ...]]:
+    """Issue tokens per slot, isolating failures so healthy slots keep capturing.
+
+    Args:
+        clients: Clients aligned index-wise with ``credentials``.
+        credentials: Credentials whose log-safe ``slot`` labels identify failures.
+        broker_session: Open session passed to each client's ``ensure_token``.
+
+    Returns:
+        (healthy clients in input order, labels of slots whose token issuance failed).
+
+    Raises:
+        RuntimeError: No slot produced a usable token.
+    """
+    if len(clients) != len(credentials):
+        raise ValueError("clients and credentials must align")
+    healthy: list[Any] = []
+    failed: list[str] = []
+    for client, cred in zip(clients, credentials, strict=True):
+        try:
+            await client.ensure_token(broker_session)
+        except Exception as exc:
+            failed.append(cred.slot)
+            logger.error(
+                "[SYS] stage=token_prewarm status=SLOT_FAILED slot=%s error=%s", cred.slot, type(exc).__name__
+            )
+        else:
+            healthy.append(client)
+    if not healthy:
+        raise RuntimeError(f"No usable KIS token slot: failed={failed}")
+    return healthy, tuple(failed)

@@ -14,7 +14,7 @@ from typing import Any, Literal
 import pandas as pd
 
 from src import settings
-from src.api.kis.key_pool import resolve_research_credentials, token_cache_path
+from src.api.kis.key_pool import prewarm_healthy_clients, resolve_research_credentials, token_cache_path
 from src.config.collection import CollectionSettings
 from src.config.market_session import KRX_CLOSE_MARKET_DIV_CODE
 from src.data.capture_contracts import (
@@ -642,6 +642,7 @@ async def run_auction_capture(
     now_fn: Callable[[], datetime] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] | None = None,
     previous_trading_day: str | None = None,
+    degraded_slots: Sequence[str] = (),
 ) -> CaptureManifest:
     """Capture the complete project cohort through independently timed auctions.
 
@@ -658,6 +659,8 @@ async def run_auction_capture(
         session_clock: Verified standard or exceptional dated market clock.
         now_fn: Actual aware clock; None uses Asia/Seoul now.
         sleep_fn: Bounded scheduler wait; None uses asyncio.sleep.
+        previous_trading_day: Previous actual trading day for the opening population.
+        degraded_slots: Slots whose token issuance failed before capture; any makes the manifest PARTIAL.
 
     Returns:
         Manifest retaining all expected entries and observed task states.
@@ -696,7 +699,12 @@ async def run_auction_capture(
     reason_tag = f"auction-{phase}"
     sem = asyncio.Semaphore(int(profile.COLLECTION_CONCURRENCY_PER_KEY) * len(clients))
     entries: list[CoverageEntry] = []
-    incomplete = bool(cohort_incomplete)
+    incomplete = bool(cohort_incomplete) or bool(degraded_slots)
+    if degraded_slots:
+        logger.warning(
+            "[DATA] stage=auction_capture status=DEGRADED reason=slot_token_failed slots=%s healthy=%d",
+            ",".join(degraded_slots), len(clients),
+        )
     first_client: Any = clients[0]
 
     async with first_client.create_session() as broker_session:
@@ -936,8 +944,7 @@ async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings
     clock = session_day.clock if session_day.clock is not None else SessionClock.standard(trading_day)
     previous_trading_day: str | None = None
     async with clients[0].create_session() as broker_session:
-        for client in clients:
-            await client.ensure_token(broker_session)
+        clients, degraded_slots = await prewarm_healthy_clients(clients, creds, broker_session)
         # 평일 공휴일(명절 등)은 주말 판정으로 걸러지지 않는다. collect 와 같은 KIS 거래일 오라클로 판정한다.
         if not await is_kis_trading_day(clients[0], broker_session, snapshot_date):
             return None
@@ -953,6 +960,7 @@ async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings
         clients=clients,
         session_clock=clock,
         previous_trading_day=previous_trading_day,
+        degraded_slots=degraded_slots,
     )
 
 
