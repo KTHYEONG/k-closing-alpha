@@ -1303,6 +1303,101 @@ def audit_extended_exhausted(*, ledger_path: Path | None = None) -> tuple[str, .
     return (f"intraday:extended_exhausted:{count}",)
 
 
+@dataclass(frozen=True)
+class ExtendedExhaustedAudit:
+    """Reason breakdown (info) and WARN issues for the extended-backfill ledger."""
+
+    info_lines: tuple[str, ...]
+    issues: tuple[str, ...]
+
+
+def _prev_weekday(trading_date: date) -> date:
+    prev = trading_date - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    return prev
+
+
+def _parse_cutoff_instant(trading_date: date, cutoff: str) -> datetime:
+    return datetime(
+        trading_date.year,
+        trading_date.month,
+        trading_date.day,
+        int(cutoff[0:2]),
+        int(cutoff[2:4]),
+        int(cutoff[4:6]),
+        tzinfo=SEOUL,
+    )
+
+
+def audit_extended_exhausted_detail(
+    trading_date: date,
+    *,
+    ledger_path: Path | None = None,
+    profile: CollectionSettings | None = None,
+) -> ExtendedExhaustedAudit:
+    """Summarize EXHAUSTED ledger keys by reason class and flag newly exhausted keys with non-deterministic reasons or a count above COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX; empty result when the ledger is absent or unreadable."""
+    from src.backfill.intraday.extended_session_backfill import (
+        ExtendedBackfillLedger,
+        failure_reason_class,
+        is_deterministic_failure,
+    )
+
+    resolved = profile if profile is not None else CollectionSettings()
+    try:
+        cutoff = str(resolved.COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS)
+        window_end = _parse_cutoff_instant(trading_date, cutoff)
+        window_start = _parse_cutoff_instant(_prev_weekday(trading_date), cutoff)
+        daily_max = int(resolved.COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX)
+    except (OSError, ValueError):
+        return ExtendedExhaustedAudit((), ())
+    ledger = ExtendedBackfillLedger(ledger_path) if ledger_path is not None else ExtendedBackfillLedger()
+    try:
+        frame = ledger._read_all()
+    except (OSError, ValueError):
+        return ExtendedExhaustedAudit((), ())
+    if frame.empty or any(col not in frame.columns for col in ("snapshot_date", "session", "symbol", "status", "reason", "attempted_at")):
+        return ExtendedExhaustedAudit((), ())
+    latest = frame.drop_duplicates(subset=["snapshot_date", "session", "symbol"], keep="last")
+    exhausted = latest[latest["status"].astype(str) == "EXHAUSTED"]
+    if exhausted.empty:
+        return ExtendedExhaustedAudit((), ())
+    reasons = exhausted["reason"].astype(str).tolist()
+    attempted = exhausted["attempted_at"].astype(str).tolist()
+    classes = [failure_reason_class(reason) for reason in reasons]
+    counts: dict[str, int] = {}
+    for cls in classes:
+        counts[cls] = counts.get(cls, 0) + 1
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    shown = ordered[:DIGEST_ISSUE_DISPLAY_LIMIT]
+    omitted = len(ordered) - len(shown)
+    breakdown = ",".join(f"{name}={num}" for name, num in shown)
+    if omitted > 0:
+        breakdown += f" 외 {omitted}건"
+    info: list[str] = [f"intraday:extended_exhausted_reasons:{breakdown}"]
+    new_nondeterministic = 0
+    new_total = 0
+    for reason, stamp in zip(reasons, attempted, strict=True):
+        try:
+            parsed = datetime.fromisoformat(str(stamp))
+        except (ValueError, TypeError):
+            continue
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            continue
+        if window_start <= parsed < window_end:
+            new_total += 1
+            if not is_deterministic_failure(str(reason)):
+                new_nondeterministic += 1
+    if new_total > 0:
+        info.append(f"intraday:extended_exhausted_new:{new_total}")
+    issues: list[str] = []
+    if new_nondeterministic > 0:
+        issues.append(f"collection:extended_exhausted:{new_nondeterministic}:nondeterministic_reason")
+    if new_total > daily_max:
+        issues.append(f"collection:extended_exhausted:{new_total}:daily_surge")
+    return ExtendedExhaustedAudit(tuple(info), tuple(issues))
+
+
 def _expiry_hint_lines(items: Sequence[str]) -> list[str]:
     """KRX 달력 수평선 자체가 만료 예정일 때 표시하는 고정 갱신 안내."""
     if any(item.startswith(f"{CALENDAR_EXPIRY_NAME}:") for item in items):
@@ -1451,8 +1546,12 @@ def collect_audit_issues(
         AuditIssue(key=f"stale_kis_token:{token}", transient=True, text=f"KIS 토큰 누락: {token}")
         for token in stale_kis_tokens
     )
+    issues.extend(
+        AuditIssue(key=raw, transient=False, text=f"수집 이상: {raw}")
+        for raw in critical_collection
+        if day_kind != DAY_HOLIDAY or raw.startswith("collection:extended_exhausted:")
+    )
     if day_kind != DAY_HOLIDAY:
-        issues.extend(AuditIssue(key=raw, transient=False, text=f"수집 이상: {raw}") for raw in critical_collection)
         issues.extend(
             AuditIssue(
                 key=raw,
@@ -1567,7 +1666,7 @@ def build_digest(
         missing_steps=_missing_steps,
         failed_units=list(failed_units),
         stale_kis_tokens=[] if day_kind == DAY_HOLIDAY else list(stale_kis_tokens),
-        critical_collection=[] if day_kind == DAY_HOLIDAY else list(critical_collection),
+        critical_collection=list(critical_collection),
         intraday_issues=() if day_kind == DAY_HOLIDAY else tuple(intraday_issues),
         backup_warnings=list(backup_warnings),
         undelivered_alerts=int(undelivered_alerts),
@@ -1596,6 +1695,8 @@ def build_digest(
             holiday_problems.append(f"실패유닛 {','.join(issue_failed)}")
         if issue_ops:
             holiday_problems.append(f"운영감시 {','.join(issue_ops)}")
+        if issue_critical:
+            holiday_problems.append(f"수집이상 {_format_bounded_issues(issue_critical)}")
         if issue_backup:
             holiday_problems.append(f"백업이상 {','.join(issue_backup)}")
         if issue_undelivered:
@@ -1616,6 +1717,8 @@ def build_digest(
                 summary_lines.append(f"• 실패 유닛: {', '.join(issue_failed)}")
             if issue_ops:
                 summary_lines.append(f"• 운영감시: {', '.join(issue_ops)}")
+            if issue_critical:
+                summary_lines.append(f"• 수집 이상: {_format_bounded_issues(issue_critical)}")
             if issue_backup:
                 summary_lines.append(f"• 백업 이상: {', '.join(issue_backup)}")
             if running_present:
@@ -2059,6 +2162,17 @@ def run_daily_audit(
     if extended_info:
         logger.info("[DATA] stage=daily_audit %s", extended_info[0])
     info_lines: tuple[str, ...] = tuple(extended_info)
+    try:
+        exhausted_detail = audit_extended_exhausted_detail(trading_date)
+    except (OSError, ValueError):
+        exhausted_detail = ExtendedExhaustedAudit((), ())
+    info_lines = (*info_lines, *exhausted_detail.info_lines)
+    collection_issues = (*collection_issues, *exhausted_detail.issues)
+    if exhausted_detail.issues:
+        logger.warning(
+            "[DATA] stage=daily_audit exhausted_detail=%s",
+            _format_bounded_issues(exhausted_detail.issues),
+        )
     if tick_source_diffs:
         peak = max(diff.relative_shortfall for diff in tick_source_diffs)
         shown = ",".join(diff.symbol for diff in tick_source_diffs[:10])

@@ -5220,6 +5220,39 @@ def test_p5_ops_issue_cleared_by_audit_measurement(tmp_path) -> None:
     assert clean.issues == ()
 
 
+@pytest.mark.parametrize("mode", ["info", "warning", "unreadable", "holiday"])
+def test_extended_exhausted_detail_dispatch_contract(monkeypatch, tmp_path, mode) -> None:
+    from src.tools import daily_audit
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    issue = "collection:extended_exhausted:1:nondeterministic_reason"
+    info = "intraday:extended_exhausted_new:1"
+
+    def _detail(*args, **kwargs):
+        if mode == "unreadable":
+            raise OSError("unreadable")
+        return daily_audit.ExtendedExhaustedAudit((info,), (issue,) if mode in ("warning", "holiday") else ())
+
+    monkeypatch.setattr(daily_audit, "audit_extended_exhausted_detail", _detail)
+    if mode == "holiday":
+        monkeypatch.setattr(daily_audit, "classify_day", lambda *args: daily_audit.DAY_HOLIDAY)
+        monkeypatch.setattr(daily_audit, "resolve_session_day", lambda day: SessionDay(day, SessionKind.CLOSED, None, "krx_calendar"))
+    subject, sent, heartbeat = _run_audit_isolated(monkeypatch, tmp_path, "2026-09-14", intraday=())
+    assert len(sent) == 1
+    if mode in ("warning", "holiday"):
+        assert heartbeat["severity"] == "WARNING"
+        assert issue in sent[0][1]
+    else:
+        assert heartbeat["severity"] == "OK"
+        assert issue not in sent[0][1]
+    if mode == "unreadable":
+        assert info not in sent[0][1]
+    else:
+        assert info in sent[0][1]
+    if mode != "holiday":
+        assert "intraday_complete=OK" in sent[0][1]
+
+
 def test_p5_audit_measurement_failure_is_loud() -> None:
     from src.tools import daily_audit
 
@@ -5726,4 +5759,3 @@ def test_dense_audit_excuse_never_applies_to_regular() -> None:
         krx_aftermarket_zero_row_symbols=frozenset({"B"}),
     )
     assert "intraday:regular:1:missing_symbols" in issues
-

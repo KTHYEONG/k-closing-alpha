@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import logging
 import os
+import shutil
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -427,6 +428,47 @@ def _latest_attempts(frame: pd.DataFrame, snapshot_date: str, session: str) -> d
     }
 
 
+@dataclass(frozen=True)
+class ReopenSelector:
+    """Key filter for reopen; every empty/None field means 'no restriction'."""
+
+    sessions: frozenset[str] = frozenset()
+    date_from: str | None = None
+    date_to: str | None = None
+    reason_prefix: str | None = None
+    symbols: frozenset[str] = frozenset()
+    attempted_since: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ReopenPlan:
+    """Outcome of one reopen call (dry-run and apply return the same shape)."""
+
+    matched: int
+    skipped_out_of_retention: int
+    reopened: int
+    by_reason_class: Mapping[str, int]
+    keys: tuple[tuple[str, str, str], ...]
+    backup_path: Path | None
+
+
+def _strip_exhausted_markers(reason: str) -> str:
+    stripped = str(reason)
+    while stripped.startswith("exhausted:"):
+        stripped = stripped[len("exhausted:") :]
+    return stripped
+
+
+def _parse_attempted_instant(value: object) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
 class ExtendedBackfillLedger:
     """Durable per-symbol outcome log; the latest record per key wins."""
 
@@ -627,6 +669,132 @@ class ExtendedBackfillLedger:
             )
             combined = combined.drop_duplicates(subset=list(_LEDGER_KEYS), keep="last")
             atomic_write_parquet(combined[list(_LEDGER_COLUMNS)], self._path)
+
+    def reopen_exhausted(
+        self,
+        selector: ReopenSelector,
+        *,
+        as_of: date,
+        retention_days: int,
+        apply: bool,
+        run_id: str,
+        attempted_at: datetime,
+        backup_dir: Path | None = None,
+    ) -> ReopenPlan:
+        """Return (and with apply=True persist) the in-retention EXHAUSTED keys reopened as FAILED with attempts=cap-1; raises OSError/ValueError on an unreadable ledger or failed backup, writing nothing."""
+        if int(retention_days) < 1:
+            raise ValueError(f"retention_days must be >= 1, got {retention_days!r}")
+        if attempted_at.tzinfo is None or attempted_at.utcoffset() is None:
+            raise ValueError("attempted_at must be timezone-aware")
+        earliest = (as_of - timedelta(days=int(retention_days))).isoformat()
+        as_of_str = as_of.isoformat()
+
+        def _select(frame: pd.DataFrame) -> tuple[list[tuple[str, str, str, str]], int]:
+            if frame.empty or "status" not in frame.columns:
+                return [], 0
+            latest = frame.drop_duplicates(subset=list(_LEDGER_KEYS), keep="last")
+            sub = latest[latest["status"].astype(str) == "EXHAUSTED"]
+            if sub.empty:
+                return [], 0
+            matched: list[tuple[str, str, str, str]] = []
+            skipped = 0
+            for row in sub.itertuples(index=False):
+                cols = sub.columns.tolist()
+                get = row._asdict() if hasattr(row, "_asdict") else dict(zip(cols, row))
+                day = str(get.get("snapshot_date", ""))
+                session = str(get.get("session", ""))
+                symbol = str(get.get("symbol", ""))
+                reason = str(get.get("reason", ""))
+                if selector.sessions and session not in selector.sessions:
+                    continue
+                if selector.date_from and day < selector.date_from:
+                    continue
+                if selector.date_to and day > selector.date_to:
+                    continue
+                if selector.reason_prefix is not None and not _strip_exhausted_markers(reason).startswith(
+                    selector.reason_prefix
+                ):
+                    continue
+                if selector.symbols and symbol not in selector.symbols:
+                    continue
+                if selector.attempted_since is not None:
+                    parsed = _parse_attempted_instant(get.get("attempted_at", ""))
+                    if parsed is None or parsed < selector.attempted_since:
+                        continue
+                if earliest <= day < as_of_str:
+                    matched.append((day, session, symbol, reason))
+                else:
+                    skipped += 1
+            matched.sort(key=lambda item: (item[0], item[1], item[2]))
+            return matched, skipped
+
+        if not apply:
+            frame = self._read_all()
+            if not frame.empty:
+                frame = _with_legacy_columns(frame)
+            matched, skipped = _select(frame)
+            counts: dict[str, int] = {}
+            for _, _, _, reason in matched:
+                counts[failure_reason_class(reason)] = counts.get(failure_reason_class(reason), 0) + 1
+            return ReopenPlan(
+                matched=len(matched),
+                skipped_out_of_retention=skipped,
+                reopened=0,
+                by_reason_class=dict(counts),
+                keys=tuple((d, s, y) for d, s, y, _ in matched),
+                backup_path=None,
+            )
+        with exclusive_file_lock(
+            sidecar_lock_path(self._path),
+            timeout_seconds=DEFAULT_LOCK_TIMEOUT_SECONDS,
+            purpose="backfill-ledger",
+        ):
+            frame = self._read_all()
+            if frame.empty:
+                return ReopenPlan(0, 0, 0, {}, (), None)
+            work = _with_legacy_columns(frame)
+            matched, skipped = _select(work)
+            counts = {}
+            for _, _, _, reason in matched:
+                counts[failure_reason_class(reason)] = counts.get(failure_reason_class(reason), 0) + 1
+            keys = tuple((d, s, y) for d, s, y, _ in matched)
+            if not matched:
+                return ReopenPlan(0, skipped, 0, {}, (), None)
+            original_bytes = self._path.read_bytes()
+            stem = self._path.name
+            target_dir = Path(backup_dir) if backup_dir is not None else self._path.parent
+            target_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = target_dir / f"{stem}.pre-reopen-{run_id}.bak"
+            with backup_path.open("xb") as backup, self._path.open("rb") as source:
+                shutil.copyfileobj(source, backup)
+            if backup_path.stat().st_size != len(original_bytes):
+                raise OSError(f"reopen backup size mismatch: {backup_path}")
+            last_pos: dict[tuple[str, str, str], Any] = {}
+            for pos, key_vals in enumerate(
+                zip(
+                    work["snapshot_date"].astype(str).tolist(),
+                    work["session"].astype(str).tolist(),
+                    work["symbol"].astype(str).tolist(),
+                )
+            ):
+                last_pos[(str(key_vals[0]), str(key_vals[1]), str(key_vals[2]))] = pos
+            out = work.copy()
+            for day, session, symbol, reason in matched:
+                pos = last_pos[(day, session, symbol)]
+                out.loc[out.index[pos], "status"] = "FAILED"
+                out.loc[out.index[pos], "attempts"] = EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS - 1
+                out.loc[out.index[pos], "reason"] = f"reopened:{reason}"
+                out.loc[out.index[pos], "run_id"] = str(run_id)
+                out.loc[out.index[pos], "attempted_at"] = attempted_at.isoformat()
+            atomic_write_parquet(out[list(_LEDGER_COLUMNS)], self._path)
+            return ReopenPlan(
+                matched=len(matched),
+                skipped_out_of_retention=skipped,
+                reopened=len(matched),
+                by_reason_class=dict(counts),
+                keys=keys,
+                backup_path=backup_path,
+            )
 
 
 @dataclass(frozen=True)
