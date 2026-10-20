@@ -1894,6 +1894,17 @@ def _default_backup_issues(audit_at: datetime) -> list[str]:
 
 
 AUDIT_HEARTBEAT_RELPATH: str = "logs/heartbeat/daily_audit.json"
+# Full digest per snapshot date; mail carries warnings only, so this is the host-side record of every run.
+AUDIT_DIGEST_ARCHIVE_RELDIR: str = "logs/audit_digests"
+
+
+def archive_audit_digest(snapshot_date: str, subject: str, body: str, *, root: Path | None = None) -> Path:
+    """Write the full digest to DATA_DIR/logs/audit_digests/<snapshot_date>.txt (overwrites reruns)."""
+    base = Path(root) if root is not None else Path(settings.DATA_DIR) / AUDIT_DIGEST_ARCHIVE_RELDIR
+    base.mkdir(parents=True, exist_ok=True)
+    target = base / f"{snapshot_date}.txt"
+    atomic_write_text(target, f"{subject}\n\n{body}\n", mode=None)
+    return target
 
 
 def _infer_heartbeat_severity(subject: str | None, day_kind: str) -> str:
@@ -2096,6 +2107,7 @@ def run_daily_audit(
     dispatch_fn: Callable[[str, str], dict[str, bool]] = dispatch_digest,
     backup_issues_fn: Callable[[datetime], list[str]] = _default_backup_issues,
     ops_issues_fn: Callable[[datetime], Sequence[MeasuredIssue]] | None = None,
+    archive_fn: Callable[[str, str, str], Path] = archive_audit_digest,
 ) -> str | None:
     """평일 1회 점검 후 요약을 발송한다. 주말이면 아무것도 보내지 않는다.
 
@@ -2105,6 +2117,7 @@ def run_daily_audit(
         failed_units_fn: 실패 유닛 조회 주입(테스트용).
         stale_tokens_fn: 호스트 발급 KIS 토큰 커버리지 조회 주입(테스트용).
         dispatch_fn: 요약 발송 주입(테스트용).
+        archive_fn: 전체 요약 보관 주입(테스트용). 정상일은 메일 대신 이 기록만 남는다.
         backup_issues_fn: 오프사이트 백업 신선도 조회 주입(테스트용).
 
     Returns:
@@ -2336,6 +2349,10 @@ def run_daily_audit(
         issue_annotations=intraday_annotations,
         ops_issues=ops_measured,
     )
+    try:
+        archive_fn(snapshot_date, digest.subject, digest.body)
+    except OSError as exc:
+        logger.warning("[SYS] stage=daily_audit digest_archive=FAILED reason=%s", type(exc).__name__)
     if digest.severity is DigestSeverity.WARNING:
         logger.warning("[DATA] stage=daily_audit day=%s status=WARNING subject=%s", day_kind, digest.subject)
         dispatch_fn(digest.subject, digest.body)
@@ -2346,8 +2363,8 @@ def run_daily_audit(
             digest.subject,
         )
     else:
-        logger.info("[DATA] stage=daily_audit day=%s status=OK subject=%s", day_kind, digest.subject)
-        dispatch_fn(digest.subject, digest.body)
+        # Healthy days are read from the dashboard heartbeat; mail is reserved for warnings.
+        logger.info("[DATA] stage=daily_audit day=%s status=OK subject=%s (dispatch skipped)", day_kind, digest.subject)
     finished_at = datetime.now(SEOUL)
     sync_audit_alert_state_from_digest(digest, snapshot_date, now=finished_at)
     severity = (

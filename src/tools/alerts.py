@@ -20,6 +20,7 @@ from email.message import EmailMessage
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -36,6 +37,8 @@ ALERT_JOURNAL_TAIL_LINES: int = 40
 ALERT_LINE_MAX_CHARS: int = 300
 ALERT_COMMAND_TIMEOUT_SEC: float = 10.0
 _REDELIVERY_SUBJECT_PREFIX: str = "[지연전송] "
+# Failure-alert dedup day boundary (one mail per unit per KST trading-calendar day).
+ALERT_DAY_TZ: ZoneInfo = ZoneInfo("Asia/Seoul")
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -534,50 +537,68 @@ def format_failure_alert(
     unit_status: dict[str, str],
     diagnostics: dict[str, str],
 ) -> tuple[str, str]:
-    """Construct human-readable subject and structured body for a unit failure alert.
+    """Build a short human-readable failure card; raw journal context stays on the host.
 
-    Produces a clean 5-line summary card matching the KCA alert design convention
-    (daily_audit and run_outcome), followed by the sanitized error context and
-    a copy-pasteable server journal inspection command.
-
-    Args:
-        unit: Name of the failing systemd unit.
-        unit_status: Parsed systemctl properties (Result, ExecMainStatus, timestamps).
-        diagnostics: Output from extract_failure_summary ('reason', 'location', 'context').
+    The mail is a pointer for an AI-driven fix, so it carries only what failed, when, the one-line
+    cause and where the evidence lives (journald), never the log tail itself.
 
     Returns:
-        Tuple of (subject, body):
-        - subject: '[kca] 🚨 유닛 실행 실패: {unit}'
-        - body: Structured card with unit, exit status, timestamp, core reason, location, and journal command.
+        (subject, body): subject `[<project>][실패] <unit>`; body of at most five bullet lines.
     """
     exit_status = unit_status.get("ExecMainStatus", "unknown")
     result = unit_status.get("Result", "unknown")
     start_ts = unit_status.get("ExecMainStartTimestamp", "unknown")
     exit_ts = unit_status.get("ExecMainExitTimestamp", "unknown")
-
-    subject = f"[kca] 🚨 유닛 실행 실패: {unit}"
-
     reason = diagnostics.get("reason", "알 수 없는 원인")
     location = diagnostics.get("location", "")
-    context = diagnostics.get("context", "")
 
-    summary_lines = [
-        "==================================================",
-        f"🚨 KCA 시스템 유닛 장애 알림 ({unit})",
-        "==================================================",
-        f"• 실패 유닛: {unit}",
-        f"• 종료 상태: {result} (exit code: {exit_status})",
-        f"• 발생 시각: {exit_ts} (시작: {start_ts})",
-        f"• 핵심 원인: {reason}",
+    lines = [
+        f"• 무엇: {unit} 실패 ({result}, exit {exit_status})",
+        f"• 언제: {exit_ts}",
+        f"• 원인: {reason}",
     ]
     if location:
-        summary_lines.append(f"• 발생 위치: {location}")
-    summary_lines.append(f"• 저널 확인: journalctl --user -u {unit} -n 50 --no-pager")
-    summary_lines.append("")
-    summary_lines.append("[핵심 에러 로그]")
-    summary_lines.append(context)
+        lines.append(f"• 위치: {location}")
+    since = f' --since "{start_ts}"' if start_ts != "unknown" else ""
+    lines.append(f"• 증거: journalctl --user -u {unit}{since} --no-pager")
+    return f"[{unit_project(unit)}][실패] {unit}", "\n".join(lines)
 
-    return subject, "\n".join(summary_lines)
+
+def unit_project(unit: str) -> str:
+    """Project tag for a unit name (`crypto-pilot-backup.service` -> `crypto`); the alert host is shared."""
+    return unit.split("-", 1)[0].split(".", 1)[0] or "host"
+
+
+def failure_ledger_path() -> Path:
+    """Per-unit last-alert ledger: DATA_DIR/logs/alerts/failure_sent.json."""
+    return alert_outbox_dir().parent / "failure_sent.json"
+
+
+def failure_alert_sent_today(unit: str, today: str, *, path: Path | None = None) -> bool:
+    """True when `unit` already alerted on KST date `today`; an unreadable ledger never suppresses."""
+    target = path if path is not None else failure_ledger_path()
+    try:
+        ledger = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(ledger, dict) and ledger.get(unit) == today
+
+
+def record_failure_alert(unit: str, today: str, *, path: Path | None = None) -> None:
+    """Remember that `unit` alerted on `today` (best effort; failures only log)."""
+    target = path if path is not None else failure_ledger_path()
+    try:
+        ledger = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        ledger = {}
+    if not isinstance(ledger, dict):
+        ledger = {}
+    ledger[unit] = today
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(target, json.dumps(ledger, ensure_ascii=False, sort_keys=True), mode=None)
+    except OSError as exc:
+        logger.warning("[SYS] stage=alert_delivery status=LEDGER_FAILED unit=%s reason=%s", unit, type(exc).__name__)
 
 
 def collect_unit_diagnostics(
@@ -672,6 +693,11 @@ def main(argv: list[str] | None = None) -> None:
         drain_alert_outbox(max_items=settings.ALERT_OUTBOX_MAX_DRAIN)
     except Exception as exc:
         logger.warning("[SYS] stage=alert_delivery status=DRAIN_FAILED reason=%s", type(exc).__name__)
+    today = datetime.now(ALERT_DAY_TZ).date().isoformat()
+    if failure_alert_sent_today(args.unit, today):
+        # Repeat failures of one unit on one day add no new signal; the journal and dashboard still record each.
+        logger.info("[SYS] alert dispatch unit=%s status=SUPPRESSED reason=already_alerted_today day=%s", args.unit, today)
+        return
     if args.detail:
         results = dispatch_failure_alert(args.unit, detail=args.detail)
     else:
@@ -680,6 +706,7 @@ def main(argv: list[str] | None = None) -> None:
         subject, body = format_failure_alert(args.unit, unit_status, diag)
         results = dispatch_failure_alert(args.unit, detail=body, subject=subject)
     logger.info("[SYS] alert dispatch unit=%s webhook=%s email=%s", args.unit, results["webhook"], results["email"])
+    record_failure_alert(args.unit, today)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

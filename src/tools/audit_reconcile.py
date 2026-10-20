@@ -597,22 +597,13 @@ def run_audit_reconcile(
     if announced_resolved and not new_keys:
         display = _display_resolved(list(announced_resolved))
         subject = _ops_resolution_subject(now, display) if _all_ops_keys(announced_resolved) else _resolution_subject(snapshot_date, display)
-        lines = [
-            "==================================================",
-            f"✅ K-Closing Alpha 점검 정상화 ({snapshot_date})",
-            "==================================================",
-            f"• 해소: {', '.join(display)}",
-            "• 상태: 🟢 전 항목 정상 (재확인 완료)",
-        ]
-        body = "\n".join(lines)
         if dry_run:
             return ReconcileResult(action=ACTION_RESOLVED, resolved=resolved, notified=False, held=held, remediated=started_keys)
-        results = dispatch_fn(subject, body)
-        if not any(results.values()):
-            return ReconcileResult(action=ACTION_RESOLVED, resolved=resolved, still_open=(), notified=False, held=held, remediated=started_keys)
+        # Resolution is surfaced via the dashboard heartbeat only; mail is reserved for warnings.
+        logger.info("[SYS] stage=audit_reconcile action=resolved keys=%s (dispatch skipped)", ",".join(display))
         _persist_state(set(), reminder=False)
         _refresh_heartbeat(subject, "OK", _current_outbox(), auto_notes)
-        return ReconcileResult(action=ACTION_RESOLVED, resolved=resolved, notified=True, held=held, remediated=started_keys)
+        return ReconcileResult(action=ACTION_RESOLVED, resolved=resolved, notified=False, held=held, remediated=started_keys)
 
     if notify_opened and not announced_resolved:
         subject = _pick_warning_subject(snapshot_date, now, list(notify_opened))
@@ -659,6 +650,13 @@ def run_audit_reconcile(
     ]
     body = "\n".join(lines)
     if dry_run:
+        return ReconcileResult(
+            action=ACTION_CHANGED, opened=opened, resolved=resolved, still_open=still_open, notified=False, held=held, remediated=started_keys
+        )
+    if not notify_opened:
+        # A partial resolution opens nothing new, so it stays on the dashboard heartbeat instead of mail.
+        _persist_state(set(), reminder=False, held_keys=persist_held)
+        _refresh_heartbeat(subject, "WARNING", _current_outbox(), auto_notes)
         return ReconcileResult(
             action=ACTION_CHANGED, opened=opened, resolved=resolved, still_open=still_open, notified=False, held=held, remediated=started_keys
         )
