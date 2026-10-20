@@ -365,16 +365,57 @@ def test_format_failure_alert_builds_unified_card_and_subject() -> None:
 
     subject, body = alerts.format_failure_alert("kca-auction-close.service", status, diag)
 
-    assert subject == "[kca] 🚨 유닛 실행 실패: kca-auction-close.service"
-    assert "==================================================" in body
-    assert "🚨 KCA 시스템 유닛 장애 알림 (kca-auction-close.service)" in body
-    assert "• 실패 유닛: kca-auction-close.service" in body
-    assert "• 종료 상태: exit-code (exit code: 1)" in body
-    assert "• 발생 시각: Thu 2026-09-24 15:40:17 KST (시작: Thu 2026-09-24 15:40:13 KST)" in body
-    assert "• 핵심 원인: FileNotFoundError: no qualifying cohort: '2026-09-24'" in body
-    assert "• 발생 위치: src/daily/auction_capture.py:96 in _resolve_roster" in body
-    assert "• 저널 확인: journalctl --user -u kca-auction-close.service -n 50 --no-pager" in body
-    assert "[핵심 에러 로그]" in body
+    assert subject == "[kca][실패] kca-auction-close.service"
+    assert body.splitlines() == [
+        "• 무엇: kca-auction-close.service 실패 (exit-code, exit 1)",
+        "• 언제: Thu 2026-09-24 15:40:17 KST",
+        "• 원인: FileNotFoundError: no qualifying cohort: '2026-09-24'",
+        "• 위치: src/daily/auction_capture.py:96 in _resolve_roster",
+        '• 증거: journalctl --user -u kca-auction-close.service --since "Thu 2026-09-24 15:40:13 KST" --no-pager',
+    ]
+
+
+def test_format_failure_alert_tags_sibling_project_and_omits_unknown_since() -> None:
+    from src.tools import alerts
+
+    subject, body = alerts.format_failure_alert("crypto-pilot-backup.service", {}, {"reason": "r"})
+
+    assert subject == "[crypto][실패] crypto-pilot-backup.service"
+    assert body.splitlines()[-1] == "• 증거: journalctl --user -u crypto-pilot-backup.service --no-pager"
+    assert "위치" not in body
+
+
+def test_alerts_main_sends_one_failure_mail_per_unit_per_day(monkeypatch) -> None:
+    from src.tools import alerts
+
+    sent: list[str] = []
+
+    def _dispatch(unit, *, detail="", subject=None):
+        sent.append(unit)
+        return {"webhook": False, "email": True}
+
+    monkeypatch.setattr(alerts, "dispatch_failure_alert", _dispatch)
+    monkeypatch.setattr(alerts, "drain_alert_outbox", lambda **kw: (0, 0))
+
+    alerts.main(["--unit", "kca-collect.service", "--detail", "x"])
+    alerts.main(["--unit", "kca-collect.service", "--detail", "x"])
+    alerts.main(["--unit", "krx-host-backup.service", "--detail", "x"])
+
+    assert sent == ["kca-collect.service", "krx-host-backup.service"]
+
+
+def test_failure_ledger_new_day_and_unreadable_ledger_never_suppress(tmp_path) -> None:
+    from src.tools import alerts
+
+    ledger = tmp_path / "failure_sent.json"
+    alerts.record_failure_alert("u.service", "2026-10-20", path=ledger)
+
+    assert alerts.failure_alert_sent_today("u.service", "2026-10-20", path=ledger)
+    assert not alerts.failure_alert_sent_today("u.service", "2026-10-21", path=ledger)
+    ledger.write_text("{broken", encoding="utf-8")
+    assert not alerts.failure_alert_sent_today("u.service", "2026-10-20", path=ledger)
+    alerts.record_failure_alert("u.service", "2026-10-21", path=ledger)
+    assert alerts.failure_alert_sent_today("u.service", "2026-10-21", path=ledger)
 
 
 def test_alerts_main_attaches_formatted_failure_alert_when_detail_absent(monkeypatch) -> None:
@@ -403,16 +444,15 @@ def test_alerts_main_attaches_formatted_failure_alert_when_detail_absent(monkeyp
 
     # Then
     assert captured["unit"] == "kca-collect.service"
-    assert captured["subject"] == "[kca] 🚨 유닛 실행 실패: kca-collect.service"
-    assert "🚨 KCA 시스템 유닛 장애 알림" in captured["detail"]
-    assert "ValueError: test boom" in captured["detail"]
+    assert captured["subject"] == "[kca][실패] kca-collect.service"
+    assert "• 원인: ValueError: test boom" in captured["detail"]
 
-    # When: 명시적 detail
+    # When: 명시적 detail (다른 유닛 — 같은 유닛은 당일 1회로 억제된다)
     captured.clear()
-    alerts.main(["--unit", "kca-collect.service", "--detail", "manual note"])
+    alerts.main(["--unit", "kca-predict.service", "--detail", "manual note"])
 
     # Then
-    assert captured["unit"] == "kca-collect.service"
+    assert captured["unit"] == "kca-predict.service"
     assert captured["detail"] == "manual note"
 
 
@@ -1008,3 +1048,18 @@ def test_alert_secret_values_read_credential_env_file_under_base_dir(monkeypatch
     assert alerts.alert_credential_env_file() == tmp_path / ".env"
     assert "file-pool-secret-0003" in alerts._alert_secret_values()
     assert "file-pool-secret-0003" not in alerts.redact_for_egress("boom file-pool-secret-0003")
+
+
+def test_failure_ledger_tolerates_non_mapping_and_unwritable_ledger(tmp_path, caplog) -> None:
+    from src.tools import alerts
+
+    ledger = tmp_path / "failure_sent.json"
+    ledger.write_text("[]", encoding="utf-8")
+    assert not alerts.failure_alert_sent_today("u.service", "2026-10-20", path=ledger)
+    alerts.record_failure_alert("u.service", "2026-10-20", path=ledger)
+    assert alerts.failure_alert_sent_today("u.service", "2026-10-20", path=ledger)
+
+    blocked = tmp_path / "as_dir"
+    blocked.mkdir()
+    alerts.record_failure_alert("u.service", "2026-10-20", path=blocked)
+    assert "status=LEDGER_FAILED unit=u.service" in caplog.text

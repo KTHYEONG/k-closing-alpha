@@ -100,7 +100,7 @@ def test_friday_false_positive_heals(tmp_path) -> None:
     )
     assert result.action == "RESOLVED"
     assert result.resolved == ("offsite_backup:stale",)
-    assert len(sent) == 1 and "경고" not in sent[0][0]
+    assert sent == []
     hb = json.loads(hp.read_text(encoding="utf-8"))
     assert hb["severity"] == "OK" and hb["open_issues"] == []
     assert hb["audit_kind"] == "reconcile" and hb["reconciled_at"] is not None
@@ -190,7 +190,7 @@ def test_persistent_issues_survive(tmp_path) -> None:
     assert "missing:intraday_complete" in result.still_open
     hb = json.loads(hp.read_text(encoding="utf-8"))
     assert hb["severity"] == "WARNING"
-    assert len(sent) == 1 and "경고" in sent[0][0]
+    assert sent == []
 
 
 def test_measurement_failure_never_resolves(tmp_path, caplog) -> None:
@@ -309,7 +309,7 @@ def test_weekend_open_issue_resolves(tmp_path) -> None:
                                  outbox_fn=o,
                                  dispatch_fn=lambda s, body: sent.append((s, body)) or {"webhook": True},
                                  state_path=sp, heartbeat_path=hp)
-    assert result.action == "RESOLVED" and len(sent) == 1
+    assert result.action == "RESOLVED" and sent == []
 
 
 def test_heartbeat_v2_backward_compatible(tmp_path) -> None:
@@ -738,35 +738,38 @@ def test_reminder_dispatch_failure_retries(tmp_path) -> None:
     assert sp.read_text(encoding="utf-8") == before
 
 
-def test_resolved_dispatch_failure_retries(tmp_path) -> None:
+def _no_mail(subject, body):
+    raise AssertionError(f"resolution must not mail: {subject}")
+
+
+def test_resolution_closes_state_without_mail(tmp_path) -> None:
     from src.tools.audit_reconcile import run_audit_reconcile
 
     sp, hp = _seed(tmp_path, open_keys={"offsite_backup:stale": {"transient": True, "text": "t"}})
-    before = sp.read_text(encoding="utf-8")
     f, t, b, o = _clean_fns(backup=[])
     result = run_audit_reconcile(now=_now(), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b,
-                                 outbox_fn=o,
-                                 dispatch_fn=lambda s, body: {"webhook": False},
-                                 state_path=sp, heartbeat_path=hp)
+                                 outbox_fn=o, dispatch_fn=_no_mail, state_path=sp, heartbeat_path=hp)
     assert result.action == "RESOLVED" and not result.notified
-    assert sp.read_text(encoding="utf-8") == before
+    assert json.loads(sp.read_text(encoding="utf-8"))["open"] == {}
+    assert json.loads(hp.read_text(encoding="utf-8"))["severity"] == "OK"
 
 
-def test_changed_dispatch_failure_retries(tmp_path) -> None:
+def test_partial_resolution_keeps_remaining_without_mail(tmp_path) -> None:
     from src.tools.audit_reconcile import run_audit_reconcile
 
     sp, hp = _seed(tmp_path, open_keys={
         "missing:intraday_complete": {"transient": False, "text": "t"},
         "offsite_backup:stale": {"transient": True, "text": "t"},
     })
-    before = sp.read_text(encoding="utf-8")
+    seeded = json.loads(sp.read_text(encoding="utf-8"))["open"]["missing:intraday_complete"]
     f, t, b, o = _clean_fns(backup=[])
     result = run_audit_reconcile(now=_now(), failed_units_fn=f, stale_tokens_fn=t, backup_issues_fn=b,
-                                 outbox_fn=o,
-                                 dispatch_fn=lambda s, body: {"email": False},
-                                 state_path=sp, heartbeat_path=hp)
+                                 outbox_fn=o, dispatch_fn=_no_mail, state_path=sp, heartbeat_path=hp)
     assert result.action == "CHANGED" and not result.notified
-    assert sp.read_text(encoding="utf-8") == before
+    remaining = json.loads(sp.read_text(encoding="utf-8"))["open"]
+    assert set(remaining) == {"missing:intraday_complete"}
+    assert remaining["missing:intraday_complete"]["last_notified"] == seeded["last_notified"]
+    assert json.loads(hp.read_text(encoding="utf-8"))["severity"] == "WARNING"
 
 
 def _review_run(sp, hp, sent, *, backup=(), tokens_fn=None, dry_run=False):
@@ -822,11 +825,11 @@ def test_heartbeat_failure_recovered_without_duplicate_resolution(tmp_path, monk
     monkeypatch.setattr(audit_reconcile, "write_audit_heartbeat", _fail)
     with pytest.raises(OSError, match="heartbeat disk failure"):
         _review_run(sp, hp, sent)
-    assert json.loads(sp.read_text())["open"] == {} and len(sent) == 1
+    assert json.loads(sp.read_text())["open"] == {} and sent == []
     monkeypatch.setattr(audit_reconcile, "write_audit_heartbeat", writer)
     result = _review_run(sp, hp, sent)
     hb = json.loads(hp.read_text())
-    assert result.action == "NOOP" and len(sent) == 1
+    assert result.action == "NOOP" and sent == []
     assert hb["severity"] == "OK" and hb["open_issues"] == []
     assert "경고" not in hb["subject"]
 
@@ -842,11 +845,11 @@ def test_running_suspends_old_warning_until_completion(tmp_path) -> None:
         assert "경고" not in hb["subject"]
         assert json.loads(sp.read_text())["pending_resolutions"]["offsite_backup:stale"]
     result = _review_run(sp, hp, sent)
-    assert result.action == "RESOLVED" and len(sent) == 1
-    assert "경고" not in sent[0][0]
+    assert result.action == "RESOLVED" and sent == []
+    assert "경고" not in json.loads(hp.read_text())["subject"]
     assert "pending_resolutions" not in json.loads(sp.read_text())
     _review_run(sp, hp, sent)
-    assert len(sent) == 1
+    assert sent == []
 
 
 def test_running_to_interrupted_opens_once(tmp_path) -> None:
@@ -904,7 +907,7 @@ def test_newer_token_issuance_heals_historical_warning(tmp_path) -> None:
     token_cache_path("review-key-2", tmp_path).write_text(json.dumps({"issued_at": "2026-10-02T07:05:00+09:00"}))
     sent = []
     result = _review_run(sp, hp, sent, tokens_fn=lambda d: list_stale_kis_tokens(d, env=env, cache_dir=tmp_path, allow_newer=True))
-    assert result.action == "RESOLVED" and len(sent) == 1
+    assert result.action == "RESOLVED" and sent == []
     assert json.loads(hp.read_text())["open_issues"] == []
 
 
@@ -950,8 +953,8 @@ def test_reconcile_resolves_deferred_into_draining(tmp_path: Path) -> None:
     assert result.action == "RESOLVED"
     assert result.resolved == ("offsite_backup:deferred",)
     assert result.still_open == ()
-    assert len(dispatches) == 1
-    assert "offsite_backup:deferred -> draining" in dispatches[0][0]
+    assert dispatches == []
+    assert "offsite_backup:deferred -> draining" in json.loads(hb_path.read_text())["subject"]
 
 
 def test_reconcile_preserves_advisory_notes(tmp_path: Path) -> None:
@@ -1042,7 +1045,7 @@ def test_p5_remediation_disabled_by_default(tmp_path) -> None:
         state_path=sp, heartbeat_path=hp, remediation=None, ops_issues_fn=None,
     )
     assert result.action == "RESOLVED" and result.held == () and result.remediated == ()
-    assert len(sent) == 1
+    assert sent == []
 
 
 def test_p5_ops_issue_opens_and_is_held(tmp_path) -> None:
@@ -1492,8 +1495,7 @@ def test_closed_snapshot_resolves_previously_open_token_key(tmp_path) -> None:
                                  snapshot_closed_fn=lambda _: True)
     assert "stale_kis_token:PRIMARY" in result.resolved
     assert "stale_kis_token:PRIMARY" not in result.still_open
-    assert len(sent) == 1
-    assert "점검 정상화" in sent[0][0]
+    assert sent == []
     assert json.loads(sp.read_text(encoding="utf-8"))["open"] == {}
     assert json.loads(hp.read_text(encoding="utf-8"))["open_issues"] == []
 

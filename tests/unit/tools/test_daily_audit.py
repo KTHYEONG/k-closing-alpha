@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -55,6 +57,18 @@ def _audit_moment(day, clock="20:15:00"):
 
     return datetime.fromisoformat(f"{day}T{clock}+09:00")
 
+
+
+def _archived() -> list[tuple[str, str]]:
+    """Digests archived by run_daily_audit under the isolated DATA_DIR, oldest snapshot first."""
+    from src.tools import daily_audit
+
+    root = Path(daily_audit.settings.DATA_DIR) / daily_audit.AUDIT_DIGEST_ARCHIVE_RELDIR
+    out = []
+    for path in sorted(root.glob("*.txt")):
+        subject, _, body = path.read_text(encoding="utf-8").partition("\n\n")
+        out.append((subject, body.rstrip("\n")))
+    return out
 
 def _capture_context(day, run_id, dataset, reason, session="regular"):
     from datetime import date
@@ -724,8 +738,8 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch, tmp_p
         backup_issues_fn=lambda _at: [],
     )
     assert subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
-    assert audited == ["2026-09-14"] and len(sent) == 2
-    assert sent[1][0] == subject
+    assert audited == ["2026-09-14"] and len(sent) == 1
+    assert subject in [s for s, _ in _archived()]
 
     # And: 경고 발생 시에는 요약 발송
     subject = daily_audit.run_daily_audit(
@@ -737,8 +751,8 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch, tmp_p
         backup_issues_fn=lambda _at: [],
     )
     assert "경고" in subject
-    assert len(sent) == 3
-    assert sent[2][0] == subject
+    assert len(sent) == 2
+    assert sent[1][0] == subject
 
 
 def test_audit_decision_requires_topk_or_predict_ok_outcome(monkeypatch, tmp_path) -> None:
@@ -2374,8 +2388,8 @@ def test_run_daily_audit_survives_drain_failure(monkeypatch, caplog) -> None:
         )
 
     assert subject == "[kca] 🟢 2026-09-14 일일점검 완료 (정상)"
-    assert len(sent) == 1
-    assert "undelivered_alerts=0" in sent[0][1]
+    assert sent == []
+    assert "undelivered_alerts=0" in _archived()[0][1]
     assert any("alert_drain=FAILED" in rec.message for rec in caplog.records)
 
 
@@ -2621,7 +2635,7 @@ def test_run_daily_audit_passes_expiry_report(monkeypatch, tmp_path) -> None:
 
     daily_audit.run_daily_audit("2026-09-29", trading_day_fn=lambda _d: True, **stubs)
 
-    assert len(sent) == 1 and "KIS_X:d9:2026-10-08" in sent[0][1]
+    assert sent == [] and "KIS_X:d9:2026-10-08" in _archived()[0][1]
 
 
 def test_calendar_expiry_renders_renew_hint() -> None:
@@ -3323,7 +3337,7 @@ def test_run_daily_audit_reports_extended_exhausted_informationally(monkeypatch,
             backup_issues_fn=lambda _at: [],
         )
     assert subject is not None and "🟢" in subject
-    assert len(sent) == 1 and "intraday:extended_exhausted:1" in sent[0][1]
+    assert sent == [] and "intraday:extended_exhausted:1" in _archived()[0][1]
     assert "intraday:extended_exhausted:1" in caplog.text
 
 
@@ -3360,7 +3374,7 @@ def test_run_daily_audit_survives_unreadable_exhausted_ledger(monkeypatch, tmp_p
         backup_issues_fn=lambda _at: [],
     )
     assert subject is not None and "🟢" in subject
-    assert len(sent) == 1 and "extended_exhausted" not in sent[0][1]
+    assert sent == [] and "extended_exhausted" not in _archived()[0][1]
 
 
 def test_aftermarket_two_share_surplus_is_not_a_mismatch() -> None:
@@ -3660,7 +3674,7 @@ def test_run_daily_audit_dispatches_on_severity_not_subject_text(monkeypatch, tm
         subject = daily_audit.run_daily_audit("2026-09-14", trading_day_fn=lambda _d: True, **stubs)
 
     assert subject == "[kca] 🚨 경고: text only"
-    assert len(sent) == 1
+    assert sent == [] and len(_archived()) == 1
     assert "status=OK" in caplog.text and "status=WARNING" not in caplog.text
 
 
@@ -4130,15 +4144,15 @@ def test_run_daily_audit_source_diff_is_info_only(monkeypatch, tmp_path) -> None
     )
 
     assert subject is not None and "🟢" in subject
-    assert "regular_ticks_source_diff=1 max=2.2% symbols=005930" in sent[0][1]
+    assert "regular_ticks_source_diff=1 max=2.2% symbols=005930" in _archived()[0][1]
     assert recorded and recorded[0][0] == "tick_source_diff" and recorded[0][1] == "OK"
     assert recorded[0][2]["metrics"]["n"] == 1
     assert len(recorded) == 1
     assert recorded[0][2]["run_date"] == "2026-09-30"
     assert recorded[0][2]["metrics"]["max_relative_shortfall"] == pytest.approx((163185 - 159553) / 163185)
     assert recorded[0][2]["metrics"]["symbols"] == ["005930"]
-    assert "intraday_complete=OK" in sent[0][1]
-    assert "intraday_issues=none" in sent[0][1]
+    assert "intraday_complete=OK" in _archived()[0][1]
+    assert "intraday_issues=none" in _archived()[0][1]
 
 
 def test_run_daily_audit_survives_source_diff_record_failure(monkeypatch, tmp_path, caplog) -> None:
@@ -4185,7 +4199,7 @@ def test_run_daily_audit_survives_source_diff_record_failure(monkeypatch, tmp_pa
     )
 
     assert subject is not None and "🟢" in subject
-    assert len(sent) == 1 and "regular_ticks_source_diff=1" in sent[0][1]
+    assert sent == [] and "regular_ticks_source_diff=1" in _archived()[0][1]
     assert "tick_source_diff_record=FAILED reason=OSError" in caplog.text
 
 
@@ -4420,8 +4434,8 @@ def test_run_daily_audit_persists_info_lines(monkeypatch, tmp_path) -> None:
         backup_issues_fn=lambda _at: ["offsite_backup:draining"],
     )
     assert subject is not None and "경고" not in subject
-    assert any("tape_sweep_residual=30" in body for _, body in sent)
-    assert any("backup backlog draining: 653 -> 400 dates" in body for _, body in sent)
+    assert any("tape_sweep_residual=30" in body for _, body in _archived())
+    assert any("backup backlog draining: 653 -> 400 dates" in body for _, body in _archived())
     import json as _json
 
     heartbeat = _json.loads((tmp_path / "logs" / "heartbeat" / "daily_audit.json").read_text(encoding="utf-8"))
@@ -4724,7 +4738,7 @@ def test_run_daily_audit_unverifiable_is_info_only(monkeypatch, tmp_path) -> Non
     )
 
     assert subject is not None and "🟢" in subject
-    assert "regular_ticks_unverifiable=1 max=50.0% symbols=005930" in sent[0][1]
+    assert "regular_ticks_unverifiable=1 max=50.0% symbols=005930" in _archived()[0][1]
     assert recorded and recorded[0][0] == "tick_unverifiable" and recorded[0][1] == "OK"
 
 
@@ -4779,7 +4793,7 @@ def test_run_daily_audit_survives_unverifiable_record_failure(monkeypatch, tmp_p
         )
 
     assert subject is not None and "🟢" in subject
-    assert "regular_ticks_unverifiable=1" in sent[0][1]
+    assert "regular_ticks_unverifiable=1" in _archived()[0][1]
     assert "tick_unverifiable_record=FAILED reason=OSError" in caplog.text
 
 
@@ -4872,7 +4886,7 @@ def test_advisory_only_day_is_ok(monkeypatch, tmp_path) -> None:
     assert "일일점검 완료 (정상)" in subject and "(참고 1건)" in subject
     assert "missing:intraday_complete" not in subject
     assert any(str(n).startswith("degraded:") for n in hb.get("info_notes", []))
-    assert "경고" not in sent[0][0]
+    assert "경고" not in _archived()[0][0]
 
 
 def test_blocking_intraday_issue_still_warns(monkeypatch, tmp_path) -> None:
@@ -5238,19 +5252,21 @@ def test_extended_exhausted_detail_dispatch_contract(monkeypatch, tmp_path, mode
         monkeypatch.setattr(daily_audit, "classify_day", lambda *args: daily_audit.DAY_HOLIDAY)
         monkeypatch.setattr(daily_audit, "resolve_session_day", lambda day: SessionDay(day, SessionKind.CLOSED, None, "krx_calendar"))
     subject, sent, heartbeat = _run_audit_isolated(monkeypatch, tmp_path, "2026-09-14", intraday=())
-    assert len(sent) == 1
+    body = _archived()[0][1]
     if mode in ("warning", "holiday"):
         assert heartbeat["severity"] == "WARNING"
-        assert issue in sent[0][1]
+        assert len(sent) == 1 and sent[0][1] == body
+        assert issue in body
     else:
         assert heartbeat["severity"] == "OK"
-        assert issue not in sent[0][1]
+        assert sent == []
+        assert issue not in body
     if mode == "unreadable":
-        assert info not in sent[0][1]
+        assert info not in body
     else:
-        assert info in sent[0][1]
+        assert info in body
     if mode != "holiday":
-        assert "intraday_complete=OK" in sent[0][1]
+        assert "intraday_complete=OK" in body
 
 
 def test_p5_audit_measurement_failure_is_loud() -> None:
@@ -5843,3 +5859,24 @@ def test_read_stored_partition_keeps_vendor_and_has_trade_when_stored(monkeypatc
 
     assert frame is not None
     assert list(frame.columns) == ["symbol", "ts_hms", "vendor", "has_trade"]
+
+
+def test_run_daily_audit_archive_failure_does_not_block_ok_day(monkeypatch, tmp_path, caplog) -> None:
+    from src.tools import daily_audit
+
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    def _broken_archive(_date: str, _subject: str, _body: str) -> Path:
+        raise OSError("disk full")
+
+    stubs = _stub_weekday_audit(monkeypatch, tmp_path, _dispatch)
+    subject = daily_audit.run_daily_audit("2026-09-29", trading_day_fn=lambda _d: True, archive_fn=_broken_archive, **stubs)
+
+    assert subject is not None and "정상" in subject
+    assert sent == []
+    assert "digest_archive=FAILED reason=OSError" in caplog.text
+    assert _read_heartbeat(tmp_path)["severity"] == "OK"
