@@ -1,0 +1,13 @@
+[Unit]
+Description=KCA broker API notice watcher (alerts only on notices touching our API surface)
+OnFailure=kca-alert@%n.service
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
+Environment=TZ=Asia/Seoul
+# no broker credentials or admission: public notice boards and spec files only
+TimeoutStartSec=10min
+ExecStart=%h/.local/bin/uv run python -m src.tools.api_notice_watch
