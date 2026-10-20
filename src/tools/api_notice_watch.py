@@ -27,6 +27,7 @@ import requests
 
 from src import settings
 from src.tools.api_surface import BROKER_DBSEC, BROKER_KIS, BROKER_KIWOOM, BROKER_LS, BROKER_TOSS, Surface, load_surface
+from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
@@ -630,7 +631,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI en
     mode.add_argument("--pending", action="store_true", help="list open pending actions and exit")
     mode.add_argument("--ack", nargs="+", metavar="ID", help="acknowledge handled pending actions and exit")
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_cli_logging("%(asctime)s %(levelname)s %(message)s")
     state_path = Path(settings.DATA_DIR) / STATE_RELPATH
     if args.pending:
         sys.stdout.write(format_pending(load_state(state_path).get("pending", {})))
