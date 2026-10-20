@@ -1,4 +1,9 @@
-"""Broker API notice watcher: surfaces new notices that touch the TRs/paths this repo actually calls."""
+"""Broker API notice watcher: surfaces new notices that touch the TRs/paths any host project calls.
+
+Impact is judged against the `api_surface` manifest (kca, krx, kse). Actionable items persist as pending actions
+in the state file until acknowledged; quant-dashboard renders them per project and an AI/ops check can list them
+(`--pending`), fix the affected project, then `--ack`. Nothing is mailed.
+"""
 
 from __future__ import annotations
 
@@ -21,27 +26,18 @@ from zoneinfo import ZoneInfo
 import requests
 
 from src import settings
-from src.tools.alerts import dispatch_digest
+from src.tools.api_surface import BROKER_DBSEC, BROKER_KIS, BROKER_KIWOOM, BROKER_LS, BROKER_TOSS, Surface, load_surface
 
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 STATE_RELPATH: str = "logs/heartbeat/api_notice_watch_state.json"
 STATE_SCHEMA_VERSION: int = 1
-API_SRC_ROOT: Path = Path(__file__).resolve().parents[1] / "api"
-
-BROKER_LS = "ls"
-BROKER_KIS = "kis"
-BROKER_KIWOOM = "kiwoom"
-BROKER_DBSEC = "dbsec"
-BROKER_TOSS = "toss"
-
-_TR_PATTERNS: Mapping[str, re.Pattern[str]] = {
-    BROKER_LS: re.compile(r"\bt\d{4}\b"),
-    BROKER_KIWOOM: re.compile(r"\bk[a-z]\d{5}\b"),
-    BROKER_KIS: re.compile(r"\b[A-Z]{4,5}\d{5,9}[A-Z0-9]{0,2}\b"),
-}
-_PATH_PATTERN = re.compile(r"/(?:uapi|api|oauth2?|v\d)[A-Za-z0-9_/{}\-]*[A-Za-z0-9_}]")
+PENDING_HINT: str = (
+    "처리: cd ~/k-closing-alpha && uv run python -m src.tools.api_notice_watch --pending "
+    "→ 영향 프로젝트 점검·수정 후 --ack <id>"
+)
+FALLBACK_PROJECT = "kca"
 _TAG_RE = re.compile(r"<[^>]+>")
 _STYLE_BLOCK_RE = re.compile(r"<(script|style|svg)\b.*?</\1>", re.DOTALL | re.IGNORECASE)
 _LS_ROW_RE = re.compile(
@@ -62,6 +58,7 @@ class NoticeWatchConfig:
     http_timeout_sec: float = 20.0
     request_gap_sec: float = 1.0
     seen_cap: int = 300
+    surface_max_age_days: int = 30
     keywords: tuple[str, ...] = (
         "유량", "중단", "종료", "폐지", "점검", "도메인", "인증", "토큰", "세션", "순단",
         "nxt", "넥스트레이드", "애프터마켓", "rate limit", "deprecat", "maintenance",
@@ -81,15 +78,25 @@ class NoticeRef:
 
 
 @dataclass(frozen=True)
+class ProjectImpact:
+    """A used TR/path named by a notice, with the project files that reference it."""
+
+    project: str
+    token: str
+    files: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class NoticeVerdict:
     ref: NoticeRef
-    tokens: tuple[str, ...]
+    impact: tuple[ProjectImpact, ...]
     keywords: tuple[str, ...]
     empty_body: bool
+    broker_projects: tuple[str, ...] = ()
 
     @property
     def needs_attention(self) -> bool:
-        return bool(self.tokens or self.keywords or self.empty_body)
+        return bool(self.impact or self.keywords or self.empty_body)
 
 
 class NoticeSource(Protocol):
@@ -287,33 +294,24 @@ def build_sources(cfg: NoticeWatchConfig = DEFAULT_CONFIG) -> tuple[NoticeSource
     )
 
 
-def collect_used_identifiers(api_root: Path = API_SRC_ROOT) -> dict[str, frozenset[str]]:
-    """Lower-cased TR ids and URL paths found in each broker's client package (auto-synced with the code)."""
-    used: dict[str, frozenset[str]] = {}
-    for broker_dir in sorted(p for p in api_root.iterdir() if p.is_dir() and not p.name.startswith("_")):
-        tokens: set[str] = set()
-        tr_pattern = _TR_PATTERNS.get(broker_dir.name)
-        for source_file in broker_dir.rglob("*.py"):
-            text = source_file.read_text(encoding="utf-8")
-            if tr_pattern is not None:
-                tokens.update(m.lower() for m in tr_pattern.findall(text))
-            tokens.update(m.lower() for m in _PATH_PATTERN.findall(text) if m.count("/") >= 2)
-        used[broker_dir.name] = frozenset(tokens)
-    return used
-
-
 def _token_in_text(token: str, text_lower: str) -> bool:
     if token.startswith("/"):
         return token in text_lower
     return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?!\d)", text_lower) is not None
 
 
-def judge_notice(ref: NoticeRef, body: str, used: frozenset[str], cfg: NoticeWatchConfig) -> NoticeVerdict:
-    """Match title+body against used TR/path tokens and risk keywords; empty body is flagged for manual review."""
+def judge_notice(ref: NoticeRef, body: str, surface: Surface, cfg: NoticeWatchConfig) -> NoticeVerdict:
+    """Match title+body against every project's used TR/path tokens and risk keywords; empty body needs review."""
     haystack = f"{ref.title}\n{body}".lower()
-    tokens = tuple(sorted(t for t in used if _token_in_text(t, haystack)))
+    impact = tuple(
+        ProjectImpact(project, token, surface.files(project, token))
+        for project, tokens in sorted(surface.used(ref.broker).items())
+        for token in sorted(t for t in tokens if _token_in_text(t, haystack))
+    )
     keywords = tuple(k for k in cfg.keywords if k in haystack)
-    return NoticeVerdict(ref, tokens, keywords, empty_body=not body.strip())
+    return NoticeVerdict(
+        ref, impact, keywords, empty_body=not body.strip(), broker_projects=surface.projects_using(ref.broker)
+    )
 
 
 def collect_new(
@@ -426,18 +424,21 @@ class WatchReport:
     toss_info: list[str] = field(default_factory=list)
     new_faults: list[str] = field(default_factory=list)
 
-    @property
-    def should_alert(self) -> bool:
-        return bool(self.attention or self.toss_changes or self.new_faults)
+
+_FILES_SHOWN: int = 2
 
 
-def format_digest(report: WatchReport, boards: Mapping[str, str]) -> tuple[str, str]:
+def _impact_text(impact: Sequence[ProjectImpact]) -> str:
+    return ", ".join(f"{i.project}:{i.token}({', '.join(i.files[:_FILES_SHOWN])})" for i in impact)
+
+
+def format_report(report: WatchReport, boards: Mapping[str, str]) -> tuple[str, str]:
     count = len(report.attention) + len(report.toss_changes) + len(report.new_faults)
     lines: list[str] = []
     for verdict in report.attention:
-        reasons = [f"TR/경로 {', '.join(verdict.tokens)}"] if verdict.tokens else []
+        reasons = [f"영향 {_impact_text(verdict.impact)}"] if verdict.impact else []
         if verdict.keywords:
-            reasons.append(f"키워드 {', '.join(verdict.keywords)}")
+            reasons.append(f"키워드 {', '.join(verdict.keywords)} (브로커 공통, 사용 프로젝트 {', '.join(verdict.broker_projects)})")
         if verdict.empty_body:
             reasons.append("본문 없음(첨부/이미지 가능성, 직접 확인)")
         lines.append(f"• [{verdict.ref.broker}] {verdict.ref.posted} {verdict.ref.title} — {'; '.join(reasons)}")
@@ -445,7 +446,57 @@ def format_digest(report: WatchReport, boards: Mapping[str, str]) -> tuple[str, 
     lines.extend(f"• [감시기 이상] {fault}" for fault in report.new_faults)
     lines.append(f"참고: 해당 없음으로 분류된 신규 공지 {len(report.quiet)}건")
     lines.append("게시판: " + " | ".join(f"{broker} {url}" for broker, url in boards.items()))
-    return f"🔔 API 공지 감시: 확인 필요 {count}건", "\n".join(lines)
+    lines.append(PENDING_HINT)
+    return f"API 공지 감시: 확인 필요 {count}건", "\n".join(lines)
+
+
+def _pending_from_verdict(verdict: NoticeVerdict, today: date) -> tuple[str, dict[str, Any]]:
+    ref = verdict.ref
+    projects = sorted({i.project for i in verdict.impact} or set(verdict.broker_projects)) or [FALLBACK_PROJECT]
+    return f"{ref.broker}:{ref.notice_id}", {
+        "kind": "notice",
+        "broker": ref.broker,
+        "posted": ref.posted,
+        "title": ref.title,
+        "projects": projects,
+        "impact": [{"project": i.project, "token": i.token, "files": list(i.files)} for i in verdict.impact],
+        "keywords": list(verdict.keywords),
+        "broker_projects": list(verdict.broker_projects),
+        "empty_body": verdict.empty_body,
+        "first_seen": today.isoformat(),
+    }
+
+
+def _pending_from_toss(
+    changes: Sequence[str], snapshot: TossSpecSnapshot, projects: Sequence[str], today: date
+) -> tuple[str, dict[str, Any]]:
+    return f"toss:{snapshot.openapi_sha[:8]}", {
+        "kind": "toss_spec",
+        "broker": BROKER_TOSS,
+        "posted": today.isoformat(),
+        "title": "토스 OpenAPI 명세 변경",
+        "projects": list(projects) or [FALLBACK_PROJECT],
+        "changes": list(changes),
+        "first_seen": today.isoformat(),
+    }
+
+
+def format_pending(pending: Mapping[str, Mapping[str, Any]]) -> str:
+    """Render open pending actions for an AI/ops check (id, what changed, which project files to inspect)."""
+    if not pending:
+        return "조치 대기 항목 없음\n"
+    lines: list[str] = []
+    for action_id, item in sorted(pending.items(), key=lambda kv: kv[1]["first_seen"]):
+        lines.append(f"[{action_id}] {item['posted']} {item['title']}")
+        lines.extend(
+            f"    - {entry['project']}: {entry['token']} → {', '.join(entry['files'])}" for entry in item.get("impact", [])
+        )
+        lines.extend(f"    - {change}" for change in item.get("changes", []))
+        if item.get("keywords"):
+            lines.append(f"    - 키워드: {', '.join(item['keywords'])} (브로커 공통 영향 가능, 점검 대상 프로젝트: {', '.join(item.get('broker_projects', []))})")
+        if item.get("empty_body"):
+            lines.append("    - 본문 없음: 게시판에서 직접 확인")
+    return "\n".join(lines) + "\n"
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -471,21 +522,24 @@ def write_state(path: Path, state: Mapping[str, Any]) -> None:
 def run_watch(
     sources: Sequence[NoticeSource],
     *,
-    used: Mapping[str, frozenset[str]],
+    surface: Surface,
     state_path: Path,
     today: date,
     cfg: NoticeWatchConfig = DEFAULT_CONFIG,
     toss_fetch: Callable[[], tuple[Mapping[str, Any], Mapping[str, Any]]] | None = None,
-    dispatch: Callable[[str, str], dict[str, bool]] | None = dispatch_digest,
+    persist: bool = True,
+    now: datetime | None = None,
 ) -> WatchReport:
-    """One pass: fetch new notices, judge relevance, diff the Toss specs, alert, then persist state.
+    """One pass: fetch new notices, judge impact per project, diff the Toss specs, then persist state.
 
-    State advances only for sources that fetched cleanly; a faulted source alerts once per fault episode.
-    `dispatch=None` is a dry run (no alert, no state write).
+    State advances only for sources that fetched cleanly; a faulted source is reported once per fault episode.
+    Actionable items are stored as pending actions until `ack_pending`; `last_run_at` lets the dashboard detect
+    a silent watcher. `persist=False` is a dry run (no state write).
     """
     state = load_state(state_path)
     brokers_state: dict[str, Any] = dict(state.get("brokers", {}))
     faults: dict[str, str] = dict(state.get("faults", {}))
+    pending: dict[str, Any] = dict(state.get("pending", {}))
     report = WatchReport()
 
     def record_fault(key: str, message: str) -> None:
@@ -494,14 +548,18 @@ def run_watch(
             faults[key] = today.isoformat()
         logger.error("[SYS] stage=api_notice_watch source=%s status=FAULT reason=%s", key, message)
 
+    manifest_age = surface.age_days(datetime.combine(today, datetime.min.time(), tzinfo=KST))
+    if manifest_age > cfg.surface_max_age_days:
+        record_fault("surface", f"api_surface.json is {manifest_age}d old; run `python -m src.tools.api_surface --sync`")
+    else:
+        faults.pop("surface", None)
+
     for source in sources:
         prior = brokers_state.get(source.broker, {}).get("seen")
         seen = frozenset(prior) if prior is not None else None
         try:
             fresh = collect_new(source, seen, today=today, cfg=cfg)
-            verdicts = [
-                judge_notice(ref, source.fetch_body(ref), used.get(source.broker, frozenset()), cfg) for ref in fresh
-            ]
+            verdicts = [judge_notice(ref, source.fetch_body(ref), surface, cfg) for ref in fresh]
         except SourceFaultError as exc:
             record_fault(source.broker, str(exc))
             continue
@@ -516,51 +574,87 @@ def run_watch(
         )  # fmt: skip
 
     toss_state = state.get("toss")
+    toss_snapshot: TossSpecSnapshot | None = None
     if toss_fetch is not None:
-        toss_paths = used.get(BROKER_TOSS, frozenset())
+        toss_paths = surface.attributed(BROKER_TOSS)
         try:
             openapi, asyncapi = toss_fetch()
-            snapshot = snapshot_toss_spec(openapi, asyncapi, toss_paths)
+            toss_snapshot = snapshot_toss_spec(openapi, asyncapi, toss_paths)
         except SourceFaultError as exc:
             record_fault(BROKER_TOSS, str(exc))
         else:
             faults.pop(BROKER_TOSS, None)
             if toss_state is not None:
                 report.toss_changes, report.toss_info = diff_toss_spec(
-                    TossSpecSnapshot.from_json(toss_state), snapshot, toss_paths
+                    TossSpecSnapshot.from_json(toss_state), toss_snapshot, toss_paths
                 )
-            toss_state = snapshot.to_json()
+            toss_state = toss_snapshot.to_json()
 
-    if dispatch is None:
+    if not persist:
         return report
-    if report.should_alert:
-        boards = {s.broker: s.board_url for s in sources}
-        subject, body = format_digest(report, boards)
-        dispatch(subject, body)
-    write_state(state_path, {"brokers": brokers_state, "faults": faults, "toss": toss_state})
+    for verdict in report.attention:
+        action_id, item = _pending_from_verdict(verdict, today)
+        pending.setdefault(action_id, item)
+    if report.toss_changes and toss_snapshot is not None:
+        action_id, item = _pending_from_toss(report.toss_changes, toss_snapshot, surface.projects_using(BROKER_TOSS), today)
+        pending.setdefault(action_id, item)
+    write_state(
+        state_path,
+        {
+            "brokers": brokers_state,
+            "faults": faults,
+            "toss": toss_state,
+            "pending": pending,
+            "watched_projects": sorted(surface.projects),
+            "last_run_at": (now or datetime.now(KST)).isoformat(timespec="seconds"),
+        },
+    )
     return report
 
 
-def main() -> None:  # pragma: no cover - CLI entry; logic covered via run_watch scenarios
-    parser = argparse.ArgumentParser(description="Broker API notice watcher (alerts only on notices touching our API surface)")
-    parser.add_argument("--dry-run", action="store_true", help="print the digest; send nothing and keep state untouched")
-    args = parser.parse_args()
+def ack_pending(state_path: Path, action_ids: Sequence[str]) -> list[str]:
+    """Remove acknowledged pending actions; returns the ids that were not pending (typos are not silent)."""
+    state = load_state(state_path)
+    pending: dict[str, Any] = dict(state.get("pending", {}))
+    unknown = [a for a in action_ids if a not in pending]
+    for action_id in action_ids:
+        pending.pop(action_id, None)
+    write_state(state_path, {**{k: v for k, v in state.items() if k != "schema_version"}, "pending": pending})
+    return unknown
+
+
+def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI entry; logic covered via run_watch scenarios
+    parser = argparse.ArgumentParser(description="Broker API notice watcher (records notices touching our API surface for quant-dashboard)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="print the report; keep state untouched")
+    mode.add_argument("--pending", action="store_true", help="list open pending actions and exit")
+    mode.add_argument("--ack", nargs="+", metavar="ID", help="acknowledge handled pending actions and exit")
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    state_path = Path(settings.DATA_DIR) / STATE_RELPATH
+    if args.pending:
+        sys.stdout.write(format_pending(load_state(state_path).get("pending", {})))
+        return 0
+    if args.ack:
+        unknown = ack_pending(state_path, args.ack)
+        sys.stdout.write(f"acked {len(args.ack) - len(unknown)}; unknown: {unknown}\n")
+        return 1 if unknown else 0
     cfg = DEFAULT_CONFIG
     http = _Http(cfg)
     report = run_watch(
         build_sources(cfg),
-        used=collect_used_identifiers(),
-        state_path=Path(settings.DATA_DIR) / STATE_RELPATH,
+        surface=load_surface(),
+        state_path=state_path,
         today=datetime.now(KST).date(),
         cfg=cfg,
         toss_fetch=lambda: fetch_toss_specs(http),
-        dispatch=None if args.dry_run else dispatch_digest,
+        persist=not args.dry_run,
     )
     if args.dry_run:
-        subject, body = format_digest(report, {})
+        subject, body = format_report(report, {})
         sys.stdout.write(f"{subject}\n{body}\n")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    sys.exit(main())
