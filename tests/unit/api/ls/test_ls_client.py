@@ -147,6 +147,12 @@ def test_ls_minute_chart_continuation_cursor_does_not_drop_boundary_bar() -> Non
     assert got == minutes
 
 
+def test_ls_minute_chart_pins_krx_regular_session() -> None:
+    client, state = _paging_client([_minute_page([{"date": _YMD, "time": "153000", "close": 1}], "", "", "N", "")])
+    asyncio.run(client.get_minute_chart(object(), "005930", "2026-09-04"))
+    assert state["bodies"][0]["t8412InBlock"]["krx_mmk_gubun"] == "Y"
+
+
 def test_ls_minute_chart_preserves_out_of_window_evidence() -> None:
     client, _ = _paging_client(
         [_minute_page([{"date": _YMD, "time": "200000", "close": 1010}], "", "", "N", "")],

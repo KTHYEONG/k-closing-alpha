@@ -212,6 +212,8 @@ class LsApiClient(SharedTokenClientMixin):
                             "cts_date": cts_date,
                             "cts_time": cts_time,
                             "comp_yn": "N",
+                            # Blank defaults to "all sessions" from 2026-10-22; pin regular session to keep ls:t8412 -> KRX.
+                            "krx_mmk_gubun": "Y",
                         }
                     },
                     tr_cont=tr_cont,
