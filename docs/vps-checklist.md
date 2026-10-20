@@ -133,7 +133,7 @@ print([(a.isoformat(), b.isoformat()) for a, b in DEPLOY_BLACKOUT_WINDOWS], blac
 |---|---|---|
 | DEP-01 | VPS HEAD == `origin/main`, or the newer commit's deploy is in progress / waiting on the blackout (`deploy.yml` step `blackout_wait`) | P1 |
 | DEP-02 | `git status --porcelain` empty; `latest` image ID == `sha-<HEAD>` image ID | P1 |
-| DEP-03 | `WRAPPER_MATCH`; no `DRIFT`; `NOT_IN_REPO` only `kca-kis-token-warmup.service.d` (drop-in written by krx-alpha deploy, §12) | P1 |
+| DEP-03 | `WRAPPER_MATCH`; no `DRIFT`; no `NOT_IN_REPO` (the former `kca-kis-token-warmup.service.d` drop-in is gone since the warmup unit carries kis-data itself; 2026-10-20) | P1 |
 | DEP-04 | 22 wrapper units print `rc=0 user=1001:1001` with the flags of §3 (a `USAGE_ERROR` line = unit cannot start) | P1 |
 | SCH-01 | all 28 timers `enabled active`; `Linger=yes`; no `--failed` units | P1 |
 | SCH-02 | each timer's `LAST` equals its most recent slot (UTC→KST). Units started by `After=` ordering or by remediation do not move `LAST` | P1 |
@@ -336,6 +336,9 @@ gh run list --workflow watchdog.yml --limit 5 -R kthyeong/k-closing-alpha
 - **Extended backfill `pending_manifest_conflict`**: fixed to publish one task-level PENDING checkpoint before fan-out; after this fix is deployed, any `pending_manifest_conflict` WARNING from the 23:05 run (now logged as `stage=extended_backfill`) is a regression (P2).
 - **Stale KIS token on closed days**: 2026-10-09..11 reconcile flagged `stale_kis_token:*` on holidays/weekends and reran warmup, which skips on `CLOSED` days (budget exhausted). Not seen on 2026-10-17; a recurrence is a calendar-awareness regression (P2).
 - **Backup prune keeps old dates**: `raw/` and `manifests/2026-09-14` survived past 30 days (`sealed_kept=2`, reasons not logged at INFO).
+- **Dashboard schedule list is separate**: `/home/ubuntu/quant-dashboard/config.toml` carries its own `[[schedule]]` blocks. A removed timer slot (kca-price-ingest 21:30, dropped in `627cd1c`) left there raises a recurring `예정 실행이 지연` FAIL on the dashboard kca card; fix it in the dashboard config, not in kca.
+- **Daily audit `missing_bars` is judged on D only**: the dense-partition rule exempts symbols stored solely as `vendor=dbsec` trade-minute fallback bars (KIS TPS limit fallback). Extended backfill can rewrite a past date with `vendor=kis` trade-only symbols (10-16: 213), which a re-audit of that date would flag; not an issue for the current audit.
+- **ops-sentinel `job_late` vs `After=`**: a unit held back by a running `After=` predecessor stays PENDING; a slow `archive-intraday` (32–39 min on 2026-10-16/19) used to raise a false `job_late:kca-tape-sweep`.
 - **Holidays**: weekday timers fire; jobs must `SKIP`; the daily audit digest is `HOLIDAY_SKIP`. Run data probes against the previous trading day.
 - **`journalctl` times are UTC**; `docker logs` is empty for `--rm` units; the journal is the record.
 - **Shared resources** (`TOKEN_REPLACED` for the Toss token used from PC and VPS, Drive lock, KIS slots) are cross-project; attribute precisely.
