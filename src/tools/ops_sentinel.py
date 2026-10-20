@@ -49,6 +49,7 @@ class JobSchedule:
     timer: str
     slots: tuple[ScheduleSlot, ...]
     max_runtime: timedelta
+    after: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -165,13 +166,17 @@ def load_job_schedules(unit_dir: Path | None = None) -> tuple[JobSchedule, ...]:
         service_text = service_path.read_text(encoding="utf-8")
         timeout_raw: str | None = None
         expected_raw: str | None = None
-        in_service = False
+        after: list[str] = []
+        section = ""
         for line in service_text.splitlines():
             stripped = line.strip()
             if stripped.startswith("["):
-                in_service = stripped == "[Service]"
+                section = stripped
                 continue
-            if not in_service:
+            if section == "[Unit]" and stripped.startswith("After="):
+                after.extend(stripped.split("=", 1)[1].split())
+                continue
+            if section != "[Service]":
                 continue
             if stripped.startswith("TimeoutStartSec=") and timeout_raw is None:
                 timeout_raw = stripped.split("=", 1)[1]
@@ -198,7 +203,9 @@ def load_job_schedules(unit_dir: Path | None = None) -> tuple[JobSchedule, ...]:
                 raise ValueError(f"Unsupported X-ExpectedRuntimeSec in {service_path.name}: {expected_raw!r}")
             max_runtime = expected
         schedules.append(
-            JobSchedule(unit=unit_name, timer=timer_path.name, slots=slots, max_runtime=max_runtime)
+            JobSchedule(
+                unit=unit_name, timer=timer_path.name, slots=slots, max_runtime=max_runtime, after=tuple(after)
+            )
         )
     return tuple(sorted(schedules, key=lambda s: s.unit))
 
@@ -311,8 +318,9 @@ def evaluate_job(
     now: datetime,
     *,
     grace: timedelta = SENTINEL_GRACE,
+    predecessor_running: bool = False,
 ) -> JobVerdict:
-    """Judge the latest due slot: PENDING while `now < slot + grace`; RUNNING while the unit is active/activating within `max_runtime` of its last start; OVERRUN when active longer than `max_runtime`; OK when `last_start >= slot - 60s` and the unit is not active; otherwise LATE. A never-started unit is LATE once past the grace, unless its timer became active after the slot (newly deployed unit: PENDING). A non-success `Result` with a start at or after the slot is OK for this function (failure is reported by the existing failed-unit measurement, not duplicated)."""
+    """Judge the latest due slot: PENDING while `now < slot + grace`; RUNNING while the unit is active/activating within `max_runtime` of its last start; OVERRUN when active longer than `max_runtime`; OK when `last_start >= slot - 60s` and the unit is not active; otherwise LATE. A never-started unit is LATE once past the grace, unless its timer became active after the slot (newly deployed unit: PENDING). A non-success `Result` with a start at or after the slot is OK for this function (failure is reported by the existing failed-unit measurement, not duplicated). `predecessor_running` (an `After=` unit is active) downgrades LATE to PENDING because systemd holds the unit back; a stuck predecessor is reported by its own OVERRUN."""
     current = _ensure_kst(now) if now.tzinfo is None else now
     slot = latest_due_slot(schedule, current)
     if slot is None:
@@ -320,7 +328,7 @@ def evaluate_job(
     if current < slot + grace:
         return JobVerdict.PENDING
     if state is None:
-        return JobVerdict.LATE
+        return JobVerdict.PENDING if predecessor_running else JobVerdict.LATE
     if state.last_start is None and state.timer_active_since is not None and state.timer_active_since > slot:
         return JobVerdict.PENDING
     if state.active_state in ("active", "activating"):
@@ -329,7 +337,7 @@ def evaluate_job(
         return JobVerdict.RUNNING
     if state.last_start is not None and state.last_start >= slot - timedelta(seconds=60):
         return JobVerdict.OK
-    return JobVerdict.LATE
+    return JobVerdict.PENDING if predecessor_running else JobVerdict.LATE
 
 
 def _default_inactive_timers(
@@ -395,7 +403,13 @@ def measure_ops(
     if units_ok:
         for schedule in jobs:
             try:
-                verdict = evaluate_job(schedule, states.get(schedule.unit), now)
+                predecessor_running = any(
+                    (prior := states.get(name)) is not None and prior.active_state in ("active", "activating")
+                    for name in schedule.after
+                )
+                verdict = evaluate_job(
+                    schedule, states.get(schedule.unit), now, predecessor_running=predecessor_running
+                )
             except Exception as exc:  # noqa: BLE001 - a single bad clock must not drop other jobs
                 issues.append(
                     MeasuredIssue(key="ops_measure_unavailable:units", text=f"unit states unavailable: {exc}")

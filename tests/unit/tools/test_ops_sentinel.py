@@ -602,3 +602,53 @@ def test_overrun_fires_at_expected_threshold() -> None:
     now = slot + timedelta(minutes=60)
     state = _state(active="active", start=now - timedelta(minutes=60))
     assert evaluate_job(schedule, state, now) == JobVerdict.OVERRUN  # type: ignore[arg-type]
+
+
+def test_late_downgrades_to_pending_while_after_predecessor_runs() -> None:
+    from dataclasses import replace
+
+    from src.tools.ops_sentinel import JobVerdict, evaluate_job, measure_ops
+
+    schedule = replace(_schedule(unit="kca-sweep.service", clock="20:35:00"), after=("kca-archive.service",))  # type: ignore[type-var]
+    now = _kst("2026-10-05", "20:44:00")
+    assert evaluate_job(schedule, None, now) == JobVerdict.LATE  # type: ignore[arg-type]
+    assert evaluate_job(schedule, None, now, predecessor_running=True) == JobVerdict.PENDING  # type: ignore[arg-type]
+    stale = _state(start=_kst("2026-10-02", "20:35:00"))
+    assert evaluate_job(schedule, stale, now, predecessor_running=True) == JobVerdict.PENDING  # type: ignore[arg-type]
+
+    running = _state(active="active", start=_kst("2026-10-05", "20:05:00"))
+    keys = [
+        i.key
+        for i in measure_ops(
+            now,
+            schedules=(schedule,),  # type: ignore[arg-type]
+            states_fn=lambda _u: {"kca-archive.service": running},
+            inactive_timers_fn=lambda: [],
+            disk_fn=lambda: (50, 100),
+        )
+    ]
+    assert keys == []
+    idle = _state(start=_kst("2026-10-05", "20:05:00"))
+    keys = [
+        i.key
+        for i in measure_ops(
+            now,
+            schedules=(schedule,),  # type: ignore[arg-type]
+            states_fn=lambda _u: {"kca-archive.service": idle, "kca-sweep.service": stale},
+            inactive_timers_fn=lambda: [],
+            disk_fn=lambda: (50, 100),
+        )
+    ]
+    assert keys == ["job_late:kca-sweep.service"]
+
+
+def test_loader_reads_unit_section_after_names(tmp_path: Path) -> None:
+    from src.tools.ops_sentinel import load_job_schedules
+
+    (tmp_path / "kca-x.timer").write_text("OnCalendar=Mon..Fri 07:10:00 Asia/Seoul\n", encoding="utf-8")
+    (tmp_path / "kca-x.service").write_text(
+        "[Unit]\nAfter=kca-a.service network.target\nAfter=kca-b.service\n[Service]\nType=oneshot\nAfter=ignored\n",
+        encoding="utf-8",
+    )
+    (schedule,) = load_job_schedules(tmp_path)
+    assert schedule.after == ("kca-a.service", "network.target", "kca-b.service")
