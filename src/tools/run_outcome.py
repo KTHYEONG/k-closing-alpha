@@ -100,23 +100,16 @@ def record_run_outcome(
     )
     if outcome in RUN_OUTCOMES_ALERTED:
         sender = alert_fn if alert_fn is not None else dispatch_digest
-        metrics_text = json.dumps(record["metrics"], ensure_ascii=False, default=str)
         outcome_label = "경고(DEGRADED)" if outcome == RUN_OUTCOME_DEGRADED else "미결정(NO_DECISION)"
+        # Metrics stay in the event log; the mail only points there so an AI fix can read the full record.
         body_lines = [
-            f"[⚠️ 프로세스 상태 저하: {outcome_label}]",
-            f"• 작업: {job} ({run_date})",
-            f"• 사유: {record['reason'] or '(사유 없음)'}",
-            "",
-            "[상세 내역]",
-            f"job={job}",
-            f"run_date={run_date}",
-            f"outcome={outcome}",
-            f"reason={record['reason']}",
-            f"metrics={metrics_text}",
-            f"event_log={target}",
+            f"• 무엇: {job} {outcome_label}",
+            f"• 언제: {run_date}",
+            f"• 원인: {record['reason'] or '(사유 없음)'}",
+            f"• 증거: {target} (job={job})",
         ]
         sender(
-            f"[KCA] {job} {outcome} {run_date}",
+            f"[kca][경고] {job} {outcome} {run_date}",
             "\n".join(body_lines),
         )
     return record

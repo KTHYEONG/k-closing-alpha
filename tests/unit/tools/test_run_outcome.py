@@ -68,12 +68,13 @@ def test_record_run_outcome_alerts_on_degraded_and_no_decision(tmp_path) -> None
 
     # Then
     assert [s for s, _ in sent] == [
-        "[KCA] finalize_close DEGRADED 2026-09-14",
-        "[KCA] predict NO_DECISION 2026-09-14",
+        "[kca][경고] finalize_close DEGRADED 2026-09-14",
+        "[kca][경고] predict NO_DECISION 2026-09-14",
     ]
-    assert "reason=picks_unconfirmed" in sent[0][1]
-    assert "005930" in sent[0][1]
-    assert "reason=ValueError: stale price_history" in sent[1][1]
+    assert "• 원인: picks_unconfirmed" in sent[0][1]
+    assert f"• 증거: {path}" in sent[0][1]
+    assert "005930" not in sent[0][1] and "005930" in path.read_text(encoding="utf-8")
+    assert "• 원인: ValueError: stale price_history" in sent[1][1]
     assert len(path.read_text(encoding="utf-8").splitlines()) == 2
 
 
@@ -109,7 +110,7 @@ def test_record_run_outcome_survives_event_write_failure(tmp_path, caplog) -> No
 
     # Then
     assert record["outcome"] == "DEGRADED"
-    assert sent == ["[KCA] finalize_close DEGRADED 2026-09-14"]
+    assert sent == ["[kca][경고] finalize_close DEGRADED 2026-09-14"]
     assert any("EVENT_WRITE_FAILED" in rec.getMessage() for rec in caplog.records)
 
 
