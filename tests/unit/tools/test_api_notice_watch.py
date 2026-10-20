@@ -4,17 +4,31 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from src.tools import api_notice_watch as w
+from src.tools.api_surface import Surface, TokenEntry
 
 TODAY = date(2026, 10, 20)
+NOW = datetime(2026, 10, 20, 17, 40, tzinfo=w.KST)
 CFG = w.DEFAULT_CONFIG
 LS_ID = "03f7e4d4-cdb3-4276-a7b6-0f27ca5ebfb5"
+
+
+FRESH = "2026-10-19T00:00:00+09:00"
+
+
+def _surface(
+    ls: frozenset[str] = frozenset(), toss: frozenset[str] = frozenset(), extra: dict[str, dict[str, TokenEntry]] | None = None
+) -> Surface:
+    """kca uses `ls`/`toss` tokens; `extra` adds other projects (project -> token -> entry)."""
+    kca = {t: TokenEntry(frozenset({"ls"}), ("src/api/ls/client.py",)) for t in ls}
+    kca.update({t: TokenEntry(frozenset({"toss"}), ("src/api/toss/client.py",)) for t in toss})
+    return Surface(FRESH, {"kca": kca, **(extra or {})})
 
 
 def _ref(notice_id: str, posted: str, title: str = "공지", body: str | None = None, broker: str = "ls") -> w.NoticeRef:
@@ -41,16 +55,15 @@ class FakeSource:
 def _run(
     source: FakeSource,
     state: Path,
-    sent: list[tuple[str, str]],
-    used: frozenset[str] = frozenset({"t8412"}),
+    surface: Surface | None = None,
     **kwargs: Any,
 ) -> w.WatchReport:
     return w.run_watch(
         [source],
-        used={"ls": used},
+        surface=surface or _surface(ls=frozenset({"t8412"})),
         state_path=state,
         today=TODAY,
-        dispatch=lambda s, b: sent.append((s, b)) or {"webhook": True},
+        now=NOW,
         **kwargs,
     )
 
@@ -95,31 +108,32 @@ def test_parse_kiwoom_list_orders_by_seqid_not_server_order() -> None:
     assert w.parse_kiwoom_body({"noticeDetail": {"dtlCntn": None}}) == ""
 
 
-def test_judge_notice_matches_tr_on_word_boundary_and_paths() -> None:
-    used = frozenset({"t8412", "/uapi/domestic-stock/v1/quotations/inquire-price"})
-    hit = w.judge_notice(_ref("1", "2026-10-07"), "t8412InBlock 필드 추가", used, CFG)
-    assert hit.tokens == ("t8412",)
-    assert not w.judge_notice(_ref("2", "2026-10-07"), "t84120 및 xt8412", used, CFG).tokens
-    path = w.judge_notice(_ref("3", "2026-10-07"), "경로 /UAPI/domestic-stock/v1/quotations/inquire-price 변경", used, CFG)
-    assert path.needs_attention
+def test_judge_notice_matches_tr_on_word_boundary_and_names_every_affected_project() -> None:
+    krx = {"t8412": TokenEntry(frozenset({"ls"}), ("src/realtime/adapters/ls.py",)), "s3_": TokenEntry(frozenset({"ls"}), ("x.py",))}
+    surface = _surface(ls=frozenset({"t8412"}), extra={"krx": krx})
+    hit = w.judge_notice(_ref("1", "2026-10-07"), "t8412InBlock 필드 추가", surface, CFG)
+    assert [(i.project, i.token, i.files) for i in hit.impact] == [
+        ("kca", "t8412", ("src/api/ls/client.py",)),
+        ("krx", "t8412", ("src/realtime/adapters/ls.py",)),
+    ]
+    assert not w.judge_notice(_ref("2", "2026-10-07"), "t84120 및 xt8412", surface, CFG).impact
+
+
+def test_judge_notice_matches_paths_case_insensitively_and_only_for_the_notice_broker() -> None:
+    path = "/uapi/domestic-stock/v1/quotations/inquire-price"
+    kis = {path: TokenEntry(frozenset({"kis"}), ("k.py",))}
+    surface = Surface(FRESH, {"kse": kis})
+    kis_ref = _ref("3", "2026-10-07", broker="kis")
+    assert w.judge_notice(kis_ref, f"경로 {path.upper()} 변경", surface, CFG).impact[0].project == "kse"
+    assert not w.judge_notice(_ref("4", "2026-10-07", broker="ls"), f"경로 {path}", surface, CFG).impact
 
 
 def test_judge_notice_flags_empty_body_and_keywords_but_ignores_irrelevant() -> None:
-    assert w.judge_notice(_ref("1", "2026-10-07"), "  ", frozenset(), CFG).empty_body
-    assert w.judge_notice(_ref("2", "2026-10-07"), "유량제어 시행", frozenset(), CFG).keywords == ("유량",)
-    assert not w.judge_notice(_ref("3", "2026-10-07", title="이벤트"), "수수료 할인", frozenset(), CFG).needs_attention
-
-
-def test_collect_used_identifiers_reads_trs_and_paths_per_broker(tmp_path: Path) -> None:
-    (tmp_path / "ls").mkdir()
-    (tmp_path / "ls" / "client.py").write_text('TR = "t8412"  # not t84120x\nP = "/api/dostk/chart"\n', encoding="utf-8")
-    (tmp_path / "kis").mkdir()
-    (tmp_path / "kis" / "c.py").write_text('ID = "FHKST01010100"\nU = "/uapi/domestic-stock/v1/quotations/inquire-price"', encoding="utf-8")
-    (tmp_path / "_common.py").write_text("t9999", encoding="utf-8")
-    used = w.collect_used_identifiers(tmp_path)
-    assert used["ls"] == frozenset({"t8412", "/api/dostk/chart"})
-    assert used["kis"] == frozenset({"fhkst01010100", "/uapi/domestic-stock/v1/quotations/inquire-price"})
-    assert set(used) == {"ls", "kis"}
+    surface = _surface(extra={"krx": {"s3_": TokenEntry(frozenset({"ls"}), ("x.py",))}})
+    assert w.judge_notice(_ref("1", "2026-10-07"), "  ", surface, CFG).empty_body
+    keyword = w.judge_notice(_ref("2", "2026-10-07"), "유량제어 시행", surface, CFG)
+    assert keyword.keywords == ("유량",) and keyword.broker_projects == ("krx",)
+    assert not w.judge_notice(_ref("3", "2026-10-07", title="이벤트"), "수수료 할인", surface, CFG).needs_attention
 
 
 def test_collect_new_first_run_applies_lookback_and_later_runs_use_seen() -> None:
@@ -144,37 +158,38 @@ def test_empty_first_page_is_a_fault_not_silence() -> None:
 
 
 def test_run_watch_alerts_once_then_stays_quiet_and_persists_seen(tmp_path: Path) -> None:
-    state, sent = tmp_path / "s.json", []
+    state = tmp_path / "s.json"
     source = FakeSource(
         pages=[[_ref("2", "2026-10-16", "TR 변경"), _ref("1", "2026-10-15", "이벤트")]],
         bodies={"2": "t8412 입력 필드 추가", "1": "수수료 할인"},
     )
-    first = _run(source, state, sent)
+    first = _run(source, state)
     assert [v.ref.notice_id for v in first.attention] == ["2"] and len(first.quiet) == 1
-    assert len(sent) == 1 and "t8412" in sent[0][1]
-    again = _run(source, state, sent)
-    assert not again.attention and len(sent) == 1
+    saved = w.load_state(state)
+    assert saved["last_run_at"] == "2026-10-20T17:40:00+09:00" and set(saved["pending"]) == {"ls:2"}
+    assert saved["watched_projects"] == ["kca"]
+    again = _run(source, state)
+    assert not again.attention
     assert w.load_state(state)["brokers"]["ls"]["seen"] == ["2", "1"]
 
 
 def test_run_watch_fault_alerts_once_per_episode_and_does_not_advance_state(tmp_path: Path) -> None:
-    state, sent = tmp_path / "s.json", []
+    state = tmp_path / "s.json"
     healthy = FakeSource(pages=[[_ref("1", "2026-10-16")]], bodies={"1": "t8412"})
-    _run(healthy, state, sent)
-    sent.clear()
+    _run(healthy, state)
     broken = FakeSource(fail=True)
-    assert _run(broken, state, sent).new_faults and len(sent) == 1
-    assert not _run(broken, state, sent).new_faults and len(sent) == 1
+    assert _run(broken, state).new_faults
+    assert not _run(broken, state).new_faults
     saved = w.load_state(state)
     assert saved["brokers"]["ls"]["seen"] == ["1"] and "ls" in saved["faults"]
-    _run(healthy, state, sent)
+    _run(healthy, state)
     assert "ls" not in w.load_state(state)["faults"]
 
 
-def test_dry_run_neither_dispatches_nor_writes_state(tmp_path: Path) -> None:
+def test_dry_run_does_not_write_state(tmp_path: Path) -> None:
     state = tmp_path / "s.json"
     source = FakeSource(pages=[[_ref("1", "2026-10-16")]], bodies={"1": "t8412"})
-    report = w.run_watch([source], used={"ls": frozenset({"t8412"})}, state_path=state, today=TODAY, dispatch=None)
+    report = w.run_watch([source], surface=_surface(ls=frozenset({"t8412"})), state_path=state, today=TODAY, persist=False)
     assert report.attention and not state.exists()
 
 
@@ -223,26 +238,26 @@ def test_toss_unused_changes_are_informational_and_removed_used_path_is_actionab
 
 
 def test_run_watch_toss_seeds_silently_then_alerts_on_used_path_change(tmp_path: Path) -> None:
-    state, sent = tmp_path / "s.json", []
+    state = tmp_path / "s.json"
     source = FakeSource(pages=[[_ref("1", "2026-10-16")]], bodies={"1": "수수료 할인"})
     specs = {"openapi": _OPENAPI}
     kwargs = {"toss_fetch": lambda: (specs["openapi"], {"a": 1})}
-    used = {"ls": frozenset(), "toss": _USED}
-    seed = w.run_watch([source], used=used, state_path=state, today=TODAY, dispatch=lambda s, b: sent.append((s, b)) or {}, **kwargs)
-    assert not seed.toss_changes and not sent
+    used = _surface(toss=_USED)
+    seed = w.run_watch([source], surface=used, state_path=state, today=TODAY, **kwargs)
+    assert not seed.toss_changes and not w.load_state(state)["pending"]
     changed = copy.deepcopy(_OPENAPI)
     changed["paths"]["/api/v1/prices"]["get"]["summary"] = "x"
     specs["openapi"] = changed
-    report = w.run_watch([source], used=used, state_path=state, today=TODAY, dispatch=lambda s, b: sent.append((s, b)) or {}, **kwargs)
-    assert report.toss_changes and "toss" in sent[0][1]
+    report = w.run_watch([source], surface=used, state_path=state, today=TODAY, **kwargs)
+    assert report.toss_changes and next(iter(w.load_state(state)["pending"])).startswith("toss:")
 
 
-def test_format_digest_lists_reasons_and_counts() -> None:
-    verdict = w.NoticeVerdict(_ref("1", "2026-10-07", "TR 안내"), ("t8412",), ("유량",), empty_body=False)
+def test_format_report_lists_reasons_and_counts() -> None:
+    verdict = w.NoticeVerdict(_ref("1", "2026-10-07", "TR 안내"), (w.ProjectImpact("krx", "t8412", ("a.py", "b.py")),), ("유량",), empty_body=False, broker_projects=("kca", "krx"))
     report = w.WatchReport(attention=[verdict], toss_changes=["x"], new_faults=["kis: boom"])
-    subject, body = w.format_digest(report, {"ls": "https://ls"})
+    subject, body = w.format_report(report, {"ls": "https://ls"})
     assert "3건" in subject
-    assert "t8412" in body and "유량" in body and "[감시기 이상] kis: boom" in body and "https://ls" in body
+    assert "krx:t8412(a.py, b.py)" in body and "유량" in body and "kca, krx" in body and w.PENDING_HINT in body and "[감시기 이상] kis: boom" in body and "https://ls" in body
 
 
 @dataclass
@@ -375,26 +390,83 @@ def test_toss_newly_matched_endpoint_is_actionable() -> None:
 
 def test_digest_flags_empty_body_for_manual_review() -> None:
     verdict = w.NoticeVerdict(_ref("1", "2026-10-07", "첨부 공지"), (), (), empty_body=True)
-    _, body = w.format_digest(w.WatchReport(attention=[verdict]), {})
+    _, body = w.format_report(w.WatchReport(attention=[verdict]), {})
     assert "본문 없음" in body
 
 
 def test_toss_fetch_fault_alerts_once_and_keeps_prior_snapshot(tmp_path: Path) -> None:
-    state, sent = tmp_path / "s.json", []
+    state = tmp_path / "s.json"
     source = FakeSource(pages=[[_ref("1", "2026-10-16")]], bodies={"1": "수수료"})
-    used = {"ls": frozenset(), "toss": _USED}
+    used = _surface(toss=_USED)
 
-    def dispatch(subject: str, body: str) -> dict[str, bool]:
-        sent.append((subject, body))
-        return {}
-
-    w.run_watch([source], used=used, state_path=state, today=TODAY, dispatch=dispatch, toss_fetch=lambda: (_OPENAPI, {"a": 1}))
+    w.run_watch([source], surface=used, state_path=state, today=TODAY, toss_fetch=lambda: (_OPENAPI, {"a": 1}))
     seeded = w.load_state(state)["toss"]
 
     def broken() -> tuple[dict[str, Any], dict[str, Any]]:
         raise w.SourceFaultError("spec 403")
 
     for _ in range(2):
-        w.run_watch([source], used=used, state_path=state, today=TODAY, dispatch=dispatch, toss_fetch=broken)
-    assert len(sent) == 1 and "toss: spec 403" in sent[0][1]
+        w.run_watch([source], surface=used, state_path=state, today=TODAY, toss_fetch=broken)
+    assert w.load_state(state)["faults"] == {"toss": "2026-10-20"}
     assert w.load_state(state)["toss"] == seeded
+
+
+def test_pending_actions_persist_dedupe_render_and_ack(tmp_path: Path) -> None:
+    state = tmp_path / "s.json"
+    surface = _surface(ls=frozenset({"t8412"}), extra={"krx": {"s3_": TokenEntry(frozenset({"ls"}), ("x.py",))}})
+    source = FakeSource(
+        pages=[[_ref("2", "2026-10-16", "유량 공지"), _ref("1", "2026-10-15", "TR 변경")]],
+        bodies={"2": "세션 3개로 제한", "1": "t8412 필드 추가"},
+    )
+    _run(source, state, surface=surface)
+    pending = w.load_state(state)["pending"]
+    assert set(pending) == {"ls:1", "ls:2"}
+    assert pending["ls:1"]["impact"] == [{"project": "kca", "token": "t8412", "files": ["src/api/ls/client.py"]}]
+    assert pending["ls:2"]["broker_projects"] == ["kca", "krx"]
+    assert pending["ls:1"]["projects"] == ["kca"] and pending["ls:2"]["projects"] == ["kca", "krx"]
+    rendered = w.format_pending(pending)
+    assert "kca: t8412 → src/api/ls/client.py" in rendered and "점검 대상 프로젝트: kca, krx" in rendered
+    _run(source, state, surface=surface)
+    assert set(w.load_state(state)["pending"]) == {"ls:1", "ls:2"}
+    assert w.ack_pending(state, ["ls:1", "nope"]) == ["nope"]
+    after = w.load_state(state)
+    assert set(after["pending"]) == {"ls:2"} and after["brokers"]["ls"]["seen"] == ["2", "1"]
+    assert w.format_pending({}) == "조치 대기 항목 없음\n"
+
+
+def test_empty_body_pending_is_rendered_for_manual_check() -> None:
+    verdict = w.NoticeVerdict(_ref("9", "2026-10-07", "첨부"), (), (), empty_body=True)
+    action_id, item = w._pending_from_verdict(verdict, TODAY)
+    assert item["projects"] == ["kca"]  # no impact and no broker users: falls back to the watcher owner
+    assert "게시판에서 직접 확인" in w.format_pending({action_id: item})
+
+
+def test_toss_spec_change_becomes_a_pending_action(tmp_path: Path) -> None:
+    state = tmp_path / "s.json"
+    source = FakeSource(pages=[[_ref("1", "2026-10-16")]], bodies={"1": "수수료"})
+    surface = _surface(toss=_USED)
+    specs = {"openapi": _OPENAPI}
+
+    def run() -> None:
+        w.run_watch(
+            [source], surface=surface, state_path=state, today=TODAY, toss_fetch=lambda: (specs["openapi"], {"a": 1})
+        )
+
+    run()
+    changed = copy.deepcopy(_OPENAPI)
+    changed["paths"]["/api/v1/prices"]["get"]["summary"] = "x"
+    specs["openapi"] = changed
+    run()
+    (action_id, item), = w.load_state(state)["pending"].items()
+    assert action_id.startswith("toss:") and "사용 중인 엔드포인트 명세 변경: /api/v1/prices" in w.format_pending({action_id: item})
+    assert item["projects"] == ["kca"]
+
+
+def test_stale_surface_manifest_raises_one_fault_per_episode(tmp_path: Path) -> None:
+    state = tmp_path / "s.json"
+    stale = Surface("2026-01-01T00:00:00+09:00", {"kca": {}})
+    source = FakeSource(pages=[[_ref("1", "2026-10-16")]], bodies={"1": "수수료"})
+    assert _run(source, state, surface=stale).new_faults[0].startswith("surface:")
+    assert not _run(source, state, surface=stale).new_faults
+    _run(source, state, surface=_surface())
+    assert "surface" not in w.load_state(state)["faults"]

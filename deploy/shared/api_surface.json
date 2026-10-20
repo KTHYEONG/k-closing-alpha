@@ -1,0 +1,905 @@
+{
+ "schema_version": 1,
+ "generated_at": "2026-10-20T08:11:23+00:00",
+ "projects": {
+  "kca": {
+   "/api/dostk/chart": {
+    "brokers": [
+     "kiwoom"
+    ],
+    "files": [
+     "src/api/kiwoom/client.py"
+    ]
+   },
+   "/api/dostk/rkinfo": {
+    "brokers": [
+     "kiwoom"
+    ],
+    "files": [
+     "src/api/kiwoom/client.py"
+    ]
+   },
+   "/api/dostk/stkinfo": {
+    "brokers": [
+     "kiwoom"
+    ],
+    "files": [
+     "src/api/kiwoom/client.py"
+    ]
+   },
+   "/api/v1/candles": {
+    "brokers": [
+     "toss"
+    ],
+    "files": [
+     "src/api/toss/client.py"
+    ]
+   },
+   "/api/v1/quote/kr-chart/min": {
+    "brokers": [
+     "dbsec"
+    ],
+    "files": [
+     "src/api/dbsec/client.py"
+    ]
+   },
+   "/api/v1/quote/kr-stock/inquiry/daily-price": {
+    "brokers": [
+     "dbsec"
+    ],
+    "files": [
+     "src/api/dbsec/client.py"
+    ]
+   },
+   "/api/v1/rankings": {
+    "brokers": [
+     "toss"
+    ],
+    "files": [
+     "src/api/toss/client.py"
+    ]
+   },
+   "/api/v1/stocks/{symbol}/program-trades": {
+    "brokers": [
+     "toss"
+    ],
+    "files": [
+     "src/api/toss/client.py"
+    ]
+   },
+   "/oauth2/revoke": {
+    "brokers": [
+     "kiwoom"
+    ],
+    "files": [
+     "src/api/kiwoom/client.py"
+    ]
+   },
+   "/oauth2/token": {
+    "brokers": [
+     "dbsec",
+     "kiwoom",
+     "ls",
+     "toss"
+    ],
+    "files": [
+     "src/api/dbsec/client.py",
+     "src/api/kiwoom/client.py",
+     "src/api/ls/client.py",
+     "src/api/toss/client.py"
+    ]
+   },
+   "/oauth2/tokenp": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/daily-credit-balance": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/daily-short-sale": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-price": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-time-itemconclusion": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/investor-trend-estimate": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/program-trade-by-stock": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/ranking/fluctuation": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/inquire-balance": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/trading.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/inquire-daily-ccld": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/trading.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/inquire-psbl-order": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/trading.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/order-cash": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/trading.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/order-rvsecncl": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/trading.py"
+    ]
+   },
+   "fhkst01010100": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhkst01010200": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhkst03010100": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhkst03010200": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhkst03010230": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhkup03500100": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhppg04650101": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhppg04650201": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhpst01060000": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhpst01700000": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhpst04760000": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhpst04830000": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "fhptj04160001": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "hhptj04160200": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/api/kis/client.py"
+    ]
+   },
+   "ka10027": {
+    "brokers": [
+     "kiwoom"
+    ],
+    "files": [
+     "src/api/kiwoom/client.py"
+    ]
+   },
+   "ka10059": {
+    "brokers": [
+     "kiwoom"
+    ],
+    "files": [
+     "src/api/kiwoom/client.py"
+    ]
+   },
+   "ka10079": {
+    "brokers": [
+     "kiwoom"
+    ],
+    "files": [
+     "src/api/_transport.py",
+     "src/api/kiwoom/client.py"
+    ]
+   },
+   "ka10080": {
+    "brokers": [
+     "kiwoom"
+    ],
+    "files": [
+     "src/api/kiwoom/client.py"
+    ]
+   },
+   "t8411": {
+    "brokers": [
+     "ls"
+    ],
+    "files": [
+     "src/api/ls/client.py"
+    ]
+   },
+   "t8412": {
+    "brokers": [
+     "ls"
+    ],
+    "files": [
+     "src/api/ls/client.py"
+    ]
+   }
+  },
+  "krx": {
+   "/api/v1/market-calendar/kr": {
+    "brokers": [
+     "toss"
+    ],
+    "files": [
+     "src/marketdata/toss_calendar.py"
+    ]
+   },
+   "/oauth2/approval": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/realtime/adapters/kis.py"
+    ]
+   },
+   "/oauth2/token": {
+    "brokers": [
+     "dbsec",
+     "ls",
+     "toss"
+    ],
+    "files": [
+     "src/marketdata/toss_calendar.py",
+     "src/realtime/adapters/db.py",
+     "src/realtime/adapters/ls.py"
+    ]
+   },
+   "/oauth2/tokenp": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/auth.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-index-price": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-price": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-time-indexchartprice": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/investor-trend-estimate": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/news-title": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/program-trade-by-stock": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/volume-rank": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/ranking/fluctuation": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/inquire-balance": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/trading.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/inquire-daily-ccld": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/trading.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/inquire-psbl-order": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/trading.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/order-cash": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/trading.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/order-rvsecncl": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/trading.py"
+    ]
+   },
+   "fhkst01010100": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "fhkst01010200": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "fhkst01011800": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "fhkst03010100": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "fhkst03010200": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "fhkup03500200": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "fhppg04650101": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "fhpst01700000": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "fhpst01710000": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "fhpst01720000": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "fhpup02100000": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "h0nxasp0": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/realtime/adapters/kis.py"
+    ]
+   },
+   "h0nxcnt0": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/realtime/adapters/kis.py"
+    ]
+   },
+   "h0stasp0": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/realtime/adapters/db.py",
+     "src/realtime/adapters/kis.py",
+     "src/realtime/adapters/ls.py"
+    ]
+   },
+   "h0stcnt0": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/realtime/adapters/db.py",
+     "src/realtime/adapters/kis.py",
+     "src/realtime/adapters/ls.py"
+    ]
+   },
+   "h1_": {
+    "brokers": [
+     "ls"
+    ],
+    "files": [
+     "src/realtime/adapters/ls.py"
+    ]
+   },
+   "ha_": {
+    "brokers": [
+     "ls"
+    ],
+    "files": [
+     "src/realtime/adapters/ls.py"
+    ]
+   },
+   "hhptj04160200": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "k3_": {
+    "brokers": [
+     "ls"
+    ],
+    "files": [
+     "src/realtime/adapters/ls.py"
+    ]
+   },
+   "s00": {
+    "brokers": [
+     "dbsec"
+    ],
+    "files": [
+     "src/realtime/adapters/db.py"
+    ]
+   },
+   "s01": {
+    "brokers": [
+     "dbsec"
+    ],
+    "files": [
+     "src/realtime/adapters/db.py"
+    ]
+   },
+   "s3_": {
+    "brokers": [
+     "ls"
+    ],
+    "files": [
+     "src/realtime/adapters/ls.py"
+    ]
+   }
+  },
+  "kse": {
+   "/oauth2/tokenp": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-price": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/search-stock-info": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/inquire-balance": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/inquire-daily-ccld": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/inquire-psbl-order": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/trading/order-cash": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "/uapi/hashkey": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "/v1/quote/kr-chart/day": {
+    "brokers": [
+     "dbsec"
+    ],
+    "files": [
+     "src/integrations/dbsec/client.py"
+    ]
+   },
+   "/v1/quote/kr-chart/min": {
+    "brokers": [
+     "dbsec"
+    ],
+    "files": [
+     "src/integrations/dbsec/client.py"
+    ]
+   },
+   "/v1/quote/kr-stock/inquiry/stock-ticker": {
+    "brokers": [
+     "dbsec"
+    ],
+    "files": [
+     "src/integrations/dbsec/client.py"
+    ]
+   },
+   "fhkst01010100": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "fhkst01010200": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/integrations/kis/client.py"
+    ]
+   },
+   "fhptj04160001": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "config/providers.toml",
+     "src/integrations/kis/client.py",
+     "src/integrations/kis/investor_flow.py"
+    ]
+   },
+   "t1702": {
+    "brokers": [
+     "ls"
+    ],
+    "files": [
+     "src/data/evidence_sources.py",
+     "src/data/investor_flow_silver.py",
+     "src/data/jobs/flow.py",
+     "src/integrations/ls/client.py",
+     "src/integrations/ls/investor_flow.py"
+    ]
+   }
+  }
+ }
+}
