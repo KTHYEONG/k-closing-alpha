@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA broker API notice watcher (daily 07:40 and 17:40 KST)
+
+[Timer]
+OnCalendar=*-*-* 07:40:00 Asia/Seoul
+OnCalendar=*-*-* 17:40:00 Asia/Seoul
+Persistent=true
+Unit=kca-api-notice-watch.service
+
+[Install]
+WantedBy=timers.target
