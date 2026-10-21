@@ -479,13 +479,13 @@ def test_late_open_symbol_does_not_starve_later_symbols(tmp_path, monkeypatch) -
         )
     )
     by_symbol = {e.symbol: e for e in manifest.entries if e.dataset == CaptureDataset.PRICE}
-    assert by_symbol["000001"].status == CaptureStatus.PARTIAL and by_symbol["000001"].reason == "open_unresolved"
+    assert by_symbol["000001"].status == CaptureStatus.NO_TRADES and by_symbol["000001"].reason == "no_open_trade"
     assert by_symbol["000002"].status == CaptureStatus.COMPLETE and by_symbol["000003"].status == CaptureStatus.COMPLETE
-    assert manifest.status == CaptureStatus.PARTIAL
+    assert manifest.status == CaptureStatus.COMPLETE
 
 
-def test_unresolved_open_stays_partial(tmp_path, monkeypatch) -> None:
-    """Never-appearing open retains explicit unresolved state."""
+def test_valid_reply_without_open_price_is_no_trades(tmp_path, monkeypatch) -> None:
+    """A symbol the vendor keeps answering with no open price is a terminal NO_TRADES, not a collection gap."""
     from src.daily import auction_capture
     from src.data.capture_contracts import CaptureDataset, CaptureStatus
 
@@ -509,6 +509,49 @@ def test_unresolved_open_stays_partial(tmp_path, monkeypatch) -> None:
             return {"rt_cd": "0", "output": {"stck_oprc": "0"}}
 
     client = _ZeroClient(calls=[], advance=_advance)
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="open",
+            profile=profile,
+            store=store,
+            clients=[client],
+            session_clock=clock,
+            now_fn=lambda: state["now"],
+            sleep_fn=_sleep,
+        )
+    )
+    price_entries = [e for e in manifest.entries if e.dataset == CaptureDataset.PRICE]
+    assert price_entries and all(e.status == CaptureStatus.NO_TRADES for e in price_entries)
+    assert all(e.reason == "no_open_trade" for e in price_entries)
+    assert manifest.status == CaptureStatus.COMPLETE
+
+
+def test_error_reply_without_open_price_stays_partial(tmp_path, monkeypatch) -> None:
+    """A vendor error reply is not evidence that nothing traded: the symbol stays an explicit unresolved gap."""
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-16", ["000001"])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
+    profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=31)
+    clock = _clock("2026-09-17")
+    state = {"now": _seoul(2026, 9, 17, 8, 30)}
+
+    async def _sleep(seconds: float) -> None:
+        state["now"] += dt.timedelta(seconds=seconds)
+
+    def _advance() -> None:
+        state["now"] += dt.timedelta(seconds=20)
+
+    class _ErrorClient(_FakeClient):
+        async def get_current_price(self, session: Any, code: str, market_div_code: str | None = None) -> dict[str, Any]:
+            self.calls.append(("price", code))
+            state["now"] += dt.timedelta(seconds=40)
+            return {"rt_cd": "1", "output": {"stck_oprc": "0"}}
+
+    client = _ErrorClient(calls=[], advance=_advance)
     manifest = _run(
         auction_capture.run_auction_capture(
             "2026-09-17",
