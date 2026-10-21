@@ -8,6 +8,7 @@ import functools
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Set as AbstractSet
 from datetime import date, datetime, timedelta
 from typing import Any, Literal
 
@@ -514,13 +515,22 @@ async def _observe_open_symbol(
     last_seen: dict[str, tuple[Any, datetime]],
     settled: set[int],
     degraded: list[str],
+    confirmed_empty: set[str] | None = None,
 ) -> CoverageEntry:
-    """Poll one symbol's opening price; unresolved symbols return a provisional entry for re-pass."""
+    """Poll one symbol's opening price; unresolved symbols return a provisional entry for re-pass.
+
+    `confirmed_empty` tracks symbols whose latest response was a valid vendor reply without an open price.
+    """
     started_at = poll_started.setdefault(symbol, now_fn())
     payload = await client.get_current_price(session, symbol, market_div_code=KRX_CLOSE_MARKET_DIV_CODE)
     received = now_fn()
     body = dict(payload) if isinstance(payload, dict) else None
     price = _extract_open_price(body)
+    if confirmed_empty is not None:
+        if price <= 0 and body is not None and str(body.get("rt_cd")) == "0":
+            confirmed_empty.add(symbol)
+        else:
+            confirmed_empty.discard(symbol)
     context = CaptureContext(
         trading_date=trading_day,
         run_id=run_id,
@@ -602,6 +612,31 @@ async def _observe_open_symbol(
     )
 
 
+def _unresolved_open_entry(
+    symbol: str,
+    *,
+    floor: datetime,
+    first_seen: datetime,
+    last_seen_at: datetime,
+    ref: Any,
+    no_open_trade: bool,
+) -> CoverageEntry:
+    """Final entry of a symbol without an open price: NO_TRADES when the vendor kept answering that none printed, else PARTIAL."""
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.PRICE,
+        venue="KRX",
+        session="regular",
+        scheduled_at=floor,
+        status=CaptureStatus.NO_TRADES if no_open_trade else CaptureStatus.PARTIAL,
+        rows=0,
+        first_event_time=first_seen,
+        last_event_time=last_seen_at,
+        reason="no_open_trade" if no_open_trade else "open_unresolved",
+        raw_refs=(ref,) if ref is not None else (),
+    )
+
+
 def _open_deadline_entry(
     position: int,
     symbol: str,
@@ -611,23 +646,19 @@ def _open_deadline_entry(
     poll_started: dict[str, datetime],
     last_seen: dict[str, tuple[Any, datetime]],
     settled: set[int],
+    confirmed_empty: AbstractSet[str] = frozenset(),
 ) -> CoverageEntry:
-    """Final PARTIAL entry for an open symbol never dispatched before confirmation end."""
+    """Final entry for an open symbol never dispatched before confirmation end."""
     settled.add(position)
     moment = last_seen.get(symbol)
     seen_at = moment[1] if moment is not None else now_fn()
-    return CoverageEntry(
-        symbol=symbol,
-        dataset=CaptureDataset.PRICE,
-        venue="KRX",
-        session="regular",
-        scheduled_at=floor,
-        status=CaptureStatus.PARTIAL,
-        rows=0,
-        first_event_time=poll_started.get(symbol, seen_at),
-        last_event_time=seen_at,
-        reason="open_unresolved",
-        raw_refs=(moment[0],) if moment is not None else (),
+    return _unresolved_open_entry(
+        symbol,
+        floor=floor,
+        first_seen=poll_started.get(symbol, seen_at),
+        last_seen_at=seen_at,
+        ref=moment[0] if moment is not None else None,
+        no_open_trade=symbol in confirmed_empty,
     )
 
 
@@ -803,6 +834,7 @@ async def run_auction_capture(
             pending = list(enumerate(roster))
             poll_started: dict[str, datetime] = {}
             last_seen: dict[str, tuple[Any, datetime]] = {}
+            confirmed_empty: set[str] = set()
             attempt = 0
             while pending and now_clock() <= confirm_end:
                 pass_symbols = [symbol for _, symbol in pending]
@@ -829,6 +861,7 @@ async def run_auction_capture(
                         last_seen=last_seen,
                         settled=settled,
                         degraded=pass_degraded,
+                        confirmed_empty=confirmed_empty,
                     ),
                     on_deadline=functools.partial(
                         _open_deadline_entry,
@@ -837,6 +870,7 @@ async def run_auction_capture(
                         poll_started=poll_started,
                         last_seen=last_seen,
                         settled=settled,
+                        confirmed_empty=confirmed_empty,
                     ),
                 )
                 next_pending: list[tuple[int, str]] = []
@@ -846,7 +880,7 @@ async def run_auction_capture(
                     else:
                         next_pending.append((orig_position, symbol))
                 if pass_degraded or any(
-                    entry.status is not CaptureStatus.COMPLETE
+                    entry.status not in GOOD_ENTRY_STATES
                     for pass_index, entry in enumerate(round_entries)
                     if pass_index in settled
                 ):
@@ -856,24 +890,18 @@ async def run_auction_capture(
                     attempt += 1
                     await sleeper(1.0)
             for _, symbol in pending:
-                incomplete = True
                 seen = last_seen.get(symbol)
                 moment = seen[1] if seen is not None else now_clock()
-                entries.append(
-                    CoverageEntry(
-                        symbol=symbol,
-                        dataset=CaptureDataset.PRICE,
-                        venue="KRX",
-                        session="regular",
-                        scheduled_at=floor,
-                        status=CaptureStatus.PARTIAL,
-                        rows=0,
-                        first_event_time=poll_started.get(symbol, moment),
-                        last_event_time=moment,
-                        reason="open_unresolved",
-                        raw_refs=(seen[0],) if seen is not None else (),
-                    )
+                entry = _unresolved_open_entry(
+                    symbol,
+                    floor=floor,
+                    first_seen=poll_started.get(symbol, moment),
+                    last_seen_at=moment,
+                    ref=seen[0] if seen is not None else None,
+                    no_open_trade=symbol in confirmed_empty,
                 )
+                incomplete = incomplete or entry.status not in GOOD_ENTRY_STATES
+                entries.append(entry)
     status = CaptureStatus.COMPLETE
     for item in entries:
         if item.status not in GOOD_ENTRY_STATES:
