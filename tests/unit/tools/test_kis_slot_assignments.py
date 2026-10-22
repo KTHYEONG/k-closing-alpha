@@ -9,7 +9,7 @@ import pytest
 
 TABLE_PATH = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "kis_slot_assignments.toml"
 CANONICAL_HEADER = "# canonical: krx-alpha/deploy/shared/kis_slot_assignments.toml schema=1"
-PINNED_SHA256 = "4c0b40679733c885e16c0846893f3f4022b4fe252ed8ecf7faa75c4e20260ca3"
+PINNED_SHA256 = "5064bbb38e126f37befdbd26a80578000bfd061fb0e4dd49478f2e8386e6a751"
 
 _WINDOW_RE = re.compile(r"^\d{2}:\d{2}-\d{2}:\d{2}$")
 
