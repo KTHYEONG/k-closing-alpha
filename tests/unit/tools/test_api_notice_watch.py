@@ -120,7 +120,7 @@ def test_judge_notice_matches_tr_on_word_boundary_and_names_every_affected_proje
 
 
 def test_judge_notice_matches_paths_case_insensitively_and_only_for_the_notice_broker() -> None:
-    path = "/uapi/domestic-stock/v1/quotations/inquire-price"
+    path = "/uapi/domestic-stock/v1/quotations/INQUIRE-price"
     kis = {path: TokenEntry(frozenset({"kis"}), ("k.py",))}
     surface = Surface(FRESH, {"kse": kis})
     kis_ref = _ref("3", "2026-10-07", broker="kis")
@@ -470,3 +470,75 @@ def test_stale_surface_manifest_raises_one_fault_per_episode(tmp_path: Path) -> 
     assert not _run(source, state, surface=stale).new_faults
     _run(source, state, surface=_surface())
     assert "surface" not in w.load_state(state)["faults"]
+
+
+_TOSS_SPEC_FIXTURE: dict[str, Any] = {
+    "paths": {
+        "/api/v1/candles": {"get": {"summary": "candles"}},
+        "/api/v1/rankings": {"get": {"summary": "rankings"}},
+        "/api/v1/stocks/{symbol}/program-trades": {"get": {"summary": "program trades"}},
+        "/api/v1/market-calendar/KR": {"get": {"summary": "kr calendar"}},
+    },
+    "components": {"schemas": {}},
+}
+
+
+def test_toss_exact_match_is_clean() -> None:
+    used = frozenset({"/api/v1/market-calendar/KR"})
+    before = w.snapshot_toss_spec(_TOSS_SPEC_FIXTURE, {"a": 1}, used)
+    after = w.snapshot_toss_spec(_TOSS_SPEC_FIXTURE, {"a": 1}, used)
+    actionable, info = w.diff_toss_spec(before, after, used)
+    assert actionable == [] and info == []
+
+
+def test_toss_case_mismatch_is_info_only() -> None:
+    used = frozenset({"/api/v1/market-calendar/kr"})
+    before = w.snapshot_toss_spec(_TOSS_SPEC_FIXTURE, {"a": 1}, used)
+    after = w.snapshot_toss_spec(_TOSS_SPEC_FIXTURE, {"a": 1}, used)
+    actionable, info = w.diff_toss_spec(before, after, used)
+    assert actionable == []
+    assert len(info) == 1 and "/api/v1/market-calendar/kr" in info[0] and "/api/v1/market-calendar/KR" in info[0]
+
+
+def test_toss_truly_missing_stays_actionable() -> None:
+    used = frozenset({"/api/v1/market-calendar/XX"})
+    before = w.snapshot_toss_spec(_TOSS_SPEC_FIXTURE, {"a": 1}, used)
+    after = w.snapshot_toss_spec(_TOSS_SPEC_FIXTURE, {"a": 1}, used)
+    actionable, _ = w.diff_toss_spec(before, after, used)
+    assert actionable == ["사용 중인 경로가 명세에 없음: /api/v1/market-calendar/XX"]
+
+
+@pytest.mark.parametrize("prior_paths", [{}, {"/api/v1/market-calendar/kr": {"get": {}}}])
+def test_toss_case_mismatch_does_not_create_pending_on_baseline_transition(
+    tmp_path: Path, prior_paths: dict[str, Any]
+) -> None:
+    used = frozenset({"/api/v1/market-calendar/kr"})
+    state = tmp_path / "s.json"
+    prior = w.snapshot_toss_spec({"paths": prior_paths}, {}, used)
+    w.write_state(state, {"toss": prior.to_json()})
+    report = w.run_watch(
+        [], surface=_surface(toss=used), state_path=state, today=TODAY,
+        toss_fetch=lambda: (_TOSS_SPEC_FIXTURE, {}),
+    )
+    assert report.toss_changes == []
+    assert "경로 대소문자 불일치: /api/v1/market-calendar/kr vs /api/v1/market-calendar/KR" in report.toss_info
+    assert not w.load_state(state)["pending"]
+    saved = w.load_state(state)["toss"]["used_path_sha"]
+    assert set(saved) == {"/api/v1/market-calendar/KR"}
+
+
+def test_manifest_krx_toss_paths_exist_exact_case_in_spec() -> None:
+    from src.tools.api_surface import load_surface as _load_manifest
+
+    surface = _load_manifest()
+    krx_toss_api = {t for t, e in surface.projects["krx"].items() if "toss" in e.brokers and t.startswith("/api/")}
+    assert krx_toss_api
+    assert "/api/v1/market-calendar/kr" not in surface.projects["krx"]
+    for path in krx_toss_api:
+        assert path in _TOSS_SPEC_FIXTURE["paths"]
+    assert set(_TOSS_SPEC_FIXTURE["paths"]) == {
+        "/api/v1/candles",
+        "/api/v1/rankings",
+        "/api/v1/stocks/{symbol}/program-trades",
+        "/api/v1/market-calendar/KR",
+    }
