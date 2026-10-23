@@ -58,7 +58,7 @@ EOF
 - All completeness keys (`archive close_confirmed decision paper_entry paper_exit minute_bars price_history_fresh`) must be `True`.
 - SSH failure = P0 (retry once after 30 s). Uptime shorter than the last check = reboot: `Persistent=true` timers catch up, others are skipped.
 
-## 3. Schedule and Expected Evidence (28 timers, all KST)
+## 3. Schedule and Expected Evidence (29 timers, all KST)
 
 Containerized units run `ExecStart=%h/.local/lib/kca/kca-run <job> [--kis-data] [--admission critical|standard|bulk] [--role decision|batch] [--resource …] -- uv run python -m <module>`
 (installed from `deploy/host/kca-run`; image `ghcr.io/kthyeong/k-closing-alpha:latest`; `--user 1001:1001`; `--kis-data` adds
@@ -70,6 +70,7 @@ Containerized units run `ExecStart=%h/.local/lib/kca/kca-run <job> [--kis-data] 
 | 07:00–23:00 /10 min, daily | `kca-audit-reconcile` (host) | `flock -E 75 kca-audit.lock` | 9 min | ~1–2 s; heartbeat `reconciled_at` advances; busy lock exits 75 = success | P2 |
 | Mon–Fri 07:05 | `kca-kis-token-warmup` | kis-data, critical | 5 min | ~6 s; `stage=kis_token_warmup slot=<DATA_1..5,PRIMARY,TRADING_MOCK> issued=True`; `CLOSED` → `SKIP reason=non_trading_day` | P1 |
 | Mon–Fri 07:10 | `kca-kiwoom-token-rotate` | critical | 5 min | ~5 s; `status=ROTATED` or `UNCHANGED` | P1 |
+| daily 07:40 and 17:40 | `kca-api-notice-watch` | none (`uv run`, host) | default | silent unless a broker notice touches our API surface; timer `enabled active`, last run `Result=success` | P2 |
 | Mon–Fri 08:30 / 11:30 | `kca-price-ingest` | kis-data, standard | 45 min | 08:30 ~8 min, ingests `D-1` (~2,762 rows); 11:30 ~1 min, `n_new_rows=0` when 08:30 succeeded; 08:30 may log INFO `stale_panel_pending_retry` (healthy if 11:30 is OK); 11:30 DEGRADED `stale_panel` needs an alert | P1 |
 | Mon–Fri 08:39:55 | `kca-auction-open` (optional) | kis-data, critical, batch | 40 min | runs to ~09:03; `auction_capture status=COMPLETE phase=open` | P2 |
 | Mon–Fri 08:40:10 | `kca-order-exit` | critical | 18 min | ~20 s; outcome `OK`, or `SKIPPED no_open_positions`/`trading_disabled` | P0 |
@@ -135,7 +136,7 @@ print([(a.isoformat(), b.isoformat()) for a, b in DEPLOY_BLACKOUT_WINDOWS], blac
 | DEP-02 | `git status --porcelain` empty; `latest` image ID == `sha-<HEAD>` image ID | P1 |
 | DEP-03 | `WRAPPER_MATCH`; no `DRIFT`; no `NOT_IN_REPO` (the former `kca-kis-token-warmup.service.d` drop-in is gone since the warmup unit carries kis-data itself; 2026-10-20) | P1 |
 | DEP-04 | 22 wrapper units print `rc=0 user=1001:1001` with the flags of §3 (a `USAGE_ERROR` line = unit cannot start) | P1 |
-| SCH-01 | all 28 timers `enabled active`; `Linger=yes`; no `--failed` units | P1 |
+| SCH-01 | all 29 timers `enabled active`; `Linger=yes`; no `--failed` units | P1 |
 | SCH-02 | each timer's `LAST` equals its most recent slot (UTC→KST). Units started by `After=` ordering or by remediation do not move `LAST` | P1 |
 | SCH-03 | blackout windows print `[('08:30:00','09:40:00'), ('15:10:00','15:43:00')]` | P2 |
 
