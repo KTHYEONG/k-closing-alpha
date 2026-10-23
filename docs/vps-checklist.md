@@ -164,7 +164,7 @@ EOF
 |---|---|---|
 | RUN-01 | one `Finished` per due unit per day (paper-entry twice, price-ingest twice); `ExecMainStatus=0`. `show` describes only the latest run; use the journal window for `D` | P1 |
 | RUN-02 | runtime inside §3 "normal"; > 70 % of `TimeoutStartSec` is WARN except aftermarket-book (by design) | P2 |
-| RUN-03 | run outcomes for `D`: decision jobs `OK`; `DEGRADED`/`NO_DECISION` need a matching alert (§11); a trading-day `predict` `SKIPPED` is a calendar disagreement | P1 |
+| RUN-03 | run outcomes for `D`: decision jobs `OK`; `DEGRADED`/`NO_DECISION` need a matching alert (§11); a trading-day `predict` `SKIPPED` is a calendar disagreement; a `DEGRADED` `extended_backfill` now means an actionable failure (transient outage, non-deterministic reason, conflict) — deterministic gaps appear only as `deterministic_failed/exhausted` counts and in `intraday:extended_exhausted_reasons` | P1 |
 | RUN-04 | order units: journal `data/orders/<env>/journal.jsonl` holds the day's intents; current env from `[EXEC] stage=order_session env=…` (mock on 2026-10-16). A stuck `UNKNOWN` intent is operator-only (`src.daily.order_resolve`, dry-run first) | P0 |
 | RUN-05 | `CLOSED` day: weekday units log `SKIP reason=non_trading_day` and record `SKIPPED`; rows written on a closed day = calendar bug | P1 |
 | RUN-06 | `Traceback` in a job that exited 0, or `status=DEGRADED` without an outcome/heartbeat entry, is a silent failure | P2 |
@@ -250,6 +250,10 @@ L4 causality (`DI-ARCH-09`, `DI-TOPK-01`: snapshot ≤ feature_available ≤ inf
 - `등락률` is computed on the final close (`종가`), not `결정_종가`; their gap p99 ≲ 3 % is normal.
 - Tick vs bar gaps with a `tape_complete` proof are vendor differences (`tick_source_diff` outcome, info note); only `certified_gap`/`source_diff_systemic` warn.
 - Manual spot check: 2 top-k symbols + 1 random symbol agree across archive close, `price_history.close_raw`, last 1m bar, paper entry fill.
+
+| ID | Check | Severity if not |
+|---|---|---|
+| DI-1M-07 | Every journal `stage=intraday_replace status=SHRINK_ALLOWED` has a matching `backups/intraday/<session>/<date>/*-pre-*.parquet`; report `NOT VERIFIED` if the directory cannot be listed | P0 |
 
 ## 9. Paper Ledger and Orders
 
@@ -339,6 +343,7 @@ gh run list --workflow watchdog.yml --limit 5 -R kthyeong/k-closing-alpha
 - **Backup prune keeps old dates**: `raw/` and `manifests/2026-09-14` survived past 30 days (`sealed_kept=2`, reasons not logged at INFO).
 - **Dashboard schedule list is separate**: `/home/ubuntu/quant-dashboard/config.toml` carries its own `[[schedule]]` blocks. A removed timer slot (kca-price-ingest 21:30, dropped in `627cd1c`) left there raises a recurring `예정 실행이 지연` FAIL on the dashboard kca card; fix it in the dashboard config, not in kca.
 - **Daily audit `missing_bars` is judged on D only**: the dense-partition rule exempts symbols stored solely as `vendor=dbsec` trade-minute fallback bars (KIS TPS limit fallback). Extended backfill can rewrite a past date with `vendor=kis` trade-only symbols (10-16: 213), which a re-audit of that date would flag; not an issue for the current audit.
+- **`price_basis_raw_basis_unavailable` is a stable vendor gap**: 393 keys on 2026-10-22, growing by new corporate actions only.
 - **ops-sentinel `job_late` vs `After=`**: a unit held back by a running `After=` predecessor stays PENDING; a slow `archive-intraday` (32–39 min on 2026-10-16/19) used to raise a false `job_late:kca-tape-sweep`.
 - **Holidays**: weekday timers fire; jobs must `SKIP`; the daily audit digest is `HOLIDAY_SKIP`. Run data probes against the previous trading day.
 - **`journalctl` times are UTC**; `docker logs` is empty for `--rm` units; the journal is the record.

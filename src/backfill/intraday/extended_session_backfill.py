@@ -101,6 +101,13 @@ _DETERMINISTIC_FAILURE_REASONS: frozenset[str] = frozenset(
 )
 
 
+STRUCTURAL_FAILURE_REASONS: frozenset[str] = frozenset(
+    {
+        "price_basis_no_raw_source",
+    }
+)
+
+
 def _strip_terminal_markers(reason: str) -> str:
     stripped = str(reason)
     while stripped.startswith("exhausted:") or stripped.startswith("reopened:"):
@@ -136,6 +143,11 @@ def is_deterministic_failure(reason: str) -> bool:
     if stripped in _DETERMINISTIC_FAILURE_REASONS:
         return True
     return stripped.startswith(VENDOR_FAILURE_REJECTED_PREFIX)
+
+
+def is_structural_failure(reason: str) -> bool:
+    """True when a FAILED reason is decided locally and can never change by retrying."""
+    return _strip_terminal_markers(reason) in STRUCTURAL_FAILURE_REASONS
 
 
 def failure_reason_class(reason: str) -> str:
@@ -469,6 +481,14 @@ def _parse_attempted_instant(value: object) -> datetime | None:
     return parsed
 
 
+@dataclass(frozen=True)
+class RecordResult:
+    """Counts of keys turned EXHAUSTED by one ledger append, split by actionability."""
+
+    newly_exhausted: int
+    newly_exhausted_actionable: int
+
+
 class ExtendedBackfillLedger:
     """Durable per-symbol outcome log; the latest record per key wins."""
 
@@ -539,22 +559,8 @@ class ExtendedBackfillLedger:
         vendor: str = "kis",
         price_bases: Mapping[str, str] | None = None,
         is_transient: Callable[[str], bool] | None = None,
-    ) -> int:
-        """Append per-symbol outcomes under the ledger lock and return how many keys this call turned EXHAUSTED.
-
-        A key turns EXHAUSTED only after EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS non-transient FAILED outcomes;
-        a FAILED whose reason satisfies `is_transient` never consumes an attempt (None keeps every FAILED counting).
-
-        Args:
-            snapshot_date: Trading date of the session partition.
-            session: Session tag of the entries.
-            entries: Coverage outcomes to append.
-            run_id: Acquisition identity for these rows.
-            attempted_at: Aware attempt instant.
-            vendor: Data source of these entries for audit; it never changes terminal semantics.
-            price_bases: Raw-basis source per COMPLETE symbol ("kis_raw" or "kiwoom_raw"); others empty.
-            is_transient: Predicate over the raw FAILED reason; transient failures stay FAILED without consuming attempts.
-        """
+    ) -> RecordResult:
+        """Append outcomes under lock; exhaust structural failures immediately and split exhaustion totals by actionability."""
         bases = dict(price_bases) if price_bases is not None else {}
         pending = [
             (
@@ -576,7 +582,7 @@ class ExtendedBackfillLedger:
             if entry.symbol is not None
         ]
         if not pending:
-            return 0
+            return RecordResult(newly_exhausted=0, newly_exhausted_actionable=0)
         with exclusive_file_lock(
             sidecar_lock_path(self._path),
             timeout_seconds=DEFAULT_LOCK_TIMEOUT_SECONDS,
@@ -590,8 +596,16 @@ class ExtendedBackfillLedger:
                 prev = {}
             rows = []
             newly_exhausted = 0
+            newly_exhausted_actionable = 0
             for entry, row in pending:
                 if entry.status == CaptureStatus.FAILED:
+                    if is_structural_failure(str(entry.reason)):
+                        row["status"] = "EXHAUSTED"
+                        row["reason"] = f"exhausted:{row['reason']}"
+                        row["attempts"] = 1
+                        newly_exhausted += 1
+                        rows.append(row)
+                        continue
                     transient = bool(is_transient(str(entry.reason))) if is_transient is not None else False
                     before = prev.get(str(entry.symbol))
                     if transient:
@@ -602,6 +616,8 @@ class ExtendedBackfillLedger:
                             row["status"] = "EXHAUSTED"
                             row["reason"] = f"exhausted:{row['reason']}"
                             newly_exhausted += 1
+                            if not is_deterministic_failure(str(entry.reason)):
+                                newly_exhausted_actionable += 1
                         row["attempts"] = attempts
                 else:
                     row["attempts"] = 0
@@ -614,7 +630,10 @@ class ExtendedBackfillLedger:
             )
             combined = combined.drop_duplicates(subset=list(_LEDGER_KEYS), keep="last")
             atomic_write_parquet(combined[list(_LEDGER_COLUMNS)], self._path)
-            return newly_exhausted
+            return RecordResult(
+                newly_exhausted=newly_exhausted,
+                newly_exhausted_actionable=newly_exhausted_actionable,
+            )
 
     def record_cached_absent(
         self,
@@ -810,6 +829,8 @@ class ExtendedBackfillSummary:
     stopped_by_deadline: bool
     exhausted: int = 0
     pending_conflicts: int = 0
+    deterministic_failed: int = 0
+    deterministic_exhausted: int = 0
 
 
 def classify_extended_backfill_outcome(summary: ExtendedBackfillSummary) -> tuple[str, str]:
@@ -1012,7 +1033,9 @@ async def run_extended_session_backfill(
     no_trades = 0
     not_listed = 0
     failed = 0
+    deterministic_failed = 0
     exhausted = 0
+    deterministic_exhausted = 0
     pending_conflicts = 0
     stopped = False
     unreadable: list[str] = []
@@ -1217,7 +1240,7 @@ async def run_extended_session_backfill(
                 )
                 store.publish_manifest(manifest)
                 if entries:
-                    exhausted += ledger.record(
+                    result = ledger.record(
                         task.snapshot_date,
                         task.session,
                         entries,
@@ -1226,18 +1249,26 @@ async def run_extended_session_backfill(
                         price_bases=price_bases,
                         is_transient=is_transient_failure,
                     )
+                    exhausted += int(result.newly_exhausted_actionable)
+                    deterministic_exhausted += int(result.newly_exhausted - result.newly_exhausted_actionable)
             task_complete = sum(1 for entry in entries if entry.status == CaptureStatus.COMPLETE)
             task_no_trades = sum(1 for entry in entries if entry.status == CaptureStatus.NO_TRADES)
             task_not_listed = sum(1 for entry in entries if entry.status == CaptureStatus.NOT_APPLICABLE)
-            task_failed = len(entries) - task_complete - task_no_trades - task_not_listed
+            task_deterministic_failed = sum(
+                1
+                for entry in entries
+                if entry.status == CaptureStatus.FAILED and is_deterministic_failure(str(entry.reason))
+            )
+            task_failed = len(entries) - task_complete - task_no_trades - task_not_listed - task_deterministic_failed
             complete += task_complete
             no_trades += task_no_trades
             not_listed += task_not_listed
             failed += task_failed
+            deterministic_failed += task_deterministic_failed
             done += 1
             elapsed = (clock() - started).total_seconds()
             logger.info(
-                "[DATA] stage=extended_backfill date=%s session=%s pending=%d complete=%d no_trades=%d not_listed=%d failed=%d repaired=%d adjusted=%d basis_failed=%d pending_conflict=%d elapsed_s=%.1f",
+                "[DATA] stage=extended_backfill date=%s session=%s pending=%d complete=%d no_trades=%d not_listed=%d failed=%d deterministic_failed=%d repaired=%d adjusted=%d basis_failed=%d pending_conflict=%d elapsed_s=%.1f",
                 task.snapshot_date,
                 task.session,
                 len(pending),
@@ -1245,6 +1276,7 @@ async def run_extended_session_backfill(
                 task_no_trades,
                 task_not_listed,
                 task_failed,
+                task_deterministic_failed,
                 repaired,
                 adjusted,
                 basis_failed,
@@ -1263,6 +1295,8 @@ async def run_extended_session_backfill(
         stopped_by_deadline=stopped,
         exhausted=exhausted,
         pending_conflicts=pending_conflicts,
+        deterministic_failed=deterministic_failed,
+        deterministic_exhausted=deterministic_exhausted,
     )
 
 
@@ -1462,7 +1496,7 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
 
     kis_summary = asyncio.run(_run())
     logger.info(
-        "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d exhausted=%d pending_conflicts=%d stopped_by_deadline=%s",
+        "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d exhausted=%d deterministic_failed=%d deterministic_exhausted=%d pending_conflicts=%d stopped_by_deadline=%s",
         kis_summary.tasks_done,
         kis_summary.tasks_remaining,
         kis_summary.complete,
@@ -1470,6 +1504,8 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
         kis_summary.not_listed,
         kis_summary.failed,
         kis_summary.exhausted,
+        kis_summary.deterministic_failed,
+        kis_summary.deterministic_exhausted,
         kis_summary.pending_conflicts,
         kis_summary.stopped_by_deadline,
     )

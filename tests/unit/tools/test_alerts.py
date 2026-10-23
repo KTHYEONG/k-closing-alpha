@@ -1063,3 +1063,47 @@ def test_failure_ledger_tolerates_non_mapping_and_unwritable_ledger(tmp_path, ca
     blocked.mkdir()
     alerts.record_failure_alert("u.service", "2026-10-20", path=blocked)
     assert "status=LEDGER_FAILED unit=u.service" in caplog.text
+
+
+def test_digest_receipt_masks_before_truncation_and_omits_body(monkeypatch, caplog) -> None:
+    import logging
+
+    from src.tools import alerts
+
+    secret = "receipt-secret-" + "z" * 100
+    monkeypatch.setattr(alerts.settings, "KIS_APP_SECRET", secret, raising=False)
+    delivered = []
+
+    def deliver(subject, body):
+        delivered.append((subject, body))
+        return {"webhook": True, "email": False}
+
+    monkeypatch.setattr(alerts, "_deliver_now", deliver)
+    subject = "[kca] " + secret + "x" * 100
+    with caplog.at_level(logging.INFO, logger=alerts.logger.name):
+        result = alerts.dispatch_digest(subject, "private-body-content")
+    assert result == {"webhook": True, "email": False}
+    receipts = [rec.message for rec in caplog.records if "status=SENT" in rec.message]
+    assert receipts == [
+        "[SYS] stage=alert_delivery status=SENT webhook=True email=False subject_key=" + delivered[0][0][:80]
+    ]
+    assert "***" in receipts[0]
+    assert secret not in caplog.text and "z" * 8 not in caplog.text
+    assert "private-body-content" not in caplog.text
+    assert not list(alerts.alert_outbox_dir().glob("*.json"))
+
+
+def test_digest_undelivered_receipt_keeps_outbox_path(monkeypatch, caplog) -> None:
+    import json
+    import logging
+
+    from src.tools import alerts
+
+    monkeypatch.setattr(alerts, "_deliver_now", lambda *args: {"webhook": False, "email": False})
+    with caplog.at_level(logging.INFO, logger=alerts.logger.name):
+        assert alerts.dispatch_digest("receipt-title", "receipt-body") == {"webhook": False, "email": False}
+    files = list(alerts.alert_outbox_dir().glob("*.json"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["kind"] == "digest"
+    assert any(rec.levelno == logging.ERROR and "status=UNDELIVERED" in rec.message for rec in caplog.records)
+    assert not any("status=SENT" in rec.message for rec in caplog.records)

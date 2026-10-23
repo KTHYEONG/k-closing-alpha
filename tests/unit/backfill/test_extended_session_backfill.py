@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -578,7 +579,8 @@ def test_adjusted_day_without_kiwoom_bars_fails_closed(env) -> None:
     summary = _run(profile, store, ledger, [_FakeKis(day, traded={"067310"})],
                    [ExtendedBackfillTask(day, "nxt_aftermarket", ("067310",))],
                    _adj_ref(day, "067310"), raw_client=_FakeKiwoom(day, raw={}))
-    assert summary.failed == 1 and summary.complete == 0
+    assert summary.failed == 0 and summary.deterministic_failed == 1 and summary.complete == 0
+    assert summary.deterministic_exhausted == 0
     assert not intraday_partition_path(1, day, "nxt_aftermarket").exists()
     row = _ledger_row(ledger, "067310")
     assert row["reason"] == "price_basis_raw_basis_unavailable"
@@ -600,13 +602,18 @@ def test_adjusted_day_without_raw_source_fails_closed(env) -> None:
     summary = _run(profile, store, ledger, [_FakeKis(krx_day, traded={"000001"})],
                    [ExtendedBackfillTask(krx_day, "krx_aftermarket", ("000001",))],
                    _adj_ref(krx_day, "000001", 5300.0, 1060.0), raw_client=_FakeKiwoom(krx_day, raw={"000001": "1060"}))
-    assert summary.failed == 1
-    assert _ledger_row(ledger, "000001")["reason"] == "price_basis_no_raw_source"
+    assert summary.failed == 0 and summary.deterministic_failed == 1
+    assert summary.deterministic_exhausted == 1 and summary.exhausted == 0
+    row = _ledger_row(ledger, "000001")
+    assert row["status"] == "EXHAUSTED" and int(row["attempts"]) == 1
+    assert row["reason"] == "exhausted:price_basis_no_raw_source"
+    assert "000001" in ledger.terminal_symbols(krx_day, "krx_aftermarket")
     nxt_day = "2026-03-02"
     _run(profile, store, ledger, [_FakeKis(nxt_day, traded={"000002"})],
          [ExtendedBackfillTask(nxt_day, "nxt_aftermarket", ("000002",))],
          _adj_ref(nxt_day, "000002", 5300.0, 1060.0), raw_client=None)
-    assert _ledger_row(ledger, "000002")["reason"] == "price_basis_no_raw_source"
+    row2 = _ledger_row(ledger, "000002")
+    assert row2["status"] == "EXHAUSTED" and row2["reason"] == "exhausted:price_basis_no_raw_source"
 
 
 def test_unknown_panel_day_fails_closed(env) -> None:
@@ -615,7 +622,7 @@ def test_unknown_panel_day_fails_closed(env) -> None:
     kiwoom = _FakeKiwoom(day, raw={"000001": "1000"})
     summary = _run(profile, store, ledger, [_FakeKis(day, traded={"000001"})],
                    [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))], _ref([]), raw_client=kiwoom)
-    assert summary.failed == 1 and kiwoom.calls == []
+    assert summary.failed == 0 and summary.deterministic_failed == 1 and kiwoom.calls == []
     assert _ledger_row(ledger, "000001")["reason"] == "price_basis_unknown"
 
 
@@ -836,7 +843,10 @@ def test_exhausted_keys_are_not_refetched_and_counted(env) -> None:
              _adj_ref(day, "067310"), raw_client=_FakeKiwoom(day, raw={}))
         for _ in range(EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS)
     ]
-    assert [s.exhausted for s in summaries] == [0] * (EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS - 1) + [1]
+    assert [s.exhausted for s in summaries] == [0] * EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
+    assert [s.failed for s in summaries] == [0] * EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
+    assert [s.deterministic_exhausted for s in summaries] == [0] * (EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS - 1) + [1]
+    assert [s.deterministic_failed for s in summaries] == [1] * EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
     assert "067310" in ledger.terminal_symbols(day, "nxt_aftermarket")
     kis = _FakeKis(day, traded={"067310"})
     after = _run(profile, store, ledger, [kis], tasks, _adj_ref(day, "067310"), raw_client=_FakeKiwoom(day, raw={}))
@@ -1293,3 +1303,140 @@ def test_runner_without_conflict_reports_zero(env) -> None:
                    [ExtendedBackfillTask(day, "nxt_aftermarket", symbols)],
                    _raw_ref(day, set(symbols)))
     assert summary.pending_conflicts == 0
+
+
+def test_structural_failure_terminates_on_first_attempt(tmp_path) -> None:
+    from src.backfill.intraday.extended_session_backfill import (
+        RecordResult,
+        STRUCTURAL_FAILURE_REASONS,
+        _DETERMINISTIC_FAILURE_REASONS,
+        is_structural_failure,
+    )
+
+    assert STRUCTURAL_FAILURE_REASONS < _DETERMINISTIC_FAILURE_REASONS
+    assert is_structural_failure("price_basis_no_raw_source") is True
+    assert is_structural_failure("exhausted:price_basis_no_raw_source") is True
+    assert is_structural_failure("price_basis_raw_basis_unavailable") is False
+    ledger = ExtendedBackfillLedger(tmp_path / "ledger.parquet")
+    result = ledger.record(
+        "2026-03-02", "nxt_aftermarket", [_entry("000001", CaptureStatus.FAILED)],
+        run_id="r", attempted_at=datetime.now(SEOUL),
+    )
+    assert isinstance(result, RecordResult)
+    assert result == RecordResult(newly_exhausted=0, newly_exhausted_actionable=0)
+    ledger2 = ExtendedBackfillLedger(tmp_path / "ledger2.parquet")
+    structural = _entry("000001", CaptureStatus.FAILED).model_copy(
+        update={"reason": "price_basis_no_raw_source"}
+    )
+    first = ledger2.record(
+        "2026-03-02", "nxt_aftermarket", [structural],
+        run_id="r", attempted_at=datetime.now(SEOUL),
+    )
+    assert first == RecordResult(newly_exhausted=1, newly_exhausted_actionable=0)
+    row = _ledger_row(ledger2, "000001")
+    assert row["status"] == "EXHAUSTED" and row["reason"] == "exhausted:price_basis_no_raw_source"
+    assert int(row["attempts"]) == 1
+    assert "000001" in ledger2.terminal_symbols("2026-03-02", "nxt_aftermarket")
+
+
+def test_deterministic_only_night_is_ok_and_actionable_degrades() -> None:
+    assert classify_extended_backfill_outcome(_summary(
+        failed=0, exhausted=0, deterministic_failed=2, deterministic_exhausted=1)) == ("OK", "")
+    assert classify_extended_backfill_outcome(_summary(failed=1)) == ("DEGRADED", "failed")
+    assert classify_extended_backfill_outcome(_summary(exhausted=1)) == ("DEGRADED", "exhausted")
+    assert classify_extended_backfill_outcome(_summary(pending_conflicts=1)) == (
+        "DEGRADED", "pending_manifest_conflict")
+
+
+def test_structural_and_transient_split_in_runner(env, caplog) -> None:
+    import logging
+
+    profile, store, ledger = env
+    day = "2026-09-20"
+    krx_task = ExtendedBackfillTask(day, "krx_aftermarket", ("000001", "000002"))
+    kis = _FakeKis(day, traded={"000001", "000002"}, fail={"000002"})
+    ref = _ref([(day, "000001", 5300.0, 1060.0), (day, "000002", 1000.0, 1000.0)])
+    with caplog.at_level(logging.INFO):
+        summary = _run(profile, store, ledger, [kis], [krx_task], ref, raw_client=None)
+    assert summary.failed == 1
+    assert summary.deterministic_failed == 1
+    assert summary.deterministic_exhausted == 1
+    assert summary.exhausted == 0
+    metrics = asdict(summary)
+    assert metrics["deterministic_failed"] == 1 and metrics["deterministic_exhausted"] == 1
+    assert "deterministic_failed=1" in caplog.text
+    retry = _FakeKis(day, traded={"000001", "000002"}, fail={"000002"})
+    _run(profile, store, ledger, [retry], [krx_task], ref)
+    assert retry.requested == ["000002"]
+
+
+@pytest.mark.parametrize("prior_attempts", [0, 1, 2])
+@pytest.mark.parametrize("marker", ["", "reopened:exhausted:"])
+def test_structural_failure_resets_prior_attempts(env, prior_attempts, marker) -> None:
+    _, _, ledger = env
+    day = "2026-03-02"
+    for _ in range(prior_attempts):
+        _record(ledger, "000001", CaptureStatus.FAILED)
+    entry = _entry("000001", CaptureStatus.FAILED).model_copy(
+        update={"reason": f"{marker}price_basis_no_raw_source"}
+    )
+    result = ledger.record(day, "nxt_aftermarket", [entry], run_id="r", attempted_at=datetime.now(SEOUL))
+    assert (result.newly_exhausted, result.newly_exhausted_actionable) == (1, 0)
+    assert _ledger_row(ledger, "000001")["attempts"] == 1
+
+
+@pytest.mark.parametrize(("reason", "actionable"), [
+    ("price_basis_raw_basis_unavailable", 0), ("price_basis_unknown", 0), ("normalize:ValueError", 1),
+])
+def test_nonstructural_failure_ladder_returns_actionability(env, reason, actionable) -> None:
+    _, _, ledger = env
+    entry = _entry("000001", CaptureStatus.FAILED).model_copy(update={"reason": reason})
+    for attempt in range(1, 4):
+        result = ledger.record("2026-03-02", "nxt_aftermarket", [entry], run_id="r", attempted_at=datetime.now(SEOUL))
+        exhausted = int(attempt == 3)
+        assert (result.newly_exhausted, result.newly_exhausted_actionable) == (exhausted, exhausted * actionable)
+        row = _ledger_row(ledger, "000001")
+        assert row["attempts"] == attempt
+        assert row["status"] == ("EXHAUSTED" if exhausted else "FAILED")
+
+
+@pytest.mark.parametrize("actionable", [False, True])
+def test_main_logs_split_and_records_outcome_without_deterministic_alerts(monkeypatch, tmp_path, caplog, actionable) -> None:
+    import json
+    import logging
+    import sys
+
+    from src.api.kis import key_pool
+    from src.backfill.intraday import extended_session_backfill as mod
+    from src.tools import run_outcome
+
+    summary = _summary(failed=int(actionable), deterministic_failed=1, deterministic_exhausted=1)
+    monkeypatch.setattr(sys, "argv", ["extended-backfill", "--as-of", "2026-10-23"])
+    monkeypatch.setattr(key_pool, "resolve_research_credentials", lambda *a, **kw: [object()])
+    monkeypatch.setattr(mod, "CollectionSettings", lambda: CollectionSettings(COLLECTION_BACKFILL_SLOTS=("2",)))
+
+    def finish(coro):
+        coro.close()
+        return summary
+
+    monkeypatch.setattr(mod.asyncio, "run", finish)
+    monkeypatch.setattr(run_outcome.settings, "DATA_DIR", tmp_path)
+    sent = []
+    monkeypatch.setattr(run_outcome, "dispatch_digest", lambda *args: sent.append(args))
+    with caplog.at_level(logging.INFO):
+        mod.main()
+    done = [rec.message for rec in caplog.records if "stage=extended_backfill status=DONE" in rec.message]
+    assert len(done) == 1
+    assert f"failed={int(actionable)} exhausted=0 deterministic_failed=1 deterministic_exhausted=1" in done[0]
+    assert "price_basis" not in done[0]
+    event = json.loads(run_outcome.run_events_path("2026-10-23").read_text())
+    assert event["metrics"] == asdict(summary)
+    assert event["outcome"] == ("DEGRADED" if actionable else "OK")
+    assert event["reason"] == ("failed" if actionable else "")
+    assert len(sent) == int(actionable)
+
+
+def test_summary_construction_defaults_remain_compatible() -> None:
+    summary = ExtendedBackfillSummary(1, 0, 1, 0, 0, 0, False)
+    assert (summary.deterministic_failed, summary.deterministic_exhausted) == (0, 0)
+    assert classify_extended_backfill_outcome(summary) == ("OK", "")
