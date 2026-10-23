@@ -301,6 +301,14 @@ def dispatch_digest(subject: str, body: str) -> dict[str, bool]:
     subject = redact_secrets(subject, secrets)
     body = redact_secrets(body, secrets)
     results = _deliver_now(subject, body)
+    if any(results.values()):
+        subject_key = subject[:80]
+        logger.info(
+            "[SYS] stage=alert_delivery status=SENT webhook=%s email=%s subject_key=%s",
+            results.get("webhook"),
+            results.get("email"),
+            subject_key,
+        )
     if not any(results.values()):
         _persist_undelivered(subject, body, kind="digest")
     return results

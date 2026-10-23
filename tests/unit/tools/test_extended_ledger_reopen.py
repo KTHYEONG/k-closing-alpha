@@ -171,7 +171,8 @@ def test_reopened_key_retried_then_reexhausts(tmp_path) -> None:
         "2026-09-10", SESSION, [_entry("005930", CaptureStatus.FAILED, "price_basis_raw_basis_unavailable")],
         run_id="r2", attempted_at=now, is_transient=None,
     )
-    assert turned == 1
+    assert turned.newly_exhausted == 1
+    assert turned.newly_exhausted_actionable == 0
     latest = pd.read_parquet(path).drop_duplicates(subset=["snapshot_date", "session", "symbol"], keep="last").iloc[0]
     assert latest["status"] == "EXHAUSTED" and int(latest["attempts"]) == EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS
 

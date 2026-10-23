@@ -97,7 +97,8 @@ def test_record_transient_never_exhausts(tmp_path) -> None:
             "2026-03-02", "nxt_aftermarket", [_failed("000001", "transport:X")],
             run_id="r", attempted_at=now, is_transient=is_transient_failure,
         )
-        assert returned == 0
+        assert returned.newly_exhausted == 0
+        assert returned.newly_exhausted_actionable == 0
     frame = ledger._read_all()
     latest = frame.iloc[-1]
     assert latest["status"] == "FAILED" and int(latest["attempts"]) == 0
@@ -106,24 +107,24 @@ def test_record_transient_never_exhausts(tmp_path) -> None:
 def test_record_mixed_counts_and_returns(tmp_path) -> None:
     ledger = ExtendedBackfillLedger(tmp_path / "ledger.parquet")
     now = datetime.now(SEOUL)
-    assert ledger.record("2026-03-02", "s", [], run_id="r", attempted_at=now) == 0
+    assert ledger.record("2026-03-02", "s", [], run_id="r", attempted_at=now).newly_exhausted == 0
     for _ in range(2):
         assert ledger.record(
             "2026-03-02", "s", [_failed("000001", "transport:X")],
             run_id="r", attempted_at=now, is_transient=is_transient_failure,
-        ) == 0
+        ).newly_exhausted == 0
     assert ledger.record(
         "2026-03-02", "s", [_failed("000001", "raw_basis_unavailable")],
         run_id="r", attempted_at=now, is_transient=is_transient_failure,
-    ) == 0
+    ).newly_exhausted == 0
     assert ledger.record(
         "2026-03-02", "s", [_failed("000001", "raw_basis_unavailable")],
         run_id="r", attempted_at=now, is_transient=is_transient_failure,
-    ) == 0
+    ).newly_exhausted == 0
     assert ledger.record(
         "2026-03-02", "s", [_failed("000001", "raw_basis_unavailable")],
         run_id="r", attempted_at=now, is_transient=is_transient_failure,
-    ) == 1
+    ).newly_exhausted == 1
     frame = ledger._read_all()
     assert frame.iloc[-1]["status"] == "EXHAUSTED"
     assert list(frame.columns) == list(_LEDGER_COLUMNS)
@@ -142,7 +143,8 @@ def test_interleaved_failures_exhaust_only_on_third_counting_outcome(tmp_path, s
         )
         row = ledger._read_all().iloc[0]
         assert row["attempts"] == counted
-        assert result == int(counted == 3)
+        assert result.newly_exhausted == int(counted == 3)
+        assert result.newly_exhausted_actionable == 0
         assert row["status"] == ("EXHAUSTED" if counted == 3 else "FAILED")
         assert bool(ledger.terminal_symbols("2026-03-02", "nxt_aftermarket")) == (counted == 3)
         if counted == 3:
@@ -166,7 +168,7 @@ def test_failure_after_nonfailed_status_restarts_attempts(tmp_path, previous, re
     assert ledger.record(
         "2026-03-02", "s", [_failed("000001", reason)], run_id="r",
         attempted_at=datetime.now(SEOUL), is_transient=is_transient_failure,
-    ) == 0
+    ).newly_exhausted == 0
     row = ledger._read_all().iloc[0]
     assert row["status"] == "FAILED" and row["attempts"] == expected
 
@@ -204,13 +206,13 @@ def test_legacy_attempts_and_predicate_failure_preserve_ledger(tmp_path) -> None
 def test_default_predicate_counts_transport_and_empty_records_do_not_write(tmp_path) -> None:
     ledger = ExtendedBackfillLedger(tmp_path / "ledger.parquet")
     for entries in ([], [_failed("000001", "x").model_copy(update={"symbol": None})]):
-        assert ledger.record("2026-03-02", "s", entries, run_id="r", attempted_at=datetime.now(SEOUL)) == 0
+        assert ledger.record("2026-03-02", "s", entries, run_id="r", attempted_at=datetime.now(SEOUL)).newly_exhausted == 0
         assert not ledger.path.exists()
     for expected in (0, 0, 1):
         assert ledger.record(
             "2026-03-02", "s", [_failed("000001", "transport:X")],
             run_id="r", attempted_at=datetime.now(SEOUL),
-        ) == expected
+        ).newly_exhausted == expected
     assert ledger._read_all().iloc[0]["attempts"] == 3
 
 
