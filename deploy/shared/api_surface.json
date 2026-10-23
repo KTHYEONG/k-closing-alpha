@@ -412,7 +412,7 @@
    }
   },
   "krx": {
-   "/api/v1/market-calendar/kr": {
+   "/api/v1/market-calendar/KR": {
     "brokers": [
      "toss"
     ],

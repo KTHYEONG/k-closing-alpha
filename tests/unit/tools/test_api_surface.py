@@ -54,6 +54,15 @@ def test_extra_tokens_are_attributed_and_must_exist_in_sources(tmp_path: Path) -
         sf.scan_project(stale, tmp_path)
 
 
+def test_scan_preserves_path_case_across_manifest_round_trip(tmp_path: Path) -> None:
+    _write(tmp_path, "proj/src/api/toss/client.py", 'URL = "/api/v1/market-calendar/KR"\n')
+    spec = sf.ProjectSpec("proj", "proj", ("src/api",))
+    surface = sf.build_surface(tmp_path, [spec], now=NOW)
+    target = tmp_path / "manifest.json"
+    target.write_text(json.dumps(sf.surface_to_json(surface)), encoding="utf-8")
+    assert sf.load_surface(target).attributed("toss") == {"/api/v1/market-calendar/KR"}
+
+
 def test_missing_root_or_scan_path_fails_loudly(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="scan path missing"):
         sf.scan_project(SPEC, tmp_path)
