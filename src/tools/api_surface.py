@@ -82,7 +82,7 @@ class TokenEntry:
 
 @dataclass(frozen=True)
 class Surface:
-    """Loaded manifest: project -> lower-cased token -> where it is used."""
+    """Loaded manifest: project -> token -> usage; Toss paths retain their case."""
 
     generated_at: str
     projects: Mapping[str, Mapping[str, TokenEntry]]
@@ -142,7 +142,10 @@ def scan_project(spec: ProjectSpec, base: Path) -> dict[str, TokenEntry]:
             hits: list[tuple[str, str | None]] = [
                 (m.lower(), broker) for broker, pats in _TR_PATTERNS.items() for p in pats for m in p.findall(text)
             ]
-            hits += [(m.lower(), None) for m in _PATH_PATTERN.findall(text) if m.count("/") >= 2]
+            hits += [
+                (m if BROKER_TOSS in hint else m.lower(), None)
+                for m in _PATH_PATTERN.findall(text) if m.count("/") >= 2
+            ]
             for token, tr_broker in hits:
                 brokers, where = found.setdefault(token, (set(), set()))
                 brokers.update(_classify(token, tr_broker, hint))

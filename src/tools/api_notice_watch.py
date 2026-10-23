@@ -297,7 +297,7 @@ def build_sources(cfg: NoticeWatchConfig = DEFAULT_CONFIG) -> tuple[NoticeSource
 
 def _token_in_text(token: str, text_lower: str) -> bool:
     if token.startswith("/"):
-        return token in text_lower
+        return token.lower() in text_lower
     return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?!\d)", text_lower) is not None
 
 
@@ -377,18 +377,24 @@ def snapshot_toss_spec(openapi: Mapping[str, Any], asyncapi: Mapping[str, Any], 
     """Hash the whole specs plus each used endpoint with its referenced schemas inlined."""
     components = openapi.get("components", {})
     wanted = {_canonical_path(p) for p in used_paths}
-    used_sha = {
-        path: _sha(_resolve_refs(item, components))
-        for path, item in openapi.get("paths", {}).items()
-        if _canonical_path(path) in wanted
-    }
+    wanted_lower = {c.lower() for c in wanted}
+    used_sha = {}
+    for path, item in openapi.get("paths", {}).items():
+        canonical = _canonical_path(path)
+        if canonical in wanted or canonical.lower() in wanted_lower:
+            used_sha[path] = _sha(_resolve_refs(item, components))
     return TossSpecSnapshot(_sha(openapi), _sha(asyncapi), used_sha)
 
 
 def diff_toss_spec(prior: TossSpecSnapshot, now: TossSpecSnapshot, used_paths: frozenset[str]) -> tuple[list[str], list[str]]:
     """Return (actionable, informational) change lines for the Toss specs."""
     actionable: list[str] = []
+    wanted = {_canonical_path(p) for p in used_paths}
+    present = {_canonical_path(p) for p in now.used_path_sha}
+    case_only = {p.lower() for p in wanted - present} & {p.lower() for p in present}
     for path in sorted(set(prior.used_path_sha) | set(now.used_path_sha)):
+        if _canonical_path(path).lower() in case_only:
+            continue
         before, after = prior.used_path_sha.get(path), now.used_path_sha.get(path)
         if before is not None and after is None:
             actionable.append(f"사용 중인 엔드포인트 삭제: {path}")
@@ -396,11 +402,18 @@ def diff_toss_spec(prior: TossSpecSnapshot, now: TossSpecSnapshot, used_paths: f
             actionable.append(f"엔드포인트 신규 매칭: {path}")
         elif before != after:
             actionable.append(f"사용 중인 엔드포인트 명세 변경: {path}")
-    present = {_canonical_path(p) for p in now.used_path_sha}
-    actionable.extend(
-        f"사용 중인 경로가 명세에 없음: {p}" for p in sorted(used_paths) if _canonical_path(p) not in present
-    )
+    spec_by_canonical = {_canonical_path(p): p for p in now.used_path_sha}
+    spec_by_lower = {_canonical_path(p).lower(): p for p in now.used_path_sha}
     info: list[str] = []
+    for p in sorted(used_paths):
+        canonical = _canonical_path(p)
+        if canonical in spec_by_canonical:
+            continue
+        match = spec_by_lower.get(canonical.lower())
+        if match is not None:
+            info.append(f"경로 대소문자 불일치: {p} vs {match}")
+        else:
+            actionable.append(f"사용 중인 경로가 명세에 없음: {p}")
     if prior.openapi_sha != now.openapi_sha and not actionable:
         info.append("openapi.json 변경(사용 엔드포인트 외)")
     if prior.asyncapi_sha != now.asyncapi_sha:
