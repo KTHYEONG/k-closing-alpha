@@ -17,23 +17,32 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src import settings
+from src.config.base import INTRADAY_KIS_ADJUSTED_1M_DIR_NAME
 from src.config.market_session import INTRADAY_SESSION_REGULAR_CONSOLIDATED, INTRADAY_VERIFIED_SESSIONS
 from src.data.capture_contracts import CaptureStatus, CoverageEntry
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, assert_canonical_bars, assert_canonical_ticks
+from src.data.io_utils import atomic_write_parquet, read_existing_parquet
 from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "KIS_ADJUSTED_BAR_COLUMNS",
+    "PRICE_BASIS_KIS_ADJUSTED",
     "NonPositivePriceError",
     "intraday_partition_path",
+    "kis_adjusted_partition_path",
     "log_session_coverage_outliers",
     "remove_intraday_symbols",
     "tick_partition_path",
     "write_intraday_partition",
+    "write_kis_adjusted_partition",
     "write_tick_partition",
 ]
+
+PRICE_BASIS_KIS_ADJUSTED: str = "kis_adjusted"
+KIS_ADJUSTED_BAR_COLUMNS: tuple[str, ...] = (*CANONICAL_BAR_COLUMNS, "session", "price_basis")
 
 _LOCK_TIMEOUT_SECONDS = DEFAULT_LOCK_TIMEOUT_SECONDS
 
@@ -750,3 +759,55 @@ def tick_partition_path(snapshot_date: str, session: str = "regular") -> Path:
         / f"{snapshot_date}.parquet"
     )
 
+
+
+def kis_adjusted_partition_path(snapshot_date: str, session: str) -> Path:
+    """data/history/intraday/1m_kis_adjusted/{session}/{YYYY-MM}/{YYYY-MM-DD}.parquet (never a raw-basis partition)."""
+    _require_known_session(session)
+    month = str(snapshot_date)[:7]
+    return (
+        Path(settings.HISTORY_DIR)
+        / "intraday"
+        / INTRADAY_KIS_ADJUSTED_1M_DIR_NAME
+        / str(session)
+        / month
+        / f"{snapshot_date}.parquet"
+    )
+
+
+def write_kis_adjusted_partition(frames: Mapping[str, pd.DataFrame], snapshot_date: str, session: str) -> int:
+    """Replace each given symbol's KIS adjusted 1m bars in one partition atomically (idempotent per symbol-day).
+
+    Rows carry KIS_ADJUSTED_BAR_COLUMNS with price_basis=kis_adjusted; other symbols' rows are kept unchanged.
+
+    Returns:
+        Rows written for the given symbols (0 and no file touched when frames is empty).
+
+    Raises:
+        ValueError: Non-canonical or invalid bars, wrong date, or a frame holding another symbol's rows.
+        OSError: The existing partition is unreadable or publication fails.
+    """
+    if not frames:
+        return 0
+    parts: list[pd.DataFrame] = []
+    for symbol, frame in frames.items():
+        if frame is None or len(frame) == 0:
+            raise ValueError(f"Empty adjusted frame for {symbol!r}")
+        if bool((frame["symbol"].astype(str) != str(symbol)).any()):
+            raise ValueError(f"Adjusted frame for {symbol!r} carries another symbol's rows")
+        parts.append(frame[list(CANONICAL_BAR_COLUMNS)])
+    incoming = pd.concat(parts, ignore_index=True)
+    _validate_bar_frame(incoming, str(snapshot_date), str(session), None)
+    incoming = _deduplicate_bars(incoming)
+    incoming["session"] = str(session)
+    incoming["price_basis"] = PRICE_BASIS_KIS_ADJUSTED
+    replaced = {str(symbol) for symbol in frames}
+    target = kis_adjusted_partition_path(str(snapshot_date), str(session))
+    with exclusive_file_lock(sidecar_lock_path(target), timeout_seconds=_LOCK_TIMEOUT_SECONDS, purpose="partition"):
+        existing = read_existing_parquet(target)
+        if not existing.empty:
+            existing = existing[~existing["symbol"].astype(str).isin(replaced)]
+        combined = pd.concat([existing, incoming], ignore_index=True) if not existing.empty else incoming
+        combined = combined.sort_values(["symbol", "ts_hms"], kind="stable").reset_index(drop=True)
+        atomic_write_parquet(combined[list(KIS_ADJUSTED_BAR_COLUMNS)], target)
+    return len(incoming)

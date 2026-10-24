@@ -17,7 +17,7 @@ import logging
 import os
 import shutil
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
@@ -59,7 +59,12 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
-from src.data.intraday_store import intraday_partition_path, remove_intraday_symbols, write_intraday_partition
+from src.data.intraday_store import (
+    intraday_partition_path,
+    remove_intraday_symbols,
+    write_intraday_partition,
+    write_kis_adjusted_partition,
+)
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.data.io_utils import atomic_write_parquet, read_existing_parquet
 from src.utils.cli_logging import configure_cli_logging
@@ -82,12 +87,14 @@ _LEDGER_COLUMNS: tuple[str, ...] = (
     "vendor",
     "price_basis",
     "attempts",
+    "adjusted_copy",
 )
 _LEDGER_KEYS: tuple[str, ...] = ("snapshot_date", "session", "symbol")
 EXTENDED_BACKFILL_MAX_FAILED_ATTEMPTS: int = 3
 _TERMINAL_LEDGER_STATES: frozenset[str] = frozenset({"COMPLETE", "NO_TRADES", "NOT_APPLICABLE", "EXHAUSTED"})
 # 원주가 소스(Kiwoom ka10080 _NX)가 있는 세션. KRX 애프터는 Kiwoom 과거 원주가 경로가 없어 fail-closed.
 _RAW_SOURCE_SESSIONS: frozenset[str] = frozenset({INTRADAY_SESSION_NXT_AFTERMARKET, INTRADAY_SESSION_NXT_PREMARKET})
+_RAW_BASIS_UNAVAILABLE: str = "raw_basis_unavailable"
 
 _DETERMINISTIC_FAILURE_REASONS: frozenset[str] = frozenset(
     {
@@ -404,7 +411,7 @@ def enumerate_regular_session_tasks(
 
 
 def _with_legacy_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    """Fill columns added after the first ledger files were written (vendor, price_basis, attempts)."""
+    """Fill columns added after the first ledger files were written (vendor, price_basis, attempts, adjusted_copy)."""
     out = frame
     if "vendor" not in out.columns:
         out = out.copy()
@@ -418,6 +425,9 @@ def _with_legacy_columns(frame: pd.DataFrame) -> pd.DataFrame:
             out["attempts"] = np.where(out["status"].astype(str) == "FAILED", 1, 0)
         else:
             out["attempts"] = 0
+    if "adjusted_copy" not in out.columns:
+        out = out.copy()
+        out["adjusted_copy"] = False
     return out
 
 
@@ -559,9 +569,14 @@ class ExtendedBackfillLedger:
         vendor: str = "kis",
         price_bases: Mapping[str, str] | None = None,
         is_transient: Callable[[str], bool] | None = None,
+        adjusted_copies: Collection[str] = frozenset(),
     ) -> RecordResult:
-        """Append outcomes under lock; exhaust structural failures immediately and split exhaustion totals by actionability."""
+        """Append outcomes under lock; exhaust structural failures immediately and split exhaustion totals by actionability.
+
+        ``adjusted_copies`` names symbols whose KIS adjusted bars were persisted to the separate adjusted store.
+        """
         bases = dict(price_bases) if price_bases is not None else {}
+        kept = frozenset(str(symbol) for symbol in adjusted_copies)
         pending = [
             (
                 entry,
@@ -576,6 +591,7 @@ class ExtendedBackfillLedger:
                     "attempted_at": attempted_at.isoformat(),
                     "vendor": str(vendor),
                     "price_basis": str(bases.get(str(entry.symbol), "")),
+                    "adjusted_copy": str(entry.symbol) in kept,
                 },
             )
             for entry in entries
@@ -664,6 +680,8 @@ class ExtendedBackfillLedger:
             purpose="backfill-ledger",
         ):
             existing = self._read_all()
+            if not existing.empty:
+                existing = _with_legacy_columns(existing)
             rows = [
                 {
                     "snapshot_date": str(snapshot_date),
@@ -677,6 +695,7 @@ class ExtendedBackfillLedger:
                     "vendor": str(vendor),
                     "price_basis": "",
                     "attempts": 0,
+                    "adjusted_copy": False,
                 }
                 for name in names
             ]
@@ -831,6 +850,7 @@ class ExtendedBackfillSummary:
     pending_conflicts: int = 0
     deterministic_failed: int = 0
     deterministic_exhausted: int = 0
+    adjusted_kept: int = 0
 
 
 def classify_extended_backfill_outcome(summary: ExtendedBackfillSummary) -> tuple[str, str]:
@@ -992,6 +1012,9 @@ async def run_extended_session_backfill(
     basis-less COMPLETE row covers an adjusted panel day. The store is raw-basis only: a KIS fetch is kept
     only when the panel shows no later corporate action; an adjusted symbol-day is replaced by Kiwoom raw
     bars, and without a raw source it fails closed (a repair symbol's stored adjusted rows are removed).
+    When the failure is price_basis_no_raw_source or price_basis_raw_basis_unavailable, the KIS adjusted bars
+    are kept in the separate adjusted store (before the ledger row, which records adjusted_copy=True) so the
+    vendor bars survive KIS retention; the ledger outcome is unchanged.
     Symbols are spread round-robin over the backfill credentials; each task publishes certified symbols,
     a task manifest and ledger rows before the next task starts, so an interruption loses at most the
     in-flight task.
@@ -1037,6 +1060,7 @@ async def run_extended_session_backfill(
     exhausted = 0
     deterministic_exhausted = 0
     pending_conflicts = 0
+    adjusted_kept = 0
     stopped = False
     unreadable: list[str] = []
     async with AsyncExitStack() as stack:
@@ -1133,6 +1157,7 @@ async def run_extended_session_backfill(
 
             raw_sem = asyncio.Semaphore(max(int(profile.COLLECTION_CONCURRENCY_PER_KEY), 1))
             price_bases: dict[str, str] = {}
+            adjusted_frames: dict[str, pd.DataFrame] = {}
 
             async def _raw_one(symbol: str) -> tuple[str, pd.DataFrame, CoverageEntry, str | None]:
                 frame, entry = collected[symbol]
@@ -1141,6 +1166,7 @@ async def run_extended_session_backfill(
                 if not price_reference.is_adjusted(task.snapshot_date, symbol):
                     return symbol, frame, entry, "kis_raw"
                 if raw_client is None or task.session not in _RAW_SOURCE_SESSIONS:
+                    adjusted_frames[symbol] = frame
                     return symbol, frame.iloc[0:0], _basis_failed_entry(entry, "price_basis_no_raw_source"), None
                 _client, http_session = symbol_routes[symbol]
                 async with raw_sem:
@@ -1150,6 +1176,8 @@ async def run_extended_session_backfill(
                     )
                 if raw_entry.status == CaptureStatus.COMPLETE:
                     return symbol, raw_frame, raw_entry, "kiwoom_raw"
+                if raw_entry.reason == _RAW_BASIS_UNAVAILABLE:
+                    adjusted_frames[symbol] = frame
                 return symbol, frame.iloc[0:0], _basis_failed_entry(
                     entry, f"price_basis_{raw_entry.reason}", raw_entry.raw_refs
                 ), None
@@ -1211,6 +1239,9 @@ async def run_extended_session_backfill(
             }
             if stale:
                 remove_intraday_symbols(1, task.snapshot_date, task.session, stale)
+            if adjusted_frames:
+                write_kis_adjusted_partition(adjusted_frames, task.snapshot_date, task.session)
+                adjusted_kept += len(adjusted_frames)
             if pending:
                 manifest_status = (
                     CaptureStatus.COMPLETE
@@ -1248,6 +1279,7 @@ async def run_extended_session_backfill(
                         attempted_at=clock(),
                         price_bases=price_bases,
                         is_transient=is_transient_failure,
+                        adjusted_copies=frozenset(adjusted_frames),
                     )
                     exhausted += int(result.newly_exhausted_actionable)
                     deterministic_exhausted += int(result.newly_exhausted - result.newly_exhausted_actionable)
@@ -1283,6 +1315,7 @@ async def run_extended_session_backfill(
                 pending_conflict,
                 elapsed,
             )
+    logger.info("[DATA] stage=extended_backfill_adjusted_copy adjusted_kept=%d tasks_done=%d", adjusted_kept, done)
     if unreadable:
         raise OSError(f"Cannot read existing partition evidence for tasks {unreadable}")
     return ExtendedBackfillSummary(
@@ -1297,6 +1330,7 @@ async def run_extended_session_backfill(
         pending_conflicts=pending_conflicts,
         deterministic_failed=deterministic_failed,
         deterministic_exhausted=deterministic_exhausted,
+        adjusted_kept=adjusted_kept,
     )
 
 
