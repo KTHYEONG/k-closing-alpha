@@ -1440,3 +1440,159 @@ def test_summary_construction_defaults_remain_compatible() -> None:
     summary = ExtendedBackfillSummary(1, 0, 1, 0, 0, 0, False)
     assert (summary.deterministic_failed, summary.deterministic_exhausted) == (0, 0)
     assert classify_extended_backfill_outcome(summary) == ("OK", "")
+
+
+# ---------------------------------------------------------------- adjusted copy
+
+
+def _adjusted_case(kind: str) -> tuple[str, str, object, object]:
+    """(day, session, price reference, raw client) for one adjusted-copy outcome."""
+    if kind == "no_raw_source_krx":
+        day = "2026-09-20"
+        return day, "krx_aftermarket", _adj_ref(day, "000001", 5300.0, 1060.0), _FakeKiwoom(day, raw={"000001": "1060"})
+    day = "2026-03-02"
+    if kind == "no_raw_source_unconfigured":
+        return day, "nxt_aftermarket", _adj_ref(day, "000001", 5300.0, 1060.0), None
+    if kind == "raw_basis_unavailable":
+        return day, "nxt_aftermarket", _adj_ref(day, "000001", 5300.0, 1060.0), _FakeKiwoom(day, raw={})
+    if kind == "kis_raw":
+        return day, "nxt_aftermarket", _raw_ref(day, {"000001"}), _FakeKiwoom(day, raw={})
+    if kind == "kiwoom_raw":
+        return day, "nxt_aftermarket", _adj_ref(day, "000001", 5300.0, 1060.0), _FakeKiwoom(day, raw={"000001": "1060"})
+    if kind == "unknown":
+        return day, "nxt_aftermarket", _ref([]), _FakeKiwoom(day, raw={"000001": "1060"})
+    if kind == "raw_transport":
+        return day, "nxt_aftermarket", _adj_ref(day, "000001", 5300.0, 1060.0), _FakeKiwoom(day, raw={}, error={"000001"})
+    raise AssertionError(kind)
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason"),
+    [
+        ("no_raw_source_krx", "exhausted:price_basis_no_raw_source"),
+        ("no_raw_source_unconfigured", "exhausted:price_basis_no_raw_source"),
+        ("raw_basis_unavailable", "price_basis_raw_basis_unavailable"),
+    ],
+)
+def test_discarded_kis_bars_are_kept_in_the_separate_adjusted_store(env, caplog, kind, reason) -> None:
+    import logging
+
+    from src.data.intraday_store import intraday_partition_path, kis_adjusted_partition_path
+
+    profile, store, ledger = env
+    day, session, reference, raw = _adjusted_case(kind)
+    kis = _FakeKis(day, traded={"000001"}, bars={"000001": ("5300", "10", "53000")}, hms="160000")
+    with caplog.at_level(logging.INFO):
+        summary = _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, session, ("000001",))],
+                       reference, raw_client=raw)
+    assert summary.adjusted_kept == 1 and summary.complete == 0 and summary.deterministic_failed == 1
+    assert not intraday_partition_path(1, day, session).exists()
+    kept = pd.read_parquet(kis_adjusted_partition_path(day, session))
+    assert kept["symbol"].tolist() == ["000001"] and kept["close"].tolist() == [5300]
+    assert set(kept["price_basis"]) == {"kis_adjusted"} and set(kept["session"]) == {session}
+    assert set(kept["snapshot_date"]) == {day} and set(kept["vendor"]) == {"kis"}
+    row = _ledger_row(ledger, "000001")
+    assert row["reason"] == reason and bool(row["adjusted_copy"]) is True
+    assert row["status"] == ("EXHAUSTED" if reason.startswith("exhausted:") else "FAILED")
+    assert sum("adjusted_kept=1" in rec.message for rec in caplog.records) == 1
+
+
+@pytest.mark.parametrize("kind", ["kis_raw", "kiwoom_raw", "unknown", "raw_transport"])
+def test_other_basis_outcomes_write_no_adjusted_copy(env, kind) -> None:
+    from src.data.intraday_store import kis_adjusted_partition_path
+
+    profile, store, ledger = env
+    day, session, reference, raw = _adjusted_case(kind)
+    summary = _run(profile, store, ledger, [_FakeKis(day, traded={"000001"})],
+                   [ExtendedBackfillTask(day, session, ("000001",))], reference, raw_client=raw)
+    assert summary.adjusted_kept == 0
+    assert not kis_adjusted_partition_path(day, session).exists()
+    assert bool(_ledger_row(ledger, "000001")["adjusted_copy"]) is False
+
+
+def test_adjusted_copy_never_enters_the_raw_basis_partition(env) -> None:
+    from src.data.intraday_store import intraday_partition_path, kis_adjusted_partition_path
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    reference = _ref([(day, "000001", 1000.0, 1000.0), (day, "000002", 5300.0, 1060.0)])
+    kis = _FakeKis(day, traded={"000001", "000002"}, bars={"000002": ("5300", "10", "53000")})
+    _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002"))],
+         reference, raw_client=_FakeKiwoom(day, raw={}))
+    raw_rows = pd.read_parquet(intraday_partition_path(1, day, "nxt_aftermarket"))
+    assert raw_rows["symbol"].tolist() == ["000001"] and "price_basis" not in raw_rows.columns
+    kept = pd.read_parquet(kis_adjusted_partition_path(day, "nxt_aftermarket"))
+    assert kept["symbol"].tolist() == ["000002"]
+
+
+def test_rerun_replaces_the_adjusted_copy_without_duplicates(env) -> None:
+    from src.data.intraday_store import kis_adjusted_partition_path
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    reference = _ref([(day, "000001", 5300.0, 1060.0), (day, "000002", 5300.0, 1060.0)])
+    task = [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002"))]
+    _run(profile, store, ledger, [_FakeKis(day, traded={"000001", "000002"})], task, reference,
+         raw_client=_FakeKiwoom(day, raw={}))
+    first = pd.read_parquet(kis_adjusted_partition_path(day, "nxt_aftermarket"))
+    _run(profile, store, ledger, [_FakeKis(day, traded={"000001"}, bars={"000001": ("5400", "10", "54000")})],
+         [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))], reference, raw_client=_FakeKiwoom(day, raw={}))
+    second = pd.read_parquet(kis_adjusted_partition_path(day, "nxt_aftermarket")).set_index("symbol")
+    assert len(first) == 2 and len(second) == 2
+    assert second.loc["000001", "close"] == 5400 and second.loc["000002", "close"] == 1000
+    _run(profile, store, ledger, [_FakeKis(day, traded={"000001"}, bars={"000001": ("5400", "10", "54000")})],
+         [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001",))], reference, raw_client=_FakeKiwoom(day, raw={}))
+    third = pd.read_parquet(kis_adjusted_partition_path(day, "nxt_aftermarket"))
+    pd.testing.assert_frame_equal(third.set_index("symbol"), second)
+
+
+def test_adjusted_writer_rejects_foreign_rows_and_ignores_empty_input(env) -> None:
+    from src.data.intraday_schema import normalize_bar_frame
+    from src.data.intraday_store import kis_adjusted_partition_path, write_kis_adjusted_partition
+
+    day = "2026-03-02"
+    assert write_kis_adjusted_partition({}, day, "nxt_aftermarket") == 0
+    assert not kis_adjusted_partition_path(day, "nxt_aftermarket").exists()
+    bars = normalize_bar_frame(pd.DataFrame([_row("160000", "1000", "10", "10000", day)]), "kis", day, "000001")
+    with pytest.raises(ValueError, match="Empty adjusted frame"):
+        write_kis_adjusted_partition({"000001": bars.iloc[0:0]}, day, "nxt_aftermarket")
+    with pytest.raises(ValueError, match="another symbol"):
+        write_kis_adjusted_partition({"000002": bars}, day, "nxt_aftermarket")
+    with pytest.raises(ValueError, match="Unknown intraday session"):
+        write_kis_adjusted_partition({"000001": bars}, day, "bogus")
+    assert not kis_adjusted_partition_path(day, "nxt_aftermarket").exists()
+
+
+def test_legacy_ledger_without_adjusted_copy_column_loads_and_reopens(env) -> None:
+    from src.backfill.intraday.extended_session_backfill import ReopenSelector
+    from src.data.intraday_store import kis_adjusted_partition_path
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    legacy = pd.DataFrame([
+        {"snapshot_date": day, "session": "nxt_aftermarket", "symbol": "000001", "status": "EXHAUSTED", "rows": 0,
+         "reason": "exhausted:price_basis_raw_basis_unavailable", "run_id": "old",
+         "attempted_at": "2026-03-03T01:00:00+09:00", "vendor": "kis", "price_basis": "", "attempts": 3},
+        {"snapshot_date": day, "session": "nxt_aftermarket", "symbol": "000002", "status": "COMPLETE", "rows": 1,
+         "reason": "", "run_id": "old", "attempted_at": "2026-03-03T01:00:00+09:00", "vendor": "kis",
+         "price_basis": "kis_raw", "attempts": 0},
+    ])
+    legacy.to_parquet(ledger.path, index=False)
+    assert ledger.terminal_symbols(day, "nxt_aftermarket") == frozenset({"000001", "000002"})
+    ledger.record_cached_absent(day, "nxt_aftermarket", ["000009"], reason="cached", run_id="c",
+                                attempted_at=datetime.now(SEOUL))
+    plan = ledger.reopen_exhausted(
+        ReopenSelector(reason_prefix="price_basis_raw_basis_unavailable", date_from=day),
+        as_of=AS_OF, retention_days=365, apply=True, run_id="reopen-t", attempted_at=datetime.now(SEOUL),
+    )
+    assert plan.reopened == 1 and plan.keys == ((day, "nxt_aftermarket", "000001"),)
+    reference = _ref([(day, "000001", 5300.0, 1060.0), (day, "000002", 1000.0, 1000.0)])
+    kis = _FakeKis(day, traded={"000001", "000002"})
+    summary = _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002"))],
+                   reference, raw_client=_FakeKiwoom(day, raw={}))
+    assert kis.requested == ["000001"] and summary.adjusted_kept == 1
+    assert kis_adjusted_partition_path(day, "nxt_aftermarket").exists()
+    rows = pd.read_parquet(ledger.path).set_index("symbol")
+    assert rows.loc["000001", "status"] == "EXHAUSTED"
+    assert rows.loc["000001", "reason"] == "exhausted:price_basis_raw_basis_unavailable"
+    assert bool(rows.loc["000001", "adjusted_copy"]) is True and bool(rows.loc["000002", "adjusted_copy"]) is False

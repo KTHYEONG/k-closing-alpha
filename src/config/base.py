@@ -79,3 +79,6 @@ class PathSettings(EnvSettings):
 # `settings.PARQUET_DIR` at call time so PARQUET_DIR overrides keep redirecting them.
 TOPK_DECISIONS_PARQUET_NAME: str = "topk_decisions.parquet"
 RANK_POOL_PARQUET_NAME: str = "rank_pool_predictions.parquet"
+# Sibling of the raw-basis `intraday/1m` tree, joined with `settings.HISTORY_DIR` at call time; holds
+# corporate-action adjusted KIS bars that must never be mixed into the raw-basis store.
+INTRADAY_KIS_ADJUSTED_1M_DIR_NAME: str = "1m_kis_adjusted"
