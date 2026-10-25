@@ -34,11 +34,11 @@ LOOSE_EXCLUDES: tuple[str, ...] = (
     "/history/capture/normalized/**",
     "/history/capture/manifests/**",
     "/history/capture/backups/**",
-    "/history/capture/staging/**",
+    "/history/capture/staging/offsite/**",
 )
 LOOSE_RCLONE_FLAGS: tuple[str, ...] = ("--transfers", "4", "--checkers", "8")
 BACKUP_SLOT_KST: time = time(22, 15)
-BACKUP_SLOT_WEEKDAYS: frozenset[int] = frozenset({0, 1, 2, 3, 4})
+BACKUP_SLOT_WEEKDAYS: frozenset[int] = frozenset(range(7))
 REPORT_RELPATH: str = "offsite/last_run.json"
 BACKUP_PROGRESS_RELPATH: str = "offsite/in_progress.json"
 BACKUP_SEAL_BUDGET: timedelta = timedelta(minutes=90)
@@ -547,7 +547,7 @@ def _run_offsite_backup_inner(
 
 
 def expected_backup_slot(audit_at: datetime) -> datetime:
-    """Latest scheduled backup start (Mon-Fri 22:15 KST) strictly before audit_at."""
+    """Latest scheduled backup start (daily 22:15 KST) strictly before audit_at."""
     at = _kst_now(audit_at)
     day = at.date()
     while True:

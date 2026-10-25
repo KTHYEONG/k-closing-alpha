@@ -159,12 +159,12 @@ def test_run_requests_full_scan_only_on_configured_weekday(tmp_path: Path, monke
     assert seen["full_scan"] is False
 
 
-def test_expected_slot_skips_weekend() -> None:
+def test_expected_slot_includes_weekend() -> None:
     from src.tools.offsite_backup import expected_backup_slot
 
-    # Given Monday 20:15 audit -> previous Friday 22:15 slot
+    # Given Monday 20:15 audit -> previous Sunday 22:15 slot (weekend runs carry extended backfill and tape ledgers)
     slot = expected_backup_slot(datetime.fromisoformat("2026-09-21T20:15:00+09:00"))
-    assert (slot.year, slot.month, slot.day, slot.hour, slot.minute) == (2026, 9, 18, 22, 15)
+    assert (slot.year, slot.month, slot.day, slot.hour, slot.minute) == (2026, 9, 20, 22, 15)
 
     # Given Wednesday 20:15 -> Tuesday 22:15
     slot2 = expected_backup_slot(datetime.fromisoformat("2026-09-23T20:15:00+09:00"))
@@ -181,17 +181,17 @@ def test_staleness_classifies_missing_failed_stale_ok(tmp_path: Path) -> None:
 
     # Given failed report -> failed (precedence over stale)
     failed = tmp_path / "failed.json"
-    _write_report(failed, status="failed", started_at="2026-09-18T13:15:00+00:00")
+    _write_report(failed, status="failed", started_at="2026-09-20T13:15:00+00:00")
     assert backup_staleness_issues(failed, audit_at) == ["offsite_backup:failed"]
 
     # Given ok report started before slot -> stale
     stale = tmp_path / "stale.json"
-    _write_report(stale, status="ok", started_at="2026-09-17T13:15:00+00:00")
+    _write_report(stale, status="ok", started_at="2026-09-19T13:15:00+00:00")
     assert backup_staleness_issues(stale, audit_at) == ["offsite_backup:stale"]
 
     # Given ok report after slot -> []
     ok = tmp_path / "ok.json"
-    _write_report(ok, status="ok", started_at="2026-09-18T13:30:00+00:00")
+    _write_report(ok, status="ok", started_at="2026-09-20T13:30:00+00:00")
     assert backup_staleness_issues(ok, audit_at) == []
 
     # And unreadable report
@@ -210,7 +210,7 @@ def test_staleness_classifies_missing_failed_stale_ok(tmp_path: Path) -> None:
     bad_ts.write_text(json.dumps({"status": "ok", "started_at": "not-a-date"}), encoding="utf-8")
     assert backup_staleness_issues(bad_ts, audit_at) == ["offsite_backup:unreadable"]
     naive_ok = tmp_path / "naive_ok.json"
-    naive_ok.write_text(json.dumps({"status": "ok", "started_at": "2026-09-18T22:30:00"}), encoding="utf-8")
+    naive_ok.write_text(json.dumps({"status": "ok", "started_at": "2026-09-20T22:30:00"}), encoding="utf-8")
     assert backup_staleness_issues(naive_ok, audit_at) == []
 
 
@@ -270,12 +270,19 @@ def test_backup_slot_constant_matches_timer_schedule() -> None:
 
     # Given kca-backup.timer
     text = (_Path("deploy/systemd/kca-backup.timer")).read_text(encoding="utf-8")
-    match = re.search(r"OnCalendar=(\w+)\.\.(\w+) (\d{2}):(\d{2}):\d{2}", text)
+    match = re.search(r"OnCalendar=\*-\*-\* (\d{2}):(\d{2}):\d{2}", text)
     assert match is not None
-    day_index = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
-    start, end = day_index[match.group(1)], day_index[match.group(2)]
-    assert frozenset(range(start, end + 1)) == BACKUP_SLOT_WEEKDAYS
-    assert time(int(match.group(3)), int(match.group(4))) == BACKUP_SLOT_KST
+    assert frozenset(range(7)) == BACKUP_SLOT_WEEKDAYS
+    assert time(int(match.group(1)), int(match.group(2))) == BACKUP_SLOT_KST
+
+
+def test_tape_backfill_ledger_is_not_excluded_from_loose_copy() -> None:
+    from src.tools.offsite_backup import LOOSE_EXCLUDES
+
+    # Given the resume ledger lives under capture/staging/tape_backfill
+    # Then only the seal workspace is excluded from staging
+    assert "/history/capture/staging/offsite/**" in LOOSE_EXCLUDES
+    assert not any(pattern.startswith("/history/capture/staging/**") for pattern in LOOSE_EXCLUDES)
 
 
 def _write_core_parquet(path, rows: int, max_date: str) -> None:
@@ -611,7 +618,7 @@ def test_deferred_report_yields_deferred_staleness_issue(tmp_path: Path) -> None
 
     deferred_seal = tmp_path / "deferred_seal.json"
     deferred_seal.write_text(json.dumps({
-        "started_at": "2026-09-18T13:30:00+00:00", "finished_at": "2026-09-18T13:30:00+00:00",
+        "started_at": "2026-09-20T13:30:00+00:00", "finished_at": "2026-09-20T13:30:00+00:00",
         "status": "ok",
         "steps": {"capture_seal": {"status": "ok", "deferred_dates": 3}},
     }), encoding="utf-8")
@@ -619,7 +626,7 @@ def test_deferred_report_yields_deferred_staleness_issue(tmp_path: Path) -> None
 
     deferred_loose = tmp_path / "deferred_loose.json"
     deferred_loose.write_text(json.dumps({
-        "started_at": "2026-09-18T13:30:00+00:00", "finished_at": "2026-09-18T13:30:00+00:00",
+        "started_at": "2026-09-20T13:30:00+00:00", "finished_at": "2026-09-20T13:30:00+00:00",
         "status": "ok",
         "steps": {
             "capture_seal": {"status": "ok", "deferred_dates": 0},

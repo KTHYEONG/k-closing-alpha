@@ -1746,8 +1746,8 @@ def test_default_backup_issues_reads_report_under_capture_root(tmp_path, monkeyp
     report_path.write_text(
         json.dumps(
             {
-                "started_at": "2026-09-18T13:30:00+00:00",
-                "finished_at": "2026-09-18T13:31:00+00:00",
+                "started_at": "2026-09-20T13:30:00+00:00",
+                "finished_at": "2026-09-20T13:31:00+00:00",
                 "status": "ok",
                 "steps": {},
             }
