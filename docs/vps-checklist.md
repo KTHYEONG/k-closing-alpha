@@ -91,7 +91,7 @@ Containerized units run `ExecStart=%h/.local/lib/kca/kca-run <job> [--kis-data] 
 | Mon–Fri 21:00 | `kca-backup-prune` (host) | `flock quant-gdrive.lock` | 3 h | ~2 min; `stage=backup_prune … purged=… sealed_removed=…` | P2 |
 | Mon–Fri 21:20 | `kca-daily-audit` (host) | `flock kca-audit.lock` | 30 min | 1.5–4.5 min incl. ~80 s `sudo chown -R` pre-step; subject `🟢 … 일일점검 완료` | P1 |
 | Mon–Fri 21:35 | `kca-altdata-capture` (optional) | kis-data, standard, batch | 30 min | 4–6 min | P2 |
-| Mon–Fri 22:15 | `kca-backup` (host) | `flock quant-gdrive.lock` | 3 h | 3–10 min incl. ~95 s chown pre-step; `offsite_backup status=ok` | P0 shrink / P1 fail |
+| Daily 22:15 | `kca-backup` (host) | `flock quant-gdrive.lock` | 3 h | 3–10 min incl. ~95 s chown pre-step; `offsite_backup status=ok` | P0 shrink / P1 fail |
 | daily 23:05 | `kca-extended-backfill` | kis-data, bulk, batch | 8 h | ~2.5 min (weekends too); `extended_backfill status=DONE`; run_outcome job=extended_backfill outcome=OK | P2 |
 | Sat 22:00 | `kca-retrain` | `--memory=6g --cpus=1.8 --memory-swap=8g` | 2 h | registry row `PROMOTED`; a strategy change yields `REJECTED` + unit failure by design (§10) | P1 |
 | Sun 10:00 | `kca-core-snapshot` (host) | `flock quant-gdrive.lock` | 2 h | ~1 min | P1 |
@@ -307,7 +307,7 @@ gh run list --workflow watchdog.yml --limit 5 -R kthyeong/k-closing-alpha
 
 | ID | Check | Severity if not |
 |---|---|---|
-| BAK-01 | `last_run.json` `status=ok`, every step ok, `started_at` after the last Mon–Fri 22:15 slot (+0–2 min chown pre-step); `in_progress.json` exists only while a run is active and before its `deadline_at` | P1 |
+| BAK-01 | `last_run.json` `status=ok`, every step ok, `started_at` after the last daily 22:15 slot (+0–2 min chown pre-step); `in_progress.json` exists only while a run is active and before its `deadline_at` | P1 |
 | BAK-02 | `core_panels` rows never shrink between nights | P0 |
 | BAK-03 | `deferred_dates` 0, or draining; stalled 3 runs or oldest deferred > 21 days = WARN | P2 |
 | BAK-04 | Sun verify `missing=0 mismatched=0`, restore drills `OK` for raw, normalized, manifests | P1 |
