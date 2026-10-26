@@ -61,6 +61,9 @@ CREDENTIAL_EXPIRIES: tuple[CredentialExpiry, ...] = (
     CredentialExpiry(name="KIS_DATA_4", expires_on=date(2027, 9, 15), renew_hint=_KIS_RENEW_HINT),
     CredentialExpiry(name="KIS_DATA_5", expires_on=date(2027, 9, 15), renew_hint=_KIS_RENEW_HINT),
     CredentialExpiry(name="KRX_OPENAPI_KEY", expires_on=date(2027, 1, 18), renew_hint="공공데이터포털 KRX Open API 활용신청 연장"),
+    # 발급일을 확인하지 못해 첫 사용 커밋일(LS 2026-09-05, DB 2026-10-15) 기준 1년 뒤보다 하루 앞당겨 보수적으로 둔다. 포털에서 확인되면 정정한다.
+    CredentialExpiry(name="LS_APP_KEY", expires_on=date(2027, 9, 4), renew_hint="LS증권 OpenAPI 서비스 연장 (포털 확인 후 정정)"),
+    CredentialExpiry(name="DB_APP_KEY", expires_on=date(2027, 10, 14), renew_hint="DB금융투자 OpenAPI 서비스 연장 (포털 확인 후 정정)"),
     CredentialExpiry(name="KIWOOM_APP_KEY", expires_on=date(2027, 9, 7), renew_hint="키움증권 OpenAPI 서비스 연장 (선택 경로: 종가스캔 후보 보조 소스)"),
     CredentialExpiry(name="TOSS_APP_KEY", expires_on=date(2027, 9, 11), renew_hint="토스증권 OpenAPI 서비스 연장 (선택 경로: 종가스캔 후보 보조 소스)"),
 )
