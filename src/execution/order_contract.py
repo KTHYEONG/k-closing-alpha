@@ -35,7 +35,7 @@ __all__ = [
     "size_entry_orders",
 ]
 
-_SYMBOL_RE = re.compile(r"^\d{6}$")
+_SYMBOL_RE = re.compile(r"^[0-9A-Z]{6}$")
 
 
 class OrderSide(StrEnum):
@@ -79,7 +79,7 @@ class OrderIntent:
 
     def __post_init__(self) -> None:
         if not isinstance(self.symbol, str) or not _SYMBOL_RE.fullmatch(self.symbol):
-            raise ValueError(f"symbol must be 6 digits, got {self.symbol!r}")
+            raise ValueError(f"symbol must be 6 digits or uppercase letters, got {self.symbol!r}")
         if type(self.qty) is not int or self.qty <= 0:
             raise ValueError(f"qty must be positive, got {self.qty}")
         try:

@@ -817,6 +817,9 @@ def test_validate_decision_rule_branches() -> None:
     picks, rule = sut._validate_decision(_frame([{**base, "symbol": "ABC"}]), date_str=DAY,
                                          now=now, max_sends=10)
     assert rule == "invalid_decision:bad_symbol"
+    picks, rule = sut._validate_decision(_frame([{**base, "symbol": "0013Y0"}]), date_str=DAY,
+                                         now=now, max_sends=10)
+    assert rule is None and picks is not None and picks[0]["symbol"] == "0013Y0"
     picks, rule = sut._validate_decision(
         _frame([{**base}, {**base, "pred": 0.1}]), date_str=DAY, now=now, max_sends=10)
     assert rule == "invalid_decision:duplicate_symbol"

@@ -196,10 +196,15 @@ def test_zero_capital_sizes_everything_to_zero() -> None:
     assert all(q == 0 for q in out.values())
 
 
-@pytest.mark.parametrize("symbol", ["12345", "ABCDEF", "005930 "])
-def test_non_six_digit_symbol_rejected(symbol: str) -> None:
-    with pytest.raises(ValueError, match="symbol must be 6 digits"):
+@pytest.mark.parametrize("symbol", ["12345", "0013y0", "005930 ", "00-930", "1234567"])
+def test_malformed_symbol_rejected(symbol: str) -> None:
+    with pytest.raises(ValueError, match="symbol must be 6 digits or uppercase"):
         _intent(symbol=symbol)
+
+
+@pytest.mark.parametrize("symbol", ["005930", "0013Y0", "0158S0"])
+def test_alphanumeric_krx_symbol_accepted(symbol: str) -> None:
+    assert _intent(symbol=symbol).symbol == symbol
 
 
 @pytest.mark.parametrize("date", ["not-a-date", "2026-13-40"])
