@@ -80,7 +80,7 @@ _JOB_BY_PHASE: dict[str, str] = {
 }
 
 _KST = ZoneInfo("Asia/Seoul")
-_SYMBOL_RE = re.compile(r"^\d{6}$")
+_SYMBOL_RE = re.compile(r"^[0-9A-Z]{6}$")
 _OK_SEND_STATUSES: frozenset[IntentStatus] = frozenset({IntentStatus.ACKED, IntentStatus.FILLED})
 
 
