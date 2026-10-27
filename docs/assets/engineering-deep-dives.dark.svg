@@ -1,0 +1,168 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 700" width="1200" height="700" role="img" style="font-family:Pretendard, Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <title>K-Closing Alpha 핵심 엔지니어링 문제 해결 3선</title>
+  <desc>15:20 시점 분리 및 틱 마찰비용 차단(Sharpe +0.84), 멀티 브로커 쿼터 분산 및 토큰 CAS 락(429 0건), 멱등 주문 저널 및 3중 종가 확정(오주문 0건)</desc>
+  <defs>
+    <filter id="card-shadow" x="-8%" y="-8%" width="116%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="0.35" data-paint-static="true"/>
+    </filter>
+  </defs>
+  <rect width="1200" height="700" fill="#16191E" data-fill-role="canvas"/>
+
+  <!-- Header -->
+  <g>
+    <rect data-fill-role="focus" x="48" y="41" width="6" height="42" rx="3" fill="#2E6DA4"/>
+    <text data-fill-role="muted" x="70" y="32" font-size="13.5" font-weight="700" letter-spacing="0.08em" fill="#9BA1A8" dominant-baseline="central">ENGINEERING DEEP DIVES · PROBLEM SOLVING</text>
+    <text data-fill-role="ink" x="70" y="62" font-size="26" font-weight="700" fill="#E6E8EB" dominant-baseline="central">백테스트 착시와 API 한도, 체결 불확실성을 해결한 3대 엔지니어링 해법</text>
+    <text data-fill-role="ink" x="70" y="94" font-size="14.5" font-weight="400" fill="#9BA1A8" dominant-baseline="central">미래 정보 차단 및 118개 전략 백테스트, 멀티 브로커 쿼터 격리, Write-Ahead 주문 저널을 코드와 실측 수치로 증명합니다</text>
+  </g>
+
+  <!-- CASE 01: Horizontal Card -->
+  <g>
+    <rect x="48" y="124" width="1104" height="162" rx="14" fill="#20242B" stroke="#2E6DA4" stroke-width="1.5" data-fill-role="surface" data-stroke-role="edge-line" filter="url(#card-shadow)"/>
+
+    <!-- Left Section: Case Title & Problem -->
+    <rect x="68" y="142" width="208" height="26" rx="13" fill="#1D2B3A" stroke="#2E6DA4" stroke-width="1" data-fill-role="edge-fill" data-stroke-role="edge-line"/>
+    <text x="172" y="155" font-size="11.5" font-weight="700" letter-spacing="0.06em" fill="#B0D3F0" data-fill-role="edge-ink" text-anchor="middle" dominant-baseline="central">CASE 01 · CAUSALITY &amp; COST</text>
+    <text x="68" y="190" font-size="20" font-weight="700" fill="#E6E8EB" data-fill-role="ink" dominant-baseline="central">미래 참조 차단 &amp; 마찰비용 방어</text>
+
+    <!-- Problem Pill -->
+    <rect x="68" y="214" width="296" height="52" rx="8" fill="#252932" stroke="#B45A50" stroke-width="1" data-fill-role="external-fill" data-stroke-role="danger"/>
+    <text x="80" y="231" font-size="12" font-weight="700" fill="#B45A50" data-fill-role="danger" dominant-baseline="central">문제: 15:30 종가 미래참조 &amp; 저가주 틱 잠식</text>
+    <text x="80" y="251" font-size="12" font-weight="400" fill="#9BA1A8" data-fill-role="ink" dominant-baseline="central">5천원 미만 저가주 진입 시 일평균 -12.53bp 손실</text>
+
+    <!-- Middle Flow: 3 Steps -->
+    <g>
+      <!-- Step 1 -->
+      <rect x="382" y="144" width="158" height="122" rx="10" fill="#1D2B3A" stroke="#2E6DA4" stroke-width="1" data-fill-role="edge-fill" data-stroke-role="edge-line"/>
+      <text x="396" y="172" font-size="14.5" font-weight="700" fill="#B0D3F0" data-fill-role="edge-ink" dominant-baseline="central">① 15:20 시점 분리</text>
+      <text x="396" y="202" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="edge-ink" dominant-baseline="central">결정_종가와 확정 종가</text>
+      <text x="396" y="226" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="edge-ink" dominant-baseline="central">컬럼 및 시각 물리 격리</text>
+
+      <!-- Arrow 1 -> 2 -->
+      <path d="M548 205 L558 205" fill="none" stroke="#2E6DA4" stroke-width="2" stroke-linecap="round" data-stroke-role="edge-line"/>
+      <path d="M554 201 L558 205 L554 209" fill="none" stroke="#2E6DA4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="edge-line"/>
+
+      <!-- Step 2 -->
+      <rect x="566" y="144" width="158" height="122" rx="10" fill="#1D2B3A" stroke="#2E6DA4" stroke-width="1" data-fill-role="edge-fill" data-stroke-role="edge-line"/>
+      <text x="580" y="172" font-size="14.5" font-weight="700" fill="#B0D3F0" data-fill-role="edge-ink" dominant-baseline="central">② 1틱 비용 상한제</text>
+      <text x="580" y="202" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="edge-ink" dominant-baseline="central">1틱 ≤12.0bp 필터로</text>
+      <text x="580" y="226" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="edge-ink" dominant-baseline="central">호가 마찰 잠식주 배제</text>
+
+      <!-- Arrow 2 -> 3 -->
+      <path d="M732 205 L742 205" fill="none" stroke="#2E6DA4" stroke-width="2" stroke-linecap="round" data-stroke-role="edge-line"/>
+      <path d="M738 201 L742 205 L738 209" fill="none" stroke="#2E6DA4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="edge-line"/>
+
+      <!-- Step 3 -->
+      <rect x="750" y="144" width="158" height="122" rx="10" fill="#1D2B3A" stroke="#2E6DA4" stroke-width="1" data-fill-role="edge-fill" data-stroke-role="edge-line"/>
+      <text x="764" y="172" font-size="14.5" font-weight="700" fill="#B0D3F0" data-fill-role="edge-ink" dominant-baseline="central">③ 무누출 교차검증</text>
+      <text x="764" y="202" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="edge-ink" dominant-baseline="central">CPCV 28개 경로 검증</text>
+      <text x="764" y="226" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="edge-ink" dominant-baseline="central">재학습 순위상관 ≥0.95</text>
+    </g>
+
+    <!-- Right KPI Badge -->
+    <rect x="926" y="144" width="206" height="122" rx="12" fill="#1E3029" stroke="#3F8F72" stroke-width="1.5" data-fill-role="compute-fill" data-stroke-role="compute-line"/>
+    <text x="1029" y="186" font-size="32" font-weight="700" fill="#3F8F72" data-fill-role="compute-line" text-anchor="middle" dominant-baseline="central">+0.84</text>
+    <text x="1029" y="220" font-size="15" font-weight="700" fill="#E6E8EB" data-fill-role="ink" text-anchor="middle" dominant-baseline="central">Sharpe 지수 향상</text>
+    <text x="1029" y="244" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="compute-ink" text-anchor="middle" dominant-baseline="central">+34.58bp/일 · 누출 0건</text>
+  </g>
+
+  <!-- CASE 02: Horizontal Card -->
+  <g>
+    <rect x="48" y="304" width="1104" height="162" rx="14" fill="#20242B" stroke="#3F8F72" stroke-width="1.5" data-fill-role="surface" data-stroke-role="compute-line" filter="url(#card-shadow)"/>
+
+    <!-- Left Section: Case Title & Problem -->
+    <rect x="68" y="322" width="216" height="26" rx="13" fill="#1E3029" stroke="#3F8F72" stroke-width="1" data-fill-role="compute-fill" data-stroke-role="compute-line"/>
+    <text x="176" y="335" font-size="11.5" font-weight="700" letter-spacing="0.06em" fill="#AEE0CE" data-fill-role="compute-ink" text-anchor="middle" dominant-baseline="central">CASE 02 · RATE LIMIT &amp; QUOTA</text>
+    <text x="68" y="370" font-size="20" font-weight="700" fill="#E6E8EB" data-fill-role="ink" dominant-baseline="central">멀티 브로커 쿼터 &amp; 토큰 격리</text>
+
+    <!-- Problem Pill -->
+    <rect x="68" y="394" width="296" height="52" rx="8" fill="#252932" stroke="#B45A50" stroke-width="1" data-fill-role="external-fill" data-stroke-role="danger"/>
+    <text x="80" y="411" font-size="12" font-weight="700" fill="#B45A50" data-fill-role="danger" dominant-baseline="central">문제: 15:20 결정창 API 속도 제한 병목</text>
+    <text x="80" y="431" font-size="12" font-weight="400" fill="#9BA1A8" data-fill-role="ink" dominant-baseline="central">단일 키 집중 및 다중 컨테이너 토큰 재발급 차단</text>
+
+    <!-- Middle Flow: 3 Steps -->
+    <g>
+      <!-- Step 1 -->
+      <rect x="382" y="324" width="158" height="122" rx="10" fill="#1E3029" stroke="#3F8F72" stroke-width="1" data-fill-role="compute-fill" data-stroke-role="compute-line"/>
+      <text x="396" y="352" font-size="14.5" font-weight="700" fill="#AEE0CE" data-fill-role="compute-ink" dominant-baseline="central">① 역할별 벤더 분산</text>
+      <text x="396" y="382" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="compute-ink" dominant-baseline="central">키움 스캔 · KIS 호가</text>
+      <text x="396" y="406" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="compute-ink" dominant-baseline="central">분봉·틱 병렬 라우팅</text>
+
+      <!-- Arrow 1 -> 2 -->
+      <path d="M548 385 L558 385" fill="none" stroke="#3F8F72" stroke-width="2" stroke-linecap="round" data-stroke-role="compute-line"/>
+      <path d="M554 381 L558 385 L554 389" fill="none" stroke="#3F8F72" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="compute-line"/>
+
+      <!-- Step 2 -->
+      <rect x="566" y="324" width="158" height="122" rx="10" fill="#1E3029" stroke="#3F8F72" stroke-width="1" data-fill-role="compute-fill" data-stroke-role="compute-line"/>
+      <text x="580" y="352" font-size="14.5" font-weight="700" fill="#AEE0CE" data-fill-role="compute-ink" dominant-baseline="central">② 호스트 토큰 계약</text>
+      <text x="580" y="382" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="compute-ink" dominant-baseline="central">07:05 7슬롯 사전 예열</text>
+      <text x="580" y="406" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="compute-ink" dominant-baseline="central">flock + 세대 CAS 공유</text>
+
+      <!-- Arrow 2 -> 3 -->
+      <path d="M732 385 L742 385" fill="none" stroke="#3F8F72" stroke-width="2" stroke-linecap="round" data-stroke-role="compute-line"/>
+      <path d="M738 381 L742 385 L738 389" fill="none" stroke="#3F8F72" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="compute-line"/>
+
+      <!-- Step 3 -->
+      <rect x="750" y="324" width="158" height="122" rx="10" fill="#1E3029" stroke="#3F8F72" stroke-width="1" data-fill-role="compute-fill" data-stroke-role="compute-line"/>
+      <text x="764" y="352" font-size="14.5" font-weight="700" fill="#AEE0CE" data-fill-role="compute-ink" dominant-baseline="central">③ 결정창 샤드 격리</text>
+      <text x="764" y="382" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="compute-ink" dominant-baseline="central">결정 경로(Slot 1,5)와</text>
+      <text x="764" y="406" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="compute-ink" dominant-baseline="central">배치 경로 물리적 분리</text>
+    </g>
+
+    <!-- Right KPI Badge -->
+    <rect x="926" y="324" width="206" height="122" rx="12" fill="#1E3029" stroke="#3F8F72" stroke-width="1.5" data-fill-role="compute-fill" data-stroke-role="compute-line"/>
+    <text x="1029" y="366" font-size="32" font-weight="700" fill="#3F8F72" data-fill-role="compute-line" text-anchor="middle" dominant-baseline="central">100%</text>
+    <text x="1029" y="400" font-size="15" font-weight="700" fill="#E6E8EB" data-fill-role="ink" text-anchor="middle" dominant-baseline="central">단면 수집 완결성</text>
+    <text x="1029" y="424" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="compute-ink" text-anchor="middle" dominant-baseline="central">1,247종목 &lt;95s · 429 0건</text>
+  </g>
+
+  <!-- CASE 03: Horizontal Card -->
+  <g>
+    <rect x="48" y="484" width="1104" height="162" rx="14" fill="#20242B" stroke="#5B54A8" stroke-width="1.5" data-fill-role="surface" data-stroke-role="api-line" filter="url(#card-shadow)"/>
+
+    <!-- Left Section: Case Title & Problem -->
+    <rect x="68" y="502" width="216" height="26" rx="13" fill="#28253B" stroke="#5B54A8" stroke-width="1" data-fill-role="api-fill" data-stroke-role="api-line"/>
+    <text x="176" y="515" font-size="11.5" font-weight="700" letter-spacing="0.06em" fill="#D1CDEE" data-fill-role="api-ink" text-anchor="middle" dominant-baseline="central">CASE 03 · IDEMPOTENT LEDGER</text>
+    <text x="68" y="550" font-size="20" font-weight="700" fill="#E6E8EB" data-fill-role="ink" dominant-baseline="central">멱등 주문 저널 &amp; 3중 종가 확정</text>
+
+    <!-- Problem Pill -->
+    <rect x="68" y="574" width="296" height="52" rx="8" fill="#252932" stroke="#B45A50" stroke-width="1" data-fill-role="external-fill" data-stroke-role="danger"/>
+    <text x="80" y="591" font-size="12" font-weight="700" fill="#B45A50" data-fill-role="danger" dominant-baseline="central">문제: 타임아웃 재시도 시 이중 주문 위험</text>
+    <text x="80" y="611" font-size="12" font-weight="400" fill="#9BA1A8" data-fill-role="ink" dominant-baseline="central">15:30 직후 미확정 예상체결가 오염 가능성</text>
+
+    <!-- Middle Flow: 3 Steps -->
+    <g>
+      <!-- Step 1 -->
+      <rect x="382" y="504" width="158" height="122" rx="10" fill="#28253B" stroke="#5B54A8" stroke-width="1" data-fill-role="api-fill" data-stroke-role="api-line"/>
+      <text x="396" y="532" font-size="14.5" font-weight="700" fill="#D1CDEE" data-fill-role="api-ink" dominant-baseline="central">① Write-Ahead 저널</text>
+      <text x="396" y="562" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="api-ink" dominant-baseline="central">송출 전 SEND 선기록</text>
+      <text x="396" y="586" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="api-ink" dominant-baseline="central">원장 대사 후 안전 채택</text>
+
+      <!-- Arrow 1 -> 2 -->
+      <path d="M548 565 L558 565" fill="none" stroke="#5B54A8" stroke-width="2" stroke-linecap="round" data-stroke-role="api-line"/>
+      <path d="M554 561 L558 565 L554 569" fill="none" stroke="#5B54A8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="api-line"/>
+
+      <!-- Step 2 -->
+      <rect x="566" y="504" width="158" height="122" rx="10" fill="#28253B" stroke="#5B54A8" stroke-width="1" data-fill-role="api-fill" data-stroke-role="api-line"/>
+      <text x="580" y="532" font-size="14.5" font-weight="700" fill="#D1CDEE" data-fill-role="api-ink" dominant-baseline="central">② 3중 종가 확정</text>
+      <text x="580" y="562" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="api-ink" dominant-baseline="central">15:30 + 마감코드 '3'</text>
+      <text x="580" y="586" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="api-ink" dominant-baseline="central">현재가·호가 일치 검증</text>
+
+      <!-- Arrow 2 -> 3 -->
+      <path d="M732 565 L742 565" fill="none" stroke="#5B54A8" stroke-width="2" stroke-linecap="round" data-stroke-role="api-line"/>
+      <path d="M738 561 L742 565 L738 569" fill="none" stroke="#5B54A8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="api-line"/>
+
+      <!-- Step 3 -->
+      <rect x="750" y="504" width="158" height="122" rx="10" fill="#28253B" stroke="#5B54A8" stroke-width="1" data-fill-role="api-fill" data-stroke-role="api-line"/>
+      <text x="764" y="532" font-size="14.5" font-weight="700" fill="#D1CDEE" data-fill-role="api-ink" dominant-baseline="central">③ tar.zst 봉인 백업</text>
+      <text x="764" y="562" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="api-ink" dominant-baseline="central">세그먼트 해시 검증 후</text>
+      <text x="764" y="586" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="api-ink" dominant-baseline="central">일요일 3종 복구 드릴</text>
+    </g>
+
+    <!-- Right KPI Badge -->
+    <rect x="926" y="504" width="206" height="122" rx="12" fill="#1E3029" stroke="#3F8F72" stroke-width="1.5" data-fill-role="compute-fill" data-stroke-role="compute-line"/>
+    <text x="1029" y="546" font-size="30" font-weight="700" fill="#3F8F72" data-fill-role="compute-line" text-anchor="middle" dominant-baseline="central">0 Errors</text>
+    <text x="1029" y="580" font-size="15" font-weight="700" fill="#E6E8EB" data-fill-role="ink" text-anchor="middle" dominant-baseline="central">중복 주문·정산 오차</text>
+    <text x="1029" y="604" font-size="12.5" font-weight="400" fill="#9BA1A8" data-fill-role="compute-ink" text-anchor="middle" dominant-baseline="central">NAV 오차 0원 · 복구 100%</text>
+  </g>
+</svg>

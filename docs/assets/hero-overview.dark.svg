@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 530" width="1200" height="530" role="img" style="font-family:Pretendard, Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <title>K-Closing Alpha 핵심 엔지니어링 지표 및 일일 파이프라인</title>
+  <desc>15:20 시점 분리 무누출 추론, 실측 마찰비용 차감 후 Sharpe 2.73, 886거래일 118개 전략 백테스트 및 4,688개 테스트로 검증된 개요</desc>
+  <defs>
+    <filter id="card-shadow" x="-8%" y="-8%" width="116%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="0.35" data-paint-static="true"/>
+    </filter>
+  </defs>
+  <rect width="1200" height="530" fill="#16191E" data-fill-role="canvas"/>
+
+  <!-- Header -->
+  <g>
+    <rect data-fill-role="focus" x="48" y="47" width="6" height="42" rx="3" fill="#2E6DA4"/>
+    <text data-fill-role="muted" x="70" y="38" font-size="13.5" font-weight="700" letter-spacing="0.08em" fill="#9BA1A8" dominant-baseline="central">K-CLOSING ALPHA · CLOSING AUCTION ML &amp; EXECUTION PLATFORM</text>
+    <text data-fill-role="ink" x="70" y="68" font-size="28" font-weight="700" fill="#E6E8EB" dominant-baseline="central">15:20 무누출 시점 분리 추론 &amp; 멱등 주문 실행 플랫폼</text>
+    <text data-fill-role="ink" x="70" y="100" font-size="15" font-weight="400" fill="#9BA1A8" dominant-baseline="central">15:20 PIT 무누출 피처 · LightGBM 비용인식 랭커 · 886거래일 118개 전략 백테스트 검증</text>
+  </g>
+
+  <!-- 3 Key Metric Cards -->
+  <!-- Card 1 -->
+  <g>
+    <rect x="48" y="136" width="352" height="236" rx="16" fill="#20242B" stroke="#2E6DA4" stroke-width="1.5" data-fill-role="surface" data-stroke-role="edge-line" filter="url(#card-shadow)"/>
+    <rect x="70" y="158" width="160" height="28" rx="14" fill="#1D2B3A" stroke="#2E6DA4" stroke-width="1" data-fill-role="edge-fill" data-stroke-role="edge-line"/>
+    <text x="150" y="172" font-size="12" font-weight="700" letter-spacing="0.06em" fill="#B0D3F0" data-fill-role="edge-ink" text-anchor="middle" dominant-baseline="central">ZERO LOOK-AHEAD</text>
+    <circle cx="360" cy="172" r="22" fill="#1D2B3A" data-fill-role="edge-fill"/>
+    <g transform="translate(348,160) scale(1)"><path d="M12 4 A8 8 0 1 0 12 20 A8 8 0 1 0 12 4 M12 8 V12 L15 14" fill="none" stroke="#2E6DA4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="edge-line"/></g>
+
+    <text x="70" y="244" font-size="52" font-weight="700" fill="#E6E8EB" data-fill-role="ink" dominant-baseline="central">0.00%</text>
+    <text x="70" y="296" font-size="19" font-weight="700" fill="#B0D3F0" data-fill-role="edge-ink" dominant-baseline="central">미래 정보 참조율 (인과성 보장)</text>
+    <text x="70" y="328" font-size="14.5" font-weight="400" fill="#9BA1A8" data-fill-role="edge-ink" dominant-baseline="central">15:20 결정가·15:30 확정종가 물리 분리</text>
+  </g>
+
+  <!-- Card 2 -->
+  <g>
+    <rect x="424" y="136" width="352" height="236" rx="16" fill="#20242B" stroke="#3F8F72" stroke-width="1.5" data-fill-role="surface" data-stroke-role="compute-line" filter="url(#card-shadow)"/>
+    <rect x="446" y="158" width="160" height="28" rx="14" fill="#1E3029" stroke="#3F8F72" stroke-width="1" data-fill-role="compute-fill" data-stroke-role="compute-line"/>
+    <text x="526" y="172" font-size="12" font-weight="700" letter-spacing="0.06em" fill="#AEE0CE" data-fill-role="compute-ink" text-anchor="middle" dominant-baseline="central">NET ALPHA · SHARPE</text>
+    <circle cx="736" cy="172" r="22" fill="#1E3029" data-fill-role="compute-fill"/>
+    <g transform="translate(724,160) scale(1)"><path d="M2 12 L7 12 L10 5 L14 19 L17 12 L22 12" fill="none" stroke="#3F8F72" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="compute-line"/></g>
+
+    <text x="446" y="244" font-size="52" font-weight="700" fill="#E6E8EB" data-fill-role="ink" dominant-baseline="central">2.73</text>
+    <text x="446" y="296" font-size="19" font-weight="700" fill="#AEE0CE" data-fill-role="compute-ink" dominant-baseline="central">일평균 +34.58bp 순수익</text>
+    <text x="446" y="328" font-size="14.5" font-weight="400" fill="#9BA1A8" data-fill-role="compute-ink" dominant-baseline="central">세금·왕복 2틱·수수료 전액 실측 차감</text>
+  </g>
+
+  <!-- Card 3 -->
+  <g>
+    <rect x="800" y="136" width="352" height="236" rx="16" fill="#20242B" stroke="#5B54A8" stroke-width="1.5" data-fill-role="surface" data-stroke-role="api-line" filter="url(#card-shadow)"/>
+    <rect x="822" y="158" width="168" height="28" rx="14" fill="#28253B" stroke="#5B54A8" stroke-width="1" data-fill-role="api-fill" data-stroke-role="api-line"/>
+    <text x="906" y="172" font-size="11.5" font-weight="700" letter-spacing="0.04em" fill="#D1CDEE" data-fill-role="api-ink" text-anchor="middle" dominant-baseline="central">QUANT EVALUATION</text>
+    <circle cx="1112" cy="172" r="22" fill="#28253B" data-fill-role="api-fill"/>
+    <g transform="translate(1100,160) scale(1)"><path d="M12 3 L20 6 V12 C20 17 16 20 12 21 C8 20 4 17 4 12 V6 Z" fill="none" stroke="#5B54A8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="api-line"/></g>
+
+    <text x="822" y="244" font-size="52" font-weight="700" fill="#E6E8EB" data-fill-role="ink" dominant-baseline="central">886일</text>
+    <text x="822" y="296" font-size="19" font-weight="700" fill="#D1CDEE" data-fill-role="api-ink" dominant-baseline="central">무누출 백테스트 검증</text>
+    <text x="822" y="328" font-size="14.5" font-weight="400" fill="#9BA1A8" data-fill-role="api-ink" dominant-baseline="central">118개 전략 탐색 · 4,688개 테스트</text>
+  </g>
+
+  <!-- Bottom 4-Stage Horizontal Pipeline Strip -->
+  <g>
+    <rect x="48" y="394" width="1104" height="106" rx="14" fill="#20242B" stroke="#333842" stroke-width="1.5" data-fill-role="surface" data-stroke-role="rule" filter="url(#card-shadow)"/>
+
+    <!-- Stage 1 -->
+    <text x="74" y="434" font-size="15.5" font-weight="700" fill="#E6E8EB" data-fill-role="ink" dominant-baseline="central">01. 단면 수집 &amp; 심사 (15:20)</text>
+    <text x="74" y="466" font-size="13.5" font-weight="400" fill="#9BA1A8" data-fill-role="ink" dominant-baseline="central">1틱 ≤12bp 필터 · 10호가/수급 캡처</text>
+
+    <!-- Chevron 1 -->
+    <path d="M308 440 L318 447 L308 454" fill="none" stroke="#2E6DA4" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="focus"/>
+
+    <!-- Stage 2 -->
+    <text x="350" y="434" font-size="15.5" font-weight="700" fill="#E6E8EB" data-fill-role="ink" dominant-baseline="central">02. Top-3 추론 &amp; 진입 (15:21)</text>
+    <text x="350" y="466" font-size="13.5" font-weight="400" fill="#9BA1A8" data-fill-role="ink" dominant-baseline="central">27차원 PIT 피처 · 멱등 주문 저널</text>
+
+    <!-- Chevron 2 -->
+    <path d="M584 440 L594 447 L584 454" fill="none" stroke="#3F8F72" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="positive"/>
+
+    <!-- Stage 3 -->
+    <text x="626" y="434" font-size="15.5" font-weight="700" fill="#E6E8EB" data-fill-role="ink" dominant-baseline="central">03. 3중 종가 확정 (15:30)</text>
+    <text x="626" y="466" font-size="13.5" font-weight="400" fill="#9BA1A8" data-fill-role="ink" dominant-baseline="central">단일가코드 '3' 대조 · 원장 대사</text>
+
+    <!-- Chevron 3 -->
+    <path d="M860 440 L870 447 L860 454" fill="none" stroke="#2E6DA4" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="focus"/>
+
+    <!-- Stage 4 -->
+    <text x="902" y="434" font-size="15.5" font-weight="700" fill="#E6E8EB" data-fill-role="ink" dominant-baseline="central">04. 시초가 청산 &amp; 백업 (09:00)</text>
+    <text x="902" y="466" font-size="13.5" font-weight="400" fill="#9BA1A8" data-fill-role="ink" dominant-baseline="central">기계적 전량 청산 · tar.zst 봉인</text>
+  </g>
+</svg>
