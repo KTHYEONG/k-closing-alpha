@@ -467,3 +467,205 @@ def test_core_snapshot_accepted_missing_releases_latch(tmp_path: Path, monkeypat
     current = [e for e in uploaded if e.relpath == "data/history/price_history.parquet"]
     assert validate_core_panels(current, uploaded) == []
     assert dataclasses.is_dataclass(uploaded[0])
+
+
+def _form_project(tmp_path: Path) -> Path:
+    import pandas as pd
+
+    from src.data.parquet_codec import write_price_history_parquet
+    from src.strategy.contract import derive_chg_ratio
+    from src.tools.price_history_offsite import export_offsite_form
+
+    days = pd.bdate_range("2026-07-28", "2026-09-04")
+    frame = pd.DataFrame([{"date": d, "symbol": s, "open": 100 + i, "high": 105 + i, "low": 95 + i, "close": 100 + i,
+                           "prev_close": 99 + i, "close_raw": 100.0 + i, "volume": 10, "market": "KOSPI"}
+                          for s in ("000020", "005930") for i, d in enumerate(days)])
+    frame["daily_change_pct"] = derive_chg_ratio(frame["close"].to_numpy(float), frame["prev_close"].to_numpy(float))
+    source = tmp_path / "data/history/price_history.parquet"
+    source.parent.mkdir(parents=True)
+    write_price_history_parquet(frame, source)
+    export_offsite_form(source, tmp_path / "data/history/price_history_offsite")
+    return source
+
+
+def test_core_snapshot_carries_price_history_form_with_shared_blobs(tmp_path: Path, monkeypatch) -> None:
+    import pandas as pd
+
+    from src.tools.core_snapshot import CORE_SNAPSHOT_BLOB_ROOT, CORE_SNAPSHOT_REMOTE_ROOT, run_core_snapshot
+    from src.tools.price_history_offsite import rebuild_frame
+
+    monkeypatch.setattr("src.tools.core_snapshot._resolve_rclone_bin", lambda: "rclone")
+    source = _form_project(tmp_path)
+    restored = tmp_path / "restore"
+    calls: list[list[str]] = []
+    remote_blobs = {"base/year=2026/month=07-0000000000000000.parquet"}  # an orphan from an older base
+
+    def _run(cmd, **kwargs):
+        import shutil
+
+        calls.append(list(cmd))
+        if cmd[1] == "lsf" and cmd[2] == "--dirs-only":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1] == "lsf" and cmd[-1] == CORE_SNAPSHOT_BLOB_ROOT:
+            return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(sorted(remote_blobs)), stderr="")
+        if cmd[1] == "lsf":
+            files = sorted(p.relative_to(restored).as_posix() for p in restored.rglob("*") if p.is_file() and not p.name.startswith("base"))
+            return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(f for f in files if "/" not in f), stderr="")
+        if cmd[1] == "copy":
+            # Stage both uploads into one restore directory, as the documented restore does.
+            src = Path(cmd[2])
+            for path in src.rglob("*"):
+                if path.is_file():
+                    rel = path.relative_to(src)
+                    if cmd[3] != CORE_SNAPSHOT_BLOB_ROOT:
+                        rel = rel.relative_to("data/history/price_history_offsite") if rel.parts[:3] == ("data", "history", "price_history_offsite") else None
+                    if rel is not None:
+                        (restored / rel).parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(path, restored / rel)
+            if cmd[3] == f"{CORE_SNAPSHOT_REMOTE_ROOT}/2026-09-28/":
+                assert not (src / "data/history/price_history.parquet").exists()
+                assert (src / "data/history/price_history_offsite/_manifest.json").exists()
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1] == "cat":
+            return subprocess.CompletedProcess(cmd, 0, stdout=(restored / "_manifest.json").read_text(), stderr="")
+        if cmd[1] == "delete":
+            listing = Path(cmd[cmd.index("--files-from-raw") + 1]).read_text().split()
+            assert listing == sorted(remote_blobs)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected call: {cmd}")
+
+    # When the weekly snapshot runs with a fresh nightly form
+    run_core_snapshot(tmp_path, today=date(2026, 9, 28), run_fn=_run)
+
+    # Then blobs upload before the snapshot, the snapshot carries no monolith, orphan blobs are swept,
+    # and the uploaded pieces rebuild the monolith exactly
+    copies = [c[3] for c in calls if c[1] == "copy"]
+    assert copies == [CORE_SNAPSHOT_BLOB_ROOT, f"{CORE_SNAPSHOT_REMOTE_ROOT}/2026-09-28/"]
+    assert any(c[1] == "delete" for c in calls)
+    pd.testing.assert_frame_equal(rebuild_frame(restored), pd.read_parquet(source), check_exact=True)
+
+
+def test_core_snapshot_falls_back_to_monolith_when_form_is_stale(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.core_snapshot import run_core_snapshot
+
+    monkeypatch.setattr("src.tools.core_snapshot._resolve_rclone_bin", lambda: "rclone")
+    _form_project(tmp_path)
+    import json as _json
+
+    manifest = tmp_path / "data/history/price_history_offsite/_manifest.json"
+    raw = _json.loads(manifest.read_text())
+    raw["source_sha256"] = "0" * 64
+    manifest.write_text(_json.dumps(raw))
+    uploaded: list[Path] = []
+
+    def _run(cmd, **kwargs):
+        if cmd[1] == "lsf":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1] == "copy":
+            uploaded.append(Path(cmd[2]))
+            assert (Path(cmd[2]) / "data/history/price_history.parquet").exists()
+            assert not (Path(cmd[2]) / "data/history/price_history_offsite").exists()
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected call: {cmd}")
+
+    # When the nightly form was built from another monolith / Then the snapshot carries the monolith itself
+    run_core_snapshot(tmp_path, today=date(2026, 9, 28), run_fn=_run)
+    assert len(uploaded) == 1
+
+
+def test_price_history_form_with_missing_file_is_not_usable(tmp_path: Path) -> None:
+    from src.tools.core_snapshot import collect_core_stats, usable_price_history_form
+
+    _form_project(tmp_path)
+    stat = next(s for s in collect_core_stats(tmp_path) if s.relpath == "data/history/price_history.parquet")
+    assert usable_price_history_form(tmp_path, stat) is not None
+    next((tmp_path / "data/history/price_history_offsite").glob("patch-*.parquet")).unlink()
+    assert usable_price_history_form(tmp_path, stat) is None
+
+
+def test_core_snapshot_blob_listing_failure_aborts_before_upload(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.tools.core_snapshot import CORE_SNAPSHOT_BLOB_ROOT, run_core_snapshot
+
+    monkeypatch.setattr("src.tools.core_snapshot._resolve_rclone_bin", lambda: "rclone")
+    _form_project(tmp_path)
+
+    def _run(cmd, **kwargs):
+        if cmd[1] == "lsf" and cmd[-1] == CORE_SNAPSHOT_BLOB_ROOT:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="quota")
+        if cmd[1] == "lsf":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected call: {cmd}")
+
+    with pytest.raises(RuntimeError, match="blob listing failed"):
+        run_core_snapshot(tmp_path, today=date(2026, 9, 28), run_fn=_run)
+
+
+def test_blob_gc_keeps_everything_when_a_snapshot_is_unreadable() -> None:
+    from src.tools.core_snapshot import CORE_SNAPSHOT_REMOTE_ROOT, _gc_price_history_blobs
+
+    blobs = {"base/year=2026/month=07-aaaa.parquet"}
+
+    def _runner(lsf_rc: dict[str, int], cat_rc: int):
+        def _run(cmd, **kwargs):
+            if cmd[1] == "lsf":
+                name = cmd[-1].removeprefix(CORE_SNAPSHOT_REMOTE_ROOT + "/").split("/")[0]
+                rc = lsf_rc[name]
+                return subprocess.CompletedProcess(cmd, rc, stdout="_manifest.json\n" if rc == 0 else "", stderr="")
+            if cmd[1] == "cat":
+                return subprocess.CompletedProcess(cmd, cat_rc, stdout="{}", stderr="")
+            raise AssertionError(f"no delete may run: {cmd}")
+        return _run
+
+    # A pre-form snapshot (no form dir) references nothing, but an unlistable one aborts the sweep
+    assert _gc_price_history_blobs("rclone", ["2026-08-30", "2026-09-06"], blobs, _runner({"2026-08-30": 3, "2026-09-06": 1}, 0)) == 0
+    # A manifest that cannot be read also aborts the sweep
+    assert _gc_price_history_blobs("rclone", ["2026-09-06"], blobs, _runner({"2026-09-06": 0}, 1)) == 0
+    assert _gc_price_history_blobs("rclone", ["2026-09-06"], blobs, _runner({"2026-09-06": 0}, 0)) == 0
+
+
+def test_blob_gc_noop_when_all_referenced_and_raises_on_delete_failure() -> None:
+    import pytest
+
+    from src.tools.core_snapshot import _gc_price_history_blobs
+
+    manifest = json.dumps({"schema_version": 1, "source_sha256": "s", "rows": 0, "columns": [], "files": [
+        {"relpath": "base/year=2026/month=07-aaaa.parquet", "kind": "base", "md5": "a", "bytes": 1, "rows": 0},
+        {"relpath": "patch-b.parquet", "kind": "patch", "md5": "b", "bytes": 1, "rows": 0},
+        {"relpath": "deletes-c.parquet", "kind": "deletes", "md5": "c", "bytes": 1, "rows": 0}]})
+
+    def _run(cmd, **kwargs):
+        if cmd[1] == "lsf":
+            return subprocess.CompletedProcess(cmd, 0, stdout="_manifest.json\n", stderr="")
+        if cmd[1] == "cat":
+            return subprocess.CompletedProcess(cmd, 0, stdout=manifest, stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="drive error")
+
+    # All blobs referenced: nothing to delete
+    assert _gc_price_history_blobs("rclone", ["2026-09-06"], {"base/year=2026/month=07-aaaa.parquet"}, _run) == 0
+    # An orphan whose delete fails raises
+    with pytest.raises(RuntimeError, match="blob gc failed"):
+        _gc_price_history_blobs("rclone", ["2026-09-06"], {"base/year=2026/month=07-aaaa.parquet", "base/x.parquet"}, _run)
+
+
+def test_core_snapshot_blob_upload_failure_blocks_snapshot(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from src.tools.core_snapshot import run_core_snapshot
+
+    monkeypatch.setattr("src.tools.core_snapshot._resolve_rclone_bin", lambda: "rclone")
+    _form_project(tmp_path)
+    copies: list[str] = []
+
+    def _run(cmd, **kwargs):
+        if cmd[1] == "lsf":
+            return subprocess.CompletedProcess(cmd, 3 if "-R" in cmd else 0, stdout="", stderr="")
+        if cmd[1] == "copy":
+            copies.append(cmd[3])
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="quota")
+        raise AssertionError(f"unexpected call: {cmd}")
+
+    with pytest.raises(RuntimeError, match="blob upload failed"):
+        run_core_snapshot(tmp_path, today=date(2026, 9, 28), run_fn=_run)
+    assert len(copies) == 1  # the snapshot itself is never uploaded without its blobs
