@@ -842,6 +842,7 @@ Baselines (trailing rule: compare with the prev-5 trading-day median, never with
 Known conditions:
 | Since | Condition | Expected verdict while open | Re-check / expiry | Close when |
 |---|---|---|---|---|
+| 2026-11-03 | Local capture backlog: on 10-30 a sweep rewrote 85 old-date `raw/` dirs (2026-01..10); `capture_prune` drains it under its time budget (`status=DEADLINE`, removed 82 on 11-02, one `rclone md5sum` per sealed entry), disk 35% | B05 WARN `kept_local_pre_prune` shrinking each run | 2026-11-05 M | still listing 2026-0x dirs at 11-05 M → prune throughput defect (batch md5 via one `lsjson --hash` instead of per-entry `md5sum`) |
 | 2026-11-02 | D1 prune purge cap 7 per subtree vs daily backup | B05 PASS; FAIL `cap_risk` after a ≥1-week prune outage | 2026-12-01 | cap sized from the backup cadence (fix pending) |
 | 2026-11-02 | D2 `audit_daily_completeness` omits `intraday_complete` (added in `main()` :2308) | C11 derives it from the journal | 2026-12-01 | helper returns 8 keys (fix pending) |
 | 2026-11-02 | D3 heartbeat severity fallback parses the subject (`daily_audit.py:1910-1913`) | none (latent) | 2026-12-01 | fix pending |
