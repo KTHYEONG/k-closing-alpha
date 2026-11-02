@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -21,6 +23,17 @@ from src.data.io_utils import atomic_write_text
 from src.tools.capture_offsite import OffsiteConfig, SealReport, seal_and_upload
 from src.tools.offsite_common import OFFSITE_REMOTE_BASE
 from src.tools.offsite_common import resolve_rclone_bin as _resolve_rclone_bin
+from src.tools.price_history_offsite import (
+    MANIFEST_NAME as PRICE_HISTORY_FORM_MANIFEST,
+)
+from src.tools.price_history_offsite import (
+    OFFSITE_FORM_RELPATH as PRICE_HISTORY_FORM_RELPATH,
+)
+from src.tools.price_history_offsite import (
+    PRICE_HISTORY_RELPATH,
+    ExportReport,
+    export_offsite_form,
+)
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -35,6 +48,11 @@ LOOSE_EXCLUDES: tuple[str, ...] = (
     "/history/capture/manifests/**",
     "/history/capture/backups/**",
     "/history/capture/staging/offsite/**",
+    # The full-rewrite monolith travels as its base + patch form (price_history_offsite), uploaded by its own step.
+    "/history/price_history.parquet",
+    "/history/price_history_offsite/**",
+    # Append-only seal ledgers are uploaded by their own step without _deleted versioning.
+    "/history/capture/offsite/ledger/**",
 )
 LOOSE_RCLONE_FLAGS: tuple[str, ...] = ("--transfers", "4", "--checkers", "8")
 BACKUP_SLOT_KST: time = time(22, 15)
@@ -51,6 +69,10 @@ BACKUP_DEFERRED_MAX_AGE_DAYS: int = 21
 RCLONE_DURATION_EXCEEDED_EXIT: int = 10
 # 개별 복사의 하드 서브프로세스 타임아웃 — 유닛 백스톱(TimeoutStartSec=3h)보다 길어 먼저 끊기지 않는다
 LOOSE_RCLONE_TIMEOUT_SEC: int = 4 * 3600
+PRICE_HISTORY_FORM_STEP: str = "price_history_form"
+LEDGER_STEP: str = "offsite_ledger"
+LEDGER_RELPATH: str = "offsite/ledger"
+LEDGER_UPLOAD_STATE_RELPATH: str = "offsite/ledger_upload_state.json"
 
 
 @dataclass(frozen=True)
@@ -312,6 +334,148 @@ def loose_copy_command(
     return cmd
 
 
+def price_history_form_commands(rclone: str, project_root: Path, snapshot_day: str) -> list[list[str]]:
+    """Ordered rclone calls that publish the price_history base + patch form crash-consistently.
+
+    Content-named files go first (--immutable: never overwritten), then the
+    manifest that references them, and only then a sync retires files the new
+    manifest no longer lists into _deleted/data/<day>, so the remote manifest
+    always references files that are present.
+    """
+    local = str(project_root / PRICE_HISTORY_FORM_RELPATH)
+    remote = f"{BACKUP_REMOTE_BASE}/{PRICE_HISTORY_FORM_RELPATH}"
+    retired = f"{BACKUP_REMOTE_BASE}/_deleted/data/{snapshot_day}/{PRICE_HISTORY_FORM_RELPATH.removeprefix('data/')}"
+    manifest = f"/{PRICE_HISTORY_FORM_MANIFEST}"
+    return [
+        [rclone, "copy", local, remote, "--exclude", manifest, "--immutable", *LOOSE_RCLONE_FLAGS],
+        [rclone, "copy", local, remote, "--include", manifest, "--backup-dir", retired],
+        [rclone, "sync", local, remote, "--backup-dir", retired, *LOOSE_RCLONE_FLAGS],
+    ]
+
+
+def _retire_remote_monolith_commands(rclone: str, snapshot_day: str) -> tuple[list[str], list[str]]:
+    remote = f"{BACKUP_REMOTE_BASE}/{PRICE_HISTORY_RELPATH}"
+    parked = f"{BACKUP_REMOTE_BASE}/_deleted/data/{snapshot_day}/{PRICE_HISTORY_RELPATH.removeprefix('data/')}"
+    return [rclone, "lsf", remote], [rclone, "moveto", remote, parked]
+
+
+def _run_price_history_form(
+    project_root: Path,
+    rclone: str,
+    snapshot_day: str,
+    core_issues: Sequence[str],
+    run_fn: Callable[..., subprocess.CompletedProcess[str]],
+    export_fn: Callable[[Path, Path], ExportReport],
+) -> dict[str, Any]:
+    if not (project_root / PRICE_HISTORY_RELPATH).exists():
+        return {"status": "ok", "skipped": "source_absent"}
+    if any(issue.startswith(f"core_panel:{PRICE_HISTORY_RELPATH}:") for issue in core_issues):
+        # A suspect monolith must not overwrite the last good offsite form.
+        return {"status": "failed", "error": "core_panel_issue"}
+    try:
+        report = export_fn(project_root / PRICE_HISTORY_RELPATH, project_root / PRICE_HISTORY_FORM_RELPATH)
+    except Exception as exc:
+        return {"status": "failed", "error": f"export {type(exc).__name__}: {exc}"}
+    step: dict[str, Any] = {
+        "status": "ok",
+        "rebased": report.rebased,
+        "files": report.files,
+        "written": len(report.written),
+        "patch_rows": report.patch_rows,
+        "delete_rows": report.delete_rows,
+        "rows": report.rows,
+    }
+    for cmd in price_history_form_commands(rclone, project_root, snapshot_day):
+        result = run_fn(cmd, capture_output=True, text=True, timeout=LOOSE_RCLONE_TIMEOUT_SEC, check=False)
+        if result.returncode != 0:
+            return {**step, "status": "failed", "returncode": result.returncode, "stderr": (result.stderr or "")[-2000:]}
+    # One-time: park the frozen pre-form monolith so a data/ restore cannot pick up a stale copy.
+    listing, move = _retire_remote_monolith_commands(rclone, snapshot_day)
+    listed = run_fn(listing, capture_output=True, text=True, timeout=LOOSE_RCLONE_TIMEOUT_SEC, check=False)
+    if listed.returncode == 0 and listed.stdout.strip():
+        moved = run_fn(move, capture_output=True, text=True, timeout=LOOSE_RCLONE_TIMEOUT_SEC, check=False)
+        step["retired_monolith"] = moved.returncode == 0
+    return step
+
+
+def _prefix_sha256(path: Path, size: int) -> str:
+    # Seal ledgers stay in the tens of MiB, so one bounded read is fine.
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read(size)).hexdigest()
+
+
+def classify_ledger_files(capture_root: Path) -> tuple[list[str], list[str], list[str], dict[str, list[Any]]]:
+    """Split changed seal-ledger files by what the last uploaded state proves about them.
+
+    A file is a proven append when its first `size` bytes still hash to the
+    digest recorded at its last upload: the remote copy is then a strict prefix
+    of the local one, so it may be overwritten without a `_deleted` version.
+
+    Returns:
+        (appended, unproven, rewritten, next state): appended files are proven
+        appends; unproven files have no recorded upload (new, or first run);
+        rewritten files contradict their recorded prefix. Relpaths are relative
+        to the ledger directory; unchanged files are in no list.
+    """
+    ledger_dir = Path(capture_root) / LEDGER_RELPATH
+    try:
+        raw: object = json.loads((Path(capture_root) / LEDGER_UPLOAD_STATE_RELPATH).read_text(encoding="utf-8"))
+        previous = raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError):
+        previous = {}
+    appended: list[str] = []
+    unproven: list[str] = []
+    rewritten: list[str] = []
+    state: dict[str, list[Any]] = {}
+    for path in sorted(ledger_dir.rglob("*.jsonl")) if ledger_dir.is_dir() else []:
+        rel = path.relative_to(ledger_dir).as_posix()
+        size = path.stat().st_size
+        state[rel] = [size, _prefix_sha256(path, size)]
+        old = previous.get(rel)
+        if old == state[rel]:
+            continue
+        if not (isinstance(old, list) and len(old) == 2 and isinstance(old[0], int) and isinstance(old[1], str)):
+            unproven.append(rel)
+        elif size >= old[0] and _prefix_sha256(path, old[0]) == old[1]:
+            appended.append(rel)
+        else:
+            rewritten.append(rel)
+    return appended, unproven, rewritten, state
+
+
+def _run_ledger_upload(
+    project_root: Path, capture_root: Path, rclone: str, snapshot_day: str, run_fn: Callable[..., subprocess.CompletedProcess[str]]
+) -> dict[str, Any]:
+    try:
+        rel_capture = Path(capture_root).resolve().relative_to((Path(project_root) / "data").resolve()).as_posix()
+    except ValueError:
+        return {"status": "ok", "skipped": "capture_root_outside_data"}
+    appended, unproven, rewritten, state = classify_ledger_files(capture_root)
+    remote = f"{BACKUP_REMOTE_BASE}/data/{rel_capture}/{LEDGER_RELPATH}"
+    retired = f"{BACKUP_REMOTE_BASE}/_deleted/data/{snapshot_day}/{rel_capture}/{LEDGER_RELPATH}"
+    local = str(Path(capture_root) / LEDGER_RELPATH)
+    batches: tuple[tuple[str, list[str], list[str]], ...] = (
+        ("appended", appended, []),
+        ("versioned", [*unproven, *rewritten], ["--backup-dir", retired]),
+    )
+    with tempfile.TemporaryDirectory(prefix="offsite-ledger-") as scratch:
+        for name, files, extra in batches:
+            if not files:
+                continue
+            listing = Path(scratch) / f"{name}.txt"
+            listing.write_text("".join(f"{rel}\n" for rel in files), encoding="utf-8")
+            cmd = [rclone, "copy", local, remote, "--files-from-raw", str(listing), *extra, *LOOSE_RCLONE_FLAGS]
+            result = run_fn(cmd, capture_output=True, text=True, timeout=LOOSE_RCLONE_TIMEOUT_SEC, check=False)
+            if result.returncode != 0:
+                return {"status": "failed", "returncode": result.returncode, "stderr": (result.stderr or "")[-2000:]}
+    atomic_write_text(Path(capture_root) / LEDGER_UPLOAD_STATE_RELPATH, json.dumps(state, sort_keys=True), mode=None)
+    step: dict[str, Any] = {"status": "ok", "appended": len(appended), "unproven": len(unproven), "rewritten": len(rewritten)}
+    if rewritten:
+        # Uploaded with a _deleted version, but a rewrite of an append-only ledger is an anomaly to alert on.
+        step.update(status="failed", error="ledger_not_append_only", files=rewritten[:20])
+    return step
+
+
 def _load_previous_core_panels(capture_root: Path) -> list[dict[str, Any]]:
     path = capture_root / REPORT_RELPATH
     if not path.exists():
@@ -368,10 +532,11 @@ def run_offsite_backup(
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     seal_fn: Callable[..., SealReport] = seal_and_upload,
     accepted_missing: frozenset[str] = frozenset(),
+    price_history_export_fn: Callable[[Path, Path], ExportReport] = export_offsite_form,
 ) -> BackupRunReport:
-    """Run one nightly offsite backup: seal capture segments, then loose copies.
+    """Run one nightly offsite backup: price_history form, seal capture segments, then loose copies.
 
-    Steps run in order capture_seal -> data -> artifacts so the offsite
+    Steps run in order price_history_form -> capture_seal -> data -> artifacts so the offsite
     ledger committed by sealing is carried by the same night's data copy.
     A failing step does not skip later steps (partial offsite progress beats
     none); the report is persisted before the overall outcome is raised.
@@ -409,6 +574,7 @@ def run_offsite_backup(
                 run_fn=run_fn,
                 seal_fn=seal_fn,
                 accepted_missing=accepted_missing,
+                export_fn=price_history_export_fn,
             )
         except Exception as exc:
             run_report = BackupRunReport(
@@ -458,6 +624,7 @@ def _run_offsite_backup_inner(
     run_fn: Callable[..., subprocess.CompletedProcess[str]],
     seal_fn: Callable[..., SealReport],
     accepted_missing: frozenset[str],
+    export_fn: Callable[[Path, Path], ExportReport],
 ) -> BackupRunReport:
     rclone = _resolve_rclone_bin()
     steps: dict[str, dict[str, Any]] = {}
@@ -483,6 +650,8 @@ def _run_offsite_backup_inner(
     else:
         steps["core_panels"] = {"status": "ok", "issues": []}
 
+    steps[PRICE_HISTORY_FORM_STEP] = _run_price_history_form(project_root, rclone, snapshot_day, core_issues, run_fn, export_fn)
+
     try:
         report = seal_fn(capture_root, today=today, full_scan=full_scan, deadline=kst + BACKUP_SEAL_BUDGET)
         steps["capture_seal"] = {
@@ -497,6 +666,11 @@ def _run_offsite_backup_inner(
         }
     except Exception as exc:
         steps["capture_seal"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+
+    try:
+        steps[LEDGER_STEP] = _run_ledger_upload(project_root, capture_root, rclone, snapshot_day, run_fn)
+    except Exception as exc:
+        steps[LEDGER_STEP] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
     for subtree in LOOSE_SUBTREES:
         remaining_s = max(60, int(((kst + BACKUP_TOTAL_BUDGET) - datetime.now(KST)).total_seconds()))

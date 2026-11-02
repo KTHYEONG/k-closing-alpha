@@ -34,8 +34,11 @@ def test_loose_copy_data_excludes_segment_tiers_and_local_snapshots() -> None:
     assert cmd[cmd.index("--backup-dir") + 1] == f"{BACKUP_REMOTE_BASE}/_deleted/data/2026-09-18"
     for pattern in LOOSE_EXCLUDES:
         assert pattern in cmd
-    assert len(LOOSE_EXCLUDES) == 5
+    assert len(LOOSE_EXCLUDES) == 8
+    assert "/history/capture/offsite/ledger/**" in LOOSE_EXCLUDES
     assert "/history/capture/manifests/**" in LOOSE_EXCLUDES
+    assert "/history/price_history.parquet" in LOOSE_EXCLUDES
+    assert "/history/price_history_offsite/**" in LOOSE_EXCLUDES
     assert "--transfers" in cmd and "4" in cmd
     assert "sync" not in cmd
     assert "--fast-list" not in cmd
@@ -479,6 +482,7 @@ def test_offsite_backup_accepted_missing_persists_current_baseline(tmp_path: Pat
 
     from src.tools.capture_offsite import SealReport
     from src.tools.offsite_backup import REPORT_RELPATH, run_offsite_backup
+    from src.tools.price_history_offsite import ExportReport
 
     monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
     project = tmp_path / "proj_acc"
@@ -519,8 +523,12 @@ def test_offsite_backup_accepted_missing_persists_current_baseline(tmp_path: Pat
     def _run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
+    def _export(source: Path, out_dir: Path) -> ExportReport:
+        return ExportReport(files=3, written=(), removed=(), rebased=False, patch_rows=0, delete_rows=0, rows=10, source_sha256="c" * 64)
+
     report = run_offsite_backup(
-        project, capture, now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal, accepted_missing=frozenset({"data/paper/x.parquet"})
+        project, capture, now=_now_kst("2026-09-18"), run_fn=_run, seal_fn=_seal,
+        accepted_missing=frozenset({"data/paper/x.parquet"}), price_history_export_fn=_export,
     )
     assert report.status == "ok"
     assert report.steps["core_panels"]["status"] == "ok"
@@ -1330,3 +1338,219 @@ def test_backlog_info_none_when_ok_report_has_nothing_deferred(tmp_path: Path) -
         encoding="utf-8",
     )
     assert backup_backlog_info(report, _now_kst("2026-10-06", "20:15:00")) is None
+
+
+def test_price_history_form_commands_publish_files_then_manifest_then_retire() -> None:
+    from src.tools.offsite_backup import BACKUP_REMOTE_BASE, price_history_form_commands
+
+    # Given the form upload for one night
+    cmds = price_history_form_commands("rclone", Path("/proj"), "2026-11-02")
+    remote = f"{BACKUP_REMOTE_BASE}/data/history/price_history_offsite"
+    retired = f"{BACKUP_REMOTE_BASE}/_deleted/data/2026-11-02/history/price_history_offsite"
+
+    # Then content-named files go first and immutable, the manifest second, and the retiring sync last
+    assert [c[1] for c in cmds] == ["copy", "copy", "sync"]
+    assert all(c[2] == "/proj/data/history/price_history_offsite" and c[3] == remote for c in cmds)
+    assert "--immutable" in cmds[0] and cmds[0][cmds[0].index("--exclude") + 1] == "/_manifest.json"
+    assert cmds[1][cmds[1].index("--include") + 1] == "/_manifest.json"
+    assert cmds[1][cmds[1].index("--backup-dir") + 1] == retired
+    assert cmds[2][cmds[2].index("--backup-dir") + 1] == retired
+
+
+def _form_report():
+    from src.tools.price_history_offsite import ExportReport
+
+    return ExportReport(files=3, written=("patch-x.parquet",), removed=(), rebased=False, patch_rows=7, delete_rows=0, rows=10, source_sha256="c" * 64)
+
+
+def test_price_history_form_runs_before_seal_and_retires_stale_monolith(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import BACKUP_REMOTE_BASE, run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    _write_core_parquet(tmp_path / "data/history/price_history.parquet", 10, "2026-10-30")
+    order: list[str] = []
+    calls: list[list[str]] = []
+
+    def _export(source: Path, out_dir: Path):
+        order.append("export")
+        return _form_report()
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        order.append("capture_seal")
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        calls.append(cmd)
+        order.append(f"{cmd[1]}:{Path(cmd[2]).name}")
+        stdout = "price_history.parquet\n" if cmd[1] == "lsf" else ""
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    # When the nightly backup runs
+    report = run_offsite_backup(tmp_path, tmp_path / "capture", now=_now_kst("2026-11-02", "22:15:00"), run_fn=_run, seal_fn=_seal,
+                                price_history_export_fn=_export)
+
+    # Then the form is exported and uploaded before sealing, and the frozen monolith is parked once
+    step = report.steps["price_history_form"]
+    assert report.status == "ok" and step["status"] == "ok" and step["patch_rows"] == 7 and step["retired_monolith"] is True
+    assert order[:5] == ["export", "copy:price_history_offsite", "copy:price_history_offsite", "sync:price_history_offsite", "lsf:price_history.parquet"]
+    assert order.index("capture_seal") > order.index("sync:price_history_offsite")
+    move = next(c for c in calls if c[1] == "moveto")
+    assert move[2:] == [f"{BACKUP_REMOTE_BASE}/data/history/price_history.parquet",
+                        f"{BACKUP_REMOTE_BASE}/_deleted/data/2026-11-02/history/price_history.parquet"]
+    data_copy = next(c for c in calls if c[1] == "copy" and c[2].endswith("/data"))
+    assert "/history/price_history.parquet" in data_copy and "/history/price_history_offsite/**" in data_copy
+
+
+def test_price_history_form_skips_export_on_core_issue_and_fails_on_upload_error(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import _run_price_history_form
+
+    (tmp_path / "data/history").mkdir(parents=True)
+    (tmp_path / "data/history/price_history.parquet").write_bytes(b"x")
+    exported: list[Path] = []
+
+    def _export(source: Path, out_dir: Path):
+        exported.append(source)
+        return _form_report()
+
+    def _ok(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def _upload_fails(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1 if cmd[1] == "copy" else 0, stdout="", stderr="quota")
+
+    # When the monolith carries a core-panel issue / Then the last good form is left alone
+    suspect = _run_price_history_form(tmp_path, "rclone", "2026-11-02", ["core_panel:data/history/price_history.parquet:rows_shrank"], _ok, _export)
+    assert suspect == {"status": "failed", "error": "core_panel_issue"} and exported == []
+
+    # When an upload call fails / Then the step fails with the rclone evidence and no monolith is moved
+    failed = _run_price_history_form(tmp_path, "rclone", "2026-11-02", [], _upload_fails, _export)
+    assert failed["status"] == "failed" and failed["returncode"] == 1 and failed["stderr"] == "quota"
+    assert "retired_monolith" not in failed
+
+    # When the monolith is absent / Then the step is a no-op success
+    (tmp_path / "data/history/price_history.parquet").unlink()
+    assert _run_price_history_form(tmp_path, "rclone", "2026-11-02", [], _ok, _export) == {"status": "ok", "skipped": "source_absent"}
+
+
+def test_price_history_form_export_error_fails_the_step(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import _run_price_history_form
+
+    (tmp_path / "data/history").mkdir(parents=True)
+    (tmp_path / "data/history/price_history.parquet").write_bytes(b"x")
+
+    def _export(source: Path, out_dir: Path):
+        raise ValueError("does not rebuild")
+
+    def _never(cmd, **kwargs):
+        raise AssertionError(f"no upload after a failed export: {cmd}")
+
+    step = _run_price_history_form(tmp_path, "rclone", "2026-11-02", [], _never, _export)
+    assert step == {"status": "failed", "error": "export ValueError: does not rebuild"}
+
+
+def test_ledger_upload_overwrites_only_proven_appends(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import BACKUP_REMOTE_BASE, LEDGER_UPLOAD_STATE_RELPATH, _run_ledger_upload
+
+    capture = tmp_path / "data/history/capture"
+    ledger = capture / "offsite/ledger/raw"
+    ledger.mkdir(parents=True)
+    (ledger / "2026-10-30.jsonl").write_text('{"segment_name": "a"}\n')
+    (ledger / "2026-10-29.jsonl").write_text('{"segment_name": "b"}\n')
+    calls: list[tuple[list[str], list[str]]] = []
+
+    def _run(cmd, **kwargs):
+        listed = Path(cmd[cmd.index("--files-from-raw") + 1]).read_text().split()
+        calls.append((cmd, listed))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    retired = f"{BACKUP_REMOTE_BASE}/_deleted/data/2026-11-02/history/capture/offsite/ledger"
+
+    # When nothing was uploaded before / Then every file goes through the versioned route
+    first = _run_ledger_upload(tmp_path, capture, "rclone", "2026-11-02", _run)
+    assert first == {"status": "ok", "appended": 0, "unproven": 2, "rewritten": 0}
+    assert calls[0][0][3] == f"{BACKUP_REMOTE_BASE}/data/history/capture/offsite/ledger"
+    assert calls[0][0][calls[0][0].index("--backup-dir") + 1] == retired
+    assert calls[0][1] == ["raw/2026-10-29.jsonl", "raw/2026-10-30.jsonl"]
+    assert (capture / LEDGER_UPLOAD_STATE_RELPATH).exists()
+
+    # When nothing changed / Then nothing is sent
+    calls.clear()
+    assert _run_ledger_upload(tmp_path, capture, "rclone", "2026-11-03", _run)["appended"] == 0 and calls == []
+
+    # When one ledger gains a line / Then only it is sent, without a _deleted version
+    with open(ledger / "2026-10-30.jsonl", "a") as handle:
+        handle.write('{"segment_name": "c"}\n')
+    step = _run_ledger_upload(tmp_path, capture, "rclone", "2026-11-03", _run)
+    assert step == {"status": "ok", "appended": 1, "unproven": 0, "rewritten": 0}
+    assert calls[0][1] == ["raw/2026-10-30.jsonl"] and "--backup-dir" not in calls[0][0]
+
+    # When a ledger is rewritten / Then it is versioned and the step raises the anomaly
+    calls.clear()
+    (ledger / "2026-10-29.jsonl").write_text('{"segment_name": "X"}\n')
+    rewritten = _run_ledger_upload(tmp_path, capture, "rclone", "2026-11-04", _run)
+    assert rewritten["status"] == "failed" and rewritten["error"] == "ledger_not_append_only" and rewritten["files"] == ["raw/2026-10-29.jsonl"]
+    assert "--backup-dir" in calls[0][0]
+
+
+def test_ledger_upload_failure_keeps_previous_state(tmp_path: Path) -> None:
+    from src.tools.offsite_backup import LEDGER_UPLOAD_STATE_RELPATH, _run_ledger_upload
+
+    capture = tmp_path / "data/history/capture"
+    (capture / "offsite/ledger/raw").mkdir(parents=True)
+    (capture / "offsite/ledger/raw/2026-10-30.jsonl").write_text("{}\n")
+
+    def _fail(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="quota")
+
+    step = _run_ledger_upload(tmp_path, capture, "rclone", "2026-11-02", _fail)
+    assert step == {"status": "failed", "returncode": 1, "stderr": "quota"}
+    assert not (capture / LEDGER_UPLOAD_STATE_RELPATH).exists()
+    assert _run_ledger_upload(tmp_path, tmp_path / "elsewhere", "rclone", "2026-11-02", _fail) == {"status": "ok", "skipped": "capture_root_outside_data"}
+
+
+def test_ledger_step_runs_after_seal_and_before_data_copy(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    capture = tmp_path / "data/history/capture"
+    order: list[str] = []
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        (capture_root / "offsite/ledger/raw").mkdir(parents=True, exist_ok=True)
+        (capture_root / "offsite/ledger/raw/2026-11-02.jsonl").write_text("{}\n")
+        order.append("capture_seal")
+        return SealReport(dates_scanned=1, segments_committed=1, members_committed=1, archive_bytes=1, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        order.append("ledger" if cmd[2].endswith("offsite/ledger") else Path(cmd[2]).name)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    report = run_offsite_backup(tmp_path, capture, now=_now_kst("2026-11-02", "22:15:00"), run_fn=_run, seal_fn=_seal)
+    assert report.status == "ok" and report.steps["offsite_ledger"]["unproven"] == 1
+    assert order == ["capture_seal", "ledger", "data", "artifacts"]
+
+
+def test_ledger_step_error_is_isolated(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+
+    def _boom(*args, **kwargs):
+        raise OSError("ledger unreadable")
+
+    monkeypatch.setattr("src.tools.offsite_backup._run_ledger_upload", _boom)
+    copies: list[str] = []
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _run(cmd, **kwargs):
+        copies.append(Path(cmd[2]).name)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="offsite_ledger"):
+        run_offsite_backup(tmp_path, tmp_path / "capture", now=_now_kst("2026-11-02"), run_fn=_run, seal_fn=_seal)
+    assert copies == ["data", "artifacts"]  # later steps still run
