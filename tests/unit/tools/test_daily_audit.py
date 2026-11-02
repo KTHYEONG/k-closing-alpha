@@ -4217,10 +4217,8 @@ def test_run_daily_audit_survives_source_diff_record_failure(monkeypatch, tmp_pa
 )
 def test_source_diff_checklist_probe_uses_date_scoped_evidence(tmp_path, heartbeat_day, issues, corrupt, expected) -> None:
     import json
-    import textwrap
+    from datetime import date
     from pathlib import Path
-
-    import numpy as np
 
     day = "2026-09-30"
     event_path = tmp_path / "logs" / "events" / day[:7] / f"{day}.jsonl"
@@ -4239,21 +4237,31 @@ def test_source_diff_checklist_probe_uses_date_scoped_evidence(tmp_path, heartbe
             "snapshot_date": heartbeat_day, "open_issues": [{"key": issue} for issue in issues],
         }))
     text = Path("docs/vps-checklist.md").read_text()
-    probe = textwrap.dedent(text.split("    # ---- regular tick vs bar vendor disagreement (DI-1M-06) ----\n", 1)[1]
-                            .split("\n# ---- top-k decision + causality ----", 1)[0])
+    probe = '@check("Q10")\n' + text.split('\n@check("Q10")\n', 1)[1].split("\nb_prune()", 1)[0]
+
+    def _heartbeat():
+        path = tmp_path / "logs" / "heartbeat" / "daily_audit.json"
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+
     emitted = []
     namespace = {
-        "ROOT": tmp_path, "D": day, "np": np,
-        "emit": lambda *args: emitted.append(args),
-        "level": lambda fail, warn=False: "FAIL" if fail else "WARN" if warn else "PASS",
+        "ROOT": tmp_path, "D": date.fromisoformat(day), "json": json, "heartbeat": _heartbeat,
+        "check": lambda cid: lambda fn: fn(),
+        "out": lambda cid, status, **detail: emitted.append((cid, status, detail)),
+        "lv": lambda fail, warn=False: "FAIL" if fail else "WARN" if warn else "PASS",
     }
-    exec(compile(probe, "DI-1M-06", "exec"), namespace)  # noqa: S102 - execute the trusted repository probe
+    exec(compile(probe, "Q10", "exec"), namespace)  # noqa: S102 - execute the trusted repository probe
     assert len(emitted) == 1
     cid, status, detail = emitted[0]
-    assert cid == "DI-1M-06" and status == expected
-    assert "source_diff n=2 max=2.5% symbols=A,B" in detail
-    if heartbeat_day != day:
-        assert "heartbeat_verified=False gap_warning=False" in detail
+    assert cid == "Q10"
+    assert status == expected
+    assert (detail["n"], detail["max_shortfall"], detail["symbols"]) == (2, 0.025, ["A", "B"])
+    if heartbeat_day != day or corrupt:
+        assert detail["heartbeat_for_D"] is False
+        assert detail["gap_warning"] is False
 
 
 def _all_ok_result():

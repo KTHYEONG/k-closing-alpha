@@ -711,7 +711,7 @@ def _():
     out("Q09", lv(len(sh_lines) > 0 and nb == 0, nq > 0), shrink_allowed=len(sh_lines), pre_backups_today=nb, quarantine_files=nq, expires=D + timedelta(days=3))
 @check("Q10")
 def _():
-    rec = [r for r in (json.loads(l) for l in (ROOT / f"logs/events/{D:%Y-%m}/{D}.jsonl").read_text().splitlines() if l.strip()) if r.get("job") == "tick_source_diff"]
+    rec = [r for r in (json.loads(l) for l in (ROOT / f"logs/events/{D:%Y-%m}/{D}.jsonl").read_text().splitlines() if l.strip()) if r.get("job") == "tick_source_diff" and r.get("run_date") == str(D)]
     keys = [i["key"] for i in heartbeat().get("open_issues", [])] if heartbeat().get("snapshot_date") == str(D) else None
     gap = keys is not None and any(k.startswith("intraday:regular_ticks:") and k.endswith((":source_diff_systemic", ":certified_gap")) for k in keys)
     mt = rec[-1]["metrics"] if rec else {}
