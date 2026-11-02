@@ -1,737 +1,881 @@
-# VPS Automation Audit Checklist (or-vps) — v3
+# kca or-vps Audit Runbook (AI-executed, v4)
 
-> **Audience:** an AI agent auditing the production automation of `k-closing-alpha` (kca) on host `or-vps`
-> (hostname `trading-bot`, user `ubuntu`, 2 vCPU, 11 GiB RAM). **Goal:** prove with evidence that every scheduled
-> job ran on time, produced correct data, respected the host broker contract, and is backed up — a green
-> `systemctl` is not proof. Last verified against the live host on 2026-10-17 (HEAD `cd00451`). Every command in
-> this file was run read-only against production on that date. If the host disagrees with this file, the host is
-> truth: report the drift.
+> Host `or-vps` (hostname `trading-bot`, user `ubuntu`, 2 vCPU, 11 GiB). Repo `~/k-closing-alpha`; data root `~/k-closing-alpha/data` (capture `data/history/capture`); 29 `kca-*` user timers + `kca-alert@`; container jobs run through `~/.local/lib/kca/kca-run` (image `ghcr.io/kthyeong/k-closing-alpha:latest`, `--rm`), host jobs via `flock … ~/.local/bin/uv run`.
+> Days: **D** = audited trading day (M/W: the previous trading day; O/E/N: today), **P** = trading day before D, **N** = next trading day. Times are KST; host clock and `journalctl` are UTC.
+> Last verified: 2026-11-02 09:40–09:45 KST against or-vps rev `88d3452` (image `sha-1681172`, code-identical). All five bundles were executed read-only: O for D=2026-11-02, and M/E/N/W for D=2026-10-30 (§8 log)..
 
-## 0. Rules of Engagement
+## 0. Agent contract
 
-| Rule | Detail |
-|---|---|
-| Read-only | Never `systemctl start/stop/restart/enable/disable/reset-failed/daemon-reload`, `docker run/rm/pull/exec`, `rclone` write verbs (`copy sync move delete purge dedupe cleanup`), `git` writes, or edits under `~/k-closing-alpha`, `~/quant-secrets`, `~/.cache/kis`, `~/.config/systemd`. Allowed rclone: `about lsd lsf lsjson size check --one-way`. `kca-run --print-argv` is allowed (prints argv, runs nothing). Exceptions only for a named action the operator authorizes in the current conversation. |
-| No job entry points | Never run `src.daily.*`, `src.ml.*`, `src.backfill.*`, `src.tools.{audit_reconcile,daily_audit,alerts,offsite_backup,backup_prune,core_snapshot,capture_offsite,kis_token_warmup,kiwoom_token_rotate}` as `main`: they write ledgers, issue tokens, consume broker quota, send mail or take the Drive lock. Importing the pure read helpers of §2 and the Appendix A probes is allowed. |
-| No broker traffic | Never send a request to any broker/vendor API (KIS, LS, Toss, DB금융투자, Kiwoom, KRX). |
-| Secrets | Never print `~/quant-secrets/*.env`, `env`, token/state file contents in `~/.cache/kis`, `rclone config show`, or `docker inspect … Config.Env`. Names, modes, owners, sizes, mtimes only. |
-| Leave nothing behind | Do not create files anywhere (host or local): no report files, no evidence dumps, no scratch scripts. Pipe probes over ssh stdin (heredoc or `awk … docs/vps-checklist.md \| ssh …`). The report is the chat reply only. |
-| Deploy blackout | `src/tools/deploy_window.py`: **Mon–Fri 08:30–09:40 and 15:10–15:43 KST** (weekends none; weekday holidays still count). Inside: only `systemctl`, `journalctl`, `stat`, `ls`, small-file reads. No parquet probes, `du`, `find` over `data/`, `rclone`, `uv run`. Heavy probes use `nice -n 19 timeout 300` and avoid 22:15–00:15 (backup, Drive lock). |
-| Timezones | Host clock and `journalctl --since/--until` are **UTC**; every timer `OnCalendar` and every parquet date is **KST** (UTC+9). Convert with `k(){ date -u -d "TZ=\"Asia/Seoul\" $1" +"%F %T"; }; k "2026-10-16 15:20"` → `2026-10-16 06:20:00`. Pass `TZ=Asia/Seoul` to Python. |
-| Evidence | Every PASS cites the command and the line it rests on. Ambiguous → WARN. Unchecked items go to `NOT VERIFIED` with the reason. Diagnose, do not fix. Report in Korean (keys/badges English). |
-| Neighbours | The host also runs `krx-alpha` (container `krx-collector`, `krx-*` timers, `vps-image-gc`), `k-stock-engine` (`kse-*`), `crypto-pilot`, `mt-etf-*`, `quant-dashboard`. Report contention with them (§12); do not audit their logic. |
-| rclone path | Not on the non-interactive ssh PATH: use `~/.local/bin/rclone`. Host Python: `~/.local/bin/uv run --no-sync python` inside `~/k-closing-alpha`. |
+- Loop: pick the window (§2) → run that window's bundled probe (§5.1) in ONE ssh call → every line is `ID STATUS key=val …` → for each non-PASS run the row's Drill (§4/§5.2) → triage (§6) → report per `/home/kth/krx-alpha/docs/vps-ops-agent.md` §8. Shared rules (secrets, freeze, destructive actions, commit/deploy, report format) live only in that brief.
+- Verdicts: `PASS | WARN | FAIL | UNKNOWN` (probe exception or missing evidence; never counts as PASS) `| SKIP(reason)` (not applicable by day kind or optional timer off). `CTX INFO` is the first line; `ALL SKIP(non_trading_day)` ends the run on a closed D.
+- kca deltas to the shared rules:
+  - **Blackout** (`src/tools/deploy_window.py:18-58`): Mon–Fri **08:30–09:40** and **15:10–15:43** (weekday holidays count). Inside: only `systemctl`, `journalctl`, `ls`, `stat`, small-file reads. No bundled probe, no `uv run`, no `rclone`, no parquet reads.
+  - **Drive lock** 22:15–00:15 (kca-backup holds `%t/quant-gdrive.lock`; krx-host-backup 23:30 waits on it): no `rclone check`/`size`; `lsf` of a few dirs is fine. Bundles run `nice -n 19 timeout 300`.
+  - **Forbidden entry points** (write ledgers, issue tokens, send mail, take locks): never run `src.daily.*`, `src.ml.*`, `src.backfill.*`, `src.tools.{audit_reconcile,daily_audit,alerts,offsite_backup,backup_prune,core_snapshot,capture_offsite,kis_token_warmup,kiwoom_token_rotate,order_resolve}` as `main`. Importing read helpers (`audit_daily_completeness`, `PaperLedger.load_*`, `resolve_session_day`) is allowed. `kca-run --print-argv` prints only.
+  - Host tools: host `python3` has no pandas/pyarrow, so use `~/.local/bin/uv run --no-sync python` inside `~/k-closing-alpha`. rclone is `~/.local/bin/rclone` (not on the ssh PATH). Remote root is `gdrive:quant-lake/live/k-closing-alpha`.
+  - Containers are `--rm`, so `docker logs` is empty: the journal is the record. Several jobs write no OK run outcome (§3 "evidence"); judge them from the journal or the ledger as the probe does.
 
-## 1. Run Modes
+## 1. Daily-critical invariants (CORE)
 
-| Mode | When (KST) | Scope |
+| ID | Domain | Invariant (measurable) | Verified in window | Deadline KST | Sev |
+|---|---|---|---|---|---|
+| C01 | COLLECT | 15:20 decision input: `stage=realtime_coverage coverage≥0.99 status=COMPLETE` and `manifests/<D>/decision-<D>-*` complete | E (M) | 15:30 | P0 |
+| C03 | COLLECT | Aftermarket book (live-only): every `aftermarket-book-<D>-b<n>-<krx\|nxt>` manifest complete, and the journal reports `status=COMPLETE manifests=<same count>` | N (M) | 20:20 | P1 |
+| C04 | COLLECT | Evening archive, 7 streams (regular/krx_after/nxt_after bars+ticks, nxt_pre bars): each manifest complete, or a ticks PARTIAL healed by a complete `tape-<D>-<session>-publish` | N (M) | 21:15 | P1 |
+| C07 | COLLECT | EOD panel: `price_ingest OK`, `panel_max_date == expected_panel_date == P`, `stale_panel=false` | O | 09:50 | P1 |
+| C08 | COLLECT | Tape sweep report covers D, `expiring_needs=0 expired=0 expired_recoverable=0 disk_guard=false` (Kiwoom tape depth 30 d) | N | 21:15 | P1 |
+| C11 | STORE | All 8 completeness keys True (`archive close_confirmed decision paper_entry paper_exit minute_bars intraday_complete price_history_fresh`) | N (M) | 21:50 | P1 |
+| Q08 | STORE | Non-empty partitions for D: 1m `regular nxt_premarket nxt_aftermarket krx_aftermarket`, ticks `regular krx_aftermarket nxt_aftermarket`, `orderbook/aftermarket` | N (M) | 21:15 | P1 |
+| Q01 | STORE | `archive.parquet` D: rows>0, unique symbols, 0 nulls, confirmed share ≥0.9, OHLC/등락률 consistent, 0 causality violations | E | 15:45 | P0 |
+| B01 | BACKUP | `capture/offsite/last_run.json` `status=ok`, started at or after the last 22:15 slot, all steps ok, `missing_sealed_members=0`, core panels tracked with no issues | M | 01:00 | P1 (shrink P0) |
+| B02 | BACKUP | For D, every local ledger segment (`raw normalized manifests`) is listed remotely under `capture_sealed/<tier>/<YYYY-MM>/<D>/`, and no local file older than the run is unsealed | M | 01:00 | P0 |
+| B05 | BACKUP | Last weekday prune logged its summary with no failed step; remote `_deleted` has nothing older than 30 d at the last prune; fewer than 7 day dirs due next (D1 cap) | M, N | 21:20 | P2 (cap risk P1) |
+| P01 | PAPER | D entry recorded once: entry orders == top-k rows (no duplicate order_id/symbol), or a NO_DECISION row | E (M) | 15:45 | P0 |
+| P02 | PAPER | Every P lot has a `<entry>:exit:<D>` sell and a `trades` row; no open lot with decision_date < D | O (M) | 09:30 | P0 |
+| P03 | PAPER | Conservation: \|nav − cash − open_market_value\| ≤ 1 KRW for D, one nav row per day, cumulative cost monotone, friction > 0 on every trade, net = gross − cost, fill ids unique | O, E (M) | 09:35 / 15:45 | P0 |
+| P04 | PAPER | Causality: `input_available ≤ inference_started ≤ decided < 15:30:00` for every top-k row, and no entry fill before the last `decided_at` | E (M) | 15:45 | P0 |
+| P06 | PAPER | Shadow orders (`data/orders/<env>/journal.jsonl` via outcome metrics): `n_unknown=0`, `n_unknown_unresolved_total=0`, `n_missing_at_broker=0`, no shortfall, `n_lots`/`n_picks` fully accounted for | O, E | 09:35 / 15:45 | P0 |
+
+## 2. Check windows (when to look)
+
+| Window | KST (day kind) | Why this moment | Probe | Check IDs |
+|---|---|---|---|---|
+| **M** next-morning (mandatory) | business day 07:30–08:20 (Monday covers Fri + weekend nights) | 22:15 backup and 23:05 backfill are done; `last_run.json` is not yet overwritten; D's shrink backups still exist; ends before the 08:30 blackout | `kca_probe M` | H01 R01 R02 R03 R05 C01 C03 C04 C05 C11 Q08 P01–P04 B01 B02 B04 B05 A01 A03 A04 X01 |
+| **O** post-exit (mandatory) | business day 09:45–11:00 | exit window closed 09:30; price-ingest D-1 landed (a failed 08:30 run is auto-rerun at 09:40) | `kca_probe O` | R01 R02 C05 C07 Q05 P02 P03 P06 A01 A03 X01 |
+| **E** post-decision (mandatory) | business day 15:45–16:30 | entry chain ends 15:45; the archive row is still the decision snapshot | `kca_probe E` | R01 R02 C01 C05 Q01 P01 P03 P04 P06 A01 A03 X01 |
+| **L** liveness (optional) | 16:30–19:50 | aftermarket-book is the only long live capture (runs to ~19:59) | §5.2 `R06` | R06 |
+| **N** evening (mandatory; M re-checks if missed) | business day 21:50–22:10 | archive 20:05, tape 20:35, prune 21:00 and audit 21:20 are done; must finish before the 22:15 backup takes the Drive lock | `kca_probe N` | R01 R03 C03 C04 C06 C08 C11 Q06 Q07 Q08 Q09 Q10 B05 A01 A03 X01 |
+| **W** weekly (mandatory) | Monday 07:30–08:20, after M | Sat 22:00 retrain, Sun 10:00 snapshot, Sun 11:00 verify | `kca_probe W` + §5.1 local | H02 H03 H04 R04 B07 B08 Q11 A05 |
+| **Ev** event | after a deploy/alert/incident | parity of what changed | H02 H04 + affected rows | — |
+
+On a CLOSED weekday every probe prints `ALL SKIP(non_trading_day)` for D=today. M/W automatically audit the previous trading day.
+
+Evidence volatility:
+| Evidence | Lifetime / overwritten when | Must be read in window |
 |---|---|---|
-| **W** window watch | ~2 min after a §3 slot | that slot's units + run outcome (light commands only inside blackouts) |
-| **D** daily | trading day ≥ 23:00, or next morning 07:30–08:20 | §2–§11 for audit date `D` |
-| **WK** weekly | Monday 07:30–08:20 | D + Sat retrain, Sun snapshot/verify, trends |
-| **E** event | after a deploy, alert, incident or operator question | affected areas + §4 |
+| `capture/offsite/last_run.json`, `in_progress.json`, `scan_state.json` | overwritten nightly 22:15 | M |
+| `capture/offsite/deferred_history.json` | last 14 runs | M (trend) |
+| `logs/heartbeat/daily_audit.json` | rewritten 21:20; `reconciled_at`/open_issues every 10 min 07:00–23:00 | N (D snapshot), M |
+| `capture/staging/tape_sweep/last_report.json` | overwritten each 20:35 sweep | N |
+| `capture/backups/intraday/<session>/<day>` (shrink evidence; never offsite) | deleted after 3 days by the 21:00 prune (`backup_prune.py:37`) | N, at the latest M+2 |
+| local `capture/{raw,normalized,manifests}/<day>` | removed after 30 d once remote md5 verified; extended-backfill re-creates old trade-date dirs at 23:05, pruned at the next weekday 21:00 | any |
+| remote `_deleted/<day>` / `snapshots/` | 30 d / last 8 + first of each of 12 months | W |
+| journal | latest-only `systemctl show`; LAST resets on reboot for non-persistent timers | any |
+| `logs/events/*.jsonl`, `remediation/ledger.jsonl`, `audit_digests/<D>.txt`, paper + order ledgers | permanent, append-only | any |
 
-`D` = most recent `STANDARD`/`SHIFTED` day whose evening chain finished. On a `CLOSED` weekday, run data probes with
-the previous trading day and expect `SKIPPED reason=non_trading_day` outcomes for that weekday.
+## 3. Routine inventory (code-derived)
 
-## 2. Context (always first)
+Weekday timers also fire on weekday holidays; jobs self-skip through `resolve_session_day`/`trading_session_gate` plus the KIS oracle `is_kis_trading_day`. **P** = `Persistent=true`. Outcome = `data/logs/events/<YYYY-MM>/<D>.jsonl` (`src/tools/run_outcome.py:22-34`; last line per job wins).
+
+| Routine | Trigger | Entry point | Outputs | Success evidence | Deadline | Loss |
+|---|---|---|---|---|---|---|
+| audit-reconcile (host, `flock -E 75`, exit 75 ok) | /10 min 07:00–23:00 daily | `src/tools/audit_reconcile.py` + `auto_remediation.py` | heartbeat `reconciled_at`, `remediation/ledger.jsonl` | `reconciled_at` ≤ 10 min | — | LOW |
+| kis-token-warmup (critical, Restart ×4) P | Mon–Fri 07:05 | `src/tools/kis_token_warmup.py` (skips only verified CLOSED, :51-58) | `~/.cache/kis/token_<sha12>.json` | `slot=<…> issued=True` ×7 | 07:10 | MED |
+| kiwoom-token-rotate P | Mon–Fri 07:10 | `src/tools/kiwoom_token_rotate.py` | Kiwoom token | `status=ROTATED\|UNCHANGED` | 07:30 | MED |
+| api-notice-watch (host) P | 07:40, 17:40 daily | `src/tools/api_notice_watch.py` | `heartbeat/api_notice_watch_state.json` | Result=success | — | LOW |
+| price-ingest (standard) P | Mon–Fri 08:30, 11:30 | `src/daily/price_ingest.py:main` :1305 | `history/price_history.parquet` (:1232), security classification | outcome `OK`, `panel_max_date=P` | 09:50 | MED |
+| auction-open (optional, batch) | Mon–Fri 08:39:55 | `src/daily/auction_capture.py:main` :995 `--phase open` | raw + `auction-open-<D>-*` manifest | `status=COMPLETE phase=open entries=N` | 09:05 | MED |
+| order-exit | Mon–Fri 08:40:10 | `src/daily/order_session.py --phase exit` | `data/orders/<env>/journal.jsonl` (env `KIS_TRADING_ENV` off/mock/live, `src/api/kis/trading.py:104-121`) | outcome `OK exit_complete` / `SKIPPED no_open_positions\|trading_disabled` | 08:59 | HIGH |
+| order-reconcile-exit | Mon–Fri 09:00:40 | `order_session --phase reconcile-exit` | journal | outcome `OK reconcile_complete` | 09:33 | HIGH |
+| paper-exit (decision) P | Mon–Fri 09:01 | `src/daily/paper_trade.py --phase exit` (window to 09:30, `src/config/market_session.py:97-103`) | `data/paper/{orders,fills,trades,nav}.parquet` | journal `stage=paper_ledger_refresh as_of=D … n_open=0`; **no OK outcome** | 09:30 | HIGH |
+| collect (decision) | Mon–Fri 15:20 | `src/daily/collect.py:main` :1100 | `archive.parquet` via `src/daily/archive.py:upsert_archive_snapshot` :165; `capture/decision/<D>/<run>/input.parquet` | `stage=realtime_coverage … status=COMPLETE` (min 0.99, :201); **outcome only on SKIPPED** | 15:29 | HIGH |
+| predict (After=collect) | Mon–Fri 15:21 | `src/daily/predict.py:main` :455 | `parquet/{rank_pool_predictions,topk_decisions}.parquet` | outcome `OK` | 15:30 | HIGH |
+| auction-close (optional) | Mon–Fri 15:21:05 | `auction_capture --phase close` | raw + manifest | `status=COMPLETE phase=close` | 15:36 | MED |
+| order-entry | Mon–Fri 15:21:15 | `order_session --phase entry` | journal | outcome `OK entry_complete` | 15:29 | HIGH |
+| finalize-close (decision; ExecStopPost starts paper-entry) | Mon–Fri 15:30:30 | `src/daily/finalize_close.py:main` :481 | archive `종가_확정`, raw `close_confirmation` | outcome `OK` (DEGRADED `empty_archive\|picks_unconfirmed\|zero_confirmed`, :148-156) | 15:33 | HIGH |
+| order-reconcile-entry | Mon–Fri 15:30:40 | `order_session --phase reconcile-entry` | journal | outcome `OK` | 15:43 | HIGH |
+| paper-entry (decision) P | Mon–Fri 15:34 + finalize trigger | `paper_trade --phase entry` | paper orders/fills/decisions/nav | entry fills at the 종가 (`paper_broker.py:220-274`); second run `already_recorded` (:498,:520); outcome only NO_DECISION/DEGRADED/SKIPPED | 15:45 | HIGH |
+| archive-intraday-regular P | Mon–Fri 15:40 | `src/daily/archive_intraday.py:main` :1039 `--phase regular` | 1m+ticks `regular`, manifests `archive-<D>-regular-{bars,ticks}-*` | `stage=intraday_archive_stream … status=COMPLETE` | 18:40 | HIGH |
+| aftermarket-book (batch) | Mon–Fri 15:40 (to ~19:59 by design) | `src/daily/aftermarket_book.py:main` :632 | `history/orderbook/aftermarket/<YYYY-MM>/<D>.parquet`, 35 manifests `aftermarket-book-<D>-b<n>-<venue>` | `stage=aftermarket_book status=COMPLETE date=D manifests=N` | 20:20 | HIGH |
+| auction-path (bulk, DB증권) | Mon–Fri 15:45 | `src/daily/auction_path.py:main` :304 | `history/auction_path/<YYYY-MM>/<D>.parquet` | outcome from manifest (:270) | 19:00 | MED |
+| archive-intraday P | Mon–Fri 20:05 | `archive_intraday --phase aftermarket` | 1m `nxt_premarket nxt_aftermarket krx_aftermarket`, ticks `krx_aftermarket nxt_aftermarket` (since 2026-09-29, market_session.py:74) | stream lines COMPLETE; outcome only DEGRADED/SKIPPED | 23:05 | HIGH |
+| tape-sweep (bulk, Kiwoom; After=archive-intraday) P | Mon–Fri 20:35 | `src/daily/tick_tape_sweep.py:main` :330 | `capture/staging/tape_backfill/ledger.jsonl`, `staging/tape_sweep/last_report.json`, `tape-<D>-<session>-publish-*` manifests | report day = D; **no outcome** | 21:15 (`TAPE_SWEEP_DEADLINE_HHMMSS`) | HIGH |
+| backup-prune (host, Drive lock) P | Mon–Fri 21:00 | `src/tools/backup_prune.py` (+`capture_offsite.py:980-1159`) | deletes remote `_deleted/<day>` > 30 d (cap 7/subtree), local `backups/intraday` > 3 d, local sealed tiers > 30 d after a remote md5 check | `stage=backup_prune dry_run=False purged= … sealed_kept=` | 21:20 | MED |
+| daily-audit (host, `kca-audit.lock`) P | Mon–Fri 21:20 | `src/tools/daily_audit.py` | heartbeat v2, `audit_digests/<D>.txt`, mail | `stage=daily_audit day=trading status=OK subject=[kca] 🟢 …` | 21:50 | MED |
+| altdata-capture (optional) | Mon–Fri 21:35 | `src/daily/altdata_capture.py:main` :137 | `history/altdata/*`, `_manifest.json` | panels `status=ok` | 22:05 | MED |
+| backup (host, `flock -w 7200` Drive lock; OnSuccess=audit-reconcile) P | **daily** 22:15 | `src/tools/offsite_backup.py:363-546` | `capture_sealed/<tier>/<YYYY-MM>/<D>/seg-<sha16>.tar.zst` (immutable, md5), `rclone copy data/ artifacts/` (backup-dir `_deleted/<sub>/<day>`), ledger `capture/offsite/ledger/<tier>/<D>.jsonl` | `last_run.json status=ok`; `stage=offsite_backup status=ok`; **no outcome** | 01:00 (`deadline_at`) | HIGH |
+| extended-backfill (bulk, batch) | daily 23:05 | `src/backfill/intraday/extended_session_backfill.py:main` :1350 | past-date partitions, `backfill_ledger/extended_sessions.parquet`, `1m_kis_adjusted`, raw for old trade dates | outcome `OK`, `status=DONE tasks_remaining=0 pending_conflicts=0` | 07:05 | MED |
+| retrain (6g/1.8 cpu) P | Sat 22:00 | `src/ml/retrain.py --train-ranker-bundle` | `artifacts/models/topk_ranker/retrain_registry.jsonl` | registry `PROMOTED\|PROMOTED_UNGATED` | Sun 00:00 | LOW |
+| core-snapshot (host, Drive lock) P | Sun 10:00 | `src/tools/core_snapshot.py` | `snapshots/<D>/` (price_history, archive, topk, rank_pool, paper/*, bundle) | `stage=core_snapshot … status=ok` | Sun 12:00 | MED |
+| offsite-verify (host, Drive lock) P | Sun 11:00 | `src/tools/capture_offsite.py verify` :1268-1468 | drill staging removed after | `missing=0 mismatched=0`, 3 `restore_drill … status=OK` | Sun 13:00 | HIGH |
+| kca-alert@ (host) | OnFailure of every kca unit (+ `krx-deferred-recreate`, `krx-host-backup`) | `src/tools/alerts.py` | mail + webhook, outbox | `Finished kca-alert@<unit>` | +5 min | MED |
+| GitHub `watchdog.yml` | cron `40 22 * * 1-5` UTC = 07:40 KST Tue–Sat (runs 2–4.5 h late) | `src/tools/watchdog_probe.py`; GHCR PAT expiry ≤ 30 d | — | run success | — | LOW |
+| GitHub `deploy.yml` | push to main | `vps-deploy-lib.sh` pull → preflight → `blackout_wait` → promote → converge (`git reset --hard`, `src.tools.code_sync`) | units, wrapper | run success | — | — |
+
+Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auction-open, auction-close, altdata-capture. They are never auto-enabled (`install_systemd.sh` enables 26), but all 3 are enabled on the host. Not daily: `1m/regular_consolidated` (Toss backfill, last 2026-08-31) and `1m_kis_adjusted` (extended-backfill output).
+
+## 4. Check catalogue
+
+| ID | Tier | Windows | Assert (machine-checkable PASS) | Fail → Sev | Drill |
+|---|---|---|---|---|---|
+| H01 | EXT | M | 29 `kca-*` timers listed, no `--failed` kca unit, `Linger=yes` (WARN: a timer not enabled) | P1 | `systemctl --user list-timers 'kca-*' --all` |
+| H02 | EXT | W, Ev | host `git status` clean, `kca-run` == repo wrapper, no unit DRIFT / NOT_IN_REPO, `latest` image ID == `sha-<HEAD>`; local: VPS HEAD == `origin/main` (or a deploy waits in `blackout_wait`) | P1 | §5.2 `H02-local` |
+| H03 | EXT | W | no exited `kca-*` container, no kca container outside its §3 window; no new `*.bak*/*.pre_*/*.stale*` under `data/` or `artifacts/` | P2 | `docker ps -a`, `find … -maxdepth 4` |
+| H04 | EXT | W, Ev | latest `deploy.yml` run on main is `success` (a red test job freezes `latest`); after a history rewrite, pinned SHAs in `tests/` fixtures are ancestors of `origin/main`; the 22 wrapper units print `rc=0` via `--print-argv` | P1 | §5.2 `H04` |
+| R01 | EXT | M O E N | each unit due in the window has ≥1 `Finished` since its slot (optional timers only if enabled); a `Failed with result` followed by a Finished rerun is WARN | P1 (decision chain P0) | `journalctl --user -u kca-<u> --since <UTC>` |
+| R02 | EXT | M O E | outcome per job ∈ allowed set: price_ingest OK; order_exit OK/SKIPPED(no_open_positions\|trading_disabled); order_reconcile_exit OK/SKIPPED(no_orders); predict OK; order_entry OK; finalize_close OK; order_reconcile_entry OK; extended_backfill OK | P1 (decision P0) | `events/<YYYY-MM>/<D>.jsonl` |
+| R03 | EXT | M N | lists DEGRADED/NO_DECISION outcomes of D (WARN; each must map to an alert/known condition). `auction_path DEGRADED` is research (P2). A DEGRADED `extended_backfill` is actionable (transient outage, conflict); deterministic gaps show only as `deterministic_failed/exhausted` counts | P2 | outcome `reason`/metrics |
+| R04 | EXT | W | last registry row `PROMOTED\|PROMOTED_UNGATED\|MANUAL_HOTFIX` ≤ 8 d old and the live `model_version` is in the registry. A `strategy or screen changed vs live bundle` REJECTED fails the unit by design: the operator certifies and reruns with `--skip-promotion-gate`; auto-remediation never reruns retrain | P1 | `journalctl -u kca-retrain` |
+| R05 | EXT | M | today 07:05: ≥7 distinct `slot=… issued=True` (DATA_n, PRIMARY, TRADING_MOCK) and the Kiwoom rotate status line; CLOSED day → `non_trading_day` skip | P1 | warmup journal |
+| R06 | EXT | L | `kca-aftermarket-book` active with container `kca-aftermarket-book` up between 15:40 and 19:59; ~92 % of its 4 h 40 min timeout is normal | P1 | §5.2 `R06` |
+| C01 | CORE | E M | §1 | P0 | collect journal `stage=realtime_quote/requote` |
+| C03 | CORE | N M | §1; PARTIAL (WARN) entry reasons `deadline\|vendor_failure\|missed_start`; `nxt_not_listed` is normal | P1 | §5.2 `C-manifest` |
+| C04 | CORE | N M | §1; output `streams={…: complete\|tape_healed\|partial(n failed)\|missing}`. Partial bars = WARN; missing = FAIL | P1 | §5.2 `C-manifest`, journal `stage=intraday_archive_stream` |
+| C05 | EXT | O E M | auction open/close manifests complete (SKIP if timer off) | P2 | auction journal `status=LATE/DEGRADED` |
+| C06 | EXT | N | `auction-path-<D>-*` manifest complete (else WARN; 10-30 PARTIAL) | P2 | outcome metrics |
+| C07 | CORE | O | §1; WARN on `flow_shortfall`/`program_flow_shortfall`. A 08:30 `stale_panel_pending_retry` is healthy when 11:30 is OK; an 11:30 DEGRADED `stale_panel` needs an alert | P1 | price-ingest journal |
+| C08 | CORE | N | §1 (report `days_checked[-1] == D`) | P1 | `last_report.json` `unresolved`, `stage=tape_sweep status=WARNING` |
+| C11 | CORE | N M | §1: `audit_daily_completeness(D)` (7 keys) + `intraday_complete` = the daily-audit run for D logged no `step=intraday_complete status=FAIL date=D` (mirrors `daily_audit.py:2308`) | P1 | daily-audit journal for D |
+| Q01 | CORE | E | §1 thresholds: confirmed share <0.9 FAIL, <0.99 WARN; `수급_실패` share >0.1 WARN; other flags >0 FAIL; `등락률` mismatch >1 % rows FAIL (computed on 종가, not 결정_종가); 종가 vs 결정_종가 gap p99 >3 % WARN. Rows follow the market screen (93–1,247/day); `snap_in_1520` drops at large `n_raw` (0.694 at 1,247 rows) and is info | P0 | §5.2 `Q-spot` |
+| Q05 | EXT | O | price_history day P: rows/prev5 median ∈ [0.97, 1.03], no dup (day or total), no invalid OHLCV, one `kospi_pct` | P1 | — |
+| Q06 | EXT | N | 1m regular D: no dup `(symbol, ts_hms)`, no invalid bar, ts covers 09:01–15:29 | P1 | — |
+| Q07 | EXT | N | day P: 1m volume / EOD volume median ≤1.01 (≈0.96 for vendor `ls`; judge drift vs baseline ±0.02, share <0.9 ±0.05); last-bar close matches `close_raw` share ≥0.98 (FAIL <0.9) | P2 | — |
+| Q08 | CORE | N M | §1 (`auction_path` missing = WARN) | P1 | `ls history/intraday/*/<session>/<YYYY-MM>/` |
+| Q09 | EXT | N | every `stage=intraday_replace … SHRINK_ALLOWED` since P 23:00 has `backups/intraday/<session>/<D>/*-pre-*.parquet`; WARN if `quarantine/shrink/<D>` has files. **Evidence expires D+3** | P0 | journal grep |
+| Q10 | EXT | N | `tick_source_diff` metrics for D plus heartbeat for D without `intraday:regular_ticks:*:{source_diff_systemic,certified_gap}`. A tick vs bar gap with `tape_complete` proof is a vendor difference (info) | P2 | heartbeat `info_notes` |
+| Q11 | EXT | W | altdata panels `ok` with trading-day lag ≤ 2 (`credit_balance` ≤ 4); backfill ledgers (`extended_sessions toss_regular nxt_calibration`) have no FAILED with ≥3 attempts; NXT table sha == fit report; quarantine entries listed (each needs a `moves-*.json`) | P2 | — |
+| Q12 | EXT | M (manual) | spot check: 2 top-k + 1 random symbol agree across archive 종가, `price_history.close_raw` (next day), last 1m bar, paper entry `fill_price` | P1 | §5.2 `Q-spot` |
+| B01 | CORE | M | §1; WARN: start delay >15 min (Drive lock contention), `deferred_dates>0`, `in_progress.json` present | P1 | `journalctl -u kca-backup`, `steps.*.stderr` |
+| B02 | CORE | M | §1 (`segs>0`, `remote_missing0`, `unsealed_pre_run0` per tier) | P0 | §5.2 `B-parity` |
+| B03 | EXT | W | remote `data/` and `artifacts/` vs local: `rclone check --one-way --size-only` shows `+`/`*` only for files modified after `last_run.started_at` (heartbeat, ledgers, backfill partitions) | P1 | §5.2 `B03` |
+| B04 | EXT | M | deferred trend not stalled 3 runs and oldest deferred ≤ 21 d; WARN if `capture_seal.status != ok` (then `deferred_dates` reads 0 falsely, D6) | P2 | `deferred_history.json` |
+| B05 | CORE | M N | §1; WARN `sealed_kept>0` or a local tier date < prune cutoff with mtime before the prune (named, reason in journal) | P2/P1 | prune journal `stage=capture_prune` |
+| B07 | EXT | W | Sun verify `missing=0 mismatched=0` and 3 restore drills (raw, normalized, manifests) `OK` | P1 | verify journal `finding=` |
+| B08 | EXT | W | remote `snapshots/` newest == last Sunday; core-snapshot `status=ok` | P1 | core-snapshot journal |
+| P01 | CORE | E M | §1; WARN when fills < orders (statuses `ZERO_QTY NO_SNAPSHOT_ROW UNCONFIRMED INSUFFICIENT_CASH`) | P0 | `paper/orders.parquet` |
+| P02 | CORE | O M | §1 | P0 | paper-exit journal (`exit_window_expired`) |
+| P03 | CORE | O E M | §1 | P0 | §5.2 `P-ledger` |
+| P04 | CORE | E M | §1 | P0 | `topk_decisions.parquet` |
+| P06 | CORE | O E | §1. Entry reconcile `n_intents` counts exit + entry intents for the day (e.g. 6 for 3 picks). A stuck UNKNOWN intent is operator-only (`src.daily.order_resolve`, dry-run first) | P0 | `data/orders/<env>/journal.jsonl` |
+| P07 | EXT | E (manual) | paper entry symbols == order-journal entry intent symbols for D (same top-k) | P1 | journal `kind=intent` payload |
+| A01 | EXT | all | heartbeat `schema_version 2`, `undelivered_alerts 0`, `reconciled_at` ≤ 15 min (07:00–23:05), `snapshot_date == D` after 21:30 (N) and in M; WARN on open issues | P1 | `cat logs/heartbeat/*.json`, `tail remediation/ledger.jsonl` |
+| A02 | EXT | M | digest `logs/audit_digests/<D>.txt` line 1 `[kca] 🟢 <D> 일일점검 완료`; open issue keys each map to a finding; remediation rows `started` without `resolved/unresolved` are in flight; `unresolved/skipped_budget` need the operator; no forbidden unit (collect, predict, finalize, paper-*, aftermarket-book, auction-*, retrain, daily-audit, kiwoom-rotate) in the ledger | P1 | `head -1 audit_digests/<D>.txt` |
+| A03 | EXT | all | every unit with `Failed with result` since the window start has a `kca-alert@<unit>` run | P1 | alert journal |
+| A04 | EXT | M | dashboard kca card all OK (non-OK must map to a finding; its `[[schedule]]` list lives in `quant-dashboard/config.toml`) | P2 | `public/status.json` |
+| A05 | EXT | W | `watchdog.yml` last 5 scheduled runs `success` | P1 | `gh run list --workflow watchdog.yml` |
+| X01 | EXT | all | kca journal since the window start: no `HostBrokerDirNotSharedError AdmissionDirNotSharedError SCHEMA_INVALID` (FAIL); WARN on `IGW00201 EGW00201 EGW00133 EGW00121 AUTH_REJECTED ADOPTED_ROTATED TokenIssueThrottled TokenStoreLockTimeout TOKEN_REPLACED http=429`; any hit on decision units 15:20–15:31 = P1 | P2/P1 | grep with unit names |
+| X02 | EXT | M | Drive lock: kca-backup start delay ≤ 15 min (B01 `start_delay_min`); other holders: `kse-backup` 02:30, `krx-host-backup` 23:30 (`krx-alpha/deploy/host/krx-host-backup.sh:7,131`) | P2 | `journalctl -u kca-backup -u krx-host-backup -u kse-backup` |
+| X03 | EXT | — | shared, probed once by the ops brief: clock drift, disk/inodes < 80 %, memory, `~/.cache/kis` mode 700 + `.host-admission` marker + contract file names/owners, `~/quant-secrets` 700/600 | — | ops brief |
+| X04 | EXT | — | shared, probed once by the ops brief: `deploy/vps-deploy-lib.sh` == krx `deploy/host/vps-deploy-lib.sh`; `src/api/host_broker_contract.py` == krx `deploy/shared/host_broker_contract.py`; `deploy/shared/kis_slot_assignments.toml` == krx canonical | — | `sha256sum` (local) |
+| X05 | EXT | — | shared, probed once by the ops brief: `vps-image-gc` (05:30) keeps `latest` + 5 `sha-*`; krx-collector root files in `~/.cache/kis` re-owned by the reconcile `sudo chown` | — | ops brief |
+
+## 5. Probes
+
+### 5.1 Bundled window probes
+
+Run from the local repo root, outside the blackouts. Each call extracts the `lib` block plus one window block and streams them over one ssh (nothing is written on either side). `D` is optional; it defaults to the previous trading day for M/W and to today for O/E/N.
 
 ```bash
-ssh -o ConnectTimeout=15 or-vps 'hostname; date -u; TZ=Asia/Seoul date; uptime; loginctl show-user $USER -p Linger; free -h | sed -n 2,3p; df -h / | tail -1; df -i / | tail -1'
-ssh or-vps 'cd ~/k-closing-alpha && TZ=Asia/Seoul timeout 180 ~/.local/bin/uv run --no-sync python - <D>' <<'EOF'
-import sys
-from datetime import datetime, timedelta
+kca_probe() { awk -v w="probe=$1" '/^```python probe=/{f=($2=="probe=lib"||$2==w);next} /^```/{f=0} f' docs/vps-checklist.md \
+  | ssh -o ConnectTimeout=15 or-vps "cd ~/k-closing-alpha && TZ=Asia/Seoul nice -n 19 timeout 300 ~/.local/bin/uv run --no-sync python - $1 ${2:-}"; }
+kca_probe M            # O | E | N | W ; e.g. kca_probe N 2026-10-30 re-audits a past day
+# W adds local evidence (no ssh):
+git -C /home/kth/k-closing-alpha fetch -q && git -C /home/kth/k-closing-alpha log -1 --format='%h %ci' origin/main
+gh run list -R kthyeong/k-closing-alpha --workflow deploy.yml --limit 1; gh run list -R kthyeong/k-closing-alpha --workflow watchdog.yml --limit 5
+```
+
+Shared helpers (always prepended):
+
+```python probe=lib
+import collections, json, os, re, subprocess, sys
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from src.data.session_calendar import resolve_session_day
-from src.tools.daily_audit import audit_daily_completeness, list_failed_kca_units
-from src.tools.run_outcome import load_run_outcomes
-now = datetime.now(ZoneInfo("Asia/Seoul"))
-print("days", [(str(now.date() - timedelta(days=k)), resolve_session_day(now.date() - timedelta(days=k)).kind.value) for k in range(8)])
-D = sys.argv[1]
-print("completeness", audit_daily_completeness(D))
-print("failed_units", list_failed_kca_units())
-print("outcomes", load_run_outcomes(D))
-EOF
+KST, UTC = ZoneInfo("Asia/Seoul"), ZoneInfo("UTC")
+NOW = datetime.now(KST)
+TODAY = NOW.date()
+W = sys.argv[1]
+ROOT, CAP = Path("data"), Path("data/history/capture")
+RCLONE, REMOTE = os.path.expanduser("~/.local/bin/rclone"), "gdrive:quant-lake/live/k-closing-alpha"
+def out(cid, st, **kv):
+    print(cid, st, *(f"{k}={str(v).replace(' ', '')}" for k, v in kv.items()), flush=True)
+def lv(fail, warn=False):
+    return "FAIL" if fail else ("WARN" if warn else "PASS")
+def check(cid):
+    def deco(fn):
+        try:
+            fn()
+        except Exception as exc:  # a probe crash is UNKNOWN, never PASS
+            out(cid, "UNKNOWN", err=f"{type(exc).__name__}:{str(exc)[:140]}")
+        return fn
+    return deco
+def kind(d):
+    return resolve_session_day(d).kind.value
+def is_td(d):
+    return kind(d) in ("STANDARD", "SHIFTED")
+def prev_td(d):
+    x = d - timedelta(days=1)
+    while not is_td(x):
+        x -= timedelta(days=1)
+    return x
+def at(d, hms):
+    return datetime.combine(d, datetime.strptime(hms, "%H:%M:%S").time(), KST)
+def sh(cmd, timeout=120):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+def jr(units, since, until=None, pat=None):
+    cmd = ["journalctl", "--user", "--no-pager", "-o", "cat", "--since", since.astimezone(UTC).strftime("%F %T UTC")]
+    for u in units if isinstance(units, (list, tuple)) else [units]:
+        cmd += ["-u", u if u.endswith(".service") or "*" in u else f"kca-{u}.service"]
+    if until:
+        cmd += ["--until", until.astimezone(UTC).strftime("%F %T UTC")]
+    lines = sh(cmd).splitlines()
+    return [l for l in lines if pat is None or re.search(pat, l)]
+def outcomes(d):
+    p, last = ROOT / f"logs/events/{d:%Y-%m}/{d}.jsonl", {}
+    if p.exists():
+        for line in p.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            last[r.get("job")] = r
+    return last
+def expect(cid, d, spec):
+    o, bad = outcomes(d), []
+    for job, allowed in spec.items():
+        r = o.get(job)
+        got = "absent" if r is None else f"{r['outcome']}:{r.get('reason', '')}"
+        if r is None or not (r["outcome"] in allowed or got in allowed):
+            bad.append(f"{job}={got}")
+    out(cid, lv(bool(bad)), date=d, jobs=len(spec), bad=",".join(bad) or "-")
+    return o
+def runs(cid, specs):
+    miss, rec = [], []
+    for unit, d, hms, need in specs:
+        if unit in OPTIONAL and sh(["systemctl", "--user", "is-enabled", f"kca-{unit}.timer"]).strip() != "enabled":
+            continue
+        lines = jr(unit, at(d, hms) - timedelta(seconds=90))
+        fin = sum(l.startswith("Finished ") for l in lines)
+        bad = sum("Failed with result" in l for l in lines)
+        if fin < need:
+            miss.append(f"{unit}:fin{fin}/{need}:failed{bad}")
+        elif bad:
+            rec.append(f"{unit}:failed{bad}_rerun_ok")
+    out(cid, lv(bool(miss), bool(rec)), units=len(specs), missing=",".join(miss) or "-", recovered=",".join(rec) or "-")
+OPTIONAL = {"auction-open", "auction-close", "altdata-capture"}
+def manifest_status(d, prefix):
+    res = {}
+    for run in sorted((CAP / f"manifests/{d}").glob(prefix + "*")):
+        st = {f.name[9:-5] for f in run.glob("manifest-*.json")}
+        res[run.name] = "complete" if "complete" in st else ("partial" if "partial" in st else ("pending" if st else "none"))
+    return res
+def failed_entries(d, run):
+    m = json.loads((CAP / f"manifests/{d}/{run}/manifest-partial.json").read_text())
+    return sum(e.get("status") != "COMPLETE" for e in m.get("entries", []))
+def heartbeat():
+    return json.loads((ROOT / "logs/heartbeat/daily_audit.json").read_text())
+def timer_active(name):
+    return sh(["systemctl", "--user", "is-active", f"kca-{name}.timer"]).strip() == "active"
+D = date.fromisoformat(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else (prev_td(TODAY) if W in ("M", "W") else TODAY)
+P = prev_td(D)
+REV = sh(["git", "log", "-1", "--format=%h"]).strip()
+out("CTX", "INFO", now=NOW.strftime("%F_%T"), window=W, today=f"{TODAY}:{kind(TODAY)}", D=f"{D}:{kind(D)}", P=P, rev=REV)
+if not is_td(D):
+    out("ALL", "SKIP(non_trading_day)", D=D)
+    sys.exit(0)
+# ---------- shared check bodies (called by the window blocks) ----------
+def c_manifests_live(d):
+    @check("C03")
+    def _():
+        st = manifest_status(d, f"aftermarket-book-{d}-")
+        c = collections.Counter(st.values())
+        line = jr("aftermarket-book", at(d, "15:39:00"), at(d, "23:59:00"), rf"stage=aftermarket_book status=\w+ date={d}")
+        ok_line = bool(line) and "status=COMPLETE" in line[-1] and f"manifests={len(st)}" in line[-1]
+        out("C03", lv(not st or c["pending"] + c["none"] > 0, c["partial"] > 0 or not ok_line), batches=len(st), status=dict(c), journal=(line[-1].split("status=")[1][:40] if line else "absent"))
+    @check("C04")
+    def _():
+        streams = ["regular-bars", "regular-ticks", "nxt-premarket-bars", "nxt-aftermarket-bars", "krx-aftermarket-bars", "krx-aftermarket-ticks", "nxt-aftermarket-ticks"]
+        tape = manifest_status(d, f"tape-{d}-")
+        res, fail, warn = {}, [], []
+        for s in streams:
+            st = manifest_status(d, f"archive-{d}-{s}-")
+            best = "complete" if "complete" in st.values() else ("partial" if "partial" in st.values() else "missing")
+            if best == "partial" and s.endswith("ticks"):
+                sess = s[: -len("-ticks")].replace("-", "_")
+                if any(k.startswith(f"tape-{d}-{sess}-") and v == "complete" for k, v in tape.items()):
+                    best = "tape_healed"
+            if best == "partial":
+                run = [k for k, v in st.items() if v == "partial"][-1]
+                best = f"partial({failed_entries(d, run)}failed)"
+                warn.append(s)
+            if best == "missing":
+                fail.append(s)
+            res[s] = best
+        out("C04", lv(bool(fail), bool(warn)), streams=res)
+    @check("C05")
+    def _():
+        res = {}
+        for ph, unit in (("open", "auction-open"), ("close", "auction-close")):
+            if not timer_active(unit):
+                res[ph] = "SKIP(timer_off)"
+                continue
+            st = manifest_status(d, f"auction-{ph}-{d}-")
+            res[ph] = ",".join(sorted(set(st.values()))) or "missing"
+        out("C05", lv(any(v == "missing" for v in res.values()), any(v not in ("complete", "SKIP(timer_off)") for v in res.values())), **res)
+def c_decision(d):
+    @check("C01")
+    def _():
+        st = manifest_status(d, f"decision-{d}-")
+        cov = jr("collect", at(d, "15:19:00"), at(d, "15:35:00"), r"stage=realtime_coverage")
+        m = re.search(r"coverage=([\d.]+) status=(\w+)", cov[-1]) if cov else None
+        covv = float(m.group(1)) if m else -1.0
+        out("C01", lv("complete" not in st.values() or covv < 0.99, m is not None and m.group(2) != "COMPLETE"), manifest=",".join(st.values()) or "missing", coverage=covv, status=m.group(2) if m else "absent")
+def q_partitions(d, ticks_after=True):
+    @check("Q08")
+    def _():
+        paths = {f"1m/{s}": ROOT / f"history/intraday/1m/{s}/{d:%Y-%m}/{d}.parquet" for s in ("regular", "nxt_premarket", "nxt_aftermarket", "krx_aftermarket")}
+        paths.update({f"ticks/{s}": ROOT / f"history/intraday/ticks/{s}/{d:%Y-%m}/{d}.parquet" for s in ("regular", "krx_aftermarket", "nxt_aftermarket")})
+        paths["orderbook/aftermarket"] = ROOT / f"history/orderbook/aftermarket/{d:%Y-%m}/{d}.parquet"
+        paths["auction_path"] = ROOT / f"history/auction_path/{d:%Y-%m}/{d}.parquet"
+        size = {k: (p.stat().st_size if p.exists() else 0) for k, p in paths.items()}
+        miss = [k for k, v in size.items() if v == 0 and k != "auction_path"]
+        out("Q08", lv(bool(miss), size["auction_path"] == 0), missing=",".join(miss) or "-", kib={k: v // 1024 for k, v in size.items()})
+def p_ledger(d, p, morning):
+    import pandas as pd
+    from src.execution.paper_broker import PaperLedger
+    led = PaperLedger(root=ROOT / "paper")
+    fills = led.load_effective_fills()
+    fills["dd"] = fills["decision_date"].astype(str).str[:10]
+    @check("P02")
+    def _():
+        opn = led.load_open_positions()
+        stale = sorted(set(opn.loc[opn["decision_date"].astype(str).str[:10] < str(d), "decision_date"].astype(str).str[:10]))
+        buys = fills[(fills["side"].astype(str) == "buy") & (fills["dd"] == str(p))]
+        sells = fills[fills["side"].astype(str) == "sell"]
+        exited = set(sells["entry_order_id"].astype(str))
+        unexited = sorted(set(buys["order_id"].astype(str)) - exited)
+        tr = pd.read_parquet(ROOT / "paper/trades.parquet")
+        no_trade = sorted(set(sells[sells["entry_order_id"].astype(str).isin(buys["order_id"].astype(str))]["order_id"].astype(str)) - set(tr["exit_order_id"].astype(str)))
+        out("P02", lv(bool(stale) or bool(unexited) or bool(no_trade)), prev_lots=len(buys), unexited=len(unexited), sells_without_trade=len(no_trade), stale_open_decisions=stale or "-")
+    @check("P03")
+    def _():
+        nav = pd.read_parquet(ROOT / "paper/nav.parquet")
+        nav["day"] = nav["as_of_date"].astype(str).str[:10]
+        row = nav[nav["day"] == str(d)]
+        gap = abs(float(row.iloc[-1]["nav"]) - float(row.iloc[-1]["cash"]) - float(row.iloc[-1]["open_market_value"])) if len(row) else float("nan")
+        dup = int(nav.duplicated(["day"]).sum())
+        cc = nav.sort_values("day")["cumulative_cost"].astype(float).diff().dropna()
+        tr = pd.read_parquet(ROOT / "paper/trades.parquet")
+        fric = int(((tr["buy_fee"] <= 0) | (tr["sell_fee"] <= 0) | (tr["sell_tax"] <= 0)).sum())
+        net = float((tr["gross_pnl"].astype(float) - tr["cost"].astype(float) - tr["net_pnl"].astype(float)).abs().max())
+        dupf = int(pd.read_parquet(ROOT / "paper/fills.parquet")["order_id"].duplicated().sum())
+        out("P03", lv(not len(row) or gap > 1.0 or dup > 0 or bool((cc < -1e-9).any()) or fric > 0 or net > 1.0 or dupf > 0),
+            nav_minus_cash_mv=round(gap, 2), dup_nav_days=dup, cost_monotone=not bool((cc < -1e-9).any()), zero_friction=fric, max_net_err=round(net, 2), dup_fill_ids=dupf, nav=int(row.iloc[-1]["nav"]) if len(row) else "absent")
+    if morning:
+        return
+    @check("P01")
+    def _():
+        orders = pd.read_parquet(ROOT / "paper/orders.parquet")
+        eo = orders[(orders["decision_date"].astype(str).str[:10] == str(d)) & (orders["reason"].astype(str) == "entry")]
+        tk = pd.read_parquet(ROOT / "parquet/topk_decisions.parquet")
+        k = int((tk["decision_date"].astype(str).str[:10] == str(d)).sum())
+        nod = pd.read_parquet(ROOT / "paper/decisions.parquet")
+        nodec = int((nod["decision_date"].astype(str).str[:10] == str(d)).sum())
+        eb = fills[(fills["side"].astype(str) == "buy") & (fills["dd"] == str(d))]
+        dup = int(eo["order_id"].duplicated().sum()) + int(eo["symbol"].duplicated().sum())
+        st = dict(collections.Counter(eo["status"].astype(str)))
+        ok = (len(eo) == k and dup == 0) or (k == 0 and nodec > 0)
+        out("P01", lv(not ok, len(eb) < len(eo)), topk=k, entry_orders=len(eo), entry_fills=len(eb), dup=dup, status=st, no_decision_rows=nodec)
+    @check("P04")
+    def _():
+        tk = pd.read_parquet(ROOT / "parquet/topk_decisions.parquet")
+        t = tk[tk["decision_date"].astype(str).str[:10] == str(d)]
+        ts = {c: pd.to_datetime(t[c], utc=True).dt.tz_convert(KST) for c in ("input_available_at", "inference_started_at", "decided_at")}
+        viol = int((ts["input_available_at"] > ts["inference_started_at"]).sum() + (ts["inference_started_at"] > ts["decided_at"]).sum() + (ts["decided_at"].dt.strftime("%H%M%S") >= "153000").sum())
+        eb = fills[(fills["side"].astype(str) == "buy") & (fills["dd"] == str(d))]
+        fa = pd.to_datetime(eb["filled_at"], utc=True).dt.tz_convert(KST)
+        early = int((fa < ts["decided_at"].max()).sum()) if len(t) and len(eb) else 0
+        out("P04", lv(viol > 0 or early > 0 or len(t) != t["symbol"].nunique()), rows=len(t), causality_violations=viol, fills_before_decision=early, decided_max=ts["decided_at"].max().strftime("%T") if len(t) else "-", first_fill=fa.min().strftime("%T") if len(eb) else "-")
+def b_offsite(d):
+    lr = json.loads((CAP / "offsite/last_run.json").read_text())
+    @check("B01")
+    def _():
+        slot = at(TODAY, "22:15:00") if NOW >= at(TODAY, "22:15:00") else at(TODAY - timedelta(days=1), "22:15:00")
+        started = datetime.fromisoformat(lr["started_at"]).astimezone(KST)
+        seal = lr["steps"].get("capture_seal", {})
+        steps_bad = [k for k, v in lr["steps"].items() if v.get("status") not in ("ok", "deferred")]
+        inprog = (CAP / "offsite/in_progress.json").exists()
+        late = (started - slot).total_seconds() / 60
+        out("B01", lv(lr["status"] != "ok" or bool(steps_bad) or started < slot - timedelta(minutes=1) or seal.get("missing_sealed_members", 1) != 0 or not lr["core_panels"],
+                       late > 15 or seal.get("deferred_dates", 0) > 0 or inprog),
+            status=lr["status"], started=started.strftime("%m-%d_%T"), start_delay_min=round(late, 1), steps_bad=steps_bad or "-", segments=seal.get("segments_committed"), deferred=seal.get("deferred_dates"), missing_sealed=seal.get("missing_sealed_members"), in_progress=inprog, core_issues=lr["steps"].get("core_panels", {}).get("issues"))
+    @check("B02")
+    def _():
+        started = datetime.fromisoformat(lr["started_at"]).timestamp()
+        res, bad = {}, []
+        for tier in ("raw", "normalized", "manifests"):
+            lp = CAP / f"offsite/ledger/{tier}/{d}.jsonl"
+            local = CAP / tier / str(d)
+            if not local.exists():
+                res[tier] = "no_local"
+                continue
+            segs = [json.loads(l) for l in lp.read_text().splitlines() if l.strip()] if lp.exists() else []
+            members = {m["path"] for s in segs for m in s["members"]}
+            unsealed = 0
+            for r, _, fs in os.walk(local):
+                for f in fs:
+                    full = Path(r) / f
+                    if f.endswith(".lock") or f.startswith("stage-") or full.is_symlink():
+                        continue
+                    if full.stat().st_mtime < started and full.relative_to(CAP).as_posix() not in members:
+                        unsealed += 1
+            dirs = {s["remote_path"].rsplit("/", 1)[0] for s in segs}
+            remote = set()
+            for dr in dirs:
+                remote |= {x.strip() for x in sh([RCLONE, "lsf", "--files-only", dr], 120).splitlines()}
+            missing = sum(s["remote_path"].rsplit("/", 1)[1] not in remote for s in segs)
+            res[tier] = f"segs{len(segs)}:remote_missing{missing}:unsealed_pre_run{unsealed}"
+            if not segs or missing or unsealed:
+                bad.append(tier)
+        out("B02", lv(bool(bad)), date=d, **res)
+    @check("B04")
+    def _():
+        hist = json.loads((CAP / "offsite/deferred_history.json").read_text())[-5:]
+        tr = [int(e.get("deferred_dates", -1)) for e in hist]
+        stall = len(tr) >= 3 and tr[-1] > 0 and tr[-1] >= tr[-2] >= tr[-3]
+        old = hist[-1].get("oldest_deferred_date") if hist else ""
+        aged = bool(old) and (TODAY - date.fromisoformat(old)).days > 21
+        seal_ok = lr["steps"].get("capture_seal", {}).get("status") == "ok"
+        out("B04", lv(stall or aged, not seal_ok), trend=tr, oldest=old or "-", seal_status_ok=seal_ok)
+def b_prune():
+    @check("B05")
+    def _():
+        last = TODAY if NOW >= at(TODAY, "21:05:00") and TODAY.weekday() < 5 else TODAY - timedelta(days=1)
+        while last.weekday() >= 5:
+            last -= timedelta(days=1)
+        summ = jr("backup-prune", at(last, "20:59:00"), at(last, "23:59:00"), r"stage=backup_prune (dry_run|step=)")
+        failed = [l for l in summ if "status=failed" in l]
+        kept = re.search(r"sealed_kept=(\d+)", summ[-1]).group(1) if summ and "sealed_kept" in summ[-1] else "?"
+        ages = {}
+        for sub in ("data", "artifacts"):
+            ds = [x.strip("/") for x in sh([RCLONE, "lsf", "--dirs-only", f"{REMOTE}/_deleted/{sub}"], 120).splitlines()]
+            ds = sorted(x for x in ds if re.fullmatch(r"\d{4}-\d{2}-\d{2}", x))
+            over_now = sum(date.fromisoformat(x) < last - timedelta(days=30) for x in ds)
+            next_batch = sum(date.fromisoformat(x) < TODAY + timedelta(days=1) - timedelta(days=30) for x in ds)
+            ages[sub] = f"n{len(ds)}:oldest{ds[0] if ds else '-'}:over30_at_last_prune{over_now}:due_next{next_batch}"
+            if over_now or next_batch >= 7:
+                failed.append(f"{sub}:cap_risk" if next_batch >= 7 else f"{sub}:not_purged")
+        cutoff = last - timedelta(days=30)
+        kept_local = []
+        for tier in ("raw", "normalized", "manifests"):
+            for p in (CAP / tier).iterdir():
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.name) and date.fromisoformat(p.name) < cutoff and datetime.fromtimestamp(p.stat().st_mtime, KST) < at(last, "21:00:00"):
+                    kept_local.append(f"{tier}/{p.name}")
+        out("B05", lv(not summ or bool(failed), kept != "0" or bool(kept_local)), last_prune=last, summary=bool(summ), failed=failed or "-", sealed_kept=kept, kept_local_pre_prune=kept_local[:5] or "-", remote_deleted=ages)
+def a_heartbeat(expect_date=None):
+    @check("A01")
+    def _():
+        h = heartbeat()
+        rec = datetime.fromisoformat(h["reconciled_at"]).astimezone(KST)
+        in_hours = at(TODAY, "07:00:00") <= NOW <= at(TODAY, "23:05:00")
+        age = (NOW - rec).total_seconds() / 60
+        keys = [i.get("key") for i in h.get("open_issues", [])]
+        out("A01", lv(h.get("schema_version") != 2 or h.get("undelivered_alerts", 1) != 0 or (in_hours and age > 15) or (expect_date is not None and h.get("snapshot_date") != str(expect_date)), bool(keys) or h.get("severity") != "OK"),
+            snapshot=h.get("snapshot_date"), severity=h.get("severity"), reconciled_age_min=round(age, 1), undelivered=h.get("undelivered_alerts"), open_issues=keys[:8] or "-", provisional=h.get("provisional_reasons") or "-")
+def x_tokens(since, units="kca-*"):
+    @check("X01")
+    def _():
+        pat = r"IGW00201|EGW00201|EGW00133|EGW00121|AUTH_REJECTED|ADOPTED_ROTATED|TokenIssueThrottled|HostBrokerDirNotSharedError|AdmissionDirNotSharedError|SCHEMA_INVALID|TokenStoreLockTimeout|TOKEN_REPLACED|http=429"
+        hits = collections.Counter(m for l in jr(units, since, pat=pat) for m in re.findall(pat, l))
+        hard = {k: v for k, v in hits.items() if k in ("HostBrokerDirNotSharedError", "AdmissionDirNotSharedError", "SCHEMA_INVALID")}
+        out("X01", lv(bool(hard), bool(hits)), since=since.strftime("%m-%d_%H:%M"), hits=dict(hits) or "-")
+def a_alerts(since):
+    @check("A03")
+    def _():
+        failed = sorted({m for l in jr("kca-*", since, pat=r"Failed with result") for m in re.findall(r"(kca-[a-z0-9-]+\.service)", l)})
+        alerts = " ".join(jr("kca-alert@*", since, pat=r"Finished|Failed"))
+        unalerted = [u for u in failed if u not in alerts]
+        out("A03", lv(bool(unalerted), bool(failed)), failed_units=failed or "-", unalerted=unalerted or "-")
+def c_complete(d):
+    @check("C11")
+    def _():
+        import contextlib, io
+        from src.tools.daily_audit import audit_daily_completeness
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            r = audit_daily_completeness(str(d))
+        ran = jr("daily-audit", at(d, "21:19:00"), at(d, "23:59:00"), r"stage=daily_audit day=")
+        fail = jr("daily-audit", at(d, "21:19:00"), at(d, "23:59:00"), rf"step=intraday_complete status=FAIL date={d}")
+        r["intraday_complete"] = bool(ran) and not fail
+        miss = [k for k, v in r.items() if not v]
+        out("C11", lv(bool(miss)), keys=len(r), missing=miss or "-", audit_ran=bool(ran))
+def r_degraded(d):
+    @check("R03")
+    def _():
+        o = outcomes(d)
+        bad = {j: f"{r['outcome']}:{r.get('reason', '')[:60]}" for j, r in o.items() if r["outcome"] in ("DEGRADED", "NO_DECISION")}
+        out("R03", lv(False, bool(bad)), date=d, jobs=len(o), degraded=bad or "-")
 ```
 
-- Day kinds: `STANDARD`/`SHIFTED` trading, `CLOSED` weekend/holiday, `UNKNOWN` = calendar not extended (finding).
-- All completeness keys (`archive close_confirmed decision paper_entry paper_exit minute_bars price_history_fresh`) must be `True`.
-- SSH failure = P0 (retry once after 30 s). Uptime shorter than the last check = reboot: `Persistent=true` timers catch up, others are skipped.
+Window M (next-morning):
 
-## 3. Schedule and Expected Evidence (29 timers, all KST)
-
-Containerized units run `ExecStart=%h/.local/lib/kca/kca-run <job> [--kis-data] [--admission critical|standard|bulk] [--role decision|batch] [--resource …] -- uv run python -m <module>`
-(installed from `deploy/host/kca-run`; image `ghcr.io/kthyeong/k-closing-alpha:latest`; `--user 1001:1001`; `--kis-data` adds
-`kis-data.env`; `--admission` mounts `~/.cache/kis` and sets `BROKER_ADMISSION_CLASS`; `--role` sets `KIS_DATA_ROLE`). Host units
-(`flock … uv run`) are marked *host*. Normal runtimes observed 2026-10-12..16.
-
-| KST | Unit | Flags | Timeout | Normal runtime / evidence | If not |
-|---|---|---|---|---|---|
-| 07:00–23:00 /10 min, daily | `kca-audit-reconcile` (host) | `flock -E 75 kca-audit.lock` | 9 min | ~1–2 s; heartbeat `reconciled_at` advances; busy lock exits 75 = success | P2 |
-| Mon–Fri 07:05 | `kca-kis-token-warmup` | kis-data, critical | 5 min | ~6 s; `stage=kis_token_warmup slot=<DATA_1..5,PRIMARY,TRADING_MOCK> issued=True`; `CLOSED` → `SKIP reason=non_trading_day` | P1 |
-| Mon–Fri 07:10 | `kca-kiwoom-token-rotate` | critical | 5 min | ~5 s; `status=ROTATED` or `UNCHANGED` | P1 |
-| daily 07:40 and 17:40 | `kca-api-notice-watch` | none (`uv run`, host) | default | silent unless a broker notice touches our API surface; timer `enabled active`, last run `Result=success` | P2 |
-| Mon–Fri 08:30 / 11:30 | `kca-price-ingest` | kis-data, standard | 45 min | 08:30 ~8 min, ingests `D-1` (~2,762 rows); 11:30 ~1 min, `n_new_rows=0` when 08:30 succeeded; 08:30 may log INFO `stale_panel_pending_retry` (healthy if 11:30 is OK); 11:30 DEGRADED `stale_panel` needs an alert | P1 |
-| Mon–Fri 08:39:55 | `kca-auction-open` (optional) | kis-data, critical, batch | 40 min | runs to ~09:03; `auction_capture status=COMPLETE phase=open` | P2 |
-| Mon–Fri 08:40:10 | `kca-order-exit` | critical | 18 min | ~20 s; outcome `OK`, or `SKIPPED no_open_positions`/`trading_disabled` | P0 |
-| Mon–Fri 09:00:40 | `kca-order-reconcile-exit` | critical | 32 min | ~5 s; outcome `OK`/`SKIPPED no_orders` | P1 |
-| Mon–Fri 09:01 | `kca-paper-exit` | kis-data, critical, decision | 15 min | ~5 s; every older open lot sold before 09:30 | P0 |
-| Mon–Fri 15:20:00 | `kca-collect` | kis-data, critical, decision | 9 min | 25–95 s (scales with `n_raw` 93–1,247); `realtime_coverage … coverage=1.0000 status=COMPLETE` | P0 |
-| Mon–Fri 15:21 | `kca-predict` | kis-data, critical | 7 min | starts when collect ends (`After=`); ~12 s; outcome `OK` **before 15:30:00** | P0 |
-| Mon–Fri 15:21:05 | `kca-auction-close` (optional) | kis-data, critical, batch | 15 min | starts after collect; ~8 min; research | P2 |
-| Mon–Fri 15:21:15 | `kca-order-entry` | critical | 8 min | ~45 s; waits for predict; `[EXEC] stage=order_session env=<mock\|live> phase=entry … outcome=OK` | P0 |
-| Mon–Fri 15:30:30 | `kca-finalize-close` | kis-data, critical, decision | 12 min | 10 s–2.5 min; ExecStopPost starts `kca-paper-entry` | P0 |
-| Mon–Fri 15:30:40 | `kca-order-reconcile-entry` | critical | 12 min | ~5 s; outcome `OK` (`DEGRADED broker_unreadable` needs an alert) | P1 |
-| Mon–Fri 15:34 | `kca-paper-entry` | kis-data, critical, decision | 10 min | runs twice (finalize trigger + timer); `SKIP reason=already_recorded` on the second is healthy | P0 |
-| Mon–Fri 15:40 | `kca-archive-intraday-regular` | kis-data, standard | 3 h | 28–57 min; regular 1m + ticks partitions for `D` | P1 |
-| Mon–Fri 15:40 | `kca-aftermarket-book` | kis-data, standard, batch | 4 h 40 min | runs to ~19:59 by design (≈92 % of timeout is normal) | P2 |
-| Mon–Fri 15:45 | `kca-auction-path` | kis-data, bulk | 3 h 20 min | ~9 min; outcome `auction_path OK` | P2 |
-| Mon–Fri 20:05 | `kca-archive-intraday` | kis-data, standard | 3 h | 9–33 min; nxt/krx aftermarket + nxt premarket partitions | P1 |
-| Mon–Fri 20:35 | `kca-tape-sweep` | bulk | 60 min | starts after archive-intraday ends; 24–31 min; `last_report.json` `run_date=D` | P1 |
-| Mon–Fri 21:00 | `kca-backup-prune` (host) | `flock quant-gdrive.lock` | 3 h | ~2 min; `stage=backup_prune … purged=… sealed_removed=…` | P2 |
-| Mon–Fri 21:20 | `kca-daily-audit` (host) | `flock kca-audit.lock` | 30 min | 1.5–4.5 min incl. ~80 s `sudo chown -R` pre-step; subject `🟢 … 일일점검 완료` | P1 |
-| Mon–Fri 21:35 | `kca-altdata-capture` (optional) | kis-data, standard, batch | 30 min | 4–6 min | P2 |
-| Daily 22:15 | `kca-backup` (host) | `flock quant-gdrive.lock` | 3 h | 3–10 min incl. ~95 s chown pre-step; `offsite_backup status=ok` | P0 shrink / P1 fail |
-| daily 23:05 | `kca-extended-backfill` | kis-data, bulk, batch | 8 h | ~2.5 min (weekends too); `extended_backfill status=DONE`; run_outcome job=extended_backfill outcome=OK | P2 |
-| Sat 22:00 | `kca-retrain` | `--memory=6g --cpus=1.8 --memory-swap=8g` | 2 h | registry row `PROMOTED`; a strategy change yields `REJECTED` + unit failure by design (§10) | P1 |
-| Sun 10:00 | `kca-core-snapshot` (host) | `flock quant-gdrive.lock` | 2 h | ~1 min | P1 |
-| Sun 11:00 | `kca-offsite-verify` (host) | `flock quant-gdrive.lock` | 2 h | ~6 min; `missing=0 mismatched=0`, 3 restore drills `OK` | P1 |
-| on failure | `kca-alert@<unit>` (host) | — | 5 min | delivers webhook + mail; also used by `krx-deferred-recreate`, `krx-host-backup` | P1 |
-
-Optional timers (`OPTIONAL_MANUAL_TIMERS` in `src/tools/code_sync.py`): auction-open, auction-close, altdata-capture —
-report their state; all three were enabled on 2026-10-17. Weekday timers fire on weekday holidays; jobs must record `SKIPPED`.
-GitHub `watchdog.yml` (cron `40 22 * * 1-5` UTC = 07:40 KST Tue–Sat) is the external dead-man; GitHub delays it 2–4.5 h.
-
-## 4. Deploy and Scheduler Parity
-
-```bash
-git -C /home/kth/k-closing-alpha fetch -q; git -C /home/kth/k-closing-alpha log -1 --format="%h %ci %s" origin/main
-gh run list --workflow deploy.yml --limit 3 -R kthyeong/k-closing-alpha
-ssh or-vps 'cd ~/k-closing-alpha && git log -1 --format="%h %ci %s" && git status --porcelain | head; \
-  docker images ghcr.io/kthyeong/k-closing-alpha --format "{{.Tag}} {{.ID}} {{.CreatedSince}}"; \
-  cmp -s deploy/host/kca-run ~/.local/lib/kca/kca-run && echo WRAPPER_MATCH || echo WRAPPER_DRIFT; \
-  for f in deploy/systemd/kca-*; do cmp -s "$f" ~/.config/systemd/user/$(basename $f) || echo "DRIFT $(basename $f)"; done; \
-  ls ~/.config/systemd/user/ | grep "^kca-" | while read u; do [ -e deploy/systemd/$u ] || echo "NOT_IN_REPO $u"; done; \
-  for t in deploy/systemd/*.timer; do n=$(basename $t); echo "$n $(systemctl --user is-enabled $n 2>&1) $(systemctl --user is-active $n 2>&1)"; done | grep -v " enabled active$"; \
-  systemctl --user list-units --failed --no-legend; systemctl --user list-timers "kca-*" --all --no-pager'
-ssh or-vps bash -s <<'EOF'
-set -o pipefail
-for f in ~/.config/systemd/user/kca-*.service; do
-  line=$(grep -m1 '^ExecStart=%h/.local/lib/kca/kca-run ' "$f") || continue
-  out=$(eval "~/.local/lib/kca/kca-run --print-argv ${line#ExecStart=%h/.local/lib/kca/kca-run }" 2>&1 | tr '\0' ' '); rc=$?
-  printf '%-36s rc=%s user=%s kis-data=%s admission=%s role=%s\n' "$(basename "$f")" "$rc" \
-    "$(grep -oE -- '--user [0-9:]+' <<<"$out" | cut -d' ' -f2)" "$(grep -c 'kis-data.env' <<<"$out")" \
-    "$(grep -oE 'BROKER_ADMISSION_CLASS=[a-z]+' <<<"$out" | cut -d= -f2)" "$(grep -oE 'KIS_DATA_ROLE=[a-z]+' <<<"$out" | cut -d= -f2)"
-done
-EOF
-ssh or-vps 'cd ~/k-closing-alpha && TZ=Asia/Seoul timeout 60 ~/.local/bin/uv run --no-sync python -c "
-from datetime import datetime; from zoneinfo import ZoneInfo
-from src.tools.deploy_window import DEPLOY_BLACKOUT_WINDOWS, blackout_remaining
-print([(a.isoformat(), b.isoformat()) for a, b in DEPLOY_BLACKOUT_WINDOWS], blackout_remaining(datetime.now(ZoneInfo(\"Asia/Seoul\"))))"'
+```python probe=M
+import pandas as pd
+YDAY = TODAY - timedelta(days=1)
+@check("H01")
+def _():
+    n = sum("kca-" in l for l in sh(["systemctl", "--user", "list-timers", "kca-*", "--all", "--no-legend"]).splitlines())
+    off = [l.split()[0] for l in sh(["systemctl", "--user", "list-unit-files", "kca-*.timer", "--no-legend"]).splitlines() if l.split()[1:2] != ["enabled"]]
+    failed = [l.split()[0] for l in sh(["systemctl", "--user", "list-units", "--failed", "--no-legend", "--plain", "kca-*"]).splitlines() if l.strip()]
+    linger = sh(["loginctl", "show-user", os.environ.get("USER", "ubuntu"), "-p", "Linger", "--value"]).strip()
+    out("H01", lv(n != 29 or bool(failed) or linger != "yes", bool(off)), timers=n, not_enabled=off or "-", failed=failed or "-", linger=linger)
+wk = TODAY.weekday() < 5
+runs("R01", [("archive-intraday", D, "20:05:00", 1), ("tape-sweep", D, "20:35:00", 1), ("backup-prune", D, "21:00:00", 1), ("daily-audit", D, "21:20:00", 1),
+             ("altdata-capture", D, "21:35:00", 1), ("backup", YDAY, "22:15:00", 1), ("extended-backfill", YDAY, "23:05:00", 1)]
+     + ([("kis-token-warmup", TODAY, "07:05:00", 1), ("kiwoom-token-rotate", TODAY, "07:10:00", 1)] if wk and NOW > at(TODAY, "07:12:00") else []))
+expect("R02", YDAY, {"extended_backfill": {"OK"}})
+r_degraded(D)
+@check("R05")
+def _():
+    if not wk or NOW < at(TODAY, "07:12:00"):
+        out("R05", "SKIP(not_due)")
+        return
+    w = " ".join(jr("kis-token-warmup", at(TODAY, "07:04:00"), pat=r"stage=kis_token_warmup|non_trading_day"))
+    slots = sorted(set(re.findall(r"slot=(\w+) key_id=\w+ issued=True", w)))
+    rot = jr("kiwoom-token-rotate", at(TODAY, "07:09:00"), pat=r"status=(ROTATED|UNCHANGED)")
+    skipped = "non_trading_day" in w
+    out("R05", lv(not skipped and (len(slots) < 7 or not rot)), kis_slots=len(slots), slots=slots or "-", kiwoom=bool(rot), closed_skip=skipped)
+c_decision(D)
+c_manifests_live(D)
+c_complete(D)
+q_partitions(D)
+p_ledger(D, P, morning=False)
+b_offsite(D)
+b_prune()
+a_heartbeat(expect_date=D)
+a_alerts(at(D, "15:00:00"))
+x_tokens(at(D, "15:00:00"))
+@check("A04")
+def _():
+    s = json.loads(Path("/home/ubuntu/quant-dashboard/public/status.json").read_text())
+    proj = [p for p in s["projects"] if "closing" in p["name"] or p["name"] in ("kca",)]
+    bad = [(c["id"], c["level"]) for p in proj for c in p["checks"] if c["level"] != "OK"]
+    out("A04", lv(False, bool(bad) or not proj), generated=s["generated_at"][:16], card=[p["name"] for p in proj], non_ok=bad or "-")
 ```
 
-| ID | Check | Severity if not |
-|---|---|---|
-| DEP-01 | VPS HEAD == `origin/main`, or the newer commit's deploy is in progress / waiting on the blackout (`deploy.yml` step `blackout_wait`) | P1 |
-| DEP-02 | `git status --porcelain` empty; `latest` image ID == `sha-<HEAD>` image ID | P1 |
-| DEP-03 | `WRAPPER_MATCH`; no `DRIFT`; no `NOT_IN_REPO` (the former `kca-kis-token-warmup.service.d` drop-in is gone since the warmup unit carries kis-data itself; 2026-10-20) | P1 |
-| DEP-04 | 22 wrapper units print `rc=0 user=1001:1001` with the flags of §3 (a `USAGE_ERROR` line = unit cannot start) | P1 |
-| SCH-01 | all 29 timers `enabled active`; `Linger=yes`; no `--failed` units | P1 |
-| SCH-02 | each timer's `LAST` equals its most recent slot (UTC→KST). Units started by `After=` ordering or by remediation do not move `LAST` | P1 |
-| SCH-03 | blackout windows print `[('08:30:00','09:40:00'), ('15:10:00','15:43:00')]` | P2 |
+Window O (post-exit):
 
-## 5. Run Evidence
-
-```bash
-ssh or-vps 'for s in $(systemctl --user list-unit-files "kca-*.service" --no-legend | awk "{print \$1}" | grep -v "@"); do \
-  r=$(systemctl --user show $s -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp --value | tr "\n" "|"); \
-  j=$(journalctl --user -u $s --since "-8d" --no-pager -o cat | grep -cE "^Finished "); \
-  f=$(journalctl --user -u $s --since "-8d" --no-pager -o cat | grep -cE "Failed with result|Main process exited, code=exited, status=[1-9]"); \
-  printf "%-38s fin8d=%-4s fail8d=%-3s %s\n" $s $j $f "$r"; done'
-ssh or-vps 'journalctl --user -u kca-<name>.service --since "<UTC from k>" --until "<UTC from k>" --no-pager -o short-iso \
-  | grep -vE "pam_unix|COMMAND=" | grep -E "Starting|Finished|Failed|Consumed|stage=|outcome=" | cut -c1-250 | tail -30'
-ssh or-vps 'cd ~/k-closing-alpha/data/logs/events/<YYYY-MM> && python3 - <D>' <<'EOF'
-import collections, json, sys
-D = sys.argv[1]
-rows = [json.loads(l) for l in open(f"{D}.jsonl") if l.strip()]
-print(D, dict(collections.Counter(r.get("outcome") for r in rows)))
-for r in rows:
-    print(f"  {r['ts'][11:19]} {r['job']:<24} {r['outcome']:<11} {r.get('reason', '')}")
-EOF
+```python probe=O
+import pandas as pd
+runs("R01", [("price-ingest", D, "08:30:00", 1), ("auction-open", D, "08:39:55", 1), ("order-exit", D, "08:40:10", 1),
+             ("order-reconcile-exit", D, "09:00:40", 1), ("paper-exit", D, "09:01:00", 1)])
+o = expect("R02", D, {"price_ingest": {"OK"}, "order_exit": {"OK", "SKIPPED:no_open_positions", "SKIPPED:trading_disabled"},
+                      "order_reconcile_exit": {"OK", "SKIPPED:no_orders", "SKIPPED:trading_disabled"}})
+@check("C07")
+def _():
+    m = o["price_ingest"]["metrics"]
+    out("C07", lv(m["panel_max_date"] != str(P) or m["stale_panel"] or m["panel_max_date"] != m["expected_panel_date"], bool(m.get("flow_shortfall")) or bool(m.get("program_flow_shortfall"))),
+        panel_max=m["panel_max_date"], expected=P, new_rows=m["n_new_rows"], stale=m["stale_panel"], flow_shortfall=m.get("flow_shortfall") or "-")
+@check("Q05")
+def _():
+    ph = pd.read_parquet(ROOT / "history/price_history.parquet", columns=["date", "symbol", "high", "low", "close_raw", "volume", "kospi_pct"])
+    ph["day"] = ph["date"].astype(str).str[:10]
+    cnt = ph.groupby("day").size()
+    last, base = int(cnt.get(str(P), 0)), float(cnt[cnt.index < str(P)].tail(5).median())
+    dd = ph[ph["day"] == str(P)]
+    bad = int(((dd["high"] < dd["low"]) | (dd["close_raw"].astype(float) <= 0) | (dd["volume"] < 0)).sum())
+    dup, tdup, kp = int(dd["symbol"].duplicated().sum()), int(ph.duplicated(["date", "symbol"]).sum()), int(dd["kospi_pct"].nunique())
+    r = last / base if base else float("nan")
+    out("Q05", lv(last == 0 or bad > 0 or dup > 0 or tdup > 0 or kp > 1, not 0.97 <= r <= 1.03), day=P, rows=last, prev5_median=int(base), ratio=round(r, 3), invalid=bad, dup=dup, dup_total=tdup, kospi_pct_distinct=kp)
+@check("C05")
+def _():
+    if not timer_active("auction-open"):
+        out("C05", "SKIP(timer_off)")
+        return
+    st = manifest_status(D, f"auction-open-{D}-")
+    j = jr("auction-open", at(D, "08:39:00"), at(D, "09:40:00"), r"stage=auction_capture status=\w+ phase=open")
+    out("C05", lv(not st, "complete" not in st.values()), open=",".join(st.values()) or "missing", journal=j[-1].split("status=")[1][:40] if j else "absent")
+p_ledger(D, P, morning=True)
+@check("P06")
+def _():
+    ex, rc = o["order_exit"].get("metrics", {}), o["order_reconcile_exit"].get("metrics", {})
+    if o["order_exit"]["outcome"] == "SKIPPED":
+        out("P06", "SKIP(" + o["order_exit"].get("reason", "") + ")")
+        return
+    acc = ex.get("n_acked", 0) + ex.get("n_rejected", 0) + ex.get("n_skipped", 0)
+    bad = ex.get("n_unknown", 1) or ex.get("n_unknown_unresolved_total", 1) or rc.get("n_unknown", 1) or rc.get("n_missing_at_broker", 1) or rc.get("position_shortfalls") or rc.get("n_unknown_unresolved_total", 1)
+    out("P06", lv(bool(bad) or acc != ex.get("n_lots"), rc.get("n_filled") != rc.get("n_intents") or ex.get("n_rejected", 0) > 0),
+        env=ex.get("env"), lots=ex.get("n_lots"), acked=ex.get("n_acked"), rejected=ex.get("n_rejected"), unknown=ex.get("n_unknown"), rec_filled=f"{rc.get('n_filled')}/{rc.get('n_intents')}", missing_at_broker=rc.get("n_missing_at_broker"), shortfalls=rc.get("position_shortfalls") or "-")
+a_heartbeat()
+a_alerts(at(D, "07:00:00"))
+x_tokens(at(D, "07:00:00"))
 ```
 
-| ID | Check | Severity if not |
-|---|---|---|
-| RUN-01 | one `Finished` per due unit per day (paper-entry twice, price-ingest twice); `ExecMainStatus=0`. `show` describes only the latest run; use the journal window for `D` | P1 |
-| RUN-02 | runtime inside §3 "normal"; > 70 % of `TimeoutStartSec` is WARN except aftermarket-book (by design) | P2 |
-| RUN-03 | run outcomes for `D`: decision jobs `OK`; `DEGRADED`/`NO_DECISION` need a matching alert (§11); a trading-day `predict` `SKIPPED` is a calendar disagreement; a `DEGRADED` `extended_backfill` now means an actionable failure (transient outage, non-deterministic reason, conflict) — deterministic gaps appear only as `deterministic_failed/exhausted` counts and in `intraday:extended_exhausted_reasons` | P1 |
-| RUN-04 | order units: journal `data/orders/<env>/journal.jsonl` holds the day's intents; current env from `[EXEC] stage=order_session env=…` (mock on 2026-10-16). A stuck `UNKNOWN` intent is operator-only (`src.daily.order_resolve`, dry-run first) | P0 |
-| RUN-05 | `CLOSED` day: weekday units log `SKIP reason=non_trading_day` and record `SKIPPED`; rows written on a closed day = calendar bug | P1 |
-| RUN-06 | `Traceback` in a job that exited 0, or `status=DEGRADED` without an outcome/heartbeat entry, is a silent failure | P2 |
+Window E (post-decision):
 
-Containers are `--rm`: after a run `docker logs` is empty and the journal is the only record.
-
-## 6. Shared Host Broker Directory (host broker contract v1)
-
-Contract: `src/api/host_broker_contract.py`, byte-identical to krx-alpha `deploy/shared/host_broker_contract.py`
-(sha256 `0bfab4cc…`). Shared by kca, krx-collector and kse. KIS slot ownership: `deploy/shared/kis_slot_assignments.toml`
-(canonical in krx-alpha). Valid names in `~/.cache/kis` (each may have a `<name>.lock` sibling):
-
-| Kind | Name pattern | Writer |
-|---|---|---|
-| marker | `.host-admission` | `deploy/install_systemd.sh` (touched every deploy) |
-| token (LS, Toss, DB) | `token_<ls\|toss\|dbsec>_<sha12>.json` | shared token store (Kiwoom has no token file; pacing only) |
-| DB issue guard | `token_issue_dbsec_<sha12>.state` | 61 s issue spacing |
-| pacing | `admission_<vendor>_<sha12>[_<scope>].state` (scope case-preserving, e.g. `_RANKING`, `_ka10079`, `_chart`) | host pacer |
-| legacy KIS | `token_<sha12>.json`, `tps_<sha12>.state` | KIS key pool (one per slot + PRIMARY + TRADING_MOCK) |
-
-```bash
-ssh or-vps python3 - <<'EOF'
-import os, re, time
-d = os.path.expanduser("~/.cache/kis")
-V, H = "(ls|toss|dbsec|kiwoom)", "[0-9a-f]{12}"
-ok = [r"\.host-admission", rf"token_{V}_{H}\.json", rf"token_issue_{V}_{H}\.state",
-      rf"admission_{V}_{H}(_[A-Za-z0-9_-]+)?\.state", rf"token_{H}\.json", rf"tps_{H}\.state"]
-st = os.stat(d)
-print(f"dir mode={oct(st.st_mode & 0o777)} marker={os.path.isfile(os.path.join(d, '.host-admission'))}")
-names, now = sorted(os.listdir(d)), time.time()
-for n in names:
-    base = n[:-5] if n.endswith(".lock") else n
-    s = os.stat(os.path.join(d, n))
-    if not any(re.fullmatch(r, base) for r in ok):
-        print(f"NONCONTRACT {n} size={s.st_size} age_d={(now - s.st_mtime) / 86400:.1f}")
-    elif n.endswith(".lock") and base not in names:
-        print(f"ORPHAN_LOCK {n} age_d={(now - s.st_mtime) / 86400:.1f}")
-    if s.st_uid != os.getuid():
-        print(f"FOREIGN_OWNER {n} uid={s.st_uid}")
-print(f"total={len(names)}")
-EOF
-ssh or-vps 'stat -c "%a %U:%G %n" ~/.cache/kis ~/quant-secrets ~/quant-secrets/*.env; ls -la ~/.cache/kis | awk "{print \$1, \$3, \$5, \$6, \$7, \$8, \$9}"'
-ssh or-vps 'journalctl --user -u "kca-*" -u "kse-*" --since "-8d" --no-pager -o cat | grep -oE "IGW00201|EGW00201|EGW00133|TokenIssueThrottled|HostBrokerDirNotSharedError|AdmissionDirNotSharedError|SCHEMA_INVALID|TokenStoreLockTimeout|TOKEN_REPLACED|http=429" | sort | uniq -c; \
-  timeout 60 docker logs --since 168h krx-collector 2>&1 | grep -oE "IGW00201|EGW00201|TokenIssueThrottled|HostBrokerDirNotSharedError|SCHEMA_INVALID" | sort | uniq -c; \
-  journalctl --user -u kca-kis-token-warmup.service -u kca-kiwoom-token-rotate.service --since "-2d" --no-pager -o cat | grep -E "stage=" | cut -c1-200 | tail -15'
-```
-
-| ID | Check | Severity if not |
-|---|---|---|
-| BRK-01 | dir mode `700`, owner `ubuntu`, `marker=True` (missing marker → every container job raises `HostBrokerDirNotSharedError`) | P0 |
-| BRK-02 | no `NONCONTRACT`, `ORPHAN_LOCK` or `FOREIGN_OWNER` lines (root-owned files come from the root `krx-collector` container and are re-owned by the reconcile `sudo chown`, every 10 min 07:00–23:00) | P2 |
-| BRK-03 | zero `IGW00201` (LS/DB throttle), `EGW00201` (KIS TPS), `EGW00133` (KIS token issue limit), `TokenIssueThrottled`, `HostBrokerDirNotSharedError`/`AdmissionDirNotSharedError`, `SCHEMA_INVALID` (corrupt shared token record). Any hit 15:20–15:31 KST | P1 (else P2) |
-| BRK-04 | warmup on the last trading day: one `issued=True` per slot (`DATA_1..5`, `PRIMARY`, `TRADING_MOCK`); legacy `token_<sha12>.json` mtimes = that 07:05 run | P1 |
-| BRK-05 | env files `600`, `~/quant-secrets` `700` | P1 |
-| BRK-06 | `docker logs --since` covers only the current krx-collector container lifetime; say so if it restarted | info |
-
-## 7. Host Resources and Storage
-
-```bash
-ssh or-vps 'df -h /; df -i / | tail -1; free -h | sed -n 2,3p; docker system df; docker ps --format "{{.Names}} {{.Image}} {{.Status}}"; journalctl --user --disk-usage; \
-  cd ~/k-closing-alpha && nice -n 19 du -sh data artifacts; for d in data/history data/history/capture; do nice -n 19 du -sh $d/* | sort -h | tail -6; done'
-ssh or-vps 'cd ~/k-closing-alpha && nice -n 19 find data artifacts -maxdepth 4 \( -name "*.bak*" -o -name "*.pre_*" -o -name "*.stale*" \) -printf "%TY-%Tm-%Td %s %p\n"; ls ~/ops-scratch ~/k-closing-alpha/scratch 2>&1 | head'
-```
-
-| ID | Check | Severity if not |
-|---|---|---|
-| HOST-01 | disk < 80 %, inodes < 80 % (2026-10-17: 24 %, 143 GiB free; inodes 7 %). kca data 8.9 GiB, of which `capture/raw` ~250–460 MB per trading day, held 30 days locally | P1 |
-| HOST-02 | memory available > 2 GiB at rest; `kca-backup` peak 1–3.5 GiB, `kca-daily-audit` 1.4 GiB, retrain capped at 6 GiB | P2 |
-| HOST-03 | no `kca-*` container outside its §3 window (hung unit) and no exited `kca-*` leftovers | P1 |
-| HOST-04 | kca images: `latest` + newest 5 `sha-*` tags (pruned daily 05:30 KST by krx-alpha `vps-image-gc.timer`, `--keep 5`) | P2 |
-| HOST-05 | stray files: known on 2026-10-17 — `security_classification.parquet.pre_backfill_20261004`, `sizing_pipeline_bundle.joblib.{bak,pre_002_20261011}`, `~/ops-scratch/` (old audit scripts). Report new ones; list known ones once | P2 |
-
-## 8. Data Integrity (presence is not correctness)
-
-Run Appendix A on every `D` (outside blackout). Levels: L1 presence (`DI-ARCH-01`, `DI-PH-02`, `DI-1M-01`, `RS-07`, `RS-09`),
-L2 structure (`DI-ARCH-02/03/06`, `DI-PH-03/04/06`, `DI-1M-02/03`), L3 cross-source (`DI-ARCH-07/08`, `DI-1M-04/05/06`),
-L4 causality (`DI-ARCH-09`, `DI-TOPK-01`: snapshot ≤ feature_available ≤ inference ≤ decided < 15:30 ≤ execution).
-
-- Archive rows follow the market screen (93–1,247 per day observed); `DI-ARCH-01` ratio WARN is informational unless `collect` coverage < 1.
-- `DI-ARCH-09` share of snapshots inside 15:20:xx drops when `n_raw` is large (0.694 at 1,247 rows on 10-16); causality violations must stay 0.
-- `price_history` for `D` lands at the next 08:30 ingest; the probe compares `D-1` on the evening of `D`.
-- Stored 1m volume ≈ 0.96 of EOD volume for vendor `ls`; judge drift vs the printed baseline, not the level.
-- `등락률` is computed on the final close (`종가`), not `결정_종가`; their gap p99 ≲ 3 % is normal.
-- Tick vs bar gaps with a `tape_complete` proof are vendor differences (`tick_source_diff` outcome, info note); only `certified_gap`/`source_diff_systemic` warn.
-- Manual spot check: 2 top-k symbols + 1 random symbol agree across archive close, `price_history.close_raw`, last 1m bar, paper entry fill.
-
-| ID | Check | Severity if not |
-|---|---|---|
-| DI-1M-07 | Every journal `stage=intraday_replace status=SHRINK_ALLOWED` has a matching `backups/intraday/<session>/<date>/*-pre-*.parquet`; report `NOT VERIFIED` if the directory cannot be listed | P0 |
-
-## 9. Paper Ledger and Orders
-
-| ID | Check | Severity if not |
-|---|---|---|
-| PAP-01 | open lots belong only to decision date `D` after `D`'s entry; an older `decision_date` = missed exit | P0 |
-| PAP-02 | `D` has entry fills for the persisted top-k or a `paper/decisions.parquet` NO_DECISION row | P0 |
-| PAP-03 | every `D-1` lot has a sell fill with `trigger` and a `trades` row | P0 |
-| PAP-04 | `DI-PAPER-01..06` PASS (nav = cash + open MV, no duplicate nav days/fills, cost monotone, friction on every trade, net = gross − cost) | P0 |
-| PAP-05 | order journal intents for `D` match the top-k (`n_picks == n_acked + n_rejected + n_not_sent`), no lingering `UNKNOWN` | P0 |
-
-## 10. Models
-
-| ID | Check | Severity if not |
-|---|---|---|
-| ML-01 | `RS-04`: last registry row `PROMOTED`/`PROMOTED_UNGATED`/`MANUAL_HOTFIX` within 8 days and the live `model_version` is in the registry | P1 |
-| ML-02 | Sat retrain journal: a `strategy or screen changed vs live bundle` rejection fails the unit by design; the operator certifies and reruns with `--skip-promotion-gate` (registry `PROMOTED_UNGATED`), then may `reset-failed`. Auto-remediation never reruns retrain (`skipped_forbidden`) | P1 |
-| ML-03 | `RS-03` table digest matches the fit report; `RS-02-*` no FAILED with ≥ 3 attempts | P2 |
-
-## 11. Offsite Backup, Alerts and Heartbeat
-
-```bash
-ssh or-vps 'cd ~/k-closing-alpha/data/history/capture/offsite && ls in_progress.json 2>&1 | tail -1; python3 -c "
-import json
-r = json.load(open(\"last_run.json\")); print({k: r[k] for k in (\"status\", \"started_at\", \"finished_at\")})
-for k, v in r[\"steps\"].items(): print(\" step\", k, json.dumps(v)[:200])
-for p in r[\"core_panels\"]: print(\" core\", p[\"relpath\"], p[\"rows\"], p[\"max_date\"])
-print(\"deferred_tail\", json.load(open(\"deferred_history.json\"))[-3:])"'
-ssh or-vps 'journalctl --user -u kca-backup.service -u kca-backup-prune.service -u kca-offsite-verify.service --since "-8d" --no-pager -o cat \
-  | grep -E "offsite_backup status|stage=backup_prune|offsite_verify|restore_drill" | cut -c1-600 | tail -12'
-ssh or-vps 'R=~/.local/bin/rclone; timeout 120 $R about gdrive: | head -4; timeout 60 $R lsd gdrive:quant-lake/live/k-closing-alpha; \
-  timeout 60 $R lsf gdrive:quant-lake/live/k-closing-alpha/snapshots --max-depth 1 | tail -4; \
-  timeout 60 $R lsf gdrive:quant-lake/live/k-closing-alpha/_deleted/data --max-depth 1 | sort | sed -n "1p;\$p"'
-ssh or-vps 'cd ~/k-closing-alpha && nice -n 19 timeout 600 ~/.local/bin/rclone check data gdrive:quant-lake/live/k-closing-alpha/data --one-way --size-only \
-  --exclude "/history/capture/**" --combined - 2>/dev/null | awk "{c[\$1]++} \$1==\"+\"||\$1==\"*\"{print} END{for(k in c) print \"count\",k,c[k]}" | tail -20'
-ssh or-vps 'cd ~/k-closing-alpha/data/logs && python3 -c "
-import json; h = json.load(open(\"heartbeat/daily_audit.json\"))
-print({k: h.get(k) for k in (\"schema_version\", \"snapshot_date\", \"severity\", \"audit_kind\", \"day_kind\", \"finished_at\", \"reconciled_at\", \"undelivered_alerts\", \"provisional_reasons\")})
-print(\"open\", [i.get(\"key\") for i in h.get(\"open_issues\", [])]); print(\"info\", h.get(\"info_notes\"))"; \
-  cat heartbeat/audit_alert_state.json heartbeat/advisory_streaks.json; tail -n 5 remediation/ledger.jsonl | cut -c1-220'
-ssh or-vps 'journalctl --user -u "kca-alert@*" --since "-8d" --no-pager -o short-iso | grep -E "Starting|Finished|Failed" | cut -c1-200 | tail -8'
-ssh or-vps python3 - <<'EOF'
-import json
-s = json.load(open("/home/ubuntu/quant-dashboard/public/status.json"))
-print(s["generated_at"], s["level"], s.get("market_day"))
-for p in s["projects"]:
-    print(p["name"], len(p["checks"]), [(c["id"], c["level"], c["detail"][:120]) for c in p["checks"] if c["level"] != "OK"])
-EOF
-gh run list --workflow watchdog.yml --limit 5 -R kthyeong/k-closing-alpha
-```
-
-| ID | Check | Severity if not |
-|---|---|---|
-| BAK-01 | `last_run.json` `status=ok`, every step ok, `started_at` after the last daily 22:15 slot (+0–2 min chown pre-step); `in_progress.json` exists only while a run is active and before its `deadline_at` | P1 |
-| BAK-02 | `core_panels` rows never shrink between nights | P0 |
-| BAK-03 | `deferred_dates` 0, or draining; stalled 3 runs or oldest deferred > 21 days = WARN | P2 |
-| BAK-04 | Sun verify `missing=0 mismatched=0`, restore drills `OK` for raw, normalized, manifests | P1 |
-| BAK-05 | `snapshots/` newest = last Sunday; `_deleted/data` oldest ≤ 30 days at the last weekday prune (weekends add up to 2 days) | P2 |
-| BAK-06 | `rclone check` `+`/`*` entries only for files modified after `last_run.started_at` (heartbeat, extended-backfill partitions, ledgers) | P1 |
-| BAK-07 | local sealed capture older than 30 days is removed by backup-prune; dates kept past that (`sealed_kept>0`) are named in the report | P2 |
-| ALR-01 | heartbeat `schema_version 2`, `snapshot_date` = latest weekday audited, `undelivered_alerts 0`, `reconciled_at` within 10 min during 07:00–23:00 | P1 |
-| ALR-02 | every `open_issues` key maps to a finding; ledger rows `started` without a later `resolved`/`unresolved` are in flight; `unresolved`/`skipped_budget` need the operator | P1 |
-| ALR-03 | every failed unit produced a `kca-alert@<unit>` that `Finished` | P1 |
-| ALR-04 | dashboard kca card non-OK ⇔ a current finding | P1 |
-| ALR-05 | `watchdog.yml` last 5 scheduled runs `success` | P1 |
-
-## 12. Cross-Project Contention Map
-
-| KST | kca | Neighbour | Shared resource | Watch for |
-|---|---|---|---|---|
-| 07:05 | token warmup (7 KIS keys) | krx-collector relies on it (krx deploy enables the timer and adds the drop-in) | KIS tokens, issue limit | `EGW00133` |
-| 07:58–08:50 | — | krx premarket WS slot 5; `kse-morning` 08:32 (kse repo `config/providers.toml` `pool_slot = 5`, bulk) | KIS data slot 5 (kse not in the slot table) | `EGW00201` |
-| 08:30–09:03 | price-ingest, auction-open (slot 3), order-exit, paper-exit | `kse-auction-open` 08:39:30 (kis-data) | KIS data keys | `EGW00201`, late paper-exit |
-| 15:20–15:30 | collect/predict/finalize (slots 1, 5 decision) | krx snapshot REST slot 2 until 15:39 | KIS slots per slot table | `EGW00201` on the decision chain = P1 |
-| 15:40–20:00 | aftermarket-book, archive-regular (slots 2, 3), auction-path | krx aftermarket WS slots 1–4; krx-collector (same LS app key) | KIS keys (REST vs WS), LS key | `IGW00201` |
-| 20:35–21:10 | tape-sweep (Kiwoom) | `kse-collect-dbsec` 20:40 (DB) | different vendors; shared DB token | `TokenIssueThrottled` |
-| 21:00–02:30 | backup-prune, backup, core-snapshot, offsite-verify | `kse-backup` 02:30 | `flock %t/quant-gdrive.lock` | late backup start |
-| 23:05 | extended-backfill (slots 2, 3) | — | KIS slots | `EGW00201` |
-| every 10 min | audit-reconcile `sudo chown -R ~/.cache/kis` | krx-collector runs as root with `~/.cache/kis` mounted rw | file ownership | `FOREIGN_OWNER`, `PermissionError` |
-| on deploy | — | krx deploy writes `~/.config/systemd/user/kca-kis-token-warmup.service.d/10-kis-data-env.conf`; `krx-*` units use `OnFailure=kca-alert@` | kca unit namespace | drift invisible to kca `code_sync` |
-
-## 13. Known Standing Conditions and Pitfalls
-
-- **Failed state persists** until the unit's next run (e.g. retrain until next Saturday unless the operator runs `reset-failed`). Report cause, whether the deployed commit fixed it, and when it clears.
-- **Extended backfill `pending_manifest_conflict`**: fixed to publish one task-level PENDING checkpoint before fan-out; after this fix is deployed, any `pending_manifest_conflict` WARNING from the 23:05 run (now logged as `stage=extended_backfill`) is a regression (P2).
-- **Stale KIS token on closed days**: 2026-10-09..11 reconcile flagged `stale_kis_token:*` on holidays/weekends and reran warmup, which skips on `CLOSED` days (budget exhausted). Not seen on 2026-10-17; a recurrence is a calendar-awareness regression (P2).
-- **Backup prune keeps old dates**: `raw/` and `manifests/2026-09-14` survived past 30 days (`sealed_kept=2`, reasons not logged at INFO).
-- **Dashboard schedule list is separate**: `/home/ubuntu/quant-dashboard/config.toml` carries its own `[[schedule]]` blocks. A removed timer slot (kca-price-ingest 21:30, dropped in `627cd1c`) left there raises a recurring `예정 실행이 지연` FAIL on the dashboard kca card; fix it in the dashboard config, not in kca.
-- **Daily audit `missing_bars` is judged on D only**: the dense-partition rule exempts symbols stored solely as `vendor=dbsec` trade-minute fallback bars (KIS TPS limit fallback). Extended backfill can rewrite a past date with `vendor=kis` trade-only symbols (10-16: 213), which a re-audit of that date would flag; not an issue for the current audit.
-- **`price_basis_raw_basis_unavailable` is a stable vendor gap**: 393 keys on 2026-10-22, growing by new corporate actions only.
-- **ops-sentinel `job_late` vs `After=`**: a unit held back by a running `After=` predecessor stays PENDING; a slow `archive-intraday` (32–39 min on 2026-10-16/19) used to raise a false `job_late:kca-tape-sweep`.
-- **Holidays**: weekday timers fire; jobs must `SKIP`; the daily audit digest is `HOLIDAY_SKIP`. Run data probes against the previous trading day.
-- **`journalctl` times are UTC**; `docker logs` is empty for `--rm` units; the journal is the record.
-- **Shared resources** (`TOKEN_REPLACED` for the Toss token used from PC and VPS, Drive lock, KIS slots) are cross-project; attribute precisely.
-- **Checklist drift**: when a timer, unit, wrapper flag, data path or contract file name changes, update §3, §6 and Appendix A in the same change.
-
-## 14. Report Format (chat reply only — no files)
-
-```
-## kca VPS Audit — D=<D> (<mode>, checked <KST>)
-Overall: PASS | WARN | FAIL
-
-| Area | Status | Evidence (1 line) |
-|---|---|---|
-| Context / day kind | | |
-| Deploy / scheduler parity (DEP, SCH) | | |
-| Run evidence / outcomes (RUN) | | |
-| Shared broker dir / contract (BRK) | | |
-| Host resources / storage (HOST) | | |
-| Data integrity (Appendix A) | | n PASS / n WARN / n FAIL |
-| Paper ledger / orders (PAP) | | |
-| Models (ML) | | |
-| Backup / alerts / heartbeat (BAK, ALR) | | |
-| Cross-project contention | | |
-
-### Findings (severity-ordered)
-- [P0|P1|P2] <ID> <title> — 근거: <command + key output>; 영향: <what breaks>; 상태: new | continuing since <date> | resolved; 제안: <next step>
-### Known and unchanged
-### NOT VERIFIED (what, why)
-```
-
-Severity: **P0** data loss/corruption, ledger inconsistency, decision chain down, backup shrink, broker dir unshared;
-**P1** a scheduled job silently not running or failing, causality violation, throttling on the decision chain,
-restore impossible, alert path broken; **P2** research gaps, hygiene, trends, cross-project coupling.
-
----
-
-## Appendix A — Executable Probes
-
-Run from the local repo root, outside blackouts; nothing is written on either side (`D` = audit date):
-
-```bash
-cd /home/kth/k-closing-alpha
-for p in data research; do awk "/^\`\`\`python probe=$p/{f=1;next}/^\`\`\`/{f=0}f" docs/vps-checklist.md \
-  | ssh or-vps "cd ~/k-closing-alpha && TZ=Asia/Seoul nice -n 19 timeout 300 ~/.local/bin/uv run --no-sync python - <D>"; done
-```
-
-Output is `CHECK <ID> <PASS|WARN|FAIL> <detail>`. Baselines for `D=2026-10-16`: archive 1,247 rows (prev-5 median 197),
-`price_history` 2,762 rows/day, 1m regular 485 k bars / 1,273 symbols (`ls`), volume ratio median 0.959, 3 top-k rows,
-nav conservation 0.00; only `DI-ARCH-01`, `DI-ARCH-09` and `RS-05` WARN. Standing probe behaviour: `RS-01` allows
-`credit_balance` 4 trading days of lag; `RS-05` WARNs for `*.pre_*` older than 7 days; `RS-06` is PASS when each
-quarantine entry has a `moves-*.json` manifest (`2026-09-22-test-fixture-cohort` is known); `RS-08` WARNs only for
-`expiring_needs > 0`, `expired_recoverable > 0` or a stale `run_date`.
-
-```python probe=data
-import sys
-from pathlib import Path
-
+```python probe=E
 import numpy as np
 import pandas as pd
-
-D = sys.argv[1]
-ROOT = Path("data")
-out = []
-
-
-def emit(cid, status, detail):
-    print(f"CHECK {cid} {status} {detail}", flush=True)
-
-
-def level(cond_fail, cond_warn=False):
-    return "FAIL" if cond_fail else ("WARN" if cond_warn else "PASS")
-
-
-# ---- archive.parquet (15:20 snapshot) ----
-a = pd.read_parquet(ROOT / "history/archive.parquet")
-a["day"] = a["스냅샷_날짜"].astype(str).str[:10]
-cnt = a.groupby("day").size()
-prev = cnt[cnt.index < D].tail(5)
-d = a[a["day"] == D].copy()
-if d.empty:
-    emit("DI-ARCH-01", "FAIL", f"no archive rows for {D}")
-else:
-    med = float(prev.median()) if len(prev) else float("nan")
-    ratio = len(d) / med if med == med and med > 0 else float("nan")
-    emit("DI-ARCH-01", level(False, not (0.5 <= ratio <= 2.0)), f"rows={len(d)} prev5_median={med:.0f} ratio={ratio:.2f}")
-    dup = int(d.duplicated(["종목코드"]).sum())
-    emit("DI-ARCH-02", level(dup > 0), f"duplicate_symbols={dup}")
-    nulls = {c: int(d[c].isna().sum()) for c in ("종가", "결정_종가", "전일종가", "등락률", "거래대금")}
-    emit("DI-ARCH-03", level(any(nulls.values())), f"nulls={nulls}")
-    confirmed = float(d["종가_확정"].fillna(0).astype(float).mean())
-    emit("DI-ARCH-04", level(confirmed < 0.9, confirmed < 0.99), f"close_confirmed_share={confirmed:.3f}")
+runs("R01", [("collect", D, "15:20:00", 1), ("predict", D, "15:21:00", 1), ("auction-close", D, "15:21:05", 1), ("order-entry", D, "15:21:15", 1),
+             ("finalize-close", D, "15:30:30", 1), ("order-reconcile-entry", D, "15:30:40", 1), ("paper-entry", D, "15:30:30", 1)])
+o = expect("R02", D, {"predict": {"OK"}, "order_entry": {"OK", "SKIPPED:trading_disabled"}, "finalize_close": {"OK"},
+                      "order_reconcile_entry": {"OK", "SKIPPED:trading_disabled"}})
+c_decision(D)
+@check("Q01")
+def _():
+    a = pd.read_parquet(ROOT / "history/archive.parquet")
+    a["day"] = a["스냅샷_날짜"].astype(str).str[:10]
+    d = a[a["day"] == str(D)]
+    med = float(a[a["day"] < str(D)].groupby("day").size().tail(5).median())
+    nulls = int(d[["종가", "결정_종가", "전일종가", "등락률", "거래대금"]].isna().sum().sum())
+    conf = float(d["종가_확정"].fillna(0).astype(float).mean()) if len(d) else 0.0
     flags = {c: int((d[c].fillna(0).astype(float) > 0).sum()) for c in ("가격_비정상", "수급_실패", "지수_실패", "현재가_실패")}
-    flow_share = flags["수급_실패"] / len(d)
-    emit("DI-ARCH-05", level(flags["가격_비정상"] > 0 or flags["지수_실패"] > 0 or flags["현재가_실패"] > 0, flow_share > 0.1), f"flags={flags} flow_fail_share={flow_share:.3f}")
-    o, h, l, c = (d[k].astype(float) for k in ("시가", "고가", "저가", "종가"))
-    bad_ohlc = int(((h < np.maximum(o, c) - 1e-9) | (l > np.minimum(o, c) + 1e-9) | (h < l)).sum())
-    emit("DI-ARCH-06", level(bad_ohlc > 0), f"ohlc_inconsistent={bad_ohlc}")
-    chg = (d["종가"].astype(float) / d["전일종가"].astype(float) - 1.0) * 100.0
-    bad_chg = int(((chg - d["등락률"].astype(float)).abs() > 0.01).sum())
-    emit("DI-ARCH-07", level(bad_chg > max(1, len(d) * 0.01)), f"chg_ratio(final close)_mismatch={bad_chg}")
-    gap = ((d["종가"].astype(float) - d["결정_종가"].astype(float)).abs() / d["결정_종가"].astype(float))
-    emit("DI-ARCH-08", level(False, float(gap.quantile(0.99)) > 0.03), f"decision_vs_final_close_gap p50={gap.median():.4f} p99={gap.quantile(0.99):.4f}")
-    snap = pd.to_datetime(d["snapshot_timestamp"], utc=True).dt.tz_convert("Asia/Seoul")
-    feat = pd.to_datetime(d["feature_available_timestamp"], utc=True).dt.tz_convert("Asia/Seoul")
-    execu = pd.to_datetime(d["execution_timestamp"], utc=True).dt.tz_convert("Asia/Seoul")
-    s_ok = (snap.dt.strftime("%H%M%S") >= "152000").mean(), (snap.dt.strftime("%H%M%S") <= "152059").mean()
-    causal = int((feat < snap).sum() + (execu.dt.strftime("%H%M%S") < "153000").sum())
-    emit("DI-ARCH-09", level(causal > 0, min(s_ok) < 0.95), f"causality_violations={causal} snapshot_in_15:20 share={min(s_ok):.3f}")
-
-# ---- price_history ----
-ph = pd.read_parquet(ROOT / "history/price_history.parquet", columns=["date", "symbol", "high", "low", "close", "close_raw", "prev_close", "volume", "daily_change_pct", "kospi_pct"])
-ph["day"] = ph["date"].astype(str).str[:10]
-mx = ph["day"].max()
-arch_days = sorted(a["day"].unique())
-prev_arch = max([x for x in arch_days if x < D], default=None)
-PHD = D if mx >= D else mx  # price_history for D arrives with the next 08:30 ingest; compare D-1 on the evening of D
-lag_ok = mx >= D or (prev_arch is not None and mx >= prev_arch)
-emit("DI-PH-01", level(not lag_ok), f"max_date={mx} audit_date={D} compared_day={PHD} (D itself lands at the next 08:30 ingest)")
-pcnt = ph.groupby("day").size()
-last, before = pcnt.get(PHD, 0), pcnt[pcnt.index < PHD].tail(5)
-r = last / float(before.median()) if len(before) else float("nan")
-emit("DI-PH-02", level(last == 0, not (0.97 <= r <= 1.03)), f"rows_{PHD}={last} prev5_median={before.median():.0f} ratio={r:.3f}")
-dd = ph[ph["day"] == PHD]
-emit("DI-PH-03", level(int(dd.duplicated(["symbol"]).sum()) > 0), f"dup_symbols_D={int(dd.duplicated(['symbol']).sum())}")
-bad = int(((dd["high"] < dd["low"]) | (dd["close_raw"].astype(float) <= 0) | (dd["volume"] < 0)).sum())
-emit("DI-PH-04", level(bad > 0), f"ohlcv_invalid_D={bad}")
-emit("DI-PH-05", level(int(dd["kospi_pct"].nunique()) > 1), f"kospi_pct_distinct_D={int(dd['kospi_pct'].nunique())}")
-total_dup = int(ph.duplicated(["date", "symbol"]).sum())
-emit("DI-PH-06", level(total_dup > 0), f"duplicate_date_symbol_total={total_dup}")
-
-# ---- 1m regular partition ----
-pth = ROOT / f"history/intraday/1m/regular/{D[:7]}/{D}.parquet"
-if not pth.exists():
-    emit("DI-1M-01", "FAIL", f"partition missing {pth}")
-else:
-    m = pd.read_parquet(pth)
-    vend = m["vendor"].astype(str).value_counts().to_dict()
-    emit("DI-1M-01", "PASS", f"rows={len(m)} symbols={m['symbol'].nunique()} vendors={vend}")
-    dupm = int(m.duplicated(["symbol", "ts_hms"]).sum())
-    badm = int(((m["high"] < m["low"]) | (m["volume"] < 0) | (m["close"] <= 0)).sum())
-    emit("DI-1M-02", level(dupm > 0 or badm > 0), f"dup_bars={dupm} invalid_bars={badm}")
-    ts = pd.to_numeric(m["ts_hms"], errors="coerce")
-    emit("DI-1M-03", level(ts.min() > 90100 or ts.max() < 152900), f"ts_range={int(ts.min())}..{int(ts.max())}")
-    def vol_ratio(day):
-        mm = m if day == D else pd.read_parquet(ROOT / f"history/intraday/1m/regular/{day[:7]}/{day}.parquet", columns=["symbol", "volume"])
-        pp = ph[ph["day"] == day]
-        v = mm.groupby(mm["symbol"].astype(str))["volume"].sum()
-        p = pp.set_index(pp["symbol"].astype(str))["volume"]
-        rr = (v / p[p > 0]).dropna()
-        return float(rr.median()), float((rr < 0.9).mean()), len(rr)
-    hist_days = sorted(pcnt[pcnt.index < PHD].tail(4).index)
-    base = [vol_ratio(x) for x in hist_days if (ROOT / f"history/intraday/1m/regular/{x[:7]}/{x}.parquet").exists()]
-    cur = vol_ratio(PHD)
-    bmed = float(np.median([b[0] for b in base])) if base else float("nan")
-    bsh = float(np.median([b[1] for b in base])) if base else float("nan")
-    drift = abs(cur[0] - bmed) > 0.02 or abs(cur[1] - bsh) > 0.05
-    emit("DI-1M-04", level(cur[0] > 1.01, drift), f"vol_ratio_vs_eod median={cur[0]:.4f} share_below_0.9={cur[1]:.3f} n={cur[2]} baseline_median={bmed:.4f} baseline_share={bsh:.3f}")
-    mp = m if PHD == D else pd.read_parquet(ROOT / f"history/intraday/1m/regular/{PHD[:7]}/{PHD}.parquet")
-    ordered = mp.sort_values(["symbol", "ts_hms"])
-    lastbar = ordered.groupby(ordered["symbol"].astype(str)).tail(1).set_index(ordered.groupby(ordered["symbol"].astype(str)).tail(1)["symbol"].astype(str))["close"]
-    cr = dd.set_index(dd["symbol"].astype(str))["close_raw"].astype(float)
-    k = pd.concat([lastbar.rename("b"), cr.rename("c")], axis=1).dropna()
-    match = float(((k["b"] - k["c"]).abs() / k["c"] < 0.001).mean())
-    emit("DI-1M-05", level(match < 0.9, match < 0.98), f"last_bar_close_matches_eod share={match:.3f} n={len(k)}")
-    # ---- regular tick vs bar vendor disagreement (DI-1M-06) ----
-    import json as _json
-    evp = ROOT / f"logs/events/{D[:7]}/{D}.jsonl"
-    src_n, src_max, src_syms = 0, 0.0, []
-    evidence_error = False
-    if evp.exists():
-        for _line in evp.read_text().splitlines():
-            try:
-                _rec = _json.loads(_line)
-            except ValueError:
-                evidence_error = True
-                continue
-            if isinstance(_rec, dict) and _rec.get("job") == "tick_source_diff" and _rec.get("run_date") == D:
-                try:
-                    _m = _rec["metrics"]
-                    src_n = int(_m["n"])
-                    src_max = float(_m["max_relative_shortfall"])
-                    src_syms = _m["symbols"][:10]
-                    if src_n < 0 or not np.isfinite(src_max) or not 0 <= src_max <= 1:
-                        raise ValueError("invalid source-diff metrics")
-                    if not isinstance(src_syms, list) or not all(isinstance(s, str) for s in src_syms):
-                        raise ValueError("invalid source-diff symbols")
-                except (KeyError, TypeError, ValueError):
-                    evidence_error = True
-    hbp = ROOT / "logs/heartbeat/daily_audit.json"
-    gap_warning = False
-    heartbeat_verified = False
-    if hbp.exists():
-        try:
-            _hb = _json.loads(hbp.read_text())
-            if isinstance(_hb, dict) and _hb.get("snapshot_date") == D:
-                _open = _hb["open_issues"]
-                if not isinstance(_open, list):
-                    raise ValueError("invalid heartbeat issues")
-                _keys = [_e["key"] for _e in _open]
-                if not all(isinstance(_k, str) for _k in _keys):
-                    raise ValueError("invalid heartbeat issue key")
-                gap_warning = any(
-                    _k.startswith("intraday:regular_ticks:") and _k.endswith((":source_diff_systemic", ":certified_gap"))
-                    for _k in _keys
-                )
-                heartbeat_verified = True
-        except (KeyError, TypeError, ValueError):
-            evidence_error = True
-    probe_warning = gap_warning or evidence_error or not heartbeat_verified
-    symbols_text = ','.join(src_syms) if isinstance(src_syms, list) and all(isinstance(s, str) for s in src_syms) else 'unreadable'
-    emit("DI-1M-06", level(False, probe_warning), f"source_diff n={src_n} max={src_max * 100:.1f}% symbols={symbols_text or 'none'} heartbeat_verified={heartbeat_verified} gap_warning={gap_warning} evidence_error={evidence_error}")
-
-# ---- top-k decision + causality ----
-t = pd.read_parquet(ROOT / "parquet/topk_decisions.parquet")
-t["day"] = t["decision_date"].astype(str).str[:10]
-td = t[t["day"] == D]
-if td.empty:
-    emit("DI-TOPK-01", "WARN", f"no decision rows for {D} (must be a NO_DECISION row in paper/decisions.parquet)")
-else:
-    dec = pd.to_datetime(td["decided_at"], utc=True).dt.tz_convert("Asia/Seoul")
-    inp = pd.to_datetime(td["input_available_at"], utc=True).dt.tz_convert("Asia/Seoul")
-    inf = pd.to_datetime(td["inference_started_at"], utc=True).dt.tz_convert("Asia/Seoul")
-    viol = int((inp > inf).sum() + (inf > dec).sum() + (dec.dt.strftime("%H%M%S") >= "153000").sum())
-    emit("DI-TOPK-01", level(viol > 0 or len(td) != td["symbol"].nunique()), f"rows={len(td)} causality_violations={viol} models={td['model_version'].nunique()}")
-    emit("DI-TOPK-02", level(not np.isfinite(td["pred"].astype(float)).all()), f"pred_finite={bool(np.isfinite(td['pred'].astype(float)).all())} model={td['model_version'].iloc[0]}")
-
-# ---- paper ledger conservation ----
-P = ROOT / "paper"
-nav = pd.read_parquet(P / "nav.parquet")
-nav["day"] = nav["as_of_date"].astype(str).str[:10]
-row = nav[nav["day"] == D]
-if row.empty:
-    emit("DI-PAPER-01", "FAIL", f"no nav row for {D}")
-else:
-    r0 = row.iloc[-1]
-    gap = abs(float(r0["nav"]) - float(r0["cash"]) - float(r0["open_market_value"]))
-    emit("DI-PAPER-01", level(gap > 1.0), f"nav_minus_cash_minus_mv={gap:.2f}")
-    dup_nav = int(nav.duplicated(["day"]).sum())
-    emit("DI-PAPER-02", level(dup_nav > 0), f"duplicate_nav_days={dup_nav} rows={len(nav)}")
-    cc = nav.sort_values("day")["cumulative_cost"].astype(float).diff().dropna()
-    emit("DI-PAPER-03", level(bool((cc < -1e-9).any())), f"cumulative_cost_monotone={not bool((cc < -1e-9).any())}")
-tr = pd.read_parquet(P / "trades.parquet")
-fric = int(((tr["buy_fee"] <= 0) | (tr["sell_fee"] <= 0) | (tr["sell_tax"] <= 0)).sum())
-emit("DI-PAPER-04", level(fric > 0), f"closed_trades={len(tr)} zero_friction_trades={fric}")
-fl = pd.read_parquet(P / "fills.parquet")
-emit("DI-PAPER-05", level(int(fl.duplicated(["order_id"]).sum()) > 0), f"duplicate_order_fills={int(fl.duplicated(['order_id']).sum())}")
-net = (tr["gross_pnl"].astype(float) - tr["cost"].astype(float) - tr["net_pnl"].astype(float)).abs().max()
-emit("DI-PAPER-06", level(float(net) > 1.0), f"max|gross-cost-net|={float(net):.2f}")
-
-# ---- offsite backup deferred-history trend (DI-BAK-01) ----
-import json as _bjson
-_hp = ROOT / "history/capture/offsite/deferred_history.json"
-_hist = []
-_herr = None
-if _hp.exists():
-    try:
-        _raw = _bjson.loads(_hp.read_text())
-        _hist = _raw[-5:] if isinstance(_raw, list) else []
-        if not isinstance(_raw, list):
-            _herr = "malformed"
-    except ValueError:
-        _herr = "malformed"
-_trend = [(str(_e.get("run_started_at", ""))[:10], int(_e.get("deferred_dates", -1))) for _e in _hist if isinstance(_e, dict)]
-_stall = len(_trend) >= 3 and _trend[-1][1] > 0 and all(_trend[-k][1] >= _trend[-k - 1][1] for k in (1, 2))
-_aged = False
-if _hist and isinstance(_hist[-1], dict) and _hist[-1].get("oldest_deferred_date"):
-    try:
-        from datetime import date as _bdate
-        _aged = (_bdate.fromisoformat(D) - _bdate.fromisoformat(str(_hist[-1]["oldest_deferred_date"]))).days > 21
-    except ValueError:
-        pass
-emit("DI-BAK-01", level(_stall or _aged), f"trend={_trend or 'empty(first observation drains)'} stalled={_stall} aged={_aged} err={_herr}")
+    o_, h, l, c = (d[k].astype(float) for k in ("시가", "고가", "저가", "종가"))
+    ohlc = int(((h < np.maximum(o_, c) - 1e-9) | (l > np.minimum(o_, c) + 1e-9) | (h < l)).sum())
+    chg = int((((c / d["전일종가"].astype(float) - 1) * 100 - d["등락률"].astype(float)).abs() > 0.01).sum())
+    gap99 = float(((c - d["결정_종가"].astype(float)).abs() / d["결정_종가"].astype(float)).quantile(0.99)) if len(d) else 0.0
+    snap = pd.to_datetime(d["snapshot_timestamp"], utc=True).dt.tz_convert(KST)
+    feat = pd.to_datetime(d["feature_available_timestamp"], utc=True).dt.tz_convert(KST)
+    exe = pd.to_datetime(d["execution_timestamp"], utc=True).dt.tz_convert(KST)
+    causal = int((feat < snap).sum() + (exe.dt.strftime("%H%M%S") < "153000").sum())
+    in1520 = float(((snap.dt.strftime("%H%M%S") >= "152000") & (snap.dt.strftime("%H%M%S") <= "152059")).mean()) if len(d) else 0.0
+    fail = len(d) == 0 or int(d["종목코드"].duplicated().sum()) > 0 or nulls > 0 or conf < 0.9 or ohlc > 0 or causal > 0 or flags["가격_비정상"] + flags["지수_실패"] + flags["현재가_실패"] > 0 or chg > max(1, len(d) * 0.01)
+    out("Q01", lv(fail, conf < 0.99 or flags["수급_실패"] > 0.1 * max(len(d), 1) or gap99 > 0.03), rows=len(d), prev5_median=int(med), confirmed=round(conf, 3), nulls=nulls, flags=flags, ohlc_bad=ohlc, chg_mismatch=chg, close_gap_p99=round(gap99, 4), causality_violations=causal, snap_in_1520=round(in1520, 3))
+@check("C05")
+def _():
+    if not timer_active("auction-close"):
+        out("C05", "SKIP(timer_off)")
+        return
+    st = manifest_status(D, f"auction-close-{D}-")
+    out("C05", lv(not st, "complete" not in st.values()), close=",".join(st.values()) or "missing")
+p_ledger(D, P, morning=False)
+@check("P06")
+def _():
+    en, rc = o["order_entry"].get("metrics", {}), o["order_reconcile_entry"].get("metrics", {})
+    if o["order_entry"]["outcome"] == "SKIPPED":
+        out("P06", "SKIP(" + o["order_entry"].get("reason", "") + ")")
+        return
+    picks = en.get("n_picks", en.get("n_lots"))
+    acc = en.get("n_acked", 0) + en.get("n_rejected", 0) + en.get("n_not_sent", 0) + en.get("n_skipped", 0)
+    bad = en.get("n_unknown", 1) or rc.get("n_unknown", 1) or rc.get("n_missing_at_broker", 1) or rc.get("n_unknown_unresolved_total", 1)
+    out("P06", lv(bool(bad) or acc != picks, rc.get("n_filled") != rc.get("n_intents")), env=en.get("env"), picks=picks, acked=en.get("n_acked"), rejected=en.get("n_rejected"),
+        not_sent=en.get("n_not_sent"), rec_filled=f"{rc.get('n_filled')}/{rc.get('n_intents')}", unknown=rc.get("n_unknown"), shortfalls=rc.get("position_shortfalls") or "-")
+a_heartbeat()
+a_alerts(at(D, "15:00:00"))
+x_tokens(at(D, "15:15:00"))
 ```
 
-```python probe=research
-import hashlib, json, sys
-from datetime import date, timedelta
-from pathlib import Path
+Window N (evening):
 
+```python probe=N
 import pandas as pd
-
-D = sys.argv[1]
-ROOT = Path("data")
-
-
-def emit(cid, status, detail):
-    print(f"CHECK {cid} {status} {detail}", flush=True)
-
-
-def lvl(fail, warn=False):
-    return "FAIL" if fail else ("WARN" if warn else "PASS")
-
-
-def days_between(a, b):
-    return (date.fromisoformat(b) - date.fromisoformat(a)).days
-
-
-# RS-01 altdata panels (lag in trading days vs per-panel allowance)
-man = json.loads((ROOT / "history/altdata/_manifest.json").read_text())
-ALLOW_TD = {"credit_balance": 4}
-def trading_lag(a, b):
-    d, end, n = date.fromisoformat(a) + timedelta(days=1), date.fromisoformat(b), 0
-    while d <= end:
-        if d.weekday() < 5:
-            n += 1
-        d += timedelta(days=1)
-    return n
-bad = {k: (v["status"], v["last_date"]) for k, v in man["panels"].items() if v["status"] != "ok"}
-lag = {k: trading_lag(v["last_date"], D) for k, v in man["panels"].items()}
-over = {k: lag[k] for k in lag if lag[k] > ALLOW_TD.get(k, 2)}
-emit("RS-01", lvl(bool(bad), bool(over)), f"not_ok={bad} trading_lag_vs_D={lag} over_allowance={over}")
-
-# RS-02 backfill ledgers (latest record per key)
-for name in ("extended_sessions", "toss_regular", "nxt_calibration"):
-    f = pd.read_parquet(ROOT / f"history/intraday/backfill_ledger/{name}.parquet")
-    last = f.drop_duplicates(["snapshot_date", "session", "symbol"], keep="last")
-    vc = last["status"].value_counts().to_dict()
-    failed = last[last["status"] == "FAILED"]
-    stuck = int((pd.to_numeric(failed["attempts"], errors="coerce") >= 3).sum())
-    emit(f"RS-02-{name}", lvl(stuck > 0, vc.get("FAILED", 0) > 0.05 * len(last)), f"keys={len(last)} status={vc} failed_with_3plus_attempts={stuck}")
-
-# RS-03 decomposition config binding
-cfgp, repp, tabp = (ROOT / "history" / n for n in ("nxt_decomposition_config.json", "nxt_decomposition_fit_report.json", "nxt_calibration_table.parquet"))
-if cfgp.exists() and repp.exists() and tabp.exists():
-    rep = json.loads(repp.read_text())
-    sha = hashlib.sha256(tabp.read_bytes()).hexdigest()
-    tab = pd.read_parquet(tabp, columns=["date"])
-    tmax = str(tab["date"].astype(str).max())[:10]
-    emit("RS-03", lvl(sha != rep["table_sha256"], days_between(tmax, D) > 30), f"table_sha_matches_fit={sha == rep['table_sha256']} table_max_date={tmax} fit_holdout_p90={rep['holdout_rel_err_p90']:.3f}")
-else:
-    emit("RS-03", "WARN", "decomposition artifacts absent")
-
-# RS-04 retrain registry vs live decision model
-reg = [json.loads(x) for x in Path("artifacts/models/topk_ranker/retrain_registry.jsonl").read_text().splitlines() if x.strip()]
-lastr = reg[-1]
-age = abs(days_between(str(lastr["attempted_at"])[:10], D))
-t = pd.read_parquet(ROOT / "parquet/topk_decisions.parquet")
-mv = str(t.sort_values("decided_at")["model_version"].iloc[-1])
-known = any(str(r.get("trained_at", "")) and str(r["trained_at"]) in mv for r in reg)
-emit("RS-04", lvl(lastr["outcome"] not in ("PROMOTED", "PROMOTED_UNGATED", "MANUAL_HOTFIX") or not known, age > 8 or lastr["outcome"] == "MANUAL_HOTFIX"), f"last_outcome={lastr['outcome']} age_days={age} agreement={lastr.get('agreement')} live_model_in_registry={known}")
-
-# RS-05 classification + stray pre-restore files (WARN only past 7 days old)
-import time as _time
-cls = ROOT / "history/altdata/security_classification.parquet"
-c = pd.read_parquet(cls)
-aged = sorted(p.name for p in (ROOT / "history/altdata").glob("*.pre_*") if _time.time() - p.stat().st_mtime > 7 * 86400)
-emit("RS-05", lvl(False, bool(aged)), f"classification_rows={len(c)} pre_restore_older_than_7d={aged} action=delete after offsite verify")
-
-# RS-06 quarantine (INFO when each entry carries a moves-*.json manifest)
-qd = ROOT / "quarantine"
-entries = sorted(qd.iterdir()) if qd.exists() else []
-undoc = []
-for _p in entries:
-    _ok = any(_p.glob("moves-*.json")) if _p.is_dir() else any(_p.parent.glob(f"{_p.stem}.moves-*.json"))
-    if not _ok:
-        undoc.append(_p.name)
-emit("RS-06", lvl(False, bool(undoc)), f"quarantine_entries={[p.name for p in entries]} documented_info={len(entries) - len(undoc)} undocumented={undoc}")
-
-# RS-07 session partitions for D
-miss = []
-sizes = {}
-for sess in ("regular", "nxt_premarket", "nxt_aftermarket", "krx_aftermarket"):
-    p = ROOT / f"history/intraday/1m/{sess}/{D[:7]}/{D}.parquet"
-    if not p.exists():
-        miss.append(sess)
-    else:
-        sizes[sess] = p.stat().st_size
-for sess in ("regular",):
-    p = ROOT / f"history/intraday/ticks/{sess}/{D[:7]}/{D}.parquet"
-    if not p.exists():
-        miss.append(f"ticks/{sess}")
-emit("RS-07", lvl(bool(miss)), f"missing={miss} bytes={sizes}")
-
-# RS-08 tape sweep report (WARN only on expiring/expired-recoverable needs or stale run)
-rp = ROOT / "history/capture/staging/tape_sweep/last_report.json"
-if not rp.exists():
-    emit("RS-08", "FAIL", "tape sweep report absent (sweep never ran; the daily audit does not warn about this)")
-else:
-    r = json.loads(rp.read_text())
-
-    def n(x):
-        return len(x) if isinstance(x, (list, tuple, dict)) else int(x or 0)
-
-    stale = days_between(r["run_date"], D) > 4
-    emit("RS-08", lvl(False, n(r.get("expiring_needs", 0)) > 0 or n(r.get("expired_recoverable", ())) > 0 or stale), f"run_date={r['run_date']} stale={stale} unrecoverable={n(r.get('unrecoverable', ()))} expired_recoverable={n(r.get('expired_recoverable', ()))} expiring_needs={n(r.get('expiring_needs', 0))} unresolved_tracked={n(r.get('unresolved', ()))}")
-
-# RS-09 capture manifests for D
-mp = ROOT / f"history/capture/manifests/{D}"
-emit("RS-09", lvl(not mp.exists()), f"manifest_dir_entries={len(list(mp.iterdir())) if mp.exists() else 0}")
+runs("R01", [("archive-intraday-regular", D, "15:40:00", 1), ("aftermarket-book", D, "15:40:00", 1), ("auction-path", D, "15:45:00", 1), ("archive-intraday", D, "20:05:00", 1),
+             ("tape-sweep", D, "20:35:00", 1), ("backup-prune", D, "21:00:00", 1), ("daily-audit", D, "21:20:00", 1)]
+     + ([("altdata-capture", D, "21:35:00", 1)] if NOW > at(D, "21:45:00") else []))
+r_degraded(D)
+c_manifests_live(D)
+@check("C06")
+def _():
+    st = manifest_status(D, f"auction-path-{D}-")
+    out("C06", lv(False, "complete" not in st.values()), status=",".join(st.values()) or "missing")
+@check("C08")
+def _():
+    r = json.loads((CAP / "staging/tape_sweep/last_report.json").read_text())
+    n = lambda x: len(x) if isinstance(x, (list, tuple, dict)) else int(x or 0)
+    out("C08", lv(r.get("days_checked", [""])[-1] != str(D) or bool(r.get("disk_guard")), n(r.get("expiring_needs")) > 0 or n(r.get("expired_recoverable")) > 0 or n(r.get("expired")) > 0),
+        last_day=r.get("days_checked", ["-"])[-1], needs=r.get("needs"), expiring=n(r.get("expiring_needs")), expired=n(r.get("expired")), expired_recoverable=n(r.get("expired_recoverable")), unresolved=n(r.get("unresolved")), disk_guard=r.get("disk_guard"))
+c_complete(D)
+q_partitions(D)
+@check("Q06")
+def _():
+    m = pd.read_parquet(ROOT / f"history/intraday/1m/regular/{D:%Y-%m}/{D}.parquet")
+    dup = int(m.duplicated(["symbol", "ts_hms"]).sum())
+    bad = int(((m["high"] < m["low"]) | (m["volume"] < 0) | (m["close"] <= 0)).sum())
+    ts = pd.to_numeric(m["ts_hms"], errors="coerce")
+    out("Q06", lv(dup > 0 or bad > 0 or ts.min() > 90100 or ts.max() < 152900), rows=len(m), symbols=m["symbol"].nunique(), vendors={k: int(v) for k, v in m["vendor"].astype(str).value_counts().items()}, dup=dup, invalid=bad, ts=f"{int(ts.min())}..{int(ts.max())}")
+@check("Q07")
+def _():
+    ph = pd.read_parquet(ROOT / "history/price_history.parquet", columns=["date", "symbol", "volume", "close_raw"])
+    ph["day"] = ph["date"].astype(str).str[:10]
+    days = sorted(ph["day"].unique())
+    days = [x for x in days if x <= str(P)][-5:]
+    def ratio(day):
+        mm = pd.read_parquet(ROOT / f"history/intraday/1m/regular/{day[:7]}/{day}.parquet", columns=["symbol", "ts_hms", "volume", "close"])
+        pp = ph[ph["day"] == day].set_index(ph[ph["day"] == day]["symbol"].astype(str))
+        v = mm.groupby(mm["symbol"].astype(str))["volume"].sum()
+        rr = (v / pp["volume"][pp["volume"] > 0]).dropna()
+        lb = mm.sort_values(["symbol", "ts_hms"]).groupby(mm["symbol"].astype(str)).tail(1).set_index("symbol")["close"]
+        k = pd.concat([lb.rename("b"), pp["close_raw"].astype(float).rename("c")], axis=1).dropna()
+        return float(rr.median()), float((rr < 0.9).mean()), float(((k["b"] - k["c"]).abs() / k["c"] < 0.001).mean())
+    cur, base = ratio(days[-1]), [ratio(x) for x in days[:-1]]
+    bm, bs = float(pd.Series([b[0] for b in base]).median()), float(pd.Series([b[1] for b in base]).median())
+    out("Q07", lv(cur[0] > 1.01 or cur[2] < 0.9, abs(cur[0] - bm) > 0.02 or abs(cur[1] - bs) > 0.05 or cur[2] < 0.98), day=days[-1], vol_ratio=round(cur[0], 4), base=round(bm, 4), share_below_0_9=round(cur[1], 3), base_share=round(bs, 3), last_bar_match=round(cur[2], 3))
+@check("Q09")
+def _():
+    sh_lines = jr(["kca-archive-intraday.service", "kca-archive-intraday-regular.service", "kca-tape-sweep.service", "kca-extended-backfill.service"], at(P, "23:00:00"), at(D + timedelta(days=1), "07:00:00"), r"stage=intraday_replace .*SHRINK_ALLOWED")
+    bdirs = [p for p in (CAP / "backups/intraday").glob(f"*/{D}") if p.is_dir()]
+    nb = sum(len(list(p.glob("*-pre-*.parquet"))) for p in bdirs)
+    q = CAP / f"quarantine/shrink/{D}"
+    nq = sum(1 for _ in q.rglob("*") if _.is_file()) if q.exists() else 0
+    out("Q09", lv(len(sh_lines) > 0 and nb == 0, nq > 0), shrink_allowed=len(sh_lines), pre_backups_today=nb, quarantine_files=nq, expires=D + timedelta(days=3))
+@check("Q10")
+def _():
+    rec = [r for r in (json.loads(l) for l in (ROOT / f"logs/events/{D:%Y-%m}/{D}.jsonl").read_text().splitlines() if l.strip()) if r.get("job") == "tick_source_diff"]
+    keys = [i["key"] for i in heartbeat().get("open_issues", [])] if heartbeat().get("snapshot_date") == str(D) else None
+    gap = keys is not None and any(k.startswith("intraday:regular_ticks:") and k.endswith((":source_diff_systemic", ":certified_gap")) for k in keys)
+    mt = rec[-1]["metrics"] if rec else {}
+    out("Q10", lv(False, gap or keys is None), n=mt.get("n", 0), max_shortfall=mt.get("max_relative_shortfall", 0), symbols=mt.get("symbols", [])[:5] or "-", heartbeat_for_D=keys is not None, gap_warning=gap)
+b_prune()
+a_heartbeat(expect_date=D if NOW > at(D, "21:30:00") else None)
+a_alerts(at(D, "15:30:00"))
+x_tokens(at(D, "15:35:00"))
 ```
+
+Window W (weekly, run after M):
+
+```python probe=W
+import hashlib
+import pandas as pd
+sun = TODAY - timedelta(days=(TODAY.weekday() + 1) % 7)
+sat = sun - timedelta(days=1)
+@check("H02")
+def _():
+    dirty = [l for l in sh(["git", "status", "--porcelain"]).splitlines() if l.strip()]
+    wrap = Path(os.path.expanduser("~/.local/lib/kca/kca-run")).read_bytes() == Path("deploy/host/kca-run").read_bytes()
+    inst = Path(os.path.expanduser("~/.config/systemd/user"))
+    drift = [p.name for p in Path("deploy/systemd").glob("kca-*") if not (inst / p.name).exists() or (inst / p.name).read_bytes() != p.read_bytes()]
+    extra = [p.name for p in inst.glob("kca-*") if not (Path("deploy/systemd") / p.name).exists()]
+    imgs = dict(l.split() for l in sh(["docker", "images", "ghcr.io/kthyeong/k-closing-alpha", "--format", "{{.Tag}} {{.ID}}"]).splitlines() if l.strip())
+    head = sh(["git", "rev-parse", "HEAD"]).strip()
+    same = imgs.get("latest") == imgs.get(f"sha-{head}")
+    img_sha = next((k[4:] for k, v in imgs.items() if k.startswith("sha-") and v == imgs.get("latest")), "")
+    code_same = same or (bool(img_sha) and subprocess.run(["git", "diff", "--quiet", img_sha, head, "--", "src", "deploy", "pyproject.toml", "uv.lock"]).returncode == 0)
+    out("H02", lv(bool(dirty) or not wrap or bool(drift) or bool(extra) or not code_same, not same), head=head[:9], dirty=len(dirty), wrapper_match=wrap, drift=drift or "-", not_in_repo=extra or "-", latest_image=img_sha[:9] or "?", latest_is_head=same, code_identical=code_same, sha_tags=sum(k.startswith("sha-") for k in imgs))
+@check("H03")
+def _():
+    ps = [l for l in sh(["docker", "ps", "-a", "--format", "{{.Names}} {{.Status}}"]).splitlines() if l.startswith("kca-")]
+    stray = sh(["find", "data", "artifacts", "-maxdepth", "4", "(", "-name", "*.bak*", "-o", "-name", "*.pre_*", "-o", "-name", "*.stale*", ")", "-printf", "%p\n"]).split()[:8]
+    out("H03", lv(any("Exited" in l for l in ps), bool(stray)), kca_containers=ps or "-", stray=stray or "-")
+@check("R04")
+def _():
+    reg = [json.loads(x) for x in Path("artifacts/models/topk_ranker/retrain_registry.jsonl").read_text().splitlines() if x.strip()]
+    last = reg[-1]
+    age = (TODAY - date.fromisoformat(str(last["attempted_at"])[:10])).days
+    t = pd.read_parquet(ROOT / "parquet/topk_decisions.parquet", columns=["decided_at", "model_version"])
+    mv = str(t.sort_values("decided_at")["model_version"].iloc[-1])
+    known = any(str(r.get("trained_at", "")) and str(r["trained_at"]) in mv for r in reg)
+    out("R04", lv(last["outcome"] not in ("PROMOTED", "PROMOTED_UNGATED", "MANUAL_HOTFIX") or not known, age > 8 or last["outcome"] == "MANUAL_HOTFIX"), last=last["outcome"], age_days=age, agreement=last.get("agreement"), live_model_in_registry=known)
+@check("B07")
+def _():
+    v = jr("offsite-verify", at(sun, "10:59:00"), at(sun, "23:59:00"), r"stage=(offsite_verify|restore_drill)|finding=")
+    s = next((l for l in v if "stage=offsite_verify" in l and "missing=" in l), "")
+    drills = [re.search(r"tier=(\w+) .*status=(\w+)", l).groups() for l in v if "stage=restore_drill" in l]
+    ok = "missing=0" in s and "mismatched=0" in s and len(drills) >= 3 and all(st == "OK" for _, st in drills)
+    out("B07", lv(not ok), sunday=sun, summary=s.split("stage=offsite_verify")[-1][:80] or "absent", drills=drills or "-")
+@check("B08")
+def _():
+    snaps = sorted(x.strip("/") for x in sh([RCLONE, "lsf", "--dirs-only", f"{REMOTE}/snapshots"]).splitlines())
+    cs = jr("core-snapshot", at(sun, "09:59:00"), at(sun, "23:59:00"), r"stage=core_snapshot .*status=")
+    out("B08", lv(not snaps or snaps[-1] != str(sun) or not cs or "status=ok" not in cs[-1]), newest=snaps[-1] if snaps else "-", count=len(snaps), core_snapshot=cs[-1].split("status=")[1][:20] if cs else "absent")
+@check("Q11")
+def _():
+    man = json.loads((ROOT / "history/altdata/_manifest.json").read_text())
+    notok = {k: v["status"] for k, v in man["panels"].items() if v["status"] != "ok"}
+    def tdlag(x):
+        n, y = 0, D
+        while y > date.fromisoformat(x):
+            n, y = n + is_td(y), y - timedelta(days=1)
+        return n
+    lag = {k: v["last_date"] for k, v in man["panels"].items() if tdlag(v["last_date"]) > (4 if k == "credit_balance" else 2)}
+    stuck = {}
+    for name in ("extended_sessions", "toss_regular", "nxt_calibration"):
+        f = pd.read_parquet(ROOT / f"history/intraday/backfill_ledger/{name}.parquet").drop_duplicates(["snapshot_date", "session", "symbol"], keep="last")
+        stuck[name] = int(((f["status"] == "FAILED") & (pd.to_numeric(f["attempts"], errors="coerce") >= 3)).sum())
+    rep = json.loads((ROOT / "history/nxt_decomposition_fit_report.json").read_text())
+    sha_ok = hashlib.sha256((ROOT / "history/nxt_calibration_table.parquet").read_bytes()).hexdigest() == rep["table_sha256"]
+    q = [p.name for p in (ROOT / "quarantine").iterdir()] if (ROOT / "quarantine").exists() else []
+    out("Q11", lv(bool(notok) or any(stuck.values()) or not sha_ok, bool(lag)), altdata_not_ok=notok or "-", altdata_lagging=lag or "-", ledger_failed_3plus=stuck, nxt_table_sha_ok=sha_ok, quarantine=q or "-")
+```
+
+### 5.2 Drill-down probes
+
+- `H02-local`: `ssh or-vps 'git -C ~/k-closing-alpha log -1 --format=%h'` vs `git ls-remote https://github.com/kthyeong/k-closing-alpha refs/heads/main`.
+- `H04`: `ssh or-vps 'for f in ~/.config/systemd/user/kca-*.service; do l=$(grep -m1 "^ExecStart=%h/.local/lib/kca/kca-run " "$f") || continue; eval "~/.local/lib/kca/kca-run --print-argv ${l#ExecStart=%h/.local/lib/kca/kca-run }" >/dev/null 2>&1; echo "$(basename $f) rc=$?"; done | grep -v "rc=0$"'` (empty = PASS; a `USAGE_ERROR` means the unit cannot start). Fixture SHAs: `git merge-base --is-ancestor <sha> origin/main`.
+- `R06`: `ssh or-vps 'systemctl --user is-active kca-aftermarket-book.service; docker ps --filter name=kca-aftermarket-book --format "{{.Status}}"'`.
+- `C-manifest <D> <prefix>`: `ssh or-vps 'cd ~/k-closing-alpha/data/history/capture/manifests/<D> && for d in <prefix>*; do echo "$d $(ls $d | tr "\n" " ")"; done'`. For PARTIAL entries: `python3 -c` reading `manifest-partial.json` `entries[].{symbol,status,reason}` with a Counter.
+- `B-parity <D> <tier>`: `~/.local/bin/rclone lsf gdrive:quant-lake/live/k-closing-alpha/capture_sealed/<tier>/<YYYY-MM>/<D>/` vs `python3 -c` listing `segment_name` from `capture/offsite/ledger/<tier>/<D>.jsonl`.
+- `B03` (W only, outside 22:15–00:15): `cd ~/k-closing-alpha && nice -n 19 timeout 600 ~/.local/bin/rclone check data gdrive:quant-lake/live/k-closing-alpha/data --one-way --size-only --exclude "/history/capture/**" --combined - 2>/dev/null | awk '$1=="+"||$1=="*"' | tail -20`.
+- `P-ledger`: `uv run --no-sync python -c` using `PaperLedger(root=Path("data/paper")).load_open_positions()` and `nav.parquet` tail 5 (`as_of_date nav cash open_market_value cumulative_cost`).
+- `Q-spot <D> <sym>`: archive row (`종가 결정_종가 종가_확정`), last 1m bar, `price_history.close_raw` (next day), paper fill `fill_price` for the symbol.
+- Journal window for any unit: `journalctl --user -u kca-<u>.service --since "<UTC>" --until "<UTC>" -o short-iso | grep -vE "pam_unix|COMMAND=" | grep -E "Starting|Finished|Failed|stage=|outcome=" | cut -c1-250 | tail -30`. Convert with `k(){ date -u -d "TZ=\"Asia/Seoul\" $1" +"%F %T"; }`.
+
+## 6. Triage map
+
+| Symptom (verdict line) | Likely cause | Where in code / logs | Fix direction (root cause) |
+|---|---|---|---|
+| `C01 FAIL coverage<0.99` | KIS decision slots throttled (`EGW00201`) or requote deadline `152800` hit | `collect.py:201,954,1309`; slots 1/5 (`kis_slot_assignments.toml`) | slot contention vs krx; requote budget |
+| `C03 WARN partial` / `INCOMPLETE held_roster_unavailable` | aftermarket roster missing or `slot_token_failed` (slots 2/3) | `aftermarket_book.py:589-673` | token/slot health at 15:40 |
+| `C04 partial(n failed)` on ticks, no tape_healed | vendor_failure in the evening archive; tape sweep not yet published | `archive_intraday.py:292-372`; `tick_tape_sweep.py` | check C08; the tape horizon is 30 d |
+| `C07 FAIL stale` / `R01 price-ingest failed` | KRX `data-dbg.krx.co.kr` timeout (10-30); auto rerun after the 09:40 blackout | remediation ledger `failed_unit:kca-price-ingest` | expected once; repeat = KRX outage |
+| `C08 WARN expiring>0` | Kiwoom tape needs ≤3 d from the 30-d depth | `config/collection.py:125-130`; `market_session.py:85-87` | auto `intraday:tape_expiring:` rerun of tape-sweep; else manual |
+| `C11 missing=[intraday_complete]` | blocking `intraday:*` issues in the D audit | daily-audit journal `step=intraday_complete status=FAIL` | the issue keys name the session/symbol |
+| `Q09 FAIL` | shrink replace without its pre-backup | `intraday_store.py:347,400-413` | P0: restore from `_deleted`/sealed raw before D+3 |
+| `B01 FAIL status!=ok` | rclone exit (quota/auth), seal deadline 90 min, core panel shrink | `offsite_backup.py:465-537`; `last_run.steps.*.stderr` | `core_panels` issue = a data problem upstream (never accept a shrink) |
+| `B01 WARN start_delay` | Drive lock held (kse/krx backup, prune overrun) | X02 journals | stagger schedules |
+| `B02 FAIL remote_missing` | segment upload lost or ledger ahead of the remote | `capture_offsite.py:459-494` | rerun backup (safe-rerun list); then B07 drill |
+| `B02 FAIL unsealed_pre_run` | seal skipped the date (deadline/newest-first order) | `capture_offsite.py:783-822` | check `dates_scanned`, deferred |
+| `B05 FAIL cap_risk` | ≥7 `_deleted` day dirs due (prune missed days; backup is daily, prune weekdays) | `backup_prune.py:34,112-115` (D1) | operator run with `--max-purge-per-subtree` |
+| `P02 FAIL unexited` | paper-exit `exit_window_expired`/no open quote | `paper_trade.py:~820`, `market_session.py:97-103` | never re-run paper-exit after 09:30 (forbidden); `paper_ledger_correct` by operator |
+| `P03 FAIL nav_minus_cash_mv>1` | corrections or fill-id collision | `paper_broker.py:125-135,362-374` | `src/tools/paper_ledger_correct.py` (operator) |
+| `P01 FAIL dup` | double entry (paper-entry runs twice; idempotency compares `decision_date` without dtype normalization, D4) | `paper_trade.py:412-428` | P0 incident |
+| `X01 WARN EGW00121/ADOPTED_ROTATED` | another project re-issued a shared KIS key after 07:05 | token store `~/.cache/kis` | attribute (krx/kse); harmless if adopted |
+| `A01 FAIL reconciled_age` | reconcile lock busy (exit 75) or the unit is failing | `audit_reconcile.py` | journal of `kca-audit-reconcile` |
+| `UNKNOWN err=…` | probe drift (schema/path change) | this file | fix the probe in the same change (§8) |
+
+## 7. Baselines and known conditions
+
+Baselines (trailing rule: compare with the prev-5 trading-day median, never with a fixed level):
+| Metric | Seed (date) |
+|---|---|
+| archive rows/day | 93–1,247 (10-12..16); 156–172 (10-29/30) |
+| price_history rows/day | ~2,762–2,767 (10-30) |
+| 1m regular | 485 k bars / 1,273 symbols, vendor `ls`, vol ratio median 0.959 (10-16) |
+| aftermarket-book manifests | 35 (18 × krx/nxt batches; 10-30) |
+| tape sweep | needs 771, recovered 604, unresolved 167, expired 0 (10-30) |
+| backup | 3–13 min; `segments` 2–170 per night (11-01: 2) |
+| runtimes | collect 25–95 s, predict ~12 s, finalize 10 s–2.5 min, archive-regular 28–57 min, archive 9–33 min, tape-sweep 24–31 min, daily-audit 1.5–4.5 min (incl. ~80 s chown), extended-backfill ~2.5 min |
+[redacted]
+
+Known conditions:
+| Since | Condition | Expected verdict while open | Re-check / expiry | Close when |
+|---|---|---|---|---|
+| 2026-11-02 | D1 prune purge cap 7 per subtree vs daily backup | B05 PASS; FAIL `cap_risk` after a ≥1-week prune outage | 2026-12-01 | cap sized from the backup cadence (fix pending) |
+| 2026-11-02 | D2 `audit_daily_completeness` omits `intraday_complete` (added in `main()` :2308) | C11 derives it from the journal | 2026-12-01 | helper returns 8 keys (fix pending) |
+| 2026-11-02 | D3 heartbeat severity fallback parses the subject (`daily_audit.py:1910-1913`) | none (latent) | 2026-12-01 | fix pending |
+| 2026-11-02 | D4 paper-entry idempotency compares `decision_date` unnormalized (`paper_trade.py:425`) | P01 would FAIL `dup` if it ever triggers | 2026-12-01 | fix pending |
+| 2026-11-02 | D5 `kca-audit-reconcile` in its own safe-rerun list | none (busy check blocks it) | 2026-12-01 | fix pending |
+| 2026-11-02 | D6 seal exception records `deferred_dates=0` | B04 WARN `seal_status_ok=False` | 2026-12-01 | fix pending |
+| 2026-11-02 | D7 loose-copy excludes hardcoded to `/history/capture/**` | none unless `COLLECTION_ROOT`/`HISTORY_DIR` is overridden | 2026-12-01 | fix pending |
+| 2026-11-02 | D8 core panel shrink tolerance 0 rows, no override for a legitimate dedupe | B01/B08 FAIL on a legitimate dedupe | 2026-12-01 | fix pending |
+| 2026-11-02 | D9 no OK outcome for collect/paper/tape-sweep/backup/prune/verify/snapshot | probes use the journal/ledger instead | 2026-12-01 | fix pending |
+| 2026-11-02 | D10 shared KIS key `134e3b771841` rejected (`EGW00121`) at 09:01 and `ADOPTED_ROTATED` | X01 WARN on O | 2026-11-16 | attributed (krx/kse re-issue) |
+| 2026-11-02 | D11 no in-code assert nav = cash + open MV | P03 is the only guard | 2026-12-01 | fix pending |
+| 2026-10-29 | History rewrite of the README commit (`1681172` → `88d3452`): `deploy.yml` run 40891357295 test job failed, so `latest` stays on `sha-1681172` (code-identical tree). The fixture SHA fix is uncommitted in the working copy | H02 WARN `code_identical=True`; H04 FAIL | 2026-11-09 | the fixture fix is committed and deploy is green |
+| 2026-11-02 | Dashboard kca card `kca.api_actions` WARN | A04 WARN | 2026-11-09 | mapped to an API notice/action finding, or cleared |
+| 2026-10-30 | `auction_path` DEGRADED / manifest PARTIAL (DB증권 research capture) | R03 WARN, C06 WARN | 2026-11-16 | 3 consecutive COMPLETE days |
+| 2026-10-30 | 종가 vs 결정_종가 gap p99 3.09 % (normal ≲ 3 %) | Q01 WARN when p99 > 0.03 | 2026-11-16 | recalibrate the threshold if it is seen ≥ 3 of 10 days |
+| 2026-10-30 | Extended backfill `pending_manifest_conflict` fixed and deployed (`pending_conflicts=0` 2026-10-30..11-01) | R02/R03 PASS; any recurrence from the 23:05 run is a regression (P2) | 2026-11-30 | — |
+| 2026-10-31 | Host reboot 13:30 KST: non-persistent timers show LAST `-` until their next fire; judge R01 from the journal (the probe already does) | none | next reboot | — |
+| 2026-10-22 | `price_basis_raw_basis_unavailable`: 393 keys, a stable vendor gap growing only with new corporate actions | heartbeat info | 2026-11-30 | — |
+| 2026-10-16 | Daily audit `missing_bars` is judged on D only; extended backfill can rewrite past dates with `vendor=kis` trade-only symbols (10-16: 213) that a re-audit would flag | re-audits of past D may show it | 2026-11-30 | — |
+| 2026-10-09 | `stale_kis_token:*` on CLOSED days (warmup skips; budget exhausted) | regression if seen again (P2) | 2026-11-30 | — |
+| standing | Dashboard `[[schedule]]` list is separate (`quant-dashboard/config.toml`); a removed slot (price-ingest 21:30, `627cd1c`) raises `예정 실행이 지연` there | A04 WARN | on dashboard change | fix in the dashboard config |
+| standing | ops-sentinel `job_late` vs `After=`: a unit held behind a slow predecessor stays PENDING (a slow archive-intraday raised a false `job_late:kca-tape-sweep`) | R01 PASS after it finishes | — | — |
+| standing | Failed state persists until the unit's next run (e.g. retrain until next Saturday unless `reset-failed`) | H01 FAIL with the cause named | — | — |
+| standing | `TOKEN_REPLACED` (Toss token shared by PC and VPS), Drive lock and KIS slots are cross-project; attribute precisely | X01/X02 WARN | — | — |
+
+## 8. Maintenance
+
+- A new routine needs: a §3 row, a §4 presence check and a content check, a window placement (§2), and a §7 baseline. A routine without a content check is incomplete.
+- Every incident ends as a check, a triage row or a known condition with an expiry date. When a timer, unit, wrapper flag, data path or contract file changes, update §3, §4 and §5 in the same change.
+- Retired IDs (v3 → v4; never reuse): `DEP-01/02/03` → H02; `DEP-04/07` → H04; `SCH-01` → H01; `SCH-02`, `RUN-01/02/05` → R01; `SCH-03` dropped (blackout tuple; deploy.yml enforces it); `RUN-03` → R02/R03; `RUN-04` → P06; `RUN-06` → A03/R03; `BRK-01/02/04/05/06` → X03/X05/R05; `BRK-03` → X01; `HOST-01/02/04` → X03/X05; `HOST-03/05` → H03; `DI-ARCH-01..09` → Q01; `DI-PH-*` → Q05; `DI-1M-01..03` → Q06; `DI-1M-04/05` → Q07; `DI-1M-06` → Q10; `DI-1M-07` → Q09; `DI-TOPK-*` → P04; `DI-PAPER-*` → P03; `DI-BAK-01` → B04; `PAP-01/03` → P02; `PAP-02` → P01; `PAP-04` → P03; `PAP-05` → P06; `ML-01/02` → R04; `ML-03`, `RS-01..06` → Q11; `RS-07` → Q08; `RS-08` → C08; `RS-09` → C03/C04; `BAK-01/02` → B01; `BAK-03` → B04; `BAK-04` → B07; `BAK-05` → B05/B08; `BAK-06` → B03; `BAK-07` → B05; `ALR-01` → A01; `ALR-02` → A02; `ALR-03` → A03; `ALR-04/05` → A04/A05.
+- Last probe execution log:
+| Date (KST) | Rev | Window / D | Result |
+|---|---|---|---|
+| 2026-11-02 09:40 | 88d3452 | O / 11-02 | all PASS except X01 WARN (`EGW00121`/`AUTH_REJECTED`/`ADOPTED_ROTATED` ×1, D10); 5.6 s |
+| 2026-11-02 09:41 | 88d3452 | M / 10-30 (re-audit) | CORE all PASS; WARN R03 (`auction_path DEGRADED`), X01 (D10), A04 (`kca.api_actions`); 23 s |
+| 2026-11-02 09:41 | 88d3452 | E / 10-30 (retro) | CORE all PASS; WARN Q01 (`close_gap_p99=0.0309` > 0.03), X01; 5 s |
+| 2026-11-02 09:41 | 88d3452 | N / 10-30 (retro) | CORE all PASS (C04 `regular-ticks: tape_healed`); WARN R03, C06 (`auction-path partial`), X01; 14 s |
+| 2026-11-02 09:42 | 88d3452 | W / 10-30 | B07 B08 R04 Q11 PASS; WARN H02 (`latest`=sha-1681172, `code_identical=True`), H03 (5 known stray `.bak/.pre_*`); 4 s |
+| 2026-11-02 09:43 | local | W local + drills | H04 FAIL: latest `deploy.yml` run 40891357295 (88d3452) test job failed; `--print-argv` 22/22 rc=0; fixture SHAs ancestors (working copy). A05 PASS (5/5 watchdog runs). R06 drill executed: inactive (outside 15:40–19:59; expected) |
+| — | — | live E/N for 2026-11-02 | not executed live: their evidence does not exist before 15:45 / 21:50. Executed retroactively on 10-30 instead; extracted bodies pass `ast.parse` |
