@@ -32,7 +32,7 @@ def test_run_minute_history_backfill_processes_dates_oldest_first(
     monkeypatch.setattr(
         backfill_minute_history,
         "enumerate_backfill_targets",
-        lambda as_of=None, lookback_days=365: [("2026-08-01", "005930"), ("2026-08-15", "005930")],
+        lambda as_of=None, lookback_days=365, trade_log_path=None: [("2026-08-01", "005930"), ("2026-08-15", "005930")],
     )
 
     call_order: list[str] = []
