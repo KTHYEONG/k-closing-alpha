@@ -126,7 +126,7 @@ Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auct
 | C07 | CORE | O | §1; WARN on `flow_shortfall`/`program_flow_shortfall`. A 08:30 `stale_panel_pending_retry` is healthy when 11:30 is OK; an 11:30 DEGRADED `stale_panel` needs an alert | P1 | price-ingest journal |
 | C08 | CORE | N | §1 (report `days_checked[-1] == D`) | P1 | `last_report.json` `unresolved`, `stage=tape_sweep status=WARNING` |
 | C11 | CORE | N M | §1: `audit_daily_completeness(D)` (7 keys) + `intraday_complete` = the daily-audit run for D logged no `step=intraday_complete status=FAIL date=D` (mirrors `daily_audit.py:2308`) | P1 | daily-audit journal for D |
-| Q01 | CORE | E | §1 thresholds: confirmed share <0.9 FAIL, <0.99 WARN; `수급_실패` share >0.1 WARN; other flags >0 FAIL; `등락률` mismatch >1 % rows FAIL (computed on 종가, not 결정_종가); 종가 vs 결정_종가 gap p99 >3 % WARN. Rows follow the market screen (93–1,247/day); `snap_in_1520` drops at large `n_raw` (0.694 at 1,247 rows) and is info | P0 | §5.2 `Q-spot` |
+| Q01 | CORE | E | §1 thresholds: confirmed share <0.9 FAIL, <0.99 WARN; `수급_실패` share >0.1 WARN; other flags >0 FAIL; `등락률` mismatch >1 % rows FAIL (computed on 종가, not 결정_종가); 종가 vs 결정_종가 gap p99 >3 % WARN. Causality (`execution_timestamp` ≥ 15:30) is judged on confirmed rows only: an unconfirmed row keeps its 15:20 snapshot ts by design (`finalize_close` never promotes frozen prices; `paper_broker` rejects a fill whose ts precedes `placed_at`). Rows follow the market screen (93–1,247/day); `snap_in_1520` drops at large `n_raw` (0.694 at 1,247 rows) and is info | P0 | §5.2 `Q-spot` |
 | Q05 | EXT | O | price_history day P: rows/prev5 median ∈ [0.97, 1.03], no dup (day or total), no invalid OHLCV, one `kospi_pct` | P1 | — |
 | Q06 | EXT | N | 1m regular D: no dup `(symbol, ts_hms)`, no invalid bar, ts covers 09:01–15:29 | P1 | — |
 | Q07 | EXT | N | day P: 1m volume / EOD volume median ≤1.01 (≈0.96 for vendor `ls`; judge drift vs baseline ±0.02, share <0.9 ±0.05); last-bar close matches `close_raw` share ≥0.98 (FAIL <0.9) | P2 | — |
@@ -627,7 +627,8 @@ def _():
     snap = pd.to_datetime(d["snapshot_timestamp"], utc=True).dt.tz_convert(KST)
     feat = pd.to_datetime(d["feature_available_timestamp"], utc=True).dt.tz_convert(KST)
     exe = pd.to_datetime(d["execution_timestamp"], utc=True).dt.tz_convert(KST)
-    causal = int((feat < snap).sum() + (exe.dt.strftime("%H%M%S") < "153000").sum())
+    confirmed_rows = d["종가_확정"].fillna(0).astype(float).to_numpy() > 0  # unconfirmed rows keep the 15:20 snapshot ts by design (finalize_close never promotes frozen prices); their share is judged by `confirmed`
+    causal = int((feat < snap).sum() + ((exe.dt.strftime("%H%M%S") < "153000").to_numpy() & confirmed_rows).sum())
     in1520 = float(((snap.dt.strftime("%H%M%S") >= "152000") & (snap.dt.strftime("%H%M%S") <= "152059")).mean()) if len(d) else 0.0
     fail = len(d) == 0 or int(d["종목코드"].duplicated().sum()) > 0 or nulls > 0 or conf < 0.9 or ohlc > 0 or causal > 0 or flags["가격_비정상"] + flags["지수_실패"] + flags["현재가_실패"] > 0 or chg > max(1, len(d) * 0.01)
     out("Q01", lv(fail, conf < 0.99 or flags["수급_실패"] > 0.1 * max(len(d), 1) or gap99 > 0.03), rows=len(d), prev5_median=int(med), confirmed=round(conf, 3), nulls=nulls, flags=flags, ohlc_bad=ohlc, chg_mismatch=chg, close_gap_p99=round(gap99, 4), causality_violations=causal, snap_in_1520=round(in1520, 3))
