@@ -584,7 +584,7 @@ def _():
         return
     st = manifest_status(D, f"auction-open-{D}-")
     j = jr("auction-open", at(D, "08:39:00"), at(D, "09:40:00"), r"stage=auction_capture status=\w+ phase=open")
-    out("C05", lv(not st, "complete" not in st.values()), open=",".join(st.values()) or "missing", journal=j[-1].split("status=")[1][:40] if j else "absent")
+    out("C05", lv(not st, "complete" not in st.values()), open=",".join(st.values()) or "missing", journal=j[-1].split("status=")[1].split()[0] if j else "absent")
 p_ledger(D, P, morning=True)
 @check("P06")
 def _():
@@ -821,6 +821,8 @@ def _():
 | `X01 WARN EGW00121/ADOPTED_ROTATED` | another project re-issued a shared KIS key after 07:05 | token store `~/.cache/kis` | attribute (krx/kse); harmless if adopted |
 | `A01 FAIL reconciled_age` | reconcile lock busy (exit 75) or the unit is failing | `audit_reconcile.py` | journal of `kca-audit-reconcile` |
 | `UNKNOWN err=…` | probe drift (schema/path change) | this file | fix the probe in the same change (§8) |
+| Restore needed: `price_history` (since `ed5c912`, a `data/` restore has no monolith) | offsite form is base+patch | `src/tools/price_history_offsite.py` | `rclone copy gdrive:quant-lake/live/k-closing-alpha/data/history/price_history_offsite <tmp>` then `uv run python -m src.tools.price_history_offsite restore --from-dir <tmp> --target <new path>` (refuses an existing target; checks md5 + rows). From a snapshot: first `rclone copy …/snapshots/_blobs/price_history <tmp>`, then `…/snapshots/<D>/data/history/price_history_offsite <tmp>`, same restore. Snapshots ≤ 2026-11-01 hold the monolith |
+| `steps.offsite_ledger` FAIL `ledger_not_append_only` | a seal ledger was rewritten, not appended | `offsite_backup.py` `classify_ledger_files`; `capture_offsite.py:664` | the rewritten file was uploaded with a `_deleted` version; find the writer that rewrote it (root cause), never reset `ledger_upload_state.json` to silence it |
 
 ## 7. Baselines and known conditions
 
@@ -850,7 +852,9 @@ Known conditions:
 | 2026-11-02 | D9 no OK outcome for collect/paper/tape-sweep/backup/prune/verify/snapshot | probes use the journal/ledger instead | 2026-12-01 | fix pending |
 | 2026-11-02 | D10 shared KIS key `134e3b771841` rejected (`EGW00121`) at 09:01 and `ADOPTED_ROTATED` | X01 WARN on O | 2026-11-16 | attributed (krx/kse re-issue) |
 | 2026-11-02 | D11 no in-code assert nav = cash + open MV | P03 is the only guard | 2026-12-01 | fix pending |
-| 2026-10-29 | History rewrite of the README commit (`1681172` → `88d3452`): `deploy.yml` run 40891357295 test job failed, so `latest` stays on `sha-1681172` (code-identical tree). The fixture SHA fix is uncommitted in the working copy | H02 WARN `code_identical=True`; H04 FAIL | 2026-11-09 | the fixture fix is committed and deploy is green |
+| 2026-10-29 | History rewrite of the README commit (`1681172` → `88d3452`): `deploy.yml` run 40891357295 test job failed, so `latest` stays on `sha-1681172` (code-identical tree). Fixture SHA fix committed locally in `e18a930` (not pushed) | H02 WARN `code_identical=True`; H04 FAIL | 2026-11-09 | the fixture fix is committed and deploy is green |
+| 2026-11-02 | Offsite churn reduction `ed5c912`/`a2523e6` (pending deploy): `price_history` goes offsite as base+patch form `data/history/price_history_offsite/` (monolith excluded from the loose copy; first successful run moves the remote monolith to `_deleted/data/<day>/`); seal ledgers upload append-only without `_deleted` versions (`capture/offsite/ledger_upload_state.json`); snapshots store the base as shared blobs `snapshots/_blobs/price_history/` | B01: `steps.price_history_form` ok (`rebased` ≈ monthly) and `steps.offsite_ledger` ok with `rewritten=0` (else FAIL `ledger_not_append_only`); B03 lists remote `data/history/price_history.parquet` missing after the first run (expected); kca-backup peak RSS +2–3 GiB for ~15 s | 2026-11-16 | 3 clean nightly runs after deploy |
+| 2026-11-02 | Remote residue `data/history/capture/manifests` (3,657 files, 320 MiB, newest 2026-09-30; excluded from the loose copy since `c71f9d1`): 3,542 covered by sealed segments; **115 manifests + 9 raw/normalized files** (2026-09-18 decision/repair cohorts) in no ledger | INFO | 2026-11-30 | reviewed, then purge with user approval |
 | 2026-11-02 | Dashboard kca card `kca.api_actions` WARN | A04 WARN | 2026-11-09 | mapped to an API notice/action finding, or cleared |
 | 2026-10-30 | `auction_path` DEGRADED / manifest PARTIAL (DB증권 research capture) | R03 WARN, C06 WARN | 2026-11-16 | 3 consecutive COMPLETE days |
 | 2026-10-30 | 종가 vs 결정_종가 gap p99 3.09 % (normal ≲ 3 %) | Q01 WARN when p99 > 0.03 | 2026-11-16 | recalibrate the threshold if it is seen ≥ 3 of 10 days |
