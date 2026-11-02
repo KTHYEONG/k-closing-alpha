@@ -18,6 +18,16 @@ from src.backfill.altdata.runner import run_altdata_backfill
 logger = logging.getLogger(__name__)
 
 
+def trade_log_symbols(trade_log: pd.DataFrame) -> frozenset[str]:
+    """Distinct 6-digit symbols of a trade log; empty when no stock-code column is present."""
+    column = next((c for c in ("stock_code", "종목코드", "symbol", "code") if c in trade_log.columns), None)
+    if column is None:
+        return frozenset()
+    raw = trade_log[column].dropna().astype(str).str.strip()
+    symbols = set(raw[(raw != "") & (raw.str.lower() != "nan")].str.zfill(6))
+    return frozenset(s for s in symbols if s != "000000")
+
+
 def main(argv: list[str] | None = None) -> None:
     """Parse alt-data backfill arguments and dispatch to the collection runner.
 
@@ -46,9 +56,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--dart-rps", type=float, default=8.0, help="DART requests per sec")
     parser.add_argument("--krx-rps", type=float, default=4.0, help="KRX Open API requests per sec")
     parser.add_argument(
-        "--trade-log-universe",
-        action="store_true",
-        help="filter to symbols ever present in trade_log.parquet",
+        "--trade-log",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="filter to symbols ever present in this trade-log parquet; research copy: "
+        "gdrive:quant-lake/research/k-closing-alpha/manual_journal_v1/trade_log.parquet",
     )
     args = parser.parse_args(argv)
 
@@ -85,24 +98,12 @@ def main(argv: list[str] | None = None) -> None:
     krx_rps = float(args.krx_rps)
 
     universe_symbols: frozenset[str] | None = None
-    if args.trade_log_universe:
-        try:
-            trade_path = settings.TRADE_LOG_PARQUET_PATH
-            if trade_path.exists():
-                df = pd.read_parquet(trade_path)
-                # Find stock_code column
-                col = None
-                for cand in ["stock_code", "종목코드", "symbol", "code"]:
-                    if cand in df.columns:
-                        col = cand
-                        break
-                if col is not None:
-                    syms = set(df[col].astype(str).str.strip().str.zfill(6).tolist())
-                    syms = {s for s in syms if s and s != "000000" and s.lower() != "nan"}
-                    if syms:
-                        universe_symbols = frozenset(syms)
-        except Exception as exc:
-            logger.warning("[DATA] stage=altdata_universe status=FAIL error=%s", exc)
+    if args.trade_log is not None:
+        if not args.trade_log.exists():
+            parser.error(f"trade log not found: {args.trade_log}")
+        universe_symbols = trade_log_symbols(pd.read_parquet(args.trade_log))
+        if not universe_symbols:
+            parser.error(f"trade log has no stock-code column or symbols: {args.trade_log}")
 
     cfg = AltDataFetchConfig(
         start=start,

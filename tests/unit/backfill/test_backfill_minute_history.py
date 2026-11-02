@@ -113,22 +113,23 @@ def test_merge_and_write_partition_preserves_existing_codes_on_rerun(
     assert set(stored["symbol"]) == {"005930", "000660"}
 
 
-def test_enumerate_backfill_targets_merges_trade_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_enumerate_backfill_targets_merges_explicit_trade_log_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(backfill_minute_history.settings, "DATA_DIR", tmp_path)
     monkeypatch.setattr(archive, "fetch_archive_snapshot", lambda all_rows=False, **kw: pd.DataFrame())
 
+    # Given a trade log at the old implicit location and the same file passed explicitly
     parquet_dir = tmp_path / "parquet"
     parquet_dir.mkdir(parents=True)
-    trade_log_df = pd.DataFrame({
-        "매수날짜": ["2026-02-10", "2026-03-01"],
-        "종목코드": ["035420", "000270"],
-    })
-    trade_log_df.to_parquet(parquet_dir / "trade_log.parquet", index=False)
+    trade_log_path = parquet_dir / "trade_log.parquet"
+    pd.DataFrame({"매수날짜": ["2026-02-10", "2026-03-01"], "종목코드": ["035420", "000270"]}).to_parquet(trade_log_path, index=False)
 
-    result = backfill_minute_history.enumerate_backfill_targets(as_of="2026-09-04", lookback_days=365)
-
+    # Then it is used only when passed, and a missing explicit path is an error
+    assert backfill_minute_history.enumerate_backfill_targets(as_of="2026-09-04", lookback_days=365) == []
+    result = backfill_minute_history.enumerate_backfill_targets(as_of="2026-09-04", lookback_days=365, trade_log_path=trade_log_path)
     assert ("2026-02-10", "035420") in result
     assert ("2026-03-01", "000270") in result
+    with pytest.raises(FileNotFoundError, match="trade log not found"):
+        backfill_minute_history.enumerate_backfill_targets(as_of="2026-09-04", trade_log_path=tmp_path / "missing.parquet")
 
 
 def test_already_collected_codes_reflects_existing_partition(
@@ -183,7 +184,7 @@ def test_run_minute_history_backfill_skips_already_collected_codes(
     monkeypatch.setattr(
         backfill_minute_history,
         "enumerate_backfill_targets",
-        lambda as_of=None, lookback_days=365: [("2026-08-15", "005930"), ("2026-08-15", "000660")],
+        lambda as_of=None, lookback_days=365, **_: [("2026-08-15", "005930"), ("2026-08-15", "000660")],
     )
 
     # 005930은 정규세션에 이미 저장돼 있다고 가정 -- 이번 호출에서 재조회되면 안 된다.
@@ -222,7 +223,7 @@ def test_enumerate_backfill_targets_adds_next_trading_day_from_calendar(monkeypa
 
     # Arrange: Friday 2026-03-06 -> Monday 2026-03-09; 2026-03-09 is the calendar end.
     frames = [pd.DataFrame({"스냅샷_날짜": ["2026-03-06", "2026-03-09"], "종목코드": ["005930", "000660"]})]
-    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda **_: frames)
     calendar = pd.DatetimeIndex(pd.to_datetime(["2026-03-05", "2026-03-06", "2026-03-09"]))
 
     # Act
@@ -250,7 +251,7 @@ def test_enumerate_backfill_targets_resolves_exit_day_from_price_history_file(tm
 
     # Arrange: calendar lives in the price-history parquet, not injected.
     frames = [pd.DataFrame({"스냅샷_날짜": ["2026-03-06"], "종목코드": ["005930"]})]
-    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda **_: frames)
     cal_path = tmp_path / "price_history.parquet"
     pd.DataFrame({"date": pd.to_datetime(["2026-03-05", "2026-03-06", "2026-03-09"])}).to_parquet(cal_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", cal_path)
@@ -270,7 +271,7 @@ def test_enumerate_backfill_targets_skips_exit_when_calendar_missing(tmp_path, m
 
     # Arrange: no calendar file and no injected calendar.
     frames = [pd.DataFrame({"스냅샷_날짜": ["2026-03-06"], "종목코드": ["005930"]})]
-    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda **_: frames)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "missing.parquet")
 
     # Act
@@ -287,7 +288,7 @@ def test_enumerate_backfill_targets_supports_tz_aware_calendar(monkeypatch) -> N
 
     # Arrange
     frames = [pd.DataFrame({"스냅샷_날짜": ["2026-03-06"], "종목코드": ["005930"]})]
-    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda **_: frames)
     calendar = pd.DatetimeIndex(pd.to_datetime(["2026-03-06", "2026-03-09"]).tz_localize("Asia/Seoul"))
 
     # Act
@@ -306,7 +307,7 @@ def test_enumerate_backfill_targets_skips_unparseable_snapshot_date(monkeypatch)
 
     # Arrange: "2026-13-40" passes the string window filter but has no calendar successor.
     frames = [pd.DataFrame({"스냅샷_날짜": ["2026-13-40", "2026-03-06"], "종목코드": ["005930", "000660"]})]
-    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda **_: frames)
     calendar = pd.DatetimeIndex(pd.to_datetime(["2026-03-05", "2026-03-06", "2026-03-09"]))
 
     # Act
@@ -326,7 +327,7 @@ def test_enumerate_backfill_targets_treats_calendar_without_date_column_as_missi
 
     # Arrange: calendar parquet exists but holds no dates.
     frames = [pd.DataFrame({"스냅샷_날짜": ["2026-03-06"], "종목코드": ["005930"]})]
-    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda: frames)
+    monkeypatch.setattr(mod, "_load_condition_history_sources", lambda **_: frames)
     cal_path = tmp_path / "price_history.parquet"
     pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]")}).to_parquet(cal_path)
     monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", cal_path)
@@ -393,10 +394,15 @@ def test_run_minute_history_backfill_collects_krx_aftermarket_partition(monkeypa
 def test_backfill_minute_history_main_entrypoint(monkeypatch) -> None:
     import src.backfill.intraday.backfill_minute_history as bmh
 
-    monkeypatch.setattr(
-        bmh,
-        "run_minute_history_backfill",
-        lambda: {"dates": 0, "regular_rows": 0, "nxt_rows": 0, "krx_after_rows": 0},
-    )
+    calls: list[dict] = []
 
-    bmh.main()
+    def _run(**kwargs):
+        calls.append(kwargs)
+        return {"dates": 0, "regular_rows": 0, "nxt_rows": 0, "krx_after_rows": 0}
+
+    monkeypatch.setattr(bmh, "run_minute_history_backfill", _run)
+
+    bmh.main([])
+    bmh.main(["--trade-log", "/research/trade_log.parquet"])
+
+    assert calls == [{"trade_log_path": None}, {"trade_log_path": Path("/research/trade_log.parquet")}]

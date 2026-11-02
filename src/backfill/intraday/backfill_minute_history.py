@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 
@@ -27,15 +29,16 @@ logger = logging.getLogger(__name__)
 _LEGACY_CONDITION_HISTORY_PATH_NAME = "condition_history_cleaned.parquet"
 
 
-def _load_condition_history_sources() -> list[pd.DataFrame]:
-    """세 소스(공식 조건검색 아카이브 + 레거시 정제분 + 실제 매매일지)를 모두 로드해 합집합 대상을 만든다.
+def _load_condition_history_sources(trade_log_path: Path | None = None) -> list[pd.DataFrame]:
+    """Load the backfill target sources: the condition archive, the legacy cleaned history and, when given, a trade log.
 
-    - archive.parquet: archive.py 운영 시작(대략 2026-08-04) 이후 조건검색 후보.
-    - condition_history_cleaned.parquet: 그 이전 구간의 레거시 정제 백필분.
-    - trade_log.parquet: 실제 체결된 매매일지(매수날짜/종목코드) -- 조건검색 후보군과 별개로,
-      "실제로 산 종목"은 라벨/수익률이 확정된 가장 가치 높은 백필 대상이라 반드시 포함해야 한다.
-      2016년까지 거슬러 올라가지만 KIS 보관한도(~1년) 밖 날짜는 enumerate_backfill_targets의
-      lookback_days 필터가 자동으로 제외한다.
+    - archive.parquet: condition candidates since archive.py went live (about 2026-08-04).
+    - condition_history_cleaned.parquet: the legacy cleaned backfill for the earlier span.
+    - trade_log_path: an explicit manual trade journal (매수날짜/종목코드), research-only and never read
+      implicitly; dates beyond the KIS retention window are dropped by enumerate_backfill_targets' lookback.
+
+    Raises:
+        FileNotFoundError: trade_log_path is given but does not exist.
     """
     frames: list[pd.DataFrame] = []
     try:
@@ -54,17 +57,12 @@ def _load_condition_history_sources() -> list[pd.DataFrame]:
         except Exception as e:
             logger.warning("Legacy condition history read failed %s: %s", legacy_path, e)
 
-    # settings.TRADE_LOG_PARQUET_PATH(호환 재수출 상수)는 프로세스 시작 시 고정되어 테스트에서
-    # DATA_DIR 패치가 반영되지 않는다 -- legacy_path와 동일하게 DATA_DIR에서 직접 계산한다.
-    trade_log_path = settings.DATA_DIR / "parquet" / "trade_log.parquet"
-    if trade_log_path.exists():
-        try:
-            trade_df = pd.read_parquet(trade_log_path)
-            if not trade_df.empty and "매수날짜" in trade_df.columns and "종목코드" in trade_df.columns:
-                renamed = trade_df[["매수날짜", "종목코드"]].rename(columns={"매수날짜": "스냅샷_날짜"})
-                frames.append(renamed)
-        except Exception as e:
-            logger.warning("Trade log read failed %s: %s", trade_log_path, e)
+    if trade_log_path is not None:
+        if not trade_log_path.exists():
+            raise FileNotFoundError(f"trade log not found: {trade_log_path}")
+        trade_df = pd.read_parquet(trade_log_path)
+        if not trade_df.empty and "매수날짜" in trade_df.columns and "종목코드" in trade_df.columns:
+            frames.append(trade_df[["매수날짜", "종목코드"]].rename(columns={"매수날짜": "스냅샷_날짜"}))
 
     return frames
 
@@ -88,6 +86,7 @@ def enumerate_backfill_targets(
     *,
     include_exit_day: bool = True,
     trading_calendar: pd.DatetimeIndex | None = None,
+    trade_log_path: Path | None = None,
 ) -> list[tuple[str, str]]:
     """archive + 레거시 condition_history_cleaned.parquet의 (스냅샷_날짜, 종목코드) distinct 쌍을
     lookback 이내로 필터링해 날짜 오름차순으로 반환한다.
@@ -97,7 +96,7 @@ def enumerate_backfill_targets(
     """
     as_of_date = as_of or datetime.now().strftime("%Y-%m-%d")
     cutoff = (datetime.strptime(as_of_date, "%Y-%m-%d") - timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
-    frames = _load_condition_history_sources()
+    frames = _load_condition_history_sources(trade_log_path=trade_log_path)
     if not frames:
         return []
     df = pd.concat(frames, ignore_index=True)
@@ -167,9 +166,11 @@ def _merge_and_write_partition(df: pd.DataFrame, bar_interval_minutes: int, snap
     return write_intraday_partition(df, bar_interval_minutes, snapshot_date, session)
 
 
-def run_minute_history_backfill(lookback_days: int = 365, bar_interval_minutes: int = 1) -> dict[str, int]:
+def run_minute_history_backfill(
+    lookback_days: int = 365, bar_interval_minutes: int = 1, *, trade_log_path: Path | None = None
+) -> dict[str, int]:
     """1회성 오케스트레이터: 날짜 오름차순으로 정규+NXT 백필 후 날짜별 파티션에 멱등 병합."""
-    targets = enumerate_backfill_targets(lookback_days=lookback_days)
+    targets = enumerate_backfill_targets(lookback_days=lookback_days, trade_log_path=trade_log_path)
     if not targets:
         return {"dates": 0, "regular_rows": 0, "nxt_rows": 0}
     by_date: dict[str, list[str]] = {}
@@ -221,10 +222,20 @@ def run_minute_history_backfill(lookback_days: int = 365, bar_interval_minutes: 
     return asyncio.run(_run())
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="One-off minute-history backfill over archive/legacy condition targets")
+    parser.add_argument(
+        "--trade-log",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="also backfill symbols bought in this trade-log parquet; research copy: "
+        "gdrive:quant-lake/research/k-closing-alpha/manual_journal_v1/trade_log.parquet",
+    )
+    args = parser.parse_args(argv)
     configure_cli_logging()
     logger.info("1회성 분봉 히스토리 백필 시작 (다수 날짜 x 종목 조합으로 오래 걸릴 수 있음, store=%s)", settings.HISTORY_DIR)
-    result = run_minute_history_backfill()
+    result = run_minute_history_backfill(trade_log_path=args.trade_log)
     logger.info(
         "[SUCCESS] 분봉 히스토리 백필 완료 (날짜수: %d, 정규: %d행, NXT 애프터: %d행)",
         result["dates"],

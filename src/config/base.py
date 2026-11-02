@@ -36,16 +36,6 @@ class PathSettings(EnvSettings):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
-    def TRADE_LOG_PARQUET_PATH(self) -> Path:
-        return self.PARQUET_DIR / "trade_log.parquet"
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def THEME_PARQUET_PATH(self) -> Path:
-        return self.PARQUET_DIR / "theme.parquet"
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
     def HISTORY_PARQUET_PATH(self) -> Path:
         return self.HISTORY_DIR / "archive.parquet"
 

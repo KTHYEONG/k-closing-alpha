@@ -4,9 +4,7 @@ import pytest
 
 from src import settings
 from src.data.parquet_loader import (
-    ThemeMapUnreadableError,
     _atomic_write_parquet,
-    load_theme_from_parquet,
     upsert_condition_parquet,
 )
 
@@ -16,24 +14,8 @@ def tmp_parquet_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     p_dir = tmp_path / "parquet"
     p_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(settings, "PARQUET_DIR", p_dir)
-    monkeypatch.setattr(settings, "TRADE_LOG_PARQUET_PATH", p_dir / "trade_log.parquet")
-    monkeypatch.setattr(settings, "THEME_PARQUET_PATH", p_dir / "theme.parquet")
     monkeypatch.setattr(settings, "HISTORY_PARQUET_PATH", p_dir / "condition_history.parquet")
     return p_dir
-
-
-def test_load_theme_from_parquet_reads_normalized_codes(tmp_parquet_dir: Path) -> None:
-    data = {
-        "종목코드": ["005930", "000660"],
-        "테마": ["반도체", "반도체"],
-    }
-    df_theme = pd.DataFrame(data)
-    df_theme.to_parquet(settings.THEME_PARQUET_PATH)
-
-    theme_map = load_theme_from_parquet()
-    assert isinstance(theme_map, dict)
-    assert theme_map.get("005930") == "반도체"
-    assert theme_map.get("000660") == "반도체"
 
 
 def test_upsert_and_load_condition_parquet(tmp_parquet_dir: Path) -> None:
@@ -71,7 +53,8 @@ def test_parquet_loader_module_no_longer_exposes_trade_log_functions() -> None:
     assert not hasattr(mod, "save_trade_log_to_parquet")
     assert not hasattr(mod, "load_trade_log_from_parquet")
     assert not hasattr(mod, "save_theme_to_parquet")
-    assert hasattr(mod, "load_theme_from_parquet")
+    assert not hasattr(mod, "load_theme_from_parquet")
+    assert not hasattr(mod, "ThemeMapUnreadableError")
     assert hasattr(mod, "upsert_condition_parquet")
     assert not hasattr(mod, "load_condition_data_from_parquet")
 
@@ -81,45 +64,6 @@ def test_load_condition_data_from_parquet_removed_as_orphaned() -> None:
 
     assert not hasattr(mod, "load_condition_data_from_parquet")
     assert hasattr(mod, "upsert_condition_parquet")
-    assert hasattr(mod, "load_theme_from_parquet")
-
-
-def test_load_theme_from_parquet_raises_on_corrupt_file(tmp_parquet_dir: Path) -> None:
-    settings.THEME_PARQUET_PATH.write_bytes(b"not a parquet file")
-
-    with pytest.raises(ThemeMapUnreadableError) as exc_info:
-        load_theme_from_parquet()
-
-    assert exc_info.value.__cause__ is not None
-    assert str(settings.THEME_PARQUET_PATH) in str(exc_info.value)
-
-
-def test_load_theme_from_parquet_raises_on_missing_columns(tmp_parquet_dir: Path) -> None:
-    pd.DataFrame({"종목코드": ["005930"], "업종": ["반도체"]}).to_parquet(settings.THEME_PARQUET_PATH)
-
-    with pytest.raises(ThemeMapUnreadableError, match="테마"):
-        load_theme_from_parquet()
-
-
-def test_load_theme_from_parquet_absent_file_returns_empty_with_warning(
-    tmp_parquet_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    import logging
-
-    monkeypatch.setattr(settings, "THEME_PARQUET_PATH", tmp_parquet_dir / "no_theme.parquet")
-
-    with caplog.at_level(logging.WARNING, logger="src.data.parquet_loader"):
-        assert load_theme_from_parquet() == {}
-
-    assert any("THEME_MISSING" in rec.message for rec in caplog.records)
-
-
-def test_load_theme_from_parquet_drops_blank_themes(tmp_parquet_dir: Path) -> None:
-    pd.DataFrame(
-        {"종목코드": ["5930", "000660", "035420"], "테마": ["반도체", None, "  "]},
-    ).to_parquet(settings.THEME_PARQUET_PATH)
-
-    assert load_theme_from_parquet() == {"005930": "반도체"}
 
 
 def _condition_frame(date_str: str, code: str) -> pd.DataFrame:

@@ -52,6 +52,27 @@ def test_backfill_altdata_main_wires_runner(monkeypatch, tmp_path) -> None:
     assert str(cfg.out_dir) == str(tmp_path)
 
 
+def test_backfill_altdata_trade_log_filter_needs_an_explicit_existing_path(monkeypatch, tmp_path) -> None:
+    import pytest
+
+    seen = {}
+    monkeypatch.setattr(cli, "run_altdata_backfill", lambda cfg: seen.setdefault("cfg", cfg) and {"panels": {}})
+    base = ["--source", "shorting", "--start", "2024-01-02", "--end", "2024-01-10", "--out-dir", str(tmp_path)]
+
+    # Given an explicit trade log / Then its symbols bound the universe
+    trade_log = tmp_path / "trade_log.parquet"
+    pd.DataFrame({"종목코드": ["5930", "000660", "nan"]}).to_parquet(trade_log)
+    cli.main([*base, "--trade-log", str(trade_log)])
+    assert seen["cfg"].universe_symbols == frozenset({"005930", "000660"})
+
+    # Missing file or no stock-code column / Then the CLI refuses instead of silently widening the universe
+    with pytest.raises(SystemExit):
+        cli.main([*base, "--trade-log", str(tmp_path / "missing.parquet")])
+    pd.DataFrame({"x": [1]}).to_parquet(tmp_path / "bad.parquet")
+    with pytest.raises(SystemExit):
+        cli.main([*base, "--trade-log", str(tmp_path / "bad.parquet")])
+
+
 def test_run_altdata_backfill_dispatches_credit_balance_and_program_trade_daily(tmp_path, monkeypatch) -> None:
     import pandas as pd
 

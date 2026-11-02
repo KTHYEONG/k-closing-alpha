@@ -1,7 +1,6 @@
 """Parquet I/O operations and dataset manager module.
 
-Provides high-performance columnar data loading, saving, and upsert capabilities
-for theme mappings and condition search snapshots using Parquet format.
+Provides the atomic upsert of condition search snapshots into the Parquet archive.
 """
 
 from __future__ import annotations
@@ -15,15 +14,6 @@ from src import settings
 from src.data.io_utils import store_write_lock
 
 logger = logging.getLogger(__name__)
-
-
-class ThemeMapUnreadableError(RuntimeError):
-    """An existing theme map file could not be read or lacks its required schema.
-
-    Distinct from absence: an absent file is a legitimate "no theme data" state,
-    while an unreadable one means theme knowledge exists but is unknown right now.
-    Callers must not translate this into a placeholder value that would be persisted.
-    """
 
 
 def _ensure_dir(path: Path) -> None:
@@ -66,39 +56,6 @@ def _clean_df_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
                 df_clean[col] = df_clean[col].astype(str).replace({"nan": None, "None": None, "<NA>": None})
 
     return df_clean
-
-
-def load_theme_from_parquet() -> dict[str, str]:
-    """Load the stock-code → theme mapping from ``settings.THEME_PARQUET_PATH``.
-
-    Returns:
-        Mapping of 6-character stock code to stripped, non-empty theme text. Rows whose
-        theme is null or whitespace-only are omitted so a lookup miss is the only way
-        "no theme" is expressed. Duplicate codes resolve to the last row. Returns an
-        empty dict, with a ``[DATA]`` WARNING, when the file does not exist.
-
-    Raises:
-        ThemeMapUnreadableError: The file exists but reading it fails (original exception
-            chained as ``__cause__``; path in the message), or the columns ``종목코드`` /
-            ``테마`` are missing.
-    """
-    parquet_path = settings.THEME_PARQUET_PATH
-    if not parquet_path.exists():
-        logger.warning("[DATA] Theme parquet file not found stage=theme_load status=THEME_MISSING path=%s", parquet_path)
-        return {}
-
-    try:
-        df = pd.read_parquet(parquet_path)
-    except Exception as exc:
-        raise ThemeMapUnreadableError(f"theme map at {parquet_path} could not be read") from exc
-    missing = [col for col in ("종목코드", "테마") if col not in df.columns]
-    if missing:
-        raise ThemeMapUnreadableError(f"theme map at {parquet_path} is missing columns: {missing}")
-
-    usable = df.loc[df["테마"].notna() & (df["테마"].astype(str).str.strip() != "")]
-    codes = usable["종목코드"].astype(str).str.zfill(6)
-    themes = usable["테마"].astype(str).str.strip()
-    return dict(zip(codes, themes, strict=False))
 
 
 def upsert_condition_parquet(df: pd.DataFrame) -> None:

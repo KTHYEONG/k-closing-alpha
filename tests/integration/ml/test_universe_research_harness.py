@@ -95,11 +95,17 @@ def test_universe_research_main_writes_grid_parquet(tmp_path) -> None:
     ph.to_parquet(ph_path)
     out_path = tmp_path / "grid.parquet"
 
-    main(["--price-history", str(ph_path), "--theme", str(tmp_path / "no_theme.parquet"),
+    theme_path = tmp_path / "theme.parquet"
+    pd.DataFrame({"종목코드": ["000001"], "테마": ["반도체"]}).to_parquet(theme_path)
+    main(["--price-history", str(ph_path), "--theme", str(theme_path),
           "--out", str(out_path), "--cpcv-n-groups", "5", "--cpcv-k-test", "2"])
 
     df = pd.read_parquet(out_path)
     assert len(df) == 7 and "screen_name" in df.columns and "ranked_top1_net_bp" in df.columns
 
     with pytest.raises(ValueError, match="price_history not found"):
-        main(["--price-history", str(tmp_path / "missing.parquet"), "--out", str(out_path)])
+        main(["--price-history", str(tmp_path / "missing.parquet"), "--theme", str(theme_path), "--out", str(out_path)])
+    with pytest.raises(ValueError, match="theme not found"):
+        main(["--price-history", str(ph_path), "--theme", str(tmp_path / "no_theme.parquet"), "--out", str(out_path)])
+    with pytest.raises(SystemExit):
+        main(["--price-history", str(ph_path), "--out", str(out_path)])

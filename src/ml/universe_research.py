@@ -256,7 +256,12 @@ def main(argv: list[str] | None = None) -> None:
     """Run the screen family grid over full price_history and save the table."""
     parser = argparse.ArgumentParser(description="Universe screen family research harness (ranker-in-the-loop)")
     parser.add_argument("--price-history", default=str(settings.PRICE_HISTORY_PARQUET_PATH))
-    parser.add_argument("--theme", default=str(settings.THEME_PARQUET_PATH))
+    parser.add_argument(
+        "--theme",
+        required=True,
+        help="theme taxonomy parquet (종목코드, 테마); research copy: "
+        "gdrive:quant-lake/research/k-closing-alpha/manual_journal_v1/theme.parquet",
+    )
     parser.add_argument("--feature-set", choices=["close_morning61", "close_morning_history", "close_morning_sector"], default="close_morning61")
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
@@ -271,7 +276,9 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(f"price_history not found: {args.price_history}")
     price_history_df, panel_prov = load_price_panel(args.price_history)
     logger.info("[DATA] stage=panel_integrity %s", panel_prov.to_log_kv())
-    theme_df = pd.read_parquet(args.theme) if os.path.exists(args.theme) else None
+    if not os.path.exists(args.theme):
+        raise ValueError(f"theme not found: {args.theme}")
+    theme_df = pd.read_parquet(args.theme)
     date_col = "date" if "date" in price_history_df.columns else "trade_date"
     start_date = args.start_date or str(pd.to_datetime(price_history_df[date_col]).min().date())
     end_date = args.end_date or str(pd.to_datetime(price_history_df[date_col]).max().date())
