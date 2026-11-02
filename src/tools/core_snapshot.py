@@ -29,11 +29,23 @@ from src.tools.offsite_common import (
 from src.tools.offsite_common import (
     sha256_file as _sha256_file,
 )
+from src.tools.price_history_offsite import (
+    KIND_BASE,
+    MANIFEST_NAME,
+    OFFSITE_FORM_RELPATH,
+    PRICE_HISTORY_RELPATH,
+    OffsiteFile,
+    parse_manifest,
+    read_manifest,
+)
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
 
 CORE_SNAPSHOT_REMOTE_ROOT: str = OFFSITE_REMOTE_BASE + "/snapshots"
+# Content-named price_history base files shared by every snapshot (not a dated dir, so retention never lists it).
+CORE_SNAPSHOT_BLOB_ROOT: str = CORE_SNAPSHOT_REMOTE_ROOT + "/_blobs/price_history"
+RCLONE_EXIT_DIRECTORY_NOT_FOUND: int = 3
 CORE_SNAPSHOT_KEEP_WEEKLY: int = 8
 CORE_SNAPSHOT_KEEP_MONTHLY: int = 12
 CORE_ROW_SHRINK_TOLERANCE: float = 0.0
@@ -283,6 +295,73 @@ def _read_remote_manifest(
     return previous
 
 
+def usable_price_history_form(project_root: Path, stat: CorePanelStat) -> tuple[OffsiteFile, ...] | None:
+    """The nightly base + patch form when it was built from exactly this monolith, else None.
+
+    A form whose manifest names another source sha (stale) or whose files are
+    missing makes the snapshot fall back to carrying the monolith itself.
+    """
+    form = Path(project_root) / OFFSITE_FORM_RELPATH
+    try:
+        manifest = read_manifest(form)
+    except (OSError, ValueError):
+        return None
+    if manifest.source_sha256 != stat.sha256:
+        return None
+    for entry in manifest.files:
+        path = form / entry.relpath
+        if not path.is_file() or path.stat().st_size != entry.bytes:
+            return None
+    return manifest.files
+
+
+def _rclone(run_fn: Callable[..., subprocess.CompletedProcess[str]], cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    return run_fn(cmd, capture_output=True, text=True, timeout=RCLONE_TIMEOUT_SEC, check=False)
+
+
+def _list_remote_files(rclone: str, root: str, run_fn: Callable[..., subprocess.CompletedProcess[str]]) -> set[str] | None:
+    """Recursive file listing; empty set when the directory does not exist, None on any other failure."""
+    listing = _rclone(run_fn, [rclone, "lsf", "-R", "--files-only", root])
+    if listing.returncode == RCLONE_EXIT_DIRECTORY_NOT_FOUND:
+        return set()
+    if listing.returncode != 0:
+        return None
+    return {line.strip() for line in listing.stdout.splitlines() if line.strip()}
+
+
+def _gc_price_history_blobs(
+    rclone: str, kept_snapshots: Sequence[str], blobs: set[str], run_fn: Callable[..., subprocess.CompletedProcess[str]]
+) -> int:
+    """Delete blobs no kept snapshot references; any unreadable snapshot aborts the sweep (keeps everything)."""
+    referenced: set[str] = set()
+    for name in kept_snapshots:
+        form_root = f"{CORE_SNAPSHOT_REMOTE_ROOT}/{name}/{OFFSITE_FORM_RELPATH}"
+        listed = _list_remote_files(rclone, form_root, run_fn)
+        if listed is None:
+            logger.warning("[SYS] stage=core_snapshot blob_gc=ABORTED reason=unlistable snapshot=%s", name)
+            return 0
+        if MANIFEST_NAME not in listed:
+            continue
+        shown = _rclone(run_fn, [rclone, "cat", f"{form_root}/{MANIFEST_NAME}"])
+        try:
+            if shown.returncode != 0:
+                raise ValueError(f"rclone cat exit {shown.returncode}")
+            referenced |= {f.relpath for f in parse_manifest(shown.stdout).files if f.kind == KIND_BASE}
+        except ValueError:
+            logger.warning("[SYS] stage=core_snapshot blob_gc=ABORTED reason=unreadable_manifest snapshot=%s", name)
+            return 0
+    stale = sorted(blobs - referenced)
+    if not stale:
+        return 0
+    with tempfile.TemporaryDirectory(prefix="core-snapshot-gc-") as scratch:
+        listing = Path(scratch) / "stale.txt"
+        listing.write_text("".join(f"{rel}\n" for rel in stale), encoding="utf-8")
+        deleted = _rclone(run_fn, [rclone, "delete", CORE_SNAPSHOT_BLOB_ROOT, "--files-from-raw", str(listing)])
+    if deleted.returncode != 0:
+        raise RuntimeError(f"core snapshot blob gc failed: {(deleted.stderr or '').strip()}")
+    return len(stale)
+
+
 def run_core_snapshot(
     project_root: Path,
     *,
@@ -313,13 +392,41 @@ def run_core_snapshot(
     if issues:
         raise RuntimeError(f"core snapshot validation failed: {'; '.join(issues)}")
     day = today.isoformat()
+    ph_stat = next((entry for entry in stats if entry.relpath == PRICE_HISTORY_RELPATH), None)
+    form_files = usable_price_history_form(root, ph_stat) if ph_stat is not None else None
+    blobs: set[str] = set()
+    if form_files is not None:
+        listed = _list_remote_files(rclone, CORE_SNAPSHOT_BLOB_ROOT, run_fn)
+        if listed is None:
+            raise RuntimeError("core snapshot blob listing failed")
+        blobs = listed
     with tempfile.TemporaryDirectory(prefix="core-snapshot-") as staging_name:
-        staging = Path(staging_name)
+        staging = Path(staging_name) / "snapshot"
+        staging.mkdir()
         for entry in stats:
+            if form_files is not None and entry.relpath == PRICE_HISTORY_RELPATH:
+                continue
             src = root / entry.relpath
             dest = staging / entry.relpath
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest)
+        if form_files is not None:
+            form = root / OFFSITE_FORM_RELPATH
+            blob_stage = Path(staging_name) / "blobs"
+            missing = [f for f in form_files if f.kind == KIND_BASE and f.relpath not in blobs]
+            for item in form_files:
+                dest = (blob_stage if item.kind == KIND_BASE else staging / OFFSITE_FORM_RELPATH) / item.relpath
+                if item.kind != KIND_BASE or item in missing:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(form / item.relpath, dest)
+            (staging / OFFSITE_FORM_RELPATH).mkdir(parents=True, exist_ok=True)
+            shutil.copy2(form / MANIFEST_NAME, staging / OFFSITE_FORM_RELPATH / MANIFEST_NAME)
+            if missing:
+                # Blobs land before the snapshot that references them.
+                sent = _rclone(run_fn, [rclone, "copy", str(blob_stage), CORE_SNAPSHOT_BLOB_ROOT, "--immutable"])
+                if sent.returncode != 0:
+                    raise RuntimeError(f"core snapshot blob upload failed: {(sent.stderr or '').strip()}")
+                blobs |= {f.relpath for f in missing}
         manifest = staging / "manifest.json"
         manifest.write_text(
             json.dumps([asdict(entry) for entry in sorted(stats, key=lambda e: e.relpath)], sort_keys=True),
@@ -349,7 +456,14 @@ def run_core_snapshot(
         if purged.returncode != 0:
             raise RuntimeError(f"core snapshot prune failed: {target}")
         pruned.append(target)
-    logger.info("[SYS] stage=core_snapshot date=%s files=%d pruned=%d", day, len(stats), len(pruned))
+    blobs_removed = 0
+    if form_files is not None:
+        kept = sorted(set(all_names) - {target.rsplit("/", 1)[1] for target in pruned})
+        blobs_removed = _gc_price_history_blobs(rclone, kept, blobs, run_fn)
+    logger.info(
+        "[SYS] stage=core_snapshot date=%s files=%d pruned=%d price_history_form=%s blobs=%d blobs_removed=%d",
+        day, len(stats), len(pruned), form_files is not None, len(blobs), blobs_removed,
+    )
     return pruned
 
 
