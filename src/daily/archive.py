@@ -4,8 +4,6 @@ from datetime import datetime
 import pandas as pd
 
 from src import settings
-from src.data.data_loader import load_theme
-from src.data.parquet_loader import ThemeMapUnreadableError
 from src.processing.schema import ARCHIVE_COLUMN_ORDER
 
 logger = logging.getLogger(__name__)
@@ -15,8 +13,7 @@ STOCK_CODE_COL = "종목코드"
 THEME_SECTOR_COL: str = "테마_섹터"
 
 LEGACY_THEME_PLACEHOLDER: str = "테마 없음"
-"""Placeholder written by earlier versions for unmapped rows; read back as missing so
-it can be re-filled once theme data is available. Never written."""
+"""Placeholder written by earlier versions for unmapped rows; read back as missing (NaN). Never written."""
 
 # point-in-time 무결성 타임스탬프 (Asia/Seoul timezone-aware)
 SNAPSHOT_TIMESTAMP_COL = "snapshot_timestamp"
@@ -37,39 +34,15 @@ SNAPSHOT_TIMESTAMP_SYNTHETIC_COL: str = "snapshot_timestamp_synthetic"
 ARCHIVE_READ_COLUMN_ORDER = [*ARCHIVE_COLUMN_ORDER, *TIMESTAMP_COLS, SNAPSHOT_TIMESTAMP_SYNTHETIC_COL, THEME_SECTOR_COL]
 
 
-def _resolve_archive_theme_map() -> dict[str, str]:
-    """Resolve the theme map for archive enrichment without letting theme failure stop the archive.
-
-    Theme is not a decision input (the production ranker drops categorical theme features
-    and reads decisions from the capture store), so an unreadable theme file must degrade
-    the archive to "theme unknown" rather than fail the 15:20 collect or 15:30 finalize jobs.
-
-    Returns:
-        The theme map, or ``{}`` after logging
-        ``[DATA] stage=archive_theme status=THEME_UNAVAILABLE reason=<cause type> path=<theme path>``
-        at WARNING when ``ThemeMapUnreadableError`` is raised.
-    """
-    try:
-        return load_theme()
-    except ThemeMapUnreadableError as exc:
-        reason = type(exc.__cause__).__name__ if exc.__cause__ is not None else "schema"
-        logger.warning(
-            "[DATA] stage=archive_theme status=THEME_UNAVAILABLE reason=%s path=%s",
-            reason,
-            settings.THEME_PARQUET_PATH,
-        )
-        return {}
-
-
 def _standardize_archive_df(df: pd.DataFrame) -> pd.DataFrame:
     """Reorder candidates to ARCHIVE_COLUMN_ORDER with zero-filled stock codes and standardized theme/chart values.
 
     Timezone-aware timestamp columns(``snapshot_timestamp`` 등)은 표준 컬럼
     뒤에 보존되어 스냅샷 시각이 유실되지 않습니다.
 
-    ``테마_섹터`` is filled only from a known theme (existing value, else the theme map);
-    unknown themes stay NaN and the legacy placeholder is read back as NaN, because a
-    persisted placeholder cannot be repaired by downstream NaN-only fills.
+    ``테마_섹터`` is kept for schema compatibility only: a stored non-placeholder value
+    (or a legacy ``테마`` column) passes through, everything else is NaN. No theme file is
+    read; theme is research-only and not a decision input.
     """
     out = df.copy()
     if out.empty:
@@ -78,7 +51,7 @@ def _standardize_archive_df(df: pd.DataFrame) -> pd.DataFrame:
     if STOCK_CODE_COL in out.columns:
         out[STOCK_CODE_COL] = out[STOCK_CODE_COL].astype(str).str.zfill(6)
 
-    # 1. 테마_섹터 표준화 (theme.parquet에서 공식 load_theme 로 조인)
+    # 1. 테마_섹터 표준화 (저장된 값만 유지, 플레이스홀더/공백은 NaN)
     if THEME_SECTOR_COL not in out.columns and "테마" in out.columns:
         out[THEME_SECTOR_COL] = out["테마"]
     if THEME_SECTOR_COL not in out.columns:
@@ -88,10 +61,6 @@ def _standardize_archive_df(df: pd.DataFrame) -> pd.DataFrame:
     as_text = sector.astype(str).str.strip()
     missing = sector.isna() | (as_text == "") | (as_text == LEGACY_THEME_PLACEHOLDER)
     out[THEME_SECTOR_COL] = sector.mask(missing).astype(object)
-
-    if STOCK_CODE_COL in out.columns and out[THEME_SECTOR_COL].isna().any():
-        theme_map = _resolve_archive_theme_map()
-        out[THEME_SECTOR_COL] = out[THEME_SECTOR_COL].fillna(out[STOCK_CODE_COL].map(theme_map)).astype(object)
 
     # 2. 시나리오 표준화 (Scenario_Base 호환 및 과거 잔재 _Y / _N 접미사 전면 제거)
     if "시나리오" not in out.columns or out["시나리오"].isna().all():
@@ -173,8 +142,7 @@ def upsert_archive_snapshot(df: pd.DataFrame, snapshot_date: str | None = None) 
     captures exist, falling back to (스냅샷_날짜, 종목코드) otherwise. Stored in the
     standard column layout plus timestamp columns.
 
-    Theme enrichment never fails this call: an unreadable theme file is logged as
-    THEME_UNAVAILABLE and ``테마_섹터`` stays NaN for rows without a stored theme.
+    ``테마_섹터`` carries only a value already stored on the row; no theme file is read.
 
     Args:
         df: Candidate snapshot DataFrame.
@@ -263,8 +231,7 @@ def fetch_archive_snapshot(
     snapshot per (스냅샷_날짜, 종목코드) by snapshot_timestamp; latest_only=False
     preserves full history.
 
-    Theme enrichment never fails this call: an unreadable theme file is logged as
-    THEME_UNAVAILABLE and ``테마_섹터`` stays NaN for rows without a stored theme.
+    ``테마_섹터`` carries only a value already stored on the row; no theme file is read.
 
     Args:
         snapshot_date: Target date (YYYY-MM-DD) or None.

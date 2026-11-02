@@ -17,8 +17,6 @@ def test_path_settings_defaults_point_to_project_root() -> None:
 def test_path_settings_derived_paths(tmp_path: Path) -> None:
     settings = PathSettings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data", _env_file=None)
     assert tmp_path / "data" / "parquet" == settings.PARQUET_DIR
-    assert settings.TRADE_LOG_PARQUET_PATH == settings.PARQUET_DIR / "trade_log.parquet"
-    assert settings.THEME_PARQUET_PATH == settings.PARQUET_DIR / "theme.parquet"
     assert settings.HISTORY_PARQUET_PATH == settings.HISTORY_DIR / "archive.parquet"
     assert tmp_path / "data" / "history" == settings.HISTORY_DIR
 
@@ -88,3 +86,10 @@ def test_no_duplicated_decision_filename_literal() -> None:
         if "topk_decisions.parquet" in text or "rank_pool_predictions.parquet" in text:
             hits.append(str(path))
     assert hits == []
+
+
+def test_path_settings_carry_no_research_journal_paths(tmp_path: Path) -> None:
+    """theme/trade_log are research-only inputs passed by explicit path, never runtime settings."""
+    settings = PathSettings(BASE_DIR=tmp_path, DATA_DIR=tmp_path / "data", _env_file=None)
+    assert not hasattr(settings, "THEME_PARQUET_PATH")
+    assert not hasattr(settings, "TRADE_LOG_PARQUET_PATH")

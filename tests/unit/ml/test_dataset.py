@@ -157,12 +157,14 @@ def test_label_source_is_excluded_from_model_features() -> None:
 
     # Arrange
     assert LABEL_SOURCE_COLUMN in _EXCLUDED_FROM_X
-    if not Path("data/parquet/trade_log.parquet").exists():
-        pytest.skip("production trade_log parquet not present")
-    if not Path("data/parquet/theme.parquet").exists():
-        pytest.skip("production theme parquet not present")
-    trade_log = pd.read_parquet("data/parquet/trade_log.parquet").head(2000)
-    theme = pd.read_parquet("data/parquet/theme.parquet")
+    import os
+
+    # Research journal inputs (gdrive:quant-lake/research/k-closing-alpha/manual_journal_v1/) by explicit opt-in path.
+    trade_log_path, theme_path = os.environ.get("KCA_RESEARCH_TRADE_LOG", ""), os.environ.get("KCA_RESEARCH_THEME", "")
+    if not (trade_log_path and Path(trade_log_path).is_file() and theme_path and Path(theme_path).is_file()):
+        pytest.skip("set KCA_RESEARCH_TRADE_LOG and KCA_RESEARCH_THEME to the research journal parquets")
+    trade_log = pd.read_parquet(trade_log_path).head(2000)
+    theme = pd.read_parquet(theme_path)
     tagged = trade_log.copy()
     tagged[LABEL_SOURCE_COLUMN] = "sheet_executed"
 
