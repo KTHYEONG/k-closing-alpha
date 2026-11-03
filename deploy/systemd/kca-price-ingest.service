@@ -7,9 +7,9 @@ Type=oneshot
 WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
-# 실측 최대 432초 → 45분
+# Measured max 493s plus the KRX retry budget (worst ~10 min per endpoint, PRICE_INGEST_KRX_RETRY) -> keep 45min
 TimeoutStartSec=45min
-# 14-day max 492.929s (or-vps, 2026-10-08); 1.5x rounded up to 5min -> 900s.
-X-ExpectedRuntimeSec=900
+# 14-day max 492.929s (or-vps, 2026-10-08) -> 900s, plus the 600s KRX retry budget -> 1500s.
+X-ExpectedRuntimeSec=1500
 ExecStart=%h/.local/lib/kca/kca-run price-ingest --kis-data --admission standard -- uv run python -m src.daily.price_ingest
 ExecStopPost=-/usr/bin/docker rm -f kca-price-ingest
