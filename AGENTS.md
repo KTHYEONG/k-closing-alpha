@@ -11,7 +11,7 @@
 
 ## 2. Autonomy & Execution Contract
 - **Bias Toward Action & Diagnostic Autonomy:** For data queries, exploratory scratch diagnostics, and empirical root-cause isolation, execute immediately without asking for permission. When asked open-ended questions about bugs or data anomalies, proactively run scratch experiments under `scratch/` to discover truth. Never modify production code or commit in response to open-ended diagnostic queries.
-- **Skills as On-Demand Tools:** Skills (`probe`, `spec`, `implement`, `check`, `refactor`, `commit`) are modular, independent utilities—NOT a mandatory sequential pipeline. When explicitly invoked via slash commands (`/probe`, `/spec`, etc.), execute only that targeted skill and halt for user review. Specs live under `docs/specs/` (gitignored for model/tool handoffs without repo bloat).
+- **Skills:** user-level and project-agnostic (`probe`, `spec`, `implement`, `check`, `refactor`, `commit`, `ship`); this project's policy is the Workflow Profile in §6. Individual slash invocations execute only that skill and halt for user review; `/ship` is the explicit autonomy opt-in for the approved implement → check → commit chain. Specs live under `docs/specs/` (gitignored).
 
 ## 3. Project Toolchain & Verification
 Verify code changes against the project's native toolchains before concluding tasks:
@@ -30,3 +30,15 @@ Verify code changes against the project's native toolchains before concluding ta
 - **Documentation & Comments:** [documentation.md](.agents/rules/documentation.md) — *Production docstrings, architecture specs, and non-obvious rationale.*
 - **Performance & Optimization:** [performance.md](.agents/rules/performance.md) — *Vectorized panel builds, hot-loop profiling, and resource budgets.*
 - **Logging & Diagnostics:** [logging.md](.agents/rules/logging.md) — *Operational logging, 6 fixed category taxonomy, and credential redaction.*
+
+## 6. Workflow Profile
+- verify: `uv run python tools/verify.py`
+- test_scoped: `uv run pytest {files}`
+- spec_dir: `docs/specs` (untracked; archive finished specs to `docs/specs/_done/`)
+- scratch_dir: `scratch/` (never commit)
+- high_risk_paths: `src/execution/**`, `src/api/**`, `src/strategy/**`, `src/serving/**`, `src/config/**`, `src/data/**`
+- hard_stops: live broker orders or order TRs; exceeding broker API rate limits; removing process-serialization locks for concurrent sessions; exposing credentials; fills against unobservable prices or same-bar settlement; any `rm` without previewing exact targets
+- commit_style: Korean `<type>: <summary <=50 chars>` + `- **Why:** <rationale>`; types feat/fix/refactor/chore/docs; no AI or co-author trailers; every commit via `/commit`
+- artifact_language: English
+- report_language: Korean (card keys stay English)
+- rules: `.agents/rules/*.md`
