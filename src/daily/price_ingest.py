@@ -114,6 +114,25 @@ KRW_PER_100M: float = 1e8
 # Ingest holds the lock across the multi-minute vendor phase. A second ingest is a duplicate
 # run and should fail immediately instead of queueing behind it. See OD-1.
 PRICE_HISTORY_LOCK_TIMEOUT_SECONDS: float = 0.0
+
+
+@dataclass(frozen=True)
+class KrxRetryBudget:
+    """Retry budget of one strict KRX daily fetch (`retry_call` waits retry_sleep_sec * attempt)."""
+
+    retries: int
+    retry_sleep_sec: float
+
+    def worst_case_seconds(self, request_timeout_seconds: float) -> float:
+        """Upper bound of one endpoint fetch when every attempt times out."""
+        sleeps = self.retry_sleep_sec * sum(range(1, self.retries))
+        return sleeps + self.retries * request_timeout_seconds
+
+
+# KRX OpenAPI read-timed out at 08:31 on 2026-10-30 and 2026-11-03 and recovered within the hour; the
+# generic 4 x 1 s budget (~90 s) failed the run. 8 tries with 15..105 s growing waits ride out ~10 min
+# per endpoint (420 s of waits + 8 x 20 s timeouts) while staying well inside TimeoutStartSec=45min.
+PRICE_INGEST_KRX_RETRY: KrxRetryBudget = KrxRetryBudget(retries=8, retry_sleep_sec=15.0)
 _ADJUSTED_PRICE_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "prev_close")
 _TOSS_PROGRAM_AMOUNT_KEYS: tuple[str, ...] = ("netBuyAmount", "netBuyAmt", "netBuyValue", "netBuyTradeAmount")
 
@@ -1063,6 +1082,18 @@ def merge_and_adjust(
     return merged, events, changed
 
 
+def price_ingest_krx_config(run_day: pd.Timestamp, budget: KrxRetryBudget = PRICE_INGEST_KRX_RETRY) -> AltDataFetchConfig:
+    """KRX fetch config of the daily ingest: the configured key plus the ingest-specific retry budget."""
+    return AltDataFetchConfig(
+        start=run_day,
+        end=run_day + pd.Timedelta(days=1),
+        out_dir=Path("."),
+        krx_api_key=settings.KRX_OPENAPI_KEY,
+        retries=budget.retries,
+        retry_sleep_sec=budget.retry_sleep_sec,
+    )
+
+
 async def run_price_ingest(
     *,
     today: pd.Timestamp | None = None,
@@ -1105,9 +1136,7 @@ async def run_price_ingest(
     out_path = Path(settings.PRICE_HISTORY_PARQUET_PATH if path is None else path)
     if not out_path.exists():
         raise FileNotFoundError(f"price_history not found: {out_path}")
-    cfg = krx_cfg or AltDataFetchConfig(
-        start=run_day, end=run_day + pd.Timedelta(days=1), out_dir=Path("."), krx_api_key=settings.KRX_OPENAPI_KEY
-    )
+    cfg = krx_cfg or price_ingest_krx_config(run_day)
     store = CaptureStore(_capture_root())
     run_id = f"price-{run_day.strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
     if kis is None:
@@ -1302,9 +1331,49 @@ async def run_price_ingest(
     return report
 
 
+def record_stale_after_failure(
+    run_at: pd.Timestamp, *, on_outcome: Callable[..., Any], path: str | os.PathLike[str] | None = None
+) -> bool:
+    """Record DEGRADED stale_panel when a failed ingest at/after the stale-alert time left the panel stale.
+
+    A crashed safety-slot run records no outcome of its own, yet the decision input is just as missing as
+    in a completed stale run. An unreadable panel counts as stale (fail-closed).
+
+    Returns:
+        True when the stale outcome was recorded.
+    """
+    run_hhmmss = f"{run_at.hour:02d}{run_at.minute:02d}{run_at.second:02d}"
+    expected = expected_panel_date(run_at)
+    if expected is None or run_hhmmss < PRICE_INGEST_STALE_ALERT_FROM_HHMMSS:
+        return False
+    target = Path(settings.PRICE_HISTORY_PARQUET_PATH if path is None else path)
+    try:
+        panel_max: pd.Timestamp | None = pd.Timestamp(pd.read_parquet(target, columns=["date"])["date"].max()).normalize()
+    except (OSError, ValueError, KeyError):
+        panel_max = None
+    if panel_max is not None and not pd.isna(panel_max) and panel_max >= expected:
+        return False
+    on_outcome(
+        RUN_OUTCOME_DEGRADED,
+        run_date=run_at.strftime("%Y-%m-%d"),
+        reason="stale_panel",
+        metrics={
+            "ingest_failed": True,
+            "panel_max_date": panel_max.strftime("%Y-%m-%d") if panel_max is not None and not pd.isna(panel_max) else "",
+            "expected_panel_date": expected.strftime("%Y-%m-%d"),
+        },
+    )
+    return True
+
+
 def main() -> None:
     configure_cli_logging()
-    report = asyncio.run(run_price_ingest(on_outcome=functools.partial(record_run_outcome, "price_ingest")))
+    on_outcome = functools.partial(record_run_outcome, "price_ingest")
+    try:
+        report = asyncio.run(run_price_ingest(on_outcome=on_outcome))
+    except Exception:
+        record_stale_after_failure(pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None), on_outcome=on_outcome)
+        raise
     from src.daily.security_classification import classification_gap_dates, run_security_classification_ingest
 
     fresh = sorted({pd.Timestamp(d).normalize() for d in report.ingested_dates})

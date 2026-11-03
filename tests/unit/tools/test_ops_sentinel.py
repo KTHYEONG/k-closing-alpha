@@ -580,7 +580,7 @@ def test_repository_services_satisfy_expected_contract() -> None:
         "kca-archive-intraday.service": 3300,
         "kca-archive-intraday-regular.service": 6600,
         "kca-tape-sweep.service": 2700,
-        "kca-price-ingest.service": 900,
+        "kca-price-ingest.service": 1500,
         "kca-altdata-capture.service": 600,
         "kca-core-snapshot.service": 600,
         "kca-offsite-verify.service": 900,

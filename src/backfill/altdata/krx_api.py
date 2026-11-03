@@ -21,6 +21,8 @@ from src.data.capture_contracts import PageObserver, RawCaptureError, SEOUL
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://data-dbg.krx.co.kr"
+# Per-request bound; callers size their retry budgets against it.
+KRX_HTTP_TIMEOUT_SECONDS: float = 20.0
 
 # 구독 확인된 엔드포인트 (2026-09 기준). 미구독 경로는 401 로 fail-soft.
 KRX_ENDPOINT_FUT_DAILY = "/svc/apis/drv/fut_bydd_trd"
@@ -55,7 +57,7 @@ def fetch_krx_openapi_day(
     def _call() -> pd.DataFrame:
         wait_for_krx_slot(cfg)
         resp = requests.get(
-            url, params={"basDd": date_ymd}, headers={"AUTH_KEY": key}, timeout=20
+            url, params={"basDd": date_ymd}, headers={"AUTH_KEY": key}, timeout=KRX_HTTP_TIMEOUT_SECONDS
         )
         if resp.status_code in (401, 404):
             # 미구독/오타 경로 — 재시도 무의미, 빈 프레임으로 확정.
@@ -130,7 +132,7 @@ def fetch_krx_openapi_day_strict(
         started = datetime.now(SEOUL)
         try:
             resp = requests.get(
-                url, params={"basDd": date_ymd}, headers={"AUTH_KEY": key}, timeout=20
+                url, params={"basDd": date_ymd}, headers={"AUTH_KEY": key}, timeout=KRX_HTTP_TIMEOUT_SECONDS
             )
         except Exception as exc:
             received = datetime.now(SEOUL)
