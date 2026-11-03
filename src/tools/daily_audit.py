@@ -80,8 +80,9 @@ from src.data.trading_calendar import (
 )
 from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
-from src.tools.alerts import dispatch_digest, drain_alert_outbox
+from src.tools.alerts import drain_alert_outbox, record_digest
 from src.tools.expiry_notices import CALENDAR_EXPIRY_NAME, CALENDAR_RENEW_HINT, evaluate_expiries
+from src.tools.incident_pager import IncidentPager, page_issue_keys
 from src.tools.issue_registry import (
     ADVISORY_ESCALATION_AUDITS,
     AdvisoryStreak,
@@ -2098,25 +2099,38 @@ def sync_audit_alert_state_from_digest(
     return write_audit_alert_state(snapshot_date=snapshot_date, updated_at=now, open_entries=entries, path=path)
 
 
+def page_audit_issues(keys: Sequence[str], at: datetime, *, pager: IncidentPager | None = None) -> dict[str, str]:
+    """Page the CRITICAL subset of the audit's WARNING keys through the shared incident ledger."""
+    from src.tools.auto_remediation import load_paging_view
+
+    view = load_paging_view(at)
+    return page_issue_keys(
+        pager if pager is not None else IncidentPager(), keys, now=at, pending=view.pending, auto_action=view.auto_action
+    )
+
+
 def run_daily_audit(
     snapshot_date: str,
     *,
     trading_day_fn: Callable[[str], bool] | None = None,
     failed_units_fn: Callable[[], list[str]] = list_failed_kca_units,
     stale_tokens_fn: Callable[[str], list[str]] = list_stale_kis_tokens,
-    dispatch_fn: Callable[[str, str], dict[str, bool]] = dispatch_digest,
+    dispatch_fn: Callable[[str, str], dict[str, bool]] = record_digest,
     backup_issues_fn: Callable[[datetime], list[str]] = _default_backup_issues,
     ops_issues_fn: Callable[[datetime], Sequence[MeasuredIssue]] | None = None,
     archive_fn: Callable[[str, str, str], Path] = archive_audit_digest,
+    page_fn: Callable[[Sequence[str], datetime], object] | None = None,
 ) -> str | None:
-    """평일 1회 점검 후 요약을 발송한다. 주말이면 아무것도 보내지 않는다.
+    """평일 1회 점검 후 요약을 기록한다. 주말이면 아무것도 하지 않는다.
 
     Args:
         snapshot_date: 점검 대상일(YYYY-MM-DD, KST).
         trading_day_fn: 거래일 오라클 주입(테스트용).
         failed_units_fn: 실패 유닛 조회 주입(테스트용).
         stale_tokens_fn: 호스트 발급 KIS 토큰 커버리지 조회 주입(테스트용).
-        dispatch_fn: 요약 발송 주입(테스트용).
+        dispatch_fn: WARNING digest sink; defaults to the silent digest record (no mail).
+        page_fn: Receives the WARNING issue keys and audit time; pages only CRITICAL ones
+            (`incident_pager.page_issue_keys`). None disables paging.
         archive_fn: 전체 요약 보관 주입(테스트용). 정상일은 메일 대신 이 기록만 남는다.
         backup_issues_fn: 오프사이트 백업 신선도 조회 주입(테스트용).
 
@@ -2356,6 +2370,11 @@ def run_daily_audit(
     if digest.severity is DigestSeverity.WARNING:
         logger.warning("[DATA] stage=daily_audit day=%s status=WARNING subject=%s", day_kind, digest.subject)
         dispatch_fn(digest.subject, digest.body)
+        if page_fn is not None:
+            try:
+                page_fn([issue.key for issue in digest.issues], audit_at)
+            except Exception as exc:
+                logger.warning("[SYS] stage=daily_audit paging=FAILED reason=%s", type(exc).__name__)
     elif digest.severity is DigestSeverity.HOLIDAY_SKIP:
         logger.info(
             "[DATA] stage=daily_audit day=%s status=SKIP subject=%s (holiday dispatch skipped)",
@@ -2396,7 +2415,7 @@ def main() -> None:  # pragma: no cover - CLI entry; logic covered via run_daily
     args = parser.parse_args()
     now = pd.Timestamp.now(tz="Asia/Seoul")
     snapshot_date: str = args.date or resolve_snapshot_date(now)
-    run_daily_audit(snapshot_date)
+    run_daily_audit(snapshot_date, page_fn=page_audit_issues)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from src import settings
 from src.data.capture_contracts import SEOUL
+from src.tools.alert_policy import DEFAULT_ALERT_POLICY
 from src.tools.alerts import redact_for_egress
 from src.tools.deploy_window import blackout_remaining
 from src.tools.run_outcome import RUN_EVENT_REASON_MAX_CHARS
@@ -568,3 +569,61 @@ def should_hold_notification(
         return True
     attempts, _ = _attempts_today(history, issue_key, current)
     return attempts < rule.max_attempts_per_day
+
+
+def remediation_pending(
+    issue_key: str,
+    *,
+    first_seen: datetime,
+    now: datetime,
+    history: Sequence[RemediationRecord],
+    max_hold: timedelta = DEFAULT_ALERT_POLICY.max_remediation_hold,
+) -> bool:
+    """True while auto-remediation may still clear `issue_key`, so a CRITICAL page should wait.
+
+    Pending means: a rule reruns a safe unit for the key, the key is younger than `max_hold`, and either
+    an attempt is STARTED and unsettled or the day's attempt budget is not used up. Keys without a
+    remediable unit are never pending.
+    """
+    current = _ensure_aware(now)
+    seen = first_seen if first_seen.tzinfo is not None else first_seen.replace(tzinfo=SEOUL)
+    remediable = _remediable_unit(issue_key)
+    if remediable is None or current - seen >= max_hold:
+        return False
+    rule, _unit = remediable
+    latest = _latest_record(history, issue_key, lifecycle_only=True)
+    if latest is not None and latest.outcome is RemediationOutcome.STARTED:
+        return True
+    attempts, _ = _attempts_today(history, issue_key, current)
+    return attempts < rule.max_attempts_per_day
+
+
+@dataclass(frozen=True)
+class PagingRemediationView:
+    """Remediation ledger snapshot the pager consults before paging an issue key."""
+
+    history: tuple[RemediationRecord, ...]
+    now: datetime
+
+    def pending(self, issue_key: str, first_seen: datetime, now: datetime) -> bool:
+        """`remediation_pending` against this snapshot."""
+        return remediation_pending(issue_key, first_seen=first_seen, now=now, history=self.history)
+
+    def auto_action(self, issue_key: str) -> str | None:
+        """Korean `자동 조치` line for a remediable key, or None to use the incident default."""
+        if _remediable_unit(issue_key) is None:
+            return None
+        attempts, _ = _attempts_today(self.history, issue_key, _ensure_aware(self.now))
+        if attempts == 0:
+            return "자동 재실행을 시작하지 못했습니다(작업 금지 시간대 또는 실행 중)."
+        return f"자동 재실행 {attempts}회를 시도했지만 해결되지 않았습니다."
+
+
+def load_paging_view(now: datetime, *, path: Path | None = None) -> PagingRemediationView:
+    """Snapshot the remediation ledger for paging; an unreadable ledger yields an empty history."""
+    try:
+        history = read_remediation_ledger(path)
+    except OSError as exc:
+        logger.warning("[SYS] stage=auto_remediation status=LEDGER_UNREADABLE reason=%s", type(exc).__name__)
+        history = ()
+    return PagingRemediationView(history=tuple(history), now=now)

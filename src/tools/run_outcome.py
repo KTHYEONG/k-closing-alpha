@@ -1,21 +1,23 @@
 """Per-job run outcome records appended to a daily JSONL event log.
 
-DEGRADED and NO_DECISION outcomes are alerted even when the process exits 0,
-while hard failures stay with systemd OnFailure.
+CRITICAL DEGRADED/NO_DECISION outcomes page even when the process exits 0, while hard
+failures stay with systemd OnFailure; the paging policy lives in `src.tools.alert_policy`.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from src import settings
-from src.tools.alerts import dispatch_digest, redact_for_egress
+from src.tools.alert_policy import RUN_SOURCE_PREFIX, classify_run_outcome, incident_scope
+from src.tools.alerts import redact_for_egress
+from src.tools.incident_pager import IncidentPager
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ def record_run_outcome(
     reason: str = "",
     metrics: Mapping[str, Any] | None = None,
     path: Path | None = None,
-    alert_fn: Callable[[str, str], dict[str, bool]] | None = None,
+    pager: IncidentPager | None = None,
 ) -> dict[str, Any]:
     """Record one per-job run outcome to the daily JSONL event log.
 
@@ -57,7 +59,9 @@ def record_run_outcome(
             Required (non-blank) for SKIPPED so the cause stays machine-readable.
         metrics: Optional metrics mapping serialized with full float precision.
         path: Explicit event log path override (tests).
-        alert_fn: Alert dispatcher override (tests).
+        pager: Incident pager override (tests). DEGRADED/NO_DECISION page only when
+            `alert_policy.classify_run_outcome` marks them CRITICAL; OK resolves a paged
+            incident of the same job; everything else stays in the event log (SILENT).
 
     Returns:
         The recorded event dict.
@@ -98,21 +102,30 @@ def record_run_outcome(
         outcome,
         record["reason"],
     )
-    if outcome in RUN_OUTCOMES_ALERTED:
-        sender = alert_fn if alert_fn is not None else dispatch_digest
-        outcome_label = "경고(DEGRADED)" if outcome == RUN_OUTCOME_DEGRADED else "미결정(NO_DECISION)"
-        # Metrics stay in the event log; the mail only points there so an AI fix can read the full record.
-        body_lines = [
-            f"• 무엇: {job} {outcome_label}",
-            f"• 언제: {run_date}",
-            f"• 원인: {record['reason'] or '(사유 없음)'}",
-            f"• 증거: {target} (job={job})",
-        ]
-        sender(
-            f"[kca][경고] {job} {outcome} {run_date}",
-            "\n".join(body_lines),
-        )
+    if outcome in RUN_OUTCOMES_ALERTED or outcome == RUN_OUTCOME_OK:
+        _route_outcome(job, outcome, str(record["reason"]), pager=pager)
     return record
+
+
+def _route_outcome(job: str, outcome: str, reason: str, *, pager: IncidentPager | None) -> None:
+    """Page a CRITICAL outcome, resolve the job's paged incident on OK, and leave the rest SILENT.
+
+    The event log already holds the full record, so a routing failure only logs.
+    """
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    source = f"{RUN_SOURCE_PREFIX}{job}"
+    active = pager if pager is not None else IncidentPager()
+    try:
+        if outcome == RUN_OUTCOME_OK:
+            active.resolve((source,), now=now)
+            return
+        kind = classify_run_outcome(job, outcome, reason)
+        if kind is None:
+            logger.info("[SYS] stage=alert status=SILENT job=%s outcome=%s reason=%s", job, outcome, reason)
+            return
+        active.page(kind, source, scope=incident_scope(kind), now=now)
+    except Exception as exc:
+        logger.warning("[SYS] stage=alert status=ROUTE_FAILED job=%s reason=%s", job, type(exc).__name__)
 
 
 def load_run_outcomes(run_date: str, *, path: Path | None = None) -> dict[str, str]:

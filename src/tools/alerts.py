@@ -1,7 +1,7 @@
-"""경량 실패 알림: 웹훅(Slack/Discord 호환) + Gmail 앱비밀번호 이메일.
+"""Alert transport (webhook + Gmail app-password mail) and the systemd OnFailure= entry point.
 
-유료 인프라 없이 systemd OnFailure= 훅에서 직접 호출 가능하도록 설계한다.
-자격증명이 비어있으면 각 채널은 예외 없이 조용히 스킵된다(선택적 기능).
+Which failures reach a human is decided by `src.tools.alert_policy`; this module only delivers,
+redacts, and queues undelivered mail. A channel with empty credentials is skipped silently.
 """
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ from src import settings
 from src.api.kis.key_pool import load_kis_env
 from src.config.secret_fields import configured_secret_values
 from src.data.io_utils import atomic_write_text
+from src.tools.alert_policy import FAILED_UNIT_PREFIX, classify_unit, incident_scope, unit_base_name
+from src.tools.incident_pager import IncidentPager, record_silent
 from src.utils.cli_logging import configure_cli_logging
 from src.utils.redaction import redact_secrets
 
@@ -37,7 +39,7 @@ ALERT_JOURNAL_TAIL_LINES: int = 40
 ALERT_LINE_MAX_CHARS: int = 300
 ALERT_COMMAND_TIMEOUT_SEC: float = 10.0
 _REDELIVERY_SUBJECT_PREFIX: str = "[지연전송] "
-# Failure-alert dedup day boundary (one mail per unit per KST trading-calendar day).
+# KST day boundary for digest files and the OnFailure clock.
 ALERT_DAY_TZ: ZoneInfo = ZoneInfo("Asia/Seoul")
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -284,133 +286,61 @@ def send_email(*, gmail_user: str, gmail_app_password: str, to_addr: str, subjec
     return True
 
 
-def dispatch_digest(subject: str, body: str) -> dict[str, bool]:
-    """일일 요약을 웹훅과 이메일 양쪽에 보내고 채널별 성공여부를 반환한다.
+def dispatch_page(subject: str, body: str) -> dict[str, bool]:
+    """Send one operator page (CRITICAL incident or its resolution) through webhook and email.
 
-    각 채널은 bounded 재시도로 전송한다. 어떤 채널도 전달하지 못하면(미설정
-    포함) 요약을 outbox에 적재해 다음 기회에 지연전송한다.
-
-    Args:
-        subject: 요약 제목.
-        body: 요약 본문.
+    Credentials are masked before any channel or the outbox sees the text; when no channel
+    delivers, the page is queued in the outbox for redelivery.
 
     Returns:
-        {"webhook": bool, "email": bool}.
+        {"webhook": bool, "email": bool}; both False means the page was queued.
     """
     secrets = _alert_secret_values()
     subject = redact_secrets(subject, secrets)
     body = redact_secrets(body, secrets)
     results = _deliver_now(subject, body)
     if any(results.values()):
-        subject_key = subject[:80]
         logger.info(
-            "[SYS] stage=alert_delivery status=SENT webhook=%s email=%s subject_key=%s",
+            "[SYS] stage=alert_delivery status=SENT kind=page webhook=%s email=%s subject_key=%s",
             results.get("webhook"),
             results.get("email"),
-            subject_key,
+            subject[:80],
         )
-    if not any(results.values()):
-        _persist_undelivered(subject, body, kind="digest")
+    else:
+        _persist_undelivered(subject, body, kind="page")
     return results
 
 
-def post_webhook_alert(webhook_url: str, *, unit: str, detail: str = "", subject: str | None = None) -> bool:
-    """Slack/Discord 호환 웹훅으로 실패 알림을 보낸다.
+def digest_record_dir() -> Path:
+    """Directory of SILENT digests the ops check reads: DATA_DIR/logs/alerts/digest."""
+    return alert_outbox_dir().parent / "digest"
 
-    Args:
-        webhook_url: 웹훅 URL. 빈 문자열이면 미설정으로 간주해 스킵한다.
-        unit: 실패한 systemd 유닛 이름.
-        detail: 부가 설명(선택).
-        subject: 알림 제목 override(선택).
 
-    Returns:
-        전송을 시도했으면 True, webhook_url 이 비어 스킵했으면 False.
+def record_digest(subject: str, body: str, *, now: datetime | None = None, root: Path | None = None) -> dict[str, bool]:
+    """Record a non-paging digest to the daily JSONL digest file instead of mailing it.
 
-    Raises:
-        requests.RequestException: 전송 자체가 실패한 경우 그대로 전파한다.
+    Matches the (subject, body) -> results sink contract of the audit/reconcile digest path: it returns
+    {"recorded": True} on success so callers that gate state on delivery treat the digest as handled,
+    and {"recorded": False} when the file cannot be written.
     """
-    title = subject or f"[KCA][실패] systemd unit failed: {unit}"
-    text = f"{title}\n\n{detail}" if detail else title
-    return post_webhook_text(webhook_url, text)
-
-
-def send_email_alert(
-    *,
-    gmail_user: str,
-    gmail_app_password: str,
-    to_addr: str,
-    unit: str,
-    detail: str = "",
-    subject: str | None = None,
-) -> bool:
-    """Gmail 앱비밀번호 SMTP_SSL 로 실패 알림을 보낸다.
-
-    Args:
-        gmail_user: 발신 Gmail 계정.
-        gmail_app_password: Gmail 앱 비밀번호.
-        to_addr: 수신 이메일 주소.
-        unit: 실패한 systemd 유닛 이름.
-        detail: 부가 설명(선택).
-        subject: 메일 제목 override(선택).
-
-    Returns:
-        세 자격증명(gmail_user/gmail_app_password/to_addr)이 모두 있으면 전송
-        시도 후 True, 하나라도 비어있으면 스킵한 True 없이 False.
-
-    Raises:
-        smtplib.SMTPException: 전송 자체가 실패한 경우 그대로 전파한다.
-    """
-    return send_email(
-        gmail_user=gmail_user,
-        gmail_app_password=gmail_app_password,
-        to_addr=to_addr,
-        subject=subject or f"[KCA][실패] systemd unit failed: {unit}",
-        body=detail or f"unit={unit} failed with no further detail",
-    )
-
-
-def dispatch_failure_alert(unit: str, *, detail: str = "", subject: str | None = None) -> dict[str, bool]:
-    """웹훅과 이메일 채널 모두 시도하고 채널별 성공여부를 반환한다.
-
-    각 채널은 bounded 재시도로 전송하며 한 채널의 실패가 다른 채널 시도를
-    막지 않는다. 두 값 모두 False 인 상태(미설정 또는 두 채널 모두 실패)도
-    정상 반환이며 예외가 아니다. 전달된 채널이 하나도 없으면 알림을 outbox에
-    적재해 다음 기회에 지연전송한다.
-
-    Args:
-        unit: 실패한 systemd 유닛 이름(OnFailure= 의 %i, 또는 호출부가
-            구성한 논리적 식별자).
-        detail: 부가 설명(선택).
-        subject: 제목 override(선택).
-
-    Returns:
-        {"webhook": bool, "email": bool}.
-    """
+    at = now if now is not None else datetime.now(ALERT_DAY_TZ)
+    box = Path(root) if root is not None else digest_record_dir()
     secrets = _alert_secret_values()
-    redacted_subject = redact_secrets(subject, secrets) if subject is not None else None
-    redacted_detail = redact_secrets(detail, secrets)
-    title = redacted_subject if redacted_subject is not None else f"[KCA][실패] systemd unit failed: {unit}"
-    email_body = redacted_detail or f"unit={unit} failed with no further detail"
-    results = {
-        "webhook": _deliver_channel(
-            lambda: post_webhook_alert(settings.ALERT_WEBHOOK_URL, unit=unit, detail=redacted_detail, subject=redacted_subject),
-            channel="webhook",
-        ),
-        "email": _deliver_channel(
-            lambda: send_email_alert(
-                gmail_user=settings.ALERT_GMAIL_USER,
-                gmail_app_password=settings.ALERT_GMAIL_APP_PASSWORD,
-                to_addr=settings.ALERT_GMAIL_TO,
-                unit=unit,
-                detail=redacted_detail,
-                subject=redacted_subject,
-            ),
-            channel="email",
-        ),
+    record = {
+        "ts": at.isoformat(timespec="seconds"),
+        "subject": redact_secrets(subject, secrets),
+        "body": redact_secrets(body, secrets),
     }
-    if not any(results.values()):
-        _persist_undelivered(title, email_body, kind="failure")
-    return results
+    target = box / f"{at.astimezone(ALERT_DAY_TZ).date().isoformat()}.jsonl"
+    try:
+        box.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("[SYS] stage=alert status=DIGEST_RECORD_FAILED reason=%s", type(exc).__name__)
+        return {"recorded": False}
+    logger.info("[SYS] stage=alert status=SILENT kind=digest subject_key=%s", record["subject"][:80])
+    return {"recorded": True}
 
 
 def sanitize_journal_tail(text: str, *, secret_values: Collection[str] = ()) -> str:
@@ -540,75 +470,6 @@ def extract_failure_summary(journal_text: str, unit_status: dict[str, str]) -> d
     }
 
 
-def format_failure_alert(
-    unit: str,
-    unit_status: dict[str, str],
-    diagnostics: dict[str, str],
-) -> tuple[str, str]:
-    """Build a short human-readable failure card; raw journal context stays on the host.
-
-    The mail is a pointer for an AI-driven fix, so it carries only what failed, when, the one-line
-    cause and where the evidence lives (journald), never the log tail itself.
-
-    Returns:
-        (subject, body): subject `[<project>][실패] <unit>`; body of at most five bullet lines.
-    """
-    exit_status = unit_status.get("ExecMainStatus", "unknown")
-    result = unit_status.get("Result", "unknown")
-    start_ts = unit_status.get("ExecMainStartTimestamp", "unknown")
-    exit_ts = unit_status.get("ExecMainExitTimestamp", "unknown")
-    reason = diagnostics.get("reason", "알 수 없는 원인")
-    location = diagnostics.get("location", "")
-
-    lines = [
-        f"• 무엇: {unit} 실패 ({result}, exit {exit_status})",
-        f"• 언제: {exit_ts}",
-        f"• 원인: {reason}",
-    ]
-    if location:
-        lines.append(f"• 위치: {location}")
-    since = f' --since "{start_ts}"' if start_ts != "unknown" else ""
-    lines.append(f"• 증거: journalctl --user -u {unit}{since} --no-pager")
-    return f"[{unit_project(unit)}][실패] {unit}", "\n".join(lines)
-
-
-def unit_project(unit: str) -> str:
-    """Project tag for a unit name (`crypto-pilot-backup.service` -> `crypto`); the alert host is shared."""
-    return unit.split("-", 1)[0].split(".", 1)[0] or "host"
-
-
-def failure_ledger_path() -> Path:
-    """Per-unit last-alert ledger: DATA_DIR/logs/alerts/failure_sent.json."""
-    return alert_outbox_dir().parent / "failure_sent.json"
-
-
-def failure_alert_sent_today(unit: str, today: str, *, path: Path | None = None) -> bool:
-    """True when `unit` already alerted on KST date `today`; an unreadable ledger never suppresses."""
-    target = path if path is not None else failure_ledger_path()
-    try:
-        ledger = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return isinstance(ledger, dict) and ledger.get(unit) == today
-
-
-def record_failure_alert(unit: str, today: str, *, path: Path | None = None) -> None:
-    """Remember that `unit` alerted on `today` (best effort; failures only log)."""
-    target = path if path is not None else failure_ledger_path()
-    try:
-        ledger = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        ledger = {}
-    if not isinstance(ledger, dict):
-        ledger = {}
-    ledger[unit] = today
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(target, json.dumps(ledger, ensure_ascii=False, sort_keys=True), mode=None)
-    except OSError as exc:
-        logger.warning("[SYS] stage=alert_delivery status=LEDGER_FAILED unit=%s reason=%s", unit, type(exc).__name__)
-
-
 def collect_unit_diagnostics(
     unit: str,
     *,
@@ -687,34 +548,69 @@ def collect_unit_diagnostics(
     return unit_status, journal_text
 
 
-def main(argv: list[str] | None = None) -> None:
-    """systemd OnFailure= 진입점: --unit 을 파싱해 얼러트를 발송한다.
+def handle_unit_failure(
+    unit: str,
+    *,
+    now: datetime,
+    pager: IncidentPager,
+    pending: Callable[[str, datetime, datetime], bool],
+    auto_action: Callable[[str], str | None],
+    diagnostics: Callable[[str], tuple[dict[str, str], str]] = collect_unit_diagnostics,
+) -> str:
+    """Route one systemd unit failure through the paging policy.
 
-    새로운 알림을 보내기 전에 outbox에 적체된 미전송 알림부터 지연전송한다.
-    drain 실패는 새 알림을 막지 않는다.
+    SILENT units are only logged and recorded. A CRITICAL unit whose auto-remediation is still
+    pending is recorded as DEFERRED (the reconcile tick pages once remediation is exhausted and the
+    unit is still failed); any other CRITICAL unit pages through the shared incident ledger.
+
+    Args:
+        pending: (issue_key, first_seen, now) -> True while auto-remediation may still clear the key.
+        auto_action: issue_key -> `자동 조치` line, or None for the incident default.
+
+    Returns:
+        "SILENT", "DEFERRED", or the PageDecision value.
     """
-    parser = argparse.ArgumentParser(description="Dispatch a failure alert for a systemd unit (OnFailure= entrypoint)")
+    kind = classify_unit(unit)
+    source = f"{FAILED_UNIT_PREFIX}{unit_base_name(unit)}.service"
+    unit_status, journal_text = diagnostics(unit)
+    reason = extract_failure_summary(journal_text, unit_status)["reason"]
+    if kind is None:
+        record_silent(source, reason=reason, now=now)
+        return "SILENT"
+    scope = incident_scope(kind)
+    first_seen = pager.observe(kind, source, scope=scope, now=now)
+    if pending(source, first_seen, now):
+        record_silent(source, reason=reason, now=now, status="DEFERRED")
+        return "DEFERRED"
+    logger.warning("[SYS] stage=alert status=CRITICAL unit=%s kind=%s reason=%s", unit, kind.value, reason)
+    return pager.page(kind, source, scope=scope, now=now, auto_action=auto_action(source)).value
+
+
+def main(argv: list[str] | None = None) -> None:
+    """systemd OnFailure= entry point: drain the outbox, then route `--unit` through the paging policy.
+
+    A drain failure never blocks routing the new failure.
+    """
+    from src.tools.auto_remediation import load_paging_view
+
+    parser = argparse.ArgumentParser(description="Route a systemd unit failure through the paging policy (OnFailure= entrypoint)")
     parser.add_argument("--unit", required=True, help="failing unit name (systemd %%i specifier)")
-    parser.add_argument("--detail", default="", help="optional extra detail text")
     args = parser.parse_args(argv)
     try:
         drain_alert_outbox(max_items=settings.ALERT_OUTBOX_MAX_DRAIN)
     except Exception as exc:
         logger.warning("[SYS] stage=alert_delivery status=DRAIN_FAILED reason=%s", type(exc).__name__)
-    today = datetime.now(ALERT_DAY_TZ).date().isoformat()
-    if failure_alert_sent_today(args.unit, today):
-        # Repeat failures of one unit on one day add no new signal; the journal and dashboard still record each.
-        logger.info("[SYS] alert dispatch unit=%s status=SUPPRESSED reason=already_alerted_today day=%s", args.unit, today)
-        return
-    if args.detail:
-        results = dispatch_failure_alert(args.unit, detail=args.detail)
-    else:
-        unit_status, journal_text = collect_unit_diagnostics(args.unit)
-        diag = extract_failure_summary(journal_text, unit_status)
-        subject, body = format_failure_alert(args.unit, unit_status, diag)
-        results = dispatch_failure_alert(args.unit, detail=body, subject=subject)
-    logger.info("[SYS] alert dispatch unit=%s webhook=%s email=%s", args.unit, results["webhook"], results["email"])
-    record_failure_alert(args.unit, today)
+    now = datetime.now(ALERT_DAY_TZ)
+    view = load_paging_view(now)
+    status = handle_unit_failure(
+        args.unit,
+        now=now,
+        pager=IncidentPager(),
+        pending=view.pending,
+        auto_action=view.auto_action,
+        diagnostics=collect_unit_diagnostics,
+    )
+    logger.info("[SYS] stage=alert unit=%s status=%s", args.unit, status)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

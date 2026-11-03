@@ -754,6 +754,25 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch, tmp_p
     assert len(sent) == 2
     assert sent[1][0] == subject
 
+    # And: WARNING issue keys go to the pager; a pager failure never breaks the audit
+    paged: list[list[str]] = []
+
+    def _page(keys, at):
+        paged.append(list(keys))
+        raise RuntimeError("pager down")
+
+    subject = daily_audit.run_daily_audit(
+        "2026-09-15",
+        trading_day_fn=lambda _d: True,
+        failed_units_fn=lambda: ["kca-predict.service"],
+        stale_tokens_fn=lambda _d: [],
+        dispatch_fn=_dispatch,
+        backup_issues_fn=lambda _at: [],
+        page_fn=_page,
+    )
+    assert "경고" in subject
+    assert len(paged) == 1 and "failed_unit:kca-predict.service" in paged[0]
+
 
 def test_audit_decision_requires_topk_or_predict_ok_outcome(monkeypatch, tmp_path) -> None:
     import pandas as pd
@@ -1691,7 +1710,7 @@ def test_main_skips_snapshot_resolution_when_date_is_explicit(monkeypatch) -> No
 
     monkeypatch.setattr(daily_audit, "resolve_snapshot_date", _spy)
     seen: dict = {}
-    monkeypatch.setattr(daily_audit, "run_daily_audit", lambda d: seen.setdefault("date", d))
+    monkeypatch.setattr(daily_audit, "run_daily_audit", lambda d, **kw: seen.setdefault("date", d))
     monkeypatch.setattr(sys, "argv", ["daily_audit", "--date", "2026-09-01"])
 
     # When

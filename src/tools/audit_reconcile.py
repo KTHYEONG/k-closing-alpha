@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from src.data.capture_contracts import SEOUL
-from src.tools.alerts import alert_outbox_dir, dispatch_digest
+from src.tools.alert_policy import RECONCILE_MEASURED_PREFIXES
+from src.tools.alerts import alert_outbox_dir, record_digest
 from src.tools.daily_audit import (
     SYSTEMCTL_TIMEOUT_SEC,
     _default_backup_issues,
@@ -32,6 +33,7 @@ from src.tools.daily_audit import (
     write_audit_alert_state,
     write_audit_heartbeat,
 )
+from src.tools.incident_pager import IncidentPager, IssuePendingFn, page_issue_keys
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,28 @@ class ReconcileResult:
     notified: bool = False
     held: tuple[str, ...] = ()
     remediated: tuple[str, ...] = ()
+    # False when no audit state existed to re-measure; `still_open` is then not evidence of resolution.
+    measured: bool = True
+
+
+def page_reconcile_incidents(
+    result: ReconcileResult,
+    *,
+    now: datetime,
+    pager: IncidentPager,
+    pending: IssuePendingFn | None = None,
+    auto_action: Callable[[str], str | None] | None = None,
+) -> dict[str, str]:
+    """Page measured CRITICAL issues still open after this tick and resolve paged ones now absent.
+
+    Digest and heartbeat publication stays with `run_audit_reconcile`; this is the only mail path of
+    the reconcile tick. An unmeasured tick neither pages nor resolves.
+    """
+    if not result.measured:
+        return {}
+    statuses = page_issue_keys(pager, result.still_open, now=now, pending=pending, auto_action=auto_action)
+    pager.resolve_absent(result.still_open, measured_prefixes=RECONCILE_MEASURED_PREFIXES, now=now)
+    return statuses
 
 
 _OPS_KEY_PREFIXES: tuple[str, ...] = (
@@ -292,7 +316,7 @@ def run_audit_reconcile(
     state = load_audit_alert_state(state_path)
     heartbeat = read_audit_heartbeat(heartbeat_path)
     if state is None and heartbeat is None:
-        return ReconcileResult(action=ACTION_NOOP)
+        return ReconcileResult(action=ACTION_NOOP, measured=False)
 
     prev_open: dict[str, Any] = {}
     if isinstance(state, dict):
@@ -310,7 +334,7 @@ def run_audit_reconcile(
             }
     snapshot_date = str((state or {}).get("snapshot_date") or (heartbeat or {}).get("snapshot_date") or "")
     if not snapshot_date:
-        return ReconcileResult(action=ACTION_NOOP)
+        return ReconcileResult(action=ACTION_NOOP, measured=False)
 
     persistent: dict[str, dict[str, Any]] = {}
     for key, entry in prev_open.items():
@@ -697,6 +721,7 @@ def main() -> int:  # pragma: no cover - CLI entry; logic covered via run_audit_
     try:
         from src.tools.auto_remediation import (
             execute_remediation,
+            load_paging_view,
             plan_remediation,
             read_remediation_ledger,
             settle_remediation,
@@ -719,11 +744,16 @@ def main() -> int:  # pragma: no cover - CLI entry; logic covered via run_audit_
             stale_tokens_fn=lambda snapshot: list_stale_kis_tokens(snapshot, allow_newer=True),
             backup_issues_fn=_default_backup_issues,
             outbox_fn=_default_outbox_count,
-            dispatch_fn=dispatch_digest,
+            dispatch_fn=record_digest,
             dry_run=args.dry_run,
             ops_issues_fn=measure_ops,
             remediation=remediation,
         )
+        if not args.dry_run:
+            view = load_paging_view(now)
+            page_reconcile_incidents(
+                result, now=now, pager=IncidentPager(), pending=view.pending, auto_action=view.auto_action
+            )
     except OSError as exc:
         logger.error("[SYS] stage=audit_reconcile status=PERSIST_FAILED reason=%s", exc)
         return 1
