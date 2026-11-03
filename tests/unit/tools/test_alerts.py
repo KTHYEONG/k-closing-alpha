@@ -1,137 +1,7 @@
 from src.tools.alerts import alert_credential_env_file as _real_alert_credential_env_file
 
 
-def test_post_webhook_alert_sends_json_and_skips_when_url_empty(monkeypatch) -> None:
-    import requests
-
-    from src.tools.alerts import post_webhook_alert
-
-    captured: dict = {}
-
-    class _FakeResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-    def _fake_post(url, json, timeout):
-        captured["url"] = url
-        captured["json"] = json
-        captured["timeout"] = timeout
-        return _FakeResponse()
-
-    monkeypatch.setattr(requests, "post", _fake_post)
-
-    # When: URL 설정됨
-    sent = post_webhook_alert("https://hooks.example.com/x", unit="kca-collect.service", detail="boom")
-
-    # Then
-    assert sent is True
-    assert captured["url"] == "https://hooks.example.com/x"
-    assert "kca-collect.service" in captured["json"]["text"]
-    assert "boom" in captured["json"]["text"]
-
-    # When / Then: URL 비어있으면 네트워크 호출 없이 스킵
-    assert post_webhook_alert("", unit="kca-collect.service") is False
-
-
-def test_send_email_alert_skips_on_missing_credentials_and_sends_via_smtp_ssl(monkeypatch) -> None:
-    import smtplib
-
-    from src.tools import alerts
-
-    # Given / When / Then: 자격증명 미완성이면 SMTP 시도 없이 False
-    assert alerts.send_email_alert(gmail_user="", gmail_app_password="x", to_addr="a@b.com", unit="u") is False
-    assert alerts.send_email_alert(gmail_user="a@b.com", gmail_app_password="", to_addr="a@b.com", unit="u") is False
-    assert alerts.send_email_alert(gmail_user="a@b.com", gmail_app_password="x", to_addr="", unit="u") is False
-
-    # Given: 자격증명 완비 + SMTP_SSL 가짜 구현
-    sent: dict = {}
-
-    class _FakeSMTP:
-        def __init__(self, host, port, timeout):
-            sent["host"] = host
-            sent["port"] = port
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def login(self, user, password):
-            sent["user"] = user
-
-        def send_message(self, msg):
-            sent["subject"] = msg["Subject"]
-            sent["to"] = msg["To"]
-
-    monkeypatch.setattr(smtplib, "SMTP_SSL", _FakeSMTP)
-
-    # When
-    ok = alerts.send_email_alert(
-        gmail_user="bot@example.com", gmail_app_password="app-pw", to_addr="ops@example.com",
-        unit="kca-predict.service", detail="lightgbm crashed",
-    )
-
-    # Then
-    assert ok is True
-    assert sent["host"] == "smtp.gmail.com"
-    assert sent["user"] == "bot@example.com"
-    assert sent["to"] == "ops@example.com"
-    assert "kca-predict.service" in sent["subject"]
-
-
-def test_dispatch_failure_alert_isolates_channel_failures(monkeypatch) -> None:
-    from src.tools import alerts
-
-    monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", "https://hooks.example.com/x", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "bot@example.com", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "pw", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "ops@example.com", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_ATTEMPTS", 2, raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_BACKOFF_SECONDS", 0.01, raising=False)
-
-    def _boom_webhook(url, *, unit, detail="", subject=None):
-        raise alerts.requests.RequestException("network down")
-
-    # Given: 웹훅 채널은 예외, 이메일 채널은 성공
-    monkeypatch.setattr(alerts, "post_webhook_alert", _boom_webhook)
-    monkeypatch.setattr(alerts, "send_email_alert", lambda **kw: True)
-
-    # When / Then: 실패가 웹훅에만 격리되고 이메일은 정상 시도/성공
-    assert alerts.dispatch_failure_alert("kca-collect.service", detail="boom") == {"webhook": False, "email": True}
-
-    def _boom_email(**kw):
-        raise alerts.smtplib.SMTPException("auth failed")
-
-    # Given: 반대로 웹훅은 성공, 이메일 채널이 예외
-    monkeypatch.setattr(alerts, "post_webhook_alert", lambda url, *, unit, detail="", subject=None: True)
-    monkeypatch.setattr(alerts, "send_email_alert", _boom_email)
-
-    # When / Then: 실패가 이메일에만 격리되고 웹훅은 정상 시도/성공
-    assert alerts.dispatch_failure_alert("kca-predict.service", detail="boom") == {"webhook": True, "email": False}
-
-
-def test_alerts_main_parses_unit_and_dispatches(monkeypatch) -> None:
-    from src.tools import alerts
-
-    captured: dict = {}
-
-    def _fake_dispatch(unit, *, detail=""):
-        captured["unit"] = unit
-        captured["detail"] = detail
-        return {"webhook": True, "email": False}
-
-    monkeypatch.setattr(alerts, "dispatch_failure_alert", _fake_dispatch)
-    monkeypatch.setattr(alerts, "drain_alert_outbox", lambda **kw: (0, 0))
-
-    # When
-    alerts.main(["--unit", "kca-finalize-close.service", "--detail", "exit code 1"])
-
-    # Then
-    assert captured == {"unit": "kca-finalize-close.service", "detail": "exit code 1"}
-
-
-def test_dispatch_digest_sends_subject_and_body_and_isolates_channel_failures(monkeypatch) -> None:
+def test_dispatch_page_sends_subject_and_body_and_isolates_channel_failures(monkeypatch) -> None:
     from src.tools import alerts
 
     monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", "https://hooks.example.com/x", raising=False)
@@ -173,7 +43,7 @@ def test_dispatch_digest_sends_subject_and_body_and_isolates_channel_failures(mo
     monkeypatch.setattr(alerts.requests, "post", _post)
 
     # When: 두 채널 모두 정상
-    results = alerts.dispatch_digest("[KCA] 2026-09-14 일일점검 OK", "archive=OK")
+    results = alerts.dispatch_page("[KCA] 2026-09-14 일일점검 OK", "archive=OK")
 
     # Then
     assert results == {"webhook": True, "email": True}
@@ -188,7 +58,7 @@ def test_dispatch_digest_sends_subject_and_body_and_isolates_channel_failures(mo
     monkeypatch.setattr(alerts.requests, "post", _down)
 
     # Then: 이메일은 여전히 발송된다
-    assert alerts.dispatch_digest("s", "b") == {"webhook": False, "email": True}
+    assert alerts.dispatch_page("s", "b") == {"webhook": False, "email": True}
 
     # Given: 반대로 SMTP 장애
     monkeypatch.setattr(alerts.requests, "post", _post)
@@ -200,7 +70,7 @@ def test_dispatch_digest_sends_subject_and_body_and_isolates_channel_failures(mo
     monkeypatch.setattr(alerts.smtplib, "SMTP_SSL", _BrokenSMTP)
 
     # Then: 웹훅은 여전히 발송된다
-    assert alerts.dispatch_digest("s", "b") == {"webhook": True, "email": False}
+    assert alerts.dispatch_page("s", "b") == {"webhook": True, "email": False}
 
 
 def test_sanitize_journal_tail_strips_ansi_carriage_returns_and_caps_length() -> None:
@@ -348,114 +218,6 @@ def test_extract_failure_summary_prunes_noise_and_caps_context() -> None:
     assert "[ERROR]" in diag["context"]
 
 
-def test_format_failure_alert_builds_unified_card_and_subject() -> None:
-    from src.tools import alerts
-
-    status = {
-        "Result": "exit-code",
-        "ExecMainStatus": "1",
-        "ExecMainStartTimestamp": "Thu 2026-09-24 15:40:13 KST",
-        "ExecMainExitTimestamp": "Thu 2026-09-24 15:40:17 KST",
-    }
-    diag = {
-        "reason": "FileNotFoundError: no qualifying cohort: '2026-09-24'",
-        "location": "src/daily/auction_capture.py:96 in _resolve_roster",
-        "context": "FileNotFoundError: no qualifying cohort: '2026-09-24'",
-    }
-
-    subject, body = alerts.format_failure_alert("kca-auction-close.service", status, diag)
-
-    assert subject == "[kca][실패] kca-auction-close.service"
-    assert body.splitlines() == [
-        "• 무엇: kca-auction-close.service 실패 (exit-code, exit 1)",
-        "• 언제: Thu 2026-09-24 15:40:17 KST",
-        "• 원인: FileNotFoundError: no qualifying cohort: '2026-09-24'",
-        "• 위치: src/daily/auction_capture.py:96 in _resolve_roster",
-        '• 증거: journalctl --user -u kca-auction-close.service --since "Thu 2026-09-24 15:40:13 KST" --no-pager',
-    ]
-
-
-def test_format_failure_alert_tags_sibling_project_and_omits_unknown_since() -> None:
-    from src.tools import alerts
-
-    subject, body = alerts.format_failure_alert("crypto-pilot-backup.service", {}, {"reason": "r"})
-
-    assert subject == "[crypto][실패] crypto-pilot-backup.service"
-    assert body.splitlines()[-1] == "• 증거: journalctl --user -u crypto-pilot-backup.service --no-pager"
-    assert "위치" not in body
-
-
-def test_alerts_main_sends_one_failure_mail_per_unit_per_day(monkeypatch) -> None:
-    from src.tools import alerts
-
-    sent: list[str] = []
-
-    def _dispatch(unit, *, detail="", subject=None):
-        sent.append(unit)
-        return {"webhook": False, "email": True}
-
-    monkeypatch.setattr(alerts, "dispatch_failure_alert", _dispatch)
-    monkeypatch.setattr(alerts, "drain_alert_outbox", lambda **kw: (0, 0))
-
-    alerts.main(["--unit", "kca-collect.service", "--detail", "x"])
-    alerts.main(["--unit", "kca-collect.service", "--detail", "x"])
-    alerts.main(["--unit", "krx-host-backup.service", "--detail", "x"])
-
-    assert sent == ["kca-collect.service", "krx-host-backup.service"]
-
-
-def test_failure_ledger_new_day_and_unreadable_ledger_never_suppress(tmp_path) -> None:
-    from src.tools import alerts
-
-    ledger = tmp_path / "failure_sent.json"
-    alerts.record_failure_alert("u.service", "2026-10-20", path=ledger)
-
-    assert alerts.failure_alert_sent_today("u.service", "2026-10-20", path=ledger)
-    assert not alerts.failure_alert_sent_today("u.service", "2026-10-21", path=ledger)
-    ledger.write_text("{broken", encoding="utf-8")
-    assert not alerts.failure_alert_sent_today("u.service", "2026-10-20", path=ledger)
-    alerts.record_failure_alert("u.service", "2026-10-21", path=ledger)
-    assert alerts.failure_alert_sent_today("u.service", "2026-10-21", path=ledger)
-
-
-def test_alerts_main_attaches_formatted_failure_alert_when_detail_absent(monkeypatch) -> None:
-    from src.tools import alerts
-
-    captured = {}
-
-    def _fake_diag(unit):
-        return (
-            {"Result": "exit-code", "ExecMainStatus": "1", "ExecMainStartTimestamp": "T1", "ExecMainExitTimestamp": "T2"},
-            "ValueError: test boom",
-        )
-
-    def _fake_dispatch(unit, *, detail="", subject=None):
-        captured["unit"] = unit
-        captured["detail"] = detail
-        captured["subject"] = subject
-        return {"webhook": False, "email": True}
-
-    monkeypatch.setattr(alerts, "collect_unit_diagnostics", _fake_diag)
-    monkeypatch.setattr(alerts, "dispatch_failure_alert", _fake_dispatch)
-    monkeypatch.setattr(alerts, "drain_alert_outbox", lambda **kw: (0, 0))
-
-    # When: systemd OnFailure 기본 호출(--detail 없음)
-    alerts.main(["--unit", "kca-collect.service"])
-
-    # Then
-    assert captured["unit"] == "kca-collect.service"
-    assert captured["subject"] == "[kca][실패] kca-collect.service"
-    assert "• 원인: ValueError: test boom" in captured["detail"]
-
-    # When: 명시적 detail (다른 유닛 — 같은 유닛은 당일 1회로 억제된다)
-    captured.clear()
-    alerts.main(["--unit", "kca-predict.service", "--detail", "manual note"])
-
-    # Then
-    assert captured["unit"] == "kca-predict.service"
-    assert captured["detail"] == "manual note"
-
-
 def test_parse_systemctl_show_handles_empty_and_malformed_lines() -> None:
     from src.tools import alerts
 
@@ -474,27 +236,6 @@ def test_extract_failure_summary_identifies_critical_or_fatal_log() -> None:
     raw_journal2 = "2026-09-24 12:00:00 [FATAL] aborting process\n"
     diag2 = alerts.extract_failure_summary(raw_journal2, {"Result": "exit-code", "ExecMainStatus": "1"})
     assert "[FATAL] aborting process" in diag2["reason"]
-
-
-def test_dispatch_failure_alert_propagates_custom_subject(monkeypatch) -> None:
-    from src.tools import alerts
-
-    passed = {}
-
-    def _fake_post(url, *, unit, detail="", subject=None):
-        passed["webhook_subject"] = subject
-        return True
-
-    def _fake_email(*, gmail_user, gmail_app_password, to_addr, unit, detail="", subject=None):
-        passed["email_subject"] = subject
-        return True
-
-    monkeypatch.setattr(alerts, "post_webhook_alert", _fake_post)
-    monkeypatch.setattr(alerts, "send_email_alert", _fake_email)
-
-    alerts.dispatch_failure_alert("kca-predict.service", detail="d", subject="[kca] 🚨 유닛 실행 실패: kca-predict.service")
-    assert passed["webhook_subject"] == "[kca] 🚨 유닛 실행 실패: kca-predict.service"
-    assert passed["email_subject"] == "[kca] 🚨 유닛 실행 실패: kca-predict.service"
 
 
 def test_collect_unit_diagnostics_falls_back_when_invocation_id_fails() -> None:
@@ -517,7 +258,6 @@ def test_collect_unit_diagnostics_falls_back_when_invocation_id_fails() -> None:
     status, journal = alerts.collect_unit_diagnostics("kca-collect.service", run=_run)
     assert status["InvocationID"] == "fail_id"
     assert "recovered fallback log" in journal
-
 
 
 def _fast_retry(monkeypatch) -> None:
@@ -597,42 +337,7 @@ def test_deliver_with_retry_fails_after_exhausting_attempts(caplog) -> None:
     assert any("attempt=3/3 status=FAILED" in rec.message for rec in caplog.records)
 
 
-def test_dispatch_failure_alert_persists_total_failure(monkeypatch, caplog) -> None:
-    import json
-    import logging
-    import smtplib
-
-    from src.tools import alerts
-
-    _fast_retry(monkeypatch)
-    monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", "", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "bot@example.com", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "pw", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "ops@example.com", raising=False)
-    real_retry = alerts.deliver_with_retry
-    sleeps: list = []
-    monkeypatch.setattr(alerts, "deliver_with_retry", lambda send, **kw: real_retry(send, sleep_fn=sleeps.append, **kw))
-
-    def _boom(**kw):
-        raise smtplib.SMTPException("auth failed")
-
-    monkeypatch.setattr(alerts, "send_email", _boom)
-
-    with caplog.at_level(logging.ERROR, logger=alerts.logger.name):
-        results = alerts.dispatch_failure_alert("kca-collect.service", detail="boom")
-
-    assert results == {"webhook": False, "email": False}
-    assert sleeps == [5.0, 10.0]
-    files = sorted(alerts.alert_outbox_dir().glob("*.json"))
-    assert len(files) == 1
-    payload = json.loads(files[0].read_text(encoding="utf-8"))
-    assert payload["kind"] == "failure"
-    assert "kca-collect.service" in payload["subject"]
-    assert "boom" in payload["body"]
-    assert any("status=UNDELIVERED" in rec.message for rec in caplog.records)
-
-
-def test_dispatch_digest_persists_when_nothing_configured(monkeypatch) -> None:
+def test_dispatch_page_persists_when_nothing_configured(monkeypatch) -> None:
     import json
 
     from src.tools import alerts
@@ -652,14 +357,14 @@ def test_dispatch_digest_persists_when_nothing_configured(monkeypatch) -> None:
     monkeypatch.setattr(alerts, "post_webhook_text", _no_webhook)
     monkeypatch.setattr(alerts, "send_email", _no_email)
 
-    results = alerts.dispatch_digest("s", "b")
+    results = alerts.dispatch_page("s", "b")
 
     assert results == {"webhook": False, "email": False}
     assert calls == {"webhook": 1, "email": 1}
     files = sorted(alerts.alert_outbox_dir().glob("*.json"))
     assert len(files) == 1
     payload = json.loads(files[0].read_text(encoding="utf-8"))
-    assert (payload["subject"], payload["body"], payload["kind"]) == ("s", "b", "digest")
+    assert (payload["subject"], payload["body"], payload["kind"]) == ("s", "b", "page")
 
 
 def _write_outbox_file(box, name, subject, body="x-body") -> None:
@@ -801,7 +506,7 @@ def test_alert_logs_never_leak_credentials(monkeypatch, caplog) -> None:
     monkeypatch.setattr(alerts, "send_email", _boom_email)
 
     with caplog.at_level(logging.WARNING, logger=alerts.logger.name):
-        results = alerts.dispatch_digest("subject-line", "body-line")
+        results = alerts.dispatch_page("subject-line", "body-line")
 
     assert results == {"webhook": False, "email": False}
     assert webhook_url not in caplog.text
@@ -822,100 +527,11 @@ def test_persist_undelivered_survives_outbox_failure(monkeypatch, caplog) -> Non
     monkeypatch.setattr(alerts, "enqueue_undelivered", _boom)
 
     with caplog.at_level(logging.WARNING, logger=alerts.logger.name):
-        results = alerts.dispatch_digest("s", "b")
+        results = alerts.dispatch_page("s", "b")
 
     assert results == {"webhook": False, "email": False}
     assert any("OUTBOX_FAILED" in rec.message for rec in caplog.records)
     assert any("UNDELIVERED" in rec.message for rec in caplog.records)
-
-
-def test_alerts_main_drains_before_dispatch(monkeypatch) -> None:
-    from src.tools import alerts
-
-    order: list = []
-
-    def _drain(**kw):
-        order.append("drain")
-        assert kw.get("max_items") == alerts.settings.ALERT_OUTBOX_MAX_DRAIN
-        return (0, 0)
-
-    def _dispatch(unit, *, detail="", subject=None):
-        order.append("dispatch")
-        return {"webhook": True, "email": False}
-
-    monkeypatch.setattr(alerts, "drain_alert_outbox", _drain)
-    monkeypatch.setattr(alerts, "dispatch_failure_alert", _dispatch)
-    monkeypatch.setattr(alerts, "collect_unit_diagnostics", lambda unit: ({}, ""))
-
-    alerts.main(["--unit", "krx-host-backup.service"])
-
-    assert order == ["drain", "dispatch"]
-
-
-def test_alerts_main_survives_drain_failure(monkeypatch, caplog) -> None:
-    import logging
-
-    from src.tools import alerts
-
-    def _boom(**kw):
-        raise OSError("outbox unreadable")
-
-    captured: dict = {}
-
-    def _dispatch(unit, *, detail="", subject=None):
-        captured["unit"] = unit
-        return {"webhook": False, "email": False}
-
-    monkeypatch.setattr(alerts, "drain_alert_outbox", _boom)
-    monkeypatch.setattr(alerts, "dispatch_failure_alert", _dispatch)
-    monkeypatch.setattr(alerts, "collect_unit_diagnostics", lambda unit: ({}, ""))
-
-    with caplog.at_level(logging.WARNING, logger=alerts.logger.name):
-        alerts.main(["--unit", "kca-collect.service"])
-
-    assert captured == {"unit": "kca-collect.service"}
-    assert any("DRAIN_FAILED" in rec.message for rec in caplog.records)
-
-
-def test_alert_redaction_degrades_when_secret_source_unreadable(monkeypatch, tmp_path, caplog) -> None:
-    import logging
-
-    from src.tools import alerts
-
-    monkeypatch.setattr(alerts.settings, "BASE_DIR", tmp_path, raising=False)
-    monkeypatch.setattr(alerts.settings, "KIS_APP_SECRET", "kis-secret-0123456789", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", "https://hooks.example.com/x", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_ATTEMPTS", 1, raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_RETRY_BACKOFF_SECONDS", 0.01, raising=False)
-
-    def _boom_env(path):
-        raise OSError("env gone")
-
-    monkeypatch.setattr(alerts, "load_kis_env", _boom_env)
-    captured: dict = {}
-
-    class _FakeResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-    def _fake_post(url, json, timeout):
-        captured["text"] = json["text"]
-        return _FakeResponse()
-
-    monkeypatch.setattr(alerts.requests, "post", _fake_post)
-
-    with caplog.at_level(logging.WARNING, logger=alerts.logger.name):
-        results = alerts.dispatch_failure_alert(
-            "kca-collect.service", detail="boom kis-secret-0123456789"
-        )
-
-    assert results["webhook"] is True
-    assert "kis-secret-0123456789" not in captured["text"]
-    assert "***" in captured["text"]
-    assert any("stage=alert_redaction status=DEGRADED reason=OSError" in rec.message for rec in caplog.records)
 
 
 def test_sanitize_journal_tail_masks_secret_before_truncation() -> None:
@@ -939,70 +555,13 @@ def test_sanitize_journal_tail_masks_pattern_without_configured_secrets() -> Non
     assert "page_no=1" in out
 
 
-def test_dispatch_failure_alert_masks_all_channels(monkeypatch) -> None:
-    from src.tools import alerts
-
-    _fast_retry(monkeypatch)
-    monkeypatch.setattr(alerts.settings, "KIS_APP_SECRET", "kis-secret-0123456789", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_WEBHOOK_URL", "https://hooks.example.com/x", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_USER", "bot@example.com", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_APP_PASSWORD", "pw", raising=False)
-    monkeypatch.setattr(alerts.settings, "ALERT_GMAIL_TO", "ops@example.com", raising=False)
-    captured: dict[str, str] = {}
-
-    def _webhook(url, *, unit, detail="", subject=None):
-        captured["webhook"] = f"{subject}\n{detail}"
-        return True
-
-    def _email(**kw):
-        captured["email"] = f"{kw.get('subject')}\n{kw['detail']}"
-        return True
-
-    monkeypatch.setattr(alerts, "post_webhook_alert", _webhook)
-    monkeypatch.setattr(alerts, "send_email_alert", _email)
-
-    results = alerts.dispatch_failure_alert(
-        "kca-collect.service", detail="boom kis-secret-0123456789 appkey=RAWKEY12345"
-    )
-
-    assert results == {"webhook": True, "email": True}
-    for text in captured.values():
-        assert "kis-secret-0123456789" not in text
-        assert "RAWKEY12345" not in text
-
-
-def test_dispatch_failure_alert_persists_undelivered_masked(monkeypatch, caplog) -> None:
-    import json
-    import logging
-
-    from src.tools import alerts
-
-    _empty_alert_creds(monkeypatch)
-    _fast_retry(monkeypatch)
-    monkeypatch.setenv("KIS_DATA_1_APP_SECRET", "pool-secret-value-001")
-
-    with caplog.at_level(logging.ERROR, logger=alerts.logger.name):
-        alerts.dispatch_failure_alert(
-            "kca-collect.service", subject="fail pool-secret-value-001", detail="detail pool-secret-value-001"
-        )
-
-    files = sorted(alerts.alert_outbox_dir().glob("*.json"))
-    assert len(files) == 1
-    stored = files[0].read_text(encoding="utf-8")
-    assert "pool-secret-value-001" not in stored
-    assert json.loads(stored)["kind"] == "failure"
-    undelivered = [rec.getMessage() for rec in caplog.records if "status=UNDELIVERED" in rec.getMessage()]
-    assert undelivered
-    assert all("pool-secret-value-001" not in msg for msg in undelivered)
-
-
-def test_dispatch_digest_masks_before_outbox(monkeypatch) -> None:
+def test_dispatch_page_masks_before_outbox(monkeypatch) -> None:
     from src.tools import alerts
 
     _empty_alert_creds(monkeypatch)
     _fast_retry(monkeypatch)
 
-    alerts.dispatch_digest("[KCA] digest", "context Authorization: Bearer tok.abc.def")
+    alerts.dispatch_page("[KCA] digest", "context Authorization: Bearer tok.abc.def")
 
     files = sorted(alerts.alert_outbox_dir().glob("*.json"))
     assert len(files) == 1
@@ -1050,21 +609,6 @@ def test_alert_secret_values_read_credential_env_file_under_base_dir(monkeypatch
     assert "file-pool-secret-0003" not in alerts.redact_for_egress("boom file-pool-secret-0003")
 
 
-def test_failure_ledger_tolerates_non_mapping_and_unwritable_ledger(tmp_path, caplog) -> None:
-    from src.tools import alerts
-
-    ledger = tmp_path / "failure_sent.json"
-    ledger.write_text("[]", encoding="utf-8")
-    assert not alerts.failure_alert_sent_today("u.service", "2026-10-20", path=ledger)
-    alerts.record_failure_alert("u.service", "2026-10-20", path=ledger)
-    assert alerts.failure_alert_sent_today("u.service", "2026-10-20", path=ledger)
-
-    blocked = tmp_path / "as_dir"
-    blocked.mkdir()
-    alerts.record_failure_alert("u.service", "2026-10-20", path=blocked)
-    assert "status=LEDGER_FAILED unit=u.service" in caplog.text
-
-
 def test_digest_receipt_masks_before_truncation_and_omits_body(monkeypatch, caplog) -> None:
     import logging
 
@@ -1081,11 +625,11 @@ def test_digest_receipt_masks_before_truncation_and_omits_body(monkeypatch, capl
     monkeypatch.setattr(alerts, "_deliver_now", deliver)
     subject = "[kca] " + secret + "x" * 100
     with caplog.at_level(logging.INFO, logger=alerts.logger.name):
-        result = alerts.dispatch_digest(subject, "private-body-content")
+        result = alerts.dispatch_page(subject, "private-body-content")
     assert result == {"webhook": True, "email": False}
     receipts = [rec.message for rec in caplog.records if "status=SENT" in rec.message]
     assert receipts == [
-        "[SYS] stage=alert_delivery status=SENT webhook=True email=False subject_key=" + delivered[0][0][:80]
+        "[SYS] stage=alert_delivery status=SENT kind=page webhook=True email=False subject_key=" + delivered[0][0][:80]
     ]
     assert "***" in receipts[0]
     assert secret not in caplog.text and "z" * 8 not in caplog.text
@@ -1101,9 +645,9 @@ def test_digest_undelivered_receipt_keeps_outbox_path(monkeypatch, caplog) -> No
 
     monkeypatch.setattr(alerts, "_deliver_now", lambda *args: {"webhook": False, "email": False})
     with caplog.at_level(logging.INFO, logger=alerts.logger.name):
-        assert alerts.dispatch_digest("receipt-title", "receipt-body") == {"webhook": False, "email": False}
+        assert alerts.dispatch_page("receipt-title", "receipt-body") == {"webhook": False, "email": False}
     files = list(alerts.alert_outbox_dir().glob("*.json"))
     assert len(files) == 1
-    assert json.loads(files[0].read_text())["kind"] == "digest"
+    assert json.loads(files[0].read_text())["kind"] == "page"
     assert any(rec.levelno == logging.ERROR and "status=UNDELIVERED" in rec.message for rec in caplog.records)
     assert not any("status=SENT" in rec.message for rec in caplog.records)

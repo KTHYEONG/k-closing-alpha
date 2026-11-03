@@ -1422,7 +1422,7 @@ def test_main_logs_split_and_records_outcome_without_deterministic_alerts(monkey
     monkeypatch.setattr(mod.asyncio, "run", finish)
     monkeypatch.setattr(run_outcome.settings, "DATA_DIR", tmp_path)
     sent = []
-    monkeypatch.setattr(run_outcome, "dispatch_digest", lambda *args: sent.append(args))
+    monkeypatch.setattr("src.tools.alerts.dispatch_page", lambda *args: sent.append(args) or {"email": True})
     with caplog.at_level(logging.INFO):
         mod.main()
     done = [rec.message for rec in caplog.records if "stage=extended_backfill status=DONE" in rec.message]
@@ -1433,7 +1433,7 @@ def test_main_logs_split_and_records_outcome_without_deterministic_alerts(monkey
     assert event["metrics"] == asdict(summary)
     assert event["outcome"] == ("DEGRADED" if actionable else "OK")
     assert event["reason"] == ("failed" if actionable else "")
-    assert len(sent) == int(actionable)
+    assert sent == []  # extended backfill is SILENT under the paging policy
 
 
 def test_summary_construction_defaults_remain_compatible() -> None:
