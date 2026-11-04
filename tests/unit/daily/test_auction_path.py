@@ -505,3 +505,60 @@ def test_auction_path_overlaps_symbols_up_to_concurrency_bound(tmp_path, monkeyp
     assert state["peak"] == 2
     assert [entry.symbol for entry in manifest.entries] == symbols
     assert all(entry.status == CaptureStatus.COMPLETE for entry in manifest.entries)
+
+
+def test_path_extras_in_partition_and_sibling_manifest(tmp_path, monkeypatch) -> None:
+    """Extras join the partition while the primary manifest keeps only the cohort."""
+    import asyncio
+
+    from src.data.research_roster import ResearchRoster, RosterCandidate, build_roster_frame, publish_research_roster
+
+    _live_settings(monkeypatch, tmp_path)
+    store = _seed_store(tmp_path, ["000001"])
+    trading_day = date.fromisoformat(DATE)
+    members = ["000003"]
+    roster = ResearchRoster(
+        trading_date=trading_day,
+        roster_id=f"research-roster-{DATE}",
+        rule_version="liquid_any_direction@v1",
+        observed_at=datetime(2026, 10, 15, 15, 19, 55, tzinfo=SEOUL),
+        as_of_panel_date=date(2026, 10, 14),
+        members=tuple(members),
+        dropped={},
+        truncated=False,
+    )
+    candidates = [RosterCandidate(symbol=members[0], rank=1, trade_value_100m=500.0, change_pct=0.0, last_price=10_000)]
+    frame = build_roster_frame(candidates, roster.members, {}, {members[0]: 10_000.0})
+    publish_research_roster(
+        store,
+        roster,
+        frame,
+        raw_refs=(),
+        completed_at=datetime(2026, 10, 15, 15, 20, tzinfo=SEOUL),
+    )
+    client = _FakeClient(
+        {
+            "000001": {"rows": [_row("152500"), _row("153001", sell="100")]},
+            "000003": {"rows": [_row("152500"), _row("153001", sell="100")]},
+        }
+    )
+
+    manifest = asyncio.run(
+        auction_path.run_auction_path_capture(
+            snapshot_date=DATE,
+            profile=CollectionSettings(COLLECTION_RESEARCH_ROSTER_ENABLED=True),
+            client=client,  # type: ignore[arg-type]
+            session=object(),
+            store=store,
+            now=lambda: READY_NOW,
+        )
+    )
+
+    assert {entry.symbol for entry in manifest.entries} == {"000001"}
+    assert sorted(client.calls) == ["000001", "000003"]
+    stored = pd.read_parquet(auction_path_store.auction_path_partition_path(DATE))
+    assert sorted(stored["symbol"].unique().tolist()) == ["000001", "000003"]
+    research = [m for m in store.read_manifests(DATE) if m.context.capture_reason == "auction-path-research"]
+    assert len(research) == 1
+    assert {entry.symbol for entry in research[0].entries} == {"000003"}
+    assert research[0].context.cohort_id is None

@@ -937,3 +937,119 @@ def test_degraded_slot_marks_every_manifest_partial(tmp_path: Path) -> None:
     )
     assert manifests
     assert {m.status for m in manifests} == {CaptureStatus.PARTIAL}
+
+
+def _timed_runner(start: dt.datetime) -> tuple[dict[str, dt.datetime], Any]:
+    state = {"now": start}
+
+    async def _sleep(seconds: float) -> None:
+        state["now"] += dt.timedelta(seconds=seconds)
+
+    return state, _sleep
+
+
+def test_sparse_rounds_append_research_after_sparse(tmp_path: Path) -> None:
+    """Sparse rounds sweep the sorted cohort before research extras; dense rounds never do."""
+    from src.daily.aftermarket_book import run_aftermarket_book_capture
+
+    profile = _profile(tmp_path, COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES=("170000",))
+    store = _store(tmp_path)
+    state, sleep = _timed_runner(_seoul(2026, 9, 29, 16, 0))
+    seen: list[tuple[str, str]] = []
+
+    def _handler(div: str | None, code: str) -> dict[str, Any]:
+        seen.append((state["now"].strftime("%H%M"), code))
+        return _listed_book()
+
+    _run(
+        run_aftermarket_book_capture(
+            "2026-09-29",
+            profile=profile,
+            store=store,
+            clients=[_StubClient(handler=_handler)],
+            dense_symbols=("000001",),
+            sparse_symbols=("000001", "000002"),
+            research_symbols=("000009", "000003"),
+            now_fn=lambda: state["now"],
+            sleep_fn=sleep,
+        )
+    )
+
+    sparse_codes = [code for at, code in seen if at == "1700"]
+    assert sparse_codes == ["000001", "000002", "000009", "000003"] * 2
+    dense_codes = {code for at, code in seen if at != "1700"}
+    assert dense_codes == {"000001"}
+
+
+def test_research_book_manifest_per_block_venue(tmp_path: Path) -> None:
+    """Each (block, venue) that swept research symbols publishes one sibling right after its primary."""
+    from src.daily.aftermarket_book import run_aftermarket_book_capture
+    from src.data.capture_contracts import CaptureDataset
+
+    profile = _profile(tmp_path, COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES=("170000",), COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS=2)
+    store = _store(tmp_path)
+    state, sleep = _timed_runner(_seoul(2026, 9, 29, 16, 0))
+
+    manifests = _run(
+        run_aftermarket_book_capture(
+            "2026-09-29",
+            profile=profile,
+            store=store,
+            clients=[_StubClient()],
+            dense_symbols=("000001",),
+            sparse_symbols=("000001", "000002"),
+            research_symbols=("000009", "000003"),
+            now_fn=lambda: state["now"],
+            sleep_fn=sleep,
+        )
+    )
+
+    assert len(manifests) == 8
+    research = [m for m in manifests if m.context.capture_reason == "aftermarket-book-research"]
+    assert sorted(m.context.session for m in research) == ["krx_aftermarket", "nxt_aftermarket"]
+    for sibling in research:
+        index = manifests.index(sibling)
+        primary = manifests[index - 1]
+        assert primary.context.capture_reason == "aftermarket-book"
+        assert primary.context.session == sibling.context.session
+        assert sibling.context.run_id == primary.context.run_id + "-research"
+        assert sibling.context.dataset == CaptureDataset.ORDERBOOK
+        assert {e.symbol for e in sibling.entries} == {"000009", "000003"}
+        assert {e.symbol for e in primary.entries} == {"000001", "000002"}
+
+
+def test_empty_research_symbols_is_identity(tmp_path: Path) -> None:
+    """Passing no research symbols produces exactly the pre-extras manifests."""
+    from src.daily.aftermarket_book import run_aftermarket_book_capture
+
+    def _signature(manifests: tuple[Any, ...]) -> list[Any]:
+        return [
+            (
+                m.context.session,
+                m.context.capture_reason,
+                m.status.value,
+                [(e.symbol, e.scheduled_at, e.status.value, e.reason, e.rows) for e in m.entries],
+            )
+            for m in manifests
+        ]
+
+    def _capture(root: Path, **kwargs: Any) -> tuple[Any, ...]:
+        profile = _profile(root, COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES=("170000",))
+        return _run(
+            run_aftermarket_book_capture(
+                "2026-09-29",
+                profile=profile,
+                store=_store(root),
+                clients=[_StubClient()],
+                dense_symbols=("000001",),
+                sparse_symbols=("000001", "000002"),
+                now_fn=lambda: _seoul(2026, 9, 29, 16, 0),
+                **kwargs,
+            )
+        )
+
+    baseline = _capture(tmp_path / "a")
+    explicit_empty = _capture(tmp_path / "b", research_symbols=())
+
+    assert _signature(explicit_empty) == _signature(baseline)
+    assert not [m for m in explicit_empty if m.context.capture_reason.endswith("-research")]

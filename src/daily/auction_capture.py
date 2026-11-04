@@ -32,6 +32,7 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
+from src.data.research_roster import research_extras, research_manifest, split_research_entries
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day, resolve_prev_trading_day_kis
 from src.execution.paper_broker import load_held_roster
@@ -742,6 +743,16 @@ async def run_auction_capture(
         raise ValueError("auction capture requires prewarmed data clients")
     now = now_clock()
     roster, cohort_id, cohort_incomplete = _resolve_roster(snapshot_date, phase, store, now, previous_trading_day)
+    roster_date = snapshot_date if phase == "close" else (previous_trading_day or _previous_trading_day(snapshot_date))
+    extras = research_extras(
+        store,
+        roster_date,
+        available_by=now,
+        exclude=set(roster),
+        enabled=profile.COLLECTION_RESEARCH_ROSTER_ENABLED,
+    )
+    dispatch = [*roster, *extras]
+    research_set = frozenset(extras)
     if phase == "close":
         rounds = close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS))
         phase_end = session_clock.close_at
@@ -767,7 +778,7 @@ async def run_auction_capture(
                 _capture_program_rounds(
                     session=broker_session,
                     rounds=program_rounds(session_clock),
-                    roster=roster,
+                    roster=dispatch,
                     clients=clients,
                     semaphore=sem,
                     store=store,
@@ -791,7 +802,7 @@ async def run_auction_capture(
                     "[DATA] stage=auction_capture status=DEADLINE_EXCEEDED phase=%s round=%s n_missing=%d",
                     phase,
                     scheduled_at.isoformat(),
-                    len(roster),
+                    len(dispatch),
                 )
                 incomplete = True
                 entries.extend(
@@ -808,12 +819,12 @@ async def run_auction_capture(
                         reason="deadline",
                         raw_refs=(),
                     )
-                    for symbol in roster
+                    for symbol in dispatch
                 )
                 continue
             degraded: list[str] = []
             round_entries = await _observe_roster(
-                roster=roster,
+                roster=dispatch,
                 clients=clients,
                 semaphore=sem,
                 deadline=deadline,
@@ -836,13 +847,21 @@ async def run_auction_capture(
                 on_deadline=functools.partial(_orderbook_deadline_entry, scheduled_at=scheduled_at),
             )
             entries.extend(round_entries)
-            if degraded or any(entry.status is not CaptureStatus.COMPLETE for entry in round_entries):
+            if any(symbol not in research_set for symbol in degraded) or any(
+                entry.status is not CaptureStatus.COMPLETE
+                for entry in round_entries
+                if entry.symbol not in research_set
+            ):
                 incomplete = True
         if phase == "close":
             if program_task is not None:
                 program_entries = await program_task
                 entries.extend(program_entries)
-                if any(entry.status not in GOOD_ENTRY_STATES for entry in program_entries):
+                if any(
+                    entry.status not in GOOD_ENTRY_STATES
+                    for entry in program_entries
+                    if entry.symbol not in research_set
+                ):
                     incomplete = True
         else:
             floor = session_clock.open_at + timedelta(seconds=_OPEN_TRUST_FLOOR_SECONDS)
@@ -853,7 +872,7 @@ async def run_auction_capture(
             wait = (floor - now_clock()).total_seconds()
             if wait > 0:
                 await sleeper(wait)
-            pending = list(enumerate(roster))
+            pending = list(enumerate(dispatch))
             poll_started: dict[str, datetime] = {}
             last_seen: dict[str, tuple[Any, datetime]] = {}
             confirmed_empty: set[str] = set()
@@ -901,10 +920,10 @@ async def run_auction_capture(
                         entries.append(entry)
                     else:
                         next_pending.append((orig_position, symbol))
-                if pass_degraded or any(
+                if any(symbol not in research_set for symbol in pass_degraded) or any(
                     entry.status not in GOOD_ENTRY_STATES
                     for pass_index, entry in enumerate(round_entries)
-                    if pass_index in settled
+                    if pass_index in settled and entry.symbol not in research_set
                 ):
                     incomplete = True
                 pending = next_pending
@@ -922,38 +941,51 @@ async def run_auction_capture(
                     ref=seen[0] if seen is not None else None,
                     no_open_trade=symbol in confirmed_empty,
                 )
-                incomplete = incomplete or entry.status not in GOOD_ENTRY_STATES
+                if symbol not in research_set and entry.status not in GOOD_ENTRY_STATES:
+                    incomplete = True
                 entries.append(entry)
+    primary, research = split_research_entries(entries, research_set)
     status = CaptureStatus.COMPLETE
-    for item in entries:
+    for item in primary:
         if item.status not in GOOD_ENTRY_STATES:
             status = CaptureStatus.PARTIAL
             break
     if incomplete and status == CaptureStatus.COMPLETE:
         status = CaptureStatus.PARTIAL
+    completed_at = now_clock()
+    context = CaptureContext(
+        trading_date=trading_day,
+        run_id=run_id,
+        dataset=CaptureDataset.ORDERBOOK if phase == "close" else CaptureDataset.PRICE,
+        vendor="kis",
+        endpoint="auction-capture",
+        symbol=None,
+        venue="KRX",
+        session="regular",
+        capture_reason=reason_tag,
+        cohort_id=cohort_id,
+        scheduled_at=None,
+    )
     manifest = CaptureManifest(
         schema_version=1,
-        context=CaptureContext(
-            trading_date=trading_day,
-            run_id=run_id,
-            dataset=CaptureDataset.ORDERBOOK if phase == "close" else CaptureDataset.PRICE,
-            vendor="kis",
-            endpoint="auction-capture",
-            symbol=None,
-            venue="KRX",
-            session="regular",
-            capture_reason=reason_tag,
-            cohort_id=cohort_id,
-            scheduled_at=None,
-        ),
+        context=context,
         cohort=None,
-        completed_at=now_clock(),
-        entries=tuple(entries),
-        artifacts=tuple(ref for item in entries for ref in item.raw_refs),
+        completed_at=completed_at,
+        entries=tuple(primary),
+        artifacts=tuple(ref for item in primary for ref in item.raw_refs),
         status=status,
     )
     try:
         store.publish_manifest(manifest)
+        if research:
+            store.publish_manifest(
+                research_manifest(
+                    context,
+                    research,
+                    completed_at=completed_at,
+                    force_partial=bool(degraded_slots),
+                )
+            )
     except OSError as exc:
         raise OSError("required auction coverage persistence fails") from exc
     return manifest

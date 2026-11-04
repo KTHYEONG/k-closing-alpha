@@ -38,6 +38,7 @@ from src.data.capture_contracts import (
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.orderbook_store import append_orderbook_snapshots, build_orderbook_rows
+from src.data.research_roster import research_extras, research_manifest, split_research_entries
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day
 from src.execution.paper_broker import HeldRoster, load_held_roster
@@ -224,6 +225,7 @@ async def run_aftermarket_book_capture(
     sparse_symbols: Sequence[str],
     roster_incomplete: bool = False,
     degraded_slots: Sequence[str] = (),
+    research_symbols: Sequence[str] = (),
     now_fn: Callable[[], datetime] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] | None = None,
 ) -> tuple[CaptureManifest, ...]:
@@ -246,6 +248,7 @@ async def run_aftermarket_book_capture(
             every published manifest is then PARTIAL because the dense universe may be
             missing held lots.
         degraded_slots: Slots whose token issuance failed before capture; any makes every manifest PARTIAL.
+        research_symbols: Research extras swept after the sparse universe in sparse rounds only.
         now_fn: Aware clock; None uses Asia/Seoul now.
         sleep_fn: Wait primitive; None uses asyncio.sleep.
 
@@ -272,6 +275,14 @@ async def run_aftermarket_book_capture(
         )
     dense = tuple(sorted({str(item).strip().zfill(6) for item in dense_symbols if str(item).strip()}))
     sparse = tuple(sorted({str(item).strip().zfill(6) for item in sparse_symbols if str(item).strip()}))
+    sparse_set = frozenset(sparse)
+    research = tuple(
+        item
+        for item in dict.fromkeys(str(symbol).strip().zfill(6) for symbol in research_symbols if str(symbol).strip())
+        if item not in sparse_set
+    )
+    research_set = frozenset(research)
+    sparse_universe = (*sparse, *research)
     rounds = aftermarket_book_rounds(
         trading_day,
         dense_seconds=int(profile.COLLECTION_AFTERMARKET_BOOK_DENSE_SECONDS),
@@ -427,7 +438,7 @@ async def run_aftermarket_book_capture(
             per_venue_entries: dict[str, dict[str, list[CoverageEntry]]] = {"KRX": {}, "NXT": {}}
             for offset, book_round in enumerate(block_rounds):
                 round_index = block_start + offset
-                universe = sparse if book_round.kind == "sparse" else dense
+                universe = sparse_universe if book_round.kind == "sparse" else dense
                 venues = venues_for_round(book_round.scheduled_at)
                 if book_round.scheduled_at in missed:
                     for venue in venues:
@@ -490,7 +501,7 @@ async def run_aftermarket_book_capture(
                 by_symbol = per_venue_entries[venue]
                 if not by_symbol:
                     continue
-                entries: list[CoverageEntry] = []
+                merged_entries: list[CoverageEntry] = []
                 for symbol in sorted(by_symbol):
                     parts = by_symbol[symbol]
                     if len(parts) == 1:
@@ -506,7 +517,7 @@ async def run_aftermarket_book_capture(
                         merged = _merge_block_entries(symbol, venue, parts, "vendor_failure")
                     else:
                         merged = _merge_block_entries(symbol, venue, parts, "aftermarket-book")
-                    entries.append(merged)
+                    merged_entries.append(merged)
                     if merged.status == CaptureStatus.COMPLETE:
                         ok += 1
                     elif merged.status == CaptureStatus.NOT_APPLICABLE:
@@ -515,34 +526,46 @@ async def run_aftermarket_book_capture(
                         late += 1
                     else:
                         failed += 1
-                status = (
-                    CaptureStatus.PARTIAL
-                    if roster_incomplete or degraded_slots or not all(item.status in GOOD_ENTRY_STATES for item in entries)
-                    else CaptureStatus.COMPLETE
+                entries, research_entries = split_research_entries(merged_entries, research_set)
+                context = CaptureContext(
+                    trading_date=trading_day,
+                    run_id=block_run_ids[venue],
+                    dataset=CaptureDataset.ORDERBOOK,
+                    vendor="kis",
+                    endpoint="aftermarket-book",
+                    symbol=None,
+                    venue="owner-local",
+                    session=_VENUE_SESSION[venue],
+                    capture_reason="aftermarket-book",
+                    cohort_id=None,
+                    scheduled_at=None,
                 )
-                manifest = CaptureManifest(
-                    schema_version=1,
-                    context=CaptureContext(
-                        trading_date=trading_day,
-                        run_id=block_run_ids[venue],
-                        dataset=CaptureDataset.ORDERBOOK,
-                        vendor="kis",
-                        endpoint="aftermarket-book",
-                        symbol=None,
-                        venue="owner-local",
-                        session=_VENUE_SESSION[venue],
-                        capture_reason="aftermarket-book",
-                        cohort_id=None,
-                        scheduled_at=None,
-                    ),
-                    cohort=None,
-                    completed_at=completed_at,
-                    entries=tuple(entries),
-                    artifacts=tuple(ref for item in entries for ref in item.raw_refs),
-                    status=status,
-                )
-                store.publish_manifest(manifest)
-                manifests.append(manifest)
+                if entries:
+                    status = (
+                        CaptureStatus.PARTIAL
+                        if roster_incomplete or degraded_slots or not all(item.status in GOOD_ENTRY_STATES for item in entries)
+                        else CaptureStatus.COMPLETE
+                    )
+                    manifest = CaptureManifest(
+                        schema_version=1,
+                        context=context,
+                        cohort=None,
+                        completed_at=completed_at,
+                        entries=tuple(entries),
+                        artifacts=tuple(ref for item in entries for ref in item.raw_refs),
+                        status=status,
+                    )
+                    store.publish_manifest(manifest)
+                    manifests.append(manifest)
+                if research_entries:
+                    research_sibling = research_manifest(
+                        context,
+                        research_entries,
+                        completed_at=completed_at,
+                        force_partial=roster_incomplete or bool(degraded_slots),
+                    )
+                    store.publish_manifest(research_sibling)
+                    manifests.append(research_sibling)
             logger.info(
                 "[DATA] stage=aftermarket_book block=%d rounds=%d ok=%d late=%d failed=%d nx_unlisted=%d rows_total=%d",
                 block,
@@ -616,7 +639,15 @@ async def _run_async(snapshot_date: str, profile: CollectionSettings) -> tuple[C
         if not await is_kis_trading_day(clients[0], broker_session, snapshot_date):
             return None
     held = load_held_roster()
-    dense_symbols, sparse_symbols = resolve_book_universes(snapshot_date, store=store, now=datetime.now(SEOUL), held=held)
+    now = datetime.now(SEOUL)
+    dense_symbols, sparse_symbols = resolve_book_universes(snapshot_date, store=store, now=now, held=held)
+    research_symbols = research_extras(
+        store,
+        snapshot_date,
+        available_by=now,
+        exclude=set(sparse_symbols),
+        enabled=profile.COLLECTION_RESEARCH_ROSTER_ENABLED,
+    )
     return await run_aftermarket_book_capture(
         snapshot_date,
         profile=profile,
@@ -626,6 +657,7 @@ async def _run_async(snapshot_date: str, profile: CollectionSettings) -> tuple[C
         sparse_symbols=sparse_symbols,
         roster_incomplete=not held.ok,
         degraded_slots=degraded_slots,
+        research_symbols=research_symbols,
     )
 
 
