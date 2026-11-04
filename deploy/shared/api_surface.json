@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "generated_at": "2026-11-04T06:18:55+00:00",
+ "generated_at": "2026-11-04T10:23:51+00:00",
  "projects": {
   "kca": {
    "/api/dostk/chart": {
@@ -362,6 +362,14 @@
     ]
    },
    "ka10027": {
+    "brokers": [
+     "kiwoom"
+    ],
+    "files": [
+     "src/api/kiwoom/client.py"
+    ]
+   },
+   "ka10032": {
     "brokers": [
      "kiwoom"
     ],

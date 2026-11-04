@@ -97,6 +97,11 @@ class CollectionSettings(EnvSettings):
             before a need is terminal, default 3.
         COLLECTION_TAPE_TERMINALIZE_MAX_SHARE: Max share of one sweep's attempted needs that may become terminal
             in a run, default 0.10.
+        COLLECTION_RESEARCH_ROSTER_ENABLED: Enable the 15:20 research roster capture, default False.
+        COLLECTION_RESEARCH_ROSTER_MIN_TRADE_VALUE_100M: Roster trade-value floor in 100M KRW, default 100.0.
+        COLLECTION_RESEARCH_ROSTER_MIN_MARKET_CAP_100M: Roster estimated market-cap floor in 100M KRW, default 500.0.
+        COLLECTION_RESEARCH_ROSTER_MAX_PAGES: Ranking page budget (100 rows per page), default 6.
+        COLLECTION_RESEARCH_ROSTER_MAX_MEMBERS: Roster capacity cap, default 400.
 
     Raises:
         ValueError: Invalid limits, duplicate slots, or enabled auctions without
@@ -165,6 +170,11 @@ class CollectionSettings(EnvSettings):
     COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS: Annotated[tuple[str, ...], NoDecode] = Field(
         default=("0850-0940", "1510-1550")
     )
+    COLLECTION_RESEARCH_ROSTER_ENABLED: bool = Field(default=False)
+    COLLECTION_RESEARCH_ROSTER_MIN_TRADE_VALUE_100M: float = Field(default=100.0, ge=0.0, allow_inf_nan=False)
+    COLLECTION_RESEARCH_ROSTER_MIN_MARKET_CAP_100M: float = Field(default=500.0, ge=0.0, allow_inf_nan=False)
+    COLLECTION_RESEARCH_ROSTER_MAX_PAGES: int = Field(default=6, gt=0, le=20)
+    COLLECTION_RESEARCH_ROSTER_MAX_MEMBERS: int = Field(default=400, gt=0)
 
     @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", "COLLECTION_BACKFILL_SLOTS", "COLLECTION_AFTERMARKET_BOOK_SLOTS", mode="before")
     @classmethod

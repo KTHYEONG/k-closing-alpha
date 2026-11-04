@@ -427,6 +427,27 @@ class CaptureStore:
             raise ValueError("persisted decision input cannot be reconciled with its cohort")
         return frame.copy()
 
+    def read_frame(self, ref: ArtifactRef) -> pd.DataFrame:
+        """Load a hash-verified normalized Parquet artifact as a fresh frame.
+
+        Args:
+            ref: Reference previously returned by publish_frame or carried by a manifest.
+
+        Returns:
+            Newly decoded frame; mutating it does not affect the stored evidence.
+
+        Raises:
+            ValueError: The artifact is missing or its bytes do not match the reference.
+        """
+        data = self._check_ref(ref)
+        tmp_path = self._staging / f"stage-{uuid.uuid4().hex}.parquet"
+        try:
+            tmp_path.write_bytes(data)
+            return pd.read_parquet(tmp_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
     def read_cohort(self, snapshot_date: str, *, available_by: datetime) -> Cohort:
         """Resolve a declared cohort without inferring it from trading picks or stale days.
 

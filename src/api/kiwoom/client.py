@@ -421,6 +421,98 @@ class KiwoomApiClient:
             return {"rt_cd": "1", "msg1": str(e), "output": [], "vendor": "kiwoom"}
         return {"rt_cd": "0", "output": collected, "vendor": "kiwoom"}
 
+    async def get_trade_value_ranking(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        max_pages: int,
+        min_trade_value_krw: int,
+        stex_tp: str = "1",
+        on_page: PageObserver | None = None,
+    ) -> BrokerPayload:
+        """Walk the ka10032 trade-value ranking and return every row of the walked pages, unfiltered.
+
+        Args:
+            session: Existing authenticated HTTP session.
+            max_pages: Page budget; exhausting it while the vendor still has rows returns truncated.
+            min_trade_value_krw: Stop once a page's last parsed row trades below this KRW floor.
+            stex_tp: Venue selector; "1" is KRX.
+            on_page: Optional source evidence observer, called for every page before any filtering.
+        Returns:
+            Vendor payload with rt_cd "0" or "1", raw rows, truncated flag, and msg1.
+        Raises:
+            RawCaptureError: Source evidence persistence failed.
+        """
+        cont_yn, next_key = "N", ""
+        collected: list[dict[str, Any]] = []
+        in_observer = False
+        try:
+            for page_index in range(max(1, int(max_pages))):
+                started = now_seoul()
+                data, resp_headers = await self._post_tr(
+                    session,
+                    "ka10032",
+                    "/api/dostk/rkinfo",
+                    {"mrkt_tp": "000", "mang_stk_incls": "0", "stex_tp": str(stex_tp)},
+                    cont_yn=cont_yn,
+                    next_key=next_key,
+                )
+                received = now_seoul()
+                header_cont = str(resp_headers.get("cont-yn", "N") or "N")
+                header_key = str(resp_headers.get("next-key", "") or "")
+                metadata = {
+                    "vendor": "kiwoom",
+                    "endpoint": "trade-value-ranking",
+                    "cont-yn": header_cont,
+                    "next-key": header_key,
+                }
+                in_observer = True
+                if on_page is not None:
+                    on_page(dict(data), metadata, started, received, page_index, 0)
+                in_observer = False
+                if data.get("return_code") != 0:
+                    return {
+                        "rt_cd": "1",
+                        "msg1": str(data.get("return_msg", "")),
+                        "output": [],
+                        "vendor": "kiwoom",
+                        "truncated": False,
+                    }
+                rows = data.get("trde_prica_upper") or []
+                collected.extend(dict(r) for r in rows)
+                cont_yn, next_key = header_cont, header_key
+                if cont_yn != "Y":
+                    break
+                last_value_mil: int | None = None
+                for row in rows:
+                    try:
+                        last_value_mil = int(str(row["trde_prica"]).strip())
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                if last_value_mil is not None and last_value_mil * 1_000_000 < min_trade_value_krw:
+                    break
+            else:
+                logger.warning(
+                    "[DATA] stage=research_roster vendor=kiwoom status=TRUNCATED max_pages=%d n_rows=%d",
+                    int(max_pages),
+                    len(collected),
+                )
+                return {
+                    "rt_cd": "1",
+                    "msg1": f"ranking truncated at max_pages={int(max_pages)}",
+                    "output": collected,
+                    "vendor": "kiwoom",
+                    "truncated": True,
+                }
+        except Exception as e:
+            if in_observer:
+                if isinstance(e, RawCaptureError):
+                    raise
+                raise RawCaptureError(str(e)) from e
+            logger.warning("Kiwoom trade-value ranking failed: %s", e)
+            return {"rt_cd": "1", "msg1": str(e), "output": [], "vendor": "kiwoom", "truncated": False}
+        return {"rt_cd": "0", "msg1": "", "output": collected, "vendor": "kiwoom", "truncated": False}
+
     async def get_tick_chart(
         self,
         session: aiohttp.ClientSession,

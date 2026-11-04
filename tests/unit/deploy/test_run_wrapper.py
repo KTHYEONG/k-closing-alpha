@@ -61,7 +61,12 @@ def _wrapper_units() -> list[Path]:
 
 def test_legacy_argv_parity_all_units() -> None:
     fixture = _fixture()
-    assert {path.name for path in _wrapper_units()} == set(fixture["execstart"])
+    wrapped = {path.name for path in _wrapper_units()}
+    pinned = set(fixture["execstart"])
+    assert pinned <= wrapped
+    migrated_tree = set(_git_show(f"{fixture['migration_sha']}:deploy/systemd").decode("utf-8").split())
+    # Units added after the migration have no legacy docker form; every migrated unit stays pinned.
+    assert (wrapped - pinned).isdisjoint(migrated_tree)
     for name, legacy in fixture["execstart"].items():
         assert effective_execstart(SYSTEMD / name) == legacy, name
 

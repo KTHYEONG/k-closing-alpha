@@ -631,6 +631,26 @@ def test_read_artifact_rejects_malformed(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="path-safe"):
         ArtifactRef(path="raw/./dot.json.gz", sha256="0" * 64, bytes=1)
 
+def test_read_frame_hash_mismatch_raises(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    ref = store.publish_frame(pd.DataFrame({"symbol": ["005930"], "rank": [1]}), context=_context())
+    artifact = tmp_path / "capture" / ref.path
+    artifact.write_bytes(artifact.read_bytes()[:-1] + b"\x00")
+
+    with pytest.raises(ValueError, match="hash-inconsistent"):
+        store.read_frame(ref)
+    assert list((tmp_path / "capture" / "staging").glob("stage-*.parquet")) == []
+
+
+def test_read_frame_round_trips_published_frame(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    frame = pd.DataFrame({"symbol": ["005930", "000660"], "rank": [1, 2]})
+    ref = store.publish_frame(frame, context=_context())
+
+    loaded = store.read_frame(ref)
+
+    pd.testing.assert_frame_equal(loaded, frame)
+
 
 def test_publish_lock_timeout_fails_explicitly(tmp_path: Path, monkeypatch: Any) -> None:
     store = CaptureStore(tmp_path / "capture")

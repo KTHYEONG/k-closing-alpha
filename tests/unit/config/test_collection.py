@@ -317,3 +317,26 @@ def test_collection_pit_backfill_rejects_nan_threshold() -> None:
     """Non-finite PIT thresholds are rejected."""
     with pytest.raises(ValueError, match="finite"):
         CollectionSettings(COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M=float("nan"), _env_file=None)
+
+
+def test_roster_defaults_off() -> None:
+    profile = CollectionSettings(_env_file=None)
+
+    assert profile.COLLECTION_RESEARCH_ROSTER_ENABLED is False
+    assert profile.COLLECTION_RESEARCH_ROSTER_MIN_TRADE_VALUE_100M == 100.0
+    assert profile.COLLECTION_RESEARCH_ROSTER_MIN_MARKET_CAP_100M == 500.0
+    assert profile.COLLECTION_RESEARCH_ROSTER_MAX_PAGES == 6
+    assert profile.COLLECTION_RESEARCH_ROSTER_MAX_MEMBERS == 400
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"COLLECTION_RESEARCH_ROSTER_MAX_PAGES": 0},
+        {"COLLECTION_RESEARCH_ROSTER_MAX_PAGES": 21},
+        {"COLLECTION_RESEARCH_ROSTER_MAX_MEMBERS": 0},
+    ],
+)
+def test_roster_bounds_validated(overrides: dict[str, int]) -> None:
+    with pytest.raises(ValueError, match="COLLECTION_RESEARCH_ROSTER_MAX_"):
+        CollectionSettings(_env_file=None, **overrides)
