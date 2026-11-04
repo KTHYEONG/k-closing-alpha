@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA research roster capture (Mon-Fri 15:20:30 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 15:20:30 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kca-research-roster.service
+
+[Install]
+WantedBy=timers.target

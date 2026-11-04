@@ -821,6 +821,130 @@ def test_kiwoom_get_fluctuation_ranking_flags_truncation_when_pages_exhausted() 
     assert len(res["output"]) == 3
     assert inspect.signature(KiwoomApiClient.get_fluctuation_ranking).parameters["max_pages"].default == 20
 
+def _trade_value_row(code: str, trde_prica: str) -> dict[str, str]:
+    return {"stk_cd": code, "stk_nm": "X", "cur_prc": "+1000", "flu_rt": "-15.00", "now_rank": "1", "trde_prica": trde_prica}
+
+
+def test_kiwoom_trade_value_ranking_stops_below_floor() -> None:
+    import asyncio
+
+    client = _kiwoom_client()
+    pages = [
+        ([_trade_value_row("005930", "1000"), _trade_value_row("000660", "20000")], {"cont-yn": "Y", "next-key": "k2"}),
+        ([_trade_value_row("035420", "15000"), _trade_value_row("051910", "5000")], {"cont-yn": "Y", "next-key": "k3"}),
+        ([_trade_value_row("207940", "4000")], {"cont-yn": "N", "next-key": ""}),
+    ]
+    calls: list[dict[str, Any]] = []
+
+    async def fake_post_tr(session, api_id, path, body, cont_yn="N", next_key="", max_retries=3):
+        calls.append({"cont_yn": cont_yn, "next_key": next_key})
+        rows, headers = pages[len(calls) - 1]
+        return ({"return_code": 0, "trde_prica_upper": rows}, headers)
+
+    client._post_tr = fake_post_tr
+    res = asyncio.run(
+        client.get_trade_value_ranking(object(), max_pages=5, min_trade_value_krw=10_000_000_000)
+    )
+
+    assert len(calls) == 2
+    assert res["rt_cd"] == "0"
+    assert res["truncated"] is False
+    assert [row["stk_cd"] for row in res["output"]] == ["005930", "000660", "035420", "051910"]
+
+
+def test_kiwoom_trade_value_ranking_truncated_keeps_rows() -> None:
+    import asyncio
+
+    client = _kiwoom_client()
+    calls = {"n": 0}
+
+    async def fake_post_tr(session, api_id, path, body, cont_yn="N", next_key="", max_retries=3):
+        calls["n"] += 1
+        row = _trade_value_row(f"00000{calls['n']}", "90000")
+        return ({"return_code": 0, "trde_prica_upper": [row]}, {"cont-yn": "Y", "next-key": f"k{calls['n']}"})
+
+    client._post_tr = fake_post_tr
+    res = asyncio.run(client.get_trade_value_ranking(object(), max_pages=2, min_trade_value_krw=0))
+
+    assert res["rt_cd"] == "1"
+    assert res["truncated"] is True
+    assert [row["stk_cd"] for row in res["output"]] == ["000001", "000002"]
+
+
+def test_kiwoom_trade_value_ranking_observer_sees_unfiltered_pages() -> None:
+    import asyncio
+
+    client = _kiwoom_client()
+    rows = [_trade_value_row("005930", "1000"), _trade_value_row("000660", "10")]
+
+    async def fake_post_tr(session, api_id, path, body, cont_yn="N", next_key="", max_retries=3):
+        return ({"return_code": 0, "trde_prica_upper": rows}, {"cont-yn": "N", "next-key": ""})
+
+    client._post_tr = fake_post_tr
+    seen: list[Any] = []
+    res = asyncio.run(
+        client.get_trade_value_ranking(
+            object(), max_pages=3, min_trade_value_krw=10_000_000_000, on_page=lambda *a: seen.append(a)
+        ),
+    )
+
+    assert len(seen) == 1
+    assert seen[0][0]["trde_prica_upper"] == rows
+    assert seen[0][1]["endpoint"] == "trade-value-ranking"
+    assert seen[0][1]["vendor"] == "kiwoom"
+    assert seen[0][4] == 0
+    assert len(res["output"]) == 2
+
+
+def test_kiwoom_trade_value_ranking_observer_failure_is_raw_capture_error() -> None:
+    import asyncio
+
+    client = _kiwoom_client()
+
+    async def fake_post_tr(session, api_id, path, body, cont_yn="N", next_key="", max_retries=3):
+        return ({"return_code": 0, "trde_prica_upper": [_trade_value_row("005930", "1000")]}, {"cont-yn": "N"})
+
+    def _boom(*args: Any) -> None:
+        raise OSError("disk full")
+
+    client._post_tr = fake_post_tr
+    with pytest.raises(RawCaptureError):
+        asyncio.run(client.get_trade_value_ranking(object(), max_pages=1, min_trade_value_krw=0, on_page=_boom))
+
+
+def test_kiwoom_trade_value_ranking_vendor_error_returns_soft_failure() -> None:
+    import asyncio
+
+    client = _kiwoom_client()
+
+    async def fake_post_tr(session, api_id, path, body, cont_yn="N", next_key="", max_retries=3):
+        return ({"return_code": 3, "return_msg": "rate limited"}, {"cont-yn": "N"})
+
+    client._post_tr = fake_post_tr
+    res = asyncio.run(client.get_trade_value_ranking(object(), max_pages=3, min_trade_value_krw=0))
+
+    assert res["rt_cd"] == "1"
+    assert res["output"] == []
+    assert res["truncated"] is False
+
+
+def test_kiwoom_trade_value_ranking_request_body_contract() -> None:
+    import asyncio
+
+    client = _kiwoom_client()
+    sent: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def fake_post_tr(session, api_id, path, body, cont_yn="N", next_key="", max_retries=3):
+        sent.append((api_id, path, body))
+        return ({"return_code": 0, "trde_prica_upper": []}, {"cont-yn": "N", "next-key": ""})
+
+    client._post_tr = fake_post_tr
+    asyncio.run(client.get_trade_value_ranking(object(), max_pages=1, min_trade_value_krw=0))
+
+    assert sent == [
+        ("ka10032", "/api/dostk/rkinfo", {"mrkt_tp": "000", "mang_stk_incls": "0", "stex_tp": "1"}),
+    ]
+
 
 
 def test_kiwoom_client_explicit_credentials_win_over_instance(monkeypatch) -> None:
