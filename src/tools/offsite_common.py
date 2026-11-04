@@ -48,3 +48,19 @@ def sha256_file(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def md5_file(path: Path) -> str:
+    """Stream a file's MD5 hex digest (the checksum Drive exposes via `rclone md5sum`; not a security hash).
+
+    Raises:
+        OSError: The file cannot be read.
+    """
+    digest = hashlib.md5()  # noqa: S324 - content checksum, not security
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()

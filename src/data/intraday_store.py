@@ -23,6 +23,7 @@ from src.data.capture_contracts import CaptureStatus, CoverageEntry
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_schema import CANONICAL_BAR_COLUMNS, assert_canonical_bars, assert_canonical_ticks
 from src.data.io_utils import atomic_write_parquet, read_existing_parquet
+from src.data.partition_eviction import require_writable
 from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
 
 logger = logging.getLogger(__name__)
@@ -508,7 +509,10 @@ def _bounded_symbol_replace(
     # 되돌아오는 순환 임포트를 모듈 로드 시점에 막기 위해 호출 시점에만 가져온다.
     from src.data.parquet_codec import INTRADAY_COMPRESSION, PARQUET_COMPRESSION_LEVEL
 
+    require_writable(target)
     with exclusive_file_lock(sidecar_lock_path(target), timeout_seconds=_LOCK_TIMEOUT_SECONDS, purpose="partition"):
+        # Re-check under the partition lock: eviction tombstones and unlinks while holding the same lock.
+        require_writable(target)
         before_count = _partition_row_count(target)
         incoming, replaced = _apply_shrink_guard(
             target, incoming, set(replaced), batch_rows, str(snapshot_date), str(session), frozenset(allow_shrink_symbols),
@@ -605,6 +609,7 @@ def remove_intraday_symbols(bar_interval_minutes: int, snapshot_date: str, sessi
         OSError: Existing evidence or staging/publication fails.
     """
     target = intraday_partition_path(bar_interval_minutes, snapshot_date, session)
+    require_writable(target)
     if not symbols or not target.exists():
         return _partition_row_count(target)
     empty = pd.DataFrame({c: pd.Series(dtype="object") for c in CANONICAL_BAR_COLUMNS})
@@ -650,6 +655,7 @@ def write_intraday_partition(
     bound = _batch_rows_or_default(batch_rows)
     allowed = frozenset(str(item) for item in allow_shrink_symbols)
     target = intraday_partition_path(bar_interval_minutes, snapshot_date, session)
+    require_writable(target)
     if df is None or len(df) == 0:
         if coverage is None:
             return _partition_row_count(target)
@@ -718,6 +724,7 @@ def write_tick_partition(
     bound = _batch_rows_or_default(batch_rows)
     allowed = frozenset(str(item) for item in allow_shrink_symbols)
     target = tick_partition_path(snapshot_date, session)
+    require_writable(target)
     if df is None or len(df) == 0:
         if coverage is None:
             return _partition_row_count(target)
@@ -804,6 +811,7 @@ def write_kis_adjusted_partition(frames: Mapping[str, pd.DataFrame], snapshot_da
     replaced = {str(symbol) for symbol in frames}
     target = kis_adjusted_partition_path(str(snapshot_date), str(session))
     with exclusive_file_lock(sidecar_lock_path(target), timeout_seconds=_LOCK_TIMEOUT_SECONDS, purpose="partition"):
+        require_writable(target)
         existing = read_existing_parquet(target)
         if not existing.empty:
             existing = existing[~existing["symbol"].astype(str).isin(replaced)]

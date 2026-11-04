@@ -272,3 +272,22 @@ def test_build_orderbook_rows_carries_optional_timing_columns() -> None:
     plain = build_orderbook_rows(res, "005930", "NXT", "aftermarket-dense", capture_ts)
     assert "scheduled_at" not in plain[0]
     assert "request_started_at" not in plain[0]
+
+
+def test_append_orderbook_snapshots_refuses_evicted_partition(tmp_path, monkeypatch) -> None:
+    from datetime import datetime
+
+    import pytest
+
+    from src.data import orderbook_store
+    from src.data.partition_eviction import EvictedPartitionError, tombstone_path
+
+    monkeypatch.setattr(orderbook_store.settings, "HISTORY_DIR", tmp_path)
+    target = orderbook_store.orderbook_partition_path("2026-09-04")
+    target.parent.mkdir(parents=True)
+    tombstone_path(target).write_text("{}")
+    rows = [{"capture_ts": datetime(2026, 9, 4, 15, 20), "symbol": "005930", "venue": "J", "capture_reason": "auction"}]
+
+    with pytest.raises(EvictedPartitionError):
+        orderbook_store.append_orderbook_snapshots(rows, "2026-09-04")
+    assert not target.exists()

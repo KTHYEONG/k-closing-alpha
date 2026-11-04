@@ -30,6 +30,7 @@ from src.backfill.intraday.extended_session_backfill import (
     ExtendedBackfillTask,
     _TERMINAL_LEDGER_STATES,
     _stored_partition_symbols,
+    _evicted_task_partition,
     regular_superset_symbols_by_day,
 )
 from src.backfill.intraday.price_basis import PriceReference
@@ -195,6 +196,7 @@ class TossBackfillSummary:
     exhausted: int
     stopped_by_deadline: bool
     outage_aborted: bool
+    evicted: int = 0
 
 
 def _delisted_symbols(ledger: ExtendedBackfillLedger) -> set[str]:
@@ -270,6 +272,7 @@ async def run_toss_regular_backfill(
     not_listed = 0
     failed = 0
     exhausted = 0
+    evicted = 0
     stopped = False
     outage_aborted = False
     unreadable: list[str] = []
@@ -316,6 +319,12 @@ async def run_toss_regular_backfill(
             if not fetchable and not cached:
                 done += 1
                 symbol_days_done += len(task.symbols)
+                continue
+            if _evicted_task_partition(task.snapshot_date, INTRADAY_SESSION_REGULAR):
+                evicted += 1
+                done += 1
+                symbol_days_done += len(task.symbols)
+                logger.warning("[DATA] stage=toss_regular_backfill status=EVICTED date=%s", task.snapshot_date)
                 continue
             run_id = f"toss-regular-{task.snapshot_date}-{uuid.uuid4().hex[:8]}"
             semaphore = asyncio.Semaphore(concurrency)
@@ -504,6 +513,7 @@ async def run_toss_regular_backfill(
         exhausted=exhausted,
         stopped_by_deadline=stopped,
         outage_aborted=outage_aborted,
+        evicted=evicted,
     )
 
 
@@ -560,6 +570,7 @@ async def run_toss_consolidated_backfill(
     not_listed = 0
     failed = 0
     exhausted = 0
+    evicted = 0
     stopped = False
     outage_aborted = False
     unreadable: list[str] = []
@@ -606,6 +617,12 @@ async def run_toss_consolidated_backfill(
             if not fetchable and not cached:
                 done += 1
                 symbol_days_done += len(task.symbols)
+                continue
+            if _evicted_task_partition(task.snapshot_date, INTRADAY_SESSION_REGULAR_CONSOLIDATED):
+                evicted += 1
+                done += 1
+                symbol_days_done += len(task.symbols)
+                logger.warning("[DATA] stage=toss_consolidated_backfill status=EVICTED date=%s", task.snapshot_date)
                 continue
             run_id = f"toss-consolidated-{task.snapshot_date}-{uuid.uuid4().hex[:8]}"
             semaphore = asyncio.Semaphore(concurrency)
@@ -802,6 +819,7 @@ async def run_toss_consolidated_backfill(
         exhausted=exhausted,
         stopped_by_deadline=stopped,
         outage_aborted=outage_aborted,
+        evicted=evicted,
     )
 
 
@@ -1015,11 +1033,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 store=store, ledger=ledger, tasks=list(plan.tasks), eod_volumes=eod_volumes,
             )
             logger.info(
-                "[DATA] stage=toss_consolidated_backfill status=%s tasks_done=%d tasks_remaining=%d complete=%d consolidated=%d not_listed=%d failed=%d exhausted=%d stopped_by_deadline=%s outage_aborted=%s",
+                "[DATA] stage=toss_consolidated_backfill status=%s tasks_done=%d tasks_remaining=%d complete=%d consolidated=%d not_listed=%d failed=%d exhausted=%d evicted=%d stopped_by_deadline=%s outage_aborted=%s",
                 "OUTAGE_ABORT" if summary.outage_aborted else "DONE",
                 summary.tasks_done, summary.tasks_remaining, summary.complete,
                 summary.consolidated, summary.not_listed, summary.failed,
-                summary.exhausted, summary.stopped_by_deadline, summary.outage_aborted,
+                summary.exhausted, summary.evicted, summary.stopped_by_deadline, summary.outage_aborted,
             )
             if summary.outage_aborted:
                 return 1
@@ -1046,11 +1064,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 store=store, ledger=ledger, tasks=list(plan.tasks), eod_volumes=eod_volumes,
             )
             logger.info(
-                "[DATA] stage=toss_regular_backfill status=%s tasks_done=%d tasks_remaining=%d complete=%d consolidated=%d not_listed=%d failed=%d exhausted=%d stopped_by_deadline=%s outage_aborted=%s",
+                "[DATA] stage=toss_regular_backfill status=%s tasks_done=%d tasks_remaining=%d complete=%d consolidated=%d not_listed=%d failed=%d exhausted=%d evicted=%d stopped_by_deadline=%s outage_aborted=%s",
                 "OUTAGE_ABORT" if summary.outage_aborted else "DONE",
                 summary.tasks_done, summary.tasks_remaining, summary.complete,
                 summary.consolidated, summary.not_listed, summary.failed,
-                summary.exhausted, summary.stopped_by_deadline, summary.outage_aborted,
+                summary.exhausted, summary.evicted, summary.stopped_by_deadline, summary.outage_aborted,
             )
             if summary.outage_aborted:
                 return 1

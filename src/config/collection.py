@@ -51,6 +51,11 @@ class CollectionSettings(EnvSettings):
         COLLECTION_BACKFILL_SLOTS: Explicit backfill key slots, default empty.
         [redacted]
         COLLECTION_KIS_MINUTE_RETENTION_DAYS: KIS minute history window, default 365.
+        HISTORY_EVICTION_ENABLED: Evict offsite-verified history partitions behind tombstones, default False.
+        HISTORY_EVICTION_BARS_RETENTION_DAYS: Local retention of intraday/1m and 1m_kis_adjusted partitions, default 400.
+        HISTORY_EVICTION_TICKS_RETENTION_DAYS: Local retention of intraday/ticks partitions, default 40.
+        HISTORY_EVICTION_SAMEDAY_RETENTION_DAYS: Local retention of orderbook, auction_path and research partitions, default 40.
+        HISTORY_EVICTION_MAX_FILES_PER_RUN: Eviction cap per prune run, default 400.
         COLLECTION_BACKFILL_STOP_HHMMSS: KST wall time after which no new task starts, default 065000.
         COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX: Audit WARN threshold on newly EXHAUSTED keys, default 100.
         COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS: KST wall time bounding the audit window, default 230000.
@@ -144,6 +149,11 @@ class CollectionSettings(EnvSettings):
     COLLECTION_BACKFILL_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     [redacted]
     COLLECTION_KIS_MINUTE_RETENTION_DAYS: int = Field(default=365, gt=0)
+    HISTORY_EVICTION_ENABLED: bool = Field(default=False)
+    HISTORY_EVICTION_BARS_RETENTION_DAYS: int = Field(default=400, gt=0)
+    HISTORY_EVICTION_TICKS_RETENTION_DAYS: int = Field(default=40, gt=0)
+    HISTORY_EVICTION_SAMEDAY_RETENTION_DAYS: int = Field(default=40, gt=0)
+    HISTORY_EVICTION_MAX_FILES_PER_RUN: int = Field(default=400, gt=0)
     COLLECTION_BACKFILL_STOP_HHMMSS: str = Field(default="065000", pattern=r"^\d{6}$")
     COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX: int = Field(default=100, ge=0)
     COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS: str = Field(default="230000", pattern=r"^\d{6}$")

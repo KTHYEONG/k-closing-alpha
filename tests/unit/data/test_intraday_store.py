@@ -1262,3 +1262,37 @@ def test_remove_intraday_symbols_not_blocked_by_stored_zero_prices(tmp_path: Pat
     assert stored["symbol"].tolist() == ["Y"]
     assert stored["close"].tolist() == [50000]
 
+
+
+def _tombstone(target: Path) -> None:
+    from src.data.partition_eviction import tombstone_path
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tombstone_path(target).write_text("{}")
+
+
+def test_writers_refuse_evicted_partition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data.partition_eviction import EvictedPartitionError
+
+    monkeypatch.setattr(intraday_store.settings, "HISTORY_DIR", tmp_path)
+    day = "2026-09-03"
+    bars = _canon_bar("005930", day)
+    tick_raw = pd.DataFrame({"time": ["090300"], "close": [70000], "jdiff_vol": [1000]})
+    ticks = normalize_tick_frame(tick_raw, "ls", day, "005930")
+    targets = [
+        intraday_store.intraday_partition_path(1, day, "regular"),
+        intraday_store.tick_partition_path(day, "regular"),
+        intraday_store.kis_adjusted_partition_path(day, "regular"),
+    ]
+    for target in targets:
+        _tombstone(target)
+
+    with pytest.raises(EvictedPartitionError):
+        intraday_store.write_intraday_partition(bars, 1, day, "regular")
+    with pytest.raises(EvictedPartitionError):
+        intraday_store.remove_intraday_symbols(1, day, "regular", {"005930"})
+    with pytest.raises(EvictedPartitionError):
+        intraday_store.write_tick_partition(ticks, day, "regular")
+    with pytest.raises(EvictedPartitionError):
+        intraday_store.write_kis_adjusted_partition({"005930": bars}, day, "regular")
+    assert not any(target.exists() for target in targets)

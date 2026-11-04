@@ -61,12 +61,14 @@ from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.intraday_store import (
     intraday_partition_path,
+    kis_adjusted_partition_path,
     remove_intraday_symbols,
     write_intraday_partition,
     write_kis_adjusted_partition,
 )
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.data.io_utils import atomic_write_parquet, read_existing_parquet
+from src.data.partition_eviction import is_evicted, stored_symbols
 from src.utils.cli_logging import configure_cli_logging
 from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
 
@@ -851,6 +853,7 @@ class ExtendedBackfillSummary:
     deterministic_failed: int = 0
     deterministic_exhausted: int = 0
     adjusted_kept: int = 0
+    evicted: int = 0
 
 
 def classify_extended_backfill_outcome(summary: ExtendedBackfillSummary) -> tuple[str, str]:
@@ -868,16 +871,14 @@ def classify_extended_backfill_outcome(summary: ExtendedBackfillSummary) -> tupl
 
 
 def _stored_partition_symbols(snapshot_date: str, session: str) -> set[str]:
-    target = intraday_partition_path(1, str(snapshot_date), str(session))
-    if not target.exists():
-        return set()
-    try:
-        existing = pd.read_parquet(target, columns=["symbol"])
-    except Exception as exc:
-        raise OSError(f"Cannot read existing partition evidence: {target}") from exc
-    if existing.empty or "symbol" not in existing.columns:
-        return set()
-    return {str(item) for item in existing["symbol"].astype(str).tolist()}
+    return stored_symbols(intraday_partition_path(1, str(snapshot_date), str(session)))
+
+
+def _evicted_task_partition(snapshot_date: str, session: str) -> bool:
+    """True when a raw or adjusted 1m partition of the task was evicted, so every write would be refused."""
+    return is_evicted(intraday_partition_path(1, str(snapshot_date), str(session))) or is_evicted(
+        kis_adjusted_partition_path(str(snapshot_date), str(session))
+    )
 
 
 @dataclass(frozen=True)
@@ -1061,6 +1062,7 @@ async def run_extended_session_backfill(
     deterministic_exhausted = 0
     pending_conflicts = 0
     adjusted_kept = 0
+    evicted = 0
     stopped = False
     unreadable: list[str] = []
     async with AsyncExitStack() as stack:
@@ -1092,6 +1094,14 @@ async def run_extended_session_backfill(
                 for symbol in task.symbols
                 if (symbol not in terminal and symbol not in stored) or symbol in repair_candidates
             ]
+            if pending and _evicted_task_partition(task.snapshot_date, task.session):
+                evicted += 1
+                done += 1
+                logger.warning(
+                    "[DATA] stage=extended_backfill status=EVICTED date=%s session=%s pending=%d",
+                    task.snapshot_date, task.session, len(pending),
+                )
+                continue
             repaired = sum(1 for symbol in pending if symbol in repair_candidates)
             run_id = f"extended-backfill-{task.snapshot_date}-{task.session}-{uuid.uuid4().hex[:8]}"
             pending_conflict = 0
@@ -1331,6 +1341,7 @@ async def run_extended_session_backfill(
         deterministic_failed=deterministic_failed,
         deterministic_exhausted=deterministic_exhausted,
         adjusted_kept=adjusted_kept,
+        evicted=evicted,
     )
 
 
@@ -1530,7 +1541,7 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
 
     kis_summary = asyncio.run(_run())
     logger.info(
-        "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d exhausted=%d deterministic_failed=%d deterministic_exhausted=%d pending_conflicts=%d stopped_by_deadline=%s",
+        "[DATA] stage=extended_backfill status=DONE tasks_done=%d tasks_remaining=%d complete=%d no_trades=%d not_listed=%d failed=%d exhausted=%d deterministic_failed=%d deterministic_exhausted=%d pending_conflicts=%d evicted=%d stopped_by_deadline=%s",
         kis_summary.tasks_done,
         kis_summary.tasks_remaining,
         kis_summary.complete,
@@ -1541,6 +1552,7 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
         kis_summary.deterministic_failed,
         kis_summary.deterministic_exhausted,
         kis_summary.pending_conflicts,
+        kis_summary.evicted,
         kis_summary.stopped_by_deadline,
     )
     outcome, reason = classify_extended_backfill_outcome(kis_summary)

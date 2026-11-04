@@ -19,7 +19,15 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from src import settings
+from src.config.collection import CollectionSettings
 from src.data.capture_store import resolve_capture_root as _capture_root
+from src.data.partition_eviction import (
+    EvictionReport,
+    evict_verified_partitions,
+    eviction_families,
+    validate_retention,
+)
 from src.tools.capture_offsite import LocalRetentionReport, prune_local_sealed_capture
 from src.tools.offsite_common import DATED_DIR_RE, OFFSITE_REMOTE_BASE, resolve_rclone_bin
 from src.utils.cli_logging import configure_cli_logging
@@ -34,6 +42,7 @@ BACKUP_RETENTION_DAYS: int = 30
 BACKUP_MAX_PURGE_DIRS_PER_SUBTREE: int = 7
 # The sealed-capture prune holds the shared Drive lock; bounded so a backlog cannot starve the nightly backup or neighbours.
 SEALED_PRUNE_BUDGET: timedelta = timedelta(minutes=40)
+HISTORY_EVICTION_BUDGET: timedelta = timedelta(minutes=30)
 LOCAL_INTRADAY_BACKUP_RETENTION_DAYS: int = 3
 RCLONE_TIMEOUT_SEC: int = 600
 # rclone 문서화된 종료코드: 3 = directory not found (아직 한 번도 옮겨진 파일이 없는 하위 트리)
@@ -185,6 +194,7 @@ def main(argv: list[str] | None = None) -> None:
     purged: list[str] = []
     local_purged: list[str] = []
     sealed_report = LocalRetentionReport(removed=(), kept=(), bytes_removed=0)
+    history_report = EvictionReport(evicted=(), kept=(), bytes_freed=0, stopped_by_deadline=False, capped=False)
     steps: list[tuple[str, Callable[[], None]]] = []
 
     def _run_remote() -> None:
@@ -204,7 +214,29 @@ def main(argv: list[str] | None = None) -> None:
             deadline=datetime.now(_KST) + SEALED_PRUNE_BUDGET,
         )
 
-    steps = [("remote", _run_remote), ("local_intraday", _run_local), ("local_sealed", _run_sealed)]
+    def _run_history() -> None:
+        nonlocal history_report
+        profile = CollectionSettings()
+        if not profile.HISTORY_EVICTION_ENABLED:
+            logger.info("[SYS] stage=backup_prune step=local_history status=disabled")
+            return
+        validate_retention(profile)
+        history_report = evict_verified_partitions(
+            history_dir=Path(settings.HISTORY_DIR),
+            today=today.date(),
+            families=eviction_families(profile),
+            remote_base=f"{OFFSITE_REMOTE_BASE}/data/history",
+            dry_run=args.dry_run,
+            deadline=datetime.now(_KST) + HISTORY_EVICTION_BUDGET,
+            max_files=profile.HISTORY_EVICTION_MAX_FILES_PER_RUN,
+        )
+
+    steps = [
+        ("remote", _run_remote),
+        ("local_intraday", _run_local),
+        ("local_sealed", _run_sealed),
+        ("local_history", _run_history),
+    ]
     for name, fn in steps:
         try:
             fn()
@@ -212,9 +244,10 @@ def main(argv: list[str] | None = None) -> None:
             logger.exception("[SYS] stage=backup_prune step=%s status=failed", name)
             failures.append(name)
     logger.info(
-        "[SYS] stage=backup_prune dry_run=%s purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d sealed_skipped=%s",
+        "[SYS] stage=backup_prune dry_run=%s purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d sealed_skipped=%s history_evicted=%d history_bytes=%d history_kept=%d",
         args.dry_run, len(purged), purged, len(local_purged), local_purged,
         len(sealed_report.removed), sealed_report.bytes_removed, len(sealed_report.kept), sealed_report.skipped_reason,
+        len(history_report.evicted), history_report.bytes_freed, len(history_report.kept),
     )
     logger.debug("[SYS] stage=backup_prune sealed_kept=%s", sealed_report.kept)
     if failures:

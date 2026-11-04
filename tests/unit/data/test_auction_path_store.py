@@ -126,3 +126,17 @@ def test_auction_path_rejects_malformed_hour_and_negative_quantity() -> None:
         build_auction_path_rows([_row("1525")], snapshot_date=DATE, symbol="005930", available_at=AT)
     with pytest.raises(ValueError, match="negative quantity"):
         build_auction_path_rows([_row("152500", buy="-5", sell="5")], snapshot_date=DATE, symbol="005930", available_at=AT)
+
+
+def test_auction_path_writer_refuses_evicted_partition(monkeypatch, tmp_path) -> None:
+    from src.data.partition_eviction import EvictedPartitionError, tombstone_path
+
+    monkeypatch.setattr(store.settings, "HISTORY_DIR", tmp_path / "history")
+    target = auction_path_partition_path(DATE)
+    target.parent.mkdir(parents=True)
+    tombstone_path(target).write_text("{}")
+    frame = build_auction_path_rows([_row("152500")], snapshot_date=DATE, symbol="005930", available_at=AT)
+
+    with pytest.raises(EvictedPartitionError):
+        write_auction_path_partition(frame, DATE)
+    assert not target.exists()

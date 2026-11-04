@@ -12,6 +12,7 @@ import pandas as pd
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet, read_existing_parquet
+from src.data.partition_eviction import require_writable
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ def append_orderbook_snapshots(rows: list[dict[str, Any]], snapshot_date: str, *
     if not rows:
         return 0
     target = orderbook_partition_path(snapshot_date, session)
+    require_writable(target)
     new_df = pd.DataFrame(rows)
     existing = read_existing_parquet(target)
     if len(existing) == 0:

@@ -76,3 +76,15 @@ def test_read_missing_partition_raises() -> None:
 
 def test_module_exposes_research_directory_name() -> None:
     assert research_store.RESEARCH_DIR_NAME == "research"
+
+
+def test_research_writer_refuses_evicted_partition() -> None:
+    from src.data.partition_eviction import EvictedPartitionError, tombstone_path
+
+    target = research_partition_path("postclose_strength", DATE)
+    target.parent.mkdir(parents=True)
+    tombstone_path(target).write_text("{}")
+
+    with pytest.raises(EvictedPartitionError):
+        write_research_partition(pd.DataFrame({"symbol": ["A"]}), "postclose_strength", DATE, overwrite=True)
+    assert not target.exists()
