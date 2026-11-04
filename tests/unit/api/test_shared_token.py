@@ -14,6 +14,7 @@ from src.api.shared_token import (
     IssuedToken,
     SharedTokenStore,
     TokenStoreLockTimeout,
+    TokenStoreReadError,
     shared_token_path,
 )
 
@@ -245,7 +246,7 @@ def test_lock_timeout(tmp_path: Path) -> None:
         os.close(fd)
 
 
-def test_corrupt_file_treated_as_absent(tmp_path: Path) -> None:
+def test_corrupt_file_prevents_issuance(tmp_path: Path) -> None:
     path = tmp_path / "t.json"
     path.write_text("not-json{{{", encoding="utf-8")
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
@@ -257,14 +258,15 @@ def test_corrupt_file_treated_as_absent(tmp_path: Path) -> None:
         vendor="toss",
         issue_throttle_policy="raise",
     )
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
 
     async def _issue() -> IssuedToken:
-        return IssuedToken(access_token="tok-new", expires_in_seconds=3600.0)
+        raise AssertionError("corrupt token state must prevent issuance")
 
-    rec = asyncio.run(store.get_or_issue(_issue))
-    assert rec.access_token == "tok-new"
-    assert rec.generation == 1
+    with pytest.raises(TokenStoreReadError, match="record is malformed"):
+        asyncio.run(store.get_or_issue(_issue))
+    assert path.read_text(encoding="utf-8") == "not-json{{{"
 
 
 def test_no_secret_persisted_and_exact_keys(tmp_path: Path) -> None:
@@ -344,7 +346,7 @@ def test_double_checked_read_after_lock(tmp_path: Path, monkeypatch) -> None:
     assert calls["n"] == 0
 
 
-def test_schema_invalid_variants_return_none(tmp_path: Path) -> None:
+def test_schema_invalid_variants_fail_closed(tmp_path: Path) -> None:
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
     aware = now.isoformat()
     naive = "2026-10-01T12:00:00"
@@ -373,10 +375,11 @@ def test_schema_invalid_variants_return_none(tmp_path: Path) -> None:
             vendor="toss",
             issue_throttle_policy="raise",
         )
-        assert store.read() is None, i
+        with pytest.raises(TokenStoreReadError, match="schema is invalid"):
+            store.read()
 
 
-def test_read_unreadable_logged(tmp_path: Path, monkeypatch) -> None:
+def test_read_unreadable_fails_closed(tmp_path: Path, monkeypatch) -> None:
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
     store = SharedTokenStore(
         tmp_path / "t.json",
@@ -391,7 +394,8 @@ def test_read_unreadable_logged(tmp_path: Path, monkeypatch) -> None:
         raise PermissionError("denied")
 
     monkeypatch.setattr(Path, "read_text", _boom)
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
 
 
 def test_no_expiry_token_is_usable_and_none_expiry_persisted(tmp_path: Path) -> None:
