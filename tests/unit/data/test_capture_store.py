@@ -525,6 +525,26 @@ def test_read_decision_rejects_cohortless_or_inputless_manifest(tmp_path: Path) 
         store.read_decision("2026-09-17", available_by=completed + timedelta(minutes=1), run_id="run-3")
 
 
+def test_later_cohortless_task_manifest_never_hijacks_unnamed_decision_read(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    decided = START + timedelta(minutes=1)
+    _publish_decision(store, "run-1", decided)
+    input_ref = store.read_manifests("2026-09-17")[0].artifacts[0]
+    task = CaptureManifest(
+        schema_version=1,
+        context=_context(run_id="auction-close-1"),
+        cohort=None,
+        completed_at=decided + timedelta(minutes=8),
+        entries=(),
+        artifacts=(input_ref,),
+        status=CaptureStatus.COMPLETE,
+    )
+    store.publish_manifest(task)
+    frame = store.read_decision("2026-09-17", available_by=decided + timedelta(minutes=9))
+    assert frame["capture_run_id"].iloc[0] == "run-1"
+    assert store.read_cohort("2026-09-17", available_by=decided + timedelta(minutes=9)).cohort_id == _cohort().cohort_id
+
+
 def test_read_validates_cutoff_date_and_identity(tmp_path: Path) -> None:
     store = CaptureStore(tmp_path / "capture")
     completed = START + timedelta(minutes=4)
