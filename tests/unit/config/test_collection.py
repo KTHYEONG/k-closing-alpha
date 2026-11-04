@@ -300,7 +300,7 @@ def test_collection_pit_backfill_defaults(monkeypatch: pytest.MonkeyPatch) -> No
         profile.COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M,
         profile.COLLECTION_PIT_BACKFILL_MIN_MARKET_CAP_100M,
         profile.COLLECTION_PIT_BACKFILL_COMMON_STOCK_ONLY,
-    ) == (True, 0.01, 0.12, 100.0, 495.0, False)
+    ) == (True, -1.0, 1.0, 100.0, 495.0, False)
 
 
 def test_collection_pit_backfill_rejects_empty_band() -> None:

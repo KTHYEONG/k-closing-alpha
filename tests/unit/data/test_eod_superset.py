@@ -24,7 +24,7 @@ def _rows(records: list[dict]) -> pd.DataFrame:
 
 
 def test_eod_superset_mask_bounds_are_inclusive_exclusive() -> None:
-    screen = _screen()
+    screen = _screen(COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO=0.01, COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO=0.12)
     panel = _rows([
         {"symbol": "005930", "chg_ratio": 0.01, "tv_clean": 100.0, "mc_clean": 495.0, "volume": 10.0},
         {"symbol": "000660", "chg_ratio": 0.12, "tv_clean": 500.0, "mc_clean": 900.0, "volume": 10.0},
@@ -98,3 +98,32 @@ def test_eod_superset_mask_names_missing_columns() -> None:
     with pytest.raises(ValueError, match="tv_clean") as exc:
         eod_superset_mask(panel, _screen())
     assert "mc_clean" in str(exc.value)
+
+
+def test_default_profile_contains_training_screen() -> None:
+    EodSupersetScreen.from_profile(CollectionSettings(_env_file=None))
+
+
+def test_default_superset_admits_down_and_limit_moves() -> None:
+    chg = [-0.25, -0.05, 0.0, 0.15, 0.29]
+    panel = pd.DataFrame({
+        "symbol": [f"{100000 + i:06d}" for i in range(len(chg))],
+        "chg_ratio": chg,
+        "tv_clean": [150.0] * len(chg),
+        "mc_clean": [800.0] * len(chg),
+        "volume": [1000.0] * len(chg),
+    })
+    mask = eod_superset_mask(panel, EodSupersetScreen.from_profile(CollectionSettings(_env_file=None)))
+    assert mask.tolist() == [True] * len(chg)
+
+
+def test_default_superset_keeps_liquidity_floors() -> None:
+    panel = pd.DataFrame({
+        "symbol": ["100000", "100001"],
+        "chg_ratio": [0.05, 0.05],
+        "tv_clean": [99.9, 150.0],
+        "mc_clean": [800.0, 494.9],
+        "volume": [1000.0, 1000.0],
+    })
+    mask = eod_superset_mask(panel, EodSupersetScreen.from_profile(CollectionSettings(_env_file=None)))
+    assert mask.tolist() == [False, False]
