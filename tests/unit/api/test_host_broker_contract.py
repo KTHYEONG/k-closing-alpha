@@ -22,6 +22,7 @@ from src.api.host_broker_contract import (
     TokenRecord,
     TokenStore,
     TokenStoreLockTimeout,
+    TokenStoreReadError,
     admission_state_path,
     credential_digest,
     issue_guard_path,
@@ -80,9 +81,7 @@ def test_scope_case_preserved(tmp_path: Path) -> None:
         admission_state_path(tmp_path, "toss", "")
 
 
-def test_schema_strict(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    import logging
-
+def test_schema_strict(tmp_path: Path) -> None:
     aware = _NOW.isoformat()
     naive = "2026-10-01T12:00:00"
     cases: list[object] = [
@@ -95,9 +94,8 @@ def test_schema_strict(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None
         path = tmp_path / f"bad{i}.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         store = _async_store(path)
-        with caplog.at_level(logging.WARNING):
-            assert store.read() is None
-    assert any("SCHEMA_INVALID" in r.getMessage() for r in caplog.records)
+        with pytest.raises(TokenStoreReadError, match="schema is invalid"):
+            store.read()
 
 
 def test_single_issuance_under_contention(tmp_path: Path) -> None:
@@ -379,7 +377,7 @@ def test_vendored_copy_hash_pinned() -> None:
     lines = src.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "# canonical: krx-alpha/deploy/shared/host_broker_contract.py contract=v1"
     digest = hashlib.sha256(src.read_bytes()).hexdigest()
-    assert digest == "0bfab4ccae0f0921a32493492683014e1e080e708db3d92473731a5c4eb0b0c1"
+    assert digest == "2a01bb7a31650dda4e2c570cf6a45fdc8f8a95d292b1291e4a102deaba4a5e25"
     assert isinstance(TokenRecord(access_token="x", issued_at=_NOW, expires_at=None, generation=1), TokenRecord)
     assert TokenStoreLockTimeout.__name__ == "TokenStoreLockTimeout"
 
@@ -414,13 +412,14 @@ def test_store_init_rejects_bad_args(tmp_path: Path) -> None:
         HostPacer(tmp_path / "s.state", 1.0, max_lead_seconds=0.0)
 
 
-def test_guard_open_failure_treated_as_no_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_guard_open_failure_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import os as _os
 
     import src.api.host_broker_contract as hbc
 
     monkeypatch.setattr(_os, "open", lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
-    assert hbc._read_guard_value(tmp_path / "g.state") is None
+    with pytest.raises(TokenStoreReadError, match="guard is unreadable"):
+        hbc._read_guard_value(tmp_path / "g.state")
     assert hbc._throttle_delay_seconds("toss", None, 1000.0) == 0.0
     assert hbc._throttle_delay_seconds("toss", tmp_path / "g.state", 1000.0) == 0.0
 
@@ -670,12 +669,13 @@ def test_nonfinite_limits_rejected(tmp_path: Path, value: float) -> None:
 
 
 @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", ""])
-def test_nonfinite_host_files_recover(tmp_path: Path, raw: str) -> None:
+def test_nonfinite_token_guard_fails_closed_and_admission_state_recovers(tmp_path: Path, raw: str) -> None:
     import src.api.host_broker_contract as hbc
 
     guard = tmp_path / "guard.state"
     guard.write_text(raw, encoding="ascii")
-    assert hbc._read_guard_value(guard) is None
+    with pytest.raises(TokenStoreReadError, match="guard is malformed"):
+        hbc._read_guard_value(guard)
     state = tmp_path / "admission.state"
     state.write_text(raw, encoding="ascii")
     HostPacer(state, 4.0, clock=lambda: 1000.0).acquire()
@@ -686,9 +686,11 @@ def test_malformed_records_and_scope_rejected(tmp_path: Path) -> None:
     path = tmp_path / "token.json"
     path.write_text(json.dumps({"schema_version": True, "access_token": "a", "issued_at": _NOW.isoformat(),
                                 "expires_at": None, "generation": 1}), encoding="utf-8")
-    assert _async_store(path).read() is None
+    with pytest.raises(TokenStoreReadError):
+        _async_store(path).read()
     path.write_bytes(b"\xff")
-    assert _async_store(path).read() is None
+    with pytest.raises(TokenStoreReadError):
+        _async_store(path).read()
     with pytest.raises(ValueError, match="scope"):
         admission_state_path(tmp_path, "toss", "k", "STOCK_TRADING_TREND\n")
 

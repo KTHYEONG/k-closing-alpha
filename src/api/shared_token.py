@@ -10,6 +10,7 @@ from src.api.host_broker_contract import (
     TokenIssueThrottled,
     TokenRecord,
     TokenStoreLockTimeout,
+    TokenStoreReadError,
     token_record_path,
 )
 from src.api.kis.rate_limit import resolve_admission_dir
@@ -28,5 +29,6 @@ __all__ = [
     "TokenIssueThrottled",
     "TokenRecord",
     "TokenStoreLockTimeout",
+    "TokenStoreReadError",
     "shared_token_path",
 ]

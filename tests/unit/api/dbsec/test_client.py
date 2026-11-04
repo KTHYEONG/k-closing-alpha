@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from src.api.dbsec.client import DbsecApiClient, DbsecTokenThrottled
-from src.api.host_broker_contract import issue_guard_path
+from src.api.host_broker_contract import TokenStoreReadError, issue_guard_path
 from src.data.capture_contracts import ChartBudget
 from tests.broker_fakes import FakeBrokerResponse, scripted_session
 
@@ -92,7 +92,7 @@ def test_refresh_vendor_throttle_reraises_subclass(tmp_path, monkeypatch) -> Non
     client = DbsecApiClient(app_key="k", app_secret="s")
     seed = scripted_session([], token_bodies=[{"access_token": "tok-1", "expires_in": 86400}])
     assert asyncio.run(client.ensure_token(seed)) == "tok-1"
-    from src.api.host_broker_contract import issue_guard_path as _guard
+    from src.api.host_broker_contract import TokenStoreReadError, issue_guard_path as _guard
 
     _guard(tmp_path, "dbsec", "k").unlink(missing_ok=True)
     throttled = scripted_session([], token_bodies=[{"error_code": "IGW00201"}])
@@ -296,12 +296,20 @@ def test_client_rejects_malformed_code_before_send() -> None:
 def test_token_pacing_helpers_edge_cases(tmp_path, monkeypatch) -> None:
     _seed_admission(tmp_path, monkeypatch)
     path = issue_guard_path(tmp_path, "dbsec", "k")
-    path.write_text("not-a-float")
     client = DbsecApiClient(app_key="k", app_secret="s")
     session = scripted_session([], token_bodies=[{"access_token": "good", "expires_in": 86400}])
+    for raw in ("not-a-float", ""):
+        path.write_text(raw)
+        with pytest.raises(TokenStoreReadError, match="guard is malformed"):
+            asyncio.run(client.ensure_token(session))
+        assert session.requests == []
+        assert client.token is None
+        assert path.read_text() == raw
+    path.write_text("0.0")
     assert asyncio.run(client.ensure_token(session)) == "good"
     path.write_text("")
     assert asyncio.run(client.ensure_token(session)) == "good"
+    assert len(session.requests) == 1
 
 
 def test_rows_of_dict_and_missing_out() -> None:
