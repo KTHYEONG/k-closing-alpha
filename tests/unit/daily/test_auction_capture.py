@@ -1775,3 +1775,166 @@ def test_degraded_slot_marks_manifest_partial(tmp_path) -> None:
         )
     )
     assert manifest.status == CaptureStatus.PARTIAL
+
+
+def _publish_research_roster(store: Any, trading_date: str, members: list[str], *, completed_at: dt.datetime) -> None:
+    from src.data.research_roster import ResearchRoster, RosterCandidate, build_roster_frame, publish_research_roster
+
+    day = dt.date.fromisoformat(trading_date)
+    roster = ResearchRoster(
+        trading_date=day,
+        roster_id=f"research-roster-{trading_date}",
+        rule_version="liquid_any_direction@v1",
+        observed_at=completed_at - dt.timedelta(seconds=5),
+        as_of_panel_date=day - dt.timedelta(days=1),
+        members=tuple(members),
+        dropped={},
+        truncated=False,
+    )
+    candidates = [
+        RosterCandidate(symbol=member, rank=rank, trade_value_100m=500.0, change_pct=0.0, last_price=10_000)
+        for rank, member in enumerate(members, start=1)
+    ]
+    frame = build_roster_frame(candidates, roster.members, {}, dict.fromkeys(roster.members, 10_000.0))
+    publish_research_roster(store, roster, frame, raw_refs=(), completed_at=completed_at)
+
+
+def _close_run(root: Path, client: Any, *, enabled: bool, state: dict[str, dt.datetime] | None = None) -> tuple[Any, Any]:
+    from src.daily import auction_capture
+
+    store = _store(root)
+    _publish_cohort(store, "2026-09-17", ["000001", "000002"])
+    _publish_research_roster(store, "2026-09-17", ["000003"], completed_at=_seoul(2026, 9, 17, 15, 0))
+    profile = _profile(root, COLLECTION_RESEARCH_ROSTER_ENABLED=enabled)
+    clock_state = state if state is not None else {"now": _seoul(2026, 9, 17, 15, 20)}
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=profile,
+            store=store,
+            clients=[client],
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: clock_state["now"],
+        )
+    )
+    return store, manifest
+
+
+def test_close_primary_manifest_unchanged_with_extras(tmp_path) -> None:
+    """Extras never alter the primary manifest and get their own sibling manifest."""
+    from src.daily.auction_capture import close_rounds, program_rounds
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    off_store, off = _close_run(tmp_path / "off", _FakeClient(calls=[]), enabled=False)
+    on_store, on = _close_run(tmp_path / "on", _FakeClient(calls=[]), enabled=True)
+
+    def _shape(manifest: Any) -> list[tuple[str, str, dt.datetime, str]]:
+        return sorted((e.symbol, e.dataset.value, e.scheduled_at, e.status.value) for e in manifest.entries)
+
+    assert _shape(on) == _shape(off)
+    assert {e.symbol for e in on.entries} == {"000001", "000002"}
+    assert on.status == off.status == CaptureStatus.COMPLETE
+    assert on.context.cohort_id == off.context.cohort_id
+    research = [m for m in on_store.read_manifests("2026-09-17") if m.context.capture_reason == "auction-close-research"]
+    assert len(research) == 1
+    assert {e.symbol for e in research[0].entries} == {"000003"}
+    clock = _clock("2026-09-17")
+    expected = {(CaptureDataset.ORDERBOOK, slot) for slot in close_rounds(clock, 60)} | {
+        (CaptureDataset.PROGRAM, slot) for slot in program_rounds(clock)
+    }
+    assert {(e.dataset, e.scheduled_at) for e in research[0].entries} == expected
+    assert not [m for m in off_store.read_manifests("2026-09-17") if m.context.capture_reason.endswith("-research")]
+
+
+def test_close_extras_dispatched_after_cohort(tmp_path) -> None:
+    """Every round requests the cohort before any extra."""
+    from src.daily.auction_capture import close_rounds, program_rounds
+
+    client = _FakeClient(calls=[])
+    _close_run(tmp_path, client, enabled=True)
+
+    rounds = len(close_rounds(_clock("2026-09-17"), 60))
+    assert [code for kind, code in client.calls if kind == "orderbook"] == ["000001", "000002", "000003"] * rounds
+    assert [code for kind, code in client.calls if kind == "program"] == ["000001", "000002", "000003"] * len(
+        program_rounds(_clock("2026-09-17"))
+    )
+
+
+def test_close_deadline_hits_extras_first(tmp_path, monkeypatch) -> None:
+    """At the round deadline the cohort is complete while the extra is dispatched as a deadline miss."""
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    monkeypatch.setattr(auction_capture, "program_rounds", lambda clock: [])
+    state = {"now": _seoul(2026, 9, 17, 15, 20)}
+    round_start = _seoul(2026, 9, 17, 15, 21)
+    round_deadline = _seoul(2026, 9, 17, 15, 22)
+
+    class _DeadlineClient(_FakeClient):
+        async def get_orderbook_snapshot(self, session: Any, code: str, market_div_code: str | None = None) -> dict[str, Any]:
+            if code == "000002" and state["now"] < round_deadline:
+                state["now"] = round_deadline
+            return await super().get_orderbook_snapshot(session, code, market_div_code)
+
+    store, manifest = _close_run(tmp_path, _DeadlineClient(calls=[]), enabled=True, state=state)
+
+    assert manifest.status == CaptureStatus.COMPLETE
+    first_round = [e for e in manifest.entries if e.scheduled_at == round_start]
+    assert {e.symbol: e.status for e in first_round} == {"000001": CaptureStatus.COMPLETE, "000002": CaptureStatus.COMPLETE}
+    research = [m for m in store.read_manifests("2026-09-17") if m.context.capture_reason == "auction-close-research"]
+    assert len(research) == 1
+    assert research[0].status == CaptureStatus.PARTIAL
+    (extra,) = [e for e in research[0].entries if e.scheduled_at == round_start]
+    assert extra.symbol == "000003"
+    assert extra.dataset == CaptureDataset.ORDERBOOK
+    assert extra.status == CaptureStatus.PARTIAL
+    assert extra.reason == "deadline"
+
+
+def test_open_uses_previous_day_roster(tmp_path, monkeypatch) -> None:
+    """Opening extras come from the previous trading day's roster, never today's."""
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-16", ["000001"])
+    _publish_research_roster(store, "2026-09-16", ["000009"], completed_at=_seoul(2026, 9, 16, 15, 20))
+    _publish_research_roster(store, "2026-09-17", ["000008"], completed_at=_seoul(2026, 9, 17, 8, 0))
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
+    profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=600, COLLECTION_RESEARCH_ROSTER_ENABLED=True)
+    clock = _clock("2026-09-17")
+    state = {"now": _seoul(2026, 9, 17, 8, 30)}
+
+    async def _sleep(seconds: float) -> None:
+        state["now"] += dt.timedelta(seconds=seconds)
+
+    client = _FakeClient(price_seq={"000001": [100], "000008": [100], "000009": [100]}, calls=[])
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="open",
+            profile=profile,
+            store=store,
+            clients=[client],
+            session_clock=clock,
+            now_fn=lambda: state["now"],
+            sleep_fn=_sleep,
+        )
+    )
+
+    assert {e.symbol for e in manifest.entries} == {"000001"}
+    research = [m for m in store.read_manifests("2026-09-17") if m.context.capture_reason == "auction-open-research"]
+    assert len(research) == 1
+    assert {e.symbol for e in research[0].entries} == {"000009"}
+    assert ("price", "000008") not in client.calls
+
+
+def test_flag_off_no_research_manifest(tmp_path) -> None:
+    """A disabled flag ignores a present roster entirely."""
+    client = _FakeClient(calls=[])
+    store, manifest = _close_run(tmp_path, client, enabled=False)
+
+    assert {code for kind, code in client.calls if kind == "orderbook"} == {"000001", "000002"}
+    assert {code for kind, code in client.calls if kind == "program"} == {"000001", "000002"}
+    assert {e.symbol for e in manifest.entries} == {"000001", "000002"}
+    assert not [m for m in store.read_manifests("2026-09-17") if m.context.capture_reason.endswith("-research")]

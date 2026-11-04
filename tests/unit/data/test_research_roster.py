@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,10 @@ from src.data.research_roster import (
     parse_trade_value_rows,
     publish_research_roster,
     read_research_roster,
+    research_extras,
+    research_manifest,
     select_research_roster,
+    split_research_entries,
 )
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -546,3 +550,132 @@ def test_roster_without_members_round_trips(tmp_path: Path) -> None:
 
     assert read.members == ()
     assert read.dropped == {"005930": "below_trade_value"}
+
+
+def _primary_context() -> CaptureContext:
+    return CaptureContext(
+        trading_date=DAY,
+        run_id="auction-close-2026-11-04-ab12cd34",
+        dataset=CaptureDataset.ORDERBOOK,
+        vendor="kis",
+        endpoint="auction-capture",
+        symbol=None,
+        venue="KRX",
+        session="regular",
+        capture_reason="auction-close",
+        cohort_id="cohort-1",
+        scheduled_at=None,
+    )
+
+
+def _coverage(symbol: str | None, *, status: CaptureStatus = CaptureStatus.COMPLETE, refs: tuple[ArtifactRef, ...] = ()) -> CoverageEntry:
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=CaptureDataset.ORDERBOOK,
+        venue="KRX",
+        session="regular",
+        scheduled_at=COMPLETED,
+        status=status,
+        rows=1,
+        first_event_time=COMPLETED,
+        last_event_time=COMPLETED,
+        reason="auction-close",
+        raw_refs=refs,
+    )
+
+
+class _ExplodingStore:
+    def read_manifests(self, snapshot_date: str) -> tuple[()]:
+        raise AssertionError("disabled extras must not read the store")
+
+
+def test_extras_disabled_no_read() -> None:
+    assert research_extras(_ExplodingStore(), "2026-11-04", available_by=COMPLETED, exclude=frozenset(), enabled=False) == ()  # type: ignore[arg-type]
+
+
+def test_extras_missing_roster_warns_empty(tmp_path: Path, caplog: Any) -> None:
+    store = CaptureStore(tmp_path / "capture")
+
+    with caplog.at_level(logging.WARNING, logger="src.data.research_roster"):
+        extras = research_extras(store, "2026-11-04", available_by=COMPLETED, exclude=frozenset(), enabled=True)
+
+    assert extras == ()
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "status=MISSING" in warnings[0].getMessage()
+
+
+def test_extras_unreadable_evidence_warns_empty(tmp_path: Path, caplog: Any) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    _publish_evidence(store, [_valid_frame(), _valid_frame()])
+
+    with caplog.at_level(logging.WARNING, logger="src.data.research_roster"):
+        extras = research_extras(
+            store,
+            "2026-11-04",
+            available_by=COMPLETED + timedelta(minutes=1),
+            exclude=frozenset(),
+            enabled=True,
+        )
+
+    assert extras == ()
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "status=UNREADABLE" in warnings[0].getMessage()
+
+
+def test_extras_exclude_preserves_roster_order(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    _publish_roster(store, _roster(("000001", "000002", "000003", "000004"), {}))
+
+    extras = research_extras(
+        store,
+        "2026-11-04",
+        available_by=COMPLETED + timedelta(minutes=1),
+        exclude={"000002"},
+        enabled=True,
+    )
+
+    assert extras == ("000001", "000003", "000004")
+
+
+def test_split_keeps_symbolless_in_primary() -> None:
+    symbolless = _coverage(None)
+    primary_entry = _coverage("000001")
+    research_entry = _coverage("000003")
+
+    primary, research = split_research_entries((symbolless, primary_entry, research_entry), frozenset({"000003"}))
+
+    assert primary == [symbolless, primary_entry]
+    assert research == [research_entry]
+
+
+def test_research_manifest_identity(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    ref = _raw_ref(store)
+    entry = _coverage("000003", refs=(ref,))
+
+    manifest = research_manifest(_primary_context(), [entry], completed_at=COMPLETED, force_partial=False)
+
+    assert manifest.context.run_id == "auction-close-2026-11-04-ab12cd34-research"
+    assert manifest.context.capture_reason == "auction-close-research"
+    assert manifest.context.cohort_id is None
+    assert manifest.cohort is None
+    assert manifest.artifacts == (ref,)
+    assert manifest.entries == (entry,)
+    assert manifest.status == CaptureStatus.COMPLETE
+
+
+def test_research_manifest_force_partial() -> None:
+    entry = _coverage("000003")
+
+    forced = research_manifest(_primary_context(), [entry], completed_at=COMPLETED, force_partial=True)
+    unforced = research_manifest(_primary_context(), [entry], completed_at=COMPLETED, force_partial=False)
+
+    assert forced.status == CaptureStatus.PARTIAL
+    assert unforced.status == CaptureStatus.COMPLETE
+
+
+def test_research_manifest_rejects_empty() -> None:
+    with pytest.raises(ValueError, match="at least one entry"):
+        research_manifest(_primary_context(), [], completed_at=COMPLETED, force_partial=False)

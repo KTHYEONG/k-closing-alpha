@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Self
@@ -13,6 +14,7 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from src.data.capture_contracts import (
+    GOOD_ENTRY_STATES,
     ArtifactRef,
     CaptureContext,
     CaptureDataset,
@@ -22,6 +24,9 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 
+logger = logging.getLogger(__name__)
+
+RESEARCH_SUFFIX: str = "-research"
 RESEARCH_ROSTER_RULE_VERSION = "liquid_any_direction@v1"
 RESEARCH_ROSTER_REASON = "research-roster"
 RESEARCH_ROSTER_FRAME_COLUMNS: tuple[str, ...] = (
@@ -376,4 +381,102 @@ def read_research_roster(store: CaptureStore, snapshot_date: str, *, available_b
         members=tuple(members_rows["symbol"].astype(str).tolist()),
         dropped={str(row.symbol): str(row.reason) for row in dropped_rows.itertuples(index=False)},
         truncated=chosen.status == CaptureStatus.PARTIAL,
+    )
+
+
+def research_extras(
+    store: CaptureStore,
+    roster_date: str,
+    *,
+    available_by: datetime,
+    exclude: Collection[str],
+    enabled: bool,
+) -> tuple[str, ...]:
+    """Return roster members not already covered by the primary population, in roster order.
+
+    Args:
+        store: Owner-local capture store.
+        roster_date: ISO date whose roster is observed.
+        available_by: Aware cutoff of information available to the caller.
+        exclude: Symbols the primary population already covers.
+        enabled: Feature flag; False returns without reading the store.
+
+    Returns:
+        Extra symbols; empty when disabled, or when the roster is missing or unreadable.
+    """
+    if not enabled:
+        return ()
+    try:
+        roster = read_research_roster(store, roster_date, available_by=available_by)
+    except FileNotFoundError:
+        logger.warning("[DATA] stage=research_roster status=MISSING date=%s", roster_date)
+        return ()
+    except ValueError:
+        logger.warning("[DATA] stage=research_roster status=UNREADABLE date=%s", roster_date)
+        return ()
+    covered = set(exclude)
+    return tuple(member for member in roster.members if member not in covered)
+
+
+def split_research_entries(
+    entries: Sequence[CoverageEntry], research: frozenset[str]
+) -> tuple[list[CoverageEntry], list[CoverageEntry]]:
+    """Partition coverage entries into primary and research groups, preserving order.
+
+    Args:
+        entries: Coverage entries of one capture task.
+        research: Symbols attributed to the research population.
+
+    Returns:
+        Primary entries (including symbol-less entries) and research entries.
+    """
+    primary: list[CoverageEntry] = []
+    extras: list[CoverageEntry] = []
+    for entry in entries:
+        if entry.symbol is not None and entry.symbol in research:
+            extras.append(entry)
+        else:
+            primary.append(entry)
+    return primary, extras
+
+
+def research_manifest(
+    primary_context: CaptureContext,
+    entries: Sequence[CoverageEntry],
+    *,
+    completed_at: datetime,
+    force_partial: bool,
+) -> CaptureManifest:
+    """Build the cohort-less sibling manifest that carries research coverage.
+
+    Args:
+        primary_context: Context of the primary manifest this sibling accompanies.
+        entries: Research coverage entries; must be non-empty.
+        completed_at: Aware publication time.
+        force_partial: True marks the manifest PARTIAL regardless of entry states.
+
+    Returns:
+        Unpublished manifest whose run id and capture reason carry RESEARCH_SUFFIX.
+
+    Raises:
+        ValueError: The entries are empty.
+    """
+    if not entries:
+        raise ValueError("research manifest requires at least one entry")
+    context = primary_context.model_copy(
+        update={
+            "run_id": primary_context.run_id + RESEARCH_SUFFIX,
+            "capture_reason": primary_context.capture_reason + RESEARCH_SUFFIX,
+            "cohort_id": None,
+        }
+    )
+    complete = not force_partial and all(entry.status in GOOD_ENTRY_STATES for entry in entries)
+    return CaptureManifest(
+        schema_version=1,
+        context=context,
+        cohort=None,
+        completed_at=completed_at,
+        entries=tuple(entries),
+        artifacts=tuple(ref for entry in entries for ref in entry.raw_refs),
+        status=CaptureStatus.COMPLETE if complete else CaptureStatus.PARTIAL,
     )

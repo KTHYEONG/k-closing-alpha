@@ -34,6 +34,7 @@ from src.data.capture_contracts import (
 )
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
+from src.data.research_roster import research_extras, research_manifest, split_research_entries
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.tools.alerts import redact_for_egress
 from src.tools.run_outcome import (
@@ -92,6 +93,13 @@ async def run_auction_path_capture(
     if observed < _at_hhmmss(trading_day, AUCTION_PATH_READY_HHMMSS):
         raise ValueError(f"auction path not observable before {AUCTION_PATH_READY_HHMMSS}: too_early")
     roster, cohort_id, _ = _resolve_roster(snapshot_date, "close", store, observed)
+    extras = research_extras(
+        store,
+        snapshot_date,
+        available_by=observed,
+        exclude=set(roster),
+        enabled=profile.COLLECTION_RESEARCH_ROSTER_ENABLED,
+    )
     deadline = _at_hhmmss(trading_day, str(settings.DB_AUCTION_PATH_DEADLINE_HHMMSS))
     run_id = f"auction-path-{snapshot_date}-{uuid.uuid4().hex[:8]}"
     bound = asyncio.Semaphore(max(1, int(settings.DB_AUCTION_PATH_CONCURRENCY)))
@@ -217,8 +225,9 @@ async def run_auction_path_capture(
         )
         return entry, kept, pages
 
-    outcomes = await asyncio.gather(*(_capture_symbol(symbol) for symbol in roster))
-    entries: list[CoverageEntry] = [entry for entry, _, _ in outcomes]
+    outcomes = await asyncio.gather(*(_capture_symbol(symbol) for symbol in (*roster, *extras)))
+    all_entries: list[CoverageEntry] = [entry for entry, _, _ in outcomes]
+    entries, research = split_research_entries(all_entries, frozenset(extras))
     complete_frames: list[pd.DataFrame] = [frame for _, frame, _ in outcomes if frame is not None]
     total_pages = sum(pages for _, _, pages in outcomes)
     if complete_frames:
@@ -254,6 +263,10 @@ async def run_auction_path_capture(
         status=status,
     )
     store.publish_manifest(manifest)
+    if research:
+        store.publish_manifest(
+            research_manifest(manifest.context, research, completed_at=manifest.completed_at, force_partial=False)
+        )
     n_complete = sum(1 for item in entries if item.status == CaptureStatus.COMPLETE)
     n_partial = sum(1 for item in entries if item.status == CaptureStatus.PARTIAL)
     n_failed = sum(1 for item in entries if item.status == CaptureStatus.FAILED)

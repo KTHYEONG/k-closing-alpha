@@ -1372,6 +1372,52 @@ def test_audit_collection_reconciles_enabled_auction_sweeps(tmp_path) -> None:
     assert not any(issue.startswith("collection:auction_close") for issue in issues)
 
 
+def test_audit_ignores_research_manifests(tmp_path) -> None:
+    """Research sibling manifests never create auction issues."""
+    from src.daily.auction_capture import close_rounds
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus, CoverageEntry
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    clock = _session_clock(day)
+    profile = _collection_profile(tmp_path, auction=True)
+    symbols = ["005930"]
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, symbols)
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, symbols)
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, symbols)
+    _publish_auction_close(store, day, "run-close", symbols, clock=clock)
+    _publish_auction_open(store, day, "run-open", symbols, clock=clock)
+    research = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, "run-close-research", CaptureDataset.ORDERBOOK, "auction-close-research"),
+        cohort=None,
+        completed_at=_audit_moment(day, "15:40:00"),
+        entries=(
+            CoverageEntry(
+                symbol="000660",
+                dataset=CaptureDataset.ORDERBOOK,
+                venue="KRX",
+                session="regular",
+                scheduled_at=close_rounds(clock, 60)[0],
+                status=CaptureStatus.PARTIAL,
+                rows=0,
+                first_event_time=None,
+                last_event_time=None,
+                reason="deadline",
+                raw_refs=(),
+            ),
+        ),
+        artifacts=(),
+        status=CaptureStatus.PARTIAL,
+    )
+    store.publish_manifest(research)
+
+    issues = _audit(store, day, profile, clock, _audit_moment(day))
+
+    assert not any(issue.startswith("collection:auction_close") for issue in issues)
+
+
 def test_audit_collection_reports_partial_auction_close_coverage(tmp_path) -> None:
     """Missing slots and failed entries stay visible."""
     from src.daily.auction_capture import close_rounds, program_rounds
