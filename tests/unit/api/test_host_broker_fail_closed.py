@@ -43,7 +43,7 @@ def _operate(store: Any, *, asynchronous: bool, operation: str, calls: list[str]
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("operation", ["get_or_issue", "replace_rejected"])
-@pytest.mark.parametrize("contents", [b"", b"{sensitive-token", b"\xffsensitive-token", b"{}", b"[]"])
+@pytest.mark.parametrize("contents", [b"", b"{sensitive-token", b"\xffsensitive-token", b"{}", b"[]", b"[" * 2000 + b"]" * 2000])
 def test_invalid_record_never_issues(tmp_path: Path, asynchronous: bool, operation: str, contents: bytes) -> None:
     path = tmp_path / "token.json"
     path.write_bytes(contents)
