@@ -1,6 +1,6 @@
 # kca or-vps Audit Runbook (AI-executed, v4)
 
-> Host `or-vps` (hostname `trading-bot`, user `ubuntu`, 2 vCPU, 11 GiB). Repo `~/k-closing-alpha`; data root `~/k-closing-alpha/data` (capture `data/history/capture`); 29 `kca-*` user timers + `kca-alert@`; container jobs run through `~/.local/lib/kca/kca-run` (image `ghcr.io/kthyeong/k-closing-alpha:latest`, `--rm`), host jobs via `flock … ~/.local/bin/uv run`.
+> Host `or-vps` (hostname `trading-bot`, user `ubuntu`, 2 vCPU, 11 GiB). Repo `~/k-closing-alpha`; data root `~/k-closing-alpha/data` (capture `data/history/capture`); 32 `kca-*` user timers + `kca-alert@`; container jobs run through `~/.local/lib/kca/kca-run` (image `ghcr.io/kthyeong/k-closing-alpha:latest`, `--rm`), host jobs via `flock … ~/.local/bin/uv run`.
 > Days: **D** = audited trading day (M/W: the previous trading day; O/E/N: today), **P** = trading day before D, **N** = next trading day. Times are KST; host clock and `journalctl` are UTC.
 > Last verified: 2026-11-02 09:40–09:45 KST against or-vps rev `88d3452` (image `sha-1681172`, code-identical). All five bundles were executed read-only: O for D=2026-11-02, and M/E/N/W for D=2026-10-30 (§8 log)..
 
@@ -42,9 +42,9 @@
 |---|---|---|---|---|
 | **M** next-morning (mandatory) | business day 07:30–08:20 (Monday covers Fri + weekend nights) | 22:15 backup and 23:05 backfill are done; `last_run.json` is not yet overwritten; D's shrink backups still exist; ends before the 08:30 blackout | `kca_probe M` | H01 R01 R02 R03 R05 C01 C03 C04 C05 C11 Q08 P01–P04 B01 B02 B04 B05 A01 A03 A04 X01 |
 | **O** post-exit (mandatory) | business day 09:45–11:00 | exit window closed 09:30; price-ingest D-1 landed (a failed 08:30 run is auto-rerun at 09:40) | `kca_probe O` | R01 R02 C05 C07 Q05 P02 P03 P06 A01 A03 X01 |
-| **E** post-decision (mandatory) | business day 15:45–16:30 | entry chain ends 15:45; the archive row is still the decision snapshot | `kca_probe E` | R01 R02 C01 C05 Q01 P01 P03 P04 P06 A01 A03 X01 |
+| **E** post-decision (mandatory) | business day 15:45–16:30 | entry chain ends 15:45; the archive row is still the decision snapshot | `kca_probe E` | R01 R02 C01 C05 C12 C13 C14 Q01 P01 P03 P04 P06 A01 A03 X01 |
 | **L** liveness (optional) | 16:30–19:50 | aftermarket-book is the only long live capture (runs to ~19:59) | §5.2 `R06` | R06 |
-| **N** evening (mandatory; M re-checks if missed) | business day 21:50–22:10 | archive 20:05, tape 20:35, prune 21:00 and audit 21:20 are done; must finish before the 22:15 backup takes the Drive lock | `kca_probe N` | R01 R03 C03 C04 C06 C08 C11 Q06 Q07 Q08 Q09 Q10 B05 A01 A03 X01 |
+| **N** evening (mandatory; M re-checks if missed) | business day 21:50–22:10 | archive 20:05, tape 20:35, prune 21:00 and audit 21:20 are done; must finish before the 22:15 backup takes the Drive lock | `kca_probe N` | R01 R03 C03 C04 C06 C08 C13 C15 C11 Q06 Q07 Q08 Q09 Q10 B05 A01 A03 X01 |
 | **W** weekly (mandatory) | Monday 07:30–08:20, after M | Sat 22:00 retrain, Sun 10:00 snapshot, Sun 11:00 verify | `kca_probe W` + §5.1 local | H02 H03 H04 R04 B07 B08 Q11 A05 |
 | **Ev** event | after a deploy/alert/incident | parity of what changed | H02 H04 + affected rows | — |
 
@@ -64,7 +64,7 @@ Evidence volatility:
 | `logs/events/*.jsonl`, `remediation/ledger.jsonl`, `audit_digests/<D>.txt`, paper + order ledgers | permanent, append-only | any |
 | `logs/alerts/{silent,digest}/<D>.jsonl`, `logs/alerts/incidents.json`, `logs/alerts/outbox/` | silent alert record / reconcile digests (append-only); incident ledger (one page per kind per KST day); undelivered pages | any |
 
-**Alert policy** (`src/tools/alert_policy.py`). Mail (`[긴급][kca] …`, body exactly `무슨 일 / 자동 조치 / 지금 할 일`) is sent only for CRITICAL incidents: failed `kca-order-{entry,exit,reconcile-entry,reconcile-exit}`, `kca-collect`, `kca-predict`, `kca-finalize-close`; order-session DEGRADED outcomes (except entry-reconcile `partial_or_unfilled`); collect/predict NO_DECISION; finalize_close `picks_unconfirmed/zero_confirmed/empty_archive`; price-ingest `stale_panel` (only recorded from 11:00, i.e. after the 11:30 safety run, including a crashed safety run that left the panel stale); `kca-kis-token-warmup` still failed after auto-remediation; a stale KIS token in the 2 h before 15:20; offsite backup failing ≥ 24 h (two nightly slots); foreign `krx-deferred-recreate` and every `kse-alert@*` relay (kse could not deliver its own CRITICAL page). One incident = one mail per KST day across all paths (reminders at most daily, not before 08:00); a paged measured incident (token, backup) that clears gets one `[해결됨][kca]` line. Everything else (paper, auctions, aftermarket book, altdata, archive, extended backfill, tape sweep, retrain, audit/reconcile self-failures, api notice, flow coverage, kiwoom rotate, `krx-host-backup`, `vps-image-gc`, `crypto-pilot-*`, undelivered backlog) is SILENT: `[SYS] stage=alert status=SILENT` + `logs/alerts/silent/<D>.jsonl`, heartbeat, digests. Safe-rerun CRITICAL units are DEFERRED while auto-remediation has tries left (≤ 2 h).
+**Alert policy** (`src/tools/alert_policy.py`). Mail (`[긴급][kca] …`, body exactly `무슨 일 / 자동 조치 / 지금 할 일`) is sent only for CRITICAL incidents: failed `kca-order-{entry,exit,reconcile-entry,reconcile-exit}`, `kca-collect`, `kca-predict`, `kca-finalize-close`; order-session DEGRADED outcomes (except entry-reconcile `partial_or_unfilled`); collect/predict NO_DECISION; finalize_close `picks_unconfirmed/zero_confirmed/empty_archive`; price-ingest `stale_panel` (only recorded from 11:00, i.e. after the 11:30 safety run, including a crashed safety run that left the panel stale); `kca-kis-token-warmup` still failed after auto-remediation; a stale KIS token in the 2 h before 15:20; offsite backup failing ≥ 24 h (two nightly slots); foreign `krx-deferred-recreate` and every `kse-alert@*` relay (kse could not deliver its own CRITICAL page). One incident = one mail per KST day across all paths (reminders at most daily, not before 08:00); a paged measured incident (token, backup) that clears gets one `[해결됨][kca]` line. Everything else (paper, auctions, research roster, postclose snapshot, decision extras, aftermarket book, altdata, archive, extended backfill, tape sweep, retrain, audit/reconcile self-failures, api notice, flow coverage, kiwoom rotate, `krx-host-backup`, `vps-image-gc`, `crypto-pilot-*`, undelivered backlog) is SILENT: `[SYS] stage=alert status=SILENT` + `logs/alerts/silent/<D>.jsonl`, heartbeat, digests. Safe-rerun CRITICAL units are DEFERRED while auto-remediation has tries left (≤ 2 h).
 
 ## 3. Routine inventory (code-derived)
 
@@ -82,15 +82,18 @@ Weekday timers also fire on weekday holidays; jobs self-skip through `resolve_se
 | order-reconcile-exit | Mon–Fri 09:00:40 | `order_session --phase reconcile-exit` | journal | outcome `OK reconcile_complete` | 09:33 | HIGH |
 | paper-exit (decision) P | Mon–Fri 09:01 | `src/daily/paper_trade.py --phase exit` (window to 09:30, `src/config/market_session.py:97-103`) | `data/paper/{orders,fills,trades,nav}.parquet` | journal `stage=paper_ledger_refresh as_of=D … n_open=0`; **no OK outcome** | 09:30 | HIGH |
 | collect (decision) | Mon–Fri 15:20 | `src/daily/collect.py:main` :1100 | `archive.parquet` via `src/daily/archive.py:upsert_archive_snapshot` :165; `capture/decision/<D>/<run>/input.parquet` | `stage=realtime_coverage … status=COMPLETE` (min 0.99, :201); **outcome only on SKIPPED** | 15:29 | HIGH |
+| research-roster (standard, Kiwoom ka10032; silent) | Mon–Fri 15:20:30 (inside the blackout) | `src/daily/roster_capture.py:main` | `manifests/<D>/research-roster-<D>-*` + normalized roster frame (members, drop reasons); never carries a cohort | outcome `OK members=…` (`DEGRADED truncated`; `SKIPPED disabled\|non_trading_day`) | 15:21:05 | MED |
 | predict (After=collect) | Mon–Fri 15:21 | `src/daily/predict.py:main` :455 | `parquet/{rank_pool_predictions,topk_decisions}.parquet` | outcome `OK` | 15:30 | HIGH |
-| auction-close (optional) | Mon–Fri 15:21:05 | `auction_capture --phase close` | raw + manifest | `status=COMPLETE phase=close` | 15:36 | MED |
+| auction-close (optional) | Mon–Fri 15:21:05 | `auction_capture --phase close` | raw + manifest `auction-close-<D>-*` (cohort) + sibling `…-research` (roster extras, dispatched after the cohort each round) | `status=COMPLETE phase=close` | 15:36 | MED |
 | order-entry | Mon–Fri 15:21:15 | `order_session --phase entry` | journal | outcome `OK entry_complete` | 15:29 | HIGH |
 | finalize-close (decision; ExecStopPost starts paper-entry) | Mon–Fri 15:30:30 | `src/daily/finalize_close.py:main` :481 | archive `종가_확정`, raw `close_confirmation` | outcome `OK` (DEGRADED `empty_archive\|picks_unconfirmed\|zero_confirmed`, :148-156) | 15:33 | HIGH |
 | order-reconcile-entry | Mon–Fri 15:30:40 | `order_session --phase reconcile-entry` | journal | outcome `OK` | 15:43 | HIGH |
 | paper-entry (decision) P | Mon–Fri 15:34 + finalize trigger | `paper_trade --phase entry` | paper orders/fills/decisions/nav | entry fills at the 종가 (`paper_broker.py:220-274`); second run `already_recorded` (:498,:520); outcome only NO_DECISION/DEGRADED/SKIPPED | 15:45 | HIGH |
+| postclose-snapshot (standard, batch slot; silent) | Mon–Fri 15:31:30 | `src/daily/postclose_snapshot.py:main` | `manifests/<D>/postclose-<D>-*`, `history/research/{postclose_strength,investor_estimate_postclose}/<YYYY-MM>/<D>.parquet` (write-once) | outcome `OK` (`DEGRADED partial`) | 15:39 (no request after `COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS`) | MED |
 | archive-intraday-regular P | Mon–Fri 15:40 | `src/daily/archive_intraday.py:main` :1039 `--phase regular` | 1m+ticks `regular`, manifests `archive-<D>-regular-{bars,ticks}-*` | `stage=intraday_archive_stream … status=COMPLETE` | 18:40 | HIGH |
-| aftermarket-book (batch) | Mon–Fri 15:40 (to ~19:59 by design) | `src/daily/aftermarket_book.py:main` :632 | `history/orderbook/aftermarket/<YYYY-MM>/<D>.parquet`, 35 manifests `aftermarket-book-<D>-b<n>-<venue>` | `stage=aftermarket_book status=COMPLETE date=D manifests=N` | 20:20 | HIGH |
-| auction-path (bulk, DB증권) | Mon–Fri 15:45 | `src/daily/auction_path.py:main` :304 | `history/auction_path/<YYYY-MM>/<D>.parquet` | outcome from manifest (:270) | 19:00 | MED |
+| aftermarket-book (batch) | Mon–Fri 15:40 (to ~19:59 by design) | `src/daily/aftermarket_book.py:main` :632 | `history/orderbook/aftermarket/<YYYY-MM>/<D>.parquet`, 35 primary manifests `aftermarket-book-<D>-b<n>-<venue>` + `…-research` siblings for blocks with sparse rounds | `stage=aftermarket_book status=COMPLETE date=D manifests=N` | 20:20 | HIGH |
+| auction-path (bulk, DB증권) | Mon–Fri 15:45 | `src/daily/auction_path.py:main` :304 | `history/auction_path/<YYYY-MM>/<D>.parquet` (cohort + roster extras), sibling `auction-path-<D>-*-research` | outcome from manifest (:270) | 19:00 | MED |
+| decision-extras (bulk, no broker) | Mon–Fri 16:30 | `src/daily/extras_extract.py:main` (`--from/--to` retro over local raw) | `history/research/{decision_extras,investor_estimate_decision}/<YYYY-MM>/<D>.parquet` (overwritable, derived from the decision run raw) | outcome `OK` (`SKIPPED no_decision_input`, `DEGRADED invalid_raw_evidence`) | 17:00 | LOW |
 | archive-intraday P | Mon–Fri 20:05 | `archive_intraday --phase aftermarket` | 1m `nxt_premarket nxt_aftermarket krx_aftermarket`, ticks `krx_aftermarket nxt_aftermarket` (since 2026-09-29, market_session.py:74) | stream lines COMPLETE; outcome only DEGRADED/SKIPPED | 23:05 | HIGH |
 | tape-sweep (bulk, Kiwoom; After=archive-intraday) P | Mon–Fri 20:35 | `src/daily/tick_tape_sweep.py:main` :330 | `capture/staging/tape_backfill/ledger.jsonl`, `staging/tape_sweep/last_report.json`, `tape-<D>-<session>-publish-*` manifests | report day = D; **no outcome** | 21:15 (`TAPE_SWEEP_DEADLINE_HHMMSS`) | HIGH |
 | backup-prune (host, Drive lock) P | Mon–Fri 21:00 | `src/tools/backup_prune.py` (+`capture_offsite.py:980-1159`) | deletes remote `_deleted/<day>` > 30 d (cap 7/subtree), local `backups/intraday` > 3 d, local sealed tiers > 30 d after a remote md5 check | `stage=backup_prune dry_run=False purged= … sealed_kept=` | 21:20 | MED |
@@ -105,13 +108,13 @@ Weekday timers also fire on weekday holidays; jobs self-skip through `resolve_se
 | GitHub `watchdog.yml` | cron `40 22 * * 1-5` UTC = 07:40 KST Tue–Sat (runs 2–4.5 h late) | `src/tools/watchdog_probe.py`; GHCR PAT expiry ≤ 30 d | — | run success | — | LOW |
 | GitHub `deploy.yml` | push to main | `vps-deploy-lib.sh` pull → preflight → `blackout_wait` → promote → converge (`git reset --hard`, `src.tools.code_sync`) | units, wrapper | run success | — | — |
 
-Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auction-open, auction-close, altdata-capture. They are never auto-enabled (`install_systemd.sh` enables 26), but all 3 are enabled on the host. Not daily: `1m/regular_consolidated` (Toss backfill, last 2026-08-31) and `1m_kis_adjusted` (extended-backfill output).
+Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auction-open, auction-close, altdata-capture. They are never auto-enabled (`install_systemd.sh` enables 29), but all 3 are enabled on the host. Not daily: `1m/regular_consolidated` (Toss backfill, last 2026-08-31) and `1m_kis_adjusted` (extended-backfill output).
 
 ## 4. Check catalogue
 
 | ID | Tier | Windows | Assert (machine-checkable PASS) | Fail → Sev | Drill |
 |---|---|---|---|---|---|
-| H01 | EXT | M | 29 `kca-*` timers listed, no `--failed` kca unit, `Linger=yes` (WARN: a timer not enabled) | P1 | `systemctl --user list-timers 'kca-*' --all` |
+| H01 | EXT | M | 32 `kca-*` timers listed, no `--failed` kca unit, `Linger=yes` (WARN: a timer not enabled) | P1 | `systemctl --user list-timers 'kca-*' --all` |
 | H02 | EXT | W, Ev | host `git status` clean, `kca-run` == repo wrapper, no unit DRIFT / NOT_IN_REPO, `latest` image ID == `sha-<HEAD>`; local: VPS HEAD == `origin/main` (or a deploy waits in `blackout_wait`) | P1 | §5.2 `H02-local` |
 | H03 | EXT | W | no exited `kca-*` container, no kca container outside its §3 window; no new `*.bak*/*.pre_*/*.stale*` under `data/` or `artifacts/` | P2 | `docker ps -a`, `find … -maxdepth 4` |
 | H04 | EXT | W, Ev | latest `deploy.yml` run on main is `success` (a red test job freezes `latest`); after a history rewrite, pinned SHAs in `tests/` fixtures are ancestors of `origin/main`; the 22 wrapper units print `rc=0` via `--print-argv` | P1 | §5.2 `H04` |
@@ -124,8 +127,12 @@ Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auct
 | C01 | CORE | E M | §1 | P0 | collect journal `stage=realtime_quote/requote` |
 | C03 | CORE | N M | §1; PARTIAL (WARN) entry reasons `deadline\|vendor_failure\|missed_start`; `nxt_not_listed` is normal | P1 | §5.2 `C-manifest` |
 | C04 | CORE | N M | §1; output `streams={…: complete\|tape_healed\|partial(n failed)\|missing}`. Partial bars = WARN; missing = FAIL | P1 | §5.2 `C-manifest`, journal `stage=intraday_archive_stream` |
-| C05 | EXT | O E M | auction open/close manifests complete (SKIP if timer off) | P2 | auction journal `status=LATE/DEGRADED` |
+| C05 | EXT | O E M | auction open/close primary manifests complete, `-research` siblings excluded (SKIP if timer off) | P2 | auction journal `status=LATE/DEGRADED` |
 | C06 | EXT | N | `auction-path-<D>-*` manifest complete (else WARN; 10-30 PARTIAL) | P2 | outcome metrics |
+| C12 | EXT | E | research roster manifest COMPLETE and completed ≤ 15:21:05, members 150–400 (outcome metrics); SKIP when the outcome is SKIPPED or the timer is off | P2 | roster journal `stage=research_roster` |
+| C13 | EXT | E N | `-research` sibling manifests present for auction-close (E) and auction-path/aftermarket-book (N); deadline/missed-start share of their entries ≤ 10 %. Primary manifests are judged by C03/C05/C06 without them | P2 | sibling `manifest-partial.json` reasons |
+| C14 | EXT | E | postclose manifest present, completed ≤ 15:39, good-entry share ≥ 0.95, `research/postclose_strength/<D>` exists | P2 | postclose journal `stage=postclose_snapshot` |
+| C15 | EXT | N | `research/decision_extras/<D>` rows == decision cohort rows, `kiwoom_cntr_str` filled ≥ 0.9 (Toss-union names have none), investor series partition exists | P2 | `uv run python -m src.daily.extras_extract --date <D>` (idempotent) |
 | C07 | CORE | O | §1; WARN on `flow_shortfall`/`program_flow_shortfall`. A 08:30 `stale_panel_pending_retry` is healthy when 11:30 is OK; an 11:30 DEGRADED `stale_panel` (or a failed 11:30 run with a stale panel) pages `[긴급][kca] 가격 이력 미갱신` | P1 | price-ingest journal |
 | C08 | CORE | N | §1 (report `days_checked[-1] == D`) | P1 | `last_report.json` `unresolved`, `stage=tape_sweep status=WARNING` |
 | C11 | CORE | N M | §1: `audit_daily_completeness(D)` (7 keys) + `intraday_complete` = the daily-audit run for D logged no `step=intraday_complete status=FAIL date=D` (mirrors `daily_audit.py:2308`) | P1 | daily-audit journal for D |
@@ -257,15 +264,24 @@ def runs(cid, specs):
             rec.append(f"{unit}:failed{bad}_rerun_ok")
     out(cid, lv(bool(miss), bool(rec)), units=len(specs), missing=",".join(miss) or "-", recovered=",".join(rec) or "-")
 OPTIONAL = {"auction-open", "auction-close", "altdata-capture"}
-def manifest_status(d, prefix):
+def manifest_status(d, prefix, research=False):
+    # research=False: primary manifests only; `<run>-research` siblings (roster extras) share the prefix and are judged by C13
     res = {}
     for run in sorted((CAP / f"manifests/{d}").glob(prefix + "*")):
+        if run.name.endswith("-research") != research:
+            continue
         st = {f.name[9:-5] for f in run.glob("manifest-*.json")}
         res[run.name] = "complete" if "complete" in st else ("partial" if "partial" in st else ("pending" if st else "none"))
     return res
 def failed_entries(d, run):
     m = json.loads((CAP / f"manifests/{d}/{run}/manifest-partial.json").read_text())
     return sum(e.get("status") != "COMPLETE" for e in m.get("entries", []))
+def manifest_entries(d, run):
+    for f in sorted((CAP / f"manifests/{d}/{run}").glob("manifest-*.json")):
+        return json.loads(f.read_text())
+    return {}
+def research_p(d, ds):
+    return ROOT / f"history/research/{ds}/{d:%Y-%m}/{d}.parquet"
 def heartbeat():
     return json.loads((ROOT / "logs/heartbeat/daily_audit.json").read_text())
 def timer_active(name):
@@ -284,7 +300,8 @@ def c_manifests_live(d):
         st = manifest_status(d, f"aftermarket-book-{d}-")
         c = collections.Counter(st.values())
         line = jr("aftermarket-book", at(d, "15:39:00"), at(d, "23:59:00"), rf"stage=aftermarket_book status=\w+ date={d}")
-        ok_line = bool(line) and "status=COMPLETE" in line[-1] and f"manifests={len(st)}" in line[-1]
+        n_all = len(st) + len(manifest_status(d, f"aftermarket-book-{d}-", research=True))
+        ok_line = bool(line) and "status=COMPLETE" in line[-1] and f"manifests={n_all}" in line[-1]
         out("C03", lv(not st or c["pending"] + c["none"] > 0, c["partial"] > 0 or not ok_line), batches=len(st), status=dict(c), journal=(line[-1].split("status=")[1][:40] if line else "absent"))
     @check("C04")
     def _():
@@ -316,6 +333,71 @@ def c_manifests_live(d):
             st = manifest_status(d, f"auction-{ph}-{d}-")
             res[ph] = ",".join(sorted(set(st.values()))) or "missing"
         out("C05", lv(any(v == "missing" for v in res.values()), any(v not in ("complete", "SKIP(timer_off)") for v in res.values())), **res)
+def _research_share(d, prefixes):
+    tot = cut = 0
+    found = {}
+    for pre in prefixes:
+        st = manifest_status(d, pre, research=True)
+        found[pre.split(f"-{d}-")[0]] = ",".join(sorted(set(st.values()))) or "missing"
+        for run in st:
+            es = manifest_entries(d, run).get("entries", [])
+            tot += len(es)
+            cut += sum(e.get("reason") in ("deadline", "missed_start") for e in es)
+    return found, tot, cut
+def c_research_e(d):
+    @check("C12")
+    def _():
+        if not timer_active("research-roster"):
+            out("C12", "SKIP(timer_off)")
+            return
+        o = outcomes(d).get("research_roster")
+        if o and o["outcome"] == "SKIPPED":
+            out("C12", f"SKIP({o.get('reason', '')})")
+            return
+        runs_ = [p for p in (CAP / f"manifests/{d}").glob(f"research-roster-{d}-*")]
+        m = manifest_entries(d, sorted(runs_)[-1].name) if runs_ else {}
+        done = datetime.fromisoformat(m["completed_at"]).astimezone(KST) if m else None
+        n = (o or {}).get("metrics", {}).get("members")
+        out("C12", lv(not m, m.get("status") != "COMPLETE" or done > at(d, "15:21:05") or not n or not 150 <= n <= 400),
+            status=m.get("status", "missing"), completed=done.strftime("%T") if done else "-", members=n, outcome=(o or {}).get("outcome", "absent"))
+    @check("C13")
+    def _():
+        found, tot, cut = _research_share(d, [f"auction-close-{d}-"])
+        share = cut / tot if tot else 0.0
+        out("C13", lv(False, "missing" in found.values() or share > 0.10), **found, entries=tot, cut_share=round(share, 3))
+    @check("C14")
+    def _():
+        if not timer_active("postclose-snapshot"):
+            out("C14", "SKIP(timer_off)")
+            return
+        st = manifest_status(d, f"postclose-{d}-")
+        runs_ = sorted(st)
+        m = manifest_entries(d, runs_[-1]) if runs_ else {}
+        es = m.get("entries", [])
+        good = sum(e.get("status") in ("COMPLETE", "NO_TRADES", "NOT_APPLICABLE") for e in es) / len(es) if es else 0.0
+        done = datetime.fromisoformat(m["completed_at"]).astimezone(KST) if m else None
+        part = research_p(d, "postclose_strength").exists()
+        out("C14", lv(not m or not part, good < 0.95 or done > at(d, "15:39:00")), status=m.get("status", "missing"),
+            completed=done.strftime("%T") if done else "-", good_share=round(good, 3), partition=part)
+def c_research_n(d):
+    @check("C13")
+    def _():
+        found, tot, cut = _research_share(d, [f"auction-path-{d}-", f"aftermarket-book-{d}-"])
+        share = cut / tot if tot else 0.0
+        out("C13", lv(False, "missing" in found.values() or share > 0.10), **found, entries=tot, cut_share=round(share, 3))
+    @check("C15")
+    def _():
+        import pandas as pd
+        p = research_p(d, "decision_extras")
+        if not p.exists():
+            out("C15", "FAIL", partition="missing")
+            return
+        x = pd.read_parquet(p)
+        dec = sorted((CAP / f"decision/{d}").glob("*/input.parquet"))
+        n_cohort = len(pd.read_parquet(dec[-1], columns=["종목코드"])) if dec else -1
+        cntr = float(x["kiwoom_cntr_str"].notna().mean()) if len(x) else 0.0
+        out("C15", lv(False, len(x) != n_cohort or cntr < 0.9 or not research_p(d, "investor_estimate_decision").exists()),
+            rows=len(x), cohort=n_cohort, cntr_str_share=round(cntr, 3))
 def c_decision(d):
     @check("C01")
     def _():
@@ -521,7 +603,7 @@ def _():
     off = [l.split()[0] for l in sh(["systemctl", "--user", "list-unit-files", "kca-*.timer", "--no-legend"]).splitlines() if l.split()[1:2] != ["enabled"]]
     failed = [l.split()[0] for l in sh(["systemctl", "--user", "list-units", "--failed", "--no-legend", "--plain", "kca-*"]).splitlines() if l.strip()]
     linger = sh(["loginctl", "show-user", os.environ.get("USER", "ubuntu"), "-p", "Linger", "--value"]).strip()
-    out("H01", lv(n != 29 or bool(failed) or linger != "yes", bool(off)), timers=n, not_enabled=off or "-", failed=failed or "-", linger=linger)
+    out("H01", lv(n != 32 or bool(failed) or linger != "yes", bool(off)), timers=n, not_enabled=off or "-", failed=failed or "-", linger=linger)
 wk = TODAY.weekday() < 5
 runs("R01", [("archive-intraday", D, "20:05:00", 1), ("tape-sweep", D, "20:35:00", 1), ("backup-prune", D, "21:00:00", 1), ("daily-audit", D, "21:20:00", 1),
              ("altdata-capture", D, "21:35:00", 1), ("backup", YDAY, "22:15:00", 1), ("extended-backfill", YDAY, "23:05:00", 1)]
@@ -609,8 +691,8 @@ Window E (post-decision):
 ```python probe=E
 import numpy as np
 import pandas as pd
-runs("R01", [("collect", D, "15:20:00", 1), ("predict", D, "15:21:00", 1), ("auction-close", D, "15:21:05", 1), ("order-entry", D, "15:21:15", 1),
-             ("finalize-close", D, "15:30:30", 1), ("order-reconcile-entry", D, "15:30:40", 1), ("paper-entry", D, "15:30:30", 1)])
+runs("R01", [("collect", D, "15:20:00", 1), ("research-roster", D, "15:20:30", 1), ("predict", D, "15:21:00", 1), ("auction-close", D, "15:21:05", 1), ("order-entry", D, "15:21:15", 1),
+             ("finalize-close", D, "15:30:30", 1), ("order-reconcile-entry", D, "15:30:40", 1), ("paper-entry", D, "15:30:30", 1), ("postclose-snapshot", D, "15:31:30", 1)])
 o = expect("R02", D, {"predict": {"OK"}, "order_entry": {"OK", "SKIPPED:trading_disabled"}, "finalize_close": {"OK"},
                       "order_reconcile_entry": {"OK", "SKIPPED:trading_disabled"}})
 c_decision(D)
@@ -642,6 +724,7 @@ def _():
         return
     st = manifest_status(D, f"auction-close-{D}-")
     out("C05", lv(not st, "complete" not in st.values()), close=",".join(st.values()) or "missing")
+c_research_e(D)
 p_ledger(D, P, morning=False)
 @check("P06")
 def _():
@@ -663,7 +746,7 @@ Window N (evening):
 
 ```python probe=N
 import pandas as pd
-runs("R01", [("archive-intraday-regular", D, "15:40:00", 1), ("aftermarket-book", D, "15:40:00", 1), ("auction-path", D, "15:45:00", 1), ("archive-intraday", D, "20:05:00", 1),
+runs("R01", [("archive-intraday-regular", D, "15:40:00", 1), ("aftermarket-book", D, "15:40:00", 1), ("auction-path", D, "15:45:00", 1), ("decision-extras", D, "16:30:00", 1), ("archive-intraday", D, "20:05:00", 1),
              ("tape-sweep", D, "20:35:00", 1), ("backup-prune", D, "21:00:00", 1), ("daily-audit", D, "21:20:00", 1)]
      + ([("altdata-capture", D, "21:35:00", 1)] if NOW > at(D, "21:45:00") else []))
 r_degraded(D)
@@ -672,6 +755,7 @@ c_manifests_live(D)
 def _():
     st = manifest_status(D, f"auction-path-{D}-")
     out("C06", lv(False, "complete" not in st.values()), status=",".join(st.values()) or "missing")
+c_research_n(D)
 @check("C08")
 def _():
     r = json.loads((CAP / "staging/tape_sweep/last_report.json").read_text())
@@ -837,15 +921,20 @@ Baselines (trailing rule: compare with the prev-5 trading-day median, never with
 | archive rows/day | 93–1,247 (10-12..16); 156–172 (10-29/30) |
 | price_history rows/day | ~2,762–2,767 (10-30) |
 | 1m regular | 485 k bars / 1,273 symbols, vendor `ls`, vol ratio median 0.959 (10-16) |
-| aftermarket-book manifests | 35 (18 × krx/nxt batches; 10-30) |
+| aftermarket-book manifests | 35 primary (18 × krx/nxt batches; 10-30); `-research` siblings from 11-05 (seed pending) |
+| research roster | 254 members of 400 ranking rows; drops 138 `not_listed_in_panel` (135 ETF/ETN), 7 `non_screenable_class` (11-04 21:10 dry run) |
 | tape sweep | needs 771, recovered 604, unresolved 167, expired 0 (10-30) |
 | backup | 3–13 min; `segments` 2–170 per night (11-01: 2) |
-| runtimes | collect 25–95 s, predict ~12 s, finalize 10 s–2.5 min, archive-regular 28–57 min, archive 9–33 min, tape-sweep 24–31 min, daily-audit 1.5–4.5 min (incl. ~80 s chown), extended-backfill ~2.5 min |
+| runtimes | collect 25–95 s, predict ~12 s, finalize 10 s–2.5 min, archive-regular 28–57 min, archive 9–33 min, tape-sweep 24–31 min, daily-audit 1.5–4.5 min (incl. ~80 s chown), extended-backfill ~2.5 min (until 11-04; direction-free superset drain runs to the 06:50 stop) |
 [redacted]
 
 Known conditions:
 | Since | Condition | Expected verdict while open | Re-check / expiry | Close when |
 |---|---|---|---|---|
+| 2026-11-04 | Direction-free PIT superset (`d6abd78`): extended-backfill drains ~40 k new KIS symbol-days over several nights and stops at 06:50 | R02/R03 WARN `tasks_remaining>0` on the 23:05 run | 2026-11-12 | `status=DONE tasks_remaining=0` again |
+| 2026-11-04 | Manual Toss pre-retention backfill `kca-toss-backfill-manual.service` (transient, 927 dates, started 21:16) | X01 WARN `TOKEN_REPLACED` (Toss) possible; Q11 lists `toss_regular` FAILED rows; H03 sees container `kca-toss-backfill` | 2026-11-06 | unit inactive with `status=DONE`; rerun once for FAILED rows |
+| 2026-11-04 | `decision_extras` absent for 2026-09-18..10-02 (local raw already pruned after sealing) | none (C15 is N-only, D-scoped) | — | restore sealed raw if those days are needed |
+| 2026-11-04 | `pit1520_panel` rebuilt before the superset drain finishes shows many `NOT_FETCHED` exclusions | none (manual build only) | 2026-11-12 | rebuild after the drain |
 | 2026-11-03 | Local capture backlog: on 10-30 a sweep rewrote 85 old-date `raw/` dirs (2026-01..10); `capture_prune` drains it under its time budget (`status=DEADLINE`, removed 82 on 11-02, one `rclone md5sum` per sealed entry), disk 35% | B05 WARN `kept_local_pre_prune` shrinking each run | 2026-11-05 M | still listing 2026-0x dirs at 11-05 M → prune throughput defect (batch md5 via one `lsjson --hash` instead of per-entry `md5sum`) |
 | 2026-11-02 | D1 prune purge cap 7 per subtree vs daily backup | B05 PASS; FAIL `cap_risk` after a ≥1-week prune outage | 2026-12-01 | cap sized from the backup cadence (fix pending) |
 | 2026-11-02 | D2 `audit_daily_completeness` omits `intraday_complete` (added in `main()` :2308) | C11 derives it from the journal | 2026-12-01 | helper returns 8 keys (fix pending) |
@@ -881,6 +970,7 @@ Known conditions:
 - Last probe execution log:
 | Date (KST) | Rev | Window / D | Result |
 |---|---|---|---|
+| 2026-11-04 21:37 | 3dfe41f | E, N / 11-04 (research rows added) | C03 C04 C06 C15 PASS (C15 rows 530 = cohort, cntr_str 0.945); R01 FAIL / C12 C14 FAIL / C13 WARN only because research-roster, postclose-snapshot and decision-extras first fire on 11-05 (expected for any D ≤ 11-04); C05 WARN close partial (one KIS vendor_failure 15:25) |
 | 2026-11-02 09:40 | 88d3452 | O / 11-02 | all PASS except X01 WARN (`EGW00121`/`AUTH_REJECTED`/`ADOPTED_ROTATED` ×1, D10); 5.6 s |
 | 2026-11-02 09:41 | 88d3452 | M / 10-30 (re-audit) | CORE all PASS; WARN R03 (`auction_path DEGRADED`), X01 (D10), A04 (`kca.api_actions`); 23 s |
 | 2026-11-02 09:41 | 88d3452 | E / 10-30 (retro) | CORE all PASS; WARN Q01 (`close_gap_p99=0.0309` > 0.03), X01; 5 s |
