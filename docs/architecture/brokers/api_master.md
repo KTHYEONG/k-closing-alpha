@@ -26,7 +26,7 @@ All 5 brokers operate natively on Linux 64-bit via standard HTTPS/OAuth2 protoco
 | **Ranking Capacity** | 30 stocks/call (hard-capped sample) | 100 stocks/call | **200 stocks/page** (up to 1,000 stocks) | 100 stocks/call (realtime & 1d/1w/1mo/1y) | **400 stocks/call** (`RANKLIST`) |
 | **Orderbook & Auction** | **Level-10 + `antc_cnpr` (output1+2)** | Level-10 ask/bid (`t1101`) | Level-10 ask/bid (`ka10004`) | Level-10 ask/bid array (`/orderbook`) | Level-5 (REST `HOGA`) / **Level-10 + `AntcCnpr` + `AntcCnqn` (WSS `S01`) + MOC series (`DAYTRADE` code 8)** |
 | **Intraday Investor Estimate**| **Yes (`HHPTJ04160200`, 외인/기관)** | Intraday hourly (`t1405`) | Daily investor trend (`ka10014`) | Daily 7-sector institutional breakdown | Daily investor trend (`DAYSTOCKTJJ`) |
-| **Order / Account Trading** | Supported live (`TTTC0802U` 등) | Supported by server (`CSPAT...`) | Supported by server (`kt10...`) | **Modern REST Orders & Server OCO/OTO Triggers** | **Live KRX & Dedicated NXT Orders** (`CSPAT00600` / `00610`) |
+| **Order / Account Trading** | Supported live (`TTTC0012U`/`TTTC0011U` 등) | Supported by server (`CSPAT...`) | Supported by server (`kt10...`) | **Modern REST Orders & Server OCO/OTO Triggers** | **Live KRX & Dedicated NXT Orders** (`CSPAT00600` / `00610`) |
 
 ---
 
@@ -37,18 +37,18 @@ Each analytical and operational task is routed to the optimal broker API based o
 ```mermaid
 flowchart TD
     subgraph MultiQuote [Broad Multi-Stock Price Refresh]
-        MQ[price_scanner] -->|1st Choice: 200 stocks/call @ 15 req/s| TS_PRICE[Toss: /api/v1/prices]
+        MQ[Price Scanner] -->|1st Choice: 200 stocks/call @ 15 req/s| TS_PRICE[Toss: /api/v1/prices]
         TS_PRICE -.->|Fallback 1: 50 stocks/call| DB_PRICE[DB: MULTIPRICE 50 stocks]
         TS_PRICE -.->|Fallback 2: 50 stocks/call| LS_PRICE[LS: t8407]
     end
 
     subgraph Decision [Decision-Time Capture @ 15:20 KST]
-        D[collect.py] -->|Primary L10 & Flow| KIS_DEC[KIS: FHKST01010100 현재가<br/>FHKST01010200 호가/예상체결<br/>HHPTJ04160200 외인/기관추정]
+        D[Decision Collector] -->|Primary L10 & Flow| KIS_DEC[KIS: FHKST01010100 현재가<br/>FHKST01010200 호가/예상체결<br/>HHPTJ04160200 외인/기관추정]
         D -.->|MOC Indicative Tick Series| DB_MOC[DB: S01 WSS AntcCnpr/AntcCnqn<br/>DAYTRADE Code 8 MOC Series]
     end
 
     subgraph Universe [Universe Candidate Discovery]
-        U[universe_scan.py] -->|1st Choice: 400 stocks/call| DB_SCAN[DB: RANKLIST 400 stocks]
+        U[Universe Scanner] -->|1st Choice: 400 stocks/call| DB_SCAN[DB: RANKLIST 400 stocks]
         U -->|Scan Filter: 200 rows/P 5req/s| KW_SCAN[Kiwoom ka10027]
         U -.->|Master Dump: Full Universe 1-Call| TS_MASTER[Toss: /api/v1/stocks/all]
         U -.->|Master Dump: Full Universe 1-Call| DB_MASTER[DB: JCODES 3940+ stocks]
@@ -57,20 +57,20 @@ flowchart TD
     end
 
     subgraph RegBars [Regular Session 1m Bars 09:00-15:30]
-        RB[archive_intraday.py] -->|1st Choice: 2,000 bars/call = ~5 days| DB_BAR[DB CHARTMIN: 2,000 bars]
+        RB[Intraday Archiver] -->|1st Choice: 2,000 bars/call = ~5 days| DB_BAR[DB CHARTMIN: 2,000 bars]
         DB_BAR -.->|2nd Choice: 1 call per stock 500 bars| LS_BAR[LS t8412: 500 bars]
         LS_BAR -.->|3rd Choice: 2 calls @ 20 req/s| TS_BAR[Toss: /api/v1/candles]
         TS_BAR -.->|Fallback: 13 calls| KIS_BAR[KIS FHKST03010200: 30 bars]
     end
 
     subgraph NxtBars [Nextrade 1m Bars Premarket & Aftermarket]
-        NB[archive_intraday.py] -->|1st Choice: 2,000 bars/call NJ| DB_NX_BAR[DB CHARTMIN: NJ 2,000 bars]
+        NB[Intraday Archiver] -->|1st Choice: 2,000 bars/call NJ| DB_NX_BAR[DB CHARTMIN: NJ 2,000 bars]
         DB_NX_BAR -.->|2nd Choice: 1 call per session| KW_BAR[Kiwoom ka10080: _NX 900 bars]
         KW_BAR -.->|Fallback| KIS_NX[KIS FHKST03010200: NX]
     end
 
     subgraph Ticks [Regular Session Trade Ticks]
-        TK[archive_intraday.py] -->|1st Choice: 2,000 ticks/call| DB_TICK[DB CHARTTICK: 2,000 ticks]
+        TK[Intraday Archiver] -->|1st Choice: 2,000 ticks/call| DB_TICK[DB CHARTTICK: 2,000 ticks]
         DB_TICK -.->|2nd Choice: 900 ticks/P| KW_TICK[Kiwoom ka10079: 30P budget]
         KW_TICK -.->|3rd Choice: 500 ticks/P| LS_TICK[LS t8411: CTS cursor]
         LS_TICK -.->|Stream: WebSocket L10| TS_WS[Toss: wss /ws/v1]
@@ -78,7 +78,7 @@ flowchart TD
     end
 
     subgraph Orders [Automated Trading & Execution]
-        ORD[Execution Engine] -->|High-Frequency / Live OMS| KIS_ORD[KIS: TTTC0802U 매수/매도<br/>TTTC8434R 잔고조회]
+        ORD[Execution Engine] -->|High-Frequency / Live OMS| KIS_ORD[KIS: TTTC0012U/TTTC0011U 매수/매도<br/>TTTC0081R 잔고조회]
         ORD -->|Dedicated NXT Venue Router| DB_ORD[DB: CSPAT00600 KRX<br/>CSPAT00610 NXT 전용주문]
         ORD -->|Server OCO/OTO & Idempotency| TS_ORD[Toss: /api/v1/orders<br/>/api/v1/conditional-orders]
     end
@@ -110,10 +110,14 @@ flowchart TD
 | Venue | Session Window (KST) | Trading Type | KIS Syntax | LS Syntax | Kiwoom Syntax | Toss Syntax | DB Syntax |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **NXT Premarket** | `08:00:00` – `08:50:00` | Continuous Auction | `market_div_code="NX"` | N/A | `stk_cd="005930_NX"` | Handled in `/market-calendar/KR` | `InputCondMrktDivCode="NJ"`, `InputIscd1="N-005930"` |
+| **NXT Premarket Ticks/L10** | `08:00:00` – `08:50:00` | Continuous Auction | KIS WS `H0NXCNT0`/`H0NXASP0` | N/A | N/A | N/A | N/A |
 | **KRX Regular** | `09:00:00` – `15:20:00` | Continuous Auction | `market_div_code="J"` | `shcode="005930"` | `stk_cd="005930"` | `symbol="005930"` | `InputCondMrktDivCode="J"`, `InputIscd1="005930"` |
 | **KRX Closing Auction** | `15:20:00` – `15:30:00` | Single-Price Auction | `FHKST01010200` (`output2`) | N/A | N/A | Handled in `/market-calendar/KR` | `POST /daily-price` (`InputHourClsCode="8"`), WSS `S01` (`AntcCnpr`) |
 | **NXT Aftermarket (Order)** | `15:30:00` – `15:40:00` | Order Acceptance | N/A | N/A | N/A | Handled in `/market-calendar/KR` | `POST /order-nxt` (`CSPAT00610`) |
 | **NXT Aftermarket (Exec)** | `15:40:00` – `20:00:00` | Continuous Auction | `market_div_code="NX"` | N/A | `stk_cd="005930_NX"` | Handled in `/market-calendar/KR` | `InputCondMrktDivCode="NJ"`, `InputIscd1="N-005930"` |
+
+> [!NOTE]
+> NX 랭킹 조회 시 `FID_COND_MRKT_DIV_CODE`는 `NX`를 지원하지만 `UN`은 거부된다(`OPSQ2001`).
 
 ---
 
@@ -152,17 +156,17 @@ flowchart TD
 
 For complete parameter dictionaries, HTTP headers, return codes, and raw JSON response schemas, consult the dedicated broker specifications:
 
-* **DB금융투자 (DB Securities) Complete Specification:** [`docs/architecture/broker_db.md`](broker_db.md)  
+* **DB금융투자 (DB Securities) Complete Specification:** [`broker_db.md`](broker_db.md)  
   *(Covers 2,000-bar Single-Call Minute Charts, 1-Call 3,940+ Stock Universe Master Dump, 400-stock Fluctuation Rankings, Dedicated Nextrade ATS Orders, MOC Indicative Auction Time Series, and L10 Real-time WebSocket Streaming).*
 
-* **토스증권 (Toss Securities) Complete Specification:** [`docs/architecture/broker_toss.md`](broker_toss.md)  
+* **토스증권 (Toss Securities) Complete Specification:** [`broker_toss.md`](broker_toss.md)  
   *(Covers 200-stock Multi-Quotes, 20 req/s 1m/1d Candles, Investor/Program/Short/Credit Flows, Full Universe Master, Cash Orders, Server OCO/OTO Conditional Orders, and AsyncAPI WebSocket).*
 
-* **한국투자증권 (KIS) Complete Specification:** [`docs/architecture/broker_kis.md`](broker_kis.md)  
+* **한국투자증권 (KIS) Complete Specification:** [`broker_kis.md`](broker_kis.md)  
   *(Covers Quotations, Charts, Orderbook/Auction, Microstructure Flows, Rankings, HTS Condition Search, and Cash Buy/Sell/Balance/Deposit Orders).*
 
-* **LS증권 (LS) Complete Specification:** [`docs/architecture/broker_ls.md`](broker_ls.md)  
+* **LS증권 (LS) Complete Specification:** [`broker_ls.md`](broker_ls.md)  
   *(Covers 500-bar Single-Call Minute Charts, Ticks with CTS Pagination, Quotations, Microstructure Flows, Program Trades, Rankings, and Universe Master).*
 
-* **키움증권 (Kiwoom REST NEXT) Complete Specification:** [`docs/architecture/broker_kiwoom.md`](broker_kiwoom.md)  
+* **키움증권 (Kiwoom REST NEXT) Complete Specification:** [`broker_kiwoom.md`](broker_kiwoom.md)  
   *(Covers 200-row Fluctuation Rankings, 900-bar Single-Call Nextrade ATS Charts, 900-tick Capture, Stock Info, Quotations, and Flow Trends).*
