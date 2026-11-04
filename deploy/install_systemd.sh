@@ -30,6 +30,7 @@ systemctl --user enable --now \
   kca-auction-path.timer \
   kca-research-roster.timer \
   kca-postclose-snapshot.timer \
+  kca-decision-extras.timer \
   kca-tape-sweep.timer \
   kca-price-ingest.timer \
   kca-aftermarket-book.timer \
