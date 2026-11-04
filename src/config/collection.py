@@ -102,6 +102,10 @@ class CollectionSettings(EnvSettings):
         COLLECTION_RESEARCH_ROSTER_MIN_MARKET_CAP_100M: Roster estimated market-cap floor in 100M KRW, default 500.0.
         COLLECTION_RESEARCH_ROSTER_MAX_PAGES: Ranking page budget (100 rows per page), default 6.
         COLLECTION_RESEARCH_ROSTER_MAX_MEMBERS: Roster capacity cap, default 400.
+        COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED: Enable the post-close trade-strength snapshot, default False.
+        COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS: No new snapshot request starts at or after this
+            KST wall time, default 153900; must precede the 15:40 aftermarket start.
+        COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY: In-flight symbol limit for the snapshot, default 4.
 
     Raises:
         ValueError: Invalid limits, duplicate slots, or enabled auctions without
@@ -175,6 +179,9 @@ class CollectionSettings(EnvSettings):
     COLLECTION_RESEARCH_ROSTER_MIN_MARKET_CAP_100M: float = Field(default=500.0, ge=0.0, allow_inf_nan=False)
     COLLECTION_RESEARCH_ROSTER_MAX_PAGES: int = Field(default=6, gt=0, le=20)
     COLLECTION_RESEARCH_ROSTER_MAX_MEMBERS: int = Field(default=400, gt=0)
+    COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED: bool = Field(default=False)
+    COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS: str = Field(default="153900", pattern=r"^\d{6}$")
+    COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY: int = Field(default=4, gt=0, le=16)
 
     @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", "COLLECTION_BACKFILL_SLOTS", "COLLECTION_AFTERMARKET_BOOK_SLOTS", mode="before")
     @classmethod
@@ -249,6 +256,16 @@ class CollectionSettings(EnvSettings):
         for key, item in v.items():
             if not isinstance(key, str) or not key.strip() or not isinstance(item, str) or not item.strip():
                 raise ValueError("chart routes must map vendor:endpoint to declared venue")
+        return v
+
+    @field_validator("COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS", mode="after")
+    @classmethod
+    def _check_postclose_deadline(cls, v: str) -> str:
+        hour, minute, second = int(v[0:2]), int(v[2:4]), int(v[4:6])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+            raise ValueError("postclose snapshot deadline must be a valid HHMMSS time")
+        if v >= "154000":
+            raise ValueError("postclose snapshot deadline must precede the 15:40 aftermarket start")
         return v
 
     @model_validator(mode="after")

@@ -1,0 +1,11 @@
+[Unit]
+Description=KCA post-close trade-strength snapshot (Mon-Fri 15:31:30 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 15:31:30 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kca-postclose-snapshot.service
+
+[Install]
+WantedBy=timers.target

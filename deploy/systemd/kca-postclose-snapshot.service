@@ -1,0 +1,13 @@
+[Unit]
+Description=KCA post-close trade-strength and investor-estimate snapshot (research, no orders)
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
+Environment=TZ=Asia/Seoul
+Environment=KIS_DATA_ROLE=batch
+TimeoutStartSec=12min
+ExecStart=%h/.local/lib/kca/kca-run postclose-snapshot --kis-data --admission standard --role batch -- uv run python -m src.daily.postclose_snapshot
+ExecStopPost=-/usr/bin/docker rm -f kca-postclose-snapshot
