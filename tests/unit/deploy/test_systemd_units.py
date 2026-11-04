@@ -37,6 +37,7 @@ def test_every_timer_file_uses_h_specifier_in_its_service() -> None:
         "kca-auction-open.service",
         "kca-auction-path.service",
         "kca-research-roster.service",
+        "kca-postclose-snapshot.service",
         "kca-extended-backfill.service",
         "kca-aftermarket-book.service",
         "kca-tape-sweep.service",

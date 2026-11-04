@@ -340,3 +340,25 @@ def test_roster_defaults_off() -> None:
 def test_roster_bounds_validated(overrides: dict[str, int]) -> None:
     with pytest.raises(ValueError, match="COLLECTION_RESEARCH_ROSTER_MAX_"):
         CollectionSettings(_env_file=None, **overrides)
+
+
+def test_postclose_snapshot_defaults_off() -> None:
+    profile = CollectionSettings(_env_file=None)
+
+    assert profile.COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED is False
+    assert profile.COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS == "153900"
+    assert profile.COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY == 4
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS": "154000"}, "must precede the 15:40 aftermarket start"),
+        ({"COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS": "240000"}, "must be a valid HHMMSS time"),
+        ({"COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY": 0}, "COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY"),
+        ({"COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY": 17}, "COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY"),
+    ],
+)
+def test_postclose_snapshot_bounds_validated(overrides: dict[str, object], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        CollectionSettings(_env_file=None, **overrides)

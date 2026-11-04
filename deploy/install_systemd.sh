@@ -29,6 +29,7 @@ systemctl --user enable --now \
   kca-archive-intraday-regular.timer \
   kca-auction-path.timer \
   kca-research-roster.timer \
+  kca-postclose-snapshot.timer \
   kca-tape-sweep.timer \
   kca-price-ingest.timer \
   kca-aftermarket-book.timer \
